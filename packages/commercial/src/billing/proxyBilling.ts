@@ -37,6 +37,7 @@ import type { Pool } from "pg";
 import type { Logger } from "../logging/logger.js";
 import { computeCost, type TokenUsage } from "./calculator.js";
 import { spendTwoBucket } from "./spend.js";
+import { resolveBoardProjectAttribution } from "./boardProjectAttribution.js";
 import { lockTurnBillingKeys } from "./turnLock.js";
 import { resolveOrgBillingContext } from "../org/orgBilling.js";
 import type { ModelPricing } from "./pricing.js";
@@ -741,6 +742,10 @@ export async function settleUsageAndLedger(
     dispatchId?: string | null;
     attemptNo?: number | null;
     verificationSponsorship?: VerificationSponsorshipSnapshot | null;
+    boardProject?: {
+      boardProjectId: string | null;
+      source?: "session_bind" | "delegate_parent" | "explicit" | "migration_backfill";
+    } | null;
   },
 ): Promise<SettleResult> {
   const client = await pool.connect();
@@ -793,6 +798,13 @@ export async function settleUsageAndLedger(
     let balanceAfter: bigint | null = null;
     let debitedCredits: bigint | null = null;
     try {
+      const attribution = await resolveBoardProjectAttribution(client, {
+        usageUserId: args.userId,
+        sessionId: args.sessionId,
+        parentSessionId: args.parentSessionId,
+        mode: args.mode,
+        explicit: args.boardProject ?? null,
+      });
       const ins = await client.query<{ id: string }>(
         `INSERT INTO usage_records
           (user_id, mode, account_id, model,
@@ -801,9 +813,10 @@ export async function settleUsageAndLedger(
            delegate_agent_id, request_id, status, org_id,
            execution_revision, projection_revision, security_epoch, authority_kind,
            turn_key, parent_turn_key, dispatch_id, attempt_no,
-           verification_run_id, would_have_cost_credits)
+           verification_run_id, would_have_cost_credits,
+           board_project_id, board_project_source, board_project_captured_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16,
-                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
          RETURNING id::text AS id`,
         [
           args.userId.toString(),
@@ -836,6 +849,9 @@ export async function settleUsageAndLedger(
           args.attemptNo ?? null,
           verificationSponsored ? args.verificationSponsorship!.runId : null,
           verificationSponsored ? args.costCredits.toString() : null,
+          attribution.boardProjectId,
+          attribution.source,
+          attribution.capturedAt,
         ],
       );
       usageId = BigInt(ins.rows[0]!.id);

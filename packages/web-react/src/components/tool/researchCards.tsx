@@ -42,6 +42,7 @@ import { cn } from "../../lib/utils";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, useSignedSrc } from "../chat/media";
 import { ClaimList, CoverageBadge, GatesRow, LiteratureLibraryPanel } from "../chat/researchEvidence";
 import { connectorToolCard } from "./connectorCards";
+import { ExpandControls, useExpandableSlice } from "./expandable";
 import { asArr, asStr, detectShellFileWrites, isSafeHttpUrl, type ToolLike } from "./format";
 import { detectOcCli, type OcCli } from "./meta";
 
@@ -154,19 +155,19 @@ function parseToolData(text: string | null): { data: Record<string, unknown>; pa
 
 // ── 共用 UI 原语(与 bodies.tsx 同审美) ──────────────────────────────────────
 
-function CardShell({ icon, title, subtitle, children }: {
-  icon: ReactNode;
+// M5:专属卡恒在 ToolCard 内部渲染,外层表头已有图标 + 标签 —— 此处不再重复图标+大标题
+// (双层表头视觉过重)。保留一行轻量状态行:标题弱化为 faint 小字,subtitle(数量/状态)照旧。
+// icon 参数保留在签名里(各卡传参不动),仅不渲染。
+function CardShell({ title, subtitle, children }: {
+  icon?: ReactNode;
   title: string;
   subtitle?: string;
   children: ReactNode;
 }) {
   return (
-    <section className="space-y-2.5">
+    <section className="space-y-2">
       <div className="flex min-w-0 items-center gap-2">
-        <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
-          {icon}
-        </span>
-        <span className="min-w-0 truncate text-[12.5px] font-semibold text-fg">{title}</span>
+        <span className="min-w-0 truncate text-[11.5px] font-medium text-faint">{title}</span>
         {subtitle && (
           <span className="ml-auto shrink-0 rounded-full bg-hover px-2 py-0.5 text-[11px] font-medium text-faint">
             {subtitle}
@@ -1023,7 +1024,7 @@ function OcWebExtractCard({ tool }: { tool: ToolLike }): ReactNode | null {
       )}
       {body.length > summary.length && (
         <details className="mt-2">
-          <summary className="cursor-pointer text-[11.5px] text-accent hover:underline">查看抽取全文</summary>
+          <summary className="cursor-pointer rounded text-[11.5px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看抽取全文</summary>
           <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
             {body}
           </pre>
@@ -1099,6 +1100,8 @@ function friendlyOcFailureText(raw: string): string {
 }
 
 function FriendlyObjectPreview({ value }: { value: Record<string, unknown> }) {
+  // L3:默认只展示前 6 个字段,余下给「还有 N 个字段」入口可展开全部。
+  const [showAllFields, setShowAllFields] = useState(false);
   if (isShellResultObject(value)) {
     const msg = friendlyOcFailureText(shellResultMessage(value));
     return (
@@ -1107,48 +1110,77 @@ function FriendlyObjectPreview({ value }: { value: Record<string, unknown> }) {
       </div>
     );
   }
-  const rows = Object.entries(value).slice(0, 6);
-  if (rows.length === 0) return <div className="text-xs text-faint">没有返回内容。</div>;
+  const entries = Object.entries(value);
+  if (entries.length === 0) return <div className="text-xs text-faint">没有返回内容。</div>;
+  const rows = showAllFields ? entries : entries.slice(0, 6);
   return (
-    <dl className="grid gap-2 sm:grid-cols-2">
-      {rows.map(([key, item]) => (
-        <div key={key} className="min-w-0 rounded-lg bg-hover/70 px-3 py-2">
-          <dt className="text-[11px] font-medium text-faint">{key.replaceAll("_", " ")}</dt>
-          <dd className="mt-0.5 break-words text-[12.5px] leading-relaxed text-fg">
-            {typeof item === "string"
-              ? firstParagraph(item)
-              : typeof item === "number" || typeof item === "boolean"
-                ? String(item)
-                : Array.isArray(item)
-                  ? `${item.length} 项`
-                  : item && typeof item === "object"
-                    ? `${Object.keys(item).length} 个字段`
-                    : "—"}
-          </dd>
-        </div>
-      ))}
-    </dl>
+    <>
+      <dl className="grid gap-2 sm:grid-cols-2">
+        {rows.map(([key, item]) => (
+          <div key={key} className="min-w-0 rounded-lg bg-hover/70 px-3 py-2">
+            <dt className="text-[11px] font-medium text-faint">{key.replaceAll("_", " ")}</dt>
+            <dd className="mt-0.5 break-words text-[12.5px] leading-relaxed text-fg">
+              {typeof item === "string"
+                ? firstParagraph(item)
+                : typeof item === "number" || typeof item === "boolean"
+                  ? String(item)
+                  : Array.isArray(item)
+                    ? `${item.length} 项`
+                    : item && typeof item === "object"
+                      ? `${Object.keys(item).length} 个字段`
+                      : "—"}
+            </dd>
+          </div>
+        ))}
+      </dl>
+      {!showAllFields && entries.length > 6 && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setShowAllFields(true);
+          }}
+          className="mt-1.5 rounded text-xs text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          还有 {entries.length - 6} 个字段，展开全部
+        </button>
+      )}
+    </>
   );
 }
 
-/** 折叠的"详细输出/错误详情"(默认收起;展开也只显示 stdout 正文,已剥离命令回显)。 */
+/** 折叠的"详细输出/错误详情"(默认收起;展开也只显示 stdout 正文,已剥离命令回显)。
+ *  超过 4000 字不再硬截:接 F4 展开原语,可「展开全部/继续显示」。 */
 function OutputDetails({ text, label }: { text: string | null; label: string }) {
   const clean = text ? stripCommandEcho(text).trim() : "";
+  const slice = useExpandableSlice(clean, 4000);
   if (!clean) return null;
   return (
     <details className="mt-2">
-      <summary className="cursor-pointer text-[11.5px] text-accent hover:underline">{label}</summary>
+      <summary className="cursor-pointer rounded text-[11.5px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">
+        {label}
+      </summary>
       <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
-        {clean.slice(0, 4000)}
+        {slice.shown}
+        {slice.truncated ? "\n…" : null}
       </pre>
+      <ExpandControls slice={slice} />
     </details>
   );
 }
 
-/** 干净的语义结果正文(whitespace 保留、可换行),供识图/歌词/检索等纯文本 stdout 用。 */
+/** 干净的语义结果正文(whitespace 保留、可换行),供识图/歌词/检索等纯文本 stdout 用。
+ *  超过 4000 字接 F4 展开原语,不再"只截不展"。 */
 function ResultText({ text }: { text: string }) {
+  const slice = useExpandableSlice(text, 4000);
   return (
-    <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-fg">{text.slice(0, 4000)}</div>
+    <>
+      <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-fg">
+        {slice.shown}
+        {slice.truncated ? "…" : null}
+      </div>
+      <ExpandControls slice={slice} />
+    </>
   );
 }
 

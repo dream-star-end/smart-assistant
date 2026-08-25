@@ -2,18 +2,20 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, open, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
-import type { DurableCodexBilling } from '@openclaude/protocol'
+import {
+  AUTO_DREAM_OPTIMIZER_ABANDON_PATH as ABANDON_PATH,
+  AUTO_DREAM_OPTIMIZER_ACTION_PATH as ACTION_PATH,
+  AUTO_DREAM_OPTIMIZER_ADMIT_PATH as ADMIT_PATH,
+  AUTO_DREAM_OPTIMIZER_FINDINGS_PATH as FINDINGS_PATH,
+  AUTO_DREAM_OPTIMIZER_SETTLE_PATH as SETTLE_PATH,
+  type DurableCodexBilling,
+} from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
 import { request as undiciRequest } from 'undici'
 
 import type { AutoDreamOptimizerProposal, AutoDreamPlatformFinding } from './autoDreamOptimizer.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 
-const ADMIT_PATH = '/internal/v3/auto-dream/admit'
-const SETTLE_PATH = '/internal/v3/auto-dream/settle'
-const ABANDON_PATH = '/internal/v3/auto-dream/abandon'
-const FINDINGS_PATH = '/internal/v3/auto-dream/findings'
-const ACTION_PATH = '/internal/v3/auto-dream/action'
 const MAX_RESPONSE_BYTES = 128 * 1024
 
 interface BillingQueue {

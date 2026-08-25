@@ -1837,6 +1837,7 @@ export class SubprocessRunner extends EventEmitter {
         backend: 'ccb',
         prompt_bytes: Buffer.byteLength(mergedPrompt, 'utf8'),
         prompt_sha256: mergedPromptSha256.slice(0, 12),
+        board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
       // observability:MODEL_HINT 命中(per-model 行为补丁注入)→ structured log + prom counter。
       // 不打 prompt 原文(可能含敏感引导),只记 sha256[:8] + bytes。

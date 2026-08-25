@@ -1897,7 +1897,7 @@ describe('v5 release safety lanes', () => {
   })
 
   test('release GC protects container baseline references and skips all deletion on inspect failure', async () => {
-    const makeFixture = async (suffix: string) => {
+    const makeFixture = async (suffix: string, opts: { adminLeaf?: boolean } = {}) => {
       const dir = await mkdtemp(path.join(tmpdir(), `v5-release-gc-${suffix}-`)); dirs.push(dir)
       const releases = path.join(dir, 'releases'); await mkdir(releases)
       const releasePaths: string[] = []
@@ -1907,6 +1907,8 @@ describe('v5 release safety lanes', () => {
         await mkdir(path.join(baseline, 'skills'), { recursive: true })
         await writeFile(path.join(baseline, 'AGENTS.md'), '# agents\n')
         await writeFile(path.join(baseline, 'CLAUDE.md'), '# claude\n')
+        await writeFile(path.join(baseline, 'AGENTS.admin.md'), '# agents admin\n')
+        await writeFile(path.join(baseline, 'CLAUDE.admin.md'), '# claude admin\n')
         await writeFile(path.join(release, '.complete'), 'ok\n')
         const stamp = new Date(1_700_000_000_000 + index * 1_000)
         await utimes(release, stamp, stamp)
@@ -1928,8 +1930,8 @@ describe('v5 release safety lanes', () => {
           'com.openclaude.runtime_channel': 'v5',
         } },
         Mounts: [
-          { Type: 'bind', Source: path.join(releasePaths[0]!, 'packages/commercial/agent-sandbox/ccb-baseline/AGENTS.md'), Destination: '/opt/openclaude/AGENTS.md', RW: false },
-          { Type: 'bind', Source: path.join(releasePaths[0]!, 'packages/commercial/agent-sandbox/ccb-baseline/CLAUDE.md'), Destination: '/run/oc/claude-config/CLAUDE.md', RW: false },
+          { Type: 'bind', Source: path.join(releasePaths[0]!, `packages/commercial/agent-sandbox/ccb-baseline/${opts.adminLeaf ? 'AGENTS.admin.md' : 'AGENTS.md'}`), Destination: '/opt/openclaude/AGENTS.md', RW: false },
+          { Type: 'bind', Source: path.join(releasePaths[0]!, `packages/commercial/agent-sandbox/ccb-baseline/${opts.adminLeaf ? 'CLAUDE.admin.md' : 'CLAUDE.md'}`), Destination: '/run/oc/claude-config/CLAUDE.md', RW: false },
           { Type: 'bind', Source: path.join(releasePaths[0]!, 'packages/commercial/agent-sandbox/ccb-baseline/skills'), Destination: '/run/oc/claude-config/skills', RW: false },
         ],
       }]))
@@ -1976,6 +1978,15 @@ describe('v5 release safety lanes', () => {
     const dockerLog = await readFile(protectedFixture.dockerLog, 'utf8')
     assert.match(dockerLog, /label=com\.openclaude\.v3\.managed=1/)
     assert.match(dockerLog, /label=com\.openclaude\.runtime_channel=v5/)
+
+    // admin 容器绑 AGENTS.admin.md / CLAUDE.admin.md 变体:同样受保护,不得 SAFE-SKIP。
+    const adminFixture = await makeFixture('admin-leaf', { adminLeaf: true })
+    const adminRun = spawnSync('bash', [releaseGc, ...adminFixture.args], {
+      cwd: root, encoding: 'utf8', env: adminFixture.env,
+    })
+    assert.equal(adminRun.status, 0, adminRun.stderr || adminRun.stdout)
+    const adminSurvivors = (await readdir(adminFixture.releases)).filter((name) => name.startsWith('rel-')).sort()
+    assert.deepEqual(adminSurvivors, ['rel-proof-01', 'rel-proof-06', 'rel-proof-07', 'rel-proof-08'])
 
     const failedFixture = await makeFixture('inspect-fail')
     const before = (await readdir(failedFixture.releases)).filter((name) => name.startsWith('rel-')).sort()

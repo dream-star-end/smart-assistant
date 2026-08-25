@@ -16,7 +16,7 @@ import { type Logger, rootLogger } from '../logging/logger.js'
 import type { QueryRunner } from './internalSkillUsage.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
-export const SKILL_SHADOW_PATH = '/internal/v3/skill-shadow'
+export { SKILL_SHADOW_PATH } from '@openclaude/protocol'
 
 const MAX_BODY_BYTES = 16 * 1024
 const TRACE_RE = /^[0-9a-f]{32}$/

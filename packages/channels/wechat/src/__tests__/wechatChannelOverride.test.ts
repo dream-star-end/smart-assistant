@@ -174,7 +174,7 @@ describe('routeWechatInbound — /status command bypasses override and dispatch'
     assert.equal(cap.sendTextCalls.length, 1)
     assert.equal(cap.sendTextCalls[0]!.userId, '777')
     assert.equal(cap.sendTextCalls[0]!.senderId, 'wx-sender-abc')
-    assert.match(cap.sendTextCalls[0]!.msg, /OC bot status/)
+    assert.match(cap.sendTextCalls[0]!.msg, /OpenClaude 状态/)
     assert.match(cap.sendTextCalls[0]!.msg, /活跃 worker: 3/)
   })
 
@@ -212,7 +212,7 @@ describe('routeWechatInbound — /new command routes to the correct session owne
     assert.equal(cap.dispatchCalls.length, 0, 'dispatch must not fire for /new')
   })
 
-  it('without override, reports resetSession error back to the WeChat user', async () => {
+  it('without override, reports a fixed-copy failure to the WeChat user (raw detail stays in logs)', async () => {
     const { deps, cap } = makeDeps({
       withOverride: false,
       resetSessionThrow: new Error('db-down'),
@@ -220,7 +220,9 @@ describe('routeWechatInbound — /new command routes to the correct session owne
     await routeWechatInbound(makeEvent({ text: '/new' }), deps)
     assert.equal(cap.resetSessionCalls.length, 1)
     assert.equal(cap.sendTextCalls.length, 1)
-    assert.match(cap.sendTextCalls[0]!.msg, /\/new 失败: db-down/)
+    // E8 — 用户可见文案固定;内部错误细节(db-down)不得出现在微信消息里。
+    assert.equal(cap.sendTextCalls[0]!.msg, '开启新会话失败，请稍后重试。')
+    assert.ok(!cap.sendTextCalls[0]!.msg.includes('db-down'))
     assert.equal(cap.overrideCalls.length, 0)
     assert.equal(cap.dispatchCalls.length, 0)
   })

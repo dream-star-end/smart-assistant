@@ -523,7 +523,8 @@ describe("permission 审批", () => {
   test("已允许（普通工具）→ 状态展示", () => {
     renderMsg(mk("permission", { toolName: "Bash", requestId: "r1", _resolved: true, _behavior: "allow" }));
     expect(screen.getByText("已允许")).toBeInTheDocument();
-    expect(screen.getByText("Bash")).toBeInTheDocument();
+    // F5:工具名走中文标签(Bash→终端),不再裸英文
+    expect(screen.getByText("终端")).toBeInTheDocument();
   });
 
   test("待审批普通工具 → 自动弹审批框，允许经 onRespondPermission 回送", () => {

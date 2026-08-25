@@ -414,6 +414,7 @@ export async function buildCodexLaunchOverrides(
       .update(instructionsContent, 'utf8')
       .digest('hex')
       .slice(0, 12),
+    board_project_id: ctx.runContext?.boardProjectId ?? ctx.projectId ?? null,
   })
 
   // observability:per-model 行为补丁注入(MODEL_HINT)→ structured log + prom counter。

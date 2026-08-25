@@ -18,6 +18,7 @@ import {
   Store,
 } from "lucide-react";
 import { useEffect, useMemo, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from "react";
+import { useProjectScope } from "../hooks/useProjectScope";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
@@ -128,7 +129,12 @@ export type SidebarProps = {
   loadingMore?: boolean;
   onLoadArchived?: () => void;
   loadingArchived?: boolean;
-  onSearchMessages?: (q: string, signal: AbortSignal) => Promise<SessionSearchHit[]>;
+  onSearchMessages?: (
+    q: string,
+    signal: AbortSignal,
+    projectId?: string | null,
+  ) => Promise<SessionSearchHit[]>;
+  searchProjectId?: string | null;
   virtualizeThreshold?: number;
 };
 
@@ -184,6 +190,7 @@ export function Sidebar({
   onLoadArchived,
   loadingArchived,
   onSearchMessages,
+  searchProjectId,
   virtualizeThreshold = VIRTUALIZE_THRESHOLD,
 }: SidebarProps) {
   const [q, setQ] = useState("");
@@ -197,6 +204,9 @@ export function Sidebar({
   const [searchRemote, setSearchRemote] = useState<"idle" | "loading" | "empty" | "error">("idle");
   const coarse = useCoarsePointer();
   const searching = q.trim().length > 0;
+  const projectScope = useProjectScope();
+  const activeSearchProjectId =
+    searchProjectId !== undefined ? searchProjectId : projectScope.scope.chatProjectIdForFilter;
   const showProjects = Array.isArray(projects) && Boolean(onCreateProject);
 
   const runningIds = useMemo(() => {
@@ -284,7 +294,7 @@ export function Sidebar({
     setSearchRemote("loading");
     const ac = new AbortController();
     const timer = window.setTimeout(() => {
-      void onSearchMessages(needle, ac.signal)
+      void onSearchMessages(needle, ac.signal, activeSearchProjectId)
         .then((hits) => {
           if (ac.signal.aborted) return;
           setSearchHits(hits);
@@ -301,7 +311,7 @@ export function Sidebar({
       window.clearTimeout(timer);
       ac.abort();
     };
-  }, [q, onSearchMessages]);
+  }, [q, onSearchMessages, activeSearchProjectId]);
 
   const displayProjects = useMemo(
     () =>
@@ -550,6 +560,9 @@ export function Sidebar({
             {hit.title || "新对话"}
           </span>
           <span className="truncate text-caption text-faint">
+            {hit.projectId
+              ? `${(projects ?? []).find((p) => p.id === hit.projectId)?.name ?? "项目"} · `
+              : ""}
             <HighlightedText text={hit.snippet} query={q} />
           </span>
         </button>

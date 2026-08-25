@@ -8,7 +8,7 @@
  * → 汇总徽标行 + 每子任务 mini 卡(agent 名 / goal / 成功失败徽标 / 结果预览折叠)。
  * 解析失败返回 null,调用方回退 <OutputBlock>。视觉紧凑度对齐 AgentGroupCard。
  */
-import { Users } from "lucide-react";
+import { CheckCircle2, Users, XCircle } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "../../lib/utils";
 import { Badge } from "../ui";
@@ -69,7 +69,13 @@ function FanoutItemCard({ item }: { item: FanoutItem }) {
       )}
     >
       <div className="flex min-w-0 items-start gap-2">
-        <span className="mt-px shrink-0 text-[13px]">{item.isError ? "❌" : "✅"}</span>
+        <span className="mt-px shrink-0">
+          {item.isError ? (
+            <XCircle size={14} aria-hidden="true" className="text-danger" />
+          ) : (
+            <CheckCircle2 size={14} aria-hidden="true" className="text-success" />
+          )}
+        </span>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
             <span className="min-w-0 truncate text-[13px] font-medium text-fg">{name}</span>
@@ -78,7 +84,7 @@ function FanoutItemCard({ item }: { item: FanoutItem }) {
           {item.goal && <p className="mt-0.5 line-clamp-2 text-[12px] leading-snug text-muted">{item.goal}</p>}
           {item.body && (
             <details className="mt-1">
-              <summary className="cursor-pointer text-[11.5px] text-accent hover:underline">查看结果</summary>
+              <summary className="cursor-pointer rounded text-[11.5px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看结果</summary>
               <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
                 {item.body}
               </pre>

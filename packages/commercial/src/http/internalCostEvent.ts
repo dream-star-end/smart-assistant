@@ -28,7 +28,7 @@ import { timingSafeEqual } from "node:crypto";
 import { rootLogger, type Logger } from "../logging/logger.js";
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders, isObj } from "./util.js";
 
-export const COST_EVENT_PATH = "/internal/v5/cost-event";
+export { COST_EVENT_PATH } from "@openclaude/protocol";
 export const EGRESS_SECRET_HEADER = "x-oc-egress-secret";
 
 const MAX_BODY_BYTES = 64 * 1024;

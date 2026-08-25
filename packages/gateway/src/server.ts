@@ -65,7 +65,9 @@ import {
   isCursorEngineModel,
   isZcodeEngineModel,
   isClientMessageId,
+  isDisplayableServerMessage,
   isPersistedClientMessageId,
+  turnErrorSemantics,
   formatMessageReplyPrompt,
   normalizeMessageReplyQuote,
   shouldServeInline,
@@ -234,7 +236,9 @@ import {
 } from './agentVisibility.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
 import type {
+  GatewayEngineErrorEvent,
   GatewayStreamEvent,
+  GatewayTerminalErrorCode,
   GatewayTurnPhase,
   SessionStreamEvent,
   TurnRetryMeta,
@@ -288,12 +292,18 @@ import {
   type CronJob,
 } from './cron.js'
 import {
+  deriveFixedBoardProjectId,
+  filterCronJobsForBoard,
+  type CronProjectPorts,
+} from './cronProject.js'
+import {
   buildCronOriginResumeText,
   cronOriginClientMessageId,
   cronOriginIdempotencyKey,
   parseOriginWebchatSessionKey,
   type CronOriginFireResult,
 } from './cronOriginSession.js'
+import { getProject } from './taskboard/db/projects.js'
 import {
   buildSendToAgentCallbackText,
   isSendToAgentCallbackComplete,
@@ -2946,6 +2956,7 @@ export class Gateway {
         })
       }
     }, (job, delivery) => this.injectCronOriginSession(job, delivery))
+    this.cron.setProjectPorts(this.cronProjectPorts())
     this.cron.lastActiveChannel = this.lastActiveChannel
     this.cron.start().catch((err) => this.log.error('cron start failed', undefined, err))
 
@@ -4150,14 +4161,32 @@ export class Gateway {
           })
         return
       }
-      // 容器形态(c 空):附 durable inbox open-job / 字节 gauge(RFC §3 healthz),
-      // 异步取一次后 end。stats 失败不阻塞健康返回(inbox 是可观测面,非可服务面)。
-      void turnDispatchInboxStats()
-        .then((stats) => {
-          body.turnDispatchInbox = { openJobs: stats.openJobs, bytes: stats.bytes }
+      // 容器/个人版形态(c 空):附 durable inbox open-job / 字节 gauge(RFC §3
+      // healthz),异步取一次后 end。stats 失败不阻塞健康返回(inbox 是可观测面,
+      // 非可服务面)。个人版(无 commercial 注入)同样深度探 sessions.db —— 本地
+      // SQLite 在此形态下就是会话权威库,打不开 = list/save/落库全崩,必须翻 ok
+      // 供监控/doctor 消费(与上方 master 形态同一探针与 deps 语义)。
+      void Promise.all([
+        probeSessionsDb().catch(
+          (): { ok: false; error: string } => ({ ok: false, error: 'probe rejected' }),
+        ),
+        turnDispatchInboxStats()
+          .then((stats): { openJobs: number | null; bytes: number | null } => ({
+            openJobs: stats.openJobs,
+            bytes: stats.bytes,
+          }))
+          .catch((): { openJobs: null; bytes: null } => ({ openJobs: null, bytes: null })),
+      ])
+        .then(([sess, inbox]) => {
+          body.turnDispatchInbox = inbox
+          const built = _buildHealthzDeps(sess, {})
+          body.deps = built.deps
+          if (!built.ok) body.ok = false
         })
         .catch(() => {
-          body.turnDispatchInbox = { openJobs: null, bytes: null }
+          // 兜底防 healthz 挂起(上面各探活分支已内部 catch,理论到不了这里)。
+          body.ok = false
+          body.deps = { sessionsDb: 'error', sessionsDbError: 'probe rejected' }
         })
         .finally(() => {
           res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -4304,7 +4333,18 @@ export class Gateway {
         SESSION_SEARCH_LIMIT_MAX,
       )
       const includeArchived = parseIncludeArchivedFlag(url.searchParams.get('includeArchived'))
-      searchClientSessions(userId, { q, limit, includeArchived })
+      const projectRaw = url.searchParams.get('projectId')
+      const projectId =
+        projectRaw === null || projectRaw === '' || projectRaw === 'all'
+          ? undefined
+          : projectRaw === 'none'
+            ? null
+            : projectRaw.trim()
+      if (projectId && (projectId.length < 8 || projectId.length > 64)) {
+        this.sendJson(res, 400, { error: 'invalid projectId' })
+        return
+      }
+      searchClientSessions(userId, { q, limit, includeArchived, projectId })
         .then((out) => this.sendJson(res, 200, out))
         .catch(() => this.sendJson(res, 500, { error: 'search failed' }))
       return
@@ -4312,7 +4352,13 @@ export class Gateway {
     if (url.pathname === '/api/sessions/batch' && req.method === 'POST') {
       const userId = this.getUserId(req)
       ;(async () => {
-        let data: { ids?: unknown; action?: unknown; projectId?: unknown }
+        let data: {
+          ids?: unknown
+          action?: unknown
+          projectId?: unknown
+          expectedSessions?: unknown
+          operationId?: unknown
+        }
         try {
           data = JSON.parse(await this.readBody(req, 64 * 1024))
         } catch {
@@ -4336,6 +4382,14 @@ export class Gateway {
         if (!result.ok) {
           if (result.error === 'project_not_found') {
             this.sendJson(res, 404, { error: 'project not found' })
+            return
+          }
+          if (result.error === 'stale_session') {
+            this.sendJson(res, 409, {
+              error: 'stale session',
+              code: 'stale_session',
+              staleIds: result.staleIds ?? [],
+            })
             return
           }
           this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
@@ -4561,7 +4615,11 @@ export class Gateway {
             this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
             return
           }
-          this.sendJson(res, 200, { asset: result.asset })
+          this.sendJson(res, 200, {
+            asset: result.asset,
+            created: result.created,
+            reused: !result.created,
+          })
         })().catch(() => this.sendJson(res, 500, { error: 'create failed' }))
         return
       }
@@ -5702,7 +5760,9 @@ export class Gateway {
           await writeFile(filePath, JSON.stringify(entry, null, 2))
           this.sendJson(res, 200, { ok: true, id: entry.id })
         } catch (err) {
-          this.sendJson(res, 400, { error: String(err) })
+          // E5 — 原始错误(可能含内部路径/栈)只进日志,响应体给受控文案。
+          this.log.warn('feedback submit failed', undefined, err as Error)
+          this.sendJson(res, 400, { error: '反馈提交失败，请稍后重试' })
         }
       }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
       return
@@ -6564,6 +6624,12 @@ export class Gateway {
       this._updateWechatIdempotency(idempotencyKey, { completed: true })
       const currentWechat = this._getIdempotencyEntry(idempotencyKey)?.wechat
       const errMessage = err instanceof Error ? err.message : String(err)
+      // E5 — 渠道用户只看分类后的受控文案;原文经下方 log.error 进日志。
+      const classifiedDispatchError = classifyRunError(errMessage)
+      const publicDispatchReason =
+        classifiedDispatchError.code === 'unknown'
+          ? '任务执行暂时中断，请直接重试本条消息'
+          : classifiedDispatchError.message
       const terminalPeer = {
         ...peerOut,
         id: currentWechat?.peerId ?? wechatPeerIdFromSessionKey(currentWechat?.sessionKey) ?? peerId,
@@ -6577,7 +6643,7 @@ export class Gateway {
         blocks: [
           {
             kind: 'text' as const,
-            text: `[error] ${source === 'qqbot' ? 'QQ' : '微信'}任务启动后失败：${errMessage.slice(0, 300) || 'unknown error'}`,
+            text: `[error] ${source === 'qqbot' ? 'QQ' : '微信'}任务启动后失败：${publicDispatchReason}`,
           },
         ],
         isFinal: true,
@@ -11969,10 +12035,12 @@ export class Gateway {
     try {
       pairing = await import('@openclaude/channel-wechat' as any)
     } catch (err) {
+      // E5 — import 失败细节(路径/栈)只进日志。
+      this.log.error('channel-wechat module unavailable', undefined, err as Error)
       this.sendJson(res, 503, {
         error: {
           code: 'WECHAT_UNAVAILABLE',
-          message: '@openclaude/channel-wechat not available: ' + String(err),
+          message: '微信通道模块不可用，请检查服务端安装',
         },
       })
       return
@@ -11996,7 +12064,9 @@ export class Gateway {
         const { qrcode, qrcodeImgContent } = await startPairing(userId)
         this.sendJson(res, 200, { qrcode, qrcodeImgContent })
       } catch (err: any) {
-        this.sendError(res, 502, `QR fetch failed: ${err?.message || err}`)
+        // E5 — 上游错误原文只进日志,响应体给受控文案。
+        this.log.error('wechat pairing QR fetch failed', { userId }, err)
+        this.sendError(res, 502, '获取微信配对二维码失败，请稍后重试')
       }
       return
     }
@@ -12023,7 +12093,9 @@ export class Gateway {
           })
           return
         }
-        this.sendError(res, 500, `poll failed: ${err?.message || err}`)
+        // E5 — 上游错误原文只进日志,响应体给受控文案。
+        this.log.error('wechat pairing poll failed', { userId }, err)
+        this.sendError(res, 500, '微信配对状态查询失败，请稍后重试')
       }
       return
     }
@@ -12363,6 +12435,10 @@ export class Gateway {
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
     }
     try {
+      const cronBoard =
+        job.projectMode === 'fixed' && typeof job.boardProjectId === 'string'
+          ? job.boardProjectId
+          : undefined
       await this.dispatchInbound({
         type: 'inbound.message',
         channel: origin.channel,
@@ -12373,6 +12449,7 @@ export class Gateway {
         idempotencyKey: cronOriginIdempotencyKey(job.id, delivery.deliveryId),
         clientMessageId,
         _userId: userId,
+        ...(cronBoard ? { _cronBoardProjectId: cronBoard, _cronProjectMode: 'fixed' } : {}),
       } as any)
     } catch (err) {
       this.log.warn('origin-session dispatch failed', { jobId: job.id }, err as Error)
@@ -12602,10 +12679,44 @@ export class Gateway {
   }
 
   // ── Cron/Reminder API handlers ──
+  private cronProjectPorts(): CronProjectPorts {
+    return {
+      getBoardProject: async (id) => {
+        const p = getProject(getTaskboardDb(), id)
+        return p ? { id: p.id, archivedAt: p.archivedAt } : null
+      },
+      getSessionBoardProject: async (sessionId) => {
+        const ws = await resolveChatRunWorkspace({ sessionId })
+        return ws.bound ? ws.projectId : null
+      },
+    }
+  }
+
+  private async stampCronProject(
+    parsed: { projectMode?: unknown; boardProjectId?: unknown },
+    originPeerId?: string,
+  ): Promise<{ projectMode: 'follow_session' | 'fixed'; boardProjectId: string | null } | { error: string }> {
+    const wantFixed = parsed.projectMode === 'fixed'
+    if (!wantFixed) return { projectMode: 'follow_session', boardProjectId: null }
+    let candidate = typeof parsed.boardProjectId === 'string' ? parsed.boardProjectId : ''
+    if (!candidate && originPeerId) {
+      const live = await resolveChatRunWorkspace({ sessionId: originPeerId })
+      candidate = live.bound && live.projectId ? live.projectId : ''
+    }
+    const derived = await deriveFixedBoardProjectId(this.cronProjectPorts(), candidate)
+    if (!derived) return { error: 'fixed project must be a live unarchived board project' }
+    return { projectMode: 'fixed', boardProjectId: derived }
+  }
+
   private async handleCronApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
     if (req.method === 'GET') {
-      const jobs = filterUserVisibleByAgentField(await this.cron.listJobsWithMeta())
+      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+      let jobs = filterUserVisibleByAgentField(await this.cron.listJobsWithMeta())
+      const boardRaw = url.searchParams.get('boardProjectId')
+      if (boardRaw && boardRaw !== 'all') {
+        jobs = await filterCronJobsForBoard(jobs, boardRaw, this.cronProjectPorts())
+      }
       this.sendJson(res, 200, { jobs })
       return
     }
@@ -12661,6 +12772,10 @@ export class Gateway {
         job.sourceUserId =
           (typeof live.userId === 'string' && live.userId) || containerUser || 'default'
       }
+      const stamped = await this.stampCronProject(parsed, parseOriginWebchatSessionKey(job.sourceSessionKey || '')?.peerId)
+      if ('error' in stamped) return this.sendError(res, 400, stamped.error)
+      job.projectMode = stamped.projectMode
+      job.boardProjectId = stamped.boardProjectId
       await this.cron.addJob(job)
       this.sendJson(res, 201, { ok: true, job })
       return
@@ -12697,6 +12812,13 @@ export class Gateway {
       const existing = (await this.cron.listJobsWithMeta()).find((job) => job.id === id)
       if (existing && isHiddenSystemAgentId(existing.agent)) {
         return this.sendError(res, 404, 'cron job not found')
+      }
+      if (parsed.projectMode !== undefined || parsed.boardProjectId !== undefined) {
+        const originPeer = parseOriginWebchatSessionKey(existing?.sourceSessionKey || '')?.peerId
+        const stamped = await this.stampCronProject(parsed, originPeer)
+        if ('error' in stamped) return this.sendError(res, 400, stamped.error)
+        parsed.projectMode = stamped.projectMode
+        parsed.boardProjectId = stamped.boardProjectId
       }
       const updated = await this.cron.updateJob(id, parsed)
       this.sendJson(res, updated ? 200 : 404, { ok: updated })
@@ -12859,7 +12981,8 @@ export class Gateway {
       })
     } catch (err: any) {
       this.log.error('oauth exchange error', { provider: providerKey }, err)
-      this.sendError(res, 500, err?.message ?? 'token exchange failed')
+      // E5 — err.message 可能携带上游 URL/响应片段,只回受控文案(原文已进上行日志)。
+      this.sendError(res, 500, 'OAuth 令牌交换失败，请稍后重试')
     }
   }
 
@@ -13734,7 +13857,15 @@ export class Gateway {
           )
           reply({ ...prepared, status: 'completed' })
         } catch (err) {
-          const code = err instanceof Error ? err.message : 'MODEL_SWITCH_PREPARE_FAILED'
+          // E5 — err.message 只在形如受控大写码时才作为 errorCode 下发;任意
+          // 运行时错误文本(可能含路径/栈)收敛为固定码,原文进日志。
+          const rawCode = err instanceof Error ? err.message : ''
+          const code = /^[A-Z][A-Z0-9_]{2,64}$/.test(rawCode)
+            ? rawCode
+            : 'MODEL_SWITCH_PREPARE_FAILED'
+          if (code === 'MODEL_SWITCH_PREPARE_FAILED') {
+            this.log.error('model switch prepare failed', { sessionKey }, err as Error)
+          }
           reply({
             sourceModel: session.model ?? session.runner.model ?? '',
             status: 'failed',
@@ -13791,13 +13922,16 @@ export class Gateway {
             },
           )
         } catch (err: any) {
-          ws.send(JSON.stringify({ type: 'error', error: `compact failed: ${err?.message}` }))
+          // E5 — 原文进日志,ws 控制面错误帧只发受控文案。
+          this.log.error('compact session failed', { sessionKey }, err)
+          ws.send(JSON.stringify({ type: 'error', error: '上下文压缩失败，请稍后重试' }))
         }
       }
       } catch (err: any) {
         this.log.error('ws-message unhandled error', undefined, err)
         try {
-          ws.send(JSON.stringify({ type: 'error', error: `internal error: ${err?.message}` }))
+          // E5 — 同上:err.message 可能含内部路径/栈,只回受控文案。
+          ws.send(JSON.stringify({ type: 'error', error: '服务内部错误，请稍后重试' }))
         } catch { /* ws may already be closed */ }
       }
     })
@@ -16224,7 +16358,12 @@ export class Gateway {
     // getOrCreate(spawn)与 submit(路由字段)**同源** —— 不允许 spawn 用 A、路由用 B。
     const turnExecutionModel: string | undefined = localExec?.canonicalModel ?? safeModel
 
-    const chatWorkspace = await resolveChatRunWorkspace({ sessionId: frame.peer.id })
+    const cronRaw = (frame as unknown as { _cronBoardProjectId?: unknown })._cronBoardProjectId
+    const cronBoardOverride = typeof cronRaw === 'string' ? cronRaw : undefined
+    const chatWorkspace = await resolveChatRunWorkspace({
+      sessionId: frame.peer.id,
+      ...(cronBoardOverride ? { boardProjectId: cronBoardOverride } : {}),
+    })
     const webchatRunContext = createRunContextDescriptor({
       runId: `webchat:${frame.peer.id}`,
       boardProjectId: chatWorkspace.projectId,
@@ -16842,12 +16981,18 @@ export class Gateway {
               : rejectionMessage
                 ?? 'Image 2 服务暂时不可用，请稍后重试。'
           externalQueueTerminalText = `[error] ${message}`
+          // E4.3/E5 — detail 不再携带上游原始错误串(只留 traceId);原文进日志。
+          this.log.warn('image job failed (raw detail logged here only)', {
+            sessionKey: out.sessionKey,
+            error: err instanceof Error ? err.message : String(err),
+            ...(out.traceId ? { traceId: out.traceId } : {}),
+          })
           const errorFrame: OutboundError & { _userId?: string } = {
             type: 'outbound.error',
             ..._inheritOutboundRouting(out),
             code: insufficient ? 'insufficient_credits' : rateLimited ? 'rate_limited' : 'upstream_failed',
             message,
-            detail: err instanceof Error ? err.message : String(err),
+            ...(out.traceId ? { detail: out.traceId } : {}),
             isFinal: false,
           }
           this.deliver(errorFrame, adapter)
@@ -17471,8 +17616,20 @@ export class Gateway {
         // that raw bubble and keep the technical string folded in `detail`.
         const errFrame = _buildEngineErrorFrame(_inheritOutboundRouting(out), e)
         this.deliver(errFrame, liveWechatAdapter ? undefined : adapter)
+        // E2 — 兼容 [error] 气泡只携带分类后的受控中文文案(errFrame.message)。
+        // 上游原始错误原文(可能含 API JSON、路径)不再直达微信/Telegram 等渠道
+        // 用户,只进结构化日志(下)与 _runLog(上方 complete 已记 e.error)。
+        // "[error] " 前缀保留:新前端按 _suppressErrorBubbleAtSeq + 该前缀抑制
+        // 双帧重复气泡,旧客户端靠它识别终止器。
+        this.log.warn('turn terminal error (raw detail logged here only)', {
+          sessionKey: out.sessionKey,
+          code: errFrame.code,
+          error: e.error,
+          ...(out.traceId ? { traceId: out.traceId } : {}),
+        })
+        const compatErrorText = `[error] ${errFrame.message}`
         if (liveWechatAdapter) {
-          const errBlocks = [{ kind: 'text', text: `[error] ${e.error}` } as any]
+          const errBlocks = [{ kind: 'text', text: compatErrorText } as any]
           this.deliver(
             {
               ...out,
@@ -17490,7 +17647,7 @@ export class Gateway {
           this.deliver(
             {
               ...out,
-              blocks: [{ kind: 'text', text: `[error] ${e.error}` }],
+              blocks: [{ kind: 'text', text: compatErrorText }],
               isFinal: true,
             },
             adapter,
@@ -18127,12 +18284,44 @@ export function _inheritOutboundRouting(
   }
 }
 
-/** Build the exact structured error wire frame used by dispatchInbound. */
+/** gateway 权威预分类码(非 errorClassify 产物)的受控中文文案。errorClassify 的
+ *  PATTERNS 只覆盖 provider 原文可识别的码;这些码由编排层(handleExit / tape
+ *  终态 / 持久化降级)直接盖章,文案在此单点维护(全角标点,与前端风格对齐)。 */
+const GATEWAY_TERMINAL_CODE_MESSAGES: Record<
+  Exclude<GatewayTerminalErrorCode, 'user_cancelled'>,
+  string
+> = {
+  runner_crashed: '执行环境意外中断，你的消息已保留，请直接重试本条消息',
+  service_restart: '服务正在更新，本轮已中断，请直接重试本条消息',
+  engine_error: '任务执行遇到内部错误，请直接重试本条消息',
+  auth_error: '模型服务认证失败，请重新登录或检查凭据后重试',
+  session_persist_unavailable: '回复已生成，但会话存储暂时不可用，内容已安全排队待写入',
+}
+
+/** E4.3 — detail 收口:默认不下发原始 event.error。仅当该码在 taxonomy 中
+ *  allowPublicServerMessage 且文本过 isDisplayableServerMessage 守卫时携带
+ *  服务端说明;否则只带 traceId(若有)供用户反馈时关联日志。原文只进日志。 */
+function _safeErrorFrameDetail(
+  code: string,
+  rawError: string,
+  traceId: string | undefined,
+): string | undefined {
+  if (turnErrorSemantics(code).allowPublicServerMessage === true && isDisplayableServerMessage(rawError)) {
+    return rawError
+  }
+  return traceId || undefined
+}
+
+/** Build the exact structured error wire frame used by dispatchInbound.
+ *  参数形状为 GatewayEngineErrorEvent(engine 原生 error 事件 ⊆ 该形状):
+ *  sessionManager 经 _asEngineErrorEvent 发射的 gateway 权威终态码在此恢复精度。 */
 export function _buildEngineErrorFrame(
   routing: ReturnType<typeof _inheritOutboundRouting>,
-  event: Extract<SessionStreamEvent, { kind: 'error' }>,
+  event: GatewayEngineErrorEvent,
 ): OutboundError & { _userId?: string } {
   if (event.errorCode === 'user_cancelled') {
+    // event.error 是 gateway 自产的受控停止文案(「本轮已由用户停止。」),不是
+    // 上游原文;detail 保留原值 —— 旧前端 rolling 兼容窗口按该 detail 反推取消。
     return {
       type: 'outbound.error',
       ...routing,
@@ -18142,19 +18331,35 @@ export function _buildEngineErrorFrame(
       isFinal: false,
     }
   }
+  // gateway 权威终态码(handleExit 分类的 runner_crashed/service_restart、tape
+  // AUTH_ERROR、持久化降级 session_persist_unavailable)直接透传,不再被下面的
+  // 原文正则分类压成 upstream_failed(E4.2)。
+  if (event.errorCode) {
+    const detail = _safeErrorFrameDetail(event.errorCode, event.error, routing.traceId)
+    return {
+      type: 'outbound.error',
+      ...routing,
+      code: event.errorCode,
+      message: GATEWAY_TERMINAL_CODE_MESSAGES[event.errorCode],
+      ...(detail !== undefined ? { detail } : {}),
+      isFinal: false,
+    }
+  }
   const preClass = event.errorClass
   const classified =
     preClass && preClass !== 'unknown'
       ? { code: preClass, message: classifiedMessageForCode(preClass) }
       : classifyRunError(event.error)
+  const code = classified.code === 'unknown' ? 'upstream_failed' : classified.code
+  const detail = _safeErrorFrameDetail(code, event.error, routing.traceId)
   return {
     type: 'outbound.error',
     ...routing,
-    code: classified.code === 'unknown' ? 'upstream_failed' : classified.code,
+    code,
     message: classified.code === 'unknown'
       ? '任务执行暂时中断，请直接重试本条消息'
       : classified.message,
-    detail: event.error,
+    ...(detail !== undefined ? { detail } : {}),
     isFinal: false,
   }
 }

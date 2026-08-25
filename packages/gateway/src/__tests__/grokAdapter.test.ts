@@ -680,6 +680,92 @@ setInterval(() => {}, 1000)
   }
 })
 
+// ── P0-2:图片等 base64 二进制 block 绝不 stringify 进纯文本 prompt ──
+test('promptText replaces image blocks with a placeholder and never leaks base64', () => {
+  const base64 = 'aVZCT1J3MEtHZ29BQUFBTlNVaEVVZw=='.repeat(64)
+  const prompt = _internals.promptText([
+    { type: 'text', text: 'describe this image' },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } },
+    { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
+    { type: 'tool_result', content: 'structured-passthrough' },
+  ])
+  assert.ok(prompt.includes('describe this image'))
+  assert.ok(prompt.includes('图片附件已省略'), '占位提示必须出现在 prompt 里')
+  assert.ok(!prompt.includes(base64.slice(0, 48)), 'base64 数据绝不进 prompt')
+  assert.ok(prompt.includes('structured-passthrough'), '非二进制结构化 block 维持 stringify')
+})
+
+// ── P0-2 全链路:占位进 prompt + 用户可见提示先于模型输出 ──
+test('omits image blocks from the spawned prompt and surfaces a visible user notice', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-image-'))
+  const fake = path.join(dir, 'fake-grok.cjs')
+  const capture = path.join(dir, 'capture.json')
+  await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const argv = process.argv.slice(2)
+const promptFile = argv[argv.indexOf('--prompt-file') + 1]
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ prompt: fs.readFileSync(promptFile, 'utf8') }))
+console.log(JSON.stringify({ type: 'text', data: 'model reply' }))
+console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 } }))
+`)
+  await chmod(fake, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  const previousCapture = process.env.FAKE_GROK_CAPTURE
+  process.env.OC_GROK_CLI_BIN = fake
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  process.env.FAKE_GROK_CAPTURE = capture
+  try {
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    adapter.on('error', () => {})
+    const events: EngineEvent[] = []
+    const base64 = 'aVZCT1J3MEtHZ29BQUFBTlNVaEVVZw=='.repeat(64)
+    const run = adapter.submitTurn({
+      input: [
+        { type: 'text', text: 'describe this image' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } },
+      ],
+      requestId: REQUEST_ID,
+      turnKey: TURN_KEY,
+      assistantMessageId: 'asst-img',
+      onEvent: (event) => events.push(event),
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run.submitted
+    const summary = await run.summary
+    await adapter.waitForOutputDrain()
+
+    const captured = JSON.parse(await readFile(capture, 'utf8')) as { prompt: string }
+    assert.ok(!captured.prompt.includes(base64.slice(0, 48)), 'base64 数据绝不进 prompt')
+    assert.ok(captured.prompt.includes('图片附件已省略'), 'prompt 含占位提示')
+    assert.ok(captured.prompt.includes('describe this image'))
+
+    const textBlocks = events.filter(
+      (event) => event.kind === 'block' && event.block.kind === 'text',
+    )
+    assert.ok(textBlocks.length >= 2, '提示 block + 模型输出 block')
+    const first = textBlocks[0]!
+    assert.ok(first.kind === 'block' && first.block.kind === 'text')
+    assert.ok(first.block.text.includes('图片附件已省略'), '用户可见提示先于模型输出')
+    assert.equal(first.block.messageId, 'asst-img-s0')
+
+    assert.ok(summary)
+    assert.ok(summary.assistantText.includes('图片附件已省略'), '提示进入持久化 assistantText')
+    assert.ok(summary.assistantText.includes('model reply'))
+    assert.equal(summary.assistantSegments.length, 2, '提示独占 s0,模型输出另起 s1')
+  } finally {
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
+    restoreEnv('FAKE_GROK_CAPTURE', previousCapture)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('reads the cleaned native Grok summary carrier from the new checkpoint', async () => {
   const root = await mkdtemp(join(tmpdir(), 'grok-handoff-'))
   const sessionId = '11111111-1111-4111-8111-111111111111'

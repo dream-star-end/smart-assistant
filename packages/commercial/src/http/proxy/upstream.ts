@@ -584,6 +584,88 @@ function makeStaticKeyUpstream(
   };
 }
 
+// ─── 反封复盘 2026-08 — 账号时区一致化 ──────────────────────────────────────
+//
+// CCB 会把本地日历日期以 `Today's date is YYYY-MM-DD`(跨日再来一句
+// `... is now YYYY-MM-DD`)注入到发往 /v1/messages 的 <system-reminder> 里,按
+// CCB 进程 TZ(selfhost 默认 Asia/Tokyo)算。这与账号 persona 的 accept_language /
+// 出口住宅 IP 地域不一致(如 en-US + 美国 IP 却报东京日期),是跨区指纹。
+//
+// 时区是容器进程级(spawn 时定)、账号是每请求选的,所以唯一能按账号对齐的地方
+// 是转发层:用账号 persona.timezone 重算本地日期,改写 reminder 里的日期串。
+// 只在 <system-reminder> 且含 "Today's date is" 的文本里替换,避免误改用户正文。
+
+const REMINDER_DATE_RE = /(Today's date is (?:now )?)\d{4}-\d{2}-\d{2}/g;
+
+/** 给定 IANA 时区,返回该时区的本地 YYYY-MM-DD。en-CA locale 天然输出 ISO 日期。 */
+export function formatIsoDateInTimezone(tz: string, now: Date = new Date()): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+}
+
+function rewriteReminderText(text: string, isoDate: string): string {
+  // 双重护栏:必须同时命中 <system-reminder> 与日期串,才动手 —— 绝不碰用户正文里
+  // 恰好写了 "Today's date is 2020-01-01" 的情况。
+  if (!text.includes("<system-reminder>") || !text.includes("Today's date is")) {
+    return text;
+  }
+  return text.replace(REMINDER_DATE_RE, `$1${isoDate}`);
+}
+
+/**
+ * 把 messages 里 <system-reminder> 内的本地日期改写为 isoDate。copy-on-write:
+ * 无改动则原样返回入参引用(不破坏 caller 的 body,也不制造多余分配)。
+ */
+export function rewriteReminderDatesInMessages(
+  messages: unknown[],
+  isoDate: string,
+): unknown[] {
+  let changed = false;
+  const out = messages.map((msg) => {
+    if (msg === null || typeof msg !== "object") return msg;
+    const m = msg as { content?: unknown };
+    const content = m.content;
+    if (typeof content === "string") {
+      const nc = rewriteReminderText(content, isoDate);
+      if (nc !== content) {
+        changed = true;
+        return { ...m, content: nc };
+      }
+      return msg;
+    }
+    if (Array.isArray(content)) {
+      let blockChanged = false;
+      const nb = content.map((block) => {
+        if (
+          block !== null &&
+          typeof block === "object" &&
+          (block as { type?: unknown }).type === "text" &&
+          typeof (block as { text?: unknown }).text === "string"
+        ) {
+          const b = block as { text: string };
+          const nt = rewriteReminderText(b.text, isoDate);
+          if (nt !== b.text) {
+            blockChanged = true;
+            return { ...b, text: nt };
+          }
+        }
+        return block;
+      });
+      if (blockChanged) {
+        changed = true;
+        return { ...m, content: nb };
+      }
+      return msg;
+    }
+    return msg;
+  });
+  return changed ? out : messages;
+}
+
 function makeOAuthPoolUpstream(
   pick: PickResult,
   dispatcher: Dispatcher | undefined,
@@ -711,7 +793,12 @@ function makeOAuthPoolUpstream(
           redactedThinking: r.redactedThinkingStripped,
         });
       }
-      return r.messages;
+      // 反封复盘 2026-08 — 按账号 persona 时区改写 reminder 里的本地日期。
+      // persona 缺 timezone(理论不可达:0074 后合法账号恒有;此处 fail-open 跳过
+      // 而非 throw —— 日期没归一化只是退回旧行为,不是安全泄漏)。
+      const tz = pick.persona?.timezone;
+      if (!tz) return r.messages;
+      return rewriteReminderDatesInMessages(r.messages, formatIsoDateInTimezone(tz));
     },
     zeroizeSecrets() {
       if (zeroized) return;

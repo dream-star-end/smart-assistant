@@ -16,6 +16,7 @@
  */
 
 import { query } from "../db/queries.js";
+import { parseBoardProjectIdAttr, pgUsageBoardProjectSql } from "./boardProjectAttribution.js";
 import {
   WINDOW_SPEC,
   trendBuckets,
@@ -94,11 +95,27 @@ const EMPTY_SUMMARY: UserUsageSummary = {
  * 窗口边界 `created_at >= NOW() - ($2::int * INTERVAL '1 hour')` 完全参数化($2=回看小时数),
  * 趋势段的窗口/桶边界则内聚在 trendBuckets 里(points 桶 + 桶下界),与 org 版逐字一致。
  */
+function usageBoardExtraWhere(boardProjectId: string | null | undefined): string {
+  if (boardProjectId === undefined) return "status = 'success'";
+  if (boardProjectId === null || boardProjectId === "none") {
+    return "status = 'success' AND board_project_id IS NULL";
+  }
+  const id = parseBoardProjectIdAttr(boardProjectId);
+  if (!id) return "status = 'success' AND FALSE";
+  return `status = 'success' AND board_project_id = '${id}'`;
+}
+
 export async function getUserUsageReport(
   userId: string,
   window: UsageWindow,
+  boardProjectId?: string | null,
 ): Promise<UserUsageReport> {
   const spec = WINDOW_SPEC[window];
+  const board = pgUsageBoardProjectSql(boardProjectId, 3);
+  const usageWhere =
+    `WHERE user_id = $1 AND status = 'success'
+          AND created_at >= NOW() - ($2::int * INTERVAL '1 hour')${board.sql}`;
+  const usageParams = [userId, spec.hours, ...board.params];
 
   const [summaryRes, modelsRes, trend, ledgerTrend, ledgerReasonRes] = await Promise.all([
     // ── summary(与 handleGetMyUsage summary 同口径 + 窗口)────────────────
@@ -110,9 +127,8 @@ export async function getUserUsageReport(
               COALESCE(SUM(cache_write_tokens), 0)::text  AS cache_write_tokens,
               COALESCE(SUM(cost_credits), 0)::text        AS credits
          FROM usage_records
-        WHERE user_id = $1 AND status = 'success'
-          AND created_at >= NOW() - ($2::int * INTERVAL '1 hour')`,
-      [userId, spec.hours],
+        ${usageWhere}`,
+      usageParams,
     ),
     // ── 按模型 ─────────────────────────────────────────────────────────
     query<UserModelUsage>(
@@ -124,11 +140,10 @@ export async function getUserUsageReport(
               COALESCE(SUM(cache_read_tokens), 0)::text   AS cache_read_tokens,
               COALESCE(SUM(cache_write_tokens), 0)::text  AS cache_write_tokens
          FROM usage_records
-        WHERE user_id = $1 AND status = 'success'
-          AND created_at >= NOW() - ($2::int * INTERVAL '1 hour')
+        ${usageWhere}
         GROUP BY model
         ORDER BY SUM(cost_credits) DESC, model ASC`,
-      [userId, spec.hours],
+      usageParams,
     ),
     // ── 用量趋势(补零,桶语义同 org)────────────────────────────────────
     trendBuckets<UserUsageTrendPoint>({
@@ -136,7 +151,7 @@ export async function getUserUsageReport(
       points: spec.points,
       from: "usage_records",
       scopeWhere: "user_id = $1::bigint",
-      extraWhere: "status = 'success'",
+      extraWhere: usageBoardExtraWhere(boardProjectId),
       scopeValue: userId,
       metrics: [
         { name: "requests", expr: "COUNT(*)" },

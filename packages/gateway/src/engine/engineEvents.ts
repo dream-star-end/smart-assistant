@@ -201,8 +201,18 @@ export type EngineContentEvent =
       kind: 'error'
       error: string
       errorClass?: ClassifiedErrorCode
-      /** Gateway-owned expected terminal code; never inferred from provider text. */
-      errorCode?: 'user_cancelled'
+      /** Gateway-owned expected terminal code; never inferred from provider text.
+       *  联合取值与 ccbMessageParser.GatewayTerminalErrorCode 逐字面量对齐(此处
+       *  内联而非 import:engine/ 权威源不反向依赖 gateway 编排层模块)。engine
+       *  原生只发 'user_cancelled';其余码由编排层(handleExit / tape 终态 /
+       *  持久化降级)盖章后经同一事件通道下发。 */
+      errorCode?:
+        | 'user_cancelled'
+        | 'runner_crashed'
+        | 'service_restart'
+        | 'engine_error'
+        | 'auth_error'
+        | 'session_persist_unavailable'
     }
   | { kind: 'permission_request'; request: PermissionRequest }
   // 当前 turn 的 backend-side 非流式阶段状态。CCB 由 stdout

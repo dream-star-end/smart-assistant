@@ -56,6 +56,7 @@ export function useTaskboard(
   auth: AuthSession | null,
   enabled: boolean,
   ticketTypeFromUrl?: TicketType | null,
+  lockedProjectId?: string | null,
 ) {
   const toast = useToast()
   const [projects, setProjects] = useState<Project[] | null>(null)
@@ -238,33 +239,45 @@ export function useTaskboard(
     setLoading(true)
     setError(null)
     try {
-      const [freshProjects, freshList, freshAgents] = await Promise.all([
+      const [freshProjects, freshAgents] = await Promise.all([
         taskboardApi.listProjects(a),
-        taskboardApi.listTickets(a, { status: ACTIVE_LIST_STATUSES, limit: 200 }),
         taskboardApi.listAgents(a).catch(() => [] as BoardAgent[]),
       ])
       if (!mounted.current) return
       epoch.current += 1
       setProjects(freshProjects)
-      setTickets(freshList.items)
       setAgents(freshAgents)
-      const first = pickInitialProject(freshProjects, readLastProjectId())
-      if (first) {
-        setProjectId(first.id)
-        writeLastProjectId(first.id)
-        try {
-          const [snap, backlog] = await Promise.all([
-            taskboardApi.getProjectBoard(a, first.id, boardQueryType()),
-            fetchBacklog(a, first.id).catch(() => [] as Ticket[]),
-          ])
-          if (mounted.current) {
-            applyBoardSnap(snap)
-            setBacklogTickets(backlog)
-          }
-        } catch (e) {
-          if (!(e instanceof AuthEpochStaleError) && mounted.current) {
-            setBoard(null)
-          }
+      const first = lockedProjectId
+        ? freshProjects.find((p) => p.id === lockedProjectId) ?? null
+        : null
+      if (!first) {
+        setTickets([])
+        setProjectId(null)
+        setBoard(null)
+        return
+      }
+      setProjectId(first.id)
+      writeLastProjectId(first.id)
+      try {
+        const queryType = boardQueryType()
+        const [snap, backlog, freshList] = await Promise.all([
+          taskboardApi.getProjectBoard(a, first.id, queryType),
+          fetchBacklog(a, first.id).catch(() => [] as Ticket[]),
+          taskboardApi.listTickets(a, {
+            status: ACTIVE_LIST_STATUSES,
+            limit: 200,
+            projectId: first.id,
+          }),
+        ])
+        if (mounted.current) {
+          setTickets(freshList.items)
+          applyBoardSnap(snap)
+          setBacklogTickets(backlog)
+        }
+      } catch (e) {
+        if (!(e instanceof AuthEpochStaleError) && mounted.current) {
+          setBoard(null)
+          setTickets([])
         }
       }
     } catch (e) {
@@ -273,7 +286,7 @@ export function useTaskboard(
     } finally {
       if (mounted.current) setLoading(false)
     }
-  }, [applyBoardSnap, boardQueryType, fetchBacklog])
+  }, [applyBoardSnap, boardQueryType, fetchBacklog, lockedProjectId])
 
   useEffect(() => {
     if (!enabled || !auth) {
@@ -305,6 +318,7 @@ export function useTaskboard(
     async (id: string, type?: TicketType | '') => {
       setProjectId(id)
       projectIdRef.current = id
+      if (!id) return
       writeLastProjectId(id)
       if (type !== undefined) {
         setTicketType(type)

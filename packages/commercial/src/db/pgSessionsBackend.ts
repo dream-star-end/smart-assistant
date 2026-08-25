@@ -10935,6 +10935,24 @@ export function createPgSessionsBackend(
       const archiveSql = includeArchived ? "" : " AND cs.archived_at IS NULL";
       const candMax = SESSION_SEARCH_JSON_CANDIDATE_MAX;
       const expandMax = SESSION_SEARCH_JSON_EXPAND_MAX_BYTES;
+      const projectSql =
+        opts.projectId === undefined
+          ? ""
+          : opts.projectId === null
+            ? " AND cs.project_id IS NULL"
+            : " AND cs.project_id = $6";
+      const titleProjectSql =
+        opts.projectId === undefined
+          ? ""
+          : opts.projectId === null
+            ? " AND cs.project_id IS NULL"
+            : " AND cs.project_id = $3";
+      const titleParams: unknown[] =
+        typeof opts.projectId === "string" ? [userId, like, opts.projectId] : [userId, like];
+      const msgParams: unknown[] =
+        typeof opts.projectId === "string"
+          ? [userId, like, candMax, expandMax, q, opts.projectId]
+          : [userId, like, candMax, expandMax, q];
       const titleRows = (
         await pool.query<{
           id: string;
@@ -10944,9 +10962,9 @@ export function createPgSessionsBackend(
         }>(
           `SELECT id, title, project_id, last_at
              FROM client_sessions cs
-            WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}
+            WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}${titleProjectSql}
               AND cs.title ILIKE $2 ESCAPE '\\'`,
-          [userId, like],
+          titleParams,
         )
       ).rows;
       // 正文在 client_sessions.messages(TEXT JSON) 与 spill 的
@@ -10965,7 +10983,7 @@ export function createPgSessionsBackend(
              SELECT cs.id, cs.title, cs.project_id, cs.last_at, cs.messages,
                     octet_length(cs.messages) AS msg_bytes
                FROM client_sessions cs
-              WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}
+              WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}${projectSql}
                 AND cs.messages ILIKE $2 ESCAPE '\\'
               ORDER BY cs.last_at DESC
               LIMIT $3
@@ -10989,7 +11007,7 @@ export function createPgSessionsBackend(
              FROM text_hits c
             WHERE c.msg_bytes > $4
                OR position((chr(92) || 'u0000') in c.messages) > 0`,
-          [userId, like, candMax, expandMax, q],
+          msgParams,
         )
       ).rows;
       const chunkRows = (
@@ -11005,7 +11023,7 @@ export function createPgSessionsBackend(
                     octet_length(ch.messages) AS msg_bytes
                FROM client_session_archive_chunks ch
                JOIN client_sessions cs ON cs.id = ch.session_id AND cs.user_id = ch.user_id
-              WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}
+              WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}${projectSql}
                 AND ch.messages ILIKE $2 ESCAPE '\\'
               ORDER BY cs.last_at DESC
               LIMIT $3
@@ -11029,7 +11047,7 @@ export function createPgSessionsBackend(
              FROM text_hits c
             WHERE c.msg_bytes > $4
                OR position((chr(92) || 'u0000') in c.messages) > 0`,
-          [userId, like, candMax, expandMax, q],
+          msgParams,
         )
       ).rows;
       const hits = [
@@ -11076,8 +11094,38 @@ export function createPgSessionsBackend(
       const parsed = parseSessionBatchInput(input);
       if ("ok" in parsed) return parsed;
       const { ids, action } = parsed;
-      if (ids.length === 0) return { ok: true, updated: 0, skipped: 0 };
+      if (ids.length === 0) return { ok: true, updated: 0, skipped: 0, operationId: parsed.operationId };
       return withTx(pool, async (client): Promise<BatchClientSessionsResult> => {
+        if (parsed.expectedSessions && parsed.expectedSessions.length > 0) {
+          const staleIds: string[] = [];
+          const liveRows = (
+            await client.query<{
+              id: string;
+              project_id: string | null;
+              updated_at: string;
+              deleted_at: string | null;
+            }>(
+              `SELECT id, project_id, updated_at, deleted_at
+                 FROM client_sessions
+                WHERE user_id = $1 AND id = ANY($2::text[])`,
+              [userId, parsed.expectedSessions.map((r) => r.id)],
+            )
+          ).rows;
+          const liveMap = new Map(liveRows.map((r) => [r.id, r]));
+          for (const exp of parsed.expectedSessions) {
+            const live = liveMap.get(exp.id);
+            const liveUpdated = live ? Number(live.updated_at) : NaN;
+            if (
+              !live ||
+              live.deleted_at ||
+              liveUpdated !== exp.updatedAt ||
+              (live.project_id ?? null) !== (exp.projectId ?? null)
+            ) {
+              staleIds.push(exp.id);
+            }
+          }
+          if (staleIds.length) return { ok: false, error: "stale_session", staleIds };
+        }
         if (action === "move" && parsed.projectId) {
           const owned = (
             await client.query(
@@ -11138,18 +11186,62 @@ export function createPgSessionsBackend(
             [userId, targetIds],
           );
           updated = res.rowCount ?? 0;
+        } else if (parsed.expectedSessions && parsed.expectedSessions.length > 0) {
+          if (parsed.expectedSessions.length !== ids.length) {
+            throw Object.assign(new Error("stale_session"), { staleIds: ids, code: "stale_session" });
+          }
+          const post: Array<{ id: string; projectId: string | null; updatedAt: number }> = [];
+          for (const exp of parsed.expectedSessions) {
+            const res = await client.query<{
+              id: string;
+              project_id: string | null;
+              updated_at: string;
+            }>(
+              `UPDATE client_sessions
+                  SET project_id = $1,
+                      updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                WHERE id = $2 AND user_id = $3
+                  AND deleted_at IS NULL AND archived_at IS NULL
+                  AND updated_at = $4
+                  AND project_id IS NOT DISTINCT FROM $5
+              RETURNING id, project_id, updated_at`,
+              [parsed.projectId ?? null, exp.id, userId, exp.updatedAt, exp.projectId],
+            );
+            if ((res.rowCount ?? 0) !== 1) {
+              throw Object.assign(new Error("stale_session"), {
+                staleIds: [exp.id],
+                code: "stale_session",
+              });
+            }
+            const row = res.rows[0]!;
+            post.push({
+              id: row.id,
+              projectId: row.project_id,
+              updatedAt: Number(row.updated_at),
+            });
+          }
+          if (post.length !== parsed.expectedSessions.length) {
+            throw Object.assign(new Error("stale_session"), { staleIds: ids, code: "stale_session" });
+          }
+          return { ok: true, updated: post.length, skipped, operationId: parsed.operationId, post };
         } else {
           const res = await client.query(
             `UPDATE client_sessions
                 SET project_id = $1,
                     updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
-              WHERE user_id = $2 AND deleted_at IS NULL
+              WHERE user_id = $2 AND deleted_at IS NULL AND archived_at IS NULL
                 AND id = ANY($3::text[])`,
             [parsed.projectId ?? null, userId, targetIds],
           );
           updated = res.rowCount ?? 0;
         }
-        return { ok: true, updated, skipped };
+        return { ok: true, updated, skipped, operationId: parsed.operationId };
+      }).catch((err: unknown) => {
+        const e = err as { code?: string; staleIds?: string[] };
+        if (e.code === "stale_session") {
+          return { ok: false as const, error: "stale_session" as const, staleIds: e.staleIds };
+        }
+        throw err;
       });
     },
 
@@ -11365,7 +11457,7 @@ export function createPgSessionsBackend(
           parsed.value.digest,
           parsed.value.containerPath,
         );
-        if (dup) return { ok: true, asset: dup };
+        if (dup) return { ok: true, asset: dup, created: false };
         // 同一 (user_id, project_id) 桶的 count+INSERT 必须串行:默认 READ COMMITTED
         // 下无行锁,并发事务都会读到 count<500 再各自写入 → 上限被突破。
         // pg_advisory_xact_lock 随 COMMIT/ROLLBACK 自动释放;不用会话级
@@ -11406,7 +11498,7 @@ export function createPgSessionsBackend(
         );
         const asset = await readPgProjectAsset(client, userId, id);
         if (!asset) throw new Error("project asset insert vanished");
-        return { ok: true, asset };
+        return { ok: true, asset, created: true };
       });
     },
 

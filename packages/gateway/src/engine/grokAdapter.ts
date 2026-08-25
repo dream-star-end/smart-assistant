@@ -3,6 +3,7 @@
  * in headless streaming-json mode; subscription credentials never enter the
  * user container. Instead the master supplies an opaque, one-turn relay token.
  */
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable } from 'node:stream'
@@ -30,6 +31,7 @@ import type {
 } from './engineEvents.js'
 import { engineSessionId } from './engineSessionId.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
+import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { buildCodexEnv } from './codexShared.js'
 import { createLogger } from '../logger.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
@@ -174,6 +176,8 @@ function promptText(input: TurnParams['input']): string {
   return input
     .map((block) => {
       if (block.type === 'text' && typeof block.text === 'string') return block.text
+      // P0-2:base64 二进制 block 绝不 stringify 进纯文本 prompt,占位替换。
+      if (isBinaryInputBlock(block)) return BINARY_BLOCK_OMITTED_NOTICE
       return asText(block)
     })
     .filter(Boolean)
@@ -281,6 +285,12 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     resumeKind: 'grok-session',
     needsServerRequestId: true,
     historyMode: 'native-resume',
+    // grok-build 以 --always-approve 驱动:用户 permissionMode 不会到达底座。
+    permissionModel: 'forced-unattended',
+    emitsCallUsage: false,
+    emitsToolInputDeltas: false,
+    supportsNativeCompact: true,
+    multimodalInput: 'text-only',
   }
 
   private readonly opts: EngineCreateOpts
@@ -305,6 +315,14 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     this.currentModel = opts.model
     this.currentEffort = opts.effortLevel
     this.currentToolsets = opts.agentToolsets
+    // forced-unattended:CLI 恒以 --always-approve 驱动,非 bypass 的
+    // permissionMode 无法生效。只记日志,不向前端注入提示(用户明确选择全放行)。
+    if (opts.permissionMode && opts.permissionMode !== 'bypassPermissions') {
+      log.warn('grok engine is forced-unattended; requested permissionMode is ignored', {
+        sessionKey: opts.sessionKey,
+        permissionMode: opts.permissionMode,
+      })
+    }
   }
 
   start(): Promise<void> {
@@ -389,6 +407,8 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     ) {
       throw new Error('GROK_ROUTE_INVALID: relay must be token-bound loopback')
     }
+
+    this.emitOmittedBinaryNotice(ctx)
 
     let repoSnapshot = null
     if (this.opts.sessionId && this.opts.getRepoSnapshot) {
@@ -543,6 +563,36 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     })
   }
 
+  /** P0-2:输入含图片等二进制 block 时,除 prompt 占位替换外,再向用户发一条
+   *  可见 assistant 提示(走常规 segment 机制,live 流与持久化 tape 一致)。 */
+  private emitOmittedBinaryNotice(ctx: GrokTurnContext): void {
+    const omitted = countBinaryInputBlocks(ctx.params.input)
+    if (omitted === 0) return
+    log.warn('binary input blocks omitted from text-only grok prompt', {
+      sessionKey: this.opts.sessionKey,
+      omitted,
+    })
+    const text = `${BINARY_BLOCK_OMITTED_NOTICE}\n\n`
+    const segment: SegmentRecord = {
+      index: ctx.assistantSegments.length,
+      text,
+      ts: Date.now(),
+      eventOrdinal: ctx.params.nextDurableEventOrdinal?.(),
+    }
+    ctx.assistantSegments.push(segment)
+    ctx.assistantText += text
+    // lastContentKind 保持不变(null):模型首段 text 仍会新开自己的 segment。
+    const messageIdBase = ctx.params.assistantMessageId
+    ctx.params.onEvent({
+      kind: 'block',
+      block: {
+        kind: 'text',
+        text,
+        ...(messageIdBase ? { messageId: `${messageIdBase}-s${segment.index}` } : {}),
+      },
+    })
+  }
+
   private async composePrompt(
     params: TurnParams,
     repoSnapshot: ReturnType<NonNullable<EngineCreateOpts['getRepoSnapshot']>> | null,
@@ -576,6 +626,14 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         cwd: cwdDecision.cwd,
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
+      })
+      log.info('prompt_context_built', {
+        sessionKey: this.opts.sessionKey,
+        agentId: this.opts.agentId,
+        backend: 'grok',
+        prompt_bytes: Buffer.byteLength(platform.content || '', 'utf8'),
+        prompt_sha256: createHash('sha256').update(platform.content || '', 'utf8').digest('hex').slice(0, 12),
+        board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
       const body = platform.content ? `${platform.content}\n\n${input}` : input
       return `${GROK_PREAMBLE}\n${body}`
@@ -766,6 +824,11 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       ...(ctx.params.usageAttribution?.delegateAgentId ? { delegateAgentId: ctx.params.usageAttribution.delegateAgentId } : {}),
       engineSessionId: this.stableEngineSessionId,
       status,
+      // P1-11 审计:'CODEX_ERROR' 是刻意保留的字面量,不是笔误。engine-reported
+      // 计费帧的 terminalCode 联合类型由 protocol(losslessTurnTape.DurableCodexBilling
+      // / frames.ts billing schema)锁定为 'USER_CANCELLED' | 'CODEX_ERROR',且
+      // commercial userChatBridge 按字面量匹配、未知值会被强转回 'CODEX_ERROR'。
+      // 语义 = "engine 非用户取消的终态错误";引入 'GROK_ERROR' 需要先动 wire 契约。
       ...(status === 'error' ? { terminalCode: ctx.interrupted ? 'USER_CANCELLED' : 'CODEX_ERROR' } : {}),
       durationMs: Date.now() - ctx.startedAt,
       usage: {
@@ -990,6 +1053,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
 }
 
 export const _internals = {
+  promptText,
   PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS,
   PROCESS_KEEPALIVE_INTERVAL_MIN_MS,
   PROCESS_KEEPALIVE_INTERVAL_MAX_MS,

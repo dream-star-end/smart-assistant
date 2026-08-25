@@ -104,9 +104,9 @@ const LOSSLESS_TURN_TAPE_WIRE_MAX_BODY_BYTES = Math.ceil((LOSSLESS_TURN_TAPE_PAR
 
 /** Path the container's V3MasterSink POSTs to. Mounted on both the plain
  *  self-host listener and the mTLS remote-host listener. */
-export const SERVER_AUTHORED_PATH = "/internal/v3/server-authored-message";
+export { SERVER_AUTHORED_PATH } from "@openclaude/protocol";
 /** 容器 boot recovery 查 tape 三态(RFC §2.4 / §3):GET ?dispatchId=&attemptNo=。 */
-export const TURN_TAPE_STATE_PATH = "/internal/v3/turn-tape-state";
+export { TURN_TAPE_STATE_PATH } from "@openclaude/protocol";
 
 /** Per-tool field caps. Container-side `_capToolEntry` already enforces
  *  these by UTF-8 byte budget; the schema caps are slightly looser char

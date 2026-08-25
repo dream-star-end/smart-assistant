@@ -83,6 +83,21 @@ describe('ZcodeAdapter', () => {
     )
   })
 
+  // ── P0-2:图片等 base64 二进制 block 绝不 stringify 进纯文本 prompt ──
+  test('promptText replaces image blocks with a placeholder and never leaks base64', () => {
+    const base64 = 'aVZCT1J3MEtHZ29BQUFBTlNVaEVVZw=='.repeat(64)
+    const prompt = _internals.promptText([
+      { type: 'text', text: 'describe this image' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } },
+      { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
+      { type: 'tool_result', content: 'structured-passthrough' },
+    ])
+    assert.ok(prompt.includes('describe this image'))
+    assert.ok(prompt.includes('图片附件已省略'), '占位提示必须出现在 prompt 里')
+    assert.ok(!prompt.includes(base64.slice(0, 48)), 'base64 数据绝不进 prompt')
+    assert.ok(prompt.includes('structured-passthrough'), '非二进制结构化 block 维持 stringify')
+  })
+
   test('keeps the live 0.16.3 doctor/processName fixture experimental', () => {
     assert.equal(doctorFixture.cli.version, '0.16.3')
     assert.equal(doctorFixture.cli.processName, 'zcode-cli')

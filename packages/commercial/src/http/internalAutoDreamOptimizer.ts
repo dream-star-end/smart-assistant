@@ -7,11 +7,21 @@ import {
 } from '../auth/containerIdentity.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
-export const AUTO_DREAM_OPTIMIZER_ADMIT_PATH = '/internal/v3/auto-dream/admit'
-export const AUTO_DREAM_OPTIMIZER_SETTLE_PATH = '/internal/v3/auto-dream/settle'
-export const AUTO_DREAM_OPTIMIZER_ABANDON_PATH = '/internal/v3/auto-dream/abandon'
-export const AUTO_DREAM_OPTIMIZER_FINDINGS_PATH = '/internal/v3/auto-dream/findings'
-export const AUTO_DREAM_OPTIMIZER_ACTION_PATH = '/internal/v3/auto-dream/action'
+import {
+  AUTO_DREAM_OPTIMIZER_ADMIT_PATH,
+  AUTO_DREAM_OPTIMIZER_SETTLE_PATH,
+  AUTO_DREAM_OPTIMIZER_ABANDON_PATH,
+  AUTO_DREAM_OPTIMIZER_FINDINGS_PATH,
+  AUTO_DREAM_OPTIMIZER_ACTION_PATH,
+} from '@openclaude/protocol'
+
+export {
+  AUTO_DREAM_OPTIMIZER_ADMIT_PATH,
+  AUTO_DREAM_OPTIMIZER_SETTLE_PATH,
+  AUTO_DREAM_OPTIMIZER_ABANDON_PATH,
+  AUTO_DREAM_OPTIMIZER_FINDINGS_PATH,
+  AUTO_DREAM_OPTIMIZER_ACTION_PATH,
+}
 
 const PATHS = new Set([
   AUTO_DREAM_OPTIMIZER_ADMIT_PATH,

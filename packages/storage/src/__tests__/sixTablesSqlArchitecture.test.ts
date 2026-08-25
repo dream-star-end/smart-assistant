@@ -84,6 +84,11 @@ const WHITELIST = new Set<string>([
   // client_sessions 仅**只读 LEFT JOIN**(id+user_id 归属 + deleted_at 墓碑,判定"用户面已
   // 消失"的 open dispatch)——不写六表;dispatch 域的离场判定放 sessions backend 反而内聚更差。
   "packages/commercial/src/dispatch/turnDispatchStore.ts",
+  // Settle-time usage attribution snapshots chat_projects.board_project_id via a
+  // read-only JOIN of client_sessions on the same billing client/transaction.
+  // It does not write the six tables. Routing through sessions backend would
+  // open a second transaction and lose the settle-time bind snapshot.
+  "packages/commercial/src/billing/boardProjectAttribution.ts",
   // Orphan dispatch finalize owns one atomic PG transaction: lock dispatch + lock the
   // tenant session row + append a visible tapeless fallback + close the dispatch.
   // Splitting the session projection through a backend call would lose that fence.

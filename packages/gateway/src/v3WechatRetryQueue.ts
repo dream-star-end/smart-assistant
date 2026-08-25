@@ -1,6 +1,6 @@
 /**
- * Container-side durable retry queue for the v3 master `/internal/v3/wechat-
- * outbound` POST(P1.7 slice 7c)。
+ * Container-side durable retry queue for the v3 master
+ * `/internal/v3/wechat-outbound` POST(P1.7 slice 7c)。
  *
  * **复制 v3MasterRetryQueue 模式而非把它泛型化**:已经 Codex PASS 的代码不动,
  * 同形态拷贝一份(payload 不同、错误分类相同),互不污染。两份代码一起改的成本

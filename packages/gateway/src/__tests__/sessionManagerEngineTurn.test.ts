@@ -16,7 +16,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 
-import { SessionManager, type AgentSession } from "../sessionManager.js";
+import { SessionManager, TRANSIENT_RETRY_INPUT, type AgentSession } from "../sessionManager.js";
 import { CcbAdapter } from "../engine/ccbAdapter.js";
 import type { SessionStreamEvent, DurableRuntimeEvent } from "../engine/engineEvents.js";
 import type { EngineCreateOpts } from "../engine/registry.js";
@@ -681,9 +681,9 @@ describe("crash/interrupt partial persistence", () => {
       assert.equal(submits, 4, "initial attempt + three automatic retries before success");
       assert.deepEqual(runner.submittedInputs, [
         "finish the task",
-        "继续",
-        "继续",
-        "继续",
+        TRANSIENT_RETRY_INPUT,
+        TRANSIENT_RETRY_INPUT,
+        TRANSIENT_RETRY_INPUT,
       ]);
       assert.equal(captured.payloads.length, 1);
       const payload = captured.payloads[0]!;
@@ -786,7 +786,7 @@ describe("crash/interrupt partial persistence", () => {
       );
 
       assert.equal(submits, 11);
-      assert.deepEqual(runner.submittedInputs, ["finish the task", ...Array(10).fill("继续")]);
+      assert.deepEqual(runner.submittedInputs, ["finish the task", ...Array(10).fill(TRANSIENT_RETRY_INPUT)]);
       assert.equal(captured.payloads.length, 1);
       const payload = captured.payloads[0]!;
       assert.equal(payload.errorCode, "model_capacity");

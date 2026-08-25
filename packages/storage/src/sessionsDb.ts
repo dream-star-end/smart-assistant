@@ -65,6 +65,18 @@ function _onExit(): void {
   }
 }
 
+/**
+ * E10 — schema migration catch 的统一分诊:预期的幂等重跑错误(duplicate column
+ * name:列已在上次运行加过)保持静默;**其它任何 SQLite 错误必须出日志** ——
+ * 静默吞掉会让"迁移没跑成、后续查询 no such column"类事故毫无线索(不
+ * fail-closed:正常路径行为不变,继续 open)。
+ */
+function _logMigrationFailure(step: string, err: unknown): void {
+  const msg = err instanceof Error ? err.message : String(err)
+  if (/duplicate column name/i.test(msg)) return
+  console.error(`[sessionsDb] schema migration "${step}" failed (continuing):`, msg)
+}
+
 export async function getSessionsDb(): Promise<Database.Database> {
   if (_db) return _db
   await mkdir(dirname(paths.sessionsDb), { recursive: true })
@@ -200,13 +212,15 @@ export async function getSessionsDb(): Promise<Database.Database> {
   `)
 
   // ── Schema migrations (run BEFORE index creation) ──
+  // E10 — 各步 catch 经 _logMigrationFailure 分诊:预期的幂等重跑错误
+  // (duplicate column name)静默;其它 SQLite 错误记 console.error 后继续。
   // 1. Migrate event_log: rename session_id → session_key if old schema
   try {
     const cols = db.pragma('table_info(event_log)') as Array<{ name: string }>
     if (cols.some(c => c.name === 'session_id') && !cols.some(c => c.name === 'session_key')) {
       db.exec('ALTER TABLE event_log RENAME COLUMN session_id TO session_key')
     }
-  } catch { /* table just created, no migration needed */ }
+  } catch (err) { _logMigrationFailure('event_log rename session_id→session_key', err) }
 
   // 2. Migrate usage_log: deduplicate then add unique constraint
   try {
@@ -221,7 +235,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
       `)
       db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_log_dedup ON usage_log(session_id, turn_index)')
     }
-  } catch { /* table just created, no migration needed */ }
+  } catch (err) { _logMigrationFailure('usage_log dedup unique index', err) }
 
   // 2b. usage_log.terminal_status — mark abnormal / reconciled terminals
   try {
@@ -229,7 +243,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
     if (!usageCols.some(c => c.name === 'terminal_status')) {
       db.exec("ALTER TABLE usage_log ADD COLUMN terminal_status TEXT NOT NULL DEFAULT 'completed'")
     }
-  } catch { /* table just created with column already */ }
+  } catch (err) { _logMigrationFailure('usage_log add terminal_status', err) }
 
   // 3. Migrate event_log: add peer_id and channel columns for audit trail (P0.5)
   try {
@@ -240,7 +254,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
     if (!cols.some(c => c.name === 'channel')) {
       db.exec("ALTER TABLE event_log ADD COLUMN channel TEXT DEFAULT ''")
     }
-  } catch { /* table just created with columns already, or migration ran */ }
+  } catch (err) { _logMigrationFailure('event_log add peer_id/channel', err) }
 
   // ── Create indexes (after migrations) ──
   db.exec(`
@@ -257,17 +271,29 @@ export async function getSessionsDb(): Promise<Database.Database> {
   `)
 
   // Periodic WAL checkpoint to prevent unbounded WAL growth
+  // E10 — checkpoint 失败加 warn:长期静默失败 = WAL 无界膨胀(doctor 会报体积),
+  // 必须有日志线索;单次失败不致命,下个周期重试。
   _walTimer = setInterval(() => {
     try {
       db.pragma('wal_checkpoint(TRUNCATE)')
-    } catch {}
+    } catch (err) {
+      console.warn(
+        '[sessionsDb] periodic wal_checkpoint(TRUNCATE) failed:',
+        err instanceof Error ? err.message : String(err),
+      )
+    }
   }, 30 * 60_000) // every 30 min
   // Don't prevent process exit — mcp-memory processes are short-lived
   _walTimer.unref()
   // Run one immediately
   try {
     db.pragma('wal_checkpoint(TRUNCATE)')
-  } catch {}
+  } catch (err) {
+    console.warn(
+      '[sessionsDb] startup wal_checkpoint(TRUNCATE) failed:',
+      err instanceof Error ? err.message : String(err),
+    )
+  }
 
   // Ensure WAL is checkpointed and DB is closed on process exit.
   // Use process.on (not once) so that closeSessionsDb() + reopen still works,
@@ -2070,7 +2096,7 @@ export type ProjectAssetUpdateError =
 export type ProjectAssetDeleteError = 'not_found'
 
 export type ProjectAssetCreateResult =
-  | { ok: true; asset: ProjectAsset }
+  | { ok: true; asset: ProjectAsset; created: boolean }
   | { ok: false; error: ProjectAssetCreateError }
 export type ProjectAssetUpdateResult =
   | { ok: true; asset: ProjectAsset }
@@ -2205,6 +2231,17 @@ export type SearchClientSessionsOpts = {
   q: string
   limit?: number
   includeArchived?: boolean
+  /** undefined = no filter; null = ungrouped; string = chat_projects.id */
+  projectId?: string | null
+}
+
+export function sqlProjectFilter(
+  projectId: string | null | undefined,
+  alias = 'cs',
+): { sql: string; params: unknown[] } {
+  if (projectId === undefined) return { sql: '', params: [] }
+  if (projectId === null) return { sql: ` AND ${alias}.project_id IS NULL`, params: [] }
+  return { sql: ` AND ${alias}.project_id = ?`, params: [projectId] }
 }
 
 export type SearchClientSessionsResult = {
@@ -2213,15 +2250,33 @@ export type SearchClientSessionsResult = {
 
 export type BatchClientSessionsAction = 'archive' | 'unarchive' | 'delete' | 'move'
 
+export type BatchSessionCasRow = {
+  id: string
+  projectId: string | null
+  updatedAt: number
+}
+
 export type BatchClientSessionsInput = {
   ids?: unknown
   action?: unknown
   projectId?: unknown
+  expectedSessions?: unknown
+  operationId?: unknown
 }
 
 export type BatchClientSessionsResult =
-  | { ok: true; updated: number; skipped: number }
-  | { ok: false; error: 'invalid_ids' | 'invalid_action' | 'ids_limit' | 'project_not_found' }
+  | {
+      ok: true
+      updated: number
+      skipped: number
+      operationId?: string
+      post?: Array<{ id: string; projectId: string | null; updatedAt: number }>
+    }
+  | {
+      ok: false
+      error: 'invalid_ids' | 'invalid_action' | 'ids_limit' | 'project_not_found' | 'stale_session'
+      staleIds?: string[]
+    }
 
 /** 去掉破坏提示结构的控制字符,截断到注入上限。 */
 export function sanitizeProjectInstructions(raw: string): string {
@@ -2282,10 +2337,33 @@ export function parseIncludeArchivedFlag(raw: string | null): boolean {
   return raw === '1' || raw === 'true'
 }
 
+function parseExpectedSessions(raw: unknown): BatchSessionCasRow[] | { invalid: true } | undefined {
+  if (raw === undefined) return undefined
+  if (!Array.isArray(raw)) return { invalid: true }
+  const out: BatchSessionCasRow[] = []
+  for (const row of raw) {
+    if (!row || typeof row !== 'object') return { invalid: true }
+    const rec = row as { id?: unknown; projectId?: unknown; updatedAt?: unknown }
+    if (typeof rec.id !== 'string' || !rec.id.trim()) return { invalid: true }
+    if (rec.projectId !== null && rec.projectId !== undefined && typeof rec.projectId !== 'string') {
+      return { invalid: true }
+    }
+    if (typeof rec.updatedAt !== 'number' || !Number.isFinite(rec.updatedAt)) return { invalid: true }
+    out.push({
+      id: rec.id.trim(),
+      projectId: rec.projectId === undefined ? null : (rec.projectId as string | null),
+      updatedAt: rec.updatedAt,
+    })
+  }
+  return out
+}
+
 export function parseSessionBatchInput(input: BatchClientSessionsInput): BatchClientSessionsResult | {
   ids: string[]
   action: BatchClientSessionsAction
   projectId?: string | null
+  expectedSessions?: BatchSessionCasRow[]
+  operationId?: string
 } {
   if (!Array.isArray(input.ids)) return { ok: false, error: 'invalid_ids' }
   if (input.ids.length > SESSION_BATCH_IDS_MAX) return { ok: false, error: 'ids_limit' }
@@ -2302,6 +2380,19 @@ export function parseSessionBatchInput(input: BatchClientSessionsInput): BatchCl
   if (input.action !== 'archive' && input.action !== 'unarchive' && input.action !== 'delete' && input.action !== 'move') {
     return { ok: false, error: 'invalid_action' }
   }
+  const expectedSessions = parseExpectedSessions(input.expectedSessions)
+  if (expectedSessions && 'invalid' in expectedSessions) return { ok: false, error: 'invalid_action' }
+  if (expectedSessions && expectedSessions.length > 0) {
+    if (expectedSessions.length !== ids.length) return { ok: false, error: 'stale_session', staleIds: ids }
+    const idSet = new Set(ids)
+    for (const row of expectedSessions) {
+      if (!idSet.has(row.id)) return { ok: false, error: 'stale_session', staleIds: [row.id] }
+    }
+  }
+  const operationId =
+    typeof input.operationId === 'string' && input.operationId.trim()
+      ? input.operationId.trim().slice(0, 80)
+      : undefined
   if (input.action === 'move') {
     if (input.projectId !== undefined && input.projectId !== null && typeof input.projectId !== 'string') {
       return { ok: false, error: 'invalid_action' }
@@ -2312,9 +2403,9 @@ export function parseSessionBatchInput(input: BatchClientSessionsInput): BatchCl
     if (projectId !== null && (projectId.length < 8 || projectId.length > 64)) {
       return { ok: false, error: 'invalid_action' }
     }
-    return { ids, action: 'move', projectId }
+    return { ids, action: 'move', projectId, expectedSessions, operationId }
   }
-  return { ids, action: input.action }
+  return { ids, action: input.action, expectedSessions, operationId }
 }
 
 export type PatchClientSessionMetaResult =
@@ -6308,7 +6399,7 @@ async function _sqliteCreateProjectAsset(
       parsed.value.digest,
       parsed.value.containerPath,
     )
-    if (dup) return { ok: true, asset: dup }
+    if (dup) return { ok: true, asset: dup, created: false }
     if (_sqliteCountProjectAssets(db, userId, projectId) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
       return { ok: false, error: 'limit_exceeded' }
     }
@@ -6337,7 +6428,7 @@ async function _sqliteCreateProjectAsset(
     )
     const asset = _sqliteReadProjectAsset(db, userId, id)
     if (!asset) throw new Error('project asset insert vanished')
-    return { ok: true, asset }
+    return { ok: true, asset, created: true }
   })
   return txn()
 }
@@ -6485,14 +6576,16 @@ async function _sqliteSearchClientSessions(
   const like = `%${escapeLikePattern(q)}%`
   const db = await getSessionsDb()
   const archiveSql = includeArchived ? '' : ' AND cs.archived_at IS NULL'
+  const projectFilt = sqlProjectFilter(opts.projectId)
+  const scopeSql = `${archiveSql}${projectFilt.sql}`
   const candMax = SESSION_SEARCH_JSON_CANDIDATE_MAX
   const expandMax = SESSION_SEARCH_JSON_EXPAND_MAX_BYTES
   const titleRows = db.prepare(`
     SELECT id, title, project_id, last_at
       FROM client_sessions cs
-     WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+     WHERE cs.user_id = ? AND cs.deleted_at IS NULL${scopeSql}
        AND cs.title LIKE ? ESCAPE '\\'
-  `).all(userId, like) as Array<{ id: string; title: string; project_id: string | null; last_at: number }>
+  `).all(userId, ...projectFilt.params, like) as Array<{ id: string; title: string; project_id: string | null; last_at: number }>
   // 两段式:TEXT LIKE 收窄 → 最近 N 条 → 小行才 json_each。不把 messages blob 拉进 Node,也不对未命中行做 JSON.parse。
   const msgRows = db.prepare(`
     SELECT cs.id, cs.title, cs.project_id,
@@ -6501,26 +6594,26 @@ async function _sqliteSearchClientSessions(
       FROM (
         SELECT id, title, project_id, last_at, messages
           FROM client_sessions cs
-         WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+         WHERE cs.user_id = ? AND cs.deleted_at IS NULL${scopeSql}
            AND cs.messages LIKE ? ESCAPE '\\'
            AND length(CAST(cs.messages AS BLOB)) <= ?
          ORDER BY cs.last_at DESC
          LIMIT ?
       ) cs, json_each(cs.messages) j
      WHERE json_extract(j.value, '$.text') LIKE ? ESCAPE '\\'
-  `).all(userId, like, expandMax, candMax, like) as Array<{
+  `).all(userId, ...projectFilt.params, like, expandMax, candMax, like) as Array<{
     id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
   }>
   const oversizedMsgRows = db.prepare(`
     SELECT id, title, project_id, last_at AS matched_at,
            substr(messages, max(1, instr(lower(messages), lower(?)) - 80), 400) AS msg_text
       FROM client_sessions cs
-     WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+     WHERE cs.user_id = ? AND cs.deleted_at IS NULL${scopeSql}
        AND cs.messages LIKE ? ESCAPE '\\'
        AND length(CAST(cs.messages AS BLOB)) > ?
      ORDER BY last_at DESC
      LIMIT ?
-  `).all(q, userId, like, expandMax, candMax) as Array<{
+  `).all(q, userId, ...projectFilt.params, like, expandMax, candMax) as Array<{
     id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
   }>
   const chunkRows = db.prepare(`
@@ -6531,14 +6624,14 @@ async function _sqliteSearchClientSessions(
         SELECT cs.id, cs.title, cs.project_id, cs.last_at, ch.messages
           FROM client_session_archive_chunks ch
           JOIN client_sessions cs ON cs.id = ch.session_id AND cs.user_id = ch.user_id
-         WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+         WHERE cs.user_id = ? AND cs.deleted_at IS NULL${scopeSql}
            AND ch.messages LIKE ? ESCAPE '\\'
            AND length(CAST(ch.messages AS BLOB)) <= ?
          ORDER BY cs.last_at DESC
          LIMIT ?
       ) cs, json_each(cs.messages) j
      WHERE json_extract(j.value, '$.text') LIKE ? ESCAPE '\\'
-  `).all(userId, like, expandMax, candMax, like) as Array<{
+  `).all(userId, ...projectFilt.params, like, expandMax, candMax, like) as Array<{
     id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
   }>
   const oversizedChunkRows = db.prepare(`
@@ -6546,12 +6639,12 @@ async function _sqliteSearchClientSessions(
            substr(ch.messages, max(1, instr(lower(ch.messages), lower(?)) - 80), 400) AS msg_text
       FROM client_session_archive_chunks ch
       JOIN client_sessions cs ON cs.id = ch.session_id AND cs.user_id = ch.user_id
-     WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+     WHERE cs.user_id = ? AND cs.deleted_at IS NULL${scopeSql}
        AND ch.messages LIKE ? ESCAPE '\\'
        AND length(CAST(ch.messages AS BLOB)) > ?
      ORDER BY cs.last_at DESC
      LIMIT ?
-  `).all(q, userId, like, expandMax, candMax) as Array<{
+  `).all(q, userId, ...projectFilt.params, like, expandMax, candMax) as Array<{
     id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
   }>
   const hits: Array<Omit<SessionSearchHit, 'unread'>> = [
@@ -6610,10 +6703,32 @@ async function _sqliteBatchClientSessions(
   const parsed = parseSessionBatchInput(input)
   if ('ok' in parsed) return parsed
   const { ids, action } = parsed
-  if (ids.length === 0) return { ok: true, updated: 0, skipped: 0 }
+  if (ids.length === 0) return { ok: true, updated: 0, skipped: 0, operationId: parsed.operationId }
   const db = await getSessionsDb()
   const now = Date.now()
+  try {
   return db.transaction((): BatchClientSessionsResult => {
+    if (parsed.expectedSessions && parsed.expectedSessions.length > 0) {
+      const staleIds: string[] = []
+      const lookup = db.prepare(
+        `SELECT id, project_id, updated_at, deleted_at FROM client_sessions
+          WHERE user_id = ? AND id = ?`,
+      )
+      for (const exp of parsed.expectedSessions) {
+        const live = lookup.get(userId, exp.id) as
+          | { id: string; project_id: string | null; updated_at: number; deleted_at: number | null }
+          | undefined
+        if (
+          !live ||
+          live.deleted_at ||
+          live.updated_at !== exp.updatedAt ||
+          (live.project_id ?? null) !== (exp.projectId ?? null)
+        ) {
+          staleIds.push(exp.id)
+        }
+      }
+      if (staleIds.length) return { ok: false, error: 'stale_session', staleIds }
+    }
     if (action === 'move' && parsed.projectId) {
       const owned = db.prepare(
         'SELECT 1 AS ok FROM chat_projects WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
@@ -6650,17 +6765,52 @@ async function _sqliteBatchClientSessions(
             AND id IN (${targetIds.map(() => '?').join(',')})`,
       ).run(now, userId, ...targetIds)
       updated = res.changes
+    } else if (parsed.expectedSessions && parsed.expectedSessions.length > 0) {
+      const post: Array<{ id: string; projectId: string | null; updatedAt: number }> = []
+      const upd = db.prepare(
+        `UPDATE client_sessions
+            SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
+          WHERE id = ? AND user_id = ?
+            AND deleted_at IS NULL AND archived_at IS NULL
+            AND updated_at = ?
+            AND ((? IS NULL AND project_id IS NULL) OR project_id = ?)
+          RETURNING id, project_id, updated_at`,
+      )
+      for (const exp of parsed.expectedSessions) {
+        const row = upd.get(
+          parsed.projectId ?? null,
+          now,
+          exp.id,
+          userId,
+          exp.updatedAt,
+          exp.projectId,
+          exp.projectId,
+        ) as { id: string; project_id: string | null; updated_at: number } | undefined
+        if (!row) {
+          throw Object.assign(new Error('stale_session'), { staleIds: [exp.id] })
+        }
+        post.push({ id: row.id, projectId: row.project_id, updatedAt: row.updated_at })
+      }
+      if (post.length !== parsed.expectedSessions.length) {
+        throw Object.assign(new Error('stale_session'), { staleIds: ids })
+      }
+      return { ok: true, updated: post.length, skipped, operationId: parsed.operationId, post }
     } else {
       const res = db.prepare(
         `UPDATE client_sessions
             SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
-          WHERE user_id = ? AND deleted_at IS NULL
+          WHERE user_id = ? AND deleted_at IS NULL AND archived_at IS NULL
             AND id IN (${targetIds.map(() => '?').join(',')})`,
       ).run(parsed.projectId ?? null, now, userId, ...targetIds)
       updated = res.changes
     }
-    return { ok: true, updated, skipped }
+    return { ok: true, updated, skipped, operationId: parsed.operationId }
   })()
+  } catch (err) {
+    const staleIds = (err as { staleIds?: string[] }).staleIds
+    if (staleIds) return { ok: false, error: 'stale_session', staleIds }
+    throw err
+  }
 }
 
 async function _sqliteMarkClientSessionRead(

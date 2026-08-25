@@ -8,7 +8,7 @@ import {
 import { type Logger, rootLogger } from '../logging/logger.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
-export const MEMORY_USAGE_PATH = '/internal/v3/memory-usage'
+export { MEMORY_USAGE_PATH } from '@openclaude/protocol'
 const MAX_BODY_BYTES = 128 * 1024
 const MAX_EVENTS = 100
 const MAX_AGE_MS = 25 * 60 * 60 * 1000

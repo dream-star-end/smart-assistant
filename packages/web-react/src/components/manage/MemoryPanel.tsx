@@ -1,7 +1,9 @@
 import { AlertTriangle, BarChart3, Brain, Check, ChevronRight, MoonStar, Plus, Search, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useId, useState } from "react";
 import { ApiError, api, apiErrorMessage } from "../../lib/api";
-import { taskboardApi, type Project, type ProjectMemoryItem } from "../../lib/taskboard";
+import { useProjectScope } from "../../hooks/useProjectScope";
+import { isWorkScope } from "../../lib/projectScope";
+import { taskboardApi, type ProjectMemoryItem } from "../../lib/taskboard";
 import type {
   AuthSession,
   AutoDreamLastReport,
@@ -69,16 +71,16 @@ export function MemoryPanel({
   agents: { id: string; name: string }[];
 }) {
   const [selected, setSelected] = useState(agentId);
-  const [tab, setTab] = useState<"core" | "profile" | "project" | "usage">("core");
+  const [tab, setTab] = useState<"all" | "core" | "official" | "candidates" | "profile" | "usage">("core");
   // 选中项必须在可选列表内（agent 刚被卸载时回落到列表首项/传入项）。
   const effective = agents.some((a) => a.id === selected) ? selected : agentId;
-  const showPicker = agents.length > 1 && tab !== "profile" && tab !== "project";
+  const showPicker = agents.length > 1 && tab !== "profile" && tab !== "official" && tab !== "candidates";
 
   return (
     <div className="flex flex-col">
       <PanelHeader
         title="记忆"
-        hint="这些内容会注入智能体的长期上下文，让它越用越懂你。"
+        hint="这些内容会注入智能体的长期上下文。Core 的 type:project 只是标签，不是项目命名空间。"
         action={
           showPicker ? (
             <Select
@@ -99,12 +101,24 @@ export function MemoryPanel({
           value={tab}
           onValueChange={(v) =>
             setTab(
-              v === "profile" ? "profile" : v === "usage" ? "usage" : v === "project" ? "project" : "core",
+              v === "profile"
+                ? "profile"
+                : v === "usage"
+                  ? "usage"
+                  : v === "official"
+                    ? "official"
+                    : v === "candidates"
+                      ? "candidates"
+                      : v === "all"
+                        ? "all"
+                        : "core",
             )
           }
           items={[
-            { value: "core", label: "核心记忆" },
-            { value: "project", label: "项目记忆" },
+            { value: "all", label: "全部" },
+            { value: "core", label: "Agent Core" },
+            { value: "official", label: "项目正式" },
+            { value: "candidates", label: "项目候选" },
             { value: "profile", label: "用户画像" },
             { value: "usage", label: "使用情况" },
           ]}
@@ -118,8 +132,15 @@ export function MemoryPanel({
       >
         {tab === "core" ? (
           <CoreMemorySection key={`core:${effective}`} auth={auth} agentId={effective} />
-        ) : tab === "project" ? (
-          <ProjectMemorySection key="project-memory" auth={auth} />
+        ) : tab === "all" ? (
+          <>
+            <CoreMemorySection key={`all-core:${effective}`} auth={auth} agentId={effective} />
+            <ProjectMemorySection key="all-project" auth={auth} view="both" />
+          </>
+        ) : tab === "official" ? (
+          <ProjectMemorySection key="project-official" auth={auth} view="official" />
+        ) : tab === "candidates" ? (
+          <ProjectMemorySection key="project-candidates" auth={auth} view="candidates" />
         ) : tab === "profile" ? (
           // 画像共享,用初始 agentId(稳定)做路由参数,与切换器无关。
           <UserProfileSection key="shared:user" auth={auth} agentId={agentId} />
@@ -148,30 +169,19 @@ const OPERATION_LABELS: Record<string, string> = {
   auto_refuse: "自动记忆拒绝",
 };
 
-function ProjectMemorySection({ auth }: { auth: AuthSession }) {
+function ProjectMemorySection({
+  auth,
+  view = "both",
+}: {
+  auth: AuthSession;
+  view?: "official" | "candidates" | "both";
+}) {
   const toast = useToast();
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [projectId, setProjectId] = useState("");
+  const { scope } = useProjectScope();
+  const projectId = scope.workProject?.id ?? "";
   const [official, setOfficial] = useState<ProjectMemoryItem[]>([]);
   const [candidates, setCandidates] = useState<ProjectMemoryItem[]>([]);
   const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    void taskboardApi
-      .listProjects(auth)
-      .then((items) => {
-        if (cancelled) return;
-        setProjects(items);
-        setProjectId((cur) => cur || items[0]?.id || "");
-      })
-      .catch((e) => {
-        if (!cancelled) toast(apiErrorMessage(e, "加载项目失败"), "error");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [auth, toast]);
 
   useEffect(() => {
     if (!projectId) {
@@ -198,24 +208,27 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
     };
   }, [auth, projectId, toast]);
 
+  if (!isWorkScope(scope) || !projectId) {
+    return (
+      <div className="px-4 py-3 text-caption text-muted" data-testid="project-memory-panel">
+        选择工作项目后显示项目正式记忆与候选。复用看板 ProjectContext memory API。
+      </div>
+    );
+  }
+
+  const showCand = view === "both" || view === "candidates";
+  const showOff = view === "both" || view === "official";
+
   return (
     <div className="flex flex-col gap-3 px-4 py-3" data-testid="project-memory-panel">
-      <Select
-        aria-label="筛选项目"
-        value={projectId}
-        onValueChange={setProjectId}
-        options={projects.map((p) => ({ value: p.id, label: `${p.key} ${p.name}` }))}
-        inputSize="sm"
-        className="w-56"
-      />
       {loading ? (
         <ListSkeleton rows={3} />
       ) : (
         <>
-          <h3 className="text-section font-semibold">待审核候选</h3>
-          {candidates.length === 0 ? (
+          {showCand ? <h3 className="text-section font-semibold">待审核候选</h3> : null}
+          {showCand && candidates.length === 0 ? (
             <EmptyState icon={Brain} title="没有候选" hint="绑定项目的 Auto-Dream 只会写入候选。" />
-          ) : (
+          ) : showCand ? (
             candidates.map((c) => (
               <div key={c.id ?? c.file} className="rounded-lg border border-border p-3">
                 <div className="text-body font-medium">{c.slug}</div>
@@ -228,7 +241,13 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
                     onClick={() => {
                       void taskboardApi
                         .promoteProjectMemory(auth, projectId, c.id ?? "", c.version)
-                        .then(() => setProjectId((id) => id))
+                        .then(() => setOfficial((x) => x))
+                        .then(() =>
+                          taskboardApi.listProjectMemories(auth, projectId).then((res) => {
+                            setOfficial(res.official);
+                            setCandidates(res.candidates);
+                          }),
+                        )
                         .catch((e) => toast(apiErrorMessage(e, "采纳失败"), "error"));
                     }}
                   >
@@ -240,7 +259,12 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
                     onClick={() => {
                       void taskboardApi
                         .rejectProjectMemory(auth, projectId, c.id ?? "", c.version)
-                        .then(() => setProjectId((id) => id))
+                        .then(() =>
+                          taskboardApi.listProjectMemories(auth, projectId).then((res) => {
+                            setOfficial(res.official);
+                            setCandidates(res.candidates);
+                          }),
+                        )
                         .catch((e) => toast(apiErrorMessage(e, "丢弃失败"), "error"));
                     }}
                   >
@@ -249,15 +273,17 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
                 </div>
               </div>
             ))
-          )}
-          <h3 className="text-section font-semibold">正式 / 废弃</h3>
-          {official.map((o) => (
-            <div key={o.slug} className="text-body">
-              {o.slug}
-              {o.deprecated ? "（已废弃）" : ""}
-              {o.tampered ? "（被篡改，未注入）" : ""}
-            </div>
-          ))}
+          ) : null}
+          {showOff ? <h3 className="text-section font-semibold">正式 / 废弃</h3> : null}
+          {showOff
+            ? official.map((o) => (
+                <div key={o.slug} className="text-body">
+                  {o.slug}
+                  {o.deprecated ? "（已废弃）" : ""}
+                  {o.tampered ? "（被篡改，未注入）" : ""}
+                </div>
+              ))
+            : null}
         </>
       )}
     </div>

@@ -54,7 +54,7 @@ import { clearRunningSession } from "./sessionPointer.js"
 import { WECHAT_SESSION_ID_REGEX, type IlinkPart } from "./types.js"
 
 /** Container → master 出站 endpoint。挂在 master:18443 + self-host 18791。 */
-export const WECHAT_OUTBOUND_PATH = "/internal/v3/wechat-outbound"
+export { WECHAT_OUTBOUND_PATH } from "@openclaude/protocol"
 
 /** outboundId charset 与长度,与 server-authored requestId 思路一致(URL/log safe)。 */
 const OUTBOUND_ID_RE = /^[A-Za-z0-9._:-]{8,128}$/

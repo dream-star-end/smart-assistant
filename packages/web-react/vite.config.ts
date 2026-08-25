@@ -126,6 +126,15 @@ export default defineConfig(() => {
                 priority: 20,
               },
               {
+                // useMdViewport 被入口(App/useAppRoute)与懒加载中心(任务面板等)共用。
+                // 入口直引后 rolldown 会把它并进 main chunk,TaskboardView 懒块随即出现
+                // 「异步块 import 入口」的被禁边(见 forbidTaskboardEntryImport)。与
+                // lucide-vendor 同理:共享模块单独成块,两边都从它引,不经过入口。
+                name: "viewport-shared",
+                test: /src[\\/]hooks[\\/]useMdViewport\.ts$/,
+                priority: 25,
+              },
+              {
                 name: "lucide-vendor",
                 test: /node_modules[\\/]lucide-react[\\/]/,
                 priority: 15,

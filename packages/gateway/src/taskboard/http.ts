@@ -676,7 +676,12 @@ async function dispatch(
   const projectContextPreview = path.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/)
   if (projectContextPreview) {
     if (method !== 'GET') return sendError(res, 405, 'method not allowed')
-    return handlePreviewProjectContext(res, db, decodeURIComponent(projectContextPreview[1]))
+    return handlePreviewProjectContext(
+      res,
+      db,
+      decodeURIComponent(projectContextPreview[1]),
+      url.searchParams.get('agentId'),
+    )
   }
 
   const projectContext = path.match(/^\/api\/board\/projects\/([^/]+)\/context$/)
@@ -961,10 +966,18 @@ async function handlePreviewProjectContext(
   res: ServerResponse,
   db: TaskboardDb,
   idOrKey: string,
+  agentId?: string | null,
 ): Promise<void> {
   const project = resolveProject(db, idOrKey)
   if (!project) throw new TaskboardNotFound('project', idOrKey)
-  sendJson(res, 200, await previewProjectContext({ boardProjectId: project.id }))
+  sendJson(
+    res,
+    200,
+    await previewProjectContext({
+      boardProjectId: project.id,
+      agentId: agentId && /^[A-Za-z0-9_-]{1,64}$/.test(agentId) ? agentId : undefined,
+    }),
+  )
 }
 
 async function handleGetRunContext(

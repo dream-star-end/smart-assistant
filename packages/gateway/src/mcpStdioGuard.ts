@@ -33,6 +33,27 @@ for (const level of ['log', 'info', 'debug', 'trace', 'dir', 'warn', 'error'] as
 process.on('unhandledRejection', (reason) => {
   writeErr(`[mcp-guard] unhandledRejection (kept alive): ${format(reason)}`)
 })
+
+// E11 — 连续 uncaughtException 熔断:单次异常保持「不退出」语义(存活优于崩溃,
+// 见文件头),但**短窗口内连续**未捕获异常说明进程已带坏状态空转(事件循环反复
+// 炸同一处),继续硬撑只会让 codex 死等。达到阈值主动 exit(1) 交给 supervisor
+// 拉起干净进程。窗口外的偶发异常互不累计(计数重置),不改变既有单发行为。
+const UNCAUGHT_EXIT_THRESHOLD = 5
+const UNCAUGHT_WINDOW_MS = 60_000
+let _uncaughtStreak = 0
+let _lastUncaughtAt = 0
+
 process.on('uncaughtException', (err) => {
-  writeErr(`[mcp-guard] uncaughtException (kept alive): ${format(err)}`)
+  const now = Date.now()
+  _uncaughtStreak = now - _lastUncaughtAt <= UNCAUGHT_WINDOW_MS ? _uncaughtStreak + 1 : 1
+  _lastUncaughtAt = now
+  writeErr(
+    `[mcp-guard] uncaughtException (kept alive, streak ${_uncaughtStreak}/${UNCAUGHT_EXIT_THRESHOLD}): ${format(err)}`,
+  )
+  if (_uncaughtStreak >= UNCAUGHT_EXIT_THRESHOLD) {
+    writeErr(
+      `[mcp-guard] ${UNCAUGHT_EXIT_THRESHOLD} consecutive uncaughtExceptions within ${UNCAUGHT_WINDOW_MS}ms — exiting 1 for supervisor restart`,
+    )
+    process.exit(1)
+  }
 })

@@ -14,7 +14,9 @@ import {
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
-import { Button, Card, EmptyState, Field, Input, ListSkeleton, Select, StatCard } from '../ui'
+import { useProjectScope } from '../../hooks/useProjectScope'
+import { UNBOUND_BOARD_COPY, boardWorkQuery } from '../../lib/projectScope'
+import { Button, Card, EmptyState, Field, Input, ListSkeleton, ProjectScopeSelect, Select, StatCard } from '../ui'
 import { CostCoverageBlock } from './CostCoverageBlock'
 
 const TZ = 'Asia/Shanghai'
@@ -47,6 +49,9 @@ export function CostStatsView({
   projectId: string | null
   projects: Project[]
 }) {
+  const { scope } = useProjectScope()
+  const workQuery = boardWorkQuery(scope)
+  const scopedProjectId = 'projectId' in workQuery ? workQuery.projectId : null
   const today = ymdInZone()
   const [from, setFrom] = useState(() => addDaysYmd(today, -6))
   const [to, setTo] = useState(today)
@@ -61,6 +66,12 @@ export function CostStatsView({
   }, [projectId])
 
   const load = useCallback(async () => {
+    if (!scopedProjectId) {
+      setLoading(false)
+      setError(null)
+      setStats(null)
+      return
+    }
     setLoading(true)
     setError(null)
     try {
@@ -68,7 +79,7 @@ export function CostStatsView({
         from,
         to,
         groupBy,
-        projectId: filterProject || undefined,
+        projectId: scopedProjectId,
         timeZone: TZ,
       })
       setStats(fresh)
@@ -79,7 +90,7 @@ export function CostStatsView({
     } finally {
       setLoading(false)
     }
-  }, [auth, filterProject, from, groupBy, to])
+  }, [auth, from, groupBy, scopedProjectId, to])
 
   useEffect(() => {
     void load()
@@ -93,7 +104,7 @@ export function CostStatsView({
       <div>
         <h2 className="text-title font-semibold text-fg">成本统计</h2>
         <p className="mt-1 text-caption text-muted">
-          先看 token。美元只计有单价的执行；Cursor / Grok 等路由常把成本记成 0，不能当成没花钱。
+          任务看板 tb_project 自身统计，不含模型用量 usage_records。先看 token。美元只计有单价的执行；Cursor / Grok 等路由常把成本记成 0，不能当成没花钱。
         </p>
       </div>
       <div className="flex flex-wrap items-end gap-2">
@@ -125,22 +136,15 @@ export function CostStatsView({
           />
         </Field>
         <Field label="项目" className="min-w-[10rem]">
-          <Select
-            aria-label="成本项目"
-            inputSize="sm"
-            value={filterProject}
-            onValueChange={setFilterProject}
-            options={[
-              { value: '', label: '全部项目' },
-              ...projects.map((p) => ({ value: p.id, label: `${p.key} ${p.name}` })),
-            ]}
-          />
+          <ProjectScopeSelect variant="work" className="w-full" />
         </Field>
         <Button type="button" size="sm" variant="secondary" onClick={() => void load()}>
           刷新
         </Button>
       </div>
-      {loading && !stats ? (
+      {'blocked' in workQuery ? (
+        <EmptyState icon={Coins} title={UNBOUND_BOARD_COPY} hint="切换到已绑定看板的工作项目后再查看成本。" />
+      ) : loading && !stats ? (
         <ListSkeleton rows={5} variant="card" />
       ) : error ? (
         <EmptyState

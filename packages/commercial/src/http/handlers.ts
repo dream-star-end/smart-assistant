@@ -37,6 +37,10 @@ import { query } from "../db/queries.js";
 import { insertFeedback } from "../admin/feedback.js";
 import { getUserUsageReport, isUsageWindow, type UsageWindow } from "../billing/usageReport.js";
 import {
+  parseUsageBoardProjectQuery,
+  pgUsageBoardProjectSql,
+} from "../billing/boardProjectAttribution.js";
+import {
   verifyCommercialJwtSync,
   verifyCommercialJwtSyncDetailed,
   type CommercialJwtClaims,
@@ -1596,6 +1600,13 @@ export async function handleGetMyUsage(
   }
 
   const uid = user.id; // bigint-safe string from auth
+  const boardProjectId = parseUsageBoardProjectQuery(url.searchParams.get("boardProjectId"));
+  const board = pgUsageBoardProjectSql(boardProjectId, 2);
+  const boardUr = pgUsageBoardProjectSql(boardProjectId, 2, "ur");
+  const sessBoard = pgUsageBoardProjectSql(boardProjectId, 2);
+  const sessLimitIdx = sessBoard.nextIndex;
+  const sessOffsetIdx = sessLimitIdx + 1;
+  const savBoard = pgUsageBoardProjectSql(boardProjectId, 2);
 
   // 并发 6 条只读查询。所有语义均 WHERE user_id=$1,无 IDOR。
   const [
@@ -1622,8 +1633,8 @@ export async function handleGetMyUsage(
               COALESCE(SUM(cost_credits),0)::text        AS billed_credits,
               COUNT(*)::bigint::text                     AS requests_total
          FROM usage_records
-        WHERE user_id = $1 AND status = 'success'`,
-      [uid],
+        WHERE user_id = $1 AND status = 'success'${board.sql}`,
+      [uid, ...board.params],
     ),
     // 2) legacy:session_id IS NULL 的 success 行
     query<{
@@ -1641,8 +1652,8 @@ export async function handleGetMyUsage(
               COALESCE(SUM(cache_write_tokens),0)::text   AS cache_write_tokens,
               COALESCE(SUM(cost_credits),0)::text         AS billed_credits
          FROM usage_records
-        WHERE user_id = $1 AND status = 'success' AND session_id IS NULL`,
-      [uid],
+        WHERE user_id = $1 AND status = 'success' AND session_id IS NULL${board.sql}`,
+      [uid, ...board.params],
     ),
     // 3) debited:JOIN usage_records.ledger_id → credit_ledger,只统计真实 debit(delta<0)
     //    (Codex 建议:比按 reason 白名单更精确,避免未来其他 reason 混入)
@@ -1650,8 +1661,8 @@ export async function handleGetMyUsage(
       `SELECT COALESCE(SUM(-cl.delta), 0)::text AS debited_credits
          FROM usage_records ur
          JOIN credit_ledger cl ON cl.id = ur.ledger_id
-        WHERE ur.user_id = $1 AND ur.status = 'success' AND cl.delta < 0`,
-      [uid],
+        WHERE ur.user_id = $1 AND ur.status = 'success' AND cl.delta < 0${boardUr.sql}`,
+      [uid, ...boardUr.params],
     ),
     // 4) sessions 分页:按「归组键」GROUP BY,稳定排序,LIMIT+1 探 has_more。
     //
@@ -1697,27 +1708,27 @@ export async function handleGetMyUsage(
               bool_and(mode = 'delegate')                AS delegate_only,
               MAX(created_at)                            AS last_used_at
          FROM usage_records
-        WHERE user_id = $1 AND status = 'success' AND session_id IS NOT NULL
+        WHERE user_id = $1 AND status = 'success' AND session_id IS NOT NULL${sessBoard.sql}
         GROUP BY 1
         ORDER BY MAX(created_at) DESC, 1 DESC
-        LIMIT $2 OFFSET $3`,
-      [uid, sessionsLimit + 1, sessionsOffset],
+        LIMIT $${sessLimitIdx} OFFSET $${sessOffsetIdx}`,
+      [uid, ...sessBoard.params, sessionsLimit + 1, sessionsOffset],
     ),
     // 5) cutoff:最早一次带 session_id 的时间戳。UI 里提示"从何时开始支持会话维度"
     query<{ cutoff_started_at: Date | null }>(
       `SELECT MIN(created_at) AS cutoff_started_at
          FROM usage_records
-        WHERE user_id = $1 AND session_id IS NOT NULL`,
-      [uid],
+        WHERE user_id = $1 AND session_id IS NOT NULL${board.sql}`,
+      [uid, ...board.params],
     ),
     // 6) savings 精算所需原始行。LIMIT SAVINGS_ROW_CAP+1 真正截断,不做 COUNT(*) 扫全表
     query<{ cache_read_tokens: string; price_snapshot: unknown }>(
       `SELECT cache_read_tokens::text AS cache_read_tokens,
               price_snapshot
          FROM usage_records
-        WHERE user_id = $1 AND status = 'success' AND cache_read_tokens > 0
+        WHERE user_id = $1 AND status = 'success' AND cache_read_tokens > 0${savBoard.sql}
         LIMIT ${SAVINGS_ROW_CAP + 1}`,
-      [uid],
+      [uid, ...savBoard.params],
     ),
   ]);
 
@@ -1797,6 +1808,7 @@ export async function handleGetMyUsage(
     .filter((r) => r.delegate_requests !== "0")
     .map((r) => r.session_id);
   if (delegateKeys.length > 0) {
+    const delBoard = pgUsageBoardProjectSql(boardProjectId, 3);
     const detail = await query<DelegateDetail & { session_key: string }>(
       `SELECT COALESCE(parent_session_id, session_id) AS session_key,
               delegate_agent_id,
@@ -1806,10 +1818,10 @@ export async function handleGetMyUsage(
          FROM usage_records
         WHERE user_id = $1 AND status = 'success' AND mode = 'delegate'
           AND session_id IS NOT NULL
-          AND COALESCE(parent_session_id, session_id) = ANY($2::text[])
+          AND COALESCE(parent_session_id, session_id) = ANY($2::text[])${delBoard.sql}
         GROUP BY 1, 2, 3
         ORDER BY 1, SUM(cost_credits) DESC, 2 NULLS LAST, 3`,
-      [uid, delegateKeys],
+      [uid, delegateKeys, ...delBoard.params],
     );
     for (const d of detail.rows) {
       const list = delegatesByKey.get(d.session_key) ?? [];
@@ -1938,7 +1950,8 @@ export async function handleGetMyUsageReport(
     }
     window = raw;
   }
-  const report = await getUserUsageReport(user.id, window);
+  const boardProjectId = parseUsageBoardProjectQuery(url.searchParams.get("boardProjectId"));
+  const report = await getUserUsageReport(user.id, window, boardProjectId);
   sendJson(res, 200, report);
 }
 

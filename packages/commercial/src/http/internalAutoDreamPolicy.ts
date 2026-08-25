@@ -8,7 +8,7 @@ import {
 import { getAutoDreamPolicy } from '../user/autoDream.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
-export const AUTO_DREAM_POLICY_PATH = '/internal/v3/auto-dream-policy'
+export { AUTO_DREAM_POLICY_PATH } from '@openclaude/protocol'
 
 export type AutoDreamPolicyHandler = (
   req: IncomingMessage,

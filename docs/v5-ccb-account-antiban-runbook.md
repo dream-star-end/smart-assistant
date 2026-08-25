@@ -19,6 +19,14 @@
 | 容器 `CLAUDE_CODE_MAX_RETRIES=2` | 封顶重试放大 | `v3supervisor.ts` env |
 | 容器 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` | 关旁路遥测,出口形态单一 | 同上 |
 | `session_pin_mode=enforce`(默认) | 一会话粘一号,消除多 account_uuid 关联 | `PUT /api/admin/settings/session_pin_mode` = `observe`/`off` 可回退 |
+| persona 按 `accept_language` 映射时区 + 代理改写 body 本地日期 | 上游看到的"今天日期"与账号语言/地域自洽 | 升级映射见 `persona.ts` `ACCEPT_LANGUAGE_TIMEZONE` |
+
+> 时区说明:CCB 会把本地日历日期(`Today's date is …`)写进发往 Anthropic 的
+> messages。旧部署把 CCB 进程钉 `Asia/Tokyo`(为已废弃的日本旁路出口),与账号
+> 语言/住宅 IP 地域对不上。现在代理按每账号 `persona.timezone`(跟 `accept_language`
+> 一致)改写这个日期,所以**加号时选的住宅 IP 地域,尽量和 persona 语言/时区同区**
+> (en-US→美东、zh-CN→上海、ja-JP→东京、en-GB→伦敦、de-DE→柏林),三者才完全自洽。
+> 残留:WebSearch 工具提示里的"当前月份"仍按容器 TZ,信号弱,暂未改写。
 
 `session_pin_mode` 若需先观察再全量,可临时切 `observe` 跑 1~3 天看
 `session_pin_observe` 日志的 divergent 占比,再回 `enforce`。

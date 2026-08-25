@@ -71,8 +71,9 @@ import {
 
 const log = createLogger({ module: "v3WechatOutbound" })
 
-/** Master's broker path。与 outboundReceiver.ts:58 WECHAT_OUTBOUND_PATH 一致。 */
-export const WECHAT_OUTBOUND_PATH = "/internal/v3/wechat-outbound"
+/** Master's broker path。单一权威在 protocol 内部路由注册表。 */
+import { QQ_OUTBOUND_PATH, WECHAT_OUTBOUND_PATH } from "@openclaude/protocol"
+export { WECHAT_OUTBOUND_PATH }
 
 /** Per-POST timeout。短于 v3MasterSink(8s),因为 broker enqueue 是同步 INSERT,
  *  正常应 < 200 ms;超 3 s 必然是 master overload / 网络糟糕,落 durable retry。 */
@@ -475,7 +476,7 @@ export function makeV3QqbotOutboundAdapter(
     ...deps,
     channel: "qqbot",
     adapterId: "v3-qqbot-outbound",
-    outboundPath: "/internal/v3/qq-outbound",
+    outboundPath: QQ_OUTBOUND_PATH,
     queueDir: join(paths.home, "v3-qqbot-retry.d"),
   })
 }

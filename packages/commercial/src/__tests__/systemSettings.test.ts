@@ -200,9 +200,10 @@ describe("KEY_SCHEMAS — phase6_account_uuid_enforce / session_pin_mode (v1.0.2
     assert.equal(s.safeParse("ENFORCE").success, false);
     assert.equal(s.safeParse(true).success, false);
   });
-  test("default values (反封复盘 2026-08:session_pin_mode 默认 enforce)", () => {
-    assert.equal(DEFAULTS.phase6_account_uuid_enforce, "off");
-    // 一会话粘一号,消除多 account_uuid 关联信号(见 systemSettings.ts 注释)。
+  test("default values (反封复盘 2026-08:session_pin_mode=enforce, phase6=fail_open)", () => {
+    // account_uuid 锚定默认开到 fail_open(见 systemSettings.ts 注释)。
+    assert.equal(DEFAULTS.phase6_account_uuid_enforce, "fail_open");
+    // 一会话粘一号,消除多 account_uuid 关联信号。
     assert.equal(DEFAULTS.session_pin_mode, "enforce");
   });
 });

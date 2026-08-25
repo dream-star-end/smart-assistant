@@ -20,6 +20,8 @@ import {
   taskboardApi,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
+import { useProjectScope } from '../../hooks/useProjectScope'
+import { UNBOUND_BOARD_COPY, boardWorkQuery } from '../../lib/projectScope'
 import {
   Button,
   DropdownMenu,
@@ -32,6 +34,7 @@ import {
   IconButton,
   Input,
   ListSkeleton,
+  ProjectScopeSelect,
   Select,
   Sheet,
   Tabs,
@@ -86,7 +89,13 @@ export function TaskboardView({
   sidebarCollapsed?: boolean
   onExpandSidebar?: () => void
 }) {
-  const board = useTaskboard(auth, true, ticketTypeFromUrl)
+  const projectScope = useProjectScope()
+  const workQuery = boardWorkQuery(projectScope.scope)
+  const lockedProjectId = 'projectId' in workQuery ? workQuery.projectId : null
+  const board = useTaskboard(auth, Boolean(lockedProjectId), ticketTypeFromUrl, lockedProjectId)
+  useEffect(() => {
+    if (lockedProjectId && lockedProjectId !== board.projectId) void board.selectProject(lockedProjectId)
+  }, [lockedProjectId, board.projectId, board.selectProject])
   const toast = useToast()
   const [confirm, confirmEl] = useConfirm()
   const [promptText, promptEl] = usePrompt()
@@ -476,11 +485,6 @@ export function TaskboardView({
     onViewChange(view === 'board' ? 'list' : 'board')
   }
 
-  const projectLabel = useMemo(() => {
-    const current = (board.projects ?? []).find((p) => p.id === board.projectId && !p.archivedAt)
-    return current ? `${current.key} ${current.name}` : undefined
-  }, [board.projectId, board.projects])
-
   const renderCreateForm = (mobile: boolean) => (
     <div
       data-testid="ticket-create-form"
@@ -607,18 +611,7 @@ export function TaskboardView({
           data-testid="taskboard-responsive-toolbar"
           className="order-3 flex w-full min-w-0 items-center gap-2 md:order-2 md:ml-auto md:w-auto"
         >
-          <Select
-            aria-label="项目"
-            className="min-w-0 flex-1 md:w-56 md:max-w-[16rem] md:flex-none"
-            inputSize="sm"
-            value={board.projectId ?? ''}
-            title={projectLabel}
-            onValueChange={(id) => void board.selectProject(id)}
-            options={(board.projects ?? [])
-              .filter((p) => !p.archivedAt)
-              .map((p) => ({ value: p.id, label: `${p.key} ${p.name}` }))}
-            placeholder="选择项目"
-          />
+          <ProjectScopeSelect variant="work" className="min-w-0 flex-1 md:w-56 md:max-w-[16rem] md:flex-none" />
           <ProjectSettings
             auth={auth}
             current={board.projects?.find((p) => p.id === board.projectId) ?? null}
@@ -715,23 +708,29 @@ export function TaskboardView({
             </Button>
           }
         />
-      ) : !board.projectId ? (
-        <EmptyState
-          icon={Kanban}
-          title="还没有项目"
-          hint="新建一个项目后即可开始建单。创建时会自动带上四条默认流水线。"
-        />
       ) : view === 'cost' ? (
         <CostStatsView
           auth={auth}
-          projectId={board.projectId}
+          projectId={lockedProjectId}
           projects={(board.projects ?? []).filter((p) => !p.archivedAt)}
         />
       ) : view === 'weekly' ? (
         <WeeklyReportView
           auth={auth}
-          projectId={board.projectId}
+          projectId={lockedProjectId}
           projects={(board.projects ?? []).filter((p) => !p.archivedAt)}
+        />
+      ) : !lockedProjectId ? (
+        <EmptyState
+          icon={Kanban}
+          title={UNBOUND_BOARD_COPY}
+          hint="看板只绑定工作项目。请选择 all/none 以外的工作项目，或把当前会话绑定到看板。"
+        />
+      ) : !board.projectId ? (
+        <EmptyState
+          icon={Kanban}
+          title="还没有项目"
+          hint="新建一个项目后即可开始建单。创建时会自动带上四条默认流水线。"
         />
       ) : view === 'board' ? (
         <BoardColumns

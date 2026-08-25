@@ -56,6 +56,35 @@ export type {
 } from './engine/engineEvents.js'
 
 /**
+ * Gateway 权威终态码(wire OutboundError.code 的预分类子集)。engine 底座只发射
+ * user_cancelled;其余由 gateway 编排层(sessionManager handleExit / tape 终态 /
+ * 持久化降级)在 engine 边界之外盖章,server.ts `_buildEngineErrorFrame` 原样
+ * 透传上 wire,不再压成 upstream_failed(E4)。
+ *
+ * 类型边界说明:engine 权威事件类型(engineEvents.ts,engine/ 所有权边界内不改)
+ * 的 error 事件 `errorCode` 只声明 'user_cancelled'。gateway 编排层发射其余码时
+ * 经 sessionManager 的 `_asEngineErrorEvent` 单点受控 cast 进同一事件通道;
+ * 消费端 `_buildEngineErrorFrame` 以下方 GatewayEngineErrorEvent 形状接收。
+ */
+export type GatewayTerminalErrorCode =
+  | 'user_cancelled'
+  | 'runner_crashed'
+  | 'service_restart'
+  | 'engine_error'
+  | 'auth_error'
+  | 'session_persist_unavailable'
+
+/** error 事件的 gateway 侧加宽形状(errorCode 扩到 GatewayTerminalErrorCode)。
+ *  engine 原生 error 事件 ⊆ 本类型('user_cancelled' ⊆ 加宽联合),server 侧
+ *  消费统一按此形状,零精度损失。 */
+export type GatewayEngineErrorEvent = Omit<
+  Extract<SessionStreamEvent, { kind: 'error' }>,
+  'errorCode'
+> & {
+  errorCode?: GatewayTerminalErrorCode
+}
+
+/**
  * 审计 R3 前的本地加宽类型收敛为**权威类型的兼容别名**。
  *
  * retrying turn_status 形态与 error 事件的 errorClass 已正式上提进 engine 权威

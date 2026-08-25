@@ -18,6 +18,8 @@ import {
   generatePersona,
   assertPersona,
   personaToHeaderPairs,
+  SUPPORTED_PROXY_REGIONS,
+  isSupportedProxyRegion,
   type Persona,
 } from "../account-pool/persona.js";
 
@@ -118,7 +120,7 @@ describe("assertPersona — 合法路径", () => {
     }
   });
 
-  test("手工拼合法 persona(全 9 keys + 全非空 string)通过", () => {
+  test("手工拼合法 persona(全 10 keys + 全非空 string)通过", () => {
     const p: Persona = {
       user_agent: "ua",
       x_stainless_arch: "arm64",
@@ -129,6 +131,7 @@ describe("assertPersona — 合法路径", () => {
       x_stainless_runtime_version: "v20.0.0",
       x_stainless_retry_count: "0",
       accept_language: "en-US,en;q=0.9",
+      timezone: "America/New_York",
     };
     assertPersona(p);
   });
@@ -201,11 +204,14 @@ describe("assertPersona — 非法路径必须抛 TypeError", () => {
 // ─── personaToHeaderPairs ───────────────────────────────────────────────
 
 describe("personaToHeaderPairs", () => {
-  test("9 对、全 kebab-case header 名", () => {
+  test("9 对、全 kebab-case header 名(timezone 不进 header)", () => {
     const p = generatePersona();
     const pairs = personaToHeaderPairs(p);
     assert.equal(pairs.length, 9);
     const names = pairs.map(([k]) => k);
+    // timezone 是 persona 字段但**不是**发送头(只在 proxy 侧改写日期用),
+    // 绝不能出现在注入头里。
+    assert.ok(!names.includes("timezone"));
     assert.deepEqual(
       [...names].sort(),
       [
@@ -233,6 +239,7 @@ describe("personaToHeaderPairs", () => {
       x_stainless_runtime_version: "RTV",
       x_stainless_retry_count: "RC",
       accept_language: "AL",
+      timezone: "America/New_York",
     };
     const map = new Map(personaToHeaderPairs(p));
     assert.equal(map.get("user-agent"), "UA-X");
@@ -244,5 +251,110 @@ describe("personaToHeaderPairs", () => {
     assert.equal(map.get("x-stainless-runtime-version"), "RTV");
     assert.equal(map.get("x-stainless-retry-count"), "RC");
     assert.equal(map.get("accept-language"), "AL");
+    // timezone 不进 header
+    assert.equal(map.get("timezone"), undefined);
+  });
+});
+
+// ─── timezone(反封复盘 2026-08)─────────────────────────────────────────────
+
+describe("generatePersona — timezone 与 accept_language 一致", () => {
+  const EXPECTED: Record<string, string> = {
+    "en-US,en;q=0.9": "America/New_York",
+    "en-GB,en;q=0.9": "Europe/London",
+    "zh-CN,zh;q=0.9,en;q=0.8": "Asia/Shanghai",
+    "ja-JP,ja;q=0.9,en;q=0.8": "Asia/Tokyo",
+    "de-DE,de;q=0.9,en;q=0.8": "Europe/Berlin",
+  };
+
+  test("100 次随机:timezone 恒与 accept_language 的期望映射一致", () => {
+    for (let i = 0; i < 100; i += 1) {
+      const p = generatePersona();
+      assert.equal(
+        p.timezone,
+        EXPECTED[p.accept_language],
+        `accept_language=${p.accept_language} 应映射 ${EXPECTED[p.accept_language]}, 实际 ${p.timezone}`,
+      );
+    }
+  });
+
+  test("timezone 是合法 IANA 名(Intl 可解析)", () => {
+    const p = generatePersona();
+    assert.doesNotThrow(() =>
+      new Intl.DateTimeFormat("en-US", { timeZone: p.timezone }).format(),
+    );
+  });
+});
+
+describe("generatePersona — 代理地域驱动(反封 #1)", () => {
+  const REGION_EXPECT: Record<string, { al: string; tz: string }> = {
+    US: { al: "en-US,en;q=0.9", tz: "America/New_York" },
+    GB: { al: "en-GB,en;q=0.9", tz: "Europe/London" },
+    CN: { al: "zh-CN,zh;q=0.9,en;q=0.8", tz: "Asia/Shanghai" },
+    JP: { al: "ja-JP,ja;q=0.9,en;q=0.8", tz: "Asia/Tokyo" },
+    DE: { al: "de-DE,de;q=0.9,en;q=0.8", tz: "Europe/Berlin" },
+  };
+
+  test("每个受支持地域 → accept_language/timezone 被强制一致(50 次随机 seed)", () => {
+    for (const region of SUPPORTED_PROXY_REGIONS) {
+      const exp = REGION_EXPECT[region]!;
+      for (let i = 0; i < 50; i += 1) {
+        const p = generatePersona(undefined, region);
+        assert.equal(p.accept_language, exp.al, `region=${region}`);
+        assert.equal(p.timezone, exp.tz, `region=${region}`);
+      }
+    }
+  });
+
+  test("其它维度(os/arch/node)仍随机差异化(不被 region 锁死)", () => {
+    const fps = new Set<string>();
+    for (let i = 0; i < 50; i += 1) {
+      const p = generatePersona(undefined, "US");
+      fps.add(`${p.x_stainless_os}|${p.x_stainless_arch}|${p.x_stainless_runtime_version}`);
+    }
+    assert.ok(fps.size >= 2, `US 号仍应在 os/arch/node 上有差异, got ${fps.size}`);
+  });
+
+  test("null / 未知地域 → 回退随机(accept_language 仍合法)", () => {
+    for (const region of [null, undefined, "XX", "us", ""]) {
+      const p = generatePersona(undefined, region as string | null | undefined);
+      assert.ok(
+        Object.values(REGION_EXPECT).some((e) => e.al === p.accept_language),
+        `accept_language 应在池内, got ${p.accept_language}`,
+      );
+      // 时区始终与其 accept_language 自洽
+      assert.equal(p.timezone, REGION_EXPECT[
+        Object.keys(REGION_EXPECT).find((k) => REGION_EXPECT[k]!.al === p.accept_language)!
+      ]!.tz);
+    }
+  });
+
+  test("SUPPORTED_PROXY_REGIONS / isSupportedProxyRegion", () => {
+    assert.deepEqual([...SUPPORTED_PROXY_REGIONS].sort(), ["CN", "DE", "GB", "JP", "US"]);
+    assert.ok(isSupportedProxyRegion("US"));
+    assert.ok(!isSupportedProxyRegion("us"));
+    assert.ok(!isSupportedProxyRegion("XX"));
+    assert.ok(!isSupportedProxyRegion(null));
+    assert.ok(!isSupportedProxyRegion(undefined));
+  });
+});
+
+describe("assertPersona — 缺 timezone", () => {
+  test("缺 timezone key → 抛", () => {
+    const partial: Record<string, string> = {
+      user_agent: "ua",
+      x_stainless_arch: "arm64",
+      x_stainless_lang: "js",
+      x_stainless_os: "MacOS",
+      x_stainless_package_version: "0.81.0",
+      x_stainless_runtime: "node",
+      x_stainless_runtime_version: "v20.0.0",
+      x_stainless_retry_count: "0",
+      accept_language: "en-US,en;q=0.9",
+    };
+    assert.throws(
+      () => assertPersona(partial),
+      (err) => err instanceof TypeError && err.message.includes("timezone"),
+    );
   });
 });
