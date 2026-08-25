@@ -56,7 +56,7 @@ import {
   fetchAnthropicAccountUuid,
 } from "../account-pool/anthropicProfile.js";
 import { getDispatcherForAccount } from "../account-pool/egressDispatcher.js";
-import { getEgressProxyUrlPlaintext } from "./egressProxies.js";
+import { getEgressProxyUrlPlaintext, getEgressProxyRegion } from "./egressProxies.js";
 import {
   getAccountGroup,
   listAccountGroups,
@@ -269,6 +269,35 @@ function isAccountUuidUniqueViolation(err: unknown): boolean {
   return typeof e.constraint === "string" && e.constraint === "idx_ca_account_uuid_uq";
 }
 
+/**
+ * 反封 #1 — 判断是否命中"claude 一号一代理"唯一索引(0250
+ * idx_claude_accounts_egress_proxy_uniq)。命中 = 该住宅代理已被另一个 claude 账号占用。
+ */
+function isEgressProxyUniqueViolation(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { code?: unknown; constraint?: unknown };
+  return (
+    e.code === "23505" &&
+    typeof e.constraint === "string" &&
+    e.constraint === "idx_claude_accounts_egress_proxy_uniq"
+  );
+}
+
+/**
+ * 反封 #1 — claude 一号一代理预检:同一 egress_proxy_id 已绑其它 active/非删除
+ * 的 claude 账号时,给出友好错误(DB 唯一索引是最终兜底,这里是提前拦 + 明确报错)。
+ */
+async function ensureEgressProxyNotBoundToOtherClaude(proxyId: string): Promise<void> {
+  const r = await getPool().query<{ c: string }>(
+    `SELECT COUNT(*)::text AS c FROM claude_accounts
+      WHERE provider = 'claude' AND egress_proxy_id = $1::bigint`,
+    [proxyId],
+  );
+  if (r.rows[0] && r.rows[0].c !== "0") {
+    throw new RangeError("egress_proxy_already_bound_to_claude");
+  }
+}
+
 export async function adminCreateAccount(
   input: AdminCreateAccountInput,
   ctx: AdminAuditCtx,
@@ -332,7 +361,18 @@ export async function adminCreateAccount(
       throw new RangeError("invalid_egress_proxy_id");
     }
     await ensureEgressProxyExistsOrThrow(egressProxyId);
+    // 反封 #1 — claude 一号一代理:同一住宅代理不得被多个 claude 账号共用。
+    if (provider === "claude") {
+      await ensureEgressProxyNotBoundToOtherClaude(egressProxyId);
+    }
   }
+
+  // 反封 #1 — 出口代理地域驱动 persona:读代理 region(可空),建号时传给 store
+  // 让 accept_language/timezone 与代理国一致。非 claude / 未设 region → null(随机)。
+  const personaRegion =
+    provider === "claude" && egressProxyId !== null
+      ? await getEgressProxyRegion(egressProxyId)
+      : null;
 
   const normalizedGroupId = await normalizeGroupIdForAccount(provider, input.group_id, { defaultOfficialOAuthGroup: true });
 
@@ -364,6 +404,7 @@ export async function adminCreateAccount(
     subscription_end_at: subscriptionEndAt,
     egress_proxy_id: egressProxyId,
     account_uuid: accountUuid,
+    persona_region: personaRegion,
     group_id: normalizedGroupId ?? null,
     // 0098(P0-2)—— 本实例建号一律归本实例 channel(v5 实例 admin 建/导入
     // codex 账号强制 runtime_channel='v5';v3 实例落 'v3',与 DB DEFAULT 同值,
@@ -380,6 +421,10 @@ export async function adminCreateAccount(
     // 同一 Anthropic 账号。转 RangeError 让 HTTP 层返 400 而非 500。
     if (isAccountUuidUniqueViolation(err)) {
       throw new RangeError("account_uuid_already_exists");
+    }
+    // 反封 #1 — 一号一代理唯一索引兜底(预检与 INSERT 之间的并发窗口)。
+    if (isEgressProxyUniqueViolation(err)) {
+      throw new RangeError("egress_proxy_already_bound_to_claude");
     }
     throw err;
   }
@@ -586,7 +631,16 @@ export async function adminPatchAccount(
   if (expiresAt !== undefined) storePatch.oauth_expires_at = expiresAt;
   if (subscriptionEndAt !== undefined) storePatch.subscription_end_at = subscriptionEndAt;
 
-  const after = await storeUpdate(id, storePatch);
+  let after: AccountRow | null;
+  try {
+    after = await storeUpdate(id, storePatch);
+  } catch (err) {
+    // 反封 #1 — reassign 到已被其它 claude 账号占用的代理 → 一号一代理唯一索引 23505。
+    if (isEgressProxyUniqueViolation(err)) {
+      throw new RangeError("egress_proxy_already_bound_to_claude");
+    }
+    throw err;
+  }
   if (!after) throw new AccountNotFoundError(id);
 
   // v1.0.120 feat/codex-disable-rebind:status active→disabled 且 provider='codex'

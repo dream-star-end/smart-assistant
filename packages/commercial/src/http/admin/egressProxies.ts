@@ -34,6 +34,7 @@ function serializeEgressProxy(r: import("../../admin/egressProxies.js").EgressPr
     label: r.label,
     status: r.status,
     notes: r.notes,
+    region: r.region,
     url_masked: r.url_masked,
     created_at: r.created_at.toISOString(),
     updated_at: r.updated_at.toISOString(),
@@ -108,6 +109,12 @@ export async function handleAdminCreateEgressProxy(
     }
     input.notes = b.notes;
   }
+  if (b.region !== undefined) {
+    if (b.region !== null && typeof b.region !== "string") {
+      throw new HttpError(400, "VALIDATION", "region must be string or null");
+    }
+    input.region = b.region;
+  }
   const { createEgressProxy, EgressProxyLabelTakenError } = await import(
     "../../admin/egressProxies.js"
   );
@@ -159,6 +166,12 @@ export async function handleAdminPatchEgressProxy(
       throw new HttpError(400, "VALIDATION", "notes must be string or null");
     }
     patch.notes = b.notes;
+  }
+  if (b.region !== undefined) {
+    if (b.region !== null && typeof b.region !== "string") {
+      throw new HttpError(400, "VALIDATION", "region must be string or null");
+    }
+    patch.region = b.region;
   }
   const { patchEgressProxy, EgressProxyNotFoundError, EgressProxyLabelTakenError } = await import(
     "../../admin/egressProxies.js"

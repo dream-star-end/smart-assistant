@@ -18,6 +18,8 @@ import {
   generatePersona,
   assertPersona,
   personaToHeaderPairs,
+  SUPPORTED_PROXY_REGIONS,
+  isSupportedProxyRegion,
   type Persona,
 } from "../account-pool/persona.js";
 
@@ -281,6 +283,59 @@ describe("generatePersona — timezone 与 accept_language 一致", () => {
     assert.doesNotThrow(() =>
       new Intl.DateTimeFormat("en-US", { timeZone: p.timezone }).format(),
     );
+  });
+});
+
+describe("generatePersona — 代理地域驱动(反封 #1)", () => {
+  const REGION_EXPECT: Record<string, { al: string; tz: string }> = {
+    US: { al: "en-US,en;q=0.9", tz: "America/New_York" },
+    GB: { al: "en-GB,en;q=0.9", tz: "Europe/London" },
+    CN: { al: "zh-CN,zh;q=0.9,en;q=0.8", tz: "Asia/Shanghai" },
+    JP: { al: "ja-JP,ja;q=0.9,en;q=0.8", tz: "Asia/Tokyo" },
+    DE: { al: "de-DE,de;q=0.9,en;q=0.8", tz: "Europe/Berlin" },
+  };
+
+  test("每个受支持地域 → accept_language/timezone 被强制一致(50 次随机 seed)", () => {
+    for (const region of SUPPORTED_PROXY_REGIONS) {
+      const exp = REGION_EXPECT[region]!;
+      for (let i = 0; i < 50; i += 1) {
+        const p = generatePersona(undefined, region);
+        assert.equal(p.accept_language, exp.al, `region=${region}`);
+        assert.equal(p.timezone, exp.tz, `region=${region}`);
+      }
+    }
+  });
+
+  test("其它维度(os/arch/node)仍随机差异化(不被 region 锁死)", () => {
+    const fps = new Set<string>();
+    for (let i = 0; i < 50; i += 1) {
+      const p = generatePersona(undefined, "US");
+      fps.add(`${p.x_stainless_os}|${p.x_stainless_arch}|${p.x_stainless_runtime_version}`);
+    }
+    assert.ok(fps.size >= 2, `US 号仍应在 os/arch/node 上有差异, got ${fps.size}`);
+  });
+
+  test("null / 未知地域 → 回退随机(accept_language 仍合法)", () => {
+    for (const region of [null, undefined, "XX", "us", ""]) {
+      const p = generatePersona(undefined, region as string | null | undefined);
+      assert.ok(
+        Object.values(REGION_EXPECT).some((e) => e.al === p.accept_language),
+        `accept_language 应在池内, got ${p.accept_language}`,
+      );
+      // 时区始终与其 accept_language 自洽
+      assert.equal(p.timezone, REGION_EXPECT[
+        Object.keys(REGION_EXPECT).find((k) => REGION_EXPECT[k]!.al === p.accept_language)!
+      ]!.tz);
+    }
+  });
+
+  test("SUPPORTED_PROXY_REGIONS / isSupportedProxyRegion", () => {
+    assert.deepEqual([...SUPPORTED_PROXY_REGIONS].sort(), ["CN", "DE", "GB", "JP", "US"]);
+    assert.ok(isSupportedProxyRegion("US"));
+    assert.ok(!isSupportedProxyRegion("us"));
+    assert.ok(!isSupportedProxyRegion("XX"));
+    assert.ok(!isSupportedProxyRegion(null));
+    assert.ok(!isSupportedProxyRegion(undefined));
   });
 });
 

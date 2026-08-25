@@ -218,6 +218,12 @@ export interface CreateAccountInput {
    * 类型拒绝(`invalid input syntax for type uuid`)— store 不二次校验。
    */
   account_uuid?: string | null;
+  /**
+   * 反封复盘 2026-08(#1)— 出口代理地域码(见 persona.ts REGION_ACCEPT_LANGUAGE)。
+   * admin layer 从绑定的 egress_proxies.region 读出后传入,驱动 persona 的
+   * accept_language / timezone 与代理国一致。undefined/null → persona 随机地域(旧行为)。
+   */
+  persona_region?: string | null;
   /** Optional group binding. Admin layer validates provider/kind compatibility. */
   group_id?: bigint | string | null;
   /**
@@ -478,7 +484,9 @@ export async function createAccount(
     // 设为 NOT NULL,如果 INSERT 不传 persona 会被 DB 直接拒。生成阶段调
     // assertPersona() 自洽校验,失败抛 TypeError(generatePersona 当前实现永远
     // 返合法值,assert 是防御性兜底,捕未来 variants 池 refactor 悄默破坏 shape)。
-    const persona = generatePersona();
+    // 反封复盘 2026-08(#1):代理地域驱动 persona —— 传入 persona_region 让
+    // accept_language/timezone 与出口代理国一致(null → 随机地域,旧行为)。
+    const persona = generatePersona(undefined, input.persona_region ?? null);
     assertPersona(persona);
 
     const res = await query<RawMetaRow>(

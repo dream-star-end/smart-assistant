@@ -166,6 +166,35 @@ const ACCEPT_LANGUAGE_TIMEZONE: Record<string, string> = {
 };
 
 /**
+ * 反封复盘 2026-08(#1)— 出口代理地域(国家码)→ accept_language 的映射。
+ *
+ * 设计倒置:persona 在建号时随机生成,发生在管理员选代理**之后**,所以不能
+ * "校验 persona 地域 == 代理地域";而是**让代理地域驱动 persona 生成**——给账号
+ * 配一个某国住宅代理,就生成该国 locale 的 persona,IP/语言/时区天然一致。
+ *
+ * key = egress_proxies.region 存的国家码;value = accept_language 池里的完整串
+ * (再经 ACCEPT_LANGUAGE_TIMEZONE 推出时区),保证"代理国 → 语言 → 时区"一条链自洽。
+ * 代理未设 region(NULL)→ generatePersona 不传 region → 回到随机(旧行为)。
+ */
+const REGION_ACCEPT_LANGUAGE: Record<string, string> = {
+  US: "en-US,en;q=0.9",
+  GB: "en-GB,en;q=0.9",
+  CN: "zh-CN,zh;q=0.9,en;q=0.8",
+  JP: "ja-JP,ja;q=0.9,en;q=0.8",
+  DE: "de-DE,de;q=0.9,en;q=0.8",
+};
+
+/** egress_proxies.region 允许的国家码(admin 校验用)。NULL 也允许(= 不绑地域)。 */
+export const SUPPORTED_PROXY_REGIONS = Object.freeze(
+  Object.keys(REGION_ACCEPT_LANGUAGE),
+) as ReadonlyArray<string>;
+
+/** 判定一个字符串是否合法的代理地域码。 */
+export function isSupportedProxyRegion(region: unknown): region is string {
+  return typeof region === "string" && region in REGION_ACCEPT_LANGUAGE;
+}
+
+/**
  * 拼 user_agent —— 复刻真实 Claude Code CLI 的 wire UA。
  *
  * 真实格式(claude-code-best/src/utils/http.ts::getUserAgent):
@@ -196,8 +225,12 @@ function pick<T>(buf: Buffer, offset: number, pool: ReadonlyArray<T>): T {
  * @param seed 可选 32 字节随机 seed。不传时内部 randomBytes(32) — 用于 createAccount。
  *             传时(typically pinned_user_id 的二进制形式)用于"账号迁移 / 重建 persona"
  *             这种需要 deterministic 的场景(本仓现在没用,留 API surface 给未来 backfill 之外的需要)。
+ * @param region 可选出口代理地域码(见 REGION_ACCEPT_LANGUAGE)。命中已知地域时**强制**
+ *             accept_language(及推导出的 timezone)与代理国一致,让 IP/语言/时区自洽;
+ *             null/未知 → 回退按 seed/随机选 accept_language(旧行为)。os/arch/node
+ *             运行时版本等仍随机差异化,不受 region 影响。
  */
-export function generatePersona(seed?: Buffer): Persona {
+export function generatePersona(seed?: Buffer, region?: string | null): Persona {
   const buf = seed
     ? createHash("sha256").update(seed).digest()
     : randomBytes(32);
@@ -206,7 +239,11 @@ export function generatePersona(seed?: Buffer): Persona {
   const os = pick(buf, 1, PERSONA_VARIANTS.os);
   const runtime = pick(buf, 2, PERSONA_VARIANTS.runtime);
   const runtimeVersion = pick(buf, 3, PERSONA_VARIANTS.runtime_version);
-  const acceptLanguage = pick(buf, 4, PERSONA_VARIANTS.accept_language);
+  // region 命中 → 强制该国 accept_language(代理地域驱动);否则按 seed/随机。
+  const regionAcceptLanguage =
+    region != null ? REGION_ACCEPT_LANGUAGE[region] : undefined;
+  const acceptLanguage =
+    regionAcceptLanguage ?? pick(buf, 4, PERSONA_VARIANTS.accept_language);
   const retryCount = pick(buf, 5, PERSONA_VARIANTS.retry_count);
   const lang = pick(buf, 6, PERSONA_VARIANTS.lang);
 
