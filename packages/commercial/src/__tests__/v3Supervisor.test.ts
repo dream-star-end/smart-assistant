@@ -303,6 +303,8 @@ class FakePool {
    */
   forceConflictConstraintName: Map<number, string> = new Map();
   insertCount = 0;
+  lastVanishedSql: string | null = null;
+  lastVanishedParams: unknown[] | null = null;
   /**
    * v3 per-host cap admission test hook —— mock compute_hosts.max_containers。
    * 未配置 host_uuid → 走 DEFAULT_TEST_HOST_MAX(999,默认不踩 cap)。
@@ -428,15 +430,19 @@ class FakePool {
           return { rowCount: r ? 1 : 0, rows: [] };
         }
         if (/UPDATE agent_containers/i.test(trimmed) && /SET state\s*=\s*'vanished'/i.test(trimmed)) {
+          self.lastVanishedSql = trimmed;
+          self.lastVanishedParams = params ? [...params] : [];
           const id = Number.parseInt(String(params![0]), 10);
           const r = self.rows.find((x) => x.id === id);
           const hasIdle = /last_ws_activity IS NOT NULL/i.test(trimmed)
             && /last_ws_activity < NOW\(\)/i.test(trimmed);
           if (hasIdle && r) {
-            const cutoffMin = Number(params![3]);
+            const slot = /NOW\(\) - \(\$(\d+)::int \* interval/i.exec(trimmed);
+            const cutoffMin = slot
+              ? Number(params![Number(slot[1]) - 1])
+              : Number(params![3]);
             const cutoff = new Date(Date.now() - cutoffMin * 60_000);
             if (r.last_ws_activity == null || r.last_ws_activity >= cutoff) {
-              const returnsHostUuid = /RETURNING\s+host_uuid/i.test(trimmed);
               return { rowCount: 0, rows: [] };
             }
           }
@@ -1541,6 +1547,42 @@ describe("stopAndRemoveV3Container", () => {
     assert.equal(pool.rows[0]!.state, "active");
     assert.equal(captured.stopped, 0);
     assert.equal(captured.removed, 0);
+  });
+
+  test("requireNoOpenMigration+requireIdleCutoffMin: 占位符与 cutoff 参数对齐且能拦截", async () => {
+    const { docker, captured } = makeDocker();
+    const pool = new FakePool();
+    pool.rows.push({
+      id: 102,
+      user_id: 13,
+      host_uuid: null,
+      bound_ip: "172.30.9.102",
+      image: TEST_IMAGE,
+      secret_hash: Buffer.alloc(32),
+      state: "active",
+      port: 18789,
+      container_internal_id: "bothcid",
+      last_ws_activity: new Date(),
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    const ok = await stopAndRemoveV3Container(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      { id: 102, container_internal_id: "bothcid" },
+      5,
+      { requireNoOpenMigration: true, requireIdleCutoffMin: 30 },
+    );
+    assert.equal(ok, false);
+    assert.equal(pool.rows[0]!.state, "active");
+    assert.equal(captured.stopped, 0);
+    assert.ok(pool.lastVanishedSql);
+    assert.ok(/NOT EXISTS/i.test(pool.lastVanishedSql!));
+    const slot = /NOW\(\) - \(\$(\d+)::int \* interval/.exec(pool.lastVanishedSql!);
+    assert.ok(slot, `idle placeholder missing in SQL: ${pool.lastVanishedSql}`);
+    const n = Number(slot![1]);
+    assert.equal(pool.lastVanishedParams![n - 1], 30);
+    assert.equal(n, pool.lastVanishedParams!.length);
+    assert.equal(n > 3, true, "idle 必须排在 id/channel/cid 之后");
   });
 
   test("docker missing → 仍然把 row 标 vanished(幂等)", async () => {

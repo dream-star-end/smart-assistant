@@ -266,6 +266,54 @@ async function turnBarrierSkipReason(
 }
 
 /**
+ * stopAndRemove 守卫 UPDATE 命中 0 行时的廉价分类。只走这条罕见分支。
+ * 查询失败回退 racedWithMigration,不把整行打进 errors。
+ */
+async function classifyStopMiss(
+  deps: V3SupervisorDeps,
+  row: StaleRow,
+  idleCutoffMin: number,
+): Promise<RowSkipReason> {
+  try {
+    const r = await deps.pool.query<{
+      state: string;
+      last_ws_activity: Date | null;
+      container_internal_id: string | null;
+      open_migration: boolean;
+    }>(
+      `SELECT c.state,
+              c.last_ws_activity,
+              c.container_internal_id,
+              EXISTS (
+                SELECT 1 FROM agent_migrations m
+                 WHERE m.agent_container_id = c.id
+                   AND m.phase NOT IN ('committed', 'rolled_back')
+              ) AS open_migration
+         FROM agent_containers c
+        WHERE c.id = $1::bigint
+          AND c.runtime_channel = $2::text`,
+      [String(row.id), getRuntimeChannel()],
+    );
+    if ((r.rowCount ?? 0) === 0) return "skippedGeneration";
+    const rec = r.rows[0]!;
+    if (rec.state !== "active") return "skippedGeneration";
+    const cidNow = rec.container_internal_id ?? null;
+    const cidExpect = row.container_internal_id ?? null;
+    if (cidNow !== cidExpect) return "skippedGeneration";
+    const cutoff = Date.now() - idleCutoffMin * 60_000;
+    const activityMs = rec.last_ws_activity == null
+      ? null
+      : new Date(rec.last_ws_activity).getTime();
+    if (activityMs == null || activityMs >= cutoff) return "racedWithActivity";
+    const openMig: unknown = rec.open_migration;
+    if (openMig === true || openMig === "t") return "racedWithMigration";
+    return "skippedGeneration";
+  } catch {
+    return "racedWithMigration";
+  }
+}
+
+/**
  * 单行:BEGIN → try lock → FOR UPDATE 重读 → turn 屏障 → COMMIT → 立刻 stop+remove。
  *
  * 破坏性 UPDATE 走 deps.pool(另一条连接),必须在 FOR UPDATE 释放之后才发,
@@ -311,10 +359,11 @@ async function sweepOneRow(
       { requireNoOpenMigration: true, requireIdleCutoffMin: idleCutoffMin },
     );
     if (ok) return { kind: "swept" };
-    log?.debug?.("[v3/idleSweep] skipped: open migration ledger present", {
-      containerId: row.id,
+    const reason = await classifyStopMiss(deps, row, idleCutoffMin);
+    log?.debug?.("[v3/idleSweep] skipped after guarded UPDATE miss", {
+      containerId: row.id, reason,
     });
-    return { kind: "skip", reason: "racedWithMigration" };
+    return { kind: "skip", reason };
   } catch (err) {
     if (txOpen) {
       try { await client.query("ROLLBACK"); } catch { /* swallow */ }

@@ -3479,18 +3479,20 @@ export async function stopAndRemoveV3Container(
     : "";
   // idle sweep 第二道闸:破坏性 UPDATE 当场重校 last_ws_activity,关掉 SELECT→stop
   // 之间用户重连的 TOCTOU。不传该 option 时 SQL 与历史逐字节等价。
+  // 占位符序号由 updateParams 长度推导:guardSql 将来若带参数,先 push 再拼 idle,
+  // 禁止再写死 $4。
   const idleCutoffMin = options?.requireIdleCutoffMin;
-  const idleSql =
-    typeof idleCutoffMin === "number" && Number.isFinite(idleCutoffMin)
-      ? ` AND last_ws_activity IS NOT NULL
-        AND last_ws_activity < NOW() - ($4::int * interval '1 minute')`
-      : "";
   const updateParams: unknown[] = [
     String(containerRow.id),
     getRuntimeChannel(),
     containerRow.container_internal_id ?? null,
   ];
-  if (idleSql) updateParams.push(idleCutoffMin);
+  let idleSql = "";
+  if (typeof idleCutoffMin === "number" && Number.isFinite(idleCutoffMin)) {
+    updateParams.push(idleCutoffMin);
+    idleSql = ` AND last_ws_activity IS NOT NULL
+        AND last_ws_activity < NOW() - ($${updateParams.length}::int * interval '1 minute')`;
+  }
   // P1d 跨 channel 防护:破坏性 UPDATE 必须带 runtime_channel 过滤 —— 否则任何传错(对方
   // channel)id 的 caller 都会把对方行翻 vanished 并随后 docker stop/remove。$2=本实例 channel。
   const updateResult = await deps.pool.query<{ host_uuid: string | null }>(

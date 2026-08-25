@@ -122,6 +122,8 @@ class FakePool {
   updateActivityCalls: number[] = []; // ids 被 mark 过
   /** FOR UPDATE 重读前把这些 id 的 last_ws_activity 刷成 NOW(),模拟 SELECT 后用户重连 */
   touchActivityOnReread = new Set<number>();
+  /** vanish UPDATE 前刷 last_ws_activity=NOW(),模拟 COMMIT→UPDATE 窗口重连 */
+  touchActivityOnVanishedUpdate = new Set<number>();
   /** pg_try_advisory_xact_lock 对这些 uid key 返回 false */
   denyLockUidKeys = new Set<number>();
   /** getV3ContainerStatus 返回的 containerId 覆盖(模拟 generation changed) */
@@ -224,6 +226,24 @@ class FakePool {
       }
       return { rowCount: 0, rows: [] };
     }
+    // classifyStopMiss: SELECT c.state, c.last_ws_activity, ... EXISTS open_migration
+    if (
+      /c\.last_ws_activity/i.test(trimmed) &&
+      /AS open_migration/i.test(trimmed)
+    ) {
+      const id = Number.parseInt(String(params?.[0]), 10);
+      const r = this.rows.find((x) => x.id === id);
+      if (!r) return { rowCount: 0, rows: [] };
+      return {
+        rowCount: 1,
+        rows: [{
+          state: r.state,
+          last_ws_activity: r.last_ws_activity,
+          container_internal_id: r.container_internal_id,
+          open_migration: this.hasOpenMigration(id),
+        }],
+      };
+    }
     // getV3ContainerStatus
     if (
       /SELECT id, user_id,\s*host\(bound_ip\)/i.test(trimmed) &&
@@ -259,12 +279,18 @@ class FakePool {
       const hasIdle = /last_ws_activity IS NOT NULL/i.test(trimmed)
         && /last_ws_activity < NOW\(\)/i.test(trimmed);
       const r = this.rows.find((x) => x.id === id);
+      if (r && this.touchActivityOnVanishedUpdate.has(id)) {
+        r.last_ws_activity = new Date();
+      }
       // 守卫拦截:行存在但 open migration ledger 也在 → UPDATE 命中 0
       if (hasGuard && r && this.hasOpenMigration(id)) {
         return { rowCount: 0, rows: [] };
       }
       if (hasIdle && r) {
-        const cutoffMin = Number(params?.[3]);
+        const slot = /NOW\(\) - \(\$(\d+)::int \* interval/i.exec(trimmed);
+        const cutoffMin = slot
+          ? Number(params?.[Number(slot[1]) - 1])
+          : Number(params?.[3]);
         if (!this.isIdle(r, cutoffMin)) {
           return { rowCount: 0, rows: [] };
         }
@@ -630,6 +656,27 @@ describe("runIdleSweepTick", () => {
     assert.equal(r.scanned, 1);
     assert.equal(r.swept, 0);
     assert.equal(r.skippedGeneration, 1);
+    assert.equal(captured.stopped.length, 0);
+    assert.equal(pool.rows[0]!.state, "active");
+  });
+
+  test("COMMIT 后 UPDATE 因闲置谓词 miss → racedWithActivity 而非 racedWithMigration", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 86, user_id: 860, bound_ip: "172.30.86.1",
+      state: "active", port: 18789,
+      container_internal_id: "d-86",
+      last_ws_activity: makeStaleDate(45),
+    });
+    pool.touchActivityOnVanishedUpdate.add(86);
+    const { docker, captured } = makeDocker();
+    const r = await runIdleSweepTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+    });
+    assert.equal(r.scanned, 1);
+    assert.equal(r.swept, 0);
+    assert.equal(r.racedWithActivity, 1);
+    assert.equal(r.racedWithMigration, 0);
     assert.equal(captured.stopped.length, 0);
     assert.equal(pool.rows[0]!.state, "active");
   });
