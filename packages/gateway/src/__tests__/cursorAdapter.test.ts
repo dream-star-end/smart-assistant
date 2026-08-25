@@ -12,6 +12,7 @@ import {
   CURSOR_MAX_TURN_PAYLOAD_BYTES,
   CursorAdapter,
   cursorResumeStorePath,
+  usableCursorResumeId,
   _internals,
 } from '../engine/cursorAdapter.js'
 import type { EngineEvent, EngineExternalBillingEvent } from '../engine/engineEvents.js'
@@ -1671,6 +1672,40 @@ setInterval(() => {}, 1000);
     const adapter = new CursorAdapter(opts('/tmp'))
     assert.equal(adapter.capabilities.historyMode, 'native-resume')
     assert.equal(adapter.capabilities.resumeKind, 'cursor-session')
+  })
+
+  test('usableCursorResumeId prefers a live id whose store exists at spawn cwd', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-usable-'))
+    const liveId = 'aaaaaaaa-bbbb-cccc-dddd-111111111111'
+    const mappedId = 'aaaaaaaa-bbbb-cccc-dddd-222222222222'
+    const store = cursorResumeStorePath(dir, liveId)
+    await mkdir(path.dirname(store), { recursive: true })
+    await writeFile(store, '')
+    try {
+      assert.equal(
+        usableCursorResumeId({ workspacePath: dir, liveId, mappedId }),
+        liveId,
+      )
+      assert.equal(
+        usableCursorResumeId({ workspacePath: dir, liveId: null, mappedId: liveId }),
+        liveId,
+      )
+      assert.equal(
+        usableCursorResumeId({ workspacePath: dir, liveId: mappedId, mappedId: liveId }),
+        liveId,
+      )
+      assert.equal(
+        usableCursorResumeId({ workspacePath: dir, liveId: mappedId, mappedId }),
+        undefined,
+      )
+      assert.equal(
+        usableCursorResumeId({ workspacePath: '/no/such/workspace', liveId, mappedId: liveId }),
+        undefined,
+      )
+    } finally {
+      await rm(path.dirname(store), { recursive: true, force: true })
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   test('captures Cursor session_id from stream-json and emits it once', async () => {

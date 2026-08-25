@@ -1005,6 +1005,52 @@ describe('CcbMessageParser: system', () => {
     assert.equal(events.length, 0)
   })
 
+  it('emits task_notification as an independent event, not a transcript block', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'agt-1',
+      status: 'completed',
+      output_file: '/tmp/out',
+      summary: 'done',
+      tool_use_id: 'toolu_1',
+    } as any)
+    assert.equal(events.length, 1)
+    assert.equal(events[0].kind, 'task_notification')
+    if (events[0].kind === 'task_notification') {
+      assert.equal(events[0].taskId, 'agt-1')
+      assert.equal(events[0].status, 'completed')
+      assert.equal(events[0].outputFile, '/tmp/out')
+      assert.equal(events[0].summary, 'done')
+      assert.equal(events[0].toolUseId, 'toolu_1')
+    }
+  })
+
+  it('still emits task_notification after finalize', () => {
+    const { parser, events } = createParser()
+    parser.finish()
+    parser.parse({
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'agt-2',
+      status: 'completed',
+      output_file: '/tmp/out2',
+      summary: 'late',
+    } as any)
+    assert.equal(events.length, 1)
+    assert.equal(events[0].kind, 'task_notification')
+    if (events[0].kind === 'task_notification') {
+      assert.equal(events[0].taskId, 'agt-2')
+    }
+  })
+
+  it('drops task_notification with empty task_id', () => {
+    const { parser, events } = createParser()
+    parser.parse({ type: 'system', subtype: 'task_notification', task_id: '' } as any)
+    assert.equal(events.length, 0)
+  })
+
   // Plan 2 (compact-progress-frame) — system.status 转 kind:'turn_status'
   // 受控枚举(coreSchemas.ts:SDKStatusSchema 只 'compacting' | null),parser 不
   // 透传 CCB raw 字符串。未来 CCB 加新 status 时,gateway 没显式映射会被 normalize

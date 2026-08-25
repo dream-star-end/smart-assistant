@@ -516,3 +516,30 @@ export function isSlashCommand(cmd: QueuedCommand): boolean {
     (!cmd.skipSlashCommands || cmd.bridgeOrigin === true)
   )
 }
+
+/**
+ * Mid-turn drain snapshot at a tool-result boundary.
+ *
+ * Matches query.ts historical behavior (now/next always; later only after
+ * Sleep) plus an insurance hatch: `mode === 'task-notification'` is included
+ * even when this round never called Sleep. Missing priority is treated as
+ * `'next'`, same as getCommandsByMaxPriority.
+ *
+ * Agent scoping is preserved: main thread only takes agentId === undefined;
+ * subagents only take task-notifications addressed to them.
+ */
+export function selectMidTurnDrainCommands(opts: {
+  sleepRan: boolean
+  isMainThread: boolean
+  currentAgentId?: string
+}): QueuedCommand[] {
+  return getCommandsByMaxPriority('later').filter(cmd => {
+    if (isSlashCommand(cmd)) return false
+    if (!opts.sleepRan && cmd.mode !== 'task-notification') {
+      const priority = cmd.priority ?? 'next'
+      if (priority === 'later') return false
+    }
+    if (opts.isMainThread) return cmd.agentId === undefined
+    return cmd.mode === 'task-notification' && cmd.agentId === opts.currentAgentId
+  })
+}

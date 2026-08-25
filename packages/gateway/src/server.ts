@@ -311,6 +311,14 @@ import {
   sendToAgentCallbackIdempotencyKey,
 } from './sendToAgentCallback.js'
 import {
+  buildCcbLocalAgentCallbackText,
+  ccbLocalAgentCallbackClientMessageId,
+  ccbLocalAgentCallbackIdempotencyKey,
+  planCcbLocalAgentCallback,
+  sessionHasInFlightTurn,
+  type CcbLocalAgentNotification,
+} from './ccbLocalAgentCallback.js'
+import {
   persistSendToAgentIntent,
   recoverInterruptedSendToAgentIntents,
   removeSendToAgentIntent,
@@ -2337,6 +2345,9 @@ export class Gateway {
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
+    this.sessions.onCcbTaskNotification = (session, payload) => {
+      void this.handleCcbLocalAgentNotification(session, payload)
+    }
     this.autoDream = new AutoDreamService({
       runModel: (input) => this._runAutoDreamModel(input),
       notifyResult: (report) => postInboxMessage(formatAutoDreamReceipt(report)),
@@ -12508,6 +12519,176 @@ export class Gateway {
     )
   }
 
+  private handleCcbLocalAgentNotification(
+    session: { sessionKey: string; userId?: string; _activeTurnCount?: number; _activeClientTurnCount?: number },
+    payload: CcbLocalAgentNotification,
+  ): void {
+    const taskId = (payload.taskId || '').trim()
+    if (!taskId) return
+    const plan = planCcbLocalAgentCallback({
+      sessionKey: session.sessionKey,
+      taskId,
+      hasInFlightTurn: sessionHasInFlightTurn(session),
+    })
+    if (plan !== 'inject') {
+      this.log.info('ccb local-agent callback skipped', {
+        sessionKey: session.sessionKey,
+        taskId,
+        plan,
+      })
+      return
+    }
+    void this.injectCcbLocalAgentCallback({
+      sessionKey: session.sessionKey,
+      userId: session.userId,
+      taskId,
+      status: payload.status,
+      outputFile: payload.outputFile,
+      summary: payload.summary,
+    }).catch((err) => {
+      this.log.warn('ccb local-agent callback inject failed', {
+        sessionKey: session.sessionKey,
+        taskId,
+        err: String(err),
+      })
+    })
+  }
+
+  /**
+   * 父会话无 in-flight turn 时，把 CCB local-agent 完成通知 origin-inject
+   * 成一条新的 user 行。父 turn 仍在飞时由 CCB mid-turn drain 负责，这里
+   * 不再 retry。父 CCB 进程已死不兜底。
+   */
+  private async injectCcbLocalAgentCallback(args: {
+    sessionKey: string
+    userId?: string
+    taskId: string
+    status?: string
+    outputFile?: string
+    summary?: string
+  }): Promise<CronOriginFireResult> {
+    const origin = parseOriginWebchatSessionKey(args.sessionKey)
+    if (!origin) {
+      this.log.warn('ccb local-agent callback skipped: session is not webchat dm', {
+        taskId: args.taskId,
+        sessionKey: args.sessionKey,
+      })
+      return { kind: 'fallback' }
+    }
+    const live = this.sessions.getByKey(origin.sessionKey)
+    if (sessionHasInFlightTurn(live)) {
+      return { kind: 'fallback' }
+    }
+    const text = buildCcbLocalAgentCallbackText({
+      taskId: args.taskId,
+      status: args.status,
+      outputFile: args.outputFile,
+      summary: args.summary,
+    })
+    const clientMessageId = ccbLocalAgentCallbackClientMessageId(args.taskId)
+    const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
+    let queued = false
+    try {
+      const parent = this.sessions.getByKey(origin.sessionKey)
+      if (sessionHasInFlightTurn(parent)) {
+        return { kind: 'fallback' }
+      }
+      const userId =
+        (typeof args.userId === 'string' && args.userId.trim()) ||
+        parent?.userId ||
+        process.env.OC_USER_ID?.trim() ||
+        'default'
+      const attempt = await this.tryCcbLocalAgentCallbackDispatch({
+        origin,
+        userId,
+        text,
+        clientMessageId,
+        taskId: args.taskId,
+        sessionKey: origin.sessionKey,
+        barrierOwner: barrier.owner,
+        onQueued: () => {
+          queued = true
+          barrier.release()
+        },
+      })
+      return attempt
+    } finally {
+      if (!queued) barrier.release()
+    }
+  }
+
+  private async tryCcbLocalAgentCallbackDispatch(args: {
+    origin: { sessionKey: string; agentId: string; channel: 'webchat'; peerKind: 'dm'; peerId: string }
+    userId: string
+    text: string
+    clientMessageId: string
+    taskId: string
+    sessionKey: string
+    barrierOwner?: string
+    onQueued?: () => void
+  }): Promise<CronOriginFireResult> {
+    if (this._shuttingDown || this._runtimeRecycleDrainUntil > Date.now()) {
+      return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
+    }
+    try {
+      const existing = await getClientSession(args.origin.peerId, args.userId)
+      if (existing) {
+        const persisted = await appendServerAuthoredMessage(args.origin.peerId, args.userId, {
+          id: args.clientMessageId,
+          role: 'user',
+          text: args.text,
+          ts: Date.now(),
+        })
+        if (!persisted.applied) {
+          if (persisted.reason === 'already_exists') {
+            // same task retry — continue to dispatch
+          } else if (
+            persisted.reason === 'session_deleted' ||
+            persisted.reason === 'malformed' ||
+            persisted.reason === 'oversized'
+          ) {
+            return { kind: 'fallback' }
+          } else {
+            return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+          }
+        }
+      } else if (!this.sessions.getByKey(args.origin.sessionKey)) {
+        this.log.warn('ccb local-agent callback skipped: parent session gone', {
+          taskId: args.taskId,
+        })
+        return { kind: 'fallback' }
+      }
+    } catch (err) {
+      this.log.warn('ccb local-agent callback persist failed', { taskId: args.taskId }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+    }
+    try {
+      let wasQueued = false
+      await this.dispatchInbound({
+        type: 'inbound.message',
+        channel: args.origin.channel,
+        peer: { id: args.origin.peerId, kind: args.origin.peerKind },
+        agentId: args.origin.agentId,
+        content: { text: args.text },
+        ts: Date.now(),
+        idempotencyKey: ccbLocalAgentCallbackIdempotencyKey(args.sessionKey, args.taskId),
+        clientMessageId: args.clientMessageId,
+        _userId: args.userId,
+        _skipRateLimit: true,
+        _syntheticBarrierOwner: args.barrierOwner,
+        _onSyntheticQueued: () => {
+          wasQueued = true
+          args.onQueued?.()
+        },
+      } as any)
+      if (!wasQueued) return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
+    } catch (err) {
+      this.log.warn('ccb local-agent callback dispatch failed', { taskId: args.taskId }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_DISPATCH_FAILED' }
+    }
+    return { kind: 'injected' }
+  }
+
   private _queueSendToAgentCallback(
     runInput: RunDelegateInput,
     args: { jobId: string; agentId: string; goal: string; output?: string; error?: string },
@@ -17511,6 +17692,14 @@ export class Gateway {
           })
           this._sendStampedSessionFrame(sessionKey, peerKey, permFrame)
         }
+      } else if (e.kind === 'task_notification') {
+        void this.handleCcbLocalAgentNotification(session, {
+          taskId: e.taskId,
+          status: e.status,
+          outputFile: e.outputFile,
+          summary: e.summary,
+          toolUseId: e.toolUseId,
+        })
       } else if (e.kind === 'turn_status') {
         // Plan 2 (compact-progress-frame) — CCB setSDKStatus 侧信道。CcbMessageParser
         // 把 stdout `{type:'system', subtype:'status', status:'compacting'|null}` 转成

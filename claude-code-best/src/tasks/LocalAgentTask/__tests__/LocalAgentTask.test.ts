@@ -8,6 +8,23 @@ const noop = () => {}
 
 mock.module('src/utils/debug.ts', debugMock)
 mock.module('src/utils/log.ts', logMock)
+mock.module('ignore', () => ({
+  default: () => ({ add: () => {}, ignores: () => false }),
+}))
+mock.module('axios', () => ({
+  default: { get: async () => ({ data: {} }), post: async () => ({ data: {} }) },
+}))
+mock.module('@anthropic-ai/sdk', () => {
+  class APIError extends Error {}
+  class APIUserAbortError extends Error {}
+  class APIConnectionError extends Error {}
+  return {
+    default: class {},
+    APIError,
+    APIUserAbortError,
+    APIConnectionError,
+  }
+})
 
 mock.module('src/utils/sessionStorage.js', () => ({
   getAgentTranscriptPath: (id: string) => `/tmp/transcripts/${id}.jsonl`,
@@ -25,9 +42,12 @@ mock.module('src/utils/task/diskOutput.js', () => ({
 
 // Capture enqueuePendingNotification calls for verification
 const enqueuedNotifications: string[] = []
+const enqueuedCommands: any[] = []
+const emittedSdkEvents: any[] = []
 mock.module('src/utils/messageQueueManager.js', () => ({
   enqueuePendingNotification: (cmd: any) => {
     enqueuedNotifications.push(cmd.value)
+    enqueuedCommands.push(cmd)
   },
 }))
 
@@ -63,6 +83,9 @@ mock.module('src/utils/task/sdkProgress.js', () => ({
 
 mock.module('src/utils/sdkEventQueue.js', () => ({
   enqueueSdkEvent: noop,
+  emitTaskTerminatedSdk: (taskId: string, status: string, opts?: any) => {
+    emittedSdkEvents.push({ taskId, status, opts })
+  },
 }))
 
 mock.module('src/constants/xml.js', () => ({
@@ -161,6 +184,8 @@ function makeAssistantMessage(usage: any, content: any[] = []): any {
 
 afterEach(() => {
   enqueuedNotifications.length = 0
+  enqueuedCommands.length = 0
+  emittedSdkEvents.length = 0
 })
 
 // ─── Tests ───
@@ -457,6 +482,73 @@ describe('enqueueAgentNotification', () => {
     })
 
     expect(enqueuedNotifications).toHaveLength(0)
+    expect(emittedSdkEvents).toHaveLength(0)
+  })
+
+  test('enqueues at next priority so mid-turn drain does not need Sleep', () => {
+    const { setAppState } = createSetAppState({
+      tasks: { 'test-agent-001': makeRunningTask({ notified: false }) },
+    })
+
+    enqueueAgentNotification({
+      taskId: 'test-agent-001',
+      description: 'test',
+      status: 'completed',
+      setAppState: setAppState as any,
+      toolUseId: 'toolu_1',
+    })
+
+    expect(enqueuedCommands).toHaveLength(1)
+    expect(enqueuedCommands[0].priority).toBe('next')
+    expect(enqueuedCommands[0].mode).toBe('task-notification')
+  })
+
+  test('emits task-terminated SDK bookend exactly once', () => {
+    const { setAppState } = createSetAppState({
+      tasks: { 'test-agent-001': makeRunningTask({ notified: false }) },
+    })
+
+    enqueueAgentNotification({
+      taskId: 'test-agent-001',
+      description: 'refactor auth',
+      status: 'completed',
+      setAppState: setAppState as any,
+      toolUseId: 'toolu_1',
+      usage: { totalTokens: 12, toolUses: 3, durationMs: 40 },
+    })
+    enqueueAgentNotification({
+      taskId: 'test-agent-001',
+      description: 'refactor auth',
+      status: 'completed',
+      setAppState: setAppState as any,
+    })
+
+    expect(emittedSdkEvents).toHaveLength(1)
+    expect(emittedSdkEvents[0].taskId).toBe('test-agent-001')
+    expect(emittedSdkEvents[0].status).toBe('completed')
+    expect(emittedSdkEvents[0].opts.toolUseId).toBe('toolu_1')
+    expect(emittedSdkEvents[0].opts.outputFile).toBe('/tmp/output/test-agent-001')
+    expect(emittedSdkEvents[0].opts.usage).toEqual({
+      total_tokens: 12,
+      tool_uses: 3,
+      duration_ms: 40,
+    })
+  })
+
+  test('maps killed status to stopped for the SDK bookend', () => {
+    const { setAppState } = createSetAppState({
+      tasks: { 'test-agent-001': makeRunningTask({ notified: false }) },
+    })
+
+    enqueueAgentNotification({
+      taskId: 'test-agent-001',
+      description: 'test',
+      status: 'killed',
+      setAppState: setAppState as any,
+    })
+
+    expect(emittedSdkEvents).toHaveLength(1)
+    expect(emittedSdkEvents[0].status).toBe('stopped')
   })
 })
 

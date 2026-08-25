@@ -485,7 +485,32 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
    *     不明的 tail 灌进当前 turn(那正是 owner attribution bug 的成因)。
    */
   private _routeMessage(msg: SdkMessage): void {
-    const m = msg as { type?: unknown; subtype?: unknown; tool_use_id?: unknown }
+    const m = msg as {
+      type?: unknown
+      subtype?: unknown
+      tool_use_id?: unknown
+      task_id?: unknown
+      status?: unknown
+      output_file?: unknown
+      summary?: unknown
+    }
+    if (m?.type === 'system' && m?.subtype === 'task_notification') {
+      const payload = {
+        taskId: typeof m.task_id === 'string' ? m.task_id : '',
+        status: typeof m.status === 'string' && m.status ? m.status : 'completed',
+        outputFile: typeof m.output_file === 'string' ? m.output_file : '',
+        summary: typeof m.summary === 'string' ? m.summary : '',
+        ...(typeof m.tool_use_id === 'string' && m.tool_use_id
+          ? { toolUseId: m.tool_use_id }
+          : {}),
+      }
+      // Session-level emit so a missing / already-final _routeTurn cannot
+      // drop the bookend. Parser path still runs when a turn exists so
+      // onEvent consumers see the same independent event.
+      this.emit('task_notification', payload)
+      this._routeTurn?.parser.parse(msg)
+      return
+    }
     if (m?.type !== 'system' || m?.subtype !== 'bash_output_tail') {
       // 非 tail:逐字节维持 _routeTurn 路由。
       this._routeTurn?.parser.parse(msg)
