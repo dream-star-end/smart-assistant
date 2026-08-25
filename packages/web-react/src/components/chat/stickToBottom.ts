@@ -22,30 +22,59 @@ export function isNearBottom(
  * look like the user scrolled away. Only wheel / touch / pointer / keyboard
  * navigation updates `following`. Programmatic snaps ignore the next scroll
  * event so they cannot clear or set intent.
+ *
+ * Restick and tail-window pinning must use `canRestick`, not `following`.
+ * A live gesture sets `canRestick=false` immediately so ResizeObserver /
+ * version effects cannot write the user back to the bottom before `onScroll`.
  */
 export function createStickToBottomController() {
   const following = { current: true };
   const programmatic = { current: false };
   const userIntent = { current: false };
+  const gesture = { current: false };
   // Absolute scrollTop can rise while the user scrolls upward if a streaming
   // card grows at the same time. Bottom-relative distance preserves the real
   // direction across those layout changes.
   const lastDistanceFromBottom = { current: null as number | null };
+  // Per-event `lastGap + 1` would swallow 8 consecutive 1px moves. Leave
+  // detection is relative to the gap at the start of this gesture.
+  const gestureOriginGap = { current: null as number | null };
+
+  const canRestick = {
+    get current() {
+      return following.current && !gesture.current;
+    },
+    set current(value: boolean) {
+      following.current = value;
+    },
+  };
 
   const reset = () => {
     following.current = true;
     programmatic.current = false;
     userIntent.current = false;
+    gesture.current = false;
     lastDistanceFromBottom.current = null;
+    gestureOriginGap.current = null;
   };
 
   const markUserIntent = () => {
     userIntent.current = true;
+    gesture.current = true;
+    if (gestureOriginGap.current === null) {
+      gestureOriginGap.current = lastDistanceFromBottom.current;
+    }
+  };
+
+  const releaseUserIntent = () => {
+    gesture.current = false;
+    gestureOriginGap.current = null;
   };
 
   const scrollToBottom = (
     el: { scrollTop: number; scrollHeight: number; clientHeight: number },
   ) => {
+    if (!following.current || gesture.current) return;
     programmatic.current = true;
     el.scrollTop = el.scrollHeight;
     lastDistanceFromBottom.current = distanceFromBottom(el);
@@ -55,10 +84,14 @@ export function createStickToBottomController() {
     const previousDistance = lastDistanceFromBottom.current;
     const currentDistance = distanceFromBottom(el);
     lastDistanceFromBottom.current = currentDistance;
+    if (gesture.current && gestureOriginGap.current === null) {
+      gestureOriginGap.current = previousDistance ?? currentDistance;
+    }
+    const leaveBaseline = gestureOriginGap.current ?? previousDistance;
     if (
       userIntent.current &&
-      previousDistance !== null &&
-      currentDistance > previousDistance + 1
+      leaveBaseline !== null &&
+      currentDistance > leaveBaseline + 1
     ) {
       following.current = false;
       programmatic.current = false;
@@ -75,7 +108,16 @@ export function createStickToBottomController() {
     following.current = isNearBottom(el);
   };
 
-  return { following, reset, markUserIntent, scrollToBottom, onScroll };
+  return {
+    following,
+    canRestick,
+    gesture,
+    reset,
+    markUserIntent,
+    releaseUserIntent,
+    scrollToBottom,
+    onScroll,
+  };
 }
 
 export type StickToBottomController = ReturnType<typeof createStickToBottomController>;
