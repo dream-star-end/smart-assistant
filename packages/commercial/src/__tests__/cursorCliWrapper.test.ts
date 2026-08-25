@@ -766,6 +766,45 @@ describe('oc-cursor wrapper', () => {
     assert.match(result.stderr, /slot_result 1 ok/)
   })
 
+
+  test('passes -H x-cursor-client-type: sand and sets NODE_OPTIONS hook when .sand-mode is enabled for the chosen slot', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(
+      join(authDir, '.sand-mode'),
+      '# sand-mode v1\napi-key 1\n',
+      { mode: 0o600 },
+    )
+    const result = spawnSync(
+      f.wrapper,
+      ['--model', 'cursor-grok-4.6-high', '--', 'hello sand'],
+      { cwd: f.dir, env: f.env, encoding: 'utf8' },
+    )
+    assert.equal(result.status, 0, result.stderr)
+    const argv = readFileSync(join(f.capture, 'argv'), 'utf8').trim().split('\n')
+    const headerIdx = argv.indexOf('-H')
+    assert.ok(headerIdx >= 0, 'argv must include -H flag')
+    assert.equal(argv[headerIdx + 1], 'x-cursor-client-type: sand')
+  })
+
+  test('does not pass -H x-cursor-client-type: sand when .sand-mode is 0 or missing', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(
+      join(authDir, '.sand-mode'),
+      '# sand-mode v1\napi-key 0\n',
+      { mode: 0o600 },
+    )
+    const result = spawnSync(
+      f.wrapper,
+      ['--model', 'cursor-grok-4.6-high', '--', 'hello normal'],
+      { cwd: f.dir, env: f.env, encoding: 'utf8' },
+    )
+    assert.equal(result.status, 0, result.stderr)
+    const argv = readFileSync(join(f.capture, 'argv'), 'utf8').trim().split('\n')
+    assert.equal(argv.includes('-H'), false, 'argv must not include -H flag')
+  })
+
   test('Other Models die as quota when every slot is cursor_only', () => {
     const f = fixture()
     writeFileSync(

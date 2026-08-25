@@ -129,7 +129,8 @@
     "0247_cursor_opus_48",
     "0248_friction_error_location",
     "0249_usage_board_project_attribution",
-    "0250_ccb_egress_region_one_proxy"
+    "0250_ccb_egress_region_one_proxy",
+    "0251_cursor_sand_mode"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

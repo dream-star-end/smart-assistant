@@ -102,6 +102,31 @@ describe("syncCursorAuthDir", () => {
     assert.doesNotMatch(sidecar, /crsr_/);
   });
 
+  test("writes cursor_sand_enabled into .sand-mode sidecar", async () => {
+    const authDir = mkdtempSync(join(tmpdir(), "oc-cursor-auth-"));
+    const result = await syncCursorAuthDir({
+      authDir,
+      listAccounts: async () =>
+        [
+          { id: 1n, provider: "cursor", status: "active", cooldown_until: null, cursor_quota_class: "cursor_only", cursor_sand_enabled: true },
+          { id: 2n, provider: "cursor", status: "active", cooldown_until: null, cursor_quota_class: "other_ok", cursor_sand_enabled: false },
+        ] as never,
+      createAccount: async () => {
+        throw new Error("must not import when pool already has rows");
+      },
+      getCursorTokenSnapshot: async (id) => {
+        const key = String(id) === "1" ? KEY_A : KEY_B;
+        return { token: Buffer.from(key, "utf8") } as never;
+      },
+    });
+    assert.equal(result.written, 2);
+    const sidecar = readFileSync(join(authDir, ".sand-mode"), "utf8");
+    assert.match(sidecar, /^# sand-mode v1\n/);
+    assert.match(sidecar, /api-key 1/);
+    assert.match(sidecar, /api-key\.2 0/);
+  });
+
+
   test("after first import, deleting the last pool row does not re-import leftover host files", async () => {
     const authDir = mkdtempSync(join(tmpdir(), "oc-cursor-auth-"));
     writeFileSync(join(authDir, "api-key"), `${KEY_A}\n`, { mode: 0o600 });

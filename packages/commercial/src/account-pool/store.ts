@@ -125,6 +125,7 @@ export interface AccountRow {
   updated_at: Date;
   /** 0226 — Cursor two-pool class. Non-cursor rows stay unknown and are ignored. */
   cursor_quota_class: import("./cursorQuota.js").CursorQuotaClass;
+  cursor_sand_enabled: boolean;
 }
 
 /**
@@ -281,6 +282,7 @@ export interface UpdateAccountPatch {
   /** Optional group binding. undefined = no change; null = unassign. */
   group_id?: bigint | string | null;
   cursor_quota_class?: import("./cursorQuota.js").CursorQuotaClass;
+  cursor_sand_enabled?: boolean;
 }
 
 export class AccountNotFoundError extends Error {
@@ -322,7 +324,8 @@ const META_COLUMNS = `
   runtime_channel,
   created_at,
   updated_at,
-  COALESCE(cursor_quota_class, 'unknown') AS cursor_quota_class
+  COALESCE(cursor_quota_class, 'unknown') AS cursor_quota_class,
+  COALESCE(cursor_sand_enabled, FALSE) AS cursor_sand_enabled
 `;
 
 interface RawMetaRow extends QueryResultRow {
@@ -354,6 +357,7 @@ interface RawMetaRow extends QueryResultRow {
   created_at: Date;
   updated_at: Date;
   cursor_quota_class: string;
+  cursor_sand_enabled: boolean;
 }
 
 interface RawSecretRow extends QueryResultRow {
@@ -422,6 +426,7 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     cursor_quota_class: (row.cursor_quota_class === "other_ok" || row.cursor_quota_class === "cursor_only")
       ? row.cursor_quota_class
       : "unknown",
+    cursor_sand_enabled: row.cursor_sand_enabled === true,
   };
 }
 
@@ -500,9 +505,10 @@ export async function createAccount(
          account_uuid,
          persona,
          runtime_channel,
-         oauth_principal_type, oauth_principal_id
+         oauth_principal_type, oauth_principal_id,
+         cursor_sand_enabled
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13::jsonb, $14, $15, $16)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13::jsonb, $14, $15, $16, $17)
        RETURNING ${META_COLUMNS}`,
       [
         provider,
@@ -521,6 +527,7 @@ export async function createAccount(
         input.runtime_channel,
         input.oauth_principal_type ?? null,
         input.oauth_principal_id ?? null,
+        input.cursor_sand_enabled === true,
       ],
     );
     return parseMetaRow(res.rows[0]);
@@ -799,6 +806,12 @@ export async function updateAccount(
       throw new TypeError(`invalid cursor_quota_class: ${patch.cursor_quota_class}`);
     }
     push("cursor_quota_class", patch.cursor_quota_class);
+  }
+  if (patch.cursor_sand_enabled !== undefined) {
+    if (typeof patch.cursor_sand_enabled !== "boolean") {
+      throw new TypeError(`invalid cursor_sand_enabled: ${patch.cursor_sand_enabled}`);
+    }
+    push("cursor_sand_enabled", patch.cursor_sand_enabled);
   }
 
   if (patch.egress_proxy_id !== undefined) {

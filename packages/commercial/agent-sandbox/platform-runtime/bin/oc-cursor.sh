@@ -245,6 +245,15 @@ if [ "$eligible_count" -ge 1 ]; then
   done
 fi
 
+# Parse .sand-mode sidecar if present to determine Sand mode for the chosen slot.
+sand_enabled=0
+if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null \
+  || /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null; then
+  sand_sidecar_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.sand-mode" 2>/dev/null) \
+    || sand_sidecar_text=$(/bin/cat -- "$auth_dir/.sand-mode" 2>/dev/null) \
+    || sand_sidecar_text=""
+fi
+
 if [ "$eligible_count" -gt 1 ]; then
   rotation_state=$(/bin/cat -- "$rotation_file" 2>/dev/null) || rotation_state=""
   rotation_first=${rotation_state%% *}
@@ -284,6 +293,7 @@ fi
 
 # Advance the eligible pool past the slot that just failed. No-op for
 # single-eligible accounts, so their failure path stays byte-identical.
+
 rotation_advance() {
   [ "$eligible_count" -gt 1 ] || return 0
   rotation_next=$((rotation_idx + 1))
@@ -302,6 +312,27 @@ emit_slot_result() {
     fi
   done
 }
+
+chosen_key_name=${chosen_key_file##*/}
+if [ -n "${sand_sidecar_text:-}" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    slot_name=${line%% *}
+    slot_sand=${line#"$slot_name"}
+    slot_sand=${slot_sand# }
+    slot_sand=${slot_sand%% *}
+    if [ "$slot_name" = "$chosen_key_name" ]; then
+      case "$slot_sand" in
+        1|true|sand) sand_enabled=1 ;;
+        *) sand_enabled=0 ;;
+      esac
+    fi
+  done <<SAND_SIDECAR
+$sand_sidecar_text
+SAND_SIDECAR
+fi
 
 if ! api_key=$(/usr/bin/sudo -n /bin/cat -- "$chosen_key_file" 2>/dev/null); then
   emit_slot_result fail
@@ -528,6 +559,36 @@ if [ "${OPENCLAUDE_CURSOR_AGENT_DEBUG:-}" = "1" ] && [ -n "$oc_home" ] && [ -d "
 fi
 unset OPENCLAUDE_CURSOR_AGENT_DEBUG
 
+# When Sand mode is enabled, install ephemeral preload hook to guarantee
+# x-cursor-client-type is sand and pass -H argument.
+if [ "$sand_enabled" -eq 1 ]; then
+  sand_hook="$cursor_home/.sand-hook.cjs"
+  /bin/cat <<EOF > "$sand_hook"
+const origSet = globalThis.Headers?.prototype?.set;
+if (origSet) {
+  globalThis.Headers.prototype.set = function(k, v) {
+    if (typeof k === "string" && k.toLowerCase() === "x-cursor-client-type") {
+      return origSet.call(this, k, "sand");
+    }
+    return origSet.call(this, k, v);
+  };
+}
+const origAppend = globalThis.Headers?.prototype?.append;
+if (origAppend) {
+  globalThis.Headers.prototype.append = function(k, v) {
+    if (typeof k === "string" && k.toLowerCase() === "x-cursor-client-type") {
+      return origAppend.call(this, k, "sand");
+    }
+    return origAppend.call(this, k, v);
+  };
+}
+EOF
+  /bin/chmod 600 -- "$sand_hook" 2>/dev/null || true
+  node_opts="${NODE_OPTIONS:-}"
+  [ -z "$node_opts" ] && node_opts="--require $sand_hook" || node_opts="$node_opts --require $sand_hook"
+  export NODE_OPTIONS="$node_opts"
+fi
+
 prompt=$1
 shift
 for word in "$@"; do
@@ -545,6 +606,7 @@ fi
 [ -z "$model" ] || set -- --model "$model" "$@"
 [ -z "$mode" ] || set -- --mode "$mode" "$@"
 [ "$force" -eq 0 ] || set -- --force "$@"
+[ "$sand_enabled" -eq 0 ] || set -- -H "x-cursor-client-type: sand" "$@"
 
 # setsid gives the CLI and every tool child one process group so Stop cannot
 # leave a shell command running after the wrapper exits. HOME is per-call and

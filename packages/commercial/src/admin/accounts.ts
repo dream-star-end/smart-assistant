@@ -118,6 +118,7 @@ function snapshotForAudit(r: AccountRow): Record<string, unknown> {
     group_id: r.group_id !== null ? r.group_id.toString() : null,
     egress_proxy: maskEgressProxy(r.egress_proxy),
     egress_proxy_id: r.egress_proxy_id !== null ? r.egress_proxy_id.toString() : null,
+    cursor_sand_enabled: r.provider === "cursor" ? r.cursor_sand_enabled : null,
   };
 }
 
@@ -195,6 +196,7 @@ export interface AdminCreateAccountInput {
   egress_proxy_id?: bigint | string | null;
   /** Optional V1 account group binding. Claude accounts default to the first official OAuth group. */
   group_id?: bigint | string | null;
+  cursor_sand_enabled?: boolean;
 }
 
 /**
@@ -412,6 +414,7 @@ export async function adminCreateAccount(
     runtime_channel: getRuntimeChannel(),
     oauth_principal_type: principalType,
     oauth_principal_id: principalId,
+    cursor_sand_enabled: input.cursor_sand_enabled === true,
   };
   let row: AccountRow;
   try {
@@ -485,6 +488,7 @@ export interface AdminPatchAccountInput {
    *   - "<uuid>" = 直接绑该 host(校验必须 ready+endpoint+cert+psk 齐全)
    */
   egress_host_uuid?: string | null;
+  cursor_sand_enabled?: boolean;
 }
 
 export async function adminPatchAccount(
@@ -604,6 +608,7 @@ export async function adminPatchAccount(
     patch.egress_proxy_id !== undefined ||
     patch.group_id !== undefined ||
     patch.egress_host_uuid !== undefined ||
+    patch.cursor_sand_enabled !== undefined ||
     expiresAt !== undefined ||
     subscriptionEndAt !== undefined;
   if (!touched) {
@@ -630,6 +635,7 @@ export async function adminPatchAccount(
   if (normalizedPatchGroupId !== undefined) storePatch.group_id = normalizedPatchGroupId;
   if (expiresAt !== undefined) storePatch.oauth_expires_at = expiresAt;
   if (subscriptionEndAt !== undefined) storePatch.subscription_end_at = subscriptionEndAt;
+  if (patch.cursor_sand_enabled !== undefined) storePatch.cursor_sand_enabled = patch.cursor_sand_enabled;
 
   let after: AccountRow | null;
   try {
@@ -724,6 +730,10 @@ export async function adminPatchAccount(
   if (patch.egress_host_uuid !== undefined) {
     changedBefore.egress_host_uuid = egressHostBefore ?? null;
     changedAfter.egress_host_uuid = egressHostAfter ?? null;
+  }
+  if (patch.cursor_sand_enabled !== undefined && before.cursor_sand_enabled !== after.cursor_sand_enabled) {
+    changedBefore.cursor_sand_enabled = before.cursor_sand_enabled;
+    changedAfter.cursor_sand_enabled = after.cursor_sand_enabled;
   }
 
   await bestEffortAudit(ctx, "account.patch", `account:${String(id)}`, changedBefore, changedAfter);

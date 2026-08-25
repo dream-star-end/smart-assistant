@@ -138,3 +138,25 @@ export function parseQuotaClassSidecar(text: string): Map<string, CursorQuotaCla
   }
   return out;
 }
+
+export const CURSOR_SAND_MODE_FILE = ".sand-mode";
+
+export function renderSandModeSidecar(slots: Array<{ name: string; sandEnabled: boolean }>): string {
+  const lines = ["# sand-mode v1"];
+  for (const slot of slots) {
+    lines.push(`${slot.name} ${slot.sandEnabled ? "1" : "0"}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+export function parseSandModeSidecar(text: string): Map<string, boolean> {
+  const out = new Map<string, boolean>();
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const [name, mode] = line.split(/\s+/, 2);
+    if (!name) continue;
+    out.set(name, mode === "1" || mode === "true" || mode === "sand");
+  }
+  return out;
+}

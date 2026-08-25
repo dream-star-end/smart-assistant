@@ -45,3 +45,4 @@ packages/commercial/src/__tests__/migration0236.integ.test.ts
 packages/commercial/src/__tests__/migration0238.integ.test.ts
 packages/commercial/src/__tests__/migration0245.integ.test.ts
 packages/commercial/src/__tests__/migration0247.integ.test.ts
+packages/commercial/src/__tests__/migration0251.integ.test.ts

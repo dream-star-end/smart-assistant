@@ -58,6 +58,7 @@ export function AccountFormModal({
   const [egressId, setEgressId] = useState("");
   const [saving, setSaving] = useState(false);
   const [providerCreate, setProviderCreate] = useState<"claude" | "codex" | "grok" | "cursor">("claude");
+  const [cursorSandEnabled, setCursorSandEnabled] = useState(false);
 
   // OAuth 向导(create)。
   const [oauthState, setOauthState] = useState<string | null>(null);
@@ -89,6 +90,7 @@ export function AccountFormModal({
     setSubEnd(account?.subscription_end_at ?? "");
     setGroupId(prefillGroup);
     setEgressId(prefillEgress);
+    setCursorSandEnabled(account?.cursor_sand_enabled === true);
     setOauthState(null);
     setOauthCode("");
     setStep2(false);
@@ -243,6 +245,7 @@ export function AccountFormModal({
       void adminSend("DELETE", `/accounts/grok-device/${encodeURIComponent(grokSessionId)}`).catch(() => {});
     }
     setProviderCreate(next);
+    setCursorSandEnabled(false);
     setGroupId("");
     setToken("");
     setRefresh("");
@@ -323,7 +326,9 @@ export function AccountFormModal({
       }
       if (subEnd.trim()) body.subscription_end_at = isNull(subEnd) ? null : subEnd.trim();
       if (groupId) body.group_id = groupId;
+      if (provider === "cursor") body.cursor_sand_enabled = cursorSandEnabled;
     } else {
+      if (provider === "cursor") body.cursor_sand_enabled = cursorSandEnabled;
       body.status = statusEdit;
       if (token.trim()) body.oauth_token = token.trim();
       if (refresh.trim()) body.oauth_refresh_token = isNull(refresh) ? null : refresh.trim();
@@ -355,7 +360,7 @@ export function AccountFormModal({
   }, [
     label, plan, isCreate, token, egressId, provider, refresh, expires, subEnd, groupId,
     grokPrincipalType, grokPrincipalId,
-    statusEdit, prefillEgress, prefillGroup, account, onOpenChange, onSaved, toast,
+    statusEdit, prefillEgress, prefillGroup, account, cursorSandEnabled, onOpenChange, onSaved, toast,
   ]);
 
   const defaultGroupLabel = isCreate ? `— 默认 ${provider} 官方订阅组 —` : "— 未绑定 —";
@@ -498,6 +503,25 @@ export function AccountFormModal({
                   <CheckCircle2 size={13} /> token 已写入下方表单,核对 label/plan 后点"创建"。
                 </p>
               )}
+            </div>
+          )}
+
+          {provider === "cursor" && (
+            <div className="flex items-center justify-between rounded-lg border border-border bg-subtle p-3">
+              <div className="flex flex-col">
+                <span className="text-[13px] font-medium text-fg">启用 Sand 客户端模式</span>
+                <span className="text-[11px] text-muted">
+                  调用 Cursor Agent CLI 时携带 Sand 客户端请求头 (x-cursor-client-type: sand)
+                </span>
+              </div>
+              <label className="relative inline-flex cursor-pointer items-center">
+                <input
+                  type="checkbox"
+                  checked={cursorSandEnabled}
+                  onChange={(e) => setCursorSandEnabled(e.target.checked)}
+                  className="size-4 rounded border-border text-accent focus:ring-accent"
+                />
+              </label>
             </div>
           )}
 
