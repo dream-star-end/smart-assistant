@@ -188,7 +188,7 @@ function MobileChatPage() {
             onRespondPermission={() => {}}
             scrollParent={scroller}
             historyGeneration="mobile-page"
-            followBottomRef={stick.following}
+            followBottomRef={stick.canRestick}
           />
         </div>
         <div className="shrink-0 composer-safe-b">

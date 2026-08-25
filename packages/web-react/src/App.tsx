@@ -2096,9 +2096,21 @@ export function App() {
   //  2. 旧实现无条件劫持:用户上翻回看历史也被拽回底部。改为 near-bottom 粘滞 ——
   //     只有用户本就贴底(<80px)时才跟随;上翻即解除,拉回底部自动恢复。
   //  3. 卡片高度晚长不能当成用户离底:跟随意图只由真实输入更新,内容 ResizeObserver
-  //     在 following=true 时二次贴底(见 MessageList)。
+  //     在 canRestick=true 时二次贴底(见 MessageList)。
+  //  4. 手指/滚轮一开始就锁 restick:流式 version 与 visualViewport 不能在
+  //     onScroll 之前把视口写回底部,否则上滑会被下一帧拉回去。
   const stick = useRef(createStickToBottomController()).current;
-  const stickToBottomRef = stick.following;
+  const stickToBottomRef = stick.canRestick;
+  const userScrollReleaseTimerRef = useRef<number | null>(null);
+  const scheduleUserScrollRelease = useCallback(() => {
+    if (userScrollReleaseTimerRef.current !== null) {
+      window.clearTimeout(userScrollReleaseTimerRef.current);
+    }
+    userScrollReleaseTimerRef.current = window.setTimeout(() => {
+      userScrollReleaseTimerRef.current = null;
+      stick.releaseUserIntent();
+    }, 400);
+  }, [stick]);
   const scrollToChatBottom = useCallback(() => {
     const el = scrollRef.current;
     if (el) stick.scrollToBottom(el);
@@ -2110,11 +2122,18 @@ export function App() {
   const markUserChatScroll = useCallback(() => {
     stick.markUserIntent();
     cancelArchiveCorrection();
-  }, [stick, cancelArchiveCorrection]);
+    scheduleUserScrollRelease();
+  }, [stick, cancelArchiveCorrection, scheduleUserScrollRelease]);
+  useEffect(() => () => {
+    if (userScrollReleaseTimerRef.current !== null) {
+      window.clearTimeout(userScrollReleaseTimerRef.current);
+    }
+  }, []);
   const onChatScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     stick.onScroll(el);
+    if (stick.gesture.current) scheduleUserScrollRelease();
     const anchor = archiveScrollAnchorRef.current;
     if (
       anchor && !anchor.cancelled && !anchor.restoring &&
@@ -2123,7 +2142,7 @@ export function App() {
       // 用户已经离开点击位置：响应仍须等 DOM 提交后释放 FIFO，但不再把视口拉回旧坐标。
       anchor.cancelled = true;
     }
-  }, [settleArchiveAnchor, stick]);
+  }, [settleArchiveAnchor, scheduleUserScrollRelease, stick]);
   // 切会话:重置粘滞并瞬时跳底(历史回看从底部开始);同时清归档按钮子态与视口锚点。
   useLayoutEffect(() => {
     stick.reset();

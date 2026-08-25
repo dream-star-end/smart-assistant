@@ -67,4 +67,66 @@ describe("stickToBottom", () => {
     expect(el.scrollHeight - el.scrollTop - el.clientHeight).toBe(8);
     expect(stick.following.current).toBe(false);
   });
+
+  test("手势锁立刻禁止 restick，流式贴底不能抢先写回底部", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+    expect(stick.canRestick.current).toBe(true);
+
+    stick.markUserIntent();
+    expect(stick.following.current).toBe(true);
+    expect(stick.canRestick.current).toBe(false);
+
+    const pinnedTop = el.scrollTop;
+    el.scrollHeight = 1300;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(pinnedTop);
+    expect(el.scrollTop).not.toBe(el.scrollHeight);
+
+    el.scrollTop = 1212;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(false);
+
+    stick.releaseUserIntent();
+    expect(stick.following.current).toBe(false);
+    expect(stick.canRestick.current).toBe(false);
+  });
+
+  test("分段 1px 上滑累计后解锁仍禁止 restick", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+    const bottom = el.scrollTop;
+
+    const startGap = el.scrollHeight - bottom - el.clientHeight;
+    for (let step = 1; step <= 8; step += 1) {
+      stick.markUserIntent();
+      el.scrollTop = bottom - step;
+      stick.onScroll(el);
+    }
+    expect(el.scrollHeight - el.scrollTop - el.clientHeight).toBe(startGap + 8);
+    expect(stick.following.current).toBe(false);
+
+    stick.releaseUserIntent();
+    expect(stick.canRestick.current).toBe(false);
+
+    const pinnedTop = el.scrollTop;
+    el.scrollHeight = 1300;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(pinnedTop);
+  });
+
+  test("轻触未离底，松手后恢复可贴底", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.markUserIntent();
+    expect(stick.canRestick.current).toBe(false);
+    stick.releaseUserIntent();
+    expect(stick.following.current).toBe(true);
+    expect(stick.canRestick.current).toBe(true);
+  });
 });
