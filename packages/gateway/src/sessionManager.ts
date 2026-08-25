@@ -89,7 +89,11 @@ import {
 } from '@openclaude/protocol'
 import { resolveExecutionModel } from './server.js'
 import { classifyRunError } from './errorClassify.js'
-import type { GatewayTurnPhase } from './ccbMessageParser.js'
+import type {
+  GatewayEngineErrorEvent,
+  GatewayTerminalErrorCode,
+  GatewayTurnPhase,
+} from './ccbMessageParser.js'
 import {
   type ExecutionTarget,
   type RemoteTargetController,
@@ -167,6 +171,49 @@ function stampGatewayToolEffect(tool: TurnToolEntry): TurnToolEntry {
 export function _tapeErrorCodeForGenericFailure(detail: string | undefined): string {
   const cls = classifyRunError(detail)
   return cls.code === 'unknown' ? 'ENGINE_ERROR' : cls.code
+}
+
+/**
+ * E4.2 — tape 大写终态控制码 → wire 可透传的 gateway 权威终态码。
+ *
+ * 只映射 wire OutboundError.code 枚举里存在的码(user_cancelled / runner_crashed /
+ * service_restart / auth_error / engine_error);免单/静默恢复类(NO_RESPONSE /
+ * LIVENESS_TIMEOUT / IDLE_TIMEOUT / TURN_LIMIT …)刻意不映射 —— 它们有独立的
+ * waiver 展示分支,error 事件保持无 errorCode 走既有 classify 兜底。
+ * `_` 前缀 = 契约测试 seam。
+ */
+export function _wireTerminalCodeForTape(
+  code: string | undefined,
+): GatewayTerminalErrorCode | undefined {
+  switch (code) {
+    case 'USER_CANCELLED':
+      return 'user_cancelled'
+    case 'RUNNER_CRASHED':
+      return 'runner_crashed'
+    case 'SERVICE_RESTART':
+      return 'service_restart'
+    case 'AUTH_ERROR':
+      return 'auth_error'
+    case 'ENGINE_ERROR':
+      return 'engine_error'
+    default:
+      return undefined
+  }
+}
+
+/** E6 — queued_to_outbox 降级终态的用户向说明(受控文案,全角标点)。 */
+export const SESSION_PERSIST_QUEUED_NOTICE =
+  '回复已生成，但会话存储暂时不可用，内容已安全排队待写入。稍后刷新即可看到完整记录。'
+
+/**
+ * engine 事件通道的**单点**受控加宽 cast:engine 权威类型的 error 事件只声明
+ * errorCode 'user_cancelled'(engine/ 所有权边界内不改),gateway 编排层发射
+ * 其余权威终态码(runner_crashed / service_restart / …)时经此收口。消费端
+ * server.ts `_buildEngineErrorFrame` 以 GatewayEngineErrorEvent 形状接收,
+ * 运行时零损失;除此 helper 外不允许再出现跨该边界的 cast。
+ */
+function _asEngineErrorEvent(event: GatewayEngineErrorEvent): SessionStreamEvent {
+  return event as unknown as SessionStreamEvent
 }
 
 /**
@@ -1050,6 +1097,11 @@ const TRANSIENT_RETRY_ERROR_CODES = new Set([
   'model_capacity',
   'upstream_failed',
 ])
+
+/** E12 — 瞬时错误自动重试的续跑输入。裸「继续」会让模型丢失重试语境(可能被
+ *  理解成用户新指令);这里显式附带原始意图:上一轮因上游瞬时错误被打断,应
+ *  继续完成同一任务。导出供引擎回放测试引用同一权威串。 */
+export const TRANSIENT_RETRY_INPUT = '上一条消息因上游瞬时错误中断，请继续完成该任务。'
 
 // Re-export from ccbMessageParser so existing imports keep working
 export type { SessionStreamEvent } from './ccbMessageParser.js'
@@ -4747,7 +4799,7 @@ export class SessionManager {
         emitRetryStatus('TRANSIENT_RETRY', delay)
         // Match the only recovery action a user would take: continue the same
         // engine session. Codex/CC own tool and conversation continuation.
-        retryInput = '继续'
+        retryInput = TRANSIENT_RETRY_INPUT
         try {
           await waitForRetryDelay(delay, logicalTurnSignal)
         } finally {
@@ -5306,6 +5358,7 @@ export class SessionManager {
         terminalPersistenceClaim = 'partial'
         partialPersistencePromise = (async () => {
           let persistenceAcknowledged = !MASTER_SINK_PERSIST_CHANNELS.has(session.channel)
+          let persistenceQueuedToOutbox = false
           detach()
           if (
             status === 'interrupted' &&
@@ -5368,7 +5421,8 @@ export class SessionManager {
                 sessionKey: session.sessionKey,
                 ...(traceId ? { traceId } : {}),
               })
-              persistenceAcknowledged = await persistServerAuthoredTurn({
+              // E6 — Outcome 版本识别 'queued'(语义同 finalizeTurn 主路径)。
+              const partialOutcome = await persistServerAuthoredTurnOutcome({
                 sessionKey: session.sessionKey,
                 peerId: session.peerId,
                 agentId: session.agentId,
@@ -5411,6 +5465,11 @@ export class SessionManager {
                   ? { engineBilling: terminalEngineBilling }
                   : {}),
               })
+              persistenceAcknowledged = partialOutcome === 'acked' || partialOutcome === 'skipped'
+              // 同 finalizeTurn 主路径:降级投递仅限个人版本地 outbox;商用 v3
+              // sink 的 queued 保持静默(master ACK 权威,契约测试锁此语义)。
+              persistenceQueuedToOutbox =
+                getV3MasterSinkOrNull() === null && partialOutcome === 'queued'
             }
           } finally {
             const usageForLog = terminalUsageForPersistence({
@@ -5435,7 +5494,29 @@ export class SessionManager {
             // authoritative PG history. Never expose a terminal frame until
             // the master has ACKed it; reconnect/relogin must not turn a live
             // "finished" reply into a missing one.
-            if (persistenceAcknowledged) onEvent({ kind: 'error', error: reason })
+            // E4.2 — handleExit/interrupt 已分类的终态码(RUNNER_CRASHED /
+            // SERVICE_RESTART / USER_CANCELLED …)透传 wire 子集,不再让 server
+            // 对「子进程异常退出 (code 1)」这类原文正则分类压成 upstream_failed。
+            if (persistenceAcknowledged) {
+              const wireCode = _wireTerminalCodeForTape(errorCode)
+              onEvent(_asEngineErrorEvent({
+                kind: 'error',
+                error: reason,
+                ...(wireCode ? { errorCode: wireCode } : {}),
+              }))
+            } else if (persistenceQueuedToOutbox) {
+              // E6 — queued 降级终态(语义同 finalizeTurn 主路径):不静默卡住。
+              log.warn('partial terminal delivered in degraded persist-queued mode', {
+                sessionKey: session.sessionKey,
+                errorCode,
+                ...(traceId ? { traceId } : {}),
+              })
+              onEvent(_asEngineErrorEvent({
+                kind: 'error',
+                error: reason || SESSION_PERSIST_QUEUED_NOTICE,
+                errorCode: 'session_persist_unavailable',
+              }))
+            }
             if (settleAfter) settle(() => resolve())
           }
         })()
@@ -5541,8 +5622,12 @@ export class SessionManager {
             }
           }
           let persistenceAcknowledged = true
+          // E6 — 'queued'(queued_to_outbox)三态旁路:本地已可靠排队但权威库未
+          // 确认。不算 acknowledged(paid-turn 完成语义不变),但也不能静默不投递
+          // 终态 —— 那会让用户永远停在「思考中」。
+          let persistenceQueuedToOutbox = false
           let terminalErrorForClient: string | undefined
-          let terminalErrorCodeForClient: 'user_cancelled' | undefined
+          let terminalErrorCodeForClient: GatewayTerminalErrorCode | undefined
 
           // Detect stale --resume session id. CCB emits an error result with
           // `errors: ["No conversation found with session ID: <id>"]` when
@@ -6064,10 +6149,14 @@ export class SessionManager {
             if (completedHasError) {
               terminalErrorForClient =
                 terminalOverride?.reason ?? result.errorDetail ?? 'engine reported an error'
+              // E4.2 — gateway 权威终态码透传:handleExit/tape 已正确分类的
+              // RUNNER_CRASHED / SERVICE_RESTART(以及 USER_CANCELLED、tape
+              // AUTH_ERROR / ENGINE_ERROR)不再被 server 侧原文正则压成
+              // upstream_failed。免单/静默恢复类码(LIVENESS_TIMEOUT 等)不在
+              // wire 枚举内,保持 undefined 走既有 classify 兜底。
               terminalErrorCodeForClient =
-                terminalOverride?.errorCode === 'USER_CANCELLED'
-                  ? 'user_cancelled'
-                  : undefined
+                _wireTerminalCodeForTape(terminalOverride?.errorCode) ??
+                (result.errorKind === 'auth' ? 'auth_error' : undefined)
             }
             if (
               MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
@@ -6104,7 +6193,9 @@ export class SessionManager {
               // dedupe. Threshold extended to "thinking-only" turns (Sonnet
               // 4.6 adaptive thinking that runs out of tokens before producing
               // assistant text) so those don't disappear either.
-              const persistence = persistServerAuthoredTurn({
+              // E6 — 用四态 Outcome 版本以识别 'queued'(queued_to_outbox):
+              // 布尔层语义不变(acked|skipped→true),queued 走下方降级终态旁路。
+              const persistenceOutcome = persistServerAuthoredTurnOutcome({
                 sessionKey: session.sessionKey,
                 peerId,
                 agentId: session.agentId,
@@ -6180,12 +6271,22 @@ export class SessionManager {
                   ? { engineBilling: terminalEngineBilling }
                   : {}),
               })
+              const persistence = persistenceOutcome.then(
+                (r) => r === 'acked' || r === 'skipped',
+              )
               this._trackPersistence(persistence)
               // Do not declare the paid turn complete until master has
               // durably finalized the immutable tape. A queued local spool is
               // safe but not yet refresh-visible, so it must not masquerade as
               // an acknowledged completion.
               persistenceAcknowledged = await persistence
+              // E6 的降级投递只针对**个人版本地 outbox**(queued_to_outbox):本地
+              // SQLite 即权威库,没有任何上游会替我们把终态送给用户。商用 v3 sink
+              // 的 'queued'(master 暂不可达)保持既有静默语义 —— master ACK 才是
+              // 权威终态,提前投递会与 master 侧恢复链路(reconnect replay)打架
+              // (契约测试锁此语义)。
+              persistenceQueuedToOutbox =
+                getV3MasterSinkOrNull() === null && (await persistenceOutcome) === 'queued'
             }
 
             // Unified turn-usage emit (eventPersist writes usage_log).
@@ -6254,15 +6355,32 @@ export class SessionManager {
               // 则透传给 server.ts 直接按码组 outbound.error;缺省 undefined →
               // server 侧回落 classifyRunError,行为不变。
               const preClassified = result?.errorClass
-              onEvent({
+              onEvent(_asEngineErrorEvent({
                 kind: 'error',
                 error: terminalErrorForClient,
                 ...(preClassified ? { errorClass: preClassified } : {}),
                 ...(terminalErrorCodeForClient ? { errorCode: terminalErrorCodeForClient } : {}),
-              })
+              }))
             } else if (pendingFinal) {
               onEvent(pendingFinal)
             }
+          } else if (persistenceQueuedToOutbox) {
+            // E6 — 落库进 outbox(权威库暂不可用):不算 acknowledged,但必须向
+            // 当前连接投递降级终态,否则用户永远停在「思考中」。发一个
+            // session_persist_unavailable 的 error 事件:server.ts 组结构化
+            // outbound.error(受控文案「回复已生成、暂存待落库」)+ 兼容 [error]
+            // final 终止器关闭本轮。已流式送达的正文气泡不受影响;outbox replay
+            // 落库后刷新可见全文。原始失败细节(若有)进事件 error 字段仅供日志。
+            log.warn('turn terminal delivered in degraded persist-queued mode', {
+              sessionKey: session.sessionKey,
+              turnIndex: session.turns,
+              ...(traceId ? { traceId } : {}),
+            })
+            onEvent(_asEngineErrorEvent({
+              kind: 'error',
+              error: terminalErrorForClient ?? SESSION_PERSIST_QUEUED_NOTICE,
+              errorCode: 'session_persist_unavailable',
+            }))
           }
           settle(() => resolve())
       }

@@ -372,9 +372,9 @@ export async function routeWechatInbound(
       ? new Date(binding.lastEventAt).toISOString().slice(0, 19).replace('T', ' ')
       : '(无)'
     const msg =
-      `OC bot status\n` +
-      `account: ${binding.accountId}\n` +
-      `status: ${binding.status}\n` +
+      `OpenClaude 状态\n` +
+      `绑定账号: ${binding.accountId}\n` +
+      `绑定状态: ${binding.status === 'active' ? '正常' : binding.status}\n` +
       `最近事件: ${lastEvt}\n` +
       `活跃 worker: ${workersCount}`
     sendText(binding.userId, senderId, msg)
@@ -391,7 +391,9 @@ export async function routeWechatInbound(
       if (ctx.resetSession) await ctx.resetSession('wechat', peerId, 'dm')
       sendText(binding.userId, senderId, '已开启新会话。下一条消息将由全新的 agent 处理。')
     } catch (err: any) {
-      sendText(binding.userId, senderId, `/new 失败: ${err?.message || err}`)
+      // E8 — 错误细节(可能含内部路径/DB 报错)只进日志,用户看固定文案。
+      ctx.log.error(`[wechat] /new resetSession failed: ${err?.message || err}`)
+      sendText(binding.userId, senderId, '开启新会话失败，请稍后重试。')
     }
     return
   }

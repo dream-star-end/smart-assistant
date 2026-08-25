@@ -65,6 +65,18 @@ function _onExit(): void {
   }
 }
 
+/**
+ * E10 — schema migration catch 的统一分诊:预期的幂等重跑错误(duplicate column
+ * name:列已在上次运行加过)保持静默;**其它任何 SQLite 错误必须出日志** ——
+ * 静默吞掉会让"迁移没跑成、后续查询 no such column"类事故毫无线索(不
+ * fail-closed:正常路径行为不变,继续 open)。
+ */
+function _logMigrationFailure(step: string, err: unknown): void {
+  const msg = err instanceof Error ? err.message : String(err)
+  if (/duplicate column name/i.test(msg)) return
+  console.error(`[sessionsDb] schema migration "${step}" failed (continuing):`, msg)
+}
+
 export async function getSessionsDb(): Promise<Database.Database> {
   if (_db) return _db
   await mkdir(dirname(paths.sessionsDb), { recursive: true })
@@ -200,13 +212,15 @@ export async function getSessionsDb(): Promise<Database.Database> {
   `)
 
   // ── Schema migrations (run BEFORE index creation) ──
+  // E10 — 各步 catch 经 _logMigrationFailure 分诊:预期的幂等重跑错误
+  // (duplicate column name)静默;其它 SQLite 错误记 console.error 后继续。
   // 1. Migrate event_log: rename session_id → session_key if old schema
   try {
     const cols = db.pragma('table_info(event_log)') as Array<{ name: string }>
     if (cols.some(c => c.name === 'session_id') && !cols.some(c => c.name === 'session_key')) {
       db.exec('ALTER TABLE event_log RENAME COLUMN session_id TO session_key')
     }
-  } catch { /* table just created, no migration needed */ }
+  } catch (err) { _logMigrationFailure('event_log rename session_id→session_key', err) }
 
   // 2. Migrate usage_log: deduplicate then add unique constraint
   try {
@@ -221,7 +235,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
       `)
       db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_log_dedup ON usage_log(session_id, turn_index)')
     }
-  } catch { /* table just created, no migration needed */ }
+  } catch (err) { _logMigrationFailure('usage_log dedup unique index', err) }
 
   // 2b. usage_log.terminal_status — mark abnormal / reconciled terminals
   try {
@@ -229,7 +243,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
     if (!usageCols.some(c => c.name === 'terminal_status')) {
       db.exec("ALTER TABLE usage_log ADD COLUMN terminal_status TEXT NOT NULL DEFAULT 'completed'")
     }
-  } catch { /* table just created with column already */ }
+  } catch (err) { _logMigrationFailure('usage_log add terminal_status', err) }
 
   // 3. Migrate event_log: add peer_id and channel columns for audit trail (P0.5)
   try {
@@ -240,7 +254,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
     if (!cols.some(c => c.name === 'channel')) {
       db.exec("ALTER TABLE event_log ADD COLUMN channel TEXT DEFAULT ''")
     }
-  } catch { /* table just created with columns already, or migration ran */ }
+  } catch (err) { _logMigrationFailure('event_log add peer_id/channel', err) }
 
   // ── Create indexes (after migrations) ──
   db.exec(`
@@ -257,17 +271,29 @@ export async function getSessionsDb(): Promise<Database.Database> {
   `)
 
   // Periodic WAL checkpoint to prevent unbounded WAL growth
+  // E10 — checkpoint 失败加 warn:长期静默失败 = WAL 无界膨胀(doctor 会报体积),
+  // 必须有日志线索;单次失败不致命,下个周期重试。
   _walTimer = setInterval(() => {
     try {
       db.pragma('wal_checkpoint(TRUNCATE)')
-    } catch {}
+    } catch (err) {
+      console.warn(
+        '[sessionsDb] periodic wal_checkpoint(TRUNCATE) failed:',
+        err instanceof Error ? err.message : String(err),
+      )
+    }
   }, 30 * 60_000) // every 30 min
   // Don't prevent process exit — mcp-memory processes are short-lived
   _walTimer.unref()
   // Run one immediately
   try {
     db.pragma('wal_checkpoint(TRUNCATE)')
-  } catch {}
+  } catch (err) {
+    console.warn(
+      '[sessionsDb] startup wal_checkpoint(TRUNCATE) failed:',
+      err instanceof Error ? err.message : String(err),
+    )
+  }
 
   // Ensure WAL is checkpointed and DB is closed on process exit.
   // Use process.on (not once) so that closeSessionsDb() + reopen still works,

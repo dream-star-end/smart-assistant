@@ -2587,14 +2587,24 @@ export function _buildMessageEl(msg) {
       title.className = 'msg-error-title'
       title.textContent = msg.text || '出错了'
       card.appendChild(title)
-      if (msg._errorDetail) {
+      // E3 — 「查看详情」只展示请求 ID(trace),不展示原始错误串。websocket.js
+      // 新写入的 _errorDetail 已是「请求 ID：…」形态;这里对**水合的历史消息**
+      // (旧版本曾把上游原文存进 _errorDetail)再兜一层:非安全形态一律回退到
+      // usage.traceId 派生,派生不出就不渲染详情区。
+      const _safeDetail = (() => {
+        const raw = typeof msg._errorDetail === 'string' ? msg._errorDetail.trim() : ''
+        if (/^请求 ID：[A-Za-z0-9_-]{1,128}$/.test(raw)) return raw
+        const trace = typeof msg.usage?.traceId === 'string' ? msg.usage.traceId.trim() : ''
+        return trace ? `请求 ID：${trace}` : ''
+      })()
+      if (_safeDetail) {
         const det = document.createElement('details')
         det.className = 'msg-error-detail'
         const sum = document.createElement('summary')
         sum.textContent = '查看详情'
         det.appendChild(sum)
         const pre = document.createElement('pre')
-        pre.textContent = String(msg._errorDetail)
+        pre.textContent = _safeDetail
         det.appendChild(pre)
         card.appendChild(det)
       }

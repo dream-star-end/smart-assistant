@@ -3906,35 +3906,155 @@ function handleOutboundTurnStatus(frame) {
   }
 }
 
+// E3 — 归一化任意来源错误码 → 语义码。对齐 protocol turnErrorTaxonomy 的
+// LEGACY_CODE_ALIASES(大写 legacy 控制码 → 小写语义码)+ 前端 only 特判
+// 裸 BACKPRESSURE(旧 master 曾裸发)。alias 表内联在函数体里:
+// wsAuthControlError.test.ts 按源码抽取本函数单测,必须自包含。
 function _normalizeBridgeErrorCode(code) {
   const raw = String(code || '').trim()
-  const upper = raw.toUpperCase()
-  if (upper === 'ERR_INSUFFICIENT_CREDITS' || upper === 'INSUFFICIENT_CREDITS') {
-    return 'insufficient_credits'
+  if (!raw) return 'unknown'
+  const aliases = {
+    ENGINE_ERROR: 'engine_error',
+    AUTH_ERROR: 'auth_error',
+    MODEL_AUTHORITY_EXPIRED: 'model_authority_expired',
+    NO_RESPONSE: 'no_response',
+    PHANTOM_TURN: 'phantom_turn',
+    LIVENESS_TIMEOUT: 'liveness_timeout',
+    IDLE_TIMEOUT: 'idle_timeout',
+    TURN_LIMIT: 'turn_limit',
+    USER_CANCELLED: 'user_cancelled',
+    RUNNER_CRASHED: 'runner_crashed',
+    RUNNER_ERROR: 'runner_crashed',
+    RUNNER_INTERRUPTED: 'runner_crashed',
+    TURN_SUBMIT_FAILED: 'runner_crashed',
+    CODEX_ERROR: 'engine_error',
+    INSUFFICIENT_CREDITS: 'insufficient_credits',
+    ERR_INSUFFICIENT_CREDITS: 'insufficient_credits',
+    UNAUTHORIZED_MODEL: 'unauthorized_model',
+    MAINTENANCE: 'maintenance',
+    ERR_CONN_KICKED: 'conn_kicked',
+    CONN_KICKED: 'conn_kicked',
+    ERR_BACKPRESSURE: 'conn_kicked',
+    BACKPRESSURE: 'conn_kicked',
+    RATE_LIMITED: 'rate_limited',
+    UPSTREAM_FAILED: 'upstream_failed',
   }
-  if (upper === 'CODEX_TURN_BUSY') return 'codex_turn_busy'
-  if (upper === 'CODEX_POOL_BUSY') return 'codex_pool_busy'
-  if (upper === 'CODEX_ROUTE_UNAVAILABLE') return 'codex_route_unavailable'
-  if (upper === 'UNAUTHORIZED_MODEL') return 'unauthorized_model'
-  if (upper === 'CODEX_CONTAINER_RECYCLED') return 'codex_container_recycled'
-  if (upper === 'MAINTENANCE') return 'maintenance'
-  return raw ? raw.toLowerCase() : 'unknown'
+  const alias = aliases[raw.toUpperCase()]
+  if (alias) return alias
+  return raw.toLowerCase()
 }
 
 export function _isBridgeAuthControlError(code) {
   return _normalizeBridgeErrorCode(code) === 'unauthorized'
 }
 
+// E3 — 用户向错误正文全表,key 集合与中文文案对齐 web-react 的
+// BRIDGE_ERROR_MESSAGES(packages/web-react/src/lib/chat/pure.ts,单一权威;
+// 此处为 vanilla 前端的镜像副本,改文案两处同步)。
+const _BRIDGE_ERROR_MESSAGES = {
+  // ── 计费/配额 ──
+  insufficient_credits: '余额不足，充值后即可继续使用。',
+  rate_limited: '请求暂时较多，请稍后直接重试本条消息。',
+  // ── 上游模型服务 ──
+  model_capacity: '当前模型访问量较大，请稍后重试，或在上方切换到其他模型立即继续。',
+  upstream_failed: '任务执行暂时中断，你的消息已保留，可直接重试。',
+  upstream_timeout: '模型响应超时，你的消息已保留，请重试。',
+  network_error: '网络波动导致本轮中断，请重试。',
+  context_too_long:
+    '本会话内容已超过模型的上下文上限。可以精简这条消息后重发、点击下方按钮在新会话中继续，或在上方切换支持更长上下文的模型。',
+  bad_request: '这条请求无法被处理，请调整内容后重试。',
+  // ── 引擎/平台执行 ──
+  engine_error: '任务执行时遇到内部错误，你的消息已保留，可以直接重试。',
+  internal_error: '服务遇到内部错误，你的消息已保留，请重试。',
+  auth_error: '认证状态异常，本轮未正常完成，请重新尝试。',
+  service_restart: '服务正在更新，本轮已中断，请重试。',
+  session_persist_unavailable: '消息已保留在本机，但暂时未能安全送达。请点下方“重试”原样发送。',
+  stopped: '本轮生成已停止。',
+  user_cancelled: '本轮已取消。',
+  runner_crashed: '执行环境意外中断，你的消息已保留，请重试。',
+  // ── 免单类 ──
+  model_authority_expired: '长任务的执行凭证未能继续，本轮不收费，你可以重新尝试。',
+  liveness_timeout: '任务长时间没有新输出，系统已中断，本轮不收费。',
+  idle_timeout: '任务长时间没有新输出，系统已中断，本轮不收费。',
+  no_response: '任务未能产生有效回复，本轮未扣费。',
+  phantom_turn: '任务未能产生有效回复，本轮未扣费。',
+  turn_limit: '任务达到运行上限，系统已中断，本轮不收费。',
+  // ── 模型权威 gate 拒帧 ──
+  model_config_changed_retry_turn:
+    '平台的模型配置刚刚更新，本轮已停止（不计费）。你的消息没有丢：点它下方的「重试」即可原样重发。',
+  model_not_available: '这个模型当前不可用（已下架或未对你的账号开通），请在上方切换一个模型后重发。',
+  unresolved_agent_model: '没能确定本轮要用的模型，请在上方选择模型后重发。',
+  model_authority_unavailable: '模型配置正在同步，请稍后点「重试」重发本条消息。',
+  model_catalog_unavailable: '模型配置正在同步，请稍后点「重试」重发本条消息。',
+  unauthorized_model: '当前账号尚未开通这个模型，请切换模型或联系管理员。',
+  // ── 连接/环境 ──
+  unauthorized: '登录状态已失效，请重新登录后继续。',
+  maintenance: '服务正在维护中，请稍后再试。',
+  conn_kicked: '连接曾短暂中断，系统会自动重连并续传，已生成的内容不受影响。',
+  container_outdated: '运行环境已更新，请刷新页面后重新发送（直接重试不会生效）。',
+  err_container: '运行环境出现异常，你的消息已保留，请重试。',
+  err_container_timeout: '运行环境响应超时，请重试。',
+  err_internal: '服务遇到内部错误，请重试。',
+  forbidden: '该操作被拒绝，请检查后重试。',
+  err_frame_too_big: '本轮内容过大无法处理，请精简后重试。',
+  bad_json: '收到的数据格式异常，请重试。',
+  bad_sequence: '消息时序出现异常，请重试。',
+  unknown_control: '收到无法识别的指令，请重试。',
+  // ── 媒体/子系统 ──
+  image_upstream_rejected: '图片生成/编辑被上游拒绝（可能触发了内容审核），请调整描述或更换图片后重试。',
+  image_server_busy: '图片服务当前繁忙，请稍后重试。',
+  voice_upstream_error: '语音识别服务暂时不可用，请重试',
+  voice_timeout: '语音识别超时，请重试',
+  // ── 遗留兼容 ──
+  codex_turn_busy: '上一轮任务仍在运行，请等它结束后再发送。',
+  codex_pool_busy: '账号池繁忙，请稍后重试。',
+  codex_route_unavailable: '模型服务暂时不可用，你的消息已保留，请稍后重试。',
+  codex_container_recycled: '环境已重建，请刷新页面后重发。',
+  codex_billing: '计费服务暂时不可用，本轮未开始，请稍后重试。',
+  upstream_error: '模型服务暂时不可用，你的消息已保留，请重试。',
+}
+
+const _BRIDGE_ERROR_FALLBACK = '系统暂时不可用，请稍后重试。'
+
+// 服务端 message 白名单透传码(taxonomy allowPublicServerMessage===true 的码,
+// 与 web-react friendlyBridgeErrorMessage 同一策略)。
+const _ALLOW_SERVER_MESSAGE_CODES = new Set(['container_outdated', 'image_upstream_rejected'])
+
+// isDisplayableServerMessage 的镜像守卫(protocol turnErrorTaxonomy 同源约束:
+// ≤200 字符、非 JSON/堆栈/URL 形态)。
+function _isDisplayableServerMessage(message) {
+  if (typeof message !== 'string') return false
+  const s = message.trim()
+  if (!s || s.length > 200) return false
+  if (/^[\[{]/.test(s)) return false
+  if (/"(?:error|errors|status|code)"\s*:|\bat\s+\S+\s*\(|https?:\/\//i.test(s)) return false
+  return true
+}
+
 function _friendlyBridgeErrorMessage(code, message) {
   const normalized = _normalizeBridgeErrorCode(code)
-  if (normalized === 'insufficient_credits') return '余额不足，充值后即可继续使用。'
-  if (normalized === 'codex_turn_busy') return '上一轮 GPT/Codex 任务仍在运行，请等它结束后再发送。'
-  if (normalized === 'codex_pool_busy') return 'GPT/Codex 账号池繁忙，请稍后重试。'
-  if (normalized === 'codex_route_unavailable') return '当前模型的 GPT/Codex 通道暂不可用，请换模型或稍后重试。'
-  if (normalized === 'unauthorized_model') return '当前账号尚未开通这个模型，请切换模型或联系管理员。'
-  if (normalized === 'codex_container_recycled') return 'GPT 账号配置已变更，环境已重建，请刷新页面后重发。'
-  if (normalized === 'maintenance') return '服务正在维护中，请稍后再试。'
-  return message || '系统暂时不可用，请稍后重试。'
+  // 白名单码 + 展示守卫通过时透传服务端说明(如 container_outdated 的具体指路);
+  // 其余一律按码取文案,未知码回通用兜底 —— 绝不把裸技术串抛给用户。
+  if (
+    typeof message === 'string' &&
+    _ALLOW_SERVER_MESSAGE_CODES.has(normalized) &&
+    _isDisplayableServerMessage(message)
+  ) {
+    return message
+  }
+  if (Object.prototype.hasOwnProperty.call(_BRIDGE_ERROR_MESSAGES, normalized)) {
+    return _BRIDGE_ERROR_MESSAGES[normalized]
+  }
+  // codex_unavailable 是历史别名(非 taxonomy 码),与 route_unavailable 同义。
+  if (normalized === 'codex_unavailable') return _BRIDGE_ERROR_MESSAGES.codex_route_unavailable
+  return _BRIDGE_ERROR_FALLBACK
+}
+
+// E3 — 「查看详情」只保留 trace id(对齐 web-react safeBridgeErrorDetail):
+// 上游/路由原文不进详情区;无 trace 时不生成与正文重复的详情。
+function _safeBridgeErrorDetail(_code, traceId) {
+  const trace = typeof traceId === 'string' ? traceId.trim() : ''
+  return trace ? `请求 ID：${trace}` : ''
 }
 
 function _markLatestPendingUserMessageErrored(sess) {
@@ -3987,7 +4107,12 @@ function handleLegacyBridgeError(frame) {
   }
   addMessage(sess, 'assistant', text, {
     _errorCode: normalized,
-    _errorDetail: typeof frame?.message === 'string' ? frame.message : '',
+    // E3 — 详情区不放服务端原文,只留请求 ID(内联表达式:本函数被
+    // wsAuthControlError.test.ts 按源码抽取单测,不能引用未注入的 helper)。
+    _errorDetail:
+      typeof frame?.traceId === 'string' && frame.traceId.trim()
+        ? `请求 ID：${frame.traceId.trim()}`
+        : '',
     // 2026-06-18(Codex MEDIUM)— 错误消息也带 per-turn traceId(若有),让用户点错误
     // 红卡"反馈"时 getMsgRequestId 能拿到本轮 id、且错误卡片能渲染请求ID 芯片。legacy
     // 传输级 error 帧通常没有 turn traceId,缺失时不写(getMsgRequestId 退空)。
@@ -4016,7 +4141,9 @@ function handleOutboundError(frame) {
   const normalized = _normalizeBridgeErrorCode(frame.code)
   addMessage(sess, 'assistant', _friendlyBridgeErrorMessage(frame.code, frame.message || '出错了'), {
     _errorCode: normalized,
-    _errorDetail: typeof frame.detail === 'string' ? frame.detail : '',
+    // E3 — 对齐 web-react safeBridgeErrorDetail:详情区只留请求 ID,不放
+    // frame.detail 原文(旧 gateway 会把上游原始错误串放进 detail)。
+    _errorDetail: _safeBridgeErrorDetail(normalized, frame.traceId),
     // 2026-06-18(Codex MEDIUM)— 写入本轮 traceId(outbound.error 帧由 gateway 盖了
     // 公开 traceId),让错误红卡的"反馈"携带本轮 id + 渲染请求ID 芯片,便于反查日志。
     ...(frame.traceId ? { usage: { traceId: frame.traceId } } : {}),

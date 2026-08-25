@@ -29,7 +29,11 @@ program
   .option('--dev', '开发模式')
   .action((opts) => gatewayCmd(opts))
 
-program.command('doctor').description('健康检查').action(doctor)
+program
+  .command('doctor')
+  .description('健康检查')
+  .option('--show-token', '显示完整 gateway access token(默认脱敏)')
+  .action((opts) => doctor({ showToken: opts.showToken === true }))
 
 const agents = program.command('agents').description('agent 管理')
 agents.command('list').action(agentsList)
