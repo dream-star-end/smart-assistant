@@ -7,8 +7,10 @@
  * idle) with no ack, it origin-injects. A dead parent CCB process is not covered.
  *
  * State is three-valued, not a boolean: pending → injecting → delivered.
- * delivered is the only terminal success (CCB ack or inject really applied).
- * retryable inject failures stay pending/injecting and must be retried.
+ * delivered is written only for: CCB ack, a truly applied inject, or an
+ * observable abandon after max finalize rounds / pending TTL.
+ * An in-round retry budget exhaust is not terminal — fail back to pending
+ * so a later finalize can retry.
  */
 import { parseOriginWebchatSessionKey } from './cronOriginSession.js'
 
@@ -16,6 +18,11 @@ export { parseOriginWebchatSessionKey }
 
 const SUMMARY_MAX = 800
 const PENDING_MAX = 1024
+
+/** Max finalize-time 12-retry windows before a pending inject is abandoned. */
+export const CCB_LOCAL_AGENT_INJECT_MAX_FINALIZE_ROUNDS = 5
+/** Max age of a pending inject before it is abandoned. */
+export const CCB_LOCAL_AGENT_INJECT_PENDING_TTL_MS = 30 * 60_000
 
 export type CcbLocalAgentNotification = {
   taskId: string
@@ -29,12 +36,17 @@ export type CcbLocalAgentCallbackState = 'pending' | 'injecting' | 'delivered'
 
 export type CcbLocalAgentCallbackDecision = 'wait' | 'inject' | 'noop' | 'acked'
 
+export type CcbLocalAgentAbandonReason = 'max_finalize_rounds' | 'pending_ttl'
+
 type PendingEntry = {
   state: CcbLocalAgentCallbackState
   sessionKey: string
   taskId: string
   payload: CcbLocalAgentNotification
   userId?: string
+  firstSeenAt: number
+  finalizeRetryRounds: number
+  abandonReason?: CcbLocalAgentAbandonReason
 }
 
 const store = new Map<string, PendingEntry>()
@@ -95,11 +107,81 @@ function evictIfNeeded(): void {
   }
 }
 
+function emptyPayload(taskId: string): CcbLocalAgentNotification {
+  return {
+    taskId,
+    status: 'completed',
+    outputFile: '',
+    summary: '',
+  }
+}
+
+function limitReason(entry: PendingEntry, now: number): CcbLocalAgentAbandonReason | undefined {
+  if (entry.finalizeRetryRounds >= CCB_LOCAL_AGENT_INJECT_MAX_FINALIZE_ROUNDS) {
+    return 'max_finalize_rounds'
+  }
+  if (now - entry.firstSeenAt >= CCB_LOCAL_AGENT_INJECT_PENDING_TTL_MS) {
+    return 'pending_ttl'
+  }
+  return undefined
+}
+
+function abandonWithReason(entry: PendingEntry, reason: CcbLocalAgentAbandonReason): void {
+  entry.state = 'delivered'
+  entry.abandonReason = reason
+}
+
 export function getCcbLocalAgentCallbackState(
   sessionKey: string,
   taskId: string,
 ): CcbLocalAgentCallbackState | undefined {
   return store.get(ccbLocalAgentPendingKey(sessionKey, taskId))?.state
+}
+
+export function getCcbLocalAgentAbandonReason(
+  sessionKey: string,
+  taskId: string,
+): CcbLocalAgentAbandonReason | undefined {
+  return store.get(ccbLocalAgentPendingKey(sessionKey, taskId))?.abandonReason
+}
+
+/**
+ * Check TTL / accumulated finalize-round limits without incrementing.
+ * Used at the start of a finalize inject so an already-expired item is
+ * abandoned observably instead of spending another in-round budget.
+ */
+export function evaluateCcbLocalAgentInjectLimit(
+  sessionKey: string,
+  taskId: string,
+  now = Date.now(),
+): CcbLocalAgentAbandonReason | undefined {
+  const existing = store.get(ccbLocalAgentPendingKey(sessionKey, taskId))
+  if (!existing) return undefined
+  if (existing.state === 'delivered') return existing.abandonReason
+  const reason = limitReason(existing, now)
+  if (!reason) return undefined
+  abandonWithReason(existing, reason)
+  return reason
+}
+
+/**
+ * Record that one finalize-time 12-retry window exhausted. Caller must
+ * failCcbLocalAgentInject first (back to pending). Returns an abandon
+ * reason only when the cross-round or TTL cap is now hit.
+ */
+export function noteCcbLocalAgentFinalizeRoundExhausted(
+  sessionKey: string,
+  taskId: string,
+  now = Date.now(),
+): CcbLocalAgentAbandonReason | undefined {
+  const existing = store.get(ccbLocalAgentPendingKey(sessionKey, taskId))
+  if (!existing) return undefined
+  if (existing.state === 'delivered') return existing.abandonReason
+  existing.finalizeRetryRounds += 1
+  const reason = limitReason(existing, now)
+  if (!reason) return undefined
+  abandonWithReason(existing, reason)
+  return reason
 }
 
 /**
@@ -127,6 +209,8 @@ export function noteCcbTaskNotification(opts: {
       taskId,
       payload: { ...opts.notification, taskId },
       userId: opts.userId,
+      firstSeenAt: Date.now(),
+      finalizeRetryRounds: 0,
     })
     evictIfNeeded()
   } else if (opts.userId && !existing.userId) {
@@ -152,13 +236,11 @@ export function ackCcbTaskNotificationDelivered(opts: {
     state: 'delivered',
     sessionKey: opts.sessionKey,
     taskId,
-    payload: existing?.payload ?? {
-      taskId,
-      status: 'completed',
-      outputFile: '',
-      summary: '',
-    },
+    payload: existing?.payload ?? emptyPayload(taskId),
     userId: existing?.userId,
+    firstSeenAt: existing?.firstSeenAt ?? Date.now(),
+    finalizeRetryRounds: existing?.finalizeRetryRounds ?? 0,
+    abandonReason: existing?.abandonReason,
   })
   evictIfNeeded()
   return 'acked'
@@ -220,4 +302,32 @@ export function resetCcbLocalAgentCallbackDedupeForTest(): void {
 
 export function ccbLocalAgentPendingSizeForTest(): number {
   return store.size
+}
+
+export function getCcbLocalAgentPendingMetaForTest(
+  sessionKey: string,
+  taskId: string,
+): {
+  state: CcbLocalAgentCallbackState
+  finalizeRetryRounds: number
+  firstSeenAt: number
+  abandonReason?: CcbLocalAgentAbandonReason
+} | undefined {
+  const existing = store.get(ccbLocalAgentPendingKey(sessionKey, taskId))
+  if (!existing) return undefined
+  return {
+    state: existing.state,
+    finalizeRetryRounds: existing.finalizeRetryRounds,
+    firstSeenAt: existing.firstSeenAt,
+    abandonReason: existing.abandonReason,
+  }
+}
+
+export function setCcbLocalAgentFirstSeenAtForTest(
+  sessionKey: string,
+  taskId: string,
+  firstSeenAt: number,
+): void {
+  const existing = store.get(ccbLocalAgentPendingKey(sessionKey, taskId))
+  if (existing) existing.firstSeenAt = firstSeenAt
 }

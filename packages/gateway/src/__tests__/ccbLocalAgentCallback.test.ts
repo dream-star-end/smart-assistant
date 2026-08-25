@@ -5,18 +5,24 @@ import {
   ackCcbTaskNotificationDelivered,
   beginCcbLocalAgentInject,
   buildCcbLocalAgentCallbackText,
+  CCB_LOCAL_AGENT_INJECT_MAX_FINALIZE_ROUNDS,
+  CCB_LOCAL_AGENT_INJECT_PENDING_TTL_MS,
   ccbLocalAgentCallbackClientMessageId,
   ccbLocalAgentCallbackIdempotencyKey,
   ccbLocalAgentPendingSizeForTest,
   clearCcbLocalAgentPendingForSession,
   completeCcbLocalAgentInject,
+  evaluateCcbLocalAgentInjectLimit,
   failCcbLocalAgentInject,
+  getCcbLocalAgentAbandonReason,
   getCcbLocalAgentCallbackState,
+  getCcbLocalAgentPendingMetaForTest,
+  noteCcbLocalAgentFinalizeRoundExhausted,
   noteCcbTaskNotification,
   resetCcbLocalAgentCallbackDedupeForTest,
   sessionHasInFlightTurn,
+  setCcbLocalAgentFirstSeenAtForTest,
   takePendingInjectionsForSession,
-  abandonCcbLocalAgentInject,
 } from '../ccbLocalAgentCallback.js'
 import {
   ORIGIN_INJECT_RETRY_BUDGET,
@@ -41,6 +47,11 @@ function note(
       summary: extra.summary ?? `Agent "${taskId}" completed`,
     },
   })
+}
+
+function failRound(taskId: string) {
+  failCcbLocalAgentInject(SESSION, taskId)
+  return noteCcbLocalAgentFinalizeRoundExhausted(SESSION, taskId)
 }
 
 afterEach(() => {
@@ -185,7 +196,7 @@ describe('blocker 3: retryable inject keeps pending and retries once', () => {
     assert.equal(getCcbLocalAgentCallbackState(SESSION, 'agt-nt'), 'delivered')
   })
 
-  it('retry budget exhausted falls back observably and does not retry later', async () => {
+  it('retry budget exhausted keeps pending so a later finalize can retry', async () => {
     assert.equal(note('agt-ex', false), 'inject')
     assert.equal(beginCcbLocalAgentInject(SESSION, 'agt-ex'), true)
     const delays: number[] = []
@@ -196,7 +207,8 @@ describe('blocker 3: retryable inject keeps pending and retries once', () => {
       },
       onBudgetExhausted: () => {
         exhausted += 1
-        abandonCcbLocalAgentInject(SESSION, 'agt-ex')
+        failCcbLocalAgentInject(SESSION, 'agt-ex')
+        assert.equal(failRound('agt-ex'), undefined)
       },
       tryOnce: async () => ({ kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }),
     })
@@ -205,8 +217,84 @@ describe('blocker 3: retryable inject keeps pending and retries once', () => {
     assert.equal(delays.length, ORIGIN_INJECT_RETRY_BUDGET)
     assert.equal(delays[0], 500)
     assert.equal(delays.at(-1), 5_000)
-    assert.equal(getCcbLocalAgentCallbackState(SESSION, 'agt-ex'), 'delivered')
-    assert.equal(note('agt-ex', false), 'noop')
+    assert.equal(getCcbLocalAgentCallbackState(SESSION, 'agt-ex'), 'pending')
+    assert.equal(getCcbLocalAgentAbandonReason(SESSION, 'agt-ex'), undefined)
+    assert.equal(note('agt-ex', false), 'inject')
+    assert.deepEqual(takePendingInjectionsForSession(SESSION).map((x) => x.payload.taskId), [
+      'agt-ex',
+    ])
+    assert.equal(beginCcbLocalAgentInject(SESSION, 'agt-ex'), true)
+  })
+
+  it('later finalize after budget exhaust injects exactly once', async () => {
+    assert.equal(note('agt-retry', false), 'inject')
+    assert.equal(beginCcbLocalAgentInject(SESSION, 'agt-retry'), true)
+
+    const first = await runBoundedOriginInjectBackoff({
+      sleep: async () => {},
+      onBudgetExhausted: () => {
+        failCcbLocalAgentInject(SESSION, 'agt-retry')
+        assert.equal(noteCcbLocalAgentFinalizeRoundExhausted(SESSION, 'agt-retry'), undefined)
+      },
+      tryOnce: async () => ({ kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }),
+    })
+    assert.equal(first.kind, 'fallback')
+    assert.equal(getCcbLocalAgentCallbackState(SESSION, 'agt-retry'), 'pending')
+    assert.equal(takePendingInjectionsForSession(SESSION).length, 1)
+    assert.equal(getCcbLocalAgentPendingMetaForTest(SESSION, 'agt-retry')?.finalizeRetryRounds, 1)
+
+    assert.equal(beginCcbLocalAgentInject(SESSION, 'agt-retry'), true)
+    let calls = 0
+    const second = await runBoundedOriginInjectBackoff({
+      sleep: async () => {},
+      tryOnce: async () => {
+        calls += 1
+        completeCcbLocalAgentInject(SESSION, 'agt-retry')
+        return { kind: 'injected' }
+      },
+    })
+    assert.equal(second.kind, 'injected')
+    assert.equal(calls, 1)
+    assert.equal(getCcbLocalAgentCallbackState(SESSION, 'agt-retry'), 'delivered')
+    assert.equal(getCcbLocalAgentAbandonReason(SESSION, 'agt-retry'), undefined)
+    assert.equal(note('agt-retry', false), 'noop')
+    assert.equal(beginCcbLocalAgentInject(SESSION, 'agt-retry'), false)
+    assert.equal(takePendingInjectionsForSession(SESSION).length, 0)
+  })
+
+  it('abandons observably after max finalize rounds', () => {
+    assert.equal(note('agt-cap', false), 'inject')
+    const reasons: Array<string | undefined> = []
+    for (let i = 0; i < CCB_LOCAL_AGENT_INJECT_MAX_FINALIZE_ROUNDS; i += 1) {
+      assert.equal(beginCcbLocalAgentInject(SESSION, 'agt-cap'), true)
+      reasons.push(failRound('agt-cap'))
+    }
+    assert.deepEqual(
+      reasons.slice(0, -1),
+      Array(CCB_LOCAL_AGENT_INJECT_MAX_FINALIZE_ROUNDS - 1).fill(undefined),
+    )
+    assert.equal(reasons.at(-1), 'max_finalize_rounds')
+    assert.equal(getCcbLocalAgentCallbackState(SESSION, 'agt-cap'), 'delivered')
+    assert.equal(getCcbLocalAgentAbandonReason(SESSION, 'agt-cap'), 'max_finalize_rounds')
+    assert.equal(getCcbLocalAgentPendingMetaForTest(SESSION, 'agt-cap')?.finalizeRetryRounds, 5)
+    assert.equal(note('agt-cap', false), 'noop')
+    assert.equal(takePendingInjectionsForSession(SESSION).length, 0)
+    assert.equal(beginCcbLocalAgentInject(SESSION, 'agt-cap'), false)
+  })
+
+  it('abandons observably after pending TTL', () => {
+    assert.equal(note('agt-ttl', false), 'inject')
+    setCcbLocalAgentFirstSeenAtForTest(
+      SESSION,
+      'agt-ttl',
+      Date.now() - CCB_LOCAL_AGENT_INJECT_PENDING_TTL_MS - 1,
+    )
+    assert.equal(evaluateCcbLocalAgentInjectLimit(SESSION, 'agt-ttl'), 'pending_ttl')
+    assert.equal(getCcbLocalAgentCallbackState(SESSION, 'agt-ttl'), 'delivered')
+    assert.equal(getCcbLocalAgentAbandonReason(SESSION, 'agt-ttl'), 'pending_ttl')
+    assert.equal(note('agt-ttl', false), 'noop')
+    assert.equal(takePendingInjectionsForSession(SESSION).length, 0)
+    assert.equal(beginCcbLocalAgentInject(SESSION, 'agt-ttl'), false)
   })
 })
 

@@ -319,8 +319,10 @@ import {
   ccbLocalAgentCallbackIdempotencyKey,
   clearCcbLocalAgentPendingForSession,
   completeCcbLocalAgentInject,
+  evaluateCcbLocalAgentInjectLimit,
   failCcbLocalAgentInject,
   getCcbLocalAgentCallbackState,
+  noteCcbLocalAgentFinalizeRoundExhausted,
   noteCcbTaskNotification,
   sessionHasInFlightTurn,
   takePendingInjectionsForSession,
@@ -12621,6 +12623,15 @@ export class Gateway {
       })
       return { kind: 'fallback' }
     }
+    const preLimit = evaluateCcbLocalAgentInjectLimit(args.sessionKey, args.taskId)
+    if (preLimit) {
+      this.log.warn('ccb local-agent inject abandoned after finalize-round or TTL limit', {
+        taskId: args.taskId,
+        sessionKey: args.sessionKey,
+        reason: preLimit,
+      })
+      return { kind: 'fallback' }
+    }
     const text = buildCcbLocalAgentCallbackText({
       taskId: args.taskId,
       status: args.status,
@@ -12628,6 +12639,7 @@ export class Gateway {
       summary: args.summary,
     })
     const clientMessageId = ccbLocalAgentCallbackClientMessageId(args.taskId)
+    let budgetExhausted = false
     const result = await runBoundedOriginInjectBackoff({
       isShuttingDown: () => this._shuttingDown,
       shouldAbort: () =>
@@ -12666,6 +12678,7 @@ export class Gateway {
         }
       },
       onBudgetExhausted: () => {
+        budgetExhausted = true
         this.log.warn('ccb local-agent callback retry budget exhausted', {
           taskId: args.taskId,
           sessionKey: args.sessionKey,
@@ -12674,6 +12687,16 @@ export class Gateway {
     })
     if (result.kind === 'injected') {
       completeCcbLocalAgentInject(args.sessionKey, args.taskId)
+    } else if (budgetExhausted) {
+      failCcbLocalAgentInject(args.sessionKey, args.taskId)
+      const reason = noteCcbLocalAgentFinalizeRoundExhausted(args.sessionKey, args.taskId)
+      if (reason) {
+        this.log.warn('ccb local-agent inject abandoned after finalize-round or TTL limit', {
+          taskId: args.taskId,
+          sessionKey: args.sessionKey,
+          reason,
+        })
+      }
     } else if (result.kind === 'fallback' || result.kind === 'terminal_failure') {
       abandonCcbLocalAgentInject(args.sessionKey, args.taskId)
     } else {

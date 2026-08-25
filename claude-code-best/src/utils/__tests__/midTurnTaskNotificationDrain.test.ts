@@ -36,6 +36,7 @@ const {
   enqueuePendingNotification,
   getCommandsByMaxPriority,
   remove: removeFromQueue,
+  removeUnconsumedTaskNotifications,
   resetCommandQueue,
   selectMidTurnDrainCommands,
   taskIdFromQueuedCommand,
@@ -124,5 +125,33 @@ describe('mid-turn consume emits delivered ack (blocker 2 counterpart)', () => {
     removeFromQueue(selected)
     const delivered = ackMidTurnDeliveredTaskNotifications(selected)
     expect(delivered).toEqual(['agt-drain-ack'])
+  })
+
+  test('main-thread sweep does not drop agent-scoped TN; that agent can still drain and ack', () => {
+    enqueuePendingNotification({
+      value: '<task-notification><task-id>agt-main-sweep</task-id></task-notification>',
+      mode: 'task-notification',
+      taskId: 'agt-main-sweep',
+    } as any)
+    enqueuePendingNotification({
+      value: '<task-notification><task-id>agt-sub-keep</task-id></task-notification>',
+      mode: 'task-notification',
+      taskId: 'agt-sub-keep',
+      agentId: 'sub-keep' as any,
+    } as any)
+    const swept = removeUnconsumedTaskNotifications()
+    expect(swept.map(cmd => taskIdFromQueuedCommand(cmd))).toEqual(['agt-main-sweep'])
+    expect(
+      selectMidTurnDrainCommands({ sleepRan: false, isMainThread: true }),
+    ).toHaveLength(0)
+    const selected = selectMidTurnDrainCommands({
+      sleepRan: false,
+      isMainThread: false,
+      currentAgentId: 'sub-keep',
+    })
+    expect(selected).toHaveLength(1)
+    expect(taskIdFromQueuedCommand(selected[0]!)).toBe('agt-sub-keep')
+    removeFromQueue(selected)
+    expect(ackMidTurnDeliveredTaskNotifications(selected)).toEqual(['agt-sub-keep'])
   })
 })

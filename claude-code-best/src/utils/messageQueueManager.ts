@@ -519,6 +519,11 @@ export function isBetweenTurnDrainable(cmd: QueuedCommand): boolean {
   return cmd.mode !== 'task-notification'
 }
 
+/** Main thread owns unscoped commands; agent-scoped items stay for that agent. */
+export function isMainThreadQueuedCommand(cmd: QueuedCommand): boolean {
+  return cmd.agentId === undefined
+}
+
 export function taskIdFromQueuedCommand(cmd: QueuedCommand): string {
   if (typeof cmd.taskId === 'string' && cmd.taskId.trim()) {
     return cmd.taskId.trim()
@@ -531,11 +536,15 @@ export function taskIdFromQueuedCommand(cmd: QueuedCommand): string {
 }
 
 /**
- * Drop leftover task-notification items at turn end. Do not emit a
- * delivered ack — the gateway injects when no ack arrives.
+ * Drop leftover main-thread task-notification items at turn end.
+ * Agent-scoped items stay for that agent's mid-turn drain (or its
+ * lifecycle cleanup). Do not emit a delivered ack — the gateway
+ * injects when no ack arrives.
  */
 export function removeUnconsumedTaskNotifications(): QueuedCommand[] {
-  return removeByFilter(cmd => cmd.mode === 'task-notification')
+  return removeByFilter(
+    cmd => cmd.mode === 'task-notification' && isMainThreadQueuedCommand(cmd),
+  )
 }
 
 export function isSlashCommand(cmd: QueuedCommand): boolean {
@@ -568,7 +577,7 @@ export function selectMidTurnDrainCommands(opts: {
       const priority = cmd.priority ?? 'next'
       if (priority === 'later') return false
     }
-    if (opts.isMainThread) return cmd.agentId === undefined
+    if (opts.isMainThread) return isMainThreadQueuedCommand(cmd)
     return cmd.mode === 'task-notification' && cmd.agentId === opts.currentAgentId
   })
 }

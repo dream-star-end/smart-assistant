@@ -9,7 +9,9 @@ import {
   getCommandQueue,
   hasCommandsInQueue,
   isBetweenTurnDrainable,
+  isMainThreadQueuedCommand,
   isSlashCommand,
+  selectMidTurnDrainCommands,
   peek,
   removeUnconsumedTaskNotifications,
   resetCommandQueue,
@@ -238,5 +240,35 @@ describe('between-turn task-notification exclusion', () => {
     expect(taskIdFromQueuedCommand(removed[0]!)).toBe('agt-left')
     expect(getCommandQueue().some((c: any) => c.value === 'keep-prompt')).toBe(true)
     expect(getCommandQueue().some((c: any) => c.mode === 'task-notification')).toBe(false)
+  })
+
+  test('main-thread sweep leaves agent-scoped task-notifications', () => {
+    enqueuePendingNotification({
+      value: '<task-notification><task-id>agt-main</task-id></task-notification>',
+      mode: 'task-notification',
+      taskId: 'agt-main',
+    } as any)
+    enqueuePendingNotification({
+      value: '<task-notification><task-id>agt-sub</task-id></task-notification>',
+      mode: 'task-notification',
+      taskId: 'agt-sub',
+      agentId: 'sub-1',
+    } as any)
+    expect(isMainThreadQueuedCommand({ mode: 'task-notification' } as any)).toBe(true)
+    expect(
+      isMainThreadQueuedCommand({ mode: 'task-notification', agentId: 'sub-1' } as any),
+    ).toBe(false)
+    const removed = removeUnconsumedTaskNotifications()
+    expect(removed).toHaveLength(1)
+    expect(taskIdFromQueuedCommand(removed[0]!)).toBe('agt-main')
+    expect(getCommandQueue().some((c: any) => c.taskId === 'agt-sub')).toBe(true)
+    expect(getCommandQueue().some((c: any) => c.taskId === 'agt-main')).toBe(false)
+    const selected = selectMidTurnDrainCommands({
+      sleepRan: false,
+      isMainThread: false,
+      currentAgentId: 'sub-1',
+    })
+    expect(selected).toHaveLength(1)
+    expect(taskIdFromQueuedCommand(selected[0]!)).toBe('agt-sub')
   })
 })
