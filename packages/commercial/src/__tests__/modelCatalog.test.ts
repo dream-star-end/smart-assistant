@@ -370,18 +370,30 @@ describe("per-uid 投影", () => {
     );
   });
 
-  test("Grok engine 是管理员硬闸:public/显式 grant 都不能给普通用户放行", () => {
+  test("Grok engine follows catalog visibility; public is usable by ordinary users", () => {
     const grok = snap({
       entries: [GLM, GROK],
       pricing: [price("glm-5.2"), price("grok-build", { visibility: "public" })],
     });
-    const user = { uid: 7, role: "user" as const, grantedModelIds: new Set(["grok-build"]) };
+    const user = { uid: 7, role: "user" as const, grantedModelIds: new Set<string>() };
     const admin = { uid: 1, role: "admin" as const, grantedModelIds: new Set<string>() };
-    assert.equal(grok.canUseModel(user, "grok-build"), false);
+    assert.equal(grok.canUseModel(user, "grok-build"), true);
     assert.equal(grok.canUseModel(admin, "grok-build"), true);
     assert.equal(grok.isEngineReportedModel("grok-build"), true);
-    assert.deepEqual(grok.listForUser(user).map((row) => row.modelId), ["glm-5.2"]);
+    assert.deepEqual(grok.listForUser(user).map((row) => row.modelId), ["glm-5.2", "grok-build"]);
     assert.deepEqual(grok.listForUser(admin).map((row) => row.modelId), ["glm-5.2", "grok-build"]);
+  });
+
+  test("Grok admin/hidden visibility still requires role or an explicit grant", () => {
+    const grok = snap({
+      entries: [GLM, GROK],
+      pricing: [price("glm-5.2"), price("grok-build", { visibility: "admin" })],
+    });
+    const user = { uid: 7, role: "user" as const, grantedModelIds: new Set(["grok-build"]) };
+    const admin = { uid: 1, role: "admin" as const, grantedModelIds: new Set<string>() };
+    assert.equal(grok.canUseModel(user, "grok-build"), true);
+    assert.equal(grok.canUseModel({ ...user, grantedModelIds: new Set() }, "grok-build"), false);
+    assert.equal(grok.canUseModel(admin, "grok-build"), true);
   });
 
   test("Cursor model grant 与共享凭据成员是两层 fail-closed 授权", () => {

@@ -552,9 +552,8 @@ export class ModelCatalogSnapshot {
   canUseModel(scope: UserModelScope, modelIdOrAlias: string): boolean {
     const canonical = this.aliasToCanonical(modelIdOrAlias);
     if (!this.isRoutable(canonical)) return false;
-    // Grok is initially a platform-admin tool. A stale or malicious grant must
-    // not turn the UI visibility setting into an execution bypass.
-    if (this.activeByModel.get(canonical)?.engine === "grok" && scope.role !== "admin") return false;
+    // Grok follows catalog visibility (public / admin / hidden + grants).
+    // Cursor still requires an explicit credential-UID membership.
     if (this.activeByModel.get(canonical)?.engine === "cursor") {
       if (!isCursorCredentialMember(scope.uid)) return false;
     }

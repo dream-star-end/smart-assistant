@@ -144,6 +144,11 @@ case "$model" in
   claude-opus-5-thinking-high|claude-opus-5-thinking-high-fast|\
   claude-opus-5-thinking-xhigh|claude-opus-5-thinking-xhigh-fast|\
   claude-opus-5-thinking-max|claude-opus-5-thinking-max-fast|\
+  claude-opus-4-8-thinking-low|claude-opus-4-8-thinking-low-fast|\
+  claude-opus-4-8-thinking-medium|claude-opus-4-8-thinking-medium-fast|\
+  claude-opus-4-8-thinking-high|claude-opus-4-8-thinking-high-fast|\
+  claude-opus-4-8-thinking-xhigh|claude-opus-4-8-thinking-xhigh-fast|\
+  claude-opus-4-8-thinking-max|claude-opus-4-8-thinking-max-fast|\
   claude-fable-5-thinking-low|claude-fable-5-thinking-medium|claude-fable-5-thinking-high|\
   claude-fable-5-thinking-xhigh|claude-fable-5-thinking-max|\
   cursor-grok-4.5-high) ;;

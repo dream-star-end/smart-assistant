@@ -638,6 +638,8 @@ describe("resolveV5CursorAuthMount", () => {
       assert.equal(resolveV5CursorAuthMount(base), dir);
       assert.equal(resolveV5CursorAuthMount({ ...base, uid: 1 }), dir);
       assert.equal(resolveV5CursorAuthMount({ ...base, uid: 5 }), null);
+      assert.ok(resolveV5CursorAuthMount({ ...base, uid: 5, credentialUids: "*" }));
+      assert.ok(resolveV5CursorAuthMount({ ...base, uid: 9, credentialUids: "all" }));
       assert.equal(resolveV5CursorAuthMount({ ...base, runtimeChannel: "v3" }), null);
       assert.equal(resolveV5CursorAuthMount({ ...base, useRemote: true }), null);
       assert.equal(resolveV5CursorAuthMount({ ...base, credentialUids: "1,04" }), null);

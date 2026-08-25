@@ -13,9 +13,19 @@ describe('Cursor credential membership', () => {
     assert.equal(isCursorCredentialMember('04', '1,4'), false)
   })
 
+  test('star/all opens every syntactically valid uid', () => {
+    assert.equal(parseCursorCredentialUids('*'), 'all')
+    assert.equal(parseCursorCredentialUids('all'), 'all')
+    assert.equal(isCursorCredentialMember(2, '*'), true)
+    assert.equal(isCursorCredentialMember(7, 'all'), true)
+    assert.equal(isCursorCredentialMember('04', '*'), false)
+    assert.equal(isCursorCredentialMember(0, '*'), false)
+  })
+
   test('malformed configuration fails closed as a whole', () => {
-    for (const raw of ['', '1,04', '1, 4', '1,evil', '0,1', '9007199254740992']) {
-      assert.equal(parseCursorCredentialUids(raw).size, 0, raw)
+    for (const raw of ['', '1,04', '1, 4', '1,evil', '0,1', '9007199254740992', '*,1', 'all,4']) {
+      const parsed = parseCursorCredentialUids(raw)
+      assert.equal(parsed === 'all' ? 'all' : parsed.size, 0, raw)
     }
   })
 })

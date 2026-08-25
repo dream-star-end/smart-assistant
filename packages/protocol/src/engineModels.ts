@@ -228,6 +228,7 @@ export type CursorEngineFamilyId =
   | 'grok-4.6'
   | 'composer-2.5'
   | 'opus-5'
+  | 'opus-4.8'
   | 'fable-5'
   | 'grok-4.5'
 
@@ -329,6 +330,97 @@ export const CURSOR_ENGINE_MODELS = [
     family: 'composer-2.5',
     familyLabel: 'Cursor Composer 2.5',
     effort: null,
+    fast: true,
+  },
+
+  {
+    id: 'cursor-opus-4.8-low',
+    displayName: 'Cursor Opus 4.8 Low',
+    upstreamModel: 'claude-opus-4-8-thinking-low',
+    family: 'opus-4.8',
+    familyLabel: 'Cursor Opus 4.8',
+    effort: 'low',
+    fast: false,
+  },
+  {
+    id: 'cursor-opus-4.8-low-fast',
+    displayName: 'Cursor Opus 4.8 Low Fast',
+    upstreamModel: 'claude-opus-4-8-thinking-low-fast',
+    family: 'opus-4.8',
+    familyLabel: 'Cursor Opus 4.8',
+    effort: 'low',
+    fast: true,
+  },
+  {
+    id: 'cursor-opus-4.8-medium',
+    displayName: 'Cursor Opus 4.8 Medium',
+    upstreamModel: 'claude-opus-4-8-thinking-medium',
+    family: 'opus-4.8',
+    familyLabel: 'Cursor Opus 4.8',
+    effort: 'medium',
+    fast: false,
+  },
+  {
+    id: 'cursor-opus-4.8-medium-fast',
+    displayName: 'Cursor Opus 4.8 Medium Fast',
+    upstreamModel: 'claude-opus-4-8-thinking-medium-fast',
+    family: 'opus-4.8',
+    familyLabel: 'Cursor Opus 4.8',
+    effort: 'medium',
+    fast: true,
+  },
+  {
+    id: 'cursor-opus-4.8-high',
+    displayName: 'Cursor Opus 4.8 High',
+    upstreamModel: 'claude-opus-4-8-thinking-high',
+    family: 'opus-4.8',
+    familyLabel: 'Cursor Opus 4.8',
+    effort: 'high',
+    fast: false,
+  },
+  {
+    id: 'cursor-opus-4.8-high-fast',
+    displayName: 'Cursor Opus 4.8 High Fast',
+    upstreamModel: 'claude-opus-4-8-thinking-high-fast',
+    family: 'opus-4.8',
+    familyLabel: 'Cursor Opus 4.8',
+    effort: 'high',
+    fast: true,
+  },
+  {
+    id: 'cursor-opus-4.8-xhigh',
+    displayName: 'Cursor Opus 4.8 Extra High',
+    upstreamModel: 'claude-opus-4-8-thinking-xhigh',
+    family: 'opus-4.8',
+    familyLabel: 'Cursor Opus 4.8',
+    effort: 'xhigh',
+    fast: false,
+  },
+  {
+    id: 'cursor-opus-4.8-xhigh-fast',
+    displayName: 'Cursor Opus 4.8 Extra High Fast',
+    upstreamModel: 'claude-opus-4-8-thinking-xhigh-fast',
+    family: 'opus-4.8',
+    familyLabel: 'Cursor Opus 4.8',
+    effort: 'xhigh',
+    fast: true,
+  },
+  {
+    id: 'cursor-opus-4.8-max',
+    displayName: 'Cursor Opus 4.8 Max',
+    upstreamModel: 'claude-opus-4-8-thinking-max',
+    family: 'opus-4.8',
+    familyLabel: 'Cursor Opus 4.8',
+    effort: 'max',
+    fast: false,
+  },
+  {
+    id: 'cursor-opus-4.8-max-fast',
+    displayName: 'Cursor Opus 4.8 Max Fast',
+    upstreamModel: 'claude-opus-4-8-thinking-max-fast',
+    family: 'opus-4.8',
+    familyLabel: 'Cursor Opus 4.8',
+    effort: 'max',
     fast: true,
   },
   {
