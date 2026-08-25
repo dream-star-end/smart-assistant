@@ -75,6 +75,30 @@ export function recordProviderHealthSample(model: string, kind: HealthSampleKind
   }
 }
 
+/**
+ * 探活成功样本独立入口(recoveryProber 专用):降级期间零真实流量,恢复条件永远拿不到
+ * 成功样本(死锁)。探活 2xx 即一条 kind='final' 真实成功样本(model 带 `probe:` 前缀
+ * 区分人工流量),master scheduler 既有恢复数学直接可判恢复。只写成功:失败不写样本
+ * (缺成功样本=不恢复,判定等价;失败细节在 egress 日志 recovery_probe_failed)。
+ * 走独立 INSERT 不进 traffic buffer,不抽样(探活自身已限频);同步 fire-and-forget,
+ * 永不 throw,绝不影响在飞流。
+ */
+export function recordProviderProbeSuccess(providerId: string, model: string): void {
+  try {
+    void queryImpl(
+      `INSERT INTO provider_health_samples (provider_id, ok, kind, model) VALUES ($1, true, 'final', $2)`,
+      [providerId, `probe:${model}`],
+    ).catch((err: unknown) => {
+      log.warn("provider_probe_sample_insert_failed", {
+        provider: providerId,
+        err: String((err as Error)?.message ?? err),
+      });
+    });
+  } catch {
+    /* 信号层绝不影响在飞流 */
+  }
+}
+
 function scheduleFlush(): void {
   if (buffer.length >= MAX_BATCH) {
     void flushProviderHealthSamples();
