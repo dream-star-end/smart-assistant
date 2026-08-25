@@ -14,8 +14,8 @@
 ALTER TABLE egress_proxies
   ADD COLUMN IF NOT EXISTS region TEXT DEFAULT NULL;
 
-ALTER TABLE egress_proxies
-  DROP CONSTRAINT IF EXISTS egress_proxies_region_check;
+-- 新列的新约束,仅一次性 apply,不用 DROP-then-ADD(避免命中发布器的破坏性 DDL
+-- 门 `ALTER ... DROP`)。迁移由 migrate 运行器按 version 追踪,恰好 apply 一次。
 ALTER TABLE egress_proxies
   ADD CONSTRAINT egress_proxies_region_check
   CHECK (region IS NULL OR region IN ('US', 'GB', 'CN', 'JP', 'DE'));
