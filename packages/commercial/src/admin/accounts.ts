@@ -47,6 +47,7 @@ import {
   type UpdateAccountPatch,
 } from "../account-pool/store.js";
 import { normalizeCursorApiKey, scheduleCursorAuthSync } from "../account-pool/cursorMaterializer.js";
+import { isCursorQuotaClass, type CursorQuotaClass } from "../account-pool/cursorQuota.js";
 import { writeAdminAuditBestEffort as bestEffortAudit } from "./audit.js";
 import {
   reassignEgressHost,
@@ -197,6 +198,7 @@ export interface AdminCreateAccountInput {
   /** Optional V1 account group binding. Claude accounts default to the first official OAuth group. */
   group_id?: bigint | string | null;
   cursor_sand_enabled?: boolean;
+  cursor_quota_class?: CursorQuotaClass;
 }
 
 /**
@@ -489,6 +491,7 @@ export interface AdminPatchAccountInput {
    */
   egress_host_uuid?: string | null;
   cursor_sand_enabled?: boolean;
+  cursor_quota_class?: CursorQuotaClass;
 }
 
 export async function adminPatchAccount(
@@ -497,6 +500,9 @@ export async function adminPatchAccount(
   ctx: AdminAuditCtx,
 ): Promise<AccountRow> {
   // 前置校验
+  if (patch.cursor_quota_class !== undefined && !isCursorQuotaClass(patch.cursor_quota_class)) {
+    throw new RangeError("invalid_cursor_quota_class");
+  }
   if (patch.plan !== undefined && !ACCOUNT_PLANS.includes(patch.plan)) {
     throw new RangeError("invalid_plan");
   }
@@ -609,6 +615,7 @@ export async function adminPatchAccount(
     patch.group_id !== undefined ||
     patch.egress_host_uuid !== undefined ||
     patch.cursor_sand_enabled !== undefined ||
+    patch.cursor_quota_class !== undefined ||
     expiresAt !== undefined ||
     subscriptionEndAt !== undefined;
   if (!touched) {
@@ -636,6 +643,7 @@ export async function adminPatchAccount(
   if (expiresAt !== undefined) storePatch.oauth_expires_at = expiresAt;
   if (subscriptionEndAt !== undefined) storePatch.subscription_end_at = subscriptionEndAt;
   if (patch.cursor_sand_enabled !== undefined) storePatch.cursor_sand_enabled = patch.cursor_sand_enabled;
+  if (patch.cursor_quota_class !== undefined) storePatch.cursor_quota_class = patch.cursor_quota_class;
 
   let after: AccountRow | null;
   try {
@@ -735,6 +743,10 @@ export async function adminPatchAccount(
     changedBefore.cursor_sand_enabled = before.cursor_sand_enabled;
     changedAfter.cursor_sand_enabled = after.cursor_sand_enabled;
   }
+  if (patch.cursor_quota_class !== undefined && before.cursor_quota_class !== after.cursor_quota_class) {
+    changedBefore.cursor_quota_class = before.cursor_quota_class;
+    changedAfter.cursor_quota_class = after.cursor_quota_class;
+  }
 
   await bestEffortAudit(ctx, "account.patch", `account:${String(id)}`, changedBefore, changedAfter);
   if (after.provider === "cursor") scheduleCursorAuthSync("account.patch");
@@ -801,6 +813,10 @@ export async function adminResetCooldown(
   if (before.health_score !== after.health_score) {
     auditBefore.health_score = before.health_score;
     auditAfter.health_score = after.health_score;
+  }
+  if (before.cursor_quota_class !== after.cursor_quota_class) {
+    auditBefore.cursor_quota_class = before.cursor_quota_class;
+    auditAfter.cursor_quota_class = after.cursor_quota_class;
   }
 
   await bestEffortAudit(

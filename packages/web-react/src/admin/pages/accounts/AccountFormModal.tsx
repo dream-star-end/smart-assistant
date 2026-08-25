@@ -59,6 +59,7 @@ export function AccountFormModal({
   const [saving, setSaving] = useState(false);
   const [providerCreate, setProviderCreate] = useState<"claude" | "codex" | "grok" | "cursor">("claude");
   const [cursorSandEnabled, setCursorSandEnabled] = useState(false);
+  const [cursorQuotaClass, setCursorQuotaClass] = useState<"unknown" | "other_ok" | "cursor_only">("unknown");
 
   // OAuth 向导(create)。
   const [oauthState, setOauthState] = useState<string | null>(null);
@@ -91,6 +92,7 @@ export function AccountFormModal({
     setGroupId(prefillGroup);
     setEgressId(prefillEgress);
     setCursorSandEnabled(account?.cursor_sand_enabled === true);
+    setCursorQuotaClass((account?.cursor_quota_class as "unknown" | "other_ok" | "cursor_only") || "unknown");
     setOauthState(null);
     setOauthCode("");
     setStep2(false);
@@ -246,6 +248,7 @@ export function AccountFormModal({
     }
     setProviderCreate(next);
     setCursorSandEnabled(false);
+    setCursorQuotaClass("unknown");
     setGroupId("");
     setToken("");
     setRefresh("");
@@ -326,9 +329,15 @@ export function AccountFormModal({
       }
       if (subEnd.trim()) body.subscription_end_at = isNull(subEnd) ? null : subEnd.trim();
       if (groupId) body.group_id = groupId;
-      if (provider === "cursor") body.cursor_sand_enabled = cursorSandEnabled;
+      if (provider === "cursor") {
+        body.cursor_sand_enabled = cursorSandEnabled;
+        body.cursor_quota_class = cursorQuotaClass;
+      }
     } else {
-      if (provider === "cursor") body.cursor_sand_enabled = cursorSandEnabled;
+      if (provider === "cursor") {
+        body.cursor_sand_enabled = cursorSandEnabled;
+        body.cursor_quota_class = cursorQuotaClass;
+      }
       body.status = statusEdit;
       if (token.trim()) body.oauth_token = token.trim();
       if (refresh.trim()) body.oauth_refresh_token = isNull(refresh) ? null : refresh.trim();
@@ -360,7 +369,7 @@ export function AccountFormModal({
   }, [
     label, plan, isCreate, token, egressId, provider, refresh, expires, subEnd, groupId,
     grokPrincipalType, grokPrincipalId,
-    statusEdit, prefillEgress, prefillGroup, account, cursorSandEnabled, onOpenChange, onSaved, toast,
+    statusEdit, prefillEgress, prefillGroup, account, cursorSandEnabled, cursorQuotaClass, onOpenChange, onSaved, toast,
   ]);
 
   const defaultGroupLabel = isCreate ? `— 默认 ${provider} 官方订阅组 —` : "— 未绑定 —";
@@ -523,6 +532,22 @@ export function AccountFormModal({
                 />
               </label>
             </div>
+          )}
+
+          {provider === "cursor" && (
+            <Field
+              label="Cursor 配额分类 (Quota Class)"
+              hint="两池调度控制：cursor_only 会跳过 Opus 等高级模型；手动切为「未观察」或「全部可用」可直接放开调度限制。"
+            >
+              <Select
+                value={cursorQuotaClass}
+                onChange={(e) => setCursorQuotaClass(e.target.value as "unknown" | "other_ok" | "cursor_only")}
+              >
+                <option value="unknown">未观察 (unknown - 允许全模型调度)</option>
+                <option value="other_ok">全部可用 (other_ok - 已验证全模型可用)</option>
+                <option value="cursor_only">仅 Cursor Models (cursor_only - 跳过 Opus/GPT-5.6)</option>
+              </Select>
+            </Field>
           )}
 
           <Field label="label(账号标签,必填)">
