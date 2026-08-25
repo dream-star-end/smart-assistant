@@ -430,6 +430,16 @@ class FakePool {
         if (/UPDATE agent_containers/i.test(trimmed) && /SET state\s*=\s*'vanished'/i.test(trimmed)) {
           const id = Number.parseInt(String(params![0]), 10);
           const r = self.rows.find((x) => x.id === id);
+          const hasIdle = /last_ws_activity IS NOT NULL/i.test(trimmed)
+            && /last_ws_activity < NOW\(\)/i.test(trimmed);
+          if (hasIdle && r) {
+            const cutoffMin = Number(params![3]);
+            const cutoff = new Date(Date.now() - cutoffMin * 60_000);
+            if (r.last_ws_activity == null || r.last_ws_activity >= cutoff) {
+              const returnsHostUuid = /RETURNING\s+host_uuid/i.test(trimmed);
+              return { rowCount: 0, rows: [] };
+            }
+          }
           if (r) {
             r.state = "vanished";
             r.updated_at = new Date();
@@ -1502,6 +1512,35 @@ describe("stopAndRemoveV3Container", () => {
     assert.equal(captured.stopped, 1);
     assert.ok(captured.removed >= 1);
     assert.equal(pool.rows[0]!.state, "vanished");
+  });
+
+  test("requireIdleCutoffMin: 行已不满足闲置条件时返回 false,不 vanish,不 docker", async () => {
+    const { docker, captured } = makeDocker();
+    const pool = new FakePool();
+    pool.rows.push({
+      id: 101,
+      user_id: 12,
+      host_uuid: null,
+      bound_ip: "172.30.9.101",
+      image: TEST_IMAGE,
+      secret_hash: Buffer.alloc(32),
+      state: "active",
+      port: 18789,
+      container_internal_id: "freshcid",
+      last_ws_activity: new Date(), // 刚刚活跃,不满足 30min idle
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    const ok = await stopAndRemoveV3Container(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      { id: 101, container_internal_id: "freshcid" },
+      5,
+      { requireIdleCutoffMin: 30 },
+    );
+    assert.equal(ok, false);
+    assert.equal(pool.rows[0]!.state, "active");
+    assert.equal(captured.stopped, 0);
+    assert.equal(captured.removed, 0);
   });
 
   test("docker missing → 仍然把 row 标 vanished(幂等)", async () => {

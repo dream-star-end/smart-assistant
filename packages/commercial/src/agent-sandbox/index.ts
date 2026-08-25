@@ -126,6 +126,7 @@ export {
   DEFAULT_IDLE_SWEEP_INTERVAL_MS,
   DEFAULT_IDLE_CUTOFF_MIN,
   DEFAULT_SWEEP_BATCH_LIMIT,
+  INITIAL_SWEEP_BATCH_LIMIT,
   type IdleSweepLogger,
   type IdleSweepTickOptions,
   type IdleSweepTickResult,

@@ -600,6 +600,7 @@ import {
   makeV3EnsureRunning,
   preheatV3Image,
   startIdleSweepScheduler,
+  INITIAL_SWEEP_BATCH_LIMIT,
   startMigrationReconcileScheduler,
   startOrphanReconcileScheduler,
   markV3ContainerActivity,
@@ -3672,8 +3673,8 @@ export async function registerCommercial(
       domain: "shared",
       start: () => {
         const idleSweepLog = rootLogger.child({ subsys: "v3/idleSweep" });
-        const h = trackScheduler("idleSweep", "shared", startIdleSweepScheduler(deps, { logger: idleSweepLog, runOnStart: false }));
-        idleSweepLog.info("scheduler started", { tickSec: 60, idleCutoffMin: 30 });
+        const h = trackScheduler("idleSweep", "shared", startIdleSweepScheduler(deps, { logger: idleSweepLog, runOnStart: false, batchLimit: INITIAL_SWEEP_BATCH_LIMIT }));
+        idleSweepLog.info("scheduler started", { tickSec: 60, idleCutoffMin: 30, batchLimit: INITIAL_SWEEP_BATCH_LIMIT });
         return { stop: () => h.stop() };
       },
     });

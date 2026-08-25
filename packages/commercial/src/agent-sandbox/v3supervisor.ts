@@ -860,6 +860,24 @@ export async function acquireUserLifecycleLock(
 }
 
 /**
+ * nowait 变体:拿不到锁立即返回 false,不阻塞。
+ *
+ * idle sweep 用这条而不是阻塞 `acquireUserLifecycleLock` —— tick 有 60s 预算,
+ * 不能在 provision/volumeGc 持锁的 uid 上排队;拿不到就 skippedLocked 等下一轮。
+ * 同一 (NS, uid) 键,与 provision / volumeGc 仍互斥。
+ */
+export async function tryAcquireUserLifecycleLock(
+  client: PoolClient,
+  uid: number,
+): Promise<boolean> {
+  const r = await client.query<{ locked: boolean }>(
+    "SELECT pg_try_advisory_xact_lock($1::int4, $2::int4) AS locked",
+    [USER_LIFECYCLE_LOCK_NS, uidToLockKey(uid)],
+  );
+  return r.rows[0]?.locked === true;
+}
+
+/**
  * 在事务内 acquire per-host admission lock。COMMIT/ROLLBACK 自动 release。
  *
  * 严格只接受 PG canonical 36-char lowercase uuid:系统不变量是 hostUuid 必来自
@@ -3431,7 +3449,7 @@ export async function stopAndRemoveV3Container(
   deps: V3SupervisorDeps,
   containerRow: { id: number; container_internal_id?: string | null; host_uuid?: string | null },
   timeoutSec = 5,
-  options?: { requireNoOpenMigration?: boolean },
+  options?: { requireNoOpenMigration?: boolean; requireIdleCutoffMin?: number },
 ): Promise<boolean> {
   // 1) DB 先翻 vanished —— admin 意图就是销毁,不依赖 docker 步骤是否干净。
   //    用 RETURNING host_uuid 兜底:v1.0.20 修了 v3orphanReconcile 的 isNotFound bug
@@ -3459,6 +3477,20 @@ export async function stopAndRemoveV3Container(
              AND m.phase NOT IN ('committed', 'rolled_back')
         )`
     : "";
+  // idle sweep 第二道闸:破坏性 UPDATE 当场重校 last_ws_activity,关掉 SELECT→stop
+  // 之间用户重连的 TOCTOU。不传该 option 时 SQL 与历史逐字节等价。
+  const idleCutoffMin = options?.requireIdleCutoffMin;
+  const idleSql =
+    typeof idleCutoffMin === "number" && Number.isFinite(idleCutoffMin)
+      ? ` AND last_ws_activity IS NOT NULL
+        AND last_ws_activity < NOW() - ($4::int * interval '1 minute')`
+      : "";
+  const updateParams: unknown[] = [
+    String(containerRow.id),
+    getRuntimeChannel(),
+    containerRow.container_internal_id ?? null,
+  ];
+  if (idleSql) updateParams.push(idleCutoffMin);
   // P1d 跨 channel 防护:破坏性 UPDATE 必须带 runtime_channel 过滤 —— 否则任何传错(对方
   // channel)id 的 caller 都会把对方行翻 vanished 并随后 docker stop/remove。$2=本实例 channel。
   const updateResult = await deps.pool.query<{ host_uuid: string | null }>(
@@ -3466,13 +3498,9 @@ export async function stopAndRemoveV3Container(
         SET state='vanished',
             updated_at=NOW()
       WHERE id = $1 AND runtime_channel = $2
-        AND container_internal_id IS NOT DISTINCT FROM $3${guardSql}
+        AND container_internal_id IS NOT DISTINCT FROM $3${guardSql}${idleSql}
       RETURNING host_uuid`,
-    [
-      String(containerRow.id),
-      getRuntimeChannel(),
-      containerRow.container_internal_id ?? null,
-    ],
+    updateParams,
   );
   const rowFound = (updateResult.rowCount ?? 0) > 0;
   if (!rowFound) {
@@ -3483,7 +3511,7 @@ export async function stopAndRemoveV3Container(
     // 三种情况都绝不能用 caller 提供的 container_internal_id 去 docker rm(c 会误删对方容器,
     // a/b 无主可清)。docker↔DB 残骸对账交由 channel-aware 的 orphanReconcile 单点权威兜底。
     // (a) 是正常守卫路径不告警;(b)/(c) 是 destructive 函数拿到 0 行的"意外",记一条诊断。
-    if (options?.requireNoOpenMigration !== true) {
+    if (options?.requireNoOpenMigration !== true && idleSql === "") {
       // eslint-disable-next-line no-console
       console.warn(
         `[v3supervisor.stopAndRemove] rowCount=0 for container ${containerRow.id} ` +
