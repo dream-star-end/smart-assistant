@@ -481,6 +481,12 @@ export async function handleAdminPatchAccount(
     }
     patch.cursor_sand_enabled = b.cursor_sand_enabled;
   }
+  if (b.cursor_quota_class !== undefined) {
+    if (b.cursor_quota_class !== "unknown" && b.cursor_quota_class !== "other_ok" && b.cursor_quota_class !== "cursor_only") {
+      throw new HttpError(400, "VALIDATION", "cursor_quota_class must be unknown, other_ok, or cursor_only");
+    }
+    patch.cursor_quota_class = b.cursor_quota_class as import("../../account-pool/cursorQuota.js").CursorQuotaClass;
+  }
   // 0055: 拒绝 legacy raw egress_proxy 字段。
   if (b.egress_proxy !== undefined) {
     throw new HttpError(400, "VALIDATION", "legacy_egress_proxy_not_allowed");

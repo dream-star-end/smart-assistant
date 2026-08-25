@@ -126,6 +126,26 @@ export default function AccountsPage() {
     [confirm, toast, refresh],
   );
 
+  const doResetQuotaClass = useCallback(
+    async (a: AccountRow) => {
+      const ok = await confirm({
+        title: `重置 Cursor 配额分类 #${a.id}`,
+        body: `账号:${a.label}。将两池学习状态从 ${a.cursor_quota_class} 重置为未观察 (unknown)，直接放开 Opus / Other Models 调度。`,
+      });
+      if (!ok) return;
+      try {
+        await adminSend("PATCH", `/accounts/${encodeURIComponent(a.id)}`, {
+          cursor_quota_class: "unknown",
+        });
+        toast(`#${a.id} 配额分类已重置为未观察`, "success");
+        refresh();
+      } catch (e) {
+        toast(`重置失败:${errMsg(e)}`, "error");
+      }
+    },
+    [confirm, toast, refresh],
+  );
+
   const doDelete = useCallback(
     async (a: AccountRow) => {
       const ok = await confirm({
@@ -213,6 +233,11 @@ export default function AccountsPage() {
             <DropdownMenuContent align="end">
               {a.cooldown_until && (
                 <DropdownMenuItem onSelect={() => doReset(a)}>释放冷却</DropdownMenuItem>
+              )}
+              {a.provider === "cursor" && a.cursor_quota_class !== "unknown" && (
+                <DropdownMenuItem onSelect={() => doResetQuotaClass(a)}>
+                  重置配额分类 (解除 {a.cursor_quota_class})
+                </DropdownMenuItem>
               )}
               <DropdownMenuItem onSelect={() => setRecentAcc({ id: a.id, label: a.label })}>
                 查看使用方
