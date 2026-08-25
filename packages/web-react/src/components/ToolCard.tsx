@@ -79,45 +79,62 @@ export function ToolCard({
   // 取消(如 Codex item status 'cancelled')是中性终态:≠ 失败(不红)、≠ 运行中(不转圈)。
   const isCancelled = !hasError && (!!renderTool.cancelled || isInterruptedHistorical);
   const isRunning = !completed && !hasError && !isBlocked && !isCancelled;
-  // 单次工具异常属于助手内部执行过程：保留真实 error 数据和可展开详情，但前台
-  // 不用红色「失败」抢占用户注意力。助手通常会自行换路径继续，表头只中性标记已结束。
+  // 单次工具异常属于助手内部执行过程,助手通常会自行换路径继续:不用大红「失败」恐吓,
+  // 但也不能藏成中性「已结束」—— 用淡危险色「未成功」如实标记,错误首行进表头摘要。
   const statusLabel = isRunning
     ? "运行中"
     : hasError
-      ? "已结束"
+      ? "未成功"
       : isBlocked
         ? "受阻"
         : isCancelled
           ? "已取消"
           : "完成";
+  // 表头错误摘要:输出首个非空行(剥 markdown # 前缀),截断显示。
+  const errorFirstLine = hasError
+    ? (outputText
+        .split(/\r?\n/)
+        .map((l) => l.replace(/^#{1,6}\s*/, "").trim())
+        .find(Boolean) ?? "")
+    : "";
 
   const hasInput = !!input && Object.keys(input).length > 0;
   const hasOutput = !!renderTool.output || !!renderTool.bashTail;
   const hasBody = hasInput || hasOutput || hasError || isBlocked;
 
   // 运行中（流式）默认展开以便边流边看 diff/输出；历史（挂载即完成）默认折叠。
+  // 未成功的卡也默认展开:错误详情是用户此刻最需要的信息,不该多一次点击。
   // 初值只在挂载求一次，之后用户手动 toggle 为权威（依赖稳定 key 保持实例）。
   // 状态只决定首次挂载；之后用户的展开选择始终为权威，流式状态迁移不强制跳动。
   const isConfirmation = outputText.includes('"confirmation_required"');
-  const [open, setOpen] = useState(() => isRunning || isBlocked || isConfirmation);
+  const [open, setOpen] = useState(() => isRunning || isBlocked || isConfirmation || hasError);
 
+  // 无 body 的卡表头不渲染成 button(L5):没有可展开的内容,不该有可点语义。
+  const HeaderTag = hasBody ? ("button" as const) : ("div" as const);
   return (
     <div
       className={cn(
         // 不带外边距——间距交由容器（MessageList 的 gap / AgentGroupCard 的 space-y）统一控制，
         // 避免 margin 与父级 gap 叠加导致卡片间距过大（boss 反馈"卡片间距好大"的根因之一）。
         "overflow-hidden rounded-md border bg-surface shadow-[0_1px_2px_rgba(0,0,0,0.025)] transition-colors",
-        isBlocked
-          ? "border-warning/35"
-          : isRunning
-            ? "border-accent/25"
-            : "border-border hover:border-border-strong",
+        hasError
+          ? "border-danger/25"
+          : isBlocked
+            ? "border-warning/35"
+            : isRunning
+              ? "border-accent/25"
+              : "border-border hover:border-border-strong",
       )}
     >
-      <button
-        type="button"
-        onClick={() => hasBody && setOpen((o) => !o)}
-        aria-expanded={hasBody ? open : undefined}
+      <HeaderTag
+        {...(hasBody
+          ? {
+              type: "button" as const,
+              onClick: () => setOpen((o) => !o),
+              "aria-expanded": open,
+              "aria-label": `${open ? "收起" : "展开"}${meta.label}详情`,
+            }
+          : {})}
         className={cn(
           "flex min-h-11 w-full items-center gap-2.5 px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
           hasBody && "cursor-pointer hover:bg-hover/70 active:bg-active/70",
@@ -131,10 +148,18 @@ export function ToolCard({
         >
           <Icon size={14} />
         </span>
-        <span className="shrink-0 text-[13px] font-semibold text-fg">{meta.label}</span>
+        {/* 窄屏(L7):标题限宽、摘要优先截断,右侧徽章区 shrink-0 保持完整可见。 */}
+        <span className="min-w-0 max-w-[45%] shrink-0 truncate text-[13px] font-semibold text-fg">
+          {meta.label}
+        </span>
         {summary && (
           <span className="min-w-0 truncate font-mono text-xs text-muted" title={summary}>
             {summary}
+          </span>
+        )}
+        {errorFirstLine && (
+          <span className="min-w-0 truncate text-xs text-danger" title={errorFirstLine}>
+            {errorFirstLine}
           </span>
         )}
         <span className="ml-auto flex shrink-0 items-center gap-2">
@@ -144,7 +169,7 @@ export function ToolCard({
           {isRunning ? (
             <Spinner size={13} className="text-accent" />
           ) : hasError ? (
-            <Badge tone="neutral">已结束</Badge>
+            <Badge tone="danger">未成功</Badge>
           ) : isBlocked ? (
             <Badge tone="warning">受阻</Badge>
           ) : isCancelled ? (
@@ -187,7 +212,7 @@ export function ToolCard({
             />
           )}
         </span>
-      </button>
+      </HeaderTag>
       {open && hasBody && (
         <div className="border-t border-border/80 bg-bg/35 px-3 py-2 [&>*:first-child]:mt-0">
           <ToolInspectOpenContext.Provider value={canInspect ? openInspect : null}>

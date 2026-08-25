@@ -116,7 +116,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(document.querySelector("pre")?.textContent).toContain(marker);
   });
 
-  test("超长通用结果不再生成结果详情入口", () => {
+  test("超长通用结果:可「展开全部」+ 分段「继续显示」直至完整内容(F4)", () => {
     const marker = "EXACT_TOOL_OUTPUT_FINAL_MARKER";
     const output = `${"x".repeat(270_000)}${marker}`;
     render(
@@ -125,9 +125,17 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button"));
+    fireEvent.click(screen.getByRole("button", { name: /详情/ }));
+    // 默认截断,尾部 marker 不可见
     expect(document.body.textContent).not.toContain(marker);
-    expect(screen.queryByRole("button", { name: "结果详情" })).not.toBeInTheDocument();
+    // 展开全部 → 首屏 256KB,仍有剩余 → 继续显示 → 完整内容可达
+    fireEvent.click(screen.getByRole("button", { name: /展开全部/ }));
+    expect(document.body.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: /继续显示/ }));
+    expect(document.body.textContent).toContain(marker);
+    // 可再收起
+    fireEvent.click(screen.getByRole("button", { name: "收起" }));
+    expect(document.body.textContent).not.toContain(marker);
     expect(screen.queryByText("查看原始完整记录")).not.toBeInTheDocument();
   });
 
@@ -164,11 +172,10 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     expect(screen.getByText("写入文件")).toBeInTheDocument();
-    expect(screen.getByText("已结束")).toBeInTheDocument();
+    // F1:不再藏成中性「已结束」,徽标如实标「未成功」(但不用「失败」字眼恐吓)。
+    expect(screen.getByText("未成功")).toBeInTheDocument();
     expect(screen.queryByText("失败")).not.toBeInTheDocument();
-    // 工具异常属于内部过程，表头中性收口且默认不把错误详情推到前台。
-    expect(screen.queryByText("写入文件命令失败")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button"));
+    // 未成功的卡默认展开:错误详情免点击直接可见。
     expect(screen.getByText("写入文件命令失败")).toBeInTheDocument();
     expect(document.querySelector("pre")?.textContent).toContain("Permission denied");
     cleanup();
@@ -198,11 +205,39 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByText("编辑文件")).toBeInTheDocument();
     expect(container.querySelector(".animate-spin")).not.toBeInTheDocument();
     // 默认折叠 → diff 不可见
-    expect(screen.queryByText("- foo")).not.toBeInTheDocument();
-    // 展开
+    expect(screen.queryByText("foo")).not.toBeInTheDocument();
+    // 展开:行级 diff(F2)—— 符号、内容、行号分列渲染
     fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("- foo")).toBeInTheDocument();
-    expect(screen.getByText("+ bar")).toBeInTheDocument();
+    expect(screen.getByText("foo")).toBeInTheDocument();
+    expect(screen.getByText("bar")).toBeInTheDocument();
+    expect(screen.getByText("-")).toBeInTheDocument();
+    expect(screen.getByText("+")).toBeInTheDocument();
+  });
+
+  test("行级 diff:未变行渲染为上下文行,不再整段刷红刷绿(F2)", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Edit",
+          inputJson: {
+            file_path: "/x/y.ts",
+            old_string: "keep\nold-line\nkeep2",
+            new_string: "keep\nnew-line\nkeep2",
+          },
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    // 未变行是上下文(无 bg 着色),变化行分别标红/绿
+    const ctx = screen.getByText("keep").closest("div");
+    expect(ctx?.className).not.toContain("bg-danger-soft");
+    expect(ctx?.className).not.toContain("bg-success-soft");
+    expect(screen.getByText("old-line").closest("div")?.className).toContain("bg-danger-soft");
+    expect(screen.getByText("new-line").closest("div")?.className).toContain("bg-success-soft");
+    // 行号:上下文行同时有旧/新行号
+    const row = screen.getByText("keep").closest("div");
+    expect(row?.textContent).toContain("1");
   });
 
   test("流式 partialJson 驱动 Edit diff 边流边渲（new_string 半截）", () => {
@@ -218,24 +253,22 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     // 运行中默认展开
-    expect(screen.getByText("- foo")).toBeInTheDocument();
-    expect(screen.getByText("+ ba")).toBeInTheDocument();
+    expect(screen.getByText("foo")).toBeInTheDocument();
+    expect(screen.getByText("ba")).toBeInTheDocument();
   });
 
-  test("错误态：前台中性收口，真实详情仍可展开", () => {
+  test("错误态：「未成功」徽标 + 淡危险边框 + 默认展开 + 表头错误首行(F1)", () => {
     const { container } = render(
       <ToolCard
         message={{ toolName: "Write", inputJson: { file_path: "/a" }, error: true, _completed: true, output: "denied" }}
       />,
     );
-    expect(screen.getByText("已结束")).toBeInTheDocument();
+    expect(screen.getByText("未成功")).toBeInTheDocument();
+    // 用「未成功」不用「失败」,颜色用淡色(border-danger/25)不用大红。
     expect(screen.queryByText("失败")).not.toBeInTheDocument();
-    expect(container.querySelector(".border-danger\\/30")).not.toBeInTheDocument();
-    expect(container.querySelector(".bg-danger-soft")).not.toBeInTheDocument();
-    expect(screen.queryByText("denied")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("denied")).toBeInTheDocument();
+    expect(container.querySelector(".border-danger\\/25")).toBeInTheDocument();
+    // 默认展开:错误详情免点击可见;错误首行同时进表头摘要区(至少出现一处)。
+    expect(screen.getAllByText("denied").length).toBeGreaterThanOrEqual(2);
   });
 
   test("TodoWrite 勾选列表 + done/total 摘要", () => {
@@ -288,12 +321,11 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByText("bar")).toBeInTheDocument();
   });
 
-  test("无 input/output 时不制造空详情入口", () => {
+  test("无 input/output 时不制造空详情入口(表头也不渲染成 button,L5)", () => {
     render(<ToolCard message={{ toolName: "Read", _completed: true }} />);
-    const btn = screen.getByRole("button");
-    expect(btn).not.toHaveAttribute("aria-expanded");
-    expect(screen.queryByRole("button", { name: "结果详情" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
     expect(screen.queryByText("查看原始完整记录")).not.toBeInTheDocument();
+    expect(screen.getByText("读取文件")).toBeInTheDocument();
   });
 
   test("agent-group 子块（ChildBlock 形态）复用本组件渲染", () => {
@@ -330,7 +362,8 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
         }}
       />,
     );
-    const header = screen.getByRole("button", { name: /搜索 AI 市场.*design.*完成/ });
+    // L5:表头按钮的可及名是 aria-label「展开{工具}详情」
+    const header = screen.getByRole("button", { name: /搜索 AI 市场/ });
     const card = header.closest("div.overflow-hidden.rounded-md");
     expect(card).toBeTruthy();
     expect(card).toHaveClass("rounded-md");
@@ -355,7 +388,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
         }}
       />,
     );
-    const header = screen.getByRole("button", { name: /点击页面.*元素 e12.*完成/ });
+    const header = screen.getByRole("button", { name: /点击页面/ });
     const card = header.closest("div.overflow-hidden.rounded-md");
     expect(card).toBeTruthy();
     expect(card).toHaveClass("rounded-md");
@@ -522,12 +555,11 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     expect(screen.getByText("网页提取")).toBeInTheDocument();
-    expect(screen.getByText("已结束")).toBeInTheDocument();
-    expect(screen.queryByText(/Invalid IP address/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("未成功")).toBeInTheDocument();
+    // F1:未成功默认展开,参数与错误文本免点击可见
     expect(screen.getByText("url")).toBeInTheDocument();
     expect(screen.getAllByText("https://example.com").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText(/Invalid IP address/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Invalid IP address/).length).toBeGreaterThanOrEqual(1);
   });
 
   test("Codex MCP 运行中只展示 args，不展示空 result wrapper", () => {
@@ -725,10 +757,9 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     expect(screen.getByText("生成图片")).toBeInTheDocument();
-    expect(screen.getByText("已结束")).toBeInTheDocument();
-    expect(screen.queryByText(/imageGeneration failed: quota exceeded/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText(/imageGeneration failed: quota exceeded/)).toBeInTheDocument();
+    expect(screen.getByText("未成功")).toBeInTheDocument();
+    // F1:未成功默认展开,错误输出免点击可见(表头首行 + 展开体至少各一处)
+    expect(screen.getAllByText(/imageGeneration failed: quota exceeded/).length).toBeGreaterThanOrEqual(1);
     const text = document.body.textContent || "";
     expect(text).not.toContain("ig_error");
   });
@@ -911,10 +942,8 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
         }}
       />,
     );
-    expect(screen.getByText("已结束")).toBeInTheDocument();
-    expect(screen.queryByText(title)).not.toBeInTheDocument();
-    expect(document.body.textContent || "").not.toContain(output);
-    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("未成功")).toBeInTheDocument();
+    // F1:未成功默认展开,错误标题与 raw error 免点击可见
     expect(screen.getByText(title)).toBeInTheDocument();
     expect(document.body.textContent || "").toContain(output);
     if (misleading) expect(document.body.textContent || "").not.toContain(misleading);
@@ -1206,10 +1235,9 @@ describe("Task / Agent 子任务卡不回显 prompt 与 JSON 参数", () => {
         }}
       />,
     );
-    expect(screen.getByText("已结束")).toBeInTheDocument();
-    expect(screen.queryByText(/子任务失败: 模型超时/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText(/子任务失败: 模型超时/)).toBeInTheDocument();
+    expect(screen.getByText("未成功")).toBeInTheDocument();
+    // F1:未成功默认展开,错误结果免点击可见(表头首行 + 展开体)
+    expect(screen.getAllByText(/子任务失败: 模型超时/).length).toBeGreaterThanOrEqual(1);
     expect(document.body.textContent).not.toContain("INTERNAL_PROMPT_MARKER");
   });
 

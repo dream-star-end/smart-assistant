@@ -225,6 +225,20 @@ export function ConfirmationDetailView({ detail }: { detail: unknown }): ReactNo
   return <DetailValue value={detail} />;
 }
 
+/**
+ * 是否为明确的删除/不可逆类写操作(M4):服务端 detail 标了 irreversible,或
+ * action(原始 op 名 + 中文标签)命中删除语义词。判断不了 → false(用 accent,不吓人)。
+ */
+export function isDestructiveConfirmation(detail: ConnectorConfirmationDetail | null): boolean {
+  if (!detail) return false;
+  const d = detail.detail;
+  if (d && typeof d === "object" && !Array.isArray(d) && (d as Record<string, unknown>).irreversible === true) {
+    return true;
+  }
+  const text = `${detail.action} ${confirmActionLabel(detail.action, detail.provider)}`;
+  return /delete|remove|destroy|purge|drop|revoke|uninstall|删除|清空|销毁|撤销|移除|下架/i.test(text);
+}
+
 // ── 状态徽标 ────────────────────────────────────────────────────────────────
 
 function StatusBadge({ status }: { status: string }) {
@@ -431,11 +445,12 @@ export function ConnectorConfirmCard({
           <div className="py-1 text-[13px] text-faint">此写操作需在网页端登录后核验并确认。</div>
         )}
 
-        {/* 操作区：只有拉取成功且服务端 status==='pending' 才可点，批准是危险色（写操作） */}
+        {/* 操作区：只有拉取成功且服务端 status==='pending' 才可点。批准默认 accent
+            (与 PermissionCard「允许」一致);仅明确是删除/不可逆操作时用 danger(M4)。 */}
         {showButtons && (
           <div className="mt-2.5 flex flex-wrap items-center gap-2">
             <Button
-              variant="danger"
+              variant={isDestructiveConfirmation(detail) ? "danger" : "accent"}
               size="sm"
               disabled={!actionable}
               onClick={() => decide("approve")}

@@ -283,6 +283,120 @@ describe("PermissionCard 过期判据 _askUserExpiresAt", () => {
   });
 });
 
+function bashPermMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
+  return {
+    id: "perm-bash",
+    role: "permission",
+    text: "权限请求",
+    ts: Date.now() - 1_000,
+    requestId: "req-bash",
+    toolName: "Bash",
+    inputJson: { command: "npm run build" },
+    inputPreview: '{"command":"npm run build"}',
+    _resolved: false,
+    ...overrides,
+  } as ChatMessage;
+}
+
+describe("PermissionCard 工具展示(F5/M7)", () => {
+  test("工具名走中文标签(Bash→终端),不再裸英文;状态不再用 emoji", () => {
+    render(<PermissionCard msg={bashPermMsg()} onRespond={vi.fn()} livePrompt={false} />);
+    expect(screen.getByText("终端")).toBeInTheDocument();
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("⏳");
+    expect(text).not.toContain("✓");
+    expect(text).not.toContain("✗");
+  });
+
+  test("无 toolName → 「未知工具」而非 'unknown'", () => {
+    render(
+      <PermissionCard
+        msg={bashPermMsg({ toolName: undefined, inputJson: undefined, inputPreview: undefined })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    expect(screen.getByText("未知工具")).toBeInTheDocument();
+    expect(document.body.textContent || "").not.toContain("unknown");
+  });
+
+  test("审批 modal:Bash 结构化展示命令,原始 JSON 收进「查看完整参数」折叠", () => {
+    render(<PermissionCard msg={bashPermMsg()} onRespond={vi.fn()} livePrompt />);
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.textContent).toContain("npm run build");
+    expect(screen.getAllByText("查看完整参数").length).toBeGreaterThanOrEqual(1);
+    // 窄屏贴底 sheet(mobile="sheet" 的圆角特征类)
+    expect(dialog.className).toContain("rounded-t-2xl");
+  });
+
+  test("已解决的卡:参数结构化摘要(命令),不再裸 dump inputPreview", () => {
+    render(
+      <PermissionCard
+        msg={bashPermMsg({ _resolved: true, _behavior: "allow" })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    expect(document.body.textContent || "").toContain("npm run build");
+    expect(screen.getByText("已允许")).toBeInTheDocument();
+  });
+
+  test("mcp 工具名解析为中文标签(打开网页)", () => {
+    render(
+      <PermissionCard
+        msg={bashPermMsg({
+          toolName: "mcp__browser__browser_navigate",
+          inputJson: { url: "https://example.com" },
+          inputPreview: undefined,
+        })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("mcp__browser__browser_navigate");
+    expect(text).toContain("打开网页");
+  });
+});
+
+describe("AskUserQuestion 选项可及性(M12)", () => {
+  test("单选题:radiogroup + role=radio + aria-checked 跟随选中", () => {
+    render(<PermissionCard msg={askMsg()} onRespond={vi.fn()} livePrompt />);
+    expect(screen.getByRole("radiogroup")).toBeInTheDocument();
+    const radios = screen.getAllByRole("radio");
+    expect(radios.length).toBeGreaterThanOrEqual(2);
+    const first = screen.getByRole("radio", { name: /组队合作割草/ });
+    expect(first).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(first);
+    expect(first).toHaveAttribute("aria-checked", "true");
+  });
+
+  test("多选题:group + role=checkbox", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({
+          inputJson: {
+            questions: [
+              {
+                question: "选择要启用的能力",
+                header: "能力",
+                multiSelect: true,
+                options: [{ label: "检索" }, { label: "生成" }],
+              },
+            ],
+          },
+        })}
+        onRespond={vi.fn()}
+        livePrompt
+      />,
+    );
+    const boxes = screen.getAllByRole("checkbox");
+    expect(boxes.length).toBeGreaterThanOrEqual(2);
+    fireEvent.click(screen.getByRole("checkbox", { name: /检索/ }));
+    expect(screen.getByRole("checkbox", { name: /检索/ })).toHaveAttribute("aria-checked", "true");
+  });
+});
+
 describe("跨包契约", () => {
   // 前端改不动 gateway 常量（那是容器内源码面 / runtime release 轴），只能镜像。数值一旦漂移,
   // 孤儿判定就会与服务端 sweep 错位:偏大 → 骚扰窗口回来;偏小 → 真正在等的 agent 被静默。

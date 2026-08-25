@@ -162,7 +162,9 @@ export function PinnedTaskTracker({
         <button
           type="button"
           onClick={toggle}
-          className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-hover"
+          aria-expanded={expanded}
+          aria-controls="pinned-task-list"
+          className="flex min-h-11 w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-hover"
         >
           <ListChecks className="size-4 shrink-0 text-accent" />
           <span className="shrink-0 text-xs font-medium text-muted">
@@ -190,7 +192,10 @@ export function PinnedTaskTracker({
         </button>
         {/* 展开:全部任务 */}
         {expanded && (
-          <div className="flex max-h-52 flex-col gap-1.5 overflow-y-auto border-t border-border px-3 py-2">
+          <div
+            id="pinned-task-list"
+            className="flex max-h-52 flex-col gap-1.5 overflow-y-auto border-t border-border px-3 py-2"
+          >
             {todos.map((t, i) => (
               <TodoRow key={`${i}-${t.content.slice(0, 24)}`} t={t} />
             ))}
