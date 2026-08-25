@@ -34,7 +34,7 @@ import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
 import { decideEngineCwd } from './engineCwd.js'
-import { cursorResumeStoreExists } from './engine/cursorAdapter.js'
+import { cursorResumeStoreExists, usableCursorResumeId } from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
 import type {
   AutomaticRetryState,
@@ -2784,16 +2784,14 @@ export class SessionManager {
       return undefined
     }
     if (tag === 'cursor' && workspacePath && !cursorResumeStoreExists(workspacePath, id)) {
-      log.warn('resume-map entry points to missing Cursor chat store — dropping silently', {
+      // Do not drop the map: spawn cwd is the resume authority, and a
+      // recomputed overlay can hash to a different chats/ dir than the live
+      // CLI. Deleting here forces historical replay on the next follow-up
+      // even when store.db is still on disk.
+      log.warn('resume-map Cursor store not at this workspace — keeping map, skipping this lookup', {
         sessionKey,
         resumeId: id,
       })
-      this._resumeMap.delete(sessionKey)
-      this._resumeMapTimestamps.delete(sessionKey)
-      this._resumeMapProvider.delete(sessionKey)
-      this._resumeMapLastCost.delete(sessionKey)
-      this._resumeMapCostImprecise.delete(sessionKey)
-      this._saveResumeMap()
       return undefined
     }
     return id
@@ -3271,14 +3269,14 @@ export class SessionManager {
       const nextFingerprint =
         opts.contextFingerprint ??
         (await computeSessionContextFingerprint(nextProjectId, opts.assetsRevision))
-      const fingerprintChanged =
-        Boolean(nextFingerprint) && existing.contextFingerprint !== nextFingerprint
+      // Fingerprint ticks (project.md / assets) are re-injected each spawn via
+      // prompt slots. Replacing the runner for that would drop Cursor's live
+      // native session and force a visible history replay on ordinary follow-ups.
       if (
         existing.providerTag !== desiredEngine ||
         workspaceModeChanged ||
         workspaceCwdChanged ||
-        projectIdChanged ||
-        fingerprintChanged
+        projectIdChanged
       ) {
         const replacementNotice: NonNullable<AgentSession['_contextRebuildNotice']> =
           existing.providerTag !== desiredEngine ? 'engine-switch' : 'native-resume-loss'
@@ -3352,7 +3350,7 @@ export class SessionManager {
         if (opts.parentSessionKey && !existing.parentSessionKey)
           existing.parentSessionKey = opts.parentSessionKey
         if (opts.projectId !== undefined) existing.projectId = opts.projectId
-        if (opts.contextFingerprint) existing.contextFingerprint = opts.contextFingerprint
+        if (nextFingerprint) existing.contextFingerprint = nextFingerprint
         if (opts.runContext) existing.runContext = opts.runContext
         return existing
       }
@@ -4116,7 +4114,19 @@ export class SessionManager {
           sessionKey: session.sessionKey,
         })
       }
-      let providerResumeId = this._resumeIdFor(session.sessionKey, session.providerTag, this._cursorWorkspacePathForSession(session))
+      const spawnCwd = this._cursorWorkspacePathForSession(session)
+      const usableCursorId = session.providerTag === 'cursor'
+        ? usableCursorResumeId({
+            workspacePath: spawnCwd,
+            liveId: session.runner.nativeSessionId,
+            mappedId: this._resumeMap.get(session.sessionKey),
+          })
+        : undefined
+      let providerResumeId = usableCursorId ?? this._resumeIdFor(
+        session.sessionKey,
+        session.providerTag,
+        spawnCwd,
+      )
       const injectionKey = historicalContextInjectionKey({
         messages: effectiveMasterHistoricalMessages,
         peerId: session.peerId,

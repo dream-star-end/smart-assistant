@@ -1311,6 +1311,26 @@ export function cursorResumeStoreExists(workspacePath: string, sessionId: string
   try { return existsSync(cursorResumeStorePath(workspacePath, sessionId)) } catch { return false }
 }
 
+/**
+ * Same-engine Cursor follow-ups must resume, not replay. Prefer the live
+ * adapter id, then the resume-map id, but only if that id's store exists at
+ * the spawn cwd — a hash mismatch is a silent empty chat, not a fallback cue.
+ */
+export function usableCursorResumeId(opts: {
+  workspacePath?: string | null
+  liveId?: string | null
+  mappedId?: string | null
+}): string | undefined {
+  const workspacePath = typeof opts.workspacePath === 'string' ? opts.workspacePath.trim() : ''
+  if (!workspacePath) return undefined
+  for (const id of [opts.liveId, opts.mappedId]) {
+    if (typeof id === 'string' && id.length > 0 && cursorResumeStoreExists(workspacePath, id)) {
+      return id
+    }
+  }
+  return undefined
+}
+
 export class CursorAdapter extends EventEmitter implements EngineAdapter {
   readonly engineId = 'cursor'
   readonly capabilities: EngineCapabilities = {

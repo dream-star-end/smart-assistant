@@ -2764,6 +2764,85 @@ describe("crash/interrupt partial persistence", () => {
     assert.equal(session._contextRebuildNotice, "engine-switch");
   });
 
+  test("Cursor native follow-up resumes without replaying history or a rebuild banner", async () => {
+    const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
+    const { realpathSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const path = await import("node:path");
+    const { cursorResumeStorePath } = await import("../engine/cursorAdapter.js");
+    const dir = realpathSync(await mkdtemp(path.join(tmpdir(), "oc-cursor-followup-")));
+    const resumeId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const store = cursorResumeStorePath(dir, resumeId);
+    await mkdir(path.dirname(store), { recursive: true });
+    await writeFile(store, "");
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const runner = new FakeCcbRunner(() => {});
+      (runner as unknown as { sessionId: string }).sessionId = resumeId;
+      const session = makeSession(runner, {
+        sessionKey: "agent:main:webchat:dm:cursor-followup-resume",
+        channel: "webchat",
+        peerId: "cursor-followup-resume",
+        providerTag: "cursor",
+        workspaceCwd: dir,
+        ccbSessionId: resumeId,
+        turns: 1,
+      } as Partial<AgentSession>);
+      Object.assign(session.runner.capabilities, { historyMode: "native-resume" });
+      const internals = sm as unknown as {
+        _resumeMap: Map<string, string>;
+        _resumeMapTimestamps: Map<string, number>;
+        _resumeMapProvider: Map<string, string>;
+        _saveResumeMap: () => void;
+        runOneTurnWithRetry: (
+          session: AgentSession,
+          payload: string,
+          ...rest: unknown[]
+        ) => Promise<void>;
+      };
+      internals._saveResumeMap = () => {};
+      internals._resumeMap.set(session.sessionKey, resumeId);
+      internals._resumeMapTimestamps.set(session.sessionKey, Date.now());
+      internals._resumeMapProvider.set(session.sessionKey, "cursor");
+      const payloads: string[] = [];
+      const notices: number[] = [];
+      internals.runOneTurnWithRetry = async (_session, payload) => {
+        payloads.push(payload);
+      };
+
+      await sm.submit(
+        session,
+        "我选择:接上",
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          historicalMessages: [
+            { role: "user", id: "u1", text: "上一轮问题" },
+            {
+              role: "assistant",
+              id: `srv-${session.peerId}-${session.agentId}-t1-s3`,
+              text: "上一轮回答",
+            },
+            { role: "user", id: "u2", text: "我选择:接上", status: "sending" },
+          ],
+          emitContextRebuilt: ({ messageCount }) => notices.push(messageCount),
+        },
+      );
+
+      assert.equal(payloads[0], "我选择:接上");
+      assert.doesNotMatch(payloads[0]!, /openclaude_previous_context/);
+      assert.deepEqual(notices, []);
+      assert.equal(internals._resumeMap.get(session.sessionKey), resumeId);
+    } finally {
+      await rm(path.dirname(store), { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("native rebuild emits once and consumes its explicit notice", async () => {
     const sm = new SessionManager(makeConfigStub());
     const runner = new FakeCcbRunner(() => {});
