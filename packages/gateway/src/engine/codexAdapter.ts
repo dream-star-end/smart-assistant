@@ -316,6 +316,12 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     resumeKind: 'codex-thread',
     needsServerRequestId: true,
     historyMode: 'native-resume',
+    // codex 的审批面是 app-server approval 协议(native 语义)。
+    permissionModel: 'native',
+    emitsCallUsage: true,
+    emitsToolInputDeltas: true,
+    supportsNativeCompact: true,
+    multimodalInput: 'native',
   }
 
   private readonly kernel: CodexAppServerRunner

@@ -81,6 +81,31 @@ describe('CursorAdapter', () => {
     )
   })
 
+  // ── P0-1:setEffortLevel 必须 stash+忽略而非抛错(sessionManager 硬调面)──
+  test('setEffortLevel stashes and ignores instead of throwing', () => {
+    const adapter = new CursorAdapter(opts(tmpdir()))
+    adapter.on('error', () => {})
+    assert.doesNotThrow(() => adapter.setEffortLevel('medium'))
+    assert.equal(adapter.effortLevel, 'medium')
+    assert.doesNotThrow(() => adapter.setEffortLevel(undefined))
+    assert.equal(adapter.effortLevel, undefined)
+  })
+
+  // ── P0-2:图片等 base64 二进制 block 绝不 stringify 进纯文本 prompt ──
+  test('promptOf replaces image blocks with a placeholder and never leaks base64', () => {
+    const base64 = 'aVZCT1J3MEtHZ29BQUFBTlNVaEVVZw=='.repeat(64)
+    const prompt = _internals.promptOf([
+      { type: 'text', text: 'describe this image' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } },
+      { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
+      { type: 'tool_result', content: 'structured-passthrough' },
+    ])
+    assert.ok(prompt.includes('describe this image'))
+    assert.ok(prompt.includes('图片附件已省略'), '占位提示必须出现在 prompt 里')
+    assert.ok(!prompt.includes(base64.slice(0, 48)), 'base64 数据绝不进 prompt')
+    assert.ok(prompt.includes('structured-passthrough'), '非二进制结构化 block 维持 stringify')
+  })
+
   // ── 工具卡归一化:Cursor 原生工具 → 产品工具名 + 产品 input 形态 ──
   // fixture 形态取自 selfhost 真实 turn tape(cursor-opus-5-high 会话)。
   test('normalizes cursor-native tool names and inputs to product card shapes', () => {
@@ -1270,7 +1295,10 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
     const adapter = new CursorAdapter(opts('/tmp'))
     assert.throws(() => adapter.setModel('cursor-auto --force'), /not allowlisted/)
     assert.throws(() => adapter.setModel('gpt-5.3-codex'), /not allowlisted/)
-    assert.throws(() => adapter.setEffortLevel('high'), /does not expose/)
+    // P0-1:setEffortLevel 是 sessionManager 无条件硬调面,抛错会让 turn 卡死;
+    // 现为 stash+忽略(与 zcode 一致)。
+    assert.doesNotThrow(() => adapter.setEffortLevel('high'))
+    assert.equal(adapter.effortLevel, 'high')
   })
 
   // The wrapper starts the CLI through setsid, so a descendant that outlives

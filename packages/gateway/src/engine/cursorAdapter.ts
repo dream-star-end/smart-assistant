@@ -19,6 +19,7 @@ import type { ExecutionTarget } from '../remoteTarget.js'
 import type { EngineAdapter, EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
 import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
+import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { classifyRunError } from '../errorClassify.js'
 import { createLogger } from '../logger.js'
 import { resolveMcpMemoryEntry } from '../mcpMemoryEntry.js'
@@ -674,7 +675,8 @@ function textOf(value: unknown): string {
   try { return JSON.stringify(value) } catch { return String(value) }
 }
 function promptOf(input: TurnParams['input']): string {
-  return typeof input === 'string' ? input : input.map((v) => v.type === 'text' ? textOf(v.text) : textOf(v)).filter(Boolean).join('\n')
+  // P0-2:base64 二进制 block 绝不 stringify 进纯文本 prompt,占位替换。
+  return typeof input === 'string' ? input : input.map((v) => v.type === 'text' ? textOf(v.text) : isBinaryInputBlock(v) ? BINARY_BLOCK_OMITTED_NOTICE : textOf(v)).filter(Boolean).join('\n')
 }
 function nonnegative(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined
@@ -1318,10 +1320,17 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     needsServerRequestId: true,
     historyMode: 'native-resume',
     maxPromptBytes: CURSOR_MAX_TURN_PAYLOAD_BYTES,
+    // 托管 Cursor CLI 以非交互全放行模式驱动:permissionMode 不会到达底座。
+    permissionModel: 'forced-unattended',
+    emitsCallUsage: false,
+    emitsToolInputDeltas: false,
+    supportsNativeCompact: false,
+    multimodalInput: 'text-only',
   }
   private readonly opts: EngineCreateOpts
   private active: TurnCtx | null = null
   private currentModel: string | undefined
+  private currentEffort: string | undefined
   private currentToolsets: string[] | undefined
   private target: ExecutionTarget = { kind: 'local' }
   private drain: Promise<void> = Promise.resolve()
@@ -1344,6 +1353,14 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.nativeId = opts.resumeSessionId ?? null
     this.setModel(opts.model)
     this.currentToolsets = opts.agentToolsets
+    // forced-unattended:托管 Cursor CLI 恒为非交互全放行,非 bypass 的
+    // permissionMode 无法生效。只记日志,不向前端注入提示(用户明确选择全放行)。
+    if (opts.permissionMode && opts.permissionMode !== 'bypassPermissions') {
+      log.warn('cursor engine is forced-unattended; requested permissionMode is ignored', {
+        sessionKey: opts.sessionKey,
+        permissionMode: opts.permissionMode,
+      })
+    }
   }
   start(): Promise<void> { return Promise.resolve() }
   submitTurn(params: TurnParams): EngineTurnRun {
@@ -1404,7 +1421,21 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     mkdirSync(dir, { recursive: true, mode: 0o700 })
     return dir
   }
+  /** P0-2:输入含图片等二进制 block 时,除 prompt 占位替换外,再向用户发一条
+   *  可见 assistant 提示(走 emitText 常规 segment 机制,live 与持久化一致)。 */
+  private emitOmittedBinaryNotice(ctx: TurnCtx): void {
+    const omitted = countBinaryInputBlocks(ctx.params.input)
+    if (omitted === 0) return
+    log.warn('binary input blocks omitted from text-only cursor prompt', {
+      sessionKey: this.opts.sessionKey,
+      omitted,
+    })
+    this.emitText(ctx, 'text', BINARY_BLOCK_OMITTED_NOTICE)
+    // 提示独占一个 segment:关闭当前段,模型首段输出另起新 segment。
+    ctx.assistantSegmentClosed = true
+  }
   private async spawnTurn(ctx: TurnCtx): Promise<void> {
+    this.emitOmittedBinaryNotice(ctx)
     let repoSnapshot = null
     if (this.opts.sessionId && this.opts.getRepoSnapshot) {
       repoSnapshot = this.opts.getRepoSnapshot(this.opts.sessionId)
@@ -2025,8 +2056,19 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.currentModel = selected
   }
   get model(): string | undefined { return this.currentModel }
-  setEffortLevel(level: string | undefined): void { if (level !== undefined) throw new Error('Cursor engine does not expose reasoning effort') }
-  get effortLevel(): undefined { return undefined }
+  // Cursor 思考档编码在 canonical model id 里(supportsEffort:false),没有独立
+  // effort 旋钮。与 zcodeAdapter 一致:stash 请求值而非抛错 —— sessionManager 在
+  // turn 启动路径无条件硬调本 mutator,抛错会让 turn 永远卡在"思考中"(P0-1)。
+  setEffortLevel(level: string | undefined): void {
+    if (level !== undefined && level !== this.currentEffort) {
+      log.warn('cursor engine has no reasoning-effort knob; effort level stashed and ignored', {
+        sessionKey: this.opts.sessionKey,
+        effortLevel: level,
+      })
+    }
+    this.currentEffort = level
+  }
+  get effortLevel(): string | undefined { return this.currentEffort }
   setTraceId(_traceId: string | undefined): void {}
   setGoalState(_goal: GoalStateSnapshot | null): Promise<void> { return Promise.resolve() }
   updateConfig(config: OpenClaudeConfig): void { this.opts.config = config }
@@ -2043,6 +2085,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
 
 export const _internals = {
   CURSOR_PREAMBLE,
+  promptOf,
   renderCursorPrompt,
   validateCursorTurnPayload,
   validateCursorFinalPrompt,

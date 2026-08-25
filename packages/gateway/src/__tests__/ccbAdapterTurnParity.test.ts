@@ -27,12 +27,21 @@ import type { EngineCreateOpts } from "../engine/registry.js";
 class FakeCcbRunner extends EventEmitter {
   lastActivityAt = Date.now();
   submitted: Array<{ input: unknown; requestId?: string }> = [];
+  /** stdin 可写性开关(false 模拟 control_response 写入失败)。 */
+  permissionWritable = true;
+  permissionResponses: Array<{ requestId: string; response: unknown }> = [];
 
   async submit(
     input: string | Array<{ type: string; [key: string]: unknown }>,
     requestId?: string,
   ): Promise<void> {
     this.submitted.push({ input, requestId });
+  }
+
+  sendPermissionResponse(requestId: string, response: unknown): boolean {
+    if (!this.permissionWritable) return false;
+    this.permissionResponses.push({ requestId, response });
+    return true;
   }
 
   msg(m: Record<string, unknown>): void {
@@ -605,6 +614,46 @@ describe("CcbAdapter turn parity", () => {
 
     runner.msg(resultRow({ total_cost_usd: 0.01 }));
     await turnB.summary;
+  });
+
+  test("P1-6 waitingForUserInput:未决 can_use_tool 期间 true,回复/终态后 false", async () => {
+    const { adapter, runner } = makeAdapter();
+    const events: EngineEvent[] = [];
+    const turn = beginTurn(adapter, events);
+    await turn.submitted;
+    assert.equal(adapter.waitingForUserInput, false, "无未决请求时不等用户");
+
+    runner.msg({
+      type: "control_request",
+      request_id: "perm-1",
+      request: { subtype: "can_use_tool", tool_name: "Bash", tool_use_id: "tu1", input: { command: "ls" } },
+    });
+    assert.equal(
+      events.some((e) => e.kind === "permission_request"),
+      true,
+      "permission_request 事件正常透传",
+    );
+    assert.equal(adapter.waitingForUserInput, true, "未决 can_use_tool → idle watchdog 必须停手");
+
+    // 写入失败(进程 stdin 不可写)不允许清集 —— 请求仍未决。
+    runner.permissionWritable = false;
+    assert.equal(adapter.sendPermissionResponse("perm-1", { behavior: "allow" }), false);
+    assert.equal(adapter.waitingForUserInput, true, "响应未送达时仍在等用户");
+
+    runner.permissionWritable = true;
+    assert.equal(adapter.sendPermissionResponse("perm-1", { behavior: "allow" }), true);
+    assert.equal(adapter.waitingForUserInput, false, "响应送达即不再等用户");
+
+    // 第二个未决请求悬着直到 turn 终态:onFinish 清 _activeTurn → getter 自然回 false。
+    runner.msg({
+      type: "control_request",
+      request_id: "perm-2",
+      request: { subtype: "can_use_tool", tool_name: "Write", input: {} },
+    });
+    assert.equal(adapter.waitingForUserInput, true);
+    runner.msg(resultRow());
+    await turn.summary;
+    assert.equal(adapter.waitingForUserInput, false, "turn 终态后不再报告等用户");
   });
 
   test("activity 事件:每条原始消息 emit 一次(30-min timer refresh 信号源)", async () => {
