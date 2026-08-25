@@ -9,6 +9,7 @@ import { beforeEach, describe, test } from "node:test";
 import {
   recordProviderHealthSample,
   flushProviderHealthSamples,
+  recordProviderProbeSuccess,
   _setProviderHealthSinkDepsForTest,
   _drainBufferForTest,
   _bufferLenForTest,
@@ -93,5 +94,35 @@ describe("flushProviderHealthSamples — 批量 + 静默", () => {
     recordProviderHealthSample(STATIC_MODEL, "upstream_5xx");
     await assert.doesNotReject(flushProviderHealthSamples());
     assert.equal(_bufferLenForTest(), 0); // 失败批被丢弃,不回填
+  });
+});
+
+describe("recordProviderProbeSuccess — 探活成功样本独立 INSERT", () => {
+  test("成功直写 kind='final' 且 model 带 probe: 前缀,不走 traffic buffer、不受抽样影响", async () => {
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    _setProviderHealthSinkDepsForTest({
+      query: (sql, params) => {
+        calls.push({ sql, params });
+        return Promise.resolve();
+      },
+      random: () => 0.99, // 即便抽样率拒绝,探活也不该被抽样丢
+      logger: silentLog,
+    });
+    recordProviderProbeSuccess("opencodego", "deepseek-v4-flash");
+    await new Promise((r) => setImmediate(r)); // fire-and-forget promise 落定
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].sql, /'final'/);
+    assert.equal(calls[0].params[0], "opencodego");
+    assert.equal(calls[0].params[1], "probe:deepseek-v4-flash");
+    assert.equal(_bufferLenForTest(), 0); // 不进 traffic buffer
+  });
+
+  test("INSERT 失败只 warn 不抛(PG 闪断场景)", async () => {
+    _setProviderHealthSinkDepsForTest({
+      query: () => Promise.reject(new Error("connection refused")),
+      logger: silentLog,
+    });
+    assert.doesNotThrow(() => recordProviderProbeSuccess("ark", "glm-5.2"));
+    await new Promise((r) => setImmediate(r)); // .catch 分支执行,无 unhandled rejection
   });
 });

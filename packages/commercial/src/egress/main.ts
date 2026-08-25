@@ -43,6 +43,7 @@ import { makeLoadUserModelAuthz } from "../auth/userModelAuthz.js";
 import { makeAnthropicProxyHandler } from "../http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
 import { startLatencyProber } from "./latencyProber.js";
+import { startRecoveryProber } from "./recoveryProber.js";
 import { snapshotInflight } from "../http/proxy/inflightTracker.js";
 import {
   EGRESS_CAPABILITIES,
@@ -252,6 +253,12 @@ export async function startEgress(): Promise<void> {
   // 流量的出口进程(dispatcher direct/proxy 语义一致);任何失败只告警,不影响在飞流主职。
   const latencyProber = startLatencyProber({ staticProviderKeys, log });
 
+  // 降级探活恢复器(根治 auto 降级→前端禁选→零真实流量→零样本→永不恢复的死锁)。
+  // 与 latencyProber 同理挂 egress(真实推理出口,dispatcher/鉴权语义一致);只对
+  // auto+degraded provider 发最小推理探活,成功才写 kind='final' 样本(model 带
+  // probe: 前缀),恢复判定仍由 master scheduler 既有数学接管。零迁移。
+  const recoveryProber = startRecoveryProber({ staticProviderKeys, log });
+
   // self-host uuid 与 master 同权威(PG compute host 表)——identity 双因子里
   // hostUuid 参与 bearer 归属校验,两进程必须同值。取失败拒启(egress 无降级路径)。
   const selfHostUuid = (await getSelfHost()).id;
@@ -440,6 +447,7 @@ export async function startEgress(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     latencyProber?.stop();
+    recoveryProber?.stop();
     // eslint-disable-next-line no-console
     console.log(`[egress] SIGTERM — draining in-flight streams (max ${EGRESS_DRAIN_MS}ms)…`);
     // close() 停接新连接,已建立连接(在飞流)自然完结;到 drain 上限强制退出。
