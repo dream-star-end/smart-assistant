@@ -311,13 +311,22 @@ import {
   sendToAgentCallbackIdempotencyKey,
 } from './sendToAgentCallback.js'
 import {
+  abandonCcbLocalAgentInject,
+  ackCcbTaskNotificationDelivered,
+  beginCcbLocalAgentInject,
   buildCcbLocalAgentCallbackText,
   ccbLocalAgentCallbackClientMessageId,
   ccbLocalAgentCallbackIdempotencyKey,
-  planCcbLocalAgentCallback,
+  clearCcbLocalAgentPendingForSession,
+  completeCcbLocalAgentInject,
+  failCcbLocalAgentInject,
+  getCcbLocalAgentCallbackState,
+  noteCcbTaskNotification,
   sessionHasInFlightTurn,
+  takePendingInjectionsForSession,
   type CcbLocalAgentNotification,
 } from './ccbLocalAgentCallback.js'
+import { runBoundedOriginInjectBackoff } from './originInjectBackoff.js'
 import {
   persistSendToAgentIntent,
   recoverInterruptedSendToAgentIntents,
@@ -2348,6 +2357,9 @@ export class Gateway {
     this.sessions.onCcbTaskNotification = (session, payload) => {
       void this.handleCcbLocalAgentNotification(session, payload)
     }
+    this.sessions.onCcbTaskNotificationDelivered = (session, payload) => {
+      this.handleCcbLocalAgentDelivered(session.sessionKey, payload.taskId)
+    }
     this.autoDream = new AutoDreamService({
       runModel: (input) => this._runAutoDreamModel(input),
       notifyResult: (report) => postInboxMessage(formatAutoDreamReceipt(report)),
@@ -2441,6 +2453,7 @@ export class Gateway {
         this._outboundRing.clear(sessionKey)
         outboundRingSizeBytes.value = this._outboundRing.totalBytes()
       } catch {}
+      clearCcbLocalAgentPendingForSession(sessionKey)
     }
   }
 
@@ -12525,39 +12538,63 @@ export class Gateway {
   ): void {
     const taskId = (payload.taskId || '').trim()
     if (!taskId) return
-    const plan = planCcbLocalAgentCallback({
+    const decision = noteCcbTaskNotification({
       sessionKey: session.sessionKey,
-      taskId,
+      notification: { ...payload, taskId },
       hasInFlightTurn: sessionHasInFlightTurn(session),
-    })
-    if (plan !== 'inject') {
-      this.log.info('ccb local-agent callback skipped', {
-        sessionKey: session.sessionKey,
-        taskId,
-        plan,
-      })
-      return
-    }
-    void this.injectCcbLocalAgentCallback({
-      sessionKey: session.sessionKey,
       userId: session.userId,
+    })
+    this.log.info('ccb local-agent callback noted', {
+      sessionKey: session.sessionKey,
       taskId,
+      decision,
+    })
+    if (decision !== 'inject') return
+    this.queueCcbLocalAgentInject(session.sessionKey, payload, session.userId)
+  }
+
+  private handleCcbLocalAgentDelivered(sessionKey: string, taskId: string): void {
+    const id = (taskId || '').trim()
+    if (!id) return
+    const decision = ackCcbTaskNotificationDelivered({ sessionKey, taskId: id })
+    this.log.info('ccb local-agent callback acked', { sessionKey, taskId: id, decision })
+  }
+
+  private flushCcbLocalAgentPendingOnFinalize(
+    session: { sessionKey: string; userId?: string },
+  ): void {
+    const due = takePendingInjectionsForSession(session.sessionKey)
+    for (const item of due) {
+      this.queueCcbLocalAgentInject(session.sessionKey, item.payload, item.userId ?? session.userId)
+    }
+  }
+
+  private queueCcbLocalAgentInject(
+    sessionKey: string,
+    payload: CcbLocalAgentNotification,
+    userId?: string,
+  ): void {
+    void this.injectCcbLocalAgentCallback({
+      sessionKey,
+      userId,
+      taskId: payload.taskId,
       status: payload.status,
       outputFile: payload.outputFile,
       summary: payload.summary,
     }).catch((err) => {
       this.log.warn('ccb local-agent callback inject failed', {
-        sessionKey: session.sessionKey,
-        taskId,
+        sessionKey,
+        taskId: payload.taskId,
         err: String(err),
       })
     })
   }
 
   /**
-   * 父会话无 in-flight turn 时，把 CCB local-agent 完成通知 origin-inject
-   * 成一条新的 user 行。父 turn 仍在飞时由 CCB mid-turn drain 负责，这里
-   * 不再 retry。父 CCB 进程已死不兜底。
+   * Origin-inject a CCB local-agent completion after the parent turn is
+   * idle and no mid-turn delivered ack arrived. Retries with the same
+   * bounded backoff as send_to_agent. Parent CCB process already dead
+   * is not covered.
    */
   private async injectCcbLocalAgentCallback(args: {
     sessionKey: string
@@ -12573,10 +12610,15 @@ export class Gateway {
         taskId: args.taskId,
         sessionKey: args.sessionKey,
       })
+      abandonCcbLocalAgentInject(args.sessionKey, args.taskId)
       return { kind: 'fallback' }
     }
-    const live = this.sessions.getByKey(origin.sessionKey)
-    if (sessionHasInFlightTurn(live)) {
+    if (!beginCcbLocalAgentInject(args.sessionKey, args.taskId)) {
+      this.log.info('ccb local-agent inject skipped: not pending', {
+        sessionKey: args.sessionKey,
+        taskId: args.taskId,
+        state: getCcbLocalAgentCallbackState(args.sessionKey, args.taskId),
+      })
       return { kind: 'fallback' }
     }
     const text = buildCcbLocalAgentCallbackText({
@@ -12586,35 +12628,58 @@ export class Gateway {
       summary: args.summary,
     })
     const clientMessageId = ccbLocalAgentCallbackClientMessageId(args.taskId)
-    const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
-    let queued = false
-    try {
-      const parent = this.sessions.getByKey(origin.sessionKey)
-      if (sessionHasInFlightTurn(parent)) {
-        return { kind: 'fallback' }
-      }
-      const userId =
-        (typeof args.userId === 'string' && args.userId.trim()) ||
-        parent?.userId ||
-        process.env.OC_USER_ID?.trim() ||
-        'default'
-      const attempt = await this.tryCcbLocalAgentCallbackDispatch({
-        origin,
-        userId,
-        text,
-        clientMessageId,
-        taskId: args.taskId,
-        sessionKey: origin.sessionKey,
-        barrierOwner: barrier.owner,
-        onQueued: () => {
-          queued = true
-          barrier.release()
-        },
-      })
-      return attempt
-    } finally {
-      if (!queued) barrier.release()
+    const result = await runBoundedOriginInjectBackoff({
+      isShuttingDown: () => this._shuttingDown,
+      shouldAbort: () =>
+        getCcbLocalAgentCallbackState(args.sessionKey, args.taskId) === 'delivered',
+      tryOnce: async () => {
+        if (getCcbLocalAgentCallbackState(args.sessionKey, args.taskId) === 'delivered') {
+          return { kind: 'fallback' }
+        }
+        const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
+        let queued = false
+        try {
+          const parent = this.sessions.getByKey(origin.sessionKey)
+          if (sessionHasInFlightTurn(parent)) {
+            return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
+          }
+          const userId =
+            (typeof args.userId === 'string' && args.userId.trim()) ||
+            parent?.userId ||
+            process.env.OC_USER_ID?.trim() ||
+            'default'
+          return await this.tryCcbLocalAgentCallbackDispatch({
+            origin,
+            userId,
+            text,
+            clientMessageId,
+            taskId: args.taskId,
+            sessionKey: origin.sessionKey,
+            barrierOwner: barrier.owner,
+            onQueued: () => {
+              queued = true
+              barrier.release()
+            },
+          })
+        } finally {
+          if (!queued) barrier.release()
+        }
+      },
+      onBudgetExhausted: () => {
+        this.log.warn('ccb local-agent callback retry budget exhausted', {
+          taskId: args.taskId,
+          sessionKey: args.sessionKey,
+        })
+      },
+    })
+    if (result.kind === 'injected') {
+      completeCcbLocalAgentInject(args.sessionKey, args.taskId)
+    } else if (result.kind === 'fallback' || result.kind === 'terminal_failure') {
+      abandonCcbLocalAgentInject(args.sessionKey, args.taskId)
+    } else {
+      failCcbLocalAgentInject(args.sessionKey, args.taskId)
     }
+    return result
   }
 
   private async tryCcbLocalAgentCallbackDispatch(args: {
@@ -12744,27 +12809,22 @@ export class Gateway {
       error: args.error,
     })
     const clientMessageId = sendToAgentCallbackClientMessageId(args.jobId)
-    const sleep = (ms: number) => new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, ms)
-      timer.unref?.()
-    })
-    let delayMs = 500
-    for (let attemptNo = 0; attemptNo < 12; attemptNo += 1) {
-      if (this._shuttingDown) return { kind: 'fallback' }
-      const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
-      let queued = false
-      let attempt: CronOriginFireResult
-      try {
-        const parent = this.sessions.getByKey(origin.sessionKey)
-        if ((parent?._activeTurnCount ?? 0) > 0 || (parent?._activeClientTurnCount ?? 0) > 0) {
-          attempt = { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
-        } else {
+    return runBoundedOriginInjectBackoff({
+      isShuttingDown: () => this._shuttingDown,
+      tryOnce: async () => {
+        const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
+        let queued = false
+        try {
+          const parent = this.sessions.getByKey(origin.sessionKey)
+          if ((parent?._activeTurnCount ?? 0) > 0 || (parent?._activeClientTurnCount ?? 0) > 0) {
+            return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
+          }
           const userId =
             (typeof args.userId === 'string' && args.userId.trim()) ||
             parent?.userId ||
             process.env.OC_USER_ID?.trim() ||
             'default'
-          attempt = await this.trySendToAgentCallbackDispatch({
+          return await this.trySendToAgentCallbackDispatch({
             origin,
             userId,
             text,
@@ -12776,16 +12836,14 @@ export class Gateway {
               barrier.release()
             },
           })
+        } finally {
+          if (!queued) barrier.release()
         }
-      } finally {
-        if (!queued) barrier.release()
-      }
-      if (attempt.kind === 'injected' || attempt.kind === 'fallback') return attempt
-      await sleep(delayMs)
-      delayMs = Math.min(delayMs * 2, 5_000)
-    }
-    this.log.warn('send_to_agent callback retry budget exhausted', { jobId: args.jobId })
-    return { kind: 'fallback' }
+      },
+      onBudgetExhausted: () => {
+        this.log.warn('send_to_agent callback retry budget exhausted', { jobId: args.jobId })
+      },
+    })
   }
 
   private async trySendToAgentCallbackDispatch(args: {
@@ -17585,6 +17643,7 @@ export class Gateway {
         }
         this.deliver(usageFrame, adapter)
       } else if (e.kind === 'final') {
+        this.flushCcbLocalAgentPendingOnFinalize(session)
         leaderFinalCount++
         // Plan 2 — turn 终态前先清 turn_status cache。CCB 正常关 compact 会先
         // emit setSDKStatus(null)(parser → kind:'turn_status' status:null),
@@ -17700,6 +17759,8 @@ export class Gateway {
           summary: e.summary,
           toolUseId: e.toolUseId,
         })
+      } else if (e.kind === 'task_notification_delivered') {
+        this.handleCcbLocalAgentDelivered(session.sessionKey, e.taskId)
       } else if (e.kind === 'turn_status') {
         // Plan 2 (compact-progress-frame) — CCB setSDKStatus 侧信道。CcbMessageParser
         // 把 stdout `{type:'system', subtype:'status', status:'compacting'|null}` 转成

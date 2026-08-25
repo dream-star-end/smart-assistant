@@ -1051,6 +1051,30 @@ describe('CcbMessageParser: system', () => {
     assert.equal(events.length, 0)
   })
 
+  it('emits task_notification_delivered as an independent event after finalize', () => {
+    const { parser, events } = createParser()
+    parser.finish()
+    parser.parse({
+      type: 'system',
+      subtype: 'task_notification_delivered',
+      task_id: 'agt-ack',
+      delivered_by: 'ccb-mid-turn',
+    } as any)
+    assert.equal(events.length, 1)
+    assert.equal(events[0].kind, 'task_notification_delivered')
+    if (events[0].kind === 'task_notification_delivered') {
+      assert.equal(events[0].taskId, 'agt-ack')
+      assert.equal(events[0].deliveredBy, 'ccb-mid-turn')
+    }
+  })
+
+  it('still ignores unknown system subtypes after adding delivered ack', () => {
+    const { parser, events } = createParser()
+    parser.parse({ type: 'system', subtype: 'task_progress', task_id: 't1' } as any)
+    parser.parse({ type: 'system', subtype: 'api_retry_nope' } as any)
+    assert.equal(events.filter((e) => e.kind === 'block').length, 0)
+  })
+
   // Plan 2 (compact-progress-frame) — system.status 转 kind:'turn_status'
   // 受控枚举(coreSchemas.ts:SDKStatusSchema 只 'compacting' | null),parser 不
   // 透传 CCB raw 字符串。未来 CCB 加新 status 时,gateway 没显式映射会被 normalize

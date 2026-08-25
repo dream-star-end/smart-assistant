@@ -231,6 +231,11 @@ export type EngineContentEvent =
       summary: string
       toolUseId?: string
     }
+  | {
+      kind: 'task_notification_delivered'
+      taskId: string
+      deliveredBy: 'ccb-mid-turn'
+    }
 
 /**
  * EngineAdapter → sessionManager 的 canonical 事件模型。

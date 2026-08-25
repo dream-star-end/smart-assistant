@@ -509,6 +509,35 @@ export function getCommandsByMaxPriority(
  * Remote Control bridge messages (`bridgeOrigin`) that are re-validated later
  * through isBridgeSafeCommand().
  */
+/**
+ * Between-turn drain (print.ts drainCommandQueue) must not consume
+ * task-notification — that would start a second ask() after the parent
+ * turn has already finalized. Mid-turn drain in query.ts is the only
+ * CCB consumer.
+ */
+export function isBetweenTurnDrainable(cmd: QueuedCommand): boolean {
+  return cmd.mode !== 'task-notification'
+}
+
+export function taskIdFromQueuedCommand(cmd: QueuedCommand): string {
+  if (typeof cmd.taskId === 'string' && cmd.taskId.trim()) {
+    return cmd.taskId.trim()
+  }
+  if (typeof cmd.value !== 'string') return ''
+  const match =
+    cmd.value.match(/<task-id>([^<]+)<\/task-id>/i) ||
+    cmd.value.match(/<task_id>([^<]+)<\/task_id>/i)
+  return match?.[1]?.trim() || ''
+}
+
+/**
+ * Drop leftover task-notification items at turn end. Do not emit a
+ * delivered ack — the gateway injects when no ack arrives.
+ */
+export function removeUnconsumedTaskNotifications(): QueuedCommand[] {
+  return removeByFilter(cmd => cmd.mode === 'task-notification')
+}
+
 export function isSlashCommand(cmd: QueuedCommand): boolean {
   return (
     typeof cmd.value === 'string' &&

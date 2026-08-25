@@ -49,6 +49,9 @@ import {
   peek,
   subscribeToCommandQueue,
   getCommandsByMaxPriority,
+  isBetweenTurnDrainable,
+  removeUnconsumedTaskNotifications,
+  taskIdFromQueuedCommand,
 } from 'src/utils/messageQueueManager.js'
 import { notifyCommandLifecycle } from 'src/utils/commandLifecycle.js'
 import {
@@ -1995,6 +1998,18 @@ function runHeadlessStreaming(
     // Defined outside the try block so it's accessible in the post-finally
     // queue re-checks at the bottom of run().
     const isMainThread = (cmd: QueuedCommand) => cmd.agentId === undefined
+    const isBetweenTurnMainThread = (cmd: QueuedCommand) =>
+      isMainThread(cmd) && isBetweenTurnDrainable(cmd)
+    const sweepUnconsumedTaskNotifications = (reason: string) => {
+      const swept = removeUnconsumedTaskNotifications()
+      if (swept.length === 0) return
+      const ids = swept
+        .map(cmd => taskIdFromQueuedCommand(cmd) || '?')
+        .join(',')
+      logForDebugging(
+        `[print] dropping unconsumed task-notification(s) at ${reason}: ${ids}`,
+      )
+    }
 
     try {
       let command: QueuedCommand | undefined
@@ -2005,11 +2020,19 @@ function runHeadlessStreaming(
       // ask() call so messages that queued up during a long turn coalesce
       // into a single follow-up turn instead of N separate turns.
       const drainCommandQueue = async () => {
-        while ((command = dequeue(isMainThread))) {
+        while (true) {
+          sweepUnconsumedTaskNotifications('drainCommandQueue')
+          command = dequeue(isBetweenTurnMainThread)
+          if (!command) break
+          if (command.mode === 'task-notification') {
+            logForDebugging(
+              '[print] skipped task-notification in drainCommandQueue',
+            )
+            continue
+          }
           if (
             command.mode !== 'prompt' &&
-            command.mode !== 'orphaned-permission' &&
-            command.mode !== 'task-notification'
+            command.mode !== 'orphaned-permission'
           ) {
             throw new Error(
               'only prompt commands are supported in streaming mode',
@@ -2021,8 +2044,8 @@ function runHeadlessStreaming(
           // Prompt commands greedily collect followers with matching workload.
           let batch: QueuedCommand[] = [command]
           if (command.mode === 'prompt') {
-            while (canBatchWith(command, peek(isMainThread))) {
-              batch.push(dequeue(isMainThread)!)
+            while (canBatchWith(command, peek(isBetweenTurnMainThread))) {
+              batch.push(dequeue(isBetweenTurnMainThread)!)
             }
           }
           const queuedAutonomyClaim =
@@ -2527,7 +2550,7 @@ function runHeadlessStreaming(
           const hasRunningBg = getRunningTasks(state).some(
             t => isBackgroundTask(t) && t.type !== 'in_process_teammate',
           )
-          const hasMainThreadQueued = peek(isMainThread) !== undefined
+          const hasMainThreadQueued = peek(isBetweenTurnMainThread) !== undefined
           if (hasRunningBg || hasMainThreadQueued) {
             waitingForAgents = true
             if (!hasMainThreadQueued) {
@@ -2539,6 +2562,8 @@ function runHeadlessStreaming(
           }
         }
       } while (waitingForAgents)
+
+      sweepUnconsumedTaskNotifications('turn-end')
 
       if (heldBackResult) {
         output.enqueue(heldBackResult)
@@ -2613,7 +2638,7 @@ function runHeadlessStreaming(
       proactiveModule?.isProactiveActive() &&
       !proactiveModule.isProactivePaused()
     ) {
-      if (peek(isMainThread) === undefined && !inputClosed) {
+      if (peek(isBetweenTurnMainThread) === undefined && !inputClosed) {
         scheduleProactiveTick!()
         return
       }
@@ -2624,7 +2649,7 @@ function runHeadlessStreaming(
     // undefined and `running = false` above. In that case the caller
     // saw `running === true` and returned immediately, leaving the
     // message stranded in the queue with no one to process it.
-    if (peek(isMainThread) !== undefined) {
+    if (peek(isBetweenTurnMainThread) !== undefined) {
       void run()
       return
     }

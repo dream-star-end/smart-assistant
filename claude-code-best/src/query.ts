@@ -82,6 +82,7 @@ import {
   isSlashCommand,
   selectMidTurnDrainCommands,
 } from './utils/messageQueueManager.js'
+import { ackMidTurnDeliveredTaskNotifications } from './utils/taskNotificationAck.js'
 import {
   type AutonomyTurnOutcome,
   claimConsumableQueuedAutonomyCommands,
@@ -1968,6 +1969,11 @@ async function* queryLoop(
       }
       removeFromQueue(consumedCommands)
     }
+
+    ackMidTurnDeliveredTaskNotifications([
+      ...claimedConsumedCommands,
+      ...consumedCommands,
+    ])
 
     // Instrumentation: Track file change attachments after they're added
     const fileChangeAttachmentCount = count(

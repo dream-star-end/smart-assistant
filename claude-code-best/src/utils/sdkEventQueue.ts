@@ -59,6 +59,13 @@ type TaskNotificationSdkEvent = {
 // The 'idle' transition fires AFTER heldBackResult flushes and the bg-agent
 // do-while loop exits — so SDK consumers can trust it as the authoritative
 // "turn is over" signal even when result was withheld for background agents.
+type TaskNotificationDeliveredEvent = {
+  type: 'system'
+  subtype: 'task_notification_delivered'
+  task_id: string
+  delivered_by: 'ccb-mid-turn'
+}
+
 type SessionStateChangedEvent = {
   type: 'system'
   subtype: 'session_state_changed'
@@ -90,13 +97,23 @@ export type SdkEvent =
   | TaskStartedEvent
   | TaskProgressEvent
   | TaskNotificationSdkEvent
+  | TaskNotificationDeliveredEvent
   | SessionStateChangedEvent
   | BashOutputTailEvent
 
 const MAX_QUEUE_SIZE = 1000
 const queue: SdkEvent[] = []
 let flushListener: ((events: SdkEvent[]) => void) | null = null
+const EMITTED_TASK_TERMINATED_MAX = 1024
 const emittedTaskTerminatedIds = new Set<string>()
+
+function rememberEmittedTaskTerminated(taskId: string): void {
+  emittedTaskTerminatedIds.add(taskId)
+  if (emittedTaskTerminatedIds.size > EMITTED_TASK_TERMINATED_MAX) {
+    const oldest = emittedTaskTerminatedIds.values().next().value
+    if (oldest !== undefined) emittedTaskTerminatedIds.delete(oldest)
+  }
+}
 
 export function enqueueSdkEvent(event: SdkEvent): void {
   // SDK events are only consumed (drained) in headless/streaming mode.
@@ -183,7 +200,7 @@ export function emitTaskTerminatedSdk(
   // Record before enqueue so print.ts can skip the XML bookend even when
   // TUI mode no-ops enqueueSdkEvent. Paths that both emit here and later
   // dequeue the XML would otherwise double-write stdout.
-  emittedTaskTerminatedIds.add(taskId)
+  rememberEmittedTaskTerminated(taskId)
   enqueueSdkEvent({
     type: 'system',
     subtype: 'task_notification',
@@ -198,6 +215,17 @@ export function emitTaskTerminatedSdk(
 
 export function hasEmittedTaskTerminatedSdk(taskId: string): boolean {
   return emittedTaskTerminatedIds.has(taskId)
+}
+
+export function emitTaskNotificationDeliveredSdk(taskId: string): void {
+  const id = taskId.trim()
+  if (!id) return
+  enqueueSdkEvent({
+    type: 'system',
+    subtype: 'task_notification_delivered',
+    task_id: id,
+    delivered_by: 'ccb-mid-turn',
+  })
 }
 
 export function resetEmittedTaskTerminatedSdkForTests(): void {

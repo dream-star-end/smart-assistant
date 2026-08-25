@@ -501,6 +501,7 @@ describe('enqueueAgentNotification', () => {
     expect(enqueuedCommands).toHaveLength(1)
     expect(enqueuedCommands[0].priority).toBe('next')
     expect(enqueuedCommands[0].mode).toBe('task-notification')
+    expect(enqueuedCommands[0].taskId).toBe('test-agent-001')
   })
 
   test('emits task-terminated SDK bookend exactly once', () => {

@@ -26,6 +26,16 @@ import type {
 import type { ClassifiedErrorCode } from './errorClassify.js'
 import type { SdkMessage } from './subprocessRunner.js'
 
+function taskNotificationDeliveredEvent(raw: Record<string, any>): SessionStreamEvent | null {
+  const taskId = typeof raw.task_id === 'string' ? raw.task_id.trim() : ''
+  if (!taskId) return null
+  return {
+    kind: 'task_notification_delivered',
+    taskId,
+    deliveredBy: 'ccb-mid-turn',
+  }
+}
+
 function taskNotificationEvent(raw: Record<string, any>): SessionStreamEvent | null {
   const taskId = typeof raw.task_id === 'string' ? raw.task_id.trim() : ''
   if (!taskId) return null
@@ -585,6 +595,15 @@ export class CcbMessageParser {
       }
       return
     }
+    if (rawEarly?.type === 'system' && rawEarly?.subtype === 'task_notification_delivered') {
+      try {
+        const event = taskNotificationDeliveredEvent(rawEarly)
+        if (event) this.onEvent(event)
+      } catch (err) {
+        this.onEvent({ kind: 'error', error: String(err) })
+      }
+      return
+    }
     if (this.finalized) {
       // bash_output_tail 是 CCB 的后台 bash keepalive 信号:TaskOutput 1Hz
       // poller 在跨 turn 的整个 bash 生命周期内持续 emit。它不修改 parser
@@ -720,6 +739,8 @@ export class CcbMessageParser {
     //   - `task_notification` — handled at parse() entry (even after
     //     finalize) as an independent `kind:'task_notification'` event,
     //     never a transcript block.
+    //   - `task_notification_delivered` — CCB mid-turn ack; same sideband
+    //     privilege as task_notification so finalize cannot drop it.
     //   - `bash_output_tail` — 1 Hz snapshot tail of long-running Bash output,
     //     routed via OutboundContentBlock 'tool_output_tail' (see protocol).
     //   - `status` — coarse non-streaming turn phase (currently only

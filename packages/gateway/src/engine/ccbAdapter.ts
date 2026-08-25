@@ -511,6 +511,15 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       this._routeTurn?.parser.parse(msg)
       return
     }
+    if (m?.type === 'system' && m?.subtype === 'task_notification_delivered') {
+      const taskId = typeof m.task_id === 'string' ? m.task_id : ''
+      this.emit('task_notification_delivered', {
+        taskId,
+        deliveredBy: 'ccb-mid-turn' as const,
+      })
+      this._routeTurn?.parser.parse(msg)
+      return
+    }
     if (m?.type !== 'system' || m?.subtype !== 'bash_output_tail') {
       // 非 tail:逐字节维持 _routeTurn 路由。
       this._routeTurn?.parser.parse(msg)

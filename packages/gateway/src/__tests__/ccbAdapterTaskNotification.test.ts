@@ -126,3 +126,27 @@ describe('CcbAdapter task_notification routing', () => {
     assert.equal(orphan[0]!.taskId, 'agt-orphan')
   })
 })
+
+
+describe('CcbAdapter task_notification_delivered routing', () => {
+  test('active turn and no-route-turn both emit the ack sideband', () => {
+    const { adapter, runner } = makeAdapter()
+    const events: EngineEvent[] = []
+    const orphan: Array<{ taskId: string }> = []
+    adapter.on('task_notification_delivered', (p) => orphan.push(p))
+    beginTurn(adapter, events)
+    runner.msg({
+      type: 'system',
+      subtype: 'task_notification_delivered',
+      task_id: 'agt-ack',
+      delivered_by: 'ccb-mid-turn',
+    })
+    const notes = events.filter((e) => e.kind === 'task_notification_delivered')
+    assert.equal(notes.length, 1)
+    if (notes[0]!.kind === 'task_notification_delivered') {
+      assert.equal(notes[0].taskId, 'agt-ack')
+    }
+    assert.equal(orphan.length, 1)
+    assert.equal(orphan[0]!.taskId, 'agt-ack')
+  })
+})

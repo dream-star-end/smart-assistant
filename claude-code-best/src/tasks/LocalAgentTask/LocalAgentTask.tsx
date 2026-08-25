@@ -319,6 +319,7 @@ export function enqueueAgentNotification({
     value: message,
     mode: 'task-notification',
     priority: 'next',
+    taskId,
   });
 
   // Immediate stdout bookend for SDK/gateway consumers. Does not wait for

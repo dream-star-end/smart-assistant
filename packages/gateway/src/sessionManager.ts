@@ -1816,6 +1816,10 @@ export class SessionManager {
       toolUseId?: string
     },
   ) => void
+  public onCcbTaskNotificationDelivered?: (
+    session: AgentSession,
+    payload: { taskId: string; deliveredBy: 'ccb-mid-turn' },
+  ) => void
 
   // ── Phase 5: GitHub session repo wiring ──
   /**
@@ -3500,6 +3504,12 @@ export class SessionManager {
       toolUseId?: string
     }) => {
       this.onCcbTaskNotification?.(session, payload)
+    })
+    runner.on('task_notification_delivered', (payload: {
+      taskId: string
+      deliveredBy: 'ccb-mid-turn'
+    }) => {
+      this.onCcbTaskNotificationDelivered?.(session, payload)
     })
     runner.on('session_id', (id: string) => {
       session.ccbSessionId = id

@@ -38,7 +38,9 @@ const {
   remove: removeFromQueue,
   resetCommandQueue,
   selectMidTurnDrainCommands,
+  taskIdFromQueuedCommand,
 } = await import('../messageQueueManager.js')
+const { ackMidTurnDeliveredTaskNotifications } = await import('../taskNotificationAck.js')
 
 beforeEach(() => {
   resetCommandQueue()
@@ -102,5 +104,25 @@ describe('selectMidTurnDrainCommands task-notification insurance', () => {
     expect(
       selectMidTurnDrainCommands({ sleepRan: true, isMainThread: true }),
     ).toHaveLength(1)
+  })
+})
+
+
+describe('mid-turn consume emits delivered ack (blocker 2 counterpart)', () => {
+  test('after select+remove, ack uses the queued taskId', () => {
+    enqueuePendingNotification({
+      value: '<task-notification><task-id>agt-drain-ack</task-id></task-notification>',
+      mode: 'task-notification',
+      taskId: 'agt-drain-ack',
+    } as any)
+    const selected = selectMidTurnDrainCommands({
+      sleepRan: false,
+      isMainThread: true,
+    })
+    expect(selected).toHaveLength(1)
+    expect(taskIdFromQueuedCommand(selected[0]!)).toBe('agt-drain-ack')
+    removeFromQueue(selected)
+    const delivered = ackMidTurnDeliveredTaskNotifications(selected)
+    expect(delivered).toEqual(['agt-drain-ack'])
   })
 })

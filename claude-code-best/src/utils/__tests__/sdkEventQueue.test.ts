@@ -151,3 +151,16 @@ describe("emitTaskTerminatedSdk bookend tracking", () => {
 		expect(hasEmittedTaskTerminatedSdk("agt-bookend")).toBe(false);
 	});
 });
+
+
+describe("emitTaskNotificationDeliveredSdk", () => {
+	test("caps terminated-id memory so the process-level Set cannot grow without bound", () => {
+		resetEmittedTaskTerminatedSdkForTests();
+		for (let i = 0; i < 1100; i++) {
+			emitTaskTerminatedSdk(`agt-cap-${i}`, "completed");
+		}
+		expect(hasEmittedTaskTerminatedSdk("agt-cap-1099")).toBe(true);
+		expect(hasEmittedTaskTerminatedSdk("agt-cap-0")).toBe(false);
+		resetEmittedTaskTerminatedSdkForTests();
+	});
+});

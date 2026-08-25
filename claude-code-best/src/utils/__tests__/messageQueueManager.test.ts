@@ -6,10 +6,14 @@ import {
   dequeueAllMatching,
   enqueue,
   enqueuePendingNotification,
+  getCommandQueue,
   hasCommandsInQueue,
+  isBetweenTurnDrainable,
   isSlashCommand,
   peek,
+  removeUnconsumedTaskNotifications,
   resetCommandQueue,
+  taskIdFromQueuedCommand,
 } from '../messageQueueManager.js'
 
 // Reset module-level queue state between tests
@@ -211,5 +215,28 @@ describe('messageQueueManager priority ordering', () => {
 
     expect(dequeue()!.value).toBe('next')
     expect(dequeue()!.value).toBe('later')
+  })
+})
+
+
+describe('between-turn task-notification exclusion', () => {
+  test('isBetweenTurnDrainable keeps non-TN modes unchanged', () => {
+    expect(isBetweenTurnDrainable({ value: 'hi', mode: 'prompt' } as any)).toBe(true)
+    expect(isBetweenTurnDrainable({ value: 'x', mode: 'orphaned-permission' } as any)).toBe(true)
+    expect(isBetweenTurnDrainable({ value: '<tn/>', mode: 'task-notification' } as any)).toBe(false)
+  })
+
+  test('removeUnconsumedTaskNotifications drops only TN leftovers without touching prompts', () => {
+    enqueue({ value: 'keep-prompt', mode: 'prompt' } as any)
+    enqueuePendingNotification({
+      value: '<task-notification><task-id>agt-left</task-id></task-notification>',
+      mode: 'task-notification',
+      taskId: 'agt-left',
+    } as any)
+    const removed = removeUnconsumedTaskNotifications()
+    expect(removed).toHaveLength(1)
+    expect(taskIdFromQueuedCommand(removed[0]!)).toBe('agt-left')
+    expect(getCommandQueue().some((c: any) => c.value === 'keep-prompt')).toBe(true)
+    expect(getCommandQueue().some((c: any) => c.mode === 'task-notification')).toBe(false)
   })
 })
