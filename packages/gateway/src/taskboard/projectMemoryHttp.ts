@@ -1,7 +1,11 @@
 /**
- * Project memory REST: list / create candidate / promote / reject / deprecate.
+ * Project memory REST: list / create / promote / reject / deprecate.
  * Promote/reject/deprecate require resolveTaskboardActor === 'human'.
  * Agent bearer / CLI accessToken cannot impersonate a browser JWT.
+ *
+ * Create auto-promotes in the ledger, so an agent write is live right away and
+ * promote is only left as an idempotent no-op plus the escape hatch for
+ * candidates that predate auto-promotion. Deprecate stays the user's undo.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
@@ -129,6 +133,8 @@ export async function handleCreateProjectMemory(
     candidate: created.candidate,
     idempotent: created.idempotent ?? false,
     alreadyOfficial: created.alreadyOfficial ?? false,
+    official: created.official ?? null,
+    autoPromoted: created.autoPromoted ?? false,
   })
 }
 

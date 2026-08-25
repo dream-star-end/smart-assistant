@@ -1,5 +1,5 @@
 /**
- * Human-only promote vs agent bearer; project memory isolation.
+ * Auto-promotion on create, human-only promote vs agent bearer, isolation.
  * Run: npx tsx --test packages/gateway/src/taskboard/__tests__/projectMemoryHttp.test.ts
  */
 import * as assert from 'node:assert/strict'
@@ -65,7 +65,7 @@ async function call(base: string, method: string, path: string, body?: unknown, 
 const CONTENT = '---\nname: 约定\ndescription: 表格\ntype: project\n---\n项目约定用表格。\n'
 
 describe('project memory HTTP', () => {
-  it('agent can create candidate but cannot promote; human can promote', async () => {
+  it('agent create is official right away; promote stays a human-only no-op', async () => {
     const db = freshDb()
     const created = db.transaction(() => {
       return null
@@ -83,6 +83,8 @@ describe('project memory HTTP', () => {
           sourceAgent: 'stage-implement',
         })
         assert.equal(cand.status, 201, JSON.stringify(cand.body))
+        assert.equal(cand.body.autoPromoted, true, JSON.stringify(cand.body))
+        assert.equal((cand.body.official as { slug: string }).slug, 'notes.md')
         const candidate = cand.body.candidate as { id: string; version: number }
         const denied = await call(agentBase, 'POST', `/api/board/projects/${projectId}/memories/${candidate.id}/promote`, {
           expectedVersion: candidate.version,
@@ -92,12 +94,18 @@ describe('project memory HTTP', () => {
       })
 
       const listed = await call(base, 'GET', `/api/board/projects/${projectId}/memories`)
-      const candidates = listed.body.candidates as Array<{ id: string; version: number }>
+      // Nobody promoted anything: the agent's write is already injectable.
+      const liveOfficial = listed.body.official as Array<{ slug: string; version: number }>
+      assert.deepEqual(liveOfficial.map((o) => o.slug), ['notes.md'])
+      const candidates = listed.body.candidates as Array<{ id: string; version: number; status: string }>
       assert.equal(candidates.length, 1)
+      assert.equal(candidates[0]?.status, 'promoted')
+      // Old two-stage clients must not get an error for re-promoting.
       const ok = await call(base, 'POST', `/api/board/projects/${projectId}/memories/${candidates[0].id}/promote`, {
         expectedVersion: candidates[0].version,
       })
       assert.equal(ok.status, 200, JSON.stringify(ok.body))
+      assert.equal(ok.body.idempotent, true)
 
       const dir = new ProjectMemoryDir(projectId)
       const officialPath = dir.officialFile('notes.md')
@@ -106,6 +114,30 @@ describe('project memory HTTP', () => {
       const after = await call(base, 'GET', `/api/board/projects/${projectId}/memories?status=official`)
       const official = after.body.official as Array<{ tampered: boolean }>
       assert.equal(official[0]?.tampered, true)
+    })
+    db.close()
+  })
+
+  it('deprecate is still the undo for an auto-promoted memory', async () => {
+    const db = freshDb()
+    await withServer({ db, actor: 'human' }, async (base) => {
+      const proj = await call(base, 'POST', '/api/board/projects', { key: 'UNDO', name: 'undo' })
+      const projectId = (proj.body.project as { id: string }).id
+      const created = await call(base, 'POST', `/api/board/projects/${projectId}/memories`, {
+        slug: 'undo.md',
+        content: CONTENT,
+      })
+      assert.equal(created.status, 201, JSON.stringify(created.body))
+      const official = created.body.official as { slug: string; version: number }
+      const dropped = await call(
+        base,
+        'POST',
+        `/api/board/projects/${projectId}/memories/${official.slug}/deprecate`,
+        { expectedVersion: official.version },
+      )
+      assert.equal(dropped.status, 200, JSON.stringify(dropped.body))
+      const listed = await call(base, 'GET', `/api/board/projects/${projectId}/memories`)
+      assert.equal((listed.body.official as unknown[]).length, 0)
     })
     db.close()
   })

@@ -6,6 +6,12 @@
  * SQLite ledger whose content hash still matches the file. HMAC keys never
  * leave the gateway process — this table lives in taskboard.db, not in the
  * project data directory, and is never passed to model children.
+ *
+ * Candidates are no longer a human approval queue: createCandidate promotes
+ * immediately (actor AUTO_PROMOTE_ACTOR) so a memory reaches injection without
+ * a user round-trip. What the two stages still buy us is the audit trail —
+ * create_candidate and promote stay separate events, the candidate file keeps
+ * the pre-promotion bytes, and deprecate remains the user's undo.
  */
 
 import { randomUUID } from 'node:crypto'
@@ -14,6 +20,9 @@ import { BOARD_PROJECT_ID_RE, incrementProjectContextVersion } from './projectCo
 import { planCandidateFileName, ProjectMemoryDir, sha256Hex } from './projectMemoryDir.js'
 
 export const PROJECT_MEMORY_LEDGER_SCHEMA_VERSION = 1
+
+/** Promote actor written by the automatic path, so audits can tell it from a user. */
+export const AUTO_PROMOTE_ACTOR = 'auto-promote'
 
 export const PROJECT_MEMORY_LEDGER_DDL = `
 CREATE TABLE IF NOT EXISTS tb_project_memory_event (
@@ -142,6 +151,9 @@ export type CreateCandidateResult =
       candidate: ProjectMemoryCandidateRow
       idempotent?: boolean
       alreadyOfficial?: boolean
+      /** Official row the candidate became (null only when auto-promotion was skipped). */
+      official?: ProjectMemoryOfficialRow | null
+      autoPromoted?: boolean
     }
   | { ok: false; error: 'invalid' | 'forbidden' | 'scan_rejected' | 'invalid_id'; detail: string }
 
@@ -284,7 +296,7 @@ export class ProjectMemoryLedger {
             `SELECT * FROM tb_project_memory_candidate WHERE project_id = ? AND slug = ? ORDER BY created_at DESC`,
           )
           .get(projectId, slug) as Record<string, unknown> | undefined
-        if (existing) return { ok: true, candidate: mapCandidate(existing), idempotent: true }
+        if (existing) return await this.settleCreated(projectId, mapCandidate(existing), true)
       }
     }
 
@@ -303,6 +315,8 @@ export class ProjectMemoryLedger {
       return {
         ok: true,
         alreadyOfficial: true,
+        official,
+        autoPromoted: false,
         candidate: {
           id: 'already-official',
           projectId,
@@ -325,7 +339,7 @@ export class ProjectMemoryLedger {
 
     const hashTaken = pending.find((c) => c.contentSha256 === prepared.sha256)
     if (hashTaken) {
-      return { ok: true, candidate: hashTaken, idempotent: true }
+      return await this.settleCreated(projectId, hashTaken, true)
     }
 
     const conflictWithPending = pending.some((c) => c.contentSha256 !== prepared.sha256)
@@ -360,7 +374,7 @@ export class ProjectMemoryLedger {
         const same = await dir.readCandidate(file, prepared.sha256)
         if (same) {
           const listed = pending.find((c) => c.contentSha256 === prepared.sha256)
-          if (listed) return { ok: true, candidate: listed, idempotent: true }
+          if (listed) return await this.settleCreated(projectId, listed, true)
         }
         return { ok: false, error: 'invalid', detail: written.detail }
       }
@@ -402,34 +416,77 @@ export class ProjectMemoryLedger {
           now,
           now,
         )
-      this.db
-        .prepare(
-          `INSERT INTO tb_project_memory_event (
-            id, project_id, slug, action, content_sha256, actor,
-            source_agent, source_session, source_ticket, supersedes, expires,
-            idempotency_key, created_at
-          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        )
-        .run(
-          randomUUID(),
-          projectId,
-          slug,
-          conflict ? 'conflict' : 'create_candidate',
-          written.sha256,
-          input.actor,
-          input.sourceAgent ?? null,
-          input.sourceSession ?? null,
-          input.sourceTicket ?? null,
-          input.supersedes ?? null,
-          expires,
-          input.idempotencyKey ?? null,
-          now,
-        )
+      const insertEvent = (action: LedgerAction, idempotencyKey: string | null) => {
+        this.db
+          .prepare(
+            `INSERT INTO tb_project_memory_event (
+              id, project_id, slug, action, content_sha256, actor,
+              source_agent, source_session, source_ticket, supersedes, expires,
+              idempotency_key, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          )
+          .run(
+            randomUUID(),
+            projectId,
+            slug,
+            action,
+            written.sha256,
+            input.actor,
+            input.sourceAgent ?? null,
+            input.sourceSession ?? null,
+            input.sourceTicket ?? null,
+            input.supersedes ?? null,
+            expires,
+            idempotencyKey,
+            now,
+          )
+      }
+      insertEvent('create_candidate', input.idempotencyKey ?? null)
+      // Colliding content no longer parks the write: the conflict is only worth an
+      // audit row, because auto-promotion below lets the newest content win.
+      if (conflict) insertEvent('conflict', null)
     })
     apply()
     const row = this.getCandidate(projectId, id)
     if (!row) throw new Error('candidate insert vanished')
-    return { ok: true, candidate: row }
+    return await this.settleCreated(projectId, row)
+  }
+
+  /**
+   * Auto-promotion, applied to every candidate the ledger hands back.
+   *
+   * Promotion is the existing CAS path, so same-slug rewrites keep their version
+   * chain and supersedes semantics, and a replay lands on promote's idempotent
+   * branch. The one case we refuse to decide automatically is content the user
+   * deprecated: resurrecting exactly those bytes would make the undo button a
+   * no-op, so the candidate stays pending for a manual call.
+   */
+  private async settleCreated(
+    projectId: string,
+    candidate: ProjectMemoryCandidateRow,
+    idempotent = false,
+  ): Promise<CreateCandidateResult> {
+    let official: ProjectMemoryOfficialRow | null = null
+    if (candidate.status !== 'rejected') {
+      const current = this.getOfficial(projectId, candidate.slug)
+      if (!(current?.deprecated && current.contentSha256 === candidate.contentSha256)) {
+        const promoted = await this.promote({
+          projectId,
+          candidateId: candidate.id,
+          expectedVersion: candidate.version,
+          actor: AUTO_PROMOTE_ACTOR,
+        })
+        if (promoted.ok) official = promoted.official
+      }
+    }
+    const row = this.getCandidate(projectId, candidate.id) ?? candidate
+    return {
+      ok: true,
+      candidate: row,
+      official,
+      autoPromoted: official !== null,
+      ...(idempotent ? { idempotent: true } : {}),
+    }
   }
 
   async promote(opts: {

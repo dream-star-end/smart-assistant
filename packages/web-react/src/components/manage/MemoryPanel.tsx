@@ -71,10 +71,11 @@ export function MemoryPanel({
   agents: { id: string; name: string }[];
 }) {
   const [selected, setSelected] = useState(agentId);
-  const [tab, setTab] = useState<"all" | "core" | "official" | "candidates" | "profile" | "usage">("core");
+  const [tab, setTab] = useState<"all" | "core" | "project" | "profile" | "usage">("core");
   // 选中项必须在可选列表内（agent 刚被卸载时回落到列表首项/传入项）。
   const effective = agents.some((a) => a.id === selected) ? selected : agentId;
-  const showPicker = agents.length > 1 && tab !== "profile" && tab !== "official" && tab !== "candidates";
+  // 项目记忆与用户画像都不按智能体分,切换器在这两段里没有作用域可控。
+  const showPicker = agents.length > 1 && tab !== "profile" && tab !== "project";
 
   return (
     <div className="flex flex-col">
@@ -105,20 +106,17 @@ export function MemoryPanel({
                 ? "profile"
                 : v === "usage"
                   ? "usage"
-                  : v === "official"
-                    ? "official"
-                    : v === "candidates"
-                      ? "candidates"
-                      : v === "all"
-                        ? "all"
-                        : "core",
+                  : v === "project"
+                    ? "project"
+                    : v === "all"
+                      ? "all"
+                      : "core",
             )
           }
           items={[
             { value: "all", label: "全部" },
             { value: "core", label: "Agent Core" },
-            { value: "official", label: "项目正式" },
-            { value: "candidates", label: "项目候选" },
+            { value: "project", label: "项目记忆" },
             { value: "profile", label: "用户画像" },
             { value: "usage", label: "使用情况" },
           ]}
@@ -135,12 +133,10 @@ export function MemoryPanel({
         ) : tab === "all" ? (
           <>
             <CoreMemorySection key={`all-core:${effective}`} auth={auth} agentId={effective} />
-            <ProjectMemorySection key="all-project" auth={auth} view="both" />
+            <ProjectMemorySection key="all-project" auth={auth} />
           </>
-        ) : tab === "official" ? (
-          <ProjectMemorySection key="project-official" auth={auth} view="official" />
-        ) : tab === "candidates" ? (
-          <ProjectMemorySection key="project-candidates" auth={auth} view="candidates" />
+        ) : tab === "project" ? (
+          <ProjectMemorySection key="project" auth={auth} />
         ) : tab === "profile" ? (
           // 画像共享,用初始 agentId(稳定)做路由参数,与切换器无关。
           <UserProfileSection key="shared:user" auth={auth} agentId={agentId} />
@@ -169,21 +165,23 @@ const OPERATION_LABELS: Record<string, string> = {
   auto_refuse: "自动记忆拒绝",
 };
 
-function ProjectMemorySection({
-  auth,
-  view = "both",
-}: {
-  auth: AuthSession;
-  view?: "official" | "candidates" | "both";
-}) {
+/**
+ * 项目记忆。智能体写入即生效（台账在创建时自动晋升），所以这里只有一份"生效中"列表 +
+ * 废弃出口,没有审核队列。`leftover` 是自动晋升上线**之前**留下的待确认候选:它们不再有
+ * 独立入口,只能在这里被消化掉,消化完这一段就永久消失。
+ */
+function ProjectMemorySection({ auth }: { auth: AuthSession }) {
   const toast = useToast();
   const { scope } = useProjectScope();
   const projectId = scope.workProject?.id ?? "";
   const [official, setOfficial] = useState<ProjectMemoryItem[]>([]);
-  const [candidates, setCandidates] = useState<ProjectMemoryItem[]>([]);
+  const [leftover, setLeftover] = useState<ProjectMemoryItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [confirm, confirmEl] = useConfirm();
 
   useEffect(() => {
+    void reloadKey;
     if (!projectId) {
       setLoading(false);
       return;
@@ -195,7 +193,9 @@ function ProjectMemorySection({
       .then((res) => {
         if (cancelled) return;
         setOfficial(res.official);
-        setCandidates(res.candidates);
+        setLeftover(
+          res.candidates.filter((c) => c.status === "pending" || c.status === "conflict"),
+        );
       })
       .catch((e) => {
         if (!cancelled) toast(apiErrorMessage(e, "加载项目记忆失败"), "error");
@@ -206,88 +206,124 @@ function ProjectMemorySection({
     return () => {
       cancelled = true;
     };
-  }, [auth, projectId, toast]);
+  }, [auth, projectId, toast, reloadKey]);
+
+  const reload = useCallback(() => setReloadKey((k) => k + 1), []);
+
+  const discard = useCallback(
+    async (item: ProjectMemoryItem) => {
+      const ok = await confirm({
+        title: `废弃「${memoryTitle(item.slug)}」？`,
+        body: "废弃后这条记忆不再注入该项目的会话。智能体之后仍可能重新整理出新的版本。",
+        danger: true,
+        confirmText: "确认废弃",
+      });
+      if (!ok) return;
+      try {
+        await taskboardApi.deprecateProjectMemory(auth, projectId, item.slug, item.version);
+        toast("已废弃", "success");
+        reload();
+      } catch (e) {
+        toast(apiErrorMessage(e, "废弃失败"), "error");
+      }
+    },
+    [auth, projectId, confirm, toast, reload],
+  );
 
   if (!isWorkScope(scope) || !projectId) {
     return (
       <div className="px-4 py-3 text-caption text-muted" data-testid="project-memory-panel">
-        选择工作项目后显示项目正式记忆与候选。复用看板 ProjectContext memory API。
+        选择工作项目后，这里显示该项目的记忆。
       </div>
     );
   }
 
-  const showCand = view === "both" || view === "candidates";
-  const showOff = view === "both" || view === "official";
-
   return (
     <div className="flex flex-col gap-3 px-4 py-3" data-testid="project-memory-panel">
+      <p className="text-caption text-muted">
+        智能体自动整理，注入该项目的所有会话，可随时废弃。
+      </p>
       {loading ? (
         <ListSkeleton rows={3} />
       ) : (
         <>
-          {showCand ? <h3 className="text-section font-semibold">待审核候选</h3> : null}
-          {showCand && candidates.length === 0 ? (
-            <EmptyState icon={Brain} title="没有候选" hint="绑定项目的 Auto-Dream 只会写入候选。" />
-          ) : showCand ? (
-            candidates.map((c) => (
-              <div key={c.id ?? c.file} className="rounded-lg border border-border p-3">
-                <div className="text-body font-medium">{c.slug}</div>
-                <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-caption text-muted">
-                  {(c.content ?? "").slice(0, 1200)}
-                </pre>
-                <div className="mt-2 flex gap-2">
-                  <Button
-                    size="sm"
-                    onClick={() => {
-                      void taskboardApi
-                        .promoteProjectMemory(auth, projectId, c.id ?? "", c.version)
-                        .then(() => setOfficial((x) => x))
-                        .then(() =>
-                          taskboardApi.listProjectMemories(auth, projectId).then((res) => {
-                            setOfficial(res.official);
-                            setCandidates(res.candidates);
-                          }),
-                        )
-                        .catch((e) => toast(apiErrorMessage(e, "采纳失败"), "error"));
-                    }}
-                  >
-                    采纳
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    onClick={() => {
-                      void taskboardApi
-                        .rejectProjectMemory(auth, projectId, c.id ?? "", c.version)
-                        .then(() =>
-                          taskboardApi.listProjectMemories(auth, projectId).then((res) => {
-                            setOfficial(res.official);
-                            setCandidates(res.candidates);
-                          }),
-                        )
-                        .catch((e) => toast(apiErrorMessage(e, "丢弃失败"), "error"));
-                    }}
-                  >
-                    丢弃
-                  </Button>
+          {official.length === 0 ? (
+            <EmptyState
+              icon={Brain}
+              title="还没有项目记忆"
+              hint="智能体会把值得长期保留的项目信息整理进来，之后在这里可以看到并管理。"
+            />
+          ) : (
+            official.map((o) => (
+              <div
+                key={o.slug}
+                className="flex items-center justify-between gap-2 rounded-lg border border-border px-3 py-2"
+              >
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <span className="min-w-0 truncate text-body text-fg">{memoryTitle(o.slug)}</span>
+                  {o.tampered && (
+                    <Badge tone="warning" size="sm">
+                      文件被改动，未注入
+                    </Badge>
+                  )}
                 </div>
+                <Button size="sm" variant="secondary" onClick={() => void discard(o)}>
+                  废弃
+                </Button>
               </div>
             ))
-          ) : null}
-          {showOff ? <h3 className="text-section font-semibold">正式 / 废弃</h3> : null}
-          {showOff
-            ? official.map((o) => (
-                <div key={o.slug} className="text-body">
-                  {o.slug}
-                  {o.deprecated ? "（已废弃）" : ""}
-                  {o.tampered ? "（被篡改，未注入）" : ""}
+          )}
+          {leftover.length > 0 && (
+            <>
+              <h3 className="mt-1 text-section font-semibold">早前留下的待确认条目</h3>
+              <p className="text-caption text-muted">
+                这些是改为自动生效之前写下的，还没有生效。留下或忽略它们之后这一段就会消失。
+              </p>
+              {leftover.map((c) => (
+                <div key={c.id ?? c.file} className="rounded-lg border border-border p-3">
+                  <div className="text-body font-medium">{memoryTitle(c.slug)}</div>
+                  <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-caption text-muted">
+                    {(c.content ?? "").slice(0, 1200)}
+                  </pre>
+                  <div className="mt-2 flex gap-2">
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        void taskboardApi
+                          .promoteProjectMemory(auth, projectId, c.id ?? "", c.version)
+                          .then(() => reload())
+                          .catch((e) => toast(apiErrorMessage(e, "采纳失败"), "error"));
+                      }}
+                    >
+                      采纳
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => {
+                        void taskboardApi
+                          .rejectProjectMemory(auth, projectId, c.id ?? "", c.version)
+                          .then(() => reload())
+                          .catch((e) => toast(apiErrorMessage(e, "忽略失败"), "error"));
+                      }}
+                    >
+                      忽略
+                    </Button>
+                  </div>
                 </div>
-              ))
-            : null}
+              ))}
+            </>
+          )}
         </>
       )}
+      {confirmEl}
     </div>
   );
+}
+
+/** 存储标识（`notes.md`）→ 面向用户的标题。文件后缀对用户没有含义。 */
+function memoryTitle(slug: string): string {
+  return slug.replace(/\.md$/i, "");
 }
 
 function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: string }) {

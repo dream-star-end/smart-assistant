@@ -1,5 +1,6 @@
 /**
  * Project memory files are carriers; injection requires matching ledger hash.
+ * Candidate creation auto-promotes, so most cases here assert the one-step path.
  * Run: npx tsx --test packages/storage/src/__tests__/projectMemoryDir.test.ts
  */
 import * as assert from 'node:assert/strict'
@@ -13,8 +14,12 @@ const testHome = await mkdtemp(join(tmpdir(), 'oc-pmem-'))
 process.env.OPENCLAUDE_HOME = testHome
 
 const { ProjectMemoryDir, sha256Hex } = await import('../projectMemoryDir.js')
-const { ProjectMemoryLedger, ensureProjectMemoryLedger, officialManifestSha256 } =
-  await import('../projectMemoryLedger.js')
+const {
+  AUTO_PROMOTE_ACTOR,
+  ProjectMemoryLedger,
+  ensureProjectMemoryLedger,
+  officialManifestSha256,
+} = await import('../projectMemoryLedger.js')
 
 const ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 
@@ -59,7 +64,7 @@ describe('ProjectMemoryDir tamper gate', () => {
 })
 
 describe('candidate hash filenames (B5)', () => {
-  it('v1→v2→v3 conflict keeps every prior candidate readable', async () => {
+  it('v1→v2→v3 rewrite keeps every prior candidate readable', async () => {
     const db = new Database(':memory:')
     ensureProjectMemoryLedger(db)
     const ledger = new ProjectMemoryLedger(db)
@@ -95,6 +100,9 @@ describe('candidate hash filenames (B5)', () => {
     const r2 = await dir.readCandidate(v2.candidate.file, v2.candidate.contentSha256)
     const r3 = await dir.readCandidate(v3.candidate.file, v3.candidate.contentSha256)
     assert.ok(r1 && r2 && r3)
+    // Auto-promotion makes v3 the live content, so re-proposing v2 is a rewrite
+    // back to those bytes (last writer wins), not a deduplicated replay.
+    assert.equal(ledger.getOfficial(pid, 'notes.md')?.contentSha256, v3.candidate.contentSha256)
     const again = await ledger.createCandidate({
       projectId: pid,
       slug: 'notes.md',
@@ -103,14 +111,74 @@ describe('candidate hash filenames (B5)', () => {
     })
     assert.equal(again.ok, true)
     if (again.ok) {
-      assert.equal(again.idempotent, true)
-      assert.equal(again.candidate.file, v2.candidate.file)
+      assert.equal(again.autoPromoted, true)
+      assert.equal(again.official?.contentSha256, v2.candidate.contentSha256)
     }
+  })
+
+  it('replaying one idempotency key writes a single candidate', async () => {
+    const db = new Database(':memory:')
+    ensureProjectMemoryLedger(db)
+    const ledger = new ProjectMemoryLedger(db)
+    const pid = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+    const input = {
+      projectId: pid,
+      slug: 'notes.md',
+      content: memoryBody('约定', 'once'),
+      actor: 'agent:a',
+      idempotencyKey: 'autodream:attempt-1:notes.md',
+    }
+    const first = await ledger.createCandidate(input)
+    const replay = await ledger.createCandidate(input)
+    assert.equal(first.ok && replay.ok, true)
+    if (!first.ok || !replay.ok) return
+    assert.equal(replay.candidate.id, first.candidate.id)
+    assert.equal(ledger.listCandidates(pid).length, 1)
+    assert.equal(replay.official?.contentSha256, first.official?.contentSha256)
   })
 })
 
 describe('ProjectMemoryLedger', () => {
-  it('candidates never overwrite official; conflict keeps both; promote is CAS', async () => {
+  it('creating a candidate promotes it in one step and audits both events', async () => {
+    const db = new Database(':memory:')
+    ensureProjectMemoryLedger(db)
+    const ledger = new ProjectMemoryLedger(db)
+    const created = await ledger.createCandidate({
+      projectId: ID,
+      slug: 'auto.md',
+      content: memoryBody('自动', 'no human hop'),
+      actor: 'agent:stage-implement',
+      sourceAgent: 'stage-implement',
+      sourceSession: 'sess-auto',
+    })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+    assert.equal(created.autoPromoted, true)
+    assert.equal(created.candidate.status, 'promoted')
+
+    // No promote() call anywhere above: the memory is already injectable.
+    const official = ledger.listOfficial(ID)
+    assert.deepEqual(
+      official.map((r) => r.slug),
+      ['auto.md'],
+    )
+    assert.equal(official[0]?.contentSha256, created.candidate.contentSha256)
+    assert.equal(official[0]?.version, 1)
+
+    const events = db
+      .prepare(
+        `SELECT action, actor FROM tb_project_memory_event WHERE project_id = ? AND slug = ?`,
+      )
+      .all(ID, 'auto.md') as Array<{ action: string; actor: string }>
+    assert.deepEqual(
+      events.map((e) => e.action).sort(),
+      ['create_candidate', 'promote'],
+    )
+    assert.equal(events.find((e) => e.action === 'create_candidate')?.actor, 'agent:stage-implement')
+    assert.equal(events.find((e) => e.action === 'promote')?.actor, AUTO_PROMOTE_ACTOR)
+  })
+
+  it('same-slug rewrite wins and leaves a conflict trail; promote stays idempotent', async () => {
     const db = new Database(':memory:')
     ensureProjectMemoryLedger(db)
     const ledger = new ProjectMemoryLedger(db)
@@ -124,23 +192,22 @@ describe('ProjectMemoryLedger', () => {
     })
     assert.equal(a.ok, true)
     if (!a.ok) return
-    const promoted = await ledger.promote({
-      projectId: ID,
-      candidateId: a.candidate.id,
-      expectedVersion: a.candidate.version,
-      actor: 'user:default',
-    })
-    assert.equal(promoted.ok, true)
-    if (!promoted.ok) return
+    assert.equal(a.official?.version, 1)
 
-    const stale = await ledger.promote({
-      projectId: ID,
-      candidateId: a.candidate.id,
-      expectedVersion: 0,
-      actor: 'user:default',
-    })
-    assert.equal(stale.ok, true, JSON.stringify(stale))
-    if (stale.ok) assert.equal(stale.idempotent, true)
+    // The old two-stage clients keep working: promote on a live candidate is a no-op.
+    for (const expectedVersion of [a.candidate.version, 0]) {
+      const again = await ledger.promote({
+        projectId: ID,
+        candidateId: a.candidate.id,
+        expectedVersion,
+        actor: 'user:default',
+      })
+      assert.equal(again.ok, true, JSON.stringify(again))
+      if (again.ok) {
+        assert.equal(again.idempotent, true)
+        assert.equal(again.official.contentSha256, a.candidate.contentSha256)
+      }
+    }
 
     const b = await ledger.createCandidate({
       projectId: ID,
@@ -151,21 +218,79 @@ describe('ProjectMemoryLedger', () => {
     })
     assert.equal(b.ok, true)
     if (!b.ok) return
-    assert.equal(b.candidate.status, 'conflict')
-    assert.notEqual(b.candidate.contentSha256, promoted.official.contentSha256)
-    const still = ledger.getOfficial(ID, 'notes.md')
-    assert.ok(still)
-    assert.equal(still?.contentSha256, promoted.official.contentSha256)
+    assert.equal(b.candidate.status, 'promoted')
+    assert.notEqual(b.candidate.contentSha256, a.candidate.contentSha256)
+    // Last writer wins, version chain continues, and the collision is still audited.
+    const live = ledger.getOfficial(ID, 'notes.md')
+    assert.equal(live?.contentSha256, b.candidate.contentSha256)
+    assert.equal(live?.version, 2)
+    const conflicts = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM tb_project_memory_event
+         WHERE project_id = ? AND slug = ? AND action = 'conflict'`,
+      )
+      .get(ID, 'notes.md') as { n: number }
+    assert.equal(conflicts.n, 1)
 
     const idem = await ledger.createCandidate({
       projectId: ID,
       slug: 'notes.md',
-      content: memoryBody('约定', 'v1'),
-      actor: 'agent:stage-implement',
+      content: memoryBody('约定', 'v2 different'),
+      actor: 'agent:stage-design',
       idempotencyKey: 'auto:1:notes.md',
     })
     assert.equal(idem.ok, true)
-    if (idem.ok) assert.equal(idem.alreadyOfficial || idem.idempotent, true)
+    if (idem.ok) {
+      assert.equal(idem.alreadyOfficial, true)
+      assert.equal(ledger.getOfficial(ID, 'notes.md')?.version, 2)
+    }
+  })
+
+  it('does not resurrect content the user deprecated', async () => {
+    const db = new Database(':memory:')
+    ensureProjectMemoryLedger(db)
+    const ledger = new ProjectMemoryLedger(db)
+    const pid = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+    const body = memoryBody('撤销过的', 'stale fact')
+    const first = await ledger.createCandidate({
+      projectId: pid,
+      slug: 'revoked.md',
+      content: body,
+      actor: 'agent:main',
+    })
+    assert.equal(first.ok, true)
+    if (!first.ok || !first.official) return
+    const dropped = ledger.deprecate({
+      projectId: pid,
+      slug: 'revoked.md',
+      expectedVersion: first.official.version,
+      actor: 'user:default',
+    })
+    assert.equal(dropped.ok, true)
+
+    const retry = await ledger.createCandidate({
+      projectId: pid,
+      slug: 'revoked.md',
+      content: body,
+      actor: 'agent:main',
+    })
+    assert.equal(retry.ok, true)
+    if (!retry.ok) return
+    assert.equal(retry.autoPromoted, false)
+    assert.equal(retry.candidate.status, 'pending')
+    assert.equal(ledger.getOfficial(pid, 'revoked.md')?.deprecated, true)
+    assert.equal(ledger.listOfficial(pid).length, 0)
+
+    // Genuinely new content for the same slug is still allowed to take over.
+    const revised = await ledger.createCandidate({
+      projectId: pid,
+      slug: 'revoked.md',
+      content: memoryBody('撤销过的', 'fresh fact'),
+      actor: 'agent:main',
+    })
+    assert.equal(revised.ok, true)
+    if (revised.ok) assert.equal(revised.autoPromoted, true)
+    assert.equal(ledger.listOfficial(pid).length, 1)
   })
 
   it('expired and deprecated official rows are not injectable', async () => {

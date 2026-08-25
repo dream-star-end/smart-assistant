@@ -829,7 +829,7 @@ describe('AutoDreamService cadence', () => {
     }
   })
 
-  it('bound project run writes candidates instead of agent Core', async () => {
+  it('bound project run writes project memory instead of agent Core', async () => {
     process.env.OC_PROJECT_CONTEXT = '1'
     const agentId = 'stage-implement'
     const now = Date.UTC(2026, 6, 14, 20, 0, 0)
@@ -886,7 +886,12 @@ describe('AutoDreamService cadence', () => {
       const cands = ledger.listCandidates(project.id)
       assert.equal(cands.length, 1)
       assert.equal(cands[0]?.slug, 'board-note.md')
-      assert.ok(cands[0]?.status === 'pending' || cands[0]?.status === 'conflict')
+      // Auto-promotion: the project write is injectable without a human step.
+      assert.equal(cands[0]?.status, 'promoted')
+      assert.deepEqual(
+        ledger.listOfficial(project.id).map((r) => r.slug),
+        ['board-note.md'],
+      )
     } finally {
       MemoryDir.prototype.applyAutoAdds = originalApply
       db.close()
