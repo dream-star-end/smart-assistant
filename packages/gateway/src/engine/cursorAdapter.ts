@@ -663,6 +663,7 @@ interface TurnCtx {
   stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; resolveDrain: (() => void) | null; interrupted: boolean; error: string | null; usage?: ReportedUsage
   assistantPartialText: string; pendingAssistantText: string | null
   assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
+  lastContentKind: 'text' | 'thinking' | null
   contextDir: string | null
   rawToSafeToolId: Map<string, string>; safeToRawToolId: Map<string, string>; fallbackToolSequence: number
   sessionIdEmitted: boolean
@@ -674,6 +675,29 @@ function textOf(value: unknown): string {
   if (value == null) return ''
   try { return JSON.stringify(value) } catch { return String(value) }
 }
+/** UTF-8 byte arrays from serde of `Vec<u8>`. Anything else → null (never stringify). */
+const MAX_SHELL_BYTE_DECODE = 2 * 1024 * 1024
+function decodeUtf8Bytes(value: unknown): string | null {
+  if (value instanceof Uint8Array) {
+    if (value.length > MAX_SHELL_BYTE_DECODE) return null
+    return Buffer.from(value).toString('utf8')
+  }
+  if (!Array.isArray(value)) return null
+  if (value.length === 0) return ''
+  if (value.length > MAX_SHELL_BYTE_DECODE) return null
+  const bytes = new Uint8Array(value.length)
+  for (let i = 0; i < value.length; i += 1) {
+    const n = value[i]
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 0 || n > 255) return null
+    bytes[i] = n
+  }
+  return Buffer.from(bytes).toString('utf8')
+}
+function shellFieldText(value: unknown): string {
+  if (typeof value === 'string') return value
+  const decoded = decodeUtf8Bytes(value)
+  return decoded ?? ''
+}
 function promptOf(input: TurnParams['input']): string {
   // P0-2:base64 二进制 block 绝不 stringify 进纯文本 prompt,占位替换。
   return typeof input === 'string' ? input : input.map((v) => v.type === 'text' ? textOf(v.text) : isBinaryInputBlock(v) ? BINARY_BLOCK_OMITTED_NOTICE : textOf(v)).filter(Boolean).join('\n')
@@ -684,17 +708,52 @@ function nonnegative(value: unknown): number | undefined {
 function recordOf(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
-function assistantTextOf(event: CursorEvent): string {
-  if (typeof event.text === 'string') return event.text
-  if (typeof event.content === 'string') return event.content
-  if (typeof event.delta === 'string') return event.delta
-  if (typeof event.message === 'string') return event.message
+function isStructuredThinkingBlock(item: Record<string, unknown>): boolean {
+  const type = textOf(item.type ?? item.kind).toLowerCase()
+  if (type === 'thinking' || type === 'thought') return true
+  // A dedicated string `thinking` field is an explicit structural marker.
+  // Never classify by looking at the text content itself.
+  return typeof item.thinking === 'string'
+}
+function structuredThinkingTextOf(item: Record<string, unknown>): string {
+  if (typeof item.thinking === 'string' && item.thinking) return item.thinking
+  if (typeof item.text === 'string' && item.text) return item.text
+  if (typeof item.content === 'string' && item.content) return item.content
+  return ''
+}
+function assistantContentBlocksOf(event: CursorEvent): Array<{ kind: 'text' | 'thinking'; text: string }> {
   const message = recordOf(event.message)
-  if (!message || !Array.isArray(message.content)) return ''
-  return message.content.map((block) => {
-    const item = recordOf(block)
-    return item?.type === 'text' && typeof item.text === 'string' ? item.text : ''
-  }).join('')
+  const content = Array.isArray(message?.content)
+    ? message.content
+    : Array.isArray(event.content) ? event.content : null
+  if (content) {
+    const blocks: Array<{ kind: 'text' | 'thinking'; text: string }> = []
+    for (const block of content) {
+      const item = recordOf(block)
+      if (!item) continue
+      if (isStructuredThinkingBlock(item)) {
+        const text = structuredThinkingTextOf(item)
+        if (text) blocks.push({ kind: 'thinking', text })
+        continue
+      }
+      if (textOf(item.type).toLowerCase() === 'text' && typeof item.text === 'string' && item.text) {
+        blocks.push({ kind: 'text', text: item.text })
+      }
+    }
+    return blocks
+  }
+  const text = typeof event.text === 'string' ? event.text
+    : typeof event.content === 'string' ? event.content
+    : typeof event.delta === 'string' ? event.delta
+    : typeof event.message === 'string' ? event.message
+    : ''
+  return text ? [{ kind: 'text', text }] : []
+}
+function assistantTextOf(event: CursorEvent): string {
+  return assistantContentBlocksOf(event)
+    .filter((block) => block.kind === 'text')
+    .map((block) => block.text)
+    .join('')
 }
 function usageOf(event: CursorEvent): ReportedUsage | undefined {
   const raw = recordOf(event.usage)
@@ -1092,6 +1151,19 @@ function questionSkippedByRuntime(event: CursorEvent): boolean {
   const serialized = JSON.stringify([toolResultValueOf(event), event.output, event.rawOutput])
   return serialized.includes('Questions skipped by the user')
 }
+function shellIoOf(event: CursorEvent): { stdout: string; stderr: string; exitCode?: number } {
+  const call = toolCallOf(event)
+  const variant = toolVariantOf(event)
+  const rawResult = toolResultValueOf(event)
+  const result = recordOf(rawResult)
+  const success = recordOf(result?.success) ?? result
+  const source = success ?? variant?.value ?? call ?? {}
+  const stdout = shellFieldText(source.stdout ?? variant?.value.stdout ?? call?.stdout)
+  const stderr = shellFieldText(source.stderr ?? variant?.value.stderr ?? call?.stderr)
+  const exitRaw = source.exitCode ?? source.exit_code
+  const exitCode = typeof exitRaw === 'number' && Number.isFinite(exitRaw) ? exitRaw : undefined
+  return { stdout, stderr, ...(exitCode !== undefined ? { exitCode } : {}) }
+}
 function toolFailed(event: CursorEvent): boolean {
   if (questionSkippedByRuntime(event)) return false
   const call = toolCallOf(event)
@@ -1106,11 +1178,18 @@ function toolFailed(event: CursorEvent): boolean {
     result?.case,
     result?.status,
   ].map((value) => textOf(value).toLowerCase())
-  return event.is_error === true ||
+  if (
+    event.is_error === true ||
     failureValueOf(resultValue) !== undefined ||
     failureValueOf(variant?.value.result) !== undefined ||
     failureValueOf(call?.result) !== undefined ||
     statuses.some((status) => ['error', 'failed', 'failure', 'rejected'].includes(status))
+  ) return true
+  if (cursorToolKindOf(event) === 'shellToolCall') {
+    const exitCode = shellIoOf(event).exitCode
+    if (typeof exitCode === 'number' && exitCode !== 0) return true
+  }
+  return false
 }
 function toolOutputOf(event: CursorEvent): { output: string; outputJson: unknown } {
   const call = toolCallOf(event)
@@ -1127,11 +1206,14 @@ function toolOutputOf(event: CursorEvent): { output: string; outputJson: unknown
   const source = success ?? variant?.value ?? call ?? {}
   const kind = cursorToolKindOf(event)
   if (kind === 'shellToolCall') {
-    const stdout = textOf(source.stdout ?? variant?.value.stdout ?? call?.stdout)
-    const stderr = textOf(source.stderr ?? variant?.value.stderr ?? call?.stderr)
+    const { stdout, stderr, exitCode } = shellIoOf(event)
     const output = [stdout, stderr].filter(Boolean).join(stdout && stderr ? '\n' : '')
-    const outputJson = { ...(stdout ? { stdout } : {}), ...(stderr ? { stderr } : {}) }
-    return { output: output || textOf(rawResult), outputJson }
+    const outputJson = {
+      ...(stdout ? { stdout } : {}),
+      ...(stderr ? { stderr } : {}),
+      ...(exitCode !== undefined ? { exitCode } : {}),
+    }
+    return { output, outputJson }
   }
   if (kind === 'readToolCall') {
     const content = source.content ?? variant?.value.content ?? call?.content ?? rawResult
@@ -1386,7 +1468,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.stopPendingKeepalive()
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { ctx.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => {
       // Only ever settle this turn's own barrier: shutdown() may have already
@@ -1657,6 +1739,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   }
   private emitText(ctx: TurnCtx, kind: 'text' | 'thinking', value: unknown, separate = false): void {
     const valueText = textOf(value); if (!valueText) return
+    if (ctx.lastContentKind !== kind) {
+      if (ctx.lastContentKind === 'text') ctx.assistantSegmentClosed = ctx.assistantSegments.length > 0
+      else if (ctx.lastContentKind === 'thinking') ctx.thinkingSegmentClosed = ctx.thinkingSegments.length > 0
+      ctx.lastContentKind = kind
+    }
     const segments = kind === 'text' ? ctx.assistantSegments : ctx.thinkingSegments
     const segmentClosed = kind === 'text' ? ctx.assistantSegmentClosed : ctx.thinkingSegmentClosed
     if (!segments.at(-1) || segmentClosed) {
@@ -1691,6 +1778,17 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       || (type === 'interaction_query' && textOf(event.subtype).toLowerCase() === 'request')
     this.flushPendingAssistant(ctx, aggregateBoundary)
     if (type === 'assistant') {
+      const blocks = assistantContentBlocksOf(event)
+      const hasStructuredThinking = blocks.some((block) => block.kind === 'thinking')
+      if (hasStructuredThinking) {
+        for (const block of blocks) {
+          if (block.kind === 'text' && block.text === ctx.assistantPartialText && ctx.assistantPartialText) continue
+          this.emitText(ctx, block.kind, block.text, block.kind === 'text')
+        }
+        ctx.assistantPartialText = ''
+        ctx.pendingAssistantText = null
+        return
+      }
       const value = assistantTextOf(event); if (!value) return
       const officialNested = recordOf(event.message) !== null
       const partialDelta = officialNested && typeof event.timestamp_ms === 'number' && event.model_call_id === undefined
@@ -1750,6 +1848,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     ctx.pendingAssistantText = null
     ctx.assistantSegmentClosed = ctx.assistantSegments.length > 0
     ctx.thinkingSegmentClosed = ctx.thinkingSegments.length > 0
+    ctx.lastContentKind = null
   }
   private toolStart(ctx: TurnCtx, event: CursorEvent, rawIdOverride?: string): void {
     const rawId = rawIdOverride ?? (rawToolIdOf(event) || this.nextFallbackToolId(ctx))
@@ -1758,6 +1857,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.tools.has(id)) return
     this.flushPendingAssistant(ctx, false)
     this.closeContentSegments(ctx)
+    ctx.lastContentKind = null
     const tool: TurnToolEntry = { toolUseId: id, blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: textOf(input).slice(0, 500), output: '', completed: false, isError: false, durationMs: 0, ts: Date.now(), arrivedAt: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() }
     ctx.tools.set(id, tool); ctx.pending.add(id); ctx.startedTools.set(id, keepaliveNow()); ctx.params.toolUseIdToName.set(id, name)
     const block: OutboundContentBlock = { kind: 'tool_use', blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: tool.inputPreview, partial: false }
@@ -2119,6 +2219,7 @@ export const _internals = {
   toolNameOf,
   toolInputOf,
   toolFailed,
+  toolOutputOf,
   questionSkippedByRuntime,
   parsePendingKeepaliveIntervalMs,
   parsePendingKeepaliveMaxMs,

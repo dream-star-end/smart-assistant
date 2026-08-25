@@ -847,6 +847,253 @@ for(const e of [
     }
   })
 
+  test('shell output strips the success envelope instead of dumping it as JSON', () => {
+    const envelopeOnly = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-empty-shell',
+        shellToolCall: {
+          args: { command: 'true' },
+          result: { success: { extraField: 'nope' }, isBackground: false },
+        },
+      },
+    }
+    const empty = _internals.toolOutputOf(envelopeOnly as never)
+    assert.equal(empty.output, '')
+    assert.equal(empty.output.includes('isBackground'), false)
+    assert.equal(empty.output.includes('extraField'), false)
+    assert.deepEqual(empty.outputJson, {})
+    assert.equal(JSON.stringify(empty.outputJson).includes('isBackground'), false)
+    assert.equal(JSON.stringify(empty).includes('"success"'), false)
+
+    const bytes = [...Buffer.from('hello from bytes', 'utf8')]
+    const withBytes = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-bytes-shell',
+        shellToolCall: {
+          args: { command: 'echo' },
+          result: { success: { stdout: bytes, stderr: [], exitCode: 0 }, isBackground: false },
+        },
+      },
+    }
+    const decoded = _internals.toolOutputOf(withBytes as never)
+    assert.equal(decoded.output, 'hello from bytes')
+    assert.deepEqual(decoded.outputJson, { stdout: 'hello from bytes', exitCode: 0 })
+  })
+
+  test('shell success envelope with nonzero exitCode is a tool failure', () => {
+    const failed = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-exit-1',
+        shellToolCall: {
+          args: { command: 'oc-memory delegate --help' },
+          result: { success: { stdout: 'usage', stderr: '', exitCode: 1 }, isBackground: false },
+        },
+      },
+    }
+    assert.equal(_internals.toolFailed(failed as never), true)
+    const out = _internals.toolOutputOf(failed as never)
+    assert.equal(out.output, 'usage')
+    assert.deepEqual(out.outputJson, { stdout: 'usage', exitCode: 1 })
+
+    const ok = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-exit-0',
+        shellToolCall: {
+          args: { command: 'true' },
+          result: { success: { stdout: 'ok', exitCode: 0 } },
+        },
+      },
+    }
+    assert.equal(_internals.toolFailed(ok as never), false)
+
+    const missing = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-no-exit',
+        shellToolCall: { args: { command: 'x' }, result: { success: { stdout: 'ok' } } },
+      },
+    }
+    assert.equal(_internals.toolFailed(missing as never), false)
+
+    const snake = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-exit-snake',
+        shellToolCall: { args: { command: 'x' }, result: { success: { exit_code: 2 } } },
+      },
+    }
+    assert.equal(_internals.toolFailed(snake as never), true)
+
+    const skipped = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-ask-skip',
+        askQuestionToolCall: {
+          args: { questions: '[]' },
+          result: { reason: 'Questions skipped by the user, continue with the information you already have' },
+          status: 'rejected',
+        },
+      },
+    }
+    assert.equal(_internals.questionSkippedByRuntime(skipped as never), true)
+    assert.equal(_internals.toolFailed(skipped as never), false)
+  })
+
+  test('opens a new -sN segment when thinking and text switch without a tool boundary', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-kind-switch-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+for(const e of [
+  {type:'text',text:'A'},
+  {type:'thinking',text:'T'},
+  {type:'text',text:'B'},
+  {type:'thinking',text:'U'},
+  {type:'result',subtype:'success',is_error:false},
+]) console.log(JSON.stringify(e))
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const events: EngineEvent[] = []
+      const run = adapter.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        assistantMessageId: 'assistant-base',
+        thinkingMessageId: 'thinking-base',
+        onEvent: (event) => events.push(event),
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+      assert.deepEqual(
+        summary?.assistantSegments.map(({ index, text }) => ({ index, text })),
+        [
+          { index: 0, text: 'A' },
+          { index: 1, text: 'B' },
+        ],
+      )
+      assert.deepEqual(
+        summary?.thinkingSegments.map(({ index, text }) => ({ index, text })),
+        [
+          { index: 0, text: 'T' },
+          { index: 1, text: 'U' },
+        ],
+      )
+      const textIds = events.flatMap((event) =>
+        event.kind === 'block' && event.block.kind === 'text' ? [event.block.messageId] : [],
+      )
+      const thinkingIds = events.flatMap((event) =>
+        event.kind === 'block' && event.block.kind === 'thinking' ? [event.block.messageId] : [],
+      )
+      assert.deepEqual(textIds, ['assistant-base-s0', 'assistant-base-s1'])
+      assert.deepEqual(thinkingIds, ['thinking-base-s0', 'thinking-base-s1'])
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('emits structurally marked nested thinking blocks and keeps ordinary text as text', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-nested-thinking-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+for(const e of [
+  {type:'assistant',message:{role:'assistant',content:[
+    {type:'thinking',thinking:'secret plan'},
+    {type:'text',text:'Let me think about this. Here is the answer.'},
+  ]}},
+  {type:'result',subtype:'success',is_error:false},
+]) console.log(JSON.stringify(e))
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const events: EngineEvent[] = []
+      const run = adapter.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        assistantMessageId: 'assistant-base',
+        thinkingMessageId: 'thinking-base',
+        onEvent: (event) => events.push(event),
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(summary?.thinkingText, 'secret plan')
+      assert.equal(summary?.assistantText, 'Let me think about this. Here is the answer.')
+      const kinds = events
+        .filter((event): event is Extract<EngineEvent, { kind: 'block' }> => event.kind === 'block')
+        .map((event) => event.block.kind)
+      assert.deepEqual(kinds, ['thinking', 'text'])
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('shell cards surface empty envelopes as blank output and nonzero exit as isError', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-shell-cards-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+for(const e of [
+  {type:'tool_call',subtype:'started',call_id:'empty-1',tool_call:{shellToolCall:{args:{command:'true'}}}},
+  {type:'tool_call',subtype:'completed',call_id:'empty-1',tool_call:{shellToolCall:{args:{command:'true'},result:{success:{},isBackground:false}}}},
+  {type:'tool_call',subtype:'started',call_id:'exit-1',tool_call:{shellToolCall:{args:{command:'oc-memory delegate --help'}}}},
+  {type:'tool_call',subtype:'completed',call_id:'exit-1',tool_call:{shellToolCall:{args:{command:'oc-memory delegate --help'},result:{success:{stdout:'usage',stderr:'',exitCode:1},isBackground:false}}}},
+  {type:'result',subtype:'success',is_error:false},
+]) console.log(JSON.stringify(e))
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(summary?.tools[0]?.output, '')
+      assert.equal(summary?.tools[0]?.isError, false)
+      assert.equal(JSON.stringify(summary?.tools[0]?.outputJson ?? {}).includes('isBackground'), false)
+      assert.equal(summary?.tools[1]?.output, 'usage')
+      assert.equal(summary?.tools[1]?.isError, true)
+      assert.deepEqual(summary?.tools[1]?.outputJson, { stdout: 'usage', exitCode: 1 })
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test('domain-separated tool ids remain stable and cannot collide with raw safe-looking ids', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-tool-ids-'))
     const fake = path.join(dir, 'fake.cjs')
