@@ -880,6 +880,25 @@ for(const e of [
     const decoded = _internals.toolOutputOf(withBytes as never)
     assert.equal(decoded.output, 'hello from bytes')
     assert.deepEqual(decoded.outputJson, { stdout: 'hello from bytes', exitCode: 0 })
+
+    const oversizedLen = 2 * 1024 * 1024 + 1
+    const oversized = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-oversized-shell',
+        shellToolCall: {
+          args: { command: 'cat huge' },
+          result: {
+            success: { stdout: new Uint8Array(oversizedLen), stderr: [], exitCode: 0 },
+            isBackground: false,
+          },
+        },
+      },
+    }
+    const omitted = _internals.toolOutputOf(oversized as never)
+    assert.equal(omitted.output, `[输出过大，已省略 ${oversizedLen} 字节]`)
+    assert.equal(_internals.toolFailed(oversized as never), false)
+    assert.equal(omitted.output.includes('Error'), false)
   })
 
   test('shell success envelope with nonzero exitCode is a tool failure', () => {
@@ -1045,6 +1064,110 @@ for(const e of [
         .filter((event): event is Extract<EngineEvent, { kind: 'block' }> => event.kind === 'block')
         .map((event) => event.block.kind)
       assert.deepEqual(kinds, ['thinking', 'text'])
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('mixed thinking snapshot dedupes aggregated text blocks against streamed partials', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-mixed-thinking-dedupe-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+for(const e of [
+  {type:'assistant',message:{role:'assistant',content:[{type:'text',text:'A'}]},timestamp_ms:1},
+  {type:'assistant',message:{role:'assistant',content:[{type:'text',text:'B'}]},timestamp_ms:2},
+  {type:'assistant',message:{role:'assistant',content:[
+    {type:'thinking',thinking:'T'},
+    {type:'text',text:'A'},
+    {type:'text',text:'B'},
+  ]}},
+  {type:'result',subtype:'success',is_error:false},
+]) console.log(JSON.stringify(e))
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const events: EngineEvent[] = []
+      const run = adapter.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        assistantMessageId: 'assistant-base',
+        thinkingMessageId: 'thinking-base',
+        onEvent: (event) => events.push(event),
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(summary?.assistantText, 'AB')
+      assert.equal(summary?.thinkingText, 'T')
+      assert.deepEqual(
+        summary?.assistantSegments.map(({ index, text }) => ({ index, text })),
+        [{ index: 0, text: 'AB' }],
+      )
+      const textIds = events.flatMap((event) =>
+        event.kind === 'block' && event.block.kind === 'text' ? [event.block.messageId] : [],
+      )
+      assert.deepEqual([...new Set(textIds)], ['assistant-base-s0'])
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('thinking-only assistant events keep streamed text partials for the final snapshot', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-thinking-only-partial-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+for(const e of [
+  {type:'assistant',message:{role:'assistant',content:[{type:'text',text:'A'}]},timestamp_ms:1},
+  {type:'assistant',message:{role:'assistant',content:[{type:'thinking',thinking:'T'}]}},
+  {type:'assistant',message:{role:'assistant',content:[{type:'text',text:'A'}]}},
+  {type:'result',subtype:'success',is_error:false},
+]) console.log(JSON.stringify(e))
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const events: EngineEvent[] = []
+      const run = adapter.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        assistantMessageId: 'assistant-base',
+        thinkingMessageId: 'thinking-base',
+        onEvent: (event) => events.push(event),
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(summary?.assistantText, 'A')
+      assert.equal(summary?.thinkingText, 'T')
+      assert.deepEqual(
+        summary?.assistantSegments.map(({ index, text }) => ({ index, text })),
+        [{ index: 0, text: 'A' }],
+      )
+      const textBlocks = events.filter(
+        (event): event is Extract<EngineEvent, { kind: 'block' }> =>
+          event.kind === 'block' && event.block.kind === 'text',
+      )
+      assert.equal(textBlocks.length, 1)
+      assert.equal(textBlocks[0]?.block.kind === 'text' ? textBlocks[0].block.text : '', 'A')
     } finally {
       restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
       await rm(dir, { recursive: true, force: true })

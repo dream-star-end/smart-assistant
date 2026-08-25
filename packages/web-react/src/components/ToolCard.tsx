@@ -42,30 +42,40 @@ const TONE_TILE: Record<string, string> = {
   neutral: "bg-hover text-muted",
 };
 
-/** 行首 `oc-memory: ` / `oc-browser: ` 这类 CLI fail() 前缀；Cursor 信封则看内层 stderr/stdout。 */
-const OC_CLI_ERROR_PREFIX = /^oc-[A-Za-z][A-Za-z0-9-]*:\s/m;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
 
-function bashOutputReportsOcCliError(output: string): boolean {
-  if (OC_CLI_ERROR_PREFIX.test(output)) return true;
+/** 严格 Cursor 信封：`{ success: <object>, isBackground?: boolean }`，顶层不得有其它键。 */
+function isCursorShellEnvelope(value: Record<string, unknown>): boolean {
+  if (!isRecord(value.success)) return false;
+  const keys = Object.keys(value);
+  if (keys.some((k) => k !== "success" && k !== "isBackground")) return false;
+  if ("isBackground" in value && typeof value.isBackground !== "boolean") return false;
+  return true;
+}
+
+/** Cursor Shell 失败结果：{command, exitCode, stderr, stdout, ...}。 */
+function isShellResultObject(value: Record<string, unknown>): boolean {
+  const keys = new Set(
+    Object.keys(value).map((key) => key.toLowerCase().replaceAll("_", "").replaceAll(" ", "")),
+  );
+  return keys.has("command") && (keys.has("exitcode") || keys.has("stderr") || keys.has("stdout"));
+}
+
+/** 历史 tape 兜底：可解析的 Cursor shell 信封里，只有数字且非 0 的 exitCode 才算错误。 */
+function bashOutputReportsNonzeroExit(output: string): boolean {
   const trimmed = output.trim();
   if (!trimmed.startsWith("{")) return false;
   try {
     const parsed = JSON.parse(trimmed) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
-    const envelope = parsed as Record<string, unknown>;
-    const nested = envelope.success;
-    const keys = Object.keys(envelope);
-    const inner =
-      nested &&
-      typeof nested === "object" &&
-      !Array.isArray(nested) &&
-      keys.every((k) => k === "success" || k === "isBackground") &&
-      (!("isBackground" in envelope) || typeof envelope.isBackground === "boolean")
-        ? (nested as Record<string, unknown>)
-        : envelope;
-    return [inner.stderr, inner.stdout].some(
-      (stream) => typeof stream === "string" && OC_CLI_ERROR_PREFIX.test(stream),
-    );
+    if (!isRecord(parsed)) return false;
+    const inner = isCursorShellEnvelope(parsed)
+      ? (parsed.success as Record<string, unknown>)
+      : parsed;
+    if (!isCursorShellEnvelope(parsed) && !isShellResultObject(inner)) return false;
+    const exitRaw = inner.exitCode ?? inner.exit_code;
+    return typeof exitRaw === "number" && Number.isFinite(exitRaw) && exitRaw !== 0;
   } catch {
     return false;
   }
@@ -99,12 +109,13 @@ export function ToolCard({
   const outputText = typeof renderTool.output === "string" ? renderTool.output : "";
   // 部分 CLI 会以 exit 0 返回语义失败（Playwright 的 markdown Error、网页反爬阻断）。
   // 这些明确形状应进入用户可见状态，而不是显示绿色完成。
-  // oc-* CLI 的 fail() 写行首 `oc-memory: <msg>`，Cursor 还可能把 stderr 包进 JSON 信封。
+  // 新会话由 gateway 的 exitCode→isError 负责；历史 tape 只认信封里的非 0 exitCode。
+  // 不把 `oc-*: ` 行首前缀当错误：多个 CLI 成功路径也会往 stderr 打这个前缀。
   const isBlocked = name === "Bash" && /(?:^|\n)oc-web:\s*blocked:/i.test(outputText);
   const reportedError =
     name === "Bash" &&
     !isBlocked &&
-    (/^#{1,6}\s*Error\b/m.test(outputText) || bashOutputReportsOcCliError(outputText));
+    (/^#{1,6}\s*Error\b/m.test(outputText) || bashOutputReportsNonzeroExit(outputText));
   const hasError = !!renderTool.error || reportedError;
   // 历史 tape 是不可变真记录：turn 已中断时，未完成 tool 代表被取消，而不是仍在运行。
   const isInterruptedHistorical =

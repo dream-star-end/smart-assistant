@@ -677,14 +677,17 @@ function textOf(value: unknown): string {
 }
 /** UTF-8 byte arrays from serde of `Vec<u8>`. Anything else → null (never stringify). */
 const MAX_SHELL_BYTE_DECODE = 2 * 1024 * 1024
+function oversizedOutputNotice(byteLength: number): string {
+  return `[输出过大，已省略 ${byteLength} 字节]`
+}
 function decodeUtf8Bytes(value: unknown): string | null {
   if (value instanceof Uint8Array) {
-    if (value.length > MAX_SHELL_BYTE_DECODE) return null
+    if (value.length > MAX_SHELL_BYTE_DECODE) return oversizedOutputNotice(value.length)
     return Buffer.from(value).toString('utf8')
   }
   if (!Array.isArray(value)) return null
   if (value.length === 0) return ''
-  if (value.length > MAX_SHELL_BYTE_DECODE) return null
+  if (value.length > MAX_SHELL_BYTE_DECODE) return oversizedOutputNotice(value.length)
   const bytes = new Uint8Array(value.length)
   for (let i = 0; i < value.length; i += 1) {
     const n = value[i]
@@ -1781,12 +1784,20 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       const blocks = assistantContentBlocksOf(event)
       const hasStructuredThinking = blocks.some((block) => block.kind === 'thinking')
       if (hasStructuredThinking) {
+        const textBlocks = blocks.filter((block) => block.kind === 'text')
+        const aggregatedText = textBlocks.map((block) => block.text).join('')
+        const skipText = textBlocks.length > 0
+          && Boolean(ctx.assistantPartialText)
+          && aggregatedText === ctx.assistantPartialText
         for (const block of blocks) {
-          if (block.kind === 'text' && block.text === ctx.assistantPartialText && ctx.assistantPartialText) continue
+          if (block.kind === 'text' && skipText) continue
           this.emitText(ctx, block.kind, block.text, block.kind === 'text')
         }
-        ctx.assistantPartialText = ''
-        ctx.pendingAssistantText = null
+        // thinking-only 事件不得清正文 partial：最终快照还要用它去重。
+        if (textBlocks.length > 0) {
+          ctx.assistantPartialText = ''
+          ctx.pendingAssistantText = null
+        }
         return
       }
       const value = assistantTextOf(event); if (!value) return
@@ -1857,7 +1868,6 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.tools.has(id)) return
     this.flushPendingAssistant(ctx, false)
     this.closeContentSegments(ctx)
-    ctx.lastContentKind = null
     const tool: TurnToolEntry = { toolUseId: id, blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: textOf(input).slice(0, 500), output: '', completed: false, isError: false, durationMs: 0, ts: Date.now(), arrivedAt: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() }
     ctx.tools.set(id, tool); ctx.pending.add(id); ctx.startedTools.set(id, keepaliveNow()); ctx.params.toolUseIdToName.set(id, name)
     const block: OutboundContentBlock = { kind: 'tool_use', blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: tool.inputPreview, partial: false }

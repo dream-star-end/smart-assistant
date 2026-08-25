@@ -1074,14 +1074,19 @@ function normalizePreviewKey(key: string): string {
   return key.toLowerCase().replaceAll("_", "").replaceAll(" ", "");
 }
 
+/** 严格 Cursor 信封：`{ success: <object>, isBackground?: boolean }`，顶层不得有其它键。 */
+function isCursorShellEnvelope(value: Record<string, unknown>): boolean {
+  if (!isRecord(value.success)) return false;
+  const keys = Object.keys(value);
+  if (keys.some((k) => k !== "success" && k !== "isBackground")) return false;
+  if ("isBackground" in value && typeof value.isBackground !== "boolean") return false;
+  return true;
+}
+
 /** Cursor CLI 把 Bash 结果包成 `{ success: <shell>, isBackground?: boolean }`。渲染前剥掉信封。 */
 function unwrapCursorShellEnvelope(value: Record<string, unknown>): Record<string, unknown> {
-  const nested = value.success;
-  if (!isRecord(nested)) return value;
-  const keys = Object.keys(value);
-  if (keys.some((k) => k !== "success" && k !== "isBackground")) return value;
-  if ("isBackground" in value && typeof value.isBackground !== "boolean") return value;
-  return nested;
+  if (!isCursorShellEnvelope(value)) return value;
+  return value.success as Record<string, unknown>;
 }
 
 /** Cursor Shell 失败结果：{command, exitCode, stderr, stdout, workingDirectory, signal}。 */
@@ -1106,7 +1111,8 @@ function shellResultMessage(value: Record<string, unknown>): string {
   return typeof err === "string" ? err : "";
 }
 
-/** 从 stdout / Cursor 信封 / 裸 shell JSON 取出可展示的 CLI 流。 */
+/** 从 stdout / Cursor 信封 / 裸 shell JSON 取出可展示的 CLI 流。
+ *  只有严格信封或 `isShellResultObject` 才解包；带 `stdout` 的普通 JSON 当不透明正文。 */
 function cursorCliStreams(raw: string | null): { stdout: string; stderr: string } {
   if (!raw) return { stdout: "", stderr: "" };
   const clean = stripExternalEnvelope(stripCommandEcho(raw)).trim();
@@ -1116,11 +1122,7 @@ function cursorCliStreams(raw: string | null): { stdout: string; stderr: string 
       const parsed = JSON.parse(clean);
       if (isRecord(parsed)) {
         const inner = unwrapCursorShellEnvelope(parsed);
-        if (
-          isShellResultObject(inner) ||
-          typeof inner.stdout === "string" ||
-          typeof inner.stderr === "string"
-        ) {
+        if (isCursorShellEnvelope(parsed) || isShellResultObject(inner)) {
           return {
             stdout: typeof inner.stdout === "string" ? inner.stdout : "",
             stderr: typeof inner.stderr === "string" ? inner.stderr : "",

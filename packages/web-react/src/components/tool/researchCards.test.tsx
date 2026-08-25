@@ -548,7 +548,24 @@ describe("4 个新专属卡", () => {
     expect(container.textContent).not.toContain("delegate client timeout after 45s");
   });
 
-  test("oc-memory delegate 成功 → stdout markdown，不渲 Cursor 信封字段网格", () => {
+  test("oc-memory delegate 的合法 JSON 不当成 shell 信封，result 完整展示", () => {
+    const payload = JSON.stringify({
+      stdout: "检查完成",
+      stderr: "",
+      result: { count: 3 },
+    });
+    const { container } = render(
+      <div>
+        {researchToolCard("oc-memory delegate --goal '返回 JSON'", tool({ output: payload }))}
+      </div>,
+    );
+    expect(container.textContent).toContain("检查完成");
+    expect(container.textContent).toContain('"count":3');
+    expect(container.textContent).toContain("result");
+    expect(container.textContent).not.toMatch(/个字段/);
+  });
+
+  test("oc-memory delegate 真正的 Cursor 信封仍解包 stdout", () => {
     const envelope = JSON.stringify({
       success: {
         command: "oc-memory delegate --goal '修卡片'",

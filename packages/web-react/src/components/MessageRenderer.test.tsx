@@ -338,12 +338,39 @@ describe("tool / agent-group 集成", () => {
     expect(screen.getByText("完成")).toBeInTheDocument();
   });
 
-  test("oc-* CLI 行首错误前缀不显示绿色完成", () => {
+  test("oc-* 成功日志前缀不标未成功；信封 exitCode 非 0 才未成功", () => {
+    renderMsg(
+      mk("tool", {
+        toolName: "Bash",
+        inputJson: { command: "true" },
+        output: JSON.stringify({
+          success: {
+            command: "true",
+            exitCode: 0,
+            stdout: "",
+            stderr: "oc-cursor: using Cursor credential slot 2/3",
+          },
+          isBackground: false,
+        }),
+        _completed: true,
+      }),
+    );
+    expect(screen.getByText("完成")).toBeInTheDocument();
+    expect(screen.queryByText("未成功")).not.toBeInTheDocument();
+    cleanup();
     renderMsg(
       mk("tool", {
         toolName: "Bash",
         inputJson: { command: "oc-memory delegate --help" },
-        output: 'oc-memory: delegate requires --goal "<text>" (or a positional goal)',
+        output: JSON.stringify({
+          success: {
+            command: "oc-memory delegate --help",
+            exitCode: 1,
+            stdout: "",
+            stderr: 'oc-memory: delegate requires --goal "<text>"',
+          },
+          isBackground: false,
+        }),
         _completed: true,
       }),
     );
