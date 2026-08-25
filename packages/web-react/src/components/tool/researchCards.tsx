@@ -1072,20 +1072,64 @@ function normalizePreviewKey(key: string): string {
   return key.toLowerCase().replaceAll("_", "").replaceAll(" ", "");
 }
 
+/** Cursor CLI 把 Bash 结果包成 `{ success: <shell>, isBackground?: boolean }`。渲染前剥掉信封。 */
+function unwrapCursorShellEnvelope(value: Record<string, unknown>): Record<string, unknown> {
+  const nested = value.success;
+  if (!isRecord(nested)) return value;
+  const keys = Object.keys(value);
+  if (keys.some((k) => k !== "success" && k !== "isBackground")) return value;
+  if ("isBackground" in value && typeof value.isBackground !== "boolean") return value;
+  return nested;
+}
+
 /** Cursor Shell 失败结果：{command, exitCode, stderr, stdout, workingDirectory, signal}。 */
 function isShellResultObject(value: Record<string, unknown>): boolean {
   const keys = new Set(Object.keys(value).map(normalizePreviewKey));
   return keys.has("command") && (keys.has("exitcode") || keys.has("stderr") || keys.has("stdout"));
 }
 
-function shellResultMessage(value: Record<string, unknown>): string {
+function shellResultString(value: Record<string, unknown>, field: "stdout" | "stderr"): string {
   for (const key of Object.keys(value)) {
-    if (normalizePreviewKey(key) === "stderr" && typeof value[key] === "string" && value[key].trim()) {
+    if (normalizePreviewKey(key) === field && typeof value[key] === "string" && value[key].trim()) {
       return value[key] as string;
     }
   }
+  return "";
+}
+
+function shellResultMessage(value: Record<string, unknown>): string {
+  const stderr = shellResultString(value, "stderr");
+  if (stderr) return stderr;
   const err = value.error;
   return typeof err === "string" ? err : "";
+}
+
+/** 从 stdout / Cursor 信封 / 裸 shell JSON 取出可展示的 CLI 流。 */
+function cursorCliStreams(raw: string | null): { stdout: string; stderr: string } {
+  if (!raw) return { stdout: "", stderr: "" };
+  const clean = stripExternalEnvelope(stripCommandEcho(raw)).trim();
+  if (!clean) return { stdout: "", stderr: "" };
+  if (clean.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(clean);
+      if (isRecord(parsed)) {
+        const inner = unwrapCursorShellEnvelope(parsed);
+        if (
+          isShellResultObject(inner) ||
+          typeof inner.stdout === "string" ||
+          typeof inner.stderr === "string"
+        ) {
+          return {
+            stdout: typeof inner.stdout === "string" ? inner.stdout : "",
+            stderr: typeof inner.stderr === "string" ? inner.stderr : "",
+          };
+        }
+      }
+    } catch {
+      /* 文本预览兜底 */
+    }
+  }
+  return { stdout: clean, stderr: "" };
 }
 
 function friendlyOcFailureText(raw: string): string {
@@ -1102,15 +1146,31 @@ function friendlyOcFailureText(raw: string): string {
 function FriendlyObjectPreview({ value }: { value: Record<string, unknown> }) {
   // L3:默认只展示前 6 个字段,余下给「还有 N 个字段」入口可展开全部。
   const [showAllFields, setShowAllFields] = useState(false);
-  if (isShellResultObject(value)) {
-    const msg = friendlyOcFailureText(shellResultMessage(value));
+  const unwrapped = unwrapCursorShellEnvelope(value);
+  if (isShellResultObject(unwrapped)) {
+    const stderr = shellResultMessage(unwrapped);
+    if (stderr) {
+      return (
+        <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-fg">
+          {friendlyOcFailureText(stderr)}
+        </div>
+      );
+    }
+    const stdout = shellResultString(unwrapped, "stdout");
+    if (stdout) {
+      return (
+        <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-fg">
+          {stdout}
+        </div>
+      );
+    }
     return (
       <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-fg">
-        {msg || "工具执行失败。"}
+        工具执行失败。
       </div>
     );
   }
-  const entries = Object.entries(value);
+  const entries = Object.entries(unwrapped);
   if (entries.length === 0) return <div className="text-xs text-faint">没有返回内容。</div>;
   const rows = showAllFields ? entries : entries.slice(0, 6);
   return (
@@ -1295,10 +1355,30 @@ const MEMORY_SEARCH_SPEC: Record<string, { icon: ReactNode; title: string }> = {
   "archival-delete": { icon: <Archive className="size-4" />, title: "归档删除" },
 };
 
+const MEMORY_DELEGATE_SPEC: Record<string, { icon: ReactNode; title: string }> = {
+  delegate: { icon: <CheckCircle2 className="size-4" />, title: "委派子任务" },
+  "request-review": { icon: <FileText className="size-4" />, title: "质量审查" },
+  "delegate-wait": { icon: <Clock className="size-4" />, title: "等待委派" },
+};
+
 /** oc-memory CLI(深层召回:session-search / archival-*)→ 干净检索结果卡;不裸露命令。
- *  `memory` 子命令已退役(→ null,由 researchToolCard 兜底 GenericOcCard,历史会话不泄漏命令)。 */
+ *  `memory` 子命令已退役(→ null,由 researchToolCard 兜底 GenericOcCard,历史会话不泄漏命令)。
+ *  Cursor 引擎走 `oc-memory delegate` Bash 路径：stdout 当 markdown 渲染，失败显示 stderr 首段。 */
 function MemoryCliCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
   const sub = memorySubcommand(command);
+  const delegateSpec = MEMORY_DELEGATE_SPEC[sub];
+  if (delegateSpec) {
+    const streams = cursorCliStreams(outputText(tool));
+    const stdout = streams.stdout.trim();
+    const stderr = streams.stderr.trim();
+    const body = stdout || (stderr ? firstParagraph(stderr) : "");
+    if (!body) return null;
+    return (
+      <CardShell icon={delegateSpec.icon} title={delegateSpec.title}>
+        <ResultText text={body} />
+      </CardShell>
+    );
+  }
   const output = tool.output ?? null;
   const spec = MEMORY_SEARCH_SPEC[sub];
   if (!spec) return null;

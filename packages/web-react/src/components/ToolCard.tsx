@@ -24,10 +24,7 @@ import { cn } from "../lib/utils";
 import { TokenUsageBadge, type DisplayTokenUsage } from "./chat/tokenUsage";
 import { ToolBody } from "./tool/bodies";
 import { ToolInspectOpenContext, useArtifactInspect } from "./tool/context";
-import {
-  type ToolLike,
-  normalizeToolForDisplay,
-} from "./tool/format";
+import { type ToolLike, normalizeToolForDisplay } from "./tool/format";
 import { resolveToolMeta, toolSummary } from "./tool/meta";
 import { Badge, Spinner } from "./ui";
 
@@ -41,6 +38,35 @@ const TONE_TILE: Record<string, string> = {
   warning: "bg-warning-soft text-warning",
   neutral: "bg-hover text-muted",
 };
+
+/** 行首 `oc-memory: ` / `oc-browser: ` 这类 CLI fail() 前缀；Cursor 信封则看内层 stderr/stdout。 */
+const OC_CLI_ERROR_PREFIX = /^oc-[A-Za-z][A-Za-z0-9-]*:\s/m;
+
+function bashOutputReportsOcCliError(output: string): boolean {
+  if (OC_CLI_ERROR_PREFIX.test(output)) return true;
+  const trimmed = output.trim();
+  if (!trimmed.startsWith("{")) return false;
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const envelope = parsed as Record<string, unknown>;
+    const nested = envelope.success;
+    const keys = Object.keys(envelope);
+    const inner =
+      nested &&
+      typeof nested === "object" &&
+      !Array.isArray(nested) &&
+      keys.every((k) => k === "success" || k === "isBackground") &&
+      (!("isBackground" in envelope) || typeof envelope.isBackground === "boolean")
+        ? (nested as Record<string, unknown>)
+        : envelope;
+    return [inner.stderr, inner.stdout].some(
+      (stream) => typeof stream === "string" && OC_CLI_ERROR_PREFIX.test(stream),
+    );
+  } catch {
+    return false;
+  }
+}
 
 export function ToolCard({
   message,
@@ -70,12 +96,18 @@ export function ToolCard({
   const outputText = typeof renderTool.output === "string" ? renderTool.output : "";
   // 部分 CLI 会以 exit 0 返回语义失败（Playwright 的 markdown Error、网页反爬阻断）。
   // 这些明确形状应进入用户可见状态，而不是显示绿色完成。
-  const reportedError = name === "Bash" && /^#{1,6}\s*Error\b/m.test(outputText);
+  // oc-* CLI 的 fail() 写行首 `oc-memory: <msg>`，Cursor 还可能把 stderr 包进 JSON 信封。
   const isBlocked = name === "Bash" && /(?:^|\n)oc-web:\s*blocked:/i.test(outputText);
+  const reportedError =
+    name === "Bash" &&
+    !isBlocked &&
+    (/^#{1,6}\s*Error\b/m.test(outputText) || bashOutputReportsOcCliError(outputText));
   const hasError = !!renderTool.error || reportedError;
   // 历史 tape 是不可变真记录：turn 已中断时，未完成 tool 代表被取消，而不是仍在运行。
   const isInterruptedHistorical =
-    !completed && renderTool._timelineRecord === true && renderTool._dispatchOutcome === "interrupted";
+    !completed &&
+    renderTool._timelineRecord === true &&
+    renderTool._dispatchOutcome === "interrupted";
   // 取消(如 Codex item status 'cancelled')是中性终态:≠ 失败(不红)、≠ 运行中(不转圈)。
   const isCancelled = !hasError && (!!renderTool.cancelled || isInterruptedHistorical);
   const isRunning = !completed && !hasError && !isBlocked && !isCancelled;

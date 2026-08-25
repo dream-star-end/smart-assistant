@@ -1682,6 +1682,14 @@ export function applyOutboundMessage(
       // vanilla 在此 flush thinking 的 rAF 残留再清指针；React 侧文本已累加在模型上，
       // 无独立 rAF buffer，直接清指针即可（渲染节流在订阅侧批量 notify）。
       sess._streamingThinking = null;
+      if (
+        b.messageId &&
+        sess._streamingAssistant &&
+        sess._streamingAssistant.id !== b.messageId
+      ) {
+        sess._streamingAssistant.completedAt = Date.now();
+        sess._streamingAssistant = null;
+      }
       if (!sess._streamingAssistant) {
         if (
           b.messageId && sess.messages.some((message) =>
@@ -1710,6 +1718,14 @@ export function applyOutboundMessage(
       sess._streamingAssistant.text += blockText;
       sess._streamingAssistant.completedAt = Date.now();
     } else if (b.kind === "thinking") {
+      if (
+        b.messageId &&
+        sess._streamingThinking &&
+        sess._streamingThinking.id !== b.messageId
+      ) {
+        sess._streamingThinking.completedAt = Date.now();
+        sess._streamingThinking = null;
+      }
       if (!sess._streamingThinking) {
         if (
           b.messageId && sess.messages.some((message) =>

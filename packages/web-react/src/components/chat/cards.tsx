@@ -944,7 +944,7 @@ export function GoalCard({ msg }: { msg: ChatMessage }) {
 // 不外包 memo(同 PlanCard:就地 mutate + {msg} 会永不重渲)。可折叠:进行中默认展开(看实时进度)、
 // 完成默认折叠(收成一行摘要),与 AgentGroupCard 同款头部 chevron 交互;用户点击后本地锁定。
 export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
-  const entries = msg.entries ?? [];
+  const entries = (msg.entries ?? []).filter((e) => e.phase !== "start" && e.phase !== "done");
   const children = msg.childBlocks ?? [];
   const done = !!msg._completed;
   const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);

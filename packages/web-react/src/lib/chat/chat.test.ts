@@ -1054,6 +1054,46 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(asst[0].id).toBe("srv-1");
   });
 
+  test("text/thinking 换 messageId 时开新行，不把后到段灌进旧气泡", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "卡片前", messageId: "srv-main-t1-s0" }] }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 2, blocks: [{ kind: "text", text: "卡片后", messageId: "srv-main-t1-s1" }] }),
+    );
+    const asst = s.messages.filter((m) => m.role === "assistant");
+    expect(asst.map((m) => [m.id, m.text])).toEqual([
+      ["srv-main-t1-s0", "卡片前"],
+      ["srv-main-t1-s1", "卡片后"],
+    ]);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 3, blocks: [{ kind: "thinking", text: "先想", messageId: "srv-think-s0" }] }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 4, blocks: [{ kind: "thinking", text: "再想", messageId: "srv-think-s1" }] }),
+    );
+    const thinking = s.messages.filter((m) => m.role === "thinking");
+    expect(thinking.map((m) => [m.id, m.text])).toEqual([
+      ["srv-think-s0", "先想"],
+      ["srv-think-s1", "再想"],
+    ]);
+  });
+
+  test("text 缺省 messageId 时仍向当前流式指针追加", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "Hel" }] }));
+    applyOutboundMessage(s, msgFrame({ frameSeq: 2, blocks: [{ kind: "text", text: "lo" }] }));
+    const asst = s.messages.filter((m) => m.role === "assistant");
+    expect(asst).toHaveLength(1);
+    expect(asst[0].text).toBe("Hello");
+  });
+
   test("frameSeq dedupe drops replayed dup (no double text)", () => {
     const s = sess();
     applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "A", messageId: "srv-1" }] }));

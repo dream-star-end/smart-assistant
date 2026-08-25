@@ -417,6 +417,45 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.queryByText("查看原始完整记录")).not.toBeInTheDocument();
   });
 
+  test("oc-* CLI 用法错误显示未成功，不走绿色完成", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: "oc-memory delegate --help" },
+          output: 'oc-memory: delegate requires --goal "<text>" (or a positional goal)',
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("未成功")).toBeInTheDocument();
+    expect(screen.queryByText("完成")).not.toBeInTheDocument();
+    expect(screen.queryByText("失败")).not.toBeInTheDocument();
+  });
+
+  test("Cursor shell 信封里的 oc-* stderr 也视为语义错误", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: "oc-memory delegate --help" },
+          output: JSON.stringify({
+            success: {
+              command: "oc-memory delegate --help",
+              exitCode: 1,
+              stdout: "",
+              stderr: 'oc-memory: delegate requires --goal "<text>"',
+            },
+            isBackground: false,
+          }),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("未成功")).toBeInTheDocument();
+    expect(screen.queryByText("完成")).not.toBeInTheDocument();
+  });
+
   test("Codex MCP skill_search 解包为记忆工具卡，不展示 wrapper JSON", () => {
     const started = {
       type: "mcpToolCall",
