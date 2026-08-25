@@ -103,3 +103,25 @@ describe("cursorQuota", () => {
     assert.equal(map.get("api-key.2"), "unknown");
   });
 });
+
+import {
+  parseSandModeSidecar,
+  renderSandModeSidecar,
+} from "./cursorQuota.js";
+
+describe("sand mode sidecar", () => {
+  test("renders and parses sidecar round-trip", () => {
+    const rendered = renderSandModeSidecar([
+      { name: "api-key", sandEnabled: true },
+      { name: "api-key.2", sandEnabled: false },
+    ]);
+    assert.match(rendered, /^# sand-mode v1\n/);
+    assert.match(rendered, /api-key 1/);
+    assert.match(rendered, /api-key\.2 0/);
+
+    const parsed = parseSandModeSidecar(rendered);
+    assert.equal(parsed.get("api-key"), true);
+    assert.equal(parsed.get("api-key.2"), false);
+    assert.equal(parsed.get("api-key.3"), undefined);
+  });
+});

@@ -284,6 +284,35 @@ fi
 
 # Advance the eligible pool past the slot that just failed. No-op for
 # single-eligible accounts, so their failure path stays byte-identical.
+
+# Read .sand-mode sidecar if present. If the chosen slot has sand enabled,
+# pass -H "x-cursor-client-type: sand" to the pinned CLI.
+sand_enabled=0
+if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null \
+  || /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null; then
+  sand_sidecar_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.sand-mode" 2>/dev/null) \
+    || sand_sidecar_text=$(/bin/cat -- "$auth_dir/.sand-mode" 2>/dev/null) \
+    || sand_sidecar_text=""
+  chosen_key_name=${chosen_key_file##*/}
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    slot_name=${line%% *}
+    slot_sand=${line#"$slot_name"}
+    slot_sand=${slot_sand# }
+    slot_sand=${slot_sand%% *}
+    if [ "$slot_name" = "$chosen_key_name" ]; then
+      case "$slot_sand" in
+        1|true|sand) sand_enabled=1 ;;
+        *) sand_enabled=0 ;;
+      esac
+    fi
+  done <<SAND_SIDECAR
+$sand_sidecar_text
+SAND_SIDECAR
+fi
+
 rotation_advance() {
   [ "$eligible_count" -gt 1 ] || return 0
   rotation_next=$((rotation_idx + 1))
@@ -545,6 +574,7 @@ fi
 [ -z "$model" ] || set -- --model "$model" "$@"
 [ -z "$mode" ] || set -- --mode "$mode" "$@"
 [ "$force" -eq 0 ] || set -- --force "$@"
+[ "$sand_enabled" -eq 0 ] || set -- -H "x-cursor-client-type: sand" "$@"
 
 # setsid gives the CLI and every tool child one process group so Stop cannot
 # leave a shell command running after the wrapper exits. HOME is per-call and
