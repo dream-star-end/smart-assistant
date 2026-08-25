@@ -3383,6 +3383,206 @@ export async function provisionV3Container(
 }
 
 /**
+ * 守卫 UPDATE:把 agent_containers 行翻 vanished。不碰 docker。
+ *
+ * 接收调用方传入的 PG client(事务内 PoolClient,或 autocommit 的 pool.query),
+ * **不**自己从 deps.pool 另开连接 —— idle sweep 必须在持 FOR UPDATE 的同一事务里
+ * 完成状态翻转,否则 COMMIT 后再 UPDATE 可能排队超过 drain 10s TTL。
+ *
+ * 守卫与历史 stopAndRemoveV3Container 逐字节一致:
+ *   runtime_channel / container_internal_id IS NOT DISTINCT FROM /
+ *   requireNoOpenMigration / requireIdleCutoffMin。
+ *
+ * 返回 hit=是否命中一行,以及 RETURNING host_uuid(未命中为 null)。
+ */
+export async function markV3ContainerVanished(
+  client: Pool | PoolClient,
+  containerRow: { id: number; container_internal_id?: string | null; host_uuid?: string | null },
+  options?: { requireNoOpenMigration?: boolean; requireIdleCutoffMin?: number },
+): Promise<{ hit: boolean; hostUuid: string | null }> {
+  //    用 RETURNING host_uuid 兜底:v1.0.20 修了 v3orphanReconcile 的 isNotFound bug
+  //    后,本函数其余 5 处调用点(idleSweep / ensureRunning stale recovery / admin
+  //    stop/restart/remove)都没传 host_uuid,跨 host 容器在远端 docker 不会被真清,
+  //    留下 ghost 撞下次 docker run name/IP 冲突 → host markCooldown(60s)反复 retry。
+  //    这里就近从 DB 读出 host_uuid,所有调用点自动 host-aware,零额外 query。
+  //
+  //  R6.11 Phase 2.C:requireNoOpenMigration=true 时加 NOT EXISTS 守卫,
+  //    rowCount=0 → 静默 false,不进 docker。详见 stopAndRemoveV3Container docstring
+  //    与 docs/v3/02-DEVELOPMENT-PLAN.md §14.2.6 reader/reconciler 单点权威约束。
+  //
+  //    **race 覆盖范围(诚实标注)**:READ COMMITTED 下 UPDATE 的子查询见到的是
+  //    *statement-start* snapshot 的 agent_migrations 行,**不**是 row lock 获取时
+  //    的最新行。因此本守卫覆盖的真实区间是「SELECT 完成 → 本条 UPDATE 语句开始」
+  //    之间 writer 已 commit 的 ledger 行;**不**覆盖「UPDATE 语句开始 → 行锁获得」
+  //    之间(微秒级)新 commit 的行。这是 best-effort 第二道闸,**主**安全机制仍是
+  //    reconciler 单点写入 — 任何漏过本守卫的极小窗口会在下一轮 reconciler tick(默认
+  //    60s)被识别。要真正闭合微秒窗口需引入 per-container advisory lock 或对
+  //    `agent_containers` 显式 SELECT … FOR UPDATE,Phase 2.D/3 视实测漏检率决定。
+  const guardSql = options?.requireNoOpenMigration === true
+    ? ` AND NOT EXISTS (
+          SELECT 1 FROM agent_migrations m
+           WHERE m.agent_container_id = agent_containers.id
+             AND m.phase NOT IN ('committed', 'rolled_back')
+        )`
+    : "";
+  // idle sweep 第二道闸:破坏性 UPDATE 当场重校 last_ws_activity,关掉 SELECT→stop
+  // 之间用户重连的 TOCTOU。不传该 option 时 SQL 与历史逐字节等价。
+  // 占位符序号由 updateParams 长度推导:guardSql 将来若带参数,先 push 再拼 idle,
+  // 禁止再写死 $4。
+  const idleCutoffMin = options?.requireIdleCutoffMin;
+  const updateParams: unknown[] = [
+    String(containerRow.id),
+    getRuntimeChannel(),
+    containerRow.container_internal_id ?? null,
+  ];
+  let idleSql = "";
+  if (typeof idleCutoffMin === "number" && Number.isFinite(idleCutoffMin)) {
+    updateParams.push(idleCutoffMin);
+    idleSql = ` AND last_ws_activity IS NOT NULL
+        AND last_ws_activity < NOW() - ($${updateParams.length}::int * interval '1 minute')`;
+  }
+  // P1d 跨 channel 防护:破坏性 UPDATE 必须带 runtime_channel 过滤 —— 否则任何传错(对方
+  // channel)id 的 caller 都会把对方行翻 vanished 并随后 docker stop/remove。$2=本实例 channel。
+  const updateResult = await client.query<{ host_uuid: string | null }>(
+    `UPDATE agent_containers
+        SET state='vanished',
+            updated_at=NOW()
+      WHERE id = $1 AND runtime_channel = $2
+        AND container_internal_id IS NOT DISTINCT FROM $3${guardSql}${idleSql}
+      RETURNING host_uuid`,
+    updateParams,
+  );
+  const hit = (updateResult.rowCount ?? 0) > 0;
+  return { hit, hostUuid: hit ? (updateResult.rows[0]?.host_uuid ?? null) : null };
+}
+
+/**
+ * 事务外 docker stop + force remove(+ codex auth 文件 best-effort 清理)。
+ *
+ * DB 意图必须已经落 vanished;本函数失败不回滚 DB,残骸交给 orphanReconcile。
+ * host 路由 / missing 吞掉 / PartialV3Cleanup 聚合与历史 stopAndRemove 后半段一致。
+ */
+export async function cleanupV3ContainerDocker(
+  deps: V3SupervisorDeps,
+  containerRow: { id: number; container_internal_id?: string | null; host_uuid?: string | null },
+  timeoutSec: number,
+  dbHostUuid: string | null,
+): Promise<void> {
+  const callerHostUuid: string | null = containerRow.host_uuid ?? null;
+  // caller vs DB 不一致 → 留诊断线索(理论不该发生,可能 row 被并发改 / 容器迁移)。
+  if (
+    callerHostUuid !== null
+    && dbHostUuid !== null
+    && callerHostUuid !== dbHostUuid
+  ) {
+    // eslint-disable-next-line no-console
+    console.warn("[v3supervisor.stopAndRemove] caller host_uuid != db host_uuid", {
+      containerId: containerRow.id,
+      callerHostUuid,
+      dbHostUuid,
+    });
+  }
+  const effectiveHostUuid: string | null = callerHostUuid ?? dbHostUuid;
+
+  // 2) 容器实际清理 best-effort;先 stop 再 remove,各自吞 missing。
+  //    R2 finding 加固:此后任何错都已经过了 DB UPDATE,意图已落库。
+  //    R3 finding 加固:stop 失败也仍然 try remove({force:true}) ——
+  //    force remove 通常能覆盖大部分 stop 失败 case(daemon 抖动、容器
+  //    死锁等),缩短"row vanished 但 docker 残骸还在"的窗口。
+  //    任一 stage 失败,记录,最后聚合抛 PartialV3Cleanup(含 stages)。
+  if (!containerRow.container_internal_id) return;
+  const cid = containerRow.container_internal_id;
+  // 多 host 系统标志:selfHostId 已配 + containerService 注入。
+  // 单机 legacy 模式下 (selfHostId 缺失) host_uuid 为 null 是正常的,允许走本地。
+  const isMultiHost =
+    typeof deps.selfHostId === "string" && deps.containerService !== undefined;
+  // 安全 gate A:多 host 系统下 host 未知 → 不假设本地。
+  // 触发条件:UPDATE 0 行(row 已并发删 / id 错)且 caller 没传,
+  //         或 row 在 DB 里 host_uuid 就是 null(legacy row 跑在多 host 系统)。
+  // 默认本地 docker.remove 在跨 host 时是 noop(404),但语义上不对:
+  // 调用方期望"清这个容器",容器实际在远端,我们却往本地打。明确 skip + warn 比静默
+  // 好,出问题排障也能从日志看到 host_uuid 缺失。
+  if (effectiveHostUuid === null && isMultiHost) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[v3supervisor.stopAndRemove] host_uuid unknown in multi-host system, skipping docker cleanup",
+      { containerId: containerRow.id, cid, rowFound: true },
+    );
+    return;
+  }
+  // 决定走远端还是本地(只在 effectiveHostUuid 非 null 时区分)。
+  const isRemote =
+    typeof effectiveHostUuid === "string"
+    && typeof deps.selfHostId === "string"
+    && effectiveHostUuid !== deps.selfHostId;
+  // 安全 gate B:cross-host 但 containerService 缺失 → 不静默回退本地(会清错宿主)。
+  // 跟 v3orphanReconcile 已有 fail-safe gate 语义一致(containerService 未注入 → skip)。
+  if (isRemote && deps.containerService === undefined) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[v3supervisor.stopAndRemove] cross-host row but containerService missing, skipping docker cleanup",
+      { containerId: containerRow.id, cid, hostUuid: effectiveHostUuid },
+    );
+    return;
+  }
+  const useRemote = isRemote;
+  const failures: Array<{ stage: "stop" | "remove"; err: SupervisorError }> = [];
+  try {
+    if (useRemote) {
+      await deps.containerService!.stop(effectiveHostUuid!, cid, { timeoutSec });
+    } else {
+      await deps.docker.getContainer(cid).stop({ t: timeoutSec });
+    }
+  } catch (err) {
+    if (!isNotFound(err) && !isNotModified(err)) {
+      failures.push({ stage: "stop", err: wrapDockerError(err) });
+    }
+  }
+  // stop 失败后仍尝试 force remove;remove 成功 OR remove 404 (容器已不存在)
+  // 都视作清理完成(残骸已不在)。R4 finding:之前 remove 404 时只是不追加
+  // failure,但 stop 的 failure 还在,会误报 PartialV3Cleanup;实际上容器已没了,
+  // 应等同清理成功。
+  let containerCleared = false;
+  try {
+    if (useRemote) {
+      await deps.containerService!.remove(effectiveHostUuid!, cid, { force: true });
+    } else {
+      await deps.docker.getContainer(cid).remove({ force: true });
+    }
+    containerCleared = true;
+  } catch (err) {
+    if (isNotFound(err)) {
+      containerCleared = true; // 容器已不存在,清理目的达成
+    } else {
+      failures.push({ stage: "remove", err: wrapDockerError(err) });
+    }
+  }
+  // F3:per-container codex auth 文件 best-effort 清理(绝不阻塞清理流程)。
+  //   - 本地容器:rm <codexContainerDir>/<cid>/auth.json + rmdir 空 parent
+  //   - 远端容器(v1.0.72):RPC DELETE /files?path=<远端 default 路径>;
+  //     deps.deleteRemoteCodexAuth 未注入 → skip;失败 → 吞错。
+  //     远端不 rmdir parent(node-agent 无该 endpoint),留空 <cid>/ 目录,
+  //     与 deleteRemoteCodexContainerAuth 注释一致。
+  if (!useRemote) {
+    try {
+      const codexContainerDir = readCodexContainerDirFromEnv();
+      await removeCodexContainerAuthDir(codexContainerDir, String(containerRow.id));
+    } catch {
+      /* swallow */
+    }
+  } else if (deps.deleteRemoteCodexAuth) {
+    try {
+      await deps.deleteRemoteCodexAuth(effectiveHostUuid!, String(containerRow.id));
+    } catch {
+      /* swallow */
+    }
+  }
+  // 容器确认已清理 + 之前只有 stop 失败(没有 remove 失败) → 视作完整成功
+  if (containerCleared && failures.every((f) => f.stage === "stop")) return;
+  if (failures.length > 0) throw aggregatePartialV3Cleanup(failures);
+}
+
+/**
  * 优雅停止并删除一个 active 容器,把 row 标 vanished。
  *
  * 顺序(2026-04-21 codex round 1 finding #4 修复):
@@ -3395,6 +3595,10 @@ export async function provisionV3Container(
  *   4. 任意 docker 步骤 wrapped 抛错 → 抛给 caller(admin 看错日志,但 row
  *      已经是 vanished,下次 ensureRunning 会判 "无 active 行" 走 provision,
  *      不会被半死行卡在 stopped/missing 状态再死循环)
+ *
+ * 实现拆成 markV3ContainerVanished + cleanupV3ContainerDocker,本函数用
+ * deps.pool 组合两块,对既有调用方签名/返回值/rowCount=0 告警/host_uuid 兜底
+ * 保持不变。idle sweep 不走本组合函数,改在持锁事务内直接 mark、COMMIT 后再 docker。
  *
  * 不删 volume(GC 走 3G,banned 7d / no-login 90d 才动)。
  *
@@ -3452,59 +3656,8 @@ export async function stopAndRemoveV3Container(
   options?: { requireNoOpenMigration?: boolean; requireIdleCutoffMin?: number },
 ): Promise<boolean> {
   // 1) DB 先翻 vanished —— admin 意图就是销毁,不依赖 docker 步骤是否干净。
-  //    用 RETURNING host_uuid 兜底:v1.0.20 修了 v3orphanReconcile 的 isNotFound bug
-  //    后,本函数其余 5 处调用点(idleSweep / ensureRunning stale recovery / admin
-  //    stop/restart/remove)都没传 host_uuid,跨 host 容器在远端 docker 不会被真清,
-  //    留下 ghost 撞下次 docker run name/IP 冲突 → host markCooldown(60s)反复 retry。
-  //    这里就近从 DB 读出 host_uuid,所有调用点自动 host-aware,零额外 query。
-  //
-  //  R6.11 Phase 2.C:requireNoOpenMigration=true 时加 NOT EXISTS 守卫,
-  //    rowCount=0 → 静默 false,不进 docker。详见函数 docstring 与
-  //    docs/v3/02-DEVELOPMENT-PLAN.md §14.2.6 reader/reconciler 单点权威约束。
-  //
-  //    **race 覆盖范围(诚实标注)**:READ COMMITTED 下 UPDATE 的子查询见到的是
-  //    *statement-start* snapshot 的 agent_migrations 行,**不**是 row lock 获取时
-  //    的最新行。因此本守卫覆盖的真实区间是「SELECT 完成 → 本条 UPDATE 语句开始」
-  //    之间 writer 已 commit 的 ledger 行;**不**覆盖「UPDATE 语句开始 → 行锁获得」
-  //    之间(微秒级)新 commit 的行。这是 best-effort 第二道闸,**主**安全机制仍是
-  //    reconciler 单点写入 — 任何漏过本守卫的极小窗口会在下一轮 reconciler tick(默认
-  //    60s)被识别。要真正闭合微秒窗口需引入 per-container advisory lock 或对
-  //    `agent_containers` 显式 SELECT … FOR UPDATE,Phase 2.D/3 视实测漏检率决定。
-  const guardSql = options?.requireNoOpenMigration === true
-    ? ` AND NOT EXISTS (
-          SELECT 1 FROM agent_migrations m
-           WHERE m.agent_container_id = agent_containers.id
-             AND m.phase NOT IN ('committed', 'rolled_back')
-        )`
-    : "";
-  // idle sweep 第二道闸:破坏性 UPDATE 当场重校 last_ws_activity,关掉 SELECT→stop
-  // 之间用户重连的 TOCTOU。不传该 option 时 SQL 与历史逐字节等价。
-  // 占位符序号由 updateParams 长度推导:guardSql 将来若带参数,先 push 再拼 idle,
-  // 禁止再写死 $4。
-  const idleCutoffMin = options?.requireIdleCutoffMin;
-  const updateParams: unknown[] = [
-    String(containerRow.id),
-    getRuntimeChannel(),
-    containerRow.container_internal_id ?? null,
-  ];
-  let idleSql = "";
-  if (typeof idleCutoffMin === "number" && Number.isFinite(idleCutoffMin)) {
-    updateParams.push(idleCutoffMin);
-    idleSql = ` AND last_ws_activity IS NOT NULL
-        AND last_ws_activity < NOW() - ($${updateParams.length}::int * interval '1 minute')`;
-  }
-  // P1d 跨 channel 防护:破坏性 UPDATE 必须带 runtime_channel 过滤 —— 否则任何传错(对方
-  // channel)id 的 caller 都会把对方行翻 vanished 并随后 docker stop/remove。$2=本实例 channel。
-  const updateResult = await deps.pool.query<{ host_uuid: string | null }>(
-    `UPDATE agent_containers
-        SET state='vanished',
-            updated_at=NOW()
-      WHERE id = $1 AND runtime_channel = $2
-        AND container_internal_id IS NOT DISTINCT FROM $3${guardSql}${idleSql}
-      RETURNING host_uuid`,
-    updateParams,
-  );
-  const rowFound = (updateResult.rowCount ?? 0) > 0;
+  const vanished = await markV3ContainerVanished(deps.pool, containerRow, options);
+  const rowFound = vanished.hit;
   if (!rowFound) {
     // rowCount=0 的三种成因统一不进 docker 清理:
     //   (a) requireNoOpenMigration 守卫拦截(并发 migration ledger 行);
@@ -3513,7 +3666,9 @@ export async function stopAndRemoveV3Container(
     // 三种情况都绝不能用 caller 提供的 container_internal_id 去 docker rm(c 会误删对方容器,
     // a/b 无主可清)。docker↔DB 残骸对账交由 channel-aware 的 orphanReconcile 单点权威兜底。
     // (a) 是正常守卫路径不告警;(b)/(c) 是 destructive 函数拿到 0 行的"意外",记一条诊断。
-    if (options?.requireNoOpenMigration !== true && idleSql === "") {
+    const hasIdleGuard = typeof options?.requireIdleCutoffMin === "number"
+      && Number.isFinite(options.requireIdleCutoffMin);
+    if (options?.requireNoOpenMigration !== true && !hasIdleGuard) {
       // eslint-disable-next-line no-console
       console.warn(
         `[v3supervisor.stopAndRemove] rowCount=0 for container ${containerRow.id} ` +
@@ -3523,121 +3678,7 @@ export async function stopAndRemoveV3Container(
     }
     return false;
   }
-  const dbHostUuid: string | null = updateResult.rows[0]?.host_uuid ?? null;
-  // caller 显式传 host_uuid 优先(reconcile 已显式传,且并发场景下 caller 更可信);
-  // caller 没传 → 用 UPDATE RETURNING 兜底。
-  const callerHostUuid: string | null = containerRow.host_uuid ?? null;
-  // caller vs DB 不一致 → 留诊断线索(理论不该发生,可能 row 被并发改 / 容器迁移)。
-  if (
-    callerHostUuid !== null
-    && dbHostUuid !== null
-    && callerHostUuid !== dbHostUuid
-  ) {
-    // eslint-disable-next-line no-console
-    console.warn("[v3supervisor.stopAndRemove] caller host_uuid != db host_uuid", {
-      containerId: containerRow.id,
-      callerHostUuid,
-      dbHostUuid,
-    });
-  }
-  const effectiveHostUuid: string | null = callerHostUuid ?? dbHostUuid;
-
-  // 2) 容器实际清理 best-effort;先 stop 再 remove,各自吞 missing。
-  //    R2 finding 加固:此后任何错都已经过了 DB UPDATE,意图已落库。
-  //    R3 finding 加固:stop 失败也仍然 try remove({force:true}) ——
-  //    force remove 通常能覆盖大部分 stop 失败 case(daemon 抖动、容器
-  //    死锁等),缩短"row vanished 但 docker 残骸还在"的窗口。
-  //    任一 stage 失败,记录,最后聚合抛 PartialV3Cleanup(含 stages)。
-  if (!containerRow.container_internal_id) return true;
-  const cid = containerRow.container_internal_id;
-  // 多 host 系统标志:selfHostId 已配 + containerService 注入。
-  // 单机 legacy 模式下 (selfHostId 缺失) host_uuid 为 null 是正常的,允许走本地。
-  const isMultiHost =
-    typeof deps.selfHostId === "string" && deps.containerService !== undefined;
-  // 安全 gate A:多 host 系统下 host 未知 → 不假设本地。
-  // 触发条件:UPDATE 0 行(row 已并发删 / id 错)且 caller 没传,
-  //         或 row 在 DB 里 host_uuid 就是 null(legacy row 跑在多 host 系统)。
-  // 默认本地 docker.remove 在跨 host 时是 noop(404),但语义上不对:
-  // 调用方期望"清这个容器",容器实际在远端,我们却往本地打。明确 skip + warn 比静默
-  // 好,出问题排障也能从日志看到 host_uuid 缺失。
-  if (effectiveHostUuid === null && isMultiHost) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      "[v3supervisor.stopAndRemove] host_uuid unknown in multi-host system, skipping docker cleanup",
-      { containerId: containerRow.id, cid, rowFound },
-    );
-    return true;
-  }
-  // 决定走远端还是本地(只在 effectiveHostUuid 非 null 时区分)。
-  const isRemote =
-    typeof effectiveHostUuid === "string"
-    && typeof deps.selfHostId === "string"
-    && effectiveHostUuid !== deps.selfHostId;
-  // 安全 gate B:cross-host 但 containerService 缺失 → 不静默回退本地(会清错宿主)。
-  // 跟 v3orphanReconcile 已有 fail-safe gate 语义一致(containerService 未注入 → skip)。
-  if (isRemote && deps.containerService === undefined) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      "[v3supervisor.stopAndRemove] cross-host row but containerService missing, skipping docker cleanup",
-      { containerId: containerRow.id, cid, hostUuid: effectiveHostUuid },
-    );
-    return true;
-  }
-  const useRemote = isRemote;
-  const failures: Array<{ stage: "stop" | "remove"; err: SupervisorError }> = [];
-  try {
-    if (useRemote) {
-      await deps.containerService!.stop(effectiveHostUuid!, cid, { timeoutSec });
-    } else {
-      await deps.docker.getContainer(cid).stop({ t: timeoutSec });
-    }
-  } catch (err) {
-    if (!isNotFound(err) && !isNotModified(err)) {
-      failures.push({ stage: "stop", err: wrapDockerError(err) });
-    }
-  }
-  // stop 失败后仍尝试 force remove;remove 成功 OR remove 404 (容器已不存在)
-  // 都视作清理完成(残骸已不在)。R4 finding:之前 remove 404 时只是不追加
-  // failure,但 stop 的 failure 还在,会误报 PartialV3Cleanup;实际上容器已没了,
-  // 应等同清理成功。
-  let containerCleared = false;
-  try {
-    if (useRemote) {
-      await deps.containerService!.remove(effectiveHostUuid!, cid, { force: true });
-    } else {
-      await deps.docker.getContainer(cid).remove({ force: true });
-    }
-    containerCleared = true;
-  } catch (err) {
-    if (isNotFound(err)) {
-      containerCleared = true; // 容器已不存在,清理目的达成
-    } else {
-      failures.push({ stage: "remove", err: wrapDockerError(err) });
-    }
-  }
-  // F3:per-container codex auth 文件 best-effort 清理(绝不阻塞清理流程)。
-  //   - 本地容器:rm <codexContainerDir>/<cid>/auth.json + rmdir 空 parent
-  //   - 远端容器(v1.0.72):RPC DELETE /files?path=<远端 default 路径>;
-  //     deps.deleteRemoteCodexAuth 未注入 → skip;失败 → 吞错。
-  //     远端不 rmdir parent(node-agent 无该 endpoint),留空 <cid>/ 目录,
-  //     与 deleteRemoteCodexContainerAuth 注释一致。
-  if (!useRemote) {
-    try {
-      const codexContainerDir = readCodexContainerDirFromEnv();
-      await removeCodexContainerAuthDir(codexContainerDir, String(containerRow.id));
-    } catch {
-      /* swallow */
-    }
-  } else if (deps.deleteRemoteCodexAuth) {
-    try {
-      await deps.deleteRemoteCodexAuth(effectiveHostUuid!, String(containerRow.id));
-    } catch {
-      /* swallow */
-    }
-  }
-  // 容器确认已清理 + 之前只有 stop 失败(没有 remove 失败) → 视作完整成功
-  if (containerCleared && failures.every((f) => f.stage === "stop")) return true;
-  if (failures.length > 0) throw aggregatePartialV3Cleanup(failures);
+  await cleanupV3ContainerDocker(deps, containerRow, timeoutSec, vanished.hostUuid);
   return true;
 }
 

@@ -925,16 +925,22 @@ export interface UserChatBridgeDeps {
     connectionTraceId: string,
   ) => Promise<WebSocket>;
   /**
-   * 可选:每收到一帧 client→container 消息时调用,用于刷 last_ws_activity。
+   * 可选:刷 last_ws_activity。client→container 帧 60s debounce 一次;桥接存活期间
+   * 另有周期性刷新(默认 5min,`activityKeepaliveIntervalMs`)。
    *
-   * bridge 内部做了 60s debounce(常量 `ACTIVITY_REFRESH_INTERVAL_MS`),所以 caller
-   * 不必再做节流。container→user 帧、ping/pong、心跳**都不刷**(防 chatty 输出
-   * 把 idle 假装成活跃)。markContainerActivity 自身要 fire-and-forget(不阻塞 bridge),
-   * 异常也要 swallow,典型实现包 `void markV3ContainerActivity(deps, cid)`。
+   * 对开着页面的用户扫掉容器换不来容量(前端 ~2s 重连会立刻 ensureRunning 再 provision),
+   * 所以「有活着的桥接连接」本身就算活跃。container→user 帧、ping/pong、心跳**都不刷**
+   * (防 chatty 输出把 idle 假装成活跃)。markContainerActivity 自身要 fire-and-forget
+   * (不阻塞 bridge),异常也要 swallow,典型实现包 `void markV3ContainerActivity(deps, cid)`。
    *
    * 没注入 / endpoint 没返 containerId → bridge 直接跳过这层逻辑(等价空实现)。
    */
   markContainerActivity?: (containerId: number) => void;
+  /**
+   * 桥接存活期间周期性刷 last_ws_activity 的间隔。默认 5min(idle cutoff 30min,留足余量)。
+   * 设 0 关闭(测试用)。没注入 markContainerActivity 时本字段无效果。
+   */
+  activityKeepaliveIntervalMs?: number;
   /**
    * 0049 模型授权(plan v3 §B3/§B4 + §F4)—— 桥接层是 v3 commercial **唯一**能
    * 看到 inbound.message 帧并且也能拿到 user role + grants 的位置:
@@ -1235,6 +1241,18 @@ export type CodexRouteDecision = CodexApiRelayRoute | CodexOfficialOAuthRoute | 
  * 也不会被误判 idle)。
  */
 const ACTIVITY_REFRESH_INTERVAL_MS = 60_000;
+
+/**
+ * 桥接存活期间周期性刷 last_ws_activity。
+ *
+ * 理由:开着标签页的用户被 idle sweep 掉容器后,WS close 不属于 policy/1008,
+ * 前端 classifyClose 默认 reconnect,~2s 后握手 ensureRunning 立刻重建。
+ * 扫掉换不来任何容量,只把容器内临时态/后台进程/预览服务毁一次。
+ * 因此「有连接」必须视为活跃。5min 间隔对 30min cutoff 留足余量。
+ * 与帧 debounce 共用 lastActivityRefreshAt,用户正在打字时 keepalive 是空转。
+ * **不**刷下行流/心跳(约束保持不变)。
+ */
+const ACTIVITY_KEEPALIVE_INTERVAL_MS = 5 * 60_000;
 
 /**
  * 0049 模型授权 refresh 间隔(plan v3 review v1 §F4 follow-up)。
@@ -1766,6 +1784,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const maxBufferedBytes = deps.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES;
   const connectTimeoutMs = deps.containerConnectTimeoutMs ?? DEFAULT_CONTAINER_CONNECT_TIMEOUT_MS;
   const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+  const activityKeepaliveIntervalMs = deps.activityKeepaliveIntervalMs ?? ACTIVITY_KEEPALIVE_INTERVAL_MS;
   const heartbeatTimeoutMs = deps.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
   const promptQueuePreparationTimeoutMs =
     Number.isSafeInteger(deps.promptQueuePreparationTimeoutMs) &&
@@ -2550,6 +2569,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let clientBuildForConnection: string | null = null;
     // 周期 refresh modelChecker 的定时器;cleanup() 务必清掉。
     let modelCheckerRefreshTimer: ReturnType<typeof setInterval> | null = null;
+    // 桥接存活 keepalive:有连接即刷 last_ws_activity。cleanup/detach 必须清掉,防泄漏。
+    let activityKeepaliveTimer: ReturnType<typeof setInterval> | null = null;
 
     // 客户端存活时间戳(只由 pong / 用户上行消息刷新 —— 真·client liveness)。
     // **不**被下行帧刷新(否则容器持续吐帧会架空下面的硬上限,Codex 审 MEDIUM)。
@@ -7673,6 +7694,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 不阻塞进程退出 —— bridge 不在则 timer 也无意义。
       modelCheckerRefreshTimer.unref?.();
     }
+
+    // 有活着的桥接连接本身就算活跃:开着标签页被扫掉会立刻被重连重建,
+    // 换不来容量。没注入 markActivity / 没 containerId → 与现状一致不刷。
+    // 只刷存活,不刷下行帧。与 60s 帧 debounce 共用 lastActivityRefreshAt。
+    if (markActivity && containerId !== undefined && activityKeepaliveIntervalMs > 0) {
+      activityKeepaliveTimer = setInterval(() => {
+        if (cleaned || userDetached) return;
+        if (userWs.readyState !== WebSocket.OPEN) return;
+        const now = Date.now();
+        if (now - lastActivityRefreshAt < ACTIVITY_REFRESH_INTERVAL_MS) return;
+        lastActivityRefreshAt = now;
+        try { markActivity(containerId); } catch { /* swallow — bridge 不挂 */ }
+      }, activityKeepaliveIntervalMs);
+      activityKeepaliveTimer.unref?.();
+    }
     userWs.on("close", (code, reason) => {
       // 把客户端关闭原因转给容器(透传 code/reason,容器侧也会触发 cleanup)
       // **注意**:不要在这里 close containerWs。drain 机制需要容器仍开着接收 billing
@@ -8295,6 +8331,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (modelCheckerRefreshTimer !== null) {
         clearInterval(modelCheckerRefreshTimer);
         modelCheckerRefreshTimer = null;
+      }
+      if (activityKeepaliveTimer !== null) {
+        clearInterval(activityKeepaliveTimer);
+        activityKeepaliveTimer = null;
       }
       // attestation 门的超时 timer:连接一走就必须清(否则 timer 到点后对一条已关的
       // 连接触发 recycle —— 把用户容器无辜换掉)。

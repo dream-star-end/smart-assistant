@@ -24,6 +24,8 @@ export {
 export {
   provisionV3Container,
   stopAndRemoveV3Container,
+  markV3ContainerVanished,
+  cleanupV3ContainerDocker,
   getV3ContainerStatus,
   markV3ContainerActivity,
   removeV3Volume,

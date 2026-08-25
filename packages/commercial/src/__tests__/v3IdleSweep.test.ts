@@ -47,6 +47,8 @@ function makeDocker(opts: {
   removeThrows?: Set<string>;
   /** true → inspect State.Running,走 turn drain;默认 404 missing,跳过 drain 直接放行 */
   inspectRunning?: boolean;
+  /** 与 FakePool.eventLog 共用,断言 COMMIT/release 与 docker 的先后 */
+  eventLog?: string[];
 } = {}): {
   docker: Docker;
   captured: DockerCaptured;
@@ -62,6 +64,7 @@ function makeDocker(opts: {
       throw e;
     },
     stop: async () => {
+      opts.eventLog?.push("docker-stop");
       if (opts.stopThrows?.has(id)) {
         const e = new Error(`stop failed for ${id}`) as Error & { statusCode: number };
         e.statusCode = 500;
@@ -70,6 +73,7 @@ function makeDocker(opts: {
       captured.stopped.push(id);
     },
     remove: async () => {
+      opts.eventLog?.push("docker-remove");
       if (opts.removeThrows?.has(id)) {
         const e = new Error(`remove failed for ${id}`) as Error & { statusCode: number };
         e.statusCode = 500;
@@ -129,6 +133,8 @@ class FakePool {
   /** getV3ContainerStatus 返回的 containerId 覆盖(模拟 generation changed) */
   statusContainerIdByUser = new Map<number, number>();
   txLog: Array<"BEGIN" | "COMMIT" | "ROLLBACK"> = [];
+  eventLog: string[] = [];
+  inTx = false;
 
   seed(row: Omit<FakeRow, "updated_at"> & { updated_at?: Date }): void {
     this.rows.push({
@@ -161,14 +167,20 @@ class FakePool {
     const trimmed = String(sql).trim();
     if (/^BEGIN/i.test(trimmed)) {
       this.txLog.push("BEGIN");
+      this.inTx = true;
+      this.eventLog.push("BEGIN");
       return { rowCount: 0, rows: [] };
     }
     if (/^COMMIT/i.test(trimmed)) {
       this.txLog.push("COMMIT");
+      this.inTx = false;
+      this.eventLog.push("COMMIT");
       return { rowCount: 0, rows: [] };
     }
     if (/^ROLLBACK/i.test(trimmed)) {
       this.txLog.push("ROLLBACK");
+      this.inTx = false;
+      this.eventLog.push("ROLLBACK");
       return { rowCount: 0, rows: [] };
     }
     if (/pg_try_advisory_xact_lock/i.test(trimmed)) {
@@ -274,6 +286,7 @@ class FakePool {
       /^UPDATE agent_containers/i.test(trimmed) &&
       /SET state='vanished'/i.test(trimmed)
     ) {
+      this.eventLog.push(this.inTx ? "vanished-update-in-tx" : "vanished-update-after-commit");
       const id = Number.parseInt(String(params?.[0]), 10);
       const hasGuard = /NOT EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+agent_migrations/i.test(trimmed);
       const hasIdle = /last_ws_activity IS NOT NULL/i.test(trimmed)
@@ -323,7 +336,7 @@ class FakePool {
     const self = this;
     return {
       query: (sql: string, params?: unknown[]) => self.query(sql, params),
-      release: () => { /* */ },
+      release: () => { self.eventLog.push("release"); },
     } as unknown as PoolClient;
   }
 
@@ -660,7 +673,7 @@ describe("runIdleSweepTick", () => {
     assert.equal(pool.rows[0]!.state, "active");
   });
 
-  test("COMMIT 后 UPDATE 因闲置谓词 miss → racedWithActivity 而非 racedWithMigration", async () => {
+  test("守卫 UPDATE 因闲置谓词 miss → racedWithActivity 而非 racedWithMigration", async () => {
     const pool = new FakePool();
     pool.seed({
       id: 86, user_id: 860, bound_ip: "172.30.86.1",
@@ -679,6 +692,68 @@ describe("runIdleSweepTick", () => {
     assert.equal(r.racedWithMigration, 0);
     assert.equal(captured.stopped.length, 0);
     assert.equal(pool.rows[0]!.state, "active");
+  });
+
+  test("drain accepted 后翻 vanished 的 UPDATE 在持锁事务 COMMIT 之前,docker 在 COMMIT+release 之后", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 87, user_id: 870, bound_ip: "172.30.87.1",
+      state: "active", port: 18789,
+      container_internal_id: "d-87",
+      last_ws_activity: makeStaleDate(45),
+    });
+    const { docker, captured } = makeDocker({
+      inspectRunning: true,
+      eventLog: pool.eventLog,
+    });
+    const r = await runIdleSweepTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+      adminRuntimeRecycleDrain: async () => "accepted",
+    });
+    assert.equal(r.swept, 1);
+    assert.equal(pool.rows[0]!.state, "vanished");
+    assert.deepEqual(captured.stopped, ["d-87"]);
+    const log = pool.eventLog;
+    const upd = log.indexOf("vanished-update-in-tx");
+    const commit = log.indexOf("COMMIT");
+    const rel = log.indexOf("release");
+    const dstop = log.indexOf("docker-stop");
+    assert.ok(upd >= 0, `missing in-tx vanished UPDATE: ${log.join(",")}`);
+    assert.equal(log.includes("vanished-update-after-commit"), false,
+      "破坏性 UPDATE 不得在 COMMIT 之后另开连接发出");
+    assert.ok(upd < commit, `UPDATE must precede COMMIT: ${log.join(",")}`);
+    assert.ok(commit < rel, `release must follow COMMIT: ${log.join(",")}`);
+    assert.ok(rel < dstop, `docker must follow release: ${log.join(",")}`);
+    assert.ok(commit < dstop, `docker must follow COMMIT: ${log.join(",")}`);
+  });
+
+  test("docker 抛错时 DB 仍保持 vanished 并记 errors", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 88, user_id: 880, bound_ip: "172.30.88.1",
+      state: "active", port: 18789,
+      container_internal_id: "d-88",
+      last_ws_activity: makeStaleDate(45),
+    });
+    const { docker } = makeDocker({
+      inspectRunning: true,
+      eventLog: pool.eventLog,
+      stopThrows: new Set(["d-88"]),
+      removeThrows: new Set(["d-88"]),
+    });
+    const r = await runIdleSweepTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+      adminRuntimeRecycleDrain: async () => "accepted",
+    });
+    assert.equal(r.swept, 0);
+    assert.equal(r.errors.length, 1);
+    assert.equal(r.errors[0]!.containerId, 88);
+    assert.match(r.errors[0]!.error, /after DB marked vanished/);
+    assert.equal(pool.rows[0]!.state, "vanished");
+    const log = pool.eventLog;
+    assert.ok(log.indexOf("vanished-update-in-tx") < log.indexOf("COMMIT"));
+    assert.ok(log.indexOf("COMMIT") < log.indexOf("docker-stop"));
+    assert.ok(log.indexOf("release") < log.indexOf("docker-stop"));
   });
 });
 

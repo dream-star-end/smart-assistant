@@ -76,6 +76,8 @@ async function startRig(opts: {
   maxFrameBytes?: number;
   maxBufferedBytes?: number;
   markContainerActivity?: (containerId: number) => void;
+  activityKeepaliveIntervalMs?: number;
+  heartbeatIntervalMs?: number;
   loadAllowedModelChecker?: UserChatBridgeDeps["loadAllowedModelChecker"];
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
   loadGoalState?: UserChatBridgeDeps["loadGoalState"];
@@ -119,6 +121,8 @@ async function startRig(opts: {
     maxBufferedBytes: opts.maxBufferedBytes,
     containerConnectTimeoutMs: 1500,
     markContainerActivity: opts.markContainerActivity,
+    activityKeepaliveIntervalMs: opts.activityKeepaliveIntervalMs,
+    heartbeatIntervalMs: opts.heartbeatIntervalMs,
     loadAllowedModelChecker: opts.loadAllowedModelChecker,
     loadMasterSessionMessages: opts.loadMasterSessionMessages,
     loadGoalState: opts.loadGoalState,
@@ -1188,6 +1192,66 @@ describe("userChatBridge — markContainerActivity (PR1 idle hibernate 前置)",
 
     ws.close();
     await waitClose(ws);
+    await stopRig(rig);
+  });
+
+  test("桥接连着但用户一直没发帧时,会按周期刷 last_ws_activity", async () => {
+    const seen: number[] = [];
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 77,
+      }),
+      markContainerActivity: (cid) => { seen.push(cid); },
+      activityKeepaliveIntervalMs: 80,
+      heartbeatIntervalMs: 0,
+    });
+    portRef.p = rig.containerPort;
+
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("504");
+    const ws = openClient(rig.gatewayPort, token);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    await containerOpenP;
+
+    // 不发任何用户帧;keepalive 80ms 后应刷一次(与 60s 帧 debounce 共用窗口,短测只见 1 次)
+    await waitFor(() => seen.length >= 1, 1500);
+    assert.equal(seen[0], 77, "keepalive 应透传 containerId");
+    assert.ok(seen.length >= 1, "开着的桥在无用户帧时也必须刷 last_ws_activity");
+
+    ws.close();
+    await waitClose(ws);
+    await stopRig(rig);
+  });
+
+  test("桥关闭后 keepalive 定时器被清掉、不再刷", async () => {
+    const seen: number[] = [];
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 78,
+      }),
+      markContainerActivity: (cid) => { seen.push(cid); },
+      activityKeepaliveIntervalMs: 80,
+      heartbeatIntervalMs: 0,
+    });
+    portRef.p = rig.containerPort;
+
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("505");
+    const ws = openClient(rig.gatewayPort, token);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    await containerOpenP;
+
+    await waitFor(() => seen.length >= 1, 1500);
+    ws.close();
+    await waitClose(ws);
+    await new Promise<void>((r) => setTimeout(r, 50));
+    const afterClose = seen.length;
+    await new Promise<void>((r) => setTimeout(r, 350));
+    assert.equal(seen.length, afterClose,
+      `桥关闭后不应再刷 last_ws_activity(关闭前 ${afterClose},之后 ${seen.length})`);
+
     await stopRig(rig);
   });
 });

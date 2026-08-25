@@ -10,8 +10,8 @@
  * R6.11 Phase 2.C 改造:
  *   - SELECT 加 open-migration NOT EXISTS predicate(`agent_migrations_open_by_container_idx`
  *     partial index 命中,99% 0 行场景 sub-ms);
- *   - stopAndRemoveV3Container 走 `requireNoOpenMigration: true` 守卫 SELECT-then-UPDATE
- *     race(writer 在 SELECT 之后 INSERT ledger 行),guard 拦截时返 false → 累加
+ *   - markV3ContainerVanished 走 `requireNoOpenMigration: true` 守卫 UPDATE
+ *     (writer 在 SELECT 之后 INSERT ledger 行),hit=false → 累加
  *     `racedWithMigration` 计数,**不**计入 swept 也**不**计入 errors。
  *
  * v5-safe 偿还(per-uid lock + FOR UPDATE 重读 last_ws_activity + turn 屏障):
@@ -19,18 +19,23 @@
  *     last_ws_activity,不满足 idle → racedWithActivity++;
  *   - 仍 idle 则照抄 admin drainV3BeforeAdminMutation 的 turn 屏障
  *     (getV3ContainerStatus + requestRuntimeRecycleDrain),busy/failed fail-closed;
- *   - drain accepted 后立刻 COMMIT 再 stopAndRemove(带 requireIdleCutoffMin),
- *     避免 FOR UPDATE 跨连接与破坏性 UPDATE 死锁,且 10s drain TTL 内马上停容器。
+ *   - drain accepted 后**同一 client** 做守卫 UPDATE 翻 vanished → COMMIT →
+ *     release → 事务外 docker stop/remove。破坏性 UPDATE 不得换连接,否则行锁
+ *     被 account-pool 等 FOR UPDATE 抢走时可能排队超过 drain 10s TTL,把新 turn 杀掉。
+ *   - docker 失败不回滚 DB(意图优先,残骸 orphanReconcile),记 errors。
  *
  * 语义:
  *   每 60s 跑一次,扫 `state='active' AND last_ws_activity < NOW() - INTERVAL N min`,
- *   命中行调用 supervisor.stopAndRemoveV3Container(标 vanished + 删 docker)。
+ *   命中行在持锁事务内 markV3ContainerVanished,COMMIT 后再 docker stop/remove。
  *   单行失败不影响其他行(每行独立 try/catch),但聚合 errors[] 给 caller 上报。
  *
  * `last_ws_activity` 何时被刷:
  *   1. provision 时初始化为 NOW()(v3supervisor.allocateBoundIpAndInsertRow)
  *   2. ensureRunning(uid) 命中 'running' 分支 → markV3ContainerActivity 刷新
  *   3. bridge 内 client→container 帧 60s debounce 写一次
+ *   4. bridge 存活期间每 5 分钟刷一次(开着标签页的连接本身就算活跃:扫掉容器
+ *      会被前端 ~2s 重连并重新 provision,换不来容量只产生 churn。
+ *      container→user 下行帧和心跳**仍不刷**)
  *
  * 不在本文件管:
  *   - mode='persistent' 健康巡检(MVP 没 mode,推迟到 P1 tickPersistentHealth)
@@ -49,8 +54,9 @@ import { getRuntimeChannel } from "../runtimeChannel.js";
 
 import { requestRuntimeRecycleDrain } from "./v3ensureRunning.js";
 import {
+  cleanupV3ContainerDocker,
   getV3ContainerStatus,
-  stopAndRemoveV3Container,
+  markV3ContainerVanished,
   tryAcquireUserLifecycleLock,
   type V3SupervisorDeps,
 } from "./v3supervisor.js";
@@ -101,7 +107,7 @@ export interface IdleSweepTickResult {
   swept: number;
   /**
    * SELECT-then-UPDATE 之间被并发 INSERT migration ledger 抢占的行数。
-   * `stopAndRemoveV3Container({ requireNoOpenMigration: true })` 返 false 时累加,
+   * `markV3ContainerVanished({ requireNoOpenMigration: true })` hit=false 时累加,
    * 不计入 `swept`(没真正 vanish)、不计入 `errors`(不是错,是合法让步)。
    *
    * 持续 > 0 表示有 migration writer 上线后 idle sweep 与 reconciler 在抢同一行,
@@ -170,8 +176,8 @@ interface StaleRow {
  * 场景 sub-ms;LEFT JOIN 强迫 PG 走 hash 或 nested loop,代价更高。
  *
  * SELECT-then-stopAndRemove 中间还可能有竞态(writer 在 SELECT 后 INSERT ledger):
- * 走 `stopAndRemoveV3Container(..., { requireNoOpenMigration: true })` 在 UPDATE 层
- * 用同一个 NOT EXISTS predicate 二次兜底,rowCount=0 → 返 false → racedWithMigration++。
+ * 走 `markV3ContainerVanished(..., { requireNoOpenMigration: true })` 在 UPDATE 层
+ * 用同一个 NOT EXISTS predicate 二次兜底,hit=false → racedWithMigration++。
  *
  * 用 `LIMIT batchLimit` 防一次扫太多;下一轮 60s 后还会跑,慢慢清空也无妨。
  */
@@ -270,12 +276,13 @@ async function turnBarrierSkipReason(
  * 查询失败回退 racedWithMigration,不把整行打进 errors。
  */
 async function classifyStopMiss(
-  deps: V3SupervisorDeps,
+  client: PoolClient,
   row: StaleRow,
   idleCutoffMin: number,
 ): Promise<RowSkipReason> {
   try {
-    const r = await deps.pool.query<{
+    // 仍持行锁:同一 client 上读到的就是此刻确定答案,不必再走 deps.pool。
+    const r = await client.query<{
       state: string;
       last_ws_activity: Date | null;
       container_internal_id: string | null;
@@ -314,11 +321,12 @@ async function classifyStopMiss(
 }
 
 /**
- * 单行:BEGIN → try lock → FOR UPDATE 重读 → turn 屏障 → COMMIT → 立刻 stop+remove。
+ * 单行:BEGIN → try lock → FOR UPDATE 重读 → turn 屏障 → 同一 client 守卫 UPDATE
+ * → COMMIT → **立刻 release** → 事务外 docker stop/remove。
  *
- * 破坏性 UPDATE 走 deps.pool(另一条连接),必须在 FOR UPDATE 释放之后才发,
- * 否则会跟本事务的行锁死锁。idle 谓词由 requireIdleCutoffMin 在 UPDATE 上兜底。
- * 锁与 client 在 finally 释放,含 docker 抛错路径。
+ * 破坏性 UPDATE 必须留在持锁事务内:换连接会跟 account-pool 等 FOR UPDATE 路径
+ * 排队,可能超过 drain 10s TTL。idle 谓词由 requireIdleCutoffMin 在 UPDATE 上兜底。
+ * docker 失败不回滚(DB 意图已 COMMIT),向上抛给 tick 记 errors。
  */
 async function sweepOneRow(
   deps: V3SupervisorDeps,
@@ -328,6 +336,12 @@ async function sweepOneRow(
 ): Promise<RowOutcome> {
   const client = await deps.pool.connect();
   let txOpen = false;
+  let released = false;
+  const releaseNow = (): void => {
+    if (released) return;
+    released = true;
+    client.release();
+  };
   try {
     await client.query("BEGIN");
     txOpen = true;
@@ -349,21 +363,32 @@ async function sweepOneRow(
       txOpen = false;
       return { kind: "skip", reason: barrier };
     }
-    // drain 成功只 arm 10s TTL —— 立刻释锁并 stop+remove,中间不再插入耗时步骤。
+    // drain 成功只 arm 10s TTL —— 同一 client 立刻翻 vanished,再 COMMIT。
+    const vanished = await markV3ContainerVanished(
+      client,
+      { id: row.id, container_internal_id: row.container_internal_id },
+      { requireNoOpenMigration: true, requireIdleCutoffMin: idleCutoffMin },
+    );
+    if (!vanished.hit) {
+      const reason = await classifyStopMiss(client, row, idleCutoffMin);
+      await client.query("COMMIT");
+      txOpen = false;
+      log?.debug?.("[v3/idleSweep] skipped after guarded UPDATE miss", {
+        containerId: row.id, reason,
+      });
+      return { kind: "skip", reason };
+    }
     await client.query("COMMIT");
     txOpen = false;
-    const ok = await stopAndRemoveV3Container(
+    // COMMIT 后立刻还连接,禁止攥着空闲 pg client 直到 docker 结束。
+    releaseNow();
+    await cleanupV3ContainerDocker(
       deps,
       { id: row.id, container_internal_id: row.container_internal_id },
       STOP_TIMEOUT_SEC,
-      { requireNoOpenMigration: true, requireIdleCutoffMin: idleCutoffMin },
+      vanished.hostUuid,
     );
-    if (ok) return { kind: "swept" };
-    const reason = await classifyStopMiss(deps, row, idleCutoffMin);
-    log?.debug?.("[v3/idleSweep] skipped after guarded UPDATE miss", {
-      containerId: row.id, reason,
-    });
-    return { kind: "skip", reason };
+    return { kind: "swept" };
   } catch (err) {
     if (txOpen) {
       try { await client.query("ROLLBACK"); } catch { /* swallow */ }
@@ -371,9 +396,10 @@ async function sweepOneRow(
     }
     throw err;
   } finally {
-    client.release();
+    releaseNow();
   }
 }
+
 
 // ───────────────────────────────────────────────────────────────────────
 // 单次 tick:scan + stop+remove
