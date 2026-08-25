@@ -45,15 +45,7 @@ import {
 } from "lucide-react";
 import { agentDisplayName } from "../chat/agentNames";
 import { mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
-import {
-  asArr,
-  asStr,
-  detectShellFileWrites,
-  parseCodexTypeName,
-  safeSubtaskDescription,
-  shortPath,
-  stripShellWrapperForDisplay,
-} from "./format";
+import { asArr, asStr, detectShellFileWrites, parseCodexTypeName, safeSubtaskDescription, shortPath, stripShellWrapperForDisplay } from "./format";
 
 /** 工具卡图标底色语义(对齐设计稿 aurora-conversation-cards 的 .tic.tn-* 分色)。 */
 export type ToolTone = "accent" | "success" | "info" | "warning" | "neutral";
@@ -310,16 +302,12 @@ export function humanizeOp(op: string): string {
 }
 
 function commandOp(command: string, cli: string): string {
-  const match = new RegExp(`(?:^|[\\n;&|]\\s*)${cli.replace("-", "\\-")}\\s+([\\w-]+)`, "i").exec(
-    command,
-  );
+  const match = new RegExp(`(?:^|[\\n;&|]\\s*)${cli.replace("-", "\\-")}\\s+([\\w-]+)`, "i").exec(command);
   return (match?.[1] ?? "").toLowerCase();
 }
 
 function commandFlag(command: string, flag: string): string {
-  const match = new RegExp(`(?:^|\\s)--${flag}(?:=|\\s+)(?:"([^"]*)"|'([^']*)'|(\\S+))`).exec(
-    command,
-  );
+  const match = new RegExp(`(?:^|\\s)--${flag}(?:=|\\s+)(?:"([^"]*)"|'([^']*)'|(\\S+))`).exec(command);
   const value = match?.[1] ?? match?.[2] ?? match?.[3] ?? "";
   // `--goal --agent-id` 这类缺值：捕获到的是下一个 flag，视为没取到。
   if (value.startsWith("--")) return "";
@@ -335,9 +323,7 @@ function humanSummaryToken(value: string | undefined | null): string {
 
 function browserCommandArgs(command: string, op: string): string[] {
   if (!op) return [];
-  const match = new RegExp(`oc-browser\\s+${op.replace("-", "\\-")}\\b([^\\n;&|]*)`, "i").exec(
-    command,
-  );
+  const match = new RegExp(`oc-browser\\s+${op.replace("-", "\\-")}\\b([^\\n;&|]*)`, "i").exec(command);
   if (!match) return [];
   return [...(match[1] ?? "").matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map(
     (token) => token[1] ?? token[2] ?? token[3] ?? "",
@@ -443,10 +429,7 @@ function ocCommandSummary(cli: OcCli, command: string): string {
     const url = commandFlag(command, "url") || command.match(/https?:\/\/[^\s'";|]+/)?.[0] || "";
     return url && !url.startsWith("-") ? displayDomain(url) : "";
   }
-  const invocation = new RegExp(
-    `${cli.replace("-", "\\-")}\\s+${op}\\s+([^\\s;&|]+)(?:\\s+([^\\s;&|]+))?`,
-    "i",
-  ).exec(command);
+  const invocation = new RegExp(`${cli.replace("-", "\\-")}\\s+${op}\\s+([^\\s;&|]+)(?:\\s+([^\\s;&|]+))?`, "i").exec(command);
   if (cli === "oc-plugin" || cli === "oc-connect") {
     if (op === "call") {
       const head = humanSummaryToken(invocation?.[1]);
@@ -459,14 +442,9 @@ function ocCommandSummary(cli: OcCli, command: string): string {
   if (cli === "oc-market") {
     return humanSummaryToken(invocation?.[1]);
   }
-  if (
-    cli === "oc-memory" &&
-    (op === "delegate" || op === "request-review" || op === "delegate-wait")
-  ) {
+  if (cli === "oc-memory" && (op === "delegate" || op === "request-review" || op === "delegate-wait")) {
     // 取不到 goal/draft 就留空，绝不回退到 op 或 `--help` 这类 flag 名。
-    return humanSummaryToken(
-      commandFlag(command, "goal") || commandFlag(command, "draft") || invocation?.[1],
-    );
+    return humanSummaryToken(commandFlag(command, "goal") || commandFlag(command, "draft") || invocation?.[1]);
   }
   return "";
 }
@@ -475,7 +453,10 @@ function ocCommandSummary(cli: OcCli, command: string): string {
  * 为工具名解析图标 + 标签（处理 MCP 名）。
  * 优先级：builtin > MCP per-op > MCP server 兜底 > 通用扳手。
  */
-export function resolveToolMeta(name: string, input?: Record<string, unknown> | null): ToolMeta {
+export function resolveToolMeta(
+  name: string,
+  input?: Record<string, unknown> | null,
+): ToolMeta {
   // Bash 命令若调用 oc-* CLI,给专属语义卡而非通用"终端"卡。
   if (name === "Bash" && input) {
     // 展示层剥壳兜底(历史消息带 /bin/bash -lc 包装),否则 oc-*/写文件检测在包装内失配。
@@ -505,8 +486,7 @@ export function resolveToolMeta(name: string, input?: Record<string, unknown> | 
     // op 级 meta 没单独配 tone 时继承 server tone(再退 accent)。
     if (opMeta) return { ...opMeta, tone: opMeta.tone ?? srvMeta?.tone ?? "accent" };
     const opLabel = humanizeOp(mcp.op) || mcp.server;
-    if (srvMeta)
-      return { icon: srvMeta.icon, label: `${srvMeta.label}: ${opLabel}`, tone: srvMeta.tone };
+    if (srvMeta) return { icon: srvMeta.icon, label: `${srvMeta.label}: ${opLabel}`, tone: srvMeta.tone };
     return { icon: Wrench, label: opLabel, tone: "neutral" };
   }
   const mapped = mappedLiveActivityLabel(name);
@@ -581,10 +561,9 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
     }
     case "AskUserQuestion": {
       const qs = asArr(input.questions);
-      const first =
-        qs[0] && typeof qs[0] === "object"
-          ? asStr((qs[0] as Record<string, unknown>).question)
-          : "";
+      const first = qs[0] && typeof qs[0] === "object"
+        ? asStr((qs[0] as Record<string, unknown>).question)
+        : "";
       return first ? `${qs.length} 个问题: ${first.slice(0, 40)}` : `${qs.length} 个问题`;
     }
     case "delegate_tasks":
@@ -602,10 +581,8 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
   if (!input) return "";
   if (server === "browser") {
     if (op === "browser_navigate" || op === "browser_navigate_back") return asStr(input.url);
-    if (op === "browser_click" || op === "browser_hover")
-      return asStr(input.element) || asStr(input.ref);
-    if (op === "browser_type" || op === "browser_press_key")
-      return asStr(input.text) || asStr(input.key);
+    if (op === "browser_click" || op === "browser_hover") return asStr(input.element) || asStr(input.ref);
+    if (op === "browser_type" || op === "browser_press_key") return asStr(input.text) || asStr(input.key);
     if (op === "browser_take_screenshot") return asStr(input.filename);
     if (op === "browser_evaluate" || op === "browser_run_code")
       return (asStr(input.code) || asStr(input.function)).replace(/\s+/g, " ").slice(0, 60);
@@ -613,32 +590,24 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     return op;
   }
   if (server === "minimax-media") {
-    if (
-      op === "text_to_image" ||
-      op === "generate_video" ||
-      op === "music_generation" ||
-      op === "text_to_audio"
-    ) {
+    if (op === "text_to_image" || op === "generate_video" || op === "music_generation" || op === "text_to_audio") {
       return (asStr(input.prompt) || asStr(input.text) || asStr(input.lyrics)).slice(0, 60);
     }
     if (op === "query_video_generation") return asStr(input.task_id);
     return op;
   }
   if (server === "minimax-vision" || server === "openclaude-vision") {
-    if (op === "understand_image")
-      return (asStr(input.prompt) || asStr(input.question)).slice(0, 60);
+    if (op === "understand_image") return (asStr(input.prompt) || asStr(input.question)).slice(0, 60);
     if (op === "web_search") return asStr(input.query);
     return op;
   }
   if (server === "openclaude-memory") {
-    if (op === "memory")
-      return `${asStr(input.action) || asStr(input.op) || "read"} ${asStr(input.target) || asStr(input.section)}`.trim();
+    if (op === "memory") return `${asStr(input.action) || asStr(input.op) || "read"} ${asStr(input.target) || asStr(input.section)}`.trim();
     if (op === "archival_add" || op === "archival_search" || op === "archival_delete") {
       return asStr(input.query) || asStr(input.id) || asStr(input.text).slice(0, 50);
     }
     if (op === "session_search") return asStr(input.query);
-    if (op === "create_reminder")
-      return asStr(input.message) || asStr(input.label) || asStr(input.schedule);
+    if (op === "create_reminder") return asStr(input.message) || asStr(input.label) || asStr(input.schedule);
     if (op === "list_reminders") return "";
     if (op === "update_reminder" || op === "delete_reminder") {
       return (asStr(input.message) || asStr(input.label) || asStr(input.id)).slice(0, 50);
@@ -652,8 +621,7 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
       });
       return `${tgt}${title}`.trim();
     }
-    if (op === "skill_view" || op === "skill_delete" || op === "skill_save")
-      return asStr(input.name);
+    if (op === "skill_view" || op === "skill_delete" || op === "skill_save") return asStr(input.name);
     if (op === "skill_search") return asStr(input.query);
     if (op === "ask_gpt55_codex") return (asStr(input.goal) || asStr(input.context)).slice(0, 60);
     if (op === "task_create") return asStr(input.title);
@@ -674,11 +642,7 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
       const ids = asArr(input.identifiers);
       return ids.length ? `${ids.length} 篇` : "";
     }
-    if (
-      op === "scansci_pdf_download" ||
-      op === "scansci_pdf_citation" ||
-      op === "scansci_pdf_resolve_and_download"
-    ) {
+    if (op === "scansci_pdf_download" || op === "scansci_pdf_citation" || op === "scansci_pdf_resolve_and_download") {
       return (asStr(input.identifier) || asStr(input.file_path)).slice(0, 70);
     }
     if (op === "scansci_pdf_parse_list") return shortPath(input.file_path);
@@ -692,14 +656,10 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
 function codexSummary(codexType: string, input: Record<string, unknown>): string {
   if (codexType === "imageView") return shortPath(input.path || input.url);
   if (codexType === "imageGeneration") {
-    return (asStr(input.prompt) || asStr(input.revisedPrompt) || shortPath(input.savedPath)).slice(
-      0,
-      60,
-    );
+    return (asStr(input.prompt) || asStr(input.revisedPrompt) || shortPath(input.savedPath)).slice(0, 60);
   }
   if (codexType === "contextCompaction") return "";
-  if (codexType === "enteredReviewMode" || codexType === "exitedReviewMode")
-    return asStr(input.note);
+  if (codexType === "enteredReviewMode" || codexType === "exitedReviewMode") return asStr(input.note);
   if (codexType === "dynamicToolCall" || codexType === "mcpToolCall") {
     return asStr(input.tool) || asStr(input.toolName) || asStr(input.name);
   }

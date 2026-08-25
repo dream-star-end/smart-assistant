@@ -24,7 +24,10 @@ import { cn } from "../lib/utils";
 import { TokenUsageBadge, type DisplayTokenUsage } from "./chat/tokenUsage";
 import { ToolBody } from "./tool/bodies";
 import { ToolInspectOpenContext, useArtifactInspect } from "./tool/context";
-import { type ToolLike, normalizeToolForDisplay } from "./tool/format";
+import {
+  type ToolLike,
+  normalizeToolForDisplay,
+} from "./tool/format";
 import { resolveToolMeta, toolSummary } from "./tool/meta";
 import { Badge, Spinner } from "./ui";
 
@@ -105,9 +108,7 @@ export function ToolCard({
   const hasError = !!renderTool.error || reportedError;
   // 历史 tape 是不可变真记录：turn 已中断时，未完成 tool 代表被取消，而不是仍在运行。
   const isInterruptedHistorical =
-    !completed &&
-    renderTool._timelineRecord === true &&
-    renderTool._dispatchOutcome === "interrupted";
+    !completed && renderTool._timelineRecord === true && renderTool._dispatchOutcome === "interrupted";
   // 取消(如 Codex item status 'cancelled')是中性终态:≠ 失败(不红)、≠ 运行中(不转圈)。
   const isCancelled = !hasError && (!!renderTool.cancelled || isInterruptedHistorical);
   const isRunning = !completed && !hasError && !isBlocked && !isCancelled;

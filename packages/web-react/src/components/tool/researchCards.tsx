@@ -12,6 +12,7 @@ import {
   AppWindow,
   Archive,
   BookOpen,
+  Bot,
   Camera,
   CheckCircle2,
   ChevronDown,
@@ -32,6 +33,7 @@ import {
   Package,
   Quote,
   Search,
+  ShieldCheck,
   Trophy,
   Video,
   XCircle,
@@ -1356,8 +1358,8 @@ const MEMORY_SEARCH_SPEC: Record<string, { icon: ReactNode; title: string }> = {
 };
 
 const MEMORY_DELEGATE_SPEC: Record<string, { icon: ReactNode; title: string }> = {
-  delegate: { icon: <CheckCircle2 className="size-4" />, title: "委派子任务" },
-  "request-review": { icon: <FileText className="size-4" />, title: "质量审查" },
+  delegate: { icon: <Bot className="size-4" />, title: "委派子任务" },
+  "request-review": { icon: <ShieldCheck className="size-4" />, title: "质量审查" },
   "delegate-wait": { icon: <Clock className="size-4" />, title: "等待委派" },
 };
 
