@@ -96,6 +96,7 @@ export type SdkEvent =
 const MAX_QUEUE_SIZE = 1000
 const queue: SdkEvent[] = []
 let flushListener: ((events: SdkEvent[]) => void) | null = null
+const emittedTaskTerminatedIds = new Set<string>()
 
 export function enqueueSdkEvent(event: SdkEvent): void {
   // SDK events are only consumed (drained) in headless/streaming mode.
@@ -179,6 +180,10 @@ export function emitTaskTerminatedSdk(
     usage?: { total_tokens: number; tool_uses: number; duration_ms: number }
   },
 ): void {
+  // Record before enqueue so print.ts can skip the XML bookend even when
+  // TUI mode no-ops enqueueSdkEvent. Paths that both emit here and later
+  // dequeue the XML would otherwise double-write stdout.
+  emittedTaskTerminatedIds.add(taskId)
   enqueueSdkEvent({
     type: 'system',
     subtype: 'task_notification',
@@ -189,6 +194,14 @@ export function emitTaskTerminatedSdk(
     summary: opts?.summary ?? '',
     usage: opts?.usage,
   })
+}
+
+export function hasEmittedTaskTerminatedSdk(taskId: string): boolean {
+  return emittedTaskTerminatedIds.has(taskId)
+}
+
+export function resetEmittedTaskTerminatedSdkForTests(): void {
+  emittedTaskTerminatedIds.clear()
 }
 
 // The three payload fields of a bash_output_tail frame that define its

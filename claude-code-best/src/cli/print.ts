@@ -357,7 +357,11 @@ import { unassignTeammateTasks } from '../utils/tasks.js'
 import { getRunningTasks } from '../utils/task/framework.js'
 import { isBackgroundTask } from '../tasks/types.js'
 import { stopTask } from '../tasks/stopTask.js'
-import { drainSdkEvents, setFlushListener } from '../utils/sdkEventQueue.js'
+import {
+  drainSdkEvents,
+  hasEmittedTaskTerminatedSdk,
+  setFlushListener,
+} from '../utils/sdkEventQueue.js'
 import { initializeGrowthBook } from '../services/analytics/growthbook.js'
 import { errorMessage, toError } from '../utils/errors.js'
 import { sleep } from '../utils/sleep.js'
@@ -2143,8 +2147,10 @@ function runHeadlessStreaming(
             // <status> (they're progress pings); emitting them here would
             // default to 'completed' and falsely close the task for SDK
             // consumers. Terminal bookends are now emitted directly via
-            // emitTaskTerminatedSdk, so skipping statusless events is safe.
-            if (statusMatch) {
+            // emitTaskTerminatedSdk; skip a second stdout write for the same
+            // task_id so XML dequeue cannot double-emit.
+            const bookendTaskId = taskIdMatch?.[1] ?? ''
+            if (statusMatch && !hasEmittedTaskTerminatedSdk(bookendTaskId)) {
               output.enqueue({
                 type: 'system',
                 subtype: 'task_notification',

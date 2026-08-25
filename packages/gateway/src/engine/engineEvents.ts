@@ -218,6 +218,16 @@ export type EngineContentEvent =
   // `outbound.turn_status` 帧推给前端。受控枚举,不透传任意底座内部状态 —— 防协议
   // 被底座私有状态污染。审计 R3:retrying 形态已进权威类型,不再经 cast 穿透。
   | { kind: 'turn_status'; status: EngineTurnPhase }
+  // CCB local-agent bookend. Not a transcript block — sessionManager /
+  // server.ts consume it as a sideband to wake the parent session.
+  | {
+      kind: 'task_notification'
+      taskId: string
+      status: string
+      outputFile: string
+      summary: string
+      toolUseId?: string
+    }
 
 /**
  * EngineAdapter → sessionManager 的 canonical 事件模型。

@@ -3,6 +3,9 @@ import {
 	type BashTailSnapshot,
 	bashTailFingerprint,
 	dedupeBashOutputTail,
+	emitTaskTerminatedSdk,
+	hasEmittedTaskTerminatedSdk,
+	resetEmittedTaskTerminatedSdkForTests,
 } from "../sdkEventQueue";
 
 const snap = (
@@ -131,5 +134,20 @@ describe("bashTailFingerprint", () => {
 		const a = bashTailFingerprint(snap("x".repeat(1000), 1000));
 		const b = bashTailFingerprint(snap(`${"x".repeat(999)}y`, 1000));
 		expect(a).not.toBe(b);
+	});
+});
+
+describe("emitTaskTerminatedSdk bookend tracking", () => {
+	test("records the task id so print.ts can skip a second stdout bookend", () => {
+		resetEmittedTaskTerminatedSdkForTests();
+		expect(hasEmittedTaskTerminatedSdk("agt-bookend")).toBe(false);
+		emitTaskTerminatedSdk("agt-bookend", "completed", {
+			outputFile: "/tmp/out",
+			summary: "done",
+		});
+		expect(hasEmittedTaskTerminatedSdk("agt-bookend")).toBe(true);
+		expect(hasEmittedTaskTerminatedSdk("other")).toBe(false);
+		resetEmittedTaskTerminatedSdkForTests();
+		expect(hasEmittedTaskTerminatedSdk("agt-bookend")).toBe(false);
 	});
 });

@@ -1794,6 +1794,18 @@ export class SessionManager {
    * 都在 server.ts 的 WS handler 内,移动代价比暴露一个清理 hook 大得多。
    */
   public onSessionDestroyed?: (sessionKey: string) => void
+  /** CCB local-agent bookend with no live turn (or as a second path while
+   * a turn's onEvent is also live). server.ts plans origin-inject here. */
+  public onCcbTaskNotification?: (
+    session: AgentSession,
+    payload: {
+      taskId: string
+      status: string
+      outputFile: string
+      summary: string
+      toolUseId?: string
+    },
+  ) => void
 
   // ── Phase 5: GitHub session repo wiring ──
   /**
@@ -3470,6 +3482,15 @@ export class SessionManager {
       agentProvider: opts.agent.provider,
       _contextRebuildNotice: contextRebuildNotice,
     }
+    runner.on('task_notification', (payload: {
+      taskId: string
+      status: string
+      outputFile: string
+      summary: string
+      toolUseId?: string
+    }) => {
+      this.onCcbTaskNotification?.(session, payload)
+    })
     runner.on('session_id', (id: string) => {
       session.ccbSessionId = id
       // Remember which provider produced this id — the next getOrCreate on
