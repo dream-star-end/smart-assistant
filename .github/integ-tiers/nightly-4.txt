@@ -1,10 +1,10 @@
-# 夜跑梯队 · 分片 4 —— 单条 migration 回放
 #
+#
+# max-minutes: 30
+# min-tests: 1
+# 夜跑梯队 · 分片 4 —— 单条 migration 回放
 # 每个文件锁一条历史迁移的行为。migrate/migrate_full 已在 PR 门守住"整链能从零
 # 重放且校验和不漂",这一片补的是"某条迁移在有存量数据时的搬运语义"。
-#
-# min-tests: 1
-# max-minutes: 30
 packages/commercial/src/__tests__/migration0135.integ.test.ts
 packages/commercial/src/__tests__/migration0149.integ.test.ts
 packages/commercial/src/__tests__/migration0150.integ.test.ts
@@ -48,3 +48,4 @@ packages/commercial/src/__tests__/migration0246.integ.test.ts
 packages/commercial/src/__tests__/migration0247.integ.test.ts
 packages/commercial/src/__tests__/migration0247CursorOpus48.integ.test.ts
 packages/commercial/src/__tests__/migration0251.integ.test.ts
+packages/commercial/src/__tests__/migration0253.integ.test.ts

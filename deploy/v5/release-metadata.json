@@ -133,7 +133,8 @@
     "0249_usage_board_project_attribution",
     "0250_ccb_egress_region_one_proxy",
     "0251_cursor_sand_mode",
-    "0252_grok_route_context_kind"
+    "0252_grok_route_context_kind",
+    "0253_active_claude_proxy_uniqueness"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
