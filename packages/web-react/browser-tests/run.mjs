@@ -952,12 +952,12 @@ await check("T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录�
     "团队队员卡",
   );
 
-  await assertVisibleButtonSet("#timeline-agent-root", ["终端printf exact完成"], "通用 ToolCard");
+  await assertVisibleButtonSet("#timeline-agent-root", ["收起终端详情"], "通用 ToolCard");
 });
 
 await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度", async () => {
   const root = page.locator("#tool-card-polish-root");
-  const header = root.getByRole("button", { name: /搜索 AI 市场.*browser.*完成/ });
+  const header = root.getByRole("button", { name: "展开AI 市场详情" });
   await header.waitFor({ state: "visible", timeout: 3000 });
   const box = await header.boundingBox();
   if (!box || box.height < TOUCH_MIN) throw new Error(`工具卡头部高度=${box?.height ?? 0}px，应至少 44px`);
@@ -979,7 +979,7 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
   const width = await root.evaluate((node) => ({ client: node.clientWidth, scroll: node.scrollWidth }));
   if (width.scroll > width.client) throw new Error(`375px 级工具卡横向溢出:${JSON.stringify(width)}`);
   // 折叠态按钮名单恰好只剩卡头(同 T12:正向名单代替恒真的文案缺席断言)。
-  await assertVisibleButtonSet("#tool-card-polish-root", ["搜索 AI 市场browser完成"], "美化后的工具卡");
+  await assertVisibleButtonSet("#tool-card-polish-root", ["展开AI 市场详情"], "美化后的工具卡");
 });
 
 await check("T36 被中断历史子任务显示已取消，实时未完成子任务仍运行中", async () => {
@@ -1031,7 +1031,7 @@ async function runAskQuestionMobileCase() {
   await page.evaluate(() => window.__mountAskQuestion());
   const dialog = page.getByRole("dialog", { name: "用户问答" });
   await dialog.waitFor({ state: "visible", timeout: 3000 });
-  await dialog.getByRole("button", { name: /仿古画卷2\.5D/ }).click();
+  await dialog.getByRole("radio", { name: /仿古画卷2\.5D/ }).click();
   await dialog.getByRole("button", { name: "提交" }).click();
   await dialog.waitFor({ state: "hidden", timeout: 3000 });
   const responses = await page.evaluate(() => window.__askQuestion.responses);
