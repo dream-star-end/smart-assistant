@@ -1362,7 +1362,12 @@ export function MessageList({
     if (!el || didSnapToBottomRef.current) return;
     if (itemCountRef.current === 0) return;
     didSnapToBottomRef.current = true;
-    followBottomRef?.scrollToBottom?.(el);
+    if (typeof followBottomRef?.scrollToBottom === "function") {
+      followBottomRef.scrollToBottom(el);
+    } else {
+      // 无 controller 的只读消费方(admin/教程/harness)一次性初始定位,不参与 stick 竞态
+      el.scrollTop = el.scrollHeight;
+    }
   }, [scrollParent, windowVersion, messages.length, sessionId]);
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
