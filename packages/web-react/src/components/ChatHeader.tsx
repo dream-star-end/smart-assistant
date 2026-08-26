@@ -121,6 +121,7 @@ export function ChatHeader({
         <button
           type="button"
           data-testid="chat-project-breadcrumb"
+          data-product-control="project-breadcrumb"
           onClick={onOpenProjectScope}
           className="hidden min-w-0 max-w-[14rem] truncate rounded-lg px-2 py-1 text-caption text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:inline-block"
           title={[projectBreadcrumb.workName, projectBreadcrumb.chatName].filter(Boolean).join(" / ")}

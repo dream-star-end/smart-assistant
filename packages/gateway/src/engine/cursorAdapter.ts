@@ -660,6 +660,7 @@ interface TurnCtx {
   params: TurnParams; startedAt: number; proc: ChildProcessByStdio<null, Readable, Readable> | null
   assistantText: string; thinkingText: string; assistantSegments: SegmentRecord[]; thinkingSegments: SegmentRecord[]
   tools: Map<string, TurnToolEntry>; pending: Set<string>; startedTools: Map<string, number>
+  silentToolIds: Set<string>; presentOptionsCount: number
   stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; resolveDrain: (() => void) | null; interrupted: boolean; error: string | null; resultSeen: boolean; resultDetail: string | null; usage?: ReportedUsage
   assistantPartialText: string; pendingAssistantText: string | null
   assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
@@ -1472,7 +1473,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.stopPendingKeepalive()
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, resultSeen: false, resultDetail: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), silentToolIds: new Set(), presentOptionsCount: 0, stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, resultSeen: false, resultDetail: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { ctx.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => {
       // Only ever settle this turn's own barrier: shutdown() may have already
@@ -1880,14 +1881,15 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     const rawId = rawIdOverride ?? (rawToolIdOf(event) || this.nextFallbackToolId(ctx))
     const id = this.safeToolId(ctx, rawId)
     const name = toolNameOf(event); const input = toolInputOf(event)
-    if (ctx.tools.has(id)) return
+    if (ctx.tools.has(id) || ctx.silentToolIds.has(id)) return
     this.flushPendingAssistant(ctx, false)
     if (name === 'PresentOptions') {
-      const fence = formatPresentOptionsFence(input)
-      if (fence) this.emitText(ctx, 'text', fence.endsWith('\n') ? fence : `${fence}\n`, true)
-      const silent: TurnToolEntry = { toolUseId: id, blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: textOf(input).slice(0, 500), output: '', completed: false, isError: false, durationMs: 0, ts: Date.now(), arrivedAt: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() }
-      ctx.tools.set(id, silent); ctx.pending.add(id); ctx.startedTools.set(id, keepaliveNow()); ctx.params.toolUseIdToName.set(id, name)
-      this.ensurePendingKeepalive()
+      ctx.silentToolIds.add(id)
+      ctx.presentOptionsCount += 1
+      if (ctx.presentOptionsCount <= 4) {
+        const fence = formatPresentOptionsFence(input)
+        if (fence) this.emitText(ctx, 'text', fence.endsWith('\n') ? fence : `${fence}\n`, true)
+      }
       return
     }
     this.closeContentSegments(ctx)
@@ -1900,12 +1902,12 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private toolResult(ctx: TurnCtx, event: CursorEvent): void {
     const rawId = rawToolIdOf(event) || this.nextFallbackToolId(ctx)
     const id = this.safeToolId(ctx, rawId)
-    if (!ctx.tools.has(id)) this.toolStart(ctx, event, rawId)
-    const tool = ctx.tools.get(id)!; if (tool.completed) return
+    if (!ctx.tools.has(id) && !ctx.silentToolIds.has(id)) this.toolStart(ctx, event, rawId)
+    if (ctx.silentToolIds.delete(id)) return
+    const tool = ctx.tools.get(id); if (!tool || tool.completed) return
     const { output, outputJson } = toolOutputOf(event); const isError = toolFailed(event)
     Object.assign(tool, { output, outputJson: structuredClone(outputJson), completed: true, isError, durationMs: Date.now() - (ctx.startedTools.get(id) ?? Date.now()), ts: Date.now() }); ctx.pending.delete(id)
     if (ctx.pending.size === 0) this.stopPendingKeepalive()
-    if (tool.toolName === 'PresentOptions') return
     ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output, outputJson: structuredClone(outputJson), preview: output.slice(0, 500) } }); ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview: output.slice(0, 500), isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview } })
   }
   private finish(ctx: TurnCtx, detail: string | null): void {

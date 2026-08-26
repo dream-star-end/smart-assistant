@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import {
+  createPresentOptionsCallBudget,
   formatPresentOptionsFence,
   handlePresentOptions,
   normalizePresentOptions,
@@ -87,6 +88,13 @@ describe('handlePresentOptions', () => {
     assert.match(other.message, /only available on the Cursor engine/)
     const bad = handlePresentOptions({ options: [] }, { engineId: 'cursor', delegationDepth: 0 })
     assert.equal(bad.ok, false)
+  })
+})
+
+describe('createPresentOptionsCallBudget', () => {
+  it('每个 MCP 进程只放行前四次调用', () => {
+    const consume = createPresentOptionsCallBudget(4)
+    assert.deepEqual(Array.from({ length: 5 }, () => consume()), [true, true, true, true, false])
   })
 })
 

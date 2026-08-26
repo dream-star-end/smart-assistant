@@ -102,6 +102,16 @@ export function shouldListPresentOptions(engineId: string, delegationDepth: numb
   return engineId === 'cursor' && delegationDepth <= 0
 }
 
+export function createPresentOptionsCallBudget(limit = 4): () => boolean {
+  const maxCalls = Math.max(0, Math.floor(limit))
+  let used = 0
+  return () => {
+    if (used >= maxCalls) return false
+    used += 1
+    return true
+  }
+}
+
 export function handlePresentOptions(
   args: unknown,
   ctx: { engineId: string; delegationDepth: number },

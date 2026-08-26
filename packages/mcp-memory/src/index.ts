@@ -90,7 +90,11 @@ import {
   handleTaskUpdate,
 } from './taskboardMcp.js'
 import { SKILL_PROPOSE_TOOL, TOOLS, normalizeAskUserQuestions } from './toolDefs.js'
-import { handlePresentOptions, shouldListPresentOptions } from './presentOptions.js'
+import {
+  createPresentOptionsCallBudget,
+  handlePresentOptions,
+  shouldListPresentOptions,
+} from './presentOptions.js'
 import {
   cursorDelegateCliHint,
   isCursorHiddenDelegateTool,
@@ -109,6 +113,7 @@ const DELEGATION_DEPTH = Math.max(
 const ENGINE_ID = (process.env.OPENCLAUDE_ENGINE || '').trim().toLowerCase()
 const ASK_USER_MCP_ESCAPE = process.env.OC_ASK_USER_MCP === '1'
 const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
+const consumePresentOptionsCall = createPresentOptionsCallBudget(4)
 
 function buildSkillStore(): SkillStore {
   const projectId = (process.env.OPENCLAUDE_PROJECT_ID ?? '').trim()
@@ -265,6 +270,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'ask_user':
         return await handleAskUser(args as any)
       case 'present_options': {
+        if (!consumePresentOptionsCall()) {
+          return toolError('present_options 每回合最多调用 4 次')
+        }
         const result = handlePresentOptions(args, {
           engineId: ENGINE_ID,
           delegationDepth: DELEGATION_DEPTH,
