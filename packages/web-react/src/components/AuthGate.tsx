@@ -327,7 +327,7 @@ export function AuthGate({
   }
 
   const titles: Record<AuthMode, { h: string; sub: string }> = {
-    login: { h: `欢迎使用 ${BRAND.name}`, sub: BRAND.tagline },
+    login: { h: `欢迎使用 ${BRAND.name}`, sub: `${BRAND.nameEn} · ${BRAND.tagline}` },
     register: { h: "创建账号", sub: "注册即可免费开始，每月赠 300 积分" },
     verify: { h: "验证邮箱", sub: `验证码已发往 ${email.trim() || "你的邮箱"}` },
     forgot: { h: "找回密码", sub: "输入注册邮箱，我们发你一个重置链接" },

@@ -467,7 +467,9 @@ function AboutSection() {
         </Avatar>
         <div>
           <div className="text-title font-semibold text-fg">{BRAND.name}</div>
-          <div className="text-caption text-faint">{BRAND.slogan}</div>
+          <div className="text-caption text-faint">
+            {BRAND.nameEn} · {BRAND.slogan}
+          </div>
         </div>
       </div>
       <p className="mt-4 text-body leading-relaxed text-muted">{BRAND.intro}</p>

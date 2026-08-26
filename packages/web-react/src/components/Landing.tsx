@@ -32,10 +32,15 @@ import { Button, buttonVariants } from './ui'
 
 function Logo({ compact = false }: { compact?: boolean }) {
   return (
-    <div className="flex items-center gap-2.5" aria-label={BRAND.name}>
+    <div className="flex items-center gap-2.5" aria-label={`${BRAND.name} · ${BRAND.nameEn}`}>
       <BrandMark glow className={compact ? 'size-8' : 'size-9'} />
-      <span className="text-[19px] font-semibold tracking-[-0.04em] text-[#f5f4ed]">
-        {BRAND.name}
+      <span className="flex flex-col leading-none">
+        <span className={`font-semibold tracking-[-0.04em] text-[#f5f4ed] ${compact ? 'text-[17px]' : 'text-[19px]'}`}>
+          {BRAND.name}
+        </span>
+        <span className="mt-1 text-[10px] font-medium uppercase tracking-[0.18em] text-[#8b9086]">
+          {BRAND.nameEn}
+        </span>
       </span>
     </div>
   )
