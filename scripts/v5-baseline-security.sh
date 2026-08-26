@@ -53,8 +53,9 @@ EXPECTED_SKILLS=(
 )
 
 # Serving predecessor compatibility only: pre-admin/taskboard releases may lack
-# the two admin prompt variants and the cursor/taskboard skills. New releases
-# remain exact-manifest strict.
+# the two admin prompt variants and the cursor/taskboard skills; releases built
+# before the SSH skill landed may lack that skill too. New releases remain
+# exact-manifest strict.
 ALLOW_LEGACY_BASELINE_GAPS=0
 
 die() {
@@ -101,8 +102,11 @@ assert_structure() { # <baseline-dir>
 
   skills_expected="$(printf '%s\n' "${EXPECTED_SKILLS[@]}")"
   if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 ]]; then
-    [[ -e "$root/skills/cursor-cli" ]] || skills_expected="$(grep -vx cursor-cli <<<"$skills_expected")"
-    [[ -e "$root/skills/manage-taskboard" ]] || skills_expected="$(grep -vx manage-taskboard <<<"$skills_expected")"
+    for skill in cursor-cli manage-taskboard ssh; do
+      if [[ ! -e "$root/skills/$skill" ]]; then
+        skills_expected="$(grep -vx "$skill" <<<"$skills_expected")"
+      fi
+    done
   fi
   skills_expected="$(sorted_lines <<<"$skills_expected")"
   # Runtime resolveCcbBaselineMounts() enumerates every skills/ entry before it
@@ -114,8 +118,10 @@ assert_structure() { # <baseline-dir>
   # 与 runtime resolveCcbBaselineMounts() 同一白名单(2026-07-16 扩展):
   # skill 目录允许恰好 {SKILL.md} 或 {SKILL.md, evals/};evals/ 内恰好一个 evals.json。
   for skill in "${EXPECTED_SKILLS[@]}"; do
-    if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 && ! -e "$root/skills/$skill" && ( "$skill" == cursor-cli || "$skill" == manage-taskboard ) ]]; then
-      continue
+    if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 && ! -e "$root/skills/$skill" ]]; then
+      case "$skill" in
+        cursor-cli|manage-taskboard|ssh) continue ;;
+      esac
     fi
     [[ -d "$root/skills/$skill" ]] || die "missing skill directory: $skill"
     entries="$(find -P "$root/skills/$skill" -mindepth 1 -maxdepth 1 -printf '%f\n' | sorted_lines)"

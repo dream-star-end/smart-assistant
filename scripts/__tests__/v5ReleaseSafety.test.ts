@@ -1709,7 +1709,7 @@ describe('v5 release safety lanes', () => {
     assert.match(untraversableResult.stderr, /not world-readable\/traversable/)
   })
 
-  test('legacy serving baseline compat allows only pre-admin cursor/taskboard gaps', async () => {
+  test('legacy serving baseline compat allows only pre-admin cursor/taskboard/ssh gaps', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-legacy-cursor-')); dirs.push(dir)
     const release = path.join(dir, 'release')
     const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
@@ -1717,6 +1717,7 @@ describe('v5 release safety lanes', () => {
     await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
     await rm(path.join(baseline, 'skills/cursor-cli'), { recursive: true })
     await rm(path.join(baseline, 'skills/manage-taskboard'), { recursive: true })
+    await rm(path.join(baseline, 'skills/ssh'), { recursive: true })
     await rm(path.join(baseline, 'AGENTS.admin.md'))
     await rm(path.join(baseline, 'CLAUDE.admin.md'))
     const strict = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
@@ -1728,6 +1729,11 @@ describe('v5 release safety lanes', () => {
     const drift = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', release], { encoding: 'utf8' })
     assert.notEqual(drift.status, 0)
     assert.match(drift.stderr, /skill manifest mismatch/)
+    await rm(path.join(baseline, 'skills/undeclared'), { recursive: true })
+    await rm(path.join(baseline, 'skills/system-info'), { recursive: true })
+    const forbiddenGap = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', release], { encoding: 'utf8' })
+    assert.notEqual(forbiddenGap.status, 0)
+    assert.match(forbiddenGap.stderr, /skill manifest mismatch/)
 
     const source = await readFile(deploy, 'utf8')
     const prepare = source.match(/prepare_live_baseline_safety\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
