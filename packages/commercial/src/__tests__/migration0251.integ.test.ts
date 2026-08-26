@@ -5,16 +5,28 @@
  *   'npx tsx --test --test-force-exit packages/commercial/src/__tests__/migration0251.integ.test.ts'
  */
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { describe, test } from "node:test";
+import { fileURLToPath } from "node:url";
 
+import { generatePersona } from "../account-pool/persona.js";
 import { query } from "../db/queries.js";
 import { resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
 
 const db = useDedicatedTestDatabase("cursor_sand_0251_test");
+const here = path.dirname(fileURLToPath(import.meta.url));
+const migrationPath = path.resolve(here, "../db/migrations/0251_cursor_sand_mode.sql");
+
+async function loadSql(): Promise<string> {
+  return readFile(migrationPath, "utf8");
+}
 
 describe("0251 cursor sand mode", () => {
-  test("adds cursor_sand_enabled with false default", async () => {
-    await resetAndMigrateBefore("0251_cursor_sand_mode");
+  test("adds cursor_sand_enabled with false default", async (t) => {
+    if (db.skipIfUnavailable(t)) return;
+    await resetAndMigrateBefore("0251");
+    await query(await loadSql());
 
     const col = await query<{ column_default: string | null; is_nullable: string }>(
       `SELECT column_default, is_nullable
@@ -34,8 +46,9 @@ describe("0251 cursor sand mode", () => {
          'cursor', 'cursor-sand-test', 'max',
          decode('00','hex'), decode('000000000000000000000000','hex'),
          NULL, NULL,
-         'v5', '{}'::jsonb
+         'v5', $1::jsonb
        ) RETURNING cursor_sand_enabled AS sand`,
+      [JSON.stringify(generatePersona())],
     );
     assert.equal(inserted.rows[0]?.sand, false);
 
