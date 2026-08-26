@@ -2063,16 +2063,94 @@ setInterval(() => {}, 1000);
     }
     assert.equal(_internals.toolNameOf(other as never), 'mcp__openclaude-memory__skill_search')
 
-    // preamble 必须把正文 options 围栏指认为 cursor 的提问通道,且不再引导 ask_user。
+    const present = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-mcp-present',
+        mcpToolCall: {
+          args: {
+            serverIdentifier: 'openclaude-memory',
+            toolName: 'present_options',
+            args: {
+              question: '要不要换 baseline？',
+              options: [{ label: '现在换' }, { label: '先不换' }],
+            },
+          },
+        },
+      },
+    }
+    assert.equal(_internals.toolNameOf(present as never), 'PresentOptions')
+    assert.deepEqual(_internals.toolInputOf(present as never), {
+      question: '要不要换 baseline？',
+      options: [{ label: '现在换' }, { label: '先不换' }],
+    })
+    assert.ok(_internals.OPENCLAUDE_MEMORY_MCP_TOOLS.includes('present_options'))
+    assert.equal(_internals.OPENCLAUDE_MEMORY_MCP_TOOLS.includes('ask_user'), false)
+
+    // preamble 优先 present_options,围栏仅作 fallback,且不再引导 ask_user。
+    assert.ok(
+      _internals.CURSOR_PREAMBLE.includes('`present_options`'),
+      'preamble must point cursor at present_options',
+    )
     assert.ok(
       _internals.CURSOR_PREAMBLE.includes('fenced `options`'),
-      'preamble must point cursor at the inline options fence',
+      'preamble must keep the inline options fence as fallback',
     )
     assert.equal(
       _internals.CURSOR_PREAMBLE.includes('`ask_user`'),
       false,
       'preamble must not advertise ask_user',
     )
+  })
+
+  test('present_options injects an options fence and hides the tool card', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-present-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+for(const e of [
+  {type:'text',text:'请选：'},
+  {type:'tool_call',subtype:'started',call_id:'po-1',tool_call:{mcpToolCall:{args:{name:'openclaude-memory-present_options',args:{question:'要不要换 baseline？',options:[{label:'现在换'},{label:'先不换'}]},toolName:'present_options',serverIdentifier:'openclaude-memory'}}}},
+  {type:'tool_call',subtype:'completed',call_id:'po-1',tool_call:{mcpToolCall:{args:{name:'openclaude-memory-present_options',args:{question:'要不要换 baseline？',options:[{label:'现在换'},{label:'先不换'}]},toolName:'present_options',serverIdentifier:'openclaude-memory'},result:{success:{content:[{text:{text:'选项卡已投递'}}],isError:false}}}}},
+  {type:'result',subtype:'success',is_error:false},
+]) console.log(JSON.stringify(e))
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const events: EngineEvent[] = []
+      const run = adapter.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        onEvent: (event) => events.push(event),
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+      assert.match(summary?.assistantText ?? '', /```options/)
+      assert.match(summary?.assistantText ?? '', /要不要换 baseline？/)
+      assert.equal(
+        events.some((event) => event.kind === 'block' && event.block.kind === 'tool_use'),
+        false,
+        'present_options must not emit a visible tool_use card',
+      )
+      assert.equal(
+        events.some((event) => event.kind === 'block' && event.block.kind === 'tool_result'),
+        false,
+        'present_options must not emit a visible tool_result card',
+      )
+      assert.equal(summary?.tools[0]?.toolName, 'PresentOptions')
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   test('declares native-resume with a cursor-session resume kind', () => {

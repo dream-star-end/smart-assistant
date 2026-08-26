@@ -90,6 +90,7 @@ import {
   handleTaskUpdate,
 } from './taskboardMcp.js'
 import { SKILL_PROPOSE_TOOL, TOOLS, normalizeAskUserQuestions } from './toolDefs.js'
+import { handlePresentOptions, shouldListPresentOptions } from './presentOptions.js'
 import {
   cursorDelegateCliHint,
   isCursorHiddenDelegateTool,
@@ -196,6 +197,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (DELEGATION_DEPTH > 0 || !ASK_USER_ENABLED || !ASK_USER_MCP_ESCAPE) {
     base = base.filter((t) => t.name !== 'ask_user')
   }
+  // present_options 默认对 Cursor 主会话暴露(不看 OC_ASK_USER_MCP)。
+  // 子 agent / 非 Cursor 引擎不列出;CallTool 侧还有短路兜底。
+  if (!shouldListPresentOptions(ENGINE_ID, DELEGATION_DEPTH)) {
+    base = base.filter((t) => t.name !== 'present_options')
+  }
   if (ENGINE_ID === 'cursor') {
     base = base.filter((t) => !isCursorHiddenDelegateTool(t.name, 'cursor'))
   }
@@ -258,6 +264,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleTaskGet(args as any)
       case 'ask_user':
         return await handleAskUser(args as any)
+      case 'present_options': {
+        const result = handlePresentOptions(args, {
+          engineId: ENGINE_ID,
+          delegationDepth: DELEGATION_DEPTH,
+        })
+        return result.ok ? toolOk(result.message) : toolError(result.message)
+      }
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
     }

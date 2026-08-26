@@ -111,7 +111,7 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 需要用户在 Web 对话中对少数选项做决定时,按当前引擎选择提问通道:
 - CCB: 调用原生 \`AskUserQuestion\` 并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。
 - Codex: 调用原生 \`request_user_input\` 并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。
-- Cursor: 在正文输出 fenced \`options\` 代码块(语言标记必须是 \`options\`),块内是单个合法 JSON 对象,字段为 \`question?: string\`、\`multi?: boolean\`(仅 \`=== true\` 时多选)、\`options: Array<{label: string, desc?: string}>\`(1–12 项,超过 12 项整块解析失败)。一条回复最多 4 个 options 块;同一条回复里的多块会聚合成一次提交。闭围栏必须独占一行,后面不能再有任何字符,写完立刻换行。贴完立刻结束本回合,options 块之后不要再写正文;多个 options 块之间用空行分隔。用户点选后会作为下一条普通用户消息到达。禁止调用 Cursor 原生 ask 工具(会被托管运行时立即跳过、用户永远看不到),也不要再调用 MCP \`ask_user\`。
+- Cursor: 优先调用 MCP \`present_options\`(一次一题,一条回复最多 4 次;工具立刻返回,卡面由适配器注入)。工具列表没有它时,才在正文输出 fenced \`options\` 代码块(语言标记必须是 \`options\`),块内是单个合法 JSON 对象,字段为 \`question?: string\`、\`multi?: boolean\`(仅 \`=== true\` 时多选)、\`options: Array<{label: string, desc?: string}>\`(1–12 项,超过 12 项整块解析失败)。一条回复最多 4 个 options 块;同一条回复里的多块会聚合成一次提交。闭围栏必须独占一行,后面不能再有任何字符,写完立刻换行。贴完立刻结束本回合,options 块之后不要再写正文;多个 options 块之间用空行分隔。用户点选后会作为下一条普通用户消息到达。禁止调用 Cursor 原生 ask 工具(会被托管运行时立即跳过、用户永远看不到),也不要再调用 MCP \`ask_user\`。
 若当前工具列表没有专用提问工具(如子 agent),用普通文字列出编号选项并结束本轮回复,由用户下一条消息作答。
 
 ## 子 Agent 与并行处理
@@ -777,8 +777,8 @@ export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<Pr
   if (ctx.frozenProjectContext) {
     const index = ctx.frozenProjectContext.officialMemoryIndex
     const header = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
-正式条目由人工晋升；磁盘上未经 ledger 核验的 memory/*.md 不会注入。
-动态事实必须 live 核验，不得把过期候选当事实。新沉淀请写候选（memory-candidates/），不要改正式文件。
+正式条目由台账登记；磁盘上未经 ledger 核验的 memory/*.md 不会注入。
+动态事实必须 live 核验，不得把过期条目当事实。新沉淀请写候选（memory-candidates/，登记后立即生效），不要改正式文件。
 检索：\`oc-memory project-search "<query>"\`（不污染 core-search）。`
     if (!index) return { name: 'PROJECT_MEMORY', content: header }
     return { name: 'PROJECT_MEMORY', content: `${header}\n\n## 项目索引\n\n${index}` }
@@ -805,8 +805,8 @@ export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<Pr
     return null
   }
   const header = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
-正式条目由人工晋升；磁盘上未经 ledger 核验的 memory/*.md 不会注入。
-动态事实必须 live 核验，不得把过期候选当事实。新沉淀请写候选（memory-candidates/），不要改正式文件。
+正式条目由台账登记；磁盘上未经 ledger 核验的 memory/*.md 不会注入。
+动态事实必须 live 核验，不得把过期条目当事实。新沉淀请写候选（memory-candidates/，登记后立即生效），不要改正式文件。
 检索：\`oc-memory project-search "<query>"\`（不污染 core-search）。`
   if (!index) return { name: 'PROJECT_MEMORY', content: header }
   return {

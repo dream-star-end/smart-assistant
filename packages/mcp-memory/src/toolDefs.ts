@@ -529,6 +529,40 @@ export const TOOLS = [
       required: ['questions'],
     },
   },
+  {
+    name: 'present_options',
+    description: [
+      '向当前网页用户投递一道选择题卡片。调用后立刻返回（不阻塞、不等待、不轮询）。',
+      '返回后必须立刻结束本回合；用户点选会作为下一条普通用户消息到达。',
+      '一次调用一道题；一条回复最多 4 次。options 1-12 项。',
+      '不要自己再写 ```options 围栏（适配器会注入）。不要调用原生 ask 工具。',
+      '必须在当前会话有活跃 turn 时调用；子 agent 环境会直接返回 skipped,',
+      '此时自行决策或在最终答复里列编号选项让用户文字作答。仅 Cursor 主会话可用。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: '题面（可选）' },
+        multi: { type: 'boolean', description: '仅 true 时多选' },
+        options: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 12,
+          description: '选项；label 必填，desc 可选。',
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: '选项文案（必填）' },
+              desc: { type: 'string', description: '选项补充说明' },
+            },
+            required: ['label'],
+          },
+        },
+      },
+      required: ['options'],
+      additionalProperties: false,
+    },
+  },
 ]
 
 /**

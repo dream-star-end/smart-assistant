@@ -344,6 +344,7 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.ok(prompt.includes('一条回复最多 4 个 options 块'))
     assert.ok(prompt.includes('同一条回复里的多块会聚合成一次提交'))
     assert.ok(prompt.includes('也不要再调用 MCP `ask_user`'))
+    assert.ok(prompt.includes('优先调用 MCP `present_options`'))
     assert.ok(!prompt.includes('提问一律走 `ask_user`'))
   })
   it('原生容器网站预览 SOP 覆盖常驻 prompt、Codex 基线与平台 skill', () => {
