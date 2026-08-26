@@ -957,7 +957,7 @@ await check("T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录�
 
 await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度", async () => {
   const root = page.locator("#tool-card-polish-root");
-  const header = root.getByRole("button", { name: "展开AI 市场详情" });
+  const header = root.getByRole("button", { name: "展开搜索 AI 市场详情" });
   await header.waitFor({ state: "visible", timeout: 3000 });
   const box = await header.boundingBox();
   if (!box || box.height < TOUCH_MIN) throw new Error(`工具卡头部高度=${box?.height ?? 0}px，应至少 44px`);
@@ -979,7 +979,7 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
   const width = await root.evaluate((node) => ({ client: node.clientWidth, scroll: node.scrollWidth }));
   if (width.scroll > width.client) throw new Error(`375px 级工具卡横向溢出:${JSON.stringify(width)}`);
   // 折叠态按钮名单恰好只剩卡头(同 T12:正向名单代替恒真的文案缺席断言)。
-  await assertVisibleButtonSet("#tool-card-polish-root", ["展开AI 市场详情"], "美化后的工具卡");
+  await assertVisibleButtonSet("#tool-card-polish-root", ["展开搜索 AI 市场详情"], "美化后的工具卡");
 });
 
 await check("T36 被中断历史子任务显示已取消，实时未完成子任务仍运行中", async () => {
@@ -2413,7 +2413,7 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
     ["用量", "会话用量明细"],
     ["偏好", "外观主题"],
     ["反馈", "反馈内容"],
-    ["关于", "让复杂，从简。"],
+    ["关于", "Clarvy · 让复杂，从简。"],
   ];
 
   async function assertNoOverflow(dialog, label) {
