@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -12,16 +12,27 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..'
 const TSX = join(REPO_ROOT, 'node_modules/tsx/dist/cli.mjs')
 const ENTRY = join(REPO_ROOT, 'packages/mcp-memory/src/ocMemoryCli.ts')
 
-function runCli(home: string, args: string[]): Promise<RunResult> {
+function runCli(
+  home: string,
+  args: string[],
+  extraEnv: Record<string, string | undefined> = {},
+): Promise<RunResult> {
   return new Promise((done, reject) => {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: home,
+      OPENCLAUDE_HOME: home,
+      OC_AGENT_ID: 'cli-test-agent',
+    }
+    delete env.OPENCLAUDE_DELEGATE_CONTEXT_FILE
+    delete env.OPENCLAUDE_AGENT_ID
+    for (const [key, value] of Object.entries(extraEnv)) {
+      if (value === undefined) delete env[key]
+      else env[key] = value
+    }
     const child = spawn(process.execPath, [TSX, ENTRY, ...args], {
       cwd: REPO_ROOT,
-      env: {
-        ...process.env,
-        HOME: home,
-        OPENCLAUDE_HOME: home,
-        OC_AGENT_ID: 'cli-test-agent',
-      },
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let stdout = ''
@@ -117,6 +128,33 @@ test('oc-memory covers help, retired Core, Recall and all Archival operations', 
     result = await runCli(home, ['archival-search', id])
     assert.equal(result.code, 0, result.stderr)
     assert.match(result.stdout, /No archival entries match/)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('oc-memory delegate rejects self-delegate', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'oc-memory-cli-self-'))
+  const ctx = join(home, 'delegate-context')
+  writeFileSync(ctx, 'tok-self-delegate\n')
+  try {
+    let result = await runCli(
+      home,
+      ['delegate', '--goal', '自诊断', '--agent-id', 'cli-test-agent'],
+      { OPENCLAUDE_DELEGATE_CONTEXT_FILE: ctx },
+    )
+    assert.equal(result.code, 1)
+    assert.match(result.stderr, /oc-memory:/)
+    assert.match(result.stderr, /不能把任务委派给自己/)
+
+    result = await runCli(home, ['delegate', '--goal', '缺省自身'], {
+      OPENCLAUDE_DELEGATE_CONTEXT_FILE: ctx,
+      OC_AGENT_ID: 'main',
+      OPENCLAUDE_AGENT_ID: undefined,
+    })
+    assert.equal(result.code, 1)
+    assert.match(result.stderr, /oc-memory:/)
+    assert.match(result.stderr, /不能把任务委派给自己/)
   } finally {
     rmSync(home, { recursive: true, force: true })
   }

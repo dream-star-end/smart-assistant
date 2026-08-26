@@ -366,7 +366,12 @@ import {
   type DelegateJobHttpResult,
 } from './delegateJobs.js'
 import { DelegateResumeRegistry } from './delegateResume.js'
-import { isPlatformAgentId, parseDelegateModel } from './delegateModel.js'
+import { isPlatformAgentId, parseDelegateAllowSelf, parseDelegateModel, rejectSelfDelegate } from './delegateModel.js'
+import { EMPTY_COMPLETED_TURN_NOTICE, hasPlatedAssistantOutput } from './emptyCompletedTurn.js'
+import {
+  rebindOutboundClientMessageId,
+  resolveDelegateProgressBinding,
+} from './terminalStreamFence.js'
 import {
   acquireDelegateGrokRoute,
   delegateGrokMintModelId,
@@ -10864,6 +10869,12 @@ export class Gateway {
       : typeof sourceAgent === 'string'
         ? sourceAgent
         : undefined
+    const selfCheck = rejectSelfDelegate({
+      callerAgentId: sourceAgentId,
+      targetAgentId,
+      allowSelf: parseDelegateAllowSelf(parsed.allowSelf),
+    })
+    if (!selfCheck.ok) return this.sendError(res, 400, selfCheck.error)
     // 同步 preflight:mint/resume/占用必须在任何 await 和创建 async job 之前完成,
     // 这样 running 响应已经带着权威 sessionKey,并发 resume 也能立刻 409。
     const resume = (this._delegateResume ??= new DelegateResumeRegistry()).preflight({
@@ -11298,13 +11309,8 @@ export class Gateway {
     const nestLabel = nestedProgress
       ? [...(progressRouting?.ancestorAgentPath ?? []), targetAgentId].join('↳')
       : ''
-    // Capture webchat-ancestor cmid at closure creation. Leftover live
-    // journals are minted when delegate_progress is persisted without a
-    // clientMessageId; persist must not guess the in-flight cmid.
-    const parentCmid = progressTarget
-      ? this.sessions.getByKey(progressTarget.sessionKey)?._runningClientMessageId
-        ?? this.sessions.getByKey(progressTarget.sessionKey)?._currentDispatch?.clientMessageId
-      : undefined
+    // Live lookup each emit: a retry may have moved the parent cmid, and a
+    // terminated parent must not keep receiving dispatch:<old>:N frames.
     const emitProgress = (block: DelegateProgressBlock | null) => {
       if (!progressTarget || !block) return
       // 嵌套:把本委派的原始进度帧统一重写成「挂到一级卡上的带层级前缀非终态文本行」
@@ -11317,12 +11323,21 @@ export class Gateway {
           })
         : block
       if (!outBlock) return
+      const parentSession = this.sessions.getByKey(progressTarget.sessionKey)
+      const liveCmid =
+        parentSession?._runningClientMessageId ??
+        parentSession?._currentDispatch?.clientMessageId
+      const binding = resolveDelegateProgressBinding({
+        candidate: typeof liveCmid === 'string' ? liveCmid : undefined,
+        isFenced: (cmid) =>
+          this._outboundRing?.isTurnFenced(progressTarget.sessionKey, cmid) === true,
+      })
       const out = {
         type: 'outbound.message' as const,
         sessionKey: progressTarget.sessionKey,
         channel: progressTarget.channel,
         peer: { id: progressTarget.peerId, kind: 'dm' as const },
-        ...(isClientMessageId(parentCmid) ? { clientMessageId: parentCmid } : {}),
+        ...(binding.clientMessageId ? { clientMessageId: binding.clientMessageId } : {}),
         blocks: [outBlock as any],
         isFinal: false,
         _userId: progressTarget.userId,
@@ -17698,6 +17713,20 @@ export class Gateway {
           // WeChat gets exactly one final text message.  If the agent completed
           // with no assistant text (tools-only/interrupted edge), still send a
           // terminal marker so the user is not left with only the start link.
+          const plated = hasPlatedAssistantOutput({
+            blocks: [...aggregatedBlocks, ...out.blocks],
+            extraText: autoDreamAssistantText,
+          })
+          if (!plated) {
+            this.deliver(
+              {
+                ...out,
+                blocks: [{ kind: 'text', text: EMPTY_COMPLETED_TURN_NOTICE } as any],
+                isFinal: false,
+              },
+              undefined,
+            )
+          }
           this.deliver({ ...out, blocks: [], isFinal: true, meta: e.meta }, undefined)
           const wechatFinalBlocks =
             aggregatedBlocks.length > 0
@@ -17710,6 +17739,20 @@ export class Gateway {
           // 拷贝一份脱钩本地引用。
           this.deliver({ ...out, blocks: aggregatedBlocks.slice(), isFinal: true, meta: e.meta }, adapter)
         } else {
+          const plated = hasPlatedAssistantOutput({
+            blocks: [...aggregatedBlocks, ...out.blocks],
+            extraText: autoDreamAssistantText,
+          })
+          if (!plated) {
+            this.deliver(
+              {
+                ...out,
+                blocks: [{ kind: 'text', text: EMPTY_COMPLETED_TURN_NOTICE } as any],
+                isFinal: false,
+              },
+              undefined,
+            )
+          }
           this.deliver({ ...out, blocks: [], isFinal: true, meta: e.meta }, undefined)
         }
         // 释放本轮聚合数组的内存。本闭包跨 turn 仍会被 sessionManager 的
@@ -18260,6 +18303,23 @@ export class Gateway {
     // strip site every time it adds a new private field. Keeping stripped
     // values locally lets WS branch still route per-user.
     const { wire, userId: stampedUserId } = _stripPrivateRoutingFields(out)
+    if (wire.type === 'outbound.message' || wire.type === 'outbound.error') {
+      const sessionKey =
+        typeof (wire as { sessionKey?: unknown }).sessionKey === 'string'
+          ? (wire as { sessionKey: string }).sessionKey
+          : undefined
+      const current = (wire as { clientMessageId?: unknown }).clientMessageId
+      const rebound = rebindOutboundClientMessageId({
+        clientMessageId: typeof current === 'string' ? current : undefined,
+        sessionKey,
+        isFenced: (sk, cmid) => this._outboundRing?.isTurnFenced(sk, cmid) === true,
+        openTurnClientMessageId: sessionKey
+          ? this._outboundRing?.activeTurnClientMessageId(sessionKey)
+          : undefined,
+      })
+      if (rebound) (wire as { clientMessageId?: string }).clientMessageId = rebound
+      else delete (wire as { clientMessageId?: string }).clientMessageId
+    }
     // Plan 2 (compact-progress-frame) — sideband frame 跳过 adapter,只走 WS。
     // 背景:adapter (Telegram / 微信等) 的契约是 `OutboundMessage` 形状(.blocks
     // 必存,见 channels/telegram/src/index.ts:96 `for (const b of out.blocks)`),

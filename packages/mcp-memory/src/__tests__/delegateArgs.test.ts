@@ -4,7 +4,11 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { normalizeDelegateAgentId, normalizeDelegateModel } from '../delegateArgs.js'
+import {
+  normalizeDelegateAgentId,
+  normalizeDelegateModel,
+  rejectSelfDelegate,
+} from '../delegateArgs.js'
 
 describe('normalizeDelegateModel', () => {
   it('缺省 / 空白 → 不指定', () => {
@@ -40,5 +44,30 @@ describe('normalizeDelegateAgentId', () => {
       assert.match(r.error, /agentId 只能是平台成员/)
       assert.match(r.error, /model=/)
     }
+  })
+})
+
+describe('rejectSelfDelegate', () => {
+  it('caller===target 拒绝并提示 --allow-self', () => {
+    const r = rejectSelfDelegate({ callerAgentId: 'main', targetAgentId: 'main' })
+    assert.equal(r.ok, false)
+    if (!r.ok) {
+      assert.match(r.error, /不能把任务委派给自己/)
+      assert.match(r.error, /--allow-self/)
+    }
+  })
+
+  it('allowSelf 覆盖', () => {
+    assert.equal(
+      rejectSelfDelegate({ callerAgentId: 'main', targetAgentId: 'main', allowSelf: true }).ok,
+      true,
+    )
+  })
+
+  it('其他成员放行', () => {
+    assert.equal(
+      rejectSelfDelegate({ callerAgentId: 'main', targetAgentId: 'coding-assistant' }).ok,
+      true,
+    )
   })
 })

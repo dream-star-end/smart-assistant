@@ -61,6 +61,7 @@ import type { ZcodeRouteOverride } from './engine/zcodeAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { beginMemoryTurnTracking } from './memoryTurnObserver.js'
 import { createTurnUsageRecorder, mapTurnTerminalStatus, type TurnTerminalStatus } from './turnUsage.js'
+import { emptyCompletedTurnAssistantText } from './emptyCompletedTurn.js'
 import { applyPlatformCostIfMissing } from './usageCost.js'
 import { createLogger } from './logger.js'
 import { collectSessionOutputAssets } from './projectAssetCollector.js'
@@ -6195,12 +6196,21 @@ export class SessionManager {
           if (result) {
             terminalPersistenceClaim = 'complete'
             flushTerminalBilling()
-            const completedAssistant = combineRetryAssistantOutput(
+            const completedAssistantRaw = combineRetryAssistantOutput(
               retryAssistantSegments,
               result.assistantText,
               freezeSegments(result.assistantSegments, assistantMessageId),
               Date.now(),
             )
+            const completedAssistantText = emptyCompletedTurnAssistantText({
+              status: terminalOverride?.status ?? 'completed',
+              errorCode: terminalOverride?.errorCode,
+              assistantText: completedAssistantRaw.text,
+            })
+            const completedAssistant =
+              completedAssistantText === completedAssistantRaw.text
+                ? completedAssistantRaw
+                : { text: completedAssistantText, segments: completedAssistantRaw.segments }
             const completedThinking = combineRetryAssistantOutput(
               retryThinkingSegments,
               result.thinkingText,

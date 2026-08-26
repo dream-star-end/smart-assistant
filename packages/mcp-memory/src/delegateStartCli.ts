@@ -25,6 +25,7 @@ export type DelegateCliArgs = {
   model?: string
   toolsets?: string[]
   resumeSessionKey?: string
+  allowSelf?: boolean
 }
 
 export function readDelegateContextToken(
@@ -57,12 +58,17 @@ export function buildDelegateStartBody(args: DelegateCliArgs): Record<string, un
     ...(args.model ? { model: args.model } : {}),
     ...(args.toolsets && args.toolsets.length > 0 ? { toolsets: args.toolsets } : {}),
     ...(args.resumeSessionKey ? { resumeSessionKey: args.resumeSessionKey } : {}),
+    ...(args.allowSelf ? { allowSelf: true } : {}),
     async: true,
     streamProgress: true,
   }
 }
 
-export function requestReviewArgs(draft: string, revisionNote?: string, resumeSessionKey?: string): DelegateCliArgs {
+export function requestReviewArgs(
+  draft: string,
+  revisionNote?: string,
+  resumeSessionKey?: string,
+): DelegateCliArgs {
   const note =
     revisionNote && revisionNote.trim()
       ? `\n\n【队长修订说明】\n${revisionNote.trim().slice(0, 4000)}`
@@ -75,7 +81,11 @@ export function requestReviewArgs(draft: string, revisionNote?: string, resumeSe
   }
 }
 
-export type DelegateStartOnce = (agentId: string, body: string, contextToken: string) => Promise<{
+export type DelegateStartOnce = (
+  agentId: string,
+  body: string,
+  contextToken: string,
+) => Promise<{
   statusCode: number
   body: string
 }>
