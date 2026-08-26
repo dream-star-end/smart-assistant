@@ -245,8 +245,7 @@ RUN set -eux; \
     chmod -R a+rX /opt/typst-cache; rm -rf /tmp/typwarm; \
     find /opt/typst-cache -maxdepth 4 -type d \( -name cetz -o -name fletcher \)
 
-# ── oc-* 工具:dev fallback(生产走 PATH /run/oc/platform/current/bin 的 bundle,允许滞后)──
-# 镜像内 /usr/local/bin 副本仅当 bundle 未挂载时兜底;source 已迁 platform-runtime/bin/(改动真热)。
+
 # Debian 12 自带 LibreOffice 7.4 会把 Pandoc 原生 OMML 求和式中的括号/变量渲染成“¿”。
 # 仅升级 Writer/Math 到同发行版 backports；基础镜像已锁 bookworm，禁止跨发行版混装。
 RUN printf '%s\n' 'deb http://deb.debian.org/debian bookworm-backports main' \
@@ -258,179 +257,6 @@ RUN printf '%s\n' 'deb http://deb.debian.org/debian bookworm-backports main' \
     && libreoffice --headless --version | grep -Eq '^LibreOffice 25\.2\.' \
     && dpkg-query -W -f='${Status}\n' libreoffice-math | grep -qx 'install ok installed' \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
-
-COPY --chown=root:root ./platform-runtime/bin/oc-docx.py /usr/local/bin/oc-docx
-COPY --chown=root:root ./runtime/create-docgen-reference.py /usr/local/lib/openclaude/create-docgen-reference.py
-COPY --chown=root:root ./platform-runtime/bin/oc-minimax.py /usr/local/bin/oc-minimax
-COPY --chown=root:root ./platform-runtime/bin/oc-web-context.py /usr/local/bin/oc-web-context
-# oc-web: CLI front-end over the web-context core (replaces the retired
-# web_context_* MCP tools; documented by the `web-context` baseline skill).
-COPY --chown=root:root ./platform-runtime/bin/oc-web.sh /usr/local/bin/oc-web
-# oc-browser: isolated launcher for the pinned official Playwright CLI. It
-# preserves the product command/card while removing Agent-side MCP transport.
-COPY --chown=root:root ./platform-runtime/bin/oc-browser.sh /usr/local/bin/oc-browser
-COPY --chown=root:root ./platform-runtime/bin/oc-cursor.sh /usr/local/bin/oc-cursor
-COPY --chown=root:root ./platform-runtime/bin/oc-zcode.sh /usr/local/bin/oc-zcode
-COPY --chown=root:root ./playwright-cli.config.json /etc/openclaude/playwright-cli.config.json
-# oc-market: AI-driven AI-marketplace ops (search/install/uninstall/publish) over
-# master /internal/v3/marketplace/agent/*; documented by the `market` baseline skill.
-COPY --chown=root:root ./platform-runtime/bin/oc-market.sh /usr/local/bin/oc-market
-# oc-skill: AI-driven, conversation-triggered skill training / eval-case generation
-# over THIS container's own gateway loopback (/internal/v3/skill-local/*); documented
-# by the `skill-management` baseline skill.
-COPY --chown=root:root ./platform-runtime/bin/oc-skill.sh /usr/local/bin/oc-skill
-# oc-lit / oc-cite / oc-ingest / oc-litrag: 科研 agent 能力(多源检索 + 引用接地门禁 +
-# 文档解析 + quote-first RAG),走 master /v3/research/*(平台持 key + 铸造证据权威)。
-# 文档见对应 baseline skill。
-COPY --chown=root:root ./platform-runtime/bin/oc-lit.sh /usr/local/bin/oc-lit
-COPY --chown=root:root ./platform-runtime/bin/oc-cite.sh /usr/local/bin/oc-cite
-COPY --chown=root:root ./platform-runtime/bin/oc-ingest.sh /usr/local/bin/oc-ingest
-COPY --chown=root:root ./platform-runtime/bin/oc-litrag.sh /usr/local/bin/oc-litrag
-# oc-report / oc-slides / oc-poster: 确定性产物渲染(报告/幻灯/海报,自建 Quarto 流水线)。
-# 文档见 research-report / research-slides baseline skill。
-COPY --chown=root:root ./platform-runtime/bin/oc-report.sh /usr/local/bin/oc-report
-COPY --chown=root:root ./platform-runtime/bin/oc-slides.sh /usr/local/bin/oc-slides
-COPY --chown=root:root ./platform-runtime/bin/oc-poster.sh /usr/local/bin/oc-poster
-# oc-rank: 确定性候选排名(tournament debate / tree-search 选分支),文档见 research-tournament skill。
-COPY --chown=root:root ./platform-runtime/bin/oc-rank.sh /usr/local/bin/oc-rank
-# oc-xlsx / oc-pdf: 办公助手确定性产物(Excel via openpyxl / 通用 PDF via Quarto-Typst)。
-# oc-artifact-qa:PDF/PPTX/XLSX 结构检查 + LibreOffice/Poppler 全页渲染质量证据。
-# 文档见 office-spreadsheet / office-pdf baseline skill。
-COPY --chown=root:root ./platform-runtime/bin/oc-xlsx.py /usr/local/bin/oc-xlsx
-COPY --chown=root:root ./platform-runtime/bin/oc-pdf.sh /usr/local/bin/oc-pdf
-COPY --chown=root:root ./platform-runtime/bin/oc-artifact-qa.py /usr/local/bin/oc-artifact-qa
-# oc-vision: 识图 CLI(纯文本模型看图兜底,复用 mcpVisionServer 核心 / 默认 MiniMax-M3
-# 后端)。取代已退役的常驻 openclaude-vision MCP stdio server。文档见 oc-vision baseline skill。
-COPY --chown=root:root ./platform-runtime/bin/oc-vision.sh /usr/local/bin/oc-vision
-# oc-figcheck: 出图质量门 + vision 回看闭环(确定性检查 + MiniMax-M3 审图 → PASS/WARN/FAIL,
-# 让 agent 看到自己刚画的图并自纠,根治"开环盲画");oc-diagram: Typst+CeTZ 精密矢量
-# 示意图(机制/装置/几何/通路图)。均文档见 scientific-figures baseline skill。
-COPY --chown=root:root ./platform-runtime/bin/oc-figcheck.sh /usr/local/bin/oc-figcheck
-COPY --chown=root:root ./platform-runtime/bin/oc-diagram.sh /usr/local/bin/oc-diagram
-# oc-memory: 长期记忆 CLI(Recall + Archival),复用 mcp-memory memoryTools 核心。取代常驻
-# openclaude_memory MCP 里的 session_search/archival_* 工具(常驻 stdio 传输脆弱 → codex 死等)。
-# memdir 范式后 Core 记忆改为直接用 Write/Edit 写 MEMORY.md 索引 + memory/*.md 文件,`memory`
-# 子命令已退役(调用只打印迁移提示)。delegate/cron/skill 仍留 MCP。文档见 memory-management baseline skill。
-COPY --chown=root:root ./platform-runtime/bin/oc-memory.sh /usr/local/bin/oc-memory
-# oc-connect: 应用连接器 CLI(webdav/imap/notion/github/feishu),走 master /v3/connectors/*
-# (第三方凭据只在 master,永不落容器);写操作走 propose-then-commit 确认门。
-# 文档见 app-connectors baseline skill。
-COPY --chown=root:root ./platform-runtime/bin/oc-connect.sh /usr/local/bin/oc-connect
-RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-skill /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-artifact-qa /usr/local/bin/oc-vision /usr/local/bin/oc-figcheck /usr/local/bin/oc-diagram /usr/local/bin/oc-memory /usr/local/bin/oc-connect /usr/local/lib/openclaude/create-docgen-reference.py; \
-    ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
-    python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
-    printf '%s\n' '# DOCX smoke' 'Inline $\bar{x}=\frac{1}{n}\sum_{i=1}^{n}x_i$.' '' '$$' '\mathrm{MSE}=\frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2' '$$' > /tmp/oc-docx-smoke.md; \
-    oc-docx /tmp/oc-docx-smoke.md -o /tmp/oc-docx-smoke.docx; \
-    test -s /tmp/oc-docx-smoke.docx; \
-    unzip -tq /tmp/oc-docx-smoke.docx; \
-    unzip -p /tmp/oc-docx-smoke.docx word/document.xml | grep -q 'm:oMath'; \
-    mkdir -p /tmp/oc-docx-smoke-render; \
-    oc-docx render /tmp/oc-docx-smoke.docx -o /tmp/oc-docx-smoke-render --emit-pdf; \
-    test -s /tmp/oc-docx-smoke-render/page-1.png; \
-    test -s /tmp/oc-docx-smoke-render/vision-page-1.jpg; \
-    test "$(stat -c %s /tmp/oc-docx-smoke-render/vision-page-1.jpg)" -lt 4500000; \
-    pdftotext /tmp/oc-docx-smoke-render/oc-docx-smoke.pdf /tmp/oc-docx-smoke.txt; \
-    grep -Eq 'M[[:space:]]*S[[:space:]]*E' /tmp/oc-docx-smoke.txt; \
-    grep -q 'y' /tmp/oc-docx-smoke.txt; \
-    ! grep -q '¿' /tmp/oc-docx-smoke.txt; \
-    oc-docx inspect /tmp/oc-docx-smoke.docx --render-dir /tmp/oc-docx-smoke-render --json /tmp/oc-docx-smoke-render/report.json; \
-    oc-docx scrub /tmp/oc-docx-smoke.docx -o /tmp/oc-docx-smoke-clean.docx --keep-title; \
-    unzip -tq /tmp/oc-docx-smoke-clean.docx; \
-    unzip -p /tmp/oc-docx-smoke-clean.docx word/document.xml | grep -q 'm:oMath'; \
-    oc-docx inspect /tmp/oc-docx-smoke-clean.docx >/tmp/oc-docx-smoke-clean.json; \
-    printf '%s\n' \
-      'document:' \
-      '  title: 结构化 DOCX smoke' \
-      '  cover: true' \
-      '  table_of_contents: true' \
-      'sections:' \
-      '  - heading: 第一章' \
-      '    level: 1' \
-      '    blocks:' \
-      '      - type: callout' \
-      '        kind: success' \
-      '        text: 构建成功' \
-      '      - type: table' \
-      '        headers: [列一, 列二]' \
-      '        rows: [[A, B]]' > /tmp/oc-docx-structured.yaml; \
-    oc-docx build /tmp/oc-docx-structured.yaml -o /tmp/oc-docx-structured.docx; \
-    unzip -tq /tmp/oc-docx-structured.docx; \
-    unzip -p /tmp/oc-docx-structured.docx word/document.xml | grep -q 'w:cantSplit'; \
-    rm -rf /tmp/oc-docx-smoke.md /tmp/oc-docx-smoke.docx /tmp/oc-docx-smoke-clean.docx \
-      /tmp/oc-docx-smoke-render /tmp/oc-docx-structured.yaml /tmp/oc-docx-structured.docx; \
-    printf '%s\n' '名称,金额' '甲方,100' '乙方,200' > /tmp/oc-xlsx-smoke.csv; \
-    oc-xlsx from-csv /tmp/oc-xlsx-smoke.csv -o /tmp/oc-xlsx-smoke.xlsx; \
-    test -s /tmp/oc-xlsx-smoke.xlsx; \
-    unzip -tq /tmp/oc-xlsx-smoke.xlsx; \
-    rm -f /tmp/oc-xlsx-smoke.csv /tmp/oc-xlsx-smoke.xlsx; \
-    printf '%s\n' '# 办公助手 PDF 冒烟' '' '中文正文:验证 Noto CJK 字体 + Typst 渲染可用。' > /tmp/oc-pdf-smoke.md; \
-    oc-pdf /tmp/oc-pdf-smoke.md -o /tmp/oc-pdf-smoke.pdf; \
-    test -s /tmp/oc-pdf-smoke.pdf; \
-    head -c 5 /tmp/oc-pdf-smoke.pdf | grep -q '%PDF'; \
-    printf '%s\n' '{"kind":"pdf","requiredText":["办公助手","中文正文"],"pageCount":1}' > /tmp/oc-pdf-smoke.expect.json; \
-    oc-artifact-qa inspect --input /tmp/oc-pdf-smoke.pdf --out-dir /tmp/oc-pdf-smoke.qa --expect /tmp/oc-pdf-smoke.expect.json > /tmp/oc-pdf-smoke.report.json; \
-    jq -e '.passed == true and .facts.pageCount == 1 and (.renderedPages | length) == 1' /tmp/oc-pdf-smoke.report.json; \
-    printf '%s\n' \
-      'from reportlab.pdfgen.canvas import Canvas' \
-      'from reportlab.pdfbase import pdfmetrics' \
-      'from reportlab.pdfbase.ttfonts import TTFont' \
-      'pdfmetrics.registerFont(TTFont("WQY","/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",subfontIndex=0))' \
-      'c=Canvas("/tmp/oc-reportlab-cjk-smoke.pdf")' \
-      'for i in range(1,16):' \
-      ' c.setFont("WQY",18); c.drawString(72,760,"收 据" if i == 1 else f"第 {i} 页")' \
-      ' c.setFont("WQY",12); c.drawString(72,720,"T48 单孔总数 123 75% Ω"); c.showPage()' \
-      'c.save()' \
-      > /tmp/oc-reportlab-cjk-smoke.py; \
-    python3 /tmp/oc-reportlab-cjk-smoke.py; \
-    printf '%s\n' '{"kind":"pdf","requiredText":["收 据","T48 单孔总数 123 75% Ω"],"pageCount":15}' > /tmp/oc-reportlab-cjk-smoke.expect.json; \
-    oc-artifact-qa inspect --input /tmp/oc-reportlab-cjk-smoke.pdf --out-dir /tmp/oc-reportlab-cjk-smoke.qa --expect /tmp/oc-reportlab-cjk-smoke.expect.json > /tmp/oc-reportlab-cjk-smoke.report.json; \
-    jq -e '.passed == true and (.renderedPages | length) == 15 and (.contactSheets | length) == 1 and ([.warnings[].code] | index("contact-sheet-failed") | not) and (.facts.fonts | any(.embedded == true and .unicode == true))' /tmp/oc-reportlab-cjk-smoke.report.json; \
-    printf '%s\n' \
-      'from pptx import Presentation' \
-      'from pptx.util import Inches' \
-      'deck=Presentation(); slide=deck.slides.add_slide(deck.slide_layouts[5])' \
-      'box=slide.shapes.add_textbox(Inches(1), Inches(1), Inches(8), Inches(2))' \
-      'box.text_frame.text="季度工作汇报"' \
-      'deck.save("/tmp/oc-pptx-smoke.pptx")' \
-      > /tmp/oc-pptx-smoke.py; \
-    python3 /tmp/oc-pptx-smoke.py; \
-    printf '%s\n' '{"kind":"pptx","requiredText":["季度工作汇报"],"slideCount":1}' > /tmp/oc-pptx-smoke.expect.json; \
-    oc-artifact-qa inspect --input /tmp/oc-pptx-smoke.pptx --out-dir /tmp/oc-pptx-smoke.qa --expect /tmp/oc-pptx-smoke.expect.json > /tmp/oc-pptx-smoke.report.json; \
-    jq -e '.passed == true and .facts.slideCount == 1 and (.renderedPages | length) == 1' /tmp/oc-pptx-smoke.report.json; \
-    printf '%s\n' \
-      'from openpyxl import Workbook' \
-      'from openpyxl.worksheet.datavalidation import DataValidation' \
-      'wb=Workbook(); ws=wb.active; ws.title="汇总"' \
-      'ws.append(["项目","金额","状态"]); ws.append(["研发",100,"待确认"]); ws["B3"]="=SUM(B2:B2)"' \
-      'dv=DataValidation(type="list",formula1="\"待确认,已完成\""); ws.add_data_validation(dv); dv.add(ws["C2"])' \
-      'wb.save("/tmp/oc-xlsx-formula-smoke.xlsx")' \
-      > /tmp/oc-xlsx-formula-smoke.py; \
-    python3 /tmp/oc-xlsx-formula-smoke.py; \
-    printf '%s\n' '{"kind":"xlsx","requiredText":["项目","研发"],"requiredSheets":["汇总"],"requiredFormulaCells":["汇总!B3"],"minDataValidations":1}' > /tmp/oc-xlsx-formula-smoke.expect.json; \
-    oc-artifact-qa inspect --input /tmp/oc-xlsx-formula-smoke.xlsx --out-dir /tmp/oc-xlsx-formula-smoke.qa --expect /tmp/oc-xlsx-formula-smoke.expect.json > /tmp/oc-xlsx-formula-smoke.report.json; \
-    jq -e '.passed == true and .facts.formulaCount == 1 and .facts.dataValidationCount == 1' /tmp/oc-xlsx-formula-smoke.report.json; \
-    rm -rf /tmp/oc-pdf-smoke.md /tmp/oc-pdf-smoke.pdf /tmp/oc-pdf-smoke.expect.json /tmp/oc-pdf-smoke.report.json /tmp/oc-pdf-smoke.qa \
-      /tmp/oc-reportlab-cjk-smoke.py /tmp/oc-reportlab-cjk-smoke.pdf /tmp/oc-reportlab-cjk-smoke.expect.json /tmp/oc-reportlab-cjk-smoke.report.json /tmp/oc-reportlab-cjk-smoke.qa \
-      /tmp/oc-pptx-smoke.py /tmp/oc-pptx-smoke.pptx /tmp/oc-pptx-smoke.expect.json /tmp/oc-pptx-smoke.report.json /tmp/oc-pptx-smoke.qa \
-      /tmp/oc-xlsx-formula-smoke.py /tmp/oc-xlsx-formula-smoke.xlsx /tmp/oc-xlsx-formula-smoke.expect.json /tmp/oc-xlsx-formula-smoke.report.json /tmp/oc-xlsx-formula-smoke.qa; \
-    printf '%s\n' \
-      'import matplotlib; matplotlib.use("Agg")' \
-      'import matplotlib.pyplot as plt' \
-      'import scienceplots  # noqa: F401' \
-      'import scipy, seaborn, statsmodels, sympy, sklearn, plotly  # noqa: F401' \
-      'plt.style.use(["science", "nature", "no-latex"])' \
-      'plt.rcParams["font.family"] = ["Noto Serif CJK SC", "serif"]' \
-      'fig, ax = plt.subplots(figsize=(3.5, 2.6))' \
-      'ax.plot([1, 2, 3], [1, 4, 9], label="方法A")' \
-      'ax.set_xlabel("轮次"); ax.set_ylabel("准确率 (%)"); ax.legend()' \
-      'fig.savefig("/tmp/oc-fig-smoke.png", dpi=300, bbox_inches="tight")' \
-      'fig.savefig("/tmp/oc-fig-smoke.svg")' \
-      > /tmp/oc-fig-smoke.py; \
-    python3 /tmp/oc-fig-smoke.py; \
-    test -s /tmp/oc-fig-smoke.png; \
-    test -s /tmp/oc-fig-smoke.svg; \
-    rm -f /tmp/oc-fig-smoke.py /tmp/oc-fig-smoke.png /tmp/oc-fig-smoke.svg
 
 # ------------------------------------------------------------
 # Codex CLI(@openai/codex)— 跑 GPT 系模型用 app-server JSON-RPC runner
@@ -553,7 +379,9 @@ RUN if [ "$OC_INCLUDE_ZCODE" = "1" ]; then set -eux; \
 # Playwright CLI + Chromium for Agent browser automation
 # ------------------------------------------------------------
 # Agent turns use @playwright/cli through the browser Skill + oc-browser launcher;
-# no Agent subprocess starts @playwright/mcp. The MCP package remains installed
+# no Agent subprocess starts @playwright/mcp. Chromium install is a stable heavy
+# layer: oc-browser smoke runs later with the trailing wrapper COPY, so editing
+# oc-browser.sh does not invalidate this ~1GB layer. The MCP package remains installed
 # only because containerPreview and managed-browser plugin workers currently use
 # its bundled Playwright library/version contract directly (not its MCP server).
 # Pin CLI and MCP to releases that depend on the exact same Playwright build so
@@ -573,18 +401,6 @@ RUN set -eux; \
     "$PW_BIN" install --with-deps chromium; \
     playwright-cli --version; \
     chmod -R a+rX /usr/local/share/ms-playwright; \
-    SMOKE_HOME="$(mktemp -d)"; \
-    OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
-      OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
-      oc-browser open about:blank >/dev/null; \
-    OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
-      OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
-      oc-browser snapshot >/dev/null; \
-    OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
-      OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
-      oc-browser close >/dev/null; \
-    sleep 2; \
-    rm -rf "$SMOKE_HOME" /tmp/openclaude-playwright-cli /tmp/pw-*; \
     npm cache clean --force; \
     rm -rf /root/.npm
 
@@ -762,6 +578,197 @@ RUN apt-get update \
     && test -x /usr/bin/ssh-agent \
     && test -x /usr/bin/ssh-keyscan \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+
+# ── oc-* 工具: trailing base-stage layers (after CLI/Playwright/Chromium) ──
+# 镜像内 /usr/local/bin 副本仅当 bundle 未挂载时兜底;source 已迁 platform-runtime/bin/(改动真热)。
+# Wrappers change often; keeping them after Codex/Cursor/Grok/ZCode/Playwright means a
+# one-line oc-*.sh edit no longer busts the 966MB Chromium layer or CLI installs.
+# oc-browser smoke moved here from the Playwright install RUN (that RUN needs oc-browser).
+COPY --chown=root:root ./platform-runtime/bin/oc-docx.py /usr/local/bin/oc-docx
+COPY --chown=root:root ./runtime/create-docgen-reference.py /usr/local/lib/openclaude/create-docgen-reference.py
+COPY --chown=root:root ./platform-runtime/bin/oc-minimax.py /usr/local/bin/oc-minimax
+COPY --chown=root:root ./platform-runtime/bin/oc-web-context.py /usr/local/bin/oc-web-context
+# oc-web: CLI front-end over the web-context core (replaces the retired
+# web_context_* MCP tools; documented by the `web-context` baseline skill).
+COPY --chown=root:root ./platform-runtime/bin/oc-web.sh /usr/local/bin/oc-web
+# oc-browser: isolated launcher for the pinned official Playwright CLI. It
+# preserves the product command/card while removing Agent-side MCP transport.
+COPY --chown=root:root ./platform-runtime/bin/oc-browser.sh /usr/local/bin/oc-browser
+COPY --chown=root:root ./platform-runtime/bin/oc-cursor.sh /usr/local/bin/oc-cursor
+COPY --chown=root:root ./platform-runtime/bin/oc-zcode.sh /usr/local/bin/oc-zcode
+COPY --chown=root:root ./playwright-cli.config.json /etc/openclaude/playwright-cli.config.json
+# oc-market: AI-driven AI-marketplace ops (search/install/uninstall/publish) over
+# master /internal/v3/marketplace/agent/*; documented by the `market` baseline skill.
+COPY --chown=root:root ./platform-runtime/bin/oc-market.sh /usr/local/bin/oc-market
+# oc-skill: AI-driven, conversation-triggered skill training / eval-case generation
+# over THIS container's own gateway loopback (/internal/v3/skill-local/*); documented
+# by the `skill-management` baseline skill.
+COPY --chown=root:root ./platform-runtime/bin/oc-skill.sh /usr/local/bin/oc-skill
+# oc-lit / oc-cite / oc-ingest / oc-litrag: 科研 agent 能力(多源检索 + 引用接地门禁 +
+# 文档解析 + quote-first RAG),走 master /v3/research/*(平台持 key + 铸造证据权威)。
+# 文档见对应 baseline skill。
+COPY --chown=root:root ./platform-runtime/bin/oc-lit.sh /usr/local/bin/oc-lit
+COPY --chown=root:root ./platform-runtime/bin/oc-cite.sh /usr/local/bin/oc-cite
+COPY --chown=root:root ./platform-runtime/bin/oc-ingest.sh /usr/local/bin/oc-ingest
+COPY --chown=root:root ./platform-runtime/bin/oc-litrag.sh /usr/local/bin/oc-litrag
+# oc-report / oc-slides / oc-poster: 确定性产物渲染(报告/幻灯/海报,自建 Quarto 流水线)。
+# 文档见 research-report / research-slides baseline skill。
+COPY --chown=root:root ./platform-runtime/bin/oc-report.sh /usr/local/bin/oc-report
+COPY --chown=root:root ./platform-runtime/bin/oc-slides.sh /usr/local/bin/oc-slides
+COPY --chown=root:root ./platform-runtime/bin/oc-poster.sh /usr/local/bin/oc-poster
+# oc-rank: 确定性候选排名(tournament debate / tree-search 选分支),文档见 research-tournament skill。
+COPY --chown=root:root ./platform-runtime/bin/oc-rank.sh /usr/local/bin/oc-rank
+# oc-xlsx / oc-pdf: 办公助手确定性产物(Excel via openpyxl / 通用 PDF via Quarto-Typst)。
+# oc-artifact-qa:PDF/PPTX/XLSX 结构检查 + LibreOffice/Poppler 全页渲染质量证据。
+# 文档见 office-spreadsheet / office-pdf baseline skill。
+COPY --chown=root:root ./platform-runtime/bin/oc-xlsx.py /usr/local/bin/oc-xlsx
+COPY --chown=root:root ./platform-runtime/bin/oc-pdf.sh /usr/local/bin/oc-pdf
+COPY --chown=root:root ./platform-runtime/bin/oc-artifact-qa.py /usr/local/bin/oc-artifact-qa
+# oc-vision: 识图 CLI(纯文本模型看图兜底,复用 mcpVisionServer 核心 / 默认 MiniMax-M3
+# 后端)。取代已退役的常驻 openclaude-vision MCP stdio server。文档见 oc-vision baseline skill。
+COPY --chown=root:root ./platform-runtime/bin/oc-vision.sh /usr/local/bin/oc-vision
+# oc-figcheck: 出图质量门 + vision 回看闭环(确定性检查 + MiniMax-M3 审图 → PASS/WARN/FAIL,
+# 让 agent 看到自己刚画的图并自纠,根治"开环盲画");oc-diagram: Typst+CeTZ 精密矢量
+# 示意图(机制/装置/几何/通路图)。均文档见 scientific-figures baseline skill。
+COPY --chown=root:root ./platform-runtime/bin/oc-figcheck.sh /usr/local/bin/oc-figcheck
+COPY --chown=root:root ./platform-runtime/bin/oc-diagram.sh /usr/local/bin/oc-diagram
+# oc-memory: 长期记忆 CLI(Recall + Archival),复用 mcp-memory memoryTools 核心。取代常驻
+# openclaude_memory MCP 里的 session_search/archival_* 工具(常驻 stdio 传输脆弱 → codex 死等)。
+# memdir 范式后 Core 记忆改为直接用 Write/Edit 写 MEMORY.md 索引 + memory/*.md 文件,`memory`
+# 子命令已退役(调用只打印迁移提示)。delegate/cron/skill 仍留 MCP。文档见 memory-management baseline skill。
+COPY --chown=root:root ./platform-runtime/bin/oc-memory.sh /usr/local/bin/oc-memory
+# oc-connect: 应用连接器 CLI(webdav/imap/notion/github/feishu),走 master /v3/connectors/*
+# (第三方凭据只在 master,永不落容器);写操作走 propose-then-commit 确认门。
+# 文档见 app-connectors baseline skill。
+COPY --chown=root:root ./platform-runtime/bin/oc-connect.sh /usr/local/bin/oc-connect
+RUN set -eux; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-skill /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-artifact-qa /usr/local/bin/oc-vision /usr/local/bin/oc-figcheck /usr/local/bin/oc-diagram /usr/local/bin/oc-memory /usr/local/bin/oc-connect /usr/local/lib/openclaude/create-docgen-reference.py; \
+    ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
+    python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
+    printf '%s\n' '# DOCX smoke' 'Inline $\bar{x}=\frac{1}{n}\sum_{i=1}^{n}x_i$.' '' '$$' '\mathrm{MSE}=\frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2' '$$' > /tmp/oc-docx-smoke.md; \
+    oc-docx /tmp/oc-docx-smoke.md -o /tmp/oc-docx-smoke.docx; \
+    test -s /tmp/oc-docx-smoke.docx; \
+    unzip -tq /tmp/oc-docx-smoke.docx; \
+    unzip -p /tmp/oc-docx-smoke.docx word/document.xml | grep -q 'm:oMath'; \
+    mkdir -p /tmp/oc-docx-smoke-render; \
+    oc-docx render /tmp/oc-docx-smoke.docx -o /tmp/oc-docx-smoke-render --emit-pdf; \
+    test -s /tmp/oc-docx-smoke-render/page-1.png; \
+    test -s /tmp/oc-docx-smoke-render/vision-page-1.jpg; \
+    test "$(stat -c %s /tmp/oc-docx-smoke-render/vision-page-1.jpg)" -lt 4500000; \
+    pdftotext /tmp/oc-docx-smoke-render/oc-docx-smoke.pdf /tmp/oc-docx-smoke.txt; \
+    grep -Eq 'M[[:space:]]*S[[:space:]]*E' /tmp/oc-docx-smoke.txt; \
+    grep -q 'y' /tmp/oc-docx-smoke.txt; \
+    ! grep -q '¿' /tmp/oc-docx-smoke.txt; \
+    oc-docx inspect /tmp/oc-docx-smoke.docx --render-dir /tmp/oc-docx-smoke-render --json /tmp/oc-docx-smoke-render/report.json; \
+    oc-docx scrub /tmp/oc-docx-smoke.docx -o /tmp/oc-docx-smoke-clean.docx --keep-title; \
+    unzip -tq /tmp/oc-docx-smoke-clean.docx; \
+    unzip -p /tmp/oc-docx-smoke-clean.docx word/document.xml | grep -q 'm:oMath'; \
+    oc-docx inspect /tmp/oc-docx-smoke-clean.docx >/tmp/oc-docx-smoke-clean.json; \
+    printf '%s\n' \
+      'document:' \
+      '  title: 结构化 DOCX smoke' \
+      '  cover: true' \
+      '  table_of_contents: true' \
+      'sections:' \
+      '  - heading: 第一章' \
+      '    level: 1' \
+      '    blocks:' \
+      '      - type: callout' \
+      '        kind: success' \
+      '        text: 构建成功' \
+      '      - type: table' \
+      '        headers: [列一, 列二]' \
+      '        rows: [[A, B]]' > /tmp/oc-docx-structured.yaml; \
+    oc-docx build /tmp/oc-docx-structured.yaml -o /tmp/oc-docx-structured.docx; \
+    unzip -tq /tmp/oc-docx-structured.docx; \
+    unzip -p /tmp/oc-docx-structured.docx word/document.xml | grep -q 'w:cantSplit'; \
+    rm -rf /tmp/oc-docx-smoke.md /tmp/oc-docx-smoke.docx /tmp/oc-docx-smoke-clean.docx \
+      /tmp/oc-docx-smoke-render /tmp/oc-docx-structured.yaml /tmp/oc-docx-structured.docx; \
+    printf '%s\n' '名称,金额' '甲方,100' '乙方,200' > /tmp/oc-xlsx-smoke.csv; \
+    oc-xlsx from-csv /tmp/oc-xlsx-smoke.csv -o /tmp/oc-xlsx-smoke.xlsx; \
+    test -s /tmp/oc-xlsx-smoke.xlsx; \
+    unzip -tq /tmp/oc-xlsx-smoke.xlsx; \
+    rm -f /tmp/oc-xlsx-smoke.csv /tmp/oc-xlsx-smoke.xlsx; \
+    printf '%s\n' '# 办公助手 PDF 冒烟' '' '中文正文:验证 Noto CJK 字体 + Typst 渲染可用。' > /tmp/oc-pdf-smoke.md; \
+    oc-pdf /tmp/oc-pdf-smoke.md -o /tmp/oc-pdf-smoke.pdf; \
+    test -s /tmp/oc-pdf-smoke.pdf; \
+    head -c 5 /tmp/oc-pdf-smoke.pdf | grep -q '%PDF'; \
+    printf '%s\n' '{"kind":"pdf","requiredText":["办公助手","中文正文"],"pageCount":1}' > /tmp/oc-pdf-smoke.expect.json; \
+    oc-artifact-qa inspect --input /tmp/oc-pdf-smoke.pdf --out-dir /tmp/oc-pdf-smoke.qa --expect /tmp/oc-pdf-smoke.expect.json > /tmp/oc-pdf-smoke.report.json; \
+    jq -e '.passed == true and .facts.pageCount == 1 and (.renderedPages | length) == 1' /tmp/oc-pdf-smoke.report.json; \
+    printf '%s\n' \
+      'from reportlab.pdfgen.canvas import Canvas' \
+      'from reportlab.pdfbase import pdfmetrics' \
+      'from reportlab.pdfbase.ttfonts import TTFont' \
+      'pdfmetrics.registerFont(TTFont("WQY","/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",subfontIndex=0))' \
+      'c=Canvas("/tmp/oc-reportlab-cjk-smoke.pdf")' \
+      'for i in range(1,16):' \
+      ' c.setFont("WQY",18); c.drawString(72,760,"收 据" if i == 1 else f"第 {i} 页")' \
+      ' c.setFont("WQY",12); c.drawString(72,720,"T48 单孔总数 123 75% Ω"); c.showPage()' \
+      'c.save()' \
+      > /tmp/oc-reportlab-cjk-smoke.py; \
+    python3 /tmp/oc-reportlab-cjk-smoke.py; \
+    printf '%s\n' '{"kind":"pdf","requiredText":["收 据","T48 单孔总数 123 75% Ω"],"pageCount":15}' > /tmp/oc-reportlab-cjk-smoke.expect.json; \
+    oc-artifact-qa inspect --input /tmp/oc-reportlab-cjk-smoke.pdf --out-dir /tmp/oc-reportlab-cjk-smoke.qa --expect /tmp/oc-reportlab-cjk-smoke.expect.json > /tmp/oc-reportlab-cjk-smoke.report.json; \
+    jq -e '.passed == true and (.renderedPages | length) == 15 and (.contactSheets | length) == 1 and ([.warnings[].code] | index("contact-sheet-failed") | not) and (.facts.fonts | any(.embedded == true and .unicode == true))' /tmp/oc-reportlab-cjk-smoke.report.json; \
+    printf '%s\n' \
+      'from pptx import Presentation' \
+      'from pptx.util import Inches' \
+      'deck=Presentation(); slide=deck.slides.add_slide(deck.slide_layouts[5])' \
+      'box=slide.shapes.add_textbox(Inches(1), Inches(1), Inches(8), Inches(2))' \
+      'box.text_frame.text="季度工作汇报"' \
+      'deck.save("/tmp/oc-pptx-smoke.pptx")' \
+      > /tmp/oc-pptx-smoke.py; \
+    python3 /tmp/oc-pptx-smoke.py; \
+    printf '%s\n' '{"kind":"pptx","requiredText":["季度工作汇报"],"slideCount":1}' > /tmp/oc-pptx-smoke.expect.json; \
+    oc-artifact-qa inspect --input /tmp/oc-pptx-smoke.pptx --out-dir /tmp/oc-pptx-smoke.qa --expect /tmp/oc-pptx-smoke.expect.json > /tmp/oc-pptx-smoke.report.json; \
+    jq -e '.passed == true and .facts.slideCount == 1 and (.renderedPages | length) == 1' /tmp/oc-pptx-smoke.report.json; \
+    printf '%s\n' \
+      'from openpyxl import Workbook' \
+      'from openpyxl.worksheet.datavalidation import DataValidation' \
+      'wb=Workbook(); ws=wb.active; ws.title="汇总"' \
+      'ws.append(["项目","金额","状态"]); ws.append(["研发",100,"待确认"]); ws["B3"]="=SUM(B2:B2)"' \
+      'dv=DataValidation(type="list",formula1="\"待确认,已完成\""); ws.add_data_validation(dv); dv.add(ws["C2"])' \
+      'wb.save("/tmp/oc-xlsx-formula-smoke.xlsx")' \
+      > /tmp/oc-xlsx-formula-smoke.py; \
+    python3 /tmp/oc-xlsx-formula-smoke.py; \
+    printf '%s\n' '{"kind":"xlsx","requiredText":["项目","研发"],"requiredSheets":["汇总"],"requiredFormulaCells":["汇总!B3"],"minDataValidations":1}' > /tmp/oc-xlsx-formula-smoke.expect.json; \
+    oc-artifact-qa inspect --input /tmp/oc-xlsx-formula-smoke.xlsx --out-dir /tmp/oc-xlsx-formula-smoke.qa --expect /tmp/oc-xlsx-formula-smoke.expect.json > /tmp/oc-xlsx-formula-smoke.report.json; \
+    jq -e '.passed == true and .facts.formulaCount == 1 and .facts.dataValidationCount == 1' /tmp/oc-xlsx-formula-smoke.report.json; \
+    rm -rf /tmp/oc-pdf-smoke.md /tmp/oc-pdf-smoke.pdf /tmp/oc-pdf-smoke.expect.json /tmp/oc-pdf-smoke.report.json /tmp/oc-pdf-smoke.qa \
+      /tmp/oc-reportlab-cjk-smoke.py /tmp/oc-reportlab-cjk-smoke.pdf /tmp/oc-reportlab-cjk-smoke.expect.json /tmp/oc-reportlab-cjk-smoke.report.json /tmp/oc-reportlab-cjk-smoke.qa \
+      /tmp/oc-pptx-smoke.py /tmp/oc-pptx-smoke.pptx /tmp/oc-pptx-smoke.expect.json /tmp/oc-pptx-smoke.report.json /tmp/oc-pptx-smoke.qa \
+      /tmp/oc-xlsx-formula-smoke.py /tmp/oc-xlsx-formula-smoke.xlsx /tmp/oc-xlsx-formula-smoke.expect.json /tmp/oc-xlsx-formula-smoke.report.json /tmp/oc-xlsx-formula-smoke.qa; \
+    printf '%s\n' \
+      'import matplotlib; matplotlib.use("Agg")' \
+      'import matplotlib.pyplot as plt' \
+      'import scienceplots  # noqa: F401' \
+      'import scipy, seaborn, statsmodels, sympy, sklearn, plotly  # noqa: F401' \
+      'plt.style.use(["science", "nature", "no-latex"])' \
+      'plt.rcParams["font.family"] = ["Noto Serif CJK SC", "serif"]' \
+      'fig, ax = plt.subplots(figsize=(3.5, 2.6))' \
+      'ax.plot([1, 2, 3], [1, 4, 9], label="方法A")' \
+      'ax.set_xlabel("轮次"); ax.set_ylabel("准确率 (%)"); ax.legend()' \
+      'fig.savefig("/tmp/oc-fig-smoke.png", dpi=300, bbox_inches="tight")' \
+      'fig.savefig("/tmp/oc-fig-smoke.svg")' \
+      > /tmp/oc-fig-smoke.py; \
+    python3 /tmp/oc-fig-smoke.py; \
+    test -s /tmp/oc-fig-smoke.png; \
+    test -s /tmp/oc-fig-smoke.svg; \
+    rm -f /tmp/oc-fig-smoke.py /tmp/oc-fig-smoke.png /tmp/oc-fig-smoke.svg; \
+    SMOKE_HOME="$(mktemp -d)"; \
+    OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
+      OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
+      oc-browser open about:blank >/dev/null; \
+    OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
+      OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
+      oc-browser snapshot >/dev/null; \
+    OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
+      OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
+      oc-browser close >/dev/null; \
+    sleep 2; \
+    rm -rf "$SMOKE_HOME" /tmp/openclaude-playwright-cli /tmp/pw-*
 
 # ------------------------------------------------------------
 # 源码 embed(条件化 OC_EMBED_SOURCE,多阶段选择实现条件 COPY)
