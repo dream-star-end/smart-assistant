@@ -74,7 +74,7 @@ describe('V5 branch deployment policy', () => {
     assert.match(source, /\\mathrm\{MSE\}=\\frac\{1\}\{n\}\\sum_\{i=1\}\^\{n\}\(y_i-\\hat\{y\}_i\)\^2/)
     assert.match(source, /grep -q 'y' \/tmp\/oc-docx-smoke\.txt/)
     assert.match(source, /! grep -q '¿' \/tmp\/oc-docx-smoke\.txt/)
-    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-zcode-commercial-sync-20260821-slim$/m)
+    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-cli-codex0149-grok105-zcode381-slim$/m)
     assert.match(overrides, /v5-ccb-f8800e0c0480-embedded\(OC_RUNTIME_EMERGENCY_TUPLE/)
   })
 
