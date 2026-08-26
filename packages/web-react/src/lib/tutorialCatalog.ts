@@ -99,7 +99,7 @@ export type TutorialTopic = {
 export const TUTORIAL_TOPICS = {
   "chat-basics": {
     featureId: "chat-basics",
-    contentVersion: 4,
+    contentVersion: 5,
     intro:
       "从简不是只回答一句话的聊天框，而是能持续执行任务的工作区。你可以像给同事派活一样说明目标、材料、限制和交付格式；过程中会看到思考、工具、进度与阶段结果，任务结束后还能继续追问或让它修改。",
     outcome: "把一个模糊想法变成可核验、可继续迭代的完整交付。",
@@ -130,7 +130,10 @@ export const TUTORIAL_TOPICS = {
       "复杂任务写清“完成标准”，比堆很多提示词更有效。",
       "一次会话尽量围绕同一个目标，相关上下文会自然延续。",
     ],
-    cautions: ["涉及转账、发布、删除数据等外部动作，执行前仍应核对确认。"],
+    cautions: [
+      "涉及转账、发布、删除数据等外部动作，执行前仍应核对确认。",
+      "附件上传失败会标红并给出重试入口，这时发送会被拦住：先重试或移除该附件，避免正文发出去而附件没跟上。",
+    ],
     example:
       "把这份会议记录整理成：结论、待办、负责人、截止时间四部分；不确定的信息标出来，不要猜。",
     media: "chat-basics",

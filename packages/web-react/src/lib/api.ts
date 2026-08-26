@@ -2252,13 +2252,20 @@ export const api = {
    * 返回 `{ url, digest, size, mimeType }`——url 形如 `/api/media/<digest>.<ext>`，
    * 可直接作为 MediaRef.url 放进对话 inbound.message.content.media。
    * File/Blob body 可重发，故 401 透明刷新重放安全。
+   * 容器冷启 fail-closed → 503 + Retry-After：按 Retry-After 有界退避（上限 5 次，
+   * clamp [1, 10] 秒，缺头默认 3 秒），覆盖一次 10~30s 冷启；其它状态码立即抛错。
+   * 预算上限是刻意压住的：发布 smoke 的 E2E 附件门必须能在 J1-J4 总防挂预算内
+   * 等完整个退避，budget 一放大就会把那道门拖过 PRE_J5_TIMEOUT。
    */
-  uploadFile: (
+  async uploadFile(
     a: AuthSession,
     file: File,
-  ): Promise<{ url: string; digest?: string; size?: number; mimeType?: string }> =>
-    jsonOrThrow(
-      callWithRefresh(a, (t) =>
+    opts?: { maxRetries?: number; signal?: AbortSignal },
+  ): Promise<{ url: string; digest?: string; size?: number; mimeType?: string }> {
+    const maxRetries = opts?.maxRetries ?? 5;
+    for (let attempt = 0; ; attempt++) {
+      if (opts?.signal?.aborted) throw new DOMException("aborted", "AbortError");
+      const res = await callWithRefresh(a, (t) =>
         fetch("/api/uploads", {
           method: "POST",
           credentials: "include",
@@ -2270,8 +2277,21 @@ export const api = {
           },
           body: file,
         }),
-      ),
-    ),
+      );
+      // 换号栅栏必须逐次检查:重试循环会跨越切账号边界,旧 epoch 的响应不能继续重放,
+      // 否则退避期间换了号,文件会落进上一个账号的容器卷。
+      assertAuthResponseCurrent(res);
+      if (res.ok) return jsonOrThrow(res);
+      // 容器冷启：handleUpload / _resolveMediaDirs 未就绪时 fail-closed 503 + Retry-After。
+      // 只对 503 退避；其它状态码立即抛，避免把 4xx 拖成假成功。
+      if (res.status === 503 && attempt < maxRetries) {
+        const retryAfterSec = Math.min(10, Math.max(1, parseRetryAfter(res) ?? 3));
+        await sleep(retryAfterSec * 1000, opts?.signal);
+        continue;
+      }
+      await throwApi(res);
+    }
+  },
 
   // ── 媒体签名（commercial REST） ──────────────────────────────────────────
 

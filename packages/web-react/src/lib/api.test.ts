@@ -1229,3 +1229,99 @@ test('getSessionLiveUnits sends view=units', async () => {
     '/api/sessions/web-session-1/live-frames?view=units&n=20',
   )
 })
+
+function uploadUnavailable(retryAfter?: number) {
+  return {
+    ok: false,
+    status: 503,
+    headers: {
+      get: (h: string) => {
+        const key = h.toLowerCase()
+        if (key === 'retry-after') return retryAfter == null ? null : String(retryAfter)
+        if (key === 'x-request-id') return 'req-upload-503'
+        return null
+      },
+    },
+    json: async () => ({ error: { code: 'UNAVAILABLE', message: 'container not ready' } }),
+  }
+}
+
+function uploadFileBlob(name = 'probe.txt'): File {
+  return new File(['probe'], name, { type: 'text/plain' })
+}
+
+test('uploadFile retries 503 then succeeds', async () => {
+  vi.useFakeTimers()
+  let calls = 0
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => {
+    calls += 1
+    if (calls <= 3) return uploadUnavailable(2)
+    return ok({ url: '/api/media/probe.txt', digest: 'abc', size: 5, mimeType: 'text/plain' })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-upload-503-ok')
+  const pending = api.uploadFile(session, uploadFileBlob())
+  await vi.runAllTimersAsync()
+  await expect(pending).resolves.toMatchObject({ url: '/api/media/probe.txt', digest: 'abc' })
+  expect(fetchMock).toHaveBeenCalledTimes(4)
+  expect(String(fetchMock.mock.calls[0]?.[0])).toBe('/api/uploads')
+})
+
+test('uploadFile throws after exhausting 503 retries', async () => {
+  vi.useFakeTimers()
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => uploadUnavailable(1))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-upload-503-exhaust')
+  const pending = api.uploadFile(session, uploadFileBlob(), { maxRetries: 2 })
+  const expectation = expect(pending).rejects.toMatchObject({
+    status: 503,
+    code: 'UNAVAILABLE',
+  })
+  await vi.runAllTimersAsync()
+  await expectation
+  expect(fetchMock).toHaveBeenCalledTimes(3)
+})
+
+test('uploadFile throws non-503 immediately without retry', async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => authErr(400, 'VALIDATION', 'bad file'))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-upload-400')
+  await expect(api.uploadFile(session, uploadFileBlob())).rejects.toMatchObject({
+    status: 400,
+    code: 'VALIDATION',
+  })
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test('uploadFile honors Retry-After seconds and clamps to [1, 10]', async () => {
+  vi.useFakeTimers()
+  async function runQueued(replies: unknown[]) {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => {
+      const next = replies.shift()
+      if (next === undefined) throw new Error('unexpected extra fetch')
+      return next
+    })
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    return fetchMock
+  }
+
+  const fetchMock = await runQueued([uploadUnavailable(7), ok({ url: '/api/media/probe.txt' })])
+  const pending = api.uploadFile(makeSession('tok-upload-retry-after').session, uploadFileBlob())
+  await vi.advanceTimersByTimeAsync(0)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  await vi.advanceTimersByTimeAsync(6999)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  await vi.advanceTimersByTimeAsync(1)
+  await expect(pending).resolves.toMatchObject({ url: '/api/media/probe.txt' })
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+
+  const clampMock = await runQueued([uploadUnavailable(99), ok({ url: '/api/media/clamped.txt' })])
+  const pendingClamp = api.uploadFile(makeSession('tok-upload-clamp').session, uploadFileBlob())
+  await vi.advanceTimersByTimeAsync(0)
+  expect(clampMock).toHaveBeenCalledTimes(1)
+  await vi.advanceTimersByTimeAsync(9_999)
+  expect(clampMock).toHaveBeenCalledTimes(1)
+  await vi.advanceTimersByTimeAsync(1)
+  await expect(pendingClamp).resolves.toMatchObject({ url: '/api/media/clamped.txt' })
+  expect(clampMock).toHaveBeenCalledTimes(2)
+})

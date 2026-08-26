@@ -195,10 +195,12 @@ export function Composer({
   }, [value]);
 
   const uploading = attachments.some((a) => a.status === "uploading");
+  const attachFailed = attachments.some((a) => a.status === "error");
   const doneMedia = attachments
     .filter((a) => a.status === "done" && a.media)
     .map((a) => a.media as MediaRef);
-  const canSend = (value.trim().length > 0 || doneMedia.length > 0) && !uploading;
+  // error 与 uploading 同等拦截：失败附件不得被静默丢掉后把正文发出去。
+  const canSend = (value.trim().length > 0 || doneMedia.length > 0) && !uploading && !attachFailed;
 
   // 「+」菜单可用项:附件(有 onUpload)与目标(有 onSetGoal+onGoalAction)。两者皆无时(如 demo)
   // 退化为禁用的「+」按钮,保留原视觉锚点而不弹空菜单。
@@ -493,6 +495,13 @@ export function Composer({
             type="button"
             data-product-control
             aria-label={stopping ? "正在停止" : busy ? "停止" : "发送"}
+            title={
+              attachFailed
+                ? "有附件上传失败，请重试或移除后再发送"
+                : uploading
+                  ? "附件上传中"
+                  : undefined
+            }
             onClick={() => {
               if (busy) {
                 if (!stopping) onStop?.();

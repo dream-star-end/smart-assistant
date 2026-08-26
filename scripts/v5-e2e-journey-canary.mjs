@@ -287,10 +287,23 @@ try {
     const probePath = join(mkdtempSync(join(tmpdir(), "oc-e2e-")), probeName);
     writeFileSync(probePath, `${probeToken}\n`);
     await chooser.setFiles(probePath);
-    // chip 出现 + 真实上传完成(done 态没有重试按钮;上传中发送按钮禁用,enabled=done 活体信号)。
+    // 必须等到 chip done 终态再放行;上传飞行中没有「重试」按钮,瞬时断言会漏掉失败。
+    // done: 发送键因 doneMedia 变为可用; error: 「重试上传」出现则立刻 fail。
     await page.getByRole("button", { name: `移除 ${probeName}` }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
-    if ((await page.getByRole("button", { name: `重试上传 ${probeName}` }).count()) > 0) {
-      throw new Error("附件 chip 进入 error 态(真实上传失败)");
+    const retry = page.getByRole("button", { name: `重试上传 ${probeName}` });
+    const send = page.getByRole("button", { name: "发送" });
+    // 必须覆盖前端 uploadFile 的最坏重试预算(5 次 × Retry-After clamp 上限 10s,
+    // 外加每次请求自身的 ensure 等待),否则真上传还在合法退避就被本门判死。
+    const uploadDeadline = Date.now() + 120_000;
+    for (;;) {
+      if ((await retry.count()) > 0) {
+        throw new Error(`附件 chip 进入 error 态(真实上传失败): ${probeName}`);
+      }
+      if (!(await send.isDisabled())) break;
+      if (Date.now() > uploadDeadline) {
+        throw new Error("附件上传未在超时窗内到达 done 终态");
+      }
+      await new Promise((r) => setTimeout(r, 200));
     }
   });
 
