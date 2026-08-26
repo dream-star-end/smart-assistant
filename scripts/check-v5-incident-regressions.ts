@@ -359,6 +359,9 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   "5ecb3ead3fb07d8506d62c0d3ffc282d0170ae61",
   "655a47da520b87419353774bb9ffd77290a05460",
   "e1077dfd4b99ff28dd17cb77e627e5bc534e738e",
+  // selfhost 已在本轮 trailer gate 运行前发布到该不可变 tip；只冻结其祖先，
+  // 后续 unified commits 仍逐条走 trailer / waiver 闭环。
+  "28962cf36f60afdf3cca10f5a6d51beafcea2724",
 ] as const;
 
 function checkTrailerClosure(): number {

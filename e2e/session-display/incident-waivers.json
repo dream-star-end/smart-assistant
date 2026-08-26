@@ -92,6 +92,12 @@
       "reason": "Word/DOCX 新功能在 0% 合成验收容器中发现 Debian 12 LibreOffice 7.4 会把正确 OMML 公式误渲染为“¿”；已立即用官方 rollback 恢复旧稳定版，未向真实用户切流，聊天、计费和数据均未受影响。本提交仅把 Writer/Math 固定到同发行版 bookworm-backports 25.2 并增加复杂公式构建门。",
       "approvedBy": "dx 2026-08-11 指示按 Word DOCX Skill Kit 优化并“取消前序 OCR，先上 Word”",
       "expiresAt": "2026-09-11"
+    },
+    {
+      "commit": "e3634b2217c9b1dc39c8e9709ddd1c9d2cdb6bb3",
+      "reason": "仅修复 boss 自用 selfhost 的 Cursor 委派完成唤醒延迟与 CLI 前台分段，不涉及 claudeai.chat 付费生产流量、计费或数据事故；对应现象发生在 uid3 个人实例。",
+      "approvedBy": "dx 2026-08-26 指示统一全部部署上线",
+      "expiresAt": "2026-09-26"
     }
   ]
 }
