@@ -73,3 +73,28 @@ tmp/
 /claude-code-best/SECURITY.md
 /claude-code-best/TODO.md
 /claude-code-best/docs/
+
+# ── C. host-only surfaces that survive A/B but are not user-container runtime ──
+# 用户容器不注入 OC_RUNTIME_CHANNEL,CLI 落到 v3,web root = packages/web/public
+# (见 packages/web/README.md + gateway.ts)。packages/web 必须保留。
+# v5 master SPA(web-react)由 host master release 服务,runtime 不 vite 构建、
+# 容器也不走 spa 根;只留 package.json 以免 npm workspaces 在 npm ci 时 ENOENT。
+# e2e / .github / desktop 同理:进 digest 会把纯前端/CI 批次打成 runtime miss。
+# 拿不准不排除(多进 digest = 复用更严)。
+/e2e/
+/.github/
+/packages/desktop/
+/packages/web-react/src/
+/packages/web-react/browser-tests/
+/packages/web-react/docs/
+/packages/web-react/public/
+/packages/web-react/TUTORIALS.md
+/packages/web-react/admin.html
+/packages/web-react/index.html
+/packages/web-react/package-lock.json
+/packages/web-react/tsconfig.json
+/packages/web-react/tutorial-capture-provenance.json
+/packages/web-react/tutorial-sync-history-head.json
+/packages/web-react/tutorial-sync-history.jsonl
+/packages/web-react/tutorial-sync.json
+/packages/web-react/vite.config.ts

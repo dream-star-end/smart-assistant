@@ -8373,6 +8373,8 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(source, /try_reuse_runtime_release\(\)/)
     assert.match(source, /runtime_input_ls_tree\(\)/)
     assert.match(source, /load_runtime_rsync_exclude_patterns\(\)/)
+    assert.match(source, /runtime_release_metadata_hash\(\)/)
+    assert.match(source, /RUNTIME_INPUT_DIGEST_ALG="v3-rsync-excludes"/)
     assert.match(source, /OC_V5_RUNTIME_REUSE:-1/)
     assert.match(source, /OC_V5_RUNTIME_REUSE=0/)
     assert.match(source, /inputDigest/)
@@ -8540,7 +8542,13 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(listed.stdout, /packages\/channels\//)
     assert.match(listed.stdout, /packages\/plugin-sdk\//)
     assert.doesNotMatch(listed.stdout, /packages\/commercial\//)
+    assert.match(listed.stdout, /packages\/web\/public\//)
+    assert.match(listed.stdout, /packages\/web-react\/package.json/)
     assert.doesNotMatch(listed.stdout, /\tscripts\//)
+    assert.doesNotMatch(listed.stdout, /\tpackages\/web-react\/src\//)
+    assert.doesNotMatch(listed.stdout, /\te2e\//)
+    assert.doesNotMatch(listed.stdout, /\t\.github\//)
+    assert.doesNotMatch(listed.stdout, /\tpackages\/desktop\//)
 
     const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
     const image = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -8551,5 +8559,108 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.equal(changed.status, 0, changed.stderr)
     assert.match(base.stdout.trim(), /^[0-9a-f]{64}$/)
     assert.notEqual(base.stdout.trim(), changed.stdout.trim())
+  })
+
+  test('B5: host-only web/e2e/github changes must not invalidate runtime digest', () => {
+    const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const image = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const base = invokeHelpers(`compute_runtime_input_digest '${sha}' '${image}'`)
+    assert.equal(base.status, 0, base.stderr)
+    assert.match(base.stdout.trim(), /^[0-9a-f]{64}$/)
+
+    const web = danglingFileChange('packages/web-react/src/App.tsx')
+    const webDigest = invokeHelpers(`compute_runtime_input_digest '${web.commit}' '${image}'`)
+    assert.equal(webDigest.status, 0, webDigest.stderr)
+    assert.equal(base.stdout.trim(), webDigest.stdout.trim())
+
+    const e2e = danglingFileChange('e2e/session-display/incidents.json')
+    const e2eDigest = invokeHelpers(`compute_runtime_input_digest '${e2e.commit}' '${image}'`)
+    assert.equal(e2eDigest.status, 0, e2eDigest.stderr)
+    assert.equal(base.stdout.trim(), e2eDigest.stdout.trim())
+
+    const gh = danglingFileChange('.github/integ-tiers/nightly-4.txt')
+    const ghDigest = invokeHelpers(`compute_runtime_input_digest '${gh.commit}' '${image}'`)
+    assert.equal(ghDigest.status, 0, ghDigest.stderr)
+    assert.equal(base.stdout.trim(), ghDigest.stdout.trim())
+
+    const proto = danglingFileChange('packages/protocol/src/engineModels.ts')
+    const protoDigest = invokeHelpers(`compute_runtime_input_digest '${proto.commit}' '${image}'`)
+    assert.equal(protoDigest.status, 0, protoDigest.stderr)
+    assert.notEqual(base.stdout.trim(), protoDigest.stdout.trim())
+  })
+
+  test('B5: host-only release-metadata migrations must not invalidate runtime digest', () => {
+    const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const image = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const base = invokeHelpers(`compute_runtime_input_digest '${sha}' '${image}'`)
+    assert.equal(base.status, 0, base.stderr)
+
+    const orig = spawnSync('git', ['show', `${sha}:deploy/v5/release-metadata.json`], {
+      cwd: root,
+      encoding: 'utf8',
+    })
+    assert.equal(orig.status, 0, orig.stderr)
+    const parsed = JSON.parse(orig.stdout)
+    parsed.requiredMigrations = [...parsed.requiredMigrations, '0999_host_only_runtime_digest_fixture']
+    const blob = spawnSync('git', ['hash-object', '-w', '--stdin'], {
+      cwd: root,
+      encoding: 'utf8',
+      input: `${JSON.stringify(parsed, null, 2)}\n`,
+    }).stdout.trim()
+    assert.match(blob, /^[0-9a-f]{40}$/)
+    const ls = spawnSync('git', ['ls-tree', '-r', sha, '--', 'deploy/v5/release-metadata.json'], {
+      cwd: root,
+      encoding: 'utf8',
+    })
+    assert.equal(ls.status, 0, ls.stderr)
+    const mode = ls.stdout.trim().split(/\s+/)[0]
+    const index = path.join(tmpdir(), `oc-v5-meta-idx-${process.pid}-${Date.now()}`)
+    const env = { ...process.env, GIT_INDEX_FILE: index }
+    assert.equal(spawnSync('git', ['read-tree', sha], { cwd: root, encoding: 'utf8', env }).status, 0)
+    assert.equal(
+      spawnSync('git', ['update-index', '--cacheinfo', `${mode},${blob},deploy/v5/release-metadata.json`], {
+        cwd: root,
+        encoding: 'utf8',
+        env,
+      }).status,
+      0,
+    )
+    const tree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env }).stdout.trim()
+    const commit = spawnSync('git', ['commit-tree', tree, '-p', sha, '-m', 'audit overlay metadata migrations'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).stdout.trim()
+    spawnSync('rm', ['-f', index])
+    const migrated = invokeHelpers(`compute_runtime_input_digest '${commit}' '${image}'`)
+    assert.equal(migrated.status, 0, migrated.stderr)
+    assert.equal(base.stdout.trim(), migrated.stdout.trim())
+
+    parsed.runtimeCapabilities = [...parsed.runtimeCapabilities, 'runtime-digest-fixture-cap']
+    const capBlob = spawnSync('git', ['hash-object', '-w', '--stdin'], {
+      cwd: root,
+      encoding: 'utf8',
+      input: `${JSON.stringify(parsed, null, 2)}\n`,
+    }).stdout.trim()
+    const capIndex = path.join(tmpdir(), `oc-v5-meta-cap-idx-${process.pid}-${Date.now()}`)
+    const capEnv = { ...process.env, GIT_INDEX_FILE: capIndex }
+    assert.equal(spawnSync('git', ['read-tree', sha], { cwd: root, encoding: 'utf8', env: capEnv }).status, 0)
+    assert.equal(
+      spawnSync('git', ['update-index', '--cacheinfo', `${mode},${capBlob},deploy/v5/release-metadata.json`], {
+        cwd: root,
+        encoding: 'utf8',
+        env: capEnv,
+      }).status,
+      0,
+    )
+    const capTree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env: capEnv }).stdout.trim()
+    const capCommit = spawnSync(
+      'git',
+      ['commit-tree', capTree, '-p', sha, '-m', 'audit overlay metadata runtimeCapabilities'],
+      { cwd: root, encoding: 'utf8' },
+    ).stdout.trim()
+    spawnSync('rm', ['-f', capIndex])
+    const caps = invokeHelpers(`compute_runtime_input_digest '${capCommit}' '${image}'`)
+    assert.equal(caps.status, 0, caps.stderr)
+    assert.notEqual(base.stdout.trim(), caps.stdout.trim())
   })
 })
