@@ -5,17 +5,61 @@
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./frames": "./src/frames.ts",
-    "./teamCards": "./src/teamCards.ts",
-    "./sessionKey": "./src/sessionKey.ts",
-    "./traceId": "./src/traceId.ts",
-    "./research": "./src/research.ts",
-    "./modelAuthority": "./src/modelAuthority.ts",
-    "./goalState": "./src/goalState.ts",
-    "./mediaGeneration": "./src/mediaGeneration.ts",
-    "./containerPreview": "./src/containerPreview.ts",
-    "./containerPreviewAuth": "./src/containerPreviewAuth.ts"
+    ".": {
+      "types": "./src/index.ts",
+      "openclaude-precompiled": "./dist/index.js",
+      "default": "./src/index.ts"
+    },
+    "./frames": {
+      "types": "./src/frames.ts",
+      "openclaude-precompiled": "./dist/frames.js",
+      "default": "./src/frames.ts"
+    },
+    "./teamCards": {
+      "types": "./src/teamCards.ts",
+      "openclaude-precompiled": "./dist/teamCards.js",
+      "default": "./src/teamCards.ts"
+    },
+    "./sessionKey": {
+      "types": "./src/sessionKey.ts",
+      "openclaude-precompiled": "./dist/sessionKey.js",
+      "default": "./src/sessionKey.ts"
+    },
+    "./traceId": {
+      "types": "./src/traceId.ts",
+      "openclaude-precompiled": "./dist/traceId.js",
+      "default": "./src/traceId.ts"
+    },
+    "./research": {
+      "types": "./src/research.ts",
+      "openclaude-precompiled": "./dist/research.js",
+      "default": "./src/research.ts"
+    },
+    "./modelAuthority": {
+      "types": "./src/modelAuthority.ts",
+      "openclaude-precompiled": "./dist/modelAuthority.js",
+      "default": "./src/modelAuthority.ts"
+    },
+    "./goalState": {
+      "types": "./src/goalState.ts",
+      "openclaude-precompiled": "./dist/goalState.js",
+      "default": "./src/goalState.ts"
+    },
+    "./mediaGeneration": {
+      "types": "./src/mediaGeneration.ts",
+      "openclaude-precompiled": "./dist/mediaGeneration.js",
+      "default": "./src/mediaGeneration.ts"
+    },
+    "./containerPreview": {
+      "types": "./src/containerPreview.ts",
+      "openclaude-precompiled": "./dist/containerPreview.js",
+      "default": "./src/containerPreview.ts"
+    },
+    "./containerPreviewAuth": {
+      "types": "./src/containerPreviewAuth.ts",
+      "openclaude-precompiled": "./dist/containerPreviewAuth.js",
+      "default": "./src/containerPreviewAuth.ts"
+    }
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0"

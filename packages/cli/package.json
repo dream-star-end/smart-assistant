@@ -6,7 +6,13 @@
   "bin": {
     "openclaude": "./src/index.ts"
   },
-  "exports": { ".": "./src/index.ts" },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "openclaude-precompiled": "./dist/index.js",
+      "default": "./src/index.ts"
+    }
+  },
   "dependencies": {
     "@openclaude/gateway": "*",
     "@openclaude/storage": "*",

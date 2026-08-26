@@ -1016,7 +1016,7 @@ export function makeV3EnsureRunning(
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "provisioning");
     }
 
-    // 4) waitContainerReady —— 容器内 OpenClaude 起来需要 3-8s,HTTP+WS 双过才算 ready
+    // 4) waitContainerReady —— 容器冷启可达十几秒;默认连续轮询 30s(remote 45s),HTTP+WS 双过才算 ready
     const endpoint = chooseReadinessEndpoint(
       provisioned.hostId,
       deps.selfHostId,

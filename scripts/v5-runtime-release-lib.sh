@@ -540,6 +540,17 @@ oc_hotcfg_finalize_release() {
     [ -s "$staging/packages/mcp-memory/dist/oc-memory-mcp.cjs" ] \
       || { oc_hotcfg__die "oc-memory MCP bundle missing after build"; return 1; }
   fi
+  # Container gateway: TS→JS (module-structure transform) so user containers
+  # `node` the CLI instead of paying ~11-12s tsx compile on cold start.
+  # Native addons stay in node_modules. Runtime wrapper fail-opens to tsx.
+  # Build failure must fail finalize (no silent release without the artifact).
+  if [ -f "$staging/scripts/build-container-gateway.sh" ]; then
+    oc_hotcfg__log "precompile container gateway"
+    ( cd "$staging" && bash scripts/build-container-gateway.sh >&2 ) \
+      || { oc_hotcfg__die "container gateway precompile failed"; return 1; }
+    [ -s "$staging/packages/cli/dist/index.js" ] && [ -f "$staging/packages/cli/dist/.precompiled-ok" ] \
+      || { oc_hotcfg__die "container gateway precompile missing after build"; return 1; }
+  fi
   # 产物阶段敏感扫描(node_modules 可能夹带 .pem 测试夹具 → 只扫源码顶层,node_modules 排除以免误杀依赖自带证书夹具)
   # 说明:敏感扫描针对**源码树被误纳入凭据**,node_modules 里第三方包自带的 *.pem 测试夹具非本仓凭据,
   # 扫描 node_modules 会大量误报;故 release 敏感扫描排除 node_modules(bundle 无 node_modules 不受影响)。
