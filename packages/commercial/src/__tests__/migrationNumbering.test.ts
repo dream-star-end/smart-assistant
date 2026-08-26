@@ -11,6 +11,16 @@ const MIGRATIONS_DIR = path.resolve(here, '../db/migrations')
 // ledger 记全名,机械上无害,但破坏"next = max+1"开号约定。只冻结,不许新增
 // (2026-07-17 一天内三起并行批撞号,0163 双开实际合入 canonical 后才被发现)。
 const GRANDFATHERED_DUPLICATE_PREFIXES = new Set(['0102', '0103', '0130', '0134', '0135'])
+const FROZEN_APPLIED_FORK_DUPLICATES = new Map<string, ReadonlySet<string>>([
+  ['0246', new Set([
+    '0246_chat_project_board_bind.sql',
+    '0246_ungate_cursor_opus_fable_picker.sql',
+  ])],
+  ['0247', new Set([
+    '0247_cursor_opus_48.sql',
+    '0247_open_cursor_grok_opus48.sql',
+  ])],
+])
 
 describe('migration numbering gate', () => {
   const files = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql'))
@@ -29,8 +39,9 @@ describe('migration numbering gate', () => {
     }
     for (const [prefix, names] of byPrefix) {
       if (names.length === 1) continue
+      const exactFork = FROZEN_APPLIED_FORK_DUPLICATES.get(prefix)
       assert.ok(
-        GRANDFATHERED_DUPLICATE_PREFIXES.has(prefix),
+        GRANDFATHERED_DUPLICATE_PREFIXES.has(prefix) || exactFork !== undefined,
         `迁移序号 ${prefix} 出现 ${names.length} 个文件(${names.join(', ')})。` +
           `开号必须对生产 schema_migrations ledger 与 canonical 目录双源取 max+1;` +
           `若与并行批撞号,后落地者重编号。`,
@@ -40,12 +51,22 @@ describe('migration numbering gate', () => {
         2,
         `冻结的同号对 ${prefix} 只允许历史存量的 2 个文件,不许继续叠加: ${names.join(', ')}`,
       )
+      if (exactFork) {
+        assert.deepEqual(
+          new Set(names),
+          exactFork,
+          `已上线 fork ${prefix} 只豁免精确文件组合,不允许同号替换`,
+        )
+      }
     }
   })
 
   test('冻结名单不含已消亡的序号(防名单腐化)', () => {
     const prefixes = new Set(files.map((f) => f.slice(0, 4)))
-    for (const prefix of GRANDFATHERED_DUPLICATE_PREFIXES) {
+    for (const prefix of [
+      ...GRANDFATHERED_DUPLICATE_PREFIXES,
+      ...FROZEN_APPLIED_FORK_DUPLICATES.keys(),
+    ]) {
       assert.ok(prefixes.has(prefix), `冻结名单中的 ${prefix} 已不存在,应从名单移除`)
     }
   })

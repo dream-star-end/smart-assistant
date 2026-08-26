@@ -7,6 +7,7 @@
  * uid 只从 verifyContainerIdentity 推导，body 不得带 userId。
  */
 
+import { CRON_ORIGIN_INJECT_PATH } from "@openclaude/protocol";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { z } from "zod";
@@ -31,7 +32,7 @@ import {
   setSecurityHeaders,
 } from "./util.js";
 
-export const CRON_ORIGIN_INJECT_PATH = "/internal/v3/cron-origin-inject";
+export { CRON_ORIGIN_INJECT_PATH };
 
 const BodySchema = z
   .object({

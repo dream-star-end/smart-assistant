@@ -16,6 +16,7 @@ import { resetAndMigrateBefore, useDedicatedTestDatabase } from './helpers/db.js
 const db = useDedicatedTestDatabase('models_0247_cursor_opus48_test')
 const here = path.dirname(fileURLToPath(import.meta.url))
 const migrationPath = path.resolve(here, '../db/migrations/0247_cursor_opus_48.sql')
+const commercialMigrationPath = path.resolve(here, '../db/migrations/0247_open_cursor_grok_opus48.sql')
 
 const NEW_IDS = [
   'cursor-opus-4.8-low',
@@ -32,6 +33,10 @@ const NEW_IDS = [
 
 async function loadSql(): Promise<string> {
   return readFile(migrationPath, 'utf8')
+}
+
+async function loadCommercialSql(): Promise<string> {
+  return readFile(commercialMigrationPath, 'utf8')
 }
 
 describe('0247_cursor_opus_48', () => {
@@ -88,6 +93,27 @@ describe('0247_cursor_opus_48', () => {
     assert.equal(priced.rows[0]?.input_per_mtok, expectedInput)
     const grants = await query<{ count: string }>(
       `SELECT COUNT(*)::text AS count FROM model_visibility_grants WHERE model_id = ANY($1::text[])`,
+      [NEW_IDS],
+    )
+    assert.equal(grants.rows[0]?.count, '0')
+  })
+
+  test('converges an exact commercial family without backfilling grants', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    await resetAndMigrateBefore('0247')
+    await query(
+      `INSERT INTO users(id, email, email_verified, password_hash, role)
+       VALUES
+         (1, 'cursor-admin-0247-import@example.com', TRUE, 'argon2$stub', 'admin'),
+         (4, 'cursor-user-0247-import@example.com', TRUE, 'argon2$stub', 'user')`,
+    )
+    await query(await loadCommercialSql())
+    await query(await loadSql())
+
+    const grants = await query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count
+         FROM model_visibility_grants
+        WHERE user_id IN (1, 4) AND model_id = ANY($1::text[])`,
       [NEW_IDS],
     )
     assert.equal(grants.rows[0]?.count, '0')

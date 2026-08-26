@@ -42,6 +42,7 @@ vi.mock('../../hooks/useProjectScope', () => ({
       { value: 'chat-unbound', label: '会话组 · test' },
     ],
     loading: false,
+    refreshWorkProjects: async () => {},
   }),
 }))
 import { api } from '../../lib/api'

@@ -20,7 +20,7 @@
  * 不锁字段名、不锁字段顺序、不锁 schema 写法 —— 只锁"生产者吐得出的,消费者收得下"。
  */
 import { createHash } from 'node:crypto'
-import { readdir, readFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -29,7 +29,10 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 import type { Pool } from 'pg'
 
-import type { OutboundMessage } from '@openclaude/protocol'
+import {
+  INTERNAL_ROUTES,
+  type OutboundMessage,
+} from '@openclaude/protocol'
 import {
   makeV3QqbotOutboundAdapter,
   makeV3WechatOutboundAdapter,
@@ -297,32 +300,20 @@ describe('出站 adapter × receiver schema 对称契约(#199)', () => {
   })
 
   test('③ 新增渠道 receiver 自动纳入(不接进对照表即红)', async () => {
-    const here = dirname(fileURLToPath(import.meta.url))
-    const srcRoot = join(here, '..')
-
-    const found = new Map<string, string>()
-    async function walk(dir: string): Promise<void> {
-      for (const entry of await readdir(dir, { withFileTypes: true })) {
-        if (entry.name === '__tests__' || entry.name === 'node_modules') continue
-        const full = join(dir, entry.name)
-        if (entry.isDirectory()) {
-          await walk(full)
-          continue
-        }
-        if (!entry.name.endsWith('.ts')) continue
-        const source = await readFile(full, 'utf8')
-        for (const m of source.matchAll(
-          /export const ([A-Z0-9_]*OUTBOUND_PATH)\s*=\s*['"]([^'"]+)['"]/g,
-        )) {
-          found.set(m[2]!, `${m[1]} @ ${full}`)
-        }
-      }
-    }
-    await walk(srcRoot)
+    const found = new Map(
+      INTERNAL_ROUTES
+        .filter((route) =>
+          route.plane === 'v3' &&
+          route.match === 'exact' &&
+          route.path.endsWith('-outbound') &&
+          route.sources.some((source) => source.startsWith('commercial/src/'))
+        )
+        .map((route) => [route.path, route.sources.join(', ')] as const),
+    )
 
     assert.ok(
       found.size >= 2,
-      `只扫到 ${found.size} 个 *_OUTBOUND_PATH 导出(低于历史下界 2),扫描器可能失效`,
+      `只扫到 ${found.size} 个 protocol outbound receiver 路由(低于历史下界 2),注册表可能漂移`,
     )
 
     const covered = new Set(CHANNELS.map((c) => c.outboundPath))

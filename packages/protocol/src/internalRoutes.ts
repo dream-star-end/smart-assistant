@@ -66,6 +66,7 @@ export const SKILL_SHADOW_PATH = '/internal/v3/skill-shadow'
 export const PLATFORM_PROMPT_SLOTS_PATH = '/internal/v3/platform-prompt-slots'
 export const PROJECT_CONTEXT_PATH = '/internal/v3/project-context'
 export const CRON_INDEX_PATH = '/internal/v3/cron-index'
+export const CRON_ORIGIN_INJECT_PATH = '/internal/v3/cron-origin-inject'
 export const INBOX_POST_PATH = '/internal/v3/inbox-post'
 export const INBOX_ALERT_PATH = '/internal/v3/inbox-alert'
 export const AUTO_DREAM_POLICY_PATH = '/internal/v3/auto-dream-policy'
@@ -309,6 +310,12 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v3',
     sources: ['gateway/src/v3CronIndexPush.ts', 'commercial/src/http/internalCronIndex.ts'],
+  },
+  {
+    path: CRON_ORIGIN_INJECT_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/v3CronOriginInject.ts', 'commercial/src/http/internalCronOriginInject.ts'],
   },
   {
     path: INBOX_POST_PATH,

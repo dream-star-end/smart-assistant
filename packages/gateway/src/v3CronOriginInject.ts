@@ -1,6 +1,7 @@
 // 容器 → master origin-session 注入 client。
 // 有 OPENCLAUDE_V3_MASTER_BASE_URL + container token 才启用；缺 env → 调用方走本地 sqlite 路径。
 
+import { CRON_ORIGIN_INJECT_PATH } from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
 
 import {
@@ -11,7 +12,7 @@ import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'v3CronOriginInject' })
 
-export const CRON_ORIGIN_INJECT_PATH = '/internal/v3/cron-origin-inject'
+export { CRON_ORIGIN_INJECT_PATH }
 
 const ATTEMPT_TIMEOUT_MS = 15_000
 

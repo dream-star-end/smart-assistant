@@ -106,6 +106,7 @@ const MIGRATION_0239 = path.resolve(here, "../db/migrations/0239_turn_dispatch_s
 const MIGRATION_0240 = path.resolve(here, "../db/migrations/0240_client_session_last_read_at.sql");
 const MIGRATION_0241 = path.resolve(here, "../db/migrations/0241_raise_last_read_watermark.sql");
 const MIGRATION_0243 = path.resolve(here, "../db/migrations/0243_live_unit_checkpoints.sql");
+const MIGRATION_0246_CHAT_PROJECT = path.resolve(here, "../db/migrations/0246_chat_project_board_bind.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -243,6 +244,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0240, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0241, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0243, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0246_CHAT_PROJECT, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE agent_containers (
       user_id BIGINT NOT NULL,
@@ -6700,12 +6702,16 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       }],
     }));
 
-    const [job] = await claimDueRecoveryJobs(pool, {
+    const claimed = await claimDueRecoveryJobs(pool, {
       userId: UID,
       ownerId: "master-silent-test",
       leaseMs: 120_000,
-      limit: 1,
+      limit: 20,
     });
+    const job = claimed.find((candidate) =>
+      candidate.sessionId === sessionId &&
+      candidate.sourceClientMessageId === sourceClientMessageId
+    );
     assert.ok(job);
     const request = job.request as {
       content: {

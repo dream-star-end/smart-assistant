@@ -9,6 +9,11 @@
 --
 -- New rows are born staged then activated. Selfhost profile must not
 -- insert grants; commercial profile grants users 1/4 when both exist.
+--
+-- Fork convergence: commercial may already have created the exact Opus 4.8
+-- family through 0247_open_cursor_grok_opus48. Reuse only a complete,
+-- semantic-equivalent family; partial/drifted rows remain fail-closed and the
+-- imported path never backfills per-user grants.
 
 DO $$
 DECLARE
@@ -16,6 +21,8 @@ DECLARE
   selfhost_profile BOOLEAN := current_setting('openclaude.migration_profile', true) = 'v5-selfhost';
   rec RECORD;
   actual INTEGER;
+  existing INTEGER;
+  created_family BOOLEAN := FALSE;
   grant_count INTEGER := 0;
 BEGIN
   IF NOT EXISTS (
@@ -25,82 +32,117 @@ BEGIN
     RAISE EXCEPTION '0247 requires active enabled cursor-opus-5-high floor';
   END IF;
 
-  FOR rec IN
-    SELECT * FROM (VALUES
-      ('cursor-opus-4.8-low', 'claude-opus-4-8-thinking-low', 'Cursor Opus 4.8 Low', 1),
-      ('cursor-opus-4.8-low-fast', 'claude-opus-4-8-thinking-low-fast', 'Cursor Opus 4.8 Low Fast', 2),
-      ('cursor-opus-4.8-medium', 'claude-opus-4-8-thinking-medium', 'Cursor Opus 4.8 Medium', 1),
-      ('cursor-opus-4.8-medium-fast', 'claude-opus-4-8-thinking-medium-fast', 'Cursor Opus 4.8 Medium Fast', 2),
-      ('cursor-opus-4.8-high', 'claude-opus-4-8-thinking-high', 'Cursor Opus 4.8 High', 1),
-      ('cursor-opus-4.8-high-fast', 'claude-opus-4-8-thinking-high-fast', 'Cursor Opus 4.8 High Fast', 2),
-      ('cursor-opus-4.8-xhigh', 'claude-opus-4-8-thinking-xhigh', 'Cursor Opus 4.8 Extra High', 1),
-      ('cursor-opus-4.8-xhigh-fast', 'claude-opus-4-8-thinking-xhigh-fast', 'Cursor Opus 4.8 Extra High Fast', 2),
-      ('cursor-opus-4.8-max', 'claude-opus-4-8-thinking-max', 'Cursor Opus 4.8 Max', 1),
-      ('cursor-opus-4.8-max-fast', 'claude-opus-4-8-thinking-max-fast', 'Cursor Opus 4.8 Max Fast', 2)
-    ) AS t(model_id, upstream_model_id, display_name, multiplier)
-  LOOP
-    IF EXISTS (SELECT 1 FROM model_catalog WHERE model_id = rec.model_id)
-       OR EXISTS (SELECT 1 FROM model_pricing WHERE model_id = rec.model_id) THEN
-      RAISE EXCEPTION '0247 refuses pre-existing %', rec.model_id;
-    END IF;
-
-    INSERT INTO model_catalog (
-      model_id, engine, provider_id, upstream_model_id, context_window,
-      capability_profile, capability_schema_version, state
-    )
-    SELECT
-      rec.model_id,
-      engine,
-      provider_id,
-      rec.upstream_model_id,
-      context_window,
-      capability_profile,
-      capability_schema_version,
-      'staged'
+  SELECT COUNT(*) INTO existing
     FROM model_catalog
-    WHERE model_id = 'cursor-opus-5-high' AND state = 'active';
-    IF NOT FOUND THEN
-      RAISE EXCEPTION '0247 failed to clone catalog from cursor-opus-5-high for %', rec.model_id;
-    END IF;
-
-    INSERT INTO model_pricing (
-      model_id, display_name,
-      input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok,
-      multiplier, enabled, sort_order, visibility, extra_system_prompt,
-      default_effort, lock_version, min_plan_code
-    )
-    SELECT
-      rec.model_id,
-      rec.display_name,
-      input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok,
-      rec.multiplier, FALSE, sort_order, visibility, extra_system_prompt,
-      default_effort, 0, min_plan_code
+   WHERE model_id LIKE 'cursor-opus-4.8-%';
+  SELECT COUNT(*) INTO actual
     FROM model_pricing
-    WHERE model_id = 'cursor-opus-5-high';
-    IF NOT FOUND THEN
-      RAISE EXCEPTION '0247 failed to clone pricing from cursor-opus-5-high for %', rec.model_id;
-    END IF;
+   WHERE model_id LIKE 'cursor-opus-4.8-%';
+  IF existing NOT IN (0, 10) OR actual <> existing THEN
+    RAISE EXCEPTION
+      '0247 cursor fork refuses partial imported Opus 4.8 family (catalog %, pricing %)',
+      existing, actual;
+  END IF;
 
-    UPDATE model_catalog
-       SET state = 'active'
-     WHERE model_id = rec.model_id AND state = 'staged';
-    IF NOT FOUND THEN
-      RAISE EXCEPTION '0247 failed to activate catalog %', rec.model_id;
-    END IF;
+  IF existing = 0 THEN
+    created_family := TRUE;
+    FOR rec IN
+      SELECT * FROM (VALUES
+        ('cursor-opus-4.8-low', 'claude-opus-4-8-thinking-low', 'Cursor Opus 4.8 Low', 1),
+        ('cursor-opus-4.8-low-fast', 'claude-opus-4-8-thinking-low-fast', 'Cursor Opus 4.8 Low Fast', 2),
+        ('cursor-opus-4.8-medium', 'claude-opus-4-8-thinking-medium', 'Cursor Opus 4.8 Medium', 1),
+        ('cursor-opus-4.8-medium-fast', 'claude-opus-4-8-thinking-medium-fast', 'Cursor Opus 4.8 Medium Fast', 2),
+        ('cursor-opus-4.8-high', 'claude-opus-4-8-thinking-high', 'Cursor Opus 4.8 High', 1),
+        ('cursor-opus-4.8-high-fast', 'claude-opus-4-8-thinking-high-fast', 'Cursor Opus 4.8 High Fast', 2),
+        ('cursor-opus-4.8-xhigh', 'claude-opus-4-8-thinking-xhigh', 'Cursor Opus 4.8 Extra High', 1),
+        ('cursor-opus-4.8-xhigh-fast', 'claude-opus-4-8-thinking-xhigh-fast', 'Cursor Opus 4.8 Extra High Fast', 2),
+        ('cursor-opus-4.8-max', 'claude-opus-4-8-thinking-max', 'Cursor Opus 4.8 Max', 1),
+        ('cursor-opus-4.8-max-fast', 'claude-opus-4-8-thinking-max-fast', 'Cursor Opus 4.8 Max Fast', 2)
+      ) AS t(model_id, upstream_model_id, display_name, multiplier)
+    LOOP
+      INSERT INTO model_catalog (
+        model_id, engine, provider_id, upstream_model_id, context_window,
+        capability_profile, capability_schema_version, state
+      )
+      SELECT
+        rec.model_id,
+        engine,
+        provider_id,
+        rec.upstream_model_id,
+        context_window,
+        capability_profile,
+        capability_schema_version,
+        'staged'
+      FROM model_catalog
+      WHERE model_id = 'cursor-opus-5-high' AND state = 'active';
+      IF NOT FOUND THEN
+        RAISE EXCEPTION '0247 failed to clone catalog from cursor-opus-5-high for %', rec.model_id;
+      END IF;
 
-    UPDATE model_pricing AS neu
-       SET enabled = TRUE,
-           visibility = baseline.visibility,
-           min_plan_code = baseline.min_plan_code,
-           multiplier = rec.multiplier,
-           lock_version = neu.lock_version + 1
-      FROM model_pricing AS baseline
-     WHERE neu.model_id = rec.model_id
-       AND baseline.model_id = 'cursor-opus-5-high';
-    IF NOT FOUND THEN
-      RAISE EXCEPTION '0247 failed to enable pricing %', rec.model_id;
+      INSERT INTO model_pricing (
+        model_id, display_name,
+        input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok,
+        multiplier, enabled, sort_order, visibility, extra_system_prompt,
+        default_effort, lock_version, min_plan_code
+      )
+      SELECT
+        rec.model_id,
+        rec.display_name,
+        input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok,
+        rec.multiplier, FALSE, sort_order, visibility, extra_system_prompt,
+        default_effort, 0, min_plan_code
+      FROM model_pricing
+      WHERE model_id = 'cursor-opus-5-high';
+      IF NOT FOUND THEN
+        RAISE EXCEPTION '0247 failed to clone pricing from cursor-opus-5-high for %', rec.model_id;
+      END IF;
+
+      UPDATE model_catalog
+         SET state = 'active'
+       WHERE model_id = rec.model_id AND state = 'staged';
+      IF NOT FOUND THEN
+        RAISE EXCEPTION '0247 failed to activate catalog %', rec.model_id;
+      END IF;
+
+      UPDATE model_pricing AS neu
+         SET enabled = TRUE,
+             visibility = baseline.visibility,
+             min_plan_code = baseline.min_plan_code,
+             multiplier = rec.multiplier,
+             lock_version = neu.lock_version + 1
+        FROM model_pricing AS baseline
+       WHERE neu.model_id = rec.model_id
+         AND baseline.model_id = 'cursor-opus-5-high';
+      IF NOT FOUND THEN
+        RAISE EXCEPTION '0247 failed to enable pricing %', rec.model_id;
+      END IF;
+    END LOOP;
+  ELSE
+    IF EXISTS (
+      SELECT 1
+        FROM (VALUES
+          ('cursor-opus-4.8-low', 'claude-opus-4-8-thinking-low', 1),
+          ('cursor-opus-4.8-low-fast', 'claude-opus-4-8-thinking-low-fast', 2),
+          ('cursor-opus-4.8-medium', 'claude-opus-4-8-thinking-medium', 1),
+          ('cursor-opus-4.8-medium-fast', 'claude-opus-4-8-thinking-medium-fast', 2),
+          ('cursor-opus-4.8-high', 'claude-opus-4-8-thinking-high', 1),
+          ('cursor-opus-4.8-high-fast', 'claude-opus-4-8-thinking-high-fast', 2),
+          ('cursor-opus-4.8-xhigh', 'claude-opus-4-8-thinking-xhigh', 1),
+          ('cursor-opus-4.8-xhigh-fast', 'claude-opus-4-8-thinking-xhigh-fast', 2),
+          ('cursor-opus-4.8-max', 'claude-opus-4-8-thinking-max', 1),
+          ('cursor-opus-4.8-max-fast', 'claude-opus-4-8-thinking-max-fast', 2)
+        ) AS expected(model_id, upstream_model_id, multiplier)
+        LEFT JOIN model_catalog c USING (model_id)
+        LEFT JOIN model_pricing p USING (model_id)
+       WHERE c.engine IS DISTINCT FROM 'cursor'
+          OR c.upstream_model_id IS DISTINCT FROM expected.upstream_model_id
+          OR c.state IS DISTINCT FROM 'active'
+          OR p.enabled IS DISTINCT FROM TRUE
+          OR p.multiplier IS DISTINCT FROM expected.multiplier
+    ) THEN
+      RAISE EXCEPTION '0247 cursor fork refuses drifted imported Opus 4.8 family';
     END IF;
-  END LOOP;
+  END IF;
 
   ALTER TABLE cursor_external_usage_audit
     DROP CONSTRAINT IF EXISTS cursor_external_usage_audit_model_id_check;
@@ -154,7 +196,7 @@ BEGIN
     END IF;
   END IF;
 
-  IF present_users = 2 THEN
+  IF present_users = 2 AND created_family THEN
     IF NOT EXISTS (
       SELECT 1 FROM users WHERE id = 1 AND role = 'admin' AND status = 'active'
     ) OR NOT EXISTS (
@@ -240,7 +282,7 @@ BEGIN
     RAISE EXCEPTION '0247 min_plan_code must clone cursor-opus-5-high';
   END IF;
 
-  IF present_users = 2 AND (
+  IF present_users = 2 AND created_family AND (
     SELECT COUNT(*)
       FROM model_visibility_grants
      WHERE user_id IN (1, 4)
