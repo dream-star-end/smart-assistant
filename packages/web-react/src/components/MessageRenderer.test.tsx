@@ -2161,6 +2161,29 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     scroller.remove();
   });
 
+  test("无 followBottomRef 时首次挂载仍贴底", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 200 });
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 800 });
+    scroller.scrollTop = 0;
+    const rows = Array.from({ length: 90 }, (_, index) =>
+      mk("user", { id: "no-follow-snap-" + index, text: "只读贴底 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    expect(scroller.scrollTop).toBe(800);
+    scroller.remove();
+  });
+
   test("首开内容高度晚长时跟随底部", () => {
     const observers: ResizeObserverCallback[] = [];
     vi.stubGlobal("ResizeObserver", class {
