@@ -526,55 +526,56 @@ function ProjectMemoryReview({ auth, project }: { auth: AuthSession; project: Pr
     })
 
   if (!items) return null
+  // 候选队列只剩存量:自动晋升之前写下的 pending/conflict 还需要人工消化,之后这一段消失。
+  const leftover = items.candidates.filter((c) => c.status === 'pending' || c.status === 'conflict')
   return (
     <div className="mt-2 flex flex-col gap-2 border-t border-border pt-3" data-testid="project-memory-review">
       <h3 className="text-section font-semibold text-fg">项目记忆</h3>
       <p className="text-caption text-muted">
-        候选需人工采纳后才会注入下一轮。Agent 直接改 memory/*.md 不会绕过晋升。
+        智能体整理出的条目登记后立即注入下一轮，可在下方废弃。Agent 直接改 memory/*.md 不会被注入。
       </p>
-      {items.candidates.length === 0 ? (
-        <p className="text-caption text-faint">没有待审核候选。</p>
-      ) : (
-        items.candidates.map((c) => (
-          <div key={c.id ?? c.file} className="rounded-lg bg-hover px-3 py-2 text-body">
-            <div className="font-medium">{c.slug}</div>
-            <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap text-caption text-muted">
-              {(c.content ?? '').slice(0, 800)}
-            </pre>
-            <div className="mt-2 flex gap-1">
-              <Button
-                type="button"
-                size="sm"
-                data-testid={`project-memory-promote-${c.id}`}
-                onClick={() => {
-                  void taskboardApi
-                    .promoteProjectMemory(auth, project.id, c.id ?? '', c.version)
-                    .then(() => refresh())
-                    .catch((e) => toast(taskboardErrorMessage(e, '采纳失败'), 'error'))
-                }}
-              >
-                采纳
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="secondary"
-                onClick={() => {
-                  void taskboardApi
-                    .rejectProjectMemory(auth, project.id, c.id ?? '', c.version)
-                    .then(() => refresh())
-                    .catch((e) => toast(taskboardErrorMessage(e, '丢弃失败'), 'error'))
-                }}
-              >
-                丢弃
-              </Button>
-            </div>
-          </div>
-        ))
+      {leftover.length > 0 && (
+        <p className="text-caption text-muted">以下条目写于改为自动生效之前，还没有生效：</p>
       )}
-      <h4 className="text-meta font-semibold text-fg">正式 / 废弃</h4>
+      {leftover.map((c) => (
+        <div key={c.id ?? c.file} className="rounded-lg bg-hover px-3 py-2 text-body">
+          <div className="font-medium">{c.slug}</div>
+          <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap text-caption text-muted">
+            {(c.content ?? '').slice(0, 800)}
+          </pre>
+          <div className="mt-2 flex gap-1">
+            <Button
+              type="button"
+              size="sm"
+              data-testid={`project-memory-promote-${c.id}`}
+              onClick={() => {
+                void taskboardApi
+                  .promoteProjectMemory(auth, project.id, c.id ?? '', c.version)
+                  .then(() => refresh())
+                  .catch((e) => toast(taskboardErrorMessage(e, '采纳失败'), 'error'))
+              }}
+            >
+              采纳
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              onClick={() => {
+                void taskboardApi
+                  .rejectProjectMemory(auth, project.id, c.id ?? '', c.version)
+                  .then(() => refresh())
+                  .catch((e) => toast(taskboardErrorMessage(e, '忽略失败'), 'error'))
+              }}
+            >
+              忽略
+            </Button>
+          </div>
+        </div>
+      ))}
+      <h4 className="text-meta font-semibold text-fg">生效中的记忆</h4>
       {items.official.length === 0 ? (
-        <p className="text-caption text-faint">尚无正式项目记忆。</p>
+        <p className="text-caption text-faint">还没有项目记忆。</p>
       ) : (
         items.official.map((o) => (
           <div key={o.slug} className="flex items-center justify-between gap-2 text-body">
