@@ -59,6 +59,23 @@ describe('cron origin ids', () => {
       cronOriginIdempotencyKey('remind-a', 'del-1'),
       'cron-origin:remind-a:del-1',
     )
-    assert.equal(cronOriginClientMessageId('cron.abc-def'), 'cron-origin-cronabc-def')
+    assert.equal(
+      cronOriginClientMessageId('cron.abc-def'),
+      cronOriginClientMessageId('cron.abc-def'),
+    )
+  })
+
+  it('clientMessageId satisfies the browser id contract', () => {
+    const id = cronOriginClientMessageId('cron.remind-a.123')
+    assert.match(id, /^cron-origin-[A-Za-z0-9_-]+$/)
+    assert.ok(id.length <= 128)
+  })
+
+  it('separator-only differences no longer collide across jobs', () => {
+    // 旧实现剥掉 `.` 后这两个 deliveryId 同串,跨 job 互相幂等吞掉。
+    assert.notEqual(
+      cronOriginClientMessageId('cron.remind-a.123'),
+      cronOriginClientMessageId('cron.remind-a1.23'),
+    )
   })
 })

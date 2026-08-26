@@ -1221,12 +1221,19 @@ export class CronScheduler {
           job.resume === 'origin-session' &&
           (occurrence.state === 'executing' || occurrence.state === 'completed')
         ) {
-          // Origin inject is not replay-safe (in-memory inbound idempotency).
-          // At-most-once: never re-dispatch after submit started.
+          // executing/completed mean the inject durably happened (runOrigin-
+          // SessionJob marks executing only after a successful inject). The
+          // local-path inbound idempotency is in-memory, so at-most-once:
+          // never re-dispatch across a restart. Consume lastRun so recurring
+          // schedules cannot re-fire this same minute through catch-up.
           if (occurrence.state === 'executing') {
             settleOccurrence(occurrence, 'execution_terminal')
           } else {
             settleOccurrence(occurrence)
+          }
+          if (lastRun[job.id] === undefined || lastRun[job.id]! < occurrence.dueMinuteKey) {
+            lastRun[job.id] = occurrence.dueMinuteKey
+            lastRunDirty = true
           }
           completedRetryIds.add(job.id)
           continue
@@ -1394,12 +1401,29 @@ export class CronScheduler {
                   },
                   markSubmitStarted: async () => {
                     const record = readOccurrence(deliveryContext.deliveryId)
-                    if (!record || record.state !== 'prepared')
+                    const isOrigin = job.resume === 'origin-session'
+                    // origin-session settle retries re-enter after the inject
+                    // already durably happened; the occurrence may legally be
+                    // executing/completed for this same deliveryId. Never
+                    // regress state, never throw on that re-entry.
+                    const tolerated =
+                      isOrigin &&
+                      (record?.state === 'executing' || record?.state === 'completed')
+                    if (!record || (record.state !== 'prepared' && !tolerated))
                       throw new Error('cron occurrence is not prepared')
-                    writeOccurrence({ ...record, state: 'executing', updatedAt: Date.now() })
-                    lastRun[job.id] = dueMinuteKey
-                    await this.persistLastRun(lastRun)
-                    lastRunDirty = false
+                    if (record.state === 'prepared') {
+                      writeOccurrence({ ...record, state: 'executing', updatedAt: Date.now() })
+                    }
+                    if (!isOrigin) {
+                      // origin-session must NOT consume lastRun here: settle
+                      // failures after this point stay retryable, and
+                      // resolveCronOccurrence treats lastRun >= dueMinuteKey
+                      // as consumed. The loop tail / restart recovery records
+                      // lastRun for origin outcomes instead.
+                      lastRun[job.id] = dueMinuteKey
+                      await this.persistLastRun(lastRun)
+                      lastRunDirty = false
+                    }
                   },
                   recordEvent: (event) => {
                     const record = readOccurrence(deliveryContext.deliveryId)
@@ -1495,6 +1519,9 @@ export class CronScheduler {
               attempts: planned.attempts,
               dueMinuteKey,
             })
+            if (job.resume === 'origin-session') {
+              await this.notifyOriginSessionDropped(job, deliveryContext, 'exhausted')
+            }
             outcome = { kind: 'terminal_failure', code: 'RETRY_EXHAUSTED' }
           }
           if (outcome.kind === 'terminal_failure') {
@@ -1615,8 +1642,20 @@ export class CronScheduler {
 
   /**
    * origin-session fire: inject a new inbound into the creating conversation.
-   * If that conversation is gone, skip (do not isolated-run / lastActive-broadcast).
-   * Mark executing before inject so a crash recovers at-most-once.
+   * If that conversation is gone, skip (do not isolated-run / lastActive-broadcast),
+   * disable recurring jobs (the origin can never come back) and leave a status
+   * notice so the task does not vanish silently.
+   *
+   * Ordering: inject BEFORE markSubmitStarted. A retryable inject failure
+   * (session busy, network, master down) leaves the occurrence 'prepared' and
+   * lastRun untouched, so the normal retry planner really re-fires this exact
+   * deliveryId on a later tick. Replay safety comes from the stable
+   * clientMessageId: master dedupes durably in turn_dispatches, the local path
+   * dedupes on the persisted message id. After a restart, 'executing' and
+   * 'completed' origin occurrences settle without re-dispatch (at-most-once,
+   * see the recovery block in checkAndRun); the crash window between a
+   * successful inject and markSubmitStarted re-injects the same
+   * clientMessageId, which master absorbs as a duplicate.
    */
   private async runOriginSessionJob(
     job: CronJob,
@@ -1632,15 +1671,6 @@ export class CronScheduler {
         errorClass: stableCronErrorClass(err),
       })
       return { kind: 'retryable_failure', code: 'OCCURRENCE_PERSIST_FAILED' }
-    }
-    try {
-      await durability.markSubmitStarted?.()
-    } catch (err) {
-      logger.warn(`job ${job.id} origin-session markSubmitStarted failed`, {
-        jobId: job.id,
-        errorClass: stableCronErrorClass(err),
-      })
-      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_SETTLE_FAILED' }
     }
     let result: CronOriginFireResult
     try {
@@ -1661,6 +1691,15 @@ export class CronScheduler {
       return result
     }
     const skipped = result.kind === 'fallback'
+    try {
+      await durability.markSubmitStarted?.()
+    } catch (err) {
+      logger.warn(`job ${job.id} origin-session markSubmitStarted failed`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_SETTLE_FAILED' }
+    }
     const ts = new Date().toISOString().replace(/[:.]/g, '-')
     const outPath = join(paths.cronOutputsDir, `${job.id}-${ts}.md`)
     try {
@@ -1688,6 +1727,24 @@ export class CronScheduler {
       })
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_SETTLE_FAILED' }
     }
+    if (skipped) {
+      // A deleted origin conversation never comes back: a recurring job would
+      // skip-and-notify every tick, so persist-disable it (insufficient_credits
+      // pause precedent). Notify after the durable marks so settle retries
+      // cannot double-send the notice.
+      if (!job.oneshot && job.enabled !== false) {
+        job.enabled = false
+        try {
+          await saveCronFile(await ensureCronFile(), job)
+        } catch (err) {
+          logger.warn(`job ${job.id} origin-session gone disable failed`, {
+            jobId: job.id,
+            errorClass: stableCronErrorClass(err),
+          })
+        }
+      }
+      await this.notifyOriginSessionDropped(job, deliveryContext, 'gone')
+    }
     logger.info(`job ${job.id} origin-session ${skipped ? 'skipped' : 'injected'}`, {
       jobId: job.id,
       board_project_id: project.boardProjectId,
@@ -1695,6 +1752,37 @@ export class CronScheduler {
       source: project.source,
     })
     return skipped ? { kind: 'silent' } : { kind: 'completed' }
+  }
+
+  /**
+   * 状态变更通知(同 insufficient_credits 自动暂停的先例):origin-session 任务
+   * 被跳过/放弃时必须留下用户可见痕迹,凌驾 deliver=local。通知失败仅告警。
+   */
+  private async notifyOriginSessionDropped(
+    job: CronJob,
+    delivery: CronDeliveryContext,
+    reason: 'gone' | 'exhausted',
+  ): Promise<void> {
+    if (!isUserInitiatedCronJob(job)) return
+    const label = job.label || job.id
+    const text =
+      reason === 'gone'
+        ? `⏭️ 定时任务「${label}」已跳过：创建它的对话已不存在，无法回到原对话续跑。` +
+          `${job.oneshot ? '' : '任务已自动停用。'}如仍需要请重新创建。`
+        : `⏸️ 定时任务「${label}」已放弃本次续跑：多次重试仍无法注入原对话` +
+          `（如会话持续占线或网络异常）。请稍后在原对话手动继续或重新创建任务。`
+    try {
+      await this.onDeliver(
+        text,
+        (job.deliver ?? 'local') === 'local' ? { ...job, deliver: 'webchat' } : job,
+        delivery,
+      )
+    } catch (err) {
+      logger.warn(`origin-session drop notice failed for ${job.id}`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+    }
   }
 
   private async runJob(

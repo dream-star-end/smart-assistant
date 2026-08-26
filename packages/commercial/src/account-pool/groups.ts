@@ -670,6 +670,32 @@ export interface GrokRouteContextCreated {
 // Live requests slide it forward; normal terminal/error paths expire immediately.
 const GROK_ROUTE_ORPHAN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+/**
+ * Delegate (container-local turn) grok leases have no bridge billing terminal
+ * frame: if the gateway crashes between mint and release, nobody ever expires
+ * the row. Instead of the 7-day orphan slide, delegate rows live on a short
+ * lease that the gateway heartbeat (60s) and every relay request re-extend;
+ * a dead gateway lets the row lapse within minutes and the account cap heals
+ * on the next allocation's restore pass.
+ */
+export const GROK_DELEGATE_ROUTE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Per-container cap on concurrently held delegate grok leases. A container's
+ * gateway mints one route per delegate turn; parallel delegates are bounded
+ * far below this. The cap only exists so a misbehaving/compromised container
+ * cannot mint-loop the shared subscription pool full for everyone else.
+ */
+export const MAX_DELEGATE_GROK_LEASES_PER_CONTAINER = 4;
+
+/** Thrown by createGrokRouteContextForModel when a container is over the delegate lease cap. */
+export class GrokDelegateLeaseLimitError extends Error {
+  constructor(containerId: number, limit: number) {
+    super(`container ${containerId} already holds ${limit} active delegate grok route leases`);
+    this.name = "GrokDelegateLeaseLimitError";
+  }
+}
+
 export async function createGrokRouteContextForModel(args: {
   containerId: number;
   userId: bigint;
@@ -680,6 +706,10 @@ export async function createGrokRouteContextForModel(args: {
   runner: PoolClient;
   maxConcurrent: number;
   ttlMs?: number;
+  /** Lease origin; decides TTL semantics (see GROK_DELEGATE_ROUTE_TTL_MS). Default bridge. */
+  kind?: "bridge" | "delegate";
+  /** kind='delegate' only: reject when the container already holds this many active delegate leases. */
+  maxDelegatePerContainer?: number;
 }): Promise<GrokRouteContextCreated | null> {
   const groups = await listEnabledGroupsForModel({
     modelId: args.modelId,
@@ -697,6 +727,26 @@ export async function createGrokRouteContextForModel(args: {
     `SELECT pg_advisory_xact_lock(hashtextextended('grok-route:' || $1::text, 0))`,
     [String(args.accountId)],
   );
+  const kind = args.kind ?? "bridge";
+  if (kind === "delegate" && args.maxDelegatePerContainer !== undefined) {
+    // Second-level lock (account first, container second — consistent order,
+    // no cycle): serialize concurrent delegate mints from the same container
+    // so two racing mints cannot both pass the count below.
+    await args.runner.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended('grok-route-container:' || $1::text, 0))`,
+      [String(args.containerId)],
+    );
+    const held = await args.runner.query<{ held: string }>(
+      `SELECT COUNT(*)::text AS held
+         FROM grok_route_contexts
+        WHERE container_id = $1 AND kind = 'delegate'
+          AND status = 'active' AND expires_at > NOW()`,
+      [String(args.containerId)],
+    );
+    if (BigInt(held.rows[0]?.held ?? "0") >= BigInt(args.maxDelegatePerContainer)) {
+      throw new GrokDelegateLeaseLimitError(args.containerId, args.maxDelegatePerContainer);
+    }
+  }
   const capacity = await args.runner.query<{ active_count: string }>(
     `SELECT COUNT(*)::text AS active_count
        FROM grok_route_contexts
@@ -705,12 +755,15 @@ export async function createGrokRouteContextForModel(args: {
   );
   if (BigInt(capacity.rows[0]?.active_count ?? "0") >= BigInt(args.maxConcurrent)) return null;
   const token = mintRouteToken();
-  const expiresAt = new Date(Date.now() + (args.ttlMs ?? GROK_ROUTE_ORPHAN_TTL_MS));
+  const expiresAt = new Date(
+    Date.now() +
+      (args.ttlMs ?? (kind === "delegate" ? GROK_DELEGATE_ROUTE_TTL_MS : GROK_ROUTE_ORPHAN_TTL_MS)),
+  );
   const inserted = await args.runner.query(
       `INSERT INTO grok_route_contexts(
-         token_hash, container_id, user_id, account_id, slot_id, model_id, expires_at
+         token_hash, container_id, user_id, account_id, slot_id, model_id, expires_at, kind
        )
-       SELECT $1,$2,$3,a.id,$5,$6,$7
+       SELECT $1,$2,$3,a.id,$5,$6,$7,$10
          FROM claude_accounts a
         WHERE a.id = $4
           AND a.provider = 'grok'
@@ -727,6 +780,7 @@ export async function createGrokRouteContextForModel(args: {
       expiresAt,
       getRuntimeChannel(),
       String(group.id),
+      kind,
     ],
   );
   return (inserted.rowCount ?? 0) > 0
@@ -747,10 +801,18 @@ export async function resolveGrokRouteContext(args: {
   runner?: QueryRunner;
 }): Promise<ResolvedGrokRouteContext | null> {
   const tokenHash = hashRouteToken(args.token);
+  // Kind-dependent slide: bridge rows keep the 7-day orphan-cleanup boundary
+  // (terminal billing frames expire them explicitly); delegate rows only ever
+  // extend their short heartbeat lease, so a crashed gateway can never park a
+  // route in the account cap for a week.
   const res = await query<{ model_id: string; account_id: string; slot_id: string }>(
     `UPDATE grok_route_contexts c
         SET last_used_at = NOW(),
-            expires_at = GREATEST(c.expires_at, NOW() + INTERVAL '7 days')
+            expires_at = GREATEST(
+              c.expires_at,
+              NOW() + CASE WHEN c.kind = 'delegate'
+                           THEN make_interval(secs => $5)
+                           ELSE make_interval(secs => $6) END)
        FROM claude_accounts a
       WHERE c.token_hash = $1
         AND c.container_id = $2
@@ -762,7 +824,14 @@ export async function resolveGrokRouteContext(args: {
         AND a.runtime_channel = $4
         AND a.status = 'active'
       RETURNING c.model_id, c.account_id::text AS account_id, c.slot_id`,
-    [tokenHash, String(args.containerId), String(args.userId), getRuntimeChannel()],
+    [
+      tokenHash,
+      String(args.containerId),
+      String(args.userId),
+      getRuntimeChannel(),
+      GROK_DELEGATE_ROUTE_TTL_MS / 1000,
+      GROK_ROUTE_ORPHAN_TTL_MS / 1000,
+    ],
     args.runner,
   );
   const row = res.rows[0];
@@ -818,12 +887,16 @@ export async function expireGrokRouteContextByLease(
 
 /**
  * Drop durable Grok leases that can no longer belong to a live turn:
- * vanished containers, or a journal already committed/aborted for that
- * slot with no open grok-build dispatch still holding it.
+ * containers that are no longer active, or a journal already
+ * committed/aborted for that slot with no open grok-build dispatch still
+ * holding it.
  *
  * allocate() restores every active row into the in-process cap before
  * pick(); without this reap, a billed-and-finished turn occupies the
- * 10-slot account cap for the 7-day orphan TTL.
+ * 10-slot account cap for the 7-day orphan TTL. (Delegate rows additionally
+ * carry a short heartbeat TTL — see GROK_DELEGATE_ROUTE_TTL_MS — so a crashed
+ * gateway on a still-active container heals within minutes without needing a
+ * journal match here.)
  */
 export async function expireSettledGrokRouteLeases(
   runner?: QueryRunner,
@@ -833,10 +906,10 @@ export async function expireSettledGrokRouteLeases(
         SET status = 'expired', expires_at = NOW()
       WHERE c.status = 'active' AND c.expires_at > NOW()
         AND (
-          EXISTS (
+          NOT EXISTS (
             SELECT 1 FROM agent_containers ac
              WHERE ac.id = c.container_id
-               AND ac.state IS DISTINCT FROM 'active'
+               AND ac.state = 'active'
           )
           OR (
             EXISTS (

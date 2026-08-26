@@ -452,5 +452,7 @@ describe("internalModelCatalog — seed 完整性(全局断言)", () => {
     // 精确对齐所有权威来源,模型默认值切换时不应残留旧字面量或漏掉新 seed 依赖。
     assert.deepEqual(new Set(PLATFORM_SEED_MODEL_IDS), expected);
     assert.equal(PLATFORM_SEED_MODEL_IDS.length, expected.size, "seed 清单必须去重");
+    assert.ok(PLATFORM_SEED_MODEL_IDS.includes("glm-5.3-zai"));
+    assert.ok(!PLATFORM_SEED_MODEL_IDS.includes("glm-5.3"));
   });
 });

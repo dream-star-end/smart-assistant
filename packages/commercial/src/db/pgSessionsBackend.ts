@@ -821,6 +821,24 @@ function pgModelSidecarText(text: string): string {
   return text.replaceAll("\u0000", "\\u0000");
 }
 
+/**
+ * client_sessions.messages 落库前的 U+0000 治本清洗(INC-20260821-SESSION-LIST-NUL-READ-STORM)。
+ *
+ * messages 列是 TEXT,原始 NUL 经 JSON.stringify 会以转义序列 `\u0000` 落库 ——
+ * 写入成功,但之后任何 `::json ->>'text'` / `::jsonb` 读取都会 22P05,读侧只能整行隔离。
+ * 这里在**每个写点**把该转义序列改写成正文字面量 `\u0000`(等价于对原文做
+ * pgModelSidecarText 的可逆转义),NUL 不再以"可炸的 JSON 转义"形态入库。
+ *
+ * 只在 JSON 文本层做,免去反序列化 MB 级热尾巴。奇偶判定防误伤:
+ * JSON 里 `u0000` 前的连续反斜杠为**奇数** = 末一个反斜杠开启转义 = 原始 NUL,改写;
+ * 偶数 = 用户正文本身就是字面 `\u0000` 六个字符(或字面反斜杠结尾),原样保留。
+ */
+export function escapeNulInSessionMessagesJson(json: string): string {
+  return json.replace(/(\\+)u0000/g, (whole, slashes: string) =>
+    slashes.length % 2 === 1 ? `${slashes}\\u0000` : whole,
+  );
+}
+
 function deferredUserReplayMetadata(message: MessageLike): MessageLike {
   const rawRouting = message._routing && typeof message._routing === "object" &&
     !Array.isArray(message._routing)
@@ -1016,7 +1034,7 @@ async function pgAppendServerAuthoredCore(
            next_seq = $4, archived_through_seq = $5, archived_count = $6,
            history_revision = history_revision + $9
      WHERE id = $7 AND user_id = $8 AND deleted_at IS NULL`,
-    [plan.finalJson, tail.length + newArchivedCount, now, plan.nextSeq, plan.archivedThroughSeq, newArchivedCount, sessId, userId, historyRevisionDelta],
+    [escapeNulInSessionMessagesJson(plan.finalJson), tail.length + newArchivedCount, now, plan.nextSeq, plan.archivedThroughSeq, newArchivedCount, sessId, userId, historyRevisionDelta],
   );
   if (upd.rowCount !== 1) {
     // 并发软删抢在 SELECT 与 UPDATE 之间(FOR UPDATE 下不可达;保留作最后防线,宁报终态不复活墓碑)。
@@ -1418,6 +1436,12 @@ export interface AdmitUserTurnInput {
   dispatchId: string;
   /** 本 bridge 连接 id(lease owner)。 */
   ownerId: string;
+  /**
+   * cron origin-session: lock the session row and refuse if another
+   * clientMessageId already has an open dispatch. Same-key replay still
+   * proceeds through admitDispatch. Browser admits omit this flag.
+   */
+  exclusiveSession?: boolean;
   /** 要幂等 append 的 user 消息行。 */
   message: MessageLike & { id: string };
   /** Master-validated recovery lineage. The PG transaction revalidates it
@@ -1452,6 +1476,7 @@ export type AdmitUserTurnResult =
   | (AdmitDispatchResult & { workspaceMode: SessionWorkspaceMode })
   | { kind: "session_not_found" }
   | { kind: "session_deleted" }
+  | { kind: "session_busy" }
   | { kind: "recovery_conflict"; reason: string }
   | { kind: "append_error"; reason: string };
 
@@ -7247,12 +7272,17 @@ async function backfillEmptyVisibleHeadFromPrepared(
     ...(current?.truncated || clipped.truncated ? { truncated: true } : {}),
     partial: true,
   };
+  // read-then-write 竞态守卫:SELECT 后并发 Phase A 可能已写入(空文本 +)errorCode,
+  // 本次 UPDATE 携带的是 SELECT 快照里的 errorCode,盲写会把并发写入的 errorCode 冲掉。
+  // WHERE 再校验 errorCode 未变;变了就放弃 backfill(该头已有更权威的写者)。
+  const snapshotErrorCode = typeof current?.errorCode === "string" ? current.errorCode : "";
   await pool.query(
     `UPDATE client_session_turn_tapes
         SET visible_head=$4::jsonb
       WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
-        AND COALESCE(visible_head->>'text', '') = ''`,
-    [request.sessionId, userId, request.tapeId, JSON.stringify(next)],
+        AND COALESCE(visible_head->>'text', '') = ''
+        AND COALESCE(visible_head->>'errorCode', '') = $5`,
+    [request.sessionId, userId, request.tapeId, JSON.stringify(next), snapshotErrorCode],
   );
 }
 
@@ -7552,7 +7582,7 @@ export async function commitVisibleLosslessTurnPhaseA(
            timeline_generation=timeline_generation + 1
          WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
         [
-          plan.finalJson,
+          escapeNulInSessionMessagesJson(plan.finalJson),
           plan.tail.length + archivedCount,
           nowMs,
           plan.nextSeq,
@@ -7706,6 +7736,31 @@ export function createPgSessionsBackend(
           });
         }
         let message = input.message;
+        if (input.exclusiveSession) {
+          const locked = (
+            await client.query<{ deleted_at: string | null }>(
+              `SELECT deleted_at
+                 FROM client_sessions
+                WHERE id=$1 AND user_id=$2
+                FOR UPDATE`,
+              [input.sessionId, input.sessionUserId],
+            )
+          ).rows[0];
+          if (!locked) return { kind: "session_not_found" };
+          if (locked.deleted_at !== null) return { kind: "session_deleted" };
+          const busy = (
+            await client.query<{ client_message_id: string }>(
+              `SELECT client_message_id
+                 FROM turn_dispatches
+                WHERE user_id=$1::bigint AND session_id=$2
+                  AND status IN ('admitted','accepted','rejecting')
+                  AND client_message_id <> $3
+                LIMIT 1`,
+              [input.uid.toString(), input.sessionId, input.clientMessageId],
+            )
+          ).rows[0];
+          if (busy) return { kind: "session_busy" };
+        }
         if (input.recovery) {
           const expected = input.recovery.automatic
             ? turnRecoveryAttemptIdentity(
@@ -9013,7 +9068,7 @@ export function createPgSessionsBackend(
                timeline_generation=timeline_generation + $10
              WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
             [
-              plan.finalJson,
+              escapeNulInSessionMessagesJson(plan.finalJson),
               plan.tail.length + archivedCount,
               nowMs,
               plan.nextSeq,
@@ -9337,7 +9392,7 @@ export function createPgSessionsBackend(
           const now = Date.now();
           const plan = planSpillOverflow(finalMessages, bigIntNumOr(existing?.archived_through_seq, 0));
           const tail = plan.tail;
-          const finalJson = JSON.stringify(tail);
+          const finalJson = escapeNulInSessionMessagesJson(JSON.stringify(tail));
           // size guard 在 spill 执行**前**(理论不可达;命中则不落孤儿 chunk,ROLLBACK 更干净)。
           if (Buffer.byteLength(finalJson, "utf8") > MAX_SESSION_BYTES) {
             return "oversized";
@@ -9460,7 +9515,7 @@ export function createPgSessionsBackend(
         msgs[idx] = { ...msgs[idx], ...patch, id: msgId, _source: "server", _seq: nextSeq };
         const upd = await client.query(
           "UPDATE client_sessions SET messages = $1::jsonb, updated_at = GREATEST(updated_at + 1, $2), next_seq = $3, history_revision = history_revision + 1 WHERE id = $4 AND user_id = $5 AND deleted_at IS NULL",
-          [JSON.stringify(msgs), Date.now(), nextSeq + 1, sessId, userId],
+          [escapeNulInSessionMessagesJson(JSON.stringify(msgs)), Date.now(), nextSeq + 1, sessId, userId],
         );
         if (upd.rowCount !== 1) return { applied: false as const, reason: "session_deleted" as const };
         return { applied: true as const };
@@ -9800,7 +9855,7 @@ export function createPgSessionsBackend(
                   touched,
                   bigIntNumOr(sess.archived_through_seq, 0),
                 );
-                const finalJson = JSON.stringify(spill.tail);
+                const finalJson = escapeNulInSessionMessagesJson(JSON.stringify(spill.tail));
                 if (Buffer.byteLength(finalJson, "utf8") > MAX_SESSION_BYTES) {
                   throw new Error("lossless turn billing anchor tail unexpectedly oversized");
                 }
@@ -9924,7 +9979,7 @@ export function createPgSessionsBackend(
                        next_seq = next_seq + 1, archived_through_seq = $4, archived_count = $5,
                        history_revision = history_revision + $8
                  WHERE id = $6 AND user_id = $7`,
-                [plan.finalJson, plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, mapRow.session_id, userId, historyRevisionDelta],
+                [escapeNulInSessionMessagesJson(plan.finalJson), plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, mapRow.session_id, userId, historyRevisionDelta],
               );
               return { applied: "patched" };
             }
@@ -10116,7 +10171,7 @@ export function createPgSessionsBackend(
                  next_seq = next_seq + 1, archived_through_seq = $4, archived_count = $5,
                  history_revision = history_revision + $8
            WHERE id = $6 AND user_id = $7`,
-          [plan.finalJson, plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, clientSessionId, userId, historyRevisionDelta],
+          [escapeNulInSessionMessagesJson(plan.finalJson), plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, clientSessionId, userId, historyRevisionDelta],
         );
 
         for (const p of pendings) {

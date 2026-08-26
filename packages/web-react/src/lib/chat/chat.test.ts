@@ -7804,6 +7804,97 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
+  test("cap exit clears 思考中 when a cmid-less terminal body follows the active user row", async () => {
+    // 终态行(tape fallback)可能不带本轮 _clientMessageId。窗口内严格判定不认它
+    // (防过早消失),但打满对账窗口后必须以它为退出,否则「思考中」永挂。
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      const session = sock.sessions.get("s1")!;
+      if (!session.messages.some((m) => m.id === "srv-fallback")) {
+        session.messages.push({
+          id: "srv-fallback",
+          role: "assistant",
+          text: "终态正文(fallback 不带 cmid)",
+          ts: Date.now(),
+          _source: "server",
+        });
+      }
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 0,
+        liveClientMessageIds: [],
+        hasTapeProjection: true,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-loose", role: "user", text: "please", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-loose",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    const session = sock.sessions.get("s1")!;
+    // 窗口内:严格判定不认 cmid-less 行,「思考中」保持。
+    expect(session._sendingInFlight).toBe(true);
+    for (let i = 0; i < RESTORE_RECONCILE_MAX_ATTEMPTS; i++) {
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    expect(session._reconciling).toBe(false);
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._recoveryStatus?.kind).toBe("completed");
+    sock.stop();
+  });
+
+  test("prior-turn cmid-less body before the active user row keeps 思考中 at the cap", async () => {
+    // 27344ba55 的初衷:上一轮遗留的无主正文不能证明本轮已完成 —— 松弛判定
+    // 有位置约束(必须在本轮 user 行之后),之前的行打满窗口也不触发退出。
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 0,
+        liveClientMessageIds: [],
+        hasTapeProjection: true,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [
+        { id: "srv-prev", role: "assistant", text: "上一轮的回复", ts: now - 60_000, _source: "server" },
+        { id: "u-next", role: "user", text: "new turn", ts: now, status: "sent" },
+      ],
+      createdAt: now - 60_000,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-next",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    const session = sock.sessions.get("s1")!;
+    for (let i = 0; i < RESTORE_RECONCILE_MAX_ATTEMPTS; i++) {
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    expect(session._reconciling).toBe(false);
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._recoveryStatus?.kind).toBe("resumed");
+    sock.stop();
+  });
+
   test("late admission ACK cannot revive a stopped turn", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();

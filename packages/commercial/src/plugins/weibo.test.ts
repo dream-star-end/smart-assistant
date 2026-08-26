@@ -558,6 +558,11 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '发送'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /awaitComposerMediaReady/)
     assert.match(WEIBO_WORKER_SOURCE, /collectVisibleImageSrcs/)
+    assert.match(WEIBO_WORKER_SOURCE, /added.length >= expectedNew/)
+    assert.doesNotMatch(
+      WEIBO_WORKER_SOURCE,
+      /if \(added.length > expectedNew\) throw new Error\('media-preview'\)/,
+    )
     assert.match(createPostSource, /prepared.attached \? 8_000 : 45_000, previewBefore/)
     assert.match(createPostSource, /45_000, previewBefore, previewBeforeCount, previewBeforeDelete, previewBeforeNodes/)
     assert.match(WEIBO_WORKER_SOURCE, /woo-picture/)

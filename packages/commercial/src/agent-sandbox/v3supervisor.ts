@@ -825,6 +825,12 @@ const V3_IP_ALLOC_MAX_ATTEMPTS = 30;
 export const DEFAULT_V3_MEMORY_MB = 4096;
 export const DEFAULT_V3_CPUS = 1.0;
 export const DEFAULT_V3_PIDS_LIMIT = 4096;
+/**
+ * admin「不限资源」时仍保留的 pids 上限。memory/cpu 放开只影响本容器能吃多少;
+ * pids 打满是宿主级故障(fork bomb 耗尽 PID 空间连 dockerd 都 fork 不出来),
+ * 所以不跟随 memory/cpu 一起归零。与 node-agent containers.go 的 AdminPidsLimit 对齐。
+ */
+export const V3_ADMIN_PIDS_LIMIT = 16384;
 
 /**
  * 解析 v3 容器资源限额。env 覆盖 + 非法值回退默认。
@@ -839,10 +845,10 @@ function resolveV3ResourceLimits(opts?: { unlimited?: boolean }): {
   nanoCpus: number;
   pidsLimit: number;
 } {
-  // admin: Docker 把 0 当成不限,等于宿主有多大就能用多大。普通用户仍走 4GiB/1CPU 默认
-  // (或 OC_V3_* env)。0 只允许从 unlimited=true 进来;env 微值 floor 到 0 仍回退默认。
+  // admin: memory/cpu 的 0 = Docker 不限,宿主有多大用多大;pids 保留高位有限值
+  // (见 V3_ADMIN_PIDS_LIMIT)。0 只允许从 unlimited=true 进来;env 微值 floor 到 0 仍回退默认。
   if (opts?.unlimited) {
-    return { memoryBytes: 0, nanoCpus: 0, pidsLimit: 0 };
+    return { memoryBytes: 0, nanoCpus: 0, pidsLimit: V3_ADMIN_PIDS_LIMIT };
   }
   const MIB = 1024 * 1024;
   const NANO_CPU = 1_000_000_000;
@@ -3322,7 +3328,8 @@ export async function provisionV3Container(
             MemorySwap: memoryBytes,
             MemorySwappiness: 0,
             ...(memoryBytes === 0 && nanoCpus === 0 ? {} : { NanoCpus: nanoCpus }),
-            PidsLimit: pidsLimit === 0 ? -1 : pidsLimit,
+            // pids 永远有限:admin 也走 V3_ADMIN_PIDS_LIMIT,0 只是最后防线兜底。
+            PidsLimit: pidsLimit === 0 ? V3_ADMIN_PIDS_LIMIT : pidsLimit,
             // §9.3 cap-drop NET_RAW + NET_ADMIN(防 raw socket 伪造源 IP / 改路由)
             CapDrop: ["NET_RAW", "NET_ADMIN"],
             CapAdd: [],

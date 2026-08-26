@@ -1465,7 +1465,41 @@ export interface UserChatBridgeHandler {
   broadcastToUsers(uids: string[], payload: unknown): number;
   /** Return only requested users that currently own at least one OPEN user websocket. */
   onlineUserSubset(uids: string[]): string[];
+  /**
+   * origin-session cron: admit a synthetic user turn on the master session
+   * and run it through an attested container bridge (durable dispatch).
+   */
+  injectCronOriginTurn(input: CronOriginInjectInput): Promise<CronOriginInjectResult>;
 }
+
+export type CronOriginInjectInput = {
+  uid: bigint
+  sessionId: string
+  text: string
+  clientMessageId: string
+  agentId: string
+}
+
+export type CronOriginInjectResult =
+  | { kind: "injected" }
+  | { kind: "gone" }
+  | { kind: "in_flight" }
+  | { kind: "no_transport" }
+  | { kind: "failed"; reason: string }
+
+type CronOriginExecutor = (payload: {
+  encoded: Buffer
+  admitted: {
+    clientMessageId: string
+    sessionId: string
+    dispatchId: string
+    billingRequestId: string
+    attemptNo: number
+    leaseEpoch: number
+    anchorSeq: bigint | null
+    requestHash: string
+  }
+}) => void
 
 // ---------- 内部工具 --------------------------------------------------------
 
@@ -1929,6 +1963,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     string,
     Set<(job: ClaimedRecoveryJob) => void>
   >();
+  const uidToCronOriginExecutors = new Map<string, Set<CronOriginExecutor>>();
   const controlDrainRunning = new Set<string>();
   const recoveryDrainRunning = new Set<string>();
   const recoveryLastScanAt = new Map<string, number>();
@@ -2592,11 +2627,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     /** 容器 attest 是否携带 durable-turn-dispatch-v1:true 才走 dispatch 受理,否则 legacy。 */
     let containerHasDurableDispatch = false;
     let recoveryExecutor: ((job: ClaimedRecoveryJob) => void) | null = null;
+    let cronOriginExecutor: CronOriginExecutor | null = null;
     let attestTimer: ReturnType<typeof setTimeout> | null = null;
     const attestQueue: Array<{
       data: RawData;
       isBinary: boolean;
-      ingress: "browser" | "prompt_queue" | "recovery";
+      ingress: "browser" | "prompt_queue" | "recovery" | "cron_origin";
       dispatchRequest?: PromptQueueDispatchRequest;
       recoveryJob?: ClaimedRecoveryJob;
     }> = [];
@@ -2683,6 +2719,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         executors.add(recoveryExecutor);
         void drainDurableRecoveryForUser(uid);
+      }
+      if (containerHasDurableDispatch && deps.admitUserTurn && cronOriginExecutor === null) {
+        cronOriginExecutor = (payload) => {
+          admittedDispatches.set(payload.admitted.clientMessageId, payload.admitted);
+          executeAdmittedTurn(payload.encoded, false, "cron_origin");
+        };
+        const key = uid.toString();
+        let executors = uidToCronOriginExecutors.get(key);
+        if (!executors) {
+          executors = new Set();
+          uidToCronOriginExecutors.set(key, executors);
+        }
+        executors.add(cronOriginExecutor);
       }
       if (attestTimer !== null) {
         clearTimeout(attestTimer);
@@ -3884,6 +3933,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               });
               sendRecoverySkippedAck(admit.reason);
               return null;
+            case "session_busy":
+              // exclusiveSession only; browser admits omit the flag. Keep the
+              // switch exhaustive so session_busy cannot fall into `never`.
+              sendErrorFrame(
+                userWs, "TURN_IN_FLIGHT",
+                "another turn is already running in this session",
+                { peerId, clientMessageId },
+              );
+              return null;
             case "session_not_found":
             case "session_deleted":
             case "append_error":
@@ -4055,12 +4113,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const executeAdmittedTurn = (
       data: RawData,
       isBinary: boolean,
-      ingress: "browser" | "prompt_queue" | "recovery" = "browser",
+      ingress: "browser" | "prompt_queue" | "recovery" | "cron_origin" = "browser",
       dispatchRequest?: PromptQueueDispatchRequest,
       recoveryJob?: ClaimedRecoveryJob,
       receivedAtMs = Date.now(),
     ): void => {
       const isPromptQueueDispatch = ingress === "prompt_queue";
+      const isCronOriginDispatch = ingress === "cron_origin";
       let promptQueueResolved = false;
       let promptQueueFallbackTimer: ReturnType<typeof setTimeout> | null = null;
       const rejectPromptQueueDispatch = (reasonCode: string): void => {
@@ -4279,7 +4338,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // request handler below. A browser-authored lookalike must die before
             // it can reach the container coordinator.
             if (
-              !isPromptQueueDispatch &&
+              !isPromptQueueDispatch && !isCronOriginDispatch &&
               Object.prototype.hasOwnProperty.call(parsedObj, PROMPT_QUEUE_GRANT_FIELD)
             ) {
               delete parsedObj[PROMPT_QUEUE_GRANT_FIELD];
@@ -4296,7 +4355,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           // runtime delivery.  Legacy/test compositions without PG retain the
           // transparent path during rolling deployment.
           if (
-            !isPromptQueueDispatch && deps.pgPool && parsed !== null &&
+            !isPromptQueueDispatch && !isCronOriginDispatch && deps.pgPool && parsed !== null &&
             typeof parsed === "object" && !Array.isArray(parsed)
           ) {
             const controlFrame = parsed as Record<string, unknown>;
@@ -5095,7 +5154,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor requires the account-owned local runtime', cursorTurnIdentity);
               return;
             }
-            const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob);
+            const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch && !isCronOriginDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob);
             if (enriched === null) return;
             dispatchRecord = lookupAdmittedDispatch(enriched);
             let authorityExec: ResolvedTurnExecution | null = null;
@@ -5184,7 +5243,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               return;
             }
             const zcodeModelId = modelCapture;
-            const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob);
+            const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch && !isCronOriginDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob);
             if (enriched === null) return;
             dispatchRecord = lookupAdmittedDispatch(enriched);
             let authorityExec: ResolvedTurnExecution | null = null;
@@ -5310,7 +5369,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               inboundParsedCapture,
               turnLogCapture,
               turnTraceIdCapture,
-              !isPromptQueueDispatch,
+              !isPromptQueueDispatch && !isCronOriginDispatch,
               rejectPromptQueueDispatch,
               authorityModelCapture,
               recoveryJob,
@@ -5502,7 +5561,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               inboundParsedCapture,
               turnLogCapture,
               turnTraceIdCapture,
-              !isPromptQueueDispatch,
+              !isPromptQueueDispatch && !isCronOriginDispatch,
               rejectPromptQueueDispatch,
               authorityModelCapture,
               recoveryJob,
@@ -6285,7 +6344,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               inboundParsedCapture,
               turnLogCapture,
               turnTraceIdCapture,
-              !isPromptQueueDispatch,
+              !isPromptQueueDispatch && !isCronOriginDispatch,
               rejectPromptQueueDispatch,
               authorityModelCapture,
               recoveryJob,
@@ -8387,6 +8446,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         recoveryExecutor = null;
       }
+      if (cronOriginExecutor !== null) {
+        const key = uid.toString();
+        const executors = uidToCronOriginExecutors.get(key);
+        if (executors) {
+          executors.delete(cronOriginExecutor);
+          if (executors.size === 0) uidToCronOriginExecutors.delete(key);
+        }
+        cronOriginExecutor = null;
+      }
     }
 
     /**
@@ -8682,6 +8750,96 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     return out;
   }
 
+  async function injectCronOriginTurn(input: CronOriginInjectInput): Promise<CronOriginInjectResult> {
+    const executors = uidToCronOriginExecutors.get(input.uid.toString());
+    const executor = executors && [...executors][0];
+    if (!executor || !deps.admitUserTurn) return { kind: "no_transport" };
+    if (!isClientMessageId(input.clientMessageId) || input.sessionId.trim() === "" || input.text.trim() === "") {
+      return { kind: "failed", reason: "invalid_payload" };
+    }
+    const content = { text: input.text };
+    const requestHash = computeDispatchRequestHash(content);
+    const message = {
+      id: input.clientMessageId,
+      role: "user" as const,
+      text: input.text,
+      ts: Date.now(),
+      _routing: { teamMode: false, effortLevel: null as string | null },
+    };
+    let admit;
+    try {
+      admit = await deps.admitUserTurn({
+        uid: input.uid,
+        sessionUserId: "c:" + input.uid.toString(),
+        sessionId: input.sessionId,
+        clientMessageId: input.clientMessageId,
+        agentId: input.agentId || "main",
+        model: null,
+        requestHash,
+        billingRequestId: ensureRequestIdServerSide(),
+        dispatchId: randomUUID(),
+        ownerId: `cron-origin:${input.clientMessageId}`,
+        exclusiveSession: true,
+        message,
+      });
+    } catch (err) {
+      log?.warn("user-chat-bridge: cron origin admit threw", {
+        uid: input.uid.toString(),
+        sessionId: input.sessionId,
+        err,
+      });
+      return { kind: "failed", reason: "admit_threw" };
+    }
+    if (admit.kind === "session_not_found" || admit.kind === "session_deleted") {
+      return { kind: "gone" };
+    }
+    if (admit.kind === "session_busy") return { kind: "in_flight" };
+    if (
+      admit.kind === "append_error" ||
+      admit.kind === "recovery_conflict" ||
+      admit.kind === "previously_failed" ||
+      admit.kind === "manual_hold" ||
+      admit.kind === "immutable_conflict"
+    ) {
+      return { kind: "failed", reason: admit.kind };
+    }
+    if (
+      admit.kind === "deduplicated" ||
+      admit.kind === "already_owned" ||
+      admit.kind === "in_flight"
+    ) {
+      // 同 clientMessageId 的 dispatch 已存在(重放/重试):这轮 cron 注入已经
+      // 在原对话里了,幂等成功。绝不能掉进下面的 execute 分支重复执行同一 dispatch。
+      return { kind: "injected" };
+    }
+    // 穷尽:剩余唯一变体是 admitted(带 dispatch)。
+    const d = admit.dispatch;
+    const frame = {
+      type: "inbound.message",
+      channel: "webchat",
+      peer: { kind: "dm", id: input.sessionId },
+      agentId: input.agentId || "main",
+      clientMessageId: input.clientMessageId,
+      idempotencyKey: `cron-origin:${input.clientMessageId}`,
+      content,
+      ts: message.ts,
+    };
+    executor({
+      encoded: Buffer.from(JSON.stringify(frame), "utf8"),
+      admitted: {
+        clientMessageId: d.clientMessageId,
+        sessionId: d.sessionId,
+        dispatchId: d.dispatchId,
+        billingRequestId: d.billingRequestId,
+        attemptNo: d.attemptNo,
+        leaseEpoch: d.leaseEpoch,
+        anchorSeq: d.anchorSeq,
+        requestHash: d.requestHash,
+      },
+    });
+    return { kind: "injected" };
+  }
+
   return {
     handleUpgrade,
     shutdown,
@@ -8691,6 +8849,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     broadcastAll,
     broadcastToUsers,
     onlineUserSubset,
+    injectCronOriginTurn,
   };
 }
 

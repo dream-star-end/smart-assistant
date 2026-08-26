@@ -98,9 +98,10 @@ describe('acquireDelegateGrokRoute', () => {
     if (result.ok) await result.lease.release()
   })
 
-  test('maps 409 to busy, 503 to unavailable, 404 to unmounted master', async () => {
+  test('maps 409 to busy, 429 to per-container lease cap, 503 to unavailable, 404 to unmounted master', async () => {
     for (const [status, expectedHttp, reasonMatch] of [
       [409, 409, /并发已满/],
+      [429, 429, /委派租约已达上限/],
       [503, 503, /no usable Grok subscription account/],
       [404, 503, /未开放/],
       [500, 502, /HTTP 500/],

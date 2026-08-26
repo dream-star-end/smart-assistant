@@ -245,6 +245,7 @@ import {
   buildCodexTokenRefreshHandler,
 } from "./http/codexInternalAssembly.js";
 import {
+  MAX_DELEGATE_GROK_LEASES_PER_CONTAINER,
   createCodexRouteContextForModel,
   createGrokRouteContextForModel,
   expireCodexRouteContext,
@@ -387,6 +388,11 @@ import {
   makeCronIndexHandler,
   type CronIndexHandler,
 } from "./http/internalCronIndex.js";
+import {
+  CRON_ORIGIN_INJECT_PATH,
+  makeCronOriginInjectHandler,
+  type CronOriginInjectHandler,
+} from "./http/internalCronOriginInject.js";
 import {
   INBOX_ALERT_PATH,
   INBOX_POST_PATH,
@@ -1679,11 +1685,18 @@ export async function registerCommercial(
   // createCommercialCodexRoute 原 grok 分支的原样抽取:bridge(每帧铸 route)
   // 与下方 delegateGrokRouteHandler(容器本地 delegate turn 主动申请)必须走
   // 同一账号池、同一 grok_route_contexts durable 并发权威,不允许各自解释。
-  const allocateGrokRelayRoute = async ({ containerId, userId, modelId, sessionId }: {
+  const allocateGrokRelayRoute = async ({ containerId, userId, modelId, sessionId, origin }: {
     containerId: number;
     userId: bigint;
     modelId: string;
     sessionId?: string;
+    /**
+     * bridge(默认)= 浏览器 turn:7 天孤儿 TTL,计费终结帧显式 expire。
+     * delegate = 容器本地 delegate turn:无计费终结帧,走短心跳租约
+     * (GROK_DELEGATE_ROUTE_TTL_MS)+ per-container 并发限额,网关崩溃后
+     * 分钟级自愈,不再占满账号并发上限一周。
+     */
+    origin?: "bridge" | "delegate";
   }) => {
     // grok_route_contexts is the durable concurrency authority. Rebuild the
     // local scheduler mirror before every allocation so a browser disconnect,
@@ -1723,6 +1736,10 @@ export async function registerCommercial(
           groupId: group.id,
           runner: client,
           maxConcurrent: scheduler.maxConcurrent,
+          kind: origin ?? "bridge",
+          ...(origin === "delegate"
+            ? { maxDelegatePerContainer: MAX_DELEGATE_GROK_LEASES_PER_CONTAINER }
+            : {}),
         }));
       } catch (err) {
         scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
@@ -1888,6 +1905,11 @@ export async function registerCommercial(
   // 2026-07-02 egress split:authz 加载器抽到 auth/userModelAuthz.ts 单一权威
   // (master 与 egress 两进程共用同一份规则),语义与原内联实现逐行等价。
   const loadUserModelAuthz = makeLoadUserModelAuthz();
+  // cron-origin-inject 的 bridge 晚绑定引用:handler 必须在内层 internal-proxy 作用域
+  // 创建(identityRepo 在那里),而 userChatBridge 要到 registerCommercial 尾部才初始化。
+  // 直接闭包引用 const userChatBridge 会在初始化窗口内 TDZ 抛错(b1d9e4fbb 同类问题);
+  // 用可空 ref:bridge 未就绪 → no_transport(503),容器侧按 retryable 下轮重试。
+  let cronOriginBridgeRef: UserChatBridgeHandler | null = null;
 
   if (
     !options.skipInternalProxy &&
@@ -2170,7 +2192,9 @@ export async function registerCommercial(
         process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
           ? makeDelegateGrokRouteHandler({
               identityRepo,
-              allocate: allocateGrokRelayRoute,
+              // origin=delegate:短心跳租约 + per-container 限额(与浏览器 bridge
+              // 的 7 天孤儿 TTL 语义分离,见 allocateGrokRelayRoute 注释)。
+              allocate: (input) => allocateGrokRelayRoute({ ...input, origin: "delegate" }),
               release: async ({ routeToken, containerId, userId }) => {
                 const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
                 if (!context) return false;
@@ -2373,6 +2397,13 @@ export async function registerCommercial(
         identityRepo,
         runner: getPool() as unknown as CronWakeRunner,
       });
+      const cronOriginInjectHandler: CronOriginInjectHandler = makeCronOriginInjectHandler({
+        identityRepo,
+        inject: (input) =>
+          cronOriginBridgeRef
+            ? cronOriginBridgeRef.injectCronOriginTurn(input)
+            : Promise.resolve({ kind: "no_transport" as const }),
+      });
       // /internal/v3/inbox-post — 容器 onDeliver「离线送达兜底写站内信」。uid 由容器身份推导,
       // audience 硬编码 'user' 只给自己写;created_by = MIN active admin(同 onboarding 语义,
       // 每次现解析,不缓存)。无 admin → 抛错 → handler 500。见 http/internalInboxPost.ts。
@@ -2564,6 +2595,9 @@ export async function registerCommercial(
         }
         if (path === CRON_INDEX_PATH) {
           return cronIndexHandler(req, res, ctx);
+        }
+        if (path === CRON_ORIGIN_INJECT_PATH) {
+          return cronOriginInjectHandler(req, res, ctx);
         }
         if (path === INBOX_POST_PATH) {
           return inboxPostHandler(req, res, ctx);
@@ -5281,7 +5315,8 @@ export async function registerCommercial(
     appendCostCredits: appendCostCreditsForUser, // c:<uid> 前缀对齐 session 存储命名空间
   });
   // 把 proxy 的 forward-ref 指向真实 broadcastToUser —— 此刻以后,commit 成功
-  // 扣费事件会实时推到用户前端。
+  // 扣费事件会实时推到用户前端。cron-origin-inject 同理由此刻起可注入。
+  cronOriginBridgeRef = userChatBridge;
   bridgeBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };
