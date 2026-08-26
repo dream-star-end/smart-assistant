@@ -98,6 +98,12 @@
       "reason": "仅修复 boss 自用 selfhost 的 Cursor 委派完成唤醒延迟与 CLI 前台分段，不涉及 claudeai.chat 付费生产流量、计费或数据事故；对应现象发生在 uid3 个人实例。",
       "approvedBy": "dx 2026-08-26 指示统一全部部署上线",
       "expiresAt": "2026-09-26"
+    },
+    {
+      "commit": "c7c043cf5e98c58f84593543bfde8bd7589156f1",
+      "reason": "仅加固 boss 自用 selfhost 的 Cursor 选项卡展示：隐藏工具卡持久化并限制每回合最多四次，不涉及 claudeai.chat 付费生产流量、计费或数据事故。",
+      "approvedBy": "dx 2026-08-26 指示统一全部部署上线",
+      "expiresAt": "2026-09-26"
     }
   ]
 }
