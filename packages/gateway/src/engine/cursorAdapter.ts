@@ -660,7 +660,7 @@ interface TurnCtx {
   params: TurnParams; startedAt: number; proc: ChildProcessByStdio<null, Readable, Readable> | null
   assistantText: string; thinkingText: string; assistantSegments: SegmentRecord[]; thinkingSegments: SegmentRecord[]
   tools: Map<string, TurnToolEntry>; pending: Set<string>; startedTools: Map<string, number>
-  stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; resolveDrain: (() => void) | null; interrupted: boolean; error: string | null; usage?: ReportedUsage
+  stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; resolveDrain: (() => void) | null; interrupted: boolean; error: string | null; resultSeen: boolean; resultDetail: string | null; usage?: ReportedUsage
   assistantPartialText: string; pendingAssistantText: string | null
   assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
   lastContentKind: 'text' | 'thinking' | null
@@ -1471,7 +1471,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.stopPendingKeepalive()
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, resultSeen: false, resultDetail: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { ctx.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => {
       // Only ever settle this turn's own barrier: shutdown() may have already
@@ -1730,8 +1730,18 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         this.cleanupContextDir(ctx)
         ctx.resolveDrain?.()
         ctx.resolveDrain = null
-        if (!ctx.terminal)
-          this.finish(ctx, ctx.stderr.trim() || `Cursor CLI exited with code ${String(code)}`)
+        if (!ctx.terminal) {
+          let detail = ctx.resultSeen
+            ? ctx.resultDetail
+            : ctx.error || ctx.stderr.trim() || `Cursor CLI exited with code ${String(code)}`
+          // A success result followed by a non-zero wrapper exit is not a
+          // successful turn. Preserve the wrapper failure and its late slot
+          // marker rather than trusting the earlier stdout event.
+          if (ctx.resultSeen && code !== 0 && !detail) {
+            detail = ctx.stderr.trim() || `Cursor CLI exited with code ${String(code)}`
+          }
+          this.finish(ctx, detail)
+        }
         this.emit('exit', { code, signal, crashed: !ctx.interrupted && code !== 0 })
         if (this.active === ctx) this.active = null
       })
@@ -1826,7 +1836,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (type === 'error') { ctx.error = textOf(event.message ?? event.error ?? event.data) || 'Cursor CLI error'; return }
     if (type === 'result') {
       const failed = event.is_error === true || ['error', 'failed', 'failure'].includes(textOf(event.subtype).toLowerCase())
-      this.finish(ctx, failed ? textOf(event.error ?? event.result ?? event.message) || ctx.error || 'Cursor CLI error' : ctx.error)
+      // The account wrapper emits slot_result only after the official CLI
+      // exits. Defer terminal settlement until process close so external
+      // billing and quota learning receive the slot that actually ran.
+      ctx.resultSeen = true
+      ctx.resultDetail = failed ? textOf(event.error ?? event.result ?? event.message) || ctx.error || 'Cursor CLI error' : ctx.error
     }
   }
   private flushPendingAssistant(ctx: TurnCtx, aggregateBoundary: boolean): void {

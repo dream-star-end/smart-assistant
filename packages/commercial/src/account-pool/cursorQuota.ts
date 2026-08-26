@@ -40,12 +40,14 @@ export function parseCursorSlotResults(text: string): CursorSlotResult[] {
 
 export function coerceSlotFail(
   result: CursorSlotResultKind,
-  terminalCode: string | null | undefined,
+  _terminalCode: string | null | undefined,
 ): CursorSlotResultKind {
-  if (result !== "fail") return result;
-  if (terminalCode === "QUOTA_UNAVAILABLE") return "fail_quota";
-  if (terminalCode === "AUTH_UNAVAILABLE") return "fail_auth";
-  return "fail";
+  // A turn-level terminal code is not proof that the selected Cursor key hit
+  // its Other Models pool. It can come from MCP/browser auth, a generic 429,
+  // transport failure, or any other stderr emitted during a long agent turn.
+  // Only an explicit slot_result emitted with provider-bound provenance may
+  // change a key's quota class.
+  return result;
 }
 
 export function nextCursorQuotaClass(
@@ -55,7 +57,9 @@ export function nextCursorQuotaClass(
 ): CursorQuotaClass {
   if (family === "cursor_models") return current;
   if (result === "ok") return "other_ok";
-  if (result === "fail_auth" || result === "fail_quota") return "cursor_only";
+  // Authentication failure does not prove that Cursor Models still work, so
+  // it must never be rewritten as the two-pool state `cursor_only`.
+  if (result === "fail_quota") return "cursor_only";
   return current;
 }
 

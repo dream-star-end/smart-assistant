@@ -178,12 +178,21 @@ workspace=$(pwd -P)
 #
 # Other Models (Opus and the rest) additionally skip slots marked
 # `cursor_only` in `.quota-class`. That sidecar has no secrets. Cursor Models
-# still see every active slot.
+# still see every active slot. If every active slot is classified cursor_only,
+# one slot is periodically rechecked instead of permanently self-locking the
+# pool. A successful recheck emits `ok`, allowing the master to learn
+# `other_ok`; a failed recheck is throttled for ten minutes.
 chosen_key_file=$auth_file
 rotation_file=${OC_CURSOR_KEY_ROTATION_FILE:-/tmp/openclaude-cursor-key-rotation}
 rotation_cooldown=600
 rotation_idx=0
 rotation_exp=0
+other_models_recheck=0
+other_models_recheck_file=${OC_CURSOR_OTHER_MODELS_RECHECK_FILE:-/tmp/openclaude-cursor-other-models-recheck}
+other_models_recheck_cooldown=${OC_CURSOR_OTHER_MODELS_RECHECK_COOLDOWN:-600}
+case "$other_models_recheck_cooldown" in
+  ''|*[!0-9]*) other_models_recheck_cooldown=600 ;;
+esac
 
 cursor_family=other_models
 case "$model" in
@@ -207,6 +216,8 @@ if [ "$cursor_family" = "other_models" ]; then
       || sidecar_text=""
     eligible_names=""
     eligible_count=0
+    cursor_only_names=""
+    cursor_only_count=0
     for key_name in $key_names; do
       slot_class=unknown
       while IFS= read -r line || [ -n "$line" ]; do
@@ -226,13 +237,26 @@ if [ "$cursor_family" = "other_models" ]; then
 $sidecar_text
 SIDECAR
       if [ "$slot_class" = "cursor_only" ]; then
+        cursor_only_names="$cursor_only_names $key_name"
+        cursor_only_count=$((cursor_only_count + 1))
         continue
       fi
       eligible_names="$eligible_names $key_name"
       eligible_count=$((eligible_count + 1))
     done
     if [ "$eligible_count" -eq 0 ]; then
-      die "Cursor other-models quota unavailable"
+      recheck_exp=$(/bin/cat -- "$other_models_recheck_file" 2>/dev/null) || recheck_exp=0
+      case "$recheck_exp" in
+        ''|*[!0-9]*) recheck_exp=0 ;;
+      esac
+      recheck_now=$(/bin/date +%s)
+      if [ "$recheck_now" -lt "$recheck_exp" ]; then
+        die "Cursor other-models quota unavailable"
+      fi
+      [ "$cursor_only_count" -gt 0 ] || die "Cursor other-models quota unavailable"
+      eligible_names=$cursor_only_names
+      eligible_count=$cursor_only_count
+      other_models_recheck=1
     fi
   fi
 fi
@@ -301,6 +325,15 @@ rotation_advance() {
   printf '%s %s\n' "$rotation_next" "$(( $(/bin/date +%s) + rotation_cooldown ))" \
     > "$rotation_file" 2>/dev/null || :
 }
+mark_other_models_recheck_failure() {
+  [ "$other_models_recheck" -eq 1 ] || return 0
+  printf '%s\n' "$(( $(/bin/date +%s) + other_models_recheck_cooldown ))" \
+    > "$other_models_recheck_file" 2>/dev/null || :
+}
+clear_other_models_recheck() {
+  [ "$other_models_recheck" -eq 1 ] || return 0
+  /bin/rm -f -- "$other_models_recheck_file" 2>/dev/null || :
+}
 emit_slot_result() {
   _kind=$1
   _full=0
@@ -336,11 +369,13 @@ fi
 
 if ! api_key=$(/usr/bin/sudo -n /bin/cat -- "$chosen_key_file" 2>/dev/null); then
   emit_slot_result fail
+  mark_other_models_recheck_failure
   rotation_advance
   die "Cursor credential mount is unreadable"
 fi
 if [ -z "$api_key" ]; then
   emit_slot_result fail
+  mark_other_models_recheck_failure
   rotation_advance
   die "Cursor credential is malformed"
 fi
@@ -349,6 +384,7 @@ case "$api_key" in
   *"
 "*|*"$carriage_return"*)
     emit_slot_result fail
+    mark_other_models_recheck_failure
     rotation_advance
     die "Cursor credential is malformed"
     ;;
@@ -647,9 +683,11 @@ set -e
 # turns (user Stop) exit through forward_signal and do not touch the state.
 if [ "$status" -ne 0 ]; then
   emit_slot_result fail
+  mark_other_models_recheck_failure
   rotation_advance
 else
   emit_slot_result ok
+  clear_other_models_recheck
 fi
 
 # Shorten the lifetime of the shell copy before EXIT removes the temp HOME.

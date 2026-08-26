@@ -1540,6 +1540,43 @@ console.log(JSON.stringify({type:'result',subtype:'error',is_error:true,result:'
     }
   })
 
+  test('terminal settlement waits for the wrapper late slot_result marker', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-late-slot-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'ok'}))
+setTimeout(() => console.error('oc-cursor: slot_result 2 ok'), 20)
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      const billing: EngineExternalBillingEvent[] = []
+      adapter.on('external_billing', (event) => billing.push(event))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(summary?.isError, false)
+      assert.equal(billing[0]?.status, 'success')
+      assert.deepEqual(billing[0]?.cursorSlotResults, [{ slot: 2, result: 'ok' }])
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test(
     'Stop interrupts the detached Cursor process group and emits cancelled terminal state',
     { timeout: 5_000 },

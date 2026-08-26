@@ -805,8 +805,9 @@ describe('oc-cursor wrapper', () => {
     assert.equal(argv.includes('-H'), false, 'argv must not include -H flag')
   })
 
-  test('Other Models die as quota when every slot is cursor_only', () => {
+  test('Other Models periodically recheck an all-cursor_only pool and recover on success', () => {
     const f = fixture()
+    const recheckFile = join(f.dir, 'other-models-recheck')
     writeFileSync(
       join(dirname(f.auth), '.quota-class'),
       '# quota-class v1\napi-key cursor_only\n',
@@ -815,11 +816,65 @@ describe('oc-cursor wrapper', () => {
     const result = spawnSync(
       f.wrapper,
       ['--model', 'claude-opus-5-thinking-high', '--', 'hello'],
-      { cwd: f.dir, env: f.env, encoding: 'utf8' },
+      {
+        cwd: f.dir,
+        env: { ...f.env, OC_CURSOR_OTHER_MODELS_RECHECK_FILE: recheckFile },
+        encoding: 'utf8',
+      },
     )
-    assert.equal(result.status, 2)
-    assert.match(result.stderr, /other-models quota unavailable/)
-    assert.equal(existsSync(join(f.capture, 'key')), false)
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8').trim(), 'crsr_dummy')
+    assert.match(result.stderr, /slot_result 1 ok/)
+    assert.equal(existsSync(recheckFile), false)
+  })
+
+  test('a failed all-cursor_only recheck is throttled, then retried after expiry', () => {
+    const f = fixture()
+    const recheckFile = join(f.dir, 'other-models-recheck')
+    const captureKey = join(f.capture, 'key')
+    writeFileSync(
+      join(dirname(f.auth), '.quota-class'),
+      '# quota-class v1\napi-key cursor_only\n',
+      { mode: 0o600 },
+    )
+    const env = {
+      ...f.env,
+      OC_CURSOR_OTHER_MODELS_RECHECK_FILE: recheckFile,
+      OC_CURSOR_TEST_FAIL_ON_KEY: 'crsr_dummy',
+    }
+
+    const first = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'hello'],
+      { cwd: f.dir, env, encoding: 'utf8' },
+    )
+    assert.equal(first.status, 1)
+    assert.match(first.stderr, /slot_result 1 fail/)
+    assert.match(readFileSync(recheckFile, 'utf8'), /^\d+\n$/)
+
+    rmSync(captureKey, { force: true })
+    const throttled = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'hello'],
+      { cwd: f.dir, env, encoding: 'utf8' },
+    )
+    assert.equal(throttled.status, 2)
+    assert.match(throttled.stderr, /other-models quota unavailable/)
+    assert.equal(existsSync(captureKey), false)
+
+    writeFileSync(recheckFile, '0\n', { mode: 0o600 })
+    const recovered = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'hello'],
+      {
+        cwd: f.dir,
+        env: { ...f.env, OC_CURSOR_OTHER_MODELS_RECHECK_FILE: recheckFile },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(recovered.status, 0, recovered.stderr)
+    assert.match(recovered.stderr, /slot_result 1 ok/)
+    assert.equal(existsSync(recheckFile), false)
   })
 })
 
