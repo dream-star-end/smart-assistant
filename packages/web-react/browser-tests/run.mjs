@@ -957,7 +957,9 @@ await check("T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录�
 
 await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度", async () => {
   const root = page.locator("#tool-card-polish-root");
-  const header = root.getByRole("button", { name: "展开搜索 AI 市场详情" });
+  const header = root.getByRole("button", {
+    name: /^(?:展开|收起)搜索 AI 市场详情$/,
+  });
   await header.waitFor({ state: "visible", timeout: 3000 });
   const box = await header.boundingBox();
   if (!box || box.height < TOUCH_MIN) throw new Error(`工具卡头部高度=${box?.height ?? 0}px，应至少 44px`);
