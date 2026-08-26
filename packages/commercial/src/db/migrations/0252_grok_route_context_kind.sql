@@ -1,4 +1,5 @@
--- 0246_grok_route_context_kind.sql
+-- 0252_grok_route_context_kind.sql
+-- order-dependency: 0251_cursor_sand_mode
 -- grok_route_contexts 行按来源分租约语义:
 --   bridge   —— 浏览器 turn。user chat bridge 铸造,终态由计费终结帧显式 expire;
 --               7 天滑动 TTL 只是"孤儿密钥清扫"兜底,不是并发生命周期。
