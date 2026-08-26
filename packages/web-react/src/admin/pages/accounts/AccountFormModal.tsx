@@ -520,7 +520,7 @@ export function AccountFormModal({
               <div className="flex flex-col">
                 <span className="text-[13px] font-medium text-fg">启用 Sand 客户端模式</span>
                 <span className="text-[11px] text-muted">
-                  Opus / GPT-5.6 等其他模型携带 Sand 客户端请求头 (x-cursor-client-type: sand)；Grok 4.6 保持原生 CLI 模式
+                  Opus 5 / Opus 4.8 / Fable 5 等高级模型携带 Sand 客户端请求头 (x-cursor-client-type: sand)；Grok 4.6 / Composer 2.5 保持原生 CLI 模式
                 </span>
               </div>
               <label className="relative inline-flex cursor-pointer items-center">

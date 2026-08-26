@@ -605,7 +605,7 @@ fi
 
 if [ "$effective_sand" -eq 1 ]; then
   sand_hook="$cursor_home/.sand-hook.cjs"
-  /bin/cat <<EOF > "$sand_hook"
+  /bin/cat <<'EOF' > "$sand_hook"
 const origSet = globalThis.Headers?.prototype?.set;
 if (origSet) {
   globalThis.Headers.prototype.set = function(k, v) {
