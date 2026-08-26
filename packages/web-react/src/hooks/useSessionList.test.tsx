@@ -659,16 +659,25 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     expect(page.mock.calls[0][1]).toEqual({ includeArchived: true });
   });
 
-  test("searchSessionMessages 只回 message 命中，AbortError 当空数组", async () => {
-    vi.spyOn(api, "searchSessions").mockResolvedValue({
+  test("searchSessionMessages 透传服务端命中与项目过滤，AbortError 当空数组", async () => {
+    const search = vi.spyOn(api, "searchSessions").mockResolvedValue({
       results: [
         { sessionId: "a", title: "t", snippet: "x", matchedAt: 1, kind: "title" },
         { sessionId: "b", title: "t2", snippet: "y", matchedAt: 2, kind: "message" },
       ],
     });
     const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
-    const hits = await result.current.searchSessionMessages("foo", new AbortController().signal);
-    expect(hits.map((h) => h.sessionId)).toEqual(["b"]);
+    const hits = await result.current.searchSessionMessages(
+      "foo",
+      new AbortController().signal,
+      "project-1",
+    );
+    expect(hits.map((h) => h.sessionId)).toEqual(["a", "b"]);
+    expect(search).toHaveBeenCalledWith(
+      expect.anything(),
+      "foo",
+      expect.objectContaining({ projectId: "project-1" }),
+    );
 
     vi.spyOn(api, "searchSessions").mockRejectedValue(new DOMException("aborted", "AbortError"));
     const aborted = await result.current.searchSessionMessages("foo", new AbortController().signal);

@@ -21,12 +21,14 @@ export function ProjectScopeSelect({
         )
       : selectOptions;
   const value = options.some((o) => o.value === token) ? token : "all";
+  const selectedLabel = options.find((o) => o.value === value)?.label;
   return (
     <Select
       id={id}
       aria-label="项目范围"
       data-testid={variant === "work" ? "project-scope-select-work" : "project-scope-select"}
       value={value}
+      title={selectedLabel}
       onValueChange={(v) => setToken(v as typeof token)}
       options={options}
       inputSize="sm"

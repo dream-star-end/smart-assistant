@@ -615,10 +615,29 @@ export function TaskboardView({
           <ProjectSettings
             auth={auth}
             current={board.projects?.find((p) => p.id === board.projectId) ?? null}
-            onCreate={(input) => board.createProject(input)}
-            onPatch={(id, input) => board.patchProject(id, input)}
-            onArchive={(id) => board.archiveProject(id)}
-            onUnarchive={(id) => board.unarchiveProject(id).then((p) => !!p)}
+            onCreate={async (input) => {
+              const created = await board.createProject(input)
+              if (created) {
+                await projectScope.refreshWorkProjects()
+                projectScope.setToken(created.id)
+              }
+              return created
+            }}
+            onPatch={async (id, input) => {
+              const updated = await board.patchProject(id, input)
+              if (updated) await projectScope.refreshWorkProjects()
+              return updated
+            }}
+            onArchive={async (id) => {
+              const archived = await board.archiveProject(id)
+              if (archived) await projectScope.refreshWorkProjects()
+              return archived
+            }}
+            onUnarchive={async (id) => {
+              const restored = await board.unarchiveProject(id)
+              if (restored) await projectScope.refreshWorkProjects()
+              return Boolean(restored)
+            }}
             compact={!desktop}
           />
           <StageSettings

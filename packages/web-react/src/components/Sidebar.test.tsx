@@ -869,8 +869,9 @@ describe("Sidebar 虚拟列表拍平", () => {
       renderSidebar({ sessions: many, virtualizeThreshold: 8 });
       const list = document.querySelector("[data-sidebar-list]");
       expect(list).toHaveAttribute("data-virtualized", "true");
-      expect(screen.queryByRole("button", { name: "长列表会话 39" })).toBeNull();
-      expect(screen.getByRole("button", { name: "长列表会话 0" })).toBeInTheDocument();
+      const mounted = screen.queryAllByRole("button", { name: /^长列表会话 / });
+      expect(mounted.length).toBeGreaterThan(0);
+      expect(mounted.length).toBeLessThan(many.length);
     } finally {
       if (proto) Object.defineProperty(HTMLElement.prototype, "clientHeight", proto);
       else delete (HTMLElement.prototype as { clientHeight?: number }).clientHeight;

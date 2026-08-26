@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -30,6 +31,7 @@ type ProjectScopeContextValue = {
   chatProjects: ChatProjectLike[];
   selectOptions: { value: string; label: string; disabled?: boolean }[];
   loading: boolean;
+  refreshWorkProjects: () => Promise<WorkProjectLike[]>;
 };
 
 const ProjectScopeContext = createContext<ProjectScopeContextValue | null>(null);
@@ -81,29 +83,34 @@ export function ProjectScopeProvider({
   const [workProjects, setWorkProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(false);
   const [token, setTokenState] = useState<ProjectScopeToken>(() => tokenFromLocation() ?? "all");
+  const refreshEpoch = useRef(0);
 
-  useEffect(() => {
+  const refreshWorkProjects = useCallback(async (): Promise<Project[]> => {
+    const request = (refreshEpoch.current += 1);
     if (!auth) {
       setWorkProjects([]);
-      return;
+      setLoading(false);
+      return [];
     }
-    let cancelled = false;
     setLoading(true);
-    void taskboardApi
-      .listProjects(auth)
-      .then((rows) => {
-        if (!cancelled) setWorkProjects(rows);
-      })
-      .catch(() => {
-        if (!cancelled) setWorkProjects([]);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
+    try {
+      const rows = await taskboardApi.listProjects(auth);
+      if (refreshEpoch.current === request) setWorkProjects(rows);
+      return rows;
+    } catch {
+      if (refreshEpoch.current === request) setWorkProjects([]);
+      return [];
+    } finally {
+      if (refreshEpoch.current === request) setLoading(false);
+    }
   }, [auth]);
+
+  useEffect(() => {
+    void refreshWorkProjects();
+    return () => {
+      refreshEpoch.current += 1;
+    };
+  }, [refreshWorkProjects]);
 
   useEffect(() => {
     const fromUrl = tokenFromLocation();
@@ -169,8 +176,9 @@ export function ProjectScopeProvider({
       chatProjects: [...chatProjects],
       selectOptions,
       loading,
+      refreshWorkProjects,
     }),
-    [scope, setToken, workProjects, chatProjects, selectOptions, loading],
+    [scope, setToken, workProjects, chatProjects, selectOptions, loading, refreshWorkProjects],
   );
 
   return <ProjectScopeContext.Provider value={value}>{children}</ProjectScopeContext.Provider>;
@@ -187,6 +195,7 @@ export function useProjectScope(): ProjectScopeContextValue {
       chatProjects: [],
       selectOptions: projectScopeSelectOptions({ chatProjects: [], workProjects: [] }),
       loading: false,
+      refreshWorkProjects: async () => [],
     };
   }
   return ctx;

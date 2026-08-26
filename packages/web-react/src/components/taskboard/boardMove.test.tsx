@@ -4,6 +4,7 @@ import type { ComponentProps } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { ApiError } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
+import { ProjectScopeProvider } from '../../hooks/useProjectScope'
 import {
   type AllowedMove,
   LAST_PROJECT_STORAGE_KEY,
@@ -26,6 +27,7 @@ afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   localStorage.removeItem(LAST_PROJECT_STORAGE_KEY)
+  history.replaceState({}, '', '/')
 })
 
 const auth = createMemoryAuthSession(() => {}, 'tok-move')
@@ -143,20 +145,27 @@ function column(id: string): HTMLElement {
 }
 
 function renderBoard(over: Partial<ComponentProps<typeof TaskboardView>> = {}) {
+  history.replaceState({}, '', '/board?project=chat-project-p1')
   return render(
-    <ToastProvider>
-      <TooltipProvider>
-        <TaskboardView
-          auth={auth}
-          view="board"
-          ticketId={null}
-          onViewChange={() => {}}
-          onOpenTicket={() => {}}
-          onOpenMobileNav={() => {}}
-          {...over}
-        />
-      </TooltipProvider>
-    </ToastProvider>,
+    <ProjectScopeProvider
+      auth={auth}
+      chatProjects={[{ id: 'chat-project-p1', name: 'V5 会话', boardProjectId: 'p1' }]}
+      userId="board-move-test"
+    >
+      <ToastProvider>
+        <TooltipProvider>
+          <TaskboardView
+            auth={auth}
+            view="board"
+            ticketId={null}
+            onViewChange={() => {}}
+            onOpenTicket={() => {}}
+            onOpenMobileNav={() => {}}
+            {...over}
+          />
+        </TooltipProvider>
+      </ToastProvider>
+    </ProjectScopeProvider>,
   )
 }
 
@@ -658,6 +667,19 @@ describe('旧积压视图兼容与新建单据', () => {
   })
 
   test('新建单据默认记为积压，直接开工才传 status=ready', async () => {
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn((query: string) => ({
+        matches: query === '(min-width: 768px)',
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      })) as typeof window.matchMedia,
+    )
     stubBoard({ backlog: [] })
     const created = sampleTicket({ identifier: 'OCV5-80', title: '随手记下' })
     const create = vi.spyOn(taskboardApi, 'createTicket').mockResolvedValue({
@@ -666,7 +688,8 @@ describe('旧积压视图兼容与新建单据', () => {
     })
     renderBoard()
     await waitFor(() => {
-      expect(screen.getByLabelText('项目')).toHaveValue('p1')
+      expect(screen.getByLabelText('项目范围')).toHaveValue('p1')
+      expect(screen.getByRole('button', { name: '新建单据' })).toBeEnabled()
     })
     fireEvent.click(screen.getByRole('button', { name: '新建单据' }))
     expect(await screen.findByRole('radio', { name: '记为积压' })).toBeChecked()
@@ -960,7 +983,7 @@ describe('看板列头与卡片一级收整', () => {
     expect(within(card).queryByRole('combobox', { name: '移动到…' })).not.toBeInTheDocument()
     expect(screen.getByText('登录 500')).toHaveAttribute('title', '登录 500')
     await waitFor(() => {
-      expect(screen.getByLabelText('项目')).toHaveAttribute('title', 'OCV5 V5 自用')
+      expect(screen.getByLabelText('项目范围')).toHaveAttribute('title', 'OCV5 V5 自用')
     })
   })
 })

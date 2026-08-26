@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import type { ComponentProps } from 'react'
 import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
 import { workspaceWantPath } from '../../hooks/useAppRoute'
+import { ProjectScopeProvider } from '../../hooks/useProjectScope'
 import { api, ApiError } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
 import {
@@ -42,6 +43,7 @@ afterEach(() => {
   vi.unstubAllGlobals()
   vi.useRealTimers()
   localStorage.removeItem(LAST_PROJECT_STORAGE_KEY)
+  history.replaceState({}, '', '/')
 })
 
 beforeAll(async () => {
@@ -268,7 +270,7 @@ describe('TicketCard 类型 / 优先级映射', () => {
 })
 
 function BoardHarness() {
-  const tb = useTaskboard(auth, true)
+  const tb = useTaskboard(auth, true, null, 'p1')
   const ticket = tb.tickets?.[0]
   return (
     <div>
@@ -879,20 +881,27 @@ function mockEmptyBoard() {
 }
 
 function renderBoard(over: Partial<ComponentProps<typeof TaskboardView>> = {}) {
+  history.replaceState({}, '', '/board?project=chat-project-p1')
   return render(
-    <ToastProvider>
-      <TooltipProvider>
-        <TaskboardView
-          auth={auth}
-          view="board"
-          ticketId={null}
-          onViewChange={() => {}}
-          onOpenTicket={() => {}}
-          onOpenMobileNav={() => {}}
-          {...over}
-        />
-      </TooltipProvider>
-    </ToastProvider>,
+    <ProjectScopeProvider
+      auth={auth}
+      chatProjects={[{ id: 'chat-project-p1', name: 'V5 会话', boardProjectId: 'p1' }]}
+      userId="taskboard-test"
+    >
+      <ToastProvider>
+        <TooltipProvider>
+          <TaskboardView
+            auth={auth}
+            view="board"
+            ticketId={null}
+            onViewChange={() => {}}
+            onOpenTicket={() => {}}
+            onOpenMobileNav={() => {}}
+            {...over}
+          />
+        </TooltipProvider>
+      </ToastProvider>
+    </ProjectScopeProvider>,
   )
 }
 
@@ -952,7 +961,7 @@ describe('项目管理', () => {
       })
 
     renderBoard()
-    expect(await screen.findByText('还没有项目')).toBeInTheDocument()
+    expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
 
     fireEvent.click(screen.getByTestId('project-create-open'))
     await screen.findByTestId('project-create')
@@ -969,10 +978,10 @@ describe('项目管理', () => {
       )
     })
     await waitFor(() => {
-      expect(screen.getByLabelText('项目')).toHaveValue('p-new')
+      expect(screen.getByLabelText('项目范围')).toHaveValue('p-new')
     })
     expect(taskboardApi.getProjectBoard).toHaveBeenCalledWith(auth, 'p-new', undefined)
-    expect(screen.queryByText('还没有项目')).not.toBeInTheDocument()
+    expect(screen.queryByText('该会话项目未绑定看板')).not.toBeInTheDocument()
   })
 
   test('归档项目默认不出现在下拉里', async () => {
@@ -982,7 +991,7 @@ describe('项目管理', () => {
     ])
     mockEmptyBoard()
     renderBoard()
-    const select = await screen.findByLabelText('项目')
+    const select = await screen.findByLabelText('项目范围')
     await waitFor(() => {
       const values = [...(select as HTMLSelectElement).options].map((o) => o.value)
       expect(values).toContain('p1')
@@ -1224,4 +1233,3 @@ describe('pickInitialProject', () => {
     expect(pickInitialProject([{ ...testProj, archivedAt: 1 }, e2e], 'test')?.id).toBe('e2e')
   })
 })
-
