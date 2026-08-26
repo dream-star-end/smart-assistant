@@ -860,6 +860,24 @@ export async function acquireUserLifecycleLock(
 }
 
 /**
+ * nowait 变体:拿不到锁立即返回 false,不阻塞。
+ *
+ * idle sweep 用这条而不是阻塞 `acquireUserLifecycleLock` —— tick 有 60s 预算,
+ * 不能在 provision/volumeGc 持锁的 uid 上排队;拿不到就 skippedLocked 等下一轮。
+ * 同一 (NS, uid) 键,与 provision / volumeGc 仍互斥。
+ */
+export async function tryAcquireUserLifecycleLock(
+  client: PoolClient,
+  uid: number,
+): Promise<boolean> {
+  const r = await client.query<{ locked: boolean }>(
+    "SELECT pg_try_advisory_xact_lock($1::int4, $2::int4) AS locked",
+    [USER_LIFECYCLE_LOCK_NS, uidToLockKey(uid)],
+  );
+  return r.rows[0]?.locked === true;
+}
+
+/**
  * 在事务内 acquire per-host admission lock。COMMIT/ROLLBACK 自动 release。
  *
  * 严格只接受 PG canonical 36-char lowercase uuid:系统不变量是 hostUuid 必来自
@@ -3365,75 +3383,23 @@ export async function provisionV3Container(
 }
 
 /**
- * 优雅停止并删除一个 active 容器,把 row 标 vanished。
+ * 守卫 UPDATE:把 agent_containers 行翻 vanished。不碰 docker。
  *
- * 顺序(2026-04-21 codex round 1 finding #4 修复):
- *   1. UPDATE agent_containers SET state='vanished' WHERE id = $1 —— 优先落
- *      DB,因为这是 admin / idle sweep 的"权威意图":这个行就是要走。
- *      docker 实际清理是否成功是 best-effort;失败留半死容器也是 GC 兜的事
- *      (`v3volumeGc` 见到 vanished 行的 docker_id 还残留时再 force remove)
- *   2. docker stop(t=5,SIGTERM 给 npm 5 秒) —— missing 吞掉
- *   3. docker remove(force) —— missing 吞掉
- *   4. 任意 docker 步骤 wrapped 抛错 → 抛给 caller(admin 看错日志,但 row
- *      已经是 vanished,下次 ensureRunning 会判 "无 active 行" 走 provision,
- *      不会被半死行卡在 stopped/missing 状态再死循环)
+ * 接收调用方传入的 PG client(事务内 PoolClient,或 autocommit 的 pool.query),
+ * **不**自己从 deps.pool 另开连接 —— idle sweep 必须在持 FOR UPDATE 的同一事务里
+ * 完成状态翻转,否则 COMMIT 后再 UPDATE 可能排队超过 drain 10s TTL。
  *
- * 不删 volume(GC 走 3G,banned 7d / no-login 90d 才动)。
+ * 守卫与历史 stopAndRemoveV3Container 逐字节一致:
+ *   runtime_channel / container_internal_id IS NOT DISTINCT FROM /
+ *   requireNoOpenMigration / requireIdleCutoffMin。
  *
- * 旧顺序的 bug:先 docker stop,如果非 404 异常抛出 → 整个函数挂出错,
- * UPDATE 没跑 → 行残留 active + 容器残留半死。下次 ensureRunning 命中
- * stopped/missing 分支,要么"stopped" 拒绝 ensureRunning 长时间,要么
- * 自递归调本函数死循环 wrap 同一个 docker 错。
+ * 返回 hit=是否命中一行,以及 RETURNING host_uuid(未命中为 null)。
  */
-/**
- * R6.11 Phase 2.C — `options.requireNoOpenMigration: true` 让 caller(idle sweep /
- * orphan reconcile Direction B)在 SELECT-then-UPDATE 中间窗口被并发 migration
- * 写入 ledger 时,自动 skip 销毁动作 — 由 reconciler 作为单点权威负责后续。
- *
- * **race 覆盖范围(诚实标注,Codex Phase 2.C 评审 Finding 1)**:
- *   READ COMMITTED 下,UPDATE 子查询 (`NOT EXISTS … agent_migrations`) 见到的是
- *   *statement-start* snapshot,**不**是 row lock 获得时的最新行。本守卫覆盖的
- *   真实区间是「SELECT 完成 → 本条 UPDATE 语句开始」之间 writer 已 commit 的
- *   ledger 行,**不**覆盖「UPDATE 语句开始 → 行锁获得」(微秒级)之间新 commit 的行。
- *
- *   这是 best-effort 第二道闸,**主**安全机制仍是:
- *     1. SELECT 层 NOT EXISTS predicate(把 99.9% 时间的 mid-migration 行排除)
- *     2. reconciler 单点权威(在下一轮 tick 把 ledger 推到终态;但**注意**:本函数
- *        若漏过守卫已经把 `agent_containers.state` 翻 vanished + docker stop/remove
- *        过,reconciler 只能 terminalize ledger,**不能**反向恢复 agent_containers
- *        或重新启容器。意味着一旦发生该微秒级误判,用户体感为容器消失 → 下次访问
- *        触发 re-provision,数据卷尚在不丢但活跃 ws 连接断;这是 Phase 2.C MVP
- *        可接受的损耗,实测漏检率超阈值再升级到 advisory lock)
- *
- *   微秒窗口闭合(Phase 2.D / 3 候选):
- *     - per-container advisory lock(`pg_advisory_xact_lock(agent_container_id)`),
- *       writer/reader 都先取锁再读写 ledger / agent_containers
- *     - 或 reader 显式 `SELECT … FOR UPDATE` 锁住 `agent_containers` 行后再判
- *       ledger,与 writer 的 INSERT-then-UPDATE 事务序列化
- *   Phase 2.C 不引入这些复杂度,先用"best-effort 双闸 + reconciler 兜底"过 MVP,
- *   实测漏检率超阈值再升级。
- *
- * 默认行为(不传 options)保持向后兼容:admin / ensureRunning stale recovery /
- * migration reconciler 自身这些"显式销毁"路径不应该被 ledger 行挡住,继续走
- * 无条件 UPDATE。
- *
- * 返回值含义:
- *   - true:UPDATE 命中 1 行(或不带守卫),已落 vanished,docker 步骤已尝试
- *           (本身可能 partial 抛 PartialV3Cleanup,与历史语义一致)
- *   - false:requireNoOpenMigration=true 且 守卫 UPDATE 命中 0 行 →
- *           (a)行已被并发删 / id 错,或
- *           (b)守卫拦截:并发 migration 已 INSERT 一条 open ledger 行
- *           两种情况下都 **不**进 docker 清理,函数静默返回。下次 tick 会再扫。
- *
- * 历史 callers(Promise<void> 风格)不接 return 值 TS 兼容,silently 抛弃 boolean。
- */
-export async function stopAndRemoveV3Container(
-  deps: V3SupervisorDeps,
+export async function markV3ContainerVanished(
+  client: Pool | PoolClient,
   containerRow: { id: number; container_internal_id?: string | null; host_uuid?: string | null },
-  timeoutSec = 5,
-  options?: { requireNoOpenMigration?: boolean },
-): Promise<boolean> {
-  // 1) DB 先翻 vanished —— admin 意图就是销毁,不依赖 docker 步骤是否干净。
+  options?: { requireNoOpenMigration?: boolean; requireIdleCutoffMin?: number },
+): Promise<{ hit: boolean; hostUuid: string | null }> {
   //    用 RETURNING host_uuid 兜底:v1.0.20 修了 v3orphanReconcile 的 isNotFound bug
   //    后,本函数其余 5 处调用点(idleSweep / ensureRunning stale recovery / admin
   //    stop/restart/remove)都没传 host_uuid,跨 host 容器在远端 docker 不会被真清,
@@ -3441,8 +3407,8 @@ export async function stopAndRemoveV3Container(
   //    这里就近从 DB 读出 host_uuid,所有调用点自动 host-aware,零额外 query。
   //
   //  R6.11 Phase 2.C:requireNoOpenMigration=true 时加 NOT EXISTS 守卫,
-  //    rowCount=0 → 静默 false,不进 docker。详见函数 docstring 与
-  //    docs/v3/02-DEVELOPMENT-PLAN.md §14.2.6 reader/reconciler 单点权威约束。
+  //    rowCount=0 → 静默 false,不进 docker。详见 stopAndRemoveV3Container docstring
+  //    与 docs/v3/02-DEVELOPMENT-PLAN.md §14.2.6 reader/reconciler 单点权威约束。
   //
   //    **race 覆盖范围(诚实标注)**:READ COMMITTED 下 UPDATE 的子查询见到的是
   //    *statement-start* snapshot 的 agent_migrations 行,**不**是 row lock 获取时
@@ -3459,43 +3425,49 @@ export async function stopAndRemoveV3Container(
              AND m.phase NOT IN ('committed', 'rolled_back')
         )`
     : "";
+  // idle sweep 第二道闸:破坏性 UPDATE 当场重校 last_ws_activity,关掉 SELECT→stop
+  // 之间用户重连的 TOCTOU。不传该 option 时 SQL 与历史逐字节等价。
+  // 占位符序号由 updateParams 长度推导:guardSql 将来若带参数,先 push 再拼 idle,
+  // 禁止再写死 $4。
+  const idleCutoffMin = options?.requireIdleCutoffMin;
+  const updateParams: unknown[] = [
+    String(containerRow.id),
+    getRuntimeChannel(),
+    containerRow.container_internal_id ?? null,
+  ];
+  let idleSql = "";
+  if (typeof idleCutoffMin === "number" && Number.isFinite(idleCutoffMin)) {
+    updateParams.push(idleCutoffMin);
+    idleSql = ` AND last_ws_activity IS NOT NULL
+        AND last_ws_activity < NOW() - ($${updateParams.length}::int * interval '1 minute')`;
+  }
   // P1d 跨 channel 防护:破坏性 UPDATE 必须带 runtime_channel 过滤 —— 否则任何传错(对方
   // channel)id 的 caller 都会把对方行翻 vanished 并随后 docker stop/remove。$2=本实例 channel。
-  const updateResult = await deps.pool.query<{ host_uuid: string | null }>(
+  const updateResult = await client.query<{ host_uuid: string | null }>(
     `UPDATE agent_containers
         SET state='vanished',
             updated_at=NOW()
       WHERE id = $1 AND runtime_channel = $2
-        AND container_internal_id IS NOT DISTINCT FROM $3${guardSql}
+        AND container_internal_id IS NOT DISTINCT FROM $3${guardSql}${idleSql}
       RETURNING host_uuid`,
-    [
-      String(containerRow.id),
-      getRuntimeChannel(),
-      containerRow.container_internal_id ?? null,
-    ],
+    updateParams,
   );
-  const rowFound = (updateResult.rowCount ?? 0) > 0;
-  if (!rowFound) {
-    // rowCount=0 的三种成因统一不进 docker 清理:
-    //   (a) requireNoOpenMigration 守卫拦截(并发 migration ledger 行);
-    //   (b) 行已不存在(罕见 race);
-    //   (c) 跨 channel —— 该 id 属对方 channel(UPDATE 的 runtime_channel 过滤未命中)。
-    // 三种情况都绝不能用 caller 提供的 container_internal_id 去 docker rm(c 会误删对方容器,
-    // a/b 无主可清)。docker↔DB 残骸对账交由 channel-aware 的 orphanReconcile 单点权威兜底。
-    // (a) 是正常守卫路径不告警;(b)/(c) 是 destructive 函数拿到 0 行的"意外",记一条诊断。
-    if (options?.requireNoOpenMigration !== true) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[v3supervisor.stopAndRemove] rowCount=0 for container ${containerRow.id} ` +
-          `(channel=${getRuntimeChannel()}): row gone or wrong channel ` +
-          `— skipping docker cleanup, deferring to orphanReconcile`,
-      );
-    }
-    return false;
-  }
-  const dbHostUuid: string | null = updateResult.rows[0]?.host_uuid ?? null;
-  // caller 显式传 host_uuid 优先(reconcile 已显式传,且并发场景下 caller 更可信);
-  // caller 没传 → 用 UPDATE RETURNING 兜底。
+  const hit = (updateResult.rowCount ?? 0) > 0;
+  return { hit, hostUuid: hit ? (updateResult.rows[0]?.host_uuid ?? null) : null };
+}
+
+/**
+ * 事务外 docker stop + force remove(+ codex auth 文件 best-effort 清理)。
+ *
+ * DB 意图必须已经落 vanished;本函数失败不回滚 DB,残骸交给 orphanReconcile。
+ * host 路由 / missing 吞掉 / PartialV3Cleanup 聚合与历史 stopAndRemove 后半段一致。
+ */
+export async function cleanupV3ContainerDocker(
+  deps: V3SupervisorDeps,
+  containerRow: { id: number; container_internal_id?: string | null; host_uuid?: string | null },
+  timeoutSec: number,
+  dbHostUuid: string | null,
+): Promise<void> {
   const callerHostUuid: string | null = containerRow.host_uuid ?? null;
   // caller vs DB 不一致 → 留诊断线索(理论不该发生,可能 row 被并发改 / 容器迁移)。
   if (
@@ -3518,7 +3490,7 @@ export async function stopAndRemoveV3Container(
   //    force remove 通常能覆盖大部分 stop 失败 case(daemon 抖动、容器
   //    死锁等),缩短"row vanished 但 docker 残骸还在"的窗口。
   //    任一 stage 失败,记录,最后聚合抛 PartialV3Cleanup(含 stages)。
-  if (!containerRow.container_internal_id) return true;
+  if (!containerRow.container_internal_id) return;
   const cid = containerRow.container_internal_id;
   // 多 host 系统标志:selfHostId 已配 + containerService 注入。
   // 单机 legacy 模式下 (selfHostId 缺失) host_uuid 为 null 是正常的,允许走本地。
@@ -3534,9 +3506,9 @@ export async function stopAndRemoveV3Container(
     // eslint-disable-next-line no-console
     console.warn(
       "[v3supervisor.stopAndRemove] host_uuid unknown in multi-host system, skipping docker cleanup",
-      { containerId: containerRow.id, cid, rowFound },
+      { containerId: containerRow.id, cid, rowFound: true },
     );
-    return true;
+    return;
   }
   // 决定走远端还是本地(只在 effectiveHostUuid 非 null 时区分)。
   const isRemote =
@@ -3551,7 +3523,7 @@ export async function stopAndRemoveV3Container(
       "[v3supervisor.stopAndRemove] cross-host row but containerService missing, skipping docker cleanup",
       { containerId: containerRow.id, cid, hostUuid: effectiveHostUuid },
     );
-    return true;
+    return;
   }
   const useRemote = isRemote;
   const failures: Array<{ stage: "stop" | "remove"; err: SupervisorError }> = [];
@@ -3606,8 +3578,107 @@ export async function stopAndRemoveV3Container(
     }
   }
   // 容器确认已清理 + 之前只有 stop 失败(没有 remove 失败) → 视作完整成功
-  if (containerCleared && failures.every((f) => f.stage === "stop")) return true;
+  if (containerCleared && failures.every((f) => f.stage === "stop")) return;
   if (failures.length > 0) throw aggregatePartialV3Cleanup(failures);
+}
+
+/**
+ * 优雅停止并删除一个 active 容器,把 row 标 vanished。
+ *
+ * 顺序(2026-04-21 codex round 1 finding #4 修复):
+ *   1. UPDATE agent_containers SET state='vanished' WHERE id = $1 —— 优先落
+ *      DB,因为这是 admin / idle sweep 的"权威意图":这个行就是要走。
+ *      docker 实际清理是否成功是 best-effort;失败留半死容器也是 GC 兜的事
+ *      (`v3volumeGc` 见到 vanished 行的 docker_id 还残留时再 force remove)
+ *   2. docker stop(t=5,SIGTERM 给 npm 5 秒) —— missing 吞掉
+ *   3. docker remove(force) —— missing 吞掉
+ *   4. 任意 docker 步骤 wrapped 抛错 → 抛给 caller(admin 看错日志,但 row
+ *      已经是 vanished,下次 ensureRunning 会判 "无 active 行" 走 provision,
+ *      不会被半死行卡在 stopped/missing 状态再死循环)
+ *
+ * 实现拆成 markV3ContainerVanished + cleanupV3ContainerDocker,本函数用
+ * deps.pool 组合两块,对既有调用方签名/返回值/rowCount=0 告警/host_uuid 兜底
+ * 保持不变。idle sweep 不走本组合函数,改在持锁事务内直接 mark、COMMIT 后再 docker。
+ *
+ * 不删 volume(GC 走 3G,banned 7d / no-login 90d 才动)。
+ *
+ * 旧顺序的 bug:先 docker stop,如果非 404 异常抛出 → 整个函数挂出错,
+ * UPDATE 没跑 → 行残留 active + 容器残留半死。下次 ensureRunning 命中
+ * stopped/missing 分支,要么"stopped" 拒绝 ensureRunning 长时间,要么
+ * 自递归调本函数死循环 wrap 同一个 docker 错。
+ */
+/**
+ * R6.11 Phase 2.C — `options.requireNoOpenMigration: true` 让 caller(idle sweep /
+ * orphan reconcile Direction B)在 SELECT-then-UPDATE 中间窗口被并发 migration
+ * 写入 ledger 时,自动 skip 销毁动作 — 由 reconciler 作为单点权威负责后续。
+ *
+ * **race 覆盖范围(诚实标注,Codex Phase 2.C 评审 Finding 1)**:
+ *   READ COMMITTED 下,UPDATE 子查询 (`NOT EXISTS … agent_migrations`) 见到的是
+ *   *statement-start* snapshot,**不**是 row lock 获得时的最新行。本守卫覆盖的
+ *   真实区间是「SELECT 完成 → 本条 UPDATE 语句开始」之间 writer 已 commit 的
+ *   ledger 行,**不**覆盖「UPDATE 语句开始 → 行锁获得」(微秒级)之间新 commit 的行。
+ *
+ *   这是 best-effort 第二道闸,**主**安全机制仍是:
+ *     1. SELECT 层 NOT EXISTS predicate(把 99.9% 时间的 mid-migration 行排除)
+ *     2. reconciler 单点权威(在下一轮 tick 把 ledger 推到终态;但**注意**:本函数
+ *        若漏过守卫已经把 `agent_containers.state` 翻 vanished + docker stop/remove
+ *        过,reconciler 只能 terminalize ledger,**不能**反向恢复 agent_containers
+ *        或重新启容器。意味着一旦发生该微秒级误判,用户体感为容器消失 → 下次访问
+ *        触发 re-provision,数据卷尚在不丢但活跃 ws 连接断;这是 Phase 2.C MVP
+ *        可接受的损耗,实测漏检率超阈值再升级到 advisory lock)
+ *
+ *   微秒窗口闭合(Phase 2.D / 3 候选):
+ *     - per-container advisory lock(`pg_advisory_xact_lock(agent_container_id)`),
+ *       writer/reader 都先取锁再读写 ledger / agent_containers
+ *     - 或 reader 显式 `SELECT … FOR UPDATE` 锁住 `agent_containers` 行后再判
+ *       ledger,与 writer 的 INSERT-then-UPDATE 事务序列化
+ *   Phase 2.C 不引入这些复杂度,先用"best-effort 双闸 + reconciler 兜底"过 MVP,
+ *   实测漏检率超阈值再升级。
+ *
+ * 默认行为(不传 options)保持向后兼容:admin / ensureRunning stale recovery /
+ * migration reconciler 自身这些"显式销毁"路径不应该被 ledger 行挡住,继续走
+ * 无条件 UPDATE。
+ *
+ * 返回值含义:
+ *   - true:UPDATE 命中 1 行(或不带守卫),已落 vanished,docker 步骤已尝试
+ *           (本身可能 partial 抛 PartialV3Cleanup,与历史语义一致)
+ *   - false:requireNoOpenMigration=true 且 守卫 UPDATE 命中 0 行 →
+ *           (a)行已被并发删 / id 错,或
+ *           (b)守卫拦截:并发 migration 已 INSERT 一条 open ledger 行
+ *           两种情况下都 **不**进 docker 清理,函数静默返回。下次 tick 会再扫。
+ *
+ * 历史 callers(Promise<void> 风格)不接 return 值 TS 兼容,silently 抛弃 boolean。
+ */
+export async function stopAndRemoveV3Container(
+  deps: V3SupervisorDeps,
+  containerRow: { id: number; container_internal_id?: string | null; host_uuid?: string | null },
+  timeoutSec = 5,
+  options?: { requireNoOpenMigration?: boolean; requireIdleCutoffMin?: number },
+): Promise<boolean> {
+  // 1) DB 先翻 vanished —— admin 意图就是销毁,不依赖 docker 步骤是否干净。
+  const vanished = await markV3ContainerVanished(deps.pool, containerRow, options);
+  const rowFound = vanished.hit;
+  if (!rowFound) {
+    // rowCount=0 的三种成因统一不进 docker 清理:
+    //   (a) requireNoOpenMigration 守卫拦截(并发 migration ledger 行);
+    //   (b) 行已不存在(罕见 race);
+    //   (c) 跨 channel —— 该 id 属对方 channel(UPDATE 的 runtime_channel 过滤未命中)。
+    // 三种情况都绝不能用 caller 提供的 container_internal_id 去 docker rm(c 会误删对方容器,
+    // a/b 无主可清)。docker↔DB 残骸对账交由 channel-aware 的 orphanReconcile 单点权威兜底。
+    // (a) 是正常守卫路径不告警;(b)/(c) 是 destructive 函数拿到 0 行的"意外",记一条诊断。
+    const hasIdleGuard = typeof options?.requireIdleCutoffMin === "number"
+      && Number.isFinite(options.requireIdleCutoffMin);
+    if (options?.requireNoOpenMigration !== true && !hasIdleGuard) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[v3supervisor.stopAndRemove] rowCount=0 for container ${containerRow.id} ` +
+          `(channel=${getRuntimeChannel()}): row gone or wrong channel ` +
+          `— skipping docker cleanup, deferring to orphanReconcile`,
+      );
+    }
+    return false;
+  }
+  await cleanupV3ContainerDocker(deps, containerRow, timeoutSec, vanished.hostUuid);
   return true;
 }
 

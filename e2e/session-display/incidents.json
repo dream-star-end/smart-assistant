@@ -1614,6 +1614,59 @@
           "assertion": "lossless-anchor-contract: PASS"
         }
       ]
+    },
+    {
+      "id": "INC-20260825-HOST-FULL-POOL-SATURATION",
+      "occurredAt": "2026-08-25",
+      "severity": "P1",
+      "symptom": "商业版单节点 compute_hosts.max_containers=50 被打满，且 agent_containers state=active 恰好 50，其中 49 个 last_ws_activity 超 30 分钟（最老 401 分钟）。闲置回收器 v3idleSweep 长期被 OC_IDLE_SWEEP_DISABLED=1 关闭，槽位只进不出，把并发上限变成历史累计活跃用户上限。没有容器的用户在 WS 建桥 resolveContainerEndpoint 阶段就被 ContainerUnreadyError 挡下，前端收到 close 4503 reason=host_full 后按 server hint 每 10 秒无限重连，横幅显示「资源繁忙，正在排队重试」；turn_dispatches 与 usage_records 全为 0 行，即模型从未被调用。已有容器的用户不受影响。",
+      "rootFixCommit": "c1598ce6",
+      "coverageCommits": [
+        "d0171a2d",
+        "9d5aca4d"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3IdleSweep.test.ts",
+          "assertion": "SELECT 之后、删除之前 last_ws_activity 被刷新 → 不 vanish,racedWithActivity=1"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3IdleSweep.test.ts",
+          "assertion": "drain 返回 busy → 不 vanish、不调 docker,skippedBusy=1"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3IdleSweep.test.ts",
+          "assertion": "drain 返回 failed → 不 vanish(fail-closed),skippedDrainFailed=1"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3IdleSweep.test.ts",
+          "assertion": "拿不到 per-uid 锁 → skip 且不 vanish"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3Supervisor.test.ts",
+          "assertion": "requireIdleCutoffMin: 行已不满足闲置条件时返回 false,不 vanish,不 docker"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "桥接连着但用户一直没发帧时,会按周期刷 last_ws_activity"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "桥关闭后 keepalive 定时器被清掉、不再刷"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "idleSweep volumeGc orphanReconcile"
+        }
+      ]
     }
   ]
 }

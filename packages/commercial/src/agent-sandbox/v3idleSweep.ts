@@ -10,21 +10,32 @@
  * R6.11 Phase 2.C 改造:
  *   - SELECT 加 open-migration NOT EXISTS predicate(`agent_migrations_open_by_container_idx`
  *     partial index 命中,99% 0 行场景 sub-ms);
- *   - stopAndRemoveV3Container 走 `requireNoOpenMigration: true` 守卫 SELECT-then-UPDATE
- *     race(writer 在 SELECT 之后 INSERT ledger 行),guard 拦截时返 false → 累加
+ *   - markV3ContainerVanished 走 `requireNoOpenMigration: true` 守卫 UPDATE
+ *     (writer 在 SELECT 之后 INSERT ledger 行),hit=false → 累加
  *     `racedWithMigration` 计数,**不**计入 swept 也**不**计入 errors。
+ *
+ * v5-safe 偿还(per-uid lock + FOR UPDATE 重读 last_ws_activity + turn 屏障):
+ *   - 每行 BEGIN → tryAcquireUserLifecycleLock(nowait) → 事务内 FOR UPDATE 重读
+ *     last_ws_activity,不满足 idle → racedWithActivity++;
+ *   - 仍 idle 则照抄 admin drainV3BeforeAdminMutation 的 turn 屏障
+ *     (getV3ContainerStatus + requestRuntimeRecycleDrain),busy/failed fail-closed;
+ *   - drain accepted 后**同一 client** 做守卫 UPDATE 翻 vanished → COMMIT →
+ *     release → 事务外 docker stop/remove。破坏性 UPDATE 不得换连接,否则行锁
+ *     被 account-pool 等 FOR UPDATE 抢走时可能排队超过 drain 10s TTL,把新 turn 杀掉。
+ *   - docker 失败不回滚 DB(意图优先,残骸 orphanReconcile),记 errors。
  *
  * 语义:
  *   每 60s 跑一次,扫 `state='active' AND last_ws_activity < NOW() - INTERVAL N min`,
- *   命中行调用 supervisor.stopAndRemoveV3Container(标 vanished + 删 docker)。
+ *   命中行在持锁事务内 markV3ContainerVanished,COMMIT 后再 docker stop/remove。
  *   单行失败不影响其他行(每行独立 try/catch),但聚合 errors[] 给 caller 上报。
  *
  * `last_ws_activity` 何时被刷:
  *   1. provision 时初始化为 NOW()(v3supervisor.allocateBoundIpAndInsertRow)
  *   2. ensureRunning(uid) 命中 'running' 分支 → markV3ContainerActivity 刷新
- *   3. (TODO P1)bridge 内传输每 N 秒 debounce 写一次,避免长 ws 一直在使用却被误杀
- *      — MVP 接受"长 ws 单连超 30min 会被误杀"的窗口(用户重连即重 provision,
- *      数据全在 volume 里不丢);P1 接 telemetry 屏障再补。
+ *   3. bridge 内 client→container 帧 60s debounce 写一次
+ *   4. bridge 存活期间每 5 分钟刷一次(开着标签页的连接本身就算活跃:扫掉容器
+ *      会被前端 ~2s 重连并重新 provision,换不来容量只产生 churn。
+ *      container→user 下行帧和心跳**仍不刷**)
  *
  * 不在本文件管:
  *   - mode='persistent' 健康巡检(MVP 没 mode,推迟到 P1 tickPersistentHealth)
@@ -38,11 +49,15 @@
  *   - runOnce() 串行触发(测试用)
  */
 
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { getRuntimeChannel } from "../runtimeChannel.js";
 
+import { requestRuntimeRecycleDrain } from "./v3ensureRunning.js";
 import {
-  stopAndRemoveV3Container,
+  cleanupV3ContainerDocker,
+  getV3ContainerStatus,
+  markV3ContainerVanished,
+  tryAcquireUserLifecycleLock,
   type V3SupervisorDeps,
 } from "./v3supervisor.js";
 
@@ -58,6 +73,9 @@ export const DEFAULT_IDLE_CUTOFF_MIN = 30;
 
 /** 单次 tick 最多 stopAndRemove 多少行(防一次扫上千个把 docker daemon 打爆) */
 export const DEFAULT_SWEEP_BATCH_LIMIT = 100;
+
+/** 首轮上线限流:生产曾积 49 个 stale,20/轮 × 60s ≈ 两三轮清空,避免 docker 风暴。 */
+export const INITIAL_SWEEP_BATCH_LIMIT = 20;
 
 /** stopAndRemove 单行 docker stop 的超时(秒);默认 5s 跟 supervisor 一致 */
 const STOP_TIMEOUT_SEC = 5;
@@ -89,7 +107,7 @@ export interface IdleSweepTickResult {
   swept: number;
   /**
    * SELECT-then-UPDATE 之间被并发 INSERT migration ledger 抢占的行数。
-   * `stopAndRemoveV3Container({ requireNoOpenMigration: true })` 返 false 时累加,
+   * `markV3ContainerVanished({ requireNoOpenMigration: true })` hit=false 时累加,
    * 不计入 `swept`(没真正 vanish)、不计入 `errors`(不是错,是合法让步)。
    *
    * 持续 > 0 表示有 migration writer 上线后 idle sweep 与 reconciler 在抢同一行,
@@ -97,6 +115,22 @@ export interface IdleSweepTickResult {
    * 慢导致 sweeper 多轮空跑。
    */
   racedWithMigration: number;
+  /**
+   * FOR UPDATE 重读时 last_ws_activity 已不再满足 idle(用户在 SELECT 之后重连)。
+   * 不计入 swept / errors。
+   */
+  racedWithActivity: number;
+  /** per-uid lifecycle 锁 nowait 未拿到(provision/volumeGc 持有)。不计入 swept / errors。 */
+  skippedLocked: number;
+  /** drain 返回 busy(容器内有在飞 turn)。不计入 swept / errors。 */
+  skippedBusy: number;
+  /** drain 返回 failed。fail-closed,不 vanish。不计入 swept / errors。 */
+  skippedDrainFailed: number;
+  /**
+   * getV3ContainerStatus 为空 / containerId 或 docker id 与行不一致 / provisioning。
+   * 不计入 swept / errors。
+   */
+  skippedGeneration: number;
   /** 失败的行 + 原因(不抛,聚合返回) */
   errors: Array<{ containerId: number; error: string }>;
   /** tick 总耗时 ms(含 SELECT + 所有 stopAndRemove) */
@@ -125,6 +159,7 @@ export interface IdleSweepScheduler {
 
 interface StaleRow {
   id: number;
+  userId: number;
   container_internal_id: string | null;
 }
 
@@ -141,8 +176,8 @@ interface StaleRow {
  * 场景 sub-ms;LEFT JOIN 强迫 PG 走 hash 或 nested loop,代价更高。
  *
  * SELECT-then-stopAndRemove 中间还可能有竞态(writer 在 SELECT 后 INSERT ledger):
- * 走 `stopAndRemoveV3Container(..., { requireNoOpenMigration: true })` 在 UPDATE 层
- * 用同一个 NOT EXISTS predicate 二次兜底,rowCount=0 → 返 false → racedWithMigration++。
+ * 走 `markV3ContainerVanished(..., { requireNoOpenMigration: true })` 在 UPDATE 层
+ * 用同一个 NOT EXISTS predicate 二次兜底,hit=false → racedWithMigration++。
  *
  * 用 `LIMIT batchLimit` 防一次扫太多;下一轮 60s 后还会跑,慢慢清空也无妨。
  */
@@ -151,9 +186,13 @@ async function selectStaleRows(
   idleCutoffMin: number,
   batchLimit: number,
 ): Promise<StaleRow[]> {
-  const r = await pool.query<{ id: string; container_internal_id: string | null }>(
+  const r = await pool.query<{
+    id: string;
+    user_id: string;
+    container_internal_id: string | null;
+  }>(
     // P1a 隔离:只扫本 channel 容器 —— v3 idle sweep 不得碰 v5 行(反之亦然)。
-    `SELECT id, container_internal_id
+    `SELECT id, container_internal_id, user_id
        FROM agent_containers c
       WHERE state = 'active'
         AND c.runtime_channel = $3::text
@@ -170,9 +209,197 @@ async function selectStaleRows(
   );
   return r.rows.map((row) => ({
     id: Number.parseInt(row.id, 10),
+    userId: Number.parseInt(row.user_id, 10),
     container_internal_id: row.container_internal_id,
   }));
 }
+
+type RowSkipReason =
+  | "racedWithActivity"
+  | "skippedLocked"
+  | "skippedBusy"
+  | "skippedDrainFailed"
+  | "skippedGeneration"
+  | "racedWithMigration";
+
+type RowOutcome =
+  | { kind: "swept" }
+  | { kind: "skip"; reason: RowSkipReason };
+
+async function stillIdleLocked(
+  client: PoolClient,
+  row: StaleRow,
+  idleCutoffMin: number,
+): Promise<boolean> {
+  const r = await client.query<{ id: string }>(
+    `SELECT id
+       FROM agent_containers
+      WHERE id = $1::bigint
+        AND runtime_channel = $2::text
+        AND state = 'active'
+        AND last_ws_activity IS NOT NULL
+        AND last_ws_activity < NOW() - ($3::int * interval '1 minute')
+      FOR UPDATE`,
+    [String(row.id), getRuntimeChannel(), idleCutoffMin],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * 照抄 admin/containers.ts drainV3BeforeAdminMutation 的 turn 屏障,
+ * 但 skip 而不是 throw(sweep 不能因一行 busy 打断整轮)。
+ *
+ * 不套 isV5Channel():本调度器挂在商业/自用 v5 与 v3 channel 都会跑,
+ * 单测默认 v3;turn 屏障对两套都成立。
+ */
+async function turnBarrierSkipReason(
+  deps: V3SupervisorDeps,
+  row: StaleRow,
+): Promise<RowSkipReason | null> {
+  const status = await getV3ContainerStatus(deps, row.userId);
+  if (!status || status.containerId !== row.id) return "skippedGeneration";
+  if (status.state === "provisioning") return "skippedGeneration";
+  if (status.state !== "running") return null;
+  if (status.dockerContainerId !== (row.container_internal_id ?? "")) {
+    return "skippedGeneration";
+  }
+  const drained = deps.adminRuntimeRecycleDrain
+    ? await deps.adminRuntimeRecycleDrain(status)
+    : await requestRuntimeRecycleDrain(deps, status);
+  if (drained === "accepted") return null;
+  if (drained === "busy") return "skippedBusy";
+  return "skippedDrainFailed";
+}
+
+/**
+ * stopAndRemove 守卫 UPDATE 命中 0 行时的廉价分类。只走这条罕见分支。
+ * 查询失败回退 racedWithMigration,不把整行打进 errors。
+ */
+async function classifyStopMiss(
+  client: PoolClient,
+  row: StaleRow,
+  idleCutoffMin: number,
+): Promise<RowSkipReason> {
+  try {
+    // 仍持行锁:同一 client 上读到的就是此刻确定答案,不必再走 deps.pool。
+    const r = await client.query<{
+      state: string;
+      last_ws_activity: Date | null;
+      container_internal_id: string | null;
+      open_migration: boolean;
+    }>(
+      `SELECT c.state,
+              c.last_ws_activity,
+              c.container_internal_id,
+              EXISTS (
+                SELECT 1 FROM agent_migrations m
+                 WHERE m.agent_container_id = c.id
+                   AND m.phase NOT IN ('committed', 'rolled_back')
+              ) AS open_migration
+         FROM agent_containers c
+        WHERE c.id = $1::bigint
+          AND c.runtime_channel = $2::text`,
+      [String(row.id), getRuntimeChannel()],
+    );
+    if ((r.rowCount ?? 0) === 0) return "skippedGeneration";
+    const rec = r.rows[0]!;
+    if (rec.state !== "active") return "skippedGeneration";
+    const cidNow = rec.container_internal_id ?? null;
+    const cidExpect = row.container_internal_id ?? null;
+    if (cidNow !== cidExpect) return "skippedGeneration";
+    const cutoff = Date.now() - idleCutoffMin * 60_000;
+    const activityMs = rec.last_ws_activity == null
+      ? null
+      : new Date(rec.last_ws_activity).getTime();
+    if (activityMs == null || activityMs >= cutoff) return "racedWithActivity";
+    const openMig: unknown = rec.open_migration;
+    if (openMig === true || openMig === "t") return "racedWithMigration";
+    return "skippedGeneration";
+  } catch {
+    return "racedWithMigration";
+  }
+}
+
+/**
+ * 单行:BEGIN → try lock → FOR UPDATE 重读 → turn 屏障 → 同一 client 守卫 UPDATE
+ * → COMMIT → **立刻 release** → 事务外 docker stop/remove。
+ *
+ * 破坏性 UPDATE 必须留在持锁事务内:换连接会跟 account-pool 等 FOR UPDATE 路径
+ * 排队,可能超过 drain 10s TTL。idle 谓词由 requireIdleCutoffMin 在 UPDATE 上兜底。
+ * docker 失败不回滚(DB 意图已 COMMIT),向上抛给 tick 记 errors。
+ */
+async function sweepOneRow(
+  deps: V3SupervisorDeps,
+  row: StaleRow,
+  idleCutoffMin: number,
+  log: IdleSweepLogger | undefined,
+): Promise<RowOutcome> {
+  const client = await deps.pool.connect();
+  let txOpen = false;
+  let released = false;
+  const releaseNow = (): void => {
+    if (released) return;
+    released = true;
+    client.release();
+  };
+  try {
+    await client.query("BEGIN");
+    txOpen = true;
+    const locked = await tryAcquireUserLifecycleLock(client, row.userId);
+    if (!locked) {
+      await client.query("ROLLBACK");
+      txOpen = false;
+      return { kind: "skip", reason: "skippedLocked" };
+    }
+    const idle = await stillIdleLocked(client, row, idleCutoffMin);
+    if (!idle) {
+      await client.query("COMMIT");
+      txOpen = false;
+      return { kind: "skip", reason: "racedWithActivity" };
+    }
+    const barrier = await turnBarrierSkipReason(deps, row);
+    if (barrier) {
+      await client.query("COMMIT");
+      txOpen = false;
+      return { kind: "skip", reason: barrier };
+    }
+    // drain 成功只 arm 10s TTL —— 同一 client 立刻翻 vanished,再 COMMIT。
+    const vanished = await markV3ContainerVanished(
+      client,
+      { id: row.id, container_internal_id: row.container_internal_id },
+      { requireNoOpenMigration: true, requireIdleCutoffMin: idleCutoffMin },
+    );
+    if (!vanished.hit) {
+      const reason = await classifyStopMiss(client, row, idleCutoffMin);
+      await client.query("COMMIT");
+      txOpen = false;
+      log?.debug?.("[v3/idleSweep] skipped after guarded UPDATE miss", {
+        containerId: row.id, reason,
+      });
+      return { kind: "skip", reason };
+    }
+    await client.query("COMMIT");
+    txOpen = false;
+    // COMMIT 后立刻还连接,禁止攥着空闲 pg client 直到 docker 结束。
+    releaseNow();
+    await cleanupV3ContainerDocker(
+      deps,
+      { id: row.id, container_internal_id: row.container_internal_id },
+      STOP_TIMEOUT_SEC,
+      vanished.hostUuid,
+    );
+    return { kind: "swept" };
+  } catch (err) {
+    if (txOpen) {
+      try { await client.query("ROLLBACK"); } catch { /* swallow */ }
+      txOpen = false;
+    }
+    throw err;
+  } finally {
+    releaseNow();
+  }
+}
+
 
 // ───────────────────────────────────────────────────────────────────────
 // 单次 tick:scan + stop+remove
@@ -196,6 +423,11 @@ export async function runIdleSweepTick(
   const errors: IdleSweepTickResult["errors"] = [];
   let swept = 0;
   let racedWithMigration = 0;
+  let racedWithActivity = 0;
+  let skippedLocked = 0;
+  let skippedBusy = 0;
+  let skippedDrainFailed = 0;
+  let skippedGeneration = 0;
 
   const stale = await selectStaleRows(deps.pool, idleCutoffMin, batchLimit);
   log?.debug?.("[v3/idleSweep] scan", {
@@ -206,21 +438,18 @@ export async function runIdleSweepTick(
 
   for (const row of stale) {
     try {
-      const ok = await stopAndRemoveV3Container(
-        deps,
-        { id: row.id, container_internal_id: row.container_internal_id },
-        STOP_TIMEOUT_SEC,
-        { requireNoOpenMigration: true },
-      );
-      if (ok) {
+      const outcome = await sweepOneRow(deps, row, idleCutoffMin, log);
+      if (outcome.kind === "swept") {
         swept++;
-      } else {
-        // SELECT 之后、UPDATE 之前 migration writer INSERT 了一条 open ledger,
-        // sweep 让步给 reconciler 单点处理 — 不是错,也不算 swept,只累加 race 计数。
-        racedWithMigration++;
-        log?.debug?.("[v3/idleSweep] skipped: open migration ledger present", {
-          containerId: row.id,
-        });
+        continue;
+      }
+      switch (outcome.reason) {
+        case "racedWithMigration": racedWithMigration++; break;
+        case "racedWithActivity": racedWithActivity++; break;
+        case "skippedLocked": skippedLocked++; break;
+        case "skippedBusy": skippedBusy++; break;
+        case "skippedDrainFailed": skippedDrainFailed++; break;
+        case "skippedGeneration": skippedGeneration++; break;
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -232,16 +461,35 @@ export async function runIdleSweepTick(
   }
 
   const durationMs = Date.now() - startedAt;
-  if (stale.length > 0 || errors.length > 0 || racedWithMigration > 0) {
+  const skipped =
+    racedWithMigration + racedWithActivity + skippedLocked
+    + skippedBusy + skippedDrainFailed + skippedGeneration;
+  if (stale.length > 0 || errors.length > 0 || skipped > 0) {
     log?.info?.("[v3/idleSweep] tick done", {
       scanned: stale.length,
       swept,
       racedWithMigration,
+      racedWithActivity,
+      skippedLocked,
+      skippedBusy,
+      skippedDrainFailed,
+      skippedGeneration,
       errors: errors.length,
       durationMs,
     });
   }
-  return { scanned: stale.length, swept, racedWithMigration, errors, durationMs };
+  return {
+    scanned: stale.length,
+    swept,
+    racedWithMigration,
+    racedWithActivity,
+    skippedLocked,
+    skippedBusy,
+    skippedDrainFailed,
+    skippedGeneration,
+    errors,
+    durationMs,
+  };
 }
 
 // ───────────────────────────────────────────────────────────────────────
