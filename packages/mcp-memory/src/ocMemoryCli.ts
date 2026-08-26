@@ -49,7 +49,11 @@ import {
   gatewayDelegateHeaders,
   postJsonToGateway,
 } from './gatewayClient.js'
-import { resolveDelegateWaitPollMs, runDelegateWaitLoop } from './delegateWaitCli.js'
+import {
+  resolveDelegateCliForegroundBudgetMs,
+  resolveDelegateWaitPollMs,
+  runDelegateWaitLoop,
+} from './delegateWaitCli.js'
 import {
   normalizeDelegateAgentId,
   normalizeDelegateModel,
@@ -261,10 +265,12 @@ async function main(): Promise<void> {
     const headers = gatewayDelegateHeaders()
     headers[DELEGATE_CONTEXT_HEADER] = ctxTok.token
     const pollWaitMs = resolveDelegateWaitPollMs()
+    const foregroundBudgetMs = resolveDelegateCliForegroundBudgetMs()
     const result = await runDelegateStartAndWait({
       args,
       contextToken: ctxTok.token,
       pollWaitMs,
+      foregroundBudgetMs,
       start: (agentId, body) =>
         postJsonToGateway(`${base}/api/agents/${encodeURIComponent(agentId)}/delegate`, {
           headers,
@@ -292,6 +298,7 @@ async function main(): Promise<void> {
     const result = await runDelegateWaitLoop({
       jobIds: positional,
       pollWaitMs: resolveDelegateWaitPollMs(),
+      foregroundBudgetMs: resolveDelegateCliForegroundBudgetMs(),
       waitOnce: (jobId, waitMs) =>
         postJsonToGateway(`${base}/api/delegate/wait`, {
           headers,

@@ -7,7 +7,11 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { isTransientDelegateWaitError, runDelegateWaitLoop } from '../delegateWaitCli.js'
+import {
+  isTransientDelegateWaitError,
+  resolveDelegateCliForegroundBudgetMs,
+  runDelegateWaitLoop,
+} from '../delegateWaitCli.js'
 
 function doneBody(jobId: string, output: string): string {
   return JSON.stringify({
@@ -125,5 +129,56 @@ describe('runDelegateWaitLoop', () => {
     })
     assert.equal(r.exitCode, 1)
     assert.match(r.stderr, /requires at least one/)
+  })
+
+  it('foreground budget expires before Cursor background handoff and returns a resumable jobId', async () => {
+    let now = 0
+    let calls = 0
+    const r = await runDelegateWaitLoop({
+      jobIds: ['dlgjob-long'],
+      pollWaitMs: 20,
+      foregroundBudgetMs: 50,
+      now: () => now,
+      sleep: async () => {},
+      waitOnce: async (jobId, waitMs) => {
+        calls++
+        now += waitMs
+        return { statusCode: 200, body: JSON.stringify({ status: 'running', jobId }) }
+      },
+    })
+    assert.equal(r.exitCode, 0)
+    assert.equal(calls, 0, 'sub-250ms budget exits before a server round that would overshoot')
+    assert.match(r.stdout, /status=running jobId=dlgjob-long/)
+    assert.match(r.stdout, /oc-memory delegate-wait dlgjob-long/)
+    assert.match(r.stdout, /TaskOutput/)
+  })
+
+  it('foreground budget keeps completed fanout results and resumes only pending jobs', async () => {
+    let now = 0
+    const r = await runDelegateWaitLoop({
+      jobIds: ['dlgjob-done', 'dlgjob-pending'],
+      pollWaitMs: 250,
+      foregroundBudgetMs: 250,
+      now: () => now,
+      sleep: async () => {},
+      waitOnce: async (jobId, waitMs) => {
+        now = Math.max(now, waitMs)
+        return jobId === 'dlgjob-done'
+          ? { statusCode: 200, body: doneBody(jobId, '已完成结果') }
+          : { statusCode: 200, body: JSON.stringify({ status: 'running', jobId }) }
+      },
+    })
+    assert.equal(r.exitCode, 0)
+    assert.match(r.stdout, /已完成结果/)
+    assert.match(r.stdout, /oc-memory delegate-wait dlgjob-pending/)
+    assert.doesNotMatch(r.stdout, /delegate-wait dlgjob-done/)
+  })
+
+  it('foreground budget env is clamped below Cursor 60-minute handoff', () => {
+    assert.equal(resolveDelegateCliForegroundBudgetMs({}), 50 * 60_000)
+    assert.equal(
+      resolveDelegateCliForegroundBudgetMs({ OPENCLAUDE_DELEGATE_CLI_FOREGROUND_BUDGET_MS: '999999999' }),
+      55 * 60_000,
+    )
   })
 })

@@ -3137,6 +3137,42 @@ describe("post-terminal tail folding (A1)", () => {
     }
   });
 
+  test("A2 慢 ACK 期间的多流 backlog 合并成一条 continuation tape", async () => {
+    const captured = makeDelayingSink(25);
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const smAny = sm as unknown as { _tailFoldMinIntervalMs: number };
+      smAny._tailFoldMinIntervalMs = 0;
+      const { session, runner, events } = await runFoldTurn(sm, "2".repeat(32), {
+        toolIds: ["batch-a", "batch-b", "batch-c"],
+      });
+      const baseline = captured.payloads.length;
+
+      // 同一 tick 进队:旧实现会串行等 3 次 sink ACK;新实现用一条
+      // continuation tape 持久化 3 个有序 runtimeEvents。
+      for (const id of ["batch-a", "batch-b", "batch-c"]) {
+        runner.msg(mkTail({ tool_use_id: id, tail: `tail-${id}` }));
+      }
+      await sm.awaitPendingPersistence();
+
+      const tails = captured.payloads.slice(baseline);
+      assert.equal(tails.length, 1, "backlog 只占一次 sink/finalize ACK");
+      assert.deepEqual(
+        tails[0].runtimeEvents?.map((event) =>
+          (event.payload as { tail?: string }).tail,
+        ),
+        ["tail-batch-a", "tail-batch-b", "tail-batch-c"],
+        "批内保持到达顺序",
+      );
+      assert.equal(tailBlockCount(events), 3, "ACK 后三条 live block 都转发");
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("内容变化但 <interval:trailing flush 恰一次(合并到最新一条)", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
@@ -3554,6 +3590,17 @@ describe("post-terminal tail folding (A1)", () => {
         )
         .pop();
       assert.equal((lastTail!.block as { tail?: string }).tail, "k-4", "第 4 条(cap 之外)仍转发 → skipped 不计预算");
+
+      const beforeBatch = tailBlockCount(events);
+      for (const n of [5, 6, 7, 8]) {
+        runner.msg(mkTail({ tail: `k-${n}`, total_bytes: n }));
+      }
+      await sm.awaitPendingPersistence();
+      assert.equal(
+        tailBlockCount(events) - beforeBatch,
+        4,
+        "同批 skipped tail 也不应按计划数提前触发 cap",
+      );
 
       await flush(sm, session);
     } finally {

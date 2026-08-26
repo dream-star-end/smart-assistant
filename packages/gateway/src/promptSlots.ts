@@ -119,7 +119,7 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 即使未开启团队模式,只要系统列出了可协作 agent,也可以按收益机会式委派:
 - \`send_to_agent(agentId, message)\`:真正后台交给另一个 agent。立刻返回,请结束本回合;子任务完成后系统会把结论注入本对话并叫醒你。需要同步拿结果 → delegate_task。
 - CCB/Codex 同步委派走 MCP \`delegate_task(goal, agentId?, context?)\`;并行走 \`delegate_tasks(tasks)\`。工具会阻塞到子任务结束。
-- Cursor 同步委派走 Bash \`oc-memory delegate --goal "..."\`(一条命令开工并阻塞到结束);并行就在同一回合并发多条。不要用 MCP \`delegate_task\` / \`delegate_tasks\`(Cursor \`tools/call\` 60 秒硬超时)。质量审查用 \`oc-memory request-review --draft "..."\`。
+- Cursor 同步委派走 Bash \`oc-memory delegate --goal "..."\`;并行就在同一回合并发多条。CLI 每段前台等待会在 Cursor 约 60 分钟改挂前安全返回;若 stdout 报 \`status=running jobId=...\`,立即运行 \`oc-memory delegate-wait <jobId>\` 继续原任务,不要重新委派,不要使用 Cursor \`TaskOutput\`。不要用 MCP \`delegate_task\` / \`delegate_tasks\`(Cursor \`tools/call\` 60 秒硬超时)。质量审查用 \`oc-memory request-review --draft "..."\`。
 
 当子任务边界清晰,且专业成员能提升质量、或并行能明显节省时间时,主动委派。典型场景包括代码库搜索、独立调研、互不依赖的多文件工作,以及预计耗时较长且可分离的步骤。简单任务、步骤紧密依赖或委派成本高于收益时直接自己完成;不要把整个任务甩给子 agent,你仍负责核对结果并完成最终交付。
 
@@ -598,7 +598,7 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
         '**异步**: `send_to_agent(agentId, message)` — 真正后台,立刻返回;完成后系统注入本对话并叫醒你。',
       )
       lines.push(
-        '**同步**: CCB/Codex 用 MCP `delegate_task`; Cursor 用 Bash `oc-memory delegate --goal "..."`(阻塞到结束)。',
+        '**同步**: CCB/Codex 用 MCP `delegate_task`; Cursor 用 Bash `oc-memory delegate --goal "..."`,返回 `status=running` 时立即用 `oc-memory delegate-wait <jobId>` 续等,不用 Cursor `TaskOutput`。',
       )
       lines.push(
         '选择 agent 时考虑其模型和能力特长。需要同步拿结果继续处理 → 同步委派;可以先结束本回合、等系统回调 → send_to_agent。',

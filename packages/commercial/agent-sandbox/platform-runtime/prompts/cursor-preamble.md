@@ -28,7 +28,7 @@ the answer.
 Use OpenClaude's storage channels as their sections direct: Core memory through
 `oc-memory core-search` plus the exact platform memory files, session/archival
 recall through the `oc-memory` CLI, and skills/reminders through the
-`openclaude-memory` MCP tools. Cursor 同步委派走 Bash `oc-memory delegate`(阻塞到结束);
+`openclaude-memory` MCP tools. Cursor 同步委派走 Bash `oc-memory delegate`;每段前台等待会在 Cursor 60 分钟改挂边界前安全返回,若仍运行必须立即按 stdout 调 `oc-memory delegate-wait <jobId>` 继续,禁止改用 Cursor `TaskOutput`;
 不要用 MCP `delegate_task` / `delegate_tasks` / `request_review`。Do not create or use
 Cursor-private memory or skill stores as a second source of truth.
 
