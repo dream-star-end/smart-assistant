@@ -1667,6 +1667,45 @@
           "assertion": "idleSweep volumeGc orphanReconcile"
         }
       ]
+    },
+    {
+      "id": "INC-20260826-UPLOAD-COLDSTART-503",
+      "occurredAt": "2026-08-26",
+      "severity": "P1",
+      "symptom": "容器冷启动时 POST /api/uploads fail-closed 返回 503 + Retry-After，前端 uploadFile 不重试直接抛错；Composer 只拦 uploading 不拦 error，发送键重新可用，消息照发但附件被静默丢掉。用户以为附件已上传，agent 只能回「无法读取附件」。生产 00:21/00:28 冷 503、00:52 热 200。",
+      "rootFixCommit": "dc2e4623",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/api.test.ts",
+          "assertion": "uploadFile retries 503 then succeeds"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/api.test.ts",
+          "assertion": "uploadFile throws after exhausting 503 retries"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/api.test.ts",
+          "assertion": "uploadFile throws non-503 immediately without retry"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/api.test.ts",
+          "assertion": "uploadFile honors Retry-After seconds and clamps to [1, 10]"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/composerAttach.test.tsx",
+          "assertion": "存在 error 状态附件时发送被禁用"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-e2e-journey-canary.mjs",
+          "assertion": "必须等到 chip done 终态再放行"
+        }
+      ]
     }
   ]
 }
