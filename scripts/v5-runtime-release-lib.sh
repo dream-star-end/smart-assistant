@@ -540,6 +540,20 @@ oc_hotcfg_finalize_release() {
     [ -s "$staging/packages/mcp-memory/dist/oc-memory-mcp.cjs" ] \
       || { oc_hotcfg__die "oc-memory MCP bundle missing after build"; return 1; }
   fi
+  # Container gateway: TS→JS (module-structure transform) so user containers
+  # `node` the CLI instead of paying ~11-12s tsx compile on cold start.
+  # Builder+wrapper live under packages/cli/scripts/ so runtime-src-excludes
+  # `/scripts/` (repo-root only) cannot prune them. This lib revision always
+  # runs the builder — missing script is a failed finalize, not a skip.
+  oc_hotcfg__log "precompile container gateway"
+  local gw_build="$staging/packages/cli/scripts/build-container-gateway.sh"
+  [ -f "$gw_build" ] || {
+    oc_hotcfg__die "container gateway precompile script missing: $gw_build (packages/cli/scripts/ must survive runtime prune)"; return 1
+  }
+  ( cd "$staging" && bash "$gw_build" >&2 ) \
+    || { oc_hotcfg__die "container gateway precompile failed"; return 1; }
+  [ -s "$staging/packages/cli/dist/index.js" ] && [ -f "$staging/packages/cli/dist/.precompiled-ok" ] \
+    || { oc_hotcfg__die "container gateway precompile missing after build"; return 1; }
   # 产物阶段敏感扫描(node_modules 可能夹带 .pem 测试夹具 → 只扫源码顶层,node_modules 排除以免误杀依赖自带证书夹具)
   # 说明:敏感扫描针对**源码树被误纳入凭据**,node_modules 里第三方包自带的 *.pem 测试夹具非本仓凭据,
   # 扫描 node_modules 会大量误报;故 release 敏感扫描排除 node_modules(bundle 无 node_modules 不受影响)。

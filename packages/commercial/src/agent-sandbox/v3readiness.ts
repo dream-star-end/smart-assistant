@@ -45,8 +45,10 @@ import * as queries from "../compute-pool/queries.js";
 // 只 import 常量,避免环依赖(v3supervisor 没引 v3readiness)。
 import { V3_CONTAINER_PORT } from "./v3supervisor.js";
 
-/** 默认 readiness 总超时(ms,self-host direct 路径)。容器从 docker start 到 npm run gateway 完整 listen 一般 3-8s,留 10s 余量。 */
-export const DEFAULT_READINESS_TIMEOUT_MS = 10_000;
+/** 默认 readiness 总超时(ms,self-host direct 路径)。
+ *  冷启实测 docker start→listen 约 16s(tsx);预编译后应明显缩短。
+ *  连续轮询 30s,避免旧的 10s 首窗超时后再按 5s 重试白等。 */
+export const DEFAULT_READINESS_TIMEOUT_MS = 30_000;
 
 /**
  * 远端 host(node-tunnel)默认 readiness 总超时(ms)。
@@ -54,12 +56,12 @@ export const DEFAULT_READINESS_TIMEOUT_MS = 10_000;
  * 相比 self,跨 host probe 走 master ↔ node-agent mTLS tunnel:
  *   - 单次 RTT ~150-250ms(跨地域)、首次 TLS handshake ~500ms
  *   - 每轮 HTTP+WS probe 串行,实际有效轮数远少于 self
- *   - 容器内 OpenClaude 双层 tsx 即时编译冷启 4-7s 也照常吃
+ *   - 容器冷启(预编译直跑或 tsx 回退 ~12s 编译)也照常吃
  *
- * 取 25s 给约 3x 安全系数,够吸收 mTLS 抖动 + 冷启长尾;失败仍按 5s retryAfter
- * 让前端短重试,所以代价是真失败时用户多等最多 15s — 优先级是先压成功率。
+ * 在 direct 30s 之上再留 ~15s 隧道余量。失败仍按 5s retryAfter
+ * 让前端短重试;优先级是先压成功率。
  */
-export const DEFAULT_READINESS_TIMEOUT_REMOTE_MS = 25_000;
+export const DEFAULT_READINESS_TIMEOUT_REMOTE_MS = 45_000;
 
 /** 默认轮询间隔(ms)。200ms 抓得到瞬态 ready 又不打满 docker 桥接。 */
 export const DEFAULT_READINESS_INTERVAL_MS = 200;
@@ -282,7 +284,7 @@ export async function probeWsUpgradeViaTunnel(
 // ─── wait loop ────────────────────────────────────────────────────────
 
 export interface WaitContainerReadyOptions {
-  /** 总超时,默认按 endpoint kind 选 — direct 10s,node-tunnel 25s */
+  /** 总超时,默认按 endpoint kind 选 — direct 30s,node-tunnel 45s */
   timeoutMs?: number;
   /** 轮询间隔,默认 200ms */
   intervalMs?: number;
