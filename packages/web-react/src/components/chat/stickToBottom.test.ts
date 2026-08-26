@@ -15,7 +15,7 @@ describe("stickToBottom", () => {
     const stick = createStickToBottomController();
     const el = scroller({ scrollHeight: 800, scrollTop: 720, clientHeight: 80 });
     stick.scrollToBottom(el);
-    expect(el.scrollTop).toBe(800);
+    expect(el.scrollTop).toBe(720);
     stick.onScroll(el);
     el.scrollHeight = 1100;
     stick.onScroll(el);
@@ -40,30 +40,24 @@ describe("stickToBottom", () => {
     stick.scrollToBottom(el);
     const bottom = el.scrollTop;
 
-    // Mobile browsers may coalesce the programmatic scroll event with the
-    // first tiny touch scroll. Even inside the 80px resume threshold, moving
-    // away from the bottom is explicit user intent and must stop following.
     stick.markUserIntent();
     el.scrollTop = bottom - 8;
     stick.onScroll(el);
     expect(stick.following.current).toBe(false);
   });
 
-  test("流式增高不能掩盖用户正在离开底部", () => {
+  test("流式增高后用户离底，controller 写入不能把视口抢回", () => {
     const stick = createStickToBottomController();
     const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
     stick.scrollToBottom(el);
-
-    // A late card grows and the ResizeObserver writes the new bottom before
-    // its scroll event is delivered. The user's first upward move can then
-    // have a numerically larger scrollTop than the controller's old sample,
-    // even though the viewport is now 8px away from the new bottom.
-    el.scrollHeight = 1300;
-    el.scrollTop = 1212;
-    stick.markUserIntent();
     stick.onScroll(el);
 
-    expect(el.scrollTop).toBeGreaterThan(920);
+    el.scrollHeight = 1300;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(1220);
+
+    el.scrollTop = 1212;
+    stick.onScroll(el);
     expect(el.scrollHeight - el.scrollTop - el.clientHeight).toBe(8);
     expect(stick.following.current).toBe(false);
   });
@@ -85,7 +79,7 @@ describe("stickToBottom", () => {
     expect(el.scrollTop).toBe(pinnedTop);
     expect(el.scrollTop).not.toBe(el.scrollHeight);
 
-    el.scrollTop = 1212;
+    el.scrollTop = pinnedTop - 8;
     stick.onScroll(el);
     expect(stick.following.current).toBe(false);
 
@@ -130,7 +124,7 @@ describe("stickToBottom", () => {
     expect(stick.canRestick.current).toBe(true);
   });
 
-  test("惯性滚动在 userIntent 被消费后仍按手势起点累计离底", () => {
+  test("惯性滚动在 userIntent 被消费后仍按离底解除跟随", () => {
     const stick = createStickToBottomController();
     const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
     stick.scrollToBottom(el);
@@ -142,7 +136,7 @@ describe("stickToBottom", () => {
     el.scrollTop = bottom - 1;
     stick.onScroll(el);
     expect(stick.following.current).toBe(true);
-    expect(stick.gesture.current).toBe(true);
+    expect(stick.gesture.current).toBe(false);
 
     for (let step = 2; step <= 9; step += 1) {
       el.scrollTop = bottom - step;
@@ -171,5 +165,64 @@ describe("stickToBottom", () => {
     stick.onScroll(el);
     expect(el.scrollHeight - el.scrollTop - el.clientHeight).toBe(50);
     expect(stick.following.current).toBe(false);
+  });
+
+  test("scrollHeight 收缩 clamp 不当成用户上滑、不误 re-follow", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(true);
+
+    el.scrollHeight = 200;
+    el.scrollTop = 120;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(true);
+
+    stick.following.current = false;
+    el.scrollHeight = 150;
+    el.scrollTop = 70;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(false);
+    expect(isNearBottom(el)).toBe(true);
+  });
+
+  test("写入竞态:用户上滑后、scroll 事件到达前 pin 检出偏离", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+    const bottom = el.scrollTop;
+
+    el.scrollTop = bottom - 8;
+    stick.scrollToBottom(el);
+    expect(stick.following.current).toBe(false);
+    expect(el.scrollTop).toBe(bottom - 8);
+  });
+
+  test("两次写入合并成一个 scroll 事件", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 800, scrollTop: 720, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(720);
+    el.scrollHeight = 1100;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(1020);
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(true);
+    el.scrollHeight = 1400;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(1320);
+  });
+
+  test("programmatic 贴底不清 following", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(true);
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(true);
   });
 });

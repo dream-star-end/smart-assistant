@@ -197,6 +197,8 @@ export function SessionViewerModal({
         return !current || current.token !== anchor.token || current.cancelled ||
           current.timelineGeneration !== timelineGenerationRef.current
       },
+      undefined,
+      (node, top) => { node.scrollTop = top },
     ).finally(() => settleArchiveAnchor(anchor.token))
   }, [archiveLoading, messages, settleArchiveAnchor, timelineGeneration])
 

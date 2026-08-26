@@ -221,7 +221,7 @@ body {
 @layer utilities {
   .no-scrollbar::-webkit-scrollbar { display: none; }
   .no-scrollbar { scrollbar-width: none; }
-  .chat-scroll-area { overflow-anchor: none; }
+  .chat-scroll-area { overflow-anchor: none; /* single-writer: disable browser scroll anchoring */ }
   /* Timeline rows stay motion-stable: entrance animation would flash when a
      tail window expands or live→tape reconciles in place. */
   .chat-virtual-item .animate-in { animation: none; }

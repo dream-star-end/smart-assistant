@@ -979,6 +979,10 @@ export function MessageList({
   followBottomRef?: {
     current: boolean;
     scrollToBottom?: (el: { scrollTop: number; scrollHeight: number; clientHeight: number }) => void;
+    correctTo?: (
+      el: { scrollTop: number; scrollHeight: number; clientHeight: number },
+      nextTop: number,
+    ) => void;
   };
 }) {
   const pagingOwnerRef = useRef<{
@@ -1334,7 +1338,9 @@ export function MessageList({
     const el = scrollParent;
     if (!pending || !el) return;
     pendingExpandCorrectionRef.current = null;
-    el.scrollTop = correctedScrollTop(pending.height, el.scrollHeight, pending.top);
+    if (typeof followBottomRef?.correctTo === "function") {
+      followBottomRef.correctTo(el, correctedScrollTop(pending.height, el.scrollHeight, pending.top));
+    }
     endViewportPreserve();
   }, [windowVersion, scrollParent]);
   useLayoutEffect(() => {
@@ -1345,11 +1351,7 @@ export function MessageList({
     const follow = () => {
       if (viewportPreserveLockRef.current) return;
       if (!followBottomRef.current) return;
-      if (typeof followBottomRef.scrollToBottom === "function") {
-        followBottomRef.scrollToBottom(scroller);
-        return;
-      }
-      scroller.scrollTop = scroller.scrollHeight;
+      followBottomRef.scrollToBottom?.(scroller);
     };
     const observer = new ResizeObserver(follow);
     observer.observe(root);
@@ -1360,7 +1362,7 @@ export function MessageList({
     if (!el || didSnapToBottomRef.current) return;
     if (itemCountRef.current === 0) return;
     didSnapToBottomRef.current = true;
-    el.scrollTop = el.scrollHeight;
+    followBottomRef?.scrollToBottom?.(el);
   }, [scrollParent, windowVersion, messages.length, sessionId]);
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。

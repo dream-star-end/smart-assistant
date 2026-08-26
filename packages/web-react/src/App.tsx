@@ -2089,28 +2089,19 @@ export function App() {
     [],
   );
 
-  // autoscroll 根治(两个对称 bug 一次收口):
-  //  1. 旧依赖 [wsMessages] 是就地 mutation 的同一数组引用 → 流式期间 deps 恒等,effect
-  //     只在 turn 边界跑一次,回复长出视口后不再跟随。变更的权威信号是 chat.version
-  //     (快照单调版本号,与本仓"version 才是变更权威"的约定一致)。
-  //  2. 旧实现无条件劫持:用户上翻回看历史也被拽回底部。改为 near-bottom 粘滞 ——
-  //     只有用户本就贴底(<80px)时才跟随;上翻即解除,拉回底部自动恢复。
-  //  3. 卡片高度晚长不能当成用户离底:跟随意图只由真实输入更新,内容 ResizeObserver
-  //     在 canRestick=true 时二次贴底(见 MessageList)。
-  //  4. 手指/滚轮一开始就锁 restick:流式 version 与 visualViewport 不能在
-  //     onScroll 之前把视口写回底部,否则上滑会被下一帧拉回去。
+  // autoscroll: controller 是 scrollTop 的唯一写入方。正确性来自 check-before-write,
+  // 输入 mark 只立刻挂起写入以降低抖动,没有 400ms 手势寿命。
   const stick = useRef(createStickToBottomController()).current;
-  const stickToBottomRef = stick.canRestick;
-  const userScrollReleaseTimerRef = useRef<number | null>(null);
-  const scheduleUserScrollRelease = useCallback(() => {
-    if (userScrollReleaseTimerRef.current !== null) {
-      window.clearTimeout(userScrollReleaseTimerRef.current);
-    }
-    userScrollReleaseTimerRef.current = window.setTimeout(() => {
-      userScrollReleaseTimerRef.current = null;
-      stick.releaseUserIntent();
-    }, 400);
-  }, [stick]);
+  const stickToBottomRef = useMemo(() => ({
+    get current() {
+      return stick.following.current;
+    },
+    set current(value: boolean) {
+      stick.following.current = value;
+    },
+    scrollToBottom: stick.scrollToBottom,
+    correctTo: stick.correctTo,
+  }), [stick]);
   const scrollToChatBottom = useCallback(() => {
     const el = scrollRef.current;
     if (el) stick.scrollToBottom(el);
@@ -2122,18 +2113,14 @@ export function App() {
   const markUserChatScroll = useCallback(() => {
     stick.markUserIntent();
     cancelArchiveCorrection();
-    scheduleUserScrollRelease();
-  }, [stick, cancelArchiveCorrection, scheduleUserScrollRelease]);
-  useEffect(() => () => {
-    if (userScrollReleaseTimerRef.current !== null) {
-      window.clearTimeout(userScrollReleaseTimerRef.current);
-    }
-  }, []);
+  }, [stick, cancelArchiveCorrection]);
+  const releaseUserChatScroll = useCallback(() => {
+    stick.releaseUserIntent();
+  }, [stick]);
   const onChatScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     stick.onScroll(el);
-    if (stick.gesture.current) scheduleUserScrollRelease();
     const anchor = archiveScrollAnchorRef.current;
     if (
       anchor && !anchor.cancelled && !anchor.restoring &&
@@ -2142,7 +2129,7 @@ export function App() {
       // 用户已经离开点击位置：响应仍须等 DOM 提交后释放 FIFO，但不再把视口拉回旧坐标。
       anchor.cancelled = true;
     }
-  }, [settleArchiveAnchor, scheduleUserScrollRelease, stick]);
+  }, [settleArchiveAnchor, stick]);
   // 切会话:重置粘滞并瞬时跳底(历史回看从底部开始);同时清归档按钮子态与视口锚点。
   useLayoutEffect(() => {
     stick.reset();
@@ -2246,8 +2233,10 @@ export function App() {
         return !current || current.token !== anchor.token || current.cancelled ||
           current.timelineGeneration !== sockRef.current?.getSession(activeId)?._timelineGeneration;
       },
+      undefined,
+      stick.correctTo,
     ).finally(() => settleArchiveAnchor(anchor.token));
-  }, [archiveLoading, chat.version, settleArchiveAnchor]);
+  }, [archiveLoading, chat.version, settleArchiveAnchor, stick]);
 
   // iOS Safari 的地址栏/底栏/截图/输入键盘会触发 visualViewport 高度与 offset 抖动。
   // CSS dvh 仍可能短暂大于真实可视区；键盘弹起时 Safari 还会 pan visual viewport,
@@ -2772,7 +2761,9 @@ export function App() {
           onWheel={markUserChatScroll}
           onTouchStart={markUserChatScroll}
           onTouchMove={markUserChatScroll}
+          onTouchEnd={releaseUserChatScroll}
           onPointerDown={markUserChatScroll}
+          onPointerUp={releaseUserChatScroll}
           onKeyDown={markUserChatScroll}
           className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
         >
