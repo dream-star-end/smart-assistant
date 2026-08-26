@@ -2103,16 +2103,19 @@ setInterval(() => {}, 1000);
     )
   })
 
-  test('present_options injects an options fence and hides the tool card', async () => {
+  test('present_options injects at most four options fences and never persists a tool card', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-present-'))
     const fake = path.join(dir, 'fake.cjs')
     await writeFile(
       fake,
       `#!/usr/bin/env node
+const optionCalls=Array.from({length:5},(_,i)=>[
+  {type:'tool_call',subtype:'started',call_id:'po-'+i,tool_call:{mcpToolCall:{args:{name:'openclaude-memory-present_options',args:{question:'问题 '+i,options:[{label:'现在换'},{label:'先不换'}]},toolName:'present_options',serverIdentifier:'openclaude-memory'}}}},
+  {type:'tool_call',subtype:'completed',call_id:'po-'+i,tool_call:{mcpToolCall:{args:{name:'openclaude-memory-present_options',args:{question:'问题 '+i,options:[{label:'现在换'},{label:'先不换'}]},toolName:'present_options',serverIdentifier:'openclaude-memory'},result:{success:{content:[{text:{text:'选项卡已投递'}}],isError:false}}}}},
+]).flat()
 for(const e of [
   {type:'text',text:'请选：'},
-  {type:'tool_call',subtype:'started',call_id:'po-1',tool_call:{mcpToolCall:{args:{name:'openclaude-memory-present_options',args:{question:'要不要换 baseline？',options:[{label:'现在换'},{label:'先不换'}]},toolName:'present_options',serverIdentifier:'openclaude-memory'}}}},
-  {type:'tool_call',subtype:'completed',call_id:'po-1',tool_call:{mcpToolCall:{args:{name:'openclaude-memory-present_options',args:{question:'要不要换 baseline？',options:[{label:'现在换'},{label:'先不换'}]},toolName:'present_options',serverIdentifier:'openclaude-memory'},result:{success:{content:[{text:{text:'选项卡已投递'}}],isError:false}}}}},
+  ...optionCalls,
   {type:'result',subtype:'success',is_error:false},
 ]) console.log(JSON.stringify(e))
 `,
@@ -2135,7 +2138,9 @@ for(const e of [
       const summary = await run.summary
       await adapter.waitForOutputDrain()
       assert.match(summary?.assistantText ?? '', /```options/)
-      assert.match(summary?.assistantText ?? '', /要不要换 baseline？/)
+      assert.equal((summary?.assistantText.match(/```options/g) ?? []).length, 4)
+      assert.match(summary?.assistantText ?? '', /问题 3/)
+      assert.doesNotMatch(summary?.assistantText ?? '', /问题 4/)
       assert.equal(
         events.some((event) => event.kind === 'block' && event.block.kind === 'tool_use'),
         false,
@@ -2146,7 +2151,7 @@ for(const e of [
         false,
         'present_options must not emit a visible tool_result card',
       )
-      assert.equal(summary?.tools[0]?.toolName, 'PresentOptions')
+      assert.deepEqual(summary?.tools, [])
     } finally {
       restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
       await rm(dir, { recursive: true, force: true })
