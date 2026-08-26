@@ -5831,8 +5831,9 @@ build_platform_bundle() {
 # 内容短路——那些仍要先 archive+staging。这里在 archive 前用输入面证据决定能否整段跳过。
 # 取证失败(读不到 image id / 旧 digest 缺失 / 抽样校验失败)一律全量构建。
 # 禁止手写包白名单:覆盖「经 runtime-src-excludes.txt 同一套 rsync 规则裁剪后会进 runtime 的全部 git 输入」。
+# metadata 只哈希 runtime MANIFEST 实际消费的字段;host 面 requiredMigrations 等不得打爆 digest。
 RUNTIME_SRC_EXCLUDES_PATH="packages/commercial/agent-sandbox/runtime-src-excludes.txt"
-RUNTIME_INPUT_DIGEST_ALG="v2-rsync-excludes"
+RUNTIME_INPUT_DIGEST_ALG="v3-rsync-excludes"
 RUNTIME_RSYNC_EXCLUDE_PATTERNS=()
 
 load_runtime_rsync_exclude_patterns() { # <full-sha>
@@ -5913,13 +5914,32 @@ sys.stdout.write("\n".join(rows) + "\n")
 PY
 }
 
+# runtime MANIFEST 实际消费的 metadata 字段。host 面 requiredMigrations/capabilities
+# 变更不得打爆 runtime digest(2026-08-27:0246/0247 只加 migration 却 miss)。
+runtime_release_metadata_hash() { # <full-sha>
+  local sha="$1" raw digest
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  raw="$(git -C "$REPO_ROOT" show "${sha}:deploy/v5/release-metadata.json")" || return 1
+  digest="$(printf '%s\n' "$raw" | jq -erS '
+    if ((.runtimeCapabilities | type) != "array") then error("runtimeCapabilities must be an array")
+    elif ((.runtimeCapabilities | length) == 0) then error("runtimeCapabilities must not be empty")
+    elif any(.runtimeCapabilities[]; type != "string") then error("runtimeCapabilities must contain only strings")
+    elif ((.runtimeApi | type) != "string") or (.runtimeApi == "") then error("runtimeApi must be a non-empty string")
+    elif ((.bridgeFrameSchema | type) != "string") or (.bridgeFrameSchema == "") then error("bridgeFrameSchema must be a non-empty string")
+    else {runtimeCapabilities, runtimeApi, bridgeFrameSchema}
+    end
+  ' | sha256sum | awk '{print $1}')" || return 1
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
 compute_runtime_input_digest() { # <full-sha> <image-id>
   local sha="$1" image_id="$2" lib_hash excl_hash meta_hash tree_rows
   [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$image_id" ]] || return 1
   lib_hash="$(git -C "$REPO_ROOT" rev-parse "${sha}:scripts/v5-runtime-release-lib.sh")" || return 1
   excl_hash="$(git -C "$REPO_ROOT" rev-parse "${sha}:${RUNTIME_SRC_EXCLUDES_PATH}")" || return 1
-  meta_hash="$(git -C "$REPO_ROOT" rev-parse "${sha}:deploy/v5/release-metadata.json")" || return 1
-  [[ "$lib_hash" =~ ^[0-9a-f]{40}$ && "$excl_hash" =~ ^[0-9a-f]{40}$ && "$meta_hash" =~ ^[0-9a-f]{40}$ ]] || return 1
+  meta_hash="$(runtime_release_metadata_hash "$sha")" || return 1
+  [[ "$lib_hash" =~ ^[0-9a-f]{40}$ && "$excl_hash" =~ ^[0-9a-f]{40}$ && "$meta_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
   tree_rows="$(runtime_input_ls_tree "$sha")" || return 1
   [[ -n "$tree_rows" ]] || return 1
   printf 'alg:%s\nimage:%s\nlib:%s\nexcludes:%s\nmetadata:%s\n%s\n' \
