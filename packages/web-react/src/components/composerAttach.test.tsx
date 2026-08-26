@@ -334,3 +334,35 @@ describe("AttachChip（对话框上传图的「编辑」入口 —— 需求 §5
     expect(btn).toHaveAttribute("title", "当前模型不支持 Image 2 圈选修改，请切换到 GPT 模型");
   });
 });
+
+describe("附件 error 态不得静默发送", () => {
+  test("存在 error 状态附件时发送被禁用", async () => {
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:fail-probe"),
+    });
+    const onSend = vi.fn();
+    const onUpload = vi.fn(async () => {
+      throw new Error("container not ready");
+    });
+    render(<Composer onSend={onSend} onUpload={onUpload} />);
+    const file = new File(["png"], "fail-probe.png", { type: "image/png" });
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        items: [{ kind: "file", type: file.type, getAsFile: () => file }],
+        files: [file],
+      },
+    });
+    fireEvent(screen.getByPlaceholderText("给从简发消息…"), event);
+
+    await waitFor(() => expect(screen.getByLabelText("重试上传 fail-probe.png")).toBeInTheDocument());
+    fireEvent.change(screen.getByPlaceholderText("给从简发消息…"), { target: { value: "带附件发送" } });
+    const send = screen.getByRole("button", { name: "发送" });
+    expect(send).toBeDisabled();
+    expect(send).toHaveAttribute("title", "有附件上传失败，请重试或移除后再发送");
+    fireEvent.click(send);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("重试上传 fail-probe.png")).toBeInTheDocument();
+  });
+});
