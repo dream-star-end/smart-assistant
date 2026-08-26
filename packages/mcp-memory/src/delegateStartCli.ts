@@ -1,6 +1,6 @@
 /**
  * `oc-memory delegate` / `request-review` — start an async gateway job then
- * block on the same wait loop as `delegate-wait`. Identity/depth come from the
+ * use the same bounded foreground wait loop as `delegate-wait`. Identity/depth come from the
  * signed context file (gateway-issued), never from Shell env or CLI flags.
  */
 import { readFileSync } from 'node:fs'
@@ -96,6 +96,7 @@ export async function runDelegateStartAndWait(opts: {
   start: DelegateStartOnce
   waitOnce: DelegateWaitOnce
   pollWaitMs: number
+  foregroundBudgetMs?: number
 }): Promise<DelegateWaitLoopResult> {
   const started = await opts.start(
     opts.args.agentId,
@@ -110,6 +111,7 @@ export async function runDelegateStartAndWait(opts: {
     jobIds: [start.jobId],
     waitOnce: opts.waitOnce,
     pollWaitMs: opts.pollWaitMs,
+    foregroundBudgetMs: opts.foregroundBudgetMs,
   })
 }
 
