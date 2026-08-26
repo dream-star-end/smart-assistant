@@ -2085,7 +2085,10 @@ setInterval(() => {}, 1000);
       options: [{ label: '现在换' }, { label: '先不换' }],
     })
     assert.ok(_internals.OPENCLAUDE_MEMORY_MCP_TOOLS.includes('present_options'))
-    assert.equal(_internals.OPENCLAUDE_MEMORY_MCP_TOOLS.includes('ask_user'), false)
+    assert.equal(
+      (_internals.OPENCLAUDE_MEMORY_MCP_TOOLS as readonly string[]).includes('ask_user'),
+      false,
+    )
 
     // preamble 优先 present_options,围栏仅作 fallback,且不再引导 ask_user。
     assert.ok(

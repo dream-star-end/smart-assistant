@@ -42,10 +42,11 @@ function makeAdapter(): { adapter: CcbAdapter; runner: FakeCcbRunner } {
 }
 
 function beginTurn(adapter: CcbAdapter, events: EngineEvent[], overrides: Partial<TurnParams> = {}) {
+  const sessionTotals = { totalCostUSD: 0, turns: 0, _lastCcbCumulativeCost: 0 }
   return adapter.submitTurn({
     input: 'hello',
     onEvent: (e) => events.push(e),
-    sessionTotals: { totalCostUSD: 0, turns: 0, _lastCcbCumulativeCost: 0 },
+    sessionTotals,
     toolUseIdToName: new Map(),
     ...overrides,
   })
@@ -107,9 +108,10 @@ describe('CcbAdapter task_notification routing', () => {
     runner.msg(taskNote({ task_id: 'agt-late' }))
     const notes = events.filter((e) => e.kind === 'task_notification')
     assert.equal(notes.length, before + 1)
-    assert.equal(notes.at(-1)?.kind, 'task_notification')
-    if (notes.at(-1)?.kind === 'task_notification') {
-      assert.equal(notes.at(-1).taskId, 'agt-late')
+    const last = notes.at(-1)
+    assert.equal(last?.kind, 'task_notification')
+    if (last?.kind === 'task_notification') {
+      assert.equal(last.taskId, 'agt-late')
     }
     assert.equal(
       events.filter((e) => e.kind === 'block' && (e.block as { kind?: string }).kind !== 'text').length,

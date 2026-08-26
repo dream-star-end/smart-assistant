@@ -196,6 +196,7 @@ export interface CreateAccountInput {
   expires_at?: Date | null;
   oauth_principal_type?: string | null;
   oauth_principal_id?: string | null;
+  cursor_sand_enabled?: boolean;
   /**
    * 0064 — 订阅到期日(可选)。undefined / null = 不设置(列保持 NULL)。
    * 解析由 admin layer 完成,store 层只透传 Date | null。
