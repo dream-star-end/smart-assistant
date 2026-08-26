@@ -83,9 +83,13 @@ export function captureVisibleVirtualRowAnchor(
 
 /** Re-align one exact immutable virtual row. Returns false while Virtuoso has
  * not mounted/measured that row yet, allowing the caller to retry next frame. */
+/** The chat stick-to-bottom controller is the only programmatic writer. */
+export type ScrollTopWriter = (scroller: HTMLElement, nextTop: number) => void;
+
 export function correctToVisibleVirtualRowAnchor(
   scroller: HTMLElement,
   anchor: VisibleVirtualRowAnchor,
+  writeTop: ScrollTopWriter,
 ): boolean {
   const row = Array.from(
     scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
@@ -98,13 +102,13 @@ export function correctToVisibleVirtualRowAnchor(
     // correction, so concurrent bottom growth cannot permanently skew it.
     const heightDelta = scroller.scrollHeight - anchor.scrollHeight;
     if (Math.abs(heightDelta) > 0.5) {
-      scroller.scrollTop = anchor.scrollTop + heightDelta;
+      writeTop(scroller, anchor.scrollTop + heightDelta);
     }
     return false;
   }
   const currentTop = row.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
   const delta = currentTop - anchor.top;
-  if (Math.abs(delta) > 0.5) scroller.scrollTop += delta;
+  if (Math.abs(delta) > 0.5) writeTop(scroller, scroller.scrollTop + delta);
   return true;
 }
 
@@ -121,6 +125,7 @@ export function restoreVisibleVirtualRowAnchor(
     if (typeof requestAnimationFrame === "function") requestAnimationFrame(callback);
     else callback();
   },
+  writeTop: ScrollTopWriter,
 ): Promise<void> {
   return new Promise((resolve) => {
     // Disable content-visibility estimates during exact prepend correction. A
@@ -175,7 +180,7 @@ export function restoreVisibleVirtualRowAnchor(
         lastBeforeTop = null;
         beforeTopStableFrames = 0;
         stableFrames = 0;
-        correctToVisibleVirtualRowAnchor(scroller, anchor);
+        correctToVisibleVirtualRowAnchor(scroller, anchor, writeTop);
         schedule(correct);
         return;
       }
@@ -198,7 +203,7 @@ export function restoreVisibleVirtualRowAnchor(
       }
 
       const beforeAligned = Math.abs(beforeTop - anchor.top) <= 0.5;
-      const found = correctToVisibleVirtualRowAnchor(scroller, anchor);
+      const found = correctToVisibleVirtualRowAnchor(scroller, anchor, writeTop);
       if (!beforeAligned) {
         lastBeforeTop = null;
         beforeTopStableFrames = 0;

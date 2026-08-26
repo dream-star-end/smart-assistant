@@ -1,149 +1,148 @@
 /** Near-bottom sticky follow for the ordinary-DOM transcript scroller. */
 
 export const STICK_TO_BOTTOM_PX = 80;
+const WRITE_TOLERANCE_PX = 1;
 
-function distanceFromBottom(
-  el: { scrollHeight: number; scrollTop: number; clientHeight: number },
-): number {
+export type StickScroller = {
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+};
+
+function distanceFromBottom(el: StickScroller): number {
   return el.scrollHeight - el.scrollTop - el.clientHeight;
 }
 
-export function isNearBottom(
-  el: { scrollHeight: number; scrollTop: number; clientHeight: number },
-  px: number = STICK_TO_BOTTOM_PX,
-): boolean {
+function maxScrollTop(el: StickScroller): number {
+  return Math.max(0, el.scrollHeight - el.clientHeight);
+}
+
+export function isNearBottom(el: StickScroller, px: number = STICK_TO_BOTTOM_PX): boolean {
   return distanceFromBottom(el) < px;
 }
 
 /**
- * Intent-based stick-to-bottom.
+ * Single-writer stick-to-bottom.
  *
- * Content-height growth (cards finishing layout, streaming markdown) must not
- * look like the user scrolled away. Wheel / touch / pointer / keyboard
- * navigation updates `following`. Unmarked scrollbar drags are inferred from
- * a real upward viewport move. Programmatic snaps ignore the next scroll
- * event so they cannot clear or set intent.
+ * The controller is the only programmatic writer of `scrollTop`. Correctness
+ * comes from check-before-write against the last value we wrote (clamped when
+ * `scrollHeight` shrinks). Wheel/touch marks only suspend writes to hide jitter;
+ * they are not the leave/re-follow source, and there is no gesture timer.
  *
- * Restick and tail-window pinning must use `canRestick`, not `following`.
- * A live gesture sets `canRestick=false` immediately so ResizeObserver /
- * version effects cannot write the user back to the bottom before `onScroll`.
- * Inertial scroll after the first event still uses `gestureOriginGap` while
- * `gesture` is true, even after `userIntent` was consumed.
+ * Re-follow only when a scroll event shows `scrollTop` increased relative to the
+ * last observation and the viewport is within 80px of the bottom. A shrink-clamp
+ * that lands near the bottom is not re-follow.
  */
 export function createStickToBottomController() {
   const following = { current: true };
-  const programmatic = { current: false };
-  const userIntent = { current: false };
-  const gesture = { current: false };
-  // Absolute scrollTop can rise while the user scrolls upward if a streaming
-  // card grows at the same time. Bottom-relative distance preserves the real
-  // direction across those layout changes.
-  const lastDistanceFromBottom = { current: null as number | null };
-  const lastScrollTop = { current: null as number | null };
-  // Per-event `lastGap + 1` would swallow 8 consecutive 1px moves. Leave
-  // detection is relative to the gap at the start of this gesture.
-  const gestureOriginGap = { current: null as number | null };
+  const writeSuspended = { current: false };
+  const lastWrittenTop = { current: null as number | null };
+  const lastObservedTop = { current: null as number | null };
+
+  const expectedWrittenTop = (el: StickScroller): number | null => {
+    if (lastWrittenTop.current === null) return null;
+    return Math.min(lastWrittenTop.current, maxScrollTop(el));
+  };
+
+  const recordWrite = (el: StickScroller) => {
+    lastWrittenTop.current = el.scrollTop;
+    lastObservedTop.current = el.scrollTop;
+  };
+
+  const userMovedAboveWrite = (el: StickScroller): boolean => {
+    const expected = expectedWrittenTop(el);
+    if (expected === null) return false;
+    return el.scrollTop < expected - WRITE_TOLERANCE_PX;
+  };
 
   const reset = () => {
     following.current = true;
-    programmatic.current = false;
-    userIntent.current = false;
-    gesture.current = false;
-    lastDistanceFromBottom.current = null;
-    lastScrollTop.current = null;
-    gestureOriginGap.current = null;
+    writeSuspended.current = false;
+    lastWrittenTop.current = null;
+    lastObservedTop.current = null;
   };
 
   const markUserIntent = () => {
-    userIntent.current = true;
-    gesture.current = true;
-    if (gestureOriginGap.current === null) {
-      gestureOriginGap.current = lastDistanceFromBottom.current;
-    }
+    writeSuspended.current = true;
   };
 
   const releaseUserIntent = () => {
-    gesture.current = false;
-    gestureOriginGap.current = null;
+    writeSuspended.current = false;
   };
 
-  const leaveFollowing = () => {
-    following.current = false;
-    programmatic.current = false;
-    userIntent.current = false;
-  };
-
-  const scrollToBottom = (
-    el: { scrollTop: number; scrollHeight: number; clientHeight: number },
-  ) => {
-    if (!following.current || gesture.current) return;
-    programmatic.current = true;
-    el.scrollTop = el.scrollHeight;
-    lastDistanceFromBottom.current = distanceFromBottom(el);
-    lastScrollTop.current = el.scrollTop;
-  };
-
-  const onScroll = (el: { scrollHeight: number; scrollTop: number; clientHeight: number }) => {
-    const previousDistance = lastDistanceFromBottom.current;
-    const previousTop = lastScrollTop.current;
-    const currentDistance = distanceFromBottom(el);
-    lastDistanceFromBottom.current = currentDistance;
-    lastScrollTop.current = el.scrollTop;
-    if (gesture.current && gestureOriginGap.current === null) {
-      gestureOriginGap.current = previousDistance ?? currentDistance;
+  const scrollToBottom = (el: StickScroller) => {
+    if (!following.current || writeSuspended.current) return;
+    if (userMovedAboveWrite(el)) {
+      following.current = false;
+      return;
     }
-    const leaveBaseline = gestureOriginGap.current ?? previousDistance;
-    // Gesture (including inertia after userIntent was consumed) and the
-    // originating input both leave relative to the gesture-start gap.
+    el.scrollTop = maxScrollTop(el);
+    recordWrite(el);
+  };
+
+  const correctTo = (el: StickScroller, nextTop: number) => {
+    el.scrollTop = nextTop;
+    recordWrite(el);
+  };
+
+  const onScroll = (el: StickScroller) => {
+    writeSuspended.current = false;
+    const current = el.scrollTop;
+    const maxTop = maxScrollTop(el);
+    const prevObserved = lastObservedTop.current;
+    const expected = expectedWrittenTop(el);
+
+    // Browser clamped our last position after scrollHeight shrank. That is not
+    // a user leave, and landing near the new bottom is not a re-follow.
     if (
-      (userIntent.current || gesture.current) &&
-      leaveBaseline !== null &&
-      currentDistance > leaveBaseline + 1
+      prevObserved !== null &&
+      maxTop < prevObserved - WRITE_TOLERANCE_PX &&
+      Math.abs(current - maxTop) <= WRITE_TOLERANCE_PX
     ) {
-      leaveFollowing();
-      return;
-    }
-    if (programmatic.current) {
-      programmatic.current = false;
-      userIntent.current = false;
-      return;
-    }
-    if (!userIntent.current) {
-      // Scrollbar / other unmarked input: a real upward viewport move, not
-      // content-height growth under a stable scrollTop.
-      if (
-        !gesture.current &&
-        previousDistance !== null &&
-        previousTop !== null &&
-        currentDistance > previousDistance + 1 &&
-        el.scrollTop < previousTop - 1
-      ) {
-        leaveFollowing();
+      lastObservedTop.current = current;
+      if (lastWrittenTop.current !== null) {
+        lastWrittenTop.current = Math.min(lastWrittenTop.current, current);
       }
       return;
     }
-    userIntent.current = false;
-    following.current = isNearBottom(el);
+
+    if (expected !== null && current < expected - WRITE_TOLERANCE_PX) {
+      following.current = false;
+    } else if (prevObserved !== null && current < prevObserved - WRITE_TOLERANCE_PX) {
+      following.current = false;
+    } else if (
+      prevObserved !== null &&
+      current > prevObserved + WRITE_TOLERANCE_PX &&
+      isNearBottom(el)
+    ) {
+      following.current = true;
+    } else if (expected === null && prevObserved === null && !isNearBottom(el)) {
+      following.current = false;
+    }
+
+    lastObservedTop.current = current;
   };
 
   const canRestick = {
     get current() {
-      return following.current && !gesture.current;
+      return following.current && !writeSuspended.current;
     },
     set current(value: boolean) {
       following.current = value;
     },
     scrollToBottom,
+    correctTo,
   };
 
   return {
     following,
     canRestick,
-    gesture,
+    gesture: writeSuspended,
     reset,
     markUserIntent,
     releaseUserIntent,
     scrollToBottom,
+    correctTo,
     onScroll,
   };
 }

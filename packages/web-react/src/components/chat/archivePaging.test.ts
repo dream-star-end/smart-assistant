@@ -9,6 +9,10 @@ import {
   restoreVisibleVirtualRowAnchor,
 } from "./archivePaging";
 
+function writeTop(el: HTMLElement, top: number) {
+  el.scrollTop = top;
+}
+
 function row(seq?: number): Pick<ChatMessage, "_seq"> {
   return seq === undefined ? {} : { _seq: seq };
 }
@@ -88,7 +92,7 @@ describe("visible virtual row anchor", () => {
     });
     // 顶部归档新增 200px；同时底部 live answer 可增长任意高度，但稳定行只下移 200px。
     rowTop = 320;
-    expect(correctToVisibleVirtualRowAnchor(scroller, anchor)).toBe(true);
+    expect(correctToVisibleVirtualRowAnchor(scroller, anchor, writeTop)).toBe(true);
     expect(scroller.scrollTop).toBe(300);
   });
 
@@ -119,6 +123,7 @@ describe("visible virtual row anchor", () => {
       },
       () => cancelled,
       (callback) => frames.push(callback),
+      writeTop,
     );
 
     frames.shift()!();
@@ -144,7 +149,7 @@ describe("visible virtual row anchor", () => {
       scrollTop: 80,
       scrollHeight: 1000,
       dataIndex: null,
-    })).toBe(false);
+    }, writeTop)).toBe(false);
     expect(scroller.scrollTop).toBe(1680);
   });
 
@@ -176,6 +181,7 @@ describe("visible virtual row anchor", () => {
       anchor,
       () => false,
       (callback) => frames.push(callback),
+      writeTop,
     ).then(() => { resolved = true; });
 
     for (let frame = 0; frame < 20; frame += 1) {
@@ -229,6 +235,7 @@ describe("visible virtual row anchor", () => {
       anchor,
       () => false,
       (callback) => frames.push(callback),
+      writeTop,
     ).then(() => { resolved = true; });
 
     for (let frame = 0; frame < 20; frame += 1) {
@@ -276,6 +283,7 @@ describe("visible virtual row anchor", () => {
       anchor,
       () => false,
       (callback) => frames.push(callback),
+      writeTop,
     ).then(() => { resolved = true; });
 
     for (const offset of [10, 20, 30]) {
@@ -332,6 +340,7 @@ describe("visible virtual row anchor", () => {
       anchor,
       () => currentGeneration !== capturedGeneration,
       (callback) => frames.push(callback),
+      writeTop,
     ).then(() => { resolved = true; });
 
     rowElement.remove();
@@ -378,6 +387,7 @@ describe("visible virtual row anchor", () => {
       anchor,
       () => false,
       (callback) => frames.push(callback),
+      writeTop,
     ).then(() => { resolved = true; });
 
     for (let frame = 0; frame < 20; frame += 1) {

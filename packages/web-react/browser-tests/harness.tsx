@@ -874,7 +874,9 @@ function ScrollTimelineProbe() {
     const pending = pendingRestoreRef.current;
     if (!pending || !scroller) return;
     pendingRestoreRef.current = null;
-    void restoreVisibleVirtualRowAnchor(scroller, pending.anchor, () => false)
+    void restoreVisibleVirtualRowAnchor(scroller, pending.anchor, () => false, undefined, (node, top) => {
+      node.scrollTop = top;
+    })
       .finally(pending.resolve);
   }, [messages, scroller]);
   const loadOlder = useCallback(async () => {
@@ -971,7 +973,9 @@ function ArchiveTimelineProbe() {
     const pending = pendingRestoreRef.current;
     if (!pending || !scroller) return;
     pendingRestoreRef.current = null;
-    void restoreVisibleVirtualRowAnchor(scroller, pending.anchor, () => false)
+    void restoreVisibleVirtualRowAnchor(scroller, pending.anchor, () => false, undefined, (node, top) => {
+      node.scrollTop = top;
+    })
       .finally(pending.resolve);
   }, [messages, scroller]);
   const loadOlder = useCallback(async () => {

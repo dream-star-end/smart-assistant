@@ -5,6 +5,7 @@ import type { ChatMessage } from "../lib/chat/model";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS } from "./MessageRenderer";
+import { createStickToBottomController } from "./chat/stickToBottom";
 import { resetPermissionAutoOpenMemory, type PermissionRespond } from "./chat/PermissionCard";
 import { ResponseRatingProvider } from "./chat/ResponseRating";
 import type { CardCallbacks } from "./chat/cards";
@@ -2170,7 +2171,8 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
       disconnect() {}
       unobserve() {}
     });
-    const followBottomRef = { current: true };
+    const stick = createStickToBottomController();
+    const followBottomRef = stick.canRestick;
     const scroller = document.createElement("div");
     document.body.appendChild(scroller);
     Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 200 });
@@ -2197,7 +2199,7 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
       for (const cb of observers) cb([] as unknown as ResizeObserverEntry[], {} as ResizeObserver);
     });
     expect(followBottomRef.current).toBe(true);
-    expect(scroller.scrollTop).toBe(900);
+    expect(scroller.scrollTop).toBe(700);
     vi.unstubAllGlobals();
     scroller.remove();
   });
@@ -2212,7 +2214,8 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
       disconnect() {}
       unobserve() {}
     });
-    const followBottomRef = { current: true };
+    const stick = createStickToBottomController();
+    const followBottomRef = stick.canRestick;
     const scroller = document.createElement("div");
     document.body.appendChild(scroller);
     Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 200 });
@@ -2254,7 +2257,8 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
       disconnect() {}
       unobserve() {}
     });
-    const followBottomRef = { current: true };
+    const stick = createStickToBottomController();
+    const followBottomRef = stick.canRestick;
     const scroller = document.createElement("div");
     document.body.appendChild(scroller);
     Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 200 });
