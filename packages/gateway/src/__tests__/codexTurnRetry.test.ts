@@ -288,7 +288,10 @@ describe('runTurn — 重试门(fail-closed)', () => {
     }
     await h.r.runTurn('hi', 'req-pui')
     assert.equal(turnStarts, 1, 'pending reverse-request blocks the narrow-path retry')
-    assert.equal(statusFrames(h.messages).length, 0)
+    assert.ok(
+      statusFrames(h.messages).every((frame) => frame.status !== 'retrying'),
+      'settling the pending browser question may clear waiting state, but must not expose retrying',
+    )
     await h.cleanup()
   })
 

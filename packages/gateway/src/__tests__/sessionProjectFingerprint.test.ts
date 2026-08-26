@@ -64,7 +64,7 @@ describe('session project fingerprint rebuild', () => {
     }
   })
 
-  test('projectId A→B→null recycles runner; unchanged fingerprint reuses CCB and Codex', async () => {
+  test('projectId A→B→null recycles runner; context edits and unchanged fingerprints reuse runners', async () => {
     const sm = makeSm()
     await writeProjectInstructions(A, 'a-ins', 0)
     await writeProjectInstructions(B, 'b-ins', 0)
@@ -124,7 +124,7 @@ describe('session project fingerprint rebuild', () => {
       peerId: 'fp-peer',
       projectId: A,
     })
-    assert.notEqual(afterEdit.runner, beforeEdit)
+    assert.equal(afterEdit.runner, beforeEdit)
 
     const codexKey = 'agent:main:webchat:dm:fp-codex'
     const firstCodex = await sm.getOrCreate({

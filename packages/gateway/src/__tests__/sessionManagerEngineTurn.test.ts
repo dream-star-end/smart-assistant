@@ -29,6 +29,7 @@ import {
 import type { OpenClaudeConfig } from "@openclaude/storage";
 import type { ToolCalledEvent, TurnCompletedEvent } from "@openclaude/protocol";
 import { eventBus } from "../eventBus.js";
+import { EMPTY_COMPLETED_TURN_NOTICE } from "../emptyCompletedTurn.js";
 
 function collectTurnCompleted(): { events: TurnCompletedEvent[]; stop: () => void } {
   const events: TurnCompletedEvent[] = [];
@@ -2383,7 +2384,7 @@ describe("crash/interrupt partial persistence", () => {
 
       assert.equal(captured.payloads.length, 1);
       assert.equal(captured.payloads[0].status, "completed");
-      assert.equal(captured.payloads[0].text, "");
+      assert.equal(captured.payloads[0].text, EMPTY_COMPLETED_TURN_NOTICE);
       assert.deepEqual(
         captured.payloads[0].structuredBlocks?.map((block) => block.kind),
         ["plan", "plan", "goal"],
@@ -2428,7 +2429,7 @@ describe("crash/interrupt partial persistence", () => {
       assert.equal(captured.payloads.length, 1);
       const payload = captured.payloads[0]!;
       assert.equal(payload.status, "completed");
-      assert.equal(payload.text, "");
+      assert.equal(payload.text, EMPTY_COMPLETED_TURN_NOTICE);
       assert.equal(
         payload.errorDetail,
         JSON.stringify({
