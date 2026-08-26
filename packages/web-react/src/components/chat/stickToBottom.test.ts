@@ -129,4 +129,47 @@ describe("stickToBottom", () => {
     expect(stick.following.current).toBe(true);
     expect(stick.canRestick.current).toBe(true);
   });
+
+  test("惯性滚动在 userIntent 被消费后仍按手势起点累计离底", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+    const bottom = el.scrollTop;
+
+    const startGap = el.scrollHeight - bottom - el.clientHeight;
+    stick.markUserIntent();
+    el.scrollTop = bottom - 1;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(true);
+    expect(stick.gesture.current).toBe(true);
+
+    for (let step = 2; step <= 9; step += 1) {
+      el.scrollTop = bottom - step;
+      stick.onScroll(el);
+    }
+    expect(el.scrollHeight - el.scrollTop - el.clientHeight).toBe(startGap + 9);
+    expect(stick.following.current).toBe(false);
+
+    stick.releaseUserIntent();
+    expect(stick.canRestick.current).toBe(false);
+
+    const pinnedTop = el.scrollTop;
+    el.scrollHeight = 1300;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(pinnedTop);
+  });
+
+  test("无 mark 的滚动条离底解除跟随", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.onScroll(el);
+    expect(el.scrollHeight - el.scrollTop - el.clientHeight).toBe(0);
+    expect(stick.following.current).toBe(true);
+
+    el.scrollTop = 870;
+    stick.onScroll(el);
+    expect(el.scrollHeight - el.scrollTop - el.clientHeight).toBe(50);
+    expect(stick.following.current).toBe(false);
+  });
 });

@@ -976,7 +976,10 @@ export function MessageList({
    * this false and holds a preserve lock so ResizeObserver cannot yank to
    * bottom while correctedScrollTop runs.
    */
-  followBottomRef?: { current: boolean };
+  followBottomRef?: {
+    current: boolean;
+    scrollToBottom?: (el: { scrollTop: number; scrollHeight: number; clientHeight: number }) => void;
+  };
 }) {
   const pagingOwnerRef = useRef<{
     generation: string;
@@ -1342,6 +1345,10 @@ export function MessageList({
     const follow = () => {
       if (viewportPreserveLockRef.current) return;
       if (!followBottomRef.current) return;
+      if (typeof followBottomRef.scrollToBottom === "function") {
+        followBottomRef.scrollToBottom(scroller);
+        return;
+      }
       scroller.scrollTop = scroller.scrollHeight;
     };
     const observer = new ResizeObserver(follow);
