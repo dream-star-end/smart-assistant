@@ -23,7 +23,11 @@ import { spawnSync } from "node:child_process";
 const require = createRequire(import.meta.url);
 const esbuild = require("esbuild");
 
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const cwd = process.cwd();
+const repoRoot = existsSync(join(cwd, "packages/cli/src/index.ts"))
+  ? cwd
+  : resolve(scriptDir, "../../..");
 process.chdir(repoRoot);
 
 const SKIP = new Set(["web", "web-react", "desktop"]);

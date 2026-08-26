@@ -20,7 +20,7 @@
   ],
   "scripts": {
     "onboard": "tsx packages/cli/src/index.ts onboard",
-    "gateway": "bash scripts/run-container-gateway.sh",
+    "gateway": "bash packages/cli/scripts/run-container-gateway.sh",
     "doctor": "tsx packages/cli/src/index.ts doctor",
     "agents": "tsx packages/cli/src/index.ts agents",
     "lint": "biome check packages",

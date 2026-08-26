@@ -4,9 +4,12 @@
 # Fast path: node the finalize-precompiled dist (no tsx compile).
 # Fail-open: missing/corrupt dist → original `tsx packages/cli/src/index.ts gateway`.
 # Always logs which path was taken.
+#
+# Lives under packages/cli/scripts/ so runtime-src-excludes `/scripts/` (repo
+# root only) does not prune it out of the user-container rel.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT"
 
 ENTRY="$ROOT/packages/cli/dist/index.js"
@@ -17,7 +20,6 @@ log() { echo "[gateway] $*" >&2; }
 
 precompiled_ok() {
   [ -f "$MARKER" ] && [ -s "$ENTRY" ] || return 1
-  # Reject obviously truncated/garbage artifacts before exec.
   node --check "$ENTRY" >/dev/null 2>&1 || return 1
 }
 

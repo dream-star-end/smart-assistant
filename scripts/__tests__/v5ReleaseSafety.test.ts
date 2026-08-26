@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { chmod, cp, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
@@ -8668,5 +8669,93 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     const caps = invokeHelpers(`compute_runtime_input_digest '${capCommit}' '${image}'`)
     assert.equal(caps.status, 0, caps.stderr)
     assert.notEqual(base.stdout.trim(), caps.stdout.trim())
+  })
+})
+
+
+describe('v5 container gateway precompile survives runtime prune', () => {
+  const libPath = path.join(root, 'scripts/v5-runtime-release-lib.sh')
+  const excludesPath = path.join(root, 'packages/commercial/agent-sandbox/runtime-src-excludes.txt')
+
+  test('git archive + runtime-src-excludes keeps the package.json gateway wrapper and builder', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-gw-prune-'))
+    dirs.push(dir)
+    const raw = path.join(dir, 'raw')
+    const staging = path.join(dir, 'staging')
+    await mkdir(raw)
+    await mkdir(staging)
+
+    const index = path.join(dir, 'index')
+    const env = { ...process.env, GIT_INDEX_FILE: index }
+    const git = (args: string[]) => {
+      const r = spawnSync('git', args, { cwd: root, encoding: 'utf8', env })
+      assert.equal(r.status, 0, `git ${args.join(' ')} failed: ${r.stderr}`)
+      return r
+    }
+    git(['read-tree', 'HEAD'])
+    git(['add', '-u'])
+    git(['add', 'packages/cli/scripts'])
+    git(['checkout-index', '-a', '-f', `--prefix=${raw}/`])
+
+    const excl = path.join(raw, 'packages/commercial/agent-sandbox/runtime-src-excludes.txt')
+    assert.equal(existsSync(excl), true, 'archived tree missing runtime-src-excludes.txt')
+    const rsync = spawnSync('rsync', ['-a', `--exclude-from=${excl}`, `${raw}/`, `${staging}/`], {
+      encoding: 'utf8',
+    })
+    assert.equal(rsync.status, 0, rsync.stderr)
+
+    const pkg = JSON.parse(await readFile(path.join(staging, 'package.json'), 'utf8')) as {
+      scripts?: { gateway?: string }
+    }
+    const gateway = pkg.scripts?.gateway ?? ''
+    assert.match(gateway, /^bash\s+\S+/)
+    const wrapperRel = gateway.replace(/^bash\s+/, '').trim()
+    assert.ok(
+      !wrapperRel.startsWith('scripts/'),
+      `gateway wrapper ${wrapperRel} is under excluded /scripts/`,
+    )
+    assert.equal(
+      existsSync(path.join(staging, wrapperRel)),
+      true,
+      `pruned staging missing gateway wrapper ${wrapperRel}`,
+    )
+    assert.equal(
+      existsSync(path.join(staging, 'packages/cli/scripts/build-container-gateway.sh')),
+      true,
+      'pruned staging missing precompile builder',
+    )
+    assert.equal(
+      existsSync(path.join(staging, 'packages/cli/scripts/build-container-gateway.mjs')),
+      true,
+      'pruned staging missing precompile builder mjs',
+    )
+    assert.equal(
+      existsSync(path.join(staging, 'scripts/run-container-gateway.sh')),
+      false,
+      'root scripts/run-container-gateway.sh must stay excluded',
+    )
+    assert.equal(existsSync(path.join(staging, 'scripts')), false, 'root /scripts/ must be pruned')
+  })
+
+  test('finalize requires packages/cli/scripts builder and asserts dist marker (no silent skip)', async () => {
+    const lib = await readFile(libPath, 'utf8')
+    const start = lib.indexOf('oc_hotcfg_finalize_release() {')
+    assert.ok(start >= 0)
+    const body = lib.slice(start, lib.indexOf('\noc_hotcfg_env_get()', start))
+    assert.match(body, /packages\/cli\/scripts\/build-container-gateway\.sh/)
+    assert.match(body, /container gateway precompile script missing/)
+    assert.match(body, /packages\/cli\/dist\/\.precompiled-ok/)
+    assert.match(body, /oc_hotcfg__die "container gateway precompile failed"/)
+    assert.doesNotMatch(body, /if \[ -f "\$staging\/scripts\/build-container-gateway/)
+    assert.doesNotMatch(
+      body,
+      /if \[ -f "\$staging\/packages\/cli\/scripts\/build-container-gateway\.sh" \]; then/,
+    )
+    const excludes = await readFile(excludesPath, 'utf8')
+    assert.match(excludes, /^\/scripts\/$/m)
+    assert.doesNotMatch(excludes, /packages\/cli\/scripts/)
+    const wrapperSrc = await readFile(path.join(root, 'packages/cli/scripts/run-container-gateway.sh'), 'utf8')
+    // packages/cli/scripts → repo root is three hops; two hops would resolve under packages/.
+    assert.match(wrapperSrc, /BASH_SOURCE\[0\]\}"\)\/\.\.\/\.\.\/\.\./)
   })
 })
