@@ -8,6 +8,11 @@
 #      —— 排除清单单一权威 runtime-src-excludes.txt(体积/产物 + leak hardening)
 #   2. 把 Dockerfile + runtime/(薄壳)+ platform-runtime/(bundle 源,dev fallback)也搬过去
 #   3. docker build -t openclaude/openclaude-runtime:<tag>
+#      —— 内容摘要(Dockerfile + context path/sha256/mode + content-affecting
+#         build-arg)命中本地 label oc.build.input_digest 且 OC_BUILD_FORCE≠1 时
+#         跳过 docker build, docker tag 复用已有 image id(后续 tar/GC/summary 同成功路径)。
+#      —— 查找或摘要计算失败 fail-open,照常 docker build。
+#      —— --cache-from 本地最新 runtime 镜像 + BUILDKIT_INLINE_CACHE=1。
 #   4. docker save | pigz(无则 gzip)> /var/lib/openclaude-v3/images/openclaude-runtime-<tag>.tar.gz
 #      —— 该 tar 仅用于跨 host 分发/备份;单机池可 OC_BUILD_SKIP_TAR=1 跳过这步(省 ~55s)
 #   5. 打印 summary(tag / sha256 / size / load 提示),给 5A deploy-to-remote-v3.sh 抄
@@ -85,12 +90,20 @@ ZCODE_CLI_VERSION="${OC_ZCODE_CLI_VERSION:-0.16.3}"
 # The image tag is a deployment handle and may be chosen before the final source commit.
 # Bind the image to the exact staged source independently so activation can reject a stale
 # image even when the configured tag already exists locally.
+#
+# SOURCE_COMMIT must be a full 40-hex SHA. Commercial activation already deadlocks on
+# abbreviated sourceCommit; never accept `git rev-parse --short` here.
+# OC_EMBED_SOURCE=0 may fall back to the sentinel "toolchain" when no git/VERSION
+# identity exists (content is not embedded; runtime release digest is authoritative).
 SOURCE_COMMIT="${OC_RUNTIME_SOURCE_COMMIT:-}"
 if [ -z "$SOURCE_COMMIT" ] && [ -f "$PERSONAL_SRC/VERSION.json" ]; then
-  SOURCE_COMMIT="$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{7,40\}\)".*/\1/p' "$PERSONAL_SRC/VERSION.json" | head -1)"
+  SOURCE_COMMIT="$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' "$PERSONAL_SRC/VERSION.json" | head -1)"
 fi
 if [ -z "$SOURCE_COMMIT" ]; then
-  SOURCE_COMMIT="$(git -C "$PERSONAL_SRC" rev-parse --short HEAD 2>/dev/null || true)"
+  SOURCE_COMMIT="$(git -C "$PERSONAL_SRC" rev-parse HEAD 2>/dev/null || true)"
+fi
+if [ -z "$SOURCE_COMMIT" ]; then
+  SOURCE_COMMIT="$(git -C "$SANDBOX_DIR" rev-parse HEAD 2>/dev/null || true)"
 fi
 if [ -z "$SOURCE_COMMIT" ]; then
   if [ "$OC_EMBED_SOURCE_VAL" = "0" ]; then
@@ -100,6 +113,10 @@ if [ -z "$SOURCE_COMMIT" ]; then
     echo "[build-image] FATAL: 无法确定 runtime source commit" >&2
     exit 1
   fi
+fi
+if [ "$SOURCE_COMMIT" != "toolchain" ] && ! [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "[build-image] FATAL: SOURCE_COMMIT must be 40-hex (got '$SOURCE_COMMIT'). Short SHA deadlocks later activation." >&2
+  exit 1
 fi
 
 echo "[build-image] tag=$TAG"
@@ -400,6 +417,64 @@ CTX_BYTES="$(du -sb "$BUILD_CTX" | awk '{print $1}')"
 CTX_MB="$(( CTX_BYTES / 1024 / 1024 ))"
 echo "[build-image] build context ready: ${CTX_MB} MiB at $BUILD_CTX"
 
+# Content digest of Dockerfile + full build context (path+sha256+mode, no mtime)
+# + content-affecting build-args/env. Written as image label oc.build.input_digest.
+# Lookup/compute failure is fail-open: proceed with docker build.
+compute_input_digest() {
+  python3 - "$BUILD_CTX" <<'PY'
+import hashlib, os, stat, sys
+
+root = sys.argv[1]
+rows = []
+for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    dirnames.sort()
+    for name in sorted(filenames):
+        path = os.path.join(dirpath, name)
+        rel = os.path.relpath(path, root)
+        st = os.lstat(path)
+        mode = stat.S_IMODE(st.st_mode)
+        if stat.S_ISLNK(st.st_mode):
+            digest = "symlink->" + os.readlink(path)
+        elif stat.S_ISREG(st.st_mode):
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            digest = h.hexdigest()
+        else:
+            digest = "special"
+        rows.append("%s\t%03o\t%s" % (rel.replace("\\", "/"), mode, digest))
+rows.sort()
+sys.stdout.write("oc.build.input_digest.v1\n")
+sys.stdout.write("files %d\n" % len(rows))
+for row in rows:
+    sys.stdout.write(row + "\n")
+PY
+  # Append content-affecting build-arg/env values (stable key order).
+  # Labels like SOURCE_COMMIT are not layer content and are omitted.
+  printf '%s\n' \
+    "args" \
+    "OC_EMBED_SOURCE=${OC_EMBED_SOURCE:-1}" \
+    "OC_INCLUDE_CODEX=${OC_INCLUDE_CODEX:-1}" \
+    "OC_INCLUDE_CURSOR=${OC_INCLUDE_CURSOR:-0}" \
+    "OC_INCLUDE_GROK=${OC_INCLUDE_GROK:-0}" \
+    "OC_INCLUDE_ZCODE=${OC_INCLUDE_ZCODE:-0}" \
+    "CODEX_VERSION=${CODEX_VERSION}" \
+    "OC_CURSOR_AGENT_VERSION=${CURSOR_AGENT_VERSION}" \
+    "OC_CURSOR_AGENT_SHA256=${CURSOR_AGENT_SHA256}" \
+    "OC_GROK_VERSION=${GROK_VERSION}" \
+    "OC_ZCODE_APPIMAGE_VERSION=${ZCODE_APPIMAGE_VERSION}" \
+    "OC_ZCODE_APPIMAGE_SHA256=${ZCODE_APPIMAGE_SHA256}" \
+    "OC_ZCODE_CLI_VERSION=${ZCODE_CLI_VERSION}"
+}
+
+lookup_image_by_input_digest() {
+  local digest="$1"
+  [ -n "$digest" ] || return 1
+  docker images --no-trunc --filter "label=oc.build.input_digest=${digest}" --format '{{.ID}}' 2>/dev/null \
+    | awk 'NF { print; exit 0 }'
+}
+
 # ───────────────────────────────────────────────
 # 2. docker build
 # ───────────────────────────────────────────────
@@ -427,35 +502,100 @@ RUNTIME_FEATURES="v3-sink"
 if [ "${OC_EMBED_SOURCE:-1}" != "0" ]; then
   RUNTIME_FEATURES="$RUNTIME_FEATURES model_authority_v1 lossless-turn-tape-v2"
 fi
-docker build \
-  ${OC_BUILD_NETWORK_HOST:+--network=host} \
-  --label "oc.runtime.features=$RUNTIME_FEATURES" \
-  --label "oc.runtime.git_sha=$TAG" \
-  --label "oc.runtime.source_commit=$SOURCE_COMMIT" \
-  --label "oc.runtime.codex_version=$CODEX_VERSION" \
-  --label "oc.runtime.cursor_agent_version=$CURSOR_AGENT_VERSION" \
-  --label "oc.runtime.include_cursor=${OC_INCLUDE_CURSOR:-0}" \
-  --label "oc.runtime.include_codex=${OC_INCLUDE_CODEX:-1}" \
-  --label "oc.runtime.include_grok=${OC_INCLUDE_GROK:-0}" \
-  --label "oc.runtime.grok_version=$GROK_VERSION" \
-  --label "oc.runtime.include_zcode=${OC_INCLUDE_ZCODE:-0}" \
-  --label "oc.runtime.zcode_appimage_version=$ZCODE_APPIMAGE_VERSION" \
-  --label "oc.runtime.zcode_cli_version=$ZCODE_CLI_VERSION" \
-  --label "oc.runtime.embed_source=${OC_EMBED_SOURCE:-1}" \
-  --build-arg "OC_INCLUDE_CODEX=${OC_INCLUDE_CODEX:-1}" \
-  --build-arg "OC_CURSOR_AGENT_VERSION=$CURSOR_AGENT_VERSION" \
-  --build-arg "OC_CURSOR_AGENT_SHA256=$CURSOR_AGENT_SHA256" \
-  --build-arg "OC_INCLUDE_CURSOR=${OC_INCLUDE_CURSOR:-0}" \
-  --build-arg "OC_INCLUDE_GROK=${OC_INCLUDE_GROK:-0}" \
-  --build-arg "OC_GROK_VERSION=$GROK_VERSION" \
-  --build-arg "OC_INCLUDE_ZCODE=${OC_INCLUDE_ZCODE:-0}" \
-  --build-arg "OC_ZCODE_APPIMAGE_VERSION=$ZCODE_APPIMAGE_VERSION" \
-  --build-arg "OC_ZCODE_APPIMAGE_SHA256=$ZCODE_APPIMAGE_SHA256" \
-  --build-arg "OC_ZCODE_CLI_VERSION=$ZCODE_CLI_VERSION" \
-  --build-arg "OC_EMBED_SOURCE=${OC_EMBED_SOURCE:-1}" \
-  -f "$BUILD_CTX/Dockerfile.openclaude-runtime" \
-  -t "$IMAGE_FULL" \
-  "$BUILD_CTX"
+
+INPUT_DIGEST=""
+SKIPPED_BUILD=0
+DIGEST_MANIFEST="$(mktemp)"
+if compute_input_digest >"$DIGEST_MANIFEST" \
+  && grep -q '^oc.build.input_digest.v1$' "$DIGEST_MANIFEST" \
+  && INPUT_DIGEST="$(sha256sum "$DIGEST_MANIFEST" | awk '{print $1}')" \
+  && [ -n "$INPUT_DIGEST" ] && [[ "$INPUT_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "[build-image] input_digest=$INPUT_DIGEST"
+else
+  echo "[build-image] WARN: input digest compute failed; fail-open docker build"
+  INPUT_DIGEST=""
+fi
+rm -f "$DIGEST_MANIFEST"
+
+if [ -n "$INPUT_DIGEST" ] && [ "${OC_BUILD_FORCE:-0}" != "1" ]; then
+  EXISTING_ID=""
+  EXISTING_ID="$(lookup_image_by_input_digest "$INPUT_DIGEST" || true)"
+  if [ -n "$EXISTING_ID" ]; then
+    echo "[build-image] input digest hit → skip docker build, reuse $EXISTING_ID as $IMAGE_FULL"
+    docker tag "$EXISTING_ID" "$IMAGE_FULL"
+    SKIPPED_BUILD=1
+  else
+    echo "[build-image] input digest miss → docker build"
+  fi
+elif [ "${OC_BUILD_FORCE:-0}" = "1" ]; then
+  echo "[build-image] OC_BUILD_FORCE=1 → skip digest short-circuit, docker build"
+fi
+
+if [ "$SKIPPED_BUILD" != "1" ]; then
+  # --cache-from newest local runtime image so an empty BuildKit cache can
+  # still reuse layers already in the docker image store. Fail-open: omit
+  # --cache-from if inspect fails. BUILDKIT_INLINE_CACHE writes cache
+  # metadata into the result for the next rebuild.
+  export DOCKER_BUILDKIT=1
+  CACHE_FROM_ARGS=()
+  add_cache_from() {
+    local ref="$1"
+    [ -n "$ref" ] || return 0
+    docker image inspect "$ref" >/dev/null 2>&1 || return 0
+    local i
+    for i in "${CACHE_FROM_ARGS[@]+"${CACHE_FROM_ARGS[@]}"}"; do
+      [ "$i" = "--cache-from=$ref" ] && return 0
+    done
+    CACHE_FROM_ARGS+=(--cache-from="$ref")
+  }
+  add_cache_from "$IMAGE_FULL"
+  LATEST_RUNTIME="$(docker images --format '{{.Repository}}:{{.Tag}}' "$IMAGE_REPO" 2>/dev/null \
+    | awk 'NF && $0 !~ /<none>/ { print; exit }' || true)"
+  add_cache_from "$LATEST_RUNTIME"
+  if [ "${#CACHE_FROM_ARGS[@]}" -gt 0 ]; then
+    echo "[build-image] cache-from: ${CACHE_FROM_ARGS[*]}"
+  else
+    echo "[build-image] cache-from: (none)"
+  fi
+
+  LABEL_DIGEST_ARGS=()
+  if [ -n "$INPUT_DIGEST" ]; then
+    LABEL_DIGEST_ARGS=(--label "oc.build.input_digest=$INPUT_DIGEST")
+  fi
+
+  docker build \
+    ${OC_BUILD_NETWORK_HOST:+--network=host} \
+    "${CACHE_FROM_ARGS[@]+"${CACHE_FROM_ARGS[@]}"}" \
+    --build-arg BUILDKIT_INLINE_CACHE=1 \
+    --label "oc.runtime.features=$RUNTIME_FEATURES" \
+    --label "oc.runtime.git_sha=$TAG" \
+    --label "oc.runtime.source_commit=$SOURCE_COMMIT" \
+    --label "oc.runtime.codex_version=$CODEX_VERSION" \
+    --label "oc.runtime.cursor_agent_version=$CURSOR_AGENT_VERSION" \
+    --label "oc.runtime.include_cursor=${OC_INCLUDE_CURSOR:-0}" \
+    --label "oc.runtime.include_codex=${OC_INCLUDE_CODEX:-1}" \
+    --label "oc.runtime.include_grok=${OC_INCLUDE_GROK:-0}" \
+    --label "oc.runtime.grok_version=$GROK_VERSION" \
+    --label "oc.runtime.include_zcode=${OC_INCLUDE_ZCODE:-0}" \
+    --label "oc.runtime.zcode_appimage_version=$ZCODE_APPIMAGE_VERSION" \
+    --label "oc.runtime.zcode_cli_version=$ZCODE_CLI_VERSION" \
+    --label "oc.runtime.embed_source=${OC_EMBED_SOURCE:-1}" \
+    "${LABEL_DIGEST_ARGS[@]+"${LABEL_DIGEST_ARGS[@]}"}" \
+    --build-arg "OC_INCLUDE_CODEX=${OC_INCLUDE_CODEX:-1}" \
+    --build-arg "OC_CURSOR_AGENT_VERSION=$CURSOR_AGENT_VERSION" \
+    --build-arg "OC_CURSOR_AGENT_SHA256=$CURSOR_AGENT_SHA256" \
+    --build-arg "OC_INCLUDE_CURSOR=${OC_INCLUDE_CURSOR:-0}" \
+    --build-arg "OC_INCLUDE_GROK=${OC_INCLUDE_GROK:-0}" \
+    --build-arg "OC_GROK_VERSION=$GROK_VERSION" \
+    --build-arg "OC_INCLUDE_ZCODE=${OC_INCLUDE_ZCODE:-0}" \
+    --build-arg "OC_ZCODE_APPIMAGE_VERSION=$ZCODE_APPIMAGE_VERSION" \
+    --build-arg "OC_ZCODE_APPIMAGE_SHA256=$ZCODE_APPIMAGE_SHA256" \
+    --build-arg "OC_ZCODE_CLI_VERSION=$ZCODE_CLI_VERSION" \
+    --build-arg "OC_EMBED_SOURCE=${OC_EMBED_SOURCE:-1}" \
+    -f "$BUILD_CTX/Dockerfile.openclaude-runtime" \
+    -t "$IMAGE_FULL" \
+    "$BUILD_CTX"
+fi
 
 IMAGE_SIZE_BYTES="$(docker image inspect "$IMAGE_FULL" --format '{{.Size}}')"
 IMAGE_SIZE_MB="$(( IMAGE_SIZE_BYTES / 1024 / 1024 ))"
@@ -511,6 +651,8 @@ cat <<EOF
 [build-image]   tag        : $TAG
 [build-image]   image      : $IMAGE_FULL
 [build-image]   image size : ${IMAGE_SIZE_MB} MiB
+[build-image]   input_digest : ${INPUT_DIGEST:-uncomputed}
+[build-image]   skipped_build : $SKIPPED_BUILD
 [build-image]   tar path   : $TAR_PATH
 [build-image]   tar size   : ${TAR_SIZE_MB} MiB
 [build-image]   tar sha256 : $TAR_SHA256
