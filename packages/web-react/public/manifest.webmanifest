@@ -1,7 +1,7 @@
 {
-  "name": "从简 · 全能 Agent 工作台",
+  "name": "从简 · Clarvy",
   "short_name": "从简",
-  "description": "能思考、会执行、交付真实成果的全能 Agent 工作台。让复杂，从简。",
+  "description": "能思考、会执行、交付真实成果的全能 Agent 工作台。让复杂，从简。 From complex, to clear.",
   "lang": "zh-CN",
   "dir": "ltr",
   "start_url": "/",

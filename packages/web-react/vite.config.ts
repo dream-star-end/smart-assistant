@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { forbiddenTaskboardEntryImports } from "./src/lib/forbidTaskboardEntryImport";
 
 /**
  * 前端构建身份(版本握手单一权威):对最终 index.html(资产标签已注入)取
@@ -39,9 +40,41 @@ function ocBuildMeta(): Plugin {
   };
 }
 
+/**
+ * Fail the production build if the lazy TaskboardView chunk still imports the
+ * SPA entry. That graph made lucide icons share minified names with App
+ * callbacks; opening /board then rendered a useCallback as <Kanban />.
+ */
+function forbidTaskboardEntryImport(): Plugin {
+  return {
+    name: "forbid-taskboard-entry-import",
+    apply: "build",
+    generateBundle(_opts, bundle) {
+      const chunks = Object.values(bundle).flatMap((item) => {
+        if (item.type !== "chunk") return [];
+        return [
+          {
+            type: item.type,
+            fileName: item.fileName,
+            isEntry: item.isEntry,
+            facadeModuleId: item.facadeModuleId,
+            imports: item.imports,
+          },
+        ];
+      });
+      const bad = forbiddenTaskboardEntryImports(chunks);
+      if (bad.length) {
+        throw new Error(
+          `TaskboardView 异步块不得从 SPA 入口 main chunk 引入（打开任务面板会炸 ChunkErrorBoundary）:\n${bad.join("\n")}`,
+        );
+      }
+    },
+  };
+}
+
 export default defineConfig(() => {
   return {
-    plugins: [react(), tailwindcss(), ocBuildMeta()],
+    plugins: [react(), tailwindcss(), ocBuildMeta(), forbidTaskboardEntryImport()],
     server: {
       host: "127.0.0.1",
       port: 5174,
@@ -71,6 +104,9 @@ export default defineConfig(() => {
       // 手动分 chunk（rolldown codeSplitting.groups）。目标：首屏 vendor 单独成块走内容哈希
       // 长缓存（vite 默认 assets/[name]-[hash].js），依赖不变时跨发版命中缓存。
       //  - react-vendor / radix-vendor：首屏同步加载。
+      //  - lucide-vendor：入口与懒加载中心（任务面板等）共用的图标必须离开 main chunk。
+      //    否则 rolldown 把 Kanban/PanelLeft 放进入口后，App 的 useCallback 会复用同一
+      //    短名；点「任务」时懒块拿到的已是回调而非图标 → ChunkErrorBoundary。
       //  注意：重渲染库（react-markdown / highlight.js / unified 生态）**不**在此手动归组。
       //  它们只被 components/MarkdownImpl（经 React.lazy 动态 import）引用，自动代码分割
       //  会把它们落进按需异步 chunk；手动归组反而有把「同步图也引用的通用 util（如
@@ -88,6 +124,20 @@ export default defineConfig(() => {
                 name: "react-vendor",
                 test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/,
                 priority: 20,
+              },
+              {
+                // useMdViewport 被入口(App/useAppRoute)与懒加载中心(任务面板等)共用。
+                // 入口直引后 rolldown 会把它并进 main chunk,TaskboardView 懒块随即出现
+                // 「异步块 import 入口」的被禁边(见 forbidTaskboardEntryImport)。与
+                // lucide-vendor 同理:共享模块单独成块,两边都从它引,不经过入口。
+                name: "viewport-shared",
+                test: /src[\\/]hooks[\\/]useMdViewport\.ts$/,
+                priority: 25,
+              },
+              {
+                name: "lucide-vendor",
+                test: /node_modules[\\/]lucide-react[\\/]/,
+                priority: 15,
               },
               {
                 name: "radix-vendor",

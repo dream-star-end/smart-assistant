@@ -3,6 +3,7 @@
  * Not an official standalone CLI. Adapter never reads or logs the Coding Plan
  * key; hosted turns receive a short-lived loopback relay URL + opaque token.
  */
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { closeSync, constants, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
@@ -24,9 +25,12 @@ import type {
   TurnSummary,
 } from './engineEvents.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
+import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { classifyRunError } from '../errorClassify.js'
 import { createLogger } from '../logger.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
+import { decideEngineCwd } from '../engineCwd.js'
+import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import {
   cleanupZcodePlatformArtifacts,
@@ -129,7 +133,12 @@ function asText(value: unknown): string {
 function promptText(input: TurnParams['input']): string {
   if (typeof input === 'string') return input
   return input
-    .map((block) => (block.type === 'text' && typeof block.text === 'string' ? block.text : asText(block)))
+    .map((block) => {
+      if (block.type === 'text' && typeof block.text === 'string') return block.text
+      // P0-2:base64 二进制 block 绝不 stringify 进纯文本 prompt,占位替换。
+      if (isBinaryInputBlock(block)) return BINARY_BLOCK_OMITTED_NOTICE
+      return asText(block)
+    })
     .filter(Boolean)
     .join('\n')
 }
@@ -387,6 +396,12 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     needsServerRequestId: true,
     historyMode: 'native-resume',
     maxPromptBytes: ZCODE_MAX_PROMPT_ARG_BYTES,
+    // hosted zcode 锁定 yolo 权限模式:用户 permissionMode 不会到达底座。
+    permissionModel: 'forced-unattended',
+    emitsCallUsage: false,
+    emitsToolInputDeltas: false,
+    supportsNativeCompact: false,
+    multimodalInput: 'text-only',
   }
 
   private readonly opts: EngineCreateOpts
@@ -407,6 +422,14 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     this.currentModel = opts.model
     this.currentEffort = opts.effortLevel
     this.currentToolsets = opts.agentToolsets
+    // forced-unattended:hosted zcode 锁定 yolo,非 bypass 的 permissionMode
+    // 无法生效。只记日志,不向前端注入提示(用户明确选择全放行)。
+    if (opts.permissionMode && opts.permissionMode !== 'bypassPermissions') {
+      log.warn('zcode engine is forced-unattended; requested permissionMode is ignored', {
+        sessionKey: opts.sessionKey,
+        permissionMode: opts.permissionMode,
+      })
+    }
   }
 
   start(): Promise<void> { return Promise.resolve() }
@@ -514,6 +537,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     params: TurnParams,
     cwd: string,
     availableMcpTools: string[],
+    cwdDecision?: { source: 'project_workspace' | 'session_repo' | 'default'; sessionRepoOverlay: boolean },
   ): Promise<string> {
     const input = promptText(params.input)
     try {
@@ -527,6 +551,24 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: typeof this.opts.sessionId === 'string' ? this.opts.sessionId : undefined,
+        projectId: this.opts.projectId,
+      })
+      await persistRunContextSnapshot({
+        descriptor: this.opts.runContext,
+        applied: platform.applied,
+        promptContentSha256: platform.contentSha256,
+        frozen: platform.frozenProjectContext,
+        cwd,
+        cwdSource: cwdDecision?.source ?? (this.opts.projectId ? 'project_workspace' : 'default'),
+        sessionRepoOverlay: cwdDecision?.sessionRepoOverlay ?? false,
+      })
+      log.info('prompt_context_built', {
+        sessionKey: this.opts.sessionKey,
+        agentId: this.opts.agentId,
+        backend: 'zcode',
+        prompt_bytes: Buffer.byteLength(platform.content || '', 'utf8'),
+        prompt_sha256: createHash('sha256').update(platform.content || '', 'utf8').digest('hex').slice(0, 12),
+        board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
       return platform.content ? `${platform.content}\n\n${input}` : input
     } catch {
@@ -937,12 +979,28 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private async spawnTurn(ctx: ZcodeTurnContext): Promise<void> {
-    const upstream = this.resolveUpstream()
-    let cwd = this.opts.agentBaseDir
-    if (this.opts.sessionId && this.opts.getRepoSnapshot) {
-      const snapshot = this.opts.getRepoSnapshot(this.opts.sessionId)
-      if (snapshot?.status === 'ready' && snapshot.workspaceDir) cwd = snapshot.workspaceDir
+    // P0-2:图片等二进制 block 已在 promptText 里被占位文本替换(模型会向用户
+    // 转述)。zcode 的 assistantSegments 会被 relay/db snapshot 重建(见
+    // reconcileContentSnapshot),注入合成 segment 会与重建后的 messageId 冲突,
+    // 故不像 grok/cursor 那样发前端提示 block,只记 warn。
+    const omittedBinaryBlocks = countBinaryInputBlocks(ctx.params.input)
+    if (omittedBinaryBlocks > 0) {
+      log.warn('binary input blocks omitted from text-only zcode prompt', {
+        sessionKey: this.opts.sessionKey,
+        omitted: omittedBinaryBlocks,
+      })
     }
+    const upstream = this.resolveUpstream()
+    const snapshot =
+      this.opts.sessionId && this.opts.getRepoSnapshot
+        ? this.opts.getRepoSnapshot(this.opts.sessionId)
+        : null
+    const cwdDecision = decideEngineCwd({
+      agentBaseDir: this.opts.agentBaseDir,
+      repoSnapshot: snapshot,
+      projectBound: Boolean(this.opts.projectId),
+    })
+    const cwd = cwdDecision.cwd
     this.cleanupArtifacts(ctx)
     try {
       ctx.artifacts = createZcodePlatformArtifacts({
@@ -956,6 +1014,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         skillTrainRunId: this.opts.skillTrainRunId,
+        projectId: this.opts.projectId,
       })
     } catch (err) {
       log.warn('zcode platform artifacts unavailable; continuing without MCP/hooks', {
@@ -968,6 +1027,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       ctx.params,
       cwd,
       ctx.artifacts?.advertisedMcpTools ?? [],
+      cwdDecision,
     )
     const usingWrapper = !process.env.OC_ZCODE_CLI_BIN
     if (usingWrapper && !this.route) {
@@ -1312,6 +1372,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
 registerEngine('zcode', (opts) => new ZcodeAdapter(opts))
 
 export const _internals = {
+  promptText,
   resolveZcodeBin,
   unavailable,
   isZcodeStaleResumeError,

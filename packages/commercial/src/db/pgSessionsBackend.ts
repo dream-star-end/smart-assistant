@@ -62,6 +62,8 @@ import {
   normalizeTurnErrorCode,
   resolveModelHistoryContextWindow,
   supportsAutomaticTurnRecovery,
+  shouldPauseSilentAutomaticRecovery,
+  shouldResetNativeSessionForRecovery,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
   parseSessionWorkspaceMode,
@@ -102,7 +104,9 @@ import {
   type ChatProject,
   type ChatProjectCreateResult,
   type ChatProjectDeleteResult,
+  type ChatProjectRuntimeBind,
   type ChatProjectUpdateResult,
+  type PinnedAssetsPage,
   type ProjectAsset,
   type ProjectAssetCreateInput,
   type ProjectAssetCreateResult,
@@ -153,6 +157,8 @@ import {
   _warnSeqAnomaly,
   buildSearchSnippet,
   escapeLikePattern,
+  parseBoardProjectId,
+  assetsRevision,
   parseChatProjectName,
   parseChatProjectOptionalText,
   parseChatProjectSortOrder,
@@ -215,9 +221,11 @@ import {
   bindRecoveryJobDispatch,
   enqueueAutomaticRecoveryJob,
   lockRecoveryRoot,
+  pauseSilentRecoveryLineage,
   settleRecoveryJobForTape,
 } from "../dispatch/turnRecoveryStore.js";
 import { settleStopControlsForTurn } from "../dispatch/turnControlStore.js";
+import { filterMonotonicLiveFramePayloads } from "../dispatch/leftoverFrameFence.js";
 import {
   readClientSessionLiveFrames as readDurableClientSessionLiveFrames,
   readClientSessionLiveUnits as readDurableClientSessionLiveUnits,
@@ -526,7 +534,7 @@ async function pgUnreadBySessionIds(
 
 const PG_CHAT_PROJECT_SELECT = `
   SELECT p.id, p.name, p.instructions, p.color, p.sort_order, p.created_at, p.updated_at,
-         COALESCE(c.cnt, 0)::text AS session_count
+         p.board_project_id, COALESCE(c.cnt, 0)::text AS session_count
     FROM chat_projects p
     LEFT JOIN (
       SELECT project_id, COUNT(*) AS cnt
@@ -545,6 +553,7 @@ type PgChatProjectRow = {
   created_at: string;
   updated_at: string;
   session_count: string;
+  board_project_id: string | null;
 };
 
 function mapPgChatProjectRow(r: PgChatProjectRow): ChatProject {
@@ -557,6 +566,7 @@ function mapPgChatProjectRow(r: PgChatProjectRow): ChatProject {
     createdAt: bigIntNum(r.created_at, "created_at"),
     updatedAt: bigIntNum(r.updated_at, "updated_at"),
     sessionCount: Number(r.session_count) || 0,
+    boardProjectId: r.board_project_id ?? null,
   };
 }
 
@@ -811,6 +821,24 @@ function pgModelSidecarText(text: string): string {
   return text.replaceAll("\u0000", "\\u0000");
 }
 
+/**
+ * client_sessions.messages 落库前的 U+0000 治本清洗(INC-20260821-SESSION-LIST-NUL-READ-STORM)。
+ *
+ * messages 列是 TEXT,原始 NUL 经 JSON.stringify 会以转义序列 `\u0000` 落库 ——
+ * 写入成功,但之后任何 `::json ->>'text'` / `::jsonb` 读取都会 22P05,读侧只能整行隔离。
+ * 这里在**每个写点**把该转义序列改写成正文字面量 `\u0000`(等价于对原文做
+ * pgModelSidecarText 的可逆转义),NUL 不再以"可炸的 JSON 转义"形态入库。
+ *
+ * 只在 JSON 文本层做,免去反序列化 MB 级热尾巴。奇偶判定防误伤:
+ * JSON 里 `u0000` 前的连续反斜杠为**奇数** = 末一个反斜杠开启转义 = 原始 NUL,改写;
+ * 偶数 = 用户正文本身就是字面 `\u0000` 六个字符(或字面反斜杠结尾),原样保留。
+ */
+export function escapeNulInSessionMessagesJson(json: string): string {
+  return json.replace(/(\\+)u0000/g, (whole, slashes: string) =>
+    slashes.length % 2 === 1 ? `${slashes}\\u0000` : whole,
+  );
+}
+
 function deferredUserReplayMetadata(message: MessageLike): MessageLike {
   const rawRouting = message._routing && typeof message._routing === "object" &&
     !Array.isArray(message._routing)
@@ -1006,7 +1034,7 @@ async function pgAppendServerAuthoredCore(
            next_seq = $4, archived_through_seq = $5, archived_count = $6,
            history_revision = history_revision + $9
      WHERE id = $7 AND user_id = $8 AND deleted_at IS NULL`,
-    [plan.finalJson, tail.length + newArchivedCount, now, plan.nextSeq, plan.archivedThroughSeq, newArchivedCount, sessId, userId, historyRevisionDelta],
+    [escapeNulInSessionMessagesJson(plan.finalJson), tail.length + newArchivedCount, now, plan.nextSeq, plan.archivedThroughSeq, newArchivedCount, sessId, userId, historyRevisionDelta],
   );
   if (upd.rowCount !== 1) {
     // 并发软删抢在 SELECT 与 UPDATE 之间(FOR UPDATE 下不可达;保留作最后防线,宁报终态不复活墓碑)。
@@ -1408,6 +1436,12 @@ export interface AdmitUserTurnInput {
   dispatchId: string;
   /** 本 bridge 连接 id(lease owner)。 */
   ownerId: string;
+  /**
+   * cron origin-session: lock the session row and refuse if another
+   * clientMessageId already has an open dispatch. Same-key replay still
+   * proceeds through admitDispatch. Browser admits omit this flag.
+   */
+  exclusiveSession?: boolean;
   /** 要幂等 append 的 user 消息行。 */
   message: MessageLike & { id: string };
   /** Master-validated recovery lineage. The PG transaction revalidates it
@@ -1442,6 +1476,7 @@ export type AdmitUserTurnResult =
   | (AdmitDispatchResult & { workspaceMode: SessionWorkspaceMode })
   | { kind: "session_not_found" }
   | { kind: "session_deleted" }
+  | { kind: "session_busy" }
   | { kind: "recovery_conflict"; reason: string }
   | { kind: "append_error"; reason: string };
 
@@ -1589,6 +1624,102 @@ function recoveryWithoutCheckpointIsProven(code: string): boolean {
   return PRE_EXECUTION_RECOVERY_CODES.has(normalizeTurnErrorCode(code));
 }
 
+/** Leftover live frames are display-isolated after tape projection, but they
+ * remain the SERVICE_RESTART checkpoint store. Recovery admission is not the
+ * hot hydrate path, so it may read them without putting leftover back into
+ * GET /live-frames. */
+/** Callers must pass payloads already through filterMonotonicLiveFramePayloads. */
+function leftoverFramesToRecoveryRecords(payloads: readonly unknown[]): unknown[] {
+  const records: Array<Record<string, unknown>> = [];
+  for (const payload of payloads) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+    const frame = payload as Record<string, unknown>;
+    if (frame.type !== "outbound.message" || !Array.isArray(frame.blocks)) continue;
+    for (const block of frame.blocks) {
+      if (!block || typeof block !== "object" || Array.isArray(block)) continue;
+      const item = block as Record<string, unknown>;
+      const kind = item.kind;
+      if (kind === "thinking") {
+        records.push({
+          role: "thinking",
+          text: typeof item.text === "string" ? item.text : "",
+        });
+        continue;
+      }
+      if (kind === "text") {
+        const text = typeof item.text === "string" ? item.text : "";
+        if (text.trim().length > 0) records.push({ role: "assistant", text });
+        continue;
+      }
+      if (kind === "tool_use" || kind === "tool_result") {
+        records.push({
+          role: "tool",
+          _completed: kind === "tool_result",
+        });
+        continue;
+      }
+      if (kind === "delegate_progress") {
+        records.push({
+          role: "delegate-progress",
+          _completed: item._completed === true,
+        });
+      }
+    }
+  }
+  return records;
+}
+
+async function loadLeftoverRecoveryRecords(
+  client: PoolClient,
+  sessionId: string,
+  sessionUserId: string,
+  clientMessageId: string,
+): Promise<unknown[]> {
+  const rows = (
+    await client.query<{ payload: Buffer }>(
+      `SELECT f.payload
+         FROM client_session_live_streams s
+         JOIN client_session_live_frames f ON f.stream_key=s.stream_key
+        WHERE s.session_id=$1 AND s.user_id=$2 AND s.client_message_id=$3
+        ORDER BY f.record_id
+        LIMIT 4000`,
+      [sessionId, sessionUserId, clientMessageId],
+    )
+  ).rows;
+  const payloads: unknown[] = [];
+  for (const row of rows) {
+    try {
+      payloads.push(JSON.parse(Buffer.from(row.payload).toString("utf8")));
+    } catch {
+      // Corrupt leftover frames must not poison tape-backed recovery.
+    }
+  }
+  return leftoverFramesToRecoveryRecords(filterMonotonicLiveFramePayloads(payloads));
+}
+
+function mergeTapeAndLeftoverRecoveryAssessment(
+  tapeRecords: readonly unknown[],
+  leftoverRecords: readonly unknown[],
+): ReturnType<typeof assessTurnRecoveryTape> & { leftoverBacked: boolean } {
+  const tape = assessTurnRecoveryTape(tapeRecords);
+  if (tape.mode === "checkpoint") return { ...tape, leftoverBacked: false };
+  const leftover = assessTurnRecoveryTape(leftoverRecords);
+  if (leftover.mode === "checkpoint") return { ...leftover, leftoverBacked: true };
+  return { ...tape, leftoverBacked: false };
+}
+
+/** Completed-error already resumes unsafe checkpoints. SERVICE_RESTART crash
+ * tapes are error-only by leftover isolation, so leftover-backed process is
+ * the designed checkpoint and uses the same continuation prompt. */
+function allowUnsafeAutomaticCheckpoint(
+  status: string,
+  errorCode: string,
+  leftoverBacked: boolean,
+): boolean {
+  if (status === "completed") return true;
+  return leftoverBacked && normalizeTurnErrorCode(errorCode) === "service_restart";
+}
+
 /** The last assistant record is the semantic terminal surface. An earlier
  * error followed by a later answer is not a failed turn, while trailing tool
  * or runtime audit rows do not erase a terminal assistant error. */
@@ -1713,8 +1844,15 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   if (!routing || typeof routing !== "object" || Array.isArray(routing)) return;
   const route = routing as Record<string, unknown>;
 
-  const assessment = assessTurnRecoveryTape(
+  const leftoverRecords = await loadLeftoverRecoveryRecords(
+    client,
+    input.sessionId,
+    input.sessionUserId,
+    clientMessageId,
+  );
+  const assessment = mergeTapeAndLeftoverRecoveryAssessment(
     input.turn.records.map((record) => record.payload),
+    leftoverRecords,
   );
   // A checkpoint continuation resumes the native session with the exact
   // persisted process; it never replays the original request. Even an
@@ -1726,7 +1864,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   if (
     assessment.mode === "checkpoint" &&
     !assessment.checkpointSafe &&
-    status !== "completed"
+    !allowUnsafeAutomaticCheckpoint(status, errorCode, assessment.leftoverBacked)
   ) return;
   if (
     assessment.mode === "replay" &&
@@ -1753,6 +1891,17 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       rootClientMessageId,
     ),
   );
+  const recoveryRecords = input.turn.records.map((record) => record.payload);
+  if (shouldPauseSilentAutomaticRecovery({ errorCode, currentAttempt, records: recoveryRecords })) {
+    await pauseSilentRecoveryLineage(client, {
+      userId: input.uid,
+      sessionId: input.sessionId,
+      rootClientMessageId,
+      currentAttempt,
+      terminalOutcome: status,
+    });
+    return;
+  }
   if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) return;
   const semanticRecoveryAttempt = currentAttempt + 1;
   const identity = turnRecoveryAttemptIdentity(
@@ -1790,6 +1939,11 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       rootClientMessageId,
       attempt: semanticRecoveryAttempt,
       max: AUTOMATIC_TURN_RETRY_MAX,
+      ...(shouldResetNativeSessionForRecovery({
+        errorCode,
+        currentAttempt,
+        records: recoveryRecords,
+      }) ? { resetNativeSession: true } : {}),
     },
   };
   const request: Record<string, unknown> = {
@@ -7118,12 +7272,17 @@ async function backfillEmptyVisibleHeadFromPrepared(
     ...(current?.truncated || clipped.truncated ? { truncated: true } : {}),
     partial: true,
   };
+  // read-then-write 竞态守卫:SELECT 后并发 Phase A 可能已写入(空文本 +)errorCode,
+  // 本次 UPDATE 携带的是 SELECT 快照里的 errorCode,盲写会把并发写入的 errorCode 冲掉。
+  // WHERE 再校验 errorCode 未变;变了就放弃 backfill(该头已有更权威的写者)。
+  const snapshotErrorCode = typeof current?.errorCode === "string" ? current.errorCode : "";
   await pool.query(
     `UPDATE client_session_turn_tapes
         SET visible_head=$4::jsonb
       WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
-        AND COALESCE(visible_head->>'text', '') = ''`,
-    [request.sessionId, userId, request.tapeId, JSON.stringify(next)],
+        AND COALESCE(visible_head->>'text', '') = ''
+        AND COALESCE(visible_head->>'errorCode', '') = $5`,
+    [request.sessionId, userId, request.tapeId, JSON.stringify(next), snapshotErrorCode],
   );
 }
 
@@ -7423,7 +7582,7 @@ export async function commitVisibleLosslessTurnPhaseA(
            timeline_generation=timeline_generation + 1
          WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
         [
-          plan.finalJson,
+          escapeNulInSessionMessagesJson(plan.finalJson),
           plan.tail.length + archivedCount,
           nowMs,
           plan.nextSeq,
@@ -7577,6 +7736,31 @@ export function createPgSessionsBackend(
           });
         }
         let message = input.message;
+        if (input.exclusiveSession) {
+          const locked = (
+            await client.query<{ deleted_at: string | null }>(
+              `SELECT deleted_at
+                 FROM client_sessions
+                WHERE id=$1 AND user_id=$2
+                FOR UPDATE`,
+              [input.sessionId, input.sessionUserId],
+            )
+          ).rows[0];
+          if (!locked) return { kind: "session_not_found" };
+          if (locked.deleted_at !== null) return { kind: "session_deleted" };
+          const busy = (
+            await client.query<{ client_message_id: string }>(
+              `SELECT client_message_id
+                 FROM turn_dispatches
+                WHERE user_id=$1::bigint AND session_id=$2
+                  AND status IN ('admitted','accepted','rejecting')
+                  AND client_message_id <> $3
+                LIMIT 1`,
+              [input.uid.toString(), input.sessionId, input.clientMessageId],
+            )
+          ).rows[0];
+          if (busy) return { kind: "session_busy" };
+        }
         if (input.recovery) {
           const expected = input.recovery.automatic
             ? turnRecoveryAttemptIdentity(
@@ -7720,7 +7904,16 @@ export function createPgSessionsBackend(
               } catch {
                 return { kind: "recovery_conflict", reason: "source_tape_malformed" };
               }
-              const assessment = assessTurnRecoveryTape(records);
+              const leftoverRecords = await loadLeftoverRecoveryRecords(
+                client,
+                input.sessionId,
+                input.sessionUserId,
+                input.recovery.sourceClientMessageId,
+              );
+              const assessment = mergeTapeAndLeftoverRecoveryAssessment(
+                records,
+                leftoverRecords,
+              );
               const terminalErrorCode = terminalTurnRecordErrorCode(records);
               const finalizedErrorCode = terminalErrorCode ||
                 (finalized.status === "crashed" || finalized.status === "interrupted"
@@ -7742,7 +7935,11 @@ export function createPgSessionsBackend(
                 input.recovery.automatic &&
                 assessment.mode === "checkpoint" &&
                 !assessment.checkpointSafe &&
-                finalized.status !== "completed"
+                !allowUnsafeAutomaticCheckpoint(
+                  finalized.status,
+                  finalizedErrorCode,
+                  assessment.leftoverBacked,
+                )
               ) {
                 return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
               }
@@ -8925,7 +9122,7 @@ export function createPgSessionsBackend(
                timeline_generation=timeline_generation + $10
              WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
             [
-              plan.finalJson,
+              escapeNulInSessionMessagesJson(plan.finalJson),
               plan.tail.length + archivedCount,
               nowMs,
               plan.nextSeq,
@@ -9249,7 +9446,7 @@ export function createPgSessionsBackend(
           const now = Date.now();
           const plan = planSpillOverflow(finalMessages, bigIntNumOr(existing?.archived_through_seq, 0));
           const tail = plan.tail;
-          const finalJson = JSON.stringify(tail);
+          const finalJson = escapeNulInSessionMessagesJson(JSON.stringify(tail));
           // size guard 在 spill 执行**前**(理论不可达;命中则不落孤儿 chunk,ROLLBACK 更干净)。
           if (Buffer.byteLength(finalJson, "utf8") > MAX_SESSION_BYTES) {
             return "oversized";
@@ -9372,7 +9569,7 @@ export function createPgSessionsBackend(
         msgs[idx] = { ...msgs[idx], ...patch, id: msgId, _source: "server", _seq: nextSeq };
         const upd = await client.query(
           "UPDATE client_sessions SET messages = $1::jsonb, updated_at = GREATEST(updated_at + 1, $2), next_seq = $3, history_revision = history_revision + 1 WHERE id = $4 AND user_id = $5 AND deleted_at IS NULL",
-          [JSON.stringify(msgs), Date.now(), nextSeq + 1, sessId, userId],
+          [escapeNulInSessionMessagesJson(JSON.stringify(msgs)), Date.now(), nextSeq + 1, sessId, userId],
         );
         if (upd.rowCount !== 1) return { applied: false as const, reason: "session_deleted" as const };
         return { applied: true as const };
@@ -9712,7 +9909,7 @@ export function createPgSessionsBackend(
                   touched,
                   bigIntNumOr(sess.archived_through_seq, 0),
                 );
-                const finalJson = JSON.stringify(spill.tail);
+                const finalJson = escapeNulInSessionMessagesJson(JSON.stringify(spill.tail));
                 if (Buffer.byteLength(finalJson, "utf8") > MAX_SESSION_BYTES) {
                   throw new Error("lossless turn billing anchor tail unexpectedly oversized");
                 }
@@ -9836,7 +10033,7 @@ export function createPgSessionsBackend(
                        next_seq = next_seq + 1, archived_through_seq = $4, archived_count = $5,
                        history_revision = history_revision + $8
                  WHERE id = $6 AND user_id = $7`,
-                [plan.finalJson, plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, mapRow.session_id, userId, historyRevisionDelta],
+                [escapeNulInSessionMessagesJson(plan.finalJson), plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, mapRow.session_id, userId, historyRevisionDelta],
               );
               return { applied: "patched" };
             }
@@ -10028,7 +10225,7 @@ export function createPgSessionsBackend(
                  next_seq = next_seq + 1, archived_through_seq = $4, archived_count = $5,
                  history_revision = history_revision + $8
            WHERE id = $6 AND user_id = $7`,
-          [plan.finalJson, plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, clientSessionId, userId, historyRevisionDelta],
+          [escapeNulInSessionMessagesJson(plan.finalJson), plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, clientSessionId, userId, historyRevisionDelta],
         );
 
         for (const p of pendings) {
@@ -10761,6 +10958,80 @@ export function createPgSessionsBackend(
       return cleaned.length > 0 ? cleaned : null;
     },
 
+    async getChatProjectBindBySessionId(sessionId: string): Promise<ChatProjectRuntimeBind | null> {
+      const row = (
+        await pool.query<{
+          user_id: string;
+          chat_project_id: string;
+          board_project_id: string | null;
+          name: string;
+          instructions: string | null;
+        }>(
+          `SELECT cs.user_id, p.id AS chat_project_id, p.board_project_id, p.name, p.instructions
+             FROM client_sessions cs
+             JOIN chat_projects p ON p.id = cs.project_id AND p.user_id = cs.user_id
+            WHERE cs.id = $1 AND cs.deleted_at IS NULL AND p.deleted_at IS NULL`,
+          [sessionId],
+        )
+      ).rows[0];
+      if (!row) return null;
+      return {
+        userId: row.user_id,
+        chatProjectId: row.chat_project_id,
+        boardProjectId: row.board_project_id ?? null,
+        name: row.name,
+        instructions: row.instructions,
+      };
+    },
+
+    async getChatProjectBindByBoardProjectId(
+      userId: string,
+      boardProjectId: string,
+    ): Promise<ChatProjectRuntimeBind | null> {
+      const parsed = parseBoardProjectId(boardProjectId);
+      if (!("present" in parsed) || !parsed.present || !parsed.value) return null;
+      const row = (
+        await pool.query<{
+          user_id: string;
+          id: string;
+          board_project_id: string | null;
+          name: string;
+          instructions: string | null;
+        }>(
+          `SELECT user_id, id, board_project_id, name, instructions
+             FROM chat_projects
+            WHERE user_id = $1 AND board_project_id = $2 AND deleted_at IS NULL`,
+          [userId, parsed.value],
+        )
+      ).rows[0];
+      if (!row) return null;
+      return {
+        userId: row.user_id,
+        chatProjectId: row.id,
+        boardProjectId: row.board_project_id ?? null,
+        name: row.name,
+        instructions: row.instructions,
+      };
+    },
+
+    async listPinnedProjectAssetsForChatProject(
+      userId: string,
+      chatProjectId: string | null,
+    ): Promise<PinnedAssetsPage> {
+      const rows = (
+        await pool.query<PgProjectAssetRow>(
+          `${PG_PROJECT_ASSET_SELECT}
+            WHERE user_id = $1 AND deleted_at IS NULL AND pinned IS TRUE
+              AND project_id IS NOT DISTINCT FROM $2
+            ORDER BY created_at DESC
+            LIMIT $3`,
+          [userId, chatProjectId, PROJECT_ASSET_PINNED_INJECT_MAX],
+        )
+      ).rows;
+      const assets = rows.map(mapPgProjectAssetRow);
+      return { assets, revision: assetsRevision(assets) };
+    },
+
     async searchClientSessions(
       userId: string,
       opts: SearchClientSessionsOpts,
@@ -10775,6 +11046,24 @@ export function createPgSessionsBackend(
       const archiveSql = includeArchived ? "" : " AND cs.archived_at IS NULL";
       const candMax = SESSION_SEARCH_JSON_CANDIDATE_MAX;
       const expandMax = SESSION_SEARCH_JSON_EXPAND_MAX_BYTES;
+      const projectSql =
+        opts.projectId === undefined
+          ? ""
+          : opts.projectId === null
+            ? " AND cs.project_id IS NULL"
+            : " AND cs.project_id = $6";
+      const titleProjectSql =
+        opts.projectId === undefined
+          ? ""
+          : opts.projectId === null
+            ? " AND cs.project_id IS NULL"
+            : " AND cs.project_id = $3";
+      const titleParams: unknown[] =
+        typeof opts.projectId === "string" ? [userId, like, opts.projectId] : [userId, like];
+      const msgParams: unknown[] =
+        typeof opts.projectId === "string"
+          ? [userId, like, candMax, expandMax, q, opts.projectId]
+          : [userId, like, candMax, expandMax, q];
       const titleRows = (
         await pool.query<{
           id: string;
@@ -10784,9 +11073,9 @@ export function createPgSessionsBackend(
         }>(
           `SELECT id, title, project_id, last_at
              FROM client_sessions cs
-            WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}
+            WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}${titleProjectSql}
               AND cs.title ILIKE $2 ESCAPE '\\'`,
-          [userId, like],
+          titleParams,
         )
       ).rows;
       // 正文在 client_sessions.messages(TEXT JSON) 与 spill 的
@@ -10805,7 +11094,7 @@ export function createPgSessionsBackend(
              SELECT cs.id, cs.title, cs.project_id, cs.last_at, cs.messages,
                     octet_length(cs.messages) AS msg_bytes
                FROM client_sessions cs
-              WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}
+              WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}${projectSql}
                 AND cs.messages ILIKE $2 ESCAPE '\\'
               ORDER BY cs.last_at DESC
               LIMIT $3
@@ -10829,7 +11118,7 @@ export function createPgSessionsBackend(
              FROM text_hits c
             WHERE c.msg_bytes > $4
                OR position((chr(92) || 'u0000') in c.messages) > 0`,
-          [userId, like, candMax, expandMax, q],
+          msgParams,
         )
       ).rows;
       const chunkRows = (
@@ -10845,7 +11134,7 @@ export function createPgSessionsBackend(
                     octet_length(ch.messages) AS msg_bytes
                FROM client_session_archive_chunks ch
                JOIN client_sessions cs ON cs.id = ch.session_id AND cs.user_id = ch.user_id
-              WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}
+              WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}${projectSql}
                 AND ch.messages ILIKE $2 ESCAPE '\\'
               ORDER BY cs.last_at DESC
               LIMIT $3
@@ -10869,7 +11158,7 @@ export function createPgSessionsBackend(
              FROM text_hits c
             WHERE c.msg_bytes > $4
                OR position((chr(92) || 'u0000') in c.messages) > 0`,
-          [userId, like, candMax, expandMax, q],
+          msgParams,
         )
       ).rows;
       const hits = [
@@ -10916,8 +11205,38 @@ export function createPgSessionsBackend(
       const parsed = parseSessionBatchInput(input);
       if ("ok" in parsed) return parsed;
       const { ids, action } = parsed;
-      if (ids.length === 0) return { ok: true, updated: 0, skipped: 0 };
+      if (ids.length === 0) return { ok: true, updated: 0, skipped: 0, operationId: parsed.operationId };
       return withTx(pool, async (client): Promise<BatchClientSessionsResult> => {
+        if (parsed.expectedSessions && parsed.expectedSessions.length > 0) {
+          const staleIds: string[] = [];
+          const liveRows = (
+            await client.query<{
+              id: string;
+              project_id: string | null;
+              updated_at: string;
+              deleted_at: string | null;
+            }>(
+              `SELECT id, project_id, updated_at, deleted_at
+                 FROM client_sessions
+                WHERE user_id = $1 AND id = ANY($2::text[])`,
+              [userId, parsed.expectedSessions.map((r) => r.id)],
+            )
+          ).rows;
+          const liveMap = new Map(liveRows.map((r) => [r.id, r]));
+          for (const exp of parsed.expectedSessions) {
+            const live = liveMap.get(exp.id);
+            const liveUpdated = live ? Number(live.updated_at) : NaN;
+            if (
+              !live ||
+              live.deleted_at ||
+              liveUpdated !== exp.updatedAt ||
+              (live.project_id ?? null) !== (exp.projectId ?? null)
+            ) {
+              staleIds.push(exp.id);
+            }
+          }
+          if (staleIds.length) return { ok: false, error: "stale_session", staleIds };
+        }
         if (action === "move" && parsed.projectId) {
           const owned = (
             await client.query(
@@ -10978,18 +11297,62 @@ export function createPgSessionsBackend(
             [userId, targetIds],
           );
           updated = res.rowCount ?? 0;
+        } else if (parsed.expectedSessions && parsed.expectedSessions.length > 0) {
+          if (parsed.expectedSessions.length !== ids.length) {
+            throw Object.assign(new Error("stale_session"), { staleIds: ids, code: "stale_session" });
+          }
+          const post: Array<{ id: string; projectId: string | null; updatedAt: number }> = [];
+          for (const exp of parsed.expectedSessions) {
+            const res = await client.query<{
+              id: string;
+              project_id: string | null;
+              updated_at: string;
+            }>(
+              `UPDATE client_sessions
+                  SET project_id = $1,
+                      updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                WHERE id = $2 AND user_id = $3
+                  AND deleted_at IS NULL AND archived_at IS NULL
+                  AND updated_at = $4
+                  AND project_id IS NOT DISTINCT FROM $5
+              RETURNING id, project_id, updated_at`,
+              [parsed.projectId ?? null, exp.id, userId, exp.updatedAt, exp.projectId],
+            );
+            if ((res.rowCount ?? 0) !== 1) {
+              throw Object.assign(new Error("stale_session"), {
+                staleIds: [exp.id],
+                code: "stale_session",
+              });
+            }
+            const row = res.rows[0]!;
+            post.push({
+              id: row.id,
+              projectId: row.project_id,
+              updatedAt: Number(row.updated_at),
+            });
+          }
+          if (post.length !== parsed.expectedSessions.length) {
+            throw Object.assign(new Error("stale_session"), { staleIds: ids, code: "stale_session" });
+          }
+          return { ok: true, updated: post.length, skipped, operationId: parsed.operationId, post };
         } else {
           const res = await client.query(
             `UPDATE client_sessions
                 SET project_id = $1,
                     updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
-              WHERE user_id = $2 AND deleted_at IS NULL
+              WHERE user_id = $2 AND deleted_at IS NULL AND archived_at IS NULL
                 AND id = ANY($3::text[])`,
             [parsed.projectId ?? null, userId, targetIds],
           );
           updated = res.rowCount ?? 0;
         }
-        return { ok: true, updated, skipped };
+        return { ok: true, updated, skipped, operationId: parsed.operationId };
+      }).catch((err: unknown) => {
+        const e = err as { code?: string; staleIds?: string[] };
+        if (e.code === "stale_session") {
+          return { ok: false as const, error: "stale_session" as const, staleIds: e.staleIds };
+        }
+        throw err;
       });
     },
 
@@ -11016,16 +11379,7 @@ export function createPgSessionsBackend(
 
     async listChatProjects(userId: string): Promise<ChatProject[]> {
       const rows = (
-        await pool.query<{
-          id: string;
-          name: string;
-          instructions: string | null;
-          color: string | null;
-          sort_order: number;
-          created_at: string;
-          updated_at: string;
-          session_count: string;
-        }>(
+        await pool.query<PgChatProjectRow>(
           `${PG_CHAT_PROJECT_SELECT}
             WHERE p.user_id = $2 AND p.deleted_at IS NULL
             ORDER BY p.sort_order ASC, p.created_at ASC`,
@@ -11079,7 +11433,13 @@ export function createPgSessionsBackend(
     async updateChatProject(
       userId: string,
       id: string,
-      input: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown },
+      input: {
+        name?: unknown;
+        instructions?: unknown;
+        color?: unknown;
+        sortOrder?: unknown;
+        boardProjectId?: unknown;
+      },
     ): Promise<ChatProjectUpdateResult> {
       const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
       const params: unknown[] = [];
@@ -11093,8 +11453,20 @@ export function createPgSessionsBackend(
       if (input.instructions !== undefined) {
         const instructions = parseChatProjectOptionalText(input.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX);
         if ("invalid" in instructions || !instructions.present) return { ok: false, error: "invalid_instructions" };
-        sets.push(`instructions = $${n++}`);
-        params.push(instructions.value);
+        const existing = await readPgChatProject(pool, userId, id);
+        const nextBoard =
+          input.boardProjectId !== undefined
+            ? parseBoardProjectId(input.boardProjectId)
+            : { present: true as const, value: existing?.boardProjectId ?? null };
+        const boundAfter =
+          "present" in nextBoard &&
+          nextBoard.present &&
+          typeof nextBoard.value === "string" &&
+          nextBoard.value.length > 0;
+        if (!boundAfter) {
+          sets.push(`instructions = $${n++}`);
+          params.push(instructions.value);
+        }
       }
       if (input.color !== undefined) {
         const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX);
@@ -11108,18 +11480,32 @@ export function createPgSessionsBackend(
         sets.push(`sort_order = $${n++}`);
         params.push(sortOrder);
       }
+      if (input.boardProjectId !== undefined) {
+        const bound = parseBoardProjectId(input.boardProjectId);
+        if ("invalid" in bound) return { ok: false, error: "invalid_board_project_id" };
+        if (bound.present) {
+          sets.push(`board_project_id = $${n++}`);
+          params.push(bound.value);
+        }
+      }
       if (sets.length === 1) {
         const existing = await readPgChatProject(pool, userId, id);
         return existing ? { ok: true, project: existing } : { ok: false, error: "not_found" };
       }
       return withTx(pool, async (client) => {
         params.push(id, userId);
-        const res = await client.query(
-          `UPDATE chat_projects SET ${sets.join(", ")}
-            WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL`,
-          params,
-        );
-        if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        try {
+          const res = await client.query(
+            `UPDATE chat_projects SET ${sets.join(", ")}
+              WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL`,
+            params,
+          );
+          if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        } catch (err) {
+          const code = (err as { code?: string }).code;
+          if (code === "23505") return { ok: false, error: "board_project_bound" };
+          throw err;
+        }
         const project = await readPgChatProject(client, userId, id);
         if (!project) return { ok: false, error: "not_found" };
         return { ok: true, project };
@@ -11182,7 +11568,7 @@ export function createPgSessionsBackend(
           parsed.value.digest,
           parsed.value.containerPath,
         );
-        if (dup) return { ok: true, asset: dup };
+        if (dup) return { ok: true, asset: dup, created: false };
         // 同一 (user_id, project_id) 桶的 count+INSERT 必须串行:默认 READ COMMITTED
         // 下无行锁,并发事务都会读到 count<500 再各自写入 → 上限被突破。
         // pg_advisory_xact_lock 随 COMMIT/ROLLBACK 自动释放;不用会话级
@@ -11223,7 +11609,7 @@ export function createPgSessionsBackend(
         );
         const asset = await readPgProjectAsset(client, userId, id);
         if (!asset) throw new Error("project asset insert vanished");
-        return { ok: true, asset };
+        return { ok: true, asset, created: true };
       });
     },
 

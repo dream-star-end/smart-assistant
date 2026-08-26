@@ -27,6 +27,8 @@ export type TurnErrorCta =
   | 'refresh'
   | 'switch_model'
   | 'relogin'
+  /** 上下文超限类:本会话无法继续本轮,引导到新会话延续目标(导航,非重发)。 */
+  | 'new_session'
   | 'none'
 
 export interface TurnErrorSemantics {
@@ -74,7 +76,7 @@ export const TURN_ERROR_TAXONOMY = {
   /** 上游请求超时(errorClassify 词族;历史前端码 upstream_timeout 归并于此)。 */
   upstream_timeout: { retryable: true, automaticRecovery: true, cta: 'retry' },
   network_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
-  context_too_long: { retryable: false, cta: 'none' },
+  context_too_long: { retryable: false, cta: 'new_session' },
   bad_request: { retryable: false, cta: 'none' },
 
   // ── 引擎/平台执行 ────────────────────────────────────────
@@ -198,6 +200,85 @@ export function turnErrorSemantics(code: string): TurnErrorSemantics {
  * codes stay false. */
 export function supportsAutomaticTurnRecovery(code: string): boolean {
   return turnErrorSemantics(normalizeTurnErrorCode(code)).automaticRecovery === true
+}
+
+const SILENT_AUTOMATIC_RECOVERY_CODES = new Set([
+  'liveness_timeout',
+  'idle_timeout',
+  'no_response',
+  'phantom_turn',
+])
+
+export function isSilentAutomaticRecoveryError(code: string): boolean {
+  return SILENT_AUTOMATIC_RECOVERY_CODES.has(normalizeTurnErrorCode(code))
+}
+
+/** A narrow, versioned allow-list for evidence that a failed turn advanced
+ * beyond a silent first-event stall. Generic runtime/status/error metadata is
+ * intentionally ignored. Any model text, tool boundary or non-zero token
+ * observation keeps the ordinary recovery budget available. */
+export function hasMeaningfulAutomaticRecoveryProgress(records: readonly unknown[]): boolean {
+  let progressed = false
+  const seen = new Set<unknown>()
+  const visit = (value: unknown): void => {
+    if (progressed || !value || typeof value !== 'object' || seen.has(value)) return
+    seen.add(value)
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item)
+      return
+    }
+    const row = value as Record<string, unknown>
+    const role = typeof row.role === 'string' ? row.role : ''
+    const terminalError = row._isError === true ||
+      typeof row._errorCode === 'string' || typeof row.errorCode === 'string'
+    if (
+      !terminalError &&
+      (role === 'assistant' || role === 'thinking') &&
+      typeof row.text === 'string' && row.text.trim().length > 0
+    ) {
+      progressed = true
+      return
+    }
+    if (
+      role === 'tool' || row.kind === 'tool_use' || row.type === 'tool_use' ||
+      row.kind === 'tool_result' || row.type === 'tool_result'
+    ) {
+      progressed = true
+      return
+    }
+    for (const [key, nested] of Object.entries(row)) {
+      if (
+        /(?:input|output|cacheRead|cacheWrite|cacheCreation|reasoning|total)[_]?tokens/i.test(key) &&
+        typeof nested === 'number' && Number.isFinite(nested) && nested > 0
+      ) {
+        progressed = true
+        return
+      }
+      visit(nested)
+    }
+  }
+  for (const record of records) visit(record)
+  return progressed
+}
+
+export function shouldPauseSilentAutomaticRecovery(input: {
+  errorCode: string
+  currentAttempt: number
+  records: readonly unknown[]
+}): boolean {
+  return input.currentAttempt >= 1 &&
+    isSilentAutomaticRecoveryError(input.errorCode) &&
+    !hasMeaningfulAutomaticRecoveryProgress(input.records)
+}
+
+export function shouldResetNativeSessionForRecovery(input: {
+  errorCode: string
+  currentAttempt: number
+  records: readonly unknown[]
+}): boolean {
+  return input.currentAttempt === 0 &&
+    isSilentAutomaticRecoveryError(input.errorCode) &&
+    !hasMeaningfulAutomaticRecoveryProgress(input.records)
 }
 
 /** Errors whose authoritative terminal code proves execution never crossed a

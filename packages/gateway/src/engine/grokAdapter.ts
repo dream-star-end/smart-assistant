@@ -3,10 +3,12 @@
  * in headless streaming-json mode; subscription credentials never enter the
  * user container. Instead the master supplies an opaque, one-turn relay token.
  */
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable } from 'node:stream'
-import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type { GoalStateSnapshot, OutboundContentBlock } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
@@ -29,10 +31,13 @@ import type {
 } from './engineEvents.js'
 import { engineSessionId } from './engineSessionId.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
+import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { buildCodexEnv } from './codexShared.js'
 import { createLogger } from '../logger.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { grokProductToolInput, grokProductToolName, grokProductToolOutput } from './grokToolNormalize.js'
+import { decideEngineCwd } from '../engineCwd.js'
+import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { GROK_PREAMBLE, prepareGrokHome, projectGrokPlatform } from './grokPlatform.js'
 
@@ -42,6 +47,40 @@ const GROK_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const GROK_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 const GROK_UPSTREAM_MODEL = 'grok-4.6'
 const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
+const PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS = 30_000
+const PROCESS_KEEPALIVE_INTERVAL_MIN_MS = 5_000
+const PROCESS_KEEPALIVE_INTERVAL_MAX_MS = 120_000
+
+type GrokProcessKeepaliveTestHooks = {
+  intervalMs?: number
+}
+
+let processKeepaliveTestHooks: GrokProcessKeepaliveTestHooks | null = null
+
+function parseProcessKeepaliveIntervalMs(): number {
+  const raw = process.env.OPENCLAUDE_GROK_PROCESS_KEEPALIVE_MS
+  if (!raw) return PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed)) return PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS
+  return Math.min(
+    PROCESS_KEEPALIVE_INTERVAL_MAX_MS,
+    Math.max(PROCESS_KEEPALIVE_INTERVAL_MIN_MS, Math.floor(parsed)),
+  )
+}
+
+function resolvedProcessKeepaliveIntervalMs(): number {
+  return processKeepaliveTestHooks?.intervalMs ?? parseProcessKeepaliveIntervalMs()
+}
+
+function isPidAlive(pid: number | undefined): boolean {
+  if (typeof pid !== 'number' || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
 
 const GROK_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const GROK_CHECKPOINT_MAX_BYTES = 32 * 1024 * 1024
@@ -137,6 +176,8 @@ function promptText(input: TurnParams['input']): string {
   return input
     .map((block) => {
       if (block.type === 'text' && typeof block.text === 'string') return block.text
+      // P0-2:base64 二进制 block 绝不 stringify 进纯文本 prompt,占位替换。
+      if (isBinaryInputBlock(block)) return BINARY_BLOCK_OMITTED_NOTICE
       return asText(block)
     })
     .filter(Boolean)
@@ -203,6 +244,7 @@ interface GrokTurnContext {
   params: TurnParams
   startedAt: number
   proc: ChildProcessByStdio<null, Readable, Readable> | null
+  promptDir: string | null
   assistantText: string
   thinkingText: string
   assistantSegments: SegmentRecord[]
@@ -223,6 +265,18 @@ interface GrokTurnContext {
   resolveSummary: (summary: TurnSummary | null) => void
 }
 
+function cleanupPromptDir(ctx: GrokTurnContext): void {
+  const promptDir = ctx.promptDir
+  if (!promptDir) return
+  ctx.promptDir = null
+  try {
+    rmSync(promptDir, { recursive: true, force: true })
+  } catch {
+    // Best effort. The directory is mode 0700 and contains only this turn's
+    // mode-0600 prompt; a later container recycle removes any residue.
+  }
+}
+
 export class GrokAdapter extends EventEmitter implements EngineAdapter {
   readonly engineId = 'grok'
   readonly capabilities: EngineCapabilities = {
@@ -231,6 +285,12 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     resumeKind: 'grok-session',
     needsServerRequestId: true,
     historyMode: 'native-resume',
+    // grok-build 以 --always-approve 驱动:用户 permissionMode 不会到达底座。
+    permissionModel: 'forced-unattended',
+    emitsCallUsage: false,
+    emitsToolInputDeltas: false,
+    supportsNativeCompact: true,
+    multimodalInput: 'text-only',
   }
 
   private readonly opts: EngineCreateOpts
@@ -244,6 +304,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   private currentTarget: ExecutionTarget = { kind: 'local' }
   private traceId: string | undefined
   private drain: Promise<void> = Promise.resolve()
+  private processKeepaliveTimer: NodeJS.Timeout | null = null
   lastActivityAt = 0
 
   constructor(opts: EngineCreateOpts) {
@@ -254,6 +315,14 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     this.currentModel = opts.model
     this.currentEffort = opts.effortLevel
     this.currentToolsets = opts.agentToolsets
+    // forced-unattended:CLI 恒以 --always-approve 驱动,非 bypass 的
+    // permissionMode 无法生效。只记日志,不向前端注入提示(用户明确选择全放行)。
+    if (opts.permissionMode && opts.permissionMode !== 'bypassPermissions') {
+      log.warn('grok engine is forced-unattended; requested permissionMode is ignored', {
+        sessionKey: opts.sessionKey,
+        permissionMode: opts.permissionMode,
+      })
+    }
   }
 
   start(): Promise<void> {
@@ -271,6 +340,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       params,
       startedAt: Date.now(),
       proc: null,
+      promptDir: null,
       assistantText: '',
       thinkingText: '',
       assistantSegments: [],
@@ -297,6 +367,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       // Only ever settle this turn's own barrier: shutdown() may have already
       // abandoned it, in which case `active` and `drain` belong to a later turn
       // that this failure says nothing about.
+      cleanupPromptDir(ctx)
       if (!ctx.abandoned) {
         this.forceEnd(ctx)
         if (this.active === ctx) this.active = null
@@ -337,14 +408,21 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       throw new Error('GROK_ROUTE_INVALID: relay must be token-bound loopback')
     }
 
-    let cwd = this.opts.agentBaseDir
+    this.emitOmittedBinaryNotice(ctx)
+
     let repoSnapshot = null
     if (this.opts.sessionId && this.opts.getRepoSnapshot) {
       repoSnapshot = this.opts.getRepoSnapshot(this.opts.sessionId)
-      if (repoSnapshot?.status === 'ready' && repoSnapshot.workspaceDir) cwd = repoSnapshot.workspaceDir
     }
+    const cwdDecision = decideEngineCwd({
+      agentBaseDir: this.opts.agentBaseDir,
+      repoSnapshot,
+      projectBound: Boolean(this.opts.projectId),
+    })
+    const cwd = cwdDecision.cwd
     const platform = projectGrokPlatform({
       agentId: this.opts.agentId,
+      projectId: this.opts.projectId,
       sessionKey: this.opts.sessionKey,
       gatewayPort: this.opts.config.gateway.port,
       gatewayToken: this.opts.config.gateway.accessToken ?? '',
@@ -356,10 +434,19 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       skillTrainRunId: this.opts.skillTrainRunId,
     })
     const prompt = await this.composePrompt(ctx.params, repoSnapshot, platform.advertisedMcpTools)
+    const promptDir = mkdtempSync(join(tmpdir(), 'oc-grok-prompt-'))
+    const promptFile = join(promptDir, 'prompt.md')
+    try {
+      writeFileSync(promptFile, prompt, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    } catch (err) {
+      try { rmSync(promptDir, { recursive: true, force: true }) } catch { /* best effort */ }
+      throw err
+    }
+    ctx.promptDir = promptDir
     const args = [
       '--agent', 'grok-build',
       '--model', GROK_UPSTREAM_MODEL,
-      '-p', prompt,
+      '--prompt-file', promptFile,
       '--output-format', 'streaming-json',
       '--always-approve',
       '--no-subagents',
@@ -405,18 +492,26 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     }
     const bin = process.env.OC_GROK_CLI_BIN?.trim()
       || (existsSync('/usr/local/bin/grok-native') ? '/usr/local/bin/grok-native' : 'grok')
-    const proc = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+    let proc: ChildProcessByStdio<null, Readable, Readable>
+    try {
+      proc = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+    } catch (err) {
+      cleanupPromptDir(ctx)
+      throw err
+    }
     ctx.proc = proc
     if (ctx.abandoned) {
       // shutdown() gave up on this turn while we were still composing the
       // prompt. Nobody will read this process and it carries the turn's route
       // token, so it must not outlive the turn it belongs to.
+      cleanupPromptDir(ctx)
       killProcessGroup(proc, 'SIGKILL')
       detachChildStdio(proc)
       try { proc.unref() } catch { /* already detached */ }
       return
     }
     this.emit('spawn', { resumed: this.nativeId !== null })
+    this.ensureProcessKeepalive()
 
     let stdoutBuffer = ''
     proc.stdout.setEncoding('utf8')
@@ -439,6 +534,8 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       ctx.stderr += chunk
     })
     proc.once('error', (err) => {
+      if (this.active === ctx) this.stopProcessKeepalive()
+      cleanupPromptDir(ctx)
       // An abandoned turn has already been finalized and `active` has moved on;
       // surfacing this would report a later turn as failed.
       if (ctx.abandoned) return
@@ -446,6 +543,8 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       this.emit('error', err)
     })
     proc.once('close', (code, signal) => {
+      if (this.active === ctx) this.stopProcessKeepalive()
+      cleanupPromptDir(ctx)
       // shutdown() may have already given up on this process and finalized
       // the turn, in which case `active` belongs to a later turn that this
       // handler must not touch.
@@ -461,6 +560,36 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       }
       this.emit('exit', { code, signal, crashed })
       if (this.active === ctx) this.active = null
+    })
+  }
+
+  /** P0-2:输入含图片等二进制 block 时,除 prompt 占位替换外,再向用户发一条
+   *  可见 assistant 提示(走常规 segment 机制,live 流与持久化 tape 一致)。 */
+  private emitOmittedBinaryNotice(ctx: GrokTurnContext): void {
+    const omitted = countBinaryInputBlocks(ctx.params.input)
+    if (omitted === 0) return
+    log.warn('binary input blocks omitted from text-only grok prompt', {
+      sessionKey: this.opts.sessionKey,
+      omitted,
+    })
+    const text = `${BINARY_BLOCK_OMITTED_NOTICE}\n\n`
+    const segment: SegmentRecord = {
+      index: ctx.assistantSegments.length,
+      text,
+      ts: Date.now(),
+      eventOrdinal: ctx.params.nextDurableEventOrdinal?.(),
+    }
+    ctx.assistantSegments.push(segment)
+    ctx.assistantText += text
+    // lastContentKind 保持不变(null):模型首段 text 仍会新开自己的 segment。
+    const messageIdBase = ctx.params.assistantMessageId
+    ctx.params.onEvent({
+      kind: 'block',
+      block: {
+        kind: 'text',
+        text,
+        ...(messageIdBase ? { messageId: `${messageIdBase}-s${segment.index}` } : {}),
+      },
     })
   }
 
@@ -482,6 +611,29 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: typeof this.opts.sessionId === 'string' ? this.opts.sessionId : undefined,
+        projectId: this.opts.projectId,
+      })
+      const cwdDecision = decideEngineCwd({
+        agentBaseDir: this.opts.agentBaseDir,
+        repoSnapshot,
+        projectBound: Boolean(this.opts.projectId),
+      })
+      await persistRunContextSnapshot({
+        descriptor: this.opts.runContext,
+        applied: platform.applied,
+        promptContentSha256: platform.contentSha256,
+        frozen: platform.frozenProjectContext,
+        cwd: cwdDecision.cwd,
+        cwdSource: cwdDecision.source,
+        sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
+      })
+      log.info('prompt_context_built', {
+        sessionKey: this.opts.sessionKey,
+        agentId: this.opts.agentId,
+        backend: 'grok',
+        prompt_bytes: Buffer.byteLength(platform.content || '', 'utf8'),
+        prompt_sha256: createHash('sha256').update(platform.content || '', 'utf8').digest('hex').slice(0, 12),
+        board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
       const body = platform.content ? `${platform.content}\n\n${input}` : input
       return `${GROK_PREAMBLE}\n${body}`
@@ -672,6 +824,11 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       ...(ctx.params.usageAttribution?.delegateAgentId ? { delegateAgentId: ctx.params.usageAttribution.delegateAgentId } : {}),
       engineSessionId: this.stableEngineSessionId,
       status,
+      // P1-11 审计:'CODEX_ERROR' 是刻意保留的字面量,不是笔误。engine-reported
+      // 计费帧的 terminalCode 联合类型由 protocol(losslessTurnTape.DurableCodexBilling
+      // / frames.ts billing schema)锁定为 'USER_CANCELLED' | 'CODEX_ERROR',且
+      // commercial userChatBridge 按字面量匹配、未知值会被强转回 'CODEX_ERROR'。
+      // 语义 = "engine 非用户取消的终态错误";引入 'GROK_ERROR' 需要先动 wire 契约。
       ...(status === 'error' ? { terminalCode: ctx.interrupted ? 'USER_CANCELLED' : 'CODEX_ERROR' } : {}),
       durationMs: Date.now() - ctx.startedAt,
       usage: {
@@ -686,6 +843,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private finish(ctx: GrokTurnContext, end: GrokEvent | null): void {
+    if (this.active === ctx) this.stopProcessKeepalive()
     if (ctx.terminal) return
     const upstreamStopReason = typeof end?.stopReason === 'string' ? end.stopReason : null
     if (upstreamStopReason === 'cancelled') ctx.interrupted = true
@@ -738,9 +896,46 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private forceEnd(ctx: GrokTurnContext): void {
+    if (this.active === ctx) this.stopProcessKeepalive()
     if (ctx.terminal) return
     ctx.terminal = true
     ctx.resolveSummary(null)
+  }
+
+  private stopProcessKeepalive(): void {
+    if (!this.processKeepaliveTimer) return
+    clearInterval(this.processKeepaliveTimer)
+    this.processKeepaliveTimer = null
+  }
+
+  private ensureProcessKeepalive(): void {
+    if (this.processKeepaliveTimer) return
+    const ctx = this.active
+    if (!ctx || ctx.terminal || ctx.abandoned || !ctx.proc) return
+    const intervalMs = resolvedProcessKeepaliveIntervalMs()
+    if (intervalMs <= 0) return
+    this.processKeepaliveTimer = setInterval(() => { this.tickProcessKeepalive() }, intervalMs)
+    this.processKeepaliveTimer.unref()
+  }
+
+  private tickProcessKeepalive(): void {
+    try {
+      const ctx = this.active
+      const pid = ctx?.proc?.pid
+      if (!ctx || ctx.terminal || ctx.abandoned || !isPidAlive(pid)) {
+        this.stopProcessKeepalive()
+        return
+      }
+      // Official Grok can think or wait on the first API round-trip for minutes
+      // with no stdout. Cursor already keeps lastActivityAt fresh while the
+      // parent PID is alive; without that, grok-build dies at the 15-minute
+      // idle watchdog and then auto-recovers into a thinking-forever loop.
+      // The 12h logical-turn cap still bounds a genuinely stuck CLI.
+      this.lastActivityAt = Date.now()
+      this.emit('activity')
+    } catch {
+      // Keepalive must never throw into the interval.
+    }
   }
 
   interrupt(): boolean {
@@ -815,6 +1010,8 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     proc: ChildProcessByStdio<null, Readable, Readable> | null,
     detail: string,
   ): void {
+    if (this.active === ctx) this.stopProcessKeepalive()
+    cleanupPromptDir(ctx)
     ctx.abandoned = true
     if (proc) detachChildStdio(proc)
     if (!ctx.terminal) this.finishError(ctx, detail)
@@ -853,6 +1050,16 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   get pendingToolCalls(): number { return this.active?.pendingToolIds.size ?? 0 }
   get isRunning(): boolean { return !!this.active?.proc && !this.active.proc.killed && !this.active.terminal }
   getBoundRepoBinding(): { selectionVersion: number; workspaceDir: string } | null { return null }
+}
+
+export const _internals = {
+  promptText,
+  PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS,
+  PROCESS_KEEPALIVE_INTERVAL_MIN_MS,
+  PROCESS_KEEPALIVE_INTERVAL_MAX_MS,
+  setProcessKeepaliveTestHooks(hooks: GrokProcessKeepaliveTestHooks | null): void {
+    processKeepaliveTestHooks = hooks
+  },
 }
 
 registerEngine('grok', (opts) => new GrokAdapter(opts))

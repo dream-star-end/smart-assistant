@@ -46,3 +46,5 @@ packages/commercial/src/__tests__/migration0238.integ.test.ts
 packages/commercial/src/__tests__/migration0245.integ.test.ts
 packages/commercial/src/__tests__/migration0246.integ.test.ts
 packages/commercial/src/__tests__/migration0247.integ.test.ts
+packages/commercial/src/__tests__/migration0247CursorOpus48.integ.test.ts
+packages/commercial/src/__tests__/migration0251.integ.test.ts

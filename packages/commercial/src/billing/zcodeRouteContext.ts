@@ -9,7 +9,9 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 
-export const ZCODE_RELAY_PREFIX = "/internal/v5/zcode-relay";
+import { ZCODE_RELAY_PREFIX } from "@openclaude/protocol";
+
+export { ZCODE_RELAY_PREFIX };
 export const ZCODE_RELAY_TTL_MS = 15 * 60 * 1000;
 export const ZCODE_UPSTREAM_MODEL = "zai-coding-plan/glm-5.3";
 export const ZCODE_UPSTREAM_API_MODEL = "glm-5.3";

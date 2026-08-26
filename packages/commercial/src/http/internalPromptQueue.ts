@@ -18,10 +18,19 @@ import {
 } from '../promptQueue/pgPromptQueueStore.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
-export const PROMPT_QUEUE_MUTATION_PATH = '/internal/v5/prompt-queue/mutation'
-export const PROMPT_QUEUE_SNAPSHOT_PATH = '/internal/v5/prompt-queue/snapshot'
-export const PROMPT_QUEUE_DETAIL_PATH = '/internal/v5/prompt-queue/detail'
-export const PROMPT_QUEUE_CLAIM_PATH = '/internal/v5/prompt-queue/claim'
+import {
+  PROMPT_QUEUE_MUTATION_PATH,
+  PROMPT_QUEUE_SNAPSHOT_PATH,
+  PROMPT_QUEUE_DETAIL_PATH,
+  PROMPT_QUEUE_CLAIM_PATH,
+} from '@openclaude/protocol'
+
+export {
+  PROMPT_QUEUE_MUTATION_PATH,
+  PROMPT_QUEUE_SNAPSHOT_PATH,
+  PROMPT_QUEUE_DETAIL_PATH,
+  PROMPT_QUEUE_CLAIM_PATH,
+}
 
 const SMALL_BODY_BYTES = 8 * 1024
 const MUTATION_ENVELOPE_BYTES = 64 * 1024

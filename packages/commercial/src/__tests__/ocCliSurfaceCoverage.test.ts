@@ -381,6 +381,7 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
   },
   'oc-memory': {
     'core-search': memoryProbe(['core-search'], /core-search requires/),
+    'project-search': memoryProbe(['project-search'], /project-search requires/),
     'session-search': memoryProbe(['session-search'], /session-search requires/),
     'archival-add': memoryProbe(['archival-add'], /archival-add requires/),
     'archival-search': memoryProbe(['archival-search'], /archival-search requires/),

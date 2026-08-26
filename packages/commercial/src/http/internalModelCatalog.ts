@@ -59,9 +59,10 @@ import {
   setSecurityHeaders,
 } from "./util.js";
 
-export const MODEL_CATALOG_PATH = "/internal/v3/model-catalog";
+export { MODEL_CATALOG_PATH } from "@openclaude/protocol";
+import { MODEL_CATALOG_EPOCH_PATH } from "@openclaude/protocol";
 /** 窄端点(R2-m13:不用 HEAD body)—— LKG 使用前的 epoch 验证走它,一次单行 SELECT。 */
-export const MODEL_CATALOG_EPOCH_PATH = "/internal/v3/model-catalog-epoch";
+export { MODEL_CATALOG_EPOCH_PATH };
 
 /** 两个端点都带的响应头(容器可复用拉取响应头做 epoch 验证,免二次请求)。 */
 export const SECURITY_EPOCH_HEADER = "x-openclaude-security-epoch";
@@ -96,6 +97,12 @@ export interface ModelCatalogHandlerDeps {
   readEpoch?: () => Promise<bigint>;
   /** Provider quota/health routing view. Production injects providerHealthGate. */
   loadRoutingAvailability?: () => Promise<ProviderRoutingAvailability>;
+  /**
+   * 全表 `agent_cost_overrides`(agent_id → cost_multiplier)。
+   * 成功则写入响应(空表 = {});失败则省略该字段,让 gateway 补价 fail-closed,
+   * 而不是把「查失败」伪装成「全 1.000」。旧 gateway 见到未知字段必须无害。
+   */
+  loadAgentCostOverrides?: () => Promise<Record<string, string>>;
   logger?: Logger;
 }
 
@@ -124,6 +131,12 @@ export interface WireModelRow {
   default_effort: string | null;
   /** Missing on an old master means available=true to rolling-upgrade clients. */
   available?: boolean;
+  /** model_pricing 四维 + multiplier。旧 master 可缺席。 */
+  input_per_mtok?: string;
+  output_per_mtok?: string;
+  cache_read_per_mtok?: string;
+  cache_write_per_mtok?: string;
+  multiplier?: string;
 }
 
 export interface WireCatalogResponse {
@@ -132,6 +145,11 @@ export interface WireCatalogResponse {
   availability_revision?: string;
   security_epoch: string;
   aliases: Record<string, string>;
+  /**
+   * agent_id → cost_multiplier。新增可选字段:旧 gateway 忽略即可。
+   * 出现(含空字典)="master 明确说了当前 override 集";缺席=旧 master / 加载失败。
+   */
+  agent_cost_overrides?: Record<string, string>;
 }
 
 export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCatalogHandler {
@@ -225,26 +243,54 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
       orgPlanCode: authz.orgPlanCode ?? null,
     };
     const availability = await loadRoutingAvailability();
+    // agent 倍率与单价走同一条 catalog 下发。加载失败故意省略字段:
+    // gateway 把「没拿到字段」当 fail-closed,不能把空表/查失败伪装成全 1.000。
+    let agentCostOverrides: Record<string, string> | undefined;
+    if (deps.loadAgentCostOverrides) {
+      try {
+        agentCostOverrides = await deps.loadAgentCostOverrides();
+      } catch (err) {
+        log.error("agent_cost_overrides_load_failed", {
+          uid: identity.userId,
+          err: errMsg(err),
+        });
+      }
+    }
     const body: WireCatalogResponse = {
-      models: snapshot.listForUser(scope).map((r) => ({
-        model_id: r.modelId,
-        display_name: r.displayName,
-        engine: r.engine,
-        provider_id: r.providerId,
-        context_window: r.contextWindow,
-        supported_efforts: r.supportedEfforts,
-        supports_vision: r.supportsVision,
-        capability_zero: r.capabilityZero,
-        supports_thinking: r.supportsThinking,
-        default_effort: r.defaultEffort,
-        available:
-          r.providerId === null || !availability.unavailableProviderIds.has(r.providerId),
-      })),
+      models: snapshot.listForUser(scope).map((r) => {
+        const p = snapshot.billingPricingFor(r.modelId);
+        return {
+          model_id: r.modelId,
+          display_name: r.displayName,
+          engine: r.engine,
+          provider_id: r.providerId,
+          context_window: r.contextWindow,
+          supported_efforts: r.supportedEfforts,
+          supports_vision: r.supportsVision,
+          capability_zero: r.capabilityZero,
+          supports_thinking: r.supportsThinking,
+          default_effort: r.defaultEffort,
+          available:
+            r.providerId === null || !availability.unavailableProviderIds.has(r.providerId),
+          ...(p
+            ? {
+                input_per_mtok: p.input_per_mtok.toString(),
+                output_per_mtok: p.output_per_mtok.toString(),
+                cache_read_per_mtok: p.cache_read_per_mtok.toString(),
+                cache_write_per_mtok: p.cache_write_per_mtok.toString(),
+                multiplier: p.multiplier,
+              }
+            : {}),
+        };
+      }),
       // per-uid 投影哈希(全局 executionRevision **不下发**,R2-M12)。
       projection_revision: snapshot.projectionRevisionFor(scope),
       availability_revision: availability.revision,
       security_epoch: snapshot.securityEpoch.toString(),
       aliases: snapshot.aliasesForUser(scope),
+      ...(agentCostOverrides !== undefined
+        ? { agent_cost_overrides: agentCostOverrides }
+        : {}),
     };
 
     sendJson(res, 200, body, {

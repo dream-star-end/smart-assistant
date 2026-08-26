@@ -26,6 +26,7 @@ export type ClassifiedErrorCode =
   | 'upstream_failed'
   | 'context_too_long'
   | 'bad_request'
+  | 'auth_error'
   | 'unknown'
 
 export interface ClassifiedError {
@@ -50,20 +51,30 @@ const PATTERNS: Array<{
   {
     re: /(?:"code"\s*:\s*"MODEL_CONFIG_CHANGED_RETRY_TURN")|(?:\\"code\\"\s*:\s*\\"MODEL_CONFIG_CHANGED_RETRY_TURN\\")/,
     code: 'model_config_changed_retry_turn',
-    message: '模型配置已更新,请重发',
+    message: '模型配置已更新，请重发',
   },
   // anthropicProxy.ts:1362 sendJsonError(res, 402, "INSUFFICIENT_CREDITS", ...)
   // CCB 抛出的 message 形如 "402 INSUFFICIENT_CREDITS: insufficient credits: balance=... required=..."
   {
     re: /(?:insufficient[_ ]credits|INSUFFICIENT_CREDITS|\b402\b.*credit)/i,
     code: 'insufficient_credits',
-    message: '余额不足,请充值后继续',
+    message: '余额不足，请充值后继续',
+  },
+  // 认证/凭据失效 —— 401 / unauthorized / invalid api key / AUTH_ERROR 词族。
+  // 不可自动重试(不进 TRANSIENT_RETRY_ERROR_CODES):凭据坏了重试只会再 401。
+  // 必须排在通用 5xx/upstream 档之前,防 "401 Unauthorized from upstream" 这类
+  // 同现串被 upstream 正则吞掉。注意词族刻意窄:"Network Authentication Required"
+  // (511)不含 "authentication error" 措辞,仍归 upstream_failed(见 511 回归测试)。
+  {
+    re: /(?:\b401\b|unauthori[sz]ed|invalid (?:x-)?api[_ -]?key|authentication[_ ]?error|AUTH_ERROR)/i,
+    code: 'auth_error',
+    message: '模型服务认证失败，请重新登录或检查凭据后重试',
   },
   // 429 / RATE_LIMITED — Anthropic 直接返还,或本地 RATE_LIMITED reject
   {
     re: /(?:\b429\b|rate[_ ]?limit(?:ed)?|RATE_LIMITED)/i,
     code: 'rate_limited',
-    message: '当前账号被限流,请稍后再试',
+    message: '当前账号被限流，请稍后再试',
   },
   {
     re: /PROMPT_TOO_LONG|ran out of room in the model(?:'|’)s context window|context window (?:was )?(?:exceeded|too long)/i,
@@ -89,7 +100,7 @@ const PATTERNS: Array<{
   {
     re: /at capacity|capacity.{0,40}(?:limit|exceed|full)|overloaded|model.{0,20}busy|try a different model|\b529\b/i,
     code: 'model_capacity',
-    message: '模型繁忙,请稍后重试或切换模型',
+    message: '模型繁忙，请稍后重试或切换模型',
   },
   // 通用 5xx / 上游连接失败。
   // 审计 R1:
@@ -102,7 +113,8 @@ const PATTERNS: Array<{
   {
     re: /(?:\b5\d{2}\b|upstream|ECONNRESET|ETIMEDOUT|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|ACCOUNT_POOL_(?:BUSY|UNAVAILABLE)|UPSTREAM_FAILED)/i,
     code: 'upstream_failed',
-    message: 'Anthropic 上游异常,请稍后重试',
+    // 文案刻意不绑定具体厂商:同一分类被 CCB/Codex/多提供商路径共用。
+    message: '模型服务上游暂时异常，请稍后重试',
   },
 ]
 
@@ -138,7 +150,7 @@ export function classifyDelegateOutputError(
   if (/\b400\b[\s\S]{0,200}\bBAD_BODY\b|\bBAD_BODY\b[\s\S]{0,200}\binvalid request body\b|"code"\s*:\s*"BAD_BODY"/i.test(detail)) {
     return {
       code: 'bad_request',
-      message: '子 agent 请求体无效,请降低思考深度或稍后重试',
+      message: '子 agent 请求体无效，请降低思考深度或稍后重试',
       detail,
     }
   }

@@ -30,6 +30,8 @@ export function ChatHeader({
   onOpenInbox,
   unreadCount,
   sessionUnreadCount,
+  projectBreadcrumb,
+  onOpenProjectScope,
 }: {
   agent: Agent;
   onAgentClick: () => void;
@@ -67,6 +69,8 @@ export function ChatHeader({
   unreadCount?: number;
   /** 会话未读数（侧栏折叠/移动抽屉入口角标）。与站内信 unreadCount 并存、语义不同。 */
   sessionUnreadCount?: number;
+  projectBreadcrumb?: { chatName?: string | null; workName?: string | null } | null;
+  onOpenProjectScope?: () => void;
 }) {
   const low = credits != null && (credits.trim().startsWith("-") || /^-?0+$/.test(credits.trim()));
   // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
@@ -113,6 +117,18 @@ export function ChatHeader({
         </span>
         <ChevronDown size={15} className="shrink-0 text-faint" />
       </button>
+      {projectBreadcrumb && (projectBreadcrumb.chatName || projectBreadcrumb.workName) ? (
+        <button
+          type="button"
+          data-testid="chat-project-breadcrumb"
+          data-product-control="project-breadcrumb"
+          onClick={onOpenProjectScope}
+          className="hidden min-w-0 max-w-[14rem] truncate rounded-lg px-2 py-1 text-caption text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:inline-block"
+          title={[projectBreadcrumb.workName, projectBreadcrumb.chatName].filter(Boolean).join(" / ")}
+        >
+          {[projectBreadcrumb.workName, projectBreadcrumb.chatName].filter(Boolean).join(" / ")}
+        </button>
+      ) : null}
       {/* 团队模式可见指示:开启期间常驻 agent 名旁(弹窗外唯一的知情入口),
           点击弹说明 + 一键关闭。仅 main 会话(teamModeActive)显示。 */}
       {teamModeActive && (

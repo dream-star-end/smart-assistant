@@ -41,6 +41,10 @@ const CLASSIFY_SAMPLES: Array<{ input: string; code: string }> = [
     input: 'API Error: 400 {"error":{"code":"INVALID_REQUEST","message":"upstream rejected the request"}}',
     code: 'bad_request',
   },
+  {
+    input: 'API Error: 401 {"error":{"type":"authentication_error","message":"invalid x-api-key"}}',
+    code: 'auth_error',
+  },
 ]
 
 /** Delegate-specific input shapes that still share the ClassifiedErrorCode
@@ -149,6 +153,16 @@ describe('turnErrorTaxonomy 契约 — wire OutboundError.code 枚举', () => {
     assert.ok(wireCodes.includes('model_capacity'))
     assert.ok(wireCodes.includes('model_config_changed_retry_turn'))
     assert.ok(wireCodes.includes('user_cancelled'))
+    // E4 — gateway 权威终态透传码 + E6 持久化降级码,钉死在 wire 枚举里。
+    for (const code of [
+      'runner_crashed',
+      'service_restart',
+      'engine_error',
+      'auth_error',
+      'session_persist_unavailable',
+    ]) {
+      assert.ok(wireCodes.includes(code), `wire 枚举缺 ${code}`)
+    }
   })
 })
 

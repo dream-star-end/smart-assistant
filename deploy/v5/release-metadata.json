@@ -125,8 +125,15 @@
     "0243_live_unit_checkpoints",
     "0244_tutorial_snapshots",
     "0245_gpt56_family_half_xn",
+    "0246_chat_project_board_bind",
     "0246_ungate_cursor_opus_fable_picker",
-    "0247_open_cursor_grok_opus48"
+    "0247_cursor_opus_48",
+    "0247_open_cursor_grok_opus48",
+    "0248_friction_error_location",
+    "0249_usage_board_project_attribution",
+    "0250_ccb_egress_region_one_proxy",
+    "0251_cursor_sand_mode",
+    "0252_grok_route_context_kind"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

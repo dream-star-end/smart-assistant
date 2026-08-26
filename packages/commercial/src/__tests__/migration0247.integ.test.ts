@@ -16,6 +16,7 @@ import { resetAndMigrateBefore, useDedicatedTestDatabase } from './helpers/db.js
 const db = useDedicatedTestDatabase('models_0247_test')
 const here = path.dirname(fileURLToPath(import.meta.url))
 const migrationPath = path.resolve(here, '../db/migrations/0247_open_cursor_grok_opus48.sql')
+const selfhostMigrationPath = path.resolve(here, '../db/migrations/0247_cursor_opus_48.sql')
 const metadataPath = path.resolve(here, '../../../../deploy/v5/release-metadata.json')
 
 const NEW_IDS = [
@@ -33,6 +34,10 @@ const NEW_IDS = [
 
 async function loadSql(): Promise<string> {
   return readFile(migrationPath, 'utf8')
+}
+
+async function loadSelfhostSql(): Promise<string> {
+  return readFile(selfhostMigrationPath, 'utf8')
 }
 
 describe('0247_open_cursor_grok_opus48', () => {
@@ -166,14 +171,51 @@ describe('0247_open_cursor_grok_opus48', () => {
     assert.equal(grants.rows[0]?.count, '0')
   })
 
-  test('is fail-closed if Opus 4.8 already exists', async (t) => {
+  test('converges an exact pre-existing selfhost Opus 4.8 family', async (t) => {
     if (db.skipIfUnavailable(t)) return
     await resetAndMigrateBefore('0247')
+    await query(await loadSelfhostSql())
+    await query(await loadSql())
+
+    const rows = await query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count
+         FROM model_catalog c
+         JOIN model_pricing p USING (model_id)
+        WHERE c.model_id = ANY($1::text[])
+          AND c.state = 'active'
+          AND p.enabled IS TRUE
+          AND p.visibility = 'public'
+          AND p.min_plan_code IS NULL`,
+      [NEW_IDS],
+    )
+    assert.equal(rows.rows[0]?.count, '10')
+  })
+
+  test('is fail-closed on a partial imported Opus 4.8 family', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    await resetAndMigrateBefore('0247')
+    await query(await loadSelfhostSql())
+    await query(`DELETE FROM model_pricing WHERE model_id = 'cursor-opus-4.8-max-fast'`)
     const sql = await loadSql()
-    await query(sql)
     await assert.rejects(
       () => query(sql),
-      /0247 refuses pre-existing/,
+      /0247 refuses partial imported Opus 4\.8 family/,
+    )
+  })
+
+  test('is fail-closed on a drifted imported Opus 4.8 family', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    await resetAndMigrateBefore('0247')
+    await query(await loadSelfhostSql())
+    await query(
+      `UPDATE model_pricing
+          SET multiplier = 3
+        WHERE model_id = 'cursor-opus-4.8-high'`,
+    )
+    const sql = await loadSql()
+    await assert.rejects(
+      () => query(sql),
+      /0247 refuses drifted imported Opus 4\.8 family/,
     )
   })
 })

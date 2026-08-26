@@ -19,14 +19,18 @@ import type { ExecutionTarget } from '../remoteTarget.js'
 import type { EngineAdapter, EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
 import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
+import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { classifyRunError } from '../errorClassify.js'
 import { createLogger } from '../logger.js'
-import { resolveMcpMemoryEntry } from '../mcpMemoryEntry.js'
+import { type McpMemoryLaunch, resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
 import { getPlatformPrompt } from '../platformPrompts.js'
 import { atomicWriteJsonFile, buildCursorEfficiencyHooks } from '../efficiencyHookConfig.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
+import { decideEngineCwd } from '../engineCwd.js'
+import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { issueDelegateContextToken } from '../delegateContext.js'
+import { formatPresentOptionsFence } from './presentOptions.js'
 
 const log = createLogger({ module: 'cursorAdapter' })
 
@@ -577,18 +581,16 @@ do not claim or call a tool unless it is present in your current tool list.
 
 This hosted run is noninteractive, so the runtime resolves Cursor's native
 ask-question tool instantly as "Questions skipped by the user" — the user
-never sees the prompt and no answer will arrive. Never call the native ask-question tool. To ask the user a multiple-choice question, write
-fenced \`options\` code blocks (language tag must be \`options\`) in your
-reply, then end the turn immediately. Each block must be a single JSON object
-with fields \`question?: string\`, \`multi?: boolean\` (multi-select only when
-exactly \`true\`), and \`options: Array<{label: string, desc?: string}>\`
-(1–12 items; more than 12 makes the whole block fail). One reply may contain
-at most 4 options blocks; multiple blocks in the same reply are aggregated
-into a single submission. The closing fence must be on its own line
-with no characters after it; newline immediately. Do not write prose
-after the options block; after the last options block, end the turn.
-Separate multiple options blocks with a blank line. The user's click
-arrives as your next ordinary user message.
+never sees the prompt and no answer will arrive. Never call the native ask-question tool. To ask the user a multiple-choice question, call
+\`present_options\` (one question per call; at most 4 calls in one reply). The
+adapter injects a product options card and the tool returns immediately —
+end the turn after the last call. Do not write fenced \`options\` code blocks
+yourself unless that tool is missing from your current tool list. Each
+question uses fields \`question?: string\`, \`multi?: boolean\` (multi-select
+only when exactly \`true\`), and \`options: Array<{label: string, desc?: string}>\`
+(1–12 items; more than 12 fails). Fallback fence language tag must be
+\`options\`; closing fence on its own line; no prose after the last block.
+The user's click arrives as your next ordinary user message.
 Subagents have no user-facing UI — decide yourself, or present numbered
 options as plain text and end the turn; the user's next message carries
 the answer.
@@ -596,7 +598,7 @@ the answer.
 Use OpenClaude's storage channels as their sections direct: Core memory through
 \`oc-memory core-search\` plus the exact platform memory files, session/archival
 recall through the \`oc-memory\` CLI, and skills/reminders through the
-\`openclaude-memory\` MCP tools. Cursor 同步委派走 Bash \`oc-memory delegate\`(阻塞到结束);
+\`openclaude-memory\` MCP tools. Cursor 同步委派走 Bash \`oc-memory delegate\`;每段前台等待会在 Cursor 60 分钟改挂边界前安全返回,若仍运行必须立即按 stdout 调 \`oc-memory delegate-wait <jobId>\` 继续,禁止改用 Cursor \`TaskOutput\`;
 不要用 MCP \`delegate_task\` / \`delegate_tasks\` / \`request_review\`。Do not create or use
 Cursor-private memory or skill stores as a second source of truth.
 
@@ -619,6 +621,7 @@ const OPENCLAUDE_MEMORY_MCP_TOOLS = [
   'update_reminder',
   'delete_reminder',
   'send_to_agent',
+  'present_options',
 ] as const
 
 const CURSOR_SAFE_ENV_KEYS = [
@@ -657,9 +660,11 @@ interface TurnCtx {
   params: TurnParams; startedAt: number; proc: ChildProcessByStdio<null, Readable, Readable> | null
   assistantText: string; thinkingText: string; assistantSegments: SegmentRecord[]; thinkingSegments: SegmentRecord[]
   tools: Map<string, TurnToolEntry>; pending: Set<string>; startedTools: Map<string, number>
-  stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; resolveDrain: (() => void) | null; interrupted: boolean; error: string | null; usage?: ReportedUsage
+  silentToolIds: Set<string>; presentOptionsCount: number
+  stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; resolveDrain: (() => void) | null; interrupted: boolean; error: string | null; resultSeen: boolean; resultDetail: string | null; usage?: ReportedUsage
   assistantPartialText: string; pendingAssistantText: string | null
   assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
+  lastContentKind: 'text' | 'thinking' | null
   contextDir: string | null
   rawToSafeToolId: Map<string, string>; safeToRawToolId: Map<string, string>; fallbackToolSequence: number
   sessionIdEmitted: boolean
@@ -671,8 +676,35 @@ function textOf(value: unknown): string {
   if (value == null) return ''
   try { return JSON.stringify(value) } catch { return String(value) }
 }
+/** UTF-8 byte arrays from serde of `Vec<u8>`. Anything else → null (never stringify). */
+const MAX_SHELL_BYTE_DECODE = 2 * 1024 * 1024
+function oversizedOutputNotice(byteLength: number): string {
+  return `[输出过大，已省略 ${byteLength} 字节]`
+}
+function decodeUtf8Bytes(value: unknown): string | null {
+  if (value instanceof Uint8Array) {
+    if (value.length > MAX_SHELL_BYTE_DECODE) return oversizedOutputNotice(value.length)
+    return Buffer.from(value).toString('utf8')
+  }
+  if (!Array.isArray(value)) return null
+  if (value.length === 0) return ''
+  if (value.length > MAX_SHELL_BYTE_DECODE) return oversizedOutputNotice(value.length)
+  const bytes = new Uint8Array(value.length)
+  for (let i = 0; i < value.length; i += 1) {
+    const n = value[i]
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 0 || n > 255) return null
+    bytes[i] = n
+  }
+  return Buffer.from(bytes).toString('utf8')
+}
+function shellFieldText(value: unknown): string {
+  if (typeof value === 'string') return value
+  const decoded = decodeUtf8Bytes(value)
+  return decoded ?? ''
+}
 function promptOf(input: TurnParams['input']): string {
-  return typeof input === 'string' ? input : input.map((v) => v.type === 'text' ? textOf(v.text) : textOf(v)).filter(Boolean).join('\n')
+  // P0-2:base64 二进制 block 绝不 stringify 进纯文本 prompt,占位替换。
+  return typeof input === 'string' ? input : input.map((v) => v.type === 'text' ? textOf(v.text) : isBinaryInputBlock(v) ? BINARY_BLOCK_OMITTED_NOTICE : textOf(v)).filter(Boolean).join('\n')
 }
 function nonnegative(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined
@@ -680,17 +712,52 @@ function nonnegative(value: unknown): number | undefined {
 function recordOf(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
-function assistantTextOf(event: CursorEvent): string {
-  if (typeof event.text === 'string') return event.text
-  if (typeof event.content === 'string') return event.content
-  if (typeof event.delta === 'string') return event.delta
-  if (typeof event.message === 'string') return event.message
+function isStructuredThinkingBlock(item: Record<string, unknown>): boolean {
+  const type = textOf(item.type ?? item.kind).toLowerCase()
+  if (type === 'thinking' || type === 'thought') return true
+  // A dedicated string `thinking` field is an explicit structural marker.
+  // Never classify by looking at the text content itself.
+  return typeof item.thinking === 'string'
+}
+function structuredThinkingTextOf(item: Record<string, unknown>): string {
+  if (typeof item.thinking === 'string' && item.thinking) return item.thinking
+  if (typeof item.text === 'string' && item.text) return item.text
+  if (typeof item.content === 'string' && item.content) return item.content
+  return ''
+}
+function assistantContentBlocksOf(event: CursorEvent): Array<{ kind: 'text' | 'thinking'; text: string }> {
   const message = recordOf(event.message)
-  if (!message || !Array.isArray(message.content)) return ''
-  return message.content.map((block) => {
-    const item = recordOf(block)
-    return item?.type === 'text' && typeof item.text === 'string' ? item.text : ''
-  }).join('')
+  const content = Array.isArray(message?.content)
+    ? message.content
+    : Array.isArray(event.content) ? event.content : null
+  if (content) {
+    const blocks: Array<{ kind: 'text' | 'thinking'; text: string }> = []
+    for (const block of content) {
+      const item = recordOf(block)
+      if (!item) continue
+      if (isStructuredThinkingBlock(item)) {
+        const text = structuredThinkingTextOf(item)
+        if (text) blocks.push({ kind: 'thinking', text })
+        continue
+      }
+      if (textOf(item.type).toLowerCase() === 'text' && typeof item.text === 'string' && item.text) {
+        blocks.push({ kind: 'text', text: item.text })
+      }
+    }
+    return blocks
+  }
+  const text = typeof event.text === 'string' ? event.text
+    : typeof event.content === 'string' ? event.content
+    : typeof event.delta === 'string' ? event.delta
+    : typeof event.message === 'string' ? event.message
+    : ''
+  return text ? [{ kind: 'text', text }] : []
+}
+function assistantTextOf(event: CursorEvent): string {
+  return assistantContentBlocksOf(event)
+    .filter((block) => block.kind === 'text')
+    .map((block) => block.text)
+    .join('')
 }
 function usageOf(event: CursorEvent): ReportedUsage | undefined {
   const raw = recordOf(event.usage)
@@ -813,6 +880,7 @@ function toolNameOf(event: CursorEvent): string {
       (candidate): candidate is string => typeof candidate === 'string' && !!candidate,
     )
     if (tool === 'ask_user') return 'AskUserQuestion'
+    if (tool === 'present_options') return 'PresentOptions'
     if (server && tool) return `mcp__${server}__${tool}`
     if (tool) return tool
   }
@@ -1088,6 +1156,19 @@ function questionSkippedByRuntime(event: CursorEvent): boolean {
   const serialized = JSON.stringify([toolResultValueOf(event), event.output, event.rawOutput])
   return serialized.includes('Questions skipped by the user')
 }
+function shellIoOf(event: CursorEvent): { stdout: string; stderr: string; exitCode?: number } {
+  const call = toolCallOf(event)
+  const variant = toolVariantOf(event)
+  const rawResult = toolResultValueOf(event)
+  const result = recordOf(rawResult)
+  const success = recordOf(result?.success) ?? result
+  const source = success ?? variant?.value ?? call ?? {}
+  const stdout = shellFieldText(source.stdout ?? variant?.value.stdout ?? call?.stdout)
+  const stderr = shellFieldText(source.stderr ?? variant?.value.stderr ?? call?.stderr)
+  const exitRaw = source.exitCode ?? source.exit_code
+  const exitCode = typeof exitRaw === 'number' && Number.isFinite(exitRaw) ? exitRaw : undefined
+  return { stdout, stderr, ...(exitCode !== undefined ? { exitCode } : {}) }
+}
 function toolFailed(event: CursorEvent): boolean {
   if (questionSkippedByRuntime(event)) return false
   const call = toolCallOf(event)
@@ -1102,11 +1183,18 @@ function toolFailed(event: CursorEvent): boolean {
     result?.case,
     result?.status,
   ].map((value) => textOf(value).toLowerCase())
-  return event.is_error === true ||
+  if (
+    event.is_error === true ||
     failureValueOf(resultValue) !== undefined ||
     failureValueOf(variant?.value.result) !== undefined ||
     failureValueOf(call?.result) !== undefined ||
     statuses.some((status) => ['error', 'failed', 'failure', 'rejected'].includes(status))
+  ) return true
+  if (cursorToolKindOf(event) === 'shellToolCall') {
+    const exitCode = shellIoOf(event).exitCode
+    if (typeof exitCode === 'number' && exitCode !== 0) return true
+  }
+  return false
 }
 function toolOutputOf(event: CursorEvent): { output: string; outputJson: unknown } {
   const call = toolCallOf(event)
@@ -1123,11 +1211,14 @@ function toolOutputOf(event: CursorEvent): { output: string; outputJson: unknown
   const source = success ?? variant?.value ?? call ?? {}
   const kind = cursorToolKindOf(event)
   if (kind === 'shellToolCall') {
-    const stdout = textOf(source.stdout ?? variant?.value.stdout ?? call?.stdout)
-    const stderr = textOf(source.stderr ?? variant?.value.stderr ?? call?.stderr)
+    const { stdout, stderr, exitCode } = shellIoOf(event)
     const output = [stdout, stderr].filter(Boolean).join(stdout && stderr ? '\n' : '')
-    const outputJson = { ...(stdout ? { stdout } : {}), ...(stderr ? { stderr } : {}) }
-    return { output: output || textOf(rawResult), outputJson }
+    const outputJson = {
+      ...(stdout ? { stdout } : {}),
+      ...(stderr ? { stderr } : {}),
+      ...(exitCode !== undefined ? { exitCode } : {}),
+    }
+    return { output, outputJson }
   }
   if (kind === 'readToolCall') {
     const content = source.content ?? variant?.value.content ?? call?.content ?? rawResult
@@ -1196,9 +1287,10 @@ function validateCursorFinalPrompt(prompt: string, payloadBytes: number): void {
 }
 
 interface CursorMemoryMcpConfigInput {
-  entry: string
+  launch: McpMemoryLaunch
   tokenFile: string
   agentId: string
+  projectId?: string
   sessionKey: string
   gatewayPort: number
   delegationDepth: number
@@ -1209,9 +1301,9 @@ interface CursorMemoryMcpConfigInput {
 }
 
 function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<string, unknown> {
-  const trustedTsxCli = resolve(dirname(input.entry), '../../../node_modules/tsx/dist/cli.mjs')
   const env: Record<string, string> = {
     OPENCLAUDE_AGENT_ID: input.agentId,
+    ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
     OPENCLAUDE_SESSION_KEY: input.sessionKey,
     OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
     OPENCLAUDE_GATEWAY_TOKEN_FILE: input.tokenFile,
@@ -1234,8 +1326,8 @@ function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<s
   return {
     mcpServers: {
       'openclaude-memory': {
-        command: '/usr/local/bin/node',
-        args: [trustedTsxCli, input.entry],
+        command: input.launch.command,
+        args: input.launch.args,
         env,
       },
     },
@@ -1305,6 +1397,26 @@ export function cursorResumeStoreExists(workspacePath: string, sessionId: string
   try { return existsSync(cursorResumeStorePath(workspacePath, sessionId)) } catch { return false }
 }
 
+/**
+ * Same-engine Cursor follow-ups must resume, not replay. Prefer the live
+ * adapter id, then the resume-map id, but only if that id's store exists at
+ * the spawn cwd — a hash mismatch is a silent empty chat, not a fallback cue.
+ */
+export function usableCursorResumeId(opts: {
+  workspacePath?: string | null
+  liveId?: string | null
+  mappedId?: string | null
+}): string | undefined {
+  const workspacePath = typeof opts.workspacePath === 'string' ? opts.workspacePath.trim() : ''
+  if (!workspacePath) return undefined
+  for (const id of [opts.liveId, opts.mappedId]) {
+    if (typeof id === 'string' && id.length > 0 && cursorResumeStoreExists(workspacePath, id)) {
+      return id
+    }
+  }
+  return undefined
+}
+
 export class CursorAdapter extends EventEmitter implements EngineAdapter {
   readonly engineId = 'cursor'
   readonly capabilities: EngineCapabilities = {
@@ -1314,10 +1426,17 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     needsServerRequestId: true,
     historyMode: 'native-resume',
     maxPromptBytes: CURSOR_MAX_TURN_PAYLOAD_BYTES,
+    // 托管 Cursor CLI 以非交互全放行模式驱动:permissionMode 不会到达底座。
+    permissionModel: 'forced-unattended',
+    emitsCallUsage: false,
+    emitsToolInputDeltas: false,
+    supportsNativeCompact: false,
+    multimodalInput: 'text-only',
   }
   private readonly opts: EngineCreateOpts
   private active: TurnCtx | null = null
   private currentModel: string | undefined
+  private currentEffort: string | undefined
   private currentToolsets: string[] | undefined
   private target: ExecutionTarget = { kind: 'local' }
   private drain: Promise<void> = Promise.resolve()
@@ -1326,7 +1445,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   lastActivityAt = 0
   private pendingKeepaliveTimer: ReturnType<typeof setInterval> | null = null
   /** Log-dedup only: true while the current oldest pending tool is over budget.
-   *  Must not gate timer start/stop or the keepalive decision itself. */
+   *  Must not gate timer start/stop, lastActivityAt refresh, or activity emits. */
   private pendingKeepaliveOverBudgetLogged = false
   private pendingKeepaliveStalledLogged = false
   private pendingKeepaliveStallSince: number | null = null
@@ -1340,13 +1459,21 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.nativeId = opts.resumeSessionId ?? null
     this.setModel(opts.model)
     this.currentToolsets = opts.agentToolsets
+    // forced-unattended:托管 Cursor CLI 恒为非交互全放行,非 bypass 的
+    // permissionMode 无法生效。只记日志,不向前端注入提示(用户明确选择全放行)。
+    if (opts.permissionMode && opts.permissionMode !== 'bypassPermissions') {
+      log.warn('cursor engine is forced-unattended; requested permissionMode is ignored', {
+        sessionKey: opts.sessionKey,
+        permissionMode: opts.permissionMode,
+      })
+    }
   }
   start(): Promise<void> { return Promise.resolve() }
   submitTurn(params: TurnParams): EngineTurnRun {
     this.stopPendingKeepalive()
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), silentToolIds: new Set(), presentOptionsCount: 0, stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, resultSeen: false, resultDetail: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { ctx.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => {
       // Only ever settle this turn's own barrier: shutdown() may have already
@@ -1400,14 +1527,31 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     mkdirSync(dir, { recursive: true, mode: 0o700 })
     return dir
   }
+  /** P0-2:输入含图片等二进制 block 时,除 prompt 占位替换外,再向用户发一条
+   *  可见 assistant 提示(走 emitText 常规 segment 机制,live 与持久化一致)。 */
+  private emitOmittedBinaryNotice(ctx: TurnCtx): void {
+    const omitted = countBinaryInputBlocks(ctx.params.input)
+    if (omitted === 0) return
+    log.warn('binary input blocks omitted from text-only cursor prompt', {
+      sessionKey: this.opts.sessionKey,
+      omitted,
+    })
+    this.emitText(ctx, 'text', BINARY_BLOCK_OMITTED_NOTICE)
+    // 提示独占一个 segment:关闭当前段,模型首段输出另起新 segment。
+    ctx.assistantSegmentClosed = true
+  }
   private async spawnTurn(ctx: TurnCtx): Promise<void> {
-    let cwd = this.opts.agentBaseDir
+    this.emitOmittedBinaryNotice(ctx)
     let repoSnapshot = null
     if (this.opts.sessionId && this.opts.getRepoSnapshot) {
       repoSnapshot = this.opts.getRepoSnapshot(this.opts.sessionId)
-      if (repoSnapshot?.status === 'ready' && repoSnapshot.workspaceDir)
-        cwd = repoSnapshot.workspaceDir
     }
+    const cwdDecision = decideEngineCwd({
+      agentBaseDir: this.opts.agentBaseDir,
+      repoSnapshot,
+      projectBound: Boolean(this.opts.projectId),
+    })
+    const cwd = cwdDecision.cwd
     const bin = resolveCursorWrapperBin()
     const selected = CURSOR_ENGINE_MODELS.find((model) => model.id === this.currentModel)
     if (!selected) throw new Error(`Cursor model '${String(this.currentModel)}' is not allowlisted`)
@@ -1417,7 +1561,9 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
 
     const contextDir = this.createContextDir(ctx)
     try {
-      const mcpEntry = resolveMcpMemoryEntry(this.opts.config.auth.claudeCodePath)
+      const mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
+        fallback: 'node-tsx',
+      })
       const platformResult = await buildPromptContext({
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
@@ -1425,10 +1571,31 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         provider: 'cursor',
         model: this.currentModel,
         repoSnapshot: repoSnapshot ?? undefined,
-        availableMcpTools: mcpEntry ? [...OPENCLAUDE_MEMORY_MCP_TOOLS] : [],
+        availableMcpTools: mcpLaunch ? [...OPENCLAUDE_MEMORY_MCP_TOOLS] : [],
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: this.opts.sessionId,
+        projectId: this.opts.projectId,
+      })
+      await persistRunContextSnapshot({
+        descriptor: this.opts.runContext,
+        applied: platformResult.applied,
+        promptContentSha256: platformResult.contentSha256,
+        frozen: platformResult.frozenProjectContext,
+        cwd: cwdDecision.cwd,
+        cwdSource: cwdDecision.source,
+        sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
+      })
+      log.info('prompt_context_built', {
+        sessionKey: this.opts.sessionKey,
+        agentId: this.opts.agentId,
+        backend: 'cursor',
+        prompt_bytes: Buffer.byteLength(platformResult.content || '', 'utf8'),
+        prompt_sha256: createHash('sha256')
+          .update(platformResult.content || '', 'utf8')
+          .digest('hex')
+          .slice(0, 12),
+        board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
       const prompt = renderCursorPrompt(
         platformResult.content,
@@ -1443,7 +1610,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // explicit config env below; shell tools get non-secret agent routing.
       const env = buildCursorSpawnEnv(this.opts.agentId, this.opts.sessionKey)
 
-      if (mcpEntry) {
+      if (mcpLaunch) {
         const gatewayToken = this.opts.config.gateway.accessToken
         if (!gatewayToken) throw new Error('Cursor platform MCP gateway token is unavailable')
         const tokenFile = resolve(contextDir, 'gateway-token')
@@ -1451,9 +1618,10 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         writeFileSync(tokenFile, gatewayToken, { mode: 0o600 })
         chmodSync(tokenFile, 0o600)
         const mcpConfig = buildCursorMemoryMcpConfig({
-          entry: mcpEntry,
+          launch: mcpLaunch,
           tokenFile,
           agentId: this.opts.agentId,
+          projectId: this.opts.projectId,
           sessionKey: this.opts.sessionKey,
           gatewayPort: this.opts.config.gateway.port,
           delegationDepth: this.opts.delegationDepth ?? 0,
@@ -1564,8 +1732,18 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         this.cleanupContextDir(ctx)
         ctx.resolveDrain?.()
         ctx.resolveDrain = null
-        if (!ctx.terminal)
-          this.finish(ctx, ctx.stderr.trim() || `Cursor CLI exited with code ${String(code)}`)
+        if (!ctx.terminal) {
+          let detail = ctx.resultSeen
+            ? ctx.resultDetail
+            : ctx.error || ctx.stderr.trim() || `Cursor CLI exited with code ${String(code)}`
+          // A success result followed by a non-zero wrapper exit is not a
+          // successful turn. Preserve the wrapper failure and its late slot
+          // marker rather than trusting the earlier stdout event.
+          if (ctx.resultSeen && code !== 0 && !detail) {
+            detail = ctx.stderr.trim() || `Cursor CLI exited with code ${String(code)}`
+          }
+          this.finish(ctx, detail)
+        }
         this.emit('exit', { code, signal, crashed: !ctx.interrupted && code !== 0 })
         if (this.active === ctx) this.active = null
       })
@@ -1576,6 +1754,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   }
   private emitText(ctx: TurnCtx, kind: 'text' | 'thinking', value: unknown, separate = false): void {
     const valueText = textOf(value); if (!valueText) return
+    if (ctx.lastContentKind !== kind) {
+      if (ctx.lastContentKind === 'text') ctx.assistantSegmentClosed = ctx.assistantSegments.length > 0
+      else if (ctx.lastContentKind === 'thinking') ctx.thinkingSegmentClosed = ctx.thinkingSegments.length > 0
+      ctx.lastContentKind = kind
+    }
     const segments = kind === 'text' ? ctx.assistantSegments : ctx.thinkingSegments
     const segmentClosed = kind === 'text' ? ctx.assistantSegmentClosed : ctx.thinkingSegmentClosed
     if (!segments.at(-1) || segmentClosed) {
@@ -1610,6 +1793,25 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       || (type === 'interaction_query' && textOf(event.subtype).toLowerCase() === 'request')
     this.flushPendingAssistant(ctx, aggregateBoundary)
     if (type === 'assistant') {
+      const blocks = assistantContentBlocksOf(event)
+      const hasStructuredThinking = blocks.some((block) => block.kind === 'thinking')
+      if (hasStructuredThinking) {
+        const textBlocks = blocks.filter((block) => block.kind === 'text')
+        const aggregatedText = textBlocks.map((block) => block.text).join('')
+        const skipText = textBlocks.length > 0
+          && Boolean(ctx.assistantPartialText)
+          && aggregatedText === ctx.assistantPartialText
+        for (const block of blocks) {
+          if (block.kind === 'text' && skipText) continue
+          this.emitText(ctx, block.kind, block.text, block.kind === 'text')
+        }
+        // thinking-only 事件不得清正文 partial：最终快照还要用它去重。
+        if (textBlocks.length > 0) {
+          ctx.assistantPartialText = ''
+          ctx.pendingAssistantText = null
+        }
+        return
+      }
       const value = assistantTextOf(event); if (!value) return
       const officialNested = recordOf(event.message) !== null
       const partialDelta = officialNested && typeof event.timestamp_ms === 'number' && event.model_call_id === undefined
@@ -1636,7 +1838,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (type === 'error') { ctx.error = textOf(event.message ?? event.error ?? event.data) || 'Cursor CLI error'; return }
     if (type === 'result') {
       const failed = event.is_error === true || ['error', 'failed', 'failure'].includes(textOf(event.subtype).toLowerCase())
-      this.finish(ctx, failed ? textOf(event.error ?? event.result ?? event.message) || ctx.error || 'Cursor CLI error' : ctx.error)
+      // The account wrapper emits slot_result only after the official CLI
+      // exits. Defer terminal settlement until process close so external
+      // billing and quota learning receive the slot that actually ran.
+      ctx.resultSeen = true
+      ctx.resultDetail = failed ? textOf(event.error ?? event.result ?? event.message) || ctx.error || 'Cursor CLI error' : ctx.error
     }
   }
   private flushPendingAssistant(ctx: TurnCtx, aggregateBoundary: boolean): void {
@@ -1669,13 +1875,23 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     ctx.pendingAssistantText = null
     ctx.assistantSegmentClosed = ctx.assistantSegments.length > 0
     ctx.thinkingSegmentClosed = ctx.thinkingSegments.length > 0
+    ctx.lastContentKind = null
   }
   private toolStart(ctx: TurnCtx, event: CursorEvent, rawIdOverride?: string): void {
     const rawId = rawIdOverride ?? (rawToolIdOf(event) || this.nextFallbackToolId(ctx))
     const id = this.safeToolId(ctx, rawId)
     const name = toolNameOf(event); const input = toolInputOf(event)
-    if (ctx.tools.has(id)) return
+    if (ctx.tools.has(id) || ctx.silentToolIds.has(id)) return
     this.flushPendingAssistant(ctx, false)
+    if (name === 'PresentOptions') {
+      ctx.silentToolIds.add(id)
+      ctx.presentOptionsCount += 1
+      if (ctx.presentOptionsCount <= 4) {
+        const fence = formatPresentOptionsFence(input)
+        if (fence) this.emitText(ctx, 'text', fence.endsWith('\n') ? fence : `${fence}\n`, true)
+      }
+      return
+    }
     this.closeContentSegments(ctx)
     const tool: TurnToolEntry = { toolUseId: id, blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: textOf(input).slice(0, 500), output: '', completed: false, isError: false, durationMs: 0, ts: Date.now(), arrivedAt: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() }
     ctx.tools.set(id, tool); ctx.pending.add(id); ctx.startedTools.set(id, keepaliveNow()); ctx.params.toolUseIdToName.set(id, name)
@@ -1686,8 +1902,9 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private toolResult(ctx: TurnCtx, event: CursorEvent): void {
     const rawId = rawToolIdOf(event) || this.nextFallbackToolId(ctx)
     const id = this.safeToolId(ctx, rawId)
-    if (!ctx.tools.has(id)) this.toolStart(ctx, event, rawId)
-    const tool = ctx.tools.get(id)!; if (tool.completed) return
+    if (!ctx.tools.has(id) && !ctx.silentToolIds.has(id)) this.toolStart(ctx, event, rawId)
+    if (ctx.silentToolIds.delete(id)) return
+    const tool = ctx.tools.get(id); if (!tool || tool.completed) return
     const { output, outputJson } = toolOutputOf(event); const isError = toolFailed(event)
     Object.assign(tool, { output, outputJson: structuredClone(outputJson), completed: true, isError, durationMs: Date.now() - (ctx.startedTools.get(id) ?? Date.now()), ts: Date.now() }); ctx.pending.delete(id)
     if (ctx.pending.size === 0) this.stopPendingKeepalive()
@@ -1878,6 +2095,13 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       const oldestTool = oldestId ? ctx.tools.get(oldestId) : undefined
       const oldestToolName = oldestTool?.toolName ?? 'unknown'
       const oldestElapsedSec = Math.round(elapsedMs / 1000)
+      // Pending + live parent PID is real work for the 15-minute idle watchdog.
+      // Cursor Task/Bash can run for a long time with no stdout, no CPU delta,
+      // and no transcript growth (I/O wait, host ssh, compiling). Gating
+      // lastActivityAt on those signals false-kills live subtasks. The 12h
+      // logical-turn cap still bounds a genuinely stuck process tree.
+      this.lastActivityAt = Date.now()
+      this.emit('activity')
       if (elapsedMs > maxMs) {
         if (!this.pendingKeepaliveOverBudgetLogged) {
           this.pendingKeepaliveOverBudgetLogged = true
@@ -1889,9 +2113,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
             maxMs,
           })
         }
-        return
-      }
-      if (this.pendingKeepaliveOverBudgetLogged) {
+      } else if (this.pendingKeepaliveOverBudgetLogged) {
         this.pendingKeepaliveOverBudgetLogged = false
         log.info('cursor pending-tool keepalive resumed', {
           sessionKey: this.opts.sessionKey,
@@ -1942,8 +2164,6 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         }
         this.pendingKeepaliveStallSince = null
         this.pendingKeepaliveStalledLogged = false
-        this.lastActivityAt = Date.now()
-        this.emit('activity')
         this.emitPendingToolProgress(ctx, {
           oldestToolName,
           transcriptGrew,
@@ -1993,8 +2213,19 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.currentModel = selected
   }
   get model(): string | undefined { return this.currentModel }
-  setEffortLevel(level: string | undefined): void { if (level !== undefined) throw new Error('Cursor engine does not expose reasoning effort') }
-  get effortLevel(): undefined { return undefined }
+  // Cursor 思考档编码在 canonical model id 里(supportsEffort:false),没有独立
+  // effort 旋钮。与 zcodeAdapter 一致:stash 请求值而非抛错 —— sessionManager 在
+  // turn 启动路径无条件硬调本 mutator,抛错会让 turn 永远卡在"思考中"(P0-1)。
+  setEffortLevel(level: string | undefined): void {
+    if (level !== undefined && level !== this.currentEffort) {
+      log.warn('cursor engine has no reasoning-effort knob; effort level stashed and ignored', {
+        sessionKey: this.opts.sessionKey,
+        effortLevel: level,
+      })
+    }
+    this.currentEffort = level
+  }
+  get effortLevel(): string | undefined { return this.currentEffort }
   setTraceId(_traceId: string | undefined): void {}
   setGoalState(_goal: GoalStateSnapshot | null): Promise<void> { return Promise.resolve() }
   updateConfig(config: OpenClaudeConfig): void { this.opts.config = config }
@@ -2011,6 +2242,9 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
 
 export const _internals = {
   CURSOR_PREAMBLE,
+  OPENCLAUDE_MEMORY_MCP_TOOLS,
+  formatPresentOptionsFence,
+  promptOf,
   renderCursorPrompt,
   validateCursorTurnPayload,
   validateCursorFinalPrompt,
@@ -2023,6 +2257,7 @@ export const _internals = {
   toolNameOf,
   toolInputOf,
   toolFailed,
+  toolOutputOf,
   questionSkippedByRuntime,
   parsePendingKeepaliveIntervalMs,
   parsePendingKeepaliveMaxMs,

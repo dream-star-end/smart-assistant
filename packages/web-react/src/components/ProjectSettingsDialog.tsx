@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState, type ReactElement } from "react";
 import { apiErrorMessage } from "../lib/api";
+import { taskboardApi, type Project as BoardProject } from "../lib/taskboard";
 import type { AuthSession, ChatProject, Session } from "../lib/types";
 import { cn } from "../lib/utils";
 import { ProjectAssetsPanel } from "./ProjectAssetsPanel";
@@ -37,6 +38,7 @@ export function ProjectSettingsDialog(props: {
     name?: string;
     color?: string | null;
     instructions?: string | null;
+    boardProjectId?: string | null;
   }) => Promise<void>;
   demo?: boolean;
   auth?: AuthSession | null;
@@ -62,6 +64,9 @@ export function ProjectSettingsDialog(props: {
   const [name, setName] = useState("");
   const [color, setColor] = useState<string | null>(null);
   const [instructions, setInstructions] = useState("");
+  const [boardProjectId, setBoardProjectId] = useState<string>("");
+  const [boardProjects, setBoardProjects] = useState<BoardProject[]>([]);
+  const [contextVersion, setContextVersion] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -74,8 +79,45 @@ export function ProjectSettingsDialog(props: {
       setName(project.name);
       setColor(project.color ?? null);
       setInstructions(project.instructions ?? "");
+      setBoardProjectId(project.boardProjectId ?? "");
+      setContextVersion(null);
     }
   }, [open, project, assetsOnly]);
+
+  useEffect(() => {
+    if (!open || assetsOnly || !authSession) return;
+    let cancelled = false;
+    void taskboardApi
+      .listProjects(authSession)
+      .then((items) => {
+        if (!cancelled) setBoardProjects(items);
+      })
+      .catch(() => {
+        if (!cancelled) setBoardProjects([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, assetsOnly, authSession]);
+
+  useEffect(() => {
+    if (!open || assetsOnly || !authSession || !boardProjectId.trim()) return;
+    let cancelled = false;
+    void taskboardApi
+      .getProjectContext(authSession, boardProjectId.trim())
+      .then((ctx) => {
+        if (cancelled) return;
+        setContextVersion(typeof ctx.version === "number" ? ctx.version : 0);
+        if (typeof ctx.instructions === "string") setInstructions(ctx.instructions);
+        else if (ctx.instructions === null) setInstructions("");
+      })
+      .catch(() => {
+        if (!cancelled) setContextVersion(0);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, assetsOnly, authSession, boardProjectId]);
 
   if (!assetsOnly && !project) return null;
 
@@ -95,11 +137,26 @@ export function ProjectSettingsDialog(props: {
     setSaving(true);
     setError("");
     try {
-      await onSave({
-        name: nameTrim,
-        color,
-        instructions: instructions.trim() === "" ? null : instructions,
-      });
+      const boundId = boardProjectId.trim() === "" ? null : boardProjectId.trim();
+      if (boundId && authSession) {
+        const expected = contextVersion ?? 0;
+        await taskboardApi.putProjectContext(authSession, boundId, {
+          expectedVersion: expected,
+          instructions: instructions.trim() === "" ? null : instructions,
+        });
+        await onSave({
+          name: nameTrim,
+          color,
+          boardProjectId: boundId,
+        });
+      } else {
+        await onSave({
+          name: nameTrim,
+          color,
+          instructions: instructions.trim() === "" ? null : instructions,
+          boardProjectId: boundId,
+        });
+      }
       onClose();
     } catch (e) {
       setError(apiErrorMessage(e, "保存项目设置失败"));
@@ -204,6 +261,25 @@ export function ProjectSettingsDialog(props: {
                 </button>
               ))}
             </div>
+          </Field>
+
+          <Field
+            label="绑定任务面板项目"
+            hint="绑定后，聊天与看板 stage 共用项目指令、资产、技能和正式记忆。未绑定 GitHub 仓库的会话使用项目工作区；仓库 clone 就绪时会话会切到仓库快照（允许覆盖）。"
+          >
+            <select
+              className="w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm"
+              value={boardProjectId}
+              onChange={(e) => setBoardProjectId(e.target.value)}
+              aria-label="绑定任务面板项目"
+            >
+              <option value="">不绑定</option>
+              {boardProjects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.key} · {p.name}
+                </option>
+              ))}
+            </select>
           </Field>
 
           <Field

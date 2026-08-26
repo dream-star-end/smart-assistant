@@ -80,7 +80,9 @@ import {
   remove as removeFromQueue,
   getCommandsByMaxPriority,
   isSlashCommand,
+  selectMidTurnDrainCommands,
 } from './utils/messageQueueManager.js'
+import { ackMidTurnDeliveredTaskNotifications } from './utils/taskNotificationAck.js'
 import {
   type AutonomyTurnOutcome,
   claimConsumableQueuedAutonomyCommands,
@@ -1843,8 +1845,9 @@ async function* queryLoop(
     //
     // Drain pending notifications. LocalShellTask completions are 'next'
     // (when MONITOR_TOOL is on) and drain without Sleep. Other task types
-    // (agent/workflow/framework) still default to 'later' — the Sleep flush
-    // covers those. If all task types move to 'next', this branch could go.
+    // historically defaulted to 'later' — the Sleep flush covered those.
+    // LocalAgentTask now enqueues at 'next', and selectMidTurnDrainCommands
+    // also pulls later-priority task-notifications so Sleep is not required.
     //
     // Slash commands are excluded from mid-turn drain — they must go through
     // processSlashCommand after the turn ends (via useQueueProcessor), not be
@@ -1861,14 +1864,10 @@ async function* queryLoop(
     const isMainThread =
       querySource.startsWith('repl_main_thread') || querySource === 'sdk'
     const currentAgentId = toolUseContext.agentId
-    const queuedCommandsSnapshot = getCommandsByMaxPriority(
-      sleepRan ? 'later' : 'next',
-    ).filter(cmd => {
-      if (isSlashCommand(cmd)) return false
-      if (isMainThread) return cmd.agentId === undefined
-      // Subagents only drain task-notifications addressed to them — never
-      // user prompts, even if someone stamps an agentId on one.
-      return cmd.mode === 'task-notification' && cmd.agentId === currentAgentId
+    const queuedCommandsSnapshot = selectMidTurnDrainCommands({
+      sleepRan,
+      isMainThread,
+      currentAgentId,
     })
     const queuedAutonomyClaim = await claimConsumableQueuedAutonomyCommands(
       queuedCommandsSnapshot,
@@ -1970,6 +1969,11 @@ async function* queryLoop(
       }
       removeFromQueue(consumedCommands)
     }
+
+    ackMidTurnDeliveredTaskNotifications([
+      ...claimedConsumedCommands,
+      ...consumedCommands,
+    ])
 
     // Instrumentation: Track file change attachments after they're added
     const fileChangeAttachmentCount = count(

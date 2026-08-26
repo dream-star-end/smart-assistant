@@ -36,6 +36,7 @@ export interface ReminderJobView {
   oneshot?: boolean
   deliver?: string
   nextRunAt?: string
+  resume?: string
 }
 
 /** 空白压平:连续空白/换行/制表符 → 单个空格,并去首尾。行式输出的第一道防线。 */
@@ -86,6 +87,7 @@ export function formatReminderLine(job: ReminderJobView): string {
     deliverLabel(job.deliver),
   ]
   if (isSystem) bits.push('系统')
+  if (job.resume === 'origin-session') bits.push('续跑本对话')
   if (job.nextRunAt) bits.push(`下次 ${job.nextRunAt}`)
   return `- **${title}** (ID: \`${job.id}\`) — ${bits.join(' · ')}`
 }

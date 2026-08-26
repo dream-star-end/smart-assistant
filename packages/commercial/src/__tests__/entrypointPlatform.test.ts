@@ -85,16 +85,16 @@ describe("platform-seed.yaml schema v2 + validatePlatformSeed", () => {
     const byId = (id: string) => doc.agents.find((a: { id: string }) => a.id === id);
     const main = byId("main");
     // 执行三元组(声明 = 容器侧唯一权威;值的一致性锚在 runtimeEntrypointPolicy.test.ts)。
-    assert.equal(main.model, "glm-5.3");
-    assert.equal(main.provider, "ark");
+    assert.equal(main.model, "glm-5.3-zai");
+    assert.equal(main.provider, "zai");
     assert.equal(main.runnerKind, undefined, "main 走默认 runner");
     assert.equal(main.persona, "personas/main.md");
     assert.equal(main.permissionMode, "bypassPermissions");
     assert.equal(main.displayName, "全能助手");
     assert.equal(main.toolsets, undefined, "main declares no toolsets (matches legacy inline shape)");
     const hr = byId("hidden-reviewer");
-    assert.equal(hr.model, "glm-5.3");
-    assert.equal(hr.provider, "ark");
+    assert.equal(hr.model, "glm-5.3-zai");
+    assert.equal(hr.provider, "zai");
     assert.equal(hr.persona, "personas/hidden-reviewer.md");
     assert.equal(hr.forcePersona, true, "裁决词汇必须每 boot 强制刷新");
     assert.equal(hr.permissionMode, "bypassPermissions");
@@ -175,8 +175,8 @@ describe("platform-seed.yaml schema v2 + validatePlatformSeed", () => {
     const doc = pb.validatePlatformSeed(JSON.parse(JSON.stringify(pb.DEV_FALLBACK_SEED_DOC)));
     assert.equal(doc.schemaVersion, 2);
     assert.deepEqual(doc.agents.map((a: { id: string }) => a.id), ["main"]);
-    assert.equal(doc.agents[0].model, "glm-5.3");
-    assert.equal(doc.agents[0].provider, "ark");
+    assert.equal(doc.agents[0].model, "glm-5.3-zai");
+    assert.equal(doc.agents[0].provider, "zai");
   });
 });
 

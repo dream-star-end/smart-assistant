@@ -31,6 +31,7 @@ export type AccountRow = {
   egress_host_uuid: string | null;
   has_refresh_token: boolean;
   cursor_quota_class: "unknown" | "other_ok" | "cursor_only" | null;
+  cursor_sand_enabled: boolean | null;
   created_at: string;
   updated_at: string;
   today_requests?: number;

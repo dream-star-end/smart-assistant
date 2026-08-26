@@ -19,6 +19,7 @@ import assert from 'node:assert/strict'
 import { afterEach, describe, it } from 'node:test'
 
 import { DELEGATE_QUEUE_MAX_WAITERS, Gateway, PerTurnDelegationGuard } from '../server.js'
+import { OutboundRingBuffer } from '../outboundRing.js'
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-queue-test'
 const PARENT_PEER = 'wsess-queue-test'
@@ -94,6 +95,7 @@ function makeGateway(): any {
   gw.deliver = (out: any) => {
     gw.delivered.push(out)
   }
+  gw._outboundRing = new OutboundRingBuffer()
   return gw
 }
 
@@ -298,10 +300,7 @@ describe('资源闸有界排队 — 父会话进度提示', () => {
     assert.equal(queued.goal, '实现子任务', '排队帧必须带 goal 关联键以嵌回队长工具卡')
     const started = blocks.find((b) => b.phase === 'start' && /开始委派给/.test(b.text || ''))
     assert.ok(started, '放行后仍必须发既有"开始委派"帧')
-    assert.ok(
-      blocks.indexOf(queued) < blocks.indexOf(started),
-      '排队帧在开始帧之前',
-    )
+    assert.ok(blocks.indexOf(queued) < blocks.indexOf(started), '排队帧在开始帧之前')
   })
 
   it('排队超时且已发排队帧 → 补 error 终止帧,卡片不悬挂', async () => {
@@ -357,8 +356,6 @@ describe('资源闸有界排队 — 语义边界', () => {
   })
 })
 
-
-
 // ── leftover live journal 根治: emitProgress 盖父轮 cmid ────────────────────
 
 describe('emitProgress stamps parent webchat clientMessageId', () => {
@@ -404,6 +401,43 @@ describe('emitProgress stamps parent webchat clientMessageId', () => {
     assert.ok(outs.length > 0)
     for (const out of outs) {
       assert.equal(out.clientMessageId, undefined)
+    }
+  })
+})
+
+describe('emitProgress respects terminal fence', () => {
+  it('父 fence 无 open → progress 无旧 cmid', async () => {
+    const gw = makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent._runningClientMessageId = 'old-parent-cmid'
+    gw._outboundRing.beginActiveTurn(PARENT_KEY, 'old-parent-cmid')
+    gw._outboundRing.endActiveTurn(PARENT_KEY, 'old-parent-cmid')
+    const r = await delegate(gw, 'coding-assistant', taskBody({ streamProgress: true }))
+    assert.equal(r.status, 200)
+    const outs = gw.delivered.filter((o: any) =>
+      (o.blocks || []).some((b: any) => b?.kind === 'delegate_progress'),
+    )
+    assert.ok(outs.length > 0)
+    for (const out of outs) {
+      assert.equal(out.clientMessageId, undefined)
+    }
+  })
+
+  it('父 fence 有 retry → 跟新 cmid', async () => {
+    const gw = makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    gw._outboundRing.beginActiveTurn(PARENT_KEY, 'old-parent-cmid')
+    gw._outboundRing.endActiveTurn(PARENT_KEY, 'old-parent-cmid')
+    parent._runningClientMessageId = 'retry-parent-cmid'
+    gw._outboundRing.beginActiveTurn(PARENT_KEY, 'retry-parent-cmid')
+    const r = await delegate(gw, 'coding-assistant', taskBody({ streamProgress: true }))
+    assert.equal(r.status, 200)
+    const outs = gw.delivered.filter((o: any) =>
+      (o.blocks || []).some((b: any) => b?.kind === 'delegate_progress'),
+    )
+    assert.ok(outs.length > 0)
+    for (const out of outs) {
+      assert.equal(out.clientMessageId, 'retry-parent-cmid')
     }
   })
 })

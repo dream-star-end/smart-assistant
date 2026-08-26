@@ -120,9 +120,16 @@ function fireNotification(session: UnreadSessionInput): void {
   }
 }
 
+function shouldMarkActiveRead(session: UnreadSessionInput | undefined): boolean {
+  if (!session) return true;
+  // 还在跑就盖水位，terminal_at 会晚于 last_read_at，刷新后又绿。
+  return !isRunning(session.runState);
+}
+
 /**
  * 侧栏未读：服务端 `unread` 为权威；本地 Set 只做乐观更新。
- * 打开会话 POST mark-read。旧 localStorage 未读 key 只删除、不回填服务端。
+ * 打开已终态会话才 POST mark-read；running 等到本 tab 看到终态再盖。
+ * 旧 localStorage 未读 key 只删除、不回填服务端。
  */
 export function useUnreadSessions(args: {
   sessions: UnreadSessionInput[];
@@ -219,8 +226,13 @@ export function useUnreadSessions(args: {
     });
   }, []);
 
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
+
   useEffect(() => {
     if (!activeId) return;
+    const row = sessionsRef.current.find((s) => s.id === activeId);
+    if (!shouldMarkActiveRead(row)) return;
     markRead(activeId);
   }, [activeId, markRead]);
 
@@ -245,6 +257,8 @@ export function useUnreadSessions(args: {
       if (toMark.length > 0) {
         for (const s of toMark) {
           if (s.id === activeIdRef.current) {
+            // 打开时若已 stamp 过，必须让终态后再 POST，否则水位早于 terminal_at。
+            optimisticReadRef.current.delete(s.id);
             markRead(s.id);
             continue;
           }
@@ -264,7 +278,7 @@ export function useUnreadSessions(args: {
     const active = activeIdRef.current;
     if (active) {
       const row = sessions.find((s) => s.id === active);
-      if (row?.unread === true) markRead(active);
+      if (row?.unread === true && shouldMarkActiveRead(row)) markRead(active);
     }
 
     rebuildUnread(sessions);

@@ -33,6 +33,7 @@ import {
   type ChatSession,
   type ChildBlock,
   clearTurnTiming,
+  isEngineStartupTurnStatus,
   isRetryingTurnStatus,
   isServerAuthoredRow,
   markFrameReceived,
@@ -182,7 +183,38 @@ export function resetAgentFrameSeqCursorsForSession(sess: ChatSession): void {
 // ═══════════════ delegate / subagent helpers（websocket.js:800-1172）═══════════════
 
 function isDelegateToolName(name?: string): boolean {
-  return /(?:^|_)delegate_task$/.test(name || "");
+  return /(?:^|_)(delegate_task|send_to_agent)$/.test(name || "");
+}
+
+function isSendToAgentToolName(name?: string): boolean {
+  if (/(?:^|_)send_to_agent$/.test(name || "")) return true;
+  const mcp = parseMcpToolName(name);
+  return mcp?.server === "openclaude-memory" && mcp.op === "send_to_agent";
+}
+
+function isRunningBackgroundToolResult(output?: string, outputJson?: unknown): boolean {
+  const payloads: unknown[] = [outputJson, output];
+  for (const raw of payloads) {
+    const parsed = parseJsonObject(raw);
+    if (!parsed) continue;
+    if (parsed.status === "running") return true;
+    const wrapped = extractMcpContentText(parsed);
+    const inner = parseJsonObject(wrapped);
+    if (inner?.status === "running") return true;
+  }
+  return false;
+}
+
+function backgroundDelegateJobId(output?: string, outputJson?: unknown): string | null {
+  for (const raw of [outputJson, output]) {
+    const parsed = parseJsonObject(raw)
+    const direct = typeof parsed?.jobId === "string" ? parsed.jobId : null
+    if (direct) return direct
+    const wrapped = parsed ? extractMcpContentText(parsed) : null
+    const inner = parseJsonObject(wrapped)
+    if (typeof inner?.jobId === "string") return inner.jobId
+  }
+  return null
 }
 
 function normalizeDelegateGoalKey(raw: unknown): string {
@@ -192,7 +224,7 @@ function normalizeDelegateGoalKey(raw: unknown): string {
     .slice(0, 1024);
 }
 
-type DelegateToolInfo = { agentId: string; goalRaw: string; goalKey: string };
+type DelegateToolInfo = { agentId: string; goalRaw: string; goalKey: string; background?: boolean };
 
 function asPlainObject(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
@@ -240,12 +272,13 @@ function parseMcpToolName(name?: string): { server: string; op: string } | null 
   return { server: normalizeMcpServerName(rest.slice(0, idx)), op: rest.slice(idx + 2) };
 }
 
-function delegateInfoFromArgs(args: Record<string, unknown>): DelegateToolInfo {
-  const goalRaw = str(args.goal);
+function delegateInfoFromArgs(args: Record<string, unknown>, background = false): DelegateToolInfo {
+  const goalRaw = str(args.goal) || str(args.message);
   return {
     agentId: str(args.agentId) || "main",
     goalRaw,
     goalKey: normalizeDelegateGoalKey(goalRaw),
+    ...(background ? { background: true } : {}),
   };
 }
 
@@ -253,18 +286,18 @@ function parseDelegateToolInfo(toolName?: string, inputJson?: unknown, inputPrev
   const name = toolName || "";
   const input = parseToolInputObject(inputJson, inputPreview) ?? {};
   const mcp = parseMcpToolName(name);
-  if (mcp?.server === "openclaude-memory" && mcp.op === "delegate_task") {
-    return delegateInfoFromArgs(input);
+  if (mcp?.server === "openclaude-memory" && (mcp.op === "delegate_task" || mcp.op === "send_to_agent")) {
+    return delegateInfoFromArgs(input, mcp.op === "send_to_agent");
   }
   if (isDelegateToolName(name) && parseCodexTypeName(name) !== "mcpToolCall") {
-    return delegateInfoFromArgs(input);
+    return delegateInfoFromArgs(input, isSendToAgentToolName(name));
   }
   if (parseCodexTypeName(name) !== "mcpToolCall") return null;
   const server = normalizeMcpServerName(str(input.server) || str(input.serverName));
   const op = str(input.tool) || str(input.toolName) || str(input.name);
-  if (server !== "openclaude-memory" || op !== "delegate_task") return null;
+  if (server !== "openclaude-memory" || (op !== "delegate_task" && op !== "send_to_agent")) return null;
   const rawArgs = input.arguments ?? input.args ?? input.params;
-  return delegateInfoFromArgs(parseArgsObject(rawArgs));
+  return delegateInfoFromArgs(parseArgsObject(rawArgs), op === "send_to_agent");
 }
 
 /**
@@ -320,7 +353,7 @@ export function friendlyDelegateResultPreview(raw: unknown): string {
   const server = normalizeMcpServerName(str(parsed.server) || str(parsed.serverName));
   const op = str(parsed.tool) || str(parsed.toolName) || str(parsed.name);
   const content = extractMcpContentText(parsed);
-  if (server === "openclaude-memory" && op === "delegate_task") return content;
+  if (server === "openclaude-memory" && (op === "delegate_task" || op === "send_to_agent")) return content;
   return content || (text.trim().startsWith("{") ? "" : text);
 }
 
@@ -329,7 +362,7 @@ function isDelegateResultWrapper(raw: unknown): boolean {
   if (!parsed) return false;
   const server = normalizeMcpServerName(str(parsed.server) || str(parsed.serverName));
   const op = str(parsed.tool) || str(parsed.toolName) || str(parsed.name);
-  return server === "openclaude-memory" && op === "delegate_task";
+  return server === "openclaude-memory" && (op === "delegate_task" || op === "send_to_agent");
 }
 
 /** 子 agent 块合并进 owning Agent 卡 childBlocks（coalesce 同类尾块）。*/
@@ -438,7 +471,19 @@ function appendSubagentBlock(
 }
 
 /** 严格唯一 (agentId, goal) 把 delegate run 绑回 leader 的 delegate_task 卡。*/
-function bindDelegateRunToGroup(sess: ChatSession, block: { agentId?: string; goal?: string; runId: string }): string | null {
+function bindDelegateRunToGroup(sess: ChatSession, block: { agentId?: string; goal?: string; jobId?: string; runId: string }): string | null {
+  if (block.jobId) {
+    const exact = sess.messages.filter((m) =>
+      m.role === "agent-group" && !isServerAuthoredRow(m) && m._delegate &&
+      !m._delegateRunId && m._delegateJobId === block.jobId,
+    )
+    if (exact.length === 1) {
+      exact[0]._delegateRunId = block.runId
+      if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map()
+      sess._delegateRunGroups.set(block.runId, exact[0].id)
+      return exact[0].id
+    }
+  }
   const agentId = block.agentId || "";
   const goal = typeof block.goal === "string" ? block.goal : "";
   if (!agentId || !goal) return null;
@@ -552,6 +597,8 @@ function matchesDelegateProgress(groupMsg: ChatMessage, progress: ChatMessage): 
   if (isImmutableTapeViewportRow(progress)) return false;
   // live progress 只绑本地富卡,不落到 server 骨架行(债A：骨架行无过程树,不接收 childBlocks)。
   if (isServerAuthoredRow(groupMsg)) return false;
+  if (progress._delegateJobId && groupMsg._delegateJobId === progress._delegateJobId) return true;
+  if (progress._delegateJobId && groupMsg._delegateJobId && groupMsg._delegateJobId !== progress._delegateJobId) return false;
   if (progress.runId && groupMsg._delegateRunId === progress.runId) return true;
   if (groupMsg._delegateRunId && progress.runId && groupMsg._delegateRunId !== progress.runId) return false;
   const agentId = groupMsg._delegateAgentId || "";
@@ -807,6 +854,7 @@ type DelegateProgressBlock = {
   toolName?: string;
   isError?: boolean;
   goal?: string;
+  jobId?: string;
   block?: OutboundContentBlock;
   usageRunId?: string;
   usage?: NonNullable<ChatSession["_liveTurnUsage"]>["usage"];
@@ -1125,6 +1173,7 @@ function handleDelegateProgressBlock(
       _delegateRunId: block.runId,
       _delegateAgentId: block.agentId || "",
       _delegateGoal: goalRaw ? normalizeDelegateGoalKey(goalRaw) : "",
+      _delegateJobId: typeof block.jobId === "string" ? block.jobId : undefined,
       _completed: false,
       ...(turnOwnerId ? { _turnOwnerId: turnOwnerId } : {}),
     });
@@ -1145,6 +1194,7 @@ function handleDelegateProgressBlock(
       agentId: block.agentId || "",
       goal: typeof block.goal === "string" ? block.goal : "",
       _delegateGoal: typeof block.goal === "string" ? normalizeDelegateGoalKey(block.goal) : "",
+      _delegateJobId: typeof block.jobId === "string" ? block.jobId : undefined,
       entries: [],
       childBlocks: [],
       _completed: false,
@@ -1533,10 +1583,15 @@ export function applyOutboundMessage(
   if (!frame.isFinal && !frame.cronJob && hasBlocks && !lifecycleSidebandFrame && !sess._sendingInFlight)
     sess._sendingInFlight = true;
   if (hasBlocks || frame.isFinal) markFrameReceived(sess);
-  // 自动重试软提示的**内容帧兜底消解**:引擎在下一 attempt 产出真实内容(非 tail-only)即代表流
-  // 已恢复 → 清 retrying,防 gateway 的 turn_status:null 复位帧在断线重连窗口丢失时软提示粘住。
+  // 自动重试/引擎冷启动软提示的**内容帧兜底消解**:引擎产出真实内容(非 tail-only)即代表流
+  // 已恢复 → 清 retrying/engine_*,防 gateway 的 turn_status:null 复位帧在断线重连窗口丢失时软提示粘住。
   // final/error/interrupted 由 clearTurnTiming 统一清 _turnStatus,此处只兜「流恢复但 null 帧丢」。
-  if (hasBlocks && !lifecycleSidebandFrame && isRetryingTurnStatus(sess._turnStatus)) sess._turnStatus = null;
+  if (
+    hasBlocks &&
+    !lifecycleSidebandFrame &&
+    (isRetryingTurnStatus(sess._turnStatus) || isEngineStartupTurnStatus(sess._turnStatus))
+  )
+    sess._turnStatus = null;
   // thinking-safety：通过守卫的非 final 帧重置；isFinal 清（由 socket 持 timer）。tail-only 帧不触发。
   if (sess._sendingInFlight && !frame.isFinal && !lifecycleSidebandFrame) effects.onLiveFrame?.(sess);
 
@@ -1627,6 +1682,14 @@ export function applyOutboundMessage(
       // vanilla 在此 flush thinking 的 rAF 残留再清指针；React 侧文本已累加在模型上，
       // 无独立 rAF buffer，直接清指针即可（渲染节流在订阅侧批量 notify）。
       sess._streamingThinking = null;
+      if (
+        b.messageId &&
+        sess._streamingAssistant &&
+        sess._streamingAssistant.id !== b.messageId
+      ) {
+        sess._streamingAssistant.completedAt = Date.now();
+        sess._streamingAssistant = null;
+      }
       if (!sess._streamingAssistant) {
         if (
           b.messageId && sess.messages.some((message) =>
@@ -1655,6 +1718,14 @@ export function applyOutboundMessage(
       sess._streamingAssistant.text += blockText;
       sess._streamingAssistant.completedAt = Date.now();
     } else if (b.kind === "thinking") {
+      if (
+        b.messageId &&
+        sess._streamingThinking &&
+        sess._streamingThinking.id !== b.messageId
+      ) {
+        sess._streamingThinking.completedAt = Date.now();
+        sess._streamingThinking = null;
+      }
       if (!sess._streamingThinking) {
         if (
           b.messageId && sess.messages.some((message) =>
@@ -1771,7 +1842,12 @@ export function applyOutboundMessage(
           if (isDelegate) {
             const info = delegateInfo!;
             desc = (info.goalRaw && info.goalRaw.trim()) || preview || "委托子任务";
-            delegateFields = { _delegate: true, _delegateAgentId: info.agentId, _delegateGoal: info.goalKey };
+            delegateFields = {
+              _delegate: true,
+              _delegateAgentId: info.agentId,
+              _delegateGoal: info.goalKey,
+              ...(info.background || isSendToAgentToolName(tb.toolName) ? { _background: true } : {}),
+            };
           } else {
             const originRaw = input && typeof input.openclaudeOrigin === "string" ? input.openclaudeOrigin : "";
             const teamFallback = input?.openclaudeTeamFallback === true;
@@ -1807,6 +1883,7 @@ export function applyOutboundMessage(
               existingTool._delegate = true;
               existingTool._delegateAgentId = fields._delegateAgentId;
               existingTool._delegateGoal = fields._delegateGoal;
+              if (fields._background) existingTool._background = true;
               if (!existingTool._turnOwnerId && frameTurnOwnerId) {
                 existingTool._turnOwnerId = frameTurnOwnerId;
               }
@@ -1847,6 +1924,7 @@ export function applyOutboundMessage(
                 groupMsg._delegate = true;
                 groupMsg._delegateAgentId = delegateFields._delegateAgentId;
                 groupMsg._delegateGoal = delegateFields._delegateGoal;
+                if (delegateFields._background) groupMsg._background = true;
                 adoptStandaloneDelegateRun(sess, groupMsg);
               } else {
                 if (agentFields._agentGroupOrigin) groupMsg._agentGroupOrigin = agentFields._agentGroupOrigin;
@@ -1920,12 +1998,22 @@ export function applyOutboundMessage(
           const rawOutput = rb.output ?? rb.preview ?? "";
           const rawPreview = rb.preview ?? rawOutput;
           const preview = friendlyDelegateResultPreview(rawPreview) || (isDelegateResultWrapper(rawPreview) ? "" : rawPreview);
-          groupMsg._completed = true;
-          groupMsg._duration = Date.now() - (groupMsg.startTime || Date.now());
-          if (preview && !groupMsg._resultPreview) groupMsg._resultPreview = preview.slice(0, 200);
           groupMsg.output = rawOutput;
           if (rb.outputJson !== undefined) groupMsg.outputJson = rb.outputJson;
-          groupMsg._isError = !!rb.isError || !!groupMsg._isError;
+          if (isRunningBackgroundToolResult(rawOutput, rb.outputJson)) {
+            groupMsg._background = true;
+            groupMsg._completed = false;
+            const jobId = backgroundDelegateJobId(rawOutput, rb.outputJson)
+            if (jobId) {
+              groupMsg._delegateJobId = jobId
+              adoptStandaloneDelegateRun(sess, groupMsg)
+            }
+          } else {
+            groupMsg._completed = true;
+            groupMsg._duration = Date.now() - (groupMsg.startTime || Date.now());
+            if (preview && !groupMsg._resultPreview) groupMsg._resultPreview = preview.slice(0, 200);
+            groupMsg._isError = !!rb.isError || !!groupMsg._isError;
+          }
         }
         continue;
       }
@@ -2065,12 +2153,14 @@ export function applyOutboundMessage(
         m._partial = false;
         m.completedAt = Date.now();
       }
-      if (m.role === "tool" && typeof m._completed === "boolean" && !m._completed && !m.error) {
+      if (m.role === "tool" && typeof m._completed === "boolean" && !m._completed && !m.error && !m._background) {
         m._completed = true;
       }
       // agent-group / delegate-progress：turn 收尾仍未完成 → 标完成。turn 已结束就不该再
       // "运行中/子智能体启动中…"(委托帧 runId 绑定缺位时会卡住,这里兜底收口)。
-      if ((m.role === "agent-group" || m.role === "delegate-progress") && !m._completed) {
+      // send_to_agent 是真后台：父回合结束后子任务仍在跑，组卡必须保持运行中直到
+      // delegate_progress phase=done|error。
+      if ((m.role === "agent-group" || m.role === "delegate-progress") && !m._completed && !m._background) {
         m._completed = true;
         if (m.completedAt == null) m.completedAt = Date.now();
       }
@@ -2135,6 +2225,12 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
   // retrying 分支携带,故此处显式 narrow,不接受其它态漂出 retry 字段。
   if (frame.status === "compacting") {
     sess._turnStatus = "compacting";
+  } else if (frame.status === "waiting_for_user") {
+    sess._turnStatus = "waiting_for_user";
+  } else if (frame.status === "engine_starting" || frame.status === "engine_resuming") {
+    // 引擎冷启动阶段:gateway 在首个可观察事件时权威清除(status:null);
+    // 内容帧兜底消解见 applyOutboundMessage。
+    sess._turnStatus = frame.status;
   } else if (frame.status === "retrying") {
     sess._turnStatus = {
       kind: "retrying",

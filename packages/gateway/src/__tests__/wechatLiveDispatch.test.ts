@@ -187,8 +187,11 @@ test('v3 WeChat sends a completion marker when final has no text for WeChat', as
   assert.match(wechatCalls[0]!.blocks[0]!.text, /任务已完成/)
   assert.deepEqual(
     delivered.map((d) => d.out.blocks?.[0]?.kind ?? 'empty-final'),
-    ['thinking', 'empty-final'],
+    ['thinking', 'text', 'empty-final'],
   )
+  assert.equal(delivered[1]!.out.blocks[0]!.text, '本轮未能产出可见回复，已结束，可重试或继续')
+  assert.equal(delivered[1]!.out.isFinal, false)
+  assert.equal(delivered.at(-1)!.out.isFinal, true)
 })
 
 test('non-WeChat adapters keep historical aggregate-on-final behavior', async () => {

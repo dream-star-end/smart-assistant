@@ -18,8 +18,9 @@ import {
   type V3WechatOutboundConfig,
 } from "./v3WechatOutbound.js"
 
-/** 容器侧路径常量,必须与 master proactiveReceiver.WECHAT_PROACTIVE_PATH 对齐。 */
-export const WECHAT_PROACTIVE_PATH = "/internal/v3/wechat-proactive"
+/** 单一权威在 protocol 内部路由注册表(master proactiveReceiver 同源)。 */
+import { WECHAT_PROACTIVE_PATH } from "@openclaude/protocol"
+export { WECHAT_PROACTIVE_PATH }
 
 const ATTEMPT_TIMEOUT_MS = 10_000
 const MAX_RESP_BYTES = 16 * 1024

@@ -151,6 +151,9 @@ export interface Project {
   description: string | null
   /** 关联代码路径 / 远程主机,可选。 */
   workspace: string | null
+  /** Structured cwd spec. Authority for agent cwd; never the projects/ data dir. */
+  workspaceSpec?: { kind: 'default' | 'isolated' | 'container_path'; path?: string } | null
+  contextVersion?: number
   labels: string[]
   archivedAt: number | null
   createdAt: number
@@ -213,8 +216,13 @@ export interface PipelineStage {
   /** kind='ai' 时必填。 */
   agentId: string | null
   /**
+   * 覆盖该阶段 agent 的默认模型。null = 沿用 agent.model。
+   * 非空必须是当前 model catalog 投影里存在且 available 的 id。
+   */
+  model: string | null
+  /**
    * 提示词模板。占位符:{{ticket.identifier}} {{ticket.title}} {{ticket.body}}
-   * {{last_run.summary}} {{comments}} {{stage.exit_checklist}}。
+   * {{last_run.summary}} {{last_run.output}} {{comments}} {{stage.exit_checklist}}。
    */
   promptTemplate: string | null
   /** 该阶段允许的工具集;null = 用 agent 默认。 */
@@ -274,12 +282,21 @@ export interface TicketRun {
   tokensIn: number | null
   tokensOut: number | null
   costUsd: number | null
+  /**
+   * 补价因没拿到 master 的 agent_cost_overrides 字段而 fail-closed。
+   * null = 旧行 / 未判定;true = 成本不精确(保持 0);false = 已按复合倍率对齐。
+   */
+  costImprecise?: boolean | null
   /** agent 的结论摘要,写进卡片时间线。 */
   summary: string | null
   /** 完整产出。 */
   outputMd: string | null
   error: string | null
   createdAt: number
+  /** Spawn-time snapshot file id (safe run segment). Old runs stay null. */
+  contextSnapshotId?: string | null
+  contextSha256?: string | null
+  contextVersion?: number | null
 }
 
 export interface TicketRelation {

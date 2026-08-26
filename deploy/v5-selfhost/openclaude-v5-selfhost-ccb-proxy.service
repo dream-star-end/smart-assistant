@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenClaude v5 selfhost CCB HTTPS proxy bridge
+After=network-online.target openclaude-egress.service openclaude-v5-selfhost-hostnet.service
+Requires=openclaude-egress.service openclaude-v5-selfhost-hostnet.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat TCP-LISTEN:18991,bind=172.31.0.1,reuseaddr,fork TCP:127.0.0.1:18991
+Restart=always
+RestartSec=2s
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

@@ -65,6 +65,7 @@ describe("useUnreadSessions", () => {
       userId: "u1",
       auth,
     });
+    expect(mark).not.toHaveBeenCalled();
     rerender({
       sessions: [{ id: "s1", title: "当前", runState: "idle", lastOutcome: "crashed" }],
       activeId: "s1",
@@ -72,25 +73,66 @@ describe("useUnreadSessions", () => {
       auth,
     });
     expect(result.current.unreadIds.has("s1")).toBe(false);
-    await waitFor(() => expect(mark).toHaveBeenCalled());
+    await waitFor(() => expect(mark).toHaveBeenCalledTimes(1));
   });
 
   test("当前会话在 unread=false 回执前重复刷新只发一次 mark-read", async () => {
     const auth = createMemoryAuthSession(() => {}, "token");
     const mark = vi.spyOn(api, "markSessionRead").mockResolvedValue({ ok: true, updated: 1 });
-    const makeSessions = (): UnreadSessionInput[] => [
+    const makeRunning = (): UnreadSessionInput[] => [
       { id: "s1", title: "当前", unread: true, runState: "running" },
     ];
+    const makeTerminal = (): UnreadSessionInput[] => [
+      { id: "s1", title: "当前", unread: true, runState: "idle", lastOutcome: "completed" },
+    ];
     const { rerender } = hook({
-      sessions: makeSessions(),
+      sessions: makeRunning(),
       activeId: "s1",
       userId: "u1",
       auth,
     });
     for (let i = 0; i < 20; i += 1) {
-      rerender({ sessions: makeSessions(), activeId: "s1", userId: "u1", auth });
+      rerender({ sessions: makeRunning(), activeId: "s1", userId: "u1", auth });
     }
+    expect(mark).not.toHaveBeenCalled();
+    rerender({ sessions: makeTerminal(), activeId: "s1", userId: "u1", auth });
     await waitFor(() => expect(mark).toHaveBeenCalledTimes(1));
+    for (let i = 0; i < 20; i += 1) {
+      rerender({ sessions: makeTerminal(), activeId: "s1", userId: "u1", auth });
+    }
+    expect(mark).toHaveBeenCalledTimes(1);
+  });
+
+  test("打开仍在 running 的会话不 mark-read；终态后才 POST，刷新绿点不回", async () => {
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const mark = vi.spyOn(api, "markSessionRead").mockResolvedValue({ ok: true, updated: 1 });
+    const { result, rerender } = hook({
+      sessions: [{ id: "s1", title: "当前", unread: true, runState: "running" }],
+      activeId: "s1",
+      userId: "u1",
+      auth,
+    });
+    expect(mark).not.toHaveBeenCalled();
+    rerender({
+      sessions: [
+        { id: "s1", title: "当前", unread: true, runState: "idle", lastOutcome: "completed" },
+      ],
+      activeId: "s1",
+      userId: "u1",
+      auth,
+    });
+    await waitFor(() => expect(mark).toHaveBeenCalledTimes(1));
+    expect(result.current.unreadIds.has("s1")).toBe(false);
+    rerender({
+      sessions: [
+        { id: "s1", title: "当前", unread: true, runState: "idle", lastOutcome: "completed" },
+      ],
+      activeId: "s1",
+      userId: "u1",
+      auth,
+    });
+    expect(result.current.unreadIds.has("s1")).toBe(false);
+    expect(mark).toHaveBeenCalledTimes(1);
   });
 
   test("activeId 切换清未读", () => {

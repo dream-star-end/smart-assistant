@@ -16,7 +16,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 
-import { SessionManager, type AgentSession } from "../sessionManager.js";
+import { SessionManager, TRANSIENT_RETRY_INPUT, type AgentSession } from "../sessionManager.js";
 import { CcbAdapter } from "../engine/ccbAdapter.js";
 import type { SessionStreamEvent, DurableRuntimeEvent } from "../engine/engineEvents.js";
 import type { EngineCreateOpts } from "../engine/registry.js";
@@ -29,6 +29,7 @@ import {
 import type { OpenClaudeConfig } from "@openclaude/storage";
 import type { ToolCalledEvent, TurnCompletedEvent } from "@openclaude/protocol";
 import { eventBus } from "../eventBus.js";
+import { EMPTY_COMPLETED_TURN_NOTICE } from "../emptyCompletedTurn.js";
 
 function collectTurnCompleted(): { events: TurnCompletedEvent[]; stop: () => void } {
   const events: TurnCompletedEvent[] = [];
@@ -57,10 +58,23 @@ type FakeExitInfo = { code: number | null; signal: string | null; crashed: boole
 
 class FakeCcbRunner extends EventEmitter {
   lastActivityAt = Date.now();
+  /** Warm process by default so legacy sequence assertions see no synthetic
+   * engine_starting frame; cold-start tests flip this to false. */
+  isRunning = true;
+  startCalls = 0;
+  startDelayMs = 0;
   readonly submittedInputs: unknown[] = [];
 
   constructor(private readonly onSubmit: (runner: FakeCcbRunner) => void) {
     super();
+  }
+
+  async start(): Promise<void> {
+    this.startCalls += 1;
+    if (this.startDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.startDelayMs));
+    }
+    this.isRunning = true;
   }
 
   interrupt(): boolean {
@@ -668,9 +682,9 @@ describe("crash/interrupt partial persistence", () => {
       assert.equal(submits, 4, "initial attempt + three automatic retries before success");
       assert.deepEqual(runner.submittedInputs, [
         "finish the task",
-        "继续",
-        "继续",
-        "继续",
+        TRANSIENT_RETRY_INPUT,
+        TRANSIENT_RETRY_INPUT,
+        TRANSIENT_RETRY_INPUT,
       ]);
       assert.equal(captured.payloads.length, 1);
       const payload = captured.payloads[0]!;
@@ -773,7 +787,7 @@ describe("crash/interrupt partial persistence", () => {
       );
 
       assert.equal(submits, 11);
-      assert.deepEqual(runner.submittedInputs, ["finish the task", ...Array(10).fill("继续")]);
+      assert.deepEqual(runner.submittedInputs, ["finish the task", ...Array(10).fill(TRANSIENT_RETRY_INPUT)]);
       assert.equal(captured.payloads.length, 1);
       const payload = captured.payloads[0]!;
       assert.equal(payload.errorCode, "model_capacity");
@@ -2370,7 +2384,7 @@ describe("crash/interrupt partial persistence", () => {
 
       assert.equal(captured.payloads.length, 1);
       assert.equal(captured.payloads[0].status, "completed");
-      assert.equal(captured.payloads[0].text, "");
+      assert.equal(captured.payloads[0].text, EMPTY_COMPLETED_TURN_NOTICE);
       assert.deepEqual(
         captured.payloads[0].structuredBlocks?.map((block) => block.kind),
         ["plan", "plan", "goal"],
@@ -2415,7 +2429,7 @@ describe("crash/interrupt partial persistence", () => {
       assert.equal(captured.payloads.length, 1);
       const payload = captured.payloads[0]!;
       assert.equal(payload.status, "completed");
-      assert.equal(payload.text, "");
+      assert.equal(payload.text, EMPTY_COMPLETED_TURN_NOTICE);
       assert.equal(
         payload.errorDetail,
         JSON.stringify({
@@ -2764,6 +2778,85 @@ describe("crash/interrupt partial persistence", () => {
     assert.equal(session._contextRebuildNotice, "engine-switch");
   });
 
+  test("Cursor native follow-up resumes without replaying history or a rebuild banner", async () => {
+    const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
+    const { realpathSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const path = await import("node:path");
+    const { cursorResumeStorePath } = await import("../engine/cursorAdapter.js");
+    const dir = realpathSync(await mkdtemp(path.join(tmpdir(), "oc-cursor-followup-")));
+    const resumeId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const store = cursorResumeStorePath(dir, resumeId);
+    await mkdir(path.dirname(store), { recursive: true });
+    await writeFile(store, "");
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const runner = new FakeCcbRunner(() => {});
+      (runner as unknown as { sessionId: string }).sessionId = resumeId;
+      const session = makeSession(runner, {
+        sessionKey: "agent:main:webchat:dm:cursor-followup-resume",
+        channel: "webchat",
+        peerId: "cursor-followup-resume",
+        providerTag: "cursor",
+        workspaceCwd: dir,
+        ccbSessionId: resumeId,
+        turns: 1,
+      } as Partial<AgentSession>);
+      Object.assign(session.runner.capabilities, { historyMode: "native-resume" });
+      const internals = sm as unknown as {
+        _resumeMap: Map<string, string>;
+        _resumeMapTimestamps: Map<string, number>;
+        _resumeMapProvider: Map<string, string>;
+        _saveResumeMap: () => void;
+        runOneTurnWithRetry: (
+          session: AgentSession,
+          payload: string,
+          ...rest: unknown[]
+        ) => Promise<void>;
+      };
+      internals._saveResumeMap = () => {};
+      internals._resumeMap.set(session.sessionKey, resumeId);
+      internals._resumeMapTimestamps.set(session.sessionKey, Date.now());
+      internals._resumeMapProvider.set(session.sessionKey, "cursor");
+      const payloads: string[] = [];
+      const notices: number[] = [];
+      internals.runOneTurnWithRetry = async (_session, payload) => {
+        payloads.push(payload);
+      };
+
+      await sm.submit(
+        session,
+        "我选择:接上",
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          historicalMessages: [
+            { role: "user", id: "u1", text: "上一轮问题" },
+            {
+              role: "assistant",
+              id: `srv-${session.peerId}-${session.agentId}-t1-s3`,
+              text: "上一轮回答",
+            },
+            { role: "user", id: "u2", text: "我选择:接上", status: "sending" },
+          ],
+          emitContextRebuilt: ({ messageCount }) => notices.push(messageCount),
+        },
+      );
+
+      assert.equal(payloads[0], "我选择:接上");
+      assert.doesNotMatch(payloads[0]!, /openclaude_previous_context/);
+      assert.deepEqual(notices, []);
+      assert.equal(internals._resumeMap.get(session.sessionKey), resumeId);
+    } finally {
+      await rm(path.dirname(store), { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("native rebuild emits once and consumes its explicit notice", async () => {
     const sm = new SessionManager(makeConfigStub());
     const runner = new FakeCcbRunner(() => {});
@@ -3038,6 +3131,42 @@ describe("post-terminal tail folding (A1)", () => {
       assert.equal(tails.length, 1, "同 hash 只持久化 1 条");
       assert.equal(tails[0].continuationOfTurnKey, captured.payloads[0].turnKey);
       assert.equal(tailBlockCount(events), 1, "只转发 1 条 tool_output_tail block");
+
+      await flush(sm, session);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("A2 慢 ACK 期间的多流 backlog 合并成一条 continuation tape", async () => {
+    const captured = makeDelayingSink(25);
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const smAny = sm as unknown as { _tailFoldMinIntervalMs: number };
+      smAny._tailFoldMinIntervalMs = 0;
+      const { session, runner, events } = await runFoldTurn(sm, "2".repeat(32), {
+        toolIds: ["batch-a", "batch-b", "batch-c"],
+      });
+      const baseline = captured.payloads.length;
+
+      // 同一 tick 进队:旧实现会串行等 3 次 sink ACK;新实现用一条
+      // continuation tape 持久化 3 个有序 runtimeEvents。
+      for (const id of ["batch-a", "batch-b", "batch-c"]) {
+        runner.msg(mkTail({ tool_use_id: id, tail: `tail-${id}` }));
+      }
+      await sm.awaitPendingPersistence();
+
+      const tails = captured.payloads.slice(baseline);
+      assert.equal(tails.length, 1, "backlog 只占一次 sink/finalize ACK");
+      assert.deepEqual(
+        tails[0].runtimeEvents?.map((event) =>
+          (event.payload as { tail?: string }).tail,
+        ),
+        ["tail-batch-a", "tail-batch-b", "tail-batch-c"],
+        "批内保持到达顺序",
+      );
+      assert.equal(tailBlockCount(events), 3, "ACK 后三条 live block 都转发");
 
       await flush(sm, session);
     } finally {
@@ -3463,6 +3592,17 @@ describe("post-terminal tail folding (A1)", () => {
         .pop();
       assert.equal((lastTail!.block as { tail?: string }).tail, "k-4", "第 4 条(cap 之外)仍转发 → skipped 不计预算");
 
+      const beforeBatch = tailBlockCount(events);
+      for (const n of [5, 6, 7, 8]) {
+        runner.msg(mkTail({ tail: `k-${n}`, total_bytes: n }));
+      }
+      await sm.awaitPendingPersistence();
+      assert.equal(
+        tailBlockCount(events) - beforeBatch,
+        4,
+        "同批 skipped tail 也不应按计划数提前触发 cap",
+      );
+
       await flush(sm, session);
     } finally {
       setV3MasterSinkSingleton(null);
@@ -3735,5 +3875,149 @@ describe("active-turn replay lock-owner lifecycle", () => {
     } finally {
       setV3MasterSinkSingleton(null);
     }
+  });
+});
+
+// ── 引擎冷启动可见状态(engine_starting / engine_resuming,INC-20260824)──────
+
+describe("engine cold-start turn_status", () => {
+  function statusesOf(events: SessionStreamEvent[]): unknown[] {
+    return events
+      .filter((e): e is Extract<SessionStreamEvent, { kind: "turn_status" }> => e.kind === "turn_status")
+      .map((e) => e.status);
+  }
+
+  test("冷 runner:submit 前发 engine_starting,spawn(resumed)升级 engine_resuming,首块前清 null", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.emit("spawn", { resumed: true });
+        r.text("first delta");
+        r.result();
+      });
+    });
+    runner.isRunning = false;
+    const session = makeSession(runner);
+    await runOneTurn(sm, session, events);
+    assert.deepEqual(statusesOf(events), ["engine_starting", "engine_resuming", null]);
+    const nullIdx = events.findIndex((e) => e.kind === "turn_status" && e.status === null);
+    const blockIdx = events.findIndex((e) => e.kind === "block");
+    assert.ok(nullIdx >= 0 && blockIdx > nullIdx, "null 清态帧必须先于首个内容块发出");
+  });
+
+  test("热 runner:整轮不发任何 engine_* 帧", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.text("warm answer");
+        r.result();
+      });
+    });
+    const session = makeSession(runner);
+    await runOneTurn(sm, session, events);
+    assert.deepEqual(statusesOf(events), []);
+  });
+
+  test("后继 string 阶段态(compacting)自然覆盖启动态,不额外补 null", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.msg({ type: "system", subtype: "status", status: "compacting" });
+        r.text("after compact");
+        r.result();
+      });
+    });
+    runner.isRunning = false;
+    const session = makeSession(runner);
+    await runOneTurn(sm, session, events);
+    // engine_starting → compacting(覆盖)→ 首块不再有启动态可清。
+    assert.deepEqual(statusesOf(events), ["engine_starting", "compacting"]);
+  });
+
+  test("后继 object 阶段态(retrying)到达前先补 null 清启动态", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.msg({ type: "system", subtype: "api_retry", attempt: 1, max_retries: 10, retry_delay_ms: 1000 });
+        r.text("after retry");
+        r.result();
+      });
+    });
+    runner.isRunning = false;
+    const session = makeSession(runner);
+    await runOneTurn(sm, session, events);
+    const statuses = statusesOf(events);
+    assert.equal(statuses[0], "engine_starting");
+    assert.equal(statuses[1], null);
+    assert.equal((statuses[2] as { status?: string } | null)?.status, "retrying");
+  });
+});
+
+// ── 会话打开引擎预热(preheatRunner,INC-20260824)──────────────────────────
+
+describe("preheatRunner", () => {
+  test("冷 CCB session → start() 恰好一次并 report started;并发调用单飞", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeCcbRunner(() => {});
+    runner.isRunning = false;
+    runner.startDelayMs = 20;
+    const session = makeSession(runner);
+    const [a, b] = await Promise.all([sm.preheatRunner(session), sm.preheatRunner(session)]);
+    assert.equal(a, "started");
+    // 第二个并发调用要么共享同一 in-flight(started),要么在 isRunning 后到达。
+    assert.ok(b === "started" || b === "already_running");
+    assert.equal(runner.startCalls, 1);
+    assert.ok(session.lastUsedAt > 0, "预热成功必须刷新 lastUsedAt(重置 LRU 计时)");
+  });
+
+  test("已运行 → already_running,不再 start", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeCcbRunner(() => {});
+    const session = makeSession(runner);
+    assert.equal(await sm.preheatRunner(session), "already_running");
+    assert.equal(runner.startCalls, 0);
+  });
+
+  test("planned teardown / 活跃 turn / prompt-queue in-flight → skip 且不 start", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeCcbRunner(() => {});
+    runner.isRunning = false;
+    const tearing = makeSession(runner, { _plannedTeardown: "service_restart" } as never);
+    assert.equal(await sm.preheatRunner(tearing), "skipped_teardown");
+    const busy = makeSession(runner, { _activeTurnCount: 1 } as never);
+    assert.equal(await sm.preheatRunner(busy), "skipped_busy");
+    const queued = makeSession(runner);
+    (sm as unknown as { _promptQueueExecutionKeys: Set<string> })._promptQueueExecutionKeys.add(
+      queued.sessionKey,
+    );
+    assert.equal(await sm.preheatRunner(queued), "skipped_busy");
+    assert.equal(runner.startCalls, 0);
+  });
+
+  test("无 preheat 能力的引擎(one-shot CLI)→ skipped_engine", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const session = {
+      sessionKey: "agent:main:webchat:dm:oneshot",
+      lock: Promise.resolve(),
+      runner: { engineId: "grok", isRunning: false },
+    } as never;
+    assert.equal(await sm.preheatRunner(session), "skipped_engine");
+  });
+
+  test("start 抛错 → failed,不外抛;session.lock 正常释放", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeCcbRunner(() => {});
+    runner.isRunning = false;
+    runner.start = async () => {
+      throw new Error("spawn boom");
+    };
+    const session = makeSession(runner);
+    assert.equal(await sm.preheatRunner(session), "failed");
+    // lock 已释放:后续等待者不悬挂。
+    await session.lock;
   });
 });

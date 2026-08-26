@@ -27,7 +27,7 @@
 //
 // Ported from NousResearch/hermes-agent tools/skills_tool.py.
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { type Dir, type Dirent, type Stats, existsSync, realpathSync, statSync } from 'node:fs'
 import {
   lstat,
@@ -42,6 +42,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { hashSkillTree, loadProjectSkillFileMap } from './projectSkillLedger.js'
 import { paths } from './paths.js'
 
 export const MAX_SKILL_NAME_LENGTH = 64
@@ -80,7 +81,7 @@ export interface SkillFrontmatter {
 export type SkillSource = 'user' | 'platform'
 
 /** Precise overlay layer a skill was resolved from. ('hub' = marketplace-installed, reconciled by syncMarketplaceHub into the read-only hub overlay; lowest precedence.) */
-export type SkillLayer = 'platform' | 'agent-seed' | 'shared' | 'legacy' | 'hub'
+export type SkillLayer = 'platform' | 'agent-seed' | 'project' | 'shared' | 'legacy' | 'hub'
 
 export interface SkillMetadata extends SkillFrontmatter {
   path: string // absolute dir path
@@ -431,6 +432,17 @@ export interface SkillStoreOptions {
    */
   hubDir?: string
   /**
+   * Optional per-project skill overlay (`~/.openclaude/projects/<id>/skills`).
+   * Read-only for agents. Priority: after agent-seed, before shared. Missing
+   * sidecar → visible to this store's agent (the current run). Never writes here.
+   */
+  projectDir?: string
+  /**
+   * Gateway-owned per-file hashes for the project overlay (ledger).
+   * Runtime list/view only expose overlay skills whose whole tree matches.
+   */
+  projectSkillFiles?: ReadonlyMap<string, ReadonlyMap<string, string>>
+  /**
    * Whether the shared root is writable through this store. Runtime stores for
    * non-default agents read assigned shared skills but still write new self-authored
    * skills into their private legacy dir.
@@ -459,6 +471,10 @@ export class SkillStore {
   private readonly sharedRoot: string | null
   /** Absolute, realpath-resolved hub root (marketplace-installed skills, ro), or null. */
   private readonly hubRoot: string | null
+  /** Absolute project overlay root, or null. */
+  private readonly projectRoot: string | null
+  /** name → relativePath → sha256 for project overlay (fail-closed when empty). */
+  private readonly projectSkillFiles: ReadonlyMap<string, ReadonlyMap<string, string>> | null
   /** Aggregate all agents' legacy dirs on read (user-level surface). */
   private readonly aggregateLegacy: boolean
   /** True iff writes/deletes should target the shared root. */
@@ -509,6 +525,26 @@ export class SkillStore {
       this.sharedRoot = resolved
     } else {
       this.sharedRoot = null
+    }
+
+    // --- project overlay (ro; missing tolerated; must stay under HOME/projects) ---
+    if (opts.projectDir != null) {
+      if (!isAbsolute(opts.projectDir)) {
+        throw new Error(`projectDir must be an absolute path: ${opts.projectDir}`)
+      }
+      this.projectRoot = existsSync(opts.projectDir)
+        ? resolveExistingDir(opts.projectDir, 'projectDir')
+        : resolve(opts.projectDir)
+      const homeResolved = existsSync(paths.home) ? realpathSync(paths.home) : resolve(paths.home)
+      const projectsRoot = join(homeResolved, 'projects')
+      const resolved = existsSync(this.projectRoot) ? realpathSync(this.projectRoot) : this.projectRoot
+      if (resolved !== projectsRoot && !resolved.startsWith(projectsRoot + sep)) {
+        throw new Error(`projectDir must resolve within ${projectsRoot}: ${opts.projectDir}`)
+      }
+      this.projectSkillFiles = opts.projectSkillFiles ?? null
+    } else {
+      this.projectRoot = null
+      this.projectSkillFiles = null
     }
 
     // --- hub (ro marketplace-installed; missing tolerated; must resolve within HOME) ---
@@ -585,7 +621,11 @@ export class SkillStore {
     if (includePlatform && this.agentSeedRoot) {
       push(await this.scanRoot(this.agentSeedRoot, 'platform', 'agent-seed', false))
     }
-    // 3) shared (user-level write source)
+    // 3) project overlay (run-scoped; does not mutate global agentIds)
+    if (this.projectRoot) {
+      push(await this.scanRoot(this.projectRoot, 'user', 'project', false))
+    }
+    // 4) shared (user-level write source)
     if (this.sharedRoot) {
       push(await this.scanRoot(this.sharedRoot, 'user', 'shared', this.sharedWritable))
     }
@@ -631,6 +671,7 @@ export class SkillStore {
       try {
         const raw = await this.safeReadFile(skillMd, rootDir)
         if (!raw) continue
+        if (layer === 'project' && !this.projectOverlayTreeOk(entry.name)) continue
         const { meta } = parseFrontmatter(raw)
         if (!meta.name || !meta.description) continue
         const agentIds = await this.agentScopeForLayer(rootDir, entry.name, layer, ownerAgentId)
@@ -663,6 +704,16 @@ export class SkillStore {
   ): Promise<string[]> {
     if (layer === 'legacy' && ownerAgentId) return [ownerAgentId]
     if (layer === 'agent-seed') return [this.agentId]
+    if (layer === 'project') {
+      const raw = await this.safeReadFile(join(rootDir, name, SKILL_AGENT_SCOPE_FILE), rootDir)
+      if (!raw) return [this.agentId]
+      try {
+        const parsed = JSON.parse(raw) as { agentIds?: unknown }
+        return normalizeSkillAgentScope(parsed.agentIds, [this.agentId])
+      } catch {
+        return [this.agentId]
+      }
+    }
     if (layer === 'shared' || layer === 'hub') {
       const raw = await this.safeReadFile(join(rootDir, name, SKILL_AGENT_SCOPE_FILE), rootDir)
       if (!raw) return defaultAgentScope()
@@ -678,8 +729,30 @@ export class SkillStore {
 
   private scopeAllows(layer: SkillLayer, agentIds: readonly string[]): boolean {
     if (this.scopeMode === 'management') return true
+    if (layer === 'project') return agentIds.includes(this.agentId)
     if (layer !== 'shared' && layer !== 'hub') return true
     return agentIds.includes(this.agentId)
+  }
+
+  private projectOverlayTreeOk(name: string): boolean {
+    if (!this.projectSkillFiles || this.projectSkillFiles.size === 0) return false
+    const expected = this.projectSkillFiles.get(name)
+    if (!expected || !this.projectRoot) return false
+    const hashed = hashSkillTree(join(this.projectRoot, name))
+    if (!hashed.ok) return false
+    if (hashed.files.length !== expected.size) return false
+    for (const f of hashed.files) {
+      if (expected.get(f.relativePath) !== f.sha256) return false
+    }
+    return true
+  }
+
+  private projectOverlayFileOk(name: string, relativePath: string, raw: string | Buffer): boolean {
+    if (!this.projectOverlayTreeOk(name)) return false
+    const expected = this.projectSkillFiles?.get(name)?.get(relativePath)
+    if (!expected) return false
+    const actual = createHash('sha256').update(raw).digest('hex')
+    return actual === expected
   }
 
   /**
@@ -772,6 +845,26 @@ export class SkillStore {
         'agent-seed',
         false,
       )
+    }
+    if (await this.scopedRootHas(this.projectRoot, name, 'project')) {
+      if (this.projectOverlayTreeOk(name)) {
+        if (subfile) {
+          const rel = subfile.split('\\').join('/').replace(/^\.\//, '')
+          if (rel.includes('..') || !this.projectSkillFiles?.get(name)?.has(rel)) return null
+          return this.safeReadFile(
+            join(this.projectRoot as string, name, rel),
+            this.projectRoot as string,
+          )
+        }
+        return this.viewFromRoot(
+          name,
+          subfile,
+          this.projectRoot as string,
+          'user',
+          'project',
+          false,
+        )
+      }
     }
     if (await this.scopedRootHas(this.sharedRoot, name, 'shared')) {
       return this.viewFromRoot(
@@ -1378,6 +1471,37 @@ export function resolveDefaultAgentId(): string {
  * leader/main seeing skills deposited by delegates). Falls back step-wise if a dir
  * is invalid so the agent stays functional rather than crashing.
  */
+export function buildRunSkillStore(opts: {
+  agentId: string
+  projectId?: string | null
+  projectSkillFiles?: ReadonlyMap<string, ReadonlyMap<string, string>>
+}): SkillStore {
+  const store = buildAgentSkillStore(opts.agentId)
+  const projectId = typeof opts.projectId === 'string' ? opts.projectId.trim() : ''
+  if (!projectId) return store
+  const projectDir = paths.projectSkillsDir(projectId)
+  const baselineDir = resolveBaselineSkillsDirFromEnv()
+  const hubDir = join(paths.hubDir, 'skills')
+  const agentSeedDir = paths.agentSeedSkillsDir(opts.agentId)
+  const sharedDir = paths.sharedSkillsDir
+  const isDefault = opts.agentId === resolveDefaultAgentId()
+  const projectSkillFiles = opts.projectSkillFiles ?? loadProjectSkillFileMap(projectId)
+  try {
+    return new SkillStore(opts.agentId, {
+      baselineDir: baselineDir ?? undefined,
+      agentSeedDir: isDefault ? undefined : agentSeedDir,
+      sharedDir,
+      sharedWritable: isDefault,
+      aggregateLegacy: isDefault,
+      hubDir,
+      projectDir,
+      projectSkillFiles,
+    })
+  } catch {
+    return store
+  }
+}
+
 export function buildAgentSkillStore(agentId: string): SkillStore {
   const baselineDir = resolveBaselineSkillsDirFromEnv()
   const hubDir = join(paths.hubDir, 'skills')

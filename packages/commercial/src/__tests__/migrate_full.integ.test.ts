@@ -178,18 +178,31 @@ describe("full migration suite", () => {
     );
     assert.equal(duplicatedModels.rows.length, 0, "model_pricing must not duplicate model_id rows");
 
-    const tp = await query<{ cnt: string }>(
-      "SELECT COUNT(*)::text AS cnt FROM topup_plans",
+    // 物理行包含已下架档位与 v5 专属加量包；公开充值页只展示 enabled=true 的 4 档。
+    // 锁完整 code/state，而不是把“历史可追溯行数”误当成“用户可见档位数”。
+    const tp = await query<{ code: string; enabled: boolean; period_scoped: boolean }>(
+      `SELECT code, enabled, period_scoped
+         FROM topup_plans
+        ORDER BY code`,
     );
-    assert.equal(tp.rows[0].cnt, "4");
+    assert.deepEqual(tp.rows, [
+      { code: "pack-50", enabled: false, period_scoped: true },
+      { code: "plan-10", enabled: true, period_scoped: false },
+      { code: "plan-100", enabled: true, period_scoped: false },
+      { code: "plan-1000", enabled: false, period_scoped: false },
+      { code: "plan-200", enabled: true, period_scoped: false },
+      { code: "plan-38", enabled: false, period_scoped: false },
+      { code: "plan-50", enabled: false, period_scoped: false },
+      { code: "plan-500", enabled: true, period_scoped: false },
+    ]);
 
-    // 验证关键种子值(防止单价被误改)
+    // 验证完整迁移后的关键权威值（0234 全表单价减半；multiplier 不变）。
     const sonnet = await query<{ input_per_mtok: string; multiplier: string }>(
       "SELECT input_per_mtok::text AS input_per_mtok, multiplier::text AS multiplier FROM model_pricing WHERE model_id=$1",
       ["claude-sonnet-4-6"],
     );
     assert.equal(sonnet.rows.length, 1);
-    assert.equal(sonnet.rows[0].input_per_mtok, "300");
+    assert.equal(sonnet.rows[0].input_per_mtok, "150");
     assert.equal(sonnet.rows[0].multiplier, "2.000");
 
     const minimax = await query<{ enabled: boolean; visibility: string }>(
@@ -200,8 +213,7 @@ describe("full migration suite", () => {
     assert.equal(minimax.rows[0].enabled, true);
     assert.equal(minimax.rows[0].visibility, "public");
 
-    // 0082→0083: glm-5.1(火山方舟 Ark)定价不变;但 0083 把 visibility public→hidden(被 glm-5.2 替换,
-    // 退 picker 但保留 enabled 兼容存量会话)。
+    // 0083 隐藏 glm-5.1；0214 完成 legacy 退役后进一步 disabled，但保留价格行兼容历史账单。
     const glm = await query<{
       enabled: boolean;
       visibility: string;
@@ -221,15 +233,15 @@ describe("full migration suite", () => {
       ["glm-5.1"],
     );
     assert.equal(glm.rows.length, 1);
-    assert.equal(glm.rows[0].enabled, true);
+    assert.equal(glm.rows[0].enabled, false);
     assert.equal(glm.rows[0].visibility, "hidden");
-    assert.equal(glm.rows[0].input_per_mtok, "600");
-    assert.equal(glm.rows[0].output_per_mtok, "2400");
-    assert.equal(glm.rows[0].cache_read_per_mtok, "120");
+    assert.equal(glm.rows[0].input_per_mtok, "300");
+    assert.equal(glm.rows[0].output_per_mtok, "1200");
+    assert.equal(glm.rows[0].cache_read_per_mtok, "60");
     assert.equal(glm.rows[0].cache_write_per_mtok, "0");
     assert.equal(glm.rows[0].multiplier, "1.000");
 
-    // 0083: glm-5.2(火山方舟 Ark,2026-06-17 起平台默认/主力)public + enabled,定价参照 glm-5.1。
+    // glm-5.2 曾是 Ark 主力；0214 退役后 hidden/disabled，0224 同族定价后再由 0234 半价。
     const glm52 = await query<{
       enabled: boolean;
       visibility: string;
@@ -245,10 +257,10 @@ describe("full migration suite", () => {
       ["glm-5.2"],
     );
     assert.equal(glm52.rows.length, 1);
-    assert.equal(glm52.rows[0].enabled, true);
-    assert.equal(glm52.rows[0].visibility, "public");
-    assert.equal(glm52.rows[0].input_per_mtok, "600");
-    assert.equal(glm52.rows[0].output_per_mtok, "2400");
+    assert.equal(glm52.rows[0].enabled, false);
+    assert.equal(glm52.rows[0].visibility, "hidden");
+    assert.equal(glm52.rows[0].input_per_mtok, "226");
+    assert.equal(glm52.rows[0].output_per_mtok, "712");
     assert.equal(glm52.rows[0].multiplier, "1.000");
 
     const plan1000 = await query<{ amount_cents: string; credits: string }>(
@@ -629,7 +641,7 @@ describe("full migration suite", () => {
     assert.equal(cnt.rows[0].cnt, "2");
   });
 
-  test("agent_containers unique user_id (each user at most 1 container)", async (t) => {
+  test("agent_containers allows history and cross-channel peers but only one active row per user/channel", async (t) => {
     if (skipIfNoPg(t)) return;
     await runMigrations();
 
@@ -644,19 +656,55 @@ describe("full migration suite", () => {
     );
     const subId = sub.rows[0].id;
 
-    await query(
-      `INSERT INTO agent_containers(user_id, subscription_id, docker_name, workspace_volume, home_volume, image)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [userId, subId, `agent-u${userId}`, `agent-u${userId}-workspace`, `agent-u${userId}-home`, "openclaude/agent:v1"],
+    const insertContainer = (
+      suffix: string,
+      runtimeChannel: "v3" | "v5",
+      secretByteHex: string,
+    ) => query(
+      `INSERT INTO agent_containers(
+         user_id, subscription_id, docker_name, workspace_volume, home_volume, image,
+         secret_hash, state, runtime_channel
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, decode(repeat($7, 32), 'hex'), 'active', $8)`,
+      [
+        userId,
+        subId,
+        `agent-u${userId}${suffix}`,
+        `agent-u${userId}-workspace${suffix}`,
+        `agent-u${userId}-home${suffix}`,
+        "openclaude/agent:v1",
+        secretByteHex,
+        runtimeChannel,
+      ],
     );
 
+    await insertContainer("", "v3", "11");
+
     await assert.rejects(
-      query(
-        `INSERT INTO agent_containers(user_id, subscription_id, docker_name, workspace_volume, home_volume, image)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [userId, subId, `agent-u${userId}-2`, `agent-u${userId}-ws2`, `agent-u${userId}-home2`, "openclaude/agent:v1"],
-      ),
-      /duplicate key value|agent_containers_user_id_key/i,
+      insertContainer("-same-channel", "v3", "22"),
+      /duplicate key value|uniq_ac_user_channel_active/i,
     );
+
+    // v3/v5 灰度可并行，各 channel 仍各自保持单 active；32-byte secret_hash 是身份硬约束。
+    await insertContainer("-v5", "v5", "33");
+    await query(
+      "UPDATE agent_containers SET state='vanished' WHERE user_id=$1 AND runtime_channel='v3'",
+      [userId],
+    );
+    await insertContainer("-v3-replacement", "v3", "44");
+
+    const rows = await query<{ runtime_channel: string; state: string; cnt: string }>(
+      `SELECT runtime_channel, state, COUNT(*)::text AS cnt
+         FROM agent_containers
+        WHERE user_id=$1
+        GROUP BY runtime_channel, state
+        ORDER BY runtime_channel, state`,
+      [userId],
+    );
+    assert.deepEqual(rows.rows, [
+      { runtime_channel: "v3", state: "active", cnt: "1" },
+      { runtime_channel: "v3", state: "vanished", cnt: "1" },
+      { runtime_channel: "v5", state: "active", cnt: "1" },
+    ]);
   });
 });

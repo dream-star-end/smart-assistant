@@ -34,7 +34,9 @@ import type {
 export interface NativeModelHandoffArtifact {
   /** Native, model-authored continuation text already cleaned by the source engine. */
   summaryText: string
-  source: 'ccb' | 'codex' | 'grok'
+  /** 类型层面允许全部生产引擎;cursor/zcode 当前无原生 compact 导出实现,运行时
+   *  抛 MODEL_SWITCH_NATIVE_COMPACTION_UNAVAILABLE(见各 adapter),字段先行。 */
+  source: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
   /** Epoch captured immediately before the native compact trigger. */
   compactStartedAt: number
 }
@@ -52,6 +54,23 @@ export interface EngineCapabilities {
   /** Maximum UTF-8 bytes allowed for the final prompt argument, when the
    * engine transports the prompt as one argv element. */
   maxPromptBytes?: number
+  /** 'native' = 底座有自己的权限审批面(CCB stdio can_use_tool / codex approval),
+   *  用户的 permissionMode 会真实生效;
+   *  'forced-unattended' = 底座被平台以全放行/无人值守模式驱动(grok
+   *  --always-approve / cursor --force / zcode yolo),用户指定的 permissionMode
+   *  不会到达底座 —— adapter 至多记日志,上层可按此字段感知并决定是否提示。 */
+  permissionModel: 'native' | 'forced-unattended'
+  /** 是否产出 per-call usage 快照(EngineEvent kind:'call_usage')。 */
+  emitsCallUsage: boolean
+  /** 是否流式产出 tool_use input_json_delta(前端 partialJsonDelta 实时渲染)。 */
+  emitsToolInputDeltas: boolean
+  /** 是否有原生 compact/handoff 导出面(compactForHandoff /
+   *  readCompactionHandoffSince);false 的引擎在模型切换 compact 时 fail-closed。 */
+  supportsNativeCompact: boolean
+  /** 'native' = 接受结构化多模态 input block(image 等);
+   *  'text-only' = 仅纯文本 prompt,图片等二进制 block 会被替换为占位文本
+   *  (见各 adapter 的 promptText/promptOf)。 */
+  multimodalInput: 'native' | 'text-only'
 }
 
 /**
@@ -169,11 +188,17 @@ export interface EngineTurnRun {
  * M0 保持与 SubprocessRunner 同名同语义,后续底座各自实现或声明不支持。
  */
 export interface EngineAdapter extends EventEmitter {
-  readonly engineId: string // 'ccb' | 'codex' | 'grok' | 'cursor'
+  readonly engineId: string // 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
   readonly capabilities: EngineCapabilities
 
   // ── lifecycle ──
   start(): Promise<void>
+  /** Optional session-open preheat: warm the engine process (spawn/initialize)
+   * WITHOUT submitting a turn — zero upstream LLM calls, zero billing. Only
+   * engines with a persistent cross-turn process implement it (CCB spawns the
+   * long-lived subprocess, codex boots the app-server); one-shot CLIs
+   * (grok/cursor/zcode) omit it and are skipped by the caller. */
+  preheat?(): Promise<void>
   submitTurn(params: TurnParams): EngineTurnRun
   /** 中断当前 turn(CCB: stdin control_request interrupt)。false = 无活进程。 */
   interrupt(): boolean
@@ -219,6 +244,10 @@ export interface EngineAdapter extends EventEmitter {
   getPartialSnapshot(): PartialSnapshot
   /** 当前活跃 turn 的未完成 tool call 数(idle watchdog 阈值选择用;turn 间为 0)。 */
   readonly pendingToolCalls: number
+  /** True only while the active engine turn is blocked on an explicit human
+   * answer. The idle watchdog must not reinterpret that wait as a dead model;
+   * the logical-turn hard limit remains authoritative. */
+  readonly waitingForUserInput?: boolean
   readonly isRunning: boolean
   /** 底座最近输出活动时间戳(liveness watchdog 读;submit 开始时会重置写入)。 */
   lastActivityAt: number

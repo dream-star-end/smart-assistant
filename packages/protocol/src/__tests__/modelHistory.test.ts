@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
+  collectModelHistoryMediaPathHints,
   estimateModelHistoryTokens,
   estimateModelHistoryUtf8Bytes,
   modelHistoryReservedTokens,
@@ -131,4 +132,96 @@ test('reply snapshots normalize through an allow-list and share one deterministi
     role: 'assistant',
     text: 'x',
   }), undefined)
+})
+
+test('user history folds trusted _media paths and omits hidden, traversal, and base64', () => {
+  const digest = `${'a'.repeat(64)}.png`
+  const path = `/home/agent/.openclaude/uploads/${digest}`
+  const semantic = modelHistorySemanticText({
+    id: 'user-media',
+    role: 'user',
+    text: '看看这张图',
+    _media: [
+      {
+        kind: 'image',
+        url: `/api/media/${digest}`,
+        mimeType: 'image/png',
+        filename: '金丝雀.png',
+        base64: 'AAAA',
+        localSrc: 'blob:local',
+      },
+      { kind: 'image', url: '/api/media/secret.png', hidden: true },
+      { kind: 'image', url: '/api/media/../etc/passwd' },
+      { kind: 'image', url: '/api/media/%2e%2e%2fetc%2fpasswd' },
+      { kind: 'file', path: '/etc/passwd', filename: 'passwd' },
+      { kind: 'audio', url: `/api/media/${'b'.repeat(64)}.mp3`, mimeType: 'audio/mpeg' },
+    ],
+  })
+  assert.match(semantic, /看看这张图/)
+  assert.match(semantic, new RegExp(path.replace(/\./g, '\\.')))
+  assert.match(semantic, /用户附带了以下图片/)
+  assert.match(semantic, /用户附带了以下音频文件/)
+  assert.match(semantic, /原名: 金丝雀.png/)
+  assert.doesNotMatch(semantic, /secret\.png/)
+  assert.doesNotMatch(semantic, /etc\/passwd/)
+  assert.doesNotMatch(semantic, /AAAA/)
+  assert.doesNotMatch(semantic, /blob:local/)
+})
+
+test('user history with only an image still emits a reconstructable path', () => {
+  const digest = `${'c'.repeat(64)}.webp`
+  const semantic = modelHistorySemanticText({
+    id: 'user-image-only',
+    role: 'user',
+    text: '',
+    _media: [{ kind: 'image', url: `/api/media/${digest}` }],
+  })
+  assert.match(semantic, new RegExp(`/home/agent/\\.openclaude/uploads/${digest}`))
+  assert.doesNotMatch(semantic, /oc-vision/)
+})
+
+test('plain text user history does not grow a media path section', () => {
+  assert.equal(
+    modelHistorySemanticText({ id: 'user-plain', role: 'user', text: '你好' }),
+    '你好',
+  )
+})
+
+test('user history does not repeat a path already present in the model prompt', () => {
+  const path = `/home/agent/.openclaude/uploads/${'d'.repeat(64)}.png`
+  const semantic = modelHistorySemanticText({
+    id: 'user-dup',
+    role: 'user',
+    text: '看图',
+    _modelText: `看图\n${path}`,
+    _media: [{ kind: 'image', url: `/api/media/${'d'.repeat(64)}.png` }],
+  })
+  assert.equal(semantic.split(path).length - 1, 1)
+})
+
+test('collectModelHistoryMediaPathHints uniques paths from _media and already-projected text', () => {
+  const digest = `${'f'.repeat(64)}.png`
+  const path = `/home/agent/.openclaude/uploads/${digest}`
+  const hints = collectModelHistoryMediaPathHints([
+    {
+      role: 'user',
+      text: `看图\n- \`${path}\``,
+    },
+    {
+      role: 'user',
+      text: '另一张',
+      _media: [{ kind: 'image', url: `/api/media/${digest}` }],
+    },
+    {
+      role: 'user',
+      text: '',
+      _media: [{ kind: 'file', url: `/api/media/${'0'.repeat(64)}.pdf` }],
+    },
+  ])
+  assert.equal(hints.split(path).length - 1, 1)
+  assert.match(hints, /\/home\/agent\/\.openclaude\/uploads\/0{64}\.pdf/)
+  assert.equal(
+    collectModelHistoryMediaPathHints([{ role: 'user', text: '你好' }]),
+    '',
+  )
 })

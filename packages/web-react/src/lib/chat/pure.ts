@@ -72,6 +72,8 @@ export const COST_CHARGED_LAST_FINAL_TTL_MS = 60_000;
 export const STALE_GENERATING_MS = 12_000;
 export const STALE_WARN_MS = 30_000;
 export const STALE_DANGER_MS = 90_000;
+/** 首字未出但帧仍在跳(keepalive)时,按已耗时升级「深度思考中」预期管理文案的阈值。 */
+export const LONG_THINKING_HINT_SECS = 20;
 
 // ═══════════════ partialJson offset 累加器（websocket.js:654-666）═══════════════
 
@@ -452,6 +454,24 @@ export function onopenSetInitialStatus(offlineQueueLen: number): [string, ChatSt
 
 export type ChatStatusClass = "connected" | "connecting" | "disconnected";
 
+/** Kitchen (thinking/tool) can be on screen without being the user-facing reply. */
+export function messageHasDisplayBody(message: {
+  text?: string;
+  blocks?: unknown[];
+}): boolean {
+  if (typeof message.text === "string" && message.text.trim().length > 0) return true;
+  return Array.isArray(message.blocks) && message.blocks.length > 0;
+}
+
+/** Plated reply: assistant text/blocks only. thinking/tool are kitchen. */
+export function isPlatedAssistantMessage(message: {
+  role?: string;
+  text?: string;
+  blocks?: unknown[];
+}): boolean {
+  return message.role === "assistant" && messageHasDisplayBody(message);
+}
+
 export function computeTypingLabel(p: {
   name: string;
   secs: number;
@@ -459,10 +479,31 @@ export function computeTypingLabel(p: {
   turnStatus?: string | null;
   hint?: string;
   progressHint?: string;
+  /** Last kitchen action this turn; used when the live hint dropped between tools. */
+  kitchenStickyHint?: string;
+  /** True once this turn has plated assistant text. Never fall back to 「思考中」. */
+  hasPlated?: boolean;
 }): { text: string; cls: string } {
-  const { name, secs, silenceMs, turnStatus, hint = "", progressHint = "" } = p;
+  const {
+    name,
+    secs,
+    silenceMs,
+    turnStatus,
+    hint = "",
+    progressHint = "",
+    kitchenStickyHint = "",
+    hasPlated = false,
+  } = p;
   if (turnStatus === "compacting") {
     return { text: `${name} 正在压缩上下文 (${secs}s)`, cls: "compacting" };
+  }
+  // 引擎冷启动阶段(gateway 权威发射):模型尚未开始推理,如实告知在启动/恢复,
+  // 避免 20-40s 冷启动被误标成「思考中/深度思考中」。
+  if (turnStatus === "engine_starting") {
+    return { text: `${name} 正在启动引擎${secs >= 3 ? ` (${secs}s)` : ""}…`, cls: "engine-starting" };
+  }
+  if (turnStatus === "engine_resuming") {
+    return { text: `${name} 正在恢复会话${secs >= 3 ? ` (${secs}s)` : ""}…`, cls: "engine-starting" };
   }
   if (silenceMs >= STALE_DANGER_MS) {
     const sil = Math.round(silenceMs / 1000);
@@ -472,14 +513,24 @@ export function computeTypingLabel(p: {
     const sil = Math.round(silenceMs / 1000);
     return { text: `${name} 深度思考中 (${secs}s · ${sil}s 无新数据)`, cls: "stale-warn" };
   }
-  const progress = formatLiveActivityAction(progressHint);
+  const progress =
+    formatLiveActivityAction(progressHint) || formatLiveActivityAction(kitchenStickyHint);
   if (progress) {
     const cls = silenceMs >= STALE_GENERATING_MS ? "generating" : "";
     if (secs >= 5) return { text: `${name} ${progress} (${secs}s)${hint}`, cls };
     return { text: `${name} ${progress}${hint}`, cls };
   }
-  if (silenceMs >= STALE_GENERATING_MS) {
+  if (hasPlated || silenceMs >= STALE_GENERATING_MS) {
     return { text: `${name} 正在生成内容,请稍候 (${secs}s)`, cls: "generating" };
+  }
+  // 按「已耗时」升级(与静默升级正交):思考型模型的推理期常有 keepalive 帧不断刷新
+  // lastFrameAt,silence 永远到不了 warn 阈值,标签会无限停在「思考中 (Xs)」——用户
+  // 无从判断是卡死还是正常深思。首字未出且已耗时较长时,给出诚实的预期管理文案。
+  if (secs >= LONG_THINKING_HINT_SECS) {
+    return {
+      text: `${name} 深度思考中 (${secs}s) · 复杂问题可能需要一两分钟,可随时停止${hint}`,
+      cls: "long-thinking",
+    };
   }
   if (secs >= 5) return { text: `${name} 思考中 (${secs}s)${hint}`, cls: "" };
   return { text: `${name} 思考中${hint}`, cls: "" };
@@ -661,7 +712,8 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   upstream_failed: "任务执行暂时中断，你的消息已保留，可直接重试。",
   upstream_timeout: "模型响应超时，你的消息已保留，请重试。",
   network_error: "网络波动导致本轮中断，请重试。",
-  context_too_long: "上下文长度超过模型上限，请精简内容或开启新会话。",
+  context_too_long:
+    "本会话内容已超过模型的上下文上限。可以精简这条消息后重发、点击下方按钮在新会话中继续，或在上方切换支持更长上下文的模型。",
   bad_request: "这条请求无法被处理，请调整内容后重试。",
   // ── 引擎/平台执行 ──
   engine_error: "任务执行时遇到内部错误，你的消息已保留，可以直接重试。",

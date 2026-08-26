@@ -83,7 +83,11 @@ import {
 } from '@openclaude/protocol'
 import { resolveExecutionModel } from './server.js'
 import { classifyRunError } from './errorClassify.js'
-import type { GatewayTurnPhase } from './ccbMessageParser.js'
+import type {
+  GatewayEngineErrorEvent,
+  GatewayTerminalErrorCode,
+  GatewayTurnPhase,
+} from './ccbMessageParser.js'
 import { isCcbSlashCommandPrompt } from './ccbNativeCompaction.js'
 import {
   type ExecutionTarget,

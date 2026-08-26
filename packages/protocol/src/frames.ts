@@ -195,6 +195,10 @@ export const InboundMessage = Type.Object({
           /** Additional automatic execution number:1..10. */
           attempt: Type.Integer({ minimum: 1, maximum: AUTOMATIC_TURN_RETRY_MAX }),
           max: Type.Literal(AUTOMATIC_TURN_RETRY_MAX),
+          /** Master-only recovery instruction. A first-event silent engine
+           * timeout must not resume the same potentially poisoned native
+           * session. Omitted means ordinary native continuation. */
+          resetNativeSession: Type.Optional(Type.Literal(true)),
         }, { additionalProperties: false }),
         /** Rolling compatibility for an already-cached frontend. The master
          * normalizes this legacy first hop to root=source, attempt=1, max=10. */
@@ -1003,7 +1007,11 @@ export const OutboundError = Type.Object({
   clientMessageId: Type.Optional(ClientMessageId),
   /** 已识别错误分类。前端按 code 决定 UX(insufficient_credits → 给"去充值"CTA)。
    *  枚举值必须 ∈ protocol turnErrorTaxonomy(契约测试锁);unknown 由
-   *  server 压成 upstream_failed 后再发,wire 上永不出现未知码。 */
+   *  server 压成 upstream_failed 后再发,wire 上永不出现未知码。
+   *  runner_crashed / service_restart / engine_error / auth_error 是 gateway
+   *  权威预分类码(handleExit / tape 终态),_buildEngineErrorFrame 原样透传,
+   *  不再压成 upstream_failed;session_persist_unavailable 是「回复已生成、
+   *  落库暂不可用已排队」的降级终态侧信道(E6)。 */
   code: Type.Union([
     Type.Literal('insufficient_credits'),
     Type.Literal('rate_limited'),
@@ -1013,10 +1021,19 @@ export const OutboundError = Type.Object({
     Type.Literal('context_too_long'),
     Type.Literal('bad_request'),
     Type.Literal('user_cancelled'),
+    Type.Literal('runner_crashed'),
+    Type.Literal('service_restart'),
+    Type.Literal('engine_error'),
+    Type.Literal('auth_error'),
+    Type.Literal('session_persist_unavailable'),
   ]),
   /** 简短人类文案,前端直接渲染。 */
   message: Type.String(),
-  /** 折叠区显示的原始 error string,排查用。 */
+  /** 折叠区「查看详情」内容。**不下发上游原始错误串**:原文只进服务端日志;
+   *  仅当该码在 turnErrorTaxonomy 中 allowPublicServerMessage 且文本过
+   *  isDisplayableServerMessage 守卫时才携带服务端说明,否则只带 traceId
+   *  (若有)供用户反馈时关联日志。user_cancelled 保持 gateway 自产的受控
+   *  停止文案(非上游原文,前端 rolling 兼容依赖它)。 */
   detail: Type.Optional(Type.String()),
   /** 故意 false:本帧不是 turn 终止器,后续紧跟一帧 outbound.message isFinal=true。 */
   isFinal: Type.Literal(false),
@@ -1182,7 +1199,17 @@ const _turnStatusCommon = {
 export const OutboundTurnStatus = Type.Union([
   Type.Object({
     ..._turnStatusCommon,
-    status: Type.Union([Type.Literal('compacting'), Type.Null()]),
+    status: Type.Union([
+      Type.Literal('compacting'),
+      Type.Literal('waiting_for_user'),
+      // Engine cold-start visibility (gateway-authored, INC-20260824-FIRST-
+      // TEXT-LATENCY): the engine process for this turn is spawning
+      // (engine_starting) or resuming prior session state (engine_resuming).
+      // Cleared by the first observable event or any successor phase.
+      Type.Literal('engine_starting'),
+      Type.Literal('engine_resuming'),
+      Type.Null(),
+    ]),
   }),
   Type.Object({
     ..._turnStatusCommon,

@@ -110,6 +110,11 @@ const CODEX_CAPS: EngineCapabilities = {
   resumeKind: "codex-thread",
   needsServerRequestId: true,
   historyMode: "native-resume",
+  permissionModel: "native",
+  emitsCallUsage: true,
+  emitsToolInputDeltas: true,
+  supportsNativeCompact: true,
+  multimodalInput: "native",
 };
 
 const CCB_CAPS: EngineCapabilities = {
@@ -118,6 +123,11 @@ const CCB_CAPS: EngineCapabilities = {
   resumeKind: "ccb-session",
   needsServerRequestId: false,
   historyMode: "native-resume",
+  permissionModel: "native",
+  emitsCallUsage: true,
+  emitsToolInputDeltas: true,
+  supportsNativeCompact: true,
+  multimodalInput: "native",
 };
 
 function makeSession(runner: FakeEngineAdapter): AgentSession {

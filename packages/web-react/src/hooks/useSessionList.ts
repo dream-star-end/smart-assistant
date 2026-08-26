@@ -181,7 +181,11 @@ export type UseSessionList = {
   loadArchivedSessions: () => Promise<void>;
   loadingArchived: boolean;
   /** 服务端全文搜索（消息命中）。调用方负责防抖与 AbortController。 */
-  searchSessionMessages: (q: string, signal: AbortSignal) => Promise<SessionSearchHit[]>;
+  searchSessionMessages: (
+    q: string,
+    signal: AbortSignal,
+    projectId?: string | null,
+  ) => Promise<SessionSearchHit[]>;
   applySessionTerminal: (
     sessId: string,
     terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null,
@@ -821,6 +825,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const searchSessionMessages = async (
     q: string,
     signal: AbortSignal,
+    projectId?: string | null,
   ): Promise<SessionSearchHit[]> => {
     if (demo || !auth || !q.trim()) return [];
     try {
@@ -828,8 +833,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         limit: 30,
         includeArchived: false,
         signal,
+        ...(projectId !== undefined ? { projectId } : {}),
       });
-      return res.results.filter((hit) => hit.kind === "message");
+      return res.results;
     } catch (e) {
       if (isAbortError(e) || signal.aborted) return [];
       throw e;

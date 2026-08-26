@@ -13,8 +13,9 @@ import { type PostInboxOpts, readV3InboxPostConfig } from './v3InboxPost.js'
 
 const log = createLogger({ module: 'v3InboxAlert' })
 
-/** 必须与 master INBOX_ALERT_PATH 对齐。 */
-export const INBOX_ALERT_PATH = '/internal/v3/inbox-alert'
+/** 单一权威在 protocol 内部路由注册表(master internal 路由同源)。 */
+import { INBOX_ALERT_PATH } from '@openclaude/protocol'
+export { INBOX_ALERT_PATH }
 
 const ATTEMPT_TIMEOUT_MS = 10_000
 const MAX_TITLE_CHARS = 200

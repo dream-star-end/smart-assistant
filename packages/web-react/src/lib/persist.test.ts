@@ -1825,6 +1825,18 @@ describe("mergeFullServerWins — records_unpublished degrade page", () => {
     expect(merged.some((m) => m.id === "live-th")).toBe(true);
     expect(merged.some((m) => m.id === "live-tool")).toBe(true);
     expect(merged.some((m) => m.id === "live-plan")).toBe(true);
+
+    // The browser polls the same Phase-A page until materialization finishes.
+    // Once the fallback assistant is already present at the durable tail, the
+    // live process rows sit in the middle and must remain visible on every
+    // repeated full merge.
+    const remerged = mergeFullServerWins([user, final], merged, 0, cmid, {
+      deletionAuthority: true,
+    });
+    expect(remerged.map((m) => m.role)).toEqual(["user", "thinking", "tool", "plan", "assistant"]);
+    expect(remerged.some((m) => m.id === "live-th")).toBe(true);
+    expect(remerged.some((m) => m.id === "live-tool")).toBe(true);
+    expect(remerged.some((m) => m.id === "live-plan")).toBe(true);
   });
 
   test("a complete tape without degrade replaces the live process rows", () => {

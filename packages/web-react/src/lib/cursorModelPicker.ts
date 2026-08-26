@@ -41,6 +41,20 @@ export function modelCostLabel(model: PublicModel | undefined): string | undefin
   return formatCostX(typeof raw === 'number' ? raw : undefined)
 }
 
+/**
+ * 模型是否被后端标注为降级(0108 provider 健康度)。前端类型宽松透传,运行时 narrowing。
+ * ModelSelector 与 picker 排序共用同一判定,避免两套语义漂移。
+ */
+export function isModelDegraded(m: PublicModel): boolean {
+  return (m as { degraded?: unknown }).degraded === true
+}
+
+/** 整行(plain 模型或家族全员)是否降级——降级行在 picker 里沉底。 */
+function rowDegraded(row: ModelPickerRow): boolean {
+  if (row.kind === 'plain') return isModelDegraded(row.model)
+  return row.row.members.length > 0 && row.row.members.every(isModelDegraded)
+}
+
 /** Collapse public Cursor / GPT / Kimi catalog rows into one picker row per family. */
 export function modelPickerRows(models: readonly PublicModel[]): ModelPickerRow[] {
   const seenCursor = new Set<CursorEngineFamilyId>()
@@ -79,7 +93,9 @@ export function modelPickerRows(models: readonly PublicModel[]): ModelPickerRow[
     }
     rows.push({ kind: 'plain', model })
   }
-  return rows
+  // 降级(暂不可用)的行沉到列表底部:坏路由长期钉在首位会抢走可用模型的视觉焦点。
+  // 稳定分区,组内保持后端目录原始顺序。
+  return [...rows.filter((row) => !rowDegraded(row)), ...rows.filter(rowDegraded)]
 }
 
 export function availableCursorEfforts(members: readonly PublicModel[]): PlatformReasoningEffort[] {

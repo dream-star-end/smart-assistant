@@ -77,12 +77,10 @@ import type { V3MasterRetryQueue, V3MasterRetryEntry } from './v3MasterRetryQueu
 
 const log = createLogger({ module: 'v3MasterSink' })
 
-/** Master's path for server-authored messages. Must match the master
- *  side's `SERVER_AUTHORED_PATH` constant. Don't import from commercial —
- *  gateway is shipped INTO the container image and must not depend on
- *  master-only packages at compile time. Path is part of the wire
- *  contract; master + gateway change it together. */
-export const SERVER_AUTHORED_PATH = '/internal/v3/server-authored-message'
+/** Master's path for server-authored messages;单一权威在 protocol 内部路由
+ *  注册表(gateway 不允许 import commercial,两侧都从 protocol 取)。 */
+import { SERVER_AUTHORED_PATH } from '@openclaude/protocol'
+export { SERVER_AUTHORED_PATH }
 
 /** Bounds only an HTTP error/ACK body held for diagnostics. It never touches
  * generated turn content,which is uploaded as content-addressed parts. */

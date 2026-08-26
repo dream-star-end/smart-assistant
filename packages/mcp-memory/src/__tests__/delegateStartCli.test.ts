@@ -46,6 +46,15 @@ describe('delegateStartCli', () => {
     assert.equal(Object.hasOwn(body, 'depth'), false)
   })
 
+  it('allowSelf:true 出现在 body', () => {
+    const body = buildDelegateStartBody({
+      agentId: 'main',
+      goal: '自调用',
+      allowSelf: true,
+    })
+    assert.equal(body.allowSelf, true)
+  })
+
   it('start+wait: one start then wait loop until done', async () => {
     let starts = 0
     const r = await runDelegateStartAndWait({

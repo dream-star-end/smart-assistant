@@ -17,6 +17,7 @@ import {
   SEED_AGENT_IDS,
   listSeedStageNames,
   seedDefaultPipelines,
+  stageSeedId,
 } from '../db/seed.js'
 
 const dirs: string[] = []
@@ -89,6 +90,7 @@ describe('seedDefaultPipelines', () => {
           assert.ok(stage.exitChecklist)
           assert.equal(stage.patrolEnabled, true)
           assert.equal(stage.patrolCron, DEFAULT_PATROL_CRON)
+          assert.equal(stage.model, null)
           const han = hanCount(stage.promptTemplate ?? '')
           assert.ok(han >= 100 && han <= 250, `${stage.name} prompt 汉字 ${han} 不在 100-250`)
           for (const ph of [
@@ -96,6 +98,7 @@ describe('seedDefaultPipelines', () => {
             '{{ticket.title}}',
             '{{ticket.body}}',
             '{{last_run.summary}}',
+            '{{last_run.output}}',
             '{{comments}}',
             '{{stage.exit_checklist}}',
           ]) {
@@ -112,21 +115,28 @@ describe('seedDefaultPipelines', () => {
 
     const bug = listPipelines(db, project.id).find((p) => p.ticketType === 'bug')
     const bugStages = listStages(db, bug!.id)
-    assert.equal(bugStages.find((s) => s.name === '定位根因')?.agentId, 'explorer')
-    assert.equal(bugStages.find((s) => s.name === '修复')?.agentId, 'coding-assistant')
-    assert.equal(bugStages.find((s) => s.name === '自验')?.agentId, 'auditor')
+    assert.equal(bugStages.find((s) => s.name === '复现确认')?.agentId, 'stage-triage')
+    assert.equal(bugStages.find((s) => s.name === '定位根因')?.agentId, 'stage-diagnose')
+    assert.equal(bugStages.find((s) => s.name === '修复')?.agentId, 'stage-implement')
+    assert.equal(bugStages.find((s) => s.name === '自验')?.agentId, 'stage-verify')
 
     const feat = listPipelines(db, project.id).find((p) => p.ticketType === 'feature')
     const featStages = listStages(db, feat!.id)
-    assert.equal(featStages.find((s) => s.name === '需求澄清')?.agentId, 'general-assistant')
-    assert.equal(
-      featStages.find((s) => s.name === '检索调研' || s.name === '方案设计')?.agentId,
-      'explorer',
-    )
+    assert.equal(featStages.find((s) => s.name === '需求澄清')?.agentId, 'stage-triage')
+    assert.equal(featStages.find((s) => s.name === '方案设计')?.agentId, 'stage-design')
+    assert.equal(featStages.find((s) => s.name === '实现')?.agentId, 'stage-implement')
+    assert.equal(featStages.find((s) => s.name === '自验+审查')?.agentId, 'stage-verify')
 
     const spike = listPipelines(db, project.id).find((p) => p.ticketType === 'spike')
     const spikeStages = listStages(db, spike!.id)
-    assert.equal(spikeStages.find((s) => s.name === '检索调研')?.agentId, 'explorer')
+    assert.equal(spikeStages.find((s) => s.name === '明确问题')?.agentId, 'stage-triage')
+    assert.equal(spikeStages.find((s) => s.name === '检索调研')?.agentId, 'stage-research')
+    assert.equal(spikeStages.find((s) => s.name === '结论汇总')?.agentId, 'stage-report')
+
+    const chore = listPipelines(db, project.id).find((p) => p.ticketType === 'chore')
+    const choreStages = listStages(db, chore!.id)
+    assert.equal(choreStages.find((s) => s.name === '执行')?.agentId, 'stage-implement')
+    assert.equal(choreStages.find((s) => s.name === '自验')?.agentId, 'stage-verify')
     db.close()
   })
 
@@ -139,12 +149,47 @@ describe('seedDefaultPipelines', () => {
     assert.equal(second.createdStages, 0)
     assert.equal(second.skippedPipelines, 4)
     assert.equal(second.skippedStages, first.createdStages)
+    assert.equal(second.upgradedStages, 0)
     assert.equal(listPipelines(db, project.id).length, 4)
     const stageCount = listPipelines(db, project.id).reduce(
       (n, pipe) => n + listStages(db, pipe.id).length,
       0,
     )
     assert.equal(stageCount, first.createdStages)
+    db.close()
+  })
+
+  it('只升级未被用户修改的旧内置 prompt,保留自定义 prompt', () => {
+    const db = freshDb()
+    const project = createProject(db, { key: 'OCV5', name: 'V5' })
+    seedDefaultPipelines(db, project.id)
+
+    const untouchedId = stageSeedId(project.id, 'bug', 0)
+    const customId = stageSeedId(project.id, 'bug', 1)
+    const stages = listStages(db, `${project.id}.pipeline.bug`)
+    const previousPrompt = stages
+      .find((stage) => stage.id === untouchedId)!
+      .promptTemplate!
+      .replace(' {{last_run.output}}', '')
+    db.prepare('UPDATE tb_pipeline_stage SET prompt_template = ? WHERE id = ?').run(
+      previousPrompt,
+      untouchedId,
+    )
+    db.prepare('UPDATE tb_pipeline_stage SET prompt_template = ? WHERE id = ?').run(
+      '用户自定义模板,不要覆盖',
+      customId,
+    )
+
+    const result = seedDefaultPipelines(db, project.id)
+    assert.equal(result.upgradedStages, 1)
+    assert.match(
+      (db.prepare('SELECT prompt_template FROM tb_pipeline_stage WHERE id = ?').get(untouchedId) as { prompt_template: string }).prompt_template,
+      /\{\{last_run\.output\}\}/,
+    )
+    assert.equal(
+      (db.prepare('SELECT prompt_template FROM tb_pipeline_stage WHERE id = ?').get(customId) as { prompt_template: string }).prompt_template,
+      '用户自定义模板,不要覆盖',
+    )
     db.close()
   })
 })

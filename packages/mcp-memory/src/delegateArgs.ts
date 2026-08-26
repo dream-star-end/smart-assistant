@@ -6,8 +6,7 @@
 export const DELEGATE_MODEL_RE = /^[A-Za-z0-9._:-]{1,64}$/
 export const DELEGATE_AGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
 
-const MODEL_HINT =
-  '型号请改用 model 参数,例如 model="cursor-grok-4.6-high-fast"'
+const MODEL_HINT = '型号请改用 model 参数,例如 model="cursor-grok-4.6-high-fast"'
 
 export function normalizeDelegateModel(
   raw: unknown,
@@ -23,6 +22,25 @@ export function normalizeDelegateModel(
     }
   }
   return { ok: true, model }
+}
+
+export const SELF_DELEGATE_ERROR = '不能把任务委派给自己。确需自调用时请加 --allow-self'
+
+export function parseDelegateAllowSelf(raw: unknown): boolean {
+  return raw === true || raw === 'true' || raw === '1'
+}
+
+export function rejectSelfDelegate(opts: {
+  callerAgentId?: string | null
+  targetAgentId?: string | null
+  allowSelf?: boolean
+}): { ok: true } | { ok: false; error: string } {
+  if (opts.allowSelf) return { ok: true }
+  const caller = typeof opts.callerAgentId === 'string' ? opts.callerAgentId.trim() : ''
+  const target = typeof opts.targetAgentId === 'string' ? opts.targetAgentId.trim() : ''
+  if (!caller || !target) return { ok: true }
+  if (caller === target) return { ok: false, error: SELF_DELEGATE_ERROR }
+  return { ok: true }
 }
 
 export function normalizeDelegateAgentId(

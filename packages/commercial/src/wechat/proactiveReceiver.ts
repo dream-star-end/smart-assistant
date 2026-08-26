@@ -42,7 +42,7 @@ import { enqueue } from "./outboxStore.js"
 import { renderAssistantText } from "./rendererPipeline.js"
 
 /** 容器 → master 主动投递 endpoint。挂在 master:18443 + self-host:18791。 */
-export const WECHAT_PROACTIVE_PATH = "/internal/v3/wechat-proactive"
+export { WECHAT_PROACTIVE_PATH } from "@openclaude/protocol"
 
 const IM_WECHAT_SUFFIX = "@im.wechat"
 

@@ -1,9 +1,10 @@
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ComponentProps } from 'react'
-import { afterEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
 import { workspaceWantPath } from '../../hooks/useAppRoute'
-import { ApiError } from '../../lib/api'
+import { ProjectScopeProvider } from '../../hooks/useProjectScope'
+import { api, ApiError } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
 import {
   type PipelineStage,
@@ -42,6 +43,13 @@ afterEach(() => {
   vi.unstubAllGlobals()
   vi.useRealTimers()
   localStorage.removeItem(LAST_PROJECT_STORAGE_KEY)
+  history.replaceState({}, '', '/')
+})
+
+beforeAll(async () => {
+  // MarkdownImpl 是 React.lazy 的重 chunk。首次 transform/import 会耗尽 RTL 统一的 5s
+  // 查询窗口，findBy* 只等到纯文本占位。先显式等模块就绪，再让查询只等 React 提交 DOM。
+  await import('../MarkdownImpl')
 })
 
 const auth = createMemoryAuthSession(() => {}, 'tok-board')
@@ -262,7 +270,7 @@ describe('TicketCard 类型 / 优先级映射', () => {
 })
 
 function BoardHarness() {
-  const tb = useTaskboard(auth, true)
+  const tb = useTaskboard(auth, true, null, 'p1')
   const ticket = tb.tickets?.[0]
   return (
     <div>
@@ -359,6 +367,7 @@ function sampleStage(over: Partial<PipelineStage> = {}): PipelineStage {
     name: '实现',
     kind: 'ai',
     agentId: 'coding-assistant',
+    model: null,
     promptTemplate: null,
     toolsets: null,
     effort: null,
@@ -688,6 +697,22 @@ describe('TicketDrawer 详情', () => {
     expect(screen.getByText(/耗时未记录/)).toBeInTheDocument()
     expect(screen.getByText(/用量未记录/)).toBeInTheDocument()
   })
+
+  test('run 明细在成本旁显示不精确提示', async () => {
+    const ticket = sampleTicket()
+    const run = sampleRun({
+      status: 'succeeded',
+      skipReason: null,
+      durationMs: 1200,
+      tokensIn: 10,
+      tokensOut: 2,
+      costUsd: 0,
+      costImprecise: true,
+    })
+    mockDrawerApis(ticket, [run])
+    renderDrawer(ticket)
+    expect(await screen.findByText(/\$0\.0000（不精确）/)).toBeInTheDocument()
+  })
 })
 
 describe('TaskboardView 来源会话不把 key 当 id', () => {
@@ -856,20 +881,27 @@ function mockEmptyBoard() {
 }
 
 function renderBoard(over: Partial<ComponentProps<typeof TaskboardView>> = {}) {
+  history.replaceState({}, '', '/board?project=chat-project-p1')
   return render(
-    <ToastProvider>
-      <TooltipProvider>
-        <TaskboardView
-          auth={auth}
-          view="board"
-          ticketId={null}
-          onViewChange={() => {}}
-          onOpenTicket={() => {}}
-          onOpenMobileNav={() => {}}
-          {...over}
-        />
-      </TooltipProvider>
-    </ToastProvider>,
+    <ProjectScopeProvider
+      auth={auth}
+      chatProjects={[{ id: 'chat-project-p1', name: 'V5 会话', boardProjectId: 'p1' }]}
+      userId="taskboard-test"
+    >
+      <ToastProvider>
+        <TooltipProvider>
+          <TaskboardView
+            auth={auth}
+            view="board"
+            ticketId={null}
+            onViewChange={() => {}}
+            onOpenTicket={() => {}}
+            onOpenMobileNav={() => {}}
+            {...over}
+          />
+        </TooltipProvider>
+      </ToastProvider>
+    </ProjectScopeProvider>,
   )
 }
 
@@ -929,7 +961,7 @@ describe('项目管理', () => {
       })
 
     renderBoard()
-    expect(await screen.findByText('还没有项目')).toBeInTheDocument()
+    expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
 
     fireEvent.click(screen.getByTestId('project-create-open'))
     await screen.findByTestId('project-create')
@@ -946,10 +978,10 @@ describe('项目管理', () => {
       )
     })
     await waitFor(() => {
-      expect(screen.getByLabelText('项目')).toHaveValue('p-new')
+      expect(screen.getByLabelText('项目范围')).toHaveValue('p-new')
     })
     expect(taskboardApi.getProjectBoard).toHaveBeenCalledWith(auth, 'p-new', undefined)
-    expect(screen.queryByText('还没有项目')).not.toBeInTheDocument()
+    expect(screen.queryByText('该会话项目未绑定看板')).not.toBeInTheDocument()
   })
 
   test('归档项目默认不出现在下拉里', async () => {
@@ -959,7 +991,7 @@ describe('项目管理', () => {
     ])
     mockEmptyBoard()
     renderBoard()
-    const select = await screen.findByLabelText('项目')
+    const select = await screen.findByLabelText('项目范围')
     await waitFor(() => {
       const values = [...(select as HTMLSelectElement).options].map((o) => o.value)
       expect(values).toContain('p1')
@@ -988,6 +1020,10 @@ describe('流水线 / 阶段配置', () => {
       { id: 'coding-assistant', name: '编码助手' },
       { id: 'research', name: '调研助手' },
     ])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue([
+      { id: 'glm-5.2', display_name: 'GLM 5.2' },
+      { id: 'deepseek-v4-pro', display_name: 'DeepSeek V4 Pro' },
+    ])
     return { pipeline, stage }
   }
 
@@ -1007,6 +1043,20 @@ describe('流水线 / 阶段配置', () => {
     })
     await screen.findByTestId('stage-editor-s1')
   }
+
+  test('阶段配置能加载模型下拉，留空表示用 agent 默认', async () => {
+    mockStageApis({ model: null })
+    await openStageEditor()
+    const modelSelect = screen.getByLabelText('模型覆盖') as HTMLSelectElement
+    const values = [...modelSelect.options].map((o) => o.value)
+    const labels = [...modelSelect.options].map((o) => o.textContent)
+    expect(values).toContain('')
+    expect(values).toContain('glm-5.2')
+    expect(values).toContain('deepseek-v4-pro')
+    expect(labels.some((t) => t?.includes('留空'))).toBe(true)
+    expect(modelSelect.value).toBe('')
+    expect(api.getPublicModels).toHaveBeenCalled()
+  })
 
   test('阶段配置能加载 agent 下拉，hidden agent 不出现', async () => {
     mockStageApis()
@@ -1047,6 +1097,7 @@ describe('流水线 / 阶段配置', () => {
         agentId: 'research',
         promptTemplate: '新提示词',
         patrolCron: '0 10 * * 1-5',
+        model: null,
       }),
     )
     expect(patchStage.mock.calls[0]?.[1]).toBe('s1')
@@ -1182,4 +1233,3 @@ describe('pickInitialProject', () => {
     expect(pickInitialProject([{ ...testProj, archivedAt: 1 }, e2e], 'test')?.id).toBe('e2e')
   })
 })
-

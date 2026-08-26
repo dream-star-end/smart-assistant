@@ -446,6 +446,23 @@ describe("egress forwarder — 控制专用路径拒转", () => {
       const r1 = await fetch(`http://127.0.0.1:${fAddr.port}/internal/v5/cost-event`, { method: "POST", body: "{}" });
       assert.equal(r1.status, 403);
       assert.equal(seen.length, 0, "绝不能到 master");
+      // 3) delegate grok-route 三条精确路径是唯一放行的 /internal/v5/* 例外
+      const mint = await fetch(`http://127.0.0.1:${fAddr.port}/internal/v5/delegate/grok-route/mint`, {
+        method: "POST",
+        headers: { [EGRESS_SECRET_HEADER]: "forged" },
+        body: "{}",
+      });
+      assert.equal(mint.status, 200);
+      assert.equal(seen.at(-1)?.path, "/internal/v5/delegate/grok-route/mint");
+      assert.equal(seen.at(-1)?.secretHdr, undefined, "秘钥头同样剥除");
+      const renew = await fetch(`http://127.0.0.1:${fAddr.port}/internal/v5/delegate/grok-route/renew`, { method: "POST", body: "{}" });
+      assert.equal(renew.status, 200);
+      const release = await fetch(`http://127.0.0.1:${fAddr.port}/internal/v5/delegate/grok-route/release`, { method: "POST", body: "{}" });
+      assert.equal(release.status, 200);
+      // 4) 同前缀的其它路径仍拒转
+      const sibling = await fetch(`http://127.0.0.1:${fAddr.port}/internal/v5/delegate/grok-route/other`, { method: "POST", body: "{}" });
+      assert.equal(sibling.status, 403);
+      assert.equal(seen.length, 3, "只有 mint/renew/release 三次到达 master(turn-waive 尚未发)");
       // 2) 普通路径转发 + peer ip 注入 + 秘钥头剥除(即使容器伪造带上)
       const r2 = await fetch(`http://127.0.0.1:${fAddr.port}/internal/v3/turn-waive`, {
         method: "POST",
@@ -453,10 +470,10 @@ describe("egress forwarder — 控制专用路径拒转", () => {
         body: "{}",
       });
       assert.equal(r2.status, 200);
-      assert.equal(seen.length, 1);
-      assert.equal(seen[0]!.path, "/internal/v3/turn-waive");
-      assert.equal(seen[0]!.peerHdr, "172.31.0.9", "peer ip 必须来自 socket,不信入站头");
-      assert.equal(seen[0]!.secretHdr, undefined, "伪造秘钥头必须被剥除");
+      assert.equal(seen.length, 4, "三条 delegate grok route + 本条 turn-waive");
+      assert.equal(seen[3]!.path, "/internal/v3/turn-waive");
+      assert.equal(seen[3]!.peerHdr, "172.31.0.9", "peer ip 必须来自 socket,不信入站头");
+      assert.equal(seen[3]!.secretHdr, undefined, "伪造秘钥头必须被剥除");
     } finally {
       front.close();
       master.close();

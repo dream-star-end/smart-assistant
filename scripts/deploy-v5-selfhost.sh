@@ -6,7 +6,7 @@
 #   - HOME     /root/.openclaude-v5-selfhost
 #   - env      /etc/openclaude/commercial-v5-selfhost.env
 #   - 端口     master 127.0.0.1:18790 / egress 172.31.0.1:18892
-#   - systemd  openclaude-v5-selfhost.service + -egress + -hostnet + -sshgate
+#   - systemd  openclaude-v5-selfhost.service + -egress + -hostnet + -ccb-proxy + -sshgate
 #   - PG       openclaude_v5_selfhost / role oc_v5_selfhost
 #   - Redis    redis://127.0.0.1:6379/3
 #
@@ -52,6 +52,7 @@ V5_ENV="/etc/openclaude/commercial-v5-selfhost.env"
 V5_UNIT="openclaude-v5-selfhost.service"
 V5_EGRESS_UNIT="openclaude-v5-selfhost-egress.service"
 V5_HOSTNET_UNIT="openclaude-v5-selfhost-hostnet.service"
+V5_CCB_PROXY_UNIT="openclaude-v5-selfhost-ccb-proxy.service"
 V5_SSHGATE_UNIT="openclaude-v5-selfhost-sshgate.service"
 V5_TUNNEL_UNIT="cloudflared-v5-selfhost.service"
 V5_PORT="18790"
@@ -827,6 +828,13 @@ OC_LOCAL_OBSERVABILITY_RETENTION=1
 OC_LOCAL_EVENT_RETENTION_DAYS=30
 OC_LOCAL_USAGE_RETENTION_DAYS=365
 OC_REDACT_TOOL_EVENT_PREVIEWS=1
+# Bound project context (PROJECT.md / skill overlay / run snapshots). Commercial
+# production does not set this; gateway keeps the old path when unset.
+OC_PROJECT_CONTEXT=1
+# Claude Code external HTTPS transport:keep internal http://172.31.0.1:18892
+# on NO_PROXY while login/telemetry endpoints share the stable Japan egress.
+OC_CLAUDE_CODE_HTTPS_PROXY=http://172.31.0.1:18991
+OC_CLAUDE_CODE_TZ=Asia/Tokyo
 EOF
   append_provider_keys "$tmp"
   mkdir -p "$(dirname "$V5_ENV")"
@@ -912,7 +920,10 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_LOCAL_EVENT_RETENTION_DAYS 30
   ensure_env_kv "$V5_ENV" OC_LOCAL_USAGE_RETENTION_DAYS 365
   ensure_env_kv "$V5_ENV" OC_REDACT_TOOL_EVENT_PREVIEWS 1
-  log "  ✓ 制品根 / PG sessions / privacy-safe telemetry keys"
+  ensure_env_kv "$V5_ENV" OC_PROJECT_CONTEXT 1
+  ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_HTTPS_PROXY "http://172.31.0.1:18991"
+  ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_TZ "Asia/Tokyo"
+  log "  ✓ 制品根 / PG sessions / privacy-safe telemetry / CCB Japan transport keys"
 }
 
 ensure_worktree_complete() {
@@ -1119,7 +1130,7 @@ sync_boot_scripts_best_effort() {
 assert_aux_execstart_not_worktree() {
   local u line
   [[ "$DRY" == 1 ]] && return 0
-  for u in "$V5_HOSTNET_UNIT" "$V5_SSHGATE_UNIT"; do
+  for u in "$V5_HOSTNET_UNIT" "$V5_CCB_PROXY_UNIT" "$V5_SSHGATE_UNIT"; do
     line="$(grep -E '^ExecStart=' "/etc/systemd/system/$u" || true)"
     [[ -n "$line" ]] || die "aux unit $u 缺 ExecStart"
     if [[ "$line" == *"/opt/openclaude/openclaude-v5-selfhost/"* && "$line" != *"-live"* ]]; then
@@ -1129,13 +1140,14 @@ assert_aux_execstart_not_worktree() {
 }
 
 install_aux_units() {
-  log "── 安装辅助 systemd unit(hostnet/sshgate/tunnel;master/egress 只从候选 release snapshot 装) ──"
+  log "── 安装辅助 systemd unit(hostnet/ccb-proxy/sshgate/tunnel;master/egress 只从候选 release snapshot 装) ──"
   sync_boot_scripts_best_effort
   install_unit "$UNIT_DIR/$V5_HOSTNET_UNIT"
+  install_unit "$UNIT_DIR/$V5_CCB_PROXY_UNIT"
   install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
   install_unit "$UNIT_DIR/$V5_TUNNEL_UNIT"
   run "systemctl daemon-reload"
-  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_SSHGATE_UNIT'"
+  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_CCB_PROXY_UNIT' '$V5_SSHGATE_UNIT'"
   assert_aux_execstart_not_worktree
 }
 
@@ -1144,12 +1156,13 @@ install_units() {
   assert_unit_templates_live_wd "$UNIT_DIR"
   sync_boot_scripts_best_effort
   install_unit "$UNIT_DIR/$V5_HOSTNET_UNIT"
+  install_unit "$UNIT_DIR/$V5_CCB_PROXY_UNIT"
   install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
   install_unit "$UNIT_DIR/$V5_EGRESS_UNIT"
   install_unit "$UNIT_DIR/$V5_UNIT"
   install_unit "$UNIT_DIR/$V5_TUNNEL_UNIT"
   run "systemctl daemon-reload"
-  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_SSHGATE_UNIT'"
+  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_CCB_PROXY_UNIT' '$V5_SSHGATE_UNIT'"
   assert_aux_execstart_not_worktree
 }
 
@@ -1157,6 +1170,30 @@ restart_sshgate() {
   log "── 显式 restart $V5_SSHGATE_UNIT(setup-host-net 会 flush V5_EGRESS_IN,oneshot 不会自己再跑) ──"
   run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_SSHGATE_UNIT'"
   run "systemctl restart '$V5_SSHGATE_UNIT'"
+}
+
+refresh_ccb_proxy_path() {
+  log "── 刷新 CCB 日本 HTTPS proxy listener + V5_EGRESS_IN ──"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] sync setup-host-net.sh from HEAD; restart $V5_HOSTNET_UNIT; enable --now $V5_CCB_PROXY_UNIT; restart $V5_SSHGATE_UNIT"
+    return 0
+  fi
+  # install_aux_units intentionally prefers the old live boot script. This
+  # pre-cutover step installs the committed HEAD script so port 18991 exists
+  # before any new runtime container can receive the proxy env.
+  sync_boot_scripts_from "$REPO_ROOT"
+  systemctl restart "$V5_HOSTNET_UNIT" \
+    || die "$V5_HOSTNET_UNIT restart failed while enabling CCB proxy path"
+  systemctl enable --now "$V5_CCB_PROXY_UNIT" \
+    || die "$V5_CCB_PROXY_UNIT failed to start"
+  systemctl restart "$V5_SSHGATE_UNIT" \
+    || die "$V5_SSHGATE_UNIT restart failed after hostnet flush"
+  iptables -C V5_EGRESS_IN -d 172.31.0.1 -p tcp --dport 18991 -j RETURN \
+    -m comment --comment "v5 CCB -> stable HTTPS proxy" \
+    || die "V5_EGRESS_IN missing 172.31.0.1:18991 RETURN"
+  timeout 10 bash -c 'exec 3<>/dev/tcp/172.31.0.1/18991' \
+    || die "CCB HTTPS proxy listener 172.31.0.1:18991 is unreachable"
+  log "  ✓ CCB HTTPS proxy listener + firewall ready"
 }
 
 read_env_db_url() {
@@ -1350,7 +1387,7 @@ cmd_smoke() {
     echo "  [dry-run] curl healthz + leadership=leader + GET / oc-build + SSH 规则 + 个人版 18789"
     return 0
   fi
-  for i in $(seq 1 30); do
+  for i in $(seq 1 90); do
     hz="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/healthz" 2>/dev/null || true)"
     if echo "$hz" | jq -e '.ok==true and .runtime.controlPlaneEnabled==true and .runtime.leadership.state=="leader"' >/dev/null 2>&1; then
       ok=1
@@ -1429,6 +1466,7 @@ cmd_status() {
   log "  unit master:  $(systemctl is-active "$V5_UNIT" 2>/dev/null || echo n/a)"
   log "  unit egress:  $(systemctl is-active "$V5_EGRESS_UNIT" 2>/dev/null || echo n/a)"
   log "  unit hostnet: $(systemctl is-active "$V5_HOSTNET_UNIT" 2>/dev/null || echo n/a)"
+  log "  unit ccb-proxy: $(systemctl is-active "$V5_CCB_PROXY_UNIT" 2>/dev/null || echo n/a)"
   log "  unit sshgate: $(systemctl is-active "$V5_SSHGATE_UNIT" 2>/dev/null || echo n/a)"
   # tunnel 是公网入口,不随部署自动 enable —— 由人显式决定是否对外暴露。
   log "  unit tunnel:  $(systemctl is-active "$V5_TUNNEL_UNIT" 2>/dev/null || echo inactive) (enable 后跑 scripts/selfhost-sync-tunnel-url.sh --apply)"
@@ -1534,6 +1572,7 @@ $dirty
 
   ensure_node_modules
   install_aux_units
+  refresh_ccb_proxy_path
   ensure_model_authority
   sha="$(source_commit)"
   log "── HEAD=$sha 构建三面制品(失败则 live 不动) ──"
@@ -1572,13 +1611,13 @@ cutover_smoke_against_release() { # <rel>
   local rel="$1" hz i ok=0 html spa_ok=0 expected_build got_build
   expected_build="$(dist_oc_build "$rel")"
   [[ -n "$expected_build" ]] || { cutover_fail "smoke: release dist 缺 oc-build"; return 1; }
-  for i in $(seq 1 30); do
+  for i in $(seq 1 90); do
     hz="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/healthz" 2>/dev/null || true)"
     if echo "$hz" | jq -e '.ok==true and .runtime.controlPlaneEnabled==true and .runtime.leadership.state=="leader"' >/dev/null 2>&1; then
       ok=1
       break
     fi
-    cutover_clog "  /healthz 未收敛,重试 $i/30"
+    cutover_clog "  /healthz 未收敛,重试 $i/90"
     sleep 2
   done
   [[ "$ok" == 1 ]] || { cutover_fail "cutover smoke 失败: healthz 未收敛 ok+controlPlaneEnabled+leadership=leader"; return 1; }
@@ -1605,7 +1644,7 @@ cutover_smoke_against_release() { # <rel>
 
 cutover_smoke_healthz_only() {
   local hz i ok=0 eg
-  for i in $(seq 1 30); do
+  for i in $(seq 1 90); do
     hz="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/healthz" 2>/dev/null || true)"
     if echo "$hz" | jq -e '.ok==true and .runtime.controlPlaneEnabled==true and .runtime.leadership.state=="leader"' >/dev/null 2>&1; then
       ok=1
@@ -2131,6 +2170,19 @@ cmd_cutover() {
     || die "disarm 失败: committed marker 未确认写入。smoke 已通过,拒绝报告成功。"
   persist_selfhost_model_authority_cutover "$rel"
   sync_boot_scripts_from "$rel"
+  # 收尾 GC(镜像 deploy-v5.sh gc_releases/oc_hotcfg_gc 同款:仅告警,不回滚)。
+  # master release:引用感知 v5-release-gc.sh,keep 6;live/.prev-release/unit cwd/
+  # 容器 baseline bind 全在保护集,校验失败 rc=75 整轮安全跳过零删除。
+  # runtime tuple:oc_hotcfg_gc,history 最近 N 条 committed + env tuple + 容器 label 保护。
+  bash "$SCRIPT_DIR/v5-release-gc.sh" \
+    "$MASTER_RELEASES_ROOT" 6 \
+    "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" \
+    "$MASTER_RELEASES_ROOT/.prev-release" \
+    "$V5_UNIT" "$V5_EGRESS_UNIT" "$V5_EGRESS_UNIT" \
+    '' '' '' 2>&1 | sed 's/^/  /' \
+    || cutover_clog "  ⚠ master release GC 失败/安全跳过(仅告警,不回滚)"
+  oc_hotcfg_gc "$V5_ENV" "$OC_HOTCFG_HISTORY" 2>&1 | sed 's/^/  /' \
+    || cutover_clog "  ⚠ runtime GC 失败(仅告警,不回滚)"
   cutover_clog "✓ --cutover 完成 live → $rel"
 }
 

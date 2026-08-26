@@ -952,12 +952,14 @@ await check("T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录�
     "团队队员卡",
   );
 
-  await assertVisibleButtonSet("#timeline-agent-root", ["终端printf exact完成"], "通用 ToolCard");
+  await assertVisibleButtonSet("#timeline-agent-root", ["收起终端详情"], "通用 ToolCard");
 });
 
 await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度", async () => {
   const root = page.locator("#tool-card-polish-root");
-  const header = root.getByRole("button", { name: /搜索 AI 市场.*browser.*完成/ });
+  const header = root.getByRole("button", {
+    name: /^(?:展开|收起)搜索 AI 市场详情$/,
+  });
   await header.waitFor({ state: "visible", timeout: 3000 });
   const box = await header.boundingBox();
   if (!box || box.height < TOUCH_MIN) throw new Error(`工具卡头部高度=${box?.height ?? 0}px，应至少 44px`);
@@ -979,7 +981,7 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
   const width = await root.evaluate((node) => ({ client: node.clientWidth, scroll: node.scrollWidth }));
   if (width.scroll > width.client) throw new Error(`375px 级工具卡横向溢出:${JSON.stringify(width)}`);
   // 折叠态按钮名单恰好只剩卡头(同 T12:正向名单代替恒真的文案缺席断言)。
-  await assertVisibleButtonSet("#tool-card-polish-root", ["搜索 AI 市场browser完成"], "美化后的工具卡");
+  await assertVisibleButtonSet("#tool-card-polish-root", ["展开搜索 AI 市场详情"], "美化后的工具卡");
 });
 
 await check("T36 被中断历史子任务显示已取消，实时未完成子任务仍运行中", async () => {
@@ -1031,7 +1033,7 @@ async function runAskQuestionMobileCase() {
   await page.evaluate(() => window.__mountAskQuestion());
   const dialog = page.getByRole("dialog", { name: "用户问答" });
   await dialog.waitFor({ state: "visible", timeout: 3000 });
-  await dialog.getByRole("button", { name: /仿古画卷2\.5D/ }).click();
+  await dialog.getByRole("radio", { name: /仿古画卷2\.5D/ }).click();
   await dialog.getByRole("button", { name: "提交" }).click();
   await dialog.waitFor({ state: "hidden", timeout: 3000 });
   const responses = await page.evaluate(() => window.__askQuestion.responses);
@@ -1909,6 +1911,42 @@ await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度；重
   }
 });
 
+await check("T46 Codex 等待用户回答保持人类等待态，不显示模型卡住或自动免单", async () => {
+  const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
+  if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
+    throw new Error(`等待用户证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
+  }
+  await page.evaluate(() => window.__replayDrive.pushWaitingForUserStatus());
+  await replayRoot.getByText("等待你确认后继续", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  if (await replayRoot.getByText(/无新数据|处理时间较长|自动免单/).count()) {
+    throw new Error("等待用户状态被渲染成模型卡住或免单");
+  }
+  await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
+  await waitForReplay((state) => !state.sending, "等待用户证明轮没有被 final 正常收尾");
+});
+
+await check("T48 引擎冷启动阶段显示启动/恢复文案，首内容清除且终态不粘", async () => {
+  const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
+  if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
+    throw new Error(`引擎启动证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
+  }
+  await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_starting"));
+  await replayRoot.getByText(/正在启动引擎/).waitFor({ state: "visible", timeout: 3000 });
+  if (await replayRoot.getByLabel("生成中").getByText(/思考中|无新数据|深度思考/).count()) {
+    throw new Error("引擎启动期活动行被误标成思考中/卡住");
+  }
+  await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_resuming"));
+  await replayRoot.getByText(/正在恢复会话/).waitFor({ state: "visible", timeout: 3000 });
+  await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
+  await waitForReplay((state) => !state.sending, "引擎启动证明轮没有被 final 正常收尾");
+  if (await replayRoot.getByText(/正在启动引擎|正在恢复会话/).count()) {
+    throw new Error("终态后引擎启动文案仍粘在时间线上");
+  }
+});
+
 await check("T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交", async () => {
   await page.evaluate(() => window.__setComposerState(true, false));
   const stop = primaryComposer.getByRole("button", { name: "停止", exact: true });
@@ -2377,7 +2415,7 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
     ["用量", "会话用量明细"],
     ["偏好", "外观主题"],
     ["反馈", "反馈内容"],
-    ["关于", "让复杂，从简。"],
+    ["关于", "Clarvy · 让复杂，从简。"],
   ];
 
   async function assertNoOverflow(dialog, label) {
@@ -2446,8 +2484,18 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
 await check("T44 当前会话 unread=false 回执前的流式刷新只发送一次 mark-read", async () => {
   await page.getByTestId("unread-request-probe").waitFor({ state: "visible", timeout: 3000 });
   await page.waitForTimeout(50);
+  for (let i = 0; i < 30; i += 1) {
+    await page.evaluate(() => window.__rerenderUnreadProbe());
+    await page.waitForTimeout(0);
+  }
+  await page.waitForTimeout(50);
+  if (unreadMarkReadRequests !== 0) {
+    throw new Error(`running 期间流式刷新不应 mark-read，实际 ${unreadMarkReadRequests}`);
+  }
+  await page.evaluate(() => window.__completeUnreadProbe());
+  await page.waitForTimeout(100);
   if (unreadMarkReadRequests !== 1) {
-    throw new Error(`探针首次挂载应只发一次 mark-read，实际 ${unreadMarkReadRequests}`);
+    throw new Error(`当前会话终态后应只发一次 mark-read，实际 ${unreadMarkReadRequests}`);
   }
   for (let i = 0; i < 30; i += 1) {
     await page.evaluate(() => window.__rerenderUnreadProbe());
@@ -2460,6 +2508,15 @@ await check("T44 当前会话 unread=false 回执前的流式刷新只发送一�
 });
 
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。
+await check("T47 编程助手官方教程路由不再回落到故障 Ark 模型", async () => {
+  const probe = page.getByTestId("coding-assistant-route-probe");
+  await probe.waitFor({ state: "visible", timeout: 3000 });
+  const text = await probe.textContent();
+  if (text !== "CODING_ASSISTANT_ROUTE:glm-5.3-zai") {
+    throw new Error(`编程助手官方教程路由错误:${text}`);
+  }
+});
+
 await check("T45 中断 turn 刷新后仍显示 requestId/积分，空窗给出过程占位", async () => {
   const root = page.locator("#stopped-turn-root");
   await root.getByRole("status", { name: "已停止生成" }).first().waitFor({ state: "visible", timeout: 3000 });

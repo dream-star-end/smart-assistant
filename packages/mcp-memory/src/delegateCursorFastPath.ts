@@ -110,7 +110,7 @@ export function parseJsonObject(raw: string): Record<string, unknown> | null {
 export function interpretDelegateStartBody(
   statusCode: number,
   raw: string,
-): { jobId: string; sessionKey?: string } | { error: string } {
+): { jobId: string; sessionKey?: string; parentSessionKey?: string; parentTurnKey?: string } | { error: string } {
   if (statusCode < 200 || statusCode >= 300) {
     return { error: `委派失败: ${raw}` }
   }
@@ -121,8 +121,21 @@ export function interpretDelegateStartBody(
     typeof data.sessionKey === 'string' && data.sessionKey.trim()
       ? data.sessionKey.trim()
       : undefined
+  const parentSessionKey =
+    typeof data.parentSessionKey === 'string' && data.parentSessionKey.trim()
+      ? data.parentSessionKey.trim()
+      : undefined
+  const parentTurnKey =
+    typeof data.parentTurnKey === 'string' && data.parentTurnKey.trim()
+      ? data.parentTurnKey.trim()
+      : undefined
   if (data.status === 'running' && jobId) {
-    return sessionKey ? { jobId, sessionKey } : { jobId }
+    return {
+      jobId,
+      ...(sessionKey ? { sessionKey } : {}),
+      ...(parentSessionKey ? { parentSessionKey } : {}),
+      ...(parentTurnKey ? { parentTurnKey } : {}),
+    }
   }
   return { error: `委派失败: 异步作业未返回 jobId: ${raw.slice(0, 200)}` }
 }

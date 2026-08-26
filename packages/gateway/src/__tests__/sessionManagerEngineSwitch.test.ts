@@ -409,5 +409,13 @@ describe("prepared native model handoff fencing", () => {
     assert.ok(Array.isArray(payload));
     assert.match(String(payload[0]?.text), /native summary/);
     assert.deepEqual(payload[1], image);
+    const digest = `${"a".repeat(64)}.png`;
+    const withHints = buildNativeModelHandoffPrompt(
+      "native summary",
+      "continue",
+      `Earlier user turns attached these local files. Read them if the task still depends on their contents.\n- \`/home/agent/.openclaude/uploads/${digest}\``,
+    );
+    assert.match(withHints, new RegExp(`/home/agent/\\.openclaude/uploads/${digest}`));
+    assert.match(withHints, /<current_user_message>\ncontinue/);
   });
 });

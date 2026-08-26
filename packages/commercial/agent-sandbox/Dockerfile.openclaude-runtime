@@ -75,6 +75,8 @@ ENV TZ=Asia/Shanghai \
 #     每次新容器都装一遍纯属浪费。venv 让 pip 在 PEP-668 限制下不报错。
 #     不装 build-essential / python3-dev — 200MB+ 占用,确实需要时通过 sudo
 #     apt install 当场补足够。
+#   - openssh-client:ssh/scp/sftp/ssh-keygen。单独放在 base 阶段末尾的 RUN,避免动
+#     主 apt 层导致 LibreOffice/CLI 工具链缓存全失效。不要再拷到 ~/.local/bin。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git \
@@ -745,6 +747,21 @@ RUN chmod 0755 /usr/local/bin/entrypoint.sh && \
 # platform seed dev fallback(runtime hotcfg §5d):entrypoint 读 seed 次序 = 自身 bundle ../seed →
 # 此处 → 跳过+dev 日志。生产走挂载的 bundle seed/;这里仅 bundle 缺席时兜底(允许滞后)。
 COPY --chown=root:root ./platform-runtime/seed/ /usr/local/share/openclaude-platform/seed/
+
+# OpenSSH client: agent SSH/SCP/SFTP/ssh-keygen. Trailing base-stage layer so
+# git/curl/LibreOffice/CLI toolchain layers stay cached. Functionally the same
+# as listing openssh-client next to git/curl. Do not copy binaries onto
+# ~/.local/bin (PATH puts that directory first and would shadow /usr/bin).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client \
+    && ssh -V \
+    && test -x /usr/bin/ssh \
+    && test -x /usr/bin/ssh-keygen \
+    && test -x /usr/bin/scp \
+    && test -x /usr/bin/sftp \
+    && test -x /usr/bin/ssh-agent \
+    && test -x /usr/bin/ssh-keyscan \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # ------------------------------------------------------------
 # 源码 embed(条件化 OC_EMBED_SOURCE,多阶段选择实现条件 COPY)

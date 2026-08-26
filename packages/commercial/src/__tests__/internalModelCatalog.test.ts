@@ -20,6 +20,7 @@ import { Readable } from "node:stream";
 import { describe, test } from "node:test";
 
 import { matchBridgeApiAllowlist, matchCommercialContainerApiProxy } from "@openclaude/gateway";
+import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
 
 import { hashSecret, type ContainerIdentityRepo } from "../auth/containerIdentity.js";
 import type { UserModelAuthz } from "../auth/userModelAuthz.js";
@@ -37,6 +38,11 @@ import {
   makeModelCatalogHandler,
   type WireCatalogResponse,
 } from "../http/internalModelCatalog.js";
+import { PLATFORM_SEED_AGENT_MODEL_IDS } from "../marketplace/seedPlatformAgents.js";
+import {
+  PLATFORM_DEFAULT_MODEL,
+  PLATFORM_HIDDEN_REVIEWER_MODEL,
+} from "../platformDefaults.js";
 
 const SECRET = "a".repeat(64);
 const TOKEN = `oc-v3.7.${SECRET}`;
@@ -148,6 +154,8 @@ function handler(args: {
   readEpoch?: () => Promise<bigint>;
   unavailableProviders?: ReadonlySet<string>;
   availabilityRevision?: string;
+  agentCostOverrides?: Record<string, string>;
+  agentCostOverridesFails?: boolean;
 }) {
   const snap = args.snapshot ?? snapshot();
   return makeModelCatalogHandler({
@@ -167,6 +175,14 @@ function handler(args: {
       unavailableProviderIds: args.unavailableProviders ?? new Set<string>(),
       revision: args.availabilityRevision ?? "availability-1",
     }),
+    ...(args.agentCostOverrides !== undefined || args.agentCostOverridesFails
+      ? {
+          loadAgentCostOverrides: async () => {
+            if (args.agentCostOverridesFails) throw new Error("overrides db down");
+            return args.agentCostOverrides ?? {};
+          },
+        }
+      : {}),
   });
 }
 
@@ -206,6 +222,11 @@ describe("internalModelCatalog — per-uid 投影下发", () => {
     assert.equal(glm.engine, "ccb");
     assert.equal(glm.provider_id, "ark");
     assert.equal(glm.default_effort, "high");
+    assert.equal(glm.input_per_mtok, "600");
+    assert.equal(glm.output_per_mtok, "2400");
+    assert.equal(glm.cache_read_per_mtok, "120");
+    assert.equal(glm.cache_write_per_mtok, "0");
+    assert.equal(glm.multiplier, "1.000");
     assert.deepEqual([...glm.supported_efforts], ["high", "max"]);
     assert.equal(glm.supports_vision, false);
     assert.deepEqual(body.aliases, {
@@ -288,6 +309,42 @@ describe("internalModelCatalog — per-uid 投影下发", () => {
     await handler({ snapshot: snap })(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
     assert.equal(res.statusCode, 200);
     assert.deepEqual((res.body as WireCatalogResponse).models, []);
+  });
+});
+
+describe("internalModelCatalog — agent_cost_overrides 下发", () => {
+  test("未装配 loader → 省略字段(旧行为,旧 gateway 无感)", async () => {
+    const res = makeRes();
+    await handler({})(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    const body = res.body as WireCatalogResponse;
+    assert.equal(body.agent_cost_overrides, undefined);
+  });
+
+  test("空表 → 下发空字典(gateway 据此按 1.000 补,不是 fail-closed)", async () => {
+    const res = makeRes();
+    await handler({ agentCostOverrides: {} })(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    const body = res.body as WireCatalogResponse;
+    assert.deepEqual(body.agent_cost_overrides, {});
+  });
+
+  test("有 override → 原样下发 agent_id → cost_multiplier", async () => {
+    const res = makeRes();
+    await handler({ agentCostOverrides: { "coding-assistant": "1.500" } })(
+      makeReq({ auth: `Bearer ${TOKEN}` }),
+      res,
+      CTX,
+    );
+    const body = res.body as WireCatalogResponse;
+    assert.deepEqual(body.agent_cost_overrides, { "coding-assistant": "1.500" });
+  });
+
+  test("加载失败 → 省略字段(不 503 catalog,补价 fail-closed)", async () => {
+    const res = makeRes();
+    await handler({ agentCostOverridesFails: true })(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    assert.equal(res.statusCode, 200);
+    const body = res.body as WireCatalogResponse;
+    assert.equal(body.agent_cost_overrides, undefined);
+    assert.ok(body.models.length > 0);
   });
 });
 
@@ -385,9 +442,17 @@ describe("internalModelCatalog — seed 完整性(全局断言)", () => {
   });
 
   test("seed 清单从既有权威派生(平台默认 + 隐藏审查员 + codex 队长 + 预设 agent)", () => {
-    assert.ok(PLATFORM_SEED_MODEL_IDS.includes("glm-5.3"));
-    assert.ok(PLATFORM_SEED_MODEL_IDS.length >= 4);
-    // 去重
-    assert.equal(new Set(PLATFORM_SEED_MODEL_IDS).size, PLATFORM_SEED_MODEL_IDS.length);
+    const expected = new Set([
+      PLATFORM_DEFAULT_MODEL,
+      PLATFORM_HIDDEN_REVIEWER_MODEL,
+      DEFAULT_CODEX_ENGINE_MODEL,
+      ...PLATFORM_SEED_AGENT_MODEL_IDS,
+    ]);
+
+    // 精确对齐所有权威来源,模型默认值切换时不应残留旧字面量或漏掉新 seed 依赖。
+    assert.deepEqual(new Set(PLATFORM_SEED_MODEL_IDS), expected);
+    assert.equal(PLATFORM_SEED_MODEL_IDS.length, expected.size, "seed 清单必须去重");
+    assert.ok(PLATFORM_SEED_MODEL_IDS.includes("glm-5.3-zai"));
+    assert.ok(!PLATFORM_SEED_MODEL_IDS.includes("glm-5.3"));
   });
 });

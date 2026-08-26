@@ -43,6 +43,7 @@ interface StageRow {
   name: string
   kind: StageKind
   agent_id: string | null
+  model: string | null
   prompt_template: string | null
   toolsets: string | null
   effort: string | null
@@ -70,7 +71,7 @@ const PIPELINE_COLS = `
 `
 
 const STAGE_COLS = `
-  id, pipeline_id, ordinal, name, kind, agent_id, prompt_template, toolsets,
+  id, pipeline_id, ordinal, name, kind, agent_id, model, prompt_template, toolsets,
   effort, patrol_cron, patrol_enabled, patrol_timezone, quiet_hours_start,
   quiet_hours_end, max_runs_per_day, timeout_sec, max_retries,
   circuit_breaker_threshold, on_success, on_failure, entry_condition,
@@ -97,6 +98,7 @@ function mapStage(row: StageRow): PipelineStage {
     name: row.name,
     kind: row.kind,
     agentId: row.agent_id,
+    model: row.model,
     promptTemplate: row.prompt_template,
     toolsets: parseJsonArrayOrNull(row.toolsets),
     effort: row.effort,
@@ -141,6 +143,7 @@ export interface CreateStageInput {
   name: string
   kind: StageKind
   agentId?: string | null
+  model?: string | null
   promptTemplate?: string | null
   toolsets?: string[] | null
   effort?: string | null
@@ -165,6 +168,7 @@ export interface UpdateStageInput {
   name?: string
   kind?: StageKind
   agentId?: string | null
+  model?: string | null
   promptTemplate?: string | null
   toolsets?: string[] | null
   effort?: string | null
@@ -312,13 +316,13 @@ export function createStage(db: TaskboardDb, input: CreateStageInput): PipelineS
   const isAi = input.kind === 'ai'
   db.prepare(
     `INSERT INTO tb_pipeline_stage (
-       id, pipeline_id, ordinal, name, kind, agent_id, prompt_template, toolsets,
+       id, pipeline_id, ordinal, name, kind, agent_id, model, prompt_template, toolsets,
        effort, patrol_cron, patrol_enabled, patrol_timezone, quiet_hours_start,
        quiet_hours_end, max_runs_per_day, timeout_sec, max_retries,
        circuit_breaker_threshold, on_success, on_failure, entry_condition,
        exit_checklist, require_human_ack, auto_close, created_at, updated_at
      ) VALUES (
-       @id, @pipelineId, @ordinal, @name, @kind, @agentId, @promptTemplate, @toolsets,
+       @id, @pipelineId, @ordinal, @name, @kind, @agentId, @model, @promptTemplate, @toolsets,
        @effort, @patrolCron, @patrolEnabled, @patrolTimezone, @quietHoursStart,
        @quietHoursEnd, @maxRunsPerDay, @timeoutSec, @maxRetries,
        @circuitBreakerThreshold, @onSuccess, @onFailure, @entryCondition,
@@ -331,6 +335,7 @@ export function createStage(db: TaskboardDb, input: CreateStageInput): PipelineS
     name: input.name,
     kind: input.kind,
     agentId: input.agentId ?? null,
+    model: input.model ?? null,
     promptTemplate: input.promptTemplate ?? null,
     toolsets: input.toolsets == null ? null : stringifyJsonArray(input.toolsets),
     effort: input.effort ?? null,
@@ -389,6 +394,7 @@ export function updateStage(db: TaskboardDb, id: string, input: UpdateStageInput
        name = @name,
        kind = @kind,
        agent_id = @agentId,
+       model = @model,
        prompt_template = @promptTemplate,
        toolsets = @toolsets,
        effort = @effort,
@@ -415,6 +421,7 @@ export function updateStage(db: TaskboardDb, id: string, input: UpdateStageInput
     name: input.name ?? existing.name,
     kind: input.kind ?? existing.kind,
     agentId: input.agentId === undefined ? existing.agentId : input.agentId,
+    model: input.model === undefined ? existing.model : input.model,
     promptTemplate:
       input.promptTemplate === undefined ? existing.promptTemplate : input.promptTemplate,
     toolsets,

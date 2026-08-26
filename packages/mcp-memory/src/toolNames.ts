@@ -23,6 +23,7 @@ export const MEMORY_MCP_TOOL_NAMES = [
   'task_list',
   'task_get',
   'ask_user',
+  'present_options',
 ] as const
 
 /** 技能训练会话(OPENCLAUDE_SKILL_TRAIN_RUN_ID)条件注册,替换 skill_save/skill_delete。 */

@@ -41,6 +41,9 @@ export const DEFAULT_RING_CONFIG: RingConfig = {
   maxBytes: 8 * 1024 * 1024,
 }
 
+/** Per-session cap of terminal-fenced clientMessageIds. Oldest entry is dropped. */
+export const FENCED_TURN_CAP = 16
+
 interface RingEntry {
   seq: number
   ts: number
@@ -94,6 +97,10 @@ export class OutboundRingBuffer {
    * empty frame namespace. The marker exists only between the lock-owner
    * lifecycle callbacks and is cleared by end()/clear(). */
   private activeTurns = new Map<string, ActiveTurnMarker>()
+  /** Terminal-fenced cmids. Independent of the active marker so a retry that
+   * already moved the lock still cannot receive frames addressed to the old
+   * dispatch. Insertion order is eviction order; cap is FENCED_TURN_CAP. */
+  private fencedTurns = new Map<string, Set<string>>()
 
   constructor(private readonly config: RingConfig = DEFAULT_RING_CONFIG) {}
 
@@ -190,12 +197,16 @@ export class OutboundRingBuffer {
   }
 
   /** End exactly the marked turn, then immediately restore ordinary age
-   * pruning now that the immutable terminal tape is authoritative. */
+   * pruning now that the immutable terminal tape is authoritative.
+   * The cmid is always fenced, even when the active marker has already
+   * moved to a retry — otherwise late delegate_progress keeps growing the
+   * terminated dispatch stream. */
   endActiveTurn(
     sessionKey: string,
     clientMessageId: string,
     now: number = Date.now(),
   ): EvictionStats {
+    this.fenceTurn(sessionKey, clientMessageId)
     const marker = this.activeTurns.get(sessionKey)
     if (!marker || marker.clientMessageId !== clientMessageId) {
       return { entries: 0, age: 0, bytes: 0 }
@@ -206,6 +217,26 @@ export class OutboundRingBuffer {
     const evicted = this.prune(sessionKey, ring, now)
     if (ring.frames.length === 0) this.rings.delete(sessionKey)
     return evicted
+  }
+
+  isTurnFenced(sessionKey: string, clientMessageId: string): boolean {
+    return this.fencedTurns.get(sessionKey)?.has(clientMessageId) === true
+  }
+
+  private fenceTurn(sessionKey: string, clientMessageId: string): void {
+    if (!clientMessageId) return
+    let set = this.fencedTurns.get(sessionKey)
+    if (!set) {
+      set = new Set()
+      this.fencedTurns.set(sessionKey, set)
+    }
+    if (set.has(clientMessageId)) return
+    set.add(clientMessageId)
+    while (set.size > FENCED_TURN_CAP) {
+      const oldest = set.values().next().value
+      if (oldest === undefined) break
+      set.delete(oldest)
+    }
   }
 
   /** Server-owned identity currently bound to the actual lock owner. */
@@ -357,6 +388,7 @@ export class OutboundRingBuffer {
     this.rings.delete(sessionKey)
     this.lastSeq.delete(sessionKey)
     this.activeTurns.delete(sessionKey)
+    this.fencedTurns.delete(sessionKey)
   }
 
   /**
@@ -424,10 +456,7 @@ export class OutboundRingBuffer {
     // Hard bounds remain absolute even for an active turn. Preserve the
     // existing progress-first policy, then drop oldest content only when no
     // progress frame remains.
-    while (
-      ring.frames.length > this.config.maxEntries ||
-      ring.totalBytes > this.config.maxBytes
-    ) {
+    while (ring.frames.length > this.config.maxEntries || ring.totalBytes > this.config.maxBytes) {
       const cause: 'entries' | 'bytes' =
         ring.frames.length > this.config.maxEntries ? 'entries' : 'bytes'
       const progressIndex = ring.frames.findIndex((frame) => frame.cls === 'progress')
@@ -439,7 +468,7 @@ export class OutboundRingBuffer {
     // content. Scan the full array so an expired progress frame behind an
     // older protected content frame is still reclaimed.
     const active = this.activeTurns.get(sessionKey)
-    for (let i = 0; i < ring.frames.length;) {
+    for (let i = 0; i < ring.frames.length; ) {
       const frame = ring.frames[i]!
       const protectedCurrentContent =
         active !== undefined && frame.cls === 'content' && frame.seq > active.baseSeq

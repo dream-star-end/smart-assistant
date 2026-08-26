@@ -81,6 +81,7 @@ import {
   COST_CHARGED_LAST_FINAL_TTL_MS,
   type EmptyTurnDecision,
   emptyTurnNoticeText,
+  isPlatedAssistantMessage,
   KEEPALIVE_INTERVAL_MS,
   LIVENESS_CONFIRM_MS,
   OFFLINE_LATCH_GRACE_MS,
@@ -137,6 +138,7 @@ import {
   isClientMessageId,
   normalizeTurnErrorCode,
   maxAutomaticTurnRetryAttempt,
+  shouldPauseSilentAutomaticRecovery,
   supportsAutomaticTurnRecovery,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
@@ -324,9 +326,11 @@ export function recoverySkippedNotice(reason?: string): string {
     case "source_not_safely_replayable":
       return "没有重放原请求：服务端无法证明它尚未执行。原任务仍已保留，可从已保存的断点继续。";
     case "source_tape_malformed":
+      return "没法从保存的进度继续。任务内容还在，请刷新后再试。";
     case "recovery_mode_mismatch":
+      return "没法从保存的进度继续。任务内容还在，请再点一次「从断点继续」。";
     case "automatic_checkpoint_unsafe":
-      return "未从断点继续：服务端校验断点记录失败，原任务仍已保留。请刷新后再试。";
+      return "自动续跑已跳过。任务内容还在，你可以手动从进度继续。";
     case "automatic_retry_exhausted":
       return "自动恢复已达到次数上限，原任务仍已保留。请在错误卡上手动重试。";
     case "capability_unavailable":
@@ -382,6 +386,7 @@ export function interruptedContinuationTarget(
   error: ChatMessage,
   sessionId: string,
 ): InterruptedContinuationTarget | undefined {
+  if (error._recoverySkippedNotice) return undefined;
   const base = baseTurnRecoveryTarget(messages, error, sessionId);
   if (!base) return undefined;
   const durableRows = base.rows.filter(
@@ -460,6 +465,11 @@ export function automaticTurnRecoveryTarget(
     terminalAttempt,
     maxAutomaticTurnRetryAttempt(durableRows, rootClientMessageId),
   );
+  if (shouldPauseSilentAutomaticRecovery({
+    errorCode: error._errorCode ?? "",
+    currentAttempt,
+    records: durableRows,
+  })) return undefined;
   if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) return undefined;
   const attempt = currentAttempt + 1;
   const identity = turnRecoveryAttemptIdentity(sessionId, rootClientMessageId, attempt);
@@ -641,6 +651,8 @@ export class ChatSocket {
    * 渲染经 getTransientNotice 快照读回；set/clear 都 scheduleNotify 让 UI 及时更新。
    */
   private readonly transientNotices = new Map<string, { text: string; ts: number }>();
+  /** Page-lifetime exact-turn dedupe. Historical hydration/replay never populates this set. */
+  private readonly firstTextPaintTraceIds = new Set<string>();
 
   // ── 对账（S1：切回前台 / 重连成功 → REST syncSession 追回静默丢失）──
   /** 同会话对账去抖戳（SYNC_DEBOUNCE_MS 内至多一次）。*/
@@ -1353,10 +1365,33 @@ export class ChatSocket {
   private sessionHasVisibleTurnBody(sess: ChatSession): boolean {
     const cmid = sess._activeClientMessageId;
     return sess.messages.some((message) => {
+      if (!isPlatedAssistantMessage(message)) return false;
+      if (cmid && message._clientMessageId !== cmid) return false;
+      if (!isServerAuthoredRow(message)) return false;
+      return true;
+    });
+  }
+
+  /**
+   * 超时兜底用的松弛终态判定:终态行可能不带本轮 _clientMessageId(tape fallback
+   * 只在 anchor 带 cmid 时携带),严格判定会让 finishRestore 永远等不到退出。
+   * 位置约束防回归 27344ba55:只认**本轮 user 行之后**、且不属于其他轮
+   * (_clientMessageId/_turnOwnerId 缺失或等于本轮)的可见服务端正文;
+   * 上一轮遗留的无主行都在 user 行之前,不会被误认。
+   */
+  private sessionHasLooseTurnBodyAfterActiveUser(sess: ChatSession): boolean {
+    const cmid = sess._activeClientMessageId;
+    if (!cmid) return false;
+    const userIndex = sess.messages.findIndex(
+      (message) => message.role === "user" && (message.id === cmid || message._clientMessageId === cmid),
+    );
+    if (userIndex < 0) return false;
+    return sess.messages.slice(userIndex + 1).some((message) => {
       if (message.role !== "assistant" && message.role !== "thinking" && message.role !== "tool") {
         return false;
       }
-      if (cmid && message._clientMessageId && message._clientMessageId !== cmid) return false;
+      if (message._clientMessageId !== undefined && message._clientMessageId !== cmid) return false;
+      if (message._turnOwnerId !== undefined && message._turnOwnerId !== cmid) return false;
       if (!isServerAuthoredRow(message)) return false;
       return messageHasVisibleBody(message);
     });
@@ -1391,8 +1426,9 @@ export class ChatSocket {
 
   /**
    * Restore must have an exit. Returns true when this poll finished the loop.
-   * A still-live owner only drops recovery chrome (resumed); a finished tape
-   * or visible server body clears sending so the composer is usable again.
+   * A still-live owner only drops recovery chrome (resumed). Only a visible
+   * server body for THIS turn (or units that prove it finished) may clear
+   * sending; session-level tape projection is not that proof.
    */
   private finishRestoreIfReady(sess: ChatSession, attempt: number): boolean {
     if (sess._stopSettlement) return false;
@@ -1421,7 +1457,6 @@ export class ChatSocket {
     const obs = this.lastLiveJournalObservation.get(sess.id);
     const cmid = sess._activeClientMessageId;
     const liveOwner = !!(cmid && obs?.liveClientMessageIds.has(cmid));
-    const journalEmpty = !obs || obs.frameCount === 0;
     const hasVisible = this.sessionHasVisibleTurnBody(sess);
 
     if (sess._liveUnitsPackApplied) {
@@ -1429,7 +1464,7 @@ export class ChatSocket {
         if (!message._liveUnit && message.role !== "agent-group" && message.role !== "thinking" && message.role !== "tool" && message.role !== "plan") {
           return false;
         }
-        if (cmid && message._clientMessageId && message._clientMessageId !== cmid && message._turnOwnerId !== cmid) {
+        if (cmid && message._clientMessageId !== cmid && message._turnOwnerId !== cmid) {
           return false;
         }
         return true;
@@ -1442,12 +1477,21 @@ export class ChatSocket {
     if (hasVisible && !liveOwner) {
       return { clearSending: true, kind: "completed" };
     }
-    // journal 为空且没有 live owner:streamClientMessageIds 不含当前消息,且 tape 已投影。
-    if (journalEmpty && !liveOwner && obs?.hasTapeProjection === true) {
-      return { clearSending: true, kind: "completed" };
-    }
+    // Session-level hasTapeProjection is true whenever ANY prior turn was
+    // taped. A newly admitted turn (empty live journal before the first
+    // plated assistant text, or a 401 on live-frames) must keep in-flight.
+    // thinking/tool are kitchen, not plated — they must not clear sending.
     const startedAt = this.reconcileStartedAt.get(sess.id) ?? Date.now();
     if (attempt >= RESTORE_RECONCILE_MAX_ATTEMPTS || Date.now() - startedAt >= RESTORE_RECONCILE_MAX_MS) {
+      if (sess._sendingInFlight && !hasVisible) {
+        // 兜底退出:整个对账窗口内都没有 live owner,但本轮 user 行之后已有可见
+        // 服务端正文(终态行不带 cmid 的 tape fallback)→ 本轮实际已终态,不能让
+        // 「思考中」永挂。窗口内(未超时)仍走上面的严格判定,防过早消失。
+        if (!liveOwner && this.sessionHasLooseTurnBodyAfterActiveUser(sess)) {
+          return { clearSending: true, kind: "completed" };
+        }
+        return { clearSending: false, kind: "resumed" };
+      }
       return { clearSending: !liveOwner, kind: liveOwner ? "resumed" : "completed" };
     }
     return null;
@@ -1905,11 +1949,17 @@ export class ChatSocket {
         return;
       }
       if (this.bufferStampedFrameDuringDurableHydration(f)) return;
+      const firstTextPaint = f.type === "outbound.message"
+        ? this.prepareFirstTextPaint(f as OutboundMessageWire)
+        : null;
+      let dispatched = false;
       try {
         this.dispatch(f);
+        dispatched = true;
       } catch {
         /* dispatch 失败：吞掉，不落 payload */
       }
+      if (dispatched && firstTextPaint) this.attachFirstTextPaintProbe(firstTextPaint);
       this.scheduleNotify();
     };
 
@@ -2013,6 +2063,60 @@ export class ChatSocket {
       this.reconnectTimer = setTimeout(() => this.connect(), delay);
       this.scheduleNotify();
     };
+  }
+
+  private prepareFirstTextPaint(
+    frame: OutboundMessageWire,
+  ): NonNullable<ChatMessage["_firstTextPaintProbe"]> | null {
+    const traceId = typeof frame.traceId === "string" ? frame.traceId : "";
+    const sessionId = frame.peer?.id;
+    const clientMessageId = frame.clientMessageId;
+    if (
+      !/^[0-9a-f]{32}$/.test(traceId) ||
+      typeof sessionId !== "string" ||
+      typeof clientMessageId !== "string" ||
+      this.firstTextPaintTraceIds.has(traceId)
+    ) return null;
+    const sess = this.sessions.get(sessionId);
+    // Live-only and exact-turn-only: legacy/missing ids and replayed old turns
+    // cannot borrow the current user row's submit clock.
+    if (!sess || sess._activeClientMessageId !== clientMessageId) return null;
+    const hasText = Array.isArray(frame.blocks) && frame.blocks.some((block) => {
+      const candidate = block as { kind?: unknown; text?: unknown };
+      return candidate.kind === "text" &&
+        typeof candidate.text === "string" &&
+        candidate.text.trim().length > 0;
+    });
+    if (!hasText) return null;
+    const alreadyVisible = sess.messages.some((message) =>
+      message.role === "assistant" &&
+      (message._clientMessageId === clientMessageId || message._turnOwnerId === clientMessageId) &&
+      message.text.trim().length > 0);
+    if (alreadyVisible) return null;
+    const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
+    if (!user || !Number.isFinite(user.ts)) return null;
+    return {
+      traceId,
+      sessionId,
+      clientMessageId,
+      startedAt: user.ts,
+      backgroundAtFrame: typeof document !== "undefined" && document.visibilityState !== "visible",
+    };
+  }
+
+  private attachFirstTextPaintProbe(
+    probe: NonNullable<ChatMessage["_firstTextPaintProbe"]>,
+  ): void {
+    const sess = this.sessions.get(probe.sessionId);
+    const target = sess?.messages.find((message) =>
+      message.role === "assistant" &&
+      (message._clientMessageId === probe.clientMessageId ||
+        message._turnOwnerId === probe.clientMessageId) &&
+      message.text.trim().length > 0);
+    if (!target) return;
+    if (this.firstTextPaintTraceIds.size >= 1024) this.firstTextPaintTraceIds.clear();
+    this.firstTextPaintTraceIds.add(probe.traceId);
+    target._firstTextPaintProbe = probe;
   }
 
   private dispatch(f: OutboundWire): void {
@@ -2363,10 +2467,26 @@ export class ChatSocket {
         [sourceClientMessageId]: true,
       };
     }
-    this.transientNotices.set(sessId, {
-      text: recoverySkippedNotice(frame.recoverySkippedReason),
-      ts: Date.now(),
-    });
+    const skipNotice = recoverySkippedNotice(frame.recoverySkippedReason);
+    let attachedToError = false;
+    if (sourceClientMessageId) {
+      for (const message of sess.messages) {
+        if (
+          message.role === "assistant" &&
+          !!message._errorCode &&
+          message._clientMessageId === sourceClientMessageId
+        ) {
+          message._recoverySkippedNotice = skipNotice;
+          attachedToError = true;
+        }
+      }
+    }
+    if (!attachedToError) {
+      this.transientNotices.set(sessId, {
+        text: skipNotice,
+        ts: Date.now(),
+      });
+    }
     const userIndex = sess.messages.findIndex((message) =>
       message.id === clientMessageId && isRecoveryControlUserTurn(message));
     if (userIndex < 0) {
@@ -2853,6 +2973,7 @@ export class ChatSocket {
     this.controlQueue = [];
     this.pendingRepoBind.clear();
     this.transientNotices.clear();
+    this.firstTextPaintTraceIds.clear();
     this.lastSyncAt.clear();
     for (const timer of this.reconcileTimers.values()) clearTimeout(timer);
     this.reconcileTimers.clear();
@@ -2889,6 +3010,7 @@ export class ChatSocket {
     // 同时剥离 _media 里的 localSrc：那是乐观渲染用的 blob: URL，持久化到 IndexedDB 后
     // reload 即成死链（blob 是页面生命周期内的）。剥离后重开会话的媒体回落 url 走签名管线。
     const needsLocalSrcStrip = s.messages.some((m) => m._media?.some((r) => r.localSrc));
+    const needsFirstTextPaintProbeStrip = s.messages.some((m) => m._firstTextPaintProbe !== undefined);
     const shouldStrip = (message: ChatMessage) =>
       !!message._genPlaceholder ||
       message._timelineRecord === true ||
@@ -2924,6 +3046,14 @@ export class ChatSocket {
             return rest;
           }),
         };
+      });
+    }
+    if (needsFirstTextPaintProbeStrip) {
+      messages = messages.map((message) => {
+        if (message._firstTextPaintProbe === undefined) return message;
+        const clean = { ...message };
+        delete clean._firstTextPaintProbe;
+        return clean;
       });
     }
     return {

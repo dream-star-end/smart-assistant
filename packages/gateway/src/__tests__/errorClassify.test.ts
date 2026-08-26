@@ -17,7 +17,7 @@ describe('classifyRunError', () => {
       'API Error: 409 {"error":{"code":"MODEL_CONFIG_CHANGED_RETRY_TURN","message":"model configuration changed, please retry in a new turn"},"request_id":"req-1"}'
     const r = classifyRunError(raw)
     assert.equal(r.code, 'model_config_changed_retry_turn')
-    assert.equal(r.message, '模型配置已更新,请重发')
+    assert.equal(r.message, '模型配置已更新，请重发')
     assert.equal(
       classifyRunError(JSON.stringify({ subtype: 'success', result: raw })).code,
       'model_config_changed_retry_turn',
@@ -35,7 +35,7 @@ describe('classifyRunError', () => {
       '402 INSUFFICIENT_CREDITS: insufficient credits: balance=10 required=500',
     )
     assert.equal(r.code, 'insufficient_credits')
-    assert.equal(r.message, '余额不足,请充值后继续')
+    assert.equal(r.message, '余额不足，请充值后继续')
   })
 
   it('insufficient_credits: 大小写无关', () => {
@@ -115,10 +115,31 @@ describe('classifyRunError', () => {
     assert.equal(r.code, 'upstream_failed')
   })
 
+  it('auth_error: 401 / unauthorized / invalid api key / AUTH_ERROR 词族', () => {
+    assert.equal(
+      classifyRunError('API Error: 401 {"error":{"type":"authentication_error","message":"invalid x-api-key"}}').code,
+      'auth_error',
+    )
+    assert.equal(classifyRunError('401 Unauthorized from upstream').code, 'auth_error')
+    assert.equal(classifyRunError('invalid api key provided').code, 'auth_error')
+    assert.equal(classifyRunError('AUTH_ERROR: credential rejected').code, 'auth_error')
+    assert.equal(
+      classifyRunError('invalid api key provided').message,
+      classifiedMessageForCode('auth_error'),
+    )
+  })
+
+  it('auth_error 词族刻意窄:511 Network Authentication Required 仍归 upstream', () => {
+    assert.equal(
+      classifyRunError('gateway said 511 Network Authentication Required').code,
+      'upstream_failed',
+    )
+  })
+
   it('model_capacity: at capacity + try a different model', () => {
     const r = classifyRunError('Selected model is at capacity. Please try a different model.')
     assert.equal(r.code, 'model_capacity')
-    assert.equal(r.message, '模型繁忙,请稍后重试或切换模型')
+    assert.equal(r.message, '模型繁忙，请稍后重试或切换模型')
   })
 
   it('model_capacity: overloaded', () => {
@@ -156,10 +177,12 @@ describe('classifyRunError', () => {
   })
 
   it('classifiedMessageForCode 与 PATTERNS 同源(无平行文案表)', () => {
-    assert.equal(classifiedMessageForCode('model_capacity'), '模型繁忙,请稍后重试或切换模型')
-    assert.equal(classifiedMessageForCode('rate_limited'), '当前账号被限流,请稍后再试')
-    assert.equal(classifiedMessageForCode('insufficient_credits'), '余额不足,请充值后继续')
-    assert.equal(classifiedMessageForCode('upstream_failed'), 'Anthropic 上游异常,请稍后重试')
+    assert.equal(classifiedMessageForCode('model_capacity'), '模型繁忙，请稍后重试或切换模型')
+    assert.equal(classifiedMessageForCode('rate_limited'), '当前账号被限流，请稍后再试')
+    assert.equal(classifiedMessageForCode('insufficient_credits'), '余额不足，请充值后继续')
+    // 不绑定具体厂商(E7):同一分类被 CCB/Codex/多提供商路径共用。
+    assert.equal(classifiedMessageForCode('upstream_failed'), '模型服务上游暂时异常，请稍后重试')
+    assert.equal(classifiedMessageForCode('auth_error'), '模型服务认证失败，请重新登录或检查凭据后重试')
     // classifyRunError 命中同码时,message 与 classifiedMessageForCode 完全一致。
     assert.equal(
       classifyRunError('model is overloaded').message,
@@ -191,7 +214,7 @@ describe('classifyRunError', () => {
     )
     assert.ok(r)
     assert.equal(r.code, 'insufficient_credits')
-    assert.equal(r.message, '余额不足,请充值后继续')
+    assert.equal(r.message, '余额不足，请充值后继续')
   })
 
   it('delegate output: API Error 400 BAD_BODY is treated as bad_request', () => {
@@ -200,7 +223,7 @@ describe('classifyRunError', () => {
     )
     assert.ok(r)
     assert.equal(r.code, 'bad_request')
-    assert.equal(r.message, '子 agent 请求体无效,请降低思考深度或稍后重试')
+    assert.equal(r.message, '子 agent 请求体无效，请降低思考深度或稍后重试')
   })
 
   it('delegate output: ordinary prose mentioning API Error is not classified', () => {

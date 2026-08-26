@@ -277,6 +277,44 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    label: '/api/board/projects/:id/context',
+    re: /^\/api\/board\/projects\/[^/]+\/context$/,
+    methods: M('GET', 'PUT'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/projects/:id/context/preview',
+    re: /^\/api\/board\/projects\/[^/]+\/context\/preview$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/projects/:id/memories',
+    re: /^\/api\/board\/projects\/[^/]+\/memories$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    // Item path is in server.ts dispatch even when the handler 404s today.
+    // Family-closure (#201) requires an explicit claim next to collection/action.
+    label: '/api/board/projects/:id/memories/:id',
+    re: /^\/api\/board\/projects\/[^/]+\/memories\/[^/]+$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/projects/:id/memories/:id/:action',
+    re: /^\/api\/board\/projects\/[^/]+\/memories\/[^/]+\/(promote|reject|deprecate)$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/runs/:id/context',
+    re: /^\/api\/board\/runs\/[^/]+\/context$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/board/tickets',
     re: /^\/api\/board\/tickets$/,
     methods: M('GET', 'POST'),

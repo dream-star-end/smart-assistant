@@ -76,6 +76,36 @@ describe("checkDuplicateNumbers", () => {
     );
   });
 
+  test("只豁免已上线双分支的精确 0246/0247 fork 组", () => {
+    assert.deepEqual(
+      checkDuplicateNumbers(
+        [mf("0246_chat_project_board_bind"), mf("0246_ungate_cursor_opus_fable_picker")],
+        LEGACY,
+      ),
+      [],
+    );
+    assert.deepEqual(
+      checkDuplicateNumbers(
+        [mf("0247_cursor_opus_48"), mf("0247_open_cursor_grok_opus48")],
+        LEGACY,
+      ),
+      [],
+    );
+  });
+
+  test("fork 组出现第三支仍然 R2", () => {
+    const p = checkDuplicateNumbers(
+      [
+        mf("0247_cursor_opus_48"),
+        mf("0247_open_cursor_grok_opus48"),
+        mf("0247_third"),
+      ],
+      LEGACY,
+    );
+    assert.equal(p.length, 1);
+    assert.equal(p[0]!.rule, "R2");
+  });
+
   test("新迁移之间重号 → R2", () => {
     const p = checkDuplicateNumbers([mf("0221_a"), mf("0221_b")], LEGACY);
     assert.equal(p.length, 1);

@@ -52,6 +52,15 @@ export interface Persona {
   x_stainless_runtime_version: string;
   x_stainless_retry_count: string;
   accept_language: string;
+  /**
+   * 反封复盘 2026-08 — 账号的 IANA 时区,**与 accept_language 一致映射**。
+   *
+   * 不作为 HTTP 头发送(personaToHeaderPairs 不含它)。用途:commercial proxy 转发
+   * 时把 CCB 注入 messages 的本地日期(`Today's date is YYYY-MM-DD`)改写成该时区
+   * 的本地日期,让"body 里的日期"与"账号语言画像 + 出口 IP 地域"自洽,消除
+   * "en-US 语言 + 东京日期 + 美国住宅 IP"这类跨区指纹。
+   */
+  timezone: string;
 }
 
 const PERSONA_KEYS: ReadonlyArray<keyof Persona> = [
@@ -64,18 +73,53 @@ const PERSONA_KEYS: ReadonlyArray<keyof Persona> = [
   "x_stainless_runtime_version",
   "x_stainless_retry_count",
   "accept_language",
+  "timezone",
 ] as const;
 
 /**
- * 变体池 — 每个维度可选值。
+ * 真实 Claude Code (CCB) 版本锚点 —— **必须与实际 ship 的二进制一致**。
+ *
+ * 反封复盘(2026-08):Anthropic 侧对订阅号最强的识别信号之一是"客户端伪装
+ * 与真实二进制对不上"。旧实现把 UA 伪装成 stainless SDK 的
+ * `anthropic-ai-claude-code/<pkg>`,而真实 Claude Code CLI(含官方 + CCB,
+ * 共用 claude-code-best/src/utils/http.ts::getUserAgent)在 wire 上发的是
+ * `claude-cli/<VERSION> (<USER_TYPE>, <ENTRYPOINT>)`,并带 `x-app: cli`。
+ * 见 packages/commercial/src/auth/apiKeyIdentity.ts §UA 入站门控 —— 本仓自己
+ * 也只放行 `claude-cli/*`。因此 persona 必须发**真实 claude-cli 画像**,而非
+ * SDK 画像。
+ *
+ * 两个版本号是**不同**的东西,不能混用:
+ *   - CCB_CLI_VERSION      → UA 里的 `claude-cli/<x>`,= claude-code-best/package.json version
+ *   - CCB_SDK_VERSION      → `x-stainless-package-version`,= 内置 @anthropic-ai/sdk 版本
+ *
+ * 升级 CCB 时**同步**改这两个常量(与 claude-code-best/package.json 对齐)。
+ * 为什么用常量而非"版本池":同一 ship 的二进制,全网真实用户发的就是同一
+ * `claude-cli/<x>` + 同一 SDK 版本;伪造一批我们根本没在跑的旧版本,反而会
+ * 在"UA 版本 vs 实际请求能力"上露馅(旧版 CLI 发不出新版才有的 body 特征)。
+ * 账号间的天然差异改由 os / arch / node 运行时版本 / accept-language 承载 ——
+ * 这些在真实用户里本就千差万别,且不与请求行为相关联。
+ */
+const CCB_CLI_VERSION = "2.8.4";
+const CCB_SDK_VERSION = "0.81.0";
+
+/**
+ * UA 里的 USER_TYPE / ENTRYPOINT —— 对应容器内外接用户的真实取值。
+ * getUserAgent 格式:`claude-cli/<VERSION> (<USER_TYPE>, <ENTRYPOINT>)`。
+ * 外接(非 Anthropic 内部)用户 USER_TYPE = "external";CLI 入口 ENTRYPOINT = "cli"。
+ */
+const CCB_USER_TYPE = "external";
+const CCB_ENTRYPOINT = "cli";
+
+/**
+ * 变体池 — **只保留真实用户间天然会变、且与请求行为无关联**的维度。
  *
  * 选值原则:
  *   - 全部对应"真实存在的 Claude Code 用户分布":真实社区里 Apple Silicon Mac / Intel Mac /
  *     Linux 工作站 / Windows + WSL 都有,Anthropic 网关看到这些组合是正常的。
  *   - 不放过于稀有的组合(如 freebsd / arm32),会成为反向"挑出我们这种伪装池"的指纹。
- *   - package_version / runtime_version 跟随 CCB 当前 ship 的版本族滚动,升级 CCB 时同步。
- *     单一版本(锁死 1.0.71 + 22.16.0)在号商画像中会被识别 — 让 Anthropic 看到
- *     "我的池子里账号自然分布在最近几个 CCB 版本"是正常的版本采纳曲线。
+ *   - runtime_version 是**跑 CLI 的宿主 node 版本**,真实用户各不相同(nvm / 系统 node),
+ *     与 claude-cli 版本正交,可以安全差异化。
+ *   - 版本号(claude-cli / SDK)**不**进池:见 CCB_CLI_VERSION 注释,用真实常量。
  *   - accept_language 覆盖主要市场 + 中文用户(boss 用户基底)。
  */
 const PERSONA_VARIANTS = {
@@ -84,13 +128,6 @@ const PERSONA_VARIANTS = {
   // 简化:os 独立采样,arch=arm64 + os=Windows 的极小概率在真实分布里也存在
   //(Windows on ARM)— 整体放行。
   os: ["MacOS", "Linux", "Windows"] as const,
-  package_version: [
-    "1.0.71",
-    "1.0.85",
-    "1.0.98",
-    "1.0.110",
-    "1.0.117",
-  ] as const,
   runtime: ["node"] as const,
   runtime_version: [
     "v20.11.1",
@@ -111,21 +148,65 @@ const PERSONA_VARIANTS = {
 } as const;
 
 /**
- * 拼 user_agent:格式与真实 stainless SDK 一致,只在 package_version /
- * runtime_version / os 三处按 variants 池摆动。
+ * 反封复盘 2026-08 — accept_language → IANA 时区的**一致映射**。
  *
- * 真实 CCB User-Agent 格式(stainless SDK 拼装):
- *   "anthropic-ai-claude-code/<pkg-version> Node/<node-version> <OS>"
+ * 时区必须跟着语言画像走:一个声明 en-US 的号,body 里的"今天日期"该按美东算,
+ * 而不是按部署机的东京/上海算。key 用 accept_language 池里的完整字符串,保证每个
+ * 语言变体都有确定的时区,generatePersona 不会取到未覆盖的组合。
  *
- * 为什么不混入"其他合法 UA 模板"(Codex Round 4 反馈):
- *   - "凭空伪造"未经真实抓包验证的 UA 反而是新指纹源。
- *   - 单一真实模板 + package/runtime/os 维度天然分布,在 Anthropic 网关侧已经
- *     呈现合理多样性(全网 CCB 用户本来就跨多版本/平台),不需要额外编模板。
- *   - 真实模板未来随 CCB 升级演进时,只更新 PERSONA_VARIANTS 池子,模板字面量
- *     保持稳定。
+ * 选区原则:取该市场人口/开发者最集中的代表时区(en-US→美东,而非某个小众区),
+ * 让"语言 + 日期"组合落在真实用户最稠密的地方。
  */
-function pickUserAgent(packageVersion: string, runtimeVersion: string, os: string): string {
-  return `anthropic-ai-claude-code/${packageVersion} Node/${runtimeVersion} ${os}`;
+const ACCEPT_LANGUAGE_TIMEZONE: Record<string, string> = {
+  "en-US,en;q=0.9": "America/New_York",
+  "en-GB,en;q=0.9": "Europe/London",
+  "zh-CN,zh;q=0.9,en;q=0.8": "Asia/Shanghai",
+  "ja-JP,ja;q=0.9,en;q=0.8": "Asia/Tokyo",
+  "de-DE,de;q=0.9,en;q=0.8": "Europe/Berlin",
+};
+
+/**
+ * 反封复盘 2026-08(#1)— 出口代理地域(国家码)→ accept_language 的映射。
+ *
+ * 设计倒置:persona 在建号时随机生成,发生在管理员选代理**之后**,所以不能
+ * "校验 persona 地域 == 代理地域";而是**让代理地域驱动 persona 生成**——给账号
+ * 配一个某国住宅代理,就生成该国 locale 的 persona,IP/语言/时区天然一致。
+ *
+ * key = egress_proxies.region 存的国家码;value = accept_language 池里的完整串
+ * (再经 ACCEPT_LANGUAGE_TIMEZONE 推出时区),保证"代理国 → 语言 → 时区"一条链自洽。
+ * 代理未设 region(NULL)→ generatePersona 不传 region → 回到随机(旧行为)。
+ */
+const REGION_ACCEPT_LANGUAGE: Record<string, string> = {
+  US: "en-US,en;q=0.9",
+  GB: "en-GB,en;q=0.9",
+  CN: "zh-CN,zh;q=0.9,en;q=0.8",
+  JP: "ja-JP,ja;q=0.9,en;q=0.8",
+  DE: "de-DE,de;q=0.9,en;q=0.8",
+};
+
+/** egress_proxies.region 允许的国家码(admin 校验用)。NULL 也允许(= 不绑地域)。 */
+export const SUPPORTED_PROXY_REGIONS = Object.freeze(
+  Object.keys(REGION_ACCEPT_LANGUAGE),
+) as ReadonlyArray<string>;
+
+/** 判定一个字符串是否合法的代理地域码。 */
+export function isSupportedProxyRegion(region: unknown): region is string {
+  return typeof region === "string" && region in REGION_ACCEPT_LANGUAGE;
+}
+
+/**
+ * 拼 user_agent —— 复刻真实 Claude Code CLI 的 wire UA。
+ *
+ * 真实格式(claude-code-best/src/utils/http.ts::getUserAgent):
+ *   "claude-cli/<VERSION> (<USER_TYPE>, <ENTRYPOINT>)"
+ *   例:"claude-cli/2.8.4 (external, cli)"
+ *
+ * 注意:不再是 stainless 默认 UA(`anthropic-ai-claude-code/...`)。真实 CLI 在
+ * defaultHeaders 里用 getUserAgent() 覆盖了 SDK 默认 UA,所以 Anthropic 网关看到
+ * 的就是 `claude-cli/*`。SDK 的身份仍通过 x-stainless-* 头单独表达。
+ */
+function pickUserAgent(): string {
+  return `claude-cli/${CCB_CLI_VERSION} (${CCB_USER_TYPE}, ${CCB_ENTRYPOINT})`;
 }
 
 /**
@@ -144,31 +225,43 @@ function pick<T>(buf: Buffer, offset: number, pool: ReadonlyArray<T>): T {
  * @param seed 可选 32 字节随机 seed。不传时内部 randomBytes(32) — 用于 createAccount。
  *             传时(typically pinned_user_id 的二进制形式)用于"账号迁移 / 重建 persona"
  *             这种需要 deterministic 的场景(本仓现在没用,留 API surface 给未来 backfill 之外的需要)。
+ * @param region 可选出口代理地域码(见 REGION_ACCEPT_LANGUAGE)。命中已知地域时**强制**
+ *             accept_language(及推导出的 timezone)与代理国一致,让 IP/语言/时区自洽;
+ *             null/未知 → 回退按 seed/随机选 accept_language(旧行为)。os/arch/node
+ *             运行时版本等仍随机差异化,不受 region 影响。
  */
-export function generatePersona(seed?: Buffer): Persona {
+export function generatePersona(seed?: Buffer, region?: string | null): Persona {
   const buf = seed
     ? createHash("sha256").update(seed).digest()
     : randomBytes(32);
 
   const arch = pick(buf, 0, PERSONA_VARIANTS.arch);
   const os = pick(buf, 1, PERSONA_VARIANTS.os);
-  const packageVersion = pick(buf, 2, PERSONA_VARIANTS.package_version);
-  const runtime = pick(buf, 3, PERSONA_VARIANTS.runtime);
-  const runtimeVersion = pick(buf, 4, PERSONA_VARIANTS.runtime_version);
-  const acceptLanguage = pick(buf, 5, PERSONA_VARIANTS.accept_language);
-  const retryCount = pick(buf, 6, PERSONA_VARIANTS.retry_count);
-  const lang = pick(buf, 7, PERSONA_VARIANTS.lang);
+  const runtime = pick(buf, 2, PERSONA_VARIANTS.runtime);
+  const runtimeVersion = pick(buf, 3, PERSONA_VARIANTS.runtime_version);
+  // region 命中 → 强制该国 accept_language(代理地域驱动);否则按 seed/随机。
+  const regionAcceptLanguage =
+    region != null ? REGION_ACCEPT_LANGUAGE[region] : undefined;
+  const acceptLanguage =
+    regionAcceptLanguage ?? pick(buf, 4, PERSONA_VARIANTS.accept_language);
+  const retryCount = pick(buf, 5, PERSONA_VARIANTS.retry_count);
+  const lang = pick(buf, 6, PERSONA_VARIANTS.lang);
 
   return {
-    user_agent: pickUserAgent(packageVersion, runtimeVersion, os),
+    // UA 与 x-stainless-package-version 用真实二进制锚点常量(见 CCB_CLI_VERSION),
+    // 账号间差异化交给 os / arch / node 运行时版本 / accept-language。
+    user_agent: pickUserAgent(),
     x_stainless_arch: arch,
     x_stainless_lang: lang,
     x_stainless_os: os,
-    x_stainless_package_version: packageVersion,
+    x_stainless_package_version: CCB_SDK_VERSION,
     x_stainless_runtime: runtime,
     x_stainless_runtime_version: runtimeVersion,
     x_stainless_retry_count: retryCount,
     accept_language: acceptLanguage,
+    // 时区跟着语言画像走(见 ACCEPT_LANGUAGE_TIMEZONE);映射保证全覆盖,?? 只是
+    // TS 兜底,理论不可达。
+    timezone: ACCEPT_LANGUAGE_TIMEZONE[acceptLanguage] ?? "America/New_York",
   };
 }
 

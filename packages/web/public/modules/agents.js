@@ -16,12 +16,12 @@ export function setRenderModelPill(fn) {
 const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
   {
     id: 'main',
-    // 2026-08-14:默认队长改为 glm-5.3(火山 ark Coding Plan),displayName "全能助手"(不绑模型名),
-    // 须与 entrypoint.ts main / platformDefaults 一致。
+    // 2026-08-22:默认队长改为 glm-5.3-zai(Z.AI),displayName "全能助手"(不绑模型名),
+    // 须与 entrypoint.ts main / platformDefaults 一致。ark glm-5.3 不再做默认。
     displayName: '全能助手',
     avatarEmoji: '🧠',
-    model: 'glm-5.3',
-    provider: 'ark',
+    model: 'glm-5.3-zai',
+    provider: 'zai',
   },
   {
     id: 'researcher',
@@ -42,8 +42,8 @@ const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
     id: 'coder',
     displayName: '代码工程师',
     avatarEmoji: '🛠️',
-    model: 'glm-5.3',
-    provider: 'ark',
+    model: 'glm-5.3-zai',
+    provider: 'zai',
   },
   {
     id: 'reviewer',

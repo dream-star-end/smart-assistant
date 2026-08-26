@@ -47,6 +47,7 @@ import { createMemoryAuthSession } from "../src/lib/authSession";
 import { ChatSocket } from "../src/lib/chat/socket";
 import { useSessionList } from "../src/hooks/useSessionList";
 import { useUnreadSessions } from "../src/hooks/useUnreadSessions";
+import { TUTORIAL_CASE_BY_ID } from "../src/lib/tutorialCaseCatalog";
 import type { UseChatSocket } from "../src/hooks/useChatSocket";
 import {
   admittedAckFrame,
@@ -129,6 +130,10 @@ declare global {
       frameCount: () => number;
       /** Push the real retry-status frame for the current in-flight turn. */
       pushRetryStatus: () => void;
+      /** Push the explicit blocking-human turn status. */
+      pushWaitingForUserStatus: () => void;
+      /** Push an engine cold-start phase status for the in-flight turn. */
+      pushEngineStartupStatus: (status: "engine_starting" | "engine_resuming") => void;
       /** Complete the same turn with a live text block plus final terminator. */
       pushRetrySuccess: () => void;
       /** Reproduce page1 → WS N → page2(N) during durable journal hydration. */
@@ -178,6 +183,7 @@ declare global {
     __pushMediaJob: (job: MediaGenerationJob) => void;
     __openMediaTask: (open: boolean) => void;
     __rerenderUnreadProbe: () => void;
+    __completeUnreadProbe: () => void;
   }
 }
 window.__sends = [];
@@ -212,6 +218,8 @@ window.__replayDrive = {
   pushRemainingFrames: () => 0,
   frameCount: () => 0,
   pushRetryStatus: () => {},
+  pushWaitingForUserStatus: () => {},
+  pushEngineStartupStatus: () => {},
   pushRetrySuccess: () => {},
   runDurableOverlap: async () => {
     throw new Error("durable overlap probe 未挂载");
@@ -269,6 +277,12 @@ window.__runPendingDispatchJournalProbe = async () => {
 const mediaTaskAuth = createMemoryAuthSession(() => {}, "browser-media-token");
 const connectorsAuth = createMemoryAuthSession(() => {}, "browser-connectors-token");
 const memoryAuth = createMemoryAuthSession(() => {}, "browser-memory-token");
+const codingRouteProbe = document.createElement("div");
+codingRouteProbe.id = "coding-assistant-route-root";
+codingRouteProbe.dataset.testid = "coding-assistant-route-probe";
+codingRouteProbe.textContent = `CODING_ASSISTANT_ROUTE:${TUTORIAL_CASE_BY_ID["coding-swe-bench-fix"].suggestion.modelId}`;
+document.body.appendChild(codingRouteProbe);
+
 const communityTutorialAuth = createMemoryAuthSession(() => {}, "browser-community-token");
 
 createRoot(document.getElementById("community-tutorial-root")!).render(
@@ -1276,18 +1290,54 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
       // 真 wire → HarnessWebSocket → ChatSocket.dispatch → reducer → MessageList footer。
       live().deliver(legacyRetryStatusFrame(Date.now() + 1_000));
     },
+    pushWaitingForUserStatus: () => {
+      const session = replaySocket.sessions.get(REPLAY_SESSION_ID);
+      if (!session || !session._sendingInFlight) {
+        throw new Error("waiting_for_user 注入前没有真实在途 turn");
+      }
+      live().deliver({
+        type: "outbound.turn_status",
+        sessionKey: `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`,
+        channel: "webchat",
+        peer: { id: REPLAY_SESSION_ID, kind: "dm" },
+        status: "waiting_for_user",
+      });
+    },
+    pushEngineStartupStatus: (status) => {
+      const session = replaySocket.sessions.get(REPLAY_SESSION_ID);
+      if (!session || !session._sendingInFlight) {
+        throw new Error("engine 启动态注入前没有真实在途 turn");
+      }
+      live().deliver({
+        type: "outbound.turn_status",
+        sessionKey: `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`,
+        channel: "webchat",
+        peer: { id: REPLAY_SESSION_ID, kind: "dm" },
+        status,
+      });
+    },
     pushRetrySuccess: () => {
       if (!activeClientMessageId) throw new Error("retry success 注入前缺 clientMessageId");
+      const sessionKey = `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`;
+      const session = replaySocket.sessions.get(REPLAY_SESSION_ID);
+      if (!session) throw new Error("retry success 注入前缺 replay session");
+      // frameSeq 是 per-sessionKey 的跨 turn 单调游标，不会在新 user turn 归零。
+      // T29 与 T46 连续复用同一真实 ChatSocket；若每轮都伪造 7/8，第二轮 final
+      // 会被生产 reducer 正确视作重复帧丢弃，反而把 harness 自己留在 sending。
+      const frameSeq = Math.max(
+        session._lastFrameSeqByKey?.[sessionKey] ?? 0,
+        session._lastFrameSeq ?? 0,
+      ) + 1;
       const base = {
         type: "outbound.message",
-        sessionKey: `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`,
+        sessionKey,
         channel: "webchat",
         peer: { id: REPLAY_SESSION_ID, kind: "dm" },
         clientMessageId: activeClientMessageId,
       };
       live().deliver({
         ...base,
-        frameSeq: 7,
+        frameSeq,
         blocks: [{
           kind: "text",
           text: REPLAY_MARKERS.retrySuccess,
@@ -1295,7 +1345,7 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         }],
         isFinal: false,
       });
-      live().deliver({ ...base, frameSeq: 8, blocks: [], isFinal: true });
+      live().deliver({ ...base, frameSeq: frameSeq + 1, blocks: [], isFinal: true });
     },
     runDurableOverlap: async () => {
       replaySocket.removeSession(REPLAY_SESSION_ID);
@@ -1743,15 +1793,27 @@ createRoot(document.getElementById("codex-density-root")!).render(
 // mark-read；T44 在真 Chromium 里连续重渲染并统计真实 fetch。
 function UnreadMarkReadProbe() {
   const [, setRevision] = useState(0);
+  const [phase, setPhase] = useState<"running" | "terminal">("running");
   const authRef = useRef(createMemoryAuthSession(() => {}, "unread-browser-token"));
   useUnreadSessions({
-    sessions: [{ id: "unread-browser", title: "未读请求风暴探针", unread: true, runState: "running" }],
+    sessions: [
+      phase === "running"
+        ? { id: "unread-browser", title: "未读请求风暴探针", unread: true, runState: "running" }
+        : {
+            id: "unread-browser",
+            title: "未读请求风暴探针",
+            unread: true,
+            runState: "idle",
+            lastOutcome: "completed",
+          },
+    ],
     activeId: "unread-browser",
     userId: "unread-browser-user",
     auth: authRef.current,
   });
   useLayoutEffect(() => {
     window.__rerenderUnreadProbe = () => setRevision((value) => value + 1);
+    window.__completeUnreadProbe = () => setPhase("terminal");
   }, []);
   return <output data-testid="unread-request-probe">ready</output>;
 }

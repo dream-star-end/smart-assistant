@@ -13,6 +13,7 @@
  *   5. SKILLS            — Agent 自有 skill summaries (semi-static)
  *   6. SKILLS_LITERATURE — 平台供给文献检索能力 (personal: commercial 反向钩子;v3 容器: master GET fetch;两条路径互斥;none 时不出现)
  *   7. MEMORY            — Agent notes (MEMORY.md), changes frequently
+ *   7b. PROJECT_MEMORY   — Bound project official index (8KB/80 lines; ledger-gated)
  *   8. TOOLS             — Tool usage hints, learning system instructions (static reference)
  *   9. MODEL_HINT        — per-model 行为补丁 (personal: commercial 反向钩子;v3 容器: master GET fetch;两条路径互斥;none 时不出现)
  *   10. RESEARCH         — 用户显式选中的科研模式守则 (effortLevel='max')
@@ -32,8 +33,17 @@ import { existsSync, readFileSync } from 'node:fs'
 import {
   type SkillStore,
   MemoryDir,
+  ProjectMemoryDir,
+  ProjectMemoryLedger,
+  PROJECT_MEMORY_INDEX_MAX_CHARS,
+  PROJECT_MEMORY_INDEX_MAX_LINES,
   buildAgentSkillStore,
+  buildRunSkillStore,
+  isProjectContextEnabled,
+  loadFrozenProjectContext,
+  frozenProjectDigests,
   paths,
+  type FrozenProjectContext,
   readAgentsConfig,
   readUserProfile,
   scanMemoryContent,
@@ -48,7 +58,12 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
 import { isTextOnlyStaticVisionModel, shouldEnableOpenClaudeVision } from './mcpVisionServer.js'
 import { getPlatformPrompt } from './platformPrompts.js'
+import {
+  resolveTurnProjectContext,
+  type ResolvedTurnProjectContext,
+} from './projectContextRuntime.js'
 import { buildEnvSlot } from './envProbe.js'
+import type { FrozenProjectContextDigests } from './runContextPersist.js'
 
 // ── 平台静态 prompt 文案的个人版 fallback 常量(见文件头「文案通道边界」)──
 //
@@ -96,15 +111,15 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 需要用户在 Web 对话中对少数选项做决定时,按当前引擎选择提问通道:
 - CCB: 调用原生 \`AskUserQuestion\` 并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。
 - Codex: 调用原生 \`request_user_input\` 并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。
-- Cursor: 在正文输出 fenced \`options\` 代码块(语言标记必须是 \`options\`),块内是单个合法 JSON 对象,字段为 \`question?: string\`、\`multi?: boolean\`(仅 \`=== true\` 时多选)、\`options: Array<{label: string, desc?: string}>\`(1–12 项,超过 12 项整块解析失败)。一条回复最多 4 个 options 块;同一条回复里的多块会聚合成一次提交。闭围栏必须独占一行,后面不能再有任何字符,写完立刻换行。贴完立刻结束本回合,options 块之后不要再写正文;多个 options 块之间用空行分隔。用户点选后会作为下一条普通用户消息到达。禁止调用 Cursor 原生 ask 工具(会被托管运行时立即跳过、用户永远看不到),也不要再调用 MCP \`ask_user\`。
+- Cursor: 优先调用 MCP \`present_options\`(一次一题,一条回复最多 4 次;工具立刻返回,卡面由适配器注入)。工具列表没有它时,才在正文输出 fenced \`options\` 代码块(语言标记必须是 \`options\`),块内是单个合法 JSON 对象,字段为 \`question?: string\`、\`multi?: boolean\`(仅 \`=== true\` 时多选)、\`options: Array<{label: string, desc?: string}>\`(1–12 项,超过 12 项整块解析失败)。一条回复最多 4 个 options 块;同一条回复里的多块会聚合成一次提交。闭围栏必须独占一行,后面不能再有任何字符,写完立刻换行。贴完立刻结束本回合,options 块之后不要再写正文;多个 options 块之间用空行分隔。用户点选后会作为下一条普通用户消息到达。禁止调用 Cursor 原生 ask 工具(会被托管运行时立即跳过、用户永远看不到),也不要再调用 MCP \`ask_user\`。
 若当前工具列表没有专用提问工具(如子 agent),用普通文字列出编号选项并结束本轮回复,由用户下一条消息作答。
 
 ## 子 Agent 与并行处理
 
 即使未开启团队模式,只要系统列出了可协作 agent,也可以按收益机会式委派:
-- \`send_to_agent(agentId, message)\`:异步交给另一个 agent,结果直接推送给用户,你不会收到结果。
+- \`send_to_agent(agentId, message)\`:真正后台交给另一个 agent。立刻返回,请结束本回合;子任务完成后系统会把结论注入本对话并叫醒你。需要同步拿结果 → delegate_task。
 - CCB/Codex 同步委派走 MCP \`delegate_task(goal, agentId?, context?)\`;并行走 \`delegate_tasks(tasks)\`。工具会阻塞到子任务结束。
-- Cursor 同步委派走 Bash \`oc-memory delegate --goal "..."\`(一条命令开工并阻塞到结束);并行就在同一回合并发多条。不要用 MCP \`delegate_task\` / \`delegate_tasks\`(Cursor \`tools/call\` 60 秒硬超时)。质量审查用 \`oc-memory request-review --draft "..."\`。
+- Cursor 同步委派走 Bash \`oc-memory delegate --goal "..."\`;并行就在同一回合并发多条。CLI 每段前台等待会在 Cursor 约 60 分钟改挂前安全返回;若 stdout 报 \`status=running jobId=...\`,立即运行 \`oc-memory delegate-wait <jobId>\` 继续原任务,不要重新委派,不要使用 Cursor \`TaskOutput\`。不要用 MCP \`delegate_task\` / \`delegate_tasks\`(Cursor \`tools/call\` 60 秒硬超时)。质量审查用 \`oc-memory request-review --draft "..."\`。
 
 当子任务边界清晰,且专业成员能提升质量、或并行能明显节省时间时,主动委派。典型场景包括代码库搜索、独立调研、互不依赖的多文件工作,以及预计耗时较长且可分离的步骤。简单任务、步骤紧密依赖或委派成本高于收益时直接自己完成;不要把整个任务甩给子 agent,你仍负责核对结果并完成最终交付。
 
@@ -232,10 +247,16 @@ export interface PromptSlotContext {
   skillEvalDraft?: { name: string; dir: string }
   /** 当前 client session id;有则查找所属项目指令注入 PROJECT slot。 */
   sessionId?: string
+  /** tb_project.id when the run is a taskboard stage (no client session). */
+  projectId?: string
   /** 测试可直接注入,跳过存储查找。 */
   projectInstructions?: string | null
   /** 测试可直接注入 pinned 资产索引;undefined 时按 sessionId 查找。 */
   projectAssets?: ProjectAsset[] | null
+  /** Pre-resolved context. undefined = resolve; null = none. */
+  projectContext?: ResolvedTurnProjectContext | null
+  /** Immutable snapshot. If set, PROJECT/SKILLS/PROJECT_MEMORY must not re-read. */
+  frozenProjectContext?: FrozenProjectContext | null
 }
 
 export interface PromptSlot {
@@ -320,9 +341,8 @@ function extractUserAlwaysBlock(text: string): string | null {
   return body.trim() || null
 }
 
-function buildPromptSkillStore(agentId: string): SkillStore {
-  // Overlay (single wiring in @openclaude/storage): baseline(ro) > agent-seed(ro)
-  // > shared(rw, all agents) > legacy(per-agent).
+function buildPromptSkillStore(agentId: string, projectId?: string | null): SkillStore {
+  if (projectId) return buildRunSkillStore({ agentId, projectId })
   return buildAgentSkillStore(agentId)
 }
 
@@ -465,12 +485,24 @@ export function buildProjectAssetsSection(assets: readonly ProjectAsset[]): stri
 
 export async function buildProjectSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
   let raw = ctx.projectInstructions
+  if (raw === undefined && ctx.frozenProjectContext) {
+    raw = ctx.frozenProjectContext.instructions
+  }
+  if (raw === undefined && ctx.projectContext) {
+    raw = ctx.projectContext.instructions
+  }
   if (raw === undefined && ctx.sessionId) {
     raw = await lookupSessionProjectInstructions(ctx.sessionId)
   }
   const instructionBody = raw ? sanitizeProjectInstructionText(raw).trim() : ''
 
   let assets: ProjectAsset[] | null | undefined = ctx.projectAssets
+  if (assets === undefined && ctx.frozenProjectContext) {
+    assets = ctx.frozenProjectContext.assets
+  }
+  if (assets === undefined && ctx.projectContext) {
+    assets = ctx.projectContext.assets
+  }
   if (assets === undefined && ctx.sessionId) {
     assets = await lookupSessionProjectAssets(ctx.sessionId)
   }
@@ -562,12 +594,14 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
         lines.push(`- **${name}** (\`${a.id}\`) [${model}, ${provider}]${capability}`)
       }
       lines.push('')
-      lines.push('**异步**: `send_to_agent(agentId, message)` — 结果推送给用户,你不等待。')
       lines.push(
-        '**同步**: CCB/Codex 用 MCP `delegate_task`; Cursor 用 Bash `oc-memory delegate --goal "..."`(阻塞到结束)。',
+        '**异步**: `send_to_agent(agentId, message)` — 真正后台,立刻返回;完成后系统注入本对话并叫醒你。',
       )
       lines.push(
-        '选择 agent 时考虑其模型和能力特长。需要用结果继续处理 → 同步委派;只需通知 → send_to_agent。',
+        '**同步**: CCB/Codex 用 MCP `delegate_task`; Cursor 用 Bash `oc-memory delegate --goal "..."`,返回 `status=running` 时立即用 `oc-memory delegate-wait <jobId>` 续等,不用 Cursor `TaskOutput`。',
+      )
+      lines.push(
+        '选择 agent 时考虑其模型和能力特长。需要同步拿结果继续处理 → 同步委派;可以先结束本回合、等系统回调 → send_to_agent。',
       )
     }
   } catch {}
@@ -625,8 +659,29 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
 }
 
 export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
-  const skillStore = buildPromptSkillStore(ctx.agentId)
+  const frozenSkills = ctx.frozenProjectContext?.skills
+  const skillStore = frozenSkills
+    ? buildAgentSkillStore(ctx.agentId)
+    : buildPromptSkillStore(
+        ctx.agentId,
+        ctx.projectId ?? ctx.projectContext?.boardProjectId,
+      )
   let skillList = await skillStore.list()
+  if (frozenSkills) {
+    const overlay = new Set(frozenSkills.map((s) => s.name))
+    skillList = skillList.filter((s) => !overlay.has(s.name))
+    for (const s of frozenSkills) {
+      skillList.push({
+        name: s.name,
+        description: s.description,
+        path: paths.projectSkillsDir(ctx.frozenProjectContext!.boardProjectId) + '/' + s.name,
+        source: 'user',
+        layer: 'project',
+        writable: false,
+        agentIds: [ctx.agentId],
+      })
+    }
+  }
   // Skill-eval arm 控制:exclude 滤掉;draft 用草稿描述替换(内容 view 由 mcp 侧接管)。
   if (ctx.skillEvalExclude) skillList = skillList.filter((s) => s.name !== ctx.skillEvalExclude)
   if (ctx.skillEvalDraft) {
@@ -648,10 +703,10 @@ export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   // priority 降序补位 —— 取代纯字母序截断(曾把 office 套件/web-context 等高频
   // 技能全部截出前 15,模型只能靠 skill_search 盲找)。同优先级内保持字母序稳定。
   const rank = (s: (typeof skillList)[number]) => s.priority ?? 0
+  const layerBoost = (s: (typeof skillList)[number]) => (s.layer === 'project' ? 2 : s.source !== 'platform' ? 1 : 0)
   const sorted = [...skillList].sort((a, b) => {
-    const userA = a.source !== 'platform' ? 1 : 0
-    const userB = b.source !== 'platform' ? 1 : 0
-    if (userA !== userB) return userB - userA
+    const boost = layerBoost(b) - layerBoost(a)
+    if (boost !== 0) return boost
     if (rank(a) !== rank(b)) return rank(b) - rank(a)
     return a.name.localeCompare(b.name)
   })
@@ -717,12 +772,57 @@ export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlo
   }
 }
 
+export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
+  if (!isProjectContextEnabled()) return null
+  if (ctx.frozenProjectContext) {
+    const index = ctx.frozenProjectContext.officialMemoryIndex
+    const header = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
+正式条目由台账登记；磁盘上未经 ledger 核验的 memory/*.md 不会注入。
+动态事实必须 live 核验，不得把过期条目当事实。新沉淀请写候选（memory-candidates/，登记后立即生效），不要改正式文件。
+检索：\`oc-memory project-search "<query>"\`（不污染 core-search）。`
+    if (!index) return { name: 'PROJECT_MEMORY', content: header }
+    return { name: 'PROJECT_MEMORY', content: `${header}\n\n## 项目索引\n\n${index}` }
+  }
+  const boardId =
+    (ctx.projectContext?.bound && ctx.projectContext.boardProjectId) || ctx.projectId || null
+  if (!boardId) return null
+  let index: string | null = null
+  try {
+    const { getTaskboardDb } = await import('./taskboard/db/index.js')
+    const ledger = new ProjectMemoryLedger(getTaskboardDb())
+    const official = ledger.listOfficial(boardId)
+    index = await new ProjectMemoryDir(boardId).renderOfficialIndex(
+      official.map((row) => ({
+        slug: row.slug,
+        contentSha256: row.contentSha256,
+        expires: row.expires,
+        deprecated: row.deprecated,
+      })),
+      PROJECT_MEMORY_INDEX_MAX_CHARS,
+      PROJECT_MEMORY_INDEX_MAX_LINES,
+    )
+  } catch {
+    return null
+  }
+  const header = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
+正式条目由台账登记；磁盘上未经 ledger 核验的 memory/*.md 不会注入。
+动态事实必须 live 核验，不得把过期条目当事实。新沉淀请写候选（memory-candidates/，登记后立即生效），不要改正式文件。
+检索：\`oc-memory project-search "<query>"\`（不污染 core-search）。`
+  if (!index) return { name: 'PROJECT_MEMORY', content: header }
+  return {
+    name: 'PROJECT_MEMORY',
+    content: `${header}\n\n## 项目索引\n\n${index}`,
+  }
+}
+
 export const _memoryInternals = {
   renderMemoryInstructions,
   extractUserAlwaysBlock,
   USER_PROFILE_INJECT_MAX_CHARS,
   MEMORY_INDEX_INJECT_MAX_CHARS,
   MEMORY_INDEX_INJECT_MAX_LINES,
+  PROJECT_MEMORY_INDEX_MAX_CHARS,
+  PROJECT_MEMORY_INDEX_MAX_LINES,
 }
 
 export function buildToolsSlot(
@@ -749,7 +849,7 @@ export function buildToolsSlot(
       '',
       '用户要求定时任务或提醒时,**必须立即创建,不要说做不到**。',
       '计算 cron 前必须立刻在 Bash 运行 `date \'+%F %T %z\'` 获取带时区的当前时间,不要依赖提示词生成时刻。',
-      '快速用法: `create_reminder(schedule="分 时 日 月 周", message="内容", oneshot=true)`;到点执行的任务(非播报提醒)加 `kind="task"`。',
+      '快速用法: `create_reminder(schedule="分 时 日 月 周", message="内容", oneshot=true)`;到点执行的任务(非播报提醒)加 `kind="task"`。用户要「这条对话过一会儿再继续」时加 `resume="origin-session"`(不要传 sessionId,网关从当前对话盖章)。',
       '查看/修改/删除: `list_reminders()` / `update_reminder(id, ...)` / `delete_reminder(id)`。这套工具与网页「管理中心 → 定时任务」是同一份数据,用户在页面上建的任务你也能看到。',
       '详细指南见 `skill_view("scheduled-tasks")`。',
     )
@@ -1103,7 +1203,8 @@ export async function buildLiteratureSkillSlot(): Promise<PromptSlot | null> {
 // **不回退** provider hook —— 在 v3 容器里 hook 注定是 dead code,回退只会制造
 // "某些异常环境双重注入" 的错觉。
 
-export const PLATFORM_PROMPT_SLOTS_PATH = '/internal/v3/platform-prompt-slots'
+import { PLATFORM_PROMPT_SLOTS_PATH } from '@openclaude/protocol'
+export { PLATFORM_PROMPT_SLOTS_PATH }
 
 /** v3 supervisor 注入的两个 env。命名故意与 v3MasterSink 一致 —— 是同一条出站通道。 */
 const ENV_MASTER_URL = 'OPENCLAUDE_V3_MASTER_BASE_URL'
@@ -1286,6 +1387,8 @@ export interface PromptSlotApplied {
   meta?: Record<string, string>
 }
 
+export type { FrozenProjectContextDigests } from './runContextPersist.js'
+
 export interface PromptContextResult {
   /** 拼好的 prompt 文本(写到 extra-prompt.md 的内容) */
   content: string
@@ -1293,6 +1396,8 @@ export interface PromptContextResult {
   contentSha256: string
   /** 命中的 slot 列表(按拼装顺序) */
   applied: PromptSlotApplied[]
+  /** Frozen at build time. persist writer must not re-read project meta/ledger. */
+  frozenProjectContext?: FrozenProjectContextDigests
 }
 
 async function sha256Hex(s: string): Promise<string> {
@@ -1320,6 +1425,40 @@ async function sha256Hex(s: string): Promise<string> {
  */
 export async function buildPromptContext(ctx: PromptSlotContext): Promise<PromptContextResult> {
   const slots: PromptSlot[] = []
+  let resolved = ctx.projectContext
+  if (resolved === undefined && isProjectContextEnabled()) {
+    resolved = await resolveTurnProjectContext({
+      sessionId: ctx.sessionId,
+      boardProjectId: ctx.projectId,
+    })
+  }
+  if (resolved !== undefined) {
+    ctx = {
+      ...ctx,
+      projectContext: resolved,
+      projectId: ctx.projectId ?? resolved?.boardProjectId ?? undefined,
+    }
+  }
+
+  let frozenProjectContext = ctx.frozenProjectContext
+  if (frozenProjectContext === undefined && resolved?.bound && resolved.boardProjectId) {
+    let db = null
+    try {
+      const { getTaskboardDb } = await import('./taskboard/db/index.js')
+      db = getTaskboardDb()
+    } catch {
+      db = null
+    }
+    frozenProjectContext = await loadFrozenProjectContext({
+      boardProjectId: resolved.boardProjectId,
+      assets: resolved.assets,
+      assetsRevision: resolved.assetsRevision,
+      db,
+    })
+  }
+  if (frozenProjectContext !== undefined) {
+    ctx = { ...ctx, frozenProjectContext }
+  }
 
   // 在 build 早期就触发 remote fetch,放到与其他静态 slot 计算并行 —— 不阻塞
   // SOUL/USER 之类的本地 I/O,fetch 5s timeout 同时 SOUL/USER 5ms 内就好了,
@@ -1395,6 +1534,9 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   const memory = await buildMemorySlot(ctx)
   slots.push(memory)
 
+  const projectMemory = await buildProjectMemorySlot(ctx)
+  if (projectMemory) slots.push(projectMemory)
+
   const tools = buildToolsSlot(ctx)
   slots.push(tools)
 
@@ -1453,5 +1595,13 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
       return base
     }),
   )
-  return { content, contentSha256: await sha256Hex(content), applied }
+  return {
+    content,
+    contentSha256: await sha256Hex(content),
+    applied,
+    frozenProjectContext:
+      frozenProjectContext && frozenProjectContext.bound
+        ? frozenProjectDigests(frozenProjectContext)
+        : undefined,
+  }
 }

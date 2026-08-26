@@ -31,7 +31,19 @@ export type UserMsgStatus = "sending" | "sent" | "queued" | "read" | "replied" |
  */
 export type TurnStatusState =
   | "compacting"
+  | "waiting_for_user"
+  // 引擎冷启动阶段(gateway 权威发射,INC-20260824-FIRST-TEXT-LATENCY):
+  // 进程 spawn 中 / 带历史恢复中。首个内容块或后继阶段态到达即被清除。
+  | "engine_starting"
+  | "engine_resuming"
   | { kind: "retrying"; attempt: number; max: number; retryAt: number };
+
+/** 判别 `_turnStatus` 是否处于「引擎冷启动」阶段(内容帧兜底消解 + 渲染层消费)。 */
+export function isEngineStartupTurnStatus(
+  s: TurnStatusState | null | undefined,
+): s is "engine_starting" | "engine_resuming" {
+  return s === "engine_starting" || s === "engine_resuming";
+}
 
 /** 判别 `_turnStatus` 是否处于「自动重试中」态（供 reducer 内容帧自动消解 + 渲染层消费）。 */
 export function isRetryingTurnStatus(
@@ -208,6 +220,15 @@ export type ChatMessage = {
   ts: number;
   /** turn 结束/最后内容到达时刻。*/
   completedAt?: number;
+  /** Browser-only first-text commit probe. Created only by the live WS path,
+   * consumed after the corresponding assistant DOM has committed, and never persisted. */
+  _firstTextPaintProbe?: {
+    traceId: string;
+    sessionId: string;
+    clientMessageId: string;
+    startedAt: number;
+    backgroundAtFrame: boolean;
+  };
   /**
    * 行的产出来源。`'server'` = 后端 server-authored 行(getSession/listSessions 带回的
    * durable 快照,id 形如 `srv-*`);缺省/`'local'` = 本设备 reducer 就地产出的行。
@@ -285,6 +306,8 @@ export type ChatMessage = {
   /** error 红卡：归一化 code + 折叠区原始 detail。*/
   _errorCode?: string;
   _errorDetail?: string;
+  /** Browser-only: last recovery skip copy, attached to the source error card. */
+  _recoverySkippedNotice?: string;
   /** Highest gateway-local retry consumed before this terminal error. */
   _automaticRetryRootClientMessageId?: string;
   _automaticRetryAttempt?: number;
@@ -427,6 +450,10 @@ export type ChatMessage = {
   _delegate?: boolean;
   _delegateAgentId?: string;
   _delegateGoal?: string;
+  /** Exact send_to_agent async job handle; preferred over ambiguous goal matching. */
+  _delegateJobId?: string;
+  /** send_to_agent 真后台：父 turn 收尾后组卡仍保持运行中，直到子 agent 终态进度帧。 */
+  _background?: boolean;
   _agentGroupOrigin?: string;
   _teamFallback?: boolean;
   /** agent-group ↔ delegate-progress run 绑定键（双向 adopt，§7）。*/

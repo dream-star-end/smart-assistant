@@ -15,6 +15,7 @@ import {
   ShieldCheck,
   Sparkles,
   MessageSquare,
+  MessageSquarePlus,
   Quote,
   Square,
   Target,
@@ -79,7 +80,16 @@ export type CardCallbacks = {
   onRegenerate?: () => void;
   onContinue?: () => void;
   onTopUp?: () => void;
+  /** context_too_long 类:在新会话中延续目标(导航非重发,同 onTopUp 不受末轮门控)。 */
+  onStartNewSession?: () => void;
   onFeedback?: (ctx: FeedbackContext) => void;
+  onFirstTextPaint?: (input: {
+    traceId: string;
+    sessionId: string;
+    clientMessageId: string;
+    latencyMs: number;
+    backgroundAtFrame: boolean;
+  }) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   onRetrySend?: (msg: ChatMessage) => void;
   /** Resume an executed interrupted turn as one new, deduplicated user turn. */
@@ -556,7 +566,9 @@ export function AssistantCard({
       ? cb.resolveInterruptedContinuation?.(msg)
       : undefined;
   const showInterruptedContinuation =
-    !!interruptedContinuationTarget && !!cb.onContinueInterrupted;
+    !msg._recoverySkippedNotice &&
+    !!interruptedContinuationTarget &&
+    !!cb.onContinueInterrupted;
   const showPreciseRetry = !isInsufficient && isLastTurn && !!retryTarget;
   const showRegenFallback =
     !isInsufficient &&
@@ -566,8 +578,12 @@ export function AssistantCard({
     (sem.cta === "retry" || sem.cta === "retry_or_switch") &&
     !!cb.onRegenerate;
   const showTopUp = isInsufficient && !!cb.onTopUp;
+  // cta==='new_session'(上下文超限类):导航非重发,同「去充值」不受末轮门控。
+  const showNewSession =
+    !!presentedError && !presentedError.waived && sem.cta === "new_session" && !!cb.onStartNewSession;
   const showActionRow =
     showTopUp ||
+    showNewSession ||
     showInterruptedContinuation ||
     showPreciseRetry ||
     showRegenFallback ||
@@ -667,7 +683,7 @@ export function AssistantCard({
           >
             <div className="min-w-0">
               <p className="text-[13px] leading-5 text-fg/90 [overflow-wrap:anywhere]">
-                {presentedError.message}
+                {msg._recoverySkippedNotice ?? presentedError.message}
               </p>
               {presentedError.detail && (
                 <details className="mt-1.5 max-w-full">
@@ -685,6 +701,15 @@ export function AssistantCard({
                     // insufficient_credits「去充值」= 导航非重发,不受末轮门控。
                     <Button size="sm" variant="accent" shape="pill" onClick={cb.onTopUp}>
                       <Wallet size={14} /> 去充值
+                    </Button>
+                  ) : showNewSession ? (
+                    <Button
+                      size="sm"
+                      variant="accent"
+                      shape="pill"
+                      onClick={cb.onStartNewSession}
+                    >
+                      <MessageSquarePlus size={14} /> 新建会话继续
                     </Button>
                   ) : showInterruptedContinuation ? (
                     <Button
@@ -919,7 +944,7 @@ export function GoalCard({ msg }: { msg: ChatMessage }) {
 // 不外包 memo(同 PlanCard:就地 mutate + {msg} 会永不重渲)。可折叠:进行中默认展开(看实时进度)、
 // 完成默认折叠(收成一行摘要),与 AgentGroupCard 同款头部 chevron 交互;用户点击后本地锁定。
 export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
-  const entries = msg.entries ?? [];
+  const entries = (msg.entries ?? []).filter((e) => e.phase !== "start" && e.phase !== "done");
   const children = msg.childBlocks ?? [];
   const done = !!msg._completed;
   const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);

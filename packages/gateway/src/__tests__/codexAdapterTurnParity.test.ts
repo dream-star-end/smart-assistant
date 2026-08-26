@@ -794,6 +794,11 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
 
     p.reply(reverseRequest);
     await waitFor(() => h.events.some((e) => e.kind === "permission_request"));
+    assert.equal(h.adapter.waitingForUserInput, true);
+    assert.equal(
+      h.events.some((e) => e.kind === "turn_status" && e.status === "waiting_for_user"),
+      true,
+    );
     const permissionEvents = h.events.filter((e) => e.kind === "permission_request");
     assert.equal(permissionEvents.length, 1);
     const permission = permissionEvents[0];
@@ -825,6 +830,17 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
     assert.equal(h.events.filter((e) => e.kind === "permission_request").length, 1);
 
     const beforeResponse = p.written.length;
+    const write = p.stdin.write;
+    p.stdin.write = () => { throw new Error("EPIPE"); };
+    assert.equal(
+      h.adapter.sendPermissionResponse(permission.request.requestId, {
+        behavior: "allow",
+        updatedInput: { answers: { "Which color?": "Blue" } },
+      }),
+      false,
+    );
+    assert.equal(h.adapter.waitingForUserInput, true);
+    p.stdin.write = write;
     assert.equal(
       h.adapter.sendPermissionResponse(permission.request.requestId, {
         behavior: "allow",
@@ -836,6 +852,10 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
       true,
     );
     await waitFor(() => p.written.length === beforeResponse + 1);
+    assert.equal(h.adapter.waitingForUserInput, false);
+    const cleared = h.events.at(-1);
+    assert.ok(cleared?.kind === "turn_status");
+    assert.equal(cleared.status, null);
     assert.deepEqual(p.written[beforeResponse] as unknown, {
       jsonrpc: "2.0",
       id: "srv-user-input-1",
@@ -852,6 +872,49 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
     );
     assert.equal(p.written.length, beforeResponse + 1);
 
+    p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+  });
+
+  test("两个并发 requestUserInput 只在最后一个回答后退出 waiting", async () => {
+    const h = makeHarness();
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    const p = h.proc();
+    for (const [id, itemId] of [["srv-a", "ask-a"], ["srv-b", "ask-b"]]) {
+      p.reply({
+        jsonrpc: "2.0",
+        id,
+        method: "item/tool/requestUserInput",
+        params: {
+          threadId: "thr-new-1",
+          turnId: "turn-1",
+          itemId,
+          questions: [{
+            id: itemId,
+            header: "Confirm",
+            question: `${itemId}?`,
+            isOther: false,
+            isSecret: false,
+            options: [{ label: "Yes", description: "Continue." }],
+          }],
+          autoResolutionMs: 60_000,
+        },
+      });
+    }
+    await waitFor(() => h.events.filter((e) => e.kind === "permission_request").length === 2);
+    const permissions = h.events.filter((e) => e.kind === "permission_request");
+    assert.equal(h.adapter.waitingForUserInput, true);
+    assert.equal(h.adapter.sendPermissionResponse(
+      permissions[0]!.request.requestId,
+      { behavior: "deny" },
+    ), true);
+    assert.equal(h.adapter.waitingForUserInput, true);
+    assert.equal(h.adapter.sendPermissionResponse(
+      permissions[1]!.request.requestId,
+      { behavior: "deny" },
+    ), true);
+    assert.equal(h.adapter.waitingForUserInput, false);
     p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
     await turn.summary;
   });
@@ -1244,5 +1307,39 @@ describe("CodexAdapter — turn/start 窄路径自动重试(end-to-end)", () => 
     );
     assert.equal((statusEvents[0].status as { retry: { max: number } }).retry.max, 10);
     assert.equal(statusEvents[1].status, null);
+  });
+});
+
+// ── 会话打开预热(preheat,INC-20260824)────────────────────────────────────
+
+describe("CodexAdapter.preheat — spawn+initialize、零 thread/turn RPC", () => {
+  test("preheat 只 spawn + initialize;后续首 turn 复用同一进程再 thread/start", async () => {
+    const h = makeHarness();
+    await h.adapter.preheat();
+
+    assert.equal(h.spawnCalls.length, 1, "preheat 必须 spawn 恰好一个 app-server");
+    assert.ok(
+      h.proc().written.some((r) => r.method === "initialize"),
+      "preheat 必须完成 initialize 握手",
+    );
+    for (const forbidden of ["thread/start", "thread/resume", "turn/start"]) {
+      assert.equal(
+        h.proc().written.some((r) => r.method === forbidden),
+        false,
+        `preheat 不得发 ${forbidden}(零上游 LLM 调用/零计费边界)`,
+      );
+    }
+
+    // 并发 preheat 共享同一 in-flight,不再 spawn 第二个进程。
+    await Promise.all([h.adapter.preheat(), h.adapter.preheat()]);
+    assert.equal(h.spawnCalls.length, 1);
+
+    // 预热后的首 turn:复用同一进程,走正常 thread/start → turn/start。
+    const turn = beginTurn(h, { requestId: "req-preheat" });
+    await waitForRequest(h, "turn/start");
+    assert.equal(h.spawnCalls.length, 1, "首 turn 不得重复 spawn");
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+    await h.adapter.shutdown();
   });
 });

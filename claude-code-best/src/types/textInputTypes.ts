@@ -343,6 +343,11 @@ export type QueuedCommand = {
    */
   workload?: string
   /**
+   * Stable task id for mode === 'task-notification'. Prefer this over
+   * parsing XML in <task-id> so mid-turn ack and gateway inject share one id.
+   */
+  taskId?: string
+  /**
    * Agent that should receive this notification. Undefined = main thread.
    * Subagents run in-process and share the module-level command queue; the
    * drain gate in query.ts filters by this field so a subagent's background

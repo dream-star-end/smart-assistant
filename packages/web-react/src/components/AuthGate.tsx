@@ -1,8 +1,9 @@
-import { ArrowLeft, ArrowRight, Check, MailCheck, Sparkles } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, MailCheck } from "lucide-react";
 import { type MouseEvent as ReactMouseEvent, useEffect, useRef, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { authErrorMessage } from "../lib/api";
 import { BRAND } from "../lib/brand";
+import { BrandMark } from "./BrandMark";
 import { LEGAL_DOCS, TERMS_VERSION, type LegalKind } from "../lib/legal";
 import { LegalDocBody } from "./LegalPage";
 import { ThemeToggle } from "./ThemeToggle";
@@ -326,7 +327,7 @@ export function AuthGate({
   }
 
   const titles: Record<AuthMode, { h: string; sub: string }> = {
-    login: { h: `欢迎使用 ${BRAND.name}`, sub: BRAND.tagline },
+    login: { h: `欢迎使用 ${BRAND.name}`, sub: `${BRAND.nameEn} · ${BRAND.tagline}` },
     register: { h: "创建账号", sub: "注册即可免费开始，每月赠 300 积分" },
     verify: { h: "验证邮箱", sub: `验证码已发往 ${email.trim() || "你的邮箱"}` },
     forgot: { h: "找回密码", sub: "输入注册邮箱，我们发你一个重置链接" },
@@ -404,9 +405,9 @@ export function AuthGate({
       <div className="flex min-h-full items-center justify-center px-5 py-12">
       <div className="relative w-full max-w-[400px] animate-in">
         <div className="mb-7 flex flex-col items-center text-center">
-          <span className="mb-4 flex size-12 items-center justify-center rounded-xl2 bg-grad-cta text-white shadow-float">
-            <Sparkles size={24} />
-          </span>
+          {/* 品牌一致性:与落地页同一个「从」字方块(共享 BrandMark),
+              替换原紫色渐变 Sparkles —— 用户从落地页点「登录」进来不再像换了个产品。 */}
+          <BrandMark className="mb-4 size-12" fontSize="text-[24px]" />
           <h1 className="text-[22px] font-semibold tracking-tight text-fg">{titles[mode].h}</h1>
           <p className="mt-1.5 text-[14px] text-muted">{titles[mode].sub}</p>
         </div>

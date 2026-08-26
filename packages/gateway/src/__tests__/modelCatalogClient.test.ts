@@ -20,11 +20,13 @@ import { join } from 'node:path'
 import { describe, test } from 'node:test'
 
 import {
+  AGENT_COST_OVERRIDE_TTL_MS,
   LOCAL_CATALOG_KIND,
   MODEL_CATALOG_EPOCH_PATH,
   MODEL_CATALOG_PATH,
   ModelCatalogClient,
   ModelCatalogUnavailableError,
+  lookupCatalogAgentMultiplier,
   parseCatalogResponse,
 } from '../modelCatalogClient.js'
 
@@ -46,6 +48,11 @@ const CATALOG_BODY = {
       capability_zero: true,
       supports_thinking: true,
       default_effort: 'high',
+      input_per_mtok: '600',
+      output_per_mtok: '2400',
+      cache_read_per_mtok: '120',
+      cache_write_per_mtok: '0',
+      multiplier: '1.000',
     },
     {
       model_id: 'gpt-5.6-sol',
@@ -58,6 +65,11 @@ const CATALOG_BODY = {
       capability_zero: false,
       supports_thinking: false,
       default_effort: null,
+      input_per_mtok: '299',
+      output_per_mtok: '1799',
+      cache_read_per_mtok: '30',
+      cache_write_per_mtok: '0',
+      multiplier: '1.000',
     },
   ],
   projection_revision: 'proj-rev-1',
@@ -164,6 +176,13 @@ describe('modelCatalogClient — 新鲜快照', () => {
     assert.ok(!v1.isRoutable('not-granted'))
     assert.equal(v1.isCodexModel('gpt-5.6-sol'), true)
     assert.equal(v1.resolve('glm-5.2')?.providerId, 'ark')
+    assert.deepEqual(v1.resolve('gpt-5.6-sol')?.pricing, {
+      inputPerMtok: '299',
+      outputPerMtok: '1799',
+      cacheReadPerMtok: '30',
+      cacheWritePerMtok: '0',
+      multiplier: '1.000',
+    })
 
     await client.getView()
     assert.deepEqual(
@@ -516,4 +535,143 @@ describe('modelCatalogClient — fail-closed(无 baked 回落)', () => {
     assert.equal(client.configured, false)
     await assert.rejects(() => client.getView(), ModelCatalogUnavailableError)
   })
+})
+
+describe('modelCatalogClient — agent_cost_overrides 字段在/不在', () => {
+  test('字段缺席 → lookup 返回 null(fail-closed),不得默认 1.000', () => {
+    const view = parseCatalogResponse(CATALOG_BODY)
+    assert.equal(view.agentCostOverrides, null)
+    assert.equal(lookupCatalogAgentMultiplier(view, 'coding-assistant'), null)
+  })
+
+  test('空字典 → 缺该 agent 按 1.000(明确无 override)', () => {
+    const view = parseCatalogResponse({ ...CATALOG_BODY, agent_cost_overrides: {} })
+    assert.ok(view.agentCostOverrides != null)
+    assert.equal(view.agentCostOverrides.size, 0)
+    assert.equal(lookupCatalogAgentMultiplier(view, 'coding-assistant'), '1.000')
+  })
+
+  test('有 override → 返回下发值;其它 agent 仍 1.000', () => {
+    const view = parseCatalogResponse({
+      ...CATALOG_BODY,
+      agent_cost_overrides: { 'coding-assistant': '1.500' },
+    })
+    assert.equal(lookupCatalogAgentMultiplier(view, 'coding-assistant'), '1.500')
+    assert.equal(lookupCatalogAgentMultiplier(view, 'explorer'), '1.000')
+  })
+
+  test('空字典必须落入 LKG,冷启不能把「明确无 override」丢成「没拿到字段」', async () => {
+    const lkg = tmpLkg()
+    const body = { ...CATALOG_BODY, agent_cost_overrides: {} }
+    const client = new ModelCatalogClient({
+      env: ENV,
+      lkgPath: lkg.path,
+      ttlMs: 60_000,
+      fetcher: fakeFetcher({
+        catalog: { status: 200, body },
+        epoch: { status: 200, body: { epoch: '5' } },
+      }),
+    })
+    const first = await client.getView()
+    assert.equal(lookupCatalogAgentMultiplier(first, 'coding-assistant'), '1.000')
+    client._resetForTests()
+    const second = await client.getView()
+    assert.equal(lookupCatalogAgentMultiplier(second, 'coding-assistant'), '1.000')
+    lkg.cleanup()
+  })
+
+  test('override TTL 过期且全量刷新失败 → lookup 返回 null,不得沿用陈旧 1.000', async () => {
+    const lkg = tmpLkg()
+    let now = 0
+    let catalogOk = true
+    const body = { ...CATALOG_BODY, agent_cost_overrides: {} }
+    const client = new ModelCatalogClient({
+      env: ENV,
+      lkgPath: lkg.path,
+      now: () => now,
+      ttlMs: 60_000,
+      // biome-ignore lint/suspicious/noExplicitAny: 测试桩
+      fetcher: (async (url: string): Promise<any> => {
+        if (url.includes(MODEL_CATALOG_EPOCH_PATH)) {
+          return {
+            statusCode: 200,
+            body: (async function* () {
+              yield Buffer.from(JSON.stringify({ epoch: '5' }), 'utf8')
+            })(),
+          }
+        }
+        if (!catalogOk) throw new Error('ECONNREFUSED')
+        return {
+          statusCode: 200,
+          body: (async function* () {
+            yield Buffer.from(JSON.stringify(body), 'utf8')
+          })(),
+        }
+      }) as any,
+    })
+    assert.equal(await client.lookupAgentCostMultiplier('coding-assistant'), '1.000')
+    now += AGENT_COST_OVERRIDE_TTL_MS + 1
+    catalogOk = false
+    assert.equal(await client.lookupAgentCostMultiplier('coding-assistant'), null)
+    lkg.cleanup()
+  })
+})
+
+describe('modelCatalogClient — cross-caller full-fetch singleflight', () => {
+  test('cold getView 与 agent multiplier lookup 共用一次全量拉取', async () => {
+    const calls: Call[] = []
+    const lkg = tmpLkg()
+    const body = { ...CATALOG_BODY, agent_cost_overrides: { 'coding-assistant': '1.500' } }
+    const client = new ModelCatalogClient({
+      env: ENV,
+      lkgPath: lkg.path,
+      fetcher: fakeFetcher({ catalog: { status: 200, body }, calls }),
+    })
+    const [view, multiplier] = await Promise.all([
+      client.getView(),
+      client.lookupAgentCostMultiplier('coding-assistant'),
+    ])
+    assert.equal(view.securityEpoch, '5')
+    assert.equal(multiplier, '1.500')
+    assert.equal(calls.filter((call) => call.path === MODEL_CATALOG_PATH).length, 1)
+    lkg.cleanup()
+  })
+})
+
+test('late old epoch validation cannot overwrite a newer agent-override full fetch', async () => {
+  const lkg = tmpLkg()
+  let now = 1
+  let catalogCalls = 0
+  let releaseEpoch!: () => void
+  const epochGate = new Promise<void>((resolve) => { releaseEpoch = resolve })
+  const oldBody = { ...CATALOG_BODY, projection_revision: 'old', agent_cost_overrides: { a: '1.000' } }
+  const newBody = { ...CATALOG_BODY, projection_revision: 'new', agent_cost_overrides: { a: '2.000' } }
+  const response = (body: unknown) => ({
+    statusCode: 200,
+    body: (async function* () { yield Buffer.from(JSON.stringify(body), 'utf8') })(),
+  })
+  const client = new ModelCatalogClient({
+    env: ENV,
+    lkgPath: lkg.path,
+    now: () => now,
+    ttlMs: 10,
+    fetcher: (async (url: string): Promise<any> => {
+      if (url.includes(MODEL_CATALOG_EPOCH_PATH)) {
+        await epochGate
+        return response({ epoch: '5', availability_revision: 'availability-1' })
+      }
+      catalogCalls += 1
+      return response(catalogCalls === 1 ? oldBody : newBody)
+    }) as any,
+  })
+  await client.getView()
+  now += AGENT_COST_OVERRIDE_TTL_MS + 1
+  const lateValidation = client.getView()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(await client.lookupAgentCostMultiplier('a'), '2.000')
+  releaseEpoch()
+  const finalView = await lateValidation
+  assert.equal(finalView.projectionRevision, 'new')
+  assert.equal(lookupCatalogAgentMultiplier(finalView, 'a'), '2.000')
+  lkg.cleanup()
 })

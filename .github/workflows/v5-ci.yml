@@ -126,6 +126,25 @@ jobs:
       - name: Run web-react-browser
         run: npm run test:browser
 
+  node-agent-go:
+    name: node-agent-go
+    needs: [ci-queue-sentinel]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # node-agent 是 Go 二进制,不在 tsc/tsx 门覆盖内。
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/commercial/node-agent/go.mod
+          cache-dependency-path: packages/commercial/node-agent/go.sum
+
+      - name: Build node-agent
+        run: npm run build:node-agent
+
   v5-ops:
     name: v5-ops
     runs-on: ubuntu-latest

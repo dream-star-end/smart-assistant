@@ -15,7 +15,7 @@
 
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { paths } from '@openclaude/storage'
+import { ensureProjectMemoryLedger, ensureProjectSkillLedger, paths } from '@openclaude/storage'
 import Database from 'better-sqlite3'
 import {
   TASKBOARD_DDL_V1,
@@ -60,6 +60,29 @@ export function migrate(db: TaskboardDb): void {
     }
     if (current < 2) {
       db.exec(TASKBOARD_DDL_V2)
+    }
+    if (current < 3) {
+      // v3:阶段级模型覆盖。可空 = 沿用 agent 默认模型。已有行保持 NULL,不丢数据。
+      db.exec('ALTER TABLE tb_pipeline_stage ADD COLUMN model TEXT')
+    }
+    if (current < 4) {
+      // v4:补价因缺 agent 倍率字段而 fail-closed 时标不精确。可空 = 旧行未知。
+      db.exec('ALTER TABLE tb_ticket_run ADD COLUMN cost_imprecise INTEGER')
+    }
+    if (current < 5) {
+      db.exec('ALTER TABLE tb_project ADD COLUMN workspace_json TEXT')
+      db.exec('ALTER TABLE tb_project ADD COLUMN context_version INTEGER NOT NULL DEFAULT 0')
+    }
+    if (current < 6) {
+      ensureProjectMemoryLedger(db)
+    }
+    if (current < 7) {
+      db.exec('ALTER TABLE tb_ticket_run ADD COLUMN context_snapshot_id TEXT')
+      db.exec('ALTER TABLE tb_ticket_run ADD COLUMN context_sha256 TEXT')
+      db.exec('ALTER TABLE tb_ticket_run ADD COLUMN context_version INTEGER')
+    }
+    if (current < 8) {
+      ensureProjectSkillLedger(db)
     }
     db.pragma(`user_version = ${TASKBOARD_SCHEMA_VERSION}`)
     ensureSettingsRow(db)

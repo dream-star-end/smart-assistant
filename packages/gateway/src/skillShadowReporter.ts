@@ -9,7 +9,7 @@
  */
 import { createHash } from 'node:crypto'
 
-import type { ToolCalledEvent } from '@openclaude/protocol'
+import { SKILL_SHADOW_PATH, type ToolCalledEvent } from '@openclaude/protocol'
 import { type SkillMetadata, buildAgentSkillStore } from '@openclaude/storage'
 
 import { type GatewayEventBus, eventBus } from './eventBus.js'
@@ -30,7 +30,7 @@ import {
 const log = createLogger({ module: 'skillShadowReporter' })
 
 export const SKILL_SHADOW_ENV = 'OC_SKILL_SHADOW_SAMPLE_RATE'
-export const SKILL_SHADOW_PATH = '/internal/v3/skill-shadow'
+export { SKILL_SHADOW_PATH }
 export const SKILL_SHADOW_DEFAULT_SAMPLE_RATE = 0.1
 export const SKILL_SHADOW_BUDGET_MS = 50
 

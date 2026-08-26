@@ -39,15 +39,27 @@ import {
   handleArchivalDelete,
   handleArchivalSearch,
   handleCoreSearch,
+  handleProjectSearch,
   handleSessionSearch,
   type MemoryToolResult,
 } from './memoryTools.js'
-import { gatewayAuthHeaders, gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway } from './gatewayClient.js'
 import {
+  gatewayAuthHeaders,
+  gatewayBaseUrl,
+  gatewayDelegateHeaders,
+  postJsonToGateway,
+} from './gatewayClient.js'
+import {
+  resolveDelegateCliForegroundBudgetMs,
   resolveDelegateWaitPollMs,
   runDelegateWaitLoop,
 } from './delegateWaitCli.js'
-import { normalizeDelegateAgentId, normalizeDelegateModel } from './delegateArgs.js'
+import {
+  normalizeDelegateAgentId,
+  normalizeDelegateModel,
+  parseDelegateAllowSelf,
+  rejectSelfDelegate,
+} from './delegateArgs.js'
 import {
   readDelegateContextToken,
   requestReviewArgs,
@@ -100,12 +112,13 @@ function parseOffset(raw: string | undefined): number | undefined {
 const USAGE = [
   'usage:',
   '  oc-memory core-search "<query>" [--limit N] [--offset N]',
+  '  oc-memory project-search "<query>" [--project UUID] [--limit N] [--offset N]',
   '  oc-memory session-search "<query>" [--limit N] [--agent-id ID] [--summarize]',
   '  oc-memory archival-add "<text>" [--tags a,b,c]',
   '  oc-memory archival-search "<query>" [--limit N]',
   '  oc-memory archival-delete <id>',
   '  oc-memory delegate-wait <jobId> [<jobId>...]',
-  '  oc-memory delegate --goal "<text>" [--agent-id ID] [--model SLUG] [--context "..."] [--effort low|medium|high] [--toolsets a,b] [--resume-session-key KEY]',
+  '  oc-memory delegate --goal "<text>" [--agent-id ID] [--model SLUG] [--context "..."] [--effort low|medium|high] [--toolsets a,b] [--resume-session-key KEY] [--allow-self]',
   '  oc-memory request-review --draft "<text>" [--revision-note "..."] [--resume-session-key KEY]',
 ].join('\n')
 
@@ -148,7 +161,7 @@ async function observeMemoryResult(input: {
   result: MemoryToolResult
 }): Promise<void> {
   const telemetry = input.result.telemetry ?? {
-    outcome: input.result.isError ? 'error' as const : 'success' as const,
+    outcome: input.result.isError ? ('error' as const) : ('success' as const),
   }
   try {
     await recordMemoryUsageEvent({
@@ -203,7 +216,6 @@ async function main(): Promise<void> {
 
   const { positional, flags } = parseFlags(rest)
 
-
   if (cmd === 'delegate' || cmd === 'request-review') {
     const ctxTok = readDelegateContextToken()
     if (!ctxTok.ok) fail(ctxTok.error)
@@ -221,28 +233,44 @@ async function main(): Promise<void> {
       if (!modelNorm.ok) fail(modelNorm.error)
       const effortRaw = flags.effort
       const effort =
-        effortRaw === 'low' || effortRaw === 'medium' || effortRaw === 'high' ? effortRaw : undefined
+        effortRaw === 'low' || effortRaw === 'medium' || effortRaw === 'high'
+          ? effortRaw
+          : undefined
       const toolsets = flags.toolsets
-        ? flags.toolsets.split(',').map((s) => s.trim()).filter(Boolean)
+        ? flags.toolsets
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
         : undefined
+      const targetAgentId = agentNorm.agentId || 'main'
+      const allowSelf = parseDelegateAllowSelf(flags['allow-self'])
+      const selfCheck = rejectSelfDelegate({
+        callerAgentId: agentId,
+        targetAgentId,
+        allowSelf,
+      })
+      if (!selfCheck.ok) fail(selfCheck.error)
       args = {
-        agentId: agentNorm.agentId || 'main',
+        agentId: targetAgentId,
         goal,
         context: flags.context,
         effort,
         model: modelNorm.model,
         toolsets,
         resumeSessionKey: flags['resume-session-key'],
+        allowSelf: allowSelf || undefined,
       }
     }
     const base = gatewayBaseUrl()
     const headers = gatewayDelegateHeaders()
     headers[DELEGATE_CONTEXT_HEADER] = ctxTok.token
     const pollWaitMs = resolveDelegateWaitPollMs()
+    const foregroundBudgetMs = resolveDelegateCliForegroundBudgetMs()
     const result = await runDelegateStartAndWait({
       args,
       contextToken: ctxTok.token,
       pollWaitMs,
+      foregroundBudgetMs,
       start: (agentId, body) =>
         postJsonToGateway(`${base}/api/agents/${encodeURIComponent(agentId)}/delegate`, {
           headers,
@@ -263,12 +291,14 @@ async function main(): Promise<void> {
 
   // Cursor MCP 60s 上限的委派长等待:走网关 /api/delegate/wait 长轮询,不碰记忆后端。
   if (cmd === 'delegate-wait') {
-    if (positional.length === 0) fail('delegate-wait requires at least one <jobId> positional argument')
+    if (positional.length === 0)
+      fail('delegate-wait requires at least one <jobId> positional argument')
     const base = gatewayBaseUrl()
     const headers = gatewayDelegateHeaders()
     const result = await runDelegateWaitLoop({
       jobIds: positional,
       pollWaitMs: resolveDelegateWaitPollMs(),
+      foregroundBudgetMs: resolveDelegateCliForegroundBudgetMs(),
       waitOnce: (jobId, waitMs) =>
         postJsonToGateway(`${base}/api/delegate/wait`, {
           headers,
@@ -286,6 +316,25 @@ async function main(): Promise<void> {
     const startedAt = Date.now()
     const result = await handleCoreSearch({
       agentId,
+      query,
+      limit: parseLimit(flags.limit),
+      offset: parseOffset(flags.offset),
+    })
+    await observeAndEmit({
+      agentId,
+      operation: 'core_search',
+      memoryType: 'core',
+      query,
+      startedAt,
+      result,
+    })
+  }
+  if (cmd === 'project-search') {
+    const query = positional[0]
+    if (!query) fail('project-search requires a "<query>" positional argument')
+    const startedAt = Date.now()
+    const result = await handleProjectSearch({
+      projectId: flags.project,
       query,
       limit: parseLimit(flags.limit),
       offset: parseOffset(flags.offset),

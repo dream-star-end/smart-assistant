@@ -48,6 +48,13 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { createLogger } from './logger.js'
 import type { SessionManager } from './sessionManager.js'
 import { isHiddenSystemAgentId } from './agentVisibility.js'
+import {
+  normalizeCronProject,
+  resolveCronFireProject,
+  type CronProjectPorts,
+  type CronProjectResolution,
+} from './cronProject.js'
+import { createRunContextDescriptor } from './runContextPersist.js'
 // 引擎 API 错误识别的单一权威(delegate 输出错误同款):CCB 把上游失败以
 // "API Error: …" 文本块流出而不抛,cron 侧必须把这类"产出"当失败而非结果。
 import { classifyDelegateOutputError } from './errorClassify.js'
@@ -70,6 +77,9 @@ import {
   type CronIndexPayload,
 } from './v3CronIndexPush.js'
 import type { V3WechatOutboundConfig } from './v3WechatOutbound.js'
+import {
+  type CronOriginFireResult,
+} from './cronOriginSession.js'
 
 const logger = createLogger({ module: 'cron' })
 
@@ -420,6 +430,17 @@ export interface CronJob {
   // falsely "caught up" for the 09:00 tick it never missed. Legacy jobs
   // without createdAt are only bounded by the catch-up window itself.
   createdAt?: number
+  // origin-session: fire by injecting a new inbound turn into the conversation
+  // that created the job. Default / omitted = isolated cron session (legacy).
+  // sourceSessionKey / sourceUserId are gateway-stamped; never accept them
+  // from model tool args.
+  resume?: 'isolated' | 'origin-session'
+  sourceSessionKey?: string
+  sourceUserId?: string
+  /** Missing = follow_session (legacy jobs). */
+  projectMode?: 'follow_session' | 'fixed'
+  /** Set only when projectMode=fixed. Snapshot of tb_project.id at create. */
+  boardProjectId?: string | null
 }
 
 /**
@@ -1079,7 +1100,30 @@ export class CronScheduler {
       job: CronJob,
       delivery?: CronDeliveryContext,
     ) => void | Promise<void>,
+    private onOriginSessionFire?: (
+      job: CronJob,
+      delivery: CronDeliveryContext,
+    ) => Promise<CronOriginFireResult>,
+    private projectPorts?: CronProjectPorts,
   ) {}
+
+  setProjectPorts(ports: CronProjectPorts): void {
+    this.projectPorts = ports
+  }
+
+  private async resolveJobProject(job: CronJob): Promise<CronProjectResolution> {
+    if (this.projectPorts) return resolveCronFireProject(job, this.projectPorts)
+    const norm = normalizeCronProject(job)
+    if (norm.projectMode === 'fixed' && !norm.boardProjectId) {
+      return { ok: false, mode: 'fixed', reason: 'fixed_project_missing' }
+    }
+    return {
+      ok: true,
+      boardProjectId: norm.boardProjectId,
+      mode: norm.projectMode,
+      source: norm.projectMode === 'fixed' ? 'job_fixed' : 'follow_no_ports',
+    }
+  }
 
   /**
    * Push the derived wake-index payload to master when it changed since the last
@@ -1173,6 +1217,27 @@ export class CronScheduler {
           occurrence,
           occurrence.state === 'executing' ? readOccurrenceTape(occurrence.deliveryId) : [],
         )
+        if (
+          job.resume === 'origin-session' &&
+          (occurrence.state === 'executing' || occurrence.state === 'completed')
+        ) {
+          // executing/completed mean the inject durably happened (runOrigin-
+          // SessionJob marks executing only after a successful inject). The
+          // local-path inbound idempotency is in-memory, so at-most-once:
+          // never re-dispatch across a restart. Consume lastRun so recurring
+          // schedules cannot re-fire this same minute through catch-up.
+          if (occurrence.state === 'executing') {
+            settleOccurrence(occurrence, 'execution_terminal')
+          } else {
+            settleOccurrence(occurrence)
+          }
+          if (lastRun[job.id] === undefined || lastRun[job.id]! < occurrence.dueMinuteKey) {
+            lastRun[job.id] = occurrence.dueMinuteKey
+            lastRunDirty = true
+          }
+          completedRetryIds.add(job.id)
+          continue
+        }
         if (recovery === 'rerun') {
           if (occurrence.state === 'executing') {
             writeOccurrence({ ...occurrence, state: 'prepared', updatedAt: Date.now() })
@@ -1336,12 +1401,29 @@ export class CronScheduler {
                   },
                   markSubmitStarted: async () => {
                     const record = readOccurrence(deliveryContext.deliveryId)
-                    if (!record || record.state !== 'prepared')
+                    const isOrigin = job.resume === 'origin-session'
+                    // origin-session settle retries re-enter after the inject
+                    // already durably happened; the occurrence may legally be
+                    // executing/completed for this same deliveryId. Never
+                    // regress state, never throw on that re-entry.
+                    const tolerated =
+                      isOrigin &&
+                      (record?.state === 'executing' || record?.state === 'completed')
+                    if (!record || (record.state !== 'prepared' && !tolerated))
                       throw new Error('cron occurrence is not prepared')
-                    writeOccurrence({ ...record, state: 'executing', updatedAt: Date.now() })
-                    lastRun[job.id] = dueMinuteKey
-                    await this.persistLastRun(lastRun)
-                    lastRunDirty = false
+                    if (record.state === 'prepared') {
+                      writeOccurrence({ ...record, state: 'executing', updatedAt: Date.now() })
+                    }
+                    if (!isOrigin) {
+                      // origin-session must NOT consume lastRun here: settle
+                      // failures after this point stay retryable, and
+                      // resolveCronOccurrence treats lastRun >= dueMinuteKey
+                      // as consumed. The loop tail / restart recovery records
+                      // lastRun for origin outcomes instead.
+                      lastRun[job.id] = dueMinuteKey
+                      await this.persistLastRun(lastRun)
+                      lastRunDirty = false
+                    }
                   },
                   recordEvent: (event) => {
                     const record = readOccurrence(deliveryContext.deliveryId)
@@ -1437,6 +1519,9 @@ export class CronScheduler {
               attempts: planned.attempts,
               dueMinuteKey,
             })
+            if (job.resume === 'origin-session') {
+              await this.notifyOriginSessionDropped(job, deliveryContext, 'exhausted')
+            }
             outcome = { kind: 'terminal_failure', code: 'RETRY_EXHAUSTED' }
           }
           if (outcome.kind === 'terminal_failure') {
@@ -1555,6 +1640,151 @@ export class CronScheduler {
     }
   }
 
+  /**
+   * origin-session fire: inject a new inbound into the creating conversation.
+   * If that conversation is gone, skip (do not isolated-run / lastActive-broadcast),
+   * disable recurring jobs (the origin can never come back) and leave a status
+   * notice so the task does not vanish silently.
+   *
+   * Ordering: inject BEFORE markSubmitStarted. A retryable inject failure
+   * (session busy, network, master down) leaves the occurrence 'prepared' and
+   * lastRun untouched, so the normal retry planner really re-fires this exact
+   * deliveryId on a later tick. Replay safety comes from the stable
+   * clientMessageId: master dedupes durably in turn_dispatches, the local path
+   * dedupes on the persisted message id. After a restart, 'executing' and
+   * 'completed' origin occurrences settle without re-dispatch (at-most-once,
+   * see the recovery block in checkAndRun); the crash window between a
+   * successful inject and markSubmitStarted re-injects the same
+   * clientMessageId, which master absorbs as a duplicate.
+   */
+  private async runOriginSessionJob(
+    job: CronJob,
+    durability: CronRunDurabilityHooks,
+    deliveryContext: CronDeliveryContext,
+    project: Extract<CronProjectResolution, { ok: true }>,
+  ): Promise<CronRunOutcome> {
+    try {
+      await durability.consumeOccurrence()
+    } catch (err) {
+      logger.warn(`job ${job.id} origin-session occurrence persist failed`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'OCCURRENCE_PERSIST_FAILED' }
+    }
+    let result: CronOriginFireResult
+    try {
+      const fireJob: CronJob = {
+        ...job,
+        projectMode: project.mode,
+        boardProjectId: project.mode === 'fixed' ? project.boardProjectId : null,
+      }
+      result = await this.onOriginSessionFire!(fireJob, deliveryContext)
+    } catch (err) {
+      logger.warn(`job ${job.id} origin-session inject threw`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_INJECT_FAILED' }
+    }
+    if (result.kind === 'retryable_failure' || result.kind === 'terminal_failure') {
+      return result
+    }
+    const skipped = result.kind === 'fallback'
+    try {
+      await durability.markSubmitStarted?.()
+    } catch (err) {
+      logger.warn(`job ${job.id} origin-session markSubmitStarted failed`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_SETTLE_FAILED' }
+    }
+    const ts = new Date().toISOString().replace(/[:.]/g, '-')
+    const outPath = join(paths.cronOutputsDir, `${job.id}-${ts}.md`)
+    try {
+      await mkdir(dirname(outPath), { recursive: true })
+      await writeFile(
+        outPath,
+        skipped
+          ? `[origin-session skipped]\n${job.prompt}\n`
+          : `[origin-session injected]\n${job.prompt}\n`,
+      )
+    } catch (err) {
+      logger.warn(`job ${job.id} origin-session output archive failed`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'terminal_failure', code: 'OUTPUT_ARCHIVE_FAILED' }
+    }
+    try {
+      await durability.markCompleted?.(basename(outPath))
+      await durability.markDelivered?.()
+    } catch (err) {
+      logger.warn(`job ${job.id} origin-session durability mark failed`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_SETTLE_FAILED' }
+    }
+    if (skipped) {
+      // A deleted origin conversation never comes back: a recurring job would
+      // skip-and-notify every tick, so persist-disable it (insufficient_credits
+      // pause precedent). Notify after the durable marks so settle retries
+      // cannot double-send the notice.
+      if (!job.oneshot && job.enabled !== false) {
+        job.enabled = false
+        try {
+          await saveCronFile(await ensureCronFile(), job)
+        } catch (err) {
+          logger.warn(`job ${job.id} origin-session gone disable failed`, {
+            jobId: job.id,
+            errorClass: stableCronErrorClass(err),
+          })
+        }
+      }
+      await this.notifyOriginSessionDropped(job, deliveryContext, 'gone')
+    }
+    logger.info(`job ${job.id} origin-session ${skipped ? 'skipped' : 'injected'}`, {
+      jobId: job.id,
+      board_project_id: project.boardProjectId,
+      projectMode: project.mode,
+      source: project.source,
+    })
+    return skipped ? { kind: 'silent' } : { kind: 'completed' }
+  }
+
+  /**
+   * 状态变更通知(同 insufficient_credits 自动暂停的先例):origin-session 任务
+   * 被跳过/放弃时必须留下用户可见痕迹,凌驾 deliver=local。通知失败仅告警。
+   */
+  private async notifyOriginSessionDropped(
+    job: CronJob,
+    delivery: CronDeliveryContext,
+    reason: 'gone' | 'exhausted',
+  ): Promise<void> {
+    if (!isUserInitiatedCronJob(job)) return
+    const label = job.label || job.id
+    const text =
+      reason === 'gone'
+        ? `⏭️ 定时任务「${label}」已跳过：创建它的对话已不存在，无法回到原对话续跑。` +
+          `${job.oneshot ? '' : '任务已自动停用。'}如仍需要请重新创建。`
+        : `⏸️ 定时任务「${label}」已放弃本次续跑：多次重试仍无法注入原对话` +
+          `（如会话持续占线或网络异常）。请稍后在原对话手动继续或重新创建任务。`
+    try {
+      await this.onDeliver(
+        text,
+        (job.deliver ?? 'local') === 'local' ? { ...job, deliver: 'webchat' } : job,
+        delivery,
+      )
+    } catch (err) {
+      logger.warn(`origin-session drop notice failed for ${job.id}`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+    }
+  }
+
   private async runJob(
     job: CronJob,
     agent: AgentDef,
@@ -1565,6 +1795,27 @@ export class CronScheduler {
     },
   ): Promise<CronRunOutcome> {
     logger.info(`running job ${job.id}`, { jobId: job.id, heartbeat: !!job.heartbeat })
+
+    const project = await this.resolveJobProject(job)
+    if (!project.ok) {
+      logger.warn(`job ${job.id} project fail-closed`, {
+        jobId: job.id,
+        reason: project.reason,
+        projectMode: project.mode,
+        board_project_id: job.boardProjectId ?? null,
+      })
+      return { kind: 'terminal_failure', code: project.reason.toUpperCase() }
+    }
+    logger.info(`job ${job.id} project`, {
+      jobId: job.id,
+      board_project_id: project.boardProjectId,
+      projectMode: project.mode,
+      source: project.source,
+    })
+
+    if (job.resume === 'origin-session' && job.sourceSessionKey && this.onOriginSessionFire) {
+      return this.runOriginSessionJob(job, durability, deliveryContext, project)
+    }
 
     // Isolated session per execution for ALL jobs (heartbeat included).
     // Sharing the user's main session polluted conversation history and, when
@@ -1631,6 +1882,15 @@ export class CronScheduler {
         // Tag this run as a cron workload so CCB stamps
         // `cc_workload=cron;` into the attribution billing-header.
         workload: 'cron',
+        projectId: project.boardProjectId,
+        runContext: createRunContextDescriptor({
+          runId: `cron:${job.id}:${deliveryContext.deliveryId}`,
+          boardProjectId: project.boardProjectId,
+          channel: 'cron',
+          agentId: agent.id,
+          sessionKey,
+          persistSnapshot: Boolean(project.boardProjectId),
+        }),
       })
     } catch (err) {
       // No submit/tool execution has started, so a bounded retry is safe.
@@ -1777,6 +2037,9 @@ export class CronScheduler {
       jobId: job.id,
       chars: trimmed.length,
       deliver: job.deliver ?? 'local',
+      board_project_id: project.boardProjectId,
+      projectMode: project.mode,
+      source: project.source,
     })
     if ((job.deliver ?? 'local') === 'local') {
       // local = just log, don't push to any channel
@@ -1877,13 +2140,34 @@ export class CronScheduler {
   async updateJob(
     id: string,
     updates: Partial<
-      Pick<CronJob, 'enabled' | 'schedule' | 'prompt' | 'label' | 'deliver' | 'oneshot'>
+      Pick<
+        CronJob,
+        | 'enabled'
+        | 'schedule'
+        | 'prompt'
+        | 'label'
+        | 'deliver'
+        | 'oneshot'
+        | 'projectMode'
+        | 'boardProjectId'
+      >
     >,
   ): Promise<boolean> {
     const file = await ensureCronFile()
     const job = file.jobs.find((j) => j.id === id)
     if (!job) return false
     if (updates.enabled !== undefined) job.enabled = updates.enabled
+    if (updates.projectMode !== undefined || updates.boardProjectId !== undefined) {
+      const next = normalizeCronProject({
+        projectMode: updates.projectMode ?? job.projectMode,
+        boardProjectId:
+          updates.projectMode === 'follow_session'
+            ? null
+            : (updates.boardProjectId !== undefined ? updates.boardProjectId : job.boardProjectId),
+      })
+      job.projectMode = next.projectMode
+      job.boardProjectId = next.boardProjectId
+    }
     if (updates.schedule) {
       const schedErr = validateCronSchedule(updates.schedule)
       if (schedErr) {

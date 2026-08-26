@@ -4,6 +4,7 @@ import type { ComponentProps } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { api } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
+import { taskboardApi } from "../lib/taskboard";
 import type { ChatProject } from "../lib/types";
 import { ToastProvider, TooltipProvider } from "./ui";
 import { PROJECT_COLORS, ProjectSettingsDialog } from "./ProjectSettingsDialog";
@@ -99,6 +100,37 @@ describe("ProjectSettingsDialog", () => {
     expect(screen.getByRole("dialog")).toBeTruthy();
     fireEvent.keyDown(document, { key: "Escape" });
     await waitFor(() => expect(onClose).toHaveBeenCalled());
+  });
+
+  test("绑定态保存不把 instructions 写入 PG patch", async () => {
+    vi.spyOn(taskboardApi, "listProjects").mockResolvedValue([
+      { id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", key: "B", name: "Board" } as never,
+    ]);
+    vi.spyOn(taskboardApi, "getProjectContext").mockResolvedValue({
+      version: 2,
+      instructions: "from-project-md",
+    });
+    const put = vi.spyOn(taskboardApi, "putProjectContext").mockResolvedValue({
+      ok: true,
+      context: { version: 3, instructions: "from-project-md" },
+    });
+    const { onSave } = renderDialog({
+      project: {
+        ...project,
+        boardProjectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      },
+    });
+    await waitFor(() => expect(taskboardApi.getProjectContext).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(put).toHaveBeenCalled());
+    expect(put).toHaveBeenCalledWith(
+      expect.anything(),
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      expect.objectContaining({ expectedVersion: 2, instructions: "from-project-md" }),
+    );
+    expect(onSave).toHaveBeenCalledWith(
+      expect.not.objectContaining({ instructions: expect.anything() }),
+    );
   });
 
   test("设置 / 资产 tab 切换，保存行为不回归", async () => {

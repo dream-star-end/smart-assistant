@@ -16,7 +16,7 @@ import {
 } from "./handlers.js";
 import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
 import { recordProductFrictionEvent, type FrictionOutcome } from "../productFriction/events.js";
-import { query } from "../db/queries.js";
+import { query, type QueryRunner } from "../db/queries.js";
 
 const SAFE_LOWER = /^[a-z0-9_]{1,48}$/;
 const SAFE_CODE = /^[A-Za-z0-9_]{1,64}$/;
@@ -37,6 +37,49 @@ export type NormalizedClientFrictionReport = Omit<
   Parameters<typeof recordProductFrictionEvent>[0],
   "userId"
 >;
+
+export function isBrowserFirstTextPaintNamespace(report: NormalizedClientFrictionReport): boolean {
+  return report.surface === "webchat" && report.stage === "first_text_paint";
+}
+
+export function isBrowserFirstTextPaintReport(report: NormalizedClientFrictionReport): boolean {
+  return isBrowserFirstTextPaintNamespace(report) &&
+    report.outcome === "succeeded" &&
+    (report.code === "FIRST_TEXT_PAINT" || report.code === "FIRST_TEXT_PAINT_AFTER_BACKGROUND");
+}
+
+export async function resolveOwnedFirstTextPaintAttribution(
+  report: NormalizedClientFrictionReport,
+  userId: bigint,
+  runner?: QueryRunner,
+): Promise<{ model: string | null; provider: string | null } | null> {
+  if (
+    !isBrowserFirstTextPaintReport(report) ||
+    !report.traceId ||
+    !report.sessionId ||
+    report.latencyMs == null
+  ) return null;
+  const attribution = await query<{
+    model: string | null;
+    provider: string | null;
+  }>(
+    `SELECT t.model,mc.provider_id AS provider
+       FROM turn_traces t
+       JOIN turn_dispatches d
+         ON d.dispatch_id=t.dispatch_id
+        AND d.user_id=t.user_id
+        AND d.session_id=$3
+       LEFT JOIN LATERAL (
+         SELECT provider_id FROM model_catalog
+          WHERE model_id=t.model ORDER BY created_at DESC LIMIT 1
+       ) mc ON TRUE
+      WHERE t.trace_id=$1 AND t.user_id=$2::bigint
+      LIMIT 1`,
+    [report.traceId,userId.toString(),report.sessionId],
+    runner,
+  ).catch(() => ({ rows: [], rowCount: 0 }));
+  return attribution.rows[0] ?? null;
+}
 
 export function classifyClientFrictionPersistError(err: unknown): {
   errorClass: string;
@@ -69,6 +112,10 @@ export function normalizeClientFrictionReport(
     ? body.outcome as FrictionOutcome : "failed";
   const traceId = safeId(body.trace_id);
   const sessionId = safeId(body.session_id);
+  const safeLine = (value: unknown): number | null =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 10_000_000
+      ? Math.trunc(value)
+      : null;
   return {
     correlation: safeId(body.event_id) ?? traceId ?? safeId(body.request_id) ?? fallbackEventId,
     surface,
@@ -87,6 +134,13 @@ export function normalizeClientFrictionReport(
     traceId,
     sessionId,
     entitySlug: safeToken(body.entity_slug, 128, /^[a-z0-9][a-z0-9._-]*$/),
+    // 0248 有界错误定位:类名/bundle 基名/行列/指纹。仍然拒绝任何自由文本——
+    // 不匹配有界模式的值一律折叠为 null,message/stack 永远不会经此进入存储。
+    errorName: safeToken(body.error_name, 64, /^[A-Za-z0-9_.$-]{1,64}$/),
+    scriptRef: safeToken(body.script_ref, 120, /^[A-Za-z0-9._-]{1,120}$/),
+    lineNo: safeLine(body.line_no),
+    colNo: safeLine(body.col_no),
+    errorFingerprint: safeToken(body.error_fingerprint, 16, /^[a-f0-9]{1,16}$/),
   };
 }
 
@@ -110,9 +164,34 @@ export async function handleClientErrorReport(
     return;
   }
 
-  const persist = async (report: NormalizedClientFrictionReport): Promise<void> => {
+  const persist = async (report: NormalizedClientFrictionReport): Promise<boolean> => {
     let enriched = report;
-    if (userId !== null && report.traceId && (!report.model || !report.provider || report.latencyMs == null)) {
+    if (isBrowserFirstTextPaintNamespace(report)) {
+      // The entire namespace is reserved. Malformed code/outcome and anonymous
+      // requests must not fall through into generic product-friction storage.
+      if (
+        !isBrowserFirstTextPaintReport(report) ||
+        userId === null ||
+        !report.traceId ||
+        !report.sessionId ||
+        report.latencyMs == null
+      ) {
+        return false;
+      }
+      // This latency is accepted only when trace + session + authenticated user
+      // resolve to the same durable turn. Independent hints must never be joined.
+      const row = await resolveOwnedFirstTextPaintAttribution(report, userId);
+      if (!row) return false;
+      enriched = {
+        ...report,
+        model: row.model,
+        provider: row.provider,
+      };
+    } else if (
+      userId !== null &&
+      report.traceId &&
+      (!report.model || !report.provider || report.latencyMs == null)
+    ) {
       const attribution = await query<{
         model: string | null;
         provider: string | null;
@@ -148,6 +227,7 @@ export async function handleClientErrorReport(
         ...classifyClientFrictionPersistError(err),
       });
     });
+    return true;
   };
 
   const events = body.events;
@@ -170,7 +250,11 @@ export async function handleClientErrorReport(
   }
 
   const report = normalizeClientFrictionReport(body, ctx.requestId);
-  await persist(report);
+  const persisted = await persist(report);
+  if (!persisted) {
+    sendJson(res, 200, { ok: true });
+    return;
+  }
 
   const logFields = {
     uid: claims?.sub ?? null,

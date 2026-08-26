@@ -55,12 +55,12 @@ function agent(partial: Partial<AgentDef>): Pick<AgentDef, 'id' | 'model' | 'pro
 describe('resolveExecutionModel × AGENT_MODEL_AUTO(不锁模型的预设 agent)', () => {
   test('agent.model=auto 被候选阶梯跳过:帧模型优先,缺省落 fallback(与无 model 同形)', () => {
     assert.equal(resolveExecutionModel('glm-5.3', AGENT_MODEL_AUTO), 'glm-5.3')
-    assert.equal(resolveExecutionModel(undefined, AGENT_MODEL_AUTO), 'glm-5.3')
+    assert.equal(resolveExecutionModel(undefined, AGENT_MODEL_AUTO), 'glm-5.3-zai')
     assert.equal(resolveExecutionModel(AGENT_MODEL_AUTO, 'MiniMax-M3'), 'MiniMax-M3')
   })
 
   test('auto 单独出现 → 平台兜底(不会把 "auto" 当模型 id 泄给 runner)', () => {
-    assert.equal(resolveExecutionModel(AGENT_MODEL_AUTO, undefined), 'glm-5.3')
+    assert.equal(resolveExecutionModel(AGENT_MODEL_AUTO, undefined), 'glm-5.3-zai')
     assert.notEqual(resolveExecutionModel(AGENT_MODEL_AUTO, undefined), 'auto')
   })
 

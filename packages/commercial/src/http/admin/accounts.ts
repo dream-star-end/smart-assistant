@@ -112,6 +112,7 @@ function serializeAccount(
     /** UI 区分 oauth 过期"可自愈(待 lazy refresh)"vs"需人工"的依据。 */
     has_refresh_token: a.has_refresh_token,
     cursor_quota_class: a.provider === "cursor" ? a.cursor_quota_class : null,
+    cursor_sand_enabled: a.provider === "cursor" ? a.cursor_sand_enabled : null,
     created_at: a.created_at.toISOString(),
     updated_at: a.updated_at.toISOString(),
   };
@@ -397,6 +398,12 @@ export async function handleAdminCreateAccount(
     }
     input.subscription_end_at = b.subscription_end_at as string | null;
   }
+  if (b.cursor_sand_enabled !== undefined) {
+    if (typeof b.cursor_sand_enabled !== "boolean") {
+      throw new HttpError(400, "VALIDATION", "cursor_sand_enabled must be boolean");
+    }
+    input.cursor_sand_enabled = b.cursor_sand_enabled;
+  }
 
   try {
     const a = await adminCreateAccount(input, {
@@ -467,6 +474,18 @@ export async function handleAdminPatchAccount(
       throw new HttpError(400, "VALIDATION", "subscription_end_at must be ISO string or null");
     }
     patch.subscription_end_at = b.subscription_end_at as string | null;
+  }
+  if (b.cursor_sand_enabled !== undefined) {
+    if (typeof b.cursor_sand_enabled !== "boolean") {
+      throw new HttpError(400, "VALIDATION", "cursor_sand_enabled must be boolean");
+    }
+    patch.cursor_sand_enabled = b.cursor_sand_enabled;
+  }
+  if (b.cursor_quota_class !== undefined) {
+    if (b.cursor_quota_class !== "unknown" && b.cursor_quota_class !== "other_ok" && b.cursor_quota_class !== "cursor_only") {
+      throw new HttpError(400, "VALIDATION", "cursor_quota_class must be unknown, other_ok, or cursor_only");
+    }
+    patch.cursor_quota_class = b.cursor_quota_class as import("../../account-pool/cursorQuota.js").CursorQuotaClass;
   }
   // 0055: 拒绝 legacy raw egress_proxy 字段。
   if (b.egress_proxy !== undefined) {

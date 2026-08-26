@@ -1,14 +1,19 @@
 /**
  * 权限卡（Aurora 全新设计）。
- *  - 状态展示：⏳ 等待审批 / ✓ 已允许 / ✗ 已拒绝（含 server settled reason）。
+ *  - 状态展示：等待审批 / 已允许 / 已拒绝（lucide 图标 + 文案,含 server settled reason）。
+ *  - 工具展示走 resolveToolMeta(中文标签 + 图标),常见工具做结构化参数摘要
+ *    (Bash→命令、文件类→路径、浏览器→URL/动作),其余回落可折叠的格式化 JSON。
  *  - 审批 modal：普通工具 allow/deny；AskUserQuestion 走专用答题（单选/多选/其他/预览），
  *    提交把 `{ answers, annotations }` 经 updatedInput 回送（gateway 白名单校验）。
+ *    两个 modal 窄屏均为贴底 sheet(mobile="sheet")。
  *  - 全部经 props.onRespond（= useChatSocket.respondPermission，已绑 sessId）。
  */
-import { Check, HelpCircle, ShieldCheck } from "lucide-react";
+import { Check, Clock, HelpCircle, ShieldCheck, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import { cn } from "../../lib/utils";
+import { asStr } from "../tool/format";
+import { resolveToolMeta, toolSummary } from "../tool/meta";
 import { Button, Modal } from "../ui";
 
 export type PermissionRespond = (p: {
@@ -87,6 +92,80 @@ function asAskUserQuestion(msg: ChatMessage): AqQuestion[] | null {
   return qs.length > 0 ? qs : null;
 }
 
+/** 消息上的 inputJson 收窄为对象(结构化摘要用);非对象 → null。 */
+function permissionInput(msg: ChatMessage): Record<string, unknown> | null {
+  const v = msg.inputJson;
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+}
+
+/**
+ * 权限请求参数的结构化摘要(F5):常见工具展示语义字段(命令/路径/URL/内容),
+ * 其余回落**可折叠**的格式化 JSON —— 不再直接 dump 原始参数。卡片与审批 modal 共用。
+ */
+function PermissionInputSummary({
+  toolName,
+  input,
+  inputPreview,
+}: {
+  toolName: string;
+  input: Record<string, unknown> | null;
+  inputPreview?: string;
+}) {
+  const command = asStr(input?.command);
+  const filePath = asStr(input?.file_path) || asStr(input?.path) || asStr(input?.notebook_path);
+  const url = asStr(input?.url);
+  const prompt = asStr(input?.prompt) || asStr(input?.query) || asStr(input?.text);
+  // MCP/其余工具:meta 层的紧凑摘要(浏览器→URL/动作、媒体→prompt 等)。
+  const metaSummary = toolSummary(toolName, input);
+  const rows: { label: string; value: string }[] = [];
+  if (filePath) rows.push({ label: "文件", value: filePath });
+  if (url && !command) rows.push({ label: "地址", value: url });
+  if (!command && !filePath && !url && prompt) rows.push({ label: "内容", value: prompt.slice(0, 400) });
+  if (rows.length === 0 && !command && metaSummary) rows.push({ label: "操作", value: metaSummary });
+  const hasStructured = !!command || rows.length > 0;
+  let json = "";
+  if (input) {
+    try {
+      json = JSON.stringify(input, null, 2);
+    } catch {
+      json = inputPreview ?? "";
+    }
+  } else {
+    json = inputPreview ?? "";
+  }
+  if (json.length > 4000) json = `${json.slice(0, 4000)}\n…`;
+  return (
+    <div className="space-y-2">
+      {command && (
+        <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[12px] text-fg">
+          <span className="text-success">$ </span>
+          {command.slice(0, 2000)}
+        </pre>
+      )}
+      {rows.length > 0 && (
+        <dl className="flex flex-col gap-1 text-[12.5px]">
+          {rows.map((row) => (
+            <div key={row.label} className="flex gap-2">
+              <dt className="shrink-0 font-medium text-faint">{row.label}</dt>
+              <dd className="min-w-0 break-all font-mono text-muted">{row.value}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      {json && json !== "{}" && (
+        <details open={!hasStructured}>
+          <summary className="cursor-pointer rounded text-[11.5px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">
+            查看完整参数
+          </summary>
+          <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[12px] text-muted">
+            {json}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
 export function PermissionCard({
   msg,
   onRespond,
@@ -125,7 +204,9 @@ export function PermissionCard({
     return () => window.clearTimeout(timer);
   }, [resolved, pending, readOnly, expired, livePrompt, msg.requestId]);
 
-  const statusIcon = !resolved ? "⏳" : behavior === "allow" ? "✓" : "✗";
+  // 状态图标(M7):lucide 替代 emoji。等待→Clock / 已允许→Check / 已拒绝→X。
+  const StatusIcon = !resolved ? Clock : behavior === "allow" ? Check : X;
+  const statusIconCls = !resolved ? "text-muted" : behavior === "allow" ? "text-success" : "text-danger";
   const statusText = !resolved
     ? pending
       ? "正在提交…"
@@ -142,6 +223,12 @@ export function PermissionCard({
         ? "已跳过"
         : "已拒绝";
   const tone = !resolved ? "neutral" : behavior === "allow" ? "allow" : "deny";
+
+  // 工具中文标签 + 图标(F5):resolveToolMeta 单一权威;无 toolName → 「未知工具」。
+  const input = permissionInput(msg);
+  const meta = msg.toolName ? resolveToolMeta(msg.toolName, input) : null;
+  const toolLabel = meta ? meta.label : "未知工具";
+  const ToolIcon = meta?.icon ?? null;
 
   return (
     <div
@@ -161,12 +248,13 @@ export function PermissionCard({
           {questions ? "用户问答" : "权限请求"}
         </span>
         {!questions && (
-          <code className="rounded bg-hover px-1.5 py-0.5 font-mono text-[12px] text-muted">
-            {msg.toolName || "unknown"}
-          </code>
+          <span className="inline-flex min-w-0 items-center gap-1 rounded bg-hover px-1.5 py-0.5 text-[12px] text-muted">
+            {ToolIcon && <ToolIcon size={12} aria-hidden="true" className="shrink-0" />}
+            <span className="truncate">{toolLabel}</span>
+          </span>
         )}
-        <span className="ml-auto flex items-center gap-2 text-[12px] text-muted">
-          <span aria-hidden>{statusIcon}</span>
+        <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[12px] text-muted">
+          <StatusIcon size={13} aria-hidden="true" className={statusIconCls} />
           {statusText}
         </span>
       </div>
@@ -211,9 +299,13 @@ export function PermissionCard({
           ))}
         </div>
       )}
-      {resolved && !questions && msg.inputPreview && (
-        <div className="max-h-60 overflow-auto whitespace-pre-wrap break-words border-t border-border px-3.5 py-2 text-[12px] text-muted">
-          {msg.inputPreview}
+      {resolved && !questions && (input || msg.inputPreview) && (
+        <div className="border-t border-border px-3.5 py-2">
+          <PermissionInputSummary
+            toolName={msg.toolName || ""}
+            input={input}
+            inputPreview={msg.inputPreview}
+          />
         </div>
       )}
       {resolved && msg._settledReason && msg._settledReason !== "remote" && (
@@ -238,7 +330,10 @@ export function PermissionCard({
             open={open}
             onOpenChange={setOpen}
             requestId={msg.requestId!}
-            toolName={msg.toolName || "unknown"}
+            toolName={msg.toolName || ""}
+            toolLabel={toolLabel}
+            toolIcon={ToolIcon}
+            input={input}
             inputPreview={msg.inputPreview}
             onRespond={onRespond}
           />
@@ -268,6 +363,9 @@ function GenericPermissionModal({
   onOpenChange,
   requestId,
   toolName,
+  toolLabel,
+  toolIcon: ToolIcon,
+  input,
   inputPreview,
   onRespond,
 }: {
@@ -275,6 +373,9 @@ function GenericPermissionModal({
   onOpenChange: (o: boolean) => void;
   requestId: string;
   toolName: string;
+  toolLabel: string;
+  toolIcon: ReturnType<typeof resolveToolMeta>["icon"] | null;
+  input: Record<string, unknown> | null;
   inputPreview?: string;
   onRespond: PermissionRespond;
 }) {
@@ -282,6 +383,7 @@ function GenericPermissionModal({
     <Modal
       open={open}
       onOpenChange={onOpenChange}
+      mobile="sheet"
       title="工具权限请求"
       description="智能体请求执行以下工具，请确认是否允许。"
       footer={
@@ -307,15 +409,12 @@ function GenericPermissionModal({
         </>
       }
     >
-      <div className="space-y-2">
-        <code className="inline-block rounded bg-hover px-2 py-1 font-mono text-sm text-fg">
-          {toolName}
-        </code>
-        {inputPreview && (
-          <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 text-[12px] text-muted">
-            {inputPreview}
-          </pre>
-        )}
+      <div className="space-y-2.5">
+        <div className="inline-flex items-center gap-1.5 rounded bg-hover px-2 py-1 text-sm text-fg">
+          {ToolIcon && <ToolIcon size={14} aria-hidden="true" className="shrink-0 text-muted" />}
+          {toolLabel}
+        </div>
+        <PermissionInputSummary toolName={toolName} input={input} inputPreview={inputPreview} />
       </div>
     </Modal>
   );
@@ -403,6 +502,7 @@ function AskUserQuestionModal({
     <Modal
       open={open}
       onOpenChange={onOpenChange}
+      mobile="sheet"
       title="用户问答"
       description={questions.length > 1 ? `共 ${questions.length} 题` : "请回答以下问题"}
       className="max-w-xl"
@@ -439,13 +539,19 @@ function AskUserQuestionModal({
             >
               {q.header && <div className="text-[11px] font-medium uppercase tracking-wide text-faint">{q.header}</div>}
               <div className="text-[14px] font-medium text-fg">{q.question}</div>
-              <div className="grid gap-1.5">
+              <div
+                className="grid gap-1.5"
+                role={q.multiSelect ? "group" : "radiogroup"}
+                aria-label={q.question}
+              >
                 {safeOptions.map((opt) => {
                   const sel = qs.selected.includes(opt.label);
                   return (
                     <button
                       type="button"
                       key={opt.label}
+                      role={q.multiSelect ? "checkbox" : "radio"}
+                      aria-checked={sel}
                       onClick={() => toggle(q, opt.label)}
                       className={cn(
                         "flex items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
@@ -471,8 +577,11 @@ function AskUserQuestionModal({
                   );
                 })}
                 {showOther && (
+                  // biome-ignore lint/a11y/useSemanticElements: 富样式选项卡沿用 button,按 WAI-ARIA radio 模式补语义(M12)
                   <button
                     type="button"
+                    role="radio"
+                    aria-checked={qs.selected.includes(OTHER)}
                     onClick={() => toggle(q, OTHER)}
                     className={cn(
                       "flex items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",

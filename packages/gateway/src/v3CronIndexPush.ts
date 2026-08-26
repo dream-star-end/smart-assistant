@@ -24,8 +24,9 @@ import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'v3CronIndexPush' })
 
-/** 容器侧路径常量,必须与 master internal 路由 CRON_INDEX_PATH 对齐。 */
-export const CRON_INDEX_PATH = '/internal/v3/cron-index'
+/** 单一权威在 protocol 内部路由注册表(master internal 路由同源)。 */
+import { CRON_INDEX_PATH } from '@openclaude/protocol'
+export { CRON_INDEX_PATH }
 
 const ATTEMPT_TIMEOUT_MS = 10_000
 

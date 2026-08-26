@@ -145,6 +145,8 @@ export interface Project {
   name: string
   description: string | null
   workspace: string | null
+  workspaceSpec?: { kind: 'default' | 'isolated' | 'container_path'; path?: string } | null
+  contextVersion?: number
   labels: string[]
   archivedAt: number | null
   createdAt: number
@@ -249,6 +251,8 @@ export interface PipelineStage {
   name: string
   kind: StageKind
   agentId: string | null
+  /** null = 沿用 agent 默认模型。 */
+  model: string | null
   promptTemplate: string | null
   toolsets: string[] | null
   effort: string | null
@@ -288,10 +292,15 @@ export interface TicketRun {
   tokensIn: number | null
   tokensOut: number | null
   costUsd: number | null
+  /** 补价因缺 agent 倍率字段而 fail-closed。旧响应可缺席。 */
+  costImprecise?: boolean | null
   summary: string | null
   outputMd: string | null
   error: string | null
   createdAt: number
+  contextSnapshotId?: string | null
+  contextSha256?: string | null
+  contextVersion?: number | null
 }
 
 export interface TicketRelation {
@@ -397,6 +406,7 @@ export interface ProjectCreateInput {
   name: string
   description?: string | null
   workspace?: string | null
+  workspaceSpec?: { kind: 'default' | 'isolated' | 'container_path'; path?: string } | null
   labels?: string[]
   /** 省略 = 种四条内置线；`[]` = 不种；非空 = 按 id 套用。 */
   templateIds?: string[]
@@ -406,6 +416,7 @@ export interface ProjectPatchInput {
   name?: string
   description?: string | null
   workspace?: string | null
+  workspaceSpec?: { kind: 'default' | 'isolated' | 'container_path'; path?: string } | null
   labels?: string[]
   archivedAt?: number | null
 }
@@ -428,6 +439,7 @@ export interface StageCreateInput {
   kind: StageKind
   ordinal?: number
   agentId?: string | null
+  model?: string | null
   promptTemplate?: string | null
   toolsets?: string[] | null
   effort?: string | null
@@ -616,6 +628,7 @@ export interface TemplateStageSnapshot {
   name: string
   kind: StageKind
   agentId: string | null
+  model: string | null
   promptTemplate: string | null
   toolsets: string[] | null
   effort: string | null
@@ -754,6 +767,8 @@ const VALIDATION_ZH: Array<{ test: (msg: string) => boolean; zh: string }> = [
     zh: `无活动超时不能超过 ${DELEGATE_IDLE_TIMEOUT_MAX_SEC} 秒（45 分钟）`,
   },
   { test: (m) => /invalid kind/i.test(m), zh: '阶段类型只能是 AI、人工或闸门' },
+  { test: (m) => /model not available/i.test(m), zh: '该模型当前不可用，请换一个或留空用 agent 默认' },
+  { test: (m) => /model catalog unavailable/i.test(m), zh: '模型目录暂时不可用，稍后再改模型覆盖' },
   { test: (m) => /invalid ticketType/i.test(m), zh: '单据类型无效' },
   { test: (m) => /cannot delete builtin template/i.test(m), zh: '内置模板不能删除' },
   {
@@ -1424,4 +1439,118 @@ export const taskboardApi = {
       'POST',
       body,
     ),
+
+  listProjectMemories: (a: AuthSession, projectId: string, status?: string) =>
+    boardGet<{
+      projectId: string
+      official: ProjectMemoryItem[]
+      candidates: ProjectMemoryItem[]
+    }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(projectId)}/memories${qs({ status })}`,
+    ),
+
+  createProjectMemory: (
+    a: AuthSession,
+    projectId: string,
+    body: { slug: string; content: string; supersedes?: string },
+  ) =>
+    boardSend<{ ok: boolean; candidate: ProjectMemoryItem }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(projectId)}/memories`,
+      'POST',
+      body,
+    ),
+
+  promoteProjectMemory: (
+    a: AuthSession,
+    projectId: string,
+    candidateId: string,
+    expectedVersion: number,
+  ) =>
+    boardSend<{ ok: boolean; official: ProjectMemoryItem; idempotent?: boolean }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(projectId)}/memories/${encodeURIComponent(candidateId)}/promote`,
+      'POST',
+      { expectedVersion },
+    ),
+
+  rejectProjectMemory: (
+    a: AuthSession,
+    projectId: string,
+    candidateId: string,
+    expectedVersion: number,
+  ) =>
+    boardSend<{ ok: boolean; candidate: ProjectMemoryItem; idempotent?: boolean }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(projectId)}/memories/${encodeURIComponent(candidateId)}/reject`,
+      'POST',
+      { expectedVersion },
+    ),
+
+  getProjectContext: (a: AuthSession, id: string) =>
+    boardGet<Record<string, unknown> & { version?: number; instructions?: string | null }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(id)}/context`,
+    ),
+
+  putProjectContext: (
+    a: AuthSession,
+    id: string,
+    body: { expectedVersion: number; instructions?: string | null; skillNames?: string[] },
+  ) =>
+    boardSend<{ ok: boolean; context: { version: number; instructions: string | null } }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(id)}/context`,
+      "PUT",
+      body,
+    ),
+
+  previewProjectContext: (a: AuthSession, id: string, q?: { agentId?: string }) =>
+    boardGet<Record<string, unknown>>(
+      a,
+      `/api/board/projects/${encodeURIComponent(id)}/context/preview${qs(q)}`,
+    ),
+
+  getRunContext: (a: AuthSession, runId: string) =>
+    boardGet<{
+      runId: string
+      contextSnapshotId: string | null
+      contextSha256: string | null
+      contextVersion: number | null
+      currentVersion: number | null
+      changed: boolean
+      disclaimer: string
+    }>(a, `/api/board/runs/${encodeURIComponent(runId)}/context`),
+
+  deprecateProjectMemory: (
+    a: AuthSession,
+    projectId: string,
+    slug: string,
+    expectedVersion: number,
+  ) =>
+    boardSend<{ ok: boolean; official: ProjectMemoryItem; idempotent?: boolean }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(projectId)}/memories/${encodeURIComponent(slug)}/deprecate`,
+      'POST',
+      { expectedVersion },
+    ),
+}
+
+export interface ProjectMemoryItem {
+  id?: string
+  projectId: string
+  slug: string
+  file?: string
+  contentSha256: string
+  status?: string
+  version: number
+  content?: string | null
+  tampered?: boolean
+  deprecated?: boolean
+  expires?: string | null
+  sourceAgent?: string | null
+  sourceSession?: string | null
+  sourceTicket?: string | null
+  supersedes?: string | null
 }
