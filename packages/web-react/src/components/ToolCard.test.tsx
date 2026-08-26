@@ -94,6 +94,27 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByLabelText("同一次模型调用由多张卡片共享，共 123,456 token")).toBeInTheDocument();
   });
 
+  test("Read 卡剥掉 vitest ANSI，展开后只见正文不见 [33m", () => {
+    const output =
+      "     \u001b[33m\u001b[2m✓\u001b[22m\u001b[39m 保留未就绪 Agent 供用户理解状态，但禁止选择执行 \u001b[33m 581\u001b[2mms\u001b[22m\u001b[39m\n \u001b[32m✓\u001b[39m src/components/GoalDialog.test.tsx \u001b[2m(\u001b[22m\u001b[2m3 tests\u001b[22m\u001b[2m)\u001b[22m\u001b[33m 1970\u001b[2mms\u001b[22m\u001b[39m";
+    render(
+      <ToolCard
+        message={{
+          toolName: "Read",
+          inputJson: { file_path: "/home/agent/.openclaude/workspace/sessions/webmt9/out.log" },
+          output,
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("展开读取文件详情"));
+    const pre = document.querySelector("pre");
+    expect(pre?.textContent).toContain("保留未就绪 Agent");
+    expect(pre?.textContent).toContain("GoalDialog.test.tsx");
+    expect(pre?.textContent).toContain("1970ms");
+    expect(pre?.textContent).not.toMatch(/\[33m|\[2m|\[22m|\[39m|\[32m/);
+  });
+
   test("Bash heredoc 纯写文件：显示写入文件语义卡，展开仍保留原始命令", () => {
     const command = "mkdir -p packages/web-react/src && cat > packages/web-react/src/demo.ts <<'EOF'\nexport const x = 1;\nEOF";
     render(<ToolCard message={{ toolName: "Bash", inputJson: { command }, _completed: true, output: "ok" }} />);

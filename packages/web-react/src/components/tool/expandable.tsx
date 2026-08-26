@@ -11,6 +11,7 @@ import { type ReactNode, useContext, useState } from 'react'
 import { cn } from '../../lib/utils'
 import { ToolBodyFullContext } from './context'
 import { useHighlighter } from './highlight'
+import { stripAnsi } from './stripAnsi'
 
 /** 全文模式(详情面板)的初始上限:防单条超大 output 打爆渲染,可继续分段展开。 */
 export const FULL_TEXT_CAP = 200_000
@@ -125,7 +126,7 @@ export function ExpandablePre({
   className?: string
 }) {
   const full = useContext(ToolBodyFullContext)
-  const slice = useExpandableSlice(text, max)
+  const slice = useExpandableSlice(stripAnsi(text), max)
   const highlight = useHighlighter(language)
   const html = highlight(slice.shown)
   let body: ReactNode
