@@ -510,9 +510,10 @@ describe("v3 sweepers — INV-2 open migration exclusion(NOT EXISTS + UPDATE gua
     // turn-drain 屏障注入 accepted 桩:本用例测的是 NOT EXISTS predicate,
     // 真实握手要 bridgeSecret + 容器侧 HTTP,不在本文件范围。
     const { docker, captured } = makeDocker();
-    const r = await runIdleSweepTick(makeDeps(docker), {
+    const deps = makeDeps(docker);
+    deps.adminRuntimeRecycleDrain = async () => "accepted";
+    const r = await runIdleSweepTick(deps, {
       idleCutoffMin: 30,
-      requestRuntimeRecycleDrain: async () => "accepted",
     });
 
     assert.equal(r.scanned, 1, "committed 后 NOT EXISTS predicate 不再过滤该行");

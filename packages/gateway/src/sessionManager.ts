@@ -20,6 +20,9 @@ import {
   reserveTurnIndex,
   recordMemoryUsageEvent,
   paths,
+  projectSessionFingerprint,
+  loadProjectContext,
+  skillOverlayManifestSha256,
   type KernelFileLock,
   upsertSessionMeta,
 } from '@openclaude/storage'
@@ -30,7 +33,8 @@ import {
 import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
-import { cursorResumeStoreExists } from './engine/cursorAdapter.js'
+import { decideEngineCwd } from './engineCwd.js'
+import { cursorResumeStoreExists, usableCursorResumeId } from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
 import type {
   AutomaticRetryState,
@@ -57,6 +61,8 @@ import type { ZcodeRouteOverride } from './engine/zcodeAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { beginMemoryTurnTracking } from './memoryTurnObserver.js'
 import { createTurnUsageRecorder, mapTurnTerminalStatus, type TurnTerminalStatus } from './turnUsage.js'
+import { emptyCompletedTurnAssistantText } from './emptyCompletedTurn.js'
+import { applyPlatformCostIfMissing } from './usageCost.js'
 import { createLogger } from './logger.js'
 import { collectSessionOutputAssets } from './projectAssetCollector.js'
 import {
@@ -70,6 +76,7 @@ import {
   assessTurnRecoveryTape,
   type CallTokenUsageSnapshot,
   AUTHORITY_TURN_MAX_LIFETIME_MS,
+  collectModelHistoryMediaPathHints,
   modelHistoryRoleLabel,
   modelHistorySemanticRole,
   modelHistorySemanticText,
@@ -103,6 +110,27 @@ import {
   finalizeEfficiencyTurn,
   prepareEfficiencyTurnNote,
 } from './agentEfficiencyGuard.js'
+
+async function computeSessionContextFingerprint(
+  projectId: string | null | undefined,
+  assetsRevision?: number,
+): Promise<string> {
+  const id = typeof projectId === 'string' ? projectId.trim() : ''
+  if (!id) return projectSessionFingerprint({ projectId: null })
+  try {
+    const snap = await loadProjectContext(id)
+    return projectSessionFingerprint({
+      projectId: id,
+      contextVersion: snap.version,
+      assetsRevision,
+      projectMdSha256: snap.meta.contentManifest?.projectMdSha256 ?? snap.meta.instructionsSha256 ?? null,
+      skillManifestSha256: skillOverlayManifestSha256(snap.meta.contentManifest?.skills ?? []),
+      officialMemoryManifestSha256: snap.meta.promotion.manifestSha256 ?? null,
+    })
+  } catch {
+    return projectSessionFingerprint({ projectId: id, assetsRevision })
+  }
+}
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -145,6 +173,49 @@ function stampGatewayToolEffect(tool: TurnToolEntry): TurnToolEntry {
 export function _tapeErrorCodeForGenericFailure(detail: string | undefined): string {
   const cls = classifyRunError(detail)
   return cls.code === 'unknown' ? 'ENGINE_ERROR' : cls.code
+}
+
+/**
+ * E4.2 — tape 大写终态控制码 → wire 可透传的 gateway 权威终态码。
+ *
+ * 只映射 wire OutboundError.code 枚举里存在的码(user_cancelled / runner_crashed /
+ * service_restart / auth_error / engine_error);免单/静默恢复类(NO_RESPONSE /
+ * LIVENESS_TIMEOUT / IDLE_TIMEOUT / TURN_LIMIT …)刻意不映射 —— 它们有独立的
+ * waiver 展示分支,error 事件保持无 errorCode 走既有 classify 兜底。
+ * `_` 前缀 = 契约测试 seam。
+ */
+export function _wireTerminalCodeForTape(
+  code: string | undefined,
+): GatewayTerminalErrorCode | undefined {
+  switch (code) {
+    case 'USER_CANCELLED':
+      return 'user_cancelled'
+    case 'RUNNER_CRASHED':
+      return 'runner_crashed'
+    case 'SERVICE_RESTART':
+      return 'service_restart'
+    case 'AUTH_ERROR':
+      return 'auth_error'
+    case 'ENGINE_ERROR':
+      return 'engine_error'
+    default:
+      return undefined
+  }
+}
+
+/** E6 — queued_to_outbox 降级终态的用户向说明(受控文案,全角标点)。 */
+export const SESSION_PERSIST_QUEUED_NOTICE =
+  '回复已生成，但会话存储暂时不可用，内容已安全排队待写入。稍后刷新即可看到完整记录。'
+
+/**
+ * engine 事件通道的**单点**受控加宽 cast:engine 权威类型的 error 事件只声明
+ * errorCode 'user_cancelled'(engine/ 所有权边界内不改),gateway 编排层发射
+ * 其余权威终态码(runner_crashed / service_restart / …)时经此收口。消费端
+ * server.ts `_buildEngineErrorFrame` 以 GatewayEngineErrorEvent 形状接收,
+ * 运行时零损失;除此 helper 外不允许再出现跨该边界的 cast。
+ */
+function _asEngineErrorEvent(event: GatewayEngineErrorEvent): SessionStreamEvent {
+  return event as unknown as SessionStreamEvent
 }
 
 /**
@@ -415,18 +486,26 @@ export function buildHistoricalContextPrompt(
   ].join('\n')
 }
 
-function buildNativeModelHandoffContext(summaryText: string): string {
-  return [
+function buildNativeModelHandoffContext(summaryText: string, mediaPathHints = ''): string {
+  const sections = [
     '<openclaude_native_model_handoff>',
     'The previous source model compacted this populated session for the selected target model. Treat the following native handoff as prior conversation context. Do not restate it unless needed.',
     summaryText,
-    '</openclaude_native_model_handoff>',
-  ].join('\n')
+  ]
+  if (mediaPathHints.trim()) {
+    sections.push('', mediaPathHints.trimEnd())
+  }
+  sections.push('</openclaude_native_model_handoff>')
+  return sections.join('\n')
 }
 
-export function buildNativeModelHandoffPrompt(summaryText: string, currentUserText: string): string {
+export function buildNativeModelHandoffPrompt(
+  summaryText: string,
+  currentUserText: string,
+  mediaPathHints = '',
+): string {
   return [
-    buildNativeModelHandoffContext(summaryText),
+    buildNativeModelHandoffContext(summaryText, mediaPathHints),
     '',
     '<current_user_message>',
     currentUserText,
@@ -437,12 +516,13 @@ export function buildNativeModelHandoffPrompt(summaryText: string, currentUserTe
 export function buildNativeModelHandoffPayload(
   summaryText: string,
   currentUserInput: string | Array<{ type: string; [key: string]: unknown }>,
+  mediaPathHints = '',
 ): string | Array<{ type: string; [key: string]: unknown }> {
   if (typeof currentUserInput === 'string') {
-    return buildNativeModelHandoffPrompt(summaryText, currentUserInput)
+    return buildNativeModelHandoffPrompt(summaryText, currentUserInput, mediaPathHints)
   }
   return [
-    { type: 'text', text: buildNativeModelHandoffContext(summaryText) },
+    { type: 'text', text: buildNativeModelHandoffContext(summaryText, mediaPathHints) },
     ...currentUserInput,
   ]
 }
@@ -534,6 +614,14 @@ export function pickIdleTimeoutMs(
     return IDLE_TIMEOUT_TOOL_MS
   }
   return IDLE_TIMEOUT_DEFAULT_MS
+}
+
+export function shouldTripIdleWatchdog(input: {
+  waitingForUserInput: boolean
+  idleMs: number
+  thresholdMs: number
+}): boolean {
+  return !input.waitingForUserInput && input.idleMs > input.thresholdMs
 }
 
 /**
@@ -646,8 +734,16 @@ export interface AgentSession {
    * `agent.cwd`, or `resolveDefaultWorkspaceCwd`). Cursor chat-store hashes
    * are keyed by this path after the repo-snapshot overlay and realpath, so
    * stale-resume detection must read it back instead of recomputing.
+   *
+   * Bound chat sessions pass the project workspace here. A ready session-repo
+   * overlay is applied later in adapters via decideEngineCwd (allowed).
    */
   workspaceCwd: string
+  /** tb_project.id when this session is bound to a work project. null = unbound. */
+  projectId?: string | null
+  /** projectId + contextVersion + assetsRevision + manifest hashes. */
+  contextFingerprint?: string
+  runContext?: import('./runContextPersist.js').RunContextDescriptor
   /**
    * 直接父会话键。仅 delegate 子会话在创建时物化(handleDelegateTask 传入已校验的
    * 直接父 sessionKey);webchat 根会话为 undefined。用于委派进度**沿父链向上追溯**到
@@ -720,6 +816,11 @@ export interface AgentSession {
    *  定时器 flush 与事件回调都经它串行化,杜绝并发双 flush;含义即原 per-turn
    *  postTerminalRuntimeChain 提升到 session 维度。 */
   _postTerminalRuntimeChain?: Promise<void>
+  /** A2 — 正在等 master ACK 时新到的 tail 先进队列,下一次用一个
+   *  continuation tape 批量持久化。避免长任务终态后串行等 64 次
+   *  network/finalize ACK,同时仍保持“先持久化、后转发”。 */
+  _postTerminalTailQueue?: TailPersistQueueItem[]
+  _postTerminalTailWorkerScheduled?: boolean
   /** Complete engine-reported billing frames for this delegate subtree.
    * handleDelegateTask moves them into the parent DurableAgentGroup. */
   _durableDelegateEngineBillings?: EngineBillingEvent[]
@@ -732,6 +833,8 @@ export interface AgentSession {
   lastUsedAt: number
   // 跨 turn 累积
   totalCostUSD: number
+  /** Monotonic: any estimated/unpriced turn makes the resumed aggregate imprecise. */
+  costImprecise?: boolean
   totalInputTokens: number
   totalOutputTokens: number
   totalCacheReadTokens: number
@@ -906,6 +1009,10 @@ export interface AgentSession {
   /** Browser user-row id bound to the submit that currently owns session.lock.
    * Unlike _activeTurnCount, this never describes queued submits. */
   _runningClientMessageId?: string
+  /** Browser user-row id of the inbound currently inside dispatchInbound
+   * after getOrCreate and before that function's outer finally. Covers the
+   * mkdir/writeFile/parseDocument window where turn counters are still 0. */
+  _admittingClientMessageId?: string
 
   /** RFC-v5-durable-turn-dispatch §4 — per-session recent-terminal ring
    * (cap 8: clientMessageId → outcome). autoResumeFromHello 用 hello 携带的
@@ -998,8 +1105,23 @@ const TRANSIENT_RETRY_ERROR_CODES = new Set([
   'upstream_failed',
 ])
 
+/** E12 — 瞬时错误自动重试的续跑输入。裸「继续」会让模型丢失重试语境(可能被
+ *  理解成用户新指令);这里显式附带原始意图:上一轮因上游瞬时错误被打断,应
+ *  继续完成同一任务。导出供引擎回放测试引用同一权威串。 */
+export const TRANSIENT_RETRY_INPUT = '上一条消息因上游瞬时错误中断，请继续完成该任务。'
+
 // Re-export from ccbMessageParser so existing imports keep working
 export type { SessionStreamEvent } from './ccbMessageParser.js'
+
+/** preheatRunner 的结构化结果(engine_preheat 观测:区分未触发/排队/失败/已热)。 */
+export type PreheatOutcome =
+  | 'started'
+  | 'already_running'
+  | 'failed'
+  | 'skipped_engine'
+  | 'skipped_teardown'
+  | 'skipped_busy'
+  | 'skipped_cap'
 
 export interface CronBridgeEvent {
   action: 'create' | 'delete' | 'list'
@@ -1440,42 +1562,48 @@ function terminalUsageForPersistence(args: {
   }
 }
 
-function persistPostTerminalRuntimeEvent(args: {
+function persistPostTerminalRuntimeEvents(args: {
   sessionKey: string
   sessionId: string
   turnIndex: number
   continuationOfTurnKey: string
-  event: DurableRuntimeEvent
+  events: DurableRuntimeEvent[]
 }): Promise<TapePersistResult> {
-  const raw = JSON.stringify(args.event.payload)
+  if (args.events.length === 0) return Promise.resolve('skipped')
   const identity = createHash('sha256')
-    .update('oc-post-terminal-runtime-v1\0')
+    .update('oc-post-terminal-runtime-batch-v1\0')
     .update(args.continuationOfTurnKey)
-    .update('\0')
-    .update(String(args.event.ordinal))
-    .update('\0')
-    .update(String(args.event.observedAt))
-    .update('\0')
-    .update(raw)
-    .digest('hex')
+  for (const event of args.events) {
+    const raw = JSON.stringify(event.payload)
+    identity
+      .update('\0')
+      .update(String(event.ordinal))
+      .update('\0')
+      .update(String(event.observedAt))
+      .update('\0')
+      .update(event.source)
+      .update('\0')
+      .update(raw)
+  }
+  const identityHex = identity.digest('hex')
   // 三态透传:tail 折叠区分 acked|queued(可靠,更新 hash/count/转发)与 dropped
   // (不更新 → 冻结的 marker / 变化 tail 下次重试)。persistServerAuthoredTurnOutcome
   // 在 commercial-managed 缺 sink 时会 throw(配置异常),兜底折成 dropped。
   return persistServerAuthoredTurnOutcome({
     sessionKey: args.sessionKey,
     peerId: args.sessionId,
-    agentId: `tail_${identity.slice(0, 24)}`,
+    agentId: `tail_${identityHex.slice(0, 24)}`,
     userId: undefined,
     turnIndex: args.turnIndex,
     turnKey: createHash('sha256')
-      .update('oc-post-terminal-tape-v1\0')
-      .update(identity)
+      .update('oc-post-terminal-tape-batch-v1\0')
+      .update(identityHex)
       .digest('hex'),
     continuationOfTurnKey: args.continuationOfTurnKey,
-    createdAt: args.event.observedAt,
+    createdAt: Math.min(...args.events.map((event) => event.observedAt)),
     text: '',
     status: 'completed',
-    runtimeEvents: [structuredClone(args.event)],
+    runtimeEvents: args.events.map((event) => structuredClone(event)),
   }).catch((err): TapePersistResult => {
     log.error(
       'post-terminal runtime persist threw',
@@ -1520,6 +1648,16 @@ interface TailFoldStreamState {
    *  重造),保证重试时 identity 稳定、master UPSERT 去重,绝不产生多条 marker。 */
   markerEvent: DurableRuntimeEvent | null
 }
+
+interface TailPersistQueueItem {
+  st: TailFoldStreamState
+  item: TailFoldItem
+}
+
+type TailPersistOp =
+  | { kind: 'real'; st: TailFoldStreamState; item: TailFoldItem; event: DurableRuntimeEvent }
+  | { kind: 'stream_marker'; st: TailFoldStreamState; item: TailFoldItem; event: DurableRuntimeEvent }
+  | { kind: 'owner_marker'; st: TailFoldStreamState; item: TailFoldItem; event: DurableRuntimeEvent }
 
 /** F2/F6 — 单个 ownerTurnKey 的跨会话 tail 预算(SessionManager 级,有界 LRU)。多个
  *  delegate 子会话共享同一 parent ownerTurnKey 时**共用**本预算(不再各领 64)。 */
@@ -1640,6 +1778,11 @@ export class SessionManager {
   private _tailFoldMinIntervalMs = 5000
   private _tailFoldStreamCap = 24
   private _tailFoldOwnerCap = 64
+  // A2:同一 owner 的 backlog 用一个 continuation tape 批量落库。
+  // 32 条 / 512KiB 与 lossless runtime batching 的稳健量级一致,
+  // 避免一个慢 ACK 把 64 条 tail 串成数十分钟收尾。
+  private _tailPersistBatchMaxEvents = 32
+  private _tailPersistBatchMaxBytes = 512 * 1024
   /** Cooperative Stop grace before the gateway escalates to runner shutdown.
    * Private test seam; the production boundary remains five seconds. */
   private _terminalRequestGraceMs = 5_000
@@ -1689,6 +1832,22 @@ export class SessionManager {
    * 都在 server.ts 的 WS handler 内,移动代价比暴露一个清理 hook 大得多。
    */
   public onSessionDestroyed?: (sessionKey: string) => void
+  /** CCB local-agent bookend with no live turn (or as a second path while
+   * a turn's onEvent is also live). server.ts plans origin-inject here. */
+  public onCcbTaskNotification?: (
+    session: AgentSession,
+    payload: {
+      taskId: string
+      status: string
+      outputFile: string
+      summary: string
+      toolUseId?: string
+    },
+  ) => void
+  public onCcbTaskNotificationDelivered?: (
+    session: AgentSession,
+    payload: { taskId: string; deliveredBy: 'ccb-mid-turn' },
+  ) => void
 
   // ── Phase 5: GitHub session repo wiring ──
   /**
@@ -1809,6 +1968,7 @@ export class SessionManager {
         this._resumeMapTimestamps.delete(sessionKey)
         this._resumeMapProvider.delete(sessionKey)
         this._resumeMapLastCost.delete(sessionKey)
+        this._resumeMapCostImprecise.delete(sessionKey)
         session.ccbSessionId = null
         session.runner.clearSessionId?.()
         this._saveResumeMap()
@@ -2067,103 +2227,156 @@ export class SessionManager {
     }
   }
 
-  /** A1/F1/F1b/F2/F4/F6/F7 — 实际持久化一条 tail;达 owner/stream cap 时改持久化一条
-   *  **冻结**的 capped marker。嵌套两级串行链:**session 链**保证本流内保序、**owner 链**
-   *  把 cap 判定 + 计数增量 + 落定收进跨 session 临界区(F6:消灭共享 ownerTurnKey 的
-   *  两 session 同读 count 超发)。四态:acked|queued → 转发 + 更新 hash + 计入预算 +
-   *  进收集器;skipped(legacy 未落盘)→ 转发 + 更新 hash 但**不计预算/不进收集器**;
-   *  dropped → 全不更新(marker/变化 tail 下次用同一冻结事件重试)。cap 恒被尊重
-   *  (F7:terminal flush 不再豁免 cap,capped 后不写任何东西)。 */
+  /** A1/A2/F1/F1b/F2/F4/F6/F7 — tail 先进 per-session 队列。首条开工后
+   *  新到 backlog 由同一 worker 按 owner 成批持久化;无 backlog 时仍是单条低延迟。 */
   private _enqueueTailPersist(
     session: AgentSession,
     st: TailFoldStreamState,
     item: TailFoldItem,
   ): void {
-    // 限频锚点:尝试时刻同步置位(而非落定时刻),给后续事件稳定的间隔判定。
     st.lastPersistAt = Date.now()
-    // session 链:本流内保序;把预算临界区 + 持久化委托给 owner 链(session→owner)。
-    this._chainTailPersist(session, () =>
-      this._runOnOwnerChain(item.ownerTurnKey, async () => {
-        const metrics = (session._tailFoldMetrics ??= {
-          unchangedSuppressed: 0,
-          rateCoalesced: 0,
-          capped: 0,
-        })
-        // 迟到同内容:rapid-fire 的重复 tail 在首条落定前已排进 pending,落定后其 hash
-        // 已等于 lastPersistedHash → 不重复落。
-        if (item.hash === st.lastPersistedHash) {
-          metrics.unchangedSuppressed++
-          return
+    ;(session._postTerminalTailQueue ??= []).push({ st, item })
+    this._scheduleTailPersistWorker(session)
+  }
+
+  private _scheduleTailPersistWorker(session: AgentSession): void {
+    if (session._postTerminalTailWorkerScheduled) return
+    session._postTerminalTailWorkerScheduled = true
+    this._chainTailPersist(session, async () => {
+      try {
+        await this._drainTailPersistQueue(session)
+      } finally {
+        session._postTerminalTailWorkerScheduled = false
+        // JS 同步段无竞态,但持久化 await 期间可能到新事件;
+        // worker 退出前再补挂一次,不留无主队列。
+        if ((session._postTerminalTailQueue?.length ?? 0) > 0) {
+          this._scheduleTailPersistWorker(session)
         }
-        const owner = this._getOwnerBudget(item.ownerTurnKey)
-        // 已封顶(stream 或 owner)→ 该流彻底停(不落不转);cap 恒尊重,无豁免。
-        if (st.capped || owner.capped) return
-        // owner cap:整 owner 只落一条冻结 marker,成功(acked|queued|skipped)后封停该
-        // owner 全部流;dropped 则不封停,下次用同一冻结 marker 重试。
-        if (owner.persistedCount >= this._tailFoldOwnerCap) {
-          owner.markerEvent ??= this._buildTailCapMarker(item, 'owner_cap')
-          const outcome = await persistPostTerminalRuntimeEvent({
-            sessionKey: session.sessionKey,
-            sessionId: item.ownerSessionId,
-            turnIndex: item.turnIndex,
-            continuationOfTurnKey: item.ownerTurnKey,
-            event: owner.markerEvent,
-          })
-          if (outcome !== 'dropped') {
-            owner.capped = true
-            metrics.capped++
-            log.warn('post-terminal tail OWNER capped', {
-              sessionKey: session.sessionKey,
-              ownerTurnKey: item.ownerTurnKey,
-              ownerPersistedCount: owner.persistedCount,
-            })
-          }
-          return
-        }
-        // per-stream cap:该流落一条冻结 marker,成功后停该流。
-        if (st.persistedCount >= this._tailFoldStreamCap) {
+      }
+    })
+  }
+
+  private async _drainTailPersistQueue(session: AgentSession): Promise<void> {
+    const queue = (session._postTerminalTailQueue ??= [])
+    while (queue.length > 0) {
+      const first = queue.shift()!
+      const batch = [first]
+      let bytes = Buffer.byteLength(JSON.stringify(first.item.event), 'utf8')
+      while (queue.length > 0 && batch.length < this._tailPersistBatchMaxEvents) {
+        const next = queue[0]!
+        // continuation tape 的 owner 必须唯一;遇到另一 owner 就先收当前批。
+        if (next.item.ownerTurnKey !== first.item.ownerTurnKey) break
+        const nextBytes = Buffer.byteLength(JSON.stringify(next.item.event), 'utf8')
+        if (batch.length > 0 && bytes + nextBytes > this._tailPersistBatchMaxBytes) break
+        queue.shift()
+        batch.push(next)
+        bytes += nextBytes
+      }
+      await this._runOnOwnerChain(first.item.ownerTurnKey, () =>
+        this._persistTailBatch(session, batch),
+      )
+    }
+  }
+
+  private async _persistTailBatch(
+    session: AgentSession,
+    batch: TailPersistQueueItem[],
+  ): Promise<void> {
+    if (batch.length === 0) return
+    const first = batch[0]!.item
+    const owner = this._getOwnerBudget(first.ownerTurnKey)
+    const metrics = (session._tailFoldMetrics ??= {
+      unchangedSuppressed: 0,
+      rateCoalesced: 0,
+      capped: 0,
+    })
+    const ops: TailPersistOp[] = []
+    const plannedHashes = new Map<TailFoldStreamState, string | null>()
+    const plannedRealCounts = new Map<TailFoldStreamState, number>()
+    let ownerRealCount = 0
+    let ownerMarkerPlanned = false
+    const streamMarkerPlanned = new Set<TailFoldStreamState>()
+    // runtimeEvents-only 在 legacy/no-sink 路径会返回 skipped;它们按旧契约
+    // 不占预算、不触发 cap。sink 存在时才做持久化预算规划。
+    const enforcePersistentBudget = getV3MasterSinkOrNull() !== null
+
+    for (const entry of batch) {
+      const { st, item } = entry
+      const currentHash = plannedHashes.has(st)
+        ? plannedHashes.get(st)!
+        : st.lastPersistedHash
+      if (item.hash === currentHash) {
+        metrics.unchangedSuppressed++
+        continue
+      }
+      if (enforcePersistentBudget && (st.capped || owner.capped || ownerMarkerPlanned)) continue
+      if (
+        enforcePersistentBudget &&
+        owner.persistedCount + ownerRealCount >= this._tailFoldOwnerCap
+      ) {
+        owner.markerEvent ??= this._buildTailCapMarker(item, 'owner_cap')
+        ops.push({ kind: 'owner_marker', st, item, event: owner.markerEvent })
+        ownerMarkerPlanned = true
+        continue
+      }
+      const streamRealCount = plannedRealCounts.get(st) ?? 0
+      if (
+        enforcePersistentBudget &&
+        st.persistedCount + streamRealCount >= this._tailFoldStreamCap
+      ) {
+        if (!streamMarkerPlanned.has(st)) {
           st.markerEvent ??= this._buildTailCapMarker(item, 'cap')
-          const outcome = await persistPostTerminalRuntimeEvent({
-            sessionKey: session.sessionKey,
-            sessionId: item.ownerSessionId,
-            turnIndex: item.turnIndex,
-            continuationOfTurnKey: item.ownerTurnKey,
-            event: st.markerEvent,
-          })
-          if (outcome !== 'dropped') {
-            st.capped = true
-            metrics.capped++
-            log.warn('post-terminal tail stream capped', {
-              sessionKey: session.sessionKey,
-              ownerTurnKey: item.ownerTurnKey,
-              toolUseId: item.toolUseId,
-              persistedCount: st.persistedCount,
-            })
-          }
-          return
+          ops.push({ kind: 'stream_marker', st, item, event: st.markerEvent })
+          streamMarkerPlanned.add(st)
         }
-        // 真实 tail 持久化。
-        const outcome = await persistPostTerminalRuntimeEvent({
+        continue
+      }
+      ops.push({ kind: 'real', st, item, event: item.event })
+      plannedHashes.set(st, item.hash)
+      plannedRealCounts.set(st, streamRealCount + 1)
+      ownerRealCount++
+    }
+    if (ops.length === 0) return
+
+    const outcome = await persistPostTerminalRuntimeEvents({
+      sessionKey: session.sessionKey,
+      sessionId: first.ownerSessionId,
+      turnIndex: first.turnIndex,
+      continuationOfTurnKey: first.ownerTurnKey,
+      events: ops.map((op) => op.event),
+    })
+    if (outcome === 'dropped') return
+
+    for (const op of ops) {
+      if (op.kind === 'owner_marker') {
+        owner.capped = true
+        metrics.capped++
+        log.warn('post-terminal tail OWNER capped', {
           sessionKey: session.sessionKey,
-          sessionId: item.ownerSessionId,
-          turnIndex: item.turnIndex,
-          continuationOfTurnKey: item.ownerTurnKey,
-          event: item.event,
+          ownerTurnKey: op.item.ownerTurnKey,
+          ownerPersistedCount: owner.persistedCount,
         })
-        // dropped:全不更新(维持"转发的必已持久化",变化 tail 下次重试)。
-        if (outcome === 'dropped') return
-        // acked|queued|skipped 都更新 hash + 转发(去重前进)。
-        st.lastPersistedHash = item.hash
-        // acked|queued 才计入预算 + 进 delegate durable 收集器(skipped=未落盘,不占
-        // 预算、不进收集器)。
-        if (outcome === 'acked' || outcome === 'queued') {
-          st.persistedCount++
-          owner.persistedCount++
-          session._durableDelegateRuntimeEvents?.push(structuredClone(item.event))
-        }
-        item.onEvent({ kind: 'block', block: item.block })
-      }),
-    )
+        continue
+      }
+      if (op.kind === 'stream_marker') {
+        op.st.capped = true
+        metrics.capped++
+        log.warn('post-terminal tail stream capped', {
+          sessionKey: session.sessionKey,
+          ownerTurnKey: op.item.ownerTurnKey,
+          toolUseId: op.item.toolUseId,
+          persistedCount: op.st.persistedCount,
+        })
+        continue
+      }
+      op.st.lastPersistedHash = op.item.hash
+      if (outcome === 'acked' || outcome === 'queued') {
+        op.st.persistedCount++
+        owner.persistedCount++
+        session._durableDelegateRuntimeEvents?.push(structuredClone(op.item.event))
+      }
+      op.item.onEvent({ kind: 'block', block: op.item.block })
+    }
   }
 
   /** A1 — bash_output_tail 折叠入口(在发起 turn 的 onPostTerminalRuntimeEvent 内
@@ -2286,12 +2499,12 @@ export class SessionManager {
     if (!isTail) {
       // B6 非 tail:先持久化后转发,dropped 时 fail-closed 不转发(与 tail 路径对称)。
       this._chainTailPersist(session, async () => {
-        const outcome = await persistPostTerminalRuntimeEvent({
+        const outcome = await persistPostTerminalRuntimeEvents({
           sessionKey: session.sessionKey,
           sessionId: ownerSessionId,
           turnIndex,
           continuationOfTurnKey: ownerTurnKey,
-          event,
+          events: [event],
         })
         // dropped:帧未落盘 → 绝不抢先展示未持久化的 post-terminal 快照。
         if (outcome === 'dropped') return
@@ -2368,6 +2581,8 @@ export class SessionManager {
     session._tailFoldStreams = undefined
     session._tailFoldMetrics = undefined
     session._postTerminalRuntimeChain = undefined
+    session._postTerminalTailQueue = undefined
+    session._postTerminalTailWorkerScheduled = false
     // owner 预算不在此清:它是 SessionManager 级、可被同 ownerTurnKey 的其它(delegate)
     // 会话共享,自身受 LRU(512)有界;随会话清会破坏跨会话聚合封顶。
   }
@@ -2491,6 +2706,7 @@ export class SessionManager {
       this._resumeMapTimestamps.delete(session.sessionKey)
       this._resumeMapProvider.delete(session.sessionKey)
       this._resumeMapLastCost.delete(session.sessionKey)
+      this._resumeMapCostImprecise.delete(session.sessionKey)
       session.ccbSessionId = null
       session.runner.clearSessionId?.()
       this._saveResumeMap()
@@ -2672,19 +2888,19 @@ export class SessionManager {
       this._resumeMapTimestamps.delete(sessionKey)
       this._resumeMapProvider.delete(sessionKey)
       this._resumeMapLastCost.delete(sessionKey)
+      this._resumeMapCostImprecise.delete(sessionKey)
       this._saveResumeMap()
       return undefined
     }
     if (tag === 'cursor' && workspacePath && !cursorResumeStoreExists(workspacePath, id)) {
-      log.warn('resume-map entry points to missing Cursor chat store — dropping silently', {
+      // Do not drop the map: spawn cwd is the resume authority, and a
+      // recomputed overlay can hash to a different chats/ dir than the live
+      // CLI. Deleting here forces historical replay on the next follow-up
+      // even when store.db is still on disk.
+      log.warn('resume-map Cursor store not at this workspace — keeping map, skipping this lookup', {
         sessionKey,
         resumeId: id,
       })
-      this._resumeMap.delete(sessionKey)
-      this._resumeMapTimestamps.delete(sessionKey)
-      this._resumeMapProvider.delete(sessionKey)
-      this._resumeMapLastCost.delete(sessionKey)
-      this._saveResumeMap()
       return undefined
     }
     return id
@@ -2693,12 +2909,13 @@ export class SessionManager {
   /** Same cwd projection CursorAdapter.spawnTurn uses: repo workspace when
    *  ready, otherwise the agent base dir. Wrapper --workspace is pwd -P of
    *  that cwd, so realpath when the path exists. */
-  private _cursorWorkspacePath(agentBaseDir: string, repoSessionId?: string): string {
-    let cwd = agentBaseDir
-    if (repoSessionId && this._getRepoSnapshot) {
-      const snap = this._getRepoSnapshot(repoSessionId)
-      if (snap?.status === 'ready' && snap.workspaceDir) cwd = snap.workspaceDir
-    }
+  private _cursorWorkspacePath(agentBaseDir: string, repoSessionId?: string, projectBound?: boolean): string {
+    const snap = repoSessionId && this._getRepoSnapshot ? this._getRepoSnapshot(repoSessionId) : null
+    const cwd = decideEngineCwd({
+      agentBaseDir,
+      repoSnapshot: snap,
+      projectBound,
+    }).cwd
     try { return realpathSync(cwd) } catch { return cwd }
   }
 
@@ -2707,6 +2924,7 @@ export class SessionManager {
     return this._cursorWorkspacePath(
       session.workspaceCwd,
       session.repoSessionId ?? session.peerId,
+      Boolean(session.projectId),
     )
   }
 
@@ -2757,6 +2975,11 @@ export class SessionManager {
     if (cost === undefined) return undefined
     const tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
     return tag === wantProvider ? cost : undefined
+  }
+
+  private _costImpreciseFor(sessionKey: string, wantProvider: string): boolean {
+    const tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
+    return tag === wantProvider && this._resumeMapCostImprecise.get(sessionKey) === true
   }
 
   /** M1a:resume-map provider tag 的历史值归一。旧格式在 P1f 前写过
@@ -2814,6 +3037,9 @@ export class SessionManager {
             if (typeof lastCost === 'number' && Number.isFinite(lastCost) && lastCost >= 0) {
               this._resumeMapLastCost.set(key, lastCost)
             }
+            if ((val as any).costImprecise === true) {
+              this._resumeMapCostImprecise.set(key, true)
+            }
             // M1a:tag 归一为 engine id(历史 'codex-native' → 'codex')。
             this._resumeMapProvider.set(key, prov)
           }
@@ -2832,6 +3058,7 @@ export class SessionManager {
       id: string
       ts: number
       lastCost?: number
+      costImprecise?: boolean
       provider?: string
       historyContextVersion?: number
     }
@@ -2844,6 +3071,7 @@ export class SessionManager {
       }
       const cached = this._resumeMapLastCost.get(key)
       if (cached !== undefined && cached > 0) entry.lastCost = cached
+      if (this._resumeMapCostImprecise.get(key) === true) entry.costImprecise = true
       const prov = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(key))
       if (prov === SessionManager.CCB_PROVIDER_TAG) {
         entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
@@ -2859,6 +3087,7 @@ export class SessionManager {
           ts: now,
         }
         if (sess._lastCcbCumulativeCost > 0) entry.lastCost = sess._lastCcbCumulativeCost
+        if (sess.costImprecise === true) entry.costImprecise = true
         const prov = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(key))
         if (prov === SessionManager.CCB_PROVIDER_TAG) {
           entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
@@ -2869,6 +3098,7 @@ export class SessionManager {
         this._resumeMap.set(key, sess.ccbSessionId)
         this._resumeMapTimestamps.set(key, now)
         this._resumeMapLastCost.set(key, sess._lastCcbCumulativeCost)
+        if (sess.costImprecise === true) this._resumeMapCostImprecise.set(key, true)
       }
     }
     const data = JSON.stringify(obj, null, 2)
@@ -3003,6 +3233,13 @@ export class SessionManager {
     /** Database-authoritative default cwd policy injected by the commercial
      * master. Missing means legacy for prewarm/personal callers. */
     workspaceMode?: SessionWorkspaceMode
+    /** Explicit cwd for project workspace (taskboard / bound chat). */
+    workspaceCwd?: string
+    /** Pass null to unbind an existing session. */
+    projectId?: string | null
+    contextFingerprint?: string
+    assetsRevision?: number
+    runContext?: import('./runContextPersist.js').RunContextDescriptor
     /**
      * 直接父会话键(仅 delegate 子会话传入,已由 handleDelegateTask 经 _resolveDelegateParent
      * 校验存在于内存 + channel 合法 + sourceAgent 匹配)。物化到 AgentSession.parentSessionKey,
@@ -3132,7 +3369,24 @@ export class SessionManager {
           : existing.providerTag
       const workspaceModeChanged =
         opts.workspaceMode !== undefined && existing.workspaceMode !== workspaceMode
-      if (existing.providerTag !== desiredEngine || workspaceModeChanged) {
+      const workspaceCwdChanged =
+        opts.workspaceCwd !== undefined && existing.workspaceCwd !== opts.workspaceCwd
+      const nextProjectId =
+        opts.projectId === undefined ? existing.projectId ?? null : opts.projectId
+      const projectIdChanged =
+        opts.projectId !== undefined && (existing.projectId ?? null) !== (opts.projectId ?? null)
+      const nextFingerprint =
+        opts.contextFingerprint ??
+        (await computeSessionContextFingerprint(nextProjectId, opts.assetsRevision))
+      // Fingerprint ticks (project.md / assets) are re-injected each spawn via
+      // prompt slots. Replacing the runner for that would drop Cursor's live
+      // native session and force a visible history replay on ordinary follow-ups.
+      if (
+        existing.providerTag !== desiredEngine ||
+        workspaceModeChanged ||
+        workspaceCwdChanged ||
+        projectIdChanged
+      ) {
         const replacementNotice: NonNullable<AgentSession['_contextRebuildNotice']> =
           existing.providerTag !== desiredEngine ? 'engine-switch' : 'native-resume-loss'
         contextRebuildNotice = replacementNotice
@@ -3204,13 +3458,17 @@ export class SessionManager {
         if (opts.repoSessionId && !existing.repoSessionId) existing.repoSessionId = opts.repoSessionId
         if (opts.parentSessionKey && !existing.parentSessionKey)
           existing.parentSessionKey = opts.parentSessionKey
+        if (opts.projectId !== undefined) existing.projectId = opts.projectId
+        if (nextFingerprint) existing.contextFingerprint = nextFingerprint
+        if (opts.runContext) existing.runContext = opts.runContext
         return existing
       }
     }
     // 显式 pin 的 agent cwd(如 repo session)优先,永不被 workspace 缺省覆盖;
     // 仅在没有显式 cwd 时用 OPENCLAUDE_DEFAULT_WORKSPACE(存在且是目录)/否则 process.cwd()。
     const repoSessionId = opts.repoSessionId ?? opts.peerId
-    const cwd = opts.agent.cwd ?? resolveDefaultWorkspaceCwd(workspaceMode, repoSessionId)
+    const cwd =
+      opts.workspaceCwd ?? opts.agent.cwd ?? resolveDefaultWorkspaceCwd(workspaceMode, repoSessionId)
     const persona = opts.hermeticNoTools
       ? undefined
       : opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
@@ -3237,12 +3495,18 @@ export class SessionManager {
       // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
       resumeSessionId: opts.hermeticNoTools
         ? undefined
-        : this._resumeIdFor(opts.sessionKey, engineId, this._cursorWorkspacePath(cwd, repoSessionId)),
+        : this._resumeIdFor(
+            opts.sessionKey,
+            engineId,
+            this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
+          ),
       effortLevel: initialEffort,
       // Phase 5:repoSessionId 默认等于 peerId;delegate_task 可传父 webchat
       // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
       // getRepoSnapshot 由 Gateway 构造器注入。
       sessionId: repoSessionId,
+      projectId: opts.projectId ?? undefined,
+      runContext: opts.runContext,
       getRepoSnapshot: this._getRepoSnapshot,
       workload: opts.workload,
       skillTrainRunId: opts.skillTrainRunId,
@@ -3262,6 +3526,11 @@ export class SessionManager {
       userId: opts.userId,
       workspaceMode,
       workspaceCwd: cwd,
+      projectId: opts.projectId,
+      contextFingerprint:
+        opts.contextFingerprint ??
+        (await computeSessionContextFingerprint(opts.projectId, opts.assetsRevision)),
+      runContext: opts.runContext,
       repoSessionId,
       title: opts.title ?? 'New conversation',
       // delegate 子会话的直接父指针(webchat/普通会话为 undefined)。物化父链使委派进度
@@ -3289,6 +3558,7 @@ export class SessionManager {
       // will start at 0 after a resume. This is a known limitation; fixing it
       // requires persisting per-token totals which we do not currently do.
       totalCostUSD: this._lastCostFor(opts.sessionKey, engineId) ?? 0,
+      costImprecise: this._costImpreciseFor(opts.sessionKey, engineId),
       totalInputTokens: 0,
       totalOutputTokens: 0,
       totalCacheReadTokens: 0,
@@ -3309,6 +3579,21 @@ export class SessionManager {
       agentProvider: opts.agent.provider,
       _contextRebuildNotice: contextRebuildNotice,
     }
+    runner.on('task_notification', (payload: {
+      taskId: string
+      status: string
+      outputFile: string
+      summary: string
+      toolUseId?: string
+    }) => {
+      this.onCcbTaskNotification?.(session, payload)
+    })
+    runner.on('task_notification_delivered', (payload: {
+      taskId: string
+      deliveredBy: 'ccb-mid-turn'
+    }) => {
+      this.onCcbTaskNotificationDelivered?.(session, payload)
+    })
     runner.on('session_id', (id: string) => {
       session.ccbSessionId = id
       // Remember which provider produced this id — the next getOrCreate on
@@ -3371,6 +3656,7 @@ export class SessionManager {
           this._resumeMapTimestamps.delete(opts.sessionKey)
           this._resumeMapProvider.delete(opts.sessionKey)
           this._resumeMapLastCost.delete(opts.sessionKey)
+          this._resumeMapCostImprecise.delete(opts.sessionKey)
           session.ccbSessionId = null
           session._pendingStaleResumeClear = false
           // Also forget the id inside the runner — otherwise submit()'s next
@@ -3474,6 +3760,92 @@ export class SessionManager {
     return true
   }
 
+  // ── 引擎预热(session-open engine preheat)───────────────────────────────
+
+  /** Per-session in-flight preheat (single-flight) + global concurrency cap. */
+  private readonly _preheatInFlight = new Map<string, Promise<PreheatOutcome>>()
+  private _preheatActive = 0
+
+  /**
+   * 会话打开引擎预热(INC-20260824-FIRST-TEXT-LATENCY;调用方负责 env gate)。
+   *
+   * 只对实现了 `EngineAdapter.preheat` 的常驻进程引擎生效(CCB spawn ~20s、codex
+   * app-server 5-8s);one-shot CLI(grok/cursor/zcode)无 preheat → skip。语义边界:
+   * **不提交 turn、零上游 LLM 调用、零 LLM 计费**;但 spawn 会拉起 MCP 子进程,
+   * 用户自配 MCP 的初始化可能有本地/网络副作用 —— 由全局并发 cap=1、单飞与失败
+   * 日志兜底。串行化在 session.lock 上;与几乎同时到达的 submit 共享 runner 的
+   * in-flight start promise,不会互抛。
+   */
+  /** Prompt-queue in-flight for this session: a queued-but-not-yet-granted
+   * turn owns the spawn/side-effect boundary — preheat must not preempt it. */
+  private _promptQueueHolds(session: AgentSession): boolean {
+    return (
+      this._promptQueueExecutions.has(session) ||
+      this._promptQueueExecutionKeys.has(session.sessionKey) ||
+      this._promptQueueDispatchFences.has(session.sessionKey)
+    )
+  }
+
+  async preheatRunner(session: AgentSession): Promise<PreheatOutcome> {
+    if (session._plannedTeardown || session._replacing) return 'skipped_teardown'
+    const runner = session.runner
+    if (typeof runner.preheat !== 'function') return 'skipped_engine'
+    if (runner.isRunning) return 'already_running'
+    if ((session._activeTurnCount ?? 0) > 0 || this._promptQueueHolds(session)) {
+      return 'skipped_busy'
+    }
+    const existing = this._preheatInFlight.get(session.sessionKey)
+    if (existing) return existing
+    if (this._preheatActive >= 1) return 'skipped_cap'
+    this._preheatActive += 1
+    const startedAt = Date.now()
+    // `run` never rejects: concurrent callers share this promise via the map,
+    // and a rejected shared promise would escape the first caller's handling.
+    const run = (async (): Promise<PreheatOutcome> => {
+      const prev = session.lock
+      let release: () => void = () => {}
+      session.lock = new Promise<void>((r) => (release = r))
+      try {
+        await prev
+        // Re-check under the lock: a turn/teardown may have landed meanwhile.
+        if (session._plannedTeardown || session._replacing) return 'skipped_teardown'
+        if (session.runner.isRunning) return 'already_running'
+        if ((session._activeTurnCount ?? 0) > 0 || this._promptQueueHolds(session)) {
+          return 'skipped_busy'
+        }
+        await session.runner.preheat!()
+        session.lastUsedAt = Date.now()
+        log.info('engine_preheat', {
+          sessionKey: session.sessionKey,
+          engine: runner.engineId,
+          outcome: 'started',
+          spawn_ms: Date.now() - startedAt,
+        })
+        return 'started'
+      } catch (err) {
+        log.warn('engine_preheat', {
+          sessionKey: session.sessionKey,
+          engine: runner.engineId,
+          outcome: 'failed',
+          spawn_ms: Date.now() - startedAt,
+          err: String(err),
+        })
+        return 'failed'
+      } finally {
+        release()
+      }
+    })()
+    this._preheatInFlight.set(session.sessionKey, run)
+    try {
+      return await run
+    } finally {
+      this._preheatActive -= 1
+      if (this._preheatInFlight.get(session.sessionKey) === run) {
+        this._preheatInFlight.delete(session.sessionKey)
+      }
+    }
+  }
+
   async submit(
     session: AgentSession,
     userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
@@ -3524,6 +3896,9 @@ export class SessionManager {
       codexRoute?: CodexProviderConfigOverride | null
       /** Grok CLI receives only this one-turn opaque loopback relay route. */
       grokRoute?: GrokRouteOverride | null
+      /** Master-authored recovery fence for a first-event silent engine turn.
+       * Only Grok currently consumes it; arbitrary client input cannot set it. */
+      resetNativeSession?: boolean
       /** ZCode CLI receives only this one-turn opaque loopback Anthropic relay. */
       zcodeRoute?: ZcodeRouteOverride | null
       /** Master-authored platform goal snapshot for this exact turn. null
@@ -3777,9 +4152,9 @@ export class SessionManager {
         // 同步更新 session.model,outbound 帧 / metrics / audit 都靠它,避免
         // 下次 spawn 前的窗口期 stale。runner.model 要等 spawn 才生效;但 shutdown
         // 已让 runner 死,窗口期内不会产生新 metrics —— session.model 提前对齐安全。
-        // 最后兜底用 glm-5.3(平台默认、v5 合法的静态 key 模型)。
+        // 最后兜底用 glm-5.3-zai(平台默认、v5 合法的静态 key 模型)。
         // 不再硬编码 claude-opus-4-7 —— Claude 官方模型已下线,那会造出非法默认 → spawn 失败。
-        session.model = desiredModel ?? this.config.defaults.model ?? 'glm-5.3'
+        session.model = desiredModel ?? this.config.defaults.model ?? 'glm-5.3-zai'
       }
       if (toolsetsChanged) {
         maybeSetToolsets.call(session.runner, desiredToolsets)
@@ -3937,7 +4312,36 @@ export class SessionManager {
               ))
               .filter((prompt): prompt is string => prompt !== null)
           : []
-      let providerResumeId = this._resumeIdFor(session.sessionKey, session.providerTag, this._cursorWorkspacePathForSession(session))
+      if (opts?.resetNativeSession === true && session.providerTag === 'grok') {
+        await session.runner.shutdown()
+        this._resumeMap.delete(session.sessionKey)
+        this._resumeMapTimestamps.delete(session.sessionKey)
+        this._resumeMapProvider.delete(session.sessionKey)
+        this._resumeMapLastCost.delete(session.sessionKey)
+        session.ccbSessionId = null
+        session.runner.clearSessionId()
+        this._saveResumeMap()
+        await this.awaitResumeMapFlush()
+        session._historicalContextInjected = false
+        session._historicalContextInjectedKey = undefined
+        session._contextRebuildNotice = 'native-resume-loss'
+        log.warn('automatic recovery reset poisoned Grok native session', {
+          sessionKey: session.sessionKey,
+        })
+      }
+      const spawnCwd = this._cursorWorkspacePathForSession(session)
+      const usableCursorId = session.providerTag === 'cursor'
+        ? usableCursorResumeId({
+            workspacePath: spawnCwd,
+            liveId: session.runner.nativeSessionId,
+            mappedId: this._resumeMap.get(session.sessionKey),
+          })
+        : undefined
+      let providerResumeId = usableCursorId ?? this._resumeIdFor(
+        session.sessionKey,
+        session.providerTag,
+        spawnCwd,
+      )
       const injectionKey = historicalContextInjectionKey({
         messages: effectiveMasterHistoricalMessages,
         peerId: session.peerId,
@@ -3955,6 +4359,7 @@ export class SessionManager {
         this._resumeMapTimestamps.delete(session.sessionKey)
         this._resumeMapProvider.delete(session.sessionKey)
         this._resumeMapLastCost.delete(session.sessionKey)
+        this._resumeMapCostImprecise.delete(session.sessionKey)
         session.ccbSessionId = null
         session.runner.clearSessionId?.()
         this._saveResumeMap()
@@ -3972,7 +4377,38 @@ export class SessionManager {
           ? transition
           : null
       if (nativeHandoff) {
-        runnerPayload = buildNativeModelHandoffPayload(nativeHandoff.summaryText!, userTextOrBlocks)
+        let historyForMedia = effectiveMasterHistoricalMessages
+        if (!historyForMedia) {
+          try {
+            historyForMedia = mergePendingExternalHistory(
+              (await getEngineContextMessages(
+                session.peerId,
+                session.userId ?? 'default',
+                {
+                  contextWindow:
+                    opts?.modelAuthority?.executionDescriptor.contextWindow ??
+                    (session.providerTag === 'codex' ? null : undefined),
+                  engine: session.providerTag,
+                  currentUserText: typeof userTextOrBlocks === 'string' ? userTextOrBlocks : '',
+                  ...(opts?.replayLifecycle?.clientMessageId
+                    ? { excludeClientMessageId: opts.replayLifecycle.clientMessageId }
+                    : {}),
+                },
+              )) ?? [],
+            )
+          } catch {
+            historyForMedia = []
+          }
+        }
+        const mediaPathHints = collectModelHistoryMediaPathHints(
+          historyForMedia,
+          nativeHandoff.summaryText ?? '',
+        )
+        runnerPayload = buildNativeModelHandoffPayload(
+          nativeHandoff.summaryText!,
+          userTextOrBlocks,
+          mediaPathHints,
+        )
         nativeHandoff.summaryInjected = true
         session._historicalContextInjected = true
         session._historicalContextInjectedKey = `native-switch:${nativeHandoff.id}`
@@ -4090,6 +4526,9 @@ export class SessionManager {
             reject(error)
             return
           }
+          // A blocking Codex requestUserInput is an explicit human wait, not
+          // engine silence. Keep checking the immutable 12h hard limit above,
+          // but never turn a pending question into LIVENESS_TIMEOUT/waiver.
           const idleMs = Date.now() - session.runner.lastActivityAt
           // pendingToolCalls 经 adapter 读当前活跃 turn 的 parser(turn 间为 0),
           // 语义与旧 session._currentParser?.pendingToolCalls 一致。
@@ -4098,7 +4537,11 @@ export class SessionManager {
             session.runner.pendingToolCalls,
             session.providerTag,
           )
-          if (idleMs > threshold) {
+          if (shouldTripIdleWatchdog({
+            waitingForUserInput: session.runner.waitingForUserInput === true,
+            idleMs,
+            thresholdMs: threshold,
+          })) {
             const error = new TurnIdleTimeoutError(
               `idle timeout (${Math.round(idleMs / 1000)}s no output)`,
             )
@@ -4583,7 +5026,7 @@ export class SessionManager {
         emitRetryStatus('TRANSIENT_RETRY', delay)
         // Match the only recovery action a user would take: continue the same
         // engine session. Codex/CC own tool and conversation continuation.
-        retryInput = '继续'
+        retryInput = TRANSIENT_RETRY_INPUT
         try {
           await waitForRetryDelay(delay, logicalTurnSignal)
         } finally {
@@ -4858,7 +5301,43 @@ export class SessionManager {
         }
         if (terminalExternalBilling) onEvent({ kind: 'external_billing', ...structuredClone(terminalExternalBilling) })
       }
+      // Engine cold-start visibility (INC-20260824-FIRST-TEXT-LATENCY):
+      // while this turn's engine process is spawning/resuming, the browser
+      // shows an explicit startup phase instead of a silent 20-40s
+      // "thinking" gap. The phase is authoritatively ended HERE on the first
+      // observable event (content block / permission card / any successor
+      // turn_status / terminal event); the frontend clear-on-content is only
+      // a dropped-frame fallback.
+      let startupPhaseActive = false
+      const emitStartupPhase = (status: 'engine_starting' | 'engine_resuming'): void => {
+        startupPhaseActive = true
+        onEvent({ kind: 'turn_status', status })
+      }
+      const clearStartupPhase = (): void => {
+        if (!startupPhaseActive) return
+        startupPhaseActive = false
+        onEvent({ kind: 'turn_status', status: null })
+      }
       const handleEngineEvent = (e: EngineEvent) => {
+        if (startupPhaseActive) {
+          if (e.kind === 'turn_status') {
+            // A successor phase owns the activity row from here on. Object
+            // phases (working/retrying) do not replace the client's phase
+            // state by themselves, so null the startup phase first; string
+            // phases (compacting/waiting_for_user/null) overwrite it.
+            startupPhaseActive = false
+            if (e.status && typeof e.status === 'object') {
+              onEvent({ kind: 'turn_status', status: null })
+            }
+          } else if (
+            e.kind === 'block' ||
+            e.kind === 'permission_request' ||
+            e.kind === 'error' ||
+            e.kind === 'final'
+          ) {
+            clearStartupPhase()
+          }
+        }
         if (
           e.kind === 'turn_status' &&
           e.status &&
@@ -5059,6 +5538,13 @@ export class SessionManager {
       // Per-turn parse_error listener (previously only installed at runner
       // construction). Must be detached with the rest to avoid per-turn
       // listener accumulation (R9).
+      // Per-turn spawn listener: upgrades/announces the startup phase with
+      // resume attribution. CCB emits 'spawn' only on cold start; cursor/grok
+      // one-shot CLIs emit it on every turn (their cold start IS per turn).
+      const handleSpawn = (info: { resumed?: boolean }) => {
+        if (detached) return
+        emitStartupPhase(info?.resumed ? 'engine_resuming' : 'engine_starting')
+      }
       const handleParseError = (payload: { line: string; err?: unknown; error?: unknown }) => {
         const rawError = payload.err ?? payload.error
         const err = rawError as Error | undefined
@@ -5109,6 +5595,7 @@ export class SessionManager {
         runner.off('error', handleError)
         runner.off('exit', handleExit)
         runner.off('parse_error', handleParseError)
+        runner.off('spawn', handleSpawn)
       }
 
       const retainedTerminalErrors = new Set<string>()
@@ -5142,6 +5629,7 @@ export class SessionManager {
         terminalPersistenceClaim = 'partial'
         partialPersistencePromise = (async () => {
           let persistenceAcknowledged = !MASTER_SINK_PERSIST_CHANNELS.has(session.channel)
+          let persistenceQueuedToOutbox = false
           detach()
           if (
             status === 'interrupted' &&
@@ -5204,7 +5692,8 @@ export class SessionManager {
                 sessionKey: session.sessionKey,
                 ...(traceId ? { traceId } : {}),
               })
-              persistenceAcknowledged = await persistServerAuthoredTurn({
+              // E6 — Outcome 版本识别 'queued'(语义同 finalizeTurn 主路径)。
+              const partialOutcome = await persistServerAuthoredTurnOutcome({
                 sessionKey: session.sessionKey,
                 peerId: session.peerId,
                 agentId: session.agentId,
@@ -5247,6 +5736,11 @@ export class SessionManager {
                   ? { engineBilling: terminalEngineBilling }
                   : {}),
               })
+              persistenceAcknowledged = partialOutcome === 'acked' || partialOutcome === 'skipped'
+              // 同 finalizeTurn 主路径:降级投递仅限个人版本地 outbox;商用 v3
+              // sink 的 queued 保持静默(master ACK 权威,契约测试锁此语义)。
+              persistenceQueuedToOutbox =
+                getV3MasterSinkOrNull() === null && partialOutcome === 'queued'
             }
           } finally {
             const usageForLog = terminalUsageForPersistence({
@@ -5271,7 +5765,29 @@ export class SessionManager {
             // authoritative PG history. Never expose a terminal frame until
             // the master has ACKed it; reconnect/relogin must not turn a live
             // "finished" reply into a missing one.
-            if (persistenceAcknowledged) onEvent({ kind: 'error', error: reason })
+            // E4.2 — handleExit/interrupt 已分类的终态码(RUNNER_CRASHED /
+            // SERVICE_RESTART / USER_CANCELLED …)透传 wire 子集,不再让 server
+            // 对「子进程异常退出 (code 1)」这类原文正则分类压成 upstream_failed。
+            if (persistenceAcknowledged) {
+              const wireCode = _wireTerminalCodeForTape(errorCode)
+              onEvent(_asEngineErrorEvent({
+                kind: 'error',
+                error: reason,
+                ...(wireCode ? { errorCode: wireCode } : {}),
+              }))
+            } else if (persistenceQueuedToOutbox) {
+              // E6 — queued 降级终态(语义同 finalizeTurn 主路径):不静默卡住。
+              log.warn('partial terminal delivered in degraded persist-queued mode', {
+                sessionKey: session.sessionKey,
+                errorCode,
+                ...(traceId ? { traceId } : {}),
+              })
+              onEvent(_asEngineErrorEvent({
+                kind: 'error',
+                error: reason || SESSION_PERSIST_QUEUED_NOTICE,
+                errorCode: 'session_persist_unavailable',
+              }))
+            }
             if (settleAfter) settle(() => resolve())
           }
         })()
@@ -5377,8 +5893,12 @@ export class SessionManager {
             }
           }
           let persistenceAcknowledged = true
+          // E6 — 'queued'(queued_to_outbox)三态旁路:本地已可靠排队但权威库未
+          // 确认。不算 acknowledged(paid-turn 完成语义不变),但也不能静默不投递
+          // 终态 —— 那会让用户永远停在「思考中」。
+          let persistenceQueuedToOutbox = false
           let terminalErrorForClient: string | undefined
-          let terminalErrorCodeForClient: 'user_cancelled' | undefined
+          let terminalErrorCodeForClient: GatewayTerminalErrorCode | undefined
 
           // Detect stale --resume session id. CCB emits an error result with
           // `errors: ["No conversation found with session ID: <id>"]` when
@@ -5422,6 +5942,7 @@ export class SessionManager {
             this._resumeMapTimestamps.delete(session.sessionKey)
             this._resumeMapProvider.delete(session.sessionKey)
             this._resumeMapLastCost.delete(session.sessionKey)
+            this._resumeMapCostImprecise.delete(session.sessionKey)
             session.ccbSessionId = null
             runner.clearSessionId?.()
             this._saveResumeMap()
@@ -5764,12 +6285,21 @@ export class SessionManager {
           if (result) {
             terminalPersistenceClaim = 'complete'
             flushTerminalBilling()
-            const completedAssistant = combineRetryAssistantOutput(
+            const completedAssistantRaw = combineRetryAssistantOutput(
               retryAssistantSegments,
               result.assistantText,
               freezeSegments(result.assistantSegments, assistantMessageId),
               Date.now(),
             )
+            const completedAssistantText = emptyCompletedTurnAssistantText({
+              status: terminalOverride?.status ?? 'completed',
+              errorCode: terminalOverride?.errorCode,
+              assistantText: completedAssistantRaw.text,
+            })
+            const completedAssistant =
+              completedAssistantText === completedAssistantRaw.text
+                ? completedAssistantRaw
+                : { text: completedAssistantText, segments: completedAssistantRaw.segments }
             const completedThinking = combineRetryAssistantOutput(
               retryThinkingSegments,
               result.thinkingText,
@@ -5784,6 +6314,27 @@ export class SessionManager {
               ...retryStructuredBlocks.map((block) => structuredClone(block)),
               ...freezeStructuredBlocks(structuredBlocks),
             ]
+            const pricedUsd = await applyPlatformCostIfMissing({
+              model: session.model,
+              usage: result.usage,
+              sessionCostUsd: session.totalCostUSD,
+              prevCostUsd: prevCostUSD,
+              waiveReason: terminalOverride?.waiveReason,
+              agentId: session.agentId,
+              engine: session.providerTag,
+              isError: result.isError,
+              terminalBillingStatus:
+                terminalExternalBilling?.status ?? terminalEngineBilling?.status,
+            })
+            if (pricedUsd != null) {
+              session.totalCostUSD = prevCostUSD + pricedUsd
+              // Gateway-side catalog backfill is an estimate unless the engine
+              // reports vendor USD. Keep the estimate visible, but never present
+              // it as the exact master admission/ledger amount.
+              session.costImprecise = true
+            }
+            const resultUsageCost = result.usage as typeof result.usage & { costImprecise?: boolean }
+            if (resultUsageCost.costImprecise === true) session.costImprecise = true
             session.totalInputTokens += result.usage.inputTokens
             session.totalOutputTokens += result.usage.outputTokens
             session.totalCacheReadTokens += result.usage.cacheReadTokens
@@ -5878,10 +6429,14 @@ export class SessionManager {
             if (completedHasError) {
               terminalErrorForClient =
                 terminalOverride?.reason ?? result.errorDetail ?? 'engine reported an error'
+              // E4.2 — gateway 权威终态码透传:handleExit/tape 已正确分类的
+              // RUNNER_CRASHED / SERVICE_RESTART(以及 USER_CANCELLED、tape
+              // AUTH_ERROR / ENGINE_ERROR)不再被 server 侧原文正则压成
+              // upstream_failed。免单/静默恢复类码(LIVENESS_TIMEOUT 等)不在
+              // wire 枚举内,保持 undefined 走既有 classify 兜底。
               terminalErrorCodeForClient =
-                terminalOverride?.errorCode === 'USER_CANCELLED'
-                  ? 'user_cancelled'
-                  : undefined
+                _wireTerminalCodeForTape(terminalOverride?.errorCode) ??
+                (result.errorKind === 'auth' ? 'auth_error' : undefined)
             }
             if (
               MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
@@ -5918,7 +6473,9 @@ export class SessionManager {
               // dedupe. Threshold extended to "thinking-only" turns (Sonnet
               // 4.6 adaptive thinking that runs out of tokens before producing
               // assistant text) so those don't disappear either.
-              const persistence = persistServerAuthoredTurn({
+              // E6 — 用四态 Outcome 版本以识别 'queued'(queued_to_outbox):
+              // 布尔层语义不变(acked|skipped→true),queued 走下方降级终态旁路。
+              const persistenceOutcome = persistServerAuthoredTurnOutcome({
                 sessionKey: session.sessionKey,
                 peerId,
                 agentId: session.agentId,
@@ -5994,12 +6551,22 @@ export class SessionManager {
                   ? { engineBilling: terminalEngineBilling }
                   : {}),
               })
+              const persistence = persistenceOutcome.then(
+                (r) => r === 'acked' || r === 'skipped',
+              )
               this._trackPersistence(persistence)
               // Do not declare the paid turn complete until master has
               // durably finalized the immutable tape. A queued local spool is
               // safe but not yet refresh-visible, so it must not masquerade as
               // an acknowledged completion.
               persistenceAcknowledged = await persistence
+              // E6 的降级投递只针对**个人版本地 outbox**(queued_to_outbox):本地
+              // SQLite 即权威库,没有任何上游会替我们把终态送给用户。商用 v3 sink
+              // 的 'queued'(master 暂不可达)保持既有静默语义 —— master ACK 才是
+              // 权威终态,提前投递会与 master 侧恢复链路(reconnect replay)打架
+              // (契约测试锁此语义)。
+              persistenceQueuedToOutbox =
+                getV3MasterSinkOrNull() === null && (await persistenceOutcome) === 'queued'
             }
 
             // Unified turn-usage emit (eventPersist writes usage_log).
@@ -6068,15 +6635,32 @@ export class SessionManager {
               // 则透传给 server.ts 直接按码组 outbound.error;缺省 undefined →
               // server 侧回落 classifyRunError,行为不变。
               const preClassified = result?.errorClass
-              onEvent({
+              onEvent(_asEngineErrorEvent({
                 kind: 'error',
                 error: terminalErrorForClient,
                 ...(preClassified ? { errorClass: preClassified } : {}),
                 ...(terminalErrorCodeForClient ? { errorCode: terminalErrorCodeForClient } : {}),
-              })
+              }))
             } else if (pendingFinal) {
               onEvent(pendingFinal)
             }
+          } else if (persistenceQueuedToOutbox) {
+            // E6 — 落库进 outbox(权威库暂不可用):不算 acknowledged,但必须向
+            // 当前连接投递降级终态,否则用户永远停在「思考中」。发一个
+            // session_persist_unavailable 的 error 事件:server.ts 组结构化
+            // outbound.error(受控文案「回复已生成、暂存待落库」)+ 兼容 [error]
+            // final 终止器关闭本轮。已流式送达的正文气泡不受影响;outbox replay
+            // 落库后刷新可见全文。原始失败细节(若有)进事件 error 字段仅供日志。
+            log.warn('turn terminal delivered in degraded persist-queued mode', {
+              sessionKey: session.sessionKey,
+              turnIndex: session.turns,
+              ...(traceId ? { traceId } : {}),
+            })
+            onEvent(_asEngineErrorEvent({
+              kind: 'error',
+              error: terminalErrorForClient ?? SESSION_PERSIST_QUEUED_NOTICE,
+              errorCode: 'session_persist_unavailable',
+            }))
           }
           settle(() => resolve())
       }
@@ -6148,6 +6732,13 @@ export class SessionManager {
       runner.on('error', handleError)
       runner.on('exit', handleExit)
       runner.on('parse_error', handleParseError)
+      runner.on('spawn', handleSpawn)
+
+      // Engine not running yet → this turn pays a cold start (CCB ~20s
+      // bun+JSONL resume, codex app-server init, cursor/grok one-shot CLI
+      // every turn). Announce it before submit; the runner's own 'spawn'
+      // event upgrades starting→resuming once resume attribution is known.
+      if (!runner.isRunning) emitStartupPhase('engine_starting')
 
       // adapter 在 submitTurn 内构造 per-turn parser + telemetry(CCB 私有生命
       // 周期)并替换 stdout 路由目标 —— 旧 _currentMessageListener 的替换语义
@@ -6369,6 +6960,7 @@ export class SessionManager {
         this._resumeMapTimestamps.delete(sessionKey)
         this._resumeMapProvider.delete(sessionKey)
         this._resumeMapLastCost.delete(sessionKey)
+        this._resumeMapCostImprecise.delete(sessionKey)
         session.ccbSessionId = null
         session.runner.clearSessionId?.()
         this._saveResumeMap()
@@ -6435,6 +7027,7 @@ export class SessionManager {
       this._resumeMap.delete(sessionKey)
       this._resumeMapTimestamps.delete(sessionKey)
       this._resumeMapLastCost.delete(sessionKey)
+      this._resumeMapCostImprecise.delete(sessionKey)
       this._resumeMapProvider.delete(sessionKey)
       this._saveResumeMap()
     }
@@ -6486,6 +7079,7 @@ export class SessionManager {
     this._resumeMap.delete(sessionKey)
     this._resumeMapTimestamps.delete(sessionKey)
     this._resumeMapLastCost.delete(sessionKey)
+    this._resumeMapCostImprecise.delete(sessionKey)
     this._resumeMapProvider.delete(sessionKey)
     this._saveResumeMap()
   }
@@ -6603,6 +7197,7 @@ export class SessionManager {
               this._resumeMap.delete(key)
               this._resumeMapTimestamps.delete(key)
               this._resumeMapLastCost.delete(key)
+              this._resumeMapCostImprecise.delete(key)
               this._resumeMapProvider.delete(key)
             }
             // Medium#G1 + N11:shutdown 完才清 ring,保证不会有"runner 已死但 ring 还能
@@ -6628,6 +7223,7 @@ export class SessionManager {
   // `result` arrives (otherwise the parser would compute delta against 0 and
   // re-attribute the entire historical cumulative as this turn's cost).
   private _resumeMapLastCost = new Map<string, number>()
+  private _resumeMapCostImprecise = new Map<string, boolean>()
   // Idle TTL for entries whose in-memory AgentSession was already evicted.
   // 7 days covers typical gateway restarts / multi-day reconnect gaps while
   // preventing resume-map from growing unbounded. Rationale: resume-map exists
@@ -6647,6 +7243,7 @@ export class SessionManager {
         this._resumeMap.delete(key)
         this._resumeMapTimestamps.delete(key)
         this._resumeMapLastCost.delete(key)
+        this._resumeMapCostImprecise.delete(key)
         this._resumeMapProvider.delete(key)
         pruned = true
         log.info('pruned idle resume-map entry', {
