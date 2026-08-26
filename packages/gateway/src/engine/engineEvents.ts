@@ -57,6 +57,10 @@ export interface TurnRetryMeta {
  */
 export type EngineTurnPhase =
   | 'compacting'
+  | 'waiting_for_user'
+  // gateway-authored engine cold-start phases (sessionManager, not engine raw)
+  | 'engine_starting'
+  | 'engine_resuming'
   | null
   | { status: 'retrying'; retry: TurnRetryMeta }
   | { status: 'working'; detail?: string }
@@ -197,8 +201,18 @@ export type EngineContentEvent =
       kind: 'error'
       error: string
       errorClass?: ClassifiedErrorCode
-      /** Gateway-owned expected terminal code; never inferred from provider text. */
-      errorCode?: 'user_cancelled'
+      /** Gateway-owned expected terminal code; never inferred from provider text.
+       *  联合取值与 ccbMessageParser.GatewayTerminalErrorCode 逐字面量对齐(此处
+       *  内联而非 import:engine/ 权威源不反向依赖 gateway 编排层模块)。engine
+       *  原生只发 'user_cancelled';其余码由编排层(handleExit / tape 终态 /
+       *  持久化降级)盖章后经同一事件通道下发。 */
+      errorCode?:
+        | 'user_cancelled'
+        | 'runner_crashed'
+        | 'service_restart'
+        | 'engine_error'
+        | 'auth_error'
+        | 'session_persist_unavailable'
     }
   | { kind: 'permission_request'; request: PermissionRequest }
   // 当前 turn 的 backend-side 非流式阶段状态。CCB 由 stdout
@@ -207,6 +221,21 @@ export type EngineContentEvent =
   // `outbound.turn_status` 帧推给前端。受控枚举,不透传任意底座内部状态 —— 防协议
   // 被底座私有状态污染。审计 R3:retrying 形态已进权威类型,不再经 cast 穿透。
   | { kind: 'turn_status'; status: EngineTurnPhase }
+  // CCB local-agent bookend. Not a transcript block — sessionManager /
+  // server.ts consume it as a sideband to wake the parent session.
+  | {
+      kind: 'task_notification'
+      taskId: string
+      status: string
+      outputFile: string
+      summary: string
+      toolUseId?: string
+    }
+  | {
+      kind: 'task_notification_delivered'
+      taskId: string
+      deliveredBy: 'ccb-mid-turn'
+    }
 
 /**
  * EngineAdapter → sessionManager 的 canonical 事件模型。

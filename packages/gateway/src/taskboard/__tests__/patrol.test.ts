@@ -179,6 +179,36 @@ describe('端到端:需求单无人干预走到 waiting_human', () => {
   })
 })
 
+describe('阶段模型覆盖传到 delegate', () => {
+  it('stage 有 model 时 delegate 收到该 model', async () => {
+    const db = freshDb()
+    seedReadyAi(db, { model: 'glm-5.2' })
+    let seen: string | undefined
+    const eng = engine(db, async (input) => {
+      seen = input.model
+      return { ok: true, output: '本阶段已完成。对照 checklist 均有证据。' }
+    })
+    const report = await eng.tick(WORK)
+    assert.equal(report.started, 1, JSON.stringify(report))
+    assert.equal(seen, 'glm-5.2')
+    db.close()
+  })
+
+  it('stage 无 model 时 delegate 收到 undefined', async () => {
+    const db = freshDb()
+    seedReadyAi(db)
+    let seen: string | undefined = 'sentinel'
+    const eng = engine(db, async (input) => {
+      seen = input.model
+      return { ok: true, output: '本阶段已完成。对照 checklist 均有证据。' }
+    })
+    const report = await eng.tick(WORK)
+    assert.equal(report.started, 1, JSON.stringify(report))
+    assert.equal(seen, undefined)
+    db.close()
+  })
+})
+
 describe('lease 互斥', () => {
   it('已有未过期 lease 时本轮不双跑,只落一条 lease_held skipped', async () => {
     const db = freshDb()
@@ -729,6 +759,7 @@ function seedReadyAi(
     quietHoursEnd?: number
     maxRunsPerDay?: number
     entryCondition?: string | null
+    model?: string | null
   } = {},
 ): {
   ticket: ReturnType<typeof createTicket>
@@ -761,6 +792,7 @@ function seedReadyAi(
     onSuccess: stageOver.onSuccess ?? 'wait_human',
     onFailure: stageOver.onFailure ?? 'retry',
     entryCondition: stageOver.entryCondition ?? null,
+    model: stageOver.model ?? null,
   })
   const ticket = createTicket(db, {
     projectId: project.id,

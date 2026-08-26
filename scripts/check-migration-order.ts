@@ -108,6 +108,29 @@ export function listMigrationFiles(dir: string): { files: MigrationFile[]; probl
  * 只有「整组都是基线存量」的重号才放行(那几对已 apply 到生产,改不动了)。只要组里
  * 有一支是新迁移,就报 —— 包括新迁移去撞一个历史编号的情况。
  */
+/**
+ * 2026-08-26 双向同步前，两套已上线数据库各自占用了 0246/0247：
+ * commercial=ungate/open，selfhost=project-bind/opus48。两边 ledger 都已不可改写。
+ * 这里只豁免四个精确 version 组成的两组冲突；不豁免编号区间，也不允许第三支。
+ * 合并发布前仍须在双锁下交叉执行/验证并补齐另一条 lineage 的 ledger。
+ */
+const FROZEN_APPLIED_FORK_DUPLICATES = new Map<string, ReadonlySet<string>>([
+  ["0246", new Set([
+    "0246_chat_project_board_bind",
+    "0246_ungate_cursor_opus_fable_picker",
+  ])],
+  ["0247", new Set([
+    "0247_cursor_opus_48",
+    "0247_open_cursor_grok_opus48",
+  ])],
+]);
+
+function isFrozenAppliedForkDuplicate(number: string, versions: readonly string[]): boolean {
+  const expected = FROZEN_APPLIED_FORK_DUPLICATES.get(number);
+  if (expected === undefined || expected.size !== versions.length) return false;
+  return versions.every((version) => expected.has(version));
+}
+
 export function checkDuplicateNumbers(
   files: ReadonlyArray<MigrationFile>,
   baseline: Baseline,
@@ -122,6 +145,7 @@ export function checkDuplicateNumbers(
   for (const [number, versions] of byNumber) {
     if (versions.length < 2) continue;
     if (versions.every((v) => baseline.versions.has(v))) continue;
+    if (isFrozenAppliedForkDuplicate(number, versions)) continue;
     problems.push({
       rule: "R2",
       message:

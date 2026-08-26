@@ -10,7 +10,7 @@ import path, { join } from 'node:path'
 import { describe, test } from 'node:test'
 
 import type { OpenClaudeConfig } from '@openclaude/storage'
-import { GrokAdapter, readLatestGrokNativeHandoff } from '../engine/grokAdapter.js'
+import { GrokAdapter, readLatestGrokNativeHandoff, _internals } from '../engine/grokAdapter.js'
 import type { EngineBillingEvent, EngineEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 
@@ -52,7 +52,10 @@ describe('GrokAdapter', () => {
     const capture = path.join(dir, 'capture.json')
     await writeFile(fake, `#!/usr/bin/env node
 const fs = require('node:fs')
-fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv: process.argv.slice(2), env: {
+const argv = process.argv.slice(2)
+const promptFile = argv[argv.indexOf('--prompt-file') + 1]
+const prompt = fs.readFileSync(promptFile, 'utf8')
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, promptFile, promptMode: fs.statSync(promptFile).mode & 0o777, prompt, env: {
   XAI_API_KEY: process.env.XAI_API_KEY,
   GROK_XAI_API_BASE_URL: process.env.GROK_XAI_API_BASE_URL,
   GROK_CLI_CHAT_PROXY_BASE_URL: process.env.GROK_CLI_CHAT_PROXY_BASE_URL,
@@ -152,11 +155,14 @@ for (const event of [
         },
       }])
 
-      const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; env: Record<string, string> }
+      const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; promptFile: string; promptMode: number; prompt: string; env: Record<string, string> }
       assert.deepEqual(captured.argv.slice(0, 4), ['--agent', 'grok-build', '--model', 'grok-4.6'])
-      const prompt = captured.argv[captured.argv.indexOf('-p') + 1]
-      assert.match(prompt, /OpenClaude Platform Context \(Grok adapter\)/)
-      assert.match(prompt, /fix it/)
+      assert.match(captured.prompt, /OpenClaude Platform Context \(Grok adapter\)/)
+      assert.match(captured.prompt, /fix it/)
+      assert.equal(captured.promptMode, 0o600)
+      assert.equal(captured.argv.includes('-p'), false)
+      assert.equal(captured.argv.includes('--prompt-file'), true)
+      await assert.rejects(readFile(captured.promptFile), /ENOENT/)
       assert.ok(captured.argv.includes('--resume'))
       assert.equal(captured.argv[captured.argv.indexOf('--resume') + 1], 'prior-session')
       assert.equal(captured.argv[captured.argv.indexOf('--reasoning-effort') + 1], 'high')
@@ -170,6 +176,23 @@ for (const event of [
       assert.equal(captured.env.PATH, '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin')
       assert.equal(captured.env.OPENCLAUDE_V3_CONTAINER_TOKEN, undefined)
       assert.equal(captured.env.HTTPS_PROXY, undefined)
+      adapter.clearSessionId()
+      assert.equal(adapter.nativeSessionId, null)
+      const fresh = adapter.submitTurn({
+        input: 'continue fresh',
+        requestId: 'd'.repeat(32),
+        turnKey: 'e'.repeat(64),
+        assistantMessageId: 'asst-2',
+        thinkingMessageId: 'think-2',
+        onEvent: () => {},
+        sessionTotals: totals,
+        toolUseIdToName: new Map(),
+      })
+      await fresh.submitted
+      await fresh.summary
+      await adapter.waitForOutputDrain()
+      const freshCapture = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[] }
+      assert.equal(freshCapture.argv.includes('--resume'), false)
       const managedConfig = await readFile(path.join(captured.env.GROK_HOME, 'config.toml'), 'utf8')
       assert.match(managedConfig, /\[shell_environment_policy\]/)
       assert.match(managedConfig, /exclude = \["XAI_\*", "GROK_\*"\]/)
@@ -179,6 +202,52 @@ for (const event of [
       if (previousHome === undefined) delete process.env.OPENCLAUDE_HOME; else process.env.OPENCLAUDE_HOME = previousHome
       if (previousCapture === undefined) delete process.env.FAKE_GROK_CAPTURE; else process.env.FAKE_GROK_CAPTURE = previousCapture
       if (previousContainerToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN; else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = previousContainerToken
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('passes prompts larger than Linux MAX_ARG_STRLEN through a protected file', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-large-prompt-'))
+    const fake = path.join(dir, 'fake-grok.cjs')
+    const capture = path.join(dir, 'capture.json')
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const argv = process.argv.slice(2)
+const promptFile = argv[argv.indexOf('--prompt-file') + 1]
+const prompt = fs.readFileSync(promptFile, 'utf8')
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, promptFile, promptBytes: Buffer.byteLength(prompt) }))
+console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', usage: { input_tokens: 1, output_tokens: 1 } }))
+`)
+    await chmod(fake, 0o755)
+    const previousBin = process.env.OC_GROK_CLI_BIN
+    const previousCapture = process.env.FAKE_GROK_CAPTURE
+    process.env.OC_GROK_CLI_BIN = fake
+    process.env.FAKE_GROK_CAPTURE = capture
+    try {
+      const adapter = new GrokAdapter(createOpts(dir))
+      adapter.setGrokRoute({
+        baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+        routeToken: TOKEN,
+      })
+      adapter.on('error', () => {})
+      const largeInput = `large-prompt-sentinel:${'x'.repeat(256 * 1024)}`
+      const run = adapter.submitTurn({
+        input: largeInput,
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      assert.ok(await run.summary)
+      await adapter.waitForOutputDrain()
+      const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; promptFile: string; promptBytes: number }
+      assert.ok(captured.promptBytes > 256 * 1024)
+      assert.equal(JSON.stringify(captured.argv).includes('large-prompt-sentinel'), false)
+      await assert.rejects(readFile(captured.promptFile), /ENOENT/)
+    } finally {
+      restoreEnv('OC_GROK_CLI_BIN', previousBin)
+      restoreEnv('FAKE_GROK_CAPTURE', previousCapture)
       await rm(dir, { recursive: true, force: true })
     }
   })
@@ -426,7 +495,10 @@ test('projects openclaude-memory into GROK_HOME when a gateway token is present'
   const capture = path.join(dir, 'capture.json')
   await writeFile(fake, `#!/usr/bin/env node
 const fs = require('node:fs')
-fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv: process.argv.slice(2) }))
+const argv = process.argv.slice(2)
+const promptFile = argv[argv.indexOf('--prompt-file') + 1]
+const prompt = fs.readFileSync(promptFile, 'utf8')
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, prompt }))
 console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 } }))
 `)
   await chmod(fake, 0o755)
@@ -458,10 +530,9 @@ console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aa
     })
     await run.submitted
     await run.summary
-    const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[] }
-    const prompt = captured.argv[captured.argv.indexOf('-p') + 1]
-    assert.match(prompt, /use memory/)
-    assert.equal(prompt.includes('bearer-must-not-enter-argv'), false)
+    const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; prompt: string }
+    assert.match(captured.prompt, /use memory/)
+    assert.equal(captured.prompt.includes('bearer-must-not-enter-argv'), false)
     assert.equal(JSON.stringify(captured.argv).includes('bearer-must-not-enter-argv'), false)
     const managedConfig = await readFile(path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'config.toml'), 'utf8')
     assert.match(managedConfig, /\[mcp_servers\."openclaude-memory"\]/)
@@ -470,6 +541,223 @@ console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aa
       await readFile(path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'gateway-token'), 'utf8'),
       'bearer-must-not-enter-argv',
     )
+  } finally {
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
+    restoreEnv('FAKE_GROK_CAPTURE', previousCapture)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+async function waitUntil(pred: () => boolean, ms: number, label: string): Promise<void> {
+  const started = Date.now()
+  while (!pred()) {
+    if (Date.now() - started > ms) throw new Error(`timed out waiting for ${label}`)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+}
+
+test('refreshes lastActivityAt while the Grok CLI pid is alive even with no stdout', { timeout: 10_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-keepalive-'))
+  const fake = path.join(dir, 'fake-grok.cjs')
+  await writeFile(fake, `#!/usr/bin/env node
+setTimeout(() => {
+  console.log(JSON.stringify({
+    type: 'end',
+    stopReason: 'end_turn',
+    sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 },
+  }))
+}, 900)
+`)
+  await chmod(fake, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  process.env.OC_GROK_CLI_BIN = fake
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  _internals.setProcessKeepaliveTestHooks({ intervalMs: 40 })
+  try {
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    const activity = { count: 0 }
+    adapter.on('activity', () => { activity.count += 1 })
+    adapter.on('error', () => {})
+    const run = adapter.submitTurn({
+      input: 'think silently',
+      requestId: REQUEST_ID,
+      turnKey: TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run.submitted
+    await waitUntil(() => adapter.isRunning, 3_000, 'grok process running')
+    const activityAt = adapter.lastActivityAt
+    const countAfterStart = activity.count
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.ok(
+      activity.count - countAfterStart >= 2,
+      `expected periodic keepalive activity, got ${activity.count - countAfterStart} extra emits`,
+    )
+    assert.ok(adapter.lastActivityAt > activityAt, 'keepalive must refresh lastActivityAt')
+    const summary = await run.summary
+    await adapter.waitForOutputDrain()
+    assert.ok(summary)
+    const countAfterClose = activity.count
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    assert.equal(activity.count, countAfterClose, 'keepalive must stop after the CLI exits')
+  } finally {
+    _internals.setProcessKeepaliveTestHooks(null)
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('late close of an abandoned Grok turn does not stop the next turn keepalive', { timeout: 10_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-keepalive-late-'))
+  const hanging = path.join(dir, 'fake-grok-hanging.cjs')
+  await writeFile(hanging, `#!/usr/bin/env node
+setInterval(() => {}, 1000)
+`)
+  await chmod(hanging, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  const previousGrace = process.env.OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS
+  const previousFinal = process.env.OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS
+  process.env.OC_GROK_CLI_BIN = hanging
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  process.env.OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS = '80'
+  process.env.OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS = '80'
+  _internals.setProcessKeepaliveTestHooks({ intervalMs: 40 })
+  const adapter = new GrokAdapter(createOpts(dir))
+  adapter.setGrokRoute({
+    baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+    routeToken: TOKEN,
+  })
+  adapter.on('error', () => {})
+  try {
+    const abandoned = adapter.submitTurn({
+      input: 'abandoned hang',
+      requestId: REQUEST_ID,
+      turnKey: TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await abandoned.submitted
+    await waitUntil(() => adapter.isRunning, 3_000, 'first grok running')
+    adapter.interrupt()
+    await adapter.shutdown()
+
+    const live = adapter.submitTurn({
+      input: 'live hang',
+      requestId: REQUEST_ID,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await live.submitted
+    await waitUntil(() => adapter.isRunning, 3_000, 'second grok running')
+    const activity = { count: 0 }
+    adapter.on('activity', () => { activity.count += 1 })
+    const activityAt = adapter.lastActivityAt
+    await new Promise((resolve) => setTimeout(resolve, 180))
+    assert.ok(adapter.lastActivityAt > activityAt, 'live turn keepalive must keep ticking after abandoned close')
+    assert.ok(activity.count >= 2, `expected live keepalive emits, got ${activity.count}`)
+    live.end()
+    await adapter.shutdown()
+  } finally {
+    _internals.setProcessKeepaliveTestHooks(null)
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
+    restoreEnv('OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS', previousGrace)
+    restoreEnv('OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS', previousFinal)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// ── P0-2:图片等 base64 二进制 block 绝不 stringify 进纯文本 prompt ──
+test('promptText replaces image blocks with a placeholder and never leaks base64', () => {
+  const base64 = 'aVZCT1J3MEtHZ29BQUFBTlNVaEVVZw=='.repeat(64)
+  const prompt = _internals.promptText([
+    { type: 'text', text: 'describe this image' },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } },
+    { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
+    { type: 'tool_result', content: 'structured-passthrough' },
+  ])
+  assert.ok(prompt.includes('describe this image'))
+  assert.ok(prompt.includes('图片附件已省略'), '占位提示必须出现在 prompt 里')
+  assert.ok(!prompt.includes(base64.slice(0, 48)), 'base64 数据绝不进 prompt')
+  assert.ok(prompt.includes('structured-passthrough'), '非二进制结构化 block 维持 stringify')
+})
+
+// ── P0-2 全链路:占位进 prompt + 用户可见提示先于模型输出 ──
+test('omits image blocks from the spawned prompt and surfaces a visible user notice', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-image-'))
+  const fake = path.join(dir, 'fake-grok.cjs')
+  const capture = path.join(dir, 'capture.json')
+  await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const argv = process.argv.slice(2)
+const promptFile = argv[argv.indexOf('--prompt-file') + 1]
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ prompt: fs.readFileSync(promptFile, 'utf8') }))
+console.log(JSON.stringify({ type: 'text', data: 'model reply' }))
+console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 } }))
+`)
+  await chmod(fake, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  const previousCapture = process.env.FAKE_GROK_CAPTURE
+  process.env.OC_GROK_CLI_BIN = fake
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  process.env.FAKE_GROK_CAPTURE = capture
+  try {
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    adapter.on('error', () => {})
+    const events: EngineEvent[] = []
+    const base64 = 'aVZCT1J3MEtHZ29BQUFBTlNVaEVVZw=='.repeat(64)
+    const run = adapter.submitTurn({
+      input: [
+        { type: 'text', text: 'describe this image' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } },
+      ],
+      requestId: REQUEST_ID,
+      turnKey: TURN_KEY,
+      assistantMessageId: 'asst-img',
+      onEvent: (event) => events.push(event),
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run.submitted
+    const summary = await run.summary
+    await adapter.waitForOutputDrain()
+
+    const captured = JSON.parse(await readFile(capture, 'utf8')) as { prompt: string }
+    assert.ok(!captured.prompt.includes(base64.slice(0, 48)), 'base64 数据绝不进 prompt')
+    assert.ok(captured.prompt.includes('图片附件已省略'), 'prompt 含占位提示')
+    assert.ok(captured.prompt.includes('describe this image'))
+
+    const textBlocks = events.filter(
+      (event) => event.kind === 'block' && event.block.kind === 'text',
+    )
+    assert.ok(textBlocks.length >= 2, '提示 block + 模型输出 block')
+    const first = textBlocks[0]!
+    assert.ok(first.kind === 'block' && first.block.kind === 'text')
+    assert.ok(first.block.text.includes('图片附件已省略'), '用户可见提示先于模型输出')
+    assert.equal(first.block.messageId, 'asst-img-s0')
+
+    assert.ok(summary)
+    assert.ok(summary.assistantText.includes('图片附件已省略'), '提示进入持久化 assistantText')
+    assert.ok(summary.assistantText.includes('model reply'))
+    assert.equal(summary.assistantSegments.length, 2, '提示独占 s0,模型输出另起 s1')
   } finally {
     restoreEnv('OC_GROK_CLI_BIN', previousBin)
     restoreEnv('OPENCLAUDE_HOME', previousHome)

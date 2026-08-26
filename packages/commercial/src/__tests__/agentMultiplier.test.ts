@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import {
   composeMultiplier,
   getAgentCostMultiplier,
+  listAgentCostOverrides,
   _resetAgentMultiplierCacheForTests,
 } from "../billing/agentMultiplier.js";
 import type { Pool } from "pg";
@@ -165,6 +166,29 @@ describe("getAgentCostMultiplier", () => {
       },
     } as unknown as Pool;
     await assert.rejects(() => getAgentCostMultiplier(pool, "codex"), /connection refused/);
+  });
+
+  test("listAgentCostOverrides 空表 → {}", async () => {
+    const pool = {
+      query: async () => ({ rows: [], rowCount: 0 }),
+    } as unknown as Pool;
+    assert.deepEqual(await listAgentCostOverrides(pool), {});
+  });
+
+  test("listAgentCostOverrides 全表映射", async () => {
+    const pool = {
+      query: async () => ({
+        rows: [
+          { agent_id: "coding-assistant", cost_multiplier: "1.500" },
+          { agent_id: "explorer", cost_multiplier: "0.800" },
+        ],
+        rowCount: 2,
+      }),
+    } as unknown as Pool;
+    assert.deepEqual(await listAgentCostOverrides(pool), {
+      "coding-assistant": "1.500",
+      explorer: "0.800",
+    });
   });
 
   test("SQL 参数化:agentId 走 $1 占位符", async () => {

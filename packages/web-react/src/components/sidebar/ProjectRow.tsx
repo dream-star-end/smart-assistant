@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Folder, MoreHorizontal } from "lucide-react";
+import { ChevronDown, ChevronRight, Folder, MoreHorizontal, Plus } from "lucide-react";
 import type { DragEvent } from "react";
 import type { ChatProject } from "../../lib/types";
 import { cn } from "../../lib/utils";
@@ -30,6 +30,8 @@ export function ProjectRow({
   onDelete,
   onOpenSettings,
   onOpenAssets,
+  /** 在该项目下直接新建会话（非 default 组才由 Sidebar 传入）。 */
+  onNewSession,
   onMoveUp,
   onMoveDown,
   onDragOverSession,
@@ -57,6 +59,8 @@ export function ProjectRow({
   onOpenSettings?: (p: ChatProject) => void;
   /** 虚拟 default 组专用：菜单只含「项目资产」。 */
   onOpenAssets?: (p: ChatProject) => void;
+  /** 在该项目下直接新建会话；default 组不传（顶部「新建会话」已覆盖未分类）。 */
+  onNewSession?: () => void;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
   onDragOverSession: (e: DragEvent) => void;
@@ -135,6 +139,19 @@ export function ProjectRow({
         )}
         <span className="shrink-0 text-caption text-faint">{count}</span>
       </button>
+      {onNewSession && (
+        <IconButton
+          aria-label={`在 ${p.name} 新建会话`}
+          title="新建会话"
+          variant="muted"
+          size="xs"
+          shape="square"
+          className="shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+          onClick={onNewSession}
+        >
+          <Plus size={13} />
+        </IconButton>
+      )}
       {showMenu && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -149,6 +166,17 @@ export function ProjectRow({
             </IconButton>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-44">
+            {onNewSession && (
+              <DropdownMenuItem
+                className="[@media(hover:none)]:min-h-11"
+                onSelect={() => onNewSession()}
+              >
+                新建会话
+              </DropdownMenuItem>
+            )}
+            {onNewSession && (onOpenSettings || onRename || showMoveInMenu || onDelete) && (
+              <DropdownMenuSeparator />
+            )}
             {showAssetsOnlyMenu && (
               <DropdownMenuItem
                 className="[@media(hover:none)]:min-h-11"

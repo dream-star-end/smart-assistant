@@ -27,6 +27,39 @@ import type { ClassifiedErrorCode } from './errorClassify.js'
 import type { SdkMessage } from './subprocessRunner.js'
 import { extractCcbNativeCompactionSummary } from './ccbNativeCompaction.js'
 
+function taskNotificationDeliveredEvent(raw: Record<string, any>): SessionStreamEvent | null {
+  const taskId = typeof raw.task_id === 'string' ? raw.task_id.trim() : ''
+  if (!taskId) return null
+  return {
+    kind: 'task_notification_delivered',
+    taskId,
+    deliveredBy: 'ccb-mid-turn',
+  }
+}
+
+function taskNotificationEvent(raw: Record<string, any>): SessionStreamEvent | null {
+  const taskId = typeof raw.task_id === 'string' ? raw.task_id.trim() : ''
+  if (!taskId) return null
+  const event: {
+    kind: 'task_notification'
+    taskId: string
+    status: string
+    outputFile: string
+    summary: string
+    toolUseId?: string
+  } = {
+    kind: 'task_notification',
+    taskId,
+    status: typeof raw.status === 'string' && raw.status ? raw.status : 'completed',
+    outputFile: typeof raw.output_file === 'string' ? raw.output_file : '',
+    summary: typeof raw.summary === 'string' ? raw.summary : '',
+  }
+  if (typeof raw.tool_use_id === 'string' && raw.tool_use_id) {
+    event.toolUseId = raw.tool_use_id
+  }
+  return event
+}
+
 function bashOutputTailBlock(raw: Record<string, any>): OutboundContentBlock | null {
   const toolUseId = raw.tool_use_id
   if (typeof toolUseId !== 'string' || toolUseId.length === 0) return null
@@ -55,6 +88,35 @@ export type {
   TurnRetryMeta,
   TurnToolEntry,
 } from './engine/engineEvents.js'
+
+/**
+ * Gateway 权威终态码(wire OutboundError.code 的预分类子集)。engine 底座只发射
+ * user_cancelled;其余由 gateway 编排层(sessionManager handleExit / tape 终态 /
+ * 持久化降级)在 engine 边界之外盖章,server.ts `_buildEngineErrorFrame` 原样
+ * 透传上 wire,不再压成 upstream_failed(E4)。
+ *
+ * 类型边界说明:engine 权威事件类型(engineEvents.ts,engine/ 所有权边界内不改)
+ * 的 error 事件 `errorCode` 只声明 'user_cancelled'。gateway 编排层发射其余码时
+ * 经 sessionManager 的 `_asEngineErrorEvent` 单点受控 cast 进同一事件通道;
+ * 消费端 `_buildEngineErrorFrame` 以下方 GatewayEngineErrorEvent 形状接收。
+ */
+export type GatewayTerminalErrorCode =
+  | 'user_cancelled'
+  | 'runner_crashed'
+  | 'service_restart'
+  | 'engine_error'
+  | 'auth_error'
+  | 'session_persist_unavailable'
+
+/** error 事件的 gateway 侧加宽形状(errorCode 扩到 GatewayTerminalErrorCode)。
+ *  engine 原生 error 事件 ⊆ 本类型('user_cancelled' ⊆ 加宽联合),server 侧
+ *  消费统一按此形状,零精度损失。 */
+export type GatewayEngineErrorEvent = Omit<
+  Extract<SessionStreamEvent, { kind: 'error' }>,
+  'errorCode'
+> & {
+  errorCode?: GatewayTerminalErrorCode
+}
 
 /**
  * 审计 R3 前的本地加宽类型收敛为**权威类型的兼容别名**。
@@ -522,6 +584,29 @@ export class CcbMessageParser {
    * from SubprocessRunner.
    */
   parse(msg: SdkMessage): void {
+    const rawEarly = msg as any
+    // Independent of turn lifetime: task_notification is a sideband, not a
+    // transcript block, and must survive finalize (same privilege as
+    // bash_output_tail). Never captureRuntimeEvent — that tape belongs to
+    // the dead turn.
+    if (rawEarly?.type === 'system' && rawEarly?.subtype === 'task_notification') {
+      try {
+        const event = taskNotificationEvent(rawEarly)
+        if (event) this.onEvent(event)
+      } catch (err) {
+        this.onEvent({ kind: 'error', error: String(err) })
+      }
+      return
+    }
+    if (rawEarly?.type === 'system' && rawEarly?.subtype === 'task_notification_delivered') {
+      try {
+        const event = taskNotificationDeliveredEvent(rawEarly)
+        if (event) this.onEvent(event)
+      } catch (err) {
+        this.onEvent({ kind: 'error', error: String(err) })
+      }
+      return
+    }
     if (this.finalized) {
       // bash_output_tail 是 CCB 的后台 bash keepalive 信号:TaskOutput 1Hz
       // poller 在跨 turn 的整个 bash 生命周期内持续 emit。它不修改 parser
@@ -650,9 +735,15 @@ export class CcbMessageParser {
     }
 
     // ── system messages ──
-    // Most system subtypes (init / success / error / task_*) are ignored by
-    // the gateway; CCB emits them for SDK consumers like VS Code and Scuttle
-    // that listen on stdout directly. We surface a small whitelist:
+    // Most system subtypes (init / success / error / task_started /
+    // task_progress) are ignored by the gateway; CCB emits them for SDK
+    // consumers like VS Code and Scuttle that listen on stdout directly.
+    // We surface a small whitelist:
+    //   - `task_notification` — handled at parse() entry (even after
+    //     finalize) as an independent `kind:'task_notification'` event,
+    //     never a transcript block.
+    //   - `task_notification_delivered` — CCB mid-turn ack; same sideband
+    //     privilege as task_notification so finalize cannot drop it.
     //   - `bash_output_tail` — 1 Hz snapshot tail of long-running Bash output,
     //     routed via OutboundContentBlock 'tool_output_tail' (see protocol).
     //   - `status` — coarse non-streaming turn phase (currently only
@@ -692,8 +783,8 @@ export class CcbMessageParser {
         // 侧信道)。除这两类显式识别的形态外,任何其它值 normalize 到 null ——
         // 防止未来底座加新 status 字面量时,gateway 没有显式 mapping 就把未审过
         // 的字符串塞给前端。
-        if (raw.status === 'compacting') {
-          this.onEvent({ kind: 'turn_status', status: 'compacting' })
+        if (raw.status === 'compacting' || raw.status === 'waiting_for_user') {
+          this.onEvent({ kind: 'turn_status', status: raw.status })
         } else if (raw.status === 'retrying') {
           const retry = normalizeTurnRetry(raw.retry)
           if (retry) {

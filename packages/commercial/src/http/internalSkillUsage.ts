@@ -19,7 +19,7 @@ import {
 } from '../auth/containerIdentity.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
-export const SKILL_USAGE_PATH = '/internal/v3/marketplace/skill-usage'
+export { SKILL_USAGE_PATH } from '@openclaude/protocol'
 
 /**
  * 门控(与容器侧 skillUsageReporter 同名 env,双端一致):**默认开**,显式 '0' 才关。

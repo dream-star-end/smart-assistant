@@ -36,6 +36,10 @@ describe("cursorQuota", () => {
     );
     assert.deepEqual(
       planCursorQuotaUpdates(rows, [{ slot: 1, result: "fail" }], "other_models", "AUTH_UNAVAILABLE"),
+      [],
+    );
+    assert.deepEqual(
+      planCursorQuotaUpdates(rows, [{ slot: 1, result: "fail_quota" }], "other_models", null),
       [{ id: 3n, from: "unknown", to: "cursor_only" }],
     );
     assert.deepEqual(
@@ -78,15 +82,16 @@ describe("cursorQuota", () => {
 
   test("learns Other Models only", () => {
     assert.equal(nextCursorQuotaClass("unknown", "ok", "other_models"), "other_ok");
-    assert.equal(nextCursorQuotaClass("unknown", "fail_auth", "other_models"), "cursor_only");
+    assert.equal(nextCursorQuotaClass("unknown", "fail_auth", "other_models"), "unknown");
+    assert.equal(nextCursorQuotaClass("unknown", "fail_quota", "other_models"), "cursor_only");
     assert.equal(nextCursorQuotaClass("unknown", "fail", "other_models"), "unknown");
     assert.equal(nextCursorQuotaClass("unknown", "fail_auth", "cursor_models"), "unknown");
     assert.equal(nextCursorQuotaClass("cursor_only", "ok", "other_models"), "other_ok");
   });
 
-  test("bare fail inherits the turn terminal code", () => {
-    assert.equal(coerceSlotFail("fail", "AUTH_UNAVAILABLE"), "fail_auth");
-    assert.equal(coerceSlotFail("fail", "QUOTA_UNAVAILABLE"), "fail_quota");
+  test("bare fail never inherits a turn-level terminal code", () => {
+    assert.equal(coerceSlotFail("fail", "AUTH_UNAVAILABLE"), "fail");
+    assert.equal(coerceSlotFail("fail", "QUOTA_UNAVAILABLE"), "fail");
     assert.equal(coerceSlotFail("fail", "ENGINE_ERROR"), "fail");
     assert.equal(coerceSlotFail("ok", "AUTH_UNAVAILABLE"), "ok");
   });
@@ -101,5 +106,27 @@ describe("cursorQuota", () => {
     const map = parseQuotaClassSidecar(text);
     assert.equal(map.get("api-key"), "cursor_only");
     assert.equal(map.get("api-key.2"), "unknown");
+  });
+});
+
+import {
+  parseSandModeSidecar,
+  renderSandModeSidecar,
+} from "./cursorQuota.js";
+
+describe("sand mode sidecar", () => {
+  test("renders and parses sidecar round-trip", () => {
+    const rendered = renderSandModeSidecar([
+      { name: "api-key", sandEnabled: true },
+      { name: "api-key.2", sandEnabled: false },
+    ]);
+    assert.match(rendered, /^# sand-mode v1\n/);
+    assert.match(rendered, /api-key 1/);
+    assert.match(rendered, /api-key\.2 0/);
+
+    const parsed = parseSandModeSidecar(rendered);
+    assert.equal(parsed.get("api-key"), true);
+    assert.equal(parsed.get("api-key.2"), false);
+    assert.equal(parsed.get("api-key.3"), undefined);
   });
 });

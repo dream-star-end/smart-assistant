@@ -509,10 +509,75 @@ export function getCommandsByMaxPriority(
  * Remote Control bridge messages (`bridgeOrigin`) that are re-validated later
  * through isBridgeSafeCommand().
  */
+/**
+ * Between-turn drain (print.ts drainCommandQueue) must not consume
+ * task-notification — that would start a second ask() after the parent
+ * turn has already finalized. Mid-turn drain in query.ts is the only
+ * CCB consumer.
+ */
+export function isBetweenTurnDrainable(cmd: QueuedCommand): boolean {
+  return cmd.mode !== 'task-notification'
+}
+
+/** Main thread owns unscoped commands; agent-scoped items stay for that agent. */
+export function isMainThreadQueuedCommand(cmd: QueuedCommand): boolean {
+  return cmd.agentId === undefined
+}
+
+export function taskIdFromQueuedCommand(cmd: QueuedCommand): string {
+  if (typeof cmd.taskId === 'string' && cmd.taskId.trim()) {
+    return cmd.taskId.trim()
+  }
+  if (typeof cmd.value !== 'string') return ''
+  const match =
+    cmd.value.match(/<task-id>([^<]+)<\/task-id>/i) ||
+    cmd.value.match(/<task_id>([^<]+)<\/task_id>/i)
+  return match?.[1]?.trim() || ''
+}
+
+/**
+ * Drop leftover main-thread task-notification items at turn end.
+ * Agent-scoped items stay for that agent's mid-turn drain (or its
+ * lifecycle cleanup). Do not emit a delivered ack — the gateway
+ * injects when no ack arrives.
+ */
+export function removeUnconsumedTaskNotifications(): QueuedCommand[] {
+  return removeByFilter(
+    cmd => cmd.mode === 'task-notification' && isMainThreadQueuedCommand(cmd),
+  )
+}
+
 export function isSlashCommand(cmd: QueuedCommand): boolean {
   return (
     typeof cmd.value === 'string' &&
     cmd.value.trim().startsWith('/') &&
     (!cmd.skipSlashCommands || cmd.bridgeOrigin === true)
   )
+}
+
+/**
+ * Mid-turn drain snapshot at a tool-result boundary.
+ *
+ * Matches query.ts historical behavior (now/next always; later only after
+ * Sleep) plus an insurance hatch: `mode === 'task-notification'` is included
+ * even when this round never called Sleep. Missing priority is treated as
+ * `'next'`, same as getCommandsByMaxPriority.
+ *
+ * Agent scoping is preserved: main thread only takes agentId === undefined;
+ * subagents only take task-notifications addressed to them.
+ */
+export function selectMidTurnDrainCommands(opts: {
+  sleepRan: boolean
+  isMainThread: boolean
+  currentAgentId?: string
+}): QueuedCommand[] {
+  return getCommandsByMaxPriority('later').filter(cmd => {
+    if (isSlashCommand(cmd)) return false
+    if (!opts.sleepRan && cmd.mode !== 'task-notification') {
+      const priority = cmd.priority ?? 'next'
+      if (priority === 'later') return false
+    }
+    if (opts.isMainThread) return isMainThreadQueuedCommand(cmd)
+    return cmd.mode === 'task-notification' && cmd.agentId === opts.currentAgentId
+  })
 }

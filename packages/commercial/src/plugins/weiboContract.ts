@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { WEIBO_WORKER_SOURCE } from './weiboWorkerSource.js'
 
 export const WEIBO_PLUGIN_SLUG = 'weibo'
-export const WEIBO_PLUGIN_VERSION = '1.5.0'
+export const WEIBO_PLUGIN_VERSION = '1.6.36'
 export const WEIBO_WORKER_DIGEST = createHash('sha256').update(WEIBO_WORKER_SOURCE).digest('hex')
 export const WEIBO_DRIVER_ID = `weibo-${WEIBO_WORKER_DIGEST.slice(0, 57)}`
 export const WEIBO_DRIVER_VERSION = WEIBO_PLUGIN_VERSION
@@ -257,6 +257,7 @@ export const WEIBO_NETWORK_ORIGINS = Object.freeze([
   'https://wx2.sinaimg.cn',
   'https://wx3.sinaimg.cn',
   'https://wx4.sinaimg.cn',
+  'https://picupload.weibo.com',
 ])
 
 export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
@@ -626,13 +627,14 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'create_post',
-      description: '使用当前真实微博身份发布文字或图片微博（默认逐次确认；账号授权后可免确认）',
+      description:
+        '使用当前真实微博身份发布文字、图片或带图长文微博（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 600,
       params: {
         type: 'object',
         properties: {
-          text: { type: 'string', maxLength: 2_000 },
+          text: { type: 'string', maxLength: 20_000 },
           images: { type: 'array', maxItems: 9, items: mediaPathSchema },
           mediaManifest: { type: 'array', maxItems: 9, items: sealedImageSchema },
         },
@@ -851,14 +853,14 @@ if (COMPILED_WEIBO_PLUGIN.pluginType !== 'managed-browser')
   throw new Error('Weibo Plugin contract subtype mismatch')
 
 /**
- * The production v1.4 account-state contract is unchanged in v1.5. No other
+ * The production v1.6.14 account-state contract is unchanged in v1.6.15. No other
  * historical or user-published Weibo artifact is eligible for this upgrade.
  */
 export const WEIBO_SETUP_COMPATIBLE_PREDECESSORS = Object.freeze([
   Object.freeze({
-    version: '1.4.0',
-    artifactHash: 'e43d0e981530dc05623fd3acf920356ef65b9a172df94c0c8f9f1c93f8a11f2c',
-    execContractHash: '328f01e5e0018bfdb2ac69343c0d0e770cb672a3d917022b5efeeaf86eb952dc',
+    version: '1.6.14',
+    artifactHash: 'add60919dfd77461526ae543be1d17d70b6ab866bfff6a4bc988eacf8d1631e4',
+    execContractHash: 'fb30fd3d06fa10b3ffff9eb2b25dd644ee2a9454f8c12fd55bd7d05b2188359c',
   }),
 ])
 

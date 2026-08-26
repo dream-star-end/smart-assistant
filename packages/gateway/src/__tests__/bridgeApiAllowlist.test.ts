@@ -139,6 +139,37 @@ describe('bridge API allowlist', () => {
       '/api/board/projects/:id/board',
     )
     assert.equal(
+      matchCommercialContainerApiProxy('/api/board/projects/OCV5/context', 'GET')?.label,
+      '/api/board/projects/:id/context',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/projects/OCV5/context/preview', 'GET')?.label,
+      '/api/board/projects/:id/context/preview',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/projects/OCV5/memories', 'POST')?.label,
+      '/api/board/projects/:id/memories',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy(
+        '/api/board/projects/OCV5/memories/c1/promote',
+        'POST',
+      )?.label,
+      '/api/board/projects/:id/memories/:id/:action',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/projects/OCV5/memories/c1', 'GET')?.label,
+      '/api/board/projects/:id/memories/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/projects/OCV5/memories/c1', 'POST'),
+      null,
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/runs/r1/context', 'GET')?.label,
+      '/api/board/runs/:id/context',
+    )
+    assert.equal(
       matchCommercialContainerApiProxy('/api/board/tickets', 'GET')?.label,
       '/api/board/tickets',
     )

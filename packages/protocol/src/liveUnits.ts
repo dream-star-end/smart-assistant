@@ -77,6 +77,7 @@ export type LiveUnit = {
   runId?: string
   agentId?: string
   goal?: string
+  jobId?: string
   phase?: string
   completed?: boolean
   children?: LiveChildBlock[]
@@ -189,7 +190,69 @@ function goalKey(raw: string): string {
   return raw.replace(/\r\n?/g, '\n').trim().slice(0, 1024)
 }
 
-/** Align with web reducer `parseDelegateToolInfo` (singular delegate_task only). */
+/** Align with web reducer `parseDelegateToolInfo` (delegate_task + send_to_agent). */
+function isDelegateGroupOp(op: string): boolean {
+  return op === 'delegate_task' || op === 'send_to_agent'
+}
+
+function parseJsonRecord(raw: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null
+  } catch {
+    return null
+  }
+}
+
+function mcpWrapperTexts(obj: Record<string, unknown>): string[] {
+  const result = obj.result && typeof obj.result === 'object' && !Array.isArray(obj.result)
+    ? (obj.result as Record<string, unknown>)
+    : null
+  const content = Array.isArray(result?.content) ? result.content : []
+  return content
+    .map((part) =>
+      part && typeof part === 'object' ? str((part as Record<string, unknown>).text) : '',
+    )
+    .filter(Boolean)
+}
+
+function isRunningStatusPayload(raw: unknown): boolean {
+  const obj =
+    raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : typeof raw === 'string'
+        ? parseJsonRecord(raw.trim())
+        : null
+  if (!obj) return false
+  if (obj.status === 'running') return true
+  for (const text of mcpWrapperTexts(obj)) {
+    const inner = parseJsonRecord(text)
+    if (inner?.status === 'running') return true
+  }
+  return false
+}
+
+function runningToolJobId(block: Record<string, unknown>): string {
+  for (const raw of [block.outputJson, block.output]) {
+    const obj = raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? raw as Record<string, unknown>
+      : typeof raw === 'string' ? parseJsonRecord(raw.trim()) : null
+    if (!obj) continue
+    if (typeof obj.jobId === 'string') return obj.jobId
+    for (const text of mcpWrapperTexts(obj)) {
+      const inner = parseJsonRecord(text)
+      if (typeof inner?.jobId === 'string') return inner.jobId
+    }
+  }
+  return ''
+}
+
+function isRunningToolResult(block: Record<string, unknown>): boolean {
+  return isRunningStatusPayload(block.outputJson) || isRunningStatusPayload(block.output)
+}
+
 function parseDelegateToolInfo(
   toolName: string,
   inputJson: unknown,
@@ -199,17 +262,17 @@ function parseDelegateToolInfo(
   const input = parseJsonObject(inputJson) ?? parseJsonObject(inputPreview) ?? {}
   const fromArgs = (args: Record<string, unknown>) => ({
     agentId: str(args.agentId) || 'main',
-    goalRaw: str(args.goal),
+    goalRaw: str(args.goal) || str(args.message),
   })
   const mcp = parseMcpToolName(name)
-  if (mcp?.server === 'openclaude-memory' && mcp.op === 'delegate_task') return fromArgs(input)
-  if (/(?:^|_)delegate_task$/.test(name) && parseCodexTypeName(name) !== 'mcpToolCall') {
+  if (mcp?.server === 'openclaude-memory' && isDelegateGroupOp(mcp.op)) return fromArgs(input)
+  if (/(?:^|_)(delegate_task|send_to_agent)$/.test(name) && parseCodexTypeName(name) !== 'mcpToolCall') {
     return fromArgs(input)
   }
   if (parseCodexTypeName(name) !== 'mcpToolCall') return null
   const server = normalizeMcpServerName(str(input.server) || str(input.serverName))
   const op = str(input.tool) || str(input.toolName) || str(input.name)
-  if (server !== 'openclaude-memory' || op !== 'delegate_task') return null
+  if (server !== 'openclaude-memory' || !isDelegateGroupOp(op)) return null
   const rawArgs = input.arguments ?? input.args ?? input.params
   return fromArgs(parseJsonObject(rawArgs) ?? {})
 }
@@ -219,6 +282,14 @@ function bindDelegateRunToGroup(
   block: Record<string, unknown>,
   runId: string,
 ): MutableUnit | null {
+  const jobId = str(block.jobId)
+  if (jobId) {
+    const exact = units.filter((u) => u.kind === 'agent_group' && !u.runId && u.jobId === jobId)
+    if (exact.length === 1) {
+      exact[0]!.runId = runId
+      return exact[0]!
+    }
+  }
   const agentId = str(block.agentId)
   const goal = goalKey(str(block.goal))
   if (!agentId || !goal) return null
@@ -588,11 +659,36 @@ function reduceLiveFramesOnto(
         unit.output = str(block.output) || str(block.preview) || unit.output
         if (block.outputJson !== undefined) unit.outputJson = block.outputJson
         unit.error = !!block.isError
-        unit.open = false
-        if (unit.kind === 'agent_group') unit.completed = true
         unit.seqLast = meta.seq
         unit.recordIdLast = frame.recordId
         unit.payloadRef = meta.ref
+        if (unit.kind === 'agent_group' && isRunningToolResult(block)) {
+          unit.open = true
+          unit.completed = false
+          const jobId = runningToolJobId(block)
+          if (jobId) {
+            unit.jobId = jobId
+            const standaloneIndex = units.findIndex((candidate) =>
+              candidate !== unit && candidate.kind === 'agent_group' &&
+              candidate.jobId === jobId && typeof candidate.runId === 'string',
+            )
+            if (standaloneIndex >= 0) {
+              const standalone = units[standaloneIndex]!
+              unit.runId = standalone.runId
+              unit.phase = standalone.phase
+              unit.children = [...(standalone.children ?? []), ...(unit.children ?? [])]
+              if (standalone.seqFirst < unit.seqFirst) {
+                unit.seqFirst = standalone.seqFirst
+                unit.recordIdFirst = standalone.recordIdFirst
+              }
+              groups.set(standalone.runId!, unit)
+              units.splice(standaloneIndex, 1)
+            }
+          }
+        } else {
+          unit.open = false
+          if (unit.kind === 'agent_group') unit.completed = true
+        }
       }
       continue
     }
@@ -635,6 +731,7 @@ function reduceLiveFramesOnto(
           runId,
           agentId: str(block.agentId),
           goal: str(block.goal),
+          jobId: str(block.jobId) || undefined,
           phase: str(block.phase),
           children: [],
           completed: false,

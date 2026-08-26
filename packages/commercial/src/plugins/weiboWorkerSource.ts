@@ -1,6 +1,15 @@
 /**
- * Reviewed Weibo worker. It drives the public web UI only: no Playwright request
- * client, response-body inspection, private endpoint replay, or challenge bypass.
+ * Reviewed Weibo worker. No Playwright request client, no Node-side cookie replay,
+ * and no challenge bypass. Writes stay behind the dispatch fence.
+ *
+ * Short text plus images: after dispatch, POST the file to picupload.weibo.com
+ * straight from the weibo.com page (the endpoint answers CORS preflight and the
+ * pid is readable cross-origin), then POST /ajax/statuses/update from weibo.com
+ * with a single x-xsrf-token header from context.cookies. A picupload tab is
+ * useless here: it JS-redirects back to weibo.com and kills the execution
+ * context mid-upload. A live cookie-path miss throws media-upload instead of
+ * opening the native OS chooser. Harness tests still fall through to DOM when
+ * the cookie helper is stubbed without a via.
  */
 export const WEIBO_WORKER_SOURCE = String.raw`
 import { createHash } from 'node:crypto';
@@ -22,7 +31,7 @@ const ACTION_ORIGINS = new Set([
   'https://img.t.sinajs.cn', 'https://tvax1.sinaimg.cn',
   'https://tvax2.sinaimg.cn', 'https://tvax3.sinaimg.cn', 'https://tvax4.sinaimg.cn',
   'https://wx1.sinaimg.cn', 'https://wx2.sinaimg.cn', 'https://wx3.sinaimg.cn',
-  'https://wx4.sinaimg.cn'
+  'https://wx4.sinaimg.cn', 'https://picupload.weibo.com'
 ]);
 const WRITE_ACTIONS = new Set([
   'create_post', 'edit_post', 'delete_post', 'create_comment', 'reply_comment',
@@ -47,9 +56,70 @@ async function writeTerminalAndExit(value) {
   await new Promise((resolve, reject) => process.stdout.write(output, (error) => error ? reject(error) : resolve()));
   process.exit(0);
 }
-async function fail() {
+function classifyWriteFailure(reason) {
+  const message = reason && typeof reason === 'object' && reason.message != null ? String(reason.message) : String(reason || '');
+  if (message === 'composer-editor') return 'WEIBO_WRITE_COMPOSER_EDITOR';
+  if (message === 'composer-readback') return 'WEIBO_WRITE_COMPOSER_READBACK';
+  if (message === 'composer-longtext') return 'WEIBO_WRITE_COMPOSER_LONGTEXT';
+  if (message === 'composer') return 'WEIBO_WRITE_COMPOSER';
+  if (message === 'media-chooser') return 'WEIBO_WRITE_MEDIA_CHOOSER';
+  if (message === 'media-upload') return 'WEIBO_WRITE_MEDIA_UPLOAD';
+  if (message === 'media-preview-timeout') return 'WEIBO_WRITE_MEDIA_PREVIEW_TIMEOUT';
+  if (message === 'media-preview') return 'WEIBO_WRITE_MEDIA_PREVIEW';
+  if (message === 'media') return 'WEIBO_WRITE_MEDIA';
+  if (message === 'send-button') return 'WEIBO_WRITE_SEND_BUTTON';
+  if (message === 'send-click') return 'WEIBO_WRITE_SEND_CLICK';
+  if (message === 'send-uncleared') return 'WEIBO_WRITE_SEND_UNCLEARED';
+  if (message === 'send') return 'WEIBO_WRITE_SEND';
+  if (message === 'result') return 'WEIBO_WRITE_RESULT';
+  return 'WORKER_FAILED';
+}
+function emitStep(event) {
+  try {
+    const payload = { src: 'weibo-worker', t: Date.now() };
+    if (event && typeof event === 'object') {
+      if (typeof event.step === 'string') payload.step = String(event.step).slice(0, 64);
+      if (event.ok === true || event.ok === false) payload.ok = event.ok;
+      if (typeof event.ms === 'number' && Number.isFinite(event.ms)) payload.ms = Math.round(event.ms);
+      if (typeof event.hits === 'number' && Number.isFinite(event.hits)) payload.hits = Math.round(event.hits);
+      if (typeof event.timeoutMs === 'number' && Number.isFinite(event.timeoutMs)) payload.timeoutMs = Math.round(event.timeoutMs);
+      if (typeof event.textLen === 'number' && Number.isFinite(event.textLen)) payload.textLen = Math.round(event.textLen);
+      if (typeof event.textHash8 === 'string') payload.textHash8 = String(event.textHash8).slice(0, 8);
+      if (event.longText === true || event.longText === false) payload.longText = event.longText;
+      if (event.hasImage === true || event.hasImage === false) payload.hasImage = event.hasImage;
+      if (event.retried === true || event.retried === false) payload.retried = event.retried;
+      if (typeof event.mediaCount === 'number' && Number.isFinite(event.mediaCount)) payload.mediaCount = Math.round(event.mediaCount);
+      if (typeof event.scopeInputs === 'number' && Number.isFinite(event.scopeInputs)) payload.scopeInputs = Math.round(event.scopeInputs);
+      if (typeof event.pageInputs === 'number' && Number.isFinite(event.pageInputs)) payload.pageInputs = Math.round(event.pageInputs);
+      if (typeof event.scopeImageInputs === 'number' && Number.isFinite(event.scopeImageInputs)) payload.scopeImageInputs = Math.round(event.scopeImageInputs);
+      if (typeof event.pageImageInputs === 'number' && Number.isFinite(event.pageImageInputs)) payload.pageImageInputs = Math.round(event.pageImageInputs);
+      if (typeof event.imageTitleHits === 'number' && Number.isFinite(event.imageTitleHits)) payload.imageTitleHits = Math.round(event.imageTitleHits);
+      if (typeof event.imageIconHits === 'number' && Number.isFinite(event.imageIconHits)) payload.imageIconHits = Math.round(event.imageIconHits);
+      if (typeof event.imageTextHits === 'number' && Number.isFinite(event.imageTextHits)) payload.imageTextHits = Math.round(event.imageTextHits);
+      if (typeof event.imageControlHits === 'number' && Number.isFinite(event.imageControlHits)) payload.imageControlHits = Math.round(event.imageControlHits);
+      if (typeof event.selected === 'number' && Number.isFinite(event.selected)) payload.selected = Math.round(event.selected);
+      if (typeof event.freshSelected === 'number' && Number.isFinite(event.freshSelected)) payload.freshSelected = Math.round(event.freshSelected);
+      if (typeof event.imgCount === 'number' && Number.isFinite(event.imgCount)) payload.imgCount = Math.round(event.imgCount);
+      if (typeof event.addedSrcs === 'number' && Number.isFinite(event.addedSrcs)) payload.addedSrcs = Math.round(event.addedSrcs);
+      if (typeof event.bgCount === 'number' && Number.isFinite(event.bgCount)) payload.bgCount = Math.round(event.bgCount);
+      if (typeof event.canvasCount === 'number' && Number.isFinite(event.canvasCount)) payload.canvasCount = Math.round(event.canvasCount);
+      if (typeof event.frameCount === 'number' && Number.isFinite(event.frameCount)) payload.frameCount = Math.round(event.frameCount);
+      if (typeof event.deleteHits === 'number' && Number.isFinite(event.deleteHits)) payload.deleteHits = Math.round(event.deleteHits);
+      if (typeof event.code === 'string') payload.code = String(event.code).slice(0, 64);
+      if (typeof event.actionId === 'string') payload.actionId = String(event.actionId).slice(0, 64);
+      if (typeof event.branch === 'string') payload.branch = String(event.branch).slice(0, 32);
+      if (typeof event.reason === 'string') payload.reason = String(event.reason).slice(0, 32);
+      if (typeof event.via === 'string') payload.via = String(event.via).slice(0, 32);
+      if (typeof event.pids === 'number' && Number.isFinite(event.pids)) payload.pids = Math.round(event.pids);
+      if (typeof event.status === 'number' && Number.isFinite(event.status)) payload.status = Math.round(event.status);
+      if (event.attempted === true || event.attempted === false) payload.attempted = event.attempted;
+    }
+    process.stderr.write(JSON.stringify(payload) + '\n');
+  } catch {}
+}
+async function fail(reason) {
   if (terminal) return;
-  await writeTerminalAndExit({ event: 'failed', code: 'WORKER_FAILED' });
+  await writeTerminalAndExit({ event: 'failed', code: classifyWriteFailure(reason) });
 }
 async function readFrame() {
   return new Promise((resolve, reject) => {
@@ -1085,6 +1155,199 @@ async function confirmDialog(page, labels) {
   }
   throw new Error('confirm');
 }
+async function publishComposerViaCookieApi(page, text, files, selfId) {
+  if (!page || typeof page.evaluate !== 'function' || !Array.isArray(files) || !files.length) return { published: false, attempted: false };
+  const encoded = files.map((file) => ({
+    name: String(file && file.name || 'image.png').slice(0, 128),
+    mimeType: String(file && file.mimeType || 'image/jpeg'),
+    base64: file.buffer.toString('base64')
+  }));
+  let xsrf = '';
+  let context = null;
+  try {
+    context = typeof page.context === 'function' ? page.context() : null;
+    const cookies = context && typeof context.cookies === 'function' ? await context.cookies() : [];
+    for (const cookie of Array.isArray(cookies) ? cookies : []) {
+      if (cookie && cookie.name === 'XSRF-TOKEN' && cookie.value) {
+        xsrf = String(cookie.value);
+        break;
+      }
+    }
+  } catch { context = null; }
+  const payload = { text: String(text || ''), files: encoded, selfId: String(selfId || ''), xsrf };
+  if (!context || typeof context.newPage !== 'function') return { published: false, attempted: false, via: 'picupload-origin', reason: 'nocontext', pids: [] };
+  let uploaded = { pids: [], via: 'picupload-origin', reason: 'throw', status: 0 };
+  try {
+    uploaded = await page.evaluate(async (input) => {
+      const bytesOf = (item) => {
+        const binary = atob(item.base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+      };
+      const parseJson = (raw) => {
+        const text = String(raw || '');
+        const start = text.indexOf('{');
+        if (start < 0) return null;
+        try { return JSON.parse(text.slice(start)); } catch { return null; }
+      };
+      const pidOf = (parsed) => {
+        if (!parsed || typeof parsed !== 'object') return '';
+        const pic = parsed.pic && typeof parsed.pic === 'object' ? parsed.pic : null;
+        const pic1 = parsed.data && parsed.data.pics && parsed.data.pics.pic_1 ? parsed.data.pics.pic_1 : null;
+        const pid = String(parsed.pic_id || parsed.picid || parsed.pid || (pic && pic.pid) || (pic1 && pic1.pid) || '');
+        return /^[A-Za-z0-9._-]{8,128}$/.test(pid) ? pid : '';
+      };
+      const pids = [];
+      let status = 0;
+      const query = 'data=1&p=1&url=' + encodeURIComponent('weibo.com/u/' + input.selfId) + '&markpos=1&logo=1&nick=0&marks=0&app=miniblog&s=json&file_source=1';
+      const paths = [
+        'https://picupload.weibo.com/interface/pic_upload.php?' + query,
+        'https://picupload.weibo.com/interface/upload.php?' + query
+      ];
+      for (const file of input.files) {
+        const blob = new Blob([bytesOf(file)], { type: file.mimeType });
+        let pid = '';
+        for (const path of paths) {
+          if (pid) break;
+          try {
+            const posted = await fetch(path, { method: 'POST', credentials: 'include', body: blob });
+            status = posted.status;
+            pid = pidOf(parseJson(await posted.text()));
+          } catch {}
+        }
+        if (!pid) return { pids: pids.slice(), via: 'picupload-origin', reason: 'upload', status };
+        pids.push(pid);
+      }
+      return { pids, via: 'picupload-origin', reason: '', status };
+    }, payload);
+    if (!(uploaded && Array.isArray(uploaded.pids))) uploaded = { pids: [], via: 'picupload-origin', reason: 'throw', status: 0 };
+  } catch {
+    uploaded = { pids: [], via: 'picupload-origin', reason: 'throw', status: 0 };
+  }
+  const desktop = await (async () => {
+    if (!(uploaded && Array.isArray(uploaded.pids) && uploaded.pids.length === files.length)) {
+      return { published: false, attempted: false, via: uploaded && uploaded.via || 'picupload-origin', reason: uploaded && uploaded.reason || 'upload', pids: uploaded && uploaded.pids || [], status: uploaded && uploaded.status || 0 };
+    }
+    try {
+      return await page.evaluate(async (input) => {
+        const cookieMap = {};
+        for (const part of String(document.cookie || '').split(';')) {
+          const index = part.indexOf('=');
+          if (index <= 0) continue;
+          cookieMap[part.slice(0, index).trim()] = decodeURIComponent(part.slice(index + 1).trim());
+        }
+        const xsrf = input.xsrf || cookieMap['XSRF-TOKEN'] || '';
+        const parseJson = (raw) => {
+          const text = String(raw || '');
+          const start = text.indexOf('{');
+          if (start < 0) return null;
+          try { return JSON.parse(text.slice(start)); } catch { return null; }
+        };
+        const publishedId = (parsed) => {
+          if (!parsed || typeof parsed !== 'object') return '';
+          const ok = parsed.ok === 1 || parsed.ok === true || parsed.code === 100000 || parsed.code === '100000';
+          if (!ok) return '';
+          const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : parsed;
+          return String(data.idstr || data.mblogid || data.id || data.mid || 'ok');
+        };
+        const pids = input.pids;
+        const body = new URLSearchParams();
+        body.set('content', input.text);
+        body.set('visible', '0');
+        body.set('pic_id', pids.join(','));
+        const headers = { Accept: 'application/json, text/plain, */*', 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' };
+        // One header only: duplicate case-variants get merged into "token, token"
+        // by fetch, and weibo answers 403 "invalid csrf token".
+        if (xsrf) headers['x-xsrf-token'] = xsrf;
+        const updated = await fetch('https://weibo.com/ajax/statuses/update', { method: 'POST', credentials: 'include', headers, body: body.toString() });
+        const status = updated.status;
+        const parsed = parseJson(await updated.text());
+        const id = publishedId(parsed);
+        if (id) return { published: true, attempted: true, via: 'ajax', pids, id, status };
+        const rejected = parsed && (parsed.ok === 0 || parsed.ok === false);
+        if (status >= 200 && status < 300 && !rejected && !parsed) return { published: false, attempted: true, via: 'ajax', pids, status, reason: 'opaque' };
+        return { published: false, attempted: false, via: 'ajax', pids, status, reason: rejected ? 'rejected' : 'http' };
+      }, { text: payload.text, pids: uploaded.pids, xsrf: payload.xsrf });
+    } catch {
+      return { published: false, attempted: false, via: 'ajax', pids: uploaded.pids, reason: 'throw' };
+    }
+  })();
+  if (desktop && desktop.published === true && Array.isArray(desktop.pids) && desktop.pids.length === files.length) return desktop;
+  if (desktop && desktop.attempted === true) return desktop;
+  const mobile = await context.newPage();
+  try {
+    await mobile.goto('https://m.weibo.cn/', { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const fromMobile = await mobile.evaluate(async (input) => {
+      const bytesOf = (item) => {
+        const binary = atob(item.base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+      };
+      const parseJson = (raw) => {
+        const text = String(raw || '');
+        const start = text.indexOf('{');
+        if (start < 0) return null;
+        try { return JSON.parse(text.slice(start)); } catch { return null; }
+      };
+      const pidOf = (parsed) => {
+        if (!parsed || typeof parsed !== 'object') return '';
+        return String(parsed.pic_id || parsed.picid || parsed.pid || '');
+      };
+      const publishedId = (parsed) => {
+        if (!parsed || typeof parsed !== 'object') return '';
+        if (!(parsed.ok === 1 || parsed.ok === true)) return '';
+        const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : parsed;
+        return String(data.id || data.idstr || data.mid || 'ok');
+      };
+      const config = parseJson(await (await fetch('https://m.weibo.cn/api/config', { credentials: 'include' })).text());
+      const st = String((config && config.data && config.data.st) || '');
+      if (!st) return { published: false, attempted: false, via: 'm', pids: [] };
+      const pids = [];
+      for (const file of input.files) {
+        const form = new FormData();
+        form.append('type', 'json');
+        form.append('st', st);
+        form.append('pic', new Blob([bytesOf(file)], { type: file.mimeType }), file.name);
+        const uploaded = await fetch('https://m.weibo.cn/api/statuses/uploadPic', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'x-xsrf-token': st, 'x-requested-with': 'XMLHttpRequest' },
+          body: form
+        });
+        const pid = pidOf(parseJson(await uploaded.text()));
+        if (!/^[A-Za-z0-9._-]{8,128}$/.test(pid)) return { published: false, attempted: false, via: 'm-upload', pids: pids.slice() };
+        pids.push(pid);
+      }
+      const body = new URLSearchParams();
+      body.set('content', input.text);
+      body.set('st', st);
+      body.set('picId', pids.join(','));
+      const updated = await fetch('https://m.weibo.cn/api/statuses/update', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { Accept: 'application/json, text/plain, */*', 'Content-Type': 'application/x-www-form-urlencoded', 'x-xsrf-token': st, 'x-requested-with': 'XMLHttpRequest' },
+        body: body.toString()
+      });
+      const status = updated.status;
+      const parsed = parseJson(await updated.text());
+      const id = publishedId(parsed);
+      if (id) return { published: true, attempted: true, via: 'm', pids, id, status };
+      const rejected = parsed && (parsed.ok === 0 || parsed.ok === false);
+      if (status >= 200 && status < 300 && !rejected && !parsed) return { published: false, attempted: true, via: 'm', pids, status, reason: 'opaque' };
+      return { published: false, attempted: false, via: 'm', pids, status, reason: rejected ? 'rejected' : 'http' };
+    }, payload);
+    // Keep the desktop diagnostics (upload reason / ajax status) unless the
+    // mobile branch made real progress; a dead m.weibo.cn session says nothing.
+    if (fromMobile && typeof fromMobile === 'object' && (fromMobile.published === true || fromMobile.attempted === true || fromMobile.status)) return fromMobile;
+    return desktop;
+  } catch {
+    return desktop;
+  } finally {
+    await mobile.close().catch(() => {});
+  }
+}
 async function newestOwnPost(page, selfId, text, beforeIds) {
   await gotoAuthenticated(page, 'https://weibo.com/u/' + selfId);
   const posts = await collectPosts(page, selfId, 10);
@@ -1099,27 +1362,544 @@ async function awaitNewestOwnPost(page, selfId, text, beforeIds) {
   }
   return null;
 }
-async function preparePostImageChooser(page) {
-  const image = await exactMenuItem(page, '图片');
-  if (!image) throw new Error('media');
-  await image.click({ trial: true, timeout: 10_000 });
-  const [chooser] = await Promise.all([
-    page.waitForEvent('filechooser', { timeout: 10_000 }),
-    image.click({ timeout: 10_000 })
-  ]);
-  return chooser;
+async function composerScope(editor) {
+  if (!editor || typeof editor.locator !== 'function') return null;
+  const queries = [
+    'xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="发送"]][1]',
+    'xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="图片"]][1]',
+    'xpath=ancestor::*[.//*[@title="图片" or @aria-label="图片" or contains(@class,"woo-font--image") or contains(@class,"woo-font--pic") or contains(@class,"woo-font--picture")]][1]'
+  ];
+  for (const query of queries) {
+    const scope = editor.locator(query);
+    if (await scope.count() === 1) return scope;
+  }
+  const fileScope = editor.locator('xpath=ancestor::*[.//input[@type="file"]][1]');
+  if (await fileScope.count() === 1) {
+    const tag = String(await fileScope.evaluate((el) => (el && el.tagName) || '').catch(() => '')).toUpperCase();
+    if (tag && tag !== 'HTML' && tag !== 'BODY' && tag !== 'MAIN') return fileScope;
+  }
+  const parent = editor.locator('xpath=ancestor::*[4]');
+  if (await parent.count() === 1) return parent;
+  return editor;
 }
-async function provePostSendReady(send, timeout) {
-  if (!send) throw new Error('send');
-  await send.click({ trial: true, timeout });
+function wrapFileInput(input) {
+  return {
+    setFiles: async (files) => input.setInputFiles(files),
+    element: () => input,
+  };
 }
-async function awaitPostSendReady(page, timeout) {
+async function countImageFileInputs(scope) {
+  const result = { total: 0, image: 0, attached: 0 };
+  if (!scope || typeof scope.locator !== 'function') return result;
+  const nodes = scope.locator('input[type="file"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return result;
+  const total = Math.min(await nodes.count().catch(() => 0), 40);
+  result.total = total;
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    const attached = await node.evaluate((element) => !!element && element.isConnected).catch(() => false);
+    if (!attached) continue;
+    result.attached += 1;
+    const accept = String(await node.getAttribute('accept').catch(() => '') || '');
+    if (accept && !/image|\*/i.test(accept)) continue;
+    result.image += 1;
+  }
+  return result;
+}
+async function uniqueImageFileInput(scope) {
+  if (!scope || typeof scope.locator !== 'function') return null;
+  const nodes = scope.locator('input[type="file"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return null;
+  const matches = [];
+  const total = Math.min(await nodes.count().catch(() => 0), 40);
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    const attached = await node.evaluate((element) => !!element && element.isConnected).catch(() => false);
+    if (!attached) continue;
+    const accept = String(await node.getAttribute('accept').catch(() => '') || '');
+    if (accept && !/image|\*/i.test(accept)) continue;
+    matches.push(node);
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+async function countVisibleLocator(root, selector, limit = 20) {
+  let hits = 0;
+  if (!root || typeof root.locator !== 'function' || !selector) return hits;
+  const nodes = root.locator(selector);
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return hits;
+  const total = Math.min(await nodes.count().catch(() => 0), limit);
+  for (let index = 0; index < total; index += 1) {
+    if (await visible(nodes.nth(index))) hits += 1;
+  }
+  return hits;
+}
+async function clickableImageTool(node) {
+  const wrap = node.locator('xpath=ancestor-or-self::*[self::button or @role="button" or @role="menuitem" or contains(concat(" ",normalize-space(@class)," ")," wbpro-iconbed ")][1]');
+  if (await wrap.count() === 1 && await visible(wrap)) return wrap;
+  return node;
+}
+async function uniqueVisibleClickable(root, selector) {
+  if (!root || typeof root.locator !== 'function') return null;
+  const nodes = root.locator(selector);
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return null;
+  const matches = [];
+  const total = Math.min(await nodes.count().catch(() => 0), 20);
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    if (!await visible(node)) continue;
+    matches.push(await clickableImageTool(node));
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+async function countPreviewNodes(scope) {
+  if (!scope || typeof scope.locator !== 'function') return 0;
+  const nodes = scope.locator('img[src^="blob:"], img[src^="data:"], video, [class*="woo-picture"], [class*="wbpro-pic"], [class*="image-box"], [class*="pic-item"], [style*="blob:"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return 0;
+  const total = Math.min(await nodes.count().catch(() => 0), 20);
+  let hits = 0;
+  for (let index = 0; index < total; index += 1) {
+    if (await visible(nodes.nth(index))) hits += 1;
+  }
+  return hits;
+}
+function isComposerPreviewSrc(src) {
+  if (!src) return false;
+  if (/^(blob:|data:)/i.test(src)) return true;
+  if (/sinaimg\.cn/i.test(src) && !/avatar|\.50\/|\.180\//i.test(src)) return true;
+  return false;
+}
+async function countPreviewSignals(scope, page) {
+  const imgCount = await countVisibleImgs(scope);
+  const previewNodes = await countPreviewNodes(scope);
+  let canvasCount = 0;
+  let bgCount = 0;
+  let frameCount = 0;
+  try {
+    const canvases = scope && typeof scope.locator === 'function' ? scope.locator('canvas') : null;
+    canvasCount = Math.min(canvases && typeof canvases.count === 'function' ? await canvases.count().catch(() => 0) : 0, 12);
+  } catch {}
+  try {
+    const styled = scope && typeof scope.locator === 'function' ? scope.locator('[style*="background"]') : null;
+    bgCount = Math.min(styled && typeof styled.count === 'function' ? await styled.count().catch(() => 0) : 0, 12);
+  } catch {}
+  try {
+    const frames = page && typeof page.locator === 'function' ? page.locator('iframe') : null;
+    frameCount = Math.min(frames && typeof frames.count === 'function' ? await frames.count().catch(() => 0) : 0, 12);
+  } catch {}
+  const deleted = await exactMenuItem(scope, '删除');
+  return { imgCount, previewNodes, canvasCount, bgCount, frameCount, deleteHits: deleted ? 1 : 0 };
+}
+async function collectVisibleImageSrcs(scope) {
+  const srcs = [];
+  if (!scope || typeof scope.locator !== 'function') return srcs;
+  const nodes = scope.locator('img');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return srcs;
+  const total = Math.min(await nodes.count().catch(() => 0), 12);
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    if (!await node.isVisible().catch(() => false)) continue;
+    const src = String(await node.getAttribute('src').catch(() => '') || '');
+    if (src) srcs.push(src);
+  }
+  return srcs;
+}
+async function countVisibleImgs(scope) {
+  if (!scope || typeof scope.locator !== 'function') return 0;
+  const nodes = scope.locator('img');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return 0;
+  const total = Math.min(await nodes.count().catch(() => 0), 12);
+  let visible = 0;
+  for (let index = 0; index < total; index += 1) {
+    if (await nodes.nth(index).isVisible().catch(() => false)) visible += 1;
+  }
+  return visible;
+}
+async function awaitComposerCleared(page, editor, timeout) {
   const deadline = Date.now() + timeout;
   const attempts = Math.max(1, Math.ceil(timeout / 250));
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (!(await readPostComposer(editor))) return true;
+    const remaining = deadline - Date.now();
+    if (attempt < attempts - 1 && remaining > 0) {
+      await page.waitForTimeout(Math.min(250, remaining));
+    }
+  }
+  return false;
+}
+async function awaitComposerMediaReady(page, editor, expectedNew, timeout, beforeSrcs, beforeCount, beforeDelete, beforeNodes) {
+  const scope = (await composerScope(editor)) || page;
+  if (!scope || typeof scope.locator !== 'function') throw new Error('media-preview-timeout');
+  const before = new Set(Array.isArray(beforeSrcs) ? beforeSrcs : []);
+  const baseCount = Number.isFinite(beforeCount) ? beforeCount : before.size;
+  const baseNodes = Number.isFinite(beforeNodes) ? beforeNodes : 0;
+  const deadline = Date.now() + timeout;
+  const attempts = Math.max(1, Math.ceil(timeout / 250));
+  let emittedChange = false;
+  const startSignals = await countPreviewSignals(scope, page);
+  emitStep({
+    step: 'media.preview.start',
+    timeoutMs: timeout,
+    imgCount: startSignals.imgCount,
+    bgCount: startSignals.bgCount,
+    canvasCount: startSignals.canvasCount,
+    frameCount: startSignals.frameCount,
+    deleteHits: startSignals.deleteHits,
+  });
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (Date.now() >= deadline) break;
+    const added = [];
+    const seen = new Set();
+    for (const src of await collectVisibleImageSrcs(scope)) {
+      if (before.has(src) || seen.has(src)) continue;
+      seen.add(src);
+      added.push(src);
+    }
+    const imgs = await countVisibleImgs(scope);
+    const deleted = await exactMenuItem(scope, '删除');
+    const signals = await countPreviewSignals(scope, page);
+    const addedPreview = added.filter((src) => isComposerPreviewSrc(src)).length;
+    const ready = addedPreview >= expectedNew || added.length >= expectedNew
+      || imgs >= baseCount + expectedNew || (!!deleted && !beforeDelete)
+      || signals.previewNodes >= baseNodes + expectedNew;
+    if (!emittedChange && (added.length > 0 || imgs !== startSignals.imgCount || signals.previewNodes !== startSignals.previewNodes || (!!deleted && !beforeDelete))) {
+      emittedChange = true;
+      emitStep({
+        step: 'media.preview.change',
+        addedSrcs: added.length,
+        imgCount: signals.imgCount,
+        bgCount: signals.bgCount,
+        canvasCount: signals.canvasCount,
+        frameCount: signals.frameCount,
+        deleteHits: signals.deleteHits,
+      });
+    }
+    if (ready) {
+      emitStep({
+        step: 'media.preview.ready',
+        reason: addedPreview >= expectedNew || added.length >= expectedNew ? 'added-src' : imgs >= baseCount + expectedNew ? 'img-count' : (!!deleted && !beforeDelete) ? 'delete' : 'preview-node',
+        addedSrcs: added.length,
+        imgCount: imgs,
+        deleteHits: deleted ? 1 : 0,
+      });
+      return;
+    }
+    const remaining = deadline - Date.now();
+    if (attempt < attempts - 1 && remaining > 0) {
+      await page.waitForTimeout(Math.min(250, remaining));
+    }
+  }
+  const timed = await countPreviewSignals(scope, page);
+  emitStep({
+    step: 'media.preview.timeout',
+    reason: 'timeout',
+    addedSrcs: 0,
+    imgCount: timed.imgCount,
+    bgCount: timed.bgCount,
+    canvasCount: timed.canvasCount,
+    frameCount: timed.frameCount,
+    deleteHits: timed.deleteHits,
+  });
+  throw new Error('media-preview-timeout');
+}
+function nodeDelay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function armFileChooser(page, clickable, files) {
+  if (!page || typeof page.waitForEvent !== 'function' || !clickable || typeof clickable.click !== 'function') {
+    return { chooser: null, timedOut: false, attached: false, attachFailed: false };
+  }
+  let attached = false;
+  let attachFailed = false;
+  const chooserPromise = page.waitForEvent('filechooser', { timeout: 5_000 }).then(async (chooser) => {
+    if (chooser && Array.isArray(files) && files.length > 0 && typeof chooser.setFiles === 'function') {
+      try {
+        await chooser.setFiles(files);
+        attached = true;
+      } catch {
+        attachFailed = true;
+      }
+    }
+    return chooser || null;
+  }).catch(() => null);
+  const clickPromise = clickable.click({ timeout: 5_000, force: true, noWaitAfter: true }).catch(() => null);
+  let timer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve('__timeout__'), 8_000);
+  });
+  try {
+    const raced = await Promise.race([chooserPromise, timeoutPromise]);
+    if (raced === '__timeout__') return { chooser: null, timedOut: true, attached: false, attachFailed: false };
+    if (raced) return { chooser: raced, timedOut: false, attached, attachFailed };
+    await Promise.race([clickPromise, timeoutPromise]);
+    return { chooser: null, timedOut: false, attached: false, attachFailed: false };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+async function awaitFileChooser(page, clickable) {
+  const armed = await armFileChooser(page, clickable);
+  if (armed.timedOut) throw new Error('media-chooser');
+  if (!armed.chooser) throw new Error('media-chooser');
+  return armed.chooser;
+}
+async function uniqueExactText(root, text) {
+  if (!root || typeof root.locator !== 'function' || !text) return null;
+  const nodes = root.locator('xpath=.//*[normalize-space()="' + text + '"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return null;
+  const matches = [];
+  const total = Math.min(await nodes.count().catch(() => 0), 20);
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    if (await visible(node)) matches.push(node);
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+async function nodeBox(node) {
+  if (!node || typeof node.evaluate !== 'function') return null;
+  return node.evaluate((el) => {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.left, y: r.top, w: r.width, h: r.height };
+  }).catch(() => null);
+}
+function containsBox(outer, inner) {
+  if (!outer || !inner) return false;
+  return outer.x <= inner.x + 0.5 && outer.y <= inner.y + 0.5
+    && outer.x + outer.w + 0.5 >= inner.x + inner.w
+    && outer.y + outer.h + 0.5 >= inner.y + inner.h
+    && (outer.w * outer.h > inner.w * inner.h + 0.5);
+}
+async function boxCenter(node) {
+  const box = await nodeBox(node);
+  if (!box) return null;
+  return { x: box.x + box.w / 2, y: box.y + box.h / 2 };
+}
+async function controlIdentity(node) {
+  if (!node || typeof node.evaluate !== 'function') return '';
+  return String(await node.evaluate((el) => {
+    if (!el) return '';
+    const r = el.getBoundingClientRect();
+    return [el.tagName, el.id || '', String(el.className || '').slice(0, 80), Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)].join('|');
+  }).catch(() => ''));
+}
+async function clickableExactTextControls(root, text) {
+  if (!root || typeof root.locator !== 'function' || !text) return [];
+  const nodes = root.locator('xpath=.//*[normalize-space()="' + text + '"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return [];
+  const controls = [];
+  const seen = new Set();
+  const total = Math.min(await nodes.count().catch(() => 0), 20);
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    if (!await visible(node)) continue;
+    const control = await clickableImageTool(node);
+    const id = await controlIdentity(control);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    controls.push(control);
+  }
+  const boxed = [];
+  for (const control of controls) boxed.push({ control, box: await nodeBox(control) });
+  const collapsed = [];
+  for (const item of boxed) {
+    if (!item.box) {
+      collapsed.push(item.control);
+      continue;
+    }
+    const inside = boxed.some((other) => other !== item && containsBox(other.box, item.box));
+    if (!inside) collapsed.push(item.control);
+  }
+  return collapsed;
+}
+async function uniqueOrNearestImageText(root, input, text) {
+  const controls = await clickableExactTextControls(root, text);
+  if (controls.length === 1) return controls[0];
+  if (controls.length === 0) return null;
+  if (!input || typeof input.evaluate !== 'function') return null;
+  const inputBox = await boxCenter(input);
+  if (!inputBox) return null;
+  let best = null;
+  let bestDist = Infinity;
+  for (const control of controls) {
+    const box = await boxCenter(control);
+    if (!box) continue;
+    const dist = Math.hypot(box.x - inputBox.x, box.y - inputBox.y);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = control;
+    }
+  }
+  return best;
+}
+async function exactTextNearInput(input, text) {
+  if (!input || typeof input.locator !== 'function' || !text) return null;
+  for (let depth = 1; depth <= 8; depth += 1) {
+    const ancestor = input.locator('xpath=ancestor::*[' + depth + ']');
+    if (await ancestor.count() !== 1) continue;
+    const found = await uniqueExactText(ancestor, text);
+    if (found) return found;
+  }
+  return null;
+}
+async function smallVisibleAncestor(input) {
+  if (!input || typeof input.locator !== 'function') return null;
+  for (let depth = 1; depth <= 5; depth += 1) {
+    const node = input.locator('xpath=ancestor::*[' + depth + ']');
+    if (await node.count() !== 1) continue;
+    if (!await visible(node)) continue;
+    const box = await node.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      return { w: r.width, h: r.height };
+    }).catch(() => null);
+    if (box && box.w >= 8 && box.w <= 96 && box.h >= 8 && box.h <= 96) return node;
+  }
+  return null;
+}
+async function clickableImageToolFromInput(input) {
+  if (!input || typeof input.locator !== 'function') return null;
+  const queries = [
+    'xpath=ancestor::label[1]',
+    'xpath=ancestor::*[contains(concat(" ",normalize-space(@class)," ")," wbpro-iconbed ")][1]',
+    'xpath=ancestor::*[@role="button" or self::button or @title="图片" or @aria-label="图片"][1]',
+  ];
+  for (const query of queries) {
+    const node = input.locator(query);
+    if (await node.count() === 1 && await visible(node)) return node;
+  }
+  return smallVisibleAncestor(input);
+}
+async function imageToolControl(scope, page, scopedInput) {
+  const labeled = await exactMenuItem(scope, '图片')
+    || await uniqueOrNearestImageText(scope, scopedInput, '图片')
+    || await uniqueOrNearestImageText(scope, scopedInput, '相册')
+    || await exactTextNearInput(scopedInput, '图片')
+    || await exactTextNearInput(scopedInput, '相册')
+    || await uniqueExactText(scope, '图片')
+    || await uniqueExactText(scope, '相册');
+  if (labeled) return labeled;
+  for (const root of [scope, page]) {
+    const titled = await uniqueVisibleClickable(root, '[title="图片"], [aria-label="图片"]');
+    if (titled) return titled;
+    const icon = await uniqueVisibleClickable(root, 'i.woo-font--image, i.woo-font--pic, i.woo-font--picture');
+    if (icon) return icon;
+  }
+  const fromInput = await clickableImageToolFromInput(scopedInput);
+  if (fromInput) return fromInput;
+  return await exactMenuItem(page, '图片') || await uniqueExactText(page, '图片');
+}
+async function preparePostImageChooser(page, editor, files) {
+  const scope = (await composerScope(editor)) || page;
+  const scopedInput = await uniqueImageFileInput(scope);
+  const image = await imageToolControl(scope, page, scopedInput);
+  const beforeScope = await countImageFileInputs(scope);
+  const beforePage = await countImageFileInputs(page);
+  const imageTitleHits = await countVisibleLocator(scope, '[title="图片"], [aria-label="图片"]');
+  const imageIconHits = await countVisibleLocator(scope, 'i.woo-font--image, i.woo-font--pic, i.woo-font--picture');
+  const imageTextHits = await countVisibleLocator(scope, 'xpath=.//*[normalize-space()="图片"]');
+  const imageControlHits = (await clickableExactTextControls(scope, '图片')).length;
+  const emitChooser = (branch) => {
+    emitStep({
+      step: 'media.chooser',
+      branch,
+      hasImage: !!image,
+      scopeInputs: beforeScope.total,
+      scopeImageInputs: beforeScope.image,
+      pageInputs: beforePage.total,
+      pageImageInputs: beforePage.image,
+      imageTitleHits,
+      imageIconHits,
+      imageTextHits,
+      imageControlHits,
+      hits: beforeScope.image,
+      mediaCount: beforePage.image,
+    });
+  };
+  const finishArmed = (branch, armed) => {
+    emitChooser(branch);
+    if (armed.attachFailed) throw new Error('media-upload');
+    return { chooser: armed.chooser, attached: !!armed.attached };
+  };
+  if (image) {
+    const armed = await armFileChooser(page, image, files);
+    if (armed.timedOut) {
+      emitChooser('timeout');
+      throw new Error('media-chooser');
+    }
+    if (armed.chooser) return finishArmed('native', armed);
+    const local = await exactMenuItem(scope, '本地上传') || await exactMenuItem(page, '本地上传')
+      || await exactMenuItem(scope, '相册') || await exactMenuItem(page, '相册');
+    if (local) {
+      const localArmed = await armFileChooser(page, local, files);
+      if (localArmed.timedOut) {
+        emitChooser('timeout');
+        throw new Error('media-chooser');
+      }
+      if (localArmed.chooser) return finishArmed('local', localArmed);
+    }
+    const appeared = await uniqueImageFileInput(scope);
+    if (appeared) {
+      emitChooser('appeared');
+      return { chooser: wrapFileInput(appeared), attached: false };
+    }
+  }
+  if (scopedInput) {
+    emitChooser('existing');
+    return { chooser: wrapFileInput(scopedInput), attached: false };
+  }
+  emitChooser('miss');
+  throw new Error('media-chooser');
+}
+async function provePostImageControl(page, editor) {
+  const scope = (await composerScope(editor)) || page;
+  const scopedInput = await uniqueImageFileInput(scope);
+  if (scopedInput) return true;
+  const image = await imageToolControl(scope, page, scopedInput);
+  return !!image;
+}
+async function openLongTextComposer(page) {
+  const opener = await exactMenuItem(page, '长文');
+  if (!opener) return false;
+  await opener.click({ timeout: 10_000 });
+  return true;
+}
+async function postComposerEditor(page, longText) {
+  if (longText) {
+    const editable = await uniqueVisible(page.locator('[contenteditable="true"]'));
+    if (editable) return editable;
+  }
+  const nodes = page.locator('textarea');
+  if (nodes && typeof nodes.count === 'function' && typeof nodes.nth === 'function') {
+    const matches = [];
+    const total = Math.min(await nodes.count(), 40);
+    for (let index = 0; index < total; index += 1) {
+      const node = nodes.nth(index);
+      if (!await visible(node)) continue;
+      const sendTool = node.locator('xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="发送"]][1]');
+      const imageTool = node.locator('xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="图片"] or .//*[@title="图片" or @aria-label="图片"]][1]');
+      if (await sendTool.count() === 1 || await imageTool.count() === 1) matches.push(node);
+    }
+    if (matches.length === 1) return matches[0];
+  }
+  return uniqueVisible(page.locator('textarea'));
+}
+async function readPostComposer(editor) {
+  const value = await editor.inputValue().catch(() => '');
+  if (value) return cleanText(value, 20000);
+  const inner = typeof editor.innerText === 'function' ? await editor.innerText().catch(() => '') : '';
+  return cleanText(inner, 20000);
+}
+async function provePostSendReady(send, timeout) {
+  if (!send) throw new Error('send-button');
+  await send.click({ trial: true, timeout });
+}
+async function awaitPostSendReady(page, timeout, editor) {
+  const deadline = Date.now() + timeout;
+  const attempts = Math.max(1, Math.ceil(timeout / 250));
+  const scope = (await composerScope(editor)) || page;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     let remaining = deadline - Date.now();
     if (remaining <= 0) break;
-    const send = await exactMenuItem(page, '发送');
+    const send = await exactMenuItem(scope, '发送');
     remaining = deadline - Date.now();
     if (send && remaining > 0) {
       try {
@@ -1132,7 +1912,7 @@ async function awaitPostSendReady(page, timeout) {
       await page.waitForTimeout(Math.min(250, remaining));
     }
   }
-  throw new Error('send');
+  throw new Error('send-button');
 }
 async function activatePostSend(send) {
   await provePostSendReady(send, 10_000);
@@ -1182,40 +1962,159 @@ async function writeAction(page, input) {
     await gotoAuthenticated(page, 'https://weibo.com/u/' + selfId);
     const beforeIds = new Set((await collectPosts(page, selfId, 10)).map((post) => post.id));
     await gotoAuthenticated(page, 'https://weibo.com/');
-    const textarea = await uniqueVisible(page.locator('textarea'));
-    if (!textarea) throw new Error('composer');
-    if (params.text) await textarea.fill(params.text);
+    const expectedText = cleanText(params.text || '', 20000);
+    const longText = expectedText.length > 2000;
+    if (longText) await openLongTextComposer(page);
+    const editor = await postComposerEditor(page, longText);
+    if (!editor) throw new Error(longText ? 'composer-longtext' : 'composer-editor');
+    if (expectedText) await editor.fill(expectedText);
+    if ((await readPostComposer(editor)) !== expectedText) throw new Error('composer-readback');
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
     await assertNoChallenge(page);
     let imageChooser = null;
+    let previewBefore = [];
+    let previewBeforeCount = 0;
+    let previewBeforeDelete = false;
+    let previewBeforeNodes = 0;
     if (manifest.length === 0) {
-      await awaitPostSendReady(page, 30_000);
+      await awaitPostSendReady(page, 30_000, editor);
+    } else if (!(await provePostImageControl(page, editor))) {
+      throw new Error('media-chooser');
     } else {
-      imageChooser = await preparePostImageChooser(page);
+      const previewScope = (await composerScope(editor)) || page;
+      previewBefore = await collectVisibleImageSrcs(previewScope);
+      previewBeforeCount = await countVisibleImgs(previewScope);
+      previewBeforeDelete = !!(await exactMenuItem(previewScope, '删除'));
+      previewBeforeNodes = await countPreviewNodes(previewScope);
     }
     await awaitDispatch();
     await assertNoChallenge(page);
-    const freshTextarea = await uniqueVisible(page.locator('textarea'));
-    if (!freshTextarea || cleanText(await freshTextarea.inputValue().catch(() => ''), 2000) !== cleanText(params.text || '', 2000)) throw new Error('composer');
+    const freshEditor = await postComposerEditor(page, longText);
+    if (!freshEditor || (await readPostComposer(freshEditor)) !== expectedText) throw new Error('composer-readback');
     if (manifest.length) {
-      if (!imageChooser) throw new Error('media');
       const files = [];
       try {
         for (const item of manifest) files.push({ name: item.filename, mimeType: item.mimeType, buffer: await readFile('/inputs/' + item.inputId) });
-        await imageChooser.setFiles(files);
+        if (!longText) {
+          try {
+            const api = await publishComposerViaCookieApi(page, expectedText, files, selfId);
+            const published = !!(api && api.published === true);
+            const attempted = !!(api && api.attempted === true);
+            emitStep({
+              step: 'media.api',
+              ok: published,
+              attempted: attempted,
+              via: api && typeof api.via === 'string' ? String(api.via).slice(0, 32) : '',
+              reason: api && typeof api.reason === 'string' ? String(api.reason).slice(0, 32) : '',
+              pids: api && Array.isArray(api.pids) ? api.pids.length : 0,
+              status: api && typeof api.status === 'number' ? api.status : 0,
+              mediaCount: manifest.length
+            });
+            if (published) {
+              const post = await awaitNewestOwnPost(page, selfId, expectedText, beforeIds);
+              if (post) return { post };
+              throw new Error('result');
+            }
+            if (attempted) throw new Error('result');
+            if (api && typeof api.via === 'string' && api.via) throw new Error('media-upload');
+          } catch (error) {
+            if (String(error && error.message) === 'result' || String(error && error.message) === 'media-upload') throw error;
+            emitStep({ step: 'media.api', ok: false, attempted: false, via: 'error', pids: 0, status: 0, mediaCount: manifest.length });
+          }
+        }
+        const prepared = await preparePostImageChooser(page, freshEditor, files);
+        if (!prepared || !prepared.chooser) throw new Error('media-chooser');
+        imageChooser = prepared.chooser;
+        let selected = 0;
+        if (!prepared.attached) {
+          try {
+            await imageChooser.setFiles(files);
+          } catch {
+            emitStep({ step: 'media.upload', selected: 0, retried: false, freshSelected: -1, mediaCount: manifest.length });
+            throw new Error('media-upload');
+          }
+        }
+        try {
+          if (typeof imageChooser.element === 'function') {
+            selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
+          }
+        } catch {}
+        let retried = false;
+        let freshSelected = -1;
+        if (!prepared.attached) {
+          const scope = (await composerScope(freshEditor)) || page;
+          const liveInput = await uniqueImageFileInput(scope);
+          if (selected !== manifest.length && liveInput) {
+            await liveInput.setInputFiles(files);
+            try {
+              selected = await liveInput.evaluate((node) => node.files ? node.files.length : 0);
+            } catch {}
+          }
+          if (selected !== manifest.length) {
+            retried = true;
+            const freshInput = await uniqueImageFileInput(scope);
+            if (freshInput) {
+              await freshInput.setInputFiles(files);
+              try {
+                freshSelected = await freshInput.evaluate((node) => node.files ? node.files.length : 0);
+              } catch {
+                freshSelected = -1;
+              }
+              if (freshSelected >= 0) selected = freshSelected;
+            }
+          }
+        }
+        emitStep({
+          step: 'media.upload',
+          selected,
+          retried,
+          freshSelected,
+          attached: !!prepared.attached,
+          mediaCount: manifest.length,
+        });
+        if (selected !== manifest.length && !prepared.attached) throw new Error('media-upload');
+        let previewReady = false;
+        try {
+          await awaitComposerMediaReady(page, freshEditor, manifest.length, prepared.attached ? 8_000 : 45_000, previewBefore, previewBeforeCount, previewBeforeDelete, previewBeforeNodes);
+          previewReady = true;
+        } catch (error) {
+          if (String(error && error.message) !== 'media-preview-timeout') throw error;
+        }
+        if (!previewReady && prepared.attached) {
+          retried = true;
+          const retryScope = (await composerScope(freshEditor)) || page;
+          const liveInput = await uniqueImageFileInput(retryScope);
+          if (liveInput) {
+            await liveInput.setInputFiles(files);
+            try {
+              selected = await liveInput.evaluate((node) => node.files ? node.files.length : 0);
+            } catch {}
+          }
+          emitStep({
+            step: 'media.upload',
+            selected,
+            retried: true,
+            freshSelected,
+            attached: true,
+            mediaCount: manifest.length,
+          });
+          await awaitComposerMediaReady(page, freshEditor, manifest.length, 45_000, previewBefore, previewBeforeCount, previewBeforeDelete, previewBeforeNodes);
+        } else if (!previewReady) {
+          throw new Error('media-preview-timeout');
+        }
       } finally {
         for (const file of files) file.buffer.fill(0);
       }
-      const selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
-      if (selected !== manifest.length) throw new Error('media');
     }
     await assertNoChallenge(page);
-    const send = await awaitPostSendReady(page, 30_000);
+    const send = await awaitPostSendReady(page, manifest.length ? 90_000 : 30_000, freshEditor);
     const clickFailure = await activatePostSend(send);
     await page.waitForTimeout(2500);
-    const post = await awaitNewestOwnPost(page, selfId, params.text || '', beforeIds);
+    const cleared = await awaitComposerCleared(page, freshEditor, 10_000);
+    const post = await awaitNewestOwnPost(page, selfId, expectedText, beforeIds);
     if (!post) {
-      if (clickFailure) throw clickFailure;
+      if (clickFailure) throw new Error('send-click');
+      if (manifest.length && !cleared) throw new Error('send-uncleared');
       throw new Error('result');
     }
     return { post };
@@ -1490,7 +2389,7 @@ async function secureContext(browser, storageState, allowed) {
     const request = route.request();
     let origin;
     try { origin = new URL(request.url()).origin; } catch { await route.abort(); return; }
-    if (!allowed.has(origin) || !['GET', 'POST', 'DELETE'].includes(request.method()) || ['websocket', 'eventsource'].includes(request.resourceType())) {
+    if (!allowed.has(origin) || !['GET', 'POST', 'DELETE', 'OPTIONS'].includes(request.method()) || ['websocket', 'eventsource'].includes(request.resourceType())) {
       await route.abort();
       return;
     }
@@ -1499,12 +2398,20 @@ async function secureContext(browser, storageState, allowed) {
   return context;
 }
 async function runAction(input, relay) {
+  const started = Date.now();
+  emitStep({ step: 'action.start', actionId: input.actionId });
   const browser = await chromium.launch({ headless: true, proxy: { server: relay.proxy }, args: browserArgs() });
   try {
     const context = await secureContext(browser, input.storageState, ACTION_ORIGINS);
     const page = await context.newPage();
-    const result = WRITE_ACTIONS.has(input.actionId) ? await writeAction(page, input) : await actionRead(page, input);
-    await finishAction(context, input, result);
+    try {
+      const result = WRITE_ACTIONS.has(input.actionId) ? await writeAction(page, input) : await actionRead(page, input);
+      emitStep({ step: 'action.done', actionId: input.actionId, ok: true, ms: Date.now() - started });
+      await finishAction(context, input, result);
+    } catch (error) {
+      emitStep({ step: 'action.failed', actionId: input.actionId, ok: false, ms: Date.now() - started, code: classifyWriteFailure(error) });
+      throw error;
+    }
   } finally { await browser.close(); }
 }
 async function captureQr(page) {
@@ -1614,5 +2521,5 @@ try {
     await relay.close();
   }
   if (!terminal) await fail();
-} catch { await fail(); }
+} catch (error) { await fail(error); }
 `

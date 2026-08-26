@@ -22,6 +22,34 @@ export * from './outboundRing.js'
 export * from './promptQueueClient.js'
 export * from './promptQueueCoordinator.js'
 export * from './engine/codexAdapter.js'
+// P3-19 — grok/cursor/zcode adapter 的对称导出(与 ccb/codex 对齐)。三个模块
+// 都各自导出测试用 `_internals`,star re-export 会互相歧义,故具名导出。
+export {
+  GrokAdapter,
+  readLatestGrokNativeHandoff,
+  type GrokRouteOverride,
+} from './engine/grokAdapter.js'
+export {
+  CursorAdapter,
+  CURSOR_MAX_PROMPT_ARG_BYTES,
+  CURSOR_MAX_TURN_PAYLOAD_BYTES,
+  CURSOR_MAX_PLATFORM_ENVELOPE_BYTES,
+  CURSOR_CHATS_DIR_NAME,
+  attachCursorGatewayRouting,
+  cursorChatsRoot,
+  cursorResumeStorePath,
+  cursorResumeStoreExists,
+  type CursorTranscriptFileStamp,
+  type CursorTranscriptFingerprint,
+  type CursorPendingKeepaliveProgressSignal,
+  type CursorPendingKeepaliveTestHooks,
+} from './engine/cursorAdapter.js'
+export {
+  ZcodeAdapter,
+  ZCODE_MAX_PROMPT_ARG_BYTES,
+  type ZcodeRouteOverride,
+} from './engine/zcodeAdapter.js'
+export * from './engine/promptInput.js'
 // 模型执行权威(容器侧验签消费)。导出 CONTAINER_ATTEST_FRAME_TYPE 等常量供 commercial
 // 侧的 parity 测试锁定 —— 两包不互相 import 生产代码,但「attest 帧 type 必须同值」这条
 // 契约要有一处硬断言,否则改一侧就是静默失联(bridge 永远等不到 attest → 全站拒连接)。

@@ -828,6 +828,75 @@ describe('AutoDreamService cadence', () => {
       rmSync(statePath, { recursive: true, force: true })
     }
   })
+
+  it('bound project run writes project memory instead of agent Core', async () => {
+    process.env.OC_PROJECT_CONTEXT = '1'
+    const agentId = 'stage-implement'
+    const now = Date.UTC(2026, 6, 14, 20, 0, 0)
+    const originalApply = MemoryDir.prototype.applyAutoAdds
+    let coreWrites = 0
+    MemoryDir.prototype.applyAutoAdds = async () => {
+      coreWrites++
+      return { ok: true, created: [] }
+    }
+    const { openTaskboardDb } = await import('../taskboard/db/index.js')
+    const { createProject } = await import('../taskboard/db/projects.js')
+    const { ProjectMemoryLedger } = await import('@openclaude/storage')
+    const db = openTaskboardDb(paths.taskboardDb)
+    const project = createProject(db, { key: 'TEST', name: 'V5' })
+    try {
+      const service = new AutoDreamService({
+        policyClient: {
+          get: async () => ({
+            enabled: true as const,
+            mode: 'legacy_memory_v1' as const,
+            modelId: 'private-model',
+            modelName: 'Private Model',
+            minIntervalHours: 24,
+            minNewSessions: 1,
+          }),
+        } as never,
+        now: () => now,
+        runModel: async () =>
+          JSON.stringify({
+            upserts: [
+              {
+                file: 'board-note.md',
+                name: '看板约定',
+                description: '项目级沉淀',
+                type: 'project',
+                body: '看板约定用表格。',
+              },
+            ],
+            deletes: [],
+            summary: 'ok',
+          }),
+      })
+      await service.maybeSchedule({
+        agentId,
+        userId: '42',
+        sessionKey: 'bound-session',
+        channel: 'webchat',
+        userText: '记住看板约定',
+        assistantText: '好',
+        projectId: project.id,
+      })
+      assert.equal(coreWrites, 0)
+      const ledger = new ProjectMemoryLedger(db)
+      const cands = ledger.listCandidates(project.id)
+      assert.equal(cands.length, 1)
+      assert.equal(cands[0]?.slug, 'board-note.md')
+      // Auto-promotion: the project write is injectable without a human step.
+      assert.equal(cands[0]?.status, 'promoted')
+      assert.deepEqual(
+        ledger.listOfficial(project.id).map((r) => r.slug),
+        ['board-note.md'],
+      )
+    } finally {
+      MemoryDir.prototype.applyAutoAdds = originalApply
+      db.close()
+    }
+  })
 })
 
 describe('Auto-Dream public report projection and receipt', () => {

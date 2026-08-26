@@ -17,6 +17,7 @@ import { createActivity, listActivities } from '../db/activity.js'
 import { createComment, listComments } from '../db/comments.js'
 import {
   TASKBOARD_DDL_V1,
+  TASKBOARD_DDL_V2,
   TASKBOARD_SCHEMA_VERSION,
   TaskboardCrossProjectError,
   TaskboardCycleError,
@@ -66,12 +67,21 @@ afterEach(() => {
 })
 
 describe('schema / migrate', () => {
-  it('建表后 user_version=2,重复 migrate 不报错不改版本', () => {
+  it('建表后 user_version=5,重复 migrate 不报错不改版本', () => {
     const { db } = freshDb()
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
+    assert.equal(TASKBOARD_SCHEMA_VERSION, 8)
     migrate(db)
     migrate(db)
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
+    const runCols = db.prepare(`PRAGMA table_info(tb_ticket_run)`).all() as Array<{ name: string }>
+    assert.ok(runCols.some((c) => c.name === 'cost_imprecise'))
+    assert.ok(runCols.some((c) => c.name === 'context_snapshot_id'))
+    assert.ok(runCols.some((c) => c.name === 'context_sha256'))
+    assert.ok(runCols.some((c) => c.name === 'context_version'))
+    const projCols = db.prepare(`PRAGMA table_info(tb_project)`).all() as Array<{ name: string }>
+    assert.ok(projCols.some((c) => c.name === 'workspace_json'))
+    assert.ok(projCols.some((c) => c.name === 'context_version'))
     const tables = db
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tb_%'`)
       .all() as { name: string }[]
@@ -81,6 +91,10 @@ describe('schema / migrate', () => {
       'tb_pipeline_stage',
       'tb_pipeline_template',
       'tb_project',
+      'tb_project_memory_candidate',
+      'tb_project_memory_event',
+      'tb_project_memory_official',
+      'tb_project_skill',
       'tb_settings',
       'tb_ticket',
       'tb_ticket_activity',
@@ -121,7 +135,7 @@ describe('schema / migrate', () => {
       .run()
     raw.close()
     const db = openTaskboardDb(path)
-    assert.equal(getSchemaVersion(db), 2)
+    assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
     const tables = db
       .prepare(
         `SELECT name FROM sqlite_master WHERE type='table' AND name = 'tb_pipeline_template'`,
@@ -132,6 +146,211 @@ describe('schema / migrate', () => {
       key: string
     }
     assert.equal(project.key, 'OLD')
+    db.close()
+  })
+
+  it('v2 库升到 v3 后 40 行阶段完整且 model 为 null', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-tb-v2-'))
+    dirs.push(dir)
+    const path = join(dir, 'taskboard.db')
+    const raw = new Database(path)
+    raw.pragma('foreign_keys = ON')
+    raw.exec(TASKBOARD_DDL_V1)
+    raw.exec(TASKBOARD_DDL_V2)
+    raw.pragma('user_version = 2')
+    raw
+      .prepare(
+        `INSERT INTO tb_project (id, key, name, description, workspace, labels, archived_at, created_at, updated_at, next_ticket_seq)
+         VALUES ('p1', 'OLD', '旧项目', NULL, NULL, '[]', NULL, 1, 1, 0)`,
+      )
+      .run()
+    raw
+      .prepare(
+        `INSERT INTO tb_pipeline (id, project_id, name, ticket_type, is_default, created_at, updated_at)
+         VALUES ('pipe1', 'p1', '旧线', 'bug', 1, 1, 1)`,
+      )
+      .run()
+    const insert = raw.prepare(
+      `INSERT INTO tb_pipeline_stage (
+         id, pipeline_id, ordinal, name, kind, agent_id, prompt_template, toolsets,
+         effort, patrol_cron, patrol_enabled, patrol_timezone, quiet_hours_start,
+         quiet_hours_end, max_runs_per_day, timeout_sec, max_retries,
+         circuit_breaker_threshold, on_success, on_failure, entry_condition,
+         exit_checklist, require_human_ack, auto_close, created_at, updated_at
+       ) VALUES (
+         ?, 'pipe1', ?, ?, 'ai', 'explorer', 'do {{ticket.title}}', NULL,
+         'medium', '*/30 9-19 * * 1-5', 1, 'Asia/Shanghai', 23,
+         8, 8, 2400, 2,
+         3, 'advance', 'retry', NULL,
+         '做完', 0, 0, 1, 1
+       )`,
+    )
+    for (let i = 0; i < 40; i++) {
+      insert.run(`stage-${i}`, i, `阶段${i}`)
+    }
+    const before = raw
+      .prepare(`SELECT id, name, ordinal, agent_id FROM tb_pipeline_stage ORDER BY ordinal`)
+      .all() as Array<{ id: string; name: string; ordinal: number; agent_id: string }>
+    assert.equal(before.length, 40)
+    raw.close()
+
+    const db = openTaskboardDb(path)
+    assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
+    const cols = db.prepare(`PRAGMA table_info(tb_pipeline_stage)`).all() as Array<{ name: string }>
+    assert.ok(cols.some((c) => c.name === 'model'))
+    const after = db
+      .prepare(
+        `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
+      )
+      .all() as Array<{
+      id: string
+      name: string
+      ordinal: number
+      agent_id: string
+      model: string | null
+    }>
+    assert.equal(after.length, 40)
+    for (let i = 0; i < 40; i++) {
+      assert.equal(after[i].id, `stage-${i}`)
+      assert.equal(after[i].name, `阶段${i}`)
+      assert.equal(after[i].ordinal, i)
+      assert.equal(after[i].agent_id, 'explorer')
+      assert.equal(after[i].model, null)
+    }
+    db.close()
+  })
+
+  it('v3 库升到 v5 后阶段指纹不变、cost_imprecise 全 NULL、二次迁移幂等', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-tb-v3-'))
+    dirs.push(dir)
+    const path = join(dir, 'taskboard.db')
+    const raw = new Database(path)
+    raw.pragma('foreign_keys = ON')
+    raw.exec(TASKBOARD_DDL_V1)
+    raw.exec(TASKBOARD_DDL_V2)
+    raw.exec('ALTER TABLE tb_pipeline_stage ADD COLUMN model TEXT')
+    raw.pragma('user_version = 3')
+    raw
+      .prepare(
+        `INSERT INTO tb_project (id, key, name, description, workspace, labels, archived_at, created_at, updated_at, next_ticket_seq)
+         VALUES ('p1', 'OLD', '旧项目', NULL, NULL, '[]', NULL, 1, 1, 1)`,
+      )
+      .run()
+    raw
+      .prepare(
+        `INSERT INTO tb_pipeline (id, project_id, name, ticket_type, is_default, created_at, updated_at)
+         VALUES ('pipe1', 'p1', '旧线', 'bug', 1, 1, 1)`,
+      )
+      .run()
+    const insertStage = raw.prepare(
+      `INSERT INTO tb_pipeline_stage (
+         id, pipeline_id, ordinal, name, kind, agent_id, prompt_template, toolsets,
+         effort, patrol_cron, patrol_enabled, patrol_timezone, quiet_hours_start,
+         quiet_hours_end, max_runs_per_day, timeout_sec, max_retries,
+         circuit_breaker_threshold, on_success, on_failure, entry_condition,
+         exit_checklist, require_human_ack, auto_close, created_at, updated_at, model
+       ) VALUES (
+         ?, 'pipe1', ?, ?, 'ai', 'explorer', 'do {{ticket.title}}', NULL,
+         'medium', '*/30 9-19 * * 1-5', 1, 'Asia/Shanghai', 23,
+         8, 8, 2400, 2,
+         3, 'advance', 'retry', NULL,
+         '做完', 0, 0, 1, 1, NULL
+       )`,
+    )
+    for (let i = 0; i < 40; i++) {
+      insertStage.run(`stage-${i}`, i, `阶段${i}`)
+    }
+    raw
+      .prepare(
+        `INSERT INTO tb_ticket (
+           id, identifier, project_id, type, title, body, status, stage_id, pipeline_id,
+           priority, severity, labels, assignee, reporter, source, origin_session_key,
+           due_date, start_date, version, blocked_reason, stage_loop_count,
+           created_at, updated_at, closed_at
+         ) VALUES (
+           't1', 'OLD-1', 'p1', 'bug', '旧单', '', 'ready', 'stage-0', 'pipe1',
+           'P2', NULL, '[]', NULL, 'u', 'human', NULL,
+           NULL, NULL, 1, NULL, 0,
+           1, 1, NULL
+         )`,
+      )
+      .run()
+    raw
+      .prepare(
+        `INSERT INTO tb_ticket_run (
+           id, ticket_id, stage_id, agent_id, trigger, session_key, status,
+           skip_reason, lease_owner, lease_expires_at, started_at, finished_at,
+           duration_ms, tokens_in, tokens_out, cost_usd, summary, output_md,
+           error, created_at
+         ) VALUES (
+           'run-1', 't1', 'stage-0', 'explorer', 'patrol', 'sk', 'succeeded',
+           NULL, NULL, NULL, 1, 2,
+           1, 10, 2, 0.12, 'ok', 'done',
+           NULL, 1
+         )`,
+      )
+      .run()
+    const stageFpBefore = raw
+      .prepare(
+        `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
+      )
+      .all()
+    const runFpBefore = raw
+      .prepare(
+        `SELECT id, ticket_id, tokens_in, tokens_out, cost_usd, summary FROM tb_ticket_run ORDER BY id`,
+      )
+      .all()
+    assert.equal(
+      (raw.prepare(`SELECT COUNT(*) AS n FROM tb_pipeline_stage`).get() as { n: number }).n,
+      40,
+    )
+    raw.close()
+
+    const db = openTaskboardDb(path)
+    assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
+    const cols = db.prepare(`PRAGMA table_info(tb_ticket_run)`).all() as Array<{ name: string }>
+    assert.ok(cols.some((c) => c.name === 'cost_imprecise'))
+    assert.equal(
+      (db.prepare(`SELECT COUNT(*) AS n FROM tb_pipeline_stage`).get() as { n: number }).n,
+      40,
+    )
+    const stageFpAfter = db
+      .prepare(
+        `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
+      )
+      .all()
+    const runFpAfter = db
+      .prepare(
+        `SELECT id, ticket_id, tokens_in, tokens_out, cost_usd, summary FROM tb_ticket_run ORDER BY id`,
+      )
+      .all()
+    assert.deepEqual(stageFpAfter, stageFpBefore)
+    assert.deepEqual(runFpAfter, runFpBefore)
+    const imprecise = db
+      .prepare(`SELECT cost_imprecise FROM tb_ticket_run`)
+      .all() as Array<{ cost_imprecise: number | null }>
+    assert.ok(imprecise.length > 0)
+    assert.ok(imprecise.every((row) => row.cost_imprecise == null))
+
+    migrate(db)
+    migrate(db)
+    assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
+    const projCols = db.prepare(`PRAGMA table_info(tb_project)`).all() as Array<{ name: string }>
+    assert.ok(projCols.some((c) => c.name === 'workspace_json'))
+    const memTables = db
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tb_project_memory_%'`,
+      )
+      .all() as { name: string }[]
+    assert.equal(memTables.length, 3)
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
+        )
+        .all(),
+      stageFpBefore,
+    )
     db.close()
   })
 })

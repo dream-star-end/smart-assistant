@@ -106,6 +106,7 @@ const MIGRATION_0239 = path.resolve(here, "../db/migrations/0239_turn_dispatch_s
 const MIGRATION_0240 = path.resolve(here, "../db/migrations/0240_client_session_last_read_at.sql");
 const MIGRATION_0241 = path.resolve(here, "../db/migrations/0241_raise_last_read_watermark.sql");
 const MIGRATION_0243 = path.resolve(here, "../db/migrations/0243_live_unit_checkpoints.sql");
+const MIGRATION_0246_CHAT_PROJECT = path.resolve(here, "../db/migrations/0246_chat_project_board_bind.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -243,6 +244,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0240, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0241, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0243, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0246_CHAT_PROJECT, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE agent_containers (
       user_id BIGINT NOT NULL,
@@ -5711,6 +5713,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     records?: MessageLike[];
     tapeStatus?: "completed" | "crashed" | "interrupted";
     waiveReason?: "idle_timeout" | "turn_limit" | null;
+    errorCode?: string;
   }): Promise<void> {
     const tapeId = sha256(`recoverable-tape\0${args.sessionId}\0${args.sourceClientMessageId}`);
     const turnKey = sha256(`recoverable-turn\0${args.sessionId}\0${args.sourceClientMessageId}`);
@@ -5747,7 +5750,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
             ts: 2,
             _turnTapeId: tapeId,
             _clientMessageId: args.sourceClientMessageId,
-            _errorCode: "upstream_failed",
+            _errorCode: args.errorCode ?? "upstream_failed",
           },
     );
     await pool.query(
@@ -5786,7 +5789,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
           text: "temporary upstream failure",
           ts: 3,
           _clientMessageId: args.sourceClientMessageId,
-          _errorCode: "upstream_failed",
+          _errorCode: args.errorCode ?? "upstream_failed",
         },
       ];
     }
@@ -5837,6 +5840,138 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         sourceClientMessageId,
         mode: "checkpoint",
         automatic: false,
+      },
+    }));
+    assert.equal(recovered.kind, "admitted");
+  });
+
+  async function seedLeftoverProcessFrames(
+    sessionId: string,
+    sourceClientMessageId: string,
+  ): Promise<void> {
+    const streamKey = `legacy:1:recovery-leftover:${sessionId}`;
+    await pool.query(
+      `INSERT INTO client_session_live_streams
+         (stream_key,session_id,user_id,client_message_id,agent_container_id,source,projection_source,terminal_status)
+       VALUES ($1,$2,$3,$4,1,'gateway','tape','crashed')`,
+      [streamKey, sessionId, CUSER, sourceClientMessageId],
+    );
+    const payload = Buffer.from(JSON.stringify({
+      type: "outbound.message",
+      blocks: [
+        { kind: "thinking", text: "checking leftover" },
+        { kind: "text", text: "partial progress" },
+        { kind: "tool_use", toolName: "Bash" },
+      ],
+    }), "utf8");
+    await pool.query(
+      `INSERT INTO client_session_live_frames
+         (stream_key,source,agent_container_id,session_key,frame_seq,payload,payload_sha256)
+       VALUES ($1,'gateway',1,$2,1,$3,$4)`,
+      [streamKey, `agent:main:webchat:dm:${sessionId}`, payload, sha256(payload)],
+    );
+  }
+
+  maybe("SERVICE_RESTART error-only tape uses leftover live frames as checkpoint", async () => {
+    const sessionId = "s-dd-recovery-sr-leftover";
+    const sourceClientMessageId = "cm-dd-recovery-sr-leftover";
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      tapeStatus: "crashed",
+      errorCode: "SERVICE_RESTART",
+      records: [{
+        id: `err-${sourceClientMessageId}`,
+        role: "assistant",
+        text: "任务因服务重启中断，此前已生成的过程已完整保留",
+        ts: 2,
+        _isError: true,
+        _errorCode: "SERVICE_RESTART",
+        _clientMessageId: sourceClientMessageId,
+      }],
+    });
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    const withoutLeftover = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}-miss`,
+      dispatchId: randomUUID(),
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "manual checkpoint",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: false,
+      },
+    }));
+    assert.deepEqual(withoutLeftover, {
+      kind: "recovery_conflict",
+      reason: "recovery_mode_mismatch",
+    });
+
+    await seedLeftoverProcessFrames(sessionId, sourceClientMessageId);
+    const recovered = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      dispatchId: randomUUID(),
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "manual checkpoint",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: false,
+      },
+    }));
+    assert.equal(recovered.kind, "admitted");
+  });
+
+  maybe("SERVICE_RESTART leftover checkpoint allows automatic recovery even if tools are unproven", async () => {
+    const sessionId = "s-dd-recovery-sr-leftover-auto";
+    const sourceClientMessageId = "cm-dd-recovery-sr-leftover-auto";
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      tapeStatus: "crashed",
+      errorCode: "SERVICE_RESTART",
+      records: [{
+        id: `err-${sourceClientMessageId}`,
+        role: "assistant",
+        text: "任务因服务重启中断",
+        ts: 2,
+        _isError: true,
+        _errorCode: "SERVICE_RESTART",
+        _clientMessageId: sourceClientMessageId,
+      }],
+    });
+    await seedLeftoverProcessFrames(sessionId, sourceClientMessageId);
+    const identity = turnRecoveryAttemptIdentity(sessionId, sourceClientMessageId, 1);
+    const recovered = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      dispatchId: randomUUID(),
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "automatic checkpoint",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: true,
+        rootClientMessageId: sourceClientMessageId,
+        attempt: 1,
+        max: 10,
       },
     }));
     assert.equal(recovered.kind, "admitted");
@@ -6531,6 +6666,133 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.doesNotMatch(request.content?.text ?? "", /deploy\.sh/);
   });
 
+  maybe("silent liveness recovery resets native state once, then pauses the durable lineage", async () => {
+    const sessionId = "s-dd-recovery-silent-streak";
+    const sourceClientMessageId = "cm-dd-recovery-silent-source";
+    const sourceAdmission = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: sourceClientMessageId,
+      billingRequestId: `brq-${sourceClientMessageId}`,
+      message: {
+        id: sourceClientMessageId,
+        role: "user",
+        text: "fix it",
+        ts: 1,
+        _routing: { model: "grok-build", effortLevel: null, teamMode: false },
+      } as MessageLike & { id: string },
+    }));
+    assert.equal(sourceAdmission.kind, "admitted");
+    await stageAndFinalize(CUSER, buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "interrupted",
+      turnKey: "e".repeat(64),
+      clientMessageId: sourceClientMessageId,
+      text: "任务约 15 分钟无输出",
+      errorCode: "LIVENESS_TIMEOUT",
+      waiveReason: "idle_timeout",
+      createdAt: 1_783_950_200_000,
+      usage: { inputTokens: 0, outputTokens: 0 },
+      runtimeEvents: [{
+        ordinal: 0,
+        observedAt: 1_783_950_200_001,
+        source: "gateway",
+        payload: { type: "turn_started", status: "working" },
+      }],
+    }));
+
+    const claimed = await claimDueRecoveryJobs(pool, {
+      userId: UID,
+      ownerId: "master-silent-test",
+      leaseMs: 120_000,
+      limit: 20,
+    });
+    const job = claimed.find((candidate) =>
+      candidate.sessionId === sessionId &&
+      candidate.sourceClientMessageId === sourceClientMessageId
+    );
+    assert.ok(job);
+    const request = job.request as {
+      content: {
+        text: string;
+        recovery: {
+          sourceClientMessageId: string;
+          mode: "checkpoint" | "replay";
+          automatic: true;
+          rootClientMessageId: string;
+          attempt: number;
+          max: 10;
+          resetNativeSession?: true;
+        };
+      };
+      clientMessageId: string;
+    };
+    assert.equal(request.content.recovery.resetNativeSession, true);
+    const recoveryAdmission = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: request.clientMessageId,
+      billingRequestId: `brq-${request.clientMessageId}`,
+      message: {
+        id: request.clientMessageId,
+        role: "user",
+        text: request.content.text,
+        ts: 2,
+        _routing: { model: "grok-build", effortLevel: null, teamMode: false },
+        _automaticRecovery: true,
+        _automaticRecoveryRootClientMessageId: sourceClientMessageId,
+        _automaticRecoveryAttempt: 1,
+        _automaticRecoveryMax: 10,
+        _recoveryOfClientMessageId: sourceClientMessageId,
+      } as MessageLike & { id: string },
+      recovery: request.content.recovery,
+      recoveryJob: { jobId: job.jobId, leaseOwner: job.leaseOwner, leaseEpoch: job.leaseEpoch },
+    }));
+    assert.equal(recoveryAdmission.kind, "admitted");
+    if (recoveryAdmission.kind !== "admitted") return;
+    assert.equal(await markRecoveryContainerReceipt(pool, {
+      dispatchId: recoveryAdmission.dispatch.dispatchId,
+      dispatchAttemptNo: recoveryAdmission.dispatch.attemptNo,
+      expectedDispatchLeaseEpoch: recoveryAdmission.dispatch.leaseEpoch,
+    }), true);
+
+    await stageAndFinalize(CUSER, buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 2,
+      status: "interrupted",
+      turnKey: "f".repeat(64),
+      clientMessageId: request.clientMessageId,
+      text: "任务约 15 分钟无输出",
+      errorCode: "LIVENESS_TIMEOUT",
+      waiveReason: "idle_timeout",
+      createdAt: 1_783_950_300_000,
+      usage: { inputTokens: 0, outputTokens: 0 },
+      runtimeEvents: [{
+        ordinal: 0,
+        observedAt: 1_783_950_300_001,
+        source: "gateway",
+        payload: { type: "turn_started", status: "working" },
+      }],
+    }));
+    const lineage = await pool.query<{
+      semantic_recovery_attempt: number;
+      status: string;
+      pause_reason: string | null;
+    }>(
+      `SELECT semantic_recovery_attempt,status,pause_reason
+         FROM turn_recovery_jobs
+        WHERE user_id=$1 AND session_id=$2 AND root_client_message_id=$3
+        ORDER BY semantic_recovery_attempt`,
+      [UID.toString(), sessionId, sourceClientMessageId],
+    );
+    assert.deepEqual(lineage.rows, [{
+      semantic_recovery_attempt: 1,
+      status: "paused",
+      pause_reason: "automatic_silent_no_progress",
+    }]);
+  });
+
   maybe("verified not-accepted source can replay exactly without inventing a tape", async () => {
     const sessionId = "s-dd-recovery-not-accepted";
     const sourceClientMessageId = "cm-dd-recovery-not-accepted-source";
@@ -6742,8 +7004,11 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       role: "assistant" as const,
       text: `QUOTE-HEAD\n${"被引用的完整历史回答".repeat(30_000)}\nQUOTE-TAIL`,
     };
-    const expectedModelText = formatMessageReplyPrompt(exactModelText, replyTo)
-      .replaceAll("\u0000", "\\u0000");
+    const expectedModelText = [
+      formatMessageReplyPrompt(exactModelText, replyTo),
+      "用户附带了以下图片(已保存到服务器本地):",
+      "- `/home/agent/.openclaude/uploads/guide.png`",
+    ].join("\n").replaceAll("\u0000", "\\u0000");
     assert.ok(Buffer.byteLength(text, "utf8") > 4 * 1024 * 1024);
     await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
     const admitted = await backend.admitUserTurn(admitInput({

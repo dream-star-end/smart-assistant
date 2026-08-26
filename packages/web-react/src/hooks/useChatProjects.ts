@@ -192,7 +192,12 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
   const updateProject = useCallback(
     async (
       id: string,
-      patch: { name?: string; color?: string | null; instructions?: string | null },
+      patch: {
+        name?: string;
+        color?: string | null;
+        instructions?: string | null;
+        boardProjectId?: string | null;
+      },
     ) => {
       let snapshot: ChatProject[] = [];
       setProjects((c) => {

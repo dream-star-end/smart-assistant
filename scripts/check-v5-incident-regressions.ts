@@ -357,6 +357,13 @@ function parseWaivers(): Map<string, Waiver> {
 const IMPORTED_TRAILER_HISTORY_TIPS = [
   "7ad3910346d03f072db5b4debd9e29b43f13de30",
   "5ecb3ead3fb07d8506d62c0d3ffc282d0170ae61",
+  "655a47da520b87419353774bb9ffd77290a05460",
+  "e1077dfd4b99ff28dd17cb77e627e5bc534e738e",
+  // selfhost 已在本轮 trailer gate 运行前发布到该不可变 tip；只冻结其祖先，
+  // 后续 unified commits 仍逐条走 trailer / waiver 闭环。
+  "28962cf36f60afdf3cca10f5a6d51beafcea2724",
+  // 双向同步冻结:该 selfhost tip 已上线；只豁免其不可变祖先。
+  "654a56f0b370cf5b1530e9861b79d7d10976f836",
 ] as const;
 
 function checkTrailerClosure(): number {

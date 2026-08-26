@@ -6,8 +6,8 @@
 //   上游连错时同一句 API Error 会被无分隔拼接成上千行,截成 400 字后只剩
 //   `API …`,人看不出发生了什么。评论侧归并重复,run.outputMd 保留原文。
 
-export const SUMMARY_MAX = 400
-export const COMMENT_MAX = 1200
+export const SUMMARY_MAX = 1500
+export const COMMENT_MAX = 4000
 export const UNSTRUCTURED_TAIL_MARK = '（未结构化输出，截取尾部）'
 
 const CONCLUSION_HEADING_RE =

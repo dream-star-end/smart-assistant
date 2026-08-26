@@ -5,6 +5,9 @@ import {
   AUTOMATIC_TURN_RETRY_MAX,
   TURN_ERROR_TAXONOMY,
   assessTurnRecoveryTape,
+  hasMeaningfulAutomaticRecoveryProgress,
+  shouldPauseSilentAutomaticRecovery,
+  shouldResetNativeSessionForRecovery,
   maxAutomaticTurnRetryAttempt,
   supportsAutomaticRecoveryWithoutCheckpoint,
   supportsAutomaticTurnRecovery,
@@ -134,6 +137,34 @@ describe('automatic turn recovery policy', () => {
         max: AUTOMATIC_TURN_RETRY_MAX,
       },
     ], 'client-1'), 7)
+  })
+
+  it('resets one first-event silent recovery, then persistently pauses the same no-progress lineage', () => {
+    const silent = [
+      { role: 'runtime-event', _runtimeEvent: { type: 'status', status: 'working' } },
+      { role: 'assistant', text: '任务约 15 分钟无输出', _errorCode: 'LIVENESS_TIMEOUT' },
+      { usage: { inputTokens: 0, outputTokens: 0 } },
+    ]
+    assert.equal(hasMeaningfulAutomaticRecoveryProgress(silent), false)
+    assert.equal(shouldResetNativeSessionForRecovery({
+      errorCode: 'LIVENESS_TIMEOUT', currentAttempt: 0, records: silent,
+    }), true)
+    assert.equal(shouldPauseSilentAutomaticRecovery({
+      errorCode: 'LIVENESS_TIMEOUT', currentAttempt: 1, records: silent,
+    }), true)
+  })
+
+  it('keeps the ordinary retry budget once model, tool, or token progress exists', () => {
+    for (const records of [
+      [{ role: 'thinking', text: 'checked state' }],
+      [{ kind: 'tool_use', id: 'tool-1' }],
+      [{ usage: { cacheReadTokens: 42 } }],
+    ]) {
+      assert.equal(hasMeaningfulAutomaticRecoveryProgress(records), true)
+      assert.equal(shouldPauseSilentAutomaticRecovery({
+        errorCode: 'idle_timeout', currentAttempt: 1, records,
+      }), false)
+    }
   })
 
   it('derives checkpoint safety from exact process and external-action states', () => {

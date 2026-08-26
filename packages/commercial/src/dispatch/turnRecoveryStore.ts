@@ -71,11 +71,16 @@ export async function enqueueAutomaticRecoveryJob(
        request_json,tape_sha256
      )
      SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10
-      WHERE NOT EXISTS (
+     WHERE NOT EXISTS (
         SELECT 1 FROM turn_control_requests c
          WHERE c.user_id=$1 AND c.session_id=$2 AND c.kind='stop'
            AND c.root_client_message_id=$3
       )
+       AND NOT EXISTS (
+         SELECT 1 FROM turn_recovery_jobs p
+          WHERE p.user_id=$1 AND p.session_id=$2 AND p.root_client_message_id=$3
+            AND p.status='paused' AND p.pause_reason='automatic_silent_no_progress'
+       )
      ON CONFLICT (user_id,session_id,root_client_message_id,semantic_recovery_attempt)
        DO NOTHING`,
     [
@@ -108,11 +113,19 @@ export async function claimDueRecoveryJobs(
     lease_epoch: string
   }>(
     `WITH due AS (
-       SELECT job_id
-         FROM turn_recovery_jobs
-        WHERE user_id=$1 AND status IN ('queued','leased','sent')
-          AND next_attempt_at<=NOW()
-          AND (status='queued' OR lease_until<NOW())
+       SELECT candidate.job_id
+         FROM turn_recovery_jobs candidate
+        WHERE candidate.user_id=$1 AND candidate.status IN ('queued','leased','sent')
+          AND candidate.next_attempt_at<=NOW()
+          AND (candidate.status='queued' OR candidate.lease_until<NOW())
+          AND NOT EXISTS (
+            SELECT 1 FROM turn_recovery_jobs paused
+             WHERE paused.user_id=candidate.user_id
+               AND paused.session_id=candidate.session_id
+               AND paused.root_client_message_id=candidate.root_client_message_id
+               AND paused.status='paused'
+               AND paused.pause_reason='automatic_silent_no_progress'
+          )
         ORDER BY created_at
         FOR UPDATE SKIP LOCKED
         LIMIT $4
@@ -171,6 +184,11 @@ export async function bindRecoveryJobDispatch(
           SELECT 1 FROM turn_control_requests c
            WHERE c.user_id=$2 AND c.session_id=$3 AND c.kind='stop'
              AND c.root_client_message_id=$4
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM turn_recovery_jobs p
+           WHERE p.user_id=$2 AND p.session_id=$3 AND p.root_client_message_id=$4
+             AND p.status='paused' AND p.pause_reason='automatic_silent_no_progress'
         )`,
     [
       input.jobId, input.userId.toString(), input.sessionId, input.rootClientMessageId,
@@ -244,6 +262,12 @@ export async function forwardRecoveryUnderRootFence(
             SELECT 1 FROM turn_control_requests c
              WHERE c.user_id=j.user_id AND c.session_id=j.session_id
                AND c.kind='stop' AND c.root_client_message_id=j.root_client_message_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM turn_recovery_jobs p
+             WHERE p.user_id=j.user_id AND p.session_id=j.session_id
+               AND p.root_client_message_id=j.root_client_message_id
+               AND p.status='paused' AND p.pause_reason='automatic_silent_no_progress'
           )
         FOR UPDATE OF j,d`,
       [
@@ -371,5 +395,43 @@ export async function settleRecoveryJobForTape(
         AND request_json->>'clientMessageId'=$3
         AND status IN ('leased','sent','forwarded')`,
     [input.userId.toString(), input.sessionId, input.clientMessageId, input.outcome, AUTOMATIC_TURN_RETRY_MAX],
+  )
+}
+
+/** Persist the no-progress circuit breaker on the exact recovery lineage.
+ * The current semantic attempt becomes the durable paused receipt; any
+ * descendant authored by an older concurrent master is cancelled under the
+ * same root advisory lock. */
+export async function pauseSilentRecoveryLineage(
+  q: Queryable,
+  input: {
+    userId: bigint
+    sessionId: string
+    rootClientMessageId: string
+    currentAttempt: number
+    terminalOutcome: 'completed' | 'interrupted' | 'crashed'
+  },
+): Promise<void> {
+  if (!Number.isSafeInteger(input.currentAttempt) || input.currentAttempt < 1) return
+  await lockRecoveryRoot(q, input)
+  await q.query(
+    `UPDATE turn_recovery_jobs
+        SET status=CASE
+              WHEN semantic_recovery_attempt=$4 THEN 'paused'
+              ELSE 'cancelled'
+            END,
+            pause_reason='automatic_silent_no_progress',
+            terminal_outcome=CASE
+              WHEN semantic_recovery_attempt=$4 THEN $5
+              ELSE terminal_outcome
+            END,
+            lease_owner=NULL,lease_until=NULL,updated_at=NOW()
+      WHERE user_id=$1 AND session_id=$2 AND root_client_message_id=$3
+        AND semantic_recovery_attempt >= $4
+        AND status <> 'cancelled'`,
+    [
+      input.userId.toString(), input.sessionId, input.rootClientMessageId,
+      input.currentAttempt, input.terminalOutcome,
+    ],
   )
 }

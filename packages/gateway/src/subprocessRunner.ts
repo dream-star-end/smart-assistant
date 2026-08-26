@@ -23,8 +23,10 @@ import {
   shutdownTimeoutMs as runnerShutdownTimeoutMs,
   waitForCloseWithin,
 } from './processGroupShutdown.js'
+import { decideEngineCwd } from './engineCwd.js'
+import { persistRunContextSnapshot } from './runContextPersist.js'
 import { buildPromptContext } from './promptSlots.js'
-import { resolveMcpMemoryEntry } from './mcpMemoryEntry.js'
+import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { type TerminalBackend, createBackend } from './terminalBackend.js'
@@ -202,6 +204,92 @@ export function _buildSecondaryUtilityModelEnv(): Record<string, string> {
   const model =
     process.env.OPENCLAUDE_SECONDARY_MODEL?.trim() || DEFAULT_SECONDARY_UTILITY_MODEL
   return { ANTHROPIC_SMALL_FAST_MODEL: model }
+}
+
+const CCB_TRANSPORT_INTERNAL_KEYS = [
+  'OPENCLAUDE_CCB_HTTPS_PROXY',
+  'OPENCLAUDE_CCB_NO_PROXY',
+  'OPENCLAUDE_CCB_TZ',
+] as const
+
+function assertCredentialFreeHttpProxy(value: string): string {
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    throw new Error('OPENCLAUDE_CCB_HTTPS_PROXY must be a valid URL')
+  }
+  if (
+    (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+    parsed.username ||
+    parsed.password ||
+    !parsed.hostname ||
+    (parsed.pathname !== '' && parsed.pathname !== '/') ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new Error('OPENCLAUDE_CCB_HTTPS_PROXY must be a credential-free http(s) origin')
+  }
+  return parsed.toString().replace(/\/$/, '')
+}
+
+/**
+ * Build the inherited CCB environment while keeping platform-only transport
+ * controls out of the child. When enabled, the same HTTPS proxy is written in
+ * both cases, legacy HTTP/ALL proxy variables are removed, and the current
+ * internal ANTHROPIC_BASE_URL host must be explicitly present in NO_PROXY.
+ */
+export function buildCcbSpawnProcessEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...source }
+  for (const key of CCB_TRANSPORT_INTERNAL_KEYS) delete env[key]
+
+  const proxyRaw = source.OPENCLAUDE_CCB_HTTPS_PROXY?.trim()
+  const noProxyRaw = source.OPENCLAUDE_CCB_NO_PROXY?.trim()
+  if (proxyRaw) {
+    const proxy = assertCredentialFreeHttpProxy(proxyRaw)
+    if (!noProxyRaw) {
+      throw new Error('OPENCLAUDE_CCB_NO_PROXY is required with OPENCLAUDE_CCB_HTTPS_PROXY')
+    }
+    const noProxyHosts = new Set(
+      noProxyRaw
+        .split(',')
+        .map((part) => part.trim().replace(/^\[|\]$/g, ''))
+        .filter(Boolean),
+    )
+    const anthropicBase = source.ANTHROPIC_BASE_URL?.trim()
+    if (anthropicBase) {
+      let internalHost: string
+      try {
+        internalHost = new URL(anthropicBase).hostname
+      } catch {
+        throw new Error('ANTHROPIC_BASE_URL must be valid when CCB HTTPS proxying is enabled')
+      }
+      if (!noProxyHosts.has(internalHost)) {
+        throw new Error('OPENCLAUDE_CCB_NO_PROXY must include the ANTHROPIC_BASE_URL host')
+      }
+    }
+    delete env.HTTP_PROXY
+    delete env.http_proxy
+    delete env.ALL_PROXY
+    delete env.all_proxy
+    env.HTTPS_PROXY = proxy
+    env.https_proxy = proxy
+    env.NO_PROXY = noProxyRaw
+    env.no_proxy = noProxyRaw
+  }
+
+  const timezone = source.OPENCLAUDE_CCB_TZ?.trim()
+  if (timezone) {
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format()
+    } catch {
+      throw new Error('OPENCLAUDE_CCB_TZ must be a valid IANA timezone')
+    }
+    env.TZ = timezone
+  }
+  return env
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -566,6 +654,10 @@ export interface SubprocessRunnerOpts {
    *  理论上 sessionKey 已经能推出 sessionId,但为避免重复解析串错,显式传。
    *  null/undefined → 不查 repo snapshot(Codex / 旧调用兼容)。 */
   sessionId?: string
+  /** Bound taskboard / chat project id for MCP skill overlay. */
+  projectId?: string
+  /** Unique run-context authority. Engines must not invent runId/projectId. */
+  runContext?: import('./runContextPersist.js').RunContextDescriptor
   /** Phase 5:读 SessionRepoWorkspaceManager 的 RepoSnapshot(单进程下即权威 state)。
    *  在 start() 内调用一次,用于:
    *    1) 决定 effective addDir(ready 时切到 workspaceDir,其它情况 fall-back agentBaseDir)
@@ -984,7 +1076,25 @@ export class SubprocessRunner extends EventEmitter {
     return (this.proc !== null && !this.closed) || this.starting
   }
 
+  /** Shared in-flight spawn so concurrent callers (session preheat + submit)
+   * await the SAME start instead of the second caller returning early while
+   * `starting` is still true and then throwing on `!this.proc`. */
+  private _startPromise: Promise<void> | null = null
+
   async start(): Promise<void> {
+    if (this.proc) return
+    const inflight = this._startPromise
+    if (inflight) return inflight
+    const started = this._startInternal()
+    this._startPromise = started
+    try {
+      await started
+    } finally {
+      if (this._startPromise === started) this._startPromise = null
+    }
+  }
+
+  private async _startInternal(): Promise<void> {
     if (this.proc || this.starting) return
     // ── Crash-loop gate ──
     // If the previous crash(es) pushed _backoffUntil into the future, refuse to
@@ -1146,7 +1256,7 @@ export class SubprocessRunner extends EventEmitter {
         // 与 Bash 工具的 working directory 都跟系统提示对齐。
         subprocessCwd: learningContext.workingDir ?? effectiveAddDir,
         env: {
-          ...process.env,
+          ...buildCcbSpawnProcessEnv(),
           ...providerEnv,
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
@@ -1695,6 +1805,21 @@ export class SubprocessRunner extends EventEmitter {
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: this.opts.sessionId,
+        projectId: this.opts.projectId,
+      })
+      const cwdDecision = decideEngineCwd({
+        agentBaseDir: this.opts.agentBaseDir,
+        repoSnapshot,
+        projectBound: Boolean(this.opts.projectId),
+      })
+      await persistRunContextSnapshot({
+        descriptor: this.opts.runContext,
+        applied: promptResult.applied,
+        promptContentSha256: promptResult.contentSha256,
+        frozen: promptResult.frozenProjectContext,
+        cwd: cwdDecision.cwd,
+        cwdSource: cwdDecision.source,
+        sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
       const goalPrompt = renderCcbGoalPrompt(this.platformGoal)
       const mergedPrompt = [promptResult.content, goalPrompt].filter(Boolean).join('\n\n')
@@ -1710,6 +1835,7 @@ export class SubprocessRunner extends EventEmitter {
         backend: 'ccb',
         prompt_bytes: Buffer.byteLength(mergedPrompt, 'utf8'),
         prompt_sha256: mergedPromptSha256.slice(0, 12),
+        board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
       // observability:MODEL_HINT 命中(per-model 行为补丁注入)→ structured log + prom counter。
       // 不打 prompt 原文(可能含敏感引导),只记 sha256[:8] + bytes。
@@ -1745,12 +1871,15 @@ export class SubprocessRunner extends EventEmitter {
 
       // ── Built-in: openclaude-memory (L1/L2/L3 learning loop) ──
       // Path resolution shared with codexLaunchOverrides so ccb / codex / app-server
-      // all point npx at the same bundled entry. Note: env construction below
+      // all launch the same bundled server (prebuilt CJS when the release built
+      // it, historical npx+tsx otherwise). Note: env construction below
       // is intentionally NOT shared (v3 subprocessRunner has tighter
       // OPENCLAUDE_HOME semantics — only forward when host process actually
       // set it; codex side passes empty-string default).
-      const mcpEntry = resolveMcpMemoryEntry(this.opts.config.auth.claudeCodePath)
-      if (mcpEntry) {
+      const mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
+        fallback: 'npx-tsx',
+      })
+      if (mcpLaunch) {
         const delegateContextFile = resolve(sessionDir, 'delegate-context')
         writeFileSync(
           delegateContextFile,
@@ -1764,10 +1893,11 @@ export class SubprocessRunner extends EventEmitter {
         this.delegateContextFile = delegateContextFile
         mcpServers['openclaude-memory'] = {
           type: 'stdio',
-          command: 'npx',
-          args: ['tsx', mcpEntry],
+          command: mcpLaunch.command,
+          args: mcpLaunch.args,
           env: {
             OPENCLAUDE_AGENT_ID: this.opts.agentId,
+            ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),
             // 2026-04-22: 只在 host 进程里确实 set 了 OPENCLAUDE_HOME 时才向下传 —— 空串
             // 会被 mcp-memory 的 paths.ts 当成"有值",与 `??` 语义冲突,让所有 memory/skill
             // 路径退化为相对 cwd 的路径,跨容器串。v3 容器由 entrypoint.ts 显式注入

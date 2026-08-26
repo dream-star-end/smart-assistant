@@ -24,8 +24,7 @@ import { enqueueQqDelivery } from './outbox.js'
 import { clearRunningQqSession } from './sessionPointer.js'
 import { getQqBinding } from './store.js'
 
-export const QQ_OUTBOUND_PATH = '/internal/v3/qq-outbound'
-export const QQ_PROACTIVE_PATH = '/internal/v3/qq-proactive'
+export { QQ_OUTBOUND_PATH, QQ_PROACTIVE_PATH } from '@openclaude/protocol'
 
 const ID_RE = /^[A-Za-z0-9._:-]{8,128}$/
 const SESSION_RE = /^wsess-[0-9a-f]{16}$/

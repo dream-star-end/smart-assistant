@@ -51,6 +51,7 @@ import {
 } from "../runtimeCapabilities.js";
 import { ocGatewayIpForChannel, ocInternalProxyPortForChannel } from "../agent-sandbox/v3supervisor.js";
 import { getSelfHost } from "../compute-pool/queries.js";
+import { EGRESS_HEALTH_PATH, EGRESS_STATS_PATH } from "@openclaude/protocol";
 import { rootLogger } from "../logging/logger.js";
 import { CODEX_TOKEN_REFRESH_PATH } from "../http/internalCodexTokenRefresh.js";
 import { CODEX_RELAY_PREFIX } from "../http/internalCodexRelay.js";
@@ -395,7 +396,7 @@ export async function startEgress(): Promise<void> {
       });
       return;
     }
-    if (path === "/internal/v5/egress-health") {
+    if (path === EGRESS_HEALTH_PATH) {
       // D3④:finalize 门槛差分数据源。processStartId + 单调计数器一并暴露,
       // 部署脚本据此判断队列真排空(startId 未变 ∧ pendingEnd=0 ∧ enqueuedDelta==sentDelta
       // ∧ expired/overflow delta=0)。
@@ -419,7 +420,7 @@ export async function startEgress(): Promise<void> {
     }
     // 0106 — per-model 在飞快照(admin 容量面;master 的 model-ops 端点拉取,egress 是
     // /v1/messages 的独占进程,这里的计数即全量权威)。与 egress-health 同级内网只读面。
-    if (path === "/internal/v5/egress-stats") {
+    if (path === EGRESS_STATS_PATH) {
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
       res.end(JSON.stringify({ ok: true, role: "egress", inflight: snapshotInflight() }));

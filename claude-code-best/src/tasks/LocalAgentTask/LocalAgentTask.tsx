@@ -26,6 +26,7 @@ import { createAbortController, createChildAbortController } from '../../utils/a
 import { registerCleanup } from '../../utils/cleanupRegistry.js';
 import { getSearchExtraToolsOrReadInfo } from '../../utils/collapseReadSearch.js';
 import { enqueuePendingNotification } from '../../utils/messageQueueManager.js';
+import { emitTaskTerminatedSdk } from '../../utils/sdkEventQueue.js';
 import { getAgentTranscriptPath } from '../../utils/sessionStorage.js';
 import { evictTaskOutput, getTaskOutputPath, initTaskOutputAsSymlink } from '../../utils/task/diskOutput.js';
 import { PANEL_GRACE_MS, registerTask, updateTaskState } from '../../utils/task/framework.js';
@@ -314,7 +315,29 @@ export function enqueueAgentNotification({
 <${SUMMARY_TAG}>${summary}</${SUMMARY_TAG}>${resultSection}${usageSection}${worktreeSection}
 </${TASK_NOTIFICATION_TAG}>`;
 
-  enqueuePendingNotification({ value: message, mode: 'task-notification' });
+  enqueuePendingNotification({
+    value: message,
+    mode: 'task-notification',
+    priority: 'next',
+    taskId,
+  });
+
+  // Immediate stdout bookend for SDK/gateway consumers. Does not wait for
+  // drainCommandQueue / the next ask(). Parent CCB already dead is not
+  // covered — there is no process left to emit or inject.
+  const sdkStatus = status === 'killed' ? 'stopped' : status;
+  emitTaskTerminatedSdk(taskId, sdkStatus, {
+    toolUseId,
+    summary,
+    outputFile: outputPath,
+    usage: usage
+      ? {
+          total_tokens: usage.totalTokens,
+          tool_uses: usage.toolUses,
+          duration_ms: usage.durationMs,
+        }
+      : undefined,
+  });
 }
 
 /**

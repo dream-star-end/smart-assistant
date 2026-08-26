@@ -25,8 +25,7 @@ import {
 import { type Logger, rootLogger } from '../logging/logger.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
-export const TOOL_FAILURE_AUDIT_PATH = '/internal/v3/agent-audit/tool-failure'
-export const TOOL_CALL_ROLLUP_PATH = '/internal/v3/agent-audit/tool-rollup'
+export { TOOL_FAILURE_AUDIT_PATH, TOOL_CALL_ROLLUP_PATH } from '@openclaude/protocol'
 export const TOOL_AUDIT_SCHEMA_HEADER = 'X-OpenClaude-Tool-Audit-Schema'
 
 /**

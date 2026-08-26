@@ -5,6 +5,7 @@
 import type { BashTail } from "../../lib/chat/model";
 import { normalizeGrokToolForDisplay } from "./grokDisplay";
 import { parsePartialJson } from "./partialJson";
+import { stripAnsi } from "./stripAnsi";
 
 /**
  * 工具卡消费的最小 tool 形态。`tool` ChatMessage（role==='tool'）与 agent-group 的
@@ -312,10 +313,32 @@ export function normalizeToolForDisplay(message: ToolLike): DisplayTool {
   }
   if (codexType) {
     const normalized = normalizeCodexTool(message, codexType);
-    if (normalized) return normalized;
+    if (normalized) return stripToolAnsi(normalized);
   }
   const input = resolveToolInput(message);
-  return normalizeGrokToolForDisplay(originalName, input, message);
+  return stripToolAnsi(normalizeGrokToolForDisplay(originalName, input, message));
+}
+
+/** 展示层剥 stdout/stderr/bashTail 里的 CSI，历史 tape 刷新即可去乱码。 */
+function stripToolAnsi(display: DisplayTool): DisplayTool {
+  const { tool } = display;
+  const output = typeof tool.output === "string" ? stripAnsi(tool.output) : tool.output;
+  const text = typeof tool.text === "string" ? stripAnsi(tool.text) : tool.text;
+  const tail = tool.bashTail?.tail;
+  const nextTail = typeof tail === "string" ? stripAnsi(tail) : tail;
+  const bashTailChanged = !!tool.bashTail && nextTail !== tail;
+  if (output === tool.output && text === tool.text && !bashTailChanged) return display;
+  return {
+    ...display,
+    tool: {
+      ...tool,
+      output,
+      text,
+      ...(bashTailChanged && tool.bashTail
+        ? { bashTail: { ...tool.bashTail, tail: nextTail ?? "" } }
+        : {}),
+    },
+  };
 }
 
 /** 取末 2-3 段路径（过长时 `…/a/b/c`）。 */

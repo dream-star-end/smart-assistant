@@ -12,10 +12,14 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 
+import {
+  MARKETPLACE_AGENT_PREFIX,
+  MARKETPLACE_LOCAL_RELAY_PREFIX,
+} from '@openclaude/protocol'
 import { isLoopbackRemoteAddress } from './v3CodexRelay.js'
 
-export const V3_MARKETPLACE_LOCAL_RELAY_PREFIX = '/internal/v3/marketplace/agent-local'
-export const V3_MARKETPLACE_MASTER_AGENT_PREFIX = '/internal/v3/marketplace/agent/'
+export const V3_MARKETPLACE_LOCAL_RELAY_PREFIX = MARKETPLACE_LOCAL_RELAY_PREFIX
+export const V3_MARKETPLACE_MASTER_AGENT_PREFIX = MARKETPLACE_AGENT_PREFIX
 
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',

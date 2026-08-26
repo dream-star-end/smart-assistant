@@ -53,6 +53,13 @@ interface WaiverRow {
   inbox_message_id: string | null
 }
 
+interface WaiverLineage {
+  sessionId: string
+  clientMessageId: string
+  rootClientMessageId: string
+  messages: Array<Record<string, unknown>>
+}
+
 interface OrgLock {
   credits: bigint
   credits0: bigint
@@ -70,6 +77,79 @@ const REASON_COPY: Record<TurnWaiveReason, string> = {
   no_response: '任务未能产生有效回复',
   platform_authority_expired: '长任务的执行凭证异常',
   turn_limit: '任务达到 12 小时运行上限',
+}
+
+function recoveryRootForMessage(
+  messages: Array<Record<string, unknown>>,
+  clientMessageId: string,
+): string {
+  const user = messages.find((message) => message.role === 'user' && message.id === clientMessageId)
+  if (!user) return clientMessageId
+  const root = user._automaticRecoveryRootClientMessageId
+  if (typeof root === 'string' && root.length > 0) return root
+  const source = user._automaticRecovery === true ? user._recoveryOfClientMessageId : null
+  return typeof source === 'string' && source.length > 0 ? source : clientMessageId
+}
+
+async function readWaiverLineage(
+  client: PoolClient,
+  uid: string,
+  turnKey: string,
+): Promise<WaiverLineage | null> {
+  const row = (
+    await client.query<{
+      session_id: string
+      client_message_id: string | null
+      recovery_root_client_message_id: string | null
+      messages: string
+    }>(
+      `SELECT t.session_id,t.client_message_id,j.root_client_message_id AS recovery_root_client_message_id,
+              s.messages
+         FROM client_session_turn_tapes t
+         JOIN client_sessions s ON s.id=t.session_id AND s.user_id=t.user_id
+         LEFT JOIN turn_recovery_jobs j
+           ON j.user_id=$1::bigint AND j.session_id=t.session_id
+          AND j.request_json->>'clientMessageId'=t.client_message_id
+        WHERE t.user_id=('c:' || $1::text) AND t.turn_key=$2
+        ORDER BY t.finalized_at DESC NULLS LAST,t.created_at DESC
+        LIMIT 1`,
+      [uid, turnKey],
+    )
+  ).rows[0]
+  if (!row?.client_message_id) return null
+  try {
+    const parsed = JSON.parse(row.messages)
+    if (!Array.isArray(parsed)) return null
+    const messages = parsed.filter(
+      (value): value is Record<string, unknown> =>
+        !!value && typeof value === 'object' && !Array.isArray(value),
+    )
+    return {
+      sessionId: row.session_id,
+      clientMessageId: row.client_message_id,
+      rootClientMessageId: row.recovery_root_client_message_id ??
+        recoveryRootForMessage(messages, row.client_message_id),
+      messages,
+    }
+  } catch {
+    return null
+  }
+}
+
+function waiverReceiptBody(input: {
+  reason: TurnWaiveReason
+  refunded: bigint
+  waiverCount: number
+}): string {
+  const reasonCopy = REASON_COPY[input.reason]
+  const prefix = input.waiverCount > 1
+    ? `由于${reasonCopy}，本次任务及其自动恢复尝试已统一免单。`
+    : `由于${reasonCopy}，本轮已自动免单。`
+  return input.refunded > 0n
+    ? input.waiverCount > 1
+      ? `${prefix}累计退还 **${input.refunded.toString()} 积分**。积分已按原扣费来源退回个人或组织额度。你可以回到原会话重新尝试。`
+      : `由于${reasonCopy}，本轮已自动免单，并退还 **${input.refunded.toString()} 积分**。积分已按原扣费来源退回个人或组织额度。你可以回到原会话重新尝试。`
+    : `${prefix}没有实际扣除积分，你可以回到原会话重新尝试。`
 }
 
 /**
@@ -154,6 +234,16 @@ export async function applyTurnWaiver(
         totalAfter,
         inboxMessageId: waiver.inbox_message_id,
       }
+    }
+
+    const lineage = await readWaiverLineage(client, uid, input.turnKey)
+    if (lineage) {
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended(
+           'oc_waiver_lineage:' || $1::text || ':' || $2 || ':' || $3, 0
+         ))`,
+        [uid, lineage.sessionId, lineage.rootClientMessageId],
+      )
     }
 
     const debits = await client.query<DebitRow>(
@@ -346,27 +436,75 @@ export async function applyTurnWaiver(
       }
     }
 
-    const reasonCopy = REASON_COPY[input.reason]
-    const body =
-      refunded > 0n
-        ? `由于${reasonCopy}，本轮已自动免单，并退还 **${refunded.toString()} 积分**。积分已按原扣费来源退回个人或组织额度。你可以回到原会话重新尝试。`
-        : `由于${reasonCopy}，本轮已自动免单。本轮没有实际扣除积分，你可以回到原会话重新尝试。`
-    const inbox = await client.query<{ id: string }>(
-      `INSERT INTO inbox_messages
-         (audience,user_id,title,body_md,level,category,thread_key,created_by,notify_email,
-          source_type,source_id,source_phase)
-       SELECT 'user',$1::bigint,'本轮已自动免单',$2,'notice','billing',
-              'billing:user:' || ($1::bigint)::text,a.id,FALSE,
-              'turn_waive',$3::bigint,'receipt'
-         FROM (
-           SELECT id FROM users
-            WHERE role='admin' AND status='active'
-            ORDER BY id ASC LIMIT 1
-         ) a
-       RETURNING id::text AS id`,
-      [uid, body, waiver.id],
-    )
-    const inboxMessageId = inbox.rows[0]?.id
+    let priorRefunded = 0n
+    let waiverCount = 1
+    let inboxMessageId: string | undefined
+    if (lineage) {
+      const prior = await client.query<{
+        inbox_message_id: string
+        refunded_credits: string
+        client_message_id: string | null
+        recovery_root_client_message_id: string | null
+      }>(
+        `SELECT w.inbox_message_id::text AS inbox_message_id,
+                w.refunded_credits::text AS refunded_credits,t.client_message_id,
+                j.root_client_message_id AS recovery_root_client_message_id
+           FROM turn_waivers w
+           JOIN client_session_turn_tapes t
+             ON t.user_id=('c:' || w.user_id::text) AND t.turn_key=w.turn_key
+           LEFT JOIN turn_recovery_jobs j
+             ON j.user_id=w.user_id AND j.session_id=t.session_id
+            AND j.request_json->>'clientMessageId'=t.client_message_id
+          WHERE w.user_id=$1 AND w.id<>$2::bigint AND w.status='applied'
+            AND w.inbox_message_id IS NOT NULL AND t.session_id=$3
+          ORDER BY w.id`,
+        [uid, waiver.id, lineage.sessionId],
+      )
+      const sameLineage = prior.rows.filter((row) =>
+        row.client_message_id !== null &&
+        (row.recovery_root_client_message_id ??
+          recoveryRootForMessage(lineage.messages, row.client_message_id)) ===
+            lineage.rootClientMessageId)
+      if (sameLineage.length > 0) {
+        inboxMessageId = sameLineage[0]!.inbox_message_id
+        priorRefunded = sameLineage.reduce(
+          (total, row) => total + BigInt(row.refunded_credits),
+          0n,
+        )
+        waiverCount += sameLineage.length
+      }
+    }
+    const body = waiverReceiptBody({
+      reason: input.reason,
+      refunded: priorRefunded + refunded,
+      waiverCount,
+    })
+    if (inboxMessageId) {
+      await client.query(
+        `UPDATE inbox_messages
+            SET body_md=$2,
+                source_phase=CASE WHEN $3::bigint > 0 THEN 'receipt_updated' ELSE source_phase END
+          WHERE id=$1::bigint`,
+        [inboxMessageId, body, refunded.toString()],
+      )
+    } else {
+      const inbox = await client.query<{ id: string }>(
+        `INSERT INTO inbox_messages
+           (audience,user_id,title,body_md,level,category,thread_key,created_by,notify_email,
+            source_type,source_id,source_phase)
+         SELECT 'user',$1::bigint,'本轮已自动免单',$2,'notice','billing',
+                'billing:user:' || ($1::bigint)::text,a.id,FALSE,
+                'turn_waive',$3::bigint,'receipt'
+           FROM (
+             SELECT id FROM users
+              WHERE role='admin' AND status='active'
+              ORDER BY id ASC LIMIT 1
+           ) a
+         RETURNING id::text AS id`,
+        [uid, body, waiver.id],
+      )
+      inboxMessageId = inbox.rows[0]?.id
+    }
     if (!inboxMessageId) {
       throw new Error('turn waiver receipt requires an active system admin sender')
     }

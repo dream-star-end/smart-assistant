@@ -431,4 +431,100 @@ describe('handleDelegateTask model override', () => {
     assert.equal(r.status, 401)
     assert.equal(ran, 0)
   })
+
+  it('callbackOnComplete still injects when _runDelegateTask rejects', async () => {
+    const gw = makeGateway(false)
+    const injected: Array<{ error?: string; jobId: string }> = []
+    gw._runDelegateTask = async () => {
+      throw new Error('mapped exec boom')
+    }
+    gw.injectSendToAgentCallback = async (args: { error?: string; jobId: string }) => {
+      injected.push(args)
+      return { kind: 'injected' }
+    }
+    const r = await call(gw, 'handleDelegateTask', {
+      goal: '查萧山',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      async: true,
+      callbackOnComplete: 'origin-inject',
+      streamProgress: true,
+    })
+    assert.equal(r.status, 200)
+    assert.equal(r.body.status, 'running')
+    for (let i = 0; i < 30 && injected.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(injected.length, 1)
+    assert.match(String(injected[0]?.error), /boom/)
+  })
+
+  it('nested send_to_agent captures the root webchat before its parent session retires', async () => {
+    const gw = makeGateway(false)
+    const nestedKey = 'agent:main:delegate:main:1:nested'
+    gw._activeSendToAgentCallbacks = new Map()
+    gw._persistSendToAgentIntent = async () => {}
+    gw.sessions.getByKey = (key: string) => key === nestedKey
+      ? {
+          sessionKey: nestedKey,
+          channel: 'delegate',
+          peerId: 'nested',
+          agentId: 'main',
+          userId: 'default',
+          parentSessionKey: PARENT_KEY,
+          progressRunId: 'dlg-first',
+        }
+      : key === PARENT_KEY
+        ? {
+            sessionKey: PARENT_KEY,
+            channel: 'webchat',
+            peerId: 'wsess-async-delegate',
+            agentId: 'main',
+            userId: 'default',
+          }
+        : undefined
+    gw._runDelegateTask = async () => { throw new Error('nested done') }
+    const injected: any[] = []
+    gw.injectSendToAgentCallback = async (args: any) => {
+      injected.push(args)
+      return { kind: 'injected' }
+    }
+    const token = issueDelegateContextToken({ agentId: 'main', sessionKey: nestedKey, depth: 1 })
+    const r = await call(
+      gw,
+      'handleDelegateTask',
+      { goal: 'nested background', async: true, callbackOnComplete: 'origin-inject' },
+      'coding-assistant',
+      { [DELEGATE_CONTEXT_HEADER]: token, 'x-delegation-depth': '1' },
+      { autoContext: false },
+    )
+    assert.equal(r.status, 200)
+    for (let i = 0; i < 30 && injected.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(injected.length, 1)
+    assert.equal(injected[0].parentSessionKey, PARENT_KEY)
+    assert.equal(injected[0].userId, 'default')
+  })
+
+  it('callback dispatch is retryable while the gateway is shutting down', async () => {
+    const gw = makeGateway(false)
+    gw._shuttingDown = true
+    gw._runtimeRecycleDrainUntil = 0
+    const result = await gw.trySendToAgentCallbackDispatch({
+      origin: {
+        sessionKey: PARENT_KEY,
+        agentId: 'main',
+        channel: 'webchat',
+        peerKind: 'dm',
+        peerId: 'wsess-async-delegate',
+      },
+      userId: 'default',
+      text: 'callback',
+      clientMessageId: 'sta-cb-x',
+      jobId: 'dlgjob-x',
+    })
+    assert.equal(result.kind, 'retryable_failure')
+    assert.equal(result.code, 'NO_TRANSPORT')
+  })
 })

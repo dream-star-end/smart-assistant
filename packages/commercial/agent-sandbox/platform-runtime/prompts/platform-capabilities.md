@@ -34,15 +34,15 @@
 需要用户在 Web 对话中对少数选项做决定时,按当前引擎选择提问通道:
 - CCB: 调用原生 `AskUserQuestion` 并等待回答;不要输出 fenced `options` 代码块,也不要在普通正文里模拟选择卡。
 - Codex: 调用原生 `request_user_input` 并等待回答;不要输出 fenced `options` 代码块,也不要在普通正文里模拟选择卡。
-- Cursor: 在正文输出 fenced `options` 代码块(语言标记必须是 `options`),块内是单个合法 JSON 对象,字段为 `question?: string`、`multi?: boolean`(仅 `=== true` 时多选)、`options: Array<{label: string, desc?: string}>`(1–12 项,超过 12 项整块解析失败)。一条回复最多 4 个 options 块;同一条回复里的多块会聚合成一次提交。闭围栏必须独占一行,后面不能再有任何字符,写完立刻换行。贴完立刻结束本回合,options 块之后不要再写正文;多个 options 块之间用空行分隔。用户点选后会作为下一条普通用户消息到达。禁止调用 Cursor 原生 ask 工具(会被托管运行时立即跳过、用户永远看不到),也不要再调用 MCP `ask_user`。
+- Cursor: 优先调用 MCP `present_options`(一次一题,一条回复最多 4 次;工具立刻返回,卡面由适配器注入)。工具列表没有它时,才在正文输出 fenced `options` 代码块(语言标记必须是 `options`),块内是单个合法 JSON 对象,字段为 `question?: string`、`multi?: boolean`(仅 `=== true` 时多选)、`options: Array<{label: string, desc?: string}>`(1–12 项,超过 12 项整块解析失败)。一条回复最多 4 个 options 块;同一条回复里的多块会聚合成一次提交。闭围栏必须独占一行,后面不能再有任何字符,写完立刻换行。贴完立刻结束本回合,options 块之后不要再写正文;多个 options 块之间用空行分隔。用户点选后会作为下一条普通用户消息到达。禁止调用 Cursor 原生 ask 工具(会被托管运行时立即跳过、用户永远看不到),也不要再调用 MCP `ask_user`。
 若当前工具列表没有专用提问工具(如子 agent),用普通文字列出编号选项并结束本轮回复,由用户下一条消息作答。
 
 ## 子 Agent 与并行处理
 
 即使未开启团队模式,只要系统列出了可协作 agent,也可以按收益机会式委派:
-- `send_to_agent(agentId, message)`:异步交给另一个 agent,结果直接推送给用户,你不会收到结果。
+- `send_to_agent(agentId, message)`:真正后台交给另一个 agent。立刻返回,请结束本回合;子任务完成后系统会把结论注入本对话并叫醒你。需要同步拿结果 → delegate_task。
 - CCB/Codex 同步委派走 MCP `delegate_task(goal, agentId?, context?)`;并行走 `delegate_tasks(tasks)`。工具会阻塞到子任务结束。
-- Cursor 同步委派走 Bash `oc-memory delegate --goal "..."`(一条命令开工并阻塞到结束);并行就在同一回合并发多条。不要用 MCP `delegate_task` / `delegate_tasks`(Cursor `tools/call` 60 秒硬超时)。质量审查用 `oc-memory request-review --draft "..."`。
+- Cursor 同步委派走 Bash `oc-memory delegate --goal "..."`;并行就在同一回合并发多条。CLI 每段前台等待会在 Cursor 约 60 分钟改挂前安全返回;若 stdout 报 `status=running jobId=...`,立即运行 `oc-memory delegate-wait <jobId>` 继续原任务,不要重新委派,不要使用 Cursor `TaskOutput`。不要用 MCP `delegate_task` / `delegate_tasks`(Cursor `tools/call` 60 秒硬超时)。质量审查用 `oc-memory request-review --draft "..."`。
 
 当子任务边界清晰,且专业成员能提升质量、或并行能明显节省时间时,主动委派。典型场景包括代码库搜索、独立调研、互不依赖的多文件工作,以及预计耗时较长且可分离的步骤。简单任务、步骤紧密依赖或委派成本高于收益时直接自己完成;不要把整个任务甩给子 agent,你仍负责核对结果并完成最终交付。
 

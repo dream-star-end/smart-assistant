@@ -136,38 +136,40 @@ else
   todo "把 $KEY 投放到 $vol_key(600, 1000:1000)"
 fi
 
-# ─── 5. ssh 客户端 + host wrapper 投放到 userlocal volume ────────────
-# 运行时镜像不带 openssh-client。宿主的二进制与容器 base 的 Ubuntu 版本不同,
-# 直接拷会有动态库版本风险,所以在容器内装再落到持久卷,重建容器也还在。
-say "=== 5. ssh 客户端与 host wrapper ==="
-need_client=0
-for b in ssh scp; do
-  [[ -x "$local_mount/bin/$b" ]] || need_client=1
-done
-if [[ $need_client == 0 ]]; then
-  skip "$local_mount/bin/{ssh,scp}"
-elif [[ $APPLY == 1 ]]; then
-  docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true ||
-    { echo "✗ 需要在运行中的 $CONTAINER 内安装 openssh-client,请先开一次会话" >&2; exit 1; }
-  docker exec "$CONTAINER" bash -lc '
-    set -e
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq openssh-client
-    mkdir -p ~/.local/bin
-    cp "$(command -v ssh)" ~/.local/bin/ssh
-    cp "$(command -v scp)" ~/.local/bin/scp
-    chmod 755 ~/.local/bin/ssh ~/.local/bin/scp
-  '
-  done_ "已在容器内安装 openssh-client 并落到持久卷"
+# ─── 5. 镜像内置 OpenSSH + host wrapper ──────────────────────────────
+# runtime 镜像已带 openssh-client(/usr/bin/ssh 等)。旧脚本曾把 ssh/scp 拷到
+# userlocal ~/.local/bin,PATH 会挡住系统包且漏掉 ssh-keygen;这里删除旧副本,
+# host wrapper 固定走 /usr/bin/ssh。
+say "=== 5. OpenSSH 与 host wrapper ==="
+if docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
+  if docker exec "$CONTAINER" sh -c 'test -x /usr/bin/ssh && test -x /usr/bin/ssh-keygen && test -x /usr/bin/scp && test -x /usr/bin/sftp'; then
+    skip "容器 /usr/bin/{ssh,ssh-keygen,scp,sftp}"
+  else
+    echo "✗ 运行中的 $CONTAINER 缺少 /usr/bin/ssh-keygen。请用已内置 openssh-client 的 runtime 镜像回收该容器,不要再 apt 拷贝到 ~/.local/bin。" >&2
+    exit 1
+  fi
 else
-  todo "在 $CONTAINER 内 apt 安装 openssh-client 并拷到 ~/.local/bin"
+  say "  容器未运行,跳过镜像内 OpenSSH 在线检查。"
 fi
+
+for b in ssh scp; do
+  leftover="$local_mount/bin/$b"
+  if [[ -e "$leftover" ]]; then
+    todo "rm $leftover (旧 workaround,会挡住 /usr/bin/$b)"
+    if [[ $APPLY == 1 ]]; then
+      rm -f "$leftover"
+      done_ "已删除 $leftover"
+    fi
+  else
+    skip "$leftover 不存在"
+  fi
+done
 
 wrapper="$local_mount/bin/host"
 wrapper_body='#!/bin/sh
 # 到宿主机的固定通道。无参数=交互 shell,带参数=远程执行。
 KEY="$HOME/.openclaude/.ssh/id_ed25519"
-exec "$HOME/.local/bin/ssh" -i "$KEY" \
+exec /usr/bin/ssh -i "$KEY" \
   -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile="$HOME/.openclaude/.ssh/known_hosts" \
   -o ConnectTimeout=10 \

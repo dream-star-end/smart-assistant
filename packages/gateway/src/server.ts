@@ -59,12 +59,15 @@ import {
   AGENT_MODEL_AUTO,
   MAX_ATTACHMENTS_PER_MESSAGE,
   AUTOMATIC_TURN_RETRY_MAX,
+  AUTHORITY_TURN_MAX_LIFETIME_MS,
   isCodexEngineModel,
   isGrokEngineModel,
   isCursorEngineModel,
   isZcodeEngineModel,
   isClientMessageId,
+  isDisplayableServerMessage,
   isPersistedClientMessageId,
+  turnErrorSemantics,
   formatMessageReplyPrompt,
   normalizeMessageReplyQuote,
   shouldServeInline,
@@ -99,6 +102,8 @@ import {
   type PromptQueueTurnLifecycle,
 } from './promptQueueCoordinator.js'
 import type { AgentSession, PromptQueueExecutionFence } from './sessionManager.js'
+import { resolveChatRunWorkspace } from './projectWorkspace.js'
+import { createRunContextDescriptor } from './runContextPersist.js'
 import {
   HttpPromptQueueClient,
   readPromptQueueClientConfig,
@@ -231,7 +236,9 @@ import {
 } from './agentVisibility.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
 import type {
+  GatewayEngineErrorEvent,
   GatewayStreamEvent,
+  GatewayTerminalErrorCode,
   GatewayTurnPhase,
   SessionStreamEvent,
   TurnRetryMeta,
@@ -281,7 +288,57 @@ import {
   cronDeliveryId,
   deliverCronViaAdapter,
   isUserInitiatedCronJob,
+  type CronDeliveryContext,
+  type CronJob,
 } from './cron.js'
+import {
+  deriveFixedBoardProjectId,
+  filterCronJobsForBoard,
+  type CronProjectPorts,
+} from './cronProject.js'
+import {
+  buildCronOriginResumeText,
+  cronOriginClientMessageId,
+  cronOriginIdempotencyKey,
+  parseOriginWebchatSessionKey,
+  type CronOriginFireResult,
+} from './cronOriginSession.js'
+import { getProject } from './taskboard/db/projects.js'
+import {
+  buildSendToAgentCallbackText,
+  isSendToAgentCallbackComplete,
+  sendToAgentCallbackClientMessageId,
+  sendToAgentCallbackIdempotencyKey,
+} from './sendToAgentCallback.js'
+import {
+  abandonCcbLocalAgentInject,
+  ackCcbTaskNotificationDelivered,
+  beginCcbLocalAgentInject,
+  buildCcbLocalAgentCallbackText,
+  ccbLocalAgentCallbackClientMessageId,
+  ccbLocalAgentCallbackIdempotencyKey,
+  clearCcbLocalAgentPendingForSession,
+  completeCcbLocalAgentInject,
+  evaluateCcbLocalAgentInjectLimit,
+  failCcbLocalAgentInject,
+  getCcbLocalAgentCallbackState,
+  noteCcbLocalAgentFinalizeRoundExhausted,
+  noteCcbTaskNotification,
+  sessionHasInFlightTurn,
+  takePendingInjectionsForSession,
+  type CcbLocalAgentNotification,
+} from './ccbLocalAgentCallback.js'
+import { runBoundedOriginInjectBackoff } from './originInjectBackoff.js'
+import {
+  persistSendToAgentIntent,
+  recoverInterruptedSendToAgentIntents,
+  removeSendToAgentIntent,
+  type SendToAgentIntent,
+} from './sendToAgentIntentStore.js'
+import {
+  postCronOriginInject,
+  readV3CronOriginInjectConfig,
+} from './v3CronOriginInject.js'
 import { handleTaskboardApi, resolveTaskboardActor, setPatrolExecutionHandler } from './taskboard/http.js'
 import { getTaskboardDb } from './taskboard/db/index.js'
 import { isPatrolSessionKey } from './taskboard/domain.js'
@@ -313,7 +370,18 @@ import {
   type DelegateJobHttpResult,
 } from './delegateJobs.js'
 import { DelegateResumeRegistry } from './delegateResume.js'
-import { isPlatformAgentId, parseDelegateModel } from './delegateModel.js'
+import { isPlatformAgentId, parseDelegateAllowSelf, parseDelegateModel, rejectSelfDelegate } from './delegateModel.js'
+import { EMPTY_COMPLETED_TURN_NOTICE, hasPlatedAssistantOutput } from './emptyCompletedTurn.js'
+import {
+  rebindOutboundClientMessageId,
+  resolveDelegateProgressBinding,
+} from './terminalStreamFence.js'
+import {
+  acquireDelegateGrokRoute,
+  delegateGrokMintModelId,
+  shouldMintDelegateGrokRoute,
+  type DelegateGrokRouteLease,
+} from './delegateGrokRoute.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { startMemoryTurnObserver } from './memoryTurnObserver.js'
@@ -445,6 +513,7 @@ import {
   type LocalCatalogView,
   type LocalExecutionRejectCode,
 } from './modelCatalogClient.js'
+import { resolveDelegateCostUsd } from './usageCost.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
@@ -518,7 +587,7 @@ function teamMemberCapabilityHint(agent: AgentDef): string {
  *   - MiniMax-M3 — master 侧切到 MiniMax Token Plan Anthropic 兼容端点,
  *     同样跑 claude-subscription/non-codex agent,不进 codex-native
  *   - glm-5.1 / glm-5.2 / glm-5.3 — master 侧切到火山方舟 Ark Coding Plan Anthropic 兼容端点,
- *     同 non-codex,glm-5.3 是**平台全局默认模型**
+ *     同 non-codex;2026-08-22 起平台全局默认是 glm-5.3-zai,glm-5.3(ark) 不再做默认
  *
  * **Claude 官方模型(claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5)已全面下线**
  * (v3 + v5 均不支持),不在白名单;stale prefs / 构造帧带 Claude 模型会被拒,而不是路由到
@@ -539,7 +608,7 @@ const ALLOWED_REASONING_EFFORTS = new Set<string>(PLATFORM_REASONING_EFFORTS)
 
 /** 平台执行模型兜底:V5 当前合法的静态 key 平台默认。 */
 export const EXECUTION_MODEL_FALLBACK_ROUTE = [
-  'glm-5.3',
+  'glm-5.3-zai',
   'MiniMax-M3',
   'deepseek-v4-flash',
 ] as const
@@ -552,7 +621,7 @@ export const EXECUTION_MODEL_FALLBACK = EXECUTION_MODEL_FALLBACK_ROUTE[0]
  * delegate 委派)会**绕过入站校验**,在 SessionManager.getOrCreate 里直接作为 CCB `--model`
  * spawn。已下线模型(如某个 stale 已安装 agent 里残留的 claude-*)会让 CCB 用不可路由的
  * --model 启动 → spawn 失败 / session 卡死。runner 创建是唯一收口点,这里把任何不在白名单的
- * 模型降级到平台默认(glm-5.3),使"Claude 官方模型下线"在 agent 级路径上也真正生效。
+ * 模型降级到平台默认(glm-5.3-zai),使"Claude 官方模型下线"在 agent 级路径上也真正生效。
  */
 export function resolveExecutionModel(
   preferred: string | undefined | null,
@@ -1686,6 +1755,9 @@ interface RunDelegateInput {
   isReview?: boolean
   /** 覆盖默认 `agent:<id>:delegate:...`。taskboard 巡检必须传入 buildPatrolSessionKey()。 */
   sessionKey?: string
+  projectId?: string
+  workspaceCwd?: string
+  runContext?: import('./runContextPersist.js').RunContextDescriptor
   /** 覆盖默认 channel 'delegate'。taskboard 传 'taskboard',且不得加入
    *  MASTER_SINK_PERSIST_CHANNELS,否则巡检文本会写进 client_sessions 刷屏。 */
   channel?: string
@@ -1697,6 +1769,13 @@ interface RunDelegateInput {
   resumable?: boolean
   /** 本次是否新 mint。早退时要 drop binding,避免占 cap。 */
   resumeMinted?: boolean
+  /** send_to_agent: child 完成后把结论注入父 webchat 并新开父 turn。 */
+  callbackOnComplete?: 'origin-inject'
+  /** Captured while the delegate parent chain is still live; nested parents are ephemeral. */
+  callbackOriginSessionKey?: string
+  callbackOriginUserId?: string
+  /** Async handle returned to the send_to_agent tool, used as exact UI correlation. */
+  backgroundJobId?: string
 }
 /** `_runDelegateTask` 结果。rejected=闸/校验拒(HTTP 壳映射 4xx/429/503);error=session
  *  创建等意外(映射 500);completed=真正执行完(ok/output/error/timedOut,review 还带 verdict)。 */
@@ -1715,6 +1794,7 @@ type DelegateTaskResult =
       tokensIn?: number | null
       tokensOut?: number | null
       costUsd?: number | null
+      costImprecise?: boolean
       sessionKey?: string
     }
 
@@ -1914,6 +1994,19 @@ export function normalizeAutoDreamSchedule(
     ...(typeof row.label === 'string' ? { label: row.label } : {}),
     ...(typeof row.createdAt === 'number' ? { createdAt: row.createdAt } : {}),
   }
+}
+
+export const GATEWAY_PENDING_PERMISSION_TTL_MS = 30 * 60_000
+
+export function _permissionRequestExpiresAt(
+  blockingUserInput: boolean,
+  nowMs: number = Date.now(),
+): number {
+  return nowMs + (
+    blockingUserInput
+      ? AUTHORITY_TURN_MAX_LIFETIME_MS
+      : GATEWAY_PENDING_PERMISSION_TTL_MS
+  )
 }
 
 export class Gateway {
@@ -2173,6 +2266,9 @@ export class Gateway {
      *  the 30-minute sweeper. After the hybrid wait releases (or no waiter is
      *  holding), an allow starts a new user turn. */
     detachedAskUser?: boolean
+    /** Blocking Codex requestUserInput. Browser disconnect is not denial;
+     * it remains answerable until the logical-turn 12h authority deadline. */
+    blockingUserInput?: boolean
   }>()
   /**
    * In-flight HTTP waiters for Cursor ask_user. Keyed by requestId. A waiter
@@ -2183,7 +2279,7 @@ export class Gateway {
   /** Max wait for a permission response before the janitor auto-denies.
    *  Matched to the outer CCB turn timeout (30 min) so we don't pre-empt
    *  a slow user while a turn is still live. */
-  private static readonly PENDING_PERMISSION_TTL_MS = 30 * 60_000
+  private static readonly PENDING_PERMISSION_TTL_MS = GATEWAY_PENDING_PERMISSION_TTL_MS
   /** Detached Cursor ask_user cards stay answerable this long. */
   private static readonly DETACHED_ASK_USER_TTL_MS = DETACHED_ASK_USER_TTL_MS
   /** How often the janitor scans _pendingPermissions. */
@@ -2269,6 +2365,12 @@ export class Gateway {
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
+    this.sessions.onCcbTaskNotification = (session, payload) => {
+      void this.handleCcbLocalAgentNotification(session, payload)
+    }
+    this.sessions.onCcbTaskNotificationDelivered = (session, payload) => {
+      this.handleCcbLocalAgentDelivered(session.sessionKey, payload.taskId)
+    }
     this.autoDream = new AutoDreamService({
       runModel: (input) => this._runAutoDreamModel(input),
       notifyResult: (report) => postInboxMessage(formatAutoDreamReceipt(report)),
@@ -2362,6 +2464,7 @@ export class Gateway {
         this._outboundRing.clear(sessionKey)
         outboundRingSizeBytes.value = this._outboundRing.totalBytes()
       } catch {}
+      clearCcbLocalAgentPendingForSession(sessionKey)
     }
   }
 
@@ -2392,6 +2495,17 @@ export class Gateway {
       }
     } catch (err) {
       this.log.error('msg-outbox replay failed (continuing startup)', undefined, err as Error)
+    }
+
+    try {
+      const summary = await recoverInterruptedSendToAgentIntents((intent) =>
+        this._deliverInterruptedSendToAgentIntent(intent),
+      )
+      if (summary.recovered > 0 || summary.retained > 0 || summary.malformed > 0) {
+        this.log.info('send_to_agent intent recovery', summary)
+      }
+    } catch (err) {
+      this.log.error('send_to_agent intent recovery failed (continuing startup)', undefined, err as Error)
     }
 
     // V3 commercial: container → master sink for server-authored messages.
@@ -2876,7 +2990,8 @@ export class Gateway {
           deliveryKey: stableDeliveryId,
         })
       }
-    })
+    }, (job, delivery) => this.injectCronOriginSession(job, delivery))
+    this.cron.setProjectPorts(this.cronProjectPorts())
     this.cron.lastActiveChannel = this.lastActiveChannel
     this.cron.start().catch((err) => this.log.error('cron start failed', undefined, err))
 
@@ -3269,6 +3384,7 @@ export class Gateway {
     } catch {}
     this._stopEviction = null
     try {
+      await this._persistInterruptedSendToAgentCallbacks()
       this._delegateJobs?.close()
     } catch {}
     this._delegateJobs = undefined
@@ -4080,14 +4196,32 @@ export class Gateway {
           })
         return
       }
-      // 容器形态(c 空):附 durable inbox open-job / 字节 gauge(RFC §3 healthz),
-      // 异步取一次后 end。stats 失败不阻塞健康返回(inbox 是可观测面,非可服务面)。
-      void turnDispatchInboxStats()
-        .then((stats) => {
-          body.turnDispatchInbox = { openJobs: stats.openJobs, bytes: stats.bytes }
+      // 容器/个人版形态(c 空):附 durable inbox open-job / 字节 gauge(RFC §3
+      // healthz),异步取一次后 end。stats 失败不阻塞健康返回(inbox 是可观测面,
+      // 非可服务面)。个人版(无 commercial 注入)同样深度探 sessions.db —— 本地
+      // SQLite 在此形态下就是会话权威库,打不开 = list/save/落库全崩,必须翻 ok
+      // 供监控/doctor 消费(与上方 master 形态同一探针与 deps 语义)。
+      void Promise.all([
+        probeSessionsDb().catch(
+          (): { ok: false; error: string } => ({ ok: false, error: 'probe rejected' }),
+        ),
+        turnDispatchInboxStats()
+          .then((stats): { openJobs: number | null; bytes: number | null } => ({
+            openJobs: stats.openJobs,
+            bytes: stats.bytes,
+          }))
+          .catch((): { openJobs: null; bytes: null } => ({ openJobs: null, bytes: null })),
+      ])
+        .then(([sess, inbox]) => {
+          body.turnDispatchInbox = inbox
+          const built = _buildHealthzDeps(sess, {})
+          body.deps = built.deps
+          if (!built.ok) body.ok = false
         })
         .catch(() => {
-          body.turnDispatchInbox = { openJobs: null, bytes: null }
+          // 兜底防 healthz 挂起(上面各探活分支已内部 catch,理论到不了这里)。
+          body.ok = false
+          body.deps = { sessionsDb: 'error', sessionsDbError: 'probe rejected' }
         })
         .finally(() => {
           res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -4234,7 +4368,18 @@ export class Gateway {
         SESSION_SEARCH_LIMIT_MAX,
       )
       const includeArchived = parseIncludeArchivedFlag(url.searchParams.get('includeArchived'))
-      searchClientSessions(userId, { q, limit, includeArchived })
+      const projectRaw = url.searchParams.get('projectId')
+      const projectId =
+        projectRaw === null || projectRaw === '' || projectRaw === 'all'
+          ? undefined
+          : projectRaw === 'none'
+            ? null
+            : projectRaw.trim()
+      if (projectId && (projectId.length < 8 || projectId.length > 64)) {
+        this.sendJson(res, 400, { error: 'invalid projectId' })
+        return
+      }
+      searchClientSessions(userId, { q, limit, includeArchived, projectId })
         .then((out) => this.sendJson(res, 200, out))
         .catch(() => this.sendJson(res, 500, { error: 'search failed' }))
       return
@@ -4242,7 +4387,13 @@ export class Gateway {
     if (url.pathname === '/api/sessions/batch' && req.method === 'POST') {
       const userId = this.getUserId(req)
       ;(async () => {
-        let data: { ids?: unknown; action?: unknown; projectId?: unknown }
+        let data: {
+          ids?: unknown
+          action?: unknown
+          projectId?: unknown
+          expectedSessions?: unknown
+          operationId?: unknown
+        }
         try {
           data = JSON.parse(await this.readBody(req, 64 * 1024))
         } catch {
@@ -4266,6 +4417,14 @@ export class Gateway {
         if (!result.ok) {
           if (result.error === 'project_not_found') {
             this.sendJson(res, 404, { error: 'project not found' })
+            return
+          }
+          if (result.error === 'stale_session') {
+            this.sendJson(res, 409, {
+              error: 'stale session',
+              code: 'stale_session',
+              staleIds: result.staleIds ?? [],
+            })
             return
           }
           this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
@@ -4336,7 +4495,13 @@ export class Gateway {
       const userId = this.getUserId(req)
       if (req.method === 'PATCH') {
         ;(async () => {
-          let data: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown }
+          let data: {
+            name?: unknown
+            instructions?: unknown
+            color?: unknown
+            sortOrder?: unknown
+            boardProjectId?: unknown
+          }
           try {
             data = JSON.parse(await this.readBody(req, 16 * 1024))
           } catch {
@@ -4347,8 +4512,9 @@ export class Gateway {
           const hasInstructions = data.instructions !== undefined
           const hasColor = data.color !== undefined
           const hasSort = data.sortOrder !== undefined
-          if (!hasName && !hasInstructions && !hasColor && !hasSort) {
-            this.sendJson(res, 400, { error: 'name, instructions, color or sortOrder required' })
+          const hasBoard = data.boardProjectId !== undefined
+          if (!hasName && !hasInstructions && !hasColor && !hasSort && !hasBoard) {
+            this.sendJson(res, 400, { error: 'name, instructions, color, sortOrder or boardProjectId required' })
             return
           }
           if (hasName && parseChatProjectName(data.name) === null) {
@@ -4377,6 +4543,10 @@ export class Gateway {
           if (!result.ok) {
             if (result.error === 'not_found') {
               this.sendJson(res, 404, { error: 'not found' })
+              return
+            }
+            if (result.error === 'board_project_bound') {
+              this.sendJson(res, 409, { error: 'board project already bound', code: 'board_project_bound' })
               return
             }
             this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
@@ -4480,7 +4650,11 @@ export class Gateway {
             this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
             return
           }
-          this.sendJson(res, 200, { asset: result.asset })
+          this.sendJson(res, 200, {
+            asset: result.asset,
+            created: result.created,
+            reused: !result.created,
+          })
         })().catch(() => this.sendJson(res, 500, { error: 'create failed' }))
         return
       }
@@ -5081,12 +5255,19 @@ export class Gateway {
             view: 'timeline',
             sinceHistoryRevision,
           })
-            .then((s) => s ? this.sendJson(res, 200, {
-              ...s,
-              timelineCursor: s.timelineCursor
-                ? encodeClientTimelineCursor(s.timelineCursor)
-                : null,
-            }) : this.sendJson(res, 404, { error: 'not found' }))
+            .then((s) => {
+              if (!s) {
+                this.sendJson(res, 404, { error: 'not found' })
+                return
+              }
+              this.sendJson(res, 200, {
+                ...s,
+                timelineCursor: s.timelineCursor
+                  ? encodeClientTimelineCursor(s.timelineCursor)
+                  : null,
+              })
+              this._preheatSessionOnOpen(sessId, userId, s)
+            })
             .catch((error: unknown) => this.sendSessionReadFailure(res, error, sessId, 'get failed'))
         } else {
           getClientSession(sessId, userId, { view: 'timeline' })
@@ -5120,6 +5301,7 @@ export class Gateway {
                   ? encodeClientTimelineCursor(s.timelineCursor)
                   : null,
               })
+              this._preheatSessionOnOpen(sessId, userId, s)
             })
             .catch((error: unknown) => this.sendSessionReadFailure(res, error, sessId, 'get failed'))
         }
@@ -5613,7 +5795,9 @@ export class Gateway {
           await writeFile(filePath, JSON.stringify(entry, null, 2))
           this.sendJson(res, 200, { ok: true, id: entry.id })
         } catch (err) {
-          this.sendJson(res, 400, { error: String(err) })
+          // E5 — 原始错误(可能含内部路径/栈)只进日志,响应体给受控文案。
+          this.log.warn('feedback submit failed', undefined, err as Error)
+          this.sendJson(res, 400, { error: '反馈提交失败，请稍后重试' })
         }
       }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
       return
@@ -5670,6 +5854,12 @@ export class Gateway {
       url.pathname === '/api/board/reports/weekly' ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/board$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/context$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)\/(promote|reject|deprecate)$/) ||
+      url.pathname.match(/^\/api\/board\/runs\/([^/]+)\/context$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(ready|claim|advance)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(block|approve|reject)$/) ||
@@ -6469,6 +6659,12 @@ export class Gateway {
       this._updateWechatIdempotency(idempotencyKey, { completed: true })
       const currentWechat = this._getIdempotencyEntry(idempotencyKey)?.wechat
       const errMessage = err instanceof Error ? err.message : String(err)
+      // E5 — 渠道用户只看分类后的受控文案;原文经下方 log.error 进日志。
+      const classifiedDispatchError = classifyRunError(errMessage)
+      const publicDispatchReason =
+        classifiedDispatchError.code === 'unknown'
+          ? '任务执行暂时中断，请直接重试本条消息'
+          : classifiedDispatchError.message
       const terminalPeer = {
         ...peerOut,
         id: currentWechat?.peerId ?? wechatPeerIdFromSessionKey(currentWechat?.sessionKey) ?? peerId,
@@ -6482,7 +6678,7 @@ export class Gateway {
         blocks: [
           {
             kind: 'text' as const,
-            text: `[error] ${source === 'qqbot' ? 'QQ' : '微信'}任务启动后失败：${errMessage.slice(0, 300) || 'unknown error'}`,
+            text: `[error] ${source === 'qqbot' ? 'QQ' : '微信'}任务启动后失败：${publicDispatchReason}`,
           },
         ],
         isFinal: true,
@@ -10281,6 +10477,17 @@ export class Gateway {
   /** Cursor MCP 60s 上限的异步委派作业句柄。测试脚手架 Object.create 不跑字段
    *  初始化,使用处惰性 ??=。 */
   private _delegateJobs: DelegateJobStore | undefined
+  private readonly _activeSendToAgentCallbacks = new Map<string, {
+    originSessionKey: string
+    userId?: string
+    agentId: string
+    goal: string
+  }>()
+  private _syntheticTurnBarriers: Map<string, {
+    owner: string
+    done: Promise<void>
+    release: () => void
+  }> | undefined
   /** HTTP/MCP delegate 续跑绑定。测试脚手架 Object.create 不跑字段初始化,使用处惰性 ??=。 */
   private _delegateResume: DelegateResumeRegistry | undefined
 
@@ -10666,6 +10873,12 @@ export class Gateway {
       : typeof sourceAgent === 'string'
         ? sourceAgent
         : undefined
+    const selfCheck = rejectSelfDelegate({
+      callerAgentId: sourceAgentId,
+      targetAgentId,
+      allowSelf: parseDelegateAllowSelf(parsed.allowSelf),
+    })
+    if (!selfCheck.ok) return this.sendError(res, 400, selfCheck.error)
     // 同步 preflight:mint/resume/占用必须在任何 await 和创建 async job 之前完成,
     // 这样 running 响应已经带着权威 sessionKey,并发 resume 也能立刻 409。
     const resume = (this._delegateResume ??= new DelegateResumeRegistry()).preflight({
@@ -10678,6 +10891,12 @@ export class Gateway {
     if (!resume.ok) {
       return this.sendError(res, resume.httpStatus, resume.message)
     }
+    const callbackOnComplete = isSendToAgentCallbackComplete(parsed.callbackOnComplete)
+      ? 'origin-inject' as const
+      : undefined
+    const callbackTarget = callbackOnComplete
+      ? this._resolveDelegateProgressTarget({ parentSessionKey, sourceAgent: sourceAgentId })?.target
+      : undefined
     const runInput: RunDelegateInput = {
       targetAgentId,
       goal,
@@ -10692,6 +10911,9 @@ export class Gateway {
       sessionKey: resume.sessionKey,
       resumable: true,
       resumeMinted: resume.minted,
+      callbackOnComplete,
+      callbackOriginSessionKey: callbackTarget?.sessionKey,
+      callbackOriginUserId: callbackTarget?.userId,
     }
     // 默认同步:行为与改前完全一致(CCB/Codex 继续堵在 HTTP 上)。仅 `async: true`
     // 才切作业句柄 —— 子任务仍走同一条 _runDelegateTask(idle/hard/祖先活性/深度/并发闸全在)。
@@ -10705,14 +10927,61 @@ export class Gateway {
         return this.sendError(res, 503, 'too many in-flight delegate jobs')
       }
       const jobId = created.jobId
+      runInput.backgroundJobId = jobId
+      if (callbackOnComplete && callbackTarget) {
+        const intent: SendToAgentIntent = {
+          v: 1,
+          jobId,
+          originSessionKey: callbackTarget.sessionKey,
+          userId: callbackTarget.userId,
+          agentId: targetAgentId,
+          goal,
+          createdAt: Date.now(),
+        }
+        try {
+          await this._persistSendToAgentIntent(intent)
+        } catch (err) {
+          this._delegateResume.abort(resume.sessionKey, resume.minted)
+          store.complete(jobId, { httpStatus: 503, body: { error: 'background callback persistence unavailable' } })
+          this.log.warn('send_to_agent intent persist failed', { jobId }, err as Error)
+          return this.sendError(res, 503, 'background callback persistence unavailable')
+        }
+        this._activeSendToAgentCallbacks.set(jobId, {
+          originSessionKey: callbackTarget.sessionKey,
+          userId: callbackTarget.userId,
+          agentId: targetAgentId,
+          goal,
+        })
+      }
       void this._runDelegateTask(runInput)
         .then((result) => {
           store.complete(jobId, this._delegateResultToHttp(result, targetAgentId))
+          const output = result.kind === 'completed' ? result.output : ''
+          const error =
+            result.kind === 'rejected' || result.kind === 'error'
+              ? result.message
+              : result.kind === 'completed'
+                ? result.error
+                : undefined
+          this._queueSendToAgentCallback(runInput, {
+            jobId,
+            agentId: targetAgentId,
+            goal,
+            output,
+            error,
+          })
         })
         .catch((err) => {
+          const message = (err as Error)?.message ?? String(err)
           store.complete(jobId, {
             httpStatus: 500,
-            body: { error: (err as Error)?.message ?? String(err) },
+            body: { error: message },
+          })
+          this._queueSendToAgentCallback(runInput, {
+            jobId,
+            agentId: targetAgentId,
+            goal,
+            error: message,
           })
         })
       return this.sendJson(res, 200, {
@@ -11044,13 +11313,8 @@ export class Gateway {
     const nestLabel = nestedProgress
       ? [...(progressRouting?.ancestorAgentPath ?? []), targetAgentId].join('↳')
       : ''
-    // Capture webchat-ancestor cmid at closure creation. Leftover live
-    // journals are minted when delegate_progress is persisted without a
-    // clientMessageId; persist must not guess the in-flight cmid.
-    const parentCmid = progressTarget
-      ? this.sessions.getByKey(progressTarget.sessionKey)?._runningClientMessageId
-        ?? this.sessions.getByKey(progressTarget.sessionKey)?._currentDispatch?.clientMessageId
-      : undefined
+    // Live lookup each emit: a retry may have moved the parent cmid, and a
+    // terminated parent must not keep receiving dispatch:<old>:N frames.
     const emitProgress = (block: DelegateProgressBlock | null) => {
       if (!progressTarget || !block) return
       // 嵌套:把本委派的原始进度帧统一重写成「挂到一级卡上的带层级前缀非终态文本行」
@@ -11063,12 +11327,21 @@ export class Gateway {
           })
         : block
       if (!outBlock) return
+      const parentSession = this.sessions.getByKey(progressTarget.sessionKey)
+      const liveCmid =
+        parentSession?._runningClientMessageId ??
+        parentSession?._currentDispatch?.clientMessageId
+      const binding = resolveDelegateProgressBinding({
+        candidate: typeof liveCmid === 'string' ? liveCmid : undefined,
+        isFenced: (cmid) =>
+          this._outboundRing?.isTurnFenced(progressTarget.sessionKey, cmid) === true,
+      })
       const out = {
         type: 'outbound.message' as const,
         sessionKey: progressTarget.sessionKey,
         channel: progressTarget.channel,
         peer: { id: progressTarget.peerId, kind: 'dm' as const },
-        ...(isClientMessageId(parentCmid) ? { clientMessageId: parentCmid } : {}),
+        ...(binding.clientMessageId ? { clientMessageId: binding.clientMessageId } : {}),
         blocks: [outBlock as any],
         isFinal: false,
         _userId: progressTarget.userId,
@@ -11170,6 +11443,56 @@ export class Gateway {
       }
       return { kind: 'rejected', httpStatus, message }
     }
+    // ── grok delegate turn:向 master 铸造 relay route(与浏览器 turn 同一账号池)──
+    // delegate 是容器本地 turn,没有 bridge 注入 __oc_grok_route;不铸 route 则
+    // GrokAdapter 在 spawn 前 fail-closed(GROK_ROUTE_REQUIRED)。放在资源闸之后:
+    // 排队期间不占用稀缺的 Grok 订阅槽;mint 失败是零代价结构化拒绝(尚未创建
+    // session/runner)。生产(未开引擎本地豁免)在上方 decideLocalExecution 已拒。
+    const grokMintModelId = delegateGrokMintModelId({
+      canonicalModel: delegateExec?.canonicalModel,
+      requestedModel,
+      agentModel: execAgent.model,
+    })
+    const grokDelegate = shouldMintDelegateGrokRoute({
+      delegateEngine: delegateExec?.engine,
+      requestedModel,
+      agentModel: execAgent.model,
+    })
+    let grokRoute: { baseUrl: string; routeToken: string } | null = null
+    let grokRouteLease: DelegateGrokRouteLease | null = null
+    if (grokDelegate) {
+      if (!grokMintModelId) {
+        this._releaseDelegateSlot(slotOpts)
+        unregisterDelegation?.()
+        return {
+          kind: 'rejected',
+          httpStatus: 500,
+          message: 'Grok 委派暂不可用: missing grok model id',
+        }
+      }
+      const acquired = await acquireDelegateGrokRoute({
+        modelId: grokMintModelId,
+        sessionId: sessionKey,
+        log: this.log,
+      })
+      if (!acquired.ok) {
+        // 与排队被拒同形:已过闸的并发名额必须在此释放(下方 finally 不会执行)。
+        this._releaseDelegateSlot(slotOpts)
+        unregisterDelegation?.()
+        this.log.warn('delegate_grok_route_denied', {
+          targetAgentId,
+          httpStatus: acquired.httpStatus,
+          reason: acquired.reason,
+        })
+        return {
+          kind: 'rejected',
+          httpStatus: acquired.httpStatus,
+          message: `Grok 委派暂不可用: ${acquired.reason}`,
+        }
+      }
+      grokRoute = { baseUrl: acquired.lease.baseUrl, routeToken: acquired.lease.routeToken }
+      grokRouteLease = acquired.lease
+    }
     // 已过闸:并发名额已在 _tryReserveDelegateSlot 同步预占,此后所有路径必须释放
     // —— 正常路径走下方 finally,session 创建/开始帧投递抛错走本 catch。
     const durableTranscript: unknown[] = []
@@ -11195,6 +11518,9 @@ export class Gateway {
         peerId: sourceAgent || 'system',
         repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
         workspaceMode: delegateParent?.workspaceMode,
+        workspaceCwd: input.workspaceCwd,
+        projectId: input.projectId,
+        runContext: input.runContext,
         // 物化直接父指针(已校验的父会话键),供本 delegate 的子委派沿父链向上追溯 webchat 祖先。
         parentSessionKey: delegateParent?.sessionKey,
         title: `[delegate] ${goal.slice(0, 40)}`,
@@ -11235,10 +11561,12 @@ export class Gateway {
             // the leader's delegate_task tool_use card (matched by agentId+goal)
             // instead of spawning a separate progress card.
             goal,
+            jobId: input.backgroundJobId,
           }),
         )
       }
     } catch (err) {
+      if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
       // 原为 throw → 路由 .catch → 500;现由 HTTP 壳把 {kind:'error'} 映射成 sendError(500),
@@ -11359,7 +11687,7 @@ export class Gateway {
       undefined,
       undefined,
       undefined,
-      { platformGoal: session._platformGoal ?? null },
+      { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}) },
     )
     try {
       await Promise.race([submitPromise, timeoutPromise])
@@ -11524,6 +11852,9 @@ export class Gateway {
       }
       unregisterDelegation?.()
       this._releaseDelegateSlot(slotOpts)
+      // grok delegate 的 master 侧账号槽/路由上下文收尾(release 幂等且内部吞错,
+      // 不会因清理失败让已完成的委派翻成失败)。
+      if (grokRouteLease) await grokRouteLease.release()
       // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
       // 作为"父"再委派(hidden 审查员 / 嵌套成员);它收尾后计数键永远不会复用,
       // 两个 per-turn 计数器都清理防泄漏。注意清的是子会话自己的键,不动 delegateGuardKey
@@ -11618,6 +11949,11 @@ export class Gateway {
       }
     }
 
+    const priced = await resolveDelegateCostUsd({
+      ...session,
+      engine: session.providerTag,
+      isError: Boolean(error),
+    })
     return {
       kind: 'completed',
       ok: !error,
@@ -11633,7 +11969,8 @@ export class Gateway {
       // usage_log 是 eventBus 异步,return 时多半还没落盘,不能只靠它。
       tokensIn: session.totalInputTokens || null,
       tokensOut: session.totalOutputTokens || null,
-      costUsd: session.totalCostUSD || null,
+      costUsd: priced.costUsd,
+      costImprecise: priced.costImprecise,
     }
   }
 
@@ -11652,9 +11989,13 @@ export class Gateway {
       toolsets: input.toolsets ?? undefined,
       depth: 0,
       effort: input.effort ?? undefined,
+      model: input.model,
       sessionKey: input.sessionKey,
       channel: 'taskboard',
       idleTimeoutMs: input.timeoutSec * 1_000,
+      projectId: input.projectId,
+      workspaceCwd: input.workspaceCwd,
+      runContext: input.runContext,
     })
     if (result.kind === 'rejected') {
       return { ok: false, output: '', error: result.message }
@@ -11670,6 +12011,7 @@ export class Gateway {
       tokensIn: result.tokensIn ?? null,
       tokensOut: result.tokensOut ?? null,
       costUsd: result.costUsd ?? null,
+      costImprecise: result.costImprecise ?? null,
     }
   }
 
@@ -11738,10 +12080,12 @@ export class Gateway {
     try {
       pairing = await import('@openclaude/channel-wechat' as any)
     } catch (err) {
+      // E5 — import 失败细节(路径/栈)只进日志。
+      this.log.error('channel-wechat module unavailable', undefined, err as Error)
       this.sendJson(res, 503, {
         error: {
           code: 'WECHAT_UNAVAILABLE',
-          message: '@openclaude/channel-wechat not available: ' + String(err),
+          message: '微信通道模块不可用，请检查服务端安装',
         },
       })
       return
@@ -11765,7 +12109,9 @@ export class Gateway {
         const { qrcode, qrcodeImgContent } = await startPairing(userId)
         this.sendJson(res, 200, { qrcode, qrcodeImgContent })
       } catch (err: any) {
-        this.sendError(res, 502, `QR fetch failed: ${err?.message || err}`)
+        // E5 — 上游错误原文只进日志,响应体给受控文案。
+        this.log.error('wechat pairing QR fetch failed', { userId }, err)
+        this.sendError(res, 502, '获取微信配对二维码失败，请稍后重试')
       }
       return
     }
@@ -11792,7 +12138,9 @@ export class Gateway {
           })
           return
         }
-        this.sendError(res, 500, `poll failed: ${err?.message || err}`)
+        // E5 — 上游错误原文只进日志,响应体给受控文案。
+        this.log.error('wechat pairing poll failed', { userId }, err)
+        this.sendError(res, 500, '微信配对状态查询失败，请稍后重试')
       }
       return
     }
@@ -12082,11 +12430,592 @@ export class Gateway {
     }
   }
 
+  /**
+   * Inject a synthetic user turn into the conversation that created an
+   * origin-session cron job. Does not reuse the isolated cron sessionKey
+   * and does not submit on the user's in-flight engine.
+   */
+  private async injectCronOriginSession(
+    job: CronJob,
+    delivery: CronDeliveryContext,
+  ): Promise<CronOriginFireResult> {
+    const origin = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
+    if (!origin) return { kind: 'fallback' }
+    const text = buildCronOriginResumeText(job)
+    const clientMessageId = cronOriginClientMessageId(delivery.deliveryId)
+    const masterCfg = readV3CronOriginInjectConfig()
+    if (masterCfg) {
+      const posted = await postCronOriginInject(
+        {
+          sessionId: origin.peerId,
+          text,
+          clientMessageId,
+          agentId: origin.agentId,
+        },
+        { config: masterCfg },
+      )
+      if (posted.kind === 'injected') return { kind: 'injected' }
+      if (posted.kind === 'gone') return { kind: 'fallback' }
+      if (posted.kind === 'in_flight') {
+        return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_IN_FLIGHT' }
+      }
+      return { kind: 'retryable_failure', code: posted.code }
+    }
+    const userId =
+      (typeof job.sourceUserId === 'string' && job.sourceUserId.trim()) ||
+      process.env.OC_USER_ID?.trim() ||
+      'default'
+    let existing
+    try {
+      existing = await getClientSession(origin.peerId, userId)
+    } catch (err) {
+      this.log.warn('origin-session lookup failed', { jobId: job.id }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_LOOKUP_FAILED' }
+    }
+    if (!existing) return { kind: 'fallback' }
+    const liveParent = this.sessions.getByKey(origin.sessionKey)
+    if ((liveParent?._activeTurnCount ?? 0) > 0 || (liveParent?._activeClientTurnCount ?? 0) > 0) {
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
+    }
+    try {
+      const persisted = await appendServerAuthoredMessage(origin.peerId, userId, {
+        id: clientMessageId,
+        role: 'user',
+        text,
+        ts: Date.now(),
+      })
+      if (!persisted.applied) {
+        if (persisted.reason === 'already_exists') {
+          // retry of the same occurrence — continue to dispatch (idempotent)
+        } else if (persisted.reason === 'session_deleted') {
+          return { kind: 'fallback' }
+        } else {
+          return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+        }
+      }
+    } catch (err) {
+      this.log.warn('origin-session persist failed', { jobId: job.id }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+    }
+    try {
+      const cronBoard =
+        job.projectMode === 'fixed' && typeof job.boardProjectId === 'string'
+          ? job.boardProjectId
+          : undefined
+      await this.dispatchInbound({
+        type: 'inbound.message',
+        channel: origin.channel,
+        peer: { id: origin.peerId, kind: origin.peerKind },
+        agentId: origin.agentId,
+        content: { text },
+        ts: Date.now(),
+        idempotencyKey: cronOriginIdempotencyKey(job.id, delivery.deliveryId),
+        clientMessageId,
+        _userId: userId,
+        ...(cronBoard ? { _cronBoardProjectId: cronBoard, _cronProjectMode: 'fixed' } : {}),
+      } as any)
+    } catch (err) {
+      this.log.warn('origin-session dispatch failed', { jobId: job.id }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_DISPATCH_FAILED' }
+    }
+    return { kind: 'injected' }
+  }
+
+  private async _acquireSyntheticTurnBarrier(sessionKey: string): Promise<{
+    owner: string
+    release: () => void
+  }> {
+    const barriers = (this._syntheticTurnBarriers ??= new Map())
+    for (;;) {
+      const existing = barriers.get(sessionKey)
+      if (!existing) break
+      await existing.done
+    }
+    const owner = `synthetic-${randomBytes(8).toString('hex')}`
+    let resolveDone!: () => void
+    const done = new Promise<void>((resolve) => { resolveDone = resolve })
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      const current = this._syntheticTurnBarriers?.get(sessionKey)
+      if (current?.owner === owner) this._syntheticTurnBarriers?.delete(sessionKey)
+      resolveDone()
+    }
+    barriers.set(sessionKey, { owner, done, release })
+    return { owner, release }
+  }
+
+  private _persistSendToAgentIntent(intent: SendToAgentIntent): Promise<void> {
+    return persistSendToAgentIntent(intent)
+  }
+
+  private async _deliverInterruptedSendToAgentIntent(intent: SendToAgentIntent): Promise<boolean> {
+    const origin = parseOriginWebchatSessionKey(intent.originSessionKey)
+    if (!origin) return true
+    const userId = intent.userId || process.env.OC_USER_ID?.trim() || 'default'
+    const result = await appendServerAuthoredMessage(origin.peerId, userId, {
+      id: `sta-restart-${intent.jobId}`,
+      role: 'system',
+      text: `后台任务（${intent.agentId}：${intent.goal.slice(0, 120)}）在服务重启时未确认完成，请重新发起。`,
+      ts: Date.now(),
+      status: 'interrupted',
+    })
+    return result.applied || result.reason === 'already_exists' || result.reason === 'session_deleted'
+  }
+
+  private async _persistInterruptedSendToAgentCallbacks(): Promise<void> {
+    this._activeSendToAgentCallbacks.clear()
+    await recoverInterruptedSendToAgentIntents((intent) =>
+      this._deliverInterruptedSendToAgentIntent(intent),
+    )
+  }
+
+  private handleCcbLocalAgentNotification(
+    session: { sessionKey: string; userId?: string; _activeTurnCount?: number; _activeClientTurnCount?: number },
+    payload: CcbLocalAgentNotification,
+  ): void {
+    const taskId = (payload.taskId || '').trim()
+    if (!taskId) return
+    const decision = noteCcbTaskNotification({
+      sessionKey: session.sessionKey,
+      notification: { ...payload, taskId },
+      hasInFlightTurn: sessionHasInFlightTurn(session),
+      userId: session.userId,
+    })
+    this.log.info('ccb local-agent callback noted', {
+      sessionKey: session.sessionKey,
+      taskId,
+      decision,
+    })
+    if (decision !== 'inject') return
+    this.queueCcbLocalAgentInject(session.sessionKey, payload, session.userId)
+  }
+
+  private handleCcbLocalAgentDelivered(sessionKey: string, taskId: string): void {
+    const id = (taskId || '').trim()
+    if (!id) return
+    const decision = ackCcbTaskNotificationDelivered({ sessionKey, taskId: id })
+    this.log.info('ccb local-agent callback acked', { sessionKey, taskId: id, decision })
+  }
+
+  private flushCcbLocalAgentPendingOnFinalize(
+    session: { sessionKey: string; userId?: string },
+  ): void {
+    const due = takePendingInjectionsForSession(session.sessionKey)
+    for (const item of due) {
+      this.queueCcbLocalAgentInject(session.sessionKey, item.payload, item.userId ?? session.userId)
+    }
+  }
+
+  private queueCcbLocalAgentInject(
+    sessionKey: string,
+    payload: CcbLocalAgentNotification,
+    userId?: string,
+  ): void {
+    void this.injectCcbLocalAgentCallback({
+      sessionKey,
+      userId,
+      taskId: payload.taskId,
+      status: payload.status,
+      outputFile: payload.outputFile,
+      summary: payload.summary,
+    }).catch((err) => {
+      this.log.warn('ccb local-agent callback inject failed', {
+        sessionKey,
+        taskId: payload.taskId,
+        err: String(err),
+      })
+    })
+  }
+
+  /**
+   * Origin-inject a CCB local-agent completion after the parent turn is
+   * idle and no mid-turn delivered ack arrived. Retries with the same
+   * bounded backoff as send_to_agent. Parent CCB process already dead
+   * is not covered.
+   */
+  private async injectCcbLocalAgentCallback(args: {
+    sessionKey: string
+    userId?: string
+    taskId: string
+    status?: string
+    outputFile?: string
+    summary?: string
+  }): Promise<CronOriginFireResult> {
+    const origin = parseOriginWebchatSessionKey(args.sessionKey)
+    if (!origin) {
+      this.log.warn('ccb local-agent callback skipped: session is not webchat dm', {
+        taskId: args.taskId,
+        sessionKey: args.sessionKey,
+      })
+      abandonCcbLocalAgentInject(args.sessionKey, args.taskId)
+      return { kind: 'fallback' }
+    }
+    if (!beginCcbLocalAgentInject(args.sessionKey, args.taskId)) {
+      this.log.info('ccb local-agent inject skipped: not pending', {
+        sessionKey: args.sessionKey,
+        taskId: args.taskId,
+        state: getCcbLocalAgentCallbackState(args.sessionKey, args.taskId),
+      })
+      return { kind: 'fallback' }
+    }
+    const preLimit = evaluateCcbLocalAgentInjectLimit(args.sessionKey, args.taskId)
+    if (preLimit) {
+      this.log.warn('ccb local-agent inject abandoned after finalize-round or TTL limit', {
+        taskId: args.taskId,
+        sessionKey: args.sessionKey,
+        reason: preLimit,
+      })
+      return { kind: 'fallback' }
+    }
+    const text = buildCcbLocalAgentCallbackText({
+      taskId: args.taskId,
+      status: args.status,
+      outputFile: args.outputFile,
+      summary: args.summary,
+    })
+    const clientMessageId = ccbLocalAgentCallbackClientMessageId(args.taskId)
+    let budgetExhausted = false
+    const result = await runBoundedOriginInjectBackoff({
+      isShuttingDown: () => this._shuttingDown,
+      shouldAbort: () =>
+        getCcbLocalAgentCallbackState(args.sessionKey, args.taskId) === 'delivered',
+      tryOnce: async () => {
+        if (getCcbLocalAgentCallbackState(args.sessionKey, args.taskId) === 'delivered') {
+          return { kind: 'fallback' }
+        }
+        const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
+        let queued = false
+        try {
+          const parent = this.sessions.getByKey(origin.sessionKey)
+          if (sessionHasInFlightTurn(parent)) {
+            return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
+          }
+          const userId =
+            (typeof args.userId === 'string' && args.userId.trim()) ||
+            parent?.userId ||
+            process.env.OC_USER_ID?.trim() ||
+            'default'
+          return await this.tryCcbLocalAgentCallbackDispatch({
+            origin,
+            userId,
+            text,
+            clientMessageId,
+            taskId: args.taskId,
+            sessionKey: origin.sessionKey,
+            barrierOwner: barrier.owner,
+            onQueued: () => {
+              queued = true
+              barrier.release()
+            },
+          })
+        } finally {
+          if (!queued) barrier.release()
+        }
+      },
+      onBudgetExhausted: () => {
+        budgetExhausted = true
+        this.log.warn('ccb local-agent callback retry budget exhausted', {
+          taskId: args.taskId,
+          sessionKey: args.sessionKey,
+        })
+      },
+    })
+    if (result.kind === 'injected') {
+      completeCcbLocalAgentInject(args.sessionKey, args.taskId)
+    } else if (budgetExhausted) {
+      failCcbLocalAgentInject(args.sessionKey, args.taskId)
+      const reason = noteCcbLocalAgentFinalizeRoundExhausted(args.sessionKey, args.taskId)
+      if (reason) {
+        this.log.warn('ccb local-agent inject abandoned after finalize-round or TTL limit', {
+          taskId: args.taskId,
+          sessionKey: args.sessionKey,
+          reason,
+        })
+      }
+    } else if (result.kind === 'fallback' || result.kind === 'terminal_failure') {
+      abandonCcbLocalAgentInject(args.sessionKey, args.taskId)
+    } else {
+      failCcbLocalAgentInject(args.sessionKey, args.taskId)
+    }
+    return result
+  }
+
+  private async tryCcbLocalAgentCallbackDispatch(args: {
+    origin: { sessionKey: string; agentId: string; channel: 'webchat'; peerKind: 'dm'; peerId: string }
+    userId: string
+    text: string
+    clientMessageId: string
+    taskId: string
+    sessionKey: string
+    barrierOwner?: string
+    onQueued?: () => void
+  }): Promise<CronOriginFireResult> {
+    if (this._shuttingDown || this._runtimeRecycleDrainUntil > Date.now()) {
+      return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
+    }
+    try {
+      const existing = await getClientSession(args.origin.peerId, args.userId)
+      if (existing) {
+        const persisted = await appendServerAuthoredMessage(args.origin.peerId, args.userId, {
+          id: args.clientMessageId,
+          role: 'user',
+          text: args.text,
+          ts: Date.now(),
+        })
+        if (!persisted.applied) {
+          if (persisted.reason === 'already_exists') {
+            // same task retry — continue to dispatch
+          } else if (
+            persisted.reason === 'session_deleted' ||
+            persisted.reason === 'malformed' ||
+            persisted.reason === 'oversized'
+          ) {
+            return { kind: 'fallback' }
+          } else {
+            return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+          }
+        }
+      } else if (!this.sessions.getByKey(args.origin.sessionKey)) {
+        this.log.warn('ccb local-agent callback skipped: parent session gone', {
+          taskId: args.taskId,
+        })
+        return { kind: 'fallback' }
+      }
+    } catch (err) {
+      this.log.warn('ccb local-agent callback persist failed', { taskId: args.taskId }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+    }
+    try {
+      let wasQueued = false
+      await this.dispatchInbound({
+        type: 'inbound.message',
+        channel: args.origin.channel,
+        peer: { id: args.origin.peerId, kind: args.origin.peerKind },
+        agentId: args.origin.agentId,
+        content: { text: args.text },
+        ts: Date.now(),
+        idempotencyKey: ccbLocalAgentCallbackIdempotencyKey(args.sessionKey, args.taskId),
+        clientMessageId: args.clientMessageId,
+        _userId: args.userId,
+        _skipRateLimit: true,
+        _syntheticBarrierOwner: args.barrierOwner,
+        _onSyntheticQueued: () => {
+          wasQueued = true
+          args.onQueued?.()
+        },
+      } as any)
+      if (!wasQueued) return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
+    } catch (err) {
+      this.log.warn('ccb local-agent callback dispatch failed', { taskId: args.taskId }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_DISPATCH_FAILED' }
+    }
+    return { kind: 'injected' }
+  }
+
+  private _queueSendToAgentCallback(
+    runInput: RunDelegateInput,
+    args: { jobId: string; agentId: string; goal: string; output?: string; error?: string },
+  ): void {
+    if (runInput.callbackOnComplete !== 'origin-inject') return
+    void this.injectSendToAgentCallback({
+      parentSessionKey: runInput.callbackOriginSessionKey ?? runInput.parentSessionKey,
+      jobId: args.jobId,
+      agentId: args.agentId,
+      goal: args.goal,
+      output: args.output,
+      error: args.error,
+      userId:
+        runInput.callbackOriginUserId ??
+        this.sessions.getByKey(runInput.parentSessionKey || '')?.userId,
+    }).then(async (result) => {
+      if (result.kind !== 'injected') return
+      this._activeSendToAgentCallbacks.delete(args.jobId)
+      await removeSendToAgentIntent(args.jobId)
+    }).catch((err) => {
+      this.log.warn('send_to_agent callback inject failed', {
+        jobId: args.jobId,
+        err: String(err),
+      })
+    })
+  }
+
+  /**
+   * send_to_agent 完成后注入父 webchat：等父 turn 不在飞，再写 user 行并
+   * dispatchInbound 新开父 turn。不走 lastActiveChannel 的 📨 WS 旁路。
+   */
+  private async injectSendToAgentCallback(args: {
+    parentSessionKey?: string
+    jobId: string
+    agentId: string
+    goal: string
+    output?: string
+    error?: string
+    userId?: string
+  }): Promise<CronOriginFireResult> {
+    const origin = parseOriginWebchatSessionKey(args.parentSessionKey || '')
+    if (!origin) {
+      this.log.warn('send_to_agent callback skipped: parent is not webchat dm', {
+        jobId: args.jobId,
+        parentSessionKey: args.parentSessionKey,
+      })
+      return { kind: 'fallback' }
+    }
+    const text = buildSendToAgentCallbackText({
+      agentId: args.agentId,
+      goal: args.goal,
+      output: args.output,
+      error: args.error,
+    })
+    const clientMessageId = sendToAgentCallbackClientMessageId(args.jobId)
+    return runBoundedOriginInjectBackoff({
+      isShuttingDown: () => this._shuttingDown,
+      tryOnce: async () => {
+        const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
+        let queued = false
+        try {
+          const parent = this.sessions.getByKey(origin.sessionKey)
+          if ((parent?._activeTurnCount ?? 0) > 0 || (parent?._activeClientTurnCount ?? 0) > 0) {
+            return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
+          }
+          const userId =
+            (typeof args.userId === 'string' && args.userId.trim()) ||
+            parent?.userId ||
+            process.env.OC_USER_ID?.trim() ||
+            'default'
+          return await this.trySendToAgentCallbackDispatch({
+            origin,
+            userId,
+            text,
+            clientMessageId,
+            jobId: args.jobId,
+            barrierOwner: barrier.owner,
+            onQueued: () => {
+              queued = true
+              barrier.release()
+            },
+          })
+        } finally {
+          if (!queued) barrier.release()
+        }
+      },
+      onBudgetExhausted: () => {
+        this.log.warn('send_to_agent callback retry budget exhausted', { jobId: args.jobId })
+      },
+    })
+  }
+
+  private async trySendToAgentCallbackDispatch(args: {
+    origin: { sessionKey: string; agentId: string; channel: 'webchat'; peerKind: 'dm'; peerId: string }
+    userId: string
+    text: string
+    clientMessageId: string
+    jobId: string
+    barrierOwner?: string
+    onQueued?: () => void
+  }): Promise<CronOriginFireResult> {
+    if (this._shuttingDown || this._runtimeRecycleDrainUntil > Date.now()) {
+      return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
+    }
+    try {
+      const existing = await getClientSession(args.origin.peerId, args.userId)
+      if (existing) {
+        const persisted = await appendServerAuthoredMessage(args.origin.peerId, args.userId, {
+          id: args.clientMessageId,
+          role: 'user',
+          text: args.text,
+          ts: Date.now(),
+        })
+        if (!persisted.applied) {
+          if (persisted.reason === 'already_exists') {
+            // same job retry — continue to dispatch
+          } else if (
+            persisted.reason === 'session_deleted' ||
+            persisted.reason === 'malformed' ||
+            persisted.reason === 'oversized'
+          ) {
+            return { kind: 'fallback' }
+          } else {
+            return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+          }
+        }
+      } else if (!this.sessions.getByKey(args.origin.sessionKey)) {
+        this.log.warn('send_to_agent callback skipped: parent session gone', {
+          jobId: args.jobId,
+        })
+        return { kind: 'fallback' }
+      }
+    } catch (err) {
+      this.log.warn('send_to_agent callback persist failed', { jobId: args.jobId }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+    }
+    try {
+      let wasQueued = false
+      await this.dispatchInbound({
+        type: 'inbound.message',
+        channel: args.origin.channel,
+        peer: { id: args.origin.peerId, kind: args.origin.peerKind },
+        agentId: args.origin.agentId,
+        content: { text: args.text },
+        ts: Date.now(),
+        idempotencyKey: sendToAgentCallbackIdempotencyKey(args.jobId),
+        clientMessageId: args.clientMessageId,
+        _userId: args.userId,
+        _skipRateLimit: true,
+        _syntheticBarrierOwner: args.barrierOwner,
+        _onSyntheticQueued: () => {
+          wasQueued = true
+          args.onQueued?.()
+        },
+      } as any)
+      if (!wasQueued) return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
+    } catch (err) {
+      this.log.warn('send_to_agent callback dispatch failed', { jobId: args.jobId }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_DISPATCH_FAILED' }
+    }
+    return { kind: 'injected' }
+  }
+
   // ── Cron/Reminder API handlers ──
+  private cronProjectPorts(): CronProjectPorts {
+    return {
+      getBoardProject: async (id) => {
+        const p = getProject(getTaskboardDb(), id)
+        return p ? { id: p.id, archivedAt: p.archivedAt } : null
+      },
+      getSessionBoardProject: async (sessionId) => {
+        const ws = await resolveChatRunWorkspace({ sessionId })
+        return ws.bound ? ws.projectId : null
+      },
+    }
+  }
+
+  private async stampCronProject(
+    parsed: { projectMode?: unknown; boardProjectId?: unknown },
+    originPeerId?: string,
+  ): Promise<{ projectMode: 'follow_session' | 'fixed'; boardProjectId: string | null } | { error: string }> {
+    const wantFixed = parsed.projectMode === 'fixed'
+    if (!wantFixed) return { projectMode: 'follow_session', boardProjectId: null }
+    let candidate = typeof parsed.boardProjectId === 'string' ? parsed.boardProjectId : ''
+    if (!candidate && originPeerId) {
+      const live = await resolveChatRunWorkspace({ sessionId: originPeerId })
+      candidate = live.bound && live.projectId ? live.projectId : ''
+    }
+    const derived = await deriveFixedBoardProjectId(this.cronProjectPorts(), candidate)
+    if (!derived) return { error: 'fixed project must be a live unarchived board project' }
+    return { projectMode: 'fixed', boardProjectId: derived }
+  }
+
   private async handleCronApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
     if (req.method === 'GET') {
-      const jobs = filterUserVisibleByAgentField(await this.cron.listJobsWithMeta())
+      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+      let jobs = filterUserVisibleByAgentField(await this.cron.listJobsWithMeta())
+      const boardRaw = url.searchParams.get('boardProjectId')
+      if (boardRaw && boardRaw !== 'all') {
+        jobs = await filterCronJobsForBoard(jobs, boardRaw, this.cronProjectPorts())
+      }
       this.sendJson(res, 200, { jobs })
       return
     }
@@ -12103,7 +13032,7 @@ export class Gateway {
       const cronAgent = typeof agent === 'string' && agent ? agent : 'main'
       if (isHiddenSystemAgentId(cronAgent)) return this.sendError(res, 404, 'agent not found')
       const id = `remind-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
-      const job = {
+      const job: CronJob = {
         id,
         schedule,
         agent: cronAgent,
@@ -12116,6 +13045,36 @@ export class Gateway {
         // for a schedule point that predates this job (see cron.ts resolveDueMinute).
         createdAt: Date.now(),
       }
+      if (parsed.resume === 'origin-session') {
+        const origin = parseOriginWebchatSessionKey(
+          typeof parsed.originSessionKey === 'string' ? parsed.originSessionKey : '',
+        )
+        const live = origin ? this.sessions.getByKey(origin.sessionKey) : undefined
+        const containerUser = process.env.OC_USER_ID?.trim()
+        if (!origin || !live) {
+          return this.sendError(
+            res,
+            400,
+            'origin-session requires the current live webchat conversation; do not pass a session id',
+          )
+        }
+        if (
+          containerUser &&
+          typeof live.userId === 'string' &&
+          live.userId !== containerUser &&
+          live.userId !== 'default'
+        ) {
+          return this.sendError(res, 403, 'origin-session does not belong to this user')
+        }
+        job.resume = 'origin-session'
+        job.sourceSessionKey = origin.sessionKey
+        job.sourceUserId =
+          (typeof live.userId === 'string' && live.userId) || containerUser || 'default'
+      }
+      const stamped = await this.stampCronProject(parsed, parseOriginWebchatSessionKey(job.sourceSessionKey || '')?.peerId)
+      if ('error' in stamped) return this.sendError(res, 400, stamped.error)
+      job.projectMode = stamped.projectMode
+      job.boardProjectId = stamped.boardProjectId
       await this.cron.addJob(job)
       this.sendJson(res, 201, { ok: true, job })
       return
@@ -12152,6 +13111,13 @@ export class Gateway {
       const existing = (await this.cron.listJobsWithMeta()).find((job) => job.id === id)
       if (existing && isHiddenSystemAgentId(existing.agent)) {
         return this.sendError(res, 404, 'cron job not found')
+      }
+      if (parsed.projectMode !== undefined || parsed.boardProjectId !== undefined) {
+        const originPeer = parseOriginWebchatSessionKey(existing?.sourceSessionKey || '')?.peerId
+        const stamped = await this.stampCronProject(parsed, originPeer)
+        if ('error' in stamped) return this.sendError(res, 400, stamped.error)
+        parsed.projectMode = stamped.projectMode
+        parsed.boardProjectId = stamped.boardProjectId
       }
       const updated = await this.cron.updateJob(id, parsed)
       this.sendJson(res, updated ? 200 : 404, { ok: updated })
@@ -12314,7 +13280,8 @@ export class Gateway {
       })
     } catch (err: any) {
       this.log.error('oauth exchange error', { provider: providerKey }, err)
-      this.sendError(res, 500, err?.message ?? 'token exchange failed')
+      // E5 — err.message 可能携带上游 URL/响应片段,只回受控文案(原文已进上行日志)。
+      this.sendError(res, 500, 'OAuth 令牌交换失败，请稍后重试')
     }
   }
 
@@ -13205,7 +14172,15 @@ export class Gateway {
           )
           reply({ ...prepared, status: 'completed' })
         } catch (err) {
-          const code = err instanceof Error ? err.message : 'MODEL_SWITCH_PREPARE_FAILED'
+          // E5 — err.message 只在形如受控大写码时才作为 errorCode 下发;任意
+          // 运行时错误文本(可能含路径/栈)收敛为固定码,原文进日志。
+          const rawCode = err instanceof Error ? err.message : ''
+          const code = /^[A-Z][A-Z0-9_]{2,64}$/.test(rawCode)
+            ? rawCode
+            : 'MODEL_SWITCH_PREPARE_FAILED'
+          if (code === 'MODEL_SWITCH_PREPARE_FAILED') {
+            this.log.error('model switch prepare failed', { sessionKey }, err as Error)
+          }
           reply({
             sourceModel: session.model ?? session.runner.model ?? '',
             status: 'failed',
@@ -13262,13 +14237,16 @@ export class Gateway {
             },
           )
         } catch (err: any) {
-          ws.send(JSON.stringify({ type: 'error', error: `compact failed: ${err?.message}` }))
+          // E5 — 原文进日志,ws 控制面错误帧只发受控文案。
+          this.log.error('compact session failed', { sessionKey }, err)
+          ws.send(JSON.stringify({ type: 'error', error: '上下文压缩失败，请稍后重试' }))
         }
       }
       } catch (err: any) {
         this.log.error('ws-message unhandled error', undefined, err)
         try {
-          ws.send(JSON.stringify({ type: 'error', error: `internal error: ${err?.message}` }))
+          // E5 — 同上:err.message 可能含内部路径/栈,只回受控文案。
+          ws.send(JSON.stringify({ type: 'error', error: '服务内部错误，请稍后重试' }))
         } catch { /* ws may already be closed */ }
       }
     })
@@ -13809,7 +14787,7 @@ export class Gateway {
       this.log.warn('permission response for dead session', { sessionKey: pending.sessionKey })
       return
     }
-    let ok = session.runner.sendPermissionResponse(frame.requestId, response)
+    const ok = session.runner.sendPermissionResponse(frame.requestId, response)
     this.log.info('permission response', {
       requestId: frame.requestId,
       behavior: effectiveBehavior,
@@ -13819,6 +14797,17 @@ export class Gateway {
       askUserQuestionMerged:
         pending.toolName === 'AskUserQuestion' && forwardedInput !== pending.input,
     })
+    if (!ok) {
+      // The Codex reverse-RPC write did not reach a live stdin. Keep the
+      // authoritative prompt pending instead of recording/broadcasting a
+      // settlement the engine never received.
+      this._pendingPermissions.set(frame.requestId, pending)
+      this.log.warn('permission response write failed; request restored', {
+        requestId: frame.requestId,
+        sessionKey: pending.sessionKey,
+      })
+      return
+    }
     // Record the authoritative result BEFORE broadcasting so any late
     // duplicate response that arrives between here and the broadcast round
     // will see the correct behavior. Use pending.* so late duplicates replay
@@ -14670,7 +15659,7 @@ export class Gateway {
     // Snapshot requestIds first — the helper mutates _pendingPermissions.
     const requestIds: string[] = []
     for (const [requestId, pending] of this._pendingPermissions) {
-      if (pending.detachedAskUser) continue
+      if (pending.detachedAskUser || pending.blockingUserInput) continue
       if (pending.peerKey === peerKey) requestIds.push(requestId)
     }
     for (const requestId of requestIds) {
@@ -14762,6 +15751,59 @@ export class Gateway {
       })
       this.log.info('auto-resume pre-warmed', { sessionKey })
     }
+  }
+
+  /**
+   * GET /api/sessions/:id 成功(full 与 ?since= 两条 200 路径)后的 fire-and-forget
+   * 引擎预热(INC-20260824-FIRST-TEXT-LATENCY;gate: OC_ENGINE_PREHEAT=1,默认关)。
+   *
+   * 选中会话必打这条 GET(useSessionList.selectSession → loadHistory),粒度恰好是
+   * "用户正在看的那一个会话" —— 明确不挂 bootAutoResume / 全量 hello(那两处是
+   * 全量扇出,spawn 会打满内存/fork)。agentId/modelId 取自本次已读出的
+   * client_sessions 权威行;执行授权走 prewarm 投影,失败即跳过,不绕 fail-closed。
+   */
+  private _preheatSessionOnOpen(
+    sessId: string,
+    userId: string,
+    row: { agentId?: string; modelId?: string },
+  ): void {
+    if (process.env.OC_ENGINE_PREHEAT !== '1') return
+    void (async () => {
+      const aid = row.agentId || 'main'
+      if (isHiddenSystemAgentId(aid)) return
+      const sessionKey = `agent:${aid}:webchat:dm:${sessId}`
+      const cfg = await this._getAgentsConfig()
+      const agent = cfg.agents.find((a) => a.id === aid) ?? ({ id: aid } as AgentDef)
+      // 模型权威:预热带上会话持久化的 modelId(权威行),避免首条消息因
+      // model 不一致触发 shutdown-respawn 白烧一次冷启动;投影拒绝/不可用 →
+      // 抛 → 外层 catch 跳过预热(fail-closed,不回落 baked)。**已存在但
+      // 冷置的 session 同样必须过这道投影**——授权已撤销时不得为它拉起进程。
+      const preExec = await resolveLocalExecutionIfEnforced({
+        agent,
+        kind: 'prewarm',
+        ...(row.modelId ? { model: row.modelId } : {}),
+        defaultModel: this.deps.config.defaults.model,
+      })
+      let session = this.sessions.getByKey(sessionKey)
+      if (!session) {
+        const override = localExecutionOverride(preExec)
+        session = await this.sessions.getOrCreate({
+          sessionKey,
+          agent,
+          ...override,
+          ...(override.model === undefined && row.modelId ? { model: row.modelId } : {}),
+          channel: 'webchat',
+          peerId: sessId,
+          userId,
+        })
+      }
+      const outcome = await this.sessions.preheatRunner(session)
+      if (outcome !== 'started' && outcome !== 'already_running') {
+        this.log.info('engine_preheat_skipped', { sessionKey, outcome })
+      }
+    })().catch((err) => {
+      this.log.warn('session-open engine preheat failed', { sessId }, err)
+    })
   }
 
   private async autoResumeFromHello(
@@ -15050,6 +16092,35 @@ export class Gateway {
                 ts: Date.now(),
               }))
               this.log.info('auto-resume reconcile turn_interrupted (id-bound)', { sessionKey, clientMessageId: inFlightCmid })
+            } else if (
+              _shouldInterruptUnknownInFlight({
+                runningClientMessageId: session._runningClientMessageId,
+                admittingClientMessageId: session._admittingClientMessageId,
+                inFlightClientMessageId: inFlightCmid,
+                engineTurnCount: session._activeTurnCount,
+                clientTurnCount: session._activeClientTurnCount,
+              })
+            ) {
+              // V5 master-authoritative lookup 在容器侧恒为 unknown。若本进程
+              // 已不在跑该 cmid（重启后 liveSkipped / Grok 子进程已死 / 已换新 recover），
+              // 再发非 final turn_state_unknown 会让前端按 RFC §4 永远留「思考中」。
+              // 计数器都是 0 时生产者已不在本进程，合成 interrupted 终态清发送态。
+              ws.send(JSON.stringify({
+                type: 'outbound.message',
+                sessionKey,
+                channel: 'webchat',
+                peer: basePeer,
+                agentId: aid,
+                blocks: [],
+                clientMessageId: inFlightCmid,
+                meta: { reconcile: 'turn_interrupted', interrupted: 'service_restart', clientMessageId: inFlightCmid } as any,
+                isFinal: true,
+                ts: Date.now(),
+              }))
+              this.log.info('auto-resume reconcile unknown-in-flight as interrupted (id-bound)', {
+                sessionKey,
+                clientMessageId: inFlightCmid,
+              })
             } else {
               // 未知身份(ring 未命中 且 非 running)→ **非 final** turn_state_unknown。
               // 不冒充终态:前端立即 reconcileSession(force-sync)+ 缩短 safety 定时,
@@ -15164,11 +16235,18 @@ export class Gateway {
       // TODO: 权限响应处理
       return
     }
+    const syntheticBarrierKey = `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
+    const syntheticBarrier = this._syntheticTurnBarriers?.get(syntheticBarrierKey)
+    if (syntheticBarrier && (frame as any)._syntheticBarrierOwner !== syntheticBarrier.owner) {
+      await syntheticBarrier.done
+    }
     if (this._runtimeRecycleDrainUntil > Date.now()) {
       this.log.info('runtime recycle drain rejected inbound turn')
       return
     }
     this._runtimeRecycleIngressActive += 1
+    let admitCmid: string | undefined
+    let admitSession: { _admittingClientMessageId?: string } | undefined
     try {
 
     // ── Idempotency dedup (read-only check): skip already-processed messages ──
@@ -15227,7 +16305,7 @@ export class Gateway {
       typeof (frame as any)._rateLimitChannel === 'string'
         ? (frame as any)._rateLimitChannel
         : frame.channel
-    if (!this.rateLimiter.check(frame.peer.id, rateLimitChannel)) {
+    if (!(frame as any)._skipRateLimit && !this.rateLimiter.check(frame.peer.id, rateLimitChannel)) {
       const rlUserId: string =
         typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
       const rateLimitOut = {
@@ -15602,6 +16680,24 @@ export class Gateway {
     // getOrCreate(spawn)与 submit(路由字段)**同源** —— 不允许 spawn 用 A、路由用 B。
     const turnExecutionModel: string | undefined = localExec?.canonicalModel ?? safeModel
 
+    const cronRaw = (frame as unknown as { _cronBoardProjectId?: unknown })._cronBoardProjectId
+    const cronBoardOverride = typeof cronRaw === 'string' ? cronRaw : undefined
+    const chatWorkspace = await resolveChatRunWorkspace({
+      sessionId: frame.peer.id,
+      ...(cronBoardOverride ? { boardProjectId: cronBoardOverride } : {}),
+    })
+    const webchatRunContext = createRunContextDescriptor({
+      runId: `webchat:${frame.peer.id}`,
+      boardProjectId: chatWorkspace.projectId,
+      channel: frame.channel,
+      agentId: effectiveAgent.id,
+      sessionKey,
+      cwdSource: chatWorkspace.cwdSource,
+      workspaceSpec: chatWorkspace.spec,
+      workspaceCwd: chatWorkspace.workspaceCwd ?? null,
+      persistSnapshot: Boolean(chatWorkspace.projectId && chatWorkspace.bound),
+    })
+
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent: effectiveAgent,
@@ -15614,6 +16710,11 @@ export class Gateway {
       // null, and silently drops the reply.
       userId: activeUserId,
       workspaceMode: safeWorkspaceMode,
+      ...(chatWorkspace.workspaceCwd ? { workspaceCwd: chatWorkspace.workspaceCwd } : {}),
+      projectId: chatWorkspace.projectId,
+      contextFingerprint: chatWorkspace.contextFingerprint,
+      assetsRevision: chatWorkspace.assetsRevision,
+      runContext: webchatRunContext,
       title: (frame.content.text ?? '').slice(0, 50).trim() || undefined,
       // 仅用于**新建** runner 时初始化 effort;既存 session 的切换由 submit() 处理
       // (在那里和 turn 入队原子串行,避免并发 submit 之间互相覆盖)。
@@ -15642,6 +16743,11 @@ export class Gateway {
         ? { promptQueueExecutionFence }
         : {}),
     })
+    admitCmid = typeof safeClientMessageId === 'string' && safeClientMessageId !== ''
+      ? safeClientMessageId
+      : undefined
+    admitSession = session
+    if (admitCmid) session._admittingClientMessageId = admitCmid
     const wechatDispatchStarted = (frame as any)._wechatDispatchStarted
     if (typeof wechatDispatchStarted === 'function') {
       try {
@@ -16197,12 +17303,18 @@ export class Gateway {
               : rejectionMessage
                 ?? 'Image 2 服务暂时不可用，请稍后重试。'
           externalQueueTerminalText = `[error] ${message}`
+          // E4.3/E5 — detail 不再携带上游原始错误串(只留 traceId);原文进日志。
+          this.log.warn('image job failed (raw detail logged here only)', {
+            sessionKey: out.sessionKey,
+            error: err instanceof Error ? err.message : String(err),
+            ...(out.traceId ? { traceId: out.traceId } : {}),
+          })
           const errorFrame: OutboundError & { _userId?: string } = {
             type: 'outbound.error',
             ..._inheritOutboundRouting(out),
             code: insufficient ? 'insufficient_credits' : rateLimited ? 'rate_limited' : 'upstream_failed',
             message,
-            detail: err instanceof Error ? err.message : String(err),
+            ...(out.traceId ? { detail: out.traceId } : {}),
             isFinal: false,
           }
           this.deliver(errorFrame, adapter)
@@ -16403,7 +17515,7 @@ export class Gateway {
         '- 你是队长，也是完成用户任务的第一负责人；从任务拆解、是否委派到最终答复，都由你端到端负责。',
         '- 领域匹配优先于泛泛并行：用户任务明显属于某个已安装成员的领域时，优先把对应部分委派给该成员；多领域任务则拆给对应成员后由你综合。常见路由：代码/调试/测试/重构/代码库 → `coding-assistant`；科研/文献/论文/引用/学术分析 → `research-assistant`；文档/PPT/Excel/PDF/周报/公文/邮件/办公交付 → `office-assistant`。如果对应成员未安装，你可以自己完成或选择最接近的已安装成员。',
         '- 需要多个成员协作的复杂任务：先用 `TodoWrite` 列出一份简明的拆解计划（每一步派给谁、预期产出什么），再照计划委派；简单任务无需列计划，直接做即可。',
-        '- 任务复杂、可拆解 → **首选**同步委派给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。CCB/Codex 用 MCP `delegate_task(goal, agentId, context)`；Cursor 用 Bash `oc-memory delegate --goal "..."`（阻塞到结束，不要走 MCP）。',
+        '- 任务复杂、可拆解 → **首选**同步委派给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。CCB/Codex 用 MCP `delegate_task(goal, agentId, context)`；Cursor 用 Bash `oc-memory delegate --goal "..."`，返回 `status=running` 时立即用 `oc-memory delegate-wait <jobId>` 续等，不走 MCP，不用 Cursor `TaskOutput`。',
         '- 多个**互相独立、可同时进行**的子任务 → CCB/Codex 用 `delegate_tasks`（tasks 列表，单次最多 4 个）；Cursor 在同一回合并发多条 `oc-memory delegate`。若子任务之间有先后依赖（B 要用到 A 的产出），仍串行。',
         '- 按子任务量级选 `effort`：机械/简单子任务填 `low`，常规填 `medium`，攻坚/高难度填 `high`；拿不准就不填（用该成员默认档位），不要把简单活儿也开到 `high` 徒增开销与耗时。',
         '- 成员的大产物（完整代码/长文档/数据文件）会以「文件路径 + 摘要」的形式回传（大产物落在共享目录 `/home/agent/.openclaude/generated/`）；你综合最终答案时，需要完整内容就用 `Read` 按回传的路径读回来，别只凭摘要臆测。',
@@ -16614,6 +17726,7 @@ export class Gateway {
         }
         this.deliver(usageFrame, adapter)
       } else if (e.kind === 'final') {
+        this.flushCcbLocalAgentPendingOnFinalize(session)
         leaderFinalCount++
         // Plan 2 — turn 终态前先清 turn_status cache。CCB 正常关 compact 会先
         // emit setSDKStatus(null)(parser → kind:'turn_status' status:null),
@@ -16645,6 +17758,20 @@ export class Gateway {
           // WeChat gets exactly one final text message.  If the agent completed
           // with no assistant text (tools-only/interrupted edge), still send a
           // terminal marker so the user is not left with only the start link.
+          const plated = hasPlatedAssistantOutput({
+            blocks: [...aggregatedBlocks, ...out.blocks],
+            extraText: autoDreamAssistantText,
+          })
+          if (!plated) {
+            this.deliver(
+              {
+                ...out,
+                blocks: [{ kind: 'text', text: EMPTY_COMPLETED_TURN_NOTICE } as any],
+                isFinal: false,
+              },
+              undefined,
+            )
+          }
           this.deliver({ ...out, blocks: [], isFinal: true, meta: e.meta }, undefined)
           const wechatFinalBlocks =
             aggregatedBlocks.length > 0
@@ -16657,6 +17784,20 @@ export class Gateway {
           // 拷贝一份脱钩本地引用。
           this.deliver({ ...out, blocks: aggregatedBlocks.slice(), isFinal: true, meta: e.meta }, adapter)
         } else {
+          const plated = hasPlatedAssistantOutput({
+            blocks: [...aggregatedBlocks, ...out.blocks],
+            extraText: autoDreamAssistantText,
+          })
+          if (!plated) {
+            this.deliver(
+              {
+                ...out,
+                blocks: [{ kind: 'text', text: EMPTY_COMPLETED_TURN_NOTICE } as any],
+                isFinal: false,
+              },
+              undefined,
+            )
+          }
           this.deliver({ ...out, blocks: [], isFinal: true, meta: e.meta }, undefined)
         }
         // 释放本轮聚合数组的内存。本闭包跨 turn 仍会被 sessionManager 的
@@ -16679,6 +17820,12 @@ export class Gateway {
         // both to read from `out`, which is correct: `out` is the source of
         // truth for this turn's routing tuple after model-routing has settled
         // any agent-override sessionKey.
+        const blockingUserInput =
+          e.request.toolName === 'AskUserQuestion' &&
+          session.runner.waitingForUserInput === true
+        const permissionExpiresAt = _permissionRequestExpiresAt(
+          blockingUserInput,
+        )
         const permFrame = {
           type: 'outbound.permission_request' as const,
           ..._inheritOutboundRouting(out),
@@ -16687,6 +17834,7 @@ export class Gateway {
           toolUseId: e.request.toolUseId,
           inputPreview: JSON.stringify(e.request.input).slice(0, 400),
           inputJson: e.request.input,
+          expiresAt: permissionExpiresAt,
         }
         // Permission requests only make sense for interactive clients (WebChat)
         // Non-interactive adapters auto-deny.
@@ -16709,10 +17857,21 @@ export class Gateway {
             userId: dispatchUserId,
             channel: frame.channel,
             peer: frame.peer,
-            expiresAt: Date.now() + Gateway.PENDING_PERMISSION_TTL_MS,
+            expiresAt: permissionExpiresAt,
+            ...(blockingUserInput ? { blockingUserInput: true } : {}),
           })
           this._sendStampedSessionFrame(sessionKey, peerKey, permFrame)
         }
+      } else if (e.kind === 'task_notification') {
+        void this.handleCcbLocalAgentNotification(session, {
+          taskId: e.taskId,
+          status: e.status,
+          outputFile: e.outputFile,
+          summary: e.summary,
+          toolUseId: e.toolUseId,
+        })
+      } else if (e.kind === 'task_notification_delivered') {
+        this.handleCcbLocalAgentDelivered(session.sessionKey, e.taskId)
       } else if (e.kind === 'turn_status') {
         // Plan 2 (compact-progress-frame) — CCB setSDKStatus 侧信道。CcbMessageParser
         // 把 stdout `{type:'system', subtype:'status', status:'compacting'|null}` 转成
@@ -16818,8 +17977,20 @@ export class Gateway {
         // that raw bubble and keep the technical string folded in `detail`.
         const errFrame = _buildEngineErrorFrame(_inheritOutboundRouting(out), e)
         this.deliver(errFrame, liveWechatAdapter ? undefined : adapter)
+        // E2 — 兼容 [error] 气泡只携带分类后的受控中文文案(errFrame.message)。
+        // 上游原始错误原文(可能含 API JSON、路径)不再直达微信/Telegram 等渠道
+        // 用户,只进结构化日志(下)与 _runLog(上方 complete 已记 e.error)。
+        // "[error] " 前缀保留:新前端按 _suppressErrorBubbleAtSeq + 该前缀抑制
+        // 双帧重复气泡,旧客户端靠它识别终止器。
+        this.log.warn('turn terminal error (raw detail logged here only)', {
+          sessionKey: out.sessionKey,
+          code: errFrame.code,
+          error: e.error,
+          ...(out.traceId ? { traceId: out.traceId } : {}),
+        })
+        const compatErrorText = `[error] ${errFrame.message}`
         if (liveWechatAdapter) {
-          const errBlocks = [{ kind: 'text', text: `[error] ${e.error}` } as any]
+          const errBlocks = [{ kind: 'text', text: compatErrorText } as any]
           this.deliver(
             {
               ...out,
@@ -16837,7 +18008,7 @@ export class Gateway {
           this.deliver(
             {
               ...out,
-              blocks: [{ kind: 'text', text: `[error] ${e.error}` }],
+              blocks: [{ kind: 'text', text: compatErrorText }],
               isFinal: true,
             },
             adapter,
@@ -16875,6 +18046,11 @@ export class Gateway {
       grokRoute: safeGrokRoute,
       zcodeRoute: safeZcodeRoute,
       ...(automaticRetryState ? { automaticRetryState } : {}),
+      ...(inboundRecovery?.automatic === true &&
+          'resetNativeSession' in inboundRecovery &&
+          inboundRecovery.resetNativeSession === true
+        ? { resetNativeSession: true }
+        : {}),
       ...(safeModelSwitchId ? { modelSwitchId: safeModelSwitchId } : {}),
       // DispatchTurnContext(uid/…)→ sessionManager 逻辑键形状(userId/…)。
       ...(turnDispatchContext
@@ -16988,7 +18164,7 @@ export class Gateway {
     let clientTurnThrew = false
     let clientTurnError: unknown | undefined
     try {
-      await this.sessions.submit(
+      const submitPromise = this.sessions.submit(
         session,
         payload,
         onLeaderEvent,
@@ -17000,6 +18176,8 @@ export class Gateway {
         safeConversationMode,
         leaderSubmitOpts,
       )
+      try { (frame as any)._onSyntheticQueued?.() } catch {}
+      await submitPromise
       deliverPendingApiErrorTerminal()
 
     } catch (err) {
@@ -17045,6 +18223,7 @@ export class Gateway {
         channel: frame.channel,
         userText: text ?? '',
         assistantText: autoDreamAssistantText,
+        projectId: session.projectId ?? undefined,
       }
       // Durably await the success-only marker before detaching background scan.
       // This prevents process shutdown from losing an untracked insertion and
@@ -17121,6 +18300,9 @@ export class Gateway {
     }
     } finally {
       this._runtimeRecycleIngressActive = Math.max(0, this._runtimeRecycleIngressActive - 1)
+      if (admitCmid && admitSession && admitSession._admittingClientMessageId === admitCmid) {
+        admitSession._admittingClientMessageId = undefined
+      }
     }
   }
 
@@ -17166,6 +18348,23 @@ export class Gateway {
     // strip site every time it adds a new private field. Keeping stripped
     // values locally lets WS branch still route per-user.
     const { wire, userId: stampedUserId } = _stripPrivateRoutingFields(out)
+    if (wire.type === 'outbound.message' || wire.type === 'outbound.error') {
+      const sessionKey =
+        typeof (wire as { sessionKey?: unknown }).sessionKey === 'string'
+          ? (wire as { sessionKey: string }).sessionKey
+          : undefined
+      const current = (wire as { clientMessageId?: unknown }).clientMessageId
+      const rebound = rebindOutboundClientMessageId({
+        clientMessageId: typeof current === 'string' ? current : undefined,
+        sessionKey,
+        isFenced: (sk, cmid) => this._outboundRing?.isTurnFenced(sk, cmid) === true,
+        openTurnClientMessageId: sessionKey
+          ? this._outboundRing?.activeTurnClientMessageId(sessionKey)
+          : undefined,
+      })
+      if (rebound) (wire as { clientMessageId?: string }).clientMessageId = rebound
+      else delete (wire as { clientMessageId?: string }).clientMessageId
+    }
     // Plan 2 (compact-progress-frame) — sideband frame 跳过 adapter,只走 WS。
     // 背景:adapter (Telegram / 微信等) 的契约是 `OutboundMessage` 形状(.blocks
     // 必存,见 channels/telegram/src/index.ts:96 `for (const b of out.blocks)`),
@@ -17464,12 +18663,44 @@ export function _inheritOutboundRouting(
   }
 }
 
-/** Build the exact structured error wire frame used by dispatchInbound. */
+/** gateway 权威预分类码(非 errorClassify 产物)的受控中文文案。errorClassify 的
+ *  PATTERNS 只覆盖 provider 原文可识别的码;这些码由编排层(handleExit / tape
+ *  终态 / 持久化降级)直接盖章,文案在此单点维护(全角标点,与前端风格对齐)。 */
+const GATEWAY_TERMINAL_CODE_MESSAGES: Record<
+  Exclude<GatewayTerminalErrorCode, 'user_cancelled'>,
+  string
+> = {
+  runner_crashed: '执行环境意外中断，你的消息已保留，请直接重试本条消息',
+  service_restart: '服务正在更新，本轮已中断，请直接重试本条消息',
+  engine_error: '任务执行遇到内部错误，请直接重试本条消息',
+  auth_error: '模型服务认证失败，请重新登录或检查凭据后重试',
+  session_persist_unavailable: '回复已生成，但会话存储暂时不可用，内容已安全排队待写入',
+}
+
+/** E4.3 — detail 收口:默认不下发原始 event.error。仅当该码在 taxonomy 中
+ *  allowPublicServerMessage 且文本过 isDisplayableServerMessage 守卫时携带
+ *  服务端说明;否则只带 traceId(若有)供用户反馈时关联日志。原文只进日志。 */
+function _safeErrorFrameDetail(
+  code: string,
+  rawError: string,
+  traceId: string | undefined,
+): string | undefined {
+  if (turnErrorSemantics(code).allowPublicServerMessage === true && isDisplayableServerMessage(rawError)) {
+    return rawError
+  }
+  return traceId || undefined
+}
+
+/** Build the exact structured error wire frame used by dispatchInbound.
+ *  参数形状为 GatewayEngineErrorEvent(engine 原生 error 事件 ⊆ 该形状):
+ *  sessionManager 经 _asEngineErrorEvent 发射的 gateway 权威终态码在此恢复精度。 */
 export function _buildEngineErrorFrame(
   routing: ReturnType<typeof _inheritOutboundRouting>,
-  event: Extract<SessionStreamEvent, { kind: 'error' }>,
+  event: GatewayEngineErrorEvent,
 ): OutboundError & { _userId?: string } {
   if (event.errorCode === 'user_cancelled') {
+    // event.error 是 gateway 自产的受控停止文案(「本轮已由用户停止。」),不是
+    // 上游原文;detail 保留原值 —— 旧前端 rolling 兼容窗口按该 detail 反推取消。
     return {
       type: 'outbound.error',
       ...routing,
@@ -17479,19 +18710,35 @@ export function _buildEngineErrorFrame(
       isFinal: false,
     }
   }
+  // gateway 权威终态码(handleExit 分类的 runner_crashed/service_restart、tape
+  // AUTH_ERROR、持久化降级 session_persist_unavailable)直接透传,不再被下面的
+  // 原文正则分类压成 upstream_failed(E4.2)。
+  if (event.errorCode) {
+    const detail = _safeErrorFrameDetail(event.errorCode, event.error, routing.traceId)
+    return {
+      type: 'outbound.error',
+      ...routing,
+      code: event.errorCode,
+      message: GATEWAY_TERMINAL_CODE_MESSAGES[event.errorCode],
+      ...(detail !== undefined ? { detail } : {}),
+      isFinal: false,
+    }
+  }
   const preClass = event.errorClass
   const classified =
     preClass && preClass !== 'unknown'
       ? { code: preClass, message: classifiedMessageForCode(preClass) }
       : classifyRunError(event.error)
+  const code = classified.code === 'unknown' ? 'upstream_failed' : classified.code
+  const detail = _safeErrorFrameDetail(code, event.error, routing.traceId)
   return {
     type: 'outbound.error',
     ...routing,
-    code: classified.code === 'unknown' ? 'upstream_failed' : classified.code,
+    code,
     message: classified.code === 'unknown'
       ? '任务执行暂时中断，请直接重试本条消息'
       : classified.message,
-    detail: event.error,
+    ...(detail !== undefined ? { detail } : {}),
     isFinal: false,
   }
 }
@@ -17504,7 +18751,7 @@ export function _buildEngineErrorFrame(
 export function _turnStatusWireFields(
   phase: GatewayTurnPhase,
 ):
-  | { status: 'compacting' | null }
+  | { status: 'compacting' | 'waiting_for_user' | 'engine_starting' | 'engine_resuming' | null }
   | { status: 'retrying'; retry: TurnRetryMeta }
   | { status: 'working'; detail?: string } {
   if (phase && typeof phase === 'object') {
@@ -17778,6 +19025,34 @@ export function _shouldPushTurnInterruptedFinal(
   if (!peerInFlight) return false
   if ((engineTurnCount ?? 0) > 0) return false
   if ((clientTurnCount ?? 0) > 0) return false
+  return true
+}
+
+/**
+ * Identity-bound hello path: ring miss (or V5 master-authoritative lookup which
+ * always returns unknown) while this cmid is not `_runningClientMessageId`.
+ *
+ * Keep `turn_state_unknown` only for the dispatchInbound-before-submit window
+ * (counters > 0 but running id not bound yet). Otherwise the producer is gone
+ * from this process and leaving unknown keeps the client on 「思考中」 forever.
+ */
+export function _shouldInterruptUnknownInFlight(input: {
+  runningClientMessageId?: string | null
+  admittingClientMessageId?: string | null
+  inFlightClientMessageId: string
+  engineTurnCount?: number
+  clientTurnCount?: number
+}): boolean {
+  if (!input.inFlightClientMessageId) return false
+  if (input.runningClientMessageId === input.inFlightClientMessageId) return false
+  if (input.admittingClientMessageId === input.inFlightClientMessageId) return false
+  if (
+    !input.runningClientMessageId
+    && !input.admittingClientMessageId
+    && ((input.engineTurnCount ?? 0) > 0 || (input.clientTurnCount ?? 0) > 0)
+  ) {
+    return false
+  }
   return true
 }
 
@@ -18229,6 +19504,10 @@ export const FILE_BLOCKED_PATTERNS = [
   /\/v3-master-retry\.d\//,
   /\/v3-wechat-retry\.d\//,
 
+  // Cursor CLI cold-start diagnostics (oc-cursor.sh OPENCLAUDE_CURSOR_AGENT_DEBUG):
+  // raw CLI stderr/debug logs may carry prompts, tool args and auth diagnostics.
+  /\/logs\/cursor-cli\//,
+
   // Per-agent session JSONL subtree (thinking + tool args, may embed tokens).
   /\/\.openclaude\/agents\/[^/]+\/sessions\//,
 
@@ -18545,6 +19824,13 @@ function normalizePath(p: string): string {
     .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+/, '/api/chat-projects/:id')
     .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+/, '/api/project-assets/:id')
     .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
+    .replace(/\/api\/board\/projects\/[^/]+\/context\/preview/, '/api/board/projects/:id/context/preview')
+    .replace(/\/api\/board\/projects\/[^/]+\/context/, '/api/board/projects/:id/context')
+    .replace(
+      /\/api\/board\/projects\/[^/]+\/memories\/[^/]+\/[a-z]+/,
+      '/api/board/projects/:id/memories/:file/:action',
+    )
+    .replace(/\/api\/board\/projects\/[^/]+\/memories/, '/api/board/projects/:id/memories')
     .replace(/\/api\/board\/projects\/[^/]+/, '/api/board/projects/:id')
     .replace(/\/api\/board\/tickets\/[^/]+\/[a-z_]+/, '/api/board/tickets/:id/:action')
     .replace(/\/api\/board\/tickets\/[^/]+/, '/api/board/tickets/:id')
@@ -18552,6 +19838,7 @@ function normalizePath(p: string): string {
     .replace(/\/api\/board\/pipelines\/[^/]+\/stages/, '/api/board/pipelines/:id/stages')
     .replace(/\/api\/board\/pipelines\/[^/]+/, '/api/board/pipelines/:id')
     .replace(/\/api\/board\/stages\/[^/]+/, '/api/board/stages/:id')
+    .replace(/\/api\/board\/runs\/[^/]+\/context/, '/api/board/runs/:id/context')
     .replace(/\/api\/board\/runs\/[^/]+/, '/api/board/runs/:id')
     .replace(/\/api\/board\/relations\/[^/]+/, '/api/board/relations/:id')
     .replace(/\/api\/board\/templates\/[^/]+\/apply/, '/api/board/templates/:id/apply')

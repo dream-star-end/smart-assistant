@@ -10,7 +10,11 @@ import {
   insertTurnObservation,
   type TurnObservationBody,
 } from "../http/internalTurnObservation.js";
-import { extractFirstVisibleAttribution } from "../ws/turnPerformance.js";
+import {
+  extractFirstVisibleAttribution,
+  extractResponseVisibilityMilestones,
+  TurnResponseMilestoneTracker,
+} from "../ws/turnPerformance.js";
 
 const savedEnabled = process.env.OC_DURABLE_METRIC_ROLLUPS;
 afterEach(() => {
@@ -59,6 +63,65 @@ describe("telemetry iteration primitives", () => {
       traceId: "d".repeat(32),
       blocks: [{ kind: "tool_use", toolName: "Read" }],
     }), { traceId: "d".repeat(32), kind: "tool" });
+  });
+
+  test("response milestones independently classify non-empty thinking/text and final-only text", () => {
+    const traceId = "e".repeat(32);
+    assert.deepEqual(extractResponseVisibilityMilestones({
+      type: "outbound.message",
+      traceId,
+      peer: { id: "session_1" },
+      blocks: [
+        { kind: "thinking", text: "  " },
+        { kind: "thinking", text: "reason" },
+        { kind: "text", text: "answer" },
+      ],
+      isFinal: true,
+    }), {
+      traceId,
+      sessionId: "session_1",
+      hasThinking: true,
+      hasText: true,
+      isFinal: true,
+    });
+    assert.equal(extractResponseVisibilityMilestones({ type: "outbound.turn_status", traceId }), null);
+  });
+
+  test("turn milestone tracker records thinking/text once, then clears after final", async () => {
+    const calls: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const pool = {
+      query: async (sql: string, params: readonly unknown[]) => {
+        calls.push({ sql, params });
+        return { rows: [], rowCount: 1 };
+      },
+    } as never;
+    const traceId = "f".repeat(32);
+    const tracker = new TurnResponseMilestoneTracker();
+    tracker.begin({
+      traceId,
+      sessionId: "session_1",
+      model: "gpt-5.6-sol",
+      userId: 3n,
+      startedAtMs: 1000,
+    });
+    tracker.observe({
+      type: "outbound.message", traceId, peer: { id: "session_1" },
+      blocks: [{ kind: "thinking", text: "reason" }], isFinal: false,
+    }, pool, undefined, 1500);
+    tracker.observe({
+      type: "outbound.message", traceId, peer: { id: "session_1" },
+      blocks: [{ kind: "thinking", text: "more" }, { kind: "text", text: "answer" }], isFinal: true,
+    }, pool, undefined, 2200);
+    tracker.observe({
+      type: "outbound.message", traceId, peer: { id: "session_1" },
+      blocks: [{ kind: "text", text: "duplicate" }], isFinal: true,
+    }, pool, undefined, 2500);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls.map((call) => call.params.slice(1, 8)), [
+      ["3", "webchat", "first_thinking_frame", "FIRST_THINKING_FRAME", "succeeded", 1, 500],
+      ["3", "webchat", "first_text_frame", "FIRST_TEXT_FRAME", "succeeded", 1, 1200],
+    ]);
   });
 
   test("turn observation insert is event-id idempotent and updates linked trace", async () => {

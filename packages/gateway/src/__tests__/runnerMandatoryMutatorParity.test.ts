@@ -48,6 +48,7 @@ import { fileURLToPath } from 'node:url'
 // 导入即注册(adapter 模块底部各自 registerEngine)。
 import '../engine/ccbAdapter.js'
 import '../engine/codexAdapter.js'
+import '../engine/cursorAdapter.js'
 import '../engine/grokAdapter.js'
 import '../engine/zcodeAdapter.js'
 import type { EngineAdapter } from '../engine/engineAdapter.js'
@@ -75,9 +76,11 @@ const DUCK_TYPED_MUTATORS = [
 interface MutatorProbe {
   /** benign 入参(不触发重启/远端能力,只验证可调用 + 落值)。 */
   arg: unknown
+  /** 个别引擎的 benign 入参覆盖(如 cursor setModel 只认自家白名单 id)。 */
+  argByEngine?: Record<string, unknown>
   /** 配套 getter 名;有则必须读回,证明 mutator 真的抵达内核而不是被吞。 */
   getter?: string
-  /** 读回期望值(默认 = arg)。 */
+  /** 读回期望值(默认 = 实际使用的入参)。 */
   expected?: unknown
   /** mutator 返回 Promise 时置 true(await 之,拒绝即红)。 */
   async?: boolean
@@ -95,7 +98,9 @@ interface MutatorProbe {
  */
 const MUTATOR_PROBES: Record<string, MutatorProbe> = {
   // 硬调面
-  setModel: { arg: 'glm-5.2', getter: 'model' },
+  // cursor 的 setModel fail-closed 校验自家白名单(非白名单 id 抛错是契约的一
+  // 部分),benign 探针必须用它认识的 id。
+  setModel: { arg: 'glm-5.2', argByEngine: { cursor: 'cursor-auto' }, getter: 'model' },
   setEffortLevel: { arg: 'medium', getter: 'effortLevel' },
   setTraceId: { arg: 'trace-parity-1' }, // adapter 不暴露 getter,只验可调用
   setGoalState: { arg: null, async: true },
@@ -106,9 +111,9 @@ const MUTATOR_PROBES: Record<string, MutatorProbe> = {
   setToolsets: {
     arg: ['core'],
     getter: 'toolsets',
-    // 两个引擎都必须有:sessionManager 的 typeof 守卫会把缺失静默降级成
+    // 全部生产引擎都必须有:sessionManager 的 typeof 守卫会把缺失静默降级成
     // "toolsets 未生效"(用户少了工具却没有任何提示)。
-    requiredOnEngines: ['ccb', 'codex'],
+    requiredOnEngines: ['ccb', 'codex', 'grok', 'cursor', 'zcode'],
   },
   setCodexRoute: {
     arg: null,
@@ -129,19 +134,23 @@ const MUTATOR_PROBES: Record<string, MutatorProbe> = {
   },
 }
 
-function makeOpts(sessionKey: string): EngineCreateOpts {
+function makeOpts(sessionKey: string, engineId: string): EngineCreateOpts {
   return {
     sessionKey,
     agentId: 'main',
     agentBaseDir: tmpdir(),
     cwd: tmpdir(),
-    model: 'glm-5.2',
+    // cursor 构造期即 fail-closed 校验模型白名单,构造探针必须用它认识的 id。
+    model: engineId === 'cursor' ? 'cursor-auto' : 'glm-5.2',
   } as unknown as EngineCreateOpts
 }
 
 /** 真实内核(不注入 fake)—— 委派链断裂必须在这里现形。 */
 function buildAdapter(engineId: string): EngineAdapter {
-  const adapter = createEngine(engineId, makeOpts(`agent:main:webchat:dm:parity-${engineId}`))
+  const adapter = createEngine(
+    engineId,
+    makeOpts(`agent:main:webchat:dm:parity-${engineId}`, engineId),
+  )
   // 构造期 runner 只挂 listener、不 spawn;为防 stray 'error' 事件让进程退出,兜个空监听。
   adapter.on('error', () => {})
   return adapter
@@ -178,7 +187,7 @@ describe('runner mandatory-mutator parity — 权威源有效性', () => {
 
   it('engine 注册表可枚举且含全部生产引擎', () => {
     const engines = registeredEngines()
-    for (const id of ['ccb', 'codex', 'grok', 'zcode']) {
+    for (const id of ['ccb', 'codex', 'grok', 'cursor', 'zcode']) {
       assert.ok(engines.includes(id), `engine registry 缺少 ${id} —— 注册副作用或权威源已变`)
     }
   })
@@ -190,6 +199,9 @@ describe('runner mandatory-mutator parity — 每个 engine × 每个 mutator', 
       const adapter = buildAdapter(engineId) as unknown as Record<string, unknown>
       for (const name of HARD_CALLED_MUTATORS) {
         const probe = MUTATOR_PROBES[name]!
+        const arg = probe.argByEngine && engineId in probe.argByEngine
+          ? probe.argByEngine[engineId]
+          : probe.arg
         const fn = adapter[name]
         assert.equal(
           typeof fn,
@@ -199,14 +211,14 @@ describe('runner mandatory-mutator parity — 每个 engine × 每个 mutator', 
         )
         // 真的调:委派给内部内核的那一环若缺方法,只有这里能抓到。
         if (probe.async) {
-          await (fn as (a: unknown) => Promise<unknown>).call(adapter, probe.arg)
+          await (fn as (a: unknown) => Promise<unknown>).call(adapter, arg)
         } else {
-          ;(fn as (a: unknown) => void).call(adapter, probe.arg)
+          ;(fn as (a: unknown) => void).call(adapter, arg)
         }
         if (probe.getter) {
           assert.deepEqual(
             adapter[probe.getter],
-            probe.expected ?? probe.arg,
+            probe.expected ?? arg,
             `${engineId}.${name}() 调用后 ${probe.getter} 没有反映新值 —— ` +
               'mutator 被吞(未抵达内核),用户的模型/档位/执行目标切换不会生效',
           )
@@ -222,6 +234,9 @@ describe('runner mandatory-mutator parity — 每个 engine × 每个 mutator', 
       const adapter = buildAdapter(engineId) as unknown as Record<string, unknown>
       for (const name of DUCK_TYPED_MUTATORS) {
         const probe = MUTATOR_PROBES[name]!
+        const arg = probe.argByEngine && engineId in probe.argByEngine
+          ? probe.argByEngine[engineId]
+          : probe.arg
         const required = probe.requiredOnEngines?.includes(engineId) ?? false
         const fn = adapter[name]
         if (!required) {
@@ -237,14 +252,14 @@ describe('runner mandatory-mutator parity — 每个 engine × 每个 mutator', 
           )
         }
         if (probe.async) {
-          await (fn as (a: unknown) => Promise<unknown>).call(adapter, probe.arg)
+          await (fn as (a: unknown) => Promise<unknown>).call(adapter, arg)
         } else {
-          ;(fn as (a: unknown) => void).call(adapter, probe.arg)
+          ;(fn as (a: unknown) => void).call(adapter, arg)
         }
         if (probe.getter) {
           assert.deepEqual(
             adapter[probe.getter],
-            probe.expected ?? probe.arg,
+            probe.expected ?? arg,
             `${engineId}.${name}() 调用后 ${probe.getter} 没有反映新值(mutator 被吞)`,
           )
         }

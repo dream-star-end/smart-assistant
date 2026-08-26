@@ -146,6 +146,13 @@ interface CcbTurnContext {
    * 不明的 tail 灌进当前 turn)。per-turn 不设上限(受本 turn 工具数天然约束)。
    */
   ownedBashToolUseIds: Set<string>
+  /**
+   * P1-6 — 本 turn 未决的 can_use_tool permission_request(request_id 集)。
+   * CCB 在 stdio 等待 control_response 期间零输出,idle watchdog 若不感知会把
+   * "等用户审批"误判成模型死亡强杀 turn。waitingForUserInput getter 据此为 true;
+   * sendPermissionResponse 成功即出集,turn 终态(onFinish)整体清空。
+   */
+  pendingPermissionRequestIds: Set<string>
   stopLeaseRenewal?: () => void
 }
 
@@ -244,6 +251,11 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     resumeKind: 'ccb-session',
     needsServerRequestId: false,
     historyMode: 'native-resume',
+    permissionModel: 'native',
+    emitsCallUsage: true,
+    emitsToolInputDeltas: true,
+    supportsNativeCompact: true,
+    multimodalInput: 'native',
   }
 
   private readonly runner: SubprocessRunner
@@ -305,6 +317,13 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     return this.runner.start()
   }
 
+  /** Session-open preheat = spawn the long-lived CCB subprocess (bun boot +
+   * `--resume` JSONL load) so a cold first turn skips ~20s. The idle process
+   * waits on stdin; no user line is written, no upstream LLM call happens. */
+  preheat(): Promise<void> {
+    return this.runner.start()
+  }
+
   submitTurn(params: TurnParams): EngineTurnRun {
     const telemetry = new TelemetryChannel()
     let nativeCompactionSummary: string | undefined
@@ -320,6 +339,10 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         // raw internal response must not become a red user-facing card. The
         // terminal result below emits one normalized, waived outcome.
         if (e.kind === 'error' && containsModelAuthorityInvalid(e.error)) return
+        // P1-6:登记未决 permission_request(waitingForUserInput 数据源)。
+        if (e.kind === 'permission_request' && e.request.requestId) {
+          ctx.pendingPermissionRequestIds.add(e.request.requestId)
+        }
         params.onEvent(e as EngineEvent)
       },
       assistantMessageId: params.assistantMessageId,
@@ -352,7 +375,12 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       // (见 TurnParams.sessionTotals / CcbSessionTotals 注释)。
       sessionTotals: asCcbSessionTotals(params.sessionTotals),
     })
-    const ctx: CcbTurnContext = { parser, telemetry, ownedBashToolUseIds: new Set() }
+    const ctx: CcbTurnContext = {
+      parser,
+      telemetry,
+      ownedBashToolUseIds: new Set(),
+      pendingPermissionRequestIds: new Set(),
+    }
     this._routeTurn = ctx
     this._activeTurn = ctx
     // PR2 v1.0.66 — requestId 挂 queue entry(CCB 路径 noop 透传)。
@@ -457,7 +485,41 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
    *     不明的 tail 灌进当前 turn(那正是 owner attribution bug 的成因)。
    */
   private _routeMessage(msg: SdkMessage): void {
-    const m = msg as { type?: unknown; subtype?: unknown; tool_use_id?: unknown }
+    const m = msg as {
+      type?: unknown
+      subtype?: unknown
+      tool_use_id?: unknown
+      task_id?: unknown
+      status?: unknown
+      output_file?: unknown
+      summary?: unknown
+    }
+    if (m?.type === 'system' && m?.subtype === 'task_notification') {
+      const payload = {
+        taskId: typeof m.task_id === 'string' ? m.task_id : '',
+        status: typeof m.status === 'string' && m.status ? m.status : 'completed',
+        outputFile: typeof m.output_file === 'string' ? m.output_file : '',
+        summary: typeof m.summary === 'string' ? m.summary : '',
+        ...(typeof m.tool_use_id === 'string' && m.tool_use_id
+          ? { toolUseId: m.tool_use_id }
+          : {}),
+      }
+      // Session-level emit so a missing / already-final _routeTurn cannot
+      // drop the bookend. Parser path still runs when a turn exists so
+      // onEvent consumers see the same independent event.
+      this.emit('task_notification', payload)
+      this._routeTurn?.parser.parse(msg)
+      return
+    }
+    if (m?.type === 'system' && m?.subtype === 'task_notification_delivered') {
+      const taskId = typeof m.task_id === 'string' ? m.task_id : ''
+      this.emit('task_notification_delivered', {
+        taskId,
+        deliveredBy: 'ccb-mid-turn' as const,
+      })
+      this._routeTurn?.parser.parse(msg)
+      return
+    }
     if (m?.type !== 'system' || m?.subtype !== 'bash_output_tail') {
       // 非 tail:逐字节维持 _routeTurn 路由。
       this._routeTurn?.parser.parse(msg)
@@ -569,7 +631,14 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   // ── permission ─────────────────────────────────────────────────────────
 
   sendPermissionResponse(requestId: string, response: unknown): boolean {
-    return this.runner.sendPermissionResponse(requestId, response as PermissionResponse)
+    const sent = this.runner.sendPermissionResponse(requestId, response as PermissionResponse)
+    if (sent) {
+      // P1-6:已回复即不再"等用户"。stale response(旧 turn 的 requestId)对
+      // 当前集合是 no-op,不会误清后继 turn 的未决请求。
+      this._activeTurn?.pendingPermissionRequestIds.delete(requestId)
+      this._routeTurn?.pendingPermissionRequestIds.delete(requestId)
+    }
+    return sent
   }
 
   // ── runtime state ──────────────────────────────────────────────────────
@@ -580,6 +649,13 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 
   get pendingToolCalls(): number {
     return this._activeTurn?.parser.pendingToolCalls ?? 0
+  }
+
+  /** P1-6:存在未决 can_use_tool permission_request(等用户审批)时为 true。
+   *  idle watchdog 读到 true 即跳过强杀(shouldTripIdleWatchdog);turn 终态后
+   *  _activeTurn 置空,自然回 false。 */
+  get waitingForUserInput(): boolean {
+    return (this._activeTurn?.pendingPermissionRequestIds.size ?? 0) > 0
   }
 
   get isRunning(): boolean {

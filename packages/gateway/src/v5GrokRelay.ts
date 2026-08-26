@@ -1,9 +1,10 @@
 /** Loopback-only container hop for Grok CLI subscription traffic. */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
+import { GROK_RELAY_PREFIX } from '@openclaude/protocol'
 import { isLoopbackRemoteAddress } from './v3CodexRelay.js'
 
-export const V5_GROK_RELAY_PREFIX = '/internal/v5/grok-relay'
+export const V5_GROK_RELAY_PREFIX = GROK_RELAY_PREFIX
 
 export interface V5GrokRelayConfig {
   masterBaseUrl: string

@@ -548,6 +548,20 @@ build_master_release() {
   }
   mlog "  dist oc-build=$build_id"
 
+  # openclaude-memory MCP server 预编译 CJS(dist/ 被 gitignore,git archive 不带产物,
+  # 必须在 staging 构建;缺产物则引擎回落 tsx ~7s 冷启动路径,故 fail-loud)。
+  if [[ -f "$staging/packages/mcp-memory/scripts/build-oc-memory-mcp.sh" ]]; then
+    mlog "  build oc-memory MCP bundle @ staging"
+    if ! ( cd "$staging" && bash packages/mcp-memory/scripts/build-oc-memory-mcp.sh ); then
+      cleanup_master_staging
+      die "staging oc-memory MCP bundle 构建失败"
+    fi
+    [[ -s "$staging/packages/mcp-memory/dist/oc-memory-mcp.cjs" ]] || {
+      cleanup_master_staging
+      die "构建后缺 staging packages/mcp-memory/dist/oc-memory-mcp.cjs"
+    }
+  fi
+
   # 构建期缓存不进 artifact。rm 只丢掉本树的目录项;硬链文件 nlink>1 时 donor 仍在。
   rm -rf -- \
     "$staging/node_modules/.vite" \

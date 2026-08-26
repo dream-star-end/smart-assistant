@@ -200,6 +200,25 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
+  test("cta=new_session(context_too_long)→「新建会话继续」导航按钮,无重试类按钮", () => {
+    const onStartNewSession = vi.fn();
+    renderErr(errMsg({ _errorCode: "context_too_long", _clientMessageId: "u1" }), {
+      onStartNewSession,
+      onRetrySend: vi.fn(),
+      onRegenerate: vi.fn(),
+      resolveRetryTarget: () => retryableUser,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "新建会话继续" }));
+    expect(onStartNewSession).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
+  });
+
+  test("context_too_long 未接 onStartNewSession 时不渲染孤立按钮", () => {
+    renderErr(errMsg({ _errorCode: "context_too_long" }), { onRegenerate: vi.fn() });
+    expect(screen.queryByRole("button", { name: "新建会话继续" })).toBeNull();
+  });
+
   test("免单码(no_response)非可重试红卡 → 不显精确「重试」(保留 onRegenerate 兜底)", () => {
     // waived=true 分支:presentedError.waived 为真 → retryEligible false。
     renderErr(errMsg({ _errorCode: "no_response", _clientMessageId: "u1", usage: { waived: true } }), {
@@ -231,6 +250,21 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     fireEvent.click(screen.getByRole("button", { name: "从断点继续" }));
     expect(onContinueInterrupted).toHaveBeenCalledWith(error);
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
+  });
+
+  test("续跑被拒后错误卡改写说明并隐藏「从断点继续」", () => {
+    const error = errMsg({
+      _errorCode: "SERVICE_RESTART",
+      _clientMessageId: "u1",
+      usage: { waived: true },
+      _recoverySkippedNotice: "没法从保存的进度继续。任务内容还在，请刷新后再试。",
+    });
+    renderErr(error, {
+      onContinueInterrupted: vi.fn(),
+      resolveInterruptedContinuation: () => retryableUser,
+    });
+    expect(screen.getByText("没法从保存的进度继续。任务内容还在，请刷新后再试。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
   });
 
   test("early terminal 后还有同轮过程（非页面尾行）→ marker 不取得续跑 CTA", () => {

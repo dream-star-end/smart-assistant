@@ -110,6 +110,7 @@ export type ChatProject = {
   createdAt: number;
   updatedAt: number;
   sessionCount: number;
+  boardProjectId?: string | null;
 };
 
 /**
@@ -661,6 +662,8 @@ export type UsageQuery = {
   ledgerLimit?: number;
   /** credit_ledger id keyset 游标（取上一页 ledger.next_before）。 */
   ledgerBefore?: string;
+  /** WorkProject id snapshot filter; "none" = unattributed historical rows. */
+  boardProjectId?: string;
 };
 
 // ─── 用量报表（GET /api/me/usage/report，图表化窗口口径） ────────────────────
@@ -860,6 +863,9 @@ export type CronJob = {
   nextRunAt?: string | number | null;
   lastRunAt?: string | number | null;
   heartbeat?: boolean;
+  resume?: "isolated" | "origin-session";
+  projectMode?: "follow_session" | "fixed";
+  boardProjectId?: string | null;
 };
 
 /** 新建定时任务入参（POST /api/cron）。 */
@@ -870,6 +876,10 @@ export type CronCreateInput = {
   oneshot?: boolean;
   label?: string;
   agent?: string;
+  projectMode?: "follow_session" | "fixed";
+  boardProjectId?: string | null;
+  resume?: "isolated" | "origin-session";
+  originSessionKey?: string;
 };
 
 // ── 用户画像文档（GET/PUT /api/agents/:id/memory/user） ─────────────────────

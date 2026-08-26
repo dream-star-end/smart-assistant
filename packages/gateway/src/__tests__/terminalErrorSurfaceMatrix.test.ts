@@ -111,6 +111,13 @@ const SCENARIOS: readonly Scenario[] = [
     attempts: 1,
     why: '请求语义无效不是瞬时上游故障，重复同一请求只会制造重复原始错误',
   },
+  {
+    code: 'auth_error',
+    sample:
+      'API Error: 401 {"error":{"type":"authentication_error","message":"invalid x-api-key"}}',
+    attempts: 1,
+    why: 'E7 — 凭据坏了重试只会再 401,不进 TRANSIENT_RETRY_ERROR_CODES,立即给 relogin 引导',
+  },
 ]
 
 /**

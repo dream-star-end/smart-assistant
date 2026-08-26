@@ -260,6 +260,7 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:skill_propose": { icon: Sparkles, label: "提议技能" },
   "openclaude-memory:request_review": { icon: ShieldCheck, label: "申请质量审查" },
   "openclaude-memory:ask_user": { icon: ListChecks, label: "向用户提问" },
+  "openclaude-memory:present_options": { icon: ListChecks, label: "投递选项卡" },
   "openclaude-memory:ask_gpt55_codex": { icon: Bot, label: "Codex 审查" },
   "openclaude-memory:task_create": { icon: FilePlus, label: "创建任务单" },
   "openclaude-memory:task_update": { icon: Pencil, label: "更新任务单" },
@@ -308,7 +309,17 @@ function commandOp(command: string, cli: string): string {
 
 function commandFlag(command: string, flag: string): string {
   const match = new RegExp(`(?:^|\\s)--${flag}(?:=|\\s+)(?:"([^"]*)"|'([^']*)'|(\\S+))`).exec(command);
-  return match?.[1] ?? match?.[2] ?? match?.[3] ?? "";
+  const value = match?.[1] ?? match?.[2] ?? match?.[3] ?? "";
+  // `--goal --agent-id` 这类缺值：捕获到的是下一个 flag，视为没取到。
+  if (value.startsWith("--")) return "";
+  return value;
+}
+
+/** 卡片副标题：绝不用 CLI flag（`--help` / `-h`）或空 token 充数。 */
+function humanSummaryToken(value: string | undefined | null): string {
+  const text = (value ?? "").replace(/^["']|["']$/g, "").trim();
+  if (!text || text.startsWith("-")) return "";
+  return text.slice(0, 60);
 }
 
 function browserCommandArgs(command: string, op: string): string[] {
@@ -406,33 +417,35 @@ function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
 function ocCommandSummary(cli: OcCli, command: string): string {
   const op = commandOp(command, cli);
   if (cli === "oc-browser") {
-    const args = browserCommandArgs(command, op);
+    const args = browserCommandArgs(command, op).filter((token) => token && !token.startsWith("-"));
     if (op === "open" || op === "goto" || op === "tab-new") {
       return args[0] ? displayDomain(args[0]) : op;
     }
-    if (op === "fill") return (args[1] ?? args[0] ?? op).slice(0, 60);
-    if (op === "type" || op === "press" || op === "find") return (args[0] ?? op).slice(0, 60);
+    if (op === "fill") return humanSummaryToken(args[1] ?? args[0]) || op;
+    if (op === "type" || op === "press" || op === "find") return humanSummaryToken(args[0]) || op;
     if (op === "click" || op === "dblclick") return args[0] ? `元素 ${args[0]}` : op;
-    return commandFlag(command, "filename") || op;
+    return humanSummaryToken(commandFlag(command, "filename")) || op;
   }
   if (cli === "oc-web") {
     const url = commandFlag(command, "url") || command.match(/https?:\/\/[^\s'";|]+/)?.[0] || "";
-    return url ? displayDomain(url) : "";
+    return url && !url.startsWith("-") ? displayDomain(url) : "";
   }
   const invocation = new RegExp(`${cli.replace("-", "\\-")}\\s+${op}\\s+([^\\s;&|]+)(?:\\s+([^\\s;&|]+))?`, "i").exec(command);
   if (cli === "oc-plugin" || cli === "oc-connect") {
-    if (op === "call") return [invocation?.[1], invocation?.[2]?.replaceAll("_", " ")].filter(Boolean).join(" · ");
-    if (op === "catalog") return invocation?.[1]?.replace(/^["']|["']$/g, "") ?? "";
+    if (op === "call") {
+      const head = humanSummaryToken(invocation?.[1]);
+      const next = humanSummaryToken(invocation?.[2]).replaceAll("_", " ");
+      return [head, next].filter(Boolean).join(" · ");
+    }
+    if (op === "catalog") return humanSummaryToken(invocation?.[1]);
     return "";
   }
   if (cli === "oc-market") {
-    return invocation?.[1]?.replace(/^["']|["']$/g, "") ?? "";
+    return humanSummaryToken(invocation?.[1]);
   }
   if (cli === "oc-memory" && (op === "delegate" || op === "request-review" || op === "delegate-wait")) {
-    return (commandFlag(command, "goal") || commandFlag(command, "draft") || invocation?.[1] || op).replace(
-      /^["']|["']$/g,
-      "",
-    ).slice(0, 60);
+    // 取不到 goal/draft 就留空，绝不回退到 op 或 `--help` 这类 flag 名。
+    return humanSummaryToken(commandFlag(command, "goal") || commandFlag(command, "draft") || invocation?.[1]);
   }
   return "";
 }

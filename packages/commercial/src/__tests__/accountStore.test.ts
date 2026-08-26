@@ -122,3 +122,10 @@ describe("updateAccount — 预校验在 DB 之前拦截", () => {
     await assert.rejects(updateAccount(1n, { refresh: "" }, keyFn), TypeError);
   });
 });
+
+  test("非法 cursor_sand_enabled → TypeError", async () => {
+    await assert.rejects(
+      updateAccount(1n, { cursor_sand_enabled: "yes" as unknown as boolean }, keyFn),
+      /invalid cursor_sand_enabled/,
+    );
+  });

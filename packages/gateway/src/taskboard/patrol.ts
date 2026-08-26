@@ -28,7 +28,15 @@
 //   - tick 里的 timer 由 server.ts 持有并 unref/clearInterval;本文件不自己
 //     setInterval,以便测试进程能退出。
 
-import { getUsageSummary } from '@openclaude/storage'
+import {
+  getUsageSummary,
+  isProjectContextEnabled,
+  loadProjectContext,
+  parseProjectWorkspace,
+  resolveProjectCwd,
+} from '@openclaude/storage'
+import { createRunContextDescriptor } from '../runContextPersist.js'
+import { getProject } from './db/projects.js'
 import { createActivity } from './db/activity.js'
 import { createComment, listComments } from './db/comments.js'
 import type { TaskboardDb } from './db/index.js'
@@ -101,8 +109,13 @@ export interface PatrolDelegateInput {
   context?: string
   toolsets?: string[] | null
   effort?: string | null
+  /** 阶段级模型覆盖;undefined = 沿用 agent 默认。 */
+  model?: string
   sessionKey: string
   timeoutSec: number
+  projectId?: string
+  workspaceCwd?: string
+  runContext?: import('../runContextPersist.js').RunContextDescriptor
 }
 
 export interface PatrolDelegateResult {
@@ -113,6 +126,7 @@ export interface PatrolDelegateResult {
   tokensIn?: number | null
   tokensOut?: number | null
   costUsd?: number | null
+  costImprecise?: boolean | null
 }
 
 export type PatrolDelegateFn = (input: PatrolDelegateInput) => Promise<PatrolDelegateResult>
@@ -122,6 +136,7 @@ export interface RunUsageSnapshot {
   tokensIn: number | null
   tokensOut: number | null
   costUsd: number | null
+  costImprecise?: boolean | null
 }
 
 export type RunUsageLookup = (sessionKey: string) => Promise<RunUsageSnapshot | null>
@@ -151,6 +166,7 @@ export function usageFromDelegateResult(result: PatrolDelegateResult): RunUsageS
     tokensIn: finiteNumber(result.tokensIn),
     tokensOut: finiteNumber(result.tokensOut),
     costUsd: finiteNumber(result.costUsd),
+    costImprecise: result.costImprecise ?? null,
   }
 }
 
@@ -163,6 +179,7 @@ export function mergeRunUsage(
     tokensIn: base.tokensIn ?? extra.tokensIn,
     tokensOut: base.tokensOut ?? extra.tokensOut,
     costUsd: base.costUsd ?? extra.costUsd,
+    costImprecise: base.costImprecise ?? extra.costImprecise,
   }
 }
 
@@ -554,6 +571,14 @@ export class PatrolEngine {
 
     const comments = listComments(db, ticket.id, { limit: 200, offset: 0 })
     const lastRun = latestSettledRun(db, ticket.id, run.id)
+    const boardProject = getProject(db, ticket.projectId)
+    const projectEnabled = isProjectContextEnabled()
+    let workspaceCwd: string | undefined
+    if (projectEnabled && boardProject) {
+      const spec = parseProjectWorkspace(boardProject.workspaceSpec ?? boardProject.workspace)
+      const cwd = resolveProjectCwd(spec, boardProject.id)
+      if (cwd.ok) workspaceCwd = cwd.cwd
+    }
     let prompt: string
     try {
       prompt = renderPrompt({
@@ -562,6 +587,10 @@ export class PatrolEngine {
         stage,
         lastRun,
         comments,
+        project: boardProject
+          ? { key: boardProject.key, name: boardProject.name, workspace: workspaceCwd ?? null }
+          : null,
+        projectSlotInjected: projectEnabled,
       }).prompt
     } catch (err) {
       await this.finishRun(db, ticket, stage, run, settings, {
@@ -596,8 +625,23 @@ export class PatrolEngine {
           goal: prompt,
           toolsets: stage.toolsets,
           effort: stage.effort,
+          model: stage.model ?? undefined,
           sessionKey,
           timeoutSec: stage.timeoutSec,
+          projectId: boardProject?.id,
+          workspaceCwd,
+          runContext: createRunContextDescriptor({
+            runId: run.id,
+            boardProjectId: boardProject?.id ?? null,
+            channel: 'taskboard',
+            agentId,
+            sessionKey,
+            ticket: { id: ticket.id, identifier: ticket.identifier, version: ticket.version },
+            cwdSource: workspaceCwd ? 'project_workspace' : 'default',
+            workspaceSpec: parseProjectWorkspace(boardProject?.workspaceSpec ?? boardProject?.workspace),
+            workspaceCwd: workspaceCwd ?? null,
+            persistSnapshot: Boolean(projectEnabled && boardProject?.id),
+          }),
         })
       } catch (err) {
         result = {
@@ -665,6 +709,7 @@ export class PatrolEngine {
           tokensIn: usage.tokensIn,
           tokensOut: usage.tokensOut,
           costUsd: usage.costUsd,
+          costImprecise: usage.costImprecise ?? null,
         },
         now,
       )
@@ -694,6 +739,26 @@ export class PatrolEngine {
     if (!settled) {
       this.log('taskboard stale result discarded:fence lost', { runId: run.id, owner })
       return
+    }
+    if (isProjectContextEnabled() && ticket.projectId) {
+      try {
+        const started = getRun(db, run.id)
+        const startVersion = started?.contextVersion ?? run.contextVersion
+        if (startVersion != null) {
+          const live = await loadProjectContext(ticket.projectId)
+          if (live.version !== startVersion) {
+            createComment(db, {
+              ticketId: ticket.id,
+              authorKind: 'system',
+              author: 'system',
+              body: `context_changed_during_run: started v${startVersion}, now v${live.version}（仅警告，不把本 run 判失败）`,
+              runId: run.id,
+            })
+          }
+        }
+      } catch {
+        /* fail-soft */
+      }
     }
     if (!isRunUsageComplete(usage)) this.queueUsageBackfill(db, run.id, sessionKey)
   }
@@ -1056,6 +1121,7 @@ export class PatrolEngine {
         tokensIn: existing.tokensIn,
         tokensOut: existing.tokensOut,
         costUsd: existing.costUsd,
+        costImprecise: existing.costImprecise ?? null,
       }
       if (isRunUsageComplete(current)) return
       const looked = await this.lookupUsage(sessionKey)
@@ -1063,7 +1129,8 @@ export class PatrolEngine {
       if (
         merged.tokensIn === current.tokensIn &&
         merged.tokensOut === current.tokensOut &&
-        merged.costUsd === current.costUsd
+        merged.costUsd === current.costUsd &&
+        merged.costImprecise === current.costImprecise
       ) {
         return
       }
@@ -1071,6 +1138,7 @@ export class PatrolEngine {
         tokensIn: merged.tokensIn,
         tokensOut: merged.tokensOut,
         costUsd: merged.costUsd,
+        costImprecise: merged.costImprecise,
       })
     } catch (err) {
       this.log('taskboard usage backfill failed', { runId, sessionKey, err: String(err) })

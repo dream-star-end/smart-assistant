@@ -9,6 +9,7 @@ import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
+import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer } from "./components/Composer";
 import {
   ImageAnnotationEditor,
@@ -58,7 +59,13 @@ import {
   ResponseRatingProvider,
 } from "./components/chat/ResponseRating";
 import { MediaSignProvider } from "./components/chat/media";
-import { ChatInteractionContext, ToolCardActionsContext } from "./components/tool/context";
+import {
+  ArtifactInspectContext,
+  ChatInteractionContext,
+  ToolCardActionsContext,
+  type ArtifactInspectTarget,
+} from "./components/tool/context";
+import { InspectorPanel, InspectorPanelContent } from "./components/InspectorPanel";
 import { Sidebar } from "./components/Sidebar";
 import { ProjectSettingsDialog } from "./components/ProjectSettingsDialog";
 import { Alert, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
@@ -82,6 +89,7 @@ import { genWsSessionId, useSessionList } from "./hooks/useSessionList";
 import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
+import { useMdViewport } from "./hooks/useMdViewport";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useOptimizerPending } from "./hooks/useOptimizerPending";
@@ -111,7 +119,7 @@ import {
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
-import { deriveConnBanner, lastRealUserTurn } from "./lib/chat/pure";
+import { deriveConnBanner, isPlatedAssistantMessage, lastRealUserTurn } from "./lib/chat/pure";
 import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
 import { incidentStore } from "./lib/incidentStore";
 import {
@@ -133,6 +141,7 @@ import {
 import { resolveTutorialAction } from "./lib/tutorialActions";
 import type { TutorialCase, TutorialCaseId } from "./lib/tutorialCaseCatalog";
 import { api, apiErrorMessage } from "./lib/api";
+import { reportClientFriction } from "./lib/clientFriction";
 import {
   effectiveEffortModelId,
   effortForModel,
@@ -311,6 +320,10 @@ export function App() {
   const [chatError, setChatError] = useState<ChatError | null>(null);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
+  // 产物详情列(Codex 式第三列):选中产物是纯 UI 态(切会话/关面板即清),不进 ChatSocket。
+  // 桌面 md+ 内联第三列;窄屏用右侧 Sheet 抽屉,不硬挤三列。
+  const [inspectTarget, setInspectTarget] = useState<ArtifactInspectTarget | null>(null);
+  const isMdViewport = useMdViewport();
   // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
   // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
   const [settingsOpen, setSettingsOpen] = useState(bootPanel === "settings");
@@ -319,6 +332,8 @@ export function App() {
   const messageFeedbackTriggerRef = useRef<HTMLElement | null>(null);
   const [inboxOpen, setInboxOpen] = useState(false);
   const [mediaTasksOpen, setMediaTasksOpen] = useState(false);
+  // 「视频任务」入口门控:null=未知(保持可见),false=账号未开放(隐藏死入口)。
+  const [mediaTasksAvailable, setMediaTasksAvailable] = useState<boolean | null>(null);
   const [liveMediaJob, setLiveMediaJob] = useState<MediaGenerationJob | null>(null);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(bootPanel === "manage");
@@ -563,6 +578,22 @@ export function App() {
     holdAutoSelect: pendingRouteSession !== null,
   });
 
+  // 「项目下新建会话」草稿意图：项目行入口记下目标项目，空白草稿真正建会话（首次发送）时
+  // 消费——本地立即归属该项目 + 服务端 PATCH 落库。无参新建 / 选中已有会话都会覆盖清除，
+  // 意图只活在「一次草稿」生命周期内，不会泄漏到之后的新会话。
+  const draftProjectRef = useRef<string | null>(null);
+  const handleNew = useCallback(() => {
+    draftProjectRef.current = null;
+    newSession();
+  }, [newSession]);
+  const newSessionInProject = useCallback(
+    (projectId: string) => {
+      draftProjectRef.current = projectId;
+      newSession();
+    },
+    [newSession],
+  );
+
   const {
     projects,
     collapsedIds: collapsedProjectIds,
@@ -600,6 +631,12 @@ export function App() {
     auth: demo ? null : auth,
   });
   const sidebarWidth = useSidebarWidth();
+
+  // 切会话/进出任务看板时清掉产物详情列:消息对象引用属于旧会话上下文,跨会话保留只会
+  // 展示与当前消息流无关的陈旧内容。
+  useEffect(() => {
+    setInspectTarget(null);
+  }, [activeId, boardOpen]);
   const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
   const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
 
@@ -798,6 +835,8 @@ export function App() {
           ownerUserId: user.id,
           updatedAt: new Date().toISOString(),
           messageCount: 0,
+          // 项目下新建：草稿建行即归属目标项目（侧栏首帧正确分组；服务端归属在下方首发收尾 PATCH）。
+          ...(draftProjectRef.current ? { projectId: draftProjectRef.current } : {}),
           // 首发定格会话模型:当前有效模型(含空态显式选择)落为该会话的 per-session 选择,
           // 之后 default_model 变更/其它会话换模都不影响它(与 teamMode 的会话级落地同理)。
           ...(modelId ? { modelId } : {}),
@@ -812,6 +851,13 @@ export function App() {
       }
       const materializedDraft =
         !createdSession && sessions.some((session) => session.id === sessionId && session.messageCount === 0);
+      // 项目草稿被首轮前操作（Goal / GitHub 绑定）物化成会话行的场景：归属同样在首发落定。
+      if (materializedDraft && draftProjectRef.current) {
+        const draftPid = draftProjectRef.current;
+        setSessions((c) =>
+          c.map((x) => (x.id === sessionId && !x.projectId ? { ...x, projectId: draftPid } : x)),
+        );
+      }
       sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
       if (materializedDraft) {
         // Goal/GitHub 可在首条消息前物化服务端行。首发时须同步收敛真正标题；否则
@@ -860,6 +906,22 @@ export function App() {
         };
         return [updated, ...c.filter((s) => s.id !== sid)];
       });
+      // 首发收尾：把「项目下新建」的归属落到服务端 canonical。行由 WS 受理 / 幂等 PUT 建立，
+      // PATCH 可能在建行前到达（404），补一次延迟重试；仍失败则放弃——本地归属已正确，
+      // 用户可手动移动，下次 listSessions server-wins 会盖回，不阻塞首发。
+      if (draftProjectRef.current && sessionId) {
+        const draftPid = draftProjectRef.current;
+        if (createdSession || materializedDraft) {
+          draftProjectRef.current = null;
+          const applyProject = (retries: number) => {
+            api.patchSessionMeta(authRef.current, sessionId!, { projectId: draftPid }).catch((e: unknown) => {
+              if (retries > 0) window.setTimeout(() => applyProject(retries - 1), 1500);
+              else console.warn("patchSessionMeta(projectId) failed", e);
+            });
+          };
+          applyProject(1);
+        }
+      }
     },
     // teamMode 必须在依赖里:否则 memoized send 闭包捕获初始 false,用户开开关后仍发 false(Codex 审)。
     // setSessions/setActiveId 是 useSessionList 透传的 useState dispatcher(恒稳定),入 deps
@@ -1199,7 +1261,7 @@ export function App() {
       const destination = feature.destination;
       switch (destination.kind) {
         case "new-chat":
-          newSession();
+          handleNew();
           focusProductFeature(PRODUCT_CAPABILITIES.chatBasics.id);
           break;
         case "focus":
@@ -1234,7 +1296,7 @@ export function App() {
     },
     [
       tutorialActionContext,
-      newSession,
+      handleNew,
       focusProductFeature,
       openSettings,
       openManage,
@@ -1252,10 +1314,10 @@ export function App() {
         setView("app");
         return;
       }
-      newSession();
+      handleNew();
       setComposerPrefill({ text: item.starterPrompt, nonce: Date.now() });
     },
-    [inWorkspace, newSession],
+    [inWorkspace, handleNew],
   );
 
   // 站内信未读轮询（铃铛红点）。demo / 未登录不发请求。
@@ -1551,12 +1613,12 @@ export function App() {
       if ((e.key === "o" || e.key === "O") && e.shiftKey) {
         if (isEditable(e.target)) return;
         e.preventDefault();
-        newSession();
+        handleNew();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [newSession]);
+  }, [handleNew]);
 
   // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
   const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
@@ -1631,6 +1693,11 @@ export function App() {
       startedAt: activeSess._turnStartedAt ?? null,
       lastFrameAt: activeSess._lastFrameAt,
       progressHint: activeSess._turnProgressHint,
+      hasPlated: wsMessages.some((m) =>
+        isPlatedAssistantMessage(m) &&
+        (!activeSess._activeClientMessageId ||
+          m._clientMessageId === activeSess._activeClientMessageId),
+      ),
       turnStatus: activeSess._turnStatus ?? null,
       recoveryStatus: activeSess._recoveryStatus ?? null,
       hasVisibleProcess: activeSess._liveUnitsPackApplied === true ||
@@ -1828,6 +1895,12 @@ export function App() {
     [demo, send, sending],
   );
 
+  // 产物详情列 open 回调:引用稳定,不随面板开合变化,避免打穿 MessageList 的 sig-memo。
+  const artifactInspect = useMemo(
+    () => ({ open: (t: ArtifactInspectTarget) => setInspectTarget(t) }),
+    [],
+  );
+
   // 发送失败重试：复用原消息 payload（含附件引用）走 WS service 既有发送收口原地重发；
   // model/teamMode/effort 由 socket 复用失败首发的 routing 快照,不读取当前偏好。
   const retrySend = useCallback(
@@ -1909,7 +1982,23 @@ export function App() {
       onRegenerate: regenerate,
       onContinue: () => send(CONTINUE_PROMPT),
       onTopUp: demo ? undefined : () => openSettings(),
+      onStartNewSession: demo ? undefined : newSession,
       onFeedback,
+      onFirstTextPaint: demo
+        ? undefined
+        : (input) => {
+            reportClientFriction({
+              surface: "webchat",
+              stage: "first_text_paint",
+              code: input.backgroundAtFrame
+                ? "FIRST_TEXT_PAINT_AFTER_BACKGROUND"
+                : "FIRST_TEXT_PAINT",
+              outcome: "succeeded",
+              latencyMs: input.latencyMs,
+              traceId: input.traceId,
+              sessionId: input.sessionId,
+            }, authRef.current?.snapshot().token);
+          },
       onRetrySend: demo ? undefined : retrySend,
       onContinueInterrupted: demo ? undefined : continueInterrupted,
       resolveInterruptedContinuation: demo ? undefined : resolveInterruptedContinuation,
@@ -1953,6 +2042,7 @@ export function App() {
       send,
       demo,
       openSettings,
+      newSession,
       onFeedback,
       retrySend,
       continueInterrupted,
@@ -1970,6 +2060,28 @@ export function App() {
     messageReplyTarget && messageReplyTarget.sessionId === activeId
       ? messageReplyTarget.quote
       : null;
+
+  // 视频任务能力探测:登录后拉一次。仅在服务端明确回答 available:false 时隐藏入口;
+  // 请求失败/未知保持可见(任务中心内部有「暂未开放」兜底),避免网络抖动误藏功能。
+  const mediaGateEnabled = !demo && !!user;
+  useEffect(() => {
+    if (!mediaGateEnabled) {
+      setMediaTasksAvailable(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .getMediaCapabilities(authRef.current)
+      .then((cap) => {
+        if (!cancelled) setMediaTasksAvailable(cap?.available !== false);
+      })
+      .catch(() => {
+        if (!cancelled) setMediaTasksAvailable(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaGateEnabled]);
 
   // 已评回读：切会话/登录后拉一次 GET，填充已评态（重开会话时高亮 👍/👎、避免重复采集）。
   // 依赖用**派生布尔**（非 user 对象，refreshMe 换引用不误触发清空）+ activeId。切会话先清
@@ -2304,7 +2416,7 @@ export function App() {
       if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
         e.preventDefault();
         setBoardOpen(false);
-        newSession();
+        handleNew();
       } else if (e.key === "Escape" && sending) {
         e.preventDefault();
         stopTurn();
@@ -2312,7 +2424,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [inWorkspace, sending, newSession, stopTurn]);
+  }, [inWorkspace, sending, handleNew, stopTurn]);
 
   // ── P7 最小路由接线：URL 单向镜像（会话路径 + 面板 query）/ popstate / 深链恢复 ──
   // 面板深链单选优先级：教程 > 设置 > 市场 > 管理 > 组织（同一时刻仅镜像一个顶层中心）。
@@ -2561,7 +2673,7 @@ export function App() {
     credits: user?.credits ?? null,
     onOpenAccount: demo ? undefined : () => openSettings(),
     onOpenFeedback: demo ? undefined : () => openSettings("feedback"),
-    onNew: newSession,
+    onNew: handleNew,
     onRename: renameSessionPrompt,
     onDelete: deleteSessionConfirm,
     onTogglePin: togglePinSession,
@@ -2581,7 +2693,8 @@ export function App() {
     optimizerPending: demo ? 0 : optimizer.pendingCount,
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
     onOpenTutorial: demo ? undefined : () => openTutorial(),
-    onOpenMediaTasks: demo ? undefined : () => setMediaTasksOpen(true),
+    onOpenMediaTasks:
+      demo || mediaTasksAvailable === false ? undefined : () => setMediaTasksOpen(true),
     theme,
     onCycleTheme: cycle,
     // 管理后台入口:仅平台超管(user.role === 'admin')可见,导航到 React 管理后台
@@ -2632,8 +2745,14 @@ export function App() {
     >
     <ToolCardActionsContext.Provider value={toolActions}>
     <ChatInteractionContext.Provider value={chatInteraction}>
+    <ArtifactInspectContext.Provider value={artifactInspect}>
     <ImageEditActionsContext.Provider value={imageEditActions}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
+    <ProjectScopeProvider
+      auth={!demo && auth ? auth : null}
+      chatProjects={projects}
+      userId={user?.id}
+    >
     <div className="flex h-full min-h-0 overflow-hidden bg-bg text-fg safe-px">
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
       {!collapsed && (
@@ -2641,12 +2760,17 @@ export function App() {
           <Sidebar
             {...sidebarProps}
             onSelect={(id) => {
+              draftProjectRef.current = null;
               setBoardOpen(false);
               selectSession(id);
             }}
             onNew={() => {
               setBoardOpen(false);
-              newSession();
+              handleNew();
+            }}
+            onNewInProject={(projectId) => {
+              setBoardOpen(false);
+              newSessionInProject(projectId);
             }}
             onCollapse={() => setCollapsed(true)}
           />
@@ -2665,13 +2789,19 @@ export function App() {
         <Sidebar
           {...sidebarProps}
           onSelect={(id) => {
+            draftProjectRef.current = null;
             setBoardOpen(false);
             selectSession(id);
             setMobileNavOpen(false);
           }}
           onNew={() => {
             setBoardOpen(false);
-            newSession();
+            handleNew();
+            setMobileNavOpen(false);
+          }}
+          onNewInProject={(projectId) => {
+            setBoardOpen(false);
+            newSessionInProject(projectId);
             setMobileNavOpen(false);
           }}
           onCollapse={() => setMobileNavOpen(false)}
@@ -2725,6 +2855,13 @@ export function App() {
         <ChatHeader
           agent={agent}
           onAgentClick={() => setPickerOpen(true)}
+          projectBreadcrumb={(() => {
+            const pid = sessions.find((s) => s.id === activeId)?.projectId;
+            if (!pid) return null;
+            const chat = projects.find((p) => p.id === pid);
+            return chat ? { chatName: chat.name, workName: chat.boardProjectId ? chat.name : null } : null;
+          })()}
+          onOpenProjectScope={() => openManage(DEFAULT_MANAGE_TAB)}
           models={models}
           selectedModelId={modelId}
           onSelectModel={selectModel}
@@ -2740,7 +2877,7 @@ export function App() {
           onOpenBilling={demo ? undefined : () => openSettings()}
           sidebarCollapsed={collapsed}
           onExpandSidebar={() => setCollapsed(false)}
-          onNew={newSession}
+          onNew={handleNew}
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           unreadCount={inbox.unreadCount}
@@ -2951,6 +3088,26 @@ export function App() {
         </>
         )}
       </main>
+
+      {/* 产物详情列(Codex 式第三列)。桌面:与 Sidebar|main 并列的内联 aside;
+          窄屏:右侧 Sheet 抽屉(共用 InspectorPanelContent)。任务看板占据 main 时不渲染。 */}
+      {!boardOpen && inspectTarget && isMdViewport && (
+        <InspectorPanel target={inspectTarget} onClose={() => setInspectTarget(null)} />
+      )}
+      <Sheet
+        open={!boardOpen && !!inspectTarget && !isMdViewport}
+        onOpenChange={(o) => {
+          if (!o) setInspectTarget(null);
+        }}
+        side="right"
+        srTitle="产物详情"
+        className="w-[min(92vw,26rem)] md:hidden"
+        overlayClassName="md:hidden"
+      >
+        {inspectTarget && (
+          <InspectorPanelContent target={inspectTarget} onClose={() => setInspectTarget(null)} />
+        )}
+      </Sheet>
 
       <AgentPicker
         open={pickerOpen}
@@ -3248,7 +3405,9 @@ export function App() {
         </LazyBoundary>
       )}
     </div>
+    </ProjectScopeProvider>
     </ImageEditActionsContext.Provider>
+    </ArtifactInspectContext.Provider>
     </ChatInteractionContext.Provider>
     </ToolCardActionsContext.Provider>
     </MediaSignProvider>

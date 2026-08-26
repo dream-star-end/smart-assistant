@@ -10,8 +10,21 @@
 // actor 判定见 `resolveTaskboardActor` —— 不信 body.actor。
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import {
+  commitProjectSkillOverlay,
+  loadProjectContext,
+  parseProjectWorkspace,
+  paths,
+  readProjectRunContextFile,
+  resolveProjectCwd,
+  writeProjectInstructions,
+} from '@openclaude/storage'
 import { filterUserVisibleAgentsForManagement, isHiddenSystemAgentId } from '../agentVisibility.js'
 import { verifyJwt } from '../auth.js'
+import {
+  ModelCatalogUnavailableError,
+  getLocalCatalogView,
+} from '../modelCatalogClient.js'
 import { createActivity, listActivities } from './db/activity.js'
 import { createComment, listComments } from './db/comments.js'
 import { COST_GROUP_BY, queryCostStats, ymdRangeMs } from './db/costStats.js'
@@ -66,6 +79,8 @@ import {
   getUsage,
   updateSettings,
 } from './db/settings.js'
+import { dispatchProjectMemory } from './projectMemoryHttp.js'
+import { previewProjectContext, summarizeProjectContext } from '../projectContextPreview.js'
 import {
   applyTemplate,
   applyTemplates,
@@ -173,6 +188,11 @@ export interface TaskboardHttpContext {
   jwtSecret?: string
   isCommercialJwt?: (token: string) => boolean
   listAgents?: () => Promise<BoardAgent[]>
+  /**
+   * 阶段 model 覆盖是否在当前 catalog 投影里且 available。
+   * 测试注入;生产省略则走 getLocalCatalogView().isRoutable。
+   */
+  isAvailableStageModel?: (modelId: string) => boolean | Promise<boolean>
 }
 
 export interface ResolveActorOptions {
@@ -557,6 +577,10 @@ function mapHttpError(res: ServerResponse, err: unknown): boolean {
     sendError(res, 400, err.message, { code: 'validation' })
     return true
   }
+  if (err instanceof ModelCatalogUnavailableError) {
+    sendError(res, 503, err.message, { code: 'model_catalog_unavailable' })
+    return true
+  }
   if (err instanceof TaskboardCrossProjectError) {
     sendError(res, 422, err.message, { code: 'cross_project' })
     return true
@@ -638,7 +662,7 @@ async function dispatch(
 
   if (path === '/api/board/projects') {
     if (method === 'GET') return handleListProjects(res, url, db)
-    if (method === 'POST') return handleCreateProject(res, await readJsonBody(req), db)
+    if (method === 'POST') return handleCreateProject(res, await readJsonBody(req), db, actor, ctx)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -649,11 +673,32 @@ async function dispatch(
     return sendError(res, 405, 'method not allowed')
   }
 
+  const projectContextPreview = path.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/)
+  if (projectContextPreview) {
+    if (method !== 'GET') return sendError(res, 405, 'method not allowed')
+    return handlePreviewProjectContext(
+      res,
+      db,
+      decodeURIComponent(projectContextPreview[1]),
+      url.searchParams.get('agentId'),
+    )
+  }
+
+  const projectContext = path.match(/^\/api\/board\/projects\/([^/]+)\/context$/)
+  if (projectContext) {
+    const id = decodeURIComponent(projectContext[1])
+    if (method === 'GET') return handleGetProjectContext(res, db, id)
+    if (method === 'PUT') return handlePutProjectContext(res, await readJsonBody(req), db, actor, id)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  if (await dispatchProjectMemory(req, res, url, method, db, actor)) return
+
   const projectItem = path.match(/^\/api\/board\/projects\/([^/]+)$/)
   if (projectItem) {
     const id = decodeURIComponent(projectItem[1])
     if (method === 'GET') return handleGetProject(res, db, id)
-    if (method === 'PATCH') return handlePatchProject(res, await readJsonBody(req), db, id)
+    if (method === 'PATCH') return await handlePatchProject(res, await readJsonBody(req), db, id)
     if (method === 'DELETE') return handleDeleteProject(res, db, id)
     return sendError(res, 405, 'method not allowed')
   }
@@ -721,7 +766,7 @@ async function dispatch(
   if (pipelineStages) {
     const id = decodeURIComponent(pipelineStages[1])
     if (method === 'GET') return handleListStages(res, db, id)
-    if (method === 'POST') return handleCreateStage(res, await readJsonBody(req), db, id)
+    if (method === 'POST') return handleCreateStage(res, await readJsonBody(req), db, id, actor, ctx)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -737,8 +782,14 @@ async function dispatch(
   if (stageItem) {
     const id = decodeURIComponent(stageItem[1])
     if (method === 'GET') return handleGetStage(res, db, id)
-    if (method === 'PATCH') return handlePatchStage(res, await readJsonBody(req), db, id, actor)
+    if (method === 'PATCH') return handlePatchStage(res, await readJsonBody(req), db, id, actor, ctx)
     return sendError(res, 405, 'method not allowed')
+  }
+
+  const runContext = path.match(/^\/api\/board\/runs\/([^/]+)\/context$/)
+  if (runContext) {
+    if (method !== 'GET') return sendError(res, 405, 'method not allowed')
+    return handleGetRunContext(res, db, decodeURIComponent(runContext[1]))
   }
 
   const runItem = path.match(/^\/api\/board\/runs\/([^/]+)$/)
@@ -791,6 +842,8 @@ async function dispatch(
         await readJsonBody(req),
         db,
         decodeURIComponent(templateApply[1]),
+        actor,
+        ctx,
       )
     }
     return sendError(res, 405, 'method not allowed')
@@ -814,14 +867,22 @@ function handleListProjects(res: ServerResponse, url: URL, db: TaskboardDb): voi
   sendJson(res, 200, { items: listProjects(db, { includeArchived }) })
 }
 
-function handleCreateProject(
+async function handleCreateProject(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
-): void {
+  actor: Actor,
+  ctx: TaskboardHttpContext,
+): Promise<void> {
   const key = asString(body.key)
   const name = asString(body.name)
   if (!key || !name) throw new TaskboardValidationError('key and name are required')
+  const templateIds = asStringArray(body.templateIds)
+  if (actor !== 'human' && templateIds !== undefined && templateIds.length > 0) {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
+  if (templateIds?.length) await assertTemplatesValidForApply(db, templateIds, ctx)
   try {
     const created = db.transaction(() => {
       const project = createProject(db, {
@@ -829,9 +890,9 @@ function handleCreateProject(
         name,
         description: asNullableString(body.description) ?? null,
         workspace: asNullableString(body.workspace) ?? null,
+        workspaceSpec: parseProjectWorkspace(body.workspaceSpec),
         labels: asStringArray(body.labels) ?? [],
       })
-      const templateIds = asStringArray(body.templateIds)
       if (templateIds === undefined) {
         seedDefaultPipelines(db, project.id)
       } else if (templateIds.length > 0) {
@@ -855,22 +916,154 @@ function handleGetProject(res: ServerResponse, db: TaskboardDb, idOrKey: string)
   sendJson(res, 200, { project })
 }
 
-function handlePatchProject(
+async function handlePatchProject(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
   idOrKey: string,
-): void {
+): Promise<void> {
   const project = resolveProject(db, idOrKey)
   if (!project) throw new TaskboardNotFound('project', idOrKey)
+  const workspaceSpec =
+    body.workspaceSpec === undefined ? undefined : parseProjectWorkspace(body.workspaceSpec)
+  if (body.workspaceSpec !== undefined && body.workspaceSpec !== null && !workspaceSpec) {
+    throw new TaskboardValidationError('invalid workspaceSpec')
+  }
+  if (workspaceSpec) {
+    const cwd = resolveProjectCwd(workspaceSpec, project.id)
+    if (!cwd.ok) {
+      throw new TaskboardValidationError(
+        `workspaceSpec rejected: ${cwd.error} (${cwd.detail}). 项目数据目录 ~/.openclaude/projects 不能当工作区；仅允许 workspace/ 或 repos/ 下的绝对路径。`,
+      )
+    }
+  }
   const updated = updateProject(db, project.id, {
     name: asString(body.name),
     description: asNullableString(body.description),
     workspace: asNullableString(body.workspace),
+    workspaceSpec,
     labels: asStringArray(body.labels),
     archivedAt: asNullableNumber(body.archivedAt),
   })
+  if (workspaceSpec !== undefined) {
+    const { incrementProjectContextVersion } = await import('@openclaude/storage')
+    await incrementProjectContextVersion(project.id).catch(() => {})
+  }
   sendJson(res, 200, { ok: true, project: updated })
+}
+
+async function handleGetProjectContext(
+  res: ServerResponse,
+  db: TaskboardDb,
+  idOrKey: string,
+): Promise<void> {
+  const project = resolveProject(db, idOrKey)
+  if (!project) throw new TaskboardNotFound('project', idOrKey)
+  sendJson(res, 200, await summarizeProjectContext(project.id, db))
+}
+
+async function handlePreviewProjectContext(
+  res: ServerResponse,
+  db: TaskboardDb,
+  idOrKey: string,
+  agentId?: string | null,
+): Promise<void> {
+  const project = resolveProject(db, idOrKey)
+  if (!project) throw new TaskboardNotFound('project', idOrKey)
+  sendJson(
+    res,
+    200,
+    await previewProjectContext({
+      boardProjectId: project.id,
+      agentId: agentId && /^[A-Za-z0-9_-]{1,64}$/.test(agentId) ? agentId : undefined,
+    }),
+  )
+}
+
+async function handleGetRunContext(
+  res: ServerResponse,
+  db: TaskboardDb,
+  runId: string,
+): Promise<void> {
+  const run = getRun(db, runId)
+  if (!run) throw new TaskboardNotFound('run', runId)
+  const ticket = getTicketByIdOrIdentifier(db, run.ticketId)
+  const projectId = ticket?.projectId ?? null
+  let snapshot = null
+  if (projectId && (run.contextSnapshotId || run.id)) {
+    snapshot =
+      (run.contextSnapshotId
+        ? await readProjectRunContextFile(projectId, run.contextSnapshotId)
+        : null) ?? (await readProjectRunContextFile(projectId, run.id))
+  }
+  let currentVersion: number | null = null
+  if (projectId) {
+    try {
+      currentVersion = (await loadProjectContext(projectId)).version
+    } catch {
+      currentVersion = null
+    }
+  }
+  sendJson(res, 200, {
+    runId: run.id,
+    contextSnapshotId: run.contextSnapshotId ?? null,
+    contextSha256: run.contextSha256 ?? null,
+    contextVersion: run.contextVersion ?? null,
+    currentVersion,
+    changed: run.contextVersion != null && currentVersion != null && run.contextVersion !== currentVersion,
+    snapshot,
+    disclaimer: '仅审计、不可逐字重放',
+  })
+}
+
+async function handlePutProjectContext(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  idOrKey: string,
+): Promise<void> {
+  const project = resolveProject(db, idOrKey)
+  if (!project) throw new TaskboardNotFound('project', idOrKey)
+  const expectedVersion = asNullableNumber(body.expectedVersion)
+  if (expectedVersion == null || !Number.isFinite(expectedVersion)) {
+    throw new TaskboardValidationError('expectedVersion is required')
+  }
+  if (body.instructions !== undefined) {
+    const text = body.instructions === null ? null : asString(body.instructions) ?? ''
+    const written = await writeProjectInstructions(project.id, text, expectedVersion, {
+      key: project.key,
+    })
+    if (!written.ok) {
+      sendError(res, written.error === 'version_conflict' ? 409 : 400, written.error, {
+        current: written.current ?? null,
+      })
+      return
+    }
+    sendJson(res, 200, { ok: true, context: written.snapshot })
+    return
+  }
+  if (Array.isArray(body.skillNames)) {
+    if (actor !== 'human') {
+      sendError(res, 403, 'human approval required', { code: 'human_required' })
+      return
+    }
+    const names = body.skillNames.filter((n): n is string => typeof n === 'string')
+    const written = await commitProjectSkillOverlay(project.id, names, expectedVersion, {
+      sourceFor: (name) => `${paths.sharedSkillsDir}/${name}`,
+      db,
+      actor: 'user:default',
+    })
+    if (!written.ok) {
+      sendError(res, written.error === 'version_conflict' ? 409 : 400, written.error, {
+        current: written.current ?? null,
+      })
+      return
+    }
+    sendJson(res, 200, { ok: true, context: written.snapshot })
+    return
+  }
+  throw new TaskboardValidationError('instructions or skillNames required')
 }
 
 function handleDeleteProject(res: ServerResponse, db: TaskboardDb, idOrKey: string): void {
@@ -2123,10 +2316,35 @@ const STAGE_OPS_FIELDS = [
   'autoClose',
   'promptTemplate',
   'toolsets',
+  'model',
 ] as const
 
 function stagePatchTouchesOps(body: Record<string, unknown>): boolean {
   return STAGE_OPS_FIELDS.some((key) => Object.hasOwn(body, key))
+}
+
+/** 空串 / 空白 = 清除覆盖。undefined = 请求没带这个字段。 */
+function normalizeStageModelInput(value: unknown): string | null | undefined {
+  const raw = asNullableString(value)
+  if (raw === undefined) return undefined
+  if (raw === null) return null
+  const trimmed = raw.trim()
+  return trimmed === '' ? null : trimmed
+}
+
+async function defaultIsAvailableStageModel(modelId: string): Promise<boolean> {
+  const view = await getLocalCatalogView()
+  return view.isRoutable(view.canonicalize(modelId))
+}
+
+async function assertStageModelAvailable(
+  modelId: string,
+  ctx: TaskboardHttpContext,
+): Promise<void> {
+  const ok = ctx.isAvailableStageModel
+    ? await ctx.isAvailableStageModel(modelId)
+    : await defaultIsAvailableStageModel(modelId)
+  if (!ok) throw new TaskboardValidationError(`model not available: ${modelId}`)
 }
 
 function validateStageWrite(input: {
@@ -2159,18 +2377,47 @@ function validateStageWrite(input: {
   }
 }
 
+async function assertTemplatesValidForApply(
+  db: TaskboardDb,
+  templateIds: string[],
+  ctx: TaskboardHttpContext,
+): Promise<void> {
+  for (const templateId of templateIds) {
+    const template = getTemplate(db, templateId)
+    if (!template) throw new TaskboardNotFound('template', templateId)
+    for (const stage of template.stages) {
+      validateStageWrite({
+        kind: stage.kind,
+        agentId: stage.agentId,
+        promptTemplate: stage.promptTemplate,
+        patrolEnabled: stage.patrolEnabled,
+        patrolCron: stage.patrolCron,
+        entryCondition: stage.entryCondition,
+        timeoutSec: stage.timeoutSec,
+      })
+      if (stage.model) await assertStageModelAvailable(stage.model, ctx)
+    }
+  }
+}
+
 function throwIfStageOrdinalConflict(err: unknown): void {
   if (isUniqueConstraint(err, 'ordinal')) {
     throw new TaskboardValidationError('同一流水线内阶段序号(ordinal)不能重复')
   }
 }
 
-function handleCreateStage(
+async function handleCreateStage(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
   pipelineId: string,
-): void {
+  actor: Actor,
+  ctx: TaskboardHttpContext,
+): Promise<void> {
+  if (actor !== 'human') {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
   if (!getPipeline(db, pipelineId)) throw new TaskboardNotFound('pipeline', pipelineId)
   const name = asString(body.name)
   const kindRaw = asString(body.kind)
@@ -2187,6 +2434,8 @@ function handleCreateStage(
   const patrolCron = asNullableString(body.patrolCron) ?? null
   const entryCondition = asNullableString(body.entryCondition)
   const timeoutSec = typeof body.timeoutSec === 'number' ? body.timeoutSec : undefined
+  const model = normalizeStageModelInput(body.model) ?? null
+  if (model) await assertStageModelAvailable(model, ctx)
   validateStageWrite({
     kind,
     agentId,
@@ -2204,6 +2453,7 @@ function handleCreateStage(
       name,
       kind,
       agentId,
+      model,
       promptTemplate,
       toolsets: asNullableStringArray(body.toolsets) ?? null,
       effort: asNullableString(body.effort) ?? null,
@@ -2262,13 +2512,14 @@ function handleReorderStages(
   }
 }
 
-function handlePatchStage(
+async function handlePatchStage(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
   id: string,
   actor: Actor,
-): void {
+  ctx: TaskboardHttpContext,
+): Promise<void> {
   const existing = getStage(db, id)
   if (!existing) throw new TaskboardNotFound('stage', id)
   if (actor !== 'human' && stagePatchTouchesOps(body)) {
@@ -2287,6 +2538,8 @@ function handlePatchStage(
     body.patrolCron === undefined ? existing.patrolCron : asNullableString(body.patrolCron)
   const entryCondition = asNullableString(body.entryCondition)
   const timeoutSec = typeof body.timeoutSec === 'number' ? body.timeoutSec : existing.timeoutSec
+  const model = Object.hasOwn(body, 'model') ? normalizeStageModelInput(body.model) : undefined
+  if (model && model !== existing.model) await assertStageModelAvailable(model, ctx)
   validateStageWrite({
     kind,
     agentId,
@@ -2302,6 +2555,7 @@ function handlePatchStage(
       name: asString(body.name),
       kind: asString(body.kind) as StageKind | undefined,
       agentId: asNullableString(body.agentId),
+      model,
       promptTemplate: asNullableString(body.promptTemplate),
       toolsets: asNullableStringArray(body.toolsets),
       effort: asNullableString(body.effort),
@@ -2517,12 +2771,19 @@ function handleDeleteTemplate(res: ServerResponse, db: TaskboardDb, id: string):
   sendJson(res, 200, { ok: true })
 }
 
-function handleApplyTemplate(
+async function handleApplyTemplate(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
   templateId: string,
-): void {
+  actor: Actor,
+  ctx: TaskboardHttpContext,
+): Promise<void> {
+  if (actor !== 'human') {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
+  await assertTemplatesValidForApply(db, [templateId], ctx)
   const projectRef = asString(body.projectId)
   if (!projectRef) throw new TaskboardValidationError('projectId is required')
   const project = resolveProject(db, projectRef)

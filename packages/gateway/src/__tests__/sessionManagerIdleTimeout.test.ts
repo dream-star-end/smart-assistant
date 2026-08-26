@@ -19,6 +19,7 @@ import {
   IDLE_TIMEOUT_DEFAULT_MS,
   IDLE_TIMEOUT_TOOL_MS,
   pickIdleTimeoutMs,
+  shouldTripIdleWatchdog,
 } from "../sessionManager.js";
 
 describe("pickIdleTimeoutMs", () => {
@@ -54,5 +55,18 @@ describe("pickIdleTimeoutMs", () => {
   test("两档常量值正确(防止有人随手调小 DEFAULT)", () => {
     assert.equal(IDLE_TIMEOUT_TOOL_MS, 15 * 60_000);
     assert.equal(IDLE_TIMEOUT_DEFAULT_MS, 5 * 60_000);
+  });
+
+  test("明确等待用户时跳过 idle，但同一阈值在普通执行态仍触发", () => {
+    assert.equal(shouldTripIdleWatchdog({
+      waitingForUserInput: true,
+      idleMs: IDLE_TIMEOUT_TOOL_MS + 1,
+      thresholdMs: IDLE_TIMEOUT_TOOL_MS,
+    }), false);
+    assert.equal(shouldTripIdleWatchdog({
+      waitingForUserInput: false,
+      idleMs: IDLE_TIMEOUT_TOOL_MS + 1,
+      thresholdMs: IDLE_TIMEOUT_TOOL_MS,
+    }), true);
   });
 });

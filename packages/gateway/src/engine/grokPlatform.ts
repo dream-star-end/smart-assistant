@@ -3,12 +3,12 @@
  * Grok CLI. Grok does not inherit CCB/Cursor wiring; this module is the
  * explicit projection (see v5-official-cli-subscription-integration).
  */
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 import { paths } from '@openclaude/storage'
 import { issueDelegateContextToken } from '../delegateContext.js'
-import { resolveMcpMemoryEntry } from '../mcpMemoryEntry.js'
+import { resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
 
 export const GROK_MEMORY_MCP_TOOLS = [
   'skill_search',
@@ -86,6 +86,7 @@ export interface GrokPlatformProjection {
 
 export interface GrokPlatformInput {
   agentId: string
+  projectId?: string
   sessionKey: string
   gatewayPort: number
   gatewayToken: string
@@ -119,11 +120,8 @@ export function projectGrokPlatform(input: GrokPlatformInput): GrokPlatformProje
   let delegateContextFile: string | null = null
   let mcpToml = ''
 
-  const mcpEntry = resolveMcpMemoryEntry(input.claudeCodePath)
-  const trustedTsxCli = mcpEntry
-    ? resolve(dirname(mcpEntry), '../../../node_modules/tsx/dist/cli.mjs')
-    : null
-  if (mcpEntry && trustedTsxCli && existsSync(trustedTsxCli) && input.gatewayToken) {
+  const mcpLaunch = resolveMcpMemoryLaunch(input.claudeCodePath, { fallback: 'node-tsx' })
+  if (mcpLaunch && input.gatewayToken) {
     const tokenFile = join(grokHome, 'gateway-token')
     delegateContextFile = join(grokHome, 'delegate-context')
     writePrivate(tokenFile, input.gatewayToken)
@@ -137,6 +135,7 @@ export function projectGrokPlatform(input: GrokPlatformInput): GrokPlatformProje
     )
     const env: Record<string, string> = {
       OPENCLAUDE_AGENT_ID: input.agentId,
+      ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
       OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME?.trim() || paths.home,
       OPENCLAUDE_SESSION_KEY: input.sessionKey,
       OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
@@ -162,8 +161,8 @@ export function projectGrokPlatform(input: GrokPlatformInput): GrokPlatformProje
       .join('\n')
     mcpToml = `
 [mcp_servers."openclaude-memory"]
-command = ${tomlString('/usr/local/bin/node')}
-args = [${tomlString(trustedTsxCli)}, ${tomlString(mcpEntry)}]
+command = ${tomlString(mcpLaunch.command)}
+args = [${mcpLaunch.args.map(tomlString).join(', ')}]
 enabled = true
 startup_timeout_sec = 30
 tool_timeout_sec = 600

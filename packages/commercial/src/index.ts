@@ -245,19 +245,28 @@ import {
   buildCodexTokenRefreshHandler,
 } from "./http/codexInternalAssembly.js";
 import {
+  MAX_DELEGATE_GROK_LEASES_PER_CONTAINER,
   createCodexRouteContextForModel,
   createGrokRouteContextForModel,
   expireCodexRouteContext,
   expireGrokRouteContext,
   expireGrokRouteContextByLease,
+  expireSettledGrokRouteLeases,
   hasActiveOfficialOAuthAccountInGroup,
   listActiveGrokRouteLeases,
   listEnabledGroupsForModel,
+  resolveGrokRouteContext,
 } from "./account-pool/groups.js";
 import {
   CODEX_RELAY_PREFIX,
   type CodexRelayHandler,
 } from "./http/internalCodexRelay.js";
+import {
+  isDelegateGrokRoutePath,
+  makeDelegateGrokRouteHandler,
+  type DelegateGrokRouteAllocation,
+  type DelegateGrokRouteHandler,
+} from "./http/internalDelegateGrokRoute.js";
 import {
   GROK_RELAY_PREFIX,
   makeGrokRelayHandler,
@@ -379,6 +388,11 @@ import {
   makeCronIndexHandler,
   type CronIndexHandler,
 } from "./http/internalCronIndex.js";
+import {
+  CRON_ORIGIN_INJECT_PATH,
+  makeCronOriginInjectHandler,
+  type CronOriginInjectHandler,
+} from "./http/internalCronOriginInject.js";
 import {
   INBOX_ALERT_PATH,
   INBOX_POST_PATH,
@@ -503,6 +517,11 @@ import {
   type PlatformPromptSlotsHandler,
 } from "./http/internalPlatformPromptSlots.js";
 import {
+  PROJECT_CONTEXT_PATH,
+  makeInternalProjectContextHandler,
+  type InternalProjectContextHandler,
+} from "./http/internalProjectContext.js";
+import {
   MINIMAX_MEDIA_PATH,
   makeMiniMaxMediaHandler,
   type MiniMaxMediaHandler,
@@ -567,6 +586,7 @@ import {
 import {
   composeMultiplier,
   getAgentCostMultiplier,
+  listAgentCostOverrides,
 } from "./billing/agentMultiplier.js";
 import {
   startInflightJournal,
@@ -1661,6 +1681,94 @@ export async function registerCommercial(
   // 共享同一个 dispatcher,按 url path 分流到 anthropicProxy 或 internalServerAuthored。
   // 在 internalProxyHandler 构造完毕后赋值;mTLS listener 读它而不是 internalProxyHandler。
   let dispatchInternal: AnthropicProxyHandler | undefined;
+
+  // ── grok relay route allocation(浏览器 turn 与 delegate turn 共用)──────
+  // createCommercialCodexRoute 原 grok 分支的原样抽取:bridge(每帧铸 route)
+  // 与下方 delegateGrokRouteHandler(容器本地 delegate turn 主动申请)必须走
+  // 同一账号池、同一 grok_route_contexts durable 并发权威,不允许各自解释。
+  const allocateGrokRelayRoute = async ({ containerId, userId, modelId, sessionId, origin }: {
+    containerId: number;
+    userId: bigint;
+    modelId: string;
+    sessionId?: string;
+    /**
+     * bridge(默认)= 浏览器 turn:7 天孤儿 TTL,计费终结帧显式 expire。
+     * delegate = 容器本地 delegate turn:无计费终结帧,走短心跳租约
+     * (GROK_DELEGATE_ROUTE_TTL_MS)+ per-container 并发限额,网关崩溃后
+     * 分钟级自愈,不再占满账号并发上限一周。
+     */
+    origin?: "bridge" | "delegate";
+  }) => {
+    // grok_route_contexts is the durable concurrency authority. Rebuild the
+    // local scheduler mirror before every allocation so a browser disconnect,
+    // generic slot reaper, or Master restart cannot make a live route vanish
+    // from the cap check. Reap billed/vanished rows first — restore would
+    // otherwise refill the 10-slot cap from finished turns.
+    await expireSettledGrokRouteLeases();
+    for (const lease of await listActiveGrokRouteLeases()) {
+      scheduler.restoreCodexSlot(lease.accountId, lease.slotId);
+    }
+    const groups = await listEnabledGroupsForModel({ modelId, provider: "grok" });
+    let busy: AccountPoolBusyError | null = null;
+    for (const group of groups) {
+      let picked;
+      try {
+        picked = await scheduler.pick({
+          mode: "agent",
+          provider: "grok",
+          groupId: group.id,
+          sessionId: sessionId ?? `container:${containerId}`,
+        });
+      } catch (err) {
+        if (err instanceof AccountPoolBusyError) { busy = err; continue; }
+        if (err instanceof AccountPoolUnavailableError) continue;
+        throw err;
+      }
+      picked.token.fill(0);
+      picked.refresh?.fill(0);
+      let route;
+      try {
+        route = await tx((client) => createGrokRouteContextForModel({
+          containerId,
+          userId,
+          modelId,
+          accountId: picked.account_id,
+          slotId: picked.slotId,
+          groupId: group.id,
+          runner: client,
+          maxConcurrent: scheduler.maxConcurrent,
+          kind: origin ?? "bridge",
+          ...(origin === "delegate"
+            ? { maxDelegatePerContainer: MAX_DELEGATE_GROK_LEASES_PER_CONTAINER }
+            : {}),
+        }));
+      } catch (err) {
+        scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
+        throw err;
+      }
+      if (!route) {
+        scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
+        continue;
+      }
+      return {
+        kind: "api_relay" as const,
+        engine: "grok" as const,
+        token: route.token,
+        baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v5/grok-relay/route/${route.token}/v1`,
+        modelProvider: "grok",
+        providerName: "xAI Grok subscription",
+        wireApi: "chat" as const,
+        preferredAuthMethod: "apikey" as const,
+        disableResponseStorage: true,
+        groupId: route.group.id.toString(),
+        credentialId: route.accountId.toString(),
+        accountId: route.accountId.toString(),
+        slotId: picked.slotId,
+      };
+    }
+    if (busy) throw busy;
+    return { kind: "unavailable" as const, reason: "no usable Grok subscription account" };
+  };
   // Internal listeners are assembled before model-authority startup. Renewal
   // reads this forward ref at request time; startup windows fail closed 503.
   let modelAuthoritySigner: AuthoritySigner | undefined;
@@ -1798,6 +1906,11 @@ export async function registerCommercial(
   // 2026-07-02 egress split:authz 加载器抽到 auth/userModelAuthz.ts 单一权威
   // (master 与 egress 两进程共用同一份规则),语义与原内联实现逐行等价。
   const loadUserModelAuthz = makeLoadUserModelAuthz();
+  // cron-origin-inject 的 bridge 晚绑定引用:handler 必须在内层 internal-proxy 作用域
+  // 创建(identityRepo 在那里),而 userChatBridge 要到 registerCommercial 尾部才初始化。
+  // 直接闭包引用 const userChatBridge 会在初始化窗口内 TDZ 抛错(b1d9e4fbb 同类问题);
+  // 用可空 ref:bridge 未就绪 → no_transport(503),容器侧按 retryable 下轮重试。
+  let cronOriginBridgeRef: UserChatBridgeHandler | null = null;
 
   if (
     !options.skipInternalProxy &&
@@ -2026,6 +2139,8 @@ export async function registerCommercial(
           // 拉不起来)→ handler 内部退 legacy 归一。
           catalog: modelCatalogForProxy,
         });
+      const projectContextHandler: InternalProjectContextHandler =
+        makeInternalProjectContextHandler({ identityRepo });
       // /internal/v3/minimax — 容器内 safe mmx wrapper → master 代持 MiniMax
       // Token Plan key 调用多模态 API 并记账。Token Plan key 只在 master env,
       // 不注入容器；鉴权同 anthropicProxy / platform slots 双因子。
@@ -2069,6 +2184,36 @@ export async function registerCommercial(
           return true;
         },
       });
+      // /internal/v5/delegate/grok-route/* — 容器本地 delegate turn 的 grok route
+      // mint/renew/release(与浏览器 turn 同一账号池与 durable 并发权威)。仅在
+      // selfhost engine-local-turn 豁免下挂载(与 gateway modelAuthority
+      // isEngineLocalTurnExempt 同一 env 语义);生产不路由 → 容器侧 delegate 在
+      // decideLocalExecution 已 fail-closed,不会也不该到达这里。
+      const delegateGrokRouteHandler: DelegateGrokRouteHandler | undefined =
+        process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
+          ? makeDelegateGrokRouteHandler({
+              identityRepo,
+              // origin=delegate:短心跳租约 + per-container 限额(与浏览器 bridge
+              // 的 7 天孤儿 TTL 语义分离,见 allocateGrokRelayRoute 注释)。
+              allocate: (input) => allocateGrokRelayRoute({ ...input, origin: "delegate" }),
+              release: async ({ routeToken, containerId, userId }) => {
+                const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
+                if (!context) return false;
+                await expireGrokRouteContextByLease(context.accountId, context.slotId);
+                scheduler.releaseCodexSlot(context.accountId, context.slotId);
+                return true;
+              },
+              renew: async ({ routeToken, containerId, userId }) => {
+                const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
+                if (!context) return false;
+                if (!scheduler.renewCodexSlot(context.accountId, context.slotId)) {
+                  scheduler.restoreCodexSlot(context.accountId, context.slotId);
+                }
+                return true;
+              },
+              logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
+            })
+          : undefined;
       const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
         identityRepo,
         codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
@@ -2253,6 +2398,13 @@ export async function registerCommercial(
         identityRepo,
         runner: getPool() as unknown as CronWakeRunner,
       });
+      const cronOriginInjectHandler: CronOriginInjectHandler = makeCronOriginInjectHandler({
+        identityRepo,
+        inject: (input) =>
+          cronOriginBridgeRef
+            ? cronOriginBridgeRef.injectCronOriginTurn(input)
+            : Promise.resolve({ kind: "no_transport" as const }),
+      });
       // /internal/v3/inbox-post — 容器 onDeliver「离线送达兜底写站内信」。uid 由容器身份推导,
       // audience 硬编码 'user' 只给自己写;created_by = MIN active admin(同 onboarding 语义,
       // 每次现解析,不缓存)。无 admin → 抛错 → handler 500。见 http/internalInboxPost.ts。
@@ -2314,6 +2466,7 @@ export async function registerCommercial(
             // immediately; the endpoint itself is already a narrow local-turn call.
             loadRoutingAvailability: () =>
               getProviderRoutingAvailability(Date.now(), undefined, undefined, true),
+            loadAgentCostOverrides: () => listAgentCostOverrides(getPool()),
           })
         : null;
       // seed 完整性(§5 / R2-M8):平台预设 agent 引用的模型必须在 catalog active,否则用户
@@ -2362,6 +2515,9 @@ export async function registerCommercial(
         if (path === PLATFORM_PROMPT_SLOTS_PATH) {
           return platformPromptSlotsHandler(req, res, ctx);
         }
+        if (path === PROJECT_CONTEXT_PATH) {
+          return projectContextHandler(req, res, ctx);
+        }
         if (path === MINIMAX_MEDIA_PATH) {
           return minimaxMediaHandler(req, res, ctx);
         }
@@ -2401,6 +2557,9 @@ export async function registerCommercial(
         if (path === TURN_LEASE_RENEW_PATH) {
           return turnLeaseRenewHandler(req, res, ctx);
         }
+        if (delegateGrokRouteHandler && isDelegateGrokRoutePath(path)) {
+          return delegateGrokRouteHandler(req, res, ctx);
+        }
         if (
           promptQueueHandler &&
           (path === PROMPT_QUEUE_MUTATION_PATH || path === PROMPT_QUEUE_SNAPSHOT_PATH ||
@@ -2437,6 +2596,9 @@ export async function registerCommercial(
         }
         if (path === CRON_INDEX_PATH) {
           return cronIndexHandler(req, res, ctx);
+        }
+        if (path === CRON_ORIGIN_INJECT_PATH) {
+          return cronOriginInjectHandler(req, res, ctx);
         }
         if (path === INBOX_POST_PATH) {
           return inboxPostHandler(req, res, ctx);
@@ -3821,69 +3983,7 @@ export async function registerCommercial(
     sessionId?: string;
   }) => {
     if (isGrokEngineModel(modelId)) {
-      // grok_route_contexts is the durable concurrency authority. Rebuild the
-      // local scheduler mirror before every allocation so a browser disconnect,
-      // generic slot reaper, or Master restart cannot make a live route vanish
-      // from the cap check.
-      for (const lease of await listActiveGrokRouteLeases()) {
-        scheduler.restoreCodexSlot(lease.accountId, lease.slotId);
-      }
-      const groups = await listEnabledGroupsForModel({ modelId, provider: "grok" });
-      let busy: AccountPoolBusyError | null = null;
-      for (const group of groups) {
-        let picked;
-        try {
-          picked = await scheduler.pick({
-            mode: "agent",
-            provider: "grok",
-            groupId: group.id,
-            sessionId: sessionId ?? `container:${containerId}`,
-          });
-        } catch (err) {
-          if (err instanceof AccountPoolBusyError) { busy = err; continue; }
-          if (err instanceof AccountPoolUnavailableError) continue;
-          throw err;
-        }
-        picked.token.fill(0);
-        picked.refresh?.fill(0);
-        let route;
-        try {
-          route = await tx((client) => createGrokRouteContextForModel({
-            containerId,
-            userId,
-            modelId,
-            accountId: picked.account_id,
-            slotId: picked.slotId,
-            groupId: group.id,
-            runner: client,
-            maxConcurrent: scheduler.maxConcurrent,
-          }));
-        } catch (err) {
-          scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
-          throw err;
-        }
-        if (!route) {
-          scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
-          continue;
-        }
-        return {
-          kind: "api_relay" as const,
-          engine: "grok" as const,
-          token: route.token,
-          baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v5/grok-relay/route/${route.token}/v1`,
-          modelProvider: "grok",
-          providerName: "xAI Grok subscription",
-          wireApi: "chat" as const,
-          preferredAuthMethod: "apikey" as const,
-          disableResponseStorage: true,
-          groupId: route.group.id.toString(),
-          credentialId: route.accountId.toString(),
-          accountId: route.accountId.toString(),
-          slotId: picked.slotId,
-        };
-      }
-      if (busy) throw busy;
-      return { kind: "unavailable" as const, reason: "no usable Grok subscription account" };
+      return allocateGrokRelayRoute({ containerId, userId, modelId, sessionId });
     }
     const groups = await listEnabledGroupsForModel({ modelId, provider: "codex" });
     if (groups.length === 0) return null;
@@ -5216,7 +5316,8 @@ export async function registerCommercial(
     appendCostCredits: appendCostCreditsForUser, // c:<uid> 前缀对齐 session 存储命名空间
   });
   // 把 proxy 的 forward-ref 指向真实 broadcastToUser —— 此刻以后,commit 成功
-  // 扣费事件会实时推到用户前端。
+  // 扣费事件会实时推到用户前端。cron-origin-inject 同理由此刻起可注入。
+  cronOriginBridgeRef = userChatBridge;
   bridgeBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };

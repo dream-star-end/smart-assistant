@@ -40,12 +40,14 @@ export function parseCursorSlotResults(text: string): CursorSlotResult[] {
 
 export function coerceSlotFail(
   result: CursorSlotResultKind,
-  terminalCode: string | null | undefined,
+  _terminalCode: string | null | undefined,
 ): CursorSlotResultKind {
-  if (result !== "fail") return result;
-  if (terminalCode === "QUOTA_UNAVAILABLE") return "fail_quota";
-  if (terminalCode === "AUTH_UNAVAILABLE") return "fail_auth";
-  return "fail";
+  // A turn-level terminal code is not proof that the selected Cursor key hit
+  // its Other Models pool. It can come from MCP/browser auth, a generic 429,
+  // transport failure, or any other stderr emitted during a long agent turn.
+  // Only an explicit slot_result emitted with provider-bound provenance may
+  // change a key's quota class.
+  return result;
 }
 
 export function nextCursorQuotaClass(
@@ -55,7 +57,9 @@ export function nextCursorQuotaClass(
 ): CursorQuotaClass {
   if (family === "cursor_models") return current;
   if (result === "ok") return "other_ok";
-  if (result === "fail_auth" || result === "fail_quota") return "cursor_only";
+  // Authentication failure does not prove that Cursor Models still work, so
+  // it must never be rewritten as the two-pool state `cursor_only`.
+  if (result === "fail_quota") return "cursor_only";
   return current;
 }
 
@@ -135,6 +139,28 @@ export function parseQuotaClassSidecar(text: string): Map<string, CursorQuotaCla
     const [name, cls] = line.split(/\s+/, 2);
     if (!name || !isCursorQuotaClass(cls)) continue;
     out.set(name, cls);
+  }
+  return out;
+}
+
+export const CURSOR_SAND_MODE_FILE = ".sand-mode";
+
+export function renderSandModeSidecar(slots: Array<{ name: string; sandEnabled: boolean }>): string {
+  const lines = ["# sand-mode v1"];
+  for (const slot of slots) {
+    lines.push(`${slot.name} ${slot.sandEnabled ? "1" : "0"}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+export function parseSandModeSidecar(text: string): Map<string, boolean> {
+  const out = new Map<string, boolean>();
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const [name, mode] = line.split(/\s+/, 2);
+    if (!name) continue;
+    out.set(name, mode === "1" || mode === "true" || mode === "sand");
   }
   return out;
 }

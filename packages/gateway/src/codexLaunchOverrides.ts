@@ -35,9 +35,10 @@ import { resolve } from 'node:path'
 import { createLogger } from './logger.js'
 import { issueDelegateContextToken } from './delegateContext.js'
 import { modelHintAppliedTotal } from './metrics.js'
+import { persistRunContextSnapshot } from './runContextPersist.js'
 import { buildPromptContext } from './promptSlots.js'
 import { getPlatformPrompt } from './platformPrompts.js'
-import { resolveMcpMemoryEntry } from './mcpMemoryEntry.js'
+import { resolveMcpMemoryEntry, resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
 const overridesLog = createLogger({ module: 'codexLaunchOverrides' })
@@ -243,6 +244,7 @@ function codexMcpToolTimeoutSec(env: NodeJS.ProcessEnv = process.env): number {
 
 export interface CodexLaunchOverridesContext {
   agentId: string
+  projectId?: string
   /** Current gateway AgentSession key. Forwarded only to mcp-memory so
    *  delegate_task can stream progress back to the exact parent WebChat
    *  session without falling back to last-active routing. */
@@ -290,6 +292,8 @@ export interface CodexLaunchOverridesContext {
   repoSnapshot?: RepoSnapshot | null
   /** 当前 client session id,用于注入 PROJECT 项目指令 slot。 */
   sessionId?: string
+  runContext?: import('./runContextPersist.js').RunContextDescriptor
+  cwd?: string
 }
 
 export interface CodexLaunchOverrides {
@@ -361,8 +365,8 @@ export async function buildCodexLaunchOverrides(
   // same as web-context/browser. mcp-memory below is the only remaining
   // codex-side MCP server, so the prompt must advertise it iff the entry that
   // will actually be registered resolves.
-  const mcpEntry = resolveMcpMemoryEntry(ctx.claudeCodePath)
-  const availableMcpTools = mcpEntry
+  const mcpLaunch = resolveMcpMemoryLaunch(ctx.claudeCodePath, { fallback: 'npx-tsx' })
+  const availableMcpTools = mcpLaunch
     ? [
         'skill_search', 'skill_list', 'skill_view', 'skill_save', 'skill_delete',
         'create_reminder', 'list_reminders', 'update_reminder', 'delete_reminder',
@@ -383,6 +387,20 @@ export async function buildCodexLaunchOverrides(
     repoSnapshot: ctx.repoSnapshot ?? undefined,
     availableMcpTools,
     sessionId: ctx.sessionId,
+    projectId: ctx.projectId,
+  })
+  await persistRunContextSnapshot({
+    descriptor: ctx.runContext,
+    applied: platformResult.applied,
+    promptContentSha256: platformResult.contentSha256,
+    frozen: platformResult.frozenProjectContext,
+    cwd: ctx.cwd ?? ctx.repoSnapshot?.workspaceDir ?? null,
+    cwdSource: ctx.repoSnapshot?.status === 'ready' && ctx.repoSnapshot.workspaceDir
+      ? 'session_repo'
+      : ctx.projectId
+        ? 'project_workspace'
+        : 'default',
+    sessionRepoOverlay: ctx.repoSnapshot?.status === 'ready' && Boolean(ctx.repoSnapshot.workspaceDir),
   })
   // preamble 从 platform bundle 取(商业版真热),env 未设(个人版)回落 CODEX_PREAMBLE 常量。
   const preamble = getPlatformPrompt('codex-preamble', CODEX_PREAMBLE)
@@ -396,6 +414,7 @@ export async function buildCodexLaunchOverrides(
       .update(instructionsContent, 'utf8')
       .digest('hex')
       .slice(0, 12),
+    board_project_id: ctx.runContext?.boardProjectId ?? ctx.projectId ?? null,
   })
 
   // observability:per-model 行为补丁注入(MODEL_HINT)→ structured log + prom counter。
@@ -437,7 +456,7 @@ export async function buildCodexLaunchOverrides(
   let tokenContent: string | null = null
   let delegateContextFile: string | null = null
   let delegateContextContent: string | null = null
-  if (mcpEntry) {
+  if (mcpLaunch) {
     // v3 hardening: the gateway token NEVER lands in argv. Instead, we point
     // mcp-memory at a 0600 file via OPENCLAUDE_GATEWAY_TOKEN_FILE; the caller
     // writes ctx.gatewayToken into that file before spawn. mcp-memory
@@ -453,6 +472,7 @@ export async function buildCodexLaunchOverrides(
     })}\n`
     const mcpEnv: Record<string, string> = {
       OPENCLAUDE_AGENT_ID: ctx.agentId,
+      ...(ctx.projectId ? { OPENCLAUDE_PROJECT_ID: ctx.projectId } : {}),
       OPENCLAUDE_HOME: ctx.openclaudeHome ?? process.env.OPENCLAUDE_HOME ?? '',
       ...(ctx.sessionKey ? { OPENCLAUDE_SESSION_KEY: ctx.sessionKey } : {}),
       OPENCLAUDE_GATEWAY_PORT: String(ctx.gatewayPort),
@@ -465,9 +485,9 @@ export async function buildCodexLaunchOverrides(
     }
     argvOverrides.push(
       '-c',
-      `mcp_servers.openclaude_memory.command=${tomlValue('npx')}`,
+      `mcp_servers.openclaude_memory.command=${tomlValue(mcpLaunch.command)}`,
       '-c',
-      `mcp_servers.openclaude_memory.args=${tomlValue(['tsx', mcpEntry])}`,
+      `mcp_servers.openclaude_memory.args=${tomlValue(mcpLaunch.args)}`,
       '-c',
       `mcp_servers.openclaude_memory.env=${tomlValue(mcpEnv)}`,
       '-c',

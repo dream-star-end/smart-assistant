@@ -217,6 +217,10 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
       if (trimmed.startsWith("SELECT id::text AS id, ledger_id")) {
         return { rows: [], rowCount: 0 };
       }
+      // Settle-time WorkProject snapshot. Suites without chat/project rows stay unattributed.
+      if (/FROM client_sessions cs/.test(trimmed) && /board_project_id/.test(trimmed)) {
+        return { rows: [], rowCount: 0 };
+      }
       throw new Error(`fakeClient: unhandled SQL: ${trimmed.slice(0, 80)}`);
     },
     release(): void { /* */ },
@@ -2448,6 +2452,59 @@ describe("userChatBridge / Grok subscription relay", () => {
     assert.deepEqual(releasedLeases, [{ accountId: 53n, slotId: "slot-grok" }]);
     assert.equal(expiredTokens.includes(routeToken), true);
     ws2.close();
+  });
+
+  test("same-bridge terminal billing during drain still expires the preserved Grok lease", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("24"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      peer: { id: "grok-peer", kind: "dm" },
+      agentId: "grok",
+      model: "grok-build",
+      content: "finish after the browser tab backgrounded",
+    }));
+    const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+    const requestId = forwarded.requestId as string;
+    const userCloseP = waitContainerClose(ws, 2_000);
+    ws.close();
+    assert.equal(await userCloseP, true,
+      "client close handshake must enter bridge drain before terminal billing");
+    assert.equal(releasedLeases.length, 0, "disconnect still preserves until the terminal billing frame");
+    containerWs.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId,
+      engineSessionId: ENGINE_SID,
+      status: "success",
+      usage: { input_tokens: 10, output_tokens: 20 },
+    }));
+    await waitUntil(() => releasedLeases.length === 1, 2_000);
+    assert.deepEqual(releasedLeases, [{ accountId: 53n, slotId: "slot-grok" }],
+      "drain-period billing on the surviving container WS must expire the 7-day grok lease");
+  });
+
+  test("container close after forward releases the durable Grok lease", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("24"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      peer: { id: "grok-peer", kind: "dm" },
+      agentId: "grok",
+      model: "grok-build",
+      content: "agent crashed after submit",
+    }));
+    await waitContainerNextFrame(containerWs);
+    containerWs.close();
+    await waitUntil(() => releasedLeases.length === 1, 2_000);
+    assert.deepEqual(releasedLeases, [{ accountId: 53n, slotId: "slot-grok" }],
+      "container death closes the billing channel; crash must not keep the 7-day grok lease");
+    ws.close();
   });
 
   test("same-bridge durable release rejection retains exact identity for immutable billing retry", async () => {

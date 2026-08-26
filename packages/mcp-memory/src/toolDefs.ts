@@ -121,6 +121,11 @@ export const TOOLS = [
       '',
       'kind="reminder"(默认): message 作为提醒内容原样播报给用户。',
       'kind="task": message 作为到点要执行的任务指令(如"汇总本周进展并推送"),届时会真的执行。',
+      '',
+      'resume="origin-session": 到点在【当前这条对话】开一轮新 turn 继续(带着原历史)。',
+      '用户说「过一会儿再在这条对话里继续」时用它,并配 kind="task"。',
+      '默认 isolated: 另开隔离会话执行,不读本对话历史。',
+      '禁止传 sessionId / originSessionKey —— 网关从当前对话盖章。',
     ].join('\n'),
     inputSchema: {
       type: 'object',
@@ -137,6 +142,12 @@ export const TOOLS = [
           type: 'string',
           enum: ['webchat', 'local'],
           description: '结果送达方式: webchat=推送到网页对话(默认); local=仅记录不打扰',
+        },
+        resume: {
+          type: 'string',
+          enum: ['isolated', 'origin-session'],
+          description:
+            'isolated=另开隔离会话(默认); origin-session=到点回到当前对话开新一轮。不要传 sessionId。',
         },
       },
       required: ['schedule', 'message'],
@@ -184,12 +195,13 @@ export const TOOLS = [
   {
     name: 'send_to_agent',
     description: [
-      '向另一个 agent 发送消息。目标 agent 会在后台处理,结果推送给用户。',
-      '用于多 agent 协作: 让专业 agent 处理特定子任务。',
+      '向另一个 agent 后台发送任务。本工具立刻返回,你不会等到它的结论。',
+      '用于需要专业成员独立干活、你先结束本回合的场景。',
       '',
-      '示例: send_to_agent(agentId="research", message="帮我查一下 React 19 新特性")',
+      '示例: send_to_agent(agentId="research-assistant", message="核一遍 2010 年萧山机场事件")',
       '',
-      '注意: 这是异步操作,你不会收到目标 agent 的回复。回复会直接推送给用户。',
+      '注意: 这是真正的后台操作。请结束本回合,不要让用户「等它那条回复」。',
+      '子任务完成后,系统会把结论注入本对话并叫醒你继续。需要同步拿结果再往下做时改用 delegate_task。',
     ].join('\n'),
     inputSchema: {
       type: 'object',
@@ -515,6 +527,40 @@ export const TOOLS = [
         },
       },
       required: ['questions'],
+    },
+  },
+  {
+    name: 'present_options',
+    description: [
+      '向当前网页用户投递一道选择题卡片。调用后立刻返回（不阻塞、不等待、不轮询）。',
+      '返回后必须立刻结束本回合；用户点选会作为下一条普通用户消息到达。',
+      '一次调用一道题；一条回复最多 4 次。options 1-12 项。',
+      '不要自己再写 ```options 围栏（适配器会注入）。不要调用原生 ask 工具。',
+      '必须在当前会话有活跃 turn 时调用；子 agent 环境会直接返回 skipped,',
+      '此时自行决策或在最终答复里列编号选项让用户文字作答。仅 Cursor 主会话可用。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: '题面（可选）' },
+        multi: { type: 'boolean', description: '仅 true 时多选' },
+        options: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 12,
+          description: '选项；label 必填，desc 可选。',
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: '选项文案（必填）' },
+              desc: { type: 'string', description: '选项补充说明' },
+            },
+            required: ['label'],
+          },
+        },
+      },
+      required: ['options'],
+      additionalProperties: false,
     },
   },
 ]

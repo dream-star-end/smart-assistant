@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto'
 import {
+  PROMPT_QUEUE_CLAIM_PATH,
+  PROMPT_QUEUE_DETAIL_PATH,
   PROMPT_QUEUE_MAX_TOTAL_CONTENT_BYTES,
+  PROMPT_QUEUE_MUTATION_PATH,
+  PROMPT_QUEUE_SNAPSHOT_PATH,
   type PromptQueueMutationFrame,
   type PromptQueueSnapshot,
   PromptQueueSnapshot as PromptQueueSnapshotSchema,
@@ -8,10 +12,12 @@ import {
 import { Value } from '@sinclair/typebox/value'
 import { request as undiciRequest } from 'undici'
 
-export const PROMPT_QUEUE_MUTATION_PATH = '/internal/v5/prompt-queue/mutation'
-export const PROMPT_QUEUE_SNAPSHOT_PATH = '/internal/v5/prompt-queue/snapshot'
-export const PROMPT_QUEUE_DETAIL_PATH = '/internal/v5/prompt-queue/detail'
-export const PROMPT_QUEUE_CLAIM_PATH = '/internal/v5/prompt-queue/claim'
+export {
+  PROMPT_QUEUE_MUTATION_PATH,
+  PROMPT_QUEUE_SNAPSHOT_PATH,
+  PROMPT_QUEUE_DETAIL_PATH,
+  PROMPT_QUEUE_CLAIM_PATH,
+}
 
 const SMALL_RESPONSE_LIMIT_BYTES = 2 * 1024 * 1024
 const DETAIL_RESPONSE_LIMIT_BYTES = PROMPT_QUEUE_MAX_TOTAL_CONTENT_BYTES + 2 * 1024 * 1024

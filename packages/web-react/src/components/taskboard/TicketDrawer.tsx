@@ -562,6 +562,7 @@ function RunDetail({
 }) {
   const duration = formatDurationMs(run.durationMs)
   const cost = formatRunCostUsd(run.costUsd)
+  const costText = `${cost ?? '成本未记录'}${run.costImprecise ? '（不精确）' : ''}`
   const skip = skipReasonLabel(run.skipReason)
   const tokens =
     run.tokensIn == null && run.tokensOut == null
@@ -580,11 +581,16 @@ function RunDetail({
         <TimeAgo value={run.createdAt} className="ml-auto text-caption text-faint" />
       </div>
       <p className="text-caption text-muted">
-        {[duration ?? '耗时未记录', tokens ?? '用量未记录', cost ?? '成本未记录']
-          .filter(Boolean)
-          .join(' · ')}
+        {[duration ?? '耗时未记录', tokens ?? '用量未记录', costText].filter(Boolean).join(' · ')}
       </p>
       {skip && <p className="text-body text-warning">跳过：{skip}</p>}
+      {(run.contextSha256 || run.contextVersion != null) && (
+        <p className="text-caption text-muted" data-testid="ticket-run-context">
+          快照 {run.contextSha256 ? run.contextSha256.slice(0, 12) : '—'} · 启动 v
+          {run.contextVersion ?? '—'}
+          。仅审计、不可逐字重放。
+        </p>
+      )}
       {(run.outputMd?.trim() || run.summary) && (
         <TicketMarkdown testId="ticket-run-md">{run.outputMd?.trim() || run.summary || ''}</TicketMarkdown>
       )}

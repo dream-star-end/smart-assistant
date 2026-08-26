@@ -104,6 +104,38 @@ export const paths = {
   hubLockfile: join(HOME, 'hub', 'lock.json'),
   hubSkillDir: (slug: string) => join(HOME, 'hub', 'skills', slug),
   hubSkillMd: (slug: string) => join(HOME, 'hub', 'skills', slug, 'SKILL.md'),
+  // Unified project context (phase 1+). DATA only — never a writable agent cwd.
+  // Cwd for isolated projects lives under workspace/projects/<id>, not here.
+  projectsDir: join(HOME, 'projects'),
+  projectDir: (boardProjectId: string) => join(HOME, 'projects', boardProjectId),
+  projectMeta: (boardProjectId: string) => join(HOME, 'projects', boardProjectId, 'meta.json'),
+  projectInstructionsFile: (boardProjectId: string) =>
+    join(HOME, 'projects', boardProjectId, 'PROJECT.md'),
+  projectSkillsDir: (boardProjectId: string) => join(HOME, 'projects', boardProjectId, 'skills'),
+  projectLock: (boardProjectId: string) => join(HOME, 'projects', boardProjectId, '.lock'),
+  // Project memory files are content carriers only. Injection/search authority
+  // is the gateway-owned promotion ledger (taskboard.db), not MEMORY.md.
+  projectMemoryDir: (boardProjectId: string) => join(HOME, 'projects', boardProjectId, 'memory'),
+  projectMemoryFile: (boardProjectId: string, base: string) =>
+    join(HOME, 'projects', boardProjectId, 'memory', base),
+  projectMemoryIndex: (boardProjectId: string) => join(HOME, 'projects', boardProjectId, 'MEMORY.md'),
+  projectCandidateDir: (boardProjectId: string) =>
+    join(HOME, 'projects', boardProjectId, 'memory-candidates'),
+  projectCandidateFile: (boardProjectId: string, base: string) =>
+    join(HOME, 'projects', boardProjectId, 'memory-candidates', base),
+  projectCandidatesIndex: (boardProjectId: string) =>
+    join(HOME, 'projects', boardProjectId, 'CANDIDATES.md'),
+  projectMemoryLock: (boardProjectId: string) =>
+    join(HOME, 'projects', boardProjectId, '.memory.lock'),
+  projectRunsDir: (boardProjectId: string) => join(HOME, 'projects', boardProjectId, 'runs'),
+  projectRunDir: (boardProjectId: string, runId: string) =>
+    join(HOME, 'projects', boardProjectId, 'runs', runId),
+  projectRunContextFile: (boardProjectId: string, runId: string) =>
+    join(HOME, 'projects', boardProjectId, 'runs', runId, 'context.json'),
+  workspaceRoot: join(HOME, 'workspace'),
+  workspaceProjectsDir: join(HOME, 'workspace', 'projects'),
+  workspaceProjectDir: (boardProjectId: string) => join(HOME, 'workspace', 'projects', boardProjectId),
+  reposDir: join(HOME, 'repos'),
   // Session search (L2): SQLite FTS5 DB per install (not per agent)
   sessionsDb: join(HOME, 'sessions.db'),
   // Taskboard (V5 selfhost): independent SQLite, same directory as sessions.db.

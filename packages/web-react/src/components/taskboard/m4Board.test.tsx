@@ -2,6 +2,50 @@ import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactElement } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+
+const scopeState = vi.hoisted(() => ({
+  kind: 'work' as 'work' | 'all' | 'ungrouped' | 'chat',
+}))
+
+vi.mock('../../hooks/useProjectScope', () => ({
+  useProjectScope: () => ({
+    scope: {
+      kind: scopeState.kind,
+      token:
+        scopeState.kind === 'work'
+          ? 'p1'
+          : scopeState.kind === 'ungrouped'
+            ? 'none'
+            : scopeState.kind === 'chat'
+              ? 'chat-unbound'
+              : 'all',
+      chatProject:
+        scopeState.kind === 'chat' ? { id: 'chat-unbound', name: 'test', boardProjectId: null } : null,
+      workProject: scopeState.kind === 'work' ? { id: 'p1', key: 'OCV5', name: '自用' } : null,
+      bound: scopeState.kind === 'work',
+      chatProjectIdForFilter: scopeState.kind === 'chat' ? 'chat-unbound' : undefined,
+      invalid: false,
+    },
+    token: scopeState.kind === 'work' ? 'p1' : 'all',
+    setToken: (t: string) => {
+      if (t === 'all') scopeState.kind = 'all'
+      else if (t === 'none') scopeState.kind = 'ungrouped'
+      else if (t === 'chat-unbound') scopeState.kind = 'chat'
+      else scopeState.kind = 'work'
+    },
+    workProjects: [{ id: 'p1', key: 'OCV5', name: '自用' }],
+    chatProjects: [{ id: 'chat-unbound', name: 'test', boardProjectId: null }],
+    selectOptions: [
+      { value: 'all', label: '全部项目' },
+      { value: 'none', label: '未归类' },
+      { value: 'p1', label: 'OCV5 自用' },
+      { value: 'chat-unbound', label: '会话组 · test' },
+    ],
+    loading: false,
+    refreshWorkProjects: async () => {},
+  }),
+}))
+import { api } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
 import {
   type CostTotals,
@@ -26,6 +70,7 @@ afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  scopeState.kind = 'work'
 })
 
 const auth = createMemoryAuthSession(() => {}, 'tok-m4')
@@ -80,6 +125,7 @@ function sampleTemplate(over: Partial<PipelineTemplate> = {}): PipelineTemplate 
         name: '复现确认',
         kind: 'ai',
         agentId: null,
+        model: null,
         promptTemplate: null,
         toolsets: null,
         effort: null,
@@ -114,6 +160,7 @@ function sampleStage(over: Partial<PipelineStage> = {}): PipelineStage {
     name: '复现确认',
     kind: 'human',
     agentId: null,
+    model: null,
     promptTemplate: null,
     toolsets: null,
     effort: null,
@@ -465,6 +512,7 @@ describe('阶段拖拽排序', () => {
     vi.spyOn(taskboardApi, 'listPipelines').mockResolvedValue([pipeline])
     vi.spyOn(taskboardApi, 'getPipeline').mockResolvedValue({ pipeline, stages: [s1, s2] })
     vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue([])
     const reorderStages = vi
       .spyOn(taskboardApi, 'reorderStages')
       .mockResolvedValue({ ok: true, items: [s2, s1] })
@@ -503,5 +551,98 @@ describe('阶段拖拽排序', () => {
     await waitFor(() => {
       expect(reorderStages).toHaveBeenCalled()
     })
+  })
+})
+
+describe('Taskboard/Cost/Weekly 范围不发全局请求', () => {
+  test('work 带 projectId；all/none/unbound chat 不请求并显示未绑定看板', async () => {
+    const getCost = vi.spyOn(taskboardApi, 'getCostStats').mockResolvedValue({
+      from: '2026-08-12',
+      to: '2026-08-18',
+      timeZone: 'Asia/Shanghai',
+      groupBy: 'day',
+      totals: sampleTotals(),
+      buckets: [],
+    })
+    const getWeekly = vi.spyOn(taskboardApi, 'getWeeklyReport').mockResolvedValue({
+      period: {
+        week: '2026-W34',
+        fromYmd: '2026-08-17',
+        toYmd: '2026-08-23',
+        fromMs: 1,
+        toMs: 2,
+        timeZone: 'Asia/Shanghai',
+      },
+      projectId: 'p1',
+      flow: {
+        created: 0,
+        completed: 0,
+        canceled: 0,
+        waitingHuman: 0,
+        blockedNow: 0,
+        statusTransitions: [],
+      },
+      stages: [],
+      cost: sampleTotals(),
+      blocked: [],
+      failedRuns: [],
+    })
+    const listTickets = vi.spyOn(taskboardApi, 'listTickets').mockResolvedValue({ items: [], total: 0 })
+    vi.spyOn(taskboardApi, 'listProjects').mockResolvedValue([sampleProject()])
+    vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([])
+    vi.spyOn(taskboardApi, 'getProjectBoard').mockResolvedValue({
+      project: sampleProject(),
+      pipeline: {
+        id: 'pipe1',
+        projectId: 'p1',
+        name: '问题单默认线',
+        ticketType: 'bug',
+        isDefault: true,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      ticketType: 'bug',
+      columns: [],
+      inbox: [],
+      backlog: { tickets: [] },
+    })
+
+    scopeState.kind = 'work'
+    wrap(<CostStatsView auth={auth} projectId="p1" projects={[sampleProject()]} />)
+    await waitFor(() => {
+      expect(getCost).toHaveBeenCalledWith(auth, expect.objectContaining({ projectId: 'p1' }))
+    })
+    expect(getCost.mock.calls.some((c) => !c[1] || c[1].projectId === undefined)).toBe(false)
+
+    cleanup()
+    getCost.mockClear()
+    scopeState.kind = 'all'
+    wrap(<CostStatsView auth={auth} projectId={null} projects={[sampleProject()]} />)
+    expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
+    expect(getCost).not.toHaveBeenCalled()
+
+    cleanup()
+    scopeState.kind = 'ungrouped'
+    wrap(<WeeklyReportView auth={auth} projectId={null} projects={[]} />)
+    expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
+    expect(getWeekly).not.toHaveBeenCalled()
+
+    cleanup()
+    listTickets.mockClear()
+    scopeState.kind = 'chat'
+    wrap(
+      <TaskboardView
+        auth={auth}
+        view="board"
+        ticketId={null}
+        onViewChange={() => {}}
+        onOpenTicket={() => {}}
+        onOpenMobileNav={() => {}}
+      />,
+    )
+    expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
+    expect(listTickets).not.toHaveBeenCalled()
+    const workSelect = screen.getByTestId('project-scope-select-work')
+    expect(workSelect).toBeInTheDocument()
   })
 })

@@ -13,7 +13,9 @@ import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import { query } from '../db/queries.js'
 import { ensureRequestId, REQUEST_ID_HEADER, setSecurityHeaders } from './util.js'
 
-export const GROK_RELAY_PREFIX = '/internal/v5/grok-relay'
+import { GROK_RELAY_PREFIX } from '@openclaude/protocol'
+
+export { GROK_RELAY_PREFIX }
 export const GROK_OFFICIAL_UPSTREAM_BASE_URL = 'https://cli-chat-proxy.grok.com/v1'
 const TOKEN_RE = /^[0-9a-f]{64}$/
 const ALLOWED = new Set([

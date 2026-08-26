@@ -2,7 +2,10 @@ import { describe, expect, test } from "vitest";
 import { detectShellFileWrites, normalizeToolForDisplay } from "./format";
 import { detectOcCli, isMemoryFilePath, parseMcpName, resolveToolMeta, toolSummary } from "./meta";
 // 跨包取 openclaude-memory 工具名单一权威表(与 index.ts TOOLS 声明同源),做锁步断言。
-import { MEMORY_MCP_TOOL_NAMES, MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES } from "../../../../mcp-memory/src/toolNames";
+import {
+  MEMORY_MCP_TOOL_NAMES,
+  MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES,
+} from "../../../../mcp-memory/src/toolNames";
 
 describe("parseMcpName (P5)", () => {
   test("mcp__server__op → { server, op }", () => {
@@ -93,7 +96,9 @@ describe("toolSummary 摘要 (P5)", () => {
     ).toBe("1/3");
   });
   test("MCP browser_navigate 摘要为 URL", () => {
-    expect(toolSummary("mcp__browser__browser_navigate", { url: "https://x.com" })).toBe("https://x.com");
+    expect(toolSummary("mcp__browser__browser_navigate", { url: "https://x.com" })).toBe(
+      "https://x.com",
+    );
   });
   test("MCP memory delegate_task 摘要带目标 agent", () => {
     expect(
@@ -102,7 +107,10 @@ describe("toolSummary 摘要 (P5)", () => {
   });
   test("delegate_task 委派系统 agent(hidden-reviewer)显示映射名而非裸 id", () => {
     expect(
-      toolSummary("mcp__openclaude-memory__delegate_task", { agentId: "hidden-reviewer", goal: "审查代码" }),
+      toolSummary("mcp__openclaude-memory__delegate_task", {
+        agentId: "hidden-reviewer",
+        goal: "审查代码",
+      }),
     ).toBe("→ 质量审查员 审查代码");
     expect(toolSummary("delegate_task", { agentId: "hidden-reviewer", goal: "审查代码" })).toBe(
       "→ 质量审查员 审查代码",
@@ -116,17 +124,21 @@ describe("toolSummary 摘要 (P5)", () => {
         tasks: [{ agentId: "coding-assistant", goal: "写代码" }, { goal: "查资料" }],
       }),
     ).toBe("2 个并行子任务: 写代码");
-    expect(toolSummary("delegate_tasks", { tasks: [{ goal: "只有一个" }] })).toBe("1 个并行子任务: 只有一个");
+    expect(toolSummary("delegate_tasks", { tasks: [{ goal: "只有一个" }] })).toBe(
+      "1 个并行子任务: 只有一个",
+    );
     // 防御非数组 tasks。
-    expect(toolSummary("mcp__openclaude-memory__delegate_tasks", { tasks: "oops" })).toBe("0 个并行子任务");
+    expect(toolSummary("mcp__openclaude-memory__delegate_tasks", { tasks: "oops" })).toBe(
+      "0 个并行子任务",
+    );
   });
   test("MCP memory skill_search / web-context 摘要", () => {
-    expect(toolSummary("mcp__openclaude-memory__skill_search", { query: "literature-search" })).toBe(
-      "literature-search",
-    );
-    expect(toolSummary("mcp__web-context__web_context_parse_file", { file_path: "/a/b/c.docx" })).toBe(
-      "…/a/b/c.docx",
-    );
+    expect(
+      toolSummary("mcp__openclaude-memory__skill_search", { query: "literature-search" }),
+    ).toBe("literature-search");
+    expect(
+      toolSummary("mcp__web-context__web_context_parse_file", { file_path: "/a/b/c.docx" }),
+    ).toBe("…/a/b/c.docx");
   });
   test("Codex 简单 item 摘要", () => {
     expect(toolSummary("codex:imageView", { path: "/tmp/a/b.png" })).toBe("…/tmp/a/b.png");
@@ -189,15 +201,21 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
       }),
     ).toBe("woshipm.com");
     expect(toolSummary("Bash", { command: "which oc-web 2>/dev/null && oc-web --help" })).toBe("");
-    expect(toolSummary("Bash", { command: "oc-vision understand /home/agent/img.png --prompt 'x'" })).toBe("");
+    expect(
+      toolSummary("Bash", { command: "oc-vision understand /home/agent/img.png --prompt 'x'" }),
+    ).toBe("");
     expect(toolSummary("Bash", { command: "mmx image generate 'a cat' -o /out.png" })).toBe("");
   });
   test("oc-task Bash 卡不落成通用终端", () => {
     expect(detectOcCli("oc-task ticket get OCV5-1")).toBe("oc-task");
-    expect(resolveToolMeta("Bash", { command: "oc-task ticket get OCV5-1" }).label).toBe("任务单据");
+    expect(resolveToolMeta("Bash", { command: "oc-task ticket get OCV5-1" }).label).toBe(
+      "任务单据",
+    );
     expect(resolveToolMeta("mcp__openclaude-memory__task_create").label).toBe("创建任务单");
     expect(resolveToolMeta("mcp__openclaude-memory__task_get").label).toBe("查看任务单");
-    expect(toolSummary("mcp__openclaude-memory__task_create", { title: "登录 500" })).toBe("登录 500");
+    expect(toolSummary("mcp__openclaude-memory__task_create", { title: "登录 500" })).toBe(
+      "登录 500",
+    );
   });
 
   test("oc-memory delegate 标成委派，不叫记忆", () => {
@@ -205,28 +223,44 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
       "委派子任务",
     );
     expect(toolSummary("Bash", { command: "oc-memory delegate --goal '修卡片'" })).toBe("修卡片");
-    expect(resolveToolMeta("Bash", { command: "oc-memory core-search 记忆" }).label).toBe("记忆检索");
-    expect(resolveToolMeta("Bash", { command: "oc-memory request-review --draft '草稿'" }).label).toBe(
-      "质量审查",
+    expect(resolveToolMeta("Bash", { command: "oc-memory core-search 记忆" }).label).toBe(
+      "记忆检索",
     );
+    expect(
+      resolveToolMeta("Bash", { command: "oc-memory request-review --draft '草稿'" }).label,
+    ).toBe("质量审查");
+  });
+
+  test("oc-memory delegate 摘要不把 CLI flag 当副标题", () => {
+    expect(toolSummary("Bash", { command: "oc-memory delegate --help" })).toBe("");
+    expect(toolSummary("Bash", { command: "oc-memory delegate --goal" })).toBe("");
+    expect(
+      toolSummary("Bash", { command: 'oc-memory delegate --agent-id main --goal "修卡片"' }),
+    ).toBe("修卡片");
+    expect(toolSummary("Bash", { command: "oc-memory request-review --draft --verbose" })).toBe("");
+    expect(toolSummary("Bash", { command: "oc-market search --help" })).toBe("");
+    expect(toolSummary("Bash", { command: "oc-plugin call --help" })).toBe("");
   });
 
   test("oc-browser / oc-market 根据动作提供友好标签和摘要", () => {
-    expect(resolveToolMeta("Bash", { command: "oc-browser open https://example.com/a" }).label).toBe(
-      "打开网页",
-    );
+    expect(
+      resolveToolMeta("Bash", { command: "oc-browser open https://example.com/a" }).label,
+    ).toBe("打开网页");
     expect(toolSummary("Bash", { command: "oc-browser open https://example.com/a" })).toBe(
       "example.com",
     );
     expect(resolveToolMeta("Bash", { command: "oc-browser click e12" }).label).toBe("点击页面");
     expect(toolSummary("Bash", { command: "oc-browser click e12" })).toBe("元素 e12");
-    expect(resolveToolMeta("Bash", { command: "oc-market search image" }).label).toBe("搜索 AI 市场");
+    expect(resolveToolMeta("Bash", { command: "oc-market search image" }).label).toBe(
+      "搜索 AI 市场",
+    );
     expect(toolSummary("Bash", { command: "oc-market search image" })).toBe("image");
   });
 });
 
 describe("Bash heredoc 写文件语义卡", () => {
-  const writeOne = "mkdir -p packages/web-react/src && cat > packages/web-react/src/demo.ts <<'EOF'\nexport const x = 1;\nEOF";
+  const writeOne =
+    "mkdir -p packages/web-react/src && cat > packages/web-react/src/demo.ts <<'EOF'\nexport const x = 1;\nEOF";
   const writeTwo = "cat <<'EOF' > a.ts\none\nEOF\ncat > b.ts <<EOF\ntwo\nEOF";
 
   test("detectShellFileWrites 识别 mkdir -p + cat heredoc 纯写文件", () => {
@@ -424,15 +458,16 @@ describe("subAgentActivity meta + 存量孤儿归一化", () => {
   });
 
   test("unknown + 非 codex item 输出 → 保持 unknown 不误归一", () => {
-    expect(normalizeToolForDisplay({ toolName: "unknown", inputJson: {}, output: "plain text" }).name).toBe(
-      "unknown",
-    );
-    expect(normalizeToolForDisplay({ toolName: "unknown", inputJson: {}, output: '{"ok":true}' }).name).toBe(
-      "unknown",
-    );
+    expect(
+      normalizeToolForDisplay({ toolName: "unknown", inputJson: {}, output: "plain text" }).name,
+    ).toBe("unknown");
+    expect(
+      normalizeToolForDisplay({ toolName: "unknown", inputJson: {}, output: '{"ok":true}' }).name,
+    ).toBe("unknown");
     // 畸形 type(非标识符)不归一。
     expect(
-      normalizeToolForDisplay({ toolName: "unknown", inputJson: {}, output: '{"type":"<script>"}' }).name,
+      normalizeToolForDisplay({ toolName: "unknown", inputJson: {}, output: '{"type":"<script>"}' })
+        .name,
     ).toBe("unknown");
   });
 
@@ -478,7 +513,9 @@ describe("子任务摘要不回退到 prompt", () => {
         prompt: "FULL_INTERNAL_PROMPT",
       }),
     ).toBe("→ coder");
-    expect(toolSummary("delegate_task", { agentId: "coder", goal: "修显示层" })).toBe("→ coder 修显示层");
+    expect(toolSummary("delegate_task", { agentId: "coder", goal: "修显示层" })).toBe(
+      "→ coder 修显示层",
+    );
   });
 });
 

@@ -20,6 +20,7 @@ import { encrypt, decrypt } from "../crypto/aead.js";
 import { loadKmsKey, zeroBuffer } from "../crypto/keys.js";
 import { writeAdminAuditBestEffort as audit } from "./audit.js";
 import { maskEgressProxy } from "./accounts.js";
+import { SUPPORTED_PROXY_REGIONS, isSupportedProxyRegion } from "../account-pool/persona.js";
 
 export type EgressProxyStatus = "active" | "disabled";
 const STATUSES: readonly EgressProxyStatus[] = ["active", "disabled"];
@@ -29,6 +30,11 @@ export interface EgressProxyRow {
   label: string;
   status: EgressProxyStatus;
   notes: string | null;
+  /**
+   * 反封 #1 — 出口住宅代理所在国家码(US/GB/CN/JP/DE)或 null。绑到 claude 账号时
+   * 驱动 persona 的 accept_language/timezone 与代理国一致(见 account-pool/persona.ts)。
+   */
+  region: string | null;
   /** 给 UI 显示用 — `http://user:****@host:port`,绝不返明文。 */
   url_masked: string | null;
   created_at: Date;
@@ -40,6 +46,7 @@ interface RawRow {
   label: string;
   status: EgressProxyStatus;
   notes: string | null;
+  region: string | null;
   url_enc: Buffer;
   url_nonce: Buffer;
   created_at: Date;
@@ -60,6 +67,7 @@ function rowToView(r: RawRow, keyFn: () => Buffer): EgressProxyRow {
     label: r.label,
     status: r.status,
     notes: r.notes,
+    region: r.region ?? null,
     url_masked: masked,
     created_at: r.created_at,
     updated_at: r.updated_at,
@@ -81,9 +89,19 @@ function snapshotForAudit(r: EgressProxyRow): Record<string, unknown> {
     label: r.label,
     status: r.status,
     notes: r.notes,
+    region: r.region,
     // url_masked 已脱敏过,可入 audit;明文/密文 绝不入 audit。
     url_masked: r.url_masked,
   };
+}
+
+function validateRegion(region: unknown): asserts region is string | null {
+  if (region === null) return;
+  if (!isSupportedProxyRegion(region)) {
+    throw new RangeError(
+      `invalid_region (allowed: ${SUPPORTED_PROXY_REGIONS.join(",")} or null)`,
+    );
+  }
 }
 
 // ─── 校验 ───────────────────────────────────────────────────────────
@@ -136,7 +154,7 @@ export async function listEgressProxies(
   }
   params.push(limit, offset);
   const r = await query<RawRow>(
-    `SELECT id::text AS id, label, status, notes, url_enc, url_nonce,
+    `SELECT id::text AS id, label, status, notes, region, url_enc, url_nonce,
             created_at, updated_at
      FROM egress_proxies
      ${where}
@@ -149,12 +167,26 @@ export async function listEgressProxies(
 
 export async function getEgressProxy(id: bigint | string): Promise<EgressProxyRow | null> {
   const r = await query<RawRow>(
-    `SELECT id::text AS id, label, status, notes, url_enc, url_nonce,
+    `SELECT id::text AS id, label, status, notes, region, url_enc, url_nonce,
             created_at, updated_at
      FROM egress_proxies WHERE id = $1`,
     [String(id)],
   );
   return r.rows[0] ? rowToView(r.rows[0], loadKmsKey) : null;
+}
+
+/**
+ * 反封 #1 — 读某代理的地域码(建号时驱动 persona)。轻量:不解密 URL。
+ * 代理不存在 → null;region 未设 → null。
+ */
+export async function getEgressProxyRegion(
+  id: bigint | string,
+): Promise<string | null> {
+  const r = await query<{ region: string | null }>(
+    `SELECT region FROM egress_proxies WHERE id = $1`,
+    [String(id)],
+  );
+  return r.rows[0]?.region ?? null;
 }
 
 /**
@@ -185,6 +217,8 @@ export interface CreateEgressProxyInput {
   url: string;
   status?: EgressProxyStatus;
   notes?: string | null;
+  /** 反封 #1 — 代理所在国家码(US/GB/CN/JP/DE)或 null(不绑地域)。 */
+  region?: string | null;
 }
 
 export class EgressProxyLabelTakenError extends Error {
@@ -203,9 +237,11 @@ export async function createEgressProxy(
   validateUrl(input.url);
   if (input.status !== undefined) validateStatus(input.status);
   if (input.notes !== undefined) validateNotes(input.notes);
+  if (input.region !== undefined) validateRegion(input.region);
 
   const status: EgressProxyStatus = input.status ?? "active";
   const notes = input.notes ?? null;
+  const region = input.region ?? null;
 
   const key = loadKmsKey();
   let enc;
@@ -214,11 +250,11 @@ export async function createEgressProxy(
   let row: RawRow;
   try {
     const r = await query<RawRow>(
-      `INSERT INTO egress_proxies (label, url_enc, url_nonce, status, notes)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id::text AS id, label, status, notes, url_enc, url_nonce,
+      `INSERT INTO egress_proxies (label, url_enc, url_nonce, status, notes, region)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id::text AS id, label, status, notes, region, url_enc, url_nonce,
                  created_at, updated_at`,
-      [input.label.trim(), enc.ciphertext, enc.nonce, status, notes],
+      [input.label.trim(), enc.ciphertext, enc.nonce, status, notes, region],
     );
     row = r.rows[0]!;
   } catch (err) {
@@ -241,6 +277,8 @@ export interface PatchEgressProxyInput {
   url?: string;
   status?: EgressProxyStatus;
   notes?: string | null;
+  /** 反封 #1 — 代理地域码(US/GB/CN/JP/DE)或 null。 */
+  region?: string | null;
 }
 
 export class EgressProxyNotFoundError extends Error {
@@ -260,6 +298,7 @@ export async function patchEgressProxy(
   if (patch.url !== undefined) validateUrl(patch.url);
   if (patch.status !== undefined) validateStatus(patch.status);
   if (patch.notes !== undefined) validateNotes(patch.notes);
+  if (patch.region !== undefined) validateRegion(patch.region);
 
   const before = await getEgressProxy(id);
   if (!before) throw new EgressProxyNotFoundError(String(id));
@@ -288,6 +327,10 @@ export async function patchEgressProxy(
     params.push(patch.notes);
     sets.push(`notes = $${params.length}`);
   }
+  if (patch.region !== undefined) {
+    params.push(patch.region);
+    sets.push(`region = $${params.length}`);
+  }
 
   if (sets.length === 0) return before; // no-op patch
   sets.push(`updated_at = NOW()`);
@@ -298,7 +341,7 @@ export async function patchEgressProxy(
     const r = await query<RawRow>(
       `UPDATE egress_proxies SET ${sets.join(", ")}
        WHERE id = $${params.length}
-       RETURNING id::text AS id, label, status, notes, url_enc, url_nonce,
+       RETURNING id::text AS id, label, status, notes, region, url_enc, url_nonce,
                  created_at, updated_at`,
       params,
     );

@@ -61,10 +61,16 @@ import { isWechatSessionId, type WechatSessionId } from "./types.js"
 import { MASTER_USER_PREFIX } from "./userIds.js"
 
 /** 容器侧 inbound handler 路径(master POST → 容器 18789 内 gateway 接)。 */
-export const WECHAT_INBOUND_CONTAINER_PATH = "/internal/v3/wechat-inbound"
+import {
+  WECHAT_INBOUND_CONTAINER_PATH,
+  WECHAT_STOP_CONTAINER_PATH,
+  WECHAT_INBOUND_COMPENSATE_PATH,
+} from "@openclaude/protocol"
+
+export { WECHAT_INBOUND_CONTAINER_PATH }
 
 /** 容器侧 WeChat stop handler 路径(master POST → 容器内 interrupt)。 */
-export const WECHAT_STOP_CONTAINER_PATH = "/internal/v3/wechat-stop"
+export { WECHAT_STOP_CONTAINER_PATH }
 
 /**
  * 容器侧 inbound 补偿(回滚)路径;handler 必须 idempotent + always-200。
@@ -75,7 +81,7 @@ export const WECHAT_STOP_CONTAINER_PATH = "/internal/v3/wechat-stop"
  * 期间,真实路径会因 gateway 404 而记 `step2_failed.compensation="failed"`。Reconcile 循环
  * (slice 4c)+ grace 期兜底,不会留永久孤儿;仅观测信号会临时弱化。
  */
-export const WECHAT_INBOUND_COMPENSATE_PATH = "/internal/v3/wechat-inbound-compensate"
+export { WECHAT_INBOUND_COMPENSATE_PATH }
 
 /** Step 1 默认 HTTP 超时(S2 实测:keep-alive 热连 ~200-300ms,5s 足够覆盖网络抖动)。 */
 const DEFAULT_STEP1_TIMEOUT_MS = 5_000

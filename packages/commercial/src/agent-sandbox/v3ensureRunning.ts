@@ -31,6 +31,7 @@
  * MVP 单库 < 2^53 个用户(实际 ≪ 1k),Number(uid) 不会丢精度;但仍然显式 guard。
  */
 
+import { RUNTIME_RECYCLE_DRAIN_PATH } from "@openclaude/protocol";
 import { ContainerUnreadyError } from "../ws/userChatBridge.js";
 import { SupervisorError, type SupervisorErrorCode } from "./types.js";
 import {
@@ -283,7 +284,7 @@ export async function requestRuntimeRecycleDrain(
     const req = httpRequest({
       host: status.boundIp,
       port: status.port,
-      path: "/internal/v3/runtime-recycle-drain",
+      path: RUNTIME_RECYCLE_DRAIN_PATH,
       method: "POST",
       headers: {
         "x-openclaude-container-id": String(status.containerId),

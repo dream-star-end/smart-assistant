@@ -58,6 +58,8 @@ export function AccountFormModal({
   const [egressId, setEgressId] = useState("");
   const [saving, setSaving] = useState(false);
   const [providerCreate, setProviderCreate] = useState<"claude" | "codex" | "grok" | "cursor">("claude");
+  const [cursorSandEnabled, setCursorSandEnabled] = useState(false);
+  const [cursorQuotaClass, setCursorQuotaClass] = useState<"unknown" | "other_ok" | "cursor_only">("unknown");
 
   // OAuth 向导(create)。
   const [oauthState, setOauthState] = useState<string | null>(null);
@@ -89,6 +91,8 @@ export function AccountFormModal({
     setSubEnd(account?.subscription_end_at ?? "");
     setGroupId(prefillGroup);
     setEgressId(prefillEgress);
+    setCursorSandEnabled(account?.cursor_sand_enabled === true);
+    setCursorQuotaClass((account?.cursor_quota_class as "unknown" | "other_ok" | "cursor_only") || "unknown");
     setOauthState(null);
     setOauthCode("");
     setStep2(false);
@@ -243,6 +247,8 @@ export function AccountFormModal({
       void adminSend("DELETE", `/accounts/grok-device/${encodeURIComponent(grokSessionId)}`).catch(() => {});
     }
     setProviderCreate(next);
+    setCursorSandEnabled(false);
+    setCursorQuotaClass("unknown");
     setGroupId("");
     setToken("");
     setRefresh("");
@@ -323,7 +329,15 @@ export function AccountFormModal({
       }
       if (subEnd.trim()) body.subscription_end_at = isNull(subEnd) ? null : subEnd.trim();
       if (groupId) body.group_id = groupId;
+      if (provider === "cursor") {
+        body.cursor_sand_enabled = cursorSandEnabled;
+        body.cursor_quota_class = cursorQuotaClass;
+      }
     } else {
+      if (provider === "cursor") {
+        body.cursor_sand_enabled = cursorSandEnabled;
+        body.cursor_quota_class = cursorQuotaClass;
+      }
       body.status = statusEdit;
       if (token.trim()) body.oauth_token = token.trim();
       if (refresh.trim()) body.oauth_refresh_token = isNull(refresh) ? null : refresh.trim();
@@ -355,7 +369,7 @@ export function AccountFormModal({
   }, [
     label, plan, isCreate, token, egressId, provider, refresh, expires, subEnd, groupId,
     grokPrincipalType, grokPrincipalId,
-    statusEdit, prefillEgress, prefillGroup, account, onOpenChange, onSaved, toast,
+    statusEdit, prefillEgress, prefillGroup, account, cursorSandEnabled, cursorQuotaClass, onOpenChange, onSaved, toast,
   ]);
 
   const defaultGroupLabel = isCreate ? `— 默认 ${provider} 官方订阅组 —` : "— 未绑定 —";
@@ -499,6 +513,41 @@ export function AccountFormModal({
                 </p>
               )}
             </div>
+          )}
+
+          {provider === "cursor" && (
+            <div className="flex items-center justify-between rounded-lg border border-border bg-subtle p-3">
+              <div className="flex flex-col">
+                <span className="text-[13px] font-medium text-fg">启用 Sand 客户端模式</span>
+                <span className="text-[11px] text-muted">
+                  Opus 5 / Opus 4.8 / Fable 5 等高级模型携带 Sand 客户端请求头 (x-cursor-client-type: sand)；Grok 4.6 / Composer 2.5 保持原生 CLI 模式
+                </span>
+              </div>
+              <label className="relative inline-flex cursor-pointer items-center">
+                <input
+                  type="checkbox"
+                  checked={cursorSandEnabled}
+                  onChange={(e) => setCursorSandEnabled(e.target.checked)}
+                  className="size-4 rounded border-border text-accent focus:ring-accent"
+                />
+              </label>
+            </div>
+          )}
+
+          {provider === "cursor" && (
+            <Field
+              label="Cursor 配额分类 (Quota Class)"
+              hint="两池调度控制：cursor_only 会跳过 Opus 等高级模型；手动切为「未观察」或「全部可用」可直接放开调度限制。"
+            >
+              <Select
+                value={cursorQuotaClass}
+                onChange={(e) => setCursorQuotaClass(e.target.value as "unknown" | "other_ok" | "cursor_only")}
+              >
+                <option value="unknown">未观察 (unknown - 允许全模型调度)</option>
+                <option value="other_ok">全部可用 (other_ok - 已验证全模型可用)</option>
+                <option value="cursor_only">仅 Cursor Models (cursor_only - 跳过 Opus/GPT-5.6)</option>
+              </Select>
+            </Field>
           )}
 
           <Field label="label(账号标签,必填)">

@@ -1,7 +1,9 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
-import type { ChatMessage } from "../lib/chat/model";
+import { createSession, type ChatMessage } from "../lib/chat/model";
+import type { OutboundMessageWire } from "../lib/chat/frames";
+import { applyOutboundMessage } from "../lib/chat/reducer";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS } from "./MessageRenderer";
@@ -337,6 +339,46 @@ describe("tool / agent-group 集成", () => {
     expect(screen.getByText("完成")).toBeInTheDocument();
   });
 
+  test("oc-* 成功日志前缀不标未成功；信封 exitCode 非 0 才未成功", () => {
+    renderMsg(
+      mk("tool", {
+        toolName: "Bash",
+        inputJson: { command: "true" },
+        output: JSON.stringify({
+          success: {
+            command: "true",
+            exitCode: 0,
+            stdout: "",
+            stderr: "oc-cursor: using Cursor credential slot 2/3",
+          },
+          isBackground: false,
+        }),
+        _completed: true,
+      }),
+    );
+    expect(screen.getByText("完成")).toBeInTheDocument();
+    expect(screen.queryByText("未成功")).not.toBeInTheDocument();
+    cleanup();
+    renderMsg(
+      mk("tool", {
+        toolName: "Bash",
+        inputJson: { command: "oc-memory delegate --help" },
+        output: JSON.stringify({
+          success: {
+            command: "oc-memory delegate --help",
+            exitCode: 1,
+            stdout: "",
+            stderr: 'oc-memory: delegate requires --goal "<text>"',
+          },
+          isBackground: false,
+        }),
+        _completed: true,
+      }),
+    );
+    expect(screen.getByText("未成功")).toBeInTheDocument();
+    expect(screen.queryByText("完成")).not.toBeInTheDocument();
+  });
+
   test("历史持久化的微博 confirmation_required Bash 工具行恢复为可操作确认卡", async () => {
     const confirmationId = "315bfd38-7d9f-4a69-8e74-6d34e52aad50";
     const message = mk("tool", {
@@ -497,6 +539,39 @@ describe("tool / agent-group 集成", () => {
     expect(screen.getByText("终端")).toBeInTheDocument();
   });
 
+  test("delegate-progress 跳过 start/done 控制行，过滤后为空则不渲染 entries 列表", () => {
+    renderMsg(
+      mk("delegate-progress", {
+        _completed: false,
+        entries: [
+          { phase: "start", text: "开始委派 main: true", ts: 1 },
+          { phase: "done", text: "委派结束", ts: 2 },
+        ],
+      }),
+    );
+    expect(screen.queryByText(/开始委派/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/委派结束/)).not.toBeInTheDocument();
+    expect(screen.queryByText("[start]")).not.toBeInTheDocument();
+    expect(screen.queryByText("[done]")).not.toBeInTheDocument();
+    expect(screen.queryByRole("list")).not.toBeInTheDocument();
+  });
+
+  test("delegate-progress 仍展示 start/done 之间的进度行", () => {
+    renderMsg(
+      mk("delegate-progress", {
+        _completed: false,
+        entries: [
+          { phase: "start", text: "开始委派 main: true", ts: 1 },
+          { phase: "text", text: "正在写代码", ts: 2 },
+          { phase: "done", text: "委派结束", ts: 3 },
+        ],
+      }),
+    );
+    expect(screen.getByText("正在写代码")).toBeInTheDocument();
+    expect(screen.queryByText(/开始委派/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/委派结束/)).not.toBeInTheDocument();
+  });
+
   test("delegate-progress entries 按批挂载但可以看到从第一条到最后一条", () => {
     renderMsg(
       mk("delegate-progress", {
@@ -524,7 +599,8 @@ describe("permission 审批", () => {
   test("已允许（普通工具）→ 状态展示", () => {
     renderMsg(mk("permission", { toolName: "Bash", requestId: "r1", _resolved: true, _behavior: "allow" }));
     expect(screen.getByText("已允许")).toBeInTheDocument();
-    expect(screen.getByText("Bash")).toBeInTheDocument();
+    // F5:工具名走中文标签(Bash→终端),不再裸英文
+    expect(screen.getByText("终端")).toBeInTheDocument();
   });
 
   test("待审批普通工具 → 自动弹审批框，允许经 onRespondPermission 回送", () => {
@@ -2649,5 +2725,59 @@ describe("ResponseRating 只挂轮末条 assistant 正文(中间回复不出)", 
       true,
     );
     expect(screen.queryByText(RATING_PROMPT)).toBeNull();
+  });
+});
+
+describe("流式指针按 messageId 换行（A4）", () => {
+  function sess() {
+    return createSession({ id: "s1", agentId: "main" });
+  }
+  function msgFrame(over: Record<string, unknown>): OutboundMessageWire {
+    return {
+      type: "outbound.message",
+      sessionKey: "agent:main:webchat:dm:s1",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      blocks: [],
+      isFinal: false,
+      ...over,
+    } as unknown as OutboundMessageWire;
+  }
+
+  test("text/thinking 换 messageId 时开新行，不把后到段灌进旧气泡", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "卡片前", messageId: "srv-main-t1-s0" }] }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 2, blocks: [{ kind: "text", text: "卡片后", messageId: "srv-main-t1-s1" }] }),
+    );
+    expect(s.messages.filter((m) => m.role === "assistant").map((m) => [m.id, m.text])).toEqual([
+      ["srv-main-t1-s0", "卡片前"],
+      ["srv-main-t1-s1", "卡片后"],
+    ]);
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 3, blocks: [{ kind: "thinking", text: "先想", messageId: "srv-think-s0" }] }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 4, blocks: [{ kind: "thinking", text: "再想", messageId: "srv-think-s1" }] }),
+    );
+    expect(s.messages.filter((m) => m.role === "thinking").map((m) => [m.id, m.text])).toEqual([
+      ["srv-think-s0", "先想"],
+      ["srv-think-s1", "再想"],
+    ]);
+  });
+
+  test("text 缺省 messageId 时仍向当前流式指针追加", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "Hel" }] }));
+    applyOutboundMessage(s, msgFrame({ frameSeq: 2, blocks: [{ kind: "text", text: "lo" }] }));
+    const asst = s.messages.filter((m) => m.role === "assistant");
+    expect(asst).toHaveLength(1);
+    expect(asst[0].text).toBe("Hello");
   });
 });

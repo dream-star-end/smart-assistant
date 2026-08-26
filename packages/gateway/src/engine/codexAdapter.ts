@@ -316,6 +316,12 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     resumeKind: 'codex-thread',
     needsServerRequestId: true,
     historyMode: 'native-resume',
+    // codex 的审批面是 app-server approval 协议(native 语义)。
+    permissionModel: 'native',
+    emitsCallUsage: true,
+    emitsToolInputDeltas: true,
+    supportsNativeCompact: true,
+    multimodalInput: 'native',
   }
 
   private readonly kernel: CodexAppServerRunner
@@ -362,6 +368,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         config: opts.config,
         delegationDepth: opts.delegationDepth,
         sessionId: opts.sessionId,
+        projectId: opts.projectId,
+        runContext: opts.runContext,
         getRepoSnapshot: opts.getRepoSnapshot,
         hermeticNoTools: opts.hermeticNoTools,
         structuredOutputSchema: opts.structuredOutputSchema,
@@ -447,6 +455,12 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
 
   start(): Promise<void> {
     return this.kernel.start()
+  }
+
+  /** Session-open preheat = spawn + initialize the long-lived app-server
+   * (no thread/turn RPCs → zero upstream LLM calls / billing). */
+  preheat(): Promise<void> {
+    return this.kernel.preheat()
   }
 
   submitTurn(params: TurnParams): EngineTurnRun {
@@ -624,6 +638,10 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
 
   get pendingToolCalls(): number {
     return this._activeTurn?.parser.pendingToolCalls ?? 0
+  }
+
+  get waitingForUserInput(): boolean {
+    return this.kernel.waitingForUserInput
   }
 
   get isRunning(): boolean {

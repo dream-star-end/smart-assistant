@@ -293,7 +293,7 @@ function SkillViewInner({ v }: { v: SkillViewParse }) {
       </div>
       {v.body && (
         <details>
-          <summary className="cursor-pointer text-[11.5px] text-accent hover:underline">查看技能正文</summary>
+          <summary className="cursor-pointer rounded text-[11.5px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看技能正文</summary>
           <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
             {v.body}
           </pre>

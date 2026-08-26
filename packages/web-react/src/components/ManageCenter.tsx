@@ -8,7 +8,11 @@ import { MemoryPanel } from "./manage/MemoryPanel";
 import { OptimizationPanel } from "./manage/OptimizationPanel";
 import { SkillsPanel } from "./manage/SkillsPanel";
 import { ConnectorsTab } from "./settings/ConnectorsTab";
-import { Badge, Button, EmptyState, Modal, Tabs } from "./ui";
+import { Badge, Button, EmptyState, Modal, ProjectScopeSelect, Tabs } from "./ui";
+import { AgentProjectPreview } from "./manage/AgentProjectPreview";
+import { ProjectAssetsManagePanel } from "./manage/ProjectAssetsManagePanel";
+import { isWorkScope } from "../lib/projectScope";
+import { useProjectScope } from "../hooks/useProjectScope";
 
 export type { ManageTab };
 
@@ -65,6 +69,7 @@ export function ManageCenter({
   /** 未登录态 CTA：关闭本壳并把用户送到登录页。省略则空态只剩说明。 */
   onRequireLogin?: () => void;
 }) {
+  const { scope } = useProjectScope();
   const items = MANAGE_TABS.map((t) => ({
     value: t.id,
     featureId: t.featureId,
@@ -102,14 +107,19 @@ export function ManageCenter({
       // layout="grid"：6 个中文 tab 单行需 ~467px，390px 屏上容器只有 ~326px ——
       // 横滚形态下末尾两个 tab 在所有主流手机上默认不可见。宫格 3×2 让主导航整屏可见。
       toolbar={
-        <Tabs
-          aria-label="管理分区"
-          idBase="manage"
-          layout="grid"
-          value={tab}
-          onValueChange={(v) => onTabChange(v as ManageTab)}
-          items={items}
-        />
+        <div className="flex flex-col gap-2">
+          {tab === "memory" || tab === "skills" || tab === "cron" ? (
+            <ProjectScopeSelect className="w-full sm:w-56" />
+          ) : null}
+          <Tabs
+            aria-label="管理分区"
+            idBase="manage"
+            layout="grid"
+            value={tab}
+            onValueChange={(v) => onTabChange(v as ManageTab)}
+            items={items}
+          />
+        </div>
       }
       // 面板自带内距（PanelHeader px-4 + 正文 px-5），壳体不再叠一层。
       bodyClassName="p-0"
@@ -143,6 +153,12 @@ export function ManageCenter({
             {tab === "memory" && (
               <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.memory.id}>
                 <MemoryPanel auth={auth} agentId={agentId} agents={agents} />
+                {isWorkScope(scope) ? (
+                  <>
+                    <ProjectAssetsManagePanel auth={auth} />
+                    <AgentProjectPreview auth={auth} agentId={agentId} />
+                  </>
+                ) : null}
               </div>
             )}
             {tab === "skills" && (

@@ -125,6 +125,7 @@ export interface AccountRow {
   updated_at: Date;
   /** 0226 — Cursor two-pool class. Non-cursor rows stay unknown and are ignored. */
   cursor_quota_class: import("./cursorQuota.js").CursorQuotaClass;
+  cursor_sand_enabled: boolean;
 }
 
 /**
@@ -195,6 +196,7 @@ export interface CreateAccountInput {
   expires_at?: Date | null;
   oauth_principal_type?: string | null;
   oauth_principal_id?: string | null;
+  cursor_sand_enabled?: boolean;
   /**
    * 0064 — 订阅到期日(可选)。undefined / null = 不设置(列保持 NULL)。
    * 解析由 admin layer 完成,store 层只透传 Date | null。
@@ -218,6 +220,12 @@ export interface CreateAccountInput {
    * 类型拒绝(`invalid input syntax for type uuid`)— store 不二次校验。
    */
   account_uuid?: string | null;
+  /**
+   * 反封复盘 2026-08(#1)— 出口代理地域码(见 persona.ts REGION_ACCEPT_LANGUAGE)。
+   * admin layer 从绑定的 egress_proxies.region 读出后传入,驱动 persona 的
+   * accept_language / timezone 与代理国一致。undefined/null → persona 随机地域(旧行为)。
+   */
+  persona_region?: string | null;
   /** Optional group binding. Admin layer validates provider/kind compatibility. */
   group_id?: bigint | string | null;
   /**
@@ -275,6 +283,7 @@ export interface UpdateAccountPatch {
   /** Optional group binding. undefined = no change; null = unassign. */
   group_id?: bigint | string | null;
   cursor_quota_class?: import("./cursorQuota.js").CursorQuotaClass;
+  cursor_sand_enabled?: boolean;
 }
 
 export class AccountNotFoundError extends Error {
@@ -316,7 +325,8 @@ const META_COLUMNS = `
   runtime_channel,
   created_at,
   updated_at,
-  COALESCE(cursor_quota_class, 'unknown') AS cursor_quota_class
+  COALESCE(cursor_quota_class, 'unknown') AS cursor_quota_class,
+  COALESCE(cursor_sand_enabled, FALSE) AS cursor_sand_enabled
 `;
 
 interface RawMetaRow extends QueryResultRow {
@@ -348,6 +358,7 @@ interface RawMetaRow extends QueryResultRow {
   created_at: Date;
   updated_at: Date;
   cursor_quota_class: string;
+  cursor_sand_enabled: boolean;
 }
 
 interface RawSecretRow extends QueryResultRow {
@@ -416,6 +427,7 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     cursor_quota_class: (row.cursor_quota_class === "other_ok" || row.cursor_quota_class === "cursor_only")
       ? row.cursor_quota_class
       : "unknown",
+    cursor_sand_enabled: row.cursor_sand_enabled === true,
   };
 }
 
@@ -478,7 +490,9 @@ export async function createAccount(
     // 设为 NOT NULL,如果 INSERT 不传 persona 会被 DB 直接拒。生成阶段调
     // assertPersona() 自洽校验,失败抛 TypeError(generatePersona 当前实现永远
     // 返合法值,assert 是防御性兜底,捕未来 variants 池 refactor 悄默破坏 shape)。
-    const persona = generatePersona();
+    // 反封复盘 2026-08(#1):代理地域驱动 persona —— 传入 persona_region 让
+    // accept_language/timezone 与出口代理国一致(null → 随机地域,旧行为)。
+    const persona = generatePersona(undefined, input.persona_region ?? null);
     assertPersona(persona);
 
     const res = await query<RawMetaRow>(
@@ -492,9 +506,10 @@ export async function createAccount(
          account_uuid,
          persona,
          runtime_channel,
-         oauth_principal_type, oauth_principal_id
+         oauth_principal_type, oauth_principal_id,
+         cursor_sand_enabled
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13::jsonb, $14, $15, $16)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13::jsonb, $14, $15, $16, $17)
        RETURNING ${META_COLUMNS}`,
       [
         provider,
@@ -513,6 +528,7 @@ export async function createAccount(
         input.runtime_channel,
         input.oauth_principal_type ?? null,
         input.oauth_principal_id ?? null,
+        input.cursor_sand_enabled === true,
       ],
     );
     return parseMetaRow(res.rows[0]);
@@ -791,6 +807,12 @@ export async function updateAccount(
       throw new TypeError(`invalid cursor_quota_class: ${patch.cursor_quota_class}`);
     }
     push("cursor_quota_class", patch.cursor_quota_class);
+  }
+  if (patch.cursor_sand_enabled !== undefined) {
+    if (typeof patch.cursor_sand_enabled !== "boolean") {
+      throw new TypeError(`invalid cursor_sand_enabled: ${patch.cursor_sand_enabled}`);
+    }
+    push("cursor_sand_enabled", patch.cursor_sand_enabled);
   }
 
   if (patch.egress_proxy_id !== undefined) {

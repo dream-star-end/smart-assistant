@@ -244,6 +244,8 @@ export interface CodexAppServerRunnerOpts {
    *  legacy caller(测试或没 sessionManager 的代码路径)可不传,此时整个 repo 绑
    *  定能力关闭,行为退回 v1.0.0 老样:cwd 永远 = opts.cwd,REPO slot 不注入。 */
   sessionId?: string
+  projectId?: string
+  runContext?: import('../runContextPersist.js').RunContextDescriptor
   /** snapshot provider。由 SessionManager 注入(`this._getRepoSnapshot`),
    *  内部读 `_repoWorkspace.getRepoSnapshot(sessionId)`。返 null = 无绑定;
    *  返 ready = 已绑定可用;返 cloning/failed/pending = 不可用,运行时回退 opts.cwd。 */
@@ -1461,7 +1463,7 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   sendPermissionResponse(requestId: string, responseUnk: unknown): boolean {
-    const pending = this.takePendingUserInput(requestId)
+    const pending = this.pendingUserInputs.get(requestId)
     if (!pending) return false
 
     const response = asRecord(responseUnk)
@@ -1486,7 +1488,11 @@ export class CodexAppServerRunner extends EventEmitter {
     // vanished) is represented by the schema-valid empty answers map. Codex
     // app-server uses the same empty response after a client-side RPC error,
     // so the model receives an explicit no-answer result instead of hanging.
-    return this.writeRaw(jsonRpcResult(pending.rpcId, { answers: codexAnswers }))
+    const written = this.writeRaw(jsonRpcResult(pending.rpcId, { answers: codexAnswers }))
+    if (!written) return false
+    this.takePendingUserInput(requestId)
+    this.emitUserInputWaitStatus()
+    return true
   }
 
   private takePendingUserInput(requestId: string): PendingCodexUserInput | null {
@@ -1507,6 +1513,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.writeRaw(jsonRpcResult(pending.rpcId, { answers: {} }))
     }
     if (requestIds.length > 0) {
+      this.emitUserInputWaitStatus()
       log.info('codex requestUserInput settled without browser answer', {
         sessionKey: this.opts.sessionKey,
         turnId,
@@ -1523,8 +1530,18 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private clearPendingUserInputs(): void {
+    const hadPending = this.pendingUserInputs.size > 0
     this.pendingUserInputs.clear()
     this.pendingUserInputIdsByRpc.clear()
+    if (hadPending) this.emitUserInputWaitStatus()
+  }
+
+  get waitingForUserInput(): boolean {
+    return this.pendingUserInputs.size > 0
+  }
+
+  private emitUserInputWaitStatus(): void {
+    this.emitTurnStatus(this.pendingUserInputs.size > 0 ? 'waiting_for_user' : null)
   }
 
   async compactForHandoff(): Promise<NativeModelHandoffArtifact> {
@@ -1583,8 +1600,10 @@ export class CodexAppServerRunner extends EventEmitter {
       this.pendingRetryAbort.abort()
       return true
     }
-    if (!this.proc || this.proc.killed) return false
-    if (!this.threadId || !this.activeTurnId) return false
+    const hadPendingUserInput = this.pendingUserInputs.size > 0
+    if (hadPendingUserInput) this.settleAllPendingUserInputs('runner interrupt')
+    if (!this.proc || this.proc.killed) return hadPendingUserInput
+    if (!this.threadId || !this.activeTurnId) return hadPendingUserInput
     void this.sendRequest('turn/interrupt', {
       threadId: this.threadId,
       turnId: this.activeTurnId,
@@ -1668,6 +1687,9 @@ export class CodexAppServerRunner extends EventEmitter {
         // 让 codex 系统提示中带上仓库元信息(parity with SubprocessRunner)。
         repoSnapshot: repoSnap,
         sessionId: this.opts.sessionId,
+        projectId: this.opts.projectId,
+        runContext: this.opts.runContext,
+        cwd: this.opts.cwd,
       })
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
       // v3 hardening — see codexRunner.ts for rationale (token never in argv).
@@ -1929,14 +1951,51 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
+  /** Shared in-flight spawn+initialize. Without it, a second caller arriving
+   * while initialize is pending returned early and could proceed before the
+   * app-server finished the handshake (preheat + submit race). */
+  private _spawnPromise: Promise<void> | null = null
+
   private async ensureSpawned(
     repoSnap: RepoSnapshot | null,
     effectiveCwd: string,
   ): Promise<void> {
     if (this.proc && !this.proc.killed && this.initialized) return
+    const inflight = this._spawnPromise
+    if (inflight) return inflight
+    const spawned = this._ensureSpawnedInternal(repoSnap, effectiveCwd)
+    this._spawnPromise = spawned
+    try {
+      await spawned
+    } finally {
+      if (this._spawnPromise === spawned) this._spawnPromise = null
+    }
+  }
+
+  /** Session-open preheat: spawn + initialize the long-lived app-server so a
+   * cold first turn skips the 5-8s boot. Resolves repo snapshot/cwd through
+   * the SAME path as runTurn. Deliberately no thread/start / thread/resume /
+   * turn/start — zero upstream LLM calls, zero billing. */
+  async preheat(): Promise<void> {
+    const repoSnap = this._currentRepoSnapshot()
+    const effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
+    await this.ensureSpawned(repoSnap, effectiveCwd)
+  }
+
+  private async _ensureSpawnedInternal(
+    repoSnap: RepoSnapshot | null,
+    effectiveCwd: string,
+  ): Promise<void> {
+    if (this.proc && !this.proc.killed && this.initialized) return
     if (this.proc && !this.proc.killed && !this.initialized) {
-      // Spawn happened but initialize is in flight — caller will await.
-      return
+      // In-flight initialize is fully covered by the shared _spawnPromise, so
+      // reaching here means a previous initialize FAILED and left a live but
+      // never-initialized proc. It would poison every later ensureSpawned
+      // (this branch used to return "success"); tear it down and respawn.
+      log.warn('codex app-server alive but uninitialized — replacing process', {
+        sessionKey: this.opts.sessionKey,
+      })
+      await this.shutdown()
     }
     // Clear any partial-line residue from a prior proc (Codex review
     // #019dde20 BLOCKER round 3): stdoutBuf is runner-scoped, so without
@@ -2185,7 +2244,19 @@ export class CodexAppServerRunner extends EventEmitter {
     // are gated behind Codex's experimental API capability, so declare it
     // before any turn/start call. We call the proc fresh-spawned so writes
     // won't EPIPE.
-    await this.sendRequest('initialize', this.buildInitializeParams())
+    try {
+      await this.sendRequest('initialize', this.buildInitializeParams())
+    } catch (err) {
+      // A live but never-initialized app-server must not survive: later
+      // ensureSpawned calls would see proc-alive and (historically) skip the
+      // handshake. Tear it down before rethrowing so the next call respawns.
+      try {
+        await this.shutdown()
+      } catch {
+        /* teardown is best-effort on a failed handshake */
+      }
+      throw err
+    }
     this.initialized = true
   }
 
@@ -2461,6 +2532,7 @@ export class CodexAppServerRunner extends EventEmitter {
       questions: params.questions,
     })
     this.pendingUserInputIdsByRpc.set(rpcKey, requestId)
+    this.emitUserInputWaitStatus()
 
     // turn-retry 台账:permission / requestUserInput 请求是对外 emit 边界 → 置位。
     this.attemptHadToolOrPermission = true
@@ -4140,7 +4212,7 @@ export class CodexAppServerRunner extends EventEmitter {
     } satisfies RunnerMessage)
   }
 
-  private emitTurnStatus(status: 'compacting' | null): void {
+  private emitTurnStatus(status: 'compacting' | 'waiting_for_user' | null): void {
     this.emit('message', {
       type: 'system',
       subtype: 'status',

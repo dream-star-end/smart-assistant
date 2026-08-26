@@ -43,8 +43,12 @@ describe("researchToolCard 分派", () => {
   });
 
   test("env 前缀 / 绝对路径命令仍命中", () => {
-    expect(researchToolCard("FOO=1 oc-lit snowball 10.x", tool({ output: LIT_JSON }))).not.toBeNull();
-    expect(researchToolCard("/usr/local/bin/oc-lit search x", tool({ output: LIT_JSON }))).not.toBeNull();
+    expect(
+      researchToolCard("FOO=1 oc-lit snowball 10.x", tool({ output: LIT_JSON })),
+    ).not.toBeNull();
+    expect(
+      researchToolCard("/usr/local/bin/oc-lit search x", tool({ output: LIT_JSON })),
+    ).not.toBeNull();
   });
 
   test("非 oc 工具 → null(回落通用 Bash)", () => {
@@ -53,7 +57,10 @@ describe("researchToolCard 分派", () => {
   });
 
   test("出错的调用 → 通用错误正文(danger,外层状态由 ToolCard 统一承载)", () => {
-    const node = researchToolCard('oc-lit search "x"', tool({ output: "boom: quota exceeded", error: true }));
+    const node = researchToolCard(
+      'oc-lit search "x"',
+      tool({ output: "boom: quota exceeded", error: true }),
+    );
     expect(node).not.toBeNull();
     const { container } = render(<div>{node}</div>);
     expect(screen.getByText("boom: quota exceeded")).toHaveClass("text-danger");
@@ -85,7 +92,12 @@ describe("其余 oc-* 卡片", () => {
   test("oc-cite verify → 引用核验卡(已接地/未命中/撤稿)", () => {
     const out = JSON.stringify({
       verdicts: [
-        { identifier: "doi:10.x", resolved: true, retracted: false, gbt7714: "张三. 标题[J]. 2020." },
+        {
+          identifier: "doi:10.x",
+          resolved: true,
+          retracted: false,
+          gbt7714: "张三. 标题[J]. 2020.",
+        },
         { identifier: "doi:10.bad", resolved: false, retracted: null },
         { identifier: "doi:10.ret", resolved: true, retracted: true },
       ],
@@ -116,11 +128,24 @@ describe("其余 oc-* 卡片", () => {
         identifier: "doi:10.1093/nsr/nwx110",
         resolved: true,
         retracted: null,
-        record: { title: "Deep learning for NLP", authors: [{ name: "Hang Li" }], year: 2017, venue: "NSR", doi: "10.1093/nsr/nwx110" },
+        record: {
+          title: "Deep learning for NLP",
+          authors: [{ name: "Hang Li" }],
+          year: 2017,
+          venue: "NSR",
+          doi: "10.1093/nsr/nwx110",
+        },
         bibtex: "@article{li2017, title={Deep learning for NLP}}",
       },
     });
-    render(<div>{researchToolCard("oc-cite format 10.1093/nsr/nwx110 --style bibtex", tool({ output: out }))}</div>);
+    render(
+      <div>
+        {researchToolCard(
+          "oc-cite format 10.1093/nsr/nwx110 --style bibtex",
+          tool({ output: out }),
+        )}
+      </div>,
+    );
     expect(screen.getByText("引用格式化")).toBeInTheDocument();
     expect(screen.getByText("Deep learning for NLP")).toBeInTheDocument();
     expect(screen.getByText("已接地")).toBeInTheDocument();
@@ -136,7 +161,11 @@ describe("其余 oc-* 卡片", () => {
         coverage: { verifiedClaims: 1, totalClaims: 1 },
       },
     });
-    render(<div>{researchToolCard("oc-cite fix --manifest m.json --docs d", tool({ output: out }))}</div>);
+    render(
+      <div>
+        {researchToolCard("oc-cite fix --manifest m.json --docs d", tool({ output: out }))}
+      </div>,
+    );
     expect(screen.getByText("引用接地校验")).toBeInTheDocument();
     expect(screen.getByText("断言一")).toBeInTheDocument();
     expect(screen.getByText(/原文证据片段/)).toBeInTheDocument();
@@ -148,7 +177,9 @@ describe("其余 oc-* 卡片", () => {
       <div>
         {researchToolCard(
           "oc-ingest parse f.pdf",
-          tool({ output: JSON.stringify({ docId: "doc_abc", title: "论文", lang: "zh", spanCount: 42 }) }),
+          tool({
+            output: JSON.stringify({ docId: "doc_abc", title: "论文", lang: "zh", spanCount: 42 }),
+          }),
         )}
       </div>,
     );
@@ -167,15 +198,26 @@ describe("其余 oc-* 卡片", () => {
   });
 
   test("oc-litrag → 片段卡", () => {
-    const out = JSON.stringify({ quotes: [{ id: "q1", text: "关键原文片段", sourceId: "doc_x" }], missing: [] });
-    render(<div>{researchToolCard('oc-litrag query "问题" --docs doc_x', tool({ output: out }))}</div>);
+    const out = JSON.stringify({
+      quotes: [{ id: "q1", text: "关键原文片段", sourceId: "doc_x" }],
+      missing: [],
+    });
+    render(
+      <div>{researchToolCard('oc-litrag query "问题" --docs doc_x', tool({ output: out }))}</div>,
+    );
     expect(screen.getByText("原文片段定位")).toBeInTheDocument();
     expect(screen.getByText(/关键原文片段/)).toBeInTheDocument();
   });
 
   test("oc-report → 产物卡(参考文献数 + 红标 + 下载)", () => {
-    const out = JSON.stringify({ output: "/tmp/report.pdf", references: 12, warnings: ["第3段未接地"] });
-    render(<div>{researchToolCard("oc-report --schema s --manifest m", tool({ output: out }))}</div>);
+    const out = JSON.stringify({
+      output: "/tmp/report.pdf",
+      references: 12,
+      warnings: ["第3段未接地"],
+    });
+    render(
+      <div>{researchToolCard("oc-report --schema s --manifest m", tool({ output: out }))}</div>,
+    );
     expect(screen.getByText("报告已生成")).toBeInTheDocument();
     // 标题副标 + 下载卡都会显示文件名 → 至少出现一次(下载入口存在)。
     expect(screen.getAllByText("report.pdf").length).toBeGreaterThanOrEqual(1);
@@ -190,7 +232,9 @@ describe("其余 oc-* 卡片", () => {
       references: 3,
       warnings: [],
     });
-    render(<div>{researchToolCard("oc-report --schema s --manifest m", tool({ output: out }))}</div>);
+    render(
+      <div>{researchToolCard("oc-report --schema s --manifest m", tool({ output: out }))}</div>,
+    );
     expect(screen.getByText("引用接地详情")).toBeInTheDocument();
     expect(screen.getByText("接地 1/2")).toBeInTheDocument();
   });
@@ -200,28 +244,41 @@ describe("其余 oc-* 卡片", () => {
       output: "/tmp/report.pdf",
       manifestPath: "javascript:alert(1)//m.json",
     });
-    render(<div>{researchToolCard("oc-report --schema s --manifest m", tool({ output: out }))}</div>);
+    render(
+      <div>{researchToolCard("oc-report --schema s --manifest m", tool({ output: out }))}</div>,
+    );
     expect(screen.getByText("报告已生成")).toBeInTheDocument();
     expect(screen.queryByText("引用接地详情")).toBeNull();
   });
 
   test("oc-report 产物卡:拒绝恶意 output scheme(不产出可点 href)", () => {
     const out = JSON.stringify({ output: "javascript:alert(1)//.pdf" });
-    const { container } = render(<div>{researchToolCard("oc-report --schema s", tool({ output: out }))}</div>);
+    const { container } = render(
+      <div>{researchToolCard("oc-report --schema s", tool({ output: out }))}</div>,
+    );
     expect(screen.getByText("报告已生成")).toBeInTheDocument(); // 卡仍渲染
     expect(container.querySelector('a[href^="javascript:"]')).toBeNull(); // 无 javascript href
     expect(container.querySelector("a")).toBeNull(); // 不安全 src → 不渲染下载/预览链接
   });
 
   test("oc-rank → 排名卡(Elo)", () => {
-    const out = JSON.stringify({ ranked: [{ id: "方案A", rating: 1532.7, wins: 3, losses: 1, draws: 0 }] });
+    const out = JSON.stringify({
+      ranked: [{ id: "方案A", rating: 1532.7, wins: 3, losses: 1, draws: 0 }],
+    });
     render(<div>{researchToolCard("oc-rank elo --matches m.json", tool({ output: out }))}</div>);
     expect(screen.getByText("候选排名")).toBeInTheDocument();
     expect(screen.getByText("Elo 1533")).toBeInTheDocument();
   });
 
   test("oc-docx → 文档卡(从命令解析文件名,无需 JSON 输出;绝对路径 → 下载卡)", () => {
-    render(<div>{researchToolCard("oc-docx report.md -o /home/agent/x.docx", tool({ output: "[pandoc] ok" }))}</div>);
+    render(
+      <div>
+        {researchToolCard(
+          "oc-docx report.md -o /home/agent/x.docx",
+          tool({ output: "[pandoc] ok" }),
+        )}
+      </div>,
+    );
     expect(screen.getByText("Word 文档已生成")).toBeInTheDocument();
     // 标题副标 + 签名下载卡都显示文件名 → 至少出现一次(下载入口存在)。
     expect(screen.getAllByText("x.docx").length).toBeGreaterThanOrEqual(2);
@@ -242,7 +299,12 @@ describe("其余 oc-* 卡片", () => {
 
   test("oc-docx inspect/scrub → 分别显示结构检查与清理后的 DOCX 卡", () => {
     const { rerender } = render(
-      <div>{researchToolCard("oc-docx inspect /home/agent/x.docx", tool({ output: '{"zip_integrity_ok":true}' }))}</div>,
+      <div>
+        {researchToolCard(
+          "oc-docx inspect /home/agent/x.docx",
+          tool({ output: '{"zip_integrity_ok":true}' }),
+        )}
+      </div>,
     );
     expect(screen.getByText("Word 结构检查完成")).toBeInTheDocument();
 
@@ -278,7 +340,12 @@ describe("其余 oc-* 卡片", () => {
 
   test("oc-xlsx 相对路径 → 退回提示文案(无任何可点链接)", () => {
     const { container } = render(
-      <div>{researchToolCard("oc-xlsx build data.json -o 结果.xlsx", tool({ output: "[oc-xlsx] wrote 结果.xlsx" }))}</div>,
+      <div>
+        {researchToolCard(
+          "oc-xlsx build data.json -o 结果.xlsx",
+          tool({ output: "[oc-xlsx] wrote 结果.xlsx" }),
+        )}
+      </div>,
     );
     expect(screen.getByText("Excel 表格已生成")).toBeInTheDocument();
     expect(screen.getByText("结果.xlsx")).toBeInTheDocument(); // 副标仍显示文件名
@@ -288,7 +355,9 @@ describe("其余 oc-* 卡片", () => {
 
   test("oc-pdf 恶意 scheme 输出路径 → 不产生可点 href", () => {
     const { container } = render(
-      <div>{researchToolCard("oc-pdf x.qmd -o javascript:alert(1)//x.pdf", tool({ output: "ok" }))}</div>,
+      <div>
+        {researchToolCard("oc-pdf x.qmd -o javascript:alert(1)//x.pdf", tool({ output: "ok" }))}
+      </div>,
     );
     expect(screen.getByText("PDF 文档已生成")).toBeInTheDocument(); // 卡仍渲染
     expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
@@ -323,14 +392,21 @@ describe("其余 oc-* 卡片", () => {
     bad("oc-cite verify x", '{"verdicts":[null,{"identifier":"doi:1","resolved":true}]}');
     bad("oc-cite check m", '{"claims":[null,{"text":"c","status":"verified"}],"quotes":[null]}');
     bad("oc-rank elo m", '{"ranked":[null,{"id":"a","rating":1500}]}');
-    bad("oc-market search x", "[null, 7, {\"name\":\"X\",\"kind\":\"skill\"}]");
+    bad("oc-market search x", '[null, 7, {"name":"X","kind":"skill"}]');
     bad('oc-litrag query "q" --docs d', '{"quotes":[null,{"text":"片段"}],"missing":[]}');
     // 嵌套畸形:authors 非数组 / 元素是裸字符串。
     bad('oc-lit search "x"', '{"sources":[{"title":"a","authors":"坏数据"}]}');
     bad('oc-lit search "x"', '{"sources":[{"title":"b","authors":["张三",null,{"name":"李四"}]}]}');
     cleanup();
     // 过滤后仍能渲染有效项。
-    render(<div>{researchToolCard('oc-lit search "x"', tool({ output: '{"sources":[null,{"title":"真的"}]}' }))}</div>);
+    render(
+      <div>
+        {researchToolCard(
+          'oc-lit search "x"',
+          tool({ output: '{"sources":[null,{"title":"真的"}]}' }),
+        )}
+      </div>,
+    );
     expect(screen.getByText("真的")).toBeInTheDocument();
   });
 });
@@ -356,7 +432,7 @@ describe("渐进披露:截断输出仍渲染已加载条目", () => {
     const truncated =
       '{"sources":[{"id":"s1","title":"a } { tricky \\" brace"},{"id":"s2","title":"second"},{"id":"s3","tit';
     render(<div>{researchToolCard('oc-lit search "x"', tool({ output: truncated }))}</div>);
-    expect(screen.getByText("a } { tricky \" brace")).toBeInTheDocument();
+    expect(screen.getByText('a } { tricky " brace')).toBeInTheDocument();
     expect(screen.getByText("second")).toBeInTheDocument();
     expect(screen.getByText("已加载 2 篇")).toBeInTheDocument();
   });
@@ -387,7 +463,10 @@ describe("渐进披露:截断输出仍渲染已加载条目", () => {
 
 describe("兜底反转:oc-* 绝不泄漏原始命令", () => {
   test("未注册 body 的 oc-*(oc-web-context)→ 友好正文兜底,不裸露命令", () => {
-    const node = researchToolCard("oc-web-context extract https://x.com", tool({ output: "some helper output" }));
+    const node = researchToolCard(
+      "oc-web-context extract https://x.com",
+      tool({ output: "some helper output" }),
+    );
     expect(node).not.toBeNull();
     const { container } = render(<div>{node}</div>);
     expect(screen.getByText("some helper output")).toBeInTheDocument();
@@ -400,7 +479,12 @@ describe("兜底反转:oc-* 绝不泄漏原始命令", () => {
   });
 
   test("cd && oc-cite(分隔符后)也命中 → 非 null 卡", () => {
-    expect(researchToolCard("cd /tmp && oc-rank elo --matches m.json", tool({ output: '{"ranked":[]}' }))).not.toBeNull();
+    expect(
+      researchToolCard(
+        "cd /tmp && oc-rank elo --matches m.json",
+        tool({ output: '{"ranked":[]}' }),
+      ),
+    ).not.toBeNull();
   });
 });
 
@@ -444,7 +528,8 @@ describe("4 个新专属卡", () => {
           tool({
             error: true,
             output: JSON.stringify({
-              command: "export HOME=/home/agent OPENCLAUDE_SESSION_KEY=agent:main:x oc-memory delegate --goal x",
+              command:
+                "export HOME=/home/agent OPENCLAUDE_SESSION_KEY=agent:main:x oc-memory delegate --goal x",
               exitCode: 1,
               stderr: "oc-memory: delegate client timeout after 45s",
               stdout: "",
@@ -457,8 +542,111 @@ describe("4 个新专属卡", () => {
     );
     expect(container.textContent).toMatch(/委派还在等待子任务完成/);
     expect(container.textContent).not.toContain("export HOME");
-    expect(container.textContent).not.toMatch(/Exit Code|exitCode|WorkingDirectory|workingDirectory/i);
+    expect(container.textContent).not.toMatch(
+      /Exit Code|exitCode|WorkingDirectory|workingDirectory/i,
+    );
     expect(container.textContent).not.toContain("delegate client timeout after 45s");
+  });
+
+  test("oc-memory delegate 的合法 JSON 不当成 shell 信封，result 完整展示", () => {
+    const payload = JSON.stringify({
+      stdout: "检查完成",
+      stderr: "",
+      result: { count: 3 },
+    });
+    const { container } = render(
+      <div>
+        {researchToolCard("oc-memory delegate --goal '返回 JSON'", tool({ output: payload }))}
+      </div>,
+    );
+    expect(container.textContent).toContain("检查完成");
+    expect(container.textContent).toContain('"count":3');
+    expect(container.textContent).toContain("result");
+    expect(container.textContent).not.toMatch(/个字段/);
+  });
+
+  test("oc-memory delegate 真正的 Cursor 信封仍解包 stdout", () => {
+    const envelope = JSON.stringify({
+      success: {
+        command: "oc-memory delegate --goal '修卡片'",
+        workingDirectory: "/home/agent",
+        exitCode: 0,
+        signal: null,
+        stdout: "✅ 委派完成 (agent: coding-assistant)\n\n子任务已交付。",
+        stderr: "",
+        pid: 4242,
+        interrupted: false,
+        executionTimeMs: 12,
+        backgrounded: false,
+        isHot: false,
+        localExecution: true,
+      },
+      isBackground: false,
+    });
+    const { container } = render(
+      <div>
+        {researchToolCard("oc-memory delegate --goal '修卡片'", tool({ output: envelope }))}
+      </div>,
+    );
+    expect(container.textContent).toMatch(/委派完成 \(agent: coding-assistant\)/);
+    expect(container.textContent).toContain("子任务已交付。");
+    expect(container.textContent).not.toMatch(/个字段/);
+    expect(container.textContent).not.toContain("isBackground");
+    expect(container.textContent).not.toContain("export HOME");
+  });
+
+  test("oc-memory delegate 信封失败 → stderr 首段，不渲字段网格", () => {
+    const envelope = JSON.stringify({
+      success: {
+        command: "oc-memory delegate --help",
+        workingDirectory: "/home/agent",
+        exitCode: 1,
+        signal: null,
+        stdout: "",
+        stderr:
+          'oc-memory: delegate requires --goal "<text>" (or a positional goal)\nusage: oc-memory delegate ...',
+        pid: 7,
+        interrupted: false,
+      },
+      isBackground: false,
+    });
+    const { container } = render(
+      <div>{researchToolCard("oc-memory delegate --help", tool({ output: envelope }))}</div>,
+    );
+    expect(container.textContent).toContain('oc-memory: delegate requires --goal "<text>"');
+    expect(container.textContent).not.toMatch(/个字段/);
+    expect(container.textContent).not.toContain("isBackground");
+  });
+
+  test("Cursor shell 信封在 GenericOcCard 路径 unwrap 后显示 stdout", () => {
+    const envelope = JSON.stringify({
+      success: {
+        command: "oc-memory memory --action read",
+        workingDirectory: "/home/agent",
+        exitCode: 0,
+        stdout: "Core 记忆已改为直接编辑文件",
+        stderr: "",
+        signal: null,
+        pid: 1,
+        interrupted: false,
+        executionTimeMs: 3,
+        backgrounded: false,
+        isHot: false,
+        localExecution: true,
+      },
+      isBackground: false,
+    });
+    const { container } = render(
+      <div>
+        {researchToolCard(
+          "oc-memory memory --action read --target memory",
+          tool({ output: envelope }),
+        )}
+      </div>,
+    );
+    expect(container.textContent).toContain("Core 记忆已改为直接编辑文件");
+    expect(container.textContent).not.toMatch(/个字段/);
+    expect(container.textContent).not.toContain("isBackground");
   });
 
   test("oc-memory session-search → 历史检索卡(查询 + 结果,不裸露命令)", () => {
@@ -574,7 +762,9 @@ describe("BrowserCliCard 复合命令 + 失败原因", () => {
 
   test("open 成功 → 从输出提取 Page Title 一行标题,其余 markdown 照旧隐藏", () => {
     render(
-      <div>{researchToolCard("oc-browser open https://example.com", tool({ output: PLAYWRIGHT_OK }))}</div>,
+      <div>
+        {researchToolCard("oc-browser open https://example.com", tool({ output: PLAYWRIGHT_OK }))}
+      </div>,
     );
     expect(screen.getByText("Example Domain")).toBeInTheDocument();
     // 纯 open 无折叠详情 → 原始 markdown 不进 DOM。
@@ -600,7 +790,9 @@ describe("BrowserCliCard 复合命令 + 失败原因", () => {
 
   test("输出含 Error 时即使上层漏标 error 也不给绿色完成", () => {
     render(
-      <div>{researchToolCard("oc-browser open https://bad.example", tool({ output: BROWSER_ERR }))}</div>,
+      <div>
+        {researchToolCard("oc-browser open https://bad.example", tool({ output: BROWSER_ERR }))}
+      </div>,
     );
     expect(screen.getAllByText(/^Error: Browser/)[0].className).toContain("text-danger");
   });

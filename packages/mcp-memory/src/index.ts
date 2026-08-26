@@ -40,6 +40,7 @@ import {
   SkillDraftStore,
   type SkillStore,
   buildAgentSkillStore,
+  buildRunSkillStore,
   isPlatformReservedSkillName,
   parseSkillEvalsJson,
   searchSkillMetadata,
@@ -61,6 +62,7 @@ import {
   type FanoutCursorItem,
   type FormattedDelegateResult,
 } from './delegateCursorFastPath.js'
+import { formatSendToAgentStart } from './sendToAgent.js'
 import {
   describeDelegateTransportError,
   gatewayDelegateHeaders,
@@ -75,6 +77,7 @@ import {
   remainingAskUserWaitMs,
 } from './askUserClient.js'
 import { type ReminderJobView, formatReminderList } from './reminderFormat.js'
+import { rejectClientAssignedResumeIds, resolveReminderResume } from './reminderResume.js'
 import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPolicy.js'
 // Tool 定义(TOOLS / SKILL_PROPOSE_TOOL)抽到 ./toolDefs.ts(纯数据模块,无副作用),
 // 让「TOOLS ↔ toolNames.ts」锁步单测能直接 import 校验,而不触发本入口模块顶层的
@@ -87,6 +90,11 @@ import {
   handleTaskUpdate,
 } from './taskboardMcp.js'
 import { SKILL_PROPOSE_TOOL, TOOLS, normalizeAskUserQuestions } from './toolDefs.js'
+import {
+  createPresentOptionsCallBudget,
+  handlePresentOptions,
+  shouldListPresentOptions,
+} from './presentOptions.js'
 import {
   cursorDelegateCliHint,
   isCursorHiddenDelegateTool,
@@ -105,11 +113,11 @@ const DELEGATION_DEPTH = Math.max(
 const ENGINE_ID = (process.env.OPENCLAUDE_ENGINE || '').trim().toLowerCase()
 const ASK_USER_MCP_ESCAPE = process.env.OC_ASK_USER_MCP === '1'
 const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
+const consumePresentOptionsCall = createPresentOptionsCallBudget(4)
 
 function buildSkillStore(): SkillStore {
-  // Overlay (single wiring in @openclaude/storage): platform baseline (ro env)
-  // > agent-seed (ro) > shared (rw, user-level/all-agents; single write source)
-  // > legacy per-agent. Degrades gracefully if a dir is invalid.
+  const projectId = (process.env.OPENCLAUDE_PROJECT_ID ?? '').trim()
+  if (projectId) return buildRunSkillStore({ agentId: AGENT_ID, projectId })
   return buildAgentSkillStore(AGENT_ID)
 }
 
@@ -194,6 +202,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (DELEGATION_DEPTH > 0 || !ASK_USER_ENABLED || !ASK_USER_MCP_ESCAPE) {
     base = base.filter((t) => t.name !== 'ask_user')
   }
+  // present_options 默认对 Cursor 主会话暴露(不看 OC_ASK_USER_MCP)。
+  // 子 agent / 非 Cursor 引擎不列出;CallTool 侧还有短路兜底。
+  if (!shouldListPresentOptions(ENGINE_ID, DELEGATION_DEPTH)) {
+    base = base.filter((t) => t.name !== 'present_options')
+  }
   if (ENGINE_ID === 'cursor') {
     base = base.filter((t) => !isCursorHiddenDelegateTool(t.name, 'cursor'))
   }
@@ -256,6 +269,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleTaskGet(args as any)
       case 'ask_user':
         return await handleAskUser(args as any)
+      case 'present_options': {
+        if (!consumePresentOptionsCall()) {
+          return toolError('present_options 每回合最多调用 4 次')
+        }
+        const result = handlePresentOptions(args, {
+          engineId: ENGINE_ID,
+          delegationDepth: DELEGATION_DEPTH,
+        })
+        return result.ok ? toolOk(result.message) : toolError(result.message)
+      }
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
     }
@@ -652,36 +675,37 @@ async function handleSkillPropose(args: {
 
 // ─────────────────────────────────────────────────────────────
 async function handleSendToAgent(args: { agentId: string; message: string }) {
-  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
-  const gatewayToken = readGatewayToken()
+  const agentNorm = normalizeDelegateAgentId(args.agentId)
+  if (!agentNorm.ok) return toolError(agentNorm.error)
+  const agentId = agentNorm.agentId
+  if (!agentId) return toolError('agentId 必填')
   const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
+  const parentSessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
+  const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
   try {
-    // 与 delegate_task 同款收口 postJsonToGateway:对端 handleAgentMessage 同样是
-    // "子 turn 跑完才写响应"的长阻塞端点,裸 fetch 会在 undici 5min headersTimeout
-    // 精确复刻历史 fetch failed(ecb4ee38 修 delegate 时的同类残留)。
     const res = await postJsonToGateway(
-      `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(args.agentId)}/message`,
+      `${gatewayBaseUrl()}/api/agents/${encodeURIComponent(agentId)}/delegate`,
       {
         headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${gatewayToken}`,
+          ...gatewayDelegateHeaders(),
+          'x-delegation-depth': String(currentDepth),
         },
         body: JSON.stringify({
-          message: args.message,
+          goal: args.message,
           sourceAgent,
+          async: true,
+          callbackOnComplete: 'origin-inject',
+          ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
         }),
-        timeoutMs: AGENT_MESSAGE_CLIENT_TIMEOUT_MS,
+        timeoutMs: 15_000,
       },
     )
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      return toolError(`发送失败: ${res.body}`)
-    }
-    const data = JSON.parse(res.body) as any
-    return toolOk(
-      `✅ 已发送给 agent "${args.agentId}": "${args.message.slice(0, 50)}${args.message.length > 50 ? '...' : ''}"\n目标 agent 将在后台处理,结果会推送给用户。`,
-    )
+    const started = formatSendToAgentStart(res.statusCode, res.body, agentId, {
+      parentSessionKey: parentSessionKey || undefined,
+    })
+    if (typeof started !== 'string') return toolError(started.error)
+    return toolOk(started)
   } catch (err: any) {
-    // 带 transport code 上浮(ECONNREFUSED/ETIMEDOUT…),不吞 cause。
     return toolError(`发送失败: ${describeDelegateTransportError(err)}`)
   }
 }
@@ -728,11 +752,11 @@ async function handleDelegateTasks(args: { tasks?: unknown }) {
 // (v5 ccb-only:handleAskGpt55Codex 已移除 —— 无 codex agent。)
 
 /**
- * send_to_agent is a separate long callback endpoint. Delegate tools no longer
- * use one long HTTP request: every engine starts an async job, waits briefly,
- * then returns a resumable job handle before its MCP tools/call deadline.
+ * Delegate tools no longer use one long HTTP request: every engine starts an
+ * async job, waits briefly, then returns a resumable job handle before its
+ * MCP tools/call deadline. send_to_agent returns that handle immediately and
+ * lets the gateway inject the origin session when the child finishes.
  */
-const AGENT_MESSAGE_CLIENT_TIMEOUT_MS = 2 * 60 * 60_000 + 60_000
 
 /**
  * 引擎交互提问桥(仅 Cursor,且仅 OC_ASK_USER_MCP=1 逃生开关):把选择题 POST
@@ -966,7 +990,12 @@ async function handleCreateReminder(args: {
   oneshot?: boolean
   kind?: 'reminder' | 'task'
   deliver?: 'webchat' | 'local'
+  resume?: 'isolated' | 'origin-session'
 }) {
+  const forbidden = rejectClientAssignedResumeIds(args)
+  if (forbidden) return toolError(forbidden)
+  const resume = resolveReminderResume(args)
+  if (!resume.ok) return toolError(resume.error)
   const { base, headers } = gatewayCronBase()
   const isTask = args.kind === 'task'
   try {
@@ -982,6 +1011,9 @@ async function handleCreateReminder(args: {
         deliver: args.deliver === 'local' ? 'local' : 'webchat',
         oneshot: args.oneshot !== false,
         label: args.message.slice(0, 50),
+        ...(resume.resume === 'origin-session'
+          ? { resume: 'origin-session', originSessionKey: resume.originSessionKey }
+          : {}),
       }),
     })
     if (!res.ok) {
@@ -990,7 +1022,7 @@ async function handleCreateReminder(args: {
     }
     const data = (await res.json()) as any
     return toolOk(
-      `✅ ${isTask ? '定时任务' : '提醒'}已创建: "${args.message}"\n⏰ 计划: \`${args.schedule}\`\nID: \`${data.job?.id ?? '?'}\`${args.oneshot !== false ? ' (一次性)' : ' (重复)'}`,
+      `✅ ${isTask ? '定时任务' : '提醒'}已创建: "${args.message}"\n⏰ 计划: \`${args.schedule}\`\nID: \`${data.job?.id ?? '?'}\`${args.oneshot !== false ? ' (一次性)' : ' (重复)'}${resume.resume === 'origin-session' ? '\n🔁 到点将回到本对话继续' : ''}`,
     )
   } catch (err: any) {
     return toolError(`创建${isTask ? '任务' : '提醒'}失败: ${err?.message ?? String(err)}`)
@@ -1073,5 +1105,14 @@ function toolError(msg: string) {
 }
 
 const transport = new StdioServerTransport()
-await server.connect(transport)
-process.stderr.write(`[mcp-memory] started for agent=${AGENT_ID}\n`)
+// No top-level await: the CJS bundle (dist/oc-memory-mcp.cjs) rejects it, and
+// the promise form behaves identically under tsx/ESM.
+server
+  .connect(transport)
+  .then(() => {
+    process.stderr.write(`[mcp-memory] started for agent=${AGENT_ID}\n`)
+  })
+  .catch((err: unknown) => {
+    process.stderr.write(`[mcp-memory] failed to start: ${String(err)}\n`)
+    process.exit(1)
+  })

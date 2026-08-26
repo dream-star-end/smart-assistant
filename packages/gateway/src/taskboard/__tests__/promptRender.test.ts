@@ -6,7 +6,14 @@
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import type { TicketComment } from '../domain.js'
-import { COMMENTS_CHAR_BUDGET, formatCommentsForPrompt, renderPrompt } from '../promptRender.js'
+import {
+  COMMENTS_CHAR_BUDGET,
+  LAST_RUN_OUTPUT_MAX_CHARS,
+  LAST_RUN_OUTPUT_TRUNCATE_NOTE,
+  formatCommentsForPrompt,
+  formatLastRunOutput,
+  renderPrompt,
+} from '../promptRender.js'
 
 function comment(over: Partial<TicketComment> & { body: string }): TicketComment {
   return {
@@ -61,6 +68,55 @@ describe('renderPrompt 占位符', () => {
     assert.match(prompt, /OCV5-42/)
     assert.match(prompt, /尚无上次 run/)
     assert.match(prompt, /暂无评论/)
+  })
+
+  it('{{last_run.output}} 注入上次 run 的 output_md 全文', () => {
+    const body = '完整产出\n## 结论\n改了 X'
+    const { prompt, unknownPlaceholders } = renderPrompt({
+      template: '产出:{{last_run.output}}',
+      ticket,
+      stage,
+      lastRun: { summary: '短摘要', outputMd: body },
+    })
+    assert.equal(unknownPlaceholders.length, 0)
+    assert.match(prompt, /完整产出/)
+    assert.match(prompt, /改了 X/)
+    assert.doesNotMatch(prompt, /尚无上次 run 产出/)
+  })
+
+  it('{{last_run.output}} 超长截断并标注完整产出位置', () => {
+    const body = 'A'.repeat(LAST_RUN_OUTPUT_MAX_CHARS + 80)
+    const { prompt } = renderPrompt({
+      template: '{{last_run.output}}',
+      ticket,
+      stage,
+      lastRun: { summary: '摘要', outputMd: body },
+    })
+    assert.ok(prompt.includes(LAST_RUN_OUTPUT_TRUNCATE_NOTE))
+    assert.ok(prompt.includes('A'.repeat(100)))
+    assert.ok(!prompt.includes(body))
+    const injected = formatLastRunOutput(body)
+    assert.ok(injected.endsWith(LAST_RUN_OUTPUT_TRUNCATE_NOTE))
+    assert.equal(injected.length, LAST_RUN_OUTPUT_MAX_CHARS + LAST_RUN_OUTPUT_TRUNCATE_NOTE.length)
+  })
+
+  it('按 Unicode code point 截断,不把 emoji 对切成替换字符', () => {
+    const body = `${'A'.repeat(19999)}\u{1F600}${'B'.repeat(80)}`
+    const injected = formatLastRunOutput(body)
+    assert.ok(injected.endsWith(LAST_RUN_OUTPUT_TRUNCATE_NOTE))
+    assert.ok(injected.startsWith(`${'A'.repeat(19999)}\u{1F600}`))
+    assert.doesNotMatch(injected, /\uFFFD/)
+    const kept = injected.slice(0, injected.length - LAST_RUN_OUTPUT_TRUNCATE_NOTE.length)
+    assert.equal([...kept].length, LAST_RUN_OUTPUT_MAX_CHARS)
+  })
+
+  it('没有上次 run 时 {{last_run.output}} 给出兜底文案', () => {
+    const { prompt } = renderPrompt({
+      template: '产出:{{last_run.output}}',
+      ticket,
+      stage,
+    })
+    assert.match(prompt, /尚无上次 run 产出/)
   })
 
   it('允许 {{ ticket.title }} 带空格', () => {

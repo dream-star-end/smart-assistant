@@ -23,6 +23,7 @@ import {
   isRecoveryControlUserTurn,
   lastRealUserTurn,
   computeTypingLabel,
+  isPlatedAssistantMessage,
   STALE_WARN_MS,
 } from "./pure";
 import {
@@ -472,6 +473,12 @@ describe("applyTurnStatus retrying 判别联合", () => {
     expect(s._turnStatus).toBe("compacting");
   });
 
+  test("waiting_for_user → 明确的人类等待态", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "waiting_for_user" }));
+    expect(s._turnStatus).toBe("waiting_for_user");
+  });
+
   test("status=null 复位帧 → 清 retrying 软提示", () => {
     const s = sess();
     applyTurnStatus(s, turnStatusFrame({ status: "retrying", retry: { attempt: 1, max: 3, delayMs: 2000, retryAt: Date.now() + 2000 } }));
@@ -543,6 +550,43 @@ describe("applyTurnStatus retrying 判别联合", () => {
     expect(s._lastFrameAt).toEqual(expect.any(Number));
   });
 
+  test("engine_starting / engine_resuming → 写入阶段态,null 帧清除", () => {
+    const s = sess();
+    const before = s.messages.length;
+    applyTurnStatus(s, turnStatusFrame({ status: "engine_starting" }));
+    expect(s._turnStatus).toBe("engine_starting");
+    applyTurnStatus(s, turnStatusFrame({ status: "engine_resuming" }));
+    expect(s._turnStatus).toBe("engine_resuming");
+    expect(s.messages.length).toBe(before);
+    applyTurnStatus(s, turnStatusFrame({ status: null }));
+    expect(s._turnStatus).toBeNull();
+  });
+
+  test("清态 null 帧丢失时,首个内容帧兜底清 engine_*(防启动态粘住)", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyTurnStatus(s, turnStatusFrame({ status: "engine_resuming" }));
+    expect(s._turnStatus).toBe("engine_resuming");
+    applyOutboundMessage(
+      s,
+      msgFrame({ blocks: [{ kind: "thinking", text: "首个思考增量" }], frameSeq: 1 }),
+      {},
+    );
+    expect(s._turnStatus).toBeNull();
+  });
+
+  test("tool_output_tail-only 帧不清 engine_*(不是内容恢复)", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyTurnStatus(s, turnStatusFrame({ status: "engine_starting" }));
+    applyOutboundMessage(
+      s,
+      msgFrame({ blocks: [{ kind: "tool_output_tail", blockId: "b1", tail: "x", totalBytes: 1 }], frameSeq: 1 }),
+      {},
+    );
+    expect(s._turnStatus).toBe("engine_starting");
+  });
+
   test("status=null 清 working hint", () => {
     const s = sess();
     applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Grep keepalive" }));
@@ -583,6 +627,45 @@ describe("computeTypingLabel progressHint vs stall", () => {
     expect(out.text).toContain("无新数据");
     expect(out.text).not.toContain("Read foo.ts");
     expect(out.text).not.toContain("读取文件");
+  });
+
+  test("keepalive 刷新 silence 时按已耗时升级「深度思考中」预期管理文案", () => {
+    // 思考型模型推理期:帧不断到达(silence 低)但首字未出,不能无限停留在「思考中 (Xs)」。
+    const out = computeTypingLabel({ name: "助手", secs: 26, silenceMs: 2_000 });
+    expect(out.text).toContain("深度思考中 (26s)");
+    expect(out.text).toContain("可随时停止");
+    expect(out.cls).toBe("long-thinking");
+    // 阈值之下维持原「思考中」文案
+    const early = computeTypingLabel({ name: "助手", secs: 15, silenceMs: 2_000 });
+    expect(early.text).toContain("思考中 (15s)");
+    expect(early.text).not.toContain("可随时停止");
+  });
+
+  test("上桌后不再回落「思考中」，厨房粘滞在 hint 空窗时保持动作", () => {
+    const plated = computeTypingLabel({
+      name: "助手",
+      secs: 12,
+      silenceMs: 1_000,
+      hasPlated: true,
+    });
+    expect(plated.text).toContain("正在生成内容");
+    expect(plated.text).not.toContain("思考中");
+
+    const sticky = computeTypingLabel({
+      name: "助手",
+      secs: 20,
+      silenceMs: 2_000,
+      kitchenStickyHint: "Read foo.ts",
+    });
+    expect(sticky.text).toContain("读取文件");
+    expect(sticky.text).not.toContain("思考中");
+  });
+
+  test("isPlatedAssistantMessage 只认助手正文，thinking/tool 是厨房", () => {
+    expect(isPlatedAssistantMessage({ role: "assistant", text: "你好" })).toBe(true);
+    expect(isPlatedAssistantMessage({ role: "thinking", text: "先想想" })).toBe(false);
+    expect(isPlatedAssistantMessage({ role: "tool", text: "Read" })).toBe(false);
+    expect(isPlatedAssistantMessage({ role: "assistant", text: "   " })).toBe(false);
   });
 
   test("Cursor StrReplace working-detail 活动行只显示写入文件", () => {
@@ -969,6 +1052,46 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(asst).toHaveLength(1);
     expect(asst[0].text).toBe("Hello");
     expect(asst[0].id).toBe("srv-1");
+  });
+
+  test("text/thinking 换 messageId 时开新行，不把后到段灌进旧气泡", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "卡片前", messageId: "srv-main-t1-s0" }] }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 2, blocks: [{ kind: "text", text: "卡片后", messageId: "srv-main-t1-s1" }] }),
+    );
+    const asst = s.messages.filter((m) => m.role === "assistant");
+    expect(asst.map((m) => [m.id, m.text])).toEqual([
+      ["srv-main-t1-s0", "卡片前"],
+      ["srv-main-t1-s1", "卡片后"],
+    ]);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 3, blocks: [{ kind: "thinking", text: "先想", messageId: "srv-think-s0" }] }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 4, blocks: [{ kind: "thinking", text: "再想", messageId: "srv-think-s1" }] }),
+    );
+    const thinking = s.messages.filter((m) => m.role === "thinking");
+    expect(thinking.map((m) => [m.id, m.text])).toEqual([
+      ["srv-think-s0", "先想"],
+      ["srv-think-s1", "再想"],
+    ]);
+  });
+
+  test("text 缺省 messageId 时仍向当前流式指针追加", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "Hel" }] }));
+    applyOutboundMessage(s, msgFrame({ frameSeq: 2, blocks: [{ kind: "text", text: "lo" }] }));
+    const asst = s.messages.filter((m) => m.role === "assistant");
+    expect(asst).toHaveLength(1);
+    expect(asst[0].text).toBe("Hello");
   });
 
   test("frameSeq dedupe drops replayed dup (no double text)", () => {
@@ -3459,6 +3582,23 @@ describe("interruptedContinuationTarget (durable 断点续跑)", () => {
     expect(automaticTurnRecoveryTarget(auth, auth[2], "s1")).toBeUndefined();
     expect(interruptedContinuationTarget(auth, auth[2], "s1")).toBeUndefined();
   });
+
+  test("fallback owner 对同血缘第二次静默超时熔断，不再推进 2..10", () => {
+    const silent = rows();
+    silent[0]._automaticRecovery = true;
+    silent[0]._automaticRecoveryRootClientMessageId = "u-interrupted";
+    silent[0]._automaticRecoveryAttempt = 1;
+    silent[1] = {
+      id: "runtime-only",
+      role: "runtime-event",
+      text: "",
+      ts: 2,
+      _source: "server",
+      _turnTapeId: "tape-1",
+      _runtimeEvent: { type: "turn_started", status: "working" },
+    };
+    expect(automaticTurnRecoveryTarget(silent, silent[2], "s1")).toBeUndefined();
+  });
 });
 
 describe("applyCostWaived (turn 免单退款)", () => {
@@ -5637,8 +5777,13 @@ describe("ChatSocket interrupted continuation", () => {
     });
     expect(session.messages).toEqual([
       { ...oldRows[0], _automaticRecoveryAttempted: true },
-      ...oldRows.slice(1),
+      oldRows[1],
+      {
+        ...oldRows[2],
+        _recoverySkippedNotice: "未从断点继续：会话已有更新，原任务仍已保留。请在最新消息后再试。",
+      },
     ]);
+    expect(sock.getTransientNotice("s-auto-checkpoint")).toBeNull();
     expect(session._sendingInFlight).toBe(false);
     const sentRecoveries = () => ws.sent
       .map((raw) => JSON.parse(raw) as Record<string, any>)
@@ -5719,6 +5864,7 @@ describe("ChatSocket interrupted continuation", () => {
       _errorCode: "model_capacity",
       text: "SOURCE_ERROR_SHOULD_REAPPEAR",
       _clientMessageId: "u-lineage-skip",
+      _recoverySkippedNotice: "未从断点继续：会话已有更新，原任务仍已保留。请在最新消息后再试。",
     });
     sock.stop();
   });
@@ -7510,7 +7656,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
-  test("empty journal with tape projection exits restore and clears sending", async () => {
+  test("empty journal with session-level tape projection keeps 思考中", async () => {
     vi.useFakeTimers();
     let sock!: ChatSocket;
     const syncSession = vi.fn(async () => {
@@ -7527,7 +7673,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       id: "s1",
       agentId: "main",
       title: "s1",
-      messages: [{ id: "u-tape", role: "user", text: "done turn", ts: now, status: "sent" }],
+      messages: [{ id: "u-tape", role: "user", text: "new turn", ts: now, status: "sent" }],
       createdAt: now,
       lastAt: now,
       _sendingInFlight: true,
@@ -7537,12 +7683,12 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
 
     await Promise.resolve();
     const session = sock.sessions.get("s1")!;
-    expect(session._sendingInFlight).toBe(false);
-    expect(session._reconciling).toBe(false);
-    expect(session._recoveryStatus?.kind).toBe("completed");
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._reconciling).toBe(true);
     expect(syncSession).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(syncSession).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    expect(session._sendingInFlight).toBe(true);
     sock.stop();
   });
 
@@ -7588,6 +7734,46 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
+  test("thinking-only kitchen after reconcile does not count as plated body", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      const session = sock.sessions.get("s1")!;
+      session.messages.push({
+        id: "srv-t1",
+        role: "thinking",
+        text: "先想清楚再写",
+        ts: Date.now(),
+        _source: "server",
+        _clientMessageId: "u-kit",
+      });
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 1,
+        liveClientMessageIds: [],
+        hasTapeProjection: false,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-kit", role: "user", text: "please", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-kit",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    const session = sock.sessions.get("s1")!;
+    expect(session._sendingInFlight).toBe(true);
+    sock.stop();
+  });
+
   test("restore attempt cap exits even when journal metadata never arrives", async () => {
     vi.useFakeTimers();
     const syncSession = vi.fn(async () => true);
@@ -7613,8 +7799,99 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const session = sock.sessions.get("s1")!;
     expect(syncSession.mock.calls.length).toBeLessThanOrEqual(RESTORE_RECONCILE_MAX_ATTEMPTS);
     expect(session._reconciling).toBe(false);
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._recoveryStatus?.kind).toBe("resumed");
+    sock.stop();
+  });
+
+  test("cap exit clears 思考中 when a cmid-less terminal body follows the active user row", async () => {
+    // 终态行(tape fallback)可能不带本轮 _clientMessageId。窗口内严格判定不认它
+    // (防过早消失),但打满对账窗口后必须以它为退出,否则「思考中」永挂。
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      const session = sock.sessions.get("s1")!;
+      if (!session.messages.some((m) => m.id === "srv-fallback")) {
+        session.messages.push({
+          id: "srv-fallback",
+          role: "assistant",
+          text: "终态正文(fallback 不带 cmid)",
+          ts: Date.now(),
+          _source: "server",
+        });
+      }
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 0,
+        liveClientMessageIds: [],
+        hasTapeProjection: true,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-loose", role: "user", text: "please", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-loose",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    const session = sock.sessions.get("s1")!;
+    // 窗口内:严格判定不认 cmid-less 行,「思考中」保持。
+    expect(session._sendingInFlight).toBe(true);
+    for (let i = 0; i < RESTORE_RECONCILE_MAX_ATTEMPTS; i++) {
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    expect(session._reconciling).toBe(false);
     expect(session._sendingInFlight).toBe(false);
     expect(session._recoveryStatus?.kind).toBe("completed");
+    sock.stop();
+  });
+
+  test("prior-turn cmid-less body before the active user row keeps 思考中 at the cap", async () => {
+    // 27344ba55 的初衷:上一轮遗留的无主正文不能证明本轮已完成 —— 松弛判定
+    // 有位置约束(必须在本轮 user 行之后),之前的行打满窗口也不触发退出。
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 0,
+        liveClientMessageIds: [],
+        hasTapeProjection: true,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [
+        { id: "srv-prev", role: "assistant", text: "上一轮的回复", ts: now - 60_000, _source: "server" },
+        { id: "u-next", role: "user", text: "new turn", ts: now, status: "sent" },
+      ],
+      createdAt: now - 60_000,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-next",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    const session = sock.sessions.get("s1")!;
+    for (let i = 0; i < RESTORE_RECONCILE_MAX_ATTEMPTS; i++) {
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    expect(session._reconciling).toBe(false);
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._recoveryStatus?.kind).toBe("resumed");
     sock.stop();
   });
 
@@ -8779,5 +9056,255 @@ describe("openDispatch hydrate restores in-flight", () => {
     expect(session._sendingInFlight).toBe(true);
     expect(session._activeClientMessageId).toBe("m-open-1");
     sock.stop();
+  });
+
+  test("prior-turn tape + empty live journal does not hide 思考中 for the new turn", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      sock.noteLiveJournalObservation("s-open-2", {
+        frameCount: 0,
+        liveClientMessageIds: [],
+        hasTapeProjection: true,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s-open-2",
+      agentId: "main",
+      title: "s-open-2",
+      messages: [
+        { id: "u-old", role: "user", text: "previous", ts: now - 60_000, status: "replied" },
+        {
+          id: "a-old",
+          role: "assistant",
+          text: "previous answer",
+          ts: now - 59_000,
+          _source: "server",
+          _clientMessageId: "u-old",
+        },
+        { id: "m-open-2", role: "user", text: "根治下", ts: now, status: "sent" },
+      ],
+      createdAt: now - 60_000,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "m-open-2",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    const session = sock.sessions.get("s-open-2")!;
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._activeClientMessageId).toBe("m-open-2");
+    expect(session._reconciling).toBe(true);
+    sock.stop();
+  });
+});
+
+describe("send_to_agent background card", () => {
+  test("stays running after parent turn_completed and keeps child process until done", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "mcp__openclaude-memory__send_to_agent",
+            blockId: "tool-sta",
+            inputJson: { agentId: "research-assistant", message: "查萧山" },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-sta",
+            agentId: "research-assistant",
+            goal: "查萧山",
+            phase: "start",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "tool_result",
+            toolUseBlockId: "tool-sta",
+            output: JSON.stringify({ status: "running", jobId: "dlgjob-1" }),
+          },
+        ],
+      }),
+    );
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group).toBeTruthy();
+    expect(group?._background).toBe(true);
+    expect(group?._completed).toBeFalsy();
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 4,
+        isFinal: true,
+        meta: { stopReason: "end_turn" },
+        blocks: [{ kind: "text", text: "已交给科研助手", messageId: "srv-a" }],
+      }),
+    );
+    expect(group?._completed).toBeFalsy();
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 5,
+        isFinal: false,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-sta",
+            agentId: "research-assistant",
+            goal: "查萧山",
+            phase: "text",
+            block: { kind: "text", text: "正在检索" },
+          },
+        ],
+      }),
+    );
+    expect(group?._completed).toBeFalsy();
+    expect(group?.childBlocks?.some((c) => c.kind === "text" && c.text === "正在检索")).toBe(true);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 6,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-sta",
+            agentId: "research-assistant",
+            goal: "查萧山",
+            phase: "done",
+            text: "结论",
+          },
+        ],
+      }),
+    );
+    expect(group?._completed).toBe(true);
+  });
+
+  test("running status unwraps MCP wrapper output", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "codex:mcpToolCall",
+            blockId: "tool-wrap",
+            inputJson: {
+              server: "openclaude-memory",
+              tool: "send_to_agent",
+              arguments: { agentId: "research-assistant", message: "查萧山" },
+            },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_result",
+            toolUseBlockId: "tool-wrap",
+            output: JSON.stringify({
+              server: "openclaude-memory",
+              tool: "send_to_agent",
+              result: {
+                content: [{ type: "text", text: JSON.stringify({ status: "running", jobId: "dlgjob-w" }) }],
+              },
+            }),
+          },
+        ],
+      }),
+    );
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?._background).toBe(true);
+    expect(group?._completed).toBeFalsy();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        isFinal: true,
+        meta: { stopReason: "end_turn" },
+        blocks: [{ kind: "text", text: "已派出", messageId: "srv-b" }],
+      }),
+    );
+    expect(group?._completed).toBeFalsy();
+  });
+});
+
+describe("send_to_agent exact job correlation", () => {
+  test("two identical goals bind to their own background cards", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    for (const [seq, blockId] of [[1, "tool-same-a"], [2, "tool-same-b"]] as const) {
+      applyOutboundMessage(s, msgFrame({ frameSeq: seq, blocks: [{
+        kind: "tool_use",
+        toolName: "mcp__openclaude-memory__send_to_agent",
+        blockId,
+        inputJson: { agentId: "research-assistant", message: "同一个目标" },
+      }] }));
+    }
+    for (const [seq, runId, jobId] of [[3, "run-a", "dlgjob-a"], [4, "run-b", "dlgjob-b"]] as const) {
+      applyOutboundMessage(s, msgFrame({ frameSeq: seq, blocks: [{
+        kind: "delegate_progress",
+        runId,
+        jobId,
+        agentId: "research-assistant",
+        goal: "同一个目标",
+        phase: "start",
+      }] }));
+    }
+    for (const [seq, blockId, jobId] of [[5, "tool-same-a", "dlgjob-a"], [6, "tool-same-b", "dlgjob-b"]] as const) {
+      applyOutboundMessage(s, msgFrame({ frameSeq: seq, blocks: [{
+        kind: "tool_result",
+        toolUseBlockId: blockId,
+        output: JSON.stringify({ status: "running", jobId }),
+      }] }));
+    }
+    let groups = s.messages.filter((message) => message.role === "agent-group");
+    expect(groups).toHaveLength(2);
+    expect(s.messages.filter((message) => message.role === "delegate-progress")).toHaveLength(0);
+    expect(new Set(groups.map((group) => group._delegateRunId))).toEqual(new Set(["run-a", "run-b"]));
+
+    for (const [seq, runId, jobId] of [[7, "run-a", "dlgjob-a"], [8, "run-b", "dlgjob-b"]] as const) {
+      applyOutboundMessage(s, msgFrame({ frameSeq: seq, blocks: [{
+        kind: "delegate_progress",
+        runId,
+        jobId,
+        agentId: "research-assistant",
+        goal: "同一个目标",
+        phase: "done",
+      }] }));
+    }
+    groups = s.messages.filter((message) => message.role === "agent-group");
+    expect(groups.every((group) => group._completed)).toBe(true);
   });
 });

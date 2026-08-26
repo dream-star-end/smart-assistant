@@ -29,6 +29,16 @@ export interface ProductFrictionEvent {
   sessionId?: string | null;
   /** Stable product entity identity (for example marketplace skill slug). */
   entitySlug?: string | null;
+  /**
+   * Bounded JS error location identifiers (0248). Never raw message/stack:
+   * error class name + bundle basename + line/col + fingerprint derived from
+   * those bounded fields. Resolvable to source via client_build sourcemaps.
+   */
+  errorName?: string | null;
+  scriptRef?: string | null;
+  lineNo?: number | null;
+  colNo?: number | null;
+  errorFingerprint?: string | null;
 }
 
 function clampText(value: string | null | undefined, max: number): string | null {
@@ -59,12 +69,16 @@ export async function recordProductFrictionEvent(
   const latency = input.latencyMs == null
     ? null
     : Math.max(0, Math.min(86_400_000, Math.trunc(input.latencyMs)));
+  const clampLine = (value: number | null | undefined): number | null =>
+    value == null ? null : Math.max(0, Math.min(10_000_000, Math.trunc(value)));
   await query(
     `INSERT INTO product_friction_events
        (event_key, user_id, surface, stage, code, outcome, attempts, latency_ms,
         model, provider, client_build, browser_family, device_class, trace_id,
-        session_id, entity_slug, recovered_at)
+        session_id, entity_slug, error_name, script_ref, line_no, col_no,
+        error_fingerprint, recovered_at)
      VALUES ($1,$2,$3,$4,$5,$6::varchar,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+             $17,$18,$19,$20,$21,
              CASE WHEN $6::varchar IN ('recovered','succeeded') THEN NOW() ELSE NULL END)
      ON CONFLICT (event_key) DO UPDATE SET
        outcome = CASE
@@ -88,6 +102,11 @@ export async function recordProductFrictionEvent(
        trace_id = COALESCE(product_friction_events.trace_id, EXCLUDED.trace_id),
        session_id = COALESCE(product_friction_events.session_id, EXCLUDED.session_id),
        entity_slug = COALESCE(product_friction_events.entity_slug, EXCLUDED.entity_slug),
+       error_name = COALESCE(product_friction_events.error_name, EXCLUDED.error_name),
+       script_ref = COALESCE(product_friction_events.script_ref, EXCLUDED.script_ref),
+       line_no = COALESCE(product_friction_events.line_no, EXCLUDED.line_no),
+       col_no = COALESCE(product_friction_events.col_no, EXCLUDED.col_no),
+       error_fingerprint = COALESCE(product_friction_events.error_fingerprint, EXCLUDED.error_fingerprint),
        recovered_at = CASE
          WHEN product_friction_events.outcome IN ('recovered','succeeded','abandoned','cancelled')
            THEN product_friction_events.recovered_at
@@ -112,6 +131,11 @@ export async function recordProductFrictionEvent(
       clampText(input.traceId, 96),
       clampText(input.sessionId, 96),
       clampText(input.entitySlug, 128),
+      clampText(input.errorName, 64),
+      clampText(input.scriptRef, 120),
+      clampLine(input.lineNo),
+      clampLine(input.colNo),
+      clampText(input.errorFingerprint, 16),
     ],
     runner,
   );

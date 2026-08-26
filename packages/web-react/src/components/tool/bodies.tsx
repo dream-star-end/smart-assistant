@@ -6,15 +6,18 @@
  * format 层归一化为 native builtin/MCP 工具。
  */
 import { Sparkles, FileText } from "lucide-react";
-import type { ReactNode } from "react";
+import { useContext, useMemo, useState, type ReactNode } from "react";
 import { cn } from "../../lib/utils";
 import { SignedImg } from "../chat/media";
 import { Badge, Button } from "../ui";
+import { ExpandControls, ExpandablePre, FULL_TEXT_CAP, useExpandableSlice } from "./expandable";
+import { languageForPath, useHighlighter } from "./highlight";
+import { diffLines, type DiffRow as LineDiffRow } from "./lineDiff";
 import { ReminderStatusCard, renderReminderListCard } from "./memoryReminderCards";
 import { renderSkillListCard, renderSkillSearchCard, renderSkillViewCard } from "./skillCards";
 import { renderDelegateFanoutCard } from "./delegateFanoutCard";
 import { renderMcpResourcesCard } from "./mcpResourceCards";
-import { useToolCardActions } from "./context";
+import { ToolBodyFullContext, ToolInspectOpenContext, useToolCardActions } from "./context";
 import { formatLiveActivityAction, mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
 import {
   asArr,
@@ -46,10 +49,13 @@ type BodyProps = { input: Input; tool: ToolLike };
  * 仅用 bg-code 这层极淡表面做区隔。
  */
 function Pre({ children, className }: { children: ReactNode; className?: string }) {
+  // 全文模式(详情列)不设 max-height:滚动交给面板容器,内容一屏到底。
+  const full = useContext(ToolBodyFullContext);
   return (
     <pre
       className={cn(
-        "mt-1.5 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg",
+        "mt-1.5 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg",
+        !full && "max-h-80",
         className,
       )}
     >
@@ -93,18 +99,20 @@ function KvList({ obj, skip, maxValueLen = 240 }: { obj: Input; skip?: string[];
   );
 }
 
-/** 输出块：JSON 自动美化（< 4KB），过长夹断。 */
+/** 输出块：JSON 自动美化（< 4KB），过长截断且可「展开全部」（L8/F4）。 */
 function OutputBlock({ output, max = 1500 }: { output?: string | null; max?: number }) {
   if (!output) return null;
   let text = String(output);
+  let language: string | null = null;
   if (text.length < 4000 && /^\s*[[{]/.test(text)) {
     try {
       text = JSON.stringify(JSON.parse(text), null, 2);
+      language = "json";
     } catch {
       /* 保持原文 */
     }
   }
-  return <Pre>{text.length > max ? text.slice(0, max) + "\n…" : text}</Pre>;
+  return <ExpandablePre text={text} max={max} language={language} />;
 }
 
 function extractImageGenerationPath(input: Input, output?: string | null): string {
@@ -129,46 +137,106 @@ function stripDuplicateImageGenerationOutput(output: string | null | undefined, 
 // ── builtin ───────────────────────────────────────────────────────────────
 
 const MAX_DIFF_LINES = 60;
+/** 全文模式的 diff 行数安全上限(渲染保护,不是产品截断)。 */
+const MAX_DIFF_LINES_FULL = 4000;
 
-/** Edit 工具的加减行 diff。oldStr → 删除行（红），newStr → 新增行（绿）。 */
-function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
-  const rows: { sign: "-" | "+"; text: string }[] = [];
-  let truncated = false;
-  const add = (sign: "-" | "+", str: string) => {
-    if (!str) return;
-    for (const line of str.split("\n")) {
-      if (rows.length >= MAX_DIFF_LINES) {
-        truncated = true;
-        return;
-      }
-      rows.push({ sign, text: line });
-    }
-  };
-  add("-", oldStr);
-  if (!truncated) add("+", newStr);
+/** diff 截断行:有 inspect 回调时整行可点(去详情列看全文),否则纯提示。 */
+function DiffTruncationRow() {
+  const open = useContext(ToolInspectOpenContext);
+  if (!open) return <div className="px-3 py-1 text-faint">… (diff 过长，已截断)</div>;
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        open();
+      }}
+      className="block w-full px-3 py-1 text-left text-accent outline-none transition-colors hover:bg-hover/60 hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+    >
+      … diff 过长，在详情面板查看全文
+    </button>
+  );
+}
+
+/** diff 单行:行号(旧/新)+ 符号 + 内容(可选 hljs 着色;hljs 输出已转义)。 */
+function DiffRowView({ row, html }: { row: LineDiffRow; html: string | null }) {
+  return (
+    <div
+      className={cn(
+        "flex",
+        row.sign === "-" ? "bg-danger-soft" : row.sign === "+" ? "bg-success-soft" : undefined,
+      )}
+    >
+      <span className="w-9 shrink-0 select-none border-r border-border/60 pr-1.5 text-right text-[10.5px] leading-relaxed text-faint">
+        {row.oldNo ?? ""}
+      </span>
+      <span className="w-9 shrink-0 select-none border-r border-border/60 pr-1.5 text-right text-[10.5px] leading-relaxed text-faint">
+        {row.newNo ?? ""}
+      </span>
+      <span
+        className={cn(
+          "w-5 shrink-0 select-none text-center",
+          row.sign === "-" ? "text-danger" : row.sign === "+" ? "text-success" : "text-faint",
+        )}
+      >
+        {row.sign === " " ? "" : row.sign}
+      </span>
+      <span
+        className={cn(
+          "min-w-0 flex-1 whitespace-pre-wrap break-words pr-3",
+          row.sign === "-" ? "text-danger" : row.sign === "+" ? "text-success" : "text-muted",
+        )}
+      >
+        {html ? (
+          // biome-ignore lint/security/noDangerouslySetInnerHtml: hljs 输出对源码已做 HTML 转义
+          <span dangerouslySetInnerHTML={{ __html: html }} />
+        ) : (
+          row.text || " "
+        )}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Edit 工具的行级 diff(F2):LCS 求未变行为上下文,只把真正变化的行标 +/-,
+ * 带快照内行号;按文件后缀做 hljs 着色;超过行数上限时可「展开全部」。
+ */
+function DiffView({ oldStr, newStr, path }: { oldStr: string; newStr: string; path?: string }) {
+  const full = useContext(ToolBodyFullContext);
+  const [showAll, setShowAll] = useState(false);
+  const rows = useMemo(() => diffLines(oldStr, newStr), [oldStr, newStr]);
+  const maxLines = full || showAll ? MAX_DIFF_LINES_FULL : MAX_DIFF_LINES;
+  const truncated = rows.length > maxLines;
+  const highlight = useHighlighter(languageForPath(path ?? null));
   return (
     <div className="mt-1.5 overflow-x-auto rounded-md border border-border font-mono text-xs leading-relaxed">
-      {rows.map((r, i) => (
-        <div
-          key={i}
-          className={cn(
-            "whitespace-pre-wrap break-words px-3 py-px",
-            r.sign === "-" ? "bg-danger-soft text-danger" : "bg-success-soft text-success",
-          )}
-        >
-          {r.sign} {r.text}
-        </div>
+      {rows.slice(0, maxLines).map((r, i) => (
+        <DiffRowView key={`${i}-${r.sign}`} row={r} html={highlight(r.text)} />
       ))}
-      {truncated && <div className="px-3 py-1 text-faint">… (diff 过长，已截断)</div>}
+      {truncated && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setShowAll(true);
+          }}
+          className="block w-full px-3 py-1 text-left text-accent outline-none transition-colors hover:bg-hover/60 hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        >
+          展开全部（共 {rows.length} 行）
+        </button>
+      )}
+      {truncated && <DiffTruncationRow />}
     </div>
   );
 }
 
 function BashBody({ input, tool }: BodyProps) {
+  const full = useContext(ToolBodyFullContext);
   // 展示层剥壳兜底:历史消息的 command 落库时可能带 /bin/bash -lc 包装(新帧已由
   // runner 剥好),先剥再进 oc 检测/写文件检测/展示。
   const rawCommand = stripShellWrapperForDisplay(asStr(input?.command));
-  const command = rawCommand.slice(0, 2000);
+  const command = rawCommand.slice(0, full ? FULL_TEXT_CAP : 2000);
   // oc-* 工具(文献检索/引用核验/…):若命令命中且输出可解析 → 渲染专门卡片,
   // 而非原始"$ 命令 + JSON"终端块。不认/出错 → 回落下方通用渲染。
   const ocCard = researchToolCard(command, tool);
@@ -280,13 +348,16 @@ function parseCodexFileChanges(input: Input): CodexFileChange[] | null {
   });
 }
 
-/** codex update 的 unified diff 按行着色(+绿 / -红 / 其余弱化),行视觉同 DiffView。 */
+/** codex update 的 unified diff 按行着色(+绿 / -红 / 其余弱化),超上限可「展开全部」。 */
 function UnifiedDiffView({ diff }: { diff: string }) {
+  const full = useContext(ToolBodyFullContext);
+  const [showAll, setShowAll] = useState(false);
+  const maxLines = full || showAll ? MAX_DIFF_LINES_FULL : MAX_DIFF_LINES;
   const lines = diff.replace(/\n$/, "").split("\n");
-  const truncated = lines.length > MAX_DIFF_LINES;
+  const truncated = lines.length > maxLines;
   return (
     <div className="mt-1.5 overflow-x-auto rounded-md border border-border font-mono text-xs leading-relaxed">
-      {lines.slice(0, MAX_DIFF_LINES).map((line, i) => (
+      {lines.slice(0, maxLines).map((line, i) => (
         <div
           key={`${i}-${line.slice(0, 24)}`}
           className={cn(
@@ -301,9 +372,29 @@ function UnifiedDiffView({ diff }: { diff: string }) {
           {line || " "}
         </div>
       ))}
-      {truncated && <div className="px-3 py-1 text-faint">… (diff 过长，已截断)</div>}
+      {truncated && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setShowAll(true);
+          }}
+          className="block w-full px-3 py-1 text-left text-accent outline-none transition-colors hover:bg-hover/60 hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        >
+          展开全部（共 {lines.length} 行）
+        </button>
+      )}
+      {truncated && <DiffTruncationRow />}
     </div>
   );
+}
+
+/** add 分支的 diff 文本按「新文件内容」呈现:全部行都是 `+` 前缀时剥掉前缀(L2)。 */
+function stripAddDiffPrefix(diff: string): string {
+  const lines = diff.replace(/\n$/, "").split("\n");
+  if (!lines.some((l) => l.startsWith("+"))) return diff;
+  if (!lines.every((l) => !l || l.startsWith("+"))) return diff;
+  return lines.map((l) => (l.startsWith("+") ? l.slice(1) : l)).join("\n");
 }
 
 /** codex fileChange 渲染:add → 新文件内容;update → unified diff;delete → 删除状态行。
@@ -321,10 +412,14 @@ function CodexFileChangesView({ changes, tool }: { changes: CodexFileChange[]; t
             c.diff && <UnifiedDiffView diff={c.diff} />
           ) : (
             c.diff && (
-              <Pre>
-                {c.diff.slice(0, 1500)}
-                {c.diff.length > 1500 ? "\n…" : ""}
-              </Pre>
+              <>
+                <div className="mt-1.5 text-xs text-success">新增文件</div>
+                <ExpandablePre
+                  text={stripAddDiffPrefix(c.diff)}
+                  max={1500}
+                  language={languageForPath(c.path)}
+                />
+              </>
             )
           )}
         </div>
@@ -335,8 +430,10 @@ function CodexFileChangesView({ changes, tool }: { changes: CodexFileChange[]; t
 }
 
 function EditBody({ input, tool }: BodyProps) {
-  const oldStr = asStr(input?.old_string).slice(0, 3000);
-  const newStr = asStr(input?.new_string).slice(0, 3000);
+  const full = useContext(ToolBodyFullContext);
+  const strCap = full ? FULL_TEXT_CAP : 3000;
+  const oldStr = asStr(input?.old_string).slice(0, strCap);
+  const newStr = asStr(input?.new_string).slice(0, strCap);
   // codex apply_patch 形状(无 old/new_string,changes 数组)→ 结构化渲染;claude 原生不变。
   if (!oldStr && !newStr) {
     const changes = parseCodexFileChanges(input);
@@ -345,7 +442,9 @@ function EditBody({ input, tool }: BodyProps) {
   const out = tool.output;
   return (
     <>
-      {(oldStr || newStr) && <DiffView oldStr={oldStr} newStr={newStr} />}
+      {(oldStr || newStr) && (
+        <DiffView oldStr={oldStr} newStr={newStr} path={asStr(input?.file_path)} />
+      )}
       {out && <StatusLine text={out.slice(0, tool.error ? 300 : 200)} error={tool.error} />}
     </>
   );
@@ -359,12 +458,7 @@ function ReadBody({ input, tool }: BodyProps) {
   return (
     <>
       {parts.length > 0 && <FileMeta>{parts.join(", ")}</FileMeta>}
-      {out && (
-        <Pre>
-          {out.slice(0, 2000)}
-          {out.length > 2000 ? "\n…" : ""}
-        </Pre>
-      )}
+      {out && <ExpandablePre text={out} max={2000} language={languageForPath(asStr(input?.file_path))} />}
     </>
   );
 }
@@ -380,13 +474,117 @@ function WriteBody({ input, tool }: BodyProps) {
   return (
     <>
       {content && (
-        <Pre>
-          {content.slice(0, 500)}
-          {content.length > 500 ? "\n…" : ""}
-        </Pre>
+        <ExpandablePre text={content} max={500} language={languageForPath(asStr(input?.file_path))} />
       )}
       {out && <StatusLine text={out.slice(0, 200)} error={tool.error} />}
     </>
+  );
+}
+
+/** 转义正则元字符,把字面 pattern 安全转为 RegExp 源。 */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Grep pattern → 命中高亮用 RegExp:先按原样试(ripgrep 语法大体兼容 JS),
+ *  非法则按字面转义;仍失败 → null(不高亮)。 */
+function grepPatternRegex(pattern: string): RegExp | null {
+  if (!pattern) return null;
+  try {
+    return new RegExp(pattern, "gi");
+  } catch {
+    try {
+      return new RegExp(escapeRegExp(pattern), "gi");
+    } catch {
+      return null;
+    }
+  }
+}
+
+/** 单行文本按 regex 命中包 <mark>(React 节点拼接,非 innerHTML,天然防注入)。 */
+function markLine(line: string, re: RegExp): ReactNode {
+  const parts: ReactNode[] = [];
+  let last = 0;
+  re.lastIndex = 0;
+  for (let m = re.exec(line); m; m = re.exec(line)) {
+    if (m[0] === "") {
+      // 零宽匹配(如 `a*`)不高亮且必须手动推进,防死循环。
+      re.lastIndex += 1;
+      continue;
+    }
+    if (m.index > last) parts.push(line.slice(last, m.index));
+    parts.push(
+      <mark key={`${m.index}-${parts.length}`} className="rounded-sm bg-warning-soft px-0.5 text-fg">
+        {m[0]}
+      </mark>,
+    );
+    last = m.index + m[0].length;
+  }
+  if (parts.length === 0) return line;
+  if (last < line.length) parts.push(line.slice(last));
+  return parts;
+}
+
+/** Grep 内容输出:按 pattern 高亮命中(M2),截断可展开(F4)。 */
+function GrepOutput({ text, pattern }: { text: string; pattern: string }) {
+  const full = useContext(ToolBodyFullContext);
+  const slice = useExpandableSlice(text, 2000);
+  const re = useMemo(() => grepPatternRegex(pattern), [pattern]);
+  return (
+    <>
+      <pre
+        className={cn(
+          "mt-1.5 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg",
+          !full && "max-h-80",
+        )}
+      >
+        {re
+          ? slice.shown.split("\n").map((line, i) => (
+              <span key={`${i}-${line.slice(0, 16)}`}>
+                {i > 0 ? "\n" : null}
+                {markLine(line, re)}
+              </span>
+            ))
+          : slice.shown}
+        {slice.truncated ? "\n…" : null}
+      </pre>
+      <ExpandControls slice={slice} />
+    </>
+  );
+}
+
+/** Grep files_with_matches 输出 → 文件列表(M2)。 */
+function GrepFileList({ text }: { text: string }) {
+  const [showAll, setShowAll] = useState(false);
+  const files = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (files.length === 0) return null;
+  const limit = showAll ? files.length : 30;
+  return (
+    <div className="mt-1.5">
+      <ul className="flex flex-col gap-0.5">
+        {files.slice(0, limit).map((f) => (
+          <li key={f} className="flex items-center gap-1.5 font-mono text-xs text-muted">
+            <FileText size={12} className="shrink-0 text-faint" aria-hidden="true" />
+            <span className="min-w-0 break-all">{shortPath(f)}</span>
+          </li>
+        ))}
+      </ul>
+      {files.length > limit && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setShowAll(true);
+          }}
+          className="mt-1 rounded text-xs text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          展开全部（共 {files.length} 个文件）
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -396,15 +594,16 @@ function GrepBody({ input, tool }: BodyProps) {
   if (input?.glob) parts.push(`glob: ${asStr(input.glob)}`);
   if (input?.output_mode) parts.push(asStr(input.output_mode));
   const out = tool.output;
+  const filesMode = asStr(input?.output_mode) === "files_with_matches";
   return (
     <>
       {parts.length > 0 && <FileMeta>{parts.join(" · ")}</FileMeta>}
-      {out && (
-        <Pre>
-          {out.slice(0, 2000)}
-          {out.length > 2000 ? "\n…" : ""}
-        </Pre>
-      )}
+      {out &&
+        (filesMode ? (
+          <GrepFileList text={out} />
+        ) : (
+          <GrepOutput text={out} pattern={asStr(input?.pattern)} />
+        ))}
     </>
   );
 }
@@ -414,12 +613,7 @@ function GlobBody({ input, tool }: BodyProps) {
   return (
     <>
       {input?.path && <FileMeta>{shortPath(input.path)}</FileMeta>}
-      {out && (
-        <Pre>
-          {out.slice(0, 2000)}
-          {out.length > 2000 ? "\n…" : ""}
-        </Pre>
-      )}
+      {out && <ExpandablePre text={out} max={2000} />}
     </>
   );
 }
@@ -506,7 +700,7 @@ function BrowserBody({ op, input, tool }: BodyProps & { op: string }) {
     );
   } else if (op === "browser_evaluate" || op === "browser_run_code") {
     const code = asStr(input?.code) || asStr(input?.function);
-    if (code) head = <Pre>{code.slice(0, 1500)}</Pre>;
+    if (code) head = <ExpandablePre text={code} max={1500} language="javascript" />;
   } else if (input) {
     const target = asStr(input.element) || asStr(input.ref);
     const text = asStr(input.text);
@@ -746,7 +940,7 @@ function SkillWriteCard({ op, input, tool }: BodyProps & { op: string }) {
       </div>
       {body && (
         <details>
-          <summary className="cursor-pointer text-[11.5px] text-accent hover:underline">查看技能正文</summary>
+          <summary className="cursor-pointer rounded text-[11.5px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看技能正文</summary>
           <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
             {body}
           </pre>
@@ -905,7 +1099,7 @@ function ScanSciResults({
         return (
           <div key={i} className="rounded-md border border-border bg-surface px-3 py-2">
             <div className="break-words text-[13px] font-medium text-fg">
-              {asStr(r.title) || asStr(r.display_name) || asStr(r.identifier) || asStr(r.doi) || "Untitled paper"}
+              {asStr(r.title) || asStr(r.display_name) || asStr(r.identifier) || asStr(r.doi) || "无标题论文"}
             </div>
             {parts.length > 0 && <div className="mt-0.5 text-xs text-faint">{parts.join(" · ")}</div>}
             {onPaper && identifier && (

@@ -674,6 +674,15 @@ export function mergeFullServerWins(
       unpublishedFinalOwners.add(m._clientMessageId);
     }
   }
+  const isUnpublishedProcessRow = (message: ChatMessage): boolean => {
+    const owner = turnOwnerId(message);
+    return (
+      typeof owner === "string" &&
+      unpublishedFinalOwners.has(owner) &&
+      isTapeBackedAgentProcessRole(message.role) &&
+      message.role !== "assistant"
+    );
+  };
   const hasExactCompletionEvidence =
     !!completedClientMessageId &&
     server.some(
@@ -725,10 +734,7 @@ export function mergeFullServerWins(
       const belongsToActiveTurn =
         typeof opts.activeClientMessageId === "string" &&
         (ownerId === opts.activeClientMessageId || legacyActiveRows.has(m));
-      const unpublishedProcess =
-        typeof ownerId === "string" &&
-        unpublishedFinalOwners.has(ownerId) &&
-        m.role !== "assistant";
+      const unpublishedProcess = isUnpublishedProcessRow(m);
       if (!belongsToActiveTurn && !unpublishedProcess) return false;
     }
     if (
@@ -753,12 +759,7 @@ export function mergeFullServerWins(
       // 惰性过程记录不随会话首读返回，其缺席是预期。
       !isLocallyExpandedTapeRow(m) &&
       // Phase-A unpublished page is not absence proof for this turn's process rows.
-      !(
-        typeof turnOwnerId(m) === "string" &&
-        unpublishedFinalOwners.has(turnOwnerId(m)!) &&
-        isTapeBackedAgentProcessRole(m.role) &&
-        m.role !== "assistant"
-      )
+      !isUnpublishedProcessRow(m)
     ) {
       return false;
     }
@@ -797,7 +798,11 @@ export function mergeFullServerWins(
           (m.role === "system" && !isServerAuthoredRow(m)) ||
           // ⑥ Lazy process rows:the ordinary timeline returns the control + narrative, not fetched process pages.
           //    中段)时,须与 P1 缺席豁免一致地保留,否则 full sync 把中段展开态打回折叠。
-          isLocallyExpandedTapeRow(m)),
+          isLocallyExpandedTapeRow(m) ||
+          // Repeated Phase-A pages move live process rows into the middle once
+          // the fallback assistant is already the durable tail. Preserve them
+          // until Phase-B exact tape rows positively supersede the live copy.
+          isUnpublishedProcessRow(m)),
     );
   if (!tail.length && !preservedMid.length) {
     return repairPostFinalProcessOrder(

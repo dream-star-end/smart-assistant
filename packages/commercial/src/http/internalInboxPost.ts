@@ -43,9 +43,9 @@ import {
   setSecurityHeaders,
 } from "./util.js";
 
-export const INBOX_POST_PATH = "/internal/v3/inbox-post";
+export { INBOX_POST_PATH } from "@openclaude/protocol";
 /** 熔断等 warning 级告警。容器 inbox-post 只认 info,必须走这条才能进 createInboxMessage。 */
-export const INBOX_ALERT_PATH = "/internal/v3/inbox-alert";
+export { INBOX_ALERT_PATH } from "@openclaude/protocol";
 
 /** createInboxMessage zod 上限:title ≤ 200 / body_md ≤ 16384。本端点 body 再收紧到 4096。 */
 const MAX_TITLE = 200;

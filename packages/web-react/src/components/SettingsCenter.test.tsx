@@ -74,7 +74,10 @@ test('关于分区说明使用 text-caption text-faint，标题保持 text-title
   render(<SettingsCenter {...base} initialSection="about" />)
 
   expect(screen.getByText('设置')).toHaveClass('text-title')
-  expect(screen.getByText(BRAND.slogan)).toHaveClass('text-caption', 'text-faint')
+  expect(screen.getByText(`${BRAND.nameEn} · ${BRAND.slogan}`)).toHaveClass(
+    'text-caption',
+    'text-faint',
+  )
 })
 
 test.each([

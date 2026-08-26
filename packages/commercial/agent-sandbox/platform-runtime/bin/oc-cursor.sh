@@ -39,7 +39,9 @@ EOF
 # it inside an `|| true` cleanup path.
 for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
   /usr/bin/mktemp /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat \
-  /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/mv /bin/date /bin/ln; do
+  /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/mv /bin/date /bin/ln \
+  /usr/bin/cut /usr/bin/find /usr/bin/mkfifo /usr/bin/sha256sum \
+  /usr/bin/tail /usr/bin/tee; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
@@ -176,12 +178,21 @@ workspace=$(pwd -P)
 #
 # Other Models (Opus and the rest) additionally skip slots marked
 # `cursor_only` in `.quota-class`. That sidecar has no secrets. Cursor Models
-# still see every active slot.
+# still see every active slot. If every active slot is classified cursor_only,
+# one slot is periodically rechecked instead of permanently self-locking the
+# pool. A successful recheck emits `ok`, allowing the master to learn
+# `other_ok`; a failed recheck is throttled for ten minutes.
 chosen_key_file=$auth_file
 rotation_file=${OC_CURSOR_KEY_ROTATION_FILE:-/tmp/openclaude-cursor-key-rotation}
 rotation_cooldown=600
 rotation_idx=0
 rotation_exp=0
+other_models_recheck=0
+other_models_recheck_file=${OC_CURSOR_OTHER_MODELS_RECHECK_FILE:-/tmp/openclaude-cursor-other-models-recheck}
+other_models_recheck_cooldown=${OC_CURSOR_OTHER_MODELS_RECHECK_COOLDOWN:-600}
+case "$other_models_recheck_cooldown" in
+  ''|*[!0-9]*) other_models_recheck_cooldown=600 ;;
+esac
 
 cursor_family=other_models
 case "$model" in
@@ -205,6 +216,8 @@ if [ "$cursor_family" = "other_models" ]; then
       || sidecar_text=""
     eligible_names=""
     eligible_count=0
+    cursor_only_names=""
+    cursor_only_count=0
     for key_name in $key_names; do
       slot_class=unknown
       while IFS= read -r line || [ -n "$line" ]; do
@@ -224,13 +237,26 @@ if [ "$cursor_family" = "other_models" ]; then
 $sidecar_text
 SIDECAR
       if [ "$slot_class" = "cursor_only" ]; then
+        cursor_only_names="$cursor_only_names $key_name"
+        cursor_only_count=$((cursor_only_count + 1))
         continue
       fi
       eligible_names="$eligible_names $key_name"
       eligible_count=$((eligible_count + 1))
     done
     if [ "$eligible_count" -eq 0 ]; then
-      die "Cursor other-models quota unavailable"
+      recheck_exp=$(/bin/cat -- "$other_models_recheck_file" 2>/dev/null) || recheck_exp=0
+      case "$recheck_exp" in
+        ''|*[!0-9]*) recheck_exp=0 ;;
+      esac
+      recheck_now=$(/bin/date +%s)
+      if [ "$recheck_now" -lt "$recheck_exp" ]; then
+        die "Cursor other-models quota unavailable"
+      fi
+      [ "$cursor_only_count" -gt 0 ] || die "Cursor other-models quota unavailable"
+      eligible_names=$cursor_only_names
+      eligible_count=$cursor_only_count
+      other_models_recheck=1
     fi
   fi
 fi
@@ -241,6 +267,15 @@ if [ "$eligible_count" -ge 1 ]; then
     chosen_key_file=$auth_dir/$key_name
     break
   done
+fi
+
+# Parse .sand-mode sidecar if present to determine Sand mode for the chosen slot.
+sand_enabled=0
+if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null \
+  || /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null; then
+  sand_sidecar_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.sand-mode" 2>/dev/null) \
+    || sand_sidecar_text=$(/bin/cat -- "$auth_dir/.sand-mode" 2>/dev/null) \
+    || sand_sidecar_text=""
 fi
 
 if [ "$eligible_count" -gt 1 ]; then
@@ -282,12 +317,22 @@ fi
 
 # Advance the eligible pool past the slot that just failed. No-op for
 # single-eligible accounts, so their failure path stays byte-identical.
+
 rotation_advance() {
   [ "$eligible_count" -gt 1 ] || return 0
   rotation_next=$((rotation_idx + 1))
   if [ "$rotation_next" -ge "$eligible_count" ]; then rotation_next=0; fi
   printf '%s %s\n' "$rotation_next" "$(( $(/bin/date +%s) + rotation_cooldown ))" \
     > "$rotation_file" 2>/dev/null || :
+}
+mark_other_models_recheck_failure() {
+  [ "$other_models_recheck" -eq 1 ] || return 0
+  printf '%s\n' "$(( $(/bin/date +%s) + other_models_recheck_cooldown ))" \
+    > "$other_models_recheck_file" 2>/dev/null || :
+}
+clear_other_models_recheck() {
+  [ "$other_models_recheck" -eq 1 ] || return 0
+  /bin/rm -f -- "$other_models_recheck_file" 2>/dev/null || :
 }
 emit_slot_result() {
   _kind=$1
@@ -301,13 +346,36 @@ emit_slot_result() {
   done
 }
 
+chosen_key_name=${chosen_key_file##*/}
+if [ -n "${sand_sidecar_text:-}" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    slot_name=${line%% *}
+    slot_sand=${line#"$slot_name"}
+    slot_sand=${slot_sand# }
+    slot_sand=${slot_sand%% *}
+    if [ "$slot_name" = "$chosen_key_name" ]; then
+      case "$slot_sand" in
+        1|true|sand) sand_enabled=1 ;;
+        *) sand_enabled=0 ;;
+      esac
+    fi
+  done <<SAND_SIDECAR
+$sand_sidecar_text
+SAND_SIDECAR
+fi
+
 if ! api_key=$(/usr/bin/sudo -n /bin/cat -- "$chosen_key_file" 2>/dev/null); then
   emit_slot_result fail
+  mark_other_models_recheck_failure
   rotation_advance
   die "Cursor credential mount is unreadable"
 fi
 if [ -z "$api_key" ]; then
   emit_slot_result fail
+  mark_other_models_recheck_failure
   rotation_advance
   die "Cursor credential is malformed"
 fi
@@ -316,6 +384,7 @@ case "$api_key" in
   *"
 "*|*"$carriage_return"*)
     emit_slot_result fail
+    mark_other_models_recheck_failure
     rotation_advance
     die "Cursor credential is malformed"
     ;;
@@ -325,6 +394,10 @@ umask 077
 cursor_home=$(/usr/bin/mktemp -d /tmp/openclaude-cursor.XXXXXXXX) \
   || die "cannot create ephemeral Cursor state"
 child_pid=""
+cursor_debug=0
+debug_log=""
+debug_fifo=""
+tee_pid=""
 
 # `kill` must stay the shell builtin. On Debian /bin/kill belongs to procps,
 # which the runtime image does not install, so an absolute path silently exits
@@ -347,6 +420,23 @@ cleanup() {
   fi
   if [ -n "$child_pid" ]; then
     wait "$child_pid" 2>/dev/null || true
+  fi
+  # Debug mode: the CLI's own debug logs live inside the ephemeral HOME and
+  # would die with it. Salvage a bounded copy into the durable 0600 log before
+  # removal. find does not follow symlinks; per-file cap keeps the log sane.
+  if [ "${cursor_debug:-0}" = "1" ] && [ -n "${debug_log:-}" ] && [ ! -L "$debug_log" ]; then
+    /usr/bin/find "$cursor_home" -maxdepth 6 -type f -name '*.log' 2>/dev/null \
+      | while IFS= read -r cli_log; do
+          printf '\n[oc-cursor] -- CLI log tail: %s --\n' "${cli_log#"$cursor_home"/}" \
+            >> "$debug_log" 2>/dev/null || true
+          /usr/bin/tail -c 1048576 -- "$cli_log" >> "$debug_log" 2>/dev/null || true
+        done
+  fi
+  # tee is not in the CLI process group; if a stray descendant kept the fifo
+  # write end open (or the CLI never opened it), terminate tee explicitly so
+  # it can never outlive the wrapper.
+  if [ -n "${tee_pid:-}" ] && kill -0 "$tee_pid" 2>/dev/null; then
+    kill -TERM "$tee_pid" 2>/dev/null || true
   fi
   /bin/rm -rf -- "$cursor_home"
 }
@@ -461,6 +551,86 @@ if [ -n "$hooks_json" ]; then
 fi
 unset OPENCLAUDE_CURSOR_HOOKS_JSON
 
+# ── Optional CLI cold-start diagnostics (OPENCLAUDE_CURSOR_AGENT_DEBUG=1) ──
+# Default OFF: behavior stays bit-identical to the historical wrapper. When
+# ON, the pinned CLI keeps its own debug logging (CURSOR_AGENT_DISABLE_DEBUG_LOG
+# is NOT set) and stderr is duplicated through a fifo+tee into a durable 0600
+# log under OPENCLAUDE_HOME/logs/cursor-cli/, so 30-40s cold starts can be
+# attributed (login/JWT vs cloud handshake vs MCP). Session key never enters
+# the path (sha256 prefix only). 10MB single rotation + 7-day retention.
+# Every validation failure fails OPEN to "no log" — it must never fail the
+# turn, change the CLI exit status, or detach $child_pid from the CLI group.
+if [ "${OPENCLAUDE_CURSOR_AGENT_DEBUG:-}" = "1" ] && [ -n "$oc_home" ] && [ -d "$oc_home" ]; then
+  log_root="$oc_home/logs/cursor-cli"
+  if /bin/mkdir -p -m 0700 -- "$log_root" 2>/dev/null \
+    && [ -d "$log_root" ] && [ ! -L "$oc_home/logs" ] && [ ! -L "$log_root" ]; then
+    /bin/chmod 0700 -- "$oc_home/logs" "$log_root" 2>/dev/null || true
+    session_hash=$(printf '%s' "${OC_SESSION_KEY:-unknown}" \
+      | /usr/bin/sha256sum 2>/dev/null | /usr/bin/cut -c1-16)
+    if [ -n "$session_hash" ]; then
+      debug_log="$log_root/cursor-cli-$session_hash.log"
+      if [ ! -L "$debug_log" ]; then
+        log_size=$(/usr/bin/stat -c %s -- "$debug_log" 2>/dev/null || echo 0)
+        if [ "$log_size" -gt 10485760 ]; then
+          /bin/mv -f -- "$debug_log" "$debug_log.1" 2>/dev/null || true
+        fi
+        /usr/bin/find "$log_root" -maxdepth 1 -type f -name 'cursor-cli-*.log*' \
+          -mtime +7 -delete 2>/dev/null || true
+        debug_fifo="$cursor_home/.oc-debug-stderr"
+        if /usr/bin/mkfifo -m 0600 -- "$debug_fifo" 2>/dev/null; then
+          if printf '\n[oc-cursor] ==== turn %s ====\n' \
+            "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" \
+            >> "$debug_log" 2>/dev/null; then
+            # tee is a wrapper child, NOT in the CLI process group: Stop kills
+            # the group, the fifo write end closes, tee exits on EOF. stderr
+            # keeps flowing to the gateway via >&2.
+            /usr/bin/tee -a -- "$debug_log" < "$debug_fifo" >&2 &
+            tee_pid=$!
+            cursor_debug=1
+          fi
+        fi
+      fi
+    fi
+  fi
+fi
+unset OPENCLAUDE_CURSOR_AGENT_DEBUG
+
+# When Sand mode is enabled for Other Models (Opus, etc.), install ephemeral preload
+# hook to guarantee x-cursor-client-type is sand and pass -H argument.
+# Cursor Models (Grok 4.6 / Grok 4.5 / Composer 2.5) always run in native CLI mode.
+effective_sand=0
+if [ "$sand_enabled" -eq 1 ] && [ "$cursor_family" = "other_models" ]; then
+  effective_sand=1
+fi
+
+if [ "$effective_sand" -eq 1 ]; then
+  sand_hook="$cursor_home/.sand-hook.cjs"
+  /bin/cat <<'EOF' > "$sand_hook"
+const origSet = globalThis.Headers?.prototype?.set;
+if (origSet) {
+  globalThis.Headers.prototype.set = function(k, v) {
+    if (typeof k === "string" && k.toLowerCase() === "x-cursor-client-type") {
+      return origSet.call(this, k, "sand");
+    }
+    return origSet.call(this, k, v);
+  };
+}
+const origAppend = globalThis.Headers?.prototype?.append;
+if (origAppend) {
+  globalThis.Headers.prototype.append = function(k, v) {
+    if (typeof k === "string" && k.toLowerCase() === "x-cursor-client-type") {
+      return origAppend.call(this, k, "sand");
+    }
+    return origAppend.call(this, k, v);
+  };
+}
+EOF
+  /bin/chmod 600 -- "$sand_hook" 2>/dev/null || true
+  node_opts="${NODE_OPTIONS:-}"
+  [ -z "$node_opts" ] && node_opts="--require $sand_hook" || node_opts="$node_opts --require $sand_hook"
+  export NODE_OPTIONS="$node_opts"
+fi
+
 prompt=$1
 shift
 for word in "$@"; do
@@ -478,19 +648,40 @@ fi
 [ -z "$model" ] || set -- --model "$model" "$@"
 [ -z "$mode" ] || set -- --mode "$mode" "$@"
 [ "$force" -eq 0 ] || set -- --force "$@"
+[ "$effective_sand" -eq 0 ] || set -- -H "x-cursor-client-type: sand" "$@"
 
 # setsid gives the CLI and every tool child one process group so Stop cannot
 # leave a shell command running after the wrapper exits. HOME is per-call and
 # deleted on every exit, including Cursor's generated auth.json/JWT state.
+# The debug branch differs ONLY in (a) not disabling the CLI debug log and
+# (b) redirecting stderr through the fifo tee — same setsid group, same $!,
+# same exit-status propagation. No pipeline: `wait` still returns the CLI's
+# own status.
 set +e
-HOME="$cursor_home" \
-XDG_CONFIG_HOME="$cursor_home/.config" \
-CURSOR_AGENT_DISABLE_DEBUG_LOG=1 \
-CURSOR_API_KEY="$api_key" \
-/usr/bin/setsid "$cursor_bin" "$@" &
+if [ "$cursor_debug" -eq 1 ]; then
+  HOME="$cursor_home" \
+  XDG_CONFIG_HOME="$cursor_home/.config" \
+  CURSOR_API_KEY="$api_key" \
+  /usr/bin/setsid "$cursor_bin" "$@" 2> "$debug_fifo" &
+else
+  HOME="$cursor_home" \
+  XDG_CONFIG_HOME="$cursor_home/.config" \
+  CURSOR_AGENT_DISABLE_DEBUG_LOG=1 \
+  CURSOR_API_KEY="$api_key" \
+  /usr/bin/setsid "$cursor_bin" "$@" &
+fi
 child_pid=$!
 wait "$child_pid"
 status=$?
+# Bounded drain for tee (≤2s): descendants killed by cleanup may still hold
+# the fifo write end; never let a stuck tee hang the turn — cleanup TERMs it.
+if [ -n "$tee_pid" ]; then
+  attempts=0
+  while [ "$attempts" -lt 40 ] && kill -0 "$tee_pid" 2>/dev/null; do
+    /bin/sleep 0.05
+    attempts=$((attempts + 1))
+  done
+fi
 set -e
 
 # A failed turn may be a quota/credential problem on the slot it used: hand
@@ -498,9 +689,11 @@ set -e
 # turns (user Stop) exit through forward_signal and do not touch the state.
 if [ "$status" -ne 0 ]; then
   emit_slot_result fail
+  mark_other_models_recheck_failure
   rotation_advance
 else
   emit_slot_result ok
+  clear_other_models_recheck
 fi
 
 # Shorten the lifetime of the shell copy before EXIT removes the temp HOME.
