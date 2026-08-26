@@ -595,9 +595,15 @@ if [ "${OPENCLAUDE_CURSOR_AGENT_DEBUG:-}" = "1" ] && [ -n "$oc_home" ] && [ -d "
 fi
 unset OPENCLAUDE_CURSOR_AGENT_DEBUG
 
-# When Sand mode is enabled, install ephemeral preload hook to guarantee
-# x-cursor-client-type is sand and pass -H argument.
-if [ "$sand_enabled" -eq 1 ]; then
+# When Sand mode is enabled for Other Models (Opus, etc.), install ephemeral preload
+# hook to guarantee x-cursor-client-type is sand and pass -H argument.
+# Cursor Models (Grok 4.6 / Grok 4.5 / Composer 2.5) always run in native CLI mode.
+effective_sand=0
+if [ "$sand_enabled" -eq 1 ] && [ "$cursor_family" = "other_models" ]; then
+  effective_sand=1
+fi
+
+if [ "$effective_sand" -eq 1 ]; then
   sand_hook="$cursor_home/.sand-hook.cjs"
   /bin/cat <<EOF > "$sand_hook"
 const origSet = globalThis.Headers?.prototype?.set;
@@ -642,7 +648,7 @@ fi
 [ -z "$model" ] || set -- --model "$model" "$@"
 [ -z "$mode" ] || set -- --mode "$mode" "$@"
 [ "$force" -eq 0 ] || set -- --force "$@"
-[ "$sand_enabled" -eq 0 ] || set -- -H "x-cursor-client-type: sand" "$@"
+[ "$effective_sand" -eq 0 ] || set -- -H "x-cursor-client-type: sand" "$@"
 
 # setsid gives the CLI and every tool child one process group so Stop cannot
 # leave a shell command running after the wrapper exits. HOME is per-call and
