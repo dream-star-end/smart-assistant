@@ -20,6 +20,8 @@ describe('从简 Landing', () => {
     render(<Landing {...base} onStart={() => {}} onLogin={() => {}} />)
 
     expect(screen.getByRole('heading', { name: '让复杂，从简。' })).toBeInTheDocument()
+    expect(screen.getAllByLabelText('从简 · Clarvy').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Clarvy').length).toBeGreaterThan(0)
     expect(screen.getAllByText(/全能 Agent 工作台/).length).toBeGreaterThanOrEqual(2)
     expect(screen.getByText('产品能力演示')).toBeInTheDocument()
     expect(screen.getByText('你给目标，从简负责过程。')).toBeInTheDocument()
