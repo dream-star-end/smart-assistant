@@ -5,6 +5,7 @@
  * 码是对外契约(容器 RPC 的 {kind:'error', code} 与用户 API 的 {error:{code}} 都用它),
  * 一旦发布不得随意改名;新增走追加。
  */
+import type { PluginPassthroughErrorCode } from '../plugins/pluginErrorGuidance.js'
 
 export type ConnectorErrorCode =
   // 入参 / 目录
@@ -49,15 +50,18 @@ export type ConnectorErrorCode =
   // 兜底
   | 'INTERNAL'
 
+/** RPC 对外码 = v1 连接器稳定码 ∪ 微博/Plugin 白名单码(additive)。 */
+export type ConnectorRpcErrorCode = ConnectorErrorCode | PluginPassthroughErrorCode
+
 /**
  * 连接器统一错误。`code` 是稳定对外码;`message` 只用于服务端日志/开发,
  * **绝不**把上游原文/凭据放进来。用户/容器看到的永远只有 code。
  */
 export class ConnectorError extends Error {
-  readonly code: ConnectorErrorCode | string
+  readonly code: ConnectorRpcErrorCode
   /** 对应的用户 HTTP 状态(容器 RPC 侧只用 code,不用它)。 */
   readonly httpStatus: number
-  constructor(code: ConnectorErrorCode | string, message?: string, httpStatus?: number) {
+  constructor(code: ConnectorRpcErrorCode, message?: string, httpStatus?: number) {
     super(message ?? code)
     this.name = 'ConnectorError'
     this.code = code
@@ -65,7 +69,7 @@ export class ConnectorError extends Error {
   }
 }
 
-function defaultHttpStatus(code: ConnectorErrorCode | string): number {
+function defaultHttpStatus(code: ConnectorRpcErrorCode): number {
   switch (code) {
     case 'BAD_REQUEST':
     case 'VALIDATION_FAILED':
