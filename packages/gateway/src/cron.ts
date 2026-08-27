@@ -2105,7 +2105,11 @@ export class CronScheduler {
     // label 显式携带即生效:空串 = 清空(回退到 prompt 显示),与 create 的可选语义对称。
     if (updates.label !== undefined) job.label = updates.label || undefined
     if (updates.deliver !== undefined) {
-      this.assertDeliverValue(updates.deliver)
+      // 前端编辑会原样回传 deliver。既有 cron.yaml 合法值(如 telegram)在当前
+      // 进程未注册对应 adapter 时,未变更不得因注册表校验拦掉整次保存。
+      if (updates.deliver !== job.deliver) {
+        this.assertDeliverValue(updates.deliver)
+      }
       job.deliver = updates.deliver
     }
     // oneshot 可改:重复→一次性(下次触发后自动停用)或反向。改为重复时若任务曾因

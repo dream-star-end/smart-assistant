@@ -3,10 +3,12 @@
  *
  * 2026-08 行为变化:UI 默认 deliver='webchat' 现视为**显式选择**,不再被 QQ/微信抢先接管。
  * 理由:用户在管理中心选「网页对话」是明确意图;有在线 webchat 客户端就应先落到网页。
- * 显式通道不可达/失败后,才走自动瀑布(QQ → 微信 → lastActive → 广播 → 站内信)。
+ * 显式通道**未注册**才回落自动瀑布(QQ → 微信 → lastActive → 广播 → 站内信)。
+ * 已注册 adapter 一旦被调用后抛错(=已尝试发送但失败)照旧上抛,保留 cron outbox
+ * 以同一 deliveryId 重试,不回落、不改走站内信。
  *
  * 不变式:
- *   - QQ/微信 retryable 失败仍上抛,保留 cron outbox(同 deliveryId 重试);
+ *   - QQ/微信/已注册 adapter 的 retryable 失败仍上抛,保留 cron outbox(同 deliveryId 重试);
  *   - 微信会话过期 fallback 标注文本;
  *   - 任一通道送达成功不再兜底(don't double-notify);
  *   - buildOut 带 cronJob 元数据;广播路径内联 ts,不走 deliver()(其只作用单 peerKey);
@@ -154,13 +156,11 @@ export async function deliverCronOutput(
     } else {
       const adapter = deps.channels.get(job.deliver as string)
       if (adapter) {
-        try {
-          await deliverCronViaAdapter(adapter, buildOut(job.deliverTarget?.peerId || '__cron__'))
-          return
-        } catch {
-          // 显式 adapter 不可达/失败 → 回落自动瀑布。QQ/微信 retryable 上抛仍在下面。
-        }
+        // 已注册:发送失败必须上抛,scheduler 才能把同 deliveryId 留在 outbox 重试。
+        await deliverCronViaAdapter(adapter, buildOut(job.deliverTarget?.peerId || '__cron__'))
+        return
       }
+      // adapter 未注册 = 通道不可达,才回落自动瀑布。
     }
   }
 

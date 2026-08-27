@@ -139,7 +139,7 @@ describe('deliverCronOutput — 显式通道置顶', () => {
     assert.equal(calls.inbox.length, 0)
   })
 
-  it('显式通道失败回落自动瀑布,QQ retryable 仍上抛', async () => {
+  it('显式 adapter 已注册但发送失败 → 异常上抛,不回落、不落站内信', async () => {
     const channels = new Map<string, { send(value: unknown): Promise<void> }>()
     channels.set('telegram', {
       send: async () => { throw new Error('telegram down') },
@@ -151,6 +151,20 @@ describe('deliverCronOutput — 显式通道置顶', () => {
     })
     await assert.rejects(
       () => deliverCronOutput('hello', { ...JOB, deliver: 'telegram' }, { dueMinuteKey: 1, deliveryId: 'cron.tg-fail' }, deps),
+      /telegram down/,
+    )
+    assert.equal(calls.qq, 0)
+    assert.equal(calls.wechat, 0)
+    assert.equal(calls.inbox.length, 0)
+  })
+
+  it('显式通道未注册才回落自动瀑布,QQ retryable 仍上抛', async () => {
+    const { deps, calls } = makeDeps({
+      qq: { kind: 'failure', retryable: true, code: 'QQ_TRANSPORT_FAILED' },
+      wechat: { kind: 'delivered' },
+    })
+    await assert.rejects(
+      () => deliverCronOutput('hello', { ...JOB, deliver: 'telegram' }, { dueMinuteKey: 1, deliveryId: 'cron.tg-unreg' }, deps),
       (err: unknown) =>
         err instanceof Error &&
         (err as Error & { code?: string; retryable?: boolean }).code === 'QQ_TRANSPORT_FAILED' &&
