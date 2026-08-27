@@ -16,9 +16,12 @@ import { EventEmitter } from 'node:events'
 import { describe, it } from 'node:test'
 import { ALLOWED_INBOUND_MODELS, resolveExecutionModel } from '../server.js'
 import {
+  DEFAULT_CCB_SUBAGENT_MODEL,
   DEFAULT_SECONDARY_UTILITY_MODEL,
   SubprocessRunner,
+  _buildCcbSubagentModelEnv,
   _buildSecondaryUtilityModelEnv,
+  resolveCcbSubagentModel,
 } from '../subprocessRunner.js'
 
 function createRunner(
@@ -282,6 +285,30 @@ describe('SubprocessRunner secondary utility model env', () => {
       if (prev === undefined) delete process.env.OPENCLAUDE_SECONDARY_MODEL
       else process.env.OPENCLAUDE_SECONDARY_MODEL = prev
     }
+  })
+})
+
+describe('CCB subagent model env (CLAUDE_CODE_SUBAGENT_MODEL)', () => {
+  it('inherits a catalog-routable parent model', () => {
+    assert.equal(resolveCcbSubagentModel('glm-5.3-zai'), 'glm-5.3-zai')
+    assert.deepEqual(
+      _buildCcbSubagentModelEnv({ sessionModel: 'glm-5.3-zai', routing: 'settings-default' }),
+      { CLAUDE_CODE_SUBAGENT_MODEL: 'glm-5.3-zai' },
+    )
+  })
+
+  it('does not pin haiku / grok-build / official Claude — those 403 on selfhost catalog', () => {
+    assert.equal(resolveCcbSubagentModel('haiku'), DEFAULT_CCB_SUBAGENT_MODEL)
+    assert.equal(resolveCcbSubagentModel('claude-haiku-4-5-20251001'), DEFAULT_CCB_SUBAGENT_MODEL)
+    assert.equal(resolveCcbSubagentModel('grok-build'), DEFAULT_CCB_SUBAGENT_MODEL)
+    assert.equal(DEFAULT_CCB_SUBAGENT_MODEL, 'glm-5.3-zai')
+  })
+
+  it('leaves oauth-direct unpinned so real Anthropic keeps Haiku', () => {
+    assert.deepEqual(
+      _buildCcbSubagentModelEnv({ sessionModel: 'glm-5.3-zai', routing: 'oauth-direct' }),
+      {},
+    )
   })
 })
 

@@ -203,10 +203,44 @@ export function _buildCcbUsageAttributionEnv(
  */
 export const DEFAULT_SECONDARY_UTILITY_MODEL = 'deepseek-v4-flash'
 
+/** Fallback when the parent CCB model is not a catalog-routable CCB slug
+ *  (grok-build / cursor-* / claude-haiku / official Claude aliases). Selfhost
+ *  catalog has no haiku; CCB Agent `model: "haiku"` otherwise 403s at the
+ *  anthropic proxy. Official CCB honors CLAUDE_CODE_SUBAGENT_MODEL above the
+ *  tool-specified alias (claude-code-best/src/utils/model/agent.ts). */
+export const DEFAULT_CCB_SUBAGENT_MODEL = 'glm-5.3-zai'
+
+export function isCcbRoutableSubagentModel(model: string | undefined): boolean {
+  if (typeof model !== 'string') return false
+  const trimmed = model.trim()
+  if (!trimmed || !/^[A-Za-z0-9._-]{1,64}$/.test(trimmed)) return false
+  if (/^claude-/i.test(trimmed)) return false
+  if (/^(haiku|sonnet|opus)(\b|$)/i.test(trimmed)) return false
+  if (/^grok/i.test(trimmed) || /^cursor-/i.test(trimmed) || /^gpt-/i.test(trimmed)) return false
+  return true
+}
+
+export function resolveCcbSubagentModel(sessionModel?: string): string {
+  if (isCcbRoutableSubagentModel(sessionModel)) return sessionModel!.trim()
+  const override = process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL?.trim()
+  if (isCcbRoutableSubagentModel(override)) return override!
+  return DEFAULT_CCB_SUBAGENT_MODEL
+}
+
 export function _buildSecondaryUtilityModelEnv(): Record<string, string> {
   const model =
     process.env.OPENCLAUDE_SECONDARY_MODEL?.trim() || DEFAULT_SECONDARY_UTILITY_MODEL
   return { ANTHROPIC_SMALL_FAST_MODEL: model }
+}
+
+/** Pin CCB built-in Agent/Task default away from unroutable haiku. Omitted on
+ *  oauth-direct (real Anthropic, where Haiku is valid). */
+export function _buildCcbSubagentModelEnv(input: {
+  sessionModel?: string
+  routing: 'host-static' | 'oauth-direct' | 'settings-default'
+}): Record<string, string> {
+  if (input.routing === 'oauth-direct') return {}
+  return { CLAUDE_CODE_SUBAGENT_MODEL: resolveCcbSubagentModel(input.sessionModel) }
 }
 
 const CCB_TRANSPORT_INTERNAL_KEYS = [
@@ -522,6 +556,10 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
     Object.assign(providerEnv, hostStatic.env)
     // secondary 同 provider 可路由,用主执行模型兜底(不跨 provider 打错)。
     if (input.model) providerEnv.ANTHROPIC_SMALL_FAST_MODEL = input.model
+    Object.assign(providerEnv, _buildCcbSubagentModelEnv({
+      sessionModel: input.model,
+      routing: 'host-static',
+    }))
     return { env: providerEnv, routing: 'host-static', providerId: hostStatic.providerId }
   }
   if (input.effectiveProvider === 'claude-subscription') {
@@ -541,6 +579,10 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
   }
   // settings.json / 容器 proxy env 掌权;secondary 走全局 deepseek-v4-flash(容器可达)。
   Object.assign(providerEnv, _buildSecondaryUtilityModelEnv())
+  Object.assign(providerEnv, _buildCcbSubagentModelEnv({
+    sessionModel: input.model,
+    routing: 'settings-default',
+  }))
   return { env: providerEnv, routing: 'settings-default' }
 }
 
