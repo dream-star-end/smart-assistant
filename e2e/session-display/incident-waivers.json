@@ -164,6 +164,12 @@
       "reason": "selfhost-proven shared-code port onto commercial canonical; no new commercial production incident. Task B 2026-08-28: cherry-pick into feat/v5-aurora-rewrite only, do not deploy.",
       "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
       "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "46b78dedf",
+      "reason": "selfhost-proven shared-code port follow-up: owner-scope Phase-B keep-alive so first unified-timeline adoption still purges predecessor cache. Task B 2026-08-28, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
     }
   ]
 }
