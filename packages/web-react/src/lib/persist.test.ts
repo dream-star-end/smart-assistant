@@ -1994,6 +1994,26 @@ describe("mergeFullServerWins — records_unpublished degrade page", () => {
     expect(merged.find((m) => m.id === "t-as")?._seq).toBe(7);
   });
 
+  test("Phase-B exact page still purges unowned predecessor cache cards", () => {
+    const cached: ChatMessage[] = [
+      { id: "user-latest", role: "user", text: "最新问题", ts: 1 },
+      { id: "legacy-plan", role: "plan", text: "旧缓存计划卡", ts: 2 },
+      { id: "legacy-goal", role: "goal", text: "旧缓存目标卡", ts: 3 },
+      { id: "legacy-group", role: "agent-group", text: "旧缓存团队富卡", ts: 4, _delegateRunId: "old-run" },
+      { id: "legacy-progress", role: "delegate-progress", text: "旧缓存委派进度", ts: 5 },
+    ];
+    const server: ChatMessage[] = [
+      { id: "user-latest", role: "user", text: "最新问题", ts: 1, _source: "server", _timelineRecord: true, _orderSeq: 1 },
+      { id: "thinking-latest", role: "thinking", text: "think", ts: 2, _source: "server", _timelineRecord: true, _orderSeq: 2 },
+      { id: "tool-latest", role: "tool", text: "tool", ts: 3, _source: "server", _timelineRecord: true, _orderSeq: 3, toolName: "Bash" },
+      { id: "answer-latest", role: "assistant", text: "answer", ts: 4, _source: "server", _timelineRecord: true, _turnTapeComplete: true, _turnTapeId: "tape-new", _orderSeq: 4 },
+    ];
+    const merged = mergeFullServerWins(server, cached, 0, undefined, { adoptUnifiedTimeline: true });
+    expect(merged.map((m) => m.id)).toEqual([
+      "user-latest", "thinking-latest", "tool-latest", "answer-latest",
+    ]);
+  });
+
   test("Phase-B exact assistant + deferred agent-group keeps live agent-group", () => {
     const cmid = "u-defer-ag";
     const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1, _source: "server" };

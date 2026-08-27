@@ -626,12 +626,9 @@ export function isLiveProcessPendingExactTape(
     );
   }
   if (hasUnownedUnpublishedAssistant && exactProcessOwners.size === 0) return true;
-  if (!hasUnownedPhaseBAssistant) return false;
-  return !hasDisplayableExactRole(
-    displayableExactByOwnerRole,
-    unownedDisplayableRoles,
-    message.role,
-  );
+  // Phase-B keep-alive is owner-scoped. Unowned leftover cache from a previous
+  // generation must still be purged when the first unified exact page arrives.
+  return false;
 }
 
 /** Journal/units owner-reset: keep pending live process unless incoming units
@@ -874,7 +871,10 @@ export function mergeFullServerWins(
       const belongsToActiveTurn =
         typeof opts.activeClientMessageId === "string" &&
         (ownerId === opts.activeClientMessageId || legacyActiveRows.has(m));
-      const unpublishedProcess = isUnpublishedProcessRow(m);
+      // First unified-timeline adoption must drop predecessor cache, including
+      // client-owned team/progress cards. Phase-B keep-alive is only for the
+      // genuinely active turn.
+      const unpublishedProcess = belongsToActiveTurn && isUnpublishedProcessRow(m);
       if (!belongsToActiveTurn && !unpublishedProcess) return false;
     }
     if (
