@@ -2798,6 +2798,14 @@ export const api = {
     ).then((b) => b.jobs || []);
   },
 
+  /** 可用送达通道（GET /api/cron/channels）。失败由调用方回退写死三项。 */
+  listCronChannels: (a: AuthSession) =>
+    jsonOrThrow<{ channels: Array<{ value: string; available: boolean }> }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/cron/channels", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.channels || []),
+
   /** 新建定时任务（POST /api/cron）。 */
   createCron: (a: AuthSession, body: CronCreateInput) =>
     jsonOrThrow<{ ok: boolean; job?: CronJob }>(

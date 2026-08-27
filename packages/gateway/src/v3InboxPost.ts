@@ -5,7 +5,12 @@
 // 结果就静默丢了。兜底:把这条输出写进 master 的站内信(持久),用户下次上线能看到。
 //
 // 通道/鉴权复用 v3WechatOutbound 的 env(同 baseUrl + 容器 bearer,master 凭 bearer
-// 权威解析 uid → createInboxMessage)。两 env 缺 → 个人/dev → no-op。
+// 权威解析 uid → createInboxMessage)。两 env 缺 → 个人/dev / 中央网关进程 → no-op。
+//
+// 注入点:v3supervisor 按容器写入 OPENCLAUDE_V3_MASTER_BASE_URL +
+// OPENCLAUDE_V3_CONTAINER_TOKEN,不要写进 host EnvironmentFile。中央网关单 bearer
+// 会把所有用户的 cron 站内信记到同一个 uid;selfhost 当前是单主用户,容器 token
+// 绑的就是该 uid,路径可用,但多用户部署仍必须保持 per-container token。
 //
 // 语义:fire-and-forget,永不抛。刻意只在「在线没送到 + 微信没接管」时才由 onDeliver
 // 调用(见 server.ts),避免「送达成功还推站内信」的通知重复(boss UX 铁律)。
