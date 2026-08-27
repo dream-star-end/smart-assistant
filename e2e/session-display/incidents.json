@@ -1783,6 +1783,35 @@
         "eaa0a406",
         "8aa58948"
       ]
+    },
+    {
+      "id": "INC-20260827-LIVE-RESET-PROCESS-VANISH",
+      "occurredAt": "2026-08-27",
+      "severity": "P1",
+      "symptom": "V5 商业版正常结束轮（非用户点停止）后，时间线 thinking/tool/plan 过程行先整体消失，等 Phase-B 精确 tape 到达才恢复。根因是 Phase-A unpublished fallback 带 _turnTapeComplete，convergeTerminalTurns 清掉发送态后，live journal/units 按 cmid 做 owner reset，把无 _source:server/_turnTapeId 的 live 过程行整段滤掉。",
+      "rootFixCommit": "75a50179",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "Phase-A unpublished then empty live-units reset keeps thinking/tool/plan"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "Phase-A unpublished then retired live-frames reset keeps thinking/tool/plan"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "Phase-A fallback without _clientMessageId still keeps live process on repeated merge"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划"
+        }
+      ]
     }
   ]
 }
