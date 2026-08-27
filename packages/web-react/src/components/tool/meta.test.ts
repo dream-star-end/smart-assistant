@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { detectShellFileWrites, normalizeToolForDisplay } from "./format";
+import { Bot, Clock, ShieldCheck } from "lucide-react";
 import { detectOcCli, isMemoryFilePath, parseMcpName, resolveToolMeta, toolSummary } from "./meta";
 // 跨包取 openclaude-memory 工具名单一权威表(与 index.ts TOOLS 声明同源),做锁步断言。
 import {
@@ -219,9 +220,9 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
   });
 
   test("oc-memory delegate 标成委派，不叫记忆", () => {
-    expect(resolveToolMeta("Bash", { command: "oc-memory delegate --goal '修卡片'" }).label).toBe(
-      "委派子任务",
-    );
+    const delegated = resolveToolMeta("Bash", { command: "oc-memory delegate --goal '修卡片'" });
+    expect(delegated.label).toBe("委派子任务");
+    expect(delegated.icon).toBe(Bot);
     expect(toolSummary("Bash", { command: "oc-memory delegate --goal '修卡片'" })).toBe("修卡片");
     expect(resolveToolMeta("Bash", { command: "oc-memory core-search 记忆" }).label).toBe(
       "记忆检索",
@@ -229,6 +230,39 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     expect(
       resolveToolMeta("Bash", { command: "oc-memory request-review --draft '草稿'" }).label,
     ).toBe("质量审查");
+    expect(
+      resolveToolMeta("Bash", { command: "oc-memory request-review --draft '草稿'" }).icon,
+    ).toBe(ShieldCheck);
+    expect(resolveToolMeta("Bash", { command: "oc-memory delegate-wait dlgjob-1" }).label).toBe(
+      "等待委派",
+    );
+    expect(resolveToolMeta("Bash", { command: "oc-memory delegate-wait dlgjob-1" }).icon).toBe(
+      Clock,
+    );
+  });
+
+  test("oc-memory delegate 包装形态仍解析为委派，不落回记忆", () => {
+    const wrapped = [
+      'HOME=/home/agent oc-memory delegate --goal "修卡片"',
+      "OPENCLAUDE_GATEWAY_TOKEN_FILE=/proc/1/fd/3 OPENCLAUDE_GATEWAY_PORT=18790 oc-memory delegate-wait dlgjob-abc",
+      "cd /tmp && oc-memory delegate --goal '修卡片'",
+      "/bin/bash -lc 'HOME=/home/agent oc-memory delegate --goal \"修卡片\"'",
+      "oc-memory delegate --goal '很长的目标文本用来确认截断与引号' | tail",
+      "FOO=1 /usr/local/bin/oc-memory request-review --draft '草稿'",
+    ];
+    expect(resolveToolMeta("Bash", { command: wrapped[0] }).label).toBe("委派子任务");
+    expect(resolveToolMeta("Bash", { command: wrapped[0] }).icon).toBe(Bot);
+    expect(toolSummary("Bash", { command: wrapped[0] })).toBe("修卡片");
+    expect(resolveToolMeta("Bash", { command: wrapped[1] }).label).toBe("等待委派");
+    expect(resolveToolMeta("Bash", { command: wrapped[2] }).label).toBe("委派子任务");
+    expect(resolveToolMeta("Bash", { command: wrapped[3] }).label).toBe("委派子任务");
+    expect(toolSummary("Bash", { command: wrapped[3] })).toBe("修卡片");
+    expect(resolveToolMeta("Bash", { command: wrapped[4] }).label).toBe("委派子任务");
+    expect(resolveToolMeta("Bash", { command: wrapped[5] }).label).toBe("质量审查");
+    expect(resolveToolMeta("Shell", { command: wrapped[0] }).label).toBe("委派子任务");
+    expect(resolveToolMeta("run_terminal_command", { command: wrapped[0] }).label).toBe(
+      "委派子任务",
+    );
   });
 
   test("oc-memory delegate 摘要不把 CLI flag 当副标题", () => {
