@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
@@ -2276,6 +2276,48 @@ for(const e of [
     } finally {
       await rm(destParent, { force: true })
       await rm(path.dirname(srcStore), { recursive: true, force: true })
+      await rm(oldDir, { recursive: true, force: true })
+      await rm(newDir, { recursive: true, force: true })
+    }
+  })
+
+  test('relocateCursorResumeStore copy mid-flight failure leaves dest unpublished', async () => {
+    const oldDir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-relocate-mid-old-'))
+    const newDir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-relocate-mid-new-'))
+    const resumeId = 'aaaaaaaa-bbbb-cccc-dddd-777777777777'
+    const srcStore = cursorResumeStorePath(oldDir, resumeId)
+    const destDir = cursorResumeStoreDir(newDir, resumeId)
+    const destStore = cursorResumeStorePath(newDir, resumeId)
+    const destParent = path.dirname(destDir)
+    await mkdir(path.dirname(srcStore), { recursive: true })
+    await writeFile(srcStore, 'keep-me')
+    await writeFile(`${srcStore}-wal`, 'wal-bytes')
+    _internals.relocateTest.reset()
+    _internals.relocateTest.forceCopy = true
+    _internals.relocateTest.afterCopyFile = () => {
+      throw new Error('injected copy failure')
+    }
+    try {
+      assert.equal(
+        relocateCursorResumeStore({
+          resumeId,
+          currentWorkspacePath: newDir,
+          previousWorkspacePaths: [oldDir],
+        }),
+        undefined,
+      )
+      assert.equal(await readFile(srcStore, 'utf8'), 'keep-me')
+      assert.equal(await readFile(`${srcStore}-wal`, 'utf8'), 'wal-bytes')
+      assert.equal(existsSync(destDir), false)
+      assert.equal(existsSync(destStore), false)
+      const leftovers = existsSync(destParent)
+        ? (await readdir(destParent)).filter((name) => name.includes('.relocating-'))
+        : []
+      assert.deepEqual(leftovers, [])
+    } finally {
+      _internals.relocateTest.reset()
+      await rm(cursorResumeStoreDir(oldDir, resumeId), { recursive: true, force: true })
+      await rm(destDir, { recursive: true, force: true })
       await rm(oldDir, { recursive: true, force: true })
       await rm(newDir, { recursive: true, force: true })
     }

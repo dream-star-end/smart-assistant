@@ -29,7 +29,7 @@ import {
 // side-effect:注册 'ccb' / 'codex' factory。
 import "../engine/ccbAdapter.js";
 import "../engine/codexAdapter.js";
-import { cursorResumeStoreDir, cursorResumeStoreExists, cursorResumeStorePath } from "../engine/cursorAdapter.js";
+import { cursorResumeStoreDir, cursorResumeStoreExists, cursorResumeStorePath, _internals } from "../engine/cursorAdapter.js";
 import type { AgentDef, OpenClaudeConfig } from "@openclaude/storage";
 
 function makeConfigStub(): OpenClaudeConfig {
@@ -374,6 +374,89 @@ describe("Cursor resume workspace path uses the pinned agent cwd", () => {
       assert.equal(cursorResumeStoreExists(defaultWs, sessionId), true);
       assert.equal(existsSync(srcStore), false);
     } finally {
+      if (oldDefault === undefined) delete process.env.OPENCLAUDE_DEFAULT_WORKSPACE;
+      else process.env.OPENCLAUDE_DEFAULT_WORKSPACE = oldDefault;
+      await rm(cursorResumeStoreDir(isolated, sessionId), { recursive: true, force: true });
+      await rm(cursorResumeStoreDir(defaultWs, sessionId), { recursive: true, force: true });
+      await rm(defaultWs, { recursive: true, force: true });
+    }
+  });
+
+  test("concurrent project bind replaces the runner once and shares the lock", async () => {
+    const defaultWs = await mkdtemp(path.join(tmpdir(), "oc-cursor-conc-ws-"));
+    const peerId = "webmtbconcurrent01";
+    const isolated = path.join(defaultWs, "sessions", peerId);
+    await mkdir(isolated, { recursive: true });
+    const sessionId = "aaaaaaaa-bbbb-cccc-dddd-666666666666";
+    const srcStore = cursorResumeStorePath(isolated, sessionId);
+    await mkdir(path.dirname(srcStore), { recursive: true });
+    await writeFile(srcStore, "isolated-turn1");
+    const oldDefault = process.env.OPENCLAUDE_DEFAULT_WORKSPACE;
+    process.env.OPENCLAUDE_DEFAULT_WORKSPACE = defaultWs;
+    const key = `agent:main:webchat:dm:${peerId}`;
+    const { sm, ins } = makeSm();
+    ins._resumeMap.set(key, sessionId);
+    ins._resumeMapProvider.set(key, "cursor");
+    const cursorAgent = { id: "main", model: "cursor-auto" } as AgentDef;
+    try {
+      const first = await sm.getOrCreate({
+        sessionKey: key,
+        agent: cursorAgent,
+        channel: "webchat",
+        peerId,
+        model: "cursor-auto",
+        workspaceMode: "isolated_v1",
+      });
+      assert.equal(first.providerTag, "cursor");
+      assert.equal(first.workspaceCwd, isolated);
+
+      let shutdownCount = 0;
+      let releaseShutdown!: () => void;
+      const shutdownHeld = new Promise<void>((resolve) => {
+        releaseShutdown = resolve;
+      });
+      let enteredShutdown!: () => void;
+      const sawShutdown = new Promise<void>((resolve) => {
+        enteredShutdown = resolve;
+      });
+      const originalShutdown = first.runner.shutdown.bind(first.runner);
+      first.runner.shutdown = async () => {
+        shutdownCount += 1;
+        enteredShutdown();
+        await shutdownHeld;
+        await originalShutdown();
+      };
+
+      const bindOpts = {
+        sessionKey: key,
+        agent: cursorAgent,
+        channel: "webchat" as const,
+        peerId,
+        model: "cursor-auto",
+        workspaceMode: "isolated_v1" as const,
+        workspaceCwd: defaultWs,
+        projectId: "852859fa-aaaa-bbbb-cccc-dddddddddddd",
+      };
+      _internals.relocateTest.reset();
+      const pending = Promise.all([sm.getOrCreate(bindOpts), sm.getOrCreate(bindOpts)]);
+      await sawShutdown;
+      await Promise.resolve();
+      await Promise.resolve();
+      assert.equal(shutdownCount, 1, "second turn must wait on the sessionKey gate");
+      releaseShutdown();
+      const [a, b] = await pending;
+      assert.equal(a, b, "both turns must reuse the same AgentSession");
+      assert.equal(a.runner, b.runner, "only one runner");
+      assert.equal(a.lock, b.lock, "both turns share the same lock chain");
+      assert.equal(shutdownCount, 1, "old runner shutdown once");
+      assert.equal(a.projectId, bindOpts.projectId);
+      assert.equal(a.workspaceCwd, defaultWs);
+      assert.equal(cursorResumeStoreExists(defaultWs, sessionId), true);
+      assert.equal(existsSync(srcStore), false);
+      assert.equal(_internals.relocateTest.attempts, 1, "store must migrate once");
+      assert.equal(a.runner.nativeSessionId, sessionId);
+    } finally {
+      _internals.relocateTest.reset();
       if (oldDefault === undefined) delete process.env.OPENCLAUDE_DEFAULT_WORKSPACE;
       else process.env.OPENCLAUDE_DEFAULT_WORKSPACE = oldDefault;
       await rm(cursorResumeStoreDir(isolated, sessionId), { recursive: true, force: true });
