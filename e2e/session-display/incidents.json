@@ -347,6 +347,16 @@
           "layer": "unit",
           "path": "packages/commercial/src/plugins/weibo.test.ts",
           "assertion": "create_post with media falls through to DOM after a live cookie-path miss"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "create_post with media does not fall through to DOM when cookie helper throws after a full pid set"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "picupload posts multipart pic1 before raw blob and keeps pids if newPage throws"
         }
       ],
       "proofPending": {
@@ -355,7 +365,8 @@
       },
       "coverageCommits": [
         "53a4e840",
-        "e7f96b4d"
+        "e7f96b4d",
+        "60e024ab"
       ]
     },
     {
