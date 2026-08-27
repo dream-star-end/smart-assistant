@@ -66,7 +66,13 @@ const DELIVER_OPTIONS = [
   { value: "local", label: "仅记录", hint: "只写进智能体的记录，不会主动通知你。" },
 ] as const;
 
-const DELIVER_SELECT = DELIVER_OPTIONS.map((o) => ({ value: o.value, label: o.label }));
+const FALLBACK_DELIVER_SELECT: Array<{ value: string; label: string }> = DELIVER_OPTIONS.map(
+  (o) => ({ value: o.value, label: o.label }),
+);
+
+function deliverCopy(value: string): { label: string; hint?: string } {
+  return DELIVER_OPTIONS.find((o) => o.value === value) ?? { label: value };
+}
 
 const WEEKDAY_SELECT = WEEKDAY_OPTIONS.map((o) => ({ value: String(o.value), label: o.label }));
 
@@ -158,7 +164,7 @@ function shortTitle(s: string, max = 20): string {
 }
 
 function deliverLabel(v: string): string {
-  return DELIVER_OPTIONS.find((o) => o.value === v)?.label || v;
+  return deliverCopy(v).label;
 }
 
 /** 表单预填种子：空态预设 chip 与「再跑一次」共用。 */
@@ -203,6 +209,8 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [showRest, setShowRest] = useState(false);
+  /** 拉取失败保持写死三项;成功后只展示 available 通道。 */
+  const [deliverSelect, setDeliverSelect] = useState(FALLBACK_DELIVER_SELECT);
   const [confirmDialog, confirmDialogEl] = useConfirm();
   const toast = useToast();
   const mounted = useRef(true);
@@ -257,6 +265,25 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
       alive = false;
     };
   }, [auth, commitJobs, reload]);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .listCronChannels(auth)
+      .then((channels) => {
+        if (!alive) return;
+        const options = channels
+          .filter((c) => c.available)
+          .map((c) => ({ value: c.value, label: deliverCopy(c.value).label }));
+        if (options.length > 0) setDeliverSelect(options);
+      })
+      .catch(() => {
+        if (alive) setDeliverSelect(FALLBACK_DELIVER_SELECT);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [auth]);
 
   /** 首屏重试：唯一还会把面板塌回骨架的入口（此时本来也没有内容可保留）。 */
   const refresh = useCallback(() => setReload((n) => n + 1), []);
@@ -534,6 +561,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
                 auth={auth}
                 job={job}
                 seed={editSeed}
+                deliverSelect={deliverSelect}
                 onCancel={() => setEditingId(null)}
                 onSaved={(saved) => saved && handleUpdated(saved)}
               />
@@ -569,6 +597,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
               key={`create-${formNonce}`}
               auth={auth}
               seed={createSeed}
+              deliverSelect={deliverSelect}
               onCancel={() => setCreating(false)}
               onSaved={handleCreated}
             />
@@ -687,12 +716,14 @@ function CronForm({
   auth,
   job,
   seed,
+  deliverSelect,
   onCancel,
   onSaved,
 }: {
   auth: AuthSession;
   job?: CronJob;
   seed?: FormSeed | null;
+  deliverSelect: Array<{ value: string; label: string }>;
   onCancel: () => void;
   /** 创建时后端可能不回显 job（此时给 null，由调用方走后台对账补齐）。 */
   onSaved: (saved: CronJob | null) => void;
@@ -800,7 +831,10 @@ function CronForm({
     }
   };
 
-  const deliverHint = DELIVER_OPTIONS.find((o) => o.value === deliver)?.hint;
+  const deliverHint = deliverCopy(deliver).hint;
+  const deliverOptions = deliverSelect.some((o) => o.value === deliver)
+    ? deliverSelect
+    : [...deliverSelect, { value: deliver, label: deliverCopy(deliver).label }];
 
   return (
     <form onSubmit={submit} className="flex flex-col gap-3 px-4 py-3.5">
@@ -942,7 +976,7 @@ function CronForm({
           <Select
             value={deliver}
             onValueChange={setDeliver}
-            options={DELIVER_SELECT}
+            options={deliverOptions}
             inputSize="sm"
             className="sm:w-52"
           />
