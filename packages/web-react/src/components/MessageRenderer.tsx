@@ -51,7 +51,13 @@ import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
-import { correctedScrollTop, loadedArchivedMetrics } from "./chat/archivePaging";
+import {
+  captureVisibleVirtualRowAnchor,
+  correctedScrollTop,
+  correctToVisibleVirtualRowAnchor,
+  loadedArchivedMetrics,
+  type VisibleVirtualRowAnchor,
+} from "./chat/archivePaging";
 import { JournalHydrationRetry, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
@@ -937,6 +943,19 @@ function computePaintRange(
   return { start, end };
 }
 
+function measuredRangePx(
+  from: number,
+  to: number,
+  keyAt: (index: number) => string,
+  heights: Map<string, number>,
+): number {
+  let height = 0;
+  for (let i = from; i < to; i += 1) {
+    height += heights.get(keyAt(i)) ?? PAINT_ESTIMATE_PX;
+  }
+  return height;
+}
+
 function renderItemKey(item: RenderItem): string {
   return item.kind === "single"
     ? (item.m._timelineUnitKey ?? item.m.id)
@@ -1051,6 +1070,9 @@ export function MessageList({
   const didSnapToBottomRef = useRef(false);
   const followBottomRefBox = useRef(followBottomRef);
   followBottomRefBox.current = followBottomRef;
+  const rowHeightCacheRef = useRef<Map<string, number>>(new Map());
+  const lastViewportAnchorRef = useRef<VisibleVirtualRowAnchor | null>(null);
+  const lastPaintSpanRef = useRef({ start: -1, end: -1 });
   const beginViewportPreserve = () => {
     viewportPreserveLockRef.current = true;
     const follow = followBottomRefBox.current;
@@ -1073,6 +1095,9 @@ export function MessageList({
     startOverrideRef.current = null;
     didSnapToBottomRef.current = false;
     viewportPreserveLockRef.current = false;
+    rowHeightCacheRef.current = new Map();
+    lastViewportAnchorRef.current = null;
+    lastPaintSpanRef.current = { start: -1, end: -1 };
   }
 
   useEffect(() => {
@@ -1223,10 +1248,12 @@ export function MessageList({
       });
     };
     const onScroll = () => {
+      lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(el);
       if (raf) return;
       raf = requestAnimationFrame(update);
     };
     el.addEventListener("scroll", onScroll, { passive: true });
+    lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(el);
     update();
     return () => {
       el.removeEventListener("scroll", onScroll);
@@ -1388,13 +1415,25 @@ export function MessageList({
     const root = listRootRef.current;
     if (!scroller || !root || !followBottomRef) return;
     if (typeof ResizeObserver === "undefined") return;
+    const recapture = () => {
+      lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(scroller);
+    };
     const follow = () => {
       if (viewportPreserveLockRef.current) return;
-      if (!followBottomRef.current) return;
-      followBottomRef.scrollToBottom?.(scroller);
+      if (followBottomRef.current) {
+        followBottomRef.scrollToBottom?.(scroller);
+        recapture();
+        return;
+      }
+      const anchor = lastViewportAnchorRef.current;
+      if (anchor && typeof followBottomRef.correctTo === "function") {
+        correctToVisibleVirtualRowAnchor(scroller, anchor, followBottomRef.correctTo);
+      }
+      recapture();
     };
     const observer = new ResizeObserver(follow);
     observer.observe(root);
+    recapture();
     return () => observer.disconnect();
   }, [scrollParent, followBottomRef, windowVersion, messages.length]);
   useLayoutEffect(() => {
@@ -1451,6 +1490,39 @@ export function MessageList({
     }
   }
   const paintedItems = visibleItems.slice(paintStart, paintEnd);
+  const topSpacerPx = paintStart > 0
+    ? measuredRangePx(0, paintStart, (index) => itemKey(visibleItems[index]), rowHeightCacheRef.current)
+    : 0;
+  const bottomSpacerPx = paintEnd < visibleItems.length
+    ? measuredRangePx(paintEnd, visibleItems.length, (index) => itemKey(visibleItems[index]), rowHeightCacheRef.current)
+    : 0;
+  useLayoutEffect(() => {
+    const root = listRootRef.current;
+    if (root) {
+      for (const row of root.querySelectorAll<HTMLElement>("[data-chat-virtual-key]")) {
+        const key = row.getAttribute("data-chat-virtual-key");
+        const height = row.offsetHeight;
+        if (key && height > 0) rowHeightCacheRef.current.set(key, height);
+      }
+    }
+    const el = scrollParent;
+    if (!el) return;
+    const spanChanged =
+      lastPaintSpanRef.current.start !== paintStart || lastPaintSpanRef.current.end !== paintEnd;
+    lastPaintSpanRef.current = { start: paintStart, end: paintEnd };
+    const follow = followBottomRefBox.current;
+    if (
+      spanChanged &&
+      follow &&
+      follow.current !== true &&
+      !viewportPreserveLockRef.current &&
+      lastViewportAnchorRef.current &&
+      typeof follow.correctTo === "function"
+    ) {
+      correctToVisibleVirtualRowAnchor(el, lastViewportAnchorRef.current, follow.correctTo);
+    }
+    lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(el);
+  }, [paintStart, paintEnd, scrollParent, windowVersion, sessionId, visibleItems.length]);
   const showHistoryBoundary = hasOlderHistory || liveHasMore || windowStart > 0 || renderableMessages.some(
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
@@ -1625,7 +1697,7 @@ export function MessageList({
         <div
           aria-hidden
           data-testid="timeline-paint-spacer-top"
-          style={{ height: paintStart * PAINT_ESTIMATE_PX }}
+          style={{ height: topSpacerPx }}
         />
       ) : null}
       {paintedItems.map((item) => (
@@ -1641,7 +1713,7 @@ export function MessageList({
         <div
           aria-hidden
           data-testid="timeline-paint-spacer-bottom"
-          style={{ height: (visibleItems.length - paintEnd) * PAINT_ESTIMATE_PX }}
+          style={{ height: bottomSpacerPx }}
         />
       ) : null}
       {footer}

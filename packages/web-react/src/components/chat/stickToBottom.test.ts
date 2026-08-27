@@ -135,7 +135,7 @@ describe("stickToBottom", () => {
     stick.markUserIntent();
     el.scrollTop = bottom - 1;
     stick.onScroll(el);
-    expect(stick.following.current).toBe(true);
+    expect(stick.following.current).toBe(false);
     expect(stick.gesture.current).toBe(false);
 
     for (let step = 2; step <= 9; step += 1) {
@@ -213,6 +213,48 @@ describe("stickToBottom", () => {
     el.scrollHeight = 1400;
     stick.scrollToBottom(el);
     expect(el.scrollTop).toBe(1320);
+  });
+
+  test("流式增高中用户上滑 1px 即 leave，后续 RO/流式写入被放弃", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+
+    el.scrollHeight = 1300;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(1220);
+    stick.onScroll(el);
+
+    stick.markUserIntent();
+    el.scrollTop = 1219;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(false);
+    expect(el.scrollHeight - el.scrollTop - el.clientHeight).toBe(1);
+
+    const pinnedTop = el.scrollTop;
+    el.scrollHeight = 1600;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(pinnedTop);
+    expect(stick.following.current).toBe(false);
+    expect(stick.canRestick.current).toBe(false);
+  });
+
+  test("无 mark 的 1px clamp 不误 unfollow", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(true);
+
+    el.scrollTop = 919;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(true);
+
+    el.scrollHeight = 1300;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(1220);
+    expect(stick.following.current).toBe(true);
   });
 
   test("programmatic 贴底不清 following", () => {
