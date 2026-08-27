@@ -40,6 +40,7 @@ import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { GROK_PREAMBLE, prepareGrokHome, projectGrokPlatform } from './grokPlatform.js'
+import { renderCcbGoalPrompt } from '../goalPrompt.js'
 
 const log = createLogger({ module: 'grokAdapter' })
 
@@ -240,6 +241,18 @@ function authError(detail: string): boolean {
   return /authenticat|credentials|\b401\b|unauthorized|token (?:is )?(?:expired|invalid|revoked)|not logged in/i.test(detail)
 }
 
+function assembleGrokPrompt(
+  preamble: string,
+  platformContent: string,
+  input: string,
+  goal: GoalStateSnapshot | null,
+): string {
+  const body = platformContent ? `${platformContent}\n\n${input}` : input
+  const goalText = renderCcbGoalPrompt(goal)
+  const withGoal = goalText ? `${goalText}\n\n${body}` : body
+  return `${preamble}\n${withGoal}`
+}
+
 interface GrokTurnContext {
   params: TurnParams
   startedAt: number
@@ -306,6 +319,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   private drain: Promise<void> = Promise.resolve()
   private processKeepaliveTimer: NodeJS.Timeout | null = null
   lastActivityAt = 0
+  private platformGoal: GoalStateSnapshot | null = null
 
   constructor(opts: EngineCreateOpts) {
     super()
@@ -635,15 +649,13 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         prompt_sha256: createHash('sha256').update(platform.content || '', 'utf8').digest('hex').slice(0, 12),
         board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
-      const body = platform.content ? `${platform.content}\n\n${input}` : input
-      return `${GROK_PREAMBLE}\n${body}`
+      return assembleGrokPrompt(GROK_PREAMBLE, platform.content || '', input, this.platformGoal)
     } catch {
       let persona = ''
       if (this.opts.persona) {
         try { persona = readFileSync(this.opts.persona, 'utf8').trim() } catch { persona = '' }
       }
-      const fallback = persona ? `${persona}\n\n${input}` : input
-      return `${GROK_PREAMBLE}\n${fallback}`
+      return assembleGrokPrompt(GROK_PREAMBLE, persona, input, this.platformGoal)
     }
   }
 
@@ -1036,7 +1048,10 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   setEffortLevel(level: string | undefined): void { this.currentEffort = level }
   get effortLevel(): string | undefined { return this.currentEffort }
   setTraceId(traceId: string | undefined): void { this.traceId = traceId }
-  setGoalState(_goal: GoalStateSnapshot | null): Promise<void> { return Promise.resolve() }
+  setGoalState(goal: GoalStateSnapshot | null): Promise<void> {
+    this.platformGoal = goal ? structuredClone(goal) : null
+    return Promise.resolve()
+  }
   updateConfig(config: OpenClaudeConfig): void { this.opts.config = config }
   setToolsets(toolsets: string[] | undefined): void { this.currentToolsets = toolsets }
   get toolsets(): string[] | undefined { return this.currentToolsets }
@@ -1054,6 +1069,11 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
 
 export const _internals = {
   promptText,
+  assembleGrokPrompt,
+  promptWithStoredGoal(adapter: GrokAdapter, platformContent: string, input: string): string {
+    const goal = (adapter as unknown as { platformGoal: GoalStateSnapshot | null }).platformGoal
+    return assembleGrokPrompt(GROK_PREAMBLE, platformContent, input, goal)
+  },
   PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS,
   PROCESS_KEEPALIVE_INTERVAL_MIN_MS,
   PROCESS_KEEPALIVE_INTERVAL_MAX_MS,

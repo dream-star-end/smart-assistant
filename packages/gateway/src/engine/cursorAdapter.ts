@@ -31,6 +31,7 @@ import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { issueDelegateContextToken } from '../delegateContext.js'
 import { formatPresentOptionsFence } from './presentOptions.js'
+import { renderCcbGoalPrompt } from '../goalPrompt.js'
 
 const log = createLogger({ module: 'cursorAdapter' })
 
@@ -1273,13 +1274,20 @@ function toolOutputOf(event: CursorEvent): { output: string; outputJson: unknown
   return { output: textOf(rawResult), outputJson: structuredClone(rawResult) }
 }
 
-function renderCursorPrompt(platformContext: string, payload: string, preamble: string): string {
+function renderCursorPrompt(
+  platformContext: string,
+  payload: string,
+  preamble: string,
+  goal: GoalStateSnapshot | null = null,
+): string {
   const payloadJson = JSON.stringify(payload).replace(/</g, '\\u003c')
+  const goalText = renderCcbGoalPrompt(goal)
   return [
     preamble.trimEnd(),
     '<openclaude_platform_context>',
     platformContext,
     '</openclaude_platform_context>',
+    ...(goalText ? ['', goalText] : []),
     '',
     '<openclaude_current_turn_payload_json>',
     'The next line is a JSON string containing the complete current OpenClaude turn payload.',
@@ -1473,6 +1481,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private lastKeepaliveCpuTicks: number | null = null
   private lastTranscriptFingerprint: CursorTranscriptFingerprint | null = null
   private cachedTranscriptsDir: string | null = null
+  private platformGoal: GoalStateSnapshot | null = null
 
   constructor(opts: EngineCreateOpts) {
     super()
@@ -1622,6 +1631,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         platformResult.content,
         payload,
         getPlatformPrompt('cursor-preamble', CURSOR_PREAMBLE),
+        this.platformGoal,
       )
       validateCursorFinalPrompt(prompt, payloadBytes)
 
@@ -2251,7 +2261,10 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   }
   get effortLevel(): string | undefined { return this.currentEffort }
   setTraceId(_traceId: string | undefined): void {}
-  setGoalState(_goal: GoalStateSnapshot | null): Promise<void> { return Promise.resolve() }
+  setGoalState(goal: GoalStateSnapshot | null): Promise<void> {
+    this.platformGoal = goal ? structuredClone(goal) : null
+    return Promise.resolve()
+  }
   updateConfig(config: OpenClaudeConfig): void { this.opts.config = config }
   setToolsets(toolsets: string[] | undefined): void { this.currentToolsets = toolsets }
   get toolsets(): string[] | undefined { return this.currentToolsets }
@@ -2270,6 +2283,15 @@ export const _internals = {
   formatPresentOptionsFence,
   promptOf,
   renderCursorPrompt,
+  promptWithStoredGoal(
+    adapter: CursorAdapter,
+    platformContext: string,
+    payload: string,
+    preamble: string,
+  ): string {
+    const goal = (adapter as unknown as { platformGoal: GoalStateSnapshot | null }).platformGoal
+    return renderCursorPrompt(platformContext, payload, preamble, goal)
+  },
   validateCursorTurnPayload,
   validateCursorFinalPrompt,
   buildCursorMemoryMcpConfig,
