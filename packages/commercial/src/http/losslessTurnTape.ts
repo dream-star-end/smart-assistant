@@ -830,7 +830,13 @@ export function materializeLosslessTurn(
     if (body.status === "completed" && tool.completed === false && output === "") {
       continue;
     }
-    const completed = tool.completed !== false || output.length > 0;
+    // Trust the explicit completed flag. Never infer completion from a
+    // non-empty output (interrupted turns can carry partial bytes).
+    const completed = tool.completed === true
+      ? true
+      : tool.completed === false
+        ? false
+        : body.status === "completed";
     const arrivedAt = tool.arrivedAt;
     const toolTs = typeof arrivedAt === "number" && Number.isSafeInteger(arrivedAt) && arrivedAt >= 0
       ? arrivedAt

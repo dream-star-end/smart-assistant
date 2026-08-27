@@ -1454,6 +1454,20 @@ export function codexAbandonFailureCode(reason: string): JournalFailureCode {
   return "INTERNAL_ERROR";
 }
 
+export type CronOriginExecutor = (payload: {
+  encoded: Buffer
+  admitted: {
+    clientMessageId: string
+    sessionId: string
+    dispatchId: string
+    billingRequestId: string
+    attemptNo: number
+    leaseEpoch: number
+    anchorSeq: bigint | null
+    requestHash: string
+  }
+}) => void
+
 export interface UserChatBridgeHandler {
   /** Gateway HTTP server 的 'upgrade' 事件入口。返 false → 路径不匹配,gateway 路由别处。 */
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean;
@@ -1488,6 +1502,11 @@ export interface UserChatBridgeHandler {
    * and run it through an attested container bridge (durable dispatch).
    */
   injectCronOriginTurn(input: CronOriginInjectInput): Promise<CronOriginInjectResult>;
+  /** @internal test seam: register a fake cron-origin transport without a container WS. */
+  _testRegisterCronOriginExecutor(
+    uid: string,
+    executor: CronOriginExecutor,
+  ): void;
 }
 
 export type CronOriginInjectInput = {
@@ -1518,19 +1537,121 @@ export function resolveCronOriginAdmitModel(
   return trimmed;
 }
 
-type CronOriginExecutor = (payload: {
-  encoded: Buffer
-  admitted: {
-    clientMessageId: string
-    sessionId: string
-    dispatchId: string
-    billingRequestId: string
-    attemptNo: number
-    leaseEpoch: number
-    anchorSeq: bigint | null
-    requestHash: string
+/** Shared origin-session inject path used by the bridge and unit tests. */
+export async function executeCronOriginInject(opts: {
+  input: CronOriginInjectInput
+  pgPool?: UserChatBridgeDeps["pgPool"]
+  admitUserTurn: NonNullable<UserChatBridgeDeps["admitUserTurn"]>
+  executor: CronOriginExecutor
+  log?: Logger
+}): Promise<CronOriginInjectResult> {
+  const { input, pgPool, admitUserTurn, executor, log } = opts;
+  if (!isClientMessageId(input.clientMessageId) || input.sessionId.trim() === "" || input.text.trim() === "") {
+    return { kind: "failed", reason: "invalid_payload" };
   }
-}) => void
+  const content = { text: input.text };
+  const requestHash = computeDispatchRequestHash(content);
+  const sessionUserId = "c:" + input.uid.toString();
+  let originModel: string | null = null;
+  if (pgPool) {
+    try {
+      const row = await pgPool.query<{ model_id: string | null }>(
+        `SELECT model_id FROM client_sessions
+          WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+          LIMIT 1`,
+        [input.sessionId, sessionUserId],
+      );
+      originModel = resolveCronOriginAdmitModel(row.rows[0]?.model_id);
+    } catch (err) {
+      log?.warn("user-chat-bridge: cron origin session model lookup failed", {
+        uid: input.uid.toString(),
+        sessionId: input.sessionId,
+        err,
+      });
+    }
+  }
+  const message = {
+    id: input.clientMessageId,
+    role: "user" as const,
+    text: input.text,
+    ts: Date.now(),
+    _routing: {
+      teamMode: false,
+      effortLevel: null as string | null,
+      ...(originModel ? { model: originModel } : {}),
+    },
+  };
+  let admit;
+  try {
+    admit = await admitUserTurn({
+      uid: input.uid,
+      sessionUserId,
+      sessionId: input.sessionId,
+      clientMessageId: input.clientMessageId,
+      agentId: input.agentId || "main",
+      model: originModel,
+      requestHash,
+      billingRequestId: ensureRequestIdServerSide(),
+      dispatchId: randomUUID(),
+      ownerId: `cron-origin:${input.clientMessageId}`,
+      exclusiveSession: true,
+      message,
+    });
+  } catch (err) {
+    log?.warn("user-chat-bridge: cron origin admit threw", {
+      uid: input.uid.toString(),
+      sessionId: input.sessionId,
+      err,
+    });
+    return { kind: "failed", reason: "admit_threw" };
+  }
+  if (admit.kind === "session_not_found" || admit.kind === "session_deleted") {
+    return { kind: "gone" };
+  }
+  if (admit.kind === "session_busy") return { kind: "in_flight" };
+  if (
+    admit.kind === "append_error" ||
+    admit.kind === "recovery_conflict" ||
+    admit.kind === "previously_failed" ||
+    admit.kind === "manual_hold" ||
+    admit.kind === "immutable_conflict"
+  ) {
+    return { kind: "failed", reason: admit.kind };
+  }
+  if (
+    admit.kind === "deduplicated" ||
+    admit.kind === "already_owned" ||
+    admit.kind === "in_flight"
+  ) {
+    return { kind: "injected" };
+  }
+  const d = admit.dispatch;
+  const frame = {
+    type: "inbound.message",
+    channel: "webchat",
+    peer: { kind: "dm", id: input.sessionId },
+    agentId: input.agentId || "main",
+    clientMessageId: input.clientMessageId,
+    idempotencyKey: `cron-origin:${input.clientMessageId}`,
+    content,
+    ts: message.ts,
+    ...(originModel ? { model: originModel } : {}),
+  };
+  executor({
+    encoded: Buffer.from(JSON.stringify(frame), "utf8"),
+    admitted: {
+      clientMessageId: d.clientMessageId,
+      sessionId: d.sessionId,
+      dispatchId: d.dispatchId,
+      billingRequestId: d.billingRequestId,
+      attemptNo: d.attemptNo,
+      leaseEpoch: d.leaseEpoch,
+      anchorSeq: d.anchorSeq,
+      requestHash: d.requestHash,
+    },
+  });
+  return { kind: "injected" };
+}
 
 // ---------- 内部工具 --------------------------------------------------------
 
@@ -8807,114 +8928,22 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const executors = uidToCronOriginExecutors.get(input.uid.toString());
     const executor = executors && [...executors][0];
     if (!executor || !deps.admitUserTurn) return { kind: "no_transport" };
-    if (!isClientMessageId(input.clientMessageId) || input.sessionId.trim() === "" || input.text.trim() === "") {
-      return { kind: "failed", reason: "invalid_payload" };
-    }
-    const content = { text: input.text };
-    const requestHash = computeDispatchRequestHash(content);
-    const sessionUserId = "c:" + input.uid.toString();
-    let originModel: string | null = null;
-    if (deps.pgPool) {
-      try {
-        const row = await deps.pgPool.query<{ model_id: string | null }>(
-          `SELECT model_id FROM client_sessions
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-            LIMIT 1`,
-          [input.sessionId, sessionUserId],
-        );
-        originModel = resolveCronOriginAdmitModel(row.rows[0]?.model_id);
-      } catch (err) {
-        log?.warn("user-chat-bridge: cron origin session model lookup failed", {
-          uid: input.uid.toString(),
-          sessionId: input.sessionId,
-          err,
-        });
-      }
-    }
-    const message = {
-      id: input.clientMessageId,
-      role: "user" as const,
-      text: input.text,
-      ts: Date.now(),
-      _routing: {
-        teamMode: false,
-        effortLevel: null as string | null,
-        ...(originModel ? { model: originModel } : {}),
-      },
-    };
-    let admit;
-    try {
-      admit = await deps.admitUserTurn({
-        uid: input.uid,
-        sessionUserId,
-        sessionId: input.sessionId,
-        clientMessageId: input.clientMessageId,
-        agentId: input.agentId || "main",
-        model: originModel,
-        requestHash,
-        billingRequestId: ensureRequestIdServerSide(),
-        dispatchId: randomUUID(),
-        ownerId: `cron-origin:${input.clientMessageId}`,
-        exclusiveSession: true,
-        message,
-      });
-    } catch (err) {
-      log?.warn("user-chat-bridge: cron origin admit threw", {
-        uid: input.uid.toString(),
-        sessionId: input.sessionId,
-        err,
-      });
-      return { kind: "failed", reason: "admit_threw" };
-    }
-    if (admit.kind === "session_not_found" || admit.kind === "session_deleted") {
-      return { kind: "gone" };
-    }
-    if (admit.kind === "session_busy") return { kind: "in_flight" };
-    if (
-      admit.kind === "append_error" ||
-      admit.kind === "recovery_conflict" ||
-      admit.kind === "previously_failed" ||
-      admit.kind === "manual_hold" ||
-      admit.kind === "immutable_conflict"
-    ) {
-      return { kind: "failed", reason: admit.kind };
-    }
-    if (
-      admit.kind === "deduplicated" ||
-      admit.kind === "already_owned" ||
-      admit.kind === "in_flight"
-    ) {
-      // 同 clientMessageId 的 dispatch 已存在(重放/重试):这轮 cron 注入已经
-      // 在原对话里了,幂等成功。绝不能掉进下面的 execute 分支重复执行同一 dispatch。
-      return { kind: "injected" };
-    }
-    // 穷尽:剩余唯一变体是 admitted(带 dispatch)。
-    const d = admit.dispatch;
-    const frame = {
-      type: "inbound.message",
-      channel: "webchat",
-      peer: { kind: "dm", id: input.sessionId },
-      agentId: input.agentId || "main",
-      clientMessageId: input.clientMessageId,
-      idempotencyKey: `cron-origin:${input.clientMessageId}`,
-      content,
-      ts: message.ts,
-      ...(originModel ? { model: originModel } : {}),
-    };
-    executor({
-      encoded: Buffer.from(JSON.stringify(frame), "utf8"),
-      admitted: {
-        clientMessageId: d.clientMessageId,
-        sessionId: d.sessionId,
-        dispatchId: d.dispatchId,
-        billingRequestId: d.billingRequestId,
-        attemptNo: d.attemptNo,
-        leaseEpoch: d.leaseEpoch,
-        anchorSeq: d.anchorSeq,
-        requestHash: d.requestHash,
-      },
+    return executeCronOriginInject({
+      input,
+      pgPool: deps.pgPool,
+      admitUserTurn: deps.admitUserTurn,
+      executor,
+      log,
     });
-    return { kind: "injected" };
+  }
+
+  function _testRegisterCronOriginExecutor(uid: string, executor: CronOriginExecutor): void {
+    let set = uidToCronOriginExecutors.get(uid);
+    if (!set) {
+      set = new Set();
+      uidToCronOriginExecutors.set(uid, set);
+    }
+    set.add(executor);
   }
 
   return {
@@ -8927,6 +8956,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     broadcastToUsers,
     onlineUserSubset,
     injectCronOriginTurn,
+    _testRegisterCronOriginExecutor,
   };
 }
 

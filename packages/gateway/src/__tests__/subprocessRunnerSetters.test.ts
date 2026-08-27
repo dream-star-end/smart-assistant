@@ -16,11 +16,13 @@ import { EventEmitter } from 'node:events'
 import { describe, it } from 'node:test'
 import { ALLOWED_INBOUND_MODELS, resolveExecutionModel } from '../server.js'
 import {
+  CCB_SUBAGENT_MODEL_ENV,
   DEFAULT_CCB_SUBAGENT_MODEL,
   DEFAULT_SECONDARY_UTILITY_MODEL,
   SubprocessRunner,
   _buildCcbSubagentModelEnv,
   _buildSecondaryUtilityModelEnv,
+  finalizeCcbSpawnEnv,
   resolveCcbSubagentModel,
 } from '../subprocessRunner.js'
 
@@ -309,6 +311,20 @@ describe('CCB subagent model env (CLAUDE_CODE_SUBAGENT_MODEL)', () => {
       _buildCcbSubagentModelEnv({ sessionModel: 'glm-5.3-zai', routing: 'oauth-direct' }),
       {},
     )
+  })
+
+  it('oauth-direct final spawn env deletes an inherited CLAUDE_CODE_SUBAGENT_MODEL pin', () => {
+    const source = {
+      PATH: '/usr/bin',
+      [CCB_SUBAGENT_MODEL_ENV]: 'glm-5.3-zai',
+    } as NodeJS.ProcessEnv
+    const env = finalizeCcbSpawnEnv({
+      source,
+      providerEnv: { CLAUDE_CODE_OAUTH_TOKEN: 'oauth-tok', ANTHROPIC_BASE_URL: '' },
+      routing: 'oauth-direct',
+    })
+    assert.equal(Object.prototype.hasOwnProperty.call(env, CCB_SUBAGENT_MODEL_ENV), false)
+    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, 'oauth-tok')
   })
 })
 

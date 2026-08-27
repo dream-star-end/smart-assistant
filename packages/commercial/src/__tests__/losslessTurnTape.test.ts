@@ -837,6 +837,35 @@ describe("materializeLosslessTurn", () => {
     assert.equal(tool!.payload._completed, true);
   });
 
+  test("interrupted partial bytes stay incomplete — never inferred from output length", () => {
+    const turn = materializeLosslessTurn({
+      sessionId: "webmtbs84bpm104yg",
+      agentId: "main",
+      turnIndex: 6,
+      status: "interrupted",
+      turnKey: TURN_KEY,
+      text: "fallback",
+      createdAt: 1_783_944_000_000,
+      tools: [{
+        toolUseId: "call_partial",
+        blockId: "call_partial",
+        toolName: "Bash",
+        inputJson: { command: "curl" },
+        inputPreview: "curl",
+        output: "partial bytes",
+        completed: false,
+        isError: false,
+        durationMs: 4,
+        ts: 1,
+      }],
+    });
+    const tool = turn.records.find((record) => record.role === "tool");
+    assert.ok(tool);
+    assert.equal(tool!.payload.output, "partial bytes");
+    assert.equal(tool!.payload._completed, false);
+    assert.equal(tool!.payload.partial, true);
+  });
+
   test("completed turns drop empty partial Agent snapshots instead of freezing them", () => {
     const turn = materializeLosslessTurn({
       sessionId: "webmtbs84bpm104yg",

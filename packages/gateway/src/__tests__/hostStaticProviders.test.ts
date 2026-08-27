@@ -24,7 +24,12 @@ import {
   setHostStaticProviderKeys,
   getHostStaticProviderKeys,
 } from '../hostStaticProviders.js'
-import { _buildSecondaryUtilityModelEnv, buildHostSpawnProviderEnv } from '../subprocessRunner.js'
+import {
+  CCB_SUBAGENT_MODEL_ENV,
+  _buildSecondaryUtilityModelEnv,
+  buildHostSpawnProviderEnv,
+  finalizeCcbSpawnEnv,
+} from '../subprocessRunner.js'
 
 // 每个用例后清空模块级 seam,避免 cross-test 污染(isHostRoutableStaticModel 读模块全局)。
 afterEach(() => setHostStaticProviderKeys(null))
@@ -207,6 +212,13 @@ describe('buildHostSpawnProviderEnv — 路由决策对称性(MAJOR/MINOR 2026-0
     assert.equal(r.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, '1')
     assert.equal(r.env.ANTHROPIC_SMALL_FAST_MODEL, undefined) // direct-Anthropic 留 Haiku
     assert.equal(r.env.CLAUDE_CODE_SUBAGENT_MODEL, undefined)
+    const finalEnv = finalizeCcbSpawnEnv({
+      source: { [CCB_SUBAGENT_MODEL_ENV]: 'glm-5.3-zai', PATH: '/usr/bin' } as NodeJS.ProcessEnv,
+      providerEnv: r.env,
+      routing: r.routing,
+    })
+    assert.equal(Object.prototype.hasOwnProperty.call(finalEnv, CCB_SUBAGENT_MODEL_ENV), false)
+    assert.equal(finalEnv.CLAUDE_CODE_OAUTH_TOKEN, 'oauth-tok')
   })
 
   it('claude-subscription 无 OAuth token → settings-default(MANAGED_BY_HOST 仍设 + secondary 注入)', () => {

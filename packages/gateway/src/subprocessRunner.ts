@@ -233,14 +233,18 @@ export function _buildSecondaryUtilityModelEnv(): Record<string, string> {
   return { ANTHROPIC_SMALL_FAST_MODEL: model }
 }
 
+export const CCB_SUBAGENT_MODEL_ENV = 'CLAUDE_CODE_SUBAGENT_MODEL'
+
 /** Pin CCB built-in Agent/Task default away from unroutable haiku. Omitted on
- *  oauth-direct (real Anthropic, where Haiku is valid). */
+ *  oauth-direct (real Anthropic, where Haiku is valid). The oauth-direct
+ *  branch must still delete the inherited process env at final spawn compose
+ *  — returning {} here does not clear `process.env`. */
 export function _buildCcbSubagentModelEnv(input: {
   sessionModel?: string
   routing: 'host-static' | 'oauth-direct' | 'settings-default'
 }): Record<string, string> {
   if (input.routing === 'oauth-direct') return {}
-  return { CLAUDE_CODE_SUBAGENT_MODEL: resolveCcbSubagentModel(input.sessionModel) }
+  return { [CCB_SUBAGENT_MODEL_ENV]: resolveCcbSubagentModel(input.sessionModel) }
 }
 
 const CCB_TRANSPORT_INTERNAL_KEYS = [
@@ -325,6 +329,26 @@ export function buildCcbSpawnProcessEnv(
       throw new Error('OPENCLAUDE_CCB_TZ must be a valid IANA timezone')
     }
     env.TZ = timezone
+  }
+  return env
+}
+
+/**
+ * Final CCB spawn env: inherit process env, overlay provider routing, then
+ * oauth-direct explicitly deletes CLAUDE_CODE_SUBAGENT_MODEL so a leftover
+ * host pin cannot override Anthropic Haiku.
+ */
+export function finalizeCcbSpawnEnv(input: {
+  source?: NodeJS.ProcessEnv
+  providerEnv: Record<string, string>
+  routing: 'host-static' | 'oauth-direct' | 'settings-default'
+}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...buildCcbSpawnProcessEnv(input.source),
+    ...input.providerEnv,
+  }
+  if (input.routing === 'oauth-direct') {
+    delete env[CCB_SUBAGENT_MODEL_ENV]
   }
   return env
 }
@@ -1277,8 +1301,10 @@ export class SubprocessRunner extends EventEmitter {
         // 与 Bash 工具的 working directory 都跟系统提示对齐。
         subprocessCwd: learningContext.workingDir ?? effectiveAddDir,
         env: {
-          ...buildCcbSpawnProcessEnv(),
-          ...providerEnv,
+          ...finalizeCcbSpawnEnv({
+            providerEnv,
+            routing: hostSpawnRouting.routing,
+          }),
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
           ...(this.delegateContextFile
