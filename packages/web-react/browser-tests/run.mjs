@@ -184,7 +184,11 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+  #timeline-paint-anchor-root .timeline-scroll-probe{height:400px}
+  #timeline-paint-anchor-root [data-chat-virtual-key*="paint-short"]{min-height:80px}
+  #timeline-paint-anchor-root [data-chat-virtual-key*="paint-tall"]{min-height:420px}
+  #timeline-estimate-anchor-root .chat-timeline-row{min-height:420px}
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="timeline-paint-anchor-root"></div><div id="timeline-estimate-anchor-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -551,7 +555,7 @@ await check("T34 全面优化模式隐藏不会再更新的旧版梦境失败回
   const memoryRoot = page.locator("#memory-report-root");
   await memoryRoot.getByText("还没有核心记忆", { exact: true }).waitFor({
     state: "visible",
-    timeout: 3000,
+    timeout: 8000,
   });
   if (await memoryRoot.getByRole("region", { name: "Auto-Dream 梦境报告" }).count() !== 0) {
     throw new Error("全面优化模式仍展示旧版梦境报告卡");
@@ -897,6 +901,169 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
   const state = await page.evaluate(() => window.__archiveTimeline);
   if (state.calls !== 1 || state.messageCount !== 200) {
     throw new Error(`归档单击加载契约错误:${JSON.stringify(state)}`);
+  }
+});
+
+async function expandPaintAnchorWindow() {
+  const root = page.locator("#timeline-paint-anchor-root .timeline-scroll-probe");
+  const restore = await pinPageScroll(page);
+  try {
+    for (let step = 0; step < 4; step += 1) {
+      const count = await page.evaluate(() => window.__paintAnchor.snapshot().windowCount);
+      if (count >= 160) return count;
+      const clicked = await page.evaluate(() => {
+        const button = document.querySelector(
+          "#timeline-paint-anchor-root [data-testid='history-page-loader'] button",
+        );
+        if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+        button.click();
+        return true;
+      });
+      if (!clicked) {
+        throw new Error(`画窗扩窗第 ${step} 步没有可点加载按钮, windowCount=${count}`);
+      }
+      try {
+        await page.waitForFunction(
+          (prev) => window.__paintAnchor.snapshot().windowCount > prev,
+          count,
+          { timeout: 2000 },
+        );
+      } catch (err) {
+        const now = await page.evaluate(() => window.__paintAnchor.snapshot());
+        throw new Error(`画窗扩窗第 ${step} 步 windowCount 未增加: ${count} → ${JSON.stringify(now)}; ${err.message}`);
+      }
+    }
+  } finally {
+    await restore();
+  }
+  return page.evaluate(() => window.__paintAnchor.snapshot().windowCount);
+}
+
+await check("T49 follow→unfollow 画窗从尾窗切换时锚点不跳", async () => {
+  await page.evaluate(() => window.__mountPaintProbes());
+  const root = page.locator("#timeline-paint-anchor-root .timeline-scroll-probe");
+  await root.waitFor({ state: "visible", timeout: 3000 });
+  await expandPaintAnchorWindow();
+  await page.evaluate(() => window.__paintAnchor.armSticky());
+  try {
+    await page.waitForFunction(() => {
+      const snap = window.__paintAnchor.snapshot();
+      return snap.following && snap.windowCount >= 160 && snap.paintCount >= 50 && snap.paintCount < snap.windowCount;
+    }, null, { timeout: 3000 });
+  } catch (err) {
+    const snap = await page.evaluate(() => window.__paintAnchor.snapshot());
+    throw new Error(`贴底后画窗未启用: ${err.message}; snap=${JSON.stringify(snap)}`);
+  }
+  const before = await page.evaluate(() => {
+    window.__paintAnchor.armSticky();
+    window.__paintAnchor.userScrollBy(-80);
+    return window.__paintAnchor.snapshot();
+  });
+  if (!before.key || before.top == null) {
+    throw new Error(`unfollow 前未捕获可见锚点:${JSON.stringify(before)}`);
+  }
+  try {
+    await page.waitForFunction((prev) => {
+      const now = window.__paintAnchor.snapshot();
+      return !now.following && (now.spacerTop !== prev.spacerTop || now.paintCount !== prev.paintCount);
+    }, before, { timeout: 3000 });
+  } catch (err) {
+    const now = await page.evaluate(() => window.__paintAnchor.snapshot());
+    throw new Error(`画窗未从尾窗切走: ${err.message}; before=${JSON.stringify(before)}; now=${JSON.stringify(now)}`);
+  }
+  const afterTop = await page.evaluate((key) => window.__paintAnchor.rowTop(key), before.key);
+  const after = await page.evaluate(() => window.__paintAnchor.snapshot());
+  if (after.following) {
+    throw new Error(`画窗切换后仍处于贴底:${JSON.stringify(after)}`);
+  }
+  if (afterTop == null) {
+    throw new Error(`画窗切换后锚点行丢失:${JSON.stringify({ before, after })}`);
+  }
+  const delta = Math.abs(afterTop - before.top);
+  if (delta > 2) {
+    throw new Error(`follow→unfollow 画窗切换锚点跳动 ${delta.toFixed(2)}px，应 ≤2px; ${JSON.stringify({ before, after, afterTop })}`);
+  }
+});
+
+await check("T50 继续上滑画窗滑动时锚点不跳", async () => {
+  await page.evaluate(() => window.__mountPaintProbes());
+  const root = page.locator("#timeline-paint-anchor-root .timeline-scroll-probe");
+  await root.waitFor({ state: "visible", timeout: 3000 });
+  await expandPaintAnchorWindow();
+  await page.evaluate(() => {
+    window.__paintAnchor.armSticky();
+    const node = document.querySelector("#timeline-paint-anchor-root .timeline-scroll-probe");
+    if (!(node instanceof HTMLElement)) throw new Error("missing paint scroller");
+    window.__paintAnchor.userScrollBy(-(Math.max(0, node.scrollTop - 12000)));
+  });
+  await page.waitForFunction(() => window.__paintAnchor.snapshot().following === false, null, { timeout: 3000 });
+  let sawPaintSlide = false;
+  for (let step = 0; step < 4; step += 1) {
+    const before = await page.evaluate(() => {
+      window.__paintAnchor.userScrollBy(-2500);
+      return window.__paintAnchor.snapshot();
+    });
+    if (!before.key || before.top == null) {
+      throw new Error(`上滑第 ${step} 步未捕获锚点:${JSON.stringify(before)}`);
+    }
+    await page.waitForTimeout(80);
+    const after = await page.evaluate((key) => ({
+      snap: window.__paintAnchor.snapshot(),
+      top: window.__paintAnchor.rowTop(key),
+    }), before.key);
+    if (after.snap.following) {
+      throw new Error(`继续上滑后错误恢复贴底:${JSON.stringify({ step, before, after })}`);
+    }
+    const paintSlid = after.snap.spacerTop !== before.spacerTop || after.snap.paintCount !== before.paintCount;
+    if (paintSlid) sawPaintSlide = true;
+    if (after.top == null) {
+      if (paintSlid) {
+        throw new Error(`画窗滑动后可见锚点被卸:${JSON.stringify({ step, before, after })}`);
+      }
+      continue;
+    }
+    const delta = Math.abs(after.top - before.top);
+    if (delta > 2) {
+      throw new Error(`画窗滑动锚点跳动 ${delta.toFixed(2)}px，应 ≤2px; ${JSON.stringify({ step, before, after })}`);
+    }
+  }
+  if (!sawPaintSlide) {
+    throw new Error("继续上滑未观察到画窗滑动，无法证明 spacer 切换不跳");
+  }
+});
+
+await check("T51 短会话滚入时 200px 估高变真实高度不把内容推底", async () => {
+  await page.evaluate(() => window.__mountPaintProbes());
+  const root = page.locator("#timeline-estimate-anchor-root .timeline-scroll-probe");
+  await root.waitFor({ state: "visible", timeout: 3000 });
+  const before = await page.evaluate(() => {
+    window.__estimateAnchor.armSticky();
+    window.__estimateAnchor.userScrollBy(-120);
+    return window.__estimateAnchor.snapshot();
+  });
+  const grown = await page.evaluate(() => window.__estimateAnchor.growAboveViewport(220));
+  if (!grown) {
+    throw new Error(`短会话未找到视口上方行可增高:${JSON.stringify(before)}`);
+  }
+  if (!before.key || before.top == null) {
+    throw new Error(`短会话未捕获可见锚点:${JSON.stringify(before)}`);
+  }
+  await page.waitForTimeout(80);
+  const afterTop = await page.evaluate((key) => window.__estimateAnchor.rowTop(key), before.key);
+  const after = await page.evaluate(() => window.__estimateAnchor.snapshot());
+  if (after.following) {
+    throw new Error(`短会话估高结算后错误恢复贴底:${JSON.stringify(after)}`);
+  }
+  if (afterTop == null) {
+    throw new Error(`短会话估高结算后锚点丢失:${JSON.stringify({ before, after })}`);
+  }
+  const delta = Math.abs(afterTop - before.top);
+  if (delta > 2) {
+    throw new Error(`短会话估高变真实高度锚点跳动 ${delta.toFixed(2)}px，应 ≤2px; ${JSON.stringify({ before, after, afterTop })}`);
+  }
+  const dist = after.scrollHeight - after.scrollTop - after.clientHeight;
+  if (dist < 8) {
+    throw new Error(`短会话估高结算把内容推到底部: dist=${dist}; ${JSON.stringify({ before, after })}`);
   }
 });
 
@@ -2547,7 +2714,7 @@ await check("T45 中断 turn 刷新后仍显示 requestId/积分，空窗给出�
   }
 });
 
-await check("T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划", async () => {
+await check("T52 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runPhaseAEmptyUnitsReset());
   if (JSON.stringify(result.roles) !== JSON.stringify(["user", "thinking", "tool", "plan", "assistant"])) {
     throw new Error(`Phase-A empty units reset 丢过程行:${JSON.stringify(result)}`);

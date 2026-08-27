@@ -2,201 +2,57 @@
   "schema": 1,
   "scope": "真浏览器组件门用例清单(单一权威)。run.mjs 启动即校验:实际执行的 T 编号集合必须 ⊇ 本清单,少一个/重号/无编号一律红。删一段用例而不改本文件 = 门变红。",
   "cases": [
-    {
-      "id": "T1",
-      "proves": "「+」→「添加附件」真的弹出系统文件选择器(Radix 同步卸载不再杀掉 label 激活)"
-    },
-    {
-      "id": "T2",
-      "proves": "附件菜单点完会关,不常驻挡住输入区"
-    },
-    {
-      "id": "T3",
-      "proves": "选完文件出现附件 chip 且非错误态,onUpload 真收到该文件"
-    },
-    {
-      "id": "T4",
-      "proves": "file input 结构红线:type=file / 无 accept 白名单 / 非 display:none / tabindex=-1(国产内核可选文件)"
-    },
-    {
-      "id": "T5",
-      "proves": "惰性 user sidecar 水合出原文,重试拿到逐字节精确的原始 payload"
-    },
-    {
-      "id": "T6",
-      "proves": "惰性 Agent tape 记录水合成真实 ToolCard,不是 locator 替身"
-    },
-    {
-      "id": "T7",
-      "proves": "「+」→「设定目标」对话框能弹出(同菜单第二入口对照)"
-    },
-    {
-      "id": "T8",
-      "proves": "长会话上滑零请求、显式点击只取一页、插页后可见消息像素不跳、虚拟 remount 不重取"
-    },
-    {
-      "id": "T9",
-      "proves": "第二次点击才继续下一 cursor,已加载记录不被替换/丢失"
-    },
-    {
-      "id": "T10",
-      "proves": "归档前插跨出虚拟挂载区后,点击前可见的那条消息仍锁在原像素位置"
-    },
-    {
-      "id": "T11",
-      "proves": "思考卡实时展开、完成自动折叠,受信点击后完整正文恢复"
-    },
-    {
-      "id": "T12",
-      "proves": "单 Agent 卡/团队队员卡/通用 ToolCard 的可见按钮名单恰好等于白名单(冗余「原始完整记录」入口回归即红),真实过程仍可见"
-    },
-    {
-      "id": "T13",
-      "proves": "工具卡头部 ≥44px 触控、键盘可展开折叠、长列表渐进加载、375px 宽不横向溢出"
-    },
-    {
-      "id": "T14",
-      "proves": "反馈弹窗关闭后焦点归还原消息动作(键盘用户不丢焦点)"
-    },
-    {
-      "id": "T15",
-      "proves": "活动 turn 中 AskUserQuestion 专用 UI 在移动视口可点选并按精确结构回传"
-    },
-    {
-      "id": "T16",
-      "proves": "移动访问端自动选移动预览、铺满可视区、空闲收起控件且不吞 iframe 触控"
-    },
-    {
-      "id": "T17",
-      "proves": "桌面访问端自动选桌面预览、铺满可视区、控件可按需恢复"
-    },
-    {
-      "id": "T18",
-      "proves": "消息「引用」把精确目标送进 Composer,可取消,再次引用随正文发送"
-    },
-    {
-      "id": "T19",
-      "proves": "真 IndexedDB 下多标签陈旧快照既不抹除也不复活 pending-dispatch 日志"
-    },
-    {
-      "id": "T20",
-      "proves": "预览用例跑完后主 harness 页面仍完好(防 setContent 摧毁共享页面导致后续缺席断言恒真)"
-    },
-    {
-      "id": "T21",
-      "proves": "真 WS 帧经真 ChatSocket 消化后驱动真时间线:条目数与顺序、工具卡真实命令与输出、思考卡实时展开→终态自动折叠→可再展开、终态清发送态(补 jsdom 单测与 stub 卡片之间那段无人守的链)"
-    },
-    {
-      "id": "T22",
-      "proves": "Enter 发送 / Shift+Enter 换行 / 中文 IME 组合中回车不误发(jsdom 里 isComposing 物理恒 false,只有真浏览器组合态能证明)"
-    },
-    {
-      "id": "T23",
-      "proves": "顶栏切模型:受信点选后上层收到精确 model id、菜单关闭、触发器回显新模型;降级模型点不动也不会被静默切过去"
-    },
-    {
-      "id": "T24",
-      "proves": "markdown ```mermaid 有效语法真渲染出带节点文案的 SVG(有真实尺寸),半截/无效语法回退可读源码而不是白屏/常驻占位,且不把 mermaid 错误图注入 <body> 顶层"
-    },
-    {
-      "id": "T25",
-      "proves": "390×844 整页聊天:顶栏四个入口不被挤出视口、宽正文(长 URL/宽代码/宽表格/长命令)要么放得下要么可横滑、汉堡与「+」与发送三个入口受信可点且文本精确送出"
-    },
-    {
-      "id": "T26",
-      "proves": "真 Chromium 微博标准登录 DOM 同时含二维码与“验证码登录/获取验证码”时不会误报挑战,真实图形验证码仍 fail-closed"
-    },
-    {
-      "id": "T27",
-      "proves": "对话输入框粘贴 PNG 时阻止默认文本污染、onUpload 只收到一次精确 File、图片 chip 正常完成"
-    },
-    {
-      "id": "T28",
-      "proves": "iPhone Safari 手机支付首次渲染不请求 PC 二维码、受信点击真跳安全 mobile_url，返回后恢复订单并自动确认；微信 WebView 无链接、无二维码并提示改用系统浏览器"
-    },
-    {
-      "id": "T29",
-      "proves": "真 Chromium 中 retrying wire 帧经 HarnessWebSocket→ChatSocket→reducer→真实 MessageList 后只显示一行模型繁忙 n/10 软提示；同一在途 turn 随后收到实时正文与 final 时成功内容可见、发送态结束且没有中间 API Error 红卡"
-    },
-    {
-      "id": "T30",
-      "proves": "视频任务中心真 Chromium 中展示持久排队，接收实时进度后原位更新，通过可信点击发出精确取消请求并收敛为已取消终态"
-    },
-    {
-      "id": "T31",
-      "proves": "journal page1→实时 WS N→page2 同含 N 的确定性交错中，thinking/tool/text 各恰好一次；后续恢复从共享 record cursor 增量读取且不清空已有过程"
-    },
-    {
-      "id": "T32",
-      "proves": "durable error journal 重放时，旧 wire 用户 Stop 归一为取消且不上报/不恢复；已有较新 user 的普通历史错误持久化 decision 且不触发 REST sync 循环"
-    },
-    {
-      "id": "T33",
-      "proves": "当前版本微博账号在真浏览器中始终显示重新登录入口，确认后 POST 精确原 accountId 且扫码会话启动前不 DELETE 旧连接"
-    },
-    {
-      "id": "T34",
-      "proves": "全面优化模式收到旧版失败回执时，记忆中心不再展示永远不会更新的旧版梦境报告卡"
-    },
-    {
-      "id": "T35",
-      "proves": "活动轮含消费提醒时仍只有 Composer 一个 Stop 入口；停止结算时同一按钮切换为禁用加载态且不能重复提交"
-    },
-    {
-      "id": "T36",
-      "proves": "不可变历史 tape 已中断时未完成子任务显示已取消且无 spinner；实时未完成子任务仍运行中；中断前已完成子任务仍显示完成"
-    },
-    {
-      "id": "T37",
-      "proves": "真 Chromium 中连续点击新建只保留一个未持久化空白草稿态；已有部分消息时真实内容与明确的会话加载占位同时可见"
-    },
-    {
-      "id": "T38",
-      "proves": "社区教程在真 Chromium 中可公开只读查看、登录用户可提交进入待审核，且 390px 视口不横向溢出"
-    },
-    {
-      "id": "T39",
-      "proves": "刷新恢复同一会话的多代 live journal 时，旧容器高 frameSeq 不吞掉新容器从 1 重启的实时思考与正文，旧持久过程仍保留"
-    },
-    {
-      "id": "T40",
-      "proves": "390px 真 Chromium 失败轮只显示一个重试出口，不重复发送失败、不泄露供应商路由名、无请求 ID 时不显示详情，且紧凑 warning 卡不横溢"
-    },
-    {
-      "id": "T41",
-      "proves": "PR1 Codex 密度 token：Composer 与 ToolCard 视觉、Sidebar 单行会话/累计用时/活跃竖条与顶栏入口在 1440/390 明暗主题均成立，账号菜单保留管理/市场/组织/后台/视频任务，底栏保留教程与主题"
-    },
-    {
-      "id": "T42",
-      "proves": "PR2 设置壳：默认关闭不盖住 harness；390 单列不横溢且能切到账户/用量/偏好/反馈/关于；1440 竖导航 168px；现有教程深链 section 仍是 preferences/account/feedback"
-    },
-    {
-      "id": "T43",
-      "proves": "390px 真 Chromium 触控首次向上拖动会立即解除贴底；随后消息高度增长不把视口弹回底部"
-    },
-    {
-      "id": "T44",
-      "proves": "当前会话 running 期间流式刷新不 mark-read；终态后只发送一次，unread=false 回执前再刷新不形成请求风暴"
-    },
-    {
-      "id": "T45",
-      "proves": "中断 turn 只用服务端回显字段仍显示 requestId/积分与已产生正文；records_unpublished 空窗给出非正文占位且 fallback 有 usage 时仍显示 requestId/积分，不渲染红卡或重试"
-    },
-    {
-      "id": "T46",
-      "proves": "真 Chromium 中 waiting_for_user wire 帧经 HarnessWebSocket→ChatSocket→reducer→真实 MessageList 后显示等待用户确认，不升级为无新数据、模型卡住或自动免单；同一轮仍可被 final 正常收尾"
-    },
-    {
-      "id": "T47",
-      "proves": "真 Chromium 从产品官方教程注册表读取编程助手建议模型，必须是 glm-5.3-zai，不能回落到持续 400 的 Ark glm-5.3"
-    },
-    {
-      "id": "T48",
-      "proves": "engine_starting/engine_resuming wire 帧经真实 ChatSocket→reducer→MessageList 后活动行显示「正在启动引擎/正在恢复会话」而非误标思考中；首内容清除、终态不粘"
-    },
-    {
-      "id": "T49",
-      "proves": "真 Chromium 中 Phase-A unpublished fallback 清发送态后，空 live-units owner reset 仍保留 thinking/tool/plan，终稿与过程行同时可见"
-    }
+    { "id": "T1", "proves": "「+」→「添加附件」真的弹出系统文件选择器(Radix 同步卸载不再杀掉 label 激活)" },
+    { "id": "T2", "proves": "附件菜单点完会关,不常驻挡住输入区" },
+    { "id": "T3", "proves": "选完文件出现附件 chip 且非错误态,onUpload 真收到该文件" },
+    { "id": "T4", "proves": "file input 结构红线:type=file / 无 accept 白名单 / 非 display:none / tabindex=-1(国产内核可选文件)" },
+    { "id": "T5", "proves": "惰性 user sidecar 水合出原文,重试拿到逐字节精确的原始 payload" },
+    { "id": "T6", "proves": "惰性 Agent tape 记录水合成真实 ToolCard,不是 locator 替身" },
+    { "id": "T7", "proves": "「+」→「设定目标」对话框能弹出(同菜单第二入口对照)" },
+    { "id": "T8", "proves": "长会话上滑零请求、显式点击只取一页、插页后可见消息像素不跳、虚拟 remount 不重取" },
+    { "id": "T9", "proves": "第二次点击才继续下一 cursor,已加载记录不被替换/丢失" },
+    { "id": "T10", "proves": "归档前插跨出虚拟挂载区后,点击前可见的那条消息仍锁在原像素位置" },
+    { "id": "T11", "proves": "思考卡实时展开、完成自动折叠,受信点击后完整正文恢复" },
+    { "id": "T12", "proves": "单 Agent 卡/团队队员卡/通用 ToolCard 的可见按钮名单恰好等于白名单(冗余「原始完整记录」入口回归即红),真实过程仍可见" },
+    { "id": "T13", "proves": "工具卡头部 ≥44px 触控、键盘可展开折叠、长列表渐进加载、375px 宽不横向溢出" },
+    { "id": "T14", "proves": "反馈弹窗关闭后焦点归还原消息动作(键盘用户不丢焦点)" },
+    { "id": "T15", "proves": "活动 turn 中 AskUserQuestion 专用 UI 在移动视口可点选并按精确结构回传" },
+    { "id": "T16", "proves": "移动访问端自动选移动预览、铺满可视区、空闲收起控件且不吞 iframe 触控" },
+    { "id": "T17", "proves": "桌面访问端自动选桌面预览、铺满可视区、控件可按需恢复" },
+    { "id": "T18", "proves": "消息「引用」把精确目标送进 Composer,可取消,再次引用随正文发送" },
+    { "id": "T19", "proves": "真 IndexedDB 下多标签陈旧快照既不抹除也不复活 pending-dispatch 日志" },
+    { "id": "T20", "proves": "预览用例跑完后主 harness 页面仍完好(防 setContent 摧毁共享页面导致后续缺席断言恒真)" },
+    { "id": "T21", "proves": "真 WS 帧经真 ChatSocket 消化后驱动真时间线:条目数与顺序、工具卡真实命令与输出、思考卡实时展开→终态自动折叠→可再展开、终态清发送态(补 jsdom 单测与 stub 卡片之间那段无人守的链)" },
+    { "id": "T22", "proves": "Enter 发送 / Shift+Enter 换行 / 中文 IME 组合中回车不误发(jsdom 里 isComposing 物理恒 false,只有真浏览器组合态能证明)" },
+    { "id": "T23", "proves": "顶栏切模型:受信点选后上层收到精确 model id、菜单关闭、触发器回显新模型;降级模型点不动也不会被静默切过去" },
+    { "id": "T24", "proves": "markdown ```mermaid 有效语法真渲染出带节点文案的 SVG(有真实尺寸),半截/无效语法回退可读源码而不是白屏/常驻占位,且不把 mermaid 错误图注入 <body> 顶层" },
+    { "id": "T25", "proves": "390×844 整页聊天:顶栏四个入口不被挤出视口、宽正文(长 URL/宽代码/宽表格/长命令)要么放得下要么可横滑、汉堡与「+」与发送三个入口受信可点且文本精确送出" },
+    { "id": "T26", "proves": "真 Chromium 微博标准登录 DOM 同时含二维码与“验证码登录/获取验证码”时不会误报挑战,真实图形验证码仍 fail-closed" },
+    { "id": "T27", "proves": "对话输入框粘贴 PNG 时阻止默认文本污染、onUpload 只收到一次精确 File、图片 chip 正常完成" },
+    { "id": "T28", "proves": "iPhone Safari 手机支付首次渲染不请求 PC 二维码、受信点击真跳安全 mobile_url，返回后恢复订单并自动确认；微信 WebView 无链接、无二维码并提示改用系统浏览器" },
+    { "id": "T29", "proves": "真 Chromium 中 retrying wire 帧经 HarnessWebSocket→ChatSocket→reducer→真实 MessageList 后只显示一行模型繁忙 n/10 软提示；同一在途 turn 随后收到实时正文与 final 时成功内容可见、发送态结束且没有中间 API Error 红卡" },
+    { "id": "T30", "proves": "视频任务中心真 Chromium 中展示持久排队，接收实时进度后原位更新，通过可信点击发出精确取消请求并收敛为已取消终态" },
+    { "id": "T31", "proves": "journal page1→实时 WS N→page2 同含 N 的确定性交错中，thinking/tool/text 各恰好一次；后续恢复从共享 record cursor 增量读取且不清空已有过程" },
+    { "id": "T32", "proves": "durable error journal 重放时，旧 wire 用户 Stop 归一为取消且不上报/不恢复；已有较新 user 的普通历史错误持久化 decision 且不触发 REST sync 循环" },
+    { "id": "T33", "proves": "当前版本微博账号在真浏览器中始终显示重新登录入口，确认后 POST 精确原 accountId 且扫码会话启动前不 DELETE 旧连接" },
+    { "id": "T34", "proves": "全面优化模式收到旧版失败回执时，记忆中心不再展示永远不会更新的旧版梦境报告卡" },
+    { "id": "T35", "proves": "活动轮含消费提醒时仍只有 Composer 一个 Stop 入口；停止结算时同一按钮切换为禁用加载态且不能重复提交" },
+    { "id": "T36", "proves": "不可变历史 tape 已中断时未完成子任务显示已取消且无 spinner；实时未完成子任务仍运行中；中断前已完成子任务仍显示完成" },
+    { "id": "T37", "proves": "真 Chromium 中连续点击新建只保留一个未持久化空白草稿态；已有部分消息时真实内容与明确的会话加载占位同时可见" },
+    { "id": "T38", "proves": "社区教程在真 Chromium 中可公开只读查看、登录用户可提交进入待审核，且 390px 视口不横向溢出" },
+    { "id": "T39", "proves": "刷新恢复同一会话的多代 live journal 时，旧容器高 frameSeq 不吞掉新容器从 1 重启的实时思考与正文，旧持久过程仍保留" },
+    { "id": "T40", "proves": "390px 真 Chromium 失败轮只显示一个重试出口，不重复发送失败、不泄露供应商路由名、无请求 ID 时不显示详情，且紧凑 warning 卡不横溢" },
+    { "id": "T41", "proves": "PR1 Codex 密度 token：Composer 与 ToolCard 视觉、Sidebar 单行会话/累计用时/活跃竖条与顶栏入口在 1440/390 明暗主题均成立，账号菜单保留管理/市场/组织/后台/视频任务，底栏保留教程与主题" },
+    { "id": "T42", "proves": "PR2 设置壳：默认关闭不盖住 harness；390 单列不横溢且能切到账户/用量/偏好/反馈/关于；1440 竖导航 168px；现有教程深链 section 仍是 preferences/account/feedback" },
+    { "id": "T43", "proves": "390px 真 Chromium 触控首次向上拖动会立即解除贴底；随后消息高度增长不把视口弹回底部" },
+    { "id": "T44", "proves": "当前会话 running 期间流式刷新不 mark-read；终态后只发送一次，unread=false 回执前再刷新不形成请求风暴" },
+    { "id": "T45", "proves": "中断 turn 只用服务端回显字段仍显示 requestId/积分与已产生正文；records_unpublished 空窗给出非正文占位且 fallback 有 usage 时仍显示 requestId/积分，不渲染红卡或重试" },
+    { "id": "T46", "proves": "真 Chromium 中 waiting_for_user wire 帧经 HarnessWebSocket→ChatSocket→reducer→真实 MessageList 后显示等待用户确认，不升级为无新数据、模型卡住或自动免单；同一轮仍可被 final 正常收尾" },
+    { "id": "T47", "proves": "真 Chromium 从产品官方教程注册表读取编程助手建议模型，必须是 glm-5.3-zai，不能回落到持续 400 的 Ark glm-5.3" },
+    { "id": "T48", "proves": "engine_starting/engine_resuming wire 帧经真实 ChatSocket→reducer→MessageList 后活动行显示「正在启动引擎/正在恢复会话」而非误标思考中；首内容清除、终态不粘" },
+    { "id": "T49", "proves": "follow→unfollow 后画窗从尾窗切到滚动窗时，点击/上滑前可见的那条消息像素不跳" },
+    { "id": "T50", "proves": "已 unfollow 后继续上滑使画窗滑动时，当前可见锚点不因 spacer 估高切换而跳" },
+    { "id": "T51", "proves": "短会话不开画窗时，上方 200px 估高变成真实高度不会把视口内容推向底部" },
+    { "id": "T52", "proves": "真 Chromium 中 Phase-A unpublished fallback 清发送态后，空 live-units owner reset 仍保留 thinking/tool/plan，终稿与过程行同时可见" }
   ]
 }

@@ -9,6 +9,7 @@ import {
   StrictMode,
   useCallback,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -24,6 +25,7 @@ import { MemoryPanel } from "../src/components/manage/MemoryPanel";
 import { MediaTaskCenter } from "../src/components/MediaTaskCenter";
 import { Markdown } from "../src/components/Markdown";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
+import { createStickToBottomController } from "../src/components/chat/stickToBottom";
 import { ModelSelector } from "../src/components/ModelSelector";
 import { ToolCard } from "../src/components/ToolCard";
 import { TeamPanel } from "../src/components/chat/TeamPanel";
@@ -31,6 +33,7 @@ import { ConnectorsTab } from "../src/components/settings/ConnectorsTab";
 import { ToastProvider, TooltipProvider } from "../src/components/ui";
 import {
   captureVisibleVirtualRowAnchor,
+  correctToVisibleVirtualRowAnchor,
   restoreVisibleVirtualRowAnchor,
 } from "../src/components/chat/archivePaging";
 import {
@@ -95,6 +98,45 @@ declare global {
       mergedPages: number;
       messageCount: number;
       anchor: null | { key: string; top: number };
+    };
+    __paintAnchor: {
+      following: boolean;
+      armSticky: () => void;
+      mark: () => void;
+      userScrollBy: (delta: number) => void;
+      snapshot: () => {
+        following: boolean;
+        key: string | null;
+        top: number | null;
+        scrollTop: number;
+        scrollHeight: number;
+        clientHeight: number;
+        paintCount: number;
+        windowCount: number;
+        spacerTop: number;
+      };
+      rowTop: (key: string) => number | null;
+      growAboveViewport: (deltaPx: number) => boolean;
+    };
+    __mountPaintProbes: () => void;
+    __estimateAnchor: {
+      following: boolean;
+      armSticky: () => void;
+      mark: () => void;
+      userScrollBy: (delta: number) => void;
+      snapshot: () => {
+        following: boolean;
+        key: string | null;
+        top: number | null;
+        scrollTop: number;
+        scrollHeight: number;
+        clientHeight: number;
+        paintCount: number;
+        windowCount: number;
+        spacerTop: number;
+      };
+      rowTop: (key: string) => number | null;
+      growAboveViewport: (deltaPx: number) => boolean;
     };
     __askQuestion: { responses: unknown[] };
     __messageQuote: {
@@ -208,6 +250,45 @@ window.__scrollTimeline = {
   anchor: null,
 };
 window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0, anchor: null };
+window.__mountPaintProbes = () => {};
+window.__paintAnchor = {
+  following: true,
+  armSticky: () => {},
+  mark: () => {},
+  userScrollBy: () => {},
+  snapshot: () => ({
+    following: true,
+    key: null,
+    top: null,
+    scrollTop: 0,
+    scrollHeight: 0,
+    clientHeight: 0,
+    paintCount: 0,
+    windowCount: 0,
+    spacerTop: 0,
+  }),
+  rowTop: () => null,
+  growAboveViewport: () => false,
+};
+window.__estimateAnchor = {
+  following: true,
+  armSticky: () => {},
+  mark: () => {},
+  userScrollBy: () => {},
+  snapshot: () => ({
+    following: true,
+    key: null,
+    top: null,
+    scrollTop: 0,
+    scrollHeight: 0,
+    clientHeight: 0,
+    paintCount: 0,
+    windowCount: 0,
+    spacerTop: 0,
+  }),
+  rowTop: () => null,
+  growAboveViewport: () => false,
+};
 window.__askQuestion = { responses: [] };
 window.__messageQuote = { sends: [] };
 window.__errorUxRetries = 0;
@@ -1050,6 +1131,216 @@ function ArchiveTimelineProbe() {
 createRoot(document.getElementById("timeline-archive-root")!).render(
   <StrictMode><ArchiveTimelineProbe /></StrictMode>,
 );
+
+type TimelineAnchorSnapshot = {
+  following: boolean;
+  key: string | null;
+  top: number | null;
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+  paintCount: number;
+  windowCount: number;
+  spacerTop: number;
+};
+
+function bindTimelineAnchorApi(
+  target: Window["__paintAnchor"] | Window["__estimateAnchor"],
+  scroller: HTMLDivElement | null,
+  stick: ReturnType<typeof createStickToBottomController>,
+  onArmSticky?: () => void,
+) {
+  const snapshot = (): TimelineAnchorSnapshot => {
+    if (!scroller) {
+      return {
+        following: stick.following.current,
+        key: null,
+        top: null,
+        scrollTop: 0,
+        scrollHeight: 0,
+        clientHeight: 0,
+        paintCount: 0,
+        windowCount: 0,
+        spacerTop: 0,
+      };
+    }
+    const anchor = captureVisibleVirtualRowAnchor(scroller);
+    const rows = Array.from(scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"));
+    const fallback = rows.at(-1);
+    const fallbackKey = fallback?.getAttribute("data-chat-virtual-key") ?? null;
+    const fallbackTop = fallback
+      ? fallback.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+      : null;
+    const list = scroller.querySelector("[data-testid='timeline-short-list']");
+    const spacer = scroller.querySelector("[data-testid='timeline-paint-spacer-top']");
+    return {
+      following: stick.following.current,
+      key: anchor?.key ?? fallbackKey,
+      top: anchor?.top ?? fallbackTop,
+      scrollTop: scroller.scrollTop,
+      scrollHeight: scroller.scrollHeight,
+      clientHeight: scroller.clientHeight,
+      paintCount: Number(list?.getAttribute("data-timeline-paint-count") ?? 0),
+      windowCount: Number(list?.getAttribute("data-timeline-window-count") ?? 0),
+      spacerTop: spacer instanceof HTMLElement ? spacer.getBoundingClientRect().height : 0,
+    };
+  };
+  target.following = stick.following.current;
+  target.armSticky = () => {
+    if (!scroller) return;
+    stick.reset();
+    stick.scrollToBottom(scroller);
+    stick.onScroll(scroller);
+    target.following = stick.following.current;
+    onArmSticky?.();
+  };
+  target.mark = () => stick.markUserIntent();
+  target.userScrollBy = (delta: number) => {
+    if (!scroller) return;
+    stick.markUserIntent();
+    scroller.scrollTop = Math.max(0, scroller.scrollTop + delta);
+    stick.onScroll(scroller);
+    target.following = stick.following.current;
+  };
+  target.snapshot = snapshot;
+  target.rowTop = (key: string) => {
+    if (!scroller) return null;
+    const row = scroller.querySelector(`[data-chat-virtual-key="${key}"]`);
+    if (!(row instanceof HTMLElement)) return null;
+    return row.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+  };
+  target.growAboveViewport = (deltaPx: number) => {
+    if (!scroller) return false;
+    const viewport = scroller.getBoundingClientRect();
+    const rows = Array.from(scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"));
+    const above = rows.find((row) => row.getBoundingClientRect().bottom < viewport.top - 8);
+    if (!above) return false;
+    const anchor = captureVisibleVirtualRowAnchor(scroller);
+    const current = above.getBoundingClientRect().height;
+    above.style.minHeight = `${Math.max(current, 0) + deltaPx}px`;
+    if (anchor) {
+      correctToVisibleVirtualRowAnchor(scroller, anchor, (node, top) => stick.correctTo(node, top));
+    }
+    return true;
+  };
+}
+
+function PaintWindowAnchorProbe() {
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
+  const [, bumpPaint] = useState(0);
+  const stick = useRef(createStickToBottomController()).current;
+  const followBottomRef = useMemo(() => ({
+    get current() {
+      return stick.following.current;
+    },
+    set current(value: boolean) {
+      stick.following.current = value;
+    },
+    scrollToBottom: stick.scrollToBottom,
+    correctTo: stick.correctTo,
+  }), [stick]);
+  const messages = useMemo<ChatMessage[]>(() => Array.from({ length: 180 }, (_, index) => ({
+    id: `paint-row-${index}`,
+    role: "user" as const,
+    text: index % 2 === 0 ? "PAINT_SHORT" : "PAINT_TALL",
+    ts: index,
+    status: "sent" as const,
+    _source: "server" as const,
+    _timelineRecord: true,
+    _timelineUnitKey: `outer:${index}:paint-${index % 2 === 0 ? "short" : "tall"}-${index}`,
+  })), []);
+  bindTimelineAnchorApi(window.__paintAnchor, scroller, stick, () => {
+    bumpPaint((value) => value + 1);
+  });
+  return (
+    <div
+      ref={setScroller}
+      className="chat-scroll-area timeline-scroll-probe"
+      data-testid="paint-anchor-scroll-probe"
+      tabIndex={0}
+      onScroll={(event) => {
+        stick.onScroll(event.currentTarget);
+        window.__paintAnchor.following = stick.following.current;
+      }}
+      onWheel={() => stick.markUserIntent()}
+      onTouchStart={() => stick.markUserIntent()}
+      onPointerDown={() => stick.markUserIntent()}
+    >
+      <MessageList
+        messages={messages}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="paint-anchor"
+        followBottomRef={followBottomRef}
+      />
+    </div>
+  );
+}
+
+function EstimateAnchorProbe() {
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
+  const stick = useRef(createStickToBottomController()).current;
+  const followBottomRef = useMemo(() => ({
+    get current() {
+      return stick.following.current;
+    },
+    set current(value: boolean) {
+      stick.following.current = value;
+    },
+    scrollToBottom: stick.scrollToBottom,
+    correctTo: stick.correctTo,
+  }), [stick]);
+  const messages = useMemo<ChatMessage[]>(() => Array.from({ length: 40 }, (_, index) => ({
+    id: `estimate-row-${index}`,
+    role: "user" as const,
+    text: "ESTIMATE_ROW",
+    ts: index,
+    status: "sent" as const,
+    _source: "server" as const,
+    _timelineRecord: true,
+    _timelineUnitKey: `outer:${index}:estimate-${index}`,
+  })), []);
+  bindTimelineAnchorApi(window.__estimateAnchor, scroller, stick);
+  return (
+    <div
+      ref={setScroller}
+      className="chat-scroll-area timeline-scroll-probe"
+      data-testid="estimate-anchor-scroll-probe"
+      tabIndex={0}
+      onScroll={(event) => {
+        stick.onScroll(event.currentTarget);
+        window.__estimateAnchor.following = stick.following.current;
+      }}
+      onWheel={() => stick.markUserIntent()}
+      onTouchStart={() => stick.markUserIntent()}
+      onPointerDown={() => stick.markUserIntent()}
+    >
+      <MessageList
+        messages={messages}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="estimate-anchor"
+        followBottomRef={followBottomRef}
+      />
+    </div>
+  );
+}
+
+let paintProbesMounted = false;
+window.__mountPaintProbes = () => {
+  if (paintProbesMounted) return;
+  paintProbesMounted = true;
+  createRoot(document.getElementById("timeline-paint-anchor-root")!).render(
+    <StrictMode><PaintWindowAnchorProbe /></StrictMode>,
+  );
+  createRoot(document.getElementById("timeline-estimate-anchor-root")!).render(
+    <StrictMode><EstimateAnchorProbe /></StrictMode>,
+  );
+};
 
 // ── T21 真 WS 帧 → 真 ChatSocket → 真 MessageList ────────────────────────────
 //
