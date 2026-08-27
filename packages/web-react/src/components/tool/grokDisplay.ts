@@ -257,11 +257,12 @@ export function normalizeGrokToolForDisplay(
 ): DisplayTool {
   const product = grokProductToolName(name, input ?? undefined);
   const mappedInput = grokProductToolInput(name, input);
-  const decoded = grokProductToolOutput(message.outputJson ?? message.output ?? message.text ?? null);
-  const outputChanged = decoded !== (typeof message.output === "string" ? message.output : stringifyFallback(message.output));
-  const tool =
-    outputChanged || decoded
-      ? { ...message, output: decoded || message.output }
-      : message;
+  // output==null/undefined 视为「还没有输出」。message.text 在 Cursor/reducer
+  // 里是 toolName 占位（常为 "Bash"），绝不能当 stdout 兜底。
+  const decoded = grokProductToolOutput(message.outputJson ?? message.output ?? null);
+  const originalOutput =
+    typeof message.output === "string" ? message.output : stringifyFallback(message.output);
+  const outputChanged = decoded !== originalOutput;
+  const tool = outputChanged && decoded ? { ...message, output: decoded } : message;
   return { name: product || name, input: mappedInput, tool };
 }

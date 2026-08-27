@@ -418,7 +418,6 @@ function appendSubagentBlock(
         ...(initialPartialJson !== undefined ? { partialJson: initialPartialJson } : {}),
         _partial: !!block.partial,
         _completed: false,
-        output: null as unknown as string,
         error: false,
       });
       if (block.blockId && /^Agent$/i.test(block.toolName || "")) {
@@ -1969,7 +1968,6 @@ export function applyOutboundMessage(
           })(),
           _partial: !!tb.partial,
           _completed: false,
-          output: null,
           error: false,
           ...(frameTurnOwnerId ? { _turnOwnerId: frameTurnOwnerId } : {}),
         });

@@ -50,11 +50,18 @@ function engineMessageId(unit: LiveUnit): string | undefined {
   return typeof extra.messageId === "string" && extra.messageId ? extra.messageId : undefined;
 }
 
+function toolInputPreviewOf(unit: LiveUnit): string | undefined {
+  const extra = unit as LiveUnit & { inputPreview?: string };
+  if (typeof extra.inputPreview === "string" && extra.inputPreview) return extra.inputPreview;
+  // protocol fold 把 tool_use.inputPreview 存在 unit.text 里。
+  if (unit.kind === "tool" && typeof unit.text === "string" && unit.text) return unit.text;
+  return undefined;
+}
+
 export function liveUnitToMessage(unit: LiveUnit): ChatMessage {
   const role = roleFor(unit.kind);
-  const text = unit.kind === "tool"
-    ? (unit.toolName || "")
-    : (unit.text || unit.goal || "");
+  const text = unit.kind === "tool" ? "" : (unit.text || unit.goal || "");
+  const inputPreview = toolInputPreviewOf(unit);
   return {
     id: engineMessageId(unit) || unit.id,
     role,
@@ -67,6 +74,7 @@ export function liveUnitToMessage(unit: LiveUnit): ChatMessage {
     } : {}),
     ...(unit.blockId ? { blockId: unit.blockId } : {}),
     ...(unit.toolName ? { toolName: unit.toolName } : {}),
+    ...(inputPreview ? { inputPreview } : {}),
     ...(unit.inputJson !== undefined ? { inputJson: unit.inputJson } : {}),
     ...(unit.output !== undefined ? { output: unit.output } : {}),
     ...(unit.outputJson !== undefined ? { outputJson: unit.outputJson } : {}),
