@@ -364,6 +364,9 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   "28962cf36f60afdf3cca10f5a6d51beafcea2724",
   // 双向同步冻结:该 selfhost tip 已上线；只豁免其不可变祖先。
   "654a56f0b370cf5b1530e9861b79d7d10976f836",
+  // 2026-08-28 全量正向同步冻结:selfhost 874786599 已上线；只豁免其不可变祖先。
+  // 含 cron 送达置顶、教程/案例四条、cron-triad 批；禁止 amend 源提交。
+  "8747865996b5075e19d6aad5c9bf54bca72d0c01",
 ] as const;
 
 function checkTrailerClosure(): number {

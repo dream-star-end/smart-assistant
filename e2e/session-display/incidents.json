@@ -1855,49 +1855,6 @@
       ]
     },
     {
-      "id": "INC-20260827-PHASE-B-DEFER-VANISH",
-      "occurredAt": "2026-08-27",
-      "severity": "P1",
-      "symptom": "V5 自用实例 Phase-B 精确 assistant 到达后，`_payloadDeferred` 空壳（agent-group/tool）被当成「精确过程已到」，hasExactCompletionEvidence 与 journal owner-reset 删掉 live thinking/tool/agent-group，屏幕只剩虚线「正在读取真实 Agent 记录…」，直到 IntersectionObserver + Range 206 水合才补回。",
-      "rootFixCommit": "0002df13",
-      "regressions": [
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/lib/persist.test.ts",
-          "assertion": "Phase-B exact assistant + deferred agent-group keeps live agent-group"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/lib/persist.test.ts",
-          "assertion": "Phase-B exact assistant without thinking/tool keeps live thinking/tool"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/lib/persist.test.ts",
-          "assertion": "Phase-B hydrated non-deferred agent-group replaces live copy without duplicates"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/lib/chat/chat.test.ts",
-          "assertion": "Phase-B deferred agent-group then empty live-units reset keeps live agent-group"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/lib/chat/chat.test.ts",
-          "assertion": "Phase-B assistant without thinking/tool keeps live thinking/tool"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/lib/chat/chat.test.ts",
-          "assertion": "Phase-B hydrated agent-group replaces live copy without duplicates"
-        }
-      ],
-      "proofPending": {
-        "reason": "T1 单包 unit 已覆盖 Phase-B deferred stub、thinking/tool 未到与水合后无双份；浏览器 T49 仍只锁 Phase-A unpublished 路径，Phase-B defer 活体留给后续。",
-        "since": "2026-08-27"
-      }
-    },
-    {
       "id": "INC-20260827-WEIBO-SETUP-PIN-DRIFT",
       "occurredAt": "2026-08-27",
       "severity": "P1",
