@@ -771,7 +771,7 @@ function CaseGallery({
                   key={item.id}
                   item={item}
                   onSelect={onSelect}
-                  featured={Boolean(item.fieldReport)}
+                  featured={Boolean(item.fieldReport) && item.replay.status !== "pending_capture"}
                 />
               ))}
             </div>
@@ -840,7 +840,7 @@ function CaseGalleryCard({
         <h3 className="mt-1.5 text-[18px] font-semibold leading-6 text-fg">
           {item.title}
         </h3>
-        {report ? (
+        {report && item.replay.status !== "pending_capture" ? (
           <ul className="mt-4 grid grid-cols-3 gap-2" aria-label="案例结果">
             {report.metrics.map((metric) => (
               <li

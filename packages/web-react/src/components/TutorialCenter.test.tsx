@@ -133,6 +133,7 @@ describe("TutorialCenter", () => {
     expect(pending.length).toBeGreaterThanOrEqual(12);
     expect(screen.getByRole("heading", { name: "这些是待采集的任务脚本" })).toBeInTheDocument();
     expect(document.body.textContent).not.toContain("先看完整故事");
+    expect(screen.queryByRole("list", { name: "案例结果" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /从 30 篇论文到可追溯证据图谱/ }));
     expect(screen.getAllByText("示例待真实运行采集").length).toBeGreaterThanOrEqual(1);
