@@ -32,6 +32,9 @@ export function isNearBottom(el: StickScroller, px: number = STICK_TO_BOTTOM_PX)
  * Re-follow only when a scroll event shows `scrollTop` increased relative to the
  * last observation and the viewport is within 80px of the bottom. A shrink-clamp
  * that lands near the bottom is not re-follow.
+ *
+ * A marked user scroll leaves as soon as `current < expected`. The 1px write
+ * tolerance is only for unmarked clamp / subpixel noise.
  */
 export function createStickToBottomController() {
   const following = { current: true };
@@ -86,11 +89,13 @@ export function createStickToBottomController() {
   };
 
   const onScroll = (el: StickScroller) => {
+    const hadUserIntent = writeSuspended.current;
     writeSuspended.current = false;
     const current = el.scrollTop;
     const maxTop = maxScrollTop(el);
     const prevObserved = lastObservedTop.current;
     const expected = expectedWrittenTop(el);
+    const leaveTolerance = hadUserIntent ? 0 : WRITE_TOLERANCE_PX;
 
     // Browser clamped our last position after scrollHeight shrank. That is not
     // a user leave, and landing near the new bottom is not a re-follow.
@@ -106,9 +111,9 @@ export function createStickToBottomController() {
       return;
     }
 
-    if (expected !== null && current < expected - WRITE_TOLERANCE_PX) {
+    if (expected !== null && current < expected - leaveTolerance) {
       following.current = false;
-    } else if (prevObserved !== null && current < prevObserved - WRITE_TOLERANCE_PX) {
+    } else if (prevObserved !== null && current < prevObserved - leaveTolerance) {
       following.current = false;
     } else if (
       prevObserved !== null &&
