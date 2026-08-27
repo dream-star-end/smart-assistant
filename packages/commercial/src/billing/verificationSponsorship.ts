@@ -1,4 +1,8 @@
 import type { Pool, PoolClient } from "pg";
+import { DISPATCH_LEASE_TTL_MS } from "../dispatch/turnDispatchStore.js";
+
+/** Placeholder owner written by cron-origin-inject before a real bridge conn exists. */
+export const CRON_ORIGIN_OWNER_PREFIX = "cron-origin:";
 
 export const VERIFICATION_MODELS = ["deepseek-v4-flash", "gpt-5.6-luna"] as const;
 export type VerificationModel = (typeof VERIFICATION_MODELS)[number];
@@ -249,6 +253,11 @@ export async function admitVerificationSponsorship(
  * Before a CCB frame reaches the runtime, bind its freshly minted signed turn id to the exact
  * durable dispatch row held by this bridge.  All persisted identity fields come from the locked
  * database row; caller values are only equality fences against stale or miswired bridge state.
+ *
+ * cron-origin-inject admits on master with owner_id=`cron-origin:…` and no future connId.
+ * The container bridge later binds with the live connId; that row is adopted atomically
+ * (owner/lease/model stamped) instead of failing the identity fence. Non-cron rows keep
+ * the original owner/lease/model checks so a live connection cannot steal another conn's turn.
  */
 export async function bindAuthorityTurnDispatch(
   pool: Pool,
@@ -288,18 +297,67 @@ export async function bindAuthorityTurnDispatch(
         FOR UPDATE`,
       [input.dispatchId],
     );
-    const d = dispatch.rows[0];
-    const dispatchMatches = d !== undefined &&
+    let d = dispatch.rows[0];
+    if (d === undefined) {
+      throw new VerificationSponsorshipInvariantError("authority turn dispatch identity mismatch");
+    }
+    const coreMatches =
       d.user_id === input.userId.toString() &&
       d.session_id === input.sessionId &&
-      d.model === input.dispatchModel &&
       d.attempt_no === input.attemptNo &&
       d.status === "admitted" &&
+      d.lease_epoch === String(input.leaseEpoch);
+    const dispatchMatches = coreMatches &&
+      d.model === input.dispatchModel &&
       d.owner_id === input.ownerId &&
-      d.lease_epoch === String(input.leaseEpoch) &&
       d.lease_until !== null && d.lease_until.getTime() > Date.now();
     if (!dispatchMatches) {
-      throw new VerificationSponsorshipInvariantError("authority turn dispatch identity mismatch");
+      const adoptable = coreMatches &&
+        typeof d.owner_id === "string" &&
+        d.owner_id.startsWith(CRON_ORIGIN_OWNER_PREFIX);
+      if (!adoptable) {
+        throw new VerificationSponsorshipInvariantError("authority turn dispatch identity mismatch");
+      }
+      // Atomic adoption: only one connection can take a cron-origin placeholder.
+      // lease_epoch is left unchanged so the in-memory admitted dispatch keeps its heartbeat fence.
+      const adopted = await client.query<TurnDispatchAdmissionRow>(
+        `UPDATE turn_dispatches
+            SET owner_id = $2,
+                lease_until = NOW() + ($3::bigint * INTERVAL '1 millisecond'),
+                model = $4
+          WHERE dispatch_id = $1
+            AND owner_id LIKE 'cron-origin:%'
+            AND status = 'admitted'
+            AND user_id = $5
+            AND session_id = $6
+            AND attempt_no = $7
+            AND lease_epoch = $8
+          RETURNING user_id::text,session_id,model,attempt_no,status,owner_id,
+                    lease_epoch::text,lease_until`,
+        [
+          input.dispatchId,
+          input.ownerId,
+          DISPATCH_LEASE_TTL_MS,
+          input.dispatchModel,
+          input.userId.toString(),
+          input.sessionId,
+          input.attemptNo,
+          String(input.leaseEpoch),
+        ],
+      );
+      if (adopted.rowCount !== 1 || adopted.rows[0] === undefined) {
+        throw new VerificationSponsorshipInvariantError("authority turn dispatch identity mismatch");
+      }
+      d = adopted.rows[0];
+      if (
+        d.owner_id !== input.ownerId ||
+        d.model !== input.dispatchModel ||
+        d.status !== "admitted" ||
+        d.lease_until === null ||
+        d.lease_until.getTime() <= Date.now()
+      ) {
+        throw new VerificationSponsorshipInvariantError("authority turn dispatch identity mismatch");
+      }
     }
 
     await client.query(

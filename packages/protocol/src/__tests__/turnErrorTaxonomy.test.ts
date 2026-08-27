@@ -19,6 +19,7 @@ describe('automatic turn recovery policy', () => {
   it('classifies every frontend-visible retryable code into automatic recovery or an explicit unsafe transport/admission exclusion', () => {
     const explicitUnsafe = new Set([
       'session_persist_unavailable', // no durable user-row/tape authority
+      'durable_dispatch_unavailable', // bind fence failed; retry mints a new dispatch
       'conn_kicked', // connection lifecycle owns reconnect, not turn replay
       'bad_sequence', // requires exact sync before any new dispatch
       'codex_turn_busy', // another turn owns the session; FIFO lifecycle owns it
@@ -54,6 +55,7 @@ describe('automatic turn recovery policy', () => {
       'stopped',
       'user_cancelled',
       'session_persist_unavailable',
+      'durable_dispatch_unavailable',
       'model_not_available',
       'model_config_changed_retry_turn',
       'codex_billing',

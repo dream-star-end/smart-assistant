@@ -721,6 +721,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   auth_error: "认证状态异常，本轮未正常完成，请重新尝试。",
   service_restart: "服务正在更新，本轮已中断，请重试。",
   session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。请点下方“重试”原样发送。",
+  durable_dispatch_unavailable: "本轮派发未能接入执行通道，已中断。请点击重试。",
   stopped: "本轮生成已停止。",
   user_cancelled: "本轮已取消。",
   runner_crashed: "执行环境意外中断，你的消息已保留，请重试。",
