@@ -1812,6 +1812,25 @@
           "assertion": "T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划"
         }
       ]
+    },
+    {
+      "id": "INC-20260827-WEIBO-SETUP-PIN-DRIFT",
+      "occurredAt": "2026-08-27",
+      "severity": "P1",
+      "symptom": "V5 商业版微博扫码授权弹窗顶部红条「Plugin 授权服务暂不可用」。POST /api/plugins/weibo/setup 两次 503 PLUGIN_RUNTIME_UNAVAILABLE（33–70ms）。根因是 weiboContract WEIBO_PLUGIN_VERSION 已到 1.6.36，但 deploy-v5.sh 只自动 seed 知识星球、不 seed 微博，生产 listing 停在 1.5.0，classifyWeiboSetupPin 拒绝。根修给 deploy-v5.sh 补与知识星球同构的无人值守 seed/transition 门；人工 cookie 验证仍走 seed-weibo-plugin.ts --verify-and-upgrade-user。",
+      "rootFixCommit": "9c542d82",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5ReleaseSafety.test.ts",
+          "assertion": "Weibo Plugin is noninteractively gated like Knowledge Planet and never consumes cookies on deploy"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "seed-weibo-plugin.ts --seed-only"
+        }
+      ]
     }
   ]
 }
