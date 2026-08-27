@@ -24,9 +24,7 @@ describe("formatLiveActivityAction（活动行只显示中文动作，不堆工�
   test("任务/计划更新 → 更新任务", () => {
     expect(formatLiveActivityAction("TaskUpdate id=OCV5-1")).toBe("更新任务");
     expect(formatLiveActivityAction("TodoWrite todos=[...]")).toBe("更新任务");
-    expect(formatLiveActivityAction("mcp__openclaude-memory__task_update OCV5-1")).toBe(
-      "更新任务",
-    );
+    expect(formatLiveActivityAction("mcp__openclaude-memory__task_update OCV5-1")).toBe("更新任务");
     expect(formatLiveActivityAction("EnterPlanMode")).toBe("更新任务");
   });
 
@@ -52,25 +50,56 @@ describe("formatLiveActivityAction（活动行只显示中文动作，不堆工�
     expect(formatLiveActivityAction("use_tool skill_search")).toBe("搜索代码");
   });
 
-  test("委派/子任务 → 运行子任务", () => {
-    expect(formatLiveActivityAction("Task 修复活动行")).toBe("运行子任务");
-    expect(formatLiveActivityAction("Agent description=...")).toBe("运行子任务");
-    expect(formatLiveActivityAction("delegate_task coding-assistant")).toBe("运行子任务");
-    expect(formatLiveActivityAction("子任务 Task 运行中")).toBe("运行子任务");
-    expect(formatLiveActivityAction("子任务运行中")).toBe("运行子任务");
-    expect(formatLiveActivityAction("mcp__openclaude-memory__delegate_tasks")).toBe(
-      "运行子任务",
+  test("委派/子任务 → 运行子任务，并保留细节尾巴", () => {
+    expect(formatLiveActivityAction("Task 修复活动行")).toBe("运行子任务 · 修复活动行");
+    expect(formatLiveActivityAction("Agent description=...")).toBe("运行子任务 · description=...");
+    expect(formatLiveActivityAction("delegate_task coding-assistant")).toBe(
+      "运行子任务 · coding-assistant",
     );
+    expect(formatLiveActivityAction("子任务 Task 运行中")).toBe("运行子任务 · Task 运行中");
+    expect(formatLiveActivityAction("子任务运行中")).toBe("运行子任务 · 运行中");
+    expect(formatLiveActivityAction("mcp__openclaude-memory__delegate_tasks")).toBe("运行子任务");
+    expect(formatLiveActivityAction("子任务 编程助手: Bash npm run build")).toBe(
+      "运行子任务 · 编程助手: Bash npm run build",
+    );
+    expect(formatLiveActivityAction("运行子任务 · 编程助手: Read foo.ts")).toBe(
+      "运行子任务 · 编程助手: Read foo.ts",
+    );
+  });
+
+  test("oc-memory delegate 的 Bash/Shell 包装归入运行子任务，不回显 goal", () => {
+    expect(
+      formatLiveActivityAction('Bash HOME=/home/agent oc-memory delegate --goal "整段 prompt"'),
+    ).toBe("运行子任务");
+    expect(
+      formatLiveActivityAction(
+        "Shell OPENCLAUDE_GATEWAY_PORT=18790 oc-memory delegate-wait dlgjob-1",
+      ),
+    ).toBe("运行子任务");
+    expect(
+      formatLiveActivityAction("run_terminal_command oc-memory request-review --draft x"),
+    ).toBe("运行子任务");
+  });
+
+  test("运行子任务细节按字符截断到 60，加省略号", () => {
+    const hint = `子任务 编程助手: Bash ${"x".repeat(80)}`;
+    const out = formatLiveActivityAction(hint);
+    expect(out.startsWith("运行子任务 · 编程助手: Bash ")).toBe(true);
+    expect(out.endsWith("…")).toBe(true);
+    expect(out.length).toBe(60);
+    expect([...out].length).toBe(60);
   });
 
   test("未知工具 / 思考原文 / 路径 → 执行操作，永不回显参数", () => {
     expect(formatLiveActivityAction("Frobnicate --flag /secret")).toBe(LIVE_ACTIVITY_FALLBACK);
-    expect(
-      formatLiveActivityAction("I am inspecting the reducer next"),
-    ).toBe(LIVE_ACTIVITY_FALLBACK);
+    expect(formatLiveActivityAction("I am inspecting the reducer next")).toBe(
+      LIVE_ACTIVITY_FALLBACK,
+    );
     expect(formatLiveActivityAction("/home/agent/secret.env")).toBe(LIVE_ACTIVITY_FALLBACK);
     expect(formatLiveActivityAction("CallMcpTool skill_search coding")).toBe("搜索代码");
-    expect(formatLiveActivityAction("CallMcpTool frobnicate_unknown coding")).toBe(LIVE_ACTIVITY_FALLBACK);
+    expect(formatLiveActivityAction("CallMcpTool frobnicate_unknown coding")).toBe(
+      LIVE_ACTIVITY_FALLBACK,
+    );
   });
 
   test("已是稳定中文标签则原样（可带被误拼的尾巴也会收成标签）", () => {
@@ -79,11 +108,11 @@ describe("formatLiveActivityAction（活动行只显示中文动作，不堆工�
     expect(formatLiveActivityAction("执行操作")).toBe("执行操作");
   });
 
-  test("输出永不包含绝对路径或原始工具名", () => {
+  test("非运行子任务类别永不包含绝对路径或原始工具名", () => {
     const samples = [
       "StrReplace /home/agent/work/x.ts",
       "Bash npm test -- packages/web-react",
-      "TaskUpdate {\"id\":\"OCV5-1\"}",
+      'TaskUpdate {"id":"OCV5-1"}',
     ];
     for (const sample of samples) {
       const label = formatLiveActivityAction(sample);
