@@ -342,12 +342,53 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/plugins/weibo.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "create_post with media falls through to DOM after a live cookie-path miss"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "create_post with media does not fall through to DOM when cookie helper throws after a full pid set"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "picupload posts multipart pic1 before raw blob and keeps pids if newPage throws"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "cookie helper keeps mobile pids when statuses/update fetch rejects"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "cookie helper keeps mobile pids when statuses/update text() rejects"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "create_post with media does not fall through to DOM when mobile update fetch rejects"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "create_post with media does not fall through to DOM when mobile update text() rejects"
         }
       ],
       "proofPending": {
         "reason": "唯一 proof 证据原本填 scripts/v5-e2e-journey-canary.mjs,而该脚本只有 J1-J5 登录/附件/目标/发送/送达,与微博图片链路零关系(2026-07-26 审计),已移除充数证据;真活体证据待补(需要 Weibo 连接器的可重放沙箱)。",
         "since": "2026-07-26"
-      }
+      },
+      "coverageCommits": [
+        "53a4e840",
+        "e7f96b4d",
+        "60e024ab",
+        "7558fc12"
+      ]
     },
     {
       "id": "INC-20260721-WEIBO-WORKER-OOM",

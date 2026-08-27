@@ -375,7 +375,9 @@ describe('周报界面', () => {
   test('展示流转、阶段耗时、缺单价成本、受阻单和失败 run，并可切周/项目', async () => {
     const getWeekly = vi.spyOn(taskboardApi, 'getWeeklyReport').mockResolvedValue(report)
     wrap(<WeeklyReportView auth={auth} projectId="p1" projects={[sampleProject()]} />)
-    expect(await screen.findByTestId('weekly-period')).toHaveTextContent('2026-W34')
+    await waitFor(() => {
+      expect(screen.getByTestId('weekly-period')).toHaveTextContent('2026-W34')
+    })
     expect(screen.getByText('定位根因')).toBeInTheDocument()
     expect(screen.getByTestId('weekly-cost-money')).toHaveTextContent(
       '本区间全部无单价，仅有 token 数据',
