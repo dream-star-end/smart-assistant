@@ -124,6 +124,88 @@ export function makeDelegateProgressBlock(args: {
   return block
 }
 
+const LIVE_WORKING_DETAIL_MAX = 120
+
+/** Parent live-row working-detail for a child tool/start frame. Truncates; never dumps --goal. */
+export function formatDelegateLiveWorkingDetail(args: {
+  agentLabel: string
+  toolName?: string
+  summary?: string
+  parallelCount?: number
+}): string {
+  const member = sanitizeDelegateProgressText(args.agentLabel, 24) || '成员'
+  const tool = sanitizeDelegateProgressText(args.toolName ?? '', 40)
+  const summary = sanitizeDelegateProgressText(args.summary ?? '', 80)
+  const parallel =
+    typeof args.parallelCount === 'number' && args.parallelCount > 1
+      ? ` ×${Math.min(args.parallelCount, 99)}`
+      : ''
+  let body = `子任务 ${member}`
+  if (tool) body += `: ${tool}`
+  if (summary) body += ` ${summary}`
+  body += parallel
+  return sanitizeDelegateProgressText(body, LIVE_WORKING_DETAIL_MAX)
+}
+
+function liveHintFromToolInput(input: Record<string, unknown> | null): string {
+  if (!input) return ''
+  const command = typeof input.command === 'string' ? input.command.replace(/\s+/g, ' ').trim() : ''
+  if (command) {
+    if (/\boc-memory\s+(delegate-wait|delegate|request-review)\b/i.test(command)) return ''
+    return sanitizeDelegateProgressText(command, 80)
+  }
+  const desc = typeof input.description === 'string' ? input.description : ''
+  if (desc.trim()) return sanitizeDelegateProgressText(desc, 60)
+  return ''
+}
+
+/** Short command/path preview for the parent live row. Drops child --goal / Task prompt. */
+export function summarizeDelegateToolForLiveHint(block: unknown): string {
+  const b = block && typeof block === 'object' ? (block as Record<string, unknown>) : null
+  if (!b) return ''
+  const input =
+    b.inputJson && typeof b.inputJson === 'object' && !Array.isArray(b.inputJson)
+      ? (b.inputJson as Record<string, unknown>)
+      : null
+  const fromInput = liveHintFromToolInput(input)
+  if (fromInput) return fromInput
+  let preview = typeof b.inputPreview === 'string' ? b.inputPreview.replace(/\s+/g, ' ').trim() : ''
+  preview = preview.replace(/^调用工具\s+\S+:\s*/u, '')
+  if (/\boc-memory\s+(delegate-wait|delegate|request-review)\b/i.test(preview)) return ''
+  return sanitizeDelegateProgressText(preview, 60)
+}
+
+/**
+ * Map a delegate_progress frame to the parent session's turn_status working-detail.
+ * Only start + tool_use; results/tails/text would stick a stale "完成" on the live row.
+ */
+export function formatDelegateParentWorkingDetail(args: {
+  block: DelegateProgressBlock
+  agentLabel: string
+  parallelCount?: number
+}): string | null {
+  const { block, agentLabel, parallelCount } = args
+  if (block.phase === 'start') {
+    return formatDelegateLiveWorkingDetail({ agentLabel, parallelCount })
+  }
+  if (block.phase !== 'tool' || !block.toolName) return null
+  const inner =
+    block.block && typeof block.block === 'object'
+      ? (block.block as { kind?: unknown; inputJson?: unknown; inputPreview?: unknown })
+      : null
+  if (inner?.kind && inner.kind !== 'tool_use') return null
+  if (!inner && /执行完成|执行出错|输出更新中/.test(block.text ?? '')) return null
+  const summary = summarizeDelegateToolForLiveHint(
+    inner ?? { inputPreview: block.text, inputJson: undefined },
+  )
+  return formatDelegateLiveWorkingDetail({
+    agentLabel,
+    toolName: block.toolName,
+    summary,
+    parallelCount,
+  })
+}
+
 function planText(block: any): string {
   const parts: string[] = []
   if (typeof block.text === 'string' && block.text.trim()) parts.push(block.text.trim())

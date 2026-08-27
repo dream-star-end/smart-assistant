@@ -1,12 +1,18 @@
 import * as assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import {
+  formatDelegateLiveWorkingDetail,
+  formatDelegateParentWorkingDetail,
   makeDelegateBlockPassthrough,
   makeDelegateProgressBlock,
   makeDelegateUsageProgressBlock,
   normalizeDelegateGoalKey,
   sanitizeDelegateProgressText,
   summarizeDelegateProgressEvent,
+  summarizeDelegateToolForLiveHint,
 } from '../delegateProgress.js'
 
 describe('delegate progress sanitization', () => {
@@ -237,5 +243,114 @@ describe('makeDelegateBlockPassthrough (rich forward for main-chat-style renderi
       'a',
     ) as any
     assert.equal(out.block.text, text)
+  })
+})
+
+describe('parent live-row working-detail from delegate_progress', () => {
+  it('formats member + tool + command, with ×N for parallel', () => {
+    assert.equal(
+      formatDelegateLiveWorkingDetail({
+        agentLabel: '编程助手',
+        toolName: 'Bash',
+        summary: 'npm run build',
+      }),
+      '子任务 编程助手: Bash npm run build',
+    )
+    assert.equal(
+      formatDelegateLiveWorkingDetail({
+        agentLabel: '编程助手',
+        toolName: 'Read',
+        summary: 'foo.ts',
+        parallelCount: 2,
+      }),
+      '子任务 编程助手: Read foo.ts ×2',
+    )
+    assert.equal(
+      formatDelegateLiveWorkingDetail({ agentLabel: '编程助手' }),
+      '子任务 编程助手',
+    )
+  })
+
+  it('does not leak oc-memory --goal / Task prompt in the live hint', () => {
+    assert.equal(
+      summarizeDelegateToolForLiveHint({
+        inputJson: { command: 'HOME=/x oc-memory delegate --goal "整段 prompt 不可泄漏"' },
+      }),
+      '',
+    )
+    assert.equal(
+      summarizeDelegateToolForLiveHint({
+        inputJson: { command: 'npm run build -- --watch' },
+      }),
+      'npm run build -- --watch',
+    )
+    assert.equal(
+      summarizeDelegateToolForLiveHint({
+        inputJson: {
+          description: '修卡片',
+          prompt: 'You are running inside OpenClaude uid=3 HOME=/home/agent',
+        },
+      }),
+      '修卡片',
+    )
+  })
+
+  it('emits working-detail for start and tool_use, not for results', () => {
+    const start = makeDelegateProgressBlock({
+      runId: 'r1',
+      agentId: 'coding-assistant',
+      phase: 'start',
+      text: '开始委派',
+      goal: '修卡片',
+    })
+    assert.equal(
+      formatDelegateParentWorkingDetail({ block: start, agentLabel: '编程助手' }),
+      '子任务 编程助手',
+    )
+
+    const toolUse = makeDelegateBlockPassthrough(
+      {
+        kind: 'block',
+        block: {
+          kind: 'tool_use',
+          toolName: 'Bash',
+          inputPreview: 'npm run build',
+          inputJson: { command: 'npm run build' },
+        },
+      },
+      'r1',
+      'coding-assistant',
+    )
+    assert.ok(toolUse)
+    assert.equal(
+      formatDelegateParentWorkingDetail({
+        block: toolUse!,
+        agentLabel: '编程助手',
+        parallelCount: 1,
+      }),
+      '子任务 编程助手: Bash npm run build',
+    )
+
+    const result = makeDelegateBlockPassthrough(
+      {
+        kind: 'block',
+        block: { kind: 'tool_result', toolName: 'Bash', isError: false, preview: 'ok' },
+      },
+      'r1',
+      'coding-assistant',
+    )
+    assert.equal(
+      formatDelegateParentWorkingDetail({ block: result!, agentLabel: '编程助手' }),
+      null,
+    )
+  })
+
+  it('_runDelegateTaskCore emitProgress forwards parent working-detail on the existing turn_status channel', () => {
+    const src = readFileSync(
+      join(fileURLToPath(new URL('..', import.meta.url)), 'server.ts'),
+      'utf8',
+    )
+    assert.match(src, /formatDelegateParentWorkingDetail/)
+    assert.match(src, /_buildTurnStatusFrame\([\s\S]{0,500}status: 'working'/)
   })
 })

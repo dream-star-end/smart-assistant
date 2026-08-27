@@ -1435,6 +1435,24 @@ describe("缺陷 #8：Cursor 工具卡正文不得退化成字面 Bash", () => {
     expect(document.body.textContent || "").not.toMatch(/\$\s*oc-memory/);
   });
 
+  test("env 前缀的 oc-memory delegate 卡头是委派子任务，不是记忆", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          text: "Bash",
+          output: "操作已完成。",
+          inputJson: {
+            command: 'HOME=/home/agent oc-memory delegate --goal "修卡片"',
+          },
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("委派子任务")).toBeInTheDocument();
+    expect(screen.queryByText("记忆")).not.toBeInTheDocument();
+  });
+
   test("b) 运行中普通 Bash 只显示 $ command，无假输出行 Bash", () => {
     render(
       <ToolCard

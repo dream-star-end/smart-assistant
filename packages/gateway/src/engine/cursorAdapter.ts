@@ -439,6 +439,27 @@ function fallbackPendingToolProgress(oldestToolName: string): string {
   return `子任务 ${name} 运行中`
 }
 
+/** Parent Bash waiting on oc-memory delegate/wait/review must not clobber child working-detail. */
+function isBlockingOcMemoryDelegateCommand(command: string): boolean {
+  return /\boc-memory\s+(delegate-wait|delegate|request-review)\b/i.test(command)
+}
+
+function isBlockingOcMemoryDelegateTool(tool: {
+  toolName?: string
+  inputJson?: unknown
+  inputPreview?: string
+} | undefined): boolean {
+  if (!tool) return false
+  const name = (tool.toolName || '').toLowerCase()
+  if (name && name !== 'bash' && name !== 'shell') return false
+  const input =
+    tool.inputJson && typeof tool.inputJson === 'object' && !Array.isArray(tool.inputJson)
+      ? (tool.inputJson as Record<string, unknown>)
+      : null
+  const command = typeof input?.command === 'string' ? input.command : String(tool.inputPreview || '')
+  return isBlockingOcMemoryDelegateCommand(command)
+}
+
 function readFileTailUtf8(filePath: string, maxBytes = TRANSCRIPT_TAIL_BYTES): string {
   let fd: number | undefined
   try {
@@ -2027,20 +2048,22 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     ctx: TurnCtx,
     args: {
       oldestToolName: string
+      oldestTool?: { toolName?: string; inputJson?: unknown; inputPreview?: string }
       transcriptGrew: boolean
       prevFingerprint: CursorTranscriptFingerprint | null
       fingerprint: CursorTranscriptFingerprint | null
     },
   ): void {
     let detail: string | undefined
-    if (args.transcriptGrew && this.cachedTranscriptsDir) {
+    const blockingDelegate = isBlockingOcMemoryDelegateTool(args.oldestTool)
+    if (!blockingDelegate && args.transcriptGrew && this.cachedTranscriptsDir) {
       detail = summarizeGrownTranscriptProgress(
         this.cachedTranscriptsDir,
         args.prevFingerprint,
         args.fingerprint,
       ) ?? undefined
     }
-    if (!detail) detail = fallbackPendingToolProgress(args.oldestToolName)
+    if (!detail && !blockingDelegate) detail = fallbackPendingToolProgress(args.oldestToolName)
     try {
       ctx.params.onEvent({
         kind: 'turn_status',
@@ -2166,6 +2189,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         this.pendingKeepaliveStalledLogged = false
         this.emitPendingToolProgress(ctx, {
           oldestToolName,
+          oldestTool,
           transcriptGrew,
           prevFingerprint,
           fingerprint,
@@ -2282,6 +2306,7 @@ export const _internals = {
   progressDetailFromJsonlTail,
   summarizeGrownTranscriptProgress,
   fallbackPendingToolProgress,
+  isBlockingOcMemoryDelegateCommand,
 }
 
 registerEngine('cursor', (opts) => new CursorAdapter(opts))

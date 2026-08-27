@@ -2920,4 +2920,19 @@ setInterval(() => {
     assert.equal(_internals.fallbackPendingToolProgress('Task'), '子任务 Task 运行中')
     assert.equal(_internals.fallbackPendingToolProgress('unknown'), '子任务运行中')
   })
+
+  test('isBlockingOcMemoryDelegateCommand detects wrapped Cursor/Grok oc-memory delegate', () => {
+    assert.equal(
+      _internals.isBlockingOcMemoryDelegateCommand('HOME=/home/agent oc-memory delegate --goal g'),
+      true,
+    )
+    assert.equal(
+      _internals.isBlockingOcMemoryDelegateCommand(
+        'OPENCLAUDE_GATEWAY_PORT=18790 oc-memory delegate-wait dlgjob-1',
+      ),
+      true,
+    )
+    assert.equal(_internals.isBlockingOcMemoryDelegateCommand('oc-memory core-search x'), false)
+    assert.equal(_internals.isBlockingOcMemoryDelegateCommand('npm test'), false)
+  })
 })
