@@ -1416,3 +1416,58 @@ describe("codex 通用卡 KvList 噪音字段", () => {
     expect(text).not.toContain("durationMs");
   });
 });
+
+describe("缺陷 #8：Cursor 工具卡正文不得退化成字面 Bash", () => {
+  test("a) output:null + text:Bash 的委派卡不出现字面 Bash，且不回显 $ command", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          text: "Bash",
+          output: null,
+          inputJson: { command: "oc-memory delegate --goal x" },
+          _completed: false,
+        }}
+      />,
+    );
+    expect(screen.getByText("委派子任务")).toBeInTheDocument();
+    expect(screen.queryByText("Bash")).not.toBeInTheDocument();
+    expect(document.body.textContent || "").not.toMatch(/\$\s*oc-memory/);
+  });
+
+  test("b) 运行中普通 Bash 只显示 $ command，无假输出行 Bash", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          text: "Bash",
+          output: null,
+          inputJson: { command: "ls -la" },
+          _completed: false,
+        }}
+      />,
+    );
+    expect(screen.getByText("终端")).toBeInTheDocument();
+    expect(screen.getAllByText("ls -la").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Bash")).not.toBeInTheDocument();
+  });
+
+  test("c) 历史带真实 stdout 的卡仍显示 stdout", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          text: "Bash",
+          output: "UNIQUE_STDOUT_MARKER\n",
+          outputJson: { stdout: "UNIQUE_STDOUT_MARKER\n", exitCode: 0 },
+          inputJson: { command: "ls" },
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText(/UNIQUE_STDOUT_MARKER/)).toBeInTheDocument();
+    expect(screen.queryByText("Bash")).not.toBeInTheDocument();
+  });
+});
+
