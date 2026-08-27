@@ -123,6 +123,26 @@ function labelForToken(token: string): LiveActivityLabel | null {
   return TOOL_ACTIVITY_LABEL[key] ?? null;
 }
 
+const SUBTASK_LABEL: LiveActivityLabel = "运行子任务";
+/** Live row budget: character count (JS string length), not UTF-8 bytes. */
+const LIVE_ACTIVITY_MAX_CHARS = 60;
+
+function truncateChars(text: string, max: number): string {
+  if (text.length <= max) return text;
+  if (max <= 1) return "…";
+  return `${text.slice(0, max - 1)}…`;
+}
+
+function formatSubtaskAction(detail: string): string {
+  const cleaned = detail.replace(/\s+/g, " ").trim().replace(/^·\s*/, "");
+  if (!cleaned) return SUBTASK_LABEL;
+  return truncateChars(`${SUBTASK_LABEL} · ${cleaned}`, LIVE_ACTIVITY_MAX_CHARS);
+}
+
+function isOcMemoryDelegateHint(raw: string): boolean {
+  return /\boc-memory\s+(delegate-wait|delegate|request-review)\b/i.test(raw);
+}
+
 /** Map a bare tool name to a category label. Unknown names return null (unlike formatLiveActivityAction). */
 export function mappedLiveActivityLabel(toolName: string): LiveActivityLabel | null {
   return labelForToken(toolName);
@@ -131,6 +151,7 @@ export function mappedLiveActivityLabel(toolName: string): LiveActivityLabel | n
 /**
  * Collapse a working-detail / progress hint to a category action label.
  * Empty input stays empty so the typing row can fall through to 「思考中」.
+ * 「运行子任务」保留细节尾巴（子 agent 当前工具/命令），其它类别仍只显示标签。
  */
 export function formatLiveActivityAction(hint: string | undefined | null): string {
   const raw = String(hint ?? "")
@@ -139,23 +160,39 @@ export function formatLiveActivityAction(hint: string | undefined | null): strin
   if (!raw) return "";
 
   for (const label of LIVE_ACTIVITY_LABELS) {
-    if (raw === label || raw.startsWith(`${label} `)) return label;
+    if (raw === label || raw.startsWith(`${label} `)) {
+      if (label === SUBTASK_LABEL) {
+        const rest = raw === label ? "" : raw.slice(label.length).trim();
+        return formatSubtaskAction(rest);
+      }
+      return label;
+    }
   }
   if (LABEL_SET.has(raw)) return raw;
-  if (raw.startsWith("子任务")) return "运行子任务";
+  if (raw.startsWith("子任务")) {
+    return formatSubtaskAction(raw.slice("子任务".length).replace(/^[\s:：]+/, ""));
+  }
+  // Cursor/Grok 把 oc-memory delegate 包在 Bash/Shell 里：归入子任务，但不回显 --goal 全文。
+  if (isOcMemoryDelegateHint(raw)) return SUBTASK_LABEL;
 
   const parts = raw.split(" ");
   const first = parts[0] ?? "";
   const mapped = labelForToken(first);
+  if (mapped === SUBTASK_LABEL) return formatSubtaskAction(parts.slice(1).join(" "));
   if (mapped) return mapped;
 
   // Cursor CallMcpTool / similar wrappers: try the next token as the real op.
   const wrapper = normalizeToolToken(first);
   if (
-    (wrapper === "callmcptool" || wrapper === "call_mcp_tool" || wrapper === "getmcptools" || wrapper === "use_tool") &&
+    (wrapper === "callmcptool" ||
+      wrapper === "call_mcp_tool" ||
+      wrapper === "getmcptools" ||
+      wrapper === "use_tool") &&
     parts.length > 1
   ) {
-    return labelForToken(parts[1] ?? "") ?? LIVE_ACTIVITY_FALLBACK;
+    const inner = labelForToken(parts[1] ?? "");
+    if (inner === SUBTASK_LABEL) return formatSubtaskAction(parts.slice(2).join(" "));
+    return inner ?? LIVE_ACTIVITY_FALLBACK;
   }
 
   return LIVE_ACTIVITY_FALLBACK;

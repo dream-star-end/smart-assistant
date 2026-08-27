@@ -302,8 +302,21 @@ export function humanizeOp(op: string): string {
   return (op || "").replace(/_/g, " ").trim();
 }
 
+/** Bash 及 Cursor/Grok 归一前的 shell 工具名。 */
+const SHELL_TOOL_NAMES = new Set(["Bash", "Shell", "run_terminal_command", "run_terminal_cmd"]);
+
+function isShellToolName(name: string): boolean {
+  return SHELL_TOOL_NAMES.has(name);
+}
+
 function commandOp(command: string, cli: string): string {
-  const match = new RegExp(`(?:^|[\\n;&|]\\s*)${cli.replace("-", "\\-")}\\s+([\\w-]+)`, "i").exec(command);
+  // 与 detectOcCli 同一前缀：env 赋值、绝对/相对路径、`cd &&` / 管道 / 换行。
+  // 旧锚点只认行首或 `;|&`，会把 `HOME=/x oc-memory delegate` 的 op 解析失败并落回「记忆」。
+  const cliRe = cli.replace(/-/g, "\\-");
+  const match = new RegExp(
+    `(?:^\\s*|[\\n;&|(]\\s*)(?:\\w+=\\S*\\s+)*(?:\\S*/)?${cliRe}\\s+([\\w-]+)`,
+    "i",
+  ).exec(command);
   return (match?.[1] ?? "").toLowerCase();
 }
 
@@ -399,17 +412,17 @@ function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
   }
   if (cli === "oc-web") return { ...base, label: "提取网页内容" };
   if (cli === "oc-memory") {
-    const labels: Record<string, string> = {
-      delegate: "委派子任务",
-      "request-review": "质量审查",
-      "delegate-wait": "等待委派",
-      "core-search": "记忆检索",
-      "session-search": "历史检索",
-      "archival-search": "归档检索",
-      "archival-add": "归档写入",
-      "archival-delete": "归档删除",
+    const labels: Record<string, ToolMeta> = {
+      delegate: { icon: Bot, label: "委派子任务", tone: "accent" },
+      "request-review": { icon: ShieldCheck, label: "质量审查", tone: "accent" },
+      "delegate-wait": { icon: Clock, label: "等待委派", tone: "accent" },
+      "core-search": { icon: Brain, label: "记忆检索", tone: "accent" },
+      "session-search": { icon: Search, label: "历史检索", tone: "accent" },
+      "archival-search": { icon: Archive, label: "归档检索", tone: "accent" },
+      "archival-add": { icon: Archive, label: "归档写入", tone: "accent" },
+      "archival-delete": { icon: Archive, label: "归档删除", tone: "accent" },
     };
-    return labels[op] ? { ...base, label: labels[op] } : base;
+    return labels[op] ?? base;
   }
   return base;
 }
@@ -459,7 +472,7 @@ export function resolveToolMeta(
   input?: Record<string, unknown> | null,
 ): ToolMeta {
   // Bash 命令若调用 oc-* CLI,给专属语义卡而非通用"终端"卡。
-  if (name === "Bash" && input) {
+  if (isShellToolName(name) && input) {
     // 展示层剥壳兜底(历史消息带 /bin/bash -lc 包装),否则 oc-*/写文件检测在包装内失配。
     const command = stripShellWrapperForDisplay(asStr(input.command));
     const fileWrite = detectShellFileWrites(command);
@@ -510,7 +523,10 @@ function delegateTasksSummary(input: Record<string, unknown>): string {
 export function toolSummary(name: string, input: Record<string, unknown> | null): string {
   if (!input) return "";
   switch (name) {
-    case "Bash": {
+    case "Bash":
+    case "Shell":
+    case "run_terminal_command":
+    case "run_terminal_cmd": {
       const cmd = stripShellWrapperForDisplay(asStr(input.command));
       const fileWrite = detectShellFileWrites(cmd);
       if (fileWrite) {

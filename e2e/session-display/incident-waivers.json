@@ -104,6 +104,36 @@
       "reason": "仅加固 boss 自用 selfhost 的 Cursor 选项卡展示：隐藏工具卡持久化并限制每回合最多四次，不涉及 claudeai.chat 付费生产流量、计费或数据事故。",
       "approvedBy": "dx 2026-08-26 指示统一全部部署上线",
       "expiresAt": "2026-09-26"
+    },
+    {
+      "commit": "30a9cdeb6",
+      "reason": "selfhost-proven shared-code port onto commercial canonical; no new commercial production incident. Task B 2026-08-28: cherry-pick into feat/v5-aurora-rewrite only, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "95c498208",
+      "reason": "selfhost-proven shared-code port onto commercial canonical; no new commercial production incident. Task B 2026-08-28: cherry-pick into feat/v5-aurora-rewrite only, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "8c42779be",
+      "reason": "selfhost-proven shared-code port onto commercial canonical; no new commercial production incident. Task B 2026-08-28: cherry-pick into feat/v5-aurora-rewrite only, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "91fd1cc1e",
+      "reason": "selfhost-proven shared-code port follow-up: owner-scope Phase-B keep-alive so first unified-timeline adoption still purges predecessor cache. Task B 2026-08-28, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "32d96ac08",
+      "reason": "selfhost-proven port follow-up: first unified-timeline adoption must not keep predecessor team cache stamped by adjacent user id. Task B 2026-08-28, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
     }
   ]
 }

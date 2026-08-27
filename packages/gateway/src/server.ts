@@ -356,6 +356,7 @@ import {
   makeDelegateBlockPassthrough,
   resolveDelegateProgressRouting,
   toNestedDelegateProgressLine,
+  formatDelegateParentWorkingDetail,
   type DelegateProgressBlock,
   type DelegateProgressRouting,
 } from './delegateProgress.js'
@@ -11347,6 +11348,27 @@ export class Gateway {
         _userId: progressTarget.userId,
       }
       this.deliver(out as OutboundMessage & { _userId?: string })
+      // Reuse the parent turn_status working-detail channel (not a new event type):
+      // child tool_use/start → live row, while keepalive of the blocking parent
+      // Bash/oc-memory delegate would otherwise freeze on 「运行子任务」.
+      const liveDetail = formatDelegateParentWorkingDetail({
+        block: outBlock,
+        agentLabel: targetAgent.displayName || targetAgentId,
+        parallelCount: this._activeDelegationsByParent.get(progressTarget.sessionKey)?.size,
+      })
+      if (liveDetail) {
+        this.deliver(
+          _buildTurnStatusFrame(
+            {
+              sessionKey: progressTarget.sessionKey,
+              channel: progressTarget.channel,
+              peer: { id: progressTarget.peerId, kind: 'dm' },
+              ...(progressTarget.userId ? { _userId: progressTarget.userId } : {}),
+            },
+            { status: 'working', detail: liveDetail },
+          ),
+        )
+      }
     }
     const streamProgress = progressTarget && input.streamProgress === true
 
