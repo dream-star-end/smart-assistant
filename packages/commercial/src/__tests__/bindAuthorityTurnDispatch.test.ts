@@ -156,6 +156,16 @@ describe("bindAuthorityTurnDispatch cron-origin adoption", () => {
     assert.equal(store.row.owner_id, "conn-live");
   });
 
+  test("adopts cron-origin placeholder that already has model without wiping it", async () => {
+    const { pool, store } = fakePool({
+      row: baseRow({ model: "grok-build" }),
+    });
+    await bindAuthorityTurnDispatch(pool, bindInput({ dispatchModel: "grok-build" }));
+    assert.equal(store.row.model, "grok-build");
+    assert.equal(store.row.owner_id, "conn-live");
+    assert.ok(store.row.lease_until !== null && store.row.lease_until.getTime() > Date.now());
+  });
+
   test("normal row owner mismatch still throws (no adoption)", async () => {
     const { pool, store } = fakePool({
       row: baseRow({

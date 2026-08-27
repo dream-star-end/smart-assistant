@@ -24,7 +24,12 @@ import {
   setHostStaticProviderKeys,
   getHostStaticProviderKeys,
 } from '../hostStaticProviders.js'
-import { _buildSecondaryUtilityModelEnv, buildHostSpawnProviderEnv } from '../subprocessRunner.js'
+import {
+  CCB_SUBAGENT_MODEL_ENV,
+  _buildSecondaryUtilityModelEnv,
+  buildHostSpawnProviderEnv,
+  finalizeCcbSpawnEnv,
+} from '../subprocessRunner.js'
 
 // 每个用例后清空模块级 seam,避免 cross-test 污染(isHostRoutableStaticModel 读模块全局)。
 afterEach(() => setHostStaticProviderKeys(null))
@@ -173,6 +178,7 @@ describe('buildHostSpawnProviderEnv — 路由决策对称性(MAJOR/MINOR 2026-0
     assert.equal(r.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, '1')
     assert.equal(r.env.CLAUDE_CODE_OAUTH_TOKEN, '') // 显式清空(round-3 加固),非 oauth-tok → 未走 OAuth direct
     assert.equal(r.env.ANTHROPIC_SMALL_FAST_MODEL, 'deepseek-v4-pro') // secondary 同 provider
+    assert.equal(r.env.CLAUDE_CODE_SUBAGENT_MODEL, 'deepseek-v4-pro')
   })
 
   it('MINOR:host-static 指向 ark(glm-5.2)→ secondary 用主模型(glm-5.2),不跨 provider 打 deepseek-v4-flash', () => {
@@ -188,6 +194,7 @@ describe('buildHostSpawnProviderEnv — 路由决策对称性(MAJOR/MINOR 2026-0
     assert.equal(r.env.ANTHROPIC_BASE_URL, 'https://ark.cn-beijing.volces.com/api/coding')
     assert.equal(r.env.ANTHROPIC_SMALL_FAST_MODEL, 'glm-5.2')
     assert.notEqual(r.env.ANTHROPIC_SMALL_FAST_MODEL, 'deepseek-v4-flash')
+    assert.equal(r.env.CLAUDE_CODE_SUBAGENT_MODEL, 'glm-5.2')
   })
 
   it('claude-subscription + OAuth + 非静态模型 → oauth-direct(清空 BASE_URL,不 pin secondary)', () => {
@@ -204,6 +211,14 @@ describe('buildHostSpawnProviderEnv — 路由决策对称性(MAJOR/MINOR 2026-0
     assert.equal(r.env.ANTHROPIC_AUTH_TOKEN, '')
     assert.equal(r.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, '1')
     assert.equal(r.env.ANTHROPIC_SMALL_FAST_MODEL, undefined) // direct-Anthropic 留 Haiku
+    assert.equal(r.env.CLAUDE_CODE_SUBAGENT_MODEL, undefined)
+    const finalEnv = finalizeCcbSpawnEnv({
+      source: { [CCB_SUBAGENT_MODEL_ENV]: 'glm-5.3-zai', PATH: '/usr/bin' } as NodeJS.ProcessEnv,
+      providerEnv: r.env,
+      routing: r.routing,
+    })
+    assert.equal(Object.prototype.hasOwnProperty.call(finalEnv, CCB_SUBAGENT_MODEL_ENV), false)
+    assert.equal(finalEnv.CLAUDE_CODE_OAUTH_TOKEN, 'oauth-tok')
   })
 
   it('claude-subscription 无 OAuth token → settings-default(MANAGED_BY_HOST 仍设 + secondary 注入)', () => {
@@ -220,6 +235,7 @@ describe('buildHostSpawnProviderEnv — 路由决策对称性(MAJOR/MINOR 2026-0
       assert.equal(r.routing, 'settings-default')
       assert.equal(r.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, '1')
       assert.equal(r.env.ANTHROPIC_SMALL_FAST_MODEL, 'deepseek-v4-flash')
+      assert.equal(r.env.CLAUDE_CODE_SUBAGENT_MODEL, 'glm-5.3-zai')
     } finally {
       if (prev === undefined) delete process.env.OPENCLAUDE_SECONDARY_MODEL
       else process.env.OPENCLAUDE_SECONDARY_MODEL = prev
@@ -240,6 +256,7 @@ describe('buildHostSpawnProviderEnv — 路由决策对称性(MAJOR/MINOR 2026-0
       assert.equal(r.env.CLAUDE_CODE_OAUTH_TOKEN, undefined)
       assert.equal(r.env.ANTHROPIC_BASE_URL, undefined) // 不注入 provider auth,靠 settings.json
       assert.equal(r.env.ANTHROPIC_SMALL_FAST_MODEL, 'deepseek-v4-flash')
+      assert.equal(r.env.CLAUDE_CODE_SUBAGENT_MODEL, 'glm-5.2')
     } finally {
       if (prev === undefined) delete process.env.OPENCLAUDE_SECONDARY_MODEL
       else process.env.OPENCLAUDE_SECONDARY_MODEL = prev

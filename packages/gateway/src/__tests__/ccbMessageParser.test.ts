@@ -1232,42 +1232,34 @@ describe('CcbMessageParser: top-level tools collection (Phase 1)', () => {
     assert.deepEqual(result.tools[0].inputJson, { path: '/etc/hosts' })
   })
 
-  it('subagent tools (parent_tool_use_id present) are NOT collected — Agent card owns durability', () => {
-    // v1.0.135: the top-level Agent tool itself is ALSO excluded from
-    // completedTools — the client renders it as `role: 'agent-group'`, and
-    // persisting a parallel `srv-*-tool-*` row would collide on canonical
-    // id with role mismatch (see ccbMessageParser.ts:832 docstring +
-    // ccbMessageParserMessageId.test.ts "Agent tool" suite). Subagent tools
-    // (parent_tool_use_id set) are also excluded — pre-v1.0.135 behavior.
+  it('subagent tools (parent_tool_use_id present) are NOT collected — Agent card owns nested durability', () => {
     const { parser, getResult } = createParser()
-    // Top-level Agent tool_use
     parser.parse({
       type: 'assistant',
       message: { content: [{ type: 'tool_use', id: 'tu_agent', name: 'Agent', input: { task: 'x' } }] },
     } as any)
-    // Subagent issues a Bash tool_use (parent_tool_use_id = tu_agent)
     parser.parse({
       type: 'assistant',
       parent_tool_use_id: 'tu_agent',
       message: { content: [{ type: 'tool_use', id: 'tu_sub', name: 'Bash', input: { cmd: 'pwd' } }] },
     } as any)
-    // Subagent's tool_result (parent_tool_use_id same)
     parser.parse({
       type: 'user',
       parent_tool_use_id: 'tu_agent',
       message: { content: [{ type: 'tool_result', tool_use_id: 'tu_sub', content: '/' }] },
     } as any)
-    // Top-level Agent tool_result
     parser.parse({
       type: 'user',
-      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_agent', content: 'done' }] },
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu_agent', is_error: true, content: 'Failed to authenticate. API Error: 403 MODEL_NOT_AVAILABLE' }] },
     } as any)
     parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
 
     const result = getResult()
-    // Both subagent (tu_sub) AND top-level Agent (tu_agent) are excluded.
-    assert.equal(result.tools.length, 0,
-      'Agent excluded by name filter; subagent tools excluded by parentToolUseId guard')
+    assert.equal(result.tools.length, 1, 'nested subagent Bash stays off the parent snapshot')
+    assert.equal(result.tools[0].toolUseId, 'tu_agent')
+    assert.equal(result.tools[0].toolName, 'Agent')
+    assert.equal(result.tools[0].isError, true)
+    assert.match(result.tools[0].output, /MODEL_NOT_AVAILABLE/)
   })
 
   it('completedTools is publicly exposed for partial flush on interrupt/crash (sessionManager reads it)', () => {

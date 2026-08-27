@@ -802,6 +802,94 @@ describe("materializeLosslessTurn", () => {
     (bad.agentGroups![0]!.goalUsageRecords as Array<Record<string, unknown>>)[0]!.engine = "nope";
     assert.throws(() => parseLosslessTurnPayload(bad), /engine is invalid/);
   });
+
+  test("Agent 403 tool_result becomes a completed role=tool row with the error body", () => {
+    const errorBody =
+      'Failed to authenticate. API Error: 403 {"error":{"code":"MODEL_NOT_AVAILABLE"}}';
+    const turn = materializeLosslessTurn({
+      sessionId: "webmtbs84bpm104yg",
+      agentId: "main",
+      turnIndex: 6,
+      clientMessageId: "cron-origin-cmid_1",
+      status: "completed",
+      turnKey: TURN_KEY,
+      text: "fallback",
+      createdAt: 1_783_944_000_000,
+      tools: [{
+        toolUseId: "call_6cb99a5601424ec7ac79c8ab",
+        blockId: "call_6cb99a5601424ec7ac79c8ab",
+        toolName: "Agent",
+        inputJson: { description: "Call Grok native image_gen test", model: "haiku" },
+        inputPreview: "Call Grok native image_gen test",
+        output: errorBody,
+        isError: true,
+        durationMs: 12,
+        ts: 1,
+      }],
+    });
+    const tool = turn.records.find((record) => record.role === "tool");
+    assert.ok(tool);
+    assert.equal(tool!.payload.toolName, "Agent");
+    assert.equal(tool!.payload.output, errorBody);
+    assert.equal(tool!.payload.text, errorBody);
+    assert.equal(tool!.payload.error, true);
+    assert.equal(tool!.payload.partial, undefined);
+    assert.equal(tool!.payload._completed, true);
+  });
+
+  test("interrupted partial bytes stay incomplete — never inferred from output length", () => {
+    const turn = materializeLosslessTurn({
+      sessionId: "webmtbs84bpm104yg",
+      agentId: "main",
+      turnIndex: 6,
+      status: "interrupted",
+      turnKey: TURN_KEY,
+      text: "fallback",
+      createdAt: 1_783_944_000_000,
+      tools: [{
+        toolUseId: "call_partial",
+        blockId: "call_partial",
+        toolName: "Bash",
+        inputJson: { command: "curl" },
+        inputPreview: "curl",
+        output: "partial bytes",
+        completed: false,
+        isError: false,
+        durationMs: 4,
+        ts: 1,
+      }],
+    });
+    const tool = turn.records.find((record) => record.role === "tool");
+    assert.ok(tool);
+    assert.equal(tool!.payload.output, "partial bytes");
+    assert.equal(tool!.payload._completed, false);
+    assert.equal(tool!.payload.partial, true);
+  });
+
+  test("completed turns drop empty partial Agent snapshots instead of freezing them", () => {
+    const turn = materializeLosslessTurn({
+      sessionId: "webmtbs84bpm104yg",
+      agentId: "main",
+      turnIndex: 6,
+      status: "completed",
+      turnKey: TURN_KEY,
+      text: "fallback",
+      createdAt: 1_783_944_000_000,
+      tools: [{
+        toolUseId: "call_6cb99a5601424ec7ac79c8ab",
+        blockId: "call_6cb99a5601424ec7ac79c8ab",
+        toolName: "Agent",
+        inputJson: { description: "Call Grok native image_gen test" },
+        inputPreview: "Call Grok native image_gen test",
+        output: "",
+        completed: false,
+        isError: false,
+        durationMs: 0,
+        ts: 1,
+      }],
+    });
+    assert.equal(turn.records.filter((record) => record.role === "tool").length, 0);
+  });
 });
 
 describe("losslessBillingAnchorId vs materializeLosslessTurn", () => {

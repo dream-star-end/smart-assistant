@@ -345,9 +345,8 @@ describe('CcbMessageParser: v7.1 tool_use messageId stamping', () => {
     }
   })
 
-  it('Agent tool: tool_result handling excludes Agent from completedTools (avoids agent-group / tool role conflict)', () => {
+  it('Agent tool: tool_result lands in completedTools with output (tape must keep 403 body)', () => {
     const { parser } = createParser({ toolMessageIdFactory: factory })
-    // 1. _handleAssistant: tool_use for Agent
     parser.parse({
       type: 'assistant',
       message: {
@@ -356,20 +355,29 @@ describe('CcbMessageParser: v7.1 tool_use messageId stamping', () => {
         ],
       },
     } as any)
-    // 2. tool_result arrival
     parser.parse({
       type: 'user',
       message: {
-        content: [{ type: 'tool_result', tool_use_id: 'tu_agent', content: 'sub result' }],
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'tu_agent',
+          is_error: true,
+          content: 'Failed to authenticate. API Error: 403 {"error":{"code":"MODEL_NOT_AVAILABLE","message":"model not available"}}',
+        }],
       },
     } as any)
-    // Agent tool_use IS still emitted to UI (for live streaming card), but
-    // it MUST NOT be persisted as a server-authored 'tool' row.
-    assert.equal(parser.completedTools.length, 0,
-      'Agent tool excluded — durability belongs to the client-side agent-group card')
+    assert.equal(parser.completedTools.length, 1)
+    assert.equal(parser.completedTools[0].toolName, 'Agent')
+    assert.equal(parser.completedTools[0].isError, true)
+    assert.match(parser.completedTools[0].output, /MODEL_NOT_AVAILABLE/)
+    assert.equal(parser.completedTools[0].completed, true)
+    const snap = parser.snapshotToolsForPersistence()
+    assert.equal(snap.length, 1)
+    assert.match(snap[0]!.output, /MODEL_NOT_AVAILABLE/)
+    assert.notEqual(snap[0]!.completed, false)
   })
 
-  it('Agent filter is case-insensitive (mirrors web `/^Agent$/i` discriminator)', () => {
+  it('Agent tool_result is case-insensitive on the tool name', () => {
     const { parser } = createParser({ toolMessageIdFactory: factory })
     parser.parse({
       type: 'assistant',
@@ -385,8 +393,9 @@ describe('CcbMessageParser: v7.1 tool_use messageId stamping', () => {
         content: [{ type: 'tool_result', tool_use_id: 'tu_agent_lc', content: 'r' }],
       },
     } as any)
-    assert.equal(parser.completedTools.length, 0,
-      'case variants of "agent" also excluded — keeps parser aligned with client casing')
+    assert.equal(parser.completedTools.length, 1)
+    assert.equal(parser.completedTools[0].toolName, 'agent')
+    assert.equal(parser.completedTools[0].output, 'r')
   })
 
   it('Non-Agent tools still land in completedTools as before (regression guard)', () => {
