@@ -357,6 +357,26 @@
           "layer": "unit",
           "path": "packages/commercial/src/plugins/weibo.test.ts",
           "assertion": "picupload posts multipart pic1 before raw blob and keeps pids if newPage throws"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "cookie helper keeps mobile pids when statuses/update fetch rejects"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "cookie helper keeps mobile pids when statuses/update text() rejects"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "create_post with media does not fall through to DOM when mobile update fetch rejects"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "create_post with media does not fall through to DOM when mobile update text() rejects"
         }
       ],
       "proofPending": {
@@ -366,7 +386,8 @@
       "coverageCommits": [
         "53a4e840",
         "e7f96b4d",
-        "60e024ab"
+        "60e024ab",
+        "7558fc12"
       ]
     },
     {
