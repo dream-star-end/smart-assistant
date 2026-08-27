@@ -545,6 +545,11 @@ describe('official Weibo Plugin', () => {
       /api\.via === 'string' && api.via\) throw new Error\('media-upload'\)/,
       'picupload miss with no publish attempt must fall through to DOM',
     )
+    assert.match(
+      createPostSource,
+      /api\.pids.length === files.length\) throw new Error\('media-upload'\)/,
+      'complete pid set must not fall through to DOM even if attempted is false',
+    )
     assert.match(WEIBO_WORKER_SOURCE, /form.append\('pic1'/)
     assert.match(WEIBO_WORKER_SOURCE, /data.pic_id || data.picid || data.pid/)
     assert.match(WEIBO_WORKER_SOURCE, /ajax\/statuses\/update/)
@@ -1054,6 +1059,49 @@ describe('official Weibo Plugin', () => {
         },
       ),
       /result/,
+    )
+    assert.ok(events.indexOf('dispatch') < events.indexOf('api'))
+    assert.equal(events.includes('image-click'), false)
+    assert.equal(events.filter((event) => event === 'click').length, 0)
+  })
+
+  test('create_post with media does not fall through to DOM after a full pid set without attempted', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const send = {
+      isDisabled: async () => false,
+      click: async (options: { trial?: boolean }) => {
+        events.push(options.trial ? 'trial' : 'click')
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) =>
+        text === '图片' ? { click: async () => events.push('image-click') } : send,
+      publishComposerViaCookieApi: async () => {
+        events.push('api')
+        return { published: false, attempted: false, via: 'ajax', pids: ['pid1'], status: 200 }
+      },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    await assert.rejects(
+      harness.writeAction(
+        { locator: () => ({}), waitForTimeout: async () => {} },
+        {
+          actionId: 'create_post',
+          params: {
+            text: 'hello',
+            mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+          },
+        },
+      ),
+      /media-upload/,
     )
     assert.ok(events.indexOf('dispatch') < events.indexOf('api'))
     assert.equal(events.includes('image-click'), false)

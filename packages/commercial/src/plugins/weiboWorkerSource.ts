@@ -2029,6 +2029,10 @@ async function writeAction(page, input) {
               throw new Error('result');
             }
             if (attempted) throw new Error('result');
+            // Full pid set means ajax/mobile update was eligible (and may have
+            // started). Do not open the DOM composer. Incomplete pids means
+            // picupload missed and update was never called — fall through.
+            if (api && Array.isArray(api.pids) && api.pids.length === files.length) throw new Error('media-upload');
           } catch (error) {
             if (String(error && error.message) === 'result' || String(error && error.message) === 'media-upload') throw error;
             emitStep({ step: 'media.api', ok: false, attempted: false, via: 'error', pids: 0, status: 0, mediaCount: manifest.length });
