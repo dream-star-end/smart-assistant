@@ -1806,6 +1806,14 @@ export class CodexAppServerRunner extends EventEmitter {
     // proc, drain queue, but allow subsequent submit() to respawn. effort
     // switching and auth-token refresh paths rely on this.
     this.shuttingDown = true
+    // Hung initialize/preheat shares _spawnPromise with submit(). Drop it and
+    // reject pending JSON-RPC before waiting for the process so waiters fail
+    // closed instead of inheriting a never-settling handshake.
+    this._spawnPromise = null
+    for (const [, p] of this.pending) {
+      p.reject(new Error('CodexAppServerRunner shutdown'))
+    }
+    this.pending.clear()
     // turn-retry 批:若正卡在 turn/start 重试退避,唤醒它(abortableDelay 立即返回)。
     // runTurn 的退避后 proc-gone 门会据 shuttingDown 转终态,不把 turn/start 发进
     // 即将被 kill 的管道(否则 sendRequest 无人 settle → 挂死)。
