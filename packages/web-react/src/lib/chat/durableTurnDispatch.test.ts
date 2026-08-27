@@ -607,6 +607,8 @@ describe("durable failure status 渲染 (RFC §5)", () => {
     expect(isDispatchLostCode("dispatch_lost")).toBe(true);
     expect(isDispatchLostCode("SERVICE_RESTART")).toBe(true);
     expect(isDispatchLostCode("dispatch_not_accepted")).toBe(true); // MIN2
+    expect(isDispatchLostCode("DURABLE_DISPATCH_UNAVAILABLE")).toBe(true);
+    expect(isDispatchLostCode("durable_dispatch_unavailable")).toBe(true);
     expect(isDispatchLostCode("engine_error")).toBe(false);
     expect(isDispatchLostCode(undefined)).toBe(false);
   });
@@ -619,9 +621,10 @@ describe("durable failure status 渲染 (RFC §5)", () => {
   test("isDispatchTerminalRow 去枚举化重试判据(M5)", () => {
     // ① server 持久标记 _dispatchTerminal(code-agnostic)。
     expect(isDispatchTerminalRow({ id: "srv-x", _dispatchTerminal: true })).toBe(true);
-    // ② 不可变 tape 稳定协议码(service_restart / dispatch_not_accepted)。
+    // ② 不可变 tape / 实时 error 帧稳定协议码(无 _dispatchTerminal 也要命中)。
     expect(isDispatchTerminalRow({ id: "srv-y", _errorCode: "SERVICE_RESTART" })).toBe(true);
     expect(isDispatchTerminalRow({ id: "srv-z", _errorCode: "dispatch_not_accepted" })).toBe(true);
+    expect(isDispatchTerminalRow({ id: "srv-bind", _errorCode: "DURABLE_DISPATCH_UNAVAILABLE" })).toBe(true);
     // 普通错误 / 无标记 → 不命中(不误伤,复用旧 id 走 dedup 保护)。
     expect(isDispatchTerminalRow({ id: "srv-w", _errorCode: "engine_error" })).toBe(false);
     expect(isDispatchTerminalRow({ id: "srv-v" })).toBe(false);
@@ -792,6 +795,40 @@ describe("retryMessage clientMessageId 分流 (RFC §5)", () => {
     expect(inbound.clientMessageId).toBe(oldId);
     expect(userMsg._sendAttempt).toBe(1);
     expect(inbound.idempotencyKey).toBe(messageAttemptIdempotencyKey(oldId, 1));
+    sock.stop();
+  });
+
+  test("DURABLE_DISPATCH_UNAVAILABLE 实时红卡 → 铸新 clientMessageId", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "定时续跑" });
+    const s = sock.sessions.get("s1")!;
+    const userMsg = s.messages.find((m) => m.role === "user")!;
+    const oldId = userMsg.id;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "error",
+      code: "DURABLE_DISPATCH_UNAVAILABLE",
+      message: "durable dispatch attribution unavailable, retry this turn shortly",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: oldId,
+    }) });
+    expect(userMsg.status).toBe("error");
+    expect(s.messages.some((m) =>
+      m._errorCode === "durable_dispatch_unavailable" && m._clientMessageId === oldId,
+    )).toBe(true);
+    ws.sent.length = 0;
+
+    sock.retryMessage({ sessId: "s1", msgId: oldId, agentId: "main" });
+
+    expect(userMsg.id).not.toBe(oldId);
+    const inbound = ws.sent.map((raw) => JSON.parse(raw)).find((f) => f.type === "inbound.message");
+    expect(inbound.clientMessageId).toBe(userMsg.id);
+    expect(inbound.clientMessageId).not.toBe(oldId);
+    expect(inbound.idempotencyKey).toBe(messageAttemptIdempotencyKey(userMsg.id, 0));
+    expect(userMsg._sendAttempt).toBe(0);
     sock.stop();
   });
 });
