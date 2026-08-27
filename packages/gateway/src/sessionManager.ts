@@ -34,7 +34,7 @@ import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
 import { decideEngineCwd } from './engineCwd.js'
-import { cursorResumeStoreExists, usableCursorResumeId } from './engine/cursorAdapter.js'
+import { cursorResumeStoreExists, relocateCursorResumeStore, usableCursorResumeId } from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
 import type {
   AutomaticRetryState,
@@ -2927,6 +2927,21 @@ export class SessionManager {
       // recomputed overlay can hash to a different chats/ dir than the live
       // CLI. Deleting here forces historical replay on the next follow-up
       // even when store.db is still on disk.
+      // isolated_v1 次轮绑项目会改 spawn cwd → md5 目录对不上。旧 store 还在
+      // 时迁到当前哈希再 --resume;失败才跳过 lookup,回放历史。
+      const relocated = relocateCursorResumeStore({
+        resumeId: id,
+        currentWorkspacePath: workspacePath,
+        sessionKey,
+      })
+      if (relocated) {
+        log.info('relocated Cursor resume store to current workspace', {
+          sessionKey,
+          resumeId: id,
+          relocated: relocated.relocated,
+        })
+        return id
+      }
       log.warn('resume-map Cursor store not at this workspace — keeping map, skipping this lookup', {
         sessionKey,
         resumeId: id,
