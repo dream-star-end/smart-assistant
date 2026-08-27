@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import { describe, test } from 'node:test'
 import { SignJWT } from 'jose'
-import type { GoalStateService } from '../../goal/goalStateService.js'
+import { GoalStateError, type GoalStateService } from '../../goal/goalStateService.js'
 import { dispatchGoalRoute } from '../goalRoutes.js'
 import { HttpError } from '../util.js'
 
@@ -65,6 +65,20 @@ describe('GoalState HTTP routes', () => {
     assert.equal(out.status(), 200)
     assert.deepEqual(out.body(), { goal: null })
     assert.deepEqual(calls, [[7n, 'session-7']])
+  })
+
+  test('GET of a missing draft session returns 200 {goal:null} instead of 404', async () => {
+    const service = {
+      get: async () => { throw new GoalStateError('NOT_FOUND', 'session not found') },
+    } as unknown as GoalStateService
+    const out = response()
+    await dispatchGoalRoute(
+      request({ method: 'GET', url: '/api/session-goals/draft-1', bearer: await token() }),
+      out.res,
+      { jwtSecret: SECRET, goalStateService: service },
+    )
+    assert.equal(out.status(), 200)
+    assert.deepEqual(out.body(), { goal: null })
   })
 
   test('rejects malformed budgets and CAS revisions instead of silently clearing them', async () => {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import type { GoalStateSnapshot } from '@openclaude/protocol'
-import { renderCcbGoalPrompt } from '../subprocessRunner.js'
+import { renderCcbGoalPrompt } from '../goalPrompt.js'
 
 const active: GoalStateSnapshot = {
   sessionId: 'web-goal-1',
