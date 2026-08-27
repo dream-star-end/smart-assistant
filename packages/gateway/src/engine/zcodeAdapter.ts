@@ -32,6 +32,7 @@ import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWith
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
+import { renderCcbGoalPrompt } from '../goalPrompt.js'
 import {
   cleanupZcodePlatformArtifacts,
   createZcodePlatformArtifacts,
@@ -387,6 +388,12 @@ function suffixPrefixOverlap(existing: string, incoming: string): number {
   return matched
 }
 
+function assembleZcodePrompt(prefix: string, input: string, goal: GoalStateSnapshot | null): string {
+  const goalText = renderCcbGoalPrompt(goal)
+  const head = [prefix, goalText].filter(Boolean).join('\n\n')
+  return head ? `${head}\n\n${input}` : input
+}
+
 export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   readonly engineId = 'zcode'
   readonly capabilities: EngineCapabilities = {
@@ -414,6 +421,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   private route: ZcodeRouteOverride | null = null
   private drain: Promise<void> = Promise.resolve()
   lastActivityAt = 0
+  private platformGoal: GoalStateSnapshot | null = null
 
   constructor(opts: EngineCreateOpts) {
     super()
@@ -444,7 +452,9 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   setEffortLevel(level: string | undefined): void { this.currentEffort = level }
   get effortLevel(): string | undefined { return this.currentEffort }
   setTraceId(_traceId: string | undefined): void {}
-  async setGoalState(_goal: GoalStateSnapshot | null): Promise<void> {}
+  async setGoalState(goal: GoalStateSnapshot | null): Promise<void> {
+    this.platformGoal = goal ? structuredClone(goal) : null
+  }
   updateConfig(config: OpenClaudeConfig): void { this.opts.config = config }
   setToolsets(toolsets: string[] | undefined): void { this.currentToolsets = toolsets }
   get toolsets(): string[] | undefined { return this.currentToolsets }
@@ -570,14 +580,14 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         prompt_sha256: createHash('sha256').update(platform.content || '', 'utf8').digest('hex').slice(0, 12),
         board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
-      return platform.content ? `${platform.content}\n\n${input}` : input
+      return assembleZcodePrompt(platform.content || '', input, this.platformGoal)
     } catch {
       let persona = ''
       if (this.opts.persona) {
         try { persona = readFileSync(this.opts.persona, 'utf8').trim() } catch { persona = '' }
       }
       void cwd
-      return persona ? `${persona}\n\n${input}` : input
+      return assembleZcodePrompt(persona, input, this.platformGoal)
     }
   }
 
@@ -1373,6 +1383,11 @@ registerEngine('zcode', (opts) => new ZcodeAdapter(opts))
 
 export const _internals = {
   promptText,
+  assembleZcodePrompt,
+  promptWithStoredGoal(adapter: ZcodeAdapter, prefix: string, input: string): string {
+    const goal = (adapter as unknown as { platformGoal: GoalStateSnapshot | null }).platformGoal
+    return assembleZcodePrompt(prefix, input, goal)
+  },
   resolveZcodeBin,
   unavailable,
   isZcodeStaleResumeError,

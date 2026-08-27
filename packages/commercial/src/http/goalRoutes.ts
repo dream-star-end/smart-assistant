@@ -62,7 +62,18 @@ export async function dispatchGoalRoute(
   const { sessionId, action } = parseRoute(req)
   try {
     if (req.method === 'GET' && action === null) {
-      sendJson(res, 200, { goal: await deps.goalStateService.get(uid, sessionId) })
+      try {
+        sendJson(res, 200, { goal: await deps.goalStateService.get(uid, sessionId) })
+      } catch (err) {
+        // Draft sessions have no client_sessions row yet. Returning null keeps
+        // the GET contract (`{ goal }`) and avoids 404 log noise; the frontend
+        // already treats a missing goal as "not set".
+        if (err instanceof GoalStateError && err.code === 'NOT_FOUND') {
+          sendJson(res, 200, { goal: null })
+          return
+        }
+        throw err
+      }
       return
     }
     const raw = ((await readJsonBody(req)) ?? {}) as Record<string, unknown>

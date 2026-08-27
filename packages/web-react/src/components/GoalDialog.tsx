@@ -11,7 +11,7 @@ export type GoalSetInput = {
   expectedStateRevision: number;
 };
 
-const STATUS_LABEL: Record<GoalStateSnapshot["status"], string> = {
+export const STATUS_LABEL: Record<GoalStateSnapshot["status"], string> = {
   active: "进行中",
   paused: "已暂停",
   blocked: "受阻",
