@@ -186,6 +186,60 @@ describe('internal Grok relay', () => {
     }
   })
 
+  test('relays official CLI Imagine generation and edit, still fail-closed for other image paths', async () => {
+    const captured: string[] = []
+    let contextCalls = 0
+    const handler = makeGrokRelayHandler({
+      identityRepo: repo(),
+      resolveContext: async () => {
+        contextCalls += 1
+        return { modelId: 'grok-build', accountId: 53n, slotId: 'slot-53' }
+      },
+      freshToken: async () => Buffer.from('real-xai-oauth-token', 'utf8'),
+      resolveDispatcher: async () => ({ dispatcher: DISPATCHER }),
+      requestFn: (async (url: unknown) => {
+        captured.push(String(url))
+        return { statusCode: 201, headers: { 'content-type': 'application/json' }, body: Readable.from(['{"ok":true}']) }
+      }) as never,
+      recordStatus: async () => {},
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    const headers = { authorization: `Bearer ${CONTAINER_TOKEN}`, 'content-type': 'application/json' }
+    try {
+      for (const suffix of ['/images/generations', '/images/edits']) {
+        const response = await fetch(`http://127.0.0.1:${port}${GROK_RELAY_PREFIX}/route/${ROUTE_TOKEN}/v1${suffix}`, {
+          method: 'POST',
+          headers,
+          body: '{"prompt":"cat"}',
+        })
+        assert.equal(response.status, 201, suffix)
+      }
+      assert.deepEqual(captured, [
+        `${GROK_OFFICIAL_UPSTREAM_BASE_URL}/images/generations`,
+        `${GROK_OFFICIAL_UPSTREAM_BASE_URL}/images/edits`,
+      ])
+      assert.equal(contextCalls, 2)
+
+      const blocked = [
+        fetch(`http://127.0.0.1:${port}${GROK_RELAY_PREFIX}/route/${ROUTE_TOKEN}/v1/images/generations`, {
+          headers: { authorization: `Bearer ${CONTAINER_TOKEN}` },
+        }),
+        fetch(`http://127.0.0.1:${port}${GROK_RELAY_PREFIX}/route/${ROUTE_TOKEN}/v1/images/variations`, {
+          method: 'POST',
+          headers,
+          body: '{}',
+        }),
+      ]
+      const blockedResponses = await Promise.all(blocked)
+      assert.equal(blockedResponses[0]?.status, 405)
+      assert.equal(blockedResponses[1]?.status, 405)
+      assert.equal(contextCalls, 2)
+    } finally {
+      await close(server)
+    }
+  })
+
   test('allows the official CLI API-key probe while still replacing its fake bearer', async () => {
     let capturedUrl = ''
     let capturedAuth = ''
