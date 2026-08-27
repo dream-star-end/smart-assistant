@@ -1505,6 +1505,19 @@ export type CronOriginInjectResult =
   | { kind: "no_transport" }
   | { kind: "failed"; reason: string }
 
+/** Origin-session cron must reuse the conversation's current model, not the
+ *  process default (glm). An empty/missing model keeps the historical
+ *  `admitUserTurn({ model: null })` path. */
+export function resolveCronOriginAdmitModel(
+  sessionModelId: string | null | undefined,
+): string | null {
+  if (typeof sessionModelId !== "string") return null;
+  const trimmed = sessionModelId.trim();
+  if (!trimmed) return null;
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(trimmed)) return null;
+  return trimmed;
+}
+
 type CronOriginExecutor = (payload: {
   encoded: Buffer
   admitted: {
@@ -8799,22 +8812,45 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     }
     const content = { text: input.text };
     const requestHash = computeDispatchRequestHash(content);
+    const sessionUserId = "c:" + input.uid.toString();
+    let originModel: string | null = null;
+    if (deps.pgPool) {
+      try {
+        const row = await deps.pgPool.query<{ model_id: string | null }>(
+          `SELECT model_id FROM client_sessions
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+            LIMIT 1`,
+          [input.sessionId, sessionUserId],
+        );
+        originModel = resolveCronOriginAdmitModel(row.rows[0]?.model_id);
+      } catch (err) {
+        log?.warn("user-chat-bridge: cron origin session model lookup failed", {
+          uid: input.uid.toString(),
+          sessionId: input.sessionId,
+          err,
+        });
+      }
+    }
     const message = {
       id: input.clientMessageId,
       role: "user" as const,
       text: input.text,
       ts: Date.now(),
-      _routing: { teamMode: false, effortLevel: null as string | null },
+      _routing: {
+        teamMode: false,
+        effortLevel: null as string | null,
+        ...(originModel ? { model: originModel } : {}),
+      },
     };
     let admit;
     try {
       admit = await deps.admitUserTurn({
         uid: input.uid,
-        sessionUserId: "c:" + input.uid.toString(),
+        sessionUserId,
         sessionId: input.sessionId,
         clientMessageId: input.clientMessageId,
         agentId: input.agentId || "main",
-        model: null,
+        model: originModel,
         requestHash,
         billingRequestId: ensureRequestIdServerSide(),
         dispatchId: randomUUID(),
@@ -8863,6 +8899,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       idempotencyKey: `cron-origin:${input.clientMessageId}`,
       content,
       ts: message.ts,
+      ...(originModel ? { model: originModel } : {}),
     };
     executor({
       encoded: Buffer.from(JSON.stringify(frame), "utf8"),
