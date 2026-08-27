@@ -15,10 +15,6 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { tutorialHref } from "../../hooks/useAppRoute";
-import {
-  TUTORIAL_CASE_BY_ID,
-  type TutorialCaseCategory,
-} from "../../lib/tutorialCaseCatalog";
 
 /**
  * 三步上手：把「多快能用起来」讲清楚（调研共识：3 分钟内到 wow moment）。
@@ -78,17 +74,6 @@ const STARTERS: Starter[] = [
     text: "换个更擅长推理的模型，再帮我推演一遍这个定价方案",
   },
 ];
-
-const FEATURED_CASES = [
-  TUTORIAL_CASE_BY_ID["research-bike-demand"],
-  TUTORIAL_CASE_BY_ID["coding-swe-bench-fix"],
-];
-
-function caseCategoryLabel(category: TutorialCaseCategory): string {
-  if (category === "research") return "科研";
-  if (category === "coding") return "编码";
-  return "通用";
-}
 
 /** 可点击复制的示例指令芯片。 */
 function StarterChip({ s }: { s: Starter }) {
@@ -165,31 +150,21 @@ export function Tutorials() {
         ))}
       </div>
 
-      {/* 两条任务回放入口：让新用户先看完整故事，不再铺案例目录。 */}
-      <div className="mb-6 text-center">
-        <h3 className="text-[22px] font-bold tracking-tight">先看一件难事，V5 是怎么做完的</h3>
-        <p className="mx-auto mt-2 max-w-xl text-[14.5px] text-muted">
-          不列功能清单。直接进入科研或编码任务，看材料怎样变成可检查、可继续的成果。
-        </p>
-      </div>
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-        {FEATURED_CASES.map((item) => (
-          <a
-            key={item.id}
-            href={tutorialHref(window.location, null, item.id)}
-            className="group rounded-2xl border border-border bg-surface p-5 outline-none transition-[border-color,background-color,transform] duration-200 ease-standard hover:-translate-y-0.5 hover:border-accent/50 hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <div className="flex items-center justify-between gap-3">
-              <span className="rounded-full bg-accent-soft px-2.5 py-1 text-[11.5px] font-semibold text-accent">
-                {caseCategoryLabel(item.category)} · {item.difficulty}
-              </span>
-              <ArrowRight size={15} className="text-faint transition-transform group-hover:translate-x-0.5 group-hover:text-accent" />
-            </div>
-            <h4 className="mt-3 text-[16px] font-semibold text-fg">{item.title}</h4>
-            <p className="mt-1.5 line-clamp-2 text-[13.5px] leading-6 text-muted">{item.summary}</p>
-            <p className="mt-3 text-[12px] font-medium text-accent">打开任务全流程</p>
-          </a>
-        ))}
+      {/* 指向教程中心快速上手主线；案例回放尚未采集，这里不承诺。 */}
+      <div className="mb-14 overflow-hidden rounded-2xl border border-border bg-surface p-6 sm:flex sm:items-center sm:justify-between sm:gap-6 sm:p-7">
+        <div className="max-w-xl">
+          <h3 className="text-[20px] font-bold tracking-tight">打开后，按 10 分钟主线走一遍</h3>
+          <p className="mt-2 text-[14.5px] leading-6 text-muted">
+            发任务、补材料、选模型、看过程、拿成果。这是功能用法，不是案例回放。
+          </p>
+        </div>
+        <a
+          href={tutorialHref(window.location)}
+          className="mt-4 inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-grad-cta px-4 py-2.5 text-[13.5px] font-semibold text-white shadow-sm outline-none transition-transform hover:-translate-y-0.5 focus-visible:ring-2 focus-visible:ring-ring sm:mt-0"
+        >
+          打开快速上手
+          <ArrowRight size={15} />
+        </a>
       </div>
 
       {/* 开口第一句 */}

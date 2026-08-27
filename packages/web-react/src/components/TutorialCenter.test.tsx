@@ -83,38 +83,60 @@ function CaseHarness({
 }
 
 describe("TutorialCenter", () => {
-  it("默认只展示一个科研任务回放，不再用案例目录淹没新用户", () => {
+  it("默认展示 10 分钟快速上手主线，而不是未采集案例", () => {
     render(<CaseHarness />);
 
-    expect(
-      screen.getByRole("heading", { name: "你不用守着它。回来时，过程和成果都还在。" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "V5 会把网页、代码、数据和文件串成一个任务，并把每一步和最终成果留给你检查。",
-      ),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/2 小时 35 分 · UCI Bike Sharing/)).toBeInTheDocument();
-    expect(screen.getByText(/示意步骤.*非真实轨迹/)).toBeInTheDocument();
-    expect(screen.getByText("平台支持后台继续与断线恢复")).toBeInTheDocument();
-    expect(screen.getByText("34 项自动化验证通过")).toBeInTheDocument();
-    const chapterNav = screen.getByRole("navigation", { name: "任务阶段" });
-    for (const chapter of ["交付材料", "理解检查", "运行分析", "交叉验证", "拿走成果"]) {
-      expect(within(chapterNav).getByRole("button", { name: chapter })).toBeInTheDocument();
-    }
+    expect(screen.getByRole("heading", { name: "10 分钟走完第一次任务" })).toBeInTheDocument();
+    expect(screen.getByText("发第一个任务")).toBeInTheDocument();
+    expect(screen.getByText("补材料与约束")).toBeInTheDocument();
+    expect(screen.getByText("选模型")).toBeInTheDocument();
+    expect(screen.getByText("看执行过程")).toBeInTheDocument();
+    expect(screen.getByText("拿交付并用反馈迭代")).toBeInTheDocument();
+    expect(screen.getByText("用会话历史继续")).toBeInTheDocument();
     expect(screen.queryByRole("searchbox", { name: "搜索教程" })).not.toBeInTheDocument();
-    expect(document.body.textContent).not.toContain("全部案例");
-    expect(document.body.textContent).not.toContain("更多可直接套用的场景");
-    expect(screen.getByRole("tab", { name: "预览 report.md" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("button", { name: /用我的材料开始/ })).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "功能索引" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("heading", { name: "你不用守着它。回来时，过程和成果都还在。" }),
+    ).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("先看一件难事");
 
-    fireEvent.click(screen.getByRole("button", { name: "功能索引" }));
+    const tabs = screen.getAllByRole("button", { name: /快速上手|按场景学|功能参考|教程工作室|案例示例/ });
+    expect(tabs.map((tab) => tab.textContent?.replace(/\s+/g, " ").trim())).toEqual([
+      "快速上手",
+      "按场景学",
+      "功能参考",
+      "教程工作室",
+      "案例示例",
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "打开步骤：发第一个任务" }));
     expect(
       screen.getByRole("heading", { name: "开始一场高质量对话" }),
     ).toBeInTheDocument();
+  });
+
+  it("按场景学串起现有功能章，并进入对应详情", () => {
+    render(<CaseHarness />);
+    fireEvent.click(screen.getByRole("button", { name: "按场景学" }));
+    expect(screen.getByRole("heading", { name: "按你现在要做的事学" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "写作与办公" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "编程与 GitHub" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "编程与 GitHub：GitHub 仓库" }));
+    expect(
+      screen.getByRole("heading", { name: "连接 GitHub 仓库协作开发" }),
+    ).toBeInTheDocument();
+  });
+
+  it("案例列表与详情都标明示例待真实运行采集", () => {
+    render(<CaseHarness />);
+    fireEvent.click(screen.getByRole("button", { name: "案例示例" }));
+    const pending = screen.getAllByText("示例待真实运行采集");
+    expect(pending.length).toBeGreaterThanOrEqual(12);
+    expect(screen.getByRole("heading", { name: "这些是待采集的任务脚本" })).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("先看完整故事");
+
+    fireEvent.click(screen.getByRole("button", { name: /从 30 篇论文到可追溯证据图谱/ }));
+    expect(screen.getAllByText("示例待真实运行采集").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByRole("heading", { name: "从 30 篇论文到可追溯证据图谱" })).toBeInTheDocument();
   });
 
   it("社区 Tab 已改名为教程工作室，并提供四个入口", async () => {
@@ -157,8 +179,9 @@ describe("TutorialCenter", () => {
   });
 
   it("阶段、成果预览和科研编码切换都是真实可操作的", () => {
-    render(<CaseHarness />);
+    render(<CaseHarness initial="research-bike-demand" />);
 
+    expect(screen.getByText("示例待真实运行采集")).toBeInTheDocument();
     const chapterNav = screen.getByRole("navigation", { name: "任务阶段" });
     fireEvent.click(within(chapterNav).getByRole("button", { name: "运行分析" }));
     expect(screen.getByText("当前阶段：运行分析")).toBeInTheDocument();

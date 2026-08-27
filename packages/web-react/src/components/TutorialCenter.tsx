@@ -19,13 +19,16 @@ import {
   History,
   Image,
   Lightbulb,
+  ListOrdered,
   type LucideIcon,
+  Map,
   MessageCircle,
   MessageSquare,
   Mic,
   Monitor,
   Paperclip,
   Plug,
+  Rocket,
   Search,
   Settings,
   Sparkles,
@@ -62,6 +65,11 @@ import {
   TUTORIAL_TOPIC_LIST,
   tutorialById,
 } from "../lib/tutorialCatalog";
+import {
+  TUTORIAL_PENDING_CAPTURE_LABEL,
+  TUTORIAL_QUICKSTART,
+  TUTORIAL_SCENARIO_PATHS,
+} from "../lib/tutorialJourneys";
 import {
   markTutorialRead,
   readTutorialProgress,
@@ -222,7 +230,15 @@ export function TutorialCenter({
   sessionProjectId?: string | null;
 }) {
   const [communityOpen, setCommunityOpen] = useState(!!communityId);
-  const mode = communityId || communityOpen ? "community" : topicId ? "features" : "cases";
+  const [browseView, setBrowseView] = useState<"start" | "scenarios" | "cases">("start");
+  const mode =
+    communityId || communityOpen
+      ? "community"
+      : topicId
+        ? "features"
+        : caseId
+          ? "cases"
+          : browseView;
   const selectedTopicId = topicId ?? PRODUCT_CAPABILITIES.chatBasics.id;
   const [query, setQuery] = useState("");
   const [featureCategory, setFeatureCategory] = useState<ProductFeatureCategory | "all">("all");
@@ -238,7 +254,7 @@ export function TutorialCenter({
   const cta = actionState(feature);
   const selectedCase = caseId ? TUTORIAL_CASE_BY_ID[caseId] : null;
   const showMissionReplay =
-    !caseId || caseId === "research-bike-demand" || caseId === "coding-swe-bench-fix";
+    caseId === "research-bike-demand" || caseId === "coding-swe-bench-fix";
 
   const filteredFeatures = useMemo(
     () =>
@@ -261,6 +277,7 @@ export function TutorialCenter({
       setQuery("");
       setFeatureCategory("all");
       setCommunityOpen(false);
+      setBrowseView("start");
       return;
     }
     if (communityId) setCommunityOpen(true);
@@ -287,12 +304,17 @@ export function TutorialCenter({
       .catch(() => {});
   };
 
-  const showCases = () => {
+  const clearToBrowse = (view: "start" | "scenarios" | "cases") => {
     setQuery("");
     setCommunityOpen(false);
+    setBrowseView(view);
     onCommunityChange(null);
     onShowCaseGallery();
   };
+
+  const showStart = () => clearToBrowse("start");
+  const showScenarios = () => clearToBrowse("scenarios");
+  const showCases = () => clearToBrowse("cases");
 
   const showFeatures = () => {
     setQuery("");
@@ -305,6 +327,17 @@ export function TutorialCenter({
     setQuery("");
     setCommunityOpen(true);
   };
+
+  const headerCopy =
+    mode === "start"
+      ? { title: "快速上手", subtitle: "大约 10 分钟，走完第一次任务" }
+      : mode === "scenarios"
+        ? { title: "按场景学", subtitle: "按你的工作选一条路径" }
+        : mode === "features"
+          ? { title: "功能参考", subtitle: "按功能查找用法" }
+          : mode === "cases"
+            ? { title: "案例示例", subtitle: "任务脚本已公开，回放仍待采集" }
+            : { title: "教程工作室", subtitle: "探索、手写或从当前会话生成可复用教程" };
 
   return (
     <Dialog.Root open={open} onOpenChange={(next) => !next && onClose()}>
@@ -326,14 +359,10 @@ export function TutorialCenter({
               </span>
               <div className="min-w-0">
                 <Dialog.Title className="truncate text-[15px] font-semibold text-fg sm:text-[17px]">
-                  {mode === "cases" ? "V5 实战拆解" : mode === "features" ? "功能教程" : "教程工作室"}
+                  {headerCopy.title}
                 </Dialog.Title>
                 <p className="hidden text-[11.5px] text-faint sm:block">
-                  {mode === "cases"
-                    ? "一个真实任务，从材料到成果"
-                    : mode === "features"
-                      ? "按功能快速找到使用方法"
-                      : "探索、手写或从当前会话生成可复用教程"}
+                  {headerCopy.subtitle}
                 </p>
               </div>
             </div>
@@ -369,14 +398,20 @@ export function TutorialCenter({
           </header>
 
           <div className="no-scrollbar flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border bg-surface px-3 py-2 sm:px-5">
-            <ViewTab active={mode === "cases"} onClick={showCases} icon={TestTube2}>
-              实战回放
+            <ViewTab active={mode === "start"} onClick={showStart} icon={Rocket}>
+              快速上手
+            </ViewTab>
+            <ViewTab active={mode === "scenarios"} onClick={showScenarios} icon={Map}>
+              按场景学
             </ViewTab>
             <ViewTab active={mode === "features"} onClick={showFeatures} icon={Sparkles}>
-              功能索引
+              功能参考
             </ViewTab>
             <ViewTab active={mode === "community"} onClick={showCommunity} icon={Waypoints}>
               教程工作室
+            </ViewTab>
+            <ViewTab active={mode === "cases"} onClick={showCases} icon={TestTube2}>
+              案例示例
             </ViewTab>
           </div>
 
@@ -442,6 +477,10 @@ export function TutorialCenter({
                     initialDetailId={communityId}
                     onDetailIdChange={onCommunityChange}
                   />
+                ) : mode === "start" ? (
+                  <QuickstartView onOpenTopic={onTopicChange} />
+                ) : mode === "scenarios" ? (
+                  <ScenarioPathsView onOpenTopic={onTopicChange} />
                 ) : mode === "cases" ? (
                   showMissionReplay ? (
                     <MissionReplay
@@ -455,11 +494,13 @@ export function TutorialCenter({
                       item={selectedCase}
                       copied={copied}
                       onCopy={() => copyText(selectedCase.starterPrompt)}
-                      onBack={onShowCaseGallery}
+                      onBack={showCases}
                       actionLabel={caseActionLabel}
                       onRun={onRunCase}
                     />
-                  ) : null
+                  ) : (
+                    <CaseGallery items={TUTORIAL_CASES} onSelect={onCaseChange} />
+                  )
                 ) : (
                   <FeatureDetail
                     feature={feature}
@@ -506,6 +547,102 @@ function ViewTab({
     >
       <Icon size={14} /> {children}
     </button>
+  );
+}
+
+function PendingCaptureBadge() {
+  return (
+    <span className="rounded-full bg-warning-soft px-2.5 py-1 text-[10.5px] font-semibold text-warning">
+      {TUTORIAL_PENDING_CAPTURE_LABEL}
+    </span>
+  );
+}
+
+function QuickstartView({ onOpenTopic }: { onOpenTopic: (id: ProductFeatureId) => void }) {
+  return (
+    <section className="mx-auto max-w-3xl px-4 pb-12 pt-7 sm:px-7 sm:pt-9">
+      <p className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-accent">
+        约 {TUTORIAL_QUICKSTART.estimatedMinutes} 分钟
+      </p>
+      <h1 className="mt-2 text-balance text-[25px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]">
+        {TUTORIAL_QUICKSTART.title}
+      </h1>
+      <p className="mt-3 text-[14.5px] leading-7 text-muted">{TUTORIAL_QUICKSTART.summary}</p>
+      <ol className="mt-8 flex flex-col gap-4">
+        {TUTORIAL_QUICKSTART.steps.map((step, index) => {
+          const feature = capabilityById(step.topicId);
+          return (
+            <li key={step.id} className="rounded-2xl border border-border bg-surface p-4 shadow-sm sm:p-5">
+              <div className="flex gap-3.5">
+                <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-grad-cta text-[12px] font-semibold text-white">
+                  {index + 1}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <h2 className="text-[15px] font-semibold text-fg">{step.title}</h2>
+                  <p className="mt-1.5 text-[13.5px] leading-6 text-muted">{step.body}</p>
+                  <button
+                    type="button"
+                    onClick={() => onOpenTopic(step.topicId)}
+                    aria-label={`打开步骤：${step.title}`}
+                    className="mt-3 inline-flex items-center gap-1.5 text-[12.5px] font-semibold text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    查看「{feature.shortTitle}」
+                    <ArrowRight size={13} />
+                  </button>
+                </div>
+              </div>
+            </li>
+          );
+        })}
+      </ol>
+    </section>
+  );
+}
+
+function ScenarioPathsView({ onOpenTopic }: { onOpenTopic: (id: ProductFeatureId) => void }) {
+  return (
+    <section className="mx-auto max-w-4xl px-4 pb-12 pt-7 sm:px-7 sm:pt-9">
+      <h1 className="text-balance text-[25px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]">
+        按你现在要做的事学
+      </h1>
+      <p className="mt-3 max-w-2xl text-[14.5px] leading-7 text-muted">
+        每条路径只串已有功能章，点进去就是对应用法，不是新的案例回放。
+      </p>
+      <div className="mt-8 grid gap-4 md:grid-cols-2">
+        {TUTORIAL_SCENARIO_PATHS.map((path) => (
+          <article key={path.id} className="rounded-2xl border border-border bg-surface p-5 shadow-sm">
+            <div className="flex items-center gap-2">
+              <span className="flex size-8 items-center justify-center rounded-lg bg-accent-soft text-accent">
+                <ListOrdered size={16} />
+              </span>
+              <h2 className="text-[16px] font-semibold text-fg">{path.title}</h2>
+            </div>
+            <p className="mt-3 text-[13px] leading-6 text-muted">{path.description}</p>
+            <ol className="mt-4 flex flex-col gap-1.5">
+              {path.topicIds.map((topicId, index) => {
+                const feature = capabilityById(topicId);
+                return (
+                  <li key={topicId}>
+                    <button
+                      type="button"
+                      onClick={() => onOpenTopic(topicId)}
+                      aria-label={`${path.title}：${feature.shortTitle}`}
+                      className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-[12.5px] text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-sidebar text-[10px] font-semibold text-faint">
+                        {index + 1}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate">{feature.shortTitle}</span>
+                      <ArrowRight size={12} className="text-faint" />
+                    </button>
+                  </li>
+                );
+              })}
+            </ol>
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -592,26 +729,21 @@ function CaseGallery({
   items: readonly TutorialCase[];
   onSelect: (id: TutorialCaseId) => void;
 }) {
-  const featuredItems = items.filter((item) => item.fieldReport);
-  const templateItems = items.filter((item) => !item.fieldReport);
   return (
     <section className="mx-auto max-w-5xl px-3 pb-12 pt-4 sm:px-7 sm:pt-7">
       <div className="overflow-hidden rounded-3xl bg-[#07111f] px-5 py-6 text-white sm:px-8 sm:py-8">
         <p className="text-[10.5px] font-semibold uppercase tracking-[0.16em] text-cyan-200">
-          从你的问题开始
+          案例脚本
         </p>
         <h1 className="mt-2 max-w-2xl text-balance text-[25px] font-bold leading-tight tracking-tight sm:text-[34px]">
-          看 V5 怎样把一件难事真正做完
+          这些是待采集的任务脚本
         </h1>
         <p className="mt-3 max-w-2xl text-[13px] leading-6 text-white/72 sm:text-[14px]">
-          不讲功能清单。直接看真实场景里的材料、过程和最后能拿走的成果。
+          步骤和材料已经写好，但还没有真实运行回放。采集完成前，只把它们当参考，不当成品。
         </p>
         <div className="mt-5 flex flex-wrap gap-2 text-[10.5px] font-medium text-white/85 sm:text-[11.5px]">
-          <span className="rounded-full bg-white/10 px-3 py-1.5">科研分析</span>
-          <span className="rounded-full bg-white/10 px-3 py-1.5">代码修复</span>
-          <span className="rounded-full bg-white/10 px-3 py-1.5">
-            结果可核对
-          </span>
+          <span className="rounded-full bg-white/10 px-3 py-1.5">{TUTORIAL_PENDING_CAPTURE_LABEL}</span>
+          <span className="rounded-full bg-white/10 px-3 py-1.5">科研 / 编码 / 通用</span>
         </div>
       </div>
 
@@ -621,56 +753,29 @@ function CaseGallery({
         </div>
       ) : (
         <div className="mt-8 space-y-10">
-          {featuredItems.length > 0 && (
-            <section aria-labelledby="customer-story-title">
-              <div className="mb-4">
-                <p className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-accent">
-                  先看完整故事
-                </p>
-                <h2
-                  id="customer-story-title"
-                  className="mt-1 text-[19px] font-semibold tracking-tight text-fg sm:text-[22px]"
-                >
-                  你的问题，也可以这样交给 V5
-                </h2>
-              </div>
-              <div className="grid gap-5 md:grid-cols-2">
-                {featuredItems.map((item) => (
-                  <CaseGalleryCard
-                    key={item.id}
-                    item={item}
-                    onSelect={onSelect}
-                    featured
-                  />
-                ))}
-              </div>
-            </section>
-          )}
-
-          {templateItems.length > 0 && (
-            <section aria-labelledby="case-template-title">
-              <div className="mb-4">
-                <p className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-accent">
-                  换成你的任务
-                </p>
-                <h2
-                  id="case-template-title"
-                  className="mt-1 text-[19px] font-semibold tracking-tight text-fg sm:text-[22px]"
-                >
-                  更多可直接套用的场景
-                </h2>
-              </div>
-              <div className="grid gap-4 md:grid-cols-2">
-                {templateItems.map((item) => (
-                  <CaseGalleryCard
-                    key={item.id}
-                    item={item}
-                    onSelect={onSelect}
-                  />
-                ))}
-              </div>
-            </section>
-          )}
+          <section aria-labelledby="case-template-title">
+            <div className="mb-4">
+              <p className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-accent">
+                {TUTORIAL_PENDING_CAPTURE_LABEL}
+              </p>
+              <h2
+                id="case-template-title"
+                className="mt-1 text-[19px] font-semibold tracking-tight text-fg sm:text-[22px]"
+              >
+                全部案例脚本
+              </h2>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
+              {items.map((item) => (
+                <CaseGalleryCard
+                  key={item.id}
+                  item={item}
+                  onSelect={onSelect}
+                  featured={Boolean(item.fieldReport)}
+                />
+              ))}
+            </div>
+          </section>
         </div>
       )}
     </section>
@@ -698,7 +803,11 @@ function CaseGalleryCard({
     <button
       type="button"
       onClick={() => onSelect(item.id)}
-      aria-label={`${storyLabel}：${presentation.pain} ${item.title}。完成后得到${presentation.result}。看它怎么完成`}
+      aria-label={
+        item.replay.status === "pending_capture"
+          ? `${TUTORIAL_PENDING_CAPTURE_LABEL}：${item.title}`
+          : `${storyLabel}：${presentation.pain} ${item.title}。完成后得到${presentation.result}。看它怎么完成`
+      }
       className={cn(
         "group overflow-hidden rounded-3xl border bg-surface text-left shadow-sm outline-none transition-[border-color,box-shadow,transform] hover:-translate-y-1 hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring",
         featured
@@ -709,9 +818,10 @@ function CaseGalleryCard({
       <CaseArtwork caseId={item.id} fieldReport={report} />
       <div className="p-4 sm:p-5">
         <div className="flex flex-wrap items-center gap-2">
+          {item.replay.status === "pending_capture" && <PendingCaptureBadge />}
           <span className="rounded-full bg-accent-soft px-2.5 py-1 text-[10.5px] font-semibold text-accent">
             {report
-              ? `${storyLabel} · 案例演示`
+              ? `${storyLabel} · 案例脚本`
               : `${caseCategoryLabel(item.category)} · ${item.difficulty}`}
           </span>
           {!report &&
@@ -752,7 +862,7 @@ function CaseGalleryCard({
           </p>
         )}
         <span className="mt-4 inline-flex items-center gap-1.5 text-[12.5px] font-semibold text-fg transition-colors group-hover:text-accent">
-          看它怎么完成
+          {item.replay.status === "pending_capture" ? "查看任务脚本" : "看它怎么完成"}
           <ArrowRight
             size={14}
             className="transition-transform group-hover:translate-x-1"
@@ -795,8 +905,14 @@ function CaseDetail({
         onClick={onBack}
         className="inline-flex items-center gap-1.5 rounded-md text-[12.5px] text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
       >
-        <ArrowLeft size={14} /> 返回实战拆解
+        <ArrowLeft size={14} /> 返回案例列表
       </button>
+
+      {item.replay.status === "pending_capture" && (
+        <p className="mt-3 rounded-xl bg-warning-soft px-3 py-2 text-[12.5px] font-medium text-warning">
+          {TUTORIAL_PENDING_CAPTURE_LABEL}。当前只展示人工编写的任务脚本，不是真实运行回放。
+        </p>
+      )}
 
       <section className="mt-3 overflow-hidden rounded-3xl border border-border bg-surface shadow-sm md:grid md:grid-cols-[1.02fr_.98fr]">
         <CaseArtwork
@@ -806,8 +922,9 @@ function CaseDetail({
         />
         <div className="order-1 flex flex-col p-4 sm:p-6 md:order-2">
           <div className="flex flex-wrap items-center gap-2">
+            {item.replay.status === "pending_capture" && <PendingCaptureBadge />}
             <span className="rounded-full bg-accent-soft px-2.5 py-1 text-[10.5px] font-semibold text-accent">
-              {storyLabel} · 案例演示
+              {storyLabel} · 案例脚本
             </span>
             <span className="rounded-full bg-hover px-2.5 py-1 text-[10.5px] text-muted">
               {item.difficulty}
@@ -1472,13 +1589,21 @@ function CaseMethodDetails({
           </div>
         </section>
 
-        {item.replay.status === "verified" && (
+        {item.replay.status === "verified" ? (
           <section>
             <h3 className="text-[14px] font-semibold text-fg">运行过程回放</h3>
             <TutorialReplay caseId={item.id} replay={item.replay} />
             <p className="mt-2 text-[10.5px] leading-5 text-faint">
               {item.replay.disclosure}
             </p>
+          </section>
+        ) : (
+          <section>
+            <h3 className="text-[14px] font-semibold text-fg">运行过程回放</h3>
+            <p className="mt-1.5 text-[12.5px] leading-5 text-warning">
+              {TUTORIAL_PENDING_CAPTURE_LABEL}
+            </p>
+            <TutorialReplay caseId={item.id} replay={item.replay} />
           </section>
         )}
       </div>
