@@ -197,6 +197,10 @@
     {
       "id": "T49",
       "proves": "真 Chromium 中 Phase-A unpublished fallback 清发送态后，空 live-units owner reset 仍保留 thinking/tool/plan，终稿与过程行同时可见"
+    },
+    {
+      "id": "T50",
+      "proves": "真 Chromium 中 persist 后的用户气泡只渲染 displayText/原文，_modelText 里的【OpenClaude 论文任务系统提示】不出现在用户气泡"
     }
   ]
 }

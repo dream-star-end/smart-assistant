@@ -177,6 +177,11 @@ declare global {
         planId?: string;
         unpublished: boolean;
       }>;
+      /** Persist displayText stays user original while _modelText keeps the paper hint. */
+      runPaperHintUserBubble: () => Promise<{
+        text: string;
+        modelText?: string;
+      }>;
     };
     /** T23 会话内切模型:候选项展示名与 id 的单一权威(run.mjs 从页面读回)。 */
     __modelFixture: {
@@ -241,6 +246,9 @@ window.__replayDrive = {
   },
   runPhaseAEmptyUnitsReset: async () => {
     throw new Error("phase-a empty units reset probe 未挂载");
+  },
+  runPaperHintUserBubble: async () => {
+    throw new Error("paper-hint user bubble probe 未挂载");
   },
 };
 window.__runPendingDispatchJournalProbe = async () => {
@@ -1780,6 +1788,47 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         unpublished: session.messages.some((message) =>
           message.role === "assistant" && message._displayDegradeReason === "records_unpublished"),
       };
+    },
+    runPaperHintUserBubble: async () => {
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        "paper-hint displayText",
+      );
+      const clientMessageId = "m-browser-paper-hint";
+      const marker = "【OpenClaude 论文任务系统提示】";
+      const original = "CRISPR 论文";
+      const user = {
+        id: clientMessageId,
+        role: "user" as const,
+        text: original,
+        ts: 1,
+        status: "sent" as const,
+        _source: "server" as const,
+        _seq: 1,
+        _orderSeq: 1,
+        _modelText: `${original}\n\n---\n${marker}\nprobe`,
+        _timelineRecord: true,
+        _timelineUnitKey: `outer:${REPLAY_SESSION_ID}:1`,
+      };
+      session.messages = [user];
+      replaySocket.applyServerMessages(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        [user],
+        true,
+        1,
+        {
+          serverUpdatedAt: 1,
+          historyRevision: 1,
+          timelineGeneration: 1,
+          completedClientMessageId: clientMessageId,
+        },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const row = session.messages.find((message) => message.id === clientMessageId);
+      return { text: row?.text ?? "", modelText: row?._modelText };
     },
   };
 }

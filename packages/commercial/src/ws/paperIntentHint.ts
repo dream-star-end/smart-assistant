@@ -85,8 +85,13 @@ export function appendScanSciPaperIntentHintToFrame<T extends Record<string, unk
   if (typeof text !== "string") return frame;
   const intent = detectScanSciPaperIntent(text);
   if (intent === null) return frame;
+  const contentRecord = content as Record<string, unknown> & { displayText?: unknown };
+  // Persist already maps content.displayText → message.text and content.text →
+  // message._modelText. Keep the user-visible original here; do not rewrite the
+  // forwarded text body (container recomputes requestHash from content.text).
   const nextContent = {
-    ...(content as Record<string, unknown>),
+    ...contentRecord,
+    displayText: typeof contentRecord.displayText === "string" ? contentRecord.displayText : text,
     text: `${text}\n\n${SCANSCI_PAPER_HINT}\n- 本轮检测类型：${intent.kind} (${intent.reason})。`,
   };
   return {

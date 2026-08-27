@@ -1834,6 +1834,30 @@
       "coverageCommits": [
         "8807ea1a"
       ]
+    },
+    {
+      "id": "INC-20260827-PAPER-HINT-LEAK",
+      "occurredAt": "2026-08-27",
+      "severity": "P1",
+      "symptom": "论文/文献短句被 master 拼上【OpenClaude 论文任务系统提示】后原样写入 client_sessions 用户行 text；前端 UserCard 按 msg.text 渲染，用户气泡泄漏系统提示。根因是 appendScanSciPaperIntentHintToFrame 漏填 content.displayText，persist 回落到已拼接的 content.text。",
+      "rootFixCommit": "a1414343",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "appendScanSciPaperIntentHintToFrame keeps displayText as user original"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "paper DOI inbound.message gets hidden ScanSci hint only in forwarded frame"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T50 persist 后用户气泡只显示原文，不含论文任务系统提示"
+        }
+      ]
     }
   ]
 }
