@@ -364,6 +364,16 @@ describe("模型权威拒帧的用户向文案(MODEL_CONFIG_CHANGED_RETRY_TURN �
     expect(friendlyBridgeErrorMessage("MODEL_CATALOG_UNAVAILABLE")).toMatch(/稍后/);
   });
 
+  test("DURABLE_DISPATCH_UNAVAILABLE → 派发未接入执行通道,非通用兜底", () => {
+    expect(normalizeBridgeErrorCode("DURABLE_DISPATCH_UNAVAILABLE")).toBe(
+      "durable_dispatch_unavailable",
+    );
+    const msg = friendlyBridgeErrorMessage("DURABLE_DISPATCH_UNAVAILABLE");
+    expect(msg).toMatch(/执行通道/);
+    expect(msg).toMatch(/重试/);
+    expect(msg).not.toMatch(/系统暂时不可用/);
+  });
+
   test("配置变更/模型下架 = 预期业务态(不自动上报);catalog 不可用 = 基建故障(要上报)", () => {
     expect(EXPECTED_TURN_ERR_CODES.has("model_config_changed_retry_turn")).toBe(true);
     expect(EXPECTED_TURN_ERR_CODES.has("model_not_available")).toBe(true);
