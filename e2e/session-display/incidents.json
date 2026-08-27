@@ -1830,6 +1830,9 @@
           "path": "scripts/deploy-v5.sh",
           "assertion": "seed-weibo-plugin.ts --seed-only"
         }
+      ],
+      "coverageCommits": [
+        "8807ea1a"
       ]
     }
   ]
