@@ -38,7 +38,8 @@ export type TutorialDestination =
     }
   | { kind: "inbox" }
   | { kind: "github" }
-  | { kind: "org"; section: OrgDestinationSection };
+  | { kind: "org"; section: OrgDestinationSection }
+  | { kind: "taskboard" };
 
 export type ProductRequirement =
   "authenticated" | "image2" | "microphone" | "org-manager";
@@ -65,6 +66,16 @@ export const PRODUCT_CAPABILITIES = {
     destination: { kind: "focus", target: "chat-basics" },
     requirements: ["authenticated"],
   },
+  sessionGoal: {
+    id: "session-goal",
+    title: "为会话设定可执行目标",
+    shortTitle: "设定目标",
+    category: "start",
+    icon: "target",
+    aliases: ["目标", "Goal", "预算", "暂停目标", "完成目标"],
+    destination: { kind: "focus", target: "session-goal" },
+    requirements: ["authenticated"],
+  },
   sessions: {
     id: "sessions-history",
     title: "会话、搜索与跨端历史",
@@ -75,13 +86,23 @@ export const PRODUCT_CAPABILITIES = {
     destination: { kind: "focus", target: "sessions-history" },
     requirements: ["authenticated"],
   },
+  taskboard: {
+    id: "taskboard",
+    title: "用任务面板推进分阶段工作",
+    shortTitle: "任务面板",
+    category: "start",
+    icon: "kanban",
+    aliases: ["任务", "看板", "阶段", "工单", "委派", "阶段 agent"],
+    destination: { kind: "taskboard" },
+    requirements: ["authenticated"],
+  },
   models: {
     id: "models-reasoning",
     title: "选择模型与思考深度",
     shortTitle: "模型与思考",
     category: "start",
     icon: "cpu",
-    aliases: ["GPT", "DeepSeek", "GLM", "推理", "思考档位", "模型"],
+    aliases: ["GPT", "DeepSeek", "GLM", "Grok", "Cursor", "推理", "思考档位", "模型", "Fast"],
     destination: { kind: "focus", target: "models-reasoning" },
     requirements: ["authenticated"],
   },

@@ -282,3 +282,45 @@ describe("CronPanel 后台对账的顺序栅栏", () => {
     expect(screen.queryByText("已停用")).not.toBeInTheDocument();
   });
 });
+
+describe("CronPanel 送达通道由后端下发", () => {
+  test("挂载时拉 /api/cron/channels,不可用通道不展示", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([]);
+    vi.spyOn(api, "listCronChannels").mockResolvedValue([
+      { value: "webchat", available: true },
+      { value: "local", available: true },
+      { value: "telegram", available: false },
+    ]);
+    mountPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "创建第一个定时任务" }));
+    await waitFor(() => {
+      const values = [...document.querySelectorAll("select option")].map(
+        (o) => (o as HTMLOptionElement).value,
+      );
+      expect(values).toContain("webchat");
+      expect(values).toContain("local");
+      expect(values).not.toContain("telegram");
+    });
+    expect(screen.queryByRole("option", { name: "Telegram" })).not.toBeInTheDocument();
+  });
+
+  test("拉取失败回退写死三项", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([]);
+    vi.spyOn(api, "listCronChannels").mockRejectedValue(new Error("offline"));
+    mountPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "创建第一个定时任务" }));
+    expect(await screen.findByRole("option", { name: "网页对话" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Telegram" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "仅记录" })).toBeInTheDocument();
+  });
+
+  test("deliverLabel 对未知值原样回显", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([{ ...ACTIVE, deliver: "discord" }]);
+    vi.spyOn(api, "listCronChannels").mockResolvedValue([
+      { value: "webchat", available: true },
+      { value: "local", available: true },
+    ]);
+    mountPanel();
+    expect(await screen.findByText("discord")).toBeInTheDocument();
+  });
+});

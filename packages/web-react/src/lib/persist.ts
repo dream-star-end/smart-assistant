@@ -528,9 +528,157 @@ function isPhaseBExactAssistant(message: ChatMessage): boolean {
     message._turnTapeId.length > 0;
 }
 
+function toolIdentity(message: ChatMessage): string | undefined {
+  if (typeof message.blockId === "string" && message.blockId.length > 0) return message.blockId;
+  const extra = message as ChatMessage & { toolUseId?: string; toolUseBlockId?: string };
+  if (typeof extra.toolUseId === "string" && extra.toolUseId.length > 0) return extra.toolUseId;
+  if (typeof extra.toolUseBlockId === "string" && extra.toolUseBlockId.length > 0) {
+    return extra.toolUseBlockId;
+  }
+  return undefined;
+}
+
+function toolRowHasResult(message: ChatMessage): boolean {
+  if (typeof message.output === "string" && message.output.length > 0) return true;
+  if (message.error === true) return true;
+  return false;
+}
+
+function isLocalAgentToolName(name: string | undefined): boolean {
+  return typeof name === "string" && /^(Agent|Task)$/i.test(name);
+}
+
+function agentGroupHasResult(message: ChatMessage): boolean {
+  if (message.role !== "agent-group") return false;
+  if (typeof message.output === "string" && message.output.length > 0) return true;
+  if (message.error === true || message._isError === true) return true;
+  return false;
+}
+
+function processIdentityKey(message: ChatMessage): string | undefined {
+  if (message.role !== "tool" && message.role !== "agent-group") return undefined;
+  const id = toolIdentity(message);
+  if (!id) return undefined;
+  return `${turnOwnerId(message) ?? ""}::${id}`;
+}
+
+function foldResultIntoAgentGroup(group: ChatMessage, donor: ChatMessage): ChatMessage {
+  const donorOutput = typeof donor.output === "string" ? donor.output : "";
+  const groupOutput = typeof group.output === "string" ? group.output : "";
+  const output = groupOutput.length > 0 ? groupOutput : donorOutput;
+  const error = group.error === true || group._isError === true
+    || donor.error === true || donor._isError === true;
+  const completed = group._completed === true || donor._completed === true || error || output.length > 0;
+  return {
+    ...group,
+    role: "agent-group",
+    output: output.length > 0 ? output : group.output,
+    error,
+    _isError: error || group._isError,
+    _completed: completed,
+    _partial: completed ? false : group._partial,
+    childBlocks: Array.isArray(group.childBlocks) ? group.childBlocks : [],
+    toolName: group.toolName || donor.toolName || "Agent",
+    ...(output.length > 0 && !group._resultPreview
+      ? { _resultPreview: output.slice(0, 200) }
+      : {}),
+  };
+}
+
+function asAgentGroupDisplay(row: ChatMessage): ChatMessage {
+  if (row.role === "agent-group") return row;
+  return foldResultIntoAgentGroup({
+    ...row,
+    role: "agent-group",
+    childBlocks: Array.isArray(row.childBlocks) ? row.childBlocks : [],
+  }, row);
+}
+
+function pickCanonicalProcessRow(members: ChatMessage[]): ChatMessage {
+  const withResult = members.filter((m) => toolRowHasResult(m) || agentGroupHasResult(m));
+  const considered = withResult.length > 0
+    ? members.filter((m) => !isIncompleteDurableToolRow(m) || withResult.includes(m))
+    : members;
+  const groups = considered.filter((m) => m.role === "agent-group");
+  const tools = considered.filter((m) => m.role === "tool");
+  const agentNamed = [...groups, ...tools].some((m) => isLocalAgentToolName(m.toolName));
+
+  if (groups.length > 0) {
+    let canonical = groups.find(agentGroupHasResult) ?? groups[0]!;
+    for (const donor of considered) {
+      if (donor === canonical) continue;
+      canonical = foldResultIntoAgentGroup(canonical, donor);
+    }
+    return canonical;
+  }
+  if (agentNamed) {
+    const donor = tools.find(toolRowHasResult) ?? tools[0] ?? considered[0]!;
+    let canonical = asAgentGroupDisplay(donor);
+    for (const extra of considered) {
+      if (extra === donor) continue;
+      canonical = foldResultIntoAgentGroup(canonical, extra);
+    }
+    return canonical;
+  }
+  return tools.find(toolRowHasResult) ?? considered[0]!;
+}
+
+/**
+ * Live CCB Agent is role=agent-group; tape persists Agent/Task as role=tool.
+ * Same owner+blockId must collapse to one row. Prefer agent-group (matches
+ * AgentGroupCard). Incomplete tape tool rows are dropped when a live/result
+ * counterpart exists.
+ */
+export function coalesceProcessIdentities(rows: ChatMessage[]): ChatMessage[] {
+  const groups = new Map<string, ChatMessage[]>();
+  for (const message of rows) {
+    const key = processIdentityKey(message);
+    if (!key) continue;
+    const list = groups.get(key);
+    if (list) list.push(message);
+    else groups.set(key, [message]);
+  }
+  const replacement = new Map<ChatMessage, ChatMessage | null>();
+  for (const members of groups.values()) {
+    if (members.length === 1) {
+      const only = members[0]!;
+      if (only.role === "tool" && isLocalAgentToolName(only.toolName) && !isIncompleteDurableToolRow(only)) {
+        replacement.set(only, asAgentGroupDisplay(only));
+      }
+      continue;
+    }
+    const canonical = pickCanonicalProcessRow(members);
+    const first = members[0]!;
+    for (const member of members) {
+      replacement.set(member, member === first ? canonical : null);
+    }
+  }
+  if (replacement.size === 0) return rows;
+  const out: ChatMessage[] = [];
+  for (const message of rows) {
+    if (!replacement.has(message)) {
+      out.push(message);
+      continue;
+    }
+    const next = replacement.get(message);
+    if (next) out.push(next);
+  }
+  return out;
+}
+
+/** Tape tool rows frozen at streaming tool_use (partial + empty output) are
+ *  not a positive replacement for a live tool_result. */
+export function isIncompleteDurableToolRow(message: ChatMessage | null | undefined): boolean {
+  if (!message || message.role !== "tool") return false;
+  if (toolRowHasResult(message)) return false;
+  const extra = message as ChatMessage & { partial?: boolean; completed?: boolean };
+  return extra._partial === true || extra.partial === true || extra._completed === false || extra.completed === false;
+}
+
 /** Exact, displayable tape process — not unpublished, not a deferred stub. */
 export function isDisplayableExactProcessRow(message: ChatMessage): boolean {
   if (!message || isDeferredExactProcessStub(message)) return false;
+  if (isIncompleteDurableToolRow(message)) return false;
   if (!isTapeBackedAgentProcessRole(message.role) || message.role === "assistant") return false;
   if (message._displayDegradeReason === "records_unpublished") return false;
   if (message._timelineRecord === true) return true;
@@ -614,6 +762,26 @@ export function isLiveProcessPendingExactTape(
     }
   }
   const owner = turnOwnerId(message);
+  if (message.role === "tool" && toolRowHasResult(message)) {
+    const liveId = toolIdentity(message);
+    const exactSameTool = liveId
+      ? authorityRows.some((row) =>
+          isDisplayableExactProcessRow(row) &&
+          row.role === "tool" &&
+          toolIdentity(row) === liveId &&
+          (typeof owner !== "string" || turnOwnerId(row) === owner),
+        )
+      : false;
+    if (!exactSameTool) {
+      if (typeof owner === "string") {
+        if (unpublishedOwners.has(owner)) return true;
+        if (hasUnownedUnpublishedAssistant && !exactProcessOwners.has(owner)) return true;
+        if (phaseBOwners.has(owner) || hasUnownedPhaseBAssistant) return true;
+      } else if (hasUnownedUnpublishedAssistant || hasUnownedPhaseBAssistant) {
+        return true;
+      }
+    }
+  }
   if (typeof owner === "string") {
     if (unpublishedOwners.has(owner)) return true;
     if (hasUnownedUnpublishedAssistant && !exactProcessOwners.has(owner)) return true;
@@ -952,9 +1120,9 @@ export function mergeFullServerWins(
           isUnpublishedProcessRow(m)),
     );
   if (!tail.length && !preservedMid.length) {
-    return repairPostFinalProcessOrder(
+    return coalesceProcessIdentities(repairPostFinalProcessOrder(
       stableSortByTs(serverChanged ? serverMerged : server),
-    );
+    ));
   }
   const safeByOriginal = new Map<ChatMessage, ChatMessage>();
   for (const m of [...preservedMid, ...tail]) safeByOriginal.set(m, sanitizePreservedLocalRow(m));
@@ -965,9 +1133,9 @@ export function mergeFullServerWins(
   );
   if (!hasDurableOrderAxis) {
     // 兼容尚无 `_orderSeq` 的旧 server 快照：沿用 server→mid→tail 插入序，再按 ts 排列。
-    return repairPostFinalProcessOrder(
+    return coalesceProcessIdentities(repairPostFinalProcessOrder(
       stableSortByTs([...serverMerged, ...safePreservedMid, ...safeTail]),
-    );
+    ));
   }
   // 中段 client-owned 行若在拼接时离开本地原槽，会错误继承 server 尾行的排序锚点。
   // 一方面按原 local 插入序重建槽位；另一方面保留一次性 anchor override，明确冻结其
@@ -1012,9 +1180,9 @@ export function mergeFullServerWins(
       if (m?.id) emittedServerIds.add(m.id);
     }
   }
-  return repairPostFinalProcessOrder(
+  return coalesceProcessIdentities(repairPostFinalProcessOrder(
     stableSortByTs(inLocalOrder, anchorOverrides),
-  );
+  ));
 }
 
 /**

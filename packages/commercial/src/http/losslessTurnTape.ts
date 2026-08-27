@@ -824,7 +824,19 @@ export function materializeLosslessTurn(
     const tool = tools[i]!;
     const blockId = requiredString(tool, "blockId");
     const output = requiredString(tool, "output");
-    const completed = tool.completed !== false;
+    // A completed turn must not freeze a tool as partial=true output="".
+    // Parser now writes Agent/Task results; this drops leftover empty pending
+    // snapshots so they cannot become the durable card.
+    if (body.status === "completed" && tool.completed === false && output === "") {
+      continue;
+    }
+    // Trust the explicit completed flag. Never infer completion from a
+    // non-empty output (interrupted turns can carry partial bytes).
+    const completed = tool.completed === true
+      ? true
+      : tool.completed === false
+        ? false
+        : body.status === "completed";
     const arrivedAt = tool.arrivedAt;
     const toolTs = typeof arrivedAt === "number" && Number.isSafeInteger(arrivedAt) && arrivedAt >= 0
       ? arrivedAt

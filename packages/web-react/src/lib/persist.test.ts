@@ -5,6 +5,8 @@ import {
   dbNameForUser,
   dispatchDbNameForUser,
   mergeArchivedHistory,
+  isIncompleteDurableToolRow,
+  coalesceProcessIdentities,
   mergeFullServerWins,
   mergeTimelineHistoryPage,
   reconcileTimelineBashTailAuxiliaries,
@@ -2094,6 +2096,139 @@ describe("mergeFullServerWins — records_unpublished degrade page", () => {
     expect(merged.filter((m) => m.role === "agent-group").map((m) => m.id).sort()).toEqual(
       ["live-ag", "tape-ag"].sort(),
     );
+  });
+
+  test("incomplete tape Agent tool does not drop live 403 tool_result", () => {
+    const cmid = "cron-origin-agent-403";
+    const blockId = "call_6cb99a5601424ec7ac79c8ab";
+    const errorBody = 'Failed to authenticate. API Error: 403 {"error":{"code":"MODEL_NOT_AVAILABLE"}}';
+    const user: ChatMessage = { id: cmid, role: "user", text: "⏰ 定时续跑", ts: 1, _source: "server" };
+    const liveAgent: ChatMessage = {
+      id: "live-agent",
+      role: "agent-group",
+      text: "Call Grok native image_gen test",
+      ts: 3,
+      _clientMessageId: cmid,
+      blockId,
+      toolName: "Agent",
+      output: errorBody,
+      error: true,
+      _isError: true,
+      _completed: true,
+      childBlocks: [],
+    };
+    const tapeIncomplete: ChatMessage = {
+      id: "srv-web-t6-tool-call_6cb99a5601424ec7ac79c8ab",
+      role: "tool",
+      text: "",
+      ts: 3,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+      blockId,
+      toolName: "Agent",
+      output: "",
+      _partial: true,
+      _completed: false,
+    };
+    const tapeBash: ChatMessage = {
+      id: "tape-bash",
+      role: "tool",
+      text: "",
+      ts: 2,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+      blockId: "call_bash",
+      toolName: "Bash",
+      output: "ok",
+      _completed: true,
+    };
+    const tapeAssistant: ChatMessage = {
+      id: "tape-as",
+      role: "assistant",
+      text: "核验完成",
+      ts: 5,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+    };
+    expect(isIncompleteDurableToolRow(tapeIncomplete)).toBe(true);
+    const merged = mergeFullServerWins(
+      [user, tapeBash, tapeIncomplete, tapeAssistant],
+      [user, liveAgent],
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    const sameIdentity = merged.filter((m) => m.blockId === blockId);
+    expect(sameIdentity).toHaveLength(1);
+    expect(sameIdentity[0]?.role).toBe("agent-group");
+    expect(sameIdentity[0]?.output).toMatch(/MODEL_NOT_AVAILABLE/);
+    expect(merged.some((m) => m.id === "srv-web-t6-tool-call_6cb99a5601424ec7ac79c8ab")).toBe(false);
+    expect(coalesceProcessIdentities([liveAgent, tapeIncomplete]).filter((m) => m.blockId === blockId)).toHaveLength(1);
+  });
+
+  test("incomplete tape tool is dropped when live 403 tool has the same identity", () => {
+    const cmid = "u-tool-403";
+    const blockId = "call_bash_403";
+    const liveTool: ChatMessage = {
+      id: "live-tool",
+      role: "tool",
+      text: "",
+      ts: 3,
+      _clientMessageId: cmid,
+      blockId,
+      toolName: "Bash",
+      output: "Failed to authenticate. API Error: 403",
+      error: true,
+      _completed: true,
+    };
+    const tapeIncomplete: ChatMessage = {
+      id: "tape-partial",
+      role: "tool",
+      text: "",
+      ts: 3,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+      blockId,
+      toolName: "Bash",
+      output: "",
+      _partial: true,
+      _completed: false,
+    };
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1, _source: "server" };
+    const tapeAssistant: ChatMessage = {
+      id: "tape-as",
+      role: "assistant",
+      text: "done",
+      ts: 5,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+    };
+    const merged = mergeFullServerWins(
+      [user, tapeIncomplete, tapeAssistant],
+      [user, liveTool],
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    const same = merged.filter((m) => m.blockId === blockId);
+    expect(same).toHaveLength(1);
+    expect(same[0]?.id).toBe("live-tool");
+    expect(same[0]?.output).toMatch(/403/);
   });
 
   test("Phase-B exact assistant without thinking/tool keeps live thinking/tool", () => {

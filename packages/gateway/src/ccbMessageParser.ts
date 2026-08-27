@@ -376,6 +376,8 @@ export class CcbMessageParser {
         ?? 'unknown'
       const partialInputJson = streamed?.partialJson
       const meta = this.toolUseMeta.get(toolUseId)
+      const streamedDone = streamed?.done === true
+      if (streamedDone && !pending && !transient) continue
       snapshots.push(_snapshotToolEntry({
         toolUseId,
         blockId: toolUseId,
@@ -1387,58 +1389,31 @@ export class CcbMessageParser {
           const pending = this.pendingToolUses.get(useId)
           if (pending) this.pendingToolUses.delete(useId)
           const transient = this.transientToolSnapshots.get(useId)
-          // V3 v7.1 — exclude the `Agent` tool from the durable server-authored
-          // TOOL snapshot. The web client renders Agent tools as
-          // `role: 'agent-group'` cards owning a `childBlocks` tree (subagent
-          // text / thinking / tool_use), not a flat `role: 'tool'` row.
-          // Persisting them as `srv-*-tool-*` rows server-side would (a)
-          // duplicate the agent card after refresh (server tool row coexists
-          // with client `m-* agent-group`), (b) fight back through the id-level
-          // takeover (role mismatch → server wins, blowing away the childBlocks
-          // tree — the 2c73030d incident). This exclusion STAYS.
-          //
-          // P2 债A (team-card server-authored化) does NOT change this: team
-          // cards get their own dedicated durable channel — a `role:
-          // 'agent-group'` server row written by master from the
-          // `V3MasterSinkWirePayload.agentGroups[]`载荷 (generated at
-          // handleDelegateTask 收尾, buffered on the leader session, drained by
-          // persistServerAuthoredTurn). That row uses a distinct
-          // `srv-*-agentgroup-${runId}` id and merges **local-wins** by
-          // `_delegateRunId` (storage mergePreservingServerAuthored), so it
-          // never collides with, nor swallows the childBlocks of, the client
-          // `m-*` agent-group row. Routing Agent tools through THIS tool
-          // snapshot would reintroduce the exact 2c73030d double-card / tree-
-          // swallow fault, hence the exclusion is intentional and permanent.
-          // Regex match is case-insensitive to mirror the web side's
-          // `/^Agent$/i.test(...)` discriminator and stay aligned if CCB
-          // ever varies the casing.
-          if (!/^Agent$/i.test(toolName || '')) {
-            // Fix B (2026-05-25): preserve `ts` as tool_result completion
-            // time (legacy semantic — existing master schema treats it as
-            // a free-form field and ignores it for tool row ts decisions),
-            // and emit a NEW `arrivedAt` field for the tool CARD APPEARANCE
-            // time stamped in `_markToolBoundary`. Master priority chain
-            // `arrivedAt ?? offset` then uses arrivedAt when present,
-            // falling back to the historical computed offset when absent
-            // (pre-Fix-B gateway). Plan §3.5.4.
-            const arrivedAt = this.toolArrivedAt.get(useId) ?? Date.now()
-            this.completedTools.push(
-              _snapshotToolEntry({
-                toolUseId: useId,
-                blockId: useId,
-                toolName,
-                inputJson: pending?.inputJson ?? transient?.inputJson ?? {},
-                inputPreview: pending?.inputPreview ?? transient?.inputPreview ?? '',
-                output: fullOutput,
-                outputJson: previewRaw,
-                isError: !!c.is_error,
-                durationMs,
-                ts: Date.now(),
-                arrivedAt,
-                eventOrdinal: this.toolEventOrdinal.get(useId),
-              }),
-            )
-          }
+          this.streamingToolUses.delete(useId)
+          // Agent/Task results MUST land in completedTools. The 2026-05 v7.1
+          // exclusion left Agent in streaming/pending, so snapshotToolsForPersistence
+          // wrote a partial empty role=tool row; tape projection then hid the live
+          // 403 card (webmtbs84bpm104yg). Subagent tools (parentToolUseId) stay
+          // excluded above. Client agent-group cards merge local-wins by
+          // `_delegateRunId` and do not collide with this completed snapshot.
+          const arrivedAt = this.toolArrivedAt.get(useId) ?? Date.now()
+          this.completedTools.push(
+            _snapshotToolEntry({
+              toolUseId: useId,
+              blockId: useId,
+              toolName,
+              inputJson: pending?.inputJson ?? transient?.inputJson ?? {},
+              inputPreview: pending?.inputPreview ?? transient?.inputPreview ?? '',
+              output: fullOutput,
+              outputJson: previewRaw,
+              completed: true,
+              isError: !!c.is_error,
+              durationMs,
+              ts: Date.now(),
+              arrivedAt,
+              eventOrdinal: this.toolEventOrdinal.get(useId),
+            }),
+          )
           this.transientToolSnapshots.delete(useId)
           if (this.onToolResult) {
             const exitCode = isToolExitCode(c.exit_code) ? c.exit_code : undefined
