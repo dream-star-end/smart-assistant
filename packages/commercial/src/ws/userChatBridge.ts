@@ -42,6 +42,7 @@ import { randomUUID, randomBytes } from "node:crypto";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { Pool } from "pg";
 import { isCursorCredentialMember } from "../cursor/access.js";
+import { getClientSession } from "@openclaude/storage";
 
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
@@ -1541,11 +1542,15 @@ export function resolveCronOriginAdmitModel(
 export async function executeCronOriginInject(opts: {
   input: CronOriginInjectInput
   pgPool?: UserChatBridgeDeps["pgPool"]
+  lookupSessionModel?: (
+    sessionId: string,
+    sessionUserId: string,
+  ) => Promise<string | null | undefined>
   admitUserTurn: NonNullable<UserChatBridgeDeps["admitUserTurn"]>
   executor: CronOriginExecutor
   log?: Logger
 }): Promise<CronOriginInjectResult> {
-  const { input, pgPool, admitUserTurn, executor, log } = opts;
+  const { input, pgPool, lookupSessionModel, admitUserTurn, executor, log } = opts;
   if (!isClientMessageId(input.clientMessageId) || input.sessionId.trim() === "" || input.text.trim() === "") {
     return { kind: "failed", reason: "invalid_payload" };
   }
@@ -1553,22 +1558,22 @@ export async function executeCronOriginInject(opts: {
   const requestHash = computeDispatchRequestHash(content);
   const sessionUserId = "c:" + input.uid.toString();
   let originModel: string | null = null;
-  if (pgPool) {
-    try {
-      const row = await pgPool.query<{ model_id: string | null }>(
-        `SELECT model_id FROM client_sessions
-          WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-          LIMIT 1`,
-        [input.sessionId, sessionUserId],
-      );
-      originModel = resolveCronOriginAdmitModel(row.rows[0]?.model_id);
-    } catch (err) {
-      log?.warn("user-chat-bridge: cron origin session model lookup failed", {
-        uid: input.uid.toString(),
-        sessionId: input.sessionId,
-        err,
-      });
+  try {
+    let raw: string | null | undefined;
+    if (lookupSessionModel) {
+      raw = await lookupSessionModel(input.sessionId, sessionUserId);
+    } else if (pgPool) {
+      // Commercial path: go through the sessions backend, not a raw six-table SQL.
+      const session = await getClientSession(input.sessionId, sessionUserId);
+      raw = session?.modelId;
     }
+    originModel = resolveCronOriginAdmitModel(raw);
+  } catch (err) {
+    log?.warn("user-chat-bridge: cron origin session model lookup failed", {
+      uid: input.uid.toString(),
+      sessionId: input.sessionId,
+      err,
+    });
   }
   const message = {
     id: input.clientMessageId,
