@@ -4,7 +4,7 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
@@ -1444,6 +1444,176 @@ export function usableCursorResumeId(opts: {
     }
   }
   return undefined
+}
+
+export function cursorResumeStoreDir(workspacePath: string, sessionId: string): string {
+  return dirname(cursorResumeStorePath(workspacePath, sessionId))
+}
+
+const CURSOR_RESUME_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const WEBCHAT_DM_SESSION_RE = /:webchat:dm:([A-Za-z0-9_-]{8,50})$/
+
+export function webChatSessionIdFromSessionKey(sessionKey: string): string | undefined {
+  return WEBCHAT_DM_SESSION_RE.exec(sessionKey)?.[1]
+}
+
+/** isolated_v1 未绑项目时的 spawn cwd:`$OPENCLAUDE_DEFAULT_WORKSPACE/sessions/<webSessionId>`。 */
+export function isolatedSessionWorkspaceCandidate(
+  webSessionId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const ws = env.OPENCLAUDE_DEFAULT_WORKSPACE?.trim()
+  if (!ws) return undefined
+  if (!/^[A-Za-z0-9_-]{8,50}$/.test(webSessionId)) return undefined
+  return join(ws, 'sessions', webSessionId)
+}
+
+function cursorStoreDbReady(storePath: string): boolean {
+  try {
+    return statSync(storePath).isFile()
+  } catch {
+    return false
+  }
+}
+
+function copyDirRecursive(src: string, dest: string): void {
+  mkdirSync(dest, { recursive: true, mode: 0o700 })
+  for (const ent of readdirSync(src, { withFileTypes: true })) {
+    const from = join(src, ent.name)
+    const to = join(dest, ent.name)
+    if (ent.isDirectory()) copyDirRecursive(from, to)
+    else copyFileSync(from, to)
+  }
+}
+
+function findCursorResumeStoreElsewhere(sessionId: string, currentDir: string): string | undefined {
+  let root: string
+  try {
+    root = cursorChatsRoot()
+  } catch {
+    return undefined
+  }
+  let hashes: string[]
+  try {
+    hashes = readdirSync(root)
+  } catch {
+    return undefined
+  }
+  const currentResolved = resolve(currentDir)
+  let best: { dir: string; mtime: number } | undefined
+  for (const hash of hashes) {
+    if (!/^[0-9a-f]{32}$/.test(hash)) continue
+    const dir = join(root, hash, sessionId)
+    if (resolve(dir) === currentResolved) continue
+    const store = join(dir, 'store.db')
+    if (!cursorStoreDbReady(store)) continue
+    let mtime = 0
+    try {
+      mtime = statSync(store).mtimeMs
+    } catch {
+      /* keep 0 */
+    }
+    if (!best || mtime >= best.mtime) best = { dir, mtime }
+  }
+  return best?.dir
+}
+
+/**
+ * Cursor CLI 把 store 键在 chats/<md5(path.resolve(workspace))>/<id>/。
+ * isolated_v1 次轮绑上默认项目后 spawn cwd 从 sessions/<id> 变成 workspace 根,
+ * 旧 store 仍在旧哈希目录。查不到当前哈希时把整目录迁过来再 --resume。
+ * 任何失败返回 undefined,调用方维持历史回放;不得抛错打断回合。
+ */
+export function relocateCursorResumeStore(opts: {
+  resumeId: string
+  currentWorkspacePath: string
+  previousWorkspacePaths?: Array<string | null | undefined>
+  sessionKey?: string
+  env?: NodeJS.ProcessEnv
+}): { resumeId: string; relocated: boolean } | undefined {
+  try {
+    const resumeId = opts.resumeId.trim()
+    const currentWorkspacePath = opts.currentWorkspacePath.trim()
+    if (!CURSOR_RESUME_ID_RE.test(resumeId) || !currentWorkspacePath) return undefined
+    if (cursorResumeStoreExists(currentWorkspacePath, resumeId)) {
+      return { resumeId, relocated: false }
+    }
+
+    const destDir = cursorResumeStoreDir(currentWorkspacePath, resumeId)
+    const destStore = join(destDir, 'store.db')
+    if (existsSync(destDir)) {
+      return cursorStoreDbReady(destStore) ? { resumeId, relocated: false } : undefined
+    }
+
+    const env = opts.env ?? process.env
+    const candidates: Array<string | null | undefined> = [...(opts.previousWorkspacePaths ?? [])]
+    const webId =
+      typeof opts.sessionKey === 'string' ? webChatSessionIdFromSessionKey(opts.sessionKey) : undefined
+    if (webId) candidates.push(isolatedSessionWorkspaceCandidate(webId, env))
+
+    let srcDir: string | undefined
+    const seen = new Set<string>()
+    for (const raw of candidates) {
+      if (typeof raw !== 'string') continue
+      const prev = raw.trim()
+      if (!prev) continue
+      const key = resolve(prev)
+      if (seen.has(key) || key === resolve(currentWorkspacePath)) continue
+      seen.add(key)
+      if (!cursorResumeStoreExists(prev, resumeId)) continue
+      srcDir = cursorResumeStoreDir(prev, resumeId)
+      break
+    }
+    if (!srcDir) srcDir = findCursorResumeStoreElsewhere(resumeId, destDir)
+    if (!srcDir) return undefined
+    if (resolve(srcDir) === resolve(destDir)) {
+      return cursorStoreDbReady(destStore) ? { resumeId, relocated: false } : undefined
+    }
+    if (!cursorStoreDbReady(join(srcDir, 'store.db'))) return undefined
+
+    try {
+      mkdirSync(dirname(destDir), { recursive: true, mode: 0o700 })
+    } catch (err) {
+      log.warn('Cursor resume store dest parent create failed', { resumeId, destDir, err: String(err) })
+      return undefined
+    }
+
+    try {
+      renameSync(srcDir, destDir)
+      if (cursorStoreDbReady(destStore)) return { resumeId, relocated: true }
+    } catch (renameErr) {
+      if (existsSync(destDir) && cursorStoreDbReady(destStore)) {
+        return { resumeId, relocated: false }
+      }
+      if (existsSync(destDir)) return undefined
+      try {
+        copyDirRecursive(srcDir, destDir)
+        if (!cursorStoreDbReady(destStore)) {
+          try { rmSync(destDir, { recursive: true, force: true }) } catch { /* ignore */ }
+          return undefined
+        }
+        try {
+          rmSync(srcDir, { recursive: true, force: true })
+        } catch {
+          log.warn('Cursor resume store old dir cleanup failed', { resumeId, srcDir })
+        }
+        return { resumeId, relocated: true }
+      } catch (copyErr) {
+        log.warn('Cursor resume store relocate failed', {
+          resumeId,
+          srcDir,
+          destDir,
+          renameErr: String(renameErr),
+          copyErr: String(copyErr),
+        })
+        return undefined
+      }
+    }
+    return undefined
+  } catch (err) {
+    log.warn('Cursor resume store relocate threw', { err: String(err) })
+    return undefined
+  }
 }
 
 export class CursorAdapter extends EventEmitter implements EngineAdapter {
