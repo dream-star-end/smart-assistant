@@ -1939,7 +1939,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T53 persist 后用户气泡只显示原文，不含论文任务系统提示"
+          "assertion": "T50 persist 后用户气泡只显示原文，不含论文任务系统提示"
         }
       ]
     },
@@ -1968,7 +1968,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T54 Weibo 错误码提示重新扫码且图文失败建议纯文字"
+          "assertion": "T51 Weibo 错误码提示重新扫码且图文失败建议纯文字"
         },
         {
           "layer": "unit",

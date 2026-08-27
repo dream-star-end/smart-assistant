@@ -939,7 +939,7 @@ async function expandPaintAnchorWindow() {
   return page.evaluate(() => window.__paintAnchor.snapshot().windowCount);
 }
 
-await check("T49 follow→unfollow 画窗从尾窗切换时锚点不跳", async () => {
+await check("T52 follow→unfollow 画窗从尾窗切换时锚点不跳", async () => {
   await page.evaluate(() => window.__mountPaintProbes());
   const root = page.locator("#timeline-paint-anchor-root .timeline-scroll-probe");
   await root.waitFor({ state: "visible", timeout: 3000 });
@@ -985,7 +985,7 @@ await check("T49 follow→unfollow 画窗从尾窗切换时锚点不跳", async 
   }
 });
 
-await check("T50 继续上滑画窗滑动时锚点不跳", async () => {
+await check("T53 继续上滑画窗滑动时锚点不跳", async () => {
   await page.evaluate(() => window.__mountPaintProbes());
   const root = page.locator("#timeline-paint-anchor-root .timeline-scroll-probe");
   await root.waitFor({ state: "visible", timeout: 3000 });
@@ -1032,7 +1032,7 @@ await check("T50 继续上滑画窗滑动时锚点不跳", async () => {
   }
 });
 
-await check("T51 短会话滚入时 200px 估高变真实高度不把内容推底", async () => {
+await check("T54 短会话滚入时 200px 估高变真实高度不把内容推底", async () => {
   await page.evaluate(() => window.__mountPaintProbes());
   const root = page.locator("#timeline-estimate-anchor-root .timeline-scroll-probe");
   await root.waitFor({ state: "visible", timeout: 3000 });
@@ -2714,7 +2714,7 @@ await check("T45 中断 turn 刷新后仍显示 requestId/积分，空窗给出�
   }
 });
 
-await check("T52 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划", async () => {
+await check("T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runPhaseAEmptyUnitsReset());
   if (JSON.stringify(result.roles) !== JSON.stringify(["user", "thinking", "tool", "plan", "assistant"])) {
     throw new Error(`Phase-A empty units reset 丢过程行:${JSON.stringify(result)}`);
@@ -2737,7 +2737,7 @@ await check("T52 Phase-A unpublished 后空 live-units reset 仍保留思考/工
   });
 });
 
-await check("T53 persist 后用户气泡只显示原文，不含论文任务系统提示", async () => {
+await check("T50 persist 后用户气泡只显示原文，不含论文任务系统提示", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runPaperHintUserBubble());
   if (result.text !== "CRISPR 论文") {
     throw new Error(`用户行 text 不是原文:${JSON.stringify(result)}`);
@@ -2752,7 +2752,7 @@ await check("T53 persist 后用户气泡只显示原文，不含论文任务系�
   }
 });
 
-await check("T54 Weibo 错误码提示重新扫码且图文失败建议纯文字", async () => {
+await check("T51 Weibo 错误码提示重新扫码且图文失败建议纯文字", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runWeiboErrorGuidance());
   if (!result.actionFailed.includes("重新扫码")) {
     throw new Error(`WEIBO_ACTION_FAILED 未提示重新扫码:${JSON.stringify(result)}`);
