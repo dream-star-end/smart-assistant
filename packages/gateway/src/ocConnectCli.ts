@@ -430,6 +430,11 @@ function formatCallResponse(
       const parts = [`该操作已处理（replay）。状态=${status}`]
       if (resp.errorCode) parts.push(`错误码=${String(resp.errorCode)}`)
       if (resp.resultDigest) parts.push(`结果摘要=${String(resp.resultDigest)}`)
+      if (strOrUndef(resp.message)) parts.push(`说明=${String(resp.message)}`)
+      if (strOrUndef(resp.retrySafe)) parts.push(`retrySafe=${String(resp.retrySafe)}`)
+      if (resp.requiresReauth === true) parts.push('requiresReauth=true')
+      if (strOrUndef(resp.sideEffect)) parts.push(`sideEffect=${String(resp.sideEffect)}`)
+      if (strOrUndef(resp.nextAction)) parts.push(`下一步=${String(resp.nextAction)}`)
       // 不承诺原结果;仅 succeeded 视为成功退出。
       return {
         exitCode: status === 'succeeded' ? 0 : 1,
@@ -439,7 +444,16 @@ function formatCallResponse(
     }
     case 'error': {
       const code = strOrUndef(resp.code) || 'CONNECTOR_ERROR'
-      return { exitCode: 1, stdout: '', stderr: `${surface.program}: ${code}\n` }
+      const lines = [`${surface.program}: ${code}`]
+      if (strOrUndef(resp.message)) lines.push(String(resp.message))
+      const flags = [
+        strOrUndef(resp.retrySafe) ? `retrySafe=${String(resp.retrySafe)}` : null,
+        resp.requiresReauth === true ? 'requiresReauth=true' : null,
+        strOrUndef(resp.sideEffect) ? `sideEffect=${String(resp.sideEffect)}` : null,
+      ].filter(Boolean)
+      if (flags.length) lines.push(flags.join(' '))
+      if (strOrUndef(resp.nextAction)) lines.push(`nextAction: ${String(resp.nextAction)}`)
+      return { exitCode: 1, stdout: '', stderr: `${lines.join('\n')}\n` }
     }
     default:
       return {

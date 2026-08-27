@@ -7,6 +7,7 @@ import { signAccess } from '../auth/jwt.js'
 import { PluginAccountError } from '../plugins/accounts.js'
 import { KnowledgePlanetSetupError } from '../plugins/knowledgePlanetSetup.js'
 import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
+import { WeiboSetupError } from '../plugins/weiboSetup.js'
 import { dispatchPluginsRoute } from './plugins.js'
 import { HttpError } from './util.js'
 
@@ -611,6 +612,34 @@ describe('Plugin management HTTP dispatcher', () => {
         ),
         (error: unknown) => error instanceof HttpError && error.status === 400,
       )
+  })
+
+  test('Weibo setup UNAVAILABLE stays a generic 503 and keeps pin details off the public message', async () => {
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('POST', '/api/plugins/weibo/setup', { acceptTerms: true }),
+        response(),
+        ctx,
+        deps({
+          weiboSetup: {
+            start: async () => {
+              throw new WeiboSetupError('UNAVAILABLE', 'official Plugin trust pin mismatch')
+            },
+          },
+        }),
+      ),
+      (error: unknown) => {
+        if (!(error instanceof HttpError)) return false
+        assert.equal(error.status, 503)
+        assert.equal(error.code, 'PLUGIN_RUNTIME_UNAVAILABLE')
+        assert.equal(error.message, 'Plugin runtime unavailable')
+        assert.equal(error.logMessage, 'official Plugin trust pin mismatch')
+        assert.equal(error.retrySafe, 'yes')
+        assert.match(String(error.nextAction), /管理员/)
+        assert.doesNotMatch(error.message, /pin|hash|mismatch/i)
+        return true
+      },
+    )
   })
 
   test('setup worker saturation is a stable retryable 429', async () => {

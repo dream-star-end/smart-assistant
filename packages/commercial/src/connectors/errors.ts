@@ -54,10 +54,10 @@ export type ConnectorErrorCode =
  * **绝不**把上游原文/凭据放进来。用户/容器看到的永远只有 code。
  */
 export class ConnectorError extends Error {
-  readonly code: ConnectorErrorCode
+  readonly code: ConnectorErrorCode | string
   /** 对应的用户 HTTP 状态(容器 RPC 侧只用 code,不用它)。 */
   readonly httpStatus: number
-  constructor(code: ConnectorErrorCode, message?: string, httpStatus?: number) {
+  constructor(code: ConnectorErrorCode | string, message?: string, httpStatus?: number) {
     super(message ?? code)
     this.name = 'ConnectorError'
     this.code = code
@@ -65,7 +65,7 @@ export class ConnectorError extends Error {
   }
 }
 
-function defaultHttpStatus(code: ConnectorErrorCode): number {
+function defaultHttpStatus(code: ConnectorErrorCode | string): number {
   switch (code) {
     case 'BAD_REQUEST':
     case 'VALIDATION_FAILED':

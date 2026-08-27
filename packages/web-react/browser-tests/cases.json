@@ -201,6 +201,10 @@
     {
       "id": "T50",
       "proves": "真 Chromium 中 persist 后的用户气泡只渲染 displayText/原文，_modelText 里的【OpenClaude 论文任务系统提示】不出现在用户气泡"
+    },
+    {
+      "id": "T51",
+      "proves": "真 Chromium 中微博错误码文案提示重新扫码，图文失败建议改纯文字发布"
     }
   ]
 }
