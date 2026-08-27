@@ -1135,3 +1135,35 @@ describe('CronScheduler origin-session resume', () => {
     assert.equal(job.enabled, false)
   })
 })
+
+describe('CronScheduler deliver 通道校验与注册表对齐', () => {
+  it('rejects unknown adapter names until they are registered', async () => {
+    if (existsSync(paths.cronYaml)) unlinkSync(paths.cronYaml)
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      { getOrCreate: async () => ({}), submit: async () => {}, destroySession: async () => {} } as any,
+      async () => {},
+    )
+    const job = {
+      id: 'remind-deliver-1',
+      schedule: '0 9 * * *',
+      agent: 'main',
+      prompt: 'p',
+      deliver: 'telegram',
+      enabled: true,
+    } as any
+    await assert.rejects(
+      () => sched.addJob(job),
+      /Invalid deliver "telegram"/,
+    )
+    sched.getRegisteredDeliverChannels = () => ['telegram']
+    await sched.addJob(job)
+    await assert.rejects(
+      () => sched.updateJob(job.id, { deliver: 'discord' }),
+      /Invalid deliver "discord"/,
+    )
+    await sched.updateJob(job.id, { deliver: 'webchat' })
+    const listed = await sched.listJobs()
+    assert.equal(listed.find((j) => j.id === job.id)?.deliver, 'webchat')
+  })
+})

@@ -278,12 +278,11 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
 import {
   CronScheduler,
-  cronDeliveryId,
-  deliverCronViaAdapter,
-  isUserInitiatedCronJob,
   type CronDeliveryContext,
   type CronJob,
 } from './cron.js'
+import { listCronDeliverChannels } from './cronChannels.js'
+import { deliverCronOutput, type CronDeliverDeps } from './cronDeliver.js'
 import {
   buildCronOriginResumeText,
   cronOriginClientMessageId,
@@ -2742,156 +2741,21 @@ export class Gateway {
     const wechatProactiveCfg = readV3WechatProactiveConfig()
     const qqProactiveCfg = readV3QqProactiveConfig()
     this.cron = new CronScheduler(config, this.sessions, async (text, job, delivery) => {
-      const agentId = job.agent
-      const stableDeliveryId = delivery?.deliveryId ?? cronDeliveryId(
-        `${job.id}:${text}`,
-        Math.floor(Date.now() / 60_000),
-      )
-      // ── 根治:主动微信投递(定时任务/提醒推送到微信)──
-      // 对所有用户发起的提醒/定时任务(remind-/ccb-/未来入口),排除系统 heartbeat/reflection
-      // (见 isUserInitiatedCronJob —— 反向排除系统,避免白名单漏掉 remind- 这类入口)。
-      // master 权威解析收件人(senderId = binding.loginUserId)+ 偏好 + context_token;
-      // 据结果决定:微信接管→不重复 web;绑定但会话过期→回退 web 并标注;其它→正常 web。
-      // 刻意不读 lastActiveChannel(其纯内存、重启即失、微信条目永不恢复)。
-      let deliverText = text
-      if (qqProactiveCfg && isUserInitiatedCronJob(job)) {
-        const result = await sendV3QqProactive({
-          config: qqProactiveCfg,
-          text,
-          outboundId: stableDeliveryId,
-        })
-        if (result.kind === 'delivered') return
-        if (result.kind === 'failure' && result.retryable) {
-          throw Object.assign(new Error(result.code), {
-            code: result.code,
-            retryable: true,
-          })
-        }
-      }
-      if (wechatProactiveCfg && isUserInitiatedCronJob(job)) {
-        const result = await sendV3WechatProactive({
-          config: wechatProactiveCfg,
-          text,
-          // Scheduler-owned occurrence key survives delayed outbox retries;
-          // master outbox UNIQUE makes an ACK-lost POST idempotent.
-          outboundId: stableDeliveryId,
-        })
-        if (result.kind === 'delivered') return
-        if (result.kind === 'failure' && result.retryable) {
-          throw Object.assign(new Error(result.code), {
-            code: result.code,
-            retryable: true,
-          })
-        }
-        // A permanent 4xx rejection proves master did not accept this
-        // occurrence, so continuing to web/inbox cannot duplicate a WeChat
-        // delivery. Ambiguous transport/5xx/invalid-response failures above
-        // must instead retain the cron outbox and retry the same delivery id.
-        if (result.kind === 'fallback' && result.marked) {
-          deliverText = `⚠️ 微信因会话过期/未激活未送达(发条微信即可恢复推送)\n\n${text}`
-        }
-      }
-      const lastActive = this.lastActiveChannel.get(agentId)
-      const icon =
-        job.id === 'heartbeat'
-          ? '💓'
-          : job.id.includes('skill')
-            ? '🛠'
-            : job.id.startsWith('remind')
-              ? '⏰'
-              : '🪞'
-
-      // Build outbound message — use last active session if available
-      // Include cronJob metadata so frontend can visually distinguish system pushes
-      const buildOut = (peerId: string, sessionKey?: string) => ({
-        type: 'outbound.message' as const,
-        sessionKey: sessionKey || `agent:${agentId}:cron:dm:${job.id}`,
-        channel: 'webchat' as const,
-        peer: { id: peerId, kind: 'dm' as const },
-        blocks: [{ kind: 'text' as const, text: `${icon} ${job.label || job.id}\n\n${deliverText}` }],
-        isFinal: true,
-        cronJob: { id: job.id, heartbeat: !!job.heartbeat, label: job.label || job.id },
+      await deliverCronOutput(text, job, delivery, {
+        lastActiveChannel: this.lastActiveChannel,
+        clientsByPeer: this.clientsByPeer as CronDeliverDeps['clientsByPeer'],
+        channels: this.channels as CronDeliverDeps['channels'],
+        deliver: (msg) => this.deliver(msg as OutboundMessage),
+        makePeerKey: (userId, channel, peerId) => Gateway.makePeerKey(userId, channel, peerId),
+        qqProactiveCfg,
+        wechatProactiveCfg,
+        sendQqProactive: sendV3QqProactive,
+        sendWechatProactive: sendV3WechatProactive,
+        postInboxDurable: postInboxMessageDurable,
       })
-
-      let delivered = false
-
-      // 1. Push to last active channel + session (within 24h)
-      if (lastActive && Date.now() - lastActive.at < 24 * 3600_000) {
-        if (lastActive.channel === 'webchat') {
-          const peerKey = Gateway.makePeerKey(lastActive.userId, 'webchat', lastActive.peerId)
-          const set = this.clientsByPeer.get(peerKey)
-          if (set && set.size > 0) {
-            // Route through deliver() to preserve the "all WebChat
-            // outbound.message frames carry ts" invariant the client-side
-            // stale-final guard relies on. buildOut includes a `cronJob`
-            // marker field that OutboundMessage schema doesn't declare,
-            // hence the cast — the wire format tolerates extra keys.
-            // Stamp userId so deliver() routes to the correct per-user peerKey.
-            const cronOut = {
-              ...buildOut(lastActive.peerId, lastActive.sessionKey),
-              _userId: lastActive.userId,
-            }
-            this.deliver(cronOut as OutboundMessage)
-            delivered = true
-          }
-        }
-        // Try Telegram / other channel adapter
-        if (!delivered) {
-          const adapter = this.channels.get(lastActive.channel)
-          if (adapter) {
-            await deliverCronViaAdapter(adapter, buildOut(lastActive.peerId, lastActive.sessionKey))
-            delivered = true
-          }
-        }
-      }
-
-      // 2. Try explicit deliver target
-      if (!delivered && job.deliver && job.deliver !== 'local') {
-        const adapter = this.channels.get(job.deliver)
-        if (adapter) {
-          await deliverCronViaAdapter(adapter, buildOut(job.deliverTarget?.peerId || '__cron__'))
-          delivered = true
-        }
-      }
-
-      // 3. Fallback: broadcast to all connected webchat clients.
-      // This path can't use deliver() (which is scoped to a single peerKey) —
-      // inline the ts stamp so the client's stale-final/ts-guard invariant
-      // stays intact here too. Count actual sends so we can tell "reached an
-      // online client" from "landed nowhere" for the inbox fallback below.
-      let broadcastSent = 0
-      if (!delivered) {
-        const data = JSON.stringify({
-          ...buildOut('__reflection__'),
-          ts: Date.now(),
-        })
-        for (const set of this.clientsByPeer.values()) {
-          for (const ws of set) {
-            try {
-              ws.send(data)
-              broadcastSent++
-            } catch {}
-          }
-        }
-      }
-
-      // 4. Offline-delivery inbox fallback (commercial only; no-op without master
-      // env). Reaching here means WeChat proactive did NOT take over (that path
-      // returns early on `delivered`). If nothing reached the user online either
-      // — no last-active/target adapter delivery AND the broadcast hit zero
-      // clients — persist the output as a station inbox message so it isn't
-      // silently lost while the user is away. We suppress it whenever ANY channel
-      // delivered (delivered===true) to honor the "don't double-notify" UX rule;
-      // bodyMd is the raw output, not the wechat-fallback-prefixed text.
-      if (!delivered && broadcastSent === 0) {
-        await postInboxMessageDurable({
-          title: job.label || 'AI定时任务结果',
-          bodyMd: text,
-          deliveryKey: stableDeliveryId,
-        })
-      }
     }, (job, delivery) => this.injectCronOriginSession(job, delivery))
     this.cron.lastActiveChannel = this.lastActiveChannel
+    this.cron.getRegisteredDeliverChannels = () => this.channels.keys()
     this.cron.start().catch((err) => this.log.error('cron start failed', undefined, err))
 
     // Start event persistence (writes all events to SQLite event_log)
@@ -5659,6 +5523,11 @@ export class Gateway {
       return
     }
     // ── Cron/reminder REST API ──
+    // /api/cron/channels 必须写在 :id 匹配之前,否则会被当成 job id「channels」。
+    if (url.pathname === '/api/cron/channels') {
+      this.handleCronChannels(req, res).catch((err) => this.sendInternalError(res, err))
+      return
+    }
     if (url.pathname === '/api/cron') {
       this.handleCronApi(req, res).catch((err) => this.sendInternalError(res, err))
       return
@@ -12223,6 +12092,11 @@ export class Gateway {
   }
 
   // ── Cron/Reminder API handlers ──
+  private async handleCronChannels(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    this.sendJson(res, 200, { channels: listCronDeliverChannels(this.channels.keys()) })
+  }
+
   private async handleCronApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
     if (req.method === 'GET') {
@@ -18631,7 +18505,7 @@ const KNOWN_ROUTES = [
   '/api/runs', '/api/sessions', '/api/sessions/list', '/api/sessions/search', '/api/sessions/batch',
   '/api/sessions/read-all',
   '/api/chat-projects', '/api/project-assets', '/api/config', '/api/agents', '/api/search',
-  '/api/cron', '/api/board', '/api/board/projects', '/api/board/tickets',
+  '/api/cron', '/api/cron/channels', '/api/board', '/api/board/projects', '/api/board/tickets',
   '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
   '/api/board/stats/cost', '/api/board/templates', '/api/board/reports/weekly',
   '/api/delegate/wait', '/api/tasks', '/api/tasks-executions', '/api/webhooks',

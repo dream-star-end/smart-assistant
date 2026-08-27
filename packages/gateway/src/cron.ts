@@ -8,7 +8,7 @@
 //       agent: main                    # which agent runs it
 //       prompt: |
 //         回顾最近 24 小时所有对话...
-//       deliver: local                 # local | webchat | telegram
+//       deliver: local                 # local | webchat | registered adapter name
 //       deliverTarget: {}              # optional { channel, peerId } for non-local
 //
 // The scheduler runs every 60 seconds. If the current minute matches a cron
@@ -48,6 +48,10 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { createLogger } from './logger.js'
 import type { SessionManager } from './sessionManager.js'
 import { isHiddenSystemAgentId } from './agentVisibility.js'
+import {
+  isAllowedCronDeliverValue,
+  type CronDeliverValue,
+} from './cronChannels.js'
 // 引擎 API 错误识别的单一权威(delegate 输出错误同款):CCB 把上游失败以
 // "API Error: …" 文本块流出而不抛,cron 侧必须把这类"产出"当失败而非结果。
 import { classifyDelegateOutputError } from './errorClassify.js'
@@ -73,6 +77,8 @@ import type { V3WechatOutboundConfig } from './v3WechatOutbound.js'
 import {
   type CronOriginFireResult,
 } from './cronOriginSession.js'
+
+export type { CronDeliverValue }
 
 const logger = createLogger({ module: 'cron' })
 
@@ -406,7 +412,7 @@ export interface CronJob {
   schedule: string
   agent: string
   prompt: string
-  deliver?: 'local' | 'webchat' | 'telegram'
+  deliver?: CronDeliverValue
   deliverTarget?: { channel?: string; peerId?: string }
   enabled?: boolean
   oneshot?: boolean // fire once then auto-disable
@@ -1041,6 +1047,11 @@ export class CronScheduler {
    *  the fire-and-forget send resolves): a dropped push is recovered by master's
    *  periodic rescan, so we trade at-least-once for far fewer POSTs. */
   private lastCronIndex: CronIndexPayload | null = null
+  /**
+   * 与 Gateway.channels 同一权威来源。未接线时只接受 local/webchat
+   * (内建通道),避免测试与个人版无 adapter 时误拒。
+   */
+  public getRegisteredDeliverChannels: () => Iterable<string> = () => []
   /** job.id → 连续「余额不足」失败次数(内存态,容器重启清零 —— 失败仍在就会重新累积,
    *  最多多试 CREDIT_FAIL_PAUSE_THRESHOLD 轮,可接受)。成功产出即清零。 */
   private creditFailStreak = new Map<string, number>()
@@ -2048,6 +2059,9 @@ export class CronScheduler {
           `Delete an existing reminder before creating a new one, or raise OC_CRON_MAX_JOBS.`,
       )
     }
+    if (job.deliver !== undefined) {
+      this.assertDeliverValue(job.deliver)
+    }
     filtered.push(job)
     file.jobs = filtered
     await atomicWriteYaml(paths.cronYaml, file)
@@ -2091,9 +2105,7 @@ export class CronScheduler {
     // label 显式携带即生效:空串 = 清空(回退到 prompt 显示),与 create 的可选语义对称。
     if (updates.label !== undefined) job.label = updates.label || undefined
     if (updates.deliver !== undefined) {
-      if (!['local', 'webchat', 'telegram'].includes(updates.deliver as string)) {
-        throw new Error(`Invalid deliver "${updates.deliver}": must be local | webchat | telegram`)
-      }
+      this.assertDeliverValue(updates.deliver)
       job.deliver = updates.deliver
     }
     // oneshot 可改:重复→一次性(下次触发后自动停用)或反向。改为重复时若任务曾因
@@ -2103,6 +2115,13 @@ export class CronScheduler {
     logger.info(`updated job ${id}`, { jobId: id })
     this.maybePushCronIndex(file)
     return true
+  }
+
+  private assertDeliverValue(value: string): void {
+    if (isAllowedCronDeliverValue(value, this.getRegisteredDeliverChannels())) return
+    throw new Error(
+      `Invalid deliver "${value}": must be local, webchat, or a registered channel adapter`,
+    )
   }
 
   async listJobs(): Promise<CronJob[]> {

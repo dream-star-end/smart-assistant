@@ -250,6 +250,13 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
 
   { label: '/api/cron', re: /^\/api\/cron$/, methods: M('GET', 'POST'), proxyFromCommercial: true },
   {
+    // 必须写在 /api/cron/:id 之前:first-match,否则 GET /api/cron/channels 会被当成 job id。
+    label: '/api/cron/channels',
+    re: /^\/api\/cron\/channels$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/cron/:id',
     re: /^\/api\/cron\/[^/]+$/,
     methods: M('GET', 'PUT', 'DELETE'),
