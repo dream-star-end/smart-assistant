@@ -9,7 +9,7 @@ import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
-import { GoalDialog, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
+import { GoalDialog, STATUS_LABEL, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
 import type { MediaRef } from "../lib/chat/frames";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
@@ -294,6 +294,23 @@ export function Composer({
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4">
+      {visibleGoal && canGoal && (
+        <button
+          type="button"
+          data-testid="composer-goal-chip"
+          aria-label={`会话目标：${visibleGoal.objective}`}
+          title={visibleGoal.objective}
+          onClick={() => setGoalOpen(true)}
+          className="mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-[12px] text-fg hover:bg-hover"
+        >
+          <Target
+            size={13}
+            className={cn("shrink-0", goalNearBudget(visibleGoal) ? "text-warning" : "text-accent")}
+          />
+          <span className="min-w-0 truncate">{visibleGoal.objective}</span>
+          <span className="shrink-0 text-muted">{STATUS_LABEL[visibleGoal.status]}</span>
+        </button>
+      )}
       <div
         className={cn(
           "rounded-[26px] border border-border-control bg-surface shadow-[var(--shadow-float)] transition-all",

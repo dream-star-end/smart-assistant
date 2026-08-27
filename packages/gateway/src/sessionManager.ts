@@ -34,7 +34,7 @@ import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
 import { decideEngineCwd } from './engineCwd.js'
-import { cursorResumeStoreExists, usableCursorResumeId } from './engine/cursorAdapter.js'
+import { cursorResumeStoreExists, relocateCursorResumeStore, usableCursorResumeId } from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
 import type {
   AutomaticRetryState,
@@ -1123,6 +1123,36 @@ export type PreheatOutcome =
   | 'skipped_busy'
   | 'skipped_cap'
 
+/** CCB 冷启约 20s、codex app-server 5–8s、MCP tsx 回落约 7s。45s ≈ 两倍 CCB 冷启 + MCP 余量。 */
+export const ENGINE_PREHEAT_DEADLINE_DEFAULT_MS = 45_000
+
+export function resolveEnginePreheatDeadlineMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.OC_ENGINE_PREHEAT_DEADLINE_MS)
+  if (Number.isFinite(raw) && raw >= 20) return Math.floor(raw)
+  return ENGINE_PREHEAT_DEADLINE_DEFAULT_MS
+}
+
+const PREHEAT_DEADLINE_CODE = 'PREHEAT_DEADLINE'
+
+function withPreheatDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`engine preheat exceeded ${ms}ms deadline`)
+      ;(err as Error & { code: string }).code = PREHEAT_DEADLINE_CODE
+      reject(err)
+    }, ms)
+    timer.unref?.()
+  })
+  return Promise.race([work, timeout]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
+function isPreheatDeadline(err: unknown): boolean {
+  return Boolean(err && typeof err === 'object' && (err as { code?: string }).code === PREHEAT_DEADLINE_CODE)
+}
+
 export interface CronBridgeEvent {
   action: 'create' | 'delete' | 'list'
   agentId: string
@@ -1757,6 +1787,9 @@ export interface PromptQueueExecutionFence {
 
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
+  /** Per-sessionKey mutex around getOrCreate so two concurrent turns cannot
+   *  each replace the runner and --resume the same Cursor SQLite store. */
+  private _sessionCreateGates = new Map<string, Promise<void>>()
   /** Queue execution uses the existing promise only as an execution mutex.
    * The WeakSet is the synchronous admission fence that rejects, rather than
    * queues, any second submit while that mutex is owned. */
@@ -2897,6 +2930,21 @@ export class SessionManager {
       // recomputed overlay can hash to a different chats/ dir than the live
       // CLI. Deleting here forces historical replay on the next follow-up
       // even when store.db is still on disk.
+      // isolated_v1 次轮绑项目会改 spawn cwd → md5 目录对不上。旧 store 还在
+      // 时迁到当前哈希再 --resume;失败才跳过 lookup,回放历史。
+      const relocated = relocateCursorResumeStore({
+        resumeId: id,
+        currentWorkspacePath: workspacePath,
+        sessionKey,
+      })
+      if (relocated) {
+        log.info('relocated Cursor resume store to current workspace', {
+          sessionKey,
+          resumeId: id,
+          relocated: relocated.relocated,
+        })
+        return id
+      }
       log.warn('resume-map Cursor store not at this workspace — keeping map, skipping this lookup', {
         sessionKey,
         resumeId: id,
@@ -3288,6 +3336,31 @@ export class SessionManager {
      *  Spawn-time attribute(delegate sessionKey 带时间戳一次性,不存在复用)。 */
     usageAttribution?: UsageAttributionTag
   }): Promise<AgentSession> {
+    return this._enterSessionCreateGate(opts.sessionKey, () => this._getOrCreateExclusive(opts))
+  }
+
+  private async _enterSessionCreateGate<T>(sessionKey: string, work: () => Promise<T>): Promise<T> {
+    const previous = this._sessionCreateGates.get(sessionKey) ?? Promise.resolve()
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const tail = previous.then(() => held, () => held)
+    this._sessionCreateGates.set(sessionKey, tail)
+    try {
+      await previous
+      return await work()
+    } finally {
+      release()
+      if (this._sessionCreateGates.get(sessionKey) === tail) {
+        this._sessionCreateGates.delete(sessionKey)
+      }
+    }
+  }
+
+  private async _getOrCreateExclusive(
+    opts: Parameters<SessionManager['getOrCreate']>[0],
+  ): Promise<AgentSession> {
     const ownsDispatchFence = this._ownsPromptQueueExecutionFence(
       opts.sessionKey,
       opts.promptQueueExecutionFence,
@@ -3325,7 +3398,7 @@ export class SessionManager {
     const engineId = resolveEngine(executionModel, opts.agent, opts.executionAuthority, {
       requireAuthority: isModelAuthorityRequired(),
     })
-    const existing = this.sessions.get(opts.sessionKey)
+    let existing = this.sessions.get(opts.sessionKey)
     if (existing?._modelSwitchTransition) {
       const transition = existing._modelSwitchTransition
       if (
@@ -3408,6 +3481,35 @@ export class SessionManager {
         // first submit().
         try {
           await existing.lock
+          const canonical = this.sessions.get(opts.sessionKey)
+          if (canonical && canonical !== existing) {
+            const desiredEngineNow =
+              opts.model !== undefined ||
+              opts.executionAuthority !== undefined ||
+              opts.agent.provider === 'codex-native'
+                ? engineId
+                : canonical.providerTag
+            const stillNeedsReplace =
+              canonical.providerTag !== desiredEngineNow ||
+              (opts.workspaceMode !== undefined && canonical.workspaceMode !== workspaceMode) ||
+              (opts.workspaceCwd !== undefined && canonical.workspaceCwd !== opts.workspaceCwd) ||
+              (opts.projectId !== undefined && (canonical.projectId ?? null) !== (opts.projectId ?? null))
+            if (!stillNeedsReplace) {
+              canonical.lastUsedAt = Date.now()
+              if (opts.title && (!canonical.title || canonical.title === 'New conversation'))
+                canonical.title = opts.title
+              if (opts.userId && !canonical.userId) canonical.userId = opts.userId
+              if (opts.repoSessionId && !canonical.repoSessionId) canonical.repoSessionId = opts.repoSessionId
+              if (opts.parentSessionKey && !canonical.parentSessionKey)
+                canonical.parentSessionKey = opts.parentSessionKey
+              if (opts.projectId !== undefined) canonical.projectId = opts.projectId
+              if (nextFingerprint) canonical.contextFingerprint = nextFingerprint
+              if (opts.runContext) canonical.runContext = opts.runContext
+              return canonical
+            }
+            existing = canonical
+            existing._replacing = true
+          }
           try {
             const legacyId = this._resumeMap.get(opts.sessionKey)
             const ids =
@@ -3445,7 +3547,9 @@ export class SessionManager {
             workspaceModeChanged,
           }, err)
         }
-        this.sessions.delete(opts.sessionKey)
+        if (this.sessions.get(opts.sessionKey) === existing) {
+          this.sessions.delete(opts.sessionKey)
+        }
       } else {
         existing.lastUsedAt = Date.now()
         if (opts.title && (!existing.title || existing.title === 'New conversation'))
@@ -3813,7 +3917,28 @@ export class SessionManager {
         if ((session._activeTurnCount ?? 0) > 0 || this._promptQueueHolds(session)) {
           return 'skipped_busy'
         }
-        await session.runner.preheat!()
+        const deadlineMs = resolveEnginePreheatDeadlineMs()
+        try {
+          await withPreheatDeadline(session.runner.preheat!(), deadlineMs)
+        } catch (err) {
+          if (!isPreheatDeadline(err)) throw err
+          log.warn('engine_preheat', {
+            sessionKey: session.sessionKey,
+            engine: runner.engineId,
+            outcome: 'timed_out',
+            spawn_ms: Date.now() - startedAt,
+            deadline_ms: deadlineMs,
+            err: String(err),
+          })
+          try {
+            await session.runner.shutdown()
+          } catch (shutdownErr) {
+            log.warn('engine_preheat shutdown after deadline failed', {
+              sessionKey: session.sessionKey,
+            }, shutdownErr)
+          }
+          return 'failed'
+        }
         session.lastUsedAt = Date.now()
         log.info('engine_preheat', {
           sessionKey: session.sessionKey,

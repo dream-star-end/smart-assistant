@@ -1567,6 +1567,16 @@ export interface CommercialHook {
     { ok: true } | { ok: false; retryAfterSec: number; reason: string }
   >
   /**
+   * master GET /api/sessions/:id 时 fire-and-forget POST 到用户容器
+   * `/internal/v3/engine-preheat`。仅 master 注入;失败必须 swallow。
+   */
+  preheatUserContainer?: (args: {
+    userId: string
+    sessionId: string
+    agentId: string
+    modelId?: string
+  }) => Promise<void>
+  /**
    * **P0 监控盲区收口 — 深度依赖探活**(2026-07-07)。
    *
    * gateway 对 PG/Redis 零编译期依赖(client 全在 commercial 侧),故由 commercial
@@ -3947,6 +3957,24 @@ export class Gateway {
         this.log.error('qq-inbound handler crashed', undefined, err)
         if (!res.headersSent) {
           try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
+    // master → 容器 session-open 引擎预热。鉴权同 wechat-inbound(checkInboundBypass)。
+    // 内部口自带 gate,不读 OC_ENGINE_PREHEAT。先 200 再异步 spawn,避免卡住 master POST。
+    if (url.pathname === '/internal/v3/engine-preheat' && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      this.handleEnginePreheat(req, res).catch((err) => {
+        this.log.warn('engine-preheat handler crashed', undefined, err as Error)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 200, { ok: true, skipped: true }) } catch {}
         } else {
           try { res.end() } catch {}
         }
@@ -15784,47 +15812,84 @@ export class Gateway {
    * 全量扇出,spawn 会打满内存/fork)。agentId/modelId 取自本次已读出的
    * client_sessions 权威行;执行授权走 prewarm 投影,失败即跳过,不绕 fail-closed。
    */
+  /** session-open 预热去抖戳。`.call(fake)` 测试路径下可能缺省,惰性建。 */
+  private _sessionOpenPreheatAt = new Map<string, number>()
+
   private _preheatSessionOnOpen(
     sessId: string,
     userId: string,
     row: { agentId?: string; modelId?: string },
   ): void {
     if (process.env.OC_ENGINE_PREHEAT !== '1') return
+    const aid = row.agentId || 'main'
+    if (isHiddenSystemAgentId(aid)) return
+    const stamps = this._sessionOpenPreheatAt ?? (this._sessionOpenPreheatAt = new Map())
+    const debounceKey = `${sessId}:${aid}:${row.modelId ?? ''}`
+    const now = Date.now()
+    const last = stamps.get(debounceKey)
+    if (last !== undefined && now - last < SESSION_OPEN_PREHEAT_DEBOUNCE_MS) return
+    stamps.set(debounceKey, now)
+    if (stamps.size > 256) {
+      for (const [k, ts] of stamps) {
+        if (now - ts >= SESSION_OPEN_PREHEAT_DEBOUNCE_MS) stamps.delete(k)
+      }
+    }
     void (async () => {
-      const aid = row.agentId || 'main'
-      if (isHiddenSystemAgentId(aid)) return
-      const sessionKey = `agent:${aid}:webchat:dm:${sessId}`
-      const cfg = await this._getAgentsConfig()
-      const agent = cfg.agents.find((a) => a.id === aid) ?? ({ id: aid } as AgentDef)
-      // 模型权威:预热带上会话持久化的 modelId(权威行),避免首条消息因
-      // model 不一致触发 shutdown-respawn 白烧一次冷启动;投影拒绝/不可用 →
-      // 抛 → 外层 catch 跳过预热(fail-closed,不回落 baked)。**已存在但
-      // 冷置的 session 同样必须过这道投影**——授权已撤销时不得为它拉起进程。
-      const preExec = await resolveLocalExecutionIfEnforced({
-        agent,
-        kind: 'prewarm',
-        ...(row.modelId ? { model: row.modelId } : {}),
-        defaultModel: this.deps.config.defaults.model,
-      })
-      let session = this.sessions.getByKey(sessionKey)
-      if (!session) {
-        const override = localExecutionOverride(preExec)
-        session = await this.sessions.getOrCreate({
-          sessionKey,
-          agent,
-          ...override,
-          ...(override.model === undefined && row.modelId ? { model: row.modelId } : {}),
-          channel: 'webchat',
-          peerId: sessId,
-          userId,
+      if (hasContainerCatalogEnv()) {
+        await runSessionPreheat(this as unknown as SessionPreheatHost, sessId, userId, row)
+        return
+      }
+      const hook = this.deps.commercial?.preheatUserContainer
+      if (!hook) {
+        this.log.info('engine_preheat_skipped', {
+          sessionKey: `agent:${aid}:webchat:dm:${sessId}`,
+          outcome: 'skipped_no_container_channel',
         })
+        return
       }
-      const outcome = await this.sessions.preheatRunner(session)
-      if (outcome !== 'started' && outcome !== 'already_running') {
-        this.log.info('engine_preheat_skipped', { sessionKey, outcome })
-      }
+      await hook({
+        userId,
+        sessionId: sessId,
+        agentId: aid,
+        ...(row.modelId ? { modelId: row.modelId } : {}),
+      })
     })().catch((err) => {
       this.log.warn('session-open engine preheat failed', { sessId }, err)
+    })
+  }
+
+  /**
+   * POST /internal/v3/engine-preheat。先 200 再异步 spawn:master POST 3s 超时
+   * 不能卡在 CCB ~20s 冷启动上。失败只 warn,不再写响应。
+   */
+  private async handleEnginePreheat(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let raw: string
+    try {
+      raw = await this.readBody(req, 16 * 1024)
+    } catch {
+      this.sendJson(res, 400, { error: 'read failed' })
+      return
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      this.sendJson(res, 400, { error: 'invalid json' })
+      return
+    }
+    const validated = validateEnginePreheatBody(parsed)
+    if (!validated.ok) {
+      this.sendJson(res, 400, { error: validated.error })
+      return
+    }
+    this.sendJson(res, 200, { ok: true })
+    const ocUid = (process.env.OC_USER_ID ?? '').trim()
+    const userId = /^[1-9][0-9]{0,18}$/.test(ocUid) ? `c:${ocUid}` : 'default'
+    void runSessionPreheat(this as unknown as SessionPreheatHost, validated.payload.sessionId, userId, {
+      agentId: validated.payload.agentId,
+      ...(validated.payload.modelId ? { modelId: validated.payload.modelId } : {}),
+    }).catch((err) => {
+      this.log.warn('engine-preheat spawn failed', { sessId: validated.payload.sessionId }, err as Error)
     })
   }
 
@@ -19610,6 +19675,102 @@ const COMPENSATE_TRACE_ID_MAX_LEN = 64
  * Error strings are stable: `handleWechatInboundCompensate` returns them
  * verbatim to the broker, so changing wording is a contract change.
  */
+
+export const SESSION_OPEN_PREHEAT_DEBOUNCE_MS = 30_000
+
+export function hasContainerCatalogEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(
+    env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim() && env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim(),
+  )
+}
+
+const ENGINE_PREHEAT_SESSION_ID_RE = /^[a-zA-Z0-9_-]{8,50}$/
+const ENGINE_PREHEAT_AGENT_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/
+
+export type EnginePreheatBody = {
+  sessionId: string
+  agentId: string
+  modelId?: string
+}
+
+export type EnginePreheatValidation =
+  | { ok: true; payload: EnginePreheatBody }
+  | { ok: false; error: string }
+
+export function validateEnginePreheatBody(parsed: unknown): EnginePreheatValidation {
+  if (!parsed || typeof parsed !== 'object') {
+    return { ok: false, error: 'body must be a JSON object' }
+  }
+  const body = parsed as Record<string, unknown>
+  const sessionId = body.sessionId
+  if (typeof sessionId !== 'string' || !ENGINE_PREHEAT_SESSION_ID_RE.test(sessionId)) {
+    return { ok: false, error: 'sessionId required' }
+  }
+  const agentId = body.agentId
+  if (typeof agentId !== 'string' || !ENGINE_PREHEAT_AGENT_ID_RE.test(agentId)) {
+    return { ok: false, error: 'agentId required' }
+  }
+  if (isHiddenSystemAgentId(agentId)) {
+    return { ok: false, error: 'agentId required' }
+  }
+  let modelId: string | undefined
+  if (body.modelId !== undefined) {
+    if (typeof body.modelId !== 'string' || body.modelId.length === 0 || body.modelId.length > 128) {
+      return { ok: false, error: 'modelId invalid' }
+    }
+    modelId = body.modelId
+  }
+  return { ok: true, payload: { sessionId, agentId, ...(modelId ? { modelId } : {}) } }
+}
+
+type SessionPreheatHost = {
+  log: { info: (msg: string, fields?: unknown) => void; warn: (msg: string, fields?: unknown, err?: unknown) => void }
+  sessions: {
+    getByKey: (key: string) => unknown
+    getOrCreate: (opts: Record<string, unknown>) => Promise<unknown>
+    preheatRunner: (session: unknown) => Promise<string>
+  }
+  _getAgentsConfig: () => Promise<{ agents: AgentDef[] }>
+  deps: { config: { defaults: { model: string } } }
+}
+
+/** 容器内真实预热:投影授权 → getOrCreate → preheatRunner。供 internal 口与容器 GET 钩子共用。 */
+export async function runSessionPreheat(
+  host: SessionPreheatHost,
+  sessId: string,
+  userId: string,
+  row: { agentId?: string; modelId?: string },
+): Promise<void> {
+  const aid = row.agentId || 'main'
+  if (isHiddenSystemAgentId(aid)) return
+  const sessionKey = `agent:${aid}:webchat:dm:${sessId}`
+  const cfg = await host._getAgentsConfig()
+  const agent = cfg.agents.find((a) => a.id === aid) ?? ({ id: aid } as AgentDef)
+  const preExec = await resolveLocalExecutionIfEnforced({
+    agent,
+    kind: 'prewarm',
+    ...(row.modelId ? { model: row.modelId } : {}),
+    defaultModel: host.deps.config.defaults.model,
+  })
+  let session = host.sessions.getByKey(sessionKey)
+  if (!session) {
+    const override = localExecutionOverride(preExec)
+    session = await host.sessions.getOrCreate({
+      sessionKey,
+      agent,
+      ...override,
+      ...(override.model === undefined && row.modelId ? { model: row.modelId } : {}),
+      channel: 'webchat',
+      peerId: sessId,
+      userId,
+    })
+  }
+  const outcome = await host.sessions.preheatRunner(session)
+  if (outcome !== 'started' && outcome !== 'already_running') {
+    host.log.info('engine_preheat_skipped', { sessionKey, outcome })
+  }
+}
+
 export function validateWechatInboundCompensateBody(
   parsed: unknown,
 ): WechatInboundCompensateValidation {

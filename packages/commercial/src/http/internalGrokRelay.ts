@@ -26,6 +26,9 @@ const ALLOWED = new Set([
   'GET /deployment/config',
   'POST /chat/completions',
   'POST /responses',
+  // Official Grok CLI Imagine (image_gen / image_edit). Same host as chat proxy.
+  'POST /images/generations',
+  'POST /images/edits',
 ])
 const HOP = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'])
 const GROK_CORRELATION_HEADERS = new Set([

@@ -124,6 +124,60 @@
       "expiresAt": "2026-09-28"
     },
     {
+      "commit": "905628ed1",
+      "reason": "selfhost-proven shared-code port onto commercial canonical; no new commercial production incident. Task B 2026-08-28: cherry-pick into feat/v5-aurora-rewrite only, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "94931db30",
+      "reason": "selfhost-proven shared-code port onto commercial canonical; no new commercial production incident. Task B 2026-08-28: cherry-pick into feat/v5-aurora-rewrite only, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "a952a6b40",
+      "reason": "selfhost-proven shared-code port onto commercial canonical; no new commercial production incident. Task B 2026-08-28: cherry-pick into feat/v5-aurora-rewrite only, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "adad3a449",
+      "reason": "selfhost-proven shared-code port onto commercial canonical; no new commercial production incident. Task B 2026-08-28: cherry-pick into feat/v5-aurora-rewrite only, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "57ec1b2e3",
+      "reason": "selfhost-proven shared-code port onto commercial canonical; no new commercial production incident. Task B 2026-08-28: cherry-pick into feat/v5-aurora-rewrite only, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "93f829cdf",
+      "reason": "selfhost-proven shared-code port onto commercial canonical; no new commercial production incident. Task B 2026-08-28: cherry-pick into feat/v5-aurora-rewrite only, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "9953d1ee2",
+      "reason": "selfhost-proven shared-code port onto commercial canonical; no new commercial production incident. Task B 2026-08-28: cherry-pick into feat/v5-aurora-rewrite only, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "46b78dedf",
+      "reason": "selfhost-proven shared-code port follow-up: owner-scope Phase-B keep-alive so first unified-timeline adoption still purges predecessor cache. Task B 2026-08-28, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "c334aed84",
+      "reason": "selfhost-proven port follow-up: first unified-timeline adoption must not keep predecessor team cache stamped by adjacent user id. Task B 2026-08-28, do not deploy.",
+      "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
       "commit": "91fd1cc1e",
       "reason": "selfhost-proven shared-code port follow-up: owner-scope Phase-B keep-alive so first unified-timeline adoption still purges predecessor cache. Task B 2026-08-28, do not deploy.",
       "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",

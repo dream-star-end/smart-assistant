@@ -26,7 +26,9 @@ function extractMethodBody(source: string, methodName: string): string {
 const delegateWrapper = extractMethodBody(SERVER_TS, '_runDelegateTask')
 const delegateCore = extractMethodBody(SERVER_TS, '_runDelegateTaskCore')
 const handleStop = extractMethodBody(SERVER_TS, 'handleStop')
-const getOrCreate = extractMethodBody(SESSION_MANAGER_TS, 'getOrCreate')
+const getOrCreate =
+  extractMethodBody(SESSION_MANAGER_TS, 'getOrCreate') +
+  extractMethodBody(SESSION_MANAGER_TS, '_getOrCreateExclusive')
 
 test('delegate wrapper still dispatches into _runDelegateTaskCore', () => {
   assert.match(

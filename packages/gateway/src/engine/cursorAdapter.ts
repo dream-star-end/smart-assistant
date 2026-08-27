@@ -4,7 +4,7 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
@@ -31,6 +31,7 @@ import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { issueDelegateContextToken } from '../delegateContext.js'
 import { formatPresentOptionsFence } from './presentOptions.js'
+import { renderCcbGoalPrompt } from '../goalPrompt.js'
 
 const log = createLogger({ module: 'cursorAdapter' })
 
@@ -1273,13 +1274,20 @@ function toolOutputOf(event: CursorEvent): { output: string; outputJson: unknown
   return { output: textOf(rawResult), outputJson: structuredClone(rawResult) }
 }
 
-function renderCursorPrompt(platformContext: string, payload: string, preamble: string): string {
+function renderCursorPrompt(
+  platformContext: string,
+  payload: string,
+  preamble: string,
+  goal: GoalStateSnapshot | null = null,
+): string {
   const payloadJson = JSON.stringify(payload).replace(/</g, '\\u003c')
+  const goalText = renderCcbGoalPrompt(goal)
   return [
     preamble.trimEnd(),
     '<openclaude_platform_context>',
     platformContext,
     '</openclaude_platform_context>',
+    ...(goalText ? ['', goalText] : []),
     '',
     '<openclaude_current_turn_payload_json>',
     'The next line is a JSON string containing the complete current OpenClaude turn payload.',
@@ -1438,6 +1446,237 @@ export function usableCursorResumeId(opts: {
   return undefined
 }
 
+export function cursorResumeStoreDir(workspacePath: string, sessionId: string): string {
+  return dirname(cursorResumeStorePath(workspacePath, sessionId))
+}
+
+const CURSOR_RESUME_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const WEBCHAT_DM_SESSION_RE = /:webchat:dm:([A-Za-z0-9_-]{8,50})$/
+
+export function webChatSessionIdFromSessionKey(sessionKey: string): string | undefined {
+  return WEBCHAT_DM_SESSION_RE.exec(sessionKey)?.[1]
+}
+
+/** isolated_v1 未绑项目时的 spawn cwd:`$OPENCLAUDE_DEFAULT_WORKSPACE/sessions/<webSessionId>`。 */
+export function isolatedSessionWorkspaceCandidate(
+  webSessionId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const ws = env.OPENCLAUDE_DEFAULT_WORKSPACE?.trim()
+  if (!ws) return undefined
+  if (!/^[A-Za-z0-9_-]{8,50}$/.test(webSessionId)) return undefined
+  return join(ws, 'sessions', webSessionId)
+}
+
+function cursorStoreDbReady(storePath: string): boolean {
+  try {
+    return statSync(storePath).isFile()
+  } catch {
+    return false
+  }
+}
+
+function copyDirRecursive(
+  src: string,
+  dest: string,
+  afterCopyFile?: (from: string, to: string) => void,
+): void {
+  mkdirSync(dest, { recursive: true, mode: 0o700 })
+  for (const ent of readdirSync(src, { withFileTypes: true })) {
+    const from = join(src, ent.name)
+    const to = join(dest, ent.name)
+    if (ent.isDirectory()) copyDirRecursive(from, to, afterCopyFile)
+    else {
+      copyFileSync(from, to)
+      afterCopyFile?.(from, to)
+    }
+  }
+}
+
+function listStoreFileSizes(dir: string): Map<string, number> {
+  const out = new Map<string, number>()
+  const walk = (base: string, prefix: string): void => {
+    for (const ent of readdirSync(base, { withFileTypes: true })) {
+      const rel = prefix ? `${prefix}/${ent.name}` : ent.name
+      const full = join(base, ent.name)
+      if (ent.isDirectory()) walk(full, rel)
+      else {
+        try { out.set(rel, statSync(full).size) } catch { out.set(rel, -1) }
+      }
+    }
+  }
+  walk(dir, '')
+  return out
+}
+
+/** Staging 必须含 store.db,且源目录每个文件都按同相对路径和大小出现。 */
+function stagingMatchesSource(srcDir: string, stagingDir: string): boolean {
+  if (!cursorStoreDbReady(join(stagingDir, 'store.db'))) return false
+  const src = listStoreFileSizes(srcDir)
+  if (src.size === 0) return false
+  const dst = listStoreFileSizes(stagingDir)
+  for (const [rel, size] of src) {
+    if (dst.get(rel) !== size) return false
+  }
+  return true
+}
+
+function findCursorResumeStoreElsewhere(sessionId: string, currentDir: string): string | undefined {
+  let root: string
+  try {
+    root = cursorChatsRoot()
+  } catch {
+    return undefined
+  }
+  let hashes: string[]
+  try {
+    hashes = readdirSync(root)
+  } catch {
+    return undefined
+  }
+  const currentResolved = resolve(currentDir)
+  let best: { dir: string; mtime: number } | undefined
+  for (const hash of hashes) {
+    if (!/^[0-9a-f]{32}$/.test(hash)) continue
+    const dir = join(root, hash, sessionId)
+    if (resolve(dir) === currentResolved) continue
+    const store = join(dir, 'store.db')
+    if (!cursorStoreDbReady(store)) continue
+    let mtime = 0
+    try {
+      mtime = statSync(store).mtimeMs
+    } catch {
+      /* keep 0 */
+    }
+    if (!best || mtime >= best.mtime) best = { dir, mtime }
+  }
+  return best?.dir
+}
+
+/**
+ * Cursor CLI 把 store 键在 chats/<md5(path.resolve(workspace))>/<id>/。
+ * isolated_v1 次轮绑上默认项目后 spawn cwd 从 sessions/<id> 变成 workspace 根,
+ * 旧 store 仍在旧哈希目录。查不到当前哈希时把整目录迁过来再 --resume。
+ * 任何失败返回 undefined,调用方维持历史回放;不得抛错打断回合。
+ */
+export function relocateCursorResumeStore(opts: {
+  resumeId: string
+  currentWorkspacePath: string
+  previousWorkspacePaths?: Array<string | null | undefined>
+  sessionKey?: string
+  env?: NodeJS.ProcessEnv
+}): { resumeId: string; relocated: boolean } | undefined {
+  try {
+    const resumeId = opts.resumeId.trim()
+    const currentWorkspacePath = opts.currentWorkspacePath.trim()
+    if (!CURSOR_RESUME_ID_RE.test(resumeId) || !currentWorkspacePath) return undefined
+    if (cursorResumeStoreExists(currentWorkspacePath, resumeId)) {
+      return { resumeId, relocated: false }
+    }
+
+    const destDir = cursorResumeStoreDir(currentWorkspacePath, resumeId)
+    const destStore = join(destDir, 'store.db')
+    if (existsSync(destDir)) {
+      return cursorStoreDbReady(destStore) ? { resumeId, relocated: false } : undefined
+    }
+
+    const env = opts.env ?? process.env
+    const candidates: Array<string | null | undefined> = [...(opts.previousWorkspacePaths ?? [])]
+    const webId =
+      typeof opts.sessionKey === 'string' ? webChatSessionIdFromSessionKey(opts.sessionKey) : undefined
+    if (webId) candidates.push(isolatedSessionWorkspaceCandidate(webId, env))
+
+    let srcDir: string | undefined
+    const seen = new Set<string>()
+    for (const raw of candidates) {
+      if (typeof raw !== 'string') continue
+      const prev = raw.trim()
+      if (!prev) continue
+      const key = resolve(prev)
+      if (seen.has(key) || key === resolve(currentWorkspacePath)) continue
+      seen.add(key)
+      if (!cursorResumeStoreExists(prev, resumeId)) continue
+      srcDir = cursorResumeStoreDir(prev, resumeId)
+      break
+    }
+    if (!srcDir) srcDir = findCursorResumeStoreElsewhere(resumeId, destDir)
+    if (!srcDir) return undefined
+    const sourceDir = srcDir
+    if (resolve(sourceDir) === resolve(destDir)) {
+      return cursorStoreDbReady(destStore) ? { resumeId, relocated: false } : undefined
+    }
+    if (!cursorStoreDbReady(join(sourceDir, 'store.db'))) return undefined
+
+    const destParent = dirname(destDir)
+    try {
+      mkdirSync(destParent, { recursive: true, mode: 0o700 })
+    } catch (err) {
+      log.warn('Cursor resume store dest parent create failed', { resumeId, destDir, err: String(err) })
+      return undefined
+    }
+
+    _internals.relocateTest.attempts += 1
+
+    const publishFromStaging = (stagingDir: string): { resumeId: string; relocated: boolean } | undefined => {
+      if (!stagingMatchesSource(sourceDir, stagingDir)) {
+        try { rmSync(stagingDir, { recursive: true, force: true }) } catch { /* ignore */ }
+        return undefined
+      }
+      try {
+        renameSync(stagingDir, destDir)
+      } catch {
+        try { rmSync(stagingDir, { recursive: true, force: true }) } catch { /* ignore */ }
+        return existsSync(destDir) && cursorStoreDbReady(destStore)
+          ? { resumeId, relocated: false }
+          : undefined
+      }
+      try {
+        rmSync(sourceDir, { recursive: true, force: true })
+      } catch {
+        log.warn('Cursor resume store old dir cleanup failed', { resumeId, srcDir: sourceDir })
+      }
+      return { resumeId, relocated: true }
+    }
+
+    try {
+      if (_internals.relocateTest.forceCopy) {
+        const err = new Error('EXDEV') as NodeJS.ErrnoException
+        err.code = 'EXDEV'
+        throw err
+      }
+      renameSync(sourceDir, destDir)
+      if (cursorStoreDbReady(destStore)) return { resumeId, relocated: true }
+    } catch (renameErr) {
+      if (existsSync(destDir) && cursorStoreDbReady(destStore)) {
+        return { resumeId, relocated: false }
+      }
+      if (existsSync(destDir)) return undefined
+      let stagingDir: string | undefined
+      try {
+        stagingDir = mkdtempSync(join(destParent, `.${basename(destDir)}.relocating-`))
+        copyDirRecursive(sourceDir, stagingDir, _internals.relocateTest.afterCopyFile)
+        return publishFromStaging(stagingDir)
+      } catch (copyErr) {
+        if (stagingDir) {
+          try { rmSync(stagingDir, { recursive: true, force: true }) } catch { /* ignore */ }
+        }
+        log.warn('Cursor resume store relocate failed', {
+          resumeId,
+          srcDir: sourceDir,
+          destDir,
+          renameErr: String(renameErr),
+          copyErr: String(copyErr),
+        })
+        return undefined
+      }
+    }
+    return undefined
+  } catch (err) {
+    log.warn('Cursor resume store relocate threw', { err: String(err) })
+    return undefined
+  }
+}
+
 export class CursorAdapter extends EventEmitter implements EngineAdapter {
   readonly engineId = 'cursor'
   readonly capabilities: EngineCapabilities = {
@@ -1473,6 +1712,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private lastKeepaliveCpuTicks: number | null = null
   private lastTranscriptFingerprint: CursorTranscriptFingerprint | null = null
   private cachedTranscriptsDir: string | null = null
+  private platformGoal: GoalStateSnapshot | null = null
 
   constructor(opts: EngineCreateOpts) {
     super()
@@ -1622,6 +1862,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         platformResult.content,
         payload,
         getPlatformPrompt('cursor-preamble', CURSOR_PREAMBLE),
+        this.platformGoal,
       )
       validateCursorFinalPrompt(prompt, payloadBytes)
 
@@ -2251,7 +2492,10 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   }
   get effortLevel(): string | undefined { return this.currentEffort }
   setTraceId(_traceId: string | undefined): void {}
-  setGoalState(_goal: GoalStateSnapshot | null): Promise<void> { return Promise.resolve() }
+  setGoalState(goal: GoalStateSnapshot | null): Promise<void> {
+    this.platformGoal = goal ? structuredClone(goal) : null
+    return Promise.resolve()
+  }
   updateConfig(config: OpenClaudeConfig): void { this.opts.config = config }
   setToolsets(toolsets: string[] | undefined): void { this.currentToolsets = toolsets }
   get toolsets(): string[] | undefined { return this.currentToolsets }
@@ -2265,11 +2509,30 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
 }
 
 export const _internals = {
+  relocateTest: {
+    forceCopy: false,
+    afterCopyFile: undefined as undefined | ((from: string, to: string) => void),
+    attempts: 0,
+    reset(): void {
+      this.forceCopy = false
+      this.afterCopyFile = undefined
+      this.attempts = 0
+    },
+  },
   CURSOR_PREAMBLE,
   OPENCLAUDE_MEMORY_MCP_TOOLS,
   formatPresentOptionsFence,
   promptOf,
   renderCursorPrompt,
+  promptWithStoredGoal(
+    adapter: CursorAdapter,
+    platformContext: string,
+    payload: string,
+    preamble: string,
+  ): string {
+    const goal = (adapter as unknown as { platformGoal: GoalStateSnapshot | null }).platformGoal
+    return renderCursorPrompt(platformContext, payload, preamble, goal)
+  },
   validateCursorTurnPayload,
   validateCursorFinalPrompt,
   buildCursorMemoryMcpConfig,
