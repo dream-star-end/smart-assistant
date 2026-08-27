@@ -4504,6 +4504,219 @@ describe("Phase-A final-only tape projection retry", () => {
     expect(sess.messages.some((message) => message.id === `thinking-${sessionId}`)).toBe(true);
     sock.stop();
   });
+
+  test("Phase-B deferred agent-group then empty live-units reset keeps live agent-group", () => {
+    const sessionId = "s-phase-b-defer-ag";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    const user = unpublishedTimeline(sessionId)[0]!;
+    sess.messages = [
+      user,
+      {
+        id: `live-thinking-${sessionId}`,
+        role: "thinking",
+        text: "live reasoning",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-ag-${sessionId}`,
+        role: "agent-group",
+        text: "delegate result",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+        _delegateRunId: "run-defer-ag",
+      },
+    ];
+    const common = {
+      _source: "server" as const,
+      _seq: 2,
+      _orderSeq: 2,
+      _clientMessageId: clientMessageId,
+      _turnTapeId: `tape-${sessionId}`,
+      _turnTapeSha256: "a".repeat(64),
+      _turnTapeComplete: true,
+      _dispatchOutcome: "completed",
+      _timelineRecord: true,
+    };
+    sock.applyServerMessages(sessionId, "main", [
+      user,
+      {
+        id: `thinking-${sessionId}`,
+        role: "thinking",
+        text: "reasoning",
+        ts: 2,
+        ...common,
+        _turnTapeOrdinal: 1,
+        _timelineUnitKey: `tape:${sessionId}:1`,
+      },
+      {
+        id: `ag-${sessionId}`,
+        role: "agent-group",
+        text: "",
+        ts: 4,
+        ...common,
+        _turnTapeOrdinal: 2,
+        _timelineUnitKey: `tape:${sessionId}:2`,
+        _payloadDeferred: true,
+        _payloadBytes: 3_600_806,
+        _delegateRunId: "run-defer-ag",
+      },
+      {
+        id: `answer-${sessionId}`,
+        role: "assistant",
+        text: "final answer",
+        ts: 5,
+        ...common,
+        _turnTapeOrdinal: 3,
+        _timelineUnitKey: `tape:${sessionId}:3`,
+      },
+    ] as ChatMessage[], true, 2, {
+      serverUpdatedAt: 3,
+      historyRevision: 2,
+      timelineGeneration: 3,
+      completedClientMessageId: clientMessageId,
+    });
+    sock.applyLiveUnits(sessionId, [], [clientMessageId]);
+    expect(sess.messages.some((message) => message.id === `live-ag-${sessionId}`)).toBe(true);
+    expect(sess.messages.some((message) => message.id === `ag-${sessionId}` && message._payloadDeferred === true)).toBe(true);
+    expect(sess.messages.some((message) => message.id === `live-thinking-${sessionId}`)).toBe(false);
+    expect(sess.messages.some((message) => message.id === `thinking-${sessionId}`)).toBe(true);
+    sock.stop();
+  });
+
+  test("Phase-B assistant without thinking/tool keeps live thinking/tool", () => {
+    const sessionId = "s-phase-b-assist-only";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess.messages = [
+      unpublishedTimeline(sessionId)[0]!,
+      {
+        id: `live-thinking-${sessionId}`,
+        role: "thinking",
+        text: "live reasoning",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+      },
+    ];
+    const user = unpublishedTimeline(sessionId)[0]!;
+    sock.applyServerMessages(sessionId, "main", [
+      user,
+      {
+        id: `answer-${sessionId}`,
+        role: "assistant",
+        text: "final answer",
+        ts: 5,
+        _source: "server",
+        _seq: 2,
+        _orderSeq: 2,
+        _clientMessageId: clientMessageId,
+        _turnTapeId: `tape-${sessionId}`,
+        _turnTapeSha256: "a".repeat(64),
+        _turnTapeComplete: true,
+        _dispatchOutcome: "completed",
+        _timelineRecord: true,
+      },
+    ] as ChatMessage[], true, 2, {
+      serverUpdatedAt: 3,
+      historyRevision: 2,
+      timelineGeneration: 3,
+      completedClientMessageId: clientMessageId,
+    });
+    sock.applyLiveUnits(sessionId, [], [clientMessageId]);
+    expect(sess.messages.some((message) => message.id === `live-thinking-${sessionId}`)).toBe(true);
+    expect(sess.messages.some((message) => message.id === `live-tool-${sessionId}`)).toBe(true);
+    expect(sess.messages.some((message) => message.role === "assistant" && message.text === "final answer")).toBe(true);
+    sock.stop();
+  });
+
+  test("Phase-B hydrated agent-group replaces live copy without duplicates", () => {
+    const sessionId = "s-phase-b-hydrate-ag";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    const user = unpublishedTimeline(sessionId)[0]!;
+    sess.messages = [
+      user,
+      {
+        id: `live-ag-${sessionId}`,
+        role: "agent-group",
+        text: "delegate result",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+        _delegateRunId: "run-hydrate-ag",
+      },
+    ];
+    const deferredGroup: ChatMessage = {
+      id: `ag-${sessionId}`,
+      role: "agent-group",
+      text: "",
+      ts: 4,
+      _source: "server",
+      _seq: 2,
+      _orderSeq: 2,
+      _clientMessageId: clientMessageId,
+      _turnTapeId: `tape-${sessionId}`,
+      _turnTapeSha256: "a".repeat(64),
+      _turnTapeComplete: true,
+      _dispatchOutcome: "completed",
+      _timelineRecord: true,
+      _payloadDeferred: true,
+      _payloadBytes: 1_564_700,
+      _delegateRunId: "run-hydrate-ag",
+    };
+    const assistant: ChatMessage = {
+      id: `answer-${sessionId}`,
+      role: "assistant",
+      text: "final answer",
+      ts: 5,
+      _source: "server",
+      _seq: 2,
+      _orderSeq: 2,
+      _clientMessageId: clientMessageId,
+      _turnTapeId: `tape-${sessionId}`,
+      _turnTapeSha256: "a".repeat(64),
+      _turnTapeComplete: true,
+      _dispatchOutcome: "completed",
+      _timelineRecord: true,
+    };
+    sock.applyServerMessages(sessionId, "main", [user, deferredGroup, assistant], true, 2, {
+      serverUpdatedAt: 3,
+      historyRevision: 2,
+      timelineGeneration: 3,
+      completedClientMessageId: clientMessageId,
+    });
+    sock.applyLiveUnits(sessionId, [], [clientMessageId]);
+    expect(sess.messages.some((message) => message.id === `live-ag-${sessionId}`)).toBe(true);
+
+    const hydratedGroup: ChatMessage = {
+      ...deferredGroup,
+      text: "delegate result",
+      _payloadDeferred: undefined,
+      _payloadBytes: undefined,
+    };
+    sock.applyServerMessages(sessionId, "main", [user, hydratedGroup, assistant], true, 2, {
+      serverUpdatedAt: 4,
+      historyRevision: 3,
+      timelineGeneration: 4,
+      completedClientMessageId: clientMessageId,
+    });
+    const groups = sess.messages.filter((message) => message.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.id).toBe(`ag-${sessionId}`);
+    expect(groups[0]?._payloadDeferred).toBeUndefined();
+    sock.stop();
+  });
 });
 
 describe("legacy type:error must not fall back to firstSession", () => {
