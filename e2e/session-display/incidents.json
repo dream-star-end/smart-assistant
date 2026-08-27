@@ -1885,7 +1885,15 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T51 Weibo 错误码提示重新扫码且图文失败建议纯文字"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/pluginErrorGuidance.test.ts",
+          "assertion": "each write code × failed/unknown has exact retrySafe/sideEffect/nextAction"
         }
+      ],
+      "coverageCommits": [
+        "b5b2820d"
       ]
     }
   ]
