@@ -1629,6 +1629,8 @@ export function App() {
 
   // Goal state is platform-owned (PG), not part of the browser session blob.
   // Fetch on session selection; live updates arrive through sys.goal_snapshot.
+  // Draft sessions with no client_sessions row used to 404; the route now
+  // returns 200 {goal:null}, and a missing goal is a no-op here.
   useEffect(() => {
     if (demo || !activeId || !user) return;
     let cancelled = false;

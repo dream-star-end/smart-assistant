@@ -187,6 +187,55 @@ describe("F1b 剪贴板图片直接上传", () => {
   });
 });
 
+describe("Composer 目标 chip", () => {
+  test("有可见目标时在输入框上方渲染 chip，点击打开对话框", () => {
+    render(
+      <Composer
+        onSend={() => {}}
+        onUpload={uploadStub}
+        goal={goalFixture()}
+        onSetGoal={vi.fn()}
+        onGoalAction={vi.fn()}
+      />,
+    );
+    const chip = screen.getByTestId("composer-goal-chip");
+    expect(chip).toHaveTextContent("迁移并验证");
+    expect(chip).toHaveTextContent("进行中");
+    fireEvent.click(chip);
+    expect(screen.getByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
+  });
+
+  test("保存响应把 goal 传入后 chip 立即出现；无目标不渲染", () => {
+    const { rerender } = render(
+      <Composer onSend={() => {}} onUpload={uploadStub} onSetGoal={vi.fn()} onGoalAction={vi.fn()} />,
+    );
+    expect(screen.queryByTestId("composer-goal-chip")).toBeNull();
+    rerender(
+      <Composer
+        onSend={() => {}}
+        onUpload={uploadStub}
+        goal={goalFixture()}
+        onSetGoal={vi.fn()}
+        onGoalAction={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId("composer-goal-chip")).toHaveTextContent("迁移并验证");
+  });
+
+  test("已清除目标不渲染 chip", () => {
+    render(
+      <Composer
+        onSend={() => {}}
+        onUpload={uploadStub}
+        goal={goalFixture({ status: "cleared" })}
+        onSetGoal={vi.fn()}
+        onGoalAction={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId("composer-goal-chip")).toBeNull();
+  });
+});
+
 describe("F2 「+」按钮闭合态目标角标", () => {
   test("有活跃目标（未近预算）→ 触发按钮显 accent 圆点", () => {
     render(<Composer onSend={() => {}} onUpload={uploadStub} goal={goalFixture()} />);
