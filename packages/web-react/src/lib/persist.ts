@@ -506,13 +506,54 @@ export function turnOwnerId(message: ChatMessage): string | undefined {
       : undefined;
 }
 
+/** Deferred exact-tape locators are not a positive replacement for live
+ * process. `_payloadDeferred` is the authority bit; empty text is the usual
+ * stub body and is not a separate signal. */
+export function isDeferredExactProcessStub(message: ChatMessage | null | undefined): boolean {
+  return message?._payloadDeferred === true;
+}
+
+function ownerRoleKey(owner: string, role: ChatMessage["role"] | undefined): string {
+  return `${owner}\0${role ?? ""}`;
+}
+
+function isPhaseBExactAssistant(message: ChatMessage): boolean {
+  if (message.role !== "assistant") return false;
+  if (message._displayDegradeReason === "records_unpublished") return false;
+  if (isDeferredExactProcessStub(message)) return false;
+  if (message._timelineRecord === true) return true;
+  return message._source === "server" &&
+    message._turnTapeComplete === true &&
+    typeof message._turnTapeId === "string" &&
+    message._turnTapeId.length > 0;
+}
+
+/** Exact, displayable tape process — not unpublished, not a deferred stub. */
+export function isDisplayableExactProcessRow(message: ChatMessage): boolean {
+  if (!message || isDeferredExactProcessStub(message)) return false;
+  if (!isTapeBackedAgentProcessRole(message.role) || message.role === "assistant") return false;
+  if (message._displayDegradeReason === "records_unpublished") return false;
+  if (message._timelineRecord === true) return true;
+  return message._source === "server" &&
+    message._turnTapeComplete === true &&
+    typeof message._turnTapeId === "string" &&
+    message._turnTapeId.length > 0;
+}
+
 function isExactTimelineProcessRow(message: ChatMessage): boolean {
-  return (
-    message._timelineRecord === true &&
-    isTapeBackedAgentProcessRole(message.role) &&
-    message.role !== "assistant" &&
-    message._displayDegradeReason !== "records_unpublished"
-  );
+  return isDisplayableExactProcessRow(message);
+}
+
+function hasDisplayableExactRole(
+  displayableExactByOwnerRole: ReadonlySet<string>,
+  unownedDisplayableRoles: ReadonlySet<string>,
+  role: ChatMessage["role"] | undefined,
+  owner?: string,
+): boolean {
+  if (typeof owner === "string" && displayableExactByOwnerRole.has(ownerRoleKey(owner, role))) {
+    return true;
+  }
+  return typeof role === "string" && unownedDisplayableRoles.has(role);
 }
 
 /**
@@ -520,9 +561,16 @@ function isExactTimelineProcessRow(message: ChatMessage): boolean {
  * tape process rows positively supersede them. `authorityRows` is the server
  * payload during merge, or the current transcript during journal reset.
  *
- * Hits when the owner matches a `records_unpublished` assistant, or when the
- * authority page has an unpublished assistant without `_clientMessageId` and
- * this owner still has no exact `_timelineRecord` process rows.
+ * Hits when:
+ *  - the owner matches a `records_unpublished` assistant, or
+ *  - the authority page has an unpublished assistant without `_clientMessageId`
+ *    and this owner still has no displayable exact process rows, or
+ *  - Phase-B already landed a non-degrade assistant, but this live row's role
+ *    still has no non-deferred exact process (thinking/tool/plan/agent-group/
+ *    delegate-progress/runtime-event). Deferred stubs do not count.
+ *
+ * Default is false: ordinary P2 / completion replacement still drops live
+ * copies once a displayable exact row of the same role is present.
  */
 export function isLiveProcessPendingExactTape(
   message: ChatMessage,
@@ -538,7 +586,11 @@ export function isLiveProcessPendingExactTape(
   }
   const unpublishedOwners = new Set<string>();
   let hasUnownedUnpublishedAssistant = false;
+  const phaseBOwners = new Set<string>();
+  let hasUnownedPhaseBAssistant = false;
   const exactProcessOwners = new Set<string>();
+  const displayableExactByOwnerRole = new Set<string>();
+  const unownedDisplayableRoles = new Set<string>();
   for (const row of authorityRows) {
     if (!row) continue;
     if (row.role === "assistant" && row._displayDegradeReason === "records_unpublished") {
@@ -546,22 +598,46 @@ export function isLiveProcessPendingExactTape(
       if (typeof unpublishedOwner === "string") unpublishedOwners.add(unpublishedOwner);
       else hasUnownedUnpublishedAssistant = true;
     }
+    if (isPhaseBExactAssistant(row)) {
+      const phaseBOwner = turnOwnerId(row);
+      if (typeof phaseBOwner === "string") phaseBOwners.add(phaseBOwner);
+      else hasUnownedPhaseBAssistant = true;
+    }
     if (isExactTimelineProcessRow(row)) {
       const exactOwner = turnOwnerId(row);
-      if (typeof exactOwner === "string") exactProcessOwners.add(exactOwner);
+      if (typeof exactOwner === "string") {
+        exactProcessOwners.add(exactOwner);
+        displayableExactByOwnerRole.add(ownerRoleKey(exactOwner, row.role));
+      } else if (typeof row.role === "string") {
+        unownedDisplayableRoles.add(row.role);
+      }
     }
   }
-  if (unpublishedOwners.size === 0 && !hasUnownedUnpublishedAssistant) return false;
   const owner = turnOwnerId(message);
   if (typeof owner === "string") {
     if (unpublishedOwners.has(owner)) return true;
-    return hasUnownedUnpublishedAssistant && !exactProcessOwners.has(owner);
+    if (hasUnownedUnpublishedAssistant && !exactProcessOwners.has(owner)) return true;
+    if (!phaseBOwners.has(owner) && !hasUnownedPhaseBAssistant) return false;
+    return !hasDisplayableExactRole(
+      displayableExactByOwnerRole,
+      unownedDisplayableRoles,
+      message.role,
+      owner,
+    );
   }
-  return hasUnownedUnpublishedAssistant && exactProcessOwners.size === 0;
+  if (hasUnownedUnpublishedAssistant && exactProcessOwners.size === 0) return true;
+  if (!hasUnownedPhaseBAssistant) return false;
+  return !hasDisplayableExactRole(
+    displayableExactByOwnerRole,
+    unownedDisplayableRoles,
+    message.role,
+  );
 }
 
 /** Journal/units owner-reset: keep pending live process unless incoming units
- * already carry a replacement process row for the same owner. */
+ * already carry a replacement process row for the same owner+role. Owner-only
+ * keys remain accepted for callers that do not distinguish roles. Deferred
+ * stubs must not be added to `incomingProcessOwners`. */
 export function shouldRetainLiveProcessOnOwnerReset(
   message: ChatMessage,
   authorityRows: readonly ChatMessage[],
@@ -569,7 +645,9 @@ export function shouldRetainLiveProcessOnOwnerReset(
 ): boolean {
   if (!isLiveProcessPendingExactTape(message, authorityRows)) return false;
   const owner = turnOwnerId(message);
-  return !(typeof owner === "string" && incomingProcessOwners.has(owner));
+  if (typeof owner !== "string") return true;
+  if (incomingProcessOwners.has(ownerRoleKey(owner, message.role))) return false;
+  return !incomingProcessOwners.has(owner);
 }
 
 function validHistoryOrder(value: unknown): value is number {
@@ -752,7 +830,10 @@ export function mergeFullServerWins(
         (m.role === "assistant" || m.role === "thinking" || m.role === "tool"),
     );
   if (hasExactCompletionEvidence) {
-    local = local.filter((m) => !isSupersededLocalTurnRow(m, completedClientMessageId));
+    local = local.filter((m) =>
+      isLiveProcessPendingExactTape(m, server) ||
+      !isSupersededLocalTurnRow(m, completedClientMessageId),
+    );
   }
   if (unpublishedFinalOwners.size > 0) {
     // Phase-A degrade page is not a complete tape: keep local live
@@ -822,7 +903,10 @@ export function mergeFullServerWins(
     ) {
       return false;
     }
-    return !isCoveredStaleLocalRow(m, evidence, opts?.activeClientMessageId);
+    // Phase-B deferred stubs are not exact process; keep the live copy until a
+    // displayable row of the same role arrives.
+    return isUnpublishedProcessRow(m) ||
+      !isCoveredStaleLocalRow(m, evidence, opts?.activeClientMessageId);
   });
   // 债A：本地富卡拥有的 run → 丢弃 server 同 run 骨架行(local-wins,保住 childBlocks)。
   server = dropServerTeamSkeletonsOwnedLocally(server, local);
@@ -952,10 +1036,14 @@ export function applyServerIncremental(
       (m) =>
         isServerAuthoredRow(m) &&
         m._clientMessageId === completedClientMessageId &&
+        m._displayDegradeReason !== "records_unpublished" &&
         (m.role === "assistant" || m.role === "thinking" || m.role === "tool"),
     )
   ) {
-    local = local.filter((m) => !isSupersededLocalTurnRow(m, completedClientMessageId));
+    local = local.filter((m) =>
+      isLiveProcessPendingExactTape(m, incoming) ||
+      !isSupersededLocalTurnRow(m, completedClientMessageId),
+    );
   }
   // 同步权威传播 P2(增量版,证据为正):增量带回某 turn 的 v2 tape 展开行 = 该 turn 已原子
   // 落权威库,同 turn 的本地过期副本一并清除——不依赖调用方恰好传 completedClientMessageId。
@@ -967,7 +1055,10 @@ export function applyServerIncremental(
       m._timelineRecord !== true &&
       m.role === "agent-group" &&
       exactTimelineAgentGroupRunIds.has(agentGroupRunId(m) ?? "")
-    ) && !isCoveredStaleLocalRow(m, incomingEvidence, opts?.activeClientMessageId),
+    ) && (
+      isLiveProcessPendingExactTape(m, incoming) ||
+      !isCoveredStaleLocalRow(m, incomingEvidence, opts?.activeClientMessageId)
+    ),
   );
   // 债A：增量带回的 server 团队骨架行,若本地富卡已拥有同 run → 丢弃(local-wins,同 full 合并)。
   incoming = dropServerTeamSkeletonsOwnedLocally(incoming, local);
@@ -1252,6 +1343,7 @@ function collectExactTimelineAgentGroupRunIds(rows: ChatMessage[]): Set<string> 
   const runIds = new Set<string>();
   for (const message of rows) {
     if (message?._timelineRecord !== true || message.role !== "agent-group") continue;
+    if (isDeferredExactProcessStub(message)) continue;
     const runId = agentGroupRunId(message);
     if (runId) runIds.add(runId);
   }

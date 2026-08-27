@@ -1993,4 +1993,229 @@ describe("mergeFullServerWins — records_unpublished degrade page", () => {
     expect(merged.find((m) => m.id === "t-as")?._clientMessageId).toBeUndefined();
     expect(merged.find((m) => m.id === "t-as")?._seq).toBe(7);
   });
+
+  test("Phase-B exact assistant + deferred agent-group keeps live agent-group", () => {
+    const cmid = "u-defer-ag";
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1, _source: "server" };
+    const liveThinking: ChatMessage = {
+      id: "live-th", role: "thinking", text: "reason", ts: 2, _clientMessageId: cmid,
+    };
+    const liveTool: ChatMessage = {
+      id: "live-tool", role: "tool", text: "", ts: 3, _clientMessageId: cmid, toolName: "Bash",
+    };
+    const liveGroup: ChatMessage = {
+      id: "live-ag",
+      role: "agent-group",
+      text: "delegate result",
+      ts: 4,
+      _clientMessageId: cmid,
+      _delegateRunId: "run-defer-1",
+    };
+    const tapeThinking: ChatMessage = {
+      id: "tape-th",
+      role: "thinking",
+      text: "reason",
+      ts: 2,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+    };
+    const tapeTool: ChatMessage = {
+      id: "tape-tool",
+      role: "tool",
+      text: "",
+      ts: 3,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+      toolName: "Bash",
+    };
+    const deferredGroup: ChatMessage = {
+      id: "tape-ag",
+      role: "agent-group",
+      text: "",
+      ts: 4,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+      _payloadDeferred: true,
+      _payloadBytes: 5_196_511,
+      _delegateRunId: "run-defer-1",
+    };
+    const tapeAssistant: ChatMessage = {
+      id: "tape-as",
+      role: "assistant",
+      text: "final",
+      ts: 5,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+    };
+    const merged = mergeFullServerWins(
+      [user, tapeThinking, tapeTool, deferredGroup, tapeAssistant],
+      [user, liveThinking, liveTool, liveGroup],
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    expect(merged.some((m) => m.id === "live-th")).toBe(false);
+    expect(merged.some((m) => m.id === "live-tool")).toBe(false);
+    expect(merged.some((m) => m.id === "tape-th")).toBe(true);
+    expect(merged.some((m) => m.id === "tape-as")).toBe(true);
+    expect(merged.some((m) => m.id === "live-ag")).toBe(true);
+    expect(merged.filter((m) => m.role === "agent-group").map((m) => m.id).sort()).toEqual(
+      ["live-ag", "tape-ag"].sort(),
+    );
+  });
+
+  test("Phase-B exact assistant without thinking/tool keeps live thinking/tool", () => {
+    const cmid = "u-assist-only";
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1, _source: "server" };
+    const liveThinking: ChatMessage = {
+      id: "live-th", role: "thinking", text: "reason", ts: 2, _clientMessageId: cmid,
+    };
+    const liveTool: ChatMessage = {
+      id: "live-tool", role: "tool", text: "", ts: 3, _clientMessageId: cmid, toolName: "Bash",
+    };
+    const tapeAssistant: ChatMessage = {
+      id: "tape-as",
+      role: "assistant",
+      text: "final",
+      ts: 5,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+    };
+    const merged = mergeFullServerWins(
+      [user, tapeAssistant],
+      [user, liveThinking, liveTool],
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    expect(merged.some((m) => m.id === "live-th")).toBe(true);
+    expect(merged.some((m) => m.id === "live-tool")).toBe(true);
+    expect(merged.some((m) => m.id === "tape-as")).toBe(true);
+  });
+
+  test("Phase-B hydrated non-deferred agent-group replaces live copy without duplicates", () => {
+    const cmid = "u-hydrate-ag";
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1, _source: "server" };
+    const liveGroup: ChatMessage = {
+      id: "live-ag",
+      role: "agent-group",
+      text: "delegate result",
+      ts: 4,
+      _clientMessageId: cmid,
+      _delegateRunId: "run-hydrate-1",
+    };
+    const deferredGroup: ChatMessage = {
+      id: "tape-ag",
+      role: "agent-group",
+      text: "",
+      ts: 4,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+      _payloadDeferred: true,
+      _payloadBytes: 1_231_832,
+      _delegateRunId: "run-hydrate-1",
+    };
+    const tapeAssistant: ChatMessage = {
+      id: "tape-as",
+      role: "assistant",
+      text: "final",
+      ts: 5,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+    };
+    const pending = mergeFullServerWins(
+      [user, deferredGroup, tapeAssistant],
+      [user, liveGroup],
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    expect(pending.some((m) => m.id === "live-ag")).toBe(true);
+
+    const hydratedGroup: ChatMessage = {
+      ...deferredGroup,
+      text: "delegate result",
+      _payloadDeferred: undefined,
+      _payloadBytes: undefined,
+    };
+    const replaced = mergeFullServerWins(
+      [user, hydratedGroup, tapeAssistant],
+      pending,
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    expect(replaced.filter((m) => m.role === "agent-group").map((m) => m.id)).toEqual(["tape-ag"]);
+    expect(replaced.some((m) => m.id === "live-ag")).toBe(false);
+    expect(replaced.find((m) => m.id === "tape-ag")?._payloadDeferred).toBeUndefined();
+  });
+
+  test("Phase-B deferred tool stub keeps live tool until payload arrives", () => {
+    const cmid = "u-defer-tool";
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1, _source: "server" };
+    const liveTool: ChatMessage = {
+      id: "live-tool",
+      role: "tool",
+      text: "",
+      ts: 3,
+      _clientMessageId: cmid,
+      toolName: "Bash",
+      output: "ok",
+    };
+    const deferredTool: ChatMessage = {
+      id: "tape-tool",
+      role: "tool",
+      text: "",
+      ts: 3,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+      _payloadDeferred: true,
+      _payloadBytes: 200_000,
+      toolName: "Bash",
+    };
+    const tapeAssistant: ChatMessage = {
+      id: "tape-as",
+      role: "assistant",
+      text: "final",
+      ts: 5,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _timelineRecord: true,
+    };
+    const merged = mergeFullServerWins(
+      [user, deferredTool, tapeAssistant],
+      [user, liveTool],
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    expect(merged.some((m) => m.id === "live-tool")).toBe(true);
+    expect(merged.some((m) => m.id === "tape-tool")).toBe(true);
+  });
 });
