@@ -168,6 +168,15 @@ declare global {
         historicalSyncs: number;
         historicalDecision: boolean;
       }>;
+      /** Phase-A unpublished + empty live-units reset must keep thinking/tool/plan. */
+      runPhaseAEmptyUnitsReset: () => Promise<{
+        sending: boolean;
+        roles: string[];
+        thinkingId?: string;
+        toolId?: string;
+        planId?: string;
+        unpublished: boolean;
+      }>;
     };
     /** T23 会话内切模型:候选项展示名与 id 的单一权威(run.mjs 从页面读回)。 */
     __modelFixture: {
@@ -229,6 +238,9 @@ window.__replayDrive = {
   },
   runDurableErrorReplay: async () => {
     throw new Error("durable error replay probe 未挂载");
+  },
+  runPhaseAEmptyUnitsReset: async () => {
+    throw new Error("phase-a empty units reset probe 未挂载");
   },
 };
 window.__runPendingDispatchJournalProbe = async () => {
@@ -1674,6 +1686,99 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         historicalReports: replayReportedErrors,
         historicalSyncs: replaySyncCalls,
         historicalDecision: historical._automaticRecoveryDecisions?.[historicalId] === true,
+      };
+    },
+    runPhaseAEmptyUnitsReset: async () => {
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        "phase-a empty units reset",
+      );
+      const clientMessageId = "m-browser-phase-a-reset";
+      session._sendingInFlight = true;
+      session._activeClientMessageId = clientMessageId;
+      const user = {
+        id: clientMessageId,
+        role: "user" as const,
+        text: "BROWSER_PHASE_A_RESET_USER",
+        ts: 1,
+        status: "sent" as const,
+        _source: "server" as const,
+        _seq: 1,
+        _orderSeq: 1,
+        _timelineRecord: true,
+        _timelineUnitKey: `outer:${REPLAY_SESSION_ID}:1`,
+      };
+      session.messages = [
+        user,
+        {
+          id: "browser-phase-a-thinking",
+          role: "thinking",
+          text: "BROWSER_PHASE_A_RESET_THINKING",
+          ts: 2,
+          _clientMessageId: clientMessageId,
+        },
+        {
+          id: "browser-phase-a-tool",
+          role: "tool",
+          text: "",
+          toolName: "Bash",
+          output: "BROWSER_PHASE_A_RESET_TOOL",
+          ts: 3,
+          _clientMessageId: clientMessageId,
+        },
+        {
+          id: "browser-phase-a-plan",
+          role: "plan",
+          text: "BROWSER_PHASE_A_RESET_PLAN",
+          ts: 4,
+          _clientMessageId: clientMessageId,
+        },
+      ];
+      replaySocket.applyServerMessages(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        [
+          user,
+          {
+            id: "browser-phase-a-answer",
+            role: "assistant",
+            text: "BROWSER_PHASE_A_RESET_ANSWER",
+            ts: 5,
+            _source: "server",
+            _seq: 2,
+            _orderSeq: 2,
+            _clientMessageId: clientMessageId,
+            _turnTapeId: "tape-browser-phase-a",
+            _turnTapeSha256: "a".repeat(64),
+            _turnTapeComplete: true,
+            _dispatchOutcome: "completed",
+            _timelineRecord: true,
+            _timelineUnitKey: "tape-fallback:tape-browser-phase-a",
+            _displayDegraded: true,
+            _displayDegradeReason: "records_unpublished",
+          },
+        ],
+        true,
+        2,
+        {
+          serverUpdatedAt: 2,
+          historyRevision: 1,
+          timelineGeneration: 2,
+          completedClientMessageId: clientMessageId,
+        },
+      );
+      replaySocket.applyLiveUnits(REPLAY_SESSION_ID, [], [clientMessageId]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return {
+        sending: session._sendingInFlight === true,
+        roles: session.messages.map((message) => message.role),
+        thinkingId: session.messages.find((message) => message.id === "browser-phase-a-thinking")?.id,
+        toolId: session.messages.find((message) => message.id === "browser-phase-a-tool")?.id,
+        planId: session.messages.find((message) => message.id === "browser-phase-a-plan")?.id,
+        unpublished: session.messages.some((message) =>
+          message.role === "assistant" && message._displayDegradeReason === "records_unpublished"),
       };
     },
   };

@@ -1839,6 +1839,42 @@ describe("mergeFullServerWins — records_unpublished degrade page", () => {
     expect(remerged.some((m) => m.id === "live-plan")).toBe(true);
   });
 
+  test("Phase-A fallback without _clientMessageId still keeps live process on repeated merge", () => {
+    const cmid = "u-no-owner";
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1 };
+    const thinking: ChatMessage = {
+      id: "live-th", role: "thinking", text: "reason", ts: 2, _clientMessageId: cmid,
+    };
+    const tool: ChatMessage = {
+      id: "live-tool", role: "tool", text: "", ts: 3, _clientMessageId: cmid, toolName: "Bash",
+    };
+    const plan: ChatMessage = {
+      id: "live-plan", role: "plan", text: "plan", ts: 4, _clientMessageId: cmid,
+    };
+    const final: ChatMessage = {
+      id: "answer-1",
+      role: "assistant",
+      text: "final",
+      ts: 5,
+      _source: "server",
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _displayDegraded: true,
+      _displayDegradeReason: "records_unpublished",
+    };
+    const merged = mergeFullServerWins([user, final], [user, thinking, tool, plan], 0, cmid, {
+      deletionAuthority: true,
+    });
+    expect(merged.map((m) => m.role)).toEqual(["user", "thinking", "tool", "plan", "assistant"]);
+    const remerged = mergeFullServerWins([user, final], merged, 0, cmid, {
+      deletionAuthority: true,
+    });
+    expect(remerged.map((m) => m.role)).toEqual(["user", "thinking", "tool", "plan", "assistant"]);
+    expect(remerged.some((m) => m.id === "live-th")).toBe(true);
+    expect(remerged.some((m) => m.id === "live-tool")).toBe(true);
+    expect(remerged.some((m) => m.id === "live-plan")).toBe(true);
+  });
+
   test("a complete tape without degrade replaces the live process rows", () => {
     const cmid = "u-exact";
     const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1, _source: "server" };

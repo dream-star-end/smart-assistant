@@ -2547,6 +2547,29 @@ await check("T45 中断 turn 刷新后仍显示 requestId/积分，空窗给出�
   }
 });
 
+await check("T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runPhaseAEmptyUnitsReset());
+  if (JSON.stringify(result.roles) !== JSON.stringify(["user", "thinking", "tool", "plan", "assistant"])) {
+    throw new Error(`Phase-A empty units reset 丢过程行:${JSON.stringify(result)}`);
+  }
+  if (result.sending) throw new Error("Phase-A 完成后仍在发送");
+  if (!result.unpublished || result.thinkingId !== "browser-phase-a-thinking"
+    || result.toolId !== "browser-phase-a-tool" || result.planId !== "browser-phase-a-plan") {
+    throw new Error(`Phase-A empty units reset 缺行:${JSON.stringify(result)}`);
+  }
+  const thinkingHeader = replayRoot.getByRole("button", { name: /思考|已思考/ }).first();
+  await thinkingHeader.waitFor({ state: "visible", timeout: 3000 });
+  await thinkingHeader.click();
+  await replayRoot.getByText("BROWSER_PHASE_A_RESET_THINKING", { exact: false }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await replayRoot.getByText("BROWSER_PHASE_A_RESET_ANSWER", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+});
+
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {
   const alive = await page.evaluate(() => ({
     root: Boolean(document.querySelector("#root")),
