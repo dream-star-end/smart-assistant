@@ -528,9 +528,35 @@ function isPhaseBExactAssistant(message: ChatMessage): boolean {
     message._turnTapeId.length > 0;
 }
 
+function toolIdentity(message: ChatMessage): string | undefined {
+  if (typeof message.blockId === "string" && message.blockId.length > 0) return message.blockId;
+  const extra = message as ChatMessage & { toolUseId?: string; toolUseBlockId?: string };
+  if (typeof extra.toolUseId === "string" && extra.toolUseId.length > 0) return extra.toolUseId;
+  if (typeof extra.toolUseBlockId === "string" && extra.toolUseBlockId.length > 0) {
+    return extra.toolUseBlockId;
+  }
+  return undefined;
+}
+
+function toolRowHasResult(message: ChatMessage): boolean {
+  if (typeof message.output === "string" && message.output.length > 0) return true;
+  if (message.error === true) return true;
+  return false;
+}
+
+/** Tape tool rows frozen at streaming tool_use (partial + empty output) are
+ *  not a positive replacement for a live tool_result. */
+export function isIncompleteDurableToolRow(message: ChatMessage | null | undefined): boolean {
+  if (!message || message.role !== "tool") return false;
+  if (toolRowHasResult(message)) return false;
+  const extra = message as ChatMessage & { partial?: boolean; completed?: boolean };
+  return extra._partial === true || extra.partial === true || extra._completed === false || extra.completed === false;
+}
+
 /** Exact, displayable tape process — not unpublished, not a deferred stub. */
 export function isDisplayableExactProcessRow(message: ChatMessage): boolean {
   if (!message || isDeferredExactProcessStub(message)) return false;
+  if (isIncompleteDurableToolRow(message)) return false;
   if (!isTapeBackedAgentProcessRole(message.role) || message.role === "assistant") return false;
   if (message._displayDegradeReason === "records_unpublished") return false;
   if (message._timelineRecord === true) return true;
@@ -614,6 +640,26 @@ export function isLiveProcessPendingExactTape(
     }
   }
   const owner = turnOwnerId(message);
+  if (message.role === "tool" && toolRowHasResult(message)) {
+    const liveId = toolIdentity(message);
+    const exactSameTool = liveId
+      ? authorityRows.some((row) =>
+          isDisplayableExactProcessRow(row) &&
+          row.role === "tool" &&
+          toolIdentity(row) === liveId &&
+          (typeof owner !== "string" || turnOwnerId(row) === owner),
+        )
+      : false;
+    if (!exactSameTool) {
+      if (typeof owner === "string") {
+        if (unpublishedOwners.has(owner)) return true;
+        if (hasUnownedUnpublishedAssistant && !exactProcessOwners.has(owner)) return true;
+        if (phaseBOwners.has(owner) || hasUnownedPhaseBAssistant) return true;
+      } else if (hasUnownedUnpublishedAssistant || hasUnownedPhaseBAssistant) {
+        return true;
+      }
+    }
+  }
   if (typeof owner === "string") {
     if (unpublishedOwners.has(owner)) return true;
     if (hasUnownedUnpublishedAssistant && !exactProcessOwners.has(owner)) return true;
