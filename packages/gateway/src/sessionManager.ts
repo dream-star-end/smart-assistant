@@ -1787,6 +1787,9 @@ export interface PromptQueueExecutionFence {
 
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
+  /** Per-sessionKey mutex around getOrCreate so two concurrent turns cannot
+   *  each replace the runner and --resume the same Cursor SQLite store. */
+  private _sessionCreateGates = new Map<string, Promise<void>>()
   /** Queue execution uses the existing promise only as an execution mutex.
    * The WeakSet is the synchronous admission fence that rejects, rather than
    * queues, any second submit while that mutex is owned. */
@@ -3333,6 +3336,31 @@ export class SessionManager {
      *  Spawn-time attribute(delegate sessionKey 带时间戳一次性,不存在复用)。 */
     usageAttribution?: UsageAttributionTag
   }): Promise<AgentSession> {
+    return this._enterSessionCreateGate(opts.sessionKey, () => this._getOrCreateExclusive(opts))
+  }
+
+  private async _enterSessionCreateGate<T>(sessionKey: string, work: () => Promise<T>): Promise<T> {
+    const previous = this._sessionCreateGates.get(sessionKey) ?? Promise.resolve()
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const tail = previous.then(() => held, () => held)
+    this._sessionCreateGates.set(sessionKey, tail)
+    try {
+      await previous
+      return await work()
+    } finally {
+      release()
+      if (this._sessionCreateGates.get(sessionKey) === tail) {
+        this._sessionCreateGates.delete(sessionKey)
+      }
+    }
+  }
+
+  private async _getOrCreateExclusive(
+    opts: Parameters<SessionManager['getOrCreate']>[0],
+  ): Promise<AgentSession> {
     const ownsDispatchFence = this._ownsPromptQueueExecutionFence(
       opts.sessionKey,
       opts.promptQueueExecutionFence,
@@ -3370,7 +3398,7 @@ export class SessionManager {
     const engineId = resolveEngine(executionModel, opts.agent, opts.executionAuthority, {
       requireAuthority: isModelAuthorityRequired(),
     })
-    const existing = this.sessions.get(opts.sessionKey)
+    let existing = this.sessions.get(opts.sessionKey)
     if (existing?._modelSwitchTransition) {
       const transition = existing._modelSwitchTransition
       if (
@@ -3453,6 +3481,35 @@ export class SessionManager {
         // first submit().
         try {
           await existing.lock
+          const canonical = this.sessions.get(opts.sessionKey)
+          if (canonical && canonical !== existing) {
+            const desiredEngineNow =
+              opts.model !== undefined ||
+              opts.executionAuthority !== undefined ||
+              opts.agent.provider === 'codex-native'
+                ? engineId
+                : canonical.providerTag
+            const stillNeedsReplace =
+              canonical.providerTag !== desiredEngineNow ||
+              (opts.workspaceMode !== undefined && canonical.workspaceMode !== workspaceMode) ||
+              (opts.workspaceCwd !== undefined && canonical.workspaceCwd !== opts.workspaceCwd) ||
+              (opts.projectId !== undefined && (canonical.projectId ?? null) !== (opts.projectId ?? null))
+            if (!stillNeedsReplace) {
+              canonical.lastUsedAt = Date.now()
+              if (opts.title && (!canonical.title || canonical.title === 'New conversation'))
+                canonical.title = opts.title
+              if (opts.userId && !canonical.userId) canonical.userId = opts.userId
+              if (opts.repoSessionId && !canonical.repoSessionId) canonical.repoSessionId = opts.repoSessionId
+              if (opts.parentSessionKey && !canonical.parentSessionKey)
+                canonical.parentSessionKey = opts.parentSessionKey
+              if (opts.projectId !== undefined) canonical.projectId = opts.projectId
+              if (nextFingerprint) canonical.contextFingerprint = nextFingerprint
+              if (opts.runContext) canonical.runContext = opts.runContext
+              return canonical
+            }
+            existing = canonical
+            existing._replacing = true
+          }
           try {
             const legacyId = this._resumeMap.get(opts.sessionKey)
             const ids =
@@ -3490,7 +3547,9 @@ export class SessionManager {
             workspaceModeChanged,
           }, err)
         }
-        this.sessions.delete(opts.sessionKey)
+        if (this.sessions.get(opts.sessionKey) === existing) {
+          this.sessions.delete(opts.sessionKey)
+        }
       } else {
         existing.lastUsedAt = Date.now()
         if (opts.title && (!existing.title || existing.title === 'New conversation'))

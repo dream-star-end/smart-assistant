@@ -1476,14 +1476,49 @@ function cursorStoreDbReady(storePath: string): boolean {
   }
 }
 
-function copyDirRecursive(src: string, dest: string): void {
+function copyDirRecursive(
+  src: string,
+  dest: string,
+  afterCopyFile?: (from: string, to: string) => void,
+): void {
   mkdirSync(dest, { recursive: true, mode: 0o700 })
   for (const ent of readdirSync(src, { withFileTypes: true })) {
     const from = join(src, ent.name)
     const to = join(dest, ent.name)
-    if (ent.isDirectory()) copyDirRecursive(from, to)
-    else copyFileSync(from, to)
+    if (ent.isDirectory()) copyDirRecursive(from, to, afterCopyFile)
+    else {
+      copyFileSync(from, to)
+      afterCopyFile?.(from, to)
+    }
   }
+}
+
+function listStoreFileSizes(dir: string): Map<string, number> {
+  const out = new Map<string, number>()
+  const walk = (base: string, prefix: string): void => {
+    for (const ent of readdirSync(base, { withFileTypes: true })) {
+      const rel = prefix ? `${prefix}/${ent.name}` : ent.name
+      const full = join(base, ent.name)
+      if (ent.isDirectory()) walk(full, rel)
+      else {
+        try { out.set(rel, statSync(full).size) } catch { out.set(rel, -1) }
+      }
+    }
+  }
+  walk(dir, '')
+  return out
+}
+
+/** Staging 必须含 store.db,且源目录每个文件都按同相对路径和大小出现。 */
+function stagingMatchesSource(srcDir: string, stagingDir: string): boolean {
+  if (!cursorStoreDbReady(join(stagingDir, 'store.db'))) return false
+  const src = listStoreFileSizes(srcDir)
+  if (src.size === 0) return false
+  const dst = listStoreFileSizes(stagingDir)
+  for (const [rel, size] of src) {
+    if (dst.get(rel) !== size) return false
+  }
+  return true
 }
 
 function findCursorResumeStoreElsewhere(sessionId: string, currentDir: string): string | undefined {
@@ -1566,42 +1601,68 @@ export function relocateCursorResumeStore(opts: {
     }
     if (!srcDir) srcDir = findCursorResumeStoreElsewhere(resumeId, destDir)
     if (!srcDir) return undefined
-    if (resolve(srcDir) === resolve(destDir)) {
+    const sourceDir = srcDir
+    if (resolve(sourceDir) === resolve(destDir)) {
       return cursorStoreDbReady(destStore) ? { resumeId, relocated: false } : undefined
     }
-    if (!cursorStoreDbReady(join(srcDir, 'store.db'))) return undefined
+    if (!cursorStoreDbReady(join(sourceDir, 'store.db'))) return undefined
 
+    const destParent = dirname(destDir)
     try {
-      mkdirSync(dirname(destDir), { recursive: true, mode: 0o700 })
+      mkdirSync(destParent, { recursive: true, mode: 0o700 })
     } catch (err) {
       log.warn('Cursor resume store dest parent create failed', { resumeId, destDir, err: String(err) })
       return undefined
     }
 
+    _internals.relocateTest.attempts += 1
+
+    const publishFromStaging = (stagingDir: string): { resumeId: string; relocated: boolean } | undefined => {
+      if (!stagingMatchesSource(sourceDir, stagingDir)) {
+        try { rmSync(stagingDir, { recursive: true, force: true }) } catch { /* ignore */ }
+        return undefined
+      }
+      try {
+        renameSync(stagingDir, destDir)
+      } catch {
+        try { rmSync(stagingDir, { recursive: true, force: true }) } catch { /* ignore */ }
+        return existsSync(destDir) && cursorStoreDbReady(destStore)
+          ? { resumeId, relocated: false }
+          : undefined
+      }
+      try {
+        rmSync(sourceDir, { recursive: true, force: true })
+      } catch {
+        log.warn('Cursor resume store old dir cleanup failed', { resumeId, srcDir: sourceDir })
+      }
+      return { resumeId, relocated: true }
+    }
+
     try {
-      renameSync(srcDir, destDir)
+      if (_internals.relocateTest.forceCopy) {
+        const err = new Error('EXDEV') as NodeJS.ErrnoException
+        err.code = 'EXDEV'
+        throw err
+      }
+      renameSync(sourceDir, destDir)
       if (cursorStoreDbReady(destStore)) return { resumeId, relocated: true }
     } catch (renameErr) {
       if (existsSync(destDir) && cursorStoreDbReady(destStore)) {
         return { resumeId, relocated: false }
       }
       if (existsSync(destDir)) return undefined
+      let stagingDir: string | undefined
       try {
-        copyDirRecursive(srcDir, destDir)
-        if (!cursorStoreDbReady(destStore)) {
-          try { rmSync(destDir, { recursive: true, force: true }) } catch { /* ignore */ }
-          return undefined
-        }
-        try {
-          rmSync(srcDir, { recursive: true, force: true })
-        } catch {
-          log.warn('Cursor resume store old dir cleanup failed', { resumeId, srcDir })
-        }
-        return { resumeId, relocated: true }
+        stagingDir = mkdtempSync(join(destParent, `.${basename(destDir)}.relocating-`))
+        copyDirRecursive(sourceDir, stagingDir, _internals.relocateTest.afterCopyFile)
+        return publishFromStaging(stagingDir)
       } catch (copyErr) {
+        if (stagingDir) {
+          try { rmSync(stagingDir, { recursive: true, force: true }) } catch { /* ignore */ }
+        }
         log.warn('Cursor resume store relocate failed', {
           resumeId,
-          srcDir,
+          srcDir: sourceDir,
           destDir,
           renameErr: String(renameErr),
           copyErr: String(copyErr),
@@ -2448,6 +2509,16 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
 }
 
 export const _internals = {
+  relocateTest: {
+    forceCopy: false,
+    afterCopyFile: undefined as undefined | ((from: string, to: string) => void),
+    attempts: 0,
+    reset(): void {
+      this.forceCopy = false
+      this.afterCopyFile = undefined
+      this.attempts = 0
+    },
+  },
   CURSOR_PREAMBLE,
   OPENCLAUDE_MEMORY_MCP_TOOLS,
   formatPresentOptionsFence,
