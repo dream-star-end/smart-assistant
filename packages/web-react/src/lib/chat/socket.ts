@@ -583,13 +583,34 @@ const LIVE_PROCESS_FRAME_KINDS = new Set([
   "thinking", "tool_use", "plan", "goal", "agent_group", "delegate_progress",
 ]);
 
+function liveProcessRoleForUnitKind(kind: string | undefined): ChatMessage["role"] | undefined {
+  if (kind === "agent_group") return "agent-group";
+  if (kind === "delegate_progress") return "delegate-progress";
+  if (kind === "thinking" || kind === "tool" || kind === "plan" || kind === "goal") return kind;
+  return undefined;
+}
+
+function liveProcessRoleForFrameKind(kind: string | undefined): ChatMessage["role"] | undefined {
+  if (kind === "tool_use") return "tool";
+  return liveProcessRoleForUnitKind(kind);
+}
+
 function liveProcessOwnersFromUnits(
-  units: Array<{ kind?: string; clientMessageId?: string | null }>,
+  units: Array<{
+    kind?: string;
+    clientMessageId?: string | null;
+    text?: string | null;
+    _payloadDeferred?: boolean;
+    payloadDeferred?: boolean;
+  }>,
 ): Set<string> {
   const owners = new Set<string>();
   for (const unit of units) {
     if (typeof unit.clientMessageId !== "string" || !unit.clientMessageId) continue;
-    if (LIVE_PROCESS_UNIT_KINDS.has(unit.kind ?? "")) owners.add(unit.clientMessageId);
+    if (!LIVE_PROCESS_UNIT_KINDS.has(unit.kind ?? "")) continue;
+    if (unit._payloadDeferred === true || unit.payloadDeferred === true) continue;
+    const role = liveProcessRoleForUnitKind(unit.kind);
+    if (role) owners.add(`${unit.clientMessageId}\0${role}`);
   }
   return owners;
 }
@@ -601,7 +622,12 @@ function liveProcessOwnersFromFrames(
   for (const record of frames) {
     const payload = record.payload;
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
-    const raw = payload as { clientMessageId?: unknown; blocks?: unknown };
+    const raw = payload as {
+      clientMessageId?: unknown;
+      blocks?: unknown;
+      _payloadDeferred?: unknown;
+    };
+    if (raw._payloadDeferred === true) continue;
     const clientMessageId =
       typeof record.clientMessageId === "string" && record.clientMessageId
         ? record.clientMessageId
@@ -609,12 +635,17 @@ function liveProcessOwnersFromFrames(
           ? raw.clientMessageId
           : undefined;
     if (!clientMessageId || !Array.isArray(raw.blocks)) continue;
-    if (raw.blocks.some((block) => {
+    for (const block of raw.blocks) {
       const kind = block && typeof block === "object"
         ? (block as { kind?: unknown }).kind
         : undefined;
-      return typeof kind === "string" && LIVE_PROCESS_FRAME_KINDS.has(kind);
-    })) owners.add(clientMessageId);
+      if (typeof kind !== "string" || !LIVE_PROCESS_FRAME_KINDS.has(kind)) continue;
+      if (block && typeof block === "object" && (block as { _payloadDeferred?: unknown })._payloadDeferred === true) {
+        continue;
+      }
+      const role = liveProcessRoleForFrameKind(kind);
+      if (role) owners.add(`${clientMessageId}\0${role}`);
+    }
   }
   return owners;
 }
