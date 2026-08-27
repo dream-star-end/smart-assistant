@@ -45,6 +45,7 @@ const knowledgePlanetSeed = path.join(
   root,
   'packages/commercial/scripts/seed-knowledge-planet-plugin.ts',
 )
+const weiboSeed = path.join(root, 'packages/commercial/scripts/seed-weibo-plugin.ts')
 const supervisor = path.join(root, 'packages/commercial/src/agent-sandbox/v3supervisor.ts')
 const runtimeDockerfile = path.join(root, 'packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime')
 const v5Overrides = path.join(root, 'deploy/v5/commercial-v5.env.overrides')
@@ -1433,6 +1434,86 @@ describe('v5 release safety lanes', () => {
       seedSource,
       /throw new Error\('new Knowledge Planet Plugin versions require an encrypted action handoff'\)/,
     )
+  })
+
+  test('Weibo Plugin is noninteractively gated like Knowledge Planet and never consumes cookies on deploy', async () => {
+    const [source, seedSource] = await Promise.all([
+      readFile(deploy, 'utf8'),
+      readFile(weiboSeed, 'utf8'),
+    ])
+    const start = source.indexOf('\ndeploy() {')
+    const end = source.indexOf('\n# ───────────────────────── offline recycle', start)
+    assert.ok(start >= 0 && end > start)
+    const body = source.slice(start, end)
+    const built = body.indexOf('build_release ||')
+    const kpAdvisory = body.indexOf('knowledge_planet_plugin_advisory_gate "$BUILT_RELEASE"')
+    const weiboAdvisory = body.indexOf('weibo_plugin_advisory_gate "$BUILT_RELEASE"')
+    const maintenance = body.indexOf('begin_planned_maintenance deploy')
+    const weiboClose = body.indexOf('weibo_plugin_close_gate "$BUILT_RELEASE"')
+    const weiboClassify = body.indexOf('weibo_plugin_classify_previous_release')
+    const activation = body.indexOf('activate_release "$BUILT_RELEASE"')
+    const fullSmoke = body.indexOf('smoke "$ACTIVE_PORT"')
+    const kpSeed = body.indexOf('knowledge_planet_plugin_seed "$BUILT_RELEASE"')
+    const weiboFinishZeroTouch = body.indexOf('weibo_plugin_finish_or_seed "$BUILT_RELEASE"')
+    const weiboFinishAfterKp = body.indexOf('weibo_plugin_finish_or_seed "$BUILT_RELEASE"', kpSeed)
+    assert.ok(built >= 0 && kpAdvisory > built && weiboAdvisory > kpAdvisory && maintenance > weiboAdvisory)
+    assert.ok(
+      weiboClose > maintenance &&
+        weiboClassify > weiboClose &&
+        activation > weiboClassify &&
+        fullSmoke > activation &&
+        weiboFinishZeroTouch > fullSmoke &&
+        weiboFinishZeroTouch < kpSeed &&
+        weiboFinishAfterKp > kpSeed,
+    )
+    assert.match(source, /advisory == "weibo"/)
+    assert.match(source, /seed-weibo-plugin\.ts --advisory-status/)
+    assert.match(
+      source,
+      /seed-weibo-plugin\.ts --smoke-only[\s\S]*seed-weibo-plugin\.ts --seed-only/,
+    )
+    assert.match(
+      source,
+      /deploy_dist\(\)[\s\S]*weibo_plugin_assert_release_compatible[\s\S]*activate_runtime_tuple/,
+    )
+    assert.match(
+      source,
+      /canary\(\)[\s\S]*weibo_plugin_assert_release_compatible[\s\S]*start_candidate_unit_and_wait/,
+    )
+    assert.match(
+      source,
+      /finalize\(\)[\s\S]*weibo_plugin_assert_release_compatible[\s\S]*finalize_run_steps/,
+    )
+    assert.match(seedSource, /--verify-and-upgrade-user=/)
+    assert.match(seedSource, /--advisory-status/)
+    assert.match(seedSource, /--seed-only/)
+    assert.match(seedSource, /--smoke-only/)
+    assert.match(seedSource, /--close-listing-gate/)
+    assert.match(seedSource, /--classify-current-for-release=/)
+    assert.match(seedSource, /--open-listing-gate-current/)
+    assert.match(seedSource, /zero-touch seed: reopening gate to current approved version/)
+    assert.match(seedSource, /async function openListingGateToCurrent/)
+    assert.match(seedSource, /findApprovedWeiboPluginForDeploy/)
+    assert.match(seedSource, /process\.exit\(1\)/)
+    assert.doesNotMatch(seedSource, /smoke skipped/)
+    const smokeOnly = seedSource.slice(
+      seedSource.indexOf('async function smokeOnly()'),
+      seedSource.indexOf('async function seedOnly()'),
+    )
+    assert.doesNotMatch(smokeOnly, /startLogin|exactImageSmoke|qrSmoke/)
+    const seedOnly = seedSource.slice(
+      seedSource.indexOf('async function seedOnly()'),
+      seedSource.indexOf('interface TargetReleaseContract'),
+    )
+    assert.doesNotMatch(seedOnly, /--verify-and-upgrade-user=\d|loadVerifiedState|exactImageSmoke/)
+    assert.match(seedOnly, /seedWeiboPlugin/)
+    assert.doesNotMatch(body, /weibo_plugin_verify_user/)
+    assert.doesNotMatch(source, /--verify-weibo-user/)
+    const dry = run(deploy, ['--dry-run'])
+    assert.equal(dry.status, 0, dry.stdout + dry.stderr)
+    assert.match(dry.stdout, /Weibo Plugin:advisory status/)
+    assert.match(dry.stdout, /close Weibo listing execution gate/)
+    assert.match(dry.stdout, /official Weibo seed\/migration/)
   })
 
   test('Knowledge Planet setup-first deploy is race-guarded, repeat-safe, and skips the v1.1 seed', async () => {

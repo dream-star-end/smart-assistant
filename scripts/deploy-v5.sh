@@ -7566,6 +7566,249 @@ knowledge_planet_compensate_setup_first() { # <helper/new> <previous> <hotcfg:0|
   return "$failed"
 }
 
+# Official Weibo Plugin publication is a deploy-time operation, isomorphic to
+# Knowledge Planet. Human cookie verification stays on seed-weibo-plugin.ts
+# --verify-and-upgrade-user. Normal deploy is strictly noninteractive: advisory
+# + listing gate + --seed-only. Seed failure fails the deploy loud; listing
+# already matching the compiled pin is an idempotent pass.
+weibo_candidate_commit() {
+  [[ "$BUILT_RELEASE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "✗ Weibo candidate source commit is not pinned" >&2
+    return 1
+  }
+  printf '%s' "$BUILT_RELEASE_SOURCE_COMMIT"
+}
+
+weibo_plugin_smoke_gate() { # <pinned master release>
+  local release="$1"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] noninteractive exact-image Weibo approval gate @ $release"
+    return 0
+  fi
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$release'
+    npx --no-install tsx packages/commercial/scripts/seed-weibo-plugin.ts --smoke-only"
+}
+
+# 与知识星球同构的非阻断咨询门:平台部署不被微博审批状态阻断。未审批制品
+# 运行时 fail-closed(classifyWeiboSetupPin 拒 pin)。stdout 单行 JSON + jq 校验;
+# 基础设施故障(镜像/DB)仍 fail-closed。
+WB_PLUGIN_PROMOTE=0
+weibo_plugin_advisory_gate() { # <pinned master release>
+  local release="$1"
+  WB_PLUGIN_PROMOTE=0
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] Weibo advisory status(非阻断;判定是否做插件迁移)@ $release"
+    return 0
+  fi
+  local output
+  output="$(ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$release'
+    npx --no-install tsx packages/commercial/scripts/seed-weibo-plugin.ts --advisory-status")" || {
+    echo "✗ Weibo advisory status 执行失败(基础设施:镜像/DB/ssh)" >&2
+    return 1
+  }
+  local line
+  line="$(printf '%s\n' "$output" | grep -a '"advisory":"weibo"' | tail -1)"
+  if [[ -z "$line" ]] || ! jq -e '
+      .advisory == "weibo"
+      and (.approvedForDeploy | type == "boolean")
+      and (.handoffPresent | type == "boolean")
+      and (.artifactMatchesCurrentApproved | type == "boolean")' >/dev/null 2>&1 <<<"$line"; then
+    echo "✗ Weibo advisory status 输出不符合 JSON 契约:$(printf '%s' "$output" | head -c 200)" >&2
+    return 1
+  fi
+  local approved handoff matches
+  approved="$(jq -r '.approvedForDeploy' <<<"$line")"
+  handoff="$(jq -r '.handoffPresent' <<<"$line")"
+  matches="$(jq -r '.artifactMatchesCurrentApproved' <<<"$line")"
+  if [[ "$approved" == true || "$handoff" == true ]]; then
+    WB_PLUGIN_PROMOTE=1
+    echo "  · Weibo:候选已审批/持有 handoff → 本次部署执行插件版本迁移段"
+  elif [[ "$matches" == true ]]; then
+    echo "  · Weibo:插件制品与线上已审批版本一致 → 零接触(插件不受影响继续服务;运行时按已审批版本 pin 执行)"
+  else
+    echo "⚠ Weibo:插件制品有改动且未验证 → 零接触部署;新 release 下该插件将 RUNTIME_UNAVAILABLE(运行时 fail-closed 拒未审批制品),直至 packages/commercial/scripts/seed-weibo-plugin.ts --verify-and-upgrade-user=<id> 验证晋升。平台部署不因此阻断。" >&2
+  fi
+  return 0
+}
+
+weibo_plugin_seed() { # <active master release>
+  local release="$1"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] official Weibo seed/migration (listing pin match → idempotent no-op) @ $release"
+    return 0
+  fi
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$release'
+    npx --no-install tsx packages/commercial/scripts/seed-weibo-plugin.ts --seed-only"
+}
+
+weibo_plugin_close_gate() { # <release containing transition helper>
+  local runner="$1"
+  WEIBO_GATE_VERSION_ID=""
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] close Weibo listing execution gate @ $runner"
+    return 0
+  fi
+  local output result
+  output="$(ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-weibo-plugin.ts --close-listing-gate")" || {
+    [[ -n "$output" ]] && printf '%s\n' "$output"
+    return 1
+  }
+  printf '%s\n' "$output"
+  result="$(tail -n 1 <<<"$output")"
+  jq -e '(.changed | type == "boolean") and
+         (.currentVersionId == null or
+          (.currentVersionId | type == "string" and test("^[0-9]+$")))' \
+    >/dev/null <<<"$result" || {
+    echo "✗ Weibo gate close 返回非法结果" >&2
+    return 1
+  }
+  WEIBO_GATE_VERSION_ID="$(jq -r '.currentVersionId // ""' <<<"$result")"
+}
+
+weibo_plugin_classify_previous_release() { # <helper> <previous-release> <expected-current-version-or-empty>
+  local runner="$1" previous="$2" expected_current="$3"
+  WEIBO_PREVIOUS_RELEASE_AVAILABLE=0
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] classify exact approved Weibo version for previous release @ $previous"
+    return 0
+  fi
+  local output result actual_current available
+  output="$(ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-weibo-plugin.ts '--classify-current-for-release=$previous'")" || {
+    [[ -n "$output" ]] && printf '%s\n' "$output"
+    return 1
+  }
+  printf '%s\n' "$output"
+  result="$(tail -n 1 <<<"$output")"
+  jq -e '(.available | type == "boolean") and
+         (.versionId == null or (.versionId | type == "string" and test("^[0-9]+$"))) and
+         (.currentVersionId == null or
+          (.currentVersionId | type == "string" and test("^[0-9]+$")))' \
+    >/dev/null <<<"$result" || {
+    echo "✗ Weibo previous-release classifier 返回非法结果" >&2
+    return 1
+  }
+  actual_current="$(jq -r '.currentVersionId // ""' <<<"$result")"
+  [[ "$actual_current" == "$expected_current" ]] || {
+    echo "✗ Weibo current version 在 close/classify 间变化(expected=${expected_current:-<none>} actual=${actual_current:-<none>})" >&2
+    return 1
+  }
+  available="$(jq -r '.available' <<<"$result")"
+  if [[ "$available" == true ]]; then
+    WEIBO_PREVIOUS_RELEASE_AVAILABLE=1
+  fi
+}
+
+weibo_plugin_transition_to_release() { # <helper release> <target release>
+  local runner="$1" target="$2"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] transition Weibo installs/accounts → $target (gate stays closed) @ $runner"
+    return 0
+  fi
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-weibo-plugin.ts '--transition-to-release=$target'"
+}
+
+weibo_plugin_open_gate_to_release() { # <helper release> <target release>
+  local runner="$1" target="$2"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] verify $target exact official contract → open Weibo listing gate @ $runner"
+    return 0
+  fi
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-weibo-plugin.ts '--open-listing-gate-to-release=$target'"
+}
+
+weibo_plugin_open_gate_current() { # <helper release>
+  local runner="$1"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] open Weibo listing gate to current approved version @ $runner"
+    return 0
+  fi
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-weibo-plugin.ts --open-listing-gate-current"
+}
+
+weibo_plugin_assert_release_compatible() { # <helper release> <target release>
+  local runner="$1" target="$2"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] assert Weibo target contract == DB current @ $target"
+    return 0
+  fi
+  ssh "$KL_HOST" "set -a; . '$V5_ENV'; set +a
+    cd '$runner'
+    npx --no-install tsx packages/commercial/scripts/seed-weibo-plugin.ts '--assert-current-release-compatible=$target'"
+}
+
+# Plugin-pin restoration only. Source / egress / tuple restore stays in
+# knowledge_planet_compensate_deploy so the master is flipped exactly once.
+# hotcfg/egress arguments are accepted to keep the call-site shape isomorphic
+# with the Knowledge Planet compensator; they are not used here.
+weibo_compensate_deploy() { # <helper/new> <previous> <hotcfg:0|1> <egress-switched:0|1> <previous-egress> [had-previous-plugin:0|1]
+  local helper="$1" previous="$2" hotcfg="$3" egress_switched="$4" previous_egress="$5"
+  local had_previous_plugin="${6:-1}"
+  local failed=0
+  : "$hotcfg" "$egress_switched" "$previous_egress"
+  require_mutation_lease_for_compensation "weibo-deploy-compensation" || exit 86
+  [[ "$had_previous_plugin" =~ ^[01]$ ]] || {
+    echo "✗ Weibo compensation previous-plugin flag 非法:$had_previous_plugin" >&2
+    return 2
+  }
+  if [[ "$had_previous_plugin" == 0 ]]; then
+    if ! weibo_plugin_close_gate "$helper"; then
+      failed=1
+    fi
+  else
+    if ! weibo_plugin_close_gate "$helper" \
+      || ! weibo_plugin_transition_to_release "$helper" "$previous"; then
+      failed=1
+    elif ! weibo_plugin_open_gate_to_release "$helper" "$previous" \
+      && ! weibo_plugin_open_gate_current "$helper"; then
+      failed=1
+    fi
+  fi
+  return "$failed"
+}
+
+# Restore Weibo listing/installs after a deploy-time failure. Does not replace
+# Knowledge Planet compensation; callers invoke both. Source restore is owned by
+# the Knowledge Planet compensator when both run, so this helper prefers
+# listing-gate restore and only flips source when KP compensation is not used.
+weibo_plugin_finish_or_seed() { # <release> <previous> <hotcfg:0|1> <egress-switched:0|1> <previous-egress> <wb-bracket:0|1> <wb-had-previous:0|1> <kp-had-previous:0|1>
+  local release="$1" previous="$2" hotcfg="$3" egress_switched="$4" previous_egress="$5"
+  local wb_bracket="$6" wb_had_previous="$7" kp_had_previous="$8"
+  [[ "$wb_bracket" =~ ^[01]$ && "$wb_had_previous" =~ ^[01]$ && "$kp_had_previous" =~ ^[01]$ ]] || {
+    echo "✗ Weibo finish flags 非法:bracket=$wb_bracket had=$wb_had_previous kp=$kp_had_previous" >&2
+    return 2
+  }
+  if [[ "$wb_bracket" != 1 ]]; then
+    echo "  · Weibo:零接触部署(门未关/classify 降级),跳过 seed;promotion 顺延至下次部署或显式 --verify-and-upgrade-user"
+    return 0
+  fi
+  echo "── Weibo Plugin:官方 listing seed/transition(无人值守;已对齐 pin 则幂等 no-op)──"
+  if weibo_plugin_seed "$release"; then
+    return 0
+  fi
+  echo "✗ Weibo Plugin 发布/迁移失败；执行门保持关闭，开始 source+DB 对称补偿" >&2
+  require_mutation_lease_for_compensation "deploy-validation-compensation" || exit 86
+  weibo_compensate_deploy "$release" "$previous" "$hotcfg" "$egress_switched" "$previous_egress" "$wb_had_previous" \
+    || { mark_deploy_recovery_required "Weibo Plugin seed failed and source/DB/egress compensation failed"; exit 1; }
+  knowledge_planet_compensate_deploy "$release" "$previous" "$hotcfg" "$egress_switched" "$previous_egress" "$kp_had_previous" \
+    || { mark_deploy_recovery_required "Weibo Plugin seed failed and Knowledge Planet compensation failed"; exit 1; }
+  end_planned_maintenance || true
+  echo "✗ Weibo Plugin seed 失败；已确认回到旧 source/账号版本，部署未生效" >&2
+  exit 1
+}
+
 activate_egress_release() {
   local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" caps running_cwd require_cap=0
   if [[ "$DRY" == 1 ]]; then
@@ -7671,6 +7914,9 @@ deploy() {
     knowledge_planet_plugin_advisory_gate "$BUILT_RELEASE" \
       || { echo "✗ Knowledge Planet advisory status 基础设施故障(读不到状态,fail-closed),未激活新 release" >&2; exit 1; }
   fi
+  echo "── Weibo Plugin:advisory status(非阻断;DB 零写入)──"
+  weibo_plugin_advisory_gate "$BUILT_RELEASE" \
+    || { echo "✗ Weibo advisory status 基础设施故障(读不到状态,fail-closed),未激活新 release" >&2; exit 1; }
   # runtime hotcfg 机制门控(§5):两机制**各自独立开关,默认关**;未启用 → 完全退化为原
   # "activate_release(翻转+restart)"路径,合并后未部署期间生产行为**零变化**。
   # 启用时:build bundle/release(仅启用者)→ activate saga 取代直接 restart(master 源码翻转
@@ -7762,6 +8008,33 @@ deploy() {
     fi
   fi
   echo "  · Knowledge Planet closed current=${kp_previous_plugin_version_id:-<none>} previous-exact-available=$kp_had_previous_plugin"
+  echo "── Weibo Plugin:关闭跨版本执行门──"
+  local wb_deploy_bracket=1 wb_had_previous_plugin=0 wb_previous_plugin_version_id=""
+  if ! weibo_plugin_close_gate "$BUILT_RELEASE"; then
+    require_mutation_lease_for_compensation "weibo-close-gate-recovery" || exit 86
+    echo "⚠ Weibo 执行门关闭失败:插件零接触继续部署(版本 pin 不动,promotion 顺延)" >&2
+    weibo_plugin_open_gate_current "$BUILT_RELEASE" \
+      || mark_deploy_recovery_required "Weibo gate close failed and current-version gate restore also failed"
+    wb_deploy_bracket=0
+    WB_PLUGIN_PROMOTE=0
+  fi
+  wb_previous_plugin_version_id="$WEIBO_GATE_VERSION_ID"
+  if [[ "$wb_deploy_bracket" == 0 ]]; then
+    wb_had_previous_plugin=0
+  elif ! weibo_plugin_classify_previous_release \
+      "$BUILT_RELEASE" "$kp_previous_release" "$wb_previous_plugin_version_id"; then
+    echo "⚠ Weibo previous-release classify 失败:插件零接触继续部署" >&2
+    require_mutation_lease_for_compensation "weibo-classify-recovery" || exit 86
+    weibo_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+      || weibo_plugin_open_gate_current "$BUILT_RELEASE" \
+      || mark_deploy_recovery_required "Weibo previous-release classification failed and gate restore was not confirmed"
+    wb_deploy_bracket=0
+    WB_PLUGIN_PROMOTE=0
+    wb_had_previous_plugin=0
+  else
+    wb_had_previous_plugin="$WEIBO_PREVIOUS_RELEASE_AVAILABLE"
+  fi
+  echo "  · Weibo closed current=${wb_previous_plugin_version_id:-<none>} previous-exact-available=$wb_had_previous_plugin"
   if [[ "$hc_any" == 1 ]]; then
     if ! activate_runtime_tuple; then
       require_mutation_lease_for_compensation "runtime-tuple-activation-recovery" || exit 86
@@ -7774,6 +8047,11 @@ deploy() {
           knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
             || mark_deploy_recovery_required "tuple 激活回滚后 Knowledge Planet 执行门未恢复"
         fi
+      fi
+      if [[ "$wb_had_previous_plugin" == 1 ]]; then
+        weibo_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+          || weibo_plugin_open_gate_current "$BUILT_RELEASE" \
+          || mark_deploy_recovery_required "tuple 激活回滚后 Weibo 执行门未恢复"
       fi
       end_planned_maintenance || true
       echo "✗ tuple 激活失败(saga 已自动回滚)" >&2
@@ -7791,6 +8069,11 @@ deploy() {
           knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
             || mark_deploy_recovery_required "release 激活回滚后 Knowledge Planet 执行门未恢复"
         fi
+      fi
+      if [[ "$wb_had_previous_plugin" == 1 ]]; then
+        weibo_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
+          || weibo_plugin_open_gate_current "$BUILT_RELEASE" \
+          || mark_deploy_recovery_required "release 激活回滚后 Weibo 执行门未恢复"
       fi
       end_planned_maintenance || true
       exit 1
@@ -7850,11 +8133,19 @@ deploy() {
     # F7:补偿(恢复旧稳态)前 复核 lease,缩小与自愈 host-action 并发窗;失活则 crash-stop，禁止无 lease 补偿。
     require_mutation_lease_for_compensation "deploy-validation-compensation" || exit 86
     if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
+      weibo_compensate_deploy \
+        "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
+        "$egress_switched" "$egress_prev_release" "$wb_had_previous_plugin" \
+        || { mark_deploy_recovery_required "setup-first validation failed and Weibo compensation failed: $validation_failure"; exit 1; }
       knowledge_planet_compensate_setup_first \
         "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
         "$egress_switched" "$egress_prev_release" "$kp_setup_plugin_version_id" \
         || { mark_deploy_recovery_required "setup-first validation failed and exact source/gate compensation failed: $validation_failure"; exit 1; }
     else
+      weibo_compensate_deploy \
+        "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
+        "$egress_switched" "$egress_prev_release" "$wb_had_previous_plugin" \
+        || { mark_deploy_recovery_required "pre-seed validation failed and Weibo compensation failed: $validation_failure"; exit 1; }
       knowledge_planet_compensate_deploy \
         "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
         "$egress_switched" "$egress_prev_release" "$kp_had_previous_plugin" \
@@ -7866,6 +8157,9 @@ deploy() {
   fi
   if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
     echo "  ✓ setup-first 完成：扫码实时感知已上线；Plugin/安装仍钉旧 v1.0，等待用户在界面绑定"
+    weibo_plugin_finish_or_seed "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
+      "$egress_switched" "$egress_prev_release" "$wb_deploy_bracket" \
+      "$wb_had_previous_plugin" "$kp_had_previous_plugin"
     end_planned_maintenance
     smoke_sourcemap_sealed || exit 1
     gc_releases
@@ -7875,6 +8169,9 @@ deploy() {
   fi
   if [[ "$kp_deploy_bracket" == 0 ]]; then
     echo "  · Knowledge Planet:零接触部署(门未关/classify 降级),跳过 seed;promotion 顺延至下次部署或显式 verify lane"
+    weibo_plugin_finish_or_seed "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
+      "$egress_switched" "$egress_prev_release" "$wb_deploy_bracket" \
+      "$wb_had_previous_plugin" "$kp_had_previous_plugin"
     end_planned_maintenance
     smoke_sourcemap_sealed || exit 1
     gc_releases
@@ -7887,6 +8184,10 @@ deploy() {
     echo "✗ Knowledge Planet Plugin 发布/迁移失败；执行门保持关闭，开始 source+DB 对称补偿" >&2
     # F7:同上,补偿前 复核 lease(helper 幂等,与上方 validation 补偿可安全连调)。
     require_mutation_lease_for_compensation "deploy-validation-compensation" || exit 86
+    weibo_compensate_deploy \
+      "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
+      "$egress_switched" "$egress_prev_release" "$wb_had_previous_plugin" \
+      || { mark_deploy_recovery_required "Plugin seed failed and Weibo compensation failed"; exit 1; }
     knowledge_planet_compensate_deploy \
       "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
       "$egress_switched" "$egress_prev_release" "$kp_had_previous_plugin" \
@@ -7895,6 +8196,9 @@ deploy() {
     echo "✗ Knowledge Planet Plugin seed 失败；已确认回到旧 source/账号版本，部署未生效" >&2
     exit 1
   fi
+  weibo_plugin_finish_or_seed "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
+    "$egress_switched" "$egress_prev_release" "$wb_deploy_bracket" \
+    "$wb_had_previous_plugin" "$kp_had_previous_plugin"
   end_planned_maintenance
   smoke_sourcemap_sealed || exit 1
   gc_releases
@@ -8007,6 +8311,8 @@ activate_staged_inner() {
   assert_gpt56_migration_ready
   knowledge_planet_plugin_assert_release_compatible "$REMOTE_SRC" "$REMOTE_SRC" \
     || echo "⚠ staged source 的 Knowledge Planet 插件制品与 DB 已审批版本不一致:插件将 RUNTIME_UNAVAILABLE 直至验证晋升(运行时按内容 pin fail-closed);staged cutover 不因此阻断(2026-07-17 纠偏)" >&2
+  weibo_plugin_assert_release_compatible "$REMOTE_SRC" "$REMOTE_SRC" \
+    || echo "⚠ staged source 的 Weibo 插件制品与 DB 已审批版本不一致:插件将 RUNTIME_UNAVAILABLE 直至验证晋升(运行时按内容 pin fail-closed);staged cutover 不因此阻断" >&2
   install_cutover_target_image_env
   local expected_commit expected_full_commit expected_build remote_commit remote_build runtime_image
   local image_commit image_codex_version image_include_grok actual_codex_version actual_grok_version
@@ -8118,6 +8424,8 @@ deploy_dist() {
   build_release || { echo "✗ build_release 失败,未激活(live 未改)" >&2; exit 1; }
   knowledge_planet_plugin_assert_release_compatible "$BUILT_RELEASE" "$BUILT_RELEASE" \
     || echo "⚠ --dist 目标的 Knowledge Planet 插件制品与 DB 已审批版本不一致:插件将 RUNTIME_UNAVAILABLE 直至验证晋升;--dist 不因此阻断(2026-07-17 纠偏)" >&2
+  weibo_plugin_assert_release_compatible "$BUILT_RELEASE" "$BUILT_RELEASE" \
+    || echo "⚠ --dist 目标的 Weibo 插件制品与 DB 已审批版本不一致:插件将 RUNTIME_UNAVAILABLE 直至验证晋升;--dist 不因此阻断" >&2
   prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,未激活新 release" >&2; exit 1; }
   # hotcfg 启用时同样走 tuple saga(master 源码翻转=extra_apply,单次重启)。纯前端变更下
   # bundle/release digest 不变 → 幂等复用零 churn;tuple env 不变 → 只是随本次重启一并生效。
@@ -8267,6 +8575,9 @@ rollback() {
         knowledge_planet_plugin_open_gate_to_release "$kp_rollback_helper" "$kp_rollback_helper" \
           || knowledge_planet_plugin_open_gate_current "$kp_rollback_helper" \
           || mark_deploy_recovery_required "tuple rollback reverse compensation succeeded but Plugin gate restore failed"
+        weibo_plugin_open_gate_to_release "$kp_rollback_helper" "$kp_rollback_helper" \
+          || weibo_plugin_open_gate_current "$kp_rollback_helper" \
+          || mark_deploy_recovery_required "tuple rollback reverse compensation succeeded but Weibo gate restore failed"
       else
         mark_deploy_recovery_required "tuple rollback full smoke failed and reverse compensation failed"
         exit 1
@@ -8283,6 +8594,12 @@ rollback() {
       require_mutation_lease_for_compensation "tuple-rollback-gate-recovery" || exit 86
       knowledge_planet_plugin_open_gate_current "$kp_rollback_helper" \
         || mark_deploy_recovery_required "tuple rollback succeeded but Plugin gate could not be reopened (current-version fallback also failed)"
+    fi
+    if ! weibo_plugin_open_gate_to_release "$kp_rollback_helper" "$kp_rollback_target"; then
+      echo "⚠ Weibo release 身份门开启失败(目标可能早于插件审批),走 current-version 兜底,不推翻回滚" >&2
+      require_mutation_lease_for_compensation "tuple-rollback-weibo-gate-recovery" || exit 86
+      weibo_plugin_open_gate_current "$kp_rollback_helper" \
+        || mark_deploy_recovery_required "tuple rollback succeeded but Weibo gate could not be reopened (current-version fallback also failed)"
     fi
     end_planned_maintenance
     echo "✓ rollback(tuple 感知,master+tuple 同条 history)完成。"
@@ -8345,7 +8662,7 @@ rollback() {
   # 2026-07-17 架构纠偏:插件括号 best-effort——回滚是紧急通道,插件侧失败只降级
   # (零接触/兜底重开当前已审批版本),永不阻断回滚本体。
   echo "── Knowledge Planet Plugin:回滚前关闭执行门并反向迁移账号/install(best-effort)──"
-  local kp_rb_bracket=1
+  local kp_rb_bracket=1 wb_rb_bracket=1
   if ! knowledge_planet_plugin_close_gate "$live_master"; then
     echo "⚠ Knowledge Planet 执行门关闭失败:插件零接触继续回滚(门保持现状,版本 pin 不迁移)" >&2
     kp_rb_bracket=0
@@ -8356,6 +8673,18 @@ rollback() {
     knowledge_planet_plugin_open_gate_current "$live_master" \
       || mark_deploy_recovery_required "rollback Plugin transition failed and current-version gate restore also failed"
     kp_rb_bracket=0
+  fi
+  echo "── Weibo Plugin:回滚前关闭执行门并反向迁移账号/install(best-effort)──"
+  if ! weibo_plugin_close_gate "$live_master"; then
+    echo "⚠ Weibo 执行门关闭失败:插件零接触继续回滚(门保持现状,版本 pin 不迁移)" >&2
+    wb_rb_bracket=0
+  fi
+  if [[ "$wb_rb_bracket" == 1 ]] && ! weibo_plugin_transition_to_release "$live_master" "$target"; then
+    echo "⚠ Weibo 版本反向迁移失败(目标 release 可能早于插件审批):跳过迁移,兜底重开当前已审批版本后继续回滚" >&2
+    require_mutation_lease_for_compensation "rollback-weibo-transition-recovery" || exit 86
+    weibo_plugin_open_gate_current "$live_master" \
+      || mark_deploy_recovery_required "rollback Weibo transition failed and current-version gate restore also failed"
+    wb_rb_bracket=0
   fi
   # activate_release 内 ds_commit_active_release 会把 previous_active_release←旧 active(=回滚前的 release)、
   # active_release←target 原子对调(BLOCKER 4:rollback 成功后 CAS 更新 active_release+previous 对调)。
@@ -8370,10 +8699,18 @@ rollback() {
         || knowledge_planet_plugin_open_gate_current "$live_master" \
         || mark_deploy_recovery_required "rollback source compensation succeeded but Knowledge Planet DB compensation failed"
     fi
+    if [[ "$wb_rb_bracket" == 1 ]]; then
+      weibo_plugin_transition_to_release "$live_master" "$live_master" \
+        && weibo_plugin_open_gate_to_release "$live_master" "$live_master" \
+        || weibo_plugin_open_gate_current "$live_master" \
+        || mark_deploy_recovery_required "rollback source compensation succeeded but Weibo DB compensation failed"
+    fi
     end_planned_maintenance || true
     exit 1
   fi
   if ! smoke "$ACTIVE_PORT"; then
+    weibo_compensate_deploy "$live_master" "$live_master" 0 0 "" "$wb_rb_bracket" \
+      || { mark_deploy_recovery_required "rollback target smoke failed and Weibo compensation failed"; exit 1; }
     knowledge_planet_compensate_deploy "$live_master" "$live_master" 0 0 "" "$kp_rb_bracket" \
       || { mark_deploy_recovery_required "rollback target smoke failed and source/Plugin compensation failed"; exit 1; }
     end_planned_maintenance || true
@@ -8387,6 +8724,12 @@ rollback() {
     require_mutation_lease_for_compensation "rollback-gate-recovery" || exit 86
     knowledge_planet_plugin_open_gate_current "$live_master" \
       || mark_deploy_recovery_required "rollback succeeded but Plugin gate could not be reopened (current-version fallback also failed)"
+  fi
+  if [[ "$wb_rb_bracket" == 1 ]] && ! weibo_plugin_open_gate_to_release "$live_master" "$target"; then
+    echo "⚠ Weibo release 身份门开启失败(目标可能早于插件审批),走 current-version 兜底,不推翻回滚" >&2
+    require_mutation_lease_for_compensation "rollback-weibo-gate-recovery" || exit 86
+    weibo_plugin_open_gate_current "$live_master" \
+      || mark_deploy_recovery_required "rollback succeeded but Weibo gate could not be reopened (current-version fallback also failed)"
   fi
   end_planned_maintenance
   echo "✓ rollback 完成 → $target(slot=$ACTIVE_SLOT)。"
@@ -8574,7 +8917,7 @@ rollback_runtime_tuple() {
   # 插件侧失败都不得阻断(运行时按内容 pin fail-closed,插件门状态不影响平台
   # 完整性;最坏情形=插件休眠,用 open_gate_current 兜底恢复已审批版本)。
   echo "── Knowledge Planet Plugin:tuple 回滚前关闭执行门并反向迁移账号/install(best-effort)──"
-  local kp_plugin_bracket=1
+  local kp_plugin_bracket=1 wb_plugin_bracket=1
   if ! knowledge_planet_plugin_close_gate "$plugin_helper"; then
     echo "⚠ Knowledge Planet 执行门关闭失败:插件零接触继续回滚(门保持现状,版本 pin 不迁移)" >&2
     kp_plugin_bracket=0
@@ -8588,6 +8931,20 @@ rollback_runtime_tuple() {
       kp_plugin_bracket=0
     fi
   fi
+  echo "── Weibo Plugin:tuple 回滚前关闭执行门并反向迁移账号/install(best-effort)──"
+  if ! weibo_plugin_close_gate "$plugin_helper"; then
+    echo "⚠ Weibo 执行门关闭失败:插件零接触继续回滚(门保持现状,版本 pin 不迁移)" >&2
+    wb_plugin_bracket=0
+  fi
+  if [[ "$wb_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
+    if ! weibo_plugin_transition_to_release "$plugin_helper" "$master"; then
+      echo "⚠ Weibo 版本反向迁移失败(目标 release 可能早于插件审批):跳过迁移,兜底重开当前已审批版本后继续回滚" >&2
+      require_mutation_lease_for_compensation "tuple-rollback-weibo-transition-recovery" || exit 86
+      weibo_plugin_open_gate_current "$plugin_helper" \
+        || mark_deploy_recovery_required "tuple rollback Weibo transition failed and current-version gate restore also failed"
+      wb_plugin_bracket=0
+    fi
+  fi
   if ! prepare_direct_turn_timeline_activation "$master" "$prev_src"; then
     if [[ "$kp_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
       require_mutation_lease_for_compensation "tuple-rollback-timeline-compensation" || exit 86
@@ -8595,6 +8952,13 @@ rollback_runtime_tuple() {
         && knowledge_planet_plugin_open_gate_to_release "$plugin_helper" "$prev_src" \
         || knowledge_planet_plugin_open_gate_current "$plugin_helper" \
         || mark_deploy_recovery_required "master capability floor rejected tuple rollback and Plugin DB compensation failed"
+    fi
+    if [[ "$wb_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
+      require_mutation_lease_for_compensation "tuple-rollback-weibo-timeline-compensation" || exit 86
+      weibo_plugin_transition_to_release "$plugin_helper" "$prev_src" \
+        && weibo_plugin_open_gate_to_release "$plugin_helper" "$prev_src" \
+        || weibo_plugin_open_gate_current "$plugin_helper" \
+        || mark_deploy_recovery_required "master capability floor rejected tuple rollback and Weibo DB compensation failed"
     fi
     return 1
   fi
@@ -8620,6 +8984,18 @@ rollback_runtime_tuple() {
       knowledge_planet_plugin_close_gate "$plugin_helper" \
         || mark_deploy_recovery_required "tuple rollback saga failed and first-publication Plugin gate state is unknown"
     fi
+    if [[ "$wb_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
+      weibo_plugin_transition_to_release "$plugin_helper" "$prev_src" \
+        && weibo_plugin_open_gate_to_release "$plugin_helper" "$prev_src" \
+        || {
+          echo "⚠ Weibo release 身份门恢复失败,走 current-version 兜底" >&2
+          weibo_plugin_open_gate_current "$plugin_helper" \
+            || mark_deploy_recovery_required "tuple rollback saga compensated source but Weibo DB compensation failed"
+        }
+    elif [[ "$wb_plugin_bracket" == 1 ]]; then
+      weibo_plugin_close_gate "$plugin_helper" \
+        || mark_deploy_recovery_required "tuple rollback saga failed and first-publication Weibo gate state is unknown"
+    fi
     return 1
   fi
   if [[ "$defer_plugin_open" != 1 && "$kp_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
@@ -8629,6 +9005,15 @@ rollback_runtime_tuple() {
         require_mutation_lease_for_compensation "tuple-rollback-target-gate-recovery" || exit 86
         knowledge_planet_plugin_open_gate_current "$plugin_helper" \
           || mark_deploy_recovery_required "tuple rollback target active but Plugin gate failed to open (current-version fallback also failed)"
+      }
+  fi
+  if [[ "$defer_plugin_open" != 1 && "$wb_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
+    weibo_plugin_open_gate_to_release "$plugin_helper" "$master" \
+      || {
+        echo "⚠ Weibo release 身份门开启失败(目标可能早于插件审批),走 current-version 兜底,不阻断回滚" >&2
+        require_mutation_lease_for_compensation "tuple-rollback-weibo-target-gate-recovery" || exit 86
+        weibo_plugin_open_gate_current "$plugin_helper" \
+          || mark_deploy_recovery_required "tuple rollback target active but Weibo gate failed to open (current-version fallback also failed)"
       }
   fi
   if [[ "$state_commit" == 1 ]]; then
@@ -9735,6 +10120,8 @@ canary() {
   }
   knowledge_planet_plugin_assert_release_compatible "$reldir" "$reldir" \
     || echo "⚠ canary candidate 的 Knowledge Planet 插件制品与 DB 已审批版本不一致:candidate lane 上该插件将 RUNTIME_UNAVAILABLE(active lane 不受影响,运行时按内容 pin);canary 不因此阻断(2026-07-17 纠偏)" >&2
+  weibo_plugin_assert_release_compatible "$reldir" "$reldir" \
+    || echo "⚠ canary candidate 的 Weibo 插件制品与 DB 已审批版本不一致:candidate lane 上该插件将 RUNTIME_UNAVAILABLE(active lane 不受影响,运行时按内容 pin);canary 不因此阻断" >&2
   ds_cas_or_die "candidate_release='$(ds_lit "$reldir")', transition_step=1" 1 "built candidate_release=$reldir"
   bind_emergency_candidate_release "$reldir" || exit 1
 
@@ -9974,6 +10361,9 @@ finalize() {
   knowledge_planet_plugin_assert_release_compatible \
     "$kp_candidate_release" "$kp_candidate_release" \
     || echo "⚠ candidate 的 Knowledge Planet 插件制品与 DB 已审批版本不一致:finalize 后该插件将 RUNTIME_UNAVAILABLE 直至验证晋升;finalize 不因此阻断(2026-07-17 纠偏)" >&2
+  weibo_plugin_assert_release_compatible \
+    "$kp_candidate_release" "$kp_candidate_release" \
+    || echo "⚠ candidate 的 Weibo 插件制品与 DB 已审批版本不一致:finalize 后该插件将 RUNTIME_UNAVAILABLE 直至验证晋升;finalize 不因此阻断" >&2
   if [[ "$DRY" == 1 ]]; then
     ds_assert_phase canary
     cand="${DS_candidate_slot:-B}"; old="$DS_active_slot"
