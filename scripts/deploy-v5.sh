@@ -7799,7 +7799,7 @@ weibo_plugin_finish_or_seed() { # <release> <previous> <hotcfg:0|1> <egress-swit
     return 0
   fi
   echo "✗ Weibo Plugin 发布/迁移失败；执行门保持关闭，开始 source+DB 对称补偿" >&2
-  require_mutation_lease_for_compensation "deploy-validation-compensation" || exit 86
+  require_mutation_lease_for_compensation "weibo-seed-compensation" || exit 86
   weibo_compensate_deploy "$release" "$previous" "$hotcfg" "$egress_switched" "$previous_egress" "$wb_had_previous" \
     || { mark_deploy_recovery_required "Weibo Plugin seed failed and source/DB/egress compensation failed"; exit 1; }
   knowledge_planet_compensate_deploy "$release" "$previous" "$hotcfg" "$egress_switched" "$previous_egress" "$kp_had_previous" \
