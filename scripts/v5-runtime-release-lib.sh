@@ -493,6 +493,18 @@ oc_hotcfg_build_ccb_dist() {
   printf '%s\t%s\n' "$ver" "$src_key"
 }
 
+# Runtime 必须带上预编译 CJS(容器 spawn MCP/CLI 才不会回落 tsx ~7s)。
+# gateway precompile 会对每个 workspace `rmSync(pkg/dist)`,CLI/MCP bundle 必须在它之后重建;
+# 同 digest 复用旧制品时也要验叶子,禁止把「构建过但被抹掉」的 rel 再发出去。
+oc_hotcfg_assert_runtime_mcp_cjs() {
+  local root="$1"
+  [ -s "$root/packages/mcp-memory/dist/oc-memory-mcp.cjs" ] \
+    || { oc_hotcfg__die "runtime 缺 packages/mcp-memory/dist/oc-memory-mcp.cjs @ $root"; return 1; }
+  [ -s "$root/packages/mcp-memory/dist/oc-memory.cjs" ] \
+    || { oc_hotcfg__die "runtime 缺 packages/mcp-memory/dist/oc-memory.cjs @ $root"; return 1; }
+  return 0
+}
+
 # release 落定(§3.1 d/e):在已 archive+prune+敏感扫描过的 staging 上装依赖、建 ccb dist、
 # 生成 MANIFEST(含 depsCacheKey/bunVersion)、按 digest 定名 mv -T。
 # 依赖形态(R2-m2 表述更正,无"两套 node_modules"):root 一套 npm ci;CCB 独立 bun build 仅拷
@@ -521,30 +533,12 @@ oc_hotcfg_finalize_release() {
   local ccb_out ccb_key
   ccb_out="$(oc_hotcfg_build_ccb_dist "$staging" "$prev")" || return 1
   bunver="${ccb_out%%$'\t'*}"; ccb_key="${ccb_out##*$'\t'}"
-  # oc-memory CLI:预编译单文件 CJS,沙箱 wrapper 可 exec node 而非 npx+tsx(~7s 冷启动)。
-  # native addon 保持 external,从本 release 的 node_modules 解析。脚本在源树则 fail-loud
-  # (缺产物会静默回落 7s 路径);旧源无脚本则跳过,保持回滚兼容。
-  if [ -f "$staging/packages/mcp-memory/scripts/build-oc-memory-cli.sh" ]; then
-    oc_hotcfg__log "build oc-memory CLI bundle"
-    ( cd "$staging" && bash packages/mcp-memory/scripts/build-oc-memory-cli.sh >&2 ) \
-      || { oc_hotcfg__die "oc-memory CLI bundle failed"; return 1; }
-    [ -s "$staging/packages/mcp-memory/dist/oc-memory.cjs" ] \
-      || { oc_hotcfg__die "oc-memory CLI bundle missing after build"; return 1; }
-  fi
-  # openclaude-memory MCP server:同款预编译 CJS,引擎适配器可 node 直启而非 tsx 解释
-  # (grok/cursor 每 turn、ccb/codex 每 spawn 各省 ~7s)。旧源无脚本则跳过,回滚兼容。
-  if [ -f "$staging/packages/mcp-memory/scripts/build-oc-memory-mcp.sh" ]; then
-    oc_hotcfg__log "build oc-memory MCP bundle"
-    ( cd "$staging" && bash packages/mcp-memory/scripts/build-oc-memory-mcp.sh >&2 ) \
-      || { oc_hotcfg__die "oc-memory MCP bundle failed"; return 1; }
-    [ -s "$staging/packages/mcp-memory/dist/oc-memory-mcp.cjs" ] \
-      || { oc_hotcfg__die "oc-memory MCP bundle missing after build"; return 1; }
-  fi
   # Container gateway: TS→JS (module-structure transform) so user containers
   # `node` the CLI instead of paying ~11-12s tsx compile on cold start.
   # Builder+wrapper live under packages/cli/scripts/ so runtime-src-excludes
   # `/scripts/` (repo-root only) cannot prune them. This lib revision always
   # runs the builder — missing script is a failed finalize, not a skip.
+  # compilePkg rmSync(pkg/dist) wipes oc-memory-*.cjs; those bundles are rebuilt below.
   oc_hotcfg__log "precompile container gateway"
   local gw_build="$staging/packages/cli/scripts/build-container-gateway.sh"
   [ -f "$gw_build" ] || {
@@ -554,6 +548,23 @@ oc_hotcfg_finalize_release() {
     || { oc_hotcfg__die "container gateway precompile failed"; return 1; }
   [ -s "$staging/packages/cli/dist/index.js" ] && [ -f "$staging/packages/cli/dist/.precompiled-ok" ] \
     || { oc_hotcfg__die "container gateway precompile missing after build"; return 1; }
+  # oc-memory CLI/MCP CJS MUST run after gateway precompile (which rmSync dist/).
+  # Missing script is a failed finalize, not a skip: containers otherwise pay ~7s tsx/spawn.
+  local cli_build="$staging/packages/mcp-memory/scripts/build-oc-memory-cli.sh"
+  [ -f "$cli_build" ] || {
+    oc_hotcfg__die "oc-memory CLI bundle script missing: $cli_build (packages/mcp-memory/scripts/ must survive runtime prune)"; return 1
+  }
+  oc_hotcfg__log "build oc-memory CLI bundle"
+  ( cd "$staging" && bash packages/mcp-memory/scripts/build-oc-memory-cli.sh >&2 ) \
+    || { oc_hotcfg__die "oc-memory CLI bundle failed"; return 1; }
+  local mcp_build="$staging/packages/mcp-memory/scripts/build-oc-memory-mcp.sh"
+  [ -f "$mcp_build" ] || {
+    oc_hotcfg__die "oc-memory MCP bundle script missing: $mcp_build (packages/mcp-memory/scripts/ must survive runtime prune)"; return 1
+  }
+  oc_hotcfg__log "build oc-memory MCP bundle"
+  ( cd "$staging" && bash packages/mcp-memory/scripts/build-oc-memory-mcp.sh >&2 ) \
+    || { oc_hotcfg__die "oc-memory MCP bundle failed"; return 1; }
+  oc_hotcfg_assert_runtime_mcp_cjs "$staging" || return 1
   # 产物阶段敏感扫描(node_modules 可能夹带 .pem 测试夹具 → 只扫源码顶层,node_modules 排除以免误杀依赖自带证书夹具)
   # 说明:敏感扫描针对**源码树被误纳入凭据**,node_modules 里第三方包自带的 *.pem 测试夹具非本仓凭据,
   # 扫描 node_modules 会大量误报;故 release 敏感扫描排除 node_modules(bundle 无 node_modules 不受影响)。
@@ -575,6 +586,7 @@ oc_hotcfg_finalize_release() {
   if [ -d "$target" ]; then
     oc_hotcfg__log "release rel-$digest 已存在 → 抽样重校验后复用"
     if oc_hotcfg_verify_manifest_sampled "$target" 64; then
+      oc_hotcfg_assert_runtime_mcp_cjs "$target" || return 1
       # capability 声明补写(幂等自愈):同 digest = 同源码树 ⇒ 同 capability。旧制品建于本
       # 特性之前(MANIFEST 无 capabilities)会被兼容地板判为"容器面不具备能力"而拒绝激活 ——
       # 那是**假阴性**(树里明明有代码)。此处按当前 caps 就地补写(MANIFEST 不进 digest,

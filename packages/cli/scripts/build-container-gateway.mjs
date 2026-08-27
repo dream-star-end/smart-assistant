@@ -145,6 +145,7 @@ async function compilePkg(pkg) {
     console.error(`build-container-gateway: skip ${pkg} (no ts sources)`);
     return;
   }
+  // Wipes pkg/dist, including oc-memory-*.cjs. finalize_release rebuilds those after this step.
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });
   console.error(`build-container-gateway: ${pkg} (${files.length} files)`);
