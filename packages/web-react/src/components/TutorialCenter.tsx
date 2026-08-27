@@ -254,7 +254,9 @@ export function TutorialCenter({
   const cta = actionState(feature);
   const selectedCase = caseId ? TUTORIAL_CASE_BY_ID[caseId] : null;
   const showMissionReplay =
-    caseId === "research-bike-demand" || caseId === "coding-swe-bench-fix";
+    selectedCase != null &&
+    selectedCase.replay.status !== "pending_capture" &&
+    (caseId === "research-bike-demand" || caseId === "coding-swe-bench-fix");
 
   const filteredFeatures = useMemo(
     () =>

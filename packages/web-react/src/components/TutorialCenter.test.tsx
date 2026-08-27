@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -179,31 +179,26 @@ describe("TutorialCenter", () => {
     expect(await screen.findByText("深链正文")).toBeInTheDocument();
   });
 
-  it("阶段、成果预览和科研编码切换都是真实可操作的", () => {
+  it("待采集精选案例走任务脚本详情，不展示完成态回放", () => {
     render(<CaseHarness initial="research-bike-demand" />);
 
-    expect(screen.getByText("示例待真实运行采集")).toBeInTheDocument();
-    const chapterNav = screen.getByRole("navigation", { name: "任务阶段" });
-    fireEvent.click(within(chapterNav).getByRole("button", { name: "运行分析" }));
-    expect(screen.getByText("当前阶段：运行分析")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /基线和非线性模型正面对照/ })).toHaveAttribute("aria-expanded", "true");
-
-    fireEvent.click(screen.getByRole("tab", { name: "预览可复跑工程" }));
-    expect(screen.getByText(/make reproduce/)).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "编码" }));
-    expect(screen.getByText(/15 分 49 秒 · Astropy #12906/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /真实 Issue 和固定基线已接收/ })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("tab", { name: "预览修复内容" }));
-    expect(screen.getByText(/matrix\[\.\.\., -right\.shape\[0\]:\] = right/)).toBeInTheDocument();
-    expect(screen.getByText(/不冒充完整可下载 patch/)).toBeInTheDocument();
+    expect(screen.getAllByText(/示例待真实运行采集/).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText(/当前只展示人工编写的任务脚本，不是真实运行回放/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "公开数据到可复现的单车需求分析" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "任务阶段" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "你不用守着它。回来时，过程和成果都还在。" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/15 分 49 秒 · Astropy #12906/)).not.toBeInTheDocument();
   });
 
   it("主操作只把选中的真实案例交给现有开工流程", () => {
     const onRunCase = vi.fn();
     render(<CaseHarness initial="coding-swe-bench-fix" onRunCase={onRunCase} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "用我的材料开始，带着指令去对话" }));
+    fireEvent.click(screen.getByRole("button", { name: "带着我的材料开始，带着指令去对话" }));
     expect(onRunCase).toHaveBeenCalledTimes(1);
     expect(onRunCase).toHaveBeenCalledWith(expect.objectContaining({ id: "coding-swe-bench-fix" }));
   });
