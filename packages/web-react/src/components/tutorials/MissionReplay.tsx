@@ -204,7 +204,8 @@ export function MissionReplay({
       <section className="mt-5">
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div>
-            <p className="text-caption font-semibold text-accent">
+            <p className="text-caption font-semibold text-warning">示例待真实运行采集</p>
+            <p className="mt-1 text-caption font-semibold text-accent">
               示意步骤 · 非真实轨迹 · {kind === 'research' ? '科研分析' : '代码修复'}
             </p>
             <h1 className="mt-2 max-w-4xl text-2xl font-bold tracking-tight text-fg sm:text-3xl">

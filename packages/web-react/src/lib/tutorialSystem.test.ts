@@ -39,7 +39,7 @@ describe("v5 教程单一能力注册表", () => {
       const topic = tutorialById(feature.id as ProductFeatureId);
       expect(topic.featureId).toBe(feature.id);
       expect(topic.media).toBe(feature.id);
-      expect(topic.steps).toHaveLength(4);
+      expect(topic.steps.length).toBeGreaterThanOrEqual(4);
       expect(topic.scenarios.length).toBeGreaterThanOrEqual(3);
       expect(TUTORIAL_MEDIA[topic.media].poster).toMatch(
         /^\/tutorials\/.+\.webp$/,

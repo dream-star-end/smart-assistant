@@ -434,7 +434,7 @@ describe("CodexAdapter — 事件映射 parity(fake-SDK 不出边界)", () => {
     const summary = await turn.summary;
     assert.ok(summary);
     assert.equal(summary.tools.length, 1);
-    assert.equal(summary.tools[0].completed, undefined);
+    assert.equal(summary.tools[0].completed, true);
     assert.deepEqual(
       (summary.tools[0].inputJson as { changes?: unknown }).changes,
       latestChanges,

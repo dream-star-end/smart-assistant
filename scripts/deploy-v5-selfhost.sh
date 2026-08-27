@@ -835,6 +835,9 @@ OC_PROJECT_CONTEXT=1
 # on NO_PROXY while login/telemetry endpoints share the stable Japan egress.
 OC_CLAUDE_CODE_HTTPS_PROXY=http://172.31.0.1:18991
 OC_CLAUDE_CODE_TZ=Asia/Tokyo
+# 不要在本文件写入 OPENCLAUDE_V3_MASTER_BASE_URL / OPENCLAUDE_V3_CONTAINER_TOKEN。
+# 这两项由 v3supervisor 按用户容器注入;写进 host env 会让 cron 站内信全部落到同一个 uid。
+# token 明文不得进 git。上线无需改本文件,下一次容器重建即带上 supervisor 注入的 env。
 EOF
   append_provider_keys "$tmp"
   mkdir -p "$(dirname "$V5_ENV")"

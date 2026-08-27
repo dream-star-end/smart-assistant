@@ -1135,3 +1135,69 @@ describe('CronScheduler origin-session resume', () => {
     assert.equal(job.enabled, false)
   })
 })
+
+describe('CronScheduler deliver 通道校验与注册表对齐', () => {
+  it('rejects unknown adapter names until they are registered', async () => {
+    if (existsSync(paths.cronYaml)) unlinkSync(paths.cronYaml)
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      { getOrCreate: async () => ({}), submit: async () => {}, destroySession: async () => {} } as any,
+      async () => {},
+    )
+    const job = {
+      id: 'remind-deliver-1',
+      schedule: '0 9 * * *',
+      agent: 'main',
+      prompt: 'p',
+      deliver: 'telegram',
+      enabled: true,
+    } as any
+    await assert.rejects(
+      () => sched.addJob(job),
+      /Invalid deliver "telegram"/,
+    )
+    sched.getRegisteredDeliverChannels = () => ['telegram']
+    await sched.addJob(job)
+    await assert.rejects(
+      () => sched.updateJob(job.id, { deliver: 'discord' }),
+      /Invalid deliver "discord"/,
+    )
+    await sched.updateJob(job.id, { deliver: 'webchat' })
+    const listed = await sched.listJobs()
+    assert.equal(listed.find((j) => j.id === job.id)?.deliver, 'webchat')
+  })
+
+  it('既有 telegram 任务在 adapter 未注册时,未变更 deliver 仍可改 label', async () => {
+    if (existsSync(paths.cronYaml)) unlinkSync(paths.cronYaml)
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      { getOrCreate: async () => ({}), submit: async () => {}, destroySession: async () => {} } as any,
+      async () => {},
+    )
+    sched.getRegisteredDeliverChannels = () => ['telegram']
+    await sched.addJob({
+      id: 'remind-deliver-legacy',
+      schedule: '0 9 * * *',
+      agent: 'main',
+      prompt: 'p',
+      deliver: 'telegram',
+      label: '旧标题',
+      enabled: true,
+    })
+    sched.getRegisteredDeliverChannels = () => []
+    assert.equal(await sched.updateJob('remind-deliver-legacy', { label: '新标题', deliver: 'telegram' }), true)
+    const kept = (await sched.listJobs()).find((j) => j.id === 'remind-deliver-legacy')
+    assert.equal(kept?.label, '新标题')
+    assert.equal(kept?.deliver, 'telegram')
+    await assert.rejects(
+      () => sched.updateJob('remind-deliver-legacy', { deliver: 'discord' }),
+      /Invalid deliver "discord"/,
+    )
+    sched.getRegisteredDeliverChannels = () => ['discord']
+    assert.equal(await sched.updateJob('remind-deliver-legacy', { deliver: 'discord' }), true)
+    assert.equal(
+      (await sched.listJobs()).find((j) => j.id === 'remind-deliver-legacy')?.deliver,
+      'discord',
+    )
+  })
+})

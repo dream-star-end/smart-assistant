@@ -28,13 +28,13 @@
       "sourceHash": "71638006bcb2345a01607dea624179993f2e631faf9c23886c85b76040cea799"
     },
     "chat-basics": {
-      "contentHash": "1380c8f4161c007d16927903baf5889f96c9755b88dc2b7133df52cf80f62bc0",
-      "contentVersion": 5,
+      "contentHash": "387cd97eec61939fcbc8ec2170b84aa7922ce1ba43fb8d243fdf5ec1bb18add2",
+      "contentVersion": 6,
       "mediaHash": "0cc612d377280f73f9fcc131c43e8ebde31ec42226e82a8745b0cb6534649779",
       "mediaKey": "chat-basics",
       "mediaVersion": 3,
       "registryHash": "343b05739f30ffb4df16583570adcf768ad03a8f0df19d80097465aec77dc35f",
-      "sourceHash": "3fb5bafa50c14b59f0644117aa608d77aeb6ef66450e960fff58361b5c7d8ec2"
+      "sourceHash": "8d127e77d090dbcd6595e0171fe712d1b2d5443aea59c969c75c12477c0e64e6"
     },
     "connectors": {
       "contentHash": "3273aeac669b33e701c19aad3473ab19adc5e6f0db455d0a975ea2927b0d3b48",
@@ -127,13 +127,13 @@
       "sourceHash": "6fdf941af5169e3f3fce107f9693c73ed98eecc26a2f7ef4a07005aab54f6c4d"
     },
     "models-reasoning": {
-      "contentHash": "94ae018d06f7ed3aa73106d60050dca4fef067d96738c87476f44fab0e9ec8df",
-      "contentVersion": 4,
+      "contentHash": "6dacdc44bb76b8a3772a6234d5ea94395ec14d1fd68db1bf43fcbae24502cf47",
+      "contentVersion": 5,
       "mediaHash": "e331e8565a68475c57c08ed1742c7b8b4a512cd154c83b7f0e8e270563733a3c",
       "mediaKey": "models-reasoning",
       "mediaVersion": 2,
-      "registryHash": "e7810af073bb4425162754c943fdd589c374280ccb614bf6e17596eac69ca180",
-      "sourceHash": "11360ffb6edff59c0cef269e5d0d7368926af021f0acb79c5dd29b89440bc98f"
+      "registryHash": "05d9024636c1060f19b7670c735a8a5bc39bf7dfdacd83a719260e898df68ee2",
+      "sourceHash": "75077d83e9711f4d293e511ac5c89affafecdf279ee753610e60028f61a7fadf"
     },
     "organization": {
       "contentHash": "7cb835c5e2b81ac2543f0f161a8e706139b7f5bafc5dae6080ab475b95e7e0dd",
@@ -162,14 +162,23 @@
       "registryHash": "7bd425366e0f70cbf2e087a5e133fd7e2b6a4c1bb789b629d26e9580f6f4bde9",
       "sourceHash": "d9832949ba003f584f937d6235759d4142bc499d0d4d270bb0406b08760fb573"
     },
+    "session-goal": {
+      "contentHash": "21b0b50439449039ab0e7be29e3e97f707431f4e11f453d37424927ca66f390b",
+      "contentVersion": 1,
+      "mediaHash": "fc6225d5869710e09d87c11d9238320751f6f330a07fe5128712e94a9b6317d4",
+      "mediaKey": "session-goal",
+      "mediaVersion": 2,
+      "registryHash": "8b23cda49354154525f848f3dc7da58327906fad388ecc62ad20f6801c572b86",
+      "sourceHash": "b5ca5d49dcdb2b05e16220817943f63715123e49673d47f2e2e1b750dac042c8"
+    },
     "sessions-history": {
-      "contentHash": "17d175caa9213dcb846f7e1ef45022548e6cbedf6c712498eb2d47582b8ba796",
-      "contentVersion": 2,
+      "contentHash": "ae055e00f6cda07668e7f0f2332e65ac52e5fc5b875673046e1940fdfaff68ad",
+      "contentVersion": 3,
       "mediaHash": "ff30df1636efc5dfd95f414f46ff689252bd0b11be1ddc43b31111186e4eab9e",
       "mediaKey": "sessions-history",
       "mediaVersion": 2,
       "registryHash": "35fab636ddeba4b50639aa74096f650b5c342fa42457f15dd7e8265ed9c42828",
-      "sourceHash": "f9b2b5632dc1ac1938b89de8321a3f4b823ebfa0ce3f49064f3431b69f02d258"
+      "sourceHash": "bdc9f6d8e38a58eb5966129f7e041bf1cf9e67b41cdc4cd03e63561bc4624725"
     },
     "skills-training": {
       "contentHash": "e2153ef7ccb7bbd46b3ddcfac3368e004dfff463d95c1f9f805d75c4a06846e2",
@@ -180,14 +189,23 @@
       "registryHash": "8a53ced07b08480a052d6a3cd4e63e74341c8944a071aa1a47f49c8e2aa75772",
       "sourceHash": "8d8a2ab999bb8b70c1f66a1177e12bf13a81242d468bc1f878e8b4192c0897d6"
     },
+    "taskboard": {
+      "contentHash": "759fdef5188979b87ee3a35fb169a266f763c63a9d40e10eca03e0485db8c0c6",
+      "contentVersion": 1,
+      "mediaHash": "b1283b2f8dd9848de674a12a2523c022f5ad2996da6421a63086d3ab3d5f7936",
+      "mediaKey": "taskboard",
+      "mediaVersion": 2,
+      "registryHash": "5d2d680186397e8cc82ca801033bae7294a50df26075ac63c4f4e6416c0bad6d",
+      "sourceHash": "a93866a265b753179dbc697adaeefc0c9cb7dd313551e14de35f997005d3cbe4"
+    },
     "team-mode": {
-      "contentHash": "5bfb8dc3c9acea3f609cec878403dbbe4585529df38ddfd420d30957ca5632b1",
-      "contentVersion": 2,
+      "contentHash": "99be643adaf53c612cfcdcd8d0cddebd89c3e2f01b98329fa4b683aab38927d3",
+      "contentVersion": 3,
       "mediaHash": "65c7d1266d9d4476c2751ae8d320a2c256e155293f4f8e591a479bd6b9def4eb",
       "mediaKey": "team-mode",
       "mediaVersion": 3,
       "registryHash": "b72bb329d18eb6d2bc79156b0b78af40408734514e3e711c176ae71a04c0132a",
-      "sourceHash": "3396fff22959d4da6b1f00aa66c01611add93e6aa3016054f075dcef254fdb0c"
+      "sourceHash": "cbc63fdf66bd1d5be13630250faf3b53a604d51c0f99d8175971d5aa2d3cfc89"
     },
     "voice-input": {
       "contentHash": "144229b18b8fdb8b87305b9d050c6b60245f0eeb110b4b3396da1aad19ac808e",
@@ -512,6 +530,20 @@
       "videoSha256": "bed5b04607ed8f1cfc247656c598cd01c3c56dfc4be6a440cff0d43fe0dc9d46",
       "width": 960
     },
+    "session-goal": {
+      "caption": "打开输入框“+”菜单，进入设定目标并填写本会话要完成的事。",
+      "codec": "VP8",
+      "durationSeconds": 4,
+      "height": 540,
+      "poster": "/tutorials/session-goal.webp",
+      "posterBytes": 9222,
+      "posterSha256": "9b215cd74f94e15bcbbaa232ffd6ea5da56aa1aa19a81cdd29bbf5789a1bde2d",
+      "version": 2,
+      "video": "/tutorials/session-goal.webm",
+      "videoBytes": 68843,
+      "videoSha256": "858e9ed7d76fdbd2f7e368ef94026ef9ff11637970107b0984c3f56136075001",
+      "width": 960
+    },
     "sessions-history": {
       "caption": "搜索会话并切换到“客户研究”，继续已有工作。",
       "codec": "VP8",
@@ -538,6 +570,20 @@
       "video": "/tutorials/skills-training.webm",
       "videoBytes": 54708,
       "videoSha256": "af1e986c8ce8ac110b9a74e3e7559c70601f497ab27a2f82b2e8479e054d6cb2",
+      "width": 960
+    },
+    "taskboard": {
+      "caption": "点击侧栏“任务”，进入任务面板查看阶段与工单。",
+      "codec": "VP8",
+      "durationSeconds": 4,
+      "height": 540,
+      "poster": "/tutorials/taskboard.webp",
+      "posterBytes": 16634,
+      "posterSha256": "84a3f6a766ba30dcf79244b21cd1f5b5fa6752eec96e8e2664225d4aff3c4fc8",
+      "version": 2,
+      "video": "/tutorials/taskboard.webm",
+      "videoBytes": 50757,
+      "videoSha256": "37f9714470229a2a1d756b21ec07973410717c95d914698cdc28bfc6d47e4190",
       "width": 960
     },
     "team-mode": {

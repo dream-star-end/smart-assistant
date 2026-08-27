@@ -288,11 +288,12 @@ describe("Sidebar 会话列表", () => {
 });
 
 describe("Sidebar 任务面板入口", () => {
-  it("传入 onOpenBoard 时渲染入口，并用 data-product-control 标注", () => {
+  it("传入 onOpenBoard 时渲染入口，并用 data-product-feature=taskboard 标注", () => {
     const onOpenBoard = vi.fn();
     renderSidebar({ onOpenBoard, boardActive: true });
     const btn = screen.getByRole("button", { name: "任务" });
-    expect(btn).toHaveAttribute("data-product-control");
+    expect(btn).toHaveAttribute("data-product-feature", "taskboard");
+    expect(btn).not.toHaveAttribute("data-product-control");
     expect(btn).toHaveAttribute("aria-current", "true");
     expect(btn).not.toHaveTextContent("看板");
     fireEvent.click(btn);

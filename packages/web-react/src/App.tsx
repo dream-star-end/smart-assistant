@@ -1292,6 +1292,12 @@ export function App() {
         case "org":
           openOrg(destination.section);
           break;
+        case "taskboard":
+          if (TASKBOARD_ENABLED) {
+            setCollapsed(false);
+            setBoardOpen(true);
+          }
+          break;
       }
     },
     [

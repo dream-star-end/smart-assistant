@@ -34,6 +34,8 @@ function destinationLabel(feature: ProductCapability): string {
       return '连接 GitHub'
     case 'org':
       return '打开组织中心'
+    case 'taskboard':
+      return '打开任务面板'
   }
 }
 

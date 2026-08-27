@@ -110,6 +110,11 @@ describe('bridge API allowlist', () => {
     )
     assert.equal(matchCommercialContainerApiProxy('/api/cron', 'POST')?.label, '/api/cron')
     assert.equal(
+      matchCommercialContainerApiProxy('/api/cron/channels', 'GET')?.label,
+      '/api/cron/channels',
+    )
+    assert.equal(matchCommercialContainerApiProxy('/api/cron/channels', 'POST'), null)
+    assert.equal(
       matchCommercialContainerApiProxy('/api/cron/job-1', 'DELETE')?.label,
       '/api/cron/:id',
     )

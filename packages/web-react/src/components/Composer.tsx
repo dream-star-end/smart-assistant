@@ -439,7 +439,10 @@ export function Composer({
                   </DropdownMenuItem>
                 )}
                 {canGoal && (
-                  <DropdownMenuItem onSelect={() => setGoalOpen(true)}>
+                  <DropdownMenuItem
+                    data-product-feature={PRODUCT_CAPABILITIES.sessionGoal.id}
+                    onSelect={() => setGoalOpen(true)}
+                  >
                     <Target size={16} className="shrink-0 text-muted" />
                     <span className="flex-1">{visibleGoal ? "目标" : "设定目标"}</span>
                     {visibleGoal && (

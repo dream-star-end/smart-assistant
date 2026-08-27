@@ -2688,6 +2688,9 @@ export async function provisionV3Container(
       // (容器 SQLite,在 v3 表里永远 session_not_found 然后失败),即回到
       // 修复前的丢消息行为。**生产必须有这两个 env;personal 版没有它们,
       // V3MasterSink getter 返回 null,旧路径继续工作。**
+      // 同一对 env 也是 cron 离线站内信(postInboxMessageDurable → /internal/v3/inbox-post)
+      // 的鉴权:master 凭容器 bearer 解析 uid。不要改注入到 host 进程——单 bearer
+      // 会把多用户 cron 都记到一个 uid。selfhost 单主用户先按容器身份落地。
       `OPENCLAUDE_V3_MASTER_BASE_URL=${internalProxyUrl}`,
       `OPENCLAUDE_V3_CONTAINER_TOKEN=${token}`,
       // 商用版容器:跳过 personal-version 默认 cron jobs(daily-reflection /
