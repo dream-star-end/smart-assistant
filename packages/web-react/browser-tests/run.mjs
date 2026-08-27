@@ -2737,6 +2737,34 @@ await check("T52 Phase-A unpublished 后空 live-units reset 仍保留思考/工
   });
 });
 
+await check("T53 persist 后用户气泡只显示原文，不含论文任务系统提示", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runPaperHintUserBubble());
+  if (result.text !== "CRISPR 论文") {
+    throw new Error(`用户行 text 不是原文:${JSON.stringify(result)}`);
+  }
+  if (!result.modelText || !result.modelText.includes("【OpenClaude 论文任务系统提示】")) {
+    throw new Error(`_modelText 未保留论文提示:${JSON.stringify(result)}`);
+  }
+  await replayRoot.getByText("CRISPR 论文", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  const leaked = await replayRoot.getByText("【OpenClaude 论文任务系统提示】").count();
+  if (leaked !== 0) {
+    throw new Error(`用户气泡泄漏了论文系统提示 count=${leaked}`);
+  }
+});
+
+await check("T54 Weibo 错误码提示重新扫码且图文失败建议纯文字", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runWeiboErrorGuidance());
+  if (!result.actionFailed.includes("重新扫码")) {
+    throw new Error(`WEIBO_ACTION_FAILED 未提示重新扫码:${JSON.stringify(result)}`);
+  }
+  if (!result.loginExpired.includes("重新扫码")) {
+    throw new Error(`LOGIN_EXPIRED_ACCOUNT 未提示重新扫码:${JSON.stringify(result)}`);
+  }
+  if (!result.mediaUpload.includes("纯文字")) {
+    throw new Error(`WEIBO_WRITE_MEDIA_UPLOAD 未建议纯文字:${JSON.stringify(result)}`);
+  }
+});
+
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {
   const alive = await page.evaluate(() => ({
     root: Boolean(document.querySelector("#root")),

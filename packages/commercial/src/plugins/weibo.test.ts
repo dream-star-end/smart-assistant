@@ -73,6 +73,39 @@ function compileWorkerPostHarness(overrides: Record<string, unknown>): {
   )(...names.map((name) => bound[name])) as ReturnType<typeof compileWorkerPostHarness>
 }
 
+function compileCookieApiHarness(): {
+  publishComposerViaCookieApi(
+    page: unknown,
+    text: string,
+    files: Array<{ name: string; mimeType: string; buffer: Buffer }>,
+    selfId: string,
+  ): Promise<{
+    published?: boolean
+    attempted?: boolean
+    via?: string
+    reason?: string
+    pids?: string[]
+    status?: number
+  }>
+} {
+  const start = WEIBO_WORKER_SOURCE.indexOf('async function publishComposerViaCookieApi')
+  const end = WEIBO_WORKER_SOURCE.indexOf('async function newestOwnPost', start)
+  assert.ok(start >= 0 && end > start)
+  return new Function(
+    `'use strict'; ${WEIBO_WORKER_SOURCE.slice(start, end)}; return { publishComposerViaCookieApi };`,
+  )() as ReturnType<typeof compileCookieApiHarness>
+}
+
+function compileDesktopPidOf(): (parsed: unknown) => string {
+  const marker = 'const pidOf = (parsed) => {'
+  const start = WEIBO_WORKER_SOURCE.indexOf(marker)
+  const end = WEIBO_WORKER_SOURCE.indexOf('const pids = [];', start)
+  assert.ok(start >= 0 && end > start)
+  return new Function(`${WEIBO_WORKER_SOURCE.slice(start, end)}; return pidOf;`)() as (
+    parsed: unknown,
+  ) => string
+}
+
 function compileWorkerPostTextHarness(): {
   cleanPostText(value: unknown, max: number): string
 } {
@@ -198,7 +231,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.36')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.37')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -206,6 +239,11 @@ describe('official Weibo Plugin', () => {
         version: '1.6.14',
         artifactHash: 'add60919dfd77461526ae543be1d17d70b6ab866bfff6a4bc988eacf8d1631e4',
         execContractHash: 'fb30fd3d06fa10b3ffff9eb2b25dd644ee2a9454f8c12fd55bd7d05b2188359c',
+      },
+      {
+        version: '1.6.36',
+        artifactHash: '43b41699741b1c67be3216bb15e48944a27a73677bd75c112a88519f1a0c818e',
+        execContractHash: '0f333585cd72292cc9a6eb291df3e2a5122eb5c547c9ed4c03518a64fec756fe',
       },
     ])
     assert.equal(
@@ -218,6 +256,10 @@ describe('official Weibo Plugin', () => {
     )
     assert.equal(
       classifyWeiboSetupPin(WEIBO_SETUP_COMPATIBLE_PREDECESSORS[0]),
+      'compatible-predecessor',
+    )
+    assert.equal(
+      classifyWeiboSetupPin(WEIBO_SETUP_COMPATIBLE_PREDECESSORS[1]),
       'compatible-predecessor',
     )
     assert.equal(
@@ -334,6 +376,9 @@ describe('official Weibo Plugin', () => {
     assert.ok(WEIBO_LOGIN_ORIGINS.includes('https://v2.qr.weibo.cn:443'))
     assert.ok(
       WEIBO_PLUGIN_CONTRACT.runtime.accountState.cookieDomains.includes('login.sina.com.cn'),
+    )
+    assert.ok(
+      WEIBO_PLUGIN_CONTRACT.runtime.accountState.cookieDomains.includes('picupload.weibo.com'),
     )
     const state = validateWeiboAccountState({
       cookies: [
@@ -528,7 +573,23 @@ describe('official Weibo Plugin', () => {
       'exactly one xsrf header: case-variant duplicates merge into an invalid token',
     )
     assert.doesNotMatch(WEIBO_WORKER_SOURCE, /X-XSRF-TOKEN'\] = xsrf/)
-    assert.match(createPostSource, /api\.via === 'string' && api.via/)
+    assert.doesNotMatch(
+      createPostSource,
+      /api\.via === 'string' && api.via\) throw new Error\('media-upload'\)/,
+      'picupload miss with no publish attempt must fall through to DOM',
+    )
+    assert.match(
+      createPostSource,
+      /api\.pids.length === files.length\) throw new Error\('media-upload'\)/,
+      'complete pid set must not fall through to DOM even if attempted is false',
+    )
+    assert.match(WEIBO_WORKER_SOURCE, /form.append\('pic1'/)
+    assert.match(WEIBO_WORKER_SOURCE, /data.pic_id || data.picid || data.pid/)
+    assert.match(
+      WEIBO_WORKER_SOURCE,
+      /mobile = await context.newPage\(\);/,
+      'mobile tab must be assigned inside try so newPage throws return desktop pids',
+    )
     assert.match(WEIBO_WORKER_SOURCE, /ajax\/statuses\/update/)
     assert.match(WEIBO_WORKER_SOURCE, /api\/statuses\/uploadPic/)
     assert.match(WEIBO_WORKER_SOURCE, /api\/statuses\/update/)
@@ -1042,7 +1103,7 @@ describe('official Weibo Plugin', () => {
     assert.equal(events.filter((event) => event === 'click').length, 0)
   })
 
-  test('create_post with media skips the native chooser after a live cookie-path miss', async () => {
+  test('create_post with media does not fall through to DOM after a full pid set without attempted', async () => {
     const events: string[] = []
     const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
     const send = {
@@ -1062,7 +1123,7 @@ describe('official Weibo Plugin', () => {
         text === '图片' ? { click: async () => events.push('image-click') } : send,
       publishComposerViaCookieApi: async () => {
         events.push('api')
-        return { published: false, attempted: false, via: 'picupload-origin', pids: [], status: 0 }
+        return { published: false, attempted: false, via: 'ajax', pids: ['pid1'], status: 200 }
       },
       cleanText: (value: unknown) => String(value).trim(),
       readFile: async () => Buffer.from('image'),
@@ -1082,6 +1143,482 @@ describe('official Weibo Plugin', () => {
     )
     assert.ok(events.indexOf('dispatch') < events.indexOf('api'))
     assert.equal(events.includes('image-click'), false)
+    assert.equal(events.filter((event) => event === 'click').length, 0)
+  })
+
+  test('create_post with media does not fall through to DOM when cookie helper throws after a full pid set', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const send = {
+      isDisabled: async () => false,
+      click: async (options: { trial?: boolean }) => {
+        events.push(options.trial ? 'trial' : 'click')
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) =>
+        text === '图片' ? { click: async () => events.push('image-click') } : send,
+      publishComposerViaCookieApi: async () => {
+        events.push('api')
+        throw Object.assign(new Error('newpage'), { pids: ['pid1'] })
+      },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    await assert.rejects(
+      harness.writeAction(
+        { locator: () => ({}), waitForTimeout: async () => {} },
+        {
+          actionId: 'create_post',
+          params: {
+            text: 'hello',
+            mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+          },
+        },
+      ),
+      /media-upload/,
+    )
+    assert.ok(events.indexOf('dispatch') < events.indexOf('api'))
+    assert.equal(events.includes('image-click'), false)
+    assert.equal(events.filter((event) => event === 'click').length, 0)
+  })
+
+  test('pidOf accepts nested pic_id fields and rejects invalid pids', () => {
+    const pidOf = compileDesktopPidOf()
+    assert.equal(pidOf({ data: { pic_id: 'ABCDEFGHpid' } }), 'ABCDEFGHpid')
+    assert.equal(pidOf({ data: { pid: 'ABCDEFGHpid' } }), 'ABCDEFGHpid')
+    assert.equal(pidOf({ pic: { pic_id: 'ABCDEFGHpid' } }), 'ABCDEFGHpid')
+    assert.equal(pidOf({ pic_id: 'ABCDEFGHpid' }), 'ABCDEFGHpid')
+    assert.equal(pidOf({ pid: 'short' }), '')
+    assert.equal(pidOf({ pid: 'bad pid!!' }), '')
+    assert.equal(pidOf({ ret: 1, msg: 'ok' }), '')
+    assert.equal(pidOf(null), '')
+  })
+
+  test('picupload posts multipart pic1 before raw blob and keeps pids if newPage throws', async () => {
+    const helper = compileCookieApiHarness()
+    const calls: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+      const href = String(url)
+      const kind =
+        typeof FormData !== 'undefined' && init?.body instanceof FormData
+          ? 'form'
+          : typeof Blob !== 'undefined' && init?.body instanceof Blob
+            ? 'blob'
+            : typeof init?.body
+      calls.push(`${kind}:${href}`)
+      if (href.includes('pic_upload.php') && init?.body instanceof FormData) {
+        return { status: 200, text: async () => JSON.stringify({ data: { pic_id: 'NESTEDPID12345' } }) }
+      }
+      if (href.includes('ajax/statuses/update')) {
+        return { status: 403, text: async () => JSON.stringify({ ok: 0 }) }
+      }
+      throw new Error(`unexpected fetch ${href}`)
+    }) as typeof fetch
+    try {
+      const files = [{ name: 'a.jpg', mimeType: 'image/jpeg', buffer: Buffer.from('img') }]
+      const page = {
+        evaluate: async (fn: (input: unknown) => Promise<unknown>, input: unknown) => fn(input),
+        context: () => ({
+          cookies: async () => [{ name: 'XSRF-TOKEN', value: 't' }],
+          newPage: async () => {
+            throw new Error('newpage')
+          },
+        }),
+      }
+      const result = await helper.publishComposerViaCookieApi(page, 'hello', files, '12345')
+      assert.match(calls[0] || '', /^form:https:\/\/picupload\.weibo\.com\/interface\/pic_upload\.php/)
+      assert.equal(
+        calls.some((entry) => entry.startsWith('blob:')),
+        false,
+        'raw blob fallback must not run after multipart returned a pid',
+      )
+      assert.deepEqual(result.pids, ['NESTEDPID12345'])
+      assert.equal(result.attempted, false)
+      assert.equal(result.via, 'ajax')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('picupload falls back from empty multipart to a raw blob body', async () => {
+    const helper = compileCookieApiHarness()
+    const calls: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+      const href = String(url)
+      const kind =
+        typeof FormData !== 'undefined' && init?.body instanceof FormData
+          ? 'form'
+          : typeof Blob !== 'undefined' && init?.body instanceof Blob
+            ? 'blob'
+            : typeof init?.body
+      calls.push(`${kind}:${href}`)
+      if (init?.body instanceof FormData) {
+        return { status: 200, text: async () => JSON.stringify({ ret: 1 }) }
+      }
+      if (href.includes('/interface/pic_upload.php') || href.includes('/interface/upload.php')) {
+        return { status: 200, text: async () => JSON.stringify({ pic_id: 'RAWBLOBPID123' }) }
+      }
+      if (href.includes('ajax/statuses/update')) {
+        return { status: 200, text: async () => JSON.stringify({ ok: 1, data: { idstr: 'mid1' } }) }
+      }
+      throw new Error(`unexpected fetch ${href}`)
+    }) as typeof fetch
+    try {
+      const files = [{ name: 'a.jpg', mimeType: 'image/jpeg', buffer: Buffer.from('img') }]
+      const page = {
+        evaluate: async (fn: (input: unknown) => Promise<unknown>, input: unknown) => fn(input),
+        context: () => ({
+          cookies: async () => [{ name: 'XSRF-TOKEN', value: 't' }],
+          newPage: async () => {
+            throw new Error('newpage')
+          },
+        }),
+      }
+      const previousDocument = (globalThis as { document?: { cookie: string } }).document
+      ;(globalThis as { document?: { cookie: string } }).document = { cookie: '' }
+      let result: Awaited<ReturnType<typeof helper.publishComposerViaCookieApi>>
+      try {
+        result = await helper.publishComposerViaCookieApi(page, 'hello', files, '12345')
+      } finally {
+        const scoped = globalThis as { document?: { cookie: string } }
+        if (previousDocument) scoped.document = previousDocument
+        else scoped.document = undefined
+      }
+      assert.match(calls[0] || '', /^form:/)
+      assert.ok(calls.some((entry) => entry.startsWith('blob:')))
+      assert.equal(result.published, true)
+      assert.deepEqual(result.pids, ['RAWBLOBPID123'])
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  function desktopMissMobilePage(overrides: {
+    updateEvaluate?: (fn: (input: unknown) => Promise<unknown>, input: unknown) => Promise<unknown>
+  } = {}) {
+    let mobileEvals = 0
+    return {
+      evaluate: async (fn: (input: unknown) => Promise<unknown>, input: unknown) => fn(input),
+      context: () => ({
+        cookies: async () => [{ name: 'XSRF-TOKEN', value: 't' }],
+        newPage: async () => ({
+          goto: async () => {},
+          evaluate: async (fn: (input: unknown) => Promise<unknown>, input: unknown) => {
+            mobileEvals += 1
+            if (mobileEvals === 2 && overrides.updateEvaluate) return overrides.updateEvaluate(fn, input)
+            return fn(input)
+          },
+          close: async () => {},
+        }),
+      }),
+    }
+  }
+
+  async function withMockedFetch<T>(
+    impl: (url: string, init?: { body?: unknown }) => Promise<{ status: number; text: () => Promise<string> }>,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const originalFetch = globalThis.fetch
+    const calls: string[] = []
+    globalThis.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+      const href = String(url)
+      calls.push(href)
+      return impl(href, init)
+    }) as typeof fetch
+    try {
+      const result = await run()
+      return Object.assign(result as object, { _calls: calls }) as T
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }
+
+  function mobileUpdateFetch(mode: 'fetch-reject' | 'text-reject' | 'ok') {
+    return async (href: string) => {
+      if (href.includes('picupload.weibo.com') || href.includes('/interface/pic_upload.php') || href.includes('/interface/upload.php')) {
+        return { status: 200, text: async () => JSON.stringify({ ret: 1 }) }
+      }
+      if (href.includes('m.weibo.cn/api/config')) {
+        return { status: 200, text: async () => JSON.stringify({ data: { st: 'stoken' } }) }
+      }
+      if (href.includes('api/statuses/uploadPic')) {
+        return { status: 200, text: async () => JSON.stringify({ pic_id: 'MOBILEPID123' }) }
+      }
+      if (href.includes('api/statuses/update')) {
+        if (mode === 'fetch-reject') throw new Error('update fetch')
+        if (mode === 'text-reject') {
+          return { status: 200, text: async () => { throw new Error('update text') } }
+        }
+        return { status: 200, text: async () => JSON.stringify({ ok: 1, data: { idstr: 'mid1' } }) }
+      }
+      if (href.includes('ajax/statuses/update')) {
+        throw new Error('desktop ajax should not run after picupload miss')
+      }
+      throw new Error(`unexpected fetch ${href}`)
+    }
+  }
+
+  test('cookie helper keeps mobile pids when statuses/update fetch rejects', async () => {
+    const helper = compileCookieApiHarness()
+    const files = [{ name: 'a.jpg', mimeType: 'image/jpeg', buffer: Buffer.from('img') }]
+    const result = await withMockedFetch(mobileUpdateFetch('fetch-reject'), () =>
+      helper.publishComposerViaCookieApi(desktopMissMobilePage(), 'hello', files, '12345'),
+    )
+    assert.equal(result.attempted, true)
+    assert.equal(result.via, 'm')
+    assert.deepEqual(result.pids, ['MOBILEPID123'])
+    assert.notEqual(result.via, 'picupload-origin')
+  })
+
+  test('cookie helper keeps mobile pids when statuses/update text() rejects', async () => {
+    const helper = compileCookieApiHarness()
+    const files = [{ name: 'a.jpg', mimeType: 'image/jpeg', buffer: Buffer.from('img') }]
+    const result = await withMockedFetch(mobileUpdateFetch('text-reject'), () =>
+      helper.publishComposerViaCookieApi(desktopMissMobilePage(), 'hello', files, '12345'),
+    )
+    assert.equal(result.attempted, true)
+    assert.equal(result.via, 'm')
+    assert.deepEqual(result.pids, ['MOBILEPID123'])
+  })
+
+  test('cookie helper keeps mobile pids when update evaluate throws after a full pid set', async () => {
+    const helper = compileCookieApiHarness()
+    const files = [{ name: 'a.jpg', mimeType: 'image/jpeg', buffer: Buffer.from('img') }]
+    const result = await withMockedFetch(mobileUpdateFetch('ok'), () =>
+      helper.publishComposerViaCookieApi(
+        desktopMissMobilePage({
+          updateEvaluate: async () => {
+            throw new Error('execution context destroyed')
+          },
+        }),
+        'hello',
+        files,
+        '12345',
+      ),
+    )
+    assert.equal(result.attempted, true)
+    assert.equal(result.via, 'm')
+    assert.deepEqual(result.pids, ['MOBILEPID123'])
+  })
+
+  test('create_post with media does not fall through to DOM when mobile update fetch rejects', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const send = {
+      isDisabled: async () => false,
+      click: async (options: { trial?: boolean }) => {
+        events.push(options.trial ? 'trial' : 'click')
+      },
+    }
+    const helper = compileCookieApiHarness()
+    const files = [{ name: 'image.png', mimeType: 'image/png', buffer: Buffer.from('image') }]
+    const page = {
+      ...desktopMissMobilePage(),
+      locator: () => ({}),
+      waitForTimeout: async () => {},
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) =>
+        text === '图片' ? { click: async () => events.push('image-click') } : send,
+      publishComposerViaCookieApi: async (_page: unknown, text: string, media: typeof files, selfId: string) => {
+        events.push('api')
+        return withMockedFetch(mobileUpdateFetch('fetch-reject'), () =>
+          helper.publishComposerViaCookieApi(page, text, media, selfId),
+        )
+      },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    await assert.rejects(
+      harness.writeAction(page, {
+        actionId: 'create_post',
+        params: {
+          text: 'hello',
+          mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+        },
+      }),
+      /result/,
+    )
+    assert.ok(events.indexOf('dispatch') < events.indexOf('api'))
+    assert.equal(events.includes('image-click'), false)
+    assert.equal(events.filter((event) => event === 'click').length, 0)
+  })
+
+  test('create_post with media does not fall through to DOM when mobile update text() rejects', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const send = {
+      isDisabled: async () => false,
+      click: async (options: { trial?: boolean }) => {
+        events.push(options.trial ? 'trial' : 'click')
+      },
+    }
+    const helper = compileCookieApiHarness()
+    const page = {
+      ...desktopMissMobilePage(),
+      locator: () => ({}),
+      waitForTimeout: async () => {},
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) =>
+        text === '图片' ? { click: async () => events.push('image-click') } : send,
+      publishComposerViaCookieApi: async (_page: unknown, text: string, media: Array<{ name: string; mimeType: string; buffer: Buffer }>, selfId: string) => {
+        events.push('api')
+        return withMockedFetch(mobileUpdateFetch('text-reject'), () =>
+          helper.publishComposerViaCookieApi(page, text, media, selfId),
+        )
+      },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    await assert.rejects(
+      harness.writeAction(page, {
+        actionId: 'create_post',
+        params: {
+          text: 'hello',
+          mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+        },
+      }),
+      /result/,
+    )
+    assert.equal(events.includes('image-click'), false)
+    assert.equal(events.filter((event) => event === 'click').length, 0)
+  })
+
+  test('cookie helper keeps desktop pids when ajax update fetch rejects', async () => {
+    const helper = compileCookieApiHarness()
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown) => {
+      const href = String(url)
+      if (href.includes('pic_upload.php') || href.includes('/interface/upload.php')) {
+        return { status: 200, text: async () => JSON.stringify({ pic_id: 'DESKTOPPID1' }) }
+      }
+      if (href.includes('ajax/statuses/update')) throw new Error('ajax fetch')
+      throw new Error(href)
+    }) as typeof fetch
+    try {
+      const files = [{ name: 'a.jpg', mimeType: 'image/jpeg', buffer: Buffer.from('img') }]
+      const page = {
+        evaluate: async (fn: (input: unknown) => Promise<unknown>, input: unknown) => fn(input),
+        context: () => ({
+          cookies: async () => [{ name: 'XSRF-TOKEN', value: 't' }],
+          newPage: async () => {
+            throw new Error('newpage')
+          },
+        }),
+      }
+      const previousDocument = (globalThis as { document?: { cookie: string } }).document
+      ;(globalThis as { document?: { cookie: string } }).document = { cookie: '' }
+      try {
+        const result = await helper.publishComposerViaCookieApi(page, 'hello', files, '12345')
+        assert.equal(result.attempted, true)
+        assert.equal(result.via, 'ajax')
+        assert.deepEqual(result.pids, ['DESKTOPPID1'])
+      } finally {
+        const scoped = globalThis as { document?: { cookie: string } }
+        if (previousDocument) scoped.document = previousDocument
+        else scoped.document = undefined
+      }
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('create_post with media falls through to DOM after a live cookie-path miss', async () => {
+    const events: string[] = []
+    const textarea = {
+      fill: async () => {},
+      inputValue: async () => (events.includes('click') ? '' : 'hello'),
+    }
+    const fileInput = {
+      setInputFiles: async () => events.push('upload'),
+      evaluate: async (
+        fn: (node: { isConnected: boolean; files: { length: number } }) => unknown,
+      ) => fn({ isConnected: true, files: { length: events.includes('upload') ? 1 : 0 } }),
+      getAttribute: async () => 'image/*',
+    }
+    const send = {
+      isDisabled: async () => false,
+      click: async (options: { trial?: boolean }) => {
+        if (!options.trial) events.push('click')
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () =>
+        events.includes('upload') ? [{ id: 'dom-fallback', owned: true, text: 'hello' }] : [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) => {
+        if (text === '图片') {
+          return {
+            click: async (options?: { trial?: boolean }) => {
+              if (!options?.trial) events.push('image-click')
+            },
+          }
+        }
+        if (text === '发送') return send
+        return null
+      },
+      publishComposerViaCookieApi: async () => {
+        events.push('api')
+        return {
+          published: false,
+          attempted: false,
+          via: 'picupload-origin',
+          pids: [],
+          status: 200,
+        }
+      },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    const page = {
+      locator: (selector: string) => {
+        if (selector === 'input[type="file"]') return { count: async () => 1, nth: () => fileInput }
+        if (selector === 'img') return uploadedImageLocator(events)
+        return {}
+      },
+      waitForEvent: async () => {
+        events.push('filechooser')
+        throw new Error('filechooser should not open')
+      },
+      waitForTimeout: async () => {},
+    }
+    const result = await harness.writeAction(page, {
+      actionId: 'create_post',
+      params: {
+        text: 'hello',
+        mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+      },
+    })
+    assert.deepEqual(result, { post: { id: 'dom-fallback', owned: true, text: 'hello' } })
+    assert.ok(events.indexOf('dispatch') < events.indexOf('api'))
+    assert.ok(events.indexOf('api') < events.indexOf('upload'))
+    assert.ok(events.includes('click'))
   })
 
   test('create_post does not dispatch a page-level file input outside composer scope', async () => {

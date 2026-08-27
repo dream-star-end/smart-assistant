@@ -92,6 +92,28 @@ export function assertWeiboUpgradeVerificationScope(
     )
 }
 
+export type WeiboDeployDecision = 'noop' | 'promote' | 'unverified'
+
+/** Unattended deploy classifier: pin-aligned active listing is a zero-write no-op. */
+export function classifyWeiboDeployDecision(input: {
+  listingState: string | null
+  listingVersion: string | null
+  listingArtifactHash: string | null
+  listingExecHash: string | null
+  compiledVersion: string
+  compiledArtifactHash: string
+  compiledExecHash: string
+  approvedForDeploy: boolean
+}): WeiboDeployDecision {
+  const pinMatches =
+    input.listingVersion === input.compiledVersion &&
+    input.listingArtifactHash === input.compiledArtifactHash &&
+    input.listingExecHash === input.compiledExecHash
+  if (input.listingState === 'active' && pinMatches) return 'noop'
+  if (input.approvedForDeploy) return 'promote'
+  return 'unverified'
+}
+
 async function locateVersion(): Promise<LocatedVersion | null> {
   const row = await query<LocatedVersion>(
     `SELECT v.id::text, l.owner_user_id::text, v.submitted_by::text,

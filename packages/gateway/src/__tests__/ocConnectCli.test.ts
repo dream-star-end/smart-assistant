@@ -431,6 +431,55 @@ describe('oc-connect call — response kinds', () => {
     assert.equal(r.stderr, 'oc-connect: CONNECTION_REVOKED\n')
   })
 
+  test('kind=error with agent guidance prints nextAction for the model', async () => {
+    const { deps } = mkDeps({
+      responses: {
+        call: {
+          kind: 'error',
+          code: 'WEIBO_ACTION_FAILED',
+          message: '微博动作失败，页面未能完成操作',
+          retrySafe: 'after_reauth',
+          requiresReauth: false,
+          sideEffect: 'none',
+          nextAction: '引导用户重新扫码授权微博',
+        },
+      },
+    })
+    const r = await runOcConnectCli(['call', 'weibo', 'get_self', '--account', '6'], deps)
+    assert.equal(r.exitCode, 1)
+    assert.match(r.stderr, /^oc-connect: WEIBO_ACTION_FAILED\n/)
+    assert.match(r.stderr, /retrySafe=after_reauth/)
+    assert.match(r.stderr, /sideEffect=none/)
+    assert.match(r.stderr, /nextAction: 引导用户重新扫码授权微博/)
+  })
+
+  test('kind=replay unknown includes check-first guidance', async () => {
+    const { deps } = mkDeps({
+      responses: {
+        call: {
+          kind: 'replay',
+          status: 'unknown',
+          errorCode: 'WEIBO_WRITE_MEDIA_UPLOAD',
+          message: '商业版微博图片上传链路当前不可用',
+          retrySafe: 'no',
+          requiresReauth: false,
+          sideEffect: 'possible',
+          nextAction: '商业版图片上传链路当前不可用，建议改纯文字发布',
+        },
+      },
+    })
+    const r = await runOcConnectCli(
+      ['call', 'weibo', 'create_post', '--account', '6', '--confirm', 'cfm-5'],
+      deps,
+    )
+    assert.equal(r.exitCode, 1)
+    assert.match(r.stdout, /unknown/)
+    assert.match(r.stdout, /WEIBO_WRITE_MEDIA_UPLOAD/)
+    assert.match(r.stdout, /retrySafe=no/)
+    assert.match(r.stdout, /sideEffect=possible/)
+    assert.match(r.stdout, /纯文字/)
+  })
+
   test('unknown kind → CONNECTOR_UNEXPECTED_RESPONSE, exit 1', async () => {
     const { deps } = mkDeps({ responses: { call: { kind: 'wat' } } })
     const r = await runOcConnectCli(['call', 'webdav', 'list_dir', '--account', '11'], deps)

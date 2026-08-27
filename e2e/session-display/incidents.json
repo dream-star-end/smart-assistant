@@ -342,12 +342,53 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/plugins/weibo.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "create_post with media falls through to DOM after a live cookie-path miss"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "create_post with media does not fall through to DOM when cookie helper throws after a full pid set"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "picupload posts multipart pic1 before raw blob and keeps pids if newPage throws"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "cookie helper keeps mobile pids when statuses/update fetch rejects"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "cookie helper keeps mobile pids when statuses/update text() rejects"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "create_post with media does not fall through to DOM when mobile update fetch rejects"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "create_post with media does not fall through to DOM when mobile update text() rejects"
         }
       ],
       "proofPending": {
         "reason": "唯一 proof 证据原本填 scripts/v5-e2e-journey-canary.mjs,而该脚本只有 J1-J5 登录/附件/目标/发送/送达,与微博图片链路零关系(2026-07-26 审计),已移除充数证据;真活体证据待补(需要 Weibo 连接器的可重放沙箱)。",
         "since": "2026-07-26"
-      }
+      },
+      "coverageCommits": [
+        "53a4e840",
+        "e7f96b4d",
+        "60e024ab",
+        "7558fc12"
+      ]
     },
     {
       "id": "INC-20260721-WEIBO-WORKER-OOM",
@@ -1855,6 +1896,89 @@
         "reason": "T1 单包 unit 已覆盖 Phase-B deferred stub、thinking/tool 未到与水合后无双份；浏览器 T49 仍只锁 Phase-A unpublished 路径，Phase-B defer 活体留给后续。",
         "since": "2026-08-27"
       }
+    },
+    {
+      "id": "INC-20260827-WEIBO-SETUP-PIN-DRIFT",
+      "occurredAt": "2026-08-27",
+      "severity": "P1",
+      "symptom": "V5 商业版微博扫码授权弹窗顶部红条「Plugin 授权服务暂不可用」。POST /api/plugins/weibo/setup 两次 503 PLUGIN_RUNTIME_UNAVAILABLE（33–70ms）。根因是 weiboContract WEIBO_PLUGIN_VERSION 已到 1.6.36，但 deploy-v5.sh 只自动 seed 知识星球、不 seed 微博，生产 listing 停在 1.5.0，classifyWeiboSetupPin 拒绝。根修给 deploy-v5.sh 补与知识星球同构的无人值守 seed/transition 门；人工 cookie 验证仍走 seed-weibo-plugin.ts --verify-and-upgrade-user。",
+      "rootFixCommit": "9c542d82",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5ReleaseSafety.test.ts",
+          "assertion": "Weibo Plugin is noninteractively gated like Knowledge Planet and never consumes cookies on deploy"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "seed-weibo-plugin.ts --seed-only"
+        }
+      ],
+      "coverageCommits": [
+        "8807ea1a"
+      ]
+    },
+    {
+      "id": "INC-20260827-PAPER-HINT-LEAK",
+      "occurredAt": "2026-08-27",
+      "severity": "P1",
+      "symptom": "论文/文献短句被 master 拼上【OpenClaude 论文任务系统提示】后原样写入 client_sessions 用户行 text；前端 UserCard 按 msg.text 渲染，用户气泡泄漏系统提示。根因是 appendScanSciPaperIntentHintToFrame 漏填 content.displayText，persist 回落到已拼接的 content.text。",
+      "rootFixCommit": "a1414343",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "appendScanSciPaperIntentHintToFrame keeps displayText as user original"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "paper DOI inbound.message gets hidden ScanSci hint only in forwarded frame"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T53 persist 后用户气泡只显示原文，不含论文任务系统提示"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260827-WEIBO-ERRCODE-ACTIONABLE",
+      "occurredAt": "2026-08-27",
+      "severity": "P1",
+      "symptom": "V5 商业版 user 1 微博读动作把 WEIBO_ACTION_FAILED 吞成 CONNECTION_ERROR，写动作对外 message 千篇一律 Weibo action failed，unknown 账本不给副作用/重试指引，会话失效也不提示重新扫码。根因是 rpc 白名单过窄、WeiboRuntimeError 统一文案、错误信封没有 agent 指引字段。",
+      "rootFixCommit": "0d4d8d09",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/pluginErrorGuidance.test.ts",
+          "assertion": "LOGIN_EXPIRED_ACCOUNT tells the agent to rescan and is not retry-safe"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/pluginErrorGuidance.test.ts",
+          "assertion": "WEIBO_WRITE_MEDIA_UPLOAD tells the agent the image path is unavailable"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/connectorsLogic.test.ts",
+          "assertion": "/v3/plugins/call 放行微博已知错误码并附带 agent 指引，不再吞成 CONNECTION_ERROR"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T54 Weibo 错误码提示重新扫码且图文失败建议纯文字"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/pluginErrorGuidance.test.ts",
+          "assertion": "each write code × failed/unknown has exact retrySafe/sideEffect/nextAction"
+        }
+      ],
+      "coverageCommits": [
+        "b5b2820d"
+      ]
     }
   ]
 }

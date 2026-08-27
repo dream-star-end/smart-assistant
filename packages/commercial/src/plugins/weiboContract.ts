@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { WEIBO_WORKER_SOURCE } from './weiboWorkerSource.js'
 
 export const WEIBO_PLUGIN_SLUG = 'weibo'
-export const WEIBO_PLUGIN_VERSION = '1.6.36'
+export const WEIBO_PLUGIN_VERSION = '1.6.37'
 export const WEIBO_WORKER_DIGEST = createHash('sha256').update(WEIBO_WORKER_SOURCE).digest('hex')
 export const WEIBO_DRIVER_ID = `weibo-${WEIBO_WORKER_DIGEST.slice(0, 57)}`
 export const WEIBO_DRIVER_VERSION = WEIBO_PLUGIN_VERSION
@@ -270,6 +270,7 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
   accountState: {
     cookieDomains: [
       'weibo.com',
+      'picupload.weibo.com',
       'passport.weibo.com',
       'm.weibo.cn',
       'weibo.cn',
@@ -853,14 +854,20 @@ if (COMPILED_WEIBO_PLUGIN.pluginType !== 'managed-browser')
   throw new Error('Weibo Plugin contract subtype mismatch')
 
 /**
- * The production v1.6.14 account-state contract is unchanged in v1.6.15. No other
- * historical or user-published Weibo artifact is eligible for this upgrade.
+ * Live production listing is 1.6.36. Keep it as a predecessor so setup stays
+ * up between this release and the official seed. 1.6.14 remains eligible.
+ * No other historical or user-published Weibo artifact may upgrade here.
  */
 export const WEIBO_SETUP_COMPATIBLE_PREDECESSORS = Object.freeze([
   Object.freeze({
     version: '1.6.14',
     artifactHash: 'add60919dfd77461526ae543be1d17d70b6ab866bfff6a4bc988eacf8d1631e4',
     execContractHash: 'fb30fd3d06fa10b3ffff9eb2b25dd644ee2a9454f8c12fd55bd7d05b2188359c',
+  }),
+  Object.freeze({
+    version: '1.6.36',
+    artifactHash: '43b41699741b1c67be3216bb15e48944a27a73677bd75c112a88519f1a0c818e',
+    execContractHash: '0f333585cd72292cc9a6eb291df3e2a5122eb5c547c9ed4c03518a64fec756fe',
   }),
 ])
 
