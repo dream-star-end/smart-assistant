@@ -492,18 +492,84 @@ function isGeneratedRole(role: ChatMessage["role"] | undefined): boolean {
 /** Live presentation rows that have a one-for-one durable counterpart in a
  * finalized Agent tape. User/permission/system rows are deliberately absent:
  * they are not replaceable Agent-process UI. */
-function isTapeBackedAgentProcessRole(role: ChatMessage["role"] | undefined): boolean {
+export function isTapeBackedAgentProcessRole(role: ChatMessage["role"] | undefined): boolean {
   return role === "assistant" || role === "thinking" || role === "tool" ||
     role === "plan" || role === "goal" || role === "agent-group" ||
     role === "delegate-progress" || role === "runtime-event";
 }
 
-function turnOwnerId(message: ChatMessage): string | undefined {
+export function turnOwnerId(message: ChatMessage): string | undefined {
   return typeof message._turnOwnerId === "string" && message._turnOwnerId
     ? message._turnOwnerId
     : typeof message._clientMessageId === "string" && message._clientMessageId
       ? message._clientMessageId
       : undefined;
+}
+
+function isExactTimelineProcessRow(message: ChatMessage): boolean {
+  return (
+    message._timelineRecord === true &&
+    isTapeBackedAgentProcessRole(message.role) &&
+    message.role !== "assistant" &&
+    message._displayDegradeReason !== "records_unpublished"
+  );
+}
+
+/**
+ * Live tape-backed process (not assistant) that must stay visible until exact
+ * tape process rows positively supersede them. `authorityRows` is the server
+ * payload during merge, or the current transcript during journal reset.
+ *
+ * Hits when the owner matches a `records_unpublished` assistant, or when the
+ * authority page has an unpublished assistant without `_clientMessageId` and
+ * this owner still has no exact `_timelineRecord` process rows.
+ */
+export function isLiveProcessPendingExactTape(
+  message: ChatMessage,
+  authorityRows: readonly ChatMessage[],
+): boolean {
+  if (
+    !message ||
+    !isTapeBackedAgentProcessRole(message.role) ||
+    message.role === "assistant" ||
+    message._timelineRecord === true
+  ) {
+    return false;
+  }
+  const unpublishedOwners = new Set<string>();
+  let hasUnownedUnpublishedAssistant = false;
+  const exactProcessOwners = new Set<string>();
+  for (const row of authorityRows) {
+    if (!row) continue;
+    if (row.role === "assistant" && row._displayDegradeReason === "records_unpublished") {
+      const unpublishedOwner = turnOwnerId(row);
+      if (typeof unpublishedOwner === "string") unpublishedOwners.add(unpublishedOwner);
+      else hasUnownedUnpublishedAssistant = true;
+    }
+    if (isExactTimelineProcessRow(row)) {
+      const exactOwner = turnOwnerId(row);
+      if (typeof exactOwner === "string") exactProcessOwners.add(exactOwner);
+    }
+  }
+  if (unpublishedOwners.size === 0 && !hasUnownedUnpublishedAssistant) return false;
+  const owner = turnOwnerId(message);
+  if (typeof owner === "string") {
+    if (unpublishedOwners.has(owner)) return true;
+    return hasUnownedUnpublishedAssistant && !exactProcessOwners.has(owner);
+  }
+  return hasUnownedUnpublishedAssistant && exactProcessOwners.size === 0;
+}
+
+/** Journal/units owner-reset: keep pending live process unless incoming units
+ * already carry a replacement process row for the same owner. */
+export function shouldRetainLiveProcessOnOwnerReset(
+  message: ChatMessage,
+  authorityRows: readonly ChatMessage[],
+  incomingProcessOwners: ReadonlySet<string>,
+): boolean {
+  if (!isLiveProcessPendingExactTape(message, authorityRows)) return false;
+  const owner = turnOwnerId(message);
+  return !(typeof owner === "string" && incomingProcessOwners.has(owner));
 }
 
 function validHistoryOrder(value: unknown): value is number {
@@ -674,15 +740,8 @@ export function mergeFullServerWins(
       unpublishedFinalOwners.add(m._clientMessageId);
     }
   }
-  const isUnpublishedProcessRow = (message: ChatMessage): boolean => {
-    const owner = turnOwnerId(message);
-    return (
-      typeof owner === "string" &&
-      unpublishedFinalOwners.has(owner) &&
-      isTapeBackedAgentProcessRole(message.role) &&
-      message.role !== "assistant"
-    );
-  };
+  const isUnpublishedProcessRow = (message: ChatMessage): boolean =>
+    isLiveProcessPendingExactTape(message, server);
   const hasExactCompletionEvidence =
     !!completedClientMessageId &&
     server.some(
