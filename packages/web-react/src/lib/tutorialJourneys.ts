@@ -102,6 +102,6 @@ export const TUTORIAL_SCENARIO_PATHS = [
     id: "team-delegation",
     title: "团队协作与委派",
     description: "把大任务拆给多个助手，并查看团队如何推进。",
-    topicIds: ["team-mode", "agents", "inbox", "organization"],
+    topicIds: ["taskboard", "team-mode", "agents", "inbox"],
   },
 ] as const satisfies readonly TutorialScenarioPath[];

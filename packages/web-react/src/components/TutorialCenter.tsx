@@ -17,6 +17,7 @@ import {
   FileOutput,
   GitBranch,
   History,
+  Kanban,
   Image,
   Lightbulb,
   ListOrdered,
@@ -33,6 +34,7 @@ import {
   Settings,
   Sparkles,
   Store,
+  Target,
   TestTube2,
   TriangleAlert,
   Upload,
@@ -108,6 +110,8 @@ const ICONS: Record<string, LucideIcon> = {
   building: Building2,
   "message-square": MessageSquare,
   monitor: Monitor,
+  kanban: Kanban,
+  target: Target,
 };
 
 const CASE_CATEGORIES: readonly {

@@ -1149,6 +1149,114 @@ async function fixtureFor(
 
   if (method === "POST" && path === "/api/feedback")
     return json({ ok: true, feedback_id: "tutorial-feedback-id" });
+  if (method === "GET" && path === "/api/chat-projects")
+    return json({
+      projects: [
+        {
+          id: "tutorial-board-project",
+          name: "示例任务项目",
+          instructions: null,
+          color: null,
+          sortOrder: 0,
+          createdAt: Date.parse(FIXED_NOW),
+          updatedAt: Date.parse(FIXED_NOW),
+          sessionCount: 1,
+          boardProjectId: "tutorial-board-project",
+        },
+      ],
+    });
+  if (method === "GET" && path === "/api/media-generation/capabilities")
+    return json({ available: false });
+  if (method === "GET" && /^\/api\/agents\/[^/]+\/auto-dream-optimizer$/.test(path))
+    return json({
+      schemaVersion: 2,
+      status: "idle",
+      sessionsReviewed: 0,
+      pagesReviewed: 0,
+      proposals: [],
+    });
+  if (method === "POST" && /^\/api\/sessions\/[^/]+\/read$/.test(path))
+    return json({ ok: true, updated: 1 });
+  if (method === "GET" && path.startsWith("/api/session-goals/"))
+    return json({ goal: null });
+  if (path.startsWith("/api/board/")) {
+    if (
+      (method === "GET" && path === "/api/board/projects") ||
+      (method === "GET" && path.startsWith("/api/board/projects?"))
+    ) {
+      return json({
+        items: [
+          {
+            id: "tutorial-board-project",
+            key: "TUT",
+            name: "示例任务项目",
+            description: null,
+            workspace: null,
+            labels: [],
+            archivedAt: null,
+            createdAt: Date.parse(FIXED_NOW),
+            updatedAt: Date.parse(FIXED_NOW),
+          },
+        ],
+      });
+    }
+    if (method === "GET" && path === "/api/board/agents") {
+      return json({
+        items: AGENTS.map((agent) => ({
+          id: agent.id,
+          name: agent.name,
+          description: agent.description,
+        })),
+      });
+    }
+    if (method === "GET" && path === "/api/board/settings") {
+      return json({
+        schemaVersion: 1,
+        defaultTicketType: "feature",
+      });
+    }
+    if (method === "GET" && path.startsWith("/api/board/tickets")) {
+      return json({ items: [], total: 0 });
+    }
+    if (method === "GET" && path.startsWith("/api/board/pipelines")) {
+      return json({
+        items: [
+          {
+            id: "tutorial-pipe",
+            projectId: "tutorial-board-project",
+            name: "功能默认线",
+            ticketType: "feature",
+            isDefault: true,
+            createdAt: Date.parse(FIXED_NOW),
+            updatedAt: Date.parse(FIXED_NOW),
+            stages: [
+              {
+                id: "tutorial-stage-ready",
+                name: "待办",
+                key: "ready",
+                position: 0,
+              },
+              {
+                id: "tutorial-stage-running",
+                name: "进行中",
+                key: "running",
+                position: 1,
+              },
+            ],
+          },
+        ],
+      });
+    }
+    if (method === "GET" && /\/board(?:\?|$)/.test(path)) {
+      return json({
+        columns: [
+          { id: "tutorial-stage-ready", name: "待办", tickets: [] },
+          { id: "tutorial-stage-running", name: "进行中", tickets: [] },
+        ],
+      });
+    }
+    return json({ items: [] });
+  }
   throw new Error(`未知教程 fixture：${method} ${path}${url.search}`);
 }
 
@@ -1685,6 +1793,24 @@ const SCENARIOS: ScenarioDefinition[] = [
     },
   },
   {
+    featureId: "session-goal",
+    async run(ctx) {
+      await plainClick(ctx, 'button[aria-label="更多选项"]');
+      await stage(ctx, "打开输入框更多选项");
+      await tracedClick(
+        ctx,
+        '[data-product-feature="session-goal"]',
+        "打开设定目标",
+      );
+      await assertVisible(
+        ctx,
+        '[role="dialog"] :text("会话目标")',
+        "目标对话框已打开",
+      );
+      await stage(ctx, "填写本会话要完成的事");
+    },
+  },
+  {
     featureId: "sessions-history",
     async run(ctx) {
       await tracedFill(
@@ -1701,6 +1827,28 @@ const SCENARIOS: ScenarioDefinition[] = [
       );
       await assertVisible(ctx, 'main :text("对比三家产品")', "历史消息已恢复");
       await stage(ctx, "打开会话并恢复历史上下文");
+    },
+  },
+  {
+    featureId: "taskboard",
+    async run(ctx) {
+      await tracedClick(
+        ctx,
+        'aside button[data-product-feature="taskboard"][data-testid="taskboard-nav"]',
+        "打开任务面板",
+      );
+      await assertVisible(ctx, 'h1:has-text("任务面板")', "任务面板标题已出现");
+      await stage(ctx, "打开任务面板");
+      await plainClick(
+        ctx,
+        'button[data-testid="taskboard-layout-toggle"]',
+      );
+      await assertVisible(
+        ctx,
+        'button[data-testid="taskboard-layout-toggle"][aria-label="切换到看板展示"]',
+        "已切到列表展示",
+      );
+      await stage(ctx, "查看阶段与工单");
     },
   },
   {
@@ -2804,6 +2952,21 @@ async function renderMedia(
 
 async function main(): Promise<void> {
   const acceptToolchain = process.argv.includes("--accept-toolchain");
+  const onlyArg = process.argv.find((arg) => arg.startsWith("--only="));
+  const onlyIds = onlyArg
+    ? onlyArg
+        .slice("--only=".length)
+        .split(",")
+        .map((id) => id.trim())
+        .filter(Boolean)
+    : null;
+  if (onlyIds) {
+    const unknown = onlyIds.filter(
+      (id) => !FEATURE_IDS.includes(id as ProductFeatureId),
+    );
+    if (unknown.length)
+      throw new Error(`--only 含未登记能力：${unknown.join(", ")}`);
+  }
   if (
     SCENARIOS.length !== FEATURE_IDS.length ||
     new Set(SCENARIOS.map((item) => item.featureId)).size !==
@@ -2901,7 +3064,15 @@ async function main(): Promise<void> {
     const exactVideos = new Set<string>();
     const exactOperationalStages = new Map<string, string>();
     const scenarioErrors: string[] = [];
-    for (const definition of SCENARIOS) {
+    const runList = onlyIds
+      ? SCENARIOS.filter((item) => onlyIds.includes(item.featureId))
+      : SCENARIOS;
+    if (onlyIds && runList.length !== onlyIds.length) {
+      throw new Error(
+        `--only 与场景定义不一致：${onlyIds.filter((id) => !runList.some((item) => item.featureId === id)).join(", ")}`,
+      );
+    }
+    for (const definition of runList) {
       process.stdout.write(`录制 ${definition.featureId} ... `);
       try {
         const result = await captureScenario(
@@ -2968,6 +3139,13 @@ async function main(): Promise<void> {
         `教程录制有 ${scenarioErrors.length} 个场景失败：\n\n${scenarioErrors.join("\n\n")}`,
       );
 
+    const previousProvenance = existsSync(PROVENANCE_PATH)
+      ? (JSON.parse(readFileSync(PROVENANCE_PATH, "utf8")) as {
+          scenarios?: Record<string, unknown>;
+          toolchain?: Record<string, unknown>;
+          generatedAt?: string;
+        })
+      : null;
     const provenance = {
       schema: 1,
       pipelineVersion: PIPELINE_VERSION,
@@ -2982,18 +3160,37 @@ async function main(): Promise<void> {
       networkPolicy:
         "local static + explicit fixtures; unknown local and all external requests fail",
       toolchain,
-      scenarios: scenarioRecords,
+      ...(onlyIds
+        ? {
+            incremental: {
+              at: new Date().toISOString(),
+              featureIds: onlyIds,
+              previousGeneratedAt: previousProvenance?.generatedAt ?? null,
+            },
+          }
+        : {}),
+      scenarios: onlyIds
+        ? {
+            ...(previousProvenance?.scenarios ?? {}),
+            ...scenarioRecords,
+          }
+        : scenarioRecords,
     };
     scanPrivacy("provenance", JSON.stringify(provenance));
-    for (const name of readdirSync(OUTPUT)) {
-      if (/\.(?:webp|webm)$/.test(name)) rmSync(join(OUTPUT, name));
+    if (!onlyIds) {
+      for (const name of readdirSync(OUTPUT)) {
+        if (/\.(?:webp|webm)$/.test(name)) rmSync(join(OUTPUT, name));
+      }
     }
     mkdirSync(OUTPUT, { recursive: true });
     for (const name of readdirSync(tempOutput))
       renameSync(join(tempOutput, name), join(OUTPUT, name));
     writeFileSync(PROVENANCE_PATH, `${JSON.stringify(provenance, null, 2)}\n`);
+    const generatedCount = Object.keys(scenarioRecords).length;
     console.log(
-      `已从正式 v5 App 生成 ${FEATURE_IDS.length} 组独立教程媒体（${FEATURE_IDS.length * 2} 个文件）。`,
+      onlyIds
+        ? `已增量录制 ${generatedCount} 组教程媒体（--only=${onlyIds.join(",")}），未覆盖其余章节文件。`
+        : `已从正式 v5 App 生成 ${FEATURE_IDS.length} 组独立教程媒体（${FEATURE_IDS.length * 2} 个文件）。`,
     );
   } finally {
     await browser?.close().catch(() => {});

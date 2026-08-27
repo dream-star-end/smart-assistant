@@ -644,7 +644,7 @@ export function Sidebar({
         {onOpenBoard && (
           <button
             type="button"
-            data-product-control
+            data-product-feature={PRODUCT_CAPABILITIES.taskboard.id}
             data-testid="taskboard-nav"
             onClick={onOpenBoard}
             aria-current={boardActive ? "true" : undefined}

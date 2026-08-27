@@ -2,14 +2,14 @@
   "schema": 1,
   "pipelineVersion": 2,
   "generatedAt": "2026-07-15T08:00:00.000Z",
-  "sourceCommit": "db1cfb66234254ecb0e8bc95e4b7b656245c6510",
-  "sourceTreeHash": "889a065a3e2bbafe48e300b16b3fa2cac8217694386b1d10436b84de019f1684",
+  "sourceCommit": "3c52ee8ceff58e7a632ab545c20522682a87a168",
+  "sourceTreeHash": "a7bfdd62f62446128f65dea94678e47e4e0bf0b34b11478c48a59afb6c584bf3",
   "productionEntry": "index.html -> src/main.tsx -> App",
   "fixtureBoundary": "HTTP / WebSocket / browser capabilities only",
   "networkPolicy": "local static + explicit fixtures; unknown local and all external requests fail",
   "toolchain": {
     "node": "v20.20.2",
-    "chrome": "Google Chrome for Testing 149.0.7827.55",
+    "chrome": "Google Chrome for Testing 151.0.7922.34",
     "playwrightCore": "1.61.0-alpha-1781023400000",
     "ffmpeg": "ffmpeg version n7.0.1-playwright-build-1011 Copyright (c) 2000-2024 the FFmpeg developers",
     "sharp": "0.34.5",
@@ -43,6 +43,14 @@
       "--disable-component-update",
       "--disable-sync"
     ]
+  },
+  "incremental": {
+    "at": "2026-08-27T15:59:12.774Z",
+    "featureIds": [
+      "taskboard",
+      "session-goal"
+    ],
+    "previousGeneratedAt": "2026-07-15T08:00:00.000Z"
   },
   "scenarios": {
     "chat-basics": {
@@ -116,7 +124,9 @@
           "activeTabs": []
         }
       ],
-      "assertions": ["助手已返回完整交付"],
+      "assertions": [
+        "助手已返回完整交付"
+      ],
       "poster": {
         "sha256": "5f7fb3b0d8d836015c1fc7b83b1097817366f3ac757bc722b7a03189256cade2",
         "bytes": 23954
@@ -177,7 +187,9 @@
           "activeTabs": []
         }
       ],
-      "assertions": ["历史消息已恢复"],
+      "assertions": [
+        "历史消息已恢复"
+      ],
       "poster": {
         "sha256": "2529a26b5610100bcedc4a23fb412517a6a50dd92aa3e02f0005fb0f018e005a",
         "bytes": 25266
@@ -258,7 +270,9 @@
           "activeTabs": []
         }
       ],
-      "assertions": ["顶栏已显示新模型"],
+      "assertions": [
+        "顶栏已显示新模型"
+      ],
       "poster": {
         "sha256": "803ac951015ce15438e034537536ff8ebf9ba2bd9acf4c47a19e8ba48ba7abf3",
         "bytes": 25074
@@ -303,7 +317,9 @@
           "activeTabs": []
         }
       ],
-      "assertions": ["附件卡片已出现"],
+      "assertions": [
+        "附件卡片已出现"
+      ],
       "poster": {
         "sha256": "ec7aceac77066529bd25dbe72c7156164503f9a6f0387a437620c9aadf81d2d7",
         "bytes": 26708
@@ -364,7 +380,10 @@
           "activeTabs": []
         }
       ],
-      "assertions": ["录音状态已启动", "语音转写文字已进入输入框"],
+      "assertions": [
+        "录音状态已启动",
+        "语音转写文字已进入输入框"
+      ],
       "poster": {
         "sha256": "b12aebe7f491213ed8693bddc5a5493b9ebce0d4f37599f93c635bb109444238",
         "bytes": 34182
@@ -406,7 +425,9 @@
           "matchedFeatureId": "web-research",
           "matchedControl": true,
           "dialogTitle": "管理中心",
-          "activeTabs": ["记忆"]
+          "activeTabs": [
+            "记忆"
+          ]
         },
         {
           "step": "上传新的研究资料",
@@ -422,7 +443,9 @@
           "matchedFeatureId": "web-research",
           "matchedControl": true,
           "dialogTitle": "管理中心",
-          "activeTabs": ["文献库"]
+          "activeTabs": [
+            "文献库"
+          ]
         }
       ],
       "assertions": [
@@ -474,7 +497,10 @@
           "activeTabs": []
         }
       ],
-      "assertions": ["季度经营复盘会话已打开", "成果文件卡片已渲染"],
+      "assertions": [
+        "季度经营复盘会话已打开",
+        "成果文件卡片已渲染"
+      ],
       "poster": {
         "sha256": "9adfed2401f73a769d0f14dcb6a7e31b19b5654dd7366e852360fdcea90b73b9",
         "bytes": 28572
@@ -847,7 +873,10 @@
           "activeTabs": []
         }
       ],
-      "assertions": ["智能体选择器已打开", "顶栏已切换智能体"],
+      "assertions": [
+        "智能体选择器已打开",
+        "顶栏已切换智能体"
+      ],
       "poster": {
         "sha256": "1e1fb498aeafc19c05d14d26487077f8c7e808acba41c0cba22f3e65354f2b5e",
         "bytes": 22922
@@ -959,7 +988,9 @@
           "matchedFeatureId": "memory-auto-dream",
           "matchedControl": true,
           "dialogTitle": "管理中心",
-          "activeTabs": ["记忆"]
+          "activeTabs": [
+            "记忆"
+          ]
         }
       ],
       "assertions": [
@@ -1008,7 +1039,9 @@
           "matchedFeatureId": "schedules-reminders",
           "matchedControl": true,
           "dialogTitle": "管理中心",
-          "activeTabs": ["记忆"]
+          "activeTabs": [
+            "记忆"
+          ]
         },
         {
           "step": "打开新建定时任务表单",
@@ -1024,10 +1057,15 @@
           "matchedFeatureId": "schedules-reminders",
           "matchedControl": true,
           "dialogTitle": "管理中心",
-          "activeTabs": ["定时任务"]
+          "activeTabs": [
+            "定时任务"
+          ]
         }
       ],
-      "assertions": ["管理中心已打开", "定时任务列表已加载"],
+      "assertions": [
+        "管理中心已打开",
+        "定时任务列表已加载"
+      ],
       "poster": {
         "sha256": "9e1698a3d67d87558a1b3e239636b868c74e707f2a239c6afbc11b5f570fac69",
         "bytes": 13604
@@ -1069,7 +1107,9 @@
           "matchedFeatureId": "skills-training",
           "matchedControl": true,
           "dialogTitle": "管理中心",
-          "activeTabs": ["记忆"]
+          "activeTabs": [
+            "记忆"
+          ]
         },
         {
           "step": "打开技能详情",
@@ -1085,7 +1125,9 @@
           "matchedFeatureId": "skills-training",
           "matchedControl": true,
           "dialogTitle": "管理中心",
-          "activeTabs": ["技能"]
+          "activeTabs": [
+            "技能"
+          ]
         },
         {
           "step": "打开评测与训练区",
@@ -1101,10 +1143,15 @@
           "matchedFeatureId": "skills-training",
           "matchedControl": true,
           "dialogTitle": "管理中心",
-          "activeTabs": ["技能"]
+          "activeTabs": [
+            "技能"
+          ]
         }
       ],
-      "assertions": ["管理中心已打开", "技能列表已加载"],
+      "assertions": [
+        "管理中心已打开",
+        "技能列表已加载"
+      ],
       "poster": {
         "sha256": "178dd57b07372a24ca653bc67311d511f3d339c2169acefac3b4dfe4e12a7c98",
         "bytes": 14658
@@ -1146,7 +1193,9 @@
           "matchedFeatureId": "connectors",
           "matchedControl": true,
           "dialogTitle": "管理中心",
-          "activeTabs": ["记忆"]
+          "activeTabs": [
+            "记忆"
+          ]
         },
         {
           "step": "查看连接器绑定入口",
@@ -1162,10 +1211,15 @@
           "matchedFeatureId": "connectors",
           "matchedControl": true,
           "dialogTitle": "管理中心",
-          "activeTabs": ["连接器"]
+          "activeTabs": [
+            "连接器"
+          ]
         }
       ],
-      "assertions": ["管理中心已打开", "已绑定连接器已加载"],
+      "assertions": [
+        "管理中心已打开",
+        "已绑定连接器已加载"
+      ],
       "poster": {
         "sha256": "45d4dd879fdcfb433b61be7d5c78ff46e8b7622fcb29cdcdef47be3bbaeeab9a",
         "bytes": 10416
@@ -1207,7 +1261,9 @@
           "matchedFeatureId": "marketplace-discovery",
           "matchedControl": true,
           "dialogTitle": "AI 市场",
-          "activeTabs": ["发现"]
+          "activeTabs": [
+            "发现"
+          ]
         },
         {
           "step": "打开市场条目详情",
@@ -1223,10 +1279,16 @@
           "matchedFeatureId": "marketplace-discovery",
           "matchedControl": true,
           "dialogTitle": "AI 市场",
-          "activeTabs": ["发现"]
+          "activeTabs": [
+            "发现"
+          ]
         }
       ],
-      "assertions": ["AI 市场已打开", "搜索结果已加载", "条目详情已打开"],
+      "assertions": [
+        "AI 市场已打开",
+        "搜索结果已加载",
+        "条目详情已打开"
+      ],
       "poster": {
         "sha256": "1eb3aa09f46471583ea2ba41c5008372b1a742a6561ce91c4fb9560bb61fba7c",
         "bytes": 20558
@@ -1268,7 +1330,9 @@
           "matchedFeatureId": "marketplace-publishing",
           "matchedControl": true,
           "dialogTitle": "AI 市场",
-          "activeTabs": ["发现"]
+          "activeTabs": [
+            "发现"
+          ]
         },
         {
           "step": "填写技能名称",
@@ -1284,10 +1348,14 @@
           "matchedFeatureId": "marketplace-publishing",
           "matchedControl": true,
           "dialogTitle": "AI 市场",
-          "activeTabs": ["发布"]
+          "activeTabs": [
+            "发布"
+          ]
         }
       ],
-      "assertions": ["发布面板已打开"],
+      "assertions": [
+        "发布面板已打开"
+      ],
       "poster": {
         "sha256": "decbfc47ad1d142abec8c8e8e290d83210c0ed52e4a9e12dd6574d20fac2d7e5",
         "bytes": 16690
@@ -1345,7 +1413,9 @@
           "matchedFeatureId": "inbox",
           "matchedControl": true,
           "dialogTitle": "站内信",
-          "activeTabs": ["全部"]
+          "activeTabs": [
+            "全部"
+          ]
         },
         {
           "step": "展开一条未读通知",
@@ -1361,10 +1431,14 @@
           "matchedFeatureId": "inbox",
           "matchedControl": true,
           "dialogTitle": "站内信",
-          "activeTabs": ["未读"]
+          "activeTabs": [
+            "未读"
+          ]
         }
       ],
-      "assertions": ["站内信已打开"],
+      "assertions": [
+        "站内信已打开"
+      ],
       "poster": {
         "sha256": "2ebd5f4eb13fdfc0fae1db39a83bd63b59e86966e4c104185a424d17ebaaacee",
         "bytes": 12954
@@ -1406,7 +1480,10 @@
           "matchedFeatureId": "preferences",
           "matchedControl": true,
           "dialogTitle": "设置",
-          "activeTabs": ["账户与计费", "30 天"]
+          "activeTabs": [
+            "账户与计费",
+            "30 天"
+          ]
         },
         {
           "step": "切换深色主题",
@@ -1422,10 +1499,15 @@
           "matchedFeatureId": "preferences",
           "matchedControl": true,
           "dialogTitle": "设置",
-          "activeTabs": ["偏好"]
+          "activeTabs": [
+            "偏好"
+          ]
         }
       ],
-      "assertions": ["偏好页已加载", "深色主题已生效"],
+      "assertions": [
+        "偏好页已加载",
+        "深色主题已生效"
+      ],
       "poster": {
         "sha256": "e6c656843854d8b12c293e51dfc4d7a3b8f7d9fbf3beb4a449dd275303f4a36b",
         "bytes": 10582
@@ -1483,10 +1565,16 @@
           "matchedFeatureId": "billing-usage",
           "matchedControl": true,
           "dialogTitle": "设置",
-          "activeTabs": ["账户与计费", "30 天"]
+          "activeTabs": [
+            "账户与计费",
+            "30 天"
+          ]
         }
       ],
-      "assertions": ["套餐与余额已加载", "用量趋势图已加载"],
+      "assertions": [
+        "套餐与余额已加载",
+        "用量趋势图已加载"
+      ],
       "poster": {
         "sha256": "c991db1ef6b36684c3ea2ff07192befb6130ca09f87b31fb510203c90d5fec90",
         "bytes": 12414
@@ -1528,10 +1616,16 @@
           "matchedFeatureId": "organization",
           "matchedControl": true,
           "dialogTitle": "示例研发组",
-          "activeTabs": ["概览"]
+          "activeTabs": [
+            "概览"
+          ]
         }
       ],
-      "assertions": ["组织中心已打开", "组织概览已加载", "组织用量图表已加载"],
+      "assertions": [
+        "组织中心已打开",
+        "组织概览已加载",
+        "组织用量图表已加载"
+      ],
       "poster": {
         "sha256": "9241534ee560eea92ccaf51632ef71b2af262a0d1b5af7568bb417e07ebc141b",
         "bytes": 11516
@@ -1573,7 +1667,10 @@
           "matchedFeatureId": "feedback-support",
           "matchedControl": true,
           "dialogTitle": "设置",
-          "activeTabs": ["账户与计费", "30 天"]
+          "activeTabs": [
+            "账户与计费",
+            "30 天"
+          ]
         },
         {
           "step": "选择体验问题",
@@ -1589,7 +1686,9 @@
           "matchedFeatureId": "feedback-support",
           "matchedControl": true,
           "dialogTitle": "设置",
-          "activeTabs": ["反馈"]
+          "activeTabs": [
+            "反馈"
+          ]
         },
         {
           "step": "填写复现步骤与期望结果",
@@ -1605,10 +1704,14 @@
           "matchedFeatureId": "feedback-support",
           "matchedControl": true,
           "dialogTitle": "设置",
-          "activeTabs": ["反馈"]
+          "activeTabs": [
+            "反馈"
+          ]
         }
       ],
-      "assertions": ["反馈表单已打开"],
+      "assertions": [
+        "反馈表单已打开"
+      ],
       "poster": {
         "sha256": "9dcc13731b53554948ac5eea31474f99b1602781302acb92eee93e0302e259b6",
         "bytes": 16526
@@ -1616,6 +1719,101 @@
       "video": {
         "sha256": "178bc912265a874917a38e11146c6a8ab0eeb4c325d31625b046a293e2b1bd82",
         "bytes": 57981
+      }
+    },
+    "session-goal": {
+      "mediaVersion": 2,
+      "caption": "打开输入框“+”菜单，进入设定目标并填写本会话要完成的事。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "3d26390692b024b288381a008602803220328000c000c200a40286033c822c80"
+        },
+        {
+          "label": "打开输入框更多选项",
+          "dHash": "3d26390692b024b288381a008602803224328200cd00cd00ac0286432c822c80"
+        },
+        {
+          "label": "填写本会话要完成的事",
+          "dHash": "390639269680205aa07a245aa4daa45a251aa11ae59aa05aa05a96232c100c00"
+        }
+      ],
+      "actions": [
+        {
+          "step": "打开设定目标",
+          "selector": "[data-product-feature=\"session-goal\"]",
+          "expectedFeatureId": "session-goal",
+          "assertions": [
+            "visible:[data-product-feature=\"session-goal\"]",
+            "feature:session-goal"
+          ],
+          "tag": "div",
+          "role": "menuitem",
+          "label": "设定目标",
+          "matchedFeatureId": "session-goal",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        }
+      ],
+      "assertions": [
+        "目标对话框已打开"
+      ],
+      "poster": {
+        "sha256": "9b215cd74f94e15bcbbaa232ffd6ea5da56aa1aa19a81cdd29bbf5789a1bde2d",
+        "bytes": 9222
+      },
+      "video": {
+        "sha256": "858e9ed7d76fdbd2f7e368ef94026ef9ff11637970107b0984c3f56136075001",
+        "bytes": 68843
+      }
+    },
+    "taskboard": {
+      "mediaVersion": 2,
+      "caption": "点击侧栏“任务”，进入任务面板查看阶段与工单。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "3d26390692b024b288381a008602803220328000c000c200a40286033c822c80"
+        },
+        {
+          "label": "打开任务面板",
+          "dHash": "34eb3c6a8e1c242e8440214884c487c223c08008c080c000a000800024002400"
+        },
+        {
+          "label": "查看阶段与工单",
+          "dHash": "34eb3c6b8e1324218440214884c487c223c08008c080c000a000800024002400"
+        }
+      ],
+      "actions": [
+        {
+          "step": "打开任务面板",
+          "selector": "aside button[data-product-feature=\"taskboard\"][data-testid=\"taskboard-nav\"]",
+          "expectedFeatureId": "taskboard",
+          "assertions": [
+            "visible:aside button[data-product-feature=\"taskboard\"][data-testid=\"taskboard-nav\"]",
+            "feature:taskboard"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "任务",
+          "matchedFeatureId": "taskboard",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        }
+      ],
+      "assertions": [
+        "任务面板标题已出现",
+        "已切到列表展示"
+      ],
+      "poster": {
+        "sha256": "84a3f6a766ba30dcf79244b21cd1f5b5fa6752eec96e8e2664225d4aff3c4fc8",
+        "bytes": 16634
+      },
+      "video": {
+        "sha256": "37f9714470229a2a1d756b21ec07973410717c95d914698cdc28bfc6d47e4190",
+        "bytes": 50757
       }
     }
   }
