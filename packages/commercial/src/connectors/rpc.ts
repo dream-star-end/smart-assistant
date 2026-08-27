@@ -10,7 +10,9 @@
  * HTTP 200 + 统一信封):
  *   {kind:'result', result} | {kind:'confirmation_required', id, provider, action,
  *    summary, expiresAt} | {kind:'in_progress', id} | {kind:'replay', status,
- *    errorCode?, resultDigest?} | {kind:'error', code}
+ *    errorCode?, resultDigest?, message?, retrySafe?, requiresReauth?,
+ *    sideEffect?, nextAction?} | {kind:'error', code, message, retrySafe,
+ *    requiresReauth, sideEffect, nextAction}
  * 唯一例外:容器身份双因子失败 → HTTP 401(CLI 显示 CONNECTOR_RPC_HTTP 401)。
  *
  * 限流(§3/§6):
@@ -29,6 +31,12 @@ import {
 } from '../auth/containerIdentity.js'
 import { getPool } from '../db/index.js'
 import { getGithubLinkPublic } from '../github/tokenStore.js'
+import {
+  connectorRpcErrorEnvelope,
+  connectorRpcReplayEnvelope,
+  isPluginPassthroughErrorCode,
+  resolvePluginErrorGuidance,
+} from '../plugins/pluginErrorGuidance.js'
 import type {
   PluginRuntimeFacade,
   RuntimePluginCatalogEntry,
@@ -294,6 +302,13 @@ function sendEnvelope(res: ServerResponse, body: unknown, status = 200): void {
   res.end(JSON.stringify(body))
 }
 
+function sendReplay(
+  res: ServerResponse,
+  replay: { status: string; errorCode?: string | null; resultDigest?: string | null },
+): void {
+  sendEnvelope(res, connectorRpcReplayEnvelope(replay))
+}
+
 /** meta.account_hint 提取(绑定时写入;无则空)。 */
 function accountHintOf(meta: Record<string, unknown>): string {
   const h = meta.account_hint
@@ -312,7 +327,7 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
 
   return async function handle(req, res, ctx) {
     if (req.method !== 'POST') {
-      sendEnvelope(res, { kind: 'error', code: 'BAD_REQUEST' }, 405)
+      sendEnvelope(res, connectorRpcErrorEnvelope('BAD_REQUEST'), 405)
       return
     }
     const path = (req.url ?? '/').split('?')[0]
@@ -334,7 +349,7 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
         return
       }
       log('error', 'identity_threw', { err: String(err) })
-      sendEnvelope(res, { kind: 'error', code: 'INTERNAL' }, 500)
+      sendEnvelope(res, connectorRpcErrorEnvelope('INTERNAL'), 500)
       return
     }
     const pool = deps.pool ?? getPool()
@@ -374,7 +389,7 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
         )
         return
       }
-      sendEnvelope(res, { kind: 'error', code: 'BAD_REQUEST' })
+      sendEnvelope(res, connectorRpcErrorEnvelope('BAD_REQUEST'))
     } catch (err) {
       const ce = toConnectorError(err)
       if (ce.code === 'INTERNAL') {
@@ -386,7 +401,7 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
         log('warn', 'rpc_error', { path, code: ce.code })
       }
       // 业务错误统一 HTTP 200 信封(CLI 只解析 kind;非 2xx 会被当传输层失败)
-      sendEnvelope(res, { kind: 'error', code: ce.code })
+      sendEnvelope(res, connectorRpcErrorEnvelope(ce.code))
     }
   }
 }
@@ -626,11 +641,10 @@ async function handleDeclarativeCall(
       return
     }
     if (r.kind === 'replay') {
-      sendEnvelope(res, {
-        kind: 'replay',
+      sendReplay(res, {
         status: r.status,
-        ...(r.errorCode ? { errorCode: r.errorCode } : {}),
-        ...(r.resultDigest ? { resultDigest: r.resultDigest } : {}),
+        errorCode: r.errorCode,
+        resultDigest: r.resultDigest,
       })
       return
     }
@@ -717,11 +731,10 @@ async function handleCall(
             return
           }
           if (executed.kind === 'replay') {
-            sendEnvelope(res, {
-              kind: 'replay',
+            sendReplay(res, {
               status: executed.status,
-              ...(executed.errorCode ? { errorCode: executed.errorCode } : {}),
-              ...(executed.resultDigest ? { resultDigest: executed.resultDigest } : {}),
+              errorCode: executed.errorCode,
+              resultDigest: executed.resultDigest,
             })
             return
           }
@@ -767,11 +780,10 @@ async function handleCall(
             return
           }
           if (executed.kind === 'replay') {
-            sendEnvelope(res, {
-              kind: 'replay',
+            sendReplay(res, {
               status: executed.status,
-              ...(executed.errorCode ? { errorCode: executed.errorCode } : {}),
-              ...(executed.resultDigest ? { resultDigest: executed.resultDigest } : {}),
+              errorCode: executed.errorCode,
+              resultDigest: executed.resultDigest,
             })
             return
           }
@@ -790,6 +802,7 @@ async function handleCall(
       } catch (error) {
         if (error instanceof ConnectorError) throw error
         const code = (error as { code?: unknown })?.code
+        const original = error instanceof Error ? error.message : String(error)
         if (code === 'LEASE_BUSY' || code === 'RUNTIME_BUSY')
           throw new ConnectorError('RATE_LIMITED', 'Plugin account is busy')
         if (code === 'TARGET_NOT_FOUND' || code === 'ACCOUNT_NOT_FOUND')
@@ -809,7 +822,18 @@ async function handleCall(
           throw new ConnectorError('WRITE_DISABLED', 'Plugin writes are disabled')
         if (code === 'WRITE_REQUIRES_CONFIRMATION')
           throw new ConnectorError('BAD_REQUEST', 'Plugin write confirmation is required')
-        throw new ConnectorError('CONNECTION_ERROR', 'Plugin runtime unavailable')
+        if (typeof code === 'string' && isPluginPassthroughErrorCode(code)) {
+          rt.log('warn', 'plugin_runtime_error', { code, err: original })
+          throw new ConnectorError(code, resolvePluginErrorGuidance({ code }).message)
+        }
+        rt.log('warn', 'plugin_runtime_unmapped', {
+          code: typeof code === 'string' ? code : 'INTERNAL',
+          err: original,
+        })
+        throw new ConnectorError(
+          'CONNECTION_ERROR',
+          resolvePluginErrorGuidance({ code: 'CONNECTION_ERROR' }).message,
+        )
       }
     }
   }
@@ -876,11 +900,10 @@ async function handleCall(
       return
     }
     if (begun.kind === 'replay') {
-      sendEnvelope(res, {
-        kind: 'replay',
+      sendReplay(res, {
         status: begun.status,
-        ...(begun.errorCode ? { errorCode: begun.errorCode } : {}),
-        ...(begun.resultDigest ? { resultDigest: begun.resultDigest } : {}),
+        errorCode: begun.errorCode,
+        resultDigest: begun.resultDigest,
       })
       return
     }

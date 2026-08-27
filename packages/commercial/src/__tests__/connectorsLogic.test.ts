@@ -4,7 +4,7 @@
  *   - 结果硬限(256KB / 深度8 / 数组200)
  *   - ledger classifyForExecute 状态机纯逻辑全路径
  *   - 确认卡 summary/detail 构造(含"detail 不含文件内容"防泄漏)
- *   - RPC 信封:401(身份失败)/ 业务错误 200 {kind:'error',code} / canary 防泄漏
+ *   - RPC 信封:401(身份失败)/ 业务错误 200 {kind:'error',code,...guidance} / canary 防泄漏
  *   - 用户路由 401(无 Bearer)
  */
 
@@ -44,6 +44,10 @@ import {
 import { makeConnectorsRpcHandler } from '../connectors/rpc.js'
 import { buildWriteDetail, buildWriteSummary, requireAction } from '../connectors/service.js'
 import { HttpError } from '../http/util.js'
+import {
+  connectorRpcErrorEnvelope,
+  connectorRpcReplayEnvelope,
+} from '../plugins/pluginErrorGuidance.js'
 import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
 
 // ─── registry ────────────────────────────────────────────────────────────
@@ -642,7 +646,7 @@ describe('RPC 信封契约', () => {
     assert.equal(parsed.error.code, 'UNAUTHORIZED')
   })
 
-  test('身份 OK 但 body 非法 → HTTP 200 + {kind:error, code},无多余字段(canary)', async () => {
+  test('身份 OK 但 body 非法 → HTTP 200 + {kind:error, code, guidance},无泄漏字段(canary)', async () => {
     const okRepo = {
       async findActiveByHostAndBoundIp() {
         return {
@@ -684,9 +688,16 @@ describe('RPC 信封契约', () => {
     )
     assert.equal(state.statusCode, 200) // 业务错误恒 200(CLI 非 2xx 当传输层失败)
     const parsed = JSON.parse(state.body) as Record<string, unknown>
-    assert.deepEqual(Object.keys(parsed).sort(), ['code', 'kind'])
-    assert.equal(parsed.kind, 'error')
-    assert.equal(parsed.code, 'BAD_REQUEST')
+    assert.deepEqual(parsed, connectorRpcErrorEnvelope('BAD_REQUEST'))
+    assert.deepEqual(Object.keys(parsed).sort(), [
+      'code',
+      'kind',
+      'message',
+      'nextAction',
+      'requiresReauth',
+      'retrySafe',
+      'sideEffect',
+    ])
   })
 
   test('/v3/plugins/call 复用身份与信封，并把非声明式 target 交给 Plugin facade', async () => {
@@ -954,11 +965,13 @@ describe('RPC 信封契约', () => {
       { hostUuid: 'h', boundIp: '1.2.3.4' },
     )
     assert.deepEqual(executionInput, { userId: 7, targetId: '41', confirmId })
-    assert.deepEqual(JSON.parse(state.body), {
-      kind: 'replay',
-      status: 'unknown',
-      errorCode: 'CONNECTION_ERROR',
-    })
+    assert.deepEqual(
+      JSON.parse(state.body),
+      connectorRpcReplayEnvelope({
+        status: 'unknown',
+        errorCode: 'CONNECTION_ERROR',
+      }),
+    )
   })
 
   test('/v3/plugins/call 稳定映射默认关闭的写开关', async () => {
@@ -1008,7 +1021,7 @@ describe('RPC 信封契约', () => {
       res,
       { hostUuid: 'h', boundIp: '1.2.3.4' },
     )
-    assert.deepEqual(JSON.parse(state.body), { kind: 'error', code: 'WRITE_DISABLED' })
+    assert.deepEqual(JSON.parse(state.body), connectorRpcErrorEnvelope('WRITE_DISABLED'))
   })
 
   test('/v3/plugins/call 稳定映射容量饱和与账号登录过期', async () => {
@@ -1061,8 +1074,109 @@ describe('RPC 信封契约', () => {
         res,
         { hostUuid: 'h', boundIp: '1.2.3.4' },
       )
-      assert.deepEqual(JSON.parse(state.body), { kind: 'error', code: expected })
+      assert.deepEqual(JSON.parse(state.body), connectorRpcErrorEnvelope(expected))
     }
+  })
+
+  test('/v3/plugins/call 放行微博已知错误码并附带 agent 指引，不再吞成 CONNECTION_ERROR', async () => {
+    const okRepo = {
+      async findActiveByHostAndBoundIp() {
+        return {
+          id: 1,
+          user_id: 7,
+          bound_ip: '1.2.3.4',
+          host_uuid: 'h',
+          secret_hash: (await import('node:crypto'))
+            .createHash('sha256')
+            .update(Buffer.from('b'.repeat(64), 'hex'))
+            .digest(),
+        }
+      },
+    }
+    for (const code of ['WEIBO_ACTION_FAILED', 'LOGIN_EXPIRED_ACCOUNT'] as const) {
+      const handler = makeConnectorsRpcHandler({
+        identityRepo: okRepo,
+        pool: {} as never,
+        pluginFacade: {
+          catalog: async () => [],
+          list: async () => [],
+          classifyTarget: async () => 'managed-browser',
+          actionEffect: async () => 'read',
+          proposeWrite: async () => {
+            throw new Error('unexpected write')
+          },
+          executeConfirmedWrite: async () => {
+            throw new Error('unexpected confirmation')
+          },
+          call: async () => {
+            throw Object.assign(new Error('Weibo action failed'), { code })
+          },
+        },
+        log: () => {},
+      })
+      const { res, state } = makeFakeRes()
+      await handler(
+        makeFakeReq({
+          method: 'POST',
+          url: '/v3/plugins/call',
+          headers: { authorization: `Bearer oc-v3.1.${'b'.repeat(64)}` },
+          body: JSON.stringify({ connectionId: '41', action: 'get_self', params: {} }),
+        }),
+        res,
+        { hostUuid: 'h', boundIp: '1.2.3.4' },
+      )
+      assert.deepEqual(JSON.parse(state.body), connectorRpcErrorEnvelope(code))
+      assert.notEqual(JSON.parse(state.body).code, 'CONNECTION_ERROR')
+    }
+  })
+
+  test('/v3/plugins/call 未知码仍兜底 CONNECTION_ERROR', async () => {
+    const okRepo = {
+      async findActiveByHostAndBoundIp() {
+        return {
+          id: 1,
+          user_id: 7,
+          bound_ip: '1.2.3.4',
+          host_uuid: 'h',
+          secret_hash: (await import('node:crypto'))
+            .createHash('sha256')
+            .update(Buffer.from('b'.repeat(64), 'hex'))
+            .digest(),
+        }
+      },
+    }
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: okRepo,
+      pool: {} as never,
+      pluginFacade: {
+        catalog: async () => [],
+        list: async () => [],
+        classifyTarget: async () => 'managed-browser',
+        actionEffect: async () => 'read',
+        proposeWrite: async () => {
+          throw new Error('unexpected write')
+        },
+        executeConfirmedWrite: async () => {
+          throw new Error('unexpected confirmation')
+        },
+        call: async () => {
+          throw Object.assign(new Error('mystery'), { code: 'WEATHER_FORECAST' })
+        },
+      },
+      log: () => {},
+    })
+    const { res, state } = makeFakeRes()
+    await handler(
+      makeFakeReq({
+        method: 'POST',
+        url: '/v3/plugins/call',
+        headers: { authorization: `Bearer oc-v3.1.${'b'.repeat(64)}` },
+        body: JSON.stringify({ connectionId: '41', action: 'get_self', params: {} }),
+      }),
+      res,
+      { hostUuid: 'h', boundIp: '1.2.3.4' },
+    )
+    assert.deepEqual(JSON.parse(state.body), connectorRpcErrorEnvelope('CONNECTION_ERROR'))
   })
 
   test('连接器列表不混入 runtime target，Plugin 列表只聚合一次', async () => {

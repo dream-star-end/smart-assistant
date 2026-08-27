@@ -28,6 +28,7 @@ import { ModelSelector } from "../src/components/ModelSelector";
 import { ToolCard } from "../src/components/ToolCard";
 import { TeamPanel } from "../src/components/chat/TeamPanel";
 import { ConnectorsTab } from "../src/components/settings/ConnectorsTab";
+import { connectorErrorText } from "../src/lib/connectors";
 import { ToastProvider, TooltipProvider } from "../src/components/ui";
 import {
   captureVisibleVirtualRowAnchor,
@@ -182,6 +183,12 @@ declare global {
         text: string;
         modelText?: string;
       }>;
+      /** T51: frontend Weibo error copy tells the agent to rescan / use text-only. */
+      runWeiboErrorGuidance: () => Promise<{
+        actionFailed: string;
+        loginExpired: string;
+        mediaUpload: string;
+      }>;
     };
     /** T23 会话内切模型:候选项展示名与 id 的单一权威(run.mjs 从页面读回)。 */
     __modelFixture: {
@@ -249,6 +256,9 @@ window.__replayDrive = {
   },
   runPaperHintUserBubble: async () => {
     throw new Error("paper-hint user bubble probe 未挂载");
+  },
+  runWeiboErrorGuidance: async () => {
+    throw new Error("weibo error guidance probe 未挂载");
   },
 };
 window.__runPendingDispatchJournalProbe = async () => {
@@ -1789,6 +1799,11 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
           message.role === "assistant" && message._displayDegradeReason === "records_unpublished"),
       };
     },
+    runWeiboErrorGuidance: async () => ({
+      actionFailed: connectorErrorText("WEIBO_ACTION_FAILED"),
+      loginExpired: connectorErrorText("LOGIN_EXPIRED_ACCOUNT"),
+      mediaUpload: connectorErrorText("WEIBO_WRITE_MEDIA_UPLOAD"),
+    }),
     runPaperHintUserBubble: async () => {
       replaySocket.removeSession(REPLAY_SESSION_ID);
       const session = replaySocket.ensureSession(

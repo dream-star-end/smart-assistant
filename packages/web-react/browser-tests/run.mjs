@@ -2585,6 +2585,19 @@ await check("T50 persist 后用户气泡只显示原文，不含论文任务系�
   }
 });
 
+await check("T51 Weibo 错误码提示重新扫码且图文失败建议纯文字", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runWeiboErrorGuidance());
+  if (!result.actionFailed.includes("重新扫码")) {
+    throw new Error(`WEIBO_ACTION_FAILED 未提示重新扫码:${JSON.stringify(result)}`);
+  }
+  if (!result.loginExpired.includes("重新扫码")) {
+    throw new Error(`LOGIN_EXPIRED_ACCOUNT 未提示重新扫码:${JSON.stringify(result)}`);
+  }
+  if (!result.mediaUpload.includes("纯文字")) {
+    throw new Error(`WEIBO_WRITE_MEDIA_UPLOAD 未建议纯文字:${JSON.stringify(result)}`);
+  }
+});
+
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {
   const alive = await page.evaluate(() => ({
     root: Boolean(document.querySelector("#root")),

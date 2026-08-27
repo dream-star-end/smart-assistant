@@ -2115,8 +2115,18 @@ function handleError(err: unknown, res: ServerResponse, requestId: string, log: 
   }
   if (err instanceof HttpError) {
     // 预期内的业务错(401/403/404/4xx 大多在这里):记 warn,不拉警报
-    log.warn('http_error', { status: err.status, code: err.code, message: err.message })
-    sendError(res, err.status, err.code, err.message, requestId, err.issues, err.extraHeaders)
+    log.warn('http_error', {
+      status: err.status,
+      code: err.code,
+      message: err.message,
+      ...(err.logMessage ? { detail: err.logMessage } : {}),
+    })
+    sendError(res, err.status, err.code, err.message, requestId, err.issues, err.extraHeaders, {
+      retrySafe: err.retrySafe,
+      requiresReauth: err.requiresReauth,
+      sideEffect: err.sideEffect,
+      nextAction: err.nextAction,
+    })
     return
   }
   // 未捕获 → 500;记 error 级别,带 stack

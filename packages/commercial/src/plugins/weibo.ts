@@ -17,6 +17,7 @@ import {
   REQUIRED_BROWSER_LAUNCHER_CAPABILITIES,
 } from './browserRuntime.js'
 import { WEIBO_WORKER_SOURCE } from './weiboWorkerSource.js'
+import { weiboRuntimePublicMessage } from './pluginErrorGuidance.js'
 import {
   DEFAULT_WEIBO_WORKER_LOG_DIR,
   isWeiboWorkerProtocolFailureCode,
@@ -118,7 +119,7 @@ export class WeiboRuntimeError extends Error {
 
   readonly dispatchProvenNotStarted: boolean
 
-  constructor(code: WeiboRuntimeError['code'], message: string = code) {
+  constructor(code: WeiboRuntimeError['code'], message: string = weiboRuntimePublicMessage(code)) {
     super(message)
     this.name = 'WeiboRuntimeError'
     this.code = code
@@ -872,9 +873,7 @@ export class WeiboDockerService {
     const terminal = (await worker.done).at(-1)!
     if (terminal.event === 'failed') {
       const mapped = mapWeiboWorkerProtocolFailure(terminal.code)
-      if (mapped === 'LOGIN_EXPIRED_ACCOUNT')
-        throw new WeiboRuntimeError('LOGIN_EXPIRED_ACCOUNT', 'Plugin login expired')
-      throw new WeiboRuntimeError(mapped, 'Weibo action failed')
+      throw new WeiboRuntimeError(mapped)
     }
     if (terminal.event === 'not_dispatched')
       throw new WeiboRuntimeError('PRECONDITION_CHANGED', 'Weibo target changed before dispatch')

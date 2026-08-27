@@ -8,6 +8,7 @@ import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetu
 import { KnowledgePlanetSetupError } from '../plugins/knowledgePlanetSetup.js'
 import type { PluginRuntimeFacade } from '../plugins/runtime.js'
 import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
+import { resolvePluginErrorGuidance } from '../plugins/pluginErrorGuidance.js'
 import type { WeiboSetupManager } from '../plugins/weiboSetup.js'
 import { WeiboSetupError } from '../plugins/weiboSetup.js'
 import { requireAuth } from './auth.js'
@@ -47,20 +48,37 @@ function setupManager(
   provider: 'knowledge-planet' | 'weibo',
 ): ManagedSetupManager {
   const manager = provider === 'knowledge-planet' ? deps.knowledgePlanetSetup : deps.weiboSetup
-  if (!manager) throw new HttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
+  if (!manager) throw pluginHttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
   return manager
 }
 
 function runtime(deps: CommercialHttpDeps & PluginHttpDeps): PluginRuntimeFacade {
   if (!deps.pluginRuntime)
-    throw new HttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
+    throw pluginHttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
   return deps.pluginRuntime
 }
 
 function automation(deps: CommercialHttpDeps & PluginHttpDeps): KnowledgePlanetAutomationService {
   if (!deps.knowledgePlanetAutomation)
-    throw new HttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin automation unavailable')
+    throw pluginHttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin automation unavailable')
   return deps.knowledgePlanetAutomation
+}
+
+
+function pluginHttpError(
+  status: number,
+  code: string,
+  message: string,
+  logMessage?: string,
+): HttpError {
+  const g = resolvePluginErrorGuidance({ code })
+  return new HttpError(status, code, message, {
+    ...(logMessage ? { logMessage } : {}),
+    retrySafe: g.retrySafe,
+    requiresReauth: g.requiresReauth,
+    sideEffect: g.sideEffect,
+    nextAction: g.nextAction,
+  })
 }
 
 function mapAutomationError(error: unknown): never {
@@ -89,22 +107,27 @@ function mapSetupError(error: unknown): never {
     throw error
   switch (error.code) {
     case 'NOT_INSTALLED':
-      throw new HttpError(403, error.code, 'Plugin is not installed')
+      throw pluginHttpError(403, error.code, 'Plugin is not installed')
     case 'SETUP_ACTIVE':
     case 'ACCOUNT_ALREADY_EXISTS':
-      throw new HttpError(409, error.code, 'Plugin account setup conflicts')
+      throw pluginHttpError(409, error.code, 'Plugin account setup conflicts')
     case 'SETUP_NOT_FOUND':
     case 'QR_NOT_READY':
-      throw new HttpError(404, error.code, 'Plugin setup not found')
+      throw pluginHttpError(404, error.code, 'Plugin setup not found')
     case 'TERMS_REQUIRED':
-      throw new HttpError(400, error.code, 'terms acceptance is required')
+      throw pluginHttpError(400, error.code, 'terms acceptance is required')
     case 'CAPACITY_EXCEEDED':
-      throw new HttpError(429, error.code, 'Plugin setup capacity is full')
+      throw pluginHttpError(429, error.code, 'Plugin setup capacity is full')
     case 'CLOSING':
     case 'UNAVAILABLE':
-      throw new HttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
+      throw pluginHttpError(
+        503,
+        'PLUGIN_RUNTIME_UNAVAILABLE',
+        'Plugin runtime unavailable',
+        error.message,
+      )
     default:
-      throw new HttpError(500, 'PLUGIN_SETUP_FAILED', 'Plugin setup failed')
+      throw pluginHttpError(500, 'PLUGIN_SETUP_FAILED', 'Plugin setup failed', error.message)
   }
 }
 
@@ -112,20 +135,20 @@ function mapRuntimeError(error: unknown): never {
   if (error instanceof PluginRuntimeFacadeError) {
     switch (error.code) {
       case 'BAD_REQUEST':
-        throw new HttpError(400, error.code, 'invalid Plugin request')
+        throw pluginHttpError(400, error.code, 'invalid Plugin request')
       case 'TARGET_NOT_FOUND':
-        throw new HttpError(404, error.code, 'Plugin account not found')
+        throw pluginHttpError(404, error.code, 'Plugin account not found')
       case 'TARGET_STALE':
-        throw new HttpError(409, error.code, 'Plugin account changed; retry')
+        throw pluginHttpError(409, error.code, 'Plugin account changed; retry')
       case 'WRITE_DISABLED':
       case 'WRITE_REQUIRES_CONFIRMATION':
-        throw new HttpError(409, error.code, 'Plugin writes are not enabled')
+        throw pluginHttpError(409, error.code, 'Plugin writes are not enabled')
       case 'RUNTIME_BUSY':
-        throw new HttpError(429, error.code, 'Plugin runtime is busy')
+        throw pluginHttpError(429, error.code, 'Plugin runtime is busy')
       case 'RELINK_REQUIRED':
-        throw new HttpError(401, error.code, 'Plugin account must be authorized again')
+        throw pluginHttpError(401, error.code, 'Plugin account must be authorized again')
       default:
-        throw new HttpError(503, error.code, 'Plugin runtime unavailable')
+        throw pluginHttpError(503, error.code, 'Plugin runtime unavailable', error.message)
     }
   }
   if (error instanceof PluginAccountLeaseError) {
@@ -138,7 +161,7 @@ function mapRuntimeError(error: unknown): never {
       throw new HttpError(404, 'TARGET_NOT_FOUND', 'Plugin account not found')
     if (error.code === 'ACCOUNT_STALE')
       throw new HttpError(409, 'TARGET_STALE', 'Plugin account changed; retry')
-    throw new HttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
+    throw pluginHttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
   }
   throw error
 }

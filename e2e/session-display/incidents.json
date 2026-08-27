@@ -1858,6 +1858,43 @@
           "assertion": "T50 persist 后用户气泡只显示原文，不含论文任务系统提示"
         }
       ]
+    },
+    {
+      "id": "INC-20260827-WEIBO-ERRCODE-ACTIONABLE",
+      "occurredAt": "2026-08-27",
+      "severity": "P1",
+      "symptom": "V5 商业版 user 1 微博读动作把 WEIBO_ACTION_FAILED 吞成 CONNECTION_ERROR，写动作对外 message 千篇一律 Weibo action failed，unknown 账本不给副作用/重试指引，会话失效也不提示重新扫码。根因是 rpc 白名单过窄、WeiboRuntimeError 统一文案、错误信封没有 agent 指引字段。",
+      "rootFixCommit": "0d4d8d09",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/pluginErrorGuidance.test.ts",
+          "assertion": "LOGIN_EXPIRED_ACCOUNT tells the agent to rescan and is not retry-safe"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/pluginErrorGuidance.test.ts",
+          "assertion": "WEIBO_WRITE_MEDIA_UPLOAD tells the agent the image path is unavailable"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/connectorsLogic.test.ts",
+          "assertion": "/v3/plugins/call 放行微博已知错误码并附带 agent 指引，不再吞成 CONNECTION_ERROR"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T51 Weibo 错误码提示重新扫码且图文失败建议纯文字"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/pluginErrorGuidance.test.ts",
+          "assertion": "each write code × failed/unknown has exact retrySafe/sideEffect/nextAction"
+        }
+      ],
+      "coverageCommits": [
+        "b5b2820d"
+      ]
     }
   ]
 }

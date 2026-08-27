@@ -318,9 +318,10 @@ export function sendJson(
 
 /**
  * 标准错误响应 schema(04-API):
- *   { error: { code, message, request_id, issues? } }
+ *   { error: { code, message, request_id, issues?, retrySafe?, requiresReauth?,
+ *     sideEffect?, nextAction? } }
  *
- * 所有 commercial 接口失败必须走这个。
+ * 所有 commercial 接口失败必须走这个。guidance 字段 additive,缺省兼容旧客户端。
  */
 export interface ErrorBody {
   error: {
@@ -328,8 +329,19 @@ export interface ErrorBody {
     message: string;
     request_id: string;
     issues?: ReadonlyArray<{ path: string; message: string }>;
+    retrySafe?: string;
+    requiresReauth?: boolean;
+    sideEffect?: string;
+    nextAction?: string;
   };
 }
+
+export type HttpErrorGuidance = {
+  retrySafe?: string;
+  requiresReauth?: boolean;
+  sideEffect?: string;
+  nextAction?: string;
+};
 
 export function sendError(
   res: ServerResponse,
@@ -339,9 +351,19 @@ export function sendError(
   requestId: string,
   issues?: ReadonlyArray<{ path: string; message: string }>,
   extraHeaders?: Record<string, string | number>,
+  guidance?: HttpErrorGuidance,
 ): void {
   const body: ErrorBody = {
-    error: { code, message, request_id: requestId, ...(issues ? { issues } : {}) },
+    error: {
+      code,
+      message,
+      request_id: requestId,
+      ...(issues ? { issues } : {}),
+      ...(guidance?.retrySafe ? { retrySafe: guidance.retrySafe } : {}),
+      ...(guidance?.requiresReauth !== undefined ? { requiresReauth: guidance.requiresReauth } : {}),
+      ...(guidance?.sideEffect ? { sideEffect: guidance.sideEffect } : {}),
+      ...(guidance?.nextAction ? { nextAction: guidance.nextAction } : {}),
+    },
   };
   sendJson(res, status, body, extraHeaders);
 }
@@ -352,6 +374,12 @@ export class HttpError extends Error {
   readonly code: string;
   readonly issues?: ReadonlyArray<{ path: string; message: string }>;
   readonly extraHeaders?: Record<string, string | number>;
+  /** Server-only detail. Never copied onto the public error body. */
+  readonly logMessage?: string;
+  readonly retrySafe?: string;
+  readonly requiresReauth?: boolean;
+  readonly sideEffect?: string;
+  readonly nextAction?: string;
   constructor(
     status: number,
     code: string,
@@ -359,6 +387,11 @@ export class HttpError extends Error {
     options?: {
       issues?: ReadonlyArray<{ path: string; message: string }>;
       extraHeaders?: Record<string, string | number>;
+      logMessage?: string;
+      retrySafe?: string;
+      requiresReauth?: boolean;
+      sideEffect?: string;
+      nextAction?: string;
     },
   ) {
     super(message);
@@ -367,6 +400,11 @@ export class HttpError extends Error {
     this.code = code;
     this.issues = options?.issues;
     this.extraHeaders = options?.extraHeaders;
+    this.logMessage = options?.logMessage;
+    this.retrySafe = options?.retrySafe;
+    this.requiresReauth = options?.requiresReauth;
+    this.sideEffect = options?.sideEffect;
+    this.nextAction = options?.nextAction;
   }
 }
 
