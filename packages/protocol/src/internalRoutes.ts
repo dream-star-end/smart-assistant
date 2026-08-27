@@ -92,6 +92,7 @@ export const QQ_STOP_CONTAINER_PATH = '/internal/v3/qq-stop'
 export const TURN_REJECT_IF_ABSENT_PATH = '/internal/v3/turn-reject-if-absent'
 export const TURN_DISPATCH_STATE_PATH = '/internal/v3/turn-dispatch-state'
 export const RUNTIME_RECYCLE_DRAIN_PATH = '/internal/v3/runtime-recycle-drain'
+export const ENGINE_PREHEAT_PATH = '/internal/v3/engine-preheat'
 
 // ── v3 容器 gateway loopback 本地面(容器内工具→gateway,不出容器边界)────────
 export const MARKETPLACE_LOCAL_RELAY_PREFIX = '/internal/v3/marketplace/agent-local'
@@ -453,6 +454,12 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v3',
     sources: ['gateway/src/server.ts', 'commercial/src/agent-sandbox/v3ensureRunning.ts'],
+  },
+  {
+    path: ENGINE_PREHEAT_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/server.ts', 'commercial/src/dispatch/enginePreheatClient.ts'],
   },
   // ── v3:容器 gateway loopback 本地 relay(不出容器;登记以锁扫描面)─────────
   {
