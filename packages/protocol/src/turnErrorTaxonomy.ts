@@ -85,6 +85,8 @@ export const TURN_ERROR_TAXONOMY = {
   auth_error: { retryable: false, cta: 'relogin' },
   service_restart: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true },
   session_persist_unavailable: { retryable: true, cta: 'retry' },
+  /** bridge bindAuthorityTurnDispatch 失败(含 cron-origin 未收养成功)。手动重试走新 dispatch。 */
+  durable_dispatch_unavailable: { retryable: true, cta: 'retry' },
   stopped: { retryable: false, cta: 'none', expected: true, reportable: false },
   user_cancelled: { retryable: false, cta: 'none', expected: true, reportable: false },
   runner_crashed: { retryable: true, automaticRecovery: true, cta: 'retry' },
@@ -163,6 +165,7 @@ const LEGACY_CODE_ALIASES: Record<string, TurnErrorCode> = {
   TURN_SUBMIT_FAILED: 'runner_crashed',
   CODEX_ERROR: 'engine_error',
   INSUFFICIENT_CREDITS: 'insufficient_credits',
+  DURABLE_DISPATCH_UNAVAILABLE: 'durable_dispatch_unavailable',
   ERR_INSUFFICIENT_CREDITS: 'insufficient_credits',
   UNAUTHORIZED_MODEL: 'unauthorized_model',
   MAINTENANCE: 'maintenance',

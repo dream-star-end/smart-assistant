@@ -536,6 +536,7 @@ const ERROR_LABELS: Record<string, string> = {
   auth_error: "认证状态异常",
   service_restart: "服务重启，本轮已中断",
   session_persist_unavailable: "消息暂未安全送达",
+  durable_dispatch_unavailable: "派发未能接入执行通道",
   stopped: "已停止本轮生成",
   user_cancelled: "已取消本轮",
   runner_crashed: "执行环境异常中断",

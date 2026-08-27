@@ -1063,6 +1063,154 @@ describe("settleUsageAndLedger (integ)", () => {
     assert.equal(count.rows[0].count, "1");
   });
 
+  test("cron-origin placeholder is adopted onto the live conn then bound", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("cron-origin-adopt@example.com", 1000n);
+    const dispatchId = "00000000-0000-4000-8000-000000000091";
+    const sessionId = "cron-origin-adopt-session";
+    await query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,model,request_hash,
+          billing_request_id,attempt_no,status,owner_id,lease_epoch,lease_until)
+       VALUES ($1,$2,$3,'cmid-cron-adopt','main',NULL,$4,'billing-cron-adopt',1,
+               'admitted','cron-origin:cmid-cron-adopt',0,NULL)`,
+      [dispatchId, uid.toString(), sessionId, "c".repeat(64)],
+    );
+    const binding = await bindAuthorityTurnDispatch(getPool(), {
+      authorityTurnId: "9".repeat(32),
+      dispatchId,
+      userId: uid,
+      sessionId,
+      dispatchModel: null,
+      canonicalModel: "glm-5.2",
+      attemptNo: 1,
+      ownerId: "conn-cron-live",
+      leaseEpoch: 0,
+    });
+    assert.equal(binding.dispatchId, dispatchId);
+    const adopted = await query<{
+      owner_id: string; model: string | null; lease_until: Date | null;
+    }>(
+      `SELECT owner_id, model, lease_until FROM turn_dispatches WHERE dispatch_id=$1`,
+      [dispatchId],
+    );
+    assert.equal(adopted.rows[0].owner_id, "conn-cron-live");
+    assert.equal(adopted.rows[0].model, null);
+    assert.ok(adopted.rows[0].lease_until !== null && adopted.rows[0].lease_until.getTime() > Date.now());
+  });
+
+  test("cron-origin concurrent adoption has a single winner", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("cron-origin-race@example.com", 1000n);
+    const dispatchId = "00000000-0000-4000-8000-000000000092";
+    const sessionId = "cron-origin-race-session";
+    await query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,model,request_hash,
+          billing_request_id,attempt_no,status,owner_id,lease_epoch,lease_until)
+       VALUES ($1,$2,$3,'cmid-cron-race','main',NULL,$4,'billing-cron-race',1,
+               'admitted','cron-origin:cmid-cron-race',0,NULL)`,
+      [dispatchId, uid.toString(), sessionId, "d".repeat(64)],
+    );
+    const contenders = await Promise.allSettled([
+      bindAuthorityTurnDispatch(getPool(), {
+        authorityTurnId: "8".repeat(32),
+        dispatchId,
+        userId: uid,
+        sessionId,
+        dispatchModel: null,
+        canonicalModel: "glm-5.2",
+        attemptNo: 1,
+        ownerId: "conn-cron-a",
+        leaseEpoch: 0,
+      }),
+      bindAuthorityTurnDispatch(getPool(), {
+        authorityTurnId: "7".repeat(32),
+        dispatchId,
+        userId: uid,
+        sessionId,
+        dispatchModel: null,
+        canonicalModel: "glm-5.2",
+        attemptNo: 1,
+        ownerId: "conn-cron-b",
+        leaseEpoch: 0,
+      }),
+    ]);
+    assert.equal(contenders.filter((x) => x.status === "fulfilled").length, 1);
+    assert.equal(contenders.filter((x) => x.status === "rejected").length, 1);
+    const winner = await query<{ owner_id: string }>(
+      `SELECT owner_id FROM turn_dispatches WHERE dispatch_id=$1`,
+      [dispatchId],
+    );
+    assert.ok(winner.rows[0].owner_id === "conn-cron-a" || winner.rows[0].owner_id === "conn-cron-b");
+    const mapped = await query<{ count: string }>(
+      "SELECT count(*)::text FROM authority_turn_dispatches WHERE dispatch_id=$1",
+      [dispatchId],
+    );
+    assert.equal(mapped.rows[0].count, "1");
+  });
+
+  test("ordinary owner/lease/model mismatch still rejects after cron-origin adoption exists", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("cron-origin-fence@example.com", 1000n);
+    const dispatchId = "00000000-0000-4000-8000-000000000093";
+    const sessionId = "cron-origin-fence-session";
+    await query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,model,request_hash,
+          billing_request_id,attempt_no,status,owner_id,lease_epoch,lease_until)
+       VALUES ($1,$2,$3,'cmid-cron-fence','main','glm-5.2',$4,'billing-cron-fence',1,
+               'admitted','owner-real',0,NOW()+INTERVAL '90 seconds')`,
+      [dispatchId, uid.toString(), sessionId, "e".repeat(64)],
+    );
+    await assert.rejects(
+      bindAuthorityTurnDispatch(getPool(), {
+        authorityTurnId: "6".repeat(32),
+        dispatchId,
+        userId: uid,
+        sessionId,
+        dispatchModel: "glm-5.2",
+        canonicalModel: "glm-5.2",
+        attemptNo: 1,
+        ownerId: "owner-other",
+        leaseEpoch: 0,
+      }),
+      VerificationSponsorshipInvariantError,
+    );
+    await assert.rejects(
+      bindAuthorityTurnDispatch(getPool(), {
+        authorityTurnId: "5".repeat(32),
+        dispatchId,
+        userId: uid,
+        sessionId,
+        dispatchModel: "deepseek-v4-flash",
+        canonicalModel: "glm-5.2",
+        attemptNo: 1,
+        ownerId: "owner-real",
+        leaseEpoch: 0,
+      }),
+      VerificationSponsorshipInvariantError,
+    );
+    await query(
+      `UPDATE turn_dispatches SET lease_until=NOW()-INTERVAL '5 seconds' WHERE dispatch_id=$1`,
+      [dispatchId],
+    );
+    await assert.rejects(
+      bindAuthorityTurnDispatch(getPool(), {
+        authorityTurnId: "4".repeat(32),
+        dispatchId,
+        userId: uid,
+        sessionId,
+        dispatchModel: "glm-5.2",
+        canonicalModel: "glm-5.2",
+        attemptNo: 1,
+        ownerId: "owner-real",
+        leaseEpoch: 0,
+      }),
+      VerificationSponsorshipInvariantError,
+    );
+  });
+
   test("lease-only mapping distinguishes missing, identity conflict, and expired-run billing", async (t) => {
     if (skipIfNoPg(t)) return;
     const turn = await createVerificationCcbTurn({
