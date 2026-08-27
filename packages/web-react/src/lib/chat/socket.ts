@@ -62,6 +62,7 @@ import {
   mergeFullServerWins,
   mergeTimelineHistoryPage,
   reconcileTimelineBashTailAuxiliaries,
+  shouldRetainLiveProcessOnOwnerReset,
   type ServerTurnTerminal,
   type StoredPendingDispatch,
   type StoredPendingControl,
@@ -573,6 +574,50 @@ const NOTIFY_FALLBACK_MS = 250;
 // 让活动消息全量重走 markdown 管线(remark+katex+highlight),60fps 在 10KB+ 长输出/低端机
 // 上必然掉帧发热;120ms 视觉上仍是流畅"打字机"。只降"通知频率",数据仍逐帧同步应用。
 const STREAM_NOTIFY_MS = 120;
+
+
+const LIVE_PROCESS_UNIT_KINDS = new Set([
+  "thinking", "tool", "plan", "goal", "agent_group", "delegate_progress",
+]);
+const LIVE_PROCESS_FRAME_KINDS = new Set([
+  "thinking", "tool_use", "plan", "goal", "agent_group", "delegate_progress",
+]);
+
+function liveProcessOwnersFromUnits(
+  units: Array<{ kind?: string; clientMessageId?: string | null }>,
+): Set<string> {
+  const owners = new Set<string>();
+  for (const unit of units) {
+    if (typeof unit.clientMessageId !== "string" || !unit.clientMessageId) continue;
+    if (LIVE_PROCESS_UNIT_KINDS.has(unit.kind ?? "")) owners.add(unit.clientMessageId);
+  }
+  return owners;
+}
+
+function liveProcessOwnersFromFrames(
+  frames: Array<{ clientMessageId?: string | null; payload?: unknown }>,
+): Set<string> {
+  const owners = new Set<string>();
+  for (const record of frames) {
+    const payload = record.payload;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+    const raw = payload as { clientMessageId?: unknown; blocks?: unknown };
+    const clientMessageId =
+      typeof record.clientMessageId === "string" && record.clientMessageId
+        ? record.clientMessageId
+        : typeof raw.clientMessageId === "string" && raw.clientMessageId
+          ? raw.clientMessageId
+          : undefined;
+    if (!clientMessageId || !Array.isArray(raw.blocks)) continue;
+    if (raw.blocks.some((block) => {
+      const kind = block && typeof block === "object"
+        ? (block as { kind?: unknown }).kind
+        : undefined;
+      return typeof kind === "string" && LIVE_PROCESS_FRAME_KINDS.has(kind);
+    })) owners.add(clientMessageId);
+  }
+  return owners;
+}
 
 export class ChatSocket {
   private deps: ChatSocketDeps;
@@ -3855,6 +3900,57 @@ export class ChatSocket {
     return tracked;
   }
 
+
+  /**
+   * Drop client-owned rows for the listed turn owners, except live process
+   * that is still waiting for exact tape rows. Streaming pointers stay when
+   * the pointed-to row survived — including after Phase-A cleared sending.
+   */
+  private resetOwnerLocalRows(
+    sess: ChatSession,
+    resetClientMessageIds: string[],
+    incomingProcessOwners: ReadonlySet<string>,
+  ): void {
+    const owners = new Set(resetClientMessageIds);
+    const authority = sess.messages;
+    const streamingAssistant = sess._streamingAssistant;
+    const streamingThinking = sess._streamingThinking;
+    const preserveStreamingPointer = (
+      !!sess._sendingInFlight &&
+      typeof sess._activeClientMessageId === "string" &&
+      owners.has(sess._activeClientMessageId)
+    ) || sess.messages.some((message) =>
+      shouldRetainLiveProcessOnOwnerReset(message, authority, incomingProcessOwners) &&
+      (message === streamingAssistant || message === streamingThinking)
+    );
+    sess.messages = sess.messages.filter((message) => {
+      if (message.role === "user") return true;
+      if (message._source === "server" || !!message._turnTapeId) return true;
+      if (preserveStreamingPointer && message === streamingAssistant) return true;
+      if (shouldRetainLiveProcessOnOwnerReset(message, authority, incomingProcessOwners)) {
+        return true;
+      }
+      return !(
+        (typeof message._turnOwnerId === "string" && owners.has(message._turnOwnerId)) ||
+        (typeof message._clientMessageId === "string" && owners.has(message._clientMessageId))
+      );
+    });
+    // In-flight hydrate may keep a streaming object that is not yet in
+    // messages[]. After Phase-A clears sending, keep pointers only when the
+    // pointed-to process row survived the owner reset.
+    if (!preserveStreamingPointer) {
+      sess._streamingAssistant = streamingAssistant && sess.messages.includes(streamingAssistant)
+        ? streamingAssistant
+        : null;
+      sess._streamingThinking = streamingThinking && sess.messages.includes(streamingThinking)
+        ? streamingThinking
+        : null;
+    }
+    sess._blockIdToMsgId = new Map();
+    sess._agentGroups = new Map();
+    rebuildIndexes(sess);
+  }
+
   applyLiveUnits(
     sessId: string,
     units: import("@openclaude/protocol").LiveUnit[],
@@ -3864,26 +3960,7 @@ export class ChatSocket {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
     if (resetClientMessageIds.length > 0) {
-      const owners = new Set(resetClientMessageIds);
-      const preserveStreamingPointer = !!sess._sendingInFlight &&
-        typeof sess._activeClientMessageId === "string" &&
-        owners.has(sess._activeClientMessageId);
-      sess.messages = sess.messages.filter((message) => {
-        if (message.role === "user") return true;
-        if (message._source === "server" || !!message._turnTapeId) return true;
-        if (preserveStreamingPointer && message === sess._streamingAssistant) return true;
-        return !(
-          (typeof message._turnOwnerId === "string" && owners.has(message._turnOwnerId)) ||
-          (typeof message._clientMessageId === "string" && owners.has(message._clientMessageId))
-        );
-      });
-      if (!preserveStreamingPointer) {
-        sess._streamingAssistant = null;
-        sess._streamingThinking = null;
-      }
-      sess._blockIdToMsgId = new Map();
-      sess._agentGroups = new Map();
-      rebuildIndexes(sess);
+      this.resetOwnerLocalRows(sess, resetClientMessageIds, liveProcessOwnersFromUnits(units));
     }
     const mapped = units.map(liveUnitToMessage);
     sess.messages = prependLiveUnitMessages(sess.messages, mapped);
@@ -3941,31 +4018,7 @@ export class ChatSocket {
       for (const sessionKey of resetSessionKeys) {
         resetFrameSeqCursor(sess, { sessionKey });
       }
-      const owners = new Set(resetClientMessageIds);
-      const preserveStreamingPointer = !!sess._sendingInFlight &&
-        typeof sess._activeClientMessageId === "string" &&
-        owners.has(sess._activeClientMessageId);
-      sess.messages = sess.messages.filter((message) => {
-        if (message.role === "user") return true;
-        if (message._source === "server" || !!message._turnTapeId) return true;
-        // Keep the live streaming object; still drop other local rows for this
-        // cmid so retired-stream hydrates can purge a stale cache copy.
-        if (preserveStreamingPointer && message === sess._streamingAssistant) return true;
-        return !(
-          (typeof message._turnOwnerId === "string" && owners.has(message._turnOwnerId)) ||
-          (typeof message._clientMessageId === "string" && owners.has(message._clientMessageId))
-        );
-      });
-      // P0: a still-in-flight owner must keep streaming pointers. Initial
-      // journal hydrate resets owner ids (including the live cmid) and used to
-      // wipe _streamingAssistant even when applyTapeProjection was skipped.
-      if (!preserveStreamingPointer) {
-        sess._streamingAssistant = null;
-        sess._streamingThinking = null;
-      }
-      sess._blockIdToMsgId = new Map();
-      sess._agentGroups = new Map();
-      rebuildIndexes(sess);
+      this.resetOwnerLocalRows(sess, resetClientMessageIds, liveProcessOwnersFromFrames(frames));
     }
     for (const record of frames) {
       if (!record.payload || typeof record.payload !== "object" || Array.isArray(record.payload)) continue;

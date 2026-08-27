@@ -4284,6 +4284,174 @@ describe("Phase-A final-only tape projection retry", () => {
     sock.stop();
   });
 
+  test("Phase-A unpublished then empty live-units reset keeps thinking/tool/plan", () => {
+    const sessionId = "s-units-reset-keep-live";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess._sendingInFlight = true;
+    sess._activeClientMessageId = clientMessageId;
+    sess.messages = [
+      unpublishedTimeline(sessionId)[0]!,
+      {
+        id: `live-thinking-${sessionId}`,
+        role: "thinking",
+        text: "live reasoning",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        output: "ok",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-plan-${sessionId}`,
+        role: "plan",
+        text: "live plan",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+      },
+    ];
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+      completedClientMessageId: clientMessageId,
+    });
+    expect(sess._sendingInFlight).toBe(false);
+    sock.applyLiveUnits(sessionId, [], [clientMessageId]);
+    expect(sess.messages.map((message) => message.role)).toEqual([
+      "user", "thinking", "tool", "plan", "assistant",
+    ]);
+    expect(sess.messages.some((message) => message.id === `live-thinking-${sessionId}`)).toBe(true);
+    expect(sess.messages.some((message) => message.id === `live-tool-${sessionId}`)).toBe(true);
+    expect(sess.messages.some((message) => message.id === `live-plan-${sessionId}`)).toBe(true);
+    expect(sess.messages.some((message) =>
+      message.role === "assistant" && message._displayDegradeReason === "records_unpublished",
+    )).toBe(true);
+    sock.stop();
+  });
+
+  test("Phase-A unpublished then retired live-frames reset keeps thinking/tool/plan", () => {
+    const sessionId = "s-frames-reset-keep-live";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess._sendingInFlight = true;
+    sess._activeClientMessageId = clientMessageId;
+    sess.messages = [
+      unpublishedTimeline(sessionId)[0]!,
+      {
+        id: `live-thinking-${sessionId}`,
+        role: "thinking",
+        text: "live reasoning",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-plan-${sessionId}`,
+        role: "plan",
+        text: "live plan",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+      },
+    ];
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+      completedClientMessageId: clientMessageId,
+    });
+    expect(sess._sendingInFlight).toBe(false);
+    sock.applyDurableLiveFrames(sessionId, [], [clientMessageId]);
+    expect(sess.messages.map((message) => message.role)).toEqual([
+      "user", "thinking", "tool", "plan", "assistant",
+    ]);
+    expect(sess.messages.some((message) => message.id === `live-thinking-${sessionId}`)).toBe(true);
+    expect(sess.messages.some((message) => message.id === `live-tool-${sessionId}`)).toBe(true);
+    expect(sess.messages.some((message) => message.id === `live-plan-${sessionId}`)).toBe(true);
+    expect(sess.messages.some((message) =>
+      message.role === "assistant" && message._displayDegradeReason === "records_unpublished",
+    )).toBe(true);
+    sock.stop();
+  });
+
+  test("live-units reset with thinking/tool for the same turn replaces live copies without duplicates", () => {
+    const sessionId = "s-units-reset-replace-live";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess.messages = [
+      unpublishedTimeline(sessionId)[0]!,
+      {
+        id: "srv-think-1",
+        role: "thinking",
+        text: "old live",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: "tool:1:a",
+        role: "tool",
+        text: "Bash",
+        toolName: "Bash",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+      },
+    ];
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+      completedClientMessageId: clientMessageId,
+    });
+    sock.applyLiveUnits(sessionId, [{
+      id: "thinking:1:cm",
+      kind: "thinking",
+      messageId: "srv-think-1",
+      seqFirst: 1,
+      seqLast: 2,
+      recordIdFirst: "10",
+      recordIdLast: "11",
+      open: false,
+      clientMessageId,
+      text: "unit thinking",
+    }, {
+      id: "tool:1:a",
+      kind: "tool",
+      seqFirst: 3,
+      seqLast: 3,
+      recordIdFirst: "12",
+      recordIdLast: "12",
+      open: false,
+      clientMessageId,
+      toolName: "Bash",
+    }], [clientMessageId]);
+    const thinking = sess.messages.filter((message) => message.role === "thinking");
+    const tools = sess.messages.filter((message) => message.role === "tool");
+    expect(thinking).toHaveLength(1);
+    expect(tools).toHaveLength(1);
+    expect(thinking[0]?.id).toBe("srv-think-1");
+    expect(tools[0]?.id).toBe("tool:1:a");
+    expect(sess.messages.some((message) =>
+      message.role === "assistant" && message._displayDegradeReason === "records_unpublished",
+    )).toBe(true);
+    sock.stop();
+  });
+
   test("complete tape without degrade replaces live thinking/tool/plan", () => {
     const sessionId = "s-degrade-then-exact";
     const sock = makeSocket();
