@@ -871,11 +871,15 @@ export function mergeFullServerWins(
       const belongsToActiveTurn =
         typeof opts.activeClientMessageId === "string" &&
         (ownerId === opts.activeClientMessageId || legacyActiveRows.has(m));
-      // First unified-timeline adoption must drop predecessor cache, including
-      // client-owned team/progress cards. Phase-B keep-alive is only for the
-      // genuinely active turn.
-      const unpublishedProcess = belongsToActiveTurn && isUnpublishedProcessRow(m);
-      if (!belongsToActiveTurn && !unpublishedProcess) return false;
+      const unpublishedProcess = isUnpublishedProcessRow(m);
+      // Adjacent-user owner stamping (repairPostFinalProcessOrder) must not
+      // keep predecessor team/progress cache. Keep only when this row's owner
+      // is the Phase-A unpublished turn or the Phase-B exact assistant turn.
+      const pendingOwnerMatchesTurn = typeof ownerId === "string" && (
+        unpublishedFinalOwners.has(ownerId) ||
+        server.some((row) => isPhaseBExactAssistant(row) && turnOwnerId(row) === ownerId)
+      );
+      if (!belongsToActiveTurn && !(unpublishedProcess && pendingOwnerMatchesTurn)) return false;
     }
     if (
       m._timelineRecord !== true &&
