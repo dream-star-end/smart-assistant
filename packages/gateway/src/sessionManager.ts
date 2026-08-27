@@ -1123,6 +1123,36 @@ export type PreheatOutcome =
   | 'skipped_busy'
   | 'skipped_cap'
 
+/** CCB 冷启约 20s、codex app-server 5–8s、MCP tsx 回落约 7s。45s ≈ 两倍 CCB 冷启 + MCP 余量。 */
+export const ENGINE_PREHEAT_DEADLINE_DEFAULT_MS = 45_000
+
+export function resolveEnginePreheatDeadlineMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.OC_ENGINE_PREHEAT_DEADLINE_MS)
+  if (Number.isFinite(raw) && raw >= 20) return Math.floor(raw)
+  return ENGINE_PREHEAT_DEADLINE_DEFAULT_MS
+}
+
+const PREHEAT_DEADLINE_CODE = 'PREHEAT_DEADLINE'
+
+function withPreheatDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`engine preheat exceeded ${ms}ms deadline`)
+      ;(err as Error & { code: string }).code = PREHEAT_DEADLINE_CODE
+      reject(err)
+    }, ms)
+    timer.unref?.()
+  })
+  return Promise.race([work, timeout]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
+function isPreheatDeadline(err: unknown): boolean {
+  return Boolean(err && typeof err === 'object' && (err as { code?: string }).code === PREHEAT_DEADLINE_CODE)
+}
+
 export interface CronBridgeEvent {
   action: 'create' | 'delete' | 'list'
   agentId: string
@@ -3813,7 +3843,28 @@ export class SessionManager {
         if ((session._activeTurnCount ?? 0) > 0 || this._promptQueueHolds(session)) {
           return 'skipped_busy'
         }
-        await session.runner.preheat!()
+        const deadlineMs = resolveEnginePreheatDeadlineMs()
+        try {
+          await withPreheatDeadline(session.runner.preheat!(), deadlineMs)
+        } catch (err) {
+          if (!isPreheatDeadline(err)) throw err
+          log.warn('engine_preheat', {
+            sessionKey: session.sessionKey,
+            engine: runner.engineId,
+            outcome: 'timed_out',
+            spawn_ms: Date.now() - startedAt,
+            deadline_ms: deadlineMs,
+            err: String(err),
+          })
+          try {
+            await session.runner.shutdown()
+          } catch (shutdownErr) {
+            log.warn('engine_preheat shutdown after deadline failed', {
+              sessionKey: session.sessionKey,
+            }, shutdownErr)
+          }
+          return 'failed'
+        }
         session.lastUsedAt = Date.now()
         log.info('engine_preheat', {
           sessionKey: session.sessionKey,

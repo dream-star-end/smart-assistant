@@ -4020,4 +4020,65 @@ describe("preheatRunner", () => {
     // lock 已释放:后续等待者不悬挂。
     await session.lock;
   });
+
+  test("永不 settle 的 preheat → deadline 后 session.lock 可被 turn 拿到且 dispatch 走全新 spawn", async () => {
+    const prev = process.env.OC_ENGINE_PREHEAT_DEADLINE_MS;
+    process.env.OC_ENGINE_PREHEAT_DEADLINE_MS = "40";
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const inner = new FakeCcbRunner(() => {});
+      inner.isRunning = false;
+      const session = makeSession(inner);
+      const hung = new Promise<void>(() => {});
+      let generation = 0;
+      let startCalls = 0;
+      let shutdownCalls = 0;
+      session.runner.start = async () => {
+        startCalls += 1;
+        if (generation === 0) return hung;
+        inner.isRunning = true;
+      };
+      session.runner.preheat = () => session.runner.start();
+      session.runner.shutdown = async () => {
+        shutdownCalls += 1;
+        generation += 1;
+        inner.isRunning = false;
+      };
+      const preheatP = sm.preheatRunner(session);
+      await new Promise((r) => setTimeout(r, 80));
+      const lockState = await Promise.race([
+        session.lock.then(() => "unlocked" as const),
+        new Promise<"still-locked">((r) => setTimeout(() => r("still-locked"), 100)),
+      ]);
+      assert.equal(lockState, "unlocked");
+      assert.equal(await preheatP, "failed");
+      assert.ok(shutdownCalls >= 1, "timeout must shutdown runner to drop shared spawn");
+      const before = startCalls;
+      await session.runner.start();
+      assert.equal(startCalls, before + 1, "dispatch must cold-start, not reuse hung spawn promise");
+      assert.equal(inner.isRunning, true);
+    } finally {
+      if (prev === undefined) Reflect.deleteProperty(process.env, "OC_ENGINE_PREHEAT_DEADLINE_MS");
+      else process.env.OC_ENGINE_PREHEAT_DEADLINE_MS = prev;
+    }
+  });
+
+  test("deadline 内完成的 preheat 行为不变", async () => {
+    const prev = process.env.OC_ENGINE_PREHEAT_DEADLINE_MS;
+    process.env.OC_ENGINE_PREHEAT_DEADLINE_MS = "200";
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const runner = new FakeCcbRunner(() => {});
+      runner.isRunning = false;
+      runner.startDelayMs = 20;
+      const session = makeSession(runner);
+      assert.equal(await sm.preheatRunner(session), "started");
+      assert.equal(runner.startCalls, 1);
+      assert.ok(session.lastUsedAt > 0);
+      await session.lock;
+    } finally {
+      if (prev === undefined) Reflect.deleteProperty(process.env, "OC_ENGINE_PREHEAT_DEADLINE_MS");
+      else process.env.OC_ENGINE_PREHEAT_DEADLINE_MS = prev;
+    }
+  });
 });
