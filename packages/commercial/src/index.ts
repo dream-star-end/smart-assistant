@@ -2399,6 +2399,8 @@ export async function registerCommercial(
       // /internal/v3/inbox-post — 容器 onDeliver「离线送达兜底写站内信」。uid 由容器身份推导,
       // audience 硬编码 'user' 只给自己写;created_by = MIN active admin(同 onboarding 语义,
       // 每次现解析,不缓存)。无 admin → 抛错 → handler 500。见 http/internalInboxPost.ts。
+      // selfhost 限制:中央网关若共用一个容器 bearer,所有 cron 都会记到该 bearer 对应 uid;
+      // 当前 selfhost 单主用户,cron 跑在 uid 容器内,token 即该用户,路径可用。
       const postInboxToUser = async (
         uid: number,
         msg: { title: string; bodyMd: string; level: "info" | "warning"; deliveryKey?: string },

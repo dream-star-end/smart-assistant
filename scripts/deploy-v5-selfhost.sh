@@ -827,6 +827,9 @@ OC_LOCAL_OBSERVABILITY_RETENTION=1
 OC_LOCAL_EVENT_RETENTION_DAYS=30
 OC_LOCAL_USAGE_RETENTION_DAYS=365
 OC_REDACT_TOOL_EVENT_PREVIEWS=1
+# 不要在本文件写入 OPENCLAUDE_V3_MASTER_BASE_URL / OPENCLAUDE_V3_CONTAINER_TOKEN。
+# 这两项由 v3supervisor 按用户容器注入;写进 host env 会让 cron 站内信全部落到同一个 uid。
+# token 明文不得进 git。上线无需改本文件,下一次容器重建即带上 supervisor 注入的 env。
 EOF
   append_provider_keys "$tmp"
   mkdir -p "$(dirname "$V5_ENV")"
