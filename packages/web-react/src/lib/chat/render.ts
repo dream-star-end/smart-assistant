@@ -26,11 +26,14 @@ import { friendlyBridgeErrorMessage } from "./pure";
  * 这些是 **server 权威的稳定协议码**:`dispatch_lost`/`dispatch_not_accepted` 由 reconciler 铸在
  * durable dispatch status 上;`service_restart` 由 gateway 写在**不可变 tape**(boot recovery synthetic
  * crashed)里 —— 不可变行无法回填 master 标记,故按稳定协议码识别(非脆弱的内部 failureCode 枚举)。
+ * `durable_dispatch_unavailable` 由 bridge 在 bind 失败后 CAS terminal(executed_error)再发
+ * 实时 error 帧;该帧不带 `_dispatchTerminal`,必须靠稳定协议码走铸新 clientMessageId 的重试分流。
  */
 export const DISPATCH_LOST_ERROR_CODES = new Set([
   "dispatch_lost",
   "dispatch_not_accepted",
   "service_restart",
+  "durable_dispatch_unavailable",
 ]);
 
 /** 归一化后是否命中 dispatch 终态错误码。 */
