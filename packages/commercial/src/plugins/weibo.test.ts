@@ -73,6 +73,39 @@ function compileWorkerPostHarness(overrides: Record<string, unknown>): {
   )(...names.map((name) => bound[name])) as ReturnType<typeof compileWorkerPostHarness>
 }
 
+function compileCookieApiHarness(): {
+  publishComposerViaCookieApi(
+    page: unknown,
+    text: string,
+    files: Array<{ name: string; mimeType: string; buffer: Buffer }>,
+    selfId: string,
+  ): Promise<{
+    published?: boolean
+    attempted?: boolean
+    via?: string
+    reason?: string
+    pids?: string[]
+    status?: number
+  }>
+} {
+  const start = WEIBO_WORKER_SOURCE.indexOf('async function publishComposerViaCookieApi')
+  const end = WEIBO_WORKER_SOURCE.indexOf('async function newestOwnPost', start)
+  assert.ok(start >= 0 && end > start)
+  return new Function(
+    `'use strict'; ${WEIBO_WORKER_SOURCE.slice(start, end)}; return { publishComposerViaCookieApi };`,
+  )() as ReturnType<typeof compileCookieApiHarness>
+}
+
+function compileDesktopPidOf(): (parsed: unknown) => string {
+  const marker = 'const pidOf = (parsed) => {'
+  const start = WEIBO_WORKER_SOURCE.indexOf(marker)
+  const end = WEIBO_WORKER_SOURCE.indexOf('const pids = [];', start)
+  assert.ok(start >= 0 && end > start)
+  return new Function(`${WEIBO_WORKER_SOURCE.slice(start, end)}; return pidOf;`)() as (
+    parsed: unknown,
+  ) => string
+}
+
 function compileWorkerPostTextHarness(): {
   cleanPostText(value: unknown, max: number): string
 } {
@@ -552,6 +585,11 @@ describe('official Weibo Plugin', () => {
     )
     assert.match(WEIBO_WORKER_SOURCE, /form.append\('pic1'/)
     assert.match(WEIBO_WORKER_SOURCE, /data.pic_id || data.picid || data.pid/)
+    assert.match(
+      WEIBO_WORKER_SOURCE,
+      /mobile = await context.newPage\(\);/,
+      'mobile tab must be assigned inside try so newPage throws return desktop pids',
+    )
     assert.match(WEIBO_WORKER_SOURCE, /ajax\/statuses\/update/)
     assert.match(WEIBO_WORKER_SOURCE, /api\/statuses\/uploadPic/)
     assert.match(WEIBO_WORKER_SOURCE, /api\/statuses\/update/)
@@ -1106,6 +1144,162 @@ describe('official Weibo Plugin', () => {
     assert.ok(events.indexOf('dispatch') < events.indexOf('api'))
     assert.equal(events.includes('image-click'), false)
     assert.equal(events.filter((event) => event === 'click').length, 0)
+  })
+
+  test('create_post with media does not fall through to DOM when cookie helper throws after a full pid set', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const send = {
+      isDisabled: async () => false,
+      click: async (options: { trial?: boolean }) => {
+        events.push(options.trial ? 'trial' : 'click')
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) =>
+        text === '图片' ? { click: async () => events.push('image-click') } : send,
+      publishComposerViaCookieApi: async () => {
+        events.push('api')
+        throw Object.assign(new Error('newpage'), { pids: ['pid1'] })
+      },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    await assert.rejects(
+      harness.writeAction(
+        { locator: () => ({}), waitForTimeout: async () => {} },
+        {
+          actionId: 'create_post',
+          params: {
+            text: 'hello',
+            mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+          },
+        },
+      ),
+      /media-upload/,
+    )
+    assert.ok(events.indexOf('dispatch') < events.indexOf('api'))
+    assert.equal(events.includes('image-click'), false)
+    assert.equal(events.filter((event) => event === 'click').length, 0)
+  })
+
+  test('pidOf accepts nested pic_id fields and rejects invalid pids', () => {
+    const pidOf = compileDesktopPidOf()
+    assert.equal(pidOf({ data: { pic_id: 'ABCDEFGHpid' } }), 'ABCDEFGHpid')
+    assert.equal(pidOf({ data: { pid: 'ABCDEFGHpid' } }), 'ABCDEFGHpid')
+    assert.equal(pidOf({ pic: { pic_id: 'ABCDEFGHpid' } }), 'ABCDEFGHpid')
+    assert.equal(pidOf({ pic_id: 'ABCDEFGHpid' }), 'ABCDEFGHpid')
+    assert.equal(pidOf({ pid: 'short' }), '')
+    assert.equal(pidOf({ pid: 'bad pid!!' }), '')
+    assert.equal(pidOf({ ret: 1, msg: 'ok' }), '')
+    assert.equal(pidOf(null), '')
+  })
+
+  test('picupload posts multipart pic1 before raw blob and keeps pids if newPage throws', async () => {
+    const helper = compileCookieApiHarness()
+    const calls: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+      const href = String(url)
+      const kind =
+        typeof FormData !== 'undefined' && init?.body instanceof FormData
+          ? 'form'
+          : typeof Blob !== 'undefined' && init?.body instanceof Blob
+            ? 'blob'
+            : typeof init?.body
+      calls.push(`${kind}:${href}`)
+      if (href.includes('pic_upload.php') && init?.body instanceof FormData) {
+        return { status: 200, text: async () => JSON.stringify({ data: { pic_id: 'NESTEDPID12345' } }) }
+      }
+      if (href.includes('ajax/statuses/update')) {
+        return { status: 403, text: async () => JSON.stringify({ ok: 0 }) }
+      }
+      throw new Error(`unexpected fetch ${href}`)
+    }) as typeof fetch
+    try {
+      const files = [{ name: 'a.jpg', mimeType: 'image/jpeg', buffer: Buffer.from('img') }]
+      const page = {
+        evaluate: async (fn: (input: unknown) => Promise<unknown>, input: unknown) => fn(input),
+        context: () => ({
+          cookies: async () => [{ name: 'XSRF-TOKEN', value: 't' }],
+          newPage: async () => {
+            throw new Error('newpage')
+          },
+        }),
+      }
+      const result = await helper.publishComposerViaCookieApi(page, 'hello', files, '12345')
+      assert.match(calls[0] || '', /^form:https:\/\/picupload\.weibo\.com\/interface\/pic_upload\.php/)
+      assert.equal(
+        calls.some((entry) => entry.startsWith('blob:')),
+        false,
+        'raw blob fallback must not run after multipart returned a pid',
+      )
+      assert.deepEqual(result.pids, ['NESTEDPID12345'])
+      assert.equal(result.attempted, false)
+      assert.equal(result.via, 'ajax')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('picupload falls back from empty multipart to a raw blob body', async () => {
+    const helper = compileCookieApiHarness()
+    const calls: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+      const href = String(url)
+      const kind =
+        typeof FormData !== 'undefined' && init?.body instanceof FormData
+          ? 'form'
+          : typeof Blob !== 'undefined' && init?.body instanceof Blob
+            ? 'blob'
+            : typeof init?.body
+      calls.push(`${kind}:${href}`)
+      if (init?.body instanceof FormData) {
+        return { status: 200, text: async () => JSON.stringify({ ret: 1 }) }
+      }
+      if (href.includes('/interface/pic_upload.php') || href.includes('/interface/upload.php')) {
+        return { status: 200, text: async () => JSON.stringify({ pic_id: 'RAWBLOBPID123' }) }
+      }
+      if (href.includes('ajax/statuses/update')) {
+        return { status: 200, text: async () => JSON.stringify({ ok: 1, data: { idstr: 'mid1' } }) }
+      }
+      throw new Error(`unexpected fetch ${href}`)
+    }) as typeof fetch
+    try {
+      const files = [{ name: 'a.jpg', mimeType: 'image/jpeg', buffer: Buffer.from('img') }]
+      const page = {
+        evaluate: async (fn: (input: unknown) => Promise<unknown>, input: unknown) => fn(input),
+        context: () => ({
+          cookies: async () => [{ name: 'XSRF-TOKEN', value: 't' }],
+          newPage: async () => {
+            throw new Error('newpage')
+          },
+        }),
+      }
+      const previousDocument = (globalThis as { document?: { cookie: string } }).document
+      ;(globalThis as { document?: { cookie: string } }).document = { cookie: '' }
+      let result: Awaited<ReturnType<typeof helper.publishComposerViaCookieApi>>
+      try {
+        result = await helper.publishComposerViaCookieApi(page, 'hello', files, '12345')
+      } finally {
+        const scoped = globalThis as { document?: { cookie: string } }
+        if (previousDocument) scoped.document = previousDocument
+        else scoped.document = undefined
+      }
+      assert.match(calls[0] || '', /^form:/)
+      assert.ok(calls.some((entry) => entry.startsWith('blob:')))
+      assert.equal(result.published, true)
+      assert.deepEqual(result.pids, ['RAWBLOBPID123'])
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   })
 
   test('create_post with media falls through to DOM after a live cookie-path miss', async () => {

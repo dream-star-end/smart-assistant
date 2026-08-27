@@ -8,7 +8,8 @@
  * x-xsrf-token header from context.cookies. A picupload tab JS-redirects back
  * to weibo.com and kills the execution context mid-upload. A cookie-path miss
  * with no publish attempt falls through to the DOM filechooser; an attempted
- * ajax/update still fail-closes without opening the native OS chooser.
+ * ajax/update still fail-closes without opening the native OS chooser. A
+ * complete pid set stays fail-closed even if opening the mobile tab throws.
  */
 export const WEIBO_WORKER_SOURCE = String.raw`
 import { createHash } from 'node:crypto';
@@ -1288,7 +1289,15 @@ async function publishComposerViaCookieApi(page, text, files, selfId) {
   })();
   if (desktop && desktop.published === true && Array.isArray(desktop.pids) && desktop.pids.length === files.length) return desktop;
   if (desktop && desktop.attempted === true) return desktop;
-  const mobile = await context.newPage();
+  // ajax/update may already have been sent with attempted=false. A throw from
+  // newPage() used to reject the helper, which the caller treated as a miss
+  // and opened the DOM composer — a possible double post.
+  let mobile;
+  try {
+    mobile = await context.newPage();
+  } catch {
+    return desktop;
+  }
   try {
     await mobile.goto('https://m.weibo.cn/', { waitUntil: 'domcontentloaded', timeout: 30_000 });
     const fromMobile = await mobile.evaluate(async (input) => {
@@ -1358,7 +1367,7 @@ async function publishComposerViaCookieApi(page, text, files, selfId) {
   } catch {
     return desktop;
   } finally {
-    await mobile.close().catch(() => {});
+    if (mobile) await mobile.close().catch(() => {});
   }
 }
 async function newestOwnPost(page, selfId, text, beforeIds) {
@@ -2035,7 +2044,11 @@ async function writeAction(page, input) {
             if (api && Array.isArray(api.pids) && api.pids.length === files.length) throw new Error('media-upload');
           } catch (error) {
             if (String(error && error.message) === 'result' || String(error && error.message) === 'media-upload') throw error;
-            emitStep({ step: 'media.api', ok: false, attempted: false, via: 'error', pids: 0, status: 0, mediaCount: manifest.length });
+            const thrownPids = error && Array.isArray(error.pids) ? error.pids : [];
+            const thrownAttempted = !!(error && error.attempted === true);
+            emitStep({ step: 'media.api', ok: false, attempted: thrownAttempted, via: 'error', pids: thrownPids.length, status: 0, mediaCount: manifest.length });
+            if (thrownAttempted) throw new Error('result');
+            if (thrownPids.length === files.length) throw new Error('media-upload');
           }
         }
         const prepared = await preparePostImageChooser(page, freshEditor, files);
