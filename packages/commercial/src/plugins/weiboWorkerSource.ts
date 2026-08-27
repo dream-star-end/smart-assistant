@@ -1274,9 +1274,18 @@ async function publishComposerViaCookieApi(page, text, files, selfId) {
         // One header only: duplicate case-variants get merged into "token, token"
         // by fetch, and weibo answers 403 "invalid csrf token".
         if (xsrf) headers['x-xsrf-token'] = xsrf;
-        const updated = await fetch('https://weibo.com/ajax/statuses/update', { method: 'POST', credentials: 'include', headers, body: body.toString() });
+        let updated;
+        try {
+          updated = await fetch('https://weibo.com/ajax/statuses/update', { method: 'POST', credentials: 'include', headers, body: body.toString() });
+        } catch {
+          return { published: false, attempted: true, via: 'ajax', pids, reason: 'throw' };
+        }
+        let raw = '';
+        try { raw = await updated.text(); } catch {
+          return { published: false, attempted: true, via: 'ajax', pids, status: updated.status, reason: 'throw' };
+        }
         const status = updated.status;
-        const parsed = parseJson(await updated.text());
+        const parsed = parseJson(raw);
         const id = publishedId(parsed);
         if (id) return { published: true, attempted: true, via: 'ajax', pids, id, status };
         const rejected = parsed && (parsed.ok === 0 || parsed.ok === false);
@@ -1300,68 +1309,114 @@ async function publishComposerViaCookieApi(page, text, files, selfId) {
   }
   try {
     await mobile.goto('https://m.weibo.cn/', { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    const fromMobile = await mobile.evaluate(async (input) => {
-      const bytesOf = (item) => {
-        const binary = atob(item.base64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-        return bytes;
-      };
-      const parseJson = (raw) => {
-        const text = String(raw || '');
-        const start = text.indexOf('{');
-        if (start < 0) return null;
-        try { return JSON.parse(text.slice(start)); } catch { return null; }
-      };
-      const pidOf = (parsed) => {
-        if (!parsed || typeof parsed !== 'object') return '';
-        return String(parsed.pic_id || parsed.picid || parsed.pid || '');
-      };
-      const publishedId = (parsed) => {
-        if (!parsed || typeof parsed !== 'object') return '';
-        if (!(parsed.ok === 1 || parsed.ok === true)) return '';
-        const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : parsed;
-        return String(data.id || data.idstr || data.mid || 'ok');
-      };
-      const config = parseJson(await (await fetch('https://m.weibo.cn/api/config', { credentials: 'include' })).text());
-      const st = String((config && config.data && config.data.st) || '');
-      if (!st) return { published: false, attempted: false, via: 'm', pids: [] };
-      const pids = [];
-      for (const file of input.files) {
-        const form = new FormData();
-        form.append('type', 'json');
-        form.append('st', st);
-        form.append('pic', new Blob([bytesOf(file)], { type: file.mimeType }), file.name);
-        const uploaded = await fetch('https://m.weibo.cn/api/statuses/uploadPic', {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'x-xsrf-token': st, 'x-requested-with': 'XMLHttpRequest' },
-          body: form
-        });
-        const pid = pidOf(parseJson(await uploaded.text()));
-        if (!/^[A-Za-z0-9._-]{8,128}$/.test(pid)) return { published: false, attempted: false, via: 'm-upload', pids: pids.slice() };
-        pids.push(pid);
+    let fromMobile = null;
+    try {
+      fromMobile = await mobile.evaluate(async (input) => {
+        const bytesOf = (item) => {
+          const binary = atob(item.base64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+          return bytes;
+        };
+        const parseJson = (raw) => {
+          const text = String(raw || '');
+          const start = text.indexOf('{');
+          if (start < 0) return null;
+          try { return JSON.parse(text.slice(start)); } catch { return null; }
+        };
+        const pidOf = (parsed) => {
+          if (!parsed || typeof parsed !== 'object') return '';
+          return String(parsed.pic_id || parsed.picid || parsed.pid || '');
+        };
+        let st = '';
+        try {
+          const config = parseJson(await (await fetch('https://m.weibo.cn/api/config', { credentials: 'include' })).text());
+          st = String((config && config.data && config.data.st) || '');
+        } catch {
+          return { published: false, attempted: false, via: 'm', pids: [], reason: 'config' };
+        }
+        if (!st) return { published: false, attempted: false, via: 'm', pids: [] };
+        const pids = [];
+        try {
+          for (const file of input.files) {
+            const form = new FormData();
+            form.append('type', 'json');
+            form.append('st', st);
+            form.append('pic', new Blob([bytesOf(file)], { type: file.mimeType }), file.name);
+            const uploaded = await fetch('https://m.weibo.cn/api/statuses/uploadPic', {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'x-xsrf-token': st, 'x-requested-with': 'XMLHttpRequest' },
+              body: form
+            });
+            const pid = pidOf(parseJson(await uploaded.text()));
+            if (!/^[A-Za-z0-9._-]{8,128}$/.test(pid)) return { published: false, attempted: false, via: 'm-upload', pids: pids.slice(), st };
+            pids.push(pid);
+          }
+        } catch {
+          return { published: false, attempted: false, via: 'm-upload', pids: pids.slice(), st };
+        }
+        return { published: false, attempted: false, via: 'm-upload', pids, st };
+      }, payload);
+    } catch {
+      fromMobile = null;
+    }
+    const mobilePids = fromMobile && Array.isArray(fromMobile.pids) ? fromMobile.pids.slice() : [];
+    const mobileSt = fromMobile && typeof fromMobile.st === 'string' ? fromMobile.st : '';
+    // Full pid set: update is eligible. Persist pids outside evaluate so a
+    // later transport/Playwright throw cannot fall back to the desktop miss.
+    if (mobilePids.length === files.length) {
+      try {
+        const updated = await mobile.evaluate(async (input) => {
+          const parseJson = (raw) => {
+            const text = String(raw || '');
+            const start = text.indexOf('{');
+            if (start < 0) return null;
+            try { return JSON.parse(text.slice(start)); } catch { return null; }
+          };
+          const publishedId = (parsed) => {
+            if (!parsed || typeof parsed !== 'object') return '';
+            if (!(parsed.ok === 1 || parsed.ok === true)) return '';
+            const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : parsed;
+            return String(data.id || data.idstr || data.mid || 'ok');
+          };
+          const pids = Array.isArray(input.pids) ? input.pids : [];
+          const body = new URLSearchParams();
+          body.set('content', input.text);
+          body.set('st', input.st);
+          body.set('picId', pids.join(','));
+          let posted;
+          try {
+            posted = await fetch('https://m.weibo.cn/api/statuses/update', {
+              method: 'POST',
+              credentials: 'include',
+              headers: { Accept: 'application/json, text/plain, */*', 'Content-Type': 'application/x-www-form-urlencoded', 'x-xsrf-token': input.st, 'x-requested-with': 'XMLHttpRequest' },
+              body: body.toString()
+            });
+          } catch {
+            return { published: false, attempted: true, via: 'm', pids, reason: 'throw' };
+          }
+          let raw = '';
+          try { raw = await posted.text(); } catch {
+            return { published: false, attempted: true, via: 'm', pids, status: posted.status, reason: 'throw' };
+          }
+          const status = posted.status;
+          const parsed = parseJson(raw);
+          const id = publishedId(parsed);
+          if (id) return { published: true, attempted: true, via: 'm', pids, id, status };
+          const rejected = parsed && (parsed.ok === 0 || parsed.ok === false);
+          if (status >= 200 && status < 300 && !rejected && !parsed) return { published: false, attempted: true, via: 'm', pids, status, reason: 'opaque' };
+          return { published: false, attempted: false, via: 'm', pids, status, reason: rejected ? 'rejected' : 'http' };
+        }, { text: payload.text, pids: mobilePids, st: mobileSt });
+        if (updated && typeof updated === 'object') {
+          if (!Array.isArray(updated.pids) || updated.pids.length !== files.length) updated.pids = mobilePids;
+          return updated;
+        }
+      } catch {
+        return { published: false, attempted: true, via: 'm', pids: mobilePids, reason: 'throw' };
       }
-      const body = new URLSearchParams();
-      body.set('content', input.text);
-      body.set('st', st);
-      body.set('picId', pids.join(','));
-      const updated = await fetch('https://m.weibo.cn/api/statuses/update', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { Accept: 'application/json, text/plain, */*', 'Content-Type': 'application/x-www-form-urlencoded', 'x-xsrf-token': st, 'x-requested-with': 'XMLHttpRequest' },
-        body: body.toString()
-      });
-      const status = updated.status;
-      const parsed = parseJson(await updated.text());
-      const id = publishedId(parsed);
-      if (id) return { published: true, attempted: true, via: 'm', pids, id, status };
-      const rejected = parsed && (parsed.ok === 0 || parsed.ok === false);
-      if (status >= 200 && status < 300 && !rejected && !parsed) return { published: false, attempted: true, via: 'm', pids, status, reason: 'opaque' };
-      return { published: false, attempted: false, via: 'm', pids, status, reason: rejected ? 'rejected' : 'http' };
-    }, payload);
-    // Keep the desktop diagnostics (upload reason / ajax status) unless the
-    // mobile branch made real progress; a dead m.weibo.cn session says nothing.
+      return { published: false, attempted: true, via: 'm', pids: mobilePids, reason: 'throw' };
+    }
     if (fromMobile && typeof fromMobile === 'object' && (fromMobile.published === true || fromMobile.attempted === true || fromMobile.status)) return fromMobile;
     return desktop;
   } catch {
