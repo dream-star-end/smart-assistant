@@ -8887,6 +8887,21 @@ describe('v5 container gateway precompile survives runtime prune', () => {
       'root scripts/run-container-gateway.sh must stay excluded',
     )
     assert.equal(existsSync(path.join(staging, 'scripts')), false, 'root /scripts/ must be pruned')
+    assert.equal(
+      existsSync(path.join(staging, 'packages/mcp-memory/scripts/build-oc-memory-mcp.sh')),
+      true,
+      'pruned staging missing oc-memory MCP builder',
+    )
+    assert.equal(
+      existsSync(path.join(staging, 'packages/mcp-memory/scripts/build-oc-memory-cli.sh')),
+      true,
+      'pruned staging missing oc-memory CLI builder',
+    )
+    assert.equal(
+      existsSync(path.join(staging, 'packages/mcp-memory/src/index.ts')),
+      true,
+      'pruned staging missing oc-memory MCP entry',
+    )
   })
 
   test('finalize requires packages/cli/scripts builder and asserts dist marker (no silent skip)', async () => {
@@ -8909,5 +8924,90 @@ describe('v5 container gateway precompile survives runtime prune', () => {
     const wrapperSrc = await readFile(path.join(root, 'packages/cli/scripts/run-container-gateway.sh'), 'utf8')
     // packages/cli/scripts → repo root is three hops; two hops would resolve under packages/.
     assert.match(wrapperSrc, /BASH_SOURCE\[0\]\}"\)\/\.\.\/\.\.\/\.\./)
+  })
+})
+
+describe('v5 oc-memory MCP cjs survives runtime prune and gateway precompile', () => {
+  const libPath = path.join(root, 'scripts/v5-runtime-release-lib.sh')
+  const excludesPath = path.join(root, 'packages/commercial/agent-sandbox/runtime-src-excludes.txt')
+  const gatewayMjs = path.join(root, 'packages/cli/scripts/build-container-gateway.mjs')
+
+  test('git archive + rsync excludes keep MCP builder; gateway compilePkg wipe removes a planted cjs', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-mcp-cjs-prune-'))
+    dirs.push(dir)
+    const raw = path.join(dir, 'raw')
+    const staging = path.join(dir, 'staging')
+    await mkdir(raw)
+    await mkdir(staging)
+
+    const index = path.join(dir, 'index')
+    const env = { ...process.env, GIT_INDEX_FILE: index }
+    const git = (args: string[]) => {
+      const r = spawnSync('git', args, { cwd: root, encoding: 'utf8', env })
+      assert.equal(r.status, 0, `git ${args.join(' ')} failed: ${r.stderr}`)
+      return r
+    }
+    git(['read-tree', 'HEAD'])
+    git(['add', '-u'])
+    git(['add', 'packages/mcp-memory/scripts'])
+    git(['checkout-index', '-a', '-f', `--prefix=${raw}/`])
+
+    const excl = path.join(raw, 'packages/commercial/agent-sandbox/runtime-src-excludes.txt')
+    assert.equal(existsSync(excl), true, 'archived tree missing runtime-src-excludes.txt')
+    const rsync = spawnSync('rsync', ['-a', `--exclude-from=${excl}`, `${raw}/`, `${staging}/`], {
+      encoding: 'utf8',
+    })
+    assert.equal(rsync.status, 0, rsync.stderr)
+    assert.equal(
+      existsSync(path.join(staging, 'packages/mcp-memory/scripts/build-oc-memory-mcp.sh')),
+      true,
+      'production prune dropped packages/mcp-memory/scripts/build-oc-memory-mcp.sh',
+    )
+    assert.equal(
+      existsSync(path.join(staging, 'packages/mcp-memory/src/index.ts')),
+      true,
+      'production prune dropped packages/mcp-memory/src/index.ts',
+    )
+
+    const dist = path.join(staging, 'packages/mcp-memory/dist')
+    await mkdir(dist, { recursive: true })
+    const planted = path.join(dist, 'oc-memory-mcp.cjs')
+    await writeFile(planted, 'planted-cjs\n')
+    assert.equal(existsSync(planted), true)
+    // Same wipe compilePkg uses: rmSync(out, { recursive: true, force: true })
+    await rm(dist, { recursive: true, force: true })
+    assert.equal(existsSync(planted), false, 'gateway compilePkg rmSync(dist) must wipe planted cjs')
+  })
+
+  test('finalize rebuilds MCP/CLI cjs AFTER gateway precompile and fail-closes on reuse miss', async () => {
+    const lib = await readFile(libPath, 'utf8')
+    const start = lib.indexOf('oc_hotcfg_finalize_release() {')
+    assert.ok(start >= 0)
+    const body = lib.slice(start, lib.indexOf('\noc_hotcfg_env_get()', start))
+    const gw = body.indexOf('precompile container gateway')
+    const mcp = body.indexOf('build oc-memory MCP bundle')
+    const cli = body.indexOf('build oc-memory CLI bundle')
+    assert.ok(gw >= 0 && mcp >= 0 && cli >= 0, 'finalize must log gateway + both oc-memory bundles')
+    assert.ok(gw < cli, 'CLI cjs must be built after gateway precompile')
+    assert.ok(gw < mcp, 'MCP cjs must be built after gateway precompile')
+    assert.ok(cli < mcp, 'CLI bundle should precede MCP bundle')
+    assert.match(body, /oc_hotcfg_assert_runtime_mcp_cjs "\$staging"/)
+    assert.match(body, /oc_hotcfg_assert_runtime_mcp_cjs "\$target"/)
+    assert.match(body, /oc-memory MCP bundle script missing/)
+    assert.match(body, /oc-memory CLI bundle script missing/)
+    assert.doesNotMatch(
+      body,
+      /if \[ -f "\$staging\/packages\/mcp-memory\/scripts\/build-oc-memory-mcp\.sh" \]; then/,
+    )
+    assert.doesNotMatch(
+      body,
+      /if \[ -f "\$staging\/packages\/mcp-memory\/scripts\/build-oc-memory-cli\.sh" \]; then/,
+    )
+    const helper = lib.indexOf('oc_hotcfg_assert_runtime_mcp_cjs() {')
+    assert.ok(helper >= 0 && helper < start, 'assert helper must exist before finalize_release')
+    const mjs = await readFile(gatewayMjs, 'utf8')
+    assert.match(mjs, /rmSync\(out,\s*\{\s*recursive:\s*true,\s*force:\s*true\s*\}\)/)
+    const excludes = await readFile(excludesPath, 'utf8')
+    assert.doesNotMatch(excludes, /packages\/mcp-memory\/scripts/)
   })
 })
