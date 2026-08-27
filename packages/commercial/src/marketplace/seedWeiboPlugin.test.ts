@@ -2,7 +2,10 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
 import type { OfficialManagedBrowserTransitionScope } from '../plugins/officialManagedBrowserTransition.js'
-import { assertWeiboUpgradeVerificationScope } from './seedWeiboPlugin.js'
+import {
+  assertWeiboUpgradeVerificationScope,
+  classifyWeiboDeployDecision,
+} from './seedWeiboPlugin.js'
 
 const SOURCE_HASH = 'a'.repeat(64)
 const SOURCE_EXEC_HASH = 'b'.repeat(64)
@@ -103,6 +106,70 @@ describe('official Weibo upgrade verification scope', () => {
     assert.throws(
       () => assertWeiboUpgradeVerificationScope(missingInstall, 626, SOURCE_HASH, SOURCE_EXEC_HASH),
       /verified active account/,
+    )
+  })
+})
+
+describe('unattended Weibo deploy decision', () => {
+  const compiled = {
+    compiledVersion: '1.6.36',
+    compiledArtifactHash: SOURCE_HASH,
+    compiledExecHash: SOURCE_EXEC_HASH,
+  }
+
+  test('active listing with exact version/artifact/exec is a zero-write no-op', () => {
+    assert.equal(
+      classifyWeiboDeployDecision({
+        listingState: 'active',
+        listingVersion: '1.6.36',
+        listingArtifactHash: SOURCE_HASH,
+        listingExecHash: SOURCE_EXEC_HASH,
+        approvedForDeploy: true,
+        ...compiled,
+      }),
+      'noop',
+    )
+  })
+
+  test('unapproved pin drift is rejected for unattended promote', () => {
+    assert.equal(
+      classifyWeiboDeployDecision({
+        listingState: 'active',
+        listingVersion: '1.5.0',
+        listingArtifactHash: 'c'.repeat(64),
+        listingExecHash: 'd'.repeat(64),
+        approvedForDeploy: false,
+        ...compiled,
+      }),
+      'unverified',
+    )
+  })
+
+  test('unlisted leftover with deploy approval is a promote/reopen, not a no-op', () => {
+    assert.equal(
+      classifyWeiboDeployDecision({
+        listingState: 'unlisted',
+        listingVersion: '1.6.36',
+        listingArtifactHash: SOURCE_HASH,
+        listingExecHash: SOURCE_EXEC_HASH,
+        approvedForDeploy: true,
+        ...compiled,
+      }),
+      'promote',
+    )
+  })
+
+  test('version-only drift is not a no-op even if artifact accidentally matches', () => {
+    assert.equal(
+      classifyWeiboDeployDecision({
+        listingState: 'active',
+        listingVersion: '1.6.14',
+        listingArtifactHash: SOURCE_HASH,
+        listingExecHash: SOURCE_EXEC_HASH,
+        approvedForDeploy: false,
+        ...compiled,
+      }),
+      'unverified',
     )
   })
 })

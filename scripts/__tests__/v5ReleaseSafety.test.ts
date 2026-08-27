@@ -1449,8 +1449,7 @@ describe('v5 release safety lanes', () => {
     const kpAdvisory = body.indexOf('knowledge_planet_plugin_advisory_gate "$BUILT_RELEASE"')
     const weiboAdvisory = body.indexOf('weibo_plugin_advisory_gate "$BUILT_RELEASE"')
     const maintenance = body.indexOf('begin_planned_maintenance deploy')
-    const weiboClose = body.indexOf('weibo_plugin_close_gate "$BUILT_RELEASE"')
-    const weiboClassify = body.indexOf('weibo_plugin_classify_previous_release')
+    const weiboPre = body.indexOf('weibo_plugin_pre_activation_bracket "$BUILT_RELEASE"')
     const activation = body.indexOf('activate_release "$BUILT_RELEASE"')
     const fullSmoke = body.indexOf('smoke "$ACTIVE_PORT"')
     const kpSeed = body.indexOf('knowledge_planet_plugin_seed "$BUILT_RELEASE"')
@@ -1458,20 +1457,18 @@ describe('v5 release safety lanes', () => {
     const weiboFinishAfterKp = body.indexOf('weibo_plugin_finish_or_seed "$BUILT_RELEASE"', kpSeed)
     assert.ok(built >= 0 && kpAdvisory > built && weiboAdvisory > kpAdvisory && maintenance > weiboAdvisory)
     assert.ok(
-      weiboClose > maintenance &&
-        weiboClassify > weiboClose &&
-        activation > weiboClassify &&
+      weiboPre > maintenance &&
+        activation > weiboPre &&
         fullSmoke > activation &&
         weiboFinishZeroTouch > fullSmoke &&
         weiboFinishZeroTouch < kpSeed &&
         weiboFinishAfterKp > kpSeed,
     )
     assert.match(source, /advisory == "weibo"/)
-    assert.match(source, /seed-weibo-plugin\.ts --advisory-status/)
-    assert.match(
-      source,
-      /seed-weibo-plugin\.ts --smoke-only[\s\S]*seed-weibo-plugin\.ts --seed-only/,
-    )
+    assert.match(source, /\.decision == "noop" or \.decision == "promote" or \.decision == "unverified"/)
+    assert.match(source, /weibo_plugin_pre_activation_bracket/)
+    assert.doesNotMatch(source, /weibo_candidate_commit/)
+    assert.doesNotMatch(source, /weibo_plugin_smoke_gate/)
     assert.match(
       source,
       /deploy_dist\(\)[\s\S]*weibo_plugin_assert_release_compatible[\s\S]*activate_runtime_tuple/,
@@ -1485,35 +1482,109 @@ describe('v5 release safety lanes', () => {
       /finalize\(\)[\s\S]*weibo_plugin_assert_release_compatible[\s\S]*finalize_run_steps/,
     )
     assert.match(seedSource, /--verify-and-upgrade-user=/)
-    assert.match(seedSource, /--advisory-status/)
-    assert.match(seedSource, /--seed-only/)
-    assert.match(seedSource, /--smoke-only/)
-    assert.match(seedSource, /--close-listing-gate/)
-    assert.match(seedSource, /--classify-current-for-release=/)
-    assert.match(seedSource, /--open-listing-gate-current/)
-    assert.match(seedSource, /zero-touch seed: reopening gate to current approved version/)
-    assert.match(seedSource, /async function openListingGateToCurrent/)
-    assert.match(seedSource, /findApprovedWeiboPluginForDeploy/)
-    assert.match(seedSource, /process\.exit\(1\)/)
-    assert.doesNotMatch(seedSource, /smoke skipped/)
-    const smokeOnly = seedSource.slice(
-      seedSource.indexOf('async function smokeOnly()'),
-      seedSource.indexOf('async function seedOnly()'),
-    )
-    assert.doesNotMatch(smokeOnly, /startLogin|exactImageSmoke|qrSmoke/)
-    const seedOnly = seedSource.slice(
-      seedSource.indexOf('async function seedOnly()'),
-      seedSource.indexOf('interface TargetReleaseContract'),
-    )
-    assert.doesNotMatch(seedOnly, /--verify-and-upgrade-user=\d|loadVerifiedState|exactImageSmoke/)
-    assert.match(seedOnly, /seedWeiboPlugin/)
+    assert.match(seedSource, /classifyWeiboDeployDecision/)
+    assert.match(seedSource, /decision === 'noop'/)
+    assert.match(seedSource, /refuse unattended seed/)
     assert.doesNotMatch(body, /weibo_plugin_verify_user/)
     assert.doesNotMatch(source, /--verify-weibo-user/)
     const dry = run(deploy, ['--dry-run'])
     assert.equal(dry.status, 0, dry.stdout + dry.stderr)
     assert.match(dry.stdout, /Weibo Plugin:advisory status/)
-    assert.match(dry.stdout, /close Weibo listing execution gate/)
-    assert.match(dry.stdout, /official Weibo seed\/migration/)
+    assert.match(dry.stdout, /live pin classify skipped/)
+    assert.match(dry.stdout, /未审批候选拒绝晋升,跳过 close\/classify\/seed/)
+    assert.doesNotMatch(dry.stdout, /close Weibo listing execution gate/)
+    assert.doesNotMatch(dry.stdout, /官方 listing seed\/transition──/)
+  })
+
+  test('Weibo deploy state machine no-ops, rejects unverified, and fail-closes promote', () => {
+    const harness = [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
+      'calls=()',
+      'require_mutation_lease_for_compensation() { calls+=("lease:$1"); return 0; }',
+      'mark_deploy_recovery_required() { calls+=("recover:$1"); }',
+      'weibo_plugin_close_gate() { calls+=("close:$1"); WEIBO_GATE_VERSION_ID=77; }',
+      'weibo_plugin_classify_previous_release() { calls+=("classify:$1:$2:$3"); WEIBO_PREVIOUS_RELEASE_AVAILABLE=1; }',
+      'weibo_plugin_open_gate_current() { calls+=("open-current:$1"); }',
+      'weibo_plugin_open_gate_to_release() { calls+=("open-release:$1:$2"); }',
+      'weibo_plugin_transition_to_release() { calls+=("transition:$1:$2"); }',
+      'weibo_plugin_seed() { calls+=("seed:$1"); }',
+      'knowledge_planet_compensate_deploy() { calls+=("kp-compensate:$*"); }',
+      'knowledge_planet_compensate_setup_first() { calls+=("kp-setup-compensate:$*"); }',
+      'end_planned_maintenance() { calls+=("end-maint"); }',
+      'WB_PIN_ALIGNED=1; WB_PLUGIN_PROMOTE=0',
+      'weibo_plugin_pre_activation_bracket new-release old-release',
+      'test "$WEIBO_DEPLOY_BRACKET" = 0',
+      'weibo_plugin_finish_or_seed new-release old-release 0 0 "" "$WEIBO_DEPLOY_BRACKET" 0 1',
+      'printf "noop:%s\\n" "${calls[*]-}"',
+      'calls=()',
+      'WB_PIN_ALIGNED=0; WB_PLUGIN_PROMOTE=0',
+      'weibo_plugin_pre_activation_bracket new-release old-release',
+      'test "$WEIBO_DEPLOY_BRACKET" = 0',
+      'weibo_plugin_finish_or_seed new-release old-release 0 0 "" "$WEIBO_DEPLOY_BRACKET" 0 1',
+      'printf "unverified:%s\\n" "${calls[*]-}"',
+      'calls=()',
+      'WB_PIN_ALIGNED=0; WB_PLUGIN_PROMOTE=1',
+      'weibo_plugin_close_gate() { calls+=("close:$1"); return 1; }',
+      'set +e',
+      'weibo_plugin_pre_activation_bracket new-release old-release',
+      'close_rc=$?',
+      'set -e',
+      'test "$close_rc" = 1',
+      'printf "close-fail:%s\\n" "${calls[*]}"',
+      'calls=()',
+      'weibo_plugin_close_gate() { calls+=("close:$1"); WEIBO_GATE_VERSION_ID=77; }',
+      'weibo_plugin_classify_previous_release() { calls+=("classify:$1:$2:$3"); return 1; }',
+      'set +e',
+      'weibo_plugin_pre_activation_bracket new-release old-release',
+      'classify_rc=$?',
+      'set -e',
+      'test "$classify_rc" = 1',
+      'printf "classify-fail:%s\\n" "${calls[*]}"',
+      'calls=()',
+      'weibo_plugin_classify_previous_release() { calls+=("classify:$1:$2:$3"); WEIBO_PREVIOUS_RELEASE_AVAILABLE=1; }',
+      'weibo_plugin_pre_activation_bracket new-release old-release',
+      'test "$WEIBO_DEPLOY_BRACKET" = 1',
+      'weibo_plugin_seed() { calls+=("seed:$1"); return 1; }',
+      'set +e',
+      'weibo_plugin_finish_or_seed new-release old-release 0 0 "" 1 1 1',
+      'seed_rc=$?',
+      'set -e',
+      'test "$seed_rc" != 0',
+      'printf "seed-fail:%s\\n" "${calls[*]}"',
+      'calls=()',
+      'weibo_plugin_seed() { calls+=("seed:$1"); return 1; }',
+      'set +e',
+      'weibo_plugin_finish_or_seed new-release old-release 0 0 "" 1 1 1 1606',
+      'setup_rc=$?',
+      'set -e',
+      'test "$setup_rc" != 0',
+      'printf "setup-first-seed-fail:%s\\n" "${calls[*]}"',
+      'calls=()',
+      'weibo_compensate_deploy new-release old-release 0 0 "" 1',
+      'printf "compensate:%s\\n" "${calls[*]}"',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.equal(result.status, 0, result.stdout + result.stderr)
+    assert.match(result.stdout, /^noop:$/m)
+    assert.match(result.stdout, /^unverified:$/m)
+    assert.match(result.stdout, /close-fail:close:new-release lease:weibo-close-gate-recovery open-current:new-release/)
+    assert.match(result.stdout, /classify-fail:close:new-release classify:new-release:old-release:77 lease:weibo-classify-recovery/)
+    assert.match(result.stdout, /seed-fail:.*seed:new-release lease:weibo-seed-compensation/)
+    assert.match(result.stdout, /seed-fail:.*kp-compensate:/)
+    assert.doesNotMatch(result.stdout.split('seed-fail:')[1]?.split('\n')[0] ?? '', /kp-setup-compensate/)
+    assert.match(result.stdout, /setup-first-seed-fail:.*kp-setup-compensate:/)
+    assert.doesNotMatch(
+      result.stdout.split('setup-first-seed-fail:')[1]?.split('\n')[0] ?? '',
+      /kp-compensate:/,
+    )
+    assert.match(result.stdout, /compensate:lease:weibo-deploy-compensation close:new-release transition:new-release:old-release open-release:new-release:old-release/)
   })
 
   test('Knowledge Planet setup-first deploy is race-guarded, repeat-safe, and skips the v1.1 seed', async () => {

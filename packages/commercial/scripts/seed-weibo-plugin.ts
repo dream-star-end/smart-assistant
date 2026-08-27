@@ -20,6 +20,7 @@ import { query } from '../src/db/queries.js'
 import { installApprovedVersion } from '../src/marketplace/marketplaceDb.js'
 import {
   assertWeiboUpgradeVerificationScope,
+  classifyWeiboDeployDecision,
   findApprovedWeiboPluginForDeploy,
   seedWeiboPlugin,
 } from '../src/marketplace/seedWeiboPlugin.js'
@@ -436,19 +437,90 @@ async function smokeOnly(): Promise<void> {
   )
 }
 
+async function readWeiboListingPin(): Promise<{
+  listingState: string | null
+  listingVersion: string | null
+  listingArtifactHash: string | null
+  listingExecHash: string | null
+}> {
+  const current = await query<{
+    listing_state: string
+    version: string
+    artifact_hash: string
+    exec_contract_hash: string
+  }>(
+    `SELECT l.state AS listing_state, v.version, v.artifact_hash,
+            encode(v.exec_contract_hash, 'hex') AS exec_contract_hash
+       FROM marketplace_skill_listings l
+       JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
+      WHERE l.slug = $1 AND l.kind = 'connector' AND l.plugin_type = 'managed-browser'
+        AND v.status = 'approved' AND v.exec_revoked_at IS NULL`,
+    [WEIBO_PLUGIN_CONTRACT.id],
+  )
+  const row = current.rows[0]
+  return {
+    listingState: row?.listing_state ?? null,
+    listingVersion: row?.version ?? null,
+    listingArtifactHash: row?.artifact_hash ?? null,
+    listingExecHash: row?.exec_contract_hash ?? null,
+  }
+}
+
+async function weiboDeployDecisionFromDb(): Promise<{
+  decision: ReturnType<typeof classifyWeiboDeployDecision>
+  approvedForDeploy: boolean
+  artifactMatchesCurrentApproved: boolean
+  listingState: string | null
+  listingVersion: string | null
+}> {
+  const pin = await readWeiboListingPin()
+  const artifactMatchesCurrentApproved =
+    pin.listingArtifactHash !== null &&
+    pin.listingArtifactHash === COMPILED_WEIBO_PLUGIN.artifactHash
+  const approvedForDeploy =
+    artifactMatchesCurrentApproved &&
+    (await findApprovedWeiboPluginForDeploy(process.env)) !== null
+  const decision = classifyWeiboDeployDecision({
+    listingState: pin.listingState,
+    listingVersion: pin.listingVersion,
+    listingArtifactHash: pin.listingArtifactHash,
+    listingExecHash: pin.listingExecHash,
+    compiledVersion: WEIBO_PLUGIN_CONTRACT.version,
+    compiledArtifactHash: COMPILED_WEIBO_PLUGIN.artifactHash,
+    compiledExecHash: COMPILED_WEIBO_PLUGIN.execContractHash,
+    approvedForDeploy,
+  })
+  return {
+    decision,
+    approvedForDeploy,
+    artifactMatchesCurrentApproved,
+    listingState: pin.listingState,
+    listingVersion: pin.listingVersion,
+  }
+}
+
 async function seedOnly(): Promise<void> {
+  const classified = await weiboDeployDecisionFromDb()
+  if (classified.decision === 'noop') {
+    process.stdout.write(
+      `${JSON.stringify({
+        noop: true,
+        decision: 'noop',
+        published: false,
+        migratedPluginInstalls: 0,
+        migratedPluginAccounts: 0,
+        currentVersion: classified.listingVersion,
+      })}\n`,
+    )
+    return
+  }
   const imageId = exactImageId()
   const docker = dockerClient()
   await inspectExactImage(docker, imageId)
-  const alreadyApproved = (await findApprovedWeiboPluginForDeploy(process.env)) !== null
-  if (!alreadyApproved) {
-    // 与知识星球同构:未审批候选不阻断平台部署。零接触收尾只重开 listing
-    // 当前已审批版本,不做版本迁移/账号绑定。候选晋升走 --verify-and-upgrade-user。
-    process.stderr.write(
-      'Weibo candidate is not approved; zero-touch seed: reopening gate to current approved version.\n',
+  if (classified.decision === 'unverified') {
+    throw new Error(
+      'new Weibo candidate is not approved; refuse unattended seed. run packages/commercial/scripts/seed-weibo-plugin.ts --verify-and-upgrade-user=<id>',
     )
-    await openListingGateToCurrent()
-    return
   }
   const redis = await leaseRedis()
   try {
@@ -457,7 +529,7 @@ async function seedOnly(): Promise<void> {
       env: process.env,
       leaseRedis: redis,
     })
-    process.stdout.write(`${JSON.stringify({ ...result, accountBind: null })}\n`)
+    process.stdout.write(`${JSON.stringify({ ...result, accountBind: null, decision: 'promote' })}\n`)
   } finally {
     await redis.quit().catch(() => redis.disconnect())
   }
@@ -683,27 +755,16 @@ async function advisoryStatus(): Promise<void> {
   const docker = dockerClient()
   const imageId = exactImageId()
   await inspectExactImage(docker, imageId)
-  const current = await query<{ artifact_hash: string }>(
-    `SELECT v.artifact_hash
-       FROM marketplace_skill_listings l
-       JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
-      WHERE l.slug = $1 AND l.kind = 'connector' AND l.plugin_type = 'managed-browser'
-        AND v.status = 'approved' AND v.exec_revoked_at IS NULL`,
-    [WEIBO_PLUGIN_CONTRACT.id],
-  )
-  const currentApprovedArtifactHash = current.rows[0]?.artifact_hash ?? null
-  const artifactMatchesCurrentApproved =
-    currentApprovedArtifactHash !== null &&
-    currentApprovedArtifactHash === COMPILED_WEIBO_PLUGIN.artifactHash
-  const approvedForDeploy =
-    artifactMatchesCurrentApproved &&
-    (await findApprovedWeiboPluginForDeploy(process.env)) !== null
+  const classified = await weiboDeployDecisionFromDb()
   process.stdout.write(
     `${JSON.stringify({
       advisory: 'weibo',
-      approvedForDeploy,
+      approvedForDeploy: classified.approvedForDeploy,
       handoffPresent: false,
-      artifactMatchesCurrentApproved,
+      artifactMatchesCurrentApproved: classified.artifactMatchesCurrentApproved,
+      pinAligned: classified.decision === 'noop',
+      decision: classified.decision,
+      listingState: classified.listingState,
     })}\n`,
   )
 }
