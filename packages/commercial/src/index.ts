@@ -449,6 +449,7 @@ import {
 } from "./db/pgSessionsBackend.js";
 import { persistGatewayLiveFrame } from "./db/liveTurnFrames.js";
 import { makeContainerDispatchClient } from "./dispatch/containerDispatchClient.js";
+import { makeEnginePreheatClient } from "./dispatch/enginePreheatClient.js";
 import {
   resolveDispatchStuckThresholdMs,
   startTurnDispatchReconciler,
@@ -863,6 +864,16 @@ export interface RegisterCommercialResult {
   ensureContainerReady?: (
     uid: bigint,
   ) => Promise<{ ok: true } | { ok: false; retryAfterSec: number; reason: string }>;
+  /**
+   * GET /api/sessions/:id 时 master 把引擎预热打到用户容器
+   * `/internal/v3/engine-preheat`。失败必须 swallow。
+   */
+  preheatUserContainer?: (args: {
+    userId: string;
+    sessionId: string;
+    agentId: string;
+    modelId?: string;
+  }) => Promise<void>;
   /**
    * 2026-05-16 hotfix — remote-host upload push hook。
    *
@@ -6432,6 +6443,38 @@ export async function registerCommercial(
             throw err;
           }
         }
+      : undefined,
+    preheatUserContainer: bridgeSecret
+      ? makeEnginePreheatClient({
+          transport: makeNodeHttpContainerTransport(),
+          bridgeSecret,
+          resolveRunningEndpoint: async (uid) => {
+            const r = await getPool().query<{
+              id: string;
+              bound_ip: string | null;
+              port: number | null;
+              host_name: string | null;
+            }>(
+              `SELECT ac.id::text AS id, host(ac.bound_ip) AS bound_ip, ac.port,
+                      ch.name AS host_name
+                 FROM agent_containers ac
+                 LEFT JOIN compute_hosts ch ON ch.id = ac.host_uuid
+                WHERE ac.user_id = $1 AND ac.state = 'active' AND ac.runtime_channel = $2
+                  AND ac.bound_ip IS NOT NULL AND ac.port IS NOT NULL
+                ORDER BY ac.updated_at DESC LIMIT 1`,
+              [uid.toString(), getRuntimeChannel()],
+            );
+            const row = r.rows[0];
+            if (!row || !row.bound_ip || row.port === null) return null;
+            const isRemoteHost = row.host_name !== null && row.host_name !== "self";
+            return {
+              host: row.bound_ip,
+              port: Number(row.port),
+              containerId: Number(row.id),
+              ...(isRemoteHost ? { tunnel: { kind: "remote-host" as const } } : {}),
+            };
+          },
+        })
       : undefined,
     // remote-host media push hook(2026-05-16 hotfix):用户容器调度到 remote
     // compute host 时,master 收到 /api/uploads → 本地暂存 → 调本 hook 把字节
