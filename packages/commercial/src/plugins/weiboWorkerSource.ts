@@ -3,13 +3,12 @@
  * and no challenge bypass. Writes stay behind the dispatch fence.
  *
  * Short text plus images: after dispatch, POST the file to picupload.weibo.com
- * straight from the weibo.com page (the endpoint answers CORS preflight and the
- * pid is readable cross-origin), then POST /ajax/statuses/update from weibo.com
- * with a single x-xsrf-token header from context.cookies. A picupload tab is
- * useless here: it JS-redirects back to weibo.com and kills the execution
- * context mid-upload. A live cookie-path miss throws media-upload instead of
- * opening the native OS chooser. Harness tests still fall through to DOM when
- * the cookie helper is stubbed without a via.
+ * from the weibo.com page (multipart pic1 first — a CORS simple request — then
+ * the raw-blob paths), then POST /ajax/statuses/update with a single
+ * x-xsrf-token header from context.cookies. A picupload tab JS-redirects back
+ * to weibo.com and kills the execution context mid-upload. A cookie-path miss
+ * with no publish attempt falls through to the DOM filechooser; an attempted
+ * ajax/update still fail-closes without opening the native OS chooser.
  */
 export const WEIBO_WORKER_SOURCE = String.raw`
 import { createHash } from 'node:crypto';
@@ -1194,8 +1193,15 @@ async function publishComposerViaCookieApi(page, text, files, selfId) {
       const pidOf = (parsed) => {
         if (!parsed || typeof parsed !== 'object') return '';
         const pic = parsed.pic && typeof parsed.pic === 'object' ? parsed.pic : null;
-        const pic1 = parsed.data && parsed.data.pics && parsed.data.pics.pic_1 ? parsed.data.pics.pic_1 : null;
-        const pid = String(parsed.pic_id || parsed.picid || parsed.pid || (pic && pic.pid) || (pic1 && pic1.pid) || '');
+        const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : null;
+        const pic1 = data && data.pics && data.pics.pic_1 ? data.pics.pic_1 : null;
+        const pid = String(
+          parsed.pic_id || parsed.picid || parsed.pid ||
+          (pic && (pic.pid || pic.pic_id)) ||
+          (pic1 && (pic1.pid || pic1.pic_id)) ||
+          (data && (data.pic_id || data.picid || data.pid)) ||
+          ''
+        );
         return /^[A-Za-z0-9._-]{8,128}$/.test(pid) ? pid : '';
       };
       const pids = [];
@@ -1208,6 +1214,13 @@ async function publishComposerViaCookieApi(page, text, files, selfId) {
       for (const file of input.files) {
         const blob = new Blob([bytesOf(file)], { type: file.mimeType });
         let pid = '';
+        try {
+          const form = new FormData();
+          form.append('pic1', blob, file.name);
+          const posted = await fetch('https://picupload.weibo.com/interface/pic_upload.php?app=miniblog&s=json&data=1', { method: 'POST', credentials: 'include', body: form });
+          status = posted.status;
+          pid = pidOf(parseJson(await posted.text()));
+        } catch {}
         for (const path of paths) {
           if (pid) break;
           try {
@@ -2016,7 +2029,6 @@ async function writeAction(page, input) {
               throw new Error('result');
             }
             if (attempted) throw new Error('result');
-            if (api && typeof api.via === 'string' && api.via) throw new Error('media-upload');
           } catch (error) {
             if (String(error && error.message) === 'result' || String(error && error.message) === 'media-upload') throw error;
             emitStep({ step: 'media.api', ok: false, attempted: false, via: 'error', pids: 0, status: 0, mediaCount: manifest.length });

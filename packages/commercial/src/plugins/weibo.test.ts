@@ -198,7 +198,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.36')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.37')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -206,6 +206,11 @@ describe('official Weibo Plugin', () => {
         version: '1.6.14',
         artifactHash: 'add60919dfd77461526ae543be1d17d70b6ab866bfff6a4bc988eacf8d1631e4',
         execContractHash: 'fb30fd3d06fa10b3ffff9eb2b25dd644ee2a9454f8c12fd55bd7d05b2188359c',
+      },
+      {
+        version: '1.6.36',
+        artifactHash: '43b41699741b1c67be3216bb15e48944a27a73677bd75c112a88519f1a0c818e',
+        execContractHash: '0f333585cd72292cc9a6eb291df3e2a5122eb5c547c9ed4c03518a64fec756fe',
       },
     ])
     assert.equal(
@@ -218,6 +223,10 @@ describe('official Weibo Plugin', () => {
     )
     assert.equal(
       classifyWeiboSetupPin(WEIBO_SETUP_COMPATIBLE_PREDECESSORS[0]),
+      'compatible-predecessor',
+    )
+    assert.equal(
+      classifyWeiboSetupPin(WEIBO_SETUP_COMPATIBLE_PREDECESSORS[1]),
       'compatible-predecessor',
     )
     assert.equal(
@@ -334,6 +343,9 @@ describe('official Weibo Plugin', () => {
     assert.ok(WEIBO_LOGIN_ORIGINS.includes('https://v2.qr.weibo.cn:443'))
     assert.ok(
       WEIBO_PLUGIN_CONTRACT.runtime.accountState.cookieDomains.includes('login.sina.com.cn'),
+    )
+    assert.ok(
+      WEIBO_PLUGIN_CONTRACT.runtime.accountState.cookieDomains.includes('picupload.weibo.com'),
     )
     const state = validateWeiboAccountState({
       cookies: [
@@ -528,7 +540,13 @@ describe('official Weibo Plugin', () => {
       'exactly one xsrf header: case-variant duplicates merge into an invalid token',
     )
     assert.doesNotMatch(WEIBO_WORKER_SOURCE, /X-XSRF-TOKEN'\] = xsrf/)
-    assert.match(createPostSource, /api\.via === 'string' && api.via/)
+    assert.doesNotMatch(
+      createPostSource,
+      /api\.via === 'string' && api.via\) throw new Error\('media-upload'\)/,
+      'picupload miss with no publish attempt must fall through to DOM',
+    )
+    assert.match(WEIBO_WORKER_SOURCE, /form.append\('pic1'/)
+    assert.match(WEIBO_WORKER_SOURCE, /data.pic_id || data.picid || data.pid/)
     assert.match(WEIBO_WORKER_SOURCE, /ajax\/statuses\/update/)
     assert.match(WEIBO_WORKER_SOURCE, /api\/statuses\/uploadPic/)
     assert.match(WEIBO_WORKER_SOURCE, /api\/statuses\/update/)
@@ -1042,46 +1060,80 @@ describe('official Weibo Plugin', () => {
     assert.equal(events.filter((event) => event === 'click').length, 0)
   })
 
-  test('create_post with media skips the native chooser after a live cookie-path miss', async () => {
+  test('create_post with media falls through to DOM after a live cookie-path miss', async () => {
     const events: string[] = []
-    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const textarea = {
+      fill: async () => {},
+      inputValue: async () => (events.includes('click') ? '' : 'hello'),
+    }
+    const fileInput = {
+      setInputFiles: async () => events.push('upload'),
+      evaluate: async (
+        fn: (node: { isConnected: boolean; files: { length: number } }) => unknown,
+      ) => fn({ isConnected: true, files: { length: events.includes('upload') ? 1 : 0 } }),
+      getAttribute: async () => 'image/*',
+    }
     const send = {
       isDisabled: async () => false,
       click: async (options: { trial?: boolean }) => {
-        events.push(options.trial ? 'trial' : 'click')
+        if (!options.trial) events.push('click')
       },
     }
     const harness = compileWorkerPostHarness({
       ensureSelfId: async () => '12345',
       gotoAuthenticated: async () => {},
-      collectPosts: async () => [],
+      collectPosts: async () =>
+        events.includes('upload') ? [{ id: 'dom-fallback', owned: true, text: 'hello' }] : [],
       uniqueVisible: async () => textarea,
       assertNoChallenge: async () => {},
       awaitDispatch: async () => events.push('dispatch'),
-      exactMenuItem: async (_page: unknown, text: string) =>
-        text === '图片' ? { click: async () => events.push('image-click') } : send,
+      exactMenuItem: async (_page: unknown, text: string) => {
+        if (text === '图片') {
+          return {
+            click: async (options?: { trial?: boolean }) => {
+              if (!options?.trial) events.push('image-click')
+            },
+          }
+        }
+        if (text === '发送') return send
+        return null
+      },
       publishComposerViaCookieApi: async () => {
         events.push('api')
-        return { published: false, attempted: false, via: 'picupload-origin', pids: [], status: 0 }
+        return {
+          published: false,
+          attempted: false,
+          via: 'picupload-origin',
+          pids: [],
+          status: 200,
+        }
       },
       cleanText: (value: unknown) => String(value).trim(),
       readFile: async () => Buffer.from('image'),
     })
-    await assert.rejects(
-      harness.writeAction(
-        { locator: () => ({}), waitForTimeout: async () => {} },
-        {
-          actionId: 'create_post',
-          params: {
-            text: 'hello',
-            mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
-          },
-        },
-      ),
-      /media-upload/,
-    )
+    const page = {
+      locator: (selector: string) => {
+        if (selector === 'input[type="file"]') return { count: async () => 1, nth: () => fileInput }
+        if (selector === 'img') return uploadedImageLocator(events)
+        return {}
+      },
+      waitForEvent: async () => {
+        events.push('filechooser')
+        throw new Error('filechooser should not open')
+      },
+      waitForTimeout: async () => {},
+    }
+    const result = await harness.writeAction(page, {
+      actionId: 'create_post',
+      params: {
+        text: 'hello',
+        mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+      },
+    })
+    assert.deepEqual(result, { post: { id: 'dom-fallback', owned: true, text: 'hello' } })
     assert.ok(events.indexOf('dispatch') < events.indexOf('api'))
-    assert.equal(events.includes('image-click'), false)
+    assert.ok(events.indexOf('api') < events.indexOf('upload'))
+    assert.ok(events.includes('click'))
   })
 
   test('create_post does not dispatch a page-level file input outside composer scope', async () => {
