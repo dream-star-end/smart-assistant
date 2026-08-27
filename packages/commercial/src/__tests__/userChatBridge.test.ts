@@ -40,6 +40,7 @@ import {
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
 import {
+  appendScanSciPaperIntentHintToFrame,
   detectScanSciPaperIntent,
   SCANSCI_PAPER_HINT_MARKER,
 } from "../ws/paperIntentHint.js";
@@ -289,6 +290,25 @@ describe("detectScanSciPaperIntent", () => {
   test("does not trigger generic non-paper PDF/chat text", () => {
     assert.equal(detectScanSciPaperIntent("晚上吃什么？"), null);
     assert.equal(detectScanSciPaperIntent("帮我把这个 PDF 转成 Word"), null);
+  });
+
+  test("appendScanSciPaperIntentHintToFrame keeps displayText as user original", () => {
+    const next = appendScanSciPaperIntentHintToFrame({
+      content: { text: "10.1038/nature12373" },
+    });
+    const content = next.content as { text?: string; displayText?: string };
+    assert.equal(content.displayText, "10.1038/nature12373");
+    assert.equal((content.displayText ?? "").includes(SCANSCI_PAPER_HINT_MARKER), false);
+    assert.ok((content.text ?? "").startsWith("10.1038/nature12373"));
+    assert.ok((content.text ?? "").includes(SCANSCI_PAPER_HINT_MARKER));
+
+    const withDisplay = appendScanSciPaperIntentHintToFrame({
+      content: { text: "10.1038/nature12373\n[attachment text]", displayText: "10.1038/nature12373" },
+    });
+    const kept = withDisplay.content as { text?: string; displayText?: string };
+    assert.equal(kept.displayText, "10.1038/nature12373");
+    assert.ok((kept.text ?? "").includes(SCANSCI_PAPER_HINT_MARKER));
+    assert.ok((kept.text ?? "").includes("[attachment text]"));
   });
 });
 
@@ -1891,7 +1911,13 @@ describe("userChatBridge — model authorization", () => {
   });
 
   test("paper DOI inbound.message gets hidden ScanSci hint only in forwarded frame", async () => {
-    const rig = await startRig();
+    const persisted: Array<{ text?: string; _modelText?: string }> = [];
+    const rig = await startRig({
+      persistMasterUserMessage: async (_uid, _sessionId, message) => {
+        persisted.push({ text: message.text, _modelText: message._modelText });
+        return { applied: true };
+      },
+    });
     try {
       const containerOpenP = waitNextContainerSocket(rig);
       const token = await makeJwt("205");
@@ -1908,15 +1934,24 @@ describe("userChatBridge — model authorization", () => {
         type: "inbound.message",
         channel: "webchat",
         peer: { id: "sess-paper", kind: "dm" },
+        clientMessageId: "m-paper-doi",
         content: { text: "10.1038/nature12373" },
       }));
       const got = await seenP;
       const forwarded = JSON.parse(
         typeof got === "string" ? got : got.toString("utf8"),
-      ) as { content?: { text?: string }; traceId?: string };
+      ) as { content?: { text?: string; displayText?: string }; traceId?: string };
       assert.match(forwarded.traceId ?? "", /^[a-f0-9]{32}$/);
       assert.ok(forwarded.content?.text?.startsWith("10.1038/nature12373"));
       assert.ok((forwarded.content?.text ?? "").includes(SCANSCI_PAPER_HINT_MARKER));
+      // Forwarded text body must still carry the hint (requestHash input).
+      // Persist displayText stays the user original.
+      assert.equal(persisted.length, 1);
+      assert.equal(persisted[0]?.text, "10.1038/nature12373");
+      assert.equal((persisted[0]?.text ?? "").includes(SCANSCI_PAPER_HINT_MARKER), false);
+      assert.ok((persisted[0]?._modelText ?? "").includes(SCANSCI_PAPER_HINT_MARKER));
+      assert.equal(forwarded.content?.displayText, "10.1038/nature12373");
+      assert.equal((forwarded.content?.displayText ?? "").includes(SCANSCI_PAPER_HINT_MARKER), false);
       // 文献检索/引用权威已迁到 oc-* 研究 CLI:hint 必须指向 oc-lit/oc-cite,而非
       // 已退役的 scansci-pdf CLI(当前镜像 server-only,无 search/download 子命令——
       // 旧 hint 引导 `scansci-pdf search` 会让 agent 每次先必失败再回落)。

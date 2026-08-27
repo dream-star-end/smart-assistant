@@ -2570,6 +2570,21 @@ await check("T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工
   });
 });
 
+await check("T50 persist 后用户气泡只显示原文，不含论文任务系统提示", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runPaperHintUserBubble());
+  if (result.text !== "CRISPR 论文") {
+    throw new Error(`用户行 text 不是原文:${JSON.stringify(result)}`);
+  }
+  if (!result.modelText || !result.modelText.includes("【OpenClaude 论文任务系统提示】")) {
+    throw new Error(`_modelText 未保留论文提示:${JSON.stringify(result)}`);
+  }
+  await replayRoot.getByText("CRISPR 论文", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  const leaked = await replayRoot.getByText("【OpenClaude 论文任务系统提示】").count();
+  if (leaked !== 0) {
+    throw new Error(`用户气泡泄漏了论文系统提示 count=${leaked}`);
+  }
+});
+
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {
   const alive = await page.evaluate(() => ({
     root: Boolean(document.querySelector("#root")),
