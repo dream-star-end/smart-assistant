@@ -18,7 +18,9 @@ import assert from "node:assert/strict";
 import {
   IDLE_TIMEOUT_DEFAULT_MS,
   IDLE_TIMEOUT_TOOL_MS,
+  applyTurnIdleTimeoutTick,
   pickIdleTimeoutMs,
+  shouldFireTurnIdleTimeout,
   shouldTripIdleWatchdog,
 } from "../sessionManager.js";
 
@@ -68,5 +70,77 @@ describe("pickIdleTimeoutMs", () => {
       idleMs: IDLE_TIMEOUT_TOOL_MS + 1,
       thresholdMs: IDLE_TIMEOUT_TOOL_MS,
     }), true);
+  });
+});
+
+describe("shouldFireTurnIdleTimeout / applyTurnIdleTimeoutTick", () => {
+  test("等待用户回答期间不触发 30min 硬背书，并重新武装定时器", () => {
+    assert.equal(shouldFireTurnIdleTimeout({
+      waitingForUserInput: true,
+      finalized: false,
+    }), false);
+    let refreshed = 0;
+    const fire = applyTurnIdleTimeoutTick({
+      waitingForUserInput: true,
+      finalized: false,
+      refresh: () => {
+        refreshed += 1;
+      },
+    });
+    assert.equal(fire, false);
+    assert.equal(refreshed, 1);
+    // Waiting can span many 30min windows; each tick re-arms.
+    const fireAgain = applyTurnIdleTimeoutTick({
+      waitingForUserInput: true,
+      finalized: false,
+      refresh: () => {
+        refreshed += 1;
+      },
+    });
+    assert.equal(fireAgain, false);
+    assert.equal(refreshed, 2);
+  });
+
+  test("非等待且未 finalized → 触发 interrupt/免单，不 refresh", () => {
+    assert.equal(shouldFireTurnIdleTimeout({
+      waitingForUserInput: false,
+      finalized: false,
+    }), true);
+    let refreshed = 0;
+    const fire = applyTurnIdleTimeoutTick({
+      waitingForUserInput: false,
+      finalized: false,
+      refresh: () => {
+        refreshed += 1;
+      },
+    });
+    assert.equal(fire, true);
+    assert.equal(refreshed, 0);
+  });
+
+  test("finalized 不触发、不 refresh（含同时仍标 waiting）", () => {
+    assert.equal(shouldFireTurnIdleTimeout({
+      waitingForUserInput: false,
+      finalized: true,
+    }), false);
+    assert.equal(shouldFireTurnIdleTimeout({
+      waitingForUserInput: true,
+      finalized: true,
+    }), false);
+    let refreshed = 0;
+    const refresh = () => {
+      refreshed += 1;
+    };
+    assert.equal(applyTurnIdleTimeoutTick({
+      waitingForUserInput: false,
+      finalized: true,
+      refresh,
+    }), false);
+    assert.equal(applyTurnIdleTimeoutTick({
+      waitingForUserInput: true,
+      finalized: true,
+      refresh,
+    }), false);
+    assert.equal(refreshed, 0);
   });
 });
