@@ -83,6 +83,21 @@ describe("parseContainerToken", () => {
     );
   });
 
+  test("拒 oc-dv.* 设备凭证前缀(不得当容器 token)", () => {
+    const sec = "a".repeat(64);
+    assert.throws(
+      () => parseContainerToken(`oc-dv.aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.${sec}`),
+      (e: unknown) =>
+        e instanceof ContainerIdentityError &&
+        e.code === "BAD_TOKEN_FORMAT" &&
+        /oc-dv/.test((e as ContainerIdentityError).message),
+    );
+    assert.throws(
+      () => parseContainerToken(`Bearer oc-dv.x.${sec}`),
+      (e: unknown) => e instanceof ContainerIdentityError && e.code === "BAD_TOKEN_FORMAT",
+    );
+  });
+
   test("非数字 container id", () => {
     assert.throws(
       () => parseContainerToken(`oc-v3.abc.${"0".repeat(64)}`),

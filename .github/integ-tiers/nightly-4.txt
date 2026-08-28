@@ -50,3 +50,4 @@ packages/commercial/src/__tests__/migration0247CursorOpus48.integ.test.ts
 packages/commercial/src/__tests__/migration0251.integ.test.ts
 packages/commercial/src/__tests__/migration0253.integ.test.ts
 packages/commercial/src/__tests__/migration0254.integ.test.ts
+packages/commercial/src/__tests__/runtimeKindIsolation.integ.test.ts
