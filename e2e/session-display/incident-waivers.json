@@ -212,6 +212,18 @@
       "reason": "selfhost-proven port follow-up: first unified-timeline adoption must not keep predecessor team cache stamped by adjacent user id. Task B 2026-08-28, do not deploy.",
       "approvedBy": "dx 2026-08-28 任务B：selfhost 共享修复正向搬运到商业 canonical（只合代码不发布）",
       "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "11340da6d",
+      "reason": "selfhost-proven port of cron heartbeat skip-webchat + HEARTBEAT_OK last-line silent. OCV5-11 boss-approved semantics; no commercial production incident id. Do not deploy.",
+      "approvedBy": "dx 2026-08-28 OCV5-11: selfhost f5947b198+17103fc0c 正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "2bfe33b47",
+      "reason": "selfhost-proven port follow-up: HEARTBEAT_OK relaxed last-line/suffix match is heartbeat-only; non-heartbeat keeps exact trimmed match. OCV5-11 boss-approved. Do not deploy.",
+      "approvedBy": "dx 2026-08-28 OCV5-11: selfhost f5947b198+17103fc0c 正向搬运到商业 canonical（只合代码不发布）",
+      "expiresAt": "2026-09-28"
     }
   ]
 }

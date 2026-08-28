@@ -28,6 +28,8 @@
 //
 // Job output: run_id + timestamp written to ~/.openclaude/cron/outputs/<id>-<ts>.md.
 // If the agent's final text starts with [SILENT], output is archived but not delivered.
+// HEARTBEAT_OK: exact trimmed match is silent for all jobs (baseline).
+// Relaxed last-line/suffix + 200-char match is heartbeat-only (OCV5-11).
 
 import {
   appendFileSync,
@@ -468,6 +470,42 @@ export function isUserInitiatedCronJob(job: Pick<CronJob, 'id' | 'heartbeat'>): 
   if (id === 'daily-reflection' || id === 'weekly-curation' || id === 'skill-check') return false
   if (id.includes('reflection') || id.includes('skill')) return false
   return true
+}
+
+/** Max trimmed length for HEARTBEAT_OK silence (OCV5-11). Longer reports that
+ *  happen to end with OK must still be delivered. */
+export const HEARTBEAT_OK_SILENT_MAX_CHARS = 200
+
+/**
+ * Silent cron output: archived but not delivered.
+ * - `[SILENT]` prefix (all jobs, unchanged)
+ * - HEARTBEAT_OK exact trimmed match (all jobs, baseline)
+ * - Relaxed last-line / token-boundary suffix + ≤200 chars: **heartbeat only**.
+ *   Non-heartbeat jobs must not swallow `检查已完成。HEARTBEAT_OK`.
+ */
+export function classifySilentCronOutput(
+  output: string,
+  opts?: { heartbeat?: boolean },
+): {
+  silent: boolean
+  reason?: 'silent' | 'heartbeat_ok'
+} {
+  const trimmed = output.trim()
+  if (!trimmed) return { silent: false }
+  if (trimmed.startsWith('[SILENT]')) return { silent: true, reason: 'silent' }
+  if (opts?.heartbeat === true) {
+    if (isHeartbeatOkSilent(trimmed)) return { silent: true, reason: 'heartbeat_ok' }
+  } else if (trimmed === 'HEARTBEAT_OK') {
+    return { silent: true, reason: 'heartbeat_ok' }
+  }
+  return { silent: false }
+}
+
+function isHeartbeatOkSilent(trimmed: string): boolean {
+  if (trimmed.length > HEARTBEAT_OK_SILENT_MAX_CHARS) return false
+  const lastLine = trimmed.split(/\r?\n/).pop()!.trim()
+  if (lastLine === 'HEARTBEAT_OK') return true
+  return /(?:^|[^A-Za-z0-9_])HEARTBEAT_OK$/.test(lastLine)
 }
 
 export interface CronFile {
@@ -1984,13 +2022,14 @@ export class CronScheduler {
       logger.warn(`job ${job.id} produced empty output`, { jobId: job.id })
       return { kind: 'terminal_failure', code: 'EMPTY_OUTPUT' }
     }
-    if (trimmed.startsWith('[SILENT]') || trimmed === 'HEARTBEAT_OK') {
+    const silent = classifySilentCronOutput(output, { heartbeat: job.heartbeat === true })
+    if (silent.silent) {
       if (!archivedOutputFile) return { kind: 'terminal_failure', code: 'OUTPUT_ARCHIVE_FAILED' }
       await durability.markCompleted?.(archivedOutputFile)
       await durability.markDelivered?.()
       logger.info(`job ${job.id} silent/empty, not delivering`, {
         jobId: job.id,
-        reason: trimmed.startsWith('[SILENT]') ? 'silent' : 'heartbeat_ok',
+        reason: silent.reason,
       })
       return { kind: 'silent' }
     }
