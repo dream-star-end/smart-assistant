@@ -3,7 +3,14 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import { describe, test } from "node:test";
 import { HttpError } from "../http/util.js";
-import { handleDesktopEnrollStart } from "../http/desktopEnroll.js";
+import {
+  handleDesktopEnrollConfirm,
+  handleDesktopEnrollFinish,
+  handleDesktopEnrollStart,
+  handleDesktopRevoke,
+  handleDesktopTokenMint,
+  handleDesktopTokenRefresh,
+} from "../http/desktopEnroll.js";
 import type { CommercialHttpDeps, RequestContext } from "../http/handlers.js";
 import { resetDesktopFlagCache, setDesktopSettingsLoader } from "../desktop/flags.js";
 import { rootLogger } from "../logging/logger.js";
@@ -51,6 +58,32 @@ describe("desktop enroll HTTP gates", () => {
     resetDesktopFlagCache();
   });
 
+  test("flag off → 404 on every desktop route", async () => {
+    const prev = process.env.OC_DESKTOP_VIRTUAL_CONTAINER;
+    delete process.env.OC_DESKTOP_VIRTUAL_CONTAINER;
+    resetDesktopFlagCache();
+    setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [1] }));
+    const handlers = [
+      handleDesktopEnrollStart,
+      handleDesktopEnrollConfirm,
+      handleDesktopEnrollFinish,
+      handleDesktopTokenMint,
+      handleDesktopTokenRefresh,
+      handleDesktopRevoke,
+    ];
+    for (const handler of handlers) {
+      const res = { statusCode: 0, setHeader() {}, end() {} } as unknown as ServerResponse;
+      await assert.rejects(
+        () => handler(req({}), res, ctx(), dummyDeps()),
+        (e: unknown) => e instanceof HttpError && e.status === 404,
+      );
+    }
+    if (prev === undefined) delete process.env.OC_DESKTOP_VIRTUAL_CONTAINER;
+    else process.env.OC_DESKTOP_VIRTUAL_CONTAINER = prev;
+    setDesktopSettingsLoader(null);
+    resetDesktopFlagCache();
+  });
+
   test("kill switch → 503", async () => {
     const prev = process.env.OC_DESKTOP_VIRTUAL_CONTAINER;
     const prevK = process.env.OC_DESKTOP_KIND_KILLSWITCH;
@@ -61,6 +94,26 @@ describe("desktop enroll HTTP gates", () => {
     const res = { statusCode: 0, setHeader() {}, end() {} } as unknown as ServerResponse;
     await assert.rejects(
       () => handleDesktopEnrollStart(req({}), res, ctx(), dummyDeps()),
+      (e: unknown) => e instanceof HttpError && e.status === 503 && e.code === "DESKTOP_KILLSWITCH",
+    );
+    if (prev === undefined) delete process.env.OC_DESKTOP_VIRTUAL_CONTAINER;
+    else process.env.OC_DESKTOP_VIRTUAL_CONTAINER = prev;
+    if (prevK === undefined) delete process.env.OC_DESKTOP_KIND_KILLSWITCH;
+    else process.env.OC_DESKTOP_KIND_KILLSWITCH = prevK;
+    setDesktopSettingsLoader(null);
+    resetDesktopFlagCache();
+  });
+
+  test("kill switch → 503 on token mint", async () => {
+    const prev = process.env.OC_DESKTOP_VIRTUAL_CONTAINER;
+    const prevK = process.env.OC_DESKTOP_KIND_KILLSWITCH;
+    process.env.OC_DESKTOP_VIRTUAL_CONTAINER = "1";
+    process.env.OC_DESKTOP_KIND_KILLSWITCH = "1";
+    resetDesktopFlagCache();
+    setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [1] }));
+    const res = { statusCode: 0, setHeader() {}, end() {} } as unknown as ServerResponse;
+    await assert.rejects(
+      () => handleDesktopTokenMint(req({ device_credential: "oc-dv.x" }), res, ctx(), dummyDeps()),
       (e: unknown) => e instanceof HttpError && e.status === 503 && e.code === "DESKTOP_KILLSWITCH",
     );
     if (prev === undefined) delete process.env.OC_DESKTOP_VIRTUAL_CONTAINER;

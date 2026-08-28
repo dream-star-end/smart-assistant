@@ -16,6 +16,18 @@ describe("DesktopTunnelRegistry", () => {
     assert.equal(reg.size(), 1);
   });
 
+  test("expiry timer drops the slot", async () => {
+    const reg = createMemoryDesktopTunnelRegistry();
+    let closed = 0;
+    reg.attach(3, { close: () => { closed += 1; } }, {
+      deviceId: "d3", uid: 1, expiresAt: new Date(Date.now() + 25),
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(closed, 1);
+    assert.equal(reg.get(3), undefined);
+    assert.equal(reg.size(), 0);
+  });
+
   test("drop closes handle and mint-style drop is idempotent", () => {
     const reg = createMemoryDesktopTunnelRegistry();
     let closed = 0;

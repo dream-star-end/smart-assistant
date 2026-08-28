@@ -110,6 +110,44 @@ describe("verifyDesktopIdentity", () => {
     }
   });
 
+  test("revoked device is rejected", async () => {
+    try {
+      await verifyDesktopIdentity(
+        repo({
+          device: {
+            id: deviceId,
+            user_id: 7,
+            container_id: 42,
+            tls_client_fp: fp,
+            revoked_at: new Date(),
+          },
+        }),
+        tls(),
+        `Bearer oc-v3.42.${secret}`,
+      );
+      assert.fail("expected revoked");
+    } catch (e) {
+      assert.ok(e instanceof DesktopIdentityError);
+      assert.equal(e.logCode, "DEVICE_REVOKED");
+      assert.equal(e.message, DESKTOP_IDENTITY_PUBLIC_MESSAGE);
+    }
+  });
+
+  test("missing client cert is TLS_REQUIRED", async () => {
+    try {
+      await verifyDesktopIdentity(
+        repo(),
+        { tls: true, deviceCertFp: Buffer.alloc(0), deviceSpiffe: "" },
+        `Bearer oc-v3.42.${secret}`,
+      );
+      assert.fail("expected tls required");
+    } catch (e) {
+      assert.ok(e instanceof DesktopIdentityError);
+      assert.equal(e.logCode, "TLS_REQUIRED");
+      assert.equal(e.message, DESKTOP_IDENTITY_PUBLIC_MESSAGE);
+    }
+  });
+
   test("fp mismatch 401 + token_device_mismatch audit", async () => {
     const audits: string[] = [];
     const other = randomBytes(32);

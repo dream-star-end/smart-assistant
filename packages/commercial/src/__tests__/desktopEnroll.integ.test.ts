@@ -256,10 +256,18 @@ describe("desktop enrollment integ", () => {
       deps,
     );
     assert.equal(rev.status(), 200);
+    assert.ok(drops.filter((id) => id === containerId).length >= 2);
     await assert.rejects(
       () => handleDesktopTokenMint(request({ device_credential: deviceCred }), response().res, ctx(), deps),
       (e: unknown) => e instanceof HttpError && e.status === 401,
     );
+    try {
+      await verifyDesktopIdentity(identRepo, tls, token2);
+      assert.fail("revoked identity should fail");
+    } catch (e) {
+      assert.ok(e instanceof DesktopIdentityError);
+      assert.equal(e.message, DESKTOP_IDENTITY_PUBLIC_MESSAGE);
+    }
 
     const u2 = await query<{ id: string }>(
       `INSERT INTO users(email, password_hash, role, status)
@@ -365,6 +373,79 @@ describe("desktop enrollment integ", () => {
     const conflict = results.filter((r) => r.status === "rejected" && r.reason instanceof HttpError && r.reason.code === "ENROLL_CONSUMED").length;
     assert.equal(ok, 1);
     assert.equal(conflict, 1);
+    await rm(caDir, { recursive: true, force: true });
+    setDesktopSettingsLoader(null);
+    resetDesktopFlagCache();
+  });
+
+  test("expired pending enrollment is rejected", async (t) => {
+    if (db.skipIfUnavailable(t)) return;
+    const caDir = await mkdtemp(path.join(os.tmpdir(), "oc-dca-"));
+    process.env.OPENCLAUDE_DEVICE_CA_DIR = caDir;
+    process.env.OC_DESKTOP_VIRTUAL_CONTAINER = "1";
+    process.env.OC_DESKTOP_SIM_ENROLL = "1";
+    const u = await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, role, status)
+       VALUES ($1,'x','admin','active') RETURNING id::text`,
+      [`desk-exp-${Date.now()}@t.local`],
+    );
+    const uid = Number(u.rows[0]!.id);
+    resetDesktopFlagCache();
+    setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [uid] }));
+    const verifier = generatePkceVerifier();
+    const challenge = await pkceChallengeS256(verifier);
+    const deps: CommercialHttpDeps = {
+      jwtSecret: JWT,
+      mailer: { send: async () => {} },
+      redis: memRedis(),
+    } as CommercialHttpDeps;
+    const startOut = response();
+    await handleDesktopEnrollStart(
+      request({ pkce_challenge: challenge, app_id: "chat.claudeai.clarvy", platform: "sim" }),
+      startOut.res,
+      ctx(),
+      deps,
+    );
+    const enrollmentId = String(startOut.body().enrollment_id);
+    const tok = await bearer(uid);
+    await query(`UPDATE desktop_enrollments SET expires_at = NOW() - interval '1 minute' WHERE id = $1`, [enrollmentId]);
+    await assert.rejects(
+      () =>
+        handleDesktopEnrollConfirm(
+          request({ enrollment_id: enrollmentId }, { authorization: `Bearer ${tok}` }),
+          response().res,
+          ctx(),
+          deps,
+        ),
+      (e: unknown) => e instanceof HttpError && e.status === 409,
+    );
+    const start2 = response();
+    await handleDesktopEnrollStart(
+      request({ pkce_challenge: challenge, app_id: "chat.claudeai.clarvy", platform: "sim" }),
+      start2.res,
+      ctx(),
+      deps,
+    );
+    const enrollmentId2 = String(start2.body().enrollment_id);
+    const confirm2 = response();
+    await handleDesktopEnrollConfirm(
+      request({ enrollment_id: enrollmentId2 }, { authorization: `Bearer ${tok}` }),
+      confirm2.res,
+      ctx(),
+      deps,
+    );
+    const code = String(confirm2.body().code);
+    await query(`UPDATE desktop_enrollments SET expires_at = NOW() - interval '1 minute' WHERE id = $1`, [enrollmentId2]);
+    await assert.rejects(
+      () =>
+        handleDesktopEnrollFinish(
+          request({ enrollment_id: enrollmentId2, code, pkce_verifier: verifier }),
+          response().res,
+          ctx(),
+          deps,
+        ),
+      (e: unknown) => e instanceof HttpError && (e as HttpError).status === 409 && (e as HttpError).code === "ENROLL_EXPIRED",
+    );
     await rm(caDir, { recursive: true, force: true });
     setDesktopSettingsLoader(null);
     resetDesktopFlagCache();
