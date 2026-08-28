@@ -41,6 +41,11 @@ import {
   loadTrayIcon,
   shouldHideInsteadOfClose,
 } from './desktop-tray.mjs'
+import {
+  OPENCLAUDE_PROTOCOL,
+  findOpenClaudeUrlInArgv,
+  parseOpenClaudeDeepLink,
+} from './desktop-protocol.mjs'
 import { DownloadRegistry, taskbarProgressState } from './download-registry.mjs'
 import { IPC_CHANNELS, isTrustedShellEvent, parseShellCommand } from './ipc-contract.mjs'
 import { permissionDecision } from './permission-adapter.mjs'
@@ -117,6 +122,7 @@ registerShellScheme(protocol)
 app.enableSandbox()
 app.setName(APP_NAME)
 if (process.platform === 'win32') app.setAppUserModelId(APP_ID)
+if (!smokeTest && app.isPackaged) app.setAsDefaultProtocolClient(OPENCLAUDE_PROTOCOL)
 
 let mainWindow = null
 let shellView = null
@@ -136,6 +142,7 @@ let applicationMenu = null
 let desktopSettingsStore = null
 let desktopTrayApi = null
 let isQuitting = false
+let pendingDeepLinkTarget = null
 const liveNotifications = new Set()
 
 const viewerWindows = new Set()
@@ -1989,6 +1996,23 @@ async function writeSmokeFailureReport(stage, error) {
 }
 
 
+
+function applyDeepLink(raw) {
+  const parsed = parseOpenClaudeDeepLink(raw)
+  if (parsed.action !== 'open') {
+    console.info('[windows] ignored deep link:', parsed.reason)
+    return false
+  }
+  if (!productWebContents || productWebContents.isDestroyed()) {
+    pendingDeepLinkTarget = parsed.targetUrl
+    if (!smokeTest) void ensureNormalMainWindow()
+    return true
+  }
+  void loadProductUrl(parsed.targetUrl)
+  showMainWindow()
+  return true
+}
+
 function showMainWindow() {
   if (!isAlive(mainWindow)) {
     void ensureNormalMainWindow()
@@ -2050,7 +2074,8 @@ function normalStartUrl() {
 async function ensureNormalMainWindow() {
   if (isAlive(mainWindow)) return mainWindow
   if (creatingMainWindow) return creatingMainWindow
-  const startUrl = normalStartUrl()
+  const startUrl = pendingDeepLinkTarget || normalStartUrl()
+  pendingDeepLinkTarget = null
   creatingMainWindow = createMainWindow({
     startUrl,
     appOrigin: originOf(startUrl) || PINNED_APP_ORIGIN,
@@ -2069,6 +2094,8 @@ if (!hasSingleInstanceLock) {
   app.quit()
 } else {
   app.on('second-instance', (_event, argv) => {
+    const deepLink = findOpenClaudeUrlInArgv(argv)
+    if (deepLink && applyDeepLink(deepLink)) return
     const intent = parseLaunchIntent(argv)
     if (!isAlive(mainWindow)) {
       void ensureNormalMainWindow()
@@ -2076,6 +2103,11 @@ if (!hasSingleInstanceLock) {
     }
     if (intent?.type === 'home') homeProduct()
     showMainWindow()
+  })
+
+  app.on('open-url', (event, url) => {
+    event.preventDefault()
+    applyDeepLink(url)
   })
 
   app
@@ -2089,6 +2121,8 @@ if (!hasSingleInstanceLock) {
         return
       }
       await installDesktopTray()
+      const launchDeepLink = findOpenClaudeUrlInArgv(process.argv)
+      if (launchDeepLink) applyDeepLink(launchDeepLink)
       await ensureNormalMainWindow()
     })
     .catch(async (error) => {
