@@ -1936,6 +1936,40 @@
       "coverageCommits": [
         "b5b2820d"
       ]
+    },
+    {
+      "id": "INC-20260828-CCB-PROMPT-TOO-LONG",
+      "occurredAt": "2026-08-28",
+      "severity": "P1",
+      "symptom": "CCB 长会话在用户回答 AskUserQuestion 后恢复执行时，上游以 subtype=success + result=\"Prompt is too long\" 返回上下文溢出；gateway 未把该规范诊断识别为 context_too_long，也未清除 poisoned native resume，导致进程反复崩溃、原轮被中断且继续尝试仍落回同一失败点。",
+      "rootFixCommit": "0633e7a7",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
+          "assertion": "context_too_long: CCB canonical prompt-too-long success envelope"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "CCB canonical Prompt is too long diagnostic clears native resume and safely rebuilds the same turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "CCB canonical Prompt is too long after observable work never replays the user turn"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5ReleaseSafety.test.ts",
+          "assertion": "CCB release build 必须固定启用且仅额外启用 REACTIVE_COMPACT"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-runtime-release-lib.sh",
+          "assertion": "oc_hotcfg_build_ccb_dist"
+        }
+      ]
     }
   ]
 }
