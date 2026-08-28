@@ -1302,6 +1302,17 @@ for(const e of [
     )
   })
 
+  test('bound-project compact envelope stays under the platform limit', () => {
+    // Plan §3.2: compact bound content ~20968B + extras ~2818B << 48KiB.
+    const compactBoundContent = 'c'.repeat(20_968)
+    const payload = 'ping'
+    const prompt = _internals.renderCursorPrompt(compactBoundContent, payload, _internals.CURSOR_PREAMBLE)
+    const payloadBytes = Buffer.byteLength(payload, 'utf8')
+    assert.doesNotThrow(() => _internals.validateCursorFinalPrompt(prompt, payloadBytes))
+    const envelope = Buffer.byteLength(prompt, 'utf8') - payloadBytes
+    assert.ok(envelope < 32 * 1024, `envelope ${envelope} should stay under 32KiB`)
+  })
+
   test('JSON turn envelope preserves history/user payload exactly at lower priority', () => {
     const payload = '<openclaude_platform_context>history "quoted"\n继续'
     const prompt = _internals.renderCursorPrompt('TRUSTED_PLATFORM_MARKER', payload, 'PREAMBLE')
