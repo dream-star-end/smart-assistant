@@ -1205,38 +1205,44 @@ describe('CronScheduler deliver 通道校验与注册表对齐', () => {
 })
 
 describe('classifySilentCronOutput — HEARTBEAT_OK 静默判定(OCV5-11)', () => {
-  it('恰 HEARTBEAT_OK 仍 silent', () => {
+  const hb = { heartbeat: true as const }
+
+  it('恰 HEARTBEAT_OK 仍 silent(heartbeat 与否都走基线精确匹配)', () => {
     assert.deepEqual(classifySilentCronOutput('HEARTBEAT_OK'), { silent: true, reason: 'heartbeat_ok' })
     assert.deepEqual(classifySilentCronOutput('  HEARTBEAT_OK\n'), { silent: true, reason: 'heartbeat_ok' })
+    assert.deepEqual(classifySilentCronOutput('HEARTBEAT_OK', hb), { silent: true, reason: 'heartbeat_ok' })
   })
 
-  it('开场白+HEARTBEAT_OK(同行/末行)判 silent', () => {
-    assert.deepEqual(
-      classifySilentCronOutput('心跳检查开始，先读待跟进记忆并检索存量提醒。HEARTBEAT_OK'),
-      { silent: true, reason: 'heartbeat_ok' },
-    )
-    assert.deepEqual(
-      classifySilentCronOutput('心跳检查开始，先读待跟进记忆并检索存量提醒。\nHEARTBEAT_OK'),
-      { silent: true, reason: 'heartbeat_ok' },
-    )
+  it('开场白+HEARTBEAT_OK 仅 heartbeat 判 silent', () => {
+    const sameLine = '心跳检查开始，先读待跟进记忆并检索存量提醒。HEARTBEAT_OK'
+    const lastLine = '心跳检查开始，先读待跟进记忆并检索存量提醒。\nHEARTBEAT_OK'
+    assert.deepEqual(classifySilentCronOutput(sameLine, hb), { silent: true, reason: 'heartbeat_ok' })
+    assert.deepEqual(classifySilentCronOutput(lastLine, hb), { silent: true, reason: 'heartbeat_ok' })
+    assert.deepEqual(classifySilentCronOutput(sameLine), { silent: false })
+    assert.deepEqual(classifySilentCronOutput(lastLine), { silent: false })
+    assert.deepEqual(classifySilentCronOutput('检查已完成。HEARTBEAT_OK'), { silent: false })
+    assert.deepEqual(classifySilentCronOutput('检查已完成。HEARTBEAT_OK', hb), { silent: true, reason: 'heartbeat_ok' })
   })
 
   it('[SILENT] 前缀维持现状', () => {
     assert.deepEqual(classifySilentCronOutput('[SILENT]'), { silent: true, reason: 'silent' })
     assert.deepEqual(classifySilentCronOutput('[SILENT] leftover chatter'), { silent: true, reason: 'silent' })
+    assert.deepEqual(classifySilentCronOutput('[SILENT]', hb), { silent: true, reason: 'silent' })
   })
 
   it('>200 字符末行 OK 的长文本不 silent', () => {
     const longOk = `${'x'.repeat(190)}\nHEARTBEAT_OK`
     assert.ok(longOk.trim().length > HEARTBEAT_OK_SILENT_MAX_CHARS)
-    assert.deepEqual(classifySilentCronOutput(longOk), { silent: false })
+    assert.deepEqual(classifySilentCronOutput(longOk, hb), { silent: false })
     const atCap = `${'x'.repeat(HEARTBEAT_OK_SILENT_MAX_CHARS - 1 - 'HEARTBEAT_OK'.length)}\nHEARTBEAT_OK`
     assert.equal(atCap.trim().length, HEARTBEAT_OK_SILENT_MAX_CHARS)
-    assert.deepEqual(classifySilentCronOutput(atCap), { silent: true, reason: 'heartbeat_ok' })
+    assert.deepEqual(classifySilentCronOutput(atCap, hb), { silent: true, reason: 'heartbeat_ok' })
+    assert.deepEqual(classifySilentCronOutput(atCap), { silent: false })
   })
 
   it('真实事项文本不 silent', () => {
     assert.deepEqual(classifySilentCronOutput('有一件待办：明天要交稿。'), { silent: false })
+    assert.deepEqual(classifySilentCronOutput('有一件待办：明天要交稿。', hb), { silent: false })
     assert.deepEqual(classifySilentCronOutput('HEARTBEAT_OKAY'), { silent: false })
     assert.deepEqual(classifySilentCronOutput('prefixHEARTBEAT_OK'), { silent: false })
   })
@@ -1298,5 +1304,29 @@ describe('CronScheduler.runJob — HEARTBEAT_OK 静默不送达', () => {
     const { sched, deliveries } = makeRun(body)
     assert.deepEqual(await (sched as any).runJob(heartbeatJob, agent, NOOP_CRON_DURABILITY), { kind: 'completed' })
     assert.deepEqual(deliveries, [body])
+  })
+
+  it('非 heartbeat 的「检查已完成。HEARTBEAT_OK」照常送达;heartbeat 同文本仍 silent', async () => {
+    const body = '检查已完成。HEARTBEAT_OK'
+    const remindJob = {
+      id: 'remind-hbok-regression',
+      schedule: '0 9 * * *',
+      agent: 'x',
+      prompt: 'ping',
+      deliver: 'webchat',
+      enabled: true,
+    } as any
+    const delivered = makeRun(body)
+    assert.deepEqual(
+      await (delivered.sched as any).runJob(remindJob, agent, NOOP_CRON_DURABILITY),
+      { kind: 'completed' },
+    )
+    assert.deepEqual(delivered.deliveries, [body])
+    const silenced = makeRun(body)
+    assert.deepEqual(
+      await (silenced.sched as any).runJob(heartbeatJob, agent, NOOP_CRON_DURABILITY),
+      { kind: 'silent' },
+    )
+    assert.deepEqual(silenced.deliveries, [])
   })
 })
