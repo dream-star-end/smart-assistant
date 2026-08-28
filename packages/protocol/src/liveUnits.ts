@@ -521,6 +521,16 @@ function reduceLiveFramesOnto(
     if (meta.seq > throughFrameSeq) throughFrameSeq = meta.seq
     throughRecordId = frame.recordId
     if (meta.sessionKey) sessionKey = meta.sessionKey
+    // Permission lifecycle frames are user-blocking control state, not message
+    // blocks. The compact live-unit schema cannot represent them. Advancing a
+    // resume cursor past either frame would make the browser skip the raw
+    // permission_request forever after a reload, leaving only the
+    // AskUserQuestion tool card visible while the engine waits. Fail closed to
+    // the exact raw-frame journal instead; fallback pages intentionally mint no
+    // resume cursor, so hydration replays the request/settlement through the
+    // ordinary reducer and restores the answer modal.
+    if (meta.type === 'outbound.permission_request' || meta.type === 'outbound.permission_settled')
+      return { ok: false, degraded: 'fallback' }
     if (meta.type !== 'outbound.message') continue
     const block = meta.blocks[0]
     if (!block) continue
