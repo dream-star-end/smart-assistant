@@ -367,6 +367,9 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // 2026-08-28 全量正向同步冻结:selfhost 874786599 已上线；只豁免其不可变祖先。
   // 含 cron 送达置顶、教程/案例四条、cron-triad 批；禁止 amend 源提交。
   "8747865996b5075e19d6aad5c9bf54bca72d0c01",
+  // 2026-08-28 selfhost rel-e9496b174 已上线；其源提交不可改写。只冻结 e949
+  // 及祖先，后续 892bac026/CCB overflow/permission restore 仍逐条走 trailer 门。
+  "e9496b17426877f5163cdbb37ffaa3d4b255bff9",
 ] as const;
 
 function checkTrailerClosure(): number {
