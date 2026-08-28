@@ -53,6 +53,7 @@ V5_UNIT="openclaude-v5-selfhost.service"
 V5_EGRESS_UNIT="openclaude-v5-selfhost-egress.service"
 V5_HOSTNET_UNIT="openclaude-v5-selfhost-hostnet.service"
 V5_CCB_PROXY_UNIT="openclaude-v5-selfhost-ccb-proxy.service"
+V5_CURSOR_PROXY_UNIT="openclaude-v5-selfhost-cursor-proxy.service"
 V5_SSHGATE_UNIT="openclaude-v5-selfhost-sshgate.service"
 V5_TUNNEL_UNIT="cloudflared-v5-selfhost.service"
 V5_PORT="18790"
@@ -1133,7 +1134,7 @@ sync_boot_scripts_best_effort() {
 assert_aux_execstart_not_worktree() {
   local u line
   [[ "$DRY" == 1 ]] && return 0
-  for u in "$V5_HOSTNET_UNIT" "$V5_CCB_PROXY_UNIT" "$V5_SSHGATE_UNIT"; do
+  for u in "$V5_HOSTNET_UNIT" "$V5_CCB_PROXY_UNIT" "$V5_CURSOR_PROXY_UNIT" "$V5_SSHGATE_UNIT"; do
     line="$(grep -E '^ExecStart=' "/etc/systemd/system/$u" || true)"
     [[ -n "$line" ]] || die "aux unit $u 缺 ExecStart"
     if [[ "$line" == *"/opt/openclaude/openclaude-v5-selfhost/"* && "$line" != *"-live"* ]]; then
@@ -1147,10 +1148,11 @@ install_aux_units() {
   sync_boot_scripts_best_effort
   install_unit "$UNIT_DIR/$V5_HOSTNET_UNIT"
   install_unit "$UNIT_DIR/$V5_CCB_PROXY_UNIT"
+  install_unit "$UNIT_DIR/$V5_CURSOR_PROXY_UNIT"
   install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
   install_unit "$UNIT_DIR/$V5_TUNNEL_UNIT"
   run "systemctl daemon-reload"
-  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_CCB_PROXY_UNIT' '$V5_SSHGATE_UNIT'"
+  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_CCB_PROXY_UNIT' '$V5_CURSOR_PROXY_UNIT' '$V5_SSHGATE_UNIT'"
   assert_aux_execstart_not_worktree
 }
 
@@ -1160,12 +1162,13 @@ install_units() {
   sync_boot_scripts_best_effort
   install_unit "$UNIT_DIR/$V5_HOSTNET_UNIT"
   install_unit "$UNIT_DIR/$V5_CCB_PROXY_UNIT"
+  install_unit "$UNIT_DIR/$V5_CURSOR_PROXY_UNIT"
   install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
   install_unit "$UNIT_DIR/$V5_EGRESS_UNIT"
   install_unit "$UNIT_DIR/$V5_UNIT"
   install_unit "$UNIT_DIR/$V5_TUNNEL_UNIT"
   run "systemctl daemon-reload"
-  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_CCB_PROXY_UNIT' '$V5_SSHGATE_UNIT'"
+  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_CCB_PROXY_UNIT' '$V5_CURSOR_PROXY_UNIT' '$V5_SSHGATE_UNIT'"
   assert_aux_execstart_not_worktree
 }
 
@@ -1191,11 +1194,20 @@ refresh_ccb_proxy_path() {
     || die "$V5_CCB_PROXY_UNIT failed to start"
   systemctl restart "$V5_SSHGATE_UNIT" \
     || die "$V5_SSHGATE_UNIT restart failed after hostnet flush"
-  iptables -C V5_EGRESS_IN -d 172.31.0.1 -p tcp --dport 18991 -j RETURN \
-    -m comment --comment "v5 CCB -> stable HTTPS proxy" \
+  iptables -C V5_EGRESS_IN -d 172.31.0.1 -p tcp --dport 18991 \
+    -m comment --comment "v5 CCB -> stable HTTPS proxy" -j RETURN \
     || die "V5_EGRESS_IN missing 172.31.0.1:18991 RETURN"
   timeout 10 bash -c 'exec 3<>/dev/tcp/172.31.0.1/18991' \
     || die "CCB HTTPS proxy listener 172.31.0.1:18991 is unreachable"
+  if [[ -f /etc/sing-box/openclaude-cursor-egress-proxy.json ]]; then
+    systemctl enable --now "$V5_CURSOR_PROXY_UNIT" \
+      || die "$V5_CURSOR_PROXY_UNIT failed to start"
+    iptables -C V5_EGRESS_IN -d 172.31.0.1 -p tcp --dport 18992 \
+      -m comment --comment "v5 Cursor -> dedicated HTTPS proxy" -j RETURN \
+      || die "V5_EGRESS_IN missing 172.31.0.1:18992 RETURN"
+    timeout 10 bash -c 'exec 3<>/dev/tcp/172.31.0.1/18992' \
+      || die "Cursor HTTPS proxy listener 172.31.0.1:18992 is unreachable"
+  fi
   log "  ✓ CCB HTTPS proxy listener + firewall ready"
 }
 

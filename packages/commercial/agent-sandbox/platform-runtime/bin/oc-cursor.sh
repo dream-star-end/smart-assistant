@@ -58,6 +58,52 @@ auth_file=/run/oc/cursor-auth/api-key
 # auth directory is root-authored, but a stray glob-shaped entry must not
 # resolve against workspace filenames.
 auth_dir=${auth_file%/*}
+
+# Optional host-authored Cursor-only HTTPS egress. The sidecar lives beside
+# the root-owned API key, so the gateway never needs to inherit generic proxy
+# variables and CCB/Codex/Grok keep their existing transports. The wrapper
+# accepts only a credential-free http:// origin and pins NO_PROXY for every
+# local OpenClaude control path that Cursor or its MCP children may call.
+cursor_https_proxy=""
+cursor_proxy_file=$auth_dir/.https-proxy
+if /usr/bin/sudo -n /usr/bin/test -f "$cursor_proxy_file" 2>/dev/null; then
+  cursor_proxy_type=$(/usr/bin/sudo -n /usr/bin/stat -c %F -- "$cursor_proxy_file" 2>/dev/null) \
+    || die "Cursor HTTPS proxy metadata is unavailable"
+  cursor_proxy_uid=$(/usr/bin/sudo -n /usr/bin/stat -c %u -- "$cursor_proxy_file" 2>/dev/null) \
+    || die "Cursor HTTPS proxy metadata is unavailable"
+  cursor_auth_uid=$(/usr/bin/sudo -n /usr/bin/stat -c %u -- "$auth_file" 2>/dev/null) \
+    || die "Cursor credential metadata is unavailable"
+  cursor_proxy_mode=$(/usr/bin/sudo -n /usr/bin/stat -c %a -- "$cursor_proxy_file" 2>/dev/null) \
+    || die "Cursor HTTPS proxy metadata is unavailable"
+  [ "$cursor_proxy_type" = "regular file" ] \
+    && [ "$cursor_proxy_uid" = "$cursor_auth_uid" ] \
+    && [ "$cursor_proxy_mode" = "600" ] \
+    || die "Cursor HTTPS proxy sidecar is invalid"
+  cursor_https_proxy=$(/usr/bin/sudo -n /bin/cat -- "$cursor_proxy_file" 2>/dev/null) \
+    || die "Cursor HTTPS proxy sidecar is unreadable"
+  case "$cursor_https_proxy" in
+    http://*) ;;
+    *) die "Cursor HTTPS proxy must be a credential-free http origin" ;;
+  esac
+  cursor_proxy_authority=${cursor_https_proxy#http://}
+  case "$cursor_proxy_authority" in
+    ''|*/*|*\?*|*\#*|*@*|*[!A-Za-z0-9._:-]*)
+      die "Cursor HTTPS proxy must be a credential-free http origin"
+      ;;
+  esac
+  cursor_proxy_host=${cursor_proxy_authority%:*}
+  cursor_proxy_port=${cursor_proxy_authority##*:}
+  [ -n "$cursor_proxy_host" ] && [ "$cursor_proxy_port" != "$cursor_proxy_authority" ] \
+    || die "Cursor HTTPS proxy must include host and port"
+  case "$cursor_proxy_port" in ''|*[!0-9]*) die "Cursor HTTPS proxy port is invalid" ;; esac
+  [ "$cursor_proxy_port" -ge 1 ] && [ "$cursor_proxy_port" -le 65535 ] \
+    || die "Cursor HTTPS proxy port is invalid"
+  HTTPS_PROXY=$cursor_https_proxy
+  HTTP_PROXY=$cursor_https_proxy
+  NO_PROXY=127.0.0.1,localhost,::1,172.31.0.1
+  export HTTPS_PROXY HTTP_PROXY NO_PROXY
+fi
+
 set -f
 key_names=""
 key_count=0

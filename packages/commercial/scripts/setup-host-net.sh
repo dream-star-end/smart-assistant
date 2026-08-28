@@ -37,6 +37,7 @@ case "$CHANNEL" in
     INTERNAL_PROXY_PORT="18791"
     V3_HOST_GUARD_CHAIN="V3_EGRESS_IN"
     CCB_HTTPS_PROXY_PORT=""
+    CURSOR_HTTPS_PROXY_PORT=""
     ;;
   v5)
     NET_NAME="openclaude-v5-net"
@@ -45,13 +46,14 @@ case "$CHANNEL" in
     INTERNAL_PROXY_PORT="18892"
     V3_HOST_GUARD_CHAIN="V5_EGRESS_IN"
     CCB_HTTPS_PROXY_PORT="18991"
+    CURSOR_HTTPS_PROXY_PORT="18992"
     ;;
   *)
     echo "[ABORT] 未知 channel: $CHANNEL (仅支持 v3 / v5)"
     exit 1
     ;;
 esac
-echo "[CHANNEL] $CHANNEL → net=$NET_NAME subnet=$SUBNET gw=$GATEWAY proxy_port=$INTERNAL_PROXY_PORT ccb_https_proxy_port=${CCB_HTTPS_PROXY_PORT:-off} chain=$V3_HOST_GUARD_CHAIN"
+echo "[CHANNEL] $CHANNEL → net=$NET_NAME subnet=$SUBNET gw=$GATEWAY proxy_port=$INTERNAL_PROXY_PORT ccb_https_proxy_port=${CCB_HTTPS_PROXY_PORT:-off} cursor_https_proxy_port=${CURSOR_HTTPS_PROXY_PORT:-off} chain=$V3_HOST_GUARD_CHAIN"
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -128,6 +130,12 @@ ensure_ufw_rule() {
     apply_ufw "deny v4/v6 → ${CCB_HTTPS_PROXY_PORT}/tcp (除 ${SUBNET} 外)" \
       deny in proto tcp to any port "$CCB_HTTPS_PROXY_PORT"
   fi
+  if [[ -n "$CURSOR_HTTPS_PROXY_PORT" ]]; then
+    apply_ufw "allow ${SUBNET} -> ${CURSOR_HTTPS_PROXY_PORT}/tcp" \
+      allow proto tcp from "$SUBNET" to any port "$CURSOR_HTTPS_PROXY_PORT" comment "openclaude-${CHANNEL} Cursor HTTPS proxy (${GATEWAY}:${CURSOR_HTTPS_PROXY_PORT})"
+    apply_ufw "deny external -> ${CURSOR_HTTPS_PROXY_PORT}/tcp" \
+      deny in proto tcp to any port "$CURSOR_HTTPS_PROXY_PORT"
+  fi
 }
 
 ensure_v3_host_guard() {
@@ -187,6 +195,11 @@ ensure_v3_host_guard() {
       -m comment --comment "${CHANNEL} CCB -> stable HTTPS proxy"
   fi
   # ICMP echo 留着,容器内 ping 网关用作 readiness 检测可以;ICMP 不会泄露敏感
+  if [[ -n "$CURSOR_HTTPS_PROXY_PORT" ]]; then
+    iptables -A "$V3_HOST_GUARD_CHAIN" \
+      -d "$GATEWAY" -p tcp --dport "$CURSOR_HTTPS_PROXY_PORT" -j RETURN \
+      -m comment --comment "${CHANNEL} Cursor -> dedicated HTTPS proxy"
+  fi
   iptables -A "$V3_HOST_GUARD_CHAIN" \
     -d "$GATEWAY" -p icmp --icmp-type echo-request -j RETURN \
     -m comment --comment "${CHANNEL} container -> gateway icmp (readiness)"
@@ -194,7 +207,7 @@ ensure_v3_host_guard() {
     -d "$GATEWAY" -j DROP \
     -m comment --comment "${CHANNEL} container -> any other host port: deny"
   # 注意:不在链内匹配 src=172.30.0.0/16,src 已在 INPUT jump 时过滤
-  echo "[ADDED] $V3_HOST_GUARD_CHAIN allow $GATEWAY:$INTERNAL_PROXY_PORT${CCB_HTTPS_PROXY_PORT:+,$GATEWAY:$CCB_HTTPS_PROXY_PORT}, deny rest"
+  echo "[ADDED] $V3_HOST_GUARD_CHAIN allow $GATEWAY:$INTERNAL_PROXY_PORT${CCB_HTTPS_PROXY_PORT:+,$GATEWAY:$CCB_HTTPS_PROXY_PORT}${CURSOR_HTTPS_PROXY_PORT:+,$GATEWAY:$CURSOR_HTTPS_PROXY_PORT}, deny rest"
 
   # 3) INPUT 入口 jump(真正幂等 — 2026-04-22 R2 B2 修复)
   #

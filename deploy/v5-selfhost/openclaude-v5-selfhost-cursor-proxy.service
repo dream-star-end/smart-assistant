@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenClaude v5 selfhost Cursor-only HTTPS egress
+After=network-online.target docker.service openclaude-v5-selfhost-hostnet.service
+Wants=network-online.target
+Requires=docker.service openclaude-v5-selfhost-hostnet.service
+ConditionPathExists=/etc/sing-box/openclaude-cursor-egress-proxy.json
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/openclaude-cursor-egress-proxy.json
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

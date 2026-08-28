@@ -62,6 +62,7 @@ printf '%s\\n' "$@" > "$OC_CURSOR_TEST_CAPTURE/argv"
 printf '%s\\n' "\${OPENCLAUDE_CURSOR_MCP_CONFIG-unset}" > "$OC_CURSOR_TEST_CAPTURE/mcp-env"
 printf '%s\\n' "\${OPENCLAUDE_CURSOR_RESUME_ID-unset}" > "$OC_CURSOR_TEST_CAPTURE/resume-env"
 printf '%s\\n' "\${CURSOR_AGENT_DISABLE_DEBUG_LOG-unset}" > "$OC_CURSOR_TEST_CAPTURE/disable-debug"
+/usr/bin/env > "$OC_CURSOR_TEST_CAPTURE/env"
 if [ "\${OC_CURSOR_TEST_STDERR:-0}" = 1 ]; then
   printf 'FAKE_DEBUG_LINE\\n' >&2
 fi
@@ -117,6 +118,7 @@ printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"o
     .replaceAll('/usr/bin/sudo -n /usr/bin/test -f', '/usr/bin/test -f')
     .replaceAll('/usr/bin/sudo -n /bin/ls', '/bin/ls')
     .replaceAll('/usr/bin/sudo -n /bin/cat', '/bin/cat')
+    .replaceAll('/usr/bin/sudo -n /usr/bin/stat', '/usr/bin/stat')
   writeFileSync(wrapper, rewritten, { mode: 0o755 })
   chmodSync(wrapper, 0o755)
   return {
@@ -289,6 +291,51 @@ describe('oc-cursor wrapper', () => {
     assert.match(result.stderr, /fail-open/)
     assert.equal(existsSync(join(f.capture, 'hooks.json')), false)
     assert.equal(readFileSync(join(f.capture, 'hooks-env'), 'utf8').trim(), 'unset')
+  })
+
+  test('injects a credential-free Cursor-only proxy from the root-authored sidecar', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const env = { ...f.env }
+    delete env.HTTPS_PROXY
+    delete env.HTTP_PROXY
+    delete env.NO_PROXY
+
+    const result = spawnSync(f.wrapper, ['--model', 'cursor-grok-4.6-high', '--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    const childEnv = readFileSync(join(f.capture, 'env'), 'utf8')
+    assert.match(childEnv, /^HTTPS_PROXY=http:\/\/172\.31\.0\.1:18992$/m)
+    assert.match(childEnv, /^HTTP_PROXY=http:\/\/172\.31\.0\.1:18992$/m)
+    assert.match(childEnv, /^NO_PROXY=127\.0\.0\.1,localhost,::1,172\.31\.0\.1$/m)
+  })
+
+  test('fails closed on an unsafe Cursor proxy sidecar', () => {
+    const cases = [
+      ['credentialed', 'http://user:pass@172.31.0.1:18992\n', 0o600],
+      ['non-http', 'socks5://172.31.0.1:18992\n', 0o600],
+      ['world-readable', 'http://172.31.0.1:18992\n', 0o644],
+      ['missing-port', 'http://172.31.0.1\n', 0o600],
+    ] as const
+    for (const [label, value, mode] of cases) {
+      const f = fixture()
+      const proxySidecar = join(dirname(f.auth), '.https-proxy')
+      writeFileSync(proxySidecar, value, { mode })
+      chmodSync(proxySidecar, mode)
+      const result = spawnSync(f.wrapper, ['--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 2, label)
+      assert.match(result.stderr, /Cursor HTTPS proxy/, label)
+      assert.equal(existsSync(join(f.capture, 'env')), false, label)
+    }
   })
 
   test('copies one validated adapter MCP config, approves it, and unsets the source env', () => {
