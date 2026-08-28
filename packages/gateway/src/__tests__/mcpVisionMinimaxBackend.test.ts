@@ -110,15 +110,17 @@ describe('vision gating 派生自 protocol supportsVision(反漂移)', () => {
   })
 })
 
-describe('vision backend cap/timeout(selfhost 默认 codex)', () => {
-  it('默认(无 env)→ codex cap 20MB / 120s(2026-08-16 selfhost 后端改 GPT)', () => {
-    const p = join(uploads, 'a.png')
-    writeFileSync(p, PNG)
-    const r = vision.resolveVisionInput({ image_file: p })
-    assert.equal(r.maxImageBytes, 20 * 1024 * 1024)
-    assert.equal(r.timeoutMs, 120_000)
+describe('vision backend cap/timeout(商业版与 selfhost 默认 MiniMax-M3)', () => {
+  it('默认(无 env)→ MiniMax cap 5MB / 60s', async () => {
+    await withEnv({ OPENCLAUDE_VISION_BACKEND: undefined }, () => {
+      const p = join(uploads, 'a.png')
+      writeFileSync(p, PNG)
+      const r = vision.resolveVisionInput({ image_file: p })
+      assert.equal(r.maxImageBytes, 5 * 1024 * 1024)
+      assert.equal(r.timeoutMs, 60_000)
+    })
   })
-  it('OPENCLAUDE_VISION_BACKEND=minimax 显式回退 → cap 5MB / 60s', async () => {
+  it('OPENCLAUDE_VISION_BACKEND=minimax 显式固定 → cap 5MB / 60s', async () => {
     await withEnv({ OPENCLAUDE_VISION_BACKEND: 'minimax' }, () => {
       const p = join(uploads, 'a2.png')
       writeFileSync(p, PNG)
