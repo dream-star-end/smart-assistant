@@ -9,10 +9,12 @@ import {
   BrowserWindow,
   Menu,
   Notification,
+  Tray,
   WebContentsView,
   app,
   dialog,
   ipcMain,
+  nativeImage,
   nativeTheme,
   protocol,
   screen,
@@ -33,6 +35,12 @@ import {
   createDownloadCompletedNotification,
   shouldReleaseNotificationOnClose,
 } from './download-notify.mjs'
+import { DesktopSettingsStore } from './desktop-settings.mjs'
+import {
+  createDesktopTray,
+  loadTrayIcon,
+  shouldHideInsteadOfClose,
+} from './desktop-tray.mjs'
 import { DownloadRegistry, taskbarProgressState } from './download-registry.mjs'
 import { IPC_CHANNELS, isTrustedShellEvent, parseShellCommand } from './ipc-contract.mjs'
 import { permissionDecision } from './permission-adapter.mjs'
@@ -125,6 +133,9 @@ let creatingMainWindow = null
 let smokeMenuOpenCount = 0
 let overlayActive = false
 let applicationMenu = null
+let desktopSettingsStore = null
+let desktopTrayApi = null
+let isQuitting = false
 const liveNotifications = new Set()
 
 const viewerWindows = new Set()
@@ -962,7 +973,20 @@ function installWindowLifecycle(window, localShellView, localProductView) {
     nativeTheme.removeListener('updated', updateAppearance)
   }
 
-  window.once('close', () => {
+  window.on('show', () => desktopTrayApi?.rebuild())
+  window.on('hide', () => desktopTrayApi?.rebuild())
+  window.on('close', (event) => {
+    if (
+      shouldHideInsteadOfClose({
+        isQuitting,
+        closeToTray: desktopSettingsStore?.closeToTray === true,
+        smokeTest,
+      })
+    ) {
+      event.preventDefault()
+      if (!window.isDestroyed()) window.hide()
+      return
+    }
     if (authWindow && !authWindow.isDestroyed()) authWindow.close()
     for (const viewer of viewerWindows) {
       if (!viewer.isDestroyed()) viewer.close()
@@ -1964,6 +1988,58 @@ async function writeSmokeFailureReport(stage, error) {
   }
 }
 
+
+function showMainWindow() {
+  if (!isAlive(mainWindow)) {
+    void ensureNormalMainWindow()
+    return
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function hideMainWindow() {
+  if (isAlive(mainWindow) && mainWindow.isVisible()) mainWindow.hide()
+}
+
+function quitApplication() {
+  isQuitting = true
+  app.quit()
+}
+
+async function installDesktopTray() {
+  if (smokeTest || desktopTrayApi) return
+  desktopSettingsStore = new DesktopSettingsStore({
+    userDataPath: app.getPath('userData'),
+    onError: (error) => console.error('[windows] desktop settings save failed:', error.message),
+  })
+  await desktopSettingsStore.load()
+  const icon = await loadTrayIcon(nativeImage, {
+    app,
+    isPackaged: app.isPackaged,
+    execPath: process.execPath,
+    moduleDir: __dirname,
+    resourcesPath: process.resourcesPath,
+  })
+  desktopTrayApi = createDesktopTray({
+    Tray,
+    Menu,
+    icon,
+    tooltip: APP_NAME,
+    getState: () => ({
+      windowVisible: isAlive(mainWindow) && mainWindow.isVisible(),
+      closeToTray: desktopSettingsStore?.closeToTray === true,
+    }),
+    onShow: showMainWindow,
+    onHide: hideMainWindow,
+    onToggleCloseToTray: (value) => {
+      void desktopSettingsStore?.setCloseToTray(value === true)
+    },
+    onQuit: quitApplication,
+  })
+}
+
 function normalStartUrl() {
   return resolveStartUrl({
     isPackaged: app.isPackaged,
@@ -1999,9 +2075,7 @@ if (!hasSingleInstanceLock) {
       return
     }
     if (intent?.type === 'home') homeProduct()
-    if (mainWindow.isMinimized()) mainWindow.restore()
-    mainWindow.show()
-    mainWindow.focus()
+    showMainWindow()
   })
 
   app
@@ -2014,6 +2088,7 @@ if (!hasSingleInstanceLock) {
         app.exit(exitCode)
         return
       }
+      await installDesktopTray()
       await ensureNormalMainWindow()
     })
     .catch(async (error) => {
@@ -2028,6 +2103,7 @@ app.on('activate', () => {
 })
 
 app.on('before-quit', () => {
+  isQuitting = true
   void windowStateStore?.flush().catch(() => {})
 })
 

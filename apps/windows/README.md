@@ -43,7 +43,7 @@ BaseWindow
 - 下载与离线状态是本地 modal：进入 modal 时 main 隐藏 product view，shell 扩展为整窗；关闭下载
   modal 或网络恢复后，main 恢复 product view、重新布局并把焦点还给产品区。两块 renderer 不叠层
   抢占输入。
-- 暂不做 close-to-tray、自动启动、深链、自动更新或离线聊天。
+- 支持托盘常驻：托盘菜单可显示/隐藏主窗口、切换「关闭时最小化到托盘」（默认关闭，写入 userData/desktop-settings.json）、退出。未开启该开关时点窗口 X 仍直接退出。暂不做自动启动、深链、自动更新或离线聊天。
 
 ## 开发与验证
 
