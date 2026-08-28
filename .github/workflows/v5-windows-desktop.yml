@@ -100,11 +100,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $exe = Join-Path $PWD 'apps/windows/release/win-unpacked/Aurora.exe'
+          $exe = Join-Path $PWD 'apps/windows/release/win-unpacked/Clarvy.exe'
           if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
             throw "packaged executable missing: $exe"
           }
-          $smokeReport = Join-Path $env:RUNNER_TEMP 'aurora-unpacked-smoke.txt'
+          $smokeReport = Join-Path $env:RUNNER_TEMP 'clarvy-unpacked-smoke.txt'
           $env:OPENCLAUDE_SMOKE_REPORT_PATH = $smokeReport
 
           # --smoke-test is an offline desktop contract: it creates the trusted shell
@@ -114,7 +114,7 @@ jobs:
           try {
             if (-not $process.WaitForExit(45000)) {
               Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-              throw 'Aurora.exe --smoke-test exceeded the hard 45 second timeout'
+              throw 'Clarvy.exe --smoke-test exceeded the hard 45 second timeout'
             }
             $process.Refresh()
           if ($process.ExitCode -ne 0) {
@@ -123,7 +123,7 @@ jobs:
             } else {
               'No application smoke report was produced.'
             }
-            throw "Aurora.exe --smoke-test exited with code $($process.ExitCode)`n$detail"
+            throw "Clarvy.exe --smoke-test exited with code $($process.ExitCode)`n$detail"
             }
           }
           finally {
@@ -137,12 +137,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $releaseDir = Join-Path $PWD 'apps/windows/release'
-          $installers = @(Get-ChildItem -LiteralPath $releaseDir -Filter 'Aurora-Setup-*.exe' -File)
+          $installers = @(Get-ChildItem -LiteralPath $releaseDir -Filter 'Clarvy-Setup-*.exe' -File)
           if ($installers.Count -ne 1) {
-            throw "expected exactly one Aurora NSIS installer, found $($installers.Count)"
+            throw "expected exactly one Clarvy NSIS installer, found $($installers.Count)"
           }
 
-          $installDir = Join-Path $env:RUNNER_TEMP 'aurora-installed-smoke'
+          $installDir = Join-Path $env:RUNNER_TEMP 'clarvy-installed-smoke'
           $install = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', "/D=$installDir") -PassThru
           if (-not $install.WaitForExit(60000)) {
             Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
@@ -153,16 +153,16 @@ jobs:
             throw "silent installer exited with code $($install.ExitCode)"
           }
 
-          $installedExe = Join-Path $installDir 'Aurora.exe'
+          $installedExe = Join-Path $installDir 'Clarvy.exe'
           if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
             throw "installed executable missing: $installedExe"
           }
-          $installedSmokeReport = Join-Path $env:RUNNER_TEMP 'aurora-installed-smoke.txt'
+          $installedSmokeReport = Join-Path $env:RUNNER_TEMP 'clarvy-installed-smoke.txt'
           $env:OPENCLAUDE_SMOKE_REPORT_PATH = $installedSmokeReport
           $smoke = Start-Process -FilePath $installedExe -ArgumentList '--smoke-test' -PassThru
           if (-not $smoke.WaitForExit(45000)) {
             Stop-Process -Id $smoke.Id -Force -ErrorAction SilentlyContinue
-            throw 'installed Aurora.exe --smoke-test exceeded 45 seconds'
+            throw 'installed Clarvy.exe --smoke-test exceeded 45 seconds'
           }
           $smoke.Refresh()
           if ($smoke.ExitCode -ne 0) {
@@ -171,12 +171,12 @@ jobs:
             } else {
               'No installed application smoke report was produced.'
             }
-            throw "installed Aurora.exe --smoke-test exited with code $($smoke.ExitCode)`n$detail"
+            throw "installed Clarvy.exe --smoke-test exited with code $($smoke.ExitCode)`n$detail"
           }
 
           $uninstallers = @(Get-ChildItem -LiteralPath $installDir -Filter 'Uninstall*.exe' -File)
           if ($uninstallers.Count -ne 1) {
-            throw "expected exactly one Aurora uninstaller, found $($uninstallers.Count)"
+            throw "expected exactly one Clarvy uninstaller, found $($uninstallers.Count)"
           }
           $uninstall = Start-Process -FilePath $uninstallers[0].FullName -ArgumentList '/S' -PassThru
           if (-not $uninstall.WaitForExit(60000)) {
@@ -192,7 +192,7 @@ jobs:
             Start-Sleep -Milliseconds 500
           }
           if (Test-Path -LiteralPath $installedExe) {
-            throw 'Aurora.exe remains after silent uninstall'
+            throw 'Clarvy.exe remains after silent uninstall'
           }
 
       - name: Generate installer SHA-256
@@ -200,9 +200,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $releaseDir = Join-Path $PWD 'apps/windows/release'
-          $installers = @(Get-ChildItem -LiteralPath $releaseDir -Filter 'Aurora-Setup-*.exe' -File)
+          $installers = @(Get-ChildItem -LiteralPath $releaseDir -Filter 'Clarvy-Setup-*.exe' -File)
           if ($installers.Count -ne 1) {
-            throw "expected exactly one Aurora NSIS installer, found $($installers.Count)"
+            throw "expected exactly one Clarvy NSIS installer, found $($installers.Count)"
           }
 
           $lines = foreach ($installer in $installers) {
@@ -216,10 +216,10 @@ jobs:
       - name: Upload unsigned installer
         uses: actions/upload-artifact@v4
         with:
-          name: aurora-windows-x64-unsigned-${{ github.sha }}
+          name: clarvy-windows-x64-unsigned-${{ github.sha }}
           path: |
-            apps/windows/release/Aurora-Setup-*.exe
-            apps/windows/release/Aurora-Setup-*.exe.blockmap
+            apps/windows/release/Clarvy-Setup-*.exe
+            apps/windows/release/Clarvy-Setup-*.exe.blockmap
             apps/windows/release/latest*.yml
             apps/windows/release/SHA256SUMS.txt
           if-no-files-found: error

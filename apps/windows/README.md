@@ -1,6 +1,6 @@
-# OpenClaude Aurora for Windows
+# Clarvy（从简）for Windows
 
-Aurora for Windows 是 OpenClaude V5 的独立桌面产品线。它不是把线上站点直接塞进单个
+Clarvy（从简）for Windows 是 OpenClaude V5 的独立桌面产品线。它不是把线上站点直接塞进单个
 `BrowserWindow`：安装包自带本地 Fluent Windows shell，远端 V5 产品区运行在另一块隔离的
 `WebContentsView` 中。认证、会话、聊天协议、计费和核心聊天 UI 仍复用 V5 Web/服务端单一
 权威，桌面端不复制 gateway、用户 runtime 或模型凭据。
@@ -31,7 +31,7 @@ BaseWindow
 
 - 参考 Codex 桌面版的信息层级，窗口顶部保留 44px 本地 app bar；Windows 上与系统 caption
   通过 Electron Window Controls Overlay 合并，失败则回退标准标题栏。标题固定为安装包内的
-  “Aurora / 桌面工作区”，不读取远端 DOM，也不伪造项目、任务或会话标题。
+  “从简 / 桌面工作区”，不读取远端 DOM，也不伪造项目、任务或会话标题。
 - app bar 只承载下载状态和更多操作；后退、前进、刷新、主页、缩放与下载等桌面命令由
   Electron 原生 `Menu` 和既有键盘快捷键提供，不在远端产品区注入脚本。
 - Segoe UI Variable/system 字体、键盘可达、可见焦点、forced-colors/high-contrast 和 reduced
@@ -43,7 +43,8 @@ BaseWindow
 - 下载与离线状态是本地 modal：进入 modal 时 main 隐藏 product view，shell 扩展为整窗；关闭下载
   modal 或网络恢复后，main 恢复 product view、重新布局并把焦点还给产品区。两块 renderer 不叠层
   抢占输入。
-- 暂不做 close-to-tray、自动启动、深链、自动更新或离线聊天。
+- 支持托盘常驻：托盘菜单可显示/隐藏主窗口、切换「关闭时最小化到托盘」（默认关闭，写入 userData/desktop-settings.json）、退出。未开启该开关时点窗口 X 仍直接退出。
+- 打包态注册 `openclaude://` 深链；仅 `openclaude://open?path=/...` 且 path 通过 pinned-origin 校验时才导航产品区，其余深链忽略并记日志。开发态不注册协议。暂不做自动启动、自动更新或离线聊天。
 
 ## 开发与验证
 
@@ -77,7 +78,7 @@ Windows x64 NSIS：
 npm --prefix apps/windows run dist:win
 ```
 
-主要产物是 `release/win-unpacked/Aurora.exe`、`release/Aurora-Setup-<version>-x64.exe` 和 CI
+主要产物是 `release/win-unpacked/Clarvy.exe`、`release/Clarvy-Setup-<version>-x64.exe` 和 CI
 生成的 `release/SHA256SUMS.txt`。
 
 ## 发布边界

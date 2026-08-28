@@ -2,7 +2,7 @@
 
 ## Microsoft Fluent UI System Icons
 
-Aurora for Windows vendors only the seven regular SVG assets referenced by its local renderer:
+Clarvy（从简）for Windows vendors only the seven regular SVG assets referenced by its local renderer:
 
 - `arrow_download_20_regular.svg`
 - `more_horizontal_20_regular.svg`

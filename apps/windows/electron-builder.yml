@@ -1,5 +1,5 @@
-appId: chat.claudeai.aurora
-productName: OpenClaude Aurora
+appId: chat.claudeai.clarvy
+productName: Clarvy
 asar: true
 # appId 必须与 src/main.mjs 的 APP_ID 一致，否则 Windows toast / Jump List 无法绑定到本应用。
 # NSIS 会创建同名开始菜单快捷方式；本阶段不保证进程退出后 Action Center 点击能重新拉起下载面板。
@@ -14,13 +14,13 @@ files:
   - package.json
 
 win:
-  executableName: Aurora
+  executableName: Clarvy
   target:
     - target: nsis
       arch:
         - x64
   icon: icon-512.png
-  artifactName: Aurora-Setup-${version}-${arch}.${ext}
+  artifactName: Clarvy-Setup-${version}-${arch}.${ext}
   forceCodeSigning: false
   verifyUpdateCodeSignature: true
 
@@ -30,7 +30,7 @@ nsis:
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
-  shortcutName: OpenClaude Aurora
+  shortcutName: 从简
   deleteAppDataOnUninstall: false
 
 electronFuses:

@@ -9,10 +9,12 @@ import {
   BrowserWindow,
   Menu,
   Notification,
+  Tray,
   WebContentsView,
   app,
   dialog,
   ipcMain,
+  nativeImage,
   nativeTheme,
   protocol,
   screen,
@@ -33,6 +35,17 @@ import {
   createDownloadCompletedNotification,
   shouldReleaseNotificationOnClose,
 } from './download-notify.mjs'
+import { DesktopSettingsStore } from './desktop-settings.mjs'
+import {
+  createDesktopTray,
+  loadTrayIcon,
+  shouldHideInsteadOfClose,
+} from './desktop-tray.mjs'
+import {
+  OPENCLAUDE_PROTOCOL,
+  findOpenClaudeUrlInArgv,
+  parseOpenClaudeDeepLink,
+} from './desktop-protocol.mjs'
 import { DownloadRegistry, taskbarProgressState } from './download-registry.mjs'
 import { IPC_CHANNELS, isTrustedShellEvent, parseShellCommand } from './ipc-contract.mjs'
 import { permissionDecision } from './permission-adapter.mjs'
@@ -94,8 +107,8 @@ import {
   parseLaunchIntent,
 } from './windows-integration.mjs'
 
-const APP_ID = 'chat.claudeai.aurora'
-const APP_NAME = 'OpenClaude Aurora'
+const APP_ID = 'chat.claudeai.clarvy'
+const APP_NAME = 'Clarvy'
 const SHELL_PARTITION = 'openclaude-v5-shell-v1'
 const SMOKE_TIMEOUT_MS = 25_000
 const ZOOM_MIN = 0.5
@@ -109,6 +122,7 @@ registerShellScheme(protocol)
 app.enableSandbox()
 app.setName(APP_NAME)
 if (process.platform === 'win32') app.setAppUserModelId(APP_ID)
+if (!smokeTest && app.isPackaged) app.setAsDefaultProtocolClient(OPENCLAUDE_PROTOCOL)
 
 let mainWindow = null
 let shellView = null
@@ -125,6 +139,10 @@ let creatingMainWindow = null
 let smokeMenuOpenCount = 0
 let overlayActive = false
 let applicationMenu = null
+let desktopSettingsStore = null
+let desktopTrayApi = null
+let isQuitting = false
+let pendingDeepLinkTarget = null
 const liveNotifications = new Set()
 
 const viewerWindows = new Set()
@@ -962,7 +980,20 @@ function installWindowLifecycle(window, localShellView, localProductView) {
     nativeTheme.removeListener('updated', updateAppearance)
   }
 
-  window.once('close', () => {
+  window.on('show', () => desktopTrayApi?.rebuild())
+  window.on('hide', () => desktopTrayApi?.rebuild())
+  window.on('close', (event) => {
+    if (
+      shouldHideInsteadOfClose({
+        isQuitting,
+        closeToTray: desktopSettingsStore?.closeToTray === true,
+        smokeTest,
+      })
+    ) {
+      event.preventDefault()
+      if (!window.isDestroyed()) window.hide()
+      return
+    }
     if (authWindow && !authWindow.isDestroyed()) authWindow.close()
     for (const viewer of viewerWindows) {
       if (!viewer.isDestroyed()) viewer.close()
@@ -1695,7 +1726,7 @@ async function runSmokeContract() {
 
   const completedDownload = {
     id: 'smoke-completed',
-    name: 'Aurora-notes.txt',
+    name: 'Clarvy-notes.txt',
     state: 'completed',
     progress: 1,
     canShow: true,
@@ -1964,6 +1995,75 @@ async function writeSmokeFailureReport(stage, error) {
   }
 }
 
+
+
+function applyDeepLink(raw) {
+  const parsed = parseOpenClaudeDeepLink(raw)
+  if (parsed.action !== 'open') {
+    console.info('[windows] ignored deep link:', parsed.reason)
+    return false
+  }
+  if (!productWebContents || productWebContents.isDestroyed()) {
+    pendingDeepLinkTarget = parsed.targetUrl
+    if (!smokeTest) void ensureNormalMainWindow()
+    return true
+  }
+  void loadProductUrl(parsed.targetUrl)
+  showMainWindow()
+  return true
+}
+
+function showMainWindow() {
+  if (!isAlive(mainWindow)) {
+    void ensureNormalMainWindow()
+    return
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function hideMainWindow() {
+  if (isAlive(mainWindow) && mainWindow.isVisible()) mainWindow.hide()
+}
+
+function quitApplication() {
+  isQuitting = true
+  app.quit()
+}
+
+async function installDesktopTray() {
+  if (smokeTest || desktopTrayApi) return
+  desktopSettingsStore = new DesktopSettingsStore({
+    userDataPath: app.getPath('userData'),
+    onError: (error) => console.error('[windows] desktop settings save failed:', error.message),
+  })
+  await desktopSettingsStore.load()
+  const icon = await loadTrayIcon(nativeImage, {
+    app,
+    isPackaged: app.isPackaged,
+    execPath: process.execPath,
+    moduleDir: __dirname,
+    resourcesPath: process.resourcesPath,
+  })
+  desktopTrayApi = createDesktopTray({
+    Tray,
+    Menu,
+    icon,
+    tooltip: APP_NAME,
+    getState: () => ({
+      windowVisible: isAlive(mainWindow) && mainWindow.isVisible(),
+      closeToTray: desktopSettingsStore?.closeToTray === true,
+    }),
+    onShow: showMainWindow,
+    onHide: hideMainWindow,
+    onToggleCloseToTray: (value) => {
+      void desktopSettingsStore?.setCloseToTray(value === true)
+    },
+    onQuit: quitApplication,
+  })
+}
+
 function normalStartUrl() {
   return resolveStartUrl({
     isPackaged: app.isPackaged,
@@ -1974,7 +2074,8 @@ function normalStartUrl() {
 async function ensureNormalMainWindow() {
   if (isAlive(mainWindow)) return mainWindow
   if (creatingMainWindow) return creatingMainWindow
-  const startUrl = normalStartUrl()
+  const startUrl = pendingDeepLinkTarget || normalStartUrl()
+  pendingDeepLinkTarget = null
   creatingMainWindow = createMainWindow({
     startUrl,
     appOrigin: originOf(startUrl) || PINNED_APP_ORIGIN,
@@ -1993,15 +2094,20 @@ if (!hasSingleInstanceLock) {
   app.quit()
 } else {
   app.on('second-instance', (_event, argv) => {
+    const deepLink = findOpenClaudeUrlInArgv(argv)
+    if (deepLink && applyDeepLink(deepLink)) return
     const intent = parseLaunchIntent(argv)
     if (!isAlive(mainWindow)) {
       void ensureNormalMainWindow()
       return
     }
     if (intent?.type === 'home') homeProduct()
-    if (mainWindow.isMinimized()) mainWindow.restore()
-    mainWindow.show()
-    mainWindow.focus()
+    showMainWindow()
+  })
+
+  app.on('open-url', (event, url) => {
+    event.preventDefault()
+    applyDeepLink(url)
   })
 
   app
@@ -2014,6 +2120,9 @@ if (!hasSingleInstanceLock) {
         app.exit(exitCode)
         return
       }
+      await installDesktopTray()
+      const launchDeepLink = findOpenClaudeUrlInArgv(process.argv)
+      if (launchDeepLink) applyDeepLink(launchDeepLink)
       await ensureNormalMainWindow()
     })
     .catch(async (error) => {
@@ -2028,6 +2137,7 @@ app.on('activate', () => {
 })
 
 app.on('before-quit', () => {
+  isQuitting = true
   void windowStateStore?.flush().catch(() => {})
 })
 
