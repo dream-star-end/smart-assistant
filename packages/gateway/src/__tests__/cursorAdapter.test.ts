@@ -1437,6 +1437,7 @@ for(const e of [
       const summary = await run.summary
       assert.equal(summary?.isError, true)
       assert.equal(summary?.errorClass, 'context_too_long')
+      assert.match(summary?.errorDetail ?? '', /PROMPT_TOO_LONG/)
     } finally {
       restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
     }
