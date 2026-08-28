@@ -81,7 +81,7 @@ function defaultMigrationsDir(): string {
 }
 
 /**
- * 把一段 SQL 按顶层分号切成独立语句。识别 `--` / `/* */` 注释、单双引号、
+ * 把一段 SQL 按顶层分号切成独立语句。识别行注释、块注释、单双引号、
  * dollar-quote (`$$` / `$tag$`),不会切开 DO $$ ... END $$ 块内部的分号。
  *
  * 给 `-- no-transaction` 迁移用:CREATE/DROP INDEX CONCURRENTLY 必须是独立
