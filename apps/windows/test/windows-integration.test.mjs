@@ -11,25 +11,25 @@ import {
 } from '../src/windows-integration.mjs'
 
 test('parseLaunchIntent recognizes only the fixed privacy-safe home argument', () => {
-  assert.deepEqual(parseLaunchIntent(['Aurora.exe', '--home']), { type: 'home' })
-  assert.equal(parseLaunchIntent(['Aurora.exe', '--home=https://attacker.invalid']), null)
-  assert.equal(parseLaunchIntent(['Aurora.exe', 'https://claudeai.chat/session/private']), null)
+  assert.deepEqual(parseLaunchIntent(['Clarvy.exe', '--home']), { type: 'home' })
+  assert.equal(parseLaunchIntent(['Clarvy.exe', '--home=https://attacker.invalid']), null)
+  assert.equal(parseLaunchIntent(['Clarvy.exe', 'https://claudeai.chat/session/private']), null)
   assert.equal(parseLaunchIntent('not-an-array'), null)
 })
 
 test('buildJumpList contains one fixed home task and no user content', () => {
-  assert.deepEqual(buildJumpList({ executablePath: 'C:\\Aurora\\Aurora.exe' }), [
+  assert.deepEqual(buildJumpList({ executablePath: 'C:\\Clarvy\\Clarvy.exe' }), [
     {
       type: 'tasks',
       items: [
         {
           type: 'task',
-          program: 'C:\\Aurora\\Aurora.exe',
+          program: 'C:\\Clarvy\\Clarvy.exe',
           args: '--home',
-          iconPath: 'C:\\Aurora\\Aurora.exe',
+          iconPath: 'C:\\Clarvy\\Clarvy.exe',
           iconIndex: 0,
           title: '打开主页',
-          description: '打开 OpenClaude Aurora 主页',
+          description: '打开 Clarvy 主页',
         },
       ],
     },
@@ -40,7 +40,7 @@ test('buildJumpList contains one fixed home task and no user content', () => {
 test('installJumpList uses only the injected Electron app and degrades safely', () => {
   let installed
   const app = {
-    getPath: (name) => (name === 'exe' ? 'C:\\Aurora\\Aurora.exe' : ''),
+    getPath: (name) => (name === 'exe' ? 'C:\\Clarvy\\Clarvy.exe' : ''),
     setJumpList: (categories) => {
       installed = categories
       return 'ok'

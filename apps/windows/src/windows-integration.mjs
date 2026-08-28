@@ -23,7 +23,7 @@ export function buildJumpList({ executablePath, iconPath = executablePath } = {}
           iconPath: safeIconPath,
           iconIndex: 0,
           title: '打开主页',
-          description: '打开 OpenClaude Aurora 主页',
+          description: '打开 Clarvy 主页',
         },
       ],
     },

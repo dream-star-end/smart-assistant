@@ -68,7 +68,7 @@ function freezeClone(value, depth = 0) {
 const api = Object.freeze({
   send(command) {
     const normalized = normalizeCommand(command)
-    if (!normalized) throw new TypeError('Unsupported Aurora desktop command')
+    if (!normalized) throw new TypeError('Unsupported Clarvy desktop command')
     ipcRenderer.send(COMMAND_CHANNEL, normalized)
     return true
   },

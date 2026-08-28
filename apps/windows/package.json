@@ -1,7 +1,7 @@
 {
   "name": "@openclaude/windows-app",
-  "version": "0.4.0",
-  "description": "OpenClaude Aurora V5 hybrid Windows application",
+  "version": "0.5.0",
+  "description": "Clarvy（从简）V5 Windows 桌面版",
   "private": true,
   "type": "module",
   "main": "src/main.mjs",

@@ -1,6 +1,6 @@
-# Aurora V5 Windows Desktop
+# Clarvy（从简）V5 Windows Desktop
 
-本文是 Aurora Windows PC 客户端的架构、开发、CI、安全与发布验收说明。桌面端是
+本文是 Clarvy（从简）Windows PC 客户端的架构、开发、CI、安全与发布验收说明。桌面端是
 “本地 Fluent Windows shell + 隔离远端 V5 产品区”的混合应用，不建立第二套聊天、认证、
 会话或计费实现，也不再是单个 `BrowserWindow` 直接包装线上站点。
 
@@ -37,7 +37,7 @@ resolution、禁止 force/delete，并 require GitHub Actions 的 `Windows app g
 
 ```text
 Windows NSIS
-  └─ Aurora.exe (Electron main，窗口/权限/下载/IPC 权威)
+  └─ Clarvy.exe (Electron main，窗口/权限/下载/IPC 权威)
        └─ BaseWindow
             ├─ app://aurora-shell
             │    └─ 本地 Fluent shell WebContentsView + 窄 preload bridge
@@ -97,7 +97,7 @@ main frame 和 payload schema。禁止任意 URL/path、原始 `ipcRenderer`、�
 ### 3.1.1 Codex 风格桌面框架合同
 
 视觉层级参考 Codex 桌面版，但不复制其本地仓库/任务数据模型。shell 只提供一条 44px 高的本地
-app bar，标题固定为安装包内的“Aurora / 桌面工作区”，不读取远端页面 DOM、路由标题或聊天内容。
+app bar，标题固定为安装包内的“从简 / 桌面工作区”，不读取远端页面 DOM、路由标题或聊天内容。
 远端 V5 产品区仍占据 app bar 下方的完整工作区，并继续是认证、会话和核心 UI 的唯一权威。
 
 Windows 上 app bar 与 Electron Window Controls Overlay（`titleBarOverlay`，高度同样 44px）合并，
@@ -200,9 +200,9 @@ Workflow：`.github/workflows/v5-windows-desktop.yml`。
 1. 用 `apps/windows` 独立 lockfile 执行 `npm ci`。
 2. 执行策略、合同、窗口/IPC/下载和语法检查 `npm run check`。
 3. 以 electron-builder 构建 Windows x64 NSIS。
-4. 启动 `release/win-unpacked/Aurora.exe --smoke-test` 跑 packaged 双-view 行为合同，45 秒未退出即强杀并判红。
+4. 启动 `release/win-unpacked/Clarvy.exe --smoke-test` 跑 packaged 双-view 行为合同，45 秒未退出即强杀并判红。
 5. 静默安装到 runner 临时目录，再跑一次 installed smoke，最后静默卸载并确认 exe 消失。
-6. 对唯一的 `Aurora-Setup-*.exe` 生成 `SHA256SUMS.txt`。
+6. 对唯一的 `Clarvy-Setup-*.exe` 生成 `SHA256SUMS.txt`。
 7. 上传 installer、blockmap/metadata（若生成）和 SHA-256，保留 14 天。
 
 该 workflow 当前在所有触发方式下都设置 `CSC_IDENTITY_AUTO_DISCOVERY=false`，产物名含
@@ -233,7 +233,7 @@ CI 当前生成的是未签名内测包。Windows 会显示“未知发布者”
 内测人员必须从受控 CI run 下载，并对照同一 artifact 内 `SHA256SUMS.txt`：
 
 ```powershell
-Get-FileHash .\Aurora-Setup-<version>-x64.exe -Algorithm SHA256
+Get-FileHash .\Clarvy-Setup-<version>-x64.exe -Algorithm SHA256
 ```
 
 ## 8. 正式签名前置条件

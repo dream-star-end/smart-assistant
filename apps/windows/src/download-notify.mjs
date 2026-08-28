@@ -1,4 +1,4 @@
-export const DOWNLOAD_NOTIFICATION_TITLE = 'OpenClaude Aurora'
+export const DOWNLOAD_NOTIFICATION_TITLE = 'Clarvy'
 export const DOWNLOAD_NOTIFICATION_BODY = '下载已完成'
 export const LIVE_NOTIFICATION_LIMIT = 20
 const OPAQUE_DOWNLOAD_ID = /^[A-Za-z0-9_-]{1,128}$/
