@@ -575,7 +575,8 @@ export function shouldEmitContextRebuilt(opts: {
  * 把它合并到 TOOL 档,不新增第三档(同语义不切碎)。
  *
  * 另有 _runOneTurn 内部一个 30 min 硬背书 timer(被任意 stdout chunk 重置),
- * 作为这两档之上的兜底,不在本文件常量范围。
+ * 作为这两档之上的兜底,不在本文件常量范围。等人回答期间不得把它当静默
+ * 触发 interrupt/免单,见 `shouldFireTurnIdleTimeout`。
  */
 export const IDLE_TIMEOUT_TOOL_MS = 15 * 60_000
 export const IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
@@ -622,6 +623,42 @@ export function shouldTripIdleWatchdog(input: {
   thresholdMs: number
 }): boolean {
   return !input.waitingForUserInput && input.idleMs > input.thresholdMs
+}
+
+/**
+ * 30min per-turn hard-backstop timer in `_runOneTurn`.
+ *
+ * Waiting for explicit user input (AskUserQuestion / request_user_input /
+ * permission card) is not engine silence. Same authority signal as
+ * `shouldTripIdleWatchdog`: `runner.waitingForUserInput === true`.
+ * Finalized turns are already past the interrupt/waiver window.
+ */
+export function shouldFireTurnIdleTimeout(input: {
+  waitingForUserInput: boolean
+  finalized: boolean
+}): boolean {
+  return !input.finalized && !input.waitingForUserInput
+}
+
+/**
+ * Drive one tick of the 30min per-turn timer.
+ * Returns true → caller should interrupt + waive.
+ * Waiting-for-user re-arms `refresh` and returns false (defer repeatedly).
+ * Finalized turns are a no-op.
+ */
+export function applyTurnIdleTimeoutTick(input: {
+  waitingForUserInput: boolean
+  finalized: boolean
+  refresh: () => void
+}): boolean {
+  if (!shouldFireTurnIdleTimeout({
+    waitingForUserInput: input.waitingForUserInput,
+    finalized: input.finalized,
+  })) {
+    if (!input.finalized && input.waitingForUserInput) input.refresh()
+    return false
+  }
+  return true
 }
 
 /**
@@ -5392,20 +5429,26 @@ export class SessionManager {
       // 含 parser 会忽略的消息 —— 与旧 runner 'message' 的 refresh 时机逐条对齐)。
       // A turn is only killed if the agent produces no output for this long, so long
       // active tasks keep running while genuinely stuck turns still get interrupted.
+      // Waiting for the user is not silence: re-arm instead of IDLE_TIMEOUT/waiver.
+      // The 12h logical-turn hard limit in submit() is unchanged.
       const IDLE_TIMEOUT_MS = 30 * 60 * 1000 // 30 min of silence from runner
       const timer = setTimeout(
         () => {
-          if (!turn?.finalized) {
-            const reason = '任务 30 分钟没有新输出，已中断。本轮已自动免单，积分将原路退回；请重试。'
-            const persistence = requestTerminalPersistence?.(
-              'interrupted',
-              reason,
-              'IDLE_TIMEOUT',
-              'idle_timeout',
-            )
-              ?? Promise.resolve()
-            this._trackPersistence(persistence)
-          }
+          const fire = applyTurnIdleTimeoutTick({
+            waitingForUserInput: runner.waitingForUserInput === true,
+            finalized: turn?.finalized === true,
+            refresh: () => timer.refresh(),
+          })
+          if (!fire) return
+          const reason = '任务 30 分钟没有新输出，已中断。本轮已自动免单，积分将原路退回；请重试。'
+          const persistence = requestTerminalPersistence?.(
+            'interrupted',
+            reason,
+            'IDLE_TIMEOUT',
+            'idle_timeout',
+          )
+            ?? Promise.resolve()
+          this._trackPersistence(persistence)
         },
         IDLE_TIMEOUT_MS,
       )
