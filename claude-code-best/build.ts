@@ -30,12 +30,15 @@ const envFeatures = Object.keys(process.env)
 //   ③ 与 v5 既有机制重叠待评估:ULTRATHINK / ULTRAPLAN(v5 有自己的 effort/thinking
 //      权威)、LODESTONE(v5 有自己的 context 定制)、BUDDY(终端宠物,v5 走 web 无意义)。
 //
-// 因此本批升级保持**行为面零变化**:features 仍只来自 env,让 680 commit 的代码跟进
-// 与 feature 开启解耦 —— 出问题才定位得出来。feature 开启走独立批次,逐项评估
-// (成本实测 + 安全审 + canary),清单与结论记在 UPSTREAM.md §2.1。
+// 因此本批升级保持**行为面最小化**:除 REACTIVE_COMPACT 外,features 仍只来自 env,
+// 让 680 commit 的代码跟进与其它 feature 开启解耦。REACTIVE_COMPACT 是 2026-08-28
+// 经真实 Kimi K3 长 turn 事故单独放行的恢复面:上游返回 `Prompt is too long` 后,
+// 只做一次有界 compact + retry;compact 自身超窗时最多按 API-round 丢头重试 3 次,
+// 不开启 reactive-only 模式,也不改变现有 proactive auto-compact 阈值。其余 feature
+// 仍须独立评估(成本实测 + 安全审 + canary),清单与结论记在 UPSTREAM.md §2.1。
 //
 // 想临时试某个 feature:`FEATURE_MONITOR_TOOL=1 bun run build`。
-const features = envFeatures
+const features = [...new Set(['REACTIVE_COMPACT', ...envFeatures])]
 
 // Step 2: Bundle with splitting
 //

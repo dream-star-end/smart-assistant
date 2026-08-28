@@ -68,6 +68,16 @@ describe('classifyRunError', () => {
     assert.equal(r.code, 'context_too_long')
   })
 
+  it('context_too_long: CCB canonical prompt-too-long success envelope', () => {
+    const raw = JSON.stringify({
+      subtype: 'success',
+      result: 'Prompt is too long',
+    })
+    const r = classifyRunError(raw)
+    assert.equal(r.code, 'context_too_long')
+    assert.equal(r.message, '上下文长度超过模型上限')
+  })
+
   it('bad_request: generic upstream invalid request is not called an outage', () => {
     const apiError =
       'API Error: 400 {"error":{"code":"INVALID_REQUEST","message":"The upstream provider rejected this request"}}'
