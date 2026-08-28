@@ -254,10 +254,10 @@ describe("0254–0257 desktop virtual container apply", () => {
       await readFile(path.join(migrationsDir, "0256_drop_user_channel_active.sql"), "utf8"),
     );
     for (const stmt of dropStmts) await query(stmt);
-    const oldIdx = await query<{ n: string }>(
+    const oldIdxAfterDrop = await query<{ n: string }>(
       `SELECT COUNT(*)::text AS n FROM pg_class WHERE relname='uniq_ac_user_channel_active'`,
     );
-    assert.equal(oldIdx.rows[0]!.n, "0");
+    assert.equal(oldIdxAfterDrop.rows[0]!.n, "0");
 
     await query(
       await readFile(path.join(migrationsDir, "0257_turn_dispatches_agent_container.sql"), "utf8"),
