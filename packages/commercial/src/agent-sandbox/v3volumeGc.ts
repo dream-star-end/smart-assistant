@@ -209,6 +209,7 @@ async function hasActiveContainerLocked(
         WHERE user_id = $1::bigint
           AND state = 'active'
           AND runtime_channel = $2::text
+          AND runtime_kind = 'docker'
      ) AS exists`,
     [String(uid), getRuntimeChannel()],
   );

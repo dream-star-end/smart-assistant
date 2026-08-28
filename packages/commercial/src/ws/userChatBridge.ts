@@ -1824,7 +1824,8 @@ export async function isCursorContainerOnSelfHost(
   if (!trustedHostId) return false;
   const eligible = await pgPool.query<{ ok: number }>(
     `SELECT 1 AS ok FROM agent_containers
-      WHERE id=$1 AND user_id=$2 AND state='active' AND host_uuid=$3::uuid`,
+      WHERE id=$1 AND user_id=$2 AND state='active' AND host_uuid=$3::uuid
+        AND runtime_kind = 'docker'`,
     [containerId, uid, trustedHostId],
   );
   return eligible.rowCount === 1;

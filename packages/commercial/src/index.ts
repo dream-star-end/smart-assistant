@@ -4959,7 +4959,7 @@ export async function registerCommercial(
                       EXTRACT(EPOCH FROM (NOW() - ac.created_at))::text AS age_seconds
                FROM agent_containers ac
                LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-               WHERE ac.id = $1 AND ac.runtime_channel = $2
+               WHERE ac.id = $1 AND ac.runtime_channel = $2 AND ac.runtime_kind = 'docker'
                FOR UPDATE OF ac`,
               [containerId, getRuntimeChannel()],
             );
@@ -5028,7 +5028,8 @@ export async function registerCommercial(
               const upd = await client.query(
                 `UPDATE agent_containers
                     SET state = 'vanished', updated_at = NOW()
-                  WHERE id = $1 AND state = 'active' AND runtime_channel = $2`,
+                  WHERE id = $1 AND state = 'active' AND runtime_channel = $2
+                    AND runtime_kind = 'docker'`,
                 [containerId, getRuntimeChannel()],
               );
               if ((upd.rowCount ?? 0) === 0) {
@@ -5146,7 +5147,7 @@ export async function registerCommercial(
           // lint-agent-containers-sql: allow — 回收路径必须能看到任意 state 的行,
           // 目的就是把它 stop+remove;行只喂 stopAndRemoveV3Container,
           // 不进任何用户可见视图 / 计费聚合。
-          "SELECT id, container_internal_id, host_uuid FROM agent_containers WHERE id = $1",
+          "SELECT id, container_internal_id, host_uuid FROM agent_containers WHERE id = $1 AND runtime_kind = 'docker'",
           [containerId],
         );
         const row = rows[0];
@@ -5774,6 +5775,7 @@ export async function registerCommercial(
                  FROM agent_containers ac
                  LEFT JOIN compute_hosts ch ON ch.id = ac.host_uuid
                 WHERE ac.user_id = $1 AND ac.state = 'active' AND ac.runtime_channel = $2
+                  AND ac.runtime_kind = 'docker'
                   AND ac.bound_ip IS NOT NULL AND ac.port IS NOT NULL
                 ORDER BY ac.updated_at DESC LIMIT 1`,
               [uid.toString(), getRuntimeChannel()],
@@ -6462,6 +6464,7 @@ export async function registerCommercial(
                  FROM agent_containers ac
                  LEFT JOIN compute_hosts ch ON ch.id = ac.host_uuid
                 WHERE ac.user_id = $1 AND ac.state = 'active' AND ac.runtime_channel = $2
+                  AND ac.runtime_kind = 'docker'
                   AND ac.bound_ip IS NOT NULL AND ac.port IS NOT NULL
                 ORDER BY ac.updated_at DESC LIMIT 1`,
               [uid.toString(), getRuntimeChannel()],

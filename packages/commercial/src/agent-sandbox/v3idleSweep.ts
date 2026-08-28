@@ -181,7 +181,7 @@ interface StaleRow {
  *
  * 用 `LIMIT batchLimit` 防一次扫太多;下一轮 60s 后还会跑,慢慢清空也无妨。
  */
-async function selectStaleRows(
+export async function selectStaleRows(
   pool: Pool,
   idleCutoffMin: number,
   batchLimit: number,
@@ -196,6 +196,7 @@ async function selectStaleRows(
        FROM agent_containers c
       WHERE state = 'active'
         AND c.runtime_channel = $3::text
+        AND c.runtime_kind = 'docker'
         AND last_ws_activity IS NOT NULL
         AND last_ws_activity < NOW() - ($1::int * interval '1 minute')
         AND NOT EXISTS (
@@ -236,6 +237,7 @@ async function stillIdleLocked(
        FROM agent_containers
       WHERE id = $1::bigint
         AND runtime_channel = $2::text
+        AND runtime_kind = 'docker'
         AND state = 'active'
         AND last_ws_activity IS NOT NULL
         AND last_ws_activity < NOW() - ($3::int * interval '1 minute')
@@ -298,7 +300,8 @@ async function classifyStopMiss(
               ) AS open_migration
          FROM agent_containers c
         WHERE c.id = $1::bigint
-          AND c.runtime_channel = $2::text`,
+          AND c.runtime_channel = $2::text
+          AND c.runtime_kind = 'docker'`,
       [String(row.id), getRuntimeChannel()],
     );
     if ((r.rowCount ?? 0) === 0) return "skippedGeneration";

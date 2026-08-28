@@ -336,6 +336,7 @@ export async function findOpenByUser(
       WHERE c.user_id = $1
         AND c.state IN ('active', 'pending_apply')
         AND c.runtime_channel = $2
+        AND c.runtime_kind = 'docker'
         AND m.phase NOT IN ('committed', 'rolled_back')
       ORDER BY m.updated_at DESC, m.id DESC
       LIMIT 1`,

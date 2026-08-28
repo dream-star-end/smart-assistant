@@ -67,7 +67,7 @@ async function latestV3Container(uid: string): Promise<V3ContainerRow | null> {
   // "当前/最后一次真正跑起来的容器落点",防历史残留 vanished 行选到错误 host)。
   const r = await query<V3ContainerRow>(
     `SELECT host_uuid, state FROM agent_containers
-      WHERE user_id = $1 AND runtime_channel = 'v3'
+      WHERE user_id = $1 AND runtime_channel = 'v3' AND runtime_kind = 'docker'
       ORDER BY (state = 'active') DESC,
                COALESCE(last_started_at, created_at) DESC,
                created_at DESC

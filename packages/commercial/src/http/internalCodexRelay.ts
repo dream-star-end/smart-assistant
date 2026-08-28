@@ -740,7 +740,7 @@ export function makeDefaultCodexRelayDb(): CodexRelayDb {
                 ca.status AS account_status
            FROM agent_containers ac -- state selected above; handler rejects non-active
            LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-          WHERE ac.id = $1 AND ac.runtime_channel = $2`,
+          WHERE ac.id = $1 AND ac.runtime_channel = $2 AND ac.runtime_kind = 'docker'`,
         [containerId, getRuntimeChannel()],
       )
       if (!r.rows[0]) return null
