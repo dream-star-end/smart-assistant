@@ -124,8 +124,9 @@ scripts/ccb-upstream.sh plan v2.8.4     # 三方合并预演:冲突面、搬迁�
 
 ### ① feature 门控的新增
 
-上游 v2.8.4 起有 `DEFAULT_BUILD_FEATURES`(35 项默认开),而 v5 生产是零 feature(见 `build.ts`
-的 v5 定制段)。危险情形是:**pin 时代某能力不受门控(直接可用),上游给它加了门控** ——
+上游 v2.8.4 起有 `DEFAULT_BUILD_FEATURES`(35 项默认开),而 v5 生产只固定开启经事故验证的
+`REACTIVE_COMPACT`,其它 feature 仍默认关闭(见 `build.ts` 的 v5 定制段)。危险情形是:
+**pin 时代某能力不受门控(直接可用),上游给它加了门控** ——
 那我们不开就等于砍掉用户已有功能。
 
 ```bash

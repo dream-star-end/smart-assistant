@@ -77,7 +77,13 @@ const PATTERNS: Array<{
     message: '当前账号被限流，请稍后再试',
   },
   {
-    re: /PROMPT_TOO_LONG|ran out of room in the model(?:'|’)s context window|context window (?:was )?(?:exceeded|too long)/i,
+    // CCB intentionally normalizes provider 400/413 details to the exact
+    // assistant diagnostic `Prompt is too long` (services/api/errors.ts).
+    // Its terminal row is unusual but valid: subtype=success + is_error=true.
+    // Match that canonical text as well as structured proxy/Codex variants so
+    // the gateway can retire the poisoned native resume instead of retrying it
+    // forever as an upstream outage.
+    re: /PROMPT_TOO_LONG|\bprompt is too long\b|ran out of room in the model(?:'|’)s context window|context window (?:was )?(?:exceeded|too long)/i,
     code: 'context_too_long',
     message: '上下文长度超过模型上限',
   },
