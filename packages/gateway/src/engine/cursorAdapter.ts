@@ -1595,7 +1595,14 @@ export function relocateCursorResumeStore(opts: {
     const destDir = cursorResumeStoreDir(currentWorkspacePath, resumeId)
     const destStore = join(destDir, 'store.db')
     if (existsSync(destDir)) {
-      return cursorStoreDbReady(destStore) ? { resumeId, relocated: false } : undefined
+      if (cursorStoreDbReady(destStore)) return { resumeId, relocated: false }
+      // destDir exists but has no usable store.db file. Clear leftover then continue.
+      try {
+        rmSync(destDir, { recursive: true, force: true })
+      } catch {
+        return undefined
+      }
+      if (existsSync(destDir) || cursorStoreDbReady(destStore)) return undefined
     }
 
     const env = opts.env ?? process.env

@@ -2257,6 +2257,36 @@ for(const e of [
     }
   })
 
+  test('relocateCursorResumeStore clears empty destDir then migrates', async () => {
+    const oldDir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-relocate-emptydest-old-'))
+    const newDir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-relocate-emptydest-new-'))
+    const resumeId = 'aaaaaaaa-bbbb-cccc-dddd-666666666666'
+    const srcStore = cursorResumeStorePath(oldDir, resumeId)
+    const destDir = cursorResumeStoreDir(newDir, resumeId)
+    const destStore = cursorResumeStorePath(newDir, resumeId)
+    await mkdir(path.dirname(srcStore), { recursive: true })
+    await writeFile(srcStore, 'turn1-store')
+    await mkdir(destDir, { recursive: true })
+    await writeFile(path.join(destDir, 'leftover.txt'), 'not-a-store')
+    try {
+      const result = relocateCursorResumeStore({
+        resumeId,
+        currentWorkspacePath: newDir,
+        previousWorkspacePaths: [oldDir],
+      })
+      assert.deepEqual(result, { resumeId, relocated: true })
+      assert.equal(existsSync(destStore), true)
+      assert.equal(await readFile(destStore, 'utf8'), 'turn1-store')
+      assert.equal(existsSync(srcStore), false)
+      assert.equal(existsSync(path.join(destDir, 'leftover.txt')), false)
+    } finally {
+      await rm(cursorResumeStoreDir(oldDir, resumeId), { recursive: true, force: true })
+      await rm(destDir, { recursive: true, force: true })
+      await rm(oldDir, { recursive: true, force: true })
+      await rm(newDir, { recursive: true, force: true })
+    }
+  })
+
   test('relocateCursorResumeStore skips lookup when neither hash has a store', async () => {
     const oldDir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-relocate-miss-old-'))
     const newDir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-relocate-miss-new-'))
