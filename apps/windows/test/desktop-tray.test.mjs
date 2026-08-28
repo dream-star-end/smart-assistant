@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import path from 'node:path'
 import test from 'node:test'
 
 import {
@@ -19,16 +20,19 @@ test('shouldHideInsteadOfClose only intercepts close when the persisted toggle i
 })
 
 test('resolveTrayIconCandidates prefers the existing packaged PNG then the executable', () => {
+  const moduleDir = '/repo/apps/windows/src'
+  const resourcesPath = '/repo/resources'
+  const execPath = 'C:\\Clarvy\\Clarvy.exe'
   assert.deepEqual(
     resolveTrayIconCandidates({
-      moduleDir: '/repo/apps/windows/src',
-      resourcesPath: '/repo/resources',
-      execPath: 'C:\\Clarvy\\Clarvy.exe',
+      moduleDir,
+      resourcesPath,
+      execPath,
     }),
     [
-      '/repo/packages/web-react/public/icons/icon-512.png',
-      '/repo/resources/icon-512.png',
-      'C:\\Clarvy\\Clarvy.exe',
+      path.join(moduleDir, '../../../packages/web-react/public/icons/icon-512.png'),
+      path.join(resourcesPath, 'icon-512.png'),
+      execPath,
     ],
   )
   assert.deepEqual(resolveTrayIconCandidates({}), [])
