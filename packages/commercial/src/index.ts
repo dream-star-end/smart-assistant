@@ -116,6 +116,7 @@ import {
   startRefreshEventsSweeper,
   type SweeperHandle as RefreshEventsSweeperHandle,
 } from "./account-pool/refreshEventsSweeper.js";
+import { startDesktopEnrollmentSweep } from "./http/desktopEnroll.js";
 import {
   startAuditRetentionSweeper,
   type AuditRetentionSweeperHandle,
@@ -5384,6 +5385,17 @@ export async function registerCommercial(
       domain: "shared",
       start: () => {
         const h = trackScheduler("refreshEventsSweep", "shared", startRefreshEventsSweeper());
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
+  if (process.env.OC_DESKTOP_ENROLL_SWEEP_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "desktopEnrollSweep",
+      domain: "shared",
+      start: () => {
+        const h = trackScheduler("desktopEnrollSweep", "shared", startDesktopEnrollmentSweep());
         return { stop: () => h.stop() };
       },
     });

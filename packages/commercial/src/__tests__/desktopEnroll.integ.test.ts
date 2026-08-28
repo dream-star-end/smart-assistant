@@ -1,0 +1,372 @@
+/**
+ * Desktop enrollment + token lifecycle (real PG + openssl device CA).
+ *
+ * REQUIRE_TEST_DB=1 bash scripts/test-mutex.sh commercial \
+ *   'npx tsx --test --test-force-exit --test-concurrency=1 --test-timeout=180000 \
+ *    packages/commercial/src/__tests__/desktopEnroll.integ.test.ts'
+ */
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { Readable } from "node:stream";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { describe, test } from "node:test";
+import { SignJWT } from "jose";
+import { generatePkceVerifier, pkceChallengeS256 } from "../connectors/pkce.js";
+import { query } from "../db/queries.js";
+import { resetDesktopFlagCache, setDesktopSettingsLoader } from "../desktop/flags.js";
+import { createMemoryDesktopTunnelRegistry } from "../ws/desktopTunnelRegistry.js";
+import { DESKTOP_IDENTITY_PUBLIC_MESSAGE } from "../desktop/flags.js";
+import { verifyDesktopIdentity, DesktopIdentityError, type DesktopIdentityRepo } from "../auth/desktopIdentity.js";
+import { createPgDesktopIdentityRepo } from "../http/desktopEnroll.js";
+import {
+  handleDesktopEnrollConfirm,
+  handleDesktopEnrollFinish,
+  handleDesktopEnrollStart,
+  handleDesktopRevoke,
+  handleDesktopTokenMint,
+  handleDesktopTokenRefresh,
+} from "../http/desktopEnroll.js";
+import type { CommercialHttpDeps, RequestContext } from "../http/handlers.js";
+import { HttpError } from "../http/util.js";
+import { rootLogger } from "../logging/logger.js";
+import { useDedicatedTestDatabase } from "./helpers/db.js";
+
+const db = useDedicatedTestDatabase("desktop_enroll_p1b_test");
+const JWT = "desktop-enroll-integ-secret-must-be-32b!!";
+
+function memRedis() {
+  const m = new Map<string, number>();
+  return {
+    async incr(key: string) {
+      m.set(key, (m.get(key) ?? 0) + 1);
+      return m.get(key)!;
+    },
+    async expire() {
+      return 1;
+    },
+  };
+}
+
+function request(body: unknown, headers: Record<string, string> = {}): IncomingMessage {
+  const stream = Readable.from([JSON.stringify(body)]) as IncomingMessage;
+  stream.method = "POST";
+  stream.url = "/";
+  stream.headers = { "content-type": "application/json", ...headers };
+  return stream;
+}
+
+function response(): { res: ServerResponse; body: () => Record<string, unknown>; status: () => number } {
+  let payload = "";
+  let statusCode = 200;
+  const res = {
+    setHeader() {},
+    get statusCode() {
+      return statusCode;
+    },
+    set statusCode(v: number) {
+      statusCode = v;
+    },
+    end(chunk?: string) {
+      payload = chunk ?? "";
+    },
+  } as unknown as ServerResponse;
+  return {
+    res,
+    body: () => JSON.parse(payload || "{}") as Record<string, unknown>,
+    status: () => statusCode,
+  };
+}
+
+function ctx(): RequestContext {
+  return {
+    requestId: "integ",
+    clientIp: "10.0.0.9",
+    authBoundIp: "10.0.0.9",
+    userAgent: "integ",
+    log: rootLogger.child({ subsys: "desktop-enroll-integ" }),
+  };
+}
+
+async function bearer(uid: number, role = "admin"): Promise<string> {
+  return new SignJWT({ sub: String(uid), role, jti: "d1" })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime("1h")
+    .sign(new TextEncoder().encode(JWT));
+}
+
+function derFromPem(pem: string): Buffer {
+  const b64 = pem.replace(/-----[^-]+-----/g, "").replace(/\s/g, "");
+  return Buffer.from(b64, "base64");
+}
+
+describe("desktop enrollment integ", () => {
+  test("full enroll, token rotate, revoke, CAS, gates", async (t) => {
+    if (db.skipIfUnavailable(t)) return;
+    const caDir = await mkdtemp(path.join(os.tmpdir(), "oc-dca-"));
+    const prevCa = process.env.OPENCLAUDE_DEVICE_CA_DIR;
+    const prevFlag = process.env.OC_DESKTOP_VIRTUAL_CONTAINER;
+    const prevSim = process.env.OC_DESKTOP_SIM_ENROLL;
+    process.env.OPENCLAUDE_DEVICE_CA_DIR = caDir;
+    process.env.OC_DESKTOP_VIRTUAL_CONTAINER = "1";
+    process.env.OC_DESKTOP_SIM_ENROLL = "1";
+    const u = await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, role, status)
+       VALUES ($1,'x','admin','active') RETURNING id::text`,
+      [`desk-enroll-${Date.now()}@t.local`],
+    );
+    const uid = Number(u.rows[0]!.id);
+    resetDesktopFlagCache();
+    setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [uid] }));
+    const drops: number[] = [];
+    const registry = createMemoryDesktopTunnelRegistry();
+    const origDrop = registry.drop.bind(registry);
+    registry.drop = (id, reason) => {
+      drops.push(id);
+      return origDrop(id, reason);
+    };
+    const verifier = generatePkceVerifier();
+    const challenge = await pkceChallengeS256(verifier);
+    const deps: CommercialHttpDeps = {
+      jwtSecret: JWT,
+      mailer: { send: async () => {} },
+      redis: memRedis(),
+      desktopTunnelRegistry: registry,
+    } as CommercialHttpDeps;
+
+    const startOut = response();
+    await handleDesktopEnrollStart(
+      request({ pkce_challenge: challenge, app_id: "chat.claudeai.clarvy", public_name: "sim", platform: "sim" }),
+      startOut.res,
+      ctx(),
+      deps,
+    );
+    assert.equal(startOut.status(), 200);
+    const enrollmentId = String(startOut.body().enrollment_id);
+
+    const tok = await bearer(uid);
+    const confirmOut = response();
+    await handleDesktopEnrollConfirm(
+      request({ enrollment_id: enrollmentId }, { authorization: `Bearer ${tok}` }),
+      confirmOut.res,
+      ctx(),
+      deps,
+    );
+    assert.equal(confirmOut.status(), 200);
+    const code = String(confirmOut.body().code);
+
+    const finishOnce = () =>
+      handleDesktopEnrollFinish(
+        request({ enrollment_id: enrollmentId, code, pkce_verifier: verifier }),
+        response().res,
+        ctx(),
+        deps,
+      );
+    const replay = response();
+    await handleDesktopEnrollFinish(
+      request({ enrollment_id: enrollmentId, code, pkce_verifier: verifier }),
+      replay.res,
+      ctx(),
+      deps,
+    );
+    assert.equal(replay.status(), 200);
+    const finished = replay.body();
+    const deviceCred = String(finished.device_credential);
+    const deviceCert = String(finished.device_cert);
+    const deviceId = String(finished.deviceId);
+    const containerId = Number(finished.containerId);
+    await assert.rejects(finishOnce, (e: unknown) => e instanceof HttpError && e.status === 409 && e.code === "ENROLL_CONSUMED");
+
+    const startDup = response();
+    await handleDesktopEnrollStart(
+      request({ pkce_challenge: challenge, app_id: "chat.claudeai.clarvy", platform: "sim" }),
+      startDup.res,
+      ctx(),
+      deps,
+    );
+    await assert.rejects(
+      () =>
+        handleDesktopEnrollConfirm(
+          request({ enrollment_id: String(startDup.body().enrollment_id) }, { authorization: `Bearer ${tok}` }),
+          response().res,
+          ctx(),
+          deps,
+        ),
+      (e: unknown) => e instanceof HttpError && e.status === 409 && e.code === "DEVICE_LIMIT",
+    );
+
+    const der = derFromPem(deviceCert);
+    deps.desktopPeerCert = () => ({
+      raw: der,
+      subjectaltname: `URI:spiffe://openclaude/desktop-device/${deviceId}`,
+    });
+
+    const mint1 = response();
+    await handleDesktopTokenMint(
+      request({ device_credential: deviceCred }),
+      mint1.res,
+      ctx(),
+      deps,
+    );
+    assert.equal(mint1.status(), 200);
+    const token1 = String(mint1.body().token);
+    assert.match(token1, /^oc-v3\.\d+\.[0-9a-f]{64}$/);
+    assert.ok(drops.includes(containerId));
+
+    const mint2 = response();
+    await handleDesktopTokenMint(
+      request({ device_credential: deviceCred }),
+      mint2.res,
+      ctx(),
+      deps,
+    );
+    const token2 = String(mint2.body().token);
+    const identRepo: DesktopIdentityRepo = createPgDesktopIdentityRepo();
+    const tls = {
+      tls: true as const,
+      deviceCertFp: createHash("sha256").update(der).digest(),
+      deviceSpiffe: `spiffe://openclaude/desktop-device/${deviceId}`,
+    };
+    await verifyDesktopIdentity(identRepo, tls, token2);
+    try {
+      await verifyDesktopIdentity(identRepo, tls, token1);
+      assert.fail("old token should fail");
+    } catch (e) {
+      assert.ok(e instanceof DesktopIdentityError);
+      assert.equal(e.message, DESKTOP_IDENTITY_PUBLIC_MESSAGE);
+    }
+
+    const refresh = response();
+    await handleDesktopTokenRefresh(
+      request({ device_credential: deviceCred, token: token2 }),
+      refresh.res,
+      ctx(),
+      deps,
+    );
+    assert.equal(refresh.status(), 200);
+
+    const rev = response();
+    await handleDesktopRevoke(
+      request({}, { authorization: `Bearer ${tok}` }),
+      rev.res,
+      ctx(),
+      deps,
+    );
+    assert.equal(rev.status(), 200);
+    await assert.rejects(
+      () => handleDesktopTokenMint(request({ device_credential: deviceCred }), response().res, ctx(), deps),
+      (e: unknown) => e instanceof HttpError && e.status === 401,
+    );
+
+    const u2 = await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, role, status)
+       VALUES ($1,'x','user','active') RETURNING id::text`,
+      [`desk-enroll-denied-${Date.now()}@t.local`],
+    );
+    const deniedTok = await bearer(Number(u2.rows[0]!.id), "user");
+    setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [] }));
+    resetDesktopFlagCache();
+    const start2 = response();
+    await handleDesktopEnrollStart(
+      request({ pkce_challenge: challenge, app_id: "chat.claudeai.clarvy", platform: "sim" }),
+      start2.res,
+      ctx(),
+      deps,
+    );
+    const e2 = String(start2.body().enrollment_id);
+    await assert.rejects(
+      () =>
+        handleDesktopEnrollConfirm(
+          request({ enrollment_id: e2 }, { authorization: `Bearer ${deniedTok}` }),
+          response().res,
+          ctx(),
+          deps,
+        ),
+      (err: unknown) => err instanceof HttpError && err.status === 403 && err.code === "DESKTOP_NOT_ENTITLED",
+    );
+    await assert.rejects(
+      () =>
+        handleDesktopEnrollConfirm(
+          request({ enrollment_id: e2 }),
+          response().res,
+          ctx(),
+          deps,
+        ),
+      (err: unknown) => err instanceof HttpError && err.status === 401,
+    );
+
+    if (prevCa === undefined) delete process.env.OPENCLAUDE_DEVICE_CA_DIR;
+    else process.env.OPENCLAUDE_DEVICE_CA_DIR = prevCa;
+    if (prevFlag === undefined) delete process.env.OC_DESKTOP_VIRTUAL_CONTAINER;
+    else process.env.OC_DESKTOP_VIRTUAL_CONTAINER = prevFlag;
+    if (prevSim === undefined) delete process.env.OC_DESKTOP_SIM_ENROLL;
+    else process.env.OC_DESKTOP_SIM_ENROLL = prevSim;
+    setDesktopSettingsLoader(null);
+    resetDesktopFlagCache();
+    await rm(caDir, { recursive: true, force: true });
+  });
+
+  test("concurrent finish CAS: only one succeeds", async (t) => {
+    if (db.skipIfUnavailable(t)) return;
+    const caDir = await mkdtemp(path.join(os.tmpdir(), "oc-dca-"));
+    process.env.OPENCLAUDE_DEVICE_CA_DIR = caDir;
+    process.env.OC_DESKTOP_VIRTUAL_CONTAINER = "1";
+    process.env.OC_DESKTOP_SIM_ENROLL = "1";
+    const u = await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, role, status)
+       VALUES ($1,'x','admin','active') RETURNING id::text`,
+      [`desk-cas-${Date.now()}@t.local`],
+    );
+    const uid = Number(u.rows[0]!.id);
+    resetDesktopFlagCache();
+    setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [uid] }));
+    const verifier = generatePkceVerifier();
+    const challenge = await pkceChallengeS256(verifier);
+    const deps: CommercialHttpDeps = {
+      jwtSecret: JWT,
+      mailer: { send: async () => {} },
+      redis: memRedis(),
+    } as CommercialHttpDeps;
+    const startOut = response();
+    await handleDesktopEnrollStart(
+      request({ pkce_challenge: challenge, app_id: "chat.claudeai.clarvy", platform: "sim" }),
+      startOut.res,
+      ctx(),
+      deps,
+    );
+    const enrollmentId = String(startOut.body().enrollment_id);
+    const tok = await bearer(uid);
+    const confirmOut = response();
+    await handleDesktopEnrollConfirm(
+      request({ enrollment_id: enrollmentId }, { authorization: `Bearer ${tok}` }),
+      confirmOut.res,
+      ctx(),
+      deps,
+    );
+    const code = String(confirmOut.body().code);
+    const results = await Promise.allSettled([
+      handleDesktopEnrollFinish(
+        request({ enrollment_id: enrollmentId, code, pkce_verifier: verifier }),
+        response().res,
+        ctx(),
+        deps,
+      ),
+      handleDesktopEnrollFinish(
+        request({ enrollment_id: enrollmentId, code, pkce_verifier: verifier }),
+        response().res,
+        ctx(),
+        deps,
+      ),
+    ]);
+    const ok = results.filter((r) => r.status === "fulfilled").length;
+    const conflict = results.filter((r) => r.status === "rejected" && r.reason instanceof HttpError && r.reason.code === "ENROLL_CONSUMED").length;
+    assert.equal(ok, 1);
+    assert.equal(conflict, 1);
+    await rm(caDir, { recursive: true, force: true });
+    setDesktopSettingsLoader(null);
+    resetDesktopFlagCache();
+  });
+});
