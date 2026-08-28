@@ -3435,9 +3435,24 @@ describe('v5 release safety lanes', () => {
 
   test('ccb dist build fail-closes on await-using leakage (2026-05-22 crash-loop 机制化)', async () => {
     const runtimeLib = await readFile(path.join(root, 'scripts/v5-runtime-release-lib.sh'), 'utf8')
+    const ccbBuild = await readFile(path.join(root, 'claude-code-best/build.ts'), 'utf8')
     const start = runtimeLib.indexOf('oc_hotcfg_build_ccb_dist()')
     const body = runtimeLib.slice(start, runtimeLib.indexOf('oc_hotcfg_finalize_release()', start))
     assert.ok(start >= 0 && body.length > 0, 'oc_hotcfg_build_ccb_dist 函数体未找到')
+
+    // V5 仍禁止整包继承上游 DEFAULT_BUILD_FEATURES,但必须编译真实 400/413 后的
+    // 有界 reactive compact;否则 CCB 只会把 `Prompt is too long` 当成功子型错误吐给
+    // gateway,同一个 poisoned resume 点“重新尝试”仍会原地失败。
+    assert.match(
+      ccbBuild,
+      /const features = \[\.\.\.new Set\(\['REACTIVE_COMPACT', \.\.\.envFeatures\]\)\]/,
+      'CCB release build 必须固定启用且仅额外启用 REACTIVE_COMPACT',
+    )
+    assert.doesNotMatch(
+      ccbBuild,
+      /const features\s*=\s*\[[^\]]*DEFAULT_BUILD_FEATURES/,
+      'V5 CCB release 不得顺带打开上游整包默认 features',
+    )
 
     // build.ts pin 了 target='node' 让 Bun 把 `await using` 降级成 ES2022 try/finally。
     // 该 pin 一旦被上游合并覆盖回 'bun'(或 bun 默认 target 漂移),dist 会残留
