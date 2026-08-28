@@ -7,6 +7,11 @@
  * 已注册 adapter 一旦被调用后抛错(=已尝试发送但失败)照旧上抛,保留 cron outbox
  * 以同一 deliveryId 重试,不回落、不改走站内信。
  *
+ * heartbeat 语义凌驾(2026-08-28):job.heartbeat === true 时跳过一切 webchat 会话注入
+ * (tryLastActiveWebchat / broadcastWebchat),即使 deliver='webchat'。真有事项走既有
+ * 自动瀑布的非 webchat 部分(QQ/微信仍仅用户任务;heartbeat 落到 lastActive 非 webchat
+ * adapter 或站内信)。非 heartbeat 行为不变(webchat 显式置顶仍生效)。
+ *
  * 不变式:
  *   - QQ/微信/已注册 adapter 的 retryable 失败仍上抛,保留 cron outbox(同 deliveryId 重试);
  *   - 微信会话过期 fallback 标注文本;
@@ -137,22 +142,26 @@ export async function deliverCronOutput(
   let delivered = false
   let broadcastSent = 0
   const explicit = job.deliver && job.deliver !== 'local'
+  // heartbeat 永不注入 webchat,显式 deliver='webchat' 也不例外。
+  const skipWebchat = job.heartbeat === true
 
   // 显式非 local 通道置顶。deliver='webchat' 是 UI 默认值,本轮起按显式选择处理:
   // 有在线网页客户端就先落网页,不被 QQ/微信接管;离线才轮到自动通道。
   if (explicit) {
     if (job.deliver === 'webchat') {
-      const lastActive = deps.lastActiveChannel.get(job.agent)
-      if (
-        lastActive &&
-        now - lastActive.at < LAST_ACTIVE_TTL_MS &&
-        lastActive.channel === 'webchat' &&
-        tryLastActiveWebchat(lastActive)
-      ) {
-        return
+      if (!skipWebchat) {
+        const lastActive = deps.lastActiveChannel.get(job.agent)
+        if (
+          lastActive &&
+          now - lastActive.at < LAST_ACTIVE_TTL_MS &&
+          lastActive.channel === 'webchat' &&
+          tryLastActiveWebchat(lastActive)
+        ) {
+          return
+        }
+        broadcastSent = broadcastWebchat(deps.clientsByPeer, buildOut('__reflection__'))
+        if (broadcastSent > 0) return
       }
-      broadcastSent = broadcastWebchat(deps.clientsByPeer, buildOut('__reflection__'))
-      if (broadcastSent > 0) return
     } else {
       const adapter = deps.channels.get(job.deliver as string)
       if (adapter) {
@@ -190,9 +199,11 @@ export async function deliverCronOutput(
   const lastActive = deps.lastActiveChannel.get(job.agent)
   if (lastActive && now - lastActive.at < LAST_ACTIVE_TTL_MS) {
     if (lastActive.channel === 'webchat') {
-      delivered = tryLastActiveWebchat(lastActive)
+      if (!skipWebchat) {
+        delivered = tryLastActiveWebchat(lastActive)
+      }
     }
-    if (!delivered) {
+    if (!delivered && !(skipWebchat && lastActive.channel === 'webchat')) {
       const adapter = deps.channels.get(lastActive.channel)
       if (adapter) {
         await deliverCronViaAdapter(adapter, buildOut(lastActive.peerId, lastActive.sessionKey))
@@ -201,7 +212,7 @@ export async function deliverCronOutput(
     }
   }
 
-  if (!delivered) {
+  if (!delivered && !skipWebchat) {
     broadcastSent += broadcastWebchat(deps.clientsByPeer, buildOut('__reflection__'))
   }
 

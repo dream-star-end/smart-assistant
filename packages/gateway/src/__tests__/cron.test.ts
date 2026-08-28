@@ -34,6 +34,8 @@ const {
   deliverCronViaAdapter,
   classifyCronOccurrenceRecovery,
   cronExecutionTapeIsReplaySafe,
+  classifySilentCronOutput,
+  HEARTBEAT_OK_SILENT_MAX_CHARS,
   CRON_MAX_ATTEMPTS,
   CronScheduler,
 } = await import('../cron.js')
@@ -1199,5 +1201,102 @@ describe('CronScheduler deliver 通道校验与注册表对齐', () => {
       (await sched.listJobs()).find((j) => j.id === 'remind-deliver-legacy')?.deliver,
       'discord',
     )
+  })
+})
+
+describe('classifySilentCronOutput — HEARTBEAT_OK 静默判定(OCV5-11)', () => {
+  it('恰 HEARTBEAT_OK 仍 silent', () => {
+    assert.deepEqual(classifySilentCronOutput('HEARTBEAT_OK'), { silent: true, reason: 'heartbeat_ok' })
+    assert.deepEqual(classifySilentCronOutput('  HEARTBEAT_OK\n'), { silent: true, reason: 'heartbeat_ok' })
+  })
+
+  it('开场白+HEARTBEAT_OK(同行/末行)判 silent', () => {
+    assert.deepEqual(
+      classifySilentCronOutput('心跳检查开始，先读待跟进记忆并检索存量提醒。HEARTBEAT_OK'),
+      { silent: true, reason: 'heartbeat_ok' },
+    )
+    assert.deepEqual(
+      classifySilentCronOutput('心跳检查开始，先读待跟进记忆并检索存量提醒。\nHEARTBEAT_OK'),
+      { silent: true, reason: 'heartbeat_ok' },
+    )
+  })
+
+  it('[SILENT] 前缀维持现状', () => {
+    assert.deepEqual(classifySilentCronOutput('[SILENT]'), { silent: true, reason: 'silent' })
+    assert.deepEqual(classifySilentCronOutput('[SILENT] leftover chatter'), { silent: true, reason: 'silent' })
+  })
+
+  it('>200 字符末行 OK 的长文本不 silent', () => {
+    const longOk = `${'x'.repeat(190)}\nHEARTBEAT_OK`
+    assert.ok(longOk.trim().length > HEARTBEAT_OK_SILENT_MAX_CHARS)
+    assert.deepEqual(classifySilentCronOutput(longOk), { silent: false })
+    const atCap = `${'x'.repeat(HEARTBEAT_OK_SILENT_MAX_CHARS - 1 - 'HEARTBEAT_OK'.length)}\nHEARTBEAT_OK`
+    assert.equal(atCap.trim().length, HEARTBEAT_OK_SILENT_MAX_CHARS)
+    assert.deepEqual(classifySilentCronOutput(atCap), { silent: true, reason: 'heartbeat_ok' })
+  })
+
+  it('真实事项文本不 silent', () => {
+    assert.deepEqual(classifySilentCronOutput('有一件待办：明天要交稿。'), { silent: false })
+    assert.deepEqual(classifySilentCronOutput('HEARTBEAT_OKAY'), { silent: false })
+    assert.deepEqual(classifySilentCronOutput('prefixHEARTBEAT_OK'), { silent: false })
+  })
+})
+
+describe('CronScheduler.runJob — HEARTBEAT_OK 静默不送达', () => {
+  function makeRun(text: string): {
+    sched: InstanceType<typeof CronScheduler>
+    deliveries: string[]
+  } {
+    const deliveries: string[] = []
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      {
+        getOrCreate: async (opts: any) => ({ sessionKey: opts.sessionKey }),
+        submit: async (_session: any, _prompt: any, cb: any) => {
+          cb({ kind: 'block', block: { kind: 'text', text } })
+        },
+        destroySession: async () => {},
+      } as any,
+      (delivered: string) => { deliveries.push(delivered) },
+    )
+    return { sched, deliveries }
+  }
+
+  const heartbeatJob = {
+    id: 'heartbeat',
+    schedule: '13 */4 * * *',
+    agent: 'x',
+    prompt: 'ping',
+    deliver: 'webchat',
+    heartbeat: true,
+    enabled: true,
+  } as any
+  const agent = { id: 'x', model: 'glm-5.2' } as any
+
+  it('开场白+HEARTBEAT_OK 不送达', async () => {
+    const { sched, deliveries } = makeRun('心跳检查开始，先读待跟进记忆并检索存量提醒。HEARTBEAT_OK')
+    assert.deepEqual(await (sched as any).runJob(heartbeatJob, agent, NOOP_CRON_DURABILITY), { kind: 'silent' })
+    assert.deepEqual(deliveries, [])
+  })
+
+  it('恰 HEARTBEAT_OK 不送达', async () => {
+    const { sched, deliveries } = makeRun('HEARTBEAT_OK')
+    assert.deepEqual(await (sched as any).runJob(heartbeatJob, agent, NOOP_CRON_DURABILITY), { kind: 'silent' })
+    assert.deepEqual(deliveries, [])
+  })
+
+  it('>200 字符末行 OK 仍送达', async () => {
+    const body = `${'待办事项：'.repeat(40)}\nHEARTBEAT_OK`
+    assert.ok(body.trim().length > HEARTBEAT_OK_SILENT_MAX_CHARS)
+    const { sched, deliveries } = makeRun(body)
+    assert.deepEqual(await (sched as any).runJob(heartbeatJob, agent, NOOP_CRON_DURABILITY), { kind: 'completed' })
+    assert.deepEqual(deliveries, [body])
+  })
+
+  it('真实事项文本照常送达', async () => {
+    const body = '有一件待办：明天要交稿，请确认是否还要跟进。'
+    const { sched, deliveries } = makeRun(body)
+    assert.deepEqual(await (sched as any).runJob(heartbeatJob, agent, NOOP_CRON_DURABILITY), { kind: 'completed' })
+    assert.deepEqual(deliveries, [body])
   })
 })

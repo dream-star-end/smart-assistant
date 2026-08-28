@@ -238,3 +238,61 @@ describe('deliverCronOutput — 显式通道置顶', () => {
     assert.equal(calls.inbox.length, 0)
   })
 })
+
+describe('deliverCronOutput — heartbeat 永不注入 webchat', () => {
+  const HEARTBEAT: CronJob = {
+    id: 'heartbeat',
+    schedule: '13 */4 * * *',
+    agent: 'main',
+    prompt: 'p',
+    deliver: 'webchat',
+    heartbeat: true,
+    label: 'heartbeat',
+  }
+  const MATTER = '有一件待办：明天要交稿，请确认是否还要跟进。'
+
+  it('heartbeat 有真实产出且 webchat 在线 → 零 webchat outbound,落站内信', async () => {
+    const { deps, calls } = makeDeps({
+      lastActive: lastActiveWebchat(),
+      onlinePeer: true,
+      extraClients: [{ send: () => {} }],
+      qq: { kind: 'delivered' },
+      wechat: { kind: 'delivered' },
+    })
+    await deliverCronOutput(MATTER, HEARTBEAT, { dueMinuteKey: 1, deliveryId: 'cron.hb-online' }, deps)
+    assert.equal(calls.deliver, 0, 'tryLastActiveWebchat must not fire')
+    assert.equal(calls.broadcast.length, 0, 'broadcastWebchat must not fire')
+    assert.equal(calls.qq, 0, 'heartbeat is not user-initiated; QQ stays gated')
+    assert.equal(calls.wechat, 0, 'heartbeat is not user-initiated; WeChat stays gated')
+    assert.equal(calls.inbox.length, 1)
+    assert.equal(calls.inbox[0]!.bodyMd, MATTER)
+    assert.equal(calls.inbox[0]!.title, 'heartbeat')
+    assert.equal(calls.inbox[0]!.deliveryKey, 'cron.hb-online')
+  })
+
+  it('heartbeat 全通道仅站内信可用 → postInboxDurable', async () => {
+    const { deps, calls } = makeDeps({})
+    await deliverCronOutput(MATTER, HEARTBEAT, { dueMinuteKey: 2, deliveryId: 'cron.hb-inbox' }, deps)
+    assert.equal(calls.deliver, 0)
+    assert.equal(calls.broadcast.length, 0)
+    assert.equal(calls.qq, 0)
+    assert.equal(calls.wechat, 0)
+    assert.equal(calls.inbox.length, 1)
+    assert.equal(calls.inbox[0]!.bodyMd, MATTER)
+    assert.equal(calls.inbox[0]!.deliveryKey, 'cron.hb-inbox')
+  })
+
+  it('非 heartbeat 显式 webchat 在线仍注入 lastActive 会话', async () => {
+    const { deps, calls } = makeDeps({
+      lastActive: lastActiveWebchat(),
+      onlinePeer: true,
+      qq: { kind: 'delivered' },
+      wechat: { kind: 'delivered' },
+    })
+    await deliverCronOutput('hello', { ...JOB, deliver: 'webchat' }, { dueMinuteKey: 1, deliveryId: 'cron.web-reg' }, deps)
+    assert.equal(calls.deliver, 1)
+    assert.equal(calls.qq, 0)
+    assert.equal(calls.wechat, 0)
+    assert.equal(calls.inbox.length, 0)
+  })
+})
