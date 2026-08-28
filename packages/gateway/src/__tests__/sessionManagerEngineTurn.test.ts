@@ -1076,20 +1076,107 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
-  test("CCB context overflow after non-diagnostic assistant output never replays the user turn", async () => {
+  test("CCB canonical Prompt is too long diagnostic clears native resume and safely rebuilds the same turn", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const internals = sm as unknown as {
+        _resumeMap: Map<string, string>;
+        _resumeMapTimestamps: Map<string, number>;
+        _resumeMapProvider: Map<string, string>;
+        _resumeMapLastCost: Map<string, number>;
+        _saveResumeMap: () => void;
+      };
+      internals._saveResumeMap = () => {};
+      const events: SessionStreamEvent[] = [];
+      let submits = 0;
+      const runner = new FakeCcbRunner((r) => {
+        submits += 1;
+        setImmediate(() => {
+          if (submits === 1) {
+            r.text("Prompt is too long");
+            r.result({
+              is_error: true,
+              subtype: "success",
+              result: "Prompt is too long",
+            });
+            return;
+          }
+          r.text("continued after canonical diagnostic rebuild");
+          r.result({ stop_reason: "end_turn" });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        providerTag: "ccb",
+        ccbSessionId: "ccb-full-context-canonical",
+        _historicalContextInjected: true,
+        _historicalContextInjectedKey: "master:previous",
+      } as Partial<AgentSession>);
+      internals._resumeMap.set(session.sessionKey, "ccb-full-context-canonical");
+      internals._resumeMapTimestamps.set(session.sessionKey, Date.now());
+      internals._resumeMapProvider.set(session.sessionKey, "ccb");
+      internals._resumeMapLastCost.set(session.sessionKey, 1);
+      let shutdowns = 0;
+      session.runner.shutdown = async () => { shutdowns += 1; };
+      let clears = 0;
+      session.runner.clearSessionId = () => { clears += 1; };
+
+      await sm.submit(
+        session,
+        "继续原任务",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        "1".repeat(32),
+        undefined,
+        undefined,
+        {
+          historicalMessages: [{
+            id: `srv-${session.peerId}-${session.agentId}-t1`,
+            role: "assistant",
+            text: `exact-history-${"x".repeat(16_000)}-tail`,
+            status: "completed",
+          }],
+        },
+      );
+
+      assert.equal(submits, 2);
+      assert.equal(runner.submittedInputs[0], "继续原任务");
+      assert.match(String(runner.submittedInputs[1]), /<openclaude_previous_context>/);
+      assert.match(String(runner.submittedInputs[1]), /-tail/);
+      assert.equal(shutdowns, 1);
+      assert.equal(clears, 1);
+      assert.equal(session.ccbSessionId, null);
+      assert.equal(internals._resumeMap.has(session.sessionKey), false);
+      assert.ok(events.some((event) =>
+        event.kind === "turn_status" && typeof event.status === "object" &&
+        event.status?.status === "retrying"));
+      assert.equal(events.some((event) => event.kind === "error"), false);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "completed");
+      assert.match(captured.payloads[0]!.text, /continued after canonical diagnostic rebuild$/);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("CCB canonical Prompt is too long after observable work never replays the user turn", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     try {
       const sm = new SessionManager(makeConfigStub());
       const events: SessionStreamEvent[] = [];
-      const apiError = 'API Error: 413 {"error":{"code":"PROMPT_TOO_LONG"}}';
+      const apiError = "Prompt is too long";
       const runner = new FakeCcbRunner((r) => {
         setImmediate(() => {
           r.text("observable partial work\n");
           r.text(apiError);
           r.result({
             is_error: true,
-            subtype: "error_during_execution",
+            subtype: "success",
             result: apiError,
           });
         });

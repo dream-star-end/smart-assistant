@@ -6149,8 +6149,11 @@ export class SessionManager {
             session.providerTag === 'ccb' &&
             result !== null &&
             result.assistantSegments.length === 1 &&
-            /^API Error:\s*413\b[\s\S]*\bPROMPT_TOO_LONG\b[\s\S]*$/i.test(
-              result.assistantSegments[0]!.text.trim(),
+            (
+              /^API Error:\s*413\b[\s\S]*\bPROMPT_TOO_LONG\b[\s\S]*$/i.test(
+                result.assistantSegments[0]!.text.trim(),
+              ) ||
+              /^Prompt is too long\.?$/i.test(result.assistantSegments[0]!.text.trim())
             ) &&
             result.assistantText.trim() === result.assistantSegments[0]!.text.trim()
           const contextOverflowIsSafeToRetry =
