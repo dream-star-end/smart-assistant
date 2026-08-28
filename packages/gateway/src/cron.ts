@@ -28,8 +28,8 @@
 //
 // Job output: run_id + timestamp written to ~/.openclaude/cron/outputs/<id>-<ts>.md.
 // If the agent's final text starts with [SILENT], output is archived but not delivered.
-// HEARTBEAT_OK is silent when the trimmed last line is (or ends at a token
-// boundary with) HEARTBEAT_OK and the full trimmed text is <= 200 chars.
+// HEARTBEAT_OK: exact trimmed match is silent for all jobs (baseline).
+// Relaxed last-line/suffix + 200-char match is heartbeat-only (OCV5-11).
 
 import {
   appendFileSync,
@@ -478,20 +478,26 @@ export const HEARTBEAT_OK_SILENT_MAX_CHARS = 200
 
 /**
  * Silent cron output: archived but not delivered.
- * - `[SILENT]` prefix (unchanged)
- * - HEARTBEAT_OK: after trim, last line equals `HEARTBEAT_OK`, or last line
- *   ends with `HEARTBEAT_OK` behind a non-identifier boundary (same-line
- *   开场白, 2026-08-28 incident), AND full trimmed length ≤ 200 so a real
- *   report that happens to end in OK is not swallowed.
+ * - `[SILENT]` prefix (all jobs, unchanged)
+ * - HEARTBEAT_OK exact trimmed match (all jobs, baseline)
+ * - Relaxed last-line / token-boundary suffix + ≤200 chars: **heartbeat only**.
+ *   Non-heartbeat jobs must not swallow `检查已完成。HEARTBEAT_OK`.
  */
-export function classifySilentCronOutput(output: string): {
+export function classifySilentCronOutput(
+  output: string,
+  opts?: { heartbeat?: boolean },
+): {
   silent: boolean
   reason?: 'silent' | 'heartbeat_ok'
 } {
   const trimmed = output.trim()
   if (!trimmed) return { silent: false }
   if (trimmed.startsWith('[SILENT]')) return { silent: true, reason: 'silent' }
-  if (isHeartbeatOkSilent(trimmed)) return { silent: true, reason: 'heartbeat_ok' }
+  if (opts?.heartbeat === true) {
+    if (isHeartbeatOkSilent(trimmed)) return { silent: true, reason: 'heartbeat_ok' }
+  } else if (trimmed === 'HEARTBEAT_OK') {
+    return { silent: true, reason: 'heartbeat_ok' }
+  }
   return { silent: false }
 }
 
@@ -2016,7 +2022,7 @@ export class CronScheduler {
       logger.warn(`job ${job.id} produced empty output`, { jobId: job.id })
       return { kind: 'terminal_failure', code: 'EMPTY_OUTPUT' }
     }
-    const silent = classifySilentCronOutput(output)
+    const silent = classifySilentCronOutput(output, { heartbeat: job.heartbeat === true })
     if (silent.silent) {
       if (!archivedOutputFile) return { kind: 'terminal_failure', code: 'OUTPUT_ARCHIVE_FAILED' }
       await durability.markCompleted?.(archivedOutputFile)
