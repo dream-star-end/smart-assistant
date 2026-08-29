@@ -55,6 +55,22 @@ describe('delegateStartCli', () => {
     assert.equal(body.allowSelf, true)
   })
 
+  it('resume start body carries a stable idempotencyKey derived from session+goal', () => {
+    const args = {
+      agentId: 'auditor',
+      goal: '复审',
+      resumeSessionKey: 'agent:auditor:delegate:main:1:abcd',
+    }
+    const a = buildDelegateStartBody(args)
+    const b = buildDelegateStartBody(args)
+    assert.equal(a.resumeSessionKey, args.resumeSessionKey)
+    assert.equal(typeof a.idempotencyKey, 'string')
+    assert.match(String(a.idempotencyKey), /^resume:agent:auditor:delegate:main:1:abcd:/)
+    assert.equal(a.idempotencyKey, b.idempotencyKey)
+    const other = buildDelegateStartBody({ ...args, goal: '另一份草稿' })
+    assert.notEqual(other.idempotencyKey, a.idempotencyKey)
+  })
+
   it('start+wait: one start then wait loop until done', async () => {
     let starts = 0
     const r = await runDelegateStartAndWait({

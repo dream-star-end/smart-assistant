@@ -21,11 +21,17 @@ export type DelegateResumeBinding = {
   lastUsedAt: number
 }
 
+export const DELEGATE_RESUME_OCCUPIED_MESSAGE =
+  '该委派会话仍在运行或正在收尾,请用 delegate-wait 等待,不要重复 resume'
+
 export type DelegateResumeClaim = {
   ok: true
   sessionKey: string
   minted: boolean
   evictedKeys: string[]
+  /** False on idempotent replay: caller must not spawn a second child. */
+  dispatchGranted: boolean
+  replay: boolean
 }
 
 export type DelegateResumeReject = {
@@ -33,6 +39,8 @@ export type DelegateResumeReject = {
   httpStatus: 400 | 409 | 503
   message: string
   evictedKeys: string[]
+  dispatchGranted: false
+  replay: boolean
 }
 
 export type DelegateResumePreflight = DelegateResumeClaim | DelegateResumeReject
@@ -63,14 +71,31 @@ function defaultNonce(): string {
   return randomBytes(8).toString('hex')
 }
 
+function attemptId(sessionKey: string, idempotencyKey: string): string {
+  return `${sessionKey}\0${idempotencyKey}`
+}
+
+type ResumeAttempt = {
+  sessionKey: string
+  idempotencyKey: string
+  outcome: 'dispatching' | 'rejected'
+  httpStatus?: 400 | 409 | 503
+  message?: string
+  dispatchGranted: boolean
+}
+
 export class DelegateResumeRegistry {
   private readonly bindings = new Map<string, DelegateResumeBinding>()
   /** Occupancy fence: active = running, retiring = shutdown in progress. */
   private readonly reserved = new Map<string, 'active' | 'retiring'>()
+  /** Resume request idempotency: same (sessionKey, idempotencyKey) never grants a second dispatch. */
+  private readonly attempts = new Map<string, ResumeAttempt>()
   private readonly ttlMs: number
   private readonly maxBindings: number
   private readonly now: () => number
   private readonly nonce: () => string
+  /** Test hook: increments only when occupancy is newly granted. */
+  dispatchGrants = 0
 
   constructor(opts: DelegateResumeRegistryOptions = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_DELEGATE_RESUME_TTL_MS
@@ -88,6 +113,8 @@ export class DelegateResumeRegistry {
     parentSessionKey?: string
     targetAgentId: string
     sourceAgent: string
+    /** Client/request idempotency key. Same key + same resume session never dispatches twice. */
+    idempotencyKey?: string
   }): DelegateResumePreflight {
     const evictedKeys = this.pruneExpired()
     const parentSessionKey =
@@ -95,40 +122,64 @@ export class DelegateResumeRegistry {
     const sourceAgent = input.sourceAgent || 'system'
     const targetAgentId = input.targetAgentId
     const resumeKey = normalizeResumeSessionKey(input.resumeSessionKey)
+    const idempotencyKey = normalizeResumeSessionKey(input.idempotencyKey)
+
+    if (resumeKey && idempotencyKey) {
+      const existing = this.attempts.get(attemptId(resumeKey, idempotencyKey))
+      if (existing) {
+        if (existing.outcome === 'rejected') {
+          return {
+            ok: false,
+            httpStatus: existing.httpStatus ?? 409,
+            message: existing.message ?? DELEGATE_RESUME_OCCUPIED_MESSAGE,
+            evictedKeys,
+            dispatchGranted: false,
+            replay: true,
+          }
+        }
+        return {
+          ok: true,
+          sessionKey: resumeKey,
+          minted: false,
+          evictedKeys,
+          dispatchGranted: false,
+          replay: true,
+        }
+      }
+    }
 
     if (resumeKey) {
       const binding = this.bindings.get(resumeKey)
       if (!binding) {
-        return {
-          ok: false,
-          httpStatus: 400,
-          message: 'resumeSessionKey 无效或已过期',
-          evictedKeys,
-        }
+        return this.reject(resumeKey, idempotencyKey, 400, 'resumeSessionKey 无效或已过期', evictedKeys)
       }
       if (
         binding.parentSessionKey !== parentSessionKey ||
         binding.targetAgentId !== targetAgentId ||
         binding.sourceAgent !== sourceAgent
       ) {
-        return {
-          ok: false,
-          httpStatus: 400,
-          message: 'resumeSessionKey 与当前父会话/目标 agent 不匹配',
+        return this.reject(
+          resumeKey,
+          idempotencyKey,
+          400,
+          'resumeSessionKey 与当前父会话/目标 agent 不匹配',
           evictedKeys,
-        }
+        )
       }
       if (this.reserved.has(resumeKey)) {
-        return {
-          ok: false,
-          httpStatus: 409,
-          message: '该委派会话仍在运行或正在收尾,请用 delegate-wait 等待,不要重复 resume',
-          evictedKeys,
-        }
+        return this.reject(resumeKey, idempotencyKey, 409, DELEGATE_RESUME_OCCUPIED_MESSAGE, evictedKeys)
       }
       this.reserved.set(resumeKey, 'active')
       binding.lastUsedAt = this.now()
-      return { ok: true, sessionKey: resumeKey, minted: false, evictedKeys }
+      this.grantDispatch(resumeKey, idempotencyKey)
+      return {
+        ok: true,
+        sessionKey: resumeKey,
+        minted: false,
+        evictedKeys,
+        dispatchGranted: true,
+        replay: false,
+      }
     }
 
     const capEvicted = this.evictOldestInactiveForCapacity()
@@ -139,6 +190,8 @@ export class DelegateResumeRegistry {
         httpStatus: 503,
         message: 'delegate resume 绑定已满且没有可驱逐的空闲项,请稍后重试',
         evictedKeys,
+        dispatchGranted: false,
+        replay: false,
       }
     }
 
@@ -166,7 +219,46 @@ export class DelegateResumeRegistry {
       lastUsedAt: ts,
     })
     this.reserved.set(sessionKey, 'active')
-    return { ok: true, sessionKey, minted: true, evictedKeys }
+    this.grantDispatch(sessionKey, idempotencyKey)
+    return {
+      ok: true,
+      sessionKey,
+      minted: true,
+      evictedKeys,
+      dispatchGranted: true,
+      replay: false,
+    }
+  }
+
+  private reject(
+    sessionKey: string,
+    idempotencyKey: string | undefined,
+    httpStatus: 400 | 409 | 503,
+    message: string,
+    evictedKeys: string[],
+  ): DelegateResumeReject {
+    if (idempotencyKey) {
+      this.attempts.set(attemptId(sessionKey, idempotencyKey), {
+        sessionKey,
+        idempotencyKey,
+        outcome: 'rejected',
+        httpStatus,
+        message,
+        dispatchGranted: false,
+      })
+    }
+    return { ok: false, httpStatus, message, evictedKeys, dispatchGranted: false, replay: false }
+  }
+
+  private grantDispatch(sessionKey: string, idempotencyKey: string | undefined): void {
+    this.dispatchGrants += 1
+    if (!idempotencyKey) return
+    this.attempts.set(attemptId(sessionKey, idempotencyKey), {
+      sessionKey,
+      idempotencyKey,
+      outcome: 'dispatching',
+      dispatchGranted: true,
+    })
   }
 
   markRetiring(sessionKey: string): void {

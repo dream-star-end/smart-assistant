@@ -43,10 +43,27 @@ const TRACEPARENT_RE = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/
 export interface GrokRelayCtx { hostUuid: string; boundIp: string }
 export type GrokRelayHandler = (req: IncomingMessage, res: ServerResponse, ctx: GrokRelayCtx) => Promise<void>
 
+function grokRelayPublicMessage(code: string): string {
+  switch (code) {
+    case 'NOT_FOUND':
+      return 'grok relay path or token not found'
+    case 'METHOD_NOT_ALLOWED':
+      return 'grok relay method not allowed'
+    case 'GROK_ROUTE_EXPIRED':
+      return 'grok route expired'
+    case 'GROK_SLOT_LEASE_LOST':
+      return 'grok slot lease lost'
+    case 'UNAUTHORIZED':
+      return 'grok relay unauthorized'
+    default:
+      return `grok relay error (${code})`
+  }
+}
+
 function error(res: ServerResponse, status: number, code: string, requestId: string): void {
   res.statusCode = status
   res.setHeader('content-type', 'application/json; charset=utf-8')
-  res.end(JSON.stringify({ error: { code, message: 'grok relay unavailable' }, requestId }))
+  res.end(JSON.stringify({ error: { code, message: grokRelayPublicMessage(code) }, requestId }))
 }
 
 function upstreamHeaders(req: IncomingMessage, accessToken: Buffer): Record<string, string> {

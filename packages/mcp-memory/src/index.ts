@@ -55,6 +55,7 @@ import {
   normalizeFanoutTasks,
 } from './delegateFanout.js'
 import { normalizeDelegateAgentId, normalizeDelegateModel } from './delegateArgs.js'
+import { delegateResumeIdempotencyKey } from './delegateStartCli.js'
 import {
   formatDelegateFanoutRunning,
   resolveCursorFastWaitMs,
@@ -927,6 +928,16 @@ async function runAsyncDelegateToAgent(
     toolsets: args.toolsets,
     async: true,
     ...(args.resumeSessionKey ? { resumeSessionKey: args.resumeSessionKey } : {}),
+    ...(args.resumeSessionKey
+      ? {
+          idempotencyKey: delegateResumeIdempotencyKey({
+            resumeSessionKey: args.resumeSessionKey,
+            goal: args.goal,
+            context: args.context,
+            model: args.model,
+          }),
+        }
+      : {}),
     ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
   })
   const fastWaitMs = resolveCursorFastWaitMs()

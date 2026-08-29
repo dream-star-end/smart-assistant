@@ -75,6 +75,10 @@ import {
   isLiveUnitsEnabled,
   type PromptQueueMutationFrame,
 } from '@openclaude/protocol'
+import {
+  failureClassFromLocalExecutionCode,
+  type DelegateFailureClass,
+} from '../../protocol/src/delegation.js'
 
 const CONTROL_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
 const isControlId = (value: unknown): value is string =>
@@ -369,7 +373,8 @@ import {
   resolveDelegateWaitMs,
   type DelegateJobHttpResult,
 } from './delegateJobs.js'
-import { DelegateResumeRegistry } from './delegateResume.js'
+import { DelegateResumeRegistry, DELEGATE_RESUME_OCCUPIED_MESSAGE } from './delegateResume.js'
+import { isDelegateSmEnabled, resolveDelegateCallbackOwner } from './delegateSmFlag.js'
 import { isPlatformAgentId, parseDelegateAllowSelf, parseDelegateModel, rejectSelfDelegate } from './delegateModel.js'
 import { EMPTY_COMPLETED_TURN_NOTICE, hasPlatedAssistantOutput } from './emptyCompletedTurn.js'
 import {
@@ -1706,6 +1711,21 @@ const DELEGATE_SUBMIT_SETTLE_DEFAULT_MS = 15_000
  *  "排队"本身堆成第二波雪崩;超出直接按原闸形状立即拒。 */
 export const DELEGATE_QUEUE_MAX_WAITERS = 8
 
+function parseDelegateIdempotencyKey(
+  body: { idempotencyKey?: unknown; idempotency_key?: unknown },
+  headers: IncomingHttpHeaders,
+): string | undefined {
+  const fromBody =
+    (typeof body.idempotencyKey === 'string' && body.idempotencyKey.trim()) ||
+    (typeof body.idempotency_key === 'string' && body.idempotency_key.trim()) ||
+    ''
+  if (fromBody) return fromBody
+  const header = headers['idempotency-key']
+  const raw = Array.isArray(header) ? header[0] : header
+  if (typeof raw === 'string' && raw.trim()) return raw.trim()
+  return undefined
+}
+
 function parseDelegateQueueWaitMs(): number {
   const raw = Number(process.env.OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS)
   return Number.isFinite(raw) && raw >= 0 ? raw : DELEGATE_QUEUE_WAIT_DEFAULT_MS
@@ -1812,8 +1832,14 @@ interface RunDelegateInput {
 /** `_runDelegateTask` 结果。rejected=闸/校验拒(HTTP 壳映射 4xx/429/503);error=session
  *  创建等意外(映射 500);completed=真正执行完(ok/output/error/timedOut,review 还带 verdict)。 */
 type DelegateTaskResult =
-  | { kind: 'rejected'; httpStatus: number; message: string; code?: LocalExecutionRejectCode }
-  | { kind: 'error'; message: string }
+  | {
+      kind: 'rejected'
+      httpStatus: number
+      message: string
+      code?: LocalExecutionRejectCode
+      failureClass?: DelegateFailureClass
+    }
+  | { kind: 'error'; message: string; failureClass?: DelegateFailureClass }
   | {
       kind: 'completed'
       ok: boolean
@@ -2530,8 +2556,13 @@ export class Gateway {
     }
 
     try {
-      const summary = await recoverInterruptedSendToAgentIntents((intent) =>
-        this._deliverInterruptedSendToAgentIntent(intent),
+      const summary = await recoverInterruptedSendToAgentIntents(
+        (intent) => this._deliverInterruptedSendToAgentIntent(intent),
+        process.env,
+        {
+          callbackOwner: resolveDelegateCallbackOwner(),
+          resolveJob: (jobId) => this._delegateJobs?.snapshotOf(jobId),
+        },
       )
       if (summary.recovered > 0 || summary.retained > 0 || summary.malformed > 0) {
         this.log.info('send_to_agent intent recovery', summary)
@@ -2891,6 +2922,13 @@ export class Gateway {
     this.cron.lastActiveChannel = this.lastActiveChannel
     this.cron.getRegisteredDeliverChannels = () => this.channels.keys()
     this.cron.start().catch((err) => this.log.error('cron start failed', undefined, err))
+    if (isDelegateSmEnabled()) {
+      this._delegateJobs ??= new DelegateJobStore({
+        ttlMs: resolveDelegateJobTtlMs(),
+        sm: true,
+      })
+      this.cron.delegateJobs = this._delegateJobs
+    }
 
     // Start event persistence (writes all events to SQLite event_log)
     startEventPersistence()
@@ -10803,15 +10841,30 @@ export class Gateway {
     if (!selfCheck.ok) return this.sendError(res, 400, selfCheck.error)
     // 同步 preflight:mint/resume/占用必须在任何 await 和创建 async job 之前完成,
     // 这样 running 响应已经带着权威 sessionKey,并发 resume 也能立刻 409。
+    // 拒绝路径不得产生副作用（不 create job、不 spawn、不 persist intent）。
+    const idempotencyKey = parseDelegateIdempotencyKey(parsed, req.headers)
     const resume = (this._delegateResume ??= new DelegateResumeRegistry()).preflight({
       resumeSessionKey: parsed.resumeSessionKey,
       parentSessionKey,
       targetAgentId,
       sourceAgent: sourceAgentId || 'system',
+      idempotencyKey,
     })
     this._forgetEvictedDelegateResumes(resume.evictedKeys)
     if (!resume.ok) {
       return this.sendError(res, resume.httpStatus, resume.message)
+    }
+    if (resume.replay && !resume.dispatchGranted) {
+      const existing = this._delegateJobs?.findBySessionKey(resume.sessionKey)
+      if (existing) {
+        return this.sendJson(res, 200, {
+          status: isDelegateSmEnabled() && existing.state === 'queued' ? 'queued' : 'running',
+          jobId: existing.id,
+          agentId: targetAgentId,
+          sessionKey: resume.sessionKey,
+        })
+      }
+      return this.sendError(res, 409, DELEGATE_RESUME_OCCUPIED_MESSAGE)
     }
     const callbackOnComplete = isSendToAgentCallbackComplete(parsed.callbackOnComplete)
       ? 'origin-inject' as const
@@ -10840,10 +10893,31 @@ export class Gateway {
     // 默认同步:行为与改前完全一致(CCB/Codex 继续堵在 HTTP 上)。仅 `async: true`
     // 才切作业句柄 —— 子任务仍走同一条 _runDelegateTask(idle/hard/祖先活性/深度/并发闸全在)。
     if (parsed.async === true) {
+      const sm = isDelegateSmEnabled()
       const store = (this._delegateJobs ??= new DelegateJobStore({
         ttlMs: resolveDelegateJobTtlMs(),
+        sm,
       }))
-      const created = store.create(targetAgentId, { sessionKey: resume.sessionKey })
+      if (sm && (this._delegateQueueWaiters?.size ?? 0) >= DELEGATE_QUEUE_MAX_WAITERS) {
+        const blocked = this._checkDelegateResourceGate({
+          parentBucketKey: parentSessionKey,
+          isReview: isHiddenSystemAgentId(targetAgentId),
+        })
+        if (blocked) {
+          this._delegateResume.abort(resume.sessionKey, resume.minted)
+          return this.sendJson(res, 429, {
+            error: `too many concurrent delegations (max ${Gateway.MAX_CONCURRENT_DELEGATIONS}); 排队等待者已满(${DELEGATE_QUEUE_MAX_WAITERS} 个)`,
+            failure_class: 'capacity_queue_full',
+          })
+        }
+      }
+      const created = store.create(targetAgentId, {
+        sessionKey: resume.sessionKey,
+        queued: sm,
+        kind: callbackOnComplete ? 'send_to_agent' : 'delegate',
+        callback: callbackOnComplete ? 'origin-inject' : 'stdout-wait',
+        idempotencyKey,
+      })
       if ('error' in created) {
         this._delegateResume.abort(resume.sessionKey, resume.minted)
         return this.sendError(res, 503, 'too many in-flight delegate jobs')
@@ -10877,7 +10951,21 @@ export class Gateway {
       }
       void this._runDelegateTask(runInput)
         .then((result) => {
-          store.complete(jobId, this._delegateResultToHttp(result, targetAgentId))
+          const mapped = this._delegateResultToHttp(result, targetAgentId)
+          if (sm && result.kind === 'rejected' && result.failureClass) {
+            const snap = store.snapshotOf(jobId)
+            store.fail(jobId, {
+              failureClass: result.failureClass,
+              detail: result.message,
+              httpStatus: mapped.httpStatus,
+              body: mapped.body,
+              claimToken: snap?.claimToken,
+              fencingEpoch: snap?.fencingEpoch,
+              nextState: result.failureClass === 'cancelled' ? 'cancelled' : 'failed',
+            })
+          } else {
+            store.complete(jobId, mapped)
+          }
           const output = result.kind === 'completed' ? result.output : ''
           const error =
             result.kind === 'rejected' || result.kind === 'error'
@@ -10923,15 +11011,26 @@ export class Gateway {
     targetAgentId: string,
   ): DelegateJobHttpResult {
     if (result.kind === 'rejected') {
+      const failureClass =
+        result.failureClass ??
+        (result.code ? failureClassFromLocalExecutionCode(result.code) : undefined)
       return {
         httpStatus: result.httpStatus,
-        body: result.code
-          ? { error: result.message, code: result.code }
-          : { error: result.message },
+        body: {
+          error: result.message,
+          ...(result.code ? { code: result.code } : {}),
+          ...(failureClass ? { failure_class: failureClass } : {}),
+        },
       }
     }
     if (result.kind === 'error') {
-      return { httpStatus: 500, body: { error: result.message } }
+      return {
+        httpStatus: 500,
+        body: {
+          error: result.message,
+          ...(result.failureClass ? { failure_class: result.failureClass } : {}),
+        },
+      }
     }
     return {
       httpStatus: 200,
@@ -10969,6 +11068,15 @@ export class Gateway {
         status: 'expired',
         jobId,
         error: 'delegate job not found or expired',
+        ...(view.failure_class ? { failure_class: view.failure_class } : {}),
+      })
+    }
+    if (view.status === 'queued') {
+      return this.sendJson(res, 200, {
+        status: 'queued',
+        jobId,
+        state: 'queued',
+        ...(view.sessionKey ? { sessionKey: view.sessionKey } : {}),
       })
     }
     if (view.status === 'running') {
@@ -10976,6 +11084,18 @@ export class Gateway {
         status: 'running',
         jobId,
         ...(view.sessionKey ? { sessionKey: view.sessionKey } : {}),
+      })
+    }
+    if (view.status === 'failed') {
+      const capacity = view.failure_class === 'capacity_timeout' || view.failure_class === 'capacity_queue_full'
+      return this.sendJson(res, capacity ? 429 : 200, {
+        ...view.body,
+        status: 'failed',
+        jobId,
+        httpStatus: view.httpStatus,
+        failure_class: view.failure_class,
+        failure_detail: view.failure_detail,
+        state: view.state,
       })
     }
     return this.sendJson(res, 200, {
@@ -11384,7 +11504,17 @@ export class Gateway {
           }),
         )
       }
-      return { kind: 'rejected', httpStatus, message }
+      let failureClass: DelegateFailureClass | undefined
+      if (isDelegateSmEnabled()) {
+        if (gate.status === 'timeout') failureClass = 'capacity_timeout'
+        else if (gate.status === 'queue_full') failureClass = 'capacity_queue_full'
+        else if (gate.status === 'aborted') failureClass = 'cancelled'
+        else failureClass = 'capacity_timeout'
+      }
+      return { kind: 'rejected', httpStatus, message, failureClass }
+    }
+    if (isDelegateSmEnabled() && input.backgroundJobId) {
+      this._delegateJobs?.claimQueued(input.backgroundJobId)
     }
     // ── grok delegate turn:向 master 铸造 relay route(与浏览器 turn 同一账号池)──
     // delegate 是容器本地 turn,没有 bridge 注入 __oc_grok_route;不铸 route 则
@@ -12519,8 +12649,13 @@ export class Gateway {
 
   private async _persistInterruptedSendToAgentCallbacks(): Promise<void> {
     this._activeSendToAgentCallbacks.clear()
-    await recoverInterruptedSendToAgentIntents((intent) =>
-      this._deliverInterruptedSendToAgentIntent(intent),
+    await recoverInterruptedSendToAgentIntents(
+      (intent) => this._deliverInterruptedSendToAgentIntent(intent),
+      process.env,
+      {
+        callbackOwner: resolveDelegateCallbackOwner(),
+        resolveJob: (jobId) => this._delegateJobs?.snapshotOf(jobId),
+      },
     )
   }
 
