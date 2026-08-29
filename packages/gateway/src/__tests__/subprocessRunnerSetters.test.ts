@@ -123,6 +123,10 @@ describe('SubprocessRunner.model getter / setModel', () => {
     // 两者都缺/非法 → 平台默认 glm-5.3-zai。
     assert.equal(resolveExecutionModel(undefined, null), 'glm-5.3-zai')
     assert.equal(resolveExecutionModel('some-unknown-model', undefined), 'glm-5.3-zai')
+    assert.throws(
+      () => resolveExecutionModel('some-unknown-model', undefined, undefined, { explicit: true }),
+      (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_MODEL_UNKNOWN',
+    )
   })
 
   it('ALLOWED_INBOUND_MODELS rejects bogus / typo model ids', () => {

@@ -268,12 +268,32 @@ describe('② flag 开 + catalog 可用 → engine/model 取投影', () => {
         row('deepseek-v4-pro', 'ccb'),
       ]),
       agent: { id: 'research-assistant', model: 'deepseek-v4-pro' },
-      model: 'glm-5.2',
       defaultModel: 'glm-5.2',
       kind: 'turn',
     })
-    // agent 自身 deepseek 仍可用，所以显式/默认 glm 不可用后先尊重 agent 默认。
+    // 无显式 --model 时，agent 自身 deepseek 仍可用。
     assert.equal(d.canonicalModel, 'deepseek-v4-pro')
+  })
+
+  test('explicit unknown slug is DELEGATE_MODEL_UNKNOWN and does not inherit', () => {
+    assert.throws(
+      () =>
+        decideLocalExecution({
+          view: view([row('glm-5.2', 'ccb'), row('deepseek-v4-flash', 'ccb')]),
+          agent: { id: 'main', model: 'glm-5.2' },
+          model: 'definitely-not-a-model',
+          defaultModel: 'glm-5.2',
+          kind: 'turn',
+        }),
+      (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_MODEL_UNKNOWN',
+    )
+    const inherited = decideLocalExecution({
+      view: view([row('glm-5.2', 'ccb')]),
+      agent: { id: 'main', model: 'stale-agent-model' },
+      defaultModel: 'glm-5.2',
+      kind: 'turn',
+    })
+    assert.equal(inherited.canonicalModel, 'glm-5.2')
   })
 
   test('agent 默认也不可用时按 glm → MiniMax → DeepSeek Flash 多级路由', () => {

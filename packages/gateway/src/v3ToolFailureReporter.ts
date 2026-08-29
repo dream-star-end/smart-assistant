@@ -25,6 +25,8 @@ import {
   type ToolFailureKind,
   type ToolTerminationReason,
   classifyToolFailure,
+  projectClassToLegacy,
+  sanitizeToolFailureErrorMsg,
 } from '@openclaude/protocol'
 
 import { type GatewayEventBus, eventBus } from './eventBus.js'
@@ -123,11 +125,17 @@ export interface ToolFailureReportPayloadV4 extends Omit<ToolFailureReportPayloa
   traceId?: string
 }
 
+export interface ToolFailureReportPayloadV5 extends Omit<ToolFailureReportPayloadV4, 'schemaVersion'> {
+  schemaVersion: 5
+  errorMsg: string
+}
+
 export type ToolFailureReportPayload =
   | ToolFailureReportPayloadV1
   | ToolFailureReportPayloadV2
   | ToolFailureReportPayloadV3
   | ToolFailureReportPayloadV4
+  | ToolFailureReportPayloadV5
 
 export interface TurnObservationPayload {
   schemaVersion: 1
@@ -231,15 +239,16 @@ function sha256Preview(value: string | undefined): string | undefined {
 
 export function buildToolFailureReportPayload(
   ev: ToolCalledEvent,
-): ToolFailureReportPayloadV4 | null {
+): ToolFailureReportPayloadV5 | null {
   if (!ev.isError) return null
+  const { errorMsg } = sanitizeToolFailureErrorMsg(ev.outputPreview)
   const classification = classifyToolFailure({
     outputPreview: ev.outputPreview,
     exitCode: ev.exitCode,
     terminationReason: ev.terminationReason,
   })
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     eventId: safeString(ev.id, createHash('sha256').update(JSON.stringify(ev)).digest('hex'), 128),
     sessionKey: safeString(ev.sessionKey, 'unknown', 512),
     agentId: safeString(ev.agentId, 'unknown', 128),
@@ -248,6 +257,7 @@ export function buildToolFailureReportPayload(
     durationMs: Number.isFinite(ev.durationMs) ? Math.max(0, Math.trunc(ev.durationMs)) : 0,
     inputHash: sha256Preview(ev.inputPreview),
     outputHash: sha256Preview(ev.outputPreview),
+    errorMsg,
     errorClass: classification.errorClass,
     failureKind: classification.failureKind,
     ...(ev.traceId && /^[0-9a-f]{32}$/.test(ev.traceId) ? { traceId: ev.traceId } : {}),
@@ -257,18 +267,24 @@ export function buildToolFailureReportPayload(
   }
 }
 
+export function v4Projection(payload: ToolFailureReportPayloadV5): ToolFailureReportPayloadV4 {
+  const { errorMsg: _drop, ...rest } = payload
+  return { ...rest, schemaVersion: 4, errorClass: projectClassToLegacy(payload.errorClass) }
+}
+
 function v3Projection(payload: ToolFailureReportPayloadV4): ToolFailureReportPayloadV3 {
   const { traceId: _traceId, ...v3 } = payload
-  return { ...v3, schemaVersion: 3 }
+  return { ...v3, schemaVersion: 3, errorClass: projectClassToLegacy(payload.errorClass) }
 }
 
 function v2Projection(payload: ToolFailureReportPayloadV3): ToolFailureReportPayloadV2 {
+  const mapped = projectClassToLegacy(payload.errorClass)
   const errorClass =
-    payload.errorClass === 'not_executable'
+    mapped === 'not_executable'
       ? 'permission_denied'
-      : payload.errorClass === 'process_exit' || payload.errorClass === 'edit_conflict'
+      : mapped === 'process_exit' || mapped === 'edit_conflict'
         ? 'other'
-        : payload.errorClass
+        : mapped
   return {
     schemaVersion: 2,
     eventId: payload.eventId,
@@ -284,12 +300,46 @@ function v2Projection(payload: ToolFailureReportPayloadV3): ToolFailureReportPay
   }
 }
 
+export function projectRollupToLegacy(payload: ToolCallRollupPayload): ToolCallRollupPayload {
+  return {
+    ...payload,
+    counts: payload.counts.map((count) => ({
+      ...count,
+      errorClass:
+        count.outcome === 'failure'
+          ? projectClassToLegacy(count.errorClass as ToolFailureErrorClass)
+          : count.errorClass,
+    })),
+  }
+}
+
 let schemaFallbackWarned = false
+let advertisedToolAuditSchemaHint = 0
+
+export function _resetAdvertisedToolAuditSchemaHintForTests(): void {
+  advertisedToolAuditSchemaHint = 0
+  schemaFallbackWarned = false
+}
 
 function advertisedToolAuditSchema(res: Response): number {
   const raw = res.headers.get(TOOL_AUDIT_SCHEMA_HEADER)
   const value = raw === null ? 0 : Number(raw)
-  return Number.isInteger(value) && value >= 0 ? value : 0
+  const parsed = Number.isInteger(value) && value >= 0 ? value : 0
+  if (parsed > 0) advertisedToolAuditSchemaHint = parsed
+  return parsed
+}
+
+function asV5(payload: ToolFailureReportPayload): ToolFailureReportPayloadV5 | null {
+  return payload.schemaVersion === 5 ? payload : null
+}
+
+function initialFailurePayload(payload: ToolFailureReportPayload): ToolFailureReportPayload {
+  const v5 = asV5(payload)
+  if (!v5) return payload
+  if (advertisedToolAuditSchemaHint >= 5 || advertisedToolAuditSchemaHint === 0) return v5
+  if (advertisedToolAuditSchemaHint === 4) return v4Projection(v5)
+  if (advertisedToolAuditSchemaHint === 3) return v3Projection(v4Projection(v5))
+  return v2Projection(v3Projection(v4Projection(v5)))
 }
 
 function retryableStatus(status: number, rollup = false): boolean {
@@ -329,20 +379,31 @@ export async function sendToolFailureReport(
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? ATTEMPT_TIMEOUT_MS)
   const fetchImpl = opts.fetchImpl ?? fetch
   try {
-    let res = await postReport(TOOL_FAILURE_AUDIT_PATH, payload, cfg, fetchImpl, controller.signal)
+    let outgoing = initialFailurePayload(payload)
+    let res = await postReport(TOOL_FAILURE_AUDIT_PATH, outgoing, cfg, fetchImpl, controller.signal)
     if (res.ok) return
+    const v5 = asV5(payload)
+    if (v5 && res.status === 400 && advertisedToolAuditSchema(res) < 5) {
+      if (!schemaFallbackWarned) {
+        schemaFallbackWarned = true
+        log.warn('tool failure audit master lacks current schema; falling back')
+      }
+      outgoing = v4Projection(v5)
+      res = await postReport(TOOL_FAILURE_AUDIT_PATH, outgoing, cfg, fetchImpl, controller.signal)
+      if (res.ok) return
+    }
     if (
-      (payload.schemaVersion === 4 || payload.schemaVersion === 3) &&
+      (outgoing.schemaVersion === 4 || outgoing.schemaVersion === 3) &&
       res.status === 400 &&
-      advertisedToolAuditSchema(res) < payload.schemaVersion
+      advertisedToolAuditSchema(res) < outgoing.schemaVersion
     ) {
       if (!schemaFallbackWarned) {
         schemaFallbackWarned = true
         log.warn('tool failure audit master lacks current schema; falling back')
       }
-      const fallback = payload.schemaVersion === 4
-        ? v3Projection(payload)
-        : v2Projection(payload)
+      const fallback = outgoing.schemaVersion === 4
+        ? v3Projection(outgoing as ToolFailureReportPayloadV4)
+        : v2Projection(outgoing as ToolFailureReportPayloadV3)
       res = await postReport(
         TOOL_FAILURE_AUDIT_PATH,
         fallback,
@@ -352,7 +413,7 @@ export async function sendToolFailureReport(
       )
       if (res.ok) return
       if (
-        payload.schemaVersion === 4 && res.status === 400
+        outgoing.schemaVersion === 4 && res.status === 400
         && advertisedToolAuditSchema(res) < fallback.schemaVersion
       ) {
         res = await postReport(
@@ -391,10 +452,13 @@ export async function sendToolCallRollup(
     let res = await postReport(TOOL_CALL_ROLLUP_PATH, payload, cfg, fetchImpl, controller.signal)
     if (res.ok) return
     if (res.status === 400) {
+      const classProjected = projectRollupToLegacy(payload)
+      res = await postReport(TOOL_CALL_ROLLUP_PATH, classProjected, cfg, fetchImpl, controller.signal)
+      if (res.ok) return
       const legacy = {
-        ...payload,
+        ...classProjected,
         schemaVersion: 1,
-        counts: payload.counts.map(({ totalDurationMs: _total, maxDurationMs: _max, ...count }) => count),
+        counts: classProjected.counts.map(({ totalDurationMs: _total, maxDurationMs: _max, ...count }) => count),
       }
       res = await postReport(TOOL_CALL_ROLLUP_PATH, legacy, cfg, fetchImpl, controller.signal)
       if (res.ok) return
