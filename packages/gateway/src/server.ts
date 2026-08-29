@@ -1706,6 +1706,18 @@ const DELEGATE_SUBMIT_SETTLE_DEFAULT_MS = 15_000
  *  "排队"本身堆成第二波雪崩;超出直接按原闸形状立即拒。 */
 export const DELEGATE_QUEUE_MAX_WAITERS = 8
 
+/** Default global concurrent-delegation cap. Env OPENCLAUDE_DELEGATE_MAX_CONCURRENT overrides. */
+const MAX_CONCURRENT_DELEGATIONS = 5
+/** Default review reserved slots. Env OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS overrides. */
+const DELEGATE_REVIEW_RESERVED_SLOTS = 1
+
+function parseDelegateEnvInt(name: string, min: number, fallback: number): number {
+  const trimmed = process.env[name]?.trim()
+  if (!trimmed) return fallback
+  const raw = Number(trimmed)
+  return Number.isFinite(raw) && raw >= min ? Math.floor(raw) : fallback
+}
+
 function parseDelegateQueueWaitMs(): number {
   const raw = Number(process.env.OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS)
   return Number.isFinite(raw) && raw >= 0 ? raw : DELEGATE_QUEUE_WAIT_DEFAULT_MS
@@ -10358,11 +10370,29 @@ export class Gateway {
 
   /** Active delegation count for recursion/concurrency limits */
   private _activeDelegations = 0
-  private static MAX_CONCURRENT_DELEGATIONS = 5
+  /** Global concurrent cap. Reads OPENCLAUDE_DELEGATE_MAX_CONCURRENT at call
+   *  time (finite int ≥1); illegal/unset → MAX_CONCURRENT_DELEGATIONS (5). */
+  private static get MAX_CONCURRENT_DELEGATIONS(): number {
+    return parseDelegateEnvInt(
+      'OPENCLAUDE_DELEGATE_MAX_CONCURRENT',
+      1,
+      MAX_CONCURRENT_DELEGATIONS,
+    )
+  }
   /** P2 债C/3.5 — 硬编排 review 保留槽:非 review 委派最多用到
    *  (MAX_CONCURRENT_DELEGATIONS − 保留槽),给质量审查留位,消 cron/他会话把并发占满
-   *  导致队长的 review delegate 拿不到槽而降级放行。review 委派本身可用满全局上限。 */
-  private static DELEGATE_REVIEW_RESERVED_SLOTS = 1
+   *  导致队长的 review delegate 拿不到槽而降级放行。review 委派本身可用满全局上限。
+   *  env OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS(整数 ≥0,非法/缺省 → 1);
+   *  clamp 到 max−1,保证普通委派永远至少 1 槽。 */
+  private static get DELEGATE_REVIEW_RESERVED_SLOTS(): number {
+    const parsed = parseDelegateEnvInt(
+      'OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS',
+      0,
+      DELEGATE_REVIEW_RESERVED_SLOTS,
+    )
+    const max = Gateway.MAX_CONCURRENT_DELEGATIONS
+    return Math.min(parsed, Math.max(0, max - 1))
+  }
   /** P2 债C/3.5 — 单父会话(队长)并行 fan-out 上限。非 review 委派按父分桶计数,
    *  超上限进排队;review 委派豁免此桶(有独立保留槽)。消"一个队长把 5 个全局槽占光"。
    *  env 可配(下限 1)。 */
