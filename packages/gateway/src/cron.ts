@@ -123,6 +123,9 @@ interface CronOccurrenceRecord {
   updatedAt: number
   /** OCV5-22 B3: projection of the unique Enqueue job. */
   delegateJobId?: string
+  /** Fence captured at claimQueued for this occurrence; never re-read from the live job. */
+  delegateClaimToken?: string
+  delegateFencingEpoch?: number
 }
 
 export function classifyCronOccurrenceRecovery(
@@ -1405,6 +1408,7 @@ export class CronScheduler {
             dueMinuteKey,
             deliveryId: existingRetry?.deliveryId ?? cronDeliveryId(job.id, dueMinuteKey),
           }
+          let cronClaimFence: { claimToken: string; fencingEpoch: number } | undefined
           let outcome: CronRunOutcome
           if (existingRetry?.phase === 'delivery') {
             outcome = await this.retryArchivedDelivery(job, existingRetry)
@@ -1483,7 +1487,31 @@ export class CronScheduler {
                       writeOccurrence({ ...record, state: 'executing', updatedAt: Date.now() })
                     }
                     if (isDelegateSmEnabled() && this.delegateJobs && record?.delegateJobId) {
-                      this.delegateJobs.claimQueued(record.delegateJobId)
+                      const claimed = this.delegateJobs.claimQueued(record.delegateJobId)
+                      if (claimed.ok) {
+                        cronClaimFence = {
+                          claimToken: claimed.claimToken,
+                          fencingEpoch: claimed.fencingEpoch,
+                        }
+                        const latest = readOccurrence(deliveryContext.deliveryId) ?? record
+                        writeOccurrence({
+                          ...latest,
+                          delegateClaimToken: claimed.claimToken,
+                          delegateFencingEpoch: claimed.fencingEpoch,
+                          updatedAt: Date.now(),
+                        })
+                      } else {
+                        const latest = readOccurrence(deliveryContext.deliveryId)
+                        if (
+                          latest?.delegateClaimToken &&
+                          latest.delegateFencingEpoch !== undefined
+                        ) {
+                          cronClaimFence = {
+                            claimToken: latest.delegateClaimToken,
+                            fencingEpoch: latest.delegateFencingEpoch,
+                          }
+                        }
+                      }
                     }
                     if (!isOrigin) {
                       // origin-session must NOT consume lastRun here: settle
@@ -1623,14 +1651,27 @@ export class CronScheduler {
               settleOccurrence(occurrence, 'execution_terminal')
             }
           }
-          const dlg = readOccurrence(deliveryContext.deliveryId)?.delegateJobId
+          const occ = readOccurrence(deliveryContext.deliveryId)
+          const dlg = occ?.delegateJobId
           if (isDelegateSmEnabled() && this.delegateJobs && dlg) {
             const silent = outcome.kind === 'silent'
             const failed = outcome.kind === 'terminal_failure'
+            let fence = cronClaimFence
+            if (
+              !fence &&
+              occ.delegateClaimToken &&
+              occ.delegateFencingEpoch !== undefined
+            ) {
+              fence = {
+                claimToken: occ.delegateClaimToken,
+                fencingEpoch: occ.delegateFencingEpoch,
+              }
+            }
             settleCronDelegateJob(
               this.delegateJobs,
               dlg,
               failed ? 'failed' : silent ? 'skipped_silent' : 'completed',
+              fence,
               failed && 'code' in outcome ? String(outcome.code) : undefined,
             )
           }

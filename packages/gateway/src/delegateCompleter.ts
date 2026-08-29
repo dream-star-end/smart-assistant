@@ -67,13 +67,5 @@ export function markCallbackState(
   next: 'pending' | 'injecting' | 'delivered' | 'abandoned' | 'skipped_silent',
   fence?: { claimToken: string; fencingEpoch: number },
 ): boolean {
-  const snap = store.snapshotOf(jobId)
-  if (!snap) return false
-  if (snap.claimToken && fence) {
-    if (snap.claimToken !== fence.claimToken || snap.fencingEpoch !== fence.fencingEpoch) return false
-  }
-  const job = store.snapshotOf(jobId)
-  if (!job) return false
-  // Mutate via complete/fail is too coarse; restore overlay on the live row.
   return store.patchCallbackState(jobId, next, fence)
 }

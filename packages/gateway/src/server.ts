@@ -2601,8 +2601,10 @@ export class Gateway {
               clientMessageId: delegateCallbackMessageId(intent.jobId, epoch),
             })
             if (result.kind === 'injected') {
-              this._delegateJobs?.patchCallbackState(intent.jobId, 'delivered')
-              return true
+              const fence = job.claimToken
+                ? { claimToken: job.claimToken, fencingEpoch: job.fencingEpoch }
+                : undefined
+              return this._delegateJobs?.patchCallbackState(intent.jobId, 'delivered', fence) === true
             }
             return false
           },
@@ -3363,10 +3365,14 @@ export class Gateway {
     } catch {}
     this._stopEviction = null
     try {
-      await this._persistInterruptedSendToAgentCallbacks()
-      this._delegateJobs?.close()
-    } catch {}
-    this._delegateJobs = undefined
+      await this._persistAndCloseDelegateJobs()
+    } catch (err) {
+      this.log.error(
+        'delegate job snapshot persist failed; keeping in-memory jobs',
+        undefined,
+        err as Error,
+      )
+    }
     this._skillShadowReporter?.stop()
     this._skillShadowReporter = null
     if (this._wsKeepaliveTimer !== null) {
@@ -11104,6 +11110,8 @@ export class Gateway {
         } catch (err) {
           this._delegateResume.abort(resume.sessionKey, resume.minted)
           store.complete(jobId, { httpStatus: 503, body: { error: 'background callback persistence unavailable' } })
+          if (sm && runInput.capacityReserved) this._releaseDelegateSlot(slotOpts)
+          if (sm) this._delegateQueueWaiters?.delete(resume.sessionKey)
           this.log.warn('send_to_agent intent persist failed', { jobId }, err as Error)
           return this.sendError(res, 503, 'background callback persistence unavailable')
         }
@@ -11125,11 +11133,12 @@ export class Gateway {
           if (result.kind === 'rejected' && result.alreadyDispatched) {
             return
           }
+          let winner = false
           if (sm && result.kind === 'rejected' && result.failureClass) {
             const dropped =
               result.failureClass === 'capacity_queue_full' && store.dropIfUnclaimed(jobId)
             if (!dropped) {
-              store.fail(jobId, {
+              winner = store.fail(jobId, {
                 failureClass: result.failureClass,
                 detail: result.message,
                 httpStatus: mapped.httpStatus,
@@ -11140,10 +11149,12 @@ export class Gateway {
               })
             }
           } else if (sm) {
-            store.complete(jobId, mapped, fence)
+            winner = store.complete(jobId, mapped, fence)
           } else {
             store.complete(jobId, mapped)
+            winner = true
           }
+          if (!winner) return
           const output = result.kind === 'completed' ? result.output : ''
           const error =
             result.kind === 'rejected' || result.kind === 'error'
@@ -11166,8 +11177,12 @@ export class Gateway {
             runInput.claimToken && runInput.fencingEpoch !== undefined
               ? { claimToken: runInput.claimToken, fencingEpoch: runInput.fencingEpoch }
               : undefined
-          if (sm) store.complete(jobId, { httpStatus: 500, body: { error: message } }, fence)
-          else store.complete(jobId, { httpStatus: 500, body: { error: message } })
+          if (sm) {
+            const winner = store.complete(jobId, { httpStatus: 500, body: { error: message } }, fence)
+            if (!winner) return
+          } else {
+            store.complete(jobId, { httpStatus: 500, body: { error: message } })
+          }
           this._queueSendToAgentCallback(runInput, {
             jobId,
             agentId: targetAgentId,
@@ -12892,14 +12907,16 @@ export class Gateway {
     return result.applied || result.reason === 'already_exists' || result.reason === 'session_deleted'
   }
 
+  private async _persistAndCloseDelegateJobs(): Promise<void> {
+    await this._persistInterruptedSendToAgentCallbacks()
+    this._delegateJobs?.close()
+    this._delegateJobs = undefined
+  }
+
   private async _persistInterruptedSendToAgentCallbacks(): Promise<void> {
     const owner = resolveDelegateCallbackOwner()
     if (this._delegateJobs) {
-      try {
-        await persistDelegateJobSnapshots(this._delegateJobs)
-      } catch (err) {
-        this.log.warn('delegate job snapshot persist failed', { err: String(err) })
-      }
+      await persistDelegateJobSnapshots(this._delegateJobs)
     }
     this._activeSendToAgentCallbacks.clear()
     await recoverInterruptedSendToAgentIntents(
@@ -12919,8 +12936,10 @@ export class Gateway {
             clientMessageId: delegateCallbackMessageId(intent.jobId, epoch),
           })
           if (result.kind === 'injected') {
-            this._delegateJobs?.patchCallbackState(intent.jobId, 'delivered')
-            return true
+            const fence = job.claimToken
+              ? { claimToken: job.claimToken, fencingEpoch: job.fencingEpoch }
+              : undefined
+            return this._delegateJobs?.patchCallbackState(intent.jobId, 'delivered', fence) === true
           }
           return false
         },
@@ -13181,10 +13200,13 @@ export class Gateway {
     const epoch = snap?.callbackEpoch || 1
     const clientMessageId =
       owner === 'job' ? delegateCallbackMessageId(args.jobId, epoch) : undefined
-    if (owner === 'job') {
-      this._delegateJobs?.patchCallbackState(args.jobId, 'injecting', runInput.claimToken && runInput.fencingEpoch !== undefined
+    const fence =
+      runInput.claimToken && runInput.fencingEpoch !== undefined
         ? { claimToken: runInput.claimToken, fencingEpoch: runInput.fencingEpoch }
-        : undefined)
+        : undefined
+    if (owner === 'job') {
+      const injecting = this._delegateJobs?.patchCallbackState(args.jobId, 'injecting', fence)
+      if (!injecting) return
     }
     void this.injectSendToAgentCallback({
       parentSessionKey: runInput.callbackOriginSessionKey ?? runInput.parentSessionKey,
@@ -13200,12 +13222,16 @@ export class Gateway {
     }).then(async (result) => {
       if (result.kind !== 'injected') {
         if (owner === 'job') {
-          this._delegateJobs?.patchCallbackState(args.jobId, 'pending')
+          this._delegateJobs?.patchCallbackState(args.jobId, 'pending', fence)
         }
         return
       }
       if (owner === 'job') {
-        this._delegateJobs?.patchCallbackState(args.jobId, 'delivered')
+        const delivered = this._delegateJobs?.patchCallbackState(args.jobId, 'delivered', fence)
+        if (!delivered) {
+          this._delegateJobs?.patchCallbackState(args.jobId, 'pending', fence)
+          return
+        }
       }
       this._activeSendToAgentCallbacks.delete(args.jobId)
       await removeSendToAgentIntent(args.jobId)
