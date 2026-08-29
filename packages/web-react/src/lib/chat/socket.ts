@@ -69,6 +69,7 @@ import {
   type StoredSession,
 } from "../persist";
 import { appUpdate } from "../appUpdate";
+import { observeTimelineShadow } from "../timeline/shadowLifecycle";
 import {
   AUTO_CONTINUE_DISPLAY,
   AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY,
@@ -3990,10 +3991,11 @@ export class ChatSocket {
   ): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
+    const preReset = sess.messages.slice();
+    const mapped = units.map((unit) => liveUnitToMessage(unit));
     if (resetClientMessageIds.length > 0) {
       this.resetOwnerLocalRows(sess, resetClientMessageIds, liveProcessOwnersFromUnits(units));
     }
-    const mapped = units.map(liveUnitToMessage);
     sess.messages = prependLiveUnitMessages(sess.messages, mapped);
     restoreLiveUnitStreamingState(sess, units);
     if (resume?.sessionKey && resume.frameSeq > 0) {
@@ -4007,6 +4009,12 @@ export class ChatSocket {
     normalizeDelegateCards(sess);
     normalizeGoalCards(sess);
     sess.messages = repairPostFinalProcessOrder(sess.messages);
+    observeTimelineShadow({
+      entry: "live-units",
+      sessionId: sessId,
+      input: [...preReset, ...mapped],
+      oldOutput: sess.messages,
+    });
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
   }
@@ -4014,7 +4022,7 @@ export class ChatSocket {
   prependLiveUnits(sessId: string, units: import("@openclaude/protocol").LiveUnit[]): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
-    sess.messages = prependLiveUnitMessages(sess.messages, units.map(liveUnitToMessage));
+    sess.messages = prependLiveUnitMessages(sess.messages, units.map((unit) => liveUnitToMessage(unit)));
     rebuildIndexes(sess);
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
@@ -4038,6 +4046,7 @@ export class ChatSocket {
   ): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
+    const preReset = sess.messages.slice();
     if (resetClientMessageIds.length > 0) {
       const resetSessionKeys = new Set<string>();
       for (const record of frames) {
@@ -4112,6 +4121,12 @@ export class ChatSocket {
     normalizeDelegateCards(sess);
     normalizeGoalCards(sess);
     sess.messages = repairPostFinalProcessOrder(sess.messages);
+    observeTimelineShadow({
+      entry: "durable-frames",
+      sessionId: sessId,
+      input: [...preReset, ...sess.messages],
+      oldOutput: sess.messages,
+    });
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
   }

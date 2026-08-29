@@ -1,4 +1,9 @@
 import type { LiveChildBlock, LiveUnit, LiveUnitsPage } from "@openclaude/protocol";
+import {
+  EPOCH_BAND,
+  packEpoch,
+  timelineIdentity,
+} from "@openclaude/protocol";
 import type { ChatMessage, ChildBlock } from "./model";
 
 export function isLiveUnitsPage(value: unknown): value is LiveUnitsPage {
@@ -58,16 +63,28 @@ function toolInputPreviewOf(unit: LiveUnit): string | undefined {
   return undefined;
 }
 
-export function liveUnitToMessage(unit: LiveUnit): ChatMessage {
+export function liveUnitToMessage(
+  unit: LiveUnit,
+  opts?: { streamGeneration?: number },
+): ChatMessage {
   const role = roleFor(unit.kind);
   const text = unit.kind === "tool" ? "" : (unit.text || unit.goal || "");
   const inputPreview = toolInputPreviewOf(unit);
+  const owner = unit.clientMessageId || "";
+  const processKey = unit.timelineProcessKey ?? "";
+  const streamGeneration = opts?.streamGeneration ?? 0;
+  const lifecycle = unit.open ? "live_open" as const : "live_closed" as const;
   return {
     id: engineMessageId(unit) || unit.id,
     role,
     text,
     ts: Date.now(),
     _liveUnit: true,
+    _lifecycle: lifecycle,
+    _lifecycleEpoch: packEpoch(EPOCH_BAND.LIVE, streamGeneration, unit.seqLast, 0),
+    _timelineProcessKey: processKey,
+    _timelineIdentity: timelineIdentity(owner, role, processKey),
+    _timelineStreamGen: streamGeneration,
     ...(unit.clientMessageId ? {
       _clientMessageId: unit.clientMessageId,
       _turnOwnerId: unit.clientMessageId,

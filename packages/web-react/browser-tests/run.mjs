@@ -2768,6 +2768,47 @@ await check("T55 Phase-B deferred agent-group 后空 live-units reset 仍保留�
   }
 });
 
+await check("T56 同 owner 两段 thinking 被 tool 隔开不合并", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runShadowTwoThinkingExact());
+  if (result.merged) {
+    throw new Error(`T56 两段 thinking 被合并:${JSON.stringify(result)}`);
+  }
+  if (result.thinkingKeys.length !== 2 || result.thinkingKeys[0] === result.thinkingKeys[1]) {
+    throw new Error(`T56 processKey 未逐段区分:${JSON.stringify(result)}`);
+  }
+  if (!result.thinkingKeys.includes("seg:10:recA") || !result.thinkingKeys.includes("seg:40:recB")) {
+    throw new Error(`T56 exact 未分别命中:${JSON.stringify(result)}`);
+  }
+});
+
+await check("T57 permission 在 live-units shadow 投影中保留", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runShadowPermissionReset());
+  if (!result.permissionKeptProjected || !result.shadowNewKeep) {
+    throw new Error(`T57 投影器丢掉 permission:${JSON.stringify(result)}`);
+  }
+  if (result.shadowEntry !== "live-units" && result.shadowEntry !== "none") {
+    throw new Error(`T57 未走 live-units 入口:${JSON.stringify(result)}`);
+  }
+});
+
+await check("T58 双槽/乱序 epoch/四入口 shadow 采样", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runShadowDualSlotAndEpoch());
+  if (result.dualSlotLive !== 6 || result.dualSlotStubs !== 6) {
+    throw new Error(`T58 1MiB×6 双槽失败:${JSON.stringify(result)}`);
+  }
+  if (result.outOfOrderText !== "AB") {
+    throw new Error(`T58 乱序 epoch 回滚正文:${JSON.stringify(result)}`);
+  }
+  if (result.exactAfterRange !== 1) {
+    throw new Error(`T58 Range exact 未收敛:${JSON.stringify(result)}`);
+  }
+  const needed = ["full", "incremental", "live-units", "durable-frames"];
+  const missing = needed.filter((entry) => !result.entriesSampled.includes(entry));
+  if (missing.length > 0) {
+    throw new Error(`T58 缺入口采样 ${missing.join(",")}:${JSON.stringify(result)}`);
+  }
+});
+
 await check("T50 persist 后用户气泡只显示原文，不含论文任务系统提示", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runPaperHintUserBubble());
   if (result.text !== "CRISPR 论文") {

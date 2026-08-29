@@ -382,6 +382,23 @@ export type ChatMessage = {
   _timelineUnitKey?: string;
   /** Exact logical order inside one immutable physical tape record. */
   _timelineLogicalOrdinal?: number;
+  /** Server-authored lifecycle stamp (OCV5-21). Absent on legacy rows. */
+  _lifecycle?:
+    | "optimistic_local"
+    | "live_open"
+    | "live_closed"
+    | "phase_a"
+    | "exact_deferred"
+    | "exact_displayable"
+    | "retired";
+  /** Packed packEpoch() safe-int. Independent of reducerEpoch. */
+  _lifecycleEpoch?: number;
+  /** `${owner}\\0${role}\\0${processKey}` */
+  _timelineIdentity?: string;
+  /** Stable per-role process identity. Empty only for the narrative assistant slot. */
+  _timelineProcessKey?: string;
+  /** Live stream generation for packEpoch streamGen. */
+  _timelineStreamGen?: number;
   /** Client page identity used only by virtualization/scroll anchoring. */
   _historyPageKey?: string;
   /** Opaque cursor that produced this older in-memory page. */

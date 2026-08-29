@@ -68,6 +68,13 @@ import {
   turnRecoveryIdentity,
   parseSessionWorkspaceMode,
   losslessBillingAnchorId,
+  applyTimelineStamp,
+  deriveProcessKeyFromRecord,
+  packEpoch,
+  packTapeSeq,
+  timelineIdentity,
+  EPOCH_BAND,
+  type TimelineLifecycle,
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
@@ -5437,13 +5444,61 @@ async function hasCompletedClientTurnImpl(
   }
 }
 
+function stampTapeLifecycle(
+  record: MessageLike,
+  lifecycle: TimelineLifecycle,
+  opts: {
+    processKey?: string;
+    historyRevision?: number;
+    ordinal?: number;
+    exactBit?: 0 | 1;
+  } = {},
+): MessageLike {
+  const owner = typeof record._turnOwnerId === "string" && record._turnOwnerId
+    ? record._turnOwnerId
+    : typeof record._clientMessageId === "string"
+      ? record._clientMessageId
+      : "";
+  const role = typeof record.role === "string" ? record.role : "";
+  const ordinal = opts.ordinal ?? (
+    typeof record._recordOrdinal === "number"
+      ? record._recordOrdinal
+      : typeof record._turnTapeOrdinal === "number"
+        ? record._turnTapeOrdinal
+        : 0
+  );
+  const processKey = opts.processKey ?? deriveProcessKeyFromRecord({
+    role,
+    messageId: typeof record.messageId === "string" ? record.messageId : undefined,
+    blockId: typeof record.blockId === "string" ? record.blockId : undefined,
+    runId: typeof record.runId === "string" ? record.runId : undefined,
+    jobId: typeof record.jobId === "string" ? record.jobId : undefined,
+    requestId: typeof record.requestId === "string" ? record.requestId : undefined,
+    _delegateRunId: typeof record._delegateRunId === "string" ? record._delegateRunId : undefined,
+    _timelineProcessKey: typeof record._timelineProcessKey === "string"
+      ? record._timelineProcessKey
+      : undefined,
+    _turnTapeId: typeof record._turnTapeId === "string" ? record._turnTapeId : undefined,
+    _turnTapeOrdinal: typeof record._turnTapeOrdinal === "number" ? record._turnTapeOrdinal : undefined,
+    _recordOrdinal: typeof record._recordOrdinal === "number" ? record._recordOrdinal : undefined,
+  }, typeof record._turnTapeId === "string" ? record._turnTapeId : undefined, ordinal);
+  const seq = packTapeSeq(opts.historyRevision ?? 0, ordinal);
+  const exactBit = opts.exactBit ?? (lifecycle === "exact_displayable" ? 1 : 0);
+  return applyTimelineStamp(record as Record<string, unknown>, {
+    _lifecycle: lifecycle,
+    _lifecycleEpoch: packEpoch(EPOCH_BAND.TAPE, 0, seq, exactBit),
+    _timelineIdentity: timelineIdentity(String(owner), role, processKey),
+    _timelineProcessKey: processKey,
+  }) as MessageLike;
+}
+
 function deferredTapeRecord(
   tapeId: string,
   tapeSha256: string,
   head: { msg_id: string; ordinal: number; role: string; ts: string; content_sha256?: string },
   payloadBytes: number,
 ): MessageLike {
-  return {
+  return stampTapeLifecycle({
     id: head.msg_id,
     role: head.role,
     text: "",
@@ -5458,7 +5513,7 @@ function deferredTapeRecord(
     _payloadDeferred: true,
     _payloadBytes: payloadBytes,
     ...(head.content_sha256 ? { _payloadSha256: head.content_sha256 } : {}),
-  };
+  }, "exact_deferred", { ordinal: head.ordinal, exactBit: 0 });
 }
 
 type DirectTapePageHead = {
@@ -6117,7 +6172,7 @@ function unifiedTimelineTapeFallbackMessages(
   const ts = typeof head?.ts === "number" && Number.isFinite(head.ts)
     ? head.ts
     : (typeof unit.anchor.ts === "number" && Number.isFinite(unit.anchor.ts) ? unit.anchor.ts : 0);
-  return [attachFallbackSettlementUsage({
+  return [stampTapeLifecycle(attachFallbackSettlementUsage({
     id,
     role: "assistant",
     text: picked.text,
@@ -6145,7 +6200,11 @@ function unifiedTimelineTapeFallbackMessages(
     ...(typeof head?.errorCode === "string" ? { _errorCode: head.errorCode } : {}),
     ...(reason === "records_unpublished" ? { _recordsPending: true } : {}),
     ...(head?.partial === true ? { _visibleHeadPartial: true } : {}),
-  }, unit.header, unit.anchor.usage)];
+  }, unit.header, unit.anchor.usage), "phase_a", {
+    processKey: "",
+    historyRevision: unit.orderSeq,
+    exactBit: 0,
+  })];
 }
 
 async function hydrateUnifiedTimelineTapeUnits(
@@ -6310,7 +6369,22 @@ async function hydrateUnifiedTimelineTapeUnits(
       _timelineRecord: true,
       _timelineLogicalOrdinal: logicalIndex,
       _timelineUnitKey: timelineTapeKey(header.tapeId, head.ordinal, logicalIndex, record.id),
-    }));
+    })).map((record) => {
+      const row = record as MessageLike;
+      const deferred = row._payloadDeferred === true;
+      return stampTapeLifecycle(
+        row,
+        deferred ? "exact_deferred" : "exact_displayable",
+        {
+          historyRevision: unit.orderSeq,
+          ordinal: head.ordinal,
+          exactBit: deferred ? 0 : 1,
+          processKey: typeof row._timelineProcessKey === "string"
+            ? row._timelineProcessKey
+            : undefined,
+        },
+      );
+    });
     result.set(physicalKey, logicalRecords);
     } catch (error) {
       result.set(physicalKey, unifiedTimelineTapeFallbackMessages(sessionId, {
