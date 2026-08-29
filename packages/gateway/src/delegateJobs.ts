@@ -160,6 +160,22 @@ export function mintDelegateClaimToken(): string {
   return randomBytes(32).toString('hex')
 }
 
+const LEGAL_CALLBACK_TRANSITIONS = new Set<string>([
+  'none->pending',
+  'none->skipped_silent',
+  'pending->injecting',
+  'pending->delivered',
+  'pending->skipped_silent',
+  'pending->abandoned',
+  'injecting->delivered',
+  'injecting->pending',
+  'injecting->abandoned',
+])
+
+function isLegalCallbackTransition(from: DelegateCallbackState, to: DelegateCallbackState): boolean {
+  return LEGAL_CALLBACK_TRANSITIONS.has(`${from}->${to}`)
+}
+
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => {
     setTimeout(resolve, ms)
@@ -257,16 +273,16 @@ export class DelegateJobStore {
     return job ? this.snapshot(job) : undefined
   }
 
-  complete(jobId: string, result: DelegateJobHttpResult, fence?: { claimToken: string; fencingEpoch: number }): void {
+  complete(jobId: string, result: DelegateJobHttpResult, fence?: { claimToken: string; fencingEpoch: number }): boolean {
     const job = this.jobs.get(jobId)
-    if (!job || job.result) return
+    if (!job || job.result) return false
     if (this.sm && job.claimToken) {
-      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) return
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) return false
     }
     if (this.sm) {
       const next: DelegateJobState = result.httpStatus >= 200 && result.httpStatus < 300 ? 'completed' : 'failed'
       const gate = assertDelegateTransition(job.state, next)
-      if (!gate.ok && job.state !== next) return
+      if (!gate.ok && job.state !== next) return false
       job.state = next
       if (next === 'failed' && !job.failureClass) {
         job.failureClass = 'child_error'
@@ -286,6 +302,7 @@ export class DelegateJobStore {
     job.expiresAt = this.now() + this.ttlMs
     const waiters = job.waiters.splice(0)
     for (const w of waiters) w(this.viewOf(job))
+    return true
   }
 
   /**
@@ -620,9 +637,11 @@ export class DelegateJobStore {
   ): boolean {
     const job = this.jobs.get(jobId)
     if (!job) return false
-    if (job.claimToken && fence) {
-      if (job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) return false
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) return false
     }
+    if (job.callbackState === next) return true
+    if (!isLegalCallbackTransition(job.callbackState, next)) return false
     job.callbackState = next
     return true
   }

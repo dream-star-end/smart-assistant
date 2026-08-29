@@ -580,7 +580,16 @@ describe('auditor probes: cron terminal frees capacity', () => {
       })
       assert.ok(!('error' in enq), `occurrence ${i} should enqueue`)
       if ('error' in enq) return
-      assert.equal(settleCronDelegateJob(store, enq.jobId, 'completed'), true)
+      const claimed = store.claimQueued(enq.jobId)
+      assert.equal(claimed.ok, true, `occurrence ${i} should claim`)
+      if (!claimed.ok) return
+      assert.equal(
+        settleCronDelegateJob(store, enq.jobId, 'completed', {
+          claimToken: claimed.claimToken,
+          fencingEpoch: claimed.fencingEpoch,
+        }),
+        true,
+      )
     }
     assert.ok(store.nonTerminalCount() < 256)
     assert.ok(store.size() >= 1)
@@ -630,6 +639,216 @@ describe('auditor probes: shutdown keeps recovery records', () => {
       assert.deepEqual(await readdir(intentDir), [`${created.jobId}.json`])
     } finally {
       await rm(dir, { recursive: true, force: true })
+      await rm(intentDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('auditor probes: cron settle never borrows the live fence', () => {
+  it('claim A then rotate B: settle with A affects 0 rows', () => {
+    let now = 1_000
+    const store = new DelegateJobStore({
+      sm: true,
+      ttlMs: 60_000,
+      bootId: 'gw:a',
+      leaseMs: 10,
+      now: () => now,
+    })
+    const enq = enqueueCronOccurrenceJob(store, {
+      cronJobId: 'remind-fence',
+      dueMinuteKey: 1_700_000_100,
+      agentId: 'main',
+    })
+    assert.ok(!('error' in enq))
+    if ('error' in enq) return
+    const claimedA = store.claimQueued(enq.jobId)
+    assert.equal(claimedA.ok, true)
+    if (!claimedA.ok) return
+    now = 50_000
+    const adopted = store.adoptOrKill(enq.jobId, claimedA.fencingEpoch, 'running')
+    assert.equal(adopted?.state, 'running')
+    assert.notEqual(adopted?.claimToken, claimedA.claimToken)
+    const missing = settleCronDelegateJob(store, enq.jobId, 'completed', undefined)
+    assert.equal(missing, false)
+    assert.equal(store.snapshotOf(enq.jobId)?.state, 'running')
+    const stale = settleCronDelegateJob(store, enq.jobId, 'completed', {
+      claimToken: claimedA.claimToken,
+      fencingEpoch: claimedA.fencingEpoch,
+    })
+    assert.equal(stale, false)
+    assert.equal(store.snapshotOf(enq.jobId)?.state, 'running')
+    assert.equal(store.snapshotOf(enq.jobId)?.claimToken, adopted?.claimToken)
+  })
+})
+
+describe('auditor probes: snapshot persist fail-closed', () => {
+  it('persist failure does not close or clear in-memory jobs', async () => {
+    const gw = Object.create(Gateway.prototype) as any
+    gw.log = { debug() {}, info() {}, warn() {}, error() {} }
+    gw._activeSendToAgentCallbacks = new Map()
+    const store = new DelegateJobStore({ sm: true, ttlMs: 60_000 })
+    const created = store.create('coding-assistant', {
+      queued: true,
+      callback: 'origin-inject',
+      sessionKey: 'sk',
+    })
+    assert.ok('jobId' in created)
+    gw._delegateJobs = store
+    const prev = process.env.OPENCLAUDE_DELEGATE_JOB_SNAPSHOT_DIR
+    process.env.OPENCLAUDE_DELEGATE_JOB_SNAPSHOT_DIR = '/dev/null/ocv5-22-phase0'
+    let closed = 0
+    const origClose = store.close.bind(store)
+    store.close = () => {
+      closed += 1
+      origClose()
+    }
+    try {
+      await gw._persistAndCloseDelegateJobs()
+      assert.fail('persist failure must propagate')
+    } catch (err: any) {
+      assert.equal(err?.code, 'ENOTDIR')
+    } finally {
+      if (prev === undefined) delete process.env.OPENCLAUDE_DELEGATE_JOB_SNAPSHOT_DIR
+      else process.env.OPENCLAUDE_DELEGATE_JOB_SNAPSHOT_DIR = prev
+    }
+    assert.equal(closed, 0)
+    assert.equal(gw._delegateJobs, store)
+    assert.equal(store.size(), 1)
+    assert.equal(store.snapshotOf(created.jobId)?.state, 'queued')
+  })
+})
+
+describe('auditor probes: callback CAS winner only', () => {
+  it('stale-owner fence does not inject or delete intent', async () => {
+    const prevSm = process.env.OC_DELEGATE_SM
+    process.env.OC_DELEGATE_SM = '1'
+    const intentDir = await mkdtemp(join(tmpdir(), 'oc-sta-stale-'))
+    const envPrev = process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR
+    process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR = intentDir
+    try {
+      const gw = makeGateway(false)
+      const store = new DelegateJobStore({ sm: true, ttlMs: 60_000, now: () => 1 })
+      const created = store.create('coding-assistant', {
+        queued: true,
+        callback: 'origin-inject',
+        sessionKey: 'sk',
+      })
+      assert.ok('jobId' in created)
+      const claimed = store.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      if (!claimed.ok) return
+      const won = store.complete(
+        created.jobId,
+        { httpStatus: 200, body: { ok: true, output: 'done' } },
+        { claimToken: claimed.claimToken, fencingEpoch: claimed.fencingEpoch },
+      )
+      assert.equal(won, true)
+      await persistSendToAgentIntent({
+        v: 1,
+        jobId: created.jobId,
+        originSessionKey: 'agent:main:webchat:dm:sess-1',
+        agentId: 'coding-assistant',
+        goal: 'x',
+        createdAt: 1,
+      })
+      gw._delegateJobs = store
+      gw._activeSendToAgentCallbacks = new Map([[created.jobId, { originSessionKey: 's' }]])
+      let injected = 0
+      gw.injectSendToAgentCallback = async () => {
+        injected += 1
+        return { kind: 'injected' }
+      }
+      gw._queueSendToAgentCallback(
+        {
+          callbackOnComplete: 'origin-inject',
+          claimToken: 'stale-owner',
+          fencingEpoch: claimed.fencingEpoch,
+          parentSessionKey: PARENT_KEY,
+        },
+        { jobId: created.jobId, agentId: 'coding-assistant', goal: 'x', output: 'done' },
+      )
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      assert.equal(injected, 0)
+      assert.equal(store.snapshotOf(created.jobId)?.callbackState, 'pending')
+      assert.deepEqual(await readdir(intentDir), [`${created.jobId}.json`])
+    } finally {
+      if (prevSm === undefined) delete process.env.OC_DELEGATE_SM
+      else process.env.OC_DELEGATE_SM = prevSm
+      if (envPrev === undefined) delete process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR
+      else process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR = envPrev
+      await rm(intentDir, { recursive: true, force: true })
+    }
+  })
+
+  it('delivered CAS false keeps the intent shadow', async () => {
+    const prevSm = process.env.OC_DELEGATE_SM
+    process.env.OC_DELEGATE_SM = '1'
+    const intentDir = await mkdtemp(join(tmpdir(), 'oc-sta-cas-'))
+    const envPrev = process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR
+    process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR = intentDir
+    try {
+      const gw = makeGateway(false)
+      const store = new DelegateJobStore({ sm: true, ttlMs: 60_000, now: () => 1 })
+      const created = store.create('coding-assistant', {
+        queued: true,
+        callback: 'origin-inject',
+        sessionKey: 'sk',
+      })
+      assert.ok('jobId' in created)
+      const claimed = store.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      if (!claimed.ok) return
+      assert.equal(
+        store.complete(
+          created.jobId,
+          { httpStatus: 200, body: { ok: true } },
+          { claimToken: claimed.claimToken, fencingEpoch: claimed.fencingEpoch },
+        ),
+        true,
+      )
+      await persistSendToAgentIntent({
+        v: 1,
+        jobId: created.jobId,
+        originSessionKey: 'agent:main:webchat:dm:sess-1',
+        agentId: 'coding-assistant',
+        goal: 'x',
+        createdAt: 1,
+      })
+      const origPatch = store.patchCallbackState.bind(store)
+      store.patchCallbackState = (jobId, next, fence) => {
+        if (next === 'delivered') return false
+        return origPatch(jobId, next, fence)
+      }
+      gw._delegateJobs = store
+      gw._activeSendToAgentCallbacks = new Map([[created.jobId, { originSessionKey: 's' }]])
+      let injected = 0
+      gw.injectSendToAgentCallback = async () => {
+        injected += 1
+        return { kind: 'injected' }
+      }
+      gw._queueSendToAgentCallback(
+        {
+          callbackOnComplete: 'origin-inject',
+          claimToken: claimed.claimToken,
+          fencingEpoch: claimed.fencingEpoch,
+          parentSessionKey: PARENT_KEY,
+        },
+        { jobId: created.jobId, agentId: 'coding-assistant', goal: 'x', output: 'done' },
+      )
+      for (let i = 0; i < 30 && injected === 0; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      assert.equal(injected, 1)
+      for (let i = 0; i < 30 && store.snapshotOf(created.jobId)?.callbackState === 'injecting'; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      assert.equal(store.snapshotOf(created.jobId)?.callbackState, 'pending')
+      assert.deepEqual(await readdir(intentDir), [`${created.jobId}.json`])
+    } finally {
+      if (prevSm === undefined) delete process.env.OC_DELEGATE_SM
+      else process.env.OC_DELEGATE_SM = prevSm
+      if (envPrev === undefined) delete process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR
+      else process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR = envPrev
       await rm(intentDir, { recursive: true, force: true })
     }
   })
