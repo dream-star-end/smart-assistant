@@ -570,6 +570,39 @@ export class DelegateJobStore {
     return true
   }
 
+  /**
+   * Capacity-reject an unclaimed queued job. Mutually exclusive with
+   * {@link claimQueued}: a claimed running owner is left untouched so the
+   * caller can choose "already dispatched" over reporting failure.
+   *
+   * `drop: true` (queue_full) deletes the row. Timeout/abort mark explicit
+   * `failed` so Wait surfaces `failure_class` and a later claim cannot execute.
+   */
+  settleCapacityReject(
+    jobId: string,
+    args: {
+      failureClass: DelegateFailureClass
+      detail: string
+      httpStatus: number
+      drop: boolean
+      nextState?: Extract<DelegateJobState, 'failed' | 'killed_by_cutover' | 'cancelled'>
+    },
+  ): 'dropped' | 'failed' | 'claimed' | 'missing' {
+    const job = this.jobs.get(jobId)
+    if (!job) return 'missing'
+    if (isDelegateTerminalState(job.state) || job.result) return 'missing'
+    if (job.state !== 'queued' || job.claimToken) return 'claimed'
+    if (args.drop) return this.dropIfUnclaimed(jobId) ? 'dropped' : 'claimed'
+    return this.fail(jobId, {
+      failureClass: args.failureClass,
+      detail: args.detail,
+      httpStatus: args.httpStatus,
+      nextState: args.nextState,
+    })
+      ? 'failed'
+      : 'claimed'
+  }
+
   snapshotsForPersist(): DelegateJobSnapshot[] {
     const out: DelegateJobSnapshot[] = []
     for (const job of this.jobs.values()) {

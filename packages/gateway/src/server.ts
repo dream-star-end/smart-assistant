@@ -77,8 +77,10 @@ import {
 } from '@openclaude/protocol'
 import {
   failureClassFromLocalExecutionCode,
+  isDelegateTerminalState,
   type DelegateFailureClass,
 } from '../../protocol/src/delegation.js'
+import { formatDelegateConcurrencyReject } from './delegateCapacity.js'
 
 const CONTROL_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
 const isControlId = (value: unknown): value is string =>
@@ -1850,6 +1852,8 @@ type DelegateTaskResult =
       message: string
       code?: LocalExecutionRejectCode
       failureClass?: DelegateFailureClass
+      /** Capacity reject lost the race to claimQueued; job is already dispatched. */
+      alreadyDispatched?: boolean
     }
   | { kind: 'error'; message: string; failureClass?: DelegateFailureClass }
   | {
@@ -10657,6 +10661,81 @@ export class Gateway {
     return 'wait'
   }
 
+  private _formatDelegateConcurrencyReject(opts: {
+    isReview: boolean
+    parentBucketKey?: string
+    waitedS?: number
+    queueFull?: boolean
+  }): string {
+    const perParentMax = Gateway.MAX_CONCURRENT_DELEGATIONS_PER_PARENT
+    const perParentInUse =
+      !opts.isReview && opts.parentBucketKey
+        ? (this._runningDelegationsByParent ??= new Map()).get(opts.parentBucketKey) ?? 0
+        : undefined
+    return formatDelegateConcurrencyReject({
+      isReview: opts.isReview,
+      inUse: this._activeDelegations,
+      perParentInUse,
+      perParentMax,
+      waitedS: opts.waitedS,
+      queueFull: opts.queueFull,
+      queueMaxWaiters: DELEGATE_QUEUE_MAX_WAITERS,
+    })
+  }
+
+  /**
+   * Capacity reject must not leave an executable job, and must not fail a job
+   * that already lost the race to claimQueued. Single-threaded Map ops make
+   * settle vs claim exclusive; this just chooses drop / fail / already-dispatched
+   * on the production write path (not later in the async `.then`).
+   */
+  private _applyDelegateCapacityReject(
+    input: RunDelegateInput,
+    args: {
+      httpStatus: number
+      message: string
+      failureClass?: DelegateFailureClass
+      drop: boolean
+    },
+  ): DelegateTaskResult {
+    const jobId = input.backgroundJobId
+    const store = this._delegateJobs
+    if (jobId && store) {
+      if (store.smEnabled) {
+        const outcome = store.settleCapacityReject(jobId, {
+          failureClass: args.failureClass ?? 'capacity_timeout',
+          detail: args.message,
+          httpStatus: args.httpStatus,
+          drop: args.drop,
+          nextState: args.failureClass === 'cancelled' ? 'cancelled' : 'failed',
+        })
+        if (outcome === 'claimed') {
+          return {
+            kind: 'rejected',
+            httpStatus: args.httpStatus,
+            message: args.message,
+            failureClass: args.failureClass,
+            alreadyDispatched: true,
+          }
+        }
+      } else {
+        store.complete(jobId, {
+          httpStatus: args.httpStatus,
+          body: {
+            error: args.message,
+            ...(args.failureClass ? { failure_class: args.failureClass } : {}),
+          },
+        })
+      }
+    }
+    return {
+      kind: 'rejected',
+      httpStatus: args.httpStatus,
+      message: args.message,
+      failureClass: args.failureClass,
+    }
+  }
+
   /**
    * 解析委派进度路由:沿父链向上追溯到最近的 webchat 祖先会话(取代旧的「父非 webchat
    * 即 null」——那会让二级+嵌套委派的进度整段丢弃,一级卡长时间无进展)。
@@ -10965,7 +11044,11 @@ export class Gateway {
         if (admit === 'full') {
           this._delegateResume.abort(resume.sessionKey, resume.minted)
           return this.sendJson(res, 429, {
-            error: `too many concurrent delegations (max ${Gateway.MAX_CONCURRENT_DELEGATIONS}); 排队等待者已满(${DELEGATE_QUEUE_MAX_WAITERS} 个)`,
+            error: this._formatDelegateConcurrencyReject({
+              isReview: slotOpts.isReview,
+              parentBucketKey: slotOpts.parentBucketKey,
+              queueFull: true,
+            }),
             failure_class: 'capacity_queue_full',
           })
         }
@@ -11032,6 +11115,9 @@ export class Gateway {
             runInput.claimToken && runInput.fencingEpoch !== undefined
               ? { claimToken: runInput.claimToken, fencingEpoch: runInput.fencingEpoch }
               : undefined
+          if (result.kind === 'rejected' && result.alreadyDispatched) {
+            return
+          }
           if (sm && result.kind === 'rejected' && result.failureClass) {
             const dropped =
               result.failureClass === 'capacity_queue_full' && store.dropIfUnclaimed(jobId)
@@ -11571,11 +11657,12 @@ export class Gateway {
       } else {
         // 与排队机制引入前的并发闸同形:429 + "too many concurrent delegations"。
         httpStatus = 429
-        const base = `too many concurrent delegations (max ${Gateway.MAX_CONCURRENT_DELEGATIONS})`
-        message =
-          gate.status === 'timeout'
-            ? `${base}; 已等待 ${waitedS}s 资源仍紧张,请稍后重试`
-            : `${base}; 排队等待者已满(${DELEGATE_QUEUE_MAX_WAITERS} 个)`
+        message = this._formatDelegateConcurrencyReject({
+          isReview,
+          parentBucketKey,
+          waitedS: gate.status === 'timeout' ? waitedS : undefined,
+          queueFull: gate.status === 'queue_full',
+        })
         this.log.warn('delegate_queue_reject', {
           targetAgentId,
           outcome: gate.status,
@@ -11596,59 +11683,76 @@ export class Gateway {
         )
       }
       let failureClass: DelegateFailureClass | undefined
-      if (isDelegateSmEnabled()) {
-        if (gate.status === 'timeout') failureClass = 'capacity_timeout'
-        else if (gate.status === 'queue_full') failureClass = 'capacity_queue_full'
-        else if (gate.status === 'aborted') failureClass = 'cancelled'
-        else failureClass = 'capacity_timeout'
-        if (gate.status === 'queue_full' && input.backgroundJobId) {
-          this._delegateJobs?.dropIfUnclaimed(input.backgroundJobId)
-        }
-      }
-      return { kind: 'rejected', httpStatus, message, failureClass }
+      if (gate.status === 'timeout') failureClass = 'capacity_timeout'
+      else if (gate.status === 'queue_full') failureClass = 'capacity_queue_full'
+      else if (gate.status === 'aborted') failureClass = 'cancelled'
+      else failureClass = 'capacity_timeout'
+      return this._applyDelegateCapacityReject(input, {
+        httpStatus,
+        message,
+        failureClass,
+        drop: gate.status === 'queue_full',
+      })
     }
     if (isDelegateSmEnabled() && input.backgroundJobId) {
       const claimed = this._delegateJobs?.claimQueued(input.backgroundJobId)
-      if (claimed?.ok) {
-        input.claimToken = claimed.claimToken
-        input.fencingEpoch = claimed.fencingEpoch
-        const tok = claimed.claimToken
-        const epoch = claimed.fencingEpoch
-        const jobId = input.backgroundJobId
-        const timer = setInterval(() => {
-          const ok = this._delegateJobs?.casHeartbeat(jobId, tok, epoch)
-          if (!ok) {
-            clearInterval(timer)
-            // Child key is local `sessionKey` (`input.sessionKey ?? generated`).
-            // `input.sessionKey` is optional and must not be passed to interrupt().
-            if (!sessionKey) {
+      if (!claimed?.ok) {
+        this._releaseDelegateSlot(slotOpts)
+        unregisterDelegation?.()
+        const snap = this._delegateJobs?.snapshotOf(input.backgroundJobId)
+        if (snap && !isDelegateTerminalState(snap.state)) {
+          return {
+            kind: 'rejected',
+            httpStatus: 429,
+            message: 'delegate already claimed',
+            alreadyDispatched: true,
+          }
+        }
+        return {
+          kind: 'rejected',
+          httpStatus: 429,
+          message: snap?.failureDetail || 'delegate job was rejected before claim',
+          failureClass: snap?.failureClass,
+        }
+      }
+      input.claimToken = claimed.claimToken
+      input.fencingEpoch = claimed.fencingEpoch
+      const tok = claimed.claimToken
+      const epoch = claimed.fencingEpoch
+      const jobId = input.backgroundJobId
+      const timer = setInterval(() => {
+        const ok = this._delegateJobs?.casHeartbeat(jobId, tok, epoch)
+        if (!ok) {
+          clearInterval(timer)
+          // Child key is local `sessionKey` (`input.sessionKey ?? generated`).
+          // `input.sessionKey` is optional and must not be passed to interrupt().
+          if (!sessionKey) {
+            this.log.warn('delegate_lease_fence_lost', {
+              jobId,
+              reason: 'casHeartbeat failed; child sessionKey missing',
+            })
+            return
+          }
+          try {
+            const interrupted = this.sessions.interrupt(sessionKey)
+            if (!interrupted) {
               this.log.warn('delegate_lease_fence_lost', {
                 jobId,
-                reason: 'casHeartbeat failed; child sessionKey missing',
+                sessionKey,
+                reason: 'casHeartbeat failed; child session not interruptible',
               })
-              return
             }
-            try {
-              const interrupted = this.sessions.interrupt(sessionKey)
-              if (!interrupted) {
-                this.log.warn('delegate_lease_fence_lost', {
-                  jobId,
-                  sessionKey,
-                  reason: 'casHeartbeat failed; child session not interruptible',
-                })
-              }
-            } catch (err) {
-              this.log.warn(
-                'delegate_lease_fence_interrupt_failed',
-                { jobId, sessionKey },
-                err,
-              )
-            }
+          } catch (err) {
+            this.log.warn(
+              'delegate_lease_fence_interrupt_failed',
+              { jobId, sessionKey },
+              err,
+            )
           }
-        }, 15_000)
-        timer.unref()
-        input._leaseTimer = timer
-      }
+        }
+      }, 15_000)
+      timer.unref()
+      input._leaseTimer = timer
     }
     // ── grok delegate turn:向 master 铸造 relay route(与浏览器 turn 同一账号池)──
     // delegate 是容器本地 turn,没有 bridge 注入 __oc_grok_route;不铸 route 则
