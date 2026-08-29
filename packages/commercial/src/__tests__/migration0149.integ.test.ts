@@ -112,6 +112,7 @@ describe('0149_audit_hardening', () => {
     assert.equal(rows.rows[2].input_meta.error_class, 'timeout')
     for (const row of rows.rows) {
       assert.equal('input_preview' in row.input_meta, false)
+      // 0149-era contract: unconditional NULL. Live non-empty contract is 0254.
       assert.equal(row.error_msg, null)
     }
   })

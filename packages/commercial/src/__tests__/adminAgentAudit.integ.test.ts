@@ -852,7 +852,7 @@ describe("GET /api/admin/agent-audit (integ)", () => {
     const rows = r.json.rows as Array<Record<string, unknown>>;
     assert.equal(rows.length, 1);
     assert.equal(rows[0].success, false);
-    assert.equal(rows[0].error_msg, null);
+    assert.equal(rows[0].error_msg, "command not found");
     const meta = rows[0].input_meta as Record<string, unknown>;
     assert.equal(meta.error_class, "command_not_found");
     assert.equal("input_preview" in meta, false);

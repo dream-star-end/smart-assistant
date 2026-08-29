@@ -53,8 +53,9 @@ type TaskOutput = {
 };
 
 type TaskOutputToolOutput = {
-  retrieval_status: 'success' | 'timeout' | 'not_ready';
+  retrieval_status: 'success' | 'timeout' | 'not_ready' | 'not_found' | 'already_terminal';
   task: TaskOutput | null;
+  reason?: string;
 };
 
 // Re-export Progress from centralized types to break import cycles
@@ -234,7 +235,23 @@ export const TaskOutputTool: Tool<InputSchema, TaskOutputToolOutput> = buildTool
     const task = appState.tasks?.[task_id] as TaskState | undefined;
 
     if (!task) {
-      throw new Error(`No task found with ID: ${task_id}`);
+      return {
+        data: {
+          retrieval_status: 'not_found' as const,
+          task: null,
+          reason: `No task found with ID: ${task_id}`,
+        },
+      };
+    }
+
+    if (['completed', 'failed', 'killed', 'error'].includes(task.status)) {
+      return {
+        data: {
+          retrieval_status: 'already_terminal' as const,
+          task: await getTaskOutputData(task),
+          reason: `task ${task_id} already ${task.status}`,
+        },
+      };
     }
 
     if (!block) {
@@ -282,8 +299,9 @@ export const TaskOutputTool: Tool<InputSchema, TaskOutputToolOutput> = buildTool
     if (!completedTask) {
       return {
         data: {
-          retrieval_status: 'timeout' as const,
+          retrieval_status: 'not_found' as const,
           task: null,
+          reason: `No task found with ID: ${task_id}`,
         },
       };
     }
@@ -315,6 +333,9 @@ export const TaskOutputTool: Tool<InputSchema, TaskOutputToolOutput> = buildTool
     const parts: string[] = [];
 
     parts.push(`<retrieval_status>${data.retrieval_status}</retrieval_status>`);
+    if (data.reason) {
+      parts.push(`<reason>${data.reason}</reason>`);
+    }
 
     if (data.task) {
       parts.push(`<task_id>${data.task.task_id}</task_id>`);
@@ -335,10 +356,17 @@ export const TaskOutputTool: Tool<InputSchema, TaskOutputToolOutput> = buildTool
       }
     }
 
+    const failedTerminal =
+      data.retrieval_status === 'already_terminal' &&
+      ['failed', 'killed', 'error'].includes(data.task?.status ?? '');
+    const isError =
+      data.retrieval_status === 'not_found' || failedTerminal;
+
     return {
       tool_use_id: toolUseID,
       type: 'tool_result' as const,
       content: parts.join('\n\n'),
+      ...(isError ? { is_error: true } : {}),
     };
   },
 

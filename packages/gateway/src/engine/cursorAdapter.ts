@@ -13,6 +13,7 @@ import {
   DEFAULT_CURSOR_ENGINE_MODEL,
   type GoalStateSnapshot,
   type OutboundContentBlock,
+  synthesizeEmptyFailedToolPreview,
 } from '@openclaude/protocol'
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
@@ -1271,6 +1272,23 @@ function toolOutputOf(event: CursorEvent): { output: string; outputJson: unknown
     })
     return { output: content.join('\n'), outputJson: structuredClone(source.content) }
   }
+  if (kind === 'awaitToolCall') {
+    const output = textOf(rawResult)
+    const blank = !output.trim() || output.trim() === '{}' || output.trim() === 'null'
+    if (blank && toolFailed(event)) {
+      const input = toolInputOf(event)
+      const taskId = textOf(recordOf(input)?.task_id)
+      const status = textOf(event.status || event.subtype || 'failed') || 'failed'
+      const synthesized = synthesizeEmptyFailedToolPreview({
+        toolName: 'TaskOutput',
+        engine: 'cursor',
+        taskId,
+        status,
+      })
+      return { output: synthesized, outputJson: { error: synthesized } }
+    }
+    return { output, outputJson: structuredClone(rawResult) }
+  }
   return { output: textOf(rawResult), outputJson: structuredClone(rawResult) }
 }
 
@@ -2168,9 +2186,20 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.silentToolIds.delete(id)) return
     const tool = ctx.tools.get(id); if (!tool || tool.completed) return
     const { output, outputJson } = toolOutputOf(event); const isError = toolFailed(event)
-    Object.assign(tool, { output, outputJson: structuredClone(outputJson), completed: true, isError, durationMs: Date.now() - (ctx.startedTools.get(id) ?? Date.now()), ts: Date.now() }); ctx.pending.delete(id)
+    let preview = output.slice(0, 500)
+    if (isError && !preview.trim()) {
+      preview = synthesizeEmptyFailedToolPreview({
+        toolName: tool.toolName,
+        engine: 'cursor',
+        taskId: textOf(recordOf(tool.inputJson)?.task_id),
+        status: textOf(event.status || 'failed') || 'failed',
+      })
+    }
+    const terminationReason = isError ? 'tool_error' as const : undefined
+    const exitCode = cursorToolKindOf(event) === 'shellToolCall' ? shellIoOf(event).exitCode : undefined
+    Object.assign(tool, { output: preview || output, outputJson: structuredClone(outputJson), completed: true, isError, durationMs: Date.now() - (ctx.startedTools.get(id) ?? Date.now()), ts: Date.now() }); ctx.pending.delete(id)
     if (ctx.pending.size === 0) this.stopPendingKeepalive()
-    ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output, outputJson: structuredClone(outputJson), preview: output.slice(0, 500) } }); ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview: output.slice(0, 500), isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview } })
+    ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output: preview || output, outputJson: structuredClone(outputJson), preview } }); ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview, isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview, ...(exitCode !== undefined ? { exitCode } : {}), ...(terminationReason ? { terminationReason } : {}) } })
   }
   private finish(ctx: TurnCtx, detail: string | null): void {
     this.stopPendingKeepalive()

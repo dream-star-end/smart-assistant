@@ -3427,6 +3427,7 @@ export class SessionManager {
       opts.model ?? opts.agent.model,
       this.config.defaults.model,
       opts.executionAuthority,
+      { explicit: typeof opts.model === 'string' && opts.model !== '' },
     )
     // flag 门(§3):托管 + OC_MODEL_AUTHORITY=1 时,**无 master 权威一律不许创建 runner**。
     // 判定放在 resolveEngine 内部(engine 判定的单一收口),这里只把 flag 传进去 ——
