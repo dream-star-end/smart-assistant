@@ -27,8 +27,10 @@ export LANG=C
 export LC_ALL=C
 
 # Flavor identity (OCV5-20 §2.7). Helper is discovered from this script's
-# realpath (release root), never from cwd. Missing helper on a guarded
-# artifact is fail-closed.
+# realpath (release root / breakglass boot), never from cwd.
+# Missing helper is a loud skip (same as no-manifest skip) so a breakglass
+# copy without scripts/lib cannot take hostnet down. Helper present +
+# identity fail stays fail-closed ABORT.
 SETUP_HOST_NET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _flavor_lib=""
 _flavor_probe="$SETUP_HOST_NET_DIR"
@@ -48,8 +50,7 @@ elif [ -f "$SETUP_HOST_NET_DIR/../../../scripts/lib/assert-flavor.sh" ]; then
   # shellcheck disable=SC1090
   . "$SETUP_HOST_NET_DIR/../../../scripts/lib/assert-flavor.sh"
 else
-  echo "[ABORT] flavor helper missing for setup-host-net.sh" >&2
-  exit 1
+  echo "[WARN] flavor helper missing for setup-host-net.sh; skipping flavor identity check" >&2
 fi
 unset _flavor_lib _flavor_probe _flavor_next
 
@@ -275,6 +276,15 @@ ensure_v3_host_guard() {
   iptables -I INPUT 1 -s "$SUBNET" -j "$V3_HOST_GUARD_CHAIN" \
     -m comment --comment "${CHANNEL} container egress isolation"
   echo "[ADDED] INPUT -s $SUBNET -j $V3_HOST_GUARD_CHAIN (at position 1, deduped)"
+
+  # uid3 `host` SSH: flush rebuild would otherwise drop
+  # 172.31.0.0/16 → 172.31.0.1 tcp/22 RETURN until sshgate oneshot re-runs.
+  # Keep the exact match sshgate-insert.sh uses so later -C is idempotent.
+  if [ "$CHANNEL" = "v5" ]; then
+    iptables -C "$V3_HOST_GUARD_CHAIN" -s "$SUBNET" -d "$GATEWAY" -p tcp --dport 22 -j RETURN 2>/dev/null \
+      || iptables -I "$V3_HOST_GUARD_CHAIN" 1 -s "$SUBNET" -d "$GATEWAY" -p tcp --dport 22 -j RETURN
+    echo "[ADDED] $V3_HOST_GUARD_CHAIN SSH RETURN $SUBNET → $GATEWAY:22 (chain head)"
+  fi
 }
 
 main() {

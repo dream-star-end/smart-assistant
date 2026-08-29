@@ -1109,24 +1109,38 @@ install_unit() {
 
 # 把开机 oneshot 脚本拷到固定目录。ExecStart 不跟 rel-* 变,也不钉 git 工作树。
 sync_boot_scripts_from() {
-  local src="$1" hostnet_src sshgate_src tmp
+  local src="$1" hostnet_src sshgate_src flavor_lib_src flavor_rules_src tmp have_flavor=0
   [[ -n "$src" && -d "$src" ]] || die "sync_boot_scripts_from: 缺源目录 $src"
   hostnet_src="$src/packages/commercial/scripts/setup-host-net.sh"
   sshgate_src="$src/deploy/v5-selfhost/sshgate-insert.sh"
+  flavor_lib_src="$src/scripts/lib/assert-flavor.sh"
+  flavor_rules_src="$src/scripts/lib/flavor-rules.json"
   [[ -f "$hostnet_src" && ! -L "$hostnet_src" ]] || die "缺 setup-host-net.sh: $hostnet_src"
   [[ -f "$sshgate_src" && ! -L "$sshgate_src" ]] || die "缺 sshgate-insert.sh: $sshgate_src"
+  if [[ -f "$flavor_lib_src" && ! -L "$flavor_lib_src" && -f "$flavor_rules_src" && ! -L "$flavor_rules_src" ]]; then
+    have_flavor=1
+  fi
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] install $hostnet_src + $sshgate_src → $BOOT_SCRIPT_DIR"
+    echo "  [dry-run] install $hostnet_src + $sshgate_src + flavor helper → $BOOT_SCRIPT_DIR"
     return 0
   fi
-  mkdir -p -- "$BOOT_SCRIPT_DIR"
+  mkdir -p -- "$BOOT_SCRIPT_DIR/scripts/lib"
   tmp="$(mktemp -d -- "$BOOT_SCRIPT_DIR/.staging.XXXXXX")"
+  mkdir -p -- "$tmp/scripts/lib"
   install -m 0755 "$hostnet_src" "$tmp/setup-host-net.sh"
   install -m 0755 "$sshgate_src" "$tmp/sshgate-insert.sh"
   mv -f -- "$tmp/setup-host-net.sh" "$BOOT_SCRIPT_DIR/setup-host-net.sh"
   mv -f -- "$tmp/sshgate-insert.sh" "$BOOT_SCRIPT_DIR/sshgate-insert.sh"
-  rmdir -- "$tmp"
-  log "  ✓ 已同步开机脚本 → $BOOT_SCRIPT_DIR (from $src)"
+  if [[ "$have_flavor" == 1 ]]; then
+    install -m 0755 "$flavor_lib_src" "$tmp/scripts/lib/assert-flavor.sh"
+    install -m 0644 "$flavor_rules_src" "$tmp/scripts/lib/flavor-rules.json"
+    mv -f -- "$tmp/scripts/lib/assert-flavor.sh" "$BOOT_SCRIPT_DIR/scripts/lib/assert-flavor.sh"
+    mv -f -- "$tmp/scripts/lib/flavor-rules.json" "$BOOT_SCRIPT_DIR/scripts/lib/flavor-rules.json"
+    log "  ✓ 已同步开机脚本 → $BOOT_SCRIPT_DIR (from $src; flavor helper included)"
+  else
+    log "  ⚠ src $src 无 flavor helper, boot 仅同步 hostnet/sshgate (setup-host-net will skip flavor check)"
+  fi
+  rm -rf -- "$tmp"
 }
 
 # 优先当前 live;尚未翻转时用工作树(仅 bootstrap)。
