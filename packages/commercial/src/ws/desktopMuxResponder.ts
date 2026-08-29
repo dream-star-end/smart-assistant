@@ -22,7 +22,7 @@ export interface DesktopMuxResponderOpts {
 
 export function attachDesktopMuxResponder(opts: DesktopMuxResponderOpts): { close: () => void } {
   const origin = new URL(opts.localOrigin);
-  let buf = Buffer.alloc(0);
+  let buf: Buffer = Buffer.alloc(0);
   const pendingHttp = new Map<number, { method: string; path: string; headers: Record<string, string>; chunks: Buffer[] }>();
   const localWs = new Map<number, WebSocket>();
   let closed = false;
@@ -37,12 +37,12 @@ export function attachDesktopMuxResponder(opts: DesktopMuxResponderOpts): { clos
 
   const onMsg = (data: unknown) => {
     const chunk = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
-    buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+    buf = buf.length === 0 ? Buffer.from(chunk) : Buffer.concat([buf, chunk]);
     let frames;
     try {
       const decoded = decodeFrames(buf);
       frames = decoded.frames;
-      buf = decoded.rest;
+      buf = Buffer.from(decoded.rest);
     } catch {
       return;
     }

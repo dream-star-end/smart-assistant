@@ -217,7 +217,7 @@ export type StopOutcome = { kind: "command_echo"; reply: string; interrupted: bo
  */
 export interface ContainerTransport {
   post(
-    endpoint: { host: string; port: number; tunnel?: unknown },
+    endpoint: { host: string; port: number; tunnel?: unknown; containerId?: number },
     path: string,
     headers: Record<string, string>,
     bodyJson: string,
@@ -230,7 +230,7 @@ export interface ContainerTransport {
    */
   request?(
     method: "GET" | "POST",
-    endpoint: { host: string; port: number; tunnel?: unknown },
+    endpoint: { host: string; port: number; tunnel?: unknown; containerId?: number },
     path: string,
     headers: Record<string, string>,
     bodyJson: string | null,

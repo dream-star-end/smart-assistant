@@ -306,7 +306,7 @@ async function boot(t: { skip: (m?: string) => void }): Promise<Harness | null> 
             userId: BigInt(ident.userId),
             containerId: BigInt(ident.containerId),
             model: "e2e-stub",
-            precheckCredits: 0,
+            precheckCredits: 0n,
             ctxJson: { runtimeKind: "desktop", source: "desktop_e2e_stub" },
           });
           sendJson(res, 200, { id: requestId, type: "message", role: "assistant", content: [{ type: "text", text: "ok" }] });
