@@ -2468,16 +2468,14 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
       const preReset = session.messages.slice();
       replaySocket.applyLiveUnits(REPLAY_SESSION_ID, [], [cmid]);
       await new Promise((resolve) => setTimeout(resolve, 0));
-      const projected = projectTimeline(preReset);
       const liveShadow = lastShadowFor("live-units");
       const permId = timelineIdentity(cmid, "permission", "req-t57");
+      const shadowHit = liveShadow?.mismatches.find((row) => row.identity === permId);
       return {
         permissionKeptOld: session.messages.some((message) => message.role === "permission"),
-        permissionKeptProjected: projected.some((message) => message.role === "permission"),
+        permissionKeptProjected: shadowHit?.newKeep === true,
         shadowEntry: liveShadow?.entry ?? "none",
-        shadowNewKeep: liveShadow?.mismatches.some((row) =>
-          row.identity === permId && row.newKeep,
-        ) === true || projected.some((message) => identityOf(message) === permId),
+        shadowNewKeep: shadowHit?.newKeep === true,
       };
     },
     runShadowDualSlotAndEpoch: async () => {

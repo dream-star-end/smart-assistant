@@ -68,4 +68,18 @@ describe("shadow observer", () => {
       row.identity.includes("agent-group") && (row.oldText !== row.newText || row.oldKeep !== row.newKeep),
     )).toBe(true);
   });
+
+  test("full text after the first 240 chars still counts as a mismatch", () => {
+    (globalThis as { __OC_TIMELINE_LIFECYCLE_V1?: string }).__OC_TIMELINE_LIFECYCLE_V1 = "shadow";
+    (globalThis as { __OC_TIMELINE_LIFECYCLE_SHADOW_FORCE?: boolean }).__OC_TIMELINE_LIFECYCLE_SHADOW_FORCE = true;
+    const prefix = "a".repeat(240);
+    const oldRow = stamped({ id: "th", role: "thinking", text: `${prefix}OLD` }, "live_open", "k");
+    const newRow = stamped({ id: "th", role: "thinking", text: `${prefix}NEW` }, "live_open", "k");
+    const obs = observeTimelineShadow({
+      entry: "full",
+      input: [newRow],
+      oldOutput: [oldRow],
+    });
+    expect(obs?.mismatchCount).toBeGreaterThan(0);
+  });
 });

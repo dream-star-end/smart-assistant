@@ -109,8 +109,9 @@ function nowMs(): number {
 }
 
 function fingerprint(row: ChatMessage): string {
-  const text = `${row.text || ""}\n${typeof row.output === "string" ? row.output : ""}`.slice(0, 240);
-  return `${identityOf(row)}\t${lifecycleOf(row)}\t${text}`;
+  const text = `${row.text || ""}\n${typeof row.output === "string" ? row.output : ""}`;
+  const children = Array.isArray(row.childBlocks) ? JSON.stringify(row.childBlocks) : "";
+  return `${identityOf(row)}\t${lifecycleOf(row)}\t${text}\t${children}`;
 }
 
 function rowText(row: ChatMessage | undefined): string | undefined {

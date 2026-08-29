@@ -645,6 +645,7 @@ async function readOpenDispatchStreamMeta(
   hasTapeProjection: boolean;
   tapeProjectionVersion: number;
   streamGeneration: number;
+  lineage: string[];
 } | null> {
   const session = await client.query(
     "SELECT 1 FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL",
@@ -720,6 +721,7 @@ async function readOpenDispatchStreamMeta(
     hasTapeProjection: streams.rows.some((row) => row.projection_source === "tape"),
     tapeProjectionVersion,
     streamGeneration: streamGenerationFromLineage(lineage, currentStreamKeys),
+    lineage,
   };
 }
 
@@ -796,11 +798,18 @@ export async function readClientSessionLiveUnits(
   }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
 
   const opts = options ?? {};
-  const reduced = snapshot.checkpoint
-    ? continueReduceLiveFrames(snapshot.checkpoint.state, snapshot.frames, opts)
+  const seedState = snapshot.checkpoint?.state
+    ? {
+      ...snapshot.checkpoint.state,
+      streamKeyLineage: snapshot.checkpoint.state.streamKeyLineage?.length
+        ? snapshot.checkpoint.state.streamKeyLineage
+        : snapshot.meta.lineage ?? [],
+    }
+    : null;
+  const reduced = seedState
+    ? continueReduceLiveFrames(seedState, snapshot.frames, opts)
     : reduceLiveFrames(snapshot.frames, opts);
   if (!reduced.ok) return fallbackLiveUnitsPage(snapshot.meta);
-  reduced.state.streamGeneration = snapshot.meta.streamGeneration ?? 0;
   const page = assembleLiveUnitsFromState(reduced.state, snapshot.meta, opts, catchUp);
   if (page.degraded === false) {
     const forCache = catchUp.length === 0

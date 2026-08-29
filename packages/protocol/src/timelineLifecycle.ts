@@ -32,8 +32,9 @@ export type TimelineStamp = {
   _timelineUnitKey?: string;
 };
 
-const STREAM_GEN_MASK = 0x3ff;
-const SEQ_MASK = 0xffffffffff;
+const STREAM_GEN_RADIX = 2 ** 10;
+const SEQ_RADIX = 2 ** 40;
+const BAND_RADIX = 2 ** 51;
 
 export function packEpoch(
   band: EpochBand,
@@ -41,11 +42,25 @@ export function packEpoch(
   seq: number,
   exactBit: 0 | 1,
 ): number {
-  const e =
-    band * 2 ** 51 +
-    (streamGen & STREAM_GEN_MASK) * 2 ** 41 +
-    (seq & SEQ_MASK) * 2 +
-    exactBit;
+  if (!Number.isInteger(band) || band < 0 || band > 2) {
+    throw new Error("lifecycle_epoch_band");
+  }
+  if (!Number.isInteger(streamGen) || streamGen < 0) {
+    throw new Error("lifecycle_epoch_stream_gen");
+  }
+  if (!Number.isInteger(seq) || seq < 0) {
+    throw new Error("lifecycle_epoch_seq");
+  }
+  if (exactBit !== 0 && exactBit !== 1) {
+    throw new Error("lifecycle_epoch_exact_bit");
+  }
+  if (streamGen >= STREAM_GEN_RADIX) {
+    throw new Error("lifecycle_stream_generation_overflow");
+  }
+  if (seq >= SEQ_RADIX) {
+    throw new Error("lifecycle_epoch_seq_overflow");
+  }
+  const e = band * BAND_RADIX + streamGen * (2 ** 41) + seq * 2 + exactBit;
   if (!Number.isSafeInteger(e)) throw new Error("lifecycle_epoch_overflow");
   return e;
 }
@@ -56,18 +71,19 @@ export function unpackEpoch(epoch: number): {
   seq: number;
   exactBit: 0 | 1;
 } {
-  const exactBit = (epoch & 1) as 0 | 1;
-  const seq = Math.floor(epoch / 2) & SEQ_MASK;
-  const streamGen = Math.floor(epoch / 2 ** 41) & STREAM_GEN_MASK;
-  const band = Math.floor(epoch / 2 ** 51) as EpochBand;
+  const exactBit = (Math.abs(epoch) % 2 === 1 ? 1 : 0) as 0 | 1;
+  const withoutExact = Math.floor(epoch / 2);
+  const seq = withoutExact % SEQ_RADIX;
+  const rest = Math.floor(withoutExact / SEQ_RADIX);
+  const streamGen = rest % STREAM_GEN_RADIX;
+  const band = Math.floor(rest / STREAM_GEN_RADIX) as EpochBand;
   return { band, streamGen, seq, exactBit };
 }
 
 /** Tape seq packing: historyRevision in the high 24 bits, ordinal in the low 16. */
 export function packTapeSeq(historyRevision: number, ordinal: number): number {
-  const rev = Math.max(0, historyRevision | 0) & 0xffffff;
-  const ord = Math.max(0, ordinal | 0) & 0xffff;
-  // Avoid 32-bit `<<` overflow once historyRevision exceeds 15 bits.
+  const rev = Math.max(0, Math.trunc(historyRevision)) % 0x1000000;
+  const ord = Math.max(0, Math.trunc(ordinal)) % 0x10000;
   return rev * 0x10000 + ord;
 }
 
@@ -78,8 +94,6 @@ export function timelineIdentity(
 ): string {
   return `${owner}\0${role}\0${processKey}`;
 }
-
-const STREAM_GEN_MAX = 0x3ff;
 
 /**
  * Map a session's stream_key lineage onto packEpoch streamGen.
@@ -107,7 +121,10 @@ export function streamGenerationFromLineage(
     const gen = idx >= 0 ? idx : Math.max(0, lineage.length);
     if (gen > max) max = gen;
   }
-  return Math.min(STREAM_GEN_MAX, max);
+  if (max >= STREAM_GEN_RADIX) {
+    throw new Error("lifecycle_stream_generation_overflow");
+  }
+  return max;
 }
 
 /** `dispatch:<uuid>:<attempt>` attempt_no is 1-based; generation is 0-based. */
@@ -116,7 +133,10 @@ export function streamGenerationFromStreamKey(streamKey: string): number {
   if (!match) return 0;
   const attempt = Number(match[1]);
   if (!Number.isSafeInteger(attempt) || attempt < 1) return 0;
-  return Math.min(STREAM_GEN_MAX, attempt - 1);
+  if (attempt - 1 >= STREAM_GEN_RADIX) {
+    throw new Error("lifecycle_stream_generation_overflow");
+  }
+  return attempt - 1;
 }
 
 export type LiveProcessKeySeed = {
@@ -176,7 +196,63 @@ export type EngineIdentityFields = {
   _turnTapeId?: string;
   _turnTapeOrdinal?: number;
   _recordOrdinal?: number;
+  _timelineLogicalOrdinal?: number;
+  _clientMessageId?: string;
+  _turnOwnerId?: string;
 };
+
+export type LiveProcessIdentitySeed = {
+  kind: string;
+  clientMessageId?: string | null;
+  timelineProcessKey?: string;
+  messageId?: string;
+  blockId?: string;
+  runId?: string;
+  jobId?: string;
+  seqFirst: number;
+};
+
+function liveKindForRole(role: string): string {
+  if (role === "agent-group") return "agent_group";
+  if (role === "assistant") return "text";
+  return role;
+}
+
+/**
+ * Copy a live-minted processKey onto a tape row. Aligns by engine key first,
+ * then by same-owner+role ordinal (thinking A/B sharing messageId).
+ */
+export function copyProcessKeyFromLiveUnits(
+  liveUnits: readonly LiveProcessIdentitySeed[],
+  record: EngineIdentityFields,
+  sameRoleOrdinalIndex: number,
+): string | undefined {
+  const owner = record._turnOwnerId || record._clientMessageId || "";
+  const role = record.role ?? "";
+  const kind = liveKindForRole(role);
+  const candidates = liveUnits
+    .filter((unit) => (unit.clientMessageId || "") === owner && unit.kind === kind)
+    .slice()
+    .sort((a, b) => a.seqFirst - b.seqFirst);
+  if (role === "tool" && record.blockId) {
+    const hit = candidates.find((unit) => unit.blockId === record.blockId);
+    if (typeof hit?.timelineProcessKey === "string") return hit.timelineProcessKey;
+  }
+  if (role === "agent-group" || role === "delegate-progress") {
+    const runId = record.runId || record._delegateRunId || record.jobId;
+    if (runId) {
+      const hit = candidates.find((unit) => unit.runId === runId || unit.jobId === runId);
+      if (typeof hit?.timelineProcessKey === "string") return hit.timelineProcessKey;
+    }
+  }
+  if (role === "plan" && record.blockId) {
+    const hit = candidates.find((unit) => unit.blockId === record.blockId);
+    if (typeof hit?.timelineProcessKey === "string") return hit.timelineProcessKey;
+  }
+  const byIndex = candidates[sameRoleOrdinalIndex];
+  if (typeof byIndex?.timelineProcessKey === "string") return byIndex.timelineProcessKey;
+  return undefined;
+}
 
 /**
  * Rebuild processKey from engine fields already on a tape/live row.
@@ -188,6 +264,7 @@ export function deriveProcessKeyFromRecord(
   record: EngineIdentityFields,
   fallbackTapeId?: string,
   fallbackOrdinal?: number,
+  logicalIndex?: number,
 ): string {
   if (typeof record._timelineProcessKey === "string") {
     return record._timelineProcessKey;
@@ -218,6 +295,10 @@ export function deriveProcessKeyFromRecord(
     record._recordOrdinal ??
     record._turnTapeOrdinal ??
     0;
+  const logical = logicalIndex ?? record._timelineLogicalOrdinal;
+  if (typeof logical === "number" && Number.isInteger(logical) && logical >= 0) {
+    return `legacy:${tapeId}:${ordinal}:${logical}`;
+  }
   return `legacy:${tapeId}:${ordinal}`;
 }
 

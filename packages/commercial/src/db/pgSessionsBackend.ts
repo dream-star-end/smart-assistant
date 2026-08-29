@@ -69,6 +69,7 @@ import {
   parseSessionWorkspaceMode,
   losslessBillingAnchorId,
   applyTimelineStamp,
+  copyProcessKeyFromLiveUnits,
   deriveProcessKeyFromRecord,
   packEpoch,
   packTapeSeq,
@@ -240,6 +241,7 @@ import {
   reconcileLiveStreamWithFinalTape,
   convergeFinalizedTapeLiveStreams,
 } from "./liveTurnFrames.js";
+import { loadSessionLiveCheckpointUnits } from "./liveUnitCheckpoints.js";
 
 // ── BIGINT codec(RFC D7)─────────────────────────────────────────────────────
 // node-postgres 默认把 int8/BIGINT 返回 string(避免 JS number 精度丢失)。这些列全是
@@ -5444,32 +5446,9 @@ async function hasCompletedClientTurnImpl(
   }
 }
 
-/** Stamp hydrated MessageLike fields only. Never rewrite tape BYTEA / content_sha256. */
-function stampTapeLifecycle(
-  record: MessageLike,
-  lifecycle: TimelineLifecycle,
-  opts: {
-    processKey?: string;
-    historyRevision?: number;
-    ordinal?: number;
-    exactBit?: 0 | 1;
-  } = {},
-): MessageLike {
-  const owner = typeof record._turnOwnerId === "string" && record._turnOwnerId
-    ? record._turnOwnerId
-    : typeof record._clientMessageId === "string"
-      ? record._clientMessageId
-      : "";
-  const role = typeof record.role === "string" ? record.role : "";
-  const ordinal = opts.ordinal ?? (
-    typeof record._recordOrdinal === "number"
-      ? record._recordOrdinal
-      : typeof record._turnTapeOrdinal === "number"
-        ? record._turnTapeOrdinal
-        : 0
-  );
-  const processKey = opts.processKey ?? deriveProcessKeyFromRecord({
-    role,
+function identityFieldsOf(record: MessageLike): import("@openclaude/protocol").EngineIdentityFields {
+  return {
+    role: typeof record.role === "string" ? record.role : undefined,
     messageId: typeof record.messageId === "string" ? record.messageId : undefined,
     blockId: typeof record.blockId === "string" ? record.blockId : undefined,
     runId: typeof record.runId === "string" ? record.runId : undefined,
@@ -5482,7 +5461,44 @@ function stampTapeLifecycle(
     _turnTapeId: typeof record._turnTapeId === "string" ? record._turnTapeId : undefined,
     _turnTapeOrdinal: typeof record._turnTapeOrdinal === "number" ? record._turnTapeOrdinal : undefined,
     _recordOrdinal: typeof record._recordOrdinal === "number" ? record._recordOrdinal : undefined,
-  }, typeof record._turnTapeId === "string" ? record._turnTapeId : undefined, ordinal);
+    _timelineLogicalOrdinal: typeof record._timelineLogicalOrdinal === "number"
+      ? record._timelineLogicalOrdinal
+      : undefined,
+    _clientMessageId: typeof record._clientMessageId === "string" ? record._clientMessageId : undefined,
+    _turnOwnerId: typeof record._turnOwnerId === "string" ? record._turnOwnerId : undefined,
+  };
+}
+
+/** Stamp hydrated MessageLike fields only. Never rewrite tape BYTEA / content_sha256. */
+function stampTapeLifecycle(
+  record: MessageLike,
+  lifecycle: TimelineLifecycle,
+  opts: {
+    processKey?: string;
+    historyRevision?: number;
+    ordinal?: number;
+    exactBit?: 0 | 1;
+    liveUnits?: import("@openclaude/protocol").LiveProcessIdentitySeed[];
+    sameRoleIndex?: number;
+    logicalIndex?: number;
+  } = {},
+): MessageLike {
+  const fields = identityFieldsOf(record);
+  const owner = fields._turnOwnerId || fields._clientMessageId || "";
+  const role = fields.role || "";
+  const ordinal = opts.ordinal ?? (
+    typeof record._recordOrdinal === "number"
+      ? record._recordOrdinal
+      : typeof record._turnTapeOrdinal === "number"
+        ? record._turnTapeOrdinal
+        : 0
+  );
+  const copied = opts.liveUnits
+    ? copyProcessKeyFromLiveUnits(opts.liveUnits, fields, opts.sameRoleIndex ?? 0)
+    : undefined;
+  const processKey = opts.processKey
+    ?? copied
+    ?? deriveProcessKeyFromRecord(fields, typeof record._turnTapeId === "string" ? record._turnTapeId : undefined, ordinal, opts.logicalIndex);
   const seq = packTapeSeq(opts.historyRevision ?? 0, ordinal);
   const exactBit = opts.exactBit ?? (lifecycle === "exact_displayable" ? 1 : 0);
   return applyTimelineStamp(record as Record<string, unknown>, {
@@ -6216,6 +6232,8 @@ async function hydrateUnifiedTimelineTapeUnits(
 ): Promise<Map<string, MessageLike[]>> {
   const result = new Map<string, MessageLike[]>();
   if (units.length === 0) return result;
+  const liveUnits = await loadSessionLiveCheckpointUnits(client, sessionId, userId);
+  const roleIndex = new Map<string, number>();
   const tapeIds = [...new Set(units.map((unit) => unit.header.tapeId))];
   const billingHeads = await readDirectTapeVisibleHeads(client, sessionId, userId, tapeIds);
   const billingByTape = new Map(billingHeads.map((head) => [head.tape_id, head]));
@@ -6370,9 +6388,19 @@ async function hydrateUnifiedTimelineTapeUnits(
       _timelineRecord: true,
       _timelineLogicalOrdinal: logicalIndex,
       _timelineUnitKey: timelineTapeKey(header.tapeId, head.ordinal, logicalIndex, record.id),
-    })).map((record) => {
+    }).map((record) => {
       const row = record as MessageLike;
       const deferred = row._payloadDeferred === true;
+      const owner = typeof row._turnOwnerId === "string" && row._turnOwnerId
+        ? row._turnOwnerId
+        : typeof row._clientMessageId === "string" ? row._clientMessageId : "";
+      const role = typeof row.role === "string" ? row.role : "";
+      const idxKey = `${owner}\0${role}`;
+      const sameRoleIndex = roleIndex.get(idxKey) ?? 0;
+      roleIndex.set(idxKey, sameRoleIndex + 1);
+      const logicalIndex = typeof row._timelineLogicalOrdinal === "number"
+        ? row._timelineLogicalOrdinal
+        : 0;
       return stampTapeLifecycle(
         row,
         deferred ? "exact_deferred" : "exact_displayable",
@@ -6380,9 +6408,9 @@ async function hydrateUnifiedTimelineTapeUnits(
           historyRevision: unit.orderSeq,
           ordinal: head.ordinal,
           exactBit: deferred ? 0 : 1,
-          processKey: typeof row._timelineProcessKey === "string"
-            ? row._timelineProcessKey
-            : undefined,
+          liveUnits,
+          sameRoleIndex,
+          logicalIndex,
         },
       );
     });

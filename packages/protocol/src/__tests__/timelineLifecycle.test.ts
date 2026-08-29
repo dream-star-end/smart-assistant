@@ -7,6 +7,7 @@ import {
   mintLiveProcessKey,
   packEpoch,
   packTapeSeq,
+  copyProcessKeyFromLiveUnits,
   streamGenerationFromLineage,
   streamGenerationFromStreamKey,
   timelineIdentity,
@@ -44,6 +45,19 @@ describe("packEpoch", () => {
     const stub = packEpoch(EPOCH_BAND.TAPE, 0, packTapeSeq(2, 7), 0);
     const exact = packEpoch(EPOCH_BAND.TAPE, 0, packTapeSeq(2, 7), 1);
     assert.equal(exact, stub + 1);
+  });
+
+  it("does not collide 32-bit boundaries and round-trips 40-bit seq", () => {
+    const a = packEpoch(EPOCH_BAND.LIVE, 0, 0, 0);
+    const b = packEpoch(EPOCH_BAND.LIVE, 0, 2 ** 32, 0);
+    assert.notEqual(a, b);
+    const hi = packEpoch(EPOCH_BAND.LIVE, 0, 2 ** 31, 0);
+    const lo = packEpoch(EPOCH_BAND.LIVE, 0, 2 ** 31 - 1, 0);
+    assert.equal(hi > lo, true);
+    const max = packEpoch(EPOCH_BAND.LIVE, 0, 2 ** 40 - 1, 0);
+    assert.equal(unpackEpoch(max).seq, 2 ** 40 - 1);
+    assert.equal(unpackEpoch(b).seq, 2 ** 32);
+    assert.throws(() => packEpoch(EPOCH_BAND.LIVE, 0, 2 ** 40, 0), /seq_overflow/);
   });
 });
 
@@ -99,11 +113,52 @@ describe("mintLiveProcessKey", () => {
   });
 });
 
+describe("copyProcessKeyFromLiveUnits", () => {
+  it("keeps two thinking segments with the same messageId on distinct keys", () => {
+    const live = [
+      { kind: "thinking", clientMessageId: "cm", timelineProcessKey: "msg:x", messageId: "x", seqFirst: 10 },
+      { kind: "thinking", clientMessageId: "cm", timelineProcessKey: "msg:x:seg:1", messageId: "x", seqFirst: 40 },
+    ];
+    const a = copyProcessKeyFromLiveUnits(live, { role: "thinking", _clientMessageId: "cm", messageId: "x" }, 0);
+    const b = copyProcessKeyFromLiveUnits(live, { role: "thinking", _clientMessageId: "cm", messageId: "x" }, 1);
+    assert.equal(a, "msg:x");
+    assert.equal(b, "msg:x:seg:1");
+    assert.notEqual(a, b);
+  });
+
+  it("copies agent-group runId onto a deferred stub by same-role index", () => {
+    const live = [
+      { kind: "agent_group", clientMessageId: "cm", timelineProcessKey: "run-9", runId: "run-9", seqFirst: 4 },
+    ];
+    const key = copyProcessKeyFromLiveUnits(
+      live,
+      { role: "agent-group", _clientMessageId: "cm" },
+      0,
+    );
+    assert.equal(key, "run-9");
+  });
+});
+
 describe("deriveProcessKeyFromRecord", () => {
   it("fail-closed to legacy when engine keys are missing", () => {
     assert.equal(
       deriveProcessKeyFromRecord({ role: "thinking" }, "tape-1", 3),
       "legacy:tape-1:3",
+    );
+  });
+
+  it("includes logicalIndex so a runtime batch cannot merge two events", () => {
+    assert.equal(
+      deriveProcessKeyFromRecord({ role: "runtime-event" }, "tape-1", 8, 0),
+      "legacy:tape-1:8:0",
+    );
+    assert.equal(
+      deriveProcessKeyFromRecord({ role: "runtime-event" }, "tape-1", 8, 1),
+      "legacy:tape-1:8:1",
+    );
+    assert.notEqual(
+      deriveProcessKeyFromRecord({ role: "runtime-event" }, "tape-1", 8, 0),
+      deriveProcessKeyFromRecord({ role: "runtime-event" }, "tape-1", 8, 1),
     );
   });
 
@@ -132,9 +187,12 @@ describe("streamGenerationFromLineage", () => {
     assert.equal(newGen > oldGen, true);
   });
 
-  it("caps at 10 bits", () => {
-    const keys = Array.from({ length: 2000 }, (_v, i) => `s${i}`);
-    assert.equal(streamGenerationFromLineage(keys, [`s${1999}`]), 0x3ff);
+  it("fail-closed overflow instead of clamping to 1023", () => {
+    const keys = Array.from({ length: 1025 }, (_v, i) => `s${i}`);
+    assert.throws(
+      () => streamGenerationFromLineage(keys, ["s1024"]),
+      /lifecycle_stream_generation_overflow/,
+    );
   });
 });
 

@@ -55,6 +55,25 @@ describe("liveUnitToMessage tool 行", () => {
     expect(msg.text).toBe("");
   });
 
+  test("plan 行不把 engine blockId 写成 ChatMessage.blockId", () => {
+    const msg = liveUnitToMessage({
+      id: "plan:1:x",
+      kind: "plan",
+      seqFirst: 1,
+      seqLast: 1,
+      recordIdFirst: "r1",
+      recordIdLast: "r1",
+      open: false,
+      clientMessageId: "m-1",
+      text: "plan",
+      blockId: "must-not-copy",
+      timelineProcessKey: "plan-block",
+    });
+    expect(msg.role).toBe("plan");
+    expect(msg.blockId).toBeUndefined();
+    expect(msg._timelineProcessKey).toBe("plan-block");
+  });
+
   test("streamGeneration 进入 epoch 与 _timelineStreamGen", () => {
     const msg = liveUnitToMessage(
       toolUnit({ seqLast: 1, clientMessageId: "m-1", timelineProcessKey: "b1" }),

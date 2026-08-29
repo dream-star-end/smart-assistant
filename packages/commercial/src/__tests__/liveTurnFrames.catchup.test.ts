@@ -186,6 +186,6 @@ describe('live units streamGeneration', () => {
     const src = await readFile(srcPath, 'utf8')
     assert.match(src, /streamGenerationFromLineage/)
     assert.match(src, /SELECT stream_key,client_message_id,projection_source/)
-    assert.match(src, /reduced\.state\.streamGeneration = snapshot\.meta\.streamGeneration/)
+    assert.match(src, /streamKeyLineage/)
   })
 })

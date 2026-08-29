@@ -208,4 +208,21 @@ describe("projectTimeline epoch (B3)", () => {
     expect(out).toHaveLength(1);
     expect(out[0]!.text).toBe("NEW");
   });
+
+  test("runtime-event legacy keys include logicalIndex and do not merge", () => {
+    const a = stamped(
+      { id: "e0", role: "runtime-event", text: "one" },
+      "exact_displayable",
+      "legacy:tape:8:0",
+      packEpoch(EPOCH_BAND.TAPE, 0, 8, 1),
+    );
+    const b = stamped(
+      { id: "e1", role: "runtime-event", text: "two" },
+      "exact_displayable",
+      "legacy:tape:8:1",
+      packEpoch(EPOCH_BAND.TAPE, 0, 8, 1),
+    );
+    const out = projectTimeline([a, b]);
+    expect(out.filter((row) => row.role === "runtime-event")).toHaveLength(2);
+  });
 });

@@ -84,6 +84,40 @@ describe('§9.1 thinking interrupted by tool', () => {
   })
 })
 
+describe('plan hydrate shape', () => {
+  it('does not set LiveUnit.blockId while still minting processKey', () => {
+    const reduced = reduceLiveFrames([
+      frame('1', 1, { kind: 'plan', blockId: 'plan-block', text: 'plan' }),
+    ])
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    assert.equal(reduced.state.units[0]?.blockId, undefined)
+    assert.equal(reduced.state.units[0]?.timelineProcessKey, 'plan-block')
+  })
+})
+
+describe('per-stream generation', () => {
+  it('stamps a later stream_key with a higher generation than seq=101 of the previous stream', () => {
+    const first = reduceLiveFrames([
+      frame('1', 101, { kind: 'thinking', text: 'AB' }, {
+        streamKey: 'dispatch:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:1',
+      }),
+    ])
+    assert.equal(first.ok, true)
+    if (!first.ok) return
+    const continued = continueReduceLiveFrames(first.state, [
+      frame('2', 1, { kind: 'tool_use', blockId: 't-new', toolName: 'Bash' }, {
+        streamKey: 'dispatch:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb:1',
+      }),
+    ])
+    assert.equal(continued.ok, true)
+    if (!continued.ok) return
+    assert.equal(first.state.units[0]?.streamGeneration, 0)
+    const tool = continued.state.units.find((unit) => unit.kind === 'tool')
+    assert.equal(tool?.streamGeneration, 1)
+  })
+})
+
 describe('§9.1 delegate start + huge tool + done is not last-wins', () => {
   it('keeps the 746KB tool_result child after phase=done', () => {
     const huge = kb(746)

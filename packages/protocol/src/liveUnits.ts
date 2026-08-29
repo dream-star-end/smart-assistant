@@ -91,6 +91,8 @@ export type LiveUnit = {
    * Copied live→tape; never reminted into a different value.
    */
   timelineProcessKey?: string
+  /** Per-stream generation from stream_key lineage. Independent of reducerEpoch. */
+  streamGeneration?: number
 }
 
 export type LiveFrameInput = {
@@ -109,6 +111,8 @@ export type LiveUnitState = {
   reducerEpoch: string
   /** SessionKey-reuse generation. Independent of reducerEpoch. */
   streamGeneration?: number
+  /** First-seen stream_key order used to mint unit.streamGeneration. */
+  streamKeyLineage?: string[]
 }
 
 export type LiveUnitsResume = {
@@ -556,8 +560,10 @@ function pushStampedUnit(
   units: MutableUnit[],
   unit: MutableUnit,
   counters: ProcessKeyCounters,
+  streamGeneration?: number,
 ): void {
   stampNewUnitProcessKey(unit, counters)
+  if (typeof streamGeneration === "number") unit.streamGeneration = streamGeneration
   units.push(unit)
 }
 
@@ -606,6 +612,17 @@ function reduceLiveFramesOnto(
   const units: MutableUnit[] = seed.units as MutableUnit[]
   const { openThinking, tools, groups } = seedReduceMaps(units)
   const processKeys = seedProcessKeyCounters(units)
+  const streamKeyLineage = [...(seed.streamKeyLineage ?? [])]
+  const genFor = (streamKey: string): number => {
+    if (!streamKey) return 0
+    let idx = streamKeyLineage.indexOf(streamKey)
+    if (idx < 0) {
+      streamKeyLineage.push(streamKey)
+      idx = streamKeyLineage.length - 1
+    }
+    if (idx >= 1024) throw new Error("lifecycle_stream_generation_overflow")
+    return idx
+  }
   let throughFrameSeq = seed.throughFrameSeq
   let throughRecordId = seed.throughRecordId
   let sessionKey: string | undefined = seed.sessionKey
@@ -615,6 +632,7 @@ function reduceLiveFramesOnto(
       return { ok: false, degraded: 'fallback' }
     }
     const frame = frames[i]!
+    const streamGeneration = genFor(frame.streamKey)
     const meta = frameMeta(frame)
     if (meta.seq > throughFrameSeq) throughFrameSeq = meta.seq
     throughRecordId = frame.recordId
@@ -655,7 +673,7 @@ function reduceLiveFramesOnto(
           ...(messageId ? { messageId } : {}),
           payloadRef: meta.ref,
         }
-        pushStampedUnit(units, unit, processKeys)
+        pushStampedUnit(units, unit, processKeys, streamGeneration)
         openThinking.set(key, unit)
         if (cmid && messageId) openThinking.set(`${kind}:${cmid}`, unit)
       } else {
@@ -694,7 +712,7 @@ function reduceLiveFramesOnto(
             completed: false,
             payloadRef: meta.ref,
           }
-          pushStampedUnit(units, unit, processKeys)
+          pushStampedUnit(units, unit, processKeys, streamGeneration)
           tools.set(blockId, unit)
         } else {
           if (block.inputJson !== undefined && block.inputJson !== null) unit.inputJson = block.inputJson
@@ -725,7 +743,7 @@ function reduceLiveFramesOnto(
           text: str(block.inputPreview),
           payloadRef: meta.ref,
         }
-        pushStampedUnit(units, unit, processKeys)
+        pushStampedUnit(units, unit, processKeys, streamGeneration)
         tools.set(blockId, unit)
       } else {
         if (block.inputJson !== undefined && block.inputJson !== null) unit.inputJson = block.inputJson
@@ -761,7 +779,7 @@ function reduceLiveFramesOnto(
           error: !!block.isError,
           payloadRef: meta.ref,
         }
-        pushStampedUnit(units, unit, processKeys)
+        pushStampedUnit(units, unit, processKeys, streamGeneration)
         tools.set(toolUseId, unit)
       } else {
         unit.output = str(block.output) || str(block.preview) || unit.output
@@ -814,9 +832,9 @@ function reduceLiveFramesOnto(
         clientMessageId: cmid,
         sessionKey: meta.sessionKey,
         text: str(block.text),
-        ...(planBlockId ? { blockId: planBlockId } : {}),
+        timelineProcessKey: planBlockId || `plan:${meta.seq}`,
         payloadRef: meta.ref,
-      }, processKeys)
+      }, processKeys, streamGeneration)
       continue
     }
 
@@ -846,7 +864,7 @@ function reduceLiveFramesOnto(
           children: [],
           completed: false,
         }
-        pushStampedUnit(units, unit, processKeys)
+        pushStampedUnit(units, unit, processKeys, streamGeneration)
         groups.set(runId, unit)
       }
       applyDelegatePhase(unit, block, meta.ref)
@@ -865,7 +883,8 @@ function reduceLiveFramesOnto(
       throughRecordId,
       sessionKey,
       reducerEpoch: LIVE_UNITS_REDUCER_EPOCH,
-      streamGeneration: seed.streamGeneration ?? 0,
+      streamGeneration: streamKeyLineage.length > 0 ? streamKeyLineage.length - 1 : (seed.streamGeneration ?? 0),
+      streamKeyLineage,
     },
   }
 }
@@ -1208,6 +1227,7 @@ function cloneState(state: LiveUnitState): LiveUnitState {
     sessionKey: state.sessionKey,
     reducerEpoch: state.reducerEpoch,
     streamGeneration: state.streamGeneration,
+    streamKeyLineage: state.streamKeyLineage ? [...state.streamKeyLineage] : undefined,
   }
 }
 
@@ -1268,6 +1288,7 @@ export function foldLiveUnitStateForCheckpoint(
     sessionKey: state.sessionKey,
     reducerEpoch: state.reducerEpoch || LIVE_UNITS_REDUCER_EPOCH,
     streamGeneration: state.streamGeneration ?? 0,
+    streamKeyLineage: state.streamKeyLineage ? [...state.streamKeyLineage] : undefined,
   }
   const json = JSON.stringify(folded)
   if (utf8Bytes(json) > maxBytes) return null
@@ -1304,6 +1325,9 @@ export function parseLiveUnitCheckpoint(
     sessionKey: typeof obj.sessionKey === 'string' ? obj.sessionKey : undefined,
     reducerEpoch: expectedEpoch,
     streamGeneration: typeof obj.streamGeneration === 'number' ? obj.streamGeneration : 0,
+    streamKeyLineage: Array.isArray(obj.streamKeyLineage)
+      ? obj.streamKeyLineage.filter((key): key is string => typeof key === 'string')
+      : undefined,
   }
 }
 

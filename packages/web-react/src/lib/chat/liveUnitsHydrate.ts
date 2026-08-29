@@ -72,7 +72,9 @@ export function liveUnitToMessage(
   const inputPreview = toolInputPreviewOf(unit);
   const owner = unit.clientMessageId || "";
   const processKey = unit.timelineProcessKey ?? "";
-  const streamGeneration = opts?.streamGeneration ?? 0;
+  const streamGeneration = typeof unit.streamGeneration === "number"
+    ? unit.streamGeneration
+    : (opts?.streamGeneration ?? 0);
   const lifecycle = unit.open ? "live_open" as const : "live_closed" as const;
   return {
     id: engineMessageId(unit) || unit.id,
@@ -89,7 +91,7 @@ export function liveUnitToMessage(
       _clientMessageId: unit.clientMessageId,
       _turnOwnerId: unit.clientMessageId,
     } : {}),
-    ...(unit.blockId ? { blockId: unit.blockId } : {}),
+    ...(unit.blockId && unit.kind !== "plan" ? { blockId: unit.blockId } : {}),
     ...(unit.toolName ? { toolName: unit.toolName } : {}),
     ...(inputPreview ? { inputPreview } : {}),
     ...(unit.inputJson !== undefined ? { inputJson: unit.inputJson } : {}),

@@ -2783,11 +2783,11 @@ await check("T56 同 owner 两段 thinking 被 tool 隔开不合并", async () =
 
 await check("T57 permission 在 live-units shadow 投影中保留", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runShadowPermissionReset());
+  if (result.shadowEntry !== "live-units") {
+    throw new Error(`T57 未命中 live-units 入口:${JSON.stringify(result)}`);
+  }
   if (!result.permissionKeptProjected || !result.shadowNewKeep) {
     throw new Error(`T57 投影器丢掉 permission:${JSON.stringify(result)}`);
-  }
-  if (result.shadowEntry !== "live-units" && result.shadowEntry !== "none") {
-    throw new Error(`T57 未走 live-units 入口:${JSON.stringify(result)}`);
   }
 });
 
