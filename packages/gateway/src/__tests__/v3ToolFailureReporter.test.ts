@@ -10,7 +10,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 
-import type { ToolCalledEvent, TurnCompletedEvent } from '@openclaude/protocol'
+import {
+  isLegacyToolFailureErrorClass,
+  isRedactedReason,
+  isToolFailureKind,
+  type ToolCalledEvent,
+  type TurnCompletedEvent,
+} from '@openclaude/protocol'
 
 import {
   TOOL_AUDIT_SCHEMA_HEADER,
@@ -19,15 +25,71 @@ import {
   TURN_OBSERVATION_PATH,
   ToolFailureReportError,
   type ToolCallRollupPayload,
+  _resetAdvertisedToolAuditSchemaHintForTests,
   buildToolFailureReportPayload,
   buildTurnObservationPayload,
   isToolFailureAuditEnabled,
   makeToolFailureReporter,
+  projectRollupToLegacy,
   readToolFailureReportConfig,
+  sendToolCallRollup,
   sendToolFailureReport,
   sendTurnObservation,
   startToolFailureReporter,
+  v4Projection,
 } from '../v3ToolFailureReporter.js'
+
+afterEach(() => {
+  _resetAdvertisedToolAuditSchemaHintForTests()
+})
+
+/** Snapshot of 0aaf1a98a validateBody: 14 classes, no errorMsg. */
+function legacyValidateBodyV4(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+  const obj = raw as Record<string, unknown>
+  const allowed = new Set([
+    'schemaVersion',
+    'eventId',
+    'sessionKey',
+    'agentId',
+    'turnIndex',
+    'toolName',
+    'durationMs',
+    'timestamp',
+    'inputHash',
+    'outputHash',
+    'errorClass',
+    'failureKind',
+    'exitCode',
+    'terminationReason',
+    'traceId',
+  ])
+  if (Object.keys(obj).some((k) => !allowed.has(k))) return false
+  if (obj.schemaVersion !== 4) return false
+  return (
+    typeof obj.eventId === 'string' &&
+    typeof obj.sessionKey === 'string' &&
+    typeof obj.agentId === 'string' &&
+    typeof obj.toolName === 'string' &&
+    Number.isInteger(obj.turnIndex) &&
+    Number.isInteger(obj.durationMs) &&
+    Number.isInteger(obj.timestamp) &&
+    isLegacyToolFailureErrorClass(obj.errorClass) &&
+    isToolFailureKind(obj.failureKind)
+  )
+}
+
+function legacyValidateRollupBody(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+  const obj = raw as Record<string, unknown>
+  if (!Array.isArray(obj.counts)) return false
+  return obj.counts.every((count) => {
+    if (!count || typeof count !== 'object') return false
+    const row = count as Record<string, unknown>
+    if (row.outcome === 'success') return row.errorClass === 'none'
+    return isLegacyToolFailureErrorClass(row.errorClass)
+  })
+}
 
 let tmp: string | null = null
 afterEach(async () => {
@@ -122,13 +184,35 @@ describe('v3ToolFailureReporter', () => {
     const rawOutput = `failed with oc-v3.7.${'a'.repeat(64)}`
     assert.equal(payload.eventId, 'evt-1')
     assert.equal(payload.toolName, 'Bash')
-    assert.equal(payload.schemaVersion, 4)
+    assert.equal(payload.schemaVersion, 5)
     assert.equal(payload.inputHash, createHash('sha256').update(rawInput).digest('hex'))
     assert.equal(payload.outputHash, createHash('sha256').update(rawOutput).digest('hex'))
     assert.equal(payload.errorClass, 'other')
     assert.equal(payload.failureKind, 'unknown')
+    assert.ok(payload.errorMsg.length > 0)
+    assert.equal(payload.errorMsg.includes('secret-token'), false)
+    assert.equal(payload.errorMsg.includes('oc-v3.7.'), false)
     assert.equal('inputPreview' in payload, false)
     assert.equal('outputPreview' in payload, false)
+  })
+
+  test('v5 wire carries redactedReason for Bearer/dump and drops it in v4Projection', () => {
+    const bearer = buildToolFailureReportPayload(
+      toolEvent({ outputPreview: 'Authorization: Bearer fake-secret-value' }),
+    )!
+    assert.equal(bearer.schemaVersion, 5)
+    assert.equal(bearer.errorMsg, 'tool_failed:redacted_output')
+    assert.ok(isRedactedReason(bearer.redactedReason))
+    assert.equal(bearer.errorMsg.includes('fake-secret-value'), false)
+    const dump = buildToolFailureReportPayload(
+      toolEvent({ outputPreview: 'random dump from a core file with no known template' }),
+    )!
+    assert.equal(dump.errorMsg, 'tool_failed:redacted_output')
+    assert.equal(dump.redactedReason, 'unmatched_template')
+    const projected = v4Projection(bearer)
+    assert.equal('errorMsg' in projected, false)
+    assert.equal('redactedReason' in projected, false)
+    assert.equal(legacyValidateBodyV4(projected), true)
   })
 
   test('builds privacy-safe engine-neutral turn observations', () => {
@@ -233,12 +317,14 @@ describe('v3ToolFailureReporter', () => {
       },
     )
     assert.equal(bodies.length, 2)
-    assert.equal(bodies[0].schemaVersion, 4)
-    assert.equal(bodies[1].schemaVersion, 3)
+    assert.equal(bodies[0].schemaVersion, 5)
+    assert.equal(bodies[1].schemaVersion, 4)
     assert.equal(bodies[1].errorClass, 'process_exit')
+    assert.equal('errorMsg' in bodies[1], false)
     assert.equal('failureKind' in bodies[1], true)
 
     let calls = 0
+    _resetAdvertisedToolAuditSchemaHintForTests()
     await assert.rejects(
       () =>
         sendToolFailureReport(
@@ -256,7 +342,7 @@ describe('v3ToolFailureReporter', () => {
         ),
       (err) => err instanceof ToolFailureReportError && err.retryable === false,
     )
-    assert.equal(calls, 2)
+    assert.equal(calls, 3)
   })
 
   test('turn-observation 404 is retryable and its queue is invisible to old reporters', async () => {
@@ -606,5 +692,83 @@ describe('v3ToolFailureReporter', () => {
     await drainer.drainOnce()
     assert.ok(seenPaths.some((path) => path.endsWith(TOOL_FAILURE_AUDIT_PATH)))
     assert.ok(seenPaths.some((path) => path.endsWith(TOOL_CALL_ROLLUP_PATH)))
+  })
+
+  test('v5 new classes project to other and drop errorMsg for a v4 master', async () => {
+    const payload = buildToolFailureReportPayload(
+      toolEvent({
+        outputPreview: 'TaskOutput: empty failed output task_id=x engine=grok status=failed',
+      }),
+    )!
+    assert.equal(payload.schemaVersion, 5)
+    assert.equal(payload.errorClass, 'empty_output')
+    assert.ok(payload.errorMsg.length > 0)
+    const projected = v4Projection(payload)
+    assert.equal(projected.schemaVersion, 4)
+    assert.equal(projected.errorClass, 'other')
+    assert.equal('errorMsg' in projected, false)
+    assert.equal(legacyValidateBodyV4(projected), true)
+
+    const bodies: unknown[] = []
+    await sendToolFailureReport(
+      payload,
+      { masterBaseUrl: 'http://master', containerToken: 'tok' },
+      {
+        fetchImpl: async (_input, init) => {
+          const body = JSON.parse(String(init.body))
+          bodies.push(body)
+          if (legacyValidateBodyV4(body)) return new Response('{}', { status: 200 })
+          return new Response('{}', {
+            status: 400,
+            headers: { [TOOL_AUDIT_SCHEMA_HEADER]: '4' },
+          })
+        },
+      },
+    )
+    assert.equal((bodies[0] as { schemaVersion: number }).schemaVersion, 5)
+    assert.equal(legacyValidateBodyV4(bodies[1]), true)
+  })
+
+  test('rollup new classes 400 then legacy projection 200 against old validator', async () => {
+    const payload: ToolCallRollupPayload = {
+      schemaVersion: 2,
+      reportId: 'a'.repeat(32),
+      reporterRunId: 'b'.repeat(32),
+      sequence: 1,
+      windowStartedAt: 1,
+      windowEndedAt: 2,
+      counts: [
+        {
+          agentId: 'main',
+          toolName: 'TaskOutput',
+          outcome: 'failure',
+          errorClass: 'empty_output',
+          failureKind: 'unknown',
+          count: 1,
+          totalDurationMs: 3,
+          maxDurationMs: 3,
+        },
+      ],
+    }
+    assert.equal(legacyValidateRollupBody(payload), false)
+    const projected = projectRollupToLegacy(payload)
+    assert.equal(projected.counts[0].errorClass, 'other')
+    assert.equal(legacyValidateRollupBody(projected), true)
+
+    const bodies: unknown[] = []
+    await sendToolCallRollup(
+      payload,
+      { masterBaseUrl: 'http://master', containerToken: 'tok' },
+      {
+        fetchImpl: async (_input, init) => {
+          const body = JSON.parse(String(init.body)) as ToolCallRollupPayload
+          bodies.push(body)
+          if (legacyValidateRollupBody(body)) return new Response('{}', { status: 200 })
+          return new Response('{}', { status: 400 })
+        },
+      },
+    )
+    assert.equal((bodies[0] as ToolCallRollupPayload).counts[0].errorClass, 'empty_output')
+    assert.equal((bodies[1] as ToolCallRollupPayload).counts[0].errorClass, 'other')
   })
 })

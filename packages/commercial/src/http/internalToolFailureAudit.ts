@@ -12,9 +12,13 @@ import {
   type ToolFailureKind,
   type ToolTerminationReason,
   classifyToolFailureError,
+  isLegacyToolFailureErrorClass,
   isToolFailureErrorClass,
+  isRedactedReason,
   isToolFailureKind,
   isToolTerminationReason,
+  sanitizeToolFailureErrorMsg,
+  type RedactedReason,
 } from '@openclaude/protocol'
 
 import {
@@ -85,11 +89,18 @@ export interface ToolFailureAuditBodyV4 extends Omit<ToolFailureAuditBodyV3, 'sc
   traceId?: string
 }
 
+export interface ToolFailureAuditBodyV5 extends Omit<ToolFailureAuditBodyV4, 'schemaVersion'> {
+  schemaVersion: 5
+  errorMsg: string
+  redactedReason?: RedactedReason
+}
+
 export type ToolFailureAuditBody =
   | ToolFailureAuditBodyV1
   | ToolFailureAuditBodyV2
   | ToolFailureAuditBodyV3
   | ToolFailureAuditBodyV4
+  | ToolFailureAuditBodyV5
 
 export interface ToolCallRollupCountBody {
   agentId: string
@@ -239,7 +250,7 @@ function validateBody(raw: unknown, nowMs: number): ToolFailureAuditBody | null 
       ? [...commonAllowed, 'inputPreview', 'outputPreview']
       : obj.schemaVersion === 2
         ? [...commonAllowed, 'inputHash', 'outputHash', 'errorClass']
-        : obj.schemaVersion === 3 || obj.schemaVersion === 4
+        : obj.schemaVersion === 3 || obj.schemaVersion === 4 || obj.schemaVersion === 5
           ? [
               ...commonAllowed,
               'inputHash',
@@ -248,12 +259,13 @@ function validateBody(raw: unknown, nowMs: number): ToolFailureAuditBody | null 
               'failureKind',
               'exitCode',
               'terminationReason',
-              ...(obj.schemaVersion === 4 ? ['traceId'] : []),
+              ...(obj.schemaVersion === 4 || obj.schemaVersion === 5 ? ['traceId'] : []),
+              ...(obj.schemaVersion === 5 ? ['errorMsg', 'redactedReason'] : []),
             ]
           : commonAllowed,
   )
   if (Object.keys(obj).some((k) => !allowed.has(k))) return null
-  if (![1, 2, 3, 4].includes(Number(obj.schemaVersion))) return null
+  if (![1, 2, 3, 4, 5].includes(Number(obj.schemaVersion))) return null
   const eventId = requiredString(obj, 'eventId', 128)
   const sessionKey = requiredString(obj, 'sessionKey', 512)
   const agentId = requiredString(obj, 'agentId', 128)
@@ -296,8 +308,14 @@ function validateBody(raw: unknown, nowMs: number): ToolFailureAuditBody | null 
 
   const inputHash = optionalSha256(obj, 'inputHash')
   const outputHash = optionalSha256(obj, 'outputHash')
-  const errorClass = obj.errorClass
-  if (inputHash === null || outputHash === null || !isToolFailureErrorClass(errorClass)) return null
+  const rawErrorClass = obj.errorClass
+  const schemaVersion = Number(obj.schemaVersion)
+  const classOk =
+    schemaVersion >= 5
+      ? isToolFailureErrorClass(rawErrorClass)
+      : isLegacyToolFailureErrorClass(rawErrorClass)
+  if (inputHash === null || outputHash === null || !classOk) return null
+  const errorClass = rawErrorClass as ToolFailureErrorClass
   if (obj.schemaVersion === 2) {
     return {
       schemaVersion: 2,
@@ -316,8 +334,30 @@ function validateBody(raw: unknown, nowMs: number): ToolFailureAuditBody | null 
     (terminationReason !== undefined && !isToolTerminationReason(terminationReason))
   )
     return null
-  const traceId = obj.schemaVersion === 4 ? optionalString(obj, 'traceId', 128) : undefined
+  const traceId =
+    obj.schemaVersion === 4 || obj.schemaVersion === 5
+      ? optionalString(obj, 'traceId', 128)
+      : undefined
   if (traceId === null || (traceId !== undefined && !/^[0-9a-f]{32}$/.test(traceId))) return null
+  if (obj.schemaVersion === 5) {
+    const errorMsg = obj.errorMsg
+    if (typeof errorMsg !== 'string') return null
+    const redactedReason = obj.redactedReason
+    if (redactedReason !== undefined && !isRedactedReason(redactedReason)) return null
+    return {
+      schemaVersion: 5,
+      ...base,
+      ...(inputHash !== undefined ? { inputHash } : {}),
+      ...(outputHash !== undefined ? { outputHash } : {}),
+      errorClass,
+      failureKind,
+      errorMsg,
+      ...(redactedReason !== undefined ? { redactedReason } : {}),
+      ...(exitCode !== undefined ? { exitCode } : {}),
+      ...(terminationReason !== undefined ? { terminationReason } : {}),
+      ...(traceId !== undefined ? { traceId } : {}),
+    }
+  }
   return {
     schemaVersion: obj.schemaVersion as 3 | 4,
     ...base,
@@ -508,7 +548,20 @@ export async function insertToolFailureAudit(
     body.schemaVersion === 1 ? sha256OrNull(body.outputPreview) : (body.outputHash ?? null)
   const errorClass =
     body.schemaVersion === 1 ? classifyToolFailureError(body.outputPreview) : body.errorClass
-  const richBody = body.schemaVersion === 3 || body.schemaVersion === 4 ? body : null
+  const rawErrorMsg =
+    body.schemaVersion === 5
+      ? body.errorMsg
+      : body.schemaVersion === 1
+        ? body.outputPreview
+        : undefined
+  const sanitized = sanitizeToolFailureErrorMsg(rawErrorMsg)
+  // Gateway already sanitized; re-running on the sentinel loses the original
+  // reason. Prefer the sanitizer's reason (covers raw/v1), else the v5 wire enum.
+  const wireReason =
+    body.schemaVersion === 5 && isRedactedReason(body.redactedReason) ? body.redactedReason : undefined
+  const redactedReason = sanitized.redactedReason ?? wireReason
+  const richBody =
+    body.schemaVersion === 3 || body.schemaVersion === 4 || body.schemaVersion === 5 ? body : null
   const inputMeta = {
     schema_version: body.schemaVersion,
     event_id: body.eventId,
@@ -521,8 +574,10 @@ export async function insertToolFailureAudit(
     ...(richBody?.terminationReason !== undefined
       ? { termination_reason: richBody.terminationReason }
       : {}),
+    ...(redactedReason ? { redacted_reason: redactedReason } : {}),
   }
-  const traceId = body.schemaVersion === 4 ? (body.traceId ?? null) : null
+  const traceId =
+    body.schemaVersion === 4 || body.schemaVersion === 5 ? (body.traceId ?? null) : null
   await runner.query(
     `INSERT INTO agent_audit(
        user_id,session_id,tool,input_meta,input_hash,output_hash,
@@ -538,7 +593,7 @@ export async function insertToolFailureAudit(
       inputHash,
       outputHash,
       body.durationMs,
-      null,
+      sanitized.errorMsg,
       body.timestamp,
       traceId,
     ],
@@ -552,7 +607,7 @@ export function makeToolFailureAuditHandler(deps: ToolFailureAuditDeps): ToolFai
     setSecurityHeaders(res)
     // New runtimes use this on 400 to distinguish a current-master validation
     // failure from an old master that only understands schema v2.
-    res.setHeader(TOOL_AUDIT_SCHEMA_HEADER, '4')
+    res.setHeader(TOOL_AUDIT_SCHEMA_HEADER, '5')
     const requestId = ensureRequestId(req)
     res.setHeader(REQUEST_ID_HEADER, requestId)
 
@@ -626,6 +681,7 @@ export function makeToolCallRollupHandler(deps: ToolFailureAuditDeps): ToolCallR
     setSecurityHeaders(res)
     const requestId = ensureRequestId(req)
     res.setHeader(REQUEST_ID_HEADER, requestId)
+    res.setHeader(TOOL_AUDIT_SCHEMA_HEADER, '5')
 
     if (req.method !== 'POST') {
       send(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'POST required' } }, requestId)

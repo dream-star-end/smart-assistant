@@ -636,8 +636,20 @@ export function resolveExecutionModel(
    * 有价 + capability schema 可理解),再拿旧白名单去二次审判它,等于让旧快照否决新快照。
    */
   authority?: { canonicalModel: string },
+  opts?: { explicit?: boolean },
 ): string {
   if (authority !== undefined) return authority.canonicalModel
+  if (
+    opts?.explicit &&
+    typeof preferred === 'string' &&
+    preferred !== '' &&
+    !ALLOWED_INBOUND_MODELS.has(preferred)
+  ) {
+    throw new LocalExecutionRejected(
+      'DELEGATE_MODEL_UNKNOWN',
+      `model '${preferred}' is not in the current catalog projection (not inherited)`,
+    )
+  }
   for (const m of [preferred, fallback, ...EXECUTION_MODEL_FALLBACK_ROUTE]) {
     if (typeof m === 'string' && ALLOWED_INBOUND_MODELS.has(m)) return m
   }
@@ -860,6 +872,15 @@ export function decideLocalExecution(args: {
   }
 
   const explicitModel = typeof args.model === 'string' && args.model !== '' ? args.model : undefined
+  if (explicitModel) {
+    const canonical = view.canonicalize(explicitModel)
+    if (!view.isRoutable(canonical) || view.resolve(canonical)?.engine == null) {
+      throw new LocalExecutionRejected(
+        'DELEGATE_MODEL_UNKNOWN',
+        `model '${explicitModel}' is not in the current catalog projection (not inherited)`,
+      )
+    }
+  }
   const forcedSkipReason =
     typeof args.liveSessionSkipReason === 'string' && args.liveSessionSkipReason !== ''
       ? args.liveSessionSkipReason
@@ -901,13 +922,14 @@ export function decideLocalExecution(args: {
   // ② 候选阶梯:归一 → 投影可用性 → engine,三件事**全取投影**。
   // 无票 inbound 把存活 runner 的 model 插在 agent.model 之前;有显式 model 时不插入
   // (用户换模型 / 带 model 的普通消息行为不变)。
-  const candidates = [
-    explicitModel,
-    ticketlessReuse && liveSessionModel && liveSkipReason === undefined ? liveSessionModel : undefined,
-    agent.model,
-    args.defaultModel,
-    ...EXECUTION_MODEL_FALLBACK_ROUTE,
-  ]
+  const candidates = explicitModel
+    ? [explicitModel]
+    : [
+        ticketlessReuse && liveSessionModel && liveSkipReason === undefined ? liveSessionModel : undefined,
+        agent.model,
+        args.defaultModel,
+        ...EXECUTION_MODEL_FALLBACK_ROUTE,
+      ]
   for (const raw of candidates) {
     if (typeof raw !== 'string' || raw === '') continue
     const canonicalModel = view.canonicalize(raw)
@@ -7119,6 +7141,8 @@ export class Gateway {
       case 'MODEL_CATALOG_UNAVAILABLE':
         // 503:master 不可达/投影拉不到 —— 拒新 turn(无 baked 回落),可重试。
         return { code, httpStatus: 503, message: `MODEL_CATALOG_UNAVAILABLE: ${detail}` }
+      case 'DELEGATE_MODEL_UNKNOWN':
+        return { code, httpStatus: 400, message: `DELEGATE_MODEL_UNKNOWN: ${detail}` }
     }
   }
   /** 500 兜底收口:真实错误进日志(可排障),响应只回受控文案 —— 此前 39 处
@@ -11488,8 +11512,18 @@ export class Gateway {
       if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
-      // 原为 throw → 路由 .catch → 500;现由 HTTP 壳把 {kind:'error'} 映射成 sendError(500),
-      // 内部编排调用则据此走降级放行,语义等价、可结构化处理。
+      // flag 未开时 resolveLocalExecutionIfEnforced 是 no-op,显式未知型号在
+      // getOrCreate → resolveExecutionModel({explicit:true}) 才抛。必须复用同一
+      // 映射,否则会变成 500 且丢失 DELEGATE_MODEL_UNKNOWN。
+      const mapped = this._mapLocalExecutionError(err)
+      if (mapped) {
+        return {
+          kind: 'rejected',
+          httpStatus: mapped.httpStatus,
+          message: mapped.message,
+          code: mapped.code,
+        }
+      }
       return { kind: 'error', message: (err as Error)?.message ?? String(err) }
     }
 

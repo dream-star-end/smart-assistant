@@ -10,7 +10,7 @@ import type { Readable } from 'node:stream'
 import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import type { GoalStateSnapshot, OutboundContentBlock } from '@openclaude/protocol'
+import { synthesizeEmptyFailedToolPreview, type GoalStateSnapshot, type OutboundContentBlock } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type {
@@ -806,8 +806,25 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const status = asText(event.status).toLowerCase()
     if (!['completed', 'complete', 'failed', 'error'].includes(status) || ctx.finalizedToolIds.has(id)) return
     const outputJson = event.rawOutput ?? event.content ?? null
-    const output = grokProductToolOutput(outputJson)
+    const rawOutput = grokProductToolOutput(outputJson)
     const isError = status === 'failed' || status === 'error'
+    const taskId = (() => {
+      const input = tool.inputJson
+      if (input && typeof input === 'object' && !Array.isArray(input) && 'task_id' in input) {
+        const value = (input as { task_id?: unknown }).task_id
+        return typeof value === 'string' ? value : undefined
+      }
+      return undefined
+    })()
+    const output =
+      isError && !rawOutput.trim()
+        ? synthesizeEmptyFailedToolPreview({
+            toolName: tool.toolName,
+            engine: 'grok',
+            taskId,
+            status,
+          })
+        : rawOutput
     tool.output = output
     tool.outputJson = structuredClone(outputJson)
     tool.completed = true
@@ -816,8 +833,9 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     tool.ts = Date.now()
     ctx.finalizedToolIds.add(id)
     ctx.pendingToolIds.delete(id)
+    const terminationReason = isError ? 'tool_error' as const : undefined
     ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output, outputJson: structuredClone(outputJson), preview: output.slice(0, 500) } })
-    ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview: output.slice(0, 500), isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview } })
+    ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview: output.slice(0, 500), isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview, ...(terminationReason ? { terminationReason } : {}) } })
   }
 
   private emitBilling(ctx: GrokTurnContext, status: 'success' | 'error'): void {

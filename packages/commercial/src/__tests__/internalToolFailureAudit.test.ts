@@ -9,6 +9,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import { describe, test } from 'node:test'
 
+import { isRedactedReason, sanitizeToolFailureErrorMsg } from '@openclaude/protocol'
+
 import { type ContainerIdentityRepo, hashSecret } from '../auth/containerIdentity.js'
 import {
   type QueryRunner,
@@ -18,6 +20,7 @@ import {
   type ToolFailureAuditBodyV1,
   type ToolFailureAuditBodyV2,
   type ToolFailureAuditBodyV3,
+  type ToolFailureAuditBodyV5,
   insertToolCallRollup,
   insertToolFailureAudit,
   isToolFailureAuditEnabled,
@@ -93,6 +96,25 @@ function bodyV3(overrides: Partial<ToolFailureAuditBodyV3> = {}): ToolFailureAud
     failureKind: 'process_exit',
     exitCode: 127,
     terminationReason: 'exit_code',
+    timestamp: NOW_MS - 1_000,
+    ...overrides,
+  }
+}
+
+function bodyV5(overrides: Partial<ToolFailureAuditBodyV5> = {}): ToolFailureAuditBodyV5 {
+  return {
+    schemaVersion: 5,
+    eventId: 'evt-v5',
+    sessionKey: 'agent:codex:webchat:dm:sess5',
+    agentId: 'codex',
+    turnIndex: 6,
+    toolName: 'Bash',
+    durationMs: 23,
+    inputHash: 'c'.repeat(64),
+    outputHash: 'd'.repeat(64),
+    errorClass: 'command_not_found',
+    failureKind: 'process_exit',
+    errorMsg: 'command not found',
     timestamp: NOW_MS - 1_000,
     ...overrides,
   }
@@ -192,7 +214,8 @@ describe('insertToolFailureAudit', () => {
     assert.equal('input_preview' in meta, false)
     assert.equal(calls[1].params?.[4], createHash('sha256').update('{"cmd":"bad"}').digest('hex'))
     assert.equal(calls[1].params?.[5], createHash('sha256').update('failed').digest('hex'))
-    assert.equal(calls[1].params?.[7], null)
+    assert.equal(typeof calls[1].params?.[7], 'string')
+    assert.ok(String(calls[1].params?.[7]).length > 0)
 
     const dupRunner: QueryRunner = {
       async query() {
@@ -215,7 +238,7 @@ describe('insertToolFailureAudit', () => {
     assert.deepEqual(meta.error_class, 'file_not_found')
     assert.equal(calls[1].params?.[4], 'a'.repeat(64))
     assert.equal(calls[1].params?.[5], 'b'.repeat(64))
-    assert.equal(calls[1].params?.[7], null)
+    assert.equal(calls[1].params?.[7], 'tool_failed:empty_output')
   })
 
   test('persists v3 bounded metadata without raw previews', async () => {
@@ -238,10 +261,71 @@ describe('insertToolFailureAudit', () => {
       failure_kind: 'process_exit',
       exit_code: 127,
       termination_reason: 'exit_code',
+      redacted_reason: 'empty',
     })
     assert.equal(JSON.stringify(meta).includes('cmd'), false)
-    assert.equal(calls[1].params?.[7], null)
+    assert.equal(calls[1].params?.[7], 'tool_failed:empty_output')
     assert.equal(calls[1].params?.[8], NOW_MS - 1_000)
+  })
+
+  test('v5 reporter→master keeps redacted_reason for Bearer/dump/uncertain', async () => {
+    const cases: Array<{ preview: string; expectedReason: string }> = [
+      { preview: 'Authorization: Bearer fake-secret-value', expectedReason: 'secret_pattern' },
+      {
+        preview: 'random dump from a core file with no known template',
+        expectedReason: 'unmatched_template',
+      },
+    ]
+    for (const item of cases) {
+      const sanitized = sanitizeToolFailureErrorMsg(item.preview)
+      assert.equal(sanitized.errorMsg, 'tool_failed:redacted_output')
+      assert.equal(sanitized.redactedReason, item.expectedReason)
+      const calls: Array<{ sql: string; params?: readonly unknown[] }> = []
+      const runner: QueryRunner = {
+        async query(sql, params) {
+          calls.push({ sql, params })
+          return fakeResult([])
+        },
+      }
+      await insertToolFailureAudit(
+        runner,
+        42,
+        bodyV5({
+          eventId: `evt-${item.expectedReason}`,
+          errorMsg: sanitized.errorMsg,
+          redactedReason: sanitized.redactedReason,
+          errorClass: 'other',
+          failureKind: 'unknown',
+        }),
+      )
+      const meta = JSON.parse(String(calls[1].params?.[3]))
+      assert.equal(calls[1].params?.[7], 'tool_failed:redacted_output')
+      assert.equal(meta.redacted_reason, item.expectedReason)
+      assert.ok(isRedactedReason(meta.redacted_reason))
+      assert.equal(String(calls[1].params?.[7]).includes('fake-secret-value'), false)
+      assert.equal(String(calls[1].params?.[7]).includes('core file'), false)
+    }
+
+    const uncertainCalls: Array<{ params?: readonly unknown[] }> = []
+    const uncertainRunner: QueryRunner = {
+      async query(_sql, params) {
+        uncertainCalls.push({ params })
+        return fakeResult([])
+      },
+    }
+    await insertToolFailureAudit(
+      uncertainRunner,
+      42,
+      bodyV5({
+        eventId: 'evt-uncertain',
+        errorMsg: 'tool_failed:redacted_output',
+        redactedReason: 'sanitize_uncertain',
+        errorClass: 'other',
+        failureKind: 'unknown',
+      }),
+    )
+    const uncertainMeta = JSON.parse(String(uncertainCalls[1].params?.[3]))
+    assert.equal(uncertainMeta.redacted_reason, 'sanitize_uncertain')
   })
 })
 
@@ -287,7 +371,7 @@ describe('tool failure audit handler', () => {
     let res = makeRes()
     await h(makeReq({ auth: `Bearer ${TOKEN}`, method: 'GET', body: body() }), res, CTX)
     assert.equal(res.statusCode, 405)
-    assert.equal(res.headers[TOOL_AUDIT_SCHEMA_HEADER.toLowerCase()], '4')
+    assert.equal(res.headers[TOOL_AUDIT_SCHEMA_HEADER.toLowerCase()], '5')
 
     res = makeRes()
     await h(makeReq({ body: body() }), res, CTX)
@@ -418,6 +502,75 @@ describe('tool failure audit handler', () => {
       await h(makeReq({ auth: `Bearer ${TOKEN}`, body: bodyV3({ timestamp }) }), res, CTX)
       assert.equal(res.statusCode, 400)
     }
+  })
+
+  test('schema 5 accepts new classes and truncates 241 emoji without 400', async () => {
+    const inserted: unknown[] = []
+    const h = makeToolFailureAuditHandler({
+      identityRepo: repoFor(),
+      queryRunner: {
+        async query(_sql, params) {
+          if (params) inserted.push(params)
+          return fakeResult([])
+        },
+      },
+      now: () => NOW_MS,
+    })
+    for (const errorClass of ['empty_output', 'task_not_found', 'task_dead'] as const) {
+      const res = makeRes()
+      await h(
+        makeReq({
+          auth: `Bearer ${TOKEN}`,
+          body: bodyV5({
+            eventId: `evt-${errorClass}`,
+            errorClass,
+            failureKind: errorClass === 'empty_output' ? 'unknown' : 'tool_error',
+            errorMsg:
+              errorClass === 'empty_output'
+                ? 'tool_failed:empty_output'
+                : errorClass === 'task_not_found'
+                  ? 'No task found with ID: abc'
+                  : 'task abc already killed',
+          }),
+        }),
+        res,
+        CTX,
+      )
+      assert.equal(res.statusCode, 200)
+    }
+
+    const emojiRes = makeRes()
+    await h(
+      makeReq({
+        auth: `Bearer ${TOKEN}`,
+        body: bodyV5({
+          eventId: 'evt-emoji',
+          errorMsg: `command not found ${'😀'.repeat(241)}`,
+        }),
+      }),
+      emojiRes,
+      CTX,
+    )
+    assert.equal(emojiRes.statusCode, 200)
+    const last = inserted[inserted.length - 1] as unknown[]
+    const stored = String(last[7])
+    assert.ok(stored.length > 0)
+    assert.equal(Array.from(stored).length <= 240, true)
+
+    const v4Reject = makeRes()
+    await h(
+      makeReq({
+        auth: `Bearer ${TOKEN}`,
+        body: {
+          ...bodyV5({ errorClass: 'empty_output', failureKind: 'unknown' }),
+          schemaVersion: 4,
+          errorMsg: undefined,
+        },
+      }),
+      v4Reject,
+      CTX,
+    )
+    assert.equal(v4Reject.statusCode, 400)
   })
 })
 
