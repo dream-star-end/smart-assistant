@@ -341,13 +341,15 @@ async function boot(t: { skip: (m?: string) => void }): Promise<Harness | null> 
     const timer = setTimeout(() => reject(new Error("register timeout")), 8_000);
     ws.on("error", reject);
     ws.on("open", () => {
-      ws.send(JSON.stringify({
-        type: "register",
-        v: 1,
-        containerId: enrolled.containerId,
-        muxVersion: MUX_VERSION,
-        keyringFp: "",
-      }));
+      setTimeout(() => {
+        ws.send(JSON.stringify({
+          type: "register",
+          v: 1,
+          containerId: enrolled.containerId,
+          muxVersion: MUX_VERSION,
+          keyringFp: "",
+        }));
+      }, 20);
     });
     ws.on("message", (raw) => {
       const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
@@ -370,11 +372,12 @@ async function boot(t: { skip: (m?: string) => void }): Promise<Harness | null> 
 
 async function teardown(h: Harness | null): Promise<void> {
   if (!h) return;
-  try { h.gw.close(); } catch { /* */ }
-  try { await h.listener.close(); } catch { /* */ }
+  try { getDesktopTunnelRegistry().dropAll("teardown"); } catch { /* */ }
+  resetDesktopTunnelRegistryForTest();
+  try { await h.gw.close(); } catch { /* */ }
+  try { await Promise.race([h.listener.close(), new Promise((r) => setTimeout(r, 2000))]); } catch { /* */ }
   setDesktopSettingsLoader(null);
   resetDesktopFlagCache();
-  resetDesktopTunnelRegistryForTest();
   await rm(h.caDir, { recursive: true, force: true });
 }
 
