@@ -1168,6 +1168,7 @@ export function fallbackLiveUnitsPage(meta: {
   openDispatch: boolean
   hasTapeProjection: boolean
   tapeProjectionVersion: number
+  streamGeneration?: number
 }): LiveUnitsPage {
   return {
     view: 'units',
@@ -1181,7 +1182,7 @@ export function fallbackLiveUnitsPage(meta: {
     tapeProjectionVersion: meta.tapeProjectionVersion,
     reducerEpoch: LIVE_UNITS_REDUCER_EPOCH,
     degraded: 'fallback',
-    streamGeneration: 0,
+    streamGeneration: meta.streamGeneration ?? 0,
   }
 }
 

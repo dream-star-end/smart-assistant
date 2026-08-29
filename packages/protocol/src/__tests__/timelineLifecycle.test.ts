@@ -7,6 +7,8 @@ import {
   mintLiveProcessKey,
   packEpoch,
   packTapeSeq,
+  streamGenerationFromLineage,
+  streamGenerationFromStreamKey,
   timelineIdentity,
   unpackEpoch,
 } from "../timelineLifecycle.js";
@@ -114,6 +116,33 @@ describe("deriveProcessKeyFromRecord", () => {
       deriveProcessKeyFromRecord({ role: "agent-group", _delegateRunId: "run-9" }),
       "run-9",
     );
+  });
+});
+
+describe("streamGenerationFromLineage", () => {
+  it("is 0 for the first stream_key and increments when stream_key changes", () => {
+    const lineage = ["dispatch:a:1", "dispatch:b:1"];
+    assert.equal(streamGenerationFromLineage(lineage, ["dispatch:a:1"]), 0);
+    assert.equal(streamGenerationFromLineage(lineage, ["dispatch:b:1"]), 1);
+  });
+
+  it("lets a later stream_key beat seq=101 of an older generation", () => {
+    const oldGen = packEpoch(EPOCH_BAND.LIVE, streamGenerationFromLineage(["s1"], ["s1"]), 101, 0);
+    const newGen = packEpoch(EPOCH_BAND.LIVE, streamGenerationFromLineage(["s1", "s2"], ["s2"]), 1, 0);
+    assert.equal(newGen > oldGen, true);
+  });
+
+  it("caps at 10 bits", () => {
+    const keys = Array.from({ length: 2000 }, (_v, i) => `s${i}`);
+    assert.equal(streamGenerationFromLineage(keys, [`s${1999}`]), 0x3ff);
+  });
+});
+
+describe("streamGenerationFromStreamKey", () => {
+  it("maps dispatch attempt_no onto 0-based generation", () => {
+    assert.equal(streamGenerationFromStreamKey("dispatch:00000000-0000-4000-8000-000000000001:1"), 0);
+    assert.equal(streamGenerationFromStreamKey("dispatch:00000000-0000-4000-8000-000000000001:3"), 2);
+    assert.equal(streamGenerationFromStreamKey("legacy:1:agent:main"), 0);
   });
 });
 

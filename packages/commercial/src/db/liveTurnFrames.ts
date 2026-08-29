@@ -7,6 +7,7 @@ import {
   continueReduceLiveFrames,
   fallbackLiveUnitsPage,
   reduceLiveFrames,
+  streamGenerationFromLineage,
 } from "@openclaude/protocol";
 import type { Pool, PoolClient } from "pg";
 import {
@@ -643,6 +644,7 @@ async function readOpenDispatchStreamMeta(
   openDispatch: boolean;
   hasTapeProjection: boolean;
   tapeProjectionVersion: number;
+  streamGeneration: number;
 } | null> {
   const session = await client.query(
     "SELECT 1 FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL",
@@ -650,6 +652,7 @@ async function readOpenDispatchStreamMeta(
   );
   if ((session.rowCount ?? 0) !== 1) return null;
   const streams = await client.query<{
+    stream_key: string;
     client_message_id: string | null;
     projection_source: "live" | "tape";
     retired: boolean;
@@ -657,7 +660,7 @@ async function readOpenDispatchStreamMeta(
     tape_projection_version: string | number;
     open_dispatch: boolean;
   }>(
-    `SELECT client_message_id,projection_source,
+    `SELECT stream_key,client_message_id,projection_source,
             (provenance ? 'retired_at') AS retired,
             (
               client_message_id IS NOT NULL
@@ -702,11 +705,21 @@ async function readOpenDispatchStreamMeta(
     typeof versionRaw === "number" && Number.isSafeInteger(versionRaw) && versionRaw >= 0
       ? versionRaw
       : Number.parseInt(String(versionRaw ?? "0"), 10) || 0;
+  const lineage = streams.rows.map((row) => row.stream_key);
+  const currentStreamKeys = streams.rows
+    .filter((row) =>
+      row.projection_source === "live"
+      && !row.retired
+      && !row.superseded_by_completed_tape
+      && row.open_dispatch,
+    )
+    .map((row) => row.stream_key);
   return {
     streamClientMessageIds,
     openDispatch: streams.rows.some((row) => row.open_dispatch),
     hasTapeProjection: streams.rows.some((row) => row.projection_source === "tape"),
     tapeProjectionVersion,
+    streamGeneration: streamGenerationFromLineage(lineage, currentStreamKeys),
   };
 }
 
@@ -787,6 +800,7 @@ export async function readClientSessionLiveUnits(
     ? continueReduceLiveFrames(snapshot.checkpoint.state, snapshot.frames, opts)
     : reduceLiveFrames(snapshot.frames, opts);
   if (!reduced.ok) return fallbackLiveUnitsPage(snapshot.meta);
+  reduced.state.streamGeneration = snapshot.meta.streamGeneration ?? 0;
   const page = assembleLiveUnitsFromState(reduced.state, snapshot.meta, opts, catchUp);
   if (page.degraded === false) {
     const forCache = catchUp.length === 0

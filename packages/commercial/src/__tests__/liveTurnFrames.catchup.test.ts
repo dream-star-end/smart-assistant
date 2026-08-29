@@ -179,3 +179,13 @@ describe('persistGatewayLiveFrame live-lease touch', () => {
     assert.match(src, /leaseTtlMs: DISPATCH_LEASE_TTL_MS/)
   })
 })
+
+describe('live units streamGeneration', () => {
+  test('readOpenDispatchStreamMeta selects stream_key and stamps lineage generation', async () => {
+    const srcPath = fileURLToPath(new URL('../db/liveTurnFrames.ts', import.meta.url))
+    const src = await readFile(srcPath, 'utf8')
+    assert.match(src, /streamGenerationFromLineage/)
+    assert.match(src, /SELECT stream_key,client_message_id,projection_source/)
+    assert.match(src, /reduced\.state\.streamGeneration = snapshot\.meta\.streamGeneration/)
+  })
+})

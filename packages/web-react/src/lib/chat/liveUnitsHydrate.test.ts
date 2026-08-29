@@ -54,4 +54,14 @@ describe("liveUnitToMessage tool 行", () => {
     expect(msg.inputPreview).toBe('{"command":"ls -la"}');
     expect(msg.text).toBe("");
   });
+
+  test("streamGeneration 进入 epoch 与 _timelineStreamGen", () => {
+    const msg = liveUnitToMessage(
+      toolUnit({ seqLast: 1, clientMessageId: "m-1", timelineProcessKey: "b1" }),
+      { streamGeneration: 2 },
+    );
+    expect(msg._timelineStreamGen).toBe(2);
+    expect(typeof msg._lifecycleEpoch).toBe("number");
+    expect(msg._lifecycle).toBe("live_open");
+  });
 });

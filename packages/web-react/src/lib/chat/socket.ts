@@ -3666,7 +3666,13 @@ export class ChatSocket {
                   raw.tapeProjectionVersion,
                 );
               }
-              this.applyLiveUnits(sessId, raw.units, [...resetOwnerIds], raw.resume);
+              this.applyLiveUnits(
+                sessId,
+                raw.units,
+                [...resetOwnerIds],
+                raw.resume,
+                raw.streamGeneration,
+              );
               if (raw.resume) {
                 cursor = raw.resume.recordId;
                 const sessionKey = raw.resume.sessionKey;
@@ -3988,11 +3994,15 @@ export class ChatSocket {
     units: import("@openclaude/protocol").LiveUnit[],
     resetClientMessageIds: string[] = [],
     resume?: { sessionKey: string; frameSeq: number; recordId: string },
+    streamGeneration = 0,
   ): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
     const preReset = sess.messages.slice();
-    const mapped = units.map((unit) => liveUnitToMessage(unit));
+    const generation = typeof streamGeneration === "number" && Number.isSafeInteger(streamGeneration)
+      ? Math.max(0, streamGeneration)
+      : 0;
+    const mapped = units.map((unit) => liveUnitToMessage(unit, { streamGeneration: generation }));
     if (resetClientMessageIds.length > 0) {
       this.resetOwnerLocalRows(sess, resetClientMessageIds, liveProcessOwnersFromUnits(units));
     }

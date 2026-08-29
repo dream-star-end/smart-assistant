@@ -79,6 +79,46 @@ export function timelineIdentity(
   return `${owner}\0${role}\0${processKey}`;
 }
 
+const STREAM_GEN_MAX = 0x3ff;
+
+/**
+ * Map a session's stream_key lineage onto packEpoch streamGen.
+ *
+ * `orderedStreamKeys` is first-seen order (created_at, stream_key). The
+ * generation of the current open stream(s) is the 0-based index in that
+ * lineage so a later stream_key (sessionKey reuse / new dispatch) beats an
+ * older generation even when frameSeq restarts at 1.
+ */
+export function streamGenerationFromLineage(
+  orderedStreamKeys: readonly string[],
+  currentStreamKeys: readonly string[] = [],
+): number {
+  const lineage: string[] = [];
+  for (const key of orderedStreamKeys) {
+    if (typeof key === "string" && key.length > 0 && !lineage.includes(key)) {
+      lineage.push(key);
+    }
+  }
+  const currents = currentStreamKeys.filter((key) => typeof key === "string" && key.length > 0);
+  const pool = currents.length > 0 ? currents : lineage.slice(-1);
+  let max = 0;
+  for (const key of pool) {
+    const idx = lineage.indexOf(key);
+    const gen = idx >= 0 ? idx : Math.max(0, lineage.length);
+    if (gen > max) max = gen;
+  }
+  return Math.min(STREAM_GEN_MAX, max);
+}
+
+/** `dispatch:<uuid>:<attempt>` attempt_no is 1-based; generation is 0-based. */
+export function streamGenerationFromStreamKey(streamKey: string): number {
+  const match = /^dispatch:[0-9a-f-]+:(\d+)$/i.exec(streamKey);
+  if (!match) return 0;
+  const attempt = Number(match[1]);
+  if (!Number.isSafeInteger(attempt) || attempt < 1) return 0;
+  return Math.min(STREAM_GEN_MAX, attempt - 1);
+}
+
 export type LiveProcessKeySeed = {
   kind: "thinking" | "text" | "tool" | "plan" | "agent_group";
   seqFirst: number;

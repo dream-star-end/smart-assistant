@@ -5444,6 +5444,7 @@ async function hasCompletedClientTurnImpl(
   }
 }
 
+/** Stamp hydrated MessageLike fields only. Never rewrite tape BYTEA / content_sha256. */
 function stampTapeLifecycle(
   record: MessageLike,
   lifecycle: TimelineLifecycle,
