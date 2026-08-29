@@ -217,6 +217,10 @@
     {
       "id": "T54",
       "proves": "短会话不开画窗时，上方 200px 估高变成真实高度不会把视口内容推向底部"
+    },
+    {
+      "id": "T55",
+      "proves": "真 Chromium 中 Phase-B 精确 assistant + `_payloadDeferred` agent-group 空壳到达后，空 live-units owner reset 仍保留 live 委派过程行与终稿，不把 deferred stub 当成精确过程已到"
     }
   ]
 }

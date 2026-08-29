@@ -220,6 +220,17 @@ declare global {
         planId?: string;
         unpublished: boolean;
       }>;
+      /** Phase-B deferred agent-group stub + empty live-units reset must keep live agent-group. */
+      runPhaseBDeferredAgentGroupReset: () => Promise<{
+        sending: boolean;
+        roles: string[];
+        liveAgentGroupId?: string;
+        deferredAgentGroupId?: string;
+        tapeThinkingId?: string;
+        liveThinkingKept: boolean;
+        unpublished: boolean;
+        payloadBytes?: number;
+      }>;
       /** Persist displayText stays user original while _modelText keeps the paper hint. */
       runPaperHintUserBubble: () => Promise<{
         text: string;
@@ -334,6 +345,9 @@ window.__replayDrive = {
   },
   runPhaseAEmptyUnitsReset: async () => {
     throw new Error("phase-a empty units reset probe 未挂载");
+  },
+  runPhaseBDeferredAgentGroupReset: async () => {
+    throw new Error("phase-b deferred agent-group reset probe 未挂载");
   },
   runPaperHintUserBubble: async () => {
     throw new Error("paper-hint user bubble probe 未挂载");
@@ -2088,6 +2102,115 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         planId: session.messages.find((message) => message.id === "browser-phase-a-plan")?.id,
         unpublished: session.messages.some((message) =>
           message.role === "assistant" && message._displayDegradeReason === "records_unpublished"),
+      };
+    },
+    runPhaseBDeferredAgentGroupReset: async () => {
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        "phase-b deferred agent-group reset",
+      );
+      const clientMessageId = "m-browser-phase-b-reset";
+      const user = {
+        id: clientMessageId,
+        role: "user" as const,
+        text: "BROWSER_PHASE_B_RESET_USER",
+        ts: 1,
+        status: "sent" as const,
+        _source: "server" as const,
+        _seq: 1,
+        _orderSeq: 1,
+        _timelineRecord: true,
+        _timelineUnitKey: `outer:${REPLAY_SESSION_ID}:1`,
+      };
+      session.messages = [
+        user,
+        {
+          id: "browser-phase-b-live-thinking",
+          role: "thinking",
+          text: "BROWSER_PHASE_B_LIVE_THINKING",
+          ts: 2,
+          _clientMessageId: clientMessageId,
+        },
+        {
+          id: "browser-phase-b-live-ag",
+          role: "agent-group",
+          text: "BROWSER_PHASE_B_LIVE_AG",
+          ts: 4,
+          _clientMessageId: clientMessageId,
+          _delegateRunId: "run-browser-phase-b",
+        },
+      ];
+      const common = {
+        _source: "server" as const,
+        _seq: 2,
+        _orderSeq: 2,
+        _clientMessageId: clientMessageId,
+        _turnTapeId: "tape-browser-phase-b",
+        _turnTapeSha256: "b".repeat(64),
+        _turnTapeComplete: true,
+        _dispatchOutcome: "completed" as const,
+        _timelineRecord: true,
+      };
+      replaySocket.applyServerMessages(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        [
+          user,
+          {
+            id: "browser-phase-b-tape-thinking",
+            role: "thinking",
+            text: "BROWSER_PHASE_B_TAPE_THINKING",
+            ts: 2,
+            ...common,
+            _turnTapeOrdinal: 1,
+            _timelineUnitKey: "tape:browser-phase-b:1",
+          },
+          {
+            id: "browser-phase-b-tape-ag",
+            role: "agent-group",
+            text: "",
+            ts: 4,
+            ...common,
+            _turnTapeOrdinal: 2,
+            _timelineUnitKey: "tape:browser-phase-b:2",
+            _payloadDeferred: true,
+            _payloadBytes: 1_572_864,
+            _delegateRunId: "run-browser-phase-b",
+          },
+          {
+            id: "browser-phase-b-answer",
+            role: "assistant",
+            text: "BROWSER_PHASE_B_RESET_ANSWER",
+            ts: 5,
+            ...common,
+            _turnTapeOrdinal: 3,
+            _timelineUnitKey: "tape:browser-phase-b:3",
+          },
+        ],
+        true,
+        2,
+        {
+          serverUpdatedAt: 3,
+          historyRevision: 2,
+          timelineGeneration: 3,
+          completedClientMessageId: clientMessageId,
+        },
+      );
+      replaySocket.applyLiveUnits(REPLAY_SESSION_ID, [], [clientMessageId]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const deferred = session.messages.find((message) => message.id === "browser-phase-b-tape-ag");
+      return {
+        sending: session._sendingInFlight === true,
+        roles: session.messages.map((message) => message.role),
+        liveAgentGroupId: session.messages.find((message) => message.id === "browser-phase-b-live-ag")?.id,
+        deferredAgentGroupId: deferred?._payloadDeferred === true ? deferred.id : undefined,
+        tapeThinkingId: session.messages.find((message) => message.id === "browser-phase-b-tape-thinking")?.id,
+        liveThinkingKept: session.messages.some((message) => message.id === "browser-phase-b-live-thinking"),
+        unpublished: session.messages.some((message) =>
+          message.role === "assistant" && message._displayDegradeReason === "records_unpublished"),
+        payloadBytes: deferred?._payloadBytes,
       };
     },
     runWeiboErrorGuidance: async () => ({

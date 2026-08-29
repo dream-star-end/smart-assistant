@@ -2737,6 +2737,37 @@ await check("T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工
   });
 });
 
+await check("T55 Phase-B deferred agent-group 后空 live-units reset 仍保留委派过程行", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runPhaseBDeferredAgentGroupReset());
+  if (!result.liveAgentGroupId || result.liveAgentGroupId !== "browser-phase-b-live-ag") {
+    throw new Error(`Phase-B empty units reset 丢 live agent-group:${JSON.stringify(result)}`);
+  }
+  if (!result.deferredAgentGroupId || result.payloadBytes !== 1572864) {
+    throw new Error(`Phase-B empty units reset 缺 deferred stub:${JSON.stringify(result)}`);
+  }
+  if (result.liveThinkingKept) {
+    throw new Error(`Phase-B exact thinking 未替换 live thinking:${JSON.stringify(result)}`);
+  }
+  if (result.tapeThinkingId !== "browser-phase-b-tape-thinking") {
+    throw new Error(`Phase-B empty units reset 缺 tape thinking:${JSON.stringify(result)}`);
+  }
+  if (result.sending) throw new Error("Phase-B 完成后仍在发送");
+  if (result.unpublished) throw new Error("Phase-B 精确 assistant 不应是 unpublished 降级");
+  await replayRoot.getByText("BROWSER_PHASE_B_LIVE_AG", { exact: false }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await replayRoot.getByText("BROWSER_PHASE_B_RESET_ANSWER", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  const proofDir = process.env.OC_PHASE_B_PROOF_DIR;
+  if (proofDir) {
+    await replayRoot.screenshot({ path: join(proofDir, "t55-phase-b-replay.png") });
+    await page.screenshot({ path: join(proofDir, "t55-phase-b-full.png"), fullPage: true });
+  }
+});
+
 await check("T50 persist 后用户气泡只显示原文，不含论文任务系统提示", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runPaperHintUserBubble());
   if (result.text !== "CRISPR 论文") {
