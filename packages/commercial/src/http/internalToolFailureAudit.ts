@@ -14,9 +14,11 @@ import {
   classifyToolFailureError,
   isLegacyToolFailureErrorClass,
   isToolFailureErrorClass,
+  isRedactedReason,
   isToolFailureKind,
   isToolTerminationReason,
   sanitizeToolFailureErrorMsg,
+  type RedactedReason,
 } from '@openclaude/protocol'
 
 import {
@@ -90,6 +92,7 @@ export interface ToolFailureAuditBodyV4 extends Omit<ToolFailureAuditBodyV3, 'sc
 export interface ToolFailureAuditBodyV5 extends Omit<ToolFailureAuditBodyV4, 'schemaVersion'> {
   schemaVersion: 5
   errorMsg: string
+  redactedReason?: RedactedReason
 }
 
 export type ToolFailureAuditBody =
@@ -257,7 +260,7 @@ function validateBody(raw: unknown, nowMs: number): ToolFailureAuditBody | null 
               'exitCode',
               'terminationReason',
               ...(obj.schemaVersion === 4 || obj.schemaVersion === 5 ? ['traceId'] : []),
-              ...(obj.schemaVersion === 5 ? ['errorMsg'] : []),
+              ...(obj.schemaVersion === 5 ? ['errorMsg', 'redactedReason'] : []),
             ]
           : commonAllowed,
   )
@@ -339,6 +342,8 @@ function validateBody(raw: unknown, nowMs: number): ToolFailureAuditBody | null 
   if (obj.schemaVersion === 5) {
     const errorMsg = obj.errorMsg
     if (typeof errorMsg !== 'string') return null
+    const redactedReason = obj.redactedReason
+    if (redactedReason !== undefined && !isRedactedReason(redactedReason)) return null
     return {
       schemaVersion: 5,
       ...base,
@@ -347,6 +352,7 @@ function validateBody(raw: unknown, nowMs: number): ToolFailureAuditBody | null 
       errorClass,
       failureKind,
       errorMsg,
+      ...(redactedReason !== undefined ? { redactedReason } : {}),
       ...(exitCode !== undefined ? { exitCode } : {}),
       ...(terminationReason !== undefined ? { terminationReason } : {}),
       ...(traceId !== undefined ? { traceId } : {}),
@@ -549,6 +555,11 @@ export async function insertToolFailureAudit(
         ? body.outputPreview
         : undefined
   const sanitized = sanitizeToolFailureErrorMsg(rawErrorMsg)
+  // Gateway already sanitized; re-running on the sentinel loses the original
+  // reason. Prefer the sanitizer's reason (covers raw/v1), else the v5 wire enum.
+  const wireReason =
+    body.schemaVersion === 5 && isRedactedReason(body.redactedReason) ? body.redactedReason : undefined
+  const redactedReason = sanitized.redactedReason ?? wireReason
   const richBody =
     body.schemaVersion === 3 || body.schemaVersion === 4 || body.schemaVersion === 5 ? body : null
   const inputMeta = {
@@ -563,7 +574,7 @@ export async function insertToolFailureAudit(
     ...(richBody?.terminationReason !== undefined
       ? { termination_reason: richBody.terminationReason }
       : {}),
-    ...(sanitized.redactedReason ? { redacted_reason: sanitized.redactedReason } : {}),
+    ...(redactedReason ? { redacted_reason: redactedReason } : {}),
   }
   const traceId =
     body.schemaVersion === 4 || body.schemaVersion === 5 ? (body.traceId ?? null) : null

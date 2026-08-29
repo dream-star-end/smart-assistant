@@ -19,6 +19,7 @@ import {
   TOOL_CALL_ROLLUP_PATH,
   TOOL_FAILURE_AUDIT_PATH,
   TURN_OBSERVATION_PATH,
+  type RedactedReason,
   type ToolCalledEvent,
   type TurnCompletedEvent,
   type ToolFailureErrorClass,
@@ -128,6 +129,7 @@ export interface ToolFailureReportPayloadV4 extends Omit<ToolFailureReportPayloa
 export interface ToolFailureReportPayloadV5 extends Omit<ToolFailureReportPayloadV4, 'schemaVersion'> {
   schemaVersion: 5
   errorMsg: string
+  redactedReason?: RedactedReason
 }
 
 export type ToolFailureReportPayload =
@@ -241,7 +243,7 @@ export function buildToolFailureReportPayload(
   ev: ToolCalledEvent,
 ): ToolFailureReportPayloadV5 | null {
   if (!ev.isError) return null
-  const { errorMsg } = sanitizeToolFailureErrorMsg(ev.outputPreview)
+  const { errorMsg, redactedReason } = sanitizeToolFailureErrorMsg(ev.outputPreview)
   const classification = classifyToolFailure({
     outputPreview: ev.outputPreview,
     exitCode: ev.exitCode,
@@ -258,6 +260,7 @@ export function buildToolFailureReportPayload(
     inputHash: sha256Preview(ev.inputPreview),
     outputHash: sha256Preview(ev.outputPreview),
     errorMsg,
+    ...(redactedReason ? { redactedReason } : {}),
     errorClass: classification.errorClass,
     failureKind: classification.failureKind,
     ...(ev.traceId && /^[0-9a-f]{32}$/.test(ev.traceId) ? { traceId: ev.traceId } : {}),
@@ -268,7 +271,7 @@ export function buildToolFailureReportPayload(
 }
 
 export function v4Projection(payload: ToolFailureReportPayloadV5): ToolFailureReportPayloadV4 {
-  const { errorMsg: _drop, ...rest } = payload
+  const { errorMsg: _drop, redactedReason: _reason, ...rest } = payload
   return { ...rest, schemaVersion: 4, errorClass: projectClassToLegacy(payload.errorClass) }
 }
 

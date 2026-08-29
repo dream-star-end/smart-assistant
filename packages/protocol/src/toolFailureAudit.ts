@@ -353,7 +353,10 @@ export function sanitizeToolFailureErrorMsg(raw: string | undefined): {
       return { errorMsg: TOOL_FAILED_REDACTED_SENTINEL, redactedReason: 'secret_pattern' }
     }
     if (!matchesAllowedErrorTemplate(text)) {
-      return { errorMsg: TOOL_FAILED_REDACTED_SENTINEL, redactedReason: 'unmatched_template' }
+      return {
+        errorMsg: TOOL_FAILED_REDACTED_SENTINEL,
+        redactedReason: hadSecret ? 'secret_pattern' : 'unmatched_template',
+      }
     }
     const errorMsg = truncateCodePoints(text, TOOL_FAILURE_ERROR_MSG_MAX_CODE_POINTS)
     return hadSecret ? { errorMsg, redactedReason: 'secret_pattern' } : { errorMsg }

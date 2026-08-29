@@ -9,6 +9,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import { describe, test } from 'node:test'
 
+import { isRedactedReason, sanitizeToolFailureErrorMsg } from '@openclaude/protocol'
+
 import { type ContainerIdentityRepo, hashSecret } from '../auth/containerIdentity.js'
 import {
   type QueryRunner,
@@ -264,6 +266,66 @@ describe('insertToolFailureAudit', () => {
     assert.equal(JSON.stringify(meta).includes('cmd'), false)
     assert.equal(calls[1].params?.[7], 'tool_failed:empty_output')
     assert.equal(calls[1].params?.[8], NOW_MS - 1_000)
+  })
+
+  test('v5 reporter→master keeps redacted_reason for Bearer/dump/uncertain', async () => {
+    const cases: Array<{ preview: string; expectedReason: string }> = [
+      { preview: 'Authorization: Bearer fake-secret-value', expectedReason: 'secret_pattern' },
+      {
+        preview: 'random dump from a core file with no known template',
+        expectedReason: 'unmatched_template',
+      },
+    ]
+    for (const item of cases) {
+      const sanitized = sanitizeToolFailureErrorMsg(item.preview)
+      assert.equal(sanitized.errorMsg, 'tool_failed:redacted_output')
+      assert.equal(sanitized.redactedReason, item.expectedReason)
+      const calls: Array<{ sql: string; params?: readonly unknown[] }> = []
+      const runner: QueryRunner = {
+        async query(sql, params) {
+          calls.push({ sql, params })
+          return fakeResult([])
+        },
+      }
+      await insertToolFailureAudit(
+        runner,
+        42,
+        bodyV5({
+          eventId: `evt-${item.expectedReason}`,
+          errorMsg: sanitized.errorMsg,
+          redactedReason: sanitized.redactedReason,
+          errorClass: 'other',
+          failureKind: 'unknown',
+        }),
+      )
+      const meta = JSON.parse(String(calls[1].params?.[3]))
+      assert.equal(calls[1].params?.[7], 'tool_failed:redacted_output')
+      assert.equal(meta.redacted_reason, item.expectedReason)
+      assert.ok(isRedactedReason(meta.redacted_reason))
+      assert.equal(String(calls[1].params?.[7]).includes('fake-secret-value'), false)
+      assert.equal(String(calls[1].params?.[7]).includes('core file'), false)
+    }
+
+    const uncertainCalls: Array<{ params?: readonly unknown[] }> = []
+    const uncertainRunner: QueryRunner = {
+      async query(_sql, params) {
+        uncertainCalls.push({ params })
+        return fakeResult([])
+      },
+    }
+    await insertToolFailureAudit(
+      uncertainRunner,
+      42,
+      bodyV5({
+        eventId: 'evt-uncertain',
+        errorMsg: 'tool_failed:redacted_output',
+        redactedReason: 'sanitize_uncertain',
+        errorClass: 'other',
+        failureKind: 'unknown',
+      }),
+    )
+    const uncertainMeta = JSON.parse(String(uncertainCalls[1].params?.[3]))
+    assert.equal(uncertainMeta.redacted_reason, 'sanitize_uncertain')
   })
 })
 

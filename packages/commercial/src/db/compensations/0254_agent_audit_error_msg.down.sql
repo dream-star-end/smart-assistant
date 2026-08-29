@@ -82,10 +82,13 @@ BEGIN
 END
 $$;
 
+-- Key off created_at (DB insert time), not occurred_at (client event time).
+-- Durable queue may deliver a pre-0254 timestamp after 0254 is live; that row
+-- still received a non-null error_msg and must be cleared on compensation.
 UPDATE agent_audit
 SET error_msg = NULL
 WHERE error_msg IS NOT NULL
-  AND occurred_at >= (
+  AND created_at >= (
     SELECT applied_at FROM schema_migrations WHERE version = '0254_agent_audit_error_msg'
   );
 

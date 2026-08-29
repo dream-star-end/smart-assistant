@@ -14,8 +14,9 @@
 --   2. max(schema_migrations.version) IS the 0254_agent_audit_error_msg
 --      version (later migrations → refuse)
 --   3. operator holds pg_advisory_lock(0x0cbe1e5a01) — same key as migrate.ts
---   4. operator confirms: this down NULLs error_msg written during 0254 and
---      remaps the three new rollup classes to 'other'
+--   4. operator confirms: this down NULLs error_msg written during 0254
+--      (keyed by created_at / insert time, not occurred_at) and remaps the
+--      three new rollup classes to 'other'
 -- After down: pg_get_functiondef('agent_audit_privacy_guard') contains
 --   NEW.error_msg := NULL; windowed error_msg IS NOT NULL count is 0.
 
@@ -113,6 +114,7 @@ BEGIN
 
   v_msg := btrim(COALESCE(NEW.error_msg, ''));
   v_secret := v_msg ~* 'BEGIN [A-Z ]*PRIVATE KEY'
+           OR v_msg ~* 'BEGIN [A-Z ]+-----'
            OR v_msg ~* 'bearer '
            OR v_msg ~ 'sk-'
            OR v_msg ~ 'xai-'
@@ -123,6 +125,11 @@ BEGIN
            OR v_msg ~* 'password\s*[:=]'
            OR v_msg ~* 'Authorization:';
 
+  -- Fail-closed: home paths are always stripped, then only sentinels or
+  -- SQL-provable allowlist templates may persist. Unknown text becomes the
+  -- redacted sentinel — never raw dump.
+  v_msg := regexp_replace(v_msg, '/home/[^/[:space:]]+', '/home/[user]', 'g');
+
   IF v_msg = '' THEN
     v_msg := 'tool_failed:empty_output';
     IF v_reason IS NULL THEN
@@ -131,6 +138,28 @@ BEGIN
   ELSIF v_secret THEN
     v_msg := 'tool_failed:redacted_output';
     v_reason := 'secret_pattern';
+  ELSIF v_msg !~* '^(tool_failed:(empty_output|redacted_output))$'
+    AND v_msg !~* 'unknown skill'
+    AND v_msg !~* 'command not found|not recognized as (an internal|a) command'
+    AND v_msg !~* 'cannot execute|not executable'
+    AND v_msg !~* 'old_string.*not found|string to replace.*not found|file (was|has been) modified'
+    AND v_msg !~* '\mENOENT\M|no such file or directory|cannot find (the )?(file|path)'
+    AND v_msg !~* '\mEACCES\M|permission denied|operation not permitted'
+    AND v_msg !~* 'timed? out|timeout|deadline exceeded'
+    AND v_msg !~* '\mabort(ed)?\M|cancelled|canceled'
+    AND v_msg !~* 'too many requests|rate.?limit|http[[:space:]]*429|status[[:space:]]*429'
+    AND v_msg !~* 'service unavailable|bad gateway|http[[:space:]]*50[23]'
+    AND v_msg !~* '\mECONN(REFUSED|RESET|ABORTED)\M|\mENOTFOUND\M|network error|fetch failed|socket hang up|\mDNS\M'
+    AND v_msg !~* 'validation|invalid (input|argument|request)|schema error|bad request'
+    AND v_msg !~* '^No task found with ID: [^[:space:]]+'
+    AND v_msg !~* '^task [^[:space:]]+ already (completed|failed|killed|error)'
+    AND v_msg !~* '^TaskOutput: empty failed output task_id=[^[:space:]]+ engine=(cursor|grok) status=[^[:space:]]+$'
+    AND v_msg !~* '<retrieval_status>(not_found|already_terminal|timeout)</retrieval_status>'
+  THEN
+    v_msg := 'tool_failed:redacted_output';
+    IF v_reason IS NULL THEN
+      v_reason := 'unmatched_template';
+    END IF;
   ELSIF char_length(v_msg) > 240 THEN
     v_msg := left(v_msg, 240);
   END IF;
