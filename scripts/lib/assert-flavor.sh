@@ -41,10 +41,14 @@ flavor_here() {
 flavor_rules_path() {
   local here dir
   here="$(flavor_here)"
+  # Co-located (scripts/lib + breakglass), bundle etc-codex (json cannot live in
+  # bin/ — hotcfg peels only .sh/.py and selfcheck requires bin names bare),
+  # then repo trees from scripts/lib or platform-runtime/bin.
   for dir in \
+    "$here" \
+    "$here/../etc-codex" \
     "$here/../../packages/commercial/src/flavor" \
-    "$here/../../../src/flavor" \
-    "$here"; do
+    "$here/../../../src/flavor"; do
     if [[ -f "$dir/flavor-rules.json" ]]; then
       printf '%s' "$(cd "$dir" && pwd)/flavor-rules.json"
       return 0
