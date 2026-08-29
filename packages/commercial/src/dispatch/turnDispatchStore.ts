@@ -61,6 +61,8 @@ export interface TurnDispatchRow {
   visibleAt?: number | null
   producerFencedAt?: Date | null
   shutdownCtx?: unknown | null
+  agentContainerId?: number | null
+  runtimeKind?: string | null
 }
 
 const DISPATCH_COLUMNS = `
@@ -68,7 +70,8 @@ const DISPATCH_COLUMNS = `
   request_hash, billing_request_id, attempt_no, status, outcome, failure_code,
   conflict_reason, resolution, resolved_at, client_notified, owner_id,
   lease_epoch, lease_until, anchor_seq, admitted_at, accepted_at, terminal_at,
-  last_attempt_at, visible_head, visible_at, producer_fenced_at, shutdown_ctx`
+  last_attempt_at, visible_head, visible_at, producer_fenced_at, shutdown_ctx,
+  agent_container_id, runtime_kind`
 
 /** join 场景用(scanOpenSessionGone):client_sessions 与 turn_dispatches 同名列须限定表别名 d。 */
 const DISPATCH_COLUMNS_QUALIFIED = DISPATCH_COLUMNS.split(',')
@@ -104,6 +107,8 @@ interface RawDispatchRow {
   visible_at: string | null
   producer_fenced_at: Date | null
   shutdown_ctx: unknown | null
+  agent_container_id: string | null
+  runtime_kind: string | null
 }
 
 function mapRow(r: RawDispatchRow): TurnDispatchRow {
@@ -136,6 +141,10 @@ function mapRow(r: RawDispatchRow): TurnDispatchRow {
     visibleAt: r.visible_at === null || r.visible_at === undefined ? null : Number(r.visible_at),
     producerFencedAt: r.producer_fenced_at ?? null,
     shutdownCtx: r.shutdown_ctx ?? null,
+    agentContainerId: r.agent_container_id === null || r.agent_container_id === undefined
+      ? null
+      : Number(r.agent_container_id),
+    runtimeKind: r.runtime_kind ?? null,
   }
 }
 
@@ -159,6 +168,8 @@ export interface AdmitDispatchInput {
   anchorSeq: bigint | null
   leaseTtlMs?: number
   now?: number
+  agentContainerId?: number | null
+  runtimeKind?: string | null
 }
 
 /**
@@ -209,8 +220,9 @@ export async function admitDispatch(
       `INSERT INTO turn_dispatches
          (dispatch_id, user_id, session_id, client_message_id, agent_id, model,
           request_hash, billing_request_id, attempt_no, status,
-          owner_id, lease_epoch, lease_until, anchor_seq, admitted_at, last_attempt_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'admitted',$9,1,$10,$11,$12,$12)
+          owner_id, lease_epoch, lease_until, anchor_seq, admitted_at, last_attempt_at,
+          agent_container_id, runtime_kind)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'admitted',$9,1,$10,$11,$12,$12,$13,$14)
        RETURNING ${DISPATCH_COLUMNS}`,
       [
         input.dispatchId,
@@ -225,6 +237,8 @@ export async function admitDispatch(
         leaseUntil,
         input.anchorSeq === null ? null : input.anchorSeq.toString(),
         nowDate,
+        input.agentContainerId ?? null,
+        input.runtimeKind ?? null,
       ],
     )
     return { kind: 'admitted', dispatch: mapRow(inserted.rows[0]!), takeover: false }

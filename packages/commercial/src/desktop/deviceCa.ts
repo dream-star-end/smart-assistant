@@ -260,3 +260,50 @@ export async function issueDeviceCertificate(deviceId: string, days = 365): Prom
     await fs.rm(tmp, { recursive: true, force: true });
   }
 }
+
+export interface DesktopOriginMaterial {
+  certPem: string;
+  keyPem: string;
+  caCertPem: string;
+}
+
+/** Server leaf for 18445 (serverAuth). Isolated from 18443 host CA. */
+export async function ensureDesktopOriginCert(): Promise<DesktopOriginMaterial> {
+  const ca = await ensureDeviceCa();
+  const dir = deviceCaDir();
+  const keyPath = path.join(dir, "origin.key");
+  const crtPath = path.join(dir, "origin.crt");
+  if (!(await exists(keyPath)) || !(await exists(crtPath))) {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "oc-dorigin-"));
+    try {
+      const keyPem = await opensslRun(["ecparam", "-name", "prime256v1", "-genkey", "-noout"], undefined, "sign");
+      await writeMode(keyPath, keyPem, 0o600);
+      const csrPath = path.join(tmp, "origin.csr");
+      const extPath = path.join(tmp, "ext.cnf");
+      await opensslRun(["req", "-new", "-key", keyPath, "-subj", "/CN=openclaude-desktop-origin", "-out", csrPath], undefined, "sign");
+      await fs.writeFile(
+        extPath,
+        [
+          "subjectAltName = DNS:localhost,IP:127.0.0.1",
+          "basicConstraints = critical, CA:FALSE",
+          "keyUsage = critical, digitalSignature",
+          "extendedKeyUsage = serverAuth",
+        ].join("\n") + "\n",
+        { mode: 0o600 },
+      );
+      await opensslRun([
+        "x509", "-req", "-in", csrPath, "-CA", ca.caCertPath, "-CAkey", ca.caKeyPath,
+        "-set_serial", `0x${randomBytes(8).toString("hex")}`,
+        "-days", "365", "-extfile", extPath, "-sha256", "-out", crtPath,
+      ]);
+      await fs.chmod(crtPath, 0o644);
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  }
+  return {
+    certPem: await fs.readFile(crtPath, "utf8"),
+    keyPem: await fs.readFile(keyPath, "utf8"),
+    caCertPem: ca.caCertPem,
+  };
+}

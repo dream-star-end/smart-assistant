@@ -116,7 +116,13 @@ import {
   startRefreshEventsSweeper,
   type SweeperHandle as RefreshEventsSweeperHandle,
 } from "./account-pool/refreshEventsSweeper.js";
-import { startDesktopEnrollmentSweep } from "./http/desktopEnroll.js";
+import { startDesktopEnrollmentSweep, createPgDesktopIdentityRepo } from "./http/desktopEnroll.js";
+import { startDesktopTlsListener, makeDesktopRequestVerifier } from "./http/desktopTlsListener.js";
+import { makeDesktopIdentityStrategy } from "./auth/desktopIdentity.js";
+import { extractDesktopTlsContext } from "./desktop/tlsContext.js";
+import { makeDesktopContainerTransport } from "./wechat/desktopContainerTransport.js";
+import { resolveDispatchEndpoint } from "./dispatch/resolveDispatchEndpoint.js";
+import { getDesktopFlagSnapshot } from "./desktop/flags.js";
 import {
   startAuditRetentionSweeper,
   type AuditRetentionSweeperHandle,
@@ -1689,6 +1695,7 @@ export async function registerCommercial(
   let internalProxyAddress: { host: string; port: number } | undefined;
   let externalMtlsServer: HttpsServer | undefined;
   let externalMtlsAddress: { host: string; port: number } | undefined;
+  let desktopTlsClose: (() => Promise<void>) | undefined;
   // 2026-05-05 v3 commercial server-authored persistence:18791 plain + 18443 mTLS
   // 共享同一个 dispatcher,按 url path 分流到 anthropicProxy 或 internalServerAuthored。
   // 在 internalProxyHandler 构造完毕后赋值;mTLS listener 读它而不是 internalProxyHandler。
@@ -2483,6 +2490,82 @@ export async function registerCommercial(
             loadAgentCostOverrides: () => listAgentCostOverrides(getPool()),
           })
         : null;
+      void (async () => {
+        const deskFlags = await getDesktopFlagSnapshot();
+        if (!deskFlags.assembled) return;
+        const deskRepo = createPgDesktopIdentityRepo();
+        const deskVerify = makeDesktopRequestVerifier(deskRepo);
+        const deskIdentity = makeDesktopIdentityStrategy({
+          repo: deskRepo,
+          tlsFromReq: (req) => extractDesktopTlsContext(req),
+          pricing,
+          loadUserModelAuthz,
+        });
+        const deskMessages = makeAnthropicProxyHandler({
+          pgPool: getPool(),
+          pricing,
+          preCheckRedis,
+          scheduler,
+          identity: deskIdentity,
+          loadUserModelAuthz,
+          rateLimitRedis,
+          runtimeKind: "desktop",
+          modelCatalog: modelCatalogForProxy,
+          modelAuthorityEnforce,
+          authorityKeyring: authorityKeyringProvider(),
+          refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
+          broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
+          appendCostCredits: appendCostCreditsForUser,
+          getPhase6AccountUuidEnforce,
+          getSessionPinMode,
+          listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
+        });
+        const listener = await startDesktopTlsListener({
+          handlers: {
+            messages: deskMessages,
+            serverAuthored: makeServerAuthoredHandler({
+              identityRepo,
+              verify: deskVerify,
+              losslessTurnTapeStorage,
+              storage: {
+                appendServerAuthoredMessage,
+                appendServerAuthoredMessageForRequest,
+                appendServerAuthoredMessageDrainByUser,
+                drainDelegateCostForClientSession,
+                getClientSession,
+                readArchivedMessages,
+                patchServerAuthoredMessage,
+              },
+            }),
+            turnTape: makeTurnTapeStateHandler({
+              identityRepo,
+              verify: deskVerify,
+              storage: dispatchAdmissionBackend,
+            }),
+            turnLease: makeTurnLeaseRenewHandler({
+              identityRepo,
+              pgPool: getPool(),
+              getSigner: () => modelAuthoritySigner,
+              verify: deskVerify,
+            }),
+            catalog: modelCatalogHandler
+              ? makeModelCatalogHandler({
+                  identityRepo,
+                  verify: deskVerify,
+                  catalog: modelCatalogForProxy!,
+                  loadUserModelAuthz,
+                })
+              : async (_req, res) => {
+                  res.statusCode = 503;
+                  res.end();
+                },
+          },
+          identityRepo: deskRepo,
+        });
+        if (listener) desktopTlsClose = () => listener.close();
+      })().catch((err) => {
+        rootLogger.warn("[commercial] desktop TLS listener not started", { err: (err as Error)?.message });
+      });
       // seed 完整性(§5 / R2-M8):平台预设 agent 引用的模型必须在 catalog active,否则用户
       // 点开预设助手第一句话就被 gate 拒。**全局**断言(per-uid 下发仍严格过滤、不强塞)。
       // 影子期只告警(判定还没切过去,不该因此拒启);enforce 期 → 抛。
@@ -5144,15 +5227,34 @@ export async function registerCommercial(
           id: number;
           container_internal_id: string | null;
           host_uuid: string | null;
+          runtime_kind: string;
         }>(
-          // lint-agent-containers-sql: allow — 回收路径必须能看到任意 state 的行,
-          // 目的就是把它 stop+remove;行只喂 stopAndRemoveV3Container,
-          // 不进任何用户可见视图 / 计费聚合。
-          "SELECT id, container_internal_id, host_uuid FROM agent_containers WHERE id = $1 AND runtime_kind = 'docker'",
+          // lint-agent-containers-sql: allow — recycle by id then branch on kind
+          // lint-agent-containers-kind: allow — attestation recycle dispatches docker vs desktop
+          "SELECT id, container_internal_id, host_uuid, runtime_kind FROM agent_containers WHERE id = $1",
           [containerId],
         );
         const row = rows[0];
         if (!row) return;
+        if (row.runtime_kind === "desktop") {
+          const { getDesktopTunnelRegistry } = await import("./ws/desktopTunnelRegistry.js");
+          getDesktopTunnelRegistry().drop(containerId, "attestation_failed");
+          await getPool().query(
+            `UPDATE agent_containers SET update_required = true, updated_at = NOW()
+              WHERE id = $1 AND runtime_kind = 'desktop'`,
+            [containerId],
+          );
+          await getPool().query(
+            `INSERT INTO desktop_device_audit(user_id, event, container_id, extra)
+             SELECT user_id, 'update_required', id, $2::jsonb FROM agent_containers WHERE id = $1`,
+            [containerId, JSON.stringify({ reason })],
+          );
+          rootLogger.warn("[commercial] desktop container marked update_required (no vanish)", {
+            containerId,
+            reason,
+          });
+          return;
+        }
         await stopAndRemoveV3Container(depsForRecycle, row);
         rootLogger.warn("[commercial] recycled container without model-authority attestation", {
           containerId,
@@ -5768,39 +5870,11 @@ export async function registerCommercial(
         // 容器求证分支跳过,reconciler 仍跑纯 DB 的财务/告警分支(不静默丢终态)。
         const container = makeContainerDispatchClient({
           transport: makeNodeHttpContainerTransport(),
+          desktopTransport: makeDesktopContainerTransport(),
           bridgeSecret: dispatchBridgeSecret ?? "",
-          resolveRunningEndpoint: async (uid) => {
+          resolveRunningEndpoint: async (id) => {
             if (!dispatchBridgeSecret) return null;
-            // M3:remote-host 容器的 bound_ip **不是** master 可直拨的地址(它在 node-agent
-            // 隧道后)。join compute_hosts 拿 host 名:非 'self' = remote-host → 打 tunnel 标记,
-            // 让 containerDispatchClient(supportsTunnel=false)归为 unreachable 保持 unknown +
-            // 告警,**绝不**对 bound_ip 做 false-dial(可能误命中同网段无关主机 = 伪 negative proof)。
-            // v1 self-host 范围;tunnel transport 支持登记在 RFC §8 债表。
-            const r = await getPool().query<{
-              id: string;
-              bound_ip: string | null;
-              port: number | null;
-              host_name: string | null;
-            }>(
-              `SELECT ac.id::text AS id, host(ac.bound_ip) AS bound_ip, ac.port,
-                      ch.name AS host_name
-                 FROM agent_containers ac
-                 LEFT JOIN compute_hosts ch ON ch.id = ac.host_uuid
-                WHERE ac.user_id = $1 AND ac.state = 'active' AND ac.runtime_channel = $2
-                  AND ac.runtime_kind = 'docker'
-                  AND ac.bound_ip IS NOT NULL AND ac.port IS NOT NULL
-                ORDER BY ac.updated_at DESC LIMIT 1`,
-              [uid.toString(), getRuntimeChannel()],
-            );
-            const row = r.rows[0];
-            if (!row || !row.bound_ip || row.port === null) return null;
-            const isRemoteHost = row.host_name !== null && row.host_name !== "self";
-            return {
-              host: row.bound_ip,
-              port: Number(row.port),
-              containerId: Number(row.id),
-              ...(isRemoteHost ? { tunnel: { kind: "remote-host" as const } } : {}),
-            };
+            return resolveDispatchEndpoint(id);
           },
         });
         const reconcilerDeps = {
@@ -6406,6 +6480,9 @@ export async function registerCommercial(
             if (typeof closeAll === "function") closeAll.call(externalMtlsServer);
           } catch { resolve(); }
         });
+      }
+      if (desktopTlsClose) {
+        await desktopTlsClose().catch(() => {});
       }
       // 0060 — 清空 model hint provider,避免 shutdown 后还有人持 stale closure
       // (用于测试热重启场景:同一进程多次 register/shutdown 不能让旧 cache 被新 cache 引用)

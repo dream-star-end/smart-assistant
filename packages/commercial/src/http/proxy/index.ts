@@ -1190,6 +1190,7 @@ export function makeAnthropicProxyHandler(
                 billingRevision: gate.snapshot.billingRevision,
                 securityEpoch: gate.securityEpoch.toString(),
                 source: "ccb_proxy",
+                ...(deps.runtimeKind ? { runtimeKind: deps.runtimeKind } : {}),
                 // 0170 durable-turn dispatch 身份(best-effort;非 dispatch → 缺省)。
                 // recovery/observability 据此关联逻辑 turn。
                 ...(dispatchIdentity

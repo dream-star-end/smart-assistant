@@ -245,6 +245,8 @@ function idOf(row: TurnDispatchRow): DispatchIdentity {
     attemptNo: row.attemptNo,
     sessionId: row.sessionId,
     clientMessageId: row.clientMessageId,
+    agentContainerId: row.agentContainerId ?? null,
+    runtimeKind: row.runtimeKind ?? null,
   }
 }
 

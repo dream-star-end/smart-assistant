@@ -1470,6 +1470,8 @@ export interface AdmitUserTurnInput {
   };
   leaseTtlMs?: number;
   now?: number;
+  agentContainerId?: number | null;
+  runtimeKind?: string | null;
 }
 
 export type AdmitUserTurnResult =
@@ -8054,6 +8056,8 @@ export function createPgSessionsBackend(
           anchorSeq,
           ...(input.leaseTtlMs !== undefined ? { leaseTtlMs: input.leaseTtlMs } : {}),
           ...(input.now !== undefined ? { now: input.now } : {}),
+          ...(input.agentContainerId !== undefined ? { agentContainerId: input.agentContainerId } : {}),
+          ...(input.runtimeKind !== undefined ? { runtimeKind: input.runtimeKind } : {}),
         });
         if (input.recoveryJob) {
           const bound = await bindRecoveryJobDispatch(client, {

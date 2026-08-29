@@ -28,6 +28,31 @@ describe("DesktopTunnelRegistry", () => {
     assert.equal(reg.size(), 0);
   });
 
+  test("http and openWs require an attached mux", async () => {
+    const { DesktopMuxSession, MuxType, FLAG_FIN, encodeFrame, encodeJsonFrame, decodeFrames, createMuxLoopbackPair } = await import("../ws/desktopMux.js");
+    const pair = createMuxLoopbackPair();
+    const mux = new DesktopMuxSession(pair.master);
+    pair.desktop.on("message", (raw) => {
+      const { frames } = decodeFrames(raw as Buffer);
+      for (const f of frames) {
+        if (f.type === MuxType.OPEN_HTTP) {
+          pair.desktop.send(encodeJsonFrame(MuxType.HTTP_RESPONSE_START, f.streamId, { status: 204, headers: [] }));
+          pair.desktop.send(encodeFrame(MuxType.HTTP_END, FLAG_FIN, f.streamId));
+        }
+      }
+    });
+    const reg = createMemoryDesktopTunnelRegistry();
+    await assert.rejects(() => reg.http(1, "GET", "/", {}, null, 500));
+    reg.attach(1, { mux, close: () => {} }, {
+      deviceId: "d1", uid: 1, expiresAt: new Date(Date.now() + 60_000),
+    });
+    const res = await reg.http(1, "GET", "/healthz", {}, null, 2_000);
+    assert.equal(res.status, 204);
+    const sock = reg.openWs(1, "/ws");
+    assert.equal(typeof sock.send, "function");
+    mux.close();
+  });
+
   test("drop closes handle and mint-style drop is idempotent", () => {
     const reg = createMemoryDesktopTunnelRegistry();
     let closed = 0;

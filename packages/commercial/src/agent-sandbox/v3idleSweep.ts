@@ -463,6 +463,12 @@ export async function runIdleSweepTick(
     }
   }
 
+  try {
+    await runDesktopOfflineTick(deps.pool, { idleCutoffMin, logger: log });
+  } catch (err) {
+    log?.warn?.("[v3/idleSweep] desktop offline tick failed", { err: (err as Error)?.message });
+  }
+
   const durationMs = Date.now() - startedAt;
   const skipped =
     racedWithMigration + racedWithActivity + skippedLocked
@@ -493,6 +499,46 @@ export async function runIdleSweepTick(
     errors,
     durationMs,
   };
+}
+
+/**
+ * Desktop idle tick: 30min without heartbeat → audit + registry drop.
+ * Never vanished, never docker rm. Flag off → no-op.
+ */
+export async function runDesktopOfflineTick(
+  pool: Pool,
+  options: { idleCutoffMin?: number; logger?: IdleSweepLogger } = {},
+): Promise<number> {
+  const { getDesktopFlagSnapshot } = await import("../desktop/flags.js");
+  const flags = await getDesktopFlagSnapshot();
+  if (!flags.envEnabled) return 0;
+  const cutoff = options.idleCutoffMin ?? DEFAULT_IDLE_CUTOFF_MIN;
+  const r = await pool.query<{ id: string; user_id: string }>(
+    `SELECT id::text AS id, user_id::text AS user_id
+       FROM agent_containers
+      WHERE state = 'active' AND runtime_kind = 'desktop' AND runtime_channel = $2
+        AND last_ws_activity IS NOT NULL
+        AND last_ws_activity < NOW() - ($1::int * interval '1 minute')
+      LIMIT 100`,
+    [cutoff, getRuntimeChannel()],
+  );
+  if (r.rows.length === 0) return 0;
+  const { getDesktopTunnelRegistry } = await import("../ws/desktopTunnelRegistry.js");
+  const { query } = await import("../db/queries.js");
+  const registry = getDesktopTunnelRegistry();
+  for (const row of r.rows) {
+    const id = Number(row.id);
+    registry.drop(id, "desktop_offline");
+    try {
+      await query(
+        `INSERT INTO desktop_device_audit(user_id, event, container_id, extra)
+         VALUES ($1,'desktop_offline',$2,$3::jsonb)`,
+        [row.user_id, id, JSON.stringify({ cutoffMin: cutoff })],
+      );
+    } catch { /* best-effort */ }
+    options.logger?.info?.("[v3/idleSweep] desktop offline", { containerId: id });
+  }
+  return r.rows.length;
 }
 
 // ───────────────────────────────────────────────────────────────────────
