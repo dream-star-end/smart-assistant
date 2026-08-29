@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
@@ -12,7 +12,7 @@ const shLib = path.join(root, "scripts/lib/assert-flavor.sh");
 const shCopy = path.join(root, "packages/commercial/agent-sandbox/platform-runtime/bin/assert-flavor.sh");
 const rules = path.join(root, "packages/commercial/src/flavor/flavor-rules.json");
 const rulesLib = path.join(root, "scripts/lib/flavor-rules.json");
-const rulesBin = path.join(root, "packages/commercial/agent-sandbox/platform-runtime/bin/flavor-rules.json");
+const rulesBin = path.join(root, "packages/commercial/agent-sandbox/platform-runtime/etc-codex/flavor-rules.json");
 
 type Case = {
   name: string;
@@ -64,6 +64,10 @@ describe("assert-flavor.sh matches TS fixtures", () => {
     assert.equal(readFileSync(shLib, "utf8"), readFileSync(shCopy, "utf8"));
     assert.equal(readFileSync(rules, "utf8"), readFileSync(rulesLib, "utf8"));
     assert.equal(readFileSync(rules, "utf8"), readFileSync(rulesBin, "utf8"));
+    assert.equal(
+      existsSync(path.join(root, "packages/commercial/agent-sandbox/platform-runtime/bin/flavor-rules.json")),
+      false,
+    );
   });
 
   for (const item of cases) {
