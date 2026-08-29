@@ -12,7 +12,6 @@ export async function resolveDispatchEndpoint(id: DispatchIdentity): Promise<Run
   const pool = getPool();
   const channel = getRuntimeChannel();
   if (id.agentContainerId && Number.isInteger(id.agentContainerId) && id.agentContainerId > 0) {
-    // lint-agent-containers-kind: allow — load by target id then branch on runtime_kind
     const r = await pool.query<{
       id: string;
       bound_ip: string | null;

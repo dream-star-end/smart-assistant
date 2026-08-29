@@ -5229,8 +5229,7 @@ export async function registerCommercial(
           host_uuid: string | null;
           runtime_kind: string;
         }>(
-          // lint-agent-containers-sql: allow — recycle by id then branch on kind
-          // lint-agent-containers-kind: allow — attestation recycle dispatches docker vs desktop
+          // lint-agent-containers-sql: allow — recycle by id then branch on kind (must see any state)
           "SELECT id, container_internal_id, host_uuid, runtime_kind FROM agent_containers WHERE id = $1",
           [containerId],
         );
@@ -5246,7 +5245,8 @@ export async function registerCommercial(
           );
           await getPool().query(
             `INSERT INTO desktop_device_audit(user_id, event, container_id, extra)
-             SELECT user_id, 'update_required', id, $2::jsonb FROM agent_containers WHERE id = $1`,
+             SELECT user_id, 'update_required', id, $2::jsonb FROM agent_containers
+              WHERE id = $1 AND runtime_kind = 'desktop' AND state = 'active'`,
             [containerId, JSON.stringify({ reason })],
           );
           rootLogger.warn("[commercial] desktop container marked update_required (no vanish)", {
