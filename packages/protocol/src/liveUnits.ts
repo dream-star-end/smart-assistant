@@ -7,6 +7,8 @@
  * reduce state always keeps every child and full payloads).
  */
 
+import { mintLiveProcessKey } from './timelineLifecycle.js'
+
 export const LIVE_UNITS_REDUCER_EPOCH = '2'
 export const LIVE_UNITS_DEFAULT_N = 20
 export const LIVE_UNITS_MAX_N = 80
@@ -84,6 +86,11 @@ export type LiveUnit = {
   nestedHasMoreBefore?: boolean
   nestedBeforeCursor?: string | null
   payloadRef?: LivePayloadRef
+  /**
+   * Stable process identity minted once when the unit is created.
+   * Copied live→tape; never reminted into a different value.
+   */
+  timelineProcessKey?: string
 }
 
 export type LiveFrameInput = {
@@ -100,6 +107,8 @@ export type LiveUnitState = {
   throughRecordId: string
   sessionKey?: string
   reducerEpoch: string
+  /** SessionKey-reuse generation. Independent of reducerEpoch. */
+  streamGeneration?: number
 }
 
 export type LiveUnitsResume = {
@@ -122,6 +131,8 @@ export type LiveUnitsPage = {
   degraded: LiveUnitsDegraded | false
   resume?: LiveUnitsResume
   throughFrameSeq?: number
+  /** Exposed for packEpoch streamGen. Independent of reducerEpoch. */
+  streamGeneration?: number
 }
 
 export type ReduceLiveFramesOptions = {
@@ -465,6 +476,91 @@ function applyDelegatePhase(unit: MutableUnit, block: Record<string, unknown>, r
   unit.recordIdLast = ref.recordId
 }
 
+type ProcessKeyCounters = {
+  thinkingByOwner: Map<string, number>
+  thinkingByMessage: Map<string, number>
+  textByOwner: Map<string, number>
+}
+
+function bumpProcessKeyCounters(unit: MutableUnit, counters: ProcessKeyCounters): void {
+  const owner = unit.clientMessageId || 'unowned'
+  if (unit.kind === 'thinking') {
+    counters.thinkingByOwner.set(owner, (counters.thinkingByOwner.get(owner) ?? 0) + 1)
+    if (unit.messageId) {
+      counters.thinkingByMessage.set(
+        unit.messageId,
+        (counters.thinkingByMessage.get(unit.messageId) ?? 0) + 1,
+      )
+    }
+  } else if (unit.kind === 'text') {
+    counters.textByOwner.set(owner, (counters.textByOwner.get(owner) ?? 0) + 1)
+  }
+}
+
+function seedProcessKeyCounters(units: MutableUnit[]): ProcessKeyCounters {
+  const counters: ProcessKeyCounters = {
+    thinkingByOwner: new Map(),
+    thinkingByMessage: new Map(),
+    textByOwner: new Map(),
+  }
+  for (const unit of units) {
+    if (unit.timelineProcessKey === undefined) stampNewUnitProcessKey(unit, counters)
+    else bumpProcessKeyCounters(unit, counters)
+  }
+  return counters
+}
+
+function stampNewUnitProcessKey(unit: MutableUnit, counters: ProcessKeyCounters): void {
+  if (unit.timelineProcessKey !== undefined) return
+  const owner = unit.clientMessageId || 'unowned'
+  if (unit.kind === 'thinking') {
+    const segmentIndex = counters.thinkingByOwner.get(owner) ?? 0
+    const messageIdIndex = unit.messageId
+      ? (counters.thinkingByMessage.get(unit.messageId) ?? 0)
+      : 0
+    bumpProcessKeyCounters(unit, counters)
+    unit.timelineProcessKey = mintLiveProcessKey({
+      kind: 'thinking',
+      seqFirst: unit.seqFirst,
+      recordIdFirst: unit.recordIdFirst,
+      messageId: unit.messageId,
+      segmentIndex,
+      messageIdIndex,
+    })
+    return
+  }
+  if (unit.kind === 'text') {
+    const segmentIndex = counters.textByOwner.get(owner) ?? 0
+    bumpProcessKeyCounters(unit, counters)
+    unit.timelineProcessKey = mintLiveProcessKey({
+      kind: 'text',
+      seqFirst: unit.seqFirst,
+      recordIdFirst: unit.recordIdFirst,
+      messageId: unit.messageId,
+      segmentIndex,
+    })
+    return
+  }
+  unit.timelineProcessKey = mintLiveProcessKey({
+    kind: unit.kind,
+    seqFirst: unit.seqFirst,
+    recordIdFirst: unit.recordIdFirst,
+    blockId: unit.blockId,
+    runId: unit.runId,
+    jobId: unit.jobId,
+    segmentIndex: 0,
+  })
+}
+
+function pushStampedUnit(
+  units: MutableUnit[],
+  unit: MutableUnit,
+  counters: ProcessKeyCounters,
+): void {
+  stampNewUnitProcessKey(unit, counters)
+  units.push(unit)
+}
+
 function seedReduceMaps(units: MutableUnit[]): {
   openThinking: Map<string, MutableUnit>
   tools: Map<string, MutableUnit>
@@ -495,6 +591,7 @@ export function reduceLiveFrames(
     throughFrameSeq: 0,
     throughRecordId: '0',
     reducerEpoch: LIVE_UNITS_REDUCER_EPOCH,
+    streamGeneration: 0,
   }, frames, opts)
 }
 
@@ -508,6 +605,7 @@ function reduceLiveFramesOnto(
   const started = now()
   const units: MutableUnit[] = seed.units as MutableUnit[]
   const { openThinking, tools, groups } = seedReduceMaps(units)
+  const processKeys = seedProcessKeyCounters(units)
   let throughFrameSeq = seed.throughFrameSeq
   let throughRecordId = seed.throughRecordId
   let sessionKey: string | undefined = seed.sessionKey
@@ -557,7 +655,7 @@ function reduceLiveFramesOnto(
           ...(messageId ? { messageId } : {}),
           payloadRef: meta.ref,
         }
-        units.push(unit)
+        pushStampedUnit(units, unit, processKeys)
         openThinking.set(key, unit)
         if (cmid && messageId) openThinking.set(`${kind}:${cmid}`, unit)
       } else {
@@ -596,7 +694,7 @@ function reduceLiveFramesOnto(
             completed: false,
             payloadRef: meta.ref,
           }
-          units.push(unit)
+          pushStampedUnit(units, unit, processKeys)
           tools.set(blockId, unit)
         } else {
           if (block.inputJson !== undefined && block.inputJson !== null) unit.inputJson = block.inputJson
@@ -627,7 +725,7 @@ function reduceLiveFramesOnto(
           text: str(block.inputPreview),
           payloadRef: meta.ref,
         }
-        units.push(unit)
+        pushStampedUnit(units, unit, processKeys)
         tools.set(blockId, unit)
       } else {
         if (block.inputJson !== undefined && block.inputJson !== null) unit.inputJson = block.inputJson
@@ -663,7 +761,7 @@ function reduceLiveFramesOnto(
           error: !!block.isError,
           payloadRef: meta.ref,
         }
-        units.push(unit)
+        pushStampedUnit(units, unit, processKeys)
         tools.set(toolUseId, unit)
       } else {
         unit.output = str(block.output) || str(block.preview) || unit.output
@@ -704,8 +802,9 @@ function reduceLiveFramesOnto(
     }
 
     if (kind === 'plan') {
-      units.push({
-        id: unitId('plan', str(block.blockId) || `plan:${meta.seq}`, meta.seq),
+      const planBlockId = str(block.blockId) || undefined
+      pushStampedUnit(units, {
+        id: unitId('plan', planBlockId || `plan:${meta.seq}`, meta.seq),
         kind: 'plan',
         seqFirst: meta.seq,
         seqLast: meta.seq,
@@ -715,8 +814,9 @@ function reduceLiveFramesOnto(
         clientMessageId: cmid,
         sessionKey: meta.sessionKey,
         text: str(block.text),
+        ...(planBlockId ? { blockId: planBlockId } : {}),
         payloadRef: meta.ref,
-      })
+      }, processKeys)
       continue
     }
 
@@ -746,7 +846,7 @@ function reduceLiveFramesOnto(
           children: [],
           completed: false,
         }
-        units.push(unit)
+        pushStampedUnit(units, unit, processKeys)
         groups.set(runId, unit)
       }
       applyDelegatePhase(unit, block, meta.ref)
@@ -765,6 +865,7 @@ function reduceLiveFramesOnto(
       throughRecordId,
       sessionKey,
       reducerEpoch: LIVE_UNITS_REDUCER_EPOCH,
+      streamGeneration: seed.streamGeneration ?? 0,
     },
   }
 }
@@ -1053,6 +1154,7 @@ export function serveLiveUnits(
     tapeProjectionVersion: meta.tapeProjectionVersion,
     reducerEpoch: LIVE_UNITS_REDUCER_EPOCH,
     degraded: false,
+    streamGeneration: state.streamGeneration ?? 0,
     ...(resume ? { resume, throughFrameSeq: state.throughFrameSeq } : {}),
   }
   if (!opts.group && jsonSize(page) > maxBytes) {
@@ -1079,6 +1181,7 @@ export function fallbackLiveUnitsPage(meta: {
     tapeProjectionVersion: meta.tapeProjectionVersion,
     reducerEpoch: LIVE_UNITS_REDUCER_EPOCH,
     degraded: 'fallback',
+    streamGeneration: 0,
   }
 }
 
@@ -1103,6 +1206,7 @@ function cloneState(state: LiveUnitState): LiveUnitState {
     throughRecordId: state.throughRecordId,
     sessionKey: state.sessionKey,
     reducerEpoch: state.reducerEpoch,
+    streamGeneration: state.streamGeneration,
   }
 }
 
@@ -1162,6 +1266,7 @@ export function foldLiveUnitStateForCheckpoint(
     throughRecordId: state.throughRecordId,
     sessionKey: state.sessionKey,
     reducerEpoch: state.reducerEpoch || LIVE_UNITS_REDUCER_EPOCH,
+    streamGeneration: state.streamGeneration ?? 0,
   }
   const json = JSON.stringify(folded)
   if (utf8Bytes(json) > maxBytes) return null
@@ -1197,6 +1302,7 @@ export function parseLiveUnitCheckpoint(
     throughRecordId: obj.throughRecordId,
     sessionKey: typeof obj.sessionKey === 'string' ? obj.sessionKey : undefined,
     reducerEpoch: expectedEpoch,
+    streamGeneration: typeof obj.streamGeneration === 'number' ? obj.streamGeneration : 0,
   }
 }
 

@@ -1,5 +1,6 @@
 export * from './frames.js'
 export * from './liveUnits.js'
+export * from './timelineLifecycle.js'
 
 export * from './goalState.js'
 export * from './events.js'

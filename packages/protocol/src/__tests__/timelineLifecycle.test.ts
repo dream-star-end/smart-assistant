@@ -1,0 +1,128 @@
+import * as assert from "node:assert/strict";
+import { describe, it } from "node:test";
+
+import {
+  EPOCH_BAND,
+  deriveProcessKeyFromRecord,
+  mintLiveProcessKey,
+  packEpoch,
+  packTapeSeq,
+  timelineIdentity,
+  unpackEpoch,
+} from "../timelineLifecycle.js";
+
+describe("packEpoch", () => {
+  it("keeps any tape epoch above any live epoch", () => {
+    const liveMax = packEpoch(EPOCH_BAND.LIVE, 0x3ff, 0xffffffffff, 0);
+    const tapeMin = packEpoch(EPOCH_BAND.TAPE, 0, 0, 0);
+    assert.equal(tapeMin > liveMax, true);
+    assert.equal(Number.isSafeInteger(liveMax), true);
+    assert.equal(Number.isSafeInteger(tapeMin), true);
+  });
+
+  it("does not use reducerEpoch and is monotonic in seq/exactBit", () => {
+    const a = packEpoch(EPOCH_BAND.LIVE, 0, 100, 0);
+    const b = packEpoch(EPOCH_BAND.LIVE, 0, 101, 0);
+    const c = packEpoch(EPOCH_BAND.LIVE, 0, 101, 1);
+    assert.equal(b > a, true);
+    assert.equal(c > b, true);
+    const unpacked = unpackEpoch(b);
+    assert.equal(unpacked.band, EPOCH_BAND.LIVE);
+    assert.equal(unpacked.seq, 101);
+    assert.equal(unpacked.exactBit, 0);
+  });
+
+  it("streamGen beats a smaller generation with a larger seq", () => {
+    const oldGen = packEpoch(EPOCH_BAND.LIVE, 0, 101, 0);
+    const newGen = packEpoch(EPOCH_BAND.LIVE, 1, 1, 0);
+    assert.equal(newGen > oldGen, true);
+  });
+
+  it("Range exactBit 0→1 is a strict +1 at the same band/seq", () => {
+    const stub = packEpoch(EPOCH_BAND.TAPE, 0, packTapeSeq(2, 7), 0);
+    const exact = packEpoch(EPOCH_BAND.TAPE, 0, packTapeSeq(2, 7), 1);
+    assert.equal(exact, stub + 1);
+  });
+});
+
+describe("mintLiveProcessKey", () => {
+  it("splits two thinking units even when messageId matches", () => {
+    const a = mintLiveProcessKey({
+      kind: "thinking",
+      seqFirst: 10,
+      recordIdFirst: "recA",
+      messageId: "mid-1",
+      segmentIndex: 0,
+      messageIdIndex: 0,
+    });
+    const b = mintLiveProcessKey({
+      kind: "thinking",
+      seqFirst: 40,
+      recordIdFirst: "recB",
+      messageId: "mid-1",
+      segmentIndex: 1,
+      messageIdIndex: 1,
+    });
+    assert.equal(a, "msg:mid-1");
+    assert.equal(b, "msg:mid-1:seg:1");
+    assert.notEqual(a, b);
+  });
+
+  it("mints seg:seq:record when thinking has no messageId", () => {
+    assert.equal(
+      mintLiveProcessKey({
+        kind: "thinking",
+        seqFirst: 10,
+        recordIdFirst: "recA",
+        segmentIndex: 0,
+      }),
+      "seg:10:recA",
+    );
+  });
+
+  it("keeps the first text unit as the narrative empty key", () => {
+    assert.equal(
+      mintLiveProcessKey({ kind: "text", seqFirst: 1, segmentIndex: 0 }),
+      "",
+    );
+    assert.equal(
+      mintLiveProcessKey({
+        kind: "text",
+        seqFirst: 9,
+        messageId: "mid",
+        segmentIndex: 1,
+      }),
+      "msg:mid:seg:1",
+    );
+  });
+});
+
+describe("deriveProcessKeyFromRecord", () => {
+  it("fail-closed to legacy when engine keys are missing", () => {
+    assert.equal(
+      deriveProcessKeyFromRecord({ role: "thinking" }, "tape-1", 3),
+      "legacy:tape-1:3",
+    );
+  });
+
+  it("copies an existing stamp and prefers runId for agent-group", () => {
+    assert.equal(
+      deriveProcessKeyFromRecord({ role: "thinking", _timelineProcessKey: "seg:1:r" }),
+      "seg:1:r",
+    );
+    assert.equal(
+      deriveProcessKeyFromRecord({ role: "agent-group", _delegateRunId: "run-9" }),
+      "run-9",
+    );
+  });
+});
+
+describe("timelineIdentity", () => {
+  it("includes role so tool and agent-group never collide", () => {
+    const owner = "cm-1";
+    assert.notEqual(
+      timelineIdentity(owner, "tool", "b1"),
+      timelineIdentity(owner, "agent-group", "b1"),
+    );
+  });
+});

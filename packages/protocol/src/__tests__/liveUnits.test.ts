@@ -77,6 +77,10 @@ describe('§9.1 thinking interrupted by tool', () => {
     assert.equal(reduced.state.units[0]?.text, 'aaabbb')
     assert.equal(reduced.state.units[2]?.text, 'ccc')
     assert.notEqual(reduced.state.units[0]?.text, 'bbb')
+    assert.notEqual(reduced.state.units[0]?.timelineProcessKey, reduced.state.units[2]?.timelineProcessKey)
+    assert.equal(reduced.state.units[1]?.timelineProcessKey, 't1')
+    assert.ok(reduced.state.units[0]?.timelineProcessKey)
+    assert.ok(reduced.state.units[2]?.timelineProcessKey)
   })
 })
 
