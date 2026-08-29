@@ -2014,6 +2014,35 @@
           "assertion": "T55 Phase-B deferred agent-group 后空 live-units reset 仍保留委派过程行"
         }
       ]
+    },
+    {
+      "id": "INC-20260829-CUTOVER-SURVIVOR-STALE-WD",
+      "occurredAt": "2026-08-29",
+      "severity": "P0",
+      "symptom": "selfhost --cutover 失败后 cutover-survivor timeout 无视已恢复的 live master 健康，用布防时写死的 Aug18 工作树 unit 覆盖 master/egress，18790 宕约 11 分钟（11:22-11:33Z）。根因链：新 rel pgSessionsBackend.ts 链式 map 缺括号 → tsx TransformError 让 egress 崩溃 → saga 回滚后仍用新 dist 做 smoke → 补偿 die 未 disarm 幸存者。",
+      "rootFixCommit": "2190563c",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5SelfhostCutoverSurvivor.test.ts",
+          "assertion": "survivor alarms instead of restoring a healthy live rel"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5SelfhostCutoverSurvivor.test.ts",
+          "assertion": "this-cutover forensics is the backup dest, not stale worktree-current"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5SelfhostCutoverSurvivor.test.ts",
+          "assertion": "unified timeline stamp chain is parseable by esbuild"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-runtime-release-lib.sh",
+          "assertion": "restart_cmd 失败;摘录 egress/master 最近日志"
+        }
+      ]
     }
   ]
 }

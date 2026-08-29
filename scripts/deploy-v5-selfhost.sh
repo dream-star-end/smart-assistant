@@ -1385,7 +1385,9 @@ activate_tuple_joint() { # <master-rel> <prev-master-or-none>
   [[ -n "$BUILT_RUNTIME_RELEASE" ]] || { cutover_clog "joint: 缺 BUILT_RUNTIME_RELEASE"; return 1; }
   [[ -n "$BUILT_BUNDLE_REV" ]] || { cutover_clog "joint: 缺 BUILT_BUNDLE_REV"; return 1; }
   restart_cmd="$(egress_then_master_restart_cmd)"
-  smoke_cmd="cutover_smoke_against_release $(printf '%q' "$master_rel")"
+  # 正向 smoke 比新 rel dist;saga 回滚时 lib 置 HOTCFG_SAGA_ROLLING_BACK=1,
+  # 只验旧现场 healthz(不得拿新 dist 比已回滚的旧进程)。
+  smoke_cmd="if [[ \"\${HOTCFG_SAGA_ROLLING_BACK:-}\" == 1 ]]; then cutover_smoke_healthz_only; else cutover_smoke_against_release $(printf '%q' "$master_rel"); fi"
   prev_arg="$prev_master"
   if [[ "$prev_arg" == "none" || "$prev_arg" == "NONE" ]]; then
     prev_arg=""
@@ -1725,9 +1727,17 @@ cutover_persist_phase_or_compensate() { # <phase> <reason>
 }
 
 cutover_arm_survivor() { # <backup-dir>
-  local backup="$1" script
+  local backup="$1" script src
+  src="$SCRIPT_DIR/v5-selfhost-cutover-survivor.sh"
+  [[ -f "$src" ]] || { cutover_clog "缺仓库 survivor 脚本 $src"; return 1; }
+  mkdir -p -- "$BREAKGLASS_ROOT"
+  install -m 0755 "$src" "$BREAKGLASS_ROOT/cutover-survivor.sh" || return 1
   script="$(cutover_survivor_script)"
   [[ -x "$script" ]] || { cutover_clog "缺 survivor 脚本 $script"; return 1; }
+  if [[ "$backup" == *"/pre-cutover-20260818-144626" ]]; then
+    cutover_clog "拒绝武装:backup 是陈旧 Aug18 工作树路径 $backup"
+    return 1
+  fi
   CUTOVER_SURVIVOR_ARMED=1
   bash "$script" --arm "$$" "$backup" || return 1
 }
@@ -1741,12 +1751,31 @@ cutover_disarm_survivor() {
   CUTOVER_SURVIVOR_ARMED=0
 }
 
+cutover_backup_units_are_live_wd() { # <backup-dir>
+  local backup="$1" wd_m wd_e
+  [[ -d "$backup" && -f "$backup/$V5_UNIT" && -f "$backup/$V5_EGRESS_UNIT" ]] || return 1
+  wd_m="$(unit_template_working_directory "$backup/$V5_UNIT")"
+  wd_e="$(unit_template_working_directory "$backup/$V5_EGRESS_UNIT")"
+  [[ "$wd_m" == "$MASTER_LIVE_LINK" && "$wd_e" == "$MASTER_LIVE_LINK" ]]
+}
+
 cutover_tier2_restore() { # <backup-dir>
   local backup="$1" restore
   restore="/opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh"
   [[ -d "$backup" ]] || { cutover_clog "二级失败:备份目录不存在 $backup"; return 1; }
+  if ! cutover_backup_units_are_live_wd "$backup"; then
+    cutover_clog "二级拒绝:备份 $backup 不是本次 live WD forensics(禁止装工作树 unit)"
+    printf 'reason=cutover-tier2-refused-worktree-backup\nbackup=%s\nwritten=%s\n' \
+      "$backup" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      >"$MASTER_RELEASES_ROOT/.manual-recovery-required"
+    return 1
+  fi
   [[ -x "$restore" ]] || { cutover_clog "二级失败:缺 $restore"; return 1; }
   bash "$restore" --backup-dir "$backup"
+  if ! cutover_smoke_healthz_only; then
+    cutover_clog "二级恢复后 healthz 未绿 backup=$backup"
+    return 1
+  fi
 }
 
 cutover_rollback_inplace() { # <failed-rel> <backup-dir>
@@ -1774,16 +1803,16 @@ cutover_rollback_inplace() { # <failed-rel> <backup-dir>
   else
     cutover_clog "  一级无合法 prev(首次 none 或 digest/路径失败),降二级"
   fi
-  cutover_clog "  二级: 从 $backup 恢复工作树 unit"
+  cutover_clog "  二级: 从本次 forensics $backup 恢复 live unit"
   if cutover_tier2_restore "$backup"; then
     cutover_clog "  二级恢复且健康确认"
     return 0
   fi
   printf 'reason=cutover-rollback-smoke-failed\nwritten=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >"$MASTER_RELEASES_ROOT/.manual-recovery-required"
-  die "两级补偿后仍失败。已写 $MASTER_RELEASES_ROOT/.manual-recovery-required
-应急: export HOME=/home/agent; export PATH=\"\$HOME/.local/bin:\$PATH\"
-host '/opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh'"
+  cutover_clog "两级补偿后仍失败。已写 $MASTER_RELEASES_ROOT/.manual-recovery-required"
+  cutover_clog "应急: 从 pre-cutover-<本次> 装 live unit,并 cutover-survivor.sh --disarm"
+  return 1
 }
 
 cutover_compensate() { # <reason>
@@ -1793,8 +1822,10 @@ cutover_compensate() { # <reason>
     cutover_clog "尚未覆盖 installed unit,无需回滚"
     return 1
   fi
-  cutover_rollback_inplace "${CUTOVER_REL:-}" "${CUTOVER_BACKUP:-missing}"
-  cutover_disarm_survivor || cutover_clog "补偿后 disarm 失败(不掩盖补偿失败)"
+  local rb_rc=0
+  cutover_rollback_inplace "${CUTOVER_REL:-}" "${CUTOVER_BACKUP:-missing}" || rb_rc=$?
+  # 无论补偿成败都必须解除幸存者布防,否则 timeout 会在健康 live 上再装陈旧备份。
+  cutover_disarm_survivor || cutover_clog "补偿后 disarm 失败(不掩盖补偿结果 rc=$rb_rc)"
   return 1
 }
 

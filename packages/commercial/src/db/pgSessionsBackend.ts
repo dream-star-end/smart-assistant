@@ -6388,7 +6388,7 @@ async function hydrateUnifiedTimelineTapeUnits(
       _timelineRecord: true,
       _timelineLogicalOrdinal: logicalIndex,
       _timelineUnitKey: timelineTapeKey(header.tapeId, head.ordinal, logicalIndex, record.id),
-    }).map((record) => {
+    })).map((record) => {
       const row = record as MessageLike;
       const deferred = row._payloadDeferred === true;
       const owner = typeof row._turnOwnerId === "string" && row._turnOwnerId
