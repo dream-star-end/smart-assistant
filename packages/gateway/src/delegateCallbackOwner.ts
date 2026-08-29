@@ -3,7 +3,7 @@
  * when a durable job row exists. Completer (job row) is the sole callback
  * owner for a release generation.
  */
-import { isDelegateTerminalState, type DelegateJobState } from '../../protocol/src/delegation.js'
+import { isDelegateTerminalState, type DelegateJobState } from '@openclaude/protocol'
 
 export type IntentRecoveryAction =
   | { action: 'legacy_interrupt' }

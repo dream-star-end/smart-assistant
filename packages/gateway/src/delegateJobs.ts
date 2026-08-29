@@ -18,7 +18,7 @@ import {
   type DelegateFailureClass,
   type DelegateJobKind,
   type DelegateJobState,
-} from '../../protocol/src/delegation.js'
+} from '@openclaude/protocol'
 
 export const DEFAULT_DELEGATE_JOB_TTL_MS = 2 * 60 * 60_000
 export const MIN_DELEGATE_JOB_TTL_MS = 60_000

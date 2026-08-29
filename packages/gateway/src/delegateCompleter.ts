@@ -5,7 +5,7 @@
  */
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { delegateCallbackMessageId } from '../../protocol/src/delegation.js'
+import { delegateCallbackMessageId } from '@openclaude/protocol'
 import type { DelegateJobSnapshot, DelegateJobStore } from './delegateJobs.js'
 
 export { delegateCallbackMessageId }

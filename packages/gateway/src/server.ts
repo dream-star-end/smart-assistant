@@ -79,7 +79,7 @@ import {
   failureClassFromLocalExecutionCode,
   isDelegateTerminalState,
   type DelegateFailureClass,
-} from '../../protocol/src/delegation.js'
+} from '@openclaude/protocol'
 import {
   delegateConcurrencyCap,
   formatDelegateConcurrencyReject,

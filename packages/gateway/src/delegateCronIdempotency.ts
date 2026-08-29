@@ -2,7 +2,7 @@
  * OCV5-22 B3: cron fire Enqueue-then-project. Unique idempotency key is the
  * occurrence execution right; retries return the original dlgjob id.
  */
-import { cronDelegateIdempotencyKey } from '../../protocol/src/delegation.js'
+import { cronDelegateIdempotencyKey } from '@openclaude/protocol'
 import type { DelegateJobStore } from './delegateJobs.js'
 
 export function enqueueCronOccurrenceJob(
