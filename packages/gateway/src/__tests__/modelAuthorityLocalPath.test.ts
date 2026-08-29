@@ -51,6 +51,7 @@ import {
   PerTurnDelegationGuard,
   decideLocalExecution,
   localExecutionOverride,
+  resolveExecutionModel,
   resolveLocalExecutionIfEnforced,
 } from '../server.js'
 import { SessionManager } from '../sessionManager.js'
@@ -567,6 +568,57 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
     const r = await runDelegate(gw, 'codex-leader', { goal: '旧行为', sourceAgent: 'main' })
     assert.equal(r.status, 200)
     assert.equal(gw.sessions.getOrCreateCalls, 1)
+  })
+
+  test('HTTP delegate:flag 未开 + 显式未知型号 → 400 DELEGATE_MODEL_UNKNOWN,不得 inherit', async () => {
+    _setModelCatalogClientForTests({
+      getView: () => {
+        throw new Error('catalog must NOT be consulted while flag is off')
+      },
+    } as any)
+    const gw = makeDelegateGateway()
+    gw.sessions.getOrCreate = async (opts: any) => {
+      resolveExecutionModel(
+        opts.model ?? opts.agent?.model,
+        gw.deps.config.defaults.model,
+        opts.executionAuthority,
+        { explicit: typeof opts.model === 'string' && opts.model !== '' },
+      )
+      gw.sessions.getOrCreateCalls++
+      return {
+        agentId: 'x',
+        currentTurnStatus: null,
+        runner: { interrupt: () => {}, sendPermissionResponse: () => {} },
+      }
+    }
+    const r = await runDelegate(gw, 'coding-assistant', {
+      goal: 'x',
+      sourceAgent: 'main',
+      model: 'definitely-not-a-model',
+    })
+    assert.equal(r.status, 400)
+    assert.equal(r.body.code, 'DELEGATE_MODEL_UNKNOWN')
+    assert.match(String(r.body.error), /DELEGATE_MODEL_UNKNOWN/)
+    assert.equal(gw.sessions.getOrCreateCalls, 0, '抛错发生在 runner 返回之前')
+  })
+
+  test('HTTP delegate:flag 开 + 显式未知型号 → 400 DELEGATE_MODEL_UNKNOWN,未 spawn', async () => {
+    installCatalog()
+    const prev = process.env.OC_MODEL_AUTHORITY
+    process.env.OC_MODEL_AUTHORITY = '1'
+    try {
+      const gw = makeDelegateGateway()
+      const r = await runDelegate(gw, 'coding-assistant', {
+        goal: 'x',
+        sourceAgent: 'main',
+        model: 'definitely-not-a-model',
+      })
+      assert.equal(r.status, 400)
+      assert.equal(r.body.code, 'DELEGATE_MODEL_UNKNOWN')
+      assert.equal(gw.sessions.getOrCreateCalls, 0)
+    } finally {
+      restoreFlag(prev)
+    }
   })
 })
 

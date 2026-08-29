@@ -11512,8 +11512,18 @@ export class Gateway {
       if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
-      // 原为 throw → 路由 .catch → 500;现由 HTTP 壳把 {kind:'error'} 映射成 sendError(500),
-      // 内部编排调用则据此走降级放行,语义等价、可结构化处理。
+      // flag 未开时 resolveLocalExecutionIfEnforced 是 no-op,显式未知型号在
+      // getOrCreate → resolveExecutionModel({explicit:true}) 才抛。必须复用同一
+      // 映射,否则会变成 500 且丢失 DELEGATE_MODEL_UNKNOWN。
+      const mapped = this._mapLocalExecutionError(err)
+      if (mapped) {
+        return {
+          kind: 'rejected',
+          httpStatus: mapped.httpStatus,
+          message: mapped.message,
+          code: mapped.code,
+        }
+      }
       return { kind: 'error', message: (err as Error)?.message ?? String(err) }
     }
 

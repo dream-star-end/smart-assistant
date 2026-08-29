@@ -125,6 +125,7 @@ describe('0254_agent_audit_error_msg', () => {
     const byId = Object.fromEntries(rows.rows.map((row) => [row.session_id, row]))
     assert.equal(byId.empty.error_msg, 'tool_failed:empty_output')
     assert.equal(byId.secret.error_msg, 'tool_failed:redacted_output')
+    assert.equal(byId.secret.input_meta.redacted_reason, 'secret_pattern')
     assert.equal(byId.allow.error_msg, 'command not found')
     assert.equal(byId.ok.error_msg, null)
     for (const row of rows.rows) {
@@ -200,10 +201,58 @@ describe('0254_agent_audit_error_msg', () => {
     assert.ok(row.rows[0].error_msg.length > 0)
   })
 
+  maybe('trigger fail-closed: unmatched dump/home/truncated PEM never persist raw', async () => {
+    const pem = '-----BEGIN RSA PRIVATE KEY----- MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj'
+    await pool.query(
+      `INSERT INTO agent_audit(user_id,session_id,tool,input_meta,duration_ms,success,error_msg)
+       VALUES
+         (1,'dump','Bash','{"event_id":"dump"}',1,false,'random dump from a core file with no known template'),
+         (1,'home','Bash','{"event_id":"home"}',1,false,'command not found /home/alice/.ssh/id_rsa'),
+         (1,'pem','Bash','{"event_id":"pem"}',1,false,$1)`,
+      [pem],
+    )
+    const rows = await pool.query<{
+      session_id: string
+      error_msg: string | null
+      input_meta: Record<string, unknown>
+    }>(
+      "SELECT session_id,error_msg,input_meta FROM agent_audit WHERE session_id IN ('dump','home','pem')",
+    )
+    const byId = Object.fromEntries(rows.rows.map((row) => [row.session_id, row]))
+    assert.equal(byId.dump.error_msg, 'tool_failed:redacted_output')
+    assert.equal(byId.dump.input_meta.redacted_reason, 'unmatched_template')
+    assert.equal(String(byId.dump.error_msg).includes('core file'), false)
+    assert.equal(String(byId.home.error_msg).includes('alice'), false)
+    assert.equal(String(byId.home.error_msg).includes('/home/alice'), false)
+    assert.match(String(byId.home.error_msg), /command not found/)
+    assert.match(String(byId.home.error_msg), /\/home\/\[user\]/)
+    assert.equal(byId.pem.error_msg, 'tool_failed:redacted_output')
+    assert.equal(byId.pem.input_meta.redacted_reason, 'secret_pattern')
+    assert.equal(String(byId.pem.error_msg).includes('BEGIN'), false)
+    assert.equal(String(byId.pem.error_msg).includes('MIIE'), false)
+  })
+
   maybe('down.sql restores NULL guard and refuses when a later migration exists', async () => {
     await pool.query("INSERT INTO schema_migrations(version) VALUES ('0255_later')")
     await assert.rejects(pool.query(downSql), /compensation refused/)
     await pool.query("DELETE FROM schema_migrations WHERE version='0255_later'")
+
+    await pool.query(`
+      INSERT INTO agent_audit(
+        user_id,session_id,tool,input_meta,duration_ms,success,error_msg,occurred_at,created_at
+      ) VALUES (
+        1,'delayed','Bash','{"event_id":"delayed"}',1,false,'command not found',
+        (SELECT applied_at - interval '2 hours' FROM schema_migrations WHERE version='0254_agent_audit_error_msg'),
+        NOW()
+      )
+    `)
+    const delayedBefore = await pool.query<{ error_msg: string | null; late: boolean }>(
+      `SELECT error_msg,
+              occurred_at < (SELECT applied_at FROM schema_migrations WHERE version='0254_agent_audit_error_msg') AS late
+         FROM agent_audit WHERE session_id='delayed'`,
+    )
+    assert.equal(delayedBefore.rows[0].error_msg, 'command not found')
+    assert.equal(delayedBefore.rows[0].late, true)
 
     await pool.query(downSql)
     const def = await pool.query<{ def: string }>(
@@ -227,5 +276,9 @@ describe('0254_agent_audit_error_msg', () => {
       "SELECT COUNT(*)::text AS n FROM agent_audit WHERE error_msg IS NOT NULL",
     )
     assert.equal(leftover.rows[0].n, '0')
+    const delayedAfter = await pool.query<{ error_msg: string | null }>(
+      "SELECT error_msg FROM agent_audit WHERE session_id='delayed'",
+    )
+    assert.equal(delayedAfter.rows[0].error_msg, null)
   })
 })

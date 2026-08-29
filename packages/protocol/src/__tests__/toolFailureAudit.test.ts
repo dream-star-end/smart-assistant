@@ -171,7 +171,7 @@ describe('sanitizeToolFailureErrorMsg', () => {
     const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC' + 'A'.repeat(80)
     const result = sanitizeToolFailureErrorMsg(pem)
     assert.equal(result.errorMsg, TOOL_FAILED_REDACTED_SENTINEL)
-    assert.ok(result.redactedReason === 'secret_pattern' || result.redactedReason === 'unmatched_template')
+    assert.equal(result.redactedReason, 'secret_pattern')
     assert.equal(result.errorMsg.includes('BEGIN'), false)
     assert.equal(result.errorMsg.includes('MIIE'), false)
     assert.equal(result.errorMsg.includes('PRIVATE KEY'), false)
@@ -181,7 +181,7 @@ describe('sanitizeToolFailureErrorMsg', () => {
     const result = sanitizeToolFailureErrorMsg('Authorization: Bearer super-secret-token-value')
     assert.equal(result.errorMsg.includes('super-secret-token-value'), false)
     assert.equal(result.errorMsg, TOOL_FAILED_REDACTED_SENTINEL)
-    assert.ok(result.redactedReason === 'secret_pattern' || result.redactedReason === 'unmatched_template')
+    assert.equal(result.redactedReason, 'secret_pattern')
   })
 
   test('JWT, password=, and unmatched dumps become redacted_output', () => {

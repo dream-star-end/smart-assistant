@@ -12,6 +12,7 @@ import { afterEach, describe, test } from 'node:test'
 
 import {
   isLegacyToolFailureErrorClass,
+  isRedactedReason,
   isToolFailureKind,
   type ToolCalledEvent,
   type TurnCompletedEvent,
@@ -193,6 +194,25 @@ describe('v3ToolFailureReporter', () => {
     assert.equal(payload.errorMsg.includes('oc-v3.7.'), false)
     assert.equal('inputPreview' in payload, false)
     assert.equal('outputPreview' in payload, false)
+  })
+
+  test('v5 wire carries redactedReason for Bearer/dump and drops it in v4Projection', () => {
+    const bearer = buildToolFailureReportPayload(
+      toolEvent({ outputPreview: 'Authorization: Bearer fake-secret-value' }),
+    )!
+    assert.equal(bearer.schemaVersion, 5)
+    assert.equal(bearer.errorMsg, 'tool_failed:redacted_output')
+    assert.ok(isRedactedReason(bearer.redactedReason))
+    assert.equal(bearer.errorMsg.includes('fake-secret-value'), false)
+    const dump = buildToolFailureReportPayload(
+      toolEvent({ outputPreview: 'random dump from a core file with no known template' }),
+    )!
+    assert.equal(dump.errorMsg, 'tool_failed:redacted_output')
+    assert.equal(dump.redactedReason, 'unmatched_template')
+    const projected = v4Projection(bearer)
+    assert.equal('errorMsg' in projected, false)
+    assert.equal('redactedReason' in projected, false)
+    assert.equal(legacyValidateBodyV4(projected), true)
   })
 
   test('builds privacy-safe engine-neutral turn observations', () => {
