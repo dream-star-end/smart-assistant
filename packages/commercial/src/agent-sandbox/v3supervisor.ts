@@ -70,6 +70,7 @@ import { codexBindingAffinityKey, dockerContainerOwnedByChannel, getRuntimeChann
 import { rootLogger } from "../logging/logger.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
 import { SupervisorError } from "./types.js";
+import { assertFlavorIdentity, FlavorIdentityError } from "../flavor/assertFlavor.js";
 import { getCodexTokenSnapshot } from "../account-pool/store.js";
 import { pickCodexAccountForBinding } from "../account-pool/scheduler.js";
 import { buildCodexRelayLocalBaseUrl, readCodexUpstreamBaseUrl } from "../http/internalCodexRelay.js";
@@ -2818,6 +2819,14 @@ export async function provisionV3Container(
       // decideLocalExecution / CODEX_BILLING_GUARD 与 master 同源读它,不允许两侧各自
       // 解释。master 未设 -> 不注入,容器行为与生产完全一致(fail-closed 不变)。
       if (process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1") {
+        try {
+          assertFlavorIdentity();
+        } catch (err) {
+          if (err instanceof FlavorIdentityError) {
+            throw new SupervisorError(`selfhost engine-local-turn env refused: ${err.message}`);
+          }
+          throw err;
+        }
         env.push("OC_SELFHOST_ENGINE_LOCAL_TURNS=1");
       }
       // 次级模型(WebFetch/WebSearch 等隐藏调用走的 ANTHROPIC_SMALL_FAST_MODEL)由 **master

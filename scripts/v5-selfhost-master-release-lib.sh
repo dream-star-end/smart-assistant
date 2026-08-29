@@ -321,7 +321,8 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
     --arg metadataSha256 "$metadata_sha" \
     --arg artifactSha256 "$artifact_sha" \
     '{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
-      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256}' >"$marker_tmp"; then
+      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
+      flavorGuardGeneration:1}' >"$marker_tmp"; then
     rm -f -- "$marker_tmp"
     return 1
   fi
@@ -573,6 +574,8 @@ build_master_release() {
     cleanup_master_staging
     die "写 VERSION.json 失败"
   fi
+  write_flavor_manifest "$staging" selfhost "$full_sha" \
+    || { cleanup_master_staging; die "写 flavor.manifest.json 失败"; }
   if ! harden_unique_release_tree "$staging"; then
     cleanup_master_staging
     die "harden unique files 失败"

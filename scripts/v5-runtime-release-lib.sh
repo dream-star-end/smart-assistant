@@ -175,6 +175,17 @@ oc_hotcfg_build_manifest() {
 
 # MANIFEST.capabilities 就地补写(幂等)。MANIFEST.json 不进 file_rows/digest,故改它不动 digest,
 # 也不影响 verify_manifest_full/sampled(两者只比对 .files[] 与实际文件)。
+# MANIFEST.json is excluded from digest, so this seal can sit on the marker
+# itself: new runtime artifacts fail-closed if flavor.manifest.json is stripped.
+oc_hotcfg__patch_manifest_flavor_generation() {
+  local root="$1" tmp
+  [ -f "$root/MANIFEST.json" ] || { oc_hotcfg__die "patch_flavor_generation: 缺 MANIFEST.json @ $root"; return 1; }
+  tmp="$root/MANIFEST.json.tmp"
+  jq --argjson g 1 '.flavorGuardGeneration = $g' "$root/MANIFEST.json" > "$tmp" \
+    || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$root/MANIFEST.json" || return 1
+}
+
 oc_hotcfg__patch_manifest_capabilities() {
   local root="$1" caps="${2:-}" want have tmp
   [ -f "$root/MANIFEST.json" ] || { oc_hotcfg__die "patch_capabilities: 缺 MANIFEST.json @ $root"; return 1; }
@@ -581,6 +592,7 @@ oc_hotcfg_finalize_release() {
 
   local digest target
   digest="$(oc_hotcfg_build_manifest "$staging" 1 "$commit" "$bunver" "$cache" "$ccb_key" "$caps")" || return 1
+  oc_hotcfg__patch_manifest_flavor_generation "$staging" || return 1
   target="$OC_HOTCFG_RELEASES_ROOT/rel-$digest"
   mkdir -p "$OC_HOTCFG_RELEASES_ROOT"
   if [ -d "$target" ]; then

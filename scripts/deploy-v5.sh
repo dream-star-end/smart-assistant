@@ -155,6 +155,18 @@ RUNTIME_LIB="$SCRIPT_DIR/v5-runtime-release-lib.sh"
 [ -f "$RUNTIME_LIB" ] || { echo "FATAL: 缺 runtime release lib: $RUNTIME_LIB" >&2; exit 1; }
 # shellcheck source=scripts/v5-runtime-release-lib.sh
 source "$RUNTIME_LIB"
+FLAVOR_LIB="$SCRIPT_DIR/lib/assert-flavor.sh"
+if [[ -f "$FLAVOR_LIB" ]]; then
+  # shellcheck source=scripts/lib/assert-flavor.sh
+  source "$FLAVOR_LIB"
+fi
+if [[ "${1:-}" == "--mint-flavor-manifest" ]]; then
+  dest="${2:?usage: --mint-flavor-manifest DIR [flavor] [commit]}"
+  flavor="${3:-commercial}"
+  commit="${4:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+  write_flavor_manifest "$dest" "$flavor" "$commit"
+  exit $?
+fi
 RELEASE_QUEUE_SCRIPT="$SCRIPT_DIR/v5-release-queue.sh"
 [ -x "$RELEASE_QUEUE_SCRIPT" ] || {
   echo "FATAL: 缺或不可执行的 V5 release queue: $RELEASE_QUEUE_SCRIPT" >&2
@@ -2116,6 +2128,9 @@ REMOTE
 
 begin_cutover_step() {
   local expected="$1" next="$2"
+  if [[ -n "${BUILT_RELEASE:-}" ]]; then
+    assert_commercial_flavor_on_target "$BUILT_RELEASE" || return 1
+  fi
   if cutover_transition "$expected" "$next"; then
     if [[ "$next" == recycling ]] && ! set_cutover_maintenance; then
       recover_cutover "failed to create planned-maintenance marker"
@@ -2852,7 +2867,7 @@ version_commit="$(jq -er '.commit | select(type == "string")' "$version")" || ex
 if [[ "$kind" == strong ]]; then
   row="$(jq -er --argjson schema "$schema" '
     if (((["artifactSha256","builtAt","metadataSha256","schemaVersion","sourceCommit"] - keys) | length) == 0
-      and ((keys - ["artifactSha256","builtAt","distReuse","metadataSha256","schemaVersion","sourceCommit"]) | length) == 0
+      and ((keys - ["artifactSha256","builtAt","distReuse","flavorGuardGeneration","metadataSha256","schemaVersion","sourceCommit"]) | length) == 0)
       and .schemaVersion == $schema
       and (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
       and (.builtAt | type == "string" and test("^[0-9]{8}-[0-9]{6}$"))
@@ -3105,8 +3120,10 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
     --arg builtAt "$built_at" \
     --arg metadataSha256 "$metadata_sha" \
     --arg artifactSha256 "$artifact_sha" \
+    --argjson flavorGuardGeneration 1 \
     '{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
-      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256}' >"$marker_tmp"; then
+      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
+      flavorGuardGeneration:$flavorGuardGeneration}' >"$marker_tmp"; then
     rm -f -- "$marker_tmp"
     return 1
   fi
@@ -3802,6 +3819,20 @@ build_release() {
   ssh "$KL_HOST" "mkdir -p '$staging'" || { echo "✗ mkdir staging 失败" >&2; return 1; }
   if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | ssh "$KL_HOST" "tar -x -C '$staging'"; then
     echo "✗ git archive/解包失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+  flavor_tmpd="$(mktemp -d)"
+  if ! write_flavor_manifest "$flavor_tmpd" commercial "$full_sha"; then
+    rm -rf "$flavor_tmpd"
+    echo "✗ write commercial flavor.manifest.json failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! scp -q "$flavor_tmpd/flavor.manifest.json" "$KL_HOST:$staging/flavor.manifest.json"; then
+    rm -rf "$flavor_tmpd"
+    echo "✗ scp flavor.manifest.json failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  rm -rf "$flavor_tmpd"
   # node_modules:lock 未变且当前有 → 硬链复用;否则空目录 npm ci(不碰旧 release 硬链)
   if ! ssh "$KL_HOST" "set -e
       if [ -n '$cur' ] && [ -d '$cur/node_modules' ] && cmp -s '$staging/package-lock.json' '$cur/package-lock.json' 2>/dev/null; then
@@ -5551,12 +5582,33 @@ restore_release_state_if_committed() {  # $1=target
 
 # 原子激活 release:assets 先就位；随后 symlink→restart→健康门→deploy_state CAS。
 # 任一步失败都回切旧 symlink/unit；状态 CAS 落空/PG 错误绝不再被吞成成功。
+assert_commercial_flavor_on_target() {
+  local candidate="$1"
+  [[ -n "$candidate" ]] || { echo "✗ commercial flavor assertion missing candidate" >&2; return 1; }
+  ssh "$KL_HOST" bash -s -- "$candidate" "$V5_ENV" <<'REMOTE'
+set -euo pipefail
+cand="$1"
+env_file="$2"
+helper="$cand/scripts/lib/assert-flavor.sh"
+if [[ ! -f "$cand/flavor.manifest.json" && ! -f "$helper" ]]; then
+  echo "[flavor-identity] cutover skip: legacy candidate" >&2
+  exit 0
+fi
+if [[ ! -f "$helper" ]]; then
+  echo "[flavor-identity] guarded candidate missing helper" >&2
+  exit 1
+fi
+V5_ENV="$env_file" bash "$helper" cutover-commercial --root "$cand"
+REMOTE
+}
+
 activate_release() {
   local reldir="$1" prev tmplink old_prev_file=""
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] 校验+assets 先就位→翻转 $ACTIVE_SRC(slot=$ACTIVE_SLOT)→restart/smoke $ACTIVE_UNIT:$ACTIVE_PORT→严格 state CAS；任一步失败回切旧 release"
     return 0
   fi
+  assert_commercial_flavor_on_target "$reldir" || return 1
   assert_release_marker "$reldir" || return 1
   assert_release_required_migrations "$reldir" || return 1
   assert_release_baseline_security "$reldir" || return 1
@@ -6054,6 +6106,20 @@ build_runtime_release() {
     test -f '$raw/$excl' || { echo 'FATAL: 缺 runtime-src-excludes.txt(agent B 未就位?): $excl' >&2; exit 1; }
     rsync -a --exclude-from='$raw/$excl' '$raw/' '$staging/'
     rm -rf '$raw'" || { echo "✗ release 源钉死/prune 失败" >&2; ssh "$KL_HOST" "rm -rf '$raw' '$staging'" 2>/dev/null; return 1; }
+  flavor_tmpd="$(mktemp -d)"
+  if ! write_flavor_manifest "$flavor_tmpd" commercial "$full_sha"; then
+    rm -rf "$flavor_tmpd"
+    echo "✗ write commercial runtime flavor.manifest.json failed" >&2
+    ssh "$KL_HOST" "rm -rf '$raw' '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! scp -q "$flavor_tmpd/flavor.manifest.json" "$KL_HOST:$staging/flavor.manifest.json"; then
+    rm -rf "$flavor_tmpd"
+    echo "✗ scp runtime flavor.manifest.json failed" >&2
+    ssh "$KL_HOST" "rm -rf '$raw' '$staging'" 2>/dev/null
+    return 1
+  fi
+  rm -rf "$flavor_tmpd"
   BUILT_RUNTIME_RELEASE="$(hotcfg_rmt oc_hotcfg_finalize_release "$staging" "$RUNTIME_IMAGE_ID" "$full_sha" "${prev:-}" "$runtime_caps")" \
     || { echo "✗ release finalize 失败(npm ci / ccb build / manifest)" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; }
   BUILT_RUNTIME_RELEASE="$(printf '%s' "$BUILT_RUNTIME_RELEASE" | tr -d '[:space:]')"
@@ -6106,6 +6172,7 @@ activate_runtime_tuple() {
     echo "  [dry-run] saga: [pre-state(首启)]→[canary validate-only]→extra_apply(master symlink→$BUILT_RELEASE)→env tuple(四键恒写,禁用轴空值)→[flip current]→restart→smoke→history commit"
     return 0
   fi
+  assert_commercial_flavor_on_target "$BUILT_RELEASE" || return 1
   assert_release_marker "$BUILT_RELEASE" || return 1
   assert_release_required_migrations "$BUILT_RELEASE" || return 1
   assert_release_baseline_security "$BUILT_RELEASE" || return 1

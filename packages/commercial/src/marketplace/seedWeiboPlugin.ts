@@ -5,6 +5,7 @@ import { skillContentHash } from '@openclaude/storage'
 import { canonicalBytes } from '../connectors/spec/canonical.js'
 import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
+import { assertFlavorIdentity } from '../flavor/assertFlavor.js'
 import type { PluginLeaseRedis } from '../plugins/accountLease.js'
 import {
   OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
@@ -242,6 +243,7 @@ export async function seedWeiboPlugin(input: {
   expectedScope?: OfficialManagedBrowserTransitionScope
   beforeListingOpen?: (target: { versionId: string }) => Promise<void>
 }): Promise<SeedWeiboPluginResult> {
+  assertFlavorIdentity({ env: input.env ?? process.env })
   if (input.functionalVerified !== true)
     throw new Error('Weibo Plugin requires live functional verification')
   const env = input.env ?? process.env

@@ -66,6 +66,28 @@ auth_dir=${auth_file%/*}
 # local OpenClaude control path that Cursor or its MCP children may call.
 cursor_https_proxy=""
 cursor_proxy_file=$auth_dir/.https-proxy
+flavor_assert=""
+if [ -f "$SELF_ROOT/assert-flavor.sh" ]; then
+  flavor_assert=$SELF_ROOT/assert-flavor.sh
+elif [ -f "$SELF_ROOT/../../../../../scripts/lib/assert-flavor.sh" ]; then
+  flavor_assert=$SELF_ROOT/../../../../../scripts/lib/assert-flavor.sh
+fi
+if [ -z "$flavor_assert" ]; then
+  flavor_probe=$SELF_ROOT
+  flavor_guarded=0
+  while [ "$flavor_probe" != / ]; do
+    if [ -f "$flavor_probe/flavor.manifest.json" ] || [ -f "$flavor_probe/.complete" ]; then
+      if grep -q 'guardGeneration\|flavorGuardGeneration' "$flavor_probe/flavor.manifest.json" "$flavor_probe/.complete" 2>/dev/null; then
+        flavor_guarded=1
+      fi
+      break
+    fi
+    flavor_probe=$(/usr/bin/dirname "$flavor_probe")
+  done
+  if [ "$flavor_guarded" = 1 ]; then
+    die "flavor helper missing on guarded artifact"
+  fi
+fi
 if /usr/bin/sudo -n /usr/bin/test -f "$cursor_proxy_file" 2>/dev/null; then
   cursor_proxy_type=$(/usr/bin/sudo -n /usr/bin/stat -c %F -- "$cursor_proxy_file" 2>/dev/null) \
     || die "Cursor HTTPS proxy metadata is unavailable"
@@ -98,6 +120,12 @@ if /usr/bin/sudo -n /usr/bin/test -f "$cursor_proxy_file" 2>/dev/null; then
   case "$cursor_proxy_port" in ''|*[!0-9]*) die "Cursor HTTPS proxy port is invalid" ;; esac
   [ "$cursor_proxy_port" -ge 1 ] && [ "$cursor_proxy_port" -le 65535 ] \
     || die "Cursor HTTPS proxy port is invalid"
+  if [ -n "$flavor_assert" ]; then
+    # shellcheck disable=SC1090
+    . "$flavor_assert"
+    assert_allows selfhost-cursor-egress --sidecar 1 --effector "$SELF_ROOT" \
+      || die "flavor identity refused Cursor HTTPS proxy sidecar"
+  fi
   HTTPS_PROXY=$cursor_https_proxy
   HTTP_PROXY=$cursor_https_proxy
   NO_PROXY=127.0.0.1,localhost,::1,172.31.0.1

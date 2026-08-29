@@ -45,6 +45,15 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=scripts/lib/assert-flavor.sh
+source "$SCRIPT_DIR/lib/assert-flavor.sh"
+if [[ "${1:-}" == "--mint-flavor-manifest" ]]; then
+  dest="${2:?usage: --mint-flavor-manifest DIR [flavor] [commit]}"
+  flavor="${3:-selfhost}"
+  commit="${4:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+  write_flavor_manifest "$dest" "$flavor" "$commit"
+  exit $?
+fi
 
 INSTANCE_ID="v5-selfhost-sg"
 V5_HOME="/root/.openclaude-v5-selfhost"
@@ -71,8 +80,8 @@ CATALOG_ADMIN_ROLE="${PG_ROLE}_catalog_admin"
 MODEL_AUTHORITY_DEPLOY_ROLE="${PG_ROLE}_model_deploy"
 REDIS_URL="redis://127.0.0.1:6379/3"
 # Runtime image pin. Rebuild with:
-#   packages/commercial/agent-sandbox/build-image.sh v5-cli-codex0149-grok105-zcode381-slim
-# which auto-sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1).
+#   OC_FLAVOR=selfhost packages/commercial/agent-sandbox/build-image.sh v5-cli-codex0149-grok105-zcode381-slim
+# which sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1).
 RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-codex0149-grok105-zcode381-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
@@ -927,6 +936,8 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_PROJECT_CONTEXT 1
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_HTTPS_PROXY "http://172.31.0.1:18991"
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_TZ "Asia/Tokyo"
+  ensure_env_kv "$V5_ENV" OC_SELFHOST_ENGINE_LOCAL_TURNS 1
+  ensure_env_kv "$V5_ENV" SELFHOST_CURSOR_EGRESS 1
   log "  ✓ 制品根 / PG sessions / privacy-safe telemetry / CCB Japan transport keys"
 }
 
@@ -1200,6 +1211,8 @@ refresh_ccb_proxy_path() {
   timeout 10 bash -c 'exec 3<>/dev/tcp/172.31.0.1/18991' \
     || die "CCB HTTPS proxy listener 172.31.0.1:18991 is unreachable"
   if [[ -f /etc/sing-box/openclaude-cursor-egress-proxy.json ]]; then
+    assert_allows selfhost-unit-install \
+      || die "flavor identity refused $V5_CURSOR_PROXY_UNIT"
     systemctl enable --now "$V5_CURSOR_PROXY_UNIT" \
       || die "$V5_CURSOR_PROXY_UNIT failed to start"
     iptables -C V5_EGRESS_IN -d 172.31.0.1 -p tcp --dport 18992 \
@@ -1299,6 +1312,8 @@ build_runtime_release() {
   rsync -a --exclude-from="$EXCLUDES" "$raw/" "$staging/" \
     || { rm -rf "$raw" "$staging"; die "rsync prune 失败"; }
   rm -rf "$raw"
+  write_flavor_manifest "$staging" selfhost "$sha" \
+    || { rm -rf "$staging"; die "写 runtime flavor.manifest.json 失败"; }
   BUILT_RUNTIME_RELEASE="$(oc_hotcfg_finalize_release "$staging" "$image_id" "$sha" "${prev:-}" "$caps")" \
     || { rm -rf "$staging"; die "release finalize 失败(npm ci / ccb bun build / MANIFEST)"; }
   BUILT_RUNTIME_RELEASE="$(printf '%s' "$BUILT_RUNTIME_RELEASE" | tr -d '[:space:]')"

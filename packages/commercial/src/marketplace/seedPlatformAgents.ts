@@ -28,6 +28,7 @@ import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
 import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
 
 import { query } from '../db/queries.js'
+import { assertFlavorIdentity } from '../flavor/assertFlavor.js'
 import {
   type AgentManifest,
   VETTED_AGENT_TOOLSETS,
@@ -295,6 +296,7 @@ async function seedAgentDefs(
   deprecatedSlugs: readonly string[],
   deps: SeedPlatformAgentsDeps,
 ): Promise<SeedPlatformAgentsResult> {
+  assertFlavorIdentity()
   const out: SeedPlatformAgentsResult = {
     ownerUserId: null,
     seeded: [],

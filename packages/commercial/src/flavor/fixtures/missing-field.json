@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "flavor": "commercial",
+  "sourceCommit": "dddddddddddddddddddddddddddddddddddddddd",
+  "builder": "deploy-v5.sh",
+  "expectedHosts": ["kl-mirror"]
+}

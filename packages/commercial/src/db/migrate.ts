@@ -2,6 +2,12 @@ import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PoolClient } from "pg";
+import {
+  FlavorIdentityError,
+  assertFlavorForMigrate,
+  assertFlavorIdentity,
+  type FlavorSignals,
+} from "../flavor/assertFlavor.js";
 import { getPool } from "./index.js";
 import { verifyOrderDependencies } from "./migrationOrder.js";
 
@@ -65,6 +71,11 @@ export interface MigrationsOptions {
    * 可选:每应用一个迁移的回调(用于日志/测试观察)。
    */
   onApply?: (version: string) => void;
+  /**
+   * Flavor identity signals for tests. Production reads the artifact
+   * manifest + process env. Guard runs before any DDL.
+   */
+  flavor?: FlavorSignals;
 }
 
 export interface MigrationResult {
@@ -113,12 +124,11 @@ async function listMigrations(
 export async function runMigrations(
   opts: MigrationsOptions = {},
 ): Promise<MigrationResult> {
+  const flavorSignals = opts.flavor ?? {};
+  // Identity without a session first: env/DATABASE_URL spoof fails before connect.
+  const pre = await assertFlavorIdentity(flavorSignals);
   const dir = opts.dir ?? defaultMigrationsDir();
   const pool = getPool();
-
-  // 先确保 schema_migrations 表存在(在 advisory lock 之外就做,用 IF NOT EXISTS 幂等)。
-  // 不放 lock 内:进入 lock 后第一件事就 SELECT 它,存在性必须先保证。
-  await pool.query(SCHEMA_MIGRATIONS_DDL);
 
   // 拿一个独立 client,用它持有 session-level advisory lock,整个 migrate 期间独占。
   const client = await pool.connect();
@@ -128,6 +138,21 @@ export async function runMigrations(
   // 而不是还回 pool。
   let unlockError: unknown;
   try {
+    if (pre.status === "ok") {
+      const session = await client.query<{ current_database: string; migration_profile: string }>(
+        "SELECT current_database() AS current_database, current_setting('openclaude.migration_profile', true) AS migration_profile",
+      );
+      const dbName = flavorSignals.dbName ?? session.rows[0]?.current_database;
+      const dbProfile = flavorSignals.dbProfile ?? session.rows[0]?.migration_profile ?? "";
+      if (!dbName) {
+        throw new FlavorIdentityError("current_database() returned empty");
+      }
+      await assertFlavorForMigrate({ ...flavorSignals, dbName, dbProfile });
+    }
+
+    // 先确保 schema_migrations 表存在。身份/会话 profile 已在同一连接上验证。
+    await client.query(SCHEMA_MIGRATIONS_DDL);
+
     await client.query("SELECT pg_advisory_lock($1)", [MIGRATE_ADVISORY_LOCK_ID]);
     try {
       return await runMigrationsInner(client, dir, opts);

@@ -43,6 +43,7 @@ import { homedir } from "node:os";
 import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
+import { assertFlavorIdentity } from "./flavor/assertFlavor.js";
 import { closePool, createPool, getPool } from "./db/index.js";
 import {
   assertModelCatalogAdminPoolConfigured,
@@ -1170,6 +1171,7 @@ export async function registerCommercial(
   // 步骤 5 兼容地板(方案 §7 步 5,R3-B4):cutover marker 置位后禁止在 flag 关闭态下起。
   // 放在最前 —— 拒启要发生在任何 DB/容器/调度器副作用之前。
   assertModelAuthorityCutoverFloor();
+  assertFlavorIdentity();
 
   const cfg = loadConfig();
 
