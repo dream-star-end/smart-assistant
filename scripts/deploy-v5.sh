@@ -160,6 +160,13 @@ if [[ -f "$FLAVOR_LIB" ]]; then
   # shellcheck source=scripts/lib/assert-flavor.sh
   source "$FLAVOR_LIB"
 fi
+if [[ "${1:-}" == "--mint-flavor-manifest" ]]; then
+  dest="${2:?usage: --mint-flavor-manifest DIR [flavor] [commit]}"
+  flavor="${3:-commercial}"
+  commit="${4:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+  write_flavor_manifest "$dest" "$flavor" "$commit"
+  exit $?
+fi
 RELEASE_QUEUE_SCRIPT="$SCRIPT_DIR/v5-release-queue.sh"
 [ -x "$RELEASE_QUEUE_SCRIPT" ] || {
   echo "FATAL: 缺或不可执行的 V5 release queue: $RELEASE_QUEUE_SCRIPT" >&2
@@ -2860,7 +2867,7 @@ version_commit="$(jq -er '.commit | select(type == "string")' "$version")" || ex
 if [[ "$kind" == strong ]]; then
   row="$(jq -er --argjson schema "$schema" '
     if (((["artifactSha256","builtAt","metadataSha256","schemaVersion","sourceCommit"] - keys) | length) == 0
-      and ((keys - ["artifactSha256","builtAt","distReuse","metadataSha256","schemaVersion","sourceCommit"]) | length) == 0
+      and ((keys - ["artifactSha256","builtAt","distReuse","flavorGuardGeneration","metadataSha256","schemaVersion","sourceCommit"]) | length) == 0)
       and .schemaVersion == $schema
       and (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
       and (.builtAt | type == "string" and test("^[0-9]{8}-[0-9]{6}$"))
@@ -3113,8 +3120,10 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
     --arg builtAt "$built_at" \
     --arg metadataSha256 "$metadata_sha" \
     --arg artifactSha256 "$artifact_sha" \
+    --argjson flavorGuardGeneration 1 \
     '{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
-      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256}' >"$marker_tmp"; then
+      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
+      flavorGuardGeneration:$flavorGuardGeneration}' >"$marker_tmp"; then
     rm -f -- "$marker_tmp"
     return 1
   fi
@@ -6097,6 +6106,20 @@ build_runtime_release() {
     test -f '$raw/$excl' || { echo 'FATAL: 缺 runtime-src-excludes.txt(agent B 未就位?): $excl' >&2; exit 1; }
     rsync -a --exclude-from='$raw/$excl' '$raw/' '$staging/'
     rm -rf '$raw'" || { echo "✗ release 源钉死/prune 失败" >&2; ssh "$KL_HOST" "rm -rf '$raw' '$staging'" 2>/dev/null; return 1; }
+  flavor_tmpd="$(mktemp -d)"
+  if ! write_flavor_manifest "$flavor_tmpd" commercial "$full_sha"; then
+    rm -rf "$flavor_tmpd"
+    echo "✗ write commercial runtime flavor.manifest.json failed" >&2
+    ssh "$KL_HOST" "rm -rf '$raw' '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! scp -q "$flavor_tmpd/flavor.manifest.json" "$KL_HOST:$staging/flavor.manifest.json"; then
+    rm -rf "$flavor_tmpd"
+    echo "✗ scp runtime flavor.manifest.json failed" >&2
+    ssh "$KL_HOST" "rm -rf '$raw' '$staging'" 2>/dev/null
+    return 1
+  fi
+  rm -rf "$flavor_tmpd"
   BUILT_RUNTIME_RELEASE="$(hotcfg_rmt oc_hotcfg_finalize_release "$staging" "$RUNTIME_IMAGE_ID" "$full_sha" "${prev:-}" "$runtime_caps")" \
     || { echo "✗ release finalize 失败(npm ci / ccb build / manifest)" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; }
   BUILT_RUNTIME_RELEASE="$(printf '%s' "$BUILT_RUNTIME_RELEASE" | tr -d '[:space:]')"

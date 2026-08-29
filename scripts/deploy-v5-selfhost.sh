@@ -47,6 +47,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 # shellcheck source=scripts/lib/assert-flavor.sh
 source "$SCRIPT_DIR/lib/assert-flavor.sh"
+if [[ "${1:-}" == "--mint-flavor-manifest" ]]; then
+  dest="${2:?usage: --mint-flavor-manifest DIR [flavor] [commit]}"
+  flavor="${3:-selfhost}"
+  commit="${4:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+  write_flavor_manifest "$dest" "$flavor" "$commit"
+  exit $?
+fi
 
 INSTANCE_ID="v5-selfhost-sg"
 V5_HOME="/root/.openclaude-v5-selfhost"

@@ -123,19 +123,19 @@ describe("incident ledger superset", () => {
     assert.ok(!result.ok && result.errors.some((err) => /approval|40-hex|Tombstone-Approval/.test(err)));
   });
 
-  test("explicit tombstone with approval trailer format may pass skipGit", () => {
+  test("B7: fake approver, mismatched trailer, and fictional deletion SHA are red", () => {
     const selfhost = (JSON.parse(
       readFileSync(path.join(root, "e2e/session-display/incidents.json"), "utf8"),
     ) as { incidents: LedgerIncident[] }).incidents.filter((item) => item.id !== PHASE_B);
     const stone: Tombstone = {
       id: PHASE_B,
       removedAt: "2026-08-27",
-      removedInCommit: `${"24d43a6cf"}${"a".repeat(31)}`,
+      removedInCommit: "a".repeat(40),
       reason: "fence proofPending baseline; replay fixture",
-      approver: "boss",
+      approver: "fake-approver",
       codeStillInTree: "0002df137",
       approval: {
-        trailer: `Tombstone-Approval: ${PHASE_B} boss`,
+        trailer: `Tombstone-Approval: ${PHASE_B} claimed-boss`,
         commit: "b".repeat(40),
       },
     };
@@ -148,7 +148,79 @@ describe("incident ledger superset", () => {
       tombstones: [stone],
       trailerTips,
     });
+    assert.equal(result.ok, false);
+    const blob = result.ok ? "" : result.errors.join("\n");
+    assert.ok(/trusted human|dual DAG|trailer approver/.test(blob), blob);
+  });
+
+  test("B7: trusted approver with real dual-DAG SHAs may tombstone under skipGit", () => {
+    const selfhost = (JSON.parse(
+      readFileSync(path.join(root, "e2e/session-display/incidents.json"), "utf8"),
+    ) as { incidents: LedgerIncident[] }).incidents.filter((item) => item.id !== PHASE_B);
+    const stone: Tombstone = {
+      id: PHASE_B,
+      removedAt: "2026-08-27",
+      removedInCommit: "24d43a6cf3a83609a598a1798fe90076fff29a5e",
+      reason: "fence proofPending baseline; replay fixture",
+      approver: "dream-star-end",
+      codeStillInTree: "0002df137deb056dfc501146aa621dcfb912bf0e",
+      approval: {
+        trailer: `Tombstone-Approval: ${PHASE_B} dream-star-end`,
+        commit: "0002df137deb056dfc501146aa621dcfb912bf0e",
+      },
+    };
+    const result = checkIncidentLedgerSuperset({
+      root,
+      skipGit: true,
+      previousBaseline: null,
+      baseline: baseline(),
+      mergedIncidents: selfhost,
+      tombstones: [stone],
+      trailerTips,
+    });
     assert.equal(result.ok, true, result.ok ? "" : result.errors.join("\n"));
+  });
+
+  test("B7: rewriting an existing tombstone in place is red", () => {
+    const selfhost = (JSON.parse(
+      readFileSync(path.join(root, "e2e/session-display/incidents.json"), "utf8"),
+    ) as { incidents: LedgerIncident[] }).incidents.filter((item) => item.id !== PHASE_B);
+    const original: Tombstone = {
+      id: PHASE_B,
+      removedAt: "2026-08-27",
+      removedInCommit: "24d43a6cf3a83609a598a1798fe90076fff29a5e",
+      reason: "original reason",
+      approver: "dream-star-end",
+      codeStillInTree: "0002df137deb056dfc501146aa621dcfb912bf0e",
+      approval: {
+        trailer: `Tombstone-Approval: ${PHASE_B} dream-star-end`,
+        commit: "0002df137deb056dfc501146aa621dcfb912bf0e",
+      },
+    };
+    const rewritten: Tombstone = { ...original, reason: "rewritten in place" };
+    const result = checkIncidentLedgerSuperset({
+      root,
+      skipGit: true,
+      previousBaseline: null,
+      baseline: baseline(),
+      mergedIncidents: selfhost,
+      previousTombstones: [original],
+      tombstones: [rewritten],
+      trailerTips,
+    });
+    assert.equal(result.ok, false);
+    assert.ok(!result.ok && result.errors.some((err) => err.includes("rewritten in place")), result.ok ? "" : result.errors.join("\n"));
+  });
+
+  test("B6: wrong sha256 pin is red even when previous freeze exists", () => {
+    const result = checkIncidentLedgerSuperset({
+      root,
+      skipGit: true,
+      previousBaseline: baseline(),
+      pin: "0".repeat(64),
+    });
+    assert.equal(result.ok, false);
+    assert.ok(!result.ok && result.errors.some((err) => /sha256/.test(err) && /pin/.test(err)), result.ok ? "" : result.errors.join("\n"));
   });
 
   test("B6: shrinking baseline together with the ledger is still red", () => {
@@ -179,11 +251,14 @@ describe("incident ledger superset", () => {
     const stone: Tombstone = {
       id: PHASE_B,
       removedAt: "2026-08-27",
-      removedInCommit: "a".repeat(40),
+      removedInCommit: "24d43a6cf3a83609a598a1798fe90076fff29a5e",
       reason: "x",
-      approver: "boss",
-      codeStillInTree: "0002df137",
-      approval: { trailer: `Tombstone-Approval: ${PHASE_B} boss`, commit: "b".repeat(40) },
+      approver: "dream-star-end",
+      codeStillInTree: "0002df137deb056dfc501146aa621dcfb912bf0e",
+      approval: {
+        trailer: `Tombstone-Approval: ${PHASE_B} dream-star-end`,
+        commit: "0002df137deb056dfc501146aa621dcfb912bf0e",
+      },
     };
     const result = checkIncidentLedgerSuperset({
       root,

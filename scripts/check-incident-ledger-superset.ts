@@ -62,6 +62,7 @@ export type SupersetInput = {
   trailerTips?: string[];
   skipGit?: boolean;
   pin?: string;
+  approvers?: string[];
 };
 
 export type SupersetResult = { ok: true } | { ok: false; errors: string[] };
@@ -70,6 +71,7 @@ const DEFAULT_ROOT = resolve(import.meta.dirname, "..");
 const BASELINE_REL = "e2e/session-display/incident-ledger-baseline.json";
 const TOMBSTONE_REL = "e2e/session-display/incident-tombstones.json";
 const PIN_REL = "e2e/session-display/incident-ledger-baseline.sha256";
+const APPROVERS_REL = "e2e/session-display/incident-tombstone-approvers.json";
 const APPROVAL_RE = /^Tombstone-Approval: (INC-[0-9]{8}-[A-Z0-9-]{3,40}) (\S+)$/;
 
 function git(root: string, ...args: string[]): string {
@@ -113,6 +115,65 @@ export function loadPreviousBaseline(root: string): LedgerBaseline | null {
   return null;
 }
 
+export function loadTrustedApprovers(root: string): string[] {
+  const path = join(root, APPROVERS_REL);
+  if (!existsSync(path)) return [];
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as { approvers?: unknown };
+  return Array.isArray(parsed.approvers)
+    ? parsed.approvers.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
+}
+
+function commitExists(root: string, sha: string): boolean {
+  if (!/^[0-9a-f]{40}$/.test(sha)) return false;
+  try {
+    git(root, "cat-file", "-e", `${sha}^{commit}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function commitInDualDag(root: string, sha: string, baseline: LedgerBaseline): boolean {
+  if (!commitExists(root, sha)) return false;
+  for (const tip of [baseline.auroraTip, baseline.selfhostTip]) {
+    if (!tip) continue;
+    try {
+      execFileSync("git", ["merge-base", "--is-ancestor", sha, tip], {
+        cwd: root,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return true;
+    } catch {
+      /* try the other recorded tip */
+    }
+  }
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", sha, "HEAD"], {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function stableTombstone(stone: Tombstone): string {
+  return JSON.stringify({
+    id: stone.id,
+    removedAt: stone.removedAt,
+    removedInCommit: stone.removedInCommit,
+    reason: stone.reason,
+    approver: stone.approver,
+    codeStillInTree: stone.codeStillInTree,
+    approval: {
+      trailer: stone.approval?.trailer ?? "",
+      commit: stone.approval?.commit ?? "",
+    },
+  });
+}
+
 export function loadPreviousTombstones(root: string): Tombstone[] {
   const refs = [
     process.env.INCIDENT_LEDGER_BASE_REF,
@@ -145,6 +206,7 @@ export function checkIncidentLedgerSuperset(input: SupersetInput = {}): Superset
   const trailerTips = input.trailerTips ?? parseImportedTrailerTips(
     readFileSync(join(root, "scripts/check-v5-incident-regressions.ts"), "utf8"),
   );
+  const approvers = input.approvers ?? loadTrustedApprovers(root);
 
   if (baseline.schema !== 1) errors.push(`baseline schema must be 1, got ${baseline.schema}`);
   if (!Array.isArray(baseline.incidentIds) || baseline.incidentIds.length === 0) {
@@ -170,8 +232,8 @@ export function checkIncidentLedgerSuperset(input: SupersetInput = {}): Superset
   if (existsSync(pinPath) && input.baseline === undefined) {
     const expected = (input.pin ?? readFileSync(pinPath, "utf8")).trim().split(/\s+/)[0];
     const actual = createHash("sha256").update(readFileSync(baselinePath)).digest("hex");
-    if (expected && expected !== actual && !previous) {
-      errors.push(`baseline sha256 ${actual} != pin ${expected} and no previous freeze to prove expansion`);
+    if (expected && expected !== actual) {
+      errors.push(`baseline sha256 ${actual} != pin ${expected}`);
     }
   }
 
@@ -232,6 +294,13 @@ export function checkIncidentLedgerSuperset(input: SupersetInput = {}): Superset
   if (lostStones.length > 0) {
     errors.push(`tombstones shrank; removed ${lostStones.join(", ")}`);
   }
+  for (const prev of previousTombstones) {
+    const current = tombstones.find((item) => item.id === prev.id);
+    if (!current) continue;
+    if (stableTombstone(current) !== stableTombstone(prev)) {
+      errors.push(`tombstone ${prev.id} was rewritten in place; tombstone file is append-only`);
+    }
+  }
 
   if (tombstoneFile.schema !== undefined && tombstoneFile.schema !== 1 && input.tombstones === undefined) {
     errors.push(`tombstones schema must be 1, got ${tombstoneFile.schema}`);
@@ -251,6 +320,11 @@ export function checkIncidentLedgerSuperset(input: SupersetInput = {}): Superset
     }
     if (!/^[0-9a-f]{40}$/.test(stone.removedInCommit ?? "")) {
       errors.push(`tombstone ${stone.id} removedInCommit must be a full 40-hex SHA`);
+    } else if (!commitExists(root, stone.removedInCommit) || !commitInDualDag(root, stone.removedInCommit, baseline)) {
+      errors.push(`tombstone ${stone.id} removedInCommit ${stone.removedInCommit} is not a real commit in the dual DAG`);
+    }
+    if (stone.approver && !approvers.includes(stone.approver)) {
+      errors.push(`tombstone ${stone.id} approver ${stone.approver} is not a trusted human identity`);
     }
     const approval = stone.approval;
     if (!approval?.trailer || !approval.commit) {
@@ -261,9 +335,15 @@ export function checkIncidentLedgerSuperset(input: SupersetInput = {}): Superset
         errors.push(`tombstone ${stone.id} approval.trailer must be "Tombstone-Approval: <INC> <approver>"`);
       } else if (match[1] !== stone.id) {
         errors.push(`tombstone ${stone.id} approval trailer id mismatch`);
+      } else if (match[2] !== stone.approver) {
+        errors.push(`tombstone ${stone.id} approval trailer approver ${match[2]} != ${stone.approver}`);
+      } else if (!approvers.includes(match[2])) {
+        errors.push(`tombstone ${stone.id} approval trailer signer ${match[2]} is not a trusted human identity`);
       }
       if (!/^[0-9a-f]{40}$/.test(approval.commit)) {
         errors.push(`tombstone ${stone.id} approval.commit must be a full 40-hex SHA`);
+      } else if (!commitExists(root, approval.commit)) {
+        errors.push(`tombstone ${stone.id} approval.commit ${approval.commit} is not a real commit`);
       }
       if (!input.skipGit && approval.commit) {
         try {

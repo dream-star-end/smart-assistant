@@ -238,6 +238,7 @@ describe("adversarial identity", () => {
     assert.throws(
       () => assertFlavorIdentity({
         manifestPath: writeFixture("valid-selfhost.json"),
+        hostname: "not-a-flavor-host",
         installRoot: "/opt/openclaude/openclaude-v5-selfhost",
         dockerenv: false,
         env: { OC_FLAVOR_HOSTNAME: "v3-dev-sg" },
@@ -255,6 +256,22 @@ describe("adversarial identity", () => {
         installRoot: "/opt/openclaude/openclaude-v5",
         dockerenv: false,
         generation: 1,
+      }),
+      /guardGeneration/,
+    );
+  });
+
+  test("B2: commercial .complete generation fail-closes stripped manifest", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "flavor-complete-gen-"));
+    writeFileSync(path.join(dir, ".complete"), JSON.stringify({
+      schemaVersion: 2,
+      flavorGuardGeneration: 1,
+    }));
+    assert.throws(
+      () => assertFlavorIdentity({
+        installRoot: dir,
+        hostname: "kl-mirror",
+        dockerenv: false,
       }),
       /guardGeneration/,
     );

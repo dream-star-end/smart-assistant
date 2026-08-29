@@ -353,23 +353,56 @@ assert_allows() {
   return 0
 }
 
+flavor_realpath() {
+  local p="${1:-}"
+  [[ -n "$p" && -e "$p" ]] || return 1
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -e "$p" 2>/dev/null || return 1
+    return 0
+  fi
+  readlink -f "$p" 2>/dev/null || return 1
+}
+
+# Mint is allowed only when a BASH_SOURCE frame realpath-equals one of the two
+# official builder scripts next to this helper (scripts/deploy-v5.sh or
+# scripts/deploy-v5-selfhost.sh). Same-basename copies under /tmp are refused.
+flavor_official_builder_path() {
+  local name="${1:-}" here scripts candidate
+  [[ "$name" == "deploy-v5.sh" || "$name" == "deploy-v5-selfhost.sh" ]] || return 1
+  here="$(flavor_here)" || return 1
+  [[ "$(basename "$here")" == "lib" ]] || return 1
+  scripts="$(cd "$here/.." && pwd)" || return 1
+  [[ "$(basename "$scripts")" == "scripts" ]] || return 1
+  candidate="$scripts/$name"
+  [[ -f "$candidate" ]] || return 1
+  flavor_realpath "$candidate"
+}
+
 flavor_writer_caller() {
-  local i base
-  for ((i=${#BASH_SOURCE[@]}-1; i>=0; i--)); do
-    base="$(basename "${BASH_SOURCE[$i]}")"
-    case "$base" in
-      deploy-v5.sh|deploy-v5-selfhost.sh) printf '%s' "$base"; return 0 ;;
-    esac
+  local i caller official_selfhost official_commercial
+  official_selfhost="$(flavor_official_builder_path deploy-v5-selfhost.sh || true)"
+  official_commercial="$(flavor_official_builder_path deploy-v5.sh || true)"
+  for ((i=1; i<${#BASH_SOURCE[@]}; i++)); do
+    caller="$(flavor_realpath "${BASH_SOURCE[$i]}" 2>/dev/null || true)"
+    [[ -n "$caller" ]] || continue
+    if [[ -n "$official_selfhost" && "$caller" == "$official_selfhost" ]]; then
+      printf '%s' "deploy-v5-selfhost.sh"
+      return 0
+    fi
+    if [[ -n "$official_commercial" && "$caller" == "$official_commercial" ]]; then
+      printf '%s' "deploy-v5.sh"
+      return 0
+    fi
   done
-  basename "${0##*/}"
+  return 1
 }
 
 write_flavor_manifest() {
   local dest="${1:-}" flavor="${2:-}" commit="${3:-}"
   [[ -n "$dest" && -n "$flavor" && -n "$commit" ]] \
     || flavor_die "write_flavor_manifest <dest-dir> <flavor> <sourceCommit>"
-  local caller
-  caller="$(flavor_writer_caller)"
+  local caller=""
+  caller="$(flavor_writer_caller || true)"
   if [[ "$caller" == "deploy-v5.sh" && "$flavor" != "commercial" ]]; then
     flavor_die "cross-write refused: $caller cannot write flavor=${flavor}"
     return 1
@@ -379,7 +412,7 @@ write_flavor_manifest() {
     return 1
   fi
   if [[ "$caller" != "deploy-v5.sh" && "$caller" != "deploy-v5-selfhost.sh" ]]; then
-    flavor_die "write_flavor_manifest is builder-only (caller=$caller)"
+    flavor_die "write_flavor_manifest is builder-only (caller=${caller:-unofficial})"
     return 1
   fi
   local builder hosts roots dbs
@@ -417,6 +450,21 @@ write_flavor_manifest() {
   echo "[flavor-identity] wrote $dest/${FLAVOR_MANIFEST_NAME} flavor=${flavor}" >&2
 }
 
+# Probe execution failure is fail-closed. A command that exists but exits
+# nonzero is not treated as "no match" / empty state.
+flavor_run_probe() {
+  local label="${1:-probe}"
+  shift || true
+  local out rc=0
+  out="$("$@" 2>/dev/null)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    flavor_die "commercial cutover: ${label} probe failed (rc=${rc})"
+    return 1
+  fi
+  printf '%s' "$out"
+  return 0
+}
+
 assert_commercial_cutover() {
   flavor_parse_args "$@" || return 1
   local candidate="${FLAVOR_ARG_ROOT:-${PWD}}"
@@ -431,7 +479,11 @@ assert_commercial_cutover() {
     echo "[flavor-identity] cutover skip: no ${FLAVOR_MANIFEST_NAME} in ${candidate}" >&2
     return 0
   fi
-  assert_flavor_identity --manifest "$manifest" --root "${FLAVOR_ARG_ROOT:-/opt/openclaude/openclaude-v5}" \
+  local identity_root="/opt/openclaude/openclaude-v5"
+  case "${FLAVOR_ARG_ROOT:-}" in
+    /opt/openclaude/openclaude-v5-b|/opt/openclaude/openclaude-v5-b/*) identity_root="/opt/openclaude/openclaude-v5-b" ;;
+  esac
+  assert_flavor_identity --manifest "$manifest" --root "$identity_root" \
     --hostname "${FLAVOR_ARG_HOSTNAME:-$(hostname)}" --generation "${generation:-1}" --required \
     || return 1
   if [[ "${FLAVOR_RESOLVED:-}" != "commercial" ]]; then
@@ -460,10 +512,10 @@ assert_commercial_cutover() {
     flavor_die "commercial cutover: iptables/nft missing"
     return 1
   fi
-  local fragment state active
-  fragment="$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null || true)"
-  state="$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null || true)"
-  active="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
+  local fragment state active ss_out ipt_out nft_out
+  fragment="$(flavor_run_probe systemctl systemctl show -p FragmentPath --value "$unit")" || return 1
+  state="$(flavor_run_probe systemctl systemctl show -p UnitFileState --value "$unit")" || return 1
+  active="$(flavor_run_probe systemctl systemctl show -p ActiveState --value "$unit")" || return 1
   if [[ -n "$fragment" && "$fragment" != "" ]]; then
     flavor_die "commercial cutover: ${unit} is installed (FragmentPath=$fragment)"
     return 1
@@ -478,18 +530,21 @@ assert_commercial_cutover() {
       flavor_die "commercial cutover: ${unit} ActiveState=$active"
       return 1 ;;
   esac
-  if ss -ltn 2>/dev/null | grep -Eq '(:18992)\b'; then
+  ss_out="$(flavor_run_probe ss ss -ltn)" || return 1
+  if grep -Eq '(:18992)\b' <<<"$ss_out"; then
     flavor_die "commercial cutover: 18992 is listening"
     return 1
   fi
   if command -v iptables >/dev/null 2>&1; then
-    if iptables -S 2>/dev/null | grep -Eiq '18992'; then
+    ipt_out="$(flavor_run_probe iptables iptables -S)" || return 1
+    if grep -Eiq '18992' <<<"$ipt_out"; then
       flavor_die "commercial cutover: iptables mentions 18992"
       return 1
     fi
   fi
   if command -v nft >/dev/null 2>&1; then
-    if nft list ruleset 2>/dev/null | grep -Eiq '18992'; then
+    nft_out="$(flavor_run_probe nft nft list ruleset)" || return 1
+    if grep -Eiq '18992' <<<"$nft_out"; then
       flavor_die "commercial cutover: nft mentions 18992"
       return 1
     fi
