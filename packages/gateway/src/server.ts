@@ -11619,8 +11619,8 @@ export class Gateway {
           const ok = this._delegateJobs?.casHeartbeat(jobId, tok, epoch)
           if (!ok) {
             clearInterval(timer)
-            // Local `sessionKey` is the resolved child key (`input.sessionKey ?? generated`).
-            // `input.sessionKey` itself is optional and must not be passed to interrupt().
+            // Child key is local `sessionKey` (`input.sessionKey ?? generated`).
+            // `input.sessionKey` is optional and must not be passed to interrupt().
             if (!sessionKey) {
               this.log.warn('delegate_lease_fence_lost', {
                 jobId,
@@ -11629,14 +11629,6 @@ export class Gateway {
               return
             }
             try {
-              if (typeof this.sessions.interrupt !== 'function') {
-                this.log.warn('delegate_lease_fence_lost', {
-                  jobId,
-                  sessionKey,
-                  reason: 'casHeartbeat failed; sessions.interrupt unavailable',
-                })
-                return
-              }
               const interrupted = this.sessions.interrupt(sessionKey)
               if (!interrupted) {
                 this.log.warn('delegate_lease_fence_lost', {
@@ -11646,11 +11638,11 @@ export class Gateway {
                 })
               }
             } catch (err) {
-              this.log.warn('delegate_lease_fence_interrupt_failed', {
-                jobId,
-                sessionKey,
-                err: String(err),
-              })
+              this.log.warn(
+                'delegate_lease_fence_interrupt_failed',
+                { jobId, sessionKey },
+                err,
+              )
             }
           }
         }, 15_000)
