@@ -42,7 +42,7 @@ describe("DesktopTunnelRegistry", () => {
       }
     });
     const reg = createMemoryDesktopTunnelRegistry();
-    await assert.rejects(() => reg.http(1, "GET", "/", {}, null, 500));
+    assert.throws(() => { void reg.http(1, "GET", "/", {}, null, 500); }, /not attached/);
     reg.attach(1, { mux, close: () => {} }, {
       deviceId: "d1", uid: 1, expiresAt: new Date(Date.now() + 60_000),
     });
