@@ -134,7 +134,8 @@
     "0250_ccb_egress_region_one_proxy",
     "0251_cursor_sand_mode",
     "0252_grok_route_context_kind",
-    "0253_active_claude_proxy_uniqueness"
+    "0253_active_claude_proxy_uniqueness",
+    "0254_agent_audit_error_msg"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

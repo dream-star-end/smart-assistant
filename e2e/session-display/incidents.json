@@ -1970,6 +1970,48 @@
           "assertion": "oc_hotcfg_build_ccb_dist"
         }
       ]
+    },
+    {
+      "id": "INC-20260829-FAIL-LOUD-ERROR-MSG",
+      "occurredAt": "2026-08-29",
+      "severity": "P1",
+      "symptom": "gateway 上报的 tool-failure error_msg 被四层抹成 NULL/空串，admin 审计与 product_friction 无法定位真实失败；显式未知 --model 在 flag 关路径被映射成 HTTP 500 并 inherit 默认模型。根治：v5 只持久化 allowlist/哨兵 error_msg（≤240 code point）、三新 class 投影到 v4 other、0254 扩 CHECK+privacy_guard、未知型号 400 DELEGATE_MODEL_UNKNOWN。",
+      "rootFixCommit": "2491a190",
+      "coverageCommits": [
+        "1eae3d23"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/v3ToolFailureReporter.test.ts",
+          "assertion": "v5 wire carries redactedReason for Bearer/dump and drops it in v4Projection"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityLocalPath.test.ts",
+          "assertion": "explicit unknown slug is DELEGATE_MODEL_UNKNOWN and does not inherit"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateAsyncJobs.test.ts",
+          "assertion": "flag-off explicit unknown model returns 400 DELEGATE_MODEL_UNKNOWN"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalToolFailureAudit.test.ts",
+          "assertion": "v5 reporter→master keeps redacted_reason for Bearer/dump/uncertain"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/migration0254.integ.test.ts",
+          "assertion": "0254_agent_audit_error_msg"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "requiredMigrations mismatch; expected="
+        }
+      ]
     }
   ]
 }
