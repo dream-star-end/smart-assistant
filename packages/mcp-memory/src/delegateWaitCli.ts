@@ -155,12 +155,23 @@ export async function runDelegateWaitLoop(opts: {
   }
 
   const formatted = formatCollected(unique, results)
-  const failed = unique.some((id) => results.get(id)?.kind === 'error')
   return {
-    exitCode: failed ? 2 : 0,
+    exitCode: delegateWaitExitCode({ pendingCount: 0, results: unique.map((id) => results.get(id)) }),
     stdout: formatted.endsWith('\n') ? formatted : `${formatted}\n`,
     stderr: '',
   }
+}
+
+/** exit != 0 ⇒ no job still running. Partial fanout failure with live jobs is exit 0. */
+export function delegateWaitExitCode(opts: {
+  pendingCount: number
+  results: Iterable<FormattedDelegateResult | undefined>
+}): number {
+  if (opts.pendingCount > 0) return 0
+  for (const r of opts.results) {
+    if (r?.kind === 'error') return 2
+  }
+  return 0
 }
 
 function formatForegroundBudgetElapsed(
@@ -188,7 +199,14 @@ function formatForegroundBudgetElapsed(
     '请立即继续下一段前台等待,不要重新委派,不要使用 Cursor TaskOutput:',
     `  oc-memory delegate-wait ${pendingIds.join(' ')}`,
   )
-  return { exitCode: 0, stdout: `${lines.join('\n')}\n`, stderr: '' }
+  return {
+    exitCode: delegateWaitExitCode({
+      pendingCount: pendingIds.length,
+      results: jobIds.map((id) => results.get(id)),
+    }),
+    stdout: `${lines.join('\n')}\n`,
+    stderr: '',
+  }
 }
 
 function formatCollected(

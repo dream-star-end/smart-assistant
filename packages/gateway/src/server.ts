@@ -75,6 +75,17 @@ import {
   isLiveUnitsEnabled,
   type PromptQueueMutationFrame,
 } from '@openclaude/protocol'
+import {
+  failureClassFromLocalExecutionCode,
+  isDelegateTerminalState,
+  type DelegateFailureClass,
+} from '../../protocol/src/delegation.js'
+import {
+  delegateConcurrencyCap,
+  formatDelegateConcurrencyReject,
+  getDelegateMaxConcurrent,
+  getDelegateReviewReservedSlots,
+} from './delegateCapacity.js'
 
 const CONTROL_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
 const isControlId = (value: unknown): value is string =>
@@ -369,7 +380,13 @@ import {
   resolveDelegateWaitMs,
   type DelegateJobHttpResult,
 } from './delegateJobs.js'
-import { DelegateResumeRegistry } from './delegateResume.js'
+import { DelegateResumeRegistry, DELEGATE_RESUME_OCCUPIED_MESSAGE } from './delegateResume.js'
+import { isDelegateSmEnabled, resolveDelegateCallbackOwner } from './delegateSmFlag.js'
+import {
+  delegateCallbackMessageId,
+  persistDelegateJobSnapshots,
+  restoreDelegateJobSnapshots,
+} from './delegateCompleter.js'
 import { isPlatformAgentId, parseDelegateAllowSelf, parseDelegateModel, rejectSelfDelegate } from './delegateModel.js'
 import { EMPTY_COMPLETED_TURN_NOTICE, hasPlatedAssistantOutput } from './emptyCompletedTurn.js'
 import {
@@ -1706,17 +1723,19 @@ const DELEGATE_SUBMIT_SETTLE_DEFAULT_MS = 15_000
  *  "排队"本身堆成第二波雪崩;超出直接按原闸形状立即拒。 */
 export const DELEGATE_QUEUE_MAX_WAITERS = 8
 
-/** Default global concurrent-delegation cap. Env OPENCLAUDE_DELEGATE_MAX_CONCURRENT overrides. */
-const MAX_CONCURRENT_DELEGATIONS = 5
-/** Default review reserved slots. Env OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS overrides. */
-const DELEGATE_REVIEW_RESERVED_SLOTS = 1
-
-function parseDelegateEnvInt(name: string, min: number, fallback: number): number {
-  const trimmed = process.env[name]?.trim()
-  if (!trimmed) return fallback
-  const raw = Number(trimmed)
-  if (!Number.isInteger(raw)) return fallback
-  return raw >= min ? raw : fallback
+function parseDelegateIdempotencyKey(
+  body: { idempotencyKey?: unknown; idempotency_key?: unknown },
+  headers: IncomingHttpHeaders,
+): string | undefined {
+  const fromBody =
+    (typeof body.idempotencyKey === 'string' && body.idempotencyKey.trim()) ||
+    (typeof body.idempotency_key === 'string' && body.idempotency_key.trim()) ||
+    ''
+  if (fromBody) return fromBody
+  const header = headers['idempotency-key']
+  const raw = Array.isArray(header) ? header[0] : header
+  if (typeof raw === 'string' && raw.trim()) return raw.trim()
+  return undefined
 }
 
 function parseDelegateQueueWaitMs(): number {
@@ -1821,12 +1840,27 @@ interface RunDelegateInput {
   callbackOriginUserId?: string
   /** Async handle returned to the send_to_agent tool, used as exact UI correlation. */
   backgroundJobId?: string
+  /** Captured at claimQueued; never re-read from the store at terminal. */
+  claimToken?: string
+  fencingEpoch?: number
+  /** SM: slot already reserved at Enqueue, skip the waiter loop. */
+  capacityReserved?: boolean
+  idempotencyKey?: string
+  _leaseTimer?: ReturnType<typeof setInterval>
 }
 /** `_runDelegateTask` 结果。rejected=闸/校验拒(HTTP 壳映射 4xx/429/503);error=session
  *  创建等意外(映射 500);completed=真正执行完(ok/output/error/timedOut,review 还带 verdict)。 */
 type DelegateTaskResult =
-  | { kind: 'rejected'; httpStatus: number; message: string; code?: LocalExecutionRejectCode }
-  | { kind: 'error'; message: string }
+  | {
+      kind: 'rejected'
+      httpStatus: number
+      message: string
+      code?: LocalExecutionRejectCode
+      failureClass?: DelegateFailureClass
+      /** Capacity reject lost the race to claimQueued; job is already dispatched. */
+      alreadyDispatched?: boolean
+    }
+  | { kind: 'error'; message: string; failureClass?: DelegateFailureClass }
   | {
       kind: 'completed'
       ok: boolean
@@ -2543,8 +2577,36 @@ export class Gateway {
     }
 
     try {
-      const summary = await recoverInterruptedSendToAgentIntents((intent) =>
-        this._deliverInterruptedSendToAgentIntent(intent),
+      if (isDelegateSmEnabled()) {
+        this._delegateJobs ??= new DelegateJobStore({
+          ttlMs: resolveDelegateJobTtlMs(),
+          sm: true,
+        })
+        await restoreDelegateJobSnapshots(this._delegateJobs)
+      }
+      const summary = await recoverInterruptedSendToAgentIntents(
+        (intent) => this._deliverInterruptedSendToAgentIntent(intent),
+        process.env,
+        {
+          callbackOwner: resolveDelegateCallbackOwner(),
+          resolveJob: (jobId) => this._delegateJobs?.snapshotOf(jobId),
+          ensureCallback: async (job, intent) => {
+            const epoch = job.callbackEpoch || 1
+            const result = await this.injectSendToAgentCallback({
+              parentSessionKey: intent.originSessionKey,
+              jobId: intent.jobId,
+              agentId: intent.agentId,
+              goal: intent.goal,
+              userId: intent.userId,
+              clientMessageId: delegateCallbackMessageId(intent.jobId, epoch),
+            })
+            if (result.kind === 'injected') {
+              this._delegateJobs?.patchCallbackState(intent.jobId, 'delivered')
+              return true
+            }
+            return false
+          },
+        },
       )
       if (summary.recovered > 0 || summary.retained > 0 || summary.malformed > 0) {
         this.log.info('send_to_agent intent recovery', summary)
@@ -2904,6 +2966,13 @@ export class Gateway {
     this.cron.lastActiveChannel = this.lastActiveChannel
     this.cron.getRegisteredDeliverChannels = () => this.channels.keys()
     this.cron.start().catch((err) => this.log.error('cron start failed', undefined, err))
+    if (isDelegateSmEnabled()) {
+      this._delegateJobs ??= new DelegateJobStore({
+        ttlMs: resolveDelegateJobTtlMs(),
+        sm: true,
+      })
+      this.cron.delegateJobs = this._delegateJobs
+    }
 
     // Start event persistence (writes all events to SQLite event_log)
     startEventPersistence()
@@ -10371,32 +10440,18 @@ export class Gateway {
 
   /** Active delegation count for recursion/concurrency limits */
   private _activeDelegations = 0
-  /** Global concurrent cap. Reads OPENCLAUDE_DELEGATE_MAX_CONCURRENT at call
-   *  time (finite int ≥1); illegal/unset → MAX_CONCURRENT_DELEGATIONS (5). */
+  /** Global concurrent cap. Thin wrapper over delegateCapacity.ts so env knobs
+   *  stay call-time and server.ts does not hold a second copy of the literals. */
   private static get MAX_CONCURRENT_DELEGATIONS(): number {
-    return parseDelegateEnvInt(
-      'OPENCLAUDE_DELEGATE_MAX_CONCURRENT',
-      1,
-      MAX_CONCURRENT_DELEGATIONS,
-    )
+    return getDelegateMaxConcurrent()
   }
-  /** P2 债C/3.5 — 硬编排 review 保留槽:非 review 委派最多用到
-   *  (MAX_CONCURRENT_DELEGATIONS − 保留槽),给质量审查留位,消 cron/他会话把并发占满
-   *  导致队长的 review delegate 拿不到槽而降级放行。review 委派本身可用满全局上限。
-   *  env OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS(整数 ≥0,非法/缺省 → 1);
-   *  clamp 到 max−1,保证普通委派永远至少 1 槽。 */
+  /** P2 债C/3.5 — 硬编排 review 保留槽. Source + env overlay: delegateCapacity.ts. */
   private static get DELEGATE_REVIEW_RESERVED_SLOTS(): number {
-    const parsed = parseDelegateEnvInt(
-      'OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS',
-      0,
-      DELEGATE_REVIEW_RESERVED_SLOTS,
-    )
-    const max = Gateway.MAX_CONCURRENT_DELEGATIONS
-    return Math.min(parsed, Math.max(0, max - 1))
+    return getDelegateReviewReservedSlots()
   }
   /** P2 债C/3.5 — 单父会话(队长)并行 fan-out 上限。非 review 委派按父分桶计数,
-   *  超上限进排队;review 委派豁免此桶(有独立保留槽)。消"一个队长把 5 个全局槽占光"。
-   *  env 可配(下限 1)。 */
+   *  超上限进排队;review 委派豁免此桶(有独立保留槽)。消"一个队长把全局槽占光"。
+   *  env 可配(下限 1)。全局上限与 review 保留槽见 delegateCapacity.ts。 */
   private static get MAX_CONCURRENT_DELEGATIONS_PER_PARENT(): number {
     const raw = Number(process.env.OPENCLAUDE_DELEGATE_MAX_PER_PARENT)
     return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 3
@@ -10427,6 +10482,8 @@ export class Gateway {
   private _delegateQueueWaiters: Map<string, () => void> | undefined
   /** 排队复查间隔;测试覆写加速,生产走 DELEGATE_QUEUE_POLL_DEFAULT_MS。 */
   private _delegateQueuePollMs: number | undefined
+  /** SM queue wait clock; tests inject a fake monotonic source. */
+  private _delegateMonotonicMs: (() => number) | undefined
   /** Cursor MCP 60s 上限的异步委派作业句柄。测试脚手架 Object.create 不跑字段
    *  初始化,使用处惰性 ??=。 */
   private _delegateJobs: DelegateJobStore | undefined
@@ -10463,9 +10520,7 @@ export class Gateway {
     isReview?: boolean
   }): DelegateGateBlock | null {
     const isReview = opts?.isReview === true
-    const globalCap = isReview
-      ? Gateway.MAX_CONCURRENT_DELEGATIONS
-      : Gateway.MAX_CONCURRENT_DELEGATIONS - Gateway.DELEGATE_REVIEW_RESERVED_SLOTS
+    const globalCap = delegateConcurrencyCap(isReview)
     if (this._activeDelegations >= globalCap) {
       return { kind: 'concurrency' }
     }
@@ -10551,17 +10606,21 @@ export class Gateway {
     const first = this._tryReserveDelegateSlot(reserveOpts)
     if (!first) return { status: 'ok' }
     const waiters = (this._delegateQueueWaiters ??= new Map())
-    if (waiters.size >= DELEGATE_QUEUE_MAX_WAITERS) {
+    const preAdmitted = waiters.has(args.sessionKey)
+    if (!preAdmitted && waiters.size >= DELEGATE_QUEUE_MAX_WAITERS) {
       return { status: 'queue_full', blocked: first }
     }
     const waitBudgetMs = parseDelegateQueueWaitMs()
     const pollMs = Math.max(1, this._delegateQueuePollMs ?? DELEGATE_QUEUE_POLL_DEFAULT_MS)
-    const startedAt = Date.now()
+    const clock = this._delegateMonotonicMs ?? (() => Number(process.hrtime.bigint() / 1_000_000n))
+    const startedAt = clock()
     let aborted = false
     let wake: (() => void) | null = null
+    const prevAbort = waiters.get(args.sessionKey)
     waiters.set(args.sessionKey, () => {
       aborted = true
       wake?.()
+      prevAbort?.()
     })
     try {
       args.onQueued?.(first)
@@ -10579,17 +10638,108 @@ export class Gateway {
           }
         })
         if (aborted || this._shuttingDown) {
-          return { status: 'aborted', waitedMs: Date.now() - startedAt }
+          return { status: 'aborted', waitedMs: clock() - startedAt }
         }
         const blocked = this._tryReserveDelegateSlot(reserveOpts)
         if (!blocked) return { status: 'ok' }
         lastBlocked = blocked
-        if (Date.now() - startedAt >= waitBudgetMs) {
-          return { status: 'timeout', blocked: lastBlocked, waitedMs: Date.now() - startedAt }
+        if (clock() - startedAt >= waitBudgetMs) {
+          return { status: 'timeout', blocked: lastBlocked, waitedMs: clock() - startedAt }
         }
       }
     } finally {
       waiters.delete(args.sessionKey)
+    }
+  }
+
+  /**
+   * SM: admit Enqueue and job create in one synchronous step.
+   * 'slot' = already reserved a running slot; 'wait' = reserved a waiter; 'full' = no row.
+   */
+  private _admitDelegateCreate(
+    sessionKey: string,
+    opts: { parentBucketKey?: string; isReview?: boolean },
+  ): 'slot' | 'wait' | 'full' {
+    const blocked = this._tryReserveDelegateSlot(opts)
+    if (!blocked) return 'slot'
+    const waiters = (this._delegateQueueWaiters ??= new Map())
+    if (waiters.size >= DELEGATE_QUEUE_MAX_WAITERS) return 'full'
+    waiters.set(sessionKey, () => {})
+    return 'wait'
+  }
+
+  private _formatDelegateConcurrencyReject(opts: {
+    isReview: boolean
+    parentBucketKey?: string
+    waitedS?: number
+    queueFull?: boolean
+  }): string {
+    const perParentMax = Gateway.MAX_CONCURRENT_DELEGATIONS_PER_PARENT
+    const perParentInUse =
+      !opts.isReview && opts.parentBucketKey
+        ? (this._runningDelegationsByParent ??= new Map()).get(opts.parentBucketKey) ?? 0
+        : undefined
+    return formatDelegateConcurrencyReject({
+      isReview: opts.isReview,
+      inUse: this._activeDelegations,
+      perParentInUse,
+      perParentMax,
+      waitedS: opts.waitedS,
+      queueFull: opts.queueFull,
+      queueMaxWaiters: DELEGATE_QUEUE_MAX_WAITERS,
+    })
+  }
+
+  /**
+   * Capacity reject must not leave an executable job, and must not fail a job
+   * that already lost the race to claimQueued. Single-threaded Map ops make
+   * settle vs claim exclusive; this just chooses drop / fail / already-dispatched
+   * on the production write path (not later in the async `.then`).
+   */
+  private _applyDelegateCapacityReject(
+    input: RunDelegateInput,
+    args: {
+      httpStatus: number
+      message: string
+      failureClass?: DelegateFailureClass
+      drop: boolean
+    },
+  ): DelegateTaskResult {
+    const jobId = input.backgroundJobId
+    const store = this._delegateJobs
+    if (jobId && store) {
+      if (store.smEnabled) {
+        const outcome = store.settleCapacityReject(jobId, {
+          failureClass: args.failureClass ?? 'capacity_timeout',
+          detail: args.message,
+          httpStatus: args.httpStatus,
+          drop: args.drop,
+          nextState: args.failureClass === 'cancelled' ? 'cancelled' : 'failed',
+        })
+        if (outcome === 'claimed') {
+          return {
+            kind: 'rejected',
+            httpStatus: args.httpStatus,
+            message: args.message,
+            failureClass: args.failureClass,
+            alreadyDispatched: true,
+          }
+        }
+      } else {
+        store.complete(jobId, {
+          httpStatus: args.httpStatus,
+          body: {
+            error: args.message,
+            ...(args.failureClass ? { failure_class: args.failureClass } : {}),
+          },
+        })
+      }
+    }
+    return {
+      kind: 'rejected',
+      httpStatus: args.httpStatus,
+      message: args.message,
+      failureClass: args.failureClass,
     }
   }
 
@@ -10834,15 +10984,30 @@ export class Gateway {
     if (!selfCheck.ok) return this.sendError(res, 400, selfCheck.error)
     // 同步 preflight:mint/resume/占用必须在任何 await 和创建 async job 之前完成,
     // 这样 running 响应已经带着权威 sessionKey,并发 resume 也能立刻 409。
+    // 拒绝路径不得产生副作用（不 create job、不 spawn、不 persist intent）。
+    const idempotencyKey = parseDelegateIdempotencyKey(parsed, req.headers)
     const resume = (this._delegateResume ??= new DelegateResumeRegistry()).preflight({
       resumeSessionKey: parsed.resumeSessionKey,
       parentSessionKey,
       targetAgentId,
       sourceAgent: sourceAgentId || 'system',
+      idempotencyKey,
     })
     this._forgetEvictedDelegateResumes(resume.evictedKeys)
     if (!resume.ok) {
       return this.sendError(res, resume.httpStatus, resume.message)
+    }
+    if (resume.replay && !resume.dispatchGranted) {
+      const existing = resume.jobId ? this._delegateJobs?.snapshotOf(resume.jobId) : undefined
+      if (existing) {
+        return this.sendJson(res, 200, {
+          status: isDelegateSmEnabled() && existing.state === 'queued' ? 'queued' : 'running',
+          jobId: existing.id,
+          agentId: targetAgentId,
+          sessionKey: resume.sessionKey,
+        })
+      }
+      return this.sendError(res, 409, DELEGATE_RESUME_OCCUPIED_MESSAGE)
     }
     const callbackOnComplete = isSendToAgentCallbackComplete(parsed.callbackOnComplete)
       ? 'origin-inject' as const
@@ -10867,20 +11032,63 @@ export class Gateway {
       callbackOnComplete,
       callbackOriginSessionKey: callbackTarget?.sessionKey,
       callbackOriginUserId: callbackTarget?.userId,
+      idempotencyKey,
     }
     // 默认同步:行为与改前完全一致(CCB/Codex 继续堵在 HTTP 上)。仅 `async: true`
     // 才切作业句柄 —— 子任务仍走同一条 _runDelegateTask(idle/hard/祖先活性/深度/并发闸全在)。
     if (parsed.async === true) {
+      const sm = isDelegateSmEnabled()
       const store = (this._delegateJobs ??= new DelegateJobStore({
         ttlMs: resolveDelegateJobTtlMs(),
+        sm,
       }))
-      const created = store.create(targetAgentId, { sessionKey: resume.sessionKey })
+      const slotOpts = {
+        parentBucketKey: parentSessionKey,
+        isReview: isHiddenSystemAgentId(targetAgentId),
+      }
+      if (sm) {
+        const admit = this._admitDelegateCreate(resume.sessionKey, slotOpts)
+        if (admit === 'full') {
+          this._delegateResume.abort(resume.sessionKey, resume.minted)
+          return this.sendJson(res, 429, {
+            error: this._formatDelegateConcurrencyReject({
+              isReview: slotOpts.isReview,
+              parentBucketKey: slotOpts.parentBucketKey,
+              queueFull: true,
+            }),
+            failure_class: 'capacity_queue_full',
+          })
+        }
+        runInput.capacityReserved = admit === 'slot'
+      }
+      const created = store.create(targetAgentId, {
+        sessionKey: resume.sessionKey,
+        queued: sm,
+        kind: callbackOnComplete ? 'send_to_agent' : 'delegate',
+        callback: callbackOnComplete ? 'origin-inject' : 'stdout-wait',
+        idempotencyKey: sm ? idempotencyKey : undefined,
+      })
       if ('error' in created) {
         this._delegateResume.abort(resume.sessionKey, resume.minted)
+        if (sm && runInput.capacityReserved) this._releaseDelegateSlot(slotOpts)
+        if (sm) this._delegateQueueWaiters?.delete(resume.sessionKey)
         return this.sendError(res, 503, 'too many in-flight delegate jobs')
+      }
+      if (created.reused) {
+        this._delegateResume.bindJob(resume.sessionKey, idempotencyKey, created.jobId)
+        if (sm && runInput.capacityReserved) this._releaseDelegateSlot(slotOpts)
+        if (sm) this._delegateQueueWaiters?.delete(resume.sessionKey)
+        const existing = store.snapshotOf(created.jobId)
+        return this.sendJson(res, 200, {
+          status: existing?.state === 'queued' ? 'queued' : 'running',
+          jobId: created.jobId,
+          agentId: targetAgentId,
+          sessionKey: resume.sessionKey,
+        })
       }
       const jobId = created.jobId
       runInput.backgroundJobId = jobId
+      this._delegateResume.bindJob(resume.sessionKey, idempotencyKey, jobId)
       if (callbackOnComplete && callbackTarget) {
         const intent: SendToAgentIntent = {
           v: 1,
@@ -10908,7 +11116,34 @@ export class Gateway {
       }
       void this._runDelegateTask(runInput)
         .then((result) => {
-          store.complete(jobId, this._delegateResultToHttp(result, targetAgentId))
+          if (runInput._leaseTimer) clearInterval(runInput._leaseTimer)
+          const mapped = this._delegateResultToHttp(result, targetAgentId)
+          const fence =
+            runInput.claimToken && runInput.fencingEpoch !== undefined
+              ? { claimToken: runInput.claimToken, fencingEpoch: runInput.fencingEpoch }
+              : undefined
+          if (result.kind === 'rejected' && result.alreadyDispatched) {
+            return
+          }
+          if (sm && result.kind === 'rejected' && result.failureClass) {
+            const dropped =
+              result.failureClass === 'capacity_queue_full' && store.dropIfUnclaimed(jobId)
+            if (!dropped) {
+              store.fail(jobId, {
+                failureClass: result.failureClass,
+                detail: result.message,
+                httpStatus: mapped.httpStatus,
+                body: mapped.body,
+                claimToken: fence?.claimToken,
+                fencingEpoch: fence?.fencingEpoch,
+                nextState: result.failureClass === 'cancelled' ? 'cancelled' : 'failed',
+              })
+            }
+          } else if (sm) {
+            store.complete(jobId, mapped, fence)
+          } else {
+            store.complete(jobId, mapped)
+          }
           const output = result.kind === 'completed' ? result.output : ''
           const error =
             result.kind === 'rejected' || result.kind === 'error'
@@ -10925,11 +11160,14 @@ export class Gateway {
           })
         })
         .catch((err) => {
+          if (runInput._leaseTimer) clearInterval(runInput._leaseTimer)
           const message = (err as Error)?.message ?? String(err)
-          store.complete(jobId, {
-            httpStatus: 500,
-            body: { error: message },
-          })
+          const fence =
+            runInput.claimToken && runInput.fencingEpoch !== undefined
+              ? { claimToken: runInput.claimToken, fencingEpoch: runInput.fencingEpoch }
+              : undefined
+          if (sm) store.complete(jobId, { httpStatus: 500, body: { error: message } }, fence)
+          else store.complete(jobId, { httpStatus: 500, body: { error: message } })
           this._queueSendToAgentCallback(runInput, {
             jobId,
             agentId: targetAgentId,
@@ -10954,15 +11192,26 @@ export class Gateway {
     targetAgentId: string,
   ): DelegateJobHttpResult {
     if (result.kind === 'rejected') {
+      const failureClass =
+        result.failureClass ??
+        (result.code ? failureClassFromLocalExecutionCode(result.code) : undefined)
       return {
         httpStatus: result.httpStatus,
-        body: result.code
-          ? { error: result.message, code: result.code }
-          : { error: result.message },
+        body: {
+          error: result.message,
+          ...(result.code ? { code: result.code } : {}),
+          ...(failureClass ? { failure_class: failureClass } : {}),
+        },
       }
     }
     if (result.kind === 'error') {
-      return { httpStatus: 500, body: { error: result.message } }
+      return {
+        httpStatus: 500,
+        body: {
+          error: result.message,
+          ...(result.failureClass ? { failure_class: result.failureClass } : {}),
+        },
+      }
     }
     return {
       httpStatus: 200,
@@ -11000,6 +11249,15 @@ export class Gateway {
         status: 'expired',
         jobId,
         error: 'delegate job not found or expired',
+        ...(view.failure_class ? { failure_class: view.failure_class } : {}),
+      })
+    }
+    if (view.status === 'queued') {
+      return this.sendJson(res, 200, {
+        status: 'queued',
+        jobId,
+        state: 'queued',
+        ...(view.sessionKey ? { sessionKey: view.sessionKey } : {}),
       })
     }
     if (view.status === 'running') {
@@ -11007,6 +11265,18 @@ export class Gateway {
         status: 'running',
         jobId,
         ...(view.sessionKey ? { sessionKey: view.sessionKey } : {}),
+      })
+    }
+    if (view.status === 'failed') {
+      const capacity = view.failure_class === 'capacity_timeout' || view.failure_class === 'capacity_queue_full'
+      return this.sendJson(res, capacity ? 429 : 200, {
+        ...view.body,
+        status: 'failed',
+        jobId,
+        httpStatus: view.httpStatus,
+        failure_class: view.failure_class,
+        failure_detail: view.failure_detail,
+        state: view.state,
       })
     }
     return this.sendJson(res, 200, {
@@ -11081,6 +11351,7 @@ export class Gateway {
       }
       return result
     } finally {
+      if (input._leaseTimer) clearInterval(input._leaseTimer)
       await this._completeDelegateResumeClaim(input, sessionSpawned)
     }
   }
@@ -11338,7 +11609,9 @@ export class Gateway {
       sessionKey,
     )
     let queuedNoticeSent = false
-    const gate = await this._waitForDelegateCapacity({
+    const gate = input.capacityReserved
+      ? ({ status: 'ok' } as const)
+      : await this._waitForDelegateCapacity({
       sessionKey,
       parentBucketKey,
       isReview,
@@ -11391,11 +11664,12 @@ export class Gateway {
       } else {
         // 与排队机制引入前的并发闸同形:429 + "too many concurrent delegations"。
         httpStatus = 429
-        const base = `too many concurrent delegations (max ${Gateway.MAX_CONCURRENT_DELEGATIONS})`
-        message =
-          gate.status === 'timeout'
-            ? `${base}; 已等待 ${waitedS}s 资源仍紧张,请稍后重试`
-            : `${base}; 排队等待者已满(${DELEGATE_QUEUE_MAX_WAITERS} 个)`
+        message = this._formatDelegateConcurrencyReject({
+          isReview,
+          parentBucketKey,
+          waitedS: gate.status === 'timeout' ? waitedS : undefined,
+          queueFull: gate.status === 'queue_full',
+        })
         this.log.warn('delegate_queue_reject', {
           targetAgentId,
           outcome: gate.status,
@@ -11415,7 +11689,77 @@ export class Gateway {
           }),
         )
       }
-      return { kind: 'rejected', httpStatus, message }
+      let failureClass: DelegateFailureClass | undefined
+      if (gate.status === 'timeout') failureClass = 'capacity_timeout'
+      else if (gate.status === 'queue_full') failureClass = 'capacity_queue_full'
+      else if (gate.status === 'aborted') failureClass = 'cancelled'
+      else failureClass = 'capacity_timeout'
+      return this._applyDelegateCapacityReject(input, {
+        httpStatus,
+        message,
+        failureClass,
+        drop: gate.status === 'queue_full',
+      })
+    }
+    if (isDelegateSmEnabled() && input.backgroundJobId) {
+      const claimed = this._delegateJobs?.claimQueued(input.backgroundJobId)
+      if (!claimed?.ok) {
+        this._releaseDelegateSlot(slotOpts)
+        unregisterDelegation?.()
+        const snap = this._delegateJobs?.snapshotOf(input.backgroundJobId)
+        if (snap && !isDelegateTerminalState(snap.state)) {
+          return {
+            kind: 'rejected',
+            httpStatus: 429,
+            message: 'delegate already claimed',
+            alreadyDispatched: true,
+          }
+        }
+        return {
+          kind: 'rejected',
+          httpStatus: 429,
+          message: snap?.failureDetail || 'delegate job was rejected before claim',
+          failureClass: snap?.failureClass,
+        }
+      }
+      input.claimToken = claimed.claimToken
+      input.fencingEpoch = claimed.fencingEpoch
+      const tok = claimed.claimToken
+      const epoch = claimed.fencingEpoch
+      const jobId = input.backgroundJobId
+      const timer = setInterval(() => {
+        const ok = this._delegateJobs?.casHeartbeat(jobId, tok, epoch)
+        if (!ok) {
+          clearInterval(timer)
+          // Child key is local `sessionKey` (`input.sessionKey ?? generated`).
+          // `input.sessionKey` is optional and must not be passed to interrupt().
+          if (!sessionKey) {
+            this.log.warn('delegate_lease_fence_lost', {
+              jobId,
+              reason: 'casHeartbeat failed; child sessionKey missing',
+            })
+            return
+          }
+          try {
+            const interrupted = this.sessions.interrupt(sessionKey)
+            if (!interrupted) {
+              this.log.warn('delegate_lease_fence_lost', {
+                jobId,
+                sessionKey,
+                reason: 'casHeartbeat failed; child session not interruptible',
+              })
+            }
+          } catch (err) {
+            this.log.warn(
+              'delegate_lease_fence_interrupt_failed',
+              { jobId, sessionKey },
+              err,
+            )
+          }
+        }
+      }, 15_000)
+      timer.unref()
+      input._leaseTimer = timer
     }
     // ── grok delegate turn:向 master 铸造 relay route(与浏览器 turn 同一账号池)──
     // delegate 是容器本地 turn,没有 bridge 注入 __oc_grok_route;不铸 route 则
@@ -12549,9 +12893,38 @@ export class Gateway {
   }
 
   private async _persistInterruptedSendToAgentCallbacks(): Promise<void> {
+    const owner = resolveDelegateCallbackOwner()
+    if (this._delegateJobs) {
+      try {
+        await persistDelegateJobSnapshots(this._delegateJobs)
+      } catch (err) {
+        this.log.warn('delegate job snapshot persist failed', { err: String(err) })
+      }
+    }
     this._activeSendToAgentCallbacks.clear()
-    await recoverInterruptedSendToAgentIntents((intent) =>
-      this._deliverInterruptedSendToAgentIntent(intent),
+    await recoverInterruptedSendToAgentIntents(
+      (intent) => this._deliverInterruptedSendToAgentIntent(intent),
+      process.env,
+      {
+        callbackOwner: owner,
+        resolveJob: (jobId) => this._delegateJobs?.snapshotOf(jobId),
+        ensureCallback: async (job, intent) => {
+          const epoch = job.callbackEpoch || 1
+          const result = await this.injectSendToAgentCallback({
+            parentSessionKey: intent.originSessionKey,
+            jobId: intent.jobId,
+            agentId: intent.agentId,
+            goal: intent.goal,
+            userId: intent.userId,
+            clientMessageId: delegateCallbackMessageId(intent.jobId, epoch),
+          })
+          if (result.kind === 'injected') {
+            this._delegateJobs?.patchCallbackState(intent.jobId, 'delivered')
+            return true
+          }
+          return false
+        },
+      },
     )
   }
 
@@ -12803,6 +13176,16 @@ export class Gateway {
     args: { jobId: string; agentId: string; goal: string; output?: string; error?: string },
   ): void {
     if (runInput.callbackOnComplete !== 'origin-inject') return
+    const owner = resolveDelegateCallbackOwner()
+    const snap = this._delegateJobs?.snapshotOf(args.jobId)
+    const epoch = snap?.callbackEpoch || 1
+    const clientMessageId =
+      owner === 'job' ? delegateCallbackMessageId(args.jobId, epoch) : undefined
+    if (owner === 'job') {
+      this._delegateJobs?.patchCallbackState(args.jobId, 'injecting', runInput.claimToken && runInput.fencingEpoch !== undefined
+        ? { claimToken: runInput.claimToken, fencingEpoch: runInput.fencingEpoch }
+        : undefined)
+    }
     void this.injectSendToAgentCallback({
       parentSessionKey: runInput.callbackOriginSessionKey ?? runInput.parentSessionKey,
       jobId: args.jobId,
@@ -12813,8 +13196,17 @@ export class Gateway {
       userId:
         runInput.callbackOriginUserId ??
         this.sessions.getByKey(runInput.parentSessionKey || '')?.userId,
+      clientMessageId,
     }).then(async (result) => {
-      if (result.kind !== 'injected') return
+      if (result.kind !== 'injected') {
+        if (owner === 'job') {
+          this._delegateJobs?.patchCallbackState(args.jobId, 'pending')
+        }
+        return
+      }
+      if (owner === 'job') {
+        this._delegateJobs?.patchCallbackState(args.jobId, 'delivered')
+      }
       this._activeSendToAgentCallbacks.delete(args.jobId)
       await removeSendToAgentIntent(args.jobId)
     }).catch((err) => {
@@ -12837,6 +13229,7 @@ export class Gateway {
     output?: string
     error?: string
     userId?: string
+    clientMessageId?: string
   }): Promise<CronOriginFireResult> {
     const origin = parseOriginWebchatSessionKey(args.parentSessionKey || '')
     if (!origin) {
@@ -12852,7 +13245,7 @@ export class Gateway {
       output: args.output,
       error: args.error,
     })
-    const clientMessageId = sendToAgentCallbackClientMessageId(args.jobId)
+    const clientMessageId = args.clientMessageId || sendToAgentCallbackClientMessageId(args.jobId)
     return runBoundedOriginInjectBackoff({
       isShuttingDown: () => this._shuttingDown,
       tryOnce: async () => {

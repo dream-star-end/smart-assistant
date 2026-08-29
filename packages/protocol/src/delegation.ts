@@ -1,0 +1,195 @@
+/**
+ * OCV5-22 委派 `failure_class` + 显式状态机契约（phase 0 schema owner）。
+ *
+ * 名字与 version 由本文件冻结；OCV5-17 只做遥测映射/脱敏，不得另起 class 字符串。
+ * 存储落地（SQLite/PG）是阶段 1；阶段 0 先把枚举、合法转移和 DelegationService
+ * 命令形状固化，gateway 内存实现按此表驱动。
+ */
+
+export const DELEGATE_FAILURE_CLASS_VERSION = 1 as const
+
+export const DELEGATE_JOB_STATES = [
+  'queued',
+  'running',
+  'paused_for_cutover',
+  'completed',
+  'failed',
+  'cancelled',
+  'killed_by_cutover',
+] as const
+
+export type DelegateJobState = (typeof DELEGATE_JOB_STATES)[number]
+
+export const DELEGATE_TERMINAL_STATES: readonly DelegateJobState[] = [
+  'completed',
+  'failed',
+  'cancelled',
+  'killed_by_cutover',
+]
+
+export function isDelegateTerminalState(state: string): boolean {
+  return (DELEGATE_TERMINAL_STATES as readonly string[]).includes(state)
+}
+
+export const DELEGATE_FAILURE_CLASSES = [
+  'invalid_model',
+  'unknown_agent',
+  'self_delegate_forbidden',
+  'depth_exceeded',
+  'per_turn_limit',
+  'capacity_timeout',
+  'capacity_queue_full',
+  'idle_timeout',
+  'grok_route_denied',
+  'grok_relay_path',
+  'grok_route_expired',
+  'cutover',
+  'cancelled',
+  'child_error',
+  'transport',
+  'unknown_job',
+  'job_ttl_elapsed',
+  'unsafe_replay',
+  'internal',
+  'invalid_wait_channel',
+] as const
+
+export type DelegateFailureClass = (typeof DELEGATE_FAILURE_CLASSES)[number]
+
+export const DELEGATE_JOB_KINDS = [
+  'delegate',
+  'review',
+  'send_to_agent',
+  'cron',
+  'taskboard',
+  'ccb_local',
+] as const
+
+export type DelegateJobKind = (typeof DELEGATE_JOB_KINDS)[number]
+
+export const DELEGATE_CALLBACKS = [
+  'none',
+  'origin-inject',
+  'stdout-wait',
+  'cron-origin-inject',
+] as const
+
+export type DelegateCallback = (typeof DELEGATE_CALLBACKS)[number]
+
+export const DELEGATE_CALLBACK_STATES = [
+  'none',
+  'pending',
+  'injecting',
+  'delivered',
+  'abandoned',
+  'skipped_silent',
+] as const
+
+export type DelegateCallbackState = (typeof DELEGATE_CALLBACK_STATES)[number]
+
+export const DELEGATE_CHECKPOINT_KINDS = ['none', 'runner_quiesced'] as const
+export type DelegateCheckpointKind = (typeof DELEGATE_CHECKPOINT_KINDS)[number]
+
+export const DELEGATE_CALLBACK_OWNERS = ['job', 'intent'] as const
+export type DelegateCallbackOwner = (typeof DELEGATE_CALLBACK_OWNERS)[number]
+
+/** Legal state transitions from design v2 §2.2. Lease adoption is NOT a transition. */
+export const DELEGATE_LEGAL_TRANSITIONS: ReadonlyArray<readonly [DelegateJobState, DelegateJobState]> = [
+  ['queued', 'running'],
+  ['queued', 'failed'],
+  ['queued', 'killed_by_cutover'],
+  ['queued', 'paused_for_cutover'],
+  ['queued', 'cancelled'],
+  ['running', 'paused_for_cutover'],
+  ['running', 'killed_by_cutover'],
+  ['running', 'completed'],
+  ['running', 'failed'],
+  ['running', 'cancelled'],
+  ['paused_for_cutover', 'running'],
+  ['paused_for_cutover', 'killed_by_cutover'],
+  ['paused_for_cutover', 'cancelled'],
+]
+
+const LEGAL_SET = new Set(DELEGATE_LEGAL_TRANSITIONS.map(([from, to]) => `${from}->${to}`))
+
+export function isLegalDelegateTransition(from: DelegateJobState, to: DelegateJobState): boolean {
+  if (from === to) return false
+  return LEGAL_SET.has(`${from}->${to}`)
+}
+
+export type DelegateTransitionReject = {
+  ok: false
+  from: DelegateJobState
+  to: DelegateJobState
+  reason: 'illegal_transition' | 'already_terminal'
+}
+
+export function assertDelegateTransition(
+  from: DelegateJobState,
+  to: DelegateJobState,
+): { ok: true } | DelegateTransitionReject {
+  if (isDelegateTerminalState(from)) {
+    return { ok: false, from, to, reason: 'already_terminal' }
+  }
+  if (!isLegalDelegateTransition(from, to)) {
+    return { ok: false, from, to, reason: 'illegal_transition' }
+  }
+  return { ok: true }
+}
+
+export function cronDelegateIdempotencyKey(cronJobId: string, dueMinuteKey: number | string): string {
+  return `cron:${cronJobId}:${dueMinuteKey}`
+}
+
+export function delegateCallbackMessageId(jobId: string, callbackEpoch: number): string {
+  return `dlgcb.${jobId}.${callbackEpoch}`
+}
+
+/** Map OCV5-17 / local-execution reject codes onto this schema's class names. */
+export function failureClassFromLocalExecutionCode(code: string | undefined): DelegateFailureClass {
+  switch (code) {
+    case 'DELEGATE_MODEL_UNKNOWN':
+      return 'invalid_model'
+    case 'DELEGATE_CODEX_UNSUPPORTED':
+      return 'invalid_model'
+    case 'MODEL_NOT_AVAILABLE':
+      return 'invalid_model'
+    case 'MODEL_CATALOG_UNAVAILABLE':
+      return 'internal'
+    default:
+      return 'internal'
+  }
+}
+
+export type DelegationEnqueueInput = {
+  kind: DelegateJobKind
+  callback: DelegateCallback
+  targetAgentId: string
+  goal: string
+  parentSessionKey?: string
+  sourceAgentId?: string
+  sessionKey?: string
+  idempotencyKey?: string
+  model?: string
+  generation?: number
+}
+
+export type DelegationWaitView = {
+  jobId: string
+  state: DelegateJobState
+  sessionKey?: string
+  failureClass?: DelegateFailureClass
+  failureDetail?: string
+  callbackState?: DelegateCallbackState
+}
+
+/**
+ * Unique authority for Enqueue / Wait / Cancel / Resume.
+ * Phase 0 is in-memory; stage 1 persists the same shape.
+ */
+export interface DelegationService {
+  enqueue(input: DelegationEnqueueInput): { jobId: string } | { error: 'capacity_queue_full' }
+  wait(jobId: string, waitMs: number): Promise<DelegationWaitView>
+  cancel(jobId: string, claimToken: string, fencingEpoch: number): boolean
+  get(jobId: string): DelegationWaitView | { state: 'unknown'; failureClass: 'unknown_job' }
+}

@@ -77,6 +77,9 @@ import {
   type LocalExecutionDecision,
 } from './server.js'
 import { localExecutionRejectCode, type LocalExecutionRejectCode } from './modelCatalogClient.js'
+import { enqueueCronOccurrenceJob, settleCronDelegateJob } from './delegateCronIdempotency.js'
+import { isDelegateSmEnabled } from './delegateSmFlag.js'
+import type { DelegateJobStore } from './delegateJobs.js'
 import {
   postCronIndex,
   readV3CronIndexConfig,
@@ -118,6 +121,8 @@ interface CronOccurrenceRecord {
   tapeEvents: number
   outputFile?: string
   updatedAt: number
+  /** OCV5-22 B3: projection of the unique Enqueue job. */
+  delegateJobId?: string
 }
 
 export function classifyCronOccurrenceRecovery(
@@ -1070,6 +1075,8 @@ export function frequencyQuotaError(
 }
 
 export class CronScheduler {
+  /** OCV5-22 phase 0: optional shared job store. Unset = today's occurrence JSON is still the execution right. */
+  public delegateJobs?: DelegateJobStore
   private timer: NodeJS.Timeout | null = null
   private bootTickTimer: NodeJS.Timeout | null = null
   private stopped = false
@@ -1419,6 +1426,17 @@ export class CronScheduler {
               try {
                 outcome = await this.runJob(job, agent, {
                   consumeOccurrence: async () => {
+                    let delegateJobId: string | undefined
+                    if (isDelegateSmEnabled() && this.delegateJobs) {
+                      const enq = enqueueCronOccurrenceJob(this.delegateJobs, {
+                        cronJobId: job.id,
+                        dueMinuteKey,
+                        agentId: agent.id,
+                        sessionKey: `agent:${agent.id}:cron:dm:${job.id}:${deliveryContext.deliveryId}`,
+                      })
+                      if ('error' in enq) throw new Error('cron delegate enqueue capacity')
+                      delegateJobId = enq.jobId
+                    }
                     const record: CronOccurrenceRecord = {
                       version: 1,
                       deliveryId: deliveryContext.deliveryId,
@@ -1429,6 +1447,7 @@ export class CronScheduler {
                       sessionKey: `agent:${agent.id}:cron:dm:${job.id}:${deliveryContext.deliveryId}`,
                       tapeEvents: 0,
                       updatedAt: Date.now(),
+                      ...(delegateJobId ? { delegateJobId } : {}),
                     }
                     const existing = readOccurrence(deliveryContext.deliveryId)
                     if (!existing) writeOccurrence(record)
@@ -1462,6 +1481,9 @@ export class CronScheduler {
                       throw new Error('cron occurrence is not prepared')
                     if (record.state === 'prepared') {
                       writeOccurrence({ ...record, state: 'executing', updatedAt: Date.now() })
+                    }
+                    if (isDelegateSmEnabled() && this.delegateJobs && record?.delegateJobId) {
+                      this.delegateJobs.claimQueued(record.delegateJobId)
                     }
                     if (!isOrigin) {
                       // origin-session must NOT consume lastRun here: settle
@@ -1600,6 +1622,17 @@ export class CronScheduler {
             } else if (occurrence?.state === 'prepared' || occurrence?.state === 'executing') {
               settleOccurrence(occurrence, 'execution_terminal')
             }
+          }
+          const dlg = readOccurrence(deliveryContext.deliveryId)?.delegateJobId
+          if (isDelegateSmEnabled() && this.delegateJobs && dlg) {
+            const silent = outcome.kind === 'silent'
+            const failed = outcome.kind === 'terminal_failure'
+            settleCronDelegateJob(
+              this.delegateJobs,
+              dlg,
+              failed ? 'failed' : silent ? 'skipped_silent' : 'completed',
+              failed && 'code' in outcome ? String(outcome.code) : undefined,
+            )
           }
           // A one-shot remains enabled across retryable failures. Completed,
           // silent, permanent and explicitly exhausted outcomes consume it.

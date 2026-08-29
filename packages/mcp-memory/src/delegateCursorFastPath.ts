@@ -107,16 +107,15 @@ export function parseJsonObject(raw: string): Record<string, unknown> | null {
   }
 }
 
-export function interpretDelegateStartBody(
-  statusCode: number,
-  raw: string,
-): { jobId: string; sessionKey?: string; parentSessionKey?: string; parentTurnKey?: string } | { error: string } {
-  if (statusCode < 200 || statusCode >= 300) {
-    return { error: `委派失败: ${raw}` }
-  }
-  const data = parseJsonObject(raw)
-  if (!data) return { error: `委派失败: 无效 JSON: ${raw.slice(0, 200)}` }
+function startHandleFromBody(data: Record<string, unknown>): {
+  jobId: string
+  sessionKey?: string
+  parentSessionKey?: string
+  parentTurnKey?: string
+} | null {
   const jobId = typeof data.jobId === 'string' ? data.jobId.trim() : ''
+  const live = data.status === 'running' || data.status === 'queued'
+  if (!jobId || !live) return null
   const sessionKey =
     typeof data.sessionKey === 'string' && data.sessionKey.trim()
       ? data.sessionKey.trim()
@@ -129,15 +128,41 @@ export function interpretDelegateStartBody(
     typeof data.parentTurnKey === 'string' && data.parentTurnKey.trim()
       ? data.parentTurnKey.trim()
       : undefined
-  if (data.status === 'running' && jobId) {
-    return {
-      jobId,
-      ...(sessionKey ? { sessionKey } : {}),
-      ...(parentSessionKey ? { parentSessionKey } : {}),
-      ...(parentTurnKey ? { parentTurnKey } : {}),
-    }
+  return {
+    jobId,
+    ...(sessionKey ? { sessionKey } : {}),
+    ...(parentSessionKey ? { parentSessionKey } : {}),
+    ...(parentTurnKey ? { parentTurnKey } : {}),
   }
+}
+
+export function interpretDelegateStartBody(
+  statusCode: number,
+  raw: string,
+): { jobId: string; sessionKey?: string; parentSessionKey?: string; parentTurnKey?: string } | { error: string } {
+  const data = parseJsonObject(raw)
+  if (data) {
+    const handle = startHandleFromBody(data)
+    if (handle) return handle
+  }
+  if (statusCode < 200 || statusCode >= 300) {
+    const err =
+      typeof data?.error === 'string' && data.error.trim() ? data.error.trim() : raw
+    return { error: `委派失败: ${err}` }
+  }
+  if (!data) return { error: `委派失败: 无效 JSON: ${raw.slice(0, 200)}` }
   return { error: `委派失败: 异步作业未返回 jobId: ${raw.slice(0, 200)}` }
+}
+
+function waitRunningView(data: Record<string, unknown>): DelegateWaitView | null {
+  if (data.status !== 'running' && data.status !== 'queued') return null
+  const jobId = typeof data.jobId === 'string' ? data.jobId.trim() : ''
+  if (!jobId) return { kind: 'error', error: '等待委派结果失败: running 响应缺少 jobId' }
+  const sessionKey =
+    typeof data.sessionKey === 'string' && data.sessionKey.trim()
+      ? data.sessionKey.trim()
+      : undefined
+  return sessionKey ? { kind: 'running', jobId, sessionKey } : { kind: 'running', jobId }
 }
 
 export function interpretDelegateWaitBody(
@@ -154,27 +179,24 @@ export function interpretDelegateWaitBody(
     return { kind: 'expired', jobId, error }
   }
   if (!data) return { kind: 'error', error: `等待委派结果失败: 无效 JSON: ${raw.slice(0, 200)}` }
-  if (statusCode < 200 || statusCode >= 300) {
-    return {
-      kind: 'error',
-      error: `等待委派结果失败: ${raw}`,
-    }
-  }
-  if (data.status === 'running') {
-    const jobId = typeof data.jobId === 'string' ? data.jobId.trim() : ''
-    if (!jobId) return { kind: 'error', error: '等待委派结果失败: running 响应缺少 jobId' }
-    const sessionKey =
-      typeof data.sessionKey === 'string' && data.sessionKey.trim()
-        ? data.sessionKey.trim()
-        : undefined
-    return sessionKey ? { kind: 'running', jobId, sessionKey } : { kind: 'running', jobId }
-  }
-  if (data.status === 'done') {
+  const live = waitRunningView(data)
+  if (live) return live
+  if (data.status === 'done' || data.status === 'failed') {
     const httpStatus =
       typeof data.httpStatus === 'number' && Number.isFinite(data.httpStatus)
         ? data.httpStatus
-        : 200
+        : statusCode >= 400
+          ? statusCode
+          : 200
     return { kind: 'result', httpStatus, body: data }
+  }
+  if (statusCode < 200 || statusCode >= 300) {
+    const err =
+      typeof data.error === 'string' && data.error.trim() ? data.error.trim() : raw
+    return {
+      kind: 'error',
+      error: `等待委派结果失败: ${err}`,
+    }
   }
   return { kind: 'error', error: `等待委派结果失败: 未知响应 ${raw.slice(0, 200)}` }
 }

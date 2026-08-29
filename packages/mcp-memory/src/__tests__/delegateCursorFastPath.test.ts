@@ -138,13 +138,44 @@ describe('interpret helpers', () => {
   it('start rejects HTTP errors the same way as sync 委派失败', () => {
     const r = interpretDelegateStartBody(429, '{"error":"too many"}')
     assert.ok('error' in r)
-    if ('error' in r) assert.match(r.error, /委派失败/)
+    if ('error' in r) {
+      assert.match(r.error, /委派失败/)
+      assert.match(r.error, /too many/)
+      assert.doesNotMatch(r.error, /\{/)
+    }
   })
 
-  it('wait running / done / expired', () => {
+  it('start 429 with a live jobId is a handle, not a failure', () => {
+    const r = interpretDelegateStartBody(
+      429,
+      JSON.stringify({
+        error: 'too many concurrent delegations (max 4 non-review; in-use 4/4)',
+        status: 'running',
+        jobId: 'dlgjob-live',
+        sessionKey: 'sk',
+      }),
+    )
+    assert.ok(!('error' in r))
+    if ('error' in r) return
+    assert.equal(r.jobId, 'dlgjob-live')
+    assert.equal(r.sessionKey, 'sk')
+  })
+
+  it('wait running / queued / done / expired / failed-429', () => {
     assert.deepEqual(
       interpretDelegateWaitBody(200, JSON.stringify({ status: 'running', jobId: 'j1' })),
       { kind: 'running', jobId: 'j1' },
+    )
+    assert.deepEqual(
+      interpretDelegateWaitBody(200, JSON.stringify({ status: 'queued', jobId: 'j1' })),
+      { kind: 'running', jobId: 'j1' },
+    )
+    assert.equal(
+      interpretDelegateWaitBody(
+        429,
+        JSON.stringify({ status: 'running', jobId: 'j1' }),
+      ).kind,
+      'running',
     )
     const done = interpretDelegateWaitBody(
       200,
@@ -156,6 +187,19 @@ describe('interpret helpers', () => {
       JSON.stringify({ status: 'expired', jobId: 'j1', error: 'gone' }),
     )
     assert.equal(expired.kind, 'expired')
+    const failed = interpretDelegateWaitBody(
+      429,
+      JSON.stringify({
+        status: 'failed',
+        jobId: 'j1',
+        httpStatus: 429,
+        error: 'too many concurrent delegations (max 4 non-review; in-use 4/4)',
+        failure_class: 'capacity_timeout',
+      }),
+    )
+    assert.equal(failed.kind, 'result')
+    if (failed.kind !== 'result') return
+    assert.equal(failed.httpStatus, 429)
   })
 })
 

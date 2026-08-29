@@ -14,11 +14,15 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import { Gateway } from '../server.js'
+import {
+  DELEGATE_MAX_CONCURRENT_DELEGATIONS,
+  delegateConcurrencyCap,
+} from '../delegateCapacity.js'
 
-// MAX_CONCURRENT_DELEGATIONS=5, DELEGATE_REVIEW_RESERVED_SLOTS=1(私有 static,常量在 server.ts)。
-// 非 review 全局上限 = 5 − 1 = 4;review 全局上限 = 5。per-parent 默认 3(env 可配)。
-const NONREVIEW_GLOBAL_CAP = 4
-const GLOBAL_CAP = 5
+// 全局上限/保留槽唯一定义: packages/gateway/src/delegateCapacity.ts
+// 非 review 全局上限 = MAX − reserved;review 全局上限 = MAX。per-parent 默认 3(env 可配)。
+const NONREVIEW_GLOBAL_CAP = delegateConcurrencyCap(false)
+const GLOBAL_CAP = DELEGATE_MAX_CONCURRENT_DELEGATIONS
 const PER_PARENT_CAP = 3
 
 function makeGate(): any {

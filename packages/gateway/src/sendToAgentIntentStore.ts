@@ -2,6 +2,8 @@ import { randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { decideSendToAgentIntentRecovery } from './delegateCallbackOwner.js'
+import type { DelegateJobSnapshot } from './delegateJobs.js'
 
 export interface SendToAgentIntent {
   v: 1
@@ -76,7 +78,12 @@ function parseIntent(raw: string): SendToAgentIntent | null {
 export async function recoverInterruptedSendToAgentIntents(
   deliver: (intent: SendToAgentIntent) => Promise<boolean>,
   env: NodeJS.ProcessEnv = process.env,
-): Promise<{ recovered: number; retained: number; malformed: number }> {
+  opts?: {
+    callbackOwner?: 'job' | 'intent'
+    resolveJob?: (jobId: string) => DelegateJobSnapshot | undefined
+    ensureCallback?: (job: DelegateJobSnapshot, intent: SendToAgentIntent) => Promise<boolean>
+  },
+): Promise<{ recovered: number; retained: number; malformed: number; skippedShadow?: number }> {
   const dir = intentDir(env)
   let names: string[]
   try {
@@ -88,6 +95,8 @@ export async function recoverInterruptedSendToAgentIntents(
   let recovered = 0
   let retained = 0
   let malformed = 0
+  let skippedShadow = 0
+  const callbackOwner = opts?.callbackOwner ?? 'intent'
   for (const name of names.sort()) {
     if (!/^dlgjob-[A-Za-z0-9-]{1,160}\.json$/.test(name)) continue
     const path = join(dir, name)
@@ -95,6 +104,27 @@ export async function recoverInterruptedSendToAgentIntents(
     if (!intent) {
       malformed += 1
       await rm(path, { force: true }).catch(() => {})
+      continue
+    }
+    const job = opts?.resolveJob?.(intent.jobId)
+    const decision = decideSendToAgentIntentRecovery({
+      callbackOwner,
+      job: job ? { jobId: job.id, state: job.state } : undefined,
+    })
+    if (decision.action === 'drop_shadow') {
+      // Job still running: keep the shadow. Completer is the consumer; do not
+      // emit a legacy interrupt and do not delete the only recovery record.
+      skippedShadow += 1
+      continue
+    }
+    if (decision.action === 'ensure_callback') {
+      const ok = job && opts?.ensureCallback ? await opts.ensureCallback(job, intent) : false
+      if (ok) {
+        await rm(path, { force: true }).catch(() => {})
+        skippedShadow += 1
+      } else {
+        retained += 1
+      }
       continue
     }
     try {
@@ -108,5 +138,5 @@ export async function recoverInterruptedSendToAgentIntents(
       retained += 1
     }
   }
-  return { recovered, retained, malformed }
+  return { recovered, retained, malformed, skippedShadow }
 }
