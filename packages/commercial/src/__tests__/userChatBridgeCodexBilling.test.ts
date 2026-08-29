@@ -106,6 +106,13 @@ const PRICING: ModelPricing = {
   updated_at: new Date(0),
 };
 
+const GROK_PRICING: ModelPricing = {
+  ...PRICING,
+  model_id: "grok-build",
+  display_name: "Grok Build",
+  visibility: "admin",
+};
+
 // ---------- Fake Pool(billing 路径只看 SQL 形状) -----------------------------
 //
 // M2:settle 走 settleUsageAndLedger → spendTwoBucket,SQL 序列(单 tx):
@@ -411,7 +418,12 @@ interface BillingRig {
   poolCtrl: FakePoolControl;
   preCheckRedis: InMemoryPreCheckRedis;
   pricing: PricingCache;
-  binding: { acquireCalls: number; releaseCalls: number; acquireGroupIds: Array<string | null | undefined> };
+  binding: {
+    acquireCalls: number;
+    renewCalls: number;
+    releaseCalls: number;
+    acquireGroupIds: Array<string | null | undefined>;
+  };
   /** 模型执行权威(仅 modelAuthority:true 的 rig 有);epochAtSign 可中途改 = 模拟 admin 安全写。 */
   authority?: { signer: AuthoritySigner; epochAtSign: { value: bigint } };
 }
@@ -453,6 +465,7 @@ async function startRig(opts: {
   appendCostCredits?: UserChatBridgeDeps["appendCostCredits"];
   createCodexRoute?: UserChatBridgeDeps["createCodexRoute"];
   expireCodexRoute?: UserChatBridgeDeps["expireCodexRoute"];
+  releaseGrokRouteLease?: UserChatBridgeDeps["releaseGrokRouteLease"];
   loadAllowedModelChecker?: UserChatBridgeDeps["loadAllowedModelChecker"];
   // P0 计费旁路封堵 — bridge 可信模型推导(fake master agent 权威)。
   loadAgentModelResolver?: UserChatBridgeDeps["loadAgentModelResolver"];
@@ -498,7 +511,12 @@ async function startRig(opts: {
   const pricing = new PricingCache();
   pricing._setForTests([PRICING]);
 
-  const bindingState = { acquireCalls: 0, releaseCalls: 0, acquireGroupIds: [] as Array<string | null | undefined> };
+  const bindingState = {
+    acquireCalls: 0,
+    renewCalls: 0,
+    releaseCalls: 0,
+    acquireGroupIds: [] as Array<string | null | undefined>,
+  };
   const acquireResult = opts.acquireResult ?? "account";
   const codexBinding: CodexBindingHandle = {
     async acquire(_containerId: number, groupId?: string | null) {
@@ -512,6 +530,7 @@ async function startRig(opts: {
       if (acquireResult === "legacy") return null;
       return { account_id: 7n, slotId: "slot-codex-test" };
     },
+    renew() { bindingState.renewCalls += 1; return true; },
     release(_aid: bigint, _slotId: string) { bindingState.releaseCalls += 1; },
   };
 
@@ -533,6 +552,7 @@ async function startRig(opts: {
     codexBinding,
     createCodexRoute: opts.createCodexRoute,
     expireCodexRoute: opts.expireCodexRoute,
+    releaseGrokRouteLease: opts.releaseGrokRouteLease,
     loadAllowedModelChecker: opts.loadAllowedModelChecker,
     loadAgentModelResolver: opts.loadAgentModelResolver,
     logger: opts.logger,
@@ -2271,6 +2291,201 @@ describe("userChatBridge / codex relay — official OAuth group marker", () => {
     }));
     await waitJsonFrameOfType(ws, "outbound.cost_charged");
 
+    ws.close();
+  });
+});
+
+describe("userChatBridge / Grok subscription relay", () => {
+  let rig: BillingRig;
+  const routeToken = "e".repeat(64);
+  const expiredTokens: string[] = [];
+  const releasedLeases: Array<{ accountId: bigint; slotId: string }> = [];
+  let durableReleaseAttempts = 0;
+  let rejectNextDurableRelease = false;
+  let nextDurableReleaseGate: Promise<void> | null = null;
+
+  before(async () => {
+    process.env.DRAIN_BILLING_MS = "50";
+    rig = await startRig({
+      userBalance: 1_000_000n,
+      createCodexRoute: async (args) => {
+        assert.equal(args.modelId, "grok-build");
+        assert.equal(args.sessionId, "grok-peer");
+        return {
+          kind: "api_relay",
+          engine: "grok",
+          token: routeToken,
+          baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${routeToken}/v1`,
+          modelProvider: "grok",
+          providerName: "xAI Grok subscription",
+          wireApi: "chat",
+          preferredAuthMethod: "apikey",
+          disableResponseStorage: true,
+          groupId: "51",
+          credentialId: "53",
+          accountId: "53",
+          slotId: "slot-grok",
+        };
+      },
+      expireCodexRoute: async (token) => { expiredTokens.push(token); },
+      releaseGrokRouteLease: async (accountId, slotId) => {
+        durableReleaseAttempts += 1;
+        const gate = nextDurableReleaseGate;
+        nextDurableReleaseGate = null;
+        if (gate !== null) await gate;
+        if (rejectNextDurableRelease) {
+          rejectNextDurableRelease = false;
+          throw new Error("simulated durable Grok lease expiry failure");
+        }
+        releasedLeases.push({ accountId, slotId });
+        expiredTokens.push(routeToken);
+      },
+    });
+    rig.pricing._setForTests([PRICING, GROK_PRICING]);
+  });
+
+  after(async () => {
+    delete process.env.DRAIN_BILLING_MS;
+    await stopRig(rig);
+  });
+
+  beforeEach(() => {
+    _resetAgentMultiplierCacheForTests();
+    expiredTokens.length = 0;
+    releasedLeases.length = 0;
+    durableReleaseAttempts = 0;
+    rejectNextDurableRelease = false;
+    nextDurableReleaseGate = null;
+    rig.binding.acquireCalls = 0;
+    rig.binding.renewCalls = 0;
+    rig.binding.releaseCalls = 0;
+  });
+
+  test("injects only the server-owned route, bills exact engine usage, then releases the selected account", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("24"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      peer: { id: "grok-peer", kind: "dm" },
+      agentId: "grok",
+      model: "grok-build",
+      __oc_grok_route: { baseUrl: "http://evil.invalid", routeToken: "stolen" },
+      content: "implement the requested change",
+    }));
+
+    const frameToContainer = await waitContainerNextFrame(containerWs);
+    const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+    const serverReqId = parsed.requestId as string;
+    assert.equal(rig.binding.acquireCalls, 0, "Grok route already owns its selected subscription slot");
+    assert.deepEqual(parsed.__oc_grok_route, {
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${routeToken}/v1`,
+      routeToken,
+    });
+    assert.equal(parsed.__oc_codex_route, undefined);
+
+    containerWs.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId: serverReqId,
+      engineSessionId: ENGINE_SID,
+      status: "success",
+      usage: {
+        input_tokens: 100,
+        cache_read_input_tokens: 20,
+        cache_creation_input_tokens: 10,
+        output_tokens: 50,
+      },
+    }));
+
+    const cost = await waitJsonFrameOfType(ws, "outbound.cost_charged");
+    assert.equal(cost.requestId, serverReqId);
+    await waitUntil(() => expiredTokens.includes(routeToken));
+    assert.deepEqual(releasedLeases, [{ accountId: 53n, slotId: "slot-grok" }],
+      "terminal billing must release the exact durable Grok account slot");
+
+    const usageInsert = usageInserts(rig).at(-1);
+    assert.equal(usageInsert?.params?.[2], null, "subscription account identity must not leak into usage records");
+    ws.close();
+  });
+
+  test("bridge disconnect preserves the durable lease and cross-bridge terminal billing releases it", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("24"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      peer: { id: "grok-peer", kind: "dm" },
+      agentId: "grok",
+      model: "grok-build",
+      content: "continue a long coding task",
+    }));
+    const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+    const requestId = forwarded.requestId as string;
+    assert.equal(rig.poolCtrl.journalRows.get(requestId)?.ctx.grokAccountId, "53");
+    assert.equal(rig.poolCtrl.journalRows.get(requestId)?.ctx.grokSlotId, "slot-grok");
+    ws.close();
+    assert.equal(await waitContainerClose(containerWs, 2_000), true);
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    assert.equal(releasedLeases.length, 0, "bridge loss is not a logical-turn terminal");
+    assert.equal(expiredTokens.includes(routeToken), false, "forwarded route remains usable by the continuing container turn");
+
+    const container2P = waitNextContainerSocket(rig);
+    const ws2 = openClient(rig.gatewayPort, await makeJwt("24"));
+    await waitOpen(ws2);
+    const container2 = await container2P;
+    container2.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId,
+      engineSessionId: ENGINE_SID,
+      status: "success",
+      usage: { input_tokens: 10, output_tokens: 20 },
+    }));
+    await waitJsonFrameOfType(ws2, "outbound.cost_charged");
+    assert.deepEqual(releasedLeases, [{ accountId: 53n, slotId: "slot-grok" }]);
+    assert.equal(expiredTokens.includes(routeToken), true);
+    ws2.close();
+  });
+
+  test("same-bridge durable release rejection retains exact identity for immutable billing retry", async () => {
+    rejectNextDurableRelease = true;
+    let releaseFirstAttempt!: () => void;
+    nextDurableReleaseGate = new Promise<void>((resolve) => { releaseFirstAttempt = resolve; });
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("24"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      peer: { id: "grok-peer", kind: "dm" },
+      agentId: "grok",
+      model: "grok-build",
+      content: "finish despite one transient lease cleanup failure",
+    }));
+    const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+    const requestId = forwarded.requestId as string;
+    const billing = JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId,
+      engineSessionId: ENGINE_SID,
+      status: "success",
+      usage: { input_tokens: 10, output_tokens: 20 },
+    });
+
+    const costP = waitJsonFrameOfType(ws, "outbound.cost_charged");
+    containerWs.send(billing);
+    await waitUntil(() => durableReleaseAttempts === 1);
+    // Duplicate arrives while the first PG expiry is still pending. It must
+    // queue one exact retry rather than no-op on the in-flight promise.
+    containerWs.send(billing);
+    releaseFirstAttempt();
+    await costP;
+    await waitUntil(() => releasedLeases.length === 1);
+    assert.equal(durableReleaseAttempts, 2);
+    assert.deepEqual(releasedLeases[0], { accountId: 53n, slotId: "slot-grok" });
     ws.close();
   });
 });

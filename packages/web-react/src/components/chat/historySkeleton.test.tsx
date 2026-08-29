@@ -1,7 +1,11 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test } from "vitest";
-import { MessageListSkeleton, shouldShowHistorySkeleton } from "./HistorySkeleton";
+import {
+  MessageListSkeleton,
+  PartialHistorySkeleton,
+  shouldShowHistorySkeleton,
+} from "./HistorySkeleton";
 
 afterEach(cleanup);
 
@@ -76,5 +80,15 @@ describe("MessageListSkeleton", () => {
     render(<MessageListSkeleton />);
     const region = screen.getByLabelText("正在加载会话历史");
     expect(region).toHaveAttribute("aria-busy", "true");
+  });
+});
+
+describe("PartialHistorySkeleton", () => {
+  test("已有部分内容时保留真实消息，并用轻量尾部占位明确告知仍在加载", () => {
+    render(<PartialHistorySkeleton />);
+    const status = screen.getByRole("status", { name: "正在加载会话内容" });
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("正在加载会话内容…")).toBeInTheDocument();
   });
 });

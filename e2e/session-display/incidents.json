@@ -1104,6 +1104,291 @@
           "assertion": "T33 当前微博账号重新扫码登录不会先解绑旧连接"
         }
       ]
+    },
+    {
+      "id": "INC-20260809-CCB-CONTEXT-OVERFLOW",
+      "occurredAt": "2026-08-09",
+      "severity": "P1",
+      "symptom": "CCB 长会话把完整 Base64 工具结果按字符数低估后重新注入上游，触发上下文 400；同一轮自动重试又持久化多条原始 API Error，导致会话无法继续且 UI 同时展示重复原始错误。",
+      "rootFixCommit": "1b7c4c07",
+      "coverageCommits": [
+        "3ef0ecec"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerResumeMap.test.ts",
+          "assertion": "CCB resume map rebuilds obsolete history contexts while preserving current CCB and Codex resumes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "CCB PROMPT_TOO_LONG diagnostic clears native resume and safely rebuilds the same turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
+          "assertion": "requires an invalid_request_error with an explicit overflow predicate"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "unified timeline hides only a recovered API Error attempt and preserves its immutable audit rows"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度；重试成功保持实时可见"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260810-LIVE-FRAME-SEQUENCE-RESET",
+      "occurredAt": "2026-08-10",
+      "severity": "P1",
+      "symptom": "同一容器会话销毁后重新连接时，Gateway 帧序号从 1 重新开始并撞上另一 dispatch 或无 dispatch 的服务端定时任务历史持久化身份，导致持久化失败关闭用户共享 WebSocket，页面持续断线重连。",
+      "rootFixCommit": "6d2c930c",
+      "coverageCommits": [
+        "bab6c8c6"
+      ],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "keeps later dispatches and server-authored frames durable after a frame sequence restart"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts",
+          "assertion": "断线重连:回复到达或明确失败,绝不永久静默"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260810-TURN-WAIVER-PARAM-TYPE",
+      "occurredAt": "2026-08-10",
+      "severity": "P1",
+      "symptom": "自动免单写入定向收件箱时，同一个 PostgreSQL 参数被同时推断为 bigint 与 text，导致 waiver 事务报 42P08 并回滚，用户无法收到免单退款与回执。",
+      "rootFixCommit": "eef1a6c1",
+      "coverageCommits": [
+        "5c781c06",
+        "7667982a"
+      ],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
+          "assertion": "refunds only the exact 259-credit turn to original personal buckets and sends once"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
+          "assertion": "concurrent settlement and waiver always end free with one receipt"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-turn-waiver-sql-gate.sh",
+          "assertion": "PREPARE oc_v5_turn_waiver_receipt AS"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260810-AUTODREAM-STALE-REPORT",
+      "occurredAt": "2026-08-10",
+      "severity": "P1",
+      "symptom": "全面优化已接管梦境整理后，记忆中心仍反复展示已停用旧版任务的最后失败回执，让用户误以为当前整理始终未完成。",
+      "rootFixCommit": "27611390",
+      "coverageCommits": [
+        "da945b0c",
+        "d7d746c7"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/manage/MemoryPanel.test.tsx",
+          "assertion": "全面优化模式不再展示永远不会更新的旧版失败回执"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/autoDream.test.ts",
+          "assertion": "projects optimizer mode beside the preserved legacy receipt"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T34 全面优化模式隐藏不会再更新的旧版梦境失败回执"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/autoDreamModels.test.ts",
+          "assertion": "unifies the optimizer and legacy memory organizer on MiniMax M3"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260810-LIVE-TURN-VISIBILITY",
+      "occurredAt": "2026-08-10",
+      "severity": "P1",
+      "symptom": "Agent 后台持续执行且 live-frame 已持久化时，前端断线恢复仍从游标 0 反复全量重放并按成功次数指数退避，导致长会话已生成的思考、工具和正文长时间不可见；自动重试又额外展示带 Stop 的独立卡片，与输入框主 Stop 重复。",
+      "rootFixCommit": "6d4e70b1",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "durable journal rebuilds once, then appends only records after the shared cursor"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnActivity.test.tsx",
+          "assertion": "retrying → 滚动旧 max 也统一为「模型繁忙，正在重试中（n/10）」"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T31 journal page1→WS N→page2(N)：已响应思考/工具/正文各恰好一次"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260811-INTERRUPTED-TOOL-STATUS",
+      "occurredAt": "2026-08-11",
+      "severity": "P1",
+      "symptom": "用户停止 turn 后，输入框已正确恢复发送态，但中断 tape 内未完成的历史子任务仍显示运行中转圈，让用户误以为子任务没有停止。",
+      "rootFixCommit": "276bd969",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/ToolCard.test.tsx",
+          "assertion": "被中断 turn 的未完成历史子任务显示已取消，不再伪装运行中"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T36 被中断历史子任务显示已取消，实时未完成子任务仍运行中"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260812-H3-WORKER-MIGRATION-CANCEL",
+      "occurredAt": "2026-08-12",
+      "severity": "P1",
+      "symptom": "原 H3 worker 永久下线后，已经进入 staging 的取消任务在替换 worker 上反复收到 attempt 404，永久停留在 worker_cancel_state_unknown，用户持续看到无法收敛的任务。",
+      "rootFixCommit": "abffc3ab",
+      "coverageCommits": [
+        "702885fd",
+        "b6234527"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/mediaWorkerClient.test.ts",
+          "assertion": "worker cancel bypasses the global proxy and sends the resource class"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T30 视频任务中心持久排队、实时进度与跨 worker 取消终态"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260813-LIVE-REPLAY-GENERATION",
+      "occurredAt": "2026-08-13",
+      "severity": "P1",
+      "symptom": "Agent 执行期间刷新页面后，旧容器的高位持久化帧游标吞掉新容器从 1 重新开始的实时帧，页面永久停留在「正在恢复实时内容」且已生成内容不可见。",
+      "rootFixCommit": "7d44e0a4",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "durable journal resets the reducer cursor when a replacement container restarts frameSeq"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "durable generation boundary does not replay a new live cursor above the old high-water mark"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T39 刷新跨容器代际恢复：旧高游标不再吞掉新容器实时内容"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260813-GROK-AUTHORITY-REJECTED",
+      "occurredAt": "2026-08-13",
+      "severity": "P1",
+      "symptom": "管理员选择 Grok 后，容器 runtime 将签名 authority 中的 engine=grok 当作未知引擎拒绝，turn 未进入 Grok relay 且页面没有回复。",
+      "rootFixCommit": "78eaad0b",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityConsume.test.ts",
+          "assertion": "Grok authority:engine=grok 验签消费后保持 Grok 执行描述符"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-smoke-turn-canary.mjs",
+          "assertion": "turn-canary: TURN_OK model=${MODEL} exact_text=2 final=${result.sawFinal} cost_charged=${result.sawCost}"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260813-CURSOR-AUTHORITY-REJECTED",
+      "occurredAt": "2026-08-13",
+      "severity": "P1",
+      "symptom": "管理员受控启用 Cursor 后，容器 runtime 将签名 authority 中的 engine=cursor 当作未知引擎拒绝，turn 未启动 Cursor CLI 且页面没有回复。",
+      "rootFixCommit": "db7332ff",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityConsume.test.ts",
+          "assertion": "Cursor authority:engine=cursor 验签消费后保持受控 Cursor 执行描述符"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityConsume.test.ts",
+          "assertion": "Cursor billingRequestId 必须与 external audit 的 frame.requestId 精确绑定"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "candidate Cursor authority ticket consume gate"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260813-CURSOR-STREAM-JSON",
+      "occurredAt": "2026-08-13",
+      "severity": "P1",
+      "symptom": "Cursor 官方 CLI 已返回正确答案，但一等 adapter 把嵌套 assistant.message 对象序列化成文本，并再次追加最终聚合事件，导致前台展示 JSON 且答案重复。",
+      "rootFixCommit": "f63f06c1",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "parses pinned official stream-json without duplicating the final assistant flush"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "parses pinned official tool_call started/completed, including completion-only calls"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "candidate Cursor stream-json parser gate"
+        }
+      ],
+      "coverageCommits": [
+        "35defe79"
+      ]
     }
   ]
 }

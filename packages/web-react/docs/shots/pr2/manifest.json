@@ -1,0 +1,75 @@
+{
+  "generatedAt": "2026-08-13T18:32:42.843Z",
+  "repo": "/Users/dengxuan/git_project/openclaude_v3/openclaude-v5-web-codex-impl",
+  "outDir": "/Users/dengxuan/git_project/openclaude_v3/openclaude-v5-web-codex-impl/packages/web-react/docs/shots/pr2",
+  "viewports": {
+    "desktop": {
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 2
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "deviceScaleFactor": 2,
+      "isMobile": true,
+      "hasTouch": true
+    }
+  },
+  "themes": [
+    "light",
+    "dark"
+  ],
+  "scenes": [
+    {
+      "id": "workspace-settings-about",
+      "label": "工作区 · 设置关于页标题与说明档",
+      "group": "工作区",
+      "viewports": [
+        "desktop",
+        "mobile"
+      ]
+    }
+  ],
+  "shots": [
+    {
+      "name": "workspace-settings-about--desktop--light.png",
+      "scene": "workspace-settings-about",
+      "label": "工作区 · 设置关于页标题与说明档",
+      "group": "工作区",
+      "viewport": "desktop",
+      "theme": "light",
+      "clipped": true
+    },
+    {
+      "name": "workspace-settings-about--desktop--dark.png",
+      "scene": "workspace-settings-about",
+      "label": "工作区 · 设置关于页标题与说明档",
+      "group": "工作区",
+      "viewport": "desktop",
+      "theme": "dark",
+      "clipped": true
+    },
+    {
+      "name": "workspace-settings-about--mobile--light.png",
+      "scene": "workspace-settings-about",
+      "label": "工作区 · 设置关于页标题与说明档",
+      "group": "工作区",
+      "viewport": "mobile",
+      "theme": "light",
+      "clipped": true
+    },
+    {
+      "name": "workspace-settings-about--mobile--dark.png",
+      "scene": "workspace-settings-about",
+      "label": "工作区 · 设置关于页标题与说明档",
+      "group": "工作区",
+      "viewport": "mobile",
+      "theme": "dark",
+      "clipped": true
+    }
+  ],
+  "failures": [],
+  "retried": [],
+  "unmockedApi": []
+}

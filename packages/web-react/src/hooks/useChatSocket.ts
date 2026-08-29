@@ -8,7 +8,7 @@ import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
 import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
 import type { InboundMessage, MediaJobWire, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
 import { SessionStore, type StoredSession } from "../lib/persist";
-import type { AuthSession, DurableLiveFrame } from "../lib/types";
+import type { AuthSession, DurableLiveFrame, DurableLiveFramePage } from "../lib/types";
 
 /** 流式期防 IDB 写抖：尾沿 debounce 后落盘一次（isFinal/resume_failed 走立即写，不等它）。*/
 const PERSIST_DEBOUNCE_MS = 900;
@@ -149,6 +149,12 @@ export type UseChatSocket = {
   runDurableLiveFrameHydration: (
     sessId: string,
     hydrate: () => Promise<void>,
+  ) => Promise<void>;
+  /** One cold exact journal rebuild, then shared-cursor incremental hydration. */
+  hydrateDurableLiveFrameJournal: (
+    sessId: string,
+    fetchPage: (after: string) => Promise<DurableLiveFramePage>,
+    applyTapeProjection: () => Promise<void>,
   ) => Promise<void>;
   /** server 增量游标（getSession 的 sinceSeq；无则 0=全量）。*/
   storedMaxSeq: (sessId: string | undefined) => number;
@@ -364,42 +370,15 @@ export function useChatSocket(opts: {
               },
             );
           }
-          // Stage the first immutable snapshot before resetting any rows. Live
-          // stamped WS frames wait in ChatSocket during this session-scoped
-          // hydration and are released through the same frameSeq dedupe path.
-          await socket.runDurableLiveFrameHydration(sessId, async () => {
-            let liveCursor = "0";
-            let sawTapeProjection = false;
-            let streamClientMessageIds: string[] = [];
-            const stagedFrames: DurableLiveFrame[] = [];
-            for (;;) {
-              const page = await api.getSessionLiveFrames(a, sessId, liveCursor, 500);
-              sawTapeProjection ||= page.hasTapeProjection === true;
-              if (streamClientMessageIds.length === 0) {
-                streamClientMessageIds = page.streamClientMessageIds;
-              }
-              stagedFrames.push(...page.frames);
-              if (page.hasMore && !page.nextCursor) throw new Error("live frame page missing cursor");
-              if (page.nextCursor) liveCursor = page.nextCursor;
-              if (!page.hasMore) break;
-            }
-            socket.applyDurableLiveFrames(sessId, stagedFrames, streamClientMessageIds);
-
-            // Confirm once after the destructive reset. Any overlapping WS
-            // delivery is still buffered, so each exact sessionKey+frameSeq is
-            // applied once whether REST or WS wins.
-            for (;;) {
-              const page = await api.getSessionLiveFrames(a, sessId, liveCursor, 500);
-              sawTapeProjection ||= page.hasTapeProjection === true;
-              socket.applyDurableLiveFrames(sessId, page.frames);
-              if (page.hasMore && !page.nextCursor) throw new Error("live frame page missing cursor");
-              if (page.nextCursor) liveCursor = page.nextCursor;
-              if (!page.hasMore) break;
-            }
-            if (sawTapeProjection) {
+          // The shared ChatSocket checkpoint performs one cold exact rebuild, then
+          // every history/reconcile caller appends only records after its cursor.
+          await socket.hydrateDurableLiveFrameJournal(
+            sessId,
+            (after) => api.getSessionLiveFrames(a, sessId, after, 500),
+            async () => {
               // Tape finalization and projection cutover are one PG transaction.
-              // A full read after the journal snapshot closes detail→journal
-              // cutover races without ever substituting a summary or truncation.
+              // A full read after an observed live-owner cutover closes the
+              // detail→journal race without substituting a summary or truncation.
               const tapeDetail = await api.getSession(a, sessId, 0);
               socket.applyServerMessages(
                 sessId,
@@ -420,8 +399,8 @@ export function useChatSocket(opts: {
                   invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
                 },
               );
-            }
-          });
+            },
+          );
           sess._liveStreamBroken = false;
           persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
           return true;
@@ -723,6 +702,11 @@ export function useChatSocket(opts: {
     (sessId, hydrate) => socket.runDurableLiveFrameHydration(sessId, hydrate),
     [socket],
   );
+  const hydrateDurableLiveFrameJournal = useCallback<UseChatSocket["hydrateDurableLiveFrameJournal"]>(
+    (sessId, fetchPage, applyTapeProjection) =>
+      socket.hydrateDurableLiveFrameJournal(sessId, fetchPage, applyTapeProjection),
+    [socket],
+  );
   // 统一时间线点击加载并发闸。同一页只能由显式按钮触发一次；滚动与重渲染
   // 都不会进入这里，成功页在刷新前一直驻留内存。
   const olderHistoryFetchingRef = useRef<Set<string>>(new Set());
@@ -966,6 +950,7 @@ export function useChatSocket(opts: {
       mergeServerHistory,
       applyDurableLiveFrames,
       runDurableLiveFrameHydration,
+      hydrateDurableLiveFrameJournal,
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,
@@ -1000,6 +985,7 @@ export function useChatSocket(opts: {
       mergeServerHistory,
       applyDurableLiveFrames,
       runDurableLiveFrameHydration,
+      hydrateDurableLiveFrameJournal,
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,

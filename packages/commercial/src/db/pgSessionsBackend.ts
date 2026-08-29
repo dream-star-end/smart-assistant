@@ -50,13 +50,14 @@ import {
   LOSSLESS_TURN_TAPE_SHA256_RE,
   MODEL_HISTORY_EXACT_SUFFIX_MARKER,
   assessTurnRecoveryTape,
-  availableModelHistoryTokens,
   modelHistoryReservedTokens,
   estimateModelHistoryTokens,
+  estimateModelHistoryUtf8Bytes,
   exactModelHistoryTextSuffix,
   isClientMessageId,
   modelHistorySemanticRole,
   modelHistorySemanticText,
+  sanitizePersistedModelHistoryText,
   maxAutomaticTurnRetryAttempt,
   normalizeTurnErrorCode,
   resolveModelHistoryContextWindow,
@@ -3779,10 +3780,12 @@ async function appendFiniteModelRecord(
       ...(record.orderSeq !== undefined ? { _orderSeq: record.orderSeq } : {}),
     });
   };
-  const rowTokens = record.tokenEstimate + 4;
+  // Five shared-estimator tokens become 20 bytes under the CCB/Codex
+  // byte-worst selector, covering the longest role label plus its separator.
+  const rowTokens = record.tokenEstimate + 5;
   if (rowTokens <= state.remainingTokens) {
-    const text = await loadFullText();
-    const exactTokens = estimateModelHistoryTokens(text) + 4;
+    const text = sanitizePersistedModelHistoryText(await loadFullText());
+    const exactTokens = estimateModelHistoryTokens(text) + 5;
     if (exactTokens <= state.remainingTokens) {
       push(text);
       state.remainingTokens -= exactTokens;
@@ -3793,7 +3796,7 @@ async function appendFiniteModelRecord(
     // suffix rather than overfilling the provider request.
     const suffixBudget = Math.max(
       0,
-      state.remainingTokens - estimateModelHistoryTokens(MODEL_HISTORY_EXACT_SUFFIX_MARKER) - 4,
+      state.remainingTokens - estimateModelHistoryTokens(MODEL_HISTORY_EXACT_SUFFIX_MARKER) - 5,
     );
     if (state.remainingTokens > 64 && suffixBudget > 0) {
       const suffix = exactModelHistoryTextSuffix(text, suffixBudget);
@@ -3804,13 +3807,15 @@ async function appendFiniteModelRecord(
   }
   const suffixBudget = Math.max(
     0,
-    state.remainingTokens - estimateModelHistoryTokens(MODEL_HISTORY_EXACT_SUFFIX_MARKER) - 4,
+    state.remainingTokens - estimateModelHistoryTokens(MODEL_HISTORY_EXACT_SUFFIX_MARKER) - 5,
   );
   if (state.remainingTokens > 64 && suffixBudget > 0) {
     // Four UTF-16/code-point characters per token is the largest possible
     // exact suffix under the shared estimator (ASCII case). PostgreSQL right()
     // therefore bounds the value before it enters Node memory.
-    const bounded = await loadSuffixText(Math.min(2_000_000_000, suffixBudget * 4));
+    const bounded = sanitizePersistedModelHistoryText(
+      await loadSuffixText(Math.min(2_000_000_000, suffixBudget * 4)),
+    );
     const suffix = exactModelHistoryTextSuffix(bounded, suffixBudget);
     if (suffix) push(MODEL_HISTORY_EXACT_SUFFIX_MARKER + suffix);
   }
@@ -3826,17 +3831,18 @@ async function computeFiniteEngineContextMessages(
   options: EngineContextReadOptions,
 ): Promise<MessageLike[]> {
   const state: FiniteModelContextState = {
-    // Codex rebuilds history as one synthetic user message. Its stored token
+    // CCB and Codex rebuild history as one synthetic user message. Its stored token
     // estimate is intentionally approximate (ASCII chars / 4), which can
     // undercount dense code/JSON by up to 4x and make recovery loop forever on
-    // contextWindowExceeded. Budget that estimate at its byte-level worst case;
-    // the complete tape remains stored and older records stay retrievable.
+    // contextWindowExceeded. Charge the current user message by UTF-8 bytes,
+    // then budget stored history at its byte-level worst case. The complete
+    // tape remains stored and older records stay retrievable.
     remainingTokens: Math.floor(
-      availableModelHistoryTokens(
-        contextWindow,
-        options.currentUserText ?? "",
-        modelHistoryReservedTokens(options.engine),
-      ) / (options.engine === "codex" ? 4 : 1),
+      Math.max(
+        0,
+        contextWindow - modelHistoryReservedTokens(options.engine) -
+          estimateModelHistoryUtf8Bytes(options.currentUserText ?? ""),
+      ) / (options.engine === "ccb" || options.engine === "codex" || options.engine === "grok" ? 4 : 1),
     ),
     stopped: false,
     newestFirst: [],
@@ -4771,9 +4777,11 @@ async function readUnifiedTimelineTapeHeads(
             WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=requested.tape_id
               AND r.ordinal < requested.before_ordinal
               AND r.role <> 'runtime-event'
-              -- SessionManager persists every retry attempt. Once a later
+              -- SessionManager persists every retry attempt. Once any later
               -- assistant result exists, the earlier provider API error is
               -- audit evidence rather than a browser conversation record.
+              -- This keeps exactly the terminal API error when all attempts
+              -- fail, while a later successful result still hides all errors.
               AND NOT (
                 r.role='assistant'
                 AND EXISTS (
@@ -4786,7 +4794,7 @@ async function readUnifiedTimelineTapeHeads(
                   SELECT 1 FROM client_session_turn_tape_model_records recovered
                    WHERE recovered.session_id=r.session_id AND recovered.user_id=r.user_id
                      AND recovered.tape_id=r.tape_id AND recovered.physical_ordinal > r.ordinal
-                     AND recovered.role='assistant' AND recovered.semantic_text NOT LIKE 'API Error:%'
+                     AND recovered.role='assistant'
                 )
               )
             ORDER BY ordinal DESC

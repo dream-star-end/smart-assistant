@@ -783,6 +783,9 @@ describe('T07: v3 trusted-backend mode (OC_V3_TRUSTED_FILE_SERVE=1)', () => {
     it('denies /run/oc/codex-auth/auth.json (master-injected codex token)', () => {
       assert.ok(!isFileAllowed('/run/oc/codex-auth/auth.json'))
     })
+    it('denies /run/oc/cursor-auth/api-key (owner-scoped Cursor key)', () => {
+      assert.ok(!isFileAllowed('/run/oc/cursor-auth/api-key'))
+    })
     it('denies /run/oc/v3-bridge.sock', () => {
       assert.ok(!isFileAllowed('/run/oc/v3-bridge.sock'))
     })

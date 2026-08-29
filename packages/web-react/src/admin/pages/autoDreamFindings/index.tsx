@@ -1,12 +1,13 @@
-import { RefreshCw } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
-import { Badge, Button, Modal } from '../../../components/ui'
-import { type Column, DataTable, PageHeader } from '../../components'
+import { Archive, RefreshCw, Users } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Alert, Badge, Button, Input, Modal } from '../../../components/ui'
+import { type Column, DataTable, PageHeader, StatCard, StatCardRow, TimeAgo } from '../../components'
 import { adminGet, adminSend, apiErrorMessage } from '../../lib/adminApi'
 import { getAdminPage } from '../../registry'
 
 type Finding = {
   id: string
+  fingerprint: string
   taxonomy: string
   capability_id: string
   severity: 'low' | 'medium' | 'high'
@@ -22,7 +23,11 @@ type Finding = {
   first_seen_at: string
   last_seen_at: string
   last_model: string
+  owner: string | null
 }
+
+type FindingStatus = Finding['status']
+type SeenWithin = '1h' | '24h' | '7d' | '30d' | 'all'
 
 const STATUS_LABEL: Record<Finding['status'], string> = {
   new: '新发现',
@@ -39,12 +44,17 @@ export default function AutoDreamFindingsPage() {
   const [status, setStatus] = useState('all')
   const [traffic, setTraffic] = useState('production_user')
   const [model, setModel] = useState('current')
+  const [seenWithin, setSeenWithin] = useState<SeenWithin>('30d')
+  const [minAffectedUsers, setMinAffectedUsers] = useState('1')
+  const [ownerFilter, setOwnerFilter] = useState('')
   const [resolvedModel, setResolvedModel] = useState<string | null>(null)
   const [page, setPage] = useState(0)
   const [loading, setLoading] = useState(true)
   const [updating, setUpdating] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<Finding | null>(null)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [editOwner, setEditOwner] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -56,11 +66,15 @@ export default function AutoDreamFindingsPage() {
           status,
           traffic_class: traffic,
           model,
+          seen_within: seenWithin,
+          min_affected_users: minAffectedUsers,
+          owner: ownerFilter || undefined,
           limit: 100,
           offset: page * 100,
         },
       )
       setRows(result.rows)
+      setSelectedIds(new Set())
       setTotal(result.total)
       setResolvedModel(result.model)
     } catch (err) {
@@ -68,13 +82,57 @@ export default function AutoDreamFindingsPage() {
     } finally {
       setLoading(false)
     }
-  }, [model, page, status, traffic])
+  }, [minAffectedUsers, model, ownerFilter, page, seenWithin, status, traffic])
 
   useEffect(() => {
     void load()
   }, [load])
 
+  const visibleRows = useMemo(
+    () => [...rows].sort((a, b) => {
+      const recency = new Date(b.last_seen_at).getTime() - new Date(a.last_seen_at).getTime()
+      if (recency !== 0) return recency
+      return Number(b.affected_user_count) - Number(a.affected_user_count)
+    }),
+    [rows],
+  )
+  const summary = useMemo(() => ({
+    affected: visibleRows.reduce((sum, row) => sum + Number(row.affected_user_count), 0),
+    corroborated: visibleRows.filter((row) => row.evidence_confidence === 'corroborated').length,
+    unowned: visibleRows.filter((row) => !row.owner).length,
+  }), [visibleRows])
+
   const columns: Column<Finding>[] = [
+    {
+      key: 'selected',
+      title: (
+        <input
+          type="checkbox"
+          aria-label="选择当前页全部发现"
+          checked={visibleRows.length > 0 && visibleRows.every((row) => selectedIds.has(row.id))}
+          onChange={(event) => setSelectedIds(
+            event.target.checked ? new Set(visibleRows.map((row) => row.id)) : new Set(),
+          )}
+          className="h-4 w-4 accent-accent"
+        />
+      ),
+      width: 44,
+      render: (row) => (
+        <input
+          type="checkbox"
+          aria-label={`选择发现 ${row.title}`}
+          checked={selectedIds.has(row.id)}
+          onClick={(event) => event.stopPropagation()}
+          onChange={(event) => setSelectedIds((current) => {
+            const next = new Set(current)
+            if (event.target.checked) next.add(row.id)
+            else next.delete(row.id)
+            return next
+          })}
+          className="h-4 w-4 accent-accent"
+        />
+      ),
+    },
     {
       key: 'severity',
       title: '级别',
@@ -95,6 +153,9 @@ export default function AutoDreamFindingsPage() {
           <div className="font-medium">{row.title}</div>
           <div className="mt-0.5 text-[11.5px] text-faint">
             {row.capability_id} · {row.taxonomy}
+          </div>
+          <div className="mt-1 font-mono text-[10.5px] text-faint" title={row.fingerprint}>
+            cluster {row.fingerprint.slice(0, 12)}
           </div>
         </div>
       ),
@@ -122,6 +183,12 @@ export default function AutoDreamFindingsPage() {
       render: (row) => <span className="tabular-nums">{row.occurrence_count}</span>,
     },
     {
+      key: 'owner',
+      title: '负责人',
+      width: 104,
+      render: (row) => row.owner ? <Badge tone="info">{row.owner}</Badge> : <span className="text-faint">未指派</span>,
+    },
+    {
       key: 'status',
       title: '状态',
       render: (row) => (
@@ -133,16 +200,16 @@ export default function AutoDreamFindingsPage() {
     {
       key: 'last_seen_at',
       title: '最近发现',
-      render: (row) => new Date(row.last_seen_at).toLocaleString('zh-CN'),
+      render: (row) => <TimeAgo value={row.last_seen_at} />,
     },
   ]
 
-  async function updateStatus(next: Finding['status']) {
+  async function updateFinding(patch: { status?: FindingStatus; owner?: string | null }) {
     if (!selected) return
     setUpdating(true)
     setError(null)
     try {
-      await adminSend('PATCH', `/auto-dream-findings/${selected.id}`, { status: next })
+      await adminSend('PATCH', `/auto-dream-findings/${selected.id}`, patch)
       setSelected(null)
       await load()
     } catch (err) {
@@ -152,13 +219,32 @@ export default function AutoDreamFindingsPage() {
     }
   }
 
+  async function updateBatch(ids: string[], patch: { status?: FindingStatus; owner?: string | null }) {
+    if (ids.length === 0 || updating) return
+    setUpdating(true)
+    setError(null)
+    try {
+      await adminSend('PATCH', '/auto-dream-findings/batch', { ids, ...patch })
+      await load()
+    } catch (err) {
+      setError(apiErrorMessage(err, '批量更新发现失败'))
+    } finally {
+      setUpdating(false)
+    }
+  }
+
+  const staleSingleSourceIds = visibleRows
+    .filter((row) => row.evidence_confidence === 'single_source')
+    .filter((row) => Date.now() - new Date(row.last_seen_at).getTime() > 30 * 24 * 60 * 60 * 1000)
+    .map((row) => row.id)
+
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
         title={meta.title}
         desc={`${meta.desc} · 共 ${total} 项`}
         actions={
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <select
               value={traffic}
               onChange={(event) => {
@@ -174,12 +260,47 @@ export default function AutoDreamFindingsPage() {
               <option value="e2e">E2E</option>
             </select>
             <select
+              aria-label="发现时间范围"
+              value={seenWithin}
+              onChange={(event) => {
+                setSeenWithin(event.target.value as SeenWithin)
+                setPage(0)
+              }}
+              className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+            >
+              <option value="1h">最近 1 小时</option>
+              <option value="24h">最近 24 小时</option>
+              <option value="7d">最近 7 天</option>
+              <option value="30d">最近 30 天</option>
+              <option value="all">展开全部历史</option>
+            </select>
+            <select
+              aria-label="最低影响用户数"
+              value={minAffectedUsers}
+              onChange={(event) => {
+                setMinAffectedUsers(event.target.value)
+                setPage(0)
+              }}
+              className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+            >
+              <option value="1">至少 1 位用户</option>
+              <option value="2">至少 2 位用户</option>
+              <option value="5">至少 5 位用户</option>
+            </select>
+            <Input
+              aria-label="按负责人筛选"
+              value={ownerFilter}
+              onChange={(event) => { setOwnerFilter(event.target.value); setPage(0) }}
+              placeholder="负责人筛选"
+              className="w-36"
+            />
+            <select
               value={model}
               onChange={(event) => {
                 setModel(event.target.value)
                 setPage(0)
               }}
-              className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg"
+              className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
             >
               <option value="current">当前模型{resolvedModel ? ` · ${resolvedModel}` : ''}</option>
               <option value="all">全部模型（含历史）</option>
@@ -228,14 +349,40 @@ export default function AutoDreamFindingsPage() {
           {error}
         </div>
       )}
+      {seenWithin === 'all' && (
+        <Alert tone="warning">
+          已展开全部历史积压。默认视图只看当前模型最近 30 天，避免陈旧单一来源淹没近期多用户信号。
+        </Alert>
+      )}
+      <StatCardRow>
+        <StatCard label="当前筛选总数" value={total} icon={RefreshCw} tone="neutral" loading={loading} />
+        <StatCard label="当前页影响用户" value={summary.affected} icon={Users} tone="info" hint="聚合计数，可能跨 finding 重复" loading={loading} />
+        <StatCard label="多源印证" value={summary.corroborated} icon={Users} tone="success" loading={loading} />
+        <StatCard label="当前页未指派" value={summary.unowned} icon={Users} tone={summary.unowned > 0 ? 'warning' : 'success'} loading={loading} />
+      </StatCardRow>
+      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-surface px-3 py-2">
+        <span className="text-[12px] text-muted">已选择 {selectedIds.size} 项</span>
+        <Button size="sm" variant="secondary" disabled={selectedIds.size === 0 || updating} onClick={() => void updateBatch([...selectedIds], { status: 'triaged' })}>
+          批量分诊
+        </Button>
+        <Button size="sm" variant="secondary" disabled={selectedIds.size === 0 || updating} onClick={() => void updateBatch([...selectedIds], { status: 'dismissed' })}>
+          批量忽略
+        </Button>
+        {seenWithin === 'all' && (
+          <Button size="sm" variant="secondary" disabled={staleSingleSourceIds.length === 0 || updating} onClick={() => void updateBatch(staleSingleSourceIds, { status: 'dismissed' })}>
+            <Archive size={14} />归档当前页陈旧单源（{staleSingleSourceIds.length}）
+          </Button>
+        )}
+        <span className="text-[11px] text-faint">“归档”复用既有「已忽略」状态，不创建第二套生命周期。</span>
+      </div>
       <DataTable
-        rows={rows}
+        rows={visibleRows}
         columns={columns}
         rowKey={(row) => row.id}
         loading={loading}
         emptyTitle="暂无平台优化发现"
         emptyHint="用户同意 Auto‑Dream V2 后，匿名发现会自动聚合到这里。"
-        onRowClick={setSelected}
+        onRowClick={(row) => { setSelected(row); setEditOwner(row.owner ?? '') }}
       />
       {selected && (
         <Modal
@@ -249,28 +396,28 @@ export default function AutoDreamFindingsPage() {
               <Button
                 variant="ghost"
                 disabled={updating}
-                onClick={() => void updateStatus('dismissed')}
+                onClick={() => void updateFinding({ status: 'dismissed' })}
               >
                 忽略
               </Button>
               <Button
                 variant="ghost"
                 disabled={updating}
-                onClick={() => void updateStatus('triaged')}
+                onClick={() => void updateFinding({ status: 'triaged' })}
               >
                 已分诊
               </Button>
               <Button
                 variant="ghost"
                 disabled={updating}
-                onClick={() => void updateStatus('planned')}
+                onClick={() => void updateFinding({ status: 'planned' })}
               >
                 纳入计划
               </Button>
               <Button
                 variant="primary"
                 disabled={updating}
-                onClick={() => void updateStatus('resolved')}
+                onClick={() => void updateFinding({ status: 'resolved' })}
               >
                 标记解决
               </Button>
@@ -289,6 +436,22 @@ export default function AutoDreamFindingsPage() {
                   : '当前仅有单一来源；保留信号但不据此放大结论。'
               }
             />
+            <div>
+              <div className="mb-1 text-xs font-semibold text-faint">负责人</div>
+              <div className="flex gap-2">
+                <Input
+                  aria-label="发现负责人"
+                  value={editOwner}
+                  onChange={(event) => setEditOwner(event.target.value)}
+                  placeholder="留空取消指派"
+                  disabled={updating}
+                />
+                <Button variant="secondary" disabled={updating || editOwner.trim() === (selected.owner ?? '')} onClick={() => void updateFinding({ owner: editOwner.trim() || null })}>
+                  保存负责人
+                </Button>
+              </div>
+            </div>
+            <Field title="聚类指纹" value={selected.fingerprint} />
             <p className="text-xs text-faint">
               仅展示匿名闭集摘要，不含用户 ID、原始会话、日志正文、工具参数或凭证。
             </p>

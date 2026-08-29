@@ -38,7 +38,7 @@
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
 import { createRequire } from "node:module";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="context-rail-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -254,6 +254,42 @@ const serveBuiltAsset = (route, request) => {
 };
 // 先注册 catch-all,再注册 harness 页:playwright 后注册者优先,harness URL 命中专用处理。
 await page.route("**/*", serveBuiltAsset);
+await page.route("**/api/agents/main/**", (route, request) => {
+  const url = new URL(request.url());
+  if (url.pathname === "/api/agents/main/memory/memory" && request.method() === "GET") {
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ kind: "index", text: "", files: [], version: "browser-memory-v1" }),
+    });
+  }
+  if (url.pathname === "/api/agents/main/auto-dream-report" && request.method() === "GET") {
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "failed",
+        mode: "optimizer_v2",
+        pendingSessions: 5,
+        lastReport: {
+          status: "failed",
+          finishedAt: "2026-08-08T00:00:00.000Z",
+          sessionsReviewed: 5,
+          summary: "本次整理未完成，没有改动记忆。",
+          created: [],
+          updated: [],
+          deleted: [],
+        },
+      }),
+    });
+  }
+  return route.fulfill({
+    status: 404,
+    contentType: "application/json",
+    body: JSON.stringify({ error: { code: "NOT_FOUND" } }),
+  });
+});
+let browserMediaCanceled = false;
 await page.route("**/api/media-generation/**", (route, request) => {
   const url = new URL(request.url());
   if (url.pathname === "/api/media-generation/capabilities") {
@@ -266,22 +302,22 @@ await page.route("**/api/media-generation/**", (route, request) => {
         requestId: "browser-media-request",
         kind: "h3_generate",
         resourceClass: "gpu-h3",
-        status: "queued",
-        phase: "queued",
+        status: browserMediaCanceled ? "canceled" : "queued",
+        phase: browserMediaCanceled ? "canceled" : "queued",
         prompt: "BROWSER_MEDIA_TASK",
         sessionId: null,
         projectId: null,
         projectShotId: null,
         currentStep: null,
         totalSteps: 20,
-        queuePosition: 2,
+        queuePosition: browserMediaCanceled ? null : 2,
         resultUrl: null,
         resultSha256: null,
         resultSize: null,
         errorCode: null,
         errorMessage: null,
         createdAt: "2026-08-05T00:00:00.000Z",
-        updatedAt: "2026-08-05T00:00:00.000Z",
+        updatedAt: browserMediaCanceled ? "2026-08-05T00:00:01.000Z" : "2026-08-05T00:00:00.000Z",
       }],
       nextCursor: null,
     }) });
@@ -290,6 +326,7 @@ await page.route("**/api/media-generation/**", (route, request) => {
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ projects: [], nextCursor: null }) });
   }
   if (url.pathname.endsWith("/cancel") && request.method() === "POST") {
+    browserMediaCanceled = true;
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ job: {
       id: "33333333-3333-4333-8333-333333333333", requestId: "browser-media-request",
       kind: "h3_generate", resourceClass: "gpu-h3", status: "canceled", phase: "canceled",
@@ -317,6 +354,75 @@ const weiboSetupView = {
   createdAt: "2026-08-08T00:00:00.000Z",
   expiresAt: "2026-08-08T00:04:00.000Z",
 };
+const communityTutorialHttp = { submissions: [] };
+const communityTutorialSummary = {
+  id: "7",
+  title: "BROWSER_COMMUNITY_TUTORIAL",
+  summary: "一份用于真浏览器验证的社区共建教程摘要。",
+  category: "coding",
+  authorName: "浏览器作者",
+  publishedAt: "2026-08-12T08:00:00.000Z",
+};
+await page.route("**/api/tutorials**", (route, request) => {
+  const url = new URL(request.url());
+  if (url.pathname === "/api/tutorials" && request.method() === "GET") {
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ tutorials: [communityTutorialSummary], nextCursor: null }),
+    });
+  }
+  if (url.pathname === "/api/tutorials/7" && request.method() === "GET") {
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ tutorial: {
+        ...communityTutorialSummary,
+        bodyMarkdown: [
+          "# BROWSER_COMMUNITY_DETAIL",
+          "",
+          "![BROWSER_REMOTE_TRACKER](https://tracker.invalid/community.png)",
+          "",
+          "```htmlpreview",
+          "<script>window.__communityTutorialScriptRan = true</script><p>unsafe preview</p>",
+          "```",
+        ].join("\n"),
+      } }),
+    });
+  }
+  if (url.pathname === "/api/tutorials" && request.method() === "POST") {
+    communityTutorialHttp.submissions.push(JSON.parse(request.postData() ?? "null"));
+    return route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ tutorial: {
+        id: "8",
+        status: "pending",
+        createdAt: "2026-08-12T09:00:00.000Z",
+      } }),
+    });
+  }
+  if (url.pathname === "/api/tutorials/mine" && request.method() === "GET") {
+    const draft = communityTutorialHttp.submissions.at(-1);
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        tutorials: draft ? [{
+          id: "8",
+          ...draft,
+          status: "pending",
+          reviewNote: null,
+          createdAt: "2026-08-12T09:00:00.000Z",
+          updatedAt: "2026-08-12T09:00:00.000Z",
+          publishedAt: null,
+        }] : [],
+        nextCursor: null,
+      }),
+    });
+  }
+  return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: { code: "NOT_FOUND" } }) });
+});
 await page.route("**/api/plugins/**", (route, request) => {
   const url = new URL(request.url());
   if (url.pathname === "/api/plugins/management" && request.method() === "GET") {
@@ -431,6 +537,20 @@ const plusButton = primaryComposer.getByRole("button", { name: "更多选项" })
 // DropdownMenuContent renders in a body-level portal. Scope only the trigger
 // to the primary composer; the menu item itself must be located from the page.
 const attachItem = page.getByText("添加附件");
+
+await check("T34 全面优化模式隐藏不会再更新的旧版梦境失败回执", async () => {
+  const memoryRoot = page.locator("#memory-report-root");
+  await memoryRoot.getByText("还没有核心记忆", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  if (await memoryRoot.getByRole("region", { name: "Auto-Dream 梦境报告" }).count() !== 0) {
+    throw new Error("全面优化模式仍展示旧版梦境报告卡");
+  }
+  if (await memoryRoot.getByText("本次整理未完成，没有改动记忆。", { exact: true }).count() !== 0) {
+    throw new Error("全面优化模式仍展示永远不会更新的旧版失败回执");
+  }
+});
 
 await check("T1 点「+」→「添加附件」→ filechooser 真实弹出", async () => {
   await plusButton.click();
@@ -835,6 +955,26 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
   await assertVisibleButtonSet("#tool-card-polish-root", ["搜索 AI 市场browser完成"], "美化后的工具卡");
 });
 
+await check("T36 被中断历史子任务显示已取消，实时未完成子任务仍运行中", async () => {
+  const interrupted = page.locator("#interrupted-historical-tool");
+  await interrupted.getByText("已取消", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  if (await interrupted.locator(".animate-spin").count() !== 0) {
+    throw new Error("被中断的历史子任务仍显示运行中 spinner");
+  }
+
+  const live = page.locator("#live-incomplete-tool");
+  await live.getByText("运行中", { exact: true }).waitFor({ state: "attached", timeout: 3000 });
+  if (await live.locator(".animate-spin").count() !== 1) {
+    throw new Error("实时未完成子任务没有保持运行中 spinner");
+  }
+
+  const completed = page.locator("#completed-interrupted-tool");
+  await completed.getByText("完成", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  if (await completed.getByText("已取消", { exact: true }).count() !== 0) {
+    throw new Error("中断 turn 中已完成的子任务被误标为取消");
+  }
+});
+
 await check("T14 消息反馈弹窗关闭后把焦点还给原消息动作", async () => {
   const trigger = page.getByRole("button", { name: "打开消息反馈" });
   await trigger.click();
@@ -1089,11 +1229,11 @@ await check("T22 Enter 发送 / Shift+Enter 换行 / IME 组合中回车不误�
 });
 
 // ── T23 会话内切模型 ─────────────────────────────────────────────────────────
-// 用户可见事实:点顶栏模型名 → 菜单弹出 → 点另一个模型 → 真的切过去(菜单关闭、
-// 顶栏显示新模型、上层收到精确 model id);标了「暂不可用」的模型点不动、也不会被
+// 用户可见事实:点模型选择器 → 菜单弹出 → 点另一个模型 → 真的切过去(菜单关闭、
+// 触发器显示新模型、上层收到精确 model id);标了「暂不可用」的模型点不动、也不会被
 // 静默切过去。前半段守的是 2026-07-18 附件事故那一类(Radix 菜单项受信点击的
 // post-dispatch 副作用被同步卸载杀死),jsdom 的 fireEvent 走不出这条真实序列。
-await check("T23 顶栏切模型:受信点选生效并回显,降级模型点不动", async () => {
+await check("T23 模型选择器:受信点选生效并回显,降级模型点不动", async () => {
   const fixture = await page.evaluate(() => window.__modelFixture);
   const { markers, ids } = fixture;
   const modelRoot = page.locator("#model-selector-root");
@@ -1410,12 +1550,13 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
     );
   }
 
-  // ③ 顶栏四个入口全在视口内(挤爆时最先被推出去的就是右侧主题/铃铛)。
+  // ③ 顶栏入口全在视口内(挤爆时最先被推出去的就是右侧主题/铃铛)。
+  //    模型选择器已迁到 Composer 发送钮左侧，不在顶栏。
   const headerEntries = [
     ["打开菜单", "汉堡(唯一的移动侧栏入口)"],
     ["站内信", "站内信"],
     ["账户与计费", "余额"],
-    ["选择对话模型", "模型选择器"],
+    ["打开使用教程", "教程"],
   ];
   for (const [label, human] of headerEntries) {
     const box = await mobilePage.getByRole("button", { name: label }).boundingBox();
@@ -1445,6 +1586,17 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
   if (sendBox.x + sendBox.width > 390 + 1) {
     throw new Error(`发送按钮被挤出视口: right=${Math.round(sendBox.x + sendBox.width)}`);
   }
+  const modelBtn = mobilePage.getByRole("button", { name: "选择对话模型" });
+  const modelBox = await modelBtn.boundingBox();
+  if (!modelBox) throw new Error("Composer 模型选择器不可见");
+  if (modelBox.x < 0 || modelBox.x + modelBox.width > 390 + 1) {
+    throw new Error(`Composer 模型选择器被挤出视口: x=${Math.round(modelBox.x)} w=${Math.round(modelBox.width)}`);
+  }
+  await modelBtn.click();
+  const modelItem = mobilePage.getByRole("menuitem", { name: /均衡 Pro/ });
+  await modelItem.waitFor({ state: "visible", timeout: 3000 });
+  await mobilePage.keyboard.press("Escape");
+  await modelItem.waitFor({ state: "hidden", timeout: 3000 });
   await send.click();
   const sends = await mobilePage.evaluate(() => window.__mobilePage.sends);
   if (JSON.stringify(sends) !== JSON.stringify([{ text: "MOBILE_SEND_MARKER", mediaCount: 0 }])) {
@@ -1654,7 +1806,7 @@ await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度；重
   }
   await waitForReplay((state) => state.sending, "重试证明轮没有进入真实发送态");
   await page.evaluate(() => window.__replayDrive.pushRetryStatus());
-  await replayRoot.getByText("模型繁忙，正在自动重试中（2/10）", { exact: true }).waitFor({
+  await replayRoot.getByText("模型繁忙，正在重试中（2/10）", { exact: true }).waitFor({
     state: "visible",
     timeout: 3000,
   });
@@ -1681,7 +1833,29 @@ await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度；重
   }
 });
 
-await check("T30 视频任务中心持久排队、实时进度与可信取消交互", async () => {
+await check("T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交", async () => {
+  await page.evaluate(() => window.__setComposerState(true, false));
+  const stop = primaryComposer.getByRole("button", { name: "停止", exact: true });
+  await stop.waitFor({ state: "visible", timeout: 3000 });
+  if (await primaryComposer.getByRole("button", { name: /停止/ }).count() !== 1) {
+    throw new Error("活动轮或消费提醒出现了多个 Stop 控件");
+  }
+  const before = await page.evaluate(() => window.__composerStops);
+  await stop.click();
+  const after = await page.evaluate(() => window.__composerStops);
+  if (after !== before + 1) throw new Error(`Composer Stop 未精确提交一次:${before}→${after}`);
+
+  await page.evaluate(() => window.__setComposerState(true, true));
+  const stopping = primaryComposer.getByRole("button", { name: "正在停止", exact: true });
+  await stopping.waitFor({ state: "visible", timeout: 3000 });
+  if (!(await stopping.isDisabled())) throw new Error("Stop 结算中 Composer 控件仍可重复点击");
+  if (await primaryComposer.getByRole("button", { name: /停止/ }).count() !== 1) {
+    throw new Error("Stop 结算中仍残留第二个可操作停止入口");
+  }
+  await page.evaluate(() => window.__setComposerState(false, false));
+});
+
+await check("T30 视频任务中心持久排队、实时进度与跨 worker 取消终态", async () => {
   await page.evaluate(() => window.__openMediaTask(true));
   await page.getByText("BROWSER_MEDIA_TASK", { exact: true }).waitFor({ state: "visible", timeout: 5000 });
   await page.getByText("排队中 · queued", { exact: true }).waitFor({ state: "visible" });
@@ -1714,6 +1888,10 @@ await check("T30 视频任务中心持久排队、实时进度与可信取消交
   await page.getByRole("button", { name: "取消" }).click();
   const request = await canceled;
   if (request.postData() !== "{}") throw new Error(`取消请求体漂移: ${request.postData()}`);
+  await page.getByText("已取消 · canceled", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  if (await page.getByRole("button", { name: "取消", exact: true }).count()) {
+    throw new Error("跨 worker 取消已终态后仍显示可重复取消入口");
+  }
   await page.evaluate(() => window.__openMediaTask(false));
 });
 
@@ -1723,7 +1901,8 @@ await check("T31 journal page1→WS N→page2(N)：已响应思考/工具/正文
     result.thinkingCount !== 1 ||
     result.toolCount !== 1 ||
     result.answerCount !== 1 ||
-    result.cursor !== 2
+    result.cursor !== 2 ||
+    JSON.stringify(result.requests) !== JSON.stringify(["0", "1", "2", "2"])
   ) {
     throw new Error(`durable hydration 重复/丢失:${JSON.stringify(result)}`);
   }
@@ -1763,12 +1942,541 @@ await check("T32 durable error replay：用户 Stop 不上报，历史非尾错�
     result.stopErrorText !== "本轮已取消。" ||
     result.stopReports !== 0 ||
     result.stopSyncs !== 0 ||
+    result.stopStatusCount !== 1 ||
+    result.stopAlertCount !== 0 ||
+    result.stopRetryCount !== 0 ||
+    result.stopCancelledCopyCount !== 0 ||
     result.historicalReports !== 1 ||
     result.historicalSyncs !== 0 ||
     result.historicalDecision !== true
   ) {
     throw new Error(`durable error replay 未收敛:${JSON.stringify(result)}`);
   }
+});
+
+await check("T39 刷新跨容器代际恢复：旧高游标不再吞掉新容器实时内容", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runDurableGenerationReset());
+  if (
+    result.oldProcessCount !== 1 ||
+    result.currentProcessCount !== 1 ||
+    result.currentAnswerCount !== 1 ||
+    result.cursor !== 2 ||
+    JSON.stringify(result.requests) !== JSON.stringify(["0", "4"])
+  ) {
+    throw new Error(`跨容器 durable hydration 未恢复:${JSON.stringify(result)}`);
+  }
+  const thinkingHeader = replayRoot.getByRole("button", { name: /思考|已思考/ }).last();
+  await thinkingHeader.waitFor({ state: "visible", timeout: 3000 });
+  await thinkingHeader.click();
+  await replayRoot.getByText(result.markers.currentProcess, { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await replayRoot.getByText(result.markers.currentAnswer, { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+});
+
+await check("T37 新会话草稿与历史加载反馈：连续新建不增行，部分内容加载不中断可见性", async () => {
+  const root = page.locator("#chat-entry-ux-root");
+  await root.getByText("已有会话", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  const button = root.getByRole("button", { name: "新建会话测试" });
+  await button.click();
+  await button.click();
+  if (await root.getByTestId("new-session-count").textContent() !== "1") {
+    throw new Error("连续点击新建制造了额外侧栏占位会话");
+  }
+  if (await root.getByTestId("new-session-active-state").textContent() !== "blank") {
+    throw new Error("新建后没有停留在唯一空白草稿态");
+  }
+
+  await root.getByText("PARTIAL_HISTORY_VISIBLE_MESSAGE", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  const loader = root.getByRole("status", { name: "正在加载会话内容" });
+  await loader.waitFor({ state: "visible", timeout: 3000 });
+  if (await loader.getAttribute("aria-busy") !== "true") {
+    throw new Error("部分历史加载占位没有暴露 aria-busy");
+  }
+  if (await root.getByTestId("partial-history-skeleton").count() !== 1) {
+    throw new Error("部分历史加载占位缺失或重复");
+  }
+});
+
+await check("T38 社区教程真浏览器：公开阅读只读，用户投稿进入待审核且移动端不横溢", async () => {
+  const root = page.locator("#community-tutorial-root");
+  await root.getByText("BROWSER_COMMUNITY_TUTORIAL", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await root.getByText("BROWSER_COMMUNITY_TUTORIAL", { exact: true }).click();
+  await root.getByText("BROWSER_COMMUNITY_DETAIL", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  const unsafeRender = await root.evaluate((element) => ({
+    iframes: element.querySelectorAll("iframe").length,
+    images: element.querySelectorAll("img").length,
+    scriptRan: window.__communityTutorialScriptRan === true,
+  }));
+  if (unsafeRender.iframes !== 0 || unsafeRender.images !== 0 || unsafeRender.scriptRan) {
+    throw new Error(`社区教程正文未保持只读:${JSON.stringify(unsafeRender)}`);
+  }
+
+  await root.getByRole("button", { name: "返回社区教程" }).click();
+  await root.getByRole("button", { name: "发布教程" }).click();
+  await root.getByLabel("标题").fill("BROWSER_SUBMITTED_TITLE");
+  await root.getByLabel("摘要").fill("这是一份覆盖真实投稿流程和审核状态的完整摘要。");
+  await root.getByLabel("分类").selectOption("research");
+  await root.getByLabel("教程正文").fill(
+    "# BROWSER_SUBMITTED_BODY\n\n这是足够长的正文，用于验证所有登录用户都可以提交社区教程并进入管理员审核。",
+  );
+  await root.getByRole("button", { name: "提交审核" }).click();
+  await root.getByText("BROWSER_SUBMITTED_TITLE", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await root.getByText("待审核", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+
+  const submission = communityTutorialHttp.submissions.at(-1);
+  if (
+    submission?.title !== "BROWSER_SUBMITTED_TITLE" ||
+    submission?.category !== "research" ||
+    !submission?.bodyMarkdown?.includes("BROWSER_SUBMITTED_BODY")
+  ) {
+    throw new Error(`社区教程投稿 payload 错误:${JSON.stringify(submission)}`);
+  }
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const overflows = await root.evaluate((element) => element.scrollWidth > element.clientWidth + 1);
+  if (overflows) throw new Error("社区教程在 390px 视口发生横向溢出");
+  if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
+});
+
+await check("T40 390px 失败轮只显示一个中性紧凑重试出口", async () => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const root = page.locator("#error-ux-root");
+  await root.getByText("你是什么模型", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  const text = await root.textContent() ?? "";
+  if (text.includes("发送失败")) throw new Error("用户行仍重复展示发送失败");
+  if (text.includes("GPT")) throw new Error("供应商路由名仍暴露给用户");
+  if (await root.getByRole("button", { name: "重试", exact: true }).count() !== 1) {
+    throw new Error("失败轮没有收敛为唯一重试入口");
+  }
+  if (await root.getByText("查看请求信息", { exact: true }).count() !== 0) {
+    throw new Error("无请求 ID 时仍展示冗余详情入口");
+  }
+  const alert = root.getByRole("alert");
+  const className = await alert.getAttribute("class") ?? "";
+  if (!className.includes("border-warning/30") || !className.includes("px-3") || !className.includes("py-2")) {
+    throw new Error(`预期错误没有使用紧凑 warning 视觉:${className}`);
+  }
+  const overflows = await root.evaluate((element) => element.scrollWidth > element.clientWidth + 1);
+  if (overflows) throw new Error("错误轮在 390px 视口发生横向溢出");
+
+  await root.getByRole("button", { name: "重试", exact: true }).click();
+  if (await page.evaluate(() => window.__errorUxRetries) !== 1) {
+    throw new Error("唯一重试入口没有精确触发一次重发");
+  }
+  if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
+});
+
+await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390 明暗主题成立", async () => {
+  async function assertTheme(theme) {
+    await page.evaluate((next) => {
+      document.documentElement.classList.toggle("dark", next === "dark");
+    }, theme);
+
+    const composerClass = await page.locator("#root [class*='rounded-[26px]']").first().getAttribute("class") ?? "";
+    if (!composerClass.includes("border-border-control")) {
+      throw new Error(`Composer 非聚焦边框丢失(${theme}): ${composerClass}`);
+    }
+    if (!composerClass.includes("focus-within:border-border-strong")) {
+      throw new Error(`Composer 聚焦边框丢失(${theme}): ${composerClass}`);
+    }
+    if (/(?:^|\s)border-border(?:\s|$)/.test(composerClass)) {
+      throw new Error(`Composer 仍用分隔线 border-border(${theme}): ${composerClass}`);
+    }
+
+    const tool = await page.locator("#tool-card-polish-root").evaluate((root) => {
+      const header = root.querySelector("button");
+      if (!(header instanceof HTMLElement)) return { error: "找不到工具卡头部" };
+      const card = header.closest("div.overflow-hidden.rounded-md");
+      const body = card?.querySelector(".border-t");
+      return {
+        headerClass: header.className,
+        cardClass: card?.className ?? "",
+        bodyClass: body?.className ?? "",
+      };
+    });
+    if (tool.error) throw new Error(`${tool.error}(${theme})`);
+    if (!tool.cardClass.includes("rounded-md")) {
+      throw new Error(`工具卡圆角丢失(${theme}): ${tool.cardClass}`);
+    }
+    if (!tool.headerClass.includes("px-3") || !tool.headerClass.includes("py-2")) {
+      throw new Error(`工具卡头部 padding 丢失(${theme}): ${tool.headerClass}`);
+    }
+
+    const sidebar = page.locator("#codex-density-root");
+    const active = sidebar.getByRole("button", { name: "密度验收活跃会话" });
+    await active.waitFor({ state: "visible", timeout: 3000 });
+    const accent = await active.evaluate((btn) => Boolean(btn.closest("div")?.querySelector(".bg-accent")));
+    if (!accent) throw new Error(`活跃会话缺少 accent 竖条(${theme})`);
+    const idleAccent = await sidebar.getByRole("button", { name: "密度验收空闲会话" }).evaluate(
+      (btn) => Boolean(btn.closest("div")?.querySelector(".bg-accent")),
+    );
+    if (idleAccent) throw new Error(`空闲会话不应有 accent 竖条(${theme})`);
+
+    const createClass = await sidebar.getByRole("button", { name: "新建会话" }).getAttribute("class") ?? "";
+    if (!createClass.includes("text-section") || !createClass.includes("border-border") || !createClass.includes("bg-surface")) {
+      throw new Error(`新建会话未保持 secondary(${theme}): ${createClass}`);
+    }
+    const manageClass = await sidebar.getByRole("button", { name: /管理中心/ }).getAttribute("class") ?? "";
+    if (!manageClass.includes("text-body") || !manageClass.includes("text-muted")) {
+      throw new Error(`管理中心入口权重未下降(${theme}): ${manageClass}`);
+    }
+    const marketClass = await sidebar.getByRole("button", { name: /^市场/ }).getAttribute("class") ?? "";
+    if (!marketClass.includes("text-body") || !marketClass.includes("text-muted")) {
+      throw new Error(`市场入口权重未下降(${theme}): ${marketClass}`);
+    }
+    if (await sidebar.getByRole("button", { name: /使用教程/ }).count() !== 1) {
+      throw new Error(`教程入口丢失(${theme})`);
+    }
+    if (await sidebar.getByRole("button", { name: /组织/ }).count() !== 1) {
+      throw new Error(`组织入口丢失(${theme})`);
+    }
+    const adminHref = await sidebar.getByRole("link", { name: /管理后台/ }).getAttribute("href");
+    if (adminHref !== "/admin.html") throw new Error(`管理后台入口丢失或 href 错误(${theme}): ${adminHref}`);
+  }
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await assertTheme("light");
+  const asideWidth = await page.locator("#codex-density-root aside").evaluate((el) => el.getBoundingClientRect().width);
+  if (Math.abs(asideWidth - 268) > 1) {
+    throw new Error(`1440 下侧栏宽度应为 268px,实际 ${asideWidth}`);
+  }
+  await assertTheme("dark");
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await assertTheme("light");
+  await assertTheme("dark");
+  const composerOverflow = await page.locator("#root").evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+  if (composerOverflow) throw new Error("Composer 在 390px 发生横向溢出");
+
+  if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
+  await page.evaluate(() => document.documentElement.classList.remove("dark"));
+});
+
+await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、默认关闭不盖 harness", async () => {
+  const emptyUsage = {
+    summary: {
+      input_tokens: "0",
+      output_tokens: "0",
+      cache_read_tokens: "0",
+      cache_write_tokens: "0",
+      requests_total: "0",
+      billed_credits: "0",
+      debited_credits: "0",
+    },
+    legacy_unattributed: {
+      requests: "0",
+      input_tokens: "0",
+      output_tokens: "0",
+      cache_read_tokens: "0",
+      cache_write_tokens: "0",
+      billed_credits: "0",
+    },
+    savings: {
+      savings_credits: null,
+      savings_is_estimate: false,
+      savings_unavailable: true,
+      savings_rows_skipped: 0,
+    },
+    cache: { hit_rate: null },
+    sessions: { rows: [], limit: 20, offset: 0, has_more: false },
+    ledger: { rows: [], next_before: null },
+    cutoff_started_at: null,
+  };
+  const emptyReport = {
+    window: "30d",
+    summary: {
+      requests: "0",
+      input_tokens: "0",
+      output_tokens: "0",
+      cache_read_tokens: "0",
+      cache_write_tokens: "0",
+      credits: "0",
+    },
+    trend: [],
+    models: [],
+    ledger: { trend: [], by_reason: [] },
+  };
+  await page.route("**/api/public/models", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ models: [] }),
+    }),
+  );
+  await page.route("**/api/subscription/me", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: true,
+        data: {
+          subscription: {
+            plan_code: "free",
+            plan_name: "Free",
+            status: "active",
+            period_start: "2026-08-01T00:00:00.000Z",
+            period_end: "2026-09-01T00:00:00.000Z",
+            period_credits: "0",
+            monthly_credits: "0",
+            price_cents: "0",
+            tier: 0,
+            paid: false,
+          },
+          balance: { wallet: "0", period: "0", total: "0" },
+        },
+      }),
+    }),
+  );
+  await page.route("**/api/me/**", (route, request) => {
+    const pathname = new URL(request.url()).pathname;
+    if (pathname.startsWith("/api/me/preferences")) {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ prefs: {} }),
+      });
+    }
+    if (pathname.startsWith("/api/me/usage/report")) {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(emptyReport),
+      });
+    }
+    if (pathname.startsWith("/api/me/usage")) {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(emptyUsage),
+      });
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: "{}",
+    });
+  });
+
+  const probe = page.locator("#settings-shell-root");
+  if (await page.getByRole("dialog", { name: "设置" }).count() !== 0) {
+    throw new Error("设置壳探针默认就把 Dialog 打开了，会盖住其余 harness");
+  }
+
+  const SECTIONS = [
+    ["账户与计费", "当前套餐"],
+    ["用量", "会话用量明细"],
+    ["偏好", "外观主题"],
+    ["反馈", "反馈内容"],
+    ["关于", "备案信息待补充"],
+  ];
+
+  async function assertNoOverflow(dialog, label) {
+    const overflow = await dialog.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+    if (overflow) throw new Error(`设置壳在 ${label} 发生横向溢出`);
+  }
+
+  async function assertTheme(theme, viewport) {
+    await page.evaluate((next) => {
+      document.documentElement.classList.toggle("dark", next === "dark");
+    }, theme);
+
+    const dialog = page.getByRole("dialog", { name: "设置" });
+    await dialog.waitFor({ state: "visible", timeout: 3000 });
+    await assertNoOverflow(dialog, `${viewport} ${theme}`);
+
+    const tablist = dialog.getByRole("tablist", { name: "设置分区" });
+    const orientation = await tablist.getAttribute("aria-orientation");
+    if (viewport === "390") {
+      if (orientation === "vertical") {
+        throw new Error(`390 仍渲染了竖导航(${theme})`);
+      }
+      const navBox = await tablist.boundingBox();
+      const panel = dialog.getByRole("tabpanel");
+      const panelBox = await panel.boundingBox();
+      if (navBox && panelBox && Math.abs(navBox.y - panelBox.y) < 8 && navBox.x + navBox.width <= panelBox.x + 8) {
+        throw new Error(`390 出现 master-detail 并排(${theme})`);
+      }
+    } else {
+      if (orientation !== "vertical") {
+        throw new Error(`1440 没有竖导航(${theme}): ${orientation}`);
+      }
+      const width = await tablist.evaluate((el) => el.getBoundingClientRect().width);
+      if (Math.abs(width - 168) > 1) {
+        throw new Error(`1440 竖导航应为 168px,实际 ${width}(${theme})`);
+      }
+    }
+  }
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await probe.getByRole("button", { name: "打开设置壳" }).click();
+  await assertTheme("light", "390");
+  const dialog = page.getByRole("dialog", { name: "设置" });
+  for (const [name, marker] of SECTIONS) {
+    const tab = dialog.getByRole("tab", { name, exact: true });
+    await tab.click();
+    if ((await tab.getAttribute("aria-selected")) !== "true") {
+      throw new Error(`390 切到「${name}」后未选中`);
+    }
+    await dialog.getByText(marker, { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+    await assertNoOverflow(dialog, `390 分区 ${name}`);
+  }
+  await assertTheme("dark", "390");
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await assertTheme("light", "1440");
+  await assertTheme("dark", "1440");
+
+  await dialog.getByRole("button", { name: "关闭" }).click();
+  await dialog.waitFor({ state: "hidden", timeout: 3000 });
+
+  if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
+  await page.evaluate(() => document.documentElement.classList.remove("dark"));
+});
+
+await check("T43 右栏 390 回中栏、1440 单实例约 280px、隐藏接回、无数据不占宽", async () => {
+  const shotDir = join(HERE, "..", "docs", "shots", "pr3");
+  mkdirSync(shotDir, { recursive: true });
+  await page.evaluate(() => {
+    try {
+      sessionStorage.removeItem("oc.contextRail.hidden");
+    } catch {
+      /* ignore */
+    }
+  });
+
+  const shell = page.locator('[data-testid="context-rail-data-shell"]');
+  const center = shell.locator('[data-testid="center-column"]');
+  const empty = page.locator('[data-testid="context-rail-empty-shell"]');
+  const unbound = page.locator('[data-testid="context-rail-unbound-shell"]');
+
+  async function assertNoOverflow(label) {
+    const overflow = await shell.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+    if (overflow) throw new Error(`右栏探针在 ${label} 发生横向溢出`);
+  }
+
+  async function shot(name) {
+    await shell.screenshot({ path: join(shotDir, name) });
+  }
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.evaluate(() => document.documentElement.classList.remove("dark"));
+  if ((await shell.locator('[data-testid="context-rail"]').count()) !== 0) {
+    throw new Error("390 仍渲染了右栏 aside");
+  }
+  if ((await center.locator('[data-testid="repo-pill"]').count()) !== 1) {
+    throw new Error("390 中栏应有绑定仓库 pill");
+  }
+  if ((await center.locator('[data-testid="pinned-task-tracker"]').count()) !== 1) {
+    throw new Error("390 中栏应有任务 HUD");
+  }
+  await assertNoOverflow("390 light");
+  await shot("context-rail--mobile--light.png");
+  await page.evaluate(() => document.documentElement.classList.add("dark"));
+  await assertNoOverflow("390 dark");
+  await shot("context-rail--mobile--dark.png");
+  await page.evaluate(() => document.documentElement.classList.remove("dark"));
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const rail = shell.locator('[data-testid="context-rail"]');
+  await rail.waitFor({ state: "visible", timeout: 3000 });
+  const railWidth = await rail.evaluate((el) => el.getBoundingClientRect().width);
+  if (Math.abs(railWidth - 280) > 1) {
+    throw new Error(`1440 右栏宽度应为 280px,实际 ${railWidth}`);
+  }
+  if ((await center.locator('[data-testid="repo-pill"]').count()) !== 0) {
+    throw new Error("1440 中栏仍挂着 RepoPill，破坏单实例");
+  }
+  if ((await center.locator('[data-testid="pinned-task-tracker"]').count()) !== 0) {
+    throw new Error("1440 中栏仍挂着 PinnedTaskTracker，破坏单实例");
+  }
+  if ((await rail.locator('[data-testid="bound-repo-card"]').count()) !== 1) {
+    throw new Error("1440 右栏缺少绑定仓库卡");
+  }
+  if ((await rail.locator('[data-testid="pinned-task-tracker"]').count()) !== 1) {
+    throw new Error("1440 右栏缺少任务 HUD");
+  }
+  const railText = await rail.innerText();
+  if (railText.includes("当前分支")) {
+    throw new Error("右栏出现禁止文案「当前分支」");
+  }
+  if (!railText.includes("绑定仓库") || !railText.includes("绑定分支") || !railText.includes("绑定时 HEAD")) {
+    throw new Error("右栏未展示绑定仓库 / 绑定分支 / 绑定时 HEAD");
+  }
+  await assertNoOverflow("1440 light");
+  await shot("context-rail--desktop--light.png");
+  await page.evaluate(() => document.documentElement.classList.add("dark"));
+  await assertNoOverflow("1440 dark");
+  await shot("context-rail--desktop--dark.png");
+  await page.evaluate(() => document.documentElement.classList.remove("dark"));
+
+  if ((await empty.locator('[data-testid="context-rail"]').count()) !== 0) {
+    throw new Error("无数据时 ContextRail 仍占了 DOM");
+  }
+
+  const unboundCenter = unbound.locator('[data-testid="unbound-center"]');
+  const unboundRail = unbound.locator('[data-testid="context-rail"]');
+  await unboundRail.waitFor({ state: "visible", timeout: 3000 });
+  if ((await unboundCenter.getByRole("button", { name: "关联 GitHub 仓库" }).count()) !== 1) {
+    throw new Error("xl 未绑定 CTA 没有留在中栏");
+  }
+  if ((await unboundRail.locator('[data-testid="bound-repo-card"]').count()) !== 0) {
+    throw new Error("未绑定仍画了仓库卡");
+  }
+  if ((await unboundCenter.locator('[data-testid="pinned-task-tracker"]').count()) !== 0) {
+    throw new Error("未绑定探针 1440 中栏仍有任务 HUD");
+  }
+
+  await shell.getByRole("button", { name: "隐藏上下文" }).click();
+  await rail.waitFor({ state: "hidden", timeout: 3000 });
+  if ((await center.locator('[data-testid="repo-pill"]').count()) !== 1) {
+    throw new Error("隐藏右栏后中栏未接回 RepoPill");
+  }
+  if ((await center.locator('[data-testid="pinned-task-tracker"]').count()) !== 1) {
+    throw new Error("隐藏右栏后中栏未接回任务 HUD");
+  }
+  await shell.getByRole("button", { name: "显示上下文" }).click();
+  await rail.waitFor({ state: "visible", timeout: 3000 });
+  if ((await center.locator('[data-testid="repo-pill"]').count()) !== 0) {
+    throw new Error("重开右栏后中栏 RepoPill 未卸载");
+  }
+
+  writeFileSync(
+    join(shotDir, "manifest.json"),
+    JSON.stringify(
+      {
+        generatedAt: new Date().toISOString(),
+        outDir: shotDir,
+        shots: [
+          "context-rail--mobile--light.png",
+          "context-rail--mobile--dark.png",
+          "context-rail--desktop--light.png",
+          "context-rail--desktop--dark.png",
+        ],
+      },
+      null,
+      2,
+    ),
+  );
+
+  if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
+  await page.evaluate(() => document.documentElement.classList.remove("dark"));
 });
 
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。

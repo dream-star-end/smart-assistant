@@ -29,6 +29,7 @@ import {
   ConcurrencyLimiter,
   extractSessionId,
   isDeepseekModel,
+  isAnthropicContextTooLongError,
   isAnthropicInvalidRequestError,
   isClientAbort,
   rewriteMetadataAccountUuid,
@@ -876,6 +877,38 @@ describe("isAnthropicInvalidRequestError", () => {
       isAnthropicInvalidRequestError('{"error":{"type":1234}}'),
       false,
     );
+  });
+});
+
+describe("isAnthropicContextTooLongError", () => {
+  test("requires an invalid_request_error with an explicit overflow predicate", () => {
+    for (const message of [
+      "prompt is too long for this model",
+      "input tokens exceed the maximum limit",
+      "the context window was exceeded",
+    ]) {
+      assert.equal(isAnthropicContextTooLongError(JSON.stringify({
+        error: { type: "invalid_request_error", message },
+      })), true, message);
+    }
+  });
+
+  test("generic invalid input/length wording does not trigger a context rebuild", () => {
+    for (const message of [
+      "invalid input",
+      "invalid signature length",
+      "unsupported parameter",
+      "Invalid request: tool name is too long",
+      "The request failed because image is too large",
+      "input tokens are malformed; tool count exceeds limit",
+    ]) {
+      assert.equal(isAnthropicContextTooLongError(JSON.stringify({
+        error: { type: "invalid_request_error", message },
+      })), false, message);
+    }
+    assert.equal(isAnthropicContextTooLongError(JSON.stringify({
+      error: { type: "authentication_error", message: "prompt too long" },
+    })), false);
   });
 });
 

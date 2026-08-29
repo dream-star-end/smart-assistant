@@ -519,6 +519,17 @@ describe("V5 synthetic exact-eval overlay driver", () => {
     assert.match(REMOTE_HELPER_SOURCE, /restored standard container retains synthetic eval scratch tmpfs/);
     assert.match(REMOTE_HELPER_SOURCE, /browserCliScratch:scratch/);
     assert.match(REMOTE_HELPER_SOURCE, /browserMcpScratch:scratch/);
+    assert.match(REMOTE_HELPER_SOURCE, /\/home\/agent\/\.openclaude\/skills/);
+    assert.match(REMOTE_HELPER_SOURCE, /\/home\/agent\/\.openclaude\/skill-drafts/);
+    assert.match(REMOTE_HELPER_SOURCE, /\/home\/agent\/\.openclaude\/skill-evals/);
+    assert.match(REMOTE_HELPER_SOURCE, /\/home\/agent\/\.openclaude\/agents\/main\/skills/);
+    assert.match(REMOTE_HELPER_SOURCE, /sharedSkillsScratch:scratch/);
+    assert.match(REMOTE_HELPER_SOURCE, /skillDraftsScratch:scratch/);
+    assert.match(REMOTE_HELPER_SOURCE, /skillEvalsScratch:scratch/);
+    assert.match(
+      REMOTE_HELPER_SOURCE,
+      /agentSkillsScratch:scratch\("\/home\/agent\/\.openclaude\/agents\/main\/skills"\)/,
+    );
     assert.match(REMOTE_HELPER_SOURCE, /persistentScratch: dockerExecJson/);
     assert.match(REMOTE_HELPER_SOURCE, /function inspectTurnEvidence\(\)/);
     assert.match(REMOTE_HELPER_SOURCE, /function inspectWorkspaceArtifacts\(\)/);

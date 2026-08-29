@@ -3,7 +3,7 @@ import { ApiError, api } from "../lib/api";
 import type { ChatMessage } from "../lib/chat/model";
 import { DEMO_SESSIONS } from "../lib/demo";
 import type { StoredSession } from "../lib/persist";
-import type { AuthSession, DurableLiveFrame, Session, SessionMeta, User } from "../lib/types";
+import type { AuthSession, Session, SessionMeta, User } from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
 
 /** 历史重拉冷却（S2）：同会话此窗口内只拉一次；过后允许增量重拉（sinceSeq + server-wins 幂等）。*/
@@ -34,6 +34,7 @@ function storedToSession(s: StoredSession, ownerUserId: string): Session {
     messageCount: Array.isArray(s.messages) ? s.messages.length : 0,
     // modelId 无值时不落键:upsertSessions 的 spread 合并按"键缺席=不表态"保留另一侧的值。
     ...(s._selectedModelId ? { modelId: s._selectedModelId } : {}),
+    ...(typeof s._pinned === "boolean" ? { pinned: s._pinned } : {}),
   };
 }
 
@@ -47,6 +48,8 @@ function metaToSession(m: SessionMeta, ownerUserId: string): Session {
     messageCount: m.messageCount ?? 0,
     // 服务端无值(该会话从未显式选过/PATCH 尚未落地)= 键缺席,server-wins 合并不清掉本地意图。
     ...(m.modelId ? { modelId: m.modelId } : {}),
+    // pinned 必须显式落布尔：键缺席会让 server-wins 合并不清掉本地 true。
+    pinned: m.pinned === true,
   };
 }
 
@@ -99,10 +102,6 @@ export type UseSessionListOptions = {
    * 深链 resolve/放弃后置 false，自动选中恢复正常判定。
    */
   holdAutoSelect?: boolean;
-  /** 新建会话占位时读取"当前有效模型"(App 选择器现值,含空态显式选择),定格为新会话的
-   *  per-session 模型 —— 否则空态选完模型再点「新建会话」,占位无自有模型,resolver 会
-   *  按 default 恢复,空态选择被丢(Codex 审 MAJOR)。 */
-  currentModelId?: () => string | undefined;
 };
 
 export type UseSessionList = {
@@ -286,42 +285,15 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         });
         const liveSocket = cbRef.current.sockRef.current;
         if (liveSocket) {
-          await liveSocket.runDurableLiveFrameHydration(id, async () => {
-            let liveCursor = "0";
-            let sawTapeProjection = false;
-            let streamClientMessageIds: string[] = [];
-            const stagedFrames: DurableLiveFrame[] = [];
-            for (;;) {
-              const page = await api.getSessionLiveFrames(
-                cbRef.current.authSession,
-                id,
-                liveCursor,
-                500,
-              );
-              sawTapeProjection ||= page.hasTapeProjection === true;
-              if (streamClientMessageIds.length === 0) {
-                streamClientMessageIds = page.streamClientMessageIds;
-              }
-              stagedFrames.push(...page.frames);
-              if (page.hasMore && !page.nextCursor) throw new Error("live frame page missing cursor");
-              if (page.nextCursor) liveCursor = page.nextCursor;
-              if (!page.hasMore) break;
-            }
-            liveSocket.applyDurableLiveFrames(id, stagedFrames, streamClientMessageIds);
-            for (;;) {
-              const page = await api.getSessionLiveFrames(
-                cbRef.current.authSession,
-                id,
-                liveCursor,
-                500,
-              );
-              sawTapeProjection ||= page.hasTapeProjection === true;
-              liveSocket.applyDurableLiveFrames(id, page.frames);
-              if (page.hasMore && !page.nextCursor) throw new Error("live frame page missing cursor");
-              if (page.nextCursor) liveCursor = page.nextCursor;
-              if (!page.hasMore) break;
-            }
-            if (sawTapeProjection) {
+          await liveSocket.hydrateDurableLiveFrameJournal(
+            id,
+            (after) => api.getSessionLiveFrames(
+              cbRef.current.authSession,
+              id,
+              after,
+              500,
+            ),
+            async () => {
               const tapeDetail = await api.getSession(cbRef.current.authSession, id, 0);
               liveSocket.mergeServerHistory({
                 sessId: id,
@@ -340,8 +312,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
                 timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
                 invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
               });
-            }
-          });
+            },
+          );
         }
         // 会话级模型选择的侧栏回填:detail 比 boot 时的 listSessions 新(他设备刚改过),
         // 不回填则 App 恢复选择器仍读侧栏旧值。server-wins,detail 无值不清本地
@@ -401,22 +373,11 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       return;
     }
     if (!user) return;
-    // 非 demo：新建一个 WS 会话占位（peer.id 用真实 id），socket 侧在首次 send 时
-    // 惰性 ensureSession —— 空会话不必提前占用 service 槽位。
-    const id = genWsSessionId();
-    // 定格当前有效模型为新会话选择(含空态显式选择;见 currentModelId 注释)。纯本地占位,
-    // 服务端落地仍走首发建行 PUT / 建行后收敛 PATCH。
-    const inheritModel = cbRef.current.currentModelId?.();
-    const s: Session = {
-      id,
-      title: "新对话",
-      ownerUserId: user.id,
-      updatedAt: new Date().toISOString(),
-      messageCount: 0,
-      ...(inheritModel ? { modelId: inheritModel } : {}),
-    };
-    setSessions((c) => [s, ...c]);
-    setActiveId(id);
+    // 非 demo：新建按钮只进入一个空白草稿态。真正会话由 App 首次发送时一次性创建，
+    // 避免连续点击在侧栏堆出多个没有消息、标题都叫「新对话」的假会话。
+    // 先封住迟到的 listSessions 自动选中，再清 activeId；否则历史列表会抢回空白态。
+    autoSelectedRef.current = true;
+    setActiveId(undefined);
   }, [demo, user]);
 
   // listSessions 是否已落定（成功或失败都算）：URL 深链恢复用它判定"等无可等"。

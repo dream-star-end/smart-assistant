@@ -25,6 +25,7 @@ export type ClassifiedErrorCode =
   | 'model_config_changed_retry_turn'
   | 'upstream_failed'
   | 'context_too_long'
+  | 'bad_request'
   | 'unknown'
 
 export interface ClassifiedError {
@@ -34,7 +35,7 @@ export interface ClassifiedError {
 }
 
 export interface DelegateOutputError {
-  code: ClassifiedErrorCode | 'bad_request'
+  code: ClassifiedErrorCode
   /** 用户可见的简短文案 */
   message: string
   /** 原始 CCB/API 错误文本,用于日志和 tool detail */
@@ -65,9 +66,16 @@ const PATTERNS: Array<{
     message: '当前账号被限流,请稍后再试',
   },
   {
-    re: /ran out of room in the model(?:'|’)s context window|context window (?:was )?exceeded/i,
+    re: /PROMPT_TOO_LONG|ran out of room in the model(?:'|’)s context window|context window (?:was )?(?:exceeded|too long)/i,
     code: 'context_too_long',
     message: '上下文长度超过模型上限',
+  },
+  {
+    // CCB result terminals wrap the canonical assistant diagnostic inside
+    // `{subtype,result}` JSON, so the marker is not necessarily at offset 0.
+    re: /API Error:\s*400\b[\s\S]{0,500}(?:INVALID_REQUEST|invalid request)/i,
+    code: 'bad_request',
+    message: '这条请求无法被模型处理，请调整内容后重试',
   },
   // 模型容量满载 —— 上游"at capacity"/overloaded/model busy 词族。与 upstream_failed
   // 的区别是语义可行动:同模型稍后可用、换模型立即可用(taxonomy cta=retry_or_switch)。
@@ -127,16 +135,7 @@ export function classifyDelegateOutputError(
   // arbitrary prose that merely mentions "API Error".
   if (!/^API Error:\s*(?:\d{3}\b|\{)/i.test(detail)) return null
 
-  const cls = classifyRunError(detail)
-  if (cls.code !== 'unknown') {
-    return { code: cls.code, message: cls.message, detail }
-  }
-
-  if (
-    /\b400\b[\s\S]{0,200}\bBAD_BODY\b|\bBAD_BODY\b[\s\S]{0,200}\binvalid request body\b|"code"\s*:\s*"BAD_BODY"/i.test(
-      detail,
-    )
-  ) {
+  if (/\b400\b[\s\S]{0,200}\bBAD_BODY\b|\bBAD_BODY\b[\s\S]{0,200}\binvalid request body\b|"code"\s*:\s*"BAD_BODY"/i.test(detail)) {
     return {
       code: 'bad_request',
       message: '子 agent 请求体无效,请降低思考深度或稍后重试',
@@ -144,5 +143,8 @@ export function classifyDelegateOutputError(
     }
   }
 
-  return null
+  const cls = classifyRunError(detail)
+  return cls.code === 'unknown'
+    ? null
+    : { code: cls.code, message: cls.message, detail }
 }

@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -46,7 +46,13 @@ function Harness({
   );
 }
 
-function CaseHarness({ initial = null }: { initial?: TutorialCaseId | null }) {
+function CaseHarness({
+  initial = null,
+  onRunCase = () => {},
+}: {
+  initial?: TutorialCaseId | null;
+  onRunCase?: React.ComponentProps<typeof TutorialCenter>["onRunCase"];
+}) {
   const [caseId, setCaseId] = useState<TutorialCaseId | null>(initial);
   const [topicId, setTopicId] = useState<ProductFeatureId | null>(null);
   return (
@@ -67,7 +73,7 @@ function CaseHarness({ initial = null }: { initial?: TutorialCaseId | null }) {
         setTopicId(null);
       }}
       caseActionLabel="带着指令去对话"
-      onRunCase={() => {}}
+      onRunCase={onRunCase}
       onClose={() => {}}
       actionState={() => ({ enabled: true, label: "回到功能位置" })}
       onRunAction={() => {}}
@@ -76,56 +82,30 @@ function CaseHarness({ initial = null }: { initial?: TutorialCaseId | null }) {
 }
 
 describe("TutorialCenter", () => {
-  it("默认用问题、结果和两个主案例吸引用户，并保留功能索引入口", () => {
+  it("默认只展示一个科研任务回放，不再用案例目录淹没新用户", () => {
     render(<CaseHarness />);
 
     expect(
-      screen.getByRole("heading", { name: "看 V5 怎样把一件难事真正做完" }),
+      screen.getByRole("heading", { name: "你不用守着它。回来时，过程和成果都还在。" }),
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "不讲功能清单。直接看真实场景里的材料、过程和最后能拿走的成果。",
+        "V5 会把网页、代码、数据和文件串成一个任务，并把每一步和最终成果留给你检查。",
       ),
     ).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "你的问题，也可以这样交给 V5" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "更多可直接套用的场景" }),
-    ).toBeInTheDocument();
-    expect(screen.getByText("科研实战 · 案例演示")).toBeInTheDocument();
-    expect(screen.getByText("编码实战 · 案例演示")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", {
-        name: /论文越读越多.*从 30 篇论文到可追溯证据图谱.*每个结论都能点回原文.*看它怎么完成/,
-      }),
-    ).toBeInTheDocument();
-    expect(screen.getAllByRole("img", { name: /案例成果预览/ })).toHaveLength(
-      2,
-    );
-    expect(screen.getAllByRole("img", { name: /成果示意/ })).toHaveLength(10);
-    expect(
-      screen.getByRole("button", {
-        name: /科研实战.*分析跑完了.*公开数据到可复现的单车需求分析.*可一键重跑的单车需求分析工程.*看它怎么完成/,
-      }),
-    ).toBeInTheDocument();
-    expect(
-      new Set(
-        Array.from(document.querySelectorAll("[data-artwork-kind]"), (node) =>
-          node.getAttribute("data-artwork-kind"),
-        ),
-      ).size,
-    ).toBe(12);
-    for (const forbidden of [
-      "实跑观察",
-      "尚未公开验证",
-      "真实运行重放",
-      "待真实运行采集",
-      "这次没有装作完美",
-      "内容版本",
-    ]) {
-      expect(document.body.textContent).not.toContain(forbidden);
+    expect(screen.getByText(/2 小时 35 分 · UCI Bike Sharing/)).toBeInTheDocument();
+    expect(screen.getByText(/任务观察整理.*非逐帧运行回放/)).toBeInTheDocument();
+    expect(screen.getByText("平台支持后台继续与断线恢复")).toBeInTheDocument();
+    expect(screen.getByText("34 项自动化验证通过")).toBeInTheDocument();
+    const chapterNav = screen.getByRole("navigation", { name: "任务阶段" });
+    for (const chapter of ["交付材料", "理解检查", "运行分析", "交叉验证", "拿走成果"]) {
+      expect(within(chapterNav).getByRole("button", { name: chapter })).toBeInTheDocument();
     }
+    expect(screen.queryByRole("searchbox", { name: "搜索教程" })).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("全部案例");
+    expect(document.body.textContent).not.toContain("更多可直接套用的场景");
+    expect(screen.getByRole("tab", { name: "预览 report.md" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("button", { name: /用我的材料开始/ })).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "功能索引" }),
     ).toBeInTheDocument();
@@ -136,127 +116,43 @@ describe("TutorialCenter", () => {
     ).toBeInTheDocument();
   });
 
-  it("科研案例首屏先展示用户问题、最终成果和主操作，方法资料默认收起", () => {
-    render(<CaseHarness initial="research-bike-demand" />);
-
-    expect(
-      screen.getByRole("heading", { name: "公开数据到可复现的单车需求分析" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("分析跑完了，换台电脑却复现不了？"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("可一键重跑的单车需求分析工程"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getAllByRole("button", { name: "带着我的材料开始" }).length,
-    ).toBeGreaterThanOrEqual(1);
-    expect(
-      screen.getByRole("img", { name: /案例成果预览/ }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "从材料到成果，只看这三步" }),
-    ).toBeInTheDocument();
-    expect(screen.getByText("交给 V5")).toBeInTheDocument();
-    expect(screen.getByText("看它工作")).toBeInTheDocument();
-    expect(screen.getByText("拿走成果")).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "这些成果会直接交到你手里" }),
-    ).toBeInTheDocument();
-    fireEvent.click(
-      screen.getByRole("button", { name: /reproducible-project\.zip/ }),
-    );
-    expect(
-      screen.getByRole("img", { name: /成果预览：reproducible-project\.zip/ }),
-    ).toBeInTheDocument();
-    const methods = screen.getByText("案例资料与方法").closest("details");
-    expect(methods).not.toHaveAttribute("open");
-    fireEvent.click(screen.getByText("案例资料与方法"));
-    expect(methods).toHaveAttribute("open");
-    expect(screen.getAllByText("0.904").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText("68.36").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText(/非负 IAD 指标/)).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "准备材料" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "详细执行步骤" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/research-assistant · deepseek-v4-pro/),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("link", { name: /UCI Bike Sharing Dataset/ }),
-    ).toHaveAttribute(
-      "href",
-      "https://archive.ics.uci.edu/dataset/275/bike+sharing+dataset",
-    );
-    for (const forbidden of [
-      "实跑观察",
-      "尚未公开验证",
-      "真实运行重放",
-      "待真实运行采集",
-      "这次没有装作完美",
-      "内容版本",
-    ]) {
-      expect(document.body.textContent).not.toContain(forbidden);
-    }
-  });
-
-  it("编码案例展示补丁结果与可点击成果，同时把边界留在资料折叠区", () => {
-    render(<CaseHarness initial="coding-swe-bench-fix" />);
-
-    expect(
-      screen.getByText("Bug 修好了，怎么证明没破坏正常路径？"),
-    ).toBeInTheDocument();
-    expect(screen.getByText("带回归测试的最小修复提交")).toBeInTheDocument();
-    expect(
-      screen.getAllByRole("button", { name: "带着我的材料开始" }).length,
-    ).toBeGreaterThanOrEqual(1);
-    expect(
-      screen.getByRole("img", { name: /案例成果预览/ }),
-    ).toBeInTheDocument();
-    expect(screen.getAllByText("2 → 13").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText("− = 1")).toBeInTheDocument();
-    expect(screen.getByText("+ = right")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /root-cause\.md/ }));
-    expect(
-      screen.getByRole("img", { name: /成果预览：root-cause\.md/ }),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/没有运行官方 SWE-bench/)).toBeInTheDocument();
-    expect(
-      screen.getByText(/完整 diff.*漏掉了未跟踪的回归测试文件/),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("link", { name: /Astropy #12906 真实开源问题/ }),
-    ).toHaveAttribute(
-      "href",
-      "https://github.com/astropy/astropy/issues/12906",
-    );
-    expect(document.body.textContent).not.toContain("尚未公开验证");
-    expect(document.body.textContent).not.toContain("待真实运行采集");
-  });
-
-  it("可以用案例指标和处理证据搜索案例", () => {
+  it("阶段、成果预览和科研编码切换都是真实可操作的", () => {
     render(<CaseHarness />);
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "搜索教程" }), {
-      target: { value: "15:49 right" },
-    });
+    const chapterNav = screen.getByRole("navigation", { name: "任务阶段" });
+    fireEvent.click(within(chapterNav).getByRole("button", { name: "运行分析" }));
+    expect(screen.getByText("当前阶段：运行分析")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /基线和非线性模型正面对照/ })).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(screen.getByRole("tab", { name: "预览可复跑工程" }));
+    expect(screen.getByText(/make reproduce/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "编码" }));
+    expect(screen.getByText(/15 分 49 秒 · Astropy #12906/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /真实 Issue 和固定基线已接收/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "预览修复内容" }));
+    expect(screen.getByText(/matrix\[\.\.\., -right\.shape\[0\]:\] = right/)).toBeInTheDocument();
+    expect(screen.getByText(/不冒充完整可下载 patch/)).toBeInTheDocument();
+  });
+
+  it("主操作只把选中的真实案例交给现有开工流程", () => {
+    const onRunCase = vi.fn();
+    render(<CaseHarness initial="coding-swe-bench-fix" onRunCase={onRunCase} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "用我的材料开始，带着指令去对话" }));
+    expect(onRunCase).toHaveBeenCalledTimes(1);
+    expect(onRunCase).toHaveBeenCalledWith(expect.objectContaining({ id: "coding-swe-bench-fix" }));
+  });
+
+  it("非精选案例深链继续展示自己的原详情，不会错误回落到单车案例", () => {
+    render(<CaseHarness initial="coding-feature-delivery" />);
 
     expect(
-      screen.getByRole("heading", {
-        name: "像真实维护者一样修一个 SWE-bench Bug",
-      }),
+      screen.getByRole("heading", { name: "从一条需求交付可合并的 API 功能" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("先看完整故事")).toBeInTheDocument();
-    expect(document.body.textContent).not.toContain("先看两个完整故事");
     expect(
-      screen.queryByRole("heading", { name: "公开数据到可复现的单车需求分析" }),
+      screen.queryByRole("heading", { name: "你不用守着它。回来时，过程和成果都还在。" }),
     ).not.toBeInTheDocument();
-    expect(screen.getAllByRole("img", { name: /案例成果预览/ })).toHaveLength(
-      1,
-    );
   });
 
   it("展示详细步骤、本地演示媒体、风险提示与真实功能 CTA", () => {

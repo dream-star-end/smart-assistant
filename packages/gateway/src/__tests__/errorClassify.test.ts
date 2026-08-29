@@ -61,6 +61,26 @@ describe('classifyRunError', () => {
     assert.equal(r.message, '上下文长度超过模型上限')
   })
 
+  it('context_too_long: proxy PROMPT_TOO_LONG is provider-confirmed overflow', () => {
+    const r = classifyRunError(
+      'API Error: 413 {"error":{"code":"PROMPT_TOO_LONG","message":"Prompt exceeds the model context window"}}',
+    )
+    assert.equal(r.code, 'context_too_long')
+  })
+
+  it('bad_request: generic upstream invalid request is not called an outage', () => {
+    const apiError =
+      'API Error: 400 {"error":{"code":"INVALID_REQUEST","message":"The upstream provider rejected this request"}}'
+    for (const raw of [apiError, JSON.stringify({
+      subtype: 'error_during_execution',
+      result: apiError,
+    })]) {
+      const r = classifyRunError(raw)
+      assert.equal(r.code, 'bad_request')
+      assert.match(r.message, /无法被模型处理/)
+    }
+  })
+
   it('upstream_failed: 502', () => {
     const r = classifyRunError('Anthropic returned 502 Bad Gateway')
     assert.equal(r.code, 'upstream_failed')

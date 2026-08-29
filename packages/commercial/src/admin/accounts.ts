@@ -171,7 +171,7 @@ export async function adminGetAccount(id: bigint | string): Promise<AccountRow |
 export interface AdminCreateAccountInput {
   /**
    * V3 provider(默认 'claude' 与 v2 行为一致)。
-   * provider='codex' 必须有 oauth_refresh_token(plan 决策 Q,refresh actor 依赖)。
+   * provider='codex' / 'grok' 必须有 oauth_refresh_token。
    */
   provider?: AccountProvider;
   label: string;
@@ -179,6 +179,8 @@ export interface AdminCreateAccountInput {
   oauth_token: string;
   oauth_refresh_token?: string | null;
   oauth_expires_at?: Date | string | null;
+  oauth_principal_type?: string | null;
+  oauth_principal_id?: string | null;
   /**
    * 0064 — Anthropic 订阅周期到期日(可选,管理员手填)。
    *   - undefined / null → 不设置(列保持 NULL,scheduler 按中性 1.0 对待)
@@ -306,9 +308,21 @@ export async function adminCreateAccount(
   if (refresh !== null && (typeof refresh !== "string" || refresh.length === 0)) {
     throw new RangeError("invalid_oauth_refresh_token");
   }
-  // codex 账号必须有 refresh_token — refresh actor 60s tick 依赖它(plan 决策 Q)
-  if (provider === "codex" && refresh === null) {
-    throw new RangeError("codex_account_requires_refresh_token");
+  // Official OAuth account pools must be able to rotate short-lived access tokens.
+  if ((provider === "codex" || provider === "grok") && refresh === null) {
+    throw new RangeError(`${provider}_account_requires_refresh_token`);
+  }
+  const principalType = input.oauth_principal_type ?? null;
+  const principalId = input.oauth_principal_id ?? null;
+  if (
+    (principalType !== null || principalId !== null) &&
+    (
+      provider !== "grok" ||
+      typeof principalType !== "string" || principalType.length === 0 ||
+      typeof principalId !== "string" || principalId.length === 0
+    )
+  ) {
+    throw new RangeError("invalid_oauth_principal");
   }
   // 0055:egress_proxy_id 必填(类型签名已锁,这里 runtime 兜底防 JS 调用方绕过 TS)
   if (input.egress_proxy_id === undefined || input.egress_proxy_id === null) {
@@ -356,6 +370,8 @@ export async function adminCreateAccount(
     // codex 账号强制 runtime_channel='v5';v3 实例落 'v3',与 DB DEFAULT 同值,
     // 现网零变化)。跨 channel 迁移是显式 admin 操作,不在 create 面。
     runtime_channel: getRuntimeChannel(),
+    oauth_principal_type: principalType,
+    oauth_principal_id: principalId,
   };
   let row: AccountRow;
   try {

@@ -35,14 +35,21 @@ const INC: IncidentRow = {
   user_title: "服务不可用",
   opened_at: "2026-07-11T00:00:00Z",
   updated_at: "2026-07-11T00:10:00Z",
+  latest_repair_status: null,
+  latest_repair_at: null,
 };
 
 const SUPPRESSED: SuppressedConditionRow[] = [
   {
-    conditionKey: "ops.monitor:mem",
-    suppressedAt: "2026-07-11T02:00:00Z",
-    suppressedBy: "admin:boss",
+    condition_key: "ops.monitor:mem",
+    firing: true,
+    mode: "probe",
     level: "warning",
+    observed_at: "2026-07-11T02:00:00Z",
+    occurrence_count: "4",
+    suppressed_until_clear: true,
+    suppressed_at: "2026-07-11T02:00:00Z",
+    suppressed_by: "admin:boss",
   },
 ];
 
@@ -116,8 +123,10 @@ let detail: IncidentDetailResp = detailWith([]);
 let fuse: ReleaseFuseResp = { engaged: false };
 
 function routeGet(path: string): Promise<unknown> {
-  if (path === "/selfheal/incidents") return Promise.resolve({ incidents: [INC] });
-  if (path === "/selfheal/conditions") return Promise.resolve({ items: SUPPRESSED });
+  if (path === "/selfheal/incidents") {
+    return Promise.resolve({ rows: [INC], next_before: null, total: 1, open_total: 1 });
+  }
+  if (path === "/selfheal/conditions") return Promise.resolve({ rows: SUPPRESSED });
   if (path === "/selfheal/release-fuse") return Promise.resolve(fuse);
   if (path === "/selfheal/user-notices") return Promise.resolve({
     binding: { channelId: "5", bindingCode: "A1B2C3D4", active: false, boundIdentity: null, boundAt: null },
@@ -151,6 +160,7 @@ function renderPage(node: ReactNode) {
 }
 
 beforeEach(() => {
+  window.location.hash = "#tab=selfheal";
   adminGet.mockReset();
   adminSend.mockReset();
   detail = detailWith([]);
@@ -161,6 +171,21 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("已压制 conditions 区块", () => {
+  test("按真实 server snake_case envelope 渲染事故总数、open age 与修复状态", async () => {
+    renderPage(<SelfhealPage />);
+    expect(await screen.findByText("服务不可用")).toBeTruthy();
+    expect(screen.getByText("共 1 条 · 1 条未恢复")).toBeTruthy();
+    expect(screen.getByText(/已持续/)).toBeTruthy();
+    expect(screen.getByText("未触发")).toBeTruthy();
+  });
+
+  test("incident_id 深链在列表命中后自动打开真实事故详情", async () => {
+    window.location.hash = "#tab=selfheal&incident_id=9";
+    renderPage(<SelfhealPage />);
+    expect(await screen.findByRole("dialog", { name: "服务不可用" })).toBeTruthy();
+    expect(adminGet.mock.calls.some((call) => call[0] === "/selfheal/incidents/9")).toBe(true);
+  });
+
   test("渲染压制行:conditionKey/级别/操作人 + 解除压制按钮", async () => {
     renderPage(<SelfhealPage />);
     expect(await screen.findByText("ops.monitor:mem")).toBeTruthy();

@@ -30,14 +30,17 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-pdfmetrics.registerFont(TTFont("NotoCJK", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"))
+pdfmetrics.registerFont(TTFont("WQY", "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", subfontIndex=0))
 c = canvas.Canvas("/home/agent/.openclaude/发票.pdf", pagesize=A4)
-c.setFont("NotoCJK", 20); c.drawString(72, 760, "收 据")
-c.setFont("NotoCJK", 12); c.drawString(72, 720, "今收到:甲方  金额:¥1,000.00")
+c.setFont("WQY", 20); c.drawString(72, 760, "收 据")
+c.setFont("WQY", 12); c.drawString(72, 720, "今收到:甲方  金额:¥1,000.00")
 c.showPage(); c.save()
 ```
 
-> 找不到字体文件时用 `fc-list :lang=zh` 定位已装的 Noto CJK 路径。
+> 找不到字体文件时用 `fc-list :lang=zh` 定位字体。ReportLab 的 `TTFont` 不支持
+> Noto CJK TTC 里的 PostScript outlines;固定版式应使用镜像预装的文泉驿正黑 TTC
+> (`subfontIndex=0`)，它能同时覆盖中文、Latin、数字和常用符号；再通过 QA 的
+> `pdffonts` 结果确认 embedded/unicode 都为 true。
 
 ## 3. 合并 / 拆分 / 水印:pypdf
 
@@ -67,16 +70,21 @@ with pdfplumber.open("上传.pdf") as pdf:
 
 > 扫描件/图片型 PDF 的 OCR(PaddleOCR/ocrmypdf)属 P1 增强,当前镜像未装;遇纯扫描件先如实告知用户"需要 OCR",不要编造内容。
 
-## 5. 交付前验证
+## 5. 交付前验证:渲染后再交付
 
 ```bash
-test -s out.pdf && head -c 5 out.pdf | grep -q '%PDF'   # 合法 PDF 头
+cat > qa-expect.json <<'JSON'
+{"kind":"pdf","requiredText":["文档标题","必须出现的关键文字"],"minPages":1}
+JSON
+oc-artifact-qa inspect --input out.pdf --out-dir out.pdf.qa --expect qa-expect.json
 ```
 
-最终回复给**绝对路径**并说明由 Typst/reportlab 生成、中文字体已内嵌。
+查看 `out.pdf.qa/contact-sheets/` 或逐页 PNG,确认没有裁切、重叠、空白页、乱码和字体替换;
+发现问题就修源文件并重新生成到新的 QA 目录。`report.json` 的 `passed` 必须为 true,不能把
+“命令运行成功”或最终回复里的自述当验证。最终回复给**绝对路径**,并简述 QA 结果。
 
 ## 工具调用纪律(重要)
 
 - 生成 PDF 优先 `oc-pdf`(格式化文档)或 reportlab(精确排版),不要用 HTML 截图冒充 PDF。
-- 中文一定用 CJK 字体,交付前肉眼/程序确认无豆腐块。
+- 中文一定用 CJK 字体;以 `oc-artifact-qa` 的文本、嵌入字体和全部渲染页证据确认无豆腐块。
 - 合规红线:**绝不装或用 PyMuPDF(AGPL,SaaS 触发源码披露)/ Marker(GPL)**;PDF 解析一律用 `pdfplumber`(MIT)/`pypdf`(BSD)/`markitdown`(MIT)。

@@ -44,6 +44,7 @@ const knowledgePlanetSeed = path.join(
   'packages/commercial/scripts/seed-knowledge-planet-plugin.ts',
 )
 const supervisor = path.join(root, 'packages/commercial/src/agent-sandbox/v3supervisor.ts')
+const runtimeDockerfile = path.join(root, 'packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime')
 const v5Overrides = path.join(root, 'deploy/v5/commercial-v5.env.overrides')
 const v5UnitA = path.join(root, 'deploy/v5/openclaude-v5.service')
 const v5UnitB = path.join(root, 'deploy/v5/openclaude-v5-b.service')
@@ -60,6 +61,21 @@ describe('V5 branch deployment policy', () => {
       ['-c', `source "$1"; assert_v5_deploy_branch_allowed "$2" "$3"`, 'branch-policy', branchPolicy, branch, allowAny],
       { cwd: root, encoding: 'utf8' },
     )
+
+  test('Word runtime pins Bookworm LibreOffice 25.2 and checks complex formula rendering', async () => {
+    const source = await readFile(runtimeDockerfile, 'utf8')
+    const overrides = await readFile(v5Overrides, 'utf8')
+    assert.match(source, /^FROM node:22-bookworm-slim AS base$/m)
+    assert.match(source, /deb http:\/\/deb\.debian\.org\/debian bookworm-backports main/)
+    assert.match(source, /apt-get install -y --no-install-recommends -t bookworm-backports \\\n+\s+libreoffice-writer \\\n+\s+libreoffice-math \\/)
+    assert.match(source, /libreoffice --headless --version \| grep -Eq '\^LibreOffice 25\\\.2\\\.'/)
+    assert.match(source, /dpkg-query -W -f='\$\{Status\}\\n' libreoffice-math/)
+    assert.match(source, /\\mathrm\{MSE\}=\\frac\{1\}\{n\}\\sum_\{i=1\}\^\{n\}\(y_i-\\hat\{y\}_i\)\^2/)
+    assert.match(source, /grep -q 'y' \/tmp\/oc-docx-smoke\.txt/)
+    assert.match(source, /! grep -q '¿' \/tmp\/oc-docx-smoke\.txt/)
+    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-grok-21e30788a613-slim$/m)
+    assert.match(overrides, /v5-ccb-f8800e0c0480-embedded\(OC_RUNTIME_EMERGENCY_TUPLE/)
+  })
 
   test('Windows app branches fail closed even when ALLOW_ANY_BRANCH would bypass the generic guard', () => {
     for (const branch of [
@@ -286,13 +302,14 @@ describe('V5 P3 preserved runtime tuple surface gate', () => {
 
     const rejected = await fixture()
     await rejected.write('scripts/new.sh')
-    await rejected.write('e2e/unmatched.txt')
+    await rejected.write('e2e/session-display/incidents.json')
     const rejectedTarget = rejected.commit()
     const rejectedResult = rejected.invoke(rejected.base, rejectedTarget)
     assert.equal(rejectedResult.status, 0, rejectedResult.stderr || rejectedResult.stdout)
     const rejectedPlan = JSON.parse(rejectedResult.stdout)
     assert.ok(rejectedPlan.manual.some((entry: { reason: string }) => entry.reason.startsWith('manual_glob:')))
-    assert.ok(rejectedPlan.manual.some((entry: { reason: string }) => entry.reason === 'unmatched_path'))
+    assert.ok(rejectedPlan.manual.some((entry: { path: string, reason: string }) =>
+      entry.path === 'e2e/session-display/incidents.json' && entry.reason === 'unmatched_path'))
   })
 
   test('symlink/type changes, invalid manifests, invalid commits, and non-ancestor ranges fail closed', async () => {
@@ -624,6 +641,85 @@ describe('V5 durable development release queue', () => {
     assert.equal(jobs.find((job) => job.id === first)?.status, 'completed')
     assert.equal(jobs.find((job) => job.id === second)?.status, 'active')
     assert.equal(jobs.find((job) => job.id === cancelled)?.status, 'cancelled')
+  })
+
+  test('heartbeat refreshes only the exact active owner and records a durable event', async () => {
+    const fixture = await queueFixture()
+    const active = outputId(
+      fixture.invoke([
+        'submit',
+        '--task',
+        'long-eval',
+        '--branch',
+        'chore/long-eval',
+        '--sha',
+        fixture.candidate,
+        '--actor',
+        'test',
+      ]),
+    )
+    const queued = outputId(
+      fixture.invoke([
+        'submit',
+        '--task',
+        'waiting',
+        '--branch',
+        'chore/waiting',
+        '--sha',
+        fixture.base,
+        '--actor',
+        'test',
+      ]),
+    )
+    assert.equal(fixture.invoke(['acquire', '--id', active, '--owner', 'eval-owner']).status, 0)
+    const before = JSON.parse(fixture.invoke(['status', '--json']).stdout) as Array<{
+      id: string
+      updated_at: string
+    }>
+    const beforeUpdatedAt = before.find((job) => job.id === active)?.updated_at
+    assert.ok(beforeUpdatedAt)
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100))
+    const heartbeat = fixture.invoke(['heartbeat', '--id', active, '--owner', 'eval-owner'])
+    assert.equal(heartbeat.status, 0, heartbeat.stderr || heartbeat.stdout)
+    assert.equal(heartbeat.stdout.trim(), active)
+    const after = JSON.parse(fixture.invoke(['status', '--json']).stdout) as Array<{
+      id: string
+      updated_at: string
+    }>
+    const afterUpdatedAt = after.find((job) => job.id === active)?.updated_at
+    assert.ok(afterUpdatedAt && afterUpdatedAt > beforeUpdatedAt)
+    const heartbeatEvents = spawnSync(
+      'sqlite3',
+      [
+        fixture.env.OC_V5_RELEASE_QUEUE_DB,
+        `SELECT count(*) FROM release_queue_events WHERE job_id='${active}' AND event='heartbeat' AND actor='eval-owner';`,
+      ],
+      { encoding: 'utf8' },
+    )
+    assert.equal(heartbeatEvents.status, 0, heartbeatEvents.stderr || heartbeatEvents.stdout)
+    assert.equal(heartbeatEvents.stdout.trim(), '1')
+
+    assert.notEqual(
+      fixture.invoke(['heartbeat', '--id', active, '--owner', 'another-owner']).status,
+      0,
+      'another owner must not keep an active job alive',
+    )
+    assert.notEqual(
+      fixture.invoke(['heartbeat', '--id', queued, '--owner', 'eval-owner']).status,
+      0,
+      'a queued job must not accept heartbeats',
+    )
+    const unchangedEvents = spawnSync(
+      'sqlite3',
+      [
+        fixture.env.OC_V5_RELEASE_QUEUE_DB,
+        `SELECT count(*) FROM release_queue_events WHERE event='heartbeat';`,
+      ],
+      { encoding: 'utf8' },
+    )
+    assert.equal(unchangedEvents.status, 0, unchangedEvents.stderr || unchangedEvents.stdout)
+    assert.equal(unchangedEvents.stdout.trim(), '1')
   })
 
   test('abandon-active holds local deploy lock and official lease through the audited transition', async () => {
@@ -1586,6 +1682,31 @@ describe('v5 release safety lanes', () => {
     assert.match(untraversableResult.stderr, /not world-readable\/traversable/)
   })
 
+  test('legacy serving baseline compat allows only a missing cursor skill', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-legacy-cursor-')); dirs.push(dir)
+    const release = path.join(dir, 'release')
+    const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
+    await mkdir(path.dirname(baseline), { recursive: true })
+    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
+    await rm(path.join(baseline, 'skills/cursor-cli'), { recursive: true })
+    const strict = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
+    assert.notEqual(strict.status, 0)
+    const compat = spawnSync('bash', [baselineGuard, 'harden-release-legacy-cursor', release], { encoding: 'utf8' })
+    assert.equal(compat.status, 0, compat.stderr)
+    await mkdir(path.join(baseline, 'skills/undeclared'))
+    await writeFile(path.join(baseline, 'skills/undeclared/SKILL.md'), '# unexpected\n')
+    const drift = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', release], { encoding: 'utf8' })
+    assert.notEqual(drift.status, 0)
+    assert.match(drift.stderr, /skill manifest mismatch/)
+
+    const source = await readFile(deploy, 'utf8')
+    const prepare = source.match(/prepare_live_baseline_safety\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(prepare, /harden_legacy_release_baseline "\$live_release"/)
+    assert.match(prepare, /assert_legacy_release_baseline_security "\$live_release"/)
+    assert.doesNotMatch(prepare, /harden_release_baseline "\$live_release"/)
+    assert.doesNotMatch(prepare, /assert_release_baseline_security "\$live_release"/)
+  })
+
   test('baseline release/config guards cover build, slots, smoke, canary and rollback activation', async () => {
     const [source, overrides, unitA, unitB, portGuardSocket, portGuardService, indexSource] = await Promise.all([
       readFile(deploy, 'utf8'),
@@ -1616,7 +1737,7 @@ describe('v5 release safety lanes', () => {
     assert.match(portGuardService, /^ExecStart=\/usr\/lib\/systemd\/systemd-socket-proxyd .*baseline-port-disabled\.sock$/m)
 
     const transition = source.match(/prepare_live_baseline_safety\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
-    assert.ok(transition.indexOf('install_v5_slot_units') < transition.indexOf('harden_release_baseline'))
+    assert.ok(transition.indexOf('install_v5_slot_units') < transition.indexOf('harden_legacy_release_baseline'))
     const bootstrap = source.match(/^bootstrap\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
     assert.ok(bootstrap.indexOf('install_v5_slot_units') < bootstrap.indexOf('harden_release_baseline "$REMOTE_SRC"'))
     assert.ok(bootstrap.indexOf('install_v5_slot_units') < bootstrap.indexOf('rsync -az --delete'))
@@ -1948,6 +2069,23 @@ describe('v5 release safety lanes', () => {
         `${mode} must not depend on forward migrations declared only by current HEAD`,
       )
     }
+
+    const evidenceDir = await mkdtemp(path.join(tmpdir(), 'v5-close-emergency-debt-'))
+    dirs.push(evidenceDir)
+    const evidenceFile = path.join(evidenceDir, 'evidence.json')
+    await writeFile(evidenceFile, '{}\n')
+    const closeDebt = run(deploy, [
+      '--dry-run',
+      '--close-emergency-debt=INC-20260812-FRAME-RESET',
+      `--protected-merge-sha=${'a'.repeat(40)}`,
+      `--ci-evidence-file=${evidenceFile}`,
+    ])
+    assert.equal(closeDebt.status, 0, closeDebt.stderr || closeDebt.stdout)
+    assert.doesNotMatch(
+      closeDebt.stdout + closeDebt.stderr,
+      /校验 requiredMigrations 已全部记录/,
+      'emergency debt closure uses its existing schema and must not depend on unrelated forward migrations',
+    )
   })
 
   test('post-finalize egress handoff refreshes the committed active lane before smoke or rollback', () => {
@@ -3437,9 +3575,11 @@ describe('v5 release safety lanes', () => {
       'hotcfg_ship_lib() { :; }',
       'ssh() {',
       '  if [[ "$*" == *"docker image inspect"* && "$*" == *"source_commit"* ]]; then',
-      `    printf '%s|%s|%s\\n' "\${ACTUAL_ID:-${imageId}}" "\${SOURCE_COMMIT:-${sourceCommit}}" "\${EMBED_SOURCE:-0}"`,
+      `    printf '%s|%s|%s|%s\\n' "\${ACTUAL_ID:-${imageId}}" "\${SOURCE_COMMIT:-${sourceCommit}}" "\${EMBED_SOURCE:-0}" "\${INCLUDE_GROK:-1}"`,
       '  elif [[ "$*" == *"docker image inspect"* ]]; then',
       `    printf '%s\\n' "\${ACTUAL_ID:-${imageId}}"`,
+      '  elif [[ "$*" == *"--entrypoint grok-native"* ]]; then',
+      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.3 (test)}"',
       '  elif [[ "$*" == *"OC_RUNTIME_RELEASE"* ]]; then',
       '    printf "%s\\n" /runtime/prev',
       '  else',
@@ -3473,6 +3613,8 @@ describe('v5 release safety lanes', () => {
     for (const [env, pattern] of [
       [{ ACTUAL_ID: `sha256:${'9'.repeat(64)}` }, /immutable ID 漂移/],
       [{ EMBED_SOURCE: '1' }, /只接受 slim image/],
+      [{ INCLUDE_GROK: '0' }, /缺 official Grok binary/],
+      [{ GROK_VERSION: 'grok 1.0.2 (old)' }, /Grok binary=/],
       [{ SOURCE_COMMIT: 'a'.repeat(40), ANCESTOR_RC: '1' }, /不是 canonical HEAD 的可验证 ancestor/],
     ] as const) {
       await writeFile(capture, '')
@@ -7372,6 +7514,11 @@ wait $!
     assert.match(source, /regressionTests!=='PASS'/)
     assert.match(source, /j\.ci!=='PASS'/)
     assert.match(source, /j\.commit!==process\.argv\[3\]/)
+    const closeStart = source.indexOf('\nclose_emergency_debt() {')
+    const closeEnd = source.indexOf('\n}\n\nset_luna_visibility()', closeStart)
+    const close = source.slice(closeStart, closeEnd)
+    assert.match(close, /local_head="\$\(git rev-parse HEAD/)
+    assert.match(close, /"\$local_head" == "\$PROTECTED_MERGE_SHA"/)
 
     const canaryStart = source.indexOf('\ncanary() {')
     const canaryEnd = source.indexOf('\n# 内部账号 allowlist', canaryStart)
@@ -7396,6 +7543,14 @@ wait $!
 
   test('real-turn canary requires exact answer and keeps reconnect signals attempt-local', async () => {
     const source = await readFile(turnCanary, 'utf8')
+    assert.match(
+      source,
+      /const DEFAULT_SILENCE_MS = MODEL === 'deepseek-v4-flash' \? 270_000 : 90_000/,
+    )
+    assert.match(
+      source,
+      /process\.env\.V5_TURN_SILENCE_MS \?\? DEFAULT_SILENCE_MS/,
+    )
     const attemptAt = source.indexOf('const attempt = () => new Promise')
     assert.ok(attemptAt >= 0)
     const beforeAttempt = source.slice(0, attemptAt)
@@ -7698,10 +7853,10 @@ esac
     assert.match(source, /glob\.glob\(os\.path\.join\(expected_dir, '\*\/evals\/evals\.json'\)\)/)
     assert.match(source, /缺少评测结果/)
     assert.match(source, /baseline coverage: \{done_expected\}\/\{len\(expected\)\} done/)
-    assert.match(service, /TimeoutStartSec=43200/, '9 个技能 × 单技能 60min 后必须保留汇总余量')
+    assert.match(service, /TimeoutStartSec=43200/, '10 个技能 × 单技能 60min 后必须保留汇总余量')
   })
 
-  test('repository baseline eval inventory is the reviewed nine-skill set', async () => {
+  test('repository baseline eval inventory is the reviewed ten-skill set', async () => {
     const baselineSkills = path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline/skills')
     const entries = await readdir(baselineSkills, { withFileTypes: true })
     const actual: string[] = []
@@ -7720,6 +7875,7 @@ esac
       'memory-management',
       'office-pdf',
       'office-spreadsheet',
+      'research-slides',
       'scheduled-tasks',
       'scientific-figures',
       'skill-search',

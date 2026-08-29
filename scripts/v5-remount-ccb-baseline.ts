@@ -191,7 +191,7 @@ export async function verifyPlatformCliLinks(
 ): Promise<void> {
   const command = [
     "set -eu",
-    "for name in oc-plugin oc-ocr oc-h3 oc-video; do",
+    "for name in oc-plugin oc-ocr oc-h3 oc-video oc-cursor; do",
     '  link="/home/agent/.local/bin/$name"',
     '  source="/run/oc/platform/current/bin/$name"',
     '  test -L "$link"',

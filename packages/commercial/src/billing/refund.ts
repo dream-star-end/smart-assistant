@@ -355,8 +355,8 @@ export async function applyTurnWaiver(
       `INSERT INTO inbox_messages
          (audience,user_id,title,body_md,level,category,thread_key,created_by,notify_email,
           source_type,source_id,source_phase)
-       SELECT 'user',$1,'本轮已自动免单',$2,'notice','billing',
-              'billing:user:' || $1::text,a.id,FALSE,
+       SELECT 'user',$1::bigint,'本轮已自动免单',$2,'notice','billing',
+              'billing:user:' || ($1::bigint)::text,a.id,FALSE,
               'turn_waive',$3::bigint,'receipt'
          FROM (
            SELECT id FROM users

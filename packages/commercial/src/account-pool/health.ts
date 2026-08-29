@@ -220,7 +220,7 @@ export class AccountHealthTracker {
        WHERE status = 'cooldown'
          AND cooldown_until IS NOT NULL
          AND cooldown_until < NOW()
-         AND NOT (provider = 'codex' AND runtime_channel <> $1)
+         AND NOT (provider IN ('codex', 'grok') AND runtime_channel <> $1)
        RETURNING id::text AS id, status, health_score, cooldown_until`,
       [getRuntimeChannel()],
     );

@@ -666,11 +666,52 @@ describe('AutoDreamService cadence', () => {
     assert.equal(reports.length, 1)
     const publicStatus = await service.getPublicStatus(agentId)
     assert.equal(publicStatus.status, 'failed')
+    assert.equal(publicStatus.mode, 'legacy_memory_v1')
     assert.equal(publicStatus.lastReport?.status, 'failed')
     assert.match(publicStatus.lastReport?.summary ?? '', /没有改动记忆/)
     const serialized = JSON.stringify(publicStatus)
     assert.ok(!serialized.includes('SECRET_UPSTREAM'))
     assert.ok(!serialized.includes('hidden-model'))
+  })
+
+  it('projects optimizer mode beside the preserved legacy receipt', async () => {
+    const agentId = 'optimizer-with-legacy-receipt-agent'
+    await mkdir(paths.agentDir(agentId), { recursive: true })
+    await writeFile(
+      paths.agentAutoDreamState(agentId),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        status: 'failed',
+        counts: { sessionsSinceLastSuccess: 5, memoryFiles: 0, sessionsReviewed: 5 },
+        lastReport: {
+          status: 'failed',
+          finishedAt: '2026-08-08T12:46:34.193Z',
+          sessionsReviewed: 5,
+          summary: '本次整理未完成，没有改动记忆。',
+          created: [],
+          updated: [],
+          deleted: [],
+        },
+      })}\n`,
+    )
+    const service = new AutoDreamService({
+      policyClient: {
+        get: async () => ({
+          enabled: true as const,
+          mode: 'optimizer_v2' as const,
+          modelId: 'MiniMax-M3',
+          modelName: 'MiniMax M3 (512k)',
+          minIntervalHours: 24 * 7,
+          minNewSessions: 5,
+          auditContext: { preferences: {}, installedPlugins: [] },
+        }),
+      } as never,
+      runModel: async () => '',
+    })
+
+    const publicStatus = await service.getPublicStatus(agentId)
+    assert.equal(publicStatus.mode, 'optimizer_v2')
+    assert.equal(publicStatus.lastReport?.status, 'failed')
   })
 
   it('converts a stale running attempt into a visible failure without changing paid cadence', async () => {

@@ -57,6 +57,7 @@ export function AccountFormModal({
   const [groupId, setGroupId] = useState("");
   const [egressId, setEgressId] = useState("");
   const [saving, setSaving] = useState(false);
+  const [providerCreate, setProviderCreate] = useState<"claude" | "codex" | "grok">("claude");
 
   // OAuth 向导(create)。
   const [oauthState, setOauthState] = useState<string | null>(null);
@@ -66,8 +67,13 @@ export function AccountFormModal({
   const [authUrlFallback, setAuthUrlFallback] = useState<string | null>(null);
   const [exchanging, setExchanging] = useState(false);
   const [tokenFilled, setTokenFilled] = useState(false);
+  const [grokSessionId, setGrokSessionId] = useState<string | null>(null);
+  const [grokUserCode, setGrokUserCode] = useState<string | null>(null);
+  const [grokVerificationUrl, setGrokVerificationUrl] = useState<string | null>(null);
+  const [grokPrincipalType, setGrokPrincipalType] = useState<string | null>(null);
+  const [grokPrincipalId, setGrokPrincipalId] = useState<string | null>(null);
 
-  const provider = account?.provider || "claude";
+  const provider = isCreate ? providerCreate : account?.provider || "claude";
   const prefillEgress = account?.egress_proxy_id != null ? String(account.egress_proxy_id) : "";
   const prefillGroup = account?.group_id != null ? String(account.group_id) : "";
 
@@ -89,6 +95,12 @@ export function AccountFormModal({
     setOauthHint(null);
     setAuthUrlFallback(null);
     setTokenFilled(false);
+    setProviderCreate("claude");
+    setGrokSessionId(null);
+    setGrokUserCode(null);
+    setGrokVerificationUrl(null);
+    setGrokPrincipalType(null);
+    setGrokPrincipalId(null);
     setDepsError(null);
     setDepsLoading(true);
     let alive = true;
@@ -114,8 +126,7 @@ export function AccountFormModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, account]);
 
-  const groupProvider = provider === "codex" ? "codex" : "claude";
-  const groupOptions = groups.filter((g) => g.provider === groupProvider);
+  const groupOptions = groups.filter((g) => g.provider === provider);
   const egressInActive = proxies.some((p) => String(p.id) === egressId);
 
   const startOAuth = useCallback(async () => {
@@ -123,7 +134,7 @@ export function AccountFormModal({
       const r = await adminSend<{ authUrl?: string; state?: string }>(
         "POST",
         "/accounts/oauth/start",
-        { provider: "claude" },
+        { provider },
       );
       if (!r.authUrl || !r.state) {
         toast("OAuth 启动返回不完整", "error");
@@ -142,7 +153,110 @@ export function AccountFormModal({
     } catch (e) {
       toast(`OAuth 启动失败: ${errMsg(e)}`, "error");
     }
-  }, [toast]);
+  }, [provider, toast]);
+
+  const startGrokOAuth = useCallback(async () => {
+    if (!egressId) {
+      toast("请先选择 egress 代理池条目", "error");
+      return;
+    }
+    setExchanging(true);
+    try {
+      const r = await adminSend<{
+        status?: string;
+        session_id?: string;
+        verification_url?: string;
+        user_code?: string;
+      }>("POST", "/accounts/grok-device/start", { egress_proxy_id: egressId });
+      if (!r.session_id || !r.verification_url || !r.user_code) {
+        toast("Grok 设备授权启动返回不完整", "error");
+        return;
+      }
+      setGrokSessionId(r.session_id);
+      setGrokVerificationUrl(r.verification_url);
+      setGrokUserCode(r.user_code);
+      const win = window.open(r.verification_url, "_blank", "noopener");
+      setOauthHint(win ? "授权页已打开，确认页面上的设备码后，本页会自动回填 token。" : "弹窗被拦截，请手动打开下方链接。");
+    } catch (e) {
+      toast(`Grok 授权启动失败: ${errMsg(e)}`, "error");
+    } finally {
+      setExchanging(false);
+    }
+  }, [egressId, toast]);
+
+  useEffect(() => {
+    if (!open || !grokSessionId) return;
+    let alive = true;
+    let polling = false;
+    const poll = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const r = await adminGet<{
+          status: "pending" | "complete" | "failed";
+          access_token?: string;
+          refresh_token?: string;
+          expires_at?: string;
+          principal_type?: string;
+          principal_id?: string;
+          error?: string;
+        }>(`/accounts/grok-device/${encodeURIComponent(grokSessionId)}`);
+        if (!alive || r.status === "pending") return;
+        if (r.status === "complete" && r.access_token && r.refresh_token && r.expires_at) {
+          setToken(r.access_token);
+          setRefresh(r.refresh_token);
+          setExpires(r.expires_at);
+          setGrokPrincipalType(r.principal_type ?? null);
+          setGrokPrincipalId(r.principal_id ?? null);
+          setTokenFilled(true);
+          setGrokSessionId(null);
+          toast('Grok OAuth 已完成，token 已写入表单。', "success");
+          return;
+        }
+        setGrokSessionId(null);
+        toast(`Grok 授权失败: ${r.error || "未知错误"}`, "error");
+      } catch (e) {
+        if (alive) {
+          setGrokSessionId(null);
+          toast(`Grok 授权状态读取失败: ${errMsg(e)}`, "error");
+        }
+      } finally {
+        polling = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1500);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [open, grokSessionId, toast]);
+
+  useEffect(() => {
+    if (open || !grokSessionId) return;
+    void adminSend("DELETE", `/accounts/grok-device/${encodeURIComponent(grokSessionId)}`).catch(() => {});
+    setGrokSessionId(null);
+  }, [open, grokSessionId]);
+
+  const changeProvider = useCallback((next: "claude" | "codex" | "grok") => {
+    if (grokSessionId) {
+      void adminSend("DELETE", `/accounts/grok-device/${encodeURIComponent(grokSessionId)}`).catch(() => {});
+    }
+    setProviderCreate(next);
+    setGroupId("");
+    setToken("");
+    setRefresh("");
+    setExpires("");
+    setOauthState(null);
+    setStep2(false);
+    setTokenFilled(false);
+    setGrokSessionId(null);
+    setGrokUserCode(null);
+    setGrokVerificationUrl(null);
+    setGrokPrincipalType(null);
+    setGrokPrincipalId(null);
+    setOauthHint(null);
+  }, [grokSessionId]);
 
   const exchangeOAuth = useCallback(async () => {
     if (!oauthState) {
@@ -203,6 +317,10 @@ export function AccountFormModal({
       body.provider = provider;
       if (refresh.trim()) body.oauth_refresh_token = isNull(refresh) ? null : refresh.trim();
       if (expires.trim()) body.oauth_expires_at = isNull(expires) ? null : expires.trim();
+      if (provider === "grok" && grokPrincipalType && grokPrincipalId) {
+        body.oauth_principal_type = grokPrincipalType;
+        body.oauth_principal_id = grokPrincipalId;
+      }
       if (subEnd.trim()) body.subscription_end_at = isNull(subEnd) ? null : subEnd.trim();
       if (groupId) body.group_id = groupId;
     } else {
@@ -236,10 +354,11 @@ export function AccountFormModal({
     }
   }, [
     label, plan, isCreate, token, egressId, provider, refresh, expires, subEnd, groupId,
+    grokPrincipalType, grokPrincipalId,
     statusEdit, prefillEgress, prefillGroup, account, onOpenChange, onSaved, toast,
   ]);
 
-  const defaultGroupLabel = isCreate ? "— 默认 Claude 官方订阅组 —" : "— 未绑定 —";
+  const defaultGroupLabel = isCreate ? `— 默认 ${provider} 官方订阅组 —` : "— 未绑定 —";
 
   return (
     <Modal
@@ -271,34 +390,90 @@ export function AccountFormModal({
       ) : (
         <div className="flex flex-col gap-4">
           {isCreate && (
+            <Field label="provider">
+              <Select value={provider} onChange={(e) => changeProvider(e.target.value as "claude" | "codex" | "grok")}>
+                <option value="claude">Claude Code</option>
+                <option value="codex">Codex</option>
+                <option value="grok">Grok Build</option>
+              </Select>
+            </Field>
+          )}
+
+          <Field
+            label={`egress 代理池条目${isCreate ? "(必选)" : "(必选;不可清空)"}`}
+            hint={`OAuth 登录与后续模型请求固定走同一条账号出口;此处仅显示 active 项${
+              !isCreate && egressId && !egressInActive ? ",当前条目已被禁用" : ""
+            }。`}
+          >
+            <Select value={egressId} onChange={(e) => setEgressId(e.target.value)}>
+              {isCreate && (
+                <option value="" disabled>
+                  — 请选择代理池条目 —
+                </option>
+              )}
+              {proxies.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label} &lt;{p.url_masked || ""}&gt;
+                </option>
+              ))}
+              {!isCreate && egressId && !egressInActive && (
+                <option value={egressId}>
+                  {account?.egress_proxy_pool_label || `#${egressId}`}(已禁用)
+                </option>
+              )}
+            </Select>
+          </Field>
+
+          {isCreate && (
             <div className="rounded-lg border border-accent/40 bg-accent-soft/50 p-3.5">
               <div className="mb-2 flex items-center gap-1.5 text-[13px] font-semibold text-fg">
                 <KeyRound size={15} className="text-accent" /> OAuth 授权(推荐)
               </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <Button size="sm" variant="accent" onClick={startOAuth} disabled={exchanging}>
-                  ① 打开授权页
-                </Button>
-                <span className="text-[12px] text-muted">新页签授权 → 复制回调 URL 里的 code</span>
-              </div>
-              {authUrlFallback && (
-                <p className="mt-2 break-all font-mono text-[11px] text-muted">{authUrlFallback}</p>
-              )}
-              {step2 && (
-                <div className="mt-3 flex flex-col gap-1.5">
-                  <span className="text-[12px] text-muted">② 粘贴 code(或整段回调 URL,自动抽 code):</span>
-                  <div className="flex gap-2">
-                    <Input
-                      value={oauthCode}
-                      onChange={(e) => setOauthCode(e.target.value)}
-                      placeholder="粘 code 或 URL"
-                      className="flex-1"
-                    />
-                    <Button size="sm" variant="accent" onClick={exchangeOAuth} disabled={exchanging}>
-                      {exchanging ? <Spinner className="size-4" /> : "③ 换 token"}
+              {provider === "grok" ? (
+                <>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button size="sm" variant="accent" onClick={startGrokOAuth} disabled={exchanging || !!grokSessionId}>
+                      {exchanging || grokSessionId ? <Spinner className="size-4" /> : "打开 Grok 设备授权"}
                     </Button>
+                    <span className="text-[12px] text-muted">使用 xAI 订阅账号登录，完成后自动回填。</span>
                   </div>
-                </div>
+                  {grokVerificationUrl && (
+                    <p className="mt-2 break-all font-mono text-[11px] text-muted">{grokVerificationUrl}</p>
+                  )}
+                  {grokUserCode && (
+                    <p className="mt-2 text-[12px] text-muted">
+                      页面确认码: <strong className="font-mono text-fg">{grokUserCode}</strong>
+                    </p>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button size="sm" variant="accent" onClick={startOAuth} disabled={exchanging}>
+                      ① 打开授权页
+                    </Button>
+                    <span className="text-[12px] text-muted">新页签授权 → 复制回调 URL 里的 code</span>
+                  </div>
+                  {authUrlFallback && (
+                    <p className="mt-2 break-all font-mono text-[11px] text-muted">{authUrlFallback}</p>
+                  )}
+                  {step2 && (
+                    <div className="mt-3 flex flex-col gap-1.5">
+                      <span className="text-[12px] text-muted">② 粘贴 code(或整段回调 URL,自动抽 code):</span>
+                      <div className="flex gap-2">
+                        <Input
+                          value={oauthCode}
+                          onChange={(e) => setOauthCode(e.target.value)}
+                          placeholder="粘 code 或 URL"
+                          className="flex-1"
+                        />
+                        <Button size="sm" variant="accent" onClick={exchangeOAuth} disabled={exchanging}>
+                          {exchanging ? <Spinner className="size-4" /> : "③ 换 token"}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                </>
               )}
               {oauthHint && <p className="mt-2 text-[12px] text-muted">{oauthHint}</p>}
               {tokenFilled && (
@@ -380,30 +555,6 @@ export function AccountFormModal({
             </Select>
           </Field>
 
-          <Field
-            label={`egress 代理池条目${isCreate ? "(必选)" : "(必选;不可清空)"}`}
-            hint={`从「代理池」页维护可用条目;此处仅显示 active 项${
-              !isCreate && egressId && !egressInActive ? ",当前条目已被禁用" : ""
-            }。`}
-          >
-            <Select value={egressId} onChange={(e) => setEgressId(e.target.value)}>
-              {isCreate && (
-                <option value="" disabled>
-                  — 请选择代理池条目 —
-                </option>
-              )}
-              {proxies.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.label} &lt;{p.url_masked || ""}&gt;
-                </option>
-              ))}
-              {!isCreate && egressId && !egressInActive && (
-                <option value={egressId}>
-                  {account?.egress_proxy_pool_label || `#${egressId}`}(已禁用)
-                </option>
-              )}
-            </Select>
-          </Field>
         </div>
       )}
     </Modal>

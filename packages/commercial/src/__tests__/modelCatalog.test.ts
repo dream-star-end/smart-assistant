@@ -91,6 +91,19 @@ const SOL = entry({
     ccb: { capabilityZero: false, supportsThinking: false },
   },
 });
+const GROK = entry({
+  entryId: 3,
+  modelId: "grok-build",
+  engine: "grok",
+  providerId: "grok",
+  upstreamModelId: "grok-4.6",
+  contextWindow: 500_000,
+  capabilityProfile: {
+    supportsVision: false,
+    reasoning: { supported: ["low", "medium", "high"], codexModelDefault: null },
+    ccb: { capabilityZero: false, supportsThinking: false },
+  },
+});
 
 // ─── canonicalJson ───────────────────────────────────────────────────────
 
@@ -340,6 +353,20 @@ describe("per-uid 投影", () => {
       s.listForUser({ uid: 1, role: "admin", grantedModelIds: new Set(["hidden-model"]) }).map((r) => r.sortOrder),
       [10, 20, 30],
     );
+  });
+
+  test("Grok engine 是管理员硬闸:public/显式 grant 都不能给普通用户放行", () => {
+    const grok = snap({
+      entries: [GLM, GROK],
+      pricing: [price("glm-5.2"), price("grok-build", { visibility: "public" })],
+    });
+    const user = { uid: 7, role: "user" as const, grantedModelIds: new Set(["grok-build"]) };
+    const admin = { uid: 1, role: "admin" as const, grantedModelIds: new Set<string>() };
+    assert.equal(grok.canUseModel(user, "grok-build"), false);
+    assert.equal(grok.canUseModel(admin, "grok-build"), true);
+    assert.equal(grok.isEngineReportedModel("grok-build"), true);
+    assert.deepEqual(grok.listForUser(user).map((row) => row.modelId), ["glm-5.2"]);
+    assert.deepEqual(grok.listForUser(admin).map((row) => row.modelId), ["glm-5.2", "grok-build"]);
   });
 
   test("projectionRevision 是 per-uid 的:同内容不同 uid → 不同 hash", () => {

@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
-import { query } from "../db/queries.js";
+import { query, tx } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { signAccess } from "../auth/jwt.js";
 import { createCommercialHandler } from "../http/router.js";
@@ -307,6 +307,8 @@ describe("transitionRuleState ack 重置", () => {
     assert.ok(row);
     assert.equal(row.acked, true, "ack preserved on no-op");
     assert.equal(row.acked_by, String(adminId));
+    assert.equal(row.classification, "firing");
+    assert.equal(row.stale, false);
   });
 
   test("true → false 清 ack(resolved 下 ack 字段无意义)", async (t) => {
@@ -321,6 +323,7 @@ describe("transitionRuleState ack 重置", () => {
     assert.equal(row.acked, false, "ack cleared on resolve");
     assert.equal(row.acked_at, null);
     assert.equal(row.acked_by, null);
+    assert.equal(row.classification, "recovered");
   });
 
   test("false → true 清 ack(新一轮告警不继承旧确认)", async (t) => {
@@ -336,6 +339,24 @@ describe("transitionRuleState ack 重置", () => {
     assert.ok(row);
     assert.equal(row.firing, true);
     assert.equal(row.acked, false, "fresh fire starts unacked");
+  });
+
+  test("firing=true 但超过评估新鲜度时分类为 stale，而非当前 firing", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await transitionRuleState("stale.firing.rule", true, "stale-k", {});
+    await tx(async (client) => {
+      await client.query("SELECT set_config('oc.selfheal_condition_writer','1',true)");
+      await client.query(
+        `UPDATE admin_alert_rule_state
+            SET last_evaluated_at=NOW()-INTERVAL '16 minutes'
+          WHERE rule_id='stale.firing.rule'`,
+      );
+    });
+    const row = (await listRuleStates()).find((r) => r.rule_id === "stale.firing.rule");
+    assert.ok(row);
+    assert.equal(row.firing, true);
+    assert.equal(row.stale, true);
+    assert.equal(row.classification, "stale");
   });
 });
 

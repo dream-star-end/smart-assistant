@@ -85,7 +85,15 @@ export const ADMIN_AUDIT_ACTIONS = {
 
   // ── 反馈/收件箱────────────────────────────────────────────────────
   "feedback.ack": { kind: "write", mode: "tx" },
+  "feedback.assign": { kind: "write", mode: "tx" },
+  "feedback.priority": { kind: "write", mode: "tx" },
+  "feedback.resolution": { kind: "write", mode: "tx" },
+  "feedback.close": { kind: "write", mode: "tx" },
+  "feedback.reopen": { kind: "write", mode: "tx" },
   "auto_dream_finding.status": { kind: "write", mode: "tx" },
+  "auto_dream_finding.owner": { kind: "write", mode: "tx" },
+  "auto_dream_finding.update": { kind: "write", mode: "tx" },
+  "auto_dream_finding.batch": { kind: "write", mode: "tx" },
   "inbox.create": { kind: "write", mode: "best-effort" },
   "inbox.delete": { kind: "write", mode: "best-effort" },
 
@@ -128,6 +136,7 @@ export const ADMIN_AUDIT_ACTIONS = {
   "marketplace.skill.review_batch": { kind: "write", mode: "best-effort" },
   "marketplace.skill.revoke": { kind: "write", mode: "best-effort" },
   "marketplace.skill.featured": { kind: "write", mode: "best-effort" },
+  "tutorial.review": { kind: "write", mode: "best-effort" },
 
   // ── 连接器平台 OAuth App(平台自有 client 凭据 provisioning)────────
   // 这是 clientProvisioning='platform' 的**信任闸**:有没有这一行,决定用户能不能用平台

@@ -38,7 +38,8 @@ const MAX_HOTKEYS = 32;
 
 /**
  * 偏好 Tab：外观主题（接 useTheme，写穿到 preferences）+ 默认模型 + 思考深度 +
- * 通知开关 + 快捷键，最后嵌 API Key 自管。prefs 状态由 SettingsCenter 集中持有，
+ * 通知开关。快捷键已拆到独立导航（pane="hotkeys"），仍读写同一份 prefs。
+ * 最后嵌 API Key 自管。prefs 状态由 SettingsCenter 集中持有，本组件只负责 patch。
  * 本组件受控（onPatch 返回后由父刷新快照）。
  *
  * 主题权威源仍是 useTheme（live + localStorage）；这里只在用户切换时写穿一份到
@@ -55,6 +56,7 @@ export function PreferencesTab({
   onUpgrade,
   onOpenMemory,
   canManageApiKeys = false,
+  pane = "preferences",
 }: {
   auth: AuthSession;
   prefs: PrefsView;
@@ -66,6 +68,8 @@ export function PreferencesTab({
   onUpgrade: () => void;
   onOpenMemory: () => void;
   canManageApiKeys?: boolean;
+  /** 快捷键从偏好拆到独立导航；hotkeys 仍读同一份 prefs。 */
+  pane?: "preferences" | "hotkeys";
 }) {
   const [models, setModels] = useState<PublicModel[]>([]);
   const [err, setErr] = useState<string | null>(null);
@@ -109,6 +113,21 @@ export function PreferencesTab({
     prefs.default_effort && supportedEfforts.includes(prefs.default_effort)
       ? prefs.default_effort
       : "";
+
+  if (pane === "hotkeys") {
+    return (
+      <div className="flex flex-col">
+        {err && (
+          <div className="px-5 pt-3">
+            <Alert tone="danger" className="text-[12.5px]">
+              {err}
+            </Alert>
+          </div>
+        )}
+        <HotkeysEditor hotkeys={prefs.hotkeys ?? {}} onPatch={patch} />
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col">
@@ -202,7 +221,7 @@ export function PreferencesTab({
                 </span>
               </div>
               <p className="mt-1 text-[12.5px] leading-relaxed text-muted">
-                DeepSeek V4 Flash 结合平台功能与技能，全面审计会话、操作和日志，给出记忆、设置、技能、规则、Agent、插件与定时任务优化建议。
+                MiniMax M3 结合平台功能与技能，全面审计会话、操作和日志，给出记忆、设置、技能、规则、Agent、插件与定时任务优化建议。
               </p>
             </div>
             {autoDream?.enabled || (autoDream?.eligible && autoDream.available) ? (
@@ -300,7 +319,7 @@ export function PreferencesTab({
       >
         <div className="space-y-3 text-[13px] leading-relaxed text-muted">
           <p>
-            开启后，DeepSeek V4 Flash 会在独立、无工具、无网络的隔离环境中读取你在 V5 内保留的相关会话、操作日志、用量，以及当前记忆、技能、规则、Agent、插件和定时任务配置。
+            开启后，MiniMax M3 会在独立、无工具、无网络的隔离环境中读取你在 V5 内保留的相关会话、操作日志、用量，以及当前记忆、技能、规则、Agent、插件和定时任务配置。
           </p>
           <div className="rounded-xl border border-border bg-surface p-3">
             <p className="font-medium text-fg">你始终拥有最终决定权</p>
@@ -338,9 +357,6 @@ export function PreferencesTab({
           </label>
         ))}
       </div>
-
-      {/* 快捷键 */}
-      <HotkeysEditor hotkeys={prefs.hotkeys ?? {}} onPatch={patch} />
 
       {/* API Key 自管（admin-only rollout 命中 403 时整段隐藏） */}
       {canManageApiKeys && <ApiKeysSection auth={auth} />}

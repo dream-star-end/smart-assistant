@@ -19,7 +19,7 @@
 //   V5_CANARY_PASSWORD_FILE(默认 /root/.secrets/v5-canary.password)
 //   V5_TURN_MODEL(默认 gpt-5.6-sol —— codex 引擎侧,即 2026-07-17 的盲区面)
 //   V5_TURN_ATTEMPTS(默认 8;容器冷启动时 bridge 会 close,需重连)
-//   V5_TURN_SILENCE_MS(默认 90000;xhigh 思考档需要长窗;仅作兜底,判成靠三信号)
+//   V5_TURN_SILENCE_MS(默认 deepseek-v4-flash=270000,其它=90000;仅作兜底,判成靠三信号)
 //   V5_CANARY_ALLOW_LEDGER_COST_EVIDENCE(默认 0;仅供 0% candidate 的 CCB
 //     探针使用。exactText+final 到齐但 live cost frame 因 control VIP 仍归旧 active
 //     而不可达时,输出唯一 session/model proof 并以 rc=3 交给 deploy 脚本做精确 DB 核验)
@@ -40,7 +40,9 @@ const EMAIL = process.env.V5_CANARY_EMAIL ?? 'v5-canary@claudeai.chat'
 const PASSWORD_FILE = process.env.V5_CANARY_PASSWORD_FILE ?? '/root/.secrets/v5-canary.password'
 const MODEL = process.env.V5_TURN_MODEL ?? 'gpt-5.6-sol'
 const ATTEMPTS = Number(process.env.V5_TURN_ATTEMPTS ?? 8)
-const SILENCE_MS = Number(process.env.V5_TURN_SILENCE_MS ?? 90000)
+// 两次独立生产实测 DeepSeek 正常完成均约 233 秒；270 秒仍受部署脚本 300 秒外层门约束。
+const DEFAULT_SILENCE_MS = MODEL === 'deepseek-v4-flash' ? 270_000 : 90_000
+const SILENCE_MS = Number(process.env.V5_TURN_SILENCE_MS ?? DEFAULT_SILENCE_MS)
 const ALLOW_LEDGER_COST_EVIDENCE =
   (process.env.V5_CANARY_ALLOW_LEDGER_COST_EVIDENCE ?? '0') === '1'
 const LEDGER_COST_GRACE_MS = 5_000

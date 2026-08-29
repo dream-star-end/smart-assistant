@@ -966,6 +966,31 @@ describe("V5 synthetic exact-eval helpers", () => {
       throw new Error(`unexpected fetch: ${url}`);
     };
     type Listener = (event: { data?: string; code?: number }) => void;
+    let injectedErrorFrames: Array<(
+      inbound: { peer: { id: string; kind: string }; clientMessageId: string },
+    ) => Record<string, unknown>> = [
+      () => ({
+        type: "error",
+        code: "UNAUTHORIZED_MODEL",
+        peer: { id: "foreign-peer", kind: "dm" },
+      }),
+      () => ({
+        type: "outbound.turn_error",
+        code: "UNAUTHORIZED_MODEL",
+        clientMessageId: "foreign-client-message",
+      }),
+      () => ({
+        type: "outbound.error",
+        code: "UNAUTHORIZED_MODEL",
+        peer: { id: "foreign-peer", kind: "dm" },
+        clientMessageId: "foreign-client-message",
+      }),
+      () => ({
+        type: "outbound.message",
+        error: "stale replay error",
+        peer: { id: "foreign-peer", kind: "dm" },
+      }),
+    ];
     class FakeSocket {
       listeners = new Map<string, Listener[]>();
 
@@ -989,6 +1014,9 @@ describe("V5 synthetic exact-eval helpers", () => {
       send(text: string): void {
         const inbound = JSON.parse(text);
         queueMicrotask(() => {
+          for (const createFrame of injectedErrorFrames) {
+            this.emit("message", { data: JSON.stringify(createFrame(inbound)) });
+          }
           this.emit("message", { data: JSON.stringify({
             type: "outbound.message",
             peer: inbound.peer,
@@ -1074,6 +1102,31 @@ describe("V5 synthetic exact-eval helpers", () => {
       const claims = await verifyAccess(sessionAccessToken, jwtSecret);
       assert.equal(claims.sub, "247");
       assert.equal(claims.role, "user");
+
+      for (const currentError of [
+        (inbound: { peer: { id: string; kind: string } }) => ({
+          type: "error",
+          code: "UNAUTHORIZED_MODEL",
+          peer: inbound.peer,
+        }),
+        (inbound: { clientMessageId: string }) => ({
+          type: "outbound.turn_error",
+          code: "UNAUTHORIZED_MODEL",
+          clientMessageId: inbound.clientMessageId,
+        }),
+        (inbound: { peer: { id: string; kind: string }; clientMessageId: string }) => ({
+          type: "outbound.error",
+          code: "UNAUTHORIZED_MODEL",
+          peer: inbound.peer,
+          clientMessageId: inbound.clientMessageId,
+        }),
+        () => ({ type: "error", code: "RELAY_CONNECTION_FAILED" }),
+        () => ({ error: "relay connection failed" }),
+      ]) {
+        injectedErrorFrames = [currentError];
+        await assert.rejects(() => execute(), /turn returned an error/);
+      }
+      injectedErrorFrames = [];
 
       watcherExitCode = 1;
       await assert.rejects(

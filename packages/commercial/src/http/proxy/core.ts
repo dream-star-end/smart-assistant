@@ -36,6 +36,7 @@ import {
   HttpError,
   REQUEST_ID_HEADER,
   buildSafeUpstreamHeaders,
+  isAnthropicContextTooLongError,
   isAnthropicInvalidRequestError,
   isProviderBoundHistoryError,
   isClientAbort,
@@ -263,6 +264,8 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       // 防止 boss 自己客户端 bug 反复打到账号 cooldown。
       const isClientBadRequest =
         upstream.status === 400 && isAnthropicInvalidRequestError(preview);
+      const isContextTooLong =
+        isClientBadRequest && isAnthropicContextTooLongError(preview);
       const routeProvider = findRouteProviderForModel(body.model);
       const isQuotaExhausted =
         routeProvider?.id === "moonshot" &&
@@ -315,6 +318,26 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
           requestId,
           { "Retry-After": String(Math.max(1, Math.ceil(retryMs / 1_000))) },
           { provider: routeProvider.id, retry_after_ms: retryMs },
+        );
+        return;
+      }
+      if (isContextTooLong) {
+        sendJsonError(
+          res,
+          413,
+          "PROMPT_TOO_LONG",
+          "Prompt exceeds the model context window",
+          requestId,
+        );
+        return;
+      }
+      if (isClientBadRequest) {
+        sendJsonError(
+          res,
+          400,
+          "INVALID_REQUEST",
+          "The upstream provider rejected this request",
+          requestId,
         );
         return;
       }

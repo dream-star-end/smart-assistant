@@ -752,6 +752,33 @@ function OfficeArtifactCard({ command, ext, title, icon, note }: {
   );
 }
 
+function DocxArtifactCard({ command }: { command: string }) {
+  const operation = command.match(/(?:^|\s)(?:\S*\/)?oc-docx\s+(convert|build|render|inspect|scrub)\b/)?.[1];
+  if (operation === "render") {
+    return (
+      <CardShell icon={<FileText className="size-4" />} title="Word 页面已渲染">
+        <div className="text-xs text-faint">已生成逐页原图和视觉质检副本，请继续逐页检查。</div>
+      </CardShell>
+    );
+  }
+  if (operation === "inspect") {
+    return (
+      <CardShell icon={<FileText className="size-4" />} title="Word 结构检查完成">
+        <div className="text-xs text-faint">已检查文档结构、元数据和逐页质检副本配对。</div>
+      </CardShell>
+    );
+  }
+  return (
+    <OfficeArtifactCard
+      command={command}
+      ext="docx"
+      title={operation === "scrub" ? "Word 文档已清理" : "Word 文档已生成"}
+      icon={<FileText className="size-4" />}
+      note="可在文件区下载；文档仍需按流程完成逐页质检后再交付。"
+    />
+  );
+}
+
 // ── 技能市场卡(oc-market search / installed) ────────────────────────────────
 
 interface MarketItem {
@@ -1445,14 +1472,7 @@ const OC_BODY_CARDS: Partial<Record<OcCli, (command: string, tool: ToolLike) => 
   "oc-poster": (_c, t) => obj(t, ArtifactCard),
   "oc-rank": (_c, t) => obj(t, RankCard),
   // 办公文档 CLI(输出是 pandoc/Quarto/Typst 日志而非 JSON,从命令行解析输出路径)。
-  "oc-docx": (c) =>
-    OfficeArtifactCard({
-      command: c,
-      ext: "docx",
-      title: "Word 文档已生成",
-      icon: <FileText className="size-4" />,
-      note: "可在文件区下载;数学公式/排版已按高质量 Word 模板渲染。",
-    }),
+  "oc-docx": (c) => <DocxArtifactCard command={c} />,
   "oc-pdf": (c) =>
     OfficeArtifactCard({
       command: c,

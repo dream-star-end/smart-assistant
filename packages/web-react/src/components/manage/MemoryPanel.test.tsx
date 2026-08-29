@@ -220,6 +220,28 @@ describe("MemoryPanel · 核心记忆文件列表", () => {
     expect(within(report).getByText(/没有发现值得长期保存的新信息/)).toBeInTheDocument();
   });
 
+  test("全面优化模式不再展示永远不会更新的旧版失败回执", async () => {
+    mockDream({
+      status: "failed",
+      mode: "optimizer_v2",
+      pendingSessions: 5,
+      lastReport: {
+        status: "failed",
+        finishedAt: new Date().toISOString(),
+        sessionsReviewed: 5,
+        summary: "本次整理未完成，没有改动记忆。",
+        created: [],
+        updated: [],
+        deleted: [],
+      },
+    });
+    mockIndex([]);
+
+    renderPanel();
+    await screen.findByText("还没有核心记忆");
+    expect(screen.queryByRole("region", { name: "Auto-Dream 梦境报告" })).not.toBeInTheDocument();
+  });
+
   test("中断且结果不确定时不谎称记忆一定没有改动", async () => {
     mockDream({
       status: "failed",

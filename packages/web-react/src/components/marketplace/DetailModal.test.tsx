@@ -74,6 +74,7 @@ test("详情页人向重排:适用场景 / 效果 / 详细介绍 / 分类徽章�
       surface: "marketplace",
       stage: "detail_view",
       outcome: "succeeded",
+      entitySlug: "academic-translate",
     }),
     "tok",
   );

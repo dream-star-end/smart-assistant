@@ -1053,6 +1053,27 @@ export function isAnthropicInvalidRequestError(bodyPreview: string): boolean {
   }
 }
 
+/** Narrowly identify provider-confirmed context exhaustion inside an
+ * Anthropic invalid_request_error. Generic 400s must not trigger a history
+ * rebuild: every branch requires both the subject and an overflow predicate. */
+export function isAnthropicContextTooLongError(bodyPreview: string): boolean {
+  if (!bodyPreview) return false;
+  try {
+    const obj = JSON.parse(bodyPreview);
+    if (obj?.error?.type !== "invalid_request_error") return false;
+    const message = obj?.error?.message;
+    if (typeof message !== "string") return false;
+    const normalized = message.toLowerCase();
+    return (
+      /\bcontext window\b\s+(?:(?:was|is|has been)\s+)?(?:exceed(?:ed|s)?|too long|maximum|max(?:imum)? length)\b/.test(normalized) ||
+      /\bprompt(?: length| size)?\b\s+(?:is\s+)?(?:too long|exceeds? (?:the )?(?:model )?context window)\b/.test(normalized) ||
+      /\b(?:input tokens?|input token count|token count)\b\s+(?:(?:is|are)\s+)?exceed(?:ed|s)?\b.{0,24}\b(?:maximum|max(?:imum)?|limit|context window)\b/.test(normalized)
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** True only for an explicit provider-bound history rejection. This narrow
  * predicate gates the one safe retry that removes signed assistant blocks;
  * generic 400s must never trigger a semantically different second request. */

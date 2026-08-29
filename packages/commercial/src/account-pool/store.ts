@@ -52,7 +52,7 @@ export type AccountStatus = (typeof ACCOUNT_STATUSES)[number];
  *   - 所有不传 provider 的调用方(scheduler.pick / listAccounts / createAccount)
  *     默认按 'claude' 走,与 v2 行为一致
  */
-export const ACCOUNT_PROVIDERS = ["claude", "codex"] as const;
+export const ACCOUNT_PROVIDERS = ["claude", "codex", "grok"] as const;
 export type AccountProvider = (typeof ACCOUNT_PROVIDERS)[number];
 
 /** 不含任何加密 / nonce 列的账号元信息 —— 安全打 log / 返 admin UI。 */
@@ -191,6 +191,8 @@ export interface CreateAccountInput {
   token: string;
   refresh?: string | null;
   expires_at?: Date | null;
+  oauth_principal_type?: string | null;
+  oauth_principal_id?: string | null;
   /**
    * 0064 — 订阅到期日(可选)。undefined / null = 不设置(列保持 NULL)。
    * 解析由 admin layer 完成,store 层只透传 Date | null。
@@ -483,9 +485,10 @@ export async function createAccount(
          egress_proxy, egress_proxy_id,
          account_uuid,
          persona,
-         runtime_channel
+         runtime_channel,
+         oauth_principal_type, oauth_principal_id
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13::jsonb, $14)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13::jsonb, $14, $15, $16)
        RETURNING ${META_COLUMNS}`,
       [
         provider,
@@ -502,6 +505,8 @@ export async function createAccount(
         accountUuid,
         JSON.stringify(persona),
         input.runtime_channel,
+        input.oauth_principal_type ?? null,
+        input.oauth_principal_id ?? null,
       ],
     );
     return parseMetaRow(res.rows[0]);
@@ -990,6 +995,8 @@ interface RawCodexSecretRow extends QueryResultRow {
   oauth_refresh_enc: Buffer | null;
   oauth_refresh_nonce: Buffer | null;
   oauth_expires_at: Date | null;
+  oauth_principal_type?: string | null;
+  oauth_principal_id?: string | null;
 }
 
 /**
@@ -1039,6 +1046,60 @@ export async function getCodexTokenSnapshotInTx(
       expires_at: row.oauth_expires_at,
     };
     // 成功路径:token/refresh 交给调用方,不在 finally 清零
+    token = null;
+    refresh = null;
+    return out;
+  } catch (err) {
+    if (token) zeroBuffer(token);
+    if (refresh) zeroBuffer(refresh);
+    throw err instanceof AeadError ? err : new AeadError("decryption failed", { cause: err });
+  } finally {
+    zeroBuffer(key);
+  }
+}
+
+export interface GrokTokenSnapshot extends CodexTokenSnapshot {
+  principal_type: string | null;
+  principal_id: string | null;
+}
+
+/** Grok uses the same encrypted OAuth columns but is never mounted into a container. */
+export async function getGrokTokenSnapshotInTx(
+  client: PoolClient,
+  id: bigint | string,
+  keyFn: () => Buffer = loadKmsKey,
+): Promise<GrokTokenSnapshot | null> {
+  const res = await client.query<RawCodexSecretRow>(
+    `SELECT id::text AS id, provider,
+       oauth_token_enc, oauth_nonce,
+       oauth_refresh_enc, oauth_refresh_nonce,
+       oauth_expires_at,
+       oauth_principal_type, oauth_principal_id
+     FROM claude_accounts
+     WHERE id = $1`,
+    [String(id)],
+  );
+  if (res.rows.length === 0) return null;
+  const row = res.rows[0];
+  if (row.provider !== "grok") {
+    throw new TypeError(`getGrokTokenSnapshot called on non-grok account ${String(id)} (provider=${row.provider})`);
+  }
+  const key = keyFn();
+  let token: Buffer | null = null;
+  let refresh: Buffer | null = null;
+  try {
+    token = decryptToBuffer(row.oauth_token_enc, row.oauth_nonce, key);
+    if (row.oauth_refresh_enc && row.oauth_refresh_nonce) {
+      refresh = decryptToBuffer(row.oauth_refresh_enc, row.oauth_refresh_nonce, key);
+    }
+    const out: GrokTokenSnapshot = {
+      id: BigInt(row.id),
+      token,
+      refresh,
+      expires_at: row.oauth_expires_at,
+      principal_type: row.oauth_principal_type ?? null,
+      principal_id: row.oauth_principal_id ?? null,
+    };
     token = null;
     refresh = null;
     return out;
@@ -1113,6 +1174,49 @@ export async function updateCodexTokenSnapshotInTx(
   } finally {
     zeroBuffer(key);
   }
+}
+
+export async function updateGrokTokenSnapshotInTx(
+  client: PoolClient,
+  id: bigint | string,
+  patch: { token: string; refresh?: string | null; expires_at: Date; last_error?: string | null },
+  keyFn: () => Buffer = loadKmsKey,
+): Promise<boolean> {
+  if (!patch.token) throw new TypeError("token must be non-empty string");
+  const key = keyFn();
+  try {
+    const tok = encrypt(patch.token, key);
+    const params: unknown[] = [String(id), tok.ciphertext, tok.nonce, patch.expires_at, patch.last_error ?? null];
+    const sets = ["oauth_token_enc = $2", "oauth_nonce = $3", "oauth_expires_at = $4", "last_error = $5", "updated_at = NOW()"];
+    if (patch.refresh !== undefined) {
+      let enc: Buffer | null = null;
+      let nonce: Buffer | null = null;
+      if (patch.refresh !== null) {
+        if (!patch.refresh) throw new TypeError("refresh must be non-empty string or null");
+        const ref = encrypt(patch.refresh, key);
+        enc = ref.ciphertext;
+        nonce = ref.nonce;
+      }
+      params.push(enc, nonce);
+      sets.push(`oauth_refresh_enc = $${params.length - 1}`, `oauth_refresh_nonce = $${params.length}`);
+    }
+    const res = await client.query(
+      `UPDATE claude_accounts SET ${sets.join(", ")} WHERE id = $1 AND provider = 'grok'`,
+      params,
+    );
+    return (res.rowCount ?? 0) > 0;
+  } finally {
+    zeroBuffer(key);
+  }
+}
+
+export async function getGrokTokenSnapshot(
+  id: bigint | string,
+  keyFn: () => Buffer = loadKmsKey,
+): Promise<GrokTokenSnapshot | null> {
+  const client = await getPool().connect();
+  try { return await getGrokTokenSnapshotInTx(client, id, keyFn); }
+  finally { client.release(); }
 }
 
 /**

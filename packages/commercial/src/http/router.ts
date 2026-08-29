@@ -53,6 +53,15 @@ import {
 } from '../marketplace/marketplaceRoutes.js'
 import { handleMarketplaceSearch } from '../marketplace/marketplaceSearch.js'
 import { isActiveAdmin, isInMaintenance } from '../middleware/maintenanceMode.js'
+import {
+  handleAdminPendingCommunityTutorials,
+  handleAdminReviewCommunityTutorial,
+  handleGetCommunityTutorial,
+  handleListCommunityTutorials,
+  handleListOwnCommunityTutorials,
+  handleSubmitCommunityTutorial,
+  handleWithdrawCommunityTutorial,
+} from '../tutorials/communityTutorialRoutes.js'
 import { ContainerUnreadyError } from '../ws/userChatBridge.js'
 import {
   handleAdminCreateAccountGroup,
@@ -70,6 +79,9 @@ import {
   handleAdminCreateAccount,
   handleAdminDeleteAccount,
   handleAdminGetAccount,
+  handleAdminGrokDeviceCancel,
+  handleAdminGrokDeviceStart,
+  handleAdminGrokDeviceStatus,
   handleAdminListAccounts,
   handleAdminListRefreshEvents,
   handleAdminOAuthExchange,
@@ -107,7 +119,7 @@ import {
   handleAdminExportOrdersCsv,
   handleAdminExportUsersCsv,
 } from './admin/export.js'
-import { handleAdminAckFeedback, handleAdminListFeedback } from './admin/feedback.js'
+import { handleAdminFeedbackPost, handleAdminListFeedback } from './admin/feedback.js'
 import {
   handleAdminListAutoDreamFindings,
   handleAdminUpdateAutoDreamFinding,
@@ -116,6 +128,8 @@ import {
   handleAdminCreateInbox,
   handleAdminDeleteInbox,
   handleAdminGetInboxEmailConfig,
+  handleAdminPreviewInbox,
+  handleAdminInboxStats,
   handleAdminListInbox,
 } from './admin/inbox.js'
 import { handleAdminListLedger } from './admin/ledger.js'
@@ -125,6 +139,7 @@ import {
   handleAdminTestLiterature,
 } from './admin/literature.js'
 import { handleAdminMetrics } from './admin/metrics.js'
+import { handleAdminOpsOverview } from './admin/opsOverview.js'
 import { handleAdminRemoveUserModelGrant } from './admin/modelGrants.js'
 import {
   handleAdminModelOpsOverview,
@@ -746,6 +761,44 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/container-preview/ticket', handler: handleCreateContainerPreviewTicket },
     { method: 'POST', path: '/api/container-preview/heartbeat', handler: handleHeartbeatContainerPreview },
     { method: 'POST', path: '/api/container-preview/revoke', handler: handleRevokeContainerPreview },
+    // ── 用户共建教程：公开目录 + 登录投稿 + 管理审核 ──
+    // approved 目录/详情允许匿名读取；投稿/我的/撤回要求浏览器用户 JWT；管理员审核
+    // 由 requireAdminVerifyDb 再核验数据库角色。/api/tutorials 不进入容器 bridge allowlist。
+    {
+      method: 'GET',
+      path: '/api/tutorials',
+      handler: handleListCommunityTutorials,
+    },
+    {
+      method: 'POST',
+      path: '/api/tutorials',
+      handler: (req, res) => handleSubmitCommunityTutorial(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/tutorials/mine',
+      handler: (req, res) => handleListOwnCommunityTutorials(req, res, deps),
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/tutorials/',
+      handler: (req, res) => handleWithdrawCommunityTutorial(req, res, deps),
+    },
+    {
+      method: 'GET',
+      pathPrefix: '/api/tutorials/',
+      handler: handleGetCommunityTutorial,
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials/pending',
+      handler: (req, res) => handleAdminPendingCommunityTutorials(req, res, deps),
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/tutorials/',
+      handler: (req, res) => handleAdminReviewCommunityTutorial(req, res, deps),
+    },
     // ── Skill marketplace (B2) — browser-only user/admin routes ──
     // These serve commercial browser users (requireAuth / requireAdminVerifyDb).
     // Agent-bypass is enforced structurally, NOT via BLOCKED_FOR_USER_RULES (that
@@ -896,6 +949,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/admin/security-events', handler: handleAdminListSecurityEvents },
     { method: 'GET', path: '/api/admin/host-audit', handler: handleAdminListHostAudit },
     { method: 'GET', path: '/api/admin/product-friction', handler: handleAdminProductFriction },
+    { method: 'GET', path: '/api/admin/ops-overview', handler: handleAdminOpsOverview },
     { method: 'GET', pathPrefix: '/api/admin/trace/', handler: handleAdminTraceLookup },
     // v5 自愈体系 — incident/repair 审计页。exact list 在 prefix 之前(matchRoute exact-first);
     // 详情/resolve 走 prefix,handler 内 regex 抠 :id 并区分 /resolve 尾段。
@@ -1013,6 +1067,9 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       path: '/api/admin/accounts/oauth/exchange',
       handler: handleAdminOAuthExchange,
     },
+    { method: 'POST', path: '/api/admin/accounts/grok-device/start', handler: handleAdminGrokDeviceStart },
+    { method: 'GET', pathPrefix: '/api/admin/accounts/grok-device/', handler: handleAdminGrokDeviceStatus },
+    { method: 'DELETE', pathPrefix: '/api/admin/accounts/grok-device/', handler: handleAdminGrokDeviceCancel },
     // R3:reset-cooldown 子资源。pathPrefix 命中 /accounts/,handler 内部用 regex 抠
     //  `/accounts/:id/reset-cooldown`;POST 会先匹配到这条(method 一致),
     //  adjustCredits 走的是不同 prefix。
@@ -1272,8 +1329,13 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', pathPrefix: '/api/admin/orders/', handler: handleAdminGetOrder },
     // P1-2 反馈 admin —— GET 列表 / POST :id/ack
     { method: 'GET', path: '/api/admin/feedback', handler: handleAdminListFeedback },
-    { method: 'POST', pathPrefix: '/api/admin/feedback/', handler: handleAdminAckFeedback },
+    { method: 'POST', pathPrefix: '/api/admin/feedback/', handler: handleAdminFeedbackPost },
     { method: 'GET', path: '/api/admin/auto-dream-findings', handler: handleAdminListAutoDreamFindings },
+    {
+      method: 'PATCH',
+      path: '/api/admin/auto-dream-findings/batch',
+      handler: handleAdminUpdateAutoDreamFinding,
+    },
     {
       method: 'PATCH',
       pathPrefix: '/api/admin/auto-dream-findings/',
@@ -1318,6 +1380,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     //                                              注:GET /api/admin/messages/email-config 走
     //                                              path 完全匹配,不是 prefix,所以独立项即可.
     { method: 'GET', path: '/api/admin/messages', handler: handleAdminListInbox },
+    { method: 'POST', path: '/api/admin/messages/preview', handler: handleAdminPreviewInbox },
+    { method: 'GET', path: '/api/admin/messages/stats', handler: handleAdminInboxStats },
     {
       method: 'GET',
       path: '/api/admin/messages/email-config',
@@ -1406,6 +1470,9 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     // Covers exact `/api/marketplace` + prefix `/api/marketplace/*`; admin
     // marketplace is already covered by `/api/admin/`.
     '/api/marketplace',
+    // 用户共建教程：匹配 exact `/api/tutorials` 与所有用户侧详情/投稿子路由。
+    // 管理审核路由已由 `/api/admin/` 认领。
+    '/api/tutorials',
     // V3 CC 外接 plan Phase 3(2026-05-18)— public-facing
     // `POST /api/anthropic/v1/messages`。必须列在这里,让:
     //   - maintenance gate(L802 起)能把维护期请求统一 503;

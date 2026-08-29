@@ -27,6 +27,7 @@ export interface InboxMessage {
   expires_at: string | null;
   read_count: number;
   recipients: number;
+  audience_snapshot_status: "captured" | "legacy_unavailable";
   notify_email: boolean;
   email_send_status: EmailSendStatus | null;
   email_sent_at: string | null;
@@ -37,6 +38,36 @@ export interface InboxMessage {
   source_type: string | null;
   source_id: string | null;
   source_phase: string | null;
+}
+
+export interface MessagePreviewResp {
+  audience: InboxAudience;
+  category: InboxCategory;
+  recipients: number;
+  sample: Array<{
+    user_id: string;
+    username: string | null;
+    traffic_class: string;
+  }>;
+  recipient_load: { p50_30d: number; p90_30d: number; max_30d: number };
+}
+
+export interface MessageStatsBreakdown {
+  source_type?: string;
+  category?: InboxCategory;
+  messages: number;
+  recipients: number;
+  reads: number;
+  read_rate: number | null;
+}
+
+export interface MessageStatsResp {
+  window_days: number;
+  snapshot_coverage: { captured_messages: number; legacy_unavailable_messages: number };
+  read_funnel: { messages: number; recipients: number; reads: number; read_rate: number | null };
+  by_source: MessageStatsBreakdown[];
+  by_category: MessageStatsBreakdown[];
+  recipient_load: { users: number; p50: number; p90: number; max: number; over_20: number; over_100: number };
 }
 
 export interface MessagesResp {

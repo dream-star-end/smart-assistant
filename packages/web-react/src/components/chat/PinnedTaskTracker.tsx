@@ -102,18 +102,24 @@ function TodoRow({ t, compact }: { t: TodoItem; compact?: boolean }) {
   );
 }
 
+export function isPinnedTaskTrackerVisible(todos: TodoItem[], active: boolean): boolean {
+  return active && todos.some((t) => !isDone(t));
+}
+
 export function PinnedTaskTracker({
   todos,
   active,
   tokenUsage,
+  compact,
 }: {
   todos: TodoItem[];
   active: boolean;
   tokenUsage?: TurnTokenUsageSnapshot;
+  /** 右栏内去掉中栏 max-w-3xl 外壳，避免双套宽度。 */
+  compact?: boolean;
 }) {
   const total = todos.length;
   const doneCount = todos.filter(isDone).length;
-  const hasIncomplete = todos.some((t) => !isDone(t));
   // 「正在执行的一条」:优先 in_progress,否则第一条未完成(即将执行)。仅在有未完成任务时
   // 渲染,故 active 必非空。
   const activeTodo = todos.find((t) => t.status === "in_progress") ?? todos.find((t) => !isDone(t)) ?? null;
@@ -146,9 +152,7 @@ export function PinnedTaskTracker({
 
   // 只在当前 turn 仍在执行时显示。停止/收尾/打开旧会话后,历史 plan/TodoWrite
   // 可能仍保留 pending/in_progress 状态用于 transcript,但不能继续钉在输入框上方误导用户。
-  if (!active) return null;
-  // 只在有未完成任务时显示:全部完成(或无任务)即隐藏,不留"完成"残条、不在打开旧会话时闪。
-  if (!hasIncomplete) return null;
+  if (!isPinnedTaskTrackerVisible(todos, active)) return null;
 
   const toggle = () => {
     setUserTouched(true);
@@ -156,7 +160,10 @@ export function PinnedTaskTracker({
   };
 
   return (
-    <div className="mx-auto mb-2 w-full max-w-3xl px-4">
+    <div
+      data-testid="pinned-task-tracker"
+      className={compact ? "" : "mx-auto mb-2 w-full max-w-3xl px-4"}
+    >
       <div className="overflow-hidden rounded-lg border border-border bg-elevated shadow-soft">
         {/* 头部:进度 + 折叠态显示「正在执行的一条」+ 展开/折叠 chevron */}
         <button

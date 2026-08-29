@@ -1049,13 +1049,34 @@ describe("invariant 1 — release ownership 4 阶段铁律", () => {
         ),
     });
     const res = await h.run(minBody());
-    assert.equal(res.statusCode, 502);
+    assert.equal(res.statusCode, 400);
+    assert.equal(readErrCode(res), "INVALID_REQUEST");
     assert.equal(h.schedulerSpy.releaseCalls.length, 1);
     assert.equal(
       h.schedulerSpy.releaseCalls[0]!.result.kind,
       "client_error",
       "invalid_request_error 不扣账号健康分 — 必须走 client_error",
     );
+  });
+
+  test("(d negative) upstream context rejection → 413 PROMPT_TOO_LONG + client_error", async () => {
+    const h = buildHarness({
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              type: "invalid_request_error",
+              message: "input tokens exceed the maximum limit",
+            },
+          }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        ),
+    });
+    const res = await h.run(minBody());
+    assert.equal(res.statusCode, 413);
+    assert.equal(readErrCode(res), "PROMPT_TOO_LONG");
+    assert.equal(h.schedulerSpy.releaseCalls.length, 1);
+    assert.equal(h.schedulerSpy.releaseCalls[0]!.result.kind, "client_error");
   });
 });
 

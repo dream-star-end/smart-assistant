@@ -1559,6 +1559,7 @@ describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
     expect(hydrated[0]).toMatchObject({
       id: "s-orphan",
       agentId: "main",
+      title: "exact",
       _pendingDispatches: [expect.objectContaining({ msgId: "m-orphan" })],
       messages: [{
         id: "m-orphan",
@@ -1567,6 +1568,18 @@ describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
         status: "queued",
       }],
     });
+  });
+
+  test("journal-only 会话标题使用用户可见正文并与服务端 50 字规则一致", async () => {
+    const store = new SessionStore("journal-title", fakeIDBFactory());
+    const item = pending("s-title", "m-title");
+    const displayText = `${"甲".repeat(50)}乙`;
+    item.payload.content = { text: "隐藏的模型正文", displayText };
+    await store.putPendingDispatch("s-title", item);
+
+    const hydrated = await store.getAllForHydration();
+    expect(hydrated[0]?.title).toBe(`${"甲".repeat(50)}…`);
+    expect(hydrated[0]?.messages[0]?.text).toBe(displayText);
   });
 
   test("按 user 命名空间隔离：user B 读不到 user A 的会话（隐私）", async () => {

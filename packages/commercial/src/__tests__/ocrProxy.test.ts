@@ -1,22 +1,37 @@
 import assert from 'node:assert/strict'
-import { randomBytes } from 'node:crypto'
+import { createCipheriv, randomBytes } from 'node:crypto'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { type Server, createServer } from 'node:http'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 
 import { hashSecret } from '../auth/containerIdentity.js'
 import { makeOcrProxyHandler } from '../ocr/ocrProxy.js'
+import type {
+  CompleteOcrJobInput,
+  CreateOcrJobInput,
+  ExpiredOcrArtifact,
+  OcrJob,
+  OcrJobStatus,
+  OcrJobStore,
+} from '../ocr/ocrStore.js'
+import type { ScnetFileUploadInput } from '../ocr/scnetFileUpload.js'
+import { ScnetResultHttpError } from '../ocr/scnetResultDownload.js'
 
 const SECRET = 'a1'.repeat(32)
 const AUTH = `Bearer oc-v3.7.${SECRET}`
-const KEYS = `k1:${randomBytes(32).toString('base64')}`
-const OWNER_SECRET = randomBytes(32).toString('base64')
+const KEY_BYTES = randomBytes(32)
+const KEYS = `k1:${KEY_BYTES.toString('base64')}`
 const ctx = { hostUuid: 'host', boundIp: '10.0.0.1' }
 const servers: Server[] = []
+const tempDirs: string[] = []
 
 afterEach(async () => {
   await Promise.all(
     servers.splice(0).map((server) => new Promise<void>((done) => server.close(() => done()))),
   )
+  await Promise.all(tempDirs.splice(0).map((directory) => rm(directory, { recursive: true })))
 })
 
 function repo(userId = 42): any {
@@ -31,6 +46,115 @@ function repo(userId = 42): any {
   }
 }
 
+class MemoryOcrStore implements OcrJobStore {
+  readonly jobs = new Map<string, OcrJob>()
+
+  async create(input: CreateOcrJobInput): Promise<OcrJob> {
+    const timestamp = new Date()
+    const job: OcrJob = {
+      id: input.id,
+      userId: input.userId,
+      providerTaskId: null,
+      status: 'submitting',
+      phase: 'submitting',
+      filename: input.filename,
+      contentType: input.contentType,
+      sizeBytes: input.sizeBytes,
+      pagesTotal: null,
+      markdownPath: null,
+      jsonlPath: null,
+      errorCode: null,
+      errorMessage: null,
+      cancelRequestedAt: null,
+      expiresAt: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    this.jobs.set(job.id, job)
+    return job
+  }
+
+  async get(userId: number, id: string): Promise<OcrJob | null> {
+    const job = this.jobs.get(id)
+    return job?.userId === userId ? job : null
+  }
+
+  async markSubmitted(
+    userId: number,
+    id: string,
+    providerTaskId: string,
+    status: OcrJobStatus,
+  ): Promise<void> {
+    const job = await this.get(userId, id)
+    if (job?.status === 'submitting') Object.assign(job, { providerTaskId, status, phase: status })
+  }
+
+  async markProgress(
+    userId: number,
+    id: string,
+    status: 'queued' | 'running',
+    phase: string,
+  ): Promise<void> {
+    const job = await this.get(userId, id)
+    if (job && ['queued', 'running'].includes(job.status)) Object.assign(job, { status, phase })
+  }
+
+  async markCompleted(input: CompleteOcrJobInput): Promise<boolean> {
+    const job = await this.get(input.userId, input.id)
+    if (!job || !['queued', 'running'].includes(job.status) || job.cancelRequestedAt) return false
+    Object.assign(job, {
+      status: 'completed',
+      phase: 'completed',
+      pagesTotal: input.pagesTotal,
+      markdownPath: input.markdownPath,
+      jsonlPath: input.jsonlPath,
+      expiresAt: new Date(Date.now() + 7 * 86_400_000),
+    })
+    return true
+  }
+
+  async markFailed(userId: number, id: string, code: string, message: string): Promise<void> {
+    const job = await this.get(userId, id)
+    if (job && !job.cancelRequestedAt && ['submitting', 'queued', 'running'].includes(job.status)) {
+      Object.assign(job, {
+        status: 'failed',
+        phase: 'failed',
+        errorCode: code,
+        errorMessage: message,
+        expiresAt: new Date(Date.now() + 7 * 86_400_000),
+      })
+    }
+  }
+
+  async cancel(userId: number, id: string): Promise<OcrJob | null> {
+    const job = await this.get(userId, id)
+    if (job && !['completed', 'failed'].includes(job.status)) {
+      Object.assign(job, {
+        status: 'cancelled',
+        phase: 'cancelled',
+        cancelRequestedAt: new Date(),
+        expiresAt: new Date(Date.now() + 7 * 86_400_000),
+      })
+    }
+    return job
+  }
+
+  async listExpired(_limit: number): Promise<ExpiredOcrArtifact[]> {
+    return []
+  }
+
+  async deleteExpired(userId: number, id: string): Promise<void> {
+    const job = await this.get(userId, id)
+    if (job?.expiresAt && job.expiresAt.getTime() <= Date.now()) this.jobs.delete(id)
+  }
+}
+
+async function resultDir(): Promise<string> {
+  const directory = await mkdtemp(path.join(tmpdir(), 'oc-scnet-ocr-'))
+  tempDirs.push(directory)
+  return directory
+}
+
 async function listen(handler: ReturnType<typeof makeOcrProxyHandler>): Promise<string> {
   const server = createServer((req, res) => void handler(req, res, ctx))
   servers.push(server)
@@ -40,217 +164,631 @@ async function listen(handler: ReturnType<typeof makeOcrProxyHandler>): Promise<
   return `http://127.0.0.1:${address.port}`
 }
 
-function ready(): Response {
-  return Response.json({
-    release: 'worker-r1',
-    protocol_major: 1,
-    capabilities: { modes: ['pp', 'hybrid', 'vl'] },
-  })
-}
-
 async function post(
   base: string,
-  path: string,
+  route: string,
   body: BodyInit,
   headers: Record<string, string> = {},
+  signal?: AbortSignal,
 ): Promise<Response> {
-  return fetch(`${base}${path}`, {
+  return fetch(`${base}${route}`, {
     method: 'POST',
     headers: { authorization: AUTH, ...headers },
     body,
+    signal,
     duplex: 'half',
   } as RequestInit & { duplex: 'half' })
 }
 
-describe('ocrProxy', () => {
-  test('fails closed when worker configuration is absent', async () => {
+async function submit(base: string, bytes = Buffer.from('stream-me')): Promise<string> {
+  const response = await post(base, '/v3/ocr/submit', bytes, {
+    'content-type': 'application/pdf',
+    'content-length': String(bytes.length),
+    'x-ocr-filename': 'scan.pdf',
+    'x-ocr-mode': 'hybrid',
+    'x-ocr-fallback': '0.1',
+  })
+  assert.equal(response.status, 202)
+  return String(((await response.json()) as any).ticket)
+}
+
+function taskResponse(
+  taskId: string,
+  status: string,
+  urls: string[] = [],
+  pages?: number,
+): Response {
+  return Response.json({
+    code: '0',
+    data: [
+      {
+        output: { task_id: taskId, task_status: status, results: urls },
+        ...(pages === undefined ? {} : { usage: { image_count: pages } }),
+      },
+    ],
+  })
+}
+
+function presignResponse(): Response {
+  return Response.json({
+    code: '0',
+    msg: 'success',
+    data: {
+      upload_url: 'https://uploads.example:58003/llm',
+      file_url: 'https://uploads.example:58003/llm/uploads/job.pdf?signature=x',
+      policy: 'policy-value',
+      x_amz_algorithm: 'AWS4-HMAC-SHA256',
+      x_amz_credential: 'credential-value',
+      x_amz_date: '20260811T000000Z',
+      x_amz_signature: 'signature-value',
+      key: '/uploads/job.pdf',
+    },
+  })
+}
+
+async function consumeUpload(input: ScnetFileUploadInput): Promise<void> {
+  for await (const _chunk of input.source) {
+    // Consume the single-pass client stream like the real object-store upload.
+  }
+}
+
+function legacyTicket(userId: number, job: string): string {
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', KEY_BYTES, iv)
+  cipher.setAAD(Buffer.from('k1'))
+  const encrypted = Buffer.concat([
+    cipher.update(JSON.stringify({ v: 1, uid: userId, job })),
+    cipher.final(),
+  ])
+  return [
+    'k1',
+    iv.toString('base64url'),
+    encrypted.toString('base64url'),
+    cipher.getAuthTag().toString('base64url'),
+  ].join('.')
+}
+
+describe('ocrProxy SCNet adapter', () => {
+  test('fails closed when SCNet configuration is absent', async () => {
     const base = await listen(
       makeOcrProxyHandler({
         identityRepo: repo(),
-        workerBaseUrl: '',
-        workerToken: '',
-        expectedRelease: '',
-        ticketKeys: '',
+        store: new MemoryOcrStore(),
+        apiKey: '',
+        ticketKeys: KEYS,
+        resultDir: '',
       }),
     )
-    const response = await post(base, '/v3/ocr/status', JSON.stringify({ ticket: 'x' }), {
-      'content-type': 'application/json',
+    const response = await post(base, '/v3/ocr/submit', Buffer.from('x'), {
+      'content-length': '1',
     })
     assert.equal(response.status, 503)
   })
 
-  test('streams submit, returns opaque ticket, then status/cancel/result without leaking worker id', async () => {
+  test('presigns and uploads once, then mirrors all pages as complete Markdown and JSONL', async () => {
     const uploaded: Buffer[] = []
-    const calls: string[] = []
-    const large = Buffer.from('完整结果\n'.repeat(40_000))
-    const mockFetch = (async (url: string | URL | Request, init?: RequestInit) => {
-      const path = new URL(String(url)).pathname
-      calls.push(path)
-      if (path === '/ready') return ready()
-      if (path === '/v1/jobs') {
-        for await (const chunk of init?.body as any) uploaded.push(Buffer.from(chunk))
-        assert.equal((init?.headers as Record<string, string>)['x-ocr-owner'].includes('42'), false)
-        return Response.json(
-          { job_id: 'remote-job-secret', status: 'queued', queue_position: 1 },
-          { status: 202 },
-        )
+    let polls = 0
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const target = new URL(String(url))
+      const pathname = target.pathname
+      assert.equal((init?.headers as Record<string, string>).authorization, 'Bearer provider-key')
+      if (pathname.endsWith('/upload/presign')) {
+        assert.equal(init?.method, 'GET')
+        assert.match(target.searchParams.get('file_name') ?? '', /^[0-9a-f-]{36}\.pdf$/)
+        return presignResponse()
       }
-      if (path.endsWith('/cancel'))
+      if (pathname.endsWith('/ocrdoc/submit')) {
+        assert.equal(
+          (init?.headers as Record<string, string>)['content-type'],
+          'application/x-www-form-urlencoded',
+        )
+        const form = new URLSearchParams(String(init?.body))
+        assert.equal(
+          form.get('file_url'),
+          'https://uploads.example:58003/llm/uploads/job.pdf?signature=x',
+        )
+        assert.equal(form.get('ocr_type'), 'DOC_PARING')
+        assert.equal(form.get('is_table_cls'), 'true')
+        assert.equal(form.get('is_doc_ori'), 'true')
+        assert.equal(form.get('is_inline_formula'), 'true')
         return Response.json({
-          job_id: 'remote-job-secret',
-          status: 'running',
-          phase: 'cancelling',
+          code: '0',
+          data: { output: { task_id: 'task-secret', task_status: 'pending' } },
         })
-      if (path.endsWith('/result'))
-        return new Response(large, { headers: { 'content-length': String(large.length) } })
-      return Response.json({
-        job_id: 'remote-job-secret',
-        status: 'running',
-        pages_done: 12,
-        pages_total: 100,
-      })
+      }
+      polls += 1
+      return polls === 1
+        ? taskResponse('task-secret', 'running')
+        : taskResponse(
+            'task-secret',
+            'succeeded',
+            ['https://result.example/a', 'https://result.example/b'],
+            3,
+          )
     }) as typeof fetch
-    const handler = makeOcrProxyHandler({
-      identityRepo: repo(),
-      fetchImpl: mockFetch,
-      workerBaseUrl: 'http://worker',
-      workerToken: 'worker-token',
-      expectedRelease: 'worker-r1',
-      ticketKeys: KEYS,
-      ownerSecret: OWNER_SECRET,
-    })
-    const base = await listen(handler)
-    const submitted = await post(base, '/v3/ocr/submit', Buffer.from('stream-me'), {
-      'content-type': 'application/pdf',
-      'content-length': '9',
-      'x-ocr-filename': 'scan.pdf',
-      'x-ocr-mode': 'hybrid',
-      'x-ocr-fallback': '0.1',
-    })
-    assert.equal(submitted.status, 202)
-    const submitBody = (await submitted.json()) as any
-    assert.equal(Buffer.concat(uploaded).toString(), 'stream-me')
-    assert.equal(submitBody.ticket.includes('remote-job-secret'), false)
-    const jobBody = JSON.stringify({ ticket: submitBody.ticket })
-    let response = await post(base, '/v3/ocr/status', jobBody, {
+    const store = new MemoryOcrStore()
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store,
+        fetchImpl,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        uploadFile: async (input) => {
+          assert.equal(input.filename, 'scan.pdf')
+          assert.equal(input.contentType, 'application/pdf')
+          assert.equal(input.contentLength, 9n)
+          for await (const chunk of input.source) uploaded.push(Buffer.from(chunk))
+        },
+        downloadResult: async (url) =>
+          url.endsWith('/a')
+            ? {
+                taskId: 'task-secret',
+                documents: [
+                  {
+                    documentId: 'd1',
+                    fileName: 'a.pdf',
+                    datas: [
+                      {
+                        rotate_angle: 0,
+                        blocks: [{ type: 'text' }],
+                        md: { markdown_content: '第一页' },
+                      },
+                      {
+                        rotate_angle: 0,
+                        blocks: [{ type: 'table', html: '<table><tr><td>A</td></tr></table>' }],
+                        md: { markdown_content: '<table><tr><td>A</td></tr></table>' },
+                      },
+                    ],
+                  },
+                ],
+              }
+            : {
+                taskId: 'task-secret',
+                documents: [
+                  {
+                    documentId: 'd2',
+                    fileName: 'b.pdf',
+                    datas: [
+                      {
+                        rotate_angle: 0,
+                        blocks: [{ type: 'formula' }],
+                        md: { markdown_content: '$$x^2$$' },
+                      },
+                    ],
+                  },
+                ],
+              },
+      }),
+    )
+    const ticket = await submit(base)
+    assert.equal(Buffer.concat(uploaded).toString('utf8'), 'stream-me')
+    assert.equal(ticket.includes('task-secret'), false)
+
+    let response = await post(base, '/v3/ocr/status', JSON.stringify({ ticket }), {
       'content-type': 'application/json',
     })
-    const status = (await response.json()) as any
-    assert.equal(status.pages_done, 12)
-    assert.equal(status.job_id, undefined)
-    response = await post(base, '/v3/ocr/cancel', jobBody, { 'content-type': 'application/json' })
-    assert.equal(((await response.json()) as any).phase, 'cancelling')
-    response = await post(
-      base,
-      '/v3/ocr/result',
-      JSON.stringify({ ticket: submitBody.ticket, format: 'markdown' }),
-      { 'content-type': 'application/json' },
+    assert.equal(((await response.json()) as any).status, 'running')
+    response = await post(base, '/v3/ocr/status', JSON.stringify({ ticket }), {
+      'content-type': 'application/json',
+    })
+    const completed = (await response.json()) as any
+    assert.equal(completed.status, 'completed')
+    assert.equal(completed.pages_total, 3)
+
+    response = await post(base, '/v3/ocr/result', JSON.stringify({ ticket, format: 'markdown' }), {
+      'content-type': 'application/json',
+    })
+    const markdown = await response.text()
+    assert.match(markdown, /第一页/)
+    assert.match(markdown, /<table><tr><td>A<\/td><\/tr><\/table>/)
+    assert.match(markdown, /\$\$x\^2\$\$/)
+    assert.ok(markdown.indexOf('第一页') < markdown.indexOf('<table>'))
+    assert.ok(markdown.indexOf('<table>') < markdown.indexOf('$$x^2$$'))
+
+    response = await post(base, '/v3/ocr/result', JSON.stringify({ ticket, format: 'jsonl' }), {
+      'content-type': 'application/json',
+    })
+    const pages = (await response.text())
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    assert.deepEqual(
+      pages.map((page) => page.page),
+      [1, 2, 3],
     )
-    assert.equal(Buffer.from(await response.arrayBuffer()).equals(large), true)
-    assert.deepEqual(calls, [
-      '/ready',
-      '/v1/jobs',
-      '/ready',
-      '/v1/jobs/remote-job-secret',
-      '/ready',
-      '/v1/jobs/remote-job-secret/cancel',
-      '/ready',
-      '/v1/jobs/remote-job-secret/result',
-    ])
+    assert.equal(pages[1].raw.blocks[0].type, 'table')
+    assert.equal(pages[2].provider_document_id, 'd2')
   })
 
-  test('rejects ticket tampering and a ticket presented by another user', async () => {
-    const mockFetch = (async (url: string | URL | Request) => {
-      if (new URL(String(url)).pathname === '/ready') return ready()
-      return Response.json({ job_id: 'job-1', status: 'queued' }, { status: 202 })
+  test('persists local cancellation and never revives a cancelled job', async () => {
+    let resultPolls = 0
+    const store = new MemoryOcrStore()
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const pathname = new URL(String(url)).pathname
+      if (pathname.endsWith('/upload/presign')) return presignResponse()
+      if (pathname.endsWith('/submit')) {
+        return Response.json({
+          code: '0',
+          data: { output: { task_id: 'task-cancel', task_status: 'pending' } },
+        })
+      }
+      resultPolls += 1
+      return taskResponse('task-cancel', 'succeeded', ['https://result.example/c'], 1)
     }) as typeof fetch
-    const deps = {
-      fetchImpl: mockFetch,
-      workerBaseUrl: 'http://worker',
-      workerToken: 'token',
-      expectedRelease: 'worker-r1',
-      ticketKeys: KEYS,
-      ownerSecret: OWNER_SECRET,
-    }
-    const base = await listen(makeOcrProxyHandler({ ...deps, identityRepo: repo(42) }))
-    const submitted = await post(base, '/v3/ocr/submit', Buffer.from('x'), {
-      'content-length': '1',
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store,
+        fetchImpl,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        uploadFile: consumeUpload,
+      }),
+    )
+    const ticket = await submit(base)
+    let response = await post(base, '/v3/ocr/cancel', JSON.stringify({ ticket }), {
+      'content-type': 'application/json',
     })
-    const ticket = String(((await submitted.json()) as any).ticket)
+    assert.equal(((await response.json()) as any).status, 'cancelled')
+    response = await post(base, '/v3/ocr/status', JSON.stringify({ ticket }), {
+      'content-type': 'application/json',
+    })
+    assert.equal(((await response.json()) as any).status, 'cancelled')
+    assert.equal(resultPolls, 0)
+  })
+
+  test('fails loudly on the reproduced empty rotated page', async () => {
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const pathname = new URL(String(url)).pathname
+      if (pathname.endsWith('/upload/presign')) return presignResponse()
+      return pathname.endsWith('/submit')
+        ? Response.json({
+            code: '0',
+            data: { output: { task_id: 'task-rotate', task_status: 'pending' } },
+          })
+        : taskResponse('task-rotate', 'succeeded', ['https://result.example/rotate'], 1)
+    }) as typeof fetch
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store: new MemoryOcrStore(),
+        fetchImpl,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        uploadFile: consumeUpload,
+        downloadResult: async () => ({
+          documents: [
+            {
+              datas: [
+                {
+                  rotate_angle: -90,
+                  blocks: [{ type: 'text', lines: [] }],
+                  md: { markdown_content: '' },
+                },
+              ],
+            },
+          ],
+        }),
+      }),
+    )
+    const ticket = await submit(base)
+    const response = await post(base, '/v3/ocr/status', JSON.stringify({ ticket }), {
+      'content-type': 'application/json',
+    })
+    const value = (await response.json()) as any
+    assert.equal(value.status, 'failed')
+    assert.equal(value.error_code, 'SCNET_EMPTY_ROTATED_PAGE')
+  })
+
+  test('keeps provider result download errors retryable', async () => {
+    const store = new MemoryOcrStore()
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const pathname = new URL(String(url)).pathname
+      if (pathname.endsWith('/upload/presign')) return presignResponse()
+      return pathname.endsWith('/submit')
+        ? Response.json({
+            code: '0',
+            data: { output: { task_id: 'task-retry', task_status: 'pending' } },
+          })
+        : taskResponse('task-retry', 'succeeded', ['https://result.example/retry'], 1)
+    }) as typeof fetch
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store,
+        fetchImpl,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        uploadFile: consumeUpload,
+        downloadResult: async () => {
+          throw new ScnetResultHttpError(503, 'temporary result host failure')
+        },
+      }),
+    )
+    const ticket = await submit(base)
+    const response = await post(base, '/v3/ocr/status', JSON.stringify({ ticket }), {
+      'content-type': 'application/json',
+    })
+    assert.equal(response.status, 502)
+    assert.equal([...store.jobs.values()][0]?.status, 'queued')
+  })
+
+  test('client disconnect does not cancel in-progress result materialization', async () => {
+    const store = new MemoryOcrStore()
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const pathname = new URL(String(url)).pathname
+      if (pathname.endsWith('/upload/presign')) return presignResponse()
+      return pathname.endsWith('/submit')
+        ? Response.json({
+            code: '0',
+            data: { output: { task_id: 'task-slow', task_status: 'pending' } },
+          })
+        : taskResponse('task-slow', 'succeeded', ['https://result.example/slow'], 1)
+    }) as typeof fetch
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store,
+        fetchImpl,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        uploadFile: consumeUpload,
+        downloadResult: async () => {
+          await new Promise((done) => setTimeout(done, 80))
+          return {
+            documents: [
+              {
+                datas: [
+                  { rotate_angle: 0, blocks: [{ type: 'text' }], md: { markdown_content: 'done' } },
+                ],
+              },
+            ],
+          }
+        },
+      }),
+    )
+    const ticket = await submit(base)
+    const controller = new AbortController()
+    const pending = post(
+      base,
+      '/v3/ocr/status',
+      JSON.stringify({ ticket }),
+      { 'content-type': 'application/json' },
+      controller.signal,
+    )
+    setTimeout(() => controller.abort(), 10)
+    await assert.rejects(pending)
+    await new Promise((done) => setTimeout(done, 120))
+    const response = await post(base, '/v3/ocr/status', JSON.stringify({ ticket }), {
+      'content-type': 'application/json',
+    })
+    assert.equal(((await response.json()) as any).status, 'completed')
+  })
+
+  test('rejects tampered/cross-tenant tickets and expires legacy worker tickets explicitly', async () => {
+    const fetchImpl = (async (url: string | URL | Request) =>
+      new URL(String(url)).pathname.endsWith('/upload/presign')
+        ? presignResponse()
+        : Response.json({
+            code: '0',
+            data: { output: { task_id: 'task-ticket', task_status: 'pending' } },
+          })) as typeof fetch
+    const store = new MemoryOcrStore()
+    const shared = {
+      store,
+      fetchImpl,
+      apiKey: 'provider-key',
+      ticketKeys: KEYS,
+      resultDir: await resultDir(),
+      uploadFile: consumeUpload,
+    }
+    const base = await listen(makeOcrProxyHandler({ ...shared, identityRepo: repo(42) }))
+    const ticket = await submit(base)
     const parts = ticket.split('.')
-    parts[2] = `${parts[2][0] === 'A' ? 'B' : 'A'}${parts[2].slice(1)}`
-    const tampered = parts.join('.')
-    let response = await post(base, '/v3/ocr/status', JSON.stringify({ ticket: tampered }), {
+    parts[2] = `${parts[2]![0] === 'A' ? 'B' : 'A'}${parts[2]!.slice(1)}`
+    let response = await post(base, '/v3/ocr/status', JSON.stringify({ ticket: parts.join('.') }), {
       'content-type': 'application/json',
     })
     assert.equal(response.status, 403)
-    const other = await listen(makeOcrProxyHandler({ ...deps, identityRepo: repo(43) }))
+    const other = await listen(makeOcrProxyHandler({ ...shared, identityRepo: repo(43) }))
     response = await post(other, '/v3/ocr/status', JSON.stringify({ ticket }), {
       'content-type': 'application/json',
     })
     assert.equal(response.status, 403)
-  })
-
-  test('old ticket key keeps the same opaque owner through key rotation', async () => {
-    const oldKey = `old:${randomBytes(32).toString('base64')}`
-    const newKey = `new:${randomBytes(32).toString('base64')}`
-    let submitOwner = ''
-    let statusOwner = ''
-    const mockFetch = (async (url: string | URL | Request, init?: RequestInit) => {
-      const path = new URL(String(url)).pathname
-      if (path === '/ready') return ready()
-      const headers = init?.headers as Record<string, string>
-      if (path === '/v1/jobs') {
-        submitOwner = headers['x-ocr-owner']
-        return Response.json({ job_id: 'job-before-rotation', status: 'queued' }, { status: 202 })
-      }
-      statusOwner = headers['x-ocr-owner']
-      return Response.json({ job_id: 'job-before-rotation', status: 'running' })
-    }) as typeof fetch
-    const shared = {
-      identityRepo: repo(),
-      fetchImpl: mockFetch,
-      workerBaseUrl: 'http://worker',
-      workerToken: 'token',
-      expectedRelease: 'worker-r1',
-      ownerSecret: OWNER_SECRET,
-    }
-    const before = await listen(makeOcrProxyHandler({ ...shared, ticketKeys: oldKey }))
-    const submitted = await post(before, '/v3/ocr/submit', Buffer.from('x'), {
-      'content-length': '1',
-    })
-    const ticket = String(((await submitted.json()) as any).ticket)
-    const after = await listen(
-      makeOcrProxyHandler({ ...shared, ticketKeys: `${newKey},${oldKey}` }),
+    response = await post(
+      base,
+      '/v3/ocr/status',
+      JSON.stringify({ ticket: legacyTicket(42, 'old') }),
+      {
+        'content-type': 'application/json',
+      },
     )
-    const response = await post(after, '/v3/ocr/status', JSON.stringify({ ticket }), {
-      'content-type': 'application/json',
-    })
-    assert.equal(response.status, 200)
-    assert.equal(submitOwner, statusOwner)
+    assert.equal(response.status, 410)
+    assert.equal(((await response.json()) as any).error.code, 'OCR_LEGACY_JOB_UNAVAILABLE')
   })
 
-  test('exact worker release pin fails closed', async () => {
-    const mockFetch = (async () =>
-      Response.json({
-        release: 'wrong',
-        protocol_major: 1,
-        capabilities: { modes: ['pp', 'hybrid', 'vl'] },
-      })) as typeof fetch
+  test('provider submit rejection is explicit and terminal locally', async () => {
+    const store = new MemoryOcrStore()
     const base = await listen(
       makeOcrProxyHandler({
         identityRepo: repo(),
-        fetchImpl: mockFetch,
-        workerBaseUrl: 'http://worker',
-        workerToken: 'token',
-        expectedRelease: 'worker-r1',
+        store,
+        fetchImpl: (async (url: string | URL | Request) =>
+          new URL(String(url)).pathname.endsWith('/upload/presign')
+            ? presignResponse()
+            : Response.json({
+                code: '10011',
+                msg: 'Burst rate limit exceeded for model',
+              })) as typeof fetch,
+        apiKey: 'provider-key',
         ticketKeys: KEYS,
-        ownerSecret: OWNER_SECRET,
+        resultDir: await resultDir(),
+        uploadFile: consumeUpload,
       }),
     )
-    const response = await post(base, '/v3/ocr/status', JSON.stringify({ ticket: 'bad' }), {
-      'content-type': 'application/json',
+    const response = await post(base, '/v3/ocr/submit', Buffer.from('x'), {
+      'content-length': '1',
     })
-    assert.equal(response.status, 503)
+    assert.equal(response.status, 429)
+    assert.equal([...store.jobs.values()][0]?.status, 'failed')
+  })
+
+  test('retries the exact uploaded-file visibility rejection before accepting the job', async () => {
+    const sleeps: number[] = []
+    let submitCalls = 0
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const pathname = new URL(String(url)).pathname
+      if (pathname.endsWith('/upload/presign')) return presignResponse()
+      submitCalls += 1
+      if (submitCalls <= 2) {
+        return Response.json(
+          {
+            code: '10013',
+            msg: 'file_url is not reachable or the file cannot be read: https://uploads.example/private?signature=secret',
+          },
+          { status: 422 },
+        )
+      }
+      return Response.json({
+        code: '0',
+        data: { output: { task_id: 'task-visible', task_status: 'pending' } },
+      })
+    }) as typeof fetch
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store: new MemoryOcrStore(),
+        fetchImpl,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        sleep: async (delayMs) => {
+          sleeps.push(delayMs)
+        },
+        uploadFile: consumeUpload,
+      }),
+    )
+
+    await submit(base)
+    assert.equal(submitCalls, 3)
+    assert.deepEqual(sleeps, [250, 500])
+  })
+
+  test('does not retry other SCNet parameter errors', async () => {
+    const sleeps: number[] = []
+    let submitCalls = 0
+    const store = new MemoryOcrStore()
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store,
+        fetchImpl: (async (url: string | URL | Request) => {
+          if (new URL(String(url)).pathname.endsWith('/upload/presign')) return presignResponse()
+          submitCalls += 1
+          return Response.json(
+            { code: '10013', msg: 'Parameter illegal: invalid ocr_type' },
+            { status: 422 },
+          )
+        }) as typeof fetch,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        sleep: async (delayMs) => {
+          sleeps.push(delayMs)
+        },
+        uploadFile: consumeUpload,
+      }),
+    )
+
+    const response = await post(base, '/v3/ocr/submit', Buffer.from('x'), {
+      'content-length': '1',
+    })
+    assert.equal(response.status, 422)
+    assert.equal(submitCalls, 1)
+    assert.deepEqual(sleeps, [])
+    assert.equal([...store.jobs.values()][0]?.status, 'failed')
+  })
+
+  test('does not retry the file visibility payload under a non-422 status', async () => {
+    const sleeps: number[] = []
+    let submitCalls = 0
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store: new MemoryOcrStore(),
+        fetchImpl: (async (url: string | URL | Request) => {
+          if (new URL(String(url)).pathname.endsWith('/upload/presign')) return presignResponse()
+          submitCalls += 1
+          return Response.json({
+            code: '10013',
+            msg: 'file_url is not reachable or the file cannot be read: https://uploads.example/private?signature=secret',
+          })
+        }) as typeof fetch,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        sleep: async (delayMs) => {
+          sleeps.push(delayMs)
+        },
+        uploadFile: consumeUpload,
+      }),
+    )
+
+    const response = await post(base, '/v3/ocr/submit', Buffer.from('x'), {
+      'content-length': '1',
+    })
+    assert.equal(response.status, 502)
+    assert.equal(submitCalls, 1)
+    assert.deepEqual(sleeps, [])
+  })
+
+  test('bounds file visibility retries and redacts the presigned URL on exhaustion', async () => {
+    const sleeps: number[] = []
+    let submitCalls = 0
+    const store = new MemoryOcrStore()
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store,
+        fetchImpl: (async (url: string | URL | Request) => {
+          if (new URL(String(url)).pathname.endsWith('/upload/presign')) return presignResponse()
+          submitCalls += 1
+          return Response.json(
+            {
+              code: '10013',
+              msg: 'file_url is not reachable or the file cannot be read: https://uploads.example/private?signature=secret',
+            },
+            { status: 422 },
+          )
+        }) as typeof fetch,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        sleep: async (delayMs) => {
+          sleeps.push(delayMs)
+        },
+        uploadFile: consumeUpload,
+      }),
+    )
+
+    const response = await post(base, '/v3/ocr/submit', Buffer.from('x'), {
+      'content-length': '1',
+    })
+    assert.equal(response.status, 422)
+    assert.equal(submitCalls, 6)
+    assert.deepEqual(sleeps, [250, 500, 1_000, 2_000, 4_000])
+    const value = (await response.json()) as any
+    assert.equal(value.error.message.includes('https://'), false)
+    assert.equal(value.error.message.includes('signature=secret'), false)
+    assert.match(value.error.message, /\[redacted-url\]/)
+    const job = [...store.jobs.values()][0]
+    assert.equal(job?.status, 'failed')
+    assert.equal(job?.errorMessage?.includes('signature=secret'), false)
   })
 })

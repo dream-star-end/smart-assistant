@@ -239,6 +239,23 @@ export interface EngineBillingEvent extends DurableCodexBilling {
   // resetsAt ISO8601(runner 已把 epoch sec 转 ISO,bridge 不再二次解析)。
 }
 
+/** Subscription-backed engine audit sideband. Token fields are present only
+ * when the upstream CLI reported them; they are observations, never a basis
+ * for OpenClaude credit debits. */
+export interface EngineExternalBillingEvent {
+  requestId: string
+  engine: 'cursor'
+  status: 'success' | 'error' | 'unavailable'
+  terminalCode?: 'USER_CANCELLED' | 'AUTH_UNAVAILABLE' | 'QUOTA_UNAVAILABLE' | 'ENGINE_ERROR'
+  durationMs: number
+  usage?: {
+    input_tokens?: number
+    output_tokens?: number
+    cache_read_input_tokens?: number
+    cache_creation_input_tokens?: number
+  }
+}
+
 /**
  * 兼容联合:原 ccbMessageParser.SessionStreamEvent,形状逐变体不变。
  * server.ts / cron / skillTrain 等存量消费方继续以此为 onEvent 签名;
@@ -247,6 +264,7 @@ export interface EngineBillingEvent extends DurableCodexBilling {
 export type SessionStreamEvent =
   | EngineContentEvent
   | ({ kind: 'codex_billing' } & EngineBillingEvent)
+  | ({ kind: 'external_billing' } & EngineExternalBillingEvent)
 
 /** 底座对"本 turn 是否真调了模型 API"的一等信号(CCB 由 TelemetryChannel 提供;
  *  其他 engine 缺省 'unknown' → 上层沿用 legacy 9-AND phantom 启发式,R7 永不 fail-closed)。 */

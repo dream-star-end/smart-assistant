@@ -11,5 +11,6 @@
 #   本片实测:顶层 not ok 2 条,但 # fail = 5 个测试点。
 # 2026-07-26 首次登记,取值来源 = CI artifact commercial-integ-tap-pr-2
 #   (run 30204619386)。
-fail_max = 5
+# 2026-08-10 turn waiver 参数类型根修后,CI run 31348560092 收敛为顶层 1 条 / # fail 2。
+fail_max = 2
 cancelled_max = 0

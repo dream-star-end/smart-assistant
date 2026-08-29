@@ -128,9 +128,10 @@ describe("KEY_META", () => {
 });
 
 describe("KEY_SCHEMAS — auto_dream_model", () => {
-  test("defaults to DeepSeek V4 Flash and enforces a bounded model id", () => {
+  test("defaults to MiniMax M3 and enforces a bounded model id", () => {
     const s = KEY_SCHEMAS.auto_dream_model;
-    assert.equal(DEFAULTS.auto_dream_model, "deepseek-v4-flash");
+    assert.equal(DEFAULTS.auto_dream_model, "MiniMax-M3");
+    assert.ok(s.safeParse("MiniMax-M3").success);
     assert.ok(s.safeParse("deepseek-v4-flash").success);
     assert.ok(s.safeParse("gpt-5.6-terra").success);
     assert.equal(s.safeParse("").success, false);

@@ -173,7 +173,7 @@ export class MediaWorkerClient {
     const response = await this.request(this.url(job, 'cancel'), {
       method: 'POST',
       headers: { ...this.headers(job), 'content-type': 'application/json' },
-      body: '{}',
+      body: JSON.stringify({ resource_class: job.resourceClass }),
       signal: this.signal(30_000, external),
     })
     return this.checked(response).then((value) => value.json() as Promise<WorkerStatus>)

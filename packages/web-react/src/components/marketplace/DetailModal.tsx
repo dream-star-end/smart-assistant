@@ -456,6 +456,7 @@ export function DetailModal({
             stage: 'detail_view',
             code: 'DETAIL_VIEW',
             outcome: 'succeeded',
+            entitySlug: slug,
           },
           auth.snapshot().token,
         )

@@ -2,8 +2,10 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   estimateModelHistoryTokens,
+  estimateModelHistoryUtf8Bytes,
   modelHistoryReservedTokens,
   modelHistorySemanticText,
+  sanitizePersistedModelHistoryText,
 } from '../modelHistory.js'
 import {
   formatMessageReplyPrompt,
@@ -37,6 +39,51 @@ test('a distinct tool summary remains alongside the exact output', () => {
     }),
     'Tool: Fetch\nSummary: HTTP 200\nOutput: full body',
   )
+})
+
+test('model projection removes only explicitly labelled binary payloads', () => {
+  const base64 = 'A'.repeat(128 * 1024)
+  const semantic = modelHistorySemanticText({
+    id: 'tool-image',
+    role: 'tool',
+    toolName: 'Read',
+    output: {
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/jpeg', data: base64 },
+      note: 'keep this exact semantic note',
+    },
+  })
+  assert.doesNotMatch(semantic, new RegExp(`A{${base64.length}}`))
+  assert.match(semantic, /binary image\/jpeg omitted from model context/)
+  assert.match(semantic, /base64_chars=131072/)
+  assert.match(semantic, /keep this exact semantic note/)
+
+  const ordinaryLongAscii = 'ACGT'.repeat(40_000)
+  assert.equal(
+    modelHistorySemanticText({ id: 'user-code', role: 'user', text: ordinaryLongAscii }),
+    ordinaryLongAscii,
+  )
+})
+
+test('explicit data URIs and old structured sidecars are bounded without guessing mid-blob suffixes', () => {
+  const data = 'aGVsbG8='.repeat(2_000)
+  const projected = modelHistorySemanticText({
+    id: 'assistant-data-uri', role: 'assistant', text: `result=data:image/png;base64,${data};done`,
+  })
+  assert.match(projected, /binary image\/png omitted from model context/)
+  assert.match(projected, /;done$/)
+
+  const legacy = `Output: {"source":{"type":"base64","media_type":"image/png","data":"${data}"},"caption":"kept"}`
+  const sanitized = sanitizePersistedModelHistoryText(legacy)
+  assert.match(sanitized, /binary image\/png omitted from model context/)
+  assert.match(sanitized, /"caption":"kept"/)
+  const midBlobSuffix = `${data.slice(1_000)}"},"caption":"tail"}`
+  assert.equal(sanitizePersistedModelHistoryText(midBlobSuffix), midBlobSuffix)
+})
+
+test('UTF-8 byte estimator charges dense ASCII and multibyte current text conservatively', () => {
+  assert.equal(estimateModelHistoryUtf8Bytes('abcd'), 4)
+  assert.equal(estimateModelHistoryUtf8Bytes('继续😀'), Buffer.byteLength('继续😀', 'utf8'))
 })
 
 test('user continuity uses the exact model-visible prompt rather than bubble presentation text', () => {

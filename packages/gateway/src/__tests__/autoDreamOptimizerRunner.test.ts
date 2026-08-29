@@ -25,7 +25,12 @@ function makeGateway(model: string) {
   gateway.sessions = {
     getOrCreate: async (input: any) => {
       calls.getOrCreate.push(input)
-      return { model, runner: { engineId: model === 'deepseek-v4-flash' ? 'ccb' : 'codex' } }
+      return {
+        model,
+        runner: {
+          engineId: model === 'deepseek-v4-flash' || model === 'MiniMax-M3' ? 'ccb' : 'codex',
+        },
+      }
     },
     submit: async (
       _session: unknown,
@@ -95,35 +100,37 @@ function makeClient() {
 }
 
 describe('Gateway Auto-Dream optimizer model runner', () => {
-  test('DeepSeek V4 Flash uses CCB proxy billing without Codex admission', async () => {
-    const { gateway, calls } = makeGateway('deepseek-v4-flash')
-    const { client, calls: clientCalls } = makeClient()
-    const output = await gateway._runAutoDreamOptimizerModel(
-      {
-        runId: '00000000-0000-4000-8000-000000000001',
-        callId: '00000000-0000-4000-8000-000000000001:0',
-        agentId: 'main',
-        userId: '247',
-        model: 'deepseek-v4-flash',
-        prompt: 'audit',
-        phase: 'map',
-      },
-      client,
-    )
+  test('DeepSeek and MiniMax use CCB proxy billing without Codex admission', async () => {
+    for (const model of ['deepseek-v4-flash', 'MiniMax-M3']) {
+      const { gateway, calls } = makeGateway(model)
+      const { client, calls: clientCalls } = makeClient()
+      const output = await gateway._runAutoDreamOptimizerModel(
+        {
+          runId: '00000000-0000-4000-8000-000000000001',
+          callId: '00000000-0000-4000-8000-000000000001:0',
+          agentId: 'main',
+          userId: '247',
+          model,
+          prompt: 'audit',
+          phase: 'map',
+        },
+        client,
+      )
 
-    assert.deepEqual(JSON.parse(output), structuredOutput)
-    assert.equal(calls.getOrCreate[0]?.userId, '247')
-    assert.equal(calls.getOrCreate[0]?.hermeticNoTools, true)
-    assert.ok(calls.getOrCreate[0]?.structuredOutputSchema)
-    assert.deepEqual(calls.submit, [{ requestId: undefined, options: undefined }])
-    assert.deepEqual(clientCalls, {
-      admit: 0,
-      retryPending: 1,
-      stageBilling: 0,
-      settleStaged: 0,
-      abandon: 0,
-    })
-    assert.equal(calls.destroy.length, 1)
+      assert.deepEqual(JSON.parse(output), structuredOutput)
+      assert.equal(calls.getOrCreate[0]?.userId, '247')
+      assert.equal(calls.getOrCreate[0]?.hermeticNoTools, true)
+      assert.ok(calls.getOrCreate[0]?.structuredOutputSchema)
+      assert.deepEqual(calls.submit, [{ requestId: undefined, options: undefined }])
+      assert.deepEqual(clientCalls, {
+        admit: 0,
+        retryPending: 1,
+        stageBilling: 0,
+        settleStaged: 0,
+        abandon: 0,
+      })
+      assert.equal(calls.destroy.length, 1)
+    }
   })
 
   test('Terra keeps Codex admission and durable billing settlement', async () => {

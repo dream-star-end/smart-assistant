@@ -255,7 +255,7 @@ export async function handleAdminProductFriction(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret);
-  const [events, models, modelFailures, images, imageAttempts, orders, github, ratings] = await Promise.all([
+  const [events, models, modelFailures, images, imageAttempts, orders, github, ratings, eventSummary] = await Promise.all([
     query<{
       surface: string; stage: string; code: string; journeys_1d: string; journeys_7d: string;
       attempts_1d: string; attempts_7d: string; failed_7d: string; recovered_7d: string;
@@ -390,7 +390,54 @@ export async function handleAdminProductFriction(
          FROM response_rating WHERE created_at > NOW()-interval '30 days'
         GROUP BY rating ORDER BY rating`,
     ),
+    query<{
+      window_key: 'last_1h' | 'last_24h' | 'last_7d'; total: number; affected_users: number;
+      failed: number; recovered: number; succeeded: number; abandoned: number;
+      pending: number; cancelled: number; latest_occurrence: Date | null;
+      with_trace: number; missing_trace: number;
+    }>(
+      `WITH windows(window_key,span) AS (
+         VALUES ('last_1h',INTERVAL '1 hour'),
+                ('last_24h',INTERVAL '24 hours'),
+                ('last_7d',INTERVAL '7 days')
+       )
+       SELECT w.window_key,
+              COUNT(e.event_key)::int AS total,
+              COUNT(DISTINCT e.user_id) FILTER (WHERE e.user_id IS NOT NULL)::int AS affected_users,
+              COUNT(*) FILTER (WHERE e.outcome='failed')::int AS failed,
+              COUNT(*) FILTER (WHERE e.outcome='recovered')::int AS recovered,
+              COUNT(*) FILTER (WHERE e.outcome='succeeded')::int AS succeeded,
+              COUNT(*) FILTER (WHERE e.outcome='abandoned')::int AS abandoned,
+              COUNT(*) FILTER (WHERE e.outcome='pending')::int AS pending,
+              COUNT(*) FILTER (WHERE e.outcome='cancelled')::int AS cancelled,
+              MAX(e.created_at) AS latest_occurrence,
+              COUNT(*) FILTER (WHERE e.trace_id IS NOT NULL)::int AS with_trace,
+              COUNT(*) FILTER (WHERE e.trace_id IS NULL AND e.event_key IS NOT NULL)::int AS missing_trace
+         FROM windows w
+         LEFT JOIN product_friction_events e ON e.created_at >= NOW()-w.span
+        GROUP BY w.window_key,w.span
+        ORDER BY w.span`,
+    ),
   ]);
+
+  const summary = Object.fromEntries(eventSummary.rows.map((row) => [row.window_key, {
+    total: row.total,
+    affected_users: row.affected_users,
+    outcomes: {
+      failed: row.failed,
+      recovered: row.recovered,
+      succeeded: row.succeeded,
+      abandoned: row.abandoned,
+      pending: row.pending,
+      cancelled: row.cancelled,
+    },
+    latest_occurrence: row.latest_occurrence?.toISOString() ?? null,
+    trace: {
+      total: row.total,
+      with_trace: row.with_trace,
+      missing_trace: row.missing_trace,
+    },
+  }]));
 
   sendJson(res, 200, {
     generated_at: new Date().toISOString(),
@@ -403,5 +450,6 @@ export async function handleAdminProductFriction(
     orders: orders.rows,
     github,
     ratings: ratings.rows,
+    event_summary: summary,
   });
 }

@@ -12,7 +12,14 @@ export type ProductFeatureCategory =
 export type ManageDestinationTab =
   "memory" | "cron" | "skills" | "connectors" | "library";
 export type SettingsDestinationSection =
-  "account" | "usage" | "preferences" | "feedback" | "about";
+  | "account"
+  | "usage"
+  | "preferences"
+  | "hotkeys"
+  | "feedback"
+  | "about"
+  | "github"
+  | "plugins";
 export type MarketplaceDestinationTab = "browse" | "installed" | "publish";
 export type MarketplaceDestinationKind = "skill" | "agent" | "connector";
 export type OrgDestinationSection =

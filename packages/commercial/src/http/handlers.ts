@@ -130,6 +130,8 @@ export interface CommercialHttpDeps {
   knowledgePlanetAutomation?: KnowledgePlanetAutomationService
   mailer: Mailer
   redis: RateLimitRedis
+  /** Exact Redis GET for the current UTC literature daily counter. */
+  literatureDailyUsage?: (key: string) => Promise<number | null>
   turnstileSecret?: string
   /**
    * 是否对真实用户强制人机验证(env TURNSTILE_ENFORCE,缺省=强制)。

@@ -175,9 +175,9 @@ export const TUTORIAL_TOPICS = {
   },
   "models-reasoning": {
     featureId: "models-reasoning",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
-      "顶栏模型选择器决定本会话下一条任务由哪个模型执行；设置里的默认模型和思考深度决定新会话的起点。不同模型在速度、复杂推理、编程与成本上各有侧重，平台会如实显示当前可用范围和计费。",
+      "输入条右侧的模型选择器决定本会话下一条任务由哪个模型执行；设置里的默认模型和思考深度决定新会话的起点。不同模型在速度、复杂推理、编程与成本上各有侧重，平台会如实显示当前可用范围和计费。",
     outcome: "按任务难度选择合适模型，在响应速度、质量与积分消耗之间取得平衡。",
     scenarios: [
       "快速润色与摘要",
@@ -407,7 +407,7 @@ export const TUTORIAL_TOPICS = {
   },
   "image-create-edit": {
     featureId: "image-create-edit",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
       "在支持 Image 2 的 GPT 模型下，可以用自然语言生成图片，也可以打开已有图片进行评论、圈选和局部修改。图片编辑会保留你的原图语境，圈选区域越准确，修改越可控。",
     outcome: "完成从概念图到局部修订、导出成品的一条闭环。",
@@ -419,7 +419,7 @@ export const TUTORIAL_TOPICS = {
     steps: [
       {
         title: "选择支持的 GPT 模型",
-        body: "若编辑入口不可用，先在顶栏切换到支持 Image 2 的模型。",
+        body: "若编辑入口不可用，先在输入条右侧切换到支持 Image 2 的模型。",
       },
       {
         title: "描述画面与用途",
@@ -561,9 +561,9 @@ export const TUTORIAL_TOPICS = {
   },
   "memory-auto-dream": {
     featureId: "memory-auto-dream",
-    contentVersion: 6,
+    contentVersion: 8,
     intro:
-      "长期记忆按智能体隔离保存稳定信息。新版 Auto-Dream 使用 DeepSeek V4 Flash，在你明确同意后结合 V5 平台能力和技能，全面审计相关会话、操作与日志，并提出记忆、设置、技能、规则、Agent、插件和定时任务等优化建议。",
+      "长期记忆按智能体隔离保存稳定信息。新版 Auto-Dream 使用 MiniMax M3，在你明确同意后结合 V5 平台能力和技能，全面审计相关会话、操作与日志，并提出记忆、设置、技能、规则、Agent、插件和定时任务等优化建议。",
     outcome: "不只整理记忆，而是在保留用户控制权的前提下持续优化整个智能体工作环境。",
     scenarios: [
       "记住职业与沟通偏好",
@@ -593,7 +593,7 @@ export const TUTORIAL_TOPICS = {
       "建议冲突时先重新审计，不要覆盖审计后由你手动修改的内容。",
     ],
     cautions: [
-      "全面审计按 DeepSeek V4 Flash 实际用量计费；执行环境禁用工具和网络。",
+      "全面审计按 MiniMax M3 实际用量计费；执行环境禁用工具和网络。",
       "不要把密码、密钥、身份证号等秘密写进长期记忆。",
     ],
     example:

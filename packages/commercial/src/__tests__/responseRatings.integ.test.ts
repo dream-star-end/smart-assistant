@@ -247,6 +247,11 @@ describe('implicit rating upsert semantics (PG)', () => {
     assert.equal(after.overall.sample_note, 'small_sample')
     assert.ok(after.overall.ci95_low !== null)
     assert.ok(after.overall.ci95_high !== null)
+    assert.equal(after.trace_completeness.total, after.overall.total)
+    assert.equal(
+      after.trace_completeness.with_trace + after.trace_completeness.missing_trace,
+      after.trace_completeness.total,
+    )
   })
 
   test('traffic filter excludes administrators from the production-user rating view', async (t) => {

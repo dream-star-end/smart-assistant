@@ -1,5 +1,5 @@
-import { CheckCircle2, Clock, Inbox, MessageSquare, RefreshCw } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { CheckCircle2, Inbox, MessageSquare, RefreshCw } from "lucide-react";
+import { useRef, useState } from "react";
 import { Alert, Badge, Button } from "../../../components/ui";
 import {
   type Column,
@@ -32,13 +32,20 @@ const STATUS_OPTIONS: { label: string; value: FeedbackStatus | "" }[] = [
 ];
 const TRAFFIC_OPTIONS = [
   { label: "真实用户", value: "production_user" },
+  { label: "匿名反馈", value: "anonymous" },
+  { label: "历史口径不可用", value: "legacy_unavailable" },
   { label: "全部流量", value: "all" },
   { label: "内部管理员", value: "internal_admin" },
   { label: "合成灰度", value: "synthetic_canary" },
   { label: "E2E", value: "e2e" },
 ];
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+function trafficLabel(value: FeedbackRow["traffic_class"]): string {
+  if (value === "production_user") return "真实用户";
+  if (value === "anonymous") return "匿名";
+  if (value === "legacy_unavailable") return "历史不可用";
+  return value;
+}
 
 /** 反馈队列：KPI + 状态构成环图 + 过滤 + 复合游标翻页表；行点开右侧详情抽屉可确认处理。 */
 export function FeedbackQueue() {
@@ -47,27 +54,13 @@ export function FeedbackQueue() {
     userId: "",
     trafficClass: "production_user",
   });
-  const { rows, loading, loadingMore, error, done, loadMore, refresh, patchRow } =
+  const { rows, totals, loading, loadingMore, error, done, loadMore, refresh, patchRow } =
     useFeedbackQueue(filters);
 
   const [active, setActive] = useState<FeedbackRow | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
 
-  const kpi = useMemo(() => {
-    const now = Date.now();
-    let open = 0;
-    let acked = 0;
-    let closed = 0;
-    let last24h = 0;
-    for (const r of rows) {
-      if (r.status === "open") open += 1;
-      else if (r.status === "acked") acked += 1;
-      else if (r.status === "closed") closed += 1;
-      const t = new Date(r.created_at).getTime();
-      if (!Number.isNaN(t) && now - t <= DAY_MS) last24h += 1;
-    }
-    return { open, acked, closed, last24h };
-  }, [rows]);
+  const kpi = totals?.by_status ?? { open: 0, acked: 0, closed: 0 };
 
   const chartRef = useRef<HTMLCanvasElement>(null);
   useChart(
@@ -121,9 +114,25 @@ export function FeedbackQueue() {
       width: 92,
       render: (r) => (
         <Badge tone={r.traffic_class === "production_user" ? "success" : "neutral"}>
-          {r.traffic_class === "production_user" ? "真实用户" : r.traffic_class}
+          {trafficLabel(r.traffic_class)}
         </Badge>
       ),
+    },
+    {
+      key: "priority",
+      title: "优先级",
+      width: 76,
+      render: (r) => r.priority ? (
+        <Badge tone={r.priority === "urgent" ? "danger" : r.priority === "high" ? "warning" : "neutral"}>
+          {{ low: "低", normal: "普通", high: "高", urgent: "紧急" }[r.priority]}
+        </Badge>
+      ) : <span className="text-faint">未设置</span>,
+    },
+    {
+      key: "assigned_to",
+      title: "负责人",
+      width: 88,
+      render: (r) => r.assigned_to ? <span className="font-mono text-[11px]">#{r.assigned_to}</span> : <span className="text-faint">未指派</span>,
     },
     {
       key: "description",
@@ -148,8 +157,6 @@ export function FeedbackQueue() {
     },
   ];
 
-  const totalLabel = `${rows.length}${done ? "" : "+"}`;
-
   return (
     <div className="flex flex-col gap-4">
       <StatCardRow>
@@ -158,16 +165,16 @@ export function FeedbackQueue() {
           value={kpi.open}
           icon={Inbox}
           tone={kpi.open > 0 ? "warning" : "success"}
-          hint="open（已加载）"
+          hint="服务端全量"
         />
-        <StatCard label="已确认" value={kpi.acked} icon={CheckCircle2} tone="success" hint="acked" />
-        <StatCard label="24h 新增" value={kpi.last24h} icon={Clock} tone="info" hint="近 24 小时" />
+        <StatCard label="已确认" value={kpi.acked} icon={CheckCircle2} tone="success" hint="服务端全量" />
+        <StatCard label="已关闭" value={kpi.closed} icon={CheckCircle2} tone="neutral" hint="服务端全量" />
         <StatCard
-          label="已加载"
-          value={totalLabel}
+          label="反馈总数"
+          value={totals?.total ?? 0}
           icon={MessageSquare}
           tone="neutral"
-          hint="当前累积"
+          hint={`当前列表已加载 ${rows.length} 条`}
         />
       </StatCardRow>
 
@@ -226,8 +233,8 @@ export function FeedbackQueue() {
           )}
         </div>
 
-        <ChartCard title="状态构成" hint="按已加载反馈统计" height={240}>
-          {rows.length === 0 ? (
+        <ChartCard title="状态构成" hint="按当前筛选的服务端全量统计" height={240}>
+          {(totals?.total ?? 0) === 0 ? (
             <div className="flex h-full items-center justify-center text-[12px] text-faint">
               暂无数据
             </div>
@@ -245,7 +252,10 @@ export function FeedbackQueue() {
           setSheetOpen(nextOpen);
           if (!nextOpen) setActive(null);
         }}
-        onAcked={patchRow}
+        onUpdated={(updated) => {
+          patchRow(updated);
+          refresh();
+        }}
       />
     </div>
   );

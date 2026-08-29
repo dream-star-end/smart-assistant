@@ -17,6 +17,10 @@ export type ToolLike = {
   inputPreview?: string;
   _partial?: boolean;
   _completed?: boolean;
+  /** Exact durable row from the unified historical timeline. */
+  _timelineRecord?: boolean;
+  /** Authoritative terminal outcome carried by an immutable turn tape row. */
+  _dispatchOutcome?: string;
   output?: string | null;
   outputJson?: unknown;
   text?: string | null;

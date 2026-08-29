@@ -55,6 +55,7 @@ import {
   normalizeFanoutTasks,
 } from './delegateFanout.js'
 import { type ReminderJobView, formatReminderList } from './reminderFormat.js'
+import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPolicy.js'
 // Tool 定义(TOOLS / SKILL_PROPOSE_TOOL)抽到 ./toolDefs.ts(纯数据模块,无副作用),
 // 让「TOOLS ↔ toolNames.ts」锁步单测能直接 import 校验,而不触发本入口模块顶层的
 // server.connect(见 toolDefs.ts / __tests__/toolNames.test.ts)。
@@ -181,7 +182,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         SKILL_PROPOSE_TOOL,
       ]
     : TOOLS
-  return { tools: base }
+  return { tools: filterSkillEvalTools(base, SKILL_EVAL_MODE) }
 })
 
 // ─────────────────────────────────────────────────────────────
@@ -190,6 +191,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params
   try {
+    // Discovery filtering is not an authorization boundary: an MCP client can
+    // still call a hidden tool by name. Reject before any gateway request,
+    // persistent write, or delegation starts.
+    if (SKILL_EVAL_MODE && isSkillEvalBlockedTool(name)) {
+      return toolError(`tool "${name}" is disabled in eval sessions`)
+    }
     switch (name) {
       case 'skill_list':
         return await handleSkillList()

@@ -184,6 +184,33 @@ class Store:
             self.db.commit()
             return self.row(job_id, attempt_id)
 
+    def ensure_canceled_tombstone(
+        self, job_id, attempt_id, fence, resource_class, origin_release
+    ):
+        ts = now_ms()
+        with self.lock:
+            row = self.row(job_id, attempt_id)
+            if row is not None:
+                return row, False
+            self.db.execute(
+                """INSERT INTO attempts
+                   (job_id,attempt_id,fence_version,origin_release,resource_class,status,phase,
+                    cancel_requested_at,created_at,updated_at)
+                   VALUES (?,?,?,?,?,'canceled','canceled',?,?,?)""",
+                (
+                    job_id,
+                    attempt_id,
+                    fence,
+                    origin_release,
+                    resource_class,
+                    ts,
+                    ts,
+                    ts,
+                ),
+            )
+            self.db.commit()
+            return self.row(job_id, attempt_id), True
+
     def put_input(self, job_id, attempt_id, item):
         with self.lock:
             existing = self.db.execute(
@@ -299,6 +326,9 @@ class Worker:
     def __init__(self):
         self.root = Path(os.environ.get("H3_WORKER_STATE", "/root/private_data/openclaude-h3-worker"))
         self.worktree = Path(os.environ.get("H3_WORKER_RELEASE", "/root/private_data/minimax-h3-v5-worker"))
+        self.h3_worktree = Path(
+            os.environ.get("H3_SP_WORKTREE", "/root/private_data/minimax-h3-v5-worker")
+        )
         self.sp_state = Path(os.environ.get("H3_SP_STATE_ROOT", "/root/minimax-h3-sp-runtime"))
         self.python = Path(os.environ.get("H3_SP_PYTHON", "/root/minimax-h3-runtime/venv/bin/python"))
         self.token = os.environ.get("H3_WORKER_TOKEN", "")
@@ -611,10 +641,16 @@ class Worker:
             threading.Thread(target=self._execute, args=(job_id, attempt_id), daemon=True).start()
         return self.public_row(row)
 
-    def cancel(self, job_id, attempt_id, fence):
+    def cancel(self, job_id, attempt_id, fence, resource_class=None):
+        if resource_class is not None and resource_class not in ("gpu-h3", "cpu-compose"):
+            raise ValueError("invalid_resource_class")
         row = self.store.row(job_id, attempt_id)
         if row is None:
-            raise FileNotFoundError
+            if resource_class is None:
+                raise ValueError("resource_class is required for an unknown attempt")
+            row, _created = self.store.ensure_canceled_tombstone(
+                job_id, attempt_id, fence, resource_class, self.release
+            )
         if row["fence_version"] != fence:
             raise Conflict("stale_fence")
         if row["status"] in TERMINAL:
@@ -760,7 +796,11 @@ class Worker:
         if healthy:
             return
         env = os.environ.copy()
-        env.update(H3_SP_WORKTREE=str(self.worktree), H3_SP_STATE_ROOT=str(self.sp_state), H3_SP_PYTHON=str(self.python))
+        env.update(
+            H3_SP_WORKTREE=str(self.h3_worktree),
+            H3_SP_STATE_ROOT=str(self.sp_state),
+            H3_SP_PYTHON=str(self.python),
+        )
         subprocess.run([str(self.worktree / "scripts/minimax_h3_sp/start.sh")], env=env, check=True, timeout=300)
 
     def _stop_ranks(self):
@@ -1086,7 +1126,11 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and action in {"", "status"}:
             return self._json(200, self.worker.public_row(self.worker.store.row(job_id, attempt_id)))
         if method == "POST" and action == "cancel":
-            return self._json(200, self.worker.cancel(job_id, attempt_id, fence))
+            body = self._body()
+            return self._json(
+                200,
+                self.worker.cancel(job_id, attempt_id, fence, body.get("resource_class")),
+            )
         if method == "POST" and action == "ack":
             self.worker.ack(job_id, attempt_id, fence)
             return self._json(200, {"ok": True})

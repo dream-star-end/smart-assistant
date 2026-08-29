@@ -37,13 +37,14 @@ const CLASSIFY_SAMPLES: Array<{ input: string; code: string }> = [
     input: "prompt is too long: ran out of room in the model's context window",
     code: 'context_too_long',
   },
+  {
+    input: 'API Error: 400 {"error":{"code":"INVALID_REQUEST","message":"upstream rejected the request"}}',
+    code: 'bad_request',
+  },
 ]
 
-/**
- * 只经 `classifyDelegateOutputError` 产出、classifyRunError 不产的码(delegate
- * 子 agent 输出面)。分开列是因为两个入口的**值域不同**(DelegateOutputError.code
- * = ClassifiedErrorCode | 'bad_request'),不能混进 classifyRunError 的驱动集。
- */
+/** Delegate-specific input shapes that still share the ClassifiedErrorCode
+ * value domain. BAD_BODY keeps its more actionable sub-agent copy. */
 const DELEGATE_ONLY_SAMPLES: Array<{ input: string; code: string }> = [
   {
     input: 'API Error: 400 {"error":{"code":"BAD_BODY","message":"invalid request body"}}',

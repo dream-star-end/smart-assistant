@@ -64,6 +64,8 @@ fi
 IMAGE_FULL="${IMAGE_REPO}:${TAG}"
 TAR_PATH="${IMAGE_OUT_DIR}/openclaude-runtime-${TAG}.tar.gz"
 CODEX_VERSION="0.144.0"
+CURSOR_AGENT_VERSION="2026.08.11-e8db854"
+CURSOR_AGENT_SHA256="bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a"
 
 # The image tag is a deployment handle and may be chosen before the final source commit.
 # Bind the image to the exact staged source independently so activation can reject a stale
@@ -88,6 +90,7 @@ fi
 echo "[build-image] tag=$TAG"
 echo "[build-image] image=$IMAGE_FULL"
 echo "[build-image] source_commit=$SOURCE_COMMIT codex=$CODEX_VERSION"
+echo "[build-image] cursor_agent=$CURSOR_AGENT_VERSION"
 echo "[build-image] tar=$TAR_PATH"
 
 # ───────────────────────────────────────────────
@@ -413,9 +416,16 @@ docker build \
   --label "oc.runtime.git_sha=$TAG" \
   --label "oc.runtime.source_commit=$SOURCE_COMMIT" \
   --label "oc.runtime.codex_version=$CODEX_VERSION" \
+  --label "oc.runtime.cursor_agent_version=$CURSOR_AGENT_VERSION" \
+  --label "oc.runtime.include_cursor=${OC_INCLUDE_CURSOR:-0}" \
   --label "oc.runtime.include_codex=${OC_INCLUDE_CODEX:-1}" \
+  --label "oc.runtime.include_grok=${OC_INCLUDE_GROK:-0}" \
   --label "oc.runtime.embed_source=${OC_EMBED_SOURCE:-1}" \
   --build-arg "OC_INCLUDE_CODEX=${OC_INCLUDE_CODEX:-1}" \
+  --build-arg "OC_CURSOR_AGENT_VERSION=$CURSOR_AGENT_VERSION" \
+  --build-arg "OC_CURSOR_AGENT_SHA256=$CURSOR_AGENT_SHA256" \
+  --build-arg "OC_INCLUDE_CURSOR=${OC_INCLUDE_CURSOR:-0}" \
+  --build-arg "OC_INCLUDE_GROK=${OC_INCLUDE_GROK:-0}" \
   --build-arg "OC_EMBED_SOURCE=${OC_EMBED_SOURCE:-1}" \
   -f "$BUILD_CTX/Dockerfile.openclaude-runtime" \
   -t "$IMAGE_FULL" \

@@ -33,7 +33,7 @@ import { AeadError } from '../crypto/aead.js'
 import { loadKmsKey } from '../crypto/keys.js'
 import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
-import { getCodexAccountRuntimeChannel } from '../runtimeChannel.js'
+import { getCodexAccountRuntimeChannel, getRuntimeChannel } from '../runtimeChannel.js'
 import type { AccountHealthTracker } from './health.js'
 import {
   type AccountPlan,
@@ -768,6 +768,35 @@ export class AccountScheduler {
   }
 
   /**
+   * Refresh an existing slot lease without changing concurrency. Long-running
+   * coding turns use this heartbeat so the orphan reaper cannot reclaim a live
+   * slot and accidentally admit another turn on the same subscription account.
+   */
+  renewCodexSlot(account_id: bigint | string, slotId: string): boolean {
+    const inner = this.slots.get(String(account_id))
+    if (inner === undefined || !inner.has(slotId)) return false
+    inner.set(slotId, this.now().getTime())
+    return true
+  }
+
+  /**
+   * Rehydrate a server-owned durable slot after a browser bridge, Master
+   * process, or the generic orphan reaper has forgotten its local mirror.
+   * Existing identities are refreshed idempotently; durable truth is restored
+   * even when it is already at/above the current configured cap so subsequent
+   * allocations fail closed.
+   */
+  restoreCodexSlot(account_id: bigint | string, slotId: string): void {
+    const id = String(account_id)
+    let inner = this.slots.get(id)
+    if (inner === undefined) {
+      inner = new Map<string, number>()
+      this.slots.set(id, inner)
+    }
+    inner.set(slotId, this.now().getTime())
+  }
+
+  /**
    * 回收"活进程内泄漏"的槽:acquiredAt 早于 `now - slotLeaseTtlMs` 的租约。返回回收数。
    *
    * **不调 health tracker** —— 超时是 ambiguous(泄漏 or 合法长 turn 已被别处释放只剩残影),
@@ -1155,6 +1184,10 @@ export class AccountScheduler {
     if (groupId !== null) {
       params.push(String(groupId))
       where.push(`group_id = $${params.length}`)
+    }
+    if (provider === 'codex' || provider === 'grok') {
+      params.push(provider === 'codex' ? getCodexAccountRuntimeChannel() : getRuntimeChannel())
+      where.push(`runtime_channel = $${params.length}`)
     }
     const res = await query<CandidateRow>(
       `SELECT id::text AS id, plan, health_score,
@@ -1658,17 +1691,27 @@ export async function pickCodexAccountForBindingInTx(
   sessionId: string,
   deps: PickCodexBindingDeps = {},
 ): Promise<PickedCodexBinding | null> {
+  return pickOfficialOAuthAccountForBindingInTx(client, 'codex', sessionId, deps)
+}
+
+export async function pickOfficialOAuthAccountForBindingInTx(
+  client: PoolClient,
+  provider: 'codex' | 'grok',
+  sessionId: string,
+  deps: PickCodexBindingDeps = {},
+): Promise<PickedCodexBinding | null> {
   if (!sessionId || sessionId.length === 0) {
     throw new TypeError('sessionId required for pickCodexAccountForBindingInTx')
   }
   const hash = deps.hash ?? defaultHash
 
   const params: unknown[] = []
-  const where = ["status = 'active'", "provider = 'codex'"]
+  const where = ["status = 'active'", `provider = $1`]
+  params.push(provider)
   // 0098 channel 划分(M1b):codex 账号池权威按 runtime_channel 归属,picker 使用 Codex account-pool channel。
   // 默认仍是本 runtime channel；设置 OC_CODEX_ACCOUNT_RUNTIME_CHANNEL=v5 时,
   // v3 容器可消费 v5-owned 账号池,但容器 runtime_channel 不随之改变。
-  params.push(getCodexAccountRuntimeChannel())
+  params.push(provider === 'codex' ? getCodexAccountRuntimeChannel() : getRuntimeChannel())
   where.push(`runtime_channel = $${params.length}`)
   if (deps.groupId !== undefined && deps.groupId !== null) {
     params.push(String(deps.groupId))

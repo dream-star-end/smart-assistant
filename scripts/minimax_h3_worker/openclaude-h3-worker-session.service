@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenClaude H3 SCNet worker session lease
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/root/.secrets/openclaude-h3-worker-session.env
+ExecStart=/usr/local/sbin/openclaude-h3-worker-session
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

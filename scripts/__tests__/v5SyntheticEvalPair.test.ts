@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -21,6 +22,7 @@ import {
   controlledPromptDelta,
   parsePairArgs,
 } from "../v5-synthetic-eval-pair.mjs";
+import { main as documentArtifactMain } from "../v5-document-artifact-pair.mjs";
 
 const here = resolve(fileURLToPath(import.meta.url), "..");
 const repoRoot = resolve(here, "../..");
@@ -112,6 +114,10 @@ function armEvidence(
     workspace: { state: "tree", files: 8, directories: 0, sha256: digest("persistent-workspace") },
     browserCli: { state: "tree", files: 2, directories: 0, sha256: digest("persistent-browser-cli") },
     browserMcp: { state: "tree", files: 0, directories: 0, sha256: digest("") },
+    sharedSkills: { state: "tree", files: 4, directories: 2, sha256: digest("shared-skills") },
+    skillDrafts: { state: "absent" },
+    skillEvals: { state: "tree", files: 1, directories: 1, sha256: digest("skill-evals") },
+    agentSkills: { state: "absent" },
   };
   const turnResultSha = digest(`turn-result-${arm}`);
   return {
@@ -143,6 +149,10 @@ function armEvidence(
           workspace: structuredClone(emptyScratch),
           browserCliScratch: structuredClone(emptyScratch),
           browserMcpScratch: structuredClone(emptyScratch),
+          sharedSkillsScratch: structuredClone(emptyScratch),
+          skillDraftsScratch: structuredClone(emptyScratch),
+          skillEvalsScratch: structuredClone(emptyScratch),
+          agentSkillsScratch: structuredClone(emptyScratch),
           temporaryWorkspace: { state: "absent" },
         },
       },
@@ -163,6 +173,17 @@ function armEvidence(
             sha256: digest(`browser-scratch-${arm}`),
           },
           browserMcpScratch: structuredClone(emptyScratch),
+          sharedSkillsScratch: {
+            ...structuredClone(emptyScratch),
+            files: arm === "A" ? 1 : 0,
+            directories: arm === "A" ? 1 : 0,
+            sha256: arm === "A"
+              ? digest(`shared-skills-${arm}`)
+              : emptyScratch.sha256,
+          },
+          skillDraftsScratch: structuredClone(emptyScratch),
+          skillEvalsScratch: structuredClone(emptyScratch),
+          agentSkillsScratch: structuredClone(emptyScratch),
           temporaryWorkspace: {
             ...structuredClone(artifactIdentity),
           },
@@ -369,6 +390,62 @@ function rewriteArmB(fixture: Fixture): void {
   );
 }
 
+function replaceCapturedArtifact(
+  fixture: Fixture,
+  arm: Arm,
+  relativePath: string,
+  content: Buffer,
+): void {
+  const contentSha = createHash("sha256").update(content).digest("hex");
+  const identity = {
+    state: "tree",
+    files: 1,
+    directories: 0,
+    sha256: createHash("sha256")
+      .update(`F  ${contentSha}  ${relativePath}\n`)
+      .digest("hex"),
+  };
+  const evidence = fixture.evidence[arm];
+  const document = {
+    schemaVersion: 1,
+    uid: evidence.uid,
+    engine: evidence.engine,
+    agentId: evidence.agentId,
+    caseId: evidence.evaluationCase.id,
+    workspaceMode: evidence.evaluationCase.workspace,
+    containerId: evidence.overlayContainer.containerId,
+    manifestSha: evidence.expectedManifestSha,
+    identity,
+    entries: [{
+      path: relativePath,
+      type: "file",
+      mode: 0o644,
+      bytes: content.length,
+      sha256: contentSha,
+      contentBase64: content.toString("base64"),
+    }],
+  };
+  const captureBytes = Buffer.from(`${JSON.stringify(document)}\n`);
+  writeFileSync(fixture.artifacts[arm], captureBytes, { mode: 0o600 });
+  evidence.dynamicInputs.post.inputs.temporaryWorkspace = structuredClone(identity);
+  evidence.workspaceArtifact = {
+    state: "tree",
+    identity: structuredClone(identity),
+    entryCount: 1,
+    capturedPath: fixture.artifacts[arm],
+    bytes: captureBytes.length,
+    sha256: createHash("sha256").update(captureBytes).digest("hex"),
+    files: 1,
+    directories: 0,
+    completeBytes: content.length,
+  };
+  writeFileSync(
+    arm === "A" ? fixture.armAPath : fixture.armBPath,
+    `${JSON.stringify(evidence, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+}
+
 function allSnapshots(evidence: Record<string, any>): Record<string, any>[] {
   return [evidence.pre, evidence.post, evidence.restoreSnapshot];
 }
@@ -404,6 +481,118 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
     assert.equal(result.identity.billingBindingMode, "ccb_authority_dispatch_attempt");
     assert.equal(result.workspaceArtifacts.A.files, 1);
     assert.equal(result.workspaceArtifacts.B.files, 1);
+  });
+
+  test("artifact extension reconstructs both immutable arms and keeps blinded QA evidence", () => {
+    const fixture = makeFixture();
+    replaceCapturedArtifact(fixture, "A", "deliverables/report.pdf", Buffer.from("%PDF-1.7\nA"));
+    replaceCapturedArtifact(fixture, "B", "deliverables/report.pdf", Buffer.from("%PDF-1.7\nB"));
+    const spec = join(fixture.directory, "artifact-spec.json");
+    const artifactDir = join(fixture.directory, "blind-renders");
+    const output = join(fixture.directory, "artifact-pair.json");
+    writeFileSync(
+      spec,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        caseId: "multi-source-research",
+        kind: "pdf",
+        artifactPath: "deliverables/report.pdf",
+        expect: { requiredText: ["report"] },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const qa = join(fixture.directory, "fake-artifact-qa");
+    writeFileSync(
+      qa,
+      `#!/bin/bash
+set -euo pipefail
+input=""; out=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --input) input="$2"; shift 2;;
+    --out-dir) out="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+mkdir "$out"
+sha=$(/usr/bin/sha256sum "$input"); sha="${"${sha%% *}"}"
+printf page > "$out/page-1.png"
+printf '{"schemaVersion":1,"input":{"kind":"pdf","sha256":"%s"},"passed":true,"renderedPages":["%s/page-1.png"],"contactSheets":[],"failures":[],"warnings":[]}\\n' "$sha" "$out" > "$out/report.json"
+`,
+      { mode: 0o755 },
+    );
+    const originalQa = process.env.OC_ARTIFACT_QA_BIN;
+    process.env.OC_ARTIFACT_QA_BIN = qa;
+    try {
+      assert.equal(
+        documentArtifactMain([
+          "--arm-a",
+          fixture.armAPath,
+          "--arm-b",
+          fixture.armBPath,
+          "--spec",
+          spec,
+          "--artifact-dir",
+          artifactDir,
+          "--output",
+          output,
+          "--apply",
+        ]),
+        0,
+      );
+      const dryArtifactDir = join(fixture.directory, "dry-renders");
+      const dryOutput = join(fixture.directory, "dry-result.json");
+      const stdout: string[] = [];
+      const originalWrite = process.stdout.write;
+      process.stdout.write = ((chunk: any) => {
+        stdout.push(String(chunk));
+        return true;
+      }) as typeof process.stdout.write;
+      try {
+        assert.equal(
+          documentArtifactMain([
+            "--arm-a",
+            fixture.armAPath,
+            "--arm-b",
+            fixture.armBPath,
+            "--spec",
+            spec,
+            "--artifact-dir",
+            dryArtifactDir,
+            "--output",
+            dryOutput,
+          ]),
+          0,
+        );
+      } finally {
+        process.stdout.write = originalWrite;
+      }
+      const dryResult = JSON.parse(stdout.join(""));
+      assert.equal(dryResult.applied, false);
+      assert.equal(dryResult.evidencePersisted, false);
+      assert.equal("blindEvidenceDirectory" in dryResult, false);
+      assert.equal("reportPath" in dryResult.arms.A, false);
+      assert.equal("renderedPages" in dryResult.arms.A, false);
+      assert.equal(dryResult.arms.A.renderedPageCount, 1);
+      assert.equal(existsSync(dryArtifactDir), false);
+      assert.equal(existsSync(dryOutput), false);
+    } finally {
+      if (originalQa === undefined) delete process.env.OC_ARTIFACT_QA_BIN;
+      else process.env.OC_ARTIFACT_QA_BIN = originalQa;
+    }
+    const result = JSON.parse(readFileSync(output, "utf8"));
+    assert.equal(result.validPair, true);
+    assert.equal(result.arms.A.hardGatePassed, true);
+    assert.equal(result.arms.B.hardGatePassed, true);
+    assert.notEqual(result.arms.A.sha256, result.arms.B.sha256);
+    assert.deepEqual(
+      new Set([result.arms.A.blindLabel, result.arms.B.blindLabel]),
+      new Set(["left", "right"]),
+    );
+    for (const arm of ["A", "B"] as const) {
+      assert.equal(statSync(result.arms[arm].reportPath).isFile(), true);
+      assert.equal(statSync(result.arms[arm].renderedPages[0]).isFile(), true);
+    }
   });
 
   test("controlled full-prompt diff is deterministic and byte-exact", () => {

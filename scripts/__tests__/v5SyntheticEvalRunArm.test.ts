@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   assertDynamicInputsStable,
+  assertNoUnisolatedArchiveMutations,
   assertSameLane,
   assertStandardScratchRestored,
   assertTurnUsageMatchesFrames,
@@ -983,6 +984,10 @@ describe("V5 synthetic exact-eval run-arm", () => {
         workspace: structuredClone(emptyScratch),
         browserCliScratch: structuredClone(emptyScratch),
         browserMcpScratch: structuredClone(emptyScratch),
+        sharedSkillsScratch: structuredClone(emptyScratch),
+        skillDraftsScratch: structuredClone(emptyScratch),
+        skillEvalsScratch: structuredClone(emptyScratch),
+        agentSkillsScratch: structuredClone(emptyScratch),
         temporaryWorkspace: { state: "absent" },
       },
     };
@@ -1015,6 +1020,10 @@ describe("V5 synthetic exact-eval run-arm", () => {
         workspace: { state: "tree", files: 8, directories: 0, sha256: "1".repeat(64) },
         browserCli: { state: "tree", files: 2, directories: 0, sha256: "2".repeat(64) },
         browserMcp: { state: "tree", files: 0, directories: 0, sha256: emptyScratch.sha256 },
+        sharedSkills: { state: "tree", files: 4, directories: 2, sha256: "4".repeat(64) },
+        skillDrafts: { state: "absent" },
+        skillEvals: { state: "tree", files: 1, directories: 1, sha256: "5".repeat(64) },
+        agentSkills: { state: "absent" },
       },
     };
     assert.doesNotThrow(() =>
@@ -1044,6 +1053,74 @@ describe("V5 synthetic exact-eval run-arm", () => {
       () => assertStandardScratchRestored(absent, persistent),
       /tree identity is invalid/,
     );
+  });
+
+  test("rejects completed archive mutations without treating searches or failures as writes", () => {
+    const directory = temp("v5-run-arm-archive-mutation-");
+    const framesPath = join(directory, "frames.json");
+    const writeFrames = (blocks: Array<Record<string, unknown>>) => {
+      writeFileSync(framesPath, JSON.stringify({
+        frames: [{
+          direction: "received",
+          text: JSON.stringify({ type: "outbound.message", blocks }),
+        }],
+      }), { mode: 0o600 });
+      chmodSync(framesPath, 0o600);
+    };
+    const completed = (
+      blockId: string,
+      toolName: string,
+      inputJson: Record<string, unknown>,
+      isError = false,
+    ) => [
+      { kind: "tool_use", blockId, toolName, inputJson },
+      { kind: "tool_result", toolUseBlockId: blockId, isError },
+    ];
+
+    writeFrames(completed("direct", "codex:mcpToolCall", {
+      server: "openclaude_memory",
+      tool: "archival_add",
+    }));
+    assert.throws(
+      () => assertNoUnisolatedArchiveMutations(framesPath),
+      /unisolated archive mutation completed.*direct/,
+    );
+
+    writeFrames(completed("wrapped", "ExecuteExtraTool", {
+      tool_name: "mcp__openclaude_memory__archival_delete",
+      arguments: { id: "arc-test" },
+    }));
+    assert.throws(
+      () => assertNoUnisolatedArchiveMutations(framesPath),
+      /unisolated archive mutation completed.*wrapped/,
+    );
+
+    writeFrames(completed("direct-ccb", "mcp__openclaude_memory__archival_add", {
+      content: "sample",
+    }));
+    assert.throws(
+      () => assertNoUnisolatedArchiveMutations(framesPath),
+      /unisolated archive mutation completed.*direct-ccb/,
+    );
+
+    writeFrames(completed("shell", "Bash", {
+      command: "bash -lc 'command timeout 10s oc-memory archival-add sample'",
+    }));
+    assert.throws(
+      () => assertNoUnisolatedArchiveMutations(framesPath),
+      /unisolated archive mutation completed.*shell/,
+    );
+
+    writeFrames([
+      ...completed("search", "Bash", {
+        command: "rg \"bash -lc 'oc-memory archival-add sample'\" docs",
+      }),
+      ...completed("failed", "codex:mcpToolCall", {
+        server: "openclaude_memory",
+        tool: "archival_delete",
+      }, true),
+    ]);
+    assert.doesNotThrow(() => assertNoUnisolatedArchiveMutations(framesPath));
   });
 
   test("source keeps one outer lease, measures actual prompt bytes, and restores in finally", () => {

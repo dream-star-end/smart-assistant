@@ -657,7 +657,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   // ── 遗留兼容(新 bridge 不再发射,归一化仍认)──
   codex_turn_busy: "上一轮任务仍在运行，请等它结束后再发送。",
   codex_pool_busy: "账号池繁忙，请稍后重试。",
-  codex_route_unavailable: "GPT 服务暂时不可用，你的消息已保留，请稍后重试。",
+  codex_route_unavailable: "模型服务暂时不可用，你的消息已保留，请稍后重试。",
   codex_container_recycled: "环境已重建，请刷新页面后重发。",
   codex_billing: "计费服务暂时不可用，本轮未开始，请稍后重试。",
   upstream_error: "模型服务暂时不可用，你的消息已保留，请重试。",
@@ -683,13 +683,12 @@ export function friendlyBridgeErrorMessage(code: unknown, message?: string): str
 }
 
 /**
- * 「查看详情」只保留可公开的说明与 trace id。上游/路由/账号池原文仍进入错误遥测，
- * 但不能持久化进会话后直接展示给用户。
+ * 「查看详情」只保留 trace id。上游/路由/账号池原文仍进入错误遥测，不能持久化进会话后
+ * 直接展示给用户；无 trace 时不生成与正文重复的详情。
  */
-export function safeBridgeErrorDetail(code: unknown, traceId?: unknown): string {
-  const summary = friendlyBridgeErrorMessage(code);
+export function safeBridgeErrorDetail(_code: unknown, traceId?: unknown): string {
   const trace = typeof traceId === "string" ? traceId.trim() : "";
-  return trace ? `${summary}\n请求编号：${trace}` : summary;
+  return trace ? `请求 ID：${trace}` : "";
 }
 
 /**

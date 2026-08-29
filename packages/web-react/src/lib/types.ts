@@ -70,6 +70,8 @@ export type Session = {
   /** 会话级模型选择(per-session 持久化;缺省 = 未显式选择 → 选择器回落 default_model)。
    *  来源:本地选择写通 / IndexedDB 注水 / listSessions server-wins;App 切会话据此恢复选择器。 */
   modelId?: string;
+  /** 服务端已有的置顶标记（SessionMeta.pinned）。缺席 = 未置顶。不在本层发明写入口。 */
+  pinned?: boolean;
 };
 
 export type Message = {
@@ -798,6 +800,7 @@ export type AutoDreamLastReport = {
 
 export type AutoDreamReportResponse = {
   status: "idle" | "running" | "success" | "failed";
+  mode?: "legacy_memory_v1" | "optimizer_v2";
   startedAt?: string;
   pendingSessions: number;
   lastReport?: AutoDreamLastReport;
@@ -972,6 +975,53 @@ export type SkillDetail = SkillSummary & {
   body?: string;
   /** skill 目录下的文件相对路径（一套技能是一个目录，含 SKILL.md + 可能的附属文件）。 */
   files?: string[];
+};
+
+// ── 社区共建教程 ─────────────────────────────────────────────────────────
+
+export type CommunityTutorialCategory = "research" | "coding" | "general";
+export type CommunityTutorialStatus = "pending" | "approved" | "rejected" | "withdrawn";
+
+export type CommunityTutorialSummary = {
+  id: string;
+  title: string;
+  summary: string;
+  category: CommunityTutorialCategory;
+  authorName: string;
+  publishedAt: string;
+};
+
+export type CommunityTutorialDetail = CommunityTutorialSummary & {
+  bodyMarkdown: string;
+};
+
+export type CommunityTutorialMine = {
+  id: string;
+  title: string;
+  summary: string;
+  category: CommunityTutorialCategory;
+  bodyMarkdown: string;
+  status: CommunityTutorialStatus;
+  reviewNote: string | null;
+  createdAt: string;
+  reviewedAt: string | null;
+  publishedAt: string | null;
+};
+
+export type CommunityTutorialPending = CommunityTutorialMine & {
+  authorName: string;
+};
+
+export type CommunityTutorialDraft = {
+  title: string;
+  summary: string;
+  category: CommunityTutorialCategory;
+  bodyMarkdown: string;
+};
+
+export type CommunityTutorialPage<T> = {
+  tutorials: T[];
+  nextCursor: string | null;
 };
 
 // ── AI 市场（marketplace，见 packages/commercial/src/marketplace） ──────────

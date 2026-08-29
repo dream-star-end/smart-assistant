@@ -37,12 +37,20 @@ export interface IncidentRow {
   user_title: string;
   opened_at: string;
   updated_at: string;
+  /** 列表查询可附带的最新修复状态；未触发修复时为 null。 */
+  latest_repair_status: RepairStatus | null;
+  latest_repair_at: string | null;
 }
 
 export interface IncidentListResp {
-  incidents: IncidentRow[];
+  /** 服务端列表 envelope 的权威字段。 */
+  rows: IncidentRow[];
   /** cursor 分页游标（缺省 = 无更多）。 */
-  nextBeforeId?: string;
+  next_before: string | null;
+  /** 后端提供时为当前过滤条件的全量记录数；缺失时前端只展示“已加载”。 */
+  total: number;
+  /** 全部状态中的未恢复数（open + repairing）；不受 status 过滤影响。 */
+  open_total: number;
 }
 
 /**
@@ -172,16 +180,21 @@ export interface ResolveResp {
   rev?: number;
 }
 
-/** GET /selfheal/conditions?suppressed=1 行(camelCase,对齐后端 serializer 契约)。 */
+/** GET /selfheal/conditions?suppressed=1 行（后端 SQL serializer 的 snake_case 契约）。 */
 export interface SuppressedConditionRow {
-  conditionKey: string;
-  suppressedAt: string | null;
-  suppressedBy: string | null;
+  condition_key: string;
+  firing: boolean;
+  mode: string;
   level: Severity | null;
+  observed_at: string | null;
+  occurrence_count: string;
+  suppressed_until_clear: boolean;
+  suppressed_at: string | null;
+  suppressed_by: string | null;
 }
 
 export interface SuppressedConditionsResp {
-  items: SuppressedConditionRow[];
+  rows: SuppressedConditionRow[];
 }
 
 export interface UserNoticeProposalRow {

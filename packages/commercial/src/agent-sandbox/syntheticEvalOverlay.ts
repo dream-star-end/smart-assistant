@@ -23,15 +23,20 @@ export const SYNTHETIC_EVAL_PROMPT_SLOTS_TARGET =
   "/opt/openclaude/packages/gateway/src/promptSlots.ts";
 
 // Exact-eval turns must retain the same paths/CWD and writable semantics as a
-// normal user container without carrying one arm's scratch into the next.
-// v3supervisor overlays these three existing data-volume directories with
+// normal user container without carrying one arm's scratch or learned skills
+// into the next. v3supervisor overlays these data-volume paths with
 // per-container tmpfs mounts only while a valid local-V5 synthetic record is
-// active. Destroying the cold arm container therefore discards the scratch;
-// the underlying persistent user volume remains untouched.
+// active. Destroying the cold arm container therefore discards both ordinary
+// scratch and writable skill/training state; the underlying persistent user
+// volume remains untouched.
 export const SYNTHETIC_EVAL_SCRATCH_TMPFS_TARGETS = [
   "/home/agent/.openclaude/workspace",
   "/home/agent/.openclaude/.playwright-cli",
   "/home/agent/.openclaude/.playwright-mcp",
+  "/home/agent/.openclaude/skills",
+  "/home/agent/.openclaude/skill-drafts",
+  "/home/agent/.openclaude/skill-evals",
+  "/home/agent/.openclaude/agents/main/skills",
 ] as const;
 export const SYNTHETIC_EVAL_SCRATCH_TMPFS_OPTIONS =
   "rw,nosuid,nodev,mode=0700,uid=1000,gid=1000";

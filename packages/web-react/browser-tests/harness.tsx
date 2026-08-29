@@ -15,7 +15,19 @@ import {
 } from "react";
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
+import { SettingsCenter } from "../src/components/SettingsCenter";
+import { Sidebar } from "../src/components/Sidebar";
+import { BoundRepoCard } from "../src/components/contextRail/BoundRepoCard";
+import { ContextRail } from "../src/components/contextRail/ContextRail";
+import { RepoPill } from "../src/components/github/RepoPill";
+import { PinnedTaskTracker } from "../src/components/chat/PinnedTaskTracker";
+import { useContextRailHidden } from "../src/hooks/useContextRailHidden";
+import { useXlViewport } from "../src/hooks/useXlViewport";
+import type { RepoSelection } from "../src/lib/types";
+import { CommunityTutorials } from "../src/components/tutorials/CommunityTutorials";
 import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
+import { TurnCostReminder } from "../src/components/chat/TurnCostReminder";
+import { MemoryPanel } from "../src/components/manage/MemoryPanel";
 import { MediaTaskCenter } from "../src/components/MediaTaskCenter";
 import { Markdown } from "../src/components/Markdown";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
@@ -23,6 +35,7 @@ import { ModelSelector } from "../src/components/ModelSelector";
 import { ToolCard } from "../src/components/ToolCard";
 import { TeamPanel } from "../src/components/chat/TeamPanel";
 import { ConnectorsTab } from "../src/components/settings/ConnectorsTab";
+import { ToastProvider, TooltipProvider } from "../src/components/ui";
 import {
   captureVisibleVirtualRowAnchor,
   restoreVisibleVirtualRowAnchor,
@@ -35,9 +48,12 @@ import {
 } from "../src/lib/persist";
 import type { ChatMessage } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
+import type { User } from "../src/lib/types";
 import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 import { createMemoryAuthSession } from "../src/lib/authSession";
 import { ChatSocket } from "../src/lib/chat/socket";
+import { useSessionList } from "../src/hooks/useSessionList";
+import type { UseChatSocket } from "../src/hooks/useChatSocket";
 import {
   admittedAckFrame,
   EXPECTED_TIMELINE_ROLES,
@@ -53,6 +69,8 @@ declare global {
   interface Window {
     __sends: Array<{ text: string; mediaCount: number }>;
     __uploads: string[];
+    __composerStops: number;
+    __setComposerState: (busy: boolean, stopping: boolean) => void;
     __lazyTimeline: {
       userFetches: number;
       tapeFetches: number;
@@ -89,6 +107,7 @@ declare global {
         replyTo?: { messageId: string; role: "user" | "assistant"; text: string };
       }>;
     };
+    __errorUxRetries: number;
     __mountAskQuestion: () => void;
     __completeTimelineThinking: () => void;
     /** fixture 的精确文本标记与期望顺序,供 run.mjs 读取 —— 断言常量不在两处各写一份。 */
@@ -124,6 +143,16 @@ declare global {
         toolCount: number;
         answerCount: number;
         cursor: number;
+        requests: string[];
+      }>;
+      /** Replay a cold refresh spanning two container frameSeq generations. */
+      runDurableGenerationReset: () => Promise<{
+        markers: { oldProcess: string; currentProcess: string; currentAnswer: string };
+        oldProcessCount: number;
+        currentProcessCount: number;
+        currentAnswerCount: number;
+        cursor: number;
+        requests: string[];
       }>;
       /** Replay the two production error shapes through durable hydration. */
       runDurableErrorReplay: () => Promise<{
@@ -131,6 +160,10 @@ declare global {
         stopErrorText?: string;
         stopReports: number;
         stopSyncs: number;
+        stopStatusCount: number;
+        stopAlertCount: number;
+        stopRetryCount: number;
+        stopCancelledCopyCount: number;
         historicalReports: number;
         historicalSyncs: number;
         historicalDecision: boolean;
@@ -153,6 +186,8 @@ declare global {
 }
 window.__sends = [];
 window.__uploads = [];
+window.__composerStops = 0;
+window.__setComposerState = () => {};
 window.__lazyTimeline = { userFetches: 0, tapeFetches: 0, userRetry: null, tapeFetch: null };
 window.__scrollTimeline = {
   calls: [],
@@ -164,6 +199,7 @@ window.__scrollTimeline = {
 window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0 };
 window.__askQuestion = { responses: [] };
 window.__messageQuote = { sends: [] };
+window.__errorUxRetries = 0;
 window.__mountAskQuestion = () => {};
 window.__completeTimelineThinking = () => {};
 window.__replayFixture = {
@@ -183,6 +219,9 @@ window.__replayDrive = {
   pushRetrySuccess: () => {},
   runDurableOverlap: async () => {
     throw new Error("durable overlap probe 未挂载");
+  },
+  runDurableGenerationReset: async () => {
+    throw new Error("durable generation-reset probe 未挂载");
   },
   runDurableErrorReplay: async () => {
     throw new Error("durable error replay probe 未挂载");
@@ -233,6 +272,32 @@ window.__runPendingDispatchJournalProbe = async () => {
 
 const mediaTaskAuth = createMemoryAuthSession(() => {}, "browser-media-token");
 const connectorsAuth = createMemoryAuthSession(() => {}, "browser-connectors-token");
+const memoryAuth = createMemoryAuthSession(() => {}, "browser-memory-token");
+const communityTutorialAuth = createMemoryAuthSession(() => {}, "browser-community-token");
+
+createRoot(document.getElementById("community-tutorial-root")!).render(
+  <StrictMode>
+    <TooltipProvider>
+      <ToastProvider>
+        <CommunityTutorials auth={communityTutorialAuth} />
+      </ToastProvider>
+    </TooltipProvider>
+  </StrictMode>,
+);
+
+createRoot(document.getElementById("memory-report-root")!).render(
+  <StrictMode>
+    <TooltipProvider>
+      <ToastProvider>
+        <MemoryPanel
+          auth={memoryAuth}
+          agentId="main"
+          agents={[{ id: "main", name: "全能助手" }]}
+        />
+      </ToastProvider>
+    </TooltipProvider>
+  </StrictMode>,
+);
 
 createRoot(document.getElementById("connectors-root")!).render(
   <StrictMode><ConnectorsTab auth={connectorsAuth} /></StrictMode>,
@@ -262,17 +327,29 @@ const uploadStub = async (file: File): Promise<MediaRef> => {
   return { kind: "file", url: "https://stub.invalid/browser-test", filename: file.name };
 };
 
+function ComposerProbe() {
+  const [state, setState] = useState({ busy: false, stopping: false });
+  window.__setComposerState = (busy, stopping) => setState({ busy, stopping });
+  return (
+    <>
+      {state.busy && <TurnCostReminder credits="731" />}
+      <Composer
+        onSend={(text, media) => {
+          window.__sends.push({ text, mediaCount: media?.length ?? 0 });
+        }}
+        busy={state.busy}
+        stopping={state.stopping}
+        onStop={() => { window.__composerStops += 1; }}
+        onUpload={uploadStub}
+        onSetGoal={async () => {}}
+        onGoalAction={async () => {}}
+      />
+    </>
+  );
+}
+
 createRoot(document.getElementById("root")!).render(
-  <StrictMode>
-    <Composer
-      onSend={(text, media) => {
-        window.__sends.push({ text, mediaCount: media?.length ?? 0 });
-      }}
-      onUpload={uploadStub}
-      onSetGoal={async () => {}}
-      onGoalAction={async () => {}}
-    />
-  </StrictMode>,
+  <StrictMode><ComposerProbe /></StrictMode>,
 );
 
 const feedbackAuth = createMemoryAuthSession(() => {}, "browser-feedback-token");
@@ -363,6 +440,36 @@ function MessageQuoteProbe() {
 
 createRoot(document.getElementById("message-quote-root")!).render(
   <StrictMode><MessageQuoteProbe /></StrictMode>,
+);
+
+const errorUxUser: ChatMessage = {
+  id: "browser-error-ux-user",
+  role: "user",
+  text: "你是什么模型",
+  ts: 1,
+  status: "error",
+};
+const errorUxAssistant: ChatMessage = {
+  id: "browser-error-ux-assistant",
+  role: "assistant",
+  text: "",
+  ts: 2,
+  _errorCode: "codex_route_unavailable",
+  _clientMessageId: errorUxUser.id,
+};
+
+createRoot(document.getElementById("error-ux-root")!).render(
+  <StrictMode>
+    <MessageList
+      messages={[errorUxUser, errorUxAssistant]}
+      sending={false}
+      cb={{
+        onRetrySend: () => { window.__errorUxRetries += 1; },
+        resolveRetryTarget: (id) => id === errorUxUser.id ? errorUxUser : undefined,
+      }}
+      onRespondPermission={() => {}}
+    />
+  </StrictMode>,
 );
 
 const activeAskQuestion: ChatMessage = {
@@ -559,6 +666,40 @@ createRoot(document.getElementById("tool-card-polish-root")!).render(
           _completed: true,
         }}
       />
+    </div>
+  </StrictMode>,
+);
+
+createRoot(document.getElementById("interrupted-tool-status-root")!).render(
+  <StrictMode>
+    <div>
+      <div id="interrupted-historical-tool">
+        <ToolCard
+          message={{
+            toolName: "Agent",
+            inputJson: { description: "中断的历史子任务" },
+            _completed: false,
+            _timelineRecord: true,
+            _dispatchOutcome: "interrupted",
+          }}
+        />
+      </div>
+      <div id="live-incomplete-tool">
+        <ToolCard
+          message={{ toolName: "Agent", inputJson: { description: "仍在执行的实时子任务" }, _completed: false }}
+        />
+      </div>
+      <div id="completed-interrupted-tool">
+        <ToolCard
+          message={{
+            toolName: "Agent",
+            inputJson: { description: "中断前已完成的子任务" },
+            _completed: true,
+            _timelineRecord: true,
+            _dispatchOutcome: "interrupted",
+          }}
+        />
+      </div>
     </div>
   </StrictMode>,
 );
@@ -924,6 +1065,72 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
   <StrictMode><ReplayTimelineProbe /></StrictMode>,
 );
 
+const chatEntryUxAuth = createMemoryAuthSession(() => {}, "browser-chat-entry-ux-token");
+const chatEntryUxUser: User = {
+  id: "browser-chat-entry-user",
+  displayName: "Browser User",
+  roles: ["user"],
+};
+
+function ChatEntryUxProbe() {
+  const socketRef = useRef<UseChatSocket | null>(null);
+  const { sessions, activeId, newSession, onHydrated } = useSessionList({
+    demo: false,
+    auth: null,
+    authSession: chatEntryUxAuth,
+    user: chatEntryUxUser,
+    agentId: "main",
+    sockRef: socketRef,
+    confirmDialog: async () => true,
+    promptText: async () => null,
+    clearChatError: () => {},
+    onNewSessionReset: () => {},
+    onActiveSessionDeleted: () => {},
+  });
+  useLayoutEffect(() => {
+    onHydrated([{
+      id: "browser-existing-session",
+      agentId: "main",
+      title: "已有会话",
+      messages: [],
+      createdAt: 1,
+      lastAt: 1,
+    }]);
+  }, [onHydrated]);
+
+  return (
+    <div>
+      <section data-testid="new-session-probe">
+        <button type="button" onClick={newSession}>新建会话测试</button>
+        <span data-testid="new-session-active-state">{activeId ?? "blank"}</span>
+        <div data-testid="new-session-count">{sessions.length}</div>
+        {sessions.map((session) => (
+          <div key={session.id} data-testid="new-session-row">{session.title}</div>
+        ))}
+      </section>
+      <section data-testid="partial-history-probe">
+        <MessageList
+          messages={[{
+            id: "partial-history-visible",
+            role: "user",
+            text: "PARTIAL_HISTORY_VISIBLE_MESSAGE",
+            ts: 1,
+            status: "sent",
+          }]}
+          sending={false}
+          historyLoading
+          cb={{}}
+          onRespondPermission={() => {}}
+        />
+      </section>
+    </div>
+  );
+}
+
+createRoot(document.getElementById("chat-entry-ux-root")!).render(
+  <StrictMode><ChatEntryUxProbe /></StrictMode>,
+);
+
 {
   let pushed = 0;
   let frames: ReturnType<typeof replayTurnFrames> = [];
@@ -1080,16 +1287,47 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
         },
         { kind: "text", text: markers.answer },
       ];
-      await replaySocket.runDurableLiveFrameHydration(REPLAY_SESSION_ID, async () => {
-        const page1 = record("1", 1, [{ kind: "thinking", text: "BROWSER_DURABLE_PAGE1" }]);
-        live().deliver(payload(2, overlapBlocks));
-        const page2 = record("2", 2, overlapBlocks);
-        replaySocket.applyDurableLiveFrames(
-          REPLAY_SESSION_ID,
-          [page1, page2],
-          [clientMessageId],
-        );
-      });
+      const requests: string[] = [];
+      const page1 = record("1", 1, [{ kind: "thinking", text: "BROWSER_DURABLE_PAGE1" }]);
+      const page2 = record("2", 2, overlapBlocks);
+      await replaySocket.hydrateDurableLiveFrameJournal(
+        REPLAY_SESSION_ID,
+        async (after) => {
+          requests.push(after);
+          if (after === "0") {
+            // This live frame is persisted between journal pages and overlaps page2.
+            live().deliver(payload(2, overlapBlocks));
+            return {
+              frames: [page1], nextCursor: "1", hasMore: true,
+              streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+            };
+          }
+          if (after === "1") {
+            return {
+              frames: [page2], nextCursor: "2", hasMore: false,
+              streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+            };
+          }
+          return {
+            frames: [], nextCursor: null, hasMore: false,
+            streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+          };
+        },
+        async () => {},
+      );
+      // A later reconcile must start at the shared record cursor and preserve
+      // every already-visible process row instead of replaying from zero.
+      await replaySocket.hydrateDurableLiveFrameJournal(
+        REPLAY_SESSION_ID,
+        async (after) => {
+          requests.push(after);
+          return {
+            frames: [], nextCursor: null, hasMore: false,
+            streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+          };
+        },
+        async () => {},
+      );
       return {
         markers,
         thinkingCount: session.messages
@@ -1100,6 +1338,126 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
         answerCount: session.messages.filter((m) =>
           m.role === "assistant" && m.text === markers.answer).length,
         cursor: session._lastFrameSeqByKey?.[sessionKey] ?? -1,
+        requests,
+      };
+    },
+    runDurableGenerationReset: async () => {
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        "durable container generations",
+      );
+      const oldClientMessageId = "m-browser-old-container";
+      const currentClientMessageId = "m-browser-current-container";
+      const sessionKey = `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`;
+      const markers = {
+        oldProcess: "BROWSER_OLD_CONTAINER_PROCESS",
+        currentProcess: "BROWSER_CURRENT_CONTAINER_PROCESS",
+        currentAnswer: "BROWSER_CURRENT_CONTAINER_ANSWER",
+      };
+      session.messages.push(
+        {
+          id: oldClientMessageId,
+          role: "user",
+          text: "BROWSER_OLD_CONTAINER_USER",
+          ts: 1,
+          status: "sent",
+        },
+        {
+          id: "browser-old-durable-process",
+          role: "thinking",
+          text: markers.oldProcess,
+          ts: 1_000,
+          _source: "server",
+          _turnOwnerId: oldClientMessageId,
+        },
+        {
+          id: currentClientMessageId,
+          role: "user",
+          text: "BROWSER_CURRENT_CONTAINER_USER",
+          ts: 2,
+          status: "sent",
+        },
+      );
+      // IndexedDB persisted this cursor before the running turn moved to a
+      // replacement container whose outbound ring starts again at one.
+      session._lastFrameSeqByKey = { [sessionKey]: 1_914 };
+      session._lastFrameSeq = 1_914;
+      session._sendingInFlight = true;
+      session._activeClientMessageId = currentClientMessageId;
+      const record = (
+        recordId: string,
+        streamKey: string,
+        clientMessageId: string,
+        frameSeq: number,
+        blocks: unknown[],
+        isFinal = false,
+      ) => ({
+        recordId,
+        streamKey,
+        source: "gateway" as const,
+        clientMessageId,
+        payload: {
+          type: "outbound.message",
+          sessionKey,
+          frameSeq,
+          channel: "webchat",
+          peer: { id: REPLAY_SESSION_ID, kind: "dm" },
+          clientMessageId,
+          blocks,
+          isFinal,
+          ts: Number(recordId) * 1_000,
+        },
+      });
+      const oldStream = "dispatch:77777777-7777-4777-8777-777777777777:1";
+      const currentStream = "dispatch:88888888-8888-4888-8888-888888888888:1";
+      const requests: string[] = [];
+      await replaySocket.hydrateDurableLiveFrameJournal(
+        REPLAY_SESSION_ID,
+        async (after) => {
+          requests.push(after);
+          if (after === "0") {
+            return {
+              frames: [
+                record("1", oldStream, oldClientMessageId, 998, [{
+                  kind: "thinking", text: markers.oldProcess,
+                }]),
+                record("2", oldStream, oldClientMessageId, 1_914, [], true),
+                record("3", currentStream, currentClientMessageId, 1, [{
+                  kind: "thinking", text: markers.currentProcess,
+                }]),
+                record("4", currentStream, currentClientMessageId, 2, [{
+                  kind: "text", text: markers.currentAnswer,
+                }]),
+              ],
+              nextCursor: "4",
+              hasMore: false,
+              streamClientMessageIds: [oldClientMessageId, currentClientMessageId],
+              hasTapeProjection: false,
+            };
+          }
+          return {
+            frames: [], nextCursor: null, hasMore: false,
+            streamClientMessageIds: [oldClientMessageId, currentClientMessageId],
+            hasTapeProjection: false,
+          };
+        },
+        async () => {},
+      );
+      return {
+        markers,
+        oldProcessCount: session.messages.filter((message) =>
+          message.role === "thinking" && message.text === markers.oldProcess
+        ).length,
+        currentProcessCount: session.messages.filter((message) =>
+          message.role === "thinking" && message.text === markers.currentProcess
+        ).length,
+        currentAnswerCount: session.messages.filter((message) =>
+          message.role === "assistant" && message.text === markers.currentAnswer
+        ).length,
+        cursor: session._lastFrameSeqByKey?.[sessionKey] ?? -1,
+        requests,
       };
     },
     runDurableErrorReplay: async () => {
@@ -1163,10 +1521,19 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
         [record("stop", stoppedId, "本轮已由用户停止。")],
         [stoppedId],
       );
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      for (let i = 0; i < 100; i++) {
+        if (document.querySelector('#timeline-replay-root output[aria-label="已停止生成"]')) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
       const stoppedError = [...stopped.messages].reverse().find((message) => message.role === "assistant");
       const stopReports = replayReportedErrors;
       const stopSyncs = replaySyncCalls;
+      const stopRoot = document.querySelector("#timeline-replay-root");
+      const stopStatusCount = stopRoot?.querySelectorAll('output[aria-label="已停止生成"]').length ?? 0;
+      const stopAlertCount = stopRoot?.querySelectorAll('[role="alert"]').length ?? 0;
+      const stopRetryCount = [...(stopRoot?.querySelectorAll("button") ?? [])]
+        .filter((button) => /重试|重新尝试/.test(button.textContent ?? "")).length;
+      const stopCancelledCopyCount = (stopRoot?.textContent?.match(/本轮已取消。/g) ?? []).length;
 
       replayReportedErrors = 0;
       replaySyncCalls = 0;
@@ -1183,6 +1550,10 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
         stopErrorText: stoppedError?.text,
         stopReports,
         stopSyncs,
+        stopStatusCount,
+        stopAlertCount,
+        stopRetryCount,
+        stopCancelledCopyCount,
         historicalReports: replayReportedErrors,
         historicalSyncs: replaySyncCalls,
         historicalDecision: historical._automaticRecoveryDecisions?.[historicalId] === true,
@@ -1246,3 +1617,152 @@ createRoot(document.getElementById("markdown-rich-root")!).render(
     <div data-testid="mermaid-broken"><Markdown>{MERMAID_BROKEN}</Markdown></div>
   </StrictMode>,
 );
+
+// PR1 Codex 密度门：真实 Sidebar（活跃竖条 / 顶栏入口权重），与 #root Composer、
+// #tool-card-polish-root ToolCard 一起由 T41 在 1440/390 明暗主题下锁 class 契约。
+const DENSITY_USER: User = {
+  id: "density-user",
+  displayName: "密度验收",
+  roles: ["user"],
+  role: "admin",
+};
+createRoot(document.getElementById("codex-density-root")!).render(
+  <StrictMode>
+    <div style={{ height: 640 }}>
+      <Sidebar
+        sessions={[
+          {
+            id: "density-active",
+            title: "密度验收活跃会话",
+            ownerUserId: DENSITY_USER.id,
+            updatedAt: new Date().toISOString(),
+            messageCount: 3,
+          },
+          {
+            id: "density-idle",
+            title: "密度验收空闲会话",
+            ownerUserId: DENSITY_USER.id,
+            updatedAt: new Date().toISOString(),
+            messageCount: 1,
+          },
+        ]}
+        activeId="density-active"
+        user={DENSITY_USER}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        onOpenManage={() => {}}
+        onOpenMarketplace={() => {}}
+        onOpenTutorial={() => {}}
+        onOpenOrg={() => {}}
+        showAdmin
+      />
+    </div>
+  </StrictMode>,
+);
+
+// PR2 设置壳：默认关闭，避免 Dialog 盖住其余 harness。T42 用受信点击打开后
+// 锁 390 单列不横溢 / 五分区可切 / 1440 竖导航 168px。
+function SettingsShellProbe() {
+  const [open, setOpen] = useState(false);
+  return (
+    <TooltipProvider>
+      <button type="button" onClick={() => setOpen(true)}>
+        打开设置壳
+      </button>
+      <SettingsCenter
+        open={open}
+        auth={createMemoryAuthSession(() => {}, "settings-shell-token")}
+        user={DENSITY_USER}
+        theme="light"
+        onClose={() => setOpen(false)}
+        onSetTheme={() => {}}
+        onOpenMemory={() => {}}
+        onOpenManage={() => {}}
+        onOpenRepo={() => {}}
+        initialSection="about"
+      />
+    </TooltipProvider>
+  );
+}
+createRoot(document.getElementById("settings-shell-root")!).render(
+  <StrictMode>
+    <SettingsShellProbe />
+  </StrictMode>,
+);
+
+const RAIL_SELECTION: Extract<RepoSelection, { selected: true }> = {
+  selected: true,
+  owner: "acme",
+  repo: "aurora",
+  branch: "feat/rail",
+  status: "ready",
+  head_sha: "abcdef1234567890",
+  selection_version: 1,
+};
+const RAIL_TODOS = [{ content: "修右栏单实例", status: "in_progress", activeForm: "正在修右栏" }];
+
+/** PR3 右栏：默认挂着即可。T43 用视口切换证明 390 回中栏、1440 单实例、隐藏接回、无数据不占宽。 */
+function ContextRailDataProbe() {
+  const isXl = useXlViewport();
+  const [railHidden, setRailHidden] = useContextRailHidden();
+  const showRail = isXl && !railHidden;
+  return (
+    <div data-testid="context-rail-data-shell" className="flex h-[420px] w-full overflow-x-hidden bg-bg text-fg">
+      <main data-testid="center-column" className="flex min-w-0 flex-1 flex-col gap-2 p-3">
+        {isXl && railHidden && (
+          <button type="button" onClick={() => setRailHidden(false)}>
+            显示上下文
+          </button>
+        )}
+        {!showRail && <RepoPill selection={RAIL_SELECTION} onClick={() => {}} />}
+        {!showRail && <PinnedTaskTracker todos={RAIL_TODOS} active />}
+        <p>中栏对照正文 https://example.com/very/long/path/for/overflow-check</p>
+      </main>
+      {showRail && (
+        <ContextRail
+          renderers={{
+            "bound-repo": <BoundRepoCard selection={RAIL_SELECTION} onOpenRepo={() => {}} />,
+            "pinned-tasks": <PinnedTaskTracker todos={RAIL_TODOS} active compact />,
+          }}
+          onHide={() => setRailHidden(true)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ContextRailUnboundProbe() {
+  const isXl = useXlViewport();
+  return (
+    <div data-testid="context-rail-unbound-shell" className="flex h-[200px] w-full overflow-x-hidden bg-bg text-fg">
+      <main data-testid="unbound-center" className="flex min-w-0 flex-1 flex-col gap-2 p-3">
+        <RepoPill selection={{ selected: false }} onClick={() => {}} />
+        {isXl ? null : <PinnedTaskTracker todos={RAIL_TODOS} active />}
+      </main>
+      {isXl && (
+        <ContextRail
+          renderers={{
+            "bound-repo": null,
+            "pinned-tasks": <PinnedTaskTracker todos={RAIL_TODOS} active compact />,
+          }}
+          onHide={() => {}}
+        />
+      )}
+    </div>
+  );
+}
+
+createRoot(document.getElementById("context-rail-root")!).render(
+  <StrictMode>
+    <TooltipProvider>
+      <ContextRailDataProbe />
+      <div data-testid="context-rail-empty-shell">
+        <ContextRail renderers={{ "bound-repo": null, "pinned-tasks": null }} onHide={() => {}} />
+      </div>
+      <ContextRailUnboundProbe />
+    </TooltipProvider>
+  </StrictMode>,
+);
+

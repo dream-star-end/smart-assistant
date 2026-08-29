@@ -50,7 +50,7 @@
 
 import type Docker from "dockerode";
 import { randomBytes, createHash, createHmac } from "node:crypto";
-import { readdirSync, realpathSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/promises";
 import { basename as pathBasename, isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize } from "node:path";
 import type { Pool, PoolClient } from "pg";
@@ -284,6 +284,66 @@ const V3_AGENT_USER = "1000:1000";
  */
 export const V3_CODEX_AUTH_RO_MOUNT = "/run/oc/codex-auth";
 
+/** Owner-scoped Cursor API key directory. Never expose it through Docker Env. */
+export const V5_CURSOR_AUTH_RO_MOUNT = "/run/oc/cursor-auth";
+
+export interface V5CursorAuthMountOptions {
+  uid: number;
+  runtimeChannel: RuntimeChannel;
+  useRemote: boolean;
+  ownerUid?: string;
+  authDir?: string;
+}
+
+/**
+ * Resolve the host Cursor auth directory only for the explicitly configured
+ * local V5 owner. Invalid or incomplete configuration is fail-closed: the
+ * Agent container still starts, but no Cursor credential is mounted.
+ */
+export function resolveV5CursorAuthMount(
+  options: V5CursorAuthMountOptions,
+): string | null {
+  if (options.runtimeChannel !== "v5" || options.useRemote) return null;
+
+  const ownerRaw = options.ownerUid?.trim() ?? "";
+  const dirRaw = options.authDir?.trim() ?? "";
+  if (!ownerRaw || !dirRaw || !/^[1-9][0-9]*$/.test(ownerRaw)) return null;
+
+  const owner = Number(ownerRaw);
+  if (!Number.isSafeInteger(owner) || owner !== options.uid) return null;
+  if (!pathIsAbsolute(dirRaw)) return null;
+
+  const normalized = pathNormalize(dirRaw).replace(/(?<!^)\/+$/, "");
+  try {
+    const dirStat = lstatSync(normalized);
+    if (
+      !dirStat.isDirectory()
+      || dirStat.isSymbolicLink()
+      || dirStat.uid !== 0
+      || (dirStat.mode & 0o077) !== 0
+      || realpathSync(normalized) !== normalized
+    ) {
+      return null;
+    }
+
+    const keyPath = pathJoin(normalized, "api-key");
+    const keyStat = lstatSync(keyPath);
+    const keyMode = keyStat.mode & 0o777;
+    if (
+      !keyStat.isFile()
+      || keyStat.isSymbolicLink()
+      || keyStat.uid !== 0
+      || (keyMode !== 0o400 && keyMode !== 0o600)
+      || realpathSync(keyPath) !== keyPath
+    ) {
+      return null;
+    }
+    return normalized;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Host 侧容器 auth 目录默认路径。对应 codexAuthSync.writeContainerVariant
  * 写入的目标目录。env `OC_V3_CODEX_CONTAINER_DIR` 覆盖(仅本地 host 有效;
@@ -486,6 +546,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "office-pdf",
   "office-suite",
   "coding-suite",
+  "cursor-cli",
   "code-review",
   "debugging",
   "testing",
@@ -2776,6 +2837,27 @@ export async function provisionV3Container(
       `${volumeNames.userLocal}:${V3_USER_LOCAL_MOUNT}:rw`,
       `${volumeNames.userConfig}:${V3_USER_CONFIG_MOUNT}:rw`,
     ];
+
+    const cursorAuthMount = resolveV5CursorAuthMount({
+      uid,
+      runtimeChannel: getRuntimeChannel(),
+      useRemote,
+      ownerUid: process.env.OC_V5_CURSOR_OWNER_UID,
+      authDir: process.env.OC_V5_CURSOR_AUTH_DIR,
+    });
+    if (cursorAuthMount !== null) {
+      binds.push(`${cursorAuthMount}:${V5_CURSOR_AUTH_RO_MOUNT}:ro`);
+    } else if (
+      getRuntimeChannel() === "v5"
+      && !useRemote
+      && process.env.OC_V5_CURSOR_OWNER_UID?.trim() === String(uid)
+    ) {
+      // Do not print the configured path or inspect secret contents. A bad
+      // owner-scoped mount must disable only Cursor, never the primary Agent.
+      console.error(
+        `[v3supervisor] WARN: v5 Cursor auth mount rejected for uid ${uid}; Cursor CLI disabled`,
+      );
+    }
 
     // Codex auth ro bind-mount(plan v3 §F1/F2/D1)。仅本地 provision 路径挂 ——
     // 远端 host 上无对应目录,跨机同步 auth.json 是后续 task(GPT 模型在远端

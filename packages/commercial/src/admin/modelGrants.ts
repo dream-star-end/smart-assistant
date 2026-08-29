@@ -166,17 +166,23 @@ export async function addGrant(
   const mid = normalizeModelId(modelId)
   const out = await tx(async (client: PoolClient) => {
     // 用户存在性 —— FK 会兜底,但提前抛清晰错误码,前端 UX 友好
-    const userR = await client.query<{ id: string }>(
-      'SELECT id::text AS id FROM users WHERE id = $1::bigint',
+    const userR = await client.query<{ id: string; role: string }>(
+      'SELECT id::text AS id, role FROM users WHERE id = $1::bigint',
       [uid],
     )
     if (userR.rows.length === 0) throw new GrantUserNotFoundError(uid)
 
-    const modelR = await client.query<{ model_id: string }>(
-      'SELECT model_id FROM model_pricing WHERE model_id = $1',
+    const modelR = await client.query<{ model_id: string; engine: string | null }>(
+      `SELECT p.model_id, c.engine
+         FROM model_pricing p
+         LEFT JOIN model_catalog c ON c.model_id = p.model_id AND c.state = 'active'
+        WHERE p.model_id = $1`,
       [mid],
     )
     if (modelR.rows.length === 0) throw new GrantModelNotFoundError(mid)
+    if (modelR.rows[0]?.engine === 'grok' && userR.rows[0]?.role !== 'admin') {
+      throw new GrantInvalidInputError('admin_only_model')
+    }
 
     const ins = await client.query<ModelGrantRowView>(
       `INSERT INTO model_visibility_grants(user_id, model_id, granted_by)

@@ -101,15 +101,22 @@ const SCENARIOS: readonly Scenario[] = [
       'CCB 引擎下不可自动恢复(缩史续跑是 codex-native 专属路径,由 ' +
       'sessionManagerEngineTurn 的 codex context-overflow 用例覆盖)',
   },
+  {
+    code: 'bad_request',
+    sample: JSON.stringify({
+      subtype: 'error_during_execution',
+      result:
+        'API Error: 400 {"error":{"code":"INVALID_REQUEST","message":"The upstream provider rejected this request"}}',
+    }),
+    attempts: 1,
+    why: '请求语义无效不是瞬时上游故障，重复同一请求只会制造重复原始错误',
+  },
 ]
 
 /**
- * delegate 专属码(当前只有 bad_request)不进本矩阵:它由
- * `classifyDelegateOutputError` 在**子 agent 输出文本**上产出,不是引擎 turn 的终态
- * errorClass,没有 throw/resolved 两形态之分。其 taxonomy 归属由
- * turnErrorTaxonomyContract 覆盖。
+ * 当前所有分类码都必须回答 throw/resolved 两种终态投递形态的重试决策。
  */
-const MATRIX_EXCLUDED_CODES = new Set(['bad_request'])
+const MATRIX_EXCLUDED_CODES = new Set<string>()
 
 // ── 最小 CCB 引擎夹具(与 sessionManagerEngineTurn.test.ts 同构)────────────────
 

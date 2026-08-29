@@ -11,6 +11,7 @@ import { encrypt } from '../crypto/aead.js'
 import {
   CodexEgressError,
   resolveCodexAccountEgressDispatcher,
+  resolveOfficialOAuthAccountEgressDispatcher,
 } from '../account-pool/codexEgress.js'
 
 const KEY = Buffer.alloc(32, 7)
@@ -41,6 +42,23 @@ async function assertCodexEgressCode(promise: Promise<unknown>, code: string): P
 }
 
 describe('resolveCodexAccountEgressDispatcher', () => {
+  test('the shared resolver keeps Grok accounts in their own provider partition', async () => {
+    const result = await resolveOfficialOAuthAccountEgressDispatcher(53n, 'grok', {
+      keyFn: () => Buffer.from(KEY),
+      queryFn: async () => ({ rows: [makeRow({ provider: 'grok' })] }) as never,
+      dispatcherFactory: async () => DISPATCHER,
+    })
+    assert.strictEqual(result.dispatcher, DISPATCHER)
+    await assertCodexEgressCode(
+      resolveOfficialOAuthAccountEgressDispatcher(53n, 'grok', {
+        keyFn: () => Buffer.from(KEY),
+        queryFn: async () => ({ rows: [makeRow({ provider: 'codex' })] }) as never,
+        dispatcherFactory: async () => DISPATCHER,
+      }),
+      'provider_mismatch',
+    )
+  })
+
   test('decrypts the active account proxy and builds an account-scoped dispatcher', async () => {
     const calls: Array<{ accountId: bigint; proxyUrl: string; target: unknown }> = []
     const result = await resolveCodexAccountEgressDispatcher(53n, {

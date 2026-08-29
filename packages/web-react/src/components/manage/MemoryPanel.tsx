@@ -377,7 +377,7 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
       {/* 梦境卡与列表是两条独立的异步链。给它预留等高占位,晚到时不会把整个列表往下顶。 */}
       {dreamLoading ? (
         <Skeleton className="h-16 rounded-xl" />
-      ) : dream ? (
+      ) : dream && dream.mode !== "optimizer_v2" ? (
         <AutoDreamReportCard value={dream} files={files} onOpenMemory={setEditing} />
       ) : null}
 
