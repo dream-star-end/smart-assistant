@@ -142,6 +142,8 @@ export type LiveUnitsPage = {
 export type ReduceLiveFramesOptions = {
   deadlineMs?: number
   now?: () => number
+  /** Session-complete stream_key order. Required when this reduce sees only a later stream. */
+  streamKeyLineage?: string[]
 }
 
 export type ServeLiveUnitsOptions = {
@@ -598,6 +600,7 @@ export function reduceLiveFrames(
     throughRecordId: '0',
     reducerEpoch: LIVE_UNITS_REDUCER_EPOCH,
     streamGeneration: 0,
+    streamKeyLineage: opts.streamKeyLineage ? [...opts.streamKeyLineage] : [],
   }, frames, opts)
 }
 

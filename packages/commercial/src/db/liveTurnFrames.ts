@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import {
   type LiveFrameInput,
+  type LiveUnitState,
   type LiveUnitsPage,
+  type ReduceLiveFramesOptions,
   type ServeLiveUnitsOptions,
   assembleLiveUnitsFromState,
   continueReduceLiveFrames,
@@ -726,6 +728,29 @@ async function readOpenDispatchStreamMeta(
 }
 
 /**
+ * Fold live frames using the session-complete stream_key lineage even when
+ * this snapshot has no checkpoint and only contains a later stream.
+ */
+export function reduceLiveJournal(
+  frames: LiveFrameInput[],
+  opts: ReduceLiveFramesOptions & {
+    lineage?: string[];
+    checkpointState?: LiveUnitState | null;
+  } = {},
+): ReturnType<typeof reduceLiveFrames> {
+  const lineage = opts.lineage ?? [];
+  if (opts.checkpointState) {
+    return continueReduceLiveFrames({
+      ...opts.checkpointState,
+      streamKeyLineage: opts.checkpointState.streamKeyLineage?.length
+        ? opts.checkpointState.streamKeyLineage
+        : lineage,
+    }, frames, opts);
+  }
+  return reduceLiveFrames(frames, { ...opts, streamKeyLineage: lineage });
+}
+
+/**
  * Query-time reduce of the current open-dispatch live journal into renderable
  * units. Catch-up is a second query after the snapshot (not optional): WS does
  * not replay frames persisted before subscribe, so resume.frameSeq is only
@@ -798,17 +823,11 @@ export async function readClientSessionLiveUnits(
   }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
 
   const opts = options ?? {};
-  const seedState = snapshot.checkpoint?.state
-    ? {
-      ...snapshot.checkpoint.state,
-      streamKeyLineage: snapshot.checkpoint.state.streamKeyLineage?.length
-        ? snapshot.checkpoint.state.streamKeyLineage
-        : snapshot.meta.lineage ?? [],
-    }
-    : null;
-  const reduced = seedState
-    ? continueReduceLiveFrames(seedState, snapshot.frames, opts)
-    : reduceLiveFrames(snapshot.frames, opts);
+  const reduced = reduceLiveJournal(snapshot.frames, {
+    ...opts,
+    lineage: snapshot.meta.lineage ?? [],
+    checkpointState: snapshot.checkpoint?.state ?? null,
+  });
   if (!reduced.ok) return fallbackLiveUnitsPage(snapshot.meta);
   const page = assembleLiveUnitsFromState(reduced.state, snapshot.meta, opts, catchUp);
   if (page.degraded === false) {
