@@ -1,0 +1,332 @@
+/**
+ * OCV5-22 stage 1: volume SQLite for delegate jobs (WAL, single writer).
+ *
+ * Path sits next to sessions.db / taskboard.db under OPENCLAUDE_HOME
+ * (`delegate-jobs.db`). Override: OPENCLAUDE_DELEGATE_JOBS_DB.
+ * Schema version is PRAGMA user_version (gateway-local SQLite, not a
+ * commercial PG migration). Flag OC_DELEGATE_DURABLE defaults off.
+ */
+import { mkdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import Database from 'better-sqlite3'
+import type {
+  DelegateCallback,
+  DelegateCallbackState,
+  DelegateCheckpointKind,
+  DelegateFailureClass,
+  DelegateJobKind,
+  DelegateJobState,
+} from '@openclaude/protocol'
+
+/** Structural twin of DelegateJobHttpResult; kept local to avoid a cycle. */
+export type DurableJobResult = {
+  httpStatus: number
+  body: Record<string, unknown>
+}
+
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 1
+
+export type DurableJobRecord = {
+  id: string
+  agentId: string
+  state: DelegateJobState
+  kind: DelegateJobKind
+  sessionKey?: string
+  parentSessionKey?: string
+  generation: number
+  ownerInstanceId?: string
+  ownerLeaseUntil?: number | null
+  claimToken?: string
+  attemptNo: number
+  fencingEpoch: number
+  checkpointKind: DelegateCheckpointKind
+  callback: DelegateCallback
+  callbackState: DelegateCallbackState
+  callbackEpoch: number
+  idempotencyKey?: string
+  failureClass?: DelegateFailureClass
+  failureDetail?: string
+  result?: DurableJobResult | null
+  createdAt: number
+  updatedAt: number
+  lastActivityAt: number
+  expiresAt?: number | null
+  parentEngine?: string
+  notifyLane?: string
+  notifyId?: string
+}
+
+const DDL_V1 = `
+CREATE TABLE IF NOT EXISTS delegate_jobs (
+  job_id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  session_key TEXT,
+  parent_session_key TEXT,
+  generation INTEGER NOT NULL DEFAULT 0,
+  owner_instance_id TEXT,
+  owner_lease_until INTEGER,
+  claim_token TEXT,
+  attempt_no INTEGER NOT NULL DEFAULT 0,
+  fencing_epoch INTEGER NOT NULL DEFAULT 0,
+  checkpoint_kind TEXT NOT NULL DEFAULT 'none',
+  callback TEXT NOT NULL DEFAULT 'none',
+  callback_state TEXT NOT NULL DEFAULT 'none',
+  callback_epoch INTEGER NOT NULL DEFAULT 0,
+  idempotency_key TEXT,
+  failure_class TEXT,
+  failure_detail TEXT,
+  result_json TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  last_activity_at INTEGER NOT NULL,
+  expires_at INTEGER,
+  parent_engine TEXT,
+  notify_lane TEXT,
+  notify_id TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delegate_jobs_idempotency
+  ON delegate_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_delegate_jobs_active
+  ON delegate_jobs(state, owner_lease_until)
+  WHERE state IN ('queued','running','paused_for_cutover');
+`
+
+export function resolveDelegateJobsDbPath(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.OPENCLAUDE_DELEGATE_JOBS_DB?.trim()
+  if (override) return override
+  const home = env.OPENCLAUDE_HOME?.trim() || join(homedir(), '.openclaude')
+  return join(home, 'delegate-jobs.db')
+}
+
+type SqliteDb = InstanceType<typeof Database>
+
+export class DelegateDurableDb {
+  readonly path: string
+  private readonly db: SqliteDb
+  failNextWrite = false
+  private closed = false
+  private readonly upsertStmt
+  private readonly getStmt
+  private readonly getByIdemStmt
+  private readonly listStmt
+  private readonly listActiveStmt
+  private readonly deleteStmt
+
+  constructor(dbPath: string) {
+    mkdirSync(dirname(dbPath), { recursive: true })
+    this.path = dbPath
+    this.db = new Database(dbPath)
+    this.db.pragma('busy_timeout = 10000')
+    this.db.pragma('journal_mode = WAL')
+    this.db.pragma('foreign_keys = ON')
+    this.migrate()
+    this.upsertStmt = this.db.prepare(`
+      INSERT INTO delegate_jobs (
+        job_id, agent_id, state, kind, session_key, parent_session_key, generation,
+        owner_instance_id, owner_lease_until, claim_token, attempt_no, fencing_epoch,
+        checkpoint_kind, callback, callback_state, callback_epoch, idempotency_key,
+        failure_class, failure_detail, result_json, created_at, updated_at,
+        last_activity_at, expires_at, parent_engine, notify_lane, notify_id
+      ) VALUES (
+        @job_id, @agent_id, @state, @kind, @session_key, @parent_session_key, @generation,
+        @owner_instance_id, @owner_lease_until, @claim_token, @attempt_no, @fencing_epoch,
+        @checkpoint_kind, @callback, @callback_state, @callback_epoch, @idempotency_key,
+        @failure_class, @failure_detail, @result_json, @created_at, @updated_at,
+        @last_activity_at, @expires_at, @parent_engine, @notify_lane, @notify_id
+      )
+      ON CONFLICT(job_id) DO UPDATE SET
+        agent_id=excluded.agent_id,
+        state=excluded.state,
+        kind=excluded.kind,
+        session_key=excluded.session_key,
+        parent_session_key=excluded.parent_session_key,
+        generation=excluded.generation,
+        owner_instance_id=excluded.owner_instance_id,
+        owner_lease_until=excluded.owner_lease_until,
+        claim_token=excluded.claim_token,
+        attempt_no=excluded.attempt_no,
+        fencing_epoch=excluded.fencing_epoch,
+        checkpoint_kind=excluded.checkpoint_kind,
+        callback=excluded.callback,
+        callback_state=excluded.callback_state,
+        callback_epoch=excluded.callback_epoch,
+        idempotency_key=excluded.idempotency_key,
+        failure_class=excluded.failure_class,
+        failure_detail=excluded.failure_detail,
+        result_json=excluded.result_json,
+        updated_at=excluded.updated_at,
+        last_activity_at=excluded.last_activity_at,
+        expires_at=excluded.expires_at,
+        parent_engine=excluded.parent_engine,
+        notify_lane=excluded.notify_lane,
+        notify_id=excluded.notify_id
+    `)
+    this.getStmt = this.db.prepare('SELECT * FROM delegate_jobs WHERE job_id = ?')
+    this.getByIdemStmt = this.db.prepare(
+      'SELECT * FROM delegate_jobs WHERE idempotency_key = ? LIMIT 1',
+    )
+    this.listStmt = this.db.prepare('SELECT * FROM delegate_jobs')
+    this.listActiveStmt = this.db.prepare(
+      `SELECT * FROM delegate_jobs WHERE state IN ('queued','running','paused_for_cutover')`,
+    )
+    this.deleteStmt = this.db.prepare('DELETE FROM delegate_jobs WHERE job_id = ?')
+  }
+
+  private migrate(): void {
+    const current = Number(this.db.pragma('user_version', { simple: true }) ?? 0)
+    if (current >= DELEGATE_DURABLE_SCHEMA_VERSION) return
+    const apply = this.db.transaction(() => {
+      if (current < 1) this.db.exec(DDL_V1)
+      this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
+    })
+    apply()
+  }
+
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)()
+  }
+
+  upsert(record: DurableJobRecord): void {
+    if (this.failNextWrite) {
+      this.failNextWrite = false
+      const err = new Error('delegate durable persist failed')
+      ;(err as NodeJS.ErrnoException).code = 'ENOSPC'
+      throw err
+    }
+    this.upsertStmt.run(toRow(record))
+  }
+
+  get(jobId: string): DurableJobRecord | undefined {
+    const row = this.getStmt.get(jobId) as Record<string, unknown> | undefined
+    return row ? fromRow(row) : undefined
+  }
+
+  findByIdempotencyKey(key: string): DurableJobRecord | undefined {
+    const row = this.getByIdemStmt.get(key) as Record<string, unknown> | undefined
+    return row ? fromRow(row) : undefined
+  }
+
+  loadAll(): DurableJobRecord[] {
+    return (this.listStmt.all() as Record<string, unknown>[]).map(fromRow)
+  }
+
+  loadNonTerminal(): DurableJobRecord[] {
+    return (this.listActiveStmt.all() as Record<string, unknown>[]).map(fromRow)
+  }
+
+  delete(jobId: string): void {
+    if (this.failNextWrite) {
+      this.failNextWrite = false
+      const err = new Error('delegate durable persist failed')
+      ;(err as NodeJS.ErrnoException).code = 'ENOSPC'
+      throw err
+    }
+    this.deleteStmt.run(jobId)
+  }
+
+  close(): void {
+    if (this.closed) return
+    this.closed = true
+    try {
+      this.db.pragma('wal_checkpoint(TRUNCATE)')
+    } catch {
+      /* shutdown path */
+    }
+    try {
+      this.db.close()
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
+export function openDelegateDurableDb(
+  dbPath?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): DelegateDurableDb {
+  return new DelegateDurableDb(dbPath ?? resolveDelegateJobsDbPath(env))
+}
+
+function toRow(record: DurableJobRecord): Record<string, unknown> {
+  return {
+    job_id: record.id,
+    agent_id: record.agentId,
+    state: record.state,
+    kind: record.kind,
+    session_key: record.sessionKey ?? null,
+    parent_session_key: record.parentSessionKey ?? null,
+    generation: record.generation,
+    owner_instance_id: record.ownerInstanceId ?? null,
+    owner_lease_until: record.ownerLeaseUntil ?? null,
+    claim_token: record.claimToken ?? null,
+    attempt_no: record.attemptNo,
+    fencing_epoch: record.fencingEpoch,
+    checkpoint_kind: record.checkpointKind,
+    callback: record.callback,
+    callback_state: record.callbackState,
+    callback_epoch: record.callbackEpoch,
+    idempotency_key: record.idempotencyKey ?? null,
+    failure_class: record.failureClass ?? null,
+    failure_detail: record.failureDetail ?? null,
+    result_json: record.result ? JSON.stringify(record.result) : null,
+    created_at: record.createdAt,
+    updated_at: record.updatedAt,
+    last_activity_at: record.lastActivityAt,
+    expires_at: record.expiresAt ?? null,
+    parent_engine: record.parentEngine ?? null,
+    notify_lane: record.notifyLane ?? null,
+    notify_id: record.notifyId ?? null,
+  }
+}
+
+function fromRow(row: Record<string, unknown>): DurableJobRecord {
+  let result: DurableJobResult | null | undefined
+  if (typeof row.result_json === 'string' && row.result_json) {
+    try {
+      result = JSON.parse(row.result_json) as DurableJobResult
+    } catch {
+      result = undefined
+    }
+  }
+  return {
+    id: String(row.job_id),
+    agentId: String(row.agent_id),
+    state: row.state as DelegateJobState,
+    kind: (row.kind as DelegateJobKind) ?? 'delegate',
+    sessionKey: str(row.session_key),
+    parentSessionKey: str(row.parent_session_key),
+    generation: num(row.generation),
+    ownerInstanceId: str(row.owner_instance_id),
+    ownerLeaseUntil: row.owner_lease_until == null ? null : num(row.owner_lease_until),
+    claimToken: str(row.claim_token),
+    attemptNo: num(row.attempt_no),
+    fencingEpoch: num(row.fencing_epoch),
+    checkpointKind: (row.checkpoint_kind as DelegateCheckpointKind) ?? 'none',
+    callback: (row.callback as DelegateCallback) ?? 'none',
+    callbackState: (row.callback_state as DelegateCallbackState) ?? 'none',
+    callbackEpoch: num(row.callback_epoch),
+    idempotencyKey: str(row.idempotency_key),
+    failureClass: row.failure_class as DelegateFailureClass | undefined,
+    failureDetail: str(row.failure_detail),
+    result: result ?? null,
+    createdAt: num(row.created_at),
+    updatedAt: num(row.updated_at),
+    lastActivityAt: num(row.last_activity_at) || num(row.updated_at),
+    expiresAt: row.expires_at == null ? null : num(row.expires_at),
+    parentEngine: str(row.parent_engine),
+    notifyLane: str(row.notify_lane),
+    notifyId: str(row.notify_id),
+  }
+}
+
+function str(v: unknown): string | undefined {
+  return typeof v === 'string' && v.length > 0 ? v : undefined
+}
+
+function num(v: unknown): number {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : 0
+}
