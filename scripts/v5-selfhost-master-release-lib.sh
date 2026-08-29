@@ -144,7 +144,7 @@ def snapshot_tree():
             for entry in scan:
                 name = entry.name
                 rel = name if not prefix else prefix + b"/" + name
-                if rel == b".complete":
+                if rel == b".complete" or rel == b"flavor.manifest.json":
                     continue
                 st = entry.stat(follow_symlinks=False)
                 mode = st.st_mode
@@ -581,6 +581,10 @@ build_master_release() {
     "$MASTER_RELEASE_COMPLETE_SCHEMA_VERSION"; then
     cleanup_master_staging
     die "写 .complete / digest 失败"
+  fi
+  if declare -F write_flavor_manifest >/dev/null 2>&1; then
+    write_flavor_manifest "$staging" selfhost "$full_sha" \
+      || { cleanup_master_staging; die "写 flavor.manifest.json 失败"; }
   fi
   if ! mv -T -- "$staging" "$reldir"; then
     cleanup_master_staging

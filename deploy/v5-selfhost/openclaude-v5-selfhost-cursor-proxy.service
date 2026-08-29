@@ -7,6 +7,9 @@ ConditionPathExists=/etc/sing-box/openclaude-cursor-egress-proxy.json
 
 [Service]
 Type=simple
+Environment="OC_FLAVOR_INSTALL_ROOT=/opt/openclaude/openclaude-v5-selfhost"
+Environment="OC_FLAVOR_MANIFEST=/opt/openclaude/openclaude-v5-selfhost-live/flavor.manifest.json"
+ExecStartPre=/usr/bin/bash /opt/openclaude/openclaude-v5-selfhost-live/scripts/lib/assert-flavor.sh allows selfhost-unit-install
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/openclaude-cursor-egress-proxy.json
 Restart=always
 RestartSec=3

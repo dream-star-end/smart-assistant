@@ -26,6 +26,20 @@ set -e
 export LANG=C
 export LC_ALL=C
 
+# Flavor identity (OCV5-20 §2.7). Missing manifest = skip (legacy artifacts).
+SETUP_HOST_NET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for _flavor_lib in \
+  "$SETUP_HOST_NET_DIR/../../../scripts/lib/assert-flavor.sh" \
+  "/opt/openclaude/openclaude-v5-selfhost-live/scripts/lib/assert-flavor.sh" \
+  "/opt/openclaude/openclaude-v5/scripts/lib/assert-flavor.sh"; do
+  if [ -f "$_flavor_lib" ]; then
+    # shellcheck disable=SC1090
+    . "$_flavor_lib"
+    break
+  fi
+done
+unset _flavor_lib
+
 # P1b channel 化:同一脚本以同等安全姿态(ICC=false + egress 守卫链)建 v3/v5 两套隔离网络。
 # channel 取值优先级:$1 > $OC_RUNTIME_CHANNEL > 默认 v3。v3 取值与历史完全一致(向后兼容)。
 CHANNEL="${1:-${OC_RUNTIME_CHANNEL:-v3}}"
@@ -47,6 +61,28 @@ case "$CHANNEL" in
     V3_HOST_GUARD_CHAIN="V5_EGRESS_IN"
     CCB_HTTPS_PROXY_PORT="18991"
     CURSOR_HTTPS_PROXY_PORT="18992"
+    if type assert_flavor_identity >/dev/null 2>&1; then
+      if ! assert_flavor_identity; then
+        echo "[ABORT] flavor identity refused setup-host-net.sh"
+        exit 1
+      fi
+      if [ "${FLAVOR_RESOLVED:-}" = "commercial" ]; then
+        if [ "${SELFHOST_CURSOR_EGRESS:-}" = "1" ] || [ "${OC_SELFHOST_CURSOR_EGRESS:-}" = "1" ]; then
+          echo "[ABORT] commercial identity cannot open 18992 (SELFHOST_CURSOR_EGRESS set)"
+          exit 1
+        fi
+        CURSOR_HTTPS_PROXY_PORT=""
+      elif [ "${FLAVOR_RESOLVED:-}" = "selfhost" ]; then
+        if [ "${SELFHOST_CURSOR_EGRESS:-}" = "1" ] || [ "${OC_SELFHOST_CURSOR_EGRESS:-}" = "1" ]; then
+          if ! assert_allows selfhost-cursor-egress; then
+            echo "[ABORT] selfhost-cursor-egress refused"
+            exit 1
+          fi
+        else
+          CURSOR_HTTPS_PROXY_PORT=""
+        fi
+      fi
+    fi
     ;;
   *)
     echo "[ABORT] 未知 channel: $CHANNEL (仅支持 v3 / v5)"

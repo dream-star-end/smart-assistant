@@ -155,6 +155,11 @@ RUNTIME_LIB="$SCRIPT_DIR/v5-runtime-release-lib.sh"
 [ -f "$RUNTIME_LIB" ] || { echo "FATAL: 缺 runtime release lib: $RUNTIME_LIB" >&2; exit 1; }
 # shellcheck source=scripts/v5-runtime-release-lib.sh
 source "$RUNTIME_LIB"
+FLAVOR_LIB="$SCRIPT_DIR/lib/assert-flavor.sh"
+if [[ -f "$FLAVOR_LIB" ]]; then
+  # shellcheck source=scripts/lib/assert-flavor.sh
+  source "$FLAVOR_LIB"
+fi
 RELEASE_QUEUE_SCRIPT="$SCRIPT_DIR/v5-release-queue.sh"
 [ -x "$RELEASE_QUEUE_SCRIPT" ] || {
   echo "FATAL: 缺或不可执行的 V5 release queue: $RELEASE_QUEUE_SCRIPT" >&2
@@ -2116,6 +2121,13 @@ REMOTE
 
 begin_cutover_step() {
   local expected="$1" next="$2"
+  # New flavor.manifest.json only: skip on current production artifacts.
+  if declare -F assert_commercial_cutover >/dev/null 2>&1 && [[ -n "${BUILT_RELEASE:-}" ]]; then
+    if ssh "$KL_HOST" "test -f '$BUILT_RELEASE/flavor.manifest.json' && test -f '$BUILT_RELEASE/scripts/lib/assert-flavor.sh'"; then
+      ssh "$KL_HOST" "OC_FLAVOR_MANIFEST='$BUILT_RELEASE/flavor.manifest.json' OC_FLAVOR_INSTALL_ROOT=/opt/openclaude/openclaude-v5 OC_FLAVOR_CUTOVER_ROOT='$BUILT_RELEASE' bash '$BUILT_RELEASE/scripts/lib/assert-flavor.sh' cutover-commercial" \
+        || { echo "✗ commercial flavor cutover assertion failed" >&2; return 1; }
+    fi
+  fi
   if cutover_transition "$expected" "$next"; then
     if [[ "$next" == recycling ]] && ! set_cutover_maintenance; then
       recover_cutover "failed to create planned-maintenance marker"
@@ -3802,6 +3814,22 @@ build_release() {
   ssh "$KL_HOST" "mkdir -p '$staging'" || { echo "✗ mkdir staging 失败" >&2; return 1; }
   if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | ssh "$KL_HOST" "tar -x -C '$staging'"; then
     echo "✗ git archive/解包失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+  if declare -F write_flavor_manifest >/dev/null 2>&1; then
+    flavor_tmpd="$(mktemp -d)"
+    if ! write_flavor_manifest "$flavor_tmpd" commercial "$full_sha"; then
+      rm -rf "$flavor_tmpd"
+      echo "✗ write commercial flavor.manifest.json failed" >&2
+      ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+      return 1
+    fi
+    if ! scp -q "$flavor_tmpd/flavor.manifest.json" "$KL_HOST:$staging/flavor.manifest.json"; then
+      rm -rf "$flavor_tmpd"
+      echo "✗ scp flavor.manifest.json failed" >&2
+      ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+      return 1
+    fi
+    rm -rf "$flavor_tmpd"
+  fi
   # node_modules:lock 未变且当前有 → 硬链复用;否则空目录 npm ci(不碰旧 release 硬链)
   if ! ssh "$KL_HOST" "set -e
       if [ -n '$cur' ] && [ -d '$cur/node_modules' ] && cmp -s '$staging/package-lock.json' '$cur/package-lock.json' 2>/dev/null; then

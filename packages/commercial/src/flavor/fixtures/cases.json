@@ -1,0 +1,128 @@
+[
+  {
+    "name": "selfhost-pass",
+    "manifest": "valid-selfhost.json",
+    "hostname": "v3-dev-sg",
+    "installRoot": "/opt/openclaude/openclaude-v5-selfhost",
+    "dbName": "openclaude_v5_selfhost",
+    "env": { "OC_SELFHOST_ENGINE_LOCAL_TURNS": "1" },
+    "expect": "pass"
+  },
+  {
+    "name": "selfhost-live-root-pass",
+    "manifest": "valid-selfhost.json",
+    "hostname": "v3-dev-sg",
+    "installRoot": "/opt/openclaude/openclaude-v5-selfhost-live",
+    "dbName": "openclaude_v5_selfhost",
+    "env": {},
+    "expect": "pass"
+  },
+  {
+    "name": "selfhost-release-root-pass",
+    "manifest": "valid-selfhost.json",
+    "hostname": "v3-dev-sg",
+    "installRoot": "/opt/openclaude/openclaude-v5-selfhost-releases/rel-deadbeef",
+    "dbName": "openclaude_v5_selfhost",
+    "env": {},
+    "expect": "pass"
+  },
+  {
+    "name": "commercial-pass",
+    "manifest": "valid-commercial.json",
+    "hostname": "kl-mirror",
+    "installRoot": "/opt/openclaude/openclaude-v5",
+    "dbName": "openclaude",
+    "env": {},
+    "expect": "pass"
+  },
+  {
+    "name": "commercial-slot-b-pass",
+    "manifest": "valid-commercial.json",
+    "hostname": "ser135234097086",
+    "installRoot": "/opt/openclaude/openclaude-v5-b",
+    "dbName": "openclaude",
+    "env": {},
+    "expect": "pass"
+  },
+  {
+    "name": "commercial-selfhost-env-fail",
+    "manifest": "valid-commercial.json",
+    "hostname": "kl-mirror",
+    "installRoot": "/opt/openclaude/openclaude-v5",
+    "dbName": "openclaude",
+    "env": { "OC_SELFHOST_ENGINE_LOCAL_TURNS": "1" },
+    "expect": "fail",
+    "errorContains": "cannot be upgraded"
+  },
+  {
+    "name": "commercial-pgoptions-fail",
+    "manifest": "valid-commercial.json",
+    "hostname": "kl-mirror",
+    "installRoot": "/opt/openclaude/openclaude-v5",
+    "dbName": "openclaude",
+    "env": { "PGOPTIONS": "-c openclaude.migration_profile=v5-selfhost" },
+    "expect": "fail",
+    "errorContains": "cannot be upgraded"
+  },
+  {
+    "name": "commercial-sidecar-fail",
+    "manifest": "valid-commercial.json",
+    "hostname": "kl-mirror",
+    "installRoot": "/opt/openclaude/openclaude-v5",
+    "dbName": "openclaude",
+    "env": {},
+    "sidecar18992": true,
+    "expect": "fail",
+    "errorContains": "cannot be upgraded"
+  },
+  {
+    "name": "selfhost-wrong-host-fail",
+    "manifest": "valid-selfhost.json",
+    "hostname": "kl-mirror",
+    "installRoot": "/opt/openclaude/openclaude-v5-selfhost",
+    "dbName": "openclaude_v5_selfhost",
+    "env": {},
+    "expect": "fail",
+    "errorContains": "hostname"
+  },
+  {
+    "name": "selfhost-wrong-db-fail",
+    "manifest": "valid-selfhost.json",
+    "hostname": "v3-dev-sg",
+    "installRoot": "/opt/openclaude/openclaude-v5-selfhost",
+    "dbName": "openclaude",
+    "env": {},
+    "expect": "fail",
+    "errorContains": "selfhost migrate db"
+  },
+  {
+    "name": "commercial-selfhost-db-fail",
+    "manifest": "valid-commercial.json",
+    "hostname": "kl-mirror",
+    "installRoot": "/opt/openclaude/openclaude-v5",
+    "dbName": "openclaude_v5_selfhost",
+    "env": {},
+    "expect": "fail",
+    "errorContains": "refuses selfhost db"
+  },
+  {
+    "name": "cross-builder-fail",
+    "manifest": "cross-builder.json",
+    "hostname": "v3-dev-sg",
+    "installRoot": "/opt/openclaude/openclaude-v5-selfhost",
+    "dbName": "openclaude_v5_selfhost",
+    "env": {},
+    "expect": "fail",
+    "errorContains": "cross-write"
+  },
+  {
+    "name": "missing-field-fail",
+    "manifest": "missing-field.json",
+    "hostname": "kl-mirror",
+    "installRoot": "/opt/openclaude/openclaude-v5",
+    "dbName": "openclaude",
+    "env": {},
+    "expect": "fail",
+    "errorContains": "missing fields"
+  }
+]

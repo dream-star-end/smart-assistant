@@ -2,6 +2,11 @@ import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PoolClient } from "pg";
+import {
+  FlavorIdentityError,
+  assertFlavorForMigrate,
+  type FlavorSignals,
+} from "../flavor/assertFlavor.js";
 import { getPool } from "./index.js";
 import { verifyOrderDependencies } from "./migrationOrder.js";
 
@@ -65,6 +70,11 @@ export interface MigrationsOptions {
    * 可选:每应用一个迁移的回调(用于日志/测试观察)。
    */
   onApply?: (version: string) => void;
+  /**
+   * Flavor identity signals for tests. Production reads the artifact
+   * manifest + process env. Guard runs before any DDL.
+   */
+  flavor?: FlavorSignals;
 }
 
 export interface MigrationResult {
@@ -113,6 +123,16 @@ async function listMigrations(
 export async function runMigrations(
   opts: MigrationsOptions = {},
 ): Promise<MigrationResult> {
+  await assertFlavorForMigrate(opts.flavor ?? {}, async () => {
+    const probe = getPool();
+    const r = await probe.query<{ current_database: string }>("SELECT current_database()");
+    const dbName = r.rows[0]?.current_database;
+    if (!dbName) {
+      throw new FlavorIdentityError("current_database() returned empty");
+    }
+    return dbName;
+  });
+
   const dir = opts.dir ?? defaultMigrationsDir();
   const pool = getPool();
 
