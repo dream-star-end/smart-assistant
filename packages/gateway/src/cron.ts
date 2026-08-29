@@ -39,6 +39,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   writeFileSync,
 } from 'node:fs'
@@ -78,6 +79,7 @@ import {
 } from './server.js'
 import { localExecutionRejectCode, type LocalExecutionRejectCode } from './modelCatalogClient.js'
 import { enqueueCronOccurrenceJob, settleCronDelegateJob } from './delegateCronIdempotency.js'
+import { cronDelegateIdempotencyKey } from '@openclaude/protocol'
 import { isDelegateSmEnabled } from './delegateSmFlag.js'
 import type { DelegateJobStore } from './delegateJobs.js'
 import {
@@ -739,6 +741,42 @@ async function saveRetryState(map: Map<string, CronRetryEntry>): Promise<void> {
   const tmp = RETRY_STATE_FILE + `.${process.pid}.${++_writeCounter}.tmp`
   await writeFile(tmp, JSON.stringify(Object.fromEntries(map), null, 2))
   await rename(tmp, RETRY_STATE_FILE)
+}
+
+/**
+ * Stage 1: fill occurrence.delegateJobId from the durable job UNIQUE key when
+ * Enqueue succeeded and the JSON projection crashed before write.
+ */
+export function backfillCronOccurrenceDelegateJobs(
+  store: DelegateJobStore,
+  occurrenceDir: string = OCCURRENCE_DIR,
+): number {
+  if (!existsSync(occurrenceDir)) return 0
+  let n = 0
+  let names: string[]
+  try {
+    names = readdirSync(occurrenceDir)
+  } catch {
+    return 0
+  }
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const filePath = join(occurrenceDir, name)
+    let row: CronOccurrenceRecord
+    try {
+      row = JSON.parse(readFileSync(filePath, 'utf8')) as CronOccurrenceRecord
+    } catch {
+      continue
+    }
+    if (row?.version !== 1 || row.delegateJobId) continue
+    if (typeof row.jobId !== 'string' || !Number.isSafeInteger(row.dueMinuteKey)) continue
+    const key = cronDelegateIdempotencyKey(row.jobId, row.dueMinuteKey)
+    const job = store.findByIdempotencyKey(key)
+    if (!job) continue
+    writeFileSync(filePath, `${JSON.stringify({ ...row, delegateJobId: job.id, updatedAt: Date.now() }, null, 2)}\n`)
+    n += 1
+  }
+  return n
 }
 
 async function loadOccurrenceRecords(): Promise<CronOccurrenceRecord[]> {
