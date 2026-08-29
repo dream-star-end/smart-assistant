@@ -35,6 +35,7 @@ import {
 } from "./chat/render";
 import { friendlyDelegateResultPreview } from "./chat/reducer";
 import { sessionTitleFromText } from "./sessionTitle";
+import { observeTimelineShadow } from "./timeline/shadowLifecycle";
 
 /** turn 终态收敛(RFC §5 M5):server 载荷自证的 turn 终态类别。 */
 export type ServerTurnTerminal = "completed" | "error" | "interrupted";
@@ -951,6 +952,13 @@ export function mergeFullServerWins(
     adoptUnifiedTimeline?: boolean;
   },
 ): ChatMessage[] {
+  const shadowInput = [...server, ...local];
+  const shadowStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
+  const finishShadow = (result: ChatMessage[]): ChatMessage[] => {
+    const oldMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - shadowStarted;
+    observeTimelineShadow({ entry: "full", input: shadowInput, oldOutput: result, oldMs });
+    return result;
+  };
   local = repairPostFinalProcessOrder(local);
   const legacyActiveRows = new Set<ChatMessage>();
   if (opts?.adoptUnifiedTimeline === true && opts.activeClientMessageId) {
@@ -1120,9 +1128,9 @@ export function mergeFullServerWins(
           isUnpublishedProcessRow(m)),
     );
   if (!tail.length && !preservedMid.length) {
-    return coalesceProcessIdentities(repairPostFinalProcessOrder(
+    return finishShadow(coalesceProcessIdentities(repairPostFinalProcessOrder(
       stableSortByTs(serverChanged ? serverMerged : server),
-    ));
+    )));
   }
   const safeByOriginal = new Map<ChatMessage, ChatMessage>();
   for (const m of [...preservedMid, ...tail]) safeByOriginal.set(m, sanitizePreservedLocalRow(m));
@@ -1133,9 +1141,9 @@ export function mergeFullServerWins(
   );
   if (!hasDurableOrderAxis) {
     // 兼容尚无 `_orderSeq` 的旧 server 快照：沿用 server→mid→tail 插入序，再按 ts 排列。
-    return coalesceProcessIdentities(repairPostFinalProcessOrder(
+    return finishShadow(coalesceProcessIdentities(repairPostFinalProcessOrder(
       stableSortByTs([...serverMerged, ...safePreservedMid, ...safeTail]),
-    ));
+    )));
   }
   // 中段 client-owned 行若在拼接时离开本地原槽，会错误继承 server 尾行的排序锚点。
   // 一方面按原 local 插入序重建槽位；另一方面保留一次性 anchor override，明确冻结其
@@ -1180,9 +1188,9 @@ export function mergeFullServerWins(
       if (m?.id) emittedServerIds.add(m.id);
     }
   }
-  return coalesceProcessIdentities(repairPostFinalProcessOrder(
+  return finishShadow(coalesceProcessIdentities(repairPostFinalProcessOrder(
     stableSortByTs(inLocalOrder, anchorOverrides),
-  ));
+  )));
 }
 
 /**
@@ -1200,8 +1208,15 @@ export function applyServerIncremental(
     activeClientMessageId?: string;
   },
 ): ChatMessage[] {
+  const shadowInput = [...local, ...incoming];
+  const shadowStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
+  const finishShadow = (result: ChatMessage[]): ChatMessage[] => {
+    const oldMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - shadowStarted;
+    observeTimelineShadow({ entry: "incremental", input: shadowInput, oldOutput: result, oldMs });
+    return result;
+  };
   local = repairPostFinalProcessOrder(local);
-  if (!incoming.length) return local;
+  if (!incoming.length) return finishShadow(local);
   if (
     completedClientMessageId &&
     incoming.some(
@@ -1234,14 +1249,14 @@ export function applyServerIncremental(
   );
   // 债A：增量带回的 server 团队骨架行,若本地富卡已拥有同 run → 丢弃(local-wins,同 full 合并)。
   incoming = dropServerTeamSkeletonsOwnedLocally(incoming, local);
-  if (!incoming.length) return local;
+  if (!incoming.length) return finishShadow(local);
   const byId = new Map<string, ChatMessage>();
   for (const m of incoming) if (m?.id) byId.set(m.id, m);
   const merged = local.map((m) => (m?.id && byId.has(m.id) ? mergeLocalClientFields(byId.get(m.id)!, m) : m));
   const seen = new Set<string>();
   for (const m of local) if (m?.id) seen.add(m.id);
   for (const m of incoming) if (m?.id && !seen.has(m.id)) merged.push(m);
-  return repairPostFinalProcessOrder(stableSortByTs(merged));
+  return finishShadow(repairPostFinalProcessOrder(stableSortByTs(merged)));
 }
 
 /**

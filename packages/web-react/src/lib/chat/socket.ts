@@ -69,6 +69,7 @@ import {
   type StoredSession,
 } from "../persist";
 import { appUpdate } from "../appUpdate";
+import { observeTimelineShadow } from "../timeline/shadowLifecycle";
 import {
   AUTO_CONTINUE_DISPLAY,
   AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY,
@@ -3665,7 +3666,13 @@ export class ChatSocket {
                   raw.tapeProjectionVersion,
                 );
               }
-              this.applyLiveUnits(sessId, raw.units, [...resetOwnerIds], raw.resume);
+              this.applyLiveUnits(
+                sessId,
+                raw.units,
+                [...resetOwnerIds],
+                raw.resume,
+                raw.streamGeneration,
+              );
               if (raw.resume) {
                 cursor = raw.resume.recordId;
                 const sessionKey = raw.resume.sessionKey;
@@ -3987,13 +3994,18 @@ export class ChatSocket {
     units: import("@openclaude/protocol").LiveUnit[],
     resetClientMessageIds: string[] = [],
     resume?: { sessionKey: string; frameSeq: number; recordId: string },
+    streamGeneration = 0,
   ): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
+    const preReset = sess.messages.slice();
+    const generation = typeof streamGeneration === "number" && Number.isSafeInteger(streamGeneration)
+      ? Math.max(0, streamGeneration)
+      : 0;
+    const mapped = units.map((unit) => liveUnitToMessage(unit, { streamGeneration: generation }));
     if (resetClientMessageIds.length > 0) {
       this.resetOwnerLocalRows(sess, resetClientMessageIds, liveProcessOwnersFromUnits(units));
     }
-    const mapped = units.map(liveUnitToMessage);
     sess.messages = prependLiveUnitMessages(sess.messages, mapped);
     restoreLiveUnitStreamingState(sess, units);
     if (resume?.sessionKey && resume.frameSeq > 0) {
@@ -4007,6 +4019,12 @@ export class ChatSocket {
     normalizeDelegateCards(sess);
     normalizeGoalCards(sess);
     sess.messages = repairPostFinalProcessOrder(sess.messages);
+    observeTimelineShadow({
+      entry: "live-units",
+      sessionId: sessId,
+      input: [...preReset, ...mapped],
+      oldOutput: sess.messages,
+    });
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
   }
@@ -4014,7 +4032,7 @@ export class ChatSocket {
   prependLiveUnits(sessId: string, units: import("@openclaude/protocol").LiveUnit[]): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
-    sess.messages = prependLiveUnitMessages(sess.messages, units.map(liveUnitToMessage));
+    sess.messages = prependLiveUnitMessages(sess.messages, units.map((unit) => liveUnitToMessage(unit)));
     rebuildIndexes(sess);
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
@@ -4038,6 +4056,7 @@ export class ChatSocket {
   ): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
+    const preReset = sess.messages.slice();
     if (resetClientMessageIds.length > 0) {
       const resetSessionKeys = new Set<string>();
       for (const record of frames) {
@@ -4112,6 +4131,12 @@ export class ChatSocket {
     normalizeDelegateCards(sess);
     normalizeGoalCards(sess);
     sess.messages = repairPostFinalProcessOrder(sess.messages);
+    observeTimelineShadow({
+      entry: "durable-frames",
+      sessionId: sessId,
+      input: [...preReset, ...sess.messages],
+      oldOutput: sess.messages,
+    });
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
   }

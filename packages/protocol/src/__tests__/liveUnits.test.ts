@@ -20,6 +20,7 @@ import {
   type LiveFrameInput,
   type LiveUnit,
 } from '../liveUnits.js'
+import { EPOCH_BAND, packEpoch } from '../timelineLifecycle.js'
 
 const META = {
   streamClientMessageIds: ['cm-1'],
@@ -77,6 +78,70 @@ describe('§9.1 thinking interrupted by tool', () => {
     assert.equal(reduced.state.units[0]?.text, 'aaabbb')
     assert.equal(reduced.state.units[2]?.text, 'ccc')
     assert.notEqual(reduced.state.units[0]?.text, 'bbb')
+    assert.notEqual(reduced.state.units[0]?.timelineProcessKey, reduced.state.units[2]?.timelineProcessKey)
+    assert.equal(reduced.state.units[1]?.timelineProcessKey, 't1')
+    assert.ok(reduced.state.units[0]?.timelineProcessKey)
+    assert.ok(reduced.state.units[2]?.timelineProcessKey)
+  })
+})
+
+describe('plan hydrate shape', () => {
+  it('does not set LiveUnit.blockId while still minting processKey', () => {
+    const reduced = reduceLiveFrames([
+      frame('1', 1, { kind: 'plan', blockId: 'plan-block', text: 'plan' }),
+    ])
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    assert.equal(reduced.state.units[0]?.blockId, undefined)
+    assert.equal(reduced.state.units[0]?.timelineProcessKey, 'plan-block')
+  })
+})
+
+describe('per-stream generation', () => {
+  it('stamps a later stream_key with a higher generation than seq=101 of the previous stream', () => {
+    const first = reduceLiveFrames([
+      frame('1', 101, { kind: 'thinking', text: 'AB' }, {
+        streamKey: 'dispatch:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:1',
+      }),
+    ])
+    assert.equal(first.ok, true)
+    if (!first.ok) return
+    const continued = continueReduceLiveFrames(first.state, [
+      frame('2', 1, { kind: 'tool_use', blockId: 't-new', toolName: 'Bash' }, {
+        streamKey: 'dispatch:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb:1',
+      }),
+    ])
+    assert.equal(continued.ok, true)
+    if (!continued.ok) return
+    assert.equal(first.state.units[0]?.streamGeneration, 0)
+    const tool = continued.state.units.find((unit) => unit.kind === 'tool')
+    assert.equal(tool?.streamGeneration, 1)
+  })
+
+  it('no-checkpoint snapshot of only s2 uses DB lineage [s1,s2] so gen=1 beats old gen0/seq101', () => {
+    const reduced = reduceLiveFrames([
+      frame('2', 1, { kind: 'thinking', text: 'NEW' }, { streamKey: 's2' }),
+    ], { streamKeyLineage: ['s1', 's2'] })
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    const reducerGeneration = reduced.state.units[0]?.streamGeneration ?? -1
+    const oldEpoch = packEpoch(EPOCH_BAND.LIVE, 0, 101, 0)
+    const wrongNewEpoch = packEpoch(EPOCH_BAND.LIVE, 0, 1, 0)
+    const newEpoch = packEpoch(EPOCH_BAND.LIVE, reducerGeneration, 1, 0)
+    assert.deepEqual({
+      expectedGeneration: 1,
+      reducerGeneration,
+      actualBeatsOld: newEpoch > oldEpoch,
+      expectedBeatsOld: true,
+    }, {
+      expectedGeneration: 1,
+      reducerGeneration: 1,
+      actualBeatsOld: true,
+      expectedBeatsOld: true,
+    })
+    assert.equal(oldEpoch, 2251799813685450)
+    assert.equal(wrongNewEpoch, 2251799813685250)
+    assert.equal(newEpoch, 2253998836940802)
   })
 })
 

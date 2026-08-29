@@ -47,6 +47,14 @@ import type { ChatMessage } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
 import type { User } from "../src/lib/types";
 import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
+import { EPOCH_BAND, packEpoch, timelineIdentity } from "@openclaude/protocol";
+import { applyServerIncremental, mergeFullServerWins } from "../src/lib/persist";
+import { identityOf, lifecycleOf, projectTimeline } from "../src/lib/timeline/projectLifecycle";
+import {
+  getShadowStats,
+  lastShadowFor,
+  resetShadowStatsForTests,
+} from "../src/lib/timeline/shadowLifecycle";
 import { createMemoryAuthSession } from "../src/lib/authSession";
 import { ChatSocket } from "../src/lib/chat/socket";
 import { useSessionList } from "../src/hooks/useSessionList";
@@ -66,6 +74,8 @@ import {
 
 declare global {
   interface Window {
+    __OC_TIMELINE_LIFECYCLE_V1?: string;
+    __OC_TIMELINE_LIFECYCLE_SHADOW_FORCE?: boolean;
     __sends: Array<{ text: string; mediaCount: number }>;
     __uploads: string[];
     __composerStops: number;
@@ -231,6 +241,30 @@ declare global {
         unpublished: boolean;
         payloadBytes?: number;
       }>;
+      /** T56: two thinking segments split by a tool keep distinct identities. */
+      runShadowTwoThinkingExact: () => Promise<{
+        thinkingIds: string[];
+        thinkingKeys: string[];
+        merged: boolean;
+        shadowMismatch: number;
+        liveUnitsMismatch: number;
+      }>;
+      /** T57: permission survives projector/shadow on empty live-units reset. */
+      runShadowPermissionReset: () => Promise<{
+        permissionKeptOld: boolean;
+        permissionKeptProjected: boolean;
+        shadowEntry: string;
+        shadowNewKeep: boolean;
+      }>;
+      /** T58: dual-slot 1MiB×6, out-of-order epoch, four-entry shadow stats. */
+      runShadowDualSlotAndEpoch: () => Promise<{
+        dualSlotLive: number;
+        dualSlotStubs: number;
+        outOfOrderText: string;
+        exactAfterRange: number;
+        entriesSampled: string[];
+        p95TotalMs: number;
+      }>;
       /** Persist displayText stays user original while _modelText keeps the paper hint. */
       runPaperHintUserBubble: () => Promise<{
         text: string;
@@ -348,6 +382,15 @@ window.__replayDrive = {
   },
   runPhaseBDeferredAgentGroupReset: async () => {
     throw new Error("phase-b deferred agent-group reset probe 未挂载");
+  },
+  runShadowTwoThinkingExact: async () => {
+    throw new Error("shadow two-thinking probe 未挂载");
+  },
+  runShadowPermissionReset: async () => {
+    throw new Error("shadow permission reset probe 未挂载");
+  },
+  runShadowDualSlotAndEpoch: async () => {
+    throw new Error("shadow dual-slot/epoch probe 未挂载");
   },
   runPaperHintUserBubble: async () => {
     throw new Error("paper-hint user bubble probe 未挂载");
@@ -2211,6 +2254,325 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         unpublished: session.messages.some((message) =>
           message.role === "assistant" && message._displayDegradeReason === "records_unpublished"),
         payloadBytes: deferred?._payloadBytes,
+      };
+    },
+    runShadowTwoThinkingExact: async () => {
+      window.__OC_TIMELINE_LIFECYCLE_V1 = "shadow";
+      window.__OC_TIMELINE_LIFECYCLE_SHADOW_FORCE = true;
+      resetShadowStatsForTests();
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        "shadow two thinking",
+      );
+      const cmid = "m-browser-t56";
+      const ident = (role: ChatMessage["role"], key: string) => timelineIdentity(cmid, role, key);
+      const liveThinkA: ChatMessage = {
+        id: "t56-live-a",
+        role: "thinking",
+        text: "T56_THINK_A",
+        ts: 2,
+        _clientMessageId: cmid,
+        _lifecycle: "live_closed",
+        _lifecycleEpoch: packEpoch(EPOCH_BAND.LIVE, 0, 10, 0),
+        _timelineProcessKey: "seg:10:recA",
+        _timelineIdentity: ident("thinking", "seg:10:recA"),
+      };
+      const liveTool: ChatMessage = {
+        id: "t56-live-tool",
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        output: "ok",
+        ts: 3,
+        _clientMessageId: cmid,
+        blockId: "t56-tool",
+        _lifecycle: "live_closed",
+        _lifecycleEpoch: packEpoch(EPOCH_BAND.LIVE, 0, 20, 0),
+        _timelineProcessKey: "t56-tool",
+        _timelineIdentity: ident("tool", "t56-tool"),
+      };
+      const liveThinkB: ChatMessage = {
+        id: "t56-live-b",
+        role: "thinking",
+        text: "T56_THINK_B",
+        ts: 4,
+        _clientMessageId: cmid,
+        _lifecycle: "live_closed",
+        _lifecycleEpoch: packEpoch(EPOCH_BAND.LIVE, 0, 40, 0),
+        _timelineProcessKey: "seg:40:recB",
+        _timelineIdentity: ident("thinking", "seg:40:recB"),
+      };
+      const user: ChatMessage = {
+        id: cmid,
+        role: "user",
+        text: "T56_USER",
+        ts: 1,
+        status: "sent",
+        _source: "server",
+        _timelineRecord: true,
+      };
+      session.messages = [user, liveThinkA, liveTool, liveThinkB];
+      const common = {
+        _source: "server" as const,
+        _clientMessageId: cmid,
+        _turnTapeId: "tape-t56",
+        _turnTapeComplete: true,
+        _timelineRecord: true,
+      };
+      replaySocket.applyServerMessages(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        [
+          user,
+          {
+            ...common,
+            id: "t56-exact-a",
+            role: "thinking",
+            text: "T56_THINK_A",
+            ts: 2,
+            _lifecycle: "exact_displayable",
+            _lifecycleEpoch: packEpoch(EPOCH_BAND.TAPE, 0, 1, 1),
+            _timelineProcessKey: "seg:10:recA",
+            _timelineIdentity: ident("thinking", "seg:10:recA"),
+          },
+          {
+            ...common,
+            id: "t56-exact-tool",
+            role: "tool",
+            text: "",
+            toolName: "Bash",
+            output: "ok",
+            ts: 3,
+            blockId: "t56-tool",
+            _lifecycle: "exact_displayable",
+            _lifecycleEpoch: packEpoch(EPOCH_BAND.TAPE, 0, 2, 1),
+            _timelineProcessKey: "t56-tool",
+            _timelineIdentity: ident("tool", "t56-tool"),
+          },
+          {
+            ...common,
+            id: "t56-exact-b",
+            role: "thinking",
+            text: "T56_THINK_B",
+            ts: 4,
+            _lifecycle: "exact_displayable",
+            _lifecycleEpoch: packEpoch(EPOCH_BAND.TAPE, 0, 3, 1),
+            _timelineProcessKey: "seg:40:recB",
+            _timelineIdentity: ident("thinking", "seg:40:recB"),
+          },
+          {
+            ...common,
+            id: "t56-answer",
+            role: "assistant",
+            text: "T56_ANSWER",
+            ts: 5,
+            _lifecycle: "exact_displayable",
+            _lifecycleEpoch: packEpoch(EPOCH_BAND.TAPE, 0, 4, 1),
+            _timelineProcessKey: "",
+            _timelineIdentity: ident("assistant", ""),
+          },
+        ],
+        true,
+        2,
+        {
+          serverUpdatedAt: 4,
+          historyRevision: 2,
+          timelineGeneration: 3,
+          completedClientMessageId: cmid,
+        },
+      );
+      replaySocket.applyLiveUnits(REPLAY_SESSION_ID, [], [cmid]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const thinking = session.messages.filter((message) => message.role === "thinking");
+      const projected = projectTimeline([
+        user, liveThinkA, liveTool, liveThinkB,
+        ...session.messages.filter((message) => message._source === "server"),
+      ]);
+      const projectedThinking = projected.filter((message) => message.role === "thinking");
+      return {
+        thinkingIds: thinking.map((message) => message.id),
+        thinkingKeys: projectedThinking.map((message) => message._timelineProcessKey || ""),
+        merged: projectedThinking.length !== 2,
+        shadowMismatch: lastShadowFor("full")?.mismatchCount ?? -1,
+        liveUnitsMismatch: lastShadowFor("live-units")?.mismatchCount ?? -1,
+      };
+    },
+    runShadowPermissionReset: async () => {
+      window.__OC_TIMELINE_LIFECYCLE_V1 = "shadow";
+      window.__OC_TIMELINE_LIFECYCLE_SHADOW_FORCE = true;
+      resetShadowStatsForTests();
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        "shadow permission reset",
+      );
+      const cmid = "m-browser-t57";
+      const user: ChatMessage = {
+        id: cmid,
+        role: "user",
+        text: "T57_USER",
+        ts: 1,
+        status: "sent",
+        _source: "server",
+        _timelineRecord: true,
+      };
+      const permission: ChatMessage = {
+        id: "t57-permission",
+        role: "permission",
+        text: "T57_PERMISSION",
+        ts: 2,
+        requestId: "req-t57",
+        _clientMessageId: cmid,
+        _turnOwnerId: cmid,
+        _lifecycle: "live_open",
+        _lifecycleEpoch: packEpoch(EPOCH_BAND.LIVE, 0, 1, 0),
+        _timelineProcessKey: "req-t57",
+        _timelineIdentity: timelineIdentity(cmid, "permission", "req-t57"),
+      };
+      session.messages = [user, permission];
+      replaySocket.applyServerMessages(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        [
+          user,
+          {
+            id: "t57-answer",
+            role: "assistant",
+            text: "T57_ANSWER",
+            ts: 3,
+            _source: "server",
+            _clientMessageId: cmid,
+            _turnTapeId: "tape-t57",
+            _turnTapeComplete: true,
+            _timelineRecord: true,
+            _displayDegraded: true,
+            _displayDegradeReason: "records_unpublished",
+            _lifecycle: "phase_a",
+            _lifecycleEpoch: packEpoch(EPOCH_BAND.TAPE, 0, 1, 0),
+            _timelineProcessKey: "",
+            _timelineIdentity: timelineIdentity(cmid, "assistant", ""),
+          },
+        ],
+        true,
+        2,
+        {
+          serverUpdatedAt: 2,
+          historyRevision: 1,
+          timelineGeneration: 2,
+          completedClientMessageId: cmid,
+        },
+      );
+      const preReset = session.messages.slice();
+      replaySocket.applyLiveUnits(REPLAY_SESSION_ID, [], [cmid]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const liveShadow = lastShadowFor("live-units");
+      const permId = timelineIdentity(cmid, "permission", "req-t57");
+      const shadowHit = liveShadow?.mismatches.find((row) => row.identity === permId);
+      return {
+        permissionKeptOld: session.messages.some((message) => message.role === "permission"),
+        permissionKeptProjected: shadowHit?.newKeep === true,
+        shadowEntry: liveShadow?.entry ?? "none",
+        shadowNewKeep: shadowHit?.newKeep === true,
+      };
+    },
+    runShadowDualSlotAndEpoch: async () => {
+      window.__OC_TIMELINE_LIFECYCLE_V1 = "shadow";
+      window.__OC_TIMELINE_LIFECYCLE_SHADOW_FORCE = true;
+      resetShadowStatsForTests();
+      const cmid = "m-browser-t58";
+      const dual: ChatMessage[] = [];
+      for (let i = 0; i < 6; i++) {
+        const key = `run-t58-${i}`;
+        dual.push({
+          id: `t58-live-${i}`,
+          role: "agent-group",
+          text: `T58_LIVE_${i}`,
+          ts: 10 + i,
+          _clientMessageId: cmid,
+          _delegateRunId: key,
+          _lifecycle: "live_closed",
+          _lifecycleEpoch: packEpoch(EPOCH_BAND.LIVE, 0, 10 + i, 0),
+          _timelineProcessKey: key,
+          _timelineIdentity: timelineIdentity(cmid, "agent-group", key),
+        });
+        dual.push({
+          id: `t58-stub-${i}`,
+          role: "agent-group",
+          text: "",
+          ts: 20 + i,
+          _source: "server",
+          _clientMessageId: cmid,
+          _delegateRunId: key,
+          _payloadDeferred: true,
+          _payloadBytes: 1_048_576,
+          _lifecycle: "exact_deferred",
+          _lifecycleEpoch: packEpoch(EPOCH_BAND.TAPE, 0, 20 + i, 0),
+          _timelineProcessKey: key,
+          _timelineIdentity: timelineIdentity(cmid, "agent-group", key),
+        });
+      }
+      const projectedDual = projectTimeline(dual);
+      const newer: ChatMessage = {
+        id: "t58-101",
+        role: "thinking",
+        text: "AB",
+        ts: 1,
+        _clientMessageId: cmid,
+        _lifecycle: "live_open",
+        _lifecycleEpoch: packEpoch(EPOCH_BAND.LIVE, 0, 101, 0),
+        _timelineProcessKey: "t58-th",
+        _timelineIdentity: timelineIdentity(cmid, "thinking", "t58-th"),
+      };
+      const older: ChatMessage = {
+        ...newer,
+        id: "t58-100",
+        text: "A",
+        _lifecycleEpoch: packEpoch(EPOCH_BAND.LIVE, 0, 100, 0),
+      };
+      const outOfOrder = projectTimeline([newer, older]);
+      const exact: ChatMessage = {
+        id: "t58-exact",
+        role: "agent-group",
+        text: "hydrated",
+        ts: 30,
+        _source: "server",
+        _clientMessageId: cmid,
+        _delegateRunId: "run-t58-0",
+        _lifecycle: "exact_displayable",
+        _lifecycleEpoch: packEpoch(EPOCH_BAND.TAPE, 0, 20, 1),
+        _timelineProcessKey: "run-t58-0",
+        _timelineIdentity: timelineIdentity(cmid, "agent-group", "run-t58-0"),
+      };
+      const afterRange = projectTimeline([...dual, exact]).filter(
+        (message) => identityOf(message) === timelineIdentity(cmid, "agent-group", "run-t58-0"),
+      );
+      const user: ChatMessage = {
+        id: cmid, role: "user", text: "T58", ts: 1, _source: "server", _timelineRecord: true,
+      };
+      mergeFullServerWins([user, ...dual.filter((row) => row._source === "server")], [user, ...dual]);
+      applyServerIncremental([user, dual[0]!], [dual[1]!]);
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(REPLAY_SESSION_ID, REPLAY_AGENT_ID, "t58 shadow");
+      session.messages = [user, dual[0]!];
+      replaySocket.applyLiveUnits(REPLAY_SESSION_ID, [], [cmid]);
+      replaySocket.applyDurableLiveFrames(REPLAY_SESSION_ID, [], [cmid]);
+      const stats = getShadowStats();
+      const entriesSampled = (["full", "incremental", "live-units", "durable-frames"] as const)
+        .filter((entry) => stats.byEntry[entry].samples > 0);
+      const p95TotalMs = Math.max(
+        ...entriesSampled.map((entry) => stats.byEntry[entry].p95TotalMs),
+        0,
+      );
+      return {
+        dualSlotLive: projectedDual.filter((message) => lifecycleOf(message) === "live_closed").length,
+        dualSlotStubs: projectedDual.filter((message) => lifecycleOf(message) === "exact_deferred").length,
+        outOfOrderText: outOfOrder[0]?.text ?? "",
+        exactAfterRange: afterRange.length,
+        entriesSampled: [...entriesSampled],
+        p95TotalMs,
       };
     },
     runWeiboErrorGuidance: async () => ({

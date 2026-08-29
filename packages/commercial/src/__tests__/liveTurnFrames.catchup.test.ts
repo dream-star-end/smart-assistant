@@ -15,7 +15,9 @@ import {
   HELLO_LIVE_CATCHUP_MAX_BYTES,
   liveCatchupSendDecision,
   readOpenDispatchLiveFramePayloadsAfterSeq,
+  reduceLiveJournal,
 } from '../db/liveTurnFrames.js'
+import { EPOCH_BAND, packEpoch } from '@openclaude/protocol'
 
 type CatchupQuery = Pick<Pool, 'query'>
 
@@ -177,5 +179,50 @@ describe('persistGatewayLiveFrame live-lease touch', () => {
     const src = await readFile(srcPath, 'utf8')
     assert.match(src, /touchDispatchLeaseOnLiveFrame/)
     assert.match(src, /leaseTtlMs: DISPATCH_LEASE_TTL_MS/)
+  })
+})
+
+describe('live units streamGeneration', () => {
+  test('readOpenDispatchStreamMeta selects stream_key and stamps lineage generation', async () => {
+    const srcPath = fileURLToPath(new URL('../db/liveTurnFrames.ts', import.meta.url))
+    const src = await readFile(srcPath, 'utf8')
+    assert.match(src, /streamGenerationFromLineage/)
+    assert.match(src, /SELECT stream_key,client_message_id,projection_source/)
+    assert.match(src, /streamKeyLineage/)
+    assert.match(src, /reduceLiveJournal/)
+    assert.match(src, /lineage: snapshot\.meta\.lineage/)
+  })
+
+  test('no-checkpoint snapshot of only s2 uses DB lineage [s1,s2] so gen=1 beats old gen0/seq101', () => {
+    const reduced = reduceLiveJournal([{
+      recordId: '2',
+      streamKey: 's2',
+      clientMessageId: 'cm-1',
+      payload: {
+        type: 'outbound.message',
+        sessionKey: 'agent:main:webchat:dm:sess',
+        frameSeq: 1,
+        blocks: [{ kind: 'thinking', text: 'NEW' }],
+      },
+    }], { lineage: ['s1', 's2'], checkpointState: null })
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    const reducerGeneration = reduced.state.units[0]?.streamGeneration ?? -1
+    const oldEpoch = packEpoch(EPOCH_BAND.LIVE, 0, 101, 0)
+    const newEpoch = packEpoch(EPOCH_BAND.LIVE, reducerGeneration, 1, 0)
+    assert.deepEqual({
+      expectedGeneration: 1,
+      reducerGeneration,
+      actualBeatsOld: newEpoch > oldEpoch,
+      expectedBeatsOld: true,
+    }, {
+      expectedGeneration: 1,
+      reducerGeneration: 1,
+      actualBeatsOld: true,
+      expectedBeatsOld: true,
+    })
+    assert.equal(oldEpoch, 2251799813685450)
+    assert.equal(packEpoch(EPOCH_BAND.LIVE, 0, 1, 0), 2251799813685250)
+    assert.equal(newEpoch, 2253998836940802)
   })
 })

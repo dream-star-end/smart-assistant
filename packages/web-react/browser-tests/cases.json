@@ -221,6 +221,18 @@
     {
       "id": "T55",
       "proves": "真 Chromium 中 Phase-B 精确 assistant + `_payloadDeferred` agent-group 空壳到达后，空 live-units owner reset 仍保留 live 委派过程行与终稿，不把 deferred stub 当成精确过程已到"
+    },
+    {
+      "id": "T56",
+      "proves": "P0 shadow：同 owner 两段 thinking 被 tool 隔开保持两个 processKey，exact 分别命中，不合并（B2）"
+    },
+    {
+      "id": "T57",
+      "proves": "P0 shadow：Phase-A empty live-units reset 前快照上 permission 进入投影器 live_open 槽；与旧 reset 的 diff 计入允许清单（B5/I5）"
+    },
+    {
+      "id": "T58",
+      "proves": "P0 shadow：1MiB×6 双槽、乱序 epoch 101>100、Range 注入 exact 收敛为 1 行、四入口均有采样（B1/B3/B4/B5）"
     }
   ]
 }
