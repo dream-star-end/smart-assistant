@@ -147,7 +147,7 @@ interface HttpWaiter {
  * Minimal EventEmitter that duck-types `ws` WebSocket enough for userChatBridge.
  */
 export class DesktopBridgedSocket extends EventEmitter {
-  readyState = WebSocket.CONNECTING;
+  readyState: number = WebSocket.CONNECTING;
   constructor(private readonly sendFn: (data: Buffer, isBinary: boolean) => void, private readonly closeFn: (code?: number, reason?: string) => void) {
     super();
   }
@@ -183,7 +183,7 @@ export class DesktopBridgedSocket extends EventEmitter {
 }
 
 export class DesktopMuxSession {
-  private buf = Buffer.alloc(0);
+  private buf: Buffer = Buffer.alloc(0);
   private nextOdd = 1;
   private readonly streams = new Map<number, { kind: "http" | "ws" }>();
   private readonly httpWait = new Map<number, HttpWaiter>();
@@ -317,9 +317,9 @@ export class DesktopMuxSession {
   }
 
   private pushBytes(chunk: Buffer): void {
-    this.buf = this.buf.length === 0 ? chunk : Buffer.concat([this.buf, chunk]);
+    this.buf = this.buf.length === 0 ? Buffer.from(chunk) : Buffer.concat([this.buf, chunk]);
     const { frames, rest } = decodeFrames(this.buf);
-    this.buf = rest;
+    this.buf = Buffer.from(rest);
     for (const f of frames) this.onFrame(f);
   }
 
