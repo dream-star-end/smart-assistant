@@ -1250,6 +1250,7 @@ oc_hotcfg_activate_saga() {
       commit_state=old
     fi
     echo "⚠ [hotcfg] 激活 saga 失败且 deploy_state=old 已确认 → 回滚运行面并 restart 旧 master" >&2
+    export HOTCFG_SAGA_ROLLING_BACK=1
     if [ "$current_done" = 1 ]; then
       if [ -n "$old_current" ]; then
         local t="$platform_root/.current.rb.$$"
@@ -1289,9 +1290,16 @@ oc_hotcfg_activate_saga() {
   fi
   # 5) restart 新 master
   [ "$lossless_writer_candidate" = 1 ] && lossless_writer_may_have_served=1
-  if ! eval "$restart_cmd"; then _hotcfg_saga_rollback; return 1; fi
+  if ! eval "$restart_cmd"; then
+    echo "⚠ [hotcfg] restart_cmd 失败;摘录 egress/master 最近日志" >&2
+    journalctl -u openclaude-v5-selfhost-egress.service -n 40 --no-pager >&2 || true
+    journalctl -u openclaude-v5-selfhost.service -n 20 --no-pager >&2 || true
+    tail -n 80 /var/log/openclaude-v5-selfhost-egress.log >&2 || true
+    _hotcfg_saga_rollback; return 1; fi
   # 6) smoke
-  if ! eval "$smoke_cmd"; then _hotcfg_saga_rollback; return 1; fi
+  if ! eval "$smoke_cmd"; then
+    echo "⚠ [hotcfg] forward smoke_cmd 失败 (HOTCFG_SAGA_ROLLING_BACK=${HOTCFG_SAGA_ROLLING_BACK:-})" >&2
+    _hotcfg_saga_rollback; return 1; fi
   # 6.5) 可选外部权威提交(P3=deploy_state release CAS)。失败仍回滚 symlink/env/current+旧 master；
   #       成功后 history 若失败，commit_revert 与其它现场一起补偿。
   if [ -n "$commit_apply" ]; then
