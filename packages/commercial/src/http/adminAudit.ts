@@ -60,9 +60,8 @@ function serializeRow(r: AgentAuditRowView): Record<string, unknown> {
     output_hash: r.output_hash,
     duration_ms: r.duration_ms,
     success: r.success,
-    // Historical rows may still contain raw output previews until 0149 is applied.
-    // Never expose them through the admin API; error_class above is the diagnostic surface.
-    error_msg: null,
+    // error_msg is a ≤240 code-point sanitized summary or sentinel, not a raw preview.
+    error_msg: r.error_msg,
     created_at: r.created_at.toISOString(),
   };
 }

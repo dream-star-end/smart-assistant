@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { describe, test } from 'node:test'
 
+import { classifyToolFailure, synthesizeEmptyFailedToolPreview } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import { GrokAdapter, readLatestGrokNativeHandoff, _internals } from '../engine/grokAdapter.js'
 import type { EngineBillingEvent, EngineEvent } from '../engine/engineEvents.js'
@@ -786,4 +787,21 @@ test('reads the cleaned native Grok summary carrier from the new checkpoint', as
       compactStartedAt: started,
     })
   } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('TaskOutput empty failed output is empty_output, not task_dead', () => {
+  const preview = synthesizeEmptyFailedToolPreview({
+    toolName: 'TaskOutput',
+    engine: 'grok',
+    taskId: 'abc',
+    status: 'failed',
+  })
+  assert.ok(preview.startsWith('TaskOutput: empty failed output'))
+  assert.equal(preview.includes('no structured terminal'), false)
+  assert.equal(preview.includes('not across turns'), false)
+  assert.equal(classifyToolFailure({ outputPreview: preview }).errorClass, 'empty_output')
+  assert.equal(
+    classifyToolFailure({ outputPreview: 'No task found with ID: abc' }).errorClass,
+    'task_not_found',
+  )
 })

@@ -51,6 +51,7 @@ import {
   PerTurnDelegationGuard,
   decideLocalExecution,
   localExecutionOverride,
+  resolveExecutionModel,
   resolveLocalExecutionIfEnforced,
 } from '../server.js'
 import { SessionManager } from '../sessionManager.js'
@@ -268,12 +269,32 @@ describe('② flag 开 + catalog 可用 → engine/model 取投影', () => {
         row('deepseek-v4-pro', 'ccb'),
       ]),
       agent: { id: 'research-assistant', model: 'deepseek-v4-pro' },
-      model: 'glm-5.2',
       defaultModel: 'glm-5.2',
       kind: 'turn',
     })
-    // agent 自身 deepseek 仍可用，所以显式/默认 glm 不可用后先尊重 agent 默认。
+    // 无显式 --model 时，agent 自身 deepseek 仍可用。
     assert.equal(d.canonicalModel, 'deepseek-v4-pro')
+  })
+
+  test('explicit unknown slug is DELEGATE_MODEL_UNKNOWN and does not inherit', () => {
+    assert.throws(
+      () =>
+        decideLocalExecution({
+          view: view([row('glm-5.2', 'ccb'), row('deepseek-v4-flash', 'ccb')]),
+          agent: { id: 'main', model: 'glm-5.2' },
+          model: 'definitely-not-a-model',
+          defaultModel: 'glm-5.2',
+          kind: 'turn',
+        }),
+      (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_MODEL_UNKNOWN',
+    )
+    const inherited = decideLocalExecution({
+      view: view([row('glm-5.2', 'ccb')]),
+      agent: { id: 'main', model: 'stale-agent-model' },
+      defaultModel: 'glm-5.2',
+      kind: 'turn',
+    })
+    assert.equal(inherited.canonicalModel, 'glm-5.2')
   })
 
   test('agent 默认也不可用时按 glm → MiniMax → DeepSeek Flash 多级路由', () => {
@@ -547,6 +568,57 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
     const r = await runDelegate(gw, 'codex-leader', { goal: '旧行为', sourceAgent: 'main' })
     assert.equal(r.status, 200)
     assert.equal(gw.sessions.getOrCreateCalls, 1)
+  })
+
+  test('HTTP delegate:flag 未开 + 显式未知型号 → 400 DELEGATE_MODEL_UNKNOWN,不得 inherit', async () => {
+    _setModelCatalogClientForTests({
+      getView: () => {
+        throw new Error('catalog must NOT be consulted while flag is off')
+      },
+    } as any)
+    const gw = makeDelegateGateway()
+    gw.sessions.getOrCreate = async (opts: any) => {
+      resolveExecutionModel(
+        opts.model ?? opts.agent?.model,
+        gw.deps.config.defaults.model,
+        opts.executionAuthority,
+        { explicit: typeof opts.model === 'string' && opts.model !== '' },
+      )
+      gw.sessions.getOrCreateCalls++
+      return {
+        agentId: 'x',
+        currentTurnStatus: null,
+        runner: { interrupt: () => {}, sendPermissionResponse: () => {} },
+      }
+    }
+    const r = await runDelegate(gw, 'coding-assistant', {
+      goal: 'x',
+      sourceAgent: 'main',
+      model: 'definitely-not-a-model',
+    })
+    assert.equal(r.status, 400)
+    assert.equal(r.body.code, 'DELEGATE_MODEL_UNKNOWN')
+    assert.match(String(r.body.error), /DELEGATE_MODEL_UNKNOWN/)
+    assert.equal(gw.sessions.getOrCreateCalls, 0, '抛错发生在 runner 返回之前')
+  })
+
+  test('HTTP delegate:flag 开 + 显式未知型号 → 400 DELEGATE_MODEL_UNKNOWN,未 spawn', async () => {
+    installCatalog()
+    const prev = process.env.OC_MODEL_AUTHORITY
+    process.env.OC_MODEL_AUTHORITY = '1'
+    try {
+      const gw = makeDelegateGateway()
+      const r = await runDelegate(gw, 'coding-assistant', {
+        goal: 'x',
+        sourceAgent: 'main',
+        model: 'definitely-not-a-model',
+      })
+      assert.equal(r.status, 400)
+      assert.equal(r.body.code, 'DELEGATE_MODEL_UNKNOWN')
+      assert.equal(gw.sessions.getOrCreateCalls, 0)
+    } finally {
+      restoreFlag(prev)
+    }
   })
 })
 

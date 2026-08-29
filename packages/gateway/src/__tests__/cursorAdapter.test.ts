@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
-import { CURSOR_ENGINE_MODELS } from '@openclaude/protocol'
+import { CURSOR_ENGINE_MODELS, classifyToolFailure } from '@openclaude/protocol'
 import {
   CURSOR_MAX_PLATFORM_ENVELOPE_BYTES,
   CURSOR_MAX_PROMPT_ARG_BYTES,
@@ -213,6 +213,21 @@ describe('CursorAdapter', () => {
     }
     assert.equal(_internals.toolNameOf(awaitTool as never), 'TaskOutput')
     assert.deepEqual(_internals.toolInputOf(awaitTool as never), { task_id: '455287' })
+
+    const emptyFailedAwait = {
+      type: 'tool_call',
+      status: 'failed',
+      tool_call: {
+        id: 't-await-empty',
+        awaitToolCall: { args: { taskId: '455287' }, result: {} },
+      },
+    }
+    const emptyOut = _internals.toolOutputOf(emptyFailedAwait as never)
+    assert.ok(emptyOut.output.startsWith('TaskOutput: empty failed output'))
+    assert.equal(emptyOut.output.includes('no structured terminal'), false)
+    assert.equal(emptyOut.output.includes('not across turns'), false)
+    assert.equal(classifyToolFailure({ outputPreview: emptyOut.output }).errorClass, 'empty_output')
+    assert.notEqual(classifyToolFailure({ outputPreview: emptyOut.output }).errorClass, 'task_dead')
 
     // grepToolCall → Grep(pattern/path)
     const grep = {

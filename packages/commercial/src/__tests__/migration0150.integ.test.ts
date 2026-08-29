@@ -200,5 +200,23 @@ describe('0150_agent_tool_rollups', () => {
       termination_reason: 'exit_code',
     })
     assert.equal(result.rows[0].error_msg, null)
+
+    const next = await readFile(path.resolve(here, '../db/migrations/0254_agent_audit_error_msg.sql'), 'utf8')
+    await pool.query(next)
+    await pool.query(`
+      INSERT INTO agent_audit(
+        user_id,session_id,tool,input_meta,duration_ms,success,error_msg
+      ) VALUES (
+        1,'session-v5','Bash','{"event_id":"event-v5","error_class":"command_not_found"}',
+        8,false,'command not found'
+      )
+    `)
+    const flipped = await pool.query<{ error_msg: string | null; input_meta: Record<string, unknown> }>(
+      "SELECT error_msg,input_meta FROM agent_audit WHERE session_id='session-v5'",
+    )
+    assert.ok(flipped.rows[0].error_msg)
+    assert.notEqual(flipped.rows[0].error_msg, '')
+    assert.equal('input_preview' in flipped.rows[0].input_meta, false)
+    assert.equal((flipped.rows[0].error_msg ?? '').includes('bearer '), false)
   })
 })

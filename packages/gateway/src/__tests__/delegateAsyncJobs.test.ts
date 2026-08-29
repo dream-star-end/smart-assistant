@@ -17,7 +17,7 @@ import {
   issueDelegateContextToken,
   resetDelegateContextKeyForTests,
 } from '../delegateContext.js'
-import { Gateway, PerTurnDelegationGuard } from '../server.js'
+import { Gateway, PerTurnDelegationGuard, resolveExecutionModel } from '../server.js'
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-async-delegate'
 
@@ -357,6 +357,64 @@ describe('handleDelegateTask model override', () => {
     })
     assert.equal(r.status, 200)
     assert.equal(gw._submitted[0].model, undefined)
+  })
+
+  it('flag-off explicit unknown model returns 400 DELEGATE_MODEL_UNKNOWN', async () => {
+    const gw = makeGateway(false)
+    gw.sessions.getOrCreate = async (opts: any) => {
+      resolveExecutionModel(
+        opts.model ?? opts.agent?.model,
+        gw.deps.config.defaults.model,
+        opts.executionAuthority,
+        { explicit: typeof opts.model === 'string' && opts.model !== '' },
+      )
+      gw._created = [...(gw._created ?? []), opts]
+      return {
+        agentId: opts?.agent?.id ?? 'coding-assistant',
+        currentTurnStatus: null,
+        runner: { interrupt: () => {}, sendPermissionResponse: () => {}, on: () => {}, off: () => {} },
+      }
+    }
+    const r = await call(gw, 'handleDelegateTask', {
+      goal: '测',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      model: 'definitely-not-a-model',
+    })
+    assert.equal(r.status, 400)
+    assert.equal(r.body.code, 'DELEGATE_MODEL_UNKNOWN')
+    assert.equal(gw._created, undefined)
+  })
+
+  it('async flag-off explicit unknown model completes with 400 DELEGATE_MODEL_UNKNOWN', async () => {
+    const gw = makeGateway(false)
+    gw.sessions.getOrCreate = async (opts: any) => {
+      resolveExecutionModel(
+        opts.model ?? opts.agent?.model,
+        gw.deps.config.defaults.model,
+        opts.executionAuthority,
+        { explicit: typeof opts.model === 'string' && opts.model !== '' },
+      )
+      return {
+        agentId: opts?.agent?.id ?? 'coding-assistant',
+        currentTurnStatus: null,
+        runner: { interrupt: () => {}, sendPermissionResponse: () => {}, on: () => {}, off: () => {} },
+      }
+    }
+    const start = await call(gw, 'handleDelegateTask', {
+      goal: '测',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      model: 'definitely-not-a-model',
+      async: true,
+    })
+    assert.equal(start.status, 200)
+    assert.equal(typeof start.body.jobId, 'string')
+    const done = await call(gw, 'handleDelegateWait', { jobId: start.body.jobId, waitMs: 2_000 })
+    assert.equal(done.status, 200)
+    assert.equal(done.body.status, 'done')
+    assert.equal(done.body.httpStatus, 400)
+    assert.equal(done.body.code, 'DELEGATE_MODEL_UNKNOWN')
   })
 
   it('signed context overrides forged sourceAgent/depth/parentSessionKey', async () => {
