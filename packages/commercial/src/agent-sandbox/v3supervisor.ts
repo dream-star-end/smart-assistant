@@ -524,6 +524,28 @@ function appendCodexRelayEnv(env: string[]): void {
   env.push(...buildCodexRelayContainerEnv(process.env));
 }
 
+/** Master→container passthrough of gateway delegate concurrency knobs.
+ *  Only inject when the master process env value matches /^[0-9]+$/;
+ *  omit the key otherwise so the container gateway falls back to defaults. */
+export const DELEGATE_KNOB_CONTAINER_ENV_KEYS = [
+  "OPENCLAUDE_DELEGATE_MAX_CONCURRENT",
+  "OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS",
+  "OPENCLAUDE_DELEGATE_MAX_PER_PARENT",
+  "OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN",
+  "OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS",
+] as const;
+
+export function buildDelegateKnobContainerEnv(
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const out: string[] = [];
+  for (const key of DELEGATE_KNOB_CONTAINER_ENV_KEYS) {
+    const value = sourceEnv[key];
+    if (value && /^[0-9]+$/.test(value)) out.push(`${key}=${value}`);
+  }
+  return out;
+}
+
 /**
  * 宿主侧远程执行 mux 目录 per-user 分片根。
  *
@@ -2767,6 +2789,7 @@ export async function provisionV3Container(
       const value = process.env[key];
       if (value && /^[0-9]+$/.test(value)) env.push(`${key}=${value}`);
     }
+    env.push(...buildDelegateKnobContainerEnv(process.env));
 
     // 市场技能使用信号门控透传:与 tool-failure 相反 = **默认开**(低敏产品质量信号,
     // 只记 slug/agent/trace 不记内容)。master 未显式设 → 恒注入 '1';仅当 master 显式
