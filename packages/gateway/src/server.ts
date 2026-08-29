@@ -1715,7 +1715,8 @@ function parseDelegateEnvInt(name: string, min: number, fallback: number): numbe
   const trimmed = process.env[name]?.trim()
   if (!trimmed) return fallback
   const raw = Number(trimmed)
-  return Number.isFinite(raw) && raw >= min ? Math.floor(raw) : fallback
+  if (!Number.isInteger(raw)) return fallback
+  return raw >= min ? raw : fallback
 }
 
 function parseDelegateQueueWaitMs(): number {

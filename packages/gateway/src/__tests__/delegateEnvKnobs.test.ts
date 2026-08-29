@@ -71,6 +71,11 @@ describe('Gateway.MAX_CONCURRENT_DELEGATIONS env getter', () => {
       assert.equal(caps().max, 5, `raw=${JSON.stringify(raw)} 应回落 5`)
     }
   })
+
+  it('小数 2.9 回落默认 5（非整数非法，不 floor）', () => {
+    process.env.OPENCLAUDE_DELEGATE_MAX_CONCURRENT = '2.9'
+    assert.equal(caps().max, 5)
+  })
 })
 
 describe('Gateway.DELEGATE_REVIEW_RESERVED_SLOTS env getter', () => {
@@ -93,6 +98,12 @@ describe('Gateway.DELEGATE_REVIEW_RESERVED_SLOTS env getter', () => {
       process.env.OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS = raw
       assert.equal(caps().reserved, 1, `raw=${JSON.stringify(raw)} 应回落 1`)
     }
+  })
+
+  it('小数 2.9 回落默认 1（非整数非法，不 floor）', () => {
+    process.env.OPENCLAUDE_DELEGATE_MAX_CONCURRENT = '5'
+    process.env.OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS = '2.9'
+    assert.equal(caps().reserved, 1)
   })
 
   it('reserved≥max 时 clamp 到 max−1,普通槽 ≥1', () => {
