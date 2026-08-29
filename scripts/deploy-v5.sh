@@ -2121,12 +2121,8 @@ REMOTE
 
 begin_cutover_step() {
   local expected="$1" next="$2"
-  # New flavor.manifest.json only: skip on current production artifacts.
-  if declare -F assert_commercial_cutover >/dev/null 2>&1 && [[ -n "${BUILT_RELEASE:-}" ]]; then
-    if ssh "$KL_HOST" "test -f '$BUILT_RELEASE/flavor.manifest.json' && test -f '$BUILT_RELEASE/scripts/lib/assert-flavor.sh'"; then
-      ssh "$KL_HOST" "OC_FLAVOR_MANIFEST='$BUILT_RELEASE/flavor.manifest.json' OC_FLAVOR_INSTALL_ROOT=/opt/openclaude/openclaude-v5 OC_FLAVOR_CUTOVER_ROOT='$BUILT_RELEASE' bash '$BUILT_RELEASE/scripts/lib/assert-flavor.sh' cutover-commercial" \
-        || { echo "✗ commercial flavor cutover assertion failed" >&2; return 1; }
-    fi
+  if [[ -n "${BUILT_RELEASE:-}" ]]; then
+    assert_commercial_flavor_on_target "$BUILT_RELEASE" || return 1
   fi
   if cutover_transition "$expected" "$next"; then
     if [[ "$next" == recycling ]] && ! set_cutover_maintenance; then
@@ -3814,22 +3810,20 @@ build_release() {
   ssh "$KL_HOST" "mkdir -p '$staging'" || { echo "✗ mkdir staging 失败" >&2; return 1; }
   if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | ssh "$KL_HOST" "tar -x -C '$staging'"; then
     echo "✗ git archive/解包失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
-  if declare -F write_flavor_manifest >/dev/null 2>&1; then
-    flavor_tmpd="$(mktemp -d)"
-    if ! write_flavor_manifest "$flavor_tmpd" commercial "$full_sha"; then
-      rm -rf "$flavor_tmpd"
-      echo "✗ write commercial flavor.manifest.json failed" >&2
-      ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-      return 1
-    fi
-    if ! scp -q "$flavor_tmpd/flavor.manifest.json" "$KL_HOST:$staging/flavor.manifest.json"; then
-      rm -rf "$flavor_tmpd"
-      echo "✗ scp flavor.manifest.json failed" >&2
-      ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-      return 1
-    fi
+  flavor_tmpd="$(mktemp -d)"
+  if ! write_flavor_manifest "$flavor_tmpd" commercial "$full_sha"; then
     rm -rf "$flavor_tmpd"
+    echo "✗ write commercial flavor.manifest.json failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
   fi
+  if ! scp -q "$flavor_tmpd/flavor.manifest.json" "$KL_HOST:$staging/flavor.manifest.json"; then
+    rm -rf "$flavor_tmpd"
+    echo "✗ scp flavor.manifest.json failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  rm -rf "$flavor_tmpd"
   # node_modules:lock 未变且当前有 → 硬链复用;否则空目录 npm ci(不碰旧 release 硬链)
   if ! ssh "$KL_HOST" "set -e
       if [ -n '$cur' ] && [ -d '$cur/node_modules' ] && cmp -s '$staging/package-lock.json' '$cur/package-lock.json' 2>/dev/null; then
@@ -5579,12 +5573,33 @@ restore_release_state_if_committed() {  # $1=target
 
 # 原子激活 release:assets 先就位；随后 symlink→restart→健康门→deploy_state CAS。
 # 任一步失败都回切旧 symlink/unit；状态 CAS 落空/PG 错误绝不再被吞成成功。
+assert_commercial_flavor_on_target() {
+  local candidate="$1"
+  [[ -n "$candidate" ]] || { echo "✗ commercial flavor assertion missing candidate" >&2; return 1; }
+  ssh "$KL_HOST" bash -s -- "$candidate" "$V5_ENV" <<'REMOTE'
+set -euo pipefail
+cand="$1"
+env_file="$2"
+helper="$cand/scripts/lib/assert-flavor.sh"
+if [[ ! -f "$cand/flavor.manifest.json" && ! -f "$helper" ]]; then
+  echo "[flavor-identity] cutover skip: legacy candidate" >&2
+  exit 0
+fi
+if [[ ! -f "$helper" ]]; then
+  echo "[flavor-identity] guarded candidate missing helper" >&2
+  exit 1
+fi
+V5_ENV="$env_file" bash "$helper" cutover-commercial --root "$cand"
+REMOTE
+}
+
 activate_release() {
   local reldir="$1" prev tmplink old_prev_file=""
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] 校验+assets 先就位→翻转 $ACTIVE_SRC(slot=$ACTIVE_SLOT)→restart/smoke $ACTIVE_UNIT:$ACTIVE_PORT→严格 state CAS；任一步失败回切旧 release"
     return 0
   fi
+  assert_commercial_flavor_on_target "$reldir" || return 1
   assert_release_marker "$reldir" || return 1
   assert_release_required_migrations "$reldir" || return 1
   assert_release_baseline_security "$reldir" || return 1
@@ -6134,6 +6149,7 @@ activate_runtime_tuple() {
     echo "  [dry-run] saga: [pre-state(首启)]→[canary validate-only]→extra_apply(master symlink→$BUILT_RELEASE)→env tuple(四键恒写,禁用轴空值)→[flip current]→restart→smoke→history commit"
     return 0
   fi
+  assert_commercial_flavor_on_target "$BUILT_RELEASE" || return 1
   assert_release_marker "$BUILT_RELEASE" || return 1
   assert_release_required_migrations "$BUILT_RELEASE" || return 1
   assert_release_baseline_security "$BUILT_RELEASE" || return 1

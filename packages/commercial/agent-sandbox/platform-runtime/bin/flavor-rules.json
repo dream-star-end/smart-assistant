@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "schemaMustBeInteger": true,
+  "guardGeneration": 1,
+  "requiredFields": [
+    "schema",
+    "flavor",
+    "sourceCommit",
+    "builder",
+    "expectedHosts",
+    "expectedRoots",
+    "expectedDbNames",
+    "guardGeneration"
+  ],
+  "sourceCommitPattern": "^[0-9a-f]{40}$",
+  "builders": {
+    "selfhost": "deploy-v5-selfhost.sh",
+    "commercial": "deploy-v5.sh"
+  },
+  "selfhostDbName": "openclaude_v5_selfhost",
+  "selfhostProfile": "v5-selfhost",
+  "egressFlagExact": "1"
+}

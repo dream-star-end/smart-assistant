@@ -185,12 +185,85 @@ describe("assertFlavorForMigrate", () => {
       hostname: "v3-dev-sg",
       installRoot: "/opt/openclaude/openclaude-v5-selfhost",
       dbName: "openclaude_v5_selfhost",
+      dbProfile: "v5-selfhost",
       env: {
-        OC_FLAVOR_DOCKERENV: "0",
         PGOPTIONS: "-c openclaude.migration_profile=v5-selfhost",
       },
       dockerenv: false,
     });
     assert.equal(got.status, "ok");
+  });
+
+  test("B4: commercial + DATABASE_URL options profile fails without querying", async () => {
+    let queried = false;
+    await assert.rejects(
+      () => assertFlavorForMigrate(
+        {
+          manifestPath: writeFixture("valid-commercial.json"),
+          hostname: "kl-mirror",
+          installRoot: "/opt/openclaude/openclaude-v5",
+          dockerenv: false,
+          env: {
+            DATABASE_URL: "postgres://x@127.0.0.1:5432/openclaude?options=-c%20openclaude.migration_profile%3Dv5-selfhost",
+          },
+        },
+        async () => {
+          queried = true;
+          return { dbName: "openclaude", dbProfile: "" };
+        },
+      ),
+      /cannot be upgraded/,
+    );
+    assert.equal(queried, false);
+  });
+
+  test("B4: commercial session profile v5-selfhost fails even with clean PGOPTIONS", async () => {
+    await assert.rejects(
+      () => assertFlavorForMigrate({
+        manifestPath: writeFixture("valid-commercial.json"),
+        hostname: "kl-mirror",
+        installRoot: "/opt/openclaude/openclaude-v5",
+        dbName: "openclaude",
+        dbProfile: "v5-selfhost",
+        dockerenv: false,
+        env: {},
+      }),
+      /v5-selfhost/,
+    );
+  });
+});
+
+describe("adversarial identity", () => {
+  test("B1: OC_FLAVOR_HOSTNAME env cannot mint selfhost identity", () => {
+    assert.throws(
+      () => assertFlavorIdentity({
+        manifestPath: writeFixture("valid-selfhost.json"),
+        installRoot: "/opt/openclaude/openclaude-v5-selfhost",
+        dockerenv: false,
+        env: { OC_FLAVOR_HOSTNAME: "v3-dev-sg" },
+      }),
+      /hostname/,
+    );
+  });
+
+  test("B2: generation=1 missing manifest is fail-closed", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "flavor-gen-"));
+    assert.throws(
+      () => assertFlavorIdentity({
+        manifestPath: path.join(dir, "flavor.manifest.json"),
+        hostname: "kl-mirror",
+        installRoot: "/opt/openclaude/openclaude-v5",
+        dockerenv: false,
+        generation: 1,
+      }),
+      /guardGeneration/,
+    );
+  });
+
+  test("B3: schema boolean true is rejected", () => {
+    assert.throws(
+      () => parseFlavorManifest(JSON.parse(readFileSync(path.join(fixtures, "schema-bool-true.json"), "utf8"))),
+      /schema must be integer/,
+    );
   });
 });

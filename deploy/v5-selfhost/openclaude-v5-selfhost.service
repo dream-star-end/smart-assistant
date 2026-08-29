@@ -14,9 +14,7 @@ Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/b
 Environment="OPENCLAUDE_HOME=/root/.openclaude-v5-selfhost"
 Environment="NODE_ENV=production"
 Environment="OC_V3_CCB_BASELINE_DIR=/opt/openclaude/openclaude-v5-selfhost-live/packages/commercial/agent-sandbox/ccb-baseline"
-Environment="OC_FLAVOR_INSTALL_ROOT=/opt/openclaude/openclaude-v5-selfhost"
-Environment="OC_FLAVOR_MANIFEST=/opt/openclaude/openclaude-v5-selfhost-live/flavor.manifest.json"
-ExecStartPre=/usr/bin/bash /opt/openclaude/openclaude-v5-selfhost-live/scripts/lib/assert-flavor.sh identity
+ExecStartPre=/usr/bin/bash /opt/openclaude/openclaude-v5-selfhost-live/scripts/lib/assert-flavor.sh identity --effector /opt/openclaude/openclaude-v5-selfhost-live/scripts/lib
 ExecStart=/usr/bin/npx tsx packages/cli/src/index.ts gateway
 Restart=on-failure
 RestartSec=5

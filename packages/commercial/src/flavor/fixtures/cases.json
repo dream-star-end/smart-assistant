@@ -124,5 +124,27 @@
     "env": {},
     "expect": "fail",
     "errorContains": "missing fields"
+  },
+  {
+    "name": "schema-bool-true-fail",
+    "manifest": "schema-bool-true.json",
+    "hostname": "kl-mirror",
+    "installRoot": "/opt/openclaude/openclaude-v5",
+    "dbName": "openclaude",
+    "env": {},
+    "expect": "fail",
+    "errorContains": "schema must be integer"
+  },
+  {
+    "name": "commercial-database-url-profile-fail",
+    "manifest": "valid-commercial.json",
+    "hostname": "kl-mirror",
+    "installRoot": "/opt/openclaude/openclaude-v5",
+    "dbName": "openclaude",
+    "env": {
+      "DATABASE_URL": "postgres://x@127.0.0.1:5432/openclaude?options=-c%20openclaude.migration_profile%3Dv5-selfhost"
+    },
+    "expect": "fail",
+    "errorContains": "cannot be upgraded"
   }
 ]

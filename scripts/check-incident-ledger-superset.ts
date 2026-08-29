@@ -1,9 +1,11 @@
 #!/usr/bin/env tsx
 /**
  * OCV5-20 §2.8 incidents / trailer "only grow, never drop" gate.
- * Does not replace check-v5-incident-regressions.ts; it adds the union
- * baseline ratchet. Tree hash equality is not a skip condition.
+ * Candidate baseline must be a superset of the previous baseline from the
+ * target branch / parent commit. Tombstones require a Tombstone-Approval
+ * trailer and may only append.
  */
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -30,6 +32,11 @@ export type LedgerBaseline = {
   historicallyPresentIds: string[];
 };
 
+export type TombstoneApproval = {
+  trailer: string;
+  commit: string;
+};
+
 export type Tombstone = {
   id: string;
   removedAt: string;
@@ -37,6 +44,7 @@ export type Tombstone = {
   reason: string;
   approver: string;
   codeStillInTree: string;
+  approval: TombstoneApproval;
 };
 
 export type TombstoneFile = {
@@ -47,18 +55,25 @@ export type TombstoneFile = {
 export type SupersetInput = {
   root?: string;
   baseline?: LedgerBaseline;
+  previousBaseline?: LedgerBaseline | null;
   mergedIncidents?: LedgerIncident[];
   tombstones?: Tombstone[];
+  previousTombstones?: Tombstone[];
   trailerTips?: string[];
   skipGit?: boolean;
+  pin?: string;
 };
 
 export type SupersetResult = { ok: true } | { ok: false; errors: string[] };
 
 const DEFAULT_ROOT = resolve(import.meta.dirname, "..");
+const BASELINE_REL = "e2e/session-display/incident-ledger-baseline.json";
+const TOMBSTONE_REL = "e2e/session-display/incident-tombstones.json";
+const PIN_REL = "e2e/session-display/incident-ledger-baseline.sha256";
+const APPROVAL_RE = /^Tombstone-Approval: (INC-[0-9]{8}-[A-Z0-9-]{3,40}) (\S+)$/;
 
 function git(root: string, ...args: string[]): string {
-  return execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  return execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 
 export function parseImportedTrailerTips(checkerSource: string): string[] {
@@ -77,18 +92,56 @@ function isAncestor(root: string, sha: string, head = "HEAD"): boolean {
   }
 }
 
+function gitShowJson<T>(root: string, rev: string, rel: string): T | null {
+  try {
+    return JSON.parse(git(root, "show", `${rev}:${rel}`)) as T;
+  } catch {
+    return null;
+  }
+}
+
+export function loadPreviousBaseline(root: string): LedgerBaseline | null {
+  const refs = [
+    process.env.INCIDENT_LEDGER_BASE_REF,
+    "origin/feat/v5-selfhost",
+    "HEAD~1",
+  ].filter((item): item is string => Boolean(item));
+  for (const ref of refs) {
+    const parsed = gitShowJson<LedgerBaseline>(root, ref, BASELINE_REL);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+export function loadPreviousTombstones(root: string): Tombstone[] {
+  const refs = [
+    process.env.INCIDENT_LEDGER_BASE_REF,
+    "origin/feat/v5-selfhost",
+    "HEAD~1",
+  ].filter((item): item is string => Boolean(item));
+  for (const ref of refs) {
+    const parsed = gitShowJson<TombstoneFile>(root, ref, TOMBSTONE_REL);
+    if (parsed?.tombstones) return parsed.tombstones;
+  }
+  return [];
+}
+
 export function checkIncidentLedgerSuperset(input: SupersetInput = {}): SupersetResult {
   const errors: string[] = [];
   const root = input.root ?? DEFAULT_ROOT;
-  const baseline = input.baseline ?? (JSON.parse(
-    readFileSync(join(root, "e2e/session-display/incident-ledger-baseline.json"), "utf8"),
-  ) as LedgerBaseline);
+  const baselinePath = join(root, BASELINE_REL);
+  const baseline = input.baseline ?? (JSON.parse(readFileSync(baselinePath, "utf8")) as LedgerBaseline);
+  const previous = input.previousBaseline === undefined
+    ? (input.skipGit ? null : loadPreviousBaseline(root))
+    : input.previousBaseline;
   const merged = input.mergedIncidents ?? ((JSON.parse(
     readFileSync(join(root, "e2e/session-display/incidents.json"), "utf8"),
   ) as IncidentManifest).incidents);
-  const tombstones = input.tombstones ?? ((existsSync(join(root, "e2e/session-display/incident-tombstones.json"))
-    ? (JSON.parse(readFileSync(join(root, "e2e/session-display/incident-tombstones.json"), "utf8")) as TombstoneFile).tombstones
-    : []));
+  const tombstoneFile = existsSync(join(root, TOMBSTONE_REL))
+    ? (JSON.parse(readFileSync(join(root, TOMBSTONE_REL), "utf8")) as TombstoneFile)
+    : { schema: 1, tombstones: [] as Tombstone[] };
+  const tombstones = input.tombstones ?? tombstoneFile.tombstones;
+  const previousTombstones = input.previousTombstones ?? (input.skipGit ? [] : loadPreviousTombstones(root));
   const trailerTips = input.trailerTips ?? parseImportedTrailerTips(
     readFileSync(join(root, "scripts/check-v5-incident-regressions.ts"), "utf8"),
   );
@@ -96,6 +149,30 @@ export function checkIncidentLedgerSuperset(input: SupersetInput = {}): Superset
   if (baseline.schema !== 1) errors.push(`baseline schema must be 1, got ${baseline.schema}`);
   if (!Array.isArray(baseline.incidentIds) || baseline.incidentIds.length === 0) {
     errors.push("baseline.incidentIds must be a non-empty union");
+  }
+
+  if (previous) {
+    const lost = previous.incidentIds.filter((id) => !baseline.incidentIds.includes(id));
+    if (lost.length > 0) {
+      errors.push(`baseline shrank versus previous freeze; missing ${lost.join(", ")}`);
+    }
+    const lostTips = previous.importedTrailerHistoryTips.filter((tip) => !baseline.importedTrailerHistoryTips.includes(tip));
+    if (lostTips.length > 0) {
+      errors.push(`baseline trailer tips shrank versus previous freeze; missing ${lostTips.join(", ")}`);
+    }
+    const lostHist = (previous.historicallyPresentIds ?? []).filter((id) => !(baseline.historicallyPresentIds ?? []).includes(id));
+    if (lostHist.length > 0) {
+      errors.push(`historicallyPresentIds shrank versus previous freeze; missing ${lostHist.join(", ")}`);
+    }
+  }
+
+  const pinPath = join(root, PIN_REL);
+  if (existsSync(pinPath) && input.baseline === undefined) {
+    const expected = (input.pin ?? readFileSync(pinPath, "utf8")).trim().split(/\s+/)[0];
+    const actual = createHash("sha256").update(readFileSync(baselinePath)).digest("hex");
+    if (expected && expected !== actual && !previous) {
+      errors.push(`baseline sha256 ${actual} != pin ${expected} and no previous freeze to prove expansion`);
+    }
   }
 
   const mergedIds = new Set(merged.map((item) => item.id));
@@ -150,6 +227,16 @@ export function checkIncidentLedgerSuperset(input: SupersetInput = {}): Superset
     }
   }
 
+  const prevStoneIds = previousTombstones.map((item) => item.id);
+  const lostStones = prevStoneIds.filter((id) => !tombstoneIds.has(id));
+  if (lostStones.length > 0) {
+    errors.push(`tombstones shrank; removed ${lostStones.join(", ")}`);
+  }
+
+  if (tombstoneFile.schema !== undefined && tombstoneFile.schema !== 1 && input.tombstones === undefined) {
+    errors.push(`tombstones schema must be 1, got ${tombstoneFile.schema}`);
+  }
+
   for (const stone of tombstones) {
     const fields: Array<keyof Tombstone> = [
       "id", "removedAt", "removedInCommit", "reason", "approver", "codeStillInTree",
@@ -161,6 +248,43 @@ export function checkIncidentLedgerSuperset(input: SupersetInput = {}): Superset
     }
     if (stone.removedAt && !/^2026-[0-9]{2}-[0-9]{2}$/.test(stone.removedAt)) {
       errors.push(`tombstone ${stone.id} removedAt must be YYYY-MM-DD`);
+    }
+    if (!/^[0-9a-f]{40}$/.test(stone.removedInCommit ?? "")) {
+      errors.push(`tombstone ${stone.id} removedInCommit must be a full 40-hex SHA`);
+    }
+    const approval = stone.approval;
+    if (!approval?.trailer || !approval.commit) {
+      errors.push(`tombstone ${stone.id} missing approval.trailer/commit`);
+    } else {
+      const match = APPROVAL_RE.exec(approval.trailer);
+      if (!match) {
+        errors.push(`tombstone ${stone.id} approval.trailer must be "Tombstone-Approval: <INC> <approver>"`);
+      } else if (match[1] !== stone.id) {
+        errors.push(`tombstone ${stone.id} approval trailer id mismatch`);
+      }
+      if (!/^[0-9a-f]{40}$/.test(approval.commit)) {
+        errors.push(`tombstone ${stone.id} approval.commit must be a full 40-hex SHA`);
+      }
+      if (!input.skipGit && approval.commit) {
+        try {
+          const body = git(root, "log", "-1", "--format=%B", approval.commit);
+          if (!body.includes(approval.trailer)) {
+            errors.push(`tombstone ${stone.id} approval trailer not in commit ${approval.commit.slice(0, 12)}`);
+          }
+          if (!isAncestor(root, approval.commit)) {
+            errors.push(`tombstone ${stone.id} approval.commit is not a HEAD ancestor`);
+          }
+        } catch {
+          errors.push(`tombstone ${stone.id} approval.commit ${approval.commit.slice(0, 12)} is not readable`);
+        }
+      }
+    }
+    const frozen = baseline.incidents[stone.id];
+    if (frozen) {
+      const allowed = [frozen.rootFixCommit, ...(frozen.coverageCommits ?? [])];
+      if (stone.codeStillInTree && !allowed.some((sha) => stone.codeStillInTree.startsWith(sha) || sha.startsWith(stone.codeStillInTree.slice(0, 8)))) {
+        errors.push(`tombstone ${stone.id} codeStillInTree is not the baseline lineage`);
+      }
     }
     if (!input.skipGit && stone.codeStillInTree && !isAncestor(root, stone.codeStillInTree)) {
       errors.push(`tombstone ${stone.id}: codeStillInTree ${stone.codeStillInTree} is not a HEAD ancestor`);

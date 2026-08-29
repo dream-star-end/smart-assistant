@@ -97,7 +97,7 @@ describe("incident ledger superset", () => {
     assert.ok(!result.ok && result.errors.some((err) => err.includes(PHASE_B)));
   });
 
-  test("explicit tombstone for PHASE-B makes the drop pass", () => {
+  test("B7: fake approver human without Tombstone-Approval trailer is red", () => {
     const selfhost = (JSON.parse(
       readFileSync(path.join(root, "e2e/session-display/incidents.json"), "utf8"),
     ) as { incidents: LedgerIncident[] }).incidents.filter((item) => item.id !== PHASE_B);
@@ -108,16 +108,97 @@ describe("incident ledger superset", () => {
       reason: "fence proofPending baseline; replay fixture",
       approver: "human",
       codeStillInTree: "0002df137",
+      approval: { trailer: "looks-approved", commit: "notasha" },
     };
     const result = checkIncidentLedgerSuperset({
       root,
       skipGit: true,
+      previousBaseline: null,
+      baseline: baseline(),
+      mergedIncidents: selfhost,
+      tombstones: [stone],
+      trailerTips,
+    });
+    assert.equal(result.ok, false);
+    assert.ok(!result.ok && result.errors.some((err) => /approval|40-hex|Tombstone-Approval/.test(err)));
+  });
+
+  test("explicit tombstone with approval trailer format may pass skipGit", () => {
+    const selfhost = (JSON.parse(
+      readFileSync(path.join(root, "e2e/session-display/incidents.json"), "utf8"),
+    ) as { incidents: LedgerIncident[] }).incidents.filter((item) => item.id !== PHASE_B);
+    const stone: Tombstone = {
+      id: PHASE_B,
+      removedAt: "2026-08-27",
+      removedInCommit: `${"24d43a6cf"}${"a".repeat(31)}`,
+      reason: "fence proofPending baseline; replay fixture",
+      approver: "boss",
+      codeStillInTree: "0002df137",
+      approval: {
+        trailer: `Tombstone-Approval: ${PHASE_B} boss`,
+        commit: "b".repeat(40),
+      },
+    };
+    const result = checkIncidentLedgerSuperset({
+      root,
+      skipGit: true,
+      previousBaseline: null,
       baseline: baseline(),
       mergedIncidents: selfhost,
       tombstones: [stone],
       trailerTips,
     });
     assert.equal(result.ok, true, result.ok ? "" : result.errors.join("\n"));
+  });
+
+  test("B6: shrinking baseline together with the ledger is still red", () => {
+    const full = baseline();
+    const shrunk = {
+      ...full,
+      incidentIds: full.incidentIds.filter((id) => id !== PHASE_B),
+      historicallyPresentIds: [],
+    };
+    delete shrunk.incidents[PHASE_B];
+    const merged = (JSON.parse(
+      readFileSync(path.join(root, "e2e/session-display/incidents.json"), "utf8"),
+    ) as { incidents: LedgerIncident[] }).incidents.filter((item) => item.id !== PHASE_B);
+    const result = checkIncidentLedgerSuperset({
+      root,
+      skipGit: true,
+      previousBaseline: full,
+      baseline: shrunk,
+      mergedIncidents: merged,
+      tombstones: [],
+      trailerTips,
+    });
+    assert.equal(result.ok, false);
+    assert.ok(!result.ok && result.errors.some((err) => err.includes("shrank") && err.includes(PHASE_B)));
+  });
+
+  test("B7: deleting a previous tombstone is red", () => {
+    const stone: Tombstone = {
+      id: PHASE_B,
+      removedAt: "2026-08-27",
+      removedInCommit: "a".repeat(40),
+      reason: "x",
+      approver: "boss",
+      codeStillInTree: "0002df137",
+      approval: { trailer: `Tombstone-Approval: ${PHASE_B} boss`, commit: "b".repeat(40) },
+    };
+    const result = checkIncidentLedgerSuperset({
+      root,
+      skipGit: true,
+      previousBaseline: null,
+      baseline: baseline(),
+      mergedIncidents: (JSON.parse(
+        readFileSync(path.join(root, "e2e/session-display/incidents.json"), "utf8"),
+      ) as { incidents: LedgerIncident[] }).incidents,
+      previousTombstones: [stone],
+      tombstones: [],
+      trailerTips,
+    });
+    assert.equal(result.ok, false);
+    assert.ok(!result.ok && result.errors.some((err) => err.includes("tombstones shrank")));
   });
 
   test("dropping a trailer tip fails", () => {

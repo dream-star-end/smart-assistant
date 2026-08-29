@@ -26,19 +26,32 @@ set -e
 export LANG=C
 export LC_ALL=C
 
-# Flavor identity (OCV5-20 §2.7). Missing manifest = skip (legacy artifacts).
+# Flavor identity (OCV5-20 §2.7). Helper is discovered from this script's
+# realpath (release root), never from cwd. Missing helper on a guarded
+# artifact is fail-closed.
 SETUP_HOST_NET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-for _flavor_lib in \
-  "$SETUP_HOST_NET_DIR/../../../scripts/lib/assert-flavor.sh" \
-  "/opt/openclaude/openclaude-v5-selfhost-live/scripts/lib/assert-flavor.sh" \
-  "/opt/openclaude/openclaude-v5/scripts/lib/assert-flavor.sh"; do
-  if [ -f "$_flavor_lib" ]; then
-    # shellcheck disable=SC1090
-    . "$_flavor_lib"
+_flavor_lib=""
+_flavor_probe="$SETUP_HOST_NET_DIR"
+for _ in 1 2 3 4 5 6 7 8; do
+  if [ -f "$_flavor_probe/scripts/lib/assert-flavor.sh" ]; then
+    _flavor_lib="$_flavor_probe/scripts/lib/assert-flavor.sh"
     break
   fi
+  _flavor_next="$(dirname "$_flavor_probe")"
+  [ "$_flavor_next" = "$_flavor_probe" ] && break
+  _flavor_probe="$_flavor_next"
 done
-unset _flavor_lib
+if [ -n "$_flavor_lib" ]; then
+  # shellcheck disable=SC1090
+  . "$_flavor_lib"
+elif [ -f "$SETUP_HOST_NET_DIR/../../../scripts/lib/assert-flavor.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$SETUP_HOST_NET_DIR/../../../scripts/lib/assert-flavor.sh"
+else
+  echo "[ABORT] flavor helper missing for setup-host-net.sh" >&2
+  exit 1
+fi
+unset _flavor_lib _flavor_probe _flavor_next
 
 # P1b channel 化:同一脚本以同等安全姿态(ICC=false + egress 守卫链)建 v3/v5 两套隔离网络。
 # channel 取值优先级:$1 > $OC_RUNTIME_CHANNEL > 默认 v3。v3 取值与历史完全一致(向后兼容)。
@@ -62,7 +75,7 @@ case "$CHANNEL" in
     CCB_HTTPS_PROXY_PORT="18991"
     CURSOR_HTTPS_PROXY_PORT="18992"
     if type assert_flavor_identity >/dev/null 2>&1; then
-      if ! assert_flavor_identity; then
+      if ! assert_flavor_identity --effector "$SETUP_HOST_NET_DIR"; then
         echo "[ABORT] flavor identity refused setup-host-net.sh"
         exit 1
       fi

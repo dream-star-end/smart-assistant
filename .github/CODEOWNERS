@@ -1,0 +1,7 @@
+# P0 flavor / incident ledger ratchet. Human review required to change the
+# freeze, tombstones, or the checker that enforces them.
+e2e/session-display/incident-ledger-baseline.json @dream-star-end
+e2e/session-display/incident-ledger-baseline.sha256 @dream-star-end
+e2e/session-display/incident-tombstones.json @dream-star-end
+scripts/check-incident-ledger-superset.ts @dream-star-end
+packages/commercial/src/flavor/flavor-rules.json @dream-star-end

@@ -5,5 +5,6 @@
   "builder": "deploy-v5.sh",
   "expectedHosts": ["v3-dev-sg"],
   "expectedRoots": ["/opt/openclaude/openclaude-v5-selfhost"],
-  "expectedDbNames": ["openclaude_v5_selfhost"]
+  "expectedDbNames": ["openclaude_v5_selfhost"],
+  "guardGeneration": 1
 }

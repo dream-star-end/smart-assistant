@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": true,
   "flavor": "commercial",
   "sourceCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "builder": "deploy-v5.sh",
