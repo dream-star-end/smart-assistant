@@ -7,7 +7,10 @@ ConditionPathExists=/etc/sing-box/openclaude-cursor-egress-proxy.json
 
 [Service]
 Type=simple
-ExecStartPre=/usr/bin/bash /opt/openclaude/openclaude-v5-selfhost-live/scripts/lib/assert-flavor.sh allows selfhost-unit-install --effector /opt/openclaude/openclaude-v5-selfhost-live/scripts/lib
+# Skip-if-missing: live may not yet have assert-flavor.sh when this unit is
+# installed pre-cutover. Helper present + identity fail is still fail-closed.
+# systemd expands $$ -> $ so bash sees "$h".
+ExecStartPre=/usr/bin/bash -c 'h=/opt/openclaude/openclaude-v5-selfhost-live/scripts/lib/assert-flavor.sh; if [ -x "$$h" ]; then exec "$$h" allows selfhost-unit-install --effector /opt/openclaude/openclaude-v5-selfhost-live/scripts/lib; fi; echo "[WARN] flavor helper missing on live; skip cursor-proxy flavor check" >&2'
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/openclaude-cursor-egress-proxy.json
 Restart=always
 RestartSec=3

@@ -68,4 +68,33 @@ describe('v5 selfhost CCB HTTPS proxy deployment contract', () => {
     )
     assert.match(deploy, /install_aux_units\n  refresh_ccb_proxy_path\n  ensure_model_authority/)
   })
+
+  it('syncs flavor helper next to breakglass hostnet when the source has it', () => {
+    const deploy = read('scripts/deploy-v5-selfhost.sh')
+    assert.match(deploy, /flavor_lib_src="\$src\/scripts\/lib\/assert-flavor\.sh"/)
+    assert.match(deploy, /flavor_rules_src="\$src\/scripts\/lib\/flavor-rules\.json"/)
+    assert.match(deploy, /BOOT_SCRIPT_DIR\/scripts\/lib/)
+  })
+
+  it('setup-host-net skips flavor check when helper is missing and reinserts SSH RETURN after flush', () => {
+    const net = read('packages/commercial/scripts/setup-host-net.sh')
+    assert.match(net, /\[WARN\] flavor helper missing for setup-host-net\.sh; skipping flavor identity check/)
+    assert.equal(net.includes('[ABORT] flavor helper missing for setup-host-net.sh'), false)
+    assert.match(
+      net,
+      /iptables -F "\$V3_HOST_GUARD_CHAIN"[\s\S]*--dport 22 -j RETURN/,
+    )
+  })
+
+  it('cursor-proxy ExecStartPre does not fail-loop when live helper is missing', () => {
+    const unit = read('deploy/v5-selfhost/openclaude-v5-selfhost-cursor-proxy.service')
+    assert.match(unit, /ExecStartPre=/)
+    assert.match(unit, /flavor helper missing on live; skip cursor-proxy flavor check/)
+    assert.equal(
+      /^ExecStartPre=\/usr\/bin\/bash \/opt\/openclaude\/openclaude-v5-selfhost-live\/scripts\/lib\/assert-flavor\.sh /m.test(
+        unit,
+      ),
+      false,
+    )
+  })
 })
