@@ -2521,6 +2521,8 @@ export async function registerCommercial(
           listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
         });
         const listener = await startDesktopTlsListener({
+          role: "master",
+          allowRegister: true,
           handlers: {
             messages: deskMessages,
             serverAuthored: makeServerAuthoredHandler({

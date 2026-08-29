@@ -33,9 +33,14 @@ export interface DesktopTlsHandlers {
   catalog: (req: IncomingMessage, res: ServerResponse, ctx: { hostUuid: string; boundIp: string }) => Promise<void> | void;
 }
 
+export type DesktopTlsRole = "master" | "egress";
+
 export interface DesktopTlsListenerOpts {
   bind?: string;
   port?: number;
+  role?: DesktopTlsRole;
+  /** WSS register belongs on master (same process as DesktopTunnelRegistry). Egress must 404. */
+  allowRegister?: boolean;
   handlers: DesktopTlsHandlers;
   identityRepo?: DesktopIdentityRepo;
   v3Deps?: V3SupervisorDeps | null;
@@ -47,17 +52,33 @@ export interface DesktopTlsListener {
   close(): Promise<void>;
 }
 
-export function desktopTlsBindPort(): { bind: string; port: number } {
+export function desktopTlsBindPort(role: DesktopTlsRole = "master"): { bind: string; port: number } {
+  if (role === "egress") {
+    const bind = process.env.OC_DESKTOP_EGRESS_TLS_BIND?.trim()
+      || process.env.OC_DESKTOP_TLS_BIND?.trim()
+      || "127.0.0.1";
+    const port = Number(process.env.OC_DESKTOP_EGRESS_TLS_PORT ?? "18446");
+    return { bind, port: Number.isFinite(port) && port > 0 ? port : 18446 };
+  }
   const bind = process.env.OC_DESKTOP_TLS_BIND?.trim() || "127.0.0.1";
   const port = Number(process.env.OC_DESKTOP_TLS_PORT ?? "18445");
   return { bind, port: Number.isFinite(port) && port > 0 ? port : 18445 };
+}
+
+/** Master owns WSS register (registry lives in-process). Egress HTTPS must not attach a second registry. */
+export function desktopUpgradeAction(role: DesktopTlsRole, pathname: string): "register" | "not_found" {
+  if (pathname !== DESKTOP_REGISTER_PATH) return "not_found";
+  return role === "egress" ? "not_found" : "register";
 }
 
 export async function startDesktopTlsListener(opts: DesktopTlsListenerOpts): Promise<DesktopTlsListener | null> {
   const flags = await getDesktopFlagSnapshot();
   if (!flags.assembled) return null;
   const origin = await ensureDesktopOriginCert();
-  const { bind, port } = opts.bind && opts.port ? { bind: opts.bind, port: opts.port } : desktopTlsBindPort();
+  const role: DesktopTlsRole = opts.role ?? "master";
+  const allowRegister = opts.allowRegister ?? role !== "egress";
+  const explicit = opts.bind !== undefined && opts.port !== undefined;
+  const { bind, port } = explicit ? { bind: opts.bind!, port: opts.port! } : desktopTlsBindPort(role);
   const repo = opts.identityRepo ?? createPgDesktopIdentityRepo();
 
   const server = createHttpsServer(
@@ -85,7 +106,8 @@ export async function startDesktopTlsListener(opts: DesktopTlsListenerOpts): Pro
 
   server.on("upgrade", (req, socket, head) => {
     const path = pathnameOf(req);
-    if (path !== DESKTOP_REGISTER_PATH) {
+    const action = allowRegister ? desktopUpgradeAction("master", path) : desktopUpgradeAction("egress", path);
+    if (action !== "register") {
       socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
@@ -101,10 +123,12 @@ export async function startDesktopTlsListener(opts: DesktopTlsListenerOpts): Pro
     });
   });
 
-  rootLogger.info("desktop_tls_listening", { bind, port });
+  const addr = server.address();
+  const boundPort = typeof addr === "object" && addr ? addr.port : port;
+  rootLogger.info("desktop_tls_listening", { bind, port: boundPort, role, allowRegister });
   return {
     server,
-    address: { host: bind, port },
+    address: { host: bind, port: boundPort },
     close: () => new Promise((resolve) => {
       server.close(() => resolve());
     }),
