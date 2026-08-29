@@ -81,6 +81,7 @@ export async function recoverInterruptedSendToAgentIntents(
   opts?: {
     callbackOwner?: 'job' | 'intent'
     resolveJob?: (jobId: string) => DelegateJobSnapshot | undefined
+    ensureCallback?: (job: DelegateJobSnapshot, intent: SendToAgentIntent) => Promise<boolean>
   },
 ): Promise<{ recovered: number; retained: number; malformed: number; skippedShadow?: number }> {
   const dir = intentDir(env)
@@ -111,15 +112,19 @@ export async function recoverInterruptedSendToAgentIntents(
       job: job ? { jobId: job.id, state: job.state } : undefined,
     })
     if (decision.action === 'drop_shadow') {
-      await rm(path, { force: true }).catch(() => {})
+      // Job still running: keep the shadow. Completer is the consumer; do not
+      // emit a legacy interrupt and do not delete the only recovery record.
       skippedShadow += 1
       continue
     }
     if (decision.action === 'ensure_callback') {
-      // Completer is the sole consumer: drop the shadow; do not emit the
-      // legacy "服务重启时未确认完成" interrupt next to a completion.
-      await rm(path, { force: true }).catch(() => {})
-      skippedShadow += 1
+      const ok = job && opts?.ensureCallback ? await opts.ensureCallback(job, intent) : false
+      if (ok) {
+        await rm(path, { force: true }).catch(() => {})
+        skippedShadow += 1
+      } else {
+        retained += 1
+      }
       continue
     }
     try {

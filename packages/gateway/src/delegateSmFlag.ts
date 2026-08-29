@@ -16,5 +16,7 @@ export function resolveDelegateCallbackOwner(
   const raw = String(env.OC_DELEGATE_CALLBACK_OWNER ?? '').trim().toLowerCase()
   if (raw === 'intent') return 'intent'
   if (raw === 'job') return 'job'
+  // SM on still defaults to job, but Completer + snapshot persist must be live
+  // before any shadow is deleted (see recover + shutdown).
   return isDelegateSmEnabled(env) ? 'job' : 'intent'
 }

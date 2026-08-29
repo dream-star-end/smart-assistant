@@ -3,7 +3,7 @@
  * use the same bounded foreground wait loop as `delegate-wait`. Identity/depth come from the
  * signed context file (gateway-issued), never from Shell env or CLI flags.
  */
-import { createHash } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import {
   interpretDelegateStartBody,
@@ -26,6 +26,8 @@ export type DelegateCliArgs = {
   model?: string
   toolsets?: string[]
   resumeSessionKey?: string
+  /** Opaque per-request id. Sequential same-content resumes must mint a new one. */
+  idempotencyKey?: string
   allowSelf?: boolean
 }
 
@@ -62,12 +64,9 @@ export function buildDelegateStartBody(args: DelegateCliArgs): Record<string, un
     ...(resumeSessionKey ? { resumeSessionKey } : {}),
     ...(resumeSessionKey
       ? {
-          idempotencyKey: delegateResumeIdempotencyKey({
-            resumeSessionKey,
-            goal: args.goal,
-            context: args.context,
-            model: args.model,
-          }),
+          idempotencyKey:
+            args.idempotencyKey?.trim() ||
+            delegateResumeIdempotencyKey({ resumeSessionKey }),
         }
       : {}),
     ...(args.allowSelf ? { allowSelf: true } : {}),
@@ -78,19 +77,10 @@ export function buildDelegateStartBody(args: DelegateCliArgs): Record<string, un
 
 export function delegateResumeIdempotencyKey(args: {
   resumeSessionKey: string
-  goal: string
-  context?: string
-  model?: string
+  nonce?: string
 }): string {
-  const digest = createHash('sha256')
-    .update(args.goal)
-    .update('\0')
-    .update(args.context ?? '')
-    .update('\0')
-    .update(args.model ?? '')
-    .digest('hex')
-    .slice(0, 16)
-  return `resume:${args.resumeSessionKey}:${digest}`
+  const nonce = args.nonce ?? randomBytes(8).toString('hex')
+  return `resume:${args.resumeSessionKey}:${nonce}`
 }
 
 export function requestReviewArgs(

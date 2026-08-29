@@ -32,6 +32,8 @@ export type DelegateResumeClaim = {
   /** False on idempotent replay: caller must not spawn a second child. */
   dispatchGranted: boolean
   replay: boolean
+  /** Bound job for an in-flight replay; never an older session sibling. */
+  jobId?: string
 }
 
 export type DelegateResumeReject = {
@@ -75,20 +77,24 @@ function attemptId(sessionKey: string, idempotencyKey: string): string {
   return `${sessionKey}\0${idempotencyKey}`
 }
 
+const DEFAULT_ATTEMPT_TTL_MS = 2 * 60 * 60_000
+const DEFAULT_MAX_ATTEMPTS = 256
+
 type ResumeAttempt = {
   sessionKey: string
   idempotencyKey: string
-  outcome: 'dispatching' | 'rejected'
-  httpStatus?: 400 | 409 | 503
-  message?: string
-  dispatchGranted: boolean
+  jobId?: string
+  createdAt: number
 }
 
 export class DelegateResumeRegistry {
   private readonly bindings = new Map<string, DelegateResumeBinding>()
   /** Occupancy fence: active = running, retiring = shutdown in progress. */
   private readonly reserved = new Map<string, 'active' | 'retiring'>()
-  /** Resume request idempotency: same (sessionKey, idempotencyKey) never grants a second dispatch. */
+  /**
+   * In-flight accepted requests only. Occupancy 409 is never cached, so a
+   * later legal retry after release can dispatch. Bound to an exact jobId.
+   */
   private readonly attempts = new Map<string, ResumeAttempt>()
   private readonly ttlMs: number
   private readonly maxBindings: number
@@ -124,19 +130,10 @@ export class DelegateResumeRegistry {
     const resumeKey = normalizeResumeSessionKey(input.resumeSessionKey)
     const idempotencyKey = normalizeResumeSessionKey(input.idempotencyKey)
 
+    this.pruneAttempts()
     if (resumeKey && idempotencyKey) {
       const existing = this.attempts.get(attemptId(resumeKey, idempotencyKey))
-      if (existing) {
-        if (existing.outcome === 'rejected') {
-          return {
-            ok: false,
-            httpStatus: existing.httpStatus ?? 409,
-            message: existing.message ?? DELEGATE_RESUME_OCCUPIED_MESSAGE,
-            evictedKeys,
-            dispatchGranted: false,
-            replay: true,
-          }
-        }
+      if (existing && this.reserved.has(resumeKey)) {
         return {
           ok: true,
           sessionKey: resumeKey,
@@ -144,7 +141,11 @@ export class DelegateResumeRegistry {
           evictedKeys,
           dispatchGranted: false,
           replay: true,
+          jobId: existing.jobId,
         }
+      }
+      if (existing && !this.reserved.has(resumeKey)) {
+        this.attempts.delete(attemptId(resumeKey, idempotencyKey))
       }
     }
 
@@ -231,34 +232,41 @@ export class DelegateResumeRegistry {
   }
 
   private reject(
-    sessionKey: string,
-    idempotencyKey: string | undefined,
+    _sessionKey: string,
+    _idempotencyKey: string | undefined,
     httpStatus: 400 | 409 | 503,
     message: string,
     evictedKeys: string[],
   ): DelegateResumeReject {
-    if (idempotencyKey) {
-      this.attempts.set(attemptId(sessionKey, idempotencyKey), {
-        sessionKey,
-        idempotencyKey,
-        outcome: 'rejected',
-        httpStatus,
-        message,
-        dispatchGranted: false,
-      })
-    }
+    // Occupancy/validation rejects are not cached: a later legal retry after
+    // release or a corrected request must not be permanently 409'd.
     return { ok: false, httpStatus, message, evictedKeys, dispatchGranted: false, replay: false }
   }
 
   private grantDispatch(sessionKey: string, idempotencyKey: string | undefined): void {
     this.dispatchGrants += 1
     if (!idempotencyKey) return
+    this.evictAttemptsForCapacity()
     this.attempts.set(attemptId(sessionKey, idempotencyKey), {
       sessionKey,
       idempotencyKey,
-      outcome: 'dispatching',
-      dispatchGranted: true,
+      createdAt: this.now(),
     })
+  }
+
+  bindJob(sessionKey: string, idempotencyKey: string | undefined, jobId: string): void {
+    if (!idempotencyKey) return
+    const id = attemptId(sessionKey, idempotencyKey)
+    const existing = this.attempts.get(id)
+    if (existing) existing.jobId = jobId
+    else {
+      this.attempts.set(id, {
+        sessionKey,
+        idempotencyKey,
+        jobId,
+        createdAt: this.now(),
+      })
+    }
   }
 
   markRetiring(sessionKey: string): void {
@@ -268,6 +276,7 @@ export class DelegateResumeRegistry {
   /** Drop occupancy, keep the binding so a later turn can resume. */
   release(sessionKey: string): void {
     this.reserved.delete(sessionKey)
+    this.clearAttemptsForSession(sessionKey)
   }
 
   /**
@@ -276,7 +285,38 @@ export class DelegateResumeRegistry {
    */
   abort(sessionKey: string, dropBinding: boolean): void {
     this.reserved.delete(sessionKey)
+    this.clearAttemptsForSession(sessionKey)
     if (dropBinding) this.bindings.delete(sessionKey)
+  }
+
+  private clearAttemptsForSession(sessionKey: string): void {
+    for (const [key, attempt] of this.attempts) {
+      if (attempt.sessionKey === sessionKey) this.attempts.delete(key)
+    }
+  }
+
+  private pruneAttempts(now = this.now()): void {
+    for (const [key, attempt] of this.attempts) {
+      if (this.reserved.has(attempt.sessionKey)) continue
+      if (now - attempt.createdAt <= DEFAULT_ATTEMPT_TTL_MS) continue
+      this.attempts.delete(key)
+    }
+  }
+
+  private evictAttemptsForCapacity(): void {
+    while (this.attempts.size >= DEFAULT_MAX_ATTEMPTS) {
+      let oldestKey: string | undefined
+      let oldestAt = Infinity
+      for (const [key, attempt] of this.attempts) {
+        if (this.reserved.has(attempt.sessionKey)) continue
+        if (attempt.createdAt < oldestAt) {
+          oldestAt = attempt.createdAt
+          oldestKey = key
+        }
+      }
+      if (!oldestKey) break
+      this.attempts.delete(oldestKey)
+    }
   }
 
   get(sessionKey: string): DelegateResumeBinding | undefined {
@@ -301,6 +341,7 @@ export class DelegateResumeRegistry {
       if (this.reserved.has(key)) continue
       if (now - binding.lastUsedAt <= this.ttlMs) continue
       this.bindings.delete(key)
+      this.clearAttemptsForSession(key)
       evicted.push(key)
     }
     return evicted
@@ -320,6 +361,7 @@ export class DelegateResumeRegistry {
       }
       if (!oldestKey) break
       this.bindings.delete(oldestKey)
+      this.clearAttemptsForSession(oldestKey)
       evicted.push(oldestKey)
     }
     return evicted

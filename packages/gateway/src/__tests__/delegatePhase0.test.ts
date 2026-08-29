@@ -15,7 +15,8 @@ import {
   DelegateResumeRegistry,
 } from '../delegateResume.js'
 import { decideSendToAgentIntentRecovery } from '../delegateCallbackOwner.js'
-import { enqueueCronOccurrenceJob } from '../delegateCronIdempotency.js'
+import { enqueueCronOccurrenceJob, settleCronDelegateJob } from '../delegateCronIdempotency.js'
+import { persistDelegateJobSnapshots, restoreDelegateJobSnapshots } from '../delegateCompleter.js'
 import {
   persistSendToAgentIntent,
   recoverInterruptedSendToAgentIntents,
@@ -400,7 +401,7 @@ describe('B2 callback owner', () => {
       assert.equal(summary.skippedShadow, 1)
       assert.equal(summary.recovered, 0)
       assert.deepEqual(delivered, [])
-      assert.deepEqual(await readdir(dir), [])
+      assert.deepEqual(await readdir(dir), ['dlgjob-live.json'])
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -426,5 +427,209 @@ describe('B3 cron idempotency', () => {
     assert.equal(b.reused, true)
     assert.equal(a.jobId, b.jobId)
     assert.equal(store.size(), 1)
+  })
+})
+
+describe('auditor probes: resume key lifecycle', () => {
+  it('occupancy 409 is not cached: after release the same key can dispatch again', () => {
+    const reg = new DelegateResumeRegistry({ now: () => 10, nonce: () => 'k1' })
+    const minted = reg.preflight({
+      parentSessionKey: 'p',
+      targetAgentId: 'auditor',
+      sourceAgent: 'main',
+      idempotencyKey: 'K',
+    })
+    assert.equal(minted.ok, true)
+    if (!minted.ok) return
+    const occupied = reg.preflight({
+      resumeSessionKey: minted.sessionKey,
+      parentSessionKey: 'p',
+      targetAgentId: 'auditor',
+      sourceAgent: 'main',
+      idempotencyKey: 'K2',
+    })
+    assert.equal(occupied.ok, false)
+    if (occupied.ok) return
+    assert.equal(occupied.httpStatus, 409)
+    assert.equal(occupied.replay, false)
+    reg.release(minted.sessionKey)
+    const retry = reg.preflight({
+      resumeSessionKey: minted.sessionKey,
+      parentSessionKey: 'p',
+      targetAgentId: 'auditor',
+      sourceAgent: 'main',
+      idempotencyKey: 'K2',
+    })
+    assert.equal(retry.ok, true)
+    if (!retry.ok) return
+    assert.equal(retry.dispatchGranted, true)
+    assert.equal(retry.replay, false)
+  })
+
+  it('accepted same key while in-flight replays the bound jobId, not an older sibling', () => {
+    const reg = new DelegateResumeRegistry({ now: () => 10, nonce: () => 'k2' })
+    const minted = reg.preflight({
+      parentSessionKey: 'p',
+      targetAgentId: 'auditor',
+      sourceAgent: 'main',
+      idempotencyKey: 'req-j2',
+    })
+    assert.equal(minted.ok, true)
+    if (!minted.ok) return
+    reg.bindJob(minted.sessionKey, 'req-j2', 'dlgjob-j2')
+    const replay = reg.preflight({
+      resumeSessionKey: minted.sessionKey,
+      parentSessionKey: 'p',
+      targetAgentId: 'auditor',
+      sourceAgent: 'main',
+      idempotencyKey: 'req-j2',
+    })
+    assert.equal(replay.ok, true)
+    if (!replay.ok) return
+    assert.equal(replay.replay, true)
+    assert.equal(replay.dispatchGranted, false)
+    assert.equal(replay.jobId, 'dlgjob-j2')
+  })
+
+  it('flag-off same idempotencyKey one-shots mint two jobs and two dispatches', async () => {
+    resetDelegateContextKeyForTests()
+    const gw = makeGateway(false)
+    const a = await call(gw, 'handleDelegateTask', {
+      goal: 'one-shot',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      idempotencyKey: 'same-one-shot',
+      async: true,
+    })
+    const b = await call(gw, 'handleDelegateTask', {
+      goal: 'one-shot',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      idempotencyKey: 'same-one-shot',
+      async: true,
+    })
+    assert.equal(a.status, 200)
+    assert.equal(b.status, 200)
+    assert.notEqual(a.body.jobId, b.body.jobId)
+    assert.equal(gw._delegateJobs.size(), 2)
+  })
+})
+
+describe('auditor probes: owner fence on production complete', () => {
+  it('SM owned job complete() without fence does not go terminal', () => {
+    const store = new DelegateJobStore({ sm: true, ttlMs: 60_000, now: () => 1 })
+    const created = store.create('coding-assistant')
+    assert.ok('jobId' in created)
+    store.complete(created.jobId, { httpStatus: 200, body: { ok: true } })
+    assert.equal(store.snapshotOf(created.jobId)?.state, 'running')
+    const snap = store.snapshotOf(created.jobId)!
+    store.complete(
+      created.jobId,
+      { httpStatus: 200, body: { ok: true } },
+      { claimToken: snap.claimToken!, fencingEpoch: snap.fencingEpoch },
+    )
+    assert.equal(store.snapshotOf(created.jobId)?.state, 'completed')
+  })
+})
+
+describe('auditor probes: queue_full does not leave a job row', () => {
+  it('SM admit full rejects before create', async () => {
+    resetDelegateContextKeyForTests()
+    const prev = process.env.OC_DELEGATE_SM
+    process.env.OC_DELEGATE_SM = '1'
+    try {
+      const gw = makeGateway(false)
+      gw._delegateJobs = new DelegateJobStore({ sm: true, ttlMs: 60_000 })
+      gw._delegateQueueWaiters = new Map()
+      for (let i = 0; i < 8; i++) gw._delegateQueueWaiters.set(`w${i}`, () => {})
+      gw._activeDelegations = 5
+      const r = await call(gw, 'handleDelegateTask', {
+        goal: 'no-row',
+        sourceAgent: 'main',
+        parentSessionKey: PARENT_KEY,
+        async: true,
+      })
+      assert.equal(r.status, 429)
+      assert.equal(r.body.failure_class, 'capacity_queue_full')
+      assert.equal(gw._delegateJobs.size(), 0)
+    } finally {
+      if (prev === undefined) delete process.env.OC_DELEGATE_SM
+      else process.env.OC_DELEGATE_SM = prev
+    }
+  })
+
+  it('dropIfUnclaimed removes a provisional queued row after late queue_full', () => {
+    const store = new DelegateJobStore({ sm: true, ttlMs: 60_000 })
+    const created = store.create('coding-assistant', { queued: true })
+    assert.ok('jobId' in created)
+    assert.equal(store.dropIfUnclaimed(created.jobId), true)
+    assert.equal(store.size(), 0)
+    assert.equal(store.get(created.jobId).status, 'expired')
+  })
+})
+
+describe('auditor probes: cron terminal frees capacity', () => {
+  it('257 distinct occurrences do not exhaust the store after settle', () => {
+    const store = new DelegateJobStore({ sm: true, ttlMs: 60_000, maxJobs: 256 })
+    for (let i = 0; i < 257; i++) {
+      const enq = enqueueCronOccurrenceJob(store, {
+        cronJobId: 'remind-cap',
+        dueMinuteKey: 1_700_000_000 + i,
+        agentId: 'main',
+      })
+      assert.ok(!('error' in enq), `occurrence ${i} should enqueue`)
+      if ('error' in enq) return
+      assert.equal(settleCronDelegateJob(store, enq.jobId, 'completed'), true)
+    }
+    assert.ok(store.nonTerminalCount() < 256)
+    assert.ok(store.size() >= 1)
+  })
+})
+
+describe('auditor probes: shutdown keeps recovery records', () => {
+  it('persist snapshots survive close; drop_shadow does not delete intent', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-snap-'))
+    const intentDir = await mkdtemp(join(tmpdir(), 'oc-sta-keep-'))
+    const env = {
+      OPENCLAUDE_DELEGATE_JOB_SNAPSHOT_DIR: dir,
+      OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR: intentDir,
+    } as NodeJS.ProcessEnv
+    try {
+      const store = new DelegateJobStore({ sm: true, ttlMs: 60_000 })
+      const created = store.create('coding-assistant', {
+        queued: true,
+        callback: 'origin-inject',
+        sessionKey: 'sk',
+      })
+      assert.ok('jobId' in created)
+      await persistSendToAgentIntent({
+        v: 1,
+        jobId: created.jobId,
+        originSessionKey: 'agent:main:webchat:dm:sess-1',
+        agentId: 'coding-assistant',
+        goal: 'x',
+        createdAt: 1,
+      }, env)
+      const n = await persistDelegateJobSnapshots(store, env)
+      assert.equal(n, 1)
+      store.close()
+      assert.equal(store.size(), 0)
+      const restored = new DelegateJobStore({ sm: true, ttlMs: 60_000 })
+      await restoreDelegateJobSnapshots(restored, env)
+      assert.equal(restored.snapshotOf(created.jobId)?.state, 'queued')
+      const delivered: string[] = []
+      await recoverInterruptedSendToAgentIntents(async (intent) => {
+        delivered.push(intent.jobId)
+        return true
+      }, env, {
+        callbackOwner: 'job',
+        resolveJob: (id) => restored.snapshotOf(id),
+      })
+      assert.deepEqual(delivered, [])
+      assert.deepEqual(await readdir(intentDir), [`${created.jobId}.json`])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(intentDir, { recursive: true, force: true })
+    }
   })
 })

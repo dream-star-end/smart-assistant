@@ -77,7 +77,7 @@ import {
   type LocalExecutionDecision,
 } from './server.js'
 import { localExecutionRejectCode, type LocalExecutionRejectCode } from './modelCatalogClient.js'
-import { enqueueCronOccurrenceJob } from './delegateCronIdempotency.js'
+import { enqueueCronOccurrenceJob, settleCronDelegateJob } from './delegateCronIdempotency.js'
 import { isDelegateSmEnabled } from './delegateSmFlag.js'
 import type { DelegateJobStore } from './delegateJobs.js'
 import {
@@ -1482,6 +1482,9 @@ export class CronScheduler {
                     if (record.state === 'prepared') {
                       writeOccurrence({ ...record, state: 'executing', updatedAt: Date.now() })
                     }
+                    if (isDelegateSmEnabled() && this.delegateJobs && record?.delegateJobId) {
+                      this.delegateJobs.claimQueued(record.delegateJobId)
+                    }
                     if (!isOrigin) {
                       // origin-session must NOT consume lastRun here: settle
                       // failures after this point stay retryable, and
@@ -1619,6 +1622,17 @@ export class CronScheduler {
             } else if (occurrence?.state === 'prepared' || occurrence?.state === 'executing') {
               settleOccurrence(occurrence, 'execution_terminal')
             }
+          }
+          const dlg = readOccurrence(deliveryContext.deliveryId)?.delegateJobId
+          if (isDelegateSmEnabled() && this.delegateJobs && dlg) {
+            const silent = outcome.kind === 'silent'
+            const failed = outcome.kind === 'terminal_failure'
+            settleCronDelegateJob(
+              this.delegateJobs,
+              dlg,
+              failed ? 'failed' : silent ? 'skipped_silent' : 'completed',
+              failed && 'code' in outcome ? String(outcome.code) : undefined,
+            )
           }
           // A one-shot remains enabled across retryable failures. Completed,
           // silent, permanent and explicitly exhausted outcomes consume it.

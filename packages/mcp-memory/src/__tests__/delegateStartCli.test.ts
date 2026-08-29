@@ -55,7 +55,7 @@ describe('delegateStartCli', () => {
     assert.equal(body.allowSelf, true)
   })
 
-  it('resume start body carries a stable idempotencyKey derived from session+goal', () => {
+  it('resume start body carries an opaque per-request idempotencyKey, not a content hash', () => {
     const args = {
       agentId: 'auditor',
       goal: '复审',
@@ -65,10 +65,10 @@ describe('delegateStartCli', () => {
     const b = buildDelegateStartBody(args)
     assert.equal(a.resumeSessionKey, args.resumeSessionKey)
     assert.equal(typeof a.idempotencyKey, 'string')
-    assert.match(String(a.idempotencyKey), /^resume:agent:auditor:delegate:main:1:abcd:/)
-    assert.equal(a.idempotencyKey, b.idempotencyKey)
-    const other = buildDelegateStartBody({ ...args, goal: '另一份草稿' })
-    assert.notEqual(other.idempotencyKey, a.idempotencyKey)
+    assert.match(String(a.idempotencyKey), /^resume:agent:auditor:delegate:main:1:abcd:[0-9a-f]{16}$/)
+    assert.notEqual(a.idempotencyKey, b.idempotencyKey)
+    const pinned = buildDelegateStartBody({ ...args, idempotencyKey: 'resume:agent:auditor:delegate:main:1:abcd:fixedkey01' })
+    assert.equal(pinned.idempotencyKey, 'resume:agent:auditor:delegate:main:1:abcd:fixedkey01')
   })
 
   it('start+wait: one start then wait loop until done', async () => {

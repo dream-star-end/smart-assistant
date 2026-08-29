@@ -932,9 +932,6 @@ async function runAsyncDelegateToAgent(
       ? {
           idempotencyKey: delegateResumeIdempotencyKey({
             resumeSessionKey: args.resumeSessionKey,
-            goal: args.goal,
-            context: args.context,
-            model: args.model,
           }),
         }
       : {}),

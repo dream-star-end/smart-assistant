@@ -197,17 +197,17 @@ export class DelegateJobStore {
   create(
     agentId: string,
     meta?: DelegateCreateMeta,
-  ): { jobId: string } | { error: 'capacity' } {
+  ): { jobId: string; reused?: boolean } | { error: 'capacity' } {
     this.sweep()
     const idempotencyKey =
-      typeof meta?.idempotencyKey === 'string' && meta.idempotencyKey.trim()
+      this.sm && typeof meta?.idempotencyKey === 'string' && meta.idempotencyKey.trim()
         ? meta.idempotencyKey.trim()
         : undefined
     if (idempotencyKey) {
       const existingId = this.byIdempotency.get(idempotencyKey)
-      if (existingId && this.jobs.has(existingId)) return { jobId: existingId }
+      if (existingId && this.jobs.has(existingId)) return { jobId: existingId, reused: true }
     }
-    if (this.jobs.size >= this.maxJobs) return { error: 'capacity' }
+    if (this.nonTerminalCount() >= this.maxJobs) return { error: 'capacity' }
     const jobId = `dlgjob-${this.now().toString(36)}-${randomBytes(6).toString('hex')}`
     const createdAt = this.now()
     const queued = this.sm && meta?.queued === true
@@ -260,8 +260,8 @@ export class DelegateJobStore {
   complete(jobId: string, result: DelegateJobHttpResult, fence?: { claimToken: string; fencingEpoch: number }): void {
     const job = this.jobs.get(jobId)
     if (!job || job.result) return
-    if (this.sm && fence) {
-      if (job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) return
+    if (this.sm && job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) return
     }
     if (this.sm) {
       const next: DelegateJobState = result.httpStatus >= 200 && result.httpStatus < 300 ? 'completed' : 'failed'
@@ -308,7 +308,7 @@ export class DelegateJobStore {
     if (!job || isDelegateTerminalState(job.state)) return false
     if (job.claimToken) {
       if (!args.claimToken || args.claimToken !== job.claimToken) return false
-      if (args.fencingEpoch !== undefined && args.fencingEpoch !== job.fencingEpoch) return false
+      if (args.fencingEpoch === undefined || args.fencingEpoch !== job.fencingEpoch) return false
     }
     const next = args.nextState ?? 'failed'
     const gate = assertDelegateTransition(job.state, next)
@@ -546,6 +546,86 @@ export class DelegateJobStore {
 
   size(): number {
     return this.jobs.size
+  }
+
+  nonTerminalCount(): number {
+    let n = 0
+    for (const job of this.jobs.values()) {
+      if (!isDelegateTerminalState(job.state)) n++
+    }
+    return n
+  }
+
+  /**
+   * Undo a provisional Enqueue that lost the waiter race (queue_full).
+   * Only unclaimed queued rows; never a running owner.
+   */
+  dropIfUnclaimed(jobId: string): boolean {
+    const job = this.jobs.get(jobId)
+    if (!job || job.state !== 'queued' || job.result || job.claimToken) return false
+    const waiters = job.waiters.splice(0)
+    for (const w of waiters) w({ status: 'expired', jobId, ...(this.sm ? { failure_class: 'capacity_queue_full' as const } : {}) })
+    if (job.idempotencyKey) this.byIdempotency.delete(job.idempotencyKey)
+    this.jobs.delete(jobId)
+    return true
+  }
+
+  snapshotsForPersist(): DelegateJobSnapshot[] {
+    const out: DelegateJobSnapshot[] = []
+    for (const job of this.jobs.values()) {
+      if (!isDelegateTerminalState(job.state) || job.callbackState === 'pending' || job.callbackState === 'injecting') {
+        out.push(this.snapshot(job))
+      }
+    }
+    return out
+  }
+
+  patchCallbackState(
+    jobId: string,
+    next: DelegateCallbackState,
+    fence?: { claimToken: string; fencingEpoch: number },
+  ): boolean {
+    const job = this.jobs.get(jobId)
+    if (!job) return false
+    if (job.claimToken && fence) {
+      if (job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) return false
+    }
+    job.callbackState = next
+    return true
+  }
+
+  restoreSnapshot(snap: DelegateJobSnapshot, agentId = 'restored'): void {
+    if (this.jobs.has(snap.id)) return
+    this.jobs.set(snap.id, {
+      id: snap.id,
+      agentId,
+      createdAt: this.now(),
+      expiresAt: null,
+      sessionKey: snap.sessionKey,
+      result: isDelegateTerminalState(snap.state)
+        ? {
+            httpStatus: snap.state === 'completed' ? 200 : 409,
+            body: { failure_class: snap.failureClass, error: snap.failureDetail },
+          }
+        : null,
+      waiters: [],
+      state: snap.state,
+      failureClass: snap.failureClass,
+      failureDetail: snap.failureDetail,
+      generation: snap.generation,
+      ownerInstanceId: snap.ownerInstanceId,
+      ownerLeaseUntil: snap.ownerLeaseUntil ?? null,
+      claimToken: snap.claimToken,
+      attemptNo: snap.attemptNo,
+      fencingEpoch: snap.fencingEpoch,
+      checkpointKind: snap.checkpointKind,
+      callback: snap.callback,
+      callbackState: snap.callbackState,
+      callbackEpoch: snap.callbackEpoch,
+      idempotencyKey: snap.idempotencyKey,
+      kind: snap.kind,
+    })
+    if (snap.idempotencyKey) this.byIdempotency.set(snap.idempotencyKey, snap.id)
   }
 
   close(): void {
