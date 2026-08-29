@@ -26,6 +26,7 @@ import {
   issueDelegateContextToken,
   resetDelegateContextKeyForTests,
 } from '../delegateContext.js'
+import { DELEGATE_MAX_CONCURRENT_DELEGATIONS } from '../delegateCapacity.js'
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-phase0-delegate'
@@ -542,7 +543,7 @@ describe('auditor probes: queue_full does not leave a job row', () => {
       gw._delegateJobs = new DelegateJobStore({ sm: true, ttlMs: 60_000 })
       gw._delegateQueueWaiters = new Map()
       for (let i = 0; i < 8; i++) gw._delegateQueueWaiters.set(`w${i}`, () => {})
-      gw._activeDelegations = 5
+      gw._activeDelegations = DELEGATE_MAX_CONCURRENT_DELEGATIONS
       const r = await call(gw, 'handleDelegateTask', {
         goal: 'no-row',
         sourceAgent: 'main',

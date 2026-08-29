@@ -219,7 +219,7 @@ describe('capacity_timeout production path leaves no executable job', () => {
     process.env.OC_DELEGATE_SM = '1'
     process.env.OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS = '80'
     const gw = makeGateway()
-    gw._activeDelegations = 4
+    gw._activeDelegations = delegateConcurrencyCap(false)
     const r = await call(gw, 'handleDelegateTask', {
       goal: 'timeout-no-spawn',
       sourceAgent: 'main',
@@ -248,7 +248,7 @@ describe('capacity_timeout production path leaves no executable job', () => {
     process.env.OC_DELEGATE_SM = '1'
     process.env.OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS = '5000'
     const gw = makeGateway()
-    gw._activeDelegations = 4
+    gw._activeDelegations = delegateConcurrencyCap(false)
     const r = await call(gw, 'handleDelegateTask', {
       goal: 'reject-vs-claim',
       sourceAgent: 'main',
@@ -276,7 +276,7 @@ describe('capacity_timeout production path leaves no executable job', () => {
     resetDelegateContextKeyForTests()
     process.env.OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS = '80'
     const gw = makeGateway()
-    gw._activeDelegations = 4
+    gw._activeDelegations = delegateConcurrencyCap(false)
     const nonReview = await call(gw, 'handleDelegateTask', {
       goal: 'cap-copy',
       sourceAgent: 'main',
@@ -287,7 +287,7 @@ describe('capacity_timeout production path leaves no executable job', () => {
     assert.match(nonReview.body.error, /in-use 4\/4/)
     assert.doesNotMatch(nonReview.body.error, /max 5 review/)
 
-    gw._activeDelegations = 5
+    gw._activeDelegations = DELEGATE_MAX_CONCURRENT_DELEGATIONS
     const review = await call(
       gw,
       'handleDelegateTask',

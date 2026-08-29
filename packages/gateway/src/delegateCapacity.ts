@@ -1,7 +1,10 @@
 /**
- * Delegate concurrency-cap copy. Review vs non-review use different effective
- * maxima (reserved slot). The numeric caps themselves live on Gateway;
- * this module only formats the user/model-visible reject string.
+ * Single source of truth for delegate concurrency caps.
+ *
+ * Review vs non-review use different effective maxima (one reserved slot).
+ * Gateway's resource gate (`_checkDelegateResourceGate`) and the reject copy
+ * (`formatDelegateConcurrencyReject`) both read these values via
+ * `delegateConcurrencyCap` — do not duplicate the numeric literals in server.ts.
  */
 
 export const DELEGATE_MAX_CONCURRENT_DELEGATIONS = 5

@@ -298,8 +298,17 @@ describe('sessionManager mount contract', () => {
   })
 
   it('does not tighten delegate limits without usage evidence', () => {
+    // Cap literals live only in delegateCapacity.ts. Same protection as the old
+    // server.ts `/MAX_CONCURRENT_DELEGATIONS = 5/` source match: bumping the
+    // number without evidence fails this test. Gate + reject copy both call
+    // delegateConcurrencyCap, so a second assignment in server.ts is also a fail.
+    const capSrc = readFileSync(new URL('../delegateCapacity.ts', import.meta.url), 'utf8')
+    assert.match(capSrc, /export const DELEGATE_MAX_CONCURRENT_DELEGATIONS = 5/)
+    assert.match(capSrc, /export const DELEGATE_REVIEW_RESERVED_SLOTS = 1/)
     const src = readFileSync(new URL('../server.ts', import.meta.url), 'utf8')
-    assert.match(src, /MAX_CONCURRENT_DELEGATIONS = 5/)
     assert.match(src, /MEMBER_DELEGATIONS_PER_TURN_DEFAULT = 8/)
+    assert.match(src, /delegateConcurrencyCap\(/)
+    assert.doesNotMatch(src, /MAX_CONCURRENT_DELEGATIONS\s*=\s*\d+/)
+    assert.doesNotMatch(src, /DELEGATE_REVIEW_RESERVED_SLOTS\s*=\s*\d+/)
   })
 })

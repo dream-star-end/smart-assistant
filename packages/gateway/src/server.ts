@@ -80,7 +80,7 @@ import {
   isDelegateTerminalState,
   type DelegateFailureClass,
 } from '../../protocol/src/delegation.js'
-import { formatDelegateConcurrencyReject } from './delegateCapacity.js'
+import { delegateConcurrencyCap, formatDelegateConcurrencyReject } from './delegateCapacity.js'
 
 const CONTROL_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
 const isControlId = (value: unknown): value is string =>
@@ -10435,14 +10435,9 @@ export class Gateway {
 
   /** Active delegation count for recursion/concurrency limits */
   private _activeDelegations = 0
-  private static MAX_CONCURRENT_DELEGATIONS = 5
-  /** P2 债C/3.5 — 硬编排 review 保留槽:非 review 委派最多用到
-   *  (MAX_CONCURRENT_DELEGATIONS − 保留槽),给质量审查留位,消 cron/他会话把并发占满
-   *  导致队长的 review delegate 拿不到槽而降级放行。review 委派本身可用满全局上限。 */
-  private static DELEGATE_REVIEW_RESERVED_SLOTS = 1
   /** P2 债C/3.5 — 单父会话(队长)并行 fan-out 上限。非 review 委派按父分桶计数,
-   *  超上限进排队;review 委派豁免此桶(有独立保留槽)。消"一个队长把 5 个全局槽占光"。
-   *  env 可配(下限 1)。 */
+   *  超上限进排队;review 委派豁免此桶(有独立保留槽)。消"一个队长把全局槽占光"。
+   *  env 可配(下限 1)。全局上限与 review 保留槽见 delegateCapacity.ts。 */
   private static get MAX_CONCURRENT_DELEGATIONS_PER_PARENT(): number {
     const raw = Number(process.env.OPENCLAUDE_DELEGATE_MAX_PER_PARENT)
     return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 3
@@ -10511,9 +10506,7 @@ export class Gateway {
     isReview?: boolean
   }): DelegateGateBlock | null {
     const isReview = opts?.isReview === true
-    const globalCap = isReview
-      ? Gateway.MAX_CONCURRENT_DELEGATIONS
-      : Gateway.MAX_CONCURRENT_DELEGATIONS - Gateway.DELEGATE_REVIEW_RESERVED_SLOTS
+    const globalCap = delegateConcurrencyCap(isReview)
     if (this._activeDelegations >= globalCap) {
       return { kind: 'concurrency' }
     }

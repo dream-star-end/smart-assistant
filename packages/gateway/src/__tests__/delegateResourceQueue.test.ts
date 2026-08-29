@@ -18,6 +18,7 @@
 import assert from 'node:assert/strict'
 import { afterEach, describe, it } from 'node:test'
 
+import { DELEGATE_MAX_CONCURRENT_DELEGATIONS } from '../delegateCapacity.js'
 import { DELEGATE_QUEUE_MAX_WAITERS, Gateway, PerTurnDelegationGuard } from '../server.js'
 import { OutboundRingBuffer } from '../outboundRing.js'
 
@@ -164,7 +165,7 @@ describe('资源闸有界排队 — 命中后等待,条件恢复即放行', () =
   it('并发闸命中 → 排队 → 并发释放 → 放行(200)', async () => {
     process.env.OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS = '5000'
     const gw = makeGateway()
-    gw._activeDelegations = 5 // = MAX_CONCURRENT_DELEGATIONS,满载
+    gw._activeDelegations = DELEGATE_MAX_CONCURRENT_DELEGATIONS // 满载
     setTimeout(() => {
       gw._activeDelegations = 0 // 模拟并发释放
     }, 40)
@@ -213,12 +214,12 @@ describe('资源闸有界排队 — 等待封顶', () => {
   it('并发持续满载 → 超时 429,同形文案 + "已等待 Xs 资源仍紧张"', async () => {
     process.env.OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS = '80'
     const gw = makeGateway()
-    gw._activeDelegations = 5
+    gw._activeDelegations = DELEGATE_MAX_CONCURRENT_DELEGATIONS
     const r = await delegate(gw, 'coding-assistant', taskBody())
     assert.equal(r.status, 429, '并发闸超时必须保持 429 形状')
     assert.match(r.body.error, /too many concurrent delegations \(max 4 non-review/)
     assert.match(r.body.error, /已等待 \d+s 资源仍紧张/)
-    assert.equal(gw._activeDelegations, 5, '等待失败不得改变并发计数')
+    assert.equal(gw._activeDelegations, DELEGATE_MAX_CONCURRENT_DELEGATIONS, '等待失败不得改变并发计数')
   })
 })
 
@@ -246,7 +247,7 @@ describe('资源闸有界排队 — 等待者上限', () => {
   it(`并发闸命中且等待者已满 → 立即 429`, async () => {
     process.env.OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS = '5000'
     const gw = makeGateway()
-    gw._activeDelegations = 5
+    gw._activeDelegations = DELEGATE_MAX_CONCURRENT_DELEGATIONS
     gw._delegateQueueWaiters = new Map()
     for (let i = 0; i < DELEGATE_QUEUE_MAX_WAITERS; i++) {
       gw._delegateQueueWaiters.set(`w${i}`, () => {})
