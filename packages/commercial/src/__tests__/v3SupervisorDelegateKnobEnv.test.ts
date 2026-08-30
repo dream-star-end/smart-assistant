@@ -19,11 +19,12 @@ const KEYS = [
   'OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS',
   'OPENCLAUDE_DELEGATE_MAX_PER_PARENT',
   'OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN',
+  'OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN',
   'OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS',
 ] as const
 
 describe('buildDelegateKnobContainerEnv', () => {
-  test('exported key list matches the five knobs', () => {
+  test('exported key list matches the six knobs', () => {
     assert.deepEqual([...DELEGATE_KNOB_CONTAINER_ENV_KEYS], [...KEYS])
   })
 
@@ -33,6 +34,7 @@ describe('buildDelegateKnobContainerEnv', () => {
       OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS: '2',
       OPENCLAUDE_DELEGATE_MAX_PER_PARENT: '3',
       OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN: '4',
+      OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN: '12',
       OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS: '120000',
     })
     assert.deepEqual(out, [
@@ -40,8 +42,16 @@ describe('buildDelegateKnobContainerEnv', () => {
       'OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS=2',
       'OPENCLAUDE_DELEGATE_MAX_PER_PARENT=3',
       'OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN=4',
+      'OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN=12',
       'OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS=120000',
     ])
+  })
+
+  test('OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN 合法值单独放行', () => {
+    const out = buildDelegateKnobContainerEnv({
+      OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN: '12',
+    })
+    assert.deepEqual(out, ['OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN=12'])
   })
 
   test('非法值不注入', () => {
@@ -50,6 +60,7 @@ describe('buildDelegateKnobContainerEnv', () => {
       OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS: '-1',
       OPENCLAUDE_DELEGATE_MAX_PER_PARENT: '1.5',
       OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN: ' 8',
+      OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN: '12.0',
       OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS: '8e4',
     })
     assert.deepEqual(out, [])
