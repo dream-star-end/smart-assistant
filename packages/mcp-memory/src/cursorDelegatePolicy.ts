@@ -8,10 +8,26 @@ export const CURSOR_HIDDEN_DELEGATE_TOOLS = [
 
 export type CursorHiddenDelegateTool = (typeof CURSOR_HIDDEN_DELEGATE_TOOLS)[number]
 
+export const DELEGATE_WAIT_TOOL_NAME = 'delegate_wait'
+
 const HIDDEN = new Set<string>(CURSOR_HIDDEN_DELEGATE_TOOLS)
 
 export function isCursorEngine(engine: string | undefined = process.env.OPENCLAUDE_ENGINE): boolean {
   return (engine || '').trim().toLowerCase() === 'cursor'
+}
+
+/** R4 档 A′. Default off. A lone non-1 value (including unset) keeps the tool hidden. */
+export function isCursorMcpWaitEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = String(env.OC_DELEGATE_CURSOR_MCP_WAIT ?? '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'on'
+}
+
+/** Cursor + flag on: list/call `delegate_wait`. Other engines keep today's tool list. */
+export function shouldExposeDelegateWait(
+  engine: string | undefined = process.env.OPENCLAUDE_ENGINE,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return isCursorEngine(engine) && isCursorMcpWaitEnabled(env)
 }
 
 export function isCursorHiddenDelegateTool(
@@ -19,6 +35,27 @@ export function isCursorHiddenDelegateTool(
   engine: string | undefined = process.env.OPENCLAUDE_ENGINE,
 ): boolean {
   return isCursorEngine(engine) && HIDDEN.has(name)
+}
+
+/** ListTools filter: still hide the sync trio on Cursor; wait is flag-gated. */
+export function filterListedDelegateTools<T extends { name: string }>(
+  tools: readonly T[],
+  engine: string | undefined = process.env.OPENCLAUDE_ENGINE,
+  env: NodeJS.ProcessEnv = process.env,
+): T[] {
+  const exposeWait = shouldExposeDelegateWait(engine, env)
+  return tools.filter((t) => {
+    if (t.name === DELEGATE_WAIT_TOOL_NAME) return exposeWait
+    return !isCursorHiddenDelegateTool(t.name, engine)
+  })
+}
+
+export function delegateWaitDisabledText(): string {
+  return [
+    'status=disabled tool=delegate_wait',
+    'OC_DELEGATE_CURSOR_MCP_WAIT=0（默认关）。Cursor MCP 未注册 delegate_wait。',
+    '请用 Bash: oc-memory delegate-wait <jobId>',
+  ].join('\n')
 }
 
 export function cursorDelegateCliHint(name = 'delegate_task'): string {

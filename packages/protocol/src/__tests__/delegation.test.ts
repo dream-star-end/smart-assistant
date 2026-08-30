@@ -7,6 +7,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import {
+  DELEGATE_CURSOR_MCP_WAIT_MS,
   DELEGATE_CUTOVER_FREEZE_MS,
   DELEGATE_FAILURE_CLASS_VERSION,
   DELEGATE_FAILURE_CLASSES,
@@ -32,6 +33,7 @@ describe('OCV5-22 delegation protocol', () => {
     assert.ok(DELEGATE_JOB_STATES.includes('killed_by_cutover'))
     assert.ok(DELEGATE_JOB_STATES.includes('paused_for_cutover'))
     assert.equal(DELEGATE_CUTOVER_FREEZE_MS, 30_000)
+    assert.equal(DELEGATE_CURSOR_MCP_WAIT_MS, 55_000)
   })
 
   it('accepts v2 legal transitions including queued→paused and running→killed', () => {

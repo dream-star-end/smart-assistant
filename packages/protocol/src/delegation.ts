@@ -93,6 +93,9 @@ export type DelegateCheckpointKind = (typeof DELEGATE_CHECKPOINT_KINDS)[number]
 /** Phase F freeze budget (design v3 §3.1). Timeout pauses remaining running jobs. */
 export const DELEGATE_CUTOVER_FREEZE_MS = 30_000
 
+/** Cursor MCP `tools/call` wall is ~60s. One `delegate_wait` round stays under it (design v3 §N3). */
+export const DELEGATE_CURSOR_MCP_WAIT_MS = 55_000
+
 export const DELEGATE_CALLBACK_OWNERS = ['job', 'intent'] as const
 export type DelegateCallbackOwner = (typeof DELEGATE_CALLBACK_OWNERS)[number]
 

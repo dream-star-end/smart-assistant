@@ -16,6 +16,7 @@ export const MEMORY_MCP_TOOL_NAMES = [
   'send_to_agent',
   'delegate_task',
   'delegate_tasks',
+  'delegate_wait',
   'request_review',
   'task_create',
   'task_update',
