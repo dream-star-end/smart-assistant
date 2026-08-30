@@ -18,7 +18,7 @@ import {
 } from '@openclaude/protocol'
 import { decideSendToAgentIntentRecovery } from '../delegateCallbackOwner.js'
 import { DelegateDurableDb } from '../delegateDurable.js'
-import { DelegateJobStore, nextNotifyBackoffMs } from '../delegateJobs.js'
+import { DelegateJobStore, nextNotifyBackoffMs, NOTIFY_CLAIM_LEASE_MS } from '../delegateJobs.js'
 import {
   delayUntilNextNotifyRetry,
   dispatchJobTerminalNotify,
@@ -38,7 +38,7 @@ import {
   parseOriginWebchatSessionKey,
   resolveCronOriginInjectPayload,
 } from '../cronOriginSession.js'
-import { settleCronDelegateJob } from '../delegateCronIdempotency.js'
+import { enqueueCronOccurrenceJob, settleCronDelegateJob } from '../delegateCronIdempotency.js'
 import {
   persistSendToAgentIntent,
   recoverInterruptedSendToAgentIntents,
@@ -1297,6 +1297,361 @@ describe('stage 2 review blockers: cron generation migration + continuation', ()
       assert.equal(injected, 1)
       assert.equal(store.snapshotOf(snap.id)?.callbackState, 'delivered')
       store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  async function runCronOriginCrashWindow(args: {
+    dir: string
+    cronJobId: string
+    notifierOn: boolean
+    inject: (jobId: string, store: DelegateJobStore) => Promise<{ kind: 'injected' } | never>
+    onMarkSubmitStarted?: (store: DelegateJobStore, jobId: string) => Promise<void>
+  }) {
+    const prev = {
+      sm: process.env.OC_DELEGATE_SM,
+      durable: process.env.OC_DELEGATE_DURABLE,
+      notifier: process.env.OC_DELEGATE_NOTIFIER,
+      home: process.env.OPENCLAUDE_HOME,
+    }
+    process.env.OC_DELEGATE_SM = '1'
+    process.env.OC_DELEGATE_DURABLE = '1'
+    process.env.OC_DELEGATE_NOTIFIER = args.notifierOn ? '1' : '0'
+    process.env.OPENCLAUDE_HOME = args.dir
+    const { CronScheduler } = await import('../cron.js')
+    const dbPath = join(args.dir, 'delegate-jobs.db')
+    const store = new DelegateJobStore({
+      sm: true,
+      durable: new DelegateDurableDb(dbPath),
+      bootId: args.notifierOn ? 'gw:on' : 'gw:off',
+      ttlMs: 60_000,
+      leaseMs: 1_000,
+    })
+    const originKey = 'agent:main:webchat:dm:crash-window-parent'
+    const dueMinuteKey = 123
+    const enq = enqueueCronOccurrenceJob(store, {
+      cronJobId: args.cronJobId,
+      dueMinuteKey,
+      agentId: 'main',
+      parentSessionKey: originKey,
+      callbackOriginSessionKey: originKey,
+      callbackOriginUserId: 'uid-crash',
+      parentEngine: 'cursor',
+    })
+    assert.ok('jobId' in enq)
+    const scheduler = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      { getOrCreate: async () => ({}), submit: async () => {}, destroySession: async () => {} } as any,
+      () => {},
+      async () => args.inject(enq.jobId, store),
+    )
+    scheduler.delegateJobs = store
+    const job = {
+      id: args.cronJobId,
+      schedule: '* * * * *',
+      agent: 'main',
+      prompt: 'continue exactly once',
+      resume: 'origin-session',
+      sourceSessionKey: originKey,
+      sourceUserId: 'uid-crash',
+      projectMode: 'follow_session',
+      enabled: true,
+    } as any
+    const agent = { id: 'main', model: 'glm-5.2' } as any
+    const delivery = { dueMinuteKey, deliveryId: `cron.${args.cronJobId}.${dueMinuteKey}` }
+    const outcome = await (scheduler as any).runJob(job, agent, {
+      consumeOccurrence: async () => {},
+      markSubmitStarted: async () => {
+        if (args.onMarkSubmitStarted) {
+          await args.onMarkSubmitStarted(store, enq.jobId)
+          return
+        }
+        throw new Error('simulated crash before markSubmitStarted')
+      },
+      markCompleted: async () => {},
+      markDelivered: async () => {},
+    }, delivery)
+    const snap = store.snapshotOf(enq.jobId)!
+    return { store, job, enq, outcome, snap, dbPath, prev, originKey }
+  }
+
+  function restoreDelegateFlags(prev: {
+    sm: string | undefined
+    durable: string | undefined
+    notifier: string | undefined
+    home: string | undefined
+  }) {
+    if (prev.sm === undefined) delete process.env.OC_DELEGATE_SM
+    else process.env.OC_DELEGATE_SM = prev.sm
+    if (prev.durable === undefined) delete process.env.OC_DELEGATE_DURABLE
+    else process.env.OC_DELEGATE_DURABLE = prev.durable
+    if (prev.notifier === undefined) delete process.env.OC_DELEGATE_NOTIFIER
+    else process.env.OC_DELEGATE_NOTIFIER = prev.notifier
+    if (prev.home === undefined) delete process.env.OPENCLAUDE_HOME
+    else process.env.OPENCLAUDE_HOME = prev.home
+  }
+
+  async function settleThenDispatch(store: DelegateJobStore, jobId: string, job: { prompt: string; id: string }) {
+    const live = store.snapshotOf(jobId)!
+    let fence =
+      live.claimToken
+        ? { claimToken: live.claimToken, fencingEpoch: live.fencingEpoch }
+        : undefined
+    if (!fence) {
+      const claimed = store.claimQueued(jobId)
+      assert.equal(claimed.ok, true)
+      if (claimed.ok) fence = claimed
+    }
+    const continuation = buildCronContinuationEnvelope({
+      id: job.id,
+      prompt: job.prompt,
+      sourceUserId: 'uid-crash',
+      sourceSessionKey: live.callbackOriginSessionKey ?? live.parentSessionKey,
+    })
+    assert.equal(
+      settleCronDelegateJob(
+        store,
+        jobId,
+        'completed',
+        fence,
+        undefined,
+        { output: buildCronOriginResumeText(job), cronContinuation: continuation },
+      ),
+      true,
+    )
+    const dlgcbIds: string[] = []
+    const snap = store.snapshotOf(jobId)!
+    const result = await dispatchJobTerminalNotify(
+      store,
+      snap,
+      new DefaultEngineNotifier({
+        resumeInject: {
+          inject: async (event) => {
+            dlgcbIds.push(delegateCallbackMessageId(event.jobId, event.callbackEpoch))
+            return { ok: true }
+          },
+        },
+      }),
+    )
+    return { result, dlgcbIds, snap: store.snapshotOf(jobId)! }
+  }
+
+  it('blocker1 marker-free off→on: inject success then crash before claim is ACK not dlgcb-replayed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-mf-offon-inject-'))
+    let prev: Parameters<typeof restoreDelegateFlags>[0] | undefined
+    try {
+      let legacyInjects = 0
+      const first = await runCronOriginCrashWindow({
+        dir,
+        cronJobId: 'remind-crash-inject-then-claim',
+        notifierOn: false,
+        inject: async () => {
+          legacyInjects += 1
+          return { kind: 'injected' }
+        },
+      })
+      prev = first.prev
+      assert.equal(legacyInjects, 1)
+      assert.equal(first.snap.state, 'queued')
+      assert.equal(first.snap.callbackState, 'none')
+      assert.equal(first.snap.notifyLane, CRON_CALLBACK_LEGACY_LANE)
+      first.store.close()
+
+      process.env.OC_DELEGATE_NOTIFIER = '1'
+      const boot = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(first.dbPath),
+        bootId: 'gw:on',
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+      })
+      assert.equal(boot.snapshotOf(first.enq.jobId)?.notifyLane, CRON_CALLBACK_LEGACY_LANE)
+      const dispatched = await settleThenDispatch(boot, first.enq.jobId, first.job)
+      assert.equal('ok' in dispatched.result && dispatched.result.ok, true)
+      assert.equal(dispatched.dlgcbIds.length, 0)
+      assert.equal(dispatched.snap.callbackState, 'delivered')
+      assert.equal(legacyInjects, 1)
+      boot.close()
+    } finally {
+      if (prev) restoreDelegateFlags(prev)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('blocker1 marker-free off→on: stamp then crash before inject retries Completer key not dlgcb', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-mf-offon-stamp-'))
+    let prev: Parameters<typeof restoreDelegateFlags>[0] | undefined
+    try {
+      let legacyInjects = 0
+      const first = await runCronOriginCrashWindow({
+        dir,
+        cronJobId: 'remind-crash-stamp-then-inject',
+        notifierOn: false,
+        inject: async (jobId, store) => {
+          assert.equal(store.snapshotOf(jobId)?.notifyLane, CRON_CALLBACK_LEGACY_LANE)
+          throw new Error('simulated crash after generation lock before inject')
+        },
+      })
+      prev = first.prev
+      assert.equal(legacyInjects, 0)
+      assert.equal(first.snap.state, 'queued')
+      assert.equal(first.snap.notifyLane, CRON_CALLBACK_LEGACY_LANE)
+      first.store.close()
+
+      process.env.OC_DELEGATE_NOTIFIER = '1'
+      const boot = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(first.dbPath),
+        bootId: 'gw:on',
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+      })
+      const { CronScheduler } = await import('../cron.js')
+      const scheduler = new CronScheduler(
+        { defaults: { model: 'glm-5.2' } } as any,
+        { getOrCreate: async () => ({}), submit: async () => {}, destroySession: async () => {} } as any,
+        () => {},
+        async () => {
+          legacyInjects += 1
+          return { kind: 'injected' as const }
+        },
+      )
+      scheduler.delegateJobs = boot
+      const delivery = { dueMinuteKey: 123, deliveryId: `cron.${first.job.id}.123` }
+      const second = await (scheduler as any).runJob(first.job, { id: 'main', model: 'glm-5.2' }, {
+        consumeOccurrence: async () => {},
+        markSubmitStarted: async () => {
+          throw new Error('simulated crash before markSubmitStarted')
+        },
+        markCompleted: async () => {},
+        markDelivered: async () => {},
+      }, delivery)
+      assert.equal(second.kind, 'retryable_failure')
+      assert.equal(legacyInjects, 1)
+      const dispatched = await settleThenDispatch(boot, first.enq.jobId, first.job)
+      assert.equal('ok' in dispatched.result && dispatched.result.ok, true)
+      assert.equal(dispatched.dlgcbIds.length, 0)
+      assert.equal(dispatched.snap.callbackState, 'delivered')
+      boot.close()
+    } finally {
+      if (prev) restoreDelegateFlags(prev)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('blocker1 marker-free on→off: inject success then crash before notify-complete drains once with dlgcb', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-mf-onoff-inject-'))
+    try {
+      let now = 1_700_000_000_000
+      const durable = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const store = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable,
+        bootId: 'gw:on',
+        now: () => now,
+      })
+      const { snap, fence } = await seedCronTerminal(store)
+      const claimed = store.claimNotifyDelivery(snap.id, fence)
+      assert.equal(claimed.ok, true)
+      const ids: string[] = []
+      const notifier = new DefaultEngineNotifier({
+        resumeInject: {
+          inject: async (event) => {
+            ids.push(delegateCallbackMessageId(event.jobId, event.callbackEpoch))
+            return { ok: true }
+          },
+        },
+      })
+      const event = buildJobTerminalFromSnapshot(store.snapshotOf(snap.id)!, { parentEngine: 'cursor' })
+      assert.ok(event)
+      const injected = await notifier.notify(event)
+      assert.equal(injected.ok, true)
+      assert.equal(store.snapshotOf(snap.id)?.callbackState, 'injecting')
+      assert.deepEqual(ids, [delegateCallbackMessageId(snap.id, 1)])
+      store.close()
+
+      now += NOTIFY_CLAIM_LEASE_MS + 1
+      const boot = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable: new DelegateDurableDb(join(dir, 'delegate-jobs.db')),
+        bootId: 'gw:off',
+        now: () => now,
+      })
+      const summary = await retryPendingNotifies(
+        boot,
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async (event) => {
+              ids.push(delegateCallbackMessageId(event.jobId, event.callbackEpoch))
+              return { ok: true }
+            },
+          },
+        }),
+        {},
+        { callbacks: ['cron-origin-inject'] },
+      )
+      assert.equal(summary.delivered, 1)
+      assert.equal(ids.length, 2)
+      assert.deepEqual(new Set(ids), new Set([delegateCallbackMessageId(snap.id, 1)]))
+      assert.match(ids[0]!, /^dlgcb\./)
+      assert.equal(boot.snapshotOf(snap.id)?.callbackState, 'delivered')
+      boot.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('blocker1 marker-free on→off: notify-claim then crash before inject drains once with dlgcb', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-mf-onoff-claim-'))
+    try {
+      let now = 1_700_000_000_000
+      const store = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable: new DelegateDurableDb(join(dir, 'delegate-jobs.db')),
+        bootId: 'gw:on',
+        now: () => now,
+      })
+      const { snap, fence } = await seedCronTerminal(store)
+      const claimed = store.claimNotifyDelivery(snap.id, fence)
+      assert.equal(claimed.ok, true)
+      assert.equal(store.snapshotOf(snap.id)?.callbackState, 'injecting')
+      store.close()
+
+      now += NOTIFY_CLAIM_LEASE_MS + 1
+      const boot = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable: new DelegateDurableDb(join(dir, 'delegate-jobs.db')),
+        bootId: 'gw:off',
+        now: () => now,
+      })
+      const ids: string[] = []
+      const summary = await retryPendingNotifies(
+        boot,
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async (event) => {
+              ids.push(delegateCallbackMessageId(event.jobId, event.callbackEpoch))
+              return { ok: true }
+            },
+          },
+        }),
+        {},
+        { callbacks: ['cron-origin-inject'] },
+      )
+      assert.equal(summary.delivered, 1)
+      assert.deepEqual(ids, [delegateCallbackMessageId(snap.id, 1)])
+      assert.match(ids[0]!, /^dlgcb\./)
+      assert.equal(boot.snapshotOf(snap.id)?.callbackState, 'delivered')
+      boot.close()
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

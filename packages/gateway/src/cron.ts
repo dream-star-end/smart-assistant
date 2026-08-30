@@ -97,6 +97,7 @@ import {
   buildCronContinuationEnvelope,
   buildCronOriginResumeText,
   CRON_CALLBACK_LEGACY_LANE,
+  isLegacyCronOriginLane,
   parseOriginWebchatSessionKey,
   type CronOriginFireResult,
 } from './cronOriginSession.js'
@@ -1829,21 +1830,59 @@ export class CronScheduler {
   }
 
   /**
+   * Enqueue job id for this occurrence. Prefers the JSON projection, then the
+   * durable UNIQUE key so a mocked/crashed consumeOccurrence still stamps.
+   */
+  private resolveCronDelegateJobId(
+    job: CronJob,
+    deliveryContext: CronDeliveryContext,
+  ): string | undefined {
+    const occ = readOccurrence(deliveryContext.deliveryId)
+    if (occ?.delegateJobId) return occ.delegateJobId
+    if (!this.delegateJobs) return undefined
+    return this.delegateJobs.findByIdempotencyKey(
+      cronDelegateIdempotencyKey(job.id, deliveryContext.dueMinuteKey),
+    )?.id
+  }
+
+  /**
+   * Durable generation lock for the Completer origin-session leg. Must land
+   * before the inject side effect so a crash cannot leave a marker-free row
+   * for a later Notifier generation to dlgcb-replay. Does not claim the
+   * execution lease: claiming first would make retryable inject failures
+   * unclaimable and would let boot AdoptOrKill silence a prepared occurrence.
+   */
+  private stampLegacyCronGeneration(jobId: string): boolean {
+    if (!this.delegateJobs) return false
+    const snap = this.delegateJobs.snapshotOf(jobId)
+    if (!snap) return false
+    const fence = snap.claimToken
+      ? { claimToken: snap.claimToken, fencingEpoch: snap.fencingEpoch }
+      : undefined
+    return this.delegateJobs.patchNotifyIntent(
+      jobId,
+      {
+        notifyLane: CRON_CALLBACK_LEGACY_LANE,
+        notifyId: delegateNotifyId(jobId, 1),
+      },
+      fence,
+    )
+  }
+
+  /**
    * origin-session fire: inject a new inbound into the creating conversation.
    * If that conversation is gone, skip (do not isolated-run / lastActive-broadcast),
    * disable recurring jobs (the origin can never come back) and leave a status
    * notice so the task does not vanish silently.
    *
-   * Ordering: inject BEFORE markSubmitStarted. A retryable inject failure
-   * (session busy, network, master down) leaves the occurrence 'prepared' and
-   * lastRun untouched, so the normal retry planner really re-fires this exact
-   * deliveryId on a later tick. Replay safety comes from the stable
-   * clientMessageId: master dedupes durably in turn_dispatches, the local path
-   * dedupes on the persisted message id. After a restart, 'executing' and
-   * 'completed' origin occurrences settle without re-dispatch (at-most-once,
-   * see the recovery block in checkAndRun); the crash window between a
-   * successful inject and markSubmitStarted re-injects the same
-   * clientMessageId, which master absorbs as a duplicate.
+   * Ordering: stamp the Completer generation (legacy-completer) BEFORE inject;
+   * inject BEFORE markSubmitStarted. A retryable inject failure (session busy,
+   * network, master down) leaves the occurrence 'prepared', lastRun untouched,
+   * and the job queued, so the same leg retries this deliveryId. Replay safety
+   * comes from the stable clientMessageId plus the durable lane: flag-on boot
+   * seeing legacy-completer keeps the Completer key instead of dlgcb.*. After
+   * a restart, 'executing' and 'completed' origin occurrences settle without
+   * re-dispatch (at-most-once, see the recovery block in checkAndRun).
    */
   private async runOriginSessionJob(
     job: CronJob,
@@ -1862,10 +1901,18 @@ export class CronScheduler {
       })
       return { kind: 'retryable_failure', code: 'OCCURRENCE_PERSIST_FAILED' }
     }
+    const dlgJobId = this.resolveCronDelegateJobId(job, deliveryContext)
+    const dlgSnap =
+      dlgJobId && this.delegateJobs ? this.delegateJobs.snapshotOf(dlgJobId) : undefined
+    const legacyOwned = isLegacyCronOriginLane(dlgSnap?.notifyLane)
+    // Flag-on Completer skips inject only when this occurrence is not already
+    // owned by the Completer generation. A pre-inject crash that stamped
+    // legacy-completer must retry the same leg / same cron-origin-* key.
+    const useLegacyLeg = !isDelegateNotifierEffective() || legacyOwned
+    if (useLegacyLeg && dlgJobId) this.stampLegacyCronGeneration(dlgJobId)
     let result: CronOriginFireResult
     try {
-      // Stage 2: Completer must not inject when Notifier owns cron-origin-inject.
-      if (isDelegateNotifierEffective()) {
+      if (!useLegacyLeg) {
         result = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
           ? { kind: 'injected' }
           : { kind: 'fallback' }
