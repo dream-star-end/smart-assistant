@@ -34,6 +34,8 @@ export const INFLIGHT_MAX_TERMINAL_ROWS_PER_SESSION = 32
 export const INFLIGHT_GOAL_MAX_CHARS = 4_000
 export const INFLIGHT_LIVE_HINT_MAX_CHARS = 2_000
 export const INFLIGHT_RESULT_SUMMARY_MAX_CHARS = 2_048
+/** Auxiliary projection must never stall the gateway event loop on a lock. */
+export const INFLIGHT_SURFACE_BUSY_TIMEOUT_MS = 0
 
 const TERMINAL_SQL = `'completed','failed','cancelled','killed_by_cutover'`
 
@@ -151,7 +153,11 @@ function cloneSurface(row: SurfaceRow): InflightDelegateSurface {
 
 function publicView(row: SurfaceRow): InflightDelegateSurface {
   const out = cloneSurface(row)
-  if (out.foldedGroup) out.foldedGroup = stripDeferredStubBit(out.foldedGroup)
+  if (out.foldedGroup) {
+    const bounded = boundFoldedGroup(out.foldedGroup)
+    out.foldedGroup = bounded.group
+    if (bounded.truncated) out.truncated = true
+  }
   return out
 }
 
@@ -256,6 +262,8 @@ export class DelegateInflightSurfaceStore {
   private readonly foldedMaxBytes: number
   private readonly onWriteError?: (err: unknown, ctx: Record<string, unknown>) => void
   private readonly byJob = new Map<string, SurfaceRow>()
+  /** Queue-full / explicit drops must not be resurrected by a late upsert. */
+  private readonly droppedJobs = new Set<string>()
   private db: InstanceType<typeof Database> | null = null
   private upsertStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
   private deleteStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
@@ -305,7 +313,9 @@ export class DelegateInflightSurfaceStore {
     mkdirSync(dirname(dbPath), { recursive: true })
     const db = new Database(dbPath)
     try {
-      db.pragma('busy_timeout = 10000')
+      // Non-authoritative projection: never stall the gateway event loop on
+      // writer-lock contention. SQLITE_BUSY fails immediately and is counted.
+      db.pragma(`busy_timeout = ${INFLIGHT_SURFACE_BUSY_TIMEOUT_MS}`)
       db.pragma('journal_mode = WAL')
       this.migrate(db)
       this.db = db
@@ -341,13 +351,17 @@ export class DelegateInflightSurfaceStore {
           nested=excluded.nested,
           owner_run_id=excluded.owner_run_id
         WHERE
-          excluded.fencing_epoch > inflight_delegate_surface.fencing_epoch
-          OR (
-            excluded.fencing_epoch = inflight_delegate_surface.fencing_epoch
-            AND excluded.generation >= inflight_delegate_surface.generation
-            AND NOT (
-              inflight_delegate_surface.state IN (${TERMINAL_SQL})
-              AND excluded.state NOT IN (${TERMINAL_SQL})
+          -- First terminal is sticky across ALL terminals, not just
+          -- terminal→nonterminal. Same-terminal writes may fill payload.
+          (
+            inflight_delegate_surface.state NOT IN (${TERMINAL_SQL})
+            OR excluded.state = inflight_delegate_surface.state
+          )
+          AND (
+            excluded.fencing_epoch > inflight_delegate_surface.fencing_epoch
+            OR (
+              excluded.fencing_epoch = inflight_delegate_surface.fencing_epoch
+              AND excluded.generation >= inflight_delegate_surface.generation
             )
           )
       `)
@@ -372,7 +386,6 @@ export class DelegateInflightSurfaceStore {
 
   private migrate(db: InstanceType<typeof Database>): void {
     const current = Number(db.pragma('user_version', { simple: true }) ?? 0)
-    if (current >= SURFACE_SCHEMA_VERSION) return
     if (current < 1) db.exec(DDL)
     if (current === 1) {
       const existing = new Set(
@@ -410,7 +423,86 @@ export class DelegateInflightSurfaceStore {
         fill.run(sessionIdFromParentKey(row.parent_session_key), row.job_id)
       }
     }
-    db.pragma(`user_version = ${SURFACE_SCHEMA_VERSION}`)
+    if (current < SURFACE_SCHEMA_VERSION) {
+      db.pragma(`user_version = ${SURFACE_SCHEMA_VERSION}`)
+    }
+    // v1→v2 (and already-v2 disks that skipped clipping) must bound payload
+    // + backfill TTL before the Map load parses JSON.
+    this.clipLegacyRows(db)
+  }
+
+  /**
+   * Transactionally rewrite oversized/immortal terminal rows. Safe to run on
+   * every open: a cheap EXISTS probe skips the rewrite when already bounded.
+   */
+  private clipLegacyRows(db: InstanceType<typeof Database>): void {
+    const needs = db
+      .prepare(
+        `SELECT 1 AS n FROM inflight_delegate_surface
+         WHERE (folded_group_json IS NOT NULL AND folded_group_json != ''
+                AND (IFNULL(payload_bytes, 0) = 0 OR payload_bytes > ?))
+            OR (state IN (${TERMINAL_SQL}) AND expires_at IS NULL)
+         LIMIT 1`,
+      )
+      .get(this.foldedMaxBytes) as { n: number } | undefined
+    if (!needs) return
+    const now = this.now()
+    const rows = db
+      .prepare(
+        `SELECT job_id, state, folded_group_json, updated_at, expires_at
+         FROM inflight_delegate_surface`,
+      )
+      .all() as Array<{
+      job_id: string
+      state: string
+      folded_group_json: string | null
+      updated_at: number
+      expires_at: number | null
+    }>
+    const update = db.prepare(
+      `UPDATE inflight_delegate_surface
+       SET folded_group_json = @json,
+           payload_truncated = @trunc,
+           payload_bytes = @bytes,
+           expires_at = @exp
+       WHERE job_id = @id`,
+    )
+    const del = db.prepare('DELETE FROM inflight_delegate_surface WHERE job_id = ?')
+    const tx = db.transaction(() => {
+      for (const row of rows) {
+        const terminal = isDelegateTerminalState(row.state as DelegateJobState)
+        let json: string | null = null
+        let trunc = 0
+        let bytes = 0
+        if (typeof row.folded_group_json === 'string' && row.folded_group_json) {
+          try {
+            const parsed = JSON.parse(row.folded_group_json) as DurableAgentGroup
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              const bounded = boundFoldedGroup(parsed, this.foldedMaxBytes)
+              json = JSON.stringify(bounded.group)
+              trunc = bounded.truncated ? 1 : 0
+              bytes = bounded.bytes
+            }
+          } catch {
+            json = null
+          }
+        }
+        let expires: number | null = row.expires_at == null ? null : Number(row.expires_at)
+        if (terminal) {
+          if (expires == null || !Number.isFinite(expires)) {
+            expires = Number(row.updated_at || now) + this.terminalTtlMs
+          }
+        } else {
+          expires = null
+        }
+        if (terminal && expires != null && expires <= now) {
+          del.run(row.job_id)
+          continue
+        }
+        update.run({ json, trunc, bytes, exp: expires, id: row.job_id })
+      }
+    })
+    tx()
   }
 
   get(jobId: string): InflightDelegateSurface | undefined {
@@ -419,6 +511,28 @@ export class DelegateInflightSurfaceStore {
   }
 
   upsertEnqueue(input: InflightEnqueueInput): InflightDelegateSurface {
+    if (this.droppedJobs.has(input.jobId)) {
+      const existingDropped = this.byJob.get(input.jobId)
+      if (existingDropped) return publicView(existingDropped)
+      return publicView({
+        jobId: input.jobId,
+        parentSessionKey: input.parentSessionKey,
+        sessionId: sessionIdFromParentKey(input.parentSessionKey),
+        userId: input.userId || '',
+        agentId: input.agentId,
+        runId: input.runId || defaultRunId(input.jobId),
+        goal: clampText(input.goal ?? '', INFLIGHT_GOAL_MAX_CHARS),
+        state: 'failed',
+        liveHint: '',
+        updatedAt: this.now(),
+        fencingEpoch: 0,
+        generation: 0,
+        payloadBytes: 0,
+        expiresAt: null,
+        nested: false,
+        ownerRunId: '',
+      })
+    }
     const existing = this.byJob.get(input.jobId)
     const nextState: DelegateJobState = input.state ?? existing?.state ?? 'queued'
     if (existing && !canAdvanceState(existing.state, nextState)) {
@@ -486,6 +600,7 @@ export class DelegateInflightSurfaceStore {
     ownerRunId?: string
     preserveIdentity?: boolean
   }): InflightDelegateSurface | undefined {
+    if (this.droppedJobs.has(input.jobId)) return undefined
     const existing = this.byJob.get(input.jobId)
     if (!existing) return undefined
     const nextState = input.state ?? existing.state
@@ -544,6 +659,7 @@ export class DelegateInflightSurfaceStore {
     if (isDeferredExactProcessStub(input.group)) {
       return { folded: false, reason: 'deferred_stub' }
     }
+    if (this.droppedJobs.has(input.jobId)) return { folded: false, reason: 'missing' }
     const existing = this.byJob.get(input.jobId)
     if (!existing) return { folded: false, reason: 'missing' }
     // Job-authority mapping: a finished DurableAgentGroup is a completed job
@@ -578,10 +694,11 @@ export class DelegateInflightSurfaceStore {
     next.fencingEpoch = fencingEpoch
     next.generation = generation
     next.updatedAt = this.now()
-    next.expiresAt = this.now() + this.terminalTtlMs
+    next.expiresAt = existing.expiresAt ?? this.now() + this.terminalTtlMs
     this.persist(next)
     this.enforceTerminalCap(next.userId, next.sessionId)
-    return { folded: true, surface: publicView(this.byJob.get(input.jobId) ?? next) }
+    const committed = this.byJob.get(input.jobId) ?? existing
+    return { folded: true, surface: publicView(committed) }
   }
 
   /**
@@ -589,6 +706,7 @@ export class DelegateInflightSurfaceStore {
    * complete, fail, cancel, cutover, capacity). Fail-open: never throws.
    */
   projectJob(job: DelegateJobSnapshot): InflightDelegateSurface | undefined {
+    if (this.droppedJobs.has(job.id)) return undefined
     if (!job.parentSessionKey) return undefined
     const existing = this.byJob.get(job.id)
     const fence = { fencingEpoch: job.fencingEpoch, generation: job.generation }
@@ -668,21 +786,42 @@ export class DelegateInflightSurfaceStore {
     const items: InflightDelegateSurface[] = []
     let used = 2
     let truncated = false
-    for (let i = start; i < matched.length && items.length < limit; i++) {
-      const view = publicView(matched[i])
-      const size = Buffer.byteLength(JSON.stringify(view), 'utf8') + 1
-      if (items.length > 0 && used + size > maxBytes) {
-        truncated = true
-        break
+    let i = start
+    for (; i < matched.length && items.length < limit; i++) {
+      let view = publicView(matched[i])
+      if (view.foldedGroup) {
+        const bounded = boundFoldedGroup(view.foldedGroup, this.foldedMaxBytes)
+        if (bounded.truncated) {
+          view = { ...view, foldedGroup: bounded.group, truncated: true }
+        }
+      }
+      let size = Buffer.byteLength(JSON.stringify(view), 'utf8') + 1
+      if (used + size > maxBytes) {
+        const summary = summarizeInflightView(view)
+        size = Buffer.byteLength(JSON.stringify(summary), 'utf8') + 1
+        if (used + size > maxBytes) {
+          truncated = true
+          break
+        }
+        view = summary
       }
       items.push(view)
       used += size
     }
-    const consumedThrough = start + items.length
-    const nextCursor =
-      truncated || consumedThrough < matched.length ? items[items.length - 1]?.jobId ?? null : null
-    if (consumedThrough < matched.length) truncated = true
+    if (i < matched.length) truncated = true
+    const nextCursor = truncated ? (items[items.length - 1]?.jobId ?? matched[i]?.jobId ?? null) : null
     return { items, nextCursor, truncated }
+  }
+
+  /**
+   * Remove a projection whose job never became live (queue-full drop) or was
+   * otherwise deleted. Fail-open: never throws.
+   */
+  drop(jobId: string): boolean {
+    this.droppedJobs.add(jobId)
+    const existed = this.byJob.delete(jobId)
+    this.deleteSafe(jobId)
+    return existed
   }
 
   sweepExpired(now: number = this.now()): number {
@@ -748,9 +887,8 @@ export class DelegateInflightSurfaceStore {
         this.projectJob(resolved)
         continue
       }
-      if (opts.dropMissingLive) {
-        this.byJob.delete(jobId)
-        this.deleteSafe(jobId)
+      if (opts.dropMissingLive || row.state === 'queued') {
+        this.drop(jobId)
       }
     }
     for (const job of live.values()) {
@@ -816,6 +954,7 @@ export class DelegateInflightSurfaceStore {
   }
 
   private persist(row: SurfaceRow): boolean {
+    if (this.droppedJobs.has(row.jobId)) return false
     try {
       if (!this.upsertStmt) {
         this.byJob.set(row.jobId, row)
@@ -850,8 +989,8 @@ export class DelegateInflightSurfaceStore {
       return true
     } catch (err) {
       this.noteWriteError(err, { phase: 'persist', jobId: row.jobId })
-      // Fail-open: keep the in-process projection so GET in this process still
-      // works; never throw into Enqueue / Completer / Notifier.
+      // Fail-open, fail-fast: never throw into Enqueue / Completer / Notifier.
+      // SQLITE_BUSY is immediate (busy_timeout=0); keep the in-process row.
       this.byJob.set(row.jobId, row)
       return false
     }
@@ -873,17 +1012,21 @@ function fromRow(row: Record<string, unknown>): SurfaceRow | null {
   const parentSessionKey = typeof row.parent_session_key === 'string' ? row.parent_session_key : ''
   if (!jobId || !parentSessionKey) return null
   let foldedGroup: DurableAgentGroup | undefined
+  let payloadBytes = Number(row.payload_bytes ?? 0)
+  let truncated = Number(row.payload_truncated ?? 0) === 1
   if (typeof row.folded_group_json === 'string' && row.folded_group_json) {
     try {
       const parsed = JSON.parse(row.folded_group_json) as DurableAgentGroup
       if (parsed && typeof parsed === 'object' && !isDeferredExactProcessStub(parsed)) {
-        foldedGroup = stripDeferredStubBit(parsed)
+        const bounded = boundFoldedGroup(stripDeferredStubBit(parsed))
+        foldedGroup = bounded.group
+        payloadBytes = bounded.bytes
+        truncated = truncated || bounded.truncated
       }
     } catch {
       foldedGroup = undefined
     }
   }
-  const truncated = Number(row.payload_truncated ?? 0) === 1
   return {
     jobId,
     parentSessionKey,
@@ -900,13 +1043,40 @@ function fromRow(row: Record<string, unknown>): SurfaceRow | null {
     updatedAt: Number(row.updated_at ?? 0),
     fencingEpoch: Number(row.fencing_epoch ?? 0),
     generation: Number(row.generation ?? 0),
-    payloadBytes: Number(row.payload_bytes ?? 0),
+    payloadBytes,
     expiresAt: row.expires_at == null ? null : Number(row.expires_at),
     nested: Number(row.nested ?? 0) === 1,
     ownerRunId: typeof row.owner_run_id === 'string' ? row.owner_run_id : '',
     truncated: truncated || undefined,
     ...(foldedGroup ? { foldedGroup } : {}),
   }
+}
+
+function summarizeInflightView(view: InflightDelegateSurface): InflightDelegateSurface {
+  const folded = view.foldedGroup
+  const summary: InflightDelegateSurface = {
+    jobId: view.jobId,
+    runId: view.runId,
+    agentId: view.agentId,
+    goal: view.goal,
+    state: view.state,
+    liveHint: view.liveHint,
+    updatedAt: view.updatedAt,
+    parentSessionKey: view.parentSessionKey,
+    truncated: true,
+  }
+  if (view.nested) summary.nested = true
+  if (view.ownerRunId) summary.ownerRunId = view.ownerRunId
+  if (folded) {
+    summary.foldedGroup = {
+      runId: folded.runId,
+      agentId: folded.agentId,
+      goal: clampText(folded.goal, 256),
+      status: folded.status,
+      completedAt: folded.completedAt,
+    }
+  }
+  return summary
 }
 
 export type InflightDelegatesHttpResult = {
@@ -929,6 +1099,7 @@ export async function handleInflightDelegatesRequest(args: {
   store?: DelegateInflightSurfaceStore | null
   overlayJobs?: () => readonly DelegateJobSnapshot[]
   resolveJob?: (jobId: string) => DelegateJobSnapshot | undefined
+  dropMissingLive?: boolean
 }): Promise<InflightDelegatesHttpResult> {
   if (!args.enabled) {
     return { status: 404, body: { error: 'not found' } }
@@ -946,7 +1117,10 @@ export async function handleInflightDelegatesRequest(args: {
   }
   try {
     if (args.overlayJobs) {
-      store.rebuildFromJobs(args.overlayJobs(), { resolveJob: args.resolveJob })
+      store.rebuildFromJobs(args.overlayJobs(), {
+        resolveJob: args.resolveJob,
+        dropMissingLive: args.dropMissingLive === true,
+      })
     }
   } catch (err) {
     log.warn('inflight surface overlay failed', { sessionId: args.sessionId }, err)

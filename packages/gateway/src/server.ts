@@ -10622,6 +10622,7 @@ export class Gateway {
       ttlMs: resolveDelegateJobTtlMs(),
       sm,
       durable,
+      onDrop: (job) => this._forgetDelegateInflight(job.id),
       onTerminal: (job) => {
         if (job.sessionKey) resume.release(job.sessionKey)
         this._projectDelegateInflightFromJob(job)
@@ -10677,6 +10678,19 @@ export class Gateway {
     } catch (err) {
       this.log.warn('delegate inflight surface project failed', { jobId: job.id }, err as Error)
     }
+  }
+
+  private _forgetDelegateInflight(jobId: string): void {
+    if (!isDelegateInflightSurfaceEffective()) return
+    try {
+      this._ensureDelegateInflightSurface().drop(jobId)
+    } catch (err) {
+      this.log.warn('delegate inflight surface drop failed', { jobId }, err as Error)
+    }
+  }
+
+  private _dropDelegateInflightSurface(jobId: string): void {
+    this._forgetDelegateInflight(jobId)
   }
 
   private _touchDelegateInflightSurface(input: {
@@ -11634,7 +11648,9 @@ export class Gateway {
           if (sm && result.kind === 'rejected' && result.failureClass) {
             const dropped =
               result.failureClass === 'capacity_queue_full' && store.dropIfUnclaimed(jobId)
-            if (!dropped) {
+            if (dropped) {
+              this._dropDelegateInflightSurface(jobId)
+            } else {
               winner = store.fail(jobId, {
                 failureClass: result.failureClass,
                 detail: result.message,
@@ -12858,8 +12874,11 @@ export class Gateway {
           surface.foldTerminal({
             jobId,
             group: durableGroup,
-            // Job complete(http 200, ok:false) is `completed`; keep surface aligned.
-            state: 'completed',
+            // Job CAS winner is authority: a killed/failed/cancelled job must
+            // not be rewritten as completed by a late runner. Same-terminal
+            // folds may still fill a bounded payload.
+            state:
+              snap && isDelegateTerminalState(snap.state) ? snap.state : 'completed',
             parentSessionKey: parentKey,
             userId: progressTarget?.userId,
             ...fence,

@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import Database from 'better-sqlite3'
 
 import type { DurableAgentGroup } from '@openclaude/protocol'
 import { DelegateJobStore } from '../delegateJobs.js'
@@ -27,6 +28,7 @@ import {
   parentKeyMatchesSessionId,
   INFLIGHT_FOLDED_GROUP_MAX_BYTES,
   INFLIGHT_GET_MAX_RESPONSE_BYTES,
+  INFLIGHT_SURFACE_BUSY_TIMEOUT_MS,
 } from '../delegateInflightSurface.js'
 import {
   isDelegateInflightSurfaceEffective,
@@ -297,6 +299,12 @@ describe('R2 gateway wiring (flag-off equivalent + read endpoint)', () => {
     ]
     assert.ok(inflightUses.length >= 4)
     assert.match(serverSrc, /foldTerminal/)
+    assert.match(serverSrc, /onDrop:/)
+    assert.match(serverSrc, /_forgetDelegateInflight|_dropDelegateInflightSurface/)
+    assert.match(
+      serverSrc,
+      /snap && isDelegateTerminalState\(snap\.state\) \? snap\.state : 'completed'/,
+    )
   })
 
   it('parentKeyMatchesSessionId accepts webchat peer ids', () => {
@@ -797,3 +805,334 @@ describe('boundFoldedGroup helper', () => {
   })
 })
 
+describe('closeout residual — queue-full drop must tombstone the slot', () => {
+  it('GET does not keep a queued ghost after dropIfUnclaimed + surface.drop', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-r2-drop-'))
+    try {
+      const jobsDb = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const surface = new DelegateInflightSurfaceStore({
+        dbPath: join(dir, 'delegate-inflight-surface.db'),
+      })
+      const jobs = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        durable: jobsDb,
+        bootId: 'gw:r2-drop',
+        onDrop: (job) => surface.drop(job.id),
+      })
+      const created = jobs.create('coding-assistant', {
+        queued: true,
+        parentSessionKey: PARENT,
+        sessionKey: 'agent:coding-assistant:delegate:main:drop',
+      })
+      assert.ok('jobId' in created)
+      surface.upsertEnqueue({
+        jobId: created.jobId,
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'ghost-queued',
+        state: 'queued',
+        userId: 'user-r2',
+      })
+      assert.equal(jobs.dropIfUnclaimed(created.jobId), true)
+      assert.equal(jobs.snapshotOf(created.jobId), undefined)
+      const afterDrop = await handleInflightDelegatesRequest({
+        method: 'GET',
+        sessionId: SESS,
+        userId: 'user-r2',
+        enabled: true,
+        loadSession: async () => ({ id: SESS, userId: 'user-r2' }),
+        store: surface,
+        overlayJobs: () => jobs.listNonTerminal(),
+        resolveJob: (jobId) => jobs.snapshotOf(jobId),
+        dropMissingLive: false,
+      })
+      assert.equal(((afterDrop.body.items as unknown[]) ?? []).length, 0)
+      assert.equal(surface.get(created.jobId), undefined)
+      surface.upsertEnqueue({
+        jobId: created.jobId,
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'must-not-resurrect',
+        state: 'queued',
+        userId: 'user-r2',
+      })
+      assert.equal(surface.get(created.jobId), undefined)
+      surface.close()
+      const afterBoot = new DelegateInflightSurfaceStore({
+        dbPath: join(dir, 'delegate-inflight-surface.db'),
+      })
+      afterBoot.rebuildFromJobs([], { dropMissingLive: true })
+      assert.equal(afterBoot.get(created.jobId), undefined)
+      afterBoot.close()
+      jobs.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GET overlay with dropMissingLive heals a queue-full ghost even without drop()', async () => {
+    await withStore(async (store) => {
+      store.upsertEnqueue({
+        jobId: 'dlgjob-ghost-q',
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'still-queued',
+        state: 'queued',
+        userId: 'user-r2',
+      })
+      const page = await handleInflightDelegatesRequest({
+        method: 'GET',
+        sessionId: SESS,
+        userId: 'user-r2',
+        enabled: true,
+        loadSession: async () => ({ id: SESS, userId: 'user-r2' }),
+        store,
+        overlayJobs: () => [],
+        dropMissingLive: true,
+      })
+      assert.equal(((page.body.items as unknown[]) ?? []).length, 0)
+      assert.equal(store.get('dlgjob-ghost-q'), undefined)
+    })
+  })
+
+  it('GET overlay keeps a running sync slot that has no job row', async () => {
+    await withStore((store) => {
+      store.upsertEnqueue({
+        jobId: 'dlgjob-sync-live',
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'sync',
+        state: 'running',
+        userId: 'user-r2',
+      })
+      store.rebuildFromJobs([], { resolveJob: () => undefined })
+      assert.equal(store.get('dlgjob-sync-live')?.state, 'running')
+    })
+  })
+})
+
+describe('closeout residual — terminal→terminal is sticky', () => {
+  it('late completed fold cannot overwrite authoritative killed_by_cutover', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-r2-term-race-'))
+    const dbPath = join(dir, 'delegate-inflight-surface.db')
+    try {
+      const g0 = new DelegateInflightSurfaceStore({ dbPath, now: () => 10 })
+      g0.upsertEnqueue({
+        jobId: 'dlgjob-cutover',
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'g',
+        runId: 'dlg-cutover',
+        state: 'running',
+        userId: 'user-r2',
+        fencingEpoch: 2,
+        generation: 2,
+      })
+      const g1 = new DelegateInflightSurfaceStore({ dbPath, now: () => 11 })
+      const authoritative = g1.foldTerminal({
+        jobId: 'dlgjob-cutover',
+        group: group({ runId: 'dlg-cutover', status: 'failed', resultSummary: 'cutover' }),
+        state: 'killed_by_cutover',
+        fencingEpoch: 2,
+        generation: 3,
+      })
+      assert.equal(authoritative.folded, true)
+      if (authoritative.folded) {
+        assert.equal(authoritative.surface.state, 'killed_by_cutover')
+      }
+      const late = g0.foldTerminal({
+        jobId: 'dlgjob-cutover',
+        group: group({ runId: 'dlg-cutover', status: 'ok', resultSummary: 'late-ok' }),
+        state: 'completed',
+        fencingEpoch: 2,
+        generation: 3,
+      })
+      assert.equal(late.folded, true)
+      if (late.folded) {
+        assert.equal(late.surface.state, 'killed_by_cutover')
+        assert.notEqual(late.surface.foldedGroup?.status, 'ok')
+      }
+      g0.close()
+      g1.close()
+      const g2 = new DelegateInflightSurfaceStore({ dbPath, now: () => 12 })
+      const persisted = g2.get('dlgjob-cutover')
+      assert.equal(persisted?.state, 'killed_by_cutover')
+      assert.notEqual(persisted?.foldedGroup?.status, 'ok')
+      g2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('closeout residual — writer lock must not stall the gateway', () => {
+  it('updateLive returns immediately when another connection holds the writer lock', async () => {
+    assert.equal(INFLIGHT_SURFACE_BUSY_TIMEOUT_MS, 0)
+    const dir = await mkdtemp(join(tmpdir(), 'oc-r2-busy-'))
+    const dbPath = join(dir, 'delegate-inflight-surface.db')
+    let locker: InstanceType<typeof Database> | null = null
+    try {
+      const store = new DelegateInflightSurfaceStore({ dbPath })
+      store.upsertEnqueue({
+        jobId: 'dlgjob-busy',
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'g',
+        state: 'running',
+        liveHint: 'before',
+      })
+      locker = new Database(dbPath)
+      locker.pragma('busy_timeout = 0')
+      locker.exec('BEGIN IMMEDIATE')
+      const t0 = Date.now()
+      assert.doesNotThrow(() => {
+        store.updateLive({ jobId: 'dlgjob-busy', liveHint: 'after-lock' })
+      })
+      const elapsedMs = Date.now() - t0
+      assert.ok(elapsedMs < 250, `updateLive stalled ${elapsedMs}ms under writer lock`)
+      assert.ok(store.writeFailures >= 1)
+      assert.equal(store.get('dlgjob-busy')?.liveHint, 'after-lock')
+      assert.equal(store.get('dlgjob-busy')?.state, 'running')
+      locker.exec('ROLLBACK')
+      locker.close()
+      locker = null
+      store.close()
+    } finally {
+      try {
+        locker?.exec('ROLLBACK')
+      } catch {
+        /* already rolled back */
+      }
+      try {
+        locker?.close()
+      } catch {
+        /* closed */
+      }
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('closeout residual — v1→v2 migration clips payload and backfills TTL', () => {
+  it('upgrades a v1 disk of 2MiB terminals into bounded 2h rows', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-r2-v1mig-'))
+    const dbPath = join(dir, 'delegate-inflight-surface.db')
+    try {
+      const v1 = new Database(dbPath)
+      v1.exec(`
+        CREATE TABLE inflight_delegate_surface (
+          job_id TEXT PRIMARY KEY,
+          parent_session_key TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          agent_id TEXT NOT NULL,
+          goal TEXT NOT NULL DEFAULT '',
+          state TEXT NOT NULL,
+          live_hint TEXT NOT NULL DEFAULT '',
+          updated_at INTEGER NOT NULL,
+          folded_group_json TEXT
+        );
+      `)
+      v1.pragma('user_version = 1')
+      const blob = 'x'.repeat(2 * 1024 * 1024)
+      const insert = v1.prepare(
+        `INSERT INTO inflight_delegate_surface
+          (job_id, parent_session_key, run_id, agent_id, goal, state, live_hint, updated_at, folded_group_json)
+         VALUES (?, ?, ?, ?, ?, 'completed', '', 1000, ?)`,
+      )
+      for (const id of ['dlgjob-legacy-1', 'dlgjob-legacy-2', 'dlgjob-legacy-3']) {
+        insert.run(
+          id,
+          PARENT,
+          id,
+          'coding-assistant',
+          id,
+          JSON.stringify(
+            group({
+              runId: id,
+              goal: id,
+              transcript: [{ kind: 'text', text: blob }],
+              runtimeEvents: [{ ordinal: 1, observedAt: 1, source: 'gateway', payload: blob }],
+            }),
+          ),
+        )
+      }
+      v1.close()
+
+      const now = 1_000
+      const store = new DelegateInflightSurfaceStore({
+        dbPath,
+        now: () => now,
+        terminalTtlMs: 2 * 60 * 60 * 1000,
+      })
+      const page = store.listForSessionId(SESS, {
+        userId: undefined,
+        maxBytes: INFLIGHT_GET_MAX_RESPONSE_BYTES,
+      })
+      const encoded = JSON.stringify({ enabled: true, items: page.items, nextCursor: page.nextCursor })
+      const responseBytes = Buffer.byteLength(encoded, 'utf8')
+      assert.ok(
+        responseBytes <= INFLIGHT_GET_MAX_RESPONSE_BYTES,
+        `GET page ${responseBytes} exceeded ${INFLIGHT_GET_MAX_RESPONSE_BYTES}`,
+      )
+      assert.equal(page.items.length, 3)
+      for (const item of page.items) {
+        assert.equal(item.foldedGroup?.transcript, undefined)
+        assert.equal(item.state, 'completed')
+      }
+      store.close()
+
+      const v2 = new Database(dbPath)
+      const schemaVersion = Number(v2.pragma('user_version', { simple: true }))
+      assert.equal(schemaVersion, 2)
+      const rows = v2
+        .prepare(
+          `SELECT folded_group_json, payload_bytes, expires_at FROM inflight_delegate_surface`,
+        )
+        .all() as Array<{
+        folded_group_json: string | null
+        payload_bytes: number
+        expires_at: number | null
+      }>
+      assert.equal(rows.length, 3)
+      let payloadChars = 0
+      let immortal = 0
+      for (const row of rows) {
+        payloadChars += row.folded_group_json?.length ?? 0
+        if (row.expires_at == null) immortal += 1
+        assert.ok(row.payload_bytes <= INFLIGHT_FOLDED_GROUP_MAX_BYTES)
+        assert.equal(row.expires_at, now + 2 * 60 * 60 * 1000)
+        if (row.folded_group_json) {
+          assert.equal(JSON.parse(row.folded_group_json).transcript, undefined)
+        }
+      }
+      assert.ok(payloadChars < 64 * 1024)
+      assert.equal(immortal, 0)
+      v2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GET byte budget applies to the first item (no oversized lead row)', async () => {
+    await withStore((store) => {
+      store.upsertEnqueue({
+        jobId: 'dlgjob-lead',
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'lead',
+        state: 'running',
+        userId: 'user-r2',
+      })
+      store.foldTerminal({
+        jobId: 'dlgjob-lead',
+        group: group({ resultSummary: 'x'.repeat(400) }),
+        state: 'completed',
+      })
+      const page = store.listForSessionId(SESS, { maxBytes: 80 })
+      const encoded = JSON.stringify(page.items)
+      assert.ok(Buffer.byteLength(encoded, 'utf8') <= 80 + 8)
+      assert.equal(page.truncated, true)
+    })
+  })
+})
