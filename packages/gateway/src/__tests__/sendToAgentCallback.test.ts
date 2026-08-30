@@ -4,6 +4,7 @@ import { describe, it } from 'node:test'
 import {
   buildSendToAgentCallbackText,
   callbackPayloadFromDurableJob,
+  decideCallbackDispatchAfterPersist,
   isSendToAgentCallbackComplete,
   sendToAgentCallbackClientMessageId,
   sendToAgentCallbackIdempotencyKey,
@@ -66,11 +67,47 @@ describe('sendToAgentCallback text + ids', () => {
     })
     assert.match(failed, /失败/)
     assert.match(failed, /upstream 402/)
+    const disguised = callbackPayloadFromDurableJob({
+      state: 'completed',
+      result: { body: { ok: false, output: '', error: 'child exploded' } },
+    })
+    assert.deepEqual(disguised, { error: 'child exploded' })
   })
 
   it('accepts a live webchat parent key', () => {
     const origin = parseOriginWebchatSessionKey('agent:main:webchat:dm:sess-1')
     assert.ok(origin)
     assert.equal(origin?.peerId, 'sess-1')
+  })
+
+  it('already_exists skips dispatch only when the turn is already queued', () => {
+    assert.equal(
+      decideCallbackDispatchAfterPersist({ persistApplied: true, turnAlreadyQueued: false }),
+      'dispatch',
+    )
+    assert.equal(
+      decideCallbackDispatchAfterPersist({
+        persistApplied: false,
+        persistReason: 'already_exists',
+        turnAlreadyQueued: false,
+      }),
+      'dispatch',
+    )
+    assert.equal(
+      decideCallbackDispatchAfterPersist({
+        persistApplied: false,
+        persistReason: 'already_exists',
+        turnAlreadyQueued: true,
+      }),
+      'ack_injected',
+    )
+    assert.equal(
+      decideCallbackDispatchAfterPersist({
+        persistApplied: false,
+        persistReason: 'session_deleted',
+        turnAlreadyQueued: false,
+      }),
+      'unhandled',
+    )
   })
 })

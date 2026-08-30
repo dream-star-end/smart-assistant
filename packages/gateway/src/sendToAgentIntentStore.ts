@@ -109,8 +109,15 @@ export async function recoverInterruptedSendToAgentIntents(
     const job = opts?.resolveJob?.(intent.jobId)
     const decision = decideSendToAgentIntentRecovery({
       callbackOwner,
-      job: job ? { jobId: job.id, state: job.state } : undefined,
+      job: job
+        ? { jobId: job.id, state: job.state, callbackState: job.callbackState }
+        : undefined,
     })
+    if (decision.action === 'ack_delivered') {
+      await rm(path, { force: true }).catch(() => {})
+      skippedShadow += 1
+      continue
+    }
     if (decision.action === 'drop_shadow') {
       // Job still running: keep the shadow. Completer is the consumer; do not
       // emit a legacy interrupt and do not delete the only recovery record.

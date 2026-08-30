@@ -124,6 +124,9 @@ export const outboundRingSizeBytes = { value: 0 }
 export const modelHintAppliedTotal = new Counter()
 
 export const usageLogInsertedTotal = new Counter()
+export const delegateNotifyTotal = new Counter()
+export const delegateNotifyLatencyMs = new Histogram([50, 250, 500, 1000, 5000, 15000, 30000])
+export const delegateCursorBackgroundAwaitTotal = new Counter()
 export const usageLogDuplicateTotal = new Counter()
 export const usageLogConflictTotal = new Counter()
 export const usageLogFailedTotal = new Counter()
@@ -216,6 +219,18 @@ export function serializeMetrics(): string {
     usageLogFailedTotal.serialize(
       'oc_usage_log_failed_total',
       'usage_log inserts that threw (true loss)',
+    ),
+    delegateNotifyTotal.serialize(
+      'oc_delegate_notify_total',
+      'Delegate JobTerminal deliveries (lane/ok/degraded)',
+    ),
+    delegateNotifyLatencyMs.serialize(
+      'oc_delegate_notify_latency_ms',
+      'Delegate JobTerminal delivery latency in ms (t1 terminal persist → t2 parent ingest)',
+    ),
+    delegateCursorBackgroundAwaitTotal.serialize(
+      'oc_delegate_cursor_background_await_total',
+      'Cursor sessions waiting on OC delegate via background shell + await (target 0 after R1/R4)',
     ),
   ]
   return sections.join('\n\n') + '\n'

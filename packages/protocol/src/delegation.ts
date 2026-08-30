@@ -145,6 +145,69 @@ export function delegateCallbackMessageId(jobId: string, callbackEpoch: number):
   return `dlgcb.${jobId}.${callbackEpoch}`
 }
 
+export const DELEGATE_PARENT_ENGINES = ['ccb', 'codex', 'cursor', 'grok', 'zcode'] as const
+export type DelegateParentEngine = (typeof DELEGATE_PARENT_ENGINES)[number]
+
+export function isDelegateParentEngine(value: unknown): value is DelegateParentEngine {
+  return typeof value === 'string' && (DELEGATE_PARENT_ENGINES as readonly string[]).includes(value)
+}
+
+export const NOTIFY_LANES = [
+  'inline-push',
+  'resume-inject',
+  'mcp-wait',
+  'stdout-wait',
+  'skipped_silent',
+] as const
+export type NotifyLane = (typeof NOTIFY_LANES)[number]
+
+/** CCB + Codex can write the parent stdin. Cursor/Grok/zcode spawn with stdin=ignore. */
+export const INLINE_PUSH_ENGINES: readonly DelegateParentEngine[] = ['ccb', 'codex']
+export const RESUME_INJECT_ENGINES: readonly DelegateParentEngine[] = ['cursor', 'grok', 'zcode']
+
+export function classifyNotifyLane(engine: DelegateParentEngine): NotifyLane {
+  return INLINE_PUSH_ENGINES.includes(engine) ? 'inline-push' : 'resume-inject'
+}
+
+/** Same inputs as dlgcb; Notifier must not mint a timestamp/uuid. */
+export function delegateNotifyId(jobId: string, callbackEpoch: number): string {
+  return `dlgnfy.${jobId}.${callbackEpoch}`
+}
+
+/**
+ * Engine-agnostic terminal snapshot (design v3 §N1.1). Completer owns
+ * callback_state; EngineNotifier only chooses the delivery lane.
+ */
+export type JobTerminal = {
+  jobId: string
+  state: Extract<DelegateJobState, 'completed' | 'failed' | 'cancelled' | 'killed_by_cutover'>
+  failureClass?: DelegateFailureClass
+  failureDetail?: string
+  sessionKey?: string
+  resultRef?: string
+  parentSessionKey: string
+  parentEngine: DelegateParentEngine
+  parentNativeId?: string
+  callback: DelegateCallback
+  callbackEpoch: number
+  parallelPolicy: 'each' | 'all'
+  agentId?: string
+  goal?: string
+  /** Explicit child outcome. HTTP 200 + `{ok:false}` is a failure. */
+  resultOk?: boolean
+  /** t1: durable terminal commit time (ms). Latency is t1→t2. */
+  terminalCommittedAt?: number
+}
+
+export type NotifyResult =
+  | { ok: true; lane: NotifyLane; notifyId: string }
+  | { ok: false; failureClass: DelegateFailureClass; degradedTo?: 'resume-inject' }
+
+export interface EngineNotifier {
+  /** Idempotent: a second call with the same notifyId must no-op success. */
+  notify(event: JobTerminal): Promise<NotifyResult>
+}
+
 /** Map OCV5-17 / local-execution reject codes onto this schema's class names. */
 export function failureClassFromLocalExecutionCode(code: string | undefined): DelegateFailureClass {
   switch (code) {

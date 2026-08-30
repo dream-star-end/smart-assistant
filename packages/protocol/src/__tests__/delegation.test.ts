@@ -12,8 +12,11 @@ import {
   DELEGATE_JOB_STATES,
   assertDelegateTransition,
   cronDelegateIdempotencyKey,
+  classifyNotifyLane,
   delegateCallbackMessageId,
+  delegateNotifyId,
   failureClassFromLocalExecutionCode,
+  isDelegateParentEngine,
   isDelegateTerminalState,
   isLegalDelegateTransition,
 } from '../delegation.js'
@@ -64,5 +67,13 @@ describe('OCV5-22 delegation protocol', () => {
       'cron:remind-mtd9f0ng-pgki:1767225600',
     )
     assert.equal(delegateCallbackMessageId('dlgjob-abc', 1), 'dlgcb.dlgjob-abc.1')
+    assert.equal(delegateNotifyId('dlgjob-abc', 1), 'dlgnfy.dlgjob-abc.1')
+    assert.equal(classifyNotifyLane('ccb'), 'inline-push')
+    assert.equal(classifyNotifyLane('codex'), 'inline-push')
+    assert.equal(classifyNotifyLane('cursor'), 'resume-inject')
+    assert.equal(classifyNotifyLane('grok'), 'resume-inject')
+    assert.equal(classifyNotifyLane('zcode'), 'resume-inject')
+    assert.equal(isDelegateParentEngine('cursor'), true)
+    assert.equal(isDelegateParentEngine('unknown'), false)
   })
 })

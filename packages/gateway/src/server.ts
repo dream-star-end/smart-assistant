@@ -318,6 +318,7 @@ import { getProject } from './taskboard/db/projects.js'
 import {
   buildSendToAgentCallbackText,
   callbackPayloadFromDurableJob,
+  decideCallbackDispatchAfterPersist,
   isSendToAgentCallbackComplete,
   sendToAgentCallbackClientMessageId,
   sendToAgentCallbackIdempotencyKey,
@@ -386,7 +387,23 @@ import {
   type DelegateJobSnapshot,
 } from './delegateJobs.js'
 import { DelegateResumeRegistry, DELEGATE_RESUME_OCCUPIED_MESSAGE } from './delegateResume.js'
-import { isDelegateDurableEffective, isDelegateSmEnabled, resolveDelegateCallbackOwner } from './delegateSmFlag.js'
+import {
+  isDelegateDurableEffective,
+  isDelegateNotifierEffective,
+  isDelegateSmEnabled,
+  resolveDelegateCallbackOwner,
+} from './delegateSmFlag.js'
+import { DefaultEngineNotifier, tryWriteInlinePush, type InlinePushSession } from './engineNotifier.js'
+import {
+  delayUntilNextNotifyRetry,
+  dispatchJobTerminalNotify,
+  retryPendingNotifies,
+} from './delegateNotifyDispatch.js'
+import {
+  formatJobTerminalMarkdown,
+  injectPayloadFromJobTerminal,
+  parseParentEngine,
+} from './jobTerminal.js'
 import { openDelegateDurableDb } from './delegateDurable.js'
 import {
   nextDelegateReconcileAt,
@@ -427,6 +444,8 @@ import {
   outboundRingReplayMissTotal,
   outboundRingEvictedTotal,
   outboundRingSizeBytes,
+  delegateNotifyTotal,
+  delegateNotifyLatencyMs,
 } from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
 import { USER_PROFILE_INJECT_MAX_CHARS } from './promptSlots.js'
@@ -10486,6 +10505,8 @@ export class Gateway {
   private _delegateReconcileReady = false
   private _delegateDurablePath: string | undefined
   private _delegateReconcileTimer: ReturnType<typeof setTimeout> | undefined
+  private _notifyRetryTimer: ReturnType<typeof setTimeout> | undefined
+  private _engineNotifier: DefaultEngineNotifier | undefined
 
   private _ensureDelegateJobStore(): DelegateJobStore {
     if (this._delegateJobs) return this._delegateJobs
@@ -10499,6 +10520,7 @@ export class Gateway {
       durable,
       onTerminal: (job) => {
         if (job.sessionKey) resume.release(job.sessionKey)
+        if (isDelegateNotifierEffective()) void this._dispatchDelegateNotify(job)
       },
     })
     this._delegateJobs = store
@@ -10516,6 +10538,9 @@ export class Gateway {
       if (filled > 0) this.log.info('cron occurrence delegateJobId backfill', { filled })
       this._armDelegateReconcileFollowup(store, queueWaitMs)
       this._delegateReconcileReady = true
+      if (isDelegateNotifierEffective()) {
+        void this._retryDelegateNotifies().finally(() => this._armNotifyRetryScheduler())
+      }
     } else {
       this._delegateReconcileReady = true
     }
@@ -10554,6 +10579,122 @@ export class Gateway {
     } catch {
       return undefined
     }
+  }
+
+  private _resolveDelegateParentEngine(sessionKey?: string): ReturnType<typeof parseParentEngine> {
+    if (!sessionKey) return undefined
+    try {
+      const session = this.sessions?.getByKey?.(sessionKey) as { runner?: { engineId?: string } } | undefined
+      return parseParentEngine(session?.runner?.engineId)
+    } catch {
+      return undefined
+    }
+  }
+
+  private _notifyDispatchHooks() {
+    return {
+      resolveParentEngine: (job: DelegateJobSnapshot) =>
+        this._resolveDelegateParentEngine(job.callbackOriginSessionKey ?? job.parentSessionKey) ??
+        parseParentEngine(job.parentEngine),
+      resolveGoal: (job: DelegateJobSnapshot) => this._activeSendToAgentCallbacks?.get(job.id)?.goal,
+      resolveCallbackOrigin: (job: DelegateJobSnapshot) => job.callbackOriginSessionKey,
+      onDelivered: async (job: DelegateJobSnapshot) => {
+        this._activeSendToAgentCallbacks.delete(job.id)
+        await removeSendToAgentIntent(job.id)
+      },
+    }
+  }
+
+  private _ensureEngineNotifier(): DefaultEngineNotifier | undefined {
+    if (!isDelegateNotifierEffective()) return undefined
+    if (this._engineNotifier) return this._engineNotifier
+    this._engineNotifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: async (event) => {
+          const session = this.sessions?.getByKey?.(event.parentSessionKey) as InlinePushSession | undefined
+          return tryWriteInlinePush(session, event, formatJobTerminalMarkdown(event))
+        },
+      },
+      resumeInject: {
+        inject: async (event) => {
+          const payload = injectPayloadFromJobTerminal(event)
+          const result = await this.injectSendToAgentCallback({
+            parentSessionKey: event.parentSessionKey,
+            jobId: event.jobId,
+            agentId: event.agentId || 'unknown',
+            goal: event.goal || '',
+            output: payload.output,
+            error: payload.error,
+            clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
+          })
+          if (result.kind === 'injected') return { ok: true }
+          if (result.kind === 'retryable_failure' && result.code === 'ORIGIN_SESSION_BUSY') {
+            return { ok: false, failureClass: 'internal' as const, busy: true }
+          }
+          if (result.kind === 'fallback') {
+            return { ok: false, failureClass: 'transport' as const, gone: true }
+          }
+          return { ok: false, failureClass: 'transport' as const }
+        },
+      },
+      onSample: (sample) => {
+        delegateNotifyTotal.inc({
+          lane: sample.lane,
+          ok: sample.ok ? '1' : '0',
+          degraded: sample.degraded ? '1' : '0',
+        })
+        delegateNotifyLatencyMs.observe(sample.latencyMs, { lane: sample.lane })
+      },
+    })
+    return this._engineNotifier
+  }
+
+  private async _dispatchDelegateNotify(job: DelegateJobSnapshot): Promise<void> {
+    const store = this._delegateJobs
+    const notifier = this._ensureEngineNotifier()
+    if (!store || !notifier) return
+    try {
+      const result = await dispatchJobTerminalNotify(store, job, notifier, this._notifyDispatchHooks())
+      if ('skipped' in result) return
+      if (!result.ok) {
+        this.log.warn('delegate notify failed', {
+          jobId: job.id,
+          failureClass: result.failureClass,
+          degradedTo: result.degradedTo,
+        })
+      }
+    } catch (err) {
+      this.log.warn('delegate notify threw', { jobId: job.id }, err as Error)
+    } finally {
+      this._armNotifyRetryScheduler()
+    }
+  }
+
+  private async _retryDelegateNotifies(opts: { dueOnly?: boolean } = {}): Promise<void> {
+    const store = this._delegateJobs
+    const notifier = this._ensureEngineNotifier()
+    if (!store || !notifier) return
+    try {
+      const summary = await retryPendingNotifies(store, notifier, this._notifyDispatchHooks(), opts)
+      if (summary.scanned > 0) this.log.info('delegate notify retry', summary)
+    } catch (err) {
+      this.log.warn('delegate notify retry threw', undefined, err as Error)
+    }
+  }
+
+  private _armNotifyRetryScheduler(): void {
+    if (this._notifyRetryTimer) {
+      clearTimeout(this._notifyRetryTimer)
+      this._notifyRetryTimer = undefined
+    }
+    if (!isDelegateNotifierEffective() || !this._delegateJobs) return
+    const delay = delayUntilNextNotifyRetry(this._delegateJobs)
+    if (delay == null) return
+    this._notifyRetryTimer = setTimeout(() => {
+      this._notifyRetryTimer = undefined
+      void this._retryDelegateNotifies({ dueOnly: true }).finally(() => this._armNotifyRetryScheduler())
+    }, delay)
+    this._notifyRetryTimer.unref()
   }
 
   private readonly _activeSendToAgentCallbacks = new Map<string, {
@@ -11140,6 +11281,11 @@ export class Gateway {
         kind: callbackOnComplete ? 'send_to_agent' : 'delegate',
         callback: callbackOnComplete ? 'origin-inject' : 'stdout-wait',
         idempotencyKey: sm ? idempotencyKey : undefined,
+        parentEngine: isDelegateNotifierEffective()
+          ? this._resolveDelegateParentEngine(callbackTarget?.sessionKey ?? parentSessionKey)
+          : undefined,
+        callbackOriginSessionKey: callbackTarget?.sessionKey,
+        callbackOriginUserId: callbackTarget?.userId,
       })
       if ('error' in created) {
         this._delegateResume.abort(resume.sessionKey, resume.minted)
@@ -12984,6 +13130,10 @@ export class Gateway {
       clearTimeout(this._delegateReconcileTimer)
       this._delegateReconcileTimer = undefined
     }
+    if (this._notifyRetryTimer) {
+      clearTimeout(this._notifyRetryTimer)
+      this._notifyRetryTimer = undefined
+    }
     await this._persistInterruptedSendToAgentCallbacks()
     this._delegateJobs?.close()
     this._delegateJobs = undefined
@@ -13010,6 +13160,24 @@ export class Gateway {
     job: DelegateJobSnapshot,
     intent: SendToAgentIntent,
   ): Promise<boolean> {
+    if (isDelegateNotifierEffective() && this._delegateJobs) {
+      const notifier = this._ensureEngineNotifier()
+      if (!notifier) return false
+      const result = await dispatchJobTerminalNotify(this._delegateJobs, job, notifier, {
+        resolveParentEngine: (row) =>
+          this._resolveDelegateParentEngine(
+            row.callbackOriginSessionKey ?? intent.originSessionKey ?? row.parentSessionKey,
+          ) ?? parseParentEngine(row.parentEngine),
+        resolveGoal: () => intent.goal,
+        resolveCallbackOrigin: (row) =>
+          row.callbackOriginSessionKey ?? intent.originSessionKey,
+        onDelivered: async () => {
+          this._activeSendToAgentCallbacks.delete(job.id)
+          await removeSendToAgentIntent(job.id)
+        },
+      })
+      return !('skipped' in result) && result.ok === true
+    }
     const epoch = job.callbackEpoch || 1
     const payload = callbackPayloadFromDurableJob(job)
     const result = await this.injectSendToAgentCallback({
@@ -13279,6 +13447,9 @@ export class Gateway {
     args: { jobId: string; agentId: string; goal: string; output?: string; error?: string },
   ): void {
     if (runInput.callbackOnComplete !== 'origin-inject') return
+    // R0/R1: EngineNotifier owns origin-inject delivery when the flag is on.
+    // Completer full switch (BUSY→pending for every callback kind) is stage 2.
+    if (isDelegateNotifierEffective()) return
     const owner = resolveDelegateCallbackOwner()
     const snap = this._delegateJobs?.snapshotOf(args.jobId)
     const epoch = snap?.callbackEpoch || 1
@@ -13416,7 +13587,23 @@ export class Gateway {
         })
         if (!persisted.applied) {
           if (persisted.reason === 'already_exists') {
-            // same job retry — continue to dispatch
+            const turnAlreadyQueued = await this._sendToAgentCallbackTurnAlreadyQueued({
+              jobId: args.jobId,
+              userId: args.userId,
+              sessionKey: args.origin.sessionKey,
+              sessionId: args.origin.peerId,
+              clientMessageId: args.clientMessageId,
+            })
+            const decision = decideCallbackDispatchAfterPersist({
+              persistApplied: false,
+              persistReason: persisted.reason,
+              turnAlreadyQueued,
+            })
+            if (decision === 'ack_injected') {
+              args.onQueued?.()
+              return { kind: 'injected' }
+            }
+            // Message persisted, turn not queued yet — continue dispatchInbound.
           } else if (
             persisted.reason === 'session_deleted' ||
             persisted.reason === 'malformed' ||
@@ -13462,6 +13649,31 @@ export class Gateway {
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_DISPATCH_FAILED' }
     }
     return { kind: 'injected' }
+  }
+
+  private async _sendToAgentCallbackTurnAlreadyQueued(args: {
+    jobId: string
+    userId: string
+    sessionKey: string
+    sessionId: string
+    clientMessageId: string
+  }): Promise<boolean> {
+    if (this._isIdempotencyDuplicate(sendToAgentCallbackIdempotencyKey(args.jobId))) return true
+    const live = this.sessions.getByKey(args.sessionKey) as
+      | { _currentDispatch?: { clientMessageId?: string } }
+      | undefined
+    if (live?._currentDispatch?.clientMessageId === args.clientMessageId) return true
+    try {
+      const row = await getTurnDispatchState({
+        userId: normalizeDispatchUserId(args.userId),
+        sessionId: args.sessionId,
+        clientMessageId: args.clientMessageId,
+      })
+      if (!row) return false
+      return row.state !== 'rejected'
+    } catch {
+      return false
+    }
   }
 
   // ── Cron/Reminder API handlers ──
