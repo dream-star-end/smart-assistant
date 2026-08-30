@@ -268,8 +268,21 @@ export class DelegateJobStore {
   private readonly leaseMs: number
   private readonly durable: DelegateDurableDb | null
   private readonly onTerminal?: (job: DelegateJobSnapshot) => void
-  /** Phase F: stop new claimQueued/spawn. Queued rows stay queued. */
-  private dispatchFrozen = false
+  /**
+   * Phase F: stop new claimQueued/spawn. Queued rows stay queued.
+   * Holders are generation-owned (`cutover:<n>`, `drain:<n>`) so one origin
+   * cannot thaw another. Frozen iff the set is non-empty.
+   */
+  private readonly freezeHolders = new Set<string>()
+  /**
+   * In-process runner lifecycle keyed by jobId. Not durable: a hydrated row
+   * has no attached writer until this process claims it. `runner_quiesced`
+   * requires an ACK from the attached `(claimToken, fencingEpoch)`.
+   */
+  private readonly runners = new Map<
+    string,
+    { claimToken: string; fencingEpoch: number; phase: 'attached' | 'quiesce_acked' }
+  >()
 
   constructor(opts: DelegateJobStoreOptions = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_DELEGATE_JOB_TTL_MS
@@ -353,6 +366,9 @@ export class DelegateJobStore {
     }
     this.jobs.set(jobId, entry)
     if (idempotencyKey) this.byIdempotency.set(idempotencyKey, jobId)
+    if (!queued && entry.claimToken) {
+      this.attachRunner(jobId, entry.claimToken, entry.fencingEpoch)
+    }
     return { jobId }
   }
 
@@ -388,7 +404,10 @@ export class DelegateJobStore {
     const job = this.refreshJob(jobId)
     if (!job || job.result) return false
     if (this.sm && job.claimToken) {
-      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) return false
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        if (fence) this.detachRunner(jobId, fence.claimToken, fence.fencingEpoch)
+        return false
+      }
     }
     const draft = this.cloneEntry(job)
     if (this.sm) {
@@ -448,8 +467,18 @@ export class DelegateJobStore {
     const job = this.refreshJob(jobId)
     if (!job || isDelegateTerminalState(job.state)) return false
     if (job.claimToken) {
-      if (!args.claimToken || args.claimToken !== job.claimToken) return false
-      if (args.fencingEpoch === undefined || args.fencingEpoch !== job.fencingEpoch) return false
+      if (!args.claimToken || args.claimToken !== job.claimToken) {
+        if (args.claimToken && args.fencingEpoch !== undefined) {
+          this.detachRunner(jobId, args.claimToken, args.fencingEpoch)
+        }
+        return false
+      }
+      if (args.fencingEpoch === undefined || args.fencingEpoch !== job.fencingEpoch) {
+        if (args.claimToken && args.fencingEpoch !== undefined) {
+          this.detachRunner(jobId, args.claimToken, args.fencingEpoch)
+        }
+        return false
+      }
     }
     const next = args.nextState ?? 'failed'
     const gate = assertDelegateTransition(job.state, next)
@@ -479,19 +508,65 @@ export class DelegateJobStore {
     return this.commit(job, draft, true)
   }
 
+  freezeDispatch(holder: string): void {
+    this.freezeHolders.add(holder)
+  }
+
+  thawDispatch(holder: string): boolean {
+    return this.freezeHolders.delete(holder)
+  }
+
   setDispatchFrozen(frozen: boolean): void {
-    this.dispatchFrozen = frozen
+    if (frozen) this.freezeDispatch('legacy')
+    else this.thawDispatch('legacy')
   }
 
   isDispatchFrozen(): boolean {
-    return this.dispatchFrozen
+    return this.freezeHolders.size > 0
+  }
+
+  attachRunner(jobId: string, claimToken: string, fencingEpoch: number): void {
+    this.runners.set(jobId, { claimToken, fencingEpoch, phase: 'attached' })
+  }
+
+  detachRunner(jobId: string, claimToken: string, fencingEpoch: number): void {
+    const cur = this.runners.get(jobId)
+    if (!cur) return
+    if (cur.claimToken !== claimToken || cur.fencingEpoch !== fencingEpoch) return
+    this.runners.delete(jobId)
+  }
+
+  /**
+   * Runner stopped feeding turns and will not write terminal for this fence.
+   * Only the currently attached fence can ACK; BeginCutover may then write
+   * `runner_quiesced`.
+   */
+  ackRunnerQuiesced(jobId: string, claimToken: string, fencingEpoch: number): boolean {
+    const cur = this.runners.get(jobId)
+    if (!cur || cur.phase !== 'attached') return false
+    if (cur.claimToken !== claimToken || cur.fencingEpoch !== fencingEpoch) return false
+    cur.phase = 'quiesce_acked'
+    return true
+  }
+
+  /**
+   * True only when this process has no live terminal writer for `job`'s
+   * current fence (never attached, fence rotated, or quiesce ACK'd).
+   * Absence of a session / zero turn counters is not a positive idle proof.
+   */
+  isRunnerIdle(job: DelegateJobSnapshot): boolean {
+    if (job.state !== 'running') return true
+    const cur = this.runners.get(job.id)
+    if (!cur) return true
+    if (cur.claimToken !== job.claimToken || cur.fencingEpoch !== job.fencingEpoch) return true
+    return cur.phase === 'quiesce_acked'
   }
 
   /** queued → running with a new claim_token (slot acquired). */
   claimQueued(
     jobId: string,
   ): { ok: true; claimToken: string; fencingEpoch: number } | { ok: false; reason?: 'cutover_frozen' } {
-    if (this.dispatchFrozen) return { ok: false, reason: 'cutover_frozen' }
+    if (this.freezeHolders.size > 0) return { ok: false, reason: 'cutover_frozen' }
     const job = this.refreshJob(jobId)
     if (!job || job.state !== 'queued') return { ok: false }
     const gate = assertDelegateTransition('queued', 'running')
@@ -506,6 +581,7 @@ export class DelegateJobStore {
     draft.checkpointKind = 'none'
     draft.lastActivityAt = this.now()
     if (!this.commit(job, draft, false)) return { ok: false }
+    this.attachRunner(jobId, job.claimToken!, job.fencingEpoch)
     return { ok: true, claimToken: job.claimToken!, fencingEpoch: job.fencingEpoch }
   }
 
@@ -578,10 +654,16 @@ export class DelegateJobStore {
     return this.snapshot(job)
   }
 
-  decideAdoptNextState(job: DelegateJobSnapshot): DelegateJobState {
+  decideAdoptNextState(
+    job: DelegateJobSnapshot,
+    opts?: { resumeQuiesced?: boolean },
+  ): DelegateJobState {
     if (job.state === 'queued') return 'queued'
     if (job.state === 'paused_for_cutover') {
-      return job.checkpointKind === 'runner_quiesced' ? 'paused_for_cutover' : 'killed_by_cutover'
+      if (opts?.resumeQuiesced === true && job.checkpointKind === 'runner_quiesced') {
+        return 'paused_for_cutover'
+      }
+      return 'killed_by_cutover'
     }
     if (job.state === 'running') {
       const now = this.now()
@@ -625,6 +707,37 @@ export class DelegateJobStore {
     draft.ownerLeaseUntil = now + this.leaseMs
     draft.lastActivityAt = now
     if (!this.commit(job, draft, false)) return undefined
+    this.runners.delete(jobId)
+    return this.snapshot(job)
+  }
+
+  /**
+   * Same-process cancel/flag-off closeout. Owner does not need to be stale:
+   * we are the process that paused the row. Writes killed_by_cutover + pending
+   * in one commit so the row cannot occupy capacity or resume registry.
+   */
+  killOwnedPaused(jobId: string): DelegateJobSnapshot | undefined {
+    const job = this.refreshJob(jobId)
+    if (!job || job.state !== 'paused_for_cutover') return undefined
+    if (job.ownerInstanceId && job.ownerInstanceId !== this.bootId) return undefined
+    const gate = assertDelegateTransition('paused_for_cutover', 'killed_by_cutover')
+    if (!gate.ok) return undefined
+    const now = this.now()
+    const draft = this.cloneEntry(job)
+    draft.state = 'killed_by_cutover'
+    draft.failureClass = draft.failureClass ?? 'cutover'
+    draft.failureDetail = draft.failureDetail ?? 'cutover-cancelled'
+    draft.ownerLeaseUntil = null
+    draft.result = {
+      httpStatus: 409,
+      body: { error: draft.failureDetail, failure_class: draft.failureClass },
+    }
+    draft.expiresAt = now + this.ttlMs
+    draft.terminalCommittedAt = now
+    draft.lastActivityAt = now
+    initTerminalCallback(draft)
+    if (!this.commit(job, draft, true)) return undefined
+    this.runners.delete(jobId)
     return this.snapshot(job)
   }
 
@@ -651,6 +764,7 @@ export class DelegateJobStore {
     draft.ownerLeaseUntil = now + this.leaseMs
     draft.lastActivityAt = now
     if (!this.commit(job, draft, false)) return { ok: false }
+    this.attachRunner(jobId, job.claimToken!, job.fencingEpoch)
     return { ok: true, claimToken: job.claimToken!, fencingEpoch: job.fencingEpoch }
   }
 
@@ -1225,6 +1339,8 @@ export class DelegateJobStore {
     }
     this.jobs.clear()
     this.byIdempotency.clear()
+    this.freezeHolders.clear()
+    this.runners.clear()
     // Durable rows stay on disk. Closing the handle is the caller's job so
     // tests can reopen the same file; production shutdown closes it below.
     this.durable?.close()
@@ -1252,7 +1368,10 @@ export class DelegateJobStore {
       const pending = waiters.splice(0)
       for (const w of pending) w(this.viewOf(live))
     }
-    if (becomingTerminal) this.onTerminal?.(this.snapshot(live))
+    if (becomingTerminal) {
+      this.runners.delete(live.id)
+      this.onTerminal?.(this.snapshot(live))
+    }
     return true
   }
 

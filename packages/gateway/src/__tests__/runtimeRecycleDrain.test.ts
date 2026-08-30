@@ -153,6 +153,56 @@ describe('planned runtime recycle drain', () => {
     assert.equal('runningDelegateJobs' in ok, false)
   })
 
+  test('freeze 在 await 前持有,409/503 释放,200 保留 holder', async () => {
+    const holders = new Set<string>()
+    const busy = harness({
+      freezeDelegateDispatch: (holder) => {
+        holders.add(holder)
+      },
+      thawDelegateDispatch: (holder) => {
+        holders.delete(holder)
+      },
+      countDurableRunning: async () => 1,
+    })
+    const busyDecision = await attemptRuntimeRecycleDrain(busy.deps)
+    assert.equal(busyDecision.ok, false)
+    assert.equal(busyDecision.status, 409)
+    assert.equal(holders.size, 0)
+
+    const okHolders = new Set<string>()
+    const ok = harness({
+      freezeDelegateDispatch: (holder) => {
+        okHolders.add(holder)
+      },
+      thawDelegateDispatch: (holder) => {
+        okHolders.delete(holder)
+      },
+    })
+    const okDecision = await attemptRuntimeRecycleDrain(ok.deps)
+    assert.equal(okDecision.ok, true)
+    assert.equal(okHolders.size, 1)
+    if (okDecision.ok) assert.equal(typeof okDecision.freezeHolder, 'string')
+  })
+
+  test('ACK 前同步 peek 看到 running 则 409,即使 await count 返回 0', async () => {
+    let running = 0
+    const h = harness({
+      freezeDelegateDispatch: () => {},
+      thawDelegateDispatch: () => {},
+      countRunningDelegateJobs: async () => {
+        queueMicrotask(() => {
+          running = 1
+        })
+        return 0
+      },
+      peekRunningDelegateJobs: () => running,
+    })
+    const decision = await attemptRuntimeRecycleDrain(h.deps)
+    assert.equal(decision.ok, false)
+    assert.equal(decision.status, 409)
+    if (!decision.ok) assert.equal(decision.runningDelegateJobs, 1)
+  })
+
   test('重叠握手串行化:后请求不得释放先请求已受理的双闸', async () => {
     const h = harness()
     let durableReads = 0

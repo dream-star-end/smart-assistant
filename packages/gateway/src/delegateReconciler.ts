@@ -24,7 +24,9 @@ export type DelegateReconcileHooks = {
   queueWaitMs?: number
   /**
    * Stage 3: after adopting a runner_quiesced paused row, ClaimPaused → running.
-   * Default false so flag-off stays equivalent to 1735f46be (leave paused).
+   * Default false: historical paused rows are closed as killed_by_cutover so
+   * CUTOVER on→off cannot leak capacity / resume occupancy. Fresh boots with
+   * no paused rows stay equivalent to 1735f46be.
    */
   claimPaused?: boolean
 }
@@ -66,7 +68,7 @@ export function reconcileDelegateJobsOnBoot(
       }
       continue
     }
-    const next = store.decideAdoptNextState(job)
+    const next = store.decideAdoptNextState(job, { resumeQuiesced: hooks.claimPaused === true })
     if (shouldDeferKill(store, job, next, now, hooks.isChildAlive)) {
       summary.deferred += 1
       continue

@@ -22,10 +22,18 @@ export interface RuntimeRecycleDrainDeps {
    * `paused_for_cutover` is not running and must not block drain.
    */
   countRunningDelegateJobs?: () => Promise<number> | number
+  /**
+   * Synchronous ACK-time snapshot. Used after every await so a queued job
+   * cannot sneak `queued→running` between count and 200.
+   */
+  peekRunningDelegateJobs?: () => number
+  /** Generation-owned freeze of `claimQueued`. Flag-off omits both freeze/thaw. */
+  freezeDelegateDispatch?: (holder: string) => void
+  thawDelegateDispatch?: (holder: string) => void
 }
 
 export type RuntimeRecycleDrainDecision =
-  | { ok: true; status: 200; drainTtlMs: number }
+  | { ok: true; status: 200; drainTtlMs: number; freezeHolder?: string }
   | {
       ok: false
       status: 409 | 503
@@ -43,31 +51,42 @@ export type RuntimeRecycleDrainDecision =
 export async function attemptRuntimeRecycleDrain(
   deps: RuntimeRecycleDrainDeps,
 ): Promise<RuntimeRecycleDrainDecision> {
+  const holder = deps.freezeDelegateDispatch ? `drain:${deps.now()}` : undefined
+  const thaw = (): void => {
+    if (holder) deps.thawDelegateDispatch?.(holder)
+  }
   const release = (): void => {
     deps.releaseGatewayDrain()
     deps.releaseSessionDrain()
   }
+  const fail = (decision: Extract<RuntimeRecycleDrainDecision, { ok: false }>): RuntimeRecycleDrainDecision => {
+    thaw()
+    release()
+    return decision
+  }
+
+  // Freeze claimQueued before any await so a queued job cannot promote during
+  // durable / delegate count continuations (TOCTOU). Flag-off omits freeze.
+  if (holder) deps.freezeDelegateDispatch!(holder)
 
   deps.armGatewayDrain(deps.now() + deps.ttlMs)
   const sessionDrain = deps.armSessionDrain(deps.ttlMs)
   const initialIngress = deps.activeIngress()
   if (!sessionDrain.accepted || initialIngress > 0) {
-    release()
-    return {
+    return fail({
       ok: false,
       status: 409,
       reason: 'active_turn',
       activeIngress: initialIngress,
       activeTurns: sessionDrain.activeTurns,
-    }
+    })
   }
 
   let durableRunning: number
   try {
     durableRunning = await deps.countDurableRunning()
   } catch {
-    release()
-    return { ok: false, status: 503, reason: 'drain_state_unavailable' }
+    return fail({ ok: false, status: 503, reason: 'drain_state_unavailable' })
   }
 
   let runningDelegateJobs = 0
@@ -75,37 +94,40 @@ export async function attemptRuntimeRecycleDrain(
     try {
       runningDelegateJobs = await deps.countRunningDelegateJobs()
     } catch {
-      release()
-      return { ok: false, status: 503, reason: 'drain_state_unavailable' }
+      return fail({ ok: false, status: 503, reason: 'drain_state_unavailable' })
     }
   }
 
-  // Re-read ingress after the awaited SQLite acquisition. New ingress cannot
-  // pass while the gateway gate is armed; this catches any work that entered
-  // immediately before the gate was set and had not yet been observed.
+  // No await after this point. Peek is the ACK-time snapshot.
+  if (deps.peekRunningDelegateJobs) {
+    runningDelegateJobs = deps.peekRunningDelegateJobs()
+  }
   const activeIngress = deps.activeIngress()
   if (activeIngress > 0 || durableRunning > 0 || runningDelegateJobs > 0) {
-    release()
-    return {
+    return fail({
       ok: false,
       status: 409,
       reason: 'active_turn',
       activeIngress,
       activeTurns: sessionDrain.activeTurns,
       durableRunning: durableRunning + runningDelegateJobs,
-      ...(deps.countRunningDelegateJobs ? { runningDelegateJobs } : {}),
-    }
+      ...(deps.countRunningDelegateJobs || deps.peekRunningDelegateJobs
+        ? { runningDelegateJobs }
+        : {}),
+    })
   }
 
-  // SQLite can wait close to its busy timeout. Never answer 200 using a gate
-  // that expired while the durable read was pending.
   const finalNow = deps.now()
   if (!deps.isGatewayDrainActive(finalNow) || !deps.isSessionDrainActive(finalNow)) {
-    release()
-    return { ok: false, status: 503, reason: 'drain_fence_expired' }
+    return fail({ ok: false, status: 503, reason: 'drain_fence_expired' })
   }
 
-  return { ok: true, status: 200, drainTtlMs: deps.ttlMs }
+  return {
+    ok: true,
+    status: 200,
+    drainTtlMs: deps.ttlMs,
+    ...(holder ? { freezeHolder: holder } : {}),
+  }
 }
 
 /**
@@ -117,7 +139,7 @@ export async function attemptRuntimeRecycleDrain(
  * busy response without touching either gate.
  */
 export class RuntimeRecycleDrainCoordinator {
-  private current: { state: 'pending' | 'accepted' } | null = null
+  private current: { state: 'pending' | 'accepted'; freezeHolder?: string } | null = null
 
   constructor(private readonly deps: RuntimeRecycleDrainDeps) {}
 
@@ -136,15 +158,17 @@ export class RuntimeRecycleDrainCoordinator {
           reason: 'drain_in_progress',
         })
       }
+      if (current.freezeHolder) this.deps.thawDelegateDispatch?.(current.freezeHolder)
       this.current = null
     }
 
-    const entry: { state: 'pending' | 'accepted' } = { state: 'pending' }
+    const entry: { state: 'pending' | 'accepted'; freezeHolder?: string } = { state: 'pending' }
     this.current = entry
     return attemptRuntimeRecycleDrain(this.deps).then(
       (decision) => {
         if (decision.ok) {
           entry.state = 'accepted'
+          entry.freezeHolder = decision.freezeHolder
         } else if (this.current === entry) {
           this.current = null
         }

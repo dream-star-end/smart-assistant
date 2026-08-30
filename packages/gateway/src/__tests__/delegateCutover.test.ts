@@ -12,10 +12,16 @@ import { join } from 'node:path'
 import { describe, it } from 'node:test'
 
 import { DelegateDurableDb } from '../delegateDurable.js'
-import { beginDelegateCutover, resolveDelegateCutoverFreezeMs } from '../delegateCutover.js'
+import {
+  beginDelegateCutover,
+  endDelegateCutover,
+  isDelegateRunnerIdle,
+  resolveDelegateCutoverFreezeMs,
+} from '../delegateCutover.js'
 import { DelegateJobStore } from '../delegateJobs.js'
 import { dispatchJobTerminalNotify } from '../delegateNotifyDispatch.js'
-import { reconcileDelegateJobsOnBoot } from '../delegateReconciler.js'
+import { reconcileDelegateJobsOnBoot, restoreResumeOccupancyFromJobs } from '../delegateReconciler.js'
+import { DelegateResumeRegistry } from '../delegateResume.js'
 import {
   isDelegateCutoverEffective,
   isDelegateCutoverEnabled,
@@ -271,19 +277,206 @@ describe('restart ClaimPaused / unrecoverable', () => {
     }
   })
 
-  it('flag-off reconciler leaves quiesced paused (no ClaimPaused)', async () => {
+  it('flag-off boot closes historical paused rows (no capacity/registry leak)', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-cut-flagoff-'))
     try {
       let now = 1_000
       const s1 = openStore(dir, { bootId: 'gw:g0', now: () => now })
-      const { jobId } = await runningJob(s1)
+      const { jobId } = await runningJob(s1, {
+        sessionKey: 'agent:coding-assistant:delegate:main:1:flagoff',
+      })
       await beginDelegateCutover(s1, { freezeBudgetMs: 0, now: () => now, isIdle: () => true })
+      assert.equal(s1.snapshotOf(jobId)?.state, 'paused_for_cutover')
       s1.close()
       now = 50_000
       const s2 = openStore(dir, { bootId: 'gw:g1', now: () => now })
-      reconcileDelegateJobsOnBoot(s2, { now: () => now })
-      assert.equal(s2.snapshotOf(jobId)?.state, 'paused_for_cutover')
+      const resume = new DelegateResumeRegistry()
+      const summary = reconcileDelegateJobsOnBoot(s2, { now: () => now, claimPaused: false })
+      const snap = s2.snapshotOf(jobId)!
+      assert.equal(snap.state, 'killed_by_cutover')
+      assert.equal(snap.callbackState, 'pending')
+      assert.ok(snap.terminalCommittedAt)
+      assert.ok(summary.killed >= 1)
+      assert.equal(s2.nonTerminalCount(), 0)
+      assert.equal(restoreResumeOccupancyFromJobs(resume, s2), 0)
+      const retry = resume.preflight({
+        resumeSessionKey: 'agent:coding-assistant:delegate:main:1:flagoff',
+        parentSessionKey: 'agent:main:webchat:dm:p1',
+        targetAgentId: 'coding-assistant',
+        sourceAgent: 'main',
+      })
+      assert.equal(retry.ok, false)
+      if (!retry.ok) assert.equal(retry.httpStatus, 400)
+      now = 100_000
+      const summary2 = reconcileDelegateJobsOnBoot(s2, { now: () => now, claimPaused: false })
+      assert.equal(s2.snapshotOf(jobId)?.state, 'killed_by_cutover')
+      assert.equal(summary2.adopted, 0)
+      assert.equal(summary2.killed, 0)
+      assert.equal(s2.nonTerminalCount(), 0)
       s2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('production idle / quiesce ACK (blocker 1)', () => {
+  it('claim→spawn and submit→terminal windows are non-idle without ACK; false quiesce cannot drop terminal', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-idle-prod-'))
+    try {
+      const store = openStore(dir)
+      const { jobId, fence, snap } = await runningJob(store)
+      assert.equal(store.isRunnerIdle(snap), false)
+      assert.equal(isDelegateRunnerIdle(snap, store, null), false)
+      assert.equal(
+        isDelegateRunnerIdle(snap, store, { activeTurnCount: 0, activeClientTurnCount: 0 }),
+        false,
+      )
+      const result = await beginDelegateCutover(store, {
+        generation: 1,
+        freezeBudgetMs: 0,
+        isIdle: (job) => isDelegateRunnerIdle(job, store, null),
+      })
+      assert.equal(result.quiesced, 0)
+      assert.equal(result.timedOut, 1)
+      assert.equal(store.snapshotOf(jobId)?.checkpointKind, 'none')
+      assert.equal(
+        store.complete(jobId, { httpStatus: 200, body: { ok: true, output: 'done' } }, fence),
+        false,
+      )
+      assert.equal(store.snapshotOf(jobId)?.state, 'paused_for_cutover')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('only current-fence quiesce ACK may write runner_quiesced; stale fence cannot ACK', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-ack-'))
+    try {
+      const store = openStore(dir)
+      const { jobId, fence, snap } = await runningJob(store)
+      assert.equal(store.ackRunnerQuiesced(jobId, 'wrong-token', fence.fencingEpoch), false)
+      assert.equal(store.isRunnerIdle(snap), false)
+      assert.equal(store.ackRunnerQuiesced(jobId, fence.claimToken, fence.fencingEpoch), true)
+      assert.equal(store.isRunnerIdle(store.snapshotOf(jobId)!), true)
+      const result = await beginDelegateCutover(store, {
+        generation: 2,
+        freezeBudgetMs: 0,
+        isIdle: (job) => store.isRunnerIdle(job),
+      })
+      assert.equal(result.quiesced, 1)
+      assert.equal(result.timedOut, 0)
+      assert.equal(
+        store.complete(jobId, { httpStatus: 200, body: { output: 'should-not-land' } }, fence),
+        false,
+      )
+      const paused = store.snapshotOf(jobId)!
+      assert.equal(paused.state, 'paused_for_cutover')
+      assert.equal(paused.checkpointKind, 'runner_quiesced')
+      assert.equal(paused.result, null)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('attached runner can complete during freeze budget before timeout pause', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-idle-complete-'))
+    try {
+      let now = 1_000
+      const store = openStore(dir, { now: () => now })
+      const { jobId, fence } = await runningJob(store)
+      const result = await beginDelegateCutover(store, {
+        generation: 4,
+        freezeBudgetMs: 50,
+        now: () => now,
+        pollMs: 25,
+        sleep: async (ms) => {
+          store.complete(jobId, { httpStatus: 200, body: { ok: true, output: 'saved' } }, fence)
+          now += ms
+        },
+        isIdle: (job) => store.isRunnerIdle(job),
+      })
+      assert.equal(result.quiesced, 0)
+      assert.equal(result.timedOut, 0)
+      assert.equal(result.completedDuring, 1)
+      const snap = store.snapshotOf(jobId)!
+      assert.equal(snap.state, 'completed')
+      assert.equal((snap.result?.body as { output?: string })?.output, 'saved')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('EndCutover generation-owned thaw (blocker 2)', () => {
+  it('matching generation thaws dispatch and closes paused rows to killed_by_cutover', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-end-'))
+    try {
+      const store = openStore(dir)
+      const { jobId } = await runningJob(store)
+      await beginDelegateCutover(store, { generation: 11, freezeBudgetMs: 0, isIdle: () => true })
+      assert.equal(store.isDispatchFrozen(), true)
+      const ended = endDelegateCutover(store, 11)
+      assert.equal(ended.thawed, true)
+      assert.equal(ended.closed, 1)
+      assert.equal(store.isDispatchFrozen(), false)
+      const snap = store.snapshotOf(jobId)!
+      assert.equal(snap.state, 'killed_by_cutover')
+      assert.equal(snap.callbackState, 'pending')
+      const created = store.create('coding-assistant', { queued: true })
+      assert.ok('jobId' in created)
+      const claimed = store.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('other generation cannot thaw or close a live cutover freeze', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-end-other-'))
+    try {
+      const store = openStore(dir)
+      const { jobId } = await runningJob(store)
+      await beginDelegateCutover(store, { generation: 11, freezeBudgetMs: 0, isIdle: () => true })
+      const ended = endDelegateCutover(store, 99)
+      assert.equal(ended.thawed, false)
+      assert.equal(ended.closed, 0)
+      assert.equal(store.isDispatchFrozen(), true)
+      assert.equal(store.snapshotOf(jobId)?.state, 'paused_for_cutover')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('beginDelegateCutover throw thaws matching generation so claimQueued can proceed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-throw-thaw-'))
+    try {
+      const store = openStore(dir)
+      await runningJob(store)
+      await assert.rejects(
+        () =>
+          beginDelegateCutover(store, {
+            generation: 5,
+            freezeBudgetMs: 50,
+            pollMs: 25,
+            isIdle: () => false,
+            sleep: async () => {
+              throw new Error('boom')
+            },
+          }),
+        /boom/,
+      )
+      assert.equal(store.isDispatchFrozen(), false)
+      const created = store.create('coding-assistant', { queued: true })
+      assert.ok('jobId' in created)
+      const claimed = store.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      store.close()
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -327,6 +520,66 @@ describe('recycle drain runningDelegateJobs', () => {
       })
       const ok = await attemptRuntimeRecycleDrain(drained.deps)
       assert.deepEqual(ok, { ok: true, status: 200, drainTtlMs: 10_000 })
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('drain freezes claimQueued before count so ACK cannot race queued→running', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-drain-toctou-'))
+    try {
+      const store = openStore(dir)
+      const created = store.create('coding-assistant', { queued: true })
+      assert.ok('jobId' in created)
+      const h = drainHarness({
+        freezeDelegateDispatch: (holder) => store.freezeDispatch(holder),
+        thawDelegateDispatch: (holder) => {
+          store.thawDispatch(holder)
+        },
+        countRunningDelegateJobs: async () => {
+          await Promise.resolve()
+          const raced = store.claimQueued(created.jobId)
+          assert.equal(raced.ok, false)
+          if (!raced.ok) assert.equal(raced.reason, 'cutover_frozen')
+          return 0
+        },
+        peekRunningDelegateJobs: () => store.countRunning(),
+      })
+      const decision = await attemptRuntimeRecycleDrain(h.deps)
+      assert.equal(decision.ok, true)
+      if (decision.ok) assert.equal(decision.status, 200)
+      assert.equal(store.snapshotOf(created.jobId)?.state, 'queued')
+      assert.equal(store.countRunning(), 0)
+      assert.equal(store.isDispatchFrozen(), true)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('drain 409 thaws matching holder so a later claimQueued can dispatch', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-drain-thaw-'))
+    try {
+      const store = openStore(dir)
+      await runningJob(store)
+      const queued = store.create('coding-assistant', { queued: true })
+      assert.ok('jobId' in queued)
+      const h = drainHarness({
+        freezeDelegateDispatch: (holder) => store.freezeDispatch(holder),
+        thawDelegateDispatch: (holder) => {
+          store.thawDispatch(holder)
+        },
+        countRunningDelegateJobs: () => store.countRunning(),
+        peekRunningDelegateJobs: () => store.countRunning(),
+      })
+      const decision = await attemptRuntimeRecycleDrain(h.deps)
+      assert.equal(decision.ok, false)
+      assert.equal(decision.status, 409)
+      if (!decision.ok) assert.equal(decision.runningDelegateJobs, 1)
+      assert.equal(store.isDispatchFrozen(), false)
+      const claimed = store.claimQueued(queued.jobId)
+      assert.equal(claimed.ok, true)
       store.close()
     } finally {
       await rm(dir, { recursive: true, force: true })

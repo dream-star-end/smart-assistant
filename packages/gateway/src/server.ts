@@ -397,7 +397,12 @@ import {
   isDelegateSmEnabled,
   resolveDelegateCallbackOwner,
 } from './delegateSmFlag.js'
-import { beginDelegateCutover, resolveDelegateCutoverFreezeMs } from './delegateCutover.js'
+import {
+  beginDelegateCutover,
+  endDelegateCutover,
+  isDelegateRunnerIdle,
+  resolveDelegateCutoverFreezeMs,
+} from './delegateCutover.js'
 import { DefaultEngineNotifier, tryWriteInlinePush, type InlinePushSession } from './engineNotifier.js'
 import {
   delayUntilNextNotifyRetry,
@@ -3891,6 +3896,13 @@ export class Gateway {
           ...(isDelegateCutoverEffective()
             ? {
                 countRunningDelegateJobs: () => this._ensureDelegateJobStore().countRunning(),
+                peekRunningDelegateJobs: () => this._ensureDelegateJobStore().countRunning(),
+                freezeDelegateDispatch: (holder: string) => {
+                  this._ensureDelegateJobStore().freezeDispatch(holder)
+                },
+                thawDelegateDispatch: (holder: string) => {
+                  this._ensureDelegateJobStore().thawDispatch(holder)
+                },
               }
             : {}),
         })
@@ -3929,8 +3941,9 @@ export class Gateway {
       }
       const store = this._ensureDelegateJobStore()
       const rawGeneration = Number.parseInt(url.searchParams.get('generation') ?? '', 10)
+      const generation = Number.isFinite(rawGeneration) ? rawGeneration : Date.now()
       void beginDelegateCutover(store, {
-        generation: Number.isFinite(rawGeneration) ? rawGeneration : Date.now(),
+        generation,
         freezeBudgetMs: resolveDelegateCutoverFreezeMs(),
         isIdle: (job) => this._delegateRunnerIdle(job),
       }).then(
@@ -3938,10 +3951,30 @@ export class Gateway {
           this.sendJson(res, 200, { ok: true, ...result })
         },
         (err) => {
+          endDelegateCutover(store, generation)
           this.log.error('delegate begin-cutover failed', undefined, err as Error)
           this.sendJson(res, 503, { ok: false, reason: 'cutover_quiesce_failed' })
         },
       )
+      return
+    }
+
+    if (url.pathname === '/internal/v3/delegate-end-cutover' && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      if (!isDelegateCutoverEffective()) {
+        this.sendJson(res, 409, { ok: false, reason: 'cutover_flag_off' })
+        return
+      }
+      const store = this._ensureDelegateJobStore()
+      const rawGeneration = Number.parseInt(url.searchParams.get('generation') ?? '', 10)
+      if (!Number.isFinite(rawGeneration)) {
+        this.sendJson(res, 400, { ok: false, reason: 'generation_required' })
+        return
+      }
+      this.sendJson(res, 200, { ok: true, ...endDelegateCutover(store, rawGeneration) })
       return
     }
 
@@ -10615,16 +10648,25 @@ export class Gateway {
   }
 
   private _delegateRunnerIdle(job: DelegateJobSnapshot): boolean {
-    if (!job.sessionKey) return true
+    const store = this._delegateJobs
+    if (!store) return false
     try {
-      const session = this.sessions?.getByKey?.(job.sessionKey) as {
-        _activeTurnCount?: number
-        _activeClientTurnCount?: number
-      } | undefined
-      if (!session) return true
-      const turns =
-        Math.max(0, session._activeTurnCount ?? 0) + Math.max(0, session._activeClientTurnCount ?? 0)
-      return turns === 0
+      const session = job.sessionKey
+        ? this.sessions?.getByKey?.(job.sessionKey) as {
+            _activeTurnCount?: number
+            _activeClientTurnCount?: number
+          } | undefined
+        : undefined
+      return isDelegateRunnerIdle(
+        job,
+        store,
+        session
+          ? {
+              activeTurnCount: session._activeTurnCount ?? 0,
+              activeClientTurnCount: session._activeClientTurnCount ?? 0,
+            }
+          : null,
+      )
     } catch {
       return false
     }

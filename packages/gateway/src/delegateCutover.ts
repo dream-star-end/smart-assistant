@@ -41,67 +41,122 @@ export function resolveDelegateCutoverFreezeMs(env: NodeJS.ProcessEnv = process.
   return Math.min(DELEGATE_CUTOVER_FREEZE_MS, Math.floor(n))
 }
 
+export function cutoverFreezeHolder(generation: number): string {
+  return `cutover:${generation}`
+}
+
+/**
+ * Production idle proof: attached runner (current fence, not ACK'd) is never
+ * idle. Session turn counters are negative evidence only — missing session or
+ * zero turns cannot prove quiesce.
+ */
+export function isDelegateRunnerIdle(
+  job: DelegateJobSnapshot,
+  store: Pick<DelegateJobStore, 'isRunnerIdle'>,
+  sessionTurns?: { activeTurnCount: number; activeClientTurnCount: number } | null,
+): boolean {
+  if (!store.isRunnerIdle(job)) return false
+  if (sessionTurns) {
+    const turns =
+      Math.max(0, sessionTurns.activeTurnCount) + Math.max(0, sessionTurns.activeClientTurnCount)
+    if (turns > 0) return false
+  }
+  return true
+}
+
+export type EndCutoverResult = {
+  generation: number
+  thawed: boolean
+  closed: number
+}
+
+/**
+ * Generation-owned cancel: thaw this cutover freeze (other holders stay) and
+ * close matching paused rows. This stage has no safe in-process resume hook,
+ * so closed rows become `killed_by_cutover` + pending rather than ClaimPaused.
+ */
+export function endDelegateCutover(
+  store: DelegateJobStore,
+  generation: number,
+): EndCutoverResult {
+  const thawed = store.thawDispatch(cutoverFreezeHolder(generation))
+  let closed = 0
+  for (const job of store.listNonTerminal()) {
+    if (job.state !== 'paused_for_cutover') continue
+    if (job.generation !== generation) continue
+    if (store.killOwnedPaused(job.id)) closed += 1
+  }
+  return { generation, thawed, closed }
+}
+
 export async function beginDelegateCutover(
   store: DelegateJobStore,
   opts: BeginCutoverOptions = {},
 ): Promise<BeginCutoverResult> {
-  store.setDispatchFrozen(true)
   const now = opts.now ?? Date.now
   const sleep = opts.sleep ?? defaultSleep
   const freezeBudgetMs = opts.freezeBudgetMs ?? DELEGATE_CUTOVER_FREEZE_MS
   const pollMs = Math.max(1, opts.pollMs ?? 25)
   const generation = opts.generation ?? now()
-  const initialIds = new Set(store.listRunning().map((job) => job.id))
+  const isIdle =
+    opts.isIdle ?? ((job: DelegateJobSnapshot) => store.isRunnerIdle(job))
+  store.freezeDispatch(cutoverFreezeHolder(generation))
+  try {
+    const initialIds = new Set(store.listRunning().map((job) => job.id))
 
-  const pauseIdle = (): number => {
-    let n = 0
+    const pauseIdle = (): number => {
+      let n = 0
+      for (const job of store.listRunning()) {
+        if (isIdle(job) !== true) continue
+        if (!job.claimToken) continue
+        const paused = store.pauseForCutover(job.id, {
+          claimToken: job.claimToken,
+          fencingEpoch: job.fencingEpoch,
+          generation,
+          checkpointKind: 'runner_quiesced',
+        })
+        if (paused) n += 1
+      }
+      return n
+    }
+
+    let quiesced = pauseIdle()
+    const deadline = now() + freezeBudgetMs
+    while (store.countRunning() > 0 && now() < deadline) {
+      await sleep(pollMs)
+      quiesced += pauseIdle()
+    }
+
+    let timedOut = 0
     for (const job of store.listRunning()) {
-      if (opts.isIdle?.(job) !== true) continue
       if (!job.claimToken) continue
       const paused = store.pauseForCutover(job.id, {
         claimToken: job.claimToken,
         fencingEpoch: job.fencingEpoch,
         generation,
-        checkpointKind: 'runner_quiesced',
+        checkpointKind: 'none',
       })
-      if (paused) n += 1
+      if (paused) timedOut += 1
     }
-    return n
-  }
 
-  let quiesced = pauseIdle()
-  const deadline = now() + freezeBudgetMs
-  while (store.countRunning() > 0 && now() < deadline) {
-    await sleep(pollMs)
-    quiesced += pauseIdle()
-  }
+    let completedDuring = 0
+    for (const id of initialIds) {
+      const snap = store.snapshotOf(id)
+      if (!snap || snap.state === 'completed' || snap.state === 'failed' || snap.state === 'cancelled') {
+        completedDuring += 1
+      }
+    }
 
-  let timedOut = 0
-  for (const job of store.listRunning()) {
-    if (!job.claimToken) continue
-    const paused = store.pauseForCutover(job.id, {
-      claimToken: job.claimToken,
-      fencingEpoch: job.fencingEpoch,
+    return {
       generation,
-      checkpointKind: 'none',
-    })
-    if (paused) timedOut += 1
-  }
-
-  let completedDuring = 0
-  for (const id of initialIds) {
-    const snap = store.snapshotOf(id)
-    if (!snap || snap.state === 'completed' || snap.state === 'failed' || snap.state === 'cancelled') {
-      completedDuring += 1
+      paused: quiesced + timedOut,
+      quiesced,
+      timedOut,
+      completedDuring,
+      remainingRunning: store.countRunning(),
     }
-  }
-
-  return {
-    generation,
-    paused: quiesced + timedOut,
-    quiesced,
-    timedOut,
-    completedDuring,
-    remainingRunning: store.countRunning(),
+  } catch (err) {
+    endDelegateCutover(store, generation)
+    throw err
   }
 }
