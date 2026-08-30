@@ -1134,6 +1134,62 @@ describe('closeout residual — durable tombstone survives cross-gateway overlay
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  it('durable tombstone wins even when the stale overlay fence would lose', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-r2-tomb-fence-'))
+    const surfaceDb = join(dir, 'delegate-inflight-surface.db')
+    try {
+      const jobsDb = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const g0 = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 40 })
+      const jobs = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        durable: jobsDb,
+        bootId: 'gw:r2-tomb-fence',
+      })
+      const created = jobs.create('coding-assistant', {
+        queued: true,
+        parentSessionKey: PARENT,
+        sessionKey: 'agent:coding-assistant:delegate:main:tomb-fence',
+      })
+      assert.ok('jobId' in created)
+      const snap = jobs.snapshotOf(created.jobId)!
+      g0.upsertEnqueue({
+        jobId: created.jobId,
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'ghost-queued',
+        state: 'queued',
+        userId: 'user-r2',
+        fencingEpoch: snap.fencingEpoch,
+        generation: snap.generation + 8,
+      })
+      const staleOverlay = [structuredClone(snap)]
+      const g1 = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 41 })
+      assert.equal(jobs.dropIfUnclaimed(created.jobId), true)
+      assert.equal(g1.drop(created.jobId), true)
+      const page = await handleInflightDelegatesRequest({
+        method: 'GET',
+        sessionId: SESS,
+        userId: 'user-r2',
+        enabled: true,
+        loadSession: async () => ({ id: SESS, userId: 'user-r2' }),
+        store: g0,
+        overlayJobs: () => staleOverlay,
+        resolveJob: () => undefined,
+        dropMissingLive: false,
+      })
+      assert.equal(page.status, 200)
+      const states = ((page.body.items as Array<{ state: string }>) ?? []).map((row) => row.state)
+      assert.deepEqual(states, [])
+      assert.equal(g0.get(created.jobId), undefined)
+      g0.close()
+      g1.close()
+      jobs.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('closeout residual — writer lock must not stall the gateway', () => {

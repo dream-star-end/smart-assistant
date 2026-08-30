@@ -574,32 +574,20 @@ export class DelegateInflightSurfaceStore {
   }
 
   get(jobId: string): InflightDelegateSurface | undefined {
+    if (this.consumeTombstone(jobId)) return undefined
     const row = this.byJob.get(jobId)
     return row ? publicView(row) : undefined
   }
 
   upsertEnqueue(input: InflightEnqueueInput): InflightDelegateSurface {
-    if (this.droppedJobs.has(input.jobId)) {
-      const existingDropped = this.byJob.get(input.jobId)
-      if (existingDropped) return publicView(existingDropped)
-      return publicView({
+    if (this.consumeTombstone(input.jobId)) {
+      return this.droppedPublicView({
         jobId: input.jobId,
         parentSessionKey: input.parentSessionKey,
-        sessionId: sessionIdFromParentKey(input.parentSessionKey),
-        userId: input.userId || '',
+        userId: input.userId,
         agentId: input.agentId,
-        runId: input.runId || defaultRunId(input.jobId),
-        goal: clampText(input.goal ?? '', INFLIGHT_GOAL_MAX_CHARS),
-        state: 'failed',
-        liveHint: '',
-        updatedAt: this.now(),
-        fencingEpoch: 0,
-        generation: 0,
-        payloadBytes: 0,
-        expiresAt: null,
-        nested: false,
-        ownerRunId: '',
-        authority: AUTHORITY_PROJECTION,
+        runId: input.runId,
+        goal: input.goal,
       })
     }
     const existing = this.byJob.get(input.jobId)
@@ -652,7 +640,9 @@ export class DelegateInflightSurfaceStore {
     }
     this.persist(next)
     this.enforceTerminalCap(next.userId, next.sessionId)
-    return publicView(this.byJob.get(next.jobId) ?? next)
+    const committed = this.byJob.get(next.jobId)
+    if (!committed) return this.droppedPublicView(next)
+    return publicView(committed)
   }
 
   updateLive(input: {
@@ -671,7 +661,7 @@ export class DelegateInflightSurfaceStore {
     preserveIdentity?: boolean
     authoritative?: boolean
   }): InflightDelegateSurface | undefined {
-    if (this.droppedJobs.has(input.jobId)) return undefined
+    if (this.consumeTombstone(input.jobId)) return undefined
     const existing = this.byJob.get(input.jobId)
     if (!existing) return undefined
     const nextState = input.state ?? existing.state
@@ -732,7 +722,7 @@ export class DelegateInflightSurfaceStore {
     if (isDeferredExactProcessStub(input.group)) {
       return { folded: false, reason: 'deferred_stub' }
     }
-    if (this.droppedJobs.has(input.jobId)) return { folded: false, reason: 'missing' }
+    if (this.consumeTombstone(input.jobId)) return { folded: false, reason: 'missing' }
     const existing = this.byJob.get(input.jobId)
     if (!existing) return { folded: false, reason: 'missing' }
     // Job-authority mapping: a finished DurableAgentGroup is a completed job
@@ -788,7 +778,7 @@ export class DelegateInflightSurfaceStore {
    * complete, fail, cancel, cutover, capacity). Fail-open: never throws.
    */
   projectJob(job: DelegateJobSnapshot): InflightDelegateSurface | undefined {
-    if (this.droppedJobs.has(job.id)) return undefined
+    if (this.consumeTombstone(job.id)) return undefined
     if (!job.parentSessionKey) return undefined
     const existing = this.byJob.get(job.id)
     const fence = { fencingEpoch: job.fencingEpoch, generation: job.generation }
@@ -850,6 +840,7 @@ export class DelegateInflightSurfaceStore {
     this.sweepExpired()
     const matched: SurfaceRow[] = []
     for (const row of this.byJob.values()) {
+      if (this.droppedJobs.has(row.jobId) || row.tombstoned) continue
       if (opts.userId && row.userId && row.userId !== opts.userId) continue
       if (row.sessionId === sessionId || parentKeyMatchesSessionId(row.parentSessionKey, sessionId)) {
         matched.push(row)
@@ -964,6 +955,7 @@ export class DelegateInflightSurfaceStore {
     } = {},
   ): InflightDelegateSurface[] {
     this.sweepExpired()
+    this.refreshTombstonesFromDb()
     const live = new Map<string, DelegateJobSnapshot>()
     for (const job of jobs) {
       if (!job.parentSessionKey) continue
@@ -1042,9 +1034,70 @@ export class DelegateInflightSurfaceStore {
     this.loadStmt = null
   }
 
+  private droppedPublicView(input: {
+    jobId: string
+    parentSessionKey: string
+    userId?: string
+    agentId?: string
+    runId?: string
+    goal?: string
+  }): InflightDelegateSurface {
+    return publicView({
+      jobId: input.jobId,
+      parentSessionKey: input.parentSessionKey,
+      sessionId: sessionIdFromParentKey(input.parentSessionKey),
+      userId: input.userId || '',
+      agentId: input.agentId || '',
+      runId: input.runId || defaultRunId(input.jobId),
+      goal: clampText(input.goal ?? '', INFLIGHT_GOAL_MAX_CHARS),
+      state: 'failed',
+      liveHint: '',
+      updatedAt: this.now(),
+      fencingEpoch: 0,
+      generation: 0,
+      payloadBytes: 0,
+      expiresAt: null,
+      nested: false,
+      ownerRunId: '',
+      authority: AUTHORITY_PROJECTION,
+    })
+  }
+
   private rememberTombstone(jobId: string): void {
     this.droppedJobs.add(jobId)
     this.byJob.delete(jobId)
+  }
+
+  /**
+   * Heal this process from another gateway's durable tombstone even when
+   * the in-memory fence would otherwise skip persist().
+   */
+  private consumeTombstone(jobId: string): boolean {
+    if (this.droppedJobs.has(jobId)) {
+      this.byJob.delete(jobId)
+      return true
+    }
+    if (this.rowIsTombstoned(jobId)) {
+      this.rememberTombstone(jobId)
+      return true
+    }
+    return false
+  }
+
+  private refreshTombstonesFromDb(): void {
+    if (!this.db) return
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT job_id FROM inflight_delegate_surface WHERE IFNULL(tombstoned, 0) = 1`,
+        )
+        .all() as Array<{ job_id: string }>
+      for (const row of rows) {
+        if (row.job_id) this.rememberTombstone(row.job_id)
+      }
+    } catch (err) {
+      this.noteWriteError(err, { phase: 'refresh-tombstone' })
+    }
   }
 
   private persistTombstone(row: {
@@ -1109,7 +1162,7 @@ export class DelegateInflightSurfaceStore {
   }
 
   private persist(row: SurfaceRow): boolean {
-    if (this.droppedJobs.has(row.jobId)) return false
+    if (this.consumeTombstone(row.jobId)) return false
     try {
       if (!this.upsertStmt) {
         this.byJob.set(row.jobId, row)
