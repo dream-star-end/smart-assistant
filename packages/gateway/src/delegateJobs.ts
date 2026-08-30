@@ -103,6 +103,7 @@ export type DelegateCreateMeta = {
   ownerInstanceId?: string
   claimToken?: string
   generation?: number
+  parentEngine?: string
 }
 
 export type DelegateJobSnapshot = {
@@ -129,6 +130,9 @@ export type DelegateJobSnapshot = {
   expiresAt?: number | null
   createdAt?: number
   lastActivityAt?: number
+  parentEngine?: string
+  notifyLane?: string
+  notifyId?: string
 }
 
 type JobEntry = {
@@ -156,6 +160,9 @@ type JobEntry = {
   callbackEpoch: number
   idempotencyKey?: string
   kind: DelegateJobKind
+  parentEngine?: string
+  notifyLane?: string
+  notifyId?: string
 }
 
 export type DelegateJobStoreOptions = {
@@ -274,6 +281,7 @@ export class DelegateJobStore {
       callbackEpoch: 0,
       idempotencyKey,
       kind: meta?.kind ?? 'delegate',
+      parentEngine: meta?.parentEngine,
     }
     if (this.durable) {
       const outcome = this.durable.insertCreate(this.toDurable(entry), this.maxJobs)
@@ -616,6 +624,9 @@ export class DelegateJobStore {
       createdAt: job.createdAt,
       lastActivityAt: job.lastActivityAt,
       parentSessionKey: job.parentSessionKey,
+      parentEngine: job.parentEngine,
+      notifyLane: job.notifyLane,
+      notifyId: job.notifyId,
     }
   }
 
@@ -749,6 +760,53 @@ export class DelegateJobStore {
     return this.commit(job, draft, false)
   }
 
+  /**
+   * Persist notify_lane / notify_id / parent_engine. Never changes job
+   * state — notify is a side channel. Fence CAS still applies when the
+   * row has a claim token.
+   */
+  patchNotifyIntent(
+    jobId: string,
+    patch: { parentEngine?: string; notifyLane?: string; notifyId?: string },
+    fence?: { claimToken: string; fencingEpoch: number },
+  ): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job) return false
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        return false
+      }
+    }
+    if (
+      (patch.parentEngine === undefined || job.parentEngine === patch.parentEngine) &&
+      (patch.notifyLane === undefined || job.notifyLane === patch.notifyLane) &&
+      (patch.notifyId === undefined || job.notifyId === patch.notifyId)
+    ) {
+      return true
+    }
+    const draft = this.cloneEntry(job)
+    if (patch.parentEngine !== undefined) draft.parentEngine = patch.parentEngine
+    if (patch.notifyLane !== undefined) draft.notifyLane = patch.notifyLane
+    if (patch.notifyId !== undefined) draft.notifyId = patch.notifyId
+    draft.lastActivityAt = this.now()
+    return this.commit(job, draft, false)
+  }
+
+  /** Terminal jobs whose Completer callback is still pending/injecting. */
+  listPendingNotify(): DelegateJobSnapshot[] {
+    const out: DelegateJobSnapshot[] = []
+    if (this.durable) {
+      for (const row of this.durable.loadAll()) this.ingestDurableRow(row)
+    }
+    for (const job of this.jobs.values()) {
+      if (!isDelegateTerminalState(job.state)) continue
+      if (job.callbackState === 'pending' || job.callbackState === 'injecting') {
+        out.push(this.snapshot(job))
+      }
+    }
+    return out
+  }
+
   restoreSnapshot(snap: DelegateJobSnapshot, agentId = 'restored'): void {
     if (this.jobs.has(snap.id)) return
     const createdAt = snap.createdAt ?? this.now()
@@ -783,6 +841,9 @@ export class DelegateJobStore {
       callbackEpoch: snap.callbackEpoch,
       idempotencyKey: snap.idempotencyKey,
       kind: snap.kind,
+      parentEngine: snap.parentEngine,
+      notifyLane: snap.notifyLane,
+      notifyId: snap.notifyId,
     })
     if (snap.idempotencyKey) this.byIdempotency.set(snap.idempotencyKey, snap.id)
   }
@@ -828,6 +889,9 @@ export class DelegateJobStore {
       expiresAt: row.expiresAt ?? null,
       createdAt: row.createdAt,
       lastActivityAt: row.lastActivityAt,
+      parentEngine: row.parentEngine,
+      notifyLane: row.notifyLane,
+      notifyId: row.notifyId,
     }
   }
 
@@ -955,6 +1019,9 @@ export class DelegateJobStore {
       callbackEpoch: snap.callbackEpoch,
       idempotencyKey: snap.idempotencyKey,
       kind: snap.kind,
+      parentEngine: snap.parentEngine,
+      notifyLane: snap.notifyLane,
+      notifyId: snap.notifyId,
     }
   }
 
@@ -985,6 +1052,9 @@ export class DelegateJobStore {
       updatedAt: ts,
       lastActivityAt: job.lastActivityAt,
       expiresAt: job.expiresAt,
+      parentEngine: job.parentEngine,
+      notifyLane: job.notifyLane,
+      notifyId: job.notifyId,
     }
   }
 }

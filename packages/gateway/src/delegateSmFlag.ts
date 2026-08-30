@@ -4,6 +4,8 @@
  * OC_DELEGATE_SM=0 (default) keeps today's in-memory Map UX (running/done/expired).
  * OC_DELEGATE_SM=1 enables queued/failure_class/owner-lease/callback-owner.
  * OC_DELEGATE_DURABLE=0 (default) keeps JSON snapshots; 1 writes WAL SQLite.
+ * OC_DELEGATE_NOTIFIER=0 (default) keeps Completer origin-inject; 1 enables
+ * the EngineNotifier side channel (requires SM && DURABLE).
  * Production semantics require both SM and durable on (design v3 §4).
  * Resume occupancy + idempotency is a bugfix and is always on.
  */
@@ -20,6 +22,19 @@ export function isDelegateDurableEnabled(env: NodeJS.ProcessEnv = process.env): 
 /** Production durable path is SM && DURABLE. A lone DURABLE=1 is a no-op flag. */
 export function isDelegateDurableEffective(env: NodeJS.ProcessEnv = process.env): boolean {
   return isDelegateSmEnabled(env) && isDelegateDurableEnabled(env)
+}
+
+/**
+ * R0/R1 EngineNotifier. Default off. Production notify requires SM && DURABLE
+ * && NOTIFIER so SM=0 or DURABLE=0 stays byte-equivalent to 38c70b490.
+ */
+export function isDelegateNotifierEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = String(env.OC_DELEGATE_NOTIFIER ?? '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'on'
+}
+
+export function isDelegateNotifierEffective(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isDelegateDurableEffective(env) && isDelegateNotifierEnabled(env)
 }
 
 export function resolveDelegateCallbackOwner(
