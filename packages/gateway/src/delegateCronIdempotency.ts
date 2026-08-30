@@ -7,13 +7,26 @@ import type { DelegateJobStore } from './delegateJobs.js'
 
 export function enqueueCronOccurrenceJob(
   store: DelegateJobStore,
-  args: { cronJobId: string; dueMinuteKey: number; agentId: string; sessionKey?: string },
+  args: {
+    cronJobId: string
+    dueMinuteKey: number
+    agentId: string
+    sessionKey?: string
+    parentSessionKey?: string
+    callbackOriginSessionKey?: string
+    callbackOriginUserId?: string
+    parentEngine?: string
+  },
 ): { jobId: string; reused: boolean } | { error: 'capacity' } {
   const idempotencyKey = cronDelegateIdempotencyKey(args.cronJobId, args.dueMinuteKey)
   const existing = store.findByIdempotencyKey(idempotencyKey)
   if (existing) return { jobId: existing.id, reused: true }
   const created = store.create(args.agentId, {
     sessionKey: args.sessionKey,
+    parentSessionKey: args.parentSessionKey,
+    callbackOriginSessionKey: args.callbackOriginSessionKey,
+    callbackOriginUserId: args.callbackOriginUserId,
+    parentEngine: args.parentEngine,
     queued: true,
     kind: 'cron',
     callback: 'cron-origin-inject',
@@ -73,6 +86,7 @@ export function settleCronDelegateJob(
   outcome: 'completed' | 'failed' | 'skipped_silent',
   fence: CronDelegateFence | undefined,
   detail?: string,
+  extraBody?: Record<string, unknown>,
 ): boolean {
   if (!fence?.claimToken || !Number.isFinite(fence.fencingEpoch)) return false
   if (outcome === 'failed') {
@@ -80,6 +94,7 @@ export function settleCronDelegateJob(
       failureClass: 'child_error',
       detail: detail ?? 'cron failed',
       httpStatus: 500,
+      body: extraBody,
       claimToken: fence.claimToken,
       fencingEpoch: fence.fencingEpoch,
     })
@@ -88,7 +103,11 @@ export function settleCronDelegateJob(
     jobId,
     {
       httpStatus: 200,
-      body: { ok: true, failure_class: outcome === 'skipped_silent' ? 'cancelled' : undefined },
+      body: {
+        ok: true,
+        failure_class: outcome === 'skipped_silent' ? 'cancelled' : undefined,
+        ...(extraBody ?? {}),
+      },
     },
     fence,
     outcome === 'skipped_silent' ? { callbackState: 'skipped_silent' } : undefined,

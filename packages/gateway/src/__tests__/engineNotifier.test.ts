@@ -813,3 +813,294 @@ describe('review blockers: claim / retry / origin / outcome', () => {
     assert.deepEqual(samples, [25])
   })
 })
+
+describe('stage 2: Completer hands cron + BUSY + killed notify to EngineNotifier', () => {
+  it('cron-origin-inject with webchat origin delivers through exclusive claim', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-cron-ok-'))
+    try {
+      const store = openStore(dir)
+      const { snap } = await seededTerminal(store, {
+        parentEngine: 'cursor',
+        callback: 'cron-origin-inject',
+      })
+      let injected = 0
+      const result = await dispatchJobTerminalNotify(
+        store,
+        snap,
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async (ev) => {
+              injected += 1
+              assert.equal(ev.callback, 'cron-origin-inject')
+              assert.equal(ev.parentSessionKey, 'agent:main:webchat:dm:p1')
+              return { ok: true }
+            },
+          },
+        }),
+      )
+      assert.equal('ok' in result && result.ok, true)
+      assert.equal(injected, 1)
+      assert.equal(store.snapshotOf(snap.id)?.callbackState, 'delivered')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('isolated cron-origin-inject (no origin session) is skipped_silent, not retried', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-cron-iso-'))
+    try {
+      const store = openStore(dir)
+      const created = store.create('main', {
+        queued: true,
+        kind: 'cron',
+        callback: 'cron-origin-inject',
+        sessionKey: 'agent:main:cron:dm:hb:deliv',
+      })
+      assert.ok('jobId' in created)
+      const claimed = store.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      if (!claimed.ok) throw new Error('claim failed')
+      assert.equal(
+        store.complete(created.jobId, { httpStatus: 200, body: { ok: true, output: 'done' } }, claimed),
+        true,
+      )
+      const snap = store.snapshotOf(created.jobId)!
+      assert.equal(snap.callbackState, 'pending')
+      let injected = 0
+      const result = await dispatchJobTerminalNotify(
+        store,
+        snap,
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async () => {
+              injected += 1
+              return { ok: true }
+            },
+          },
+        }),
+      )
+      assert.equal('ok' in result && result.ok, true)
+      if (!('ok' in result) || !result.ok) return
+      assert.equal(result.lane, 'skipped_silent')
+      assert.equal(injected, 0)
+      assert.equal(store.snapshotOf(created.jobId)?.callbackState, 'skipped_silent')
+      assert.equal(store.listPendingNotify().length, 0)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('cron-origin-inject failure releases claim and retries to delivered', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-cron-fail-'))
+    try {
+      let now = 1_000
+      const durable = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const store = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable,
+        bootId: 'gw:cron-fail',
+        now: () => now,
+      })
+      const { snap } = await seededTerminal(store, {
+        parentEngine: 'cursor',
+        callback: 'cron-origin-inject',
+      })
+      await dispatchJobTerminalNotify(
+        store,
+        snap,
+        new DefaultEngineNotifier({
+          resumeInject: { inject: async () => ({ ok: false, failureClass: 'transport' }) },
+        }),
+      )
+      const after = store.snapshotOf(snap.id)!
+      assert.equal(after.state, 'completed')
+      assert.equal(after.callbackState, 'pending')
+      assert.ok((after.notifyRetryAt ?? 0) > now)
+      now = after.notifyRetryAt!
+      let injected = 0
+      const summary = await retryPendingNotifies(
+        store,
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async () => {
+              injected += 1
+              return { ok: true }
+            },
+          },
+        }),
+        {},
+        { dueOnly: true },
+      )
+      assert.equal(summary.delivered, 1)
+      assert.equal(injected, 1)
+      assert.equal(store.snapshotOf(snap.id)?.callbackState, 'delivered')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('BUSY returns callback pending and retry scheduler delivers later', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-busy-'))
+    try {
+      let now = 5_000
+      const durable = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const store = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable,
+        bootId: 'gw:busy',
+        now: () => now,
+      })
+      const { snap } = await seededTerminal(store, { parentEngine: 'cursor' })
+      const busy = new DefaultEngineNotifier({
+        resumeInject: { inject: async () => ({ ok: false, busy: true, failureClass: 'internal' }) },
+      })
+      const first = await dispatchJobTerminalNotify(store, snap, busy)
+      assert.equal('ok' in first && first.ok, false)
+      const after = store.snapshotOf(snap.id)!
+      assert.equal(after.state, 'completed')
+      assert.equal(after.callbackState, 'pending')
+      assert.ok((after.notifyRetryAt ?? 0) > now)
+      now = after.notifyRetryAt!
+      let injected = 0
+      const summary = await retryPendingNotifies(
+        store,
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async () => {
+              injected += 1
+              return { ok: true }
+            },
+          },
+        }),
+        {},
+        { dueOnly: true },
+      )
+      assert.equal(summary.delivered, 1)
+      assert.equal(injected, 1)
+      assert.equal(store.snapshotOf(snap.id)?.callbackState, 'delivered')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('adoptOrKill terminal writes terminalCommittedAt + pending and notifier can deliver', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-kill-'))
+    try {
+      let now = 1_000
+      const durable = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const store = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 100,
+        durable,
+        bootId: 'gw:g1',
+        now: () => now,
+      })
+      const created = store.create('coding-assistant', {
+        ownerInstanceId: 'gw:g0',
+        callback: 'origin-inject',
+        parentSessionKey: 'agent:main:webchat:dm:p1',
+        callbackOriginSessionKey: 'agent:main:webchat:dm:p1',
+        parentEngine: 'cursor',
+      })
+      assert.ok('jobId' in created)
+      const before = store.snapshotOf(created.jobId)!
+      assert.equal(before.callbackState, 'none')
+      now = 1_200
+      const adopted = store.adoptOrKill(created.jobId, before.fencingEpoch, 'killed_by_cutover')
+      assert.equal(adopted?.state, 'killed_by_cutover')
+      assert.equal(adopted?.terminalCommittedAt, 1_200)
+      assert.equal(adopted?.callbackState, 'pending')
+      assert.equal(adopted?.callbackEpoch, 1)
+      const samples: number[] = []
+      let injected = 0
+      const result = await dispatchJobTerminalNotify(
+        store,
+        adopted!,
+        new DefaultEngineNotifier({
+          now: () => 5_000,
+          onSample: (sample) => samples.push(sample.latencyMs),
+          resumeInject: {
+            inject: async (ev) => {
+              injected += 1
+              assert.equal(ev.state, 'killed_by_cutover')
+              assert.equal(ev.terminalCommittedAt, 1_200)
+              return { ok: true }
+            },
+          },
+        }),
+      )
+      assert.equal('ok' in result && result.ok, true)
+      assert.equal(injected, 1)
+      assert.equal(store.snapshotOf(created.jobId)?.callbackState, 'delivered')
+      assert.deepEqual(samples, [3_800])
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('cron-origin-inject two stores consume a pending notify once', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-cron-dual-'))
+    try {
+      const path = join(dir, 'delegate-jobs.db')
+      const d1 = new DelegateDurableDb(path)
+      const s1 = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable: d1,
+        bootId: 'gw:a',
+      })
+      const { snap } = await seededTerminal(s1, {
+        parentEngine: 'cursor',
+        callback: 'cron-origin-inject',
+      })
+      const d2 = new DelegateDurableDb(path)
+      const s2 = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable: d2,
+        bootId: 'gw:b',
+      })
+      const snap2 = s2.snapshotOf(snap.id)
+      assert.ok(snap2)
+      let consumerCalls = 0
+      const makeNotifier = () =>
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async () => {
+              consumerCalls += 1
+              await new Promise((resolve) => setTimeout(resolve, 40))
+              return { ok: true }
+            },
+          },
+        })
+      const [left, right] = await Promise.all([
+        dispatchJobTerminalNotify(s1, snap, makeNotifier()),
+        dispatchJobTerminalNotify(s2, snap2, makeNotifier()),
+      ])
+      const skipped = [left, right].filter((r) => 'skipped' in r && r.skipped)
+      const delivered = [left, right].filter((r) => 'ok' in r && r.ok)
+      assert.equal(consumerCalls, 1)
+      assert.equal(skipped.length, 1)
+      assert.equal(delivered.length, 1)
+      assert.equal(s1.snapshotOf(snap.id)?.callbackState, 'delivered')
+      assert.equal(s2.snapshotOf(snap.id)?.callbackState, 'delivered')
+      s1.close()
+      s2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+

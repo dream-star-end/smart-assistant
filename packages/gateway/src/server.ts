@@ -79,6 +79,7 @@ import {
   failureClassFromLocalExecutionCode,
   isDelegateTerminalState,
   type DelegateFailureClass,
+  type JobTerminal,
 } from '@openclaude/protocol'
 import {
   delegateConcurrencyCap,
@@ -402,6 +403,7 @@ import {
 import {
   formatJobTerminalMarkdown,
   injectPayloadFromJobTerminal,
+  isJobTerminalFailure,
   parseParentEngine,
 } from './jobTerminal.js'
 import { openDelegateDurableDb } from './delegateDurable.js'
@@ -10617,16 +10619,18 @@ export class Gateway {
       },
       resumeInject: {
         inject: async (event) => {
-          const payload = injectPayloadFromJobTerminal(event)
-          const result = await this.injectSendToAgentCallback({
-            parentSessionKey: event.parentSessionKey,
-            jobId: event.jobId,
-            agentId: event.agentId || 'unknown',
-            goal: event.goal || '',
-            output: payload.output,
-            error: payload.error,
-            clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
-          })
+          const result =
+            event.callback === 'cron-origin-inject'
+              ? await this.injectCronOriginFromTerminal(event)
+              : await this.injectSendToAgentCallback({
+                  parentSessionKey: event.parentSessionKey,
+                  jobId: event.jobId,
+                  agentId: event.agentId || 'unknown',
+                  goal: event.goal || '',
+                  ...injectPayloadFromJobTerminal(event),
+                  clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
+                  once: true,
+                })
           if (result.kind === 'injected') return { ok: true }
           if (result.kind === 'retryable_failure' && result.code === 'ORIGIN_SESSION_BUSY') {
             return { ok: false, failureClass: 'internal' as const, busy: true }
@@ -12992,18 +12996,46 @@ export class Gateway {
   }
 
   /**
-   * Inject a synthetic user turn into the conversation that created an
-   * origin-session cron job. Does not reuse the isolated cron sessionKey
-   * and does not submit on the user's in-flight engine.
+   * Stage 2: EngineNotifier ResumeInject for cron-origin-inject. Uses the
+   * same persist+dispatch path as Completer origin-session fire, with
+   * dlgcb.{jobId}.{epoch} as the message id.
    */
+  private async injectCronOriginFromTerminal(event: JobTerminal): Promise<CronOriginFireResult> {
+    const originKey = event.parentSessionKey
+    const origin = parseOriginWebchatSessionKey(originKey)
+    if (!origin) return { kind: 'fallback' }
+    const text =
+      event.state === 'completed' && !isJobTerminalFailure(event) && event.resultRef?.trim()
+        ? event.resultRef
+        : formatJobTerminalMarkdown(event)
+    return this.injectCronOriginSession(
+      {
+        id: event.jobId,
+        schedule: '* * * * *',
+        agent: event.agentId || origin.agentId,
+        prompt: text,
+        resume: 'origin-session',
+        sourceSessionKey: originKey,
+        label: event.goal,
+      },
+      { dueMinuteKey: 0, deliveryId: event.jobId },
+      {
+        text,
+        clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
+        idempotencyKey: `cron-origin-notify:${event.jobId}:${event.callbackEpoch}`,
+      },
+    )
+  }
+
   private async injectCronOriginSession(
     job: CronJob,
     delivery: CronDeliveryContext,
+    override?: { text?: string; clientMessageId?: string; idempotencyKey?: string },
   ): Promise<CronOriginFireResult> {
     const origin = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
     if (!origin) return { kind: 'fallback' }
-    const text = buildCronOriginResumeText(job)
-    const clientMessageId = cronOriginClientMessageId(delivery.deliveryId)
+    const text = override?.text ?? buildCronOriginResumeText(job)
+    const clientMessageId = override?.clientMessageId ?? cronOriginClientMessageId(delivery.deliveryId)
     const masterCfg = readV3CronOriginInjectConfig()
     if (masterCfg) {
       const posted = await postCronOriginInject(
@@ -13070,7 +13102,8 @@ export class Gateway {
         agentId: origin.agentId,
         content: { text },
         ts: Date.now(),
-        idempotencyKey: cronOriginIdempotencyKey(job.id, delivery.deliveryId),
+        idempotencyKey:
+          override?.idempotencyKey ?? cronOriginIdempotencyKey(job.id, delivery.deliveryId),
         clientMessageId,
         _userId: userId,
         ...(cronBoard ? { _cronBoardProjectId: cronBoard, _cronProjectMode: 'fixed' } : {}),
@@ -13447,8 +13480,8 @@ export class Gateway {
     args: { jobId: string; agentId: string; goal: string; output?: string; error?: string },
   ): void {
     if (runInput.callbackOnComplete !== 'origin-inject') return
-    // R0/R1: EngineNotifier owns origin-inject delivery when the flag is on.
-    // Completer full switch (BUSY→pending for every callback kind) is stage 2.
+    // Stage 2: EngineNotifier owns origin-inject (and cron-origin-inject)
+    // delivery when the flag is on. Completer must not also inject.
     if (isDelegateNotifierEffective()) return
     const owner = resolveDelegateCallbackOwner()
     const snap = this._delegateJobs?.snapshotOf(args.jobId)
@@ -13511,6 +13544,8 @@ export class Gateway {
     error?: string
     userId?: string
     clientMessageId?: string
+    /** Stage 2 notifier: one try, BUSY returns to pending instead of 12-then-fallback. */
+    once?: boolean
   }): Promise<CronOriginFireResult> {
     const origin = parseOriginWebchatSessionKey(args.parentSessionKey || '')
     if (!origin) {
@@ -13527,37 +13562,39 @@ export class Gateway {
       error: args.error,
     })
     const clientMessageId = args.clientMessageId || sendToAgentCallbackClientMessageId(args.jobId)
+    const tryOnce = async (): Promise<CronOriginFireResult> => {
+      const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
+      let queued = false
+      try {
+        const parent = this.sessions.getByKey(origin.sessionKey)
+        if ((parent?._activeTurnCount ?? 0) > 0 || (parent?._activeClientTurnCount ?? 0) > 0) {
+          return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
+        }
+        const userId =
+          (typeof args.userId === 'string' && args.userId.trim()) ||
+          parent?.userId ||
+          process.env.OC_USER_ID?.trim() ||
+          'default'
+        return await this.trySendToAgentCallbackDispatch({
+          origin,
+          userId,
+          text,
+          clientMessageId,
+          jobId: args.jobId,
+          barrierOwner: barrier.owner,
+          onQueued: () => {
+            queued = true
+            barrier.release()
+          },
+        })
+      } finally {
+        if (!queued) barrier.release()
+      }
+    }
+    if (args.once) return tryOnce()
     return runBoundedOriginInjectBackoff({
       isShuttingDown: () => this._shuttingDown,
-      tryOnce: async () => {
-        const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
-        let queued = false
-        try {
-          const parent = this.sessions.getByKey(origin.sessionKey)
-          if ((parent?._activeTurnCount ?? 0) > 0 || (parent?._activeClientTurnCount ?? 0) > 0) {
-            return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
-          }
-          const userId =
-            (typeof args.userId === 'string' && args.userId.trim()) ||
-            parent?.userId ||
-            process.env.OC_USER_ID?.trim() ||
-            'default'
-          return await this.trySendToAgentCallbackDispatch({
-            origin,
-            userId,
-            text,
-            clientMessageId,
-            jobId: args.jobId,
-            barrierOwner: barrier.owner,
-            onQueued: () => {
-              queued = true
-              barrier.release()
-            },
-          })
-        } finally {
-          if (!queued) barrier.release()
-        }
-      },
+      tryOnce,
       onBudgetExhausted: () => {
         this.log.warn('send_to_agent callback retry budget exhausted', { jobId: args.jobId })
       },

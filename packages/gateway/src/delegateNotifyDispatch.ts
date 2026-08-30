@@ -1,20 +1,20 @@
 /**
- * OCV5-22 R0/R1: JobTerminal emit + durable notify intent + retry.
+ * OCV5-22 stage 2: JobTerminal emit + durable notify intent + retry.
  *
  * Delivery is a side channel: failure never rolls back the job terminal
- * state. Completer still owns callback_state; this module only advances
- * pending→injecting→delivered for origin-inject jobs when the notifier
- * flag is on (so Completer's origin-inject path can be skipped).
+ * state. Completer decides callback_state; this module advances
+ * pending→injecting→delivered for ResumeInject callbacks (origin-inject
+ * and cron-origin-inject) when the notifier flag is on, so Completer
+ * must skip those inject paths to avoid double delivery.
  */
 import {
-  classifyNotifyLane,
   delegateNotifyId,
   isDelegateTerminalState,
   type EngineNotifier,
   type NotifyLane,
   type NotifyResult,
 } from '@openclaude/protocol'
-import type { DelegateJobSnapshot, DelegateJobStore } from './delegateJobs.js'
+import { isResumeInjectCallback, type DelegateJobSnapshot, type DelegateJobStore } from './delegateJobs.js'
 import {
   buildJobTerminalFromSnapshot,
   isHeartbeatSilentOutput,
@@ -22,6 +22,7 @@ import {
   parseParentEngine,
   resultRefFromSnapshot,
 } from './jobTerminal.js'
+import { parseOriginWebchatSessionKey } from './cronOriginSession.js'
 
 export type NotifyFence = { claimToken: string; fencingEpoch: number }
 
@@ -67,7 +68,7 @@ export async function dispatchJobTerminalNotify(
     return { skipped: true, reason: 'not_terminal' }
   }
 
-  const parentEngine =
+  let parentEngine =
     hooks.resolveParentEngine?.(job) ?? parseParentEngine(job.parentEngine)
   const notifyId = delegateNotifyId(job.id, job.callbackEpoch > 0 ? job.callbackEpoch : 1)
   const silent =
@@ -98,23 +99,33 @@ export async function dispatchJobTerminalNotify(
     return { ok: true, lane: 'stdout-wait', notifyId }
   }
 
-  // Cron Completer is still the producer for cron-origin-inject (stage 2).
-  // Record the intent so columns are populated, but do not deliver here.
+  // Isolated cron Completer already delivered via onDeliver. No origin
+  // session to ResumeInject; ack skipped_silent so retries do not stick.
   if (job.callback === 'cron-origin-inject') {
-    persistNotifyIntent(store, job, {
-      parentEngine: parentEngine ?? job.parentEngine,
-      notifyLane: parentEngine ? classifyNotifyLane(parentEngine) : 'resume-inject',
-      notifyId,
-    })
-    return { skipped: true, reason: 'cron_completer_owns_inject' }
+    const originKey =
+      hooks.resolveCallbackOrigin?.(job) ?? job.callbackOriginSessionKey ?? job.parentSessionKey
+    if (!originKey || !parseOriginWebchatSessionKey(originKey)) {
+      persistNotifyIntent(store, job, {
+        parentEngine: parentEngine ?? job.parentEngine,
+        notifyLane: 'skipped_silent',
+        notifyId,
+      })
+      store.patchCallbackState(job.id, 'skipped_silent', fenceOf(job))
+      return { ok: true, lane: 'skipped_silent', notifyId }
+    }
   }
+
+  const owned = isResumeInjectCallback(job.callback)
+  // Origin session may not be loaded; ResumeInject (档 B) still works
+  // without a live runner. Default cursor so JobTerminal can be built.
+  if (!parentEngine && owned) parentEngine = 'cursor'
 
   if (!parentEngine) {
     persistNotifyIntent(store, job, {
       notifyLane: 'resume-inject',
       notifyId,
     })
-    if (job.callback === 'origin-inject') {
+    if (owned) {
       store.deferPendingNotify(job.id, fenceOf(job))
     }
     return { ok: false, failureClass: 'internal' }
@@ -137,7 +148,7 @@ export async function dispatchJobTerminalNotify(
   if (!event) return { ok: false, failureClass: 'internal' }
 
   let deliveryToken: string | undefined
-  if (job.callback === 'origin-inject') {
+  if (owned) {
     const claimed = store.claimNotifyDelivery(job.id, fenceOf(live))
     if (!claimed.ok) return { skipped: true, reason: 'lost_claim' }
     deliveryToken = claimed.token
@@ -147,7 +158,7 @@ export async function dispatchJobTerminalNotify(
   try {
     result = await notifier.notify(event)
   } catch (err) {
-    if (job.callback === 'origin-inject' && deliveryToken) {
+    if (owned && deliveryToken) {
       store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(live))
     }
     throw err
@@ -160,16 +171,16 @@ export async function dispatchJobTerminalNotify(
         notifyId: result.notifyId,
       })
     }
-    if (job.callback === 'origin-inject' && deliveryToken) {
+    if (owned && deliveryToken) {
       const delivered = store.completeNotifyDelivery(job.id, deliveryToken, fenceOf(live))
       if (delivered) await hooks.onDelivered?.(store.snapshotOf(job.id) ?? live)
     }
     return result
   }
 
-  if (job.callback === 'origin-inject' && deliveryToken) {
+  if (owned && deliveryToken) {
     store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(live))
-  } else if (job.callback === 'origin-inject') {
+  } else if (owned) {
     store.deferPendingNotify(job.id, fenceOf(live))
   }
   return result

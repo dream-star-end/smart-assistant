@@ -85,7 +85,7 @@ import {
   settleCronDelegateJob,
 } from './delegateCronIdempotency.js'
 import { cronDelegateIdempotencyKey } from '@openclaude/protocol'
-import { isDelegateSmEnabled } from './delegateSmFlag.js'
+import { isDelegateNotifierEffective, isDelegateSmEnabled } from './delegateSmFlag.js'
 import type { DelegateJobStore } from './delegateJobs.js'
 import {
   postCronIndex,
@@ -94,6 +94,8 @@ import {
 } from './v3CronIndexPush.js'
 import type { V3WechatOutboundConfig } from './v3WechatOutbound.js'
 import {
+  buildCronOriginResumeText,
+  parseOriginWebchatSessionKey,
   type CronOriginFireResult,
 } from './cronOriginSession.js'
 
@@ -1475,11 +1477,18 @@ export class CronScheduler {
                   consumeOccurrence: async () => {
                     let delegateJobId: string | undefined
                     if (isDelegateSmEnabled() && this.delegateJobs) {
+                      const origin =
+                        job.resume === 'origin-session'
+                          ? parseOriginWebchatSessionKey(job.sourceSessionKey || '')
+                          : null
                       const enq = enqueueCronOccurrenceJob(this.delegateJobs, {
                         cronJobId: job.id,
                         dueMinuteKey,
                         agentId: agent.id,
                         sessionKey: `agent:${agent.id}:cron:dm:${job.id}:${deliveryContext.deliveryId}`,
+                        parentSessionKey: origin?.sessionKey,
+                        callbackOriginSessionKey: origin?.sessionKey,
+                        callbackOriginUserId: job.sourceUserId,
                       })
                       if ('error' in enq) throw new Error('cron delegate enqueue capacity')
                       delegateJobId = enq.jobId
@@ -1703,6 +1712,12 @@ export class CronScheduler {
               failed ? 'failed' : silent ? 'skipped_silent' : 'completed',
               fence,
               failed && 'code' in outcome ? String(outcome.code) : undefined,
+              !failed &&
+                !silent &&
+                isDelegateNotifierEffective() &&
+                job.resume === 'origin-session'
+                ? { output: buildCronOriginResumeText(job) }
+                : undefined,
             )
           }
           // A one-shot remains enabled across retryable failures. Completed,
@@ -1827,12 +1842,19 @@ export class CronScheduler {
     }
     let result: CronOriginFireResult
     try {
-      const fireJob: CronJob = {
-        ...job,
-        projectMode: project.mode,
-        boardProjectId: project.mode === 'fixed' ? project.boardProjectId : null,
+      // Stage 2: Completer must not inject when Notifier owns cron-origin-inject.
+      if (isDelegateNotifierEffective()) {
+        result = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
+          ? { kind: 'injected' }
+          : { kind: 'fallback' }
+      } else {
+        const fireJob: CronJob = {
+          ...job,
+          projectMode: project.mode,
+          boardProjectId: project.mode === 'fixed' ? project.boardProjectId : null,
+        }
+        result = await this.onOriginSessionFire!(fireJob, deliveryContext)
       }
-      result = await this.onOriginSessionFire!(fireJob, deliveryContext)
     } catch (err) {
       logger.warn(`job ${job.id} origin-session inject threw`, {
         jobId: job.id,
