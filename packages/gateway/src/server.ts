@@ -393,10 +393,12 @@ import { DelegateResumeRegistry, DELEGATE_RESUME_OCCUPIED_MESSAGE } from './dele
 import {
   isDelegateCutoverEffective,
   isDelegateDurableEffective,
+  isDelegateInflightSurfaceEffective,
   isDelegateNotifierEffective,
   isDelegateSmEnabled,
   resolveDelegateCallbackOwner,
 } from './delegateSmFlag.js'
+import { DelegateInflightSurfaceStore } from './delegateInflightSurface.js'
 import {
   beginDelegateCutover,
   endDelegateCutover,
@@ -5224,6 +5226,27 @@ export class Gateway {
       readArchivedMessages(sessId, userId, beforeSeq, limit, { view: 'timeline' })
         .then((r) => this.sendJson(res, 200, r))
         .catch(() => this.sendJson(res, 500, { error: 'archive read failed' }))
+      return
+    }
+    const inflightDelegatesMatch = url.pathname.match(
+      /^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/inflight-delegates$/,
+    )
+    if (inflightDelegatesMatch) {
+      const sessId = inflightDelegatesMatch[1]
+      this.getUserId(req)
+      if (req.method !== 'GET') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      if (!isDelegateInflightSurfaceEffective()) {
+        this.sendJson(res, 200, { enabled: false, items: [] })
+        return
+      }
+      const surface = this._ensureDelegateInflightSurface()
+      if (this._delegateJobs) {
+        surface.rebuildFromJobs(this._delegateJobs.listNonTerminal())
+      }
+      this.sendJson(res, 200, { enabled: true, items: surface.listForSessionId(sessId) })
       return
     }
     const sessionReadMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/read$/)
@@ -10580,6 +10603,8 @@ export class Gateway {
   private _delegateReconcileTimer: ReturnType<typeof setTimeout> | undefined
   private _notifyRetryTimer: ReturnType<typeof setTimeout> | undefined
   private _engineNotifier: DefaultEngineNotifier | undefined
+  /** R2 session-level inflight projection. Lazy; flag-off never opens the db. */
+  private _delegateInflightSurface: DelegateInflightSurfaceStore | undefined
 
   private _ensureDelegateJobStore(): DelegateJobStore {
     if (this._delegateJobs) return this._delegateJobs
@@ -10620,7 +10645,59 @@ export class Gateway {
     } else {
       this._delegateReconcileReady = true
     }
+    if (isDelegateInflightSurfaceEffective()) {
+      this._ensureDelegateInflightSurface().rebuildFromJobs(store.listNonTerminal(), {
+        dropMissingLive: true,
+      })
+    }
     return store
+  }
+
+  private _ensureDelegateInflightSurface(): DelegateInflightSurfaceStore {
+    if (this._delegateInflightSurface) return this._delegateInflightSurface
+    this._delegateInflightSurface = new DelegateInflightSurfaceStore({
+      dbPath: this._delegateDurablePath
+        ? join(dirname(this._delegateDurablePath), 'delegate-inflight-surface.db')
+        : undefined,
+    })
+    return this._delegateInflightSurface
+  }
+
+  private _touchDelegateInflightSurface(input: {
+    jobId?: string
+    progressRunId?: string
+    parentSessionKey?: string
+    agentId: string
+    goal?: string
+    state?: import('@openclaude/protocol').DelegateJobState
+    liveHint?: string
+    runId?: string
+  }): void {
+    if (!isDelegateInflightSurfaceEffective()) return
+    const parentSessionKey = input.parentSessionKey
+    if (!parentSessionKey) return
+    const jobId = DelegateInflightSurfaceStore.resolveJobId(input.jobId, input.progressRunId)
+    if (!jobId) return
+    const store = this._ensureDelegateInflightSurface()
+    const patch = store.updateLive({
+      jobId,
+      state: input.state,
+      liveHint: input.liveHint,
+      runId: input.runId ?? input.progressRunId,
+      goal: input.goal,
+      agentId: input.agentId,
+      parentSessionKey,
+    })
+    if (patch) return
+    store.upsertEnqueue({
+      jobId,
+      parentSessionKey,
+      agentId: input.agentId,
+      goal: input.goal,
+      runId: input.runId ?? input.progressRunId,
+      state: input.state ?? 'running',
+      liveHint: input.liveHint,
+    })
   }
 
   private _armDelegateReconcileFollowup(store: DelegateJobStore, queueWaitMs: number): void {
@@ -11446,6 +11523,13 @@ export class Gateway {
         if (sm && runInput.capacityReserved) this._releaseDelegateSlot(slotOpts)
         if (sm) this._delegateQueueWaiters?.delete(resume.sessionKey)
         const existing = store.snapshotOf(created.jobId)
+        this._touchDelegateInflightSurface({
+          jobId: created.jobId,
+          parentSessionKey,
+          agentId: targetAgentId,
+          goal,
+          state: existing?.state === 'queued' ? 'queued' : 'running',
+        })
         return this.sendJson(res, 200, {
           status: existing?.state === 'queued' ? 'queued' : 'running',
           jobId: created.jobId,
@@ -11455,6 +11539,13 @@ export class Gateway {
       }
       const jobId = created.jobId
       runInput.backgroundJobId = jobId
+      this._touchDelegateInflightSurface({
+        jobId,
+        parentSessionKey,
+        agentId: targetAgentId,
+        goal,
+        state: sm ? 'queued' : 'running',
+      })
       this._delegateResume.bindJob(resume.sessionKey, idempotencyKey, jobId)
       if (callbackOnComplete && callbackTarget) {
         const intent: SendToAgentIntent = {
@@ -11966,6 +12057,16 @@ export class Gateway {
           ),
         )
       }
+      this._touchDelegateInflightSurface({
+        jobId: input.backgroundJobId,
+        progressRunId: emitProgressRunId,
+        parentSessionKey: progressTarget.sessionKey,
+        agentId: targetAgentId,
+        goal,
+        state: 'running',
+        liveHint: liveDetail ?? '',
+        runId: emitProgressRunId,
+      })
     }
     const streamProgress = progressTarget && input.streamProgress === true
 
@@ -12258,6 +12359,15 @@ export class Gateway {
       detachAncestorActivity = () => session.runner.off?.('activity', handleChildActivity)
       // 回填本委派的进度卡 runId:子委派追溯到**一级**委派时复用它,把嵌套进度挂回同一张卡。
       session.progressRunId = progressRunId
+      this._touchDelegateInflightSurface({
+        jobId: input.backgroundJobId,
+        progressRunId,
+        parentSessionKey: progressTarget?.sessionKey ?? parentSessionKey,
+        agentId: targetAgentId,
+        goal,
+        state: 'running',
+        runId: progressRunId,
+      })
       if (streamProgress) {
         emitProgress(
           makeDelegateProgressBlock({
@@ -12664,6 +12774,28 @@ export class Gateway {
         // A broken/old direct-parent collector must degrade to a separate
         // durable card, never to silent loss.
         this.sessions.bufferPendingAgentGroup(progressTarget.sessionKey, durableGroup)
+      }
+    }
+    if (isDelegateInflightSurfaceEffective()) {
+      const parentKey = progressTarget?.sessionKey ?? parentSessionKey
+      const jobId = DelegateInflightSurfaceStore.resolveJobId(input.backgroundJobId, progressRunId)
+      if (jobId && parentKey) {
+        const surface = this._ensureDelegateInflightSurface()
+        if (!surface.get(jobId)) {
+          surface.upsertEnqueue({
+            jobId,
+            parentSessionKey: parentKey,
+            agentId: targetAgentId,
+            goal,
+            runId: progressRunId,
+            state: 'running',
+          })
+        }
+        surface.foldTerminal({
+          jobId,
+          group: durableGroup,
+          parentSessionKey: parentKey,
+        })
       }
     }
 
@@ -13318,6 +13450,8 @@ export class Gateway {
     await this._persistInterruptedSendToAgentCallbacks()
     this._delegateJobs?.close()
     this._delegateJobs = undefined
+    this._delegateInflightSurface?.close()
+    this._delegateInflightSurface = undefined
   }
 
   private async _persistInterruptedSendToAgentCallbacks(): Promise<void> {
@@ -20837,6 +20971,7 @@ function normalizePath(p: string): string {
   if (KNOWN_ROUTES.includes(p)) return p
   // Dynamic API routes — normalize IDs
   const normalized = p
+    .replace(/\/api\/sessions\/[a-zA-Z0-9_-]+\/inflight-delegates$/, '/api/sessions/:id/inflight-delegates')
     .replace(/\/api\/sessions\/[a-zA-Z0-9_-]+\/read$/, '/api/sessions/:id/read')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/skills\/[a-z0-9-]+/, '/api/agents/:id/skills/:name')
     .replace(/\/api\/skills\/[a-z0-9-]+/, '/api/skills/:name')

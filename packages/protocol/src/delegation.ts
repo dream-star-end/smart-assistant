@@ -96,6 +96,24 @@ export const DELEGATE_CUTOVER_FREEZE_MS = 30_000
 export const DELEGATE_CALLBACK_OWNERS = ['job', 'intent'] as const
 export type DelegateCallbackOwner = (typeof DELEGATE_CALLBACK_OWNERS)[number]
 
+/**
+ * OCV5-22 R2 — session-level inflight projection (design v3 §N4).
+ * Authority remains the job row; this is a read model for the parent
+ * session surface, decoupled from turn_status working-detail.
+ */
+export type InflightDelegateSurface = {
+  jobId: string
+  runId: string
+  agentId: string
+  goal: string
+  state: DelegateJobState
+  liveHint: string
+  updatedAt: number
+  parentSessionKey: string
+  /** Set after terminal fold into DurableAgentGroup; omitted while live. */
+  foldedGroup?: import('./teamCards.js').DurableAgentGroup
+}
+
 /** Legal state transitions from design v2 §2.2. Lease adoption is NOT a transition. */
 export const DELEGATE_LEGAL_TRANSITIONS: ReadonlyArray<readonly [DelegateJobState, DelegateJobState]> = [
   ['queued', 'running'],
