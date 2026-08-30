@@ -4,8 +4,10 @@
  * Decoupled from parent turn_status working-detail. Flag
  * OC_DELEGATE_INFLIGHT_SURFACE defaults off. Authority remains the job row;
  * this store is a fail-open projection (goal / runId / liveHint / bounded
- * folded DurableAgentGroup). Writes are fenced + monotonic; I/O errors never
- * throw into the delegate / Completer / Notifier chain.
+ * folded DurableAgentGroup). Job-store terminal projections may correct a
+ * previous surface terminal; runner fold / stale overlay may not. Queue-full
+ * drops persist a durable tombstone so another gateway cannot resurrect the
+ * row. I/O errors never throw into the delegate / Completer / Notifier chain.
  */
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -24,7 +26,10 @@ import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'delegate-inflight-surface' })
 
-const SURFACE_SCHEMA_VERSION = 2
+export const SURFACE_SCHEMA_VERSION = 3
+/** 1 = job-store CAS winner projection; 0 = runner fold / live overlay. */
+const AUTHORITY_JOB_STORE = 1
+const AUTHORITY_PROJECTION = 0
 
 export const INFLIGHT_FOLDED_GROUP_MAX_BYTES = 16 * 1024
 export const INFLIGHT_GET_DEFAULT_LIMIT = 20
@@ -58,7 +63,9 @@ CREATE TABLE IF NOT EXISTS inflight_delegate_surface (
   payload_bytes INTEGER NOT NULL DEFAULT 0,
   expires_at INTEGER,
   nested INTEGER NOT NULL DEFAULT 0,
-  owner_run_id TEXT NOT NULL DEFAULT ''
+  owner_run_id TEXT NOT NULL DEFAULT '',
+  tombstoned INTEGER NOT NULL DEFAULT 0,
+  authority INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_inflight_surface_parent
   ON inflight_delegate_surface(parent_session_key);
@@ -75,6 +82,8 @@ type SurfaceRow = InflightDelegateSurface & {
   generation: number
   payloadBytes: number
   expiresAt: number | null
+  authority: number
+  tombstoned?: boolean
 }
 
 export function resolveDelegateInflightSurfaceDbPath(
@@ -116,6 +125,8 @@ export type InflightEnqueueInput = {
   nested?: boolean
   ownerRunId?: string
   preserveIdentity?: boolean
+  /** Job-store CAS winner projection; allows correcting a previous terminal. */
+  authoritative?: boolean
 }
 
 function defaultRunId(jobId: string): string {
@@ -165,6 +176,7 @@ function cloneRow(row: SurfaceRow): SurfaceRow {
   return {
     ...row,
     foldedGroup: row.foldedGroup ? structuredClone(row.foldedGroup) : undefined,
+    authority: row.authority ?? AUTHORITY_PROJECTION,
   }
 }
 
@@ -234,12 +246,17 @@ export function summaryGroupFromJob(
   }
 }
 
-function canAdvanceState(from: DelegateJobState, to: DelegateJobState): boolean {
+function canAdvanceState(
+  from: DelegateJobState,
+  to: DelegateJobState,
+  opts: { authoritative?: boolean } = {},
+): boolean {
   if (from === to) return true
   if (isDelegateTerminalState(from) && !isDelegateTerminalState(to)) return false
   if (isDelegateTerminalState(from) && isDelegateTerminalState(to)) {
-    // Terminal→terminal is sticky: keep the first terminal, do not rewrite.
-    return false
+    // Read model follows the job-store CAS winner, not "first writer wins".
+    // Runner fold / stale overlay cannot replace a different terminal.
+    return opts.authoritative === true
   }
   return isLegalDelegateTransition(from, to)
 }
@@ -262,10 +279,11 @@ export class DelegateInflightSurfaceStore {
   private readonly foldedMaxBytes: number
   private readonly onWriteError?: (err: unknown, ctx: Record<string, unknown>) => void
   private readonly byJob = new Map<string, SurfaceRow>()
-  /** Queue-full / explicit drops must not be resurrected by a late upsert. */
+  /** Queue-full / explicit drops. Backed by durable tombstone rows. */
   private readonly droppedJobs = new Set<string>()
   private db: InstanceType<typeof Database> | null = null
   private upsertStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
+  private tombstoneStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
   private deleteStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
   private loadStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
   private closed = false
@@ -293,6 +311,7 @@ export class DelegateInflightSurfaceStore {
         this.noteWriteError(err, { phase: 'open', dbPath: this.path })
         this.db = null
         this.upsertStmt = null
+        this.tombstoneStmt = null
         this.deleteStmt = null
         this.loadStmt = null
       }
@@ -323,11 +342,13 @@ export class DelegateInflightSurfaceStore {
         INSERT INTO inflight_delegate_surface (
           job_id, parent_session_key, session_id, user_id, run_id, agent_id, goal, state,
           live_hint, updated_at, fencing_epoch, generation, folded_group_json,
-          payload_truncated, payload_bytes, expires_at, nested, owner_run_id
+          payload_truncated, payload_bytes, expires_at, nested, owner_run_id,
+          tombstoned, authority
         ) VALUES (
           @job_id, @parent_session_key, @session_id, @user_id, @run_id, @agent_id, @goal, @state,
           @live_hint, @updated_at, @fencing_epoch, @generation, @folded_group_json,
-          @payload_truncated, @payload_bytes, @expires_at, @nested, @owner_run_id
+          @payload_truncated, @payload_bytes, @expires_at, @nested, @owner_run_id,
+          0, @authority
         )
         ON CONFLICT(job_id) DO UPDATE SET
           parent_session_key=excluded.parent_session_key,
@@ -349,13 +370,17 @@ export class DelegateInflightSurfaceStore {
           payload_bytes=excluded.payload_bytes,
           expires_at=excluded.expires_at,
           nested=excluded.nested,
-          owner_run_id=excluded.owner_run_id
+          owner_run_id=excluded.owner_run_id,
+          authority=excluded.authority
         WHERE
-          -- First terminal is sticky across ALL terminals, not just
-          -- terminal→nonterminal. Same-terminal writes may fill payload.
-          (
+          inflight_delegate_surface.tombstoned = 0
+          AND (
             inflight_delegate_surface.state NOT IN (${TERMINAL_SQL})
             OR excluded.state = inflight_delegate_surface.state
+            OR (
+              excluded.authority >= ${AUTHORITY_JOB_STORE}
+              AND excluded.state IN (${TERMINAL_SQL})
+            )
           )
           AND (
             excluded.fencing_epoch > inflight_delegate_surface.fencing_epoch
@@ -365,12 +390,39 @@ export class DelegateInflightSurfaceStore {
             )
           )
       `)
+      this.tombstoneStmt = db.prepare(`
+        INSERT INTO inflight_delegate_surface (
+          job_id, parent_session_key, session_id, user_id, run_id, agent_id, goal, state,
+          live_hint, updated_at, fencing_epoch, generation, folded_group_json,
+          payload_truncated, payload_bytes, expires_at, nested, owner_run_id,
+          tombstoned, authority
+        ) VALUES (
+          @job_id, @parent_session_key, @session_id, @user_id, @run_id, @agent_id, @goal, @state,
+          '', @updated_at, @fencing_epoch, @generation, NULL,
+          0, 0, @expires_at, 0, '',
+          1, ${AUTHORITY_JOB_STORE}
+        )
+        ON CONFLICT(job_id) DO UPDATE SET
+          tombstoned = 1,
+          updated_at = excluded.updated_at,
+          expires_at = excluded.expires_at,
+          fencing_epoch = MAX(inflight_delegate_surface.fencing_epoch, excluded.fencing_epoch),
+          generation = MAX(inflight_delegate_surface.generation, excluded.generation),
+          authority = ${AUTHORITY_JOB_STORE},
+          live_hint = '',
+          folded_group_json = NULL
+      `)
       this.deleteStmt = db.prepare('DELETE FROM inflight_delegate_surface WHERE job_id = ?')
       this.loadStmt = db.prepare('SELECT * FROM inflight_delegate_surface WHERE job_id = ?')
       const rows = db.prepare('SELECT * FROM inflight_delegate_surface').all() as Array<
         Record<string, unknown>
       >
       for (const row of rows) {
+        const id = typeof row.job_id === 'string' ? row.job_id : ''
+        if (id && Number(row.tombstoned ?? 0) === 1) {
+          this.droppedJobs.add(id)
+          continue
+        }
         const parsed = fromRow(row)
         if (parsed) this.byJob.set(parsed.jobId, parsed)
       }
@@ -423,6 +475,19 @@ export class DelegateInflightSurfaceStore {
         fill.run(sessionIdFromParentKey(row.parent_session_key), row.job_id)
       }
     }
+    if (current < 3) {
+      const existing = new Set(
+        (db.prepare('PRAGMA table_info(inflight_delegate_surface)').all() as Array<{ name: string }>).map(
+          (row) => row.name,
+        ),
+      )
+      if (!existing.has('tombstoned')) {
+        db.exec('ALTER TABLE inflight_delegate_surface ADD COLUMN tombstoned INTEGER NOT NULL DEFAULT 0')
+      }
+      if (!existing.has('authority')) {
+        db.exec('ALTER TABLE inflight_delegate_surface ADD COLUMN authority INTEGER NOT NULL DEFAULT 0')
+      }
+    }
     if (current < SURFACE_SCHEMA_VERSION) {
       db.pragma(`user_version = ${SURFACE_SCHEMA_VERSION}`)
     }
@@ -439,9 +504,10 @@ export class DelegateInflightSurfaceStore {
     const needs = db
       .prepare(
         `SELECT 1 AS n FROM inflight_delegate_surface
-         WHERE (folded_group_json IS NOT NULL AND folded_group_json != ''
+         WHERE IFNULL(tombstoned, 0) = 0
+           AND ((folded_group_json IS NOT NULL AND folded_group_json != ''
                 AND (IFNULL(payload_bytes, 0) = 0 OR payload_bytes > ?))
-            OR (state IN (${TERMINAL_SQL}) AND expires_at IS NULL)
+            OR (state IN (${TERMINAL_SQL}) AND expires_at IS NULL))
          LIMIT 1`,
       )
       .get(this.foldedMaxBytes) as { n: number } | undefined
@@ -449,7 +515,7 @@ export class DelegateInflightSurfaceStore {
     const now = this.now()
     const rows = db
       .prepare(
-        `SELECT job_id, state, folded_group_json, updated_at, expires_at
+        `SELECT job_id, state, folded_group_json, updated_at, expires_at, IFNULL(tombstoned, 0) AS tombstoned
          FROM inflight_delegate_surface`,
       )
       .all() as Array<{
@@ -458,6 +524,7 @@ export class DelegateInflightSurfaceStore {
       folded_group_json: string | null
       updated_at: number
       expires_at: number | null
+      tombstoned: number
     }>
     const update = db.prepare(
       `UPDATE inflight_delegate_surface
@@ -470,6 +537,7 @@ export class DelegateInflightSurfaceStore {
     const del = db.prepare('DELETE FROM inflight_delegate_surface WHERE job_id = ?')
     const tx = db.transaction(() => {
       for (const row of rows) {
+        if (Number(row.tombstoned) === 1) continue
         const terminal = isDelegateTerminalState(row.state as DelegateJobState)
         let json: string | null = null
         let trunc = 0
@@ -531,11 +599,12 @@ export class DelegateInflightSurfaceStore {
         expiresAt: null,
         nested: false,
         ownerRunId: '',
+        authority: AUTHORITY_PROJECTION,
       })
     }
     const existing = this.byJob.get(input.jobId)
     const nextState: DelegateJobState = input.state ?? existing?.state ?? 'queued'
-    if (existing && !canAdvanceState(existing.state, nextState)) {
+    if (existing && !canAdvanceState(existing.state, nextState, { authoritative: input.authoritative })) {
       return publicView(existing)
     }
     const fencingEpoch = input.fencingEpoch ?? existing?.fencingEpoch ?? 0
@@ -570,6 +639,7 @@ export class DelegateInflightSurfaceStore {
       nested: input.nested ?? existing?.nested ?? false,
       ownerRunId: input.ownerRunId ?? existing?.ownerRunId ?? '',
       truncated: existing?.truncated,
+      authority: input.authoritative ? AUTHORITY_JOB_STORE : AUTHORITY_PROJECTION,
       ...(existing?.foldedGroup && isDelegateTerminalState(nextState)
         ? { foldedGroup: existing.foldedGroup }
         : {}),
@@ -599,12 +669,13 @@ export class DelegateInflightSurfaceStore {
     nested?: boolean
     ownerRunId?: string
     preserveIdentity?: boolean
+    authoritative?: boolean
   }): InflightDelegateSurface | undefined {
     if (this.droppedJobs.has(input.jobId)) return undefined
     const existing = this.byJob.get(input.jobId)
     if (!existing) return undefined
     const nextState = input.state ?? existing.state
-    if (!canAdvanceState(existing.state, nextState)) {
+    if (!canAdvanceState(existing.state, nextState, { authoritative: input.authoritative })) {
       return publicView(existing)
     }
     const fencingEpoch = input.fencingEpoch ?? existing.fencingEpoch
@@ -634,6 +705,7 @@ export class DelegateInflightSurfaceStore {
     next.fencingEpoch = fencingEpoch
     next.generation = generation
     next.updatedAt = this.now()
+    next.authority = input.authoritative ? AUTHORITY_JOB_STORE : AUTHORITY_PROJECTION
     if (isDelegateTerminalState(next.state)) {
       next.expiresAt = next.expiresAt ?? this.now() + this.terminalTtlMs
     } else {
@@ -655,6 +727,7 @@ export class DelegateInflightSurfaceStore {
     fencingEpoch?: number
     generation?: number
     summaryOnly?: boolean
+    authoritative?: boolean
   }): FoldTerminalResult {
     if (isDeferredExactProcessStub(input.group)) {
       return { folded: false, reason: 'deferred_stub' }
@@ -665,7 +738,10 @@ export class DelegateInflightSurfaceStore {
     // Job-authority mapping: a finished DurableAgentGroup is a completed job
     // even when group.status is failed/timeout (complete(http 200, ok:false)).
     const state: DelegateJobState = input.state ?? 'completed'
-    if (!canAdvanceState(existing.state, state) && existing.state !== state) {
+    if (
+      !canAdvanceState(existing.state, state, { authoritative: input.authoritative }) &&
+      existing.state !== state
+    ) {
       return { folded: true, surface: publicView(existing) }
     }
     const fencingEpoch = input.fencingEpoch ?? existing.fencingEpoch
@@ -673,12 +749,18 @@ export class DelegateInflightSurfaceStore {
     if (!fenceBeats({ fencingEpoch, generation }, existing)) {
       return { folded: true, surface: publicView(existing) }
     }
-    if (input.summaryOnly && existing.foldedGroup && isDelegateTerminalState(existing.state)) {
+    if (
+      input.summaryOnly &&
+      existing.foldedGroup &&
+      existing.state === state &&
+      isDelegateTerminalState(existing.state)
+    ) {
       return { folded: true, surface: publicView(existing) }
     }
     const bounded = boundFoldedGroup(input.group, this.foldedMaxBytes)
     const next = cloneRow(existing)
     next.state = state
+    next.authority = input.authoritative ? AUTHORITY_JOB_STORE : AUTHORITY_PROJECTION
     next.runId = bounded.group.runId || existing.runId
     if (bounded.group.goal) next.goal = clampText(bounded.group.goal, INFLIGHT_GOAL_MAX_CHARS)
     if (bounded.group.agentId) next.agentId = bounded.group.agentId
@@ -732,6 +814,7 @@ export class DelegateInflightSurfaceStore {
         parentSessionKey: job.parentSessionKey,
         userId: job.callbackOriginUserId || row.userId,
         summaryOnly: true,
+        authoritative: true,
         ...fence,
       })
       return folded.folded ? folded.surface : this.get(job.id)
@@ -815,13 +898,26 @@ export class DelegateInflightSurfaceStore {
 
   /**
    * Remove a projection whose job never became live (queue-full drop) or was
-   * otherwise deleted. Fail-open: never throws.
+   * otherwise deleted. Persists a durable tombstone so another gateway's
+   * stale overlay cannot INSERT the row back. Fail-open: never throws.
    */
   drop(jobId: string): boolean {
-    this.droppedJobs.add(jobId)
-    const existed = this.byJob.delete(jobId)
-    this.deleteSafe(jobId)
-    return existed
+    const existing = this.byJob.get(jobId)
+    this.rememberTombstone(jobId)
+    this.persistTombstone({
+      jobId,
+      parentSessionKey: existing?.parentSessionKey ?? '',
+      sessionId: existing?.sessionId ?? '',
+      userId: existing?.userId ?? '',
+      runId: existing?.runId ?? defaultRunId(jobId),
+      agentId: existing?.agentId ?? '',
+      goal: existing?.goal ?? '',
+      state: existing?.state ?? 'failed',
+      fencingEpoch: existing?.fencingEpoch ?? 0,
+      generation: (existing?.generation ?? 0) + 1,
+      expiresAt: this.now() + this.terminalTtlMs,
+    })
+    return Boolean(existing)
   }
 
   sweepExpired(now: number = this.now()): number {
@@ -833,7 +929,7 @@ export class DelegateInflightSurfaceStore {
         dropped += 1
       }
     }
-    return dropped
+    return dropped + this.sweepTombstones(now)
   }
 
   private enforceTerminalCap(userId: string, sessionId: string): void {
@@ -941,8 +1037,67 @@ export class DelegateInflightSurfaceStore {
     }
     this.db = null
     this.upsertStmt = null
+    this.tombstoneStmt = null
     this.deleteStmt = null
     this.loadStmt = null
+  }
+
+  private rememberTombstone(jobId: string): void {
+    this.droppedJobs.add(jobId)
+    this.byJob.delete(jobId)
+  }
+
+  private persistTombstone(row: {
+    jobId: string
+    parentSessionKey: string
+    sessionId: string
+    userId: string
+    runId: string
+    agentId: string
+    goal: string
+    state: DelegateJobState
+    fencingEpoch: number
+    generation: number
+    expiresAt: number
+  }): void {
+    try {
+      this.tombstoneStmt?.run({
+        job_id: row.jobId,
+        parent_session_key: row.parentSessionKey,
+        session_id: row.sessionId,
+        user_id: row.userId,
+        run_id: row.runId,
+        agent_id: row.agentId,
+        goal: row.goal,
+        state: row.state,
+        updated_at: this.now(),
+        fencing_epoch: row.fencingEpoch,
+        generation: row.generation,
+        expires_at: row.expiresAt,
+      })
+    } catch (err) {
+      this.noteWriteError(err, { phase: 'tombstone', jobId: row.jobId })
+    }
+  }
+
+  private sweepTombstones(now: number): number {
+    if (!this.db) return 0
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT job_id FROM inflight_delegate_surface
+           WHERE tombstoned = 1 AND expires_at IS NOT NULL AND expires_at <= ?`,
+        )
+        .all(now) as Array<{ job_id: string }>
+      for (const row of rows) {
+        this.droppedJobs.delete(row.job_id)
+        this.deleteSafe(row.job_id)
+      }
+      return rows.length
+    } catch (err) {
+      this.noteWriteError(err, { phase: 'sweep-tombstone' })
+      return 0
+    }
   }
 
   private deleteSafe(jobId: string): void {
@@ -979,8 +1134,13 @@ export class DelegateInflightSurfaceStore {
         expires_at: row.expiresAt,
         nested: row.nested ? 1 : 0,
         owner_run_id: row.ownerRunId,
+        authority: row.authority ?? AUTHORITY_PROJECTION,
       })
       if (info.changes === 0) {
+        if (this.rowIsTombstoned(row.jobId)) {
+          this.rememberTombstone(row.jobId)
+          return false
+        }
         const fresh = this.loadFromDb(row.jobId)
         if (fresh) this.byJob.set(fresh.jobId, fresh)
         return false
@@ -1003,6 +1163,17 @@ export class DelegateInflightSurfaceStore {
     } catch (err) {
       this.noteWriteError(err, { phase: 'load', jobId })
       return null
+    }
+  }
+
+  private rowIsTombstoned(jobId: string): boolean {
+    if (this.droppedJobs.has(jobId)) return true
+    try {
+      const raw = this.loadStmt?.get(jobId) as Record<string, unknown> | undefined
+      return Boolean(raw) && Number(raw?.tombstoned ?? 0) === 1
+    } catch (err) {
+      this.noteWriteError(err, { phase: 'load-tombstone', jobId })
+      return false
     }
   }
 }
@@ -1048,6 +1219,8 @@ function fromRow(row: Record<string, unknown>): SurfaceRow | null {
     nested: Number(row.nested ?? 0) === 1,
     ownerRunId: typeof row.owner_run_id === 'string' ? row.owner_run_id : '',
     truncated: truncated || undefined,
+    authority: Number(row.authority ?? 0),
+    tombstoned: Number(row.tombstoned ?? 0) === 1,
     ...(foldedGroup ? { foldedGroup } : {}),
   }
 }
