@@ -93,5 +93,14 @@ describe('OCV5-22 delegation protocol', () => {
     }
     assert.equal(row.state, 'running')
     assert.equal(typeof row.foldedGroup, 'undefined')
+    const terminal: InflightDelegateSurface = {
+      ...row,
+      state: 'completed',
+      truncated: true,
+      nested: false,
+      ownerRunId: 'dlg-parent',
+    }
+    assert.equal(terminal.truncated, true)
+    assert.equal(terminal.ownerRunId, 'dlg-parent')
   })
 })

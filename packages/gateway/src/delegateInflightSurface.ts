@@ -3,39 +3,77 @@
  *
  * Decoupled from parent turn_status working-detail. Flag
  * OC_DELEGATE_INFLIGHT_SURFACE defaults off. Authority remains the job row;
- * this store is a projection (goal / runId / liveHint / folded DurableAgentGroup).
- * Restart rebuilds live slots from durable jobs and overlays the cached hint.
+ * this store is a fail-open projection (goal / runId / liveHint / bounded
+ * folded DurableAgentGroup). Writes are fenced + monotonic; I/O errors never
+ * throw into the delegate / Completer / Notifier chain.
  */
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
 import {
   isDelegateTerminalState,
+  isLegalDelegateTransition,
   type DelegateJobState,
   type InflightDelegateSurface,
 } from '@openclaude/protocol'
 import type { DurableAgentGroup } from '@openclaude/protocol'
 
 import { resolveDelegateJobsDbPath } from './delegateDurable.js'
-import type { DelegateJobSnapshot } from './delegateJobs.js'
+import { DEFAULT_DELEGATE_JOB_TTL_MS, type DelegateJobSnapshot } from './delegateJobs.js'
+import { createLogger } from './logger.js'
 
-const SURFACE_SCHEMA_VERSION = 1
+const log = createLogger({ module: 'delegate-inflight-surface' })
+
+const SURFACE_SCHEMA_VERSION = 2
+
+export const INFLIGHT_FOLDED_GROUP_MAX_BYTES = 16 * 1024
+export const INFLIGHT_GET_DEFAULT_LIMIT = 20
+export const INFLIGHT_GET_MAX_LIMIT = 50
+export const INFLIGHT_GET_MAX_RESPONSE_BYTES = 256 * 1024
+export const INFLIGHT_MAX_TERMINAL_ROWS_PER_SESSION = 32
+export const INFLIGHT_GOAL_MAX_CHARS = 4_000
+export const INFLIGHT_LIVE_HINT_MAX_CHARS = 2_000
+export const INFLIGHT_RESULT_SUMMARY_MAX_CHARS = 2_048
+
+const TERMINAL_SQL = `'completed','failed','cancelled','killed_by_cutover'`
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS inflight_delegate_surface (
   job_id TEXT PRIMARY KEY,
   parent_session_key TEXT NOT NULL,
+  session_id TEXT NOT NULL DEFAULT '',
+  user_id TEXT NOT NULL DEFAULT '',
   run_id TEXT NOT NULL,
   agent_id TEXT NOT NULL,
   goal TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL,
   live_hint TEXT NOT NULL DEFAULT '',
   updated_at INTEGER NOT NULL,
-  folded_group_json TEXT
+  fencing_epoch INTEGER NOT NULL DEFAULT 0,
+  generation INTEGER NOT NULL DEFAULT 0,
+  folded_group_json TEXT,
+  payload_truncated INTEGER NOT NULL DEFAULT 0,
+  payload_bytes INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER,
+  nested INTEGER NOT NULL DEFAULT 0,
+  owner_run_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_inflight_surface_parent
   ON inflight_delegate_surface(parent_session_key);
+CREATE INDEX IF NOT EXISTS idx_inflight_surface_user_session
+  ON inflight_delegate_surface(user_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_inflight_surface_expires
+  ON inflight_delegate_surface(expires_at);
 `
+
+type SurfaceRow = InflightDelegateSurface & {
+  userId: string
+  sessionId: string
+  fencingEpoch: number
+  generation: number
+  payloadBytes: number
+  expiresAt: number | null
+}
 
 export function resolveDelegateInflightSurfaceDbPath(
   env: NodeJS.ProcessEnv = process.env,
@@ -70,14 +108,31 @@ export type InflightEnqueueInput = {
   runId?: string
   state?: DelegateJobState
   liveHint?: string
+  userId?: string
+  fencingEpoch?: number
+  generation?: number
+  nested?: boolean
+  ownerRunId?: string
+  preserveIdentity?: boolean
 }
 
 function defaultRunId(jobId: string): string {
   return `dlg-${jobId}`
 }
 
-function cloneSurface(row: InflightDelegateSurface): InflightDelegateSurface {
-  return {
+export function sessionIdFromParentKey(parentSessionKey: string): string {
+  if (!parentSessionKey) return ''
+  const last = parentSessionKey.split(':').pop()
+  return last || parentSessionKey
+}
+
+function clampText(value: string | undefined, max: number): string {
+  if (!value) return ''
+  return value.length <= max ? value : value.slice(0, max)
+}
+
+function cloneSurface(row: SurfaceRow): InflightDelegateSurface {
+  const out: InflightDelegateSurface = {
     jobId: row.jobId,
     runId: row.runId,
     agentId: row.agentId,
@@ -88,75 +143,274 @@ function cloneSurface(row: InflightDelegateSurface): InflightDelegateSurface {
     parentSessionKey: row.parentSessionKey,
     ...(row.foldedGroup ? { foldedGroup: structuredClone(row.foldedGroup) } : {}),
   }
+  if (row.truncated) out.truncated = true
+  if (row.nested) out.nested = true
+  if (row.ownerRunId) out.ownerRunId = row.ownerRunId
+  return out
 }
 
-function publicView(row: InflightDelegateSurface): InflightDelegateSurface {
+function publicView(row: SurfaceRow): InflightDelegateSurface {
   const out = cloneSurface(row)
   if (out.foldedGroup) out.foldedGroup = stripDeferredStubBit(out.foldedGroup)
   return out
+}
+
+function cloneRow(row: SurfaceRow): SurfaceRow {
+  return {
+    ...row,
+    foldedGroup: row.foldedGroup ? structuredClone(row.foldedGroup) : undefined,
+  }
 }
 
 export function parentKeyMatchesSessionId(parentSessionKey: string, sessionId: string): boolean {
   if (!parentSessionKey || !sessionId) return false
   if (parentSessionKey === sessionId) return true
   if (parentSessionKey.endsWith(`:${sessionId}`)) return true
-  // webchat peerId is the last segment of agent:<id>:webchat:dm:<peerId>
-  const last = parentSessionKey.split(':').pop()
-  return last === sessionId
+  return sessionIdFromParentKey(parentSessionKey) === sessionId
+}
+
+export function boundFoldedGroup(
+  group: DurableAgentGroup,
+  maxBytes: number = INFLIGHT_FOLDED_GROUP_MAX_BYTES,
+): { group: DurableAgentGroup; truncated: boolean; bytes: number } {
+  const clone = stripDeferredStubBit(structuredClone(group))
+  // Never persist the INC deferred-stub bit: a truncated summary is not exact process.
+  if ('_payloadDeferred' in clone) {
+    delete (clone as { _payloadDeferred?: unknown })._payloadDeferred
+  }
+  if (clone.goal) clone.goal = clampText(clone.goal, INFLIGHT_GOAL_MAX_CHARS)
+  if (clone.resultSummary) {
+    clone.resultSummary = clampText(clone.resultSummary, INFLIGHT_RESULT_SUMMARY_MAX_CHARS)
+  }
+  const encoded = Buffer.byteLength(JSON.stringify(clone), 'utf8')
+  if (encoded <= maxBytes) return { group: clone, truncated: false, bytes: encoded }
+  const summary: DurableAgentGroup = {
+    runId: clone.runId,
+    agentId: clone.agentId,
+    goal: clampText(clone.goal, INFLIGHT_GOAL_MAX_CHARS),
+    status: clone.status,
+    completedAt: clone.completedAt,
+    ...(clone.resultSummary ? { resultSummary: clone.resultSummary } : {}),
+    ...(clone.verdict ? { verdict: clone.verdict } : {}),
+  }
+  let bytes = Buffer.byteLength(JSON.stringify(summary), 'utf8')
+  if (bytes > maxBytes && summary.resultSummary) {
+    summary.resultSummary = clampText(summary.resultSummary, 256)
+    bytes = Buffer.byteLength(JSON.stringify(summary), 'utf8')
+  }
+  if (bytes > maxBytes && summary.goal) {
+    summary.goal = clampText(summary.goal, 256)
+    bytes = Buffer.byteLength(JSON.stringify(summary), 'utf8')
+  }
+  return { group: summary, truncated: true, bytes }
+}
+
+export function summaryGroupFromJob(
+  job: DelegateJobSnapshot,
+  existing?: Pick<InflightDelegateSurface, 'runId' | 'goal' | 'agentId'>,
+): DurableAgentGroup {
+  const body = job.result?.body ?? {}
+  const output = typeof body.output === 'string' ? body.output : ''
+  const error =
+    typeof body.error === 'string'
+      ? body.error
+      : typeof job.failureDetail === 'string'
+        ? job.failureDetail
+        : ''
+  const ok = job.state === 'completed'
+  return {
+    runId: existing?.runId || defaultRunId(job.id),
+    agentId: existing?.agentId || job.agentId,
+    goal: existing?.goal || '',
+    status: ok ? 'ok' : 'failed',
+    resultSummary: clampText(ok ? output || error : error || output, INFLIGHT_RESULT_SUMMARY_MAX_CHARS),
+    completedAt: job.lastActivityAt ?? job.createdAt ?? Date.now(),
+  }
+}
+
+function canAdvanceState(from: DelegateJobState, to: DelegateJobState): boolean {
+  if (from === to) return true
+  if (isDelegateTerminalState(from) && !isDelegateTerminalState(to)) return false
+  if (isDelegateTerminalState(from) && isDelegateTerminalState(to)) {
+    // Terminal→terminal is sticky: keep the first terminal, do not rewrite.
+    return false
+  }
+  return isLegalDelegateTransition(from, to)
+}
+
+function fenceBeats(
+  incoming: { fencingEpoch: number; generation: number },
+  existing: { fencingEpoch: number; generation: number },
+): boolean {
+  if (incoming.fencingEpoch > existing.fencingEpoch) return true
+  if (incoming.fencingEpoch < existing.fencingEpoch) return false
+  return incoming.generation >= existing.generation
 }
 
 export class DelegateInflightSurfaceStore {
   readonly path: string | null
+  writeFailures = 0
   private readonly now: () => number
-  private readonly byJob = new Map<string, InflightDelegateSurface>()
+  private readonly terminalTtlMs: number
+  private readonly maxTerminalPerSession: number
+  private readonly foldedMaxBytes: number
+  private readonly onWriteError?: (err: unknown, ctx: Record<string, unknown>) => void
+  private readonly byJob = new Map<string, SurfaceRow>()
   private db: InstanceType<typeof Database> | null = null
   private upsertStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
   private deleteStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
+  private loadStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
   private closed = false
 
-  constructor(opts: { dbPath?: string | null; now?: () => number } = {}) {
+  constructor(
+    opts: {
+      dbPath?: string | null
+      now?: () => number
+      terminalTtlMs?: number
+      maxTerminalPerSession?: number
+      foldedMaxBytes?: number
+      onWriteError?: (err: unknown, ctx: Record<string, unknown>) => void
+    } = {},
+  ) {
     this.now = opts.now ?? Date.now
+    this.terminalTtlMs = opts.terminalTtlMs ?? DEFAULT_DELEGATE_JOB_TTL_MS
+    this.maxTerminalPerSession = opts.maxTerminalPerSession ?? INFLIGHT_MAX_TERMINAL_ROWS_PER_SESSION
+    this.foldedMaxBytes = opts.foldedMaxBytes ?? INFLIGHT_FOLDED_GROUP_MAX_BYTES
+    this.onWriteError = opts.onWriteError
     this.path = opts.dbPath === undefined ? resolveDelegateInflightSurfaceDbPath() : opts.dbPath
-    if (this.path) this.openDb(this.path)
+    if (this.path) {
+      try {
+        this.openDb(this.path)
+      } catch (err) {
+        this.noteWriteError(err, { phase: 'open', dbPath: this.path })
+        this.db = null
+        this.upsertStmt = null
+        this.deleteStmt = null
+        this.loadStmt = null
+      }
+    }
+  }
+
+  private noteWriteError(err: unknown, ctx: Record<string, unknown>): void {
+    this.writeFailures += 1
+    try {
+      this.onWriteError?.(err, ctx)
+    } catch {
+      /* listener must not poison the projection */
+    }
+    log.warn('inflight surface write failed', { ...ctx, writeFailures: this.writeFailures }, err)
   }
 
   private openDb(dbPath: string): void {
     mkdirSync(dirname(dbPath), { recursive: true })
     const db = new Database(dbPath)
-    db.pragma('busy_timeout = 10000')
-    db.pragma('journal_mode = WAL')
+    try {
+      db.pragma('busy_timeout = 10000')
+      db.pragma('journal_mode = WAL')
+      this.migrate(db)
+      this.db = db
+      this.upsertStmt = db.prepare(`
+        INSERT INTO inflight_delegate_surface (
+          job_id, parent_session_key, session_id, user_id, run_id, agent_id, goal, state,
+          live_hint, updated_at, fencing_epoch, generation, folded_group_json,
+          payload_truncated, payload_bytes, expires_at, nested, owner_run_id
+        ) VALUES (
+          @job_id, @parent_session_key, @session_id, @user_id, @run_id, @agent_id, @goal, @state,
+          @live_hint, @updated_at, @fencing_epoch, @generation, @folded_group_json,
+          @payload_truncated, @payload_bytes, @expires_at, @nested, @owner_run_id
+        )
+        ON CONFLICT(job_id) DO UPDATE SET
+          parent_session_key=excluded.parent_session_key,
+          session_id=excluded.session_id,
+          user_id=CASE
+            WHEN excluded.user_id != '' THEN excluded.user_id
+            ELSE inflight_delegate_surface.user_id
+          END,
+          run_id=excluded.run_id,
+          agent_id=excluded.agent_id,
+          goal=excluded.goal,
+          state=excluded.state,
+          live_hint=excluded.live_hint,
+          updated_at=excluded.updated_at,
+          fencing_epoch=excluded.fencing_epoch,
+          generation=excluded.generation,
+          folded_group_json=excluded.folded_group_json,
+          payload_truncated=excluded.payload_truncated,
+          payload_bytes=excluded.payload_bytes,
+          expires_at=excluded.expires_at,
+          nested=excluded.nested,
+          owner_run_id=excluded.owner_run_id
+        WHERE
+          excluded.fencing_epoch > inflight_delegate_surface.fencing_epoch
+          OR (
+            excluded.fencing_epoch = inflight_delegate_surface.fencing_epoch
+            AND excluded.generation >= inflight_delegate_surface.generation
+            AND NOT (
+              inflight_delegate_surface.state IN (${TERMINAL_SQL})
+              AND excluded.state NOT IN (${TERMINAL_SQL})
+            )
+          )
+      `)
+      this.deleteStmt = db.prepare('DELETE FROM inflight_delegate_surface WHERE job_id = ?')
+      this.loadStmt = db.prepare('SELECT * FROM inflight_delegate_surface WHERE job_id = ?')
+      const rows = db.prepare('SELECT * FROM inflight_delegate_surface').all() as Array<
+        Record<string, unknown>
+      >
+      for (const row of rows) {
+        const parsed = fromRow(row)
+        if (parsed) this.byJob.set(parsed.jobId, parsed)
+      }
+    } catch (err) {
+      try {
+        db.close()
+      } catch {
+        /* open failed */
+      }
+      throw err
+    }
+  }
+
+  private migrate(db: InstanceType<typeof Database>): void {
     const current = Number(db.pragma('user_version', { simple: true }) ?? 0)
-    if (current < SURFACE_SCHEMA_VERSION) {
-      db.exec(DDL)
-      db.pragma(`user_version = ${SURFACE_SCHEMA_VERSION}`)
-    }
-    this.db = db
-    this.upsertStmt = db.prepare(`
-      INSERT INTO inflight_delegate_surface (
-        job_id, parent_session_key, run_id, agent_id, goal, state, live_hint,
-        updated_at, folded_group_json
-      ) VALUES (
-        @job_id, @parent_session_key, @run_id, @agent_id, @goal, @state, @live_hint,
-        @updated_at, @folded_group_json
+    if (current >= SURFACE_SCHEMA_VERSION) return
+    if (current < 1) db.exec(DDL)
+    if (current === 1) {
+      const existing = new Set(
+        (db.prepare('PRAGMA table_info(inflight_delegate_surface)').all() as Array<{ name: string }>).map(
+          (row) => row.name,
+        ),
       )
-      ON CONFLICT(job_id) DO UPDATE SET
-        parent_session_key=excluded.parent_session_key,
-        run_id=excluded.run_id,
-        agent_id=excluded.agent_id,
-        goal=excluded.goal,
-        state=excluded.state,
-        live_hint=excluded.live_hint,
-        updated_at=excluded.updated_at,
-        folded_group_json=excluded.folded_group_json
-    `)
-    this.deleteStmt = db.prepare('DELETE FROM inflight_delegate_surface WHERE job_id = ?')
-    const rows = db.prepare('SELECT * FROM inflight_delegate_surface').all() as Array<
-      Record<string, unknown>
-    >
-    for (const row of rows) {
-      const parsed = fromRow(row)
-      if (parsed) this.byJob.set(parsed.jobId, parsed)
+      const columns: Array<[string, string]> = [
+        ['session_id', "TEXT NOT NULL DEFAULT ''"],
+        ['user_id', "TEXT NOT NULL DEFAULT ''"],
+        ['fencing_epoch', 'INTEGER NOT NULL DEFAULT 0'],
+        ['generation', 'INTEGER NOT NULL DEFAULT 0'],
+        ['payload_truncated', 'INTEGER NOT NULL DEFAULT 0'],
+        ['payload_bytes', 'INTEGER NOT NULL DEFAULT 0'],
+        ['expires_at', 'INTEGER'],
+        ['nested', 'INTEGER NOT NULL DEFAULT 0'],
+        ['owner_run_id', "TEXT NOT NULL DEFAULT ''"],
+      ]
+      for (const [name, spec] of columns) {
+        if (existing.has(name)) continue
+        db.exec(`ALTER TABLE inflight_delegate_surface ADD COLUMN ${name} ${spec}`)
+      }
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_inflight_surface_user_session
+          ON inflight_delegate_surface(user_id, session_id);
+        CREATE INDEX IF NOT EXISTS idx_inflight_surface_expires
+          ON inflight_delegate_surface(expires_at);
+      `)
+      const legacy = db.prepare('SELECT job_id, parent_session_key FROM inflight_delegate_surface').all() as Array<{
+        job_id: string
+        parent_session_key: string
+      }>
+      const fill = db.prepare('UPDATE inflight_delegate_surface SET session_id = ? WHERE job_id = ?')
+      for (const row of legacy) {
+        fill.run(sessionIdFromParentKey(row.parent_session_key), row.job_id)
+      }
     }
+    db.pragma(`user_version = ${SURFACE_SCHEMA_VERSION}`)
   }
 
   get(jobId: string): InflightDelegateSurface | undefined {
@@ -166,21 +420,55 @@ export class DelegateInflightSurfaceStore {
 
   upsertEnqueue(input: InflightEnqueueInput): InflightDelegateSurface {
     const existing = this.byJob.get(input.jobId)
-    const next: InflightDelegateSurface = {
+    const nextState: DelegateJobState = input.state ?? existing?.state ?? 'queued'
+    if (existing && !canAdvanceState(existing.state, nextState)) {
+      return publicView(existing)
+    }
+    const fencingEpoch = input.fencingEpoch ?? existing?.fencingEpoch ?? 0
+    const generation =
+      input.generation ??
+      (existing ? existing.generation + 1 : 0)
+    if (existing && !fenceBeats({ fencingEpoch, generation }, existing)) {
+      return publicView(existing)
+    }
+    const next: SurfaceRow = {
       jobId: input.jobId,
       parentSessionKey: input.parentSessionKey,
-      agentId: input.agentId,
-      runId: input.runId || existing?.runId || defaultRunId(input.jobId),
-      goal: input.goal ?? existing?.goal ?? '',
-      state: input.state ?? existing?.state ?? 'queued',
-      liveHint: input.liveHint ?? existing?.liveHint ?? '',
+      sessionId: sessionIdFromParentKey(input.parentSessionKey),
+      userId: input.userId || existing?.userId || '',
+      agentId: input.preserveIdentity && existing ? existing.agentId : input.agentId,
+      runId:
+        input.preserveIdentity && existing
+          ? existing.runId
+          : input.runId || existing?.runId || defaultRunId(input.jobId),
+      goal: input.preserveIdentity && existing
+        ? existing.goal
+        : clampText(input.goal ?? existing?.goal ?? '', INFLIGHT_GOAL_MAX_CHARS),
+      state: nextState,
+      liveHint: clampText(input.liveHint ?? existing?.liveHint ?? '', INFLIGHT_LIVE_HINT_MAX_CHARS),
       updatedAt: this.now(),
-      ...(existing?.foldedGroup ? { foldedGroup: existing.foldedGroup } : {}),
+      fencingEpoch,
+      generation,
+      payloadBytes: existing?.payloadBytes ?? 0,
+      expiresAt: isDelegateTerminalState(nextState)
+        ? (existing?.expiresAt ?? this.now() + this.terminalTtlMs)
+        : null,
+      nested: input.nested ?? existing?.nested ?? false,
+      ownerRunId: input.ownerRunId ?? existing?.ownerRunId ?? '',
+      truncated: existing?.truncated,
+      ...(existing?.foldedGroup && isDelegateTerminalState(nextState)
+        ? { foldedGroup: existing.foldedGroup }
+        : {}),
     }
-    // Enqueue of a live job must not keep a previous folded group as "still running".
-    if (!isDelegateTerminalState(next.state)) delete next.foldedGroup
+    if (!isDelegateTerminalState(next.state)) {
+      delete next.foldedGroup
+      next.truncated = undefined
+      next.payloadBytes = 0
+      next.expiresAt = null
+    }
     this.persist(next)
-    return publicView(next)
+    this.enforceTerminalCap(next.userId, next.sessionId)
+    return publicView(this.byJob.get(next.jobId) ?? next)
   }
 
   updateLive(input: {
@@ -191,27 +479,56 @@ export class DelegateInflightSurfaceStore {
     goal?: string
     agentId?: string
     parentSessionKey?: string
+    userId?: string
+    fencingEpoch?: number
+    generation?: number
+    nested?: boolean
+    ownerRunId?: string
+    preserveIdentity?: boolean
   }): InflightDelegateSurface | undefined {
     const existing = this.byJob.get(input.jobId)
     if (!existing) return undefined
-    if (existing.foldedGroup && isDelegateTerminalState(existing.state)) {
-      // Live hint must not resurrect a folded terminal as running.
-      if (input.state && isDelegateTerminalState(input.state)) {
-        existing.state = input.state
-        existing.updatedAt = this.now()
-        this.persist(existing)
-      }
+    const nextState = input.state ?? existing.state
+    if (!canAdvanceState(existing.state, nextState)) {
       return publicView(existing)
     }
-    if (input.parentSessionKey) existing.parentSessionKey = input.parentSessionKey
-    if (input.agentId) existing.agentId = input.agentId
-    if (input.runId) existing.runId = input.runId
-    if (input.goal !== undefined && input.goal !== '') existing.goal = input.goal
-    if (input.state) existing.state = input.state
-    if (input.liveHint !== undefined) existing.liveHint = input.liveHint
-    existing.updatedAt = this.now()
-    this.persist(existing)
-    return publicView(existing)
+    const fencingEpoch = input.fencingEpoch ?? existing.fencingEpoch
+    const generation = input.generation ?? existing.generation + 1
+    if (!fenceBeats({ fencingEpoch, generation }, existing)) {
+      return publicView(existing)
+    }
+    const next = cloneRow(existing)
+    if (!input.preserveIdentity) {
+      if (input.parentSessionKey) {
+        next.parentSessionKey = input.parentSessionKey
+        next.sessionId = sessionIdFromParentKey(input.parentSessionKey)
+      }
+      if (input.agentId) next.agentId = input.agentId
+      if (input.runId) next.runId = input.runId
+      if (input.goal !== undefined && input.goal !== '') {
+        next.goal = clampText(input.goal, INFLIGHT_GOAL_MAX_CHARS)
+      }
+    }
+    if (input.userId) next.userId = input.userId
+    if (input.nested !== undefined) next.nested = input.nested
+    if (input.ownerRunId) next.ownerRunId = input.ownerRunId
+    next.state = nextState
+    if (input.liveHint !== undefined) {
+      next.liveHint = clampText(input.liveHint, INFLIGHT_LIVE_HINT_MAX_CHARS)
+    }
+    next.fencingEpoch = fencingEpoch
+    next.generation = generation
+    next.updatedAt = this.now()
+    if (isDelegateTerminalState(next.state)) {
+      next.expiresAt = next.expiresAt ?? this.now() + this.terminalTtlMs
+    } else {
+      delete next.foldedGroup
+      next.truncated = undefined
+      next.payloadBytes = 0
+      next.expiresAt = null
+    }
+    this.persist(next)
+    return publicView(this.byJob.get(input.jobId) ?? existing)
   }
 
   foldTerminal(input: {
@@ -219,29 +536,99 @@ export class DelegateInflightSurfaceStore {
     group: DurableAgentGroup
     state?: DelegateJobState
     parentSessionKey?: string
+    userId?: string
+    fencingEpoch?: number
+    generation?: number
+    summaryOnly?: boolean
   }): FoldTerminalResult {
     if (isDeferredExactProcessStub(input.group)) {
       return { folded: false, reason: 'deferred_stub' }
     }
     const existing = this.byJob.get(input.jobId)
     if (!existing) return { folded: false, reason: 'missing' }
-    const group = stripDeferredStubBit(structuredClone(input.group))
-    const state: DelegateJobState =
-      input.state ??
-      (group.status === 'ok' ? 'completed' : group.status === 'timeout' ? 'failed' : 'failed')
-    existing.state = state
-    existing.runId = group.runId || existing.runId
-    if (group.goal) existing.goal = group.goal
-    if (group.agentId) existing.agentId = group.agentId
-    if (input.parentSessionKey) existing.parentSessionKey = input.parentSessionKey
-    existing.liveHint = ''
-    existing.foldedGroup = group
-    existing.updatedAt = this.now()
-    this.persist(existing)
-    return { folded: true, surface: publicView(existing) }
+    // Job-authority mapping: a finished DurableAgentGroup is a completed job
+    // even when group.status is failed/timeout (complete(http 200, ok:false)).
+    const state: DelegateJobState = input.state ?? 'completed'
+    if (!canAdvanceState(existing.state, state) && existing.state !== state) {
+      return { folded: true, surface: publicView(existing) }
+    }
+    const fencingEpoch = input.fencingEpoch ?? existing.fencingEpoch
+    const generation = input.generation ?? existing.generation + 1
+    if (!fenceBeats({ fencingEpoch, generation }, existing)) {
+      return { folded: true, surface: publicView(existing) }
+    }
+    if (input.summaryOnly && existing.foldedGroup && isDelegateTerminalState(existing.state)) {
+      return { folded: true, surface: publicView(existing) }
+    }
+    const bounded = boundFoldedGroup(input.group, this.foldedMaxBytes)
+    const next = cloneRow(existing)
+    next.state = state
+    next.runId = bounded.group.runId || existing.runId
+    if (bounded.group.goal) next.goal = clampText(bounded.group.goal, INFLIGHT_GOAL_MAX_CHARS)
+    if (bounded.group.agentId) next.agentId = bounded.group.agentId
+    if (input.parentSessionKey) {
+      next.parentSessionKey = input.parentSessionKey
+      next.sessionId = sessionIdFromParentKey(input.parentSessionKey)
+    }
+    if (input.userId) next.userId = input.userId
+    next.liveHint = ''
+    next.foldedGroup = bounded.group
+    next.truncated = bounded.truncated || undefined
+    next.payloadBytes = bounded.bytes
+    next.fencingEpoch = fencingEpoch
+    next.generation = generation
+    next.updatedAt = this.now()
+    next.expiresAt = this.now() + this.terminalTtlMs
+    this.persist(next)
+    this.enforceTerminalCap(next.userId, next.sessionId)
+    return { folded: true, surface: publicView(this.byJob.get(input.jobId) ?? next) }
+  }
+
+  /**
+   * Shared projection commit point for every job terminal (early-exit,
+   * complete, fail, cancel, cutover, capacity). Fail-open: never throws.
+   */
+  projectJob(job: DelegateJobSnapshot): InflightDelegateSurface | undefined {
+    if (!job.parentSessionKey) return undefined
+    const existing = this.byJob.get(job.id)
+    const fence = { fencingEpoch: job.fencingEpoch, generation: job.generation }
+    if (!existing) {
+      this.upsertEnqueue({
+        jobId: job.id,
+        parentSessionKey: job.parentSessionKey,
+        agentId: job.agentId,
+        state: isDelegateTerminalState(job.state) ? 'running' : job.state,
+        userId: job.callbackOriginUserId,
+        runId: defaultRunId(job.id),
+        ...fence,
+      })
+    }
+    if (isDelegateTerminalState(job.state)) {
+      const row = this.byJob.get(job.id)
+      if (!row) return undefined
+      const group = summaryGroupFromJob(job, row)
+      const folded = this.foldTerminal({
+        jobId: job.id,
+        group,
+        state: job.state,
+        parentSessionKey: job.parentSessionKey,
+        userId: job.callbackOriginUserId || row.userId,
+        summaryOnly: true,
+        ...fence,
+      })
+      return folded.folded ? folded.surface : this.get(job.id)
+    }
+    return this.updateLive({
+      jobId: job.id,
+      state: job.state,
+      parentSessionKey: job.parentSessionKey,
+      userId: job.callbackOriginUserId,
+      ...fence,
+    })
   }
 
   listForParent(parentSessionKey: string): InflightDelegateSurface[] {
+    this.sweepExpired()
     const out: InflightDelegateSurface[] = []
     for (const row of this.byJob.values()) {
       if (row.parentSessionKey === parentSessionKey) out.push(publicView(row))
@@ -250,37 +637,120 @@ export class DelegateInflightSurfaceStore {
     return out
   }
 
-  listForSessionId(sessionId: string): InflightDelegateSurface[] {
-    const out: InflightDelegateSurface[] = []
+  listForSessionId(
+    sessionId: string,
+    opts: {
+      userId?: string
+      limit?: number
+      cursor?: string
+      maxBytes?: number
+    } = {},
+  ): { items: InflightDelegateSurface[]; nextCursor: string | null; truncated: boolean } {
+    this.sweepExpired()
+    const matched: SurfaceRow[] = []
     for (const row of this.byJob.values()) {
-      if (parentKeyMatchesSessionId(row.parentSessionKey, sessionId)) out.push(publicView(row))
+      if (opts.userId && row.userId && row.userId !== opts.userId) continue
+      if (row.sessionId === sessionId || parentKeyMatchesSessionId(row.parentSessionKey, sessionId)) {
+        matched.push(row)
+      }
     }
-    out.sort((a, b) => a.updatedAt - b.updatedAt)
-    return out
+    matched.sort((a, b) => a.updatedAt - b.updatedAt || a.jobId.localeCompare(b.jobId))
+    let start = 0
+    if (opts.cursor) {
+      const idx = matched.findIndex((row) => row.jobId === opts.cursor)
+      start = idx >= 0 ? idx + 1 : 0
+    }
+    const limit = Math.min(
+      Math.max(1, opts.limit ?? INFLIGHT_GET_DEFAULT_LIMIT),
+      INFLIGHT_GET_MAX_LIMIT,
+    )
+    const maxBytes = opts.maxBytes ?? INFLIGHT_GET_MAX_RESPONSE_BYTES
+    const items: InflightDelegateSurface[] = []
+    let used = 2
+    let truncated = false
+    for (let i = start; i < matched.length && items.length < limit; i++) {
+      const view = publicView(matched[i])
+      const size = Buffer.byteLength(JSON.stringify(view), 'utf8') + 1
+      if (items.length > 0 && used + size > maxBytes) {
+        truncated = true
+        break
+      }
+      items.push(view)
+      used += size
+    }
+    const consumedThrough = start + items.length
+    const nextCursor =
+      truncated || consumedThrough < matched.length ? items[items.length - 1]?.jobId ?? null : null
+    if (consumedThrough < matched.length) truncated = true
+    return { items, nextCursor, truncated }
+  }
+
+  sweepExpired(now: number = this.now()): number {
+    let dropped = 0
+    for (const [jobId, row] of [...this.byJob.entries()]) {
+      if (row.expiresAt != null && row.expiresAt <= now && isDelegateTerminalState(row.state)) {
+        this.byJob.delete(jobId)
+        this.deleteSafe(jobId)
+        dropped += 1
+      }
+    }
+    return dropped
+  }
+
+  private enforceTerminalCap(userId: string, sessionId: string): void {
+    if (!sessionId) return
+    const terminals = [...this.byJob.values()].filter((row) => {
+      if (!isDelegateTerminalState(row.state)) return false
+      if (row.sessionId !== sessionId) return false
+      if (userId && row.userId && row.userId !== userId) return false
+      return true
+    })
+    if (terminals.length <= this.maxTerminalPerSession) return
+    terminals.sort((a, b) => a.updatedAt - b.updatedAt || a.jobId.localeCompare(b.jobId))
+    const extra = terminals.length - this.maxTerminalPerSession
+    for (let i = 0; i < extra; i++) {
+      this.byJob.delete(terminals[i].jobId)
+      this.deleteSafe(terminals[i].jobId)
+    }
   }
 
   /**
    * Job rows are authority for liveness. Cached goal/runId/liveHint overlay.
    * Folded terminals stay even when the job has expired from the live set.
    * When `dropMissingLive` (boot/restart), missing jobs drop non-folded live
-   * rows so a dead Map cannot impersonate "still running". GET overlays only.
+   * rows so a dead Map cannot impersonate "still running". GET overlays only,
+   * but still folds live rows whose job is already terminal.
    */
   rebuildFromJobs(
     jobs: readonly DelegateJobSnapshot[],
-    opts: { dropMissingLive?: boolean } = {},
+    opts: {
+      dropMissingLive?: boolean
+      resolveJob?: (jobId: string) => DelegateJobSnapshot | undefined
+    } = {},
   ): InflightDelegateSurface[] {
+    this.sweepExpired()
     const live = new Map<string, DelegateJobSnapshot>()
     for (const job of jobs) {
       if (!job.parentSessionKey) continue
-      if (isDelegateTerminalState(job.state)) continue
+      if (isDelegateTerminalState(job.state)) {
+        this.projectJob(job)
+        continue
+      }
       live.set(job.id, job)
     }
-    if (opts.dropMissingLive) {
-      for (const [jobId, row] of [...this.byJob.entries()]) {
-        if (row.foldedGroup && isDelegateTerminalState(row.state)) continue
-        if (live.has(jobId)) continue
+    for (const [jobId, row] of [...this.byJob.entries()]) {
+      if (live.has(jobId)) continue
+      // Terminal rows (with or without a bounded group) must survive boot.
+      // Dropping them is the "fake running → 404 evaporate" anti-pattern.
+      if (isDelegateTerminalState(row.state)) continue
+      const resolved = opts.resolveJob?.(jobId)
+      if (resolved && isDelegateTerminalState(resolved.state)) {
+        this.projectJob(resolved)
+        continue
+      }
+      if (opts.dropMissingLive) {
         this.byJob.delete(jobId)
-        this.deleteStmt?.run(jobId)
+        this.deleteSafe(jobId)
       }
     }
     for (const job of live.values()) {
@@ -293,6 +763,10 @@ export class DelegateInflightSurfaceStore {
         runId: existing?.runId,
         goal: existing?.goal,
         liveHint: existing?.liveHint,
+        userId: existing?.userId || job.callbackOriginUserId,
+        fencingEpoch: job.fencingEpoch,
+        generation: job.generation,
+        preserveIdentity: Boolean(existing),
       })
     }
     return [...this.byJob.values()].map(publicView)
@@ -315,7 +789,10 @@ export class DelegateInflightSurfaceStore {
     if (this.closed) return
     this.closed = true
     try {
-      this.db?.pragma('wal_checkpoint(TRUNCATE)')
+      // PASSIVE: never truncate WAL while another gateway handle may still
+      // hold the file. TRUNCATE here was able to hide a committed terminal
+      // from the next process (cross-gateway probe).
+      this.db?.pragma('wal_checkpoint(PASSIVE)')
     } catch {
       /* shutdown */
     }
@@ -327,25 +804,71 @@ export class DelegateInflightSurfaceStore {
     this.db = null
     this.upsertStmt = null
     this.deleteStmt = null
+    this.loadStmt = null
   }
 
-  private persist(row: InflightDelegateSurface): void {
-    this.byJob.set(row.jobId, row)
-    this.upsertStmt?.run({
-      job_id: row.jobId,
-      parent_session_key: row.parentSessionKey,
-      run_id: row.runId,
-      agent_id: row.agentId,
-      goal: row.goal,
-      state: row.state,
-      live_hint: row.liveHint,
-      updated_at: row.updatedAt,
-      folded_group_json: row.foldedGroup ? JSON.stringify(row.foldedGroup) : null,
-    })
+  private deleteSafe(jobId: string): void {
+    try {
+      this.deleteStmt?.run(jobId)
+    } catch (err) {
+      this.noteWriteError(err, { phase: 'delete', jobId })
+    }
+  }
+
+  private persist(row: SurfaceRow): boolean {
+    try {
+      if (!this.upsertStmt) {
+        this.byJob.set(row.jobId, row)
+        return true
+      }
+      const info = this.upsertStmt.run({
+        job_id: row.jobId,
+        parent_session_key: row.parentSessionKey,
+        session_id: row.sessionId,
+        user_id: row.userId,
+        run_id: row.runId,
+        agent_id: row.agentId,
+        goal: row.goal,
+        state: row.state,
+        live_hint: row.liveHint,
+        updated_at: row.updatedAt,
+        fencing_epoch: row.fencingEpoch,
+        generation: row.generation,
+        folded_group_json: row.foldedGroup ? JSON.stringify(row.foldedGroup) : null,
+        payload_truncated: row.truncated ? 1 : 0,
+        payload_bytes: row.payloadBytes,
+        expires_at: row.expiresAt,
+        nested: row.nested ? 1 : 0,
+        owner_run_id: row.ownerRunId,
+      })
+      if (info.changes === 0) {
+        const fresh = this.loadFromDb(row.jobId)
+        if (fresh) this.byJob.set(fresh.jobId, fresh)
+        return false
+      }
+      this.byJob.set(row.jobId, row)
+      return true
+    } catch (err) {
+      this.noteWriteError(err, { phase: 'persist', jobId: row.jobId })
+      // Fail-open: keep the in-process projection so GET in this process still
+      // works; never throw into Enqueue / Completer / Notifier.
+      this.byJob.set(row.jobId, row)
+      return false
+    }
+  }
+
+  private loadFromDb(jobId: string): SurfaceRow | null {
+    try {
+      const raw = this.loadStmt?.get(jobId) as Record<string, unknown> | undefined
+      return raw ? fromRow(raw) : null
+    } catch (err) {
+      this.noteWriteError(err, { phase: 'load', jobId })
+      return null
+    }
   }
 }
 
-function fromRow(row: Record<string, unknown>): InflightDelegateSurface | null {
+function fromRow(row: Record<string, unknown>): SurfaceRow | null {
   const jobId = typeof row.job_id === 'string' ? row.job_id : ''
   const parentSessionKey = typeof row.parent_session_key === 'string' ? row.parent_session_key : ''
   if (!jobId || !parentSessionKey) return null
@@ -360,15 +883,89 @@ function fromRow(row: Record<string, unknown>): InflightDelegateSurface | null {
       foldedGroup = undefined
     }
   }
+  const truncated = Number(row.payload_truncated ?? 0) === 1
   return {
     jobId,
     parentSessionKey,
+    sessionId:
+      typeof row.session_id === 'string' && row.session_id
+        ? row.session_id
+        : sessionIdFromParentKey(parentSessionKey),
+    userId: typeof row.user_id === 'string' ? row.user_id : '',
     runId: typeof row.run_id === 'string' && row.run_id ? row.run_id : defaultRunId(jobId),
     agentId: typeof row.agent_id === 'string' ? row.agent_id : '',
     goal: typeof row.goal === 'string' ? row.goal : '',
     state: (typeof row.state === 'string' ? row.state : 'running') as DelegateJobState,
     liveHint: typeof row.live_hint === 'string' ? row.live_hint : '',
     updatedAt: Number(row.updated_at ?? 0),
+    fencingEpoch: Number(row.fencing_epoch ?? 0),
+    generation: Number(row.generation ?? 0),
+    payloadBytes: Number(row.payload_bytes ?? 0),
+    expiresAt: row.expires_at == null ? null : Number(row.expires_at),
+    nested: Number(row.nested ?? 0) === 1,
+    ownerRunId: typeof row.owner_run_id === 'string' ? row.owner_run_id : '',
+    truncated: truncated || undefined,
     ...(foldedGroup ? { foldedGroup } : {}),
+  }
+}
+
+export type InflightDelegatesHttpResult = {
+  status: number
+  body: Record<string, unknown>
+}
+
+/**
+ * Production GET /api/sessions/:id/inflight-delegates. Flag-off is 404
+ * `{error:'not found'}` (653ef6339 path-equivalent). Ownership is
+ * getClientSession(sessId, userId) fail-closed.
+ */
+export async function handleInflightDelegatesRequest(args: {
+  method: string
+  sessionId: string
+  userId: string
+  enabled: boolean
+  searchParams?: URLSearchParams
+  loadSession: (sessionId: string, userId: string) => Promise<unknown>
+  store?: DelegateInflightSurfaceStore | null
+  overlayJobs?: () => readonly DelegateJobSnapshot[]
+  resolveJob?: (jobId: string) => DelegateJobSnapshot | undefined
+}): Promise<InflightDelegatesHttpResult> {
+  if (!args.enabled) {
+    return { status: 404, body: { error: 'not found' } }
+  }
+  if (args.method !== 'GET') {
+    return { status: 405, body: { error: 'method not allowed' } }
+  }
+  const sess = await args.loadSession(args.sessionId, args.userId)
+  if (!sess) {
+    return { status: 404, body: { error: 'not found' } }
+  }
+  const store = args.store
+  if (!store) {
+    return { status: 200, body: { enabled: true, items: [], nextCursor: null, truncated: false } }
+  }
+  try {
+    if (args.overlayJobs) {
+      store.rebuildFromJobs(args.overlayJobs(), { resolveJob: args.resolveJob })
+    }
+  } catch (err) {
+    log.warn('inflight surface overlay failed', { sessionId: args.sessionId }, err)
+  }
+  const rawLimit = Number(args.searchParams?.get('limit') ?? '')
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : INFLIGHT_GET_DEFAULT_LIMIT
+  const cursor = args.searchParams?.get('cursor') || undefined
+  const page = store.listForSessionId(args.sessionId, {
+    userId: args.userId,
+    limit,
+    cursor,
+  })
+  return {
+    status: 200,
+    body: {
+      enabled: true,
+      items: page.items,
+      nextCursor: page.nextCursor,
+      truncated: page.truncated,
+    },
   }
 }

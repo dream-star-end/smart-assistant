@@ -112,6 +112,12 @@ export type InflightDelegateSurface = {
   parentSessionKey: string
   /** Set after terminal fold into DurableAgentGroup; omitted while live. */
   foldedGroup?: import('./teamCards.js').DurableAgentGroup
+  /** True when foldedGroup is a bounded summary, not the full transcript. */
+  truncated?: boolean
+  /** Nested child slot; UI must not replace the first-level identity. */
+  nested?: boolean
+  /** First-level progress runId this nested child reports under. */
+  ownerRunId?: string
 }
 
 /** Legal state transitions from design v2 §2.2. Lease adoption is NOT a transition. */
