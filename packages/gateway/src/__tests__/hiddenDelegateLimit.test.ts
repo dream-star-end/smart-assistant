@@ -21,7 +21,10 @@ import { Gateway, PerTurnDelegationGuard, MAX_HIDDEN_DELEGATIONS_PER_TURN } from
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-hidden-limit'
 
-const ENV_KEYS = ['OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN'] as const
+const ENV_KEYS = [
+  'OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN',
+  'OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN',
+] as const
 const ORIG_ENV: Record<string, string | undefined> = {}
 for (const k of ENV_KEYS) ORIG_ENV[k] = process.env[k]
 function restoreHiddenLimitEnv(): void {

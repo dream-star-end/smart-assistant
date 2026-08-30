@@ -8,7 +8,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/memberDelegateLimit.test.ts
  */
 import assert from 'node:assert/strict'
-import { afterEach, describe, it } from 'node:test'
+import { after, afterEach, describe, it } from 'node:test'
 
 import type { InboundFrame } from '@openclaude/protocol'
 
@@ -21,14 +21,27 @@ import {
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-member-limit'
 
-const ENV_KEYS = ['OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN'] as const
+const ENV_KEYS = [
+  'OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN',
+  'OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN',
+] as const
 const ORIG_ENV: Record<string, string | undefined> = {}
 for (const k of ENV_KEYS) ORIG_ENV[k] = process.env[k]
-afterEach(() => {
+function restoreDelegateLimitEnv(): void {
   for (const k of ENV_KEYS) {
     if (ORIG_ENV[k] === undefined) delete process.env[k]
     else process.env[k] = ORIG_ENV[k]
   }
+}
+function clearDelegateLimitEnv(): void {
+  for (const k of ENV_KEYS) delete process.env[k]
+}
+clearDelegateLimitEnv()
+afterEach(() => {
+  clearDelegateLimitEnv()
+})
+after(() => {
+  restoreDelegateLimitEnv()
 })
 
 // ── 测试脚手架 ───────────────────────────────────────────────────────────────
