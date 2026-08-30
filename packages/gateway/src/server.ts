@@ -386,7 +386,15 @@ import {
   type DelegateJobSnapshot,
 } from './delegateJobs.js'
 import { DelegateResumeRegistry, DELEGATE_RESUME_OCCUPIED_MESSAGE } from './delegateResume.js'
-import { isDelegateDurableEffective, isDelegateSmEnabled, resolveDelegateCallbackOwner } from './delegateSmFlag.js'
+import {
+  isDelegateDurableEffective,
+  isDelegateNotifierEffective,
+  isDelegateSmEnabled,
+  resolveDelegateCallbackOwner,
+} from './delegateSmFlag.js'
+import { DefaultEngineNotifier, tryWriteInlinePush, type InlinePushSession } from './engineNotifier.js'
+import { dispatchJobTerminalNotify, retryPendingNotifies } from './delegateNotifyDispatch.js'
+import { formatJobTerminalMarkdown, parseParentEngine } from './jobTerminal.js'
 import { openDelegateDurableDb } from './delegateDurable.js'
 import {
   nextDelegateReconcileAt,
@@ -427,6 +435,8 @@ import {
   outboundRingReplayMissTotal,
   outboundRingEvictedTotal,
   outboundRingSizeBytes,
+  delegateNotifyTotal,
+  delegateNotifyLatencyMs,
 } from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
 import { USER_PROFILE_INJECT_MAX_CHARS } from './promptSlots.js'
@@ -10486,6 +10496,7 @@ export class Gateway {
   private _delegateReconcileReady = false
   private _delegateDurablePath: string | undefined
   private _delegateReconcileTimer: ReturnType<typeof setTimeout> | undefined
+  private _engineNotifier: DefaultEngineNotifier | undefined
 
   private _ensureDelegateJobStore(): DelegateJobStore {
     if (this._delegateJobs) return this._delegateJobs
@@ -10499,6 +10510,7 @@ export class Gateway {
       durable,
       onTerminal: (job) => {
         if (job.sessionKey) resume.release(job.sessionKey)
+        if (isDelegateNotifierEffective()) void this._dispatchDelegateNotify(job)
       },
     })
     this._delegateJobs = store
@@ -10516,6 +10528,9 @@ export class Gateway {
       if (filled > 0) this.log.info('cron occurrence delegateJobId backfill', { filled })
       this._armDelegateReconcileFollowup(store, queueWaitMs)
       this._delegateReconcileReady = true
+      if (isDelegateNotifierEffective()) {
+        void this._retryDelegateNotifies()
+      }
     } else {
       this._delegateReconcileReady = true
     }
@@ -10553,6 +10568,98 @@ export class Gateway {
       return undefined
     } catch {
       return undefined
+    }
+  }
+
+  private _resolveDelegateParentEngine(sessionKey?: string): ReturnType<typeof parseParentEngine> {
+    if (!sessionKey) return undefined
+    try {
+      const session = this.sessions?.getByKey?.(sessionKey) as { runner?: { engineId?: string } } | undefined
+      return parseParentEngine(session?.runner?.engineId)
+    } catch {
+      return undefined
+    }
+  }
+
+  private _notifyDispatchHooks() {
+    return {
+      resolveParentEngine: (job: DelegateJobSnapshot) =>
+        this._resolveDelegateParentEngine(job.parentSessionKey) ?? parseParentEngine(job.parentEngine),
+      resolveGoal: (job: DelegateJobSnapshot) => this._activeSendToAgentCallbacks?.get(job.id)?.goal,
+    }
+  }
+
+  private _ensureEngineNotifier(): DefaultEngineNotifier | undefined {
+    if (!isDelegateNotifierEffective()) return undefined
+    if (this._engineNotifier) return this._engineNotifier
+    this._engineNotifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: async (event) => {
+          const session = this.sessions?.getByKey?.(event.parentSessionKey) as InlinePushSession | undefined
+          return tryWriteInlinePush(session, event, formatJobTerminalMarkdown(event))
+        },
+      },
+      resumeInject: {
+        inject: async (event) => {
+          const result = await this.injectSendToAgentCallback({
+            parentSessionKey: event.parentSessionKey,
+            jobId: event.jobId,
+            agentId: event.agentId || 'unknown',
+            goal: event.goal || '',
+            output: event.state === 'completed' ? event.resultRef : undefined,
+            error: event.state === 'completed' ? undefined : event.failureDetail || event.resultRef,
+            clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
+          })
+          if (result.kind === 'injected') return { ok: true }
+          if (result.kind === 'retryable_failure' && result.code === 'ORIGIN_SESSION_BUSY') {
+            return { ok: false, failureClass: 'internal' as const, busy: true }
+          }
+          if (result.kind === 'fallback') {
+            return { ok: false, failureClass: 'transport' as const, gone: true }
+          }
+          return { ok: false, failureClass: 'transport' as const }
+        },
+      },
+      onSample: (sample) => {
+        delegateNotifyTotal.inc({
+          lane: sample.lane,
+          ok: sample.ok ? '1' : '0',
+          degraded: sample.degraded ? '1' : '0',
+        })
+        delegateNotifyLatencyMs.observe(sample.latencyMs, { lane: sample.lane })
+      },
+    })
+    return this._engineNotifier
+  }
+
+  private async _dispatchDelegateNotify(job: DelegateJobSnapshot): Promise<void> {
+    const store = this._delegateJobs
+    const notifier = this._ensureEngineNotifier()
+    if (!store || !notifier) return
+    try {
+      const result = await dispatchJobTerminalNotify(store, job, notifier, this._notifyDispatchHooks())
+      if ('skipped' in result) return
+      if (!result.ok) {
+        this.log.warn('delegate notify failed', {
+          jobId: job.id,
+          failureClass: result.failureClass,
+          degradedTo: result.degradedTo,
+        })
+      }
+    } catch (err) {
+      this.log.warn('delegate notify threw', { jobId: job.id }, err as Error)
+    }
+  }
+
+  private async _retryDelegateNotifies(): Promise<void> {
+    const store = this._delegateJobs
+    const notifier = this._ensureEngineNotifier()
+    if (!store || !notifier) return
+    try {
+      const summary = await retryPendingNotifies(store, notifier, this._notifyDispatchHooks())
+      if (summary.scanned > 0) this.log.info('delegate notify retry', summary)
+    } catch (err) {
+      this.log.warn('delegate notify retry threw', undefined, err as Error)
     }
   }
 
@@ -11140,6 +11247,9 @@ export class Gateway {
         kind: callbackOnComplete ? 'send_to_agent' : 'delegate',
         callback: callbackOnComplete ? 'origin-inject' : 'stdout-wait',
         idempotencyKey: sm ? idempotencyKey : undefined,
+        parentEngine: isDelegateNotifierEffective()
+          ? this._resolveDelegateParentEngine(parentSessionKey)
+          : undefined,
       })
       if ('error' in created) {
         this._delegateResume.abort(resume.sessionKey, resume.minted)
@@ -13010,6 +13120,15 @@ export class Gateway {
     job: DelegateJobSnapshot,
     intent: SendToAgentIntent,
   ): Promise<boolean> {
+    if (isDelegateNotifierEffective() && this._delegateJobs) {
+      const notifier = this._ensureEngineNotifier()
+      if (!notifier) return false
+      const result = await dispatchJobTerminalNotify(this._delegateJobs, job, notifier, {
+        resolveParentEngine: (row) => this._resolveDelegateParentEngine(row.parentSessionKey) ?? parseParentEngine(row.parentEngine),
+        resolveGoal: () => intent.goal,
+      })
+      return !('skipped' in result) && result.ok === true
+    }
     const epoch = job.callbackEpoch || 1
     const payload = callbackPayloadFromDurableJob(job)
     const result = await this.injectSendToAgentCallback({
@@ -13279,6 +13398,9 @@ export class Gateway {
     args: { jobId: string; agentId: string; goal: string; output?: string; error?: string },
   ): void {
     if (runInput.callbackOnComplete !== 'origin-inject') return
+    // R0/R1: EngineNotifier owns origin-inject delivery when the flag is on.
+    // Completer full switch (BUSY→pending for every callback kind) is stage 2.
+    if (isDelegateNotifierEffective()) return
     const owner = resolveDelegateCallbackOwner()
     const snap = this._delegateJobs?.snapshotOf(args.jobId)
     const epoch = snap?.callbackEpoch || 1
