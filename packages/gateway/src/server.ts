@@ -393,10 +393,15 @@ import { DelegateResumeRegistry, DELEGATE_RESUME_OCCUPIED_MESSAGE } from './dele
 import {
   isDelegateCutoverEffective,
   isDelegateDurableEffective,
+  isDelegateInflightSurfaceEffective,
   isDelegateNotifierEffective,
   isDelegateSmEnabled,
   resolveDelegateCallbackOwner,
 } from './delegateSmFlag.js'
+import {
+  DelegateInflightSurfaceStore,
+  handleInflightDelegatesRequest,
+} from './delegateInflightSurface.js'
 import {
   beginDelegateCutover,
   endDelegateCutover,
@@ -5224,6 +5229,30 @@ export class Gateway {
       readArchivedMessages(sessId, userId, beforeSeq, limit, { view: 'timeline' })
         .then((r) => this.sendJson(res, 200, r))
         .catch(() => this.sendJson(res, 500, { error: 'archive read failed' }))
+      return
+    }
+    const inflightDelegatesMatch = url.pathname.match(
+      /^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/inflight-delegates$/,
+    )
+    if (inflightDelegatesMatch) {
+      const sessId = inflightDelegatesMatch[1]
+      const userId = this.getUserId(req)
+      const enabled = isDelegateInflightSurfaceEffective()
+      handleInflightDelegatesRequest({
+        method: req.method ?? 'GET',
+        sessionId: sessId,
+        userId,
+        enabled,
+        searchParams: url.searchParams,
+        loadSession: (id, uid) => getClientSession(id, uid),
+        store: enabled ? this._ensureDelegateInflightSurface() : null,
+        overlayJobs: () => this._delegateJobs?.listNonTerminal() ?? [],
+        resolveJob: (jobId) => this._delegateJobs?.snapshotOf(jobId),
+      })
+        .then((result) => this.sendJson(res, result.status, result.body))
+        .catch((error: unknown) =>
+          this.sendSessionReadFailure(res, error, sessId, 'inflight delegates read failed'),
+        )
       return
     }
     const sessionReadMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/read$/)
@@ -10580,6 +10609,8 @@ export class Gateway {
   private _delegateReconcileTimer: ReturnType<typeof setTimeout> | undefined
   private _notifyRetryTimer: ReturnType<typeof setTimeout> | undefined
   private _engineNotifier: DefaultEngineNotifier | undefined
+  /** R2 session-level inflight projection. Lazy; flag-off never opens the db. */
+  private _delegateInflightSurface: DelegateInflightSurfaceStore | undefined
 
   private _ensureDelegateJobStore(): DelegateJobStore {
     if (this._delegateJobs) return this._delegateJobs
@@ -10591,8 +10622,10 @@ export class Gateway {
       ttlMs: resolveDelegateJobTtlMs(),
       sm,
       durable,
+      onDrop: (job) => this._forgetDelegateInflight(job.id),
       onTerminal: (job) => {
         if (job.sessionKey) resume.release(job.sessionKey)
+        this._projectDelegateInflightFromJob(job)
         if (isDelegateNotifierEffective()) void this._dispatchDelegateNotify(job)
       },
     })
@@ -10620,7 +10653,107 @@ export class Gateway {
     } else {
       this._delegateReconcileReady = true
     }
+    if (isDelegateInflightSurfaceEffective()) {
+      this._ensureDelegateInflightSurface().rebuildFromJobs(store.listNonTerminal(), {
+        dropMissingLive: true,
+      })
+    }
     return store
+  }
+
+  private _ensureDelegateInflightSurface(): DelegateInflightSurfaceStore {
+    if (this._delegateInflightSurface) return this._delegateInflightSurface
+    this._delegateInflightSurface = new DelegateInflightSurfaceStore({
+      dbPath: this._delegateDurablePath
+        ? join(dirname(this._delegateDurablePath), 'delegate-inflight-surface.db')
+        : undefined,
+    })
+    return this._delegateInflightSurface
+  }
+
+  private _projectDelegateInflightFromJob(job: DelegateJobSnapshot): void {
+    if (!isDelegateInflightSurfaceEffective()) return
+    try {
+      this._ensureDelegateInflightSurface().projectJob(job)
+    } catch (err) {
+      this.log.warn('delegate inflight surface project failed', { jobId: job.id }, err as Error)
+    }
+  }
+
+  private _forgetDelegateInflight(jobId: string): void {
+    if (!isDelegateInflightSurfaceEffective()) return
+    try {
+      this._ensureDelegateInflightSurface().drop(jobId)
+    } catch (err) {
+      this.log.warn('delegate inflight surface drop failed', { jobId }, err as Error)
+    }
+  }
+
+  private _dropDelegateInflightSurface(jobId: string): void {
+    this._forgetDelegateInflight(jobId)
+  }
+
+  private _touchDelegateInflightSurface(input: {
+    jobId?: string
+    progressRunId?: string
+    parentSessionKey?: string
+    agentId: string
+    goal?: string
+    state?: import('@openclaude/protocol').DelegateJobState
+    liveHint?: string
+    runId?: string
+    userId?: string
+    nested?: boolean
+    ownerRunId?: string
+    preserveIdentity?: boolean
+  }): void {
+    if (!isDelegateInflightSurfaceEffective()) return
+    try {
+      const parentSessionKey = input.parentSessionKey
+      if (!parentSessionKey) return
+      const jobId = DelegateInflightSurfaceStore.resolveJobId(input.jobId, input.progressRunId)
+      if (!jobId) return
+      const store = this._ensureDelegateInflightSurface()
+      const snap = this._delegateJobs?.snapshotOf(jobId)
+      const fence = snap
+        ? { fencingEpoch: snap.fencingEpoch, generation: snap.generation }
+        : {}
+      const patch = store.updateLive({
+        jobId,
+        state: input.state,
+        liveHint: input.liveHint,
+        runId: input.runId ?? input.progressRunId,
+        goal: input.goal,
+        agentId: input.agentId,
+        parentSessionKey,
+        userId: input.userId,
+        nested: input.nested,
+        ownerRunId: input.ownerRunId,
+        preserveIdentity: input.preserveIdentity,
+        ...fence,
+      })
+      if (patch) return
+      store.upsertEnqueue({
+        jobId,
+        parentSessionKey,
+        agentId: input.agentId,
+        goal: input.goal,
+        runId: input.runId ?? input.progressRunId,
+        state: input.state ?? 'running',
+        liveHint: input.liveHint,
+        userId: input.userId,
+        nested: input.nested,
+        ownerRunId: input.ownerRunId,
+        preserveIdentity: input.preserveIdentity,
+        ...fence,
+      })
+    } catch (err) {
+      this.log.warn(
+        'delegate inflight surface write failed',
+        { jobId: input.jobId, progressRunId: input.progressRunId },
+        err as Error,
+      )
+    }
   }
 
   private _armDelegateReconcileFollowup(store: DelegateJobStore, queueWaitMs: number): void {
@@ -11324,6 +11457,7 @@ export class Gateway {
     // 委派执行核心与 HTTP req/res 解耦(P2 债C),让 gateway 硬编排 review pass
     // (dispatchInbound)能内部直调同一委派路径拿到结构化结果(verdict/output),
     // 无需伪造 req/res。
+    const requestUserId = this.getUserId(req)
     const parentSessionKey = boundContext
       ? boundContext.sessionKey
       : typeof parsed.parentSessionKey === 'string'
@@ -11446,6 +11580,14 @@ export class Gateway {
         if (sm && runInput.capacityReserved) this._releaseDelegateSlot(slotOpts)
         if (sm) this._delegateQueueWaiters?.delete(resume.sessionKey)
         const existing = store.snapshotOf(created.jobId)
+        this._touchDelegateInflightSurface({
+          jobId: created.jobId,
+          parentSessionKey,
+          agentId: targetAgentId,
+          goal,
+          state: existing?.state === 'queued' ? 'queued' : 'running',
+          userId: callbackTarget?.userId ?? requestUserId,
+        })
         return this.sendJson(res, 200, {
           status: existing?.state === 'queued' ? 'queued' : 'running',
           jobId: created.jobId,
@@ -11455,6 +11597,14 @@ export class Gateway {
       }
       const jobId = created.jobId
       runInput.backgroundJobId = jobId
+      this._touchDelegateInflightSurface({
+        jobId,
+        parentSessionKey,
+        agentId: targetAgentId,
+        goal,
+        state: sm ? 'queued' : 'running',
+        userId: callbackTarget?.userId ?? requestUserId,
+      })
       this._delegateResume.bindJob(resume.sessionKey, idempotencyKey, jobId)
       if (callbackOnComplete && callbackTarget) {
         const intent: SendToAgentIntent = {
@@ -11498,7 +11648,9 @@ export class Gateway {
           if (sm && result.kind === 'rejected' && result.failureClass) {
             const dropped =
               result.failureClass === 'capacity_queue_full' && store.dropIfUnclaimed(jobId)
-            if (!dropped) {
+            if (dropped) {
+              this._dropDelegateInflightSurface(jobId)
+            } else {
               winner = store.fail(jobId, {
                 failureClass: result.failureClass,
                 detail: result.message,
@@ -11966,6 +12118,21 @@ export class Gateway {
           ),
         )
       }
+      this._touchDelegateInflightSurface({
+        // Nested progress hangs on the first-level card: never let the child's
+        // jobId/agent/goal rewrite the parent slot identity.
+        jobId: nestedProgress ? undefined : input.backgroundJobId,
+        progressRunId: emitProgressRunId,
+        parentSessionKey: progressTarget.sessionKey,
+        agentId: targetAgentId,
+        goal,
+        state: 'running',
+        liveHint: liveDetail ?? '',
+        runId: emitProgressRunId,
+        userId: progressTarget.userId,
+        preserveIdentity: nestedProgress,
+        ownerRunId: emitProgressRunId,
+      })
     }
     const streamProgress = progressTarget && input.streamProgress === true
 
@@ -12258,6 +12425,18 @@ export class Gateway {
       detachAncestorActivity = () => session.runner.off?.('activity', handleChildActivity)
       // 回填本委派的进度卡 runId:子委派追溯到**一级**委派时复用它,把嵌套进度挂回同一张卡。
       session.progressRunId = progressRunId
+      this._touchDelegateInflightSurface({
+        jobId: input.backgroundJobId,
+        progressRunId,
+        parentSessionKey: progressTarget?.sessionKey ?? parentSessionKey,
+        agentId: targetAgentId,
+        goal,
+        state: 'running',
+        runId: progressRunId,
+        userId: progressTarget?.userId,
+        nested: nestedProgress,
+        ownerRunId: nestedProgress ? emitProgressRunId : undefined,
+      })
       if (streamProgress) {
         emitProgress(
           makeDelegateProgressBlock({
@@ -12664,6 +12843,54 @@ export class Gateway {
         // A broken/old direct-parent collector must degrade to a separate
         // durable card, never to silent loss.
         this.sessions.bufferPendingAgentGroup(progressTarget.sessionKey, durableGroup)
+      }
+    }
+    if (isDelegateInflightSurfaceEffective()) {
+      try {
+        const parentKey = progressTarget?.sessionKey ?? parentSessionKey
+        const jobId = DelegateInflightSurfaceStore.resolveJobId(input.backgroundJobId, progressRunId)
+        if (jobId && parentKey) {
+          const surface = this._ensureDelegateInflightSurface()
+          const snap = input.backgroundJobId
+            ? this._delegateJobs?.snapshotOf(String(input.backgroundJobId))
+            : undefined
+          const fence = snap
+            ? { fencingEpoch: snap.fencingEpoch, generation: snap.generation }
+            : {}
+          if (!surface.get(jobId)) {
+            surface.upsertEnqueue({
+              jobId,
+              parentSessionKey: parentKey,
+              agentId: targetAgentId,
+              goal,
+              runId: progressRunId,
+              state: 'running',
+              userId: progressTarget?.userId,
+              nested: nestedProgress,
+              ownerRunId: nestedProgress ? emitProgressRunId : undefined,
+              ...fence,
+            })
+          }
+          surface.foldTerminal({
+            jobId,
+            group: durableGroup,
+            // Job CAS winner is authority: a killed/failed/cancelled job must
+            // not be rewritten as completed by a late runner. Same-terminal
+            // non-authoritative folds are rejected by the surface so a late
+            // runner cannot replace the authoritative failure payload.
+            state:
+              snap && isDelegateTerminalState(snap.state) ? snap.state : 'completed',
+            parentSessionKey: parentKey,
+            userId: progressTarget?.userId,
+            ...fence,
+          })
+        }
+      } catch (err) {
+        this.log.warn(
+          'delegate inflight surface fold failed',
+          { jobId: input.backgroundJobId, progressRunId },
+          err as Error,
+        )
       }
     }
 
@@ -13318,6 +13545,8 @@ export class Gateway {
     await this._persistInterruptedSendToAgentCallbacks()
     this._delegateJobs?.close()
     this._delegateJobs = undefined
+    this._delegateInflightSurface?.close()
+    this._delegateInflightSurface = undefined
   }
 
   private async _persistInterruptedSendToAgentCallbacks(): Promise<void> {
@@ -20837,6 +21066,7 @@ function normalizePath(p: string): string {
   if (KNOWN_ROUTES.includes(p)) return p
   // Dynamic API routes — normalize IDs
   const normalized = p
+    .replace(/\/api\/sessions\/[a-zA-Z0-9_-]+\/inflight-delegates$/, '/api/sessions/:id/inflight-delegates')
     .replace(/\/api\/sessions\/[a-zA-Z0-9_-]+\/read$/, '/api/sessions/:id/read')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/skills\/[a-z0-9-]+/, '/api/agents/:id/skills/:name')
     .replace(/\/api\/skills\/[a-z0-9-]+/, '/api/skills/:name')

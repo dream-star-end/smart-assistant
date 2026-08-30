@@ -206,6 +206,8 @@ export type DelegateJobStoreOptions = {
   hydrate?: boolean
   /** Fired after a successful terminal persist so resume occupancy can release. */
   onTerminal?: (job: DelegateJobSnapshot) => void
+  /** Fired after a queue-full / unclaimed row is deleted so projections can drop. */
+  onDrop?: (job: DelegateJobSnapshot) => void
 }
 
 export function mintDelegateClaimToken(): string {
@@ -268,6 +270,7 @@ export class DelegateJobStore {
   private readonly leaseMs: number
   private readonly durable: DelegateDurableDb | null
   private readonly onTerminal?: (job: DelegateJobSnapshot) => void
+  private readonly onDrop?: (job: DelegateJobSnapshot) => void
   /**
    * Phase F: stop new claimQueued/spawn. Queued rows stay queued.
    * Holders are generation-owned (`cutover:<n>`, `drain:<n>`) so one origin
@@ -295,6 +298,7 @@ export class DelegateJobStore {
     this.leaseMs = opts.leaseMs ?? 45_000
     this.durable = opts.durable ?? null
     this.onTerminal = opts.onTerminal
+    this.onDrop = opts.onDrop
     if (this.durable && opts.hydrate !== false) this.hydrateFromDurable()
   }
 
@@ -964,11 +968,17 @@ export class DelegateJobStore {
   dropIfUnclaimed(jobId: string): boolean {
     const job = this.refreshJob(jobId)
     if (!job || job.state !== 'queued' || job.result || job.claimToken) return false
+    const snap = this.snapshot(job)
     if (!this.persistDelete(job)) return false
     const waiters = job.waiters.splice(0)
     for (const w of waiters) w({ status: 'expired', jobId, ...(this.sm ? { failure_class: 'capacity_queue_full' as const } : {}) })
     if (job.idempotencyKey) this.byIdempotency.delete(job.idempotencyKey)
     this.jobs.delete(jobId)
+    try {
+      this.onDrop?.(snap)
+    } catch {
+      /* projection must not revert an authoritative drop */
+    }
     return true
   }
 

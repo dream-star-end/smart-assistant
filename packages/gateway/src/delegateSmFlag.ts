@@ -8,6 +8,8 @@
  * the EngineNotifier side channel (requires SM && DURABLE).
  * OC_DELEGATE_CUTOVER=0 (default) keeps today's recycle/SIGTERM path; 1 enables
  * BeginCutover freeze + runningDelegateJobs drain (requires SM && DURABLE && NOTIFIER).
+ * OC_DELEGATE_INFLIGHT_SURFACE=0 (default) keeps today's turn_status working-detail
+ * only; 1 dual-writes a session-level inflight slot (design v3 §N4 / R2).
  * Production semantics require both SM and durable on (design v3 §4).
  * Resume occupancy + idempotency is a bugfix and is always on.
  */
@@ -50,6 +52,20 @@ export function isDelegateCutoverEnabled(env: NodeJS.ProcessEnv = process.env): 
 
 export function isDelegateCutoverEffective(env: NodeJS.ProcessEnv = process.env): boolean {
   return isDelegateNotifierEffective(env) && isDelegateCutoverEnabled(env)
+}
+
+/**
+ * R2 session-level inflight surface. Default off. A lone INFLIGHT_SURFACE=1
+ * enables the slot (in-process always; restart rebuild uses durable jobs when
+ * SM&&DURABLE). Flag-off is byte-equivalent to 653ef6339 for turn_status.
+ */
+export function isDelegateInflightSurfaceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = String(env.OC_DELEGATE_INFLIGHT_SURFACE ?? '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'on'
+}
+
+export function isDelegateInflightSurfaceEffective(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isDelegateInflightSurfaceEnabled(env)
 }
 
 export function resolveDelegateCallbackOwner(

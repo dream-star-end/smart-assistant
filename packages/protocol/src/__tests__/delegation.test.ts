@@ -20,6 +20,7 @@ import {
   isDelegateParentEngine,
   isDelegateTerminalState,
   isLegalDelegateTransition,
+  type InflightDelegateSurface,
 } from '../delegation.js'
 
 describe('OCV5-22 delegation protocol', () => {
@@ -77,5 +78,29 @@ describe('OCV5-22 delegation protocol', () => {
     assert.equal(classifyNotifyLane('zcode'), 'resume-inject')
     assert.equal(isDelegateParentEngine('cursor'), true)
     assert.equal(isDelegateParentEngine('unknown'), false)
+  })
+
+  it('freezes InflightDelegateSurface as the R2 session-slot read model', () => {
+    const row: InflightDelegateSurface = {
+      jobId: 'dlgjob-abc',
+      runId: 'dlg-abc',
+      agentId: 'coding-assistant',
+      goal: 'do it',
+      state: 'running',
+      liveHint: 'Read src.ts',
+      updatedAt: 1,
+      parentSessionKey: 'agent:main:webchat:dm:web-1',
+    }
+    assert.equal(row.state, 'running')
+    assert.equal(typeof row.foldedGroup, 'undefined')
+    const terminal: InflightDelegateSurface = {
+      ...row,
+      state: 'completed',
+      truncated: true,
+      nested: false,
+      ownerRunId: 'dlg-parent',
+    }
+    assert.equal(terminal.truncated, true)
+    assert.equal(terminal.ownerRunId, 'dlg-parent')
   })
 })
