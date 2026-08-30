@@ -215,6 +215,7 @@ export function mintDelegateClaimToken(): string {
 const LEGAL_CALLBACK_TRANSITIONS = new Set<string>([
   'none->pending',
   'none->skipped_silent',
+  'none->delivered',
   'pending->injecting',
   'pending->delivered',
   'pending->skipped_silent',

@@ -84,7 +84,7 @@ import {
   isCronDelegateClaimDenied,
   settleCronDelegateJob,
 } from './delegateCronIdempotency.js'
-import { cronDelegateIdempotencyKey } from '@openclaude/protocol'
+import { cronDelegateIdempotencyKey, delegateNotifyId } from '@openclaude/protocol'
 import { isDelegateNotifierEffective, isDelegateSmEnabled } from './delegateSmFlag.js'
 import type { DelegateJobStore } from './delegateJobs.js'
 import {
@@ -94,7 +94,9 @@ import {
 } from './v3CronIndexPush.js'
 import type { V3WechatOutboundConfig } from './v3WechatOutbound.js'
 import {
+  buildCronContinuationEnvelope,
   buildCronOriginResumeText,
+  CRON_CALLBACK_LEGACY_LANE,
   parseOriginWebchatSessionKey,
   type CronOriginFireResult,
 } from './cronOriginSession.js'
@@ -1454,6 +1456,7 @@ export class CronScheduler {
             deliveryId: existingRetry?.deliveryId ?? cronDeliveryId(job.id, dueMinuteKey),
           }
           let cronClaimFence: { claimToken: string; fencingEpoch: number } | undefined
+          let cronDelegateJobId: string | undefined
           let outcome: CronRunOutcome
           if (existingRetry?.phase === 'delivery') {
             outcome = await this.retryArchivedDelivery(job, existingRetry)
@@ -1492,6 +1495,7 @@ export class CronScheduler {
                       })
                       if ('error' in enq) throw new Error('cron delegate enqueue capacity')
                       delegateJobId = enq.jobId
+                      cronDelegateJobId = enq.jobId
                     }
                     const record: CronOccurrenceRecord = {
                       version: 1,
@@ -1691,14 +1695,21 @@ export class CronScheduler {
             }
           }
           const occ = readOccurrence(deliveryContext.deliveryId)
-          const dlg = occ?.delegateJobId
+          const dlg =
+            occ?.delegateJobId ??
+            cronDelegateJobId ??
+            (isDelegateSmEnabled() && this.delegateJobs
+              ? this.delegateJobs.findByIdempotencyKey(
+                  cronDelegateIdempotencyKey(job.id, dueMinuteKey),
+                )?.id
+              : undefined)
           if (isDelegateSmEnabled() && this.delegateJobs && dlg) {
             const silent = outcome.kind === 'silent'
             const failed = outcome.kind === 'terminal_failure'
             let fence = cronClaimFence
             if (
               !fence &&
-              occ.delegateClaimToken &&
+              occ?.delegateClaimToken &&
               occ.delegateFencingEpoch !== undefined
             ) {
               fence = {
@@ -1706,18 +1717,27 @@ export class CronScheduler {
                 fencingEpoch: occ.delegateFencingEpoch,
               }
             }
+            const originCompleted =
+              !failed && !silent && job.resume === 'origin-session'
+            const extraBody = originCompleted
+              ? {
+                  output: buildCronOriginResumeText(job),
+                  cronContinuation: buildCronContinuationEnvelope(job, {
+                    mode: job.projectMode,
+                    boardProjectId: job.boardProjectId,
+                  }),
+                }
+              : undefined
+            const legacyDelivered =
+              originCompleted && !isDelegateNotifierEffective()
             settleCronDelegateJob(
               this.delegateJobs,
               dlg,
               failed ? 'failed' : silent ? 'skipped_silent' : 'completed',
               fence,
               failed && 'code' in outcome ? String(outcome.code) : undefined,
-              !failed &&
-                !silent &&
-                isDelegateNotifierEffective() &&
-                job.resume === 'origin-session'
-                ? { output: buildCronOriginResumeText(job) }
-                : undefined,
+              extraBody,
+              legacyDelivered ? { callbackState: 'delivered' } : undefined,
             )
           }
           // A one-shot remains enabled across retryable failures. Completed,
@@ -1831,6 +1851,8 @@ export class CronScheduler {
     deliveryContext: CronDeliveryContext,
     project: Extract<CronProjectResolution, { ok: true }>,
   ): Promise<CronRunOutcome> {
+    job.projectMode = project.mode
+    job.boardProjectId = project.mode === 'fixed' ? project.boardProjectId : null
     try {
       await durability.consumeOccurrence()
     } catch (err) {
@@ -1885,6 +1907,30 @@ export class CronScheduler {
         errorClass: stableCronErrorClass(err),
       })
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_SETTLE_FAILED' }
+    }
+    if (
+      !isDelegateNotifierEffective() &&
+      result.kind === 'injected' &&
+      this.delegateJobs
+    ) {
+      const stamped = readOccurrence(deliveryContext.deliveryId)
+      if (
+        stamped?.delegateJobId &&
+        stamped.delegateClaimToken &&
+        stamped.delegateFencingEpoch !== undefined
+      ) {
+        this.delegateJobs.patchNotifyIntent(
+          stamped.delegateJobId,
+          {
+            notifyLane: CRON_CALLBACK_LEGACY_LANE,
+            notifyId: delegateNotifyId(stamped.delegateJobId, 1),
+          },
+          {
+            claimToken: stamped.delegateClaimToken,
+            fencingEpoch: stamped.delegateFencingEpoch,
+          },
+        )
+      }
     }
     const ts = new Date().toISOString().replace(/[:.]/g, '-')
     const outPath = join(paths.cronOutputsDir, `${job.id}-${ts}.md`)

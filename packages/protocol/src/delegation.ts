@@ -175,6 +175,20 @@ export function delegateNotifyId(jobId: string, callbackEpoch: number): string {
 }
 
 /**
+ * Immutable cron ResumeInject envelope. Must not ride the 8K display
+ * `resultRef` — that slice is for JobTerminal markdown, not task input.
+ */
+export type CronContinuationEnvelope = {
+  resumeText: string
+  sourceUserId?: string
+  projectMode?: string
+  boardProjectId?: string | null
+  cronJobId?: string
+  sourceSessionKey?: string
+  label?: string
+}
+
+/**
  * Engine-agnostic terminal snapshot (design v3 §N1.1). Completer owns
  * callback_state; EngineNotifier only chooses the delivery lane.
  */
@@ -197,6 +211,10 @@ export type JobTerminal = {
   resultOk?: boolean
   /** t1: durable terminal commit time (ms). Latency is t1→t2. */
   terminalCommittedAt?: number
+  /** Origin webchat user; cron ResumeInject must not fall back to OC_USER_ID. */
+  callbackOriginUserId?: string
+  /** Full cron continuation. Absent for non-cron callbacks. */
+  cronContinuation?: CronContinuationEnvelope
 }
 
 export type NotifyResult =

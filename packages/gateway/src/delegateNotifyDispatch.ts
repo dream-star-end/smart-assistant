@@ -22,7 +22,10 @@ import {
   parseParentEngine,
   resultRefFromSnapshot,
 } from './jobTerminal.js'
-import { parseOriginWebchatSessionKey } from './cronOriginSession.js'
+import {
+  isLegacyCronOriginLane,
+  parseOriginWebchatSessionKey,
+} from './cronOriginSession.js'
 
 export type NotifyFence = { claimToken: string; fencingEpoch: number }
 
@@ -113,6 +116,22 @@ export async function dispatchJobTerminalNotify(
       store.patchCallbackState(job.id, 'skipped_silent', fenceOf(job))
       return { ok: true, lane: 'skipped_silent', notifyId }
     }
+    // Flag-off Completer already injected with cron-origin-* ids. ACK the
+    // pending row so a later Notifier generation cannot dlgcb-replay it.
+    if (isLegacyCronOriginLane(job.notifyLane)) {
+      const liveLegacy = store.snapshotOf(job.id) ?? job
+      const claimed = store.claimNotifyDelivery(job.id, fenceOf(liveLegacy))
+      if (!claimed.ok) {
+        const latest = store.snapshotOf(job.id) ?? liveLegacy
+        if (latest.callbackState === 'delivered') {
+          return ackDelivered(store, latest, hooks, notifyId, 'resume-inject')
+        }
+        return { skipped: true, reason: 'lost_claim' }
+      }
+      const delivered = store.completeNotifyDelivery(job.id, claimed.token, fenceOf(liveLegacy))
+      if (delivered) await hooks.onDelivered?.(store.snapshotOf(job.id) ?? liveLegacy)
+      return { ok: true, lane: 'resume-inject', notifyId }
+    }
   }
 
   const owned = isResumeInjectCallback(job.callback)
@@ -190,10 +209,12 @@ export async function retryPendingNotifies(
   store: DelegateJobStore,
   notifier: EngineNotifier,
   hooks: NotifyDispatchHooks = {},
-  opts: { dueOnly?: boolean } = {},
+  opts: { dueOnly?: boolean; callbacks?: readonly string[] } = {},
 ): Promise<{ scanned: number; delivered: number; failed: number; skipped: number }> {
   const summary = { scanned: 0, delivered: 0, failed: 0, skipped: 0 }
-  const jobs = opts.dueOnly ? store.listDueNotify() : store.listPendingNotify()
+  const jobs = (opts.dueOnly ? store.listDueNotify() : store.listPendingNotify()).filter(
+    (job) => !opts.callbacks || opts.callbacks.includes(job.callback),
+  )
   for (const job of jobs) {
     summary.scanned += 1
     const result = await dispatchJobTerminalNotify(store, job, notifier, hooks)
@@ -211,9 +232,14 @@ export async function retryPendingNotifies(
 export function delayUntilNextNotifyRetry(
   store: DelegateJobStore,
   now = Date.now(),
+  opts: { callbacks?: readonly string[]; skipLegacyCron?: boolean } = {},
 ): number | undefined {
   let next: number | undefined
   for (const job of store.listPendingNotify()) {
+    if (opts.callbacks && !opts.callbacks.includes(job.callback)) continue
+    if (opts.skipLegacyCron && job.callback === 'cron-origin-inject' && isLegacyCronOriginLane(job.notifyLane)) {
+      continue
+    }
     const at =
       job.callbackState === 'injecting'
         ? (job.notifyClaimedUntil ?? now)

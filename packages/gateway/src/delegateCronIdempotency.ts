@@ -2,7 +2,12 @@
  * OCV5-22 B3: cron fire Enqueue-then-project. Unique idempotency key is the
  * occurrence execution right; retries return the original dlgjob id.
  */
-import { cronDelegateIdempotencyKey, isDelegateTerminalState, type DelegateJobState } from '@openclaude/protocol'
+import {
+  cronDelegateIdempotencyKey,
+  isDelegateTerminalState,
+  type DelegateCallbackState,
+  type DelegateJobState,
+} from '@openclaude/protocol'
 import type { DelegateJobStore } from './delegateJobs.js'
 
 export function enqueueCronOccurrenceJob(
@@ -87,6 +92,7 @@ export function settleCronDelegateJob(
   fence: CronDelegateFence | undefined,
   detail?: string,
   extraBody?: Record<string, unknown>,
+  opts?: { callbackState?: DelegateCallbackState },
 ): boolean {
   if (!fence?.claimToken || !Number.isFinite(fence.fencingEpoch)) return false
   if (outcome === 'failed') {
@@ -99,6 +105,8 @@ export function settleCronDelegateJob(
       fencingEpoch: fence.fencingEpoch,
     })
   }
+  const callbackState =
+    opts?.callbackState ?? (outcome === 'skipped_silent' ? 'skipped_silent' : undefined)
   return store.complete(
     jobId,
     {
@@ -110,6 +118,6 @@ export function settleCronDelegateJob(
       },
     },
     fence,
-    outcome === 'skipped_silent' ? { callbackState: 'skipped_silent' } : undefined,
+    callbackState ? { callbackState } : undefined,
   )
 }

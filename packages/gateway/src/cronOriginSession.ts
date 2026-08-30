@@ -5,7 +5,12 @@
 
 import { createHash } from 'node:crypto'
 
-import { parseSessionKey } from '@openclaude/protocol'
+import {
+  delegateCallbackMessageId,
+  parseSessionKey,
+  type CronContinuationEnvelope,
+  type JobTerminal,
+} from '@openclaude/protocol'
 
 export type CronResumeMode = 'isolated' | 'origin-session'
 
@@ -74,4 +79,138 @@ export function cronOriginClientMessageId(deliveryId: string): string {
   const compact = deliveryId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 60)
   const digest = createHash('sha256').update(deliveryId, 'utf8').digest('hex').slice(0, 12)
   return `cron-origin-${compact ? `${compact}-` : ''}${digest}`
+}
+
+/**
+ * Flag-off Completer inject stamps this notify_lane so a later Notifier
+ * generation can ACK the row instead of re-injecting with dlgcb.*.
+ */
+export const CRON_CALLBACK_LEGACY_LANE = 'legacy-completer'
+
+export function isLegacyCronOriginLane(lane: string | undefined): boolean {
+  return lane === CRON_CALLBACK_LEGACY_LANE
+}
+
+export function buildCronContinuationEnvelope(
+  job: {
+    id: string
+    prompt: string
+    label?: string
+    sourceUserId?: string
+    sourceSessionKey?: string
+    projectMode?: 'follow_session' | 'fixed' | string
+    boardProjectId?: string | null
+  },
+  project?: { mode?: string; boardProjectId?: string | null },
+): CronContinuationEnvelope {
+  const mode = project?.mode ?? job.projectMode ?? 'follow_session'
+  const board =
+    mode === 'fixed' ? (project?.boardProjectId ?? job.boardProjectId ?? null) : null
+  return {
+    resumeText: buildCronOriginResumeText(job),
+    sourceUserId: job.sourceUserId,
+    projectMode: mode,
+    boardProjectId: board,
+    cronJobId: job.id,
+    sourceSessionKey: job.sourceSessionKey,
+    label: job.label,
+  }
+}
+
+export function parseCronContinuation(
+  body: Record<string, unknown> | undefined,
+): CronContinuationEnvelope | undefined {
+  if (!body) return undefined
+  const raw = body.cronContinuation
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const row = raw as Record<string, unknown>
+    const resumeText =
+      typeof row.resumeText === 'string' && row.resumeText
+        ? row.resumeText
+        : typeof body.output === 'string'
+          ? body.output
+          : ''
+    if (!resumeText) return undefined
+    return {
+      resumeText,
+      sourceUserId: typeof row.sourceUserId === 'string' ? row.sourceUserId : undefined,
+      projectMode: typeof row.projectMode === 'string' ? row.projectMode : undefined,
+      boardProjectId:
+        typeof row.boardProjectId === 'string'
+          ? row.boardProjectId
+          : row.boardProjectId === null
+            ? null
+            : undefined,
+      cronJobId: typeof row.cronJobId === 'string' ? row.cronJobId : undefined,
+      sourceSessionKey: typeof row.sourceSessionKey === 'string' ? row.sourceSessionKey : undefined,
+      label: typeof row.label === 'string' ? row.label : undefined,
+    }
+  }
+  if (typeof body.output === 'string' && body.output) {
+    return { resumeText: body.output }
+  }
+  return undefined
+}
+
+export type CronOriginInjectPayload = {
+  job: {
+    id: string
+    schedule: string
+    agent: string
+    prompt: string
+    resume: 'origin-session'
+    sourceSessionKey: string
+    sourceUserId?: string
+    label?: string
+    projectMode?: 'follow_session' | 'fixed'
+    boardProjectId?: string | null
+  }
+  delivery: { dueMinuteKey: number; deliveryId: string }
+  override: { text: string; clientMessageId: string; idempotencyKey: string }
+}
+
+/**
+ * Rebuild the Completer origin-session inject arguments from a JobTerminal.
+ * Text prefers the untruncated continuation envelope over 8K resultRef.
+ * clientMessageId stays dlgcb.{jobId}.{epoch} so flag-off drain matches
+ * the Notifier generation (review blocker 1 on→off).
+ */
+export function resolveCronOriginInjectPayload(
+  event: JobTerminal,
+  fallbackText?: string,
+): CronOriginInjectPayload | null {
+  const envelope = event.cronContinuation
+  const originKey = envelope?.sourceSessionKey || event.parentSessionKey
+  const origin = parseOriginWebchatSessionKey(originKey)
+  if (!origin) return null
+  const text = envelope?.resumeText?.trim()
+    ? envelope.resumeText
+    : fallbackText?.trim()
+      ? fallbackText
+      : ''
+  if (!text) return null
+  const projectMode =
+    envelope?.projectMode === 'fixed' || envelope?.projectMode === 'follow_session'
+      ? envelope.projectMode
+      : undefined
+  return {
+    job: {
+      id: envelope?.cronJobId || event.jobId,
+      schedule: '* * * * *',
+      agent: event.agentId || origin.agentId,
+      prompt: text,
+      resume: 'origin-session',
+      sourceSessionKey: originKey,
+      sourceUserId: envelope?.sourceUserId || event.callbackOriginUserId,
+      label: envelope?.label || event.goal,
+      projectMode,
+      boardProjectId: projectMode === 'fixed' ? (envelope?.boardProjectId ?? null) : null,
+    },
+    delivery: { dueMinuteKey: 0, deliveryId: event.jobId },
+    override: {
+      text,
+      clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
+      idempotencyKey: `cron-origin-notify:${event.jobId}:${event.callbackEpoch}`,
+    },
+  }
 }

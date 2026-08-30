@@ -313,6 +313,7 @@ import {
   cronOriginClientMessageId,
   cronOriginIdempotencyKey,
   parseOriginWebchatSessionKey,
+  resolveCronOriginInjectPayload,
   type CronOriginFireResult,
 } from './cronOriginSession.js'
 import { getProject } from './taskboard/db/projects.js'
@@ -10542,6 +10543,8 @@ export class Gateway {
       this._delegateReconcileReady = true
       if (isDelegateNotifierEffective()) {
         void this._retryDelegateNotifies().finally(() => this._armNotifyRetryScheduler())
+      } else {
+        void this._drainFlagOffCronOriginNotifies().finally(() => this._armNotifyRetryScheduler())
       }
     } else {
       this._delegateReconcileReady = true
@@ -10686,17 +10689,61 @@ export class Gateway {
     }
   }
 
+  /**
+   * Notifier rolled back: Completer no longer consumes pending
+   * cron-origin-inject rows. Drain them with the same dlgcb.* ResumeInject
+   * path so BUSY leftovers are not stranded (review blocker 1 on→off).
+   */
+  private async _drainFlagOffCronOriginNotifies(opts: { dueOnly?: boolean } = {}): Promise<void> {
+    const store = this._delegateJobs
+    if (!store || isDelegateNotifierEffective() || !isDelegateDurableEffective()) return
+    const notifier = new DefaultEngineNotifier({
+      resumeInject: {
+        inject: async (event) => {
+          const result = await this.injectCronOriginFromTerminal(event)
+          if (result.kind === 'injected') return { ok: true }
+          if (result.kind === 'retryable_failure' && result.code === 'ORIGIN_SESSION_BUSY') {
+            return { ok: false, failureClass: 'internal' as const, busy: true }
+          }
+          if (result.kind === 'fallback') {
+            return { ok: false, failureClass: 'transport' as const, gone: true }
+          }
+          return { ok: false, failureClass: 'transport' as const }
+        },
+      },
+    })
+    try {
+      const summary = await retryPendingNotifies(store, notifier, this._notifyDispatchHooks(), {
+        ...opts,
+        callbacks: ['cron-origin-inject'],
+      })
+      if (summary.scanned > 0) this.log.info('flag-off cron-origin drain', summary)
+    } catch (err) {
+      this.log.warn('flag-off cron-origin drain threw', undefined, err as Error)
+    }
+  }
+
   private _armNotifyRetryScheduler(): void {
     if (this._notifyRetryTimer) {
       clearTimeout(this._notifyRetryTimer)
       this._notifyRetryTimer = undefined
     }
-    if (!isDelegateNotifierEffective() || !this._delegateJobs) return
-    const delay = delayUntilNextNotifyRetry(this._delegateJobs)
+    if (!this._delegateJobs) return
+    const notifierOn = isDelegateNotifierEffective()
+    if (!notifierOn && !isDelegateDurableEffective()) return
+    const delay = notifierOn
+      ? delayUntilNextNotifyRetry(this._delegateJobs)
+      : delayUntilNextNotifyRetry(this._delegateJobs, Date.now(), {
+          callbacks: ['cron-origin-inject'],
+          skipLegacyCron: true,
+        })
     if (delay == null) return
     this._notifyRetryTimer = setTimeout(() => {
       this._notifyRetryTimer = undefined
-      void this._retryDelegateNotifies({ dueOnly: true }).finally(() => this._armNotifyRetryScheduler())
+      const work = notifierOn
+        ? this._retryDelegateNotifies({ dueOnly: true })
+        : this._drainFlagOffCronOriginNotifies({ dueOnly: true })
+      void work.finally(() => this._armNotifyRetryScheduler())
     }, delay)
     this._notifyRetryTimer.unref()
   }
@@ -13001,30 +13048,13 @@ export class Gateway {
    * dlgcb.{jobId}.{epoch} as the message id.
    */
   private async injectCronOriginFromTerminal(event: JobTerminal): Promise<CronOriginFireResult> {
-    const originKey = event.parentSessionKey
-    const origin = parseOriginWebchatSessionKey(originKey)
-    if (!origin) return { kind: 'fallback' }
-    const text =
+    const fallbackText =
       event.state === 'completed' && !isJobTerminalFailure(event) && event.resultRef?.trim()
         ? event.resultRef
         : formatJobTerminalMarkdown(event)
-    return this.injectCronOriginSession(
-      {
-        id: event.jobId,
-        schedule: '* * * * *',
-        agent: event.agentId || origin.agentId,
-        prompt: text,
-        resume: 'origin-session',
-        sourceSessionKey: originKey,
-        label: event.goal,
-      },
-      { dueMinuteKey: 0, deliveryId: event.jobId },
-      {
-        text,
-        clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
-        idempotencyKey: `cron-origin-notify:${event.jobId}:${event.callbackEpoch}`,
-      },
-    )
+    const payload = resolveCronOriginInjectPayload(event, fallbackText)
+    if (!payload) return { kind: 'fallback' }
+    return this.injectCronOriginSession(payload.job, payload.delivery, payload.override)
   }
 
   private async injectCronOriginSession(

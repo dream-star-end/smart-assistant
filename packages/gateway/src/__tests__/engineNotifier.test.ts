@@ -31,7 +31,14 @@ import {
   injectPayloadFromJobTerminal,
   isJobTerminalFailure,
 } from '../jobTerminal.js'
-import { parseOriginWebchatSessionKey } from '../cronOriginSession.js'
+import {
+  buildCronContinuationEnvelope,
+  buildCronOriginResumeText,
+  CRON_CALLBACK_LEGACY_LANE,
+  parseOriginWebchatSessionKey,
+  resolveCronOriginInjectPayload,
+} from '../cronOriginSession.js'
+import { settleCronDelegateJob } from '../delegateCronIdempotency.js'
 import {
   persistSendToAgentIntent,
   recoverInterruptedSendToAgentIntents,
@@ -1098,6 +1105,295 @@ describe('stage 2: Completer hands cron + BUSY + killed notify to EngineNotifier
       assert.equal(s2.snapshotOf(snap.id)?.callbackState, 'delivered')
       s1.close()
       s2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('stage 2 review blockers: cron generation migration + continuation', () => {
+  const originKey = 'agent:main:webchat:dm:p1'
+
+  async function seedCronTerminal(
+    store: DelegateJobStore,
+    extra: {
+      output?: string
+      continuation?: ReturnType<typeof buildCronContinuationEnvelope>
+      callbackState?: 'pending' | 'delivered'
+      notifyLane?: string
+      originUserId?: string
+    } = {},
+  ) {
+    const created = store.create('main', {
+      queued: true,
+      kind: 'cron',
+      callback: 'cron-origin-inject',
+      parentSessionKey: originKey,
+      callbackOriginSessionKey: originKey,
+      callbackOriginUserId: extra.originUserId ?? 'user-42',
+      parentEngine: 'cursor',
+    })
+    assert.ok('jobId' in created)
+    const claimed = store.claimQueued(created.jobId)
+    assert.equal(claimed.ok, true)
+    if (!claimed.ok) throw new Error('claim failed')
+    const prompt = extra.output ?? 'continue the launch'
+    const continuation =
+      extra.continuation ??
+      buildCronContinuationEnvelope({
+        id: 'remind-origin',
+        prompt,
+        label: '续跑',
+        sourceUserId: extra.originUserId ?? 'user-42',
+        sourceSessionKey: originKey,
+        projectMode: 'fixed',
+        boardProjectId: 'proj-fixed-1',
+      })
+    assert.equal(
+      store.complete(
+        created.jobId,
+        {
+          httpStatus: 200,
+          body: {
+            ok: true,
+            output: continuation.resumeText,
+            cronContinuation: continuation,
+          },
+        },
+        claimed,
+        extra.callbackState ? { callbackState: extra.callbackState } : undefined,
+      ),
+      true,
+    )
+    if (extra.notifyLane) {
+      assert.equal(
+        store.patchNotifyIntent(
+          created.jobId,
+          { notifyLane: extra.notifyLane, notifyId: delegateNotifyId(created.jobId, 1) },
+          claimed,
+        ),
+        true,
+      )
+    }
+    const snap = store.snapshotOf(created.jobId)
+    assert.ok(snap)
+    return { jobId: created.jobId, fence: claimed, snap }
+  }
+
+  it('blocker1 off→on: flag-off delivered job is not dlgcb-replayed after Notifier boot', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-gen-offon-'))
+    try {
+      const store = openStore(dir)
+      const { snap } = await seedCronTerminal(store, { callbackState: 'delivered' })
+      assert.equal(snap.callbackState, 'delivered')
+      assert.equal(store.listPendingNotify().length, 0)
+      store.close()
+
+      const boot = openStore(dir, { bootId: 'gw:on' })
+      let injected = 0
+      const summary = await retryPendingNotifies(
+        boot,
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async () => {
+              injected += 1
+              return { ok: true }
+            },
+          },
+        }),
+      )
+      assert.equal(summary.scanned, 0)
+      assert.equal(injected, 0)
+      assert.equal(boot.snapshotOf(snap.id)?.callbackState, 'delivered')
+      boot.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('blocker1 crash-window off→on: pending + legacy-completer is ACK without inject', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-gen-crash-offon-'))
+    try {
+      const store = openStore(dir)
+      const { snap } = await seedCronTerminal(store, { notifyLane: CRON_CALLBACK_LEGACY_LANE })
+      assert.equal(snap.callbackState, 'pending')
+      assert.equal(snap.notifyLane, CRON_CALLBACK_LEGACY_LANE)
+      let injected = 0
+      const result = await dispatchJobTerminalNotify(
+        store,
+        snap,
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async () => {
+              injected += 1
+              return { ok: true }
+            },
+          },
+        }),
+      )
+      assert.equal('ok' in result && result.ok, true)
+      assert.equal(injected, 0)
+      assert.equal(store.snapshotOf(snap.id)?.callbackState, 'delivered')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('blocker1 on→off: BUSY pending is drained with dlgcb.* not cron-origin-*', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-gen-onoff-'))
+    try {
+      const store = openStore(dir)
+      const { snap } = await seedCronTerminal(store)
+      const busy = new DefaultEngineNotifier({
+        resumeInject: { inject: async () => ({ ok: false, busy: true, failureClass: 'internal' }) },
+      })
+      await dispatchJobTerminalNotify(store, snap, busy)
+      assert.equal(store.snapshotOf(snap.id)?.callbackState, 'pending')
+      store.close()
+
+      const boot = openStore(dir, { bootId: 'gw:off' })
+      const ids: string[] = []
+      const drain = new DefaultEngineNotifier({
+        resumeInject: {
+          inject: async (ev) => {
+            ids.push(delegateCallbackMessageId(ev.jobId, ev.callbackEpoch))
+            return { ok: true }
+          },
+        },
+      })
+      const summary = await retryPendingNotifies(boot, drain, {}, { callbacks: ['cron-origin-inject'] })
+      assert.equal(summary.delivered, 1)
+      assert.deepEqual(ids, [delegateCallbackMessageId(snap.id, 1)])
+      assert.match(ids[0]!, /^dlgcb\./)
+      assert.equal(boot.snapshotOf(snap.id)?.callbackState, 'delivered')
+      boot.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('blocker1 crash-window on→off: pending without legacy lane still drains once', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-gen-crash-onoff-'))
+    try {
+      const store = openStore(dir)
+      const { snap } = await seedCronTerminal(store)
+      assert.equal(snap.callbackState, 'pending')
+      let injected = 0
+      const summary = await retryPendingNotifies(
+        store,
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async () => {
+              injected += 1
+              return { ok: true }
+            },
+          },
+        }),
+        {},
+        { callbacks: ['cron-origin-inject'] },
+      )
+      assert.equal(summary.delivered, 1)
+      assert.equal(injected, 1)
+      assert.equal(store.snapshotOf(snap.id)?.callbackState, 'delivered')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('blocker2: >8K resume text keeps UNIQUE_SUFFIX; resultRef stays display-truncated', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-trunc-'))
+    try {
+      const store = openStore(dir)
+      const prompt = `${'A'.repeat(8_980)}UNIQUE_SUFFIX`
+      const { snap } = await seedCronTerminal(store, { output: prompt })
+      const event = buildJobTerminalFromSnapshot(snap, { parentEngine: 'cursor' })
+      assert.ok(event)
+      assert.equal((event.resultRef ?? '').length, 8_000)
+      assert.equal(event.resultRef?.includes('UNIQUE_SUFFIX'), false)
+      assert.ok(event.cronContinuation?.resumeText.includes('UNIQUE_SUFFIX'))
+      assert.ok(event.cronContinuation!.resumeText.length > 8_000)
+      const payload = resolveCronOriginInjectPayload(event)
+      assert.ok(payload)
+      assert.ok(payload.override.text.includes('UNIQUE_SUFFIX'))
+      assert.equal(payload.override.clientMessageId, delegateCallbackMessageId(snap.id, 1))
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('blocker2: continuation keeps sourceUserId and fixed project across restart', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-ctx-'))
+    try {
+      const store = openStore(dir)
+      const { snap } = await seedCronTerminal(store, { originUserId: 'uid-7' })
+      store.close()
+
+      const boot = openStore(dir, { bootId: 'gw:reopen' })
+      const restored = boot.snapshotOf(snap.id)
+      assert.ok(restored)
+      const event = buildJobTerminalFromSnapshot(restored, { parentEngine: 'cursor' })
+      assert.ok(event)
+      assert.equal(event.callbackOriginUserId, 'uid-7')
+      assert.equal(event.cronContinuation?.sourceUserId, 'uid-7')
+      assert.equal(event.cronContinuation?.projectMode, 'fixed')
+      assert.equal(event.cronContinuation?.boardProjectId, 'proj-fixed-1')
+      const payload = resolveCronOriginInjectPayload(event)
+      assert.ok(payload)
+      assert.equal(payload.job.sourceUserId, 'uid-7')
+      assert.equal(payload.job.projectMode, 'fixed')
+      assert.equal(payload.job.boardProjectId, 'proj-fixed-1')
+      assert.equal(payload.job.sourceSessionKey, originKey)
+      boot.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('settleCronDelegateJob flag-off writes continuation and delivered in one fence', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-settle-legacy-'))
+    try {
+      const output = buildCronOriginResumeText({ label: '续跑', prompt: 'do it' })
+      const continuation = buildCronContinuationEnvelope({
+        id: 'remind-x',
+        prompt: 'do it',
+        label: '续跑',
+        sourceUserId: 'uid-9',
+        sourceSessionKey: originKey,
+        projectMode: 'follow_session',
+      })
+      const store = openStore(dir)
+      const created = store.create('main', {
+        queued: true,
+        kind: 'cron',
+        callback: 'cron-origin-inject',
+        parentSessionKey: originKey,
+        callbackOriginSessionKey: originKey,
+        parentEngine: 'cursor',
+      })
+      assert.ok('jobId' in created)
+      const claimed = store.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      if (!claimed.ok) throw new Error('claim failed')
+      assert.equal(
+        settleCronDelegateJob(
+          store,
+          created.jobId,
+          'completed',
+          claimed,
+          undefined,
+          { output, cronContinuation: continuation },
+          { callbackState: 'delivered' },
+        ),
+        true,
+      )
+      const snap = store.snapshotOf(created.jobId)!
+      assert.equal(snap.callbackState, 'delivered')
+      assert.equal(snap.result?.body.output, output)
+      assert.deepEqual(snap.result?.body.cronContinuation, continuation)
+      store.close()
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
