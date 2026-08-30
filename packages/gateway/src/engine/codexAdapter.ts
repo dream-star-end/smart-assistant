@@ -505,8 +505,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     this._routeTurn = ctx
     this._interrupting = false
     // kernel.submit() covers the full turn, so do not wait for it to arm
-    // InlinePush. Admit on the next microtask only if the promise has not
-    // already rejected (parent input never queued).
+    // stdout routing. InlinePush eligibility is kernel.hasIngestedParentTurn
+    // (turn/start ACK), not this microtask or queue/processing.
     if (this._pendingGoalMessage) {
       const pendingGoal = this._pendingGoalMessage
       this._pendingGoalMessage = null
@@ -697,6 +697,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     if (this._interrupting) return { ok: false, processAlive: true }
     const turn = this._activeTurn
     if (!turn || !turn.parser || turn.parser.finalized) return { ok: false, processAlive: true }
+    // queue/processing is not ingest; reject after A write would orphan.
     if (this.kernel.hasIngestedParentTurn === false) return { ok: false, processAlive: true }
     return this.kernel.writeDelegateTerminalNotification(
       buildCodexDelegateTerminalNotification(event, body),

@@ -2498,8 +2498,11 @@ export class CodexAppServerRunner extends EventEmitter {
         if (typeof stdin.once === 'function') stdin.once('error', onError)
         if (typeof proc.once === 'function') proc.once('close', onClose)
         try {
-          const ok = stdin.write(`${line}\n`, (err) => finish(err))
-          if (ok === false) finish(new Error('codex stdin backpressure'))
+          // write()===false is backpressure: the chunk is already in the
+          // buffer and the caller must wait for drain/callback. It is not
+          // a failure (Node 22 Writable.write). Only the callback/error
+          // path settles this chunk.
+          stdin.write(`${line}\n`, (err) => finish(err))
         } catch (err) {
           finish(err as Error)
         }
@@ -2520,12 +2523,12 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   /**
-   * Parent-turn ingest proof for InlinePush. kernel.submit() covers the full
-   * turn, so adapter _activeTurn is not enough; a queued/in-flight turn/start
-   * is the ingest ACK. Synchronous submit() throw never reaches this.
+   * Parent-turn ingest proof for InlinePush. queue/processing/completer are
+   * admission, not ingest: turn/start may still reject. The only ACK is a
+   * turn id returned by turn/start (activeTurnId).
    */
   get hasIngestedParentTurn(): boolean {
-    return this.queue.length > 0 || this.processing || this.currentTurnCompleter != null || this.activeTurnId != null
+    return this.activeTurnId != null
   }
 
   private sendRequest(method: string, params: unknown): Promise<unknown> {

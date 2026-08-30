@@ -182,6 +182,14 @@ export async function dispatchJobTerminalNotify(
           return false
         }
       },
+      markAAttempted: () => {
+        try {
+          return store.markNotifyAAttempted(live.id, token, fenceOf(live))
+        } catch {
+          return false
+        }
+      },
+      hasAAttempted: () => store.hasNotifyAAttempted(live.id),
     }
     Object.defineProperty(event, NOTIFY_CLAIM_FENCE, {
       value: fence,

@@ -152,6 +152,7 @@ export type DelegateJobSnapshot = {
   notifyDeliveryToken?: string
   notifyClaimedUntil?: number | null
   terminalCommittedAt?: number
+  notifyAAttemptedAt?: number | null
 }
 
 type JobEntry = {
@@ -189,6 +190,7 @@ type JobEntry = {
   notifyDeliveryToken?: string
   notifyClaimedUntil?: number | null
   terminalCommittedAt?: number | null
+  notifyAAttemptedAt?: number | null
 }
 
 export type DelegateJobStoreOptions = {
@@ -912,6 +914,7 @@ export class DelegateJobStore {
       notifyDeliveryToken: job.notifyDeliveryToken,
       notifyClaimedUntil: job.notifyClaimedUntil,
       terminalCommittedAt: job.terminalCommittedAt ?? undefined,
+      notifyAAttemptedAt: job.notifyAAttemptedAt ?? undefined,
     }
   }
 
@@ -1203,6 +1206,51 @@ export class DelegateJobStore {
     return true
   }
 
+  hasNotifyAAttempted(jobId: string): boolean {
+    const job = this.refreshJob(jobId)
+    return job != null && job.notifyAAttemptedAt != null && job.notifyAAttemptedAt > 0
+  }
+
+  /**
+   * Durable a_attempted stamp. Must run before the external A write so a
+   * crash/reclaim can skip a second stdin push and consult parent tape.
+   */
+  markNotifyAAttempted(
+    jobId: string,
+    deliveryToken: string,
+    fence?: { claimToken: string; fencingEpoch: number },
+  ): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job) return false
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        return false
+      }
+    }
+    if (job.callbackState !== 'injecting' || job.notifyDeliveryToken !== deliveryToken) return false
+    if (job.notifyAAttemptedAt != null && job.notifyAAttemptedAt > 0) return true
+    const now = this.now()
+    if (this.durable) {
+      const row = this.durable.casMarkAAttempted({
+        jobId,
+        state: job.state,
+        fencingEpoch: job.fencingEpoch,
+        claimToken: job.claimToken ?? null,
+        deliveryToken,
+        now,
+      })
+      if (!row) {
+        this.refreshJob(jobId)
+        return this.hasNotifyAAttempted(jobId)
+      }
+      this.ingestDurableRow(row)
+      return true
+    }
+    job.notifyAAttemptedAt = now
+    job.lastActivityAt = now
+    return true
+  }
+
   releaseNotifyClaim(
     jobId: string,
     deliveryToken: string,
@@ -1308,6 +1356,7 @@ export class DelegateJobStore {
       notifyDeliveryToken: snap.notifyDeliveryToken,
       notifyClaimedUntil: snap.notifyClaimedUntil ?? null,
       terminalCommittedAt: snap.terminalCommittedAt ?? null,
+      notifyAAttemptedAt: snap.notifyAAttemptedAt ?? null,
     })
     if (snap.idempotencyKey) this.byIdempotency.set(snap.idempotencyKey, snap.id)
   }
@@ -1363,6 +1412,7 @@ export class DelegateJobStore {
       notifyDeliveryToken: row.notifyDeliveryToken,
       notifyClaimedUntil: row.notifyClaimedUntil,
       terminalCommittedAt: row.terminalCommittedAt,
+      notifyAAttemptedAt: row.notifyAAttemptedAt ?? undefined,
     }
   }
 
@@ -1512,6 +1562,7 @@ export class DelegateJobStore {
       notifyDeliveryToken: snap.notifyDeliveryToken,
       notifyClaimedUntil: snap.notifyClaimedUntil ?? null,
       terminalCommittedAt: snap.terminalCommittedAt ?? null,
+      notifyAAttemptedAt: snap.notifyAAttemptedAt ?? null,
     }
   }
 
@@ -1552,6 +1603,7 @@ export class DelegateJobStore {
       notifyDeliveryToken: job.notifyDeliveryToken,
       notifyClaimedUntil: job.notifyClaimedUntil ?? null,
       terminalCommittedAt: job.terminalCommittedAt ?? undefined,
+      notifyAAttemptedAt: job.notifyAAttemptedAt ?? null,
     }
   }
 }

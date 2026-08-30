@@ -404,6 +404,7 @@ import {
   resolveDelegateCutoverFreezeMs,
 } from './delegateCutover.js'
 import { DefaultEngineNotifier, writeInlinePushForSession, type InlinePushSession } from './engineNotifier.js'
+import { parentTapeHasNotifyId } from './delegateNotifyTape.js'
 import {
   delayUntilNextNotifyRetry,
   dispatchJobTerminalNotify,
@@ -10724,6 +10725,25 @@ export class Gateway {
             },
           )
         },
+      },
+      hasParentTapeIngested: async (notifyId, event) => {
+        const origin = parseOriginWebchatSessionKey(event.parentSessionKey)
+        if (!origin) return false
+        const userId =
+          event.callbackOriginUserId?.trim() ||
+          this.sessions?.getByKey?.(event.parentSessionKey)?.userId ||
+          process.env.OC_USER_ID?.trim()
+        if (!userId) return false
+        try {
+          const session = await getClientSession(origin.peerId, userId)
+          return parentTapeHasNotifyId(
+            session?.messages as Array<{ id?: unknown; text?: unknown; content?: unknown }> | undefined,
+            notifyId,
+            delegateCallbackMessageId(event.jobId, event.callbackEpoch),
+          )
+        } catch {
+          return false
+        }
       },
       resumeInject: {
         inject: async (event) => {

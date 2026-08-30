@@ -48,6 +48,11 @@ export type EngineNotifierOptions = {
   now?: () => number
   /** Cursor/Grok/zcode: missing nativeId is transport (no silent empty chat). */
   requireNativeId?: boolean
+  /**
+   * Parent-session tape ingest oracle. True iff the model-visible tape already
+   * holds this notifyId (or its paired dlgcb.* clientMessageId).
+   */
+  hasParentTapeIngested?: (notifyId: string, event: JobTerminal) => boolean | Promise<boolean>
 }
 
 /** Per-notify claim fence attached by dispatchJobTerminalNotify. */
@@ -56,6 +61,8 @@ export const NOTIFY_CLAIM_FENCE = Symbol.for('openclaude.notifyClaimFence')
 export type NotifyClaimFence = {
   isLive: () => boolean
   ackDelivered: () => boolean
+  markAAttempted?: () => boolean
+  hasAAttempted?: () => boolean
 }
 
 export type InlinePushRuntime = {
@@ -111,9 +118,18 @@ export class DefaultEngineNotifier implements EngineNotifier {
     const preferred = classifyNotifyLane(event.parentEngine)
     if (preferred === 'inline-push') {
       const pushed = await this.tryInlinePush(event)
-      if (pushed) {
+      if (pushed === 'delivered') {
         this.mark(notifyId)
         return finish({ ok: true, lane: 'inline-push', notifyId })
+      }
+      if (pushed === 'hold') {
+        // a_attempted with unknown consumption: do not B this generation.
+        // Reclaim + tape ingest decide.
+        return finish({
+          ok: false,
+          failureClass: 'transport',
+          degradedTo: 'resume-inject',
+        }, true)
       }
       const injected = await this.tryResumeInject(event)
       if (injected.ok) {
@@ -143,34 +159,72 @@ export class DefaultEngineNotifier implements EngineNotifier {
     this.opts.markDelivered?.(notifyId)
   }
 
-  private async tryInlinePush(event: JobTerminal): Promise<boolean> {
-    if (!this.opts.inlinePush) return false
-    const fence = notifyClaimFenceOf(event)
+  private async tapeHas(event: JobTerminal, notifyId: string): Promise<boolean> {
     try {
-      if (fence && !fence.isLive()) return false
-      const result = await this.opts.inlinePush.write(event)
-      if (fence && !fence.isLive()) {
-        try {
-          fence.ackDelivered()
-        } catch {
-          /* stale token; the live owner already stamped or is stamping */
-        }
-        // Another owner reclaimed. Never start B from this generation.
-        return true
-      }
-      if (!result?.ok || !result.processAlive) return false
-      // A side effect landed. Stamp delivered immediately so a crash/reclaim
-      // cannot start lane B.
-      if (fence) {
-        try {
-          fence.ackDelivered()
-        } catch {
-          /* durable write failed; dispatch retries completeNotifyDelivery */
-        }
-      }
-      return true
+      return Boolean(await this.opts.hasParentTapeIngested?.(notifyId, event))
     } catch {
       return false
+    }
+  }
+
+  private ackDeliveredQuiet(fence: NotifyClaimFence | undefined): void {
+    if (!fence) return
+    try {
+      fence.ackDelivered()
+    } catch {
+      /* stale token or durable write failed; dispatch retries complete */
+    }
+  }
+
+  /**
+   * InlinePush outcomes:
+   * - delivered: A consumed (write+alive receipt, or tape ingest)
+   * - degrade: A failed; caller may send B with the same notifyId
+   * - hold: a_attempted, consumption unknown; do not B this generation
+   */
+  private async tryInlinePush(event: JobTerminal): Promise<'delivered' | 'degrade' | 'hold'> {
+    if (!this.opts.inlinePush) return 'degrade'
+    const fence = notifyClaimFenceOf(event)
+    const notifyId = delegateNotifyId(event.jobId, event.callbackEpoch)
+    const deliveredIfTaped = async (): Promise<'delivered' | 'degrade'> => {
+      if (await this.tapeHas(event, notifyId)) {
+        this.ackDeliveredQuiet(fence)
+        return 'delivered'
+      }
+      return 'degrade'
+    }
+    try {
+      if (fence && !fence.isLive()) return 'degrade'
+      if (fence?.hasAAttempted?.()) {
+        // Reclaim: never rewrite stdin. B iff tape has not ingested notifyId.
+        const taped = await deliveredIfTaped()
+        return taped === 'delivered' ? 'delivered' : 'degrade'
+      }
+      if (fence?.markAAttempted) {
+        if (!fence.markAAttempted()) return 'degrade'
+      }
+      if (fence && !fence.isLive()) return 'degrade'
+      const result = await this.opts.inlinePush.write(event)
+      if (fence && !fence.isLive()) {
+        this.ackDeliveredQuiet(fence)
+        // Another owner reclaimed. Never start B from this generation.
+        return 'delivered'
+      }
+      if (!result?.ok || !result.processAlive) {
+        // stdin dies with the process. B is allowed only when tape has no ingest.
+        return deliveredIfTaped()
+      }
+      this.ackDeliveredQuiet(fence)
+      return 'delivered'
+    } catch {
+      if (fence?.hasAAttempted?.()) {
+        if (await this.tapeHas(event, notifyId)) {
+          this.ackDeliveredQuiet(fence)
+          return 'delivered'
+        }
+        return 'hold'
+      }
+      return 'degrade'
     }
   }
 

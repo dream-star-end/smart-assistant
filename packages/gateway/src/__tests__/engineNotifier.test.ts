@@ -67,6 +67,7 @@ import {
   isDelegateInlinePushCodexEnabled,
   isDelegateInlinePushEnabled,
 } from '../delegateSmFlag.js'
+import { parentTapeHasNotifyId } from '../delegateNotifyTape.js'
 
 function terminalEvent(over: Partial<JobTerminal> = {}): JobTerminal {
   return {
@@ -885,6 +886,218 @@ describe('R3 blocker regressions', () => {
     await assert.rejects(turn.submitted)
     assert.deepEqual(
       { pushed, writes: fake.writes },
+      { pushed: { ok: false, processAlive: true }, writes: 0 },
+    )
+    turn.end()
+  })
+
+  it('parentTapeHasNotifyId matches notifyId in id, text, or dlgcb clientMessageId', () => {
+    const notifyId = 'dlgnfy.dlgjob-n1.1'
+    const clientMessageId = delegateCallbackMessageId('dlgjob-n1', 1)
+    assert.equal(parentTapeHasNotifyId([], notifyId), false)
+    assert.equal(parentTapeHasNotifyId([{ id: notifyId, text: 'x' }], notifyId), true)
+    assert.equal(parentTapeHasNotifyId([{ id: clientMessageId, text: 'x' }], notifyId, clientMessageId), true)
+    assert.equal(
+      parentTapeHasNotifyId([{ id: 'other', text: `see ${notifyId} here` }], notifyId),
+      true,
+    )
+    assert.equal(
+      parentTapeHasNotifyId(
+        [{ id: 'other', content: [{ type: 'text', text: `<delegate-terminal notifyId=${notifyId}>` }] }],
+        notifyId,
+      ),
+      true,
+    )
+    assert.equal(parentTapeHasNotifyId([{ id: 'other', text: 'nope' }], notifyId, clientMessageId), false)
+  })
+
+  it('reclaim after a_attempted without receipt: B iff tape lacks notifyId', async () => {
+    async function run(tapeHas: boolean): Promise<{ aWrites: number; bWrites: number; state: string | undefined }> {
+      const dir = await mkdtemp(join(tmpdir(), 'r3-tape-reclaim-'))
+      let now = 2_000
+      const clock = () => now
+      let aWrites = 0
+      let bWrites = 0
+      try {
+        const s1 = openStoreAt(dir, clock, 'gw:a')
+        const seeded = await seededTerminal(s1, { parentEngine: 'ccb' })
+        const n1 = new DefaultEngineNotifier({
+          inlinePush: {
+            write: async () => {
+              aWrites += 1
+              throw new Error('simulated gateway SIGKILL after A write')
+            },
+          },
+          resumeInject: {
+            inject: async () => {
+              throw new Error('crashing generation must not start B')
+            },
+          },
+          hasParentTapeIngested: async () => false,
+        })
+        const first = await dispatchJobTerminalNotify(s1, seeded.snap, n1)
+        assert.ok(!('skipped' in first) && !first.ok)
+        assert.equal(s1.hasNotifyAAttempted(seeded.jobId), true)
+        assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'pending')
+        s1.close()
+
+        now += NOTIFY_CLAIM_LEASE_MS + 1
+        const s2 = openStoreAt(dir, clock, 'gw:b')
+        s2.hydrateFromDurable()
+        const notifyId = delegateNotifyId(seeded.jobId, 1)
+        const n2 = new DefaultEngineNotifier({
+          inlinePush: {
+            write: async () => {
+              aWrites += 1
+              return { ok: true, processAlive: true }
+            },
+          },
+          resumeInject: {
+            inject: async () => {
+              bWrites += 1
+              return { ok: true }
+            },
+          },
+          hasParentTapeIngested: async (id) => tapeHas && id === notifyId,
+        })
+        const live = s2.snapshotOf(seeded.jobId)
+        assert.ok(live)
+        const result = await dispatchJobTerminalNotify(s2, live, n2)
+        assert.ok(!('skipped' in result) && result.ok)
+        const state = s2.snapshotOf(seeded.jobId)?.callbackState
+        s2.close()
+        return { aWrites, bWrites, state }
+      } finally {
+        await rm(dir, { recursive: true, force: true })
+      }
+    }
+
+    assert.deepEqual(await run(false), { aWrites: 1, bWrites: 1, state: 'delivered' })
+    assert.deepEqual(await run(true), { aWrites: 1, bWrites: 0, state: 'delivered' })
+  })
+
+  it('CCB death after write: B iff tape lacks notifyId', async () => {
+    async function run(tapeHas: boolean): Promise<{ aWrites: number; bWrites: number }> {
+      let aWrites = 0
+      let bWrites = 0
+      const notifier = new DefaultEngineNotifier({
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            return { ok: false, processAlive: false }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+        hasParentTapeIngested: async () => tapeHas,
+      })
+      const result = await notifier.notify(terminalEvent({ parentEngine: 'ccb' }))
+      assert.equal(result.ok, true)
+      return { aWrites, bWrites }
+    }
+    assert.deepEqual(await run(false), { aWrites: 1, bWrites: 1 })
+    assert.deepEqual(await run(true), { aWrites: 1, bWrites: 0 })
+  })
+
+  it('Codex backpressure write()===false waits for callback and does not degrade to B', async () => {
+    let aWrites = 0
+    let bWrites = 0
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: async () => {
+          const runner = new CodexAppServerRunner({} as never)
+          const stdin = new EventEmitter() as EventEmitter & {
+            writable: boolean
+            destroyed: boolean
+            write: (_chunk: string, cb?: (err?: Error | null) => void) => boolean
+          }
+          stdin.writable = true
+          stdin.destroyed = false
+          stdin.write = (_chunk, cb) => {
+            setTimeout(() => cb?.(null), 20)
+            return false
+          }
+          ;(runner as unknown as { proc: object }).proc = {
+            killed: false,
+            exitCode: null,
+            signalCode: null,
+            stdin,
+            once: () => runner,
+            off: () => runner,
+          }
+          const result = await runner.writeDelegateTerminalNotification('{"jsonrpc":"2.0"}')
+          if (result.ok) aWrites += 1
+          return result
+        },
+      },
+      resumeInject: {
+        inject: async () => {
+          bWrites += 1
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(terminalEvent({ parentEngine: 'codex' }))
+    assert.equal(result.ok, true)
+    if (result.ok) assert.equal(result.lane, 'inline-push')
+    assert.deepEqual({ aWrites, bWrites }, { aWrites: 1, bWrites: 0 })
+  })
+
+  it('Codex hasIngestedParentTurn is only turn/start ACK, not queue/processing', () => {
+    const kernel = new CodexAppServerRunner({} as never)
+    const box = kernel as unknown as {
+      queue: unknown[]
+      processing: boolean
+      currentTurnCompleter: object | null
+      activeTurnId: string | null
+    }
+    box.queue = [{}]
+    box.processing = true
+    box.currentTurnCompleter = { resolve() {}, reject() {} }
+    box.activeTurnId = null
+    assert.equal(kernel.hasIngestedParentTurn, false)
+    box.activeTurnId = 'turn-1'
+    assert.equal(kernel.hasIngestedParentTurn, true)
+  })
+
+  it('Codex submit reject before turn/start ACK does not write an orphan notification', async () => {
+    class FakeCodexKernel extends EventEmitter {
+      isRunning = true
+      hasIngestedParentTurn = false
+      writes = 0
+      submit(): Promise<void> {
+        return Promise.reject(new Error('turn/start rejected before ingest'))
+      }
+      writeDelegateTerminalNotification(): Promise<{ ok: boolean; processAlive: boolean }> {
+        this.writes += 1
+        return Promise.resolve({ ok: true, processAlive: true })
+      }
+    }
+    const kernel = new FakeCodexKernel()
+    const adapter = new CodexAdapter({
+      sessionKey: 'agent:main:webchat:dm:r3',
+      agentId: 'main',
+      agentBaseDir: '/tmp',
+      config: {} as never,
+    }, kernel as never)
+    const turn = adapter.submitTurn({
+      input: 'parent input',
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await Promise.resolve()
+    const pushed = await adapter.writeDelegateTerminal!(
+      terminalEvent({ parentEngine: 'codex' }),
+      'delegate terminal',
+    )
+    await assert.rejects(turn.submitted)
+    assert.deepEqual(
+      { pushed, writes: kernel.writes },
       { pushed: { ok: false, processAlive: true }, writes: 0 },
     )
     turn.end()
