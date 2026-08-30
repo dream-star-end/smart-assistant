@@ -1931,24 +1931,32 @@ type DelegateTaskResult =
  *  (dispatchInbound teamMode-main-webchat 的 review pass),队长 preamble 不再自觉
  *  调用 hidden-reviewer。本熔断因此从"拦队长 prompt 级串行重试"变为**硬编排重试的
  *  后备保险**:硬编排自身把迭代封顶在 OPENCLAUDE_TEAM_REVIEW_MAX_ROUNDS(默认 2)轮,
- *  本上限(3)是更外层的绝对护栏——即便编排逻辑有 bug 或未来放宽轮数,单 turn 对审查员
- *  的委派也不会失控(每轮 review 都是全新 delegate session 全额计费)。delegation depth
- *  只管嵌套、MAX_CONCURRENT_DELEGATIONS 只管并行,都拦不住串行重试,这里是第三条腿。 */
+ *  本上限(默认 3,env OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN 可配)是更外层的绝对护栏
+ *  ——即便编排逻辑有 bug 或未来放宽轮数,单 turn 对审查员的委派也不会失控(每轮 review
+ *  都是全新 delegate session 全额计费)。delegation depth 只管嵌套、MAX_CONCURRENT_DELEGATIONS
+ *  只管并行,都拦不住串行重试,这里是第三条腿。 */
 export const MAX_HIDDEN_DELEGATIONS_PER_TURN = 3
 
 /** P2 批次4 — 普通成员(队长直接委派的已安装 agent,非 hidden 非 review)每 turn
  *  委派次数上限。消"串行无上限"债:队长可以持续 fan-out,但单 turn 不该无界地把
  *  同一批成员反复委派(失控的串行重试/发散拆分会烧钱且拖长 turn)。超限返回结构化
  *  错误引导队长收敛(见 _runDelegateTask member guard 分支),不是静默失败。默认 8,
- *  env 可配(下限 1);比 hidden 熔断(3)宽,因为正常复杂任务的合理 fan-out 会多于审查。 */
+ *  env 可配(下限 1);比 hidden 熔断默认值宽,因为正常复杂任务的合理 fan-out 会多于审查。 */
 export const MEMBER_DELEGATIONS_PER_TURN_DEFAULT = 8
 function resolveMemberDelegationsPerTurn(): number {
   const raw = Number(process.env.OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN)
   return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : MEMBER_DELEGATIONS_PER_TURN_DEFAULT
 }
 
+/** hidden 审查员每 turn 委派上限。call-time 读 env,不在模块加载期固化。
+ *  非法/缺省回落 MAX_HIDDEN_DELEGATIONS_PER_TURN;有限且 >=1 取 floor。 */
+function resolveHiddenDelegationsPerTurn(): number {
+  const raw = Number(process.env.OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN)
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : MAX_HIDDEN_DELEGATIONS_PER_TURN
+}
+
 /** 「每 turn、按父会话」的委派计数器 —— 一套通用机制,当前服务两条策略:
- *   1. hidden 审查员串行熔断(_hiddenDelegateGuard,上限 MAX_HIDDEN_DELEGATIONS_PER_TURN);
+ *   1. hidden 审查员串行熔断(_hiddenDelegateGuard,上限 env 可配默认 MAX_HIDDEN_DELEGATIONS_PER_TURN);
  *   2. P2 批次4 普通成员每 turn 委派上限(_memberDelegateGuard,env 可配默认 8)。
  *  两者机制完全一致(仅上限值与计数范围不同),故复用同一个类而非另起并行实现。
  *
@@ -1968,15 +1976,16 @@ export class PerTurnDelegationGuard {
     private readonly staleMs = 12 * 60 * 60_000,
   ) {}
 
-  /** 为一次 hidden 委派占额度:未达上限 → 计数 +1 放行;已达上限 → 拒绝。 */
-  tryAcquire(parentKey: string, now = Date.now()): boolean {
+  /** 为一次 hidden 委派占额度:未达上限 → 计数 +1 放行;已达上限 → 拒绝。
+   *  `limit` 缺省用构造时上限;生产 hidden 路径传入 call-time env 解析值。 */
+  tryAcquire(parentKey: string, now = Date.now(), limit = this.limit): boolean {
     this.prune(now)
     const entry = this.counts.get(parentKey)
     if (!entry) {
       this.counts.set(parentKey, { count: 1, touchedAt: now })
       return true
     }
-    if (entry.count >= this.limit) return false
+    if (entry.count >= limit) return false
     entry.count++
     entry.touchedAt = now
     return true
@@ -11949,7 +11958,7 @@ export class Gateway {
     }
 
     // Per-turn 委派熔断(两条策略共用 PerTurnDelegationGuard,互斥分派):
-    //   - hidden 系统 agent(隐藏审查员)→ 串行硬上限 MAX_HIDDEN_DELEGATIONS_PER_TURN(3);
+    //   - hidden 系统 agent(隐藏审查员)→ 串行硬上限(env OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN,默认 3);
     //   - 普通成员(非 hidden 非 review)→ 每 turn 委派上限(env 默认 8),消"串行无上限"债。
     // 计数键优先取 parentSessionKey(delegate 请求里唯一的父上下文,turn 级标识拿不到 ——
     // 依据见 PerTurnDelegationGuard 注释);极端情况下 body 缺 parentSessionKey 时退化为按
@@ -11961,16 +11970,17 @@ export class Gateway {
         ? parentSessionKey
         : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`
     if (isHiddenSystemAgentId(targetAgentId)) {
-      if (!this._hiddenDelegateGuard.tryAcquire(delegateGuardKey)) {
+      const hiddenLimit = resolveHiddenDelegationsPerTurn()
+      if (!this._hiddenDelegateGuard.tryAcquire(delegateGuardKey, Date.now(), hiddenLimit)) {
         this.log.warn('delegate_hidden_limit', {
           targetAgentId,
           guardKey: delegateGuardKey,
-          limit: MAX_HIDDEN_DELEGATIONS_PER_TURN,
+          limit: hiddenLimit,
         })
         return {
           kind: 'rejected',
           httpStatus: 429,
-          message: `审查委派已达本轮上限(${MAX_HIDDEN_DELEGATIONS_PER_TURN}次),请基于已有审查结论收尾,不要再发起新的审查委派`,
+          message: `审查委派已达本轮上限(${hiddenLimit}次),请基于已有审查结论收尾,不要再发起新的审查委派`,
         }
       }
     } else if (!isReview) {
