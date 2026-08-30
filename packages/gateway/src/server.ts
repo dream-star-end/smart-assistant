@@ -79,6 +79,7 @@ import {
   failureClassFromLocalExecutionCode,
   isDelegateTerminalState,
   type DelegateFailureClass,
+  type JobTerminal,
 } from '@openclaude/protocol'
 import {
   delegateConcurrencyCap,
@@ -311,7 +312,9 @@ import {
   buildCronOriginResumeText,
   cronOriginClientMessageId,
   cronOriginIdempotencyKey,
+  decideCronOriginDispatchAfterPersist,
   parseOriginWebchatSessionKey,
+  resolveCronOriginInjectPayload,
   type CronOriginFireResult,
 } from './cronOriginSession.js'
 import { getProject } from './taskboard/db/projects.js'
@@ -402,6 +405,7 @@ import {
 import {
   formatJobTerminalMarkdown,
   injectPayloadFromJobTerminal,
+  isJobTerminalFailure,
   parseParentEngine,
 } from './jobTerminal.js'
 import { openDelegateDurableDb } from './delegateDurable.js'
@@ -10540,6 +10544,8 @@ export class Gateway {
       this._delegateReconcileReady = true
       if (isDelegateNotifierEffective()) {
         void this._retryDelegateNotifies().finally(() => this._armNotifyRetryScheduler())
+      } else {
+        void this._drainFlagOffCronOriginNotifies().finally(() => this._armNotifyRetryScheduler())
       }
     } else {
       this._delegateReconcileReady = true
@@ -10617,16 +10623,18 @@ export class Gateway {
       },
       resumeInject: {
         inject: async (event) => {
-          const payload = injectPayloadFromJobTerminal(event)
-          const result = await this.injectSendToAgentCallback({
-            parentSessionKey: event.parentSessionKey,
-            jobId: event.jobId,
-            agentId: event.agentId || 'unknown',
-            goal: event.goal || '',
-            output: payload.output,
-            error: payload.error,
-            clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
-          })
+          const result =
+            event.callback === 'cron-origin-inject'
+              ? await this.injectCronOriginFromTerminal(event)
+              : await this.injectSendToAgentCallback({
+                  parentSessionKey: event.parentSessionKey,
+                  jobId: event.jobId,
+                  agentId: event.agentId || 'unknown',
+                  goal: event.goal || '',
+                  ...injectPayloadFromJobTerminal(event),
+                  clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
+                  once: true,
+                })
           if (result.kind === 'injected') return { ok: true }
           if (result.kind === 'retryable_failure' && result.code === 'ORIGIN_SESSION_BUSY') {
             return { ok: false, failureClass: 'internal' as const, busy: true }
@@ -10682,17 +10690,61 @@ export class Gateway {
     }
   }
 
+  /**
+   * Notifier rolled back: Completer no longer consumes pending
+   * cron-origin-inject rows. Drain them with the same dlgcb.* ResumeInject
+   * path so BUSY leftovers are not stranded (review blocker 1 on→off).
+   */
+  private async _drainFlagOffCronOriginNotifies(opts: { dueOnly?: boolean } = {}): Promise<void> {
+    const store = this._delegateJobs
+    if (!store || isDelegateNotifierEffective() || !isDelegateDurableEffective()) return
+    const notifier = new DefaultEngineNotifier({
+      resumeInject: {
+        inject: async (event) => {
+          const result = await this.injectCronOriginFromTerminal(event)
+          if (result.kind === 'injected') return { ok: true }
+          if (result.kind === 'retryable_failure' && result.code === 'ORIGIN_SESSION_BUSY') {
+            return { ok: false, failureClass: 'internal' as const, busy: true }
+          }
+          if (result.kind === 'fallback') {
+            return { ok: false, failureClass: 'transport' as const, gone: true }
+          }
+          return { ok: false, failureClass: 'transport' as const }
+        },
+      },
+    })
+    try {
+      const summary = await retryPendingNotifies(store, notifier, this._notifyDispatchHooks(), {
+        ...opts,
+        callbacks: ['cron-origin-inject'],
+      })
+      if (summary.scanned > 0) this.log.info('flag-off cron-origin drain', summary)
+    } catch (err) {
+      this.log.warn('flag-off cron-origin drain threw', undefined, err as Error)
+    }
+  }
+
   private _armNotifyRetryScheduler(): void {
     if (this._notifyRetryTimer) {
       clearTimeout(this._notifyRetryTimer)
       this._notifyRetryTimer = undefined
     }
-    if (!isDelegateNotifierEffective() || !this._delegateJobs) return
-    const delay = delayUntilNextNotifyRetry(this._delegateJobs)
+    if (!this._delegateJobs) return
+    const notifierOn = isDelegateNotifierEffective()
+    if (!notifierOn && !isDelegateDurableEffective()) return
+    const delay = notifierOn
+      ? delayUntilNextNotifyRetry(this._delegateJobs)
+      : delayUntilNextNotifyRetry(this._delegateJobs, Date.now(), {
+          callbacks: ['cron-origin-inject'],
+          skipLegacyCron: true,
+        })
     if (delay == null) return
     this._notifyRetryTimer = setTimeout(() => {
       this._notifyRetryTimer = undefined
-      void this._retryDelegateNotifies({ dueOnly: true }).finally(() => this._armNotifyRetryScheduler())
+      const work = notifierOn
+        ? this._retryDelegateNotifies({ dueOnly: true })
+        : this._drainFlagOffCronOriginNotifies({ dueOnly: true })
+      void work.finally(() => this._armNotifyRetryScheduler())
     }, delay)
     this._notifyRetryTimer.unref()
   }
@@ -12992,18 +13044,29 @@ export class Gateway {
   }
 
   /**
-   * Inject a synthetic user turn into the conversation that created an
-   * origin-session cron job. Does not reuse the isolated cron sessionKey
-   * and does not submit on the user's in-flight engine.
+   * Stage 2: EngineNotifier ResumeInject for cron-origin-inject. Uses the
+   * same persist+dispatch path as Completer origin-session fire, with
+   * dlgcb.{jobId}.{epoch} as the message id.
    */
+  private async injectCronOriginFromTerminal(event: JobTerminal): Promise<CronOriginFireResult> {
+    const fallbackText =
+      event.state === 'completed' && !isJobTerminalFailure(event) && event.resultRef?.trim()
+        ? event.resultRef
+        : formatJobTerminalMarkdown(event)
+    const payload = resolveCronOriginInjectPayload(event, fallbackText)
+    if (!payload) return { kind: 'fallback' }
+    return this.injectCronOriginSession(payload.job, payload.delivery, payload.override)
+  }
+
   private async injectCronOriginSession(
     job: CronJob,
     delivery: CronDeliveryContext,
+    override?: { text?: string; clientMessageId?: string; idempotencyKey?: string },
   ): Promise<CronOriginFireResult> {
     const origin = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
     if (!origin) return { kind: 'fallback' }
-    const text = buildCronOriginResumeText(job)
-    const clientMessageId = cronOriginClientMessageId(delivery.deliveryId)
+    const text = override?.text ?? buildCronOriginResumeText(job)
+    const clientMessageId = override?.clientMessageId ?? cronOriginClientMessageId(delivery.deliveryId)
     const masterCfg = readV3CronOriginInjectConfig()
     if (masterCfg) {
       const posted = await postCronOriginInject(
@@ -13046,13 +13109,15 @@ export class Gateway {
         ts: Date.now(),
       })
       if (!persisted.applied) {
-        if (persisted.reason === 'already_exists') {
-          // retry of the same occurrence — continue to dispatch (idempotent)
-        } else if (persisted.reason === 'session_deleted') {
-          return { kind: 'fallback' }
-        } else {
-          return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+        const decision = decideCronOriginDispatchAfterPersist(persisted)
+        if (decision === 'ack_injected') {
+          // Durable consumer-side idempotency: same clientMessageId already
+          // in sessions.db. ACK and do not dispatch a second turn. The
+          // process Map in dispatchInbound is not restart-safe.
+          return { kind: 'injected' }
         }
+        if (decision === 'fallback') return { kind: 'fallback' }
+        return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
       }
     } catch (err) {
       this.log.warn('origin-session persist failed', { jobId: job.id }, err as Error)
@@ -13070,7 +13135,8 @@ export class Gateway {
         agentId: origin.agentId,
         content: { text },
         ts: Date.now(),
-        idempotencyKey: cronOriginIdempotencyKey(job.id, delivery.deliveryId),
+        idempotencyKey:
+          override?.idempotencyKey ?? cronOriginIdempotencyKey(job.id, delivery.deliveryId),
         clientMessageId,
         _userId: userId,
         ...(cronBoard ? { _cronBoardProjectId: cronBoard, _cronProjectMode: 'fixed' } : {}),
@@ -13447,8 +13513,8 @@ export class Gateway {
     args: { jobId: string; agentId: string; goal: string; output?: string; error?: string },
   ): void {
     if (runInput.callbackOnComplete !== 'origin-inject') return
-    // R0/R1: EngineNotifier owns origin-inject delivery when the flag is on.
-    // Completer full switch (BUSY→pending for every callback kind) is stage 2.
+    // Stage 2: EngineNotifier owns origin-inject (and cron-origin-inject)
+    // delivery when the flag is on. Completer must not also inject.
     if (isDelegateNotifierEffective()) return
     const owner = resolveDelegateCallbackOwner()
     const snap = this._delegateJobs?.snapshotOf(args.jobId)
@@ -13511,6 +13577,8 @@ export class Gateway {
     error?: string
     userId?: string
     clientMessageId?: string
+    /** Stage 2 notifier: one try, BUSY returns to pending instead of 12-then-fallback. */
+    once?: boolean
   }): Promise<CronOriginFireResult> {
     const origin = parseOriginWebchatSessionKey(args.parentSessionKey || '')
     if (!origin) {
@@ -13527,37 +13595,39 @@ export class Gateway {
       error: args.error,
     })
     const clientMessageId = args.clientMessageId || sendToAgentCallbackClientMessageId(args.jobId)
+    const tryOnce = async (): Promise<CronOriginFireResult> => {
+      const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
+      let queued = false
+      try {
+        const parent = this.sessions.getByKey(origin.sessionKey)
+        if ((parent?._activeTurnCount ?? 0) > 0 || (parent?._activeClientTurnCount ?? 0) > 0) {
+          return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
+        }
+        const userId =
+          (typeof args.userId === 'string' && args.userId.trim()) ||
+          parent?.userId ||
+          process.env.OC_USER_ID?.trim() ||
+          'default'
+        return await this.trySendToAgentCallbackDispatch({
+          origin,
+          userId,
+          text,
+          clientMessageId,
+          jobId: args.jobId,
+          barrierOwner: barrier.owner,
+          onQueued: () => {
+            queued = true
+            barrier.release()
+          },
+        })
+      } finally {
+        if (!queued) barrier.release()
+      }
+    }
+    if (args.once) return tryOnce()
     return runBoundedOriginInjectBackoff({
       isShuttingDown: () => this._shuttingDown,
-      tryOnce: async () => {
-        const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
-        let queued = false
-        try {
-          const parent = this.sessions.getByKey(origin.sessionKey)
-          if ((parent?._activeTurnCount ?? 0) > 0 || (parent?._activeClientTurnCount ?? 0) > 0) {
-            return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
-          }
-          const userId =
-            (typeof args.userId === 'string' && args.userId.trim()) ||
-            parent?.userId ||
-            process.env.OC_USER_ID?.trim() ||
-            'default'
-          return await this.trySendToAgentCallbackDispatch({
-            origin,
-            userId,
-            text,
-            clientMessageId,
-            jobId: args.jobId,
-            barrierOwner: barrier.owner,
-            onQueued: () => {
-              queued = true
-              barrier.release()
-            },
-          })
-        } finally {
-          if (!queued) barrier.release()
-        }
-      },
+      tryOnce,
       onBudgetExhausted: () => {
         this.log.warn('send_to_agent callback retry budget exhausted', { jobId: args.jobId })
       },

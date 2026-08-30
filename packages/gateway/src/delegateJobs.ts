@@ -215,6 +215,7 @@ export function mintDelegateClaimToken(): string {
 const LEGAL_CALLBACK_TRANSITIONS = new Set<string>([
   'none->pending',
   'none->skipped_silent',
+  'none->delivered',
   'pending->injecting',
   'pending->delivered',
   'pending->skipped_silent',
@@ -226,6 +227,28 @@ const LEGAL_CALLBACK_TRANSITIONS = new Set<string>([
 
 function isLegalCallbackTransition(from: DelegateCallbackState, to: DelegateCallbackState): boolean {
   return LEGAL_CALLBACK_TRANSITIONS.has(`${from}->${to}`)
+}
+
+/** Completer/Notifier owned ResumeInject callbacks. */
+export function isResumeInjectCallback(callback: string | undefined): boolean {
+  return callback === 'origin-inject' || callback === 'cron-origin-inject'
+}
+
+function initTerminalCallback(draft: {
+  callback: DelegateCallback
+  callbackState: DelegateCallbackState
+  callbackEpoch: number
+}): void {
+  if (isResumeInjectCallback(draft.callback)) {
+    if (draft.callbackState === 'none') {
+      draft.callbackState = 'pending'
+      if (draft.callbackEpoch === 0) draft.callbackEpoch = 1
+    }
+    return
+  }
+  if (draft.callback === 'none' && draft.callbackState === 'none') {
+    draft.callbackState = 'skipped_silent'
+  }
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -381,13 +404,8 @@ export class DelegateJobStore {
           draft.callbackState = opts.callbackState
           if (draft.callbackEpoch === 0) draft.callbackEpoch = 1
         }
-      } else if (draft.callback === 'origin-inject' || draft.callback === 'cron-origin-inject') {
-        if (draft.callbackState === 'none') {
-          draft.callbackState = 'pending'
-          draft.callbackEpoch = 1
-        }
-      } else if (draft.callback === 'none') {
-        draft.callbackState = 'skipped_silent'
+      } else {
+        initTerminalCallback(draft)
       }
       draft.ownerLeaseUntil = null
       if (
@@ -438,7 +456,7 @@ export class DelegateJobStore {
     draft.state = next
     draft.failureClass = args.failureClass
     draft.failureDetail = args.detail.slice(0, 512)
-    if (draft.callback === 'origin-inject' || draft.callback === 'cron-origin-inject') {
+    if (isResumeInjectCallback(draft.callback)) {
       draft.callbackState = 'pending'
       draft.callbackEpoch = 1
     } else {
@@ -540,6 +558,8 @@ export class DelegateJobStore {
         body: { error: draft.failureDetail, failure_class: draft.failureClass },
       }
       draft.expiresAt = now + this.ttlMs
+      draft.terminalCommittedAt = now
+      initTerminalCallback(draft)
     }
     if (!this.commit(job, draft, terminal)) return undefined
     return this.snapshot(job)
@@ -884,7 +904,7 @@ export class DelegateJobStore {
       }
     }
     if (!isDelegateTerminalState(job.state)) return { ok: false }
-    if (job.callback !== 'origin-inject') return { ok: false }
+    if (!isResumeInjectCallback(job.callback)) return { ok: false }
     const now = this.now()
     const staleInjecting =
       job.callbackState === 'injecting' &&

@@ -12,6 +12,7 @@ import {
   type NotifyLane,
 } from '@openclaude/protocol'
 import type { DelegateJobSnapshot } from './delegateJobs.js'
+import { parseCronContinuation } from './cronOriginSession.js'
 
 const RESULT_REF_MAX = 8_000
 
@@ -87,6 +88,8 @@ export function buildJobTerminalFromSnapshot(
     job.parentSessionKey
   if (!parentSessionKey) return undefined
   const callbackEpoch = job.callbackEpoch > 0 ? job.callbackEpoch : 1
+  const cronContinuation =
+    job.callback === 'cron-origin-inject' ? parseCronContinuation(job.result?.body) : undefined
   return {
     jobId: job.id,
     state: job.state as JobTerminal['state'],
@@ -104,6 +107,8 @@ export function buildJobTerminalFromSnapshot(
     goal: extras.goal,
     resultOk: resultOkFromSnapshot(job),
     terminalCommittedAt: job.terminalCommittedAt,
+    callbackOriginUserId: job.callbackOriginUserId,
+    cronContinuation,
   }
 }
 
