@@ -48,6 +48,24 @@ export function isSendToAgentCallbackComplete(value: unknown): value is 'origin-
   return value === 'origin-inject'
 }
 
+/**
+ * Consume-side receipt after persist.
+ * - applied: first write, must dispatchInbound
+ * - already_exists + turn already queued/ingest: ack, do not dispatch again
+ * - already_exists + no turn yet: persist-then-crash, continue dispatch
+ */
+export function decideCallbackDispatchAfterPersist(opts: {
+  persistApplied: boolean
+  persistReason?: string
+  turnAlreadyQueued: boolean
+}): 'dispatch' | 'ack_injected' | 'unhandled' {
+  if (opts.persistApplied) return 'dispatch'
+  if (opts.persistReason === 'already_exists') {
+    return opts.turnAlreadyQueued ? 'ack_injected' : 'dispatch'
+  }
+  return 'unhandled'
+}
+
 /** Rebuild inject payload from a durable terminal snapshot. */
 export function callbackPayloadFromDurableJob(job: {
   state?: string

@@ -159,6 +159,8 @@ describe('档 A InlinePush', () => {
     assert.deepEqual(resumes, ['dlgnfy.dlgjob-n1.1'])
   })
 
+  // Test double only: production CcbAdapter/CodexAdapter hide proc/writeRaw
+  // on private inner runners (R3). This duck-type is not a live InlinePush port.
   it('tryWriteInlinePush writes a CCB user JSONL line when stdin is writable', async () => {
     const chunks: string[] = []
     const session = {
@@ -451,6 +453,43 @@ describe('review blockers: claim / retry / origin / outcome', () => {
     }
   })
 
+  it('notifier throw releases the exclusive claim so a retry can proceed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-throw-'))
+    try {
+      const store = openStore(dir)
+      const { snap } = await seededTerminal(store, { parentEngine: 'cursor' })
+      await assert.rejects(
+        dispatchJobTerminalNotify(
+          store,
+          snap,
+          { notify: async () => { throw new Error('boom') } },
+        ),
+        /boom/,
+      )
+      const after = store.snapshotOf(snap.id)!
+      assert.equal(after.state, 'completed')
+      assert.equal(after.callbackState, 'pending')
+      let injected = 0
+      const result = await dispatchJobTerminalNotify(
+        store,
+        after,
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async () => {
+              injected += 1
+              return { ok: true }
+            },
+          },
+        }),
+      )
+      assert.equal('ok' in result && result.ok, true)
+      assert.equal(injected, 1)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('two stores on one sqlite file consume a pending notify once', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-dual-'))
     try {
@@ -652,5 +691,125 @@ describe('review blockers: claim / retry / origin / outcome', () => {
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
+  })
+
+  it('nested origin survives crash/reopen from the durable job row', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-origin-boot-'))
+    try {
+      const parentKey = 'agent:explorer:delegate:main:123:deadbeef'
+      const originKey = 'agent:main:webchat:dm:p1'
+      const s1 = openStore(dir)
+      const created = s1.create('coding-assistant', {
+        queued: true,
+        parentSessionKey: parentKey,
+        callback: 'origin-inject',
+        parentEngine: 'cursor',
+        callbackOriginSessionKey: originKey,
+      })
+      assert.ok('jobId' in created)
+      const claimed = s1.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      if (!claimed.ok) throw new Error('claim failed')
+      assert.equal(
+        s1.complete(created.jobId, { httpStatus: 200, body: { output: 'nested-ok' } }, claimed),
+        true,
+      )
+      s1.close()
+
+      const s2 = openStore(dir, { bootId: 'gw:g1' })
+      const snap = s2.snapshotOf(created.jobId)!
+      assert.equal(snap.parentSessionKey, parentKey)
+      assert.equal(snap.callbackOriginSessionKey, originKey)
+      let injectedParent: string | undefined
+      const result = await dispatchJobTerminalNotify(
+        s2,
+        snap,
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async (ev) => {
+              injectedParent = ev.parentSessionKey
+              return { ok: true }
+            },
+          },
+        }),
+      )
+      assert.equal('ok' in result && result.ok, true)
+      assert.equal(injectedParent, originKey)
+      s2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('nested origin flag-off recovery injects the webchat intent, not the delegate parent', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-origin-flagoff-'))
+    const intentDir = await mkdtemp(join(tmpdir(), 'oc-nfy-origin-intent-'))
+    try {
+      const parentKey = 'agent:explorer:delegate:main:123:deadbeef'
+      const originKey = 'agent:main:webchat:dm:p1'
+      const store = openStore(dir)
+      const created = store.create('coding-assistant', {
+        queued: true,
+        parentSessionKey: parentKey,
+        callback: 'origin-inject',
+        parentEngine: 'cursor',
+        callbackOriginSessionKey: originKey,
+      })
+      assert.ok('jobId' in created)
+      const claimed = store.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      if (!claimed.ok) throw new Error('claim failed')
+      assert.equal(
+        store.complete(created.jobId, { httpStatus: 200, body: { output: 'nested-ok' } }, claimed),
+        true,
+      )
+      const env = { OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR: intentDir } as NodeJS.ProcessEnv
+      await persistSendToAgentIntent({
+        v: 1,
+        jobId: created.jobId,
+        originSessionKey: originKey,
+        agentId: 'coding-assistant',
+        goal: 'nested',
+        createdAt: 1,
+      }, env)
+      const seen: string[] = []
+      const summary = await recoverInterruptedSendToAgentIntents(
+        async () => {
+          throw new Error('legacy interrupt must not run')
+        },
+        env,
+        {
+          callbackOwner: 'job',
+          resolveJob: (id) => store.snapshotOf(id),
+          ensureCallback: async (_job, intent) => {
+            seen.push(intent.originSessionKey)
+            return true
+          },
+        },
+      )
+      assert.deepEqual(seen, [originKey])
+      assert.equal(summary.skippedShadow, 1)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(intentDir, { recursive: true, force: true })
+    }
+  })
+
+  it('notify latency is measured from terminal commit, not notify() start', async () => {
+    const committed = 1_700_000_000_000
+    const samples: number[] = []
+    const notifier = new DefaultEngineNotifier({
+      now: () => committed + 25,
+      onSample: (sample) => samples.push(sample.latencyMs),
+      resumeInject: { inject: async () => ({ ok: true }) },
+    })
+    await notifier.notify(
+      terminalEvent({
+        parentEngine: 'cursor',
+        terminalCommittedAt: committed,
+      }),
+    )
+    assert.deepEqual(samples, [25])
   })
 })

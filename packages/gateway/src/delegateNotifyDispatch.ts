@@ -143,7 +143,15 @@ export async function dispatchJobTerminalNotify(
     deliveryToken = claimed.token
   }
 
-  const result = await notifier.notify(event)
+  let result: NotifyResult
+  try {
+    result = await notifier.notify(event)
+  } catch (err) {
+    if (job.callback === 'origin-inject' && deliveryToken) {
+      store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(live))
+    }
+    throw err
+  }
   if (result.ok) {
     if (result.lane !== preferred) {
       persistNotifyIntent(store, live, {

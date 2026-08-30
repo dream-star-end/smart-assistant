@@ -318,6 +318,7 @@ import { getProject } from './taskboard/db/projects.js'
 import {
   buildSendToAgentCallbackText,
   callbackPayloadFromDurableJob,
+  decideCallbackDispatchAfterPersist,
   isSendToAgentCallbackComplete,
   sendToAgentCallbackClientMessageId,
   sendToAgentCallbackIdempotencyKey,
@@ -13586,7 +13587,23 @@ export class Gateway {
         })
         if (!persisted.applied) {
           if (persisted.reason === 'already_exists') {
-            // same job retry — continue to dispatch
+            const turnAlreadyQueued = await this._sendToAgentCallbackTurnAlreadyQueued({
+              jobId: args.jobId,
+              userId: args.userId,
+              sessionKey: args.origin.sessionKey,
+              sessionId: args.origin.peerId,
+              clientMessageId: args.clientMessageId,
+            })
+            const decision = decideCallbackDispatchAfterPersist({
+              persistApplied: false,
+              persistReason: persisted.reason,
+              turnAlreadyQueued,
+            })
+            if (decision === 'ack_injected') {
+              args.onQueued?.()
+              return { kind: 'injected' }
+            }
+            // Message persisted, turn not queued yet — continue dispatchInbound.
           } else if (
             persisted.reason === 'session_deleted' ||
             persisted.reason === 'malformed' ||
@@ -13632,6 +13649,31 @@ export class Gateway {
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_DISPATCH_FAILED' }
     }
     return { kind: 'injected' }
+  }
+
+  private async _sendToAgentCallbackTurnAlreadyQueued(args: {
+    jobId: string
+    userId: string
+    sessionKey: string
+    sessionId: string
+    clientMessageId: string
+  }): Promise<boolean> {
+    if (this._isIdempotencyDuplicate(sendToAgentCallbackIdempotencyKey(args.jobId))) return true
+    const live = this.sessions.getByKey(args.sessionKey) as
+      | { _currentDispatch?: { clientMessageId?: string } }
+      | undefined
+    if (live?._currentDispatch?.clientMessageId === args.clientMessageId) return true
+    try {
+      const row = await getTurnDispatchState({
+        userId: normalizeDispatchUserId(args.userId),
+        sessionId: args.sessionId,
+        clientMessageId: args.clientMessageId,
+      })
+      if (!row) return false
+      return row.state !== 'rejected'
+    } catch {
+      return false
+    }
   }
 
   // ── Cron/Reminder API handlers ──
