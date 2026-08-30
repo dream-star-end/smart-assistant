@@ -3,7 +3,8 @@
  *
  * Scans non-terminal durable jobs and runs AdoptOrKill. Conservative:
  *   - this process + live lease → leave running
- *   - queued → adopt (lease transfer, stay queued)
+ *   - queued → leave unclaimed (no token) until a real runner/cron claims;
+ *     past QUEUE_WAIT_MS wall clock → failed{capacity_timeout}
  *   - running + stale/other + checkpoint none → killed_by_cutover
  *     unless lease is still valid AND we cannot prove the child is dead
  *     (wait for lease; do not invent a kill)

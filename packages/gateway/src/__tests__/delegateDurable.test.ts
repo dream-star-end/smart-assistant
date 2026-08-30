@@ -622,6 +622,34 @@ describe('blocker 3: resume occupancy skips cron and releases on terminal', () =
 })
 
 describe('blocker 4: cron claim failure is fail-closed', () => {
+  it('queued cron stays claimable after G1 boot (no adopted token to block claim)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-cron-queued-claim-'))
+    try {
+      const s1 = openStore(dir, { bootId: 'gw:g0' })
+      const enq = enqueueCronOccurrenceJob(s1, {
+        cronJobId: 'nightly-queued',
+        dueMinuteKey: 1_700_000_222,
+        agentId: 'main',
+      })
+      assert.ok(!('error' in enq))
+      if ('error' in enq) return
+      assert.equal(s1.snapshotOf(enq.jobId)?.claimToken, undefined)
+      s1.close()
+      const s2 = openStore(dir, { bootId: 'gw:g1' })
+      const summary = reconcileDelegateJobsOnBoot(s2)
+      assert.equal(s2.snapshotOf(enq.jobId)?.state, 'queued')
+      assert.equal(s2.snapshotOf(enq.jobId)?.claimToken, undefined)
+      assert.equal(summary.adopted, 0)
+      const fence = claimCronDelegateExecution(s2, enq.jobId)
+      assert.equal(typeof fence.claimToken, 'string')
+      assert.equal(fence.claimToken.length, 64)
+      assert.equal(s2.snapshotOf(enq.jobId)?.state, 'running')
+      s2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('claimCronDelegateExecution throws after killed_by_cutover and does not mint a fence', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-cron-claim-'))
     try {
@@ -749,6 +777,47 @@ describe('blocker 6: restart callback uses durable result', () => {
     assert.deepEqual(captured, [{ output: 'UNIQUE_OUTPUT', error: undefined }])
     store.close()
   })
+
+  it('ensureCallback injects durable failure instead of fake completed-empty text', async () => {
+    const gw = Object.create(Gateway.prototype) as any
+    gw.log = { debug() {}, info() {}, warn() {}, error() {} }
+    const captured: Array<{ output?: string; error?: string }> = []
+    gw.injectSendToAgentCallback = async (args: { output?: string; error?: string }) => {
+      captured.push({ output: args.output, error: args.error })
+      return { kind: 'injected' }
+    }
+    const store = new DelegateJobStore({ sm: true, ttlMs: 60_000 })
+    const created = store.create('coding-assistant', {
+      queued: true,
+      callback: 'origin-inject',
+    })
+    assert.ok('jobId' in created)
+    const claimed = store.claimQueued(created.jobId)
+    assert.equal(claimed.ok, true)
+    if (!claimed.ok) return
+    assert.equal(
+      store.fail(created.jobId, {
+        failureClass: 'child_error',
+        detail: 'upstream 402',
+        httpStatus: 502,
+        claimToken: claimed.claimToken,
+        fencingEpoch: claimed.fencingEpoch,
+      }),
+      true,
+    )
+    gw._delegateJobs = store
+    const ok = await gw._ensureDurableSendToAgentCallback(store.snapshotOf(created.jobId), {
+      v: 1,
+      jobId: created.jobId,
+      originSessionKey: 'agent:main:webchat:dm:sess-1',
+      agentId: 'coding-assistant',
+      goal: 'x',
+      createdAt: 1,
+    })
+    assert.equal(ok, true)
+    assert.deepEqual(captured, [{ output: undefined, error: 'upstream 402' }])
+    store.close()
+  })
 })
 
 describe('blocker 7: flag quadrants and baseline JSON DTO', () => {
@@ -795,6 +864,51 @@ describe('blocker 7: flag quadrants and baseline JSON DTO', () => {
       assert.ok(baselinePersistKeys.includes(key), `unexpected persist key ${key}`)
     }
     store.close()
+  })
+
+  it('four-quadrant predicates: only SM=1 and DURABLE=1 opens SQLite', () => {
+    const cases: Array<[string | undefined, string | undefined, boolean]> = [
+      [undefined, undefined, false],
+      ['0', '0', false],
+      ['0', '1', false],
+      ['1', '0', false],
+      ['1', '1', true],
+    ]
+    for (const [sm, durable, expected] of cases) {
+      const env = {
+        ...(sm === undefined ? {} : { OC_DELEGATE_SM: sm }),
+        ...(durable === undefined ? {} : { OC_DELEGATE_DURABLE: durable }),
+      }
+      assert.equal(
+        isDelegateDurableEffective(env),
+        expected,
+        `SM=${sm} DURABLE=${durable}`,
+      )
+    }
+  })
+
+  it('SM=1 DURABLE=1 persist path is SQLite, not JSON snapshots', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-quad-sql-'))
+    try {
+      const dbPath = join(dir, 'delegate-jobs.db')
+      const snapDir = join(dir, 'json-snaps')
+      await mkdir(snapDir, { recursive: true })
+      const store = new DelegateJobStore({
+        sm: true,
+        durable: new DelegateDurableDb(dbPath),
+        bootId: 'gw:quad',
+      })
+      const created = store.create('coding-assistant', { queued: true })
+      assert.ok('jobId' in created)
+      const names = await readdir(snapDir)
+      assert.equal(names.length, 0)
+      const observer = new DelegateDurableDb(dbPath)
+      assert.equal(observer.get(created.jobId)?.state, 'queued')
+      observer.close()
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('SM=0 DURABLE=1 still writes JSON snapshots (does not skip both stores)', async () => {

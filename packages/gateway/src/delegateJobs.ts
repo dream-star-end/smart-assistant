@@ -706,7 +706,7 @@ export class DelegateJobStore {
       nextState?: Extract<DelegateJobState, 'failed' | 'killed_by_cutover' | 'cancelled'>
     },
   ): 'dropped' | 'failed' | 'claimed' | 'missing' {
-    const job = this.jobs.get(jobId)
+    const job = this.refreshJob(jobId)
     if (!job) return 'missing'
     if (isDelegateTerminalState(job.state) || job.result) return 'missing'
     if (job.state !== 'queued' || job.claimToken) return 'claimed'
