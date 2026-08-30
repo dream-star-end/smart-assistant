@@ -22,6 +22,13 @@ export type DelegateReconcileHooks = {
   now?: () => number
   /** Wall-clock budget used after restart (hrtime does not survive). */
   queueWaitMs?: number
+  /**
+   * Stage 3: after adopting a runner_quiesced paused row, ClaimPaused → running.
+   * Default false: historical paused rows are closed as killed_by_cutover so
+   * CUTOVER on→off cannot leak capacity / resume occupancy. Fresh boots with
+   * no paused rows stay equivalent to 1735f46be.
+   */
+  claimPaused?: boolean
 }
 
 export type DelegateReconcileSummary = {
@@ -61,7 +68,7 @@ export function reconcileDelegateJobsOnBoot(
       }
       continue
     }
-    const next = store.decideAdoptNextState(job)
+    const next = store.decideAdoptNextState(job, { resumeQuiesced: hooks.claimPaused === true })
     if (shouldDeferKill(store, job, next, now, hooks.isChildAlive)) {
       summary.deferred += 1
       continue
@@ -70,9 +77,16 @@ export function reconcileDelegateJobsOnBoot(
     if (!adopted) continue
     if (adopted.state === 'killed_by_cutover' || isDelegateTerminalState(adopted.state)) {
       summary.killed += 1
-    } else {
-      summary.adopted += 1
+      continue
     }
+    if (
+      hooks.claimPaused === true &&
+      adopted.state === 'paused_for_cutover' &&
+      adopted.checkpointKind === 'runner_quiesced'
+    ) {
+      store.claimPaused(adopted.id)
+    }
+    summary.adopted += 1
   }
   return summary
 }
