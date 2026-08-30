@@ -98,8 +98,15 @@ import {
 } from './presentOptions.js'
 import {
   cursorDelegateCliHint,
+  delegateWaitDisabledText,
+  filterListedDelegateTools,
   isCursorHiddenDelegateTool,
+  shouldExposeDelegateWait,
 } from './cursorDelegatePolicy.js'
+import {
+  mcpDelegateWaitHttpTimeoutMs,
+  runMcpDelegateWait,
+} from './delegateWaitMcp.js'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
 /** 本 MCP 子进程的委派深度(由网关 spawn env 注入)。>0 = 子 agent 环境,
@@ -208,9 +215,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (!shouldListPresentOptions(ENGINE_ID, DELEGATION_DEPTH)) {
     base = base.filter((t) => t.name !== 'present_options')
   }
-  if (ENGINE_ID === 'cursor') {
-    base = base.filter((t) => !isCursorHiddenDelegateTool(t.name, 'cursor'))
-  }
+  base = filterListedDelegateTools(base, ENGINE_ID)
   return { tools: filterSkillEvalTools(base, SKILL_EVAL_MODE) }
 })
 
@@ -228,6 +233,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     if (isCursorHiddenDelegateTool(name)) {
       return toolError(cursorDelegateCliHint(name))
+    }
+    if (name === 'delegate_wait' && !shouldExposeDelegateWait()) {
+      return toolError(delegateWaitDisabledText())
     }
     switch (name) {
       case 'skill_list':
@@ -256,6 +264,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleDelegateTask(args as any)
       case 'delegate_tasks':
         return await handleDelegateTasks(args as any)
+      case 'delegate_wait':
+        return await handleDelegateWait(args as any)
       case 'request_review':
         return await handleRequestReview(args as any)
       case 'task_create':
@@ -957,6 +967,28 @@ async function runAsyncDelegateToAgent(
         }),
     },
   })
+}
+
+async function handleDelegateWait(args: { jobId?: unknown; waitMs?: unknown }) {
+  if (!shouldExposeDelegateWait()) {
+    return toolError(delegateWaitDisabledText())
+  }
+  const jobId = typeof args?.jobId === 'string' ? args.jobId : ''
+  try {
+    const r = await runMcpDelegateWait({
+      jobId,
+      waitMs: args?.waitMs,
+      waitOnce: (id, waitMs) =>
+        postJsonToGateway(`${gatewayBaseUrl()}/api/delegate/wait`, {
+          headers: gatewayDelegateHeaders(),
+          body: JSON.stringify({ jobId: id, waitMs }),
+          timeoutMs: mcpDelegateWaitHttpTimeoutMs(waitMs),
+        }),
+    })
+    return r.isError ? toolError(r.text) : toolOk(r.text)
+  } catch (err: any) {
+    return toolError(`等待委派结果失败: ${describeDelegateTransportError(err)}`)
+  }
 }
 
 async function handleDelegateTaskToAgent(

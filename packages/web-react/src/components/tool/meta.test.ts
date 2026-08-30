@@ -133,6 +133,13 @@ describe("toolSummary 摘要 (P5)", () => {
       "0 个并行子任务",
     );
   });
+  test("delegate_wait 标签为「等待委派」+ 摘要为 jobId", () => {
+    expect(resolveToolMeta("mcp__openclaude-memory__delegate_wait").label).toBe("等待委派");
+    expect(resolveToolMeta("delegate_wait").label).toBe("等待委派");
+    expect(
+      toolSummary("mcp__openclaude-memory__delegate_wait", { jobId: "dlgjob-abc" }),
+    ).toBe("dlgjob-abc");
+  });
   test("MCP memory skill_search / web-context 摘要", () => {
     expect(
       toolSummary("mcp__openclaude-memory__skill_search", { query: "literature-search" }),

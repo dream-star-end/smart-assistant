@@ -328,6 +328,32 @@ export const TOOLS = [
       required: ['tasks'],
     },
   },
+  // ── Cursor 档 A′ 纯等待（flag OC_DELEGATE_CURSOR_MCP_WAIT，默认关）──
+  {
+    name: 'delegate_wait',
+    description: [
+      '纯等待一个已有的 durable 委派 job（不开工、无副作用、不占委派并发容量）。',
+      '单轮最长 55s（低于 Cursor tools/call 60s 硬超时）。',
+      '- 终态：返回结果摘要/路径。',
+      '- 到点未完成：status=running jobId=...（不是失败）。请立刻再调本工具，或结束回合改走 `oc-memory delegate-wait`。',
+      '- jobId 不存在：status=not_found，不会挂死。',
+      '不要用本工具开工；开工请用 `oc-memory delegate`。长任务禁止空转 55s。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: {
+          type: 'string',
+          description: '要等待的委派作业 id（oc-memory delegate / 快路径返回的 jobId）。',
+        },
+        waitMs: {
+          type: 'number',
+          description: '本轮最长等待毫秒。默认 55000，上限 55000。',
+        },
+      },
+      required: ['jobId'],
+    },
+  },
   // ── 团队质量审查(队长自主送审,2026-07-07) ──
   {
     name: 'request_review',
