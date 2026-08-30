@@ -12876,7 +12876,8 @@ export class Gateway {
             group: durableGroup,
             // Job CAS winner is authority: a killed/failed/cancelled job must
             // not be rewritten as completed by a late runner. Same-terminal
-            // folds may still fill a bounded payload.
+            // non-authoritative folds are rejected by the surface so a late
+            // runner cannot replace the authoritative failure payload.
             state:
               snap && isDelegateTerminalState(snap.state) ? snap.state : 'completed',
             parentSessionKey: parentKey,

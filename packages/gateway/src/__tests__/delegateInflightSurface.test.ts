@@ -17,7 +17,7 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import Database from 'better-sqlite3'
 
-import type { DurableAgentGroup } from '@openclaude/protocol'
+import { isDelegateTerminalState, type DurableAgentGroup } from '@openclaude/protocol'
 import { DelegateJobStore } from '../delegateJobs.js'
 import { DelegateDurableDb } from '../delegateDurable.js'
 import {
@@ -1044,6 +1044,130 @@ describe('closeout residual — terminal→terminal is sticky', () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  it('cutover-first then production same-state runner fold cannot replace authoritative payload', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-r2-auth-payload-'))
+    const surfaceDb = join(dir, 'delegate-inflight-surface.db')
+    try {
+      const jobsDb = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const surface = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 40 })
+      const stale = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 40 })
+      const jobs = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        durable: jobsDb,
+        bootId: 'gw:r2-auth-payload',
+        onTerminal: (job) => surface.projectJob(job),
+      })
+      const created = jobs.create('coding-assistant', {
+        queued: true,
+        parentSessionKey: PARENT,
+        sessionKey: 'agent:coding-assistant:delegate:main:auth-payload',
+      })
+      assert.ok('jobId' in created)
+      surface.upsertEnqueue({
+        jobId: created.jobId,
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'g',
+        runId: 'dlg-auth-payload',
+        state: 'queued',
+        userId: 'user-r2',
+      })
+      stale.upsertEnqueue({
+        jobId: created.jobId,
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'g',
+        runId: 'dlg-auth-payload',
+        state: 'queued',
+        userId: 'user-r2',
+      })
+      const claimed = jobs.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      if (!claimed.ok) throw new Error('claim failed')
+      const running = jobs.snapshotOf(created.jobId)!
+      surface.updateLive({
+        jobId: created.jobId,
+        state: 'running',
+        fencingEpoch: running.fencingEpoch,
+        generation: running.generation,
+      })
+      stale.updateLive({
+        jobId: created.jobId,
+        state: 'running',
+        fencingEpoch: running.fencingEpoch,
+        generation: running.generation,
+      })
+      const paused = jobs.pauseForCutover(created.jobId, {
+        claimToken: claimed.claimToken,
+        fencingEpoch: claimed.fencingEpoch,
+        generation: running.generation + 1,
+        checkpointKind: 'none',
+      })
+      assert.ok(paused)
+      const killed = jobs.killOwnedPaused(created.jobId)
+      assert.equal(killed?.state, 'killed_by_cutover')
+      const afterCutover = surface.get(created.jobId)
+      assert.equal(afterCutover?.state, 'killed_by_cutover')
+      assert.equal(afterCutover?.foldedGroup?.status, 'failed')
+
+      // Production _runDelegateTask mapping (server.ts): snapshotOf().state
+      // when the job is already terminal, plus the late runner's success group.
+      const snap = jobs.snapshotOf(created.jobId)
+      const foldState =
+        snap && isDelegateTerminalState(snap.state) ? snap.state : 'completed'
+      const fence = snap
+        ? { fencingEpoch: snap.fencingEpoch, generation: snap.generation }
+        : {}
+      const late = surface.foldTerminal({
+        jobId: created.jobId,
+        group: group({
+          runId: 'dlg-auth-payload',
+          status: 'ok',
+          resultSummary: 'runner-finished-after-kill',
+        }),
+        state: foldState,
+        ...fence,
+      })
+      assert.equal(late.folded, true)
+      if (late.folded) {
+        assert.equal(late.surface.state, 'killed_by_cutover')
+        assert.equal(late.surface.foldedGroup?.status, 'failed')
+        assert.notEqual(late.surface.foldedGroup?.resultSummary, 'runner-finished-after-kill')
+      }
+
+      // Stale in-memory running + same production mapping must lose at SQL too.
+      const staleFold = stale.foldTerminal({
+        jobId: created.jobId,
+        group: group({
+          runId: 'dlg-auth-payload',
+          status: 'ok',
+          resultSummary: 'runner-finished-after-kill',
+        }),
+        state: foldState,
+        ...fence,
+      })
+      assert.equal(staleFold.folded, true)
+      if (staleFold.folded) {
+        assert.equal(staleFold.surface.state, 'killed_by_cutover')
+        assert.equal(staleFold.surface.foldedGroup?.status, 'failed')
+        assert.notEqual(staleFold.surface.foldedGroup?.resultSummary, 'runner-finished-after-kill')
+      }
+
+      surface.close()
+      stale.close()
+      const reopened = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 41 })
+      const persisted = reopened.get(created.jobId)
+      assert.equal(persisted?.state, 'killed_by_cutover')
+      assert.equal(persisted?.foldedGroup?.status, 'failed')
+      assert.notEqual(persisted?.foldedGroup?.resultSummary, 'runner-finished-after-kill')
+      reopened.close()
+      jobs.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('closeout residual — durable tombstone survives cross-gateway overlay', () => {
@@ -1235,6 +1359,168 @@ describe('closeout residual — writer lock must not stall the gateway', () => {
       } catch {
         /* closed */
       }
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('writer-lock drop retries the tombstone so a stale overlay cannot resurrect queued', async () => {
+    assert.equal(INFLIGHT_SURFACE_BUSY_TIMEOUT_MS, 0)
+    const dir = await mkdtemp(join(tmpdir(), 'oc-r2-lock-tomb-'))
+    const surfaceDb = join(dir, 'delegate-inflight-surface.db')
+    let locker: InstanceType<typeof Database> | null = null
+    try {
+      const jobsDb = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const g0 = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 50 })
+      const g1 = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 51 })
+      const jobs = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        durable: jobsDb,
+        bootId: 'gw:r2-lock-tomb',
+      })
+      const created = jobs.create('coding-assistant', {
+        queued: true,
+        parentSessionKey: PARENT,
+        sessionKey: 'agent:coding-assistant:delegate:main:lock-tomb',
+      })
+      assert.ok('jobId' in created)
+      const snap = jobs.snapshotOf(created.jobId)!
+      g0.upsertEnqueue({
+        jobId: created.jobId,
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'ghost-queued',
+        state: 'queued',
+        userId: 'user-r2',
+        fencingEpoch: snap.fencingEpoch,
+        generation: snap.generation,
+      })
+      g1.upsertEnqueue({
+        jobId: created.jobId,
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'ghost-queued',
+        state: 'queued',
+        userId: 'user-r2',
+        fencingEpoch: snap.fencingEpoch,
+        generation: snap.generation,
+      })
+      const staleOverlay = [structuredClone(snap)]
+      assert.equal(jobs.dropIfUnclaimed(created.jobId), true)
+      assert.equal(jobs.snapshotOf(created.jobId), undefined)
+
+      locker = new Database(surfaceDb)
+      locker.pragma('busy_timeout = 0')
+      locker.exec('BEGIN IMMEDIATE')
+      const t0 = Date.now()
+      assert.equal(g1.drop(created.jobId), true)
+      const elapsedMs = Date.now() - t0
+      assert.ok(elapsedMs < 250, `drop stalled ${elapsedMs}ms under writer lock`)
+      assert.ok(g1.writeFailures >= 1)
+      const during = locker
+        .prepare('SELECT state, tombstoned, generation FROM inflight_delegate_surface WHERE job_id = ?')
+        .get(created.jobId) as { state: string; tombstoned: number; generation: number } | undefined
+      assert.equal(during?.state, 'queued')
+      assert.equal(during?.tombstoned, 0)
+
+      locker.exec('ROLLBACK')
+      locker.close()
+      locker = null
+      assert.equal(g1.flushPendingTombstones(), 0)
+      const landed = new Database(surfaceDb)
+      const tomb = landed
+        .prepare('SELECT tombstoned FROM inflight_delegate_surface WHERE job_id = ?')
+        .get(created.jobId) as { tombstoned: number } | undefined
+      landed.close()
+      assert.equal(tomb?.tombstoned, 1)
+
+      const page = await handleInflightDelegatesRequest({
+        method: 'GET',
+        sessionId: SESS,
+        userId: 'user-r2',
+        enabled: true,
+        loadSession: async () => ({ id: SESS, userId: 'user-r2' }),
+        store: g0,
+        overlayJobs: () => staleOverlay,
+        resolveJob: () => undefined,
+        dropMissingLive: false,
+      })
+      assert.equal(page.status, 200)
+      const states = ((page.body.items as Array<{ state: string }>) ?? []).map((row) => row.state)
+      assert.deepEqual(states, [])
+      assert.equal(g0.get(created.jobId), undefined)
+
+      g0.close()
+      g1.close()
+      const reopened = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 52 })
+      assert.equal(reopened.get(created.jobId), undefined)
+      reopened.rebuildFromJobs(staleOverlay, { dropMissingLive: false, resolveJob: () => undefined })
+      assert.equal(reopened.get(created.jobId), undefined)
+      const raw = new Database(surfaceDb)
+      const persisted = raw
+        .prepare('SELECT state FROM inflight_delegate_surface WHERE job_id = ? AND IFNULL(tombstoned, 0) = 0')
+        .get(created.jobId) as { state: string } | undefined
+      raw.close()
+      assert.equal(persisted, undefined)
+      reopened.close()
+      jobs.close()
+    } finally {
+      try {
+        locker?.exec('ROLLBACK')
+      } catch {
+        /* already rolled back */
+      }
+      try {
+        locker?.close()
+      } catch {
+        /* closed */
+      }
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('boot reconcile tombstones ownerless queued rows after process death', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-r2-boot-tomb-'))
+    const surfaceDb = join(dir, 'delegate-inflight-surface.db')
+    try {
+      const seed = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 60 })
+      seed.upsertEnqueue({
+        jobId: 'dlgjob-orphan-q',
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'still-queued',
+        state: 'queued',
+        userId: 'user-r2',
+        fencingEpoch: 1,
+        generation: 8,
+      })
+      seed.close()
+      const boot = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 61 })
+      boot.rebuildFromJobs([], { dropMissingLive: true })
+      assert.equal(boot.get('dlgjob-orphan-q'), undefined)
+      const page = await handleInflightDelegatesRequest({
+        method: 'GET',
+        sessionId: SESS,
+        userId: 'user-r2',
+        enabled: true,
+        loadSession: async () => ({ id: SESS, userId: 'user-r2' }),
+        store: boot,
+        overlayJobs: () => [],
+        resolveJob: () => undefined,
+        dropMissingLive: true,
+      })
+      assert.equal(((page.body.items as unknown[]) ?? []).length, 0)
+      boot.close()
+      const reopened = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 62 })
+      assert.equal(reopened.get('dlgjob-orphan-q'), undefined)
+      const raw = new Database(surfaceDb)
+      const tomb = raw
+        .prepare('SELECT tombstoned FROM inflight_delegate_surface WHERE job_id = ?')
+        .get('dlgjob-orphan-q') as { tombstoned: number } | undefined
+      raw.close()
+      assert.equal(tomb?.tombstoned, 1)
+      reopened.close()
+    } finally {
       await rm(dir, { recursive: true, force: true })
     }
   })

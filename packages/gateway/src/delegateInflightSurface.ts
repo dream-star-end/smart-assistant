@@ -5,9 +5,12 @@
  * OC_DELEGATE_INFLIGHT_SURFACE defaults off. Authority remains the job row;
  * this store is a fail-open projection (goal / runId / liveHint / bounded
  * folded DurableAgentGroup). Job-store terminal projections may correct a
- * previous surface terminal; runner fold / stale overlay may not. Queue-full
- * drops persist a durable tombstone so another gateway cannot resurrect the
- * row. I/O errors never throw into the delegate / Completer / Notifier chain.
+ * previous surface terminal (state and payload atomically). Once a terminal
+ * is settled, runner fold / stale overlay may not replace it, including
+ * same-state payload updates. Queue-full drops persist a durable tombstone
+ * (retried until the write lands while this process is alive; boot reconcile
+ * covers the death window) so another gateway cannot resurrect the row. I/O
+ * errors never throw into the delegate / Completer / Notifier chain.
  */
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -85,6 +88,22 @@ type SurfaceRow = InflightDelegateSurface & {
   authority: number
   tombstoned?: boolean
 }
+
+type TombstoneWrite = {
+  jobId: string
+  parentSessionKey: string
+  sessionId: string
+  userId: string
+  runId: string
+  agentId: string
+  goal: string
+  state: DelegateJobState
+  fencingEpoch: number
+  generation: number
+  expiresAt: number
+}
+
+const TOMBSTONE_RETRY_MS = 5
 
 export function resolveDelegateInflightSurfaceDbPath(
   env: NodeJS.ProcessEnv = process.env,
@@ -251,13 +270,13 @@ function canAdvanceState(
   to: DelegateJobState,
   opts: { authoritative?: boolean } = {},
 ): boolean {
-  if (from === to) return true
   if (isDelegateTerminalState(from) && !isDelegateTerminalState(to)) return false
-  if (isDelegateTerminalState(from) && isDelegateTerminalState(to)) {
-    // Read model follows the job-store CAS winner, not "first writer wins".
-    // Runner fold / stale overlay cannot replace a different terminal.
+  if (isDelegateTerminalState(from)) {
+    // Terminal payload is sticky. Same-state non-authoritative folds must not
+    // replace an authoritative failure summary with a late runner success.
     return opts.authoritative === true
   }
+  if (from === to) return true
   return isLegalDelegateTransition(from, to)
 }
 
@@ -281,6 +300,9 @@ export class DelegateInflightSurfaceStore {
   private readonly byJob = new Map<string, SurfaceRow>()
   /** Queue-full / explicit drops. Backed by durable tombstone rows. */
   private readonly droppedJobs = new Set<string>()
+  /** Tombstone rows that must still land in SQLite (busy_timeout=0 miss). */
+  private readonly pendingTombstones = new Map<string, TombstoneWrite>()
+  private tombstoneRetryTimer: ReturnType<typeof setTimeout> | null = null
   private db: InstanceType<typeof Database> | null = null
   private upsertStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
   private tombstoneStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
@@ -376,7 +398,6 @@ export class DelegateInflightSurfaceStore {
           inflight_delegate_surface.tombstoned = 0
           AND (
             inflight_delegate_surface.state NOT IN (${TERMINAL_SQL})
-            OR excluded.state = inflight_delegate_surface.state
             OR (
               excluded.authority >= ${AUTHORITY_JOB_STORE}
               AND excluded.state IN (${TERMINAL_SQL})
@@ -728,10 +749,7 @@ export class DelegateInflightSurfaceStore {
     // Job-authority mapping: a finished DurableAgentGroup is a completed job
     // even when group.status is failed/timeout (complete(http 200, ok:false)).
     const state: DelegateJobState = input.state ?? 'completed'
-    if (
-      !canAdvanceState(existing.state, state, { authoritative: input.authoritative }) &&
-      existing.state !== state
-    ) {
+    if (!canAdvanceState(existing.state, state, { authoritative: input.authoritative })) {
       return { folded: true, surface: publicView(existing) }
     }
     const fencingEpoch = input.fencingEpoch ?? existing.fencingEpoch
@@ -838,6 +856,7 @@ export class DelegateInflightSurfaceStore {
     } = {},
   ): { items: InflightDelegateSurface[]; nextCursor: string | null; truncated: boolean } {
     this.sweepExpired()
+    this.refreshTombstonesFromDb()
     const matched: SurfaceRow[] = []
     for (const row of this.byJob.values()) {
       if (this.droppedJobs.has(row.jobId) || row.tombstoned) continue
@@ -890,25 +909,43 @@ export class DelegateInflightSurfaceStore {
   /**
    * Remove a projection whose job never became live (queue-full drop) or was
    * otherwise deleted. Persists a durable tombstone so another gateway's
-   * stale overlay cannot INSERT the row back. Fail-open: never throws.
+   * stale overlay cannot INSERT the row back. The in-process view is hidden
+   * immediately; SQLite is retried until it lands (busy_timeout=0). Never throws.
    */
   drop(jobId: string): boolean {
     const existing = this.byJob.get(jobId)
+    const pending = this.pendingTombstones.get(jobId)
     this.rememberTombstone(jobId)
-    this.persistTombstone({
+    this.queueTombstone({
       jobId,
-      parentSessionKey: existing?.parentSessionKey ?? '',
-      sessionId: existing?.sessionId ?? '',
-      userId: existing?.userId ?? '',
-      runId: existing?.runId ?? defaultRunId(jobId),
-      agentId: existing?.agentId ?? '',
-      goal: existing?.goal ?? '',
-      state: existing?.state ?? 'failed',
-      fencingEpoch: existing?.fencingEpoch ?? 0,
-      generation: (existing?.generation ?? 0) + 1,
-      expiresAt: this.now() + this.terminalTtlMs,
+      parentSessionKey: existing?.parentSessionKey ?? pending?.parentSessionKey ?? '',
+      sessionId: existing?.sessionId ?? pending?.sessionId ?? '',
+      userId: existing?.userId ?? pending?.userId ?? '',
+      runId: existing?.runId ?? pending?.runId ?? defaultRunId(jobId),
+      agentId: existing?.agentId ?? pending?.agentId ?? '',
+      goal: existing?.goal ?? pending?.goal ?? '',
+      state: existing?.state ?? pending?.state ?? 'failed',
+      fencingEpoch: existing?.fencingEpoch ?? pending?.fencingEpoch ?? 0,
+      generation: (existing?.generation ?? pending?.generation ?? 0) + 1,
+      expiresAt: existing?.expiresAt ?? pending?.expiresAt ?? this.now() + this.terminalTtlMs,
     })
-    return Boolean(existing)
+    return Boolean(existing || pending)
+  }
+
+  /**
+   * Retry any in-memory pending tombstones. Production uses a short unref'd
+   * timer; tests call this after releasing a writer lock. Returns remaining.
+   */
+  flushPendingTombstones(): number {
+    if (this.tombstoneRetryTimer) {
+      clearTimeout(this.tombstoneRetryTimer)
+      this.tombstoneRetryTimer = null
+    }
+    for (const [jobId, row] of [...this.pendingTombstones]) {
+      if (this.tryPersistTombstone(row)) this.pendingTombstones.delete(jobId)
+    }
+    if (this.pendingTombstones.size > 0 && !this.closed) this.scheduleTombstoneRetry()
+    return this.pendingTombstones.size
   }
 
   sweepExpired(now: number = this.now()): number {
@@ -980,6 +1017,17 @@ export class DelegateInflightSurfaceStore {
       }
     }
     for (const job of live.values()) {
+      if (this.consumeTombstone(job.id)) continue
+      // Durable job store is authority: a queued overlay whose job is gone
+      // must not resurrect the slot even if the tombstone write is still pending.
+      if (
+        job.state === 'queued' &&
+        typeof opts.resolveJob === 'function' &&
+        !opts.resolveJob(job.id)
+      ) {
+        this.drop(job.id)
+        continue
+      }
       const existing = this.byJob.get(job.id)
       this.upsertEnqueue({
         jobId: job.id,
@@ -1014,6 +1062,7 @@ export class DelegateInflightSurfaceStore {
   close(): void {
     if (this.closed) return
     this.closed = true
+    this.flushPendingTombstones()
     try {
       // PASSIVE: never truncate WAL while another gateway handle may still
       // hold the file. TRUNCATE here was able to hide a committed terminal
@@ -1073,7 +1122,7 @@ export class DelegateInflightSurfaceStore {
    * the in-memory fence would otherwise skip persist().
    */
   private consumeTombstone(jobId: string): boolean {
-    if (this.droppedJobs.has(jobId)) {
+    if (this.droppedJobs.has(jobId) || this.pendingTombstones.has(jobId)) {
       this.byJob.delete(jobId)
       return true
     }
@@ -1100,21 +1149,28 @@ export class DelegateInflightSurfaceStore {
     }
   }
 
-  private persistTombstone(row: {
-    jobId: string
-    parentSessionKey: string
-    sessionId: string
-    userId: string
-    runId: string
-    agentId: string
-    goal: string
-    state: DelegateJobState
-    fencingEpoch: number
-    generation: number
-    expiresAt: number
-  }): void {
+  private queueTombstone(row: TombstoneWrite): void {
+    this.pendingTombstones.set(row.jobId, row)
+    if (this.tryPersistTombstone(row)) {
+      this.pendingTombstones.delete(row.jobId)
+      return
+    }
+    this.scheduleTombstoneRetry()
+  }
+
+  private scheduleTombstoneRetry(): void {
+    if (this.closed || this.tombstoneRetryTimer || this.pendingTombstones.size === 0) return
+    this.tombstoneRetryTimer = setTimeout(() => {
+      this.tombstoneRetryTimer = null
+      this.flushPendingTombstones()
+    }, TOMBSTONE_RETRY_MS)
+    this.tombstoneRetryTimer.unref?.()
+  }
+
+  private tryPersistTombstone(row: TombstoneWrite): boolean {
+    if (!this.tombstoneStmt) return true
     try {
-      this.tombstoneStmt?.run({
+      this.tombstoneStmt.run({
         job_id: row.jobId,
         parent_session_key: row.parentSessionKey,
         session_id: row.sessionId,
@@ -1128,8 +1184,10 @@ export class DelegateInflightSurfaceStore {
         generation: row.generation,
         expires_at: row.expiresAt,
       })
+      return true
     } catch (err) {
       this.noteWriteError(err, { phase: 'tombstone', jobId: row.jobId })
+      return false
     }
   }
 
