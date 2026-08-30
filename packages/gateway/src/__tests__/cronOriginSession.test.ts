@@ -6,6 +6,8 @@ import {
   buildCronOriginResumeText,
   cronOriginClientMessageId,
   cronOriginIdempotencyKey,
+  decideCronOriginDispatchAfterPersist,
+  isCronOriginInjectAcked,
   isCronIsolatedSessionKey,
   parseOriginWebchatSessionKey,
   resolveCronOriginInjectPayload,
@@ -105,6 +107,34 @@ describe('cron continuation envelope', () => {
     assert.equal(payload.job.sourceUserId, 'uid-3')
     assert.equal(payload.job.projectMode, 'fixed')
     assert.equal(payload.job.boardProjectId, 'board-9')
+  })
+})
+
+describe('cron origin inject receipts', () => {
+  it('acks delivered/skipped/abandoned and not none/pending', () => {
+    assert.equal(isCronOriginInjectAcked('delivered'), true)
+    assert.equal(isCronOriginInjectAcked('skipped_silent'), true)
+    assert.equal(isCronOriginInjectAcked('abandoned'), true)
+    assert.equal(isCronOriginInjectAcked('none'), false)
+    assert.equal(isCronOriginInjectAcked('pending'), false)
+    assert.equal(isCronOriginInjectAcked('injecting'), false)
+    assert.equal(isCronOriginInjectAcked(undefined), false)
+  })
+
+  it('already_exists is a durable ACK and does not dispatch', () => {
+    assert.equal(decideCronOriginDispatchAfterPersist({ applied: true }), 'dispatch')
+    assert.equal(
+      decideCronOriginDispatchAfterPersist({ applied: false, reason: 'already_exists' }),
+      'ack_injected',
+    )
+    assert.equal(
+      decideCronOriginDispatchAfterPersist({ applied: false, reason: 'session_deleted' }),
+      'fallback',
+    )
+    assert.equal(
+      decideCronOriginDispatchAfterPersist({ applied: false, reason: 'malformed' }),
+      'retry_persist',
+    )
   })
 })
 

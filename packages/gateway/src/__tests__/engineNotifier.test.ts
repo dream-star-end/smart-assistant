@@ -34,7 +34,11 @@ import {
 import {
   buildCronContinuationEnvelope,
   buildCronOriginResumeText,
+  cronOriginClientMessageId,
+  cronOriginIdempotencyKey,
   CRON_CALLBACK_LEGACY_LANE,
+  decideCronOriginDispatchAfterPersist,
+  isCronOriginInjectAcked,
   parseOriginWebchatSessionKey,
   resolveCronOriginInjectPayload,
 } from '../cronOriginSession.js'
@@ -1454,8 +1458,9 @@ describe('stage 2 review blockers: cron generation migration + continuation', ()
       prev = first.prev
       assert.equal(legacyInjects, 1)
       assert.equal(first.snap.state, 'queued')
-      assert.equal(first.snap.callbackState, 'none')
+      assert.equal(first.snap.callbackState, 'delivered')
       assert.equal(first.snap.notifyLane, CRON_CALLBACK_LEGACY_LANE)
+      assert.equal(isCronOriginInjectAcked(first.snap.callbackState), true)
       first.store.close()
 
       process.env.OC_DELEGATE_NOTIFIER = '1'
@@ -1467,6 +1472,31 @@ describe('stage 2 review blockers: cron generation migration + continuation', ()
         leaseMs: 1_000,
       })
       assert.equal(boot.snapshotOf(first.enq.jobId)?.notifyLane, CRON_CALLBACK_LEGACY_LANE)
+      assert.equal(boot.snapshotOf(first.enq.jobId)?.callbackState, 'delivered')
+      const { CronScheduler } = await import('../cron.js')
+      const scheduler = new CronScheduler(
+        { defaults: { model: 'glm-5.2' } } as any,
+        { getOrCreate: async () => ({}), submit: async () => {}, destroySession: async () => {} } as any,
+        () => {},
+        async () => {
+          legacyInjects += 1
+          return { kind: 'injected' as const }
+        },
+      )
+      scheduler.delegateJobs = boot
+      const delivery = { dueMinuteKey: 123, deliveryId: `cron.${first.job.id}.123` }
+      const second = await (scheduler as any).runJob(first.job, { id: 'main', model: 'glm-5.2' }, {
+        consumeOccurrence: async () => {},
+        markSubmitStarted: async () => {
+          const claimed = boot.claimQueued(first.enq.jobId)
+          assert.equal(claimed.ok, true)
+          throw new Error('simulated crash after skip-inject claim')
+        },
+        markCompleted: async () => {},
+        markDelivered: async () => {},
+      }, delivery)
+      assert.equal(second.kind, 'retryable_failure')
+      assert.equal(legacyInjects, 1)
       const dispatched = await settleThenDispatch(boot, first.enq.jobId, first.job)
       assert.equal('ok' in dispatched.result && dispatched.result.ok, true)
       assert.equal(dispatched.dlgcbIds.length, 0)
@@ -1496,6 +1526,8 @@ describe('stage 2 review blockers: cron generation migration + continuation', ()
       prev = first.prev
       assert.equal(legacyInjects, 0)
       assert.equal(first.snap.state, 'queued')
+      assert.equal(first.snap.callbackState, 'none')
+      assert.equal(isCronOriginInjectAcked(first.snap.callbackState), false)
       assert.equal(first.snap.notifyLane, CRON_CALLBACK_LEGACY_LANE)
       first.store.close()
 
@@ -1655,6 +1687,51 @@ describe('stage 2 review blockers: cron generation migration + continuation', ()
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
+  })
+
+  it('blocker1 local already_exists across restart ACKs without dispatch', () => {
+    const durableMessages = new Set<string>()
+    const dispatches: string[] = []
+    const deliveryId = 'cron.remind-local-restart.123'
+    const clientMessageId = cronOriginClientMessageId(deliveryId)
+    const idempotencyKey = cronOriginIdempotencyKey('remind-local-restart', deliveryId)
+
+    function persistOnce(): { applied: boolean; reason?: string } {
+      if (durableMessages.has(clientMessageId)) {
+        return { applied: false, reason: 'already_exists' }
+      }
+      durableMessages.add(clientMessageId)
+      return { applied: true }
+    }
+
+    function injectOnce(processSeen: Set<string>): 'dispatch' | 'ack_injected' | 'fallback' | 'retry_persist' {
+      const persist = persistOnce()
+      const decision = decideCronOriginDispatchAfterPersist(persist)
+      if (decision === 'dispatch') {
+        if (!processSeen.has(idempotencyKey)) {
+          processSeen.add(idempotencyKey)
+          dispatches.push(idempotencyKey)
+        }
+      }
+      return decision
+    }
+
+    const proc1 = new Set<string>()
+    assert.equal(injectOnce(proc1), 'dispatch')
+    assert.equal(dispatches.length, 1)
+
+    const proc2 = new Set<string>()
+    assert.equal(injectOnce(proc2), 'ack_injected')
+    assert.equal(dispatches.length, 1)
+    assert.equal(decideCronOriginDispatchAfterPersist({ applied: true }), 'dispatch')
+    assert.equal(
+      decideCronOriginDispatchAfterPersist({ applied: false, reason: 'session_deleted' }),
+      'fallback',
+    )
+    assert.equal(
+      decideCronOriginDispatchAfterPersist({ applied: false, reason: 'malformed' }),
+      'retry_persist',
+    )
   })
 
   it('blocker2: >8K resume text keeps UNIQUE_SUFFIX; resultRef stays display-truncated', async () => {

@@ -91,6 +91,34 @@ export function isLegacyCronOriginLane(lane: string | undefined): boolean {
   return lane === CRON_CALLBACK_LEGACY_LANE
 }
 
+/**
+ * Completer inject-success receipt. Survives restart without an execution
+ * claim, so CronScheduler can tell "stamped, not yet injected" (retry same
+ * leg) from "injected, not yet settled" (ACK, do not re-fire).
+ */
+export function isCronOriginInjectAcked(callbackState: string | undefined): boolean {
+  return (
+    callbackState === 'delivered' ||
+    callbackState === 'skipped_silent' ||
+    callbackState === 'abandoned'
+  )
+}
+
+/**
+ * Local origin-session persist receipt. `already_exists` is the durable
+ * consumer-side idempotency key (sessions.db message id), not the process
+ * Map in dispatchInbound. A replay must ACK and must not open a second turn.
+ */
+export function decideCronOriginDispatchAfterPersist(persist: {
+  applied: boolean
+  reason?: string
+}): 'dispatch' | 'ack_injected' | 'fallback' | 'retry_persist' {
+  if (persist.applied) return 'dispatch'
+  if (persist.reason === 'already_exists') return 'ack_injected'
+  if (persist.reason === 'session_deleted') return 'fallback'
+  return 'retry_persist'
+}
+
 export function buildCronContinuationEnvelope(
   job: {
     id: string

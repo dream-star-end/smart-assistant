@@ -1729,8 +1729,10 @@ export class CronScheduler {
                   }),
                 }
               : undefined
-            const legacyDelivered =
-              originCompleted && !isDelegateNotifierEffective()
+            const snapAtSettle = this.delegateJobs.snapshotOf(dlg)
+            const keepDelivered =
+              snapAtSettle?.callbackState === 'delivered' ||
+              (originCompleted && !isDelegateNotifierEffective())
             settleCronDelegateJob(
               this.delegateJobs,
               dlg,
@@ -1738,7 +1740,7 @@ export class CronScheduler {
               fence,
               failed && 'code' in outcome ? String(outcome.code) : undefined,
               extraBody,
-              legacyDelivered ? { callbackState: 'delivered' } : undefined,
+              keepDelivered ? { callbackState: 'delivered' } : undefined,
             )
           }
           // A one-shot remains enabled across retryable failures. Completed,
@@ -1870,19 +1872,41 @@ export class CronScheduler {
   }
 
   /**
+   * Durable inject-success receipt. Written immediately after Completer
+   * origin-session fire returns injected, still without claiming the
+   * execution lease. Restart seeing callback_state=delivered must settle
+   * without calling onOriginSessionFire again.
+   */
+  private ackLegacyCronInject(jobId: string): boolean {
+    if (!this.delegateJobs) return false
+    if (!this.stampLegacyCronGeneration(jobId)) return false
+    const snap = this.delegateJobs.snapshotOf(jobId)
+    if (!snap) return false
+    if (snap.callbackState === 'delivered') return true
+    const fence = snap.claimToken
+      ? { claimToken: snap.claimToken, fencingEpoch: snap.fencingEpoch }
+      : undefined
+    return this.delegateJobs.patchCallbackState(jobId, 'delivered', fence)
+  }
+
+  /**
    * origin-session fire: inject a new inbound into the creating conversation.
    * If that conversation is gone, skip (do not isolated-run / lastActive-broadcast),
    * disable recurring jobs (the origin can never come back) and leave a status
    * notice so the task does not vanish silently.
    *
    * Ordering: stamp the Completer generation (legacy-completer) BEFORE inject;
-   * inject BEFORE markSubmitStarted. A retryable inject failure (session busy,
-   * network, master down) leaves the occurrence 'prepared', lastRun untouched,
-   * and the job queued, so the same leg retries this deliveryId. Replay safety
-   * comes from the stable clientMessageId plus the durable lane: flag-on boot
-   * seeing legacy-completer keeps the Completer key instead of dlgcb.*. After
-   * a restart, 'executing' and 'completed' origin occurrences settle without
-   * re-dispatch (at-most-once, see the recovery block in checkAndRun).
+   * write callback_state=delivered immediately AFTER inject success; claim via
+   * markSubmitStarted only after that receipt. A retryable inject failure
+   * (session busy, network, master down) leaves the occurrence 'prepared',
+   * lastRun untouched, and the job queued, so the same leg retries this
+   * deliveryId. Restart distinguishes:
+   *   - stamped + callback none → retry Completer key once (inject not done)
+   *   - stamped + callback delivered → ACK, do not re-fire (inject done)
+   * Flag-on boot seeing legacy-completer still keeps the Completer key instead
+   * of dlgcb-replay. After a restart, 'executing' and 'completed' origin
+   * occurrences settle without re-dispatch (at-most-once, see the recovery
+   * block in checkAndRun).
    */
   private async runOriginSessionJob(
     job: CronJob,
@@ -1904,25 +1928,31 @@ export class CronScheduler {
     const dlgJobId = this.resolveCronDelegateJobId(job, deliveryContext)
     const dlgSnap =
       dlgJobId && this.delegateJobs ? this.delegateJobs.snapshotOf(dlgJobId) : undefined
+    const injectAcked = dlgSnap?.callbackState === 'delivered'
     const legacyOwned = isLegacyCronOriginLane(dlgSnap?.notifyLane)
     // Flag-on Completer skips inject only when this occurrence is not already
     // owned by the Completer generation. A pre-inject crash that stamped
     // legacy-completer must retry the same leg / same cron-origin-* key.
-    const useLegacyLeg = !isDelegateNotifierEffective() || legacyOwned
-    if (useLegacyLeg && dlgJobId) this.stampLegacyCronGeneration(dlgJobId)
+    // A post-inject crash that already wrote delivered must not re-fire.
+    const useLegacyLeg = !isDelegateNotifierEffective() || (legacyOwned && !injectAcked)
     let result: CronOriginFireResult
     try {
-      if (!useLegacyLeg) {
-        result = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
-          ? { kind: 'injected' }
-          : { kind: 'fallback' }
+      if (injectAcked) {
+        result = { kind: 'injected' }
       } else {
-        const fireJob: CronJob = {
-          ...job,
-          projectMode: project.mode,
-          boardProjectId: project.mode === 'fixed' ? project.boardProjectId : null,
+        if (useLegacyLeg && dlgJobId) this.stampLegacyCronGeneration(dlgJobId)
+        if (!useLegacyLeg) {
+          result = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
+            ? { kind: 'injected' }
+            : { kind: 'fallback' }
+        } else {
+          const fireJob: CronJob = {
+            ...job,
+            projectMode: project.mode,
+            boardProjectId: project.mode === 'fixed' ? project.boardProjectId : null,
+          }
+          result = await this.onOriginSessionFire!(fireJob, deliveryContext)
         }
-        result = await this.onOriginSessionFire!(fireJob, deliveryContext)
       }
     } catch (err) {
       logger.warn(`job ${job.id} origin-session inject threw`, {
@@ -1933,6 +1963,20 @@ export class CronScheduler {
     }
     if (result.kind === 'retryable_failure' || result.kind === 'terminal_failure') {
       return result
+    }
+    if (
+      !injectAcked &&
+      useLegacyLeg &&
+      result.kind === 'injected' &&
+      dlgJobId &&
+      this.delegateJobs
+    ) {
+      if (!this.ackLegacyCronInject(dlgJobId)) {
+        logger.warn(`job ${job.id} origin-session inject ack failed`, {
+          jobId: job.id,
+        })
+        return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_ACK_FAILED' }
+      }
     }
     const skipped = result.kind === 'fallback'
     try {

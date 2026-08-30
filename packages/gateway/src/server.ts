@@ -312,6 +312,7 @@ import {
   buildCronOriginResumeText,
   cronOriginClientMessageId,
   cronOriginIdempotencyKey,
+  decideCronOriginDispatchAfterPersist,
   parseOriginWebchatSessionKey,
   resolveCronOriginInjectPayload,
   type CronOriginFireResult,
@@ -13108,13 +13109,15 @@ export class Gateway {
         ts: Date.now(),
       })
       if (!persisted.applied) {
-        if (persisted.reason === 'already_exists') {
-          // retry of the same occurrence — continue to dispatch (idempotent)
-        } else if (persisted.reason === 'session_deleted') {
-          return { kind: 'fallback' }
-        } else {
-          return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+        const decision = decideCronOriginDispatchAfterPersist(persisted)
+        if (decision === 'ack_injected') {
+          // Durable consumer-side idempotency: same clientMessageId already
+          // in sessions.db. ACK and do not dispatch a second turn. The
+          // process Map in dispatchInbound is not restart-safe.
+          return { kind: 'injected' }
         }
+        if (decision === 'fallback') return { kind: 'fallback' }
+        return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
       }
     } catch (err) {
       this.log.warn('origin-session persist failed', { jobId: job.id }, err as Error)
