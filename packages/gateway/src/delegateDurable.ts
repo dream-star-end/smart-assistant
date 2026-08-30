@@ -25,7 +25,7 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 2
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 3
 
 export type DurableJobRecord = {
   id: string
@@ -62,6 +62,8 @@ export type DurableJobRecord = {
   notifyDeliveryToken?: string
   notifyClaimedUntil?: number | null
   terminalCommittedAt?: number
+  /** Unix ms when lane A attempted an external write for this notifyId. */
+  notifyAAttemptedAt?: number | null
 }
 
 const DDL_V1 = `
@@ -99,7 +101,8 @@ CREATE TABLE IF NOT EXISTS delegate_jobs (
   notify_attempt INTEGER NOT NULL DEFAULT 0,
   notify_delivery_token TEXT,
   notify_claimed_until INTEGER,
-  terminal_committed_at INTEGER
+  terminal_committed_at INTEGER,
+  notify_a_attempted_at INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_delegate_jobs_idempotency
   ON delegate_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;
@@ -129,6 +132,7 @@ export class DelegateDurableDb {
   private readonly casClaimNotifyStmt
   private readonly casCompleteNotifyStmt
   private readonly casReleaseNotifyStmt
+  private readonly casMarkAAttemptedStmt
   private readonly getStmt
   private readonly getByIdemStmt
   private readonly listStmt
@@ -330,6 +334,22 @@ export class DelegateDurableDb {
         AND notify_delivery_token=@delivery_token
       RETURNING *
     `)
+    this.casMarkAAttemptedStmt = this.db.prepare(`
+      UPDATE delegate_jobs SET
+        notify_a_attempted_at=COALESCE(notify_a_attempted_at, @now),
+        last_activity_at=@now,
+        updated_at=@now
+      WHERE job_id=@job_id
+        AND state=@expected_state
+        AND fencing_epoch=@expected_epoch
+        AND (
+          (@expected_token IS NULL AND claim_token IS NULL)
+          OR claim_token=@expected_token
+        )
+        AND callback_state='injecting'
+        AND notify_delivery_token=@delivery_token
+      RETURNING *
+    `)
     this.getStmt = this.db.prepare('SELECT * FROM delegate_jobs WHERE job_id = ?')
     this.getByIdemStmt = this.db.prepare(
       'SELECT * FROM delegate_jobs WHERE idempotency_key = ? LIMIT 1',
@@ -350,6 +370,7 @@ export class DelegateDurableDb {
     const apply = this.db.transaction(() => {
       if (current < 1) this.db.exec(DDL_V1)
       if (current < 2) this.addNotifyDeliveryColumns()
+      if (current < 3) this.addNotifyAAttemptedColumn()
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
     apply()
@@ -374,6 +395,16 @@ export class DelegateDurableDb {
       if (existing.has(name)) continue
       this.db.exec(`ALTER TABLE delegate_jobs ADD COLUMN ${name} ${type}`)
     }
+  }
+
+  private addNotifyAAttemptedColumn(): void {
+    const existing = new Set(
+      (this.db.prepare('PRAGMA table_info(delegate_jobs)').all() as Array<{ name: string }>).map(
+        (row) => row.name,
+      ),
+    )
+    if (existing.has('notify_a_attempted_at')) return
+    this.db.exec('ALTER TABLE delegate_jobs ADD COLUMN notify_a_attempted_at INTEGER')
   }
 
   transaction<T>(fn: () => T): T {
@@ -520,6 +551,26 @@ export class DelegateDurableDb {
     return row ? fromRow(row) : undefined
   }
 
+  casMarkAAttempted(args: {
+    jobId: string
+    state: string
+    fencingEpoch: number
+    claimToken?: string | null
+    deliveryToken: string
+    now: number
+  }): DurableJobRecord | undefined {
+    this.throwIfInjectedFailure()
+    const row = this.casMarkAAttemptedStmt.get({
+      job_id: args.jobId,
+      expected_state: args.state,
+      expected_epoch: args.fencingEpoch,
+      expected_token: args.claimToken ?? null,
+      delivery_token: args.deliveryToken,
+      now: args.now,
+    }) as Record<string, unknown> | undefined
+    return row ? fromRow(row) : undefined
+  }
+
   countNonTerminal(): number {
     const row = this.countActiveStmt.get() as { n?: number } | undefined
     return Number(row?.n ?? 0)
@@ -615,6 +666,7 @@ function toRow(record: DurableJobRecord): Record<string, unknown> {
     notify_delivery_token: record.notifyDeliveryToken ?? null,
     notify_claimed_until: record.notifyClaimedUntil ?? null,
     terminal_committed_at: record.terminalCommittedAt ?? null,
+    notify_a_attempted_at: record.notifyAAttemptedAt ?? null,
   }
 }
 
@@ -662,6 +714,7 @@ function fromRow(row: Record<string, unknown>): DurableJobRecord {
     notifyDeliveryToken: str(row.notify_delivery_token),
     notifyClaimedUntil: row.notify_claimed_until == null ? null : num(row.notify_claimed_until),
     terminalCommittedAt: row.terminal_committed_at == null ? undefined : num(row.terminal_committed_at),
+    notifyAAttemptedAt: row.notify_a_attempted_at == null ? null : num(row.notify_a_attempted_at),
   }
 }
 

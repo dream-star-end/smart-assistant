@@ -10,6 +10,8 @@
  * BeginCutover freeze + runningDelegateJobs drain (requires SM && DURABLE && NOTIFIER).
  * OC_DELEGATE_INFLIGHT_SURFACE=0 (default) keeps today's turn_status working-detail
  * only; 1 dual-writes a session-level inflight slot (design v3 §N4 / R2).
+ * OC_DELEGATE_INLINE_PUSH_CCB=0 / OC_DELEGATE_INLINE_PUSH_CODEX=0 (default)
+ * keep the R0/R1 duck-type stdin probe; 1 uses EngineAdapter.writeDelegateTerminal.
  * Production semantics require both SM and durable on (design v3 §4).
  * Resume occupancy + idempotency is a bugfix and is always on.
  */
@@ -66,6 +68,34 @@ export function isDelegateInflightSurfaceEnabled(env: NodeJS.ProcessEnv = proces
 
 export function isDelegateInflightSurfaceEffective(env: NodeJS.ProcessEnv = process.env): boolean {
   return isDelegateInflightSurfaceEnabled(env)
+}
+
+function envFlagOn(env: NodeJS.ProcessEnv, key: string): boolean {
+  const raw = String(env[key] ?? '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'on'
+}
+
+/**
+ * R3 档 A InlinePush. Default off per engine. A lone flag is a no-op until
+ * EngineNotifier is effective (SM && DURABLE && NOTIFIER); server wiring
+ * only reaches this predicate from the notifier port.
+ * Flag-off keeps the R0/R1 duck-type stdin probe (653ef6339 equivalent).
+ */
+export function isDelegateInlinePushCcbEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return envFlagOn(env, 'OC_DELEGATE_INLINE_PUSH_CCB')
+}
+
+export function isDelegateInlinePushCodexEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return envFlagOn(env, 'OC_DELEGATE_INLINE_PUSH_CODEX')
+}
+
+export function isDelegateInlinePushEnabled(
+  engine: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (engine === 'ccb') return isDelegateInlinePushCcbEnabled(env)
+  if (engine === 'codex') return isDelegateInlinePushCodexEnabled(env)
+  return false
 }
 
 export function resolveDelegateCallbackOwner(

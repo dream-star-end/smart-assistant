@@ -152,6 +152,7 @@ export type DelegateJobSnapshot = {
   notifyDeliveryToken?: string
   notifyClaimedUntil?: number | null
   terminalCommittedAt?: number
+  notifyAAttemptedAt?: number | null
 }
 
 type JobEntry = {
@@ -189,6 +190,7 @@ type JobEntry = {
   notifyDeliveryToken?: string
   notifyClaimedUntil?: number | null
   terminalCommittedAt?: number | null
+  notifyAAttemptedAt?: number | null
 }
 
 export type DelegateJobStoreOptions = {
@@ -530,6 +532,19 @@ export class DelegateJobStore {
   isDispatchFrozen(): boolean {
     this.purgeExpiredFreezeHolders()
     return this.freezeHolders.size > 0
+  }
+
+  /**
+   * Runtime cutover/drain window. Feature flag OC_DELEGATE_CUTOVER being on
+   * is not a window — only a live `cutover:<generation>` or `drain:<n>` freeze
+   * holder disables InlinePush.
+   */
+  hasActiveCutoverWindow(): boolean {
+    this.purgeExpiredFreezeHolders()
+    for (const holder of this.freezeHolders.keys()) {
+      if (holder.startsWith('cutover:') || holder.startsWith('drain:')) return true
+    }
+    return false
   }
 
   attachRunner(jobId: string, claimToken: string, fencingEpoch: number): void {
@@ -903,6 +918,7 @@ export class DelegateJobStore {
       notifyDeliveryToken: job.notifyDeliveryToken,
       notifyClaimedUntil: job.notifyClaimedUntil,
       terminalCommittedAt: job.terminalCommittedAt ?? undefined,
+      notifyAAttemptedAt: job.notifyAAttemptedAt ?? undefined,
     }
   }
 
@@ -1184,6 +1200,67 @@ export class DelegateJobStore {
     return true
   }
 
+  /**
+   * Slow-A fence: the claimed delivery token is still the exclusive owner.
+   * Reads durable so a second store on the same SQLite can invalidate the
+   * first writer after reclaim. Delivered or expired claims are not live.
+   */
+  isNotifyClaimLive(jobId: string, deliveryToken: string): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job) return false
+    if (job.callbackState === 'delivered' || job.callbackState === 'abandoned') return false
+    if (job.callbackState !== 'injecting') return false
+    if (job.notifyDeliveryToken !== deliveryToken) return false
+    const now = this.now()
+    if (job.notifyClaimedUntil != null && job.notifyClaimedUntil <= now) return false
+    return true
+  }
+
+  hasNotifyAAttempted(jobId: string): boolean {
+    const job = this.refreshJob(jobId)
+    return job != null && job.notifyAAttemptedAt != null && job.notifyAAttemptedAt > 0
+  }
+
+  /**
+   * Durable a_attempted stamp. Must run before the external A write so a
+   * crash/reclaim can skip a second stdin push and consult parent tape.
+   */
+  markNotifyAAttempted(
+    jobId: string,
+    deliveryToken: string,
+    fence?: { claimToken: string; fencingEpoch: number },
+  ): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job) return false
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        return false
+      }
+    }
+    if (job.callbackState !== 'injecting' || job.notifyDeliveryToken !== deliveryToken) return false
+    if (job.notifyAAttemptedAt != null && job.notifyAAttemptedAt > 0) return true
+    const now = this.now()
+    if (this.durable) {
+      const row = this.durable.casMarkAAttempted({
+        jobId,
+        state: job.state,
+        fencingEpoch: job.fencingEpoch,
+        claimToken: job.claimToken ?? null,
+        deliveryToken,
+        now,
+      })
+      if (!row) {
+        this.refreshJob(jobId)
+        return this.hasNotifyAAttempted(jobId)
+      }
+      this.ingestDurableRow(row)
+      return true
+    }
+    job.notifyAAttemptedAt = now
+    job.lastActivityAt = now
+    return true
+  }
+
   releaseNotifyClaim(
     jobId: string,
     deliveryToken: string,
@@ -1289,6 +1366,7 @@ export class DelegateJobStore {
       notifyDeliveryToken: snap.notifyDeliveryToken,
       notifyClaimedUntil: snap.notifyClaimedUntil ?? null,
       terminalCommittedAt: snap.terminalCommittedAt ?? null,
+      notifyAAttemptedAt: snap.notifyAAttemptedAt ?? null,
     })
     if (snap.idempotencyKey) this.byIdempotency.set(snap.idempotencyKey, snap.id)
   }
@@ -1344,6 +1422,7 @@ export class DelegateJobStore {
       notifyDeliveryToken: row.notifyDeliveryToken,
       notifyClaimedUntil: row.notifyClaimedUntil,
       terminalCommittedAt: row.terminalCommittedAt,
+      notifyAAttemptedAt: row.notifyAAttemptedAt ?? undefined,
     }
   }
 
@@ -1493,6 +1572,7 @@ export class DelegateJobStore {
       notifyDeliveryToken: snap.notifyDeliveryToken,
       notifyClaimedUntil: snap.notifyClaimedUntil ?? null,
       terminalCommittedAt: snap.terminalCommittedAt ?? null,
+      notifyAAttemptedAt: snap.notifyAAttemptedAt ?? null,
     }
   }
 
@@ -1533,6 +1613,7 @@ export class DelegateJobStore {
       notifyDeliveryToken: job.notifyDeliveryToken,
       notifyClaimedUntil: job.notifyClaimedUntil ?? null,
       terminalCommittedAt: job.terminalCommittedAt ?? undefined,
+      notifyAAttemptedAt: job.notifyAAttemptedAt ?? null,
     }
   }
 }

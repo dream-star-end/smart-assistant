@@ -5,6 +5,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/engineNotifier.test.ts
  */
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -18,13 +19,26 @@ import {
 } from '@openclaude/protocol'
 import { decideSendToAgentIntentRecovery } from '../delegateCallbackOwner.js'
 import { DelegateDurableDb } from '../delegateDurable.js'
+import { cutoverFreezeHolder } from '../delegateCutover.js'
 import { DelegateJobStore, nextNotifyBackoffMs, NOTIFY_CLAIM_LEASE_MS } from '../delegateJobs.js'
+import { SubprocessRunner } from '../subprocessRunner.js'
+import { CodexAppServerRunner } from '../engine/codexAppServerRunner.js'
 import {
   delayUntilNextNotifyRetry,
   dispatchJobTerminalNotify,
   retryPendingNotifies,
 } from '../delegateNotifyDispatch.js'
-import { DefaultEngineNotifier, tryWriteInlinePush } from '../engineNotifier.js'
+import {
+  DefaultEngineNotifier,
+  TAPE_ORACLE_UNKNOWN_HOLD_MS,
+  buildCcbInlinePushUserLine,
+  buildCodexDelegateTerminalNotification,
+  notifyClaimFenceOf,
+  tryWriteInlinePush,
+  writeInlinePushForSession,
+} from '../engineNotifier.js'
+import { CcbAdapter } from '../engine/ccbAdapter.js'
+import { CodexAdapter } from '../engine/codexAdapter.js'
 import {
   buildJobTerminalFromSnapshot,
   formatJobTerminalMarkdown,
@@ -50,7 +64,11 @@ import {
 import {
   isDelegateNotifierEffective,
   isDelegateDurableEffective,
+  isDelegateInlinePushCcbEnabled,
+  isDelegateInlinePushCodexEnabled,
+  isDelegateInlinePushEnabled,
 } from '../delegateSmFlag.js'
+import { parentTapeHasNotifyId, type ParentTapeIngestState } from '../delegateNotifyTape.js'
 
 function terminalEvent(over: Partial<JobTerminal> = {}): JobTerminal {
   return {
@@ -122,6 +140,20 @@ describe('OC_DELEGATE_NOTIFIER flag', () => {
   })
 })
 
+describe('OC_DELEGATE_INLINE_PUSH_* flags', () => {
+  it('defaults off; each engine is independent; cursor never enables', () => {
+    assert.equal(isDelegateInlinePushCcbEnabled({}), false)
+    assert.equal(isDelegateInlinePushCodexEnabled({}), false)
+    assert.equal(isDelegateInlinePushEnabled('ccb', {}), false)
+    assert.equal(isDelegateInlinePushEnabled('codex', {}), false)
+    assert.equal(isDelegateInlinePushEnabled('cursor', { OC_DELEGATE_INLINE_PUSH_CCB: '1' }), false)
+    assert.equal(isDelegateInlinePushEnabled('ccb', { OC_DELEGATE_INLINE_PUSH_CCB: '1' }), true)
+    assert.equal(isDelegateInlinePushEnabled('codex', { OC_DELEGATE_INLINE_PUSH_CCB: '1' }), false)
+    assert.equal(isDelegateInlinePushEnabled('codex', { OC_DELEGATE_INLINE_PUSH_CODEX: 'true' }), true)
+    assert.equal(isDelegateInlinePushEnabled('ccb', { OC_DELEGATE_INLINE_PUSH_CODEX: '1' }), false)
+  })
+})
+
 describe('档 A InlinePush', () => {
   it('writes stdin and records notifyId; second call is a no-op', async () => {
     const writes: string[] = []
@@ -170,8 +202,8 @@ describe('档 A InlinePush', () => {
     assert.deepEqual(resumes, ['dlgnfy.dlgjob-n1.1'])
   })
 
-  // Test double only: production CcbAdapter/CodexAdapter hide proc/writeRaw
-  // on private inner runners (R3). This duck-type is not a live InlinePush port.
+  // Flag-off path: duck-type probe, equivalent to 653ef6339. Production adapters
+  // still hide proc/writeRaw; live 档 A is writeDelegateTerminal behind the flags.
   it('tryWriteInlinePush writes a CCB user JSONL line when stdin is writable', async () => {
     const chunks: string[] = []
     const session = {
@@ -209,6 +241,1133 @@ describe('档 A InlinePush', () => {
     const result = await tryWriteInlinePush(session, terminalEvent(), 'x')
     assert.equal(result.ok, false)
     assert.equal(result.processAlive, true)
+  })
+
+  it('flag-off writeInlinePushForSession keeps the duck-type path', async () => {
+    const chunks: string[] = []
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        proc: {
+          stdin: {
+            writable: true,
+            write(chunk: string, cb?: (err?: Error | null) => void) {
+              chunks.push(chunk)
+              cb?.(null)
+              return true
+            },
+          },
+        },
+      },
+    }
+    const event = terminalEvent()
+    const result = await writeInlinePushForSession(session, event, formatJobTerminalMarkdown(event), {})
+    assert.equal(result.ok, true)
+    assert.equal(chunks.length, 1)
+  })
+
+  it('flag-on does not use duck-type stdin even when proc is writable', async () => {
+    const duck: string[] = []
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: true,
+        proc: {
+          stdin: {
+            writable: true,
+            write(chunk: string, cb?: (err?: Error | null) => void) {
+              duck.push(chunk)
+              cb?.(null)
+              return true
+            },
+          },
+        },
+      },
+    }
+    const result = await writeInlinePushForSession(
+      session,
+      terminalEvent(),
+      'BODY',
+      { OC_DELEGATE_INLINE_PUSH_CCB: '1' },
+    )
+    assert.equal(result.ok, false)
+    assert.equal(result.processAlive, true)
+    assert.deepEqual(duck, [])
+  })
+
+  it('CCB flag-on adapter success is lane A; second notify is not a second write', async () => {
+    const writes: string[] = []
+    let resumes = 0
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: true,
+        writeDelegateTerminal: async (_event: JobTerminal, body: string) => {
+          writes.push(body)
+          return { ok: true, processAlive: true }
+        },
+      },
+    }
+    const env = { OC_DELEGATE_INLINE_PUSH_CCB: '1' }
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: (event) => writeInlinePushForSession(session, event, formatJobTerminalMarkdown(event), env),
+      },
+      resumeInject: {
+        inject: async () => {
+          resumes += 1
+          throw new Error('must not resume-inject on A success')
+        },
+      },
+    })
+    const event = terminalEvent({ parentEngine: 'ccb' })
+    const first = await notifier.notify(event)
+    assert.equal(first.ok, true)
+    if (!first.ok) return
+    assert.equal(first.lane, 'inline-push')
+    assert.equal(first.notifyId, delegateNotifyId(event.jobId, event.callbackEpoch))
+    const second = await notifier.notify(event)
+    assert.equal(second.ok, true)
+    assert.equal(writes.length, 1)
+    assert.equal(resumes, 0)
+    assert.match(writes[0]!, /<delegate-terminal jobId=dlgjob-n1/)
+  })
+
+  it('CCB flag-on adapter failure degrades to B with the same notifyId and does not double-send', async () => {
+    const resumes: string[] = []
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: false,
+        writeDelegateTerminal: async () => ({ ok: false, processAlive: false }),
+      },
+    }
+    const env = { OC_DELEGATE_INLINE_PUSH_CCB: '1' }
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: (event) => writeInlinePushForSession(session, event, 'BODY', env),
+      },
+      resumeInject: {
+        inject: async (event) => {
+          resumes.push(delegateNotifyId(event.jobId, event.callbackEpoch))
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(terminalEvent({ parentEngine: 'ccb' }))
+    assert.equal(result.ok, true)
+    if (!result.ok) return
+    assert.equal(result.lane, 'resume-inject')
+    assert.equal(result.notifyId, 'dlgnfy.dlgjob-n1.1')
+    assert.deepEqual(resumes, ['dlgnfy.dlgjob-n1.1'])
+  })
+
+  it('Codex flag-on writes delegate/terminal JSON-RPC and keeps notifyId', async () => {
+    const lines: string[] = []
+    const session = {
+      runner: {
+        engineId: 'codex',
+        isRunning: true,
+        writeDelegateTerminal: async (event: JobTerminal, body: string) => {
+          lines.push(buildCodexDelegateTerminalNotification(event, body))
+          return { ok: true, processAlive: true }
+        },
+      },
+    }
+    const env = { OC_DELEGATE_INLINE_PUSH_CODEX: '1' }
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: (event) => writeInlinePushForSession(session, event, 'BODY', env),
+      },
+      resumeInject: {
+        inject: async () => {
+          throw new Error('must not resume-inject on Codex A success')
+        },
+      },
+    })
+    const event = terminalEvent({ parentEngine: 'codex' })
+    const result = await notifier.notify(event)
+    assert.equal(result.ok, true)
+    if (!result.ok) return
+    assert.equal(result.lane, 'inline-push')
+    assert.equal(result.notifyId, 'dlgnfy.dlgjob-n1.1')
+    assert.equal(lines.length, 1)
+    const parsed = JSON.parse(lines[0]!) as {
+      jsonrpc: string
+      method: string
+      params: { jobId: string; notifyId: string; state: string }
+    }
+    assert.equal(parsed.jsonrpc, '2.0')
+    assert.equal(parsed.method, 'delegate/terminal')
+    assert.equal(parsed.params.jobId, 'dlgjob-n1')
+    assert.equal(parsed.params.notifyId, 'dlgnfy.dlgjob-n1.1')
+    assert.equal(parsed.params.state, 'completed')
+  })
+
+  it('flag quadrant: CCB on / Codex off does not share a write port', async () => {
+    const ccbWrites: string[] = []
+    const duck: string[] = []
+    const ccbSession = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: true,
+        writeDelegateTerminal: async (_e: JobTerminal, body: string) => {
+          ccbWrites.push(body)
+          return { ok: true, processAlive: true }
+        },
+      },
+    }
+    const codexSession = {
+      runner: {
+        engineId: 'codex',
+        writeRaw: async (line: string) => {
+          duck.push(line)
+        },
+      },
+    }
+    const env = { OC_DELEGATE_INLINE_PUSH_CCB: '1' }
+    const ccb = await writeInlinePushForSession(ccbSession, terminalEvent({ parentEngine: 'ccb' }), 'CCB', env)
+    const codex = await writeInlinePushForSession(
+      codexSession,
+      terminalEvent({ parentEngine: 'codex' }),
+      'CODEX',
+      env,
+    )
+    assert.equal(ccb.ok, true)
+    assert.deepEqual(ccbWrites, ['CCB'])
+    assert.equal(codex.ok, true)
+    assert.equal(duck.length, 1)
+    assert.match(duck[0]!, /delegate\/terminal/)
+  })
+
+  it('all flags on without a freeze window still uses lane A', async () => {
+    let adapterCalls = 0
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: true,
+        writeDelegateTerminal: async () => {
+          adapterCalls += 1
+          return { ok: true, processAlive: true }
+        },
+      },
+    }
+    const env = {
+      OC_DELEGATE_SM: '1',
+      OC_DELEGATE_DURABLE: '1',
+      OC_DELEGATE_NOTIFIER: '1',
+      OC_DELEGATE_CUTOVER: '1',
+      OC_DELEGATE_INLINE_PUSH_CCB: '1',
+    }
+    const pushed = await writeInlinePushForSession(session, terminalEvent(), 'BODY', env)
+    assert.equal(pushed.ok, true)
+    assert.equal(adapterCalls, 1)
+    const resumes: string[] = []
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: (event) => writeInlinePushForSession(session, event, 'BODY', env),
+      },
+      resumeInject: {
+        inject: async (event) => {
+          resumes.push(delegateNotifyId(event.jobId, event.callbackEpoch))
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(terminalEvent())
+    assert.equal(result.ok, true)
+    if (!result.ok) return
+    assert.equal(result.lane, 'inline-push')
+    assert.equal(result.notifyId, 'dlgnfy.dlgjob-n1.1')
+    assert.deepEqual(resumes, [])
+    assert.equal(adapterCalls, 2)
+  })
+
+  it('active cutover freeze window forces degrade to B with the same notifyId', async () => {
+    let adapterCalls = 0
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: true,
+        writeDelegateTerminal: async () => {
+          adapterCalls += 1
+          return { ok: true, processAlive: true }
+        },
+      },
+    }
+    const env = {
+      OC_DELEGATE_SM: '1',
+      OC_DELEGATE_DURABLE: '1',
+      OC_DELEGATE_NOTIFIER: '1',
+      OC_DELEGATE_CUTOVER: '1',
+      OC_DELEGATE_INLINE_PUSH_CCB: '1',
+    }
+    const runtime = { isCutoverWindowActive: () => true }
+    const pushed = await writeInlinePushForSession(session, terminalEvent(), 'BODY', env, runtime)
+    assert.equal(pushed.ok, false)
+    assert.equal(pushed.processAlive, true)
+    assert.equal(adapterCalls, 0)
+    const resumes: string[] = []
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: (event) => writeInlinePushForSession(session, event, 'BODY', env, runtime),
+      },
+      resumeInject: {
+        inject: async (event) => {
+          resumes.push(delegateNotifyId(event.jobId, event.callbackEpoch))
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(terminalEvent())
+    assert.equal(result.ok, true)
+    if (!result.ok) return
+    assert.equal(result.lane, 'resume-inject')
+    assert.equal(result.notifyId, 'dlgnfy.dlgjob-n1.1')
+    assert.deepEqual(resumes, ['dlgnfy.dlgjob-n1.1'])
+  })
+
+  it('thawed cutover window restores lane A', async () => {
+    const store = new DelegateJobStore({ sm: true, ttlMs: 60_000, leaseMs: 1_000 })
+    store.freezeDispatch(cutoverFreezeHolder(7))
+    assert.equal(store.hasActiveCutoverWindow(), true)
+    assert.equal(store.isDispatchFrozen(), true)
+    let adapterCalls = 0
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: true,
+        writeDelegateTerminal: async () => {
+          adapterCalls += 1
+          return { ok: true, processAlive: true }
+        },
+      },
+    }
+    const env = {
+      OC_DELEGATE_SM: '1',
+      OC_DELEGATE_DURABLE: '1',
+      OC_DELEGATE_NOTIFIER: '1',
+      OC_DELEGATE_CUTOVER: '1',
+      OC_DELEGATE_INLINE_PUSH_CCB: '1',
+    }
+    const runtime = { isCutoverWindowActive: () => store.hasActiveCutoverWindow() }
+    const frozen = await writeInlinePushForSession(session, terminalEvent(), 'BODY', env, runtime)
+    assert.equal(frozen.ok, false)
+    assert.equal(adapterCalls, 0)
+    store.thawDispatch(cutoverFreezeHolder(7))
+    assert.equal(store.hasActiveCutoverWindow(), false)
+    const thawed = await writeInlinePushForSession(session, terminalEvent(), 'BODY', env, runtime)
+    assert.equal(thawed.ok, true)
+    assert.equal(adapterCalls, 1)
+    store.close()
+  })
+
+  it('buildCcbInlinePushUserLine uses structured text blocks, not a raw string', () => {
+    const line = buildCcbInlinePushUserLine('hello <delegate-terminal jobId=x>')
+    const parsed = JSON.parse(line.trim()) as {
+      type: string
+      message: { role: string; content: Array<{ type: string; text: string }> }
+    }
+    assert.equal(parsed.type, 'user')
+    assert.equal(parsed.message.role, 'user')
+    assert.equal(parsed.message.content[0]?.type, 'text')
+    assert.match(parsed.message.content[0]!.text, /delegate-terminal/)
+  })
+
+  it('CcbAdapter only writes after parent submit succeeds; Codex writes delegate/terminal', async () => {
+    const dummyOpts = {
+      sessionKey: 'agent:main:webchat:dm:r3',
+      agentId: 'main',
+      agentBaseDir: '/tmp',
+      config: {} as never,
+    }
+    class FakeCcbRunner extends EventEmitter {
+      isRunning = true
+      writes: string[] = []
+      async submit() {
+        return
+      }
+      async writeDelegateUserMessage(content: string) {
+        this.writes.push(content)
+        return { ok: true as const, processAlive: true as const }
+      }
+    }
+    const ccbRunner = new FakeCcbRunner()
+    const ccb = new CcbAdapter(dummyOpts, ccbRunner as never)
+    const idle = await ccb.writeDelegateTerminal!(terminalEvent(), 'BODY')
+    assert.equal(idle.ok, false)
+    assert.equal(idle.processAlive, true)
+    assert.deepEqual(ccbRunner.writes, [])
+    const turn = ccb.submitTurn({
+      input: 'parent input',
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await turn.submitted
+    const live = await ccb.writeDelegateTerminal!(terminalEvent(), 'BODY')
+    assert.equal(live.ok, true)
+    assert.deepEqual(ccbRunner.writes, ['BODY'])
+    turn.end()
+
+    class FakeCodexKernel extends EventEmitter {
+      isRunning = true
+      hasIngestedParentTurn = true
+      lines: string[] = []
+      submit() {
+        return Promise.resolve()
+      }
+      writeDelegateTerminalNotification(line: string) {
+        this.lines.push(line)
+        return { ok: true as const, processAlive: true as const }
+      }
+    }
+    const kernel = new FakeCodexKernel()
+    const codex = new CodexAdapter(dummyOpts, kernel as never)
+    const codexIdle = await codex.writeDelegateTerminal!(terminalEvent({ parentEngine: 'codex' }), 'BODY')
+    assert.equal(codexIdle.ok, false)
+    assert.equal(codexIdle.processAlive, true)
+    const codexTurn = codex.submitTurn({
+      input: 'parent input',
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await Promise.resolve()
+    const codexLive = await codex.writeDelegateTerminal!(terminalEvent({ parentEngine: 'codex' }), 'BODY')
+    assert.equal(codexLive.ok, true)
+    assert.equal(kernel.lines.length, 1)
+    const parsed = JSON.parse(kernel.lines[0]!) as { method: string; params: { notifyId: string } }
+    assert.equal(parsed.method, 'delegate/terminal')
+    assert.equal(parsed.params.notifyId, 'dlgnfy.dlgjob-n1.1')
+    codexTurn.end()
+  })
+})
+
+describe('R3 blocker regressions', () => {
+  function openStoreAt(dir: string, now: () => number, bootId: string) {
+    return new DelegateJobStore({
+      sm: true,
+      ttlMs: 60_000,
+      leaseMs: 1_000,
+      durable: new DelegateDurableDb(join(dir, 'delegate-jobs.db')),
+      bootId,
+      now,
+    })
+  }
+
+  it('crash window: A write stamps delivered so restart cannot fire B', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'r3-crash-window-'))
+    let now = 1_000
+    const clock = () => now
+    let aWrites = 0
+    let bWrites = 0
+    try {
+      const s1 = openStoreAt(dir, clock, 'gw:a')
+      const seeded = await seededTerminal(s1, { parentEngine: 'ccb' })
+      const n1 = new DefaultEngineNotifier({
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            s1.injectDurableWriteFailure()
+            return { ok: true, processAlive: true }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            throw new Error('lane B must not run after A write')
+          },
+        },
+      })
+      const first = await dispatchJobTerminalNotify(s1, seeded.snap, n1)
+      assert.ok(!('skipped' in first) && first.ok)
+      assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'delivered')
+      s1.close()
+
+      now += NOTIFY_CLAIM_LEASE_MS + 1
+      const s2 = openStoreAt(dir, clock, 'gw:b')
+      s2.hydrateFromDurable()
+      const n2 = new DefaultEngineNotifier({
+        inlinePush: { write: async () => ({ ok: false, processAlive: false }) },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+      })
+      const live = s2.snapshotOf(seeded.jobId)
+      assert.ok(live)
+      const result = await dispatchJobTerminalNotify(s2, live, n2)
+      assert.ok(!('skipped' in result) && result.ok)
+      assert.deepEqual(
+        { aWrites, bWrites, callbackState: s2.snapshotOf(seeded.jobId)?.callbackState },
+        { aWrites: 1, bWrites: 0, callbackState: 'delivered' },
+      )
+      s2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('slow A vs expired claim: fence aborts A write so B is the only settle', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'r3-slow-race-'))
+    let now = 10_000
+    const clock = () => now
+    let releaseA!: () => void
+    const aGate = new Promise<void>((resolve) => {
+      releaseA = resolve
+    })
+    let aWrites = 0
+    let bWrites = 0
+    try {
+      const s1 = openStoreAt(dir, clock, 'gw:a')
+      const s2 = openStoreAt(dir, clock, 'gw:b')
+      const seeded = await seededTerminal(s1, { parentEngine: 'ccb' })
+      s2.hydrateFromDurable()
+      const n1 = new DefaultEngineNotifier({
+        inlinePush: {
+          write: async (event) => {
+            await aGate
+            const fence = notifyClaimFenceOf(event)
+            if (fence && !fence.isLive()) {
+              return { ok: false, processAlive: true }
+            }
+            aWrites += 1
+            return { ok: true, processAlive: true }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            throw new Error('slow A must not degrade to B after losing the claim')
+          },
+        },
+      })
+      const pA = dispatchJobTerminalNotify(s1, seeded.snap, n1)
+      await new Promise((resolve) => setImmediate(resolve))
+      assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'injecting')
+
+      now += NOTIFY_CLAIM_LEASE_MS + 1
+      const n2 = new DefaultEngineNotifier({
+        inlinePush: { write: async () => ({ ok: false, processAlive: false }) },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+      })
+      const live = s2.snapshotOf(seeded.jobId)
+      assert.ok(live)
+      const resultB = await dispatchJobTerminalNotify(s2, live, n2)
+      assert.ok(!('skipped' in resultB) && resultB.ok)
+      releaseA()
+      const resultA = await pA
+      assert.ok(!('skipped' in resultA) && resultA.ok)
+      assert.deepEqual(
+        { aWrites, bWrites, callbackState: s2.snapshotOf(seeded.jobId)?.callbackState },
+        { aWrites: 0, bWrites: 1, callbackState: 'delivered' },
+      )
+      s1.close()
+      s2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('CCB death window after write callback is A failure not a false success', async () => {
+    const ccb = new SubprocessRunner({ resumeSessionId: undefined } as never)
+    const ccbProc: {
+      killed: boolean
+      exitCode: number | null
+      stdin: { writable: boolean; write: (chunk: string, cb: (err?: Error | null) => void) => boolean }
+    } = {
+      killed: false,
+      exitCode: null,
+      stdin: {
+        writable: true,
+        write(_chunk: string, cb: (err?: Error | null) => void) {
+          ccbProc.killed = true
+          ccbProc.exitCode = 1
+          cb(null)
+          return true
+        },
+      },
+    }
+    ;(ccb as unknown as { proc: typeof ccbProc }).proc = ccbProc
+    ;(ccb as unknown as { closed: boolean }).closed = false
+    const ccbResult = await ccb.writeDelegateUserMessage('x')
+    assert.deepEqual(ccbResult, { ok: false, processAlive: false })
+  })
+
+  it('Codex writeRaw rejects dead/backpressure and swallows async EPIPE', async () => {
+    const codex = new CodexAppServerRunner({} as never)
+    ;(codex as unknown as { proc: object }).proc = {
+      killed: false,
+      exitCode: 1,
+      signalCode: null,
+      stdin: { writable: false, destroyed: false, write: () => false },
+    }
+    const codexResult = await codex.writeDelegateTerminalNotification('{"jsonrpc":"2.0"}')
+    assert.deepEqual(codexResult, { ok: false, processAlive: false })
+
+    const pressure = new CodexAppServerRunner({} as never)
+    ;(pressure as unknown as { proc: object }).proc = {
+      killed: false,
+      exitCode: null,
+      signalCode: null,
+      stdin: {
+        writable: true,
+        destroyed: false,
+        write: (_chunk: string, cb?: (err?: Error | null) => void) => {
+          cb?.(new Error('backpressure'))
+          return false
+        },
+      },
+    }
+    const pressureResult = await pressure.writeDelegateTerminalNotification('{"jsonrpc":"2.0"}')
+    assert.equal(pressureResult.ok, false)
+
+    const asyncCodex = new CodexAppServerRunner({} as never)
+    const asyncStdin = new EventEmitter() as EventEmitter & {
+      writable: boolean
+      destroyed: boolean
+      write: (_chunk: string, cb?: (err?: Error | null) => void) => boolean
+    }
+    asyncStdin.writable = true
+    asyncStdin.destroyed = false
+    asyncStdin.write = (_chunk, cb) => {
+      queueMicrotask(() => {
+        const error = Object.assign(new Error('broken pipe'), { code: 'EPIPE' })
+        asyncStdin.emit('error', error)
+        cb?.(error)
+      })
+      return true
+    }
+    ;(asyncCodex as unknown as { proc: object }).proc = {
+      killed: false,
+      exitCode: null,
+      signalCode: null,
+      stdin: asyncStdin,
+    }
+    let uncaughtCode: string | undefined
+    const onUncaught = (error: NodeJS.ErrnoException) => {
+      uncaughtCode = error.code
+    }
+    process.once('uncaughtException', onUncaught)
+    const asyncCodexResult = await asyncCodex.writeDelegateTerminalNotification('{"jsonrpc":"2.0"}')
+    await new Promise((resolve) => setImmediate(resolve))
+    process.off('uncaughtException', onUncaught)
+    assert.equal(asyncCodexResult.ok, false)
+    assert.equal(uncaughtCode, undefined)
+  })
+
+  it('parent submit rejection does not write an orphan InlinePush turn', async () => {
+    class FakeRunner extends EventEmitter {
+      isRunning = true
+      lastActivityAt = Date.now()
+      writes = 0
+      submit(): Promise<void> {
+        return Promise.reject(new Error('submit rejected before user line'))
+      }
+      writeDelegateUserMessage(): Promise<{ ok: boolean; processAlive: boolean }> {
+        this.writes += 1
+        return Promise.resolve({ ok: true, processAlive: true })
+      }
+    }
+    const fake = new FakeRunner()
+    const adapter = new CcbAdapter({} as never, fake as never)
+    const turn = adapter.submitTurn({
+      input: 'parent input',
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    const pushed = await adapter.writeDelegateTerminal!(terminalEvent(), 'delegate terminal')
+    await assert.rejects(turn.submitted)
+    assert.deepEqual(
+      { pushed, writes: fake.writes },
+      { pushed: { ok: false, processAlive: true }, writes: 0 },
+    )
+    turn.end()
+  })
+
+  it('parentTapeHasNotifyId matches notifyId in id, text, or dlgcb clientMessageId', () => {
+    const notifyId = 'dlgnfy.dlgjob-n1.1'
+    const clientMessageId = delegateCallbackMessageId('dlgjob-n1', 1)
+    assert.equal(parentTapeHasNotifyId([], notifyId), false)
+    assert.equal(parentTapeHasNotifyId([{ id: notifyId, text: 'x' }], notifyId), true)
+    assert.equal(parentTapeHasNotifyId([{ id: clientMessageId, text: 'x' }], notifyId, clientMessageId), true)
+    assert.equal(
+      parentTapeHasNotifyId([{ id: 'other', text: `see ${notifyId} here` }], notifyId),
+      true,
+    )
+    assert.equal(
+      parentTapeHasNotifyId(
+        [{ id: 'other', content: [{ type: 'text', text: `<delegate-terminal notifyId=${notifyId}>` }] }],
+        notifyId,
+      ),
+      true,
+    )
+    assert.equal(parentTapeHasNotifyId([{ id: 'other', text: 'nope' }], notifyId, clientMessageId), false)
+  })
+
+  it('reclaim after a_attempted without receipt: B iff tape lacks notifyId', async () => {
+    async function run(tapeHas: boolean): Promise<{ aWrites: number; bWrites: number; state: string | undefined }> {
+      const dir = await mkdtemp(join(tmpdir(), 'r3-tape-reclaim-'))
+      let now = 2_000
+      const clock = () => now
+      let aWrites = 0
+      let bWrites = 0
+      try {
+        const s1 = openStoreAt(dir, clock, 'gw:a')
+        const seeded = await seededTerminal(s1, { parentEngine: 'ccb' })
+        const n1 = new DefaultEngineNotifier({
+          inlinePush: {
+            write: async () => {
+              aWrites += 1
+              throw new Error('simulated gateway SIGKILL after A write')
+            },
+          },
+          resumeInject: {
+            inject: async () => {
+              throw new Error('crashing generation must not start B')
+            },
+          },
+          parentTapeIngestState: async (): Promise<ParentTapeIngestState> => 'not_ingested',
+        })
+        const first = await dispatchJobTerminalNotify(s1, seeded.snap, n1)
+        assert.ok(!('skipped' in first) && !first.ok)
+        if (!('skipped' in first)) assert.equal(first.hold, true)
+        assert.equal(s1.hasNotifyAAttempted(seeded.jobId), true)
+        // Unknown consumption keeps the exclusive claim; reclaim + tape decide B.
+        assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'injecting')
+        s1.close()
+
+        now += NOTIFY_CLAIM_LEASE_MS + 1
+        const s2 = openStoreAt(dir, clock, 'gw:b')
+        s2.hydrateFromDurable()
+        const notifyId = delegateNotifyId(seeded.jobId, 1)
+        const n2 = new DefaultEngineNotifier({
+          inlinePush: {
+            write: async () => {
+              aWrites += 1
+              return { ok: true, processAlive: true }
+            },
+          },
+          resumeInject: {
+            inject: async () => {
+              bWrites += 1
+              return { ok: true }
+            },
+          },
+          parentTapeIngestState: async (id): Promise<ParentTapeIngestState> =>
+            tapeHas && id === notifyId ? 'ingested' : 'not_ingested',
+        })
+        const live = s2.snapshotOf(seeded.jobId)
+        assert.ok(live)
+        const result = await dispatchJobTerminalNotify(s2, live, n2)
+        assert.ok(!('skipped' in result) && result.ok)
+        const state = s2.snapshotOf(seeded.jobId)?.callbackState
+        s2.close()
+        return { aWrites, bWrites, state }
+      } finally {
+        await rm(dir, { recursive: true, force: true })
+      }
+    }
+
+    assert.deepEqual(await run(false), { aWrites: 1, bWrites: 1, state: 'delivered' })
+    assert.deepEqual(await run(true), { aWrites: 1, bWrites: 0, state: 'delivered' })
+  })
+
+  it('CCB death after write: B iff tape lacks notifyId', async () => {
+    async function run(tapeHas: boolean): Promise<{ aWrites: number; bWrites: number }> {
+      let aWrites = 0
+      let bWrites = 0
+      const notifier = new DefaultEngineNotifier({
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            return { ok: false, processAlive: false }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+        parentTapeIngestState: async (): Promise<ParentTapeIngestState> =>
+          tapeHas ? 'ingested' : 'not_ingested',
+      })
+      const result = await notifier.notify(terminalEvent({ parentEngine: 'ccb' }))
+      assert.equal(result.ok, true)
+      return { aWrites, bWrites }
+    }
+    assert.deepEqual(await run(false), { aWrites: 1, bWrites: 1 })
+    assert.deepEqual(await run(true), { aWrites: 1, bWrites: 0 })
+  })
+
+  it('CCB death + tape oracle throw holds and does not send B', async () => {
+    let aWrites = 0
+    let bWrites = 0
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: async () => {
+          aWrites += 1
+          return { ok: false, processAlive: false }
+        },
+      },
+      resumeInject: {
+        inject: async () => {
+          bWrites += 1
+          return { ok: true }
+        },
+      },
+      parentTapeIngestState: async () => {
+        throw new Error('tape backend unavailable')
+      },
+    })
+    const result = await notifier.notify(terminalEvent({ parentEngine: 'ccb' }))
+    assert.equal(result.ok, false)
+    if (!result.ok) assert.equal(result.hold, true)
+    assert.deepEqual({ aWrites, bWrites }, { aWrites: 1, bWrites: 0 })
+  })
+
+  it('tape oracle throw holds then recheck ingested does not send B', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'r3-tape-oracle-recover-'))
+    let now = 2_000
+    const clock = () => now
+    let aWrites = 0
+    let bWrites = 0
+    try {
+      const s1 = openStoreAt(dir, clock, 'gw:a')
+      const seeded = await seededTerminal(s1, { parentEngine: 'ccb' })
+      const n1 = new DefaultEngineNotifier({
+        now: clock,
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            return { ok: false, processAlive: false }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+        parentTapeIngestState: async () => {
+          throw new Error('tape backend unavailable')
+        },
+      })
+      const first = await dispatchJobTerminalNotify(s1, seeded.snap, n1)
+      assert.ok(!('skipped' in first) && !first.ok)
+      if (!('skipped' in first)) assert.equal(first.hold, true)
+      assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'injecting')
+      assert.deepEqual({ aWrites, bWrites }, { aWrites: 1, bWrites: 0 })
+      s1.close()
+
+      now += NOTIFY_CLAIM_LEASE_MS + 1
+      const s2 = openStoreAt(dir, clock, 'gw:b')
+      s2.hydrateFromDurable()
+      const notifyId = delegateNotifyId(seeded.jobId, 1)
+      const n2 = new DefaultEngineNotifier({
+        now: clock,
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            return { ok: true, processAlive: true }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+        parentTapeIngestState: async (id): Promise<ParentTapeIngestState> =>
+          id === notifyId ? 'ingested' : 'not_ingested',
+      })
+      const live = s2.snapshotOf(seeded.jobId)
+      assert.ok(live)
+      const result = await dispatchJobTerminalNotify(s2, live, n2)
+      assert.ok(!('skipped' in result) && result.ok)
+      if (!('skipped' in result) && result.ok) assert.equal(result.lane, 'inline-push')
+      const state = s2.snapshotOf(seeded.jobId)?.callbackState
+      s2.close()
+      assert.deepEqual({ aWrites, bWrites, state }, { aWrites: 1, bWrites: 0, state: 'delivered' })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('persistent tape oracle throw times out to exactly one B', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'r3-tape-oracle-timeout-'))
+    const start = 2_000
+    let now = start
+    const clock = () => now
+    let aWrites = 0
+    let bWrites = 0
+    const throwingOracle = async (): Promise<never> => {
+      throw new Error('tape backend unavailable')
+    }
+    try {
+      const s1 = openStoreAt(dir, clock, 'gw:a')
+      const seeded = await seededTerminal(s1, { parentEngine: 'ccb' })
+      const n1 = new DefaultEngineNotifier({
+        now: clock,
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            return { ok: false, processAlive: false }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+        parentTapeIngestState: throwingOracle,
+      })
+      const first = await dispatchJobTerminalNotify(s1, seeded.snap, n1)
+      assert.ok(!('skipped' in first) && !first.ok)
+      if (!('skipped' in first)) assert.equal(first.hold, true)
+      assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'injecting')
+      s1.close()
+
+      now += NOTIFY_CLAIM_LEASE_MS + 1
+      const s2 = openStoreAt(dir, clock, 'gw:b')
+      s2.hydrateFromDurable()
+      const n2 = new DefaultEngineNotifier({
+        now: clock,
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            return { ok: true, processAlive: true }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+        parentTapeIngestState: throwingOracle,
+      })
+      const mid = s2.snapshotOf(seeded.jobId)
+      assert.ok(mid)
+      const second = await dispatchJobTerminalNotify(s2, mid, n2)
+      assert.ok(!('skipped' in second) && !second.ok)
+      if (!('skipped' in second)) assert.equal(second.hold, true)
+      assert.equal(s2.snapshotOf(seeded.jobId)?.callbackState, 'injecting')
+      assert.equal(bWrites, 0)
+      s2.close()
+
+      now += NOTIFY_CLAIM_LEASE_MS + 1
+      assert.ok(now - start > TAPE_ORACLE_UNKNOWN_HOLD_MS)
+      const s3 = openStoreAt(dir, clock, 'gw:c')
+      s3.hydrateFromDurable()
+      const n3 = new DefaultEngineNotifier({
+        now: clock,
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            return { ok: true, processAlive: true }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+        parentTapeIngestState: throwingOracle,
+      })
+      const late = s3.snapshotOf(seeded.jobId)
+      assert.ok(late)
+      const third = await dispatchJobTerminalNotify(s3, late, n3)
+      assert.ok(!('skipped' in third) && third.ok)
+      if (!('skipped' in third) && third.ok) {
+        assert.equal(third.lane, 'resume-inject')
+        assert.equal(third.notifyId, delegateNotifyId(seeded.jobId, 1))
+      }
+      const state = s3.snapshotOf(seeded.jobId)?.callbackState
+      s3.close()
+      assert.deepEqual({ aWrites, bWrites, state }, { aWrites: 1, bWrites: 1, state: 'delivered' })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('Codex backpressure write()===false waits for callback and does not degrade to B', async () => {
+    let aWrites = 0
+    let bWrites = 0
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: async () => {
+          const runner = new CodexAppServerRunner({} as never)
+          const stdin = new EventEmitter() as EventEmitter & {
+            writable: boolean
+            destroyed: boolean
+            write: (_chunk: string, cb?: (err?: Error | null) => void) => boolean
+          }
+          stdin.writable = true
+          stdin.destroyed = false
+          stdin.write = (_chunk, cb) => {
+            setTimeout(() => cb?.(null), 20)
+            return false
+          }
+          ;(runner as unknown as { proc: object }).proc = {
+            killed: false,
+            exitCode: null,
+            signalCode: null,
+            stdin,
+            once: () => runner,
+            off: () => runner,
+          }
+          const result = await runner.writeDelegateTerminalNotification('{"jsonrpc":"2.0"}')
+          if (result.ok) aWrites += 1
+          return result
+        },
+      },
+      resumeInject: {
+        inject: async () => {
+          bWrites += 1
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(terminalEvent({ parentEngine: 'codex' }))
+    assert.equal(result.ok, true)
+    if (result.ok) assert.equal(result.lane, 'inline-push')
+    assert.deepEqual({ aWrites, bWrites }, { aWrites: 1, bWrites: 0 })
+  })
+
+  it('CCB write()===false waits for callback and does not degrade to B', async () => {
+    let aWrites = 0
+    let bWrites = 0
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: async () => {
+          const ccb = new SubprocessRunner({ resumeSessionId: undefined } as never)
+          const stdin = new EventEmitter() as EventEmitter & {
+            writable: boolean
+            destroyed: boolean
+            write: (_chunk: string, cb?: (err?: Error | null) => void) => boolean
+          }
+          stdin.writable = true
+          stdin.destroyed = false
+          stdin.write = (_chunk, cb) => {
+            setTimeout(() => cb?.(null), 20)
+            return false
+          }
+          const proc = {
+            killed: false,
+            exitCode: null as number | null,
+            signalCode: null as NodeJS.Signals | null,
+            stdin,
+            once() {
+              return proc
+            },
+            off() {
+              return proc
+            },
+          }
+          ;(ccb as unknown as { proc: object }).proc = proc
+          ;(ccb as unknown as { closed: boolean }).closed = false
+          const result = await ccb.writeDelegateUserMessage('x')
+          if (result.ok) aWrites += 1
+          return result
+        },
+      },
+      resumeInject: {
+        inject: async () => {
+          bWrites += 1
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(terminalEvent({ parentEngine: 'ccb' }))
+    assert.equal(result.ok, true)
+    if (result.ok) assert.equal(result.lane, 'inline-push')
+    assert.deepEqual({ aWrites, bWrites }, { aWrites: 1, bWrites: 0 })
+  })
+
+  it('Codex hasIngestedParentTurn is only turn/start ACK, not queue/processing', () => {
+    const kernel = new CodexAppServerRunner({} as never)
+    const box = kernel as unknown as {
+      queue: unknown[]
+      processing: boolean
+      currentTurnCompleter: object | null
+      activeTurnId: string | null
+    }
+    box.queue = [{}]
+    box.processing = true
+    box.currentTurnCompleter = { resolve() {}, reject() {} }
+    box.activeTurnId = null
+    assert.equal(kernel.hasIngestedParentTurn, false)
+    box.activeTurnId = 'turn-1'
+    assert.equal(kernel.hasIngestedParentTurn, true)
+  })
+
+  it('Codex submit reject before turn/start ACK does not write an orphan notification', async () => {
+    class FakeCodexKernel extends EventEmitter {
+      isRunning = true
+      hasIngestedParentTurn = false
+      writes = 0
+      submit(): Promise<void> {
+        return Promise.reject(new Error('turn/start rejected before ingest'))
+      }
+      writeDelegateTerminalNotification(): Promise<{ ok: boolean; processAlive: boolean }> {
+        this.writes += 1
+        return Promise.resolve({ ok: true, processAlive: true })
+      }
+    }
+    const kernel = new FakeCodexKernel()
+    const adapter = new CodexAdapter({
+      sessionKey: 'agent:main:webchat:dm:r3',
+      agentId: 'main',
+      agentBaseDir: '/tmp',
+      config: {} as never,
+    }, kernel as never)
+    const turn = adapter.submitTurn({
+      input: 'parent input',
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await Promise.resolve()
+    const pushed = await adapter.writeDelegateTerminal!(
+      terminalEvent({ parentEngine: 'codex' }),
+      'delegate terminal',
+    )
+    await assert.rejects(turn.submitted)
+    assert.deepEqual(
+      { pushed, writes: kernel.writes },
+      { pushed: { ok: false, processAlive: true }, writes: 0 },
+    )
+    turn.end()
+  })
+
+  it('unknown InlinePush result holds and does not degrade to B', async () => {
+    let bWrites = 0
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: async () => ({ ok: false, processAlive: true, unknown: true }),
+      },
+      resumeInject: {
+        inject: async () => {
+          bWrites += 1
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(terminalEvent({ parentEngine: 'codex' }))
+    assert.equal(result.ok, false)
+    if (!result.ok) assert.equal(result.hold, true)
+    assert.equal(bWrites, 0)
   })
 })
 

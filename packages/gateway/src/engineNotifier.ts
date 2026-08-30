@@ -13,10 +13,23 @@ import {
   type NotifyLane,
   type NotifyResult,
 } from '@openclaude/protocol'
+import { ccbStdinUserContent } from './ccbNativeCompaction.js'
+import { isDelegateInlinePushEnabled } from './delegateSmFlag.js'
+import type { ParentTapeIngestState } from './delegateNotifyTape.js'
 import { isHeartbeatSilentOutput } from './jobTerminal.js'
 
+/** Prefer not-lose: after this window of only-unknown tape reads, send B once. */
+export const TAPE_ORACLE_UNKNOWN_HOLD_MS = 60_000
+
+export type InlinePushWriteResult = {
+  ok: boolean
+  processAlive: boolean
+  /** Chunk may still be in the kernel buffer; do not start B this generation. */
+  unknown?: boolean
+}
+
 export type InlinePushPort = {
-  write(event: JobTerminal): Promise<{ ok: boolean; processAlive: boolean }>
+  write(event: JobTerminal): Promise<InlinePushWriteResult>
 }
 
 export type ResumeInjectPort = {
@@ -46,10 +59,36 @@ export type EngineNotifierOptions = {
   now?: () => number
   /** Cursor/Grok/zcode: missing nativeId is transport (no silent empty chat). */
   requireNativeId?: boolean
+  /**
+   * Parent-session tape ingest oracle. `not_ingested` only after a complete
+   * authoritative read; query failures / missing identity are `unknown`.
+   */
+  parentTapeIngestState?: (
+    notifyId: string,
+    event: JobTerminal,
+  ) => ParentTapeIngestState | Promise<ParentTapeIngestState>
+}
+
+/** Per-notify claim fence attached by dispatchJobTerminalNotify. */
+export const NOTIFY_CLAIM_FENCE = Symbol.for('openclaude.notifyClaimFence')
+
+export type NotifyClaimFence = {
+  isLive: () => boolean
+  ackDelivered: () => boolean
+  markAAttempted?: () => boolean
+  hasAAttempted?: () => boolean
+  /** Durable a_attempted stamp; unknown tape holds until this + TAPE_ORACLE_UNKNOWN_HOLD_MS. */
+  aAttemptedAt?: () => number | undefined
+}
+
+export type InlinePushRuntime = {
+  /** Live BeginCutover / recycle drain freeze — not the CUTOVER feature flag. */
+  isCutoverWindowActive?: () => boolean
 }
 
 export class DefaultEngineNotifier implements EngineNotifier {
   private readonly delivered = new Set<string>()
+  private readonly unknownSince = new Map<string, number>()
   private readonly opts: EngineNotifierOptions
   private readonly now: () => number
 
@@ -96,9 +135,19 @@ export class DefaultEngineNotifier implements EngineNotifier {
     const preferred = classifyNotifyLane(event.parentEngine)
     if (preferred === 'inline-push') {
       const pushed = await this.tryInlinePush(event)
-      if (pushed) {
+      if (pushed === 'delivered') {
         this.mark(notifyId)
         return finish({ ok: true, lane: 'inline-push', notifyId })
+      }
+      if (pushed === 'hold') {
+        // a_attempted with unknown consumption: do not B this generation.
+        // Reclaim + tape ingest decide. Dispatch must leave the claim injecting.
+        return finish({
+          ok: false,
+          failureClass: 'transport',
+          degradedTo: 'resume-inject',
+          hold: true,
+        }, true)
       }
       const injected = await this.tryResumeInject(event)
       if (injected.ok) {
@@ -128,13 +177,102 @@ export class DefaultEngineNotifier implements EngineNotifier {
     this.opts.markDelivered?.(notifyId)
   }
 
-  private async tryInlinePush(event: JobTerminal): Promise<boolean> {
-    if (!this.opts.inlinePush) return false
+  private async tapeIngest(event: JobTerminal, notifyId: string): Promise<ParentTapeIngestState> {
+    const oracle = this.opts.parentTapeIngestState
+    if (!oracle) return 'not_ingested'
     try {
-      const result = await this.opts.inlinePush.write(event)
-      return Boolean(result?.ok && result.processAlive)
+      const state = await oracle(notifyId, event)
+      if (state === 'ingested' || state === 'not_ingested' || state === 'unknown') return state
+      return 'unknown'
     } catch {
-      return false
+      return 'unknown'
+    }
+  }
+
+  /** First unknown always holds; later unknowns hold until a_attempted + window. */
+  private unknownShouldHold(fence: NotifyClaimFence | undefined, notifyId: string): boolean {
+    const stamped = fence?.aAttemptedAt?.()
+    const origin =
+      typeof stamped === 'number' && stamped > 0 ? stamped : this.unknownSince.get(notifyId)
+    const t = this.now()
+    if (origin == null) {
+      this.unknownSince.set(notifyId, t)
+      return true
+    }
+    return t - origin < TAPE_ORACLE_UNKNOWN_HOLD_MS
+  }
+
+  private async decideFromTape(
+    event: JobTerminal,
+    notifyId: string,
+    fence: NotifyClaimFence | undefined,
+    absent: 'degrade' | 'hold',
+  ): Promise<'delivered' | 'degrade' | 'hold'> {
+    const state = await this.tapeIngest(event, notifyId)
+    if (state === 'ingested') {
+      this.ackDeliveredQuiet(fence)
+      this.unknownSince.delete(notifyId)
+      return 'delivered'
+    }
+    if (state === 'unknown') {
+      return this.unknownShouldHold(fence, notifyId) ? 'hold' : 'degrade'
+    }
+    this.unknownSince.delete(notifyId)
+    return absent
+  }
+
+  private ackDeliveredQuiet(fence: NotifyClaimFence | undefined): void {
+    if (!fence) return
+    try {
+      fence.ackDelivered()
+    } catch {
+      /* stale token or durable write failed; dispatch retries complete */
+    }
+  }
+
+  /**
+   * InlinePush outcomes:
+   * - delivered: A consumed (write+alive receipt, or tape ingest)
+   * - degrade: A failed; caller may send B with the same notifyId
+   * - hold: a_attempted, consumption unknown; do not B this generation
+   */
+  private async tryInlinePush(event: JobTerminal): Promise<'delivered' | 'degrade' | 'hold'> {
+    if (!this.opts.inlinePush) return 'degrade'
+    const fence = notifyClaimFenceOf(event)
+    const notifyId = delegateNotifyId(event.jobId, event.callbackEpoch)
+    try {
+      if (fence && !fence.isLive()) return 'degrade'
+      if (fence?.hasAAttempted?.()) {
+        // Reclaim: never rewrite stdin. B iff a complete tape read shows absence.
+        return this.decideFromTape(event, notifyId, fence, 'degrade')
+      }
+      if (fence?.markAAttempted) {
+        if (!fence.markAAttempted()) return 'degrade'
+      }
+      if (fence && !fence.isLive()) return 'degrade'
+      const result = await this.opts.inlinePush.write(event)
+      if (fence && !fence.isLive()) {
+        this.ackDeliveredQuiet(fence)
+        // Another owner reclaimed. Never start B from this generation.
+        return 'delivered'
+      }
+      if (result?.unknown) {
+        // Process may still be alive: absence is not proof yet. Unknown tape holds.
+        return this.decideFromTape(event, notifyId, fence, 'hold')
+      }
+      if (!result?.ok || !result.processAlive) {
+        // stdin dies with the process. B only after a complete tape absence read.
+        return this.decideFromTape(event, notifyId, fence, 'degrade')
+      }
+      this.ackDeliveredQuiet(fence)
+      return 'delivered'
+    } catch {
+      if (fence?.hasAAttempted?.()) {
+        // Write threw after a_attempted: consumption unknown. Hold unless ingested
+        // or the unknown window has elapsed (prefer not-lose → B).
+        return this.decideFromTape(event, notifyId, fence, 'hold')
+      }
+      return 'degrade'
     }
   }
 
@@ -166,6 +304,11 @@ export type InlinePushSession = {
   _activeClientTurnCount?: number
   runner?: {
     engineId?: string
+    isRunning?: boolean
+    writeDelegateTerminal?: (
+      event: JobTerminal,
+      body: string,
+    ) => Promise<InlinePushWriteResult>
     writeRaw?: (line: string) => void | Promise<void>
     proc?: {
       killed?: boolean
@@ -175,11 +318,87 @@ export type InlinePushSession = {
   }
 }
 
+/** Official CCB stdin user JSONL (same shape as SubprocessRunner.submit). */
+export function buildCcbInlinePushUserLine(body: string): string {
+  const userMsg = {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: ccbStdinUserContent(body),
+    },
+    parent_tool_use_id: null,
+  }
+  return `${JSON.stringify(userMsg)}\n`
+}
+
+/** Official Codex JSON-RPC notification. Gateway writes it; no engine binary patch. */
+export function buildCodexDelegateTerminalNotification(event: JobTerminal, body: string): string {
+  return JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'delegate/terminal',
+    params: {
+      jobId: event.jobId,
+      notifyId: delegateNotifyId(event.jobId, event.callbackEpoch),
+      state: event.state,
+      body,
+    },
+  })
+}
+
 /**
- * Best-effort 档 A write. Duck-types `runner.proc` / `runner.writeRaw`.
- * Production CcbAdapter/CodexAdapter keep those on private inner runners
- * (R3), so live CCB/Codex currently degrade to ResumeInject. This port is
- * a test/R1 scaffold, not a production InlinePush capability.
+ * Production 档 A dispatch. Flag-on uses EngineAdapter.writeDelegateTerminal.
+ * Flag-off keeps the R0/R1 duck-type probe (653ef6339 equivalent).
+ * An active cutover/drain freeze window forces fail so Notifier degrades to
+ * ResumeInject. The CUTOVER feature flag alone is not a window.
+ */
+export async function writeInlinePushForSession(
+  session: InlinePushSession | undefined,
+  event: JobTerminal,
+  body: string,
+  env: NodeJS.ProcessEnv = process.env,
+  runtime: InlinePushRuntime = {},
+): Promise<InlinePushWriteResult> {
+  if (!isDelegateInlinePushEnabled(event.parentEngine, env)) {
+    return tryWriteInlinePush(session, event, body)
+  }
+  const runner = session?.runner
+  const processAlive = Boolean(runner?.isRunning)
+  const fence = notifyClaimFenceOf(event)
+  if (fence && !fence.isLive()) {
+    return { ok: false, processAlive }
+  }
+  if (runtime.isCutoverWindowActive?.() === true) {
+    return { ok: false, processAlive }
+  }
+  const write = runner?.writeDelegateTerminal
+  if (typeof write !== 'function') {
+    return { ok: false, processAlive }
+  }
+  if (fence && !fence.isLive()) {
+    return { ok: false, processAlive }
+  }
+  try {
+    const result = await write.call(runner, event, body)
+    return {
+      ok: Boolean(result?.ok && result.processAlive),
+      processAlive: Boolean(result?.processAlive),
+      unknown: Boolean(result?.unknown),
+    }
+  } catch {
+    // Write started (a_attempted already stamped). Outcome unknown.
+    return { ok: false, processAlive: false, unknown: true }
+  }
+}
+
+export function notifyClaimFenceOf(event: JobTerminal): NotifyClaimFence | undefined {
+  const fence = (event as JobTerminal & { [NOTIFY_CLAIM_FENCE]?: NotifyClaimFence })[NOTIFY_CLAIM_FENCE]
+  return fence
+}
+
+/**
+ * Flag-off 档 A write. Duck-types `runner.proc` / `runner.writeRaw` so
+ * 653ef6339 tests and Completer paths stay equivalent. Production adapters
+ * hide those fields; live 档 A is `writeDelegateTerminal` behind the R3 flags.
  */
 export async function tryWriteInlinePush(
   session: InlinePushSession | undefined,
@@ -213,18 +432,7 @@ export async function tryWriteInlinePush(
   }
   if (event.parentEngine === 'codex' && typeof runner.writeRaw === 'function') {
     try {
-      await runner.writeRaw(
-        `${JSON.stringify({
-          jsonrpc: '2.0',
-          method: 'delegate/terminal',
-          params: {
-            jobId: event.jobId,
-            notifyId: delegateNotifyId(event.jobId, event.callbackEpoch),
-            state: event.state,
-            body,
-          },
-        })}\n`,
-      )
+      await runner.writeRaw(`${buildCodexDelegateTerminalNotification(event, body)}\n`)
       return { ok: true, processAlive: true }
     } catch {
       return { ok: false, processAlive: false }

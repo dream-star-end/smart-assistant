@@ -408,7 +408,8 @@ import {
   isDelegateRunnerIdle,
   resolveDelegateCutoverFreezeMs,
 } from './delegateCutover.js'
-import { DefaultEngineNotifier, tryWriteInlinePush, type InlinePushSession } from './engineNotifier.js'
+import { DefaultEngineNotifier, writeInlinePushForSession, type InlinePushSession } from './engineNotifier.js'
+import { parentTapeHasNotifyId, type ParentTapeIngestState } from './delegateNotifyTape.js'
 import {
   delayUntilNextNotifyRetry,
   dispatchJobTerminalNotify,
@@ -10847,8 +10848,38 @@ export class Gateway {
       inlinePush: {
         write: async (event) => {
           const session = this.sessions?.getByKey?.(event.parentSessionKey) as InlinePushSession | undefined
-          return tryWriteInlinePush(session, event, formatJobTerminalMarkdown(event))
+          return writeInlinePushForSession(
+            session,
+            event,
+            formatJobTerminalMarkdown(event),
+            process.env,
+            {
+              isCutoverWindowActive: () => this._delegateJobs?.hasActiveCutoverWindow() === true,
+            },
+          )
         },
+      },
+      parentTapeIngestState: async (notifyId, event): Promise<ParentTapeIngestState> => {
+        const origin = parseOriginWebchatSessionKey(event.parentSessionKey)
+        if (!origin) return 'unknown'
+        const userId =
+          event.callbackOriginUserId?.trim() ||
+          this.sessions?.getByKey?.(event.parentSessionKey)?.userId ||
+          process.env.OC_USER_ID?.trim()
+        if (!userId) return 'unknown'
+        try {
+          const session = await getClientSession(origin.peerId, userId)
+          if (!session) return 'unknown'
+          return parentTapeHasNotifyId(
+            session.messages as Array<{ id?: unknown; text?: unknown; content?: unknown }> | undefined,
+            notifyId,
+            delegateCallbackMessageId(event.jobId, event.callbackEpoch),
+          )
+            ? 'ingested'
+            : 'not_ingested'
+        } catch {
+          return 'unknown'
+        }
       },
       resumeInject: {
         inject: async (event) => {
