@@ -30,6 +30,7 @@ import {
 } from '../delegateNotifyDispatch.js'
 import {
   DefaultEngineNotifier,
+  TAPE_ORACLE_UNKNOWN_HOLD_MS,
   buildCcbInlinePushUserLine,
   buildCodexDelegateTerminalNotification,
   notifyClaimFenceOf,
@@ -67,7 +68,7 @@ import {
   isDelegateInlinePushCodexEnabled,
   isDelegateInlinePushEnabled,
 } from '../delegateSmFlag.js'
-import { parentTapeHasNotifyId } from '../delegateNotifyTape.js'
+import { parentTapeHasNotifyId, type ParentTapeIngestState } from '../delegateNotifyTape.js'
 
 function terminalEvent(over: Partial<JobTerminal> = {}): JobTerminal {
   return {
@@ -933,7 +934,7 @@ describe('R3 blocker regressions', () => {
               throw new Error('crashing generation must not start B')
             },
           },
-          hasParentTapeIngested: async () => false,
+          parentTapeIngestState: async (): Promise<ParentTapeIngestState> => 'not_ingested',
         })
         const first = await dispatchJobTerminalNotify(s1, seeded.snap, n1)
         assert.ok(!('skipped' in first) && !first.ok)
@@ -960,7 +961,8 @@ describe('R3 blocker regressions', () => {
               return { ok: true }
             },
           },
-          hasParentTapeIngested: async (id) => tapeHas && id === notifyId,
+          parentTapeIngestState: async (id): Promise<ParentTapeIngestState> =>
+            tapeHas && id === notifyId ? 'ingested' : 'not_ingested',
         })
         const live = s2.snapshotOf(seeded.jobId)
         assert.ok(live)
@@ -995,7 +997,8 @@ describe('R3 blocker regressions', () => {
             return { ok: true }
           },
         },
-        hasParentTapeIngested: async () => tapeHas,
+        parentTapeIngestState: async (): Promise<ParentTapeIngestState> =>
+          tapeHas ? 'ingested' : 'not_ingested',
       })
       const result = await notifier.notify(terminalEvent({ parentEngine: 'ccb' }))
       assert.equal(result.ok, true)
@@ -1003,6 +1006,199 @@ describe('R3 blocker regressions', () => {
     }
     assert.deepEqual(await run(false), { aWrites: 1, bWrites: 1 })
     assert.deepEqual(await run(true), { aWrites: 1, bWrites: 0 })
+  })
+
+  it('CCB death + tape oracle throw holds and does not send B', async () => {
+    let aWrites = 0
+    let bWrites = 0
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: async () => {
+          aWrites += 1
+          return { ok: false, processAlive: false }
+        },
+      },
+      resumeInject: {
+        inject: async () => {
+          bWrites += 1
+          return { ok: true }
+        },
+      },
+      parentTapeIngestState: async () => {
+        throw new Error('tape backend unavailable')
+      },
+    })
+    const result = await notifier.notify(terminalEvent({ parentEngine: 'ccb' }))
+    assert.equal(result.ok, false)
+    if (!result.ok) assert.equal(result.hold, true)
+    assert.deepEqual({ aWrites, bWrites }, { aWrites: 1, bWrites: 0 })
+  })
+
+  it('tape oracle throw holds then recheck ingested does not send B', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'r3-tape-oracle-recover-'))
+    let now = 2_000
+    const clock = () => now
+    let aWrites = 0
+    let bWrites = 0
+    try {
+      const s1 = openStoreAt(dir, clock, 'gw:a')
+      const seeded = await seededTerminal(s1, { parentEngine: 'ccb' })
+      const n1 = new DefaultEngineNotifier({
+        now: clock,
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            return { ok: false, processAlive: false }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+        parentTapeIngestState: async () => {
+          throw new Error('tape backend unavailable')
+        },
+      })
+      const first = await dispatchJobTerminalNotify(s1, seeded.snap, n1)
+      assert.ok(!('skipped' in first) && !first.ok)
+      if (!('skipped' in first)) assert.equal(first.hold, true)
+      assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'injecting')
+      assert.deepEqual({ aWrites, bWrites }, { aWrites: 1, bWrites: 0 })
+      s1.close()
+
+      now += NOTIFY_CLAIM_LEASE_MS + 1
+      const s2 = openStoreAt(dir, clock, 'gw:b')
+      s2.hydrateFromDurable()
+      const notifyId = delegateNotifyId(seeded.jobId, 1)
+      const n2 = new DefaultEngineNotifier({
+        now: clock,
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            return { ok: true, processAlive: true }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+        parentTapeIngestState: async (id): Promise<ParentTapeIngestState> =>
+          id === notifyId ? 'ingested' : 'not_ingested',
+      })
+      const live = s2.snapshotOf(seeded.jobId)
+      assert.ok(live)
+      const result = await dispatchJobTerminalNotify(s2, live, n2)
+      assert.ok(!('skipped' in result) && result.ok)
+      if (!('skipped' in result) && result.ok) assert.equal(result.lane, 'inline-push')
+      const state = s2.snapshotOf(seeded.jobId)?.callbackState
+      s2.close()
+      assert.deepEqual({ aWrites, bWrites, state }, { aWrites: 1, bWrites: 0, state: 'delivered' })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('persistent tape oracle throw times out to exactly one B', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'r3-tape-oracle-timeout-'))
+    const start = 2_000
+    let now = start
+    const clock = () => now
+    let aWrites = 0
+    let bWrites = 0
+    const throwingOracle = async (): Promise<never> => {
+      throw new Error('tape backend unavailable')
+    }
+    try {
+      const s1 = openStoreAt(dir, clock, 'gw:a')
+      const seeded = await seededTerminal(s1, { parentEngine: 'ccb' })
+      const n1 = new DefaultEngineNotifier({
+        now: clock,
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            return { ok: false, processAlive: false }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+        parentTapeIngestState: throwingOracle,
+      })
+      const first = await dispatchJobTerminalNotify(s1, seeded.snap, n1)
+      assert.ok(!('skipped' in first) && !first.ok)
+      if (!('skipped' in first)) assert.equal(first.hold, true)
+      assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'injecting')
+      s1.close()
+
+      now += NOTIFY_CLAIM_LEASE_MS + 1
+      const s2 = openStoreAt(dir, clock, 'gw:b')
+      s2.hydrateFromDurable()
+      const n2 = new DefaultEngineNotifier({
+        now: clock,
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            return { ok: true, processAlive: true }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+        parentTapeIngestState: throwingOracle,
+      })
+      const mid = s2.snapshotOf(seeded.jobId)
+      assert.ok(mid)
+      const second = await dispatchJobTerminalNotify(s2, mid, n2)
+      assert.ok(!('skipped' in second) && !second.ok)
+      if (!('skipped' in second)) assert.equal(second.hold, true)
+      assert.equal(s2.snapshotOf(seeded.jobId)?.callbackState, 'injecting')
+      assert.equal(bWrites, 0)
+      s2.close()
+
+      now += NOTIFY_CLAIM_LEASE_MS + 1
+      assert.ok(now - start > TAPE_ORACLE_UNKNOWN_HOLD_MS)
+      const s3 = openStoreAt(dir, clock, 'gw:c')
+      s3.hydrateFromDurable()
+      const n3 = new DefaultEngineNotifier({
+        now: clock,
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            return { ok: true, processAlive: true }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+        parentTapeIngestState: throwingOracle,
+      })
+      const late = s3.snapshotOf(seeded.jobId)
+      assert.ok(late)
+      const third = await dispatchJobTerminalNotify(s3, late, n3)
+      assert.ok(!('skipped' in third) && third.ok)
+      if (!('skipped' in third) && third.ok) {
+        assert.equal(third.lane, 'resume-inject')
+        assert.equal(third.notifyId, delegateNotifyId(seeded.jobId, 1))
+      }
+      const state = s3.snapshotOf(seeded.jobId)?.callbackState
+      s3.close()
+      assert.deepEqual({ aWrites, bWrites, state }, { aWrites: 1, bWrites: 1, state: 'delivered' })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('Codex backpressure write()===false waits for callback and does not degrade to B', async () => {

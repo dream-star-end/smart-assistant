@@ -12,6 +12,12 @@ export type ParentTapeMessage = {
   content?: unknown
 }
 
+/**
+ * Tape ingest oracle result. Dual-send is judged by model-visible consumption
+ * (design v3 §10-9). A thrown / incomplete read is `unknown`, never absence.
+ */
+export type ParentTapeIngestState = 'ingested' | 'not_ingested' | 'unknown'
+
 export function parentTapeHasNotifyId(
   messages: ReadonlyArray<ParentTapeMessage> | undefined | null,
   notifyId: string,

@@ -15,7 +15,11 @@ import {
 } from '@openclaude/protocol'
 import { ccbStdinUserContent } from './ccbNativeCompaction.js'
 import { isDelegateInlinePushEnabled } from './delegateSmFlag.js'
+import type { ParentTapeIngestState } from './delegateNotifyTape.js'
 import { isHeartbeatSilentOutput } from './jobTerminal.js'
+
+/** Prefer not-lose: after this window of only-unknown tape reads, send B once. */
+export const TAPE_ORACLE_UNKNOWN_HOLD_MS = 60_000
 
 export type InlinePushWriteResult = {
   ok: boolean
@@ -56,10 +60,13 @@ export type EngineNotifierOptions = {
   /** Cursor/Grok/zcode: missing nativeId is transport (no silent empty chat). */
   requireNativeId?: boolean
   /**
-   * Parent-session tape ingest oracle. True iff the model-visible tape already
-   * holds this notifyId (or its paired dlgcb.* clientMessageId).
+   * Parent-session tape ingest oracle. `not_ingested` only after a complete
+   * authoritative read; query failures / missing identity are `unknown`.
    */
-  hasParentTapeIngested?: (notifyId: string, event: JobTerminal) => boolean | Promise<boolean>
+  parentTapeIngestState?: (
+    notifyId: string,
+    event: JobTerminal,
+  ) => ParentTapeIngestState | Promise<ParentTapeIngestState>
 }
 
 /** Per-notify claim fence attached by dispatchJobTerminalNotify. */
@@ -70,6 +77,8 @@ export type NotifyClaimFence = {
   ackDelivered: () => boolean
   markAAttempted?: () => boolean
   hasAAttempted?: () => boolean
+  /** Durable a_attempted stamp; unknown tape holds until this + TAPE_ORACLE_UNKNOWN_HOLD_MS. */
+  aAttemptedAt?: () => number | undefined
 }
 
 export type InlinePushRuntime = {
@@ -79,6 +88,7 @@ export type InlinePushRuntime = {
 
 export class DefaultEngineNotifier implements EngineNotifier {
   private readonly delivered = new Set<string>()
+  private readonly unknownSince = new Map<string, number>()
   private readonly opts: EngineNotifierOptions
   private readonly now: () => number
 
@@ -167,12 +177,48 @@ export class DefaultEngineNotifier implements EngineNotifier {
     this.opts.markDelivered?.(notifyId)
   }
 
-  private async tapeHas(event: JobTerminal, notifyId: string): Promise<boolean> {
+  private async tapeIngest(event: JobTerminal, notifyId: string): Promise<ParentTapeIngestState> {
+    const oracle = this.opts.parentTapeIngestState
+    if (!oracle) return 'not_ingested'
     try {
-      return Boolean(await this.opts.hasParentTapeIngested?.(notifyId, event))
+      const state = await oracle(notifyId, event)
+      if (state === 'ingested' || state === 'not_ingested' || state === 'unknown') return state
+      return 'unknown'
     } catch {
-      return false
+      return 'unknown'
     }
+  }
+
+  /** First unknown always holds; later unknowns hold until a_attempted + window. */
+  private unknownShouldHold(fence: NotifyClaimFence | undefined, notifyId: string): boolean {
+    const stamped = fence?.aAttemptedAt?.()
+    const origin =
+      typeof stamped === 'number' && stamped > 0 ? stamped : this.unknownSince.get(notifyId)
+    const t = this.now()
+    if (origin == null) {
+      this.unknownSince.set(notifyId, t)
+      return true
+    }
+    return t - origin < TAPE_ORACLE_UNKNOWN_HOLD_MS
+  }
+
+  private async decideFromTape(
+    event: JobTerminal,
+    notifyId: string,
+    fence: NotifyClaimFence | undefined,
+    absent: 'degrade' | 'hold',
+  ): Promise<'delivered' | 'degrade' | 'hold'> {
+    const state = await this.tapeIngest(event, notifyId)
+    if (state === 'ingested') {
+      this.ackDeliveredQuiet(fence)
+      this.unknownSince.delete(notifyId)
+      return 'delivered'
+    }
+    if (state === 'unknown') {
+      return this.unknownShouldHold(fence, notifyId) ? 'hold' : 'degrade'
+    }
+    this.unknownSince.delete(notifyId)
+    return absent
   }
 
   private ackDeliveredQuiet(fence: NotifyClaimFence | undefined): void {
@@ -194,19 +240,11 @@ export class DefaultEngineNotifier implements EngineNotifier {
     if (!this.opts.inlinePush) return 'degrade'
     const fence = notifyClaimFenceOf(event)
     const notifyId = delegateNotifyId(event.jobId, event.callbackEpoch)
-    const deliveredIfTaped = async (): Promise<'delivered' | 'degrade'> => {
-      if (await this.tapeHas(event, notifyId)) {
-        this.ackDeliveredQuiet(fence)
-        return 'delivered'
-      }
-      return 'degrade'
-    }
     try {
       if (fence && !fence.isLive()) return 'degrade'
       if (fence?.hasAAttempted?.()) {
-        // Reclaim: never rewrite stdin. B iff tape has not ingested notifyId.
-        const taped = await deliveredIfTaped()
-        return taped === 'delivered' ? 'delivered' : 'degrade'
+        // Reclaim: never rewrite stdin. B iff a complete tape read shows absence.
+        return this.decideFromTape(event, notifyId, fence, 'degrade')
       }
       if (fence?.markAAttempted) {
         if (!fence.markAAttempted()) return 'degrade'
@@ -219,25 +257,20 @@ export class DefaultEngineNotifier implements EngineNotifier {
         return 'delivered'
       }
       if (result?.unknown) {
-        if (await this.tapeHas(event, notifyId)) {
-          this.ackDeliveredQuiet(fence)
-          return 'delivered'
-        }
-        return 'hold'
+        // Process may still be alive: absence is not proof yet. Unknown tape holds.
+        return this.decideFromTape(event, notifyId, fence, 'hold')
       }
       if (!result?.ok || !result.processAlive) {
-        // stdin dies with the process. B is allowed only when tape has no ingest.
-        return deliveredIfTaped()
+        // stdin dies with the process. B only after a complete tape absence read.
+        return this.decideFromTape(event, notifyId, fence, 'degrade')
       }
       this.ackDeliveredQuiet(fence)
       return 'delivered'
     } catch {
       if (fence?.hasAAttempted?.()) {
-        if (await this.tapeHas(event, notifyId)) {
-          this.ackDeliveredQuiet(fence)
-          return 'delivered'
-        }
-        return 'hold'
+        // Write threw after a_attempted: consumption unknown. Hold unless ingested
+        // or the unknown window has elapsed (prefer not-lose → B).
+        return this.decideFromTape(event, notifyId, fence, 'hold')
       }
       return 'degrade'
     }

@@ -190,6 +190,7 @@ export async function dispatchJobTerminalNotify(
         }
       },
       hasAAttempted: () => store.hasNotifyAAttempted(live.id),
+      aAttemptedAt: () => store.snapshotOf(live.id)?.notifyAAttemptedAt ?? undefined,
     }
     Object.defineProperty(event, NOTIFY_CLAIM_FENCE, {
       value: fence,
