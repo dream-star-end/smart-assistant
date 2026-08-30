@@ -338,6 +338,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
    *  经 identity guard 清空。 */
   private _routeTurn: CodexTurnContext | null = null
   private _activeTurn: CodexTurnContext | null = null
+  /** InlinePush eligibility is revoked at interrupt / terminal persistence. */
+  private _interrupting = false
   /** Goal sync happens at the session lock boundary before submitTurn installs
    * its parser. Codex may synchronously notify from thread/goal/set, so retain
    * the latest such notification and replay it into the next turn boundary. */
@@ -501,19 +503,38 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     })
     ctx.parser = parser
     this._routeTurn = ctx
-    this._activeTurn = ctx
+    this._interrupting = false
+    // kernel.submit() covers the full turn, so do not wait for it to arm
+    // InlinePush. Admit on the next microtask only if the promise has not
+    // already rejected (parent input never queued).
     if (this._pendingGoalMessage) {
       const pendingGoal = this._pendingGoalMessage
       this._pendingGoalMessage = null
       parser.parse(pendingGoal as unknown as SdkMessage)
     }
-    const submitted = this.kernel.submit(
-      params.input as string | Array<{ type: string; text?: string }>,
-      params.requestId,
-      params.collabAgentPolicy,
-      params.queueTurn,
-      params.automaticRetryState,
-    )
+    let submitted: Promise<void>
+    try {
+      submitted = this.kernel.submit(
+        params.input as string | Array<{ type: string; text?: string }>,
+        params.requestId,
+        params.collabAgentPolicy,
+        params.queueTurn,
+        params.automaticRetryState,
+      )
+    } catch (err) {
+      submitted = Promise.reject(err)
+    }
+    let rejectedEarly = false
+    void submitted.catch(() => {
+      rejectedEarly = true
+      if (this._activeTurn === ctx) this._activeTurn = null
+    })
+    queueMicrotask(() => {
+      if (rejectedEarly) return
+      if (this._routeTurn === ctx && !ctx.parser.finalized && !this._interrupting) {
+        this._activeTurn = ctx
+      }
+    })
     return {
       submitted,
       summary,
@@ -532,6 +553,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   }
 
   interrupt(): boolean {
+    this._interrupting = true
+    if (this._activeTurn) this._activeTurn = null
     return this.kernel.interrupt()
   }
 
@@ -671,7 +694,10 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     body: string,
   ): Promise<{ ok: boolean; processAlive: boolean }> {
     if (!this.kernel.isRunning) return { ok: false, processAlive: false }
-    if (!this._activeTurn) return { ok: false, processAlive: true }
+    if (this._interrupting) return { ok: false, processAlive: true }
+    const turn = this._activeTurn
+    if (!turn || !turn.parser || turn.parser.finalized) return { ok: false, processAlive: true }
+    if (this.kernel.hasIngestedParentTurn === false) return { ok: false, processAlive: true }
     return this.kernel.writeDelegateTerminalNotification(
       buildCodexDelegateTerminalNotification(event, body),
     )

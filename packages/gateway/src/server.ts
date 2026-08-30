@@ -10714,7 +10714,15 @@ export class Gateway {
       inlinePush: {
         write: async (event) => {
           const session = this.sessions?.getByKey?.(event.parentSessionKey) as InlinePushSession | undefined
-          return writeInlinePushForSession(session, event, formatJobTerminalMarkdown(event))
+          return writeInlinePushForSession(
+            session,
+            event,
+            formatJobTerminalMarkdown(event),
+            process.env,
+            {
+              isCutoverWindowActive: () => this._delegateJobs?.hasActiveCutoverWindow() === true,
+            },
+          )
         },
       },
       resumeInject: {

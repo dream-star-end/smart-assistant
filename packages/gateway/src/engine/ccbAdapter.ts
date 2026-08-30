@@ -43,6 +43,7 @@ import type {
   TurnSummary,
 } from './engineEvents.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
+import { notifyClaimFenceOf } from '../engineNotifier.js'
 import { createLogger } from '../logger.js'
 import { renewTurnLease } from '../masterTurnLease.js'
 
@@ -274,6 +275,8 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
    * pendingToolCalls 归 0、telemetry 停止 ingest。
    */
   private _activeTurn: CcbTurnContext | null = null
+  /** InlinePush eligibility is revoked at interrupt / terminal persistence. */
+  private _interrupting = false
   /**
    * A0/F3 owner attribution:Bash tool_use_id → 发起它的 turn 上下文。CCB bg bash 的
    * bash_output_tail 在后续 turn 期间仍持续 emit,若一律按 _routeTurn(最近一次
@@ -302,7 +305,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     // telemetry 只喂尚未终态的当前 turn(旧 per-turn 'telemetry' 监听在 detach()
     // 卸载 → turn 间事件丢弃,语义一致)。
     this.runner.on('telemetry', (ev: OcTelemetryEvent) => {
-      this._activeTurn?.telemetry.ingest(ev)
+      (this._activeTurn ?? this._routeTurn)?.telemetry.ingest(ev)
     })
     for (const name of FORWARDED_RUNNER_EVENTS) {
       this.runner.on(name, (...args: unknown[]) => {
@@ -382,14 +385,15 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       pendingPermissionRequestIds: new Set(),
     }
     this._routeTurn = ctx
-    this._activeTurn = ctx
-    // PR2 v1.0.66 — requestId 挂 queue entry(CCB 路径 noop 透传)。
-    // 模型权威批次 §4 — modelAuthority 由 runner.submit 转成本 turn 的
-    // ANTHROPIC_CUSTOM_HEADERS(先于 user message 写 stdin);无值 = 本地路径,
-    // runner 侧自取 local_catalog token 并清位(单一收口,adapter 不做判定)。
+    this._interrupting = false
+    // InlinePush must not treat a not-yet-ingested parent turn as live.
+    // _activeTurn is armed only after submit() confirms the user line landed.
     const submitted = this.runner
       .submit(params.input, params.requestId, params.modelAuthority, params.turnKey)
       .then(() => {
+        if (this._routeTurn === ctx && !ctx.parser.finalized && !this._interrupting) {
+          this._activeTurn = ctx
+        }
         if (params.modelAuthority && params.turnKey && this._activeTurn === ctx) {
           ctx.stopLeaseRenewal = this._startLeaseRenewal(
             ctx,
@@ -398,6 +402,9 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
           )
         }
       })
+    void submitted.catch(() => {
+      if (this._activeTurn === ctx) this._activeTurn = null
+    })
     return {
       submitted,
       summary,
@@ -557,6 +564,8 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   interrupt(): boolean {
+    this._interrupting = true
+    if (this._activeTurn) this._activeTurn = null
     return this.runner.interrupt()
   }
 
@@ -684,7 +693,11 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     body: string,
   ): Promise<{ ok: boolean; processAlive: boolean }> {
     if (!this.runner.isRunning) return { ok: false, processAlive: false }
-    if (!this._activeTurn) return { ok: false, processAlive: true }
+    if (this._interrupting) return { ok: false, processAlive: true }
+    const turn = this._activeTurn
+    if (!turn || !turn.parser || turn.parser.finalized) return { ok: false, processAlive: true }
+    const fence = notifyClaimFenceOf(_event)
+    if (fence && !fence.isLive()) return { ok: false, processAlive: true }
     return this.runner.writeDelegateUserMessage(body)
   }
 }

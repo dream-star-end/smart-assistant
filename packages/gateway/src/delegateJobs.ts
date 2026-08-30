@@ -528,6 +528,19 @@ export class DelegateJobStore {
     return this.freezeHolders.size > 0
   }
 
+  /**
+   * Runtime cutover/drain window. Feature flag OC_DELEGATE_CUTOVER being on
+   * is not a window — only a live `cutover:<generation>` or `drain:<n>` freeze
+   * holder disables InlinePush.
+   */
+  hasActiveCutoverWindow(): boolean {
+    this.purgeExpiredFreezeHolders()
+    for (const holder of this.freezeHolders.keys()) {
+      if (holder.startsWith('cutover:') || holder.startsWith('drain:')) return true
+    }
+    return false
+  }
+
   attachRunner(jobId: string, claimToken: string, fencingEpoch: number): void {
     this.runners.set(jobId, { claimToken, fencingEpoch, phase: 'attached' })
   }
@@ -1171,6 +1184,22 @@ export class DelegateJobStore {
     job.notifyClaimedUntil = null
     job.notifyRetryAt = null
     job.lastActivityAt = now
+    return true
+  }
+
+  /**
+   * Slow-A fence: the claimed delivery token is still the exclusive owner.
+   * Reads durable so a second store on the same SQLite can invalidate the
+   * first writer after reclaim. Delivered or expired claims are not live.
+   */
+  isNotifyClaimLive(jobId: string, deliveryToken: string): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job) return false
+    if (job.callbackState === 'delivered' || job.callbackState === 'abandoned') return false
+    if (job.callbackState !== 'injecting') return false
+    if (job.notifyDeliveryToken !== deliveryToken) return false
+    const now = this.now()
+    if (job.notifyClaimedUntil != null && job.notifyClaimedUntil <= now) return false
     return true
   }
 

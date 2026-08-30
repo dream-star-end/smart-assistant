@@ -37,6 +37,16 @@ export { renderCcbGoalPrompt }
 
 const runnerLog = createLogger({ module: 'subprocessRunner' })
 
+const guardedStdin = new WeakSet<object>()
+function guardStdinErrors(stdin: { on?: (event: 'error', fn: (err: Error) => void) => unknown } | null | undefined): void {
+  if (!stdin || typeof stdin.on !== 'function') return
+  if (guardedStdin.has(stdin)) return
+  guardedStdin.add(stdin)
+  stdin.on('error', () => {
+    /* swallow async EPIPE so a settled write cannot become uncaughtException */
+  })
+}
+
 const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 
@@ -1769,10 +1779,12 @@ export class SubprocessRunner extends EventEmitter {
    */
   async writeDelegateUserMessage(content: string): Promise<{ ok: boolean; processAlive: boolean }> {
     const proc = this.proc
-    const processAlive = Boolean(proc && !this.closed && !proc.killed && proc.exitCode == null)
-    if (!processAlive || !proc) return { ok: false, processAlive: false }
+    if (!this.isInlinePushProcLive(proc) || !proc) return { ok: false, processAlive: false }
     const stdin = proc.stdin
-    if (!stdin || stdin.writable === false) return { ok: false, processAlive: true }
+    if (!stdin || stdin.writable === false || stdin.destroyed) {
+      return { ok: false, processAlive: true }
+    }
+    guardStdinErrors(stdin)
     const userMsg = {
       type: 'user',
       message: {
@@ -1783,16 +1795,45 @@ export class SubprocessRunner extends EventEmitter {
     }
     try {
       await new Promise<void>((resolve, reject) => {
-        stdin.write(`${JSON.stringify(userMsg)}\n`, (err) => {
+        let settled = false
+        const timer = setTimeout(() => finish(new Error('ccb stdin write timeout')), 2_000)
+        timer.unref?.()
+        const finish = (err?: Error | null): void => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          if (typeof proc.off === 'function') proc.off('close', onClose)
+          if (typeof stdin.off === 'function') stdin.off('error', onError)
           if (err) reject(err)
           else resolve()
-        })
+        }
+        const onClose = (): void => finish(new Error('ccb process closed during inline push'))
+        const onError = (err: Error): void => finish(err)
+        if (typeof proc.once === 'function') proc.once('close', onClose)
+        if (typeof stdin.once === 'function') stdin.once('error', onError)
+        try {
+          const ok = stdin.write(`${JSON.stringify(userMsg)}\n`, (err) => finish(err))
+          if (ok === false && (stdin.writable === false || stdin.destroyed)) {
+            finish(new Error('ccb stdin not writable after backpressure'))
+          }
+        } catch (err) {
+          finish(err as Error)
+        }
       })
+      if (!this.isInlinePushProcLive(proc) || this.proc !== proc) {
+        return { ok: false, processAlive: false }
+      }
       return { ok: true, processAlive: true }
     } catch {
-      const stillAlive = Boolean(this.proc && !this.closed && !this.proc.killed)
-      return { ok: false, processAlive: stillAlive }
+      return { ok: false, processAlive: this.isInlinePushProcLive(this.proc) }
     }
+  }
+
+  private isInlinePushProcLive(proc: ChildProcessWithoutNullStreams | null): boolean {
+    if (!proc || this.proc !== proc || this.closed) return false
+    if (proc.killed || proc.exitCode != null) return false
+    if (proc.signalCode != null) return false
+    return true
   }
 
   // ─── Build per-session learning-loop context files ───

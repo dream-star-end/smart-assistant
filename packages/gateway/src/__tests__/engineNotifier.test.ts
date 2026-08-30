@@ -19,7 +19,10 @@ import {
 } from '@openclaude/protocol'
 import { decideSendToAgentIntentRecovery } from '../delegateCallbackOwner.js'
 import { DelegateDurableDb } from '../delegateDurable.js'
+import { cutoverFreezeHolder } from '../delegateCutover.js'
 import { DelegateJobStore, nextNotifyBackoffMs, NOTIFY_CLAIM_LEASE_MS } from '../delegateJobs.js'
+import { SubprocessRunner } from '../subprocessRunner.js'
+import { CodexAppServerRunner } from '../engine/codexAppServerRunner.js'
 import {
   delayUntilNextNotifyRetry,
   dispatchJobTerminalNotify,
@@ -29,6 +32,7 @@ import {
   DefaultEngineNotifier,
   buildCcbInlinePushUserLine,
   buildCodexDelegateTerminalNotification,
+  notifyClaimFenceOf,
   tryWriteInlinePush,
   writeInlinePushForSession,
 } from '../engineNotifier.js'
@@ -434,7 +438,7 @@ describe('档 A InlinePush', () => {
     assert.match(duck[0]!, /delegate\/terminal/)
   })
 
-  it('cutover-effective flag-on forces degrade so B can own the same notifyId', async () => {
+  it('all flags on without a freeze window still uses lane A', async () => {
     let adapterCalls = 0
     const session = {
       runner: {
@@ -454,13 +458,57 @@ describe('档 A InlinePush', () => {
       OC_DELEGATE_INLINE_PUSH_CCB: '1',
     }
     const pushed = await writeInlinePushForSession(session, terminalEvent(), 'BODY', env)
+    assert.equal(pushed.ok, true)
+    assert.equal(adapterCalls, 1)
+    const resumes: string[] = []
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: (event) => writeInlinePushForSession(session, event, 'BODY', env),
+      },
+      resumeInject: {
+        inject: async (event) => {
+          resumes.push(delegateNotifyId(event.jobId, event.callbackEpoch))
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(terminalEvent())
+    assert.equal(result.ok, true)
+    if (!result.ok) return
+    assert.equal(result.lane, 'inline-push')
+    assert.equal(result.notifyId, 'dlgnfy.dlgjob-n1.1')
+    assert.deepEqual(resumes, [])
+    assert.equal(adapterCalls, 2)
+  })
+
+  it('active cutover freeze window forces degrade to B with the same notifyId', async () => {
+    let adapterCalls = 0
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: true,
+        writeDelegateTerminal: async () => {
+          adapterCalls += 1
+          return { ok: true, processAlive: true }
+        },
+      },
+    }
+    const env = {
+      OC_DELEGATE_SM: '1',
+      OC_DELEGATE_DURABLE: '1',
+      OC_DELEGATE_NOTIFIER: '1',
+      OC_DELEGATE_CUTOVER: '1',
+      OC_DELEGATE_INLINE_PUSH_CCB: '1',
+    }
+    const runtime = { isCutoverWindowActive: () => true }
+    const pushed = await writeInlinePushForSession(session, terminalEvent(), 'BODY', env, runtime)
     assert.equal(pushed.ok, false)
     assert.equal(pushed.processAlive, true)
     assert.equal(adapterCalls, 0)
     const resumes: string[] = []
     const notifier = new DefaultEngineNotifier({
       inlinePush: {
-        write: (event) => writeInlinePushForSession(session, event, 'BODY', env),
+        write: (event) => writeInlinePushForSession(session, event, 'BODY', env, runtime),
       },
       resumeInject: {
         inject: async (event) => {
@@ -477,6 +525,41 @@ describe('档 A InlinePush', () => {
     assert.deepEqual(resumes, ['dlgnfy.dlgjob-n1.1'])
   })
 
+  it('thawed cutover window restores lane A', async () => {
+    const store = new DelegateJobStore({ sm: true, ttlMs: 60_000, leaseMs: 1_000 })
+    store.freezeDispatch(cutoverFreezeHolder(7))
+    assert.equal(store.hasActiveCutoverWindow(), true)
+    assert.equal(store.isDispatchFrozen(), true)
+    let adapterCalls = 0
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: true,
+        writeDelegateTerminal: async () => {
+          adapterCalls += 1
+          return { ok: true, processAlive: true }
+        },
+      },
+    }
+    const env = {
+      OC_DELEGATE_SM: '1',
+      OC_DELEGATE_DURABLE: '1',
+      OC_DELEGATE_NOTIFIER: '1',
+      OC_DELEGATE_CUTOVER: '1',
+      OC_DELEGATE_INLINE_PUSH_CCB: '1',
+    }
+    const runtime = { isCutoverWindowActive: () => store.hasActiveCutoverWindow() }
+    const frozen = await writeInlinePushForSession(session, terminalEvent(), 'BODY', env, runtime)
+    assert.equal(frozen.ok, false)
+    assert.equal(adapterCalls, 0)
+    store.thawDispatch(cutoverFreezeHolder(7))
+    assert.equal(store.hasActiveCutoverWindow(), false)
+    const thawed = await writeInlinePushForSession(session, terminalEvent(), 'BODY', env, runtime)
+    assert.equal(thawed.ok, true)
+    assert.equal(adapterCalls, 1)
+    store.close()
+  })
+
   it('buildCcbInlinePushUserLine uses structured text blocks, not a raw string', () => {
     const line = buildCcbInlinePushUserLine('hello <delegate-terminal jobId=x>')
     const parsed = JSON.parse(line.trim()) as {
@@ -489,7 +572,7 @@ describe('档 A InlinePush', () => {
     assert.match(parsed.message.content[0]!.text, /delegate-terminal/)
   })
 
-  it('CcbAdapter only writes while a turn is active; Codex writes delegate/terminal', async () => {
+  it('CcbAdapter only writes after parent submit succeeds; Codex writes delegate/terminal', async () => {
     const dummyOpts = {
       sessionKey: 'agent:main:webchat:dm:r3',
       agentId: 'main',
@@ -499,6 +582,9 @@ describe('档 A InlinePush', () => {
     class FakeCcbRunner extends EventEmitter {
       isRunning = true
       writes: string[] = []
+      async submit() {
+        return
+      }
       async writeDelegateUserMessage(content: string) {
         this.writes.push(content)
         return { ok: true as const, processAlive: true as const }
@@ -510,14 +596,25 @@ describe('档 A InlinePush', () => {
     assert.equal(idle.ok, false)
     assert.equal(idle.processAlive, true)
     assert.deepEqual(ccbRunner.writes, [])
-    ;(ccb as unknown as { _activeTurn: { id: string } })._activeTurn = { id: 't1' }
+    const turn = ccb.submitTurn({
+      input: 'parent input',
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await turn.submitted
     const live = await ccb.writeDelegateTerminal!(terminalEvent(), 'BODY')
     assert.equal(live.ok, true)
     assert.deepEqual(ccbRunner.writes, ['BODY'])
+    turn.end()
 
     class FakeCodexKernel extends EventEmitter {
       isRunning = true
+      hasIngestedParentTurn = true
       lines: string[] = []
+      submit() {
+        return Promise.resolve()
+      }
       writeDelegateTerminalNotification(line: string) {
         this.lines.push(line)
         return { ok: true as const, processAlive: true as const }
@@ -528,13 +625,269 @@ describe('档 A InlinePush', () => {
     const codexIdle = await codex.writeDelegateTerminal!(terminalEvent({ parentEngine: 'codex' }), 'BODY')
     assert.equal(codexIdle.ok, false)
     assert.equal(codexIdle.processAlive, true)
-    ;(codex as unknown as { _activeTurn: { id: string } })._activeTurn = { id: 't1' }
+    const codexTurn = codex.submitTurn({
+      input: 'parent input',
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await Promise.resolve()
     const codexLive = await codex.writeDelegateTerminal!(terminalEvent({ parentEngine: 'codex' }), 'BODY')
     assert.equal(codexLive.ok, true)
     assert.equal(kernel.lines.length, 1)
     const parsed = JSON.parse(kernel.lines[0]!) as { method: string; params: { notifyId: string } }
     assert.equal(parsed.method, 'delegate/terminal')
     assert.equal(parsed.params.notifyId, 'dlgnfy.dlgjob-n1.1')
+    codexTurn.end()
+  })
+})
+
+describe('R3 blocker regressions', () => {
+  function openStoreAt(dir: string, now: () => number, bootId: string) {
+    return new DelegateJobStore({
+      sm: true,
+      ttlMs: 60_000,
+      leaseMs: 1_000,
+      durable: new DelegateDurableDb(join(dir, 'delegate-jobs.db')),
+      bootId,
+      now,
+    })
+  }
+
+  it('crash window: A write stamps delivered so restart cannot fire B', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'r3-crash-window-'))
+    let now = 1_000
+    const clock = () => now
+    let aWrites = 0
+    let bWrites = 0
+    try {
+      const s1 = openStoreAt(dir, clock, 'gw:a')
+      const seeded = await seededTerminal(s1, { parentEngine: 'ccb' })
+      const n1 = new DefaultEngineNotifier({
+        inlinePush: {
+          write: async () => {
+            aWrites += 1
+            s1.injectDurableWriteFailure()
+            return { ok: true, processAlive: true }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            throw new Error('lane B must not run after A write')
+          },
+        },
+      })
+      const first = await dispatchJobTerminalNotify(s1, seeded.snap, n1)
+      assert.ok(!('skipped' in first) && first.ok)
+      assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'delivered')
+      s1.close()
+
+      now += NOTIFY_CLAIM_LEASE_MS + 1
+      const s2 = openStoreAt(dir, clock, 'gw:b')
+      s2.hydrateFromDurable()
+      const n2 = new DefaultEngineNotifier({
+        inlinePush: { write: async () => ({ ok: false, processAlive: false }) },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+      })
+      const live = s2.snapshotOf(seeded.jobId)
+      assert.ok(live)
+      const result = await dispatchJobTerminalNotify(s2, live, n2)
+      assert.ok(!('skipped' in result) && result.ok)
+      assert.deepEqual(
+        { aWrites, bWrites, callbackState: s2.snapshotOf(seeded.jobId)?.callbackState },
+        { aWrites: 1, bWrites: 0, callbackState: 'delivered' },
+      )
+      s2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('slow A vs expired claim: fence aborts A write so B is the only settle', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'r3-slow-race-'))
+    let now = 10_000
+    const clock = () => now
+    let releaseA!: () => void
+    const aGate = new Promise<void>((resolve) => {
+      releaseA = resolve
+    })
+    let aWrites = 0
+    let bWrites = 0
+    try {
+      const s1 = openStoreAt(dir, clock, 'gw:a')
+      const s2 = openStoreAt(dir, clock, 'gw:b')
+      const seeded = await seededTerminal(s1, { parentEngine: 'ccb' })
+      s2.hydrateFromDurable()
+      const n1 = new DefaultEngineNotifier({
+        inlinePush: {
+          write: async (event) => {
+            await aGate
+            const fence = notifyClaimFenceOf(event)
+            if (fence && !fence.isLive()) {
+              return { ok: false, processAlive: true }
+            }
+            aWrites += 1
+            return { ok: true, processAlive: true }
+          },
+        },
+        resumeInject: {
+          inject: async () => {
+            throw new Error('slow A must not degrade to B after losing the claim')
+          },
+        },
+      })
+      const pA = dispatchJobTerminalNotify(s1, seeded.snap, n1)
+      await new Promise((resolve) => setImmediate(resolve))
+      assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'injecting')
+
+      now += NOTIFY_CLAIM_LEASE_MS + 1
+      const n2 = new DefaultEngineNotifier({
+        inlinePush: { write: async () => ({ ok: false, processAlive: false }) },
+        resumeInject: {
+          inject: async () => {
+            bWrites += 1
+            return { ok: true }
+          },
+        },
+      })
+      const live = s2.snapshotOf(seeded.jobId)
+      assert.ok(live)
+      const resultB = await dispatchJobTerminalNotify(s2, live, n2)
+      assert.ok(!('skipped' in resultB) && resultB.ok)
+      releaseA()
+      const resultA = await pA
+      assert.ok(!('skipped' in resultA) && resultA.ok)
+      assert.deepEqual(
+        { aWrites, bWrites, callbackState: s2.snapshotOf(seeded.jobId)?.callbackState },
+        { aWrites: 0, bWrites: 1, callbackState: 'delivered' },
+      )
+      s1.close()
+      s2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('CCB death window after write callback is A failure not a false success', async () => {
+    const ccb = new SubprocessRunner({ resumeSessionId: undefined } as never)
+    const ccbProc: {
+      killed: boolean
+      exitCode: number | null
+      stdin: { writable: boolean; write: (chunk: string, cb: (err?: Error | null) => void) => boolean }
+    } = {
+      killed: false,
+      exitCode: null,
+      stdin: {
+        writable: true,
+        write(_chunk: string, cb: (err?: Error | null) => void) {
+          ccbProc.killed = true
+          ccbProc.exitCode = 1
+          cb(null)
+          return true
+        },
+      },
+    }
+    ;(ccb as unknown as { proc: typeof ccbProc }).proc = ccbProc
+    ;(ccb as unknown as { closed: boolean }).closed = false
+    const ccbResult = await ccb.writeDelegateUserMessage('x')
+    assert.deepEqual(ccbResult, { ok: false, processAlive: false })
+  })
+
+  it('Codex writeRaw rejects dead/backpressure and swallows async EPIPE', async () => {
+    const codex = new CodexAppServerRunner({} as never)
+    ;(codex as unknown as { proc: object }).proc = {
+      killed: false,
+      exitCode: 1,
+      signalCode: null,
+      stdin: { writable: false, destroyed: false, write: () => false },
+    }
+    const codexResult = await codex.writeDelegateTerminalNotification('{"jsonrpc":"2.0"}')
+    assert.deepEqual(codexResult, { ok: false, processAlive: false })
+
+    const pressure = new CodexAppServerRunner({} as never)
+    ;(pressure as unknown as { proc: object }).proc = {
+      killed: false,
+      exitCode: null,
+      signalCode: null,
+      stdin: {
+        writable: true,
+        destroyed: false,
+        write: (_chunk: string, cb?: (err?: Error | null) => void) => {
+          cb?.(new Error('backpressure'))
+          return false
+        },
+      },
+    }
+    const pressureResult = await pressure.writeDelegateTerminalNotification('{"jsonrpc":"2.0"}')
+    assert.equal(pressureResult.ok, false)
+
+    const asyncCodex = new CodexAppServerRunner({} as never)
+    const asyncStdin = new EventEmitter() as EventEmitter & {
+      writable: boolean
+      destroyed: boolean
+      write: (_chunk: string, cb?: (err?: Error | null) => void) => boolean
+    }
+    asyncStdin.writable = true
+    asyncStdin.destroyed = false
+    asyncStdin.write = (_chunk, cb) => {
+      queueMicrotask(() => {
+        const error = Object.assign(new Error('broken pipe'), { code: 'EPIPE' })
+        asyncStdin.emit('error', error)
+        cb?.(error)
+      })
+      return true
+    }
+    ;(asyncCodex as unknown as { proc: object }).proc = {
+      killed: false,
+      exitCode: null,
+      signalCode: null,
+      stdin: asyncStdin,
+    }
+    let uncaughtCode: string | undefined
+    const onUncaught = (error: NodeJS.ErrnoException) => {
+      uncaughtCode = error.code
+    }
+    process.once('uncaughtException', onUncaught)
+    const asyncCodexResult = await asyncCodex.writeDelegateTerminalNotification('{"jsonrpc":"2.0"}')
+    await new Promise((resolve) => setImmediate(resolve))
+    process.off('uncaughtException', onUncaught)
+    assert.equal(asyncCodexResult.ok, false)
+    assert.equal(uncaughtCode, undefined)
+  })
+
+  it('parent submit rejection does not write an orphan InlinePush turn', async () => {
+    class FakeRunner extends EventEmitter {
+      isRunning = true
+      lastActivityAt = Date.now()
+      writes = 0
+      submit(): Promise<void> {
+        return Promise.reject(new Error('submit rejected before user line'))
+      }
+      writeDelegateUserMessage(): Promise<{ ok: boolean; processAlive: boolean }> {
+        this.writes += 1
+        return Promise.resolve({ ok: true, processAlive: true })
+      }
+    }
+    const fake = new FakeRunner()
+    const adapter = new CcbAdapter({} as never, fake as never)
+    const turn = adapter.submitTurn({
+      input: 'parent input',
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    const pushed = await adapter.writeDelegateTerminal!(terminalEvent(), 'delegate terminal')
+    await assert.rejects(turn.submitted)
+    assert.deepEqual(
+      { pushed, writes: fake.writes },
+      { pushed: { ok: false, processAlive: true }, writes: 0 },
+    )
+    turn.end()
   })
 })
 

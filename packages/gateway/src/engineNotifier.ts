@@ -14,10 +14,7 @@ import {
   type NotifyResult,
 } from '@openclaude/protocol'
 import { ccbStdinUserContent } from './ccbNativeCompaction.js'
-import {
-  isDelegateCutoverEffective,
-  isDelegateInlinePushEnabled,
-} from './delegateSmFlag.js'
+import { isDelegateInlinePushEnabled } from './delegateSmFlag.js'
 import { isHeartbeatSilentOutput } from './jobTerminal.js'
 
 export type InlinePushPort = {
@@ -51,6 +48,19 @@ export type EngineNotifierOptions = {
   now?: () => number
   /** Cursor/Grok/zcode: missing nativeId is transport (no silent empty chat). */
   requireNativeId?: boolean
+}
+
+/** Per-notify claim fence attached by dispatchJobTerminalNotify. */
+export const NOTIFY_CLAIM_FENCE = Symbol.for('openclaude.notifyClaimFence')
+
+export type NotifyClaimFence = {
+  isLive: () => boolean
+  ackDelivered: () => boolean
+}
+
+export type InlinePushRuntime = {
+  /** Live BeginCutover / recycle drain freeze — not the CUTOVER feature flag. */
+  isCutoverWindowActive?: () => boolean
 }
 
 export class DefaultEngineNotifier implements EngineNotifier {
@@ -135,9 +145,30 @@ export class DefaultEngineNotifier implements EngineNotifier {
 
   private async tryInlinePush(event: JobTerminal): Promise<boolean> {
     if (!this.opts.inlinePush) return false
+    const fence = notifyClaimFenceOf(event)
     try {
+      if (fence && !fence.isLive()) return false
       const result = await this.opts.inlinePush.write(event)
-      return Boolean(result?.ok && result.processAlive)
+      if (fence && !fence.isLive()) {
+        try {
+          fence.ackDelivered()
+        } catch {
+          /* stale token; the live owner already stamped or is stamping */
+        }
+        // Another owner reclaimed. Never start B from this generation.
+        return true
+      }
+      if (!result?.ok || !result.processAlive) return false
+      // A side effect landed. Stamp delivered immediately so a crash/reclaim
+      // cannot start lane B.
+      if (fence) {
+        try {
+          fence.ackDelivered()
+        } catch {
+          /* durable write failed; dispatch retries completeNotifyDelivery */
+        }
+      }
+      return true
     } catch {
       return false
     }
@@ -215,24 +246,33 @@ export function buildCodexDelegateTerminalNotification(event: JobTerminal, body:
 /**
  * Production 档 A dispatch. Flag-on uses EngineAdapter.writeDelegateTerminal.
  * Flag-off keeps the R0/R1 duck-type probe (653ef6339 equivalent).
- * Cutover-effective → force fail so Notifier degrades to ResumeInject.
+ * An active cutover/drain freeze window forces fail so Notifier degrades to
+ * ResumeInject. The CUTOVER feature flag alone is not a window.
  */
 export async function writeInlinePushForSession(
   session: InlinePushSession | undefined,
   event: JobTerminal,
   body: string,
   env: NodeJS.ProcessEnv = process.env,
+  runtime: InlinePushRuntime = {},
 ): Promise<{ ok: boolean; processAlive: boolean }> {
   if (!isDelegateInlinePushEnabled(event.parentEngine, env)) {
     return tryWriteInlinePush(session, event, body)
   }
   const runner = session?.runner
   const processAlive = Boolean(runner?.isRunning)
-  if (isDelegateCutoverEffective(env)) {
+  const fence = notifyClaimFenceOf(event)
+  if (fence && !fence.isLive()) {
+    return { ok: false, processAlive }
+  }
+  if (runtime.isCutoverWindowActive?.() === true) {
     return { ok: false, processAlive }
   }
   const write = runner?.writeDelegateTerminal
   if (typeof write !== 'function') {
+    return { ok: false, processAlive }
+  }
+  if (fence && !fence.isLive()) {
     return { ok: false, processAlive }
   }
   try {
@@ -244,6 +284,11 @@ export async function writeInlinePushForSession(
   } catch {
     return { ok: false, processAlive: false }
   }
+}
+
+export function notifyClaimFenceOf(event: JobTerminal): NotifyClaimFence | undefined {
+  const fence = (event as JobTerminal & { [NOTIFY_CLAIM_FENCE]?: NotifyClaimFence })[NOTIFY_CLAIM_FENCE]
+  return fence
 }
 
 /**

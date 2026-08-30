@@ -26,6 +26,7 @@ import {
   isLegacyCronOriginLane,
   parseOriginWebchatSessionKey,
 } from './cronOriginSession.js'
+import { NOTIFY_CLAIM_FENCE, type NotifyClaimFence } from './engineNotifier.js'
 
 export type NotifyFence = { claimToken: string; fencingEpoch: number }
 
@@ -171,14 +172,35 @@ export async function dispatchJobTerminalNotify(
     const claimed = store.claimNotifyDelivery(job.id, fenceOf(live))
     if (!claimed.ok) return { skipped: true, reason: 'lost_claim' }
     deliveryToken = claimed.token
+    const token = claimed.token
+    const fence: NotifyClaimFence = {
+      isLive: () => store.isNotifyClaimLive(live.id, token),
+      ackDelivered: () => {
+        try {
+          return store.completeNotifyDelivery(live.id, token, fenceOf(live))
+        } catch {
+          return false
+        }
+      },
+    }
+    Object.defineProperty(event, NOTIFY_CLAIM_FENCE, {
+      value: fence,
+      enumerable: false,
+      configurable: true,
+    })
   }
 
   let result: NotifyResult
   try {
     result = await notifier.notify(event)
   } catch (err) {
+    // A write may already have landed. Never release a delivered receipt;
+    // leave injecting so reclaim must CAS against delivered.
     if (owned && deliveryToken) {
-      store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(live))
+      const latest = store.snapshotOf(job.id)
+      if (latest?.callbackState !== 'delivered') {
+        store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(live))
+      }
     }
     throw err
   }
@@ -191,7 +213,12 @@ export async function dispatchJobTerminalNotify(
       })
     }
     if (owned && deliveryToken) {
-      const delivered = store.completeNotifyDelivery(job.id, deliveryToken, fenceOf(live))
+      let delivered = false
+      try {
+        delivered = store.completeNotifyDelivery(job.id, deliveryToken, fenceOf(live))
+      } catch {
+        delivered = store.snapshotOf(job.id)?.callbackState === 'delivered'
+      }
       if (delivered) await hooks.onDelivered?.(store.snapshotOf(job.id) ?? live)
     }
     return result

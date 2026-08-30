@@ -60,6 +60,16 @@ import type { AutomaticRetryState, CollabAgentPolicy, NativeModelHandoffArtifact
 
 const log = createLogger({ module: 'codexAppServerRunner' })
 
+const guardedStdin = new WeakSet<object>()
+function guardStdinErrors(stdin: { on?: (event: 'error', fn: (err: Error) => void) => unknown }): void {
+  if (guardedStdin.has(stdin)) return
+  guardedStdin.add(stdin)
+  if (typeof stdin.on !== 'function') return
+  stdin.on('error', () => {
+    /* swallow async EPIPE so a settled write cannot become uncaughtException */
+  })
+}
+
 const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 
@@ -2131,6 +2141,14 @@ export class CodexAppServerRunner extends EventEmitter {
       },
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
+    proc.stdin.on('error', (err: NodeJS.ErrnoException) => {
+      if (this.proc !== proc) return
+      log.warn('codex app-server stdin error', {
+        sessionKey: this.opts.sessionKey,
+        err: err.message,
+        code: err.code,
+      })
+    })
     this.outputDrainPromise = new Promise<void>((resolve) => {
       this.resolveOutputDrain = resolve
     })
@@ -2434,9 +2452,9 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private writeRaw(line: string): boolean {
-    if (!this.proc || this.proc.killed) return false
+    if (!this.isInlinePushProcLive(this.proc)) return false
     try {
-      this.proc.stdin.write(`${line}\n`)
+      this.proc!.stdin.write(`${line}\n`)
       return true
     } catch (err) {
       // EPIPE if proc died between our check and write — fail pending so
@@ -2453,11 +2471,61 @@ export class CodexAppServerRunner extends EventEmitter {
    * app-server stdin. Official mechanism only — does not patch the Codex
    * binary. Unknown notifications may be ignored by app-server (gap reported).
    */
-  writeDelegateTerminalNotification(line: string): { ok: boolean; processAlive: boolean } {
-    const processAlive = Boolean(this.proc && !this.proc.killed)
-    if (!processAlive) return { ok: false, processAlive: false }
-    const ok = this.writeRaw(line)
-    return { ok, processAlive: Boolean(this.proc && !this.proc.killed) }
+  async writeDelegateTerminalNotification(line: string): Promise<{ ok: boolean; processAlive: boolean }> {
+    const proc = this.proc
+    if (!this.isInlinePushProcLive(proc) || !proc) return { ok: false, processAlive: false }
+    const stdin = proc.stdin
+    if (!stdin || stdin.writable === false || stdin.destroyed) {
+      return { ok: false, processAlive: true }
+    }
+    guardStdinErrors(stdin)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false
+        const timer = setTimeout(() => finish(new Error('codex stdin write timeout')), 2_000)
+        timer.unref?.()
+        const finish = (err?: Error | null): void => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          if (typeof stdin.off === 'function') stdin.off('error', onError)
+          if (typeof proc.off === 'function') proc.off('close', onClose)
+          if (err) reject(err)
+          else resolve()
+        }
+        const onError = (err: Error): void => finish(err)
+        const onClose = (): void => finish(new Error('codex process closed during inline push'))
+        if (typeof stdin.once === 'function') stdin.once('error', onError)
+        if (typeof proc.once === 'function') proc.once('close', onClose)
+        try {
+          const ok = stdin.write(`${line}\n`, (err) => finish(err))
+          if (ok === false) finish(new Error('codex stdin backpressure'))
+        } catch (err) {
+          finish(err as Error)
+        }
+      })
+      if (!this.isInlinePushProcLive(proc) || this.proc !== proc) {
+        return { ok: false, processAlive: false }
+      }
+      return { ok: true, processAlive: true }
+    } catch {
+      return { ok: false, processAlive: this.isInlinePushProcLive(this.proc) }
+    }
+  }
+
+  private isInlinePushProcLive(proc: ChildProcessWithoutNullStreams | null): boolean {
+    if (!proc || this.proc !== proc) return false
+    if (proc.killed || proc.exitCode != null || proc.signalCode != null) return false
+    return true
+  }
+
+  /**
+   * Parent-turn ingest proof for InlinePush. kernel.submit() covers the full
+   * turn, so adapter _activeTurn is not enough; a queued/in-flight turn/start
+   * is the ingest ACK. Synchronous submit() throw never reaches this.
+   */
+  get hasIngestedParentTurn(): boolean {
+    return this.queue.length > 0 || this.processing || this.currentTurnCompleter != null || this.activeTurnId != null
   }
 
   private sendRequest(method: string, params: unknown): Promise<unknown> {
