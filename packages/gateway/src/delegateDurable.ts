@@ -109,10 +109,14 @@ export class DelegateDurableDb {
   failNextWrite = false
   private closed = false
   private readonly upsertStmt
+  private readonly insertStmt
+  private readonly casUpdateStmt
+  private readonly casDeleteStmt
   private readonly getStmt
   private readonly getByIdemStmt
   private readonly listStmt
   private readonly listActiveStmt
+  private readonly countActiveStmt
   private readonly deleteStmt
 
   constructor(dbPath: string) {
@@ -164,6 +168,67 @@ export class DelegateDurableDb {
         notify_lane=excluded.notify_lane,
         notify_id=excluded.notify_id
     `)
+    this.insertStmt = this.db.prepare(`
+      INSERT INTO delegate_jobs (
+        job_id, agent_id, state, kind, session_key, parent_session_key, generation,
+        owner_instance_id, owner_lease_until, claim_token, attempt_no, fencing_epoch,
+        checkpoint_kind, callback, callback_state, callback_epoch, idempotency_key,
+        failure_class, failure_detail, result_json, created_at, updated_at,
+        last_activity_at, expires_at, parent_engine, notify_lane, notify_id
+      ) VALUES (
+        @job_id, @agent_id, @state, @kind, @session_key, @parent_session_key, @generation,
+        @owner_instance_id, @owner_lease_until, @claim_token, @attempt_no, @fencing_epoch,
+        @checkpoint_kind, @callback, @callback_state, @callback_epoch, @idempotency_key,
+        @failure_class, @failure_detail, @result_json, @created_at, @updated_at,
+        @last_activity_at, @expires_at, @parent_engine, @notify_lane, @notify_id
+      )
+    `)
+    this.casUpdateStmt = this.db.prepare(`
+      UPDATE delegate_jobs SET
+        agent_id=@agent_id,
+        state=@state,
+        kind=@kind,
+        session_key=@session_key,
+        parent_session_key=@parent_session_key,
+        generation=@generation,
+        owner_instance_id=@owner_instance_id,
+        owner_lease_until=@owner_lease_until,
+        claim_token=@claim_token,
+        attempt_no=@attempt_no,
+        fencing_epoch=@fencing_epoch,
+        checkpoint_kind=@checkpoint_kind,
+        callback=@callback,
+        callback_state=@callback_state,
+        callback_epoch=@callback_epoch,
+        idempotency_key=@idempotency_key,
+        failure_class=@failure_class,
+        failure_detail=@failure_detail,
+        result_json=@result_json,
+        updated_at=@updated_at,
+        last_activity_at=@last_activity_at,
+        expires_at=@expires_at,
+        parent_engine=@parent_engine,
+        notify_lane=@notify_lane,
+        notify_id=@notify_id
+      WHERE job_id=@job_id
+        AND state=@expected_state
+        AND fencing_epoch=@expected_epoch
+        AND (
+          (@expected_token IS NULL AND claim_token IS NULL)
+          OR claim_token=@expected_token
+        )
+      RETURNING *
+    `)
+    this.casDeleteStmt = this.db.prepare(`
+      DELETE FROM delegate_jobs
+      WHERE job_id=@job_id
+        AND state=@expected_state
+        AND fencing_epoch=@expected_epoch
+        AND (
+          (@expected_token IS NULL AND claim_token IS NULL)
+          OR claim_token=@expected_token
+        )
+    `)
     this.getStmt = this.db.prepare('SELECT * FROM delegate_jobs WHERE job_id = ?')
     this.getByIdemStmt = this.db.prepare(
       'SELECT * FROM delegate_jobs WHERE idempotency_key = ? LIMIT 1',
@@ -171,6 +236,9 @@ export class DelegateDurableDb {
     this.listStmt = this.db.prepare('SELECT * FROM delegate_jobs')
     this.listActiveStmt = this.db.prepare(
       `SELECT * FROM delegate_jobs WHERE state IN ('queued','running','paused_for_cutover')`,
+    )
+    this.countActiveStmt = this.db.prepare(
+      `SELECT COUNT(*) AS n FROM delegate_jobs WHERE state IN ('queued','running','paused_for_cutover')`,
     )
     this.deleteStmt = this.db.prepare('DELETE FROM delegate_jobs WHERE job_id = ?')
   }
@@ -190,13 +258,90 @@ export class DelegateDurableDb {
   }
 
   upsert(record: DurableJobRecord): void {
-    if (this.failNextWrite) {
-      this.failNextWrite = false
-      const err = new Error('delegate durable persist failed')
-      ;(err as NodeJS.ErrnoException).code = 'ENOSPC'
-      throw err
-    }
+    this.throwIfInjectedFailure()
     this.upsertStmt.run(toRow(record))
+  }
+
+  /**
+   * Insert a new row inside a transaction that also arbitrates idempotency
+   * and non-terminal capacity. The DB is the authority for both.
+   */
+  insertCreate(
+    record: DurableJobRecord,
+    maxJobs: number,
+  ): { ok: true } | { error: 'capacity' } | { reused: DurableJobRecord } {
+    this.throwIfInjectedFailure()
+    return this.transaction(() => {
+      if (record.idempotencyKey) {
+        const hit = this.findByIdempotencyKey(record.idempotencyKey)
+        if (hit) return { reused: hit }
+      }
+      const n = this.countNonTerminal()
+      if (n >= maxJobs) return { error: 'capacity' as const }
+      try {
+        this.insertStmt.run(toRow(record))
+        return { ok: true as const }
+      } catch (err) {
+        const code = (err as { code?: string }).code ?? ''
+        if (code.startsWith('SQLITE_CONSTRAINT') && record.idempotencyKey) {
+          const hit = this.findByIdempotencyKey(record.idempotencyKey)
+          if (hit) return { reused: hit }
+        }
+        throw err
+      }
+    })
+  }
+
+  /**
+   * Fence CAS: only the row matching (job_id, expected state, epoch, token)
+   * is replaced. Returns the persisted row, or undefined when this writer lost.
+   */
+  casUpdate(
+    expected: {
+      jobId: string
+      state: string
+      fencingEpoch: number
+      claimToken?: string | null
+    },
+    record: DurableJobRecord,
+  ): DurableJobRecord | undefined {
+    this.throwIfInjectedFailure()
+    const row = this.casUpdateStmt.get({
+      ...toRow(record),
+      expected_state: expected.state,
+      expected_epoch: expected.fencingEpoch,
+      expected_token: expected.claimToken ?? null,
+    }) as Record<string, unknown> | undefined
+    return row ? fromRow(row) : undefined
+  }
+
+  casDelete(expected: {
+    jobId: string
+    state: string
+    fencingEpoch: number
+    claimToken?: string | null
+  }): boolean {
+    this.throwIfInjectedFailure()
+    const info = this.casDeleteStmt.run({
+      job_id: expected.jobId,
+      expected_state: expected.state,
+      expected_epoch: expected.fencingEpoch,
+      expected_token: expected.claimToken ?? null,
+    })
+    return info.changes === 1
+  }
+
+  countNonTerminal(): number {
+    const row = this.countActiveStmt.get() as { n?: number } | undefined
+    return Number(row?.n ?? 0)
+  }
+
+  private throwIfInjectedFailure(): void {
+    if (!this.failNextWrite) return
+    this.failNextWrite = false
+    const err = new Error('delegate durable persist failed')
+    ;(err as NodeJS.ErrnoException).code = 'ENOSPC'
+    throw err
   }
 
   get(jobId: string): DurableJobRecord | undefined {
@@ -218,12 +363,7 @@ export class DelegateDurableDb {
   }
 
   delete(jobId: string): void {
-    if (this.failNextWrite) {
-      this.failNextWrite = false
-      const err = new Error('delegate durable persist failed')
-      ;(err as NodeJS.ErrnoException).code = 'ENOSPC'
-      throw err
-    }
+    this.throwIfInjectedFailure()
     this.deleteStmt.run(jobId)
   }
 

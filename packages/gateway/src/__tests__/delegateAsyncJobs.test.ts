@@ -9,7 +9,27 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/delegateAsyncJobs.test.ts
  */
 import assert from 'node:assert/strict'
-import { describe, it } from 'node:test'
+import { after, before, describe, it } from 'node:test'
+
+const PRODUCT_ENV = [
+  'OC_AGENT_ID',
+  'OC_SELFHOST_ENGINE_LOCAL_TURNS',
+  'OC_MODEL_AUTHORITY',
+  'OC_MODEL_AUTHORITY_KEYRING',
+] as const
+const savedProductEnv: Record<string, string | undefined> = {}
+before(() => {
+  for (const key of PRODUCT_ENV) {
+    savedProductEnv[key] = process.env[key]
+    delete process.env[key]
+  }
+})
+after(() => {
+  for (const key of PRODUCT_ENV) {
+    if (savedProductEnv[key] === undefined) delete process.env[key]
+    else process.env[key] = savedProductEnv[key]
+  }
+})
 
 import { DelegateJobStore } from '../delegateJobs.js'
 import {

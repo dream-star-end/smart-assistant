@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 
 import {
   buildSendToAgentCallbackText,
+  callbackPayloadFromDurableJob,
   isSendToAgentCallbackComplete,
   sendToAgentCallbackClientMessageId,
   sendToAgentCallbackIdempotencyKey,
@@ -41,6 +42,30 @@ describe('sendToAgentCallback text + ids', () => {
     assert.equal(isSendToAgentCallbackComplete('origin-inject'), true)
     assert.equal(isSendToAgentCallbackComplete(true), false)
     assert.equal(isSendToAgentCallbackComplete('notify'), false)
+  })
+
+  it('rebuilds inject payload from a durable terminal snapshot', () => {
+    const text = buildSendToAgentCallbackText({
+      agentId: 'coding-assistant',
+      goal: 'x',
+      ...callbackPayloadFromDurableJob({
+        state: 'completed',
+        result: { body: { output: 'UNIQUE_OUTPUT' } },
+      }),
+    })
+    assert.match(text, /UNIQUE_OUTPUT/)
+    assert.doesNotMatch(text, /没有返回正文/)
+    const failed = buildSendToAgentCallbackText({
+      agentId: 'coding-assistant',
+      goal: 'x',
+      ...callbackPayloadFromDurableJob({
+        state: 'failed',
+        failureDetail: 'upstream 402',
+        result: { body: { error: 'upstream 402' } },
+      }),
+    })
+    assert.match(failed, /失败/)
+    assert.match(failed, /upstream 402/)
   })
 
   it('accepts a live webchat parent key', () => {

@@ -2,7 +2,7 @@
  * OCV5-22 B3: cron fire Enqueue-then-project. Unique idempotency key is the
  * occurrence execution right; retries return the original dlgjob id.
  */
-import { cronDelegateIdempotencyKey } from '@openclaude/protocol'
+import { cronDelegateIdempotencyKey, isDelegateTerminalState, type DelegateJobState } from '@openclaude/protocol'
 import type { DelegateJobStore } from './delegateJobs.js'
 
 export function enqueueCronOccurrenceJob(
@@ -25,9 +25,47 @@ export function enqueueCronOccurrenceJob(
 
 export type CronDelegateFence = { claimToken: string; fencingEpoch: number }
 
+export class CronDelegateClaimDeniedError extends Error {
+  readonly code = 'DELEGATE_CLAIM_DENIED'
+  constructor(
+    readonly reason: 'terminal' | 'not_claimable',
+    readonly state?: DelegateJobState,
+  ) {
+    super(`cron delegate claim denied: ${reason}${state ? ` (${state})` : ''}`)
+    this.name = 'CronDelegateClaimDeniedError'
+  }
+}
+
+export function isCronDelegateClaimDenied(err: unknown): err is CronDelegateClaimDeniedError {
+  return (
+    err instanceof CronDelegateClaimDeniedError ||
+    (typeof err === 'object' &&
+      err !== null &&
+      (err as { code?: string }).code === 'DELEGATE_CLAIM_DENIED')
+  )
+}
+
+/**
+ * Durable job row is the execution right. A failed claim must not fall back to
+ * an occurrence-captured fence or continue without a fence.
+ */
+export function claimCronDelegateExecution(
+  store: DelegateJobStore,
+  jobId: string,
+): CronDelegateFence {
+  const claimed = store.claimQueued(jobId)
+  if (claimed.ok) return { claimToken: claimed.claimToken, fencingEpoch: claimed.fencingEpoch }
+  const snap = store.snapshotOf(jobId)
+  if (!snap || isDelegateTerminalState(snap.state)) {
+    throw new CronDelegateClaimDeniedError('terminal', snap?.state)
+  }
+  throw new CronDelegateClaimDeniedError('not_claimable', snap.state)
+}
+
 /**
  * Terminal-write a cron occurrence job using the fence captured at claim time.
  * Missing or mismatched tokens return false. Never reads the live snapshot token.
+ * HEARTBEAT_OK `skipped_silent` is the same SQLite CAS as `completed`.
  */
 export function settleCronDelegateJob(
   store: DelegateJobStore,
@@ -46,15 +84,13 @@ export function settleCronDelegateJob(
       fencingEpoch: fence.fencingEpoch,
     })
   }
-  const won = store.complete(
+  return store.complete(
     jobId,
     {
       httpStatus: 200,
       body: { ok: true, failure_class: outcome === 'skipped_silent' ? 'cancelled' : undefined },
     },
     fence,
+    outcome === 'skipped_silent' ? { callbackState: 'skipped_silent' } : undefined,
   )
-  if (!won) return false
-  if (outcome === 'skipped_silent') store.patchCallbackState(jobId, 'skipped_silent', fence)
-  return true
 }

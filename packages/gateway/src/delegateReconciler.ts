@@ -57,8 +57,8 @@ export function reconcileDelegateJobsOnBoot(
           httpStatus: 429,
         })
         if (ok) summary.capacityTimedOut += 1
-        continue
       }
+      continue
     }
     const next = store.decideAdoptNextState(job)
     if (shouldDeferKill(store, job, next, now, hooks.isChildAlive)) {
@@ -74,6 +74,28 @@ export function reconcileDelegateJobsOnBoot(
     }
   }
   return summary
+}
+
+/** Earliest wall-clock instant a deferred/queued row needs another scan. */
+export function nextDelegateReconcileAt(
+  store: DelegateJobStore,
+  hooks: DelegateReconcileHooks = {},
+): number | undefined {
+  const now = hooks.now ?? Date.now
+  const queueWaitMs = hooks.queueWaitMs ?? DEFAULT_QUEUE_WAIT_MS
+  let next: number | undefined
+  for (const job of store.listNonTerminal()) {
+    let due: number
+    if (job.state === 'queued') {
+      due = (job.createdAt ?? now()) + queueWaitMs
+    } else if (job.ownerLeaseUntil != null) {
+      due = job.ownerLeaseUntil
+    } else {
+      due = now()
+    }
+    next = next == null ? due : Math.min(next, due)
+  }
+  return next
 }
 
 function shouldDeferKill(
@@ -104,6 +126,7 @@ export function restoreResumeOccupancyFromJobs(
   let n = 0
   for (const job of store.listNonTerminal()) {
     if (!job.sessionKey) continue
+    if (job.kind === 'cron' || job.kind === 'taskboard' || job.kind === 'ccb_local') continue
     registry.restoreInFlight({
       sessionKey: job.sessionKey,
       parentSessionKey: job.parentSessionKey ?? '',

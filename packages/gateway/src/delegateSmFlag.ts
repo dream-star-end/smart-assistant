@@ -17,6 +17,11 @@ export function isDelegateDurableEnabled(env: NodeJS.ProcessEnv = process.env): 
   return raw === '1' || raw === 'true' || raw === 'on'
 }
 
+/** Production durable path is SM && DURABLE. A lone DURABLE=1 is a no-op flag. */
+export function isDelegateDurableEffective(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isDelegateSmEnabled(env) && isDelegateDurableEnabled(env)
+}
+
 export function resolveDelegateCallbackOwner(
   env: NodeJS.ProcessEnv = process.env,
 ): 'job' | 'intent' {

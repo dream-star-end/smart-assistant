@@ -31,6 +31,10 @@ export const MAX_DELEGATE_WAIT_MS = 55_000
 
 export const DEFAULT_MAX_DELEGATE_JOBS = 256
 
+/** B1 lease heartbeat. 480 * 15s = 2h hard cap. */
+export const DELEGATE_LEASE_HEARTBEAT_MS = 15_000
+export const DELEGATE_LEASE_HEARTBEAT_MAX_BEATS = 480
+
 function normalizeMs(
   raw: string | undefined,
   fallback: number,
@@ -167,6 +171,8 @@ export type DelegateJobStoreOptions = {
   durable?: DelegateDurableDb | null
   /** Default true when durable is set. Tests may disable to inject rows first. */
   hydrate?: boolean
+  /** Fired after a successful terminal persist so resume occupancy can release. */
+  onTerminal?: (job: DelegateJobSnapshot) => void
 }
 
 export function mintDelegateClaimToken(): string {
@@ -205,6 +211,7 @@ export class DelegateJobStore {
   private readonly bootId: string
   private readonly leaseMs: number
   private readonly durable: DelegateDurableDb | null
+  private readonly onTerminal?: (job: DelegateJobSnapshot) => void
 
   constructor(opts: DelegateJobStoreOptions = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_DELEGATE_JOB_TTL_MS
@@ -215,6 +222,7 @@ export class DelegateJobStore {
     this.bootId = opts.bootId ?? `gw:${randomBytes(8).toString('hex')}`
     this.leaseMs = opts.leaseMs ?? 45_000
     this.durable = opts.durable ?? null
+    this.onTerminal = opts.onTerminal
     if (this.durable && opts.hydrate !== false) this.hydrateFromDurable()
   }
 
@@ -238,13 +246,7 @@ export class DelegateJobStore {
     if (idempotencyKey) {
       const existingId = this.byIdempotency.get(idempotencyKey)
       if (existingId && this.jobs.has(existingId)) return { jobId: existingId, reused: true }
-      const durableHit = this.durable?.findByIdempotencyKey(idempotencyKey)
-      if (durableHit) {
-        this.restoreSnapshot(this.snapshotFromDurable(durableHit), durableHit.agentId)
-        return { jobId: durableHit.id, reused: true }
-      }
     }
-    if (this.nonTerminalCount() >= this.maxJobs) return { error: 'capacity' }
     const jobId = `dlgjob-${this.now().toString(36)}-${randomBytes(6).toString('hex')}`
     const createdAt = this.now()
     const queued = this.sm && meta?.queued === true
@@ -273,7 +275,16 @@ export class DelegateJobStore {
       idempotencyKey,
       kind: meta?.kind ?? 'delegate',
     }
-    this.persistInsert(entry)
+    if (this.durable) {
+      const outcome = this.durable.insertCreate(this.toDurable(entry), this.maxJobs)
+      if ('error' in outcome) return { error: 'capacity' }
+      if ('reused' in outcome) {
+        this.ingestDurableRow(outcome.reused)
+        return { jobId: outcome.reused.id, reused: true }
+      }
+    } else if (this.nonTerminalCount() >= this.maxJobs) {
+      return { error: 'capacity' }
+    }
     this.jobs.set(jobId, entry)
     if (idempotencyKey) this.byIdempotency.set(idempotencyKey, jobId)
     return { jobId }
@@ -288,18 +299,27 @@ export class DelegateJobStore {
 
   findByIdempotencyKey(key: string): DelegateJobSnapshot | undefined {
     const id = this.byIdempotency.get(key)
-    if (!id) return undefined
-    const job = this.jobs.get(id)
-    return job ? this.snapshot(job) : undefined
+    if (id) {
+      const job = this.refreshJob(id)
+      return job ? this.snapshot(job) : undefined
+    }
+    const durableHit = this.durable?.findByIdempotencyKey(key)
+    if (!durableHit) return undefined
+    return this.snapshot(this.ingestDurableRow(durableHit))
   }
 
   snapshotOf(jobId: string): DelegateJobSnapshot | undefined {
-    const job = this.jobs.get(jobId)
+    const job = this.refreshJob(jobId)
     return job ? this.snapshot(job) : undefined
   }
 
-  complete(jobId: string, result: DelegateJobHttpResult, fence?: { claimToken: string; fencingEpoch: number }): boolean {
-    const job = this.jobs.get(jobId)
+  complete(
+    jobId: string,
+    result: DelegateJobHttpResult,
+    fence?: { claimToken: string; fencingEpoch: number },
+    opts?: { callbackState?: DelegateCallbackState },
+  ): boolean {
+    const job = this.refreshJob(jobId)
     if (!job || job.result) return false
     if (this.sm && job.claimToken) {
       if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) return false
@@ -314,7 +334,13 @@ export class DelegateJobStore {
         draft.failureClass = 'child_error'
         draft.failureDetail = String(result.body.error ?? 'delegate failed').slice(0, 512)
       }
-      if (draft.callback === 'origin-inject' || draft.callback === 'cron-origin-inject') {
+      if (opts?.callbackState) {
+        if (draft.callbackState !== opts.callbackState) {
+          if (!isLegalCallbackTransition(draft.callbackState, opts.callbackState)) return false
+          draft.callbackState = opts.callbackState
+          if (draft.callbackEpoch === 0) draft.callbackEpoch = 1
+        }
+      } else if (draft.callback === 'origin-inject' || draft.callback === 'cron-origin-inject') {
         if (draft.callbackState === 'none') {
           draft.callbackState = 'pending'
           draft.callbackEpoch = 1
@@ -327,8 +353,7 @@ export class DelegateJobStore {
     draft.result = result
     draft.expiresAt = this.now() + this.ttlMs
     draft.lastActivityAt = this.now()
-    this.commit(job, draft, true)
-    return true
+    return this.commit(job, draft, true)
   }
 
   /**
@@ -347,7 +372,7 @@ export class DelegateJobStore {
       nextState?: Extract<DelegateJobState, 'failed' | 'killed_by_cutover' | 'cancelled'>
     },
   ): boolean {
-    const job = this.jobs.get(jobId)
+    const job = this.refreshJob(jobId)
     if (!job || isDelegateTerminalState(job.state)) return false
     if (job.claimToken) {
       if (!args.claimToken || args.claimToken !== job.claimToken) return false
@@ -377,13 +402,12 @@ export class DelegateJobStore {
     }
     draft.expiresAt = this.now() + this.ttlMs
     draft.lastActivityAt = this.now()
-    this.commit(job, draft, true)
-    return true
+    return this.commit(job, draft, true)
   }
 
   /** queued → running with a new claim_token (slot acquired). */
   claimQueued(jobId: string): { ok: true; claimToken: string; fencingEpoch: number } | { ok: false } {
-    const job = this.jobs.get(jobId)
+    const job = this.refreshJob(jobId)
     if (!job || job.state !== 'queued') return { ok: false }
     const gate = assertDelegateTransition('queued', 'running')
     if (!gate.ok) return { ok: false }
@@ -396,20 +420,19 @@ export class DelegateJobStore {
     draft.ownerLeaseUntil = this.now() + this.leaseMs
     draft.checkpointKind = 'none'
     draft.lastActivityAt = this.now()
-    this.commit(job, draft, false)
+    if (!this.commit(job, draft, false)) return { ok: false }
     return { ok: true, claimToken: job.claimToken!, fencingEpoch: job.fencingEpoch }
   }
 
   casHeartbeat(jobId: string, claimToken: string, fencingEpoch: number): boolean {
-    const job = this.jobs.get(jobId)
+    const job = this.refreshJob(jobId)
     if (!job) return false
     if (job.claimToken !== claimToken || job.fencingEpoch !== fencingEpoch) return false
     if (job.state !== 'running' && job.state !== 'paused_for_cutover') return false
     const draft = this.cloneEntry(job)
     draft.ownerLeaseUntil = this.now() + this.leaseMs
     draft.lastActivityAt = this.now()
-    this.commit(job, draft, false)
-    return true
+    return this.commit(job, draft, false)
   }
 
   /**
@@ -421,10 +444,15 @@ export class DelegateJobStore {
     expectedEpoch: number,
     nextState: DelegateJobState,
   ): DelegateJobSnapshot | undefined {
-    const job = this.jobs.get(jobId)
+    const job = this.refreshJob(jobId)
     if (!job) return undefined
     if (!['queued', 'running', 'paused_for_cutover'].includes(job.state)) return undefined
     if (job.fencingEpoch !== expectedEpoch) return undefined
+    if (nextState === 'queued' && job.state === 'queued') {
+      // Keep queued unclaimed until a real runner/cron claims. Timeout uses
+      // fail() without a fence; a minted token here would block that path.
+      return this.snapshot(job)
+    }
     const now = this.now()
     const stale =
       !job.ownerInstanceId ||
@@ -459,7 +487,7 @@ export class DelegateJobStore {
       }
       draft.expiresAt = now + this.ttlMs
     }
-    this.commit(job, draft, terminal)
+    if (!this.commit(job, draft, terminal)) return undefined
     return this.snapshot(job)
   }
 
@@ -481,6 +509,9 @@ export class DelegateJobStore {
   }
 
   listNonTerminal(): DelegateJobSnapshot[] {
+    if (this.durable) {
+      for (const row of this.durable.loadNonTerminal()) this.ingestDurableRow(row)
+    }
     const out: DelegateJobSnapshot[] = []
     for (const job of this.jobs.values()) {
       if (!isDelegateTerminalState(job.state)) out.push(this.snapshot(job))
@@ -490,7 +521,7 @@ export class DelegateJobStore {
 
   get(jobId: string): DelegateJobWaitView {
     this.sweep()
-    const job = this.jobs.get(jobId)
+    const job = this.refreshJob(jobId)
     if (!job) {
       return this.sm
         ? { status: 'expired', jobId, failure_class: 'unknown_job' }
@@ -501,7 +532,7 @@ export class DelegateJobStore {
 
   async wait(jobId: string, waitMs: number): Promise<DelegateJobWaitView> {
     this.sweep()
-    const job = this.jobs.get(jobId)
+    const job = this.refreshJob(jobId)
     if (!job) {
       return this.sm
         ? { status: 'expired', jobId, failure_class: 'unknown_job' }
@@ -588,11 +619,38 @@ export class DelegateJobStore {
     }
   }
 
+  /**
+   * Baseline (`5ea1f77d7`) JSON DTO. Durable-only fields stay off this object
+   * so OC_DELEGATE_DURABLE=0 snapshots remain byte-equivalent.
+   */
+  private snapshotForJsonPersist(job: JobEntry): DelegateJobSnapshot {
+    return {
+      id: job.id,
+      agentId: job.agentId,
+      state: job.state,
+      sessionKey: job.sessionKey,
+      failureClass: job.failureClass,
+      failureDetail: job.failureDetail,
+      claimToken: job.claimToken,
+      fencingEpoch: job.fencingEpoch,
+      attemptNo: job.attemptNo,
+      ownerInstanceId: job.ownerInstanceId,
+      ownerLeaseUntil: job.ownerLeaseUntil ?? undefined,
+      checkpointKind: job.checkpointKind,
+      callback: job.callback,
+      callbackState: job.callbackState,
+      callbackEpoch: job.callbackEpoch,
+      idempotencyKey: job.idempotencyKey,
+      kind: job.kind,
+      generation: job.generation,
+    }
+  }
+
   sweep(now = this.now()): number {
     let removed = 0
     for (const [id, job] of this.jobs) {
       if (!job.result || job.expiresAt === null || job.expiresAt > now) continue
-      this.persistDelete(id)
+      if (!this.persistDelete(job)) continue
       const waiters = job.waiters.splice(0)
       for (const w of waiters) w({ status: 'expired', jobId: id, ...(this.sm ? { failure_class: 'job_ttl_elapsed' as const } : {}) })
       if (job.idempotencyKey) this.byIdempotency.delete(job.idempotencyKey)
@@ -607,6 +665,7 @@ export class DelegateJobStore {
   }
 
   nonTerminalCount(): number {
+    if (this.durable) return this.durable.countNonTerminal()
     let n = 0
     for (const job of this.jobs.values()) {
       if (!isDelegateTerminalState(job.state)) n++
@@ -619,9 +678,9 @@ export class DelegateJobStore {
    * Only unclaimed queued rows; never a running owner.
    */
   dropIfUnclaimed(jobId: string): boolean {
-    const job = this.jobs.get(jobId)
+    const job = this.refreshJob(jobId)
     if (!job || job.state !== 'queued' || job.result || job.claimToken) return false
-    this.persistDelete(jobId)
+    if (!this.persistDelete(job)) return false
     const waiters = job.waiters.splice(0)
     for (const w of waiters) w({ status: 'expired', jobId, ...(this.sm ? { failure_class: 'capacity_queue_full' as const } : {}) })
     if (job.idempotencyKey) this.byIdempotency.delete(job.idempotencyKey)
@@ -666,7 +725,7 @@ export class DelegateJobStore {
     const out: DelegateJobSnapshot[] = []
     for (const job of this.jobs.values()) {
       if (!isDelegateTerminalState(job.state) || job.callbackState === 'pending' || job.callbackState === 'injecting') {
-        out.push(this.snapshot(job))
+        out.push(this.snapshotForJsonPersist(job))
       }
     }
     return out
@@ -677,7 +736,7 @@ export class DelegateJobStore {
     next: DelegateCallbackState,
     fence?: { claimToken: string; fencingEpoch: number },
   ): boolean {
-    const job = this.jobs.get(jobId)
+    const job = this.refreshJob(jobId)
     if (!job) return false
     if (job.claimToken) {
       if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) return false
@@ -687,8 +746,7 @@ export class DelegateJobStore {
     const draft = this.cloneEntry(job)
     draft.callbackState = next
     draft.lastActivityAt = this.now()
-    this.commit(job, draft, false)
-    return true
+    return this.commit(job, draft, false)
   }
 
   restoreSnapshot(snap: DelegateJobSnapshot, agentId = 'restored'): void {
@@ -739,7 +797,7 @@ export class DelegateJobStore {
     let n = 0
     for (const row of this.durable.loadAll()) {
       if (this.jobs.has(row.id)) continue
-      this.restoreSnapshot(this.snapshotFromDurable(row), row.agentId)
+      this.ingestDurableRow(row)
       n += 1
     }
     return n
@@ -793,8 +851,13 @@ export class DelegateJobStore {
     }
   }
 
-  private commit(live: JobEntry, draft: JobEntry, wake: boolean): void {
-    this.persistUpdate(draft)
+  private commit(live: JobEntry, draft: JobEntry, wake: boolean): boolean {
+    const becomingTerminal =
+      isDelegateTerminalState(draft.state) && !isDelegateTerminalState(live.state)
+    if (!this.persistUpdate(live, draft)) {
+      this.refreshJob(live.id)
+      return false
+    }
     const waiters = live.waiters
     Object.assign(live, draft)
     live.waiters = waiters
@@ -802,18 +865,97 @@ export class DelegateJobStore {
       const pending = waiters.splice(0)
       for (const w of pending) w(this.viewOf(live))
     }
+    if (becomingTerminal) this.onTerminal?.(this.snapshot(live))
+    return true
   }
 
-  private persistInsert(job: JobEntry): void {
-    this.durable?.upsert(this.toDurable(job))
+  private persistUpdate(live: JobEntry, draft: JobEntry): boolean {
+    if (!this.durable) return true
+    return Boolean(
+      this.durable.casUpdate(
+        {
+          jobId: live.id,
+          state: live.state,
+          fencingEpoch: live.fencingEpoch,
+          claimToken: live.claimToken ?? null,
+        },
+        this.toDurable(draft),
+      ),
+    )
   }
 
-  private persistUpdate(job: JobEntry): void {
-    this.durable?.upsert(this.toDurable(job))
+  private persistDelete(job: JobEntry): boolean {
+    if (!this.durable) return true
+    return this.durable.casDelete({
+      jobId: job.id,
+      state: job.state,
+      fencingEpoch: job.fencingEpoch,
+      claimToken: job.claimToken ?? null,
+    })
   }
 
-  private persistDelete(jobId: string): void {
-    this.durable?.delete(jobId)
+  private refreshJob(jobId: string): JobEntry | undefined {
+    if (this.durable) {
+      const row = this.durable.get(jobId)
+      if (row) return this.ingestDurableRow(row)
+    }
+    return this.jobs.get(jobId)
+  }
+
+  private ingestDurableRow(row: DurableJobRecord): JobEntry {
+    const existing = this.jobs.get(row.id)
+    const incoming = this.entryFromDurable(row)
+    if (!existing) {
+      this.jobs.set(row.id, incoming)
+      if (row.idempotencyKey) this.byIdempotency.set(row.idempotencyKey, row.id)
+      return incoming
+    }
+    const waiters = existing.waiters
+    const hadResult = existing.result
+    Object.assign(existing, incoming)
+    existing.waiters = waiters
+    if (!hadResult && existing.result) {
+      const pending = waiters.splice(0)
+      for (const w of pending) w(this.viewOf(existing))
+    }
+    if (row.idempotencyKey) this.byIdempotency.set(row.idempotencyKey, row.id)
+    return existing
+  }
+
+  private entryFromDurable(row: DurableJobRecord): JobEntry {
+    const snap = this.snapshotFromDurable(row)
+    const reconstructed = isDelegateTerminalState(snap.state)
+      ? {
+          httpStatus: snap.state === 'completed' ? 200 : 409,
+          body: { failure_class: snap.failureClass, error: snap.failureDetail },
+        }
+      : null
+    return {
+      id: snap.id,
+      agentId: row.agentId,
+      createdAt: snap.createdAt ?? this.now(),
+      lastActivityAt: snap.lastActivityAt ?? snap.createdAt ?? this.now(),
+      expiresAt: snap.expiresAt ?? null,
+      sessionKey: snap.sessionKey,
+      parentSessionKey: snap.parentSessionKey,
+      result: snap.result ?? reconstructed,
+      waiters: [],
+      state: snap.state,
+      failureClass: snap.failureClass,
+      failureDetail: snap.failureDetail,
+      generation: snap.generation,
+      ownerInstanceId: snap.ownerInstanceId,
+      ownerLeaseUntil: snap.ownerLeaseUntil ?? null,
+      claimToken: snap.claimToken,
+      attemptNo: snap.attemptNo,
+      fencingEpoch: snap.fencingEpoch,
+      checkpointKind: snap.checkpointKind,
+      callback: snap.callback,
+      callbackState: snap.callbackState,
+      callbackEpoch: snap.callbackEpoch,
+      idempotencyKey: snap.idempotencyKey,
+      kind: snap.kind,
+    }
   }
 
   private toDurable(job: JobEntry): DurableJobRecord {
