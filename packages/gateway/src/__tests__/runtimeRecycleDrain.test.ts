@@ -184,6 +184,23 @@ describe('planned runtime recycle drain', () => {
     if (okDecision.ok) assert.equal(typeof okDecision.freezeHolder, 'string')
   })
 
+  test('freeze 后未预期抛错必须 thaw,不得留下哑 freeze', async () => {
+    const holders = new Set<string>()
+    const h = harness({
+      freezeDelegateDispatch: (holder) => {
+        holders.add(holder)
+      },
+      thawDelegateDispatch: (holder) => {
+        holders.delete(holder)
+      },
+      armGatewayDrain: () => {
+        throw new Error('boom')
+      },
+    })
+    await assert.rejects(() => attemptRuntimeRecycleDrain(h.deps), /boom/)
+    assert.equal(holders.size, 0)
+  })
+
   test('ACK 前同步 peek 看到 running 则 409,即使 await count 返回 0', async () => {
     let running = 0
     const h = harness({

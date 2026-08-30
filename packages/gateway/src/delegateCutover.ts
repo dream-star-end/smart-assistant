@@ -46,9 +46,10 @@ export function cutoverFreezeHolder(generation: number): string {
 }
 
 /**
- * Production idle proof: attached runner (current fence, not ACK'd) is never
- * idle. Session turn counters are negative evidence only — missing session or
- * zero turns cannot prove quiesce.
+ * Production idle proof: only a current-fence quiesce ACK is idle. Missing
+ * runner (hydrated row), fence mismatch, or live attached writer is never
+ * idle. Session turn counters are negative evidence only — missing session
+ * or zero turns cannot prove quiesce.
  */
 export function isDelegateRunnerIdle(
   job: DelegateJobSnapshot,

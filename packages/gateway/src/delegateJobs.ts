@@ -550,15 +550,16 @@ export class DelegateJobStore {
   }
 
   /**
-   * True only when this process has no live terminal writer for `job`'s
-   * current fence (never attached, fence rotated, or quiesce ACK'd).
-   * Absence of a session / zero turn counters is not a positive idle proof.
+   * True only when the currently attached `(claimToken, fencingEpoch)` has
+   * ACK'd quiesce. Missing runner, fence mismatch, or no ACK is not a
+   * positive idle proof — BeginCutover must then use `checkpoint=none`
+   * rather than `runner_quiesced`.
    */
   isRunnerIdle(job: DelegateJobSnapshot): boolean {
     if (job.state !== 'running') return true
     const cur = this.runners.get(job.id)
-    if (!cur) return true
-    if (cur.claimToken !== job.claimToken || cur.fencingEpoch !== job.fencingEpoch) return true
+    if (!cur) return false
+    if (cur.claimToken !== job.claimToken || cur.fencingEpoch !== job.fencingEpoch) return false
     return cur.phase === 'quiesce_acked'
   }
 

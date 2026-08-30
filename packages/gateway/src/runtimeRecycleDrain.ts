@@ -65,68 +65,74 @@ export async function attemptRuntimeRecycleDrain(
     return decision
   }
 
-  // Freeze claimQueued before any await so a queued job cannot promote during
-  // durable / delegate count continuations (TOCTOU). Flag-off omits freeze.
-  if (holder) deps.freezeDelegateDispatch!(holder)
-
-  deps.armGatewayDrain(deps.now() + deps.ttlMs)
-  const sessionDrain = deps.armSessionDrain(deps.ttlMs)
-  const initialIngress = deps.activeIngress()
-  if (!sessionDrain.accepted || initialIngress > 0) {
-    return fail({
-      ok: false,
-      status: 409,
-      reason: 'active_turn',
-      activeIngress: initialIngress,
-      activeTurns: sessionDrain.activeTurns,
-    })
-  }
-
-  let durableRunning: number
   try {
-    durableRunning = await deps.countDurableRunning()
-  } catch {
-    return fail({ ok: false, status: 503, reason: 'drain_state_unavailable' })
-  }
+    // Freeze claimQueued before any await so a queued job cannot promote during
+    // durable / delegate count continuations (TOCTOU). Flag-off omits freeze.
+    if (holder) deps.freezeDelegateDispatch!(holder)
 
-  let runningDelegateJobs = 0
-  if (deps.countRunningDelegateJobs) {
+    deps.armGatewayDrain(deps.now() + deps.ttlMs)
+    const sessionDrain = deps.armSessionDrain(deps.ttlMs)
+    const initialIngress = deps.activeIngress()
+    if (!sessionDrain.accepted || initialIngress > 0) {
+      return fail({
+        ok: false,
+        status: 409,
+        reason: 'active_turn',
+        activeIngress: initialIngress,
+        activeTurns: sessionDrain.activeTurns,
+      })
+    }
+
+    let durableRunning: number
     try {
-      runningDelegateJobs = await deps.countRunningDelegateJobs()
+      durableRunning = await deps.countDurableRunning()
     } catch {
       return fail({ ok: false, status: 503, reason: 'drain_state_unavailable' })
     }
-  }
 
-  // No await after this point. Peek is the ACK-time snapshot.
-  if (deps.peekRunningDelegateJobs) {
-    runningDelegateJobs = deps.peekRunningDelegateJobs()
-  }
-  const activeIngress = deps.activeIngress()
-  if (activeIngress > 0 || durableRunning > 0 || runningDelegateJobs > 0) {
-    return fail({
-      ok: false,
-      status: 409,
-      reason: 'active_turn',
-      activeIngress,
-      activeTurns: sessionDrain.activeTurns,
-      durableRunning: durableRunning + runningDelegateJobs,
-      ...(deps.countRunningDelegateJobs || deps.peekRunningDelegateJobs
-        ? { runningDelegateJobs }
-        : {}),
-    })
-  }
+    let runningDelegateJobs = 0
+    if (deps.countRunningDelegateJobs) {
+      try {
+        runningDelegateJobs = await deps.countRunningDelegateJobs()
+      } catch {
+        return fail({ ok: false, status: 503, reason: 'drain_state_unavailable' })
+      }
+    }
 
-  const finalNow = deps.now()
-  if (!deps.isGatewayDrainActive(finalNow) || !deps.isSessionDrainActive(finalNow)) {
-    return fail({ ok: false, status: 503, reason: 'drain_fence_expired' })
-  }
+    // No await after this point. Peek is the ACK-time snapshot.
+    if (deps.peekRunningDelegateJobs) {
+      runningDelegateJobs = deps.peekRunningDelegateJobs()
+    }
+    const activeIngress = deps.activeIngress()
+    if (activeIngress > 0 || durableRunning > 0 || runningDelegateJobs > 0) {
+      return fail({
+        ok: false,
+        status: 409,
+        reason: 'active_turn',
+        activeIngress,
+        activeTurns: sessionDrain.activeTurns,
+        durableRunning: durableRunning + runningDelegateJobs,
+        ...(deps.countRunningDelegateJobs || deps.peekRunningDelegateJobs
+          ? { runningDelegateJobs }
+          : {}),
+      })
+    }
 
-  return {
-    ok: true,
-    status: 200,
-    drainTtlMs: deps.ttlMs,
-    ...(holder ? { freezeHolder: holder } : {}),
+    const finalNow = deps.now()
+    if (!deps.isGatewayDrainActive(finalNow) || !deps.isSessionDrainActive(finalNow)) {
+      return fail({ ok: false, status: 503, reason: 'drain_fence_expired' })
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      drainTtlMs: deps.ttlMs,
+      ...(holder ? { freezeHolder: holder } : {}),
+    }
+  } catch (err) {
+    thaw()
+    release()
+    throw err
   }
 }
 

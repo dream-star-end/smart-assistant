@@ -381,6 +381,40 @@ describe('production idle / quiesce ACK (blocker 1)', () => {
     }
   })
 
+  it('hydrated running job without ACK is not runner_quiesced (missing runner is not idle proof)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-idle-hydrate-'))
+    try {
+      const s1 = openStore(dir, { bootId: 'gw:g0' })
+      const { jobId, fence } = await runningJob(s1)
+      s1.close()
+      const s2 = openStore(dir, { bootId: 'gw:g0' })
+      const snap = s2.snapshotOf(jobId)!
+      assert.equal(snap.state, 'running')
+      assert.equal(s2.isRunnerIdle(snap), false)
+      assert.equal(isDelegateRunnerIdle(snap, s2, null), false)
+      assert.equal(
+        isDelegateRunnerIdle(snap, s2, { activeTurnCount: 0, activeClientTurnCount: 0 }),
+        false,
+      )
+      const result = await beginDelegateCutover(s2, {
+        generation: 8,
+        freezeBudgetMs: 0,
+        isIdle: (job) => isDelegateRunnerIdle(job, s2, null),
+      })
+      assert.equal(result.quiesced, 0)
+      assert.equal(result.timedOut, 1)
+      assert.equal(s2.snapshotOf(jobId)?.checkpointKind, 'none')
+      assert.equal(
+        s2.complete(jobId, { httpStatus: 200, body: { output: 'must-not-land' } }, fence),
+        false,
+      )
+      assert.equal(s2.snapshotOf(jobId)?.state, 'paused_for_cutover')
+      s2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('attached runner can complete during freeze budget before timeout pause', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-cut-idle-complete-'))
     try {
