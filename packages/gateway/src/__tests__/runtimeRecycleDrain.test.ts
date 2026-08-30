@@ -137,6 +137,22 @@ describe('planned runtime recycle drain', () => {
     assert.equal(h.state().sessionUntil, 0)
   })
 
+  test('optional runningDelegateJobs 计入 409,缺省钩子不改 flag-off 形状', async () => {
+    const withJobs = harness({ countRunningDelegateJobs: async () => 2 })
+    const busy = await attemptRuntimeRecycleDrain(withJobs.deps)
+    assert.equal(busy.ok, false)
+    assert.equal(busy.status, 409)
+    if (!busy.ok) {
+      assert.equal(busy.runningDelegateJobs, 2)
+      assert.equal(busy.durableRunning, 2)
+    }
+
+    const flagOff = harness()
+    const ok = await attemptRuntimeRecycleDrain(flagOff.deps)
+    assert.deepEqual(ok, { ok: true, status: 200, drainTtlMs: 10_000 })
+    assert.equal('runningDelegateJobs' in ok, false)
+  })
+
   test('重叠握手串行化:后请求不得释放先请求已受理的双闸', async () => {
     const h = harness()
     let durableReads = 0

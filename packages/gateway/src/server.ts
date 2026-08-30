@@ -391,11 +391,13 @@ import {
 } from './delegateJobs.js'
 import { DelegateResumeRegistry, DELEGATE_RESUME_OCCUPIED_MESSAGE } from './delegateResume.js'
 import {
+  isDelegateCutoverEffective,
   isDelegateDurableEffective,
   isDelegateNotifierEffective,
   isDelegateSmEnabled,
   resolveDelegateCallbackOwner,
 } from './delegateSmFlag.js'
+import { beginDelegateCutover, resolveDelegateCutoverFreezeMs } from './delegateCutover.js'
 import { DefaultEngineNotifier, tryWriteInlinePush, type InlinePushSession } from './engineNotifier.js'
 import {
   delayUntilNextNotifyRetry,
@@ -3886,6 +3888,11 @@ export class Gateway {
           releaseSessionDrain: () => this.sessions.releaseRuntimeRecycleDrain(),
           activeIngress: () => this._runtimeRecycleIngressActive,
           countDurableRunning: () => countRuntimeRecycleUnsafeTurnDispatches(),
+          ...(isDelegateCutoverEffective()
+            ? {
+                countRunningDelegateJobs: () => this._ensureDelegateJobStore().countRunning(),
+              }
+            : {}),
         })
         this._runtimeRecycleDrainCoordinator = coordinator
       }
@@ -3904,6 +3911,35 @@ export class Gateway {
           this.sessions.releaseRuntimeRecycleDrain()
           this.log.error('runtime recycle drain evaluation failed', undefined, err as Error)
           this.sendJson(res, 503, { ok: false, reason: 'drain_state_unavailable' })
+        },
+      )
+      return
+    }
+
+    // OCV5-22 stage 3: host cutover freeze. Scripts are wired in a later
+    // deploy batch; this endpoint is the gateway-side BeginCutover signal.
+    if (url.pathname === '/internal/v3/delegate-begin-cutover' && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      if (!isDelegateCutoverEffective()) {
+        this.sendJson(res, 409, { ok: false, reason: 'cutover_flag_off' })
+        return
+      }
+      const store = this._ensureDelegateJobStore()
+      const rawGeneration = Number.parseInt(url.searchParams.get('generation') ?? '', 10)
+      void beginDelegateCutover(store, {
+        generation: Number.isFinite(rawGeneration) ? rawGeneration : Date.now(),
+        freezeBudgetMs: resolveDelegateCutoverFreezeMs(),
+        isIdle: (job) => this._delegateRunnerIdle(job),
+      }).then(
+        (result) => {
+          this.sendJson(res, 200, { ok: true, ...result })
+        },
+        (err) => {
+          this.log.error('delegate begin-cutover failed', undefined, err as Error)
+          this.sendJson(res, 503, { ok: false, reason: 'cutover_quiesce_failed' })
         },
       )
       return
@@ -10533,6 +10569,7 @@ export class Gateway {
       const summary = reconcileDelegateJobsOnBoot(store, {
         isChildAlive: (job) => this._delegateChildAlive(job.sessionKey),
         queueWaitMs,
+        claimPaused: isDelegateCutoverEffective(),
       })
       if (summary.scanned > 0) {
         this.log.info('delegate durable reconcile', summary)
@@ -10567,6 +10604,7 @@ export class Gateway {
       const summary = reconcileDelegateJobsOnBoot(this._delegateJobs, {
         isChildAlive: (job) => this._delegateChildAlive(job.sessionKey),
         queueWaitMs,
+        claimPaused: isDelegateCutoverEffective(),
       })
       if (summary.killed > 0 || summary.capacityTimedOut > 0) {
         this.log.info('delegate durable reconcile follow-up', summary)
@@ -10574,6 +10612,22 @@ export class Gateway {
       this._armDelegateReconcileFollowup(this._delegateJobs, queueWaitMs)
     }, delay)
     this._delegateReconcileTimer.unref()
+  }
+
+  private _delegateRunnerIdle(job: DelegateJobSnapshot): boolean {
+    if (!job.sessionKey) return true
+    try {
+      const session = this.sessions?.getByKey?.(job.sessionKey) as {
+        _activeTurnCount?: number
+        _activeClientTurnCount?: number
+      } | undefined
+      if (!session) return true
+      const turns =
+        Math.max(0, session._activeTurnCount ?? 0) + Math.max(0, session._activeClientTurnCount ?? 0)
+      return turns === 0
+    } catch {
+      return false
+    }
   }
 
   private _delegateChildAlive(sessionKey: string | undefined): boolean | undefined {
@@ -11984,6 +12038,15 @@ export class Gateway {
       if (!claimed?.ok) {
         this._releaseDelegateSlot(slotOpts)
         unregisterDelegation?.()
+        if (claimed && claimed.reason === 'cutover_frozen') {
+          return {
+            kind: 'rejected',
+            httpStatus: 503,
+            message: 'delegate dispatch frozen for cutover',
+            failureClass: 'cutover',
+            alreadyDispatched: true,
+          }
+        }
         const snap = this._delegateJobs?.snapshotOf(input.backgroundJobId)
         if (snap && !isDelegateTerminalState(snap.state)) {
           return {
@@ -13199,6 +13262,16 @@ export class Gateway {
     if (this._notifyRetryTimer) {
       clearTimeout(this._notifyRetryTimer)
       this._notifyRetryTimer = undefined
+    }
+    if (isDelegateCutoverEffective() && this._delegateJobs) {
+      try {
+        await beginDelegateCutover(this._delegateJobs, {
+          freezeBudgetMs: resolveDelegateCutoverFreezeMs(),
+          isIdle: (job) => this._delegateRunnerIdle(job),
+        })
+      } catch (err) {
+        this.log.error('delegate shutdown cutover freeze failed', undefined, err as Error)
+      }
     }
     await this._persistInterruptedSendToAgentCallbacks()
     this._delegateJobs?.close()

@@ -268,6 +268,8 @@ export class DelegateJobStore {
   private readonly leaseMs: number
   private readonly durable: DelegateDurableDb | null
   private readonly onTerminal?: (job: DelegateJobSnapshot) => void
+  /** Phase F: stop new claimQueued/spawn. Queued rows stay queued. */
+  private dispatchFrozen = false
 
   constructor(opts: DelegateJobStoreOptions = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_DELEGATE_JOB_TTL_MS
@@ -477,8 +479,19 @@ export class DelegateJobStore {
     return this.commit(job, draft, true)
   }
 
+  setDispatchFrozen(frozen: boolean): void {
+    this.dispatchFrozen = frozen
+  }
+
+  isDispatchFrozen(): boolean {
+    return this.dispatchFrozen
+  }
+
   /** queued → running with a new claim_token (slot acquired). */
-  claimQueued(jobId: string): { ok: true; claimToken: string; fencingEpoch: number } | { ok: false } {
+  claimQueued(
+    jobId: string,
+  ): { ok: true; claimToken: string; fencingEpoch: number } | { ok: false; reason?: 'cutover_frozen' } {
+    if (this.dispatchFrozen) return { ok: false, reason: 'cutover_frozen' }
     const job = this.refreshJob(jobId)
     if (!job || job.state !== 'queued') return { ok: false }
     const gate = assertDelegateTransition('queued', 'running')
@@ -580,6 +593,73 @@ export class DelegateJobStore {
       return job.checkpointKind === 'runner_quiesced' ? 'paused_for_cutover' : 'killed_by_cutover'
     }
     return job.state
+  }
+
+  /**
+   * Phase F CAS: running → paused_for_cutover, rotate claim_token/fencing_epoch.
+   * `runner_quiesced` only when the caller proved the runner stopped feeding turns.
+   * Timeout path uses checkpoint `none` and still does not fail/kill the row.
+   */
+  pauseForCutover(
+    jobId: string,
+    args: {
+      claimToken: string
+      fencingEpoch: number
+      generation: number
+      checkpointKind: DelegateCheckpointKind
+    },
+  ): DelegateJobSnapshot | undefined {
+    const job = this.refreshJob(jobId)
+    if (!job || job.state !== 'running') return undefined
+    if (job.claimToken !== args.claimToken || job.fencingEpoch !== args.fencingEpoch) return undefined
+    const gate = assertDelegateTransition('running', 'paused_for_cutover')
+    if (!gate.ok) return undefined
+    const now = this.now()
+    const draft = this.cloneEntry(job)
+    draft.state = 'paused_for_cutover'
+    draft.checkpointKind = args.checkpointKind
+    draft.generation = args.generation
+    draft.claimToken = mintDelegateClaimToken()
+    draft.fencingEpoch += 1
+    draft.ownerInstanceId = this.bootId
+    draft.ownerLeaseUntil = now + this.leaseMs
+    draft.lastActivityAt = now
+    if (!this.commit(job, draft, false)) return undefined
+    return this.snapshot(job)
+  }
+
+  /**
+   * Phase M ClaimPaused: paused_for_cutover + runner_quiesced → running.
+   * Does not spawn an engine; the caller may attach a resume hook.
+   */
+  claimPaused(
+    jobId: string,
+  ): { ok: true; claimToken: string; fencingEpoch: number } | { ok: false } {
+    const job = this.refreshJob(jobId)
+    if (!job || job.state !== 'paused_for_cutover') return { ok: false }
+    if (job.checkpointKind !== 'runner_quiesced') return { ok: false }
+    const gate = assertDelegateTransition('paused_for_cutover', 'running')
+    if (!gate.ok) return { ok: false }
+    const now = this.now()
+    const draft = this.cloneEntry(job)
+    draft.state = 'running'
+    draft.checkpointKind = 'none'
+    draft.claimToken = mintDelegateClaimToken()
+    draft.fencingEpoch += 1
+    draft.attemptNo += 1
+    draft.ownerInstanceId = this.bootId
+    draft.ownerLeaseUntil = now + this.leaseMs
+    draft.lastActivityAt = now
+    if (!this.commit(job, draft, false)) return { ok: false }
+    return { ok: true, claimToken: job.claimToken!, fencingEpoch: job.fencingEpoch }
+  }
+
+  listRunning(): DelegateJobSnapshot[] {
+    return this.listNonTerminal().filter((job) => job.state === 'running')
+  }
+
+  countRunning(): number {
+    return this.listRunning().length
   }
 
   listNonTerminal(): DelegateJobSnapshot[] {

@@ -17,6 +17,11 @@ export interface RuntimeRecycleDrainDeps {
   releaseSessionDrain: () => void
   activeIngress: () => number
   countDurableRunning: () => Promise<number>
+  /**
+   * Stage 3: running durable delegate jobs. Absent = flag-off (do not count).
+   * `paused_for_cutover` is not running and must not block drain.
+   */
+  countRunningDelegateJobs?: () => Promise<number> | number
 }
 
 export type RuntimeRecycleDrainDecision =
@@ -32,6 +37,7 @@ export type RuntimeRecycleDrainDecision =
       activeIngress?: number
       activeTurns?: number
       durableRunning?: number
+      runningDelegateJobs?: number
     }
 
 export async function attemptRuntimeRecycleDrain(
@@ -64,11 +70,21 @@ export async function attemptRuntimeRecycleDrain(
     return { ok: false, status: 503, reason: 'drain_state_unavailable' }
   }
 
+  let runningDelegateJobs = 0
+  if (deps.countRunningDelegateJobs) {
+    try {
+      runningDelegateJobs = await deps.countRunningDelegateJobs()
+    } catch {
+      release()
+      return { ok: false, status: 503, reason: 'drain_state_unavailable' }
+    }
+  }
+
   // Re-read ingress after the awaited SQLite acquisition. New ingress cannot
   // pass while the gateway gate is armed; this catches any work that entered
   // immediately before the gate was set and had not yet been observed.
   const activeIngress = deps.activeIngress()
-  if (activeIngress > 0 || durableRunning > 0) {
+  if (activeIngress > 0 || durableRunning > 0 || runningDelegateJobs > 0) {
     release()
     return {
       ok: false,
@@ -76,7 +92,8 @@ export async function attemptRuntimeRecycleDrain(
       reason: 'active_turn',
       activeIngress,
       activeTurns: sessionDrain.activeTurns,
-      durableRunning,
+      durableRunning: durableRunning + runningDelegateJobs,
+      ...(deps.countRunningDelegateJobs ? { runningDelegateJobs } : {}),
     }
   }
 
