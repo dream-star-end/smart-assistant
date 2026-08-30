@@ -3897,8 +3897,8 @@ export class Gateway {
             ? {
                 countRunningDelegateJobs: () => this._ensureDelegateJobStore().countRunning(),
                 peekRunningDelegateJobs: () => this._ensureDelegateJobStore().countRunning(),
-                freezeDelegateDispatch: (holder: string) => {
-                  this._ensureDelegateJobStore().freezeDispatch(holder)
+                freezeDelegateDispatch: (holder: string, expiresAt?: number) => {
+                  this._ensureDelegateJobStore().freezeDispatch(holder, expiresAt)
                 },
                 thawDelegateDispatch: (holder: string) => {
                   this._ensureDelegateJobStore().thawDispatch(holder)

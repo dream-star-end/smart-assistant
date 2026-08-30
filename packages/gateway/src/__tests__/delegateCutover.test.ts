@@ -28,7 +28,11 @@ import {
   isDelegateNotifierEffective,
 } from '../delegateSmFlag.js'
 import { DefaultEngineNotifier } from '../engineNotifier.js'
-import { attemptRuntimeRecycleDrain, type RuntimeRecycleDrainDeps } from '../runtimeRecycleDrain.js'
+import {
+  RuntimeRecycleDrainCoordinator,
+  attemptRuntimeRecycleDrain,
+  type RuntimeRecycleDrainDeps,
+} from '../runtimeRecycleDrain.js'
 
 function openStore(dir: string, opts: { bootId?: string; now?: () => number } = {}) {
   const durable = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
@@ -563,11 +567,13 @@ describe('recycle drain runningDelegateJobs', () => {
   it('drain freezes claimQueued before count so ACK cannot race queued→running', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-cut-drain-toctou-'))
     try {
-      const store = openStore(dir)
+      const clock = { now: 1_000 }
+      const store = openStore(dir, { now: () => clock.now })
       const created = store.create('coding-assistant', { queued: true })
       assert.ok('jobId' in created)
       const h = drainHarness({
-        freezeDelegateDispatch: (holder) => store.freezeDispatch(holder),
+        now: () => clock.now,
+        freezeDelegateDispatch: (holder, expiresAt) => store.freezeDispatch(holder, expiresAt),
         thawDelegateDispatch: (holder) => {
           store.thawDispatch(holder)
         },
@@ -600,7 +606,7 @@ describe('recycle drain runningDelegateJobs', () => {
       const queued = store.create('coding-assistant', { queued: true })
       assert.ok('jobId' in queued)
       const h = drainHarness({
-        freezeDelegateDispatch: (holder) => store.freezeDispatch(holder),
+        freezeDelegateDispatch: (holder, expiresAt) => store.freezeDispatch(holder, expiresAt),
         thawDelegateDispatch: (holder) => {
           store.thawDispatch(holder)
         },
@@ -619,4 +625,163 @@ describe('recycle drain runningDelegateJobs', () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  it('200 without recycle expires drain holder with dual gates; claimQueued recovers', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-drain-ttl-'))
+    try {
+      const clock = { now: 1_000 }
+      const store = openStore(dir, { now: () => clock.now })
+      const created = store.create('coding-assistant', { queued: true })
+      assert.ok('jobId' in created)
+      const coordinator = productionDrainCoordinator(store, clock)
+      const first = await coordinator.attempt()
+      assert.equal(first.ok, true)
+      if (first.ok) {
+        assert.equal(first.status, 200)
+        assert.equal(first.drainTtlMs, 10_000)
+        assert.equal(first.freezeHolder, 'drain:1000')
+      }
+      assert.equal(store.isDispatchFrozen(), true)
+      const blocked = store.claimQueued(created.jobId)
+      assert.equal(blocked.ok, false)
+      if (!blocked.ok) assert.equal(blocked.reason, 'cutover_frozen')
+
+      clock.now = 10_999
+      assert.equal(coordinator.fencesActive(), true)
+      assert.equal(store.isDispatchFrozen(), true)
+      const stillBlocked = store.claimQueued(created.jobId)
+      assert.equal(stillBlocked.ok, false)
+      if (!stillBlocked.ok) assert.equal(stillBlocked.reason, 'cutover_frozen')
+
+      clock.now = 11_001
+      assert.equal(coordinator.fencesActive(), false)
+      assert.equal(store.isDispatchFrozen(), false)
+      const claimed = store.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('drain after TTL re-arms freeze with a fresh expiry', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-drain-rearm-'))
+    try {
+      const clock = { now: 1_000 }
+      const store = openStore(dir, { now: () => clock.now })
+      const firstJob = store.create('coding-assistant', { queued: true })
+      assert.ok('jobId' in firstJob)
+      const coordinator = productionDrainCoordinator(store, clock)
+      const first = await coordinator.attempt()
+      assert.equal(first.ok, true)
+
+      clock.now = 11_001
+      assert.equal(store.isDispatchFrozen(), false)
+      const second = await coordinator.attempt()
+      assert.equal(second.ok, true)
+      if (second.ok) assert.equal(second.freezeHolder, 'drain:11001')
+      assert.equal(store.isDispatchFrozen(), true)
+      const blocked = store.claimQueued(firstJob.jobId)
+      assert.equal(blocked.ok, false)
+      if (!blocked.ok) assert.equal(blocked.reason, 'cutover_frozen')
+
+      clock.now = 21_002
+      assert.equal(store.isDispatchFrozen(), false)
+      const claimed = store.claimQueued(firstJob.jobId)
+      assert.equal(claimed.ok, true)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('recycle restart has no leftover drain holder', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-drain-restart-'))
+    try {
+      const clock = { now: 1_000 }
+      const store = openStore(dir, { now: () => clock.now })
+      const created = store.create('coding-assistant', { queued: true })
+      assert.ok('jobId' in created)
+      const coordinator = productionDrainCoordinator(store, clock)
+      const decision = await coordinator.attempt()
+      assert.equal(decision.ok, true)
+      assert.equal(store.isDispatchFrozen(), true)
+      store.close()
+
+      const restarted = openStore(dir, { bootId: 'gw:c1', now: () => clock.now })
+      assert.equal(restarted.isDispatchFrozen(), false)
+      const claimed = restarted.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      restarted.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('expired drain holder does not thaw a live cutover holder', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cut-drain-cutover-hold-'))
+    try {
+      const clock = { now: 1_000 }
+      const store = openStore(dir, { now: () => clock.now })
+      const created = store.create('coding-assistant', { queued: true })
+      assert.ok('jobId' in created)
+      store.freezeDispatch('cutover:9')
+      const coordinator = productionDrainCoordinator(store, clock)
+      const decision = await coordinator.attempt()
+      assert.equal(decision.ok, true)
+      clock.now = 11_001
+      assert.equal(store.isDispatchFrozen(), true)
+      const blocked = store.claimQueued(created.jobId)
+      assert.equal(blocked.ok, false)
+      if (!blocked.ok) assert.equal(blocked.reason, 'cutover_frozen')
+      assert.equal(store.thawDispatch('cutover:9'), true)
+      assert.equal(store.isDispatchFrozen(), false)
+      const claimed = store.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
+
+function productionDrainCoordinator(
+  store: DelegateJobStore,
+  clock: { now: number },
+) {
+  const ttlMs = 10_000
+  let gatewayUntil = 0
+  let sessionUntil = 0
+  const deps: RuntimeRecycleDrainDeps = {
+    ttlMs,
+    now: () => clock.now,
+    armGatewayDrain: (until) => {
+      gatewayUntil = until
+    },
+    isGatewayDrainActive: (at) => gatewayUntil > at,
+    releaseGatewayDrain: () => {
+      gatewayUntil = 0
+    },
+    armSessionDrain: (ttl) => {
+      sessionUntil = clock.now + ttl
+      return { accepted: true, activeTurns: 0 }
+    },
+    isSessionDrainActive: (at) => sessionUntil > at,
+    releaseSessionDrain: () => {
+      sessionUntil = 0
+    },
+    activeIngress: () => 0,
+    countDurableRunning: async () => 0,
+    countRunningDelegateJobs: () => store.countRunning(),
+    peekRunningDelegateJobs: () => store.countRunning(),
+    freezeDelegateDispatch: (holder, expiresAt) => store.freezeDispatch(holder, expiresAt),
+    thawDelegateDispatch: (holder) => {
+      store.thawDispatch(holder)
+    },
+  }
+  const coordinator = new RuntimeRecycleDrainCoordinator(deps)
+  return {
+    attempt: () => coordinator.attempt(),
+    fencesActive: () => gatewayUntil > clock.now && sessionUntil > clock.now,
+  }
+}

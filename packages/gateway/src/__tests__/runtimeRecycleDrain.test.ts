@@ -268,4 +268,22 @@ describe('planned runtime recycle drain', () => {
     assert.equal(h.state().gatewayReleases, 1)
     assert.equal(h.state().sessionReleases, 1)
   })
+
+  test('200 attaches holder expiry at ACK now + ttlMs; pending freeze has none', async () => {
+    const calls: Array<{ holder: string; expiresAt?: number }> = []
+    const h = harness({
+      freezeDelegateDispatch: (holder, expiresAt) => {
+        calls.push({ holder, expiresAt })
+      },
+      thawDelegateDispatch: () => {},
+    })
+    const decision = await attemptRuntimeRecycleDrain(h.deps)
+    assert.equal(decision.ok, true)
+    if (decision.ok) assert.equal(decision.freezeHolder, 'drain:1000')
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0]?.holder, 'drain:1000')
+    assert.equal(calls[0]?.expiresAt, undefined)
+    assert.equal(calls[1]?.holder, 'drain:1000')
+    assert.equal(calls[1]?.expiresAt, 11_000)
+  })
 })

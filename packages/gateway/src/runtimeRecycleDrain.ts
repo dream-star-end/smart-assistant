@@ -27,8 +27,13 @@ export interface RuntimeRecycleDrainDeps {
    * cannot sneak `queued→running` between count and 200.
    */
   peekRunningDelegateJobs?: () => number
-  /** Generation-owned freeze of `claimQueued`. Flag-off omits both freeze/thaw. */
-  freezeDelegateDispatch?: (holder: string) => void
+  /**
+   * Generation-owned freeze of `claimQueued`. Flag-off omits both freeze/thaw.
+   * Pass `expiresAt` (absolute ms) so an accepted drain cannot freeze dispatch
+   * forever if recycle never happens. Omit on the pending freeze; 200 attaches
+   * expiry ≥ the dual-gate window.
+   */
+  freezeDelegateDispatch?: (holder: string, expiresAt?: number) => void
   thawDelegateDispatch?: (holder: string) => void
 }
 
@@ -122,6 +127,11 @@ export async function attemptRuntimeRecycleDrain(
     if (!deps.isGatewayDrainActive(finalNow) || !deps.isSessionDrainActive(finalNow)) {
       return fail({ ok: false, status: 503, reason: 'drain_fence_expired' })
     }
+
+    // Pending freeze has no TTL (TOCTOU). Accepted freeze expires with, or
+    // slightly after, the dual gates so a lost 200 cannot deadlock dispatch,
+    // and cannot thaw before the gates and admit a new running job.
+    if (holder) deps.freezeDelegateDispatch!(holder, finalNow + deps.ttlMs)
 
     return {
       ok: true,

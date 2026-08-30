@@ -271,9 +271,10 @@ export class DelegateJobStore {
   /**
    * Phase F: stop new claimQueued/spawn. Queued rows stay queued.
    * Holders are generation-owned (`cutover:<n>`, `drain:<n>`) so one origin
-   * cannot thaw another. Frozen iff the set is non-empty.
+   * cannot thaw another. Frozen iff the map is non-empty after expiry sweep.
+   * Value is absolute expiry ms, or `null` for cutover/legacy (no TTL).
    */
-  private readonly freezeHolders = new Set<string>()
+  private readonly freezeHolders = new Map<string, number | null>()
   /**
    * In-process runner lifecycle keyed by jobId. Not durable: a hydrated row
    * has no attached writer until this process claims it. `runner_quiesced`
@@ -508,8 +509,9 @@ export class DelegateJobStore {
     return this.commit(job, draft, true)
   }
 
-  freezeDispatch(holder: string): void {
-    this.freezeHolders.add(holder)
+  freezeDispatch(holder: string, expiresAt?: number): void {
+    const prev = this.freezeHolders.get(holder)
+    this.freezeHolders.set(holder, expiresAt !== undefined ? expiresAt : (prev ?? null))
   }
 
   thawDispatch(holder: string): boolean {
@@ -522,6 +524,7 @@ export class DelegateJobStore {
   }
 
   isDispatchFrozen(): boolean {
+    this.purgeExpiredFreezeHolders()
     return this.freezeHolders.size > 0
   }
 
@@ -567,6 +570,7 @@ export class DelegateJobStore {
   claimQueued(
     jobId: string,
   ): { ok: true; claimToken: string; fencingEpoch: number } | { ok: false; reason?: 'cutover_frozen' } {
+    this.purgeExpiredFreezeHolders()
     if (this.freezeHolders.size > 0) return { ok: false, reason: 'cutover_frozen' }
     const job = this.refreshJob(jobId)
     if (!job || job.state !== 'queued') return { ok: false }
@@ -1330,6 +1334,13 @@ export class DelegateJobStore {
       notifyDeliveryToken: row.notifyDeliveryToken,
       notifyClaimedUntil: row.notifyClaimedUntil,
       terminalCommittedAt: row.terminalCommittedAt,
+    }
+  }
+
+  private purgeExpiredFreezeHolders(): void {
+    const now = this.now()
+    for (const [holder, expiresAt] of this.freezeHolders) {
+      if (expiresAt !== null && expiresAt <= now) this.freezeHolders.delete(holder)
     }
   }
 
