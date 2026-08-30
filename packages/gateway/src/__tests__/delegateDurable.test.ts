@@ -737,6 +737,13 @@ describe('blocker 6: restart callback uses durable result', () => {
       }),
       { error: 'upstream 402' },
     )
+    assert.deepEqual(
+      callbackPayloadFromDurableJob({
+        state: 'completed',
+        result: { body: { ok: false, output: '', error: 'child exploded' } },
+      }),
+      { error: 'child exploded' },
+    )
   })
 
   it('ensureCallback injects durable output instead of empty completed text', async () => {

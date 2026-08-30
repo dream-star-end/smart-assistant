@@ -35,6 +35,16 @@ export const DEFAULT_MAX_DELEGATE_JOBS = 256
 export const DELEGATE_LEASE_HEARTBEAT_MS = 15_000
 export const DELEGATE_LEASE_HEARTBEAT_MAX_BEATS = 480
 
+/** Exclusive notify claim lease. Stale injecting is reclaimable after this. */
+export const NOTIFY_CLAIM_LEASE_MS = 30_000
+export const NOTIFY_RETRY_INITIAL_MS = 1_000
+export const NOTIFY_RETRY_MAX_MS = 30_000
+
+export function nextNotifyBackoffMs(attempt: number): number {
+  const exp = Math.min(16, Math.max(0, Math.floor(attempt)))
+  return Math.min(NOTIFY_RETRY_MAX_MS, NOTIFY_RETRY_INITIAL_MS * 2 ** exp)
+}
+
 function normalizeMs(
   raw: string | undefined,
   fallback: number,
@@ -104,6 +114,8 @@ export type DelegateCreateMeta = {
   claimToken?: string
   generation?: number
   parentEngine?: string
+  callbackOriginSessionKey?: string
+  callbackOriginUserId?: string
 }
 
 export type DelegateJobSnapshot = {
@@ -133,6 +145,13 @@ export type DelegateJobSnapshot = {
   parentEngine?: string
   notifyLane?: string
   notifyId?: string
+  callbackOriginSessionKey?: string
+  callbackOriginUserId?: string
+  notifyRetryAt?: number | null
+  notifyAttempt?: number
+  notifyDeliveryToken?: string
+  notifyClaimedUntil?: number | null
+  terminalCommittedAt?: number
 }
 
 type JobEntry = {
@@ -163,6 +182,13 @@ type JobEntry = {
   parentEngine?: string
   notifyLane?: string
   notifyId?: string
+  callbackOriginSessionKey?: string
+  callbackOriginUserId?: string
+  notifyRetryAt?: number | null
+  notifyAttempt: number
+  notifyDeliveryToken?: string
+  notifyClaimedUntil?: number | null
+  terminalCommittedAt?: number | null
 }
 
 export type DelegateJobStoreOptions = {
@@ -282,6 +308,13 @@ export class DelegateJobStore {
       idempotencyKey,
       kind: meta?.kind ?? 'delegate',
       parentEngine: meta?.parentEngine,
+      callbackOriginSessionKey: meta?.callbackOriginSessionKey,
+      callbackOriginUserId: meta?.callbackOriginUserId,
+      notifyRetryAt: null,
+      notifyAttempt: 0,
+      notifyDeliveryToken: undefined,
+      notifyClaimedUntil: null,
+      terminalCommittedAt: null,
     }
     if (this.durable) {
       const outcome = this.durable.insertCreate(this.toDurable(entry), this.maxJobs)
@@ -357,10 +390,22 @@ export class DelegateJobStore {
         draft.callbackState = 'skipped_silent'
       }
       draft.ownerLeaseUntil = null
+      if (
+        draft.state === 'completed' &&
+        result.body &&
+        result.body.ok === false
+      ) {
+        if (!draft.failureClass) draft.failureClass = 'child_error'
+        const err = result.body.error
+        if (typeof err === 'string' && err.trim() && !draft.failureDetail) {
+          draft.failureDetail = err.slice(0, 512)
+        }
+      }
     }
     draft.result = result
     draft.expiresAt = this.now() + this.ttlMs
     draft.lastActivityAt = this.now()
+    draft.terminalCommittedAt = draft.lastActivityAt
     return this.commit(job, draft, true)
   }
 
@@ -410,6 +455,7 @@ export class DelegateJobStore {
     }
     draft.expiresAt = this.now() + this.ttlMs
     draft.lastActivityAt = this.now()
+    draft.terminalCommittedAt = draft.lastActivityAt
     return this.commit(job, draft, true)
   }
 
@@ -627,6 +673,13 @@ export class DelegateJobStore {
       parentEngine: job.parentEngine,
       notifyLane: job.notifyLane,
       notifyId: job.notifyId,
+      callbackOriginSessionKey: job.callbackOriginSessionKey,
+      callbackOriginUserId: job.callbackOriginUserId,
+      notifyRetryAt: job.notifyRetryAt,
+      notifyAttempt: job.notifyAttempt,
+      notifyDeliveryToken: job.notifyDeliveryToken,
+      notifyClaimedUntil: job.notifyClaimedUntil,
+      terminalCommittedAt: job.terminalCommittedAt ?? undefined,
     }
   }
 
@@ -661,6 +714,7 @@ export class DelegateJobStore {
     let removed = 0
     for (const [id, job] of this.jobs) {
       if (!job.result || job.expiresAt === null || job.expiresAt > now) continue
+      if (job.callbackState === 'pending' || job.callbackState === 'injecting') continue
       if (!this.persistDelete(job)) continue
       const waiters = job.waiters.splice(0)
       for (const w of waiters) w({ status: 'expired', jobId: id, ...(this.sm ? { failure_class: 'job_ttl_elapsed' as const } : {}) })
@@ -807,6 +861,161 @@ export class DelegateJobStore {
     return out
   }
 
+  listDueNotify(now = this.now()): DelegateJobSnapshot[] {
+    return this.listPendingNotify().filter((job) => this.isNotifyDue(job, now))
+  }
+
+  private isNotifyDue(job: DelegateJobSnapshot, now: number): boolean {
+    if (job.callbackState === 'injecting') {
+      return job.notifyClaimedUntil == null || job.notifyClaimedUntil <= now
+    }
+    return job.notifyRetryAt == null || job.notifyRetryAt <= now
+  }
+
+  claimNotifyDelivery(
+    jobId: string,
+    fence?: { claimToken: string; fencingEpoch: number },
+  ): { ok: true; token: string; snapshot: DelegateJobSnapshot } | { ok: false } {
+    const job = this.refreshJob(jobId)
+    if (!job) return { ok: false }
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        return { ok: false }
+      }
+    }
+    if (!isDelegateTerminalState(job.state)) return { ok: false }
+    if (job.callback !== 'origin-inject') return { ok: false }
+    const now = this.now()
+    const staleInjecting =
+      job.callbackState === 'injecting' &&
+      (job.notifyClaimedUntil == null || job.notifyClaimedUntil <= now)
+    if (job.callbackState !== 'pending' && !staleInjecting) return { ok: false }
+    const token = mintDelegateClaimToken()
+    const claimedUntil = now + NOTIFY_CLAIM_LEASE_MS
+    if (this.durable) {
+      const row = this.durable.casClaimNotify({
+        jobId,
+        state: job.state,
+        fencingEpoch: job.fencingEpoch,
+        claimToken: job.claimToken ?? null,
+        deliveryToken: token,
+        now,
+        claimedUntil,
+      })
+      if (!row) {
+        this.refreshJob(jobId)
+        return { ok: false }
+      }
+      const next = this.ingestDurableRow(row)
+      return { ok: true, token, snapshot: this.snapshot(next) }
+    }
+    job.callbackState = 'injecting'
+    job.notifyDeliveryToken = token
+    job.notifyClaimedUntil = claimedUntil
+    job.lastActivityAt = now
+    return { ok: true, token, snapshot: this.snapshot(job) }
+  }
+
+  completeNotifyDelivery(
+    jobId: string,
+    deliveryToken: string,
+    fence?: { claimToken: string; fencingEpoch: number },
+  ): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job) return false
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        return false
+      }
+    }
+    if (job.callbackState === 'delivered') return true
+    if (job.callbackState !== 'injecting' || job.notifyDeliveryToken !== deliveryToken) return false
+    const now = this.now()
+    if (this.durable) {
+      const row = this.durable.casCompleteNotify({
+        jobId,
+        state: job.state,
+        fencingEpoch: job.fencingEpoch,
+        claimToken: job.claimToken ?? null,
+        deliveryToken,
+        now,
+      })
+      if (!row) {
+        this.refreshJob(jobId)
+        return false
+      }
+      this.ingestDurableRow(row)
+      return true
+    }
+    job.callbackState = 'delivered'
+    job.notifyDeliveryToken = undefined
+    job.notifyClaimedUntil = null
+    job.notifyRetryAt = null
+    job.lastActivityAt = now
+    return true
+  }
+
+  releaseNotifyClaim(
+    jobId: string,
+    deliveryToken: string,
+    fence?: { claimToken: string; fencingEpoch: number },
+  ): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job) return false
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        return false
+      }
+    }
+    if (job.callbackState !== 'injecting' || job.notifyDeliveryToken !== deliveryToken) return false
+    const now = this.now()
+    const nextAttempt = (job.notifyAttempt ?? 0) + 1
+    const retryAt = now + nextNotifyBackoffMs(job.notifyAttempt ?? 0)
+    if (this.durable) {
+      const row = this.durable.casReleaseNotify({
+        jobId,
+        state: job.state,
+        fencingEpoch: job.fencingEpoch,
+        claimToken: job.claimToken ?? null,
+        deliveryToken,
+        now,
+        retryAt,
+        notifyAttempt: nextAttempt,
+      })
+      if (!row) {
+        this.refreshJob(jobId)
+        return false
+      }
+      this.ingestDurableRow(row)
+      return true
+    }
+    job.callbackState = 'pending'
+    job.notifyDeliveryToken = undefined
+    job.notifyClaimedUntil = null
+    job.notifyRetryAt = retryAt
+    job.notifyAttempt = nextAttempt
+    job.lastActivityAt = now
+    return true
+  }
+
+  deferPendingNotify(
+    jobId: string,
+    fence?: { claimToken: string; fencingEpoch: number },
+  ): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job || job.callbackState !== 'pending') return false
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        return false
+      }
+    }
+    const draft = this.cloneEntry(job)
+    draft.notifyRetryAt = this.now() + nextNotifyBackoffMs(job.notifyAttempt ?? 0)
+    draft.notifyAttempt = (job.notifyAttempt ?? 0) + 1
+    draft.lastActivityAt = this.now()
+    return this.commit(job, draft, false)
+  }
+
   restoreSnapshot(snap: DelegateJobSnapshot, agentId = 'restored'): void {
     if (this.jobs.has(snap.id)) return
     const createdAt = snap.createdAt ?? this.now()
@@ -844,6 +1053,13 @@ export class DelegateJobStore {
       parentEngine: snap.parentEngine,
       notifyLane: snap.notifyLane,
       notifyId: snap.notifyId,
+      callbackOriginSessionKey: snap.callbackOriginSessionKey,
+      callbackOriginUserId: snap.callbackOriginUserId,
+      notifyRetryAt: snap.notifyRetryAt ?? null,
+      notifyAttempt: snap.notifyAttempt ?? 0,
+      notifyDeliveryToken: snap.notifyDeliveryToken,
+      notifyClaimedUntil: snap.notifyClaimedUntil ?? null,
+      terminalCommittedAt: snap.terminalCommittedAt ?? null,
     })
     if (snap.idempotencyKey) this.byIdempotency.set(snap.idempotencyKey, snap.id)
   }
@@ -892,6 +1108,13 @@ export class DelegateJobStore {
       parentEngine: row.parentEngine,
       notifyLane: row.notifyLane,
       notifyId: row.notifyId,
+      callbackOriginSessionKey: row.callbackOriginSessionKey,
+      callbackOriginUserId: row.callbackOriginUserId,
+      notifyRetryAt: row.notifyRetryAt,
+      notifyAttempt: row.notifyAttempt ?? 0,
+      notifyDeliveryToken: row.notifyDeliveryToken,
+      notifyClaimedUntil: row.notifyClaimedUntil,
+      terminalCommittedAt: row.terminalCommittedAt,
     }
   }
 
@@ -1022,6 +1245,13 @@ export class DelegateJobStore {
       parentEngine: snap.parentEngine,
       notifyLane: snap.notifyLane,
       notifyId: snap.notifyId,
+      callbackOriginSessionKey: snap.callbackOriginSessionKey,
+      callbackOriginUserId: snap.callbackOriginUserId,
+      notifyRetryAt: snap.notifyRetryAt ?? null,
+      notifyAttempt: snap.notifyAttempt ?? 0,
+      notifyDeliveryToken: snap.notifyDeliveryToken,
+      notifyClaimedUntil: snap.notifyClaimedUntil ?? null,
+      terminalCommittedAt: snap.terminalCommittedAt ?? null,
     }
   }
 
@@ -1055,6 +1285,13 @@ export class DelegateJobStore {
       parentEngine: job.parentEngine,
       notifyLane: job.notifyLane,
       notifyId: job.notifyId,
+      callbackOriginSessionKey: job.callbackOriginSessionKey,
+      callbackOriginUserId: job.callbackOriginUserId,
+      notifyRetryAt: job.notifyRetryAt ?? null,
+      notifyAttempt: job.notifyAttempt ?? 0,
+      notifyDeliveryToken: job.notifyDeliveryToken,
+      notifyClaimedUntil: job.notifyClaimedUntil ?? null,
+      terminalCommittedAt: job.terminalCommittedAt ?? undefined,
     }
   }
 }

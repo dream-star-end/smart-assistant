@@ -355,6 +355,13 @@ describe('B2 callback owner', () => {
       { action: 'ensure_callback', jobId: 'dlgjob-1', state: 'completed' },
     )
     assert.deepEqual(
+      decideSendToAgentIntentRecovery({
+        callbackOwner: 'job',
+        job: { jobId: 'dlgjob-1', state: 'completed', callbackState: 'delivered' },
+      }),
+      { action: 'ack_delivered' },
+    )
+    assert.deepEqual(
       decideSendToAgentIntentRecovery({ callbackOwner: 'intent', job: { jobId: 'dlgjob-1', state: 'running' } }),
       { action: 'legacy_interrupt' },
     )

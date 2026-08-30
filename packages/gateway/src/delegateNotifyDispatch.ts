@@ -29,6 +29,8 @@ export type NotifyDispatchHooks = {
   resolveParentEngine?: (job: DelegateJobSnapshot) => ReturnType<typeof parseParentEngine>
   resolveNativeId?: (job: DelegateJobSnapshot) => string | undefined
   resolveGoal?: (job: DelegateJobSnapshot) => string | undefined
+  resolveCallbackOrigin?: (job: DelegateJobSnapshot) => string | undefined
+  onDelivered?: (job: DelegateJobSnapshot) => void | Promise<void>
 }
 
 function fenceOf(job: DelegateJobSnapshot): NotifyFence | undefined {
@@ -42,6 +44,17 @@ export function persistNotifyIntent(
   patch: { parentEngine?: string; notifyLane: NotifyLane; notifyId: string },
 ): boolean {
   return store.patchNotifyIntent(job.id, patch, fenceOf(job))
+}
+
+async function ackDelivered(
+  store: DelegateJobStore,
+  job: DelegateJobSnapshot,
+  hooks: NotifyDispatchHooks,
+  notifyId: string,
+  lane: NotifyLane,
+): Promise<NotifyResult> {
+  await hooks.onDelivered?.(store.snapshotOf(job.id) ?? job)
+  return { ok: true, lane, notifyId }
 }
 
 export async function dispatchJobTerminalNotify(
@@ -61,6 +74,11 @@ export async function dispatchJobTerminalNotify(
     job.callbackState === 'skipped_silent' ||
     job.callback === 'none' ||
     isHeartbeatSilentOutput(resultRefFromSnapshot(job))
+
+  if (job.callbackState === 'delivered' || job.callbackState === 'abandoned') {
+    const lane = (job.notifyLane as NotifyLane | undefined) ?? laneForCallback(job.callback, parentEngine)
+    return ackDelivered(store, job, hooks, notifyId, lane)
+  }
 
   if (silent) {
     persistNotifyIntent(store, job, {
@@ -96,6 +114,9 @@ export async function dispatchJobTerminalNotify(
       notifyLane: 'resume-inject',
       notifyId,
     })
+    if (job.callback === 'origin-inject') {
+      store.deferPendingNotify(job.id, fenceOf(job))
+    }
     return { ok: false, failureClass: 'internal' }
   }
 
@@ -106,37 +127,42 @@ export async function dispatchJobTerminalNotify(
     notifyId,
   })
 
-  const event = buildJobTerminalFromSnapshot(job, {
+  const live = store.snapshotOf(job.id) ?? job
+  const event = buildJobTerminalFromSnapshot(live, {
     parentEngine,
-    parentNativeId: hooks.resolveNativeId?.(job),
-    goal: hooks.resolveGoal?.(job),
+    parentNativeId: hooks.resolveNativeId?.(live),
+    goal: hooks.resolveGoal?.(live),
+    callbackOriginSessionKey: hooks.resolveCallbackOrigin?.(live),
   })
   if (!event) return { ok: false, failureClass: 'internal' }
 
-  if (job.callback === 'origin-inject' && job.callbackState === 'pending') {
-    store.patchCallbackState(job.id, 'injecting', fenceOf(job))
+  let deliveryToken: string | undefined
+  if (job.callback === 'origin-inject') {
+    const claimed = store.claimNotifyDelivery(job.id, fenceOf(live))
+    if (!claimed.ok) return { skipped: true, reason: 'lost_claim' }
+    deliveryToken = claimed.token
   }
 
   const result = await notifier.notify(event)
   if (result.ok) {
     if (result.lane !== preferred) {
-      persistNotifyIntent(store, job, {
+      persistNotifyIntent(store, live, {
         parentEngine,
         notifyLane: result.lane,
         notifyId: result.notifyId,
       })
     }
-    if (job.callback === 'origin-inject') {
-      const delivered = store.patchCallbackState(job.id, 'delivered', fenceOf(job))
-      if (!delivered) {
-        store.patchCallbackState(job.id, 'pending', fenceOf(job))
-      }
+    if (job.callback === 'origin-inject' && deliveryToken) {
+      const delivered = store.completeNotifyDelivery(job.id, deliveryToken, fenceOf(live))
+      if (delivered) await hooks.onDelivered?.(store.snapshotOf(job.id) ?? live)
     }
     return result
   }
 
-  if (job.callback === 'origin-inject') {
-    store.patchCallbackState(job.id, 'pending', fenceOf(job))
+  if (job.callback === 'origin-inject' && deliveryToken) {
+    store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(live))
+  } else if (job.callback === 'origin-inject') {
+    store.deferPendingNotify(job.id, fenceOf(live))
   }
   return result
 }
@@ -145,9 +171,11 @@ export async function retryPendingNotifies(
   store: DelegateJobStore,
   notifier: EngineNotifier,
   hooks: NotifyDispatchHooks = {},
+  opts: { dueOnly?: boolean } = {},
 ): Promise<{ scanned: number; delivered: number; failed: number; skipped: number }> {
   const summary = { scanned: 0, delivered: 0, failed: 0, skipped: 0 }
-  for (const job of store.listPendingNotify()) {
+  const jobs = opts.dueOnly ? store.listDueNotify() : store.listPendingNotify()
+  for (const job of jobs) {
     summary.scanned += 1
     const result = await dispatchJobTerminalNotify(store, job, notifier, hooks)
     if ('skipped' in result) {
@@ -158,4 +186,21 @@ export async function retryPendingNotifies(
     else summary.failed += 1
   }
   return summary
+}
+
+/** Milliseconds until the next pending/injecting notify is due, or undefined. */
+export function delayUntilNextNotifyRetry(
+  store: DelegateJobStore,
+  now = Date.now(),
+): number | undefined {
+  let next: number | undefined
+  for (const job of store.listPendingNotify()) {
+    const at =
+      job.callbackState === 'injecting'
+        ? (job.notifyClaimedUntil ?? now)
+        : (job.notifyRetryAt ?? now)
+    if (next === undefined || at < next) next = at
+  }
+  if (next === undefined) return undefined
+  return Math.max(0, next - now)
 }

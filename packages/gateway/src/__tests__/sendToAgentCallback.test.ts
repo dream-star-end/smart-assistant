@@ -66,6 +66,11 @@ describe('sendToAgentCallback text + ids', () => {
     })
     assert.match(failed, /失败/)
     assert.match(failed, /upstream 402/)
+    const disguised = callbackPayloadFromDurableJob({
+      state: 'completed',
+      result: { body: { ok: false, output: '', error: 'child exploded' } },
+    })
+    assert.deepEqual(disguised, { error: 'child exploded' })
   })
 
   it('accepts a live webchat parent key', () => {

@@ -193,6 +193,10 @@ export type JobTerminal = {
   parallelPolicy: 'each' | 'all'
   agentId?: string
   goal?: string
+  /** Explicit child outcome. HTTP 200 + `{ok:false}` is a failure. */
+  resultOk?: boolean
+  /** t1: durable terminal commit time (ms). Latency is t1→t2. */
+  terminalCommittedAt?: number
 }
 
 export type NotifyResult =

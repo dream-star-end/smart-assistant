@@ -59,7 +59,8 @@ export class DefaultEngineNotifier implements EngineNotifier {
   }
 
   async notify(event: JobTerminal): Promise<NotifyResult> {
-    const t0 = this.now()
+    const committed = event.terminalCommittedAt
+    const t0 = typeof committed === 'number' && committed > 0 ? committed : this.now()
     const notifyId = delegateNotifyId(event.jobId, event.callbackEpoch)
     const finish = (result: NotifyResult, degraded = false): NotifyResult => {
       const lane = result.ok ? result.lane : (result.degradedTo ?? classifySafe(event))
@@ -175,9 +176,10 @@ export type InlinePushSession = {
 }
 
 /**
- * Best-effort 档 A write. Duck-types the live parent runner so tests can
- * stub it and production can degrade to ResumeInject when stdin is gone.
- * Does not add methods to engine adapters (R3).
+ * Best-effort 档 A write. Duck-types `runner.proc` / `runner.writeRaw`.
+ * Production CcbAdapter/CodexAdapter keep those on private inner runners
+ * (R3), so live CCB/Codex currently degrade to ResumeInject. This port is
+ * a test/R1 scaffold, not a production InlinePush capability.
  */
 export async function tryWriteInlinePush(
   session: InlinePushSession | undefined,

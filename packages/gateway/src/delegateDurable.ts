@@ -25,7 +25,7 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 1
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 2
 
 export type DurableJobRecord = {
   id: string
@@ -55,6 +55,13 @@ export type DurableJobRecord = {
   parentEngine?: string
   notifyLane?: string
   notifyId?: string
+  callbackOriginSessionKey?: string
+  callbackOriginUserId?: string
+  notifyRetryAt?: number | null
+  notifyAttempt?: number
+  notifyDeliveryToken?: string
+  notifyClaimedUntil?: number | null
+  terminalCommittedAt?: number
 }
 
 const DDL_V1 = `
@@ -85,7 +92,14 @@ CREATE TABLE IF NOT EXISTS delegate_jobs (
   expires_at INTEGER,
   parent_engine TEXT,
   notify_lane TEXT,
-  notify_id TEXT
+  notify_id TEXT,
+  callback_origin_session_key TEXT,
+  callback_origin_user_id TEXT,
+  notify_retry_at INTEGER,
+  notify_attempt INTEGER NOT NULL DEFAULT 0,
+  notify_delivery_token TEXT,
+  notify_claimed_until INTEGER,
+  terminal_committed_at INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_delegate_jobs_idempotency
   ON delegate_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;
@@ -112,6 +126,9 @@ export class DelegateDurableDb {
   private readonly insertStmt
   private readonly casUpdateStmt
   private readonly casDeleteStmt
+  private readonly casClaimNotifyStmt
+  private readonly casCompleteNotifyStmt
+  private readonly casReleaseNotifyStmt
   private readonly getStmt
   private readonly getByIdemStmt
   private readonly listStmt
@@ -133,13 +150,17 @@ export class DelegateDurableDb {
         owner_instance_id, owner_lease_until, claim_token, attempt_no, fencing_epoch,
         checkpoint_kind, callback, callback_state, callback_epoch, idempotency_key,
         failure_class, failure_detail, result_json, created_at, updated_at,
-        last_activity_at, expires_at, parent_engine, notify_lane, notify_id
+        last_activity_at, expires_at, parent_engine, notify_lane, notify_id,
+        callback_origin_session_key, callback_origin_user_id, notify_retry_at, notify_attempt,
+        notify_delivery_token, notify_claimed_until, terminal_committed_at
       ) VALUES (
         @job_id, @agent_id, @state, @kind, @session_key, @parent_session_key, @generation,
         @owner_instance_id, @owner_lease_until, @claim_token, @attempt_no, @fencing_epoch,
         @checkpoint_kind, @callback, @callback_state, @callback_epoch, @idempotency_key,
         @failure_class, @failure_detail, @result_json, @created_at, @updated_at,
-        @last_activity_at, @expires_at, @parent_engine, @notify_lane, @notify_id
+        @last_activity_at, @expires_at, @parent_engine, @notify_lane, @notify_id,
+        @callback_origin_session_key, @callback_origin_user_id, @notify_retry_at, @notify_attempt,
+        @notify_delivery_token, @notify_claimed_until, @terminal_committed_at
       )
       ON CONFLICT(job_id) DO UPDATE SET
         agent_id=excluded.agent_id,
@@ -166,7 +187,14 @@ export class DelegateDurableDb {
         expires_at=excluded.expires_at,
         parent_engine=excluded.parent_engine,
         notify_lane=excluded.notify_lane,
-        notify_id=excluded.notify_id
+        notify_id=excluded.notify_id,
+        callback_origin_session_key=excluded.callback_origin_session_key,
+        callback_origin_user_id=excluded.callback_origin_user_id,
+        notify_retry_at=excluded.notify_retry_at,
+        notify_attempt=excluded.notify_attempt,
+        notify_delivery_token=excluded.notify_delivery_token,
+        notify_claimed_until=excluded.notify_claimed_until,
+        terminal_committed_at=excluded.terminal_committed_at
     `)
     this.insertStmt = this.db.prepare(`
       INSERT INTO delegate_jobs (
@@ -174,13 +202,17 @@ export class DelegateDurableDb {
         owner_instance_id, owner_lease_until, claim_token, attempt_no, fencing_epoch,
         checkpoint_kind, callback, callback_state, callback_epoch, idempotency_key,
         failure_class, failure_detail, result_json, created_at, updated_at,
-        last_activity_at, expires_at, parent_engine, notify_lane, notify_id
+        last_activity_at, expires_at, parent_engine, notify_lane, notify_id,
+        callback_origin_session_key, callback_origin_user_id, notify_retry_at, notify_attempt,
+        notify_delivery_token, notify_claimed_until, terminal_committed_at
       ) VALUES (
         @job_id, @agent_id, @state, @kind, @session_key, @parent_session_key, @generation,
         @owner_instance_id, @owner_lease_until, @claim_token, @attempt_no, @fencing_epoch,
         @checkpoint_kind, @callback, @callback_state, @callback_epoch, @idempotency_key,
         @failure_class, @failure_detail, @result_json, @created_at, @updated_at,
-        @last_activity_at, @expires_at, @parent_engine, @notify_lane, @notify_id
+        @last_activity_at, @expires_at, @parent_engine, @notify_lane, @notify_id,
+        @callback_origin_session_key, @callback_origin_user_id, @notify_retry_at, @notify_attempt,
+        @notify_delivery_token, @notify_claimed_until, @terminal_committed_at
       )
     `)
     this.casUpdateStmt = this.db.prepare(`
@@ -209,7 +241,14 @@ export class DelegateDurableDb {
         expires_at=@expires_at,
         parent_engine=@parent_engine,
         notify_lane=@notify_lane,
-        notify_id=@notify_id
+        notify_id=@notify_id,
+        callback_origin_session_key=@callback_origin_session_key,
+        callback_origin_user_id=@callback_origin_user_id,
+        notify_retry_at=@notify_retry_at,
+        notify_attempt=@notify_attempt,
+        notify_delivery_token=@notify_delivery_token,
+        notify_claimed_until=@notify_claimed_until,
+        terminal_committed_at=@terminal_committed_at
       WHERE job_id=@job_id
         AND state=@expected_state
         AND fencing_epoch=@expected_epoch
@@ -228,6 +267,68 @@ export class DelegateDurableDb {
           (@expected_token IS NULL AND claim_token IS NULL)
           OR claim_token=@expected_token
         )
+    `)
+    this.casClaimNotifyStmt = this.db.prepare(`
+      UPDATE delegate_jobs SET
+        callback_state='injecting',
+        notify_delivery_token=@delivery_token,
+        notify_claimed_until=@claimed_until,
+        last_activity_at=@now,
+        updated_at=@now
+      WHERE job_id=@job_id
+        AND state=@expected_state
+        AND fencing_epoch=@expected_epoch
+        AND (
+          (@expected_token IS NULL AND claim_token IS NULL)
+          OR claim_token=@expected_token
+        )
+        AND (
+          callback_state='pending'
+          OR (
+            callback_state='injecting'
+            AND (notify_claimed_until IS NULL OR notify_claimed_until < @now)
+          )
+        )
+      RETURNING *
+    `)
+    this.casCompleteNotifyStmt = this.db.prepare(`
+      UPDATE delegate_jobs SET
+        callback_state='delivered',
+        notify_delivery_token=NULL,
+        notify_claimed_until=NULL,
+        notify_retry_at=NULL,
+        last_activity_at=@now,
+        updated_at=@now
+      WHERE job_id=@job_id
+        AND state=@expected_state
+        AND fencing_epoch=@expected_epoch
+        AND (
+          (@expected_token IS NULL AND claim_token IS NULL)
+          OR claim_token=@expected_token
+        )
+        AND callback_state='injecting'
+        AND notify_delivery_token=@delivery_token
+      RETURNING *
+    `)
+    this.casReleaseNotifyStmt = this.db.prepare(`
+      UPDATE delegate_jobs SET
+        callback_state='pending',
+        notify_delivery_token=NULL,
+        notify_claimed_until=NULL,
+        notify_retry_at=@retry_at,
+        notify_attempt=@notify_attempt,
+        last_activity_at=@now,
+        updated_at=@now
+      WHERE job_id=@job_id
+        AND state=@expected_state
+        AND fencing_epoch=@expected_epoch
+        AND (
+          (@expected_token IS NULL AND claim_token IS NULL)
+          OR claim_token=@expected_token
+        )
+        AND callback_state='injecting'
+        AND notify_delivery_token=@delivery_token
+      RETURNING *
     `)
     this.getStmt = this.db.prepare('SELECT * FROM delegate_jobs WHERE job_id = ?')
     this.getByIdemStmt = this.db.prepare(
@@ -248,9 +349,31 @@ export class DelegateDurableDb {
     if (current >= DELEGATE_DURABLE_SCHEMA_VERSION) return
     const apply = this.db.transaction(() => {
       if (current < 1) this.db.exec(DDL_V1)
+      if (current < 2) this.addNotifyDeliveryColumns()
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
     apply()
+  }
+
+  private addNotifyDeliveryColumns(): void {
+    const existing = new Set(
+      (this.db.prepare('PRAGMA table_info(delegate_jobs)').all() as Array<{ name: string }>).map(
+        (row) => row.name,
+      ),
+    )
+    const columns: Array<[string, string]> = [
+      ['callback_origin_session_key', 'TEXT'],
+      ['callback_origin_user_id', 'TEXT'],
+      ['notify_retry_at', 'INTEGER'],
+      ['notify_attempt', 'INTEGER NOT NULL DEFAULT 0'],
+      ['notify_delivery_token', 'TEXT'],
+      ['notify_claimed_until', 'INTEGER'],
+      ['terminal_committed_at', 'INTEGER'],
+    ]
+    for (const [name, type] of columns) {
+      if (existing.has(name)) continue
+      this.db.exec(`ALTER TABLE delegate_jobs ADD COLUMN ${name} ${type}`)
+    }
   }
 
   transaction<T>(fn: () => T): T {
@@ -329,6 +452,72 @@ export class DelegateDurableDb {
       expected_token: expected.claimToken ?? null,
     })
     return info.changes === 1
+  }
+
+  casClaimNotify(args: {
+    jobId: string
+    state: string
+    fencingEpoch: number
+    claimToken?: string | null
+    deliveryToken: string
+    now: number
+    claimedUntil: number
+  }): DurableJobRecord | undefined {
+    this.throwIfInjectedFailure()
+    const row = this.casClaimNotifyStmt.get({
+      job_id: args.jobId,
+      expected_state: args.state,
+      expected_epoch: args.fencingEpoch,
+      expected_token: args.claimToken ?? null,
+      delivery_token: args.deliveryToken,
+      now: args.now,
+      claimed_until: args.claimedUntil,
+    }) as Record<string, unknown> | undefined
+    return row ? fromRow(row) : undefined
+  }
+
+  casCompleteNotify(args: {
+    jobId: string
+    state: string
+    fencingEpoch: number
+    claimToken?: string | null
+    deliveryToken: string
+    now: number
+  }): DurableJobRecord | undefined {
+    this.throwIfInjectedFailure()
+    const row = this.casCompleteNotifyStmt.get({
+      job_id: args.jobId,
+      expected_state: args.state,
+      expected_epoch: args.fencingEpoch,
+      expected_token: args.claimToken ?? null,
+      delivery_token: args.deliveryToken,
+      now: args.now,
+    }) as Record<string, unknown> | undefined
+    return row ? fromRow(row) : undefined
+  }
+
+  casReleaseNotify(args: {
+    jobId: string
+    state: string
+    fencingEpoch: number
+    claimToken?: string | null
+    deliveryToken: string
+    now: number
+    retryAt: number
+    notifyAttempt: number
+  }): DurableJobRecord | undefined {
+    this.throwIfInjectedFailure()
+    const row = this.casReleaseNotifyStmt.get({
+      job_id: args.jobId,
+      expected_state: args.state,
+      expected_epoch: args.fencingEpoch,
+      expected_token: args.claimToken ?? null,
+      delivery_token: args.deliveryToken,
+      now: args.now,
+      retry_at: args.retryAt,
+      notify_attempt: args.notifyAttempt,
+    }) as Record<string, unknown> | undefined
+    return row ? fromRow(row) : undefined
   }
 
   countNonTerminal(): number {
@@ -419,6 +608,13 @@ function toRow(record: DurableJobRecord): Record<string, unknown> {
     parent_engine: record.parentEngine ?? null,
     notify_lane: record.notifyLane ?? null,
     notify_id: record.notifyId ?? null,
+    callback_origin_session_key: record.callbackOriginSessionKey ?? null,
+    callback_origin_user_id: record.callbackOriginUserId ?? null,
+    notify_retry_at: record.notifyRetryAt ?? null,
+    notify_attempt: record.notifyAttempt ?? 0,
+    notify_delivery_token: record.notifyDeliveryToken ?? null,
+    notify_claimed_until: record.notifyClaimedUntil ?? null,
+    terminal_committed_at: record.terminalCommittedAt ?? null,
   }
 }
 
@@ -459,6 +655,13 @@ function fromRow(row: Record<string, unknown>): DurableJobRecord {
     parentEngine: str(row.parent_engine),
     notifyLane: str(row.notify_lane),
     notifyId: str(row.notify_id),
+    callbackOriginSessionKey: str(row.callback_origin_session_key),
+    callbackOriginUserId: str(row.callback_origin_user_id),
+    notifyRetryAt: row.notify_retry_at == null ? null : num(row.notify_retry_at),
+    notifyAttempt: num(row.notify_attempt),
+    notifyDeliveryToken: str(row.notify_delivery_token),
+    notifyClaimedUntil: row.notify_claimed_until == null ? null : num(row.notify_claimed_until),
+    terminalCommittedAt: row.terminal_committed_at == null ? undefined : num(row.terminal_committed_at),
   }
 }
 

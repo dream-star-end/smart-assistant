@@ -393,8 +393,16 @@ import {
   resolveDelegateCallbackOwner,
 } from './delegateSmFlag.js'
 import { DefaultEngineNotifier, tryWriteInlinePush, type InlinePushSession } from './engineNotifier.js'
-import { dispatchJobTerminalNotify, retryPendingNotifies } from './delegateNotifyDispatch.js'
-import { formatJobTerminalMarkdown, parseParentEngine } from './jobTerminal.js'
+import {
+  delayUntilNextNotifyRetry,
+  dispatchJobTerminalNotify,
+  retryPendingNotifies,
+} from './delegateNotifyDispatch.js'
+import {
+  formatJobTerminalMarkdown,
+  injectPayloadFromJobTerminal,
+  parseParentEngine,
+} from './jobTerminal.js'
 import { openDelegateDurableDb } from './delegateDurable.js'
 import {
   nextDelegateReconcileAt,
@@ -10496,6 +10504,7 @@ export class Gateway {
   private _delegateReconcileReady = false
   private _delegateDurablePath: string | undefined
   private _delegateReconcileTimer: ReturnType<typeof setTimeout> | undefined
+  private _notifyRetryTimer: ReturnType<typeof setTimeout> | undefined
   private _engineNotifier: DefaultEngineNotifier | undefined
 
   private _ensureDelegateJobStore(): DelegateJobStore {
@@ -10529,7 +10538,7 @@ export class Gateway {
       this._armDelegateReconcileFollowup(store, queueWaitMs)
       this._delegateReconcileReady = true
       if (isDelegateNotifierEffective()) {
-        void this._retryDelegateNotifies()
+        void this._retryDelegateNotifies().finally(() => this._armNotifyRetryScheduler())
       }
     } else {
       this._delegateReconcileReady = true
@@ -10584,8 +10593,14 @@ export class Gateway {
   private _notifyDispatchHooks() {
     return {
       resolveParentEngine: (job: DelegateJobSnapshot) =>
-        this._resolveDelegateParentEngine(job.parentSessionKey) ?? parseParentEngine(job.parentEngine),
+        this._resolveDelegateParentEngine(job.callbackOriginSessionKey ?? job.parentSessionKey) ??
+        parseParentEngine(job.parentEngine),
       resolveGoal: (job: DelegateJobSnapshot) => this._activeSendToAgentCallbacks?.get(job.id)?.goal,
+      resolveCallbackOrigin: (job: DelegateJobSnapshot) => job.callbackOriginSessionKey,
+      onDelivered: async (job: DelegateJobSnapshot) => {
+        this._activeSendToAgentCallbacks.delete(job.id)
+        await removeSendToAgentIntent(job.id)
+      },
     }
   }
 
@@ -10601,13 +10616,14 @@ export class Gateway {
       },
       resumeInject: {
         inject: async (event) => {
+          const payload = injectPayloadFromJobTerminal(event)
           const result = await this.injectSendToAgentCallback({
             parentSessionKey: event.parentSessionKey,
             jobId: event.jobId,
             agentId: event.agentId || 'unknown',
             goal: event.goal || '',
-            output: event.state === 'completed' ? event.resultRef : undefined,
-            error: event.state === 'completed' ? undefined : event.failureDetail || event.resultRef,
+            output: payload.output,
+            error: payload.error,
             clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
           })
           if (result.kind === 'injected') return { ok: true }
@@ -10648,19 +10664,36 @@ export class Gateway {
       }
     } catch (err) {
       this.log.warn('delegate notify threw', { jobId: job.id }, err as Error)
+    } finally {
+      this._armNotifyRetryScheduler()
     }
   }
 
-  private async _retryDelegateNotifies(): Promise<void> {
+  private async _retryDelegateNotifies(opts: { dueOnly?: boolean } = {}): Promise<void> {
     const store = this._delegateJobs
     const notifier = this._ensureEngineNotifier()
     if (!store || !notifier) return
     try {
-      const summary = await retryPendingNotifies(store, notifier, this._notifyDispatchHooks())
+      const summary = await retryPendingNotifies(store, notifier, this._notifyDispatchHooks(), opts)
       if (summary.scanned > 0) this.log.info('delegate notify retry', summary)
     } catch (err) {
       this.log.warn('delegate notify retry threw', undefined, err as Error)
     }
+  }
+
+  private _armNotifyRetryScheduler(): void {
+    if (this._notifyRetryTimer) {
+      clearTimeout(this._notifyRetryTimer)
+      this._notifyRetryTimer = undefined
+    }
+    if (!isDelegateNotifierEffective() || !this._delegateJobs) return
+    const delay = delayUntilNextNotifyRetry(this._delegateJobs)
+    if (delay == null) return
+    this._notifyRetryTimer = setTimeout(() => {
+      this._notifyRetryTimer = undefined
+      void this._retryDelegateNotifies({ dueOnly: true }).finally(() => this._armNotifyRetryScheduler())
+    }, delay)
+    this._notifyRetryTimer.unref()
   }
 
   private readonly _activeSendToAgentCallbacks = new Map<string, {
@@ -11248,8 +11281,10 @@ export class Gateway {
         callback: callbackOnComplete ? 'origin-inject' : 'stdout-wait',
         idempotencyKey: sm ? idempotencyKey : undefined,
         parentEngine: isDelegateNotifierEffective()
-          ? this._resolveDelegateParentEngine(parentSessionKey)
+          ? this._resolveDelegateParentEngine(callbackTarget?.sessionKey ?? parentSessionKey)
           : undefined,
+        callbackOriginSessionKey: callbackTarget?.sessionKey,
+        callbackOriginUserId: callbackTarget?.userId,
       })
       if ('error' in created) {
         this._delegateResume.abort(resume.sessionKey, resume.minted)
@@ -13094,6 +13129,10 @@ export class Gateway {
       clearTimeout(this._delegateReconcileTimer)
       this._delegateReconcileTimer = undefined
     }
+    if (this._notifyRetryTimer) {
+      clearTimeout(this._notifyRetryTimer)
+      this._notifyRetryTimer = undefined
+    }
     await this._persistInterruptedSendToAgentCallbacks()
     this._delegateJobs?.close()
     this._delegateJobs = undefined
@@ -13124,8 +13163,17 @@ export class Gateway {
       const notifier = this._ensureEngineNotifier()
       if (!notifier) return false
       const result = await dispatchJobTerminalNotify(this._delegateJobs, job, notifier, {
-        resolveParentEngine: (row) => this._resolveDelegateParentEngine(row.parentSessionKey) ?? parseParentEngine(row.parentEngine),
+        resolveParentEngine: (row) =>
+          this._resolveDelegateParentEngine(
+            row.callbackOriginSessionKey ?? intent.originSessionKey ?? row.parentSessionKey,
+          ) ?? parseParentEngine(row.parentEngine),
         resolveGoal: () => intent.goal,
+        resolveCallbackOrigin: (row) =>
+          row.callbackOriginSessionKey ?? intent.originSessionKey,
+        onDelivered: async () => {
+          this._activeSendToAgentCallbacks.delete(job.id)
+          await removeSendToAgentIntent(job.id)
+        },
       })
       return !('skipped' in result) && result.ok === true
     }

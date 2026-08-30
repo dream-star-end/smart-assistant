@@ -62,7 +62,8 @@ export function callbackPayloadFromDurableJob(job: {
     job.state === 'failed' ||
     job.state === 'killed_by_cutover' ||
     job.state === 'cancelled' ||
-    job.failureClass
+    job.failureClass ||
+    body.ok === false
   ) {
     const error = job.failureDetail || bodyError || 'delegate failed'
     return { error }
