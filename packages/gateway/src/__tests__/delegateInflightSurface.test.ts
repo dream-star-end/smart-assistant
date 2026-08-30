@@ -1479,6 +1479,171 @@ describe('closeout residual — writer lock must not stall the gateway', () => {
     }
   })
 
+  it('transient open-lock drop keeps pending then auto-tombstones after unlock', async () => {
+    assert.equal(INFLIGHT_SURFACE_BUSY_TIMEOUT_MS, 0)
+    const dir = await mkdtemp(join(tmpdir(), 'oc-r2-open-lock-tomb-'))
+    const surfaceDb = join(dir, 'delegate-inflight-surface.db')
+    let locker: InstanceType<typeof Database> | null = null
+    let g1: DelegateInflightSurfaceStore | null = null
+    try {
+      const jobsDb = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const jobs = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        durable: jobsDb,
+        bootId: 'gw:r2-open-lock-tomb',
+      })
+      const created = jobs.create('coding-assistant', {
+        queued: true,
+        parentSessionKey: PARENT,
+        sessionKey: 'agent:coding-assistant:delegate:main:open-lock-tomb',
+      })
+      assert.ok('jobId' in created)
+      const snap = jobs.snapshotOf(created.jobId)!
+      assert.equal(jobs.dropIfUnclaimed(created.jobId), true)
+      assert.equal(jobs.snapshotOf(created.jobId), undefined)
+
+      const v2 = new Database(surfaceDb)
+      v2.exec(`
+        CREATE TABLE inflight_delegate_surface (
+          job_id TEXT PRIMARY KEY,
+          parent_session_key TEXT NOT NULL,
+          session_id TEXT NOT NULL DEFAULT '',
+          user_id TEXT NOT NULL DEFAULT '',
+          run_id TEXT NOT NULL,
+          agent_id TEXT NOT NULL,
+          goal TEXT NOT NULL DEFAULT '',
+          state TEXT NOT NULL,
+          live_hint TEXT NOT NULL DEFAULT '',
+          updated_at INTEGER NOT NULL,
+          fencing_epoch INTEGER NOT NULL DEFAULT 0,
+          generation INTEGER NOT NULL DEFAULT 0,
+          folded_group_json TEXT,
+          payload_truncated INTEGER NOT NULL DEFAULT 0,
+          payload_bytes INTEGER NOT NULL DEFAULT 0,
+          expires_at INTEGER,
+          nested INTEGER NOT NULL DEFAULT 0,
+          owner_run_id TEXT NOT NULL DEFAULT ''
+        );
+      `)
+      v2.pragma('user_version = 2')
+      v2.prepare(
+        `INSERT INTO inflight_delegate_surface (
+           job_id, parent_session_key, session_id, user_id, run_id, agent_id, goal, state,
+           live_hint, updated_at, fencing_epoch, generation
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', '', 70, ?, ?)`,
+      ).run(
+        created.jobId,
+        PARENT,
+        SESS,
+        'user-r2',
+        created.jobId,
+        'coding-assistant',
+        'ghost-queued-open-lock',
+        snap.fencingEpoch,
+        snap.generation,
+      )
+      v2.close()
+
+      locker = new Database(surfaceDb)
+      locker.pragma('busy_timeout = 0')
+      locker.exec('BEGIN IMMEDIATE')
+
+      g1 = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 71 })
+      assert.ok(g1.writeFailures >= 1)
+      g1.upsertEnqueue({
+        jobId: created.jobId,
+        parentSessionKey: PARENT,
+        agentId: 'coding-assistant',
+        goal: 'ghost-queued-open-lock',
+        state: 'queued',
+        userId: 'user-r2',
+        fencingEpoch: snap.fencingEpoch,
+        generation: snap.generation,
+      })
+      const t0 = Date.now()
+      assert.equal(g1.drop(created.jobId), true)
+      const elapsedMs = Date.now() - t0
+      assert.ok(elapsedMs < 250, `drop stalled ${elapsedMs}ms under open lock`)
+      const pendingWhileLocked = g1.flushPendingTombstones()
+      assert.ok(pendingWhileLocked >= 1, `pendingWhileLocked=${pendingWhileLocked}`)
+      const during = locker
+        .prepare('SELECT state FROM inflight_delegate_surface WHERE job_id = ?')
+        .get(created.jobId) as { state: string } | undefined
+      assert.equal(during?.state, 'queued')
+
+      locker.exec('ROLLBACK')
+      locker.close()
+      locker = null
+
+      const deadline = Date.now() + 500
+      let landed: { tombstoned: number } | undefined
+      while (Date.now() < deadline) {
+        const probe = new Database(surfaceDb)
+        try {
+          landed = probe
+            .prepare(
+              'SELECT IFNULL(tombstoned, 0) AS tombstoned FROM inflight_delegate_surface WHERE job_id = ?',
+            )
+            .get(created.jobId) as { tombstoned: number } | undefined
+        } catch {
+          landed = { tombstoned: 0 }
+        }
+        probe.close()
+        if (landed?.tombstoned === 1) break
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      assert.equal(landed?.tombstoned, 1, 'timer did not persist tombstone after unlock')
+      assert.equal(g1.flushPendingTombstones(), 0)
+
+      const schema = new Database(surfaceDb)
+      const versionAfterUnlock = Number(schema.pragma('user_version', { simple: true }))
+      schema.close()
+      assert.equal(versionAfterUnlock, SURFACE_SCHEMA_VERSION)
+
+      const staleOverlay = [structuredClone(snap)]
+      const g0 = new DelegateInflightSurfaceStore({ dbPath: surfaceDb, now: () => 72 })
+      const page = await handleInflightDelegatesRequest({
+        method: 'GET',
+        sessionId: SESS,
+        userId: 'user-r2',
+        enabled: true,
+        loadSession: async () => ({ id: SESS, userId: 'user-r2' }),
+        store: g0,
+        overlayJobs: () => staleOverlay,
+        resolveJob: () => undefined,
+        dropMissingLive: false,
+      })
+      assert.equal(page.status, 200)
+      const states = ((page.body.items as Array<{ state: string }>) ?? []).map((row) => row.state)
+      assert.deepEqual(states, [])
+      assert.equal(g0.get(created.jobId), undefined)
+      assert.equal(g1.get(created.jobId), undefined)
+
+      g0.close()
+      g1.close()
+      g1 = null
+      jobs.close()
+    } finally {
+      try {
+        locker?.exec('ROLLBACK')
+      } catch {
+        /* already rolled back */
+      }
+      try {
+        locker?.close()
+      } catch {
+        /* closed */
+      }
+      try {
+        g1?.close()
+      } catch {
+        /* closed */
+      }
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('boot reconcile tombstones ownerless queued rows after process death', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-r2-boot-tomb-'))
     const surfaceDb = join(dir, 'delegate-inflight-surface.db')

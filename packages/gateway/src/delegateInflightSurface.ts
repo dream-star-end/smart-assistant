@@ -8,9 +8,12 @@
  * previous surface terminal (state and payload atomically). Once a terminal
  * is settled, runner fold / stale overlay may not replace it, including
  * same-state payload updates. Queue-full drops persist a durable tombstone
- * (retried until the write lands while this process is alive; boot reconcile
- * covers the death window) so another gateway cannot resurrect the row. I/O
- * errors never throw into the delegate / Completer / Notifier chain.
+ * (retried until the write lands while this process is alive, including a
+ * reopen after a transient open-lock; boot reconcile covers the death
+ * window) so another gateway cannot resurrect the row. A missing tombstone
+ * statement is a failed write, not success. Fail-open applies only to
+ * non-consistency-critical projection writes. I/O errors never throw into
+ * the delegate / Completer / Notifier chain.
  */
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -104,6 +107,7 @@ type TombstoneWrite = {
 }
 
 const TOMBSTONE_RETRY_MS = 5
+const TOMBSTONE_RETRY_MAX_MS = 80
 
 export function resolveDelegateInflightSurfaceDbPath(
   env: NodeJS.ProcessEnv = process.env,
@@ -303,6 +307,7 @@ export class DelegateInflightSurfaceStore {
   /** Tombstone rows that must still land in SQLite (busy_timeout=0 miss). */
   private readonly pendingTombstones = new Map<string, TombstoneWrite>()
   private tombstoneRetryTimer: ReturnType<typeof setTimeout> | null = null
+  private tombstoneRetryBackoffMs = TOMBSTONE_RETRY_MS
   private db: InstanceType<typeof Database> | null = null
   private upsertStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
   private tombstoneStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
@@ -331,11 +336,7 @@ export class DelegateInflightSurfaceStore {
         this.openDb(this.path)
       } catch (err) {
         this.noteWriteError(err, { phase: 'open', dbPath: this.path })
-        this.db = null
-        this.upsertStmt = null
-        this.tombstoneStmt = null
-        this.deleteStmt = null
-        this.loadStmt = null
+        this.resetDbHandles()
       }
     }
   }
@@ -440,8 +441,14 @@ export class DelegateInflightSurfaceStore {
       >
       for (const row of rows) {
         const id = typeof row.job_id === 'string' ? row.job_id : ''
-        if (id && Number(row.tombstoned ?? 0) === 1) {
+        if (!id) continue
+        if (
+          Number(row.tombstoned ?? 0) === 1 ||
+          this.droppedJobs.has(id) ||
+          this.pendingTombstones.has(id)
+        ) {
           this.droppedJobs.add(id)
+          this.byJob.delete(id)
           continue
         }
         const parsed = fromRow(row)
@@ -941,10 +948,12 @@ export class DelegateInflightSurfaceStore {
       clearTimeout(this.tombstoneRetryTimer)
       this.tombstoneRetryTimer = null
     }
+    if (this.pendingTombstones.size === 0) return 0
     for (const [jobId, row] of [...this.pendingTombstones]) {
       if (this.tryPersistTombstone(row)) this.pendingTombstones.delete(jobId)
     }
     if (this.pendingTombstones.size > 0 && !this.closed) this.scheduleTombstoneRetry()
+    else this.tombstoneRetryBackoffMs = TOMBSTONE_RETRY_MS
     return this.pendingTombstones.size
   }
 
@@ -1071,16 +1080,38 @@ export class DelegateInflightSurfaceStore {
     } catch {
       /* shutdown */
     }
-    try {
-      this.db?.close()
-    } catch {
-      /* already closed */
+    this.resetDbHandles()
+  }
+
+  private resetDbHandles(): void {
+    if (this.db) {
+      try {
+        this.db.close()
+      } catch {
+        /* already closed */
+      }
     }
     this.db = null
     this.upsertStmt = null
     this.tombstoneStmt = null
     this.deleteStmt = null
     this.loadStmt = null
+  }
+
+  /** Reopen after a transient constructor/open lock. No-op when already ready. */
+  private tryEnsureDb(): boolean {
+    if (this.tombstoneStmt && this.db) return true
+    if (!this.path) return false
+    this.resetDbHandles()
+    try {
+      this.openDb(this.path)
+      this.tombstoneRetryBackoffMs = TOMBSTONE_RETRY_MS
+      return Boolean(this.tombstoneStmt)
+    } catch (err) {
+      this.noteWriteError(err, { phase: 'reopen', dbPath: this.path })
+      this.resetDbHandles()
+      return false
+    }
   }
 
   private droppedPublicView(input: {
@@ -1160,15 +1191,23 @@ export class DelegateInflightSurfaceStore {
 
   private scheduleTombstoneRetry(): void {
     if (this.closed || this.tombstoneRetryTimer || this.pendingTombstones.size === 0) return
+    const delay = this.tombstoneStmt ? TOMBSTONE_RETRY_MS : this.tombstoneRetryBackoffMs
     this.tombstoneRetryTimer = setTimeout(() => {
       this.tombstoneRetryTimer = null
       this.flushPendingTombstones()
-    }, TOMBSTONE_RETRY_MS)
+    }, delay)
     this.tombstoneRetryTimer.unref?.()
+    if (!this.tombstoneStmt) {
+      this.tombstoneRetryBackoffMs = Math.min(this.tombstoneRetryBackoffMs * 2, TOMBSTONE_RETRY_MAX_MS)
+    }
   }
 
   private tryPersistTombstone(row: TombstoneWrite): boolean {
-    if (!this.tombstoneStmt) return true
+    // In-memory-only store: the Set is the tombstone. A durable path with no
+    // statement has not written anything and must not drop pending.
+    if (!this.path) return true
+    if (!this.tombstoneStmt && !this.tryEnsureDb()) return false
+    if (!this.tombstoneStmt) return false
     try {
       this.tombstoneStmt.run({
         job_id: row.jobId,
