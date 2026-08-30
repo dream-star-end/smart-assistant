@@ -1777,7 +1777,9 @@ export class SubprocessRunner extends EventEmitter {
    * submit() and without destroying the process on failure. Caller (CcbAdapter
    * / EngineNotifier) degrades to ResumeInject when this returns ok:false.
    */
-  async writeDelegateUserMessage(content: string): Promise<{ ok: boolean; processAlive: boolean }> {
+  async writeDelegateUserMessage(
+    content: string,
+  ): Promise<{ ok: boolean; processAlive: boolean; unknown?: boolean }> {
     const proc = this.proc
     if (!this.isInlinePushProcLive(proc) || !proc) return { ok: false, processAlive: false }
     const stdin = proc.stdin
@@ -1812,10 +1814,9 @@ export class SubprocessRunner extends EventEmitter {
         if (typeof proc.once === 'function') proc.once('close', onClose)
         if (typeof stdin.once === 'function') stdin.once('error', onError)
         try {
-          const ok = stdin.write(`${JSON.stringify(userMsg)}\n`, (err) => finish(err))
-          if (ok === false && (stdin.writable === false || stdin.destroyed)) {
-            finish(new Error('ccb stdin not writable after backpressure'))
-          }
+          // write()===false is backpressure: the chunk is already in the
+          // buffer. Wait for the callback/error; do not treat false as failure.
+          stdin.write(`${JSON.stringify(userMsg)}\n`, (err) => finish(err))
         } catch (err) {
           finish(err as Error)
         }
@@ -1824,8 +1825,13 @@ export class SubprocessRunner extends EventEmitter {
         return { ok: false, processAlive: false }
       }
       return { ok: true, processAlive: true }
-    } catch {
-      return { ok: false, processAlive: this.isInlinePushProcLive(this.proc) }
+    } catch (err) {
+      const live = this.isInlinePushProcLive(this.proc)
+      const message = err instanceof Error ? err.message : ''
+      if (live && message.includes('stdin write timeout')) {
+        return { ok: false, processAlive: true, unknown: true }
+      }
+      return { ok: false, processAlive: live }
     }
   }
 

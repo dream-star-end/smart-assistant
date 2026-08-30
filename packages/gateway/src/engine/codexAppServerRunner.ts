@@ -2471,7 +2471,9 @@ export class CodexAppServerRunner extends EventEmitter {
    * app-server stdin. Official mechanism only — does not patch the Codex
    * binary. Unknown notifications may be ignored by app-server (gap reported).
    */
-  async writeDelegateTerminalNotification(line: string): Promise<{ ok: boolean; processAlive: boolean }> {
+  async writeDelegateTerminalNotification(
+    line: string,
+  ): Promise<{ ok: boolean; processAlive: boolean; unknown?: boolean }> {
     const proc = this.proc
     if (!this.isInlinePushProcLive(proc) || !proc) return { ok: false, processAlive: false }
     const stdin = proc.stdin
@@ -2511,8 +2513,13 @@ export class CodexAppServerRunner extends EventEmitter {
         return { ok: false, processAlive: false }
       }
       return { ok: true, processAlive: true }
-    } catch {
-      return { ok: false, processAlive: this.isInlinePushProcLive(this.proc) }
+    } catch (err) {
+      const live = this.isInlinePushProcLive(this.proc)
+      const message = err instanceof Error ? err.message : ''
+      if (live && message.includes('stdin write timeout')) {
+        return { ok: false, processAlive: true, unknown: true }
+      }
+      return { ok: false, processAlive: live }
     }
   }
 

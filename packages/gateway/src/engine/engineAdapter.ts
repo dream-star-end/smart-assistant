@@ -263,5 +263,5 @@ export interface EngineAdapter extends EventEmitter {
   writeDelegateTerminal?(
     event: JobTerminal,
     body: string,
-  ): Promise<{ ok: boolean; processAlive: boolean }>
+  ): Promise<{ ok: boolean; processAlive: boolean; unknown?: boolean }>
 }

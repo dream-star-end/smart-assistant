@@ -692,7 +692,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   async writeDelegateTerminal(
     event: JobTerminal,
     body: string,
-  ): Promise<{ ok: boolean; processAlive: boolean }> {
+  ): Promise<{ ok: boolean; processAlive: boolean; unknown?: boolean }> {
     if (!this.kernel.isRunning) return { ok: false, processAlive: false }
     if (this._interrupting) return { ok: false, processAlive: true }
     const turn = this._activeTurn

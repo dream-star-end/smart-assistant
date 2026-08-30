@@ -937,8 +937,10 @@ describe('R3 blocker regressions', () => {
         })
         const first = await dispatchJobTerminalNotify(s1, seeded.snap, n1)
         assert.ok(!('skipped' in first) && !first.ok)
+        if (!('skipped' in first)) assert.equal(first.hold, true)
         assert.equal(s1.hasNotifyAAttempted(seeded.jobId), true)
-        assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'pending')
+        // Unknown consumption keeps the exclusive claim; reclaim + tape decide B.
+        assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'injecting')
         s1.close()
 
         now += NOTIFY_CLAIM_LEASE_MS + 1
@@ -1047,6 +1049,56 @@ describe('R3 blocker regressions', () => {
     assert.deepEqual({ aWrites, bWrites }, { aWrites: 1, bWrites: 0 })
   })
 
+  it('CCB write()===false waits for callback and does not degrade to B', async () => {
+    let aWrites = 0
+    let bWrites = 0
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: async () => {
+          const ccb = new SubprocessRunner({ resumeSessionId: undefined } as never)
+          const stdin = new EventEmitter() as EventEmitter & {
+            writable: boolean
+            destroyed: boolean
+            write: (_chunk: string, cb?: (err?: Error | null) => void) => boolean
+          }
+          stdin.writable = true
+          stdin.destroyed = false
+          stdin.write = (_chunk, cb) => {
+            setTimeout(() => cb?.(null), 20)
+            return false
+          }
+          const proc = {
+            killed: false,
+            exitCode: null as number | null,
+            signalCode: null as NodeJS.Signals | null,
+            stdin,
+            once() {
+              return proc
+            },
+            off() {
+              return proc
+            },
+          }
+          ;(ccb as unknown as { proc: object }).proc = proc
+          ;(ccb as unknown as { closed: boolean }).closed = false
+          const result = await ccb.writeDelegateUserMessage('x')
+          if (result.ok) aWrites += 1
+          return result
+        },
+      },
+      resumeInject: {
+        inject: async () => {
+          bWrites += 1
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(terminalEvent({ parentEngine: 'ccb' }))
+    assert.equal(result.ok, true)
+    if (result.ok) assert.equal(result.lane, 'inline-push')
+    assert.deepEqual({ aWrites, bWrites }, { aWrites: 1, bWrites: 0 })
+  })
+
   it('Codex hasIngestedParentTurn is only turn/start ACK, not queue/processing', () => {
     const kernel = new CodexAppServerRunner({} as never)
     const box = kernel as unknown as {
@@ -1101,6 +1153,25 @@ describe('R3 blocker regressions', () => {
       { pushed: { ok: false, processAlive: true }, writes: 0 },
     )
     turn.end()
+  })
+
+  it('unknown InlinePush result holds and does not degrade to B', async () => {
+    let bWrites = 0
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: async () => ({ ok: false, processAlive: true, unknown: true }),
+      },
+      resumeInject: {
+        inject: async () => {
+          bWrites += 1
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(terminalEvent({ parentEngine: 'codex' }))
+    assert.equal(result.ok, false)
+    if (!result.ok) assert.equal(result.hold, true)
+    assert.equal(bWrites, 0)
   })
 })
 

@@ -691,7 +691,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   async writeDelegateTerminal(
     _event: JobTerminal,
     body: string,
-  ): Promise<{ ok: boolean; processAlive: boolean }> {
+  ): Promise<{ ok: boolean; processAlive: boolean; unknown?: boolean }> {
     if (!this.runner.isRunning) return { ok: false, processAlive: false }
     if (this._interrupting) return { ok: false, processAlive: true }
     const turn = this._activeTurn

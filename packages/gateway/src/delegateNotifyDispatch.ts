@@ -233,7 +233,9 @@ export async function dispatchJobTerminalNotify(
   }
 
   if (owned && deliveryToken) {
-    store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(live))
+    if (!result.hold) {
+      store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(live))
+    }
   } else if (owned) {
     store.deferPendingNotify(job.id, fenceOf(live))
   }

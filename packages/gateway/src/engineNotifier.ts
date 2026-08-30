@@ -17,8 +17,15 @@ import { ccbStdinUserContent } from './ccbNativeCompaction.js'
 import { isDelegateInlinePushEnabled } from './delegateSmFlag.js'
 import { isHeartbeatSilentOutput } from './jobTerminal.js'
 
+export type InlinePushWriteResult = {
+  ok: boolean
+  processAlive: boolean
+  /** Chunk may still be in the kernel buffer; do not start B this generation. */
+  unknown?: boolean
+}
+
 export type InlinePushPort = {
-  write(event: JobTerminal): Promise<{ ok: boolean; processAlive: boolean }>
+  write(event: JobTerminal): Promise<InlinePushWriteResult>
 }
 
 export type ResumeInjectPort = {
@@ -124,11 +131,12 @@ export class DefaultEngineNotifier implements EngineNotifier {
       }
       if (pushed === 'hold') {
         // a_attempted with unknown consumption: do not B this generation.
-        // Reclaim + tape ingest decide.
+        // Reclaim + tape ingest decide. Dispatch must leave the claim injecting.
         return finish({
           ok: false,
           failureClass: 'transport',
           degradedTo: 'resume-inject',
+          hold: true,
         }, true)
       }
       const injected = await this.tryResumeInject(event)
@@ -210,6 +218,13 @@ export class DefaultEngineNotifier implements EngineNotifier {
         // Another owner reclaimed. Never start B from this generation.
         return 'delivered'
       }
+      if (result?.unknown) {
+        if (await this.tapeHas(event, notifyId)) {
+          this.ackDeliveredQuiet(fence)
+          return 'delivered'
+        }
+        return 'hold'
+      }
       if (!result?.ok || !result.processAlive) {
         // stdin dies with the process. B is allowed only when tape has no ingest.
         return deliveredIfTaped()
@@ -260,7 +275,7 @@ export type InlinePushSession = {
     writeDelegateTerminal?: (
       event: JobTerminal,
       body: string,
-    ) => Promise<{ ok: boolean; processAlive: boolean }>
+    ) => Promise<InlinePushWriteResult>
     writeRaw?: (line: string) => void | Promise<void>
     proc?: {
       killed?: boolean
@@ -309,7 +324,7 @@ export async function writeInlinePushForSession(
   body: string,
   env: NodeJS.ProcessEnv = process.env,
   runtime: InlinePushRuntime = {},
-): Promise<{ ok: boolean; processAlive: boolean }> {
+): Promise<InlinePushWriteResult> {
   if (!isDelegateInlinePushEnabled(event.parentEngine, env)) {
     return tryWriteInlinePush(session, event, body)
   }
@@ -334,9 +349,11 @@ export async function writeInlinePushForSession(
     return {
       ok: Boolean(result?.ok && result.processAlive),
       processAlive: Boolean(result?.processAlive),
+      unknown: Boolean(result?.unknown),
     }
   } catch {
-    return { ok: false, processAlive: false }
+    // Write started (a_attempted already stamped). Outcome unknown.
+    return { ok: false, processAlive: false, unknown: true }
   }
 }
 

@@ -222,7 +222,13 @@ export type JobTerminal = {
 
 export type NotifyResult =
   | { ok: true; lane: NotifyLane; notifyId: string }
-  | { ok: false; failureClass: DelegateFailureClass; degradedTo?: 'resume-inject' }
+  | {
+      ok: false
+      failureClass: DelegateFailureClass
+      degradedTo?: 'resume-inject'
+      /** a_attempted, consumption unknown: do not release the claim or start B. */
+      hold?: true
+    }
 
 export interface EngineNotifier {
   /** Idempotent: a second call with the same notifyId must no-op success. */
