@@ -403,7 +403,7 @@ import {
   isDelegateRunnerIdle,
   resolveDelegateCutoverFreezeMs,
 } from './delegateCutover.js'
-import { DefaultEngineNotifier, tryWriteInlinePush, type InlinePushSession } from './engineNotifier.js'
+import { DefaultEngineNotifier, writeInlinePushForSession, type InlinePushSession } from './engineNotifier.js'
 import {
   delayUntilNextNotifyRetry,
   dispatchJobTerminalNotify,
@@ -10714,7 +10714,7 @@ export class Gateway {
       inlinePush: {
         write: async (event) => {
           const session = this.sessions?.getByKey?.(event.parentSessionKey) as InlinePushSession | undefined
-          return tryWriteInlinePush(session, event, formatJobTerminalMarkdown(event))
+          return writeInlinePushForSession(session, event, formatJobTerminalMarkdown(event))
         },
       },
       resumeInject: {

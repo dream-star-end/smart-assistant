@@ -5,6 +5,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/engineNotifier.test.ts
  */
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -24,7 +25,15 @@ import {
   dispatchJobTerminalNotify,
   retryPendingNotifies,
 } from '../delegateNotifyDispatch.js'
-import { DefaultEngineNotifier, tryWriteInlinePush } from '../engineNotifier.js'
+import {
+  DefaultEngineNotifier,
+  buildCcbInlinePushUserLine,
+  buildCodexDelegateTerminalNotification,
+  tryWriteInlinePush,
+  writeInlinePushForSession,
+} from '../engineNotifier.js'
+import { CcbAdapter } from '../engine/ccbAdapter.js'
+import { CodexAdapter } from '../engine/codexAdapter.js'
 import {
   buildJobTerminalFromSnapshot,
   formatJobTerminalMarkdown,
@@ -50,6 +59,9 @@ import {
 import {
   isDelegateNotifierEffective,
   isDelegateDurableEffective,
+  isDelegateInlinePushCcbEnabled,
+  isDelegateInlinePushCodexEnabled,
+  isDelegateInlinePushEnabled,
 } from '../delegateSmFlag.js'
 
 function terminalEvent(over: Partial<JobTerminal> = {}): JobTerminal {
@@ -122,6 +134,20 @@ describe('OC_DELEGATE_NOTIFIER flag', () => {
   })
 })
 
+describe('OC_DELEGATE_INLINE_PUSH_* flags', () => {
+  it('defaults off; each engine is independent; cursor never enables', () => {
+    assert.equal(isDelegateInlinePushCcbEnabled({}), false)
+    assert.equal(isDelegateInlinePushCodexEnabled({}), false)
+    assert.equal(isDelegateInlinePushEnabled('ccb', {}), false)
+    assert.equal(isDelegateInlinePushEnabled('codex', {}), false)
+    assert.equal(isDelegateInlinePushEnabled('cursor', { OC_DELEGATE_INLINE_PUSH_CCB: '1' }), false)
+    assert.equal(isDelegateInlinePushEnabled('ccb', { OC_DELEGATE_INLINE_PUSH_CCB: '1' }), true)
+    assert.equal(isDelegateInlinePushEnabled('codex', { OC_DELEGATE_INLINE_PUSH_CCB: '1' }), false)
+    assert.equal(isDelegateInlinePushEnabled('codex', { OC_DELEGATE_INLINE_PUSH_CODEX: 'true' }), true)
+    assert.equal(isDelegateInlinePushEnabled('ccb', { OC_DELEGATE_INLINE_PUSH_CODEX: '1' }), false)
+  })
+})
+
 describe('档 A InlinePush', () => {
   it('writes stdin and records notifyId; second call is a no-op', async () => {
     const writes: string[] = []
@@ -170,8 +196,8 @@ describe('档 A InlinePush', () => {
     assert.deepEqual(resumes, ['dlgnfy.dlgjob-n1.1'])
   })
 
-  // Test double only: production CcbAdapter/CodexAdapter hide proc/writeRaw
-  // on private inner runners (R3). This duck-type is not a live InlinePush port.
+  // Flag-off path: duck-type probe, equivalent to 653ef6339. Production adapters
+  // still hide proc/writeRaw; live 档 A is writeDelegateTerminal behind the flags.
   it('tryWriteInlinePush writes a CCB user JSONL line when stdin is writable', async () => {
     const chunks: string[] = []
     const session = {
@@ -209,6 +235,306 @@ describe('档 A InlinePush', () => {
     const result = await tryWriteInlinePush(session, terminalEvent(), 'x')
     assert.equal(result.ok, false)
     assert.equal(result.processAlive, true)
+  })
+
+  it('flag-off writeInlinePushForSession keeps the duck-type path', async () => {
+    const chunks: string[] = []
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        proc: {
+          stdin: {
+            writable: true,
+            write(chunk: string, cb?: (err?: Error | null) => void) {
+              chunks.push(chunk)
+              cb?.(null)
+              return true
+            },
+          },
+        },
+      },
+    }
+    const event = terminalEvent()
+    const result = await writeInlinePushForSession(session, event, formatJobTerminalMarkdown(event), {})
+    assert.equal(result.ok, true)
+    assert.equal(chunks.length, 1)
+  })
+
+  it('flag-on does not use duck-type stdin even when proc is writable', async () => {
+    const duck: string[] = []
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: true,
+        proc: {
+          stdin: {
+            writable: true,
+            write(chunk: string, cb?: (err?: Error | null) => void) {
+              duck.push(chunk)
+              cb?.(null)
+              return true
+            },
+          },
+        },
+      },
+    }
+    const result = await writeInlinePushForSession(
+      session,
+      terminalEvent(),
+      'BODY',
+      { OC_DELEGATE_INLINE_PUSH_CCB: '1' },
+    )
+    assert.equal(result.ok, false)
+    assert.equal(result.processAlive, true)
+    assert.deepEqual(duck, [])
+  })
+
+  it('CCB flag-on adapter success is lane A; second notify is not a second write', async () => {
+    const writes: string[] = []
+    let resumes = 0
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: true,
+        writeDelegateTerminal: async (_event: JobTerminal, body: string) => {
+          writes.push(body)
+          return { ok: true, processAlive: true }
+        },
+      },
+    }
+    const env = { OC_DELEGATE_INLINE_PUSH_CCB: '1' }
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: (event) => writeInlinePushForSession(session, event, formatJobTerminalMarkdown(event), env),
+      },
+      resumeInject: {
+        inject: async () => {
+          resumes += 1
+          throw new Error('must not resume-inject on A success')
+        },
+      },
+    })
+    const event = terminalEvent({ parentEngine: 'ccb' })
+    const first = await notifier.notify(event)
+    assert.equal(first.ok, true)
+    if (!first.ok) return
+    assert.equal(first.lane, 'inline-push')
+    assert.equal(first.notifyId, delegateNotifyId(event.jobId, event.callbackEpoch))
+    const second = await notifier.notify(event)
+    assert.equal(second.ok, true)
+    assert.equal(writes.length, 1)
+    assert.equal(resumes, 0)
+    assert.match(writes[0]!, /<delegate-terminal jobId=dlgjob-n1/)
+  })
+
+  it('CCB flag-on adapter failure degrades to B with the same notifyId and does not double-send', async () => {
+    const resumes: string[] = []
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: false,
+        writeDelegateTerminal: async () => ({ ok: false, processAlive: false }),
+      },
+    }
+    const env = { OC_DELEGATE_INLINE_PUSH_CCB: '1' }
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: (event) => writeInlinePushForSession(session, event, 'BODY', env),
+      },
+      resumeInject: {
+        inject: async (event) => {
+          resumes.push(delegateNotifyId(event.jobId, event.callbackEpoch))
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(terminalEvent({ parentEngine: 'ccb' }))
+    assert.equal(result.ok, true)
+    if (!result.ok) return
+    assert.equal(result.lane, 'resume-inject')
+    assert.equal(result.notifyId, 'dlgnfy.dlgjob-n1.1')
+    assert.deepEqual(resumes, ['dlgnfy.dlgjob-n1.1'])
+  })
+
+  it('Codex flag-on writes delegate/terminal JSON-RPC and keeps notifyId', async () => {
+    const lines: string[] = []
+    const session = {
+      runner: {
+        engineId: 'codex',
+        isRunning: true,
+        writeDelegateTerminal: async (event: JobTerminal, body: string) => {
+          lines.push(buildCodexDelegateTerminalNotification(event, body))
+          return { ok: true, processAlive: true }
+        },
+      },
+    }
+    const env = { OC_DELEGATE_INLINE_PUSH_CODEX: '1' }
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: (event) => writeInlinePushForSession(session, event, 'BODY', env),
+      },
+      resumeInject: {
+        inject: async () => {
+          throw new Error('must not resume-inject on Codex A success')
+        },
+      },
+    })
+    const event = terminalEvent({ parentEngine: 'codex' })
+    const result = await notifier.notify(event)
+    assert.equal(result.ok, true)
+    if (!result.ok) return
+    assert.equal(result.lane, 'inline-push')
+    assert.equal(result.notifyId, 'dlgnfy.dlgjob-n1.1')
+    assert.equal(lines.length, 1)
+    const parsed = JSON.parse(lines[0]!) as {
+      jsonrpc: string
+      method: string
+      params: { jobId: string; notifyId: string; state: string }
+    }
+    assert.equal(parsed.jsonrpc, '2.0')
+    assert.equal(parsed.method, 'delegate/terminal')
+    assert.equal(parsed.params.jobId, 'dlgjob-n1')
+    assert.equal(parsed.params.notifyId, 'dlgnfy.dlgjob-n1.1')
+    assert.equal(parsed.params.state, 'completed')
+  })
+
+  it('flag quadrant: CCB on / Codex off does not share a write port', async () => {
+    const ccbWrites: string[] = []
+    const duck: string[] = []
+    const ccbSession = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: true,
+        writeDelegateTerminal: async (_e: JobTerminal, body: string) => {
+          ccbWrites.push(body)
+          return { ok: true, processAlive: true }
+        },
+      },
+    }
+    const codexSession = {
+      runner: {
+        engineId: 'codex',
+        writeRaw: async (line: string) => {
+          duck.push(line)
+        },
+      },
+    }
+    const env = { OC_DELEGATE_INLINE_PUSH_CCB: '1' }
+    const ccb = await writeInlinePushForSession(ccbSession, terminalEvent({ parentEngine: 'ccb' }), 'CCB', env)
+    const codex = await writeInlinePushForSession(
+      codexSession,
+      terminalEvent({ parentEngine: 'codex' }),
+      'CODEX',
+      env,
+    )
+    assert.equal(ccb.ok, true)
+    assert.deepEqual(ccbWrites, ['CCB'])
+    assert.equal(codex.ok, true)
+    assert.equal(duck.length, 1)
+    assert.match(duck[0]!, /delegate\/terminal/)
+  })
+
+  it('cutover-effective flag-on forces degrade so B can own the same notifyId', async () => {
+    let adapterCalls = 0
+    const session = {
+      runner: {
+        engineId: 'ccb',
+        isRunning: true,
+        writeDelegateTerminal: async () => {
+          adapterCalls += 1
+          return { ok: true, processAlive: true }
+        },
+      },
+    }
+    const env = {
+      OC_DELEGATE_SM: '1',
+      OC_DELEGATE_DURABLE: '1',
+      OC_DELEGATE_NOTIFIER: '1',
+      OC_DELEGATE_CUTOVER: '1',
+      OC_DELEGATE_INLINE_PUSH_CCB: '1',
+    }
+    const pushed = await writeInlinePushForSession(session, terminalEvent(), 'BODY', env)
+    assert.equal(pushed.ok, false)
+    assert.equal(pushed.processAlive, true)
+    assert.equal(adapterCalls, 0)
+    const resumes: string[] = []
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: (event) => writeInlinePushForSession(session, event, 'BODY', env),
+      },
+      resumeInject: {
+        inject: async (event) => {
+          resumes.push(delegateNotifyId(event.jobId, event.callbackEpoch))
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(terminalEvent())
+    assert.equal(result.ok, true)
+    if (!result.ok) return
+    assert.equal(result.lane, 'resume-inject')
+    assert.equal(result.notifyId, 'dlgnfy.dlgjob-n1.1')
+    assert.deepEqual(resumes, ['dlgnfy.dlgjob-n1.1'])
+  })
+
+  it('buildCcbInlinePushUserLine uses structured text blocks, not a raw string', () => {
+    const line = buildCcbInlinePushUserLine('hello <delegate-terminal jobId=x>')
+    const parsed = JSON.parse(line.trim()) as {
+      type: string
+      message: { role: string; content: Array<{ type: string; text: string }> }
+    }
+    assert.equal(parsed.type, 'user')
+    assert.equal(parsed.message.role, 'user')
+    assert.equal(parsed.message.content[0]?.type, 'text')
+    assert.match(parsed.message.content[0]!.text, /delegate-terminal/)
+  })
+
+  it('CcbAdapter only writes while a turn is active; Codex writes delegate/terminal', async () => {
+    const dummyOpts = {
+      sessionKey: 'agent:main:webchat:dm:r3',
+      agentId: 'main',
+      agentBaseDir: '/tmp',
+      config: {} as never,
+    }
+    class FakeCcbRunner extends EventEmitter {
+      isRunning = true
+      writes: string[] = []
+      async writeDelegateUserMessage(content: string) {
+        this.writes.push(content)
+        return { ok: true as const, processAlive: true as const }
+      }
+    }
+    const ccbRunner = new FakeCcbRunner()
+    const ccb = new CcbAdapter(dummyOpts, ccbRunner as never)
+    const idle = await ccb.writeDelegateTerminal!(terminalEvent(), 'BODY')
+    assert.equal(idle.ok, false)
+    assert.equal(idle.processAlive, true)
+    assert.deepEqual(ccbRunner.writes, [])
+    ;(ccb as unknown as { _activeTurn: { id: string } })._activeTurn = { id: 't1' }
+    const live = await ccb.writeDelegateTerminal!(terminalEvent(), 'BODY')
+    assert.equal(live.ok, true)
+    assert.deepEqual(ccbRunner.writes, ['BODY'])
+
+    class FakeCodexKernel extends EventEmitter {
+      isRunning = true
+      lines: string[] = []
+      writeDelegateTerminalNotification(line: string) {
+        this.lines.push(line)
+        return { ok: true as const, processAlive: true as const }
+      }
+    }
+    const kernel = new FakeCodexKernel()
+    const codex = new CodexAdapter(dummyOpts, kernel as never)
+    const codexIdle = await codex.writeDelegateTerminal!(terminalEvent({ parentEngine: 'codex' }), 'BODY')
+    assert.equal(codexIdle.ok, false)
+    assert.equal(codexIdle.processAlive, true)
+    ;(codex as unknown as { _activeTurn: { id: string } })._activeTurn = { id: 't1' }
+    const codexLive = await codex.writeDelegateTerminal!(terminalEvent({ parentEngine: 'codex' }), 'BODY')
+    assert.equal(codexLive.ok, true)
+    assert.equal(kernel.lines.length, 1)
+    const parsed = JSON.parse(kernel.lines[0]!) as { method: string; params: { notifyId: string } }
+    assert.equal(parsed.method, 'delegate/terminal')
+    assert.equal(parsed.params.notifyId, 'dlgnfy.dlgjob-n1.1')
   })
 })
 

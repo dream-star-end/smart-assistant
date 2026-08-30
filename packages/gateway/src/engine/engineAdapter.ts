@@ -19,7 +19,7 @@
  */
 import type { EventEmitter } from 'node:events'
 import type { OpenClaudeConfig } from '@openclaude/storage'
-import type { GoalStateSnapshot, OutboundContentBlock } from '@openclaude/protocol'
+import type { GoalStateSnapshot, JobTerminal, OutboundContentBlock } from '@openclaude/protocol'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { TurnModelAuthority, UsageAttributionTag } from '../subprocessRunner.js'
 import type {
@@ -253,4 +253,15 @@ export interface EngineAdapter extends EventEmitter {
   lastActivityAt: number
   /** Phase 5:当前活跃进程 spawn 时绑定的 ready repo snapshot(recycle 决策用)。 */
   getBoundRepoBinding(): { selectionVersion: number; workspaceDir: string } | null
+  /**
+   * R3 档 A InlinePush. CCB writes a stdin `type:user` line; Codex writes a
+   * JSON-RPC `delegate/terminal` notification. Optional: Cursor/Grok/zcode
+   * omit it and EngineNotifier degrades to ResumeInject.
+   * Fail closed (do not kill the parent process) so the notifier can fall
+   * back to lane B with the same notifyId.
+   */
+  writeDelegateTerminal?(
+    event: JobTerminal,
+    body: string,
+  ): Promise<{ ok: boolean; processAlive: boolean }>
 }

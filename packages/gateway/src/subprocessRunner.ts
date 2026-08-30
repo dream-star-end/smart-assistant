@@ -1762,6 +1762,39 @@ export class SubprocessRunner extends EventEmitter {
     })
   }
 
+  /**
+   * R3 档 A: write a CCB stdin `type:user` line without starting SessionManager
+   * submit() and without destroying the process on failure. Caller (CcbAdapter
+   * / EngineNotifier) degrades to ResumeInject when this returns ok:false.
+   */
+  async writeDelegateUserMessage(content: string): Promise<{ ok: boolean; processAlive: boolean }> {
+    const proc = this.proc
+    const processAlive = Boolean(proc && !this.closed && !proc.killed && proc.exitCode == null)
+    if (!processAlive || !proc) return { ok: false, processAlive: false }
+    const stdin = proc.stdin
+    if (!stdin || stdin.writable === false) return { ok: false, processAlive: true }
+    const userMsg = {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: ccbStdinUserContent(content),
+      },
+      parent_tool_use_id: null,
+    }
+    try {
+      await new Promise<void>((resolve, reject) => {
+        stdin.write(`${JSON.stringify(userMsg)}\n`, (err) => {
+          if (err) reject(err)
+          else resolve()
+        })
+      })
+      return { ok: true, processAlive: true }
+    } catch {
+      const stillAlive = Boolean(this.proc && !this.closed && !this.proc.killed)
+      return { ok: false, processAlive: stillAlive }
+    }
+  }
+
   // ─── Build per-session learning-loop context files ───
   // Writes temp files under /tmp/openclaude-<sessionKey>-XXXXXX/:
   //   extra-prompt.md   — USER.md content + skill metadata digest

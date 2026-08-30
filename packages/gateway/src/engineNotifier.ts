@@ -13,6 +13,11 @@ import {
   type NotifyLane,
   type NotifyResult,
 } from '@openclaude/protocol'
+import { ccbStdinUserContent } from './ccbNativeCompaction.js'
+import {
+  isDelegateCutoverEffective,
+  isDelegateInlinePushEnabled,
+} from './delegateSmFlag.js'
 import { isHeartbeatSilentOutput } from './jobTerminal.js'
 
 export type InlinePushPort = {
@@ -166,6 +171,11 @@ export type InlinePushSession = {
   _activeClientTurnCount?: number
   runner?: {
     engineId?: string
+    isRunning?: boolean
+    writeDelegateTerminal?: (
+      event: JobTerminal,
+      body: string,
+    ) => Promise<{ ok: boolean; processAlive: boolean }>
     writeRaw?: (line: string) => void | Promise<void>
     proc?: {
       killed?: boolean
@@ -175,11 +185,71 @@ export type InlinePushSession = {
   }
 }
 
+/** Official CCB stdin user JSONL (same shape as SubprocessRunner.submit). */
+export function buildCcbInlinePushUserLine(body: string): string {
+  const userMsg = {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: ccbStdinUserContent(body),
+    },
+    parent_tool_use_id: null,
+  }
+  return `${JSON.stringify(userMsg)}\n`
+}
+
+/** Official Codex JSON-RPC notification. Gateway writes it; no engine binary patch. */
+export function buildCodexDelegateTerminalNotification(event: JobTerminal, body: string): string {
+  return JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'delegate/terminal',
+    params: {
+      jobId: event.jobId,
+      notifyId: delegateNotifyId(event.jobId, event.callbackEpoch),
+      state: event.state,
+      body,
+    },
+  })
+}
+
 /**
- * Best-effort 档 A write. Duck-types `runner.proc` / `runner.writeRaw`.
- * Production CcbAdapter/CodexAdapter keep those on private inner runners
- * (R3), so live CCB/Codex currently degrade to ResumeInject. This port is
- * a test/R1 scaffold, not a production InlinePush capability.
+ * Production 档 A dispatch. Flag-on uses EngineAdapter.writeDelegateTerminal.
+ * Flag-off keeps the R0/R1 duck-type probe (653ef6339 equivalent).
+ * Cutover-effective → force fail so Notifier degrades to ResumeInject.
+ */
+export async function writeInlinePushForSession(
+  session: InlinePushSession | undefined,
+  event: JobTerminal,
+  body: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{ ok: boolean; processAlive: boolean }> {
+  if (!isDelegateInlinePushEnabled(event.parentEngine, env)) {
+    return tryWriteInlinePush(session, event, body)
+  }
+  const runner = session?.runner
+  const processAlive = Boolean(runner?.isRunning)
+  if (isDelegateCutoverEffective(env)) {
+    return { ok: false, processAlive }
+  }
+  const write = runner?.writeDelegateTerminal
+  if (typeof write !== 'function') {
+    return { ok: false, processAlive }
+  }
+  try {
+    const result = await write.call(runner, event, body)
+    return {
+      ok: Boolean(result?.ok && result.processAlive),
+      processAlive: Boolean(result?.processAlive),
+    }
+  } catch {
+    return { ok: false, processAlive: false }
+  }
+}
+
+/**
+ * Flag-off 档 A write. Duck-types `runner.proc` / `runner.writeRaw` so
+ * 653ef6339 tests and Completer paths stay equivalent. Production adapters
+ * hide those fields; live 档 A is `writeDelegateTerminal` behind the R3 flags.
  */
 export async function tryWriteInlinePush(
   session: InlinePushSession | undefined,
@@ -213,18 +283,7 @@ export async function tryWriteInlinePush(
   }
   if (event.parentEngine === 'codex' && typeof runner.writeRaw === 'function') {
     try {
-      await runner.writeRaw(
-        `${JSON.stringify({
-          jsonrpc: '2.0',
-          method: 'delegate/terminal',
-          params: {
-            jobId: event.jobId,
-            notifyId: delegateNotifyId(event.jobId, event.callbackEpoch),
-            state: event.state,
-            body,
-          },
-        })}\n`,
-      )
+      await runner.writeRaw(`${buildCodexDelegateTerminalNotification(event, body)}\n`)
       return { ok: true, processAlive: true }
     } catch {
       return { ok: false, processAlive: false }

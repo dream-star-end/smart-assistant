@@ -33,6 +33,7 @@ import { EventEmitter } from 'node:events'
 import type {
   CallTokenUsageSnapshot,
   GoalStateSnapshot,
+  JobTerminal,
   TurnTokenUsageSnapshot,
 } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
@@ -60,6 +61,7 @@ import type {
 } from './engineEvents.js'
 import { engineSessionId } from './engineSessionId.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
+import { buildCodexDelegateTerminalNotification } from '../engineNotifier.js'
 
 const log = createLogger({ module: 'codexAdapter' })
 
@@ -658,6 +660,21 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
 
   getBoundRepoBinding(): { selectionVersion: number; workspaceDir: string } | null {
     return this.kernel.getBoundRepoBinding()
+  }
+
+  /**
+   * R3 档 A. Notification is only useful while a turn is routing (`_activeTurn`);
+   * idle → degrade to ResumeInject. Write failures do not kill app-server.
+   */
+  async writeDelegateTerminal(
+    event: JobTerminal,
+    body: string,
+  ): Promise<{ ok: boolean; processAlive: boolean }> {
+    if (!this.kernel.isRunning) return { ok: false, processAlive: false }
+    if (!this._activeTurn) return { ok: false, processAlive: true }
+    return this.kernel.writeDelegateTerminalNotification(
+      buildCodexDelegateTerminalNotification(event, body),
+    )
   }
 }
 

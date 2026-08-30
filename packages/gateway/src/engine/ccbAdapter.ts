@@ -17,7 +17,7 @@
  * 硬约束:CCB stream-json SdkMessage 形状不跨出本模块。
  */
 import { EventEmitter } from 'node:events'
-import { TURN_LEASE_RENEW_AFTER_MS, type GoalStateSnapshot } from '@openclaude/protocol'
+import { TURN_LEASE_RENEW_AFTER_MS, type GoalStateSnapshot, type JobTerminal } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
 import type { ExecutionTarget } from '../remoteTarget.js'
@@ -672,6 +672,20 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 
   getBoundRepoBinding(): { selectionVersion: number; workspaceDir: string } | null {
     return this.runner.getBoundRepoBinding()
+  }
+
+  /**
+   * R3 档 A. Only write while a live turn can route stdout (`_activeTurn`).
+   * Idle process → fail with processAlive so Notifier degrades to ResumeInject
+   * (dispatchInbound owns the next turn). Write failures do not kill CCB.
+   */
+  async writeDelegateTerminal(
+    _event: JobTerminal,
+    body: string,
+  ): Promise<{ ok: boolean; processAlive: boolean }> {
+    if (!this.runner.isRunning) return { ok: false, processAlive: false }
+    if (!this._activeTurn) return { ok: false, processAlive: true }
+    return this.runner.writeDelegateUserMessage(body)
   }
 }
 

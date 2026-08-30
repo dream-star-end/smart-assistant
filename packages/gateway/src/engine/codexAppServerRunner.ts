@@ -2448,6 +2448,18 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
+  /**
+   * R3 档 A: JSON-RPC notification `delegate/terminal` over the existing
+   * app-server stdin. Official mechanism only — does not patch the Codex
+   * binary. Unknown notifications may be ignored by app-server (gap reported).
+   */
+  writeDelegateTerminalNotification(line: string): { ok: boolean; processAlive: boolean } {
+    const processAlive = Boolean(this.proc && !this.proc.killed)
+    if (!processAlive) return { ok: false, processAlive: false }
+    const ok = this.writeRaw(line)
+    return { ok, processAlive: Boolean(this.proc && !this.proc.killed) }
+  }
+
   private sendRequest(method: string, params: unknown): Promise<unknown> {
     const id = ++this.nextRequestId
     return new Promise((resolve, reject) => {
