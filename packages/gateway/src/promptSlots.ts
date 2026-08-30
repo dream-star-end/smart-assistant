@@ -658,7 +658,14 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   return { name: 'AGENTS', content: lines.join('\n') }
 }
 
+/** Cursor L0 compact SKILLS: retrieval contract only. No count, no top-15. 132B utf8. */
+export const CURSOR_SKILLS_COMPACT =
+  '# Skills\n\n技能不在本信封展开。相关任务先 `skill_search` 再 `skill_view`。不要假设未 view 的技能不存在。'
+
 export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
+  if (ctx.provider === 'cursor') {
+    return { name: 'SKILLS', content: CURSOR_SKILLS_COMPACT }
+  }
   const frozenSkills = ctx.frozenProjectContext?.skills
   const skillStore = frozenSkills
     ? buildAgentSkillStore(ctx.agentId)
@@ -755,6 +762,9 @@ export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlo
     memoryMd: paths.agentMemoryMd(ctx.agentId),
     userMd: paths.sharedUserMd,
   })
+  if (ctx.provider === 'cursor') {
+    return { name: 'MEMORY', content: instructions }
+  }
   let index: string | null = null
   try {
     index = await new MemoryDir(ctx.agentId).renderForInjectionReadonly(
@@ -772,14 +782,17 @@ export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlo
   }
 }
 
-export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
-  if (!isProjectContextEnabled()) return null
-  if (ctx.frozenProjectContext) {
-    const index = ctx.frozenProjectContext.officialMemoryIndex
-    const header = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
+const PROJECT_MEMORY_HEADER = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
 正式条目由台账登记；磁盘上未经 ledger 核验的 memory/*.md 不会注入。
 动态事实必须 live 核验，不得把过期条目当事实。新沉淀请写候选（memory-candidates/，登记后立即生效），不要改正式文件。
 检索：\`oc-memory project-search "<query>"\`（不污染 core-search）。`
+
+export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
+  if (!isProjectContextEnabled()) return null
+  if (ctx.frozenProjectContext) {
+    const header = PROJECT_MEMORY_HEADER
+    if (ctx.provider === 'cursor') return { name: 'PROJECT_MEMORY', content: header }
+    const index = ctx.frozenProjectContext.officialMemoryIndex
     if (!index) return { name: 'PROJECT_MEMORY', content: header }
     return { name: 'PROJECT_MEMORY', content: `${header}\n\n## 项目索引\n\n${index}` }
   }
@@ -804,10 +817,8 @@ export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<Pr
   } catch {
     return null
   }
-  const header = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
-正式条目由台账登记；磁盘上未经 ledger 核验的 memory/*.md 不会注入。
-动态事实必须 live 核验，不得把过期条目当事实。新沉淀请写候选（memory-candidates/，登记后立即生效），不要改正式文件。
-检索：\`oc-memory project-search "<query>"\`（不污染 core-search）。`
+  const header = PROJECT_MEMORY_HEADER
+  if (ctx.provider === 'cursor') return { name: 'PROJECT_MEMORY', content: header }
   if (!index) return { name: 'PROJECT_MEMORY', content: header }
   return {
     name: 'PROJECT_MEMORY',

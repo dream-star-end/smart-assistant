@@ -296,6 +296,7 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
 import {
   CronScheduler,
+  backfillCronOccurrenceDelegateJobs,
   type CronDeliveryContext,
   type CronJob,
 } from './cron.js'
@@ -316,6 +317,7 @@ import {
 import { getProject } from './taskboard/db/projects.js'
 import {
   buildSendToAgentCallbackText,
+  callbackPayloadFromDurableJob,
   isSendToAgentCallbackComplete,
   sendToAgentCallbackClientMessageId,
   sendToAgentCallbackIdempotencyKey,
@@ -376,12 +378,21 @@ import {
 } from './delegateTimeout.js'
 import {
   DelegateJobStore,
+  DELEGATE_LEASE_HEARTBEAT_MAX_BEATS,
+  DELEGATE_LEASE_HEARTBEAT_MS,
   resolveDelegateJobTtlMs,
   resolveDelegateWaitMs,
   type DelegateJobHttpResult,
+  type DelegateJobSnapshot,
 } from './delegateJobs.js'
 import { DelegateResumeRegistry, DELEGATE_RESUME_OCCUPIED_MESSAGE } from './delegateResume.js'
-import { isDelegateSmEnabled, resolveDelegateCallbackOwner } from './delegateSmFlag.js'
+import { isDelegateDurableEffective, isDelegateSmEnabled, resolveDelegateCallbackOwner } from './delegateSmFlag.js'
+import { openDelegateDurableDb } from './delegateDurable.js'
+import {
+  nextDelegateReconcileAt,
+  reconcileDelegateJobsOnBoot,
+  restoreResumeOccupancyFromJobs,
+} from './delegateReconciler.js'
 import {
   delegateCallbackMessageId,
   persistDelegateJobSnapshots,
@@ -2578,11 +2589,10 @@ export class Gateway {
 
     try {
       if (isDelegateSmEnabled()) {
-        this._delegateJobs ??= new DelegateJobStore({
-          ttlMs: resolveDelegateJobTtlMs(),
-          sm: true,
-        })
-        await restoreDelegateJobSnapshots(this._delegateJobs)
+        const store = this._ensureDelegateJobStore()
+        if (!isDelegateDurableEffective()) {
+          await restoreDelegateJobSnapshots(store)
+        }
       }
       const summary = await recoverInterruptedSendToAgentIntents(
         (intent) => this._deliverInterruptedSendToAgentIntent(intent),
@@ -2590,24 +2600,7 @@ export class Gateway {
         {
           callbackOwner: resolveDelegateCallbackOwner(),
           resolveJob: (jobId) => this._delegateJobs?.snapshotOf(jobId),
-          ensureCallback: async (job, intent) => {
-            const epoch = job.callbackEpoch || 1
-            const result = await this.injectSendToAgentCallback({
-              parentSessionKey: intent.originSessionKey,
-              jobId: intent.jobId,
-              agentId: intent.agentId,
-              goal: intent.goal,
-              userId: intent.userId,
-              clientMessageId: delegateCallbackMessageId(intent.jobId, epoch),
-            })
-            if (result.kind === 'injected') {
-              const fence = job.claimToken
-                ? { claimToken: job.claimToken, fencingEpoch: job.fencingEpoch }
-                : undefined
-              return this._delegateJobs?.patchCallbackState(intent.jobId, 'delivered', fence) === true
-            }
-            return false
-          },
+          ensureCallback: (job, intent) => this._ensureDurableSendToAgentCallback(job, intent),
         },
       )
       if (summary.recovered > 0 || summary.retained > 0 || summary.malformed > 0) {
@@ -2969,11 +2962,7 @@ export class Gateway {
     this.cron.getRegisteredDeliverChannels = () => this.channels.keys()
     this.cron.start().catch((err) => this.log.error('cron start failed', undefined, err))
     if (isDelegateSmEnabled()) {
-      this._delegateJobs ??= new DelegateJobStore({
-        ttlMs: resolveDelegateJobTtlMs(),
-        sm: true,
-      })
-      this.cron.delegateJobs = this._delegateJobs
+      this.cron.delegateJobs = this._ensureDelegateJobStore()
     }
 
     // Start event persistence (writes all events to SQLite event_log)
@@ -10493,6 +10482,80 @@ export class Gateway {
   /** Cursor MCP 60s 上限的异步委派作业句柄。测试脚手架 Object.create 不跑字段
    *  初始化,使用处惰性 ??=。 */
   private _delegateJobs: DelegateJobStore | undefined
+  /** Stage 1: durable boot reconciler has finished (or durable is off). */
+  private _delegateReconcileReady = false
+  private _delegateDurablePath: string | undefined
+  private _delegateReconcileTimer: ReturnType<typeof setTimeout> | undefined
+
+  private _ensureDelegateJobStore(): DelegateJobStore {
+    if (this._delegateJobs) return this._delegateJobs
+    const sm = isDelegateSmEnabled()
+    const durableOn = isDelegateDurableEffective()
+    const durable = durableOn ? openDelegateDurableDb(this._delegateDurablePath) : undefined
+    const resume = (this._delegateResume ??= new DelegateResumeRegistry())
+    const store = new DelegateJobStore({
+      ttlMs: resolveDelegateJobTtlMs(),
+      sm,
+      durable,
+      onTerminal: (job) => {
+        if (job.sessionKey) resume.release(job.sessionKey)
+      },
+    })
+    this._delegateJobs = store
+    if (durableOn) {
+      const queueWaitMs = parseDelegateQueueWaitMs()
+      const summary = reconcileDelegateJobsOnBoot(store, {
+        isChildAlive: (job) => this._delegateChildAlive(job.sessionKey),
+        queueWaitMs,
+      })
+      if (summary.scanned > 0) {
+        this.log.info('delegate durable reconcile', summary)
+      }
+      restoreResumeOccupancyFromJobs(resume, store)
+      const filled = backfillCronOccurrenceDelegateJobs(store)
+      if (filled > 0) this.log.info('cron occurrence delegateJobId backfill', { filled })
+      this._armDelegateReconcileFollowup(store, queueWaitMs)
+      this._delegateReconcileReady = true
+    } else {
+      this._delegateReconcileReady = true
+    }
+    return store
+  }
+
+  private _armDelegateReconcileFollowup(store: DelegateJobStore, queueWaitMs: number): void {
+    if (this._delegateReconcileTimer) {
+      clearTimeout(this._delegateReconcileTimer)
+      this._delegateReconcileTimer = undefined
+    }
+    const next = nextDelegateReconcileAt(store, { queueWaitMs })
+    if (next == null) return
+    const delay = Math.max(0, next - Date.now())
+    this._delegateReconcileTimer = setTimeout(() => {
+      this._delegateReconcileTimer = undefined
+      if (!this._delegateJobs) return
+      const summary = reconcileDelegateJobsOnBoot(this._delegateJobs, {
+        isChildAlive: (job) => this._delegateChildAlive(job.sessionKey),
+        queueWaitMs,
+      })
+      if (summary.killed > 0 || summary.capacityTimedOut > 0) {
+        this.log.info('delegate durable reconcile follow-up', summary)
+      }
+      this._armDelegateReconcileFollowup(this._delegateJobs, queueWaitMs)
+    }, delay)
+    this._delegateReconcileTimer.unref()
+  }
+
+  private _delegateChildAlive(sessionKey: string | undefined): boolean | undefined {
+    if (!sessionKey) return undefined
+    try {
+      const session = this.sessions?.getByKey?.(sessionKey) as { runner?: unknown } | undefined
+      if (session?.runner) return true
+      return undefined
+    } catch {
+      return undefined
+    }
+  }
+
   private readonly _activeSendToAgentCallbacks = new Map<string, {
     originSessionKey: string
     userId?: string
@@ -11044,10 +11107,13 @@ export class Gateway {
     // 才切作业句柄 —— 子任务仍走同一条 _runDelegateTask(idle/hard/祖先活性/深度/并发闸全在)。
     if (parsed.async === true) {
       const sm = isDelegateSmEnabled()
-      const store = (this._delegateJobs ??= new DelegateJobStore({
-        ttlMs: resolveDelegateJobTtlMs(),
-        sm,
-      }))
+      if (sm && isDelegateDurableEffective() && !this._delegateReconcileReady && !this._delegateJobs) {
+        this._ensureDelegateJobStore()
+      }
+      if (sm && isDelegateDurableEffective() && !this._delegateReconcileReady) {
+        return this.sendJson(res, 503, { error: 'delegate store reconciling', failure_class: 'internal' })
+      }
+      const store = this._ensureDelegateJobStore()
       const slotOpts = {
         parentBucketKey: parentSessionKey,
         isReview: isHiddenSystemAgentId(targetAgentId),
@@ -11069,6 +11135,7 @@ export class Gateway {
       }
       const created = store.create(targetAgentId, {
         sessionKey: resume.sessionKey,
+        parentSessionKey,
         queued: sm,
         kind: callbackOnComplete ? 'send_to_agent' : 'delegate',
         callback: callbackOnComplete ? 'origin-inject' : 'stdout-wait',
@@ -11255,9 +11322,7 @@ export class Gateway {
     const jobId = typeof parsed.jobId === 'string' ? parsed.jobId.trim() : ''
     if (!jobId) return this.sendError(res, 400, 'jobId required')
     const waitMs = resolveDelegateWaitMs(parsed.waitMs)
-    const store = (this._delegateJobs ??= new DelegateJobStore({
-      ttlMs: resolveDelegateJobTtlMs(),
-    }))
+    const store = this._ensureDelegateJobStore()
     const view = await store.wait(jobId, waitMs)
     if (view.status === 'expired') {
       return this.sendJson(res, 404, {
@@ -11742,8 +11807,11 @@ export class Gateway {
       const tok = claimed.claimToken
       const epoch = claimed.fencingEpoch
       const jobId = input.backgroundJobId
+      let beats = 0
       const timer = setInterval(() => {
-        const ok = this._delegateJobs?.casHeartbeat(jobId, tok, epoch)
+        beats += 1
+        const capHit = beats > DELEGATE_LEASE_HEARTBEAT_MAX_BEATS
+        const ok = !capHit && this._delegateJobs?.casHeartbeat(jobId, tok, epoch)
         if (!ok) {
           clearInterval(timer)
           // Child key is local `sessionKey` (`input.sessionKey ?? generated`).
@@ -11751,7 +11819,9 @@ export class Gateway {
           if (!sessionKey) {
             this.log.warn('delegate_lease_fence_lost', {
               jobId,
-              reason: 'casHeartbeat failed; child sessionKey missing',
+              reason: capHit
+                ? 'heartbeat hard-cap 480 (2h) reached; child sessionKey missing'
+                : 'casHeartbeat failed; child sessionKey missing',
             })
             return
           }
@@ -11761,7 +11831,9 @@ export class Gateway {
               this.log.warn('delegate_lease_fence_lost', {
                 jobId,
                 sessionKey,
-                reason: 'casHeartbeat failed; child session not interruptible',
+                reason: capHit
+                  ? 'heartbeat hard-cap 480 (2h) reached; child session not interruptible'
+                  : 'casHeartbeat failed; child session not interruptible',
               })
             }
           } catch (err) {
@@ -11772,7 +11844,7 @@ export class Gateway {
             )
           }
         }
-      }, 15_000)
+      }, DELEGATE_LEASE_HEARTBEAT_MS)
       timer.unref()
       input._leaseTimer = timer
     }
@@ -12908,6 +12980,10 @@ export class Gateway {
   }
 
   private async _persistAndCloseDelegateJobs(): Promise<void> {
+    if (this._delegateReconcileTimer) {
+      clearTimeout(this._delegateReconcileTimer)
+      this._delegateReconcileTimer = undefined
+    }
     await this._persistInterruptedSendToAgentCallbacks()
     this._delegateJobs?.close()
     this._delegateJobs = undefined
@@ -12915,7 +12991,7 @@ export class Gateway {
 
   private async _persistInterruptedSendToAgentCallbacks(): Promise<void> {
     const owner = resolveDelegateCallbackOwner()
-    if (this._delegateJobs) {
+    if (this._delegateJobs && !isDelegateDurableEffective()) {
       await persistDelegateJobSnapshots(this._delegateJobs)
     }
     this._activeSendToAgentCallbacks.clear()
@@ -12925,26 +13001,34 @@ export class Gateway {
       {
         callbackOwner: owner,
         resolveJob: (jobId) => this._delegateJobs?.snapshotOf(jobId),
-        ensureCallback: async (job, intent) => {
-          const epoch = job.callbackEpoch || 1
-          const result = await this.injectSendToAgentCallback({
-            parentSessionKey: intent.originSessionKey,
-            jobId: intent.jobId,
-            agentId: intent.agentId,
-            goal: intent.goal,
-            userId: intent.userId,
-            clientMessageId: delegateCallbackMessageId(intent.jobId, epoch),
-          })
-          if (result.kind === 'injected') {
-            const fence = job.claimToken
-              ? { claimToken: job.claimToken, fencingEpoch: job.fencingEpoch }
-              : undefined
-            return this._delegateJobs?.patchCallbackState(intent.jobId, 'delivered', fence) === true
-          }
-          return false
-        },
+        ensureCallback: (job, intent) => this._ensureDurableSendToAgentCallback(job, intent),
       },
     )
+  }
+
+  private async _ensureDurableSendToAgentCallback(
+    job: DelegateJobSnapshot,
+    intent: SendToAgentIntent,
+  ): Promise<boolean> {
+    const epoch = job.callbackEpoch || 1
+    const payload = callbackPayloadFromDurableJob(job)
+    const result = await this.injectSendToAgentCallback({
+      parentSessionKey: intent.originSessionKey,
+      jobId: intent.jobId,
+      agentId: intent.agentId,
+      goal: intent.goal,
+      userId: intent.userId,
+      output: payload.output,
+      error: payload.error,
+      clientMessageId: delegateCallbackMessageId(intent.jobId, epoch),
+    })
+    if (result.kind === 'injected') {
+      const fence = job.claimToken
+        ? { claimToken: job.claimToken, fencingEpoch: job.fencingEpoch }
+        : undefined
+      return this._delegateJobs?.patchCallbackState(intent.jobId, 'delivered', fence) === true
+    }
+    return false
   }
 
   private handleCcbLocalAgentNotification(

@@ -6698,7 +6698,9 @@ export class SessionManager {
                         terminalOverride?.errorCode ??
                         (result.errorKind === 'auth'
                           ? 'AUTH_ERROR'
-                          : _tapeErrorCodeForGenericFailure(result.errorDetail)),
+                          : (result.errorClass && result.errorClass !== 'unknown'
+                              ? result.errorClass
+                              : _tapeErrorCodeForGenericFailure(result.errorDetail))),
                       errorDetail:
                         terminalOverride?.reason ??
                         result.errorDetail ??

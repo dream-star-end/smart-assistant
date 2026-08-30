@@ -2204,11 +2204,19 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private finish(ctx: TurnCtx, detail: string | null): void {
     this.stopPendingKeepalive()
     if (ctx.terminal) return; ctx.terminal = true; const cls = detail ? unavailable(detail) : null
-    const safeDetail = detail === null ? null : ctx.interrupted ? 'Cursor turn cancelled' : cls === 'auth' ? 'Cursor authentication unavailable' : cls === 'quota' ? 'Cursor quota unavailable' : 'Cursor CLI failed'
+    const errorClass = detail ? classifyRunError(detail).code : undefined
+    const keepRawForTape =
+      detail != null &&
+      (errorClass === 'context_too_long' || /PROMPT_TOO_LONG/.test(detail))
+    const safeDetail = detail === null ? null
+      : ctx.interrupted ? 'Cursor turn cancelled'
+      : cls === 'auth' ? 'Cursor authentication unavailable'
+      : cls === 'quota' ? 'Cursor quota unavailable'
+      : keepRawForTape ? detail
+      : 'Cursor CLI failed'
     const status: EngineExternalBillingEvent['status'] = cls ? 'unavailable' : detail ? 'error' : 'success'
     const slotResults = parseCursorSlotResults(ctx.stderr)
-    if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs: Date.now() - ctx.startedAt, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
-    const errorClass = detail ? classifyRunError(detail).code : undefined
+    if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs: Date.now() - ctx.startedAt, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : errorClass === 'context_too_long' ? {} : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
     if (detail) ctx.params.onEvent({ kind: 'error', error: safeDetail!, errorClass, ...(ctx.interrupted ? { errorCode: 'user_cancelled' as const } : {}) })
     if (ctx.usage) ctx.params.onEvent({ kind: 'usage', usage: { inputTokens: ctx.usage.input_tokens ?? 0, outputTokens: ctx.usage.output_tokens ?? 0, cacheReadTokens: ctx.usage.cache_read_input_tokens ?? 0, cacheCreationTokens: ctx.usage.cache_creation_input_tokens ?? 0, totalTokens: Object.values(ctx.usage).reduce((a, b) => a + (b ?? 0), 0) } })
     ctx.params.onEvent({ kind: 'final', meta: { ...finalUsageMeta(ctx.usage), ...(ctx.interrupted ? { stopReason: 'interrupted' } : {}) } })

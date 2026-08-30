@@ -254,6 +254,36 @@ export class DelegateResumeRegistry {
     })
   }
 
+  /**
+   * Stage 1: rehydrate occupancy after a durable restart. Does not increment
+   * dispatchGrants (that counter is process-local).
+   */
+  restoreInFlight(input: {
+    sessionKey: string
+    parentSessionKey: string
+    targetAgentId: string
+    sourceAgent: string
+    jobId: string
+    idempotencyKey?: string
+  }): void {
+    const ts = this.now()
+    const existing = this.bindings.get(input.sessionKey)
+    if (!existing) {
+      this.bindings.set(input.sessionKey, {
+        sessionKey: input.sessionKey,
+        parentSessionKey: input.parentSessionKey,
+        targetAgentId: input.targetAgentId,
+        sourceAgent: input.sourceAgent,
+        createdAt: ts,
+        lastUsedAt: ts,
+      })
+    } else {
+      existing.lastUsedAt = ts
+    }
+    this.reserved.set(input.sessionKey, 'active')
+    this.bindJob(input.sessionKey, input.idempotencyKey, input.jobId)
+  }
+
   bindJob(sessionKey: string, idempotencyKey: string | undefined, jobId: string): void {
     if (!idempotencyKey) return
     const id = attemptId(sessionKey, idempotencyKey)

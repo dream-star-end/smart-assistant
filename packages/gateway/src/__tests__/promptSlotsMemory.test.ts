@@ -266,4 +266,30 @@ describe('memory retrieval hygiene', () => {
     assert.ok(slot)
     assert.match(slot.content, /已截断/)
   })
+
+  it('cursor provider MEMORY bytes do not grow with a 200-line index', async () => {
+    const agentId = 'cursor-compact-mem'
+    const empty = await buildMemorySlot({ agentId, provider: 'cursor' })
+    const rows: string[] = []
+    for (let i = 0; i < MEMORY_INDEX_INJECT_MAX_LINES; i++) {
+      const file = `n${String(i).padStart(3, '0')}.md`
+      const name = `note-${i}`
+      const desc = `hook-${i}`
+      seedEntry(agentId, file, name, desc)
+      rows.push(`- [${name}](memory/${file}) — ${desc}`)
+    }
+    seedIndex(agentId, rows)
+    const full = await buildMemorySlot({ agentId, provider: 'cursor' })
+    assert.doesNotMatch(full.content, /## 当前索引/)
+    assert.equal(
+      Buffer.byteLength(full.content, 'utf8'),
+      Buffer.byteLength(empty.content, 'utf8'),
+    )
+    const defaultProvider = await buildMemorySlot({ agentId })
+    assert.match(defaultProvider.content, /## 当前索引/)
+    assert.ok(
+      Buffer.byteLength(defaultProvider.content, 'utf8') >
+        Buffer.byteLength(full.content, 'utf8'),
+    )
+  })
 })

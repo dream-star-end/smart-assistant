@@ -39,6 +39,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   writeFileSync,
 } from 'node:fs'
@@ -77,7 +78,13 @@ import {
   type LocalExecutionDecision,
 } from './server.js'
 import { localExecutionRejectCode, type LocalExecutionRejectCode } from './modelCatalogClient.js'
-import { enqueueCronOccurrenceJob, settleCronDelegateJob } from './delegateCronIdempotency.js'
+import {
+  claimCronDelegateExecution,
+  enqueueCronOccurrenceJob,
+  isCronDelegateClaimDenied,
+  settleCronDelegateJob,
+} from './delegateCronIdempotency.js'
+import { cronDelegateIdempotencyKey } from '@openclaude/protocol'
 import { isDelegateSmEnabled } from './delegateSmFlag.js'
 import type { DelegateJobStore } from './delegateJobs.js'
 import {
@@ -739,6 +746,42 @@ async function saveRetryState(map: Map<string, CronRetryEntry>): Promise<void> {
   const tmp = RETRY_STATE_FILE + `.${process.pid}.${++_writeCounter}.tmp`
   await writeFile(tmp, JSON.stringify(Object.fromEntries(map), null, 2))
   await rename(tmp, RETRY_STATE_FILE)
+}
+
+/**
+ * Stage 1: fill occurrence.delegateJobId from the durable job UNIQUE key when
+ * Enqueue succeeded and the JSON projection crashed before write.
+ */
+export function backfillCronOccurrenceDelegateJobs(
+  store: DelegateJobStore,
+  occurrenceDir: string = OCCURRENCE_DIR,
+): number {
+  if (!existsSync(occurrenceDir)) return 0
+  let n = 0
+  let names: string[]
+  try {
+    names = readdirSync(occurrenceDir)
+  } catch {
+    return 0
+  }
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const filePath = join(occurrenceDir, name)
+    let row: CronOccurrenceRecord
+    try {
+      row = JSON.parse(readFileSync(filePath, 'utf8')) as CronOccurrenceRecord
+    } catch {
+      continue
+    }
+    if (row?.version !== 1 || row.delegateJobId) continue
+    if (typeof row.jobId !== 'string' || !Number.isSafeInteger(row.dueMinuteKey)) continue
+    const key = cronDelegateIdempotencyKey(row.jobId, row.dueMinuteKey)
+    const job = store.findByIdempotencyKey(key)
+    if (!job) continue
+    durableJsonWrite(filePath, { ...row, delegateJobId: job.id, updatedAt: Date.now() })
+    n += 1
+  }
+  return n
 }
 
 async function loadOccurrenceRecords(): Promise<CronOccurrenceRecord[]> {
@@ -1483,35 +1526,22 @@ export class CronScheduler {
                       (record?.state === 'executing' || record?.state === 'completed')
                     if (!record || (record.state !== 'prepared' && !tolerated))
                       throw new Error('cron occurrence is not prepared')
-                    if (record.state === 'prepared') {
-                      writeOccurrence({ ...record, state: 'executing', updatedAt: Date.now() })
-                    }
                     if (isDelegateSmEnabled() && this.delegateJobs && record?.delegateJobId) {
-                      const claimed = this.delegateJobs.claimQueued(record.delegateJobId)
-                      if (claimed.ok) {
-                        cronClaimFence = {
-                          claimToken: claimed.claimToken,
-                          fencingEpoch: claimed.fencingEpoch,
-                        }
-                        const latest = readOccurrence(deliveryContext.deliveryId) ?? record
-                        writeOccurrence({
-                          ...latest,
-                          delegateClaimToken: claimed.claimToken,
-                          delegateFencingEpoch: claimed.fencingEpoch,
-                          updatedAt: Date.now(),
-                        })
-                      } else {
-                        const latest = readOccurrence(deliveryContext.deliveryId)
-                        if (
-                          latest?.delegateClaimToken &&
-                          latest.delegateFencingEpoch !== undefined
-                        ) {
-                          cronClaimFence = {
-                            claimToken: latest.delegateClaimToken,
-                            fencingEpoch: latest.delegateFencingEpoch,
-                          }
-                        }
-                      }
+                      const claimed = claimCronDelegateExecution(
+                        this.delegateJobs,
+                        record.delegateJobId,
+                      )
+                      cronClaimFence = claimed
+                      const latest = readOccurrence(deliveryContext.deliveryId) ?? record
+                      writeOccurrence({
+                        ...latest,
+                        state: latest.state === 'prepared' ? 'executing' : latest.state,
+                        delegateClaimToken: claimed.claimToken,
+                        delegateFencingEpoch: claimed.fencingEpoch,
+                        updatedAt: Date.now(),
+                      })
+                    } else if (record.state === 'prepared') {
+                      writeOccurrence({ ...record, state: 'executing', updatedAt: Date.now() })
                     }
                     if (!isOrigin) {
                       // origin-session must NOT consume lastRun here: settle
@@ -1817,6 +1847,17 @@ export class CronScheduler {
     try {
       await durability.markSubmitStarted?.()
     } catch (err) {
+      if (isCronDelegateClaimDenied(err)) {
+        logger.warn(`job ${job.id} origin-session delegate claim denied`, {
+          jobId: job.id,
+          reason: err.reason,
+          state: err.state,
+        })
+        return {
+          kind: 'terminal_failure',
+          code: err.reason === 'terminal' ? 'DELEGATE_JOB_TERMINAL' : 'DELEGATE_CLAIM_DENIED',
+        }
+      }
       logger.warn(`job ${job.id} origin-session markSubmitStarted failed`, {
         jobId: job.id,
         errorClass: stableCronErrorClass(err),
@@ -2037,6 +2078,26 @@ export class CronScheduler {
     let submitError: unknown = null
     try {
       await durability.markSubmitStarted?.()
+    } catch (err) {
+      await this.sessions.destroySession(sessionKey).catch(() => {})
+      if (isCronDelegateClaimDenied(err)) {
+        logger.warn(`job ${job.id} delegate claim denied before submit`, {
+          jobId: job.id,
+          reason: err.reason,
+          state: err.state,
+        })
+        return {
+          kind: 'terminal_failure',
+          code: err.reason === 'terminal' ? 'DELEGATE_JOB_TERMINAL' : 'DELEGATE_CLAIM_DENIED',
+        }
+      }
+      logger.warn(`job ${job.id} markSubmitStarted failed before submit`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'SUBMIT_START_FAILED' }
+    }
+    try {
       await this.sessions.submit(
         session,
         job.prompt,
