@@ -1,6 +1,12 @@
 /**
  * Visible-orphan classification for turnDispatchReconciler (design rev2 §方向2).
  * Pure so unit tests do not need a fake PG for the three branches.
+ *
+ * OCV5-57: zero PG dispatch frames is not by itself a kill signal. Persist can
+ * lag hours behind a live engine (89f18ffe, 2026-08-31). Liveness evidence
+ * (turn_traces.first_visible_at, optional persist-backlog flag) must skip the
+ * 15min tapeless interrupt. OCV5-43 (engine died during hydrate, no frames,
+ * no first_visible, container still running) still interrupts at 15min.
  */
 export const PARTS_COMPLETE_QUIET_MS = 2 * 60_000;
 export const ENGINE_DEAD_QUIET_MS = 15 * 60_000;
@@ -21,6 +27,30 @@ export interface VisibleOrphanEvidence {
   acceptedOrAdmittedAtMs: number;
   containerRunning: boolean;
   nowMs: number;
+  /**
+   * `turn_traces.first_visible_at` for this dispatch. Written on the first
+   * thinking/text/tool before live-frame persist, so it survives PG persist lag.
+   */
+  firstVisibleAtMs: number | null;
+  /**
+   * True when in-process persist evidence says last_frame_at is not a reliable
+   * kill signal (frames may exist in memory but not yet in PG).
+   *
+   * Reconciler currently always passes false: `_OutboundPersistQueueCoordinator`
+   * in userChatBridge is per-bridge, keyed by container/session namespace, and
+   * is not dispatch-addressable without a cross-module registry. Do not invent
+   * that registry in this patch.
+   */
+  persistBacklogUndetermined?: boolean;
+}
+
+/** Interrupt and 6h hard-cap must fence the producer so leftover frames/settlement are rejected. */
+export function shouldFenceProducer(action: VisibleOrphanAction): boolean {
+  return action === "interrupt_tapeless" || action === "fence_hard_cap";
+}
+
+function hasEngineLiveness(row: VisibleOrphanEvidence): boolean {
+  return row.firstVisibleAtMs != null || row.persistBacklogUndetermined === true;
 }
 
 export function classifyVisibleOrphan(row: VisibleOrphanEvidence): VisibleOrphanAction {
@@ -38,15 +68,15 @@ export function classifyVisibleOrphan(row: VisibleOrphanEvidence): VisibleOrphan
   if (!partsComplete && quietMs >= ENGINE_DEAD_QUIET_MS && !row.containerRunning) {
     return "interrupt_tapeless";
   }
-  // 引擎进程死了但容器还活着（容器内崩溃/被杀）时，containerRunning 永远为 true，
-  // 旧判据会把这种 tapeless dispatch 永远 skip：不中断、不恢复、不出终态卡，用户端
-  // 永远停在「已发送」（2026-08-31 webmtd63p5mm747zh 实锤）。存活的引擎在 accepted
-  // 后必会尽快发出至少一帧（ack/thinking）；从无任何帧且静默超阈 = 引擎已死，
-  // 与容器存活与否无关。
+  // OCV5-43 webmtd63p5mm747zh: engine died inside a still-running container
+  // during hydrate. No frames, no first_visible → interrupt at 15min even
+  // while containerRunning. Zero PG dispatch frames is NOT enough when the
+  // engine already produced visible content (OCV5-57 89f18ffe persist lag).
   if (
     !partsComplete &&
     row.lastFrameAtMs === null &&
-    quietMs >= ENGINE_DEAD_QUIET_MS
+    quietMs >= ENGINE_DEAD_QUIET_MS &&
+    !hasEngineLiveness(row)
   ) {
     return "interrupt_tapeless";
   }

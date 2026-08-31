@@ -71,12 +71,15 @@ interface Canned {
 function makeFakePool(canned: Canned) {
   const writes: string[] = []
   const writeParams: unknown[][] = []
+  const queries: string[] = []
   // accepted 扫描的 SQL 时间参数捕获(Codex R1 MAJOR 回归锁:扫描下限必须是
   // ACCEPTED_UNREACHABLE_ALERT_MS 而非 stuckMs,否则求证瘫痪要等 90min+ 才首告)。
   const acceptedScanCutoffs: Date[] = []
   let txDepth = 0
   let txBuf: string[] = []
+  const attemptedWrites: string[] = []
   const recordWrite = (s: string) => {
+    attemptedWrites.push(s)
     if (txDepth > 0) txBuf.push(s)
     else writes.push(s)
   }
@@ -85,6 +88,7 @@ function makeFakePool(canned: Canned) {
   // 故 fake 必须提供 connect() + 事务 client。
   const route = (sql: string, params?: unknown[]) => {
     const s = sql.replace(/\s+/g, ' ')
+    queries.push(s)
     if (s === 'BEGIN') {
       txDepth += 1
       txBuf = []
@@ -159,6 +163,8 @@ function makeFakePool(canned: Canned) {
     },
     writes,
     writeParams,
+    queries,
+    attemptedWrites,
     acceptedScanCutoffs,
   }
   return pool
@@ -1064,6 +1070,7 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       tape_id: null,
       tape_parts_rows: '0',
       last_frame_at: new Date(nowMs - 10 * 60_000),
+      first_visible_at: null,
       container_running: false,
       ...over,
     }
@@ -1154,5 +1161,72 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.ok(pool.writes.includes('ROLLBACK'))
     assert.ok(!pool.writes.includes('COMMIT'))
     assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')))
+  })
+
+  test("SQL joins turn_traces first_visible_at for liveness evidence", async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({ visibleOrphans: [] })
+    await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    const sql = pool.queries.find((query) => query.includes("-- closeVisibleOrphans") && !query.includes("lock"))
+    assert.ok(sql, "closeVisibleOrphans scan SQL must run")
+    assert.ok(sql.includes("turn_traces"), "scan must join turn_traces")
+    assert.ok(sql.includes("first_visible_at"), "scan must select first_visible_at")
+  })
+
+  test("OCV5-43 hydrate-dead engine zero frames no first_visible still interrupts and fences", async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: "0",
+        last_frame_at: null,
+        first_visible_at: null,
+        admitted_at: new Date(nowMs - 15 * 60_000),
+        accepted_at: new Date(nowMs - 15 * 60_000),
+        container_running: true,
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 1)
+    assert.ok(pool.writes.includes("COMMIT"))
+    assert.ok(pool.writes.some((sql) => sql.includes("producer_fenced_at")), "interrupt_tapeless must fence producer")
+    assert.ok(pool.writes.some((sql) => sql.includes("visible-fallback")))
+  })
+
+  test("OCV5-57 first_visible plus zero dispatch frames skips and does not fence", async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: "0",
+        last_frame_at: null,
+        first_visible_at: new Date(nowMs - 14 * 60_000),
+        admitted_at: new Date(nowMs - 15 * 60_000),
+        accepted_at: new Date(nowMs - 15 * 60_000),
+        container_running: true,
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 0)
+    assert.ok(!pool.writes.includes("COMMIT"))
+    assert.ok(!pool.writes.some((sql) => sql.includes("producer_fenced_at")))
+    assert.ok(!pool.writes.some((sql) => sql.includes("visible-fallback")))
   })
 })

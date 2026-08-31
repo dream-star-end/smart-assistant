@@ -28,6 +28,7 @@ import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBack
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
   classifyVisibleOrphan,
+  shouldFenceProducer,
 } from './visibleOrphan.js'
 import {
   casAdmittedToRejecting,
@@ -661,6 +662,7 @@ async function closeVisibleOrphans(
     tape_id: string | null
     tape_parts_rows: string
     last_frame_at: Date | null
+    first_visible_at: Date | null
     container_running: boolean
   }>(
     `SELECT -- closeVisibleOrphans
@@ -682,6 +684,12 @@ async function closeVisibleOrphans(
                 JOIN client_session_live_frames f ON f.stream_key = s.stream_key
                WHERE s.dispatch_id = d.dispatch_id
             ) AS last_frame_at,
+            (
+              SELECT MIN(tr.first_visible_at)
+                FROM turn_traces tr
+               WHERE tr.dispatch_id = d.dispatch_id
+                 AND tr.first_visible_at IS NOT NULL
+            ) AS first_visible_at,
             EXISTS (
               SELECT 1 FROM agent_containers ac
                WHERE ac.user_id = d.user_id AND ac.state = 'active'
@@ -707,6 +715,8 @@ async function closeVisibleOrphans(
       tapePartCount: row.tape_part_count,
       tapePartsRows: Number(row.tape_parts_rows ?? '0'),
       lastFrameAtMs: row.last_frame_at ? row.last_frame_at.getTime() : null,
+      firstVisibleAtMs: row.first_visible_at ? row.first_visible_at.getTime() : null,
+      persistBacklogUndetermined: false,
       acceptedOrAdmittedAtMs: (row.accepted_at ?? row.admitted_at).getTime(),
       containerRunning: row.container_running === true,
       nowMs,
@@ -756,7 +766,7 @@ async function closeVisibleOrphans(
       row,
       outcome,
       nowMs,
-      fence: action === 'fence_hard_cap',
+      fence: shouldFenceProducer(action),
       projectFallback,
       fallbackText: text,
     })

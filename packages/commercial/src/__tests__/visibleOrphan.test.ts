@@ -5,6 +5,7 @@ import {
   ENGINE_DEAD_QUIET_MS,
   HARD_CAP_AGE_MS,
   PARTS_COMPLETE_QUIET_MS,
+  shouldFenceProducer,
 } from "../dispatch/visibleOrphan.js";
 
 describe("classifyVisibleOrphan (rev2 B4)", () => {
@@ -16,6 +17,8 @@ describe("classifyVisibleOrphan (rev2 B4)", () => {
     acceptedOrAdmittedAtMs: 1_000,
     containerRunning: false,
     nowMs: 1_000,
+    firstVisibleAtMs: null as number | null,
+    persistBacklogUndetermined: false,
   };
 
   test("complete_from_frames after parts-complete quiet", () => {
@@ -43,6 +46,7 @@ describe("classifyVisibleOrphan (rev2 B4)", () => {
       }),
       "interrupt_tapeless",
     );
+    assert.equal(shouldFenceProducer("interrupt_tapeless"), true);
   });
 
   test("fence_hard_cap at 6h with 15min quiet", () => {
@@ -56,6 +60,7 @@ describe("classifyVisibleOrphan (rev2 B4)", () => {
       }),
       "fence_hard_cap",
     );
+    assert.equal(shouldFenceProducer("fence_hard_cap"), true);
   });
 
   test("already visible converges only", () => {
@@ -67,6 +72,7 @@ describe("classifyVisibleOrphan (rev2 B4)", () => {
       }),
       "converge_only",
     );
+    assert.equal(shouldFenceProducer("converge_only"), false);
   });
 
   test("interrupt_tapeless when engine never emitted a frame even with container running", () => {
@@ -77,11 +83,72 @@ describe("classifyVisibleOrphan (rev2 B4)", () => {
         tapePartCount: 3,
         tapePartsRows: 1,
         lastFrameAtMs: null,
+        firstVisibleAtMs: null,
         nowMs: 1_000 + ENGINE_DEAD_QUIET_MS,
         containerRunning: true,
       }),
       "interrupt_tapeless",
     );
+    assert.equal(shouldFenceProducer("interrupt_tapeless"), true);
+  });
+
+  test("skip live engine with first_visible but zero dispatch frames (OCV5-57 89f18ffe)", () => {
+    // Persist lag: thinking/text already hit turn_traces.first_visible_at, but
+    // client_session_live_streams.dispatch_id row is still missing. Killing
+    // here produced "turn interrupted (visible fallback)" while cursor-agent
+    // was alive on TaskOutput.
+    assert.equal(
+      classifyVisibleOrphan({
+        ...base,
+        lastFrameAtMs: null,
+        firstVisibleAtMs: 1_000 + 33_000,
+        nowMs: 1_000 + ENGINE_DEAD_QUIET_MS,
+        containerRunning: true,
+      }),
+      "skip",
+    );
+  });
+
+  test("skip when persist backlog makes last_frame undetermined", () => {
+    assert.equal(
+      classifyVisibleOrphan({
+        ...base,
+        lastFrameAtMs: null,
+        firstVisibleAtMs: null,
+        persistBacklogUndetermined: true,
+        nowMs: 1_000 + ENGINE_DEAD_QUIET_MS,
+        containerRunning: true,
+      }),
+      "skip",
+    );
+  });
+
+  test("fence_hard_cap still fires at 6h even with first_visible and zero frames", () => {
+    assert.equal(
+      classifyVisibleOrphan({
+        ...base,
+        lastFrameAtMs: null,
+        firstVisibleAtMs: 1_000 + 33_000,
+        nowMs: 1_000 + HARD_CAP_AGE_MS,
+        containerRunning: true,
+      }),
+      "fence_hard_cap",
+    );
+    assert.equal(shouldFenceProducer("fence_hard_cap"), true);
+  });
+
+  test("fence_hard_cap still fires at 6h even when persist backlog is undetermined", () => {
+    assert.equal(
+      classifyVisibleOrphan({
+        ...base,
+        lastFrameAtMs: null,
+        persistBacklogUndetermined: true,
+        nowMs: 1_000 + HARD_CAP_AGE_MS,
+        containerRunning: true,
+      }),
+      "fence_hard_cap",
+    );
+    assert.equal(shouldFenceProducer("fence_hard_cap"), true);
   });
 
   test("skip when container running and engine has emitted frames recently", () => {
@@ -96,6 +163,7 @@ describe("classifyVisibleOrphan (rev2 B4)", () => {
       }),
       "skip",
     );
+    assert.equal(shouldFenceProducer("skip"), false);
   });
 
   test("skip when container running and engine once emitted frames then went quiet", () => {
