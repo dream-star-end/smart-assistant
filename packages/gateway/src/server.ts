@@ -721,6 +721,23 @@ export function resolveExecutionModel(
 }
 
 /**
+ * Fail-loud for an explicit delegate `--model` slug against the baked inbound set.
+ *
+ * - absent / empty → inherit, no-op
+ * - known baked slug → no-op
+ * - unknown → throws `DELEGATE_MODEL_UNKNOWN` (does not inherit)
+ *
+ * Does **not** consult the model catalog. Catalog outages stay
+ * `MODEL_CATALOG_UNAVAILABLE` on the `OC_MODEL_AUTHORITY=1` path; mixing
+ * the two would collapse "master unreachable" into "typo". Catalog-only
+ * slugs remain the flag-on `decideLocalExecution` path.
+ */
+export function assertKnownExplicitDelegateModel(model: string | undefined | null): void {
+  if (typeof model !== 'string' || model === '') return
+  resolveExecutionModel(model, undefined, undefined, { explicit: true })
+}
+
+/**
  * 服务端**合成首帧**(cron / webhook / scheduled task / inter-agent / openai-compat 等
  * gateway 进程内直接派发、不经 master bridge 计费编排的新会话首帧)的执行模型解析。
  *
@@ -1115,6 +1132,13 @@ export async function resolveLocalExecutionIfEnforced(args: {
   warn?: (message: string, fields?: Record<string, unknown>) => void
 }): Promise<LocalExecutionDecision | undefined> {
   const env = args.env ?? process.env
+  const explicitModel = typeof args.model === 'string' && args.model !== '' ? args.model : undefined
+  // Explicit unknown slug fail-loud is unconditional. Flag-off uses the baked
+  // inbound set (no catalog I/O). Flag-on still uses catalog projection below
+  // so catalog-only slugs are not rejected by the baked snapshot.
+  if (explicitModel && !isModelAuthorityRequired(env)) {
+    assertKnownExplicitDelegateModel(explicitModel)
+  }
   if (!isModelAuthorityRequired(env)) return undefined
   const view = await getLocalCatalogView()
   const liveSessionModel = args.resolveLiveSessionModel?.() ?? args.liveSessionModel
@@ -11468,6 +11492,23 @@ export class Gateway {
     if (!goal) return this.sendError(res, 400, 'goal required')
     const modelNorm = parseDelegateModel(parsed.model)
     if (!modelNorm.ok) return this.sendError(res, 400, modelNorm.error)
+    // Flag-off: reject unknown explicit slugs before async job creation / spawn.
+    // Flag-on: catalog projection in resolveLocalExecutionIfEnforced remains
+    // the authority (catalog-only slugs, catalog-unavailable ≠ unknown).
+    if (modelNorm.model && !isModelAuthorityRequired()) {
+      try {
+        assertKnownExplicitDelegateModel(modelNorm.model)
+      } catch (err) {
+        const mapped = this._mapLocalExecutionError(err)
+        if (mapped) {
+          return this.sendJson(res, mapped.httpStatus, {
+            error: mapped.message,
+            code: mapped.code,
+          })
+        }
+        throw err
+      }
+    }
     const depthHeader = req.headers['x-delegation-depth']
     const contextHeader = req.headers[DELEGATE_CONTEXT_HEADER]
     const contextRaw = Array.isArray(contextHeader) ? contextHeader[0] : contextHeader

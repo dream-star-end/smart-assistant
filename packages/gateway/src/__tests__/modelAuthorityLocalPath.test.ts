@@ -49,9 +49,9 @@ import {
 import {
   Gateway,
   PerTurnDelegationGuard,
+  assertKnownExplicitDelegateModel,
   decideLocalExecution,
   localExecutionOverride,
-  resolveExecutionModel,
   resolveLocalExecutionIfEnforced,
 } from '../server.js'
 import { SessionManager } from '../sessionManager.js'
@@ -164,6 +164,49 @@ function restoreFlag(prev: string | undefined): void {
 // ── ① flag 未开 → 零变化(连网络都不许打)───────────────────────────────────
 
 describe('① flag 未开 → 本地路径零变化', () => {
+  test('assertKnownExplicitDelegateModel:未知 slug 拒,合法 slug 与 inherit 通过', () => {
+    assert.doesNotThrow(() => assertKnownExplicitDelegateModel(undefined))
+    assert.doesNotThrow(() => assertKnownExplicitDelegateModel(''))
+    assert.doesNotThrow(() => assertKnownExplicitDelegateModel('grok-build'))
+    assert.doesNotThrow(() => assertKnownExplicitDelegateModel('glm-5.3-zai'))
+    assert.doesNotThrow(() => assertKnownExplicitDelegateModel('cursor-grok-4.6-high-fast'))
+    assert.doesNotThrow(() => assertKnownExplicitDelegateModel('cursor-grok-4.6-high'))
+    assert.throws(
+      () => assertKnownExplicitDelegateModel('definitely-not-a-model'),
+      (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_MODEL_UNKNOWN',
+    )
+    assert.throws(
+      () => assertKnownExplicitDelegateModel('grok-4.6-fast'),
+      (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_MODEL_UNKNOWN',
+    )
+  })
+
+  test('flag 未开 + 显式未知型号:resolveLocalExecutionIfEnforced 抛 DELEGATE_MODEL_UNKNOWN,不查 catalog', async () => {
+    _setModelCatalogClientForTests({
+      getView: () => {
+        throw new Error('catalog must NOT be consulted while OC_MODEL_AUTHORITY is unset')
+      },
+    } as any)
+    await assert.rejects(
+      () =>
+        resolveLocalExecutionIfEnforced({
+          agent: AGENT,
+          kind: 'turn',
+          model: 'definitely-not-a-model',
+          defaultModel: 'glm-5.2',
+          env: OFF,
+        }),
+      (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_MODEL_UNKNOWN',
+    )
+    const inherited = await resolveLocalExecutionIfEnforced({
+      agent: AGENT,
+      kind: 'turn',
+      defaultModel: 'glm-5.2',
+      env: OFF,
+    })
+    assert.equal(inherited, undefined)
+  })
+
   test('resolveLocalExecutionIfEnforced 返回 undefined,且**完全不碰 catalog client**', async () => {
     // 单例装成"一碰就炸":证明 flag 未开时本地路径根本不查投影(不是"查了但忽略")。
     _setModelCatalogClientForTests({
@@ -576,30 +619,47 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
         throw new Error('catalog must NOT be consulted while flag is off')
       },
     } as any)
-    const gw = makeDelegateGateway()
-    gw.sessions.getOrCreate = async (opts: any) => {
-      resolveExecutionModel(
-        opts.model ?? opts.agent?.model,
-        gw.deps.config.defaults.model,
-        opts.executionAuthority,
-        { explicit: typeof opts.model === 'string' && opts.model !== '' },
-      )
-      gw.sessions.getOrCreateCalls++
-      return {
-        agentId: 'x',
-        currentTurnStatus: null,
-        runner: { interrupt: () => {}, sendPermissionResponse: () => {} },
-      }
+    const prev = process.env.OC_MODEL_AUTHORITY
+    Reflect.deleteProperty(process.env, 'OC_MODEL_AUTHORITY')
+    try {
+      const gw = makeDelegateGateway()
+      const r = await runDelegate(gw, 'coding-assistant', {
+        goal: 'x',
+        sourceAgent: 'main',
+        model: 'definitely-not-a-model',
+      })
+      assert.equal(r.status, 400)
+      assert.equal(r.body.code, 'DELEGATE_MODEL_UNKNOWN')
+      assert.match(String(r.body.error), /DELEGATE_MODEL_UNKNOWN/)
+      assert.equal(gw.sessions.getOrCreateCalls, 0, '入口即拒,未 spawn')
+    } finally {
+      restoreFlag(prev)
     }
-    const r = await runDelegate(gw, 'coding-assistant', {
-      goal: 'x',
-      sourceAgent: 'main',
-      model: 'definitely-not-a-model',
-    })
-    assert.equal(r.status, 400)
-    assert.equal(r.body.code, 'DELEGATE_MODEL_UNKNOWN')
-    assert.match(String(r.body.error), /DELEGATE_MODEL_UNKNOWN/)
-    assert.equal(gw.sessions.getOrCreateCalls, 0, '抛错发生在 runner 返回之前')
+  })
+
+  test('HTTP delegate:flag 未开 + 显式合法 slug 通过,仍不查 catalog', async () => {
+    _setModelCatalogClientForTests({
+      getView: () => {
+        throw new Error('catalog must NOT be consulted while flag is off')
+      },
+    } as any)
+    const prev = process.env.OC_MODEL_AUTHORITY
+    Reflect.deleteProperty(process.env, 'OC_MODEL_AUTHORITY')
+    try {
+      const gw = makeDelegateGateway()
+      for (const model of ['glm-5.3-zai', 'cursor-grok-4.6-high-fast']) {
+        gw.sessions.getOrCreateCalls = 0
+        const r = await runDelegate(gw, 'coding-assistant', {
+          goal: 'x',
+          sourceAgent: 'main',
+          model,
+        })
+        assert.equal(r.status, 200, model)
+        assert.equal(gw.sessions.getOrCreateCalls, 1, model)
+      }
+    } finally {
+      restoreFlag(prev)
+    }
   })
 
   test('HTTP delegate:flag 开 + 显式未知型号 → 400 DELEGATE_MODEL_UNKNOWN,未 spawn', async () => {
