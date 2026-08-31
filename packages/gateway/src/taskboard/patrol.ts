@@ -102,6 +102,27 @@ import { assertTransition } from './stateMachine.js'
 
 const PRIORITY_RANK: Record<TicketPriority, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
 const TERMINAL = new Set(['done', 'canceled'])
+const STAGE_PROJECT_CONTEXT_MAX_CHARS = 4000
+
+/** Compact project instructions for stage agents (no MCP skills). */
+export function formatStageProjectContext(snap: {
+  instructions?: string | null
+  skillOverlay?: readonly string[]
+}): string | null {
+  const parts: string[] = []
+  const instructions = snap.instructions?.trim()
+  if (instructions) {
+    parts.push(
+      instructions.length > STAGE_PROJECT_CONTEXT_MAX_CHARS
+        ? `${instructions.slice(0, STAGE_PROJECT_CONTEXT_MAX_CHARS)}…`
+        : instructions,
+    )
+  }
+  if (snap.skillOverlay && snap.skillOverlay.length > 0) {
+    parts.push(`项目技能索引（只读，本阶段无 MCP skills）：${snap.skillOverlay.join('、')}`)
+  }
+  return parts.length > 0 ? parts.join('\n\n') : null
+}
 
 export interface PatrolDelegateInput {
   agentId: string
@@ -535,7 +556,11 @@ export class PatrolEngine {
       hasLease: true,
       autoClose: stage.autoClose,
     })
-    const run = acquireLease(db, ticket.id, stage.id, owner, this.leaseTtlMs, {
+    const ttlMs = Math.min(
+      this.leaseTtlMs,
+      Math.max(60_000, stage.timeoutSec * 1000 + this.leaseRenewIntervalMs),
+    )
+    const run = acquireLease(db, ticket.id, stage.id, owner, ttlMs, {
       agentId: stage.agentId,
       trigger: 'patrol',
       now,
@@ -579,6 +604,18 @@ export class PatrolEngine {
       const cwd = resolveProjectCwd(spec, boardProject.id)
       if (cwd.ok) workspaceCwd = cwd.cwd
     }
+    let projectContextText: string | null = null
+    if (projectEnabled && boardProject) {
+      try {
+        const live = await loadProjectContext(boardProject.id)
+        projectContextText = formatStageProjectContext(live)
+      } catch (err) {
+        this.log('taskboard project context load failed', {
+          projectId: boardProject.id,
+          err: String(err),
+        })
+      }
+    }
     let prompt: string
     try {
       prompt = renderPrompt({
@@ -591,6 +628,7 @@ export class PatrolEngine {
           ? { key: boardProject.key, name: boardProject.name, workspace: workspaceCwd ?? null }
           : null,
         projectSlotInjected: projectEnabled,
+        projectContextText,
       }).prompt
     } catch (err) {
       await this.finishRun(db, ticket, stage, run, settings, {

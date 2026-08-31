@@ -295,12 +295,37 @@ export class TaskboardNotifier implements TaskboardNotifyHooks {
           return
         }
         if (result.kind === 'failure') {
-          // 与 onDeliver 一致:歧义失败不跨通道回退,避免微信已入队再推站内信。
           this.log('taskboard wechat notify failed', {
             outboundId: args.outboundId,
             code: result.code,
             retryable: result.retryable,
           })
+          if (!result.retryable) {
+            // 永久失败(如 WECHAT_MASTER_REJECTED):停止重试并落站内信死信。
+            // 4xx 表示 master 未入队,回退 inbox 不会双推。
+            try {
+              if (args.warning) {
+                await this.transport.createInboxMessage({
+                  title: args.title,
+                  bodyMd: args.bodyMd,
+                  level: 'warning',
+                  deliveryKey: args.outboundId,
+                })
+              } else {
+                await this.transport.postInbox({
+                  title: args.title,
+                  bodyMd: args.bodyMd,
+                  deliveryKey: args.outboundId,
+                })
+              }
+            } catch (err) {
+              this.log('taskboard notify dead-letter inbox failed', {
+                outboundId: args.outboundId,
+                err: String(err),
+              })
+            }
+            this.sent.add(args.outboundId)
+          }
           return
         }
         if (result.marked) {
