@@ -30,6 +30,7 @@ import {
   classifyVisibleOrphan,
   shouldFenceProducer,
 } from './visibleOrphan.js'
+import { registerProducerFence } from '../db/liveTurnFrames.js'
 import {
   casAdmittedToRejecting,
   casRejectingToAccepted,
@@ -634,6 +635,13 @@ async function finalizeOrphanDispatch(input: {
       return false
     }
     await client.query('COMMIT')
+    if (input.fence) {
+      registerProducerFence({
+        dispatchId: input.row.dispatch_id,
+        sessionId: input.row.session_id,
+        clientMessageId: input.row.client_message_id,
+      })
+    }
     return true
   } catch (err) {
     try { await client.query('ROLLBACK') } catch { /* ignore */ }
@@ -687,8 +695,32 @@ async function closeVisibleOrphans(
             (
               SELECT MIN(tr.first_visible_at)
                 FROM turn_traces tr
-               WHERE tr.dispatch_id = d.dispatch_id
-                 AND tr.first_visible_at IS NOT NULL
+               WHERE tr.first_visible_at IS NOT NULL
+                 AND (
+                   tr.dispatch_id = d.dispatch_id
+                   OR (
+                     -- B2: dispatch_id backfill is fire-and-forget. turn_traces
+                     -- has no client_message_id (0126+0170); isolate the turn by
+                     -- session_key suffix + first_visible in [admitted, next admit).
+                     tr.dispatch_id IS NULL
+                     AND tr.user_id = d.user_id
+                     AND (
+                       tr.session_key = d.session_id
+                       OR tr.session_key LIKE '%:' || d.session_id
+                     )
+                     AND tr.first_visible_at >= d.admitted_at
+                     AND tr.first_visible_at < COALESCE(
+                       (
+                         SELECT MIN(d2.admitted_at)
+                           FROM turn_dispatches d2
+                          WHERE d2.user_id = d.user_id
+                            AND d2.session_id = d.session_id
+                            AND d2.admitted_at > d.admitted_at
+                       ),
+                       'infinity'::timestamptz
+                     )
+                   )
+                 )
             ) AS first_visible_at,
             EXISTS (
               SELECT 1 FROM agent_containers ac

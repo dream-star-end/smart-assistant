@@ -53,6 +53,56 @@ function hasEngineLiveness(row: VisibleOrphanEvidence): boolean {
   return row.firstVisibleAtMs != null || row.persistBacklogUndetermined === true;
 }
 
+/**
+ * Session-key shape from userChatBridge CG2d:
+ * `agent:<aid>:webchat:dm:<sessionId>`. Direct equality covers tests/unknown-peer.
+ */
+export function traceSessionKeyMatchesSession(sessionKey: string, sessionId: string): boolean {
+  return sessionKey === sessionId || sessionKey.endsWith(`:${sessionId}`);
+}
+
+export type TraceFirstVisibleRow = {
+  dispatchId: string | null;
+  userId: string;
+  sessionKey: string;
+  firstVisibleAtMs: number | null;
+};
+
+export type DispatchFirstVisibleKey = {
+  dispatchId: string;
+  userId: string;
+  sessionId: string;
+  admittedAtMs: number;
+  nextAdmittedAtMs: number | null;
+};
+
+/**
+ * Pure equivalent of the closeVisibleOrphans first_visible subquery.
+ * Primary: turn_traces.dispatch_id. Fallback when backfill missed: same
+ * user + session_key, first_visible in [admitted_at, next_admitted_at).
+ * turn_traces has no client_message_id column (0126+0170); the time window
+ * is the turn isolator (see visibleOrphan.test.ts uniqueness cases).
+ */
+export function firstVisibleAtMsForDispatch(
+  traces: readonly TraceFirstVisibleRow[],
+  dispatch: DispatchFirstVisibleKey,
+): number | null {
+  let min: number | null = null;
+  for (const tr of traces) {
+    if (tr.firstVisibleAtMs == null) continue;
+    const byDispatch = tr.dispatchId === dispatch.dispatchId;
+    const byFallback =
+      tr.dispatchId == null &&
+      tr.userId === dispatch.userId &&
+      traceSessionKeyMatchesSession(tr.sessionKey, dispatch.sessionId) &&
+      tr.firstVisibleAtMs >= dispatch.admittedAtMs &&
+      (dispatch.nextAdmittedAtMs === null || tr.firstVisibleAtMs < dispatch.nextAdmittedAtMs);
+    if (!byDispatch && !byFallback) continue;
+    if (min === null || tr.firstVisibleAtMs < min) min = tr.firstVisibleAtMs;
+  }
+  return min;
+}
+
 export function classifyVisibleOrphan(row: VisibleOrphanEvidence): VisibleOrphanAction {
   const quietMs = row.lastFrameAtMs === null
     ? row.nowMs - row.acceptedOrAdmittedAtMs
@@ -65,6 +115,9 @@ export function classifyVisibleOrphan(row: VisibleOrphanEvidence): VisibleOrphan
     row.tapePartsRows === row.tapePartCount;
   if (partsComplete && quietMs >= PARTS_COMPLETE_QUIET_MS) return "complete_from_frames";
   if (ageMs >= HARD_CAP_AGE_MS && quietMs >= ENGINE_DEAD_QUIET_MS) return "fence_hard_cap";
+  // OCV5-57 audit r1 B1 (captain 2026-08-31): containerRunning=false means the
+  // user has no active container, so the engine is dead. 15min terminal is
+  // correct; first_visible / persist-backlog liveness evidence does not apply.
   if (!partsComplete && quietMs >= ENGINE_DEAD_QUIET_MS && !row.containerRunning) {
     return "interrupt_tapeless";
   }

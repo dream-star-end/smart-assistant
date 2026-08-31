@@ -9,6 +9,10 @@ import { describe, test } from 'node:test'
 
 import type { Pool } from 'pg'
 import {
+  isProducerFenced,
+  resetProducerFenceForTests,
+} from '../db/liveTurnFrames.js'
+import {
   assessDispatchBilling,
   buildTurnDispatchReconcileFrame,
   DEFAULT_ACCEPTED_STUCK_FLOOR_MS,
@@ -1176,6 +1180,9 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.ok(sql, "closeVisibleOrphans scan SQL must run")
     assert.ok(sql.includes("turn_traces"), "scan must join turn_traces")
     assert.ok(sql.includes("first_visible_at"), "scan must select first_visible_at")
+    assert.ok(sql.includes("dispatch_id IS NULL"), "fallback must match traces with null dispatch_id")
+    assert.ok(sql.includes("session_key"), "fallback must match session_key")
+    assert.ok(sql.includes("admitted_at"), "fallback must bound first_visible by admitted_at")
   })
 
   test("OCV5-43 hydrate-dead engine attempts interrupt fence even if CAS misses", async () => {
@@ -1233,4 +1240,45 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.ok(!pool.writes.some((sql) => sql.includes("producer_fenced_at")))
     assert.ok(!pool.writes.some((sql) => sql.includes("visible-fallback")))
   })
+
+  test("interrupt fence COMMIT writes producer_fenced_at and terminal together", async () => {
+    resetProducerFenceForTests()
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: "tape-present",
+        tape_part_count: 3,
+        tape_parts_rows: "1",
+        last_frame_at: null,
+        first_visible_at: null,
+        admitted_at: new Date(nowMs - 15 * 60_000),
+        accepted_at: new Date(nowMs - 15 * 60_000),
+        container_running: true,
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 1)
+    assert.ok(pool.writes.includes("COMMIT"))
+    assert.ok(pool.writes.some((sql) => sql.includes("producer_fenced_at")))
+    assert.ok(pool.writes.some((sql) => sql.includes("status = 'terminal'")))
+    assert.equal(
+      pool.writes.indexOf("COMMIT") >
+        Math.max(
+          pool.writes.findIndex((sql) => sql.includes("producer_fenced_at")),
+          pool.writes.findIndex((sql) => sql.includes("status = 'terminal'")),
+        ),
+      true,
+    )
+    assert.equal(isProducerFenced({
+      dispatchId: "d-vis-1",
+      sessionId: "sess-vis",
+      clientMessageId: "cm-vis",
+    }), true)
+  })
+
 })

@@ -59,20 +59,47 @@ export function recordTurnTrace(
  * 还没铸;受理成功后本函数 **fire-and-forget** 补填这两个纯展示列(RFC §2 I3)。绝不动受理主链,
  * 失败只 warn(观测挂了不能拖垮对话)。COALESCE 兜底:trace 行若尚未落(极端时序),UPDATE
  * 命中 0 行无害,下次进会话仍可靠 dispatch/usage 表定位。
+ *
+ * OCV5-57 audit r1 B2: bounded retry (3 attempts, backoff) so a single PG blip
+ * does not leave dispatch_id NULL. Still non-blocking; timers are unref'd.
  */
+export const TURN_TRACE_DISPATCH_BACKFILL_DELAYS_MS = [0, 50, 250] as const;
+
 export function updateTurnTraceDispatch(
   pool: Pool | undefined,
   warn: ((msg: string, fields?: Record<string, unknown>) => void) | undefined,
   input: { traceId: string; dispatchId: string; requestId: string },
 ): void {
   if (!pool) return;
-  void pool
-    .query(
-      `UPDATE turn_traces
-          SET dispatch_id = COALESCE(dispatch_id, $2),
-              request_id  = COALESCE(request_id, $3)
-        WHERE trace_id = $1`,
-      [input.traceId, input.dispatchId, input.requestId],
-    )
-    .catch((err) => warn?.("turn-trace dispatch backfill failed", { err: String(err) }));
+  const attempt = (index: number): void => {
+    void pool
+      .query(
+        `UPDATE turn_traces
+            SET dispatch_id = COALESCE(dispatch_id, $2),
+                request_id  = COALESCE(request_id, $3)
+          WHERE trace_id = $1`,
+        [input.traceId, input.dispatchId, input.requestId],
+      )
+      .then((result) => {
+        if ((result.rowCount ?? 0) > 0) return;
+        scheduleRetry(index, "turn-trace dispatch backfill missed");
+      })
+      .catch((err) => {
+        scheduleRetry(index, "turn-trace dispatch backfill failed", { err: String(err) });
+      });
+  };
+  const scheduleRetry = (
+    index: number,
+    message: string,
+    fields?: Record<string, unknown>,
+  ): void => {
+    const next = index + 1;
+    if (next >= TURN_TRACE_DISPATCH_BACKFILL_DELAYS_MS.length) {
+      warn?.(message, { ...fields, traceId: input.traceId, attempts: next });
+      return;
+    }
+    const timer = setTimeout(() => attempt(next), TURN_TRACE_DISPATCH_BACKFILL_DELAYS_MS[next]);
+    timer.unref?.();
+  };
+  attempt(0);
 }

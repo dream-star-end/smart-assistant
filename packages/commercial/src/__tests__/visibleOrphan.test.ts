@@ -3,6 +3,7 @@ import { describe, test } from "node:test";
 import {
   classifyVisibleOrphan,
   ENGINE_DEAD_QUIET_MS,
+  firstVisibleAtMsForDispatch,
   HARD_CAP_AGE_MS,
   PARTS_COMPLETE_QUIET_MS,
   shouldFenceProducer,
@@ -178,6 +179,67 @@ describe("classifyVisibleOrphan (rev2 B4)", () => {
         containerRunning: true,
       }),
       "skip",
+    );
+  });
+});
+
+describe("firstVisibleAtMsForDispatch (OCV5-57 B2)", () => {
+  const sessionId = "webmth73crycwcwbb";
+  const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+  const dispatch = {
+    dispatchId: "89f18ffe-c2a8-4412-9ce8-97c69f17ef22",
+    userId: "3",
+    sessionId,
+    admittedAtMs: 1_000,
+    nextAdmittedAtMs: 20_000 as number | null,
+  };
+
+  test("dispatch_id NULL but same-turn first_visible still matches", () => {
+    assert.equal(
+      firstVisibleAtMsForDispatch(
+        [{
+          dispatchId: null,
+          userId: "3",
+          sessionKey,
+          firstVisibleAtMs: 1_000 + 33_000,
+        }],
+        { ...dispatch, nextAdmittedAtMs: 1_000 + 60_000 },
+      ),
+      1_000 + 33_000,
+    );
+  });
+
+  test("another turn first_visible does not match this dispatch", () => {
+    const previousTurn = {
+      dispatchId: null,
+      userId: "3",
+      sessionKey,
+      firstVisibleAtMs: 500,
+    };
+    const laterTurn = {
+      dispatchId: null,
+      userId: "3",
+      sessionKey,
+      firstVisibleAtMs: 25_000,
+    };
+    assert.equal(
+      firstVisibleAtMsForDispatch([previousTurn, laterTurn], dispatch),
+      null,
+    );
+  });
+
+  test("other session suffix does not match", () => {
+    assert.equal(
+      firstVisibleAtMsForDispatch(
+        [{
+          dispatchId: null,
+          userId: "3",
+          sessionKey: "agent:main:webchat:dm:webmth73crycwcwbbEXTRA",
+          firstVisibleAtMs: 5_000,
+        }],
+        dispatch,
+      ),
+      null,
     );
   });
 });

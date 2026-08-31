@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { Pool } from "pg";
-import { recordTurnTrace, updateTurnTraceDispatch } from "../turnTraces.js";
+import { recordTurnTrace, TURN_TRACE_DISPATCH_BACKFILL_DELAYS_MS, updateTurnTraceDispatch } from "../turnTraces.js";
 
 const ROW = {
   traceId: "5abe495ea308943a99e853649297b1b5",
@@ -100,5 +100,45 @@ describe("recordTurnTrace", () => {
     assert.doesNotThrow(() =>
       updateTurnTraceDispatch(undefined, undefined, { traceId: "t", dispatchId: "d", requestId: "r" }),
     );
+  });
+});
+
+describe("updateTurnTraceDispatch bounded retry (OCV5-57 B2)", () => {
+  it("retries on failure then succeeds without blocking the caller", async () => {
+    const calls: number[] = [];
+    let n = 0;
+    const pool = {
+      query: () => {
+        n += 1;
+        calls.push(n);
+        if (n < 3) return Promise.reject(new Error("pg blip"));
+        return Promise.resolve({ rowCount: 1 });
+      },
+    } as unknown as Pool;
+    const warns: string[] = [];
+    updateTurnTraceDispatch(pool, (msg) => warns.push(msg), {
+      traceId: "tr-1",
+      dispatchId: "11111111-1111-4111-8111-111111111111",
+      requestId: "br-1",
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(calls.length, 3);
+    assert.deepEqual(warns, []);
+  });
+
+  it("warns after 3 failed attempts", async () => {
+    const pool = {
+      query: () => Promise.reject(new Error("pg down")),
+    } as unknown as Pool;
+    const warns: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    updateTurnTraceDispatch(pool, (msg, fields) => warns.push({ msg, fields }), {
+      traceId: "tr-2",
+      dispatchId: "11111111-1111-4111-8111-111111111111",
+      requestId: "br-1",
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(warns.length, 1);
+    assert.equal(warns[0].msg, "turn-trace dispatch backfill failed");
+    assert.equal(warns[0].fields?.attempts, 3);
   });
 });

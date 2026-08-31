@@ -163,6 +163,7 @@ import {
   HELLO_LIVE_CATCHUP_MAX_BYTES,
   liveCatchupSendDecision,
   readOpenDispatchLiveFramePayloadsAfterSeq,
+  shouldForwardLiveFrameToBrowser,
 } from "../db/liveTurnFrames.js";
 import {
   admitDurableControl,
@@ -7908,6 +7909,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       }
       const forwardCommittedFrame = (): void => {
+        if (!shouldForwardLiveFrameToBrowser({
+          sessionId: durableStampedFrame?.sessionId ?? null,
+          clientMessageId: durableStampedFrame?.clientMessageId ?? null,
+        })) {
+          return;
+        }
+
         if (
           durableStampedFrame !== null
           && durableStampedFrame.clientMessageId === null
@@ -7974,6 +7982,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         deps.persistOutboundFrame
       ) {
         const stamped = durableStampedFrame;
+        if (!shouldForwardLiveFrameToBrowser({
+          sessionId: durableSessionId,
+          clientMessageId: stamped.clientMessageId,
+        })) {
+          return;
+        }
         // Fallback for old/non-browser peers that produce stamped output before
         // sending an inbound.hello subscription.
         retainOutboundPersistQueueKey(stamped.storeKey);
