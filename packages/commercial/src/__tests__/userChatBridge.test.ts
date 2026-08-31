@@ -3868,3 +3868,95 @@ describe("userChatBridge — fenced leftover frames are not forwarded", () => {
     }
   });
 });
+
+describe("userChatBridge — first_visible persist is not permanently suppressed on one PG blip", () => {
+  const TRACE = "aa".repeat(16);
+  function visibleFrame(text: string) {
+    return JSON.stringify({
+      type: "outbound.message",
+      sessionKey: "agent:main:webchat:dm:sess-fv",
+      frameSeq: 1,
+      peer: { id: "sess-fv" },
+      traceId: TRACE,
+      blocks: [{ kind: "text", text }],
+    });
+  }
+
+  test("first reject then a later visible frame writes first_visible", async () => {
+    const portRef = { p: 0 };
+    let n = 0;
+    const trio = helloTerminalBillingTrio({ row: null, lookups: [] });
+    const innerQuery = trio.pgPool!.query.bind(trio.pgPool);
+    trio.pgPool = {
+      query: async (sql: unknown, params?: unknown[]) => {
+        const s = String(sql);
+        if (s.includes("first_visible_at") && /UPDATE/i.test(s)) {
+          n += 1;
+          if (n <= 3) throw new Error("pg blip");
+          return { rowCount: 1, rows: [] };
+        }
+        return innerQuery(sql, params);
+      },
+    } as UserChatBridgeDeps["pgPool"];
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.p, containerId: 95 }),
+      ...trio,
+    });
+    portRef.p = rig.containerPort;
+    try {
+      const token = await makeJwt("9501");
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      const containerWs = await containerOpenP;
+      containerWs.send(visibleFrame("hello-1"));
+      await new Promise((r) => setTimeout(r, 400));
+      assert.equal(n, 3, "first round exhausts handler retries");
+      containerWs.send(visibleFrame("hello-2"));
+      await new Promise((r) => setTimeout(r, 400));
+      assert.equal(n, 4, "later frame retries and succeeds");
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("continuous failure is bounded and does not query on every frame", async () => {
+    const portRef = { p: 0 };
+    let n = 0;
+    const trio = helloTerminalBillingTrio({ row: null, lookups: [] });
+    const innerQuery = trio.pgPool!.query.bind(trio.pgPool);
+    trio.pgPool = {
+      query: async (sql: unknown, params?: unknown[]) => {
+        const s = String(sql);
+        if (s.includes("first_visible_at") && /UPDATE/i.test(s)) {
+          n += 1;
+          throw new Error("pg down");
+        }
+        return innerQuery(sql, params);
+      },
+    } as UserChatBridgeDeps["pgPool"];
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.p, containerId: 96 }),
+      ...trio,
+    });
+    portRef.p = rig.containerPort;
+    try {
+      const token = await makeJwt("9601");
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      const containerWs = await containerOpenP;
+      for (let i = 0; i < 8; i++) {
+        containerWs.send(visibleFrame(`tok-${i}`));
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      assert.equal(n, 9, "3 rounds × 3 attempts, not per-frame");
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});

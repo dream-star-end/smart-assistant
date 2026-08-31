@@ -28,7 +28,9 @@ import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBack
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
   classifyVisibleOrphan,
+  firstVisibleAtMsForDispatch,
   shouldFenceProducer,
+  type TraceFirstVisibleRow,
 } from './visibleOrphan.js'
 import { registerProducerFence } from '../db/liveTurnFrames.js'
 import {
@@ -651,28 +653,84 @@ async function finalizeOrphanDispatch(input: {
   }
 }
 
+type VisibleOrphanScanRow = {
+  dispatch_id: string
+  user_id: string
+  session_id: string
+  client_message_id: string
+  status: string
+  admitted_at: Date
+  accepted_at: Date | null
+  tape_visible_at: string | null
+  tape_part_count: number | null
+  tape_id: string | null
+  tape_parts_rows: string
+  last_frame_at: Date | null
+  container_running: boolean
+}
+
+/**
+ * OCV5-57 r3 W2: one prefetch per tick instead of a correlated subquery
+ * per open dispatch. Session matching uses exact suffix (r3 W1), then
+ * firstVisibleAtMsForDispatch attributes in memory.
+ */
+async function prefetchFirstVisibleTraces(
+  pool: Pool,
+  dispatches: VisibleOrphanScanRow[],
+): Promise<TraceFirstVisibleRow[] | null> {
+  if (dispatches.length === 0) return []
+  const userIds = [...new Set(dispatches.map((d) => d.user_id))]
+  const dispatchIds = [...new Set(dispatches.map((d) => d.dispatch_id))]
+  let minAdmitted = dispatches[0]!.admitted_at
+  for (const d of dispatches) {
+    if (d.admitted_at < minAdmitted) minAdmitted = d.admitted_at
+  }
+  try {
+    const result = await pool.query<{
+      dispatch_id: string | null
+      user_id: string
+      session_key: string
+      first_visible_at: Date | null
+    }>(
+      `SELECT -- firstVisiblePrefetch
+              tr.dispatch_id::text AS dispatch_id,
+              tr.user_id::text AS user_id,
+              tr.session_key,
+              tr.first_visible_at
+         FROM turn_traces tr
+        WHERE tr.first_visible_at IS NOT NULL
+          AND tr.dispatch_id = ANY($1::uuid[])
+        UNION ALL
+        SELECT tr.dispatch_id::text,
+               tr.user_id::text,
+               tr.session_key,
+               tr.first_visible_at
+          FROM turn_traces tr
+         WHERE tr.first_visible_at IS NOT NULL
+           AND tr.dispatch_id IS NULL
+           AND tr.user_id = ANY($2::bigint[])
+           AND tr.first_visible_at >= $3`,
+      [dispatchIds, userIds, minAdmitted],
+    )
+    return result.rows.map((row) => ({
+      dispatchId: row.dispatch_id,
+      userId: row.user_id,
+      sessionKey: row.session_key,
+      firstVisibleAtMs: row.first_visible_at ? row.first_visible_at.getTime() : null,
+    }))
+  } catch {
+    // Conservative: skip this tick rather than classify without liveness evidence.
+    return null
+  }
+}
+
 async function closeVisibleOrphans(
   deps: TurnDispatchReconcilerDeps,
   nowMs: number,
   limit: number,
 ): Promise<number> {
   const scanLimit = Math.min(200, Math.max(limit * 4, limit))
-  const queryVisible = async (offset: number) => deps.pool.query<{
-    dispatch_id: string
-    user_id: string
-    session_id: string
-    client_message_id: string
-    status: string
-    admitted_at: Date
-    accepted_at: Date | null
-    tape_visible_at: string | null
-    tape_part_count: number | null
-    tape_id: string | null
-    tape_parts_rows: string
-    last_frame_at: Date | null
-    first_visible_at: Date | null
-    container_running: boolean
-  }>(
+  const queryVisible = async (offset: number) => deps.pool.query<VisibleOrphanScanRow>(
     `SELECT -- closeVisibleOrphans
             d.dispatch_id, d.user_id::text AS user_id, d.session_id, d.client_message_id,
             d.status, d.admitted_at, d.accepted_at,
@@ -692,30 +750,6 @@ async function closeVisibleOrphans(
                 JOIN client_session_live_frames f ON f.stream_key = s.stream_key
                WHERE s.dispatch_id = d.dispatch_id
             ) AS last_frame_at,
-            (
-              SELECT MIN(tr.first_visible_at)
-                FROM turn_traces tr
-               WHERE tr.first_visible_at IS NOT NULL
-                 AND (
-                   tr.dispatch_id = d.dispatch_id
-                   OR (
-                     -- B2 fallback, audit r2 conservative share:
-                     -- turn_traces has no client_message_id. An exclusive
-                     -- [admitted, next admit) window mis-assigned a late
-                     -- first_visible onto the later overlapping turn
-                     -- (A@1000, B@2000, visible@3000 → killed live A).
-                     -- Prefer crediting every still-open dispatch in the
-                     -- session with admitted_at <= first_visible ("宁多等勿误杀").
-                     tr.dispatch_id IS NULL
-                     AND tr.user_id = d.user_id
-                     AND (
-                       tr.session_key = d.session_id
-                       OR tr.session_key LIKE '%:' || d.session_id
-                     )
-                     AND tr.first_visible_at >= d.admitted_at
-                   )
-                 )
-            ) AS first_visible_at,
             EXISTS (
               SELECT 1 FROM agent_containers ac
                WHERE ac.user_id = d.user_id AND ac.state = 'active'
@@ -734,6 +768,8 @@ async function closeVisibleOrphans(
   }
   if (rows.rows.length < scanLimit) visibleOrphanScanOffset = 0
   else visibleOrphanScanOffset += rows.rows.length
+  const traces = await prefetchFirstVisibleTraces(deps.pool, rows.rows)
+  if (traces === null) return 0
   let closed = 0
   for (const row of rows.rows) {
     const action = classifyVisibleOrphan({
@@ -741,7 +777,12 @@ async function closeVisibleOrphans(
       tapePartCount: row.tape_part_count,
       tapePartsRows: Number(row.tape_parts_rows ?? '0'),
       lastFrameAtMs: row.last_frame_at ? row.last_frame_at.getTime() : null,
-      firstVisibleAtMs: row.first_visible_at ? row.first_visible_at.getTime() : null,
+      firstVisibleAtMs: firstVisibleAtMsForDispatch(traces, {
+        dispatchId: row.dispatch_id,
+        userId: row.user_id,
+        sessionId: row.session_id,
+        admittedAtMs: row.admitted_at.getTime(),
+      }),
       persistBacklogUndetermined: false,
       acceptedOrAdmittedAtMs: (row.accepted_at ?? row.admitted_at).getTime(),
       containerRunning: row.container_running === true,

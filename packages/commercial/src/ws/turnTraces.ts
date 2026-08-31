@@ -22,6 +22,44 @@ export interface TurnTraceRow {
   clientBuild?: string | null;
 }
 
+/**
+ * OCV5-57 audit r3: INSERT and dispatch-id backfill share the same bounded
+ * backoff so a single PG blip does not drop the row. Timers are unref'd.
+ * ON CONFLICT DO NOTHING rowCount=0 is success (row already exists).
+ */
+export const TURN_TRACE_WRITE_RETRY_DELAYS_MS = [0, 50, 250] as const;
+export const TURN_TRACE_DISPATCH_BACKFILL_DELAYS_MS = TURN_TRACE_WRITE_RETRY_DELAYS_MS;
+
+function retryPoolWrite(opts: {
+  delays: readonly number[];
+  run: () => Promise<{ rowCount?: number | null }>;
+  /** When true, rowCount=0 schedules another attempt (UPDATE miss). INSERT conflict is success. */
+  retryOnEmpty: boolean;
+  onDone: (ok: boolean, err: unknown | undefined, attempts: number) => void;
+}): void {
+  const attempt = (index: number): void => {
+    void opts.run()
+      .then((result) => {
+        if (!opts.retryOnEmpty || (result.rowCount ?? 0) > 0) {
+          opts.onDone(true, undefined, index + 1);
+          return;
+        }
+        schedule(index, undefined);
+      })
+      .catch((err) => schedule(index, err));
+  };
+  const schedule = (index: number, err: unknown | undefined): void => {
+    const next = index + 1;
+    if (next >= opts.delays.length) {
+      opts.onDone(false, err, next);
+      return;
+    }
+    const timer = setTimeout(() => attempt(next), opts.delays[next]);
+    timer.unref?.();
+  };
+  attempt(0);
+}
+
 export function recordTurnTrace(
   pool: Pool | undefined,
   warn: ((msg: string, fields?: Record<string, unknown>) => void) | undefined,
@@ -29,8 +67,10 @@ export function recordTurnTrace(
 ): void {
   if (!pool) return;
   const version = controlPlaneIdentity();
-  void pool
-    .query(
+  retryPoolWrite({
+    delays: TURN_TRACE_WRITE_RETRY_DELAYS_MS,
+    retryOnEmpty: false,
+    run: () => pool.query(
       `INSERT INTO turn_traces
          (trace_id,user_id,session_key,agent_id,model,dispatch_id,request_id,
           control_plane_release,control_plane_commit,bundle_rev,client_build)
@@ -49,9 +89,12 @@ export function recordTurnTrace(
         row.bundleRev ?? null,
         row.clientBuild ?? null,
       ],
-    )
-    .catch((err) => warn?.("turn-trace record failed", { err: String(err) }));
-
+    ),
+    onDone: (ok, err, attempts) => {
+      if (ok) return;
+      warn?.("turn-trace record failed", { err: String(err ?? "exhausted"), attempts });
+    },
+  });
 }
 
 /**
@@ -60,46 +103,31 @@ export function recordTurnTrace(
  * 失败只 warn(观测挂了不能拖垮对话)。COALESCE 兜底:trace 行若尚未落(极端时序),UPDATE
  * 命中 0 行无害,下次进会话仍可靠 dispatch/usage 表定位。
  *
- * OCV5-57 audit r1 B2: bounded retry (3 attempts, backoff) so a single PG blip
- * does not leave dispatch_id NULL. Still non-blocking; timers are unref'd.
+ * OCV5-57 audit r1 B2 / r3: bounded retry (3 attempts, backoff) on both
+ * empty rowCount and thrown PG errors. Still non-blocking; timers are unref'd.
  */
-export const TURN_TRACE_DISPATCH_BACKFILL_DELAYS_MS = [0, 50, 250] as const;
-
 export function updateTurnTraceDispatch(
   pool: Pool | undefined,
   warn: ((msg: string, fields?: Record<string, unknown>) => void) | undefined,
   input: { traceId: string; dispatchId: string; requestId: string },
 ): void {
   if (!pool) return;
-  const attempt = (index: number): void => {
-    void pool
-      .query(
-        `UPDATE turn_traces
-            SET dispatch_id = COALESCE(dispatch_id, $2),
-                request_id  = COALESCE(request_id, $3)
-          WHERE trace_id = $1`,
-        [input.traceId, input.dispatchId, input.requestId],
-      )
-      .then((result) => {
-        if ((result.rowCount ?? 0) > 0) return;
-        scheduleRetry(index, "turn-trace dispatch backfill missed");
-      })
-      .catch((err) => {
-        scheduleRetry(index, "turn-trace dispatch backfill failed", { err: String(err) });
-      });
-  };
-  const scheduleRetry = (
-    index: number,
-    message: string,
-    fields?: Record<string, unknown>,
-  ): void => {
-    const next = index + 1;
-    if (next >= TURN_TRACE_DISPATCH_BACKFILL_DELAYS_MS.length) {
-      warn?.(message, { ...fields, traceId: input.traceId, attempts: next });
-      return;
-    }
-    const timer = setTimeout(() => attempt(next), TURN_TRACE_DISPATCH_BACKFILL_DELAYS_MS[next]);
-    timer.unref?.();
-  };
-  attempt(0);
+  retryPoolWrite({
+    delays: TURN_TRACE_DISPATCH_BACKFILL_DELAYS_MS,
+    retryOnEmpty: true,
+    run: () => pool.query(
+      `UPDATE turn_traces
+          SET dispatch_id = COALESCE(dispatch_id, $2),
+              request_id  = COALESCE(request_id, $3)
+        WHERE trace_id = $1`,
+      [input.traceId, input.dispatchId, input.requestId],
+    ),
+    onDone: (ok, err, attempts) => {
+      if (ok) return;
+      warn?.(
+        err ? "turn-trace dispatch backfill failed" : "turn-trace dispatch backfill missed",
+        { err: err !== undefined ? String(err) : undefined, traceId: input.traceId, attempts },
+      );
+    },
+  });
 }

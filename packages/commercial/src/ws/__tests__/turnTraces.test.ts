@@ -52,14 +52,37 @@ describe("recordTurnTrace", () => {
     assert.doesNotThrow(() => recordTurnTrace(undefined, undefined, ROW));
   });
 
-  it("insert 失败 → 只 warn 不抛(观测面不拖垮对话面)", async () => {
+  it("insert 失败耗尽 3 次 → 只 warn 不抛(观测面不拖垮对话面)", async () => {
+    let n = 0;
+    const warns: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const pool = {
+      query: () => {
+        n += 1;
+        return Promise.reject(new Error("pg down"));
+      },
+    } as unknown as Pool;
+    recordTurnTrace(pool, (msg, fields) => warns.push({ msg, fields }), ROW);
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(n, TURN_TRACE_DISPATCH_BACKFILL_DELAYS_MS.length);
+    assert.equal(warns.length, 1);
+    assert.equal(warns[0].msg, "turn-trace record failed");
+    assert.equal(warns[0].fields?.attempts, 3);
+  });
+
+  it("insert 首次 reject 随后成功 → 最终落库且不 warn", async () => {
+    let n = 0;
     const warns: string[] = [];
     const pool = {
-      query: () => Promise.reject(new Error("pg down")),
+      query: () => {
+        n += 1;
+        if (n === 1) return Promise.reject(new Error("pg blip"));
+        return Promise.resolve({ rows: [] });
+      },
     } as unknown as Pool;
     recordTurnTrace(pool, (msg) => warns.push(msg), ROW);
-    await new Promise((r) => setImmediate(r));
-    assert.deepEqual(warns, ["turn-trace record failed"]);
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(n, 2);
+    assert.deepEqual(warns, []);
   });
 
   it("agentId/model 缺省 → 落 NULL", async () => {

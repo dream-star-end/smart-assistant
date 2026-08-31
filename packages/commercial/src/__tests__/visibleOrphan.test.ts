@@ -249,4 +249,24 @@ describe("firstVisibleAtMsForDispatch (OCV5-57 B2)", () => {
       null,
     );
   });
+
+  test("session_id containing underscore does not LIKE-match a sibling (OCV5-57 r3 W1)", () => {
+    const sid = "sess_001";
+    const d = { ...dispatch, sessionId: sid, admittedAtMs: 1_000 };
+    const sibling = {
+      dispatchId: null,
+      userId: "3",
+      sessionKey: "agent:main:webchat:dm:sessX001",
+      firstVisibleAtMs: 5_000,
+    };
+    const exact = {
+      dispatchId: null,
+      userId: "3",
+      sessionKey: `agent:main:webchat:dm:${sid}`,
+      firstVisibleAtMs: 5_000,
+    };
+    assert.equal(firstVisibleAtMsForDispatch([sibling], d), null, "'_' is not a SQL LIKE wildcard here");
+    assert.equal(firstVisibleAtMsForDispatch([exact], d), 5_000);
+    assert.equal(firstVisibleAtMsForDispatch([exact], { ...d, sessionId: sid }), 5_000);
+  });
 });
