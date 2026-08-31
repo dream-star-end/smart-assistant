@@ -17,10 +17,11 @@
 import { Check, ChevronRight, Clock, Users, X } from "lucide-react";
 import { memo, useEffect, useState } from "react";
 import { type ChatMessage, isServerAuthoredRow } from "../../lib/chat/model";
-import { agentTerminalStatus, childSignature, reviewVerdictBadge } from "../../lib/chat/render";
+import { agentTerminalStatus, reviewVerdictBadge } from "../../lib/chat/render";
 import { cn, groupDigits } from "../../lib/utils";
 import { Badge, Spinner } from "../ui";
-import { ChildBlockView, ProgressivePlainText } from "./AgentGroupCard";
+import { ProgressivePlainText } from "./AgentGroupCard";
+import { DelegateProcessList } from "./delegateProcessList";
 import { agentDisplayName } from "./agentNames";
 import { TokenUsageBadge, addTokenUsage, delegateTokenUsage } from "./tokenUsage";
 
@@ -49,7 +50,6 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
   // 审查裁决徽记:仅隐藏审查员行返回非 null(PASS/未通过),与执行态徽记并列展示。
   const verdict = reviewVerdictBadge(msg);
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  const [visibleChildren, setVisibleChildren] = useState(100);
   const open = userOpen ?? running;
   const children = msg.childBlocks ?? [];
   const name = memberName(msg, idx);
@@ -109,15 +109,15 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
       </button>
 
       {open && (
-        <div className="space-y-2 border-t border-border/70 px-3 py-2.5">
+        <div className="border-t border-border/70">
           {children.length === 0 && running && (
-            <div className="flex items-center gap-2 text-[12px] text-faint">
+            <div className="flex items-center gap-2 px-3 py-2.5 text-[12px] text-faint">
               <Spinner size={11} /> 启动中…
             </div>
           )}
           {/* 无 childBlocks 的终态行仍展示其结果摘要。 */}
           {terminalNoChildren && (msg._resultPreview || isServerRow) && (
-            <div className="space-y-1.5">
+            <div className="space-y-1.5 px-3 py-2.5">
               {msg._resultPreview && (
                 <ProgressivePlainText
                   text={msg._resultPreview}
@@ -126,23 +126,7 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
               )}
             </div>
           )}
-          {children.slice(0, visibleChildren).map((ch, i) => (
-            <ChildBlockView
-              key={`${i}-${ch.blockId ?? ch.kind}`}
-              child={ch}
-              sig={childSignature(ch)}
-              tokenUsage={tokenUsage}
-            />
-          ))}
-          {visibleChildren < children.length && (
-            <button
-              type="button"
-              onClick={() => setVisibleChildren((value) => value + 100)}
-              className="mx-auto block rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
-            >
-              继续加载过程（还有 {children.length - visibleChildren} 条）
-            </button>
-          )}
+          {children.length > 0 && <DelegateProcessList childBlocks={children} />}
         </div>
       )}
 

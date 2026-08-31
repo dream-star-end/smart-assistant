@@ -79,6 +79,11 @@ describe("resolveToolMeta 图标/标签解析 (P5)", () => {
     expect(resolveToolMeta("TaskOutput").label).toBe("子任务结果");
     expect(resolveToolMeta("EnterPlanMode").label).toBe("进入计划模式");
   });
+  test("TaskOutput 带 task_ids / task_id → 等待输出", () => {
+    expect(resolveToolMeta("TaskOutput", { task_ids: ["call-7fc87448-abc"] }).label).toBe("等待输出");
+    expect(resolveToolMeta("TaskOutput", { task_id: "14441" }).label).toBe("等待输出");
+    expect(resolveToolMeta("TaskOutput", { description: "跑子任务" }).label).toBe("子任务结果");
+  });
 });
 
 describe("toolSummary 摘要 (P5)", () => {
