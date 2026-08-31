@@ -40,6 +40,10 @@ import {
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
 import {
+  registerProducerFence,
+  resetProducerFenceForTests,
+} from "../db/liveTurnFrames.js";
+import {
   appendScanSciPaperIntentHintToFrame,
   detectScanSciPaperIntent,
   SCANSCI_PAPER_HINT_MARKER,
@@ -3816,5 +3820,51 @@ describe("inbound turn identity is frozen onto every parsed-turn error exit", ()
     assert.match(source, /maxFrameBytes}`,[\s\S]{0,20}ccbTurnIdentity/);
     assert.match(source, /"internal error", ccbTurnIdentity/);
     assert.doesNotMatch(source, /firstSession\(\)/);
+  });
+});
+
+describe("userChatBridge — fenced leftover frames are not forwarded", () => {
+  test("container stamped frame with fenced clientMessageId never reaches user websocket", async () => {
+    resetProducerFenceForTests();
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.p, containerId: 91 }),
+    });
+    portRef.p = rig.containerPort;
+    try {
+      const token = await makeJwt("8801");
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      const containerWs = await containerOpenP;
+      const seen: string[] = [];
+      ws.on("message", (data) => {
+        seen.push(typeof data === "string" ? data : Buffer.from(data as Buffer).toString("utf8"));
+      });
+      registerProducerFence({
+        dispatchId: "11111111-1111-4111-8111-111111111111",
+        sessionId: "sess-fence",
+        clientMessageId: "cm-fence-1",
+      });
+      containerWs.send(JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sess-fence",
+        frameSeq: 1,
+        clientMessageId: "cm-fence-1",
+        peer: { id: "sess-fence" },
+        blocks: [{ kind: "text", text: "should-not-forward" }],
+      }));
+      await new Promise((r) => setTimeout(r, 200));
+      assert.equal(
+        seen.some((row) => row.includes("should-not-forward")),
+        false,
+        "fenced leftover must not reach the user websocket",
+      );
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      resetProducerFenceForTests();
+      await stopRig(rig);
+    }
   });
 });

@@ -216,16 +216,23 @@ describe("firstVisibleAtMsForDispatch (OCV5-57 B2)", () => {
       sessionKey,
       firstVisibleAtMs: 500,
     };
-    const laterTurn = {
+    assert.equal(
+      firstVisibleAtMsForDispatch([previousTurn], dispatch),
+      null,
+    );
+  });
+
+  test("overlapping admits share a late first_visible (auditor A@1000 B@2000 vis@3000)", () => {
+    const late = {
       dispatchId: null,
       userId: "3",
       sessionKey,
-      firstVisibleAtMs: 25_000,
+      firstVisibleAtMs: 3_000,
     };
-    assert.equal(
-      firstVisibleAtMsForDispatch([previousTurn, laterTurn], dispatch),
-      null,
-    );
+    const a = { ...dispatch, dispatchId: "disp-a", admittedAtMs: 1_000, nextAdmittedAtMs: 2_000 };
+    const b = { ...dispatch, dispatchId: "disp-b", admittedAtMs: 2_000, nextAdmittedAtMs: null };
+    assert.equal(firstVisibleAtMsForDispatch([late], a), 3_000, "live A must keep the evidence");
+    assert.equal(firstVisibleAtMsForDispatch([late], b), 3_000, "overlapping B is also not killed");
   });
 
   test("other session suffix does not match", () => {

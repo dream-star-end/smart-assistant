@@ -699,9 +699,13 @@ async function closeVisibleOrphans(
                  AND (
                    tr.dispatch_id = d.dispatch_id
                    OR (
-                     -- B2: dispatch_id backfill is fire-and-forget. turn_traces
-                     -- has no client_message_id (0126+0170); isolate the turn by
-                     -- session_key suffix + first_visible in [admitted, next admit).
+                     -- B2 fallback, audit r2 conservative share:
+                     -- turn_traces has no client_message_id. An exclusive
+                     -- [admitted, next admit) window mis-assigned a late
+                     -- first_visible onto the later overlapping turn
+                     -- (A@1000, B@2000, visible@3000 → killed live A).
+                     -- Prefer crediting every still-open dispatch in the
+                     -- session with admitted_at <= first_visible ("宁多等勿误杀").
                      tr.dispatch_id IS NULL
                      AND tr.user_id = d.user_id
                      AND (
@@ -709,16 +713,6 @@ async function closeVisibleOrphans(
                        OR tr.session_key LIKE '%:' || d.session_id
                      )
                      AND tr.first_visible_at >= d.admitted_at
-                     AND tr.first_visible_at < COALESCE(
-                       (
-                         SELECT MIN(d2.admitted_at)
-                           FROM turn_dispatches d2
-                          WHERE d2.user_id = d.user_id
-                            AND d2.session_id = d.session_id
-                            AND d2.admitted_at > d.admitted_at
-                       ),
-                       'infinity'::timestamptz
-                     )
                    )
                  )
             ) AS first_visible_at,

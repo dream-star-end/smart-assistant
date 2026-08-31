@@ -184,17 +184,28 @@ export function extractFirstVisibleAttribution(
 export function recordTurnFirstVisible(
   pool: Pool | undefined,
   warn: ((message: string, fields?: Record<string, unknown>) => void) | undefined,
-  input: { traceId: string; kind: FirstVisibleKind },
+  input: { traceId: string; kind: FirstVisibleKind; dispatchId?: string | null },
 ): void {
   if (!pool || !/^[0-9a-f]{32}$/.test(input.traceId)) return;
+  const dispatchId =
+    typeof input.dispatchId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.dispatchId)
+      ? input.dispatchId
+      : null;
   const attempt = async (remaining: number): Promise<void> => {
     try {
       const result = await pool.query(
-        `UPDATE turn_traces
-            SET first_visible_at=COALESCE(first_visible_at,NOW()),
-                first_visible_kind=COALESCE(first_visible_kind,$2)
-          WHERE trace_id=$1`,
-        [input.traceId, input.kind],
+        dispatchId
+          ? `UPDATE turn_traces
+                SET first_visible_at=COALESCE(first_visible_at,NOW()),
+                    first_visible_kind=COALESCE(first_visible_kind,$2),
+                    dispatch_id=COALESCE(dispatch_id,$3::uuid)
+              WHERE trace_id=$1`
+          : `UPDATE turn_traces
+                SET first_visible_at=COALESCE(first_visible_at,NOW()),
+                    first_visible_kind=COALESCE(first_visible_kind,$2)
+              WHERE trace_id=$1`,
+        dispatchId ? [input.traceId, input.kind, dispatchId] : [input.traceId, input.kind],
       );
       if ((result.rowCount ?? 0) > 0 || remaining <= 0) return;
       const timer = setTimeout(() => { void attempt(remaining - 1); }, remaining === 2 ? 50 : 250);

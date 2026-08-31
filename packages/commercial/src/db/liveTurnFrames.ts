@@ -265,7 +265,6 @@ export async function persistGatewayLiveFrame(
         ).rows[0] ?? null;
     if (
       dispatch !== null &&
-      dispatch.status === "terminal" &&
       dispatch.producer_fenced_at != null &&
       input.clientMessageId !== null
     ) {

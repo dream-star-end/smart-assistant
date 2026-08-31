@@ -73,15 +73,19 @@ export type DispatchFirstVisibleKey = {
   userId: string;
   sessionId: string;
   admittedAtMs: number;
-  nextAdmittedAtMs: number | null;
+  /**
+   * Exclusive upper bound withdrawn in audit r2. Overlapping open turns
+   * share NULL-dispatch first_visible evidence (prefer wait over false-kill).
+   */
+  nextAdmittedAtMs?: number | null;
 };
 
 /**
  * Pure equivalent of the closeVisibleOrphans first_visible subquery.
  * Primary: turn_traces.dispatch_id. Fallback when backfill missed: same
- * user + session_key, first_visible in [admitted_at, next_admitted_at).
- * turn_traces has no client_message_id column (0126+0170); the time window
- * is the turn isolator (see visibleOrphan.test.ts uniqueness cases).
+ * user + session_key and first_visible_at >= admitted_at, with NO exclusive
+ * next-admit cap. If two open turns overlap, both receive the evidence
+ * ("宁多等勿误杀"). turn_traces has no client_message_id (0126+0170).
  */
 export function firstVisibleAtMsForDispatch(
   traces: readonly TraceFirstVisibleRow[],
@@ -95,8 +99,7 @@ export function firstVisibleAtMsForDispatch(
       tr.dispatchId == null &&
       tr.userId === dispatch.userId &&
       traceSessionKeyMatchesSession(tr.sessionKey, dispatch.sessionId) &&
-      tr.firstVisibleAtMs >= dispatch.admittedAtMs &&
-      (dispatch.nextAdmittedAtMs === null || tr.firstVisibleAtMs < dispatch.nextAdmittedAtMs);
+      tr.firstVisibleAtMs >= dispatch.admittedAtMs;
     if (!byDispatch && !byFallback) continue;
     if (min === null || tr.firstVisibleAtMs < min) min = tr.firstVisibleAtMs;
   }

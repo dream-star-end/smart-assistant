@@ -139,4 +139,50 @@ describe("producer fence registry", () => {
       clientMessageId: "cm-late",
     }), false);
   });
+
+  test("fenced manual_reconcile still drops after registry clear (restart)", async () => {
+    resetProducerFenceForTests();
+    const sqls: string[] = [];
+    const pool = {
+      async connect() {
+        return {
+          async query(sql: string) {
+            const s = sql.replace(/\s+/g, " ").trim();
+            sqls.push(s);
+            if (s === "BEGIN" || s === "COMMIT" || s === "ROLLBACK") {
+              return { rows: [], rowCount: 0 };
+            }
+            if (s.includes("FROM turn_dispatches") && s.includes("FOR UPDATE")) {
+              return {
+                rows: [{
+                  dispatch_id: "11111111-1111-4111-8111-111111111111",
+                  attempt_no: 1,
+                  status: "manual_reconcile",
+                  producer_fenced_at: new Date(),
+                }],
+                rowCount: 1,
+              };
+            }
+            throw new Error(`unexpected sql ${s}`);
+          },
+          release() {},
+        };
+      },
+    } as unknown as Pool;
+    await persistGatewayLiveFrame(pool, {
+      uid: 3n,
+      sessionId: "sess-a",
+      clientMessageId: "cm-late-mr",
+      agentContainerId: 141,
+      sessionKey: "agent:main:webchat:dm:sess-a",
+      frameSeq: 12,
+      payload: '{"type":"outbound.message","frameSeq":12}',
+    });
+    assert.equal(sqls.some((s) => s.includes("INSERT INTO client_session_live_frames")), false);
+    assert.equal(shouldForwardLiveFrameToBrowser({
+      sessionId: "sess-a",
+      clientMessageId: "cm-late-mr",
+    }), false);
+  });
+
 });

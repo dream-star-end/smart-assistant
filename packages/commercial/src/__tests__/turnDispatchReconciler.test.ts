@@ -1281,4 +1281,37 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     }), true)
   })
 
+
+  test("overlapping admits: late first_visible skips both A and B", async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [
+        orphanRow({
+          dispatch_id: "disp-a",
+          last_frame_at: null,
+          first_visible_at: new Date(nowMs - 12 * 60_000),
+          admitted_at: new Date(nowMs - 15 * 60_000),
+          accepted_at: new Date(nowMs - 15 * 60_000),
+          container_running: true,
+        }),
+        orphanRow({
+          dispatch_id: "disp-b",
+          last_frame_at: null,
+          first_visible_at: new Date(nowMs - 12 * 60_000),
+          admitted_at: new Date(nowMs - 13 * 60_000),
+          accepted_at: new Date(nowMs - 13 * 60_000),
+          container_running: true,
+        }),
+      ],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 0)
+    assert.ok(!pool.writes.includes("COMMIT"))
+  })
+
 })

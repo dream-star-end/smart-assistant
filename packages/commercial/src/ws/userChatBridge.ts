@@ -163,6 +163,7 @@ import {
   HELLO_LIVE_CATCHUP_MAX_BYTES,
   liveCatchupSendDecision,
   readOpenDispatchLiveFramePayloadsAfterSeq,
+  noteProducerFenceDrop,
   shouldForwardLiveFrameToBrowser,
 } from "../db/liveTurnFrames.js";
 import {
@@ -7742,11 +7743,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           firstContainerFrameAtMs = Date.now();
           metrics.onTtft?.(uid, ttftKind, (firstContainerFrameAtMs - firstUserFrameAtMs) / 1000);
         }
-        recordTurnFirstVisible(
-          deps.pgPool,
-          (message, fields) => bridgeLog?.warn(message, fields),
-          firstVisible,
-        );
+        {
+          let firstVisibleDispatchId: string | null = null;
+          if (parsedMasterFrameCandidate && typeof parsedMasterFrameCandidate === "object") {
+            const cmid = (parsedMasterFrameCandidate as { clientMessageId?: unknown }).clientMessageId;
+            if (isClientMessageId(cmid)) {
+              firstVisibleDispatchId =
+                admittedDispatches.get(cmid)?.dispatchId
+                ?? enrichmentDispatches.get(cmid)?.record.dispatchId
+                ?? null;
+            }
+          }
+          recordTurnFirstVisible(
+            deps.pgPool,
+            (message, fields) => bridgeLog?.warn(message, fields),
+            { ...firstVisible, dispatchId: firstVisibleDispatchId },
+          );
+        }
       }
       responseMilestoneTracker.observe(
         parsedMasterFrameCandidate,
@@ -7913,6 +7926,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           sessionId: durableStampedFrame?.sessionId ?? null,
           clientMessageId: durableStampedFrame?.clientMessageId ?? null,
         })) {
+          noteProducerFenceDrop("bridge-forward");
           return;
         }
 
@@ -7986,6 +8000,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           sessionId: durableSessionId,
           clientMessageId: stamped.clientMessageId,
         })) {
+          noteProducerFenceDrop("bridge-enqueue");
           return;
         }
         // Fallback for old/non-browser peers that produce stamped output before
