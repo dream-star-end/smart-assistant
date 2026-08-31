@@ -171,7 +171,7 @@ describe("assertFlavorForMigrate", () => {
         },
         async () => {
           queried = true;
-          return "openclaude";
+          return { dbName: "openclaude", dbProfile: "v5-selfhost" };
         },
       ),
       /cannot be upgraded/,
