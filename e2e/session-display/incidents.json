@@ -2124,7 +2124,36 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-visible-orphan-liveness.ts",
           "assertion": "OCV5-57: first_visible + zero dispatch frames must skip interrupt_tapeless"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "dispatch_id NULL but same-turn first_visible still matches"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "another turn first_visible does not match this dispatch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveTurnFrames.producerFence.test.ts",
+          "assertion": "register then drop persist and forward for same clientMessageId"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "interrupt fence COMMIT writes producer_fenced_at and terminal together"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/ws/__tests__/turnTraces.test.ts",
+          "assertion": "retries on failure then succeeds without blocking the caller"
         }
+      ],
+      "coverageCommits": [
+        "3e80a4a7",
+        "568fb53b"
       ]
     }
   ]
