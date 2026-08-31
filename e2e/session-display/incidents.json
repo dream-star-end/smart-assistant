@@ -2149,11 +2149,32 @@
           "layer": "unit",
           "path": "packages/commercial/src/ws/__tests__/turnTraces.test.ts",
           "assertion": "retries on failure then succeeds without blocking the caller"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "overlapping admits share a late first_visible (auditor A@1000 B@2000 vis@3000)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveTurnFrames.producerFence.test.ts",
+          "assertion": "fenced manual_reconcile still drops after registry clear (restart)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnFirstVisible.test.ts",
+          "assertion": "writes dispatch_id in the same UPDATE when provided"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "container stamped frame with fenced clientMessageId never reaches user websocket"
         }
       ],
       "coverageCommits": [
         "3e80a4a7",
-        "568fb53b"
+        "568fb53b",
+        "1c7e4aae"
       ]
     }
   ]
