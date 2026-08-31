@@ -70,7 +70,7 @@ describe('schema / migrate', () => {
   it('建表后 user_version=5,重复 migrate 不报错不改版本', () => {
     const { db } = freshDb()
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
-    assert.equal(TASKBOARD_SCHEMA_VERSION, 9)
+    assert.equal(TASKBOARD_SCHEMA_VERSION, 10)
     migrate(db)
     migrate(db)
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
@@ -82,6 +82,9 @@ describe('schema / migrate', () => {
     const projCols = db.prepare(`PRAGMA table_info(tb_project)`).all() as Array<{ name: string }>
     assert.ok(projCols.some((c) => c.name === 'workspace_json'))
     assert.ok(projCols.some((c) => c.name === 'context_version'))
+    const ticketCols = db.prepare(`PRAGMA table_info(tb_ticket)`).all() as Array<{ name: string }>
+    assert.ok(ticketCols.some((c) => c.name === 'approved_by'))
+    assert.ok(ticketCols.some((c) => c.name === 'approved_at'))
     const tables = db
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tb_%'`)
       .all() as { name: string }[]
@@ -105,31 +108,119 @@ describe('schema / migrate', () => {
     db.close()
   })
 
-  it('v9 幂等回填 skipped 的 finished_at', () => {
-    const { db } = freshDb()
-    const project = createProject(db, { key: 'SKP', name: '跳过' })
-    const ticket = createTicket(db, {
-      projectId: project.id,
-      type: 'chore',
-      title: '旧 skip',
-      reporter: 'user:default',
-    })
-    db.prepare(
-      `INSERT INTO tb_ticket_run (
-         id, ticket_id, stage_id, agent_id, trigger, status, skip_reason,
-         started_at, finished_at, created_at
-       ) VALUES (?, ?, ?, 'stage-diagnose', 'patrol', 'skipped', 'entry_condition', ?, NULL, ?)`,
-    ).run('skip-old', ticket.id, 'stage-x', 111, 111)
+  it('v8 库顺序执行 v9 回填 skipped finished_at 与 v10 批准加列且幂等', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-tb-v8-'))
+    dirs.push(dir)
+    const path = join(dir, 'taskboard.db')
+    const raw = new Database(path)
+    raw.pragma('foreign_keys = ON')
+    raw.exec(TASKBOARD_DDL_V1)
+    raw.pragma('user_version = 8')
+    raw
+      .prepare(
+        `INSERT INTO tb_project (id, key, name, description, workspace, labels, archived_at, created_at, updated_at, next_ticket_seq)
+         VALUES ('p1', 'SKP', '跳过', NULL, NULL, '[]', NULL, 1, 1, 1)`,
+      )
+      .run()
+    raw
+      .prepare(
+        `INSERT INTO tb_ticket (
+           id, identifier, project_id, type, title, body, status, stage_id, pipeline_id,
+           priority, severity, labels, assignee, reporter, source, origin_session_key,
+           due_date, start_date, version, blocked_reason, stage_loop_count,
+           created_at, updated_at, closed_at
+         ) VALUES (
+           't1', 'SKP-1', 'p1', 'chore', '旧 skip', '', 'ready', 'stage-x', NULL,
+           'P2', NULL, '[]', NULL, 'user:default', 'human', NULL,
+           NULL, NULL, 1, NULL, 0,
+           1, 1, NULL
+         )`,
+      )
+      .run()
+    raw
+      .prepare(
+        `INSERT INTO tb_ticket_run (
+           id, ticket_id, stage_id, agent_id, trigger, status, skip_reason,
+           started_at, finished_at, created_at
+         ) VALUES ('skip-old', 't1', 'stage-x', 'stage-diagnose', 'patrol', 'skipped', 'entry_condition', ?, NULL, ?)`,
+      )
+      .run(111, 111)
+    assert.equal(
+      (raw.prepare(`SELECT finished_at AS f FROM tb_ticket_run WHERE id='skip-old'`).get() as { f: number | null }).f,
+      null,
+    )
+    const ticketColsBefore = raw.prepare(`PRAGMA table_info(tb_ticket)`).all() as Array<{ name: string }>
+    assert.ok(!ticketColsBefore.some((c) => c.name === 'approved_by'))
+    assert.ok(!ticketColsBefore.some((c) => c.name === 'approved_at'))
+    raw.close()
+
+    const db = openTaskboardDb(path)
+    const after = db.prepare(`SELECT finished_at AS f FROM tb_ticket_run WHERE id='skip-old'`).get() as { f: number }
+    assert.equal(after.f, 111)
+    const ticketCols = db.prepare(`PRAGMA table_info(tb_ticket)`).all() as Array<{ name: string }>
+    assert.ok(ticketCols.some((c) => c.name === 'approved_by'))
+    assert.ok(ticketCols.some((c) => c.name === 'approved_at'))
+    assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
+    migrate(db)
+    migrate(db)
+    assert.equal(getSchemaVersion(db), 10)
+    assert.equal(
+      (db.prepare(`SELECT finished_at AS f FROM tb_ticket_run WHERE id='skip-old'`).get() as { f: number }).f,
+      111,
+    )
+    db.close()
+  })
+
+  it('v9 库只加批准列,不重跑 skipped finished_at 回填', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-tb-v9-'))
+    dirs.push(dir)
+    const path = join(dir, 'taskboard.db')
+    const raw = new Database(path)
+    raw.pragma('foreign_keys = ON')
+    raw.exec(TASKBOARD_DDL_V1)
+    raw.pragma('user_version = 9')
+    raw
+      .prepare(
+        `INSERT INTO tb_project (id, key, name, description, workspace, labels, archived_at, created_at, updated_at, next_ticket_seq)
+         VALUES ('p1', 'SKP', '跳过', NULL, NULL, '[]', NULL, 1, 1, 1)`,
+      )
+      .run()
+    raw
+      .prepare(
+        `INSERT INTO tb_ticket (
+           id, identifier, project_id, type, title, body, status, stage_id, pipeline_id,
+           priority, severity, labels, assignee, reporter, source, origin_session_key,
+           due_date, start_date, version, blocked_reason, stage_loop_count,
+           created_at, updated_at, closed_at
+         ) VALUES (
+           't1', 'SKP-1', 'p1', 'chore', '旧 skip', '', 'ready', 'stage-x', NULL,
+           'P2', NULL, '[]', NULL, 'user:default', 'human', NULL,
+           NULL, NULL, 1, NULL, 0,
+           1, 1, NULL
+         )`,
+      )
+      .run()
+    raw
+      .prepare(
+        `INSERT INTO tb_ticket_run (
+           id, ticket_id, stage_id, agent_id, trigger, status, skip_reason,
+           started_at, finished_at, created_at
+         ) VALUES ('skip-old', 't1', 'stage-x', 'stage-diagnose', 'patrol', 'skipped', 'entry_condition', ?, NULL, ?)`,
+      )
+      .run(111, 111)
+    raw.close()
+
+    const db = openTaskboardDb(path)
     assert.equal(
       (db.prepare(`SELECT finished_at AS f FROM tb_ticket_run WHERE id='skip-old'`).get() as { f: number | null }).f,
       null,
     )
-    db.pragma('user_version = 8')
+    const ticketCols = db.prepare(`PRAGMA table_info(tb_ticket)`).all() as Array<{ name: string }>
+    assert.ok(ticketCols.some((c) => c.name === 'approved_by'))
+    assert.ok(ticketCols.some((c) => c.name === 'approved_at'))
+    assert.equal(getSchemaVersion(db), 10)
     migrate(db)
-    const after = db.prepare(`SELECT finished_at AS f FROM tb_ticket_run WHERE id='skip-old'`).get() as { f: number }
-    assert.equal(after.f, 111)
-    migrate(db)
-    assert.equal(getSchemaVersion(db), 9)
+    assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
     db.close()
   })
 
@@ -227,9 +318,7 @@ describe('schema / migrate', () => {
     const cols = db.prepare(`PRAGMA table_info(tb_pipeline_stage)`).all() as Array<{ name: string }>
     assert.ok(cols.some((c) => c.name === 'model'))
     const after = db
-      .prepare(
-        `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
-      )
+      .prepare(`SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`)
       .all() as Array<{
       id: string
       name: string
@@ -319,9 +408,7 @@ describe('schema / migrate', () => {
       )
       .run()
     const stageFpBefore = raw
-      .prepare(
-        `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
-      )
+      .prepare(`SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`)
       .all()
     const runFpBefore = raw
       .prepare(
@@ -343,9 +430,7 @@ describe('schema / migrate', () => {
       40,
     )
     const stageFpAfter = db
-      .prepare(
-        `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
-      )
+      .prepare(`SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`)
       .all()
     const runFpAfter = db
       .prepare(
@@ -354,9 +439,9 @@ describe('schema / migrate', () => {
       .all()
     assert.deepEqual(stageFpAfter, stageFpBefore)
     assert.deepEqual(runFpAfter, runFpBefore)
-    const imprecise = db
-      .prepare(`SELECT cost_imprecise FROM tb_ticket_run`)
-      .all() as Array<{ cost_imprecise: number | null }>
+    const imprecise = db.prepare(`SELECT cost_imprecise FROM tb_ticket_run`).all() as Array<{
+      cost_imprecise: number | null
+    }>
     assert.ok(imprecise.length > 0)
     assert.ok(imprecise.every((row) => row.cost_imprecise == null))
 

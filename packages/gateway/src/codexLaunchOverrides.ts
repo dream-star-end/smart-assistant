@@ -383,7 +383,7 @@ export async function buildCodexLaunchOverrides(
         'skill_search', 'skill_list', 'skill_view', 'skill_save', 'skill_delete',
         'create_reminder', 'list_reminders', 'update_reminder', 'delete_reminder',
         'send_to_agent', 'delegate_task', 'delegate_tasks', 'request_review',
-        'task_create', 'task_update', 'task_comment', 'task_list', 'task_get',
+        'task_create', 'task_update', 'task_comment', 'task_list', 'task_get', 'task_approve',
       ]
     : []
   const platformResult = await buildPromptContext({

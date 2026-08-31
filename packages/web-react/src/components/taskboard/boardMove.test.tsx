@@ -2,9 +2,9 @@ import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ComponentProps } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { ProjectScopeProvider } from '../../hooks/useProjectScope'
 import { ApiError } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
-import { ProjectScopeProvider } from '../../hooks/useProjectScope'
 import {
   type AllowedMove,
   LAST_PROJECT_STORAGE_KEY,
@@ -106,6 +106,8 @@ function sampleTicket(over: Partial<Ticket> = {}): Ticket {
     createdAt: 1,
     updatedAt: 1,
     closedAt: null,
+    approvedBy: null,
+    approvedAt: null,
     ...over,
   }
 }
@@ -188,7 +190,10 @@ function stubBoard(input: {
   vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([])
   vi.spyOn(taskboardApi, 'listTickets').mockImplementation(async (_a, q) => {
     if (q?.status === 'backlog') return { items: backlog, total: backlog.length }
-    return { items: input.list ?? [...backlog, ...inbox, ...columns.flatMap((c) => c.tickets)], total: 0 }
+    return {
+      items: input.list ?? [...backlog, ...inbox, ...columns.flatMap((c) => c.tickets)],
+      total: 0,
+    }
   })
   const getBoard = vi
     .spyOn(taskboardApi, 'getProjectBoard')
@@ -643,9 +648,15 @@ describe('旧积压视图兼容与新建单据', () => {
       status: 'backlog',
     })
     stubBoard({ backlog: [leftover], ticketType: 'bug' })
-    const moveTicket = vi.spyOn(taskboardApi, 'moveTicket').mockResolvedValue({
-      ticket: { ...leftover, status: 'ready', stageId: 's1', version: 4 },
-      move: { action: 'promote', label: '批准开工', fromStageId: null, toStageId: 's1' },
+    const approve = vi.spyOn(taskboardApi, 'approve').mockResolvedValue({
+      ok: true,
+      ticket: {
+        ...leftover,
+        status: 'ready',
+        version: 4,
+        approvedBy: 'user:default',
+        approvedAt: 2,
+      },
     })
     renderBoard({ view: 'backlog' })
     expect(await screen.findByRole('tab', { name: '任务' })).toHaveAttribute(
@@ -655,14 +666,10 @@ describe('旧积压视图兼容与新建单据', () => {
     expect(screen.queryByRole('tab', { name: /积压/ })).not.toBeInTheDocument()
     expect(await screen.findByText('遗留需求')).toBeInTheDocument()
     await act(async () => {
-      fireEvent.click(screen.getByTestId('ticket-ready'))
+      fireEvent.click(screen.getByTestId('ticket-approve'))
     })
     await waitFor(() => {
-      expect(moveTicket).toHaveBeenCalledWith(
-        auth,
-        't-feat',
-        expect.objectContaining({ toStageId: 's1' }),
-      )
+      expect(approve).toHaveBeenCalledWith(auth, 't-feat', leftover.version, undefined)
     })
   })
 

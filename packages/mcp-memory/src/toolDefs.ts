@@ -301,8 +301,7 @@ export const TOOLS = [
               },
               model: {
                 type: 'string',
-                description:
-                  '可选:该子任务的 catalog 型号,覆盖成员默认模型(同 delegate_task)。',
+                description: '可选:该子任务的 catalog 型号,覆盖成员默认模型(同 delegate_task)。',
               },
               goal: { type: 'string', description: '该子任务的目标描述' },
               context: { type: 'string', description: '传递给子 agent 的上下文信息 (可选)' },
@@ -396,7 +395,7 @@ export const TOOLS = [
       '',
       '不要传 identifier(服务端生成,返回后再用)。不要传 userId。',
       '当前对话会自动挂到单据上,卡片可点回本会话。',
-      '新建单默认 backlog(未批准),AI 不许认领;等人在面板点开工。',
+      '新建单默认 backlog(未批准),AI 不许认领。要开工时用 task_approve 显式批准,不要批量自动批准。',
     ].join('\n'),
     inputSchema: {
       type: 'object',
@@ -506,6 +505,23 @@ export const TOOLS = [
         id: { type: 'string', description: '面板返回的 identifier 或 uuid' },
       },
       required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'task_approve',
+    description: [
+      '把积压(backlog)单据显式批准为可认领(ready)。任何 agent 都可批准,但必须留痕。',
+      '只批准当前要做的那一张,禁止批量/自动批准积压队列。',
+      'id 只用面板返回的 identifier 或 uuid。expectedVersion 必填;409 时 task_get 重读后只重试一次。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '面板返回的 identifier 或 uuid' },
+        expectedVersion: { type: 'number', description: '乐观锁,来自最近一次 get/create' },
+      },
+      required: ['id', 'expectedVersion'],
       additionalProperties: false,
     },
   },
