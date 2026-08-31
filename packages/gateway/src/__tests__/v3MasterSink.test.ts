@@ -388,7 +388,18 @@ describe("attemptSend — multipart upload", () => {
     );
   });
 
-  for (const status of [400, 401, 403, 409, 413, 429, 500, 502]) {
+  test("409 is the sole fatal immutable-conflict quarantine acknowledgement", async () => {
+    // 不可变冲突重试恒失败(2026-08-31 settlement conflict 风暴),必须 fatal 而非 transient。
+    const { fetcher } = makeFetcher({ status: 409, body: "turn tape conflict" });
+    await assert.rejects(
+      () => attemptSend(PAYLOAD, { config: CFG, fetcher }),
+      (error: unknown) => error instanceof V3SinkError
+        && error.errorClass === "fatal"
+        && error.httpStatus === 409,
+    );
+  });
+
+  for (const status of [400, 401, 403, 413, 429, 500, 502]) {
     test(`${status} remains transient so staged bytes are retried`, async () => {
       const { fetcher } = makeFetcher({ status, body: "repairable" });
       await assert.rejects(

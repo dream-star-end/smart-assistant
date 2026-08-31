@@ -68,4 +68,48 @@ describe("classifyVisibleOrphan (rev2 B4)", () => {
       "converge_only",
     );
   });
+
+  test("interrupt_tapeless when engine never emitted a frame even with container running", () => {
+    // 2026-08-31 webmtd63p5mm747zh:引擎在存活容器内死亡,旧判据永远 skip。
+    assert.equal(
+      classifyVisibleOrphan({
+        ...base,
+        tapePartCount: 3,
+        tapePartsRows: 1,
+        lastFrameAtMs: null,
+        nowMs: 1_000 + ENGINE_DEAD_QUIET_MS,
+        containerRunning: true,
+      }),
+      "interrupt_tapeless",
+    );
+  });
+
+  test("skip when container running and engine has emitted frames recently", () => {
+    assert.equal(
+      classifyVisibleOrphan({
+        ...base,
+        tapePartCount: 3,
+        tapePartsRows: 1,
+        lastFrameAtMs: 500_000,
+        nowMs: 500_000 + 60_000,
+        containerRunning: true,
+      }),
+      "skip",
+    );
+  });
+
+  test("skip when container running and engine once emitted frames then went quiet", () => {
+    // 有过帧 = 引擎曾活着;中途静默可能只是长工具调用,保持保守不中断。
+    assert.equal(
+      classifyVisibleOrphan({
+        ...base,
+        tapePartCount: 3,
+        tapePartsRows: 1,
+        lastFrameAtMs: 1_000,
+        nowMs: 1_000 + ENGINE_DEAD_QUIET_MS,
+        containerRunning: true,
+      }),
+      "skip",
+    );
+  });
 });

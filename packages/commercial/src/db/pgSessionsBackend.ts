@@ -1786,6 +1786,29 @@ function replayMediaIsDurable(media: unknown[]): boolean {
  * tape while its session/dispatch transaction is still open. This is the
  * primary publication path; the table's lineage UNIQUE key makes finalize
  * ACK-loss replays harmless. */
+/** 恢复链放弃时给用户写一张可见终态卡。幂等 id = rootClientMessageId 级:
+ * 同一根消息的多次放弃判定(并发 master/重复 finalize)只落一张卡。 */
+async function appendRecoveryGiveUpTerminalCard(
+  client: PoolClient,
+  input: {
+    sessionId: string;
+    sessionUserId: string;
+    rootClientMessageId: string;
+    reason: "silent_no_progress" | "retry_exhausted";
+  },
+): Promise<void> {
+  const text = input.reason === "silent_no_progress"
+    ? "自动恢复已停止：连续多次从断点恢复都没有取得进展，为避免重复执行已暂停。请直接再发一条消息继续，或新开一个会话。"
+    : "自动恢复已停止：已达到自动恢复次数上限。请直接再发一条消息继续，或新开一个会话。";
+  await pgAppendServerAuthoredCore(client, input.sessionId, input.sessionUserId, {
+    id: `m-recovery-giveup-${input.rootClientMessageId}`,
+    role: "assistant",
+    text,
+    ts: Date.now(),
+    _source: "server",
+  });
+}
+
 async function scheduleAutomaticRecoveryForFinalizedTurn(
   client: PoolClient,
   input: {
@@ -1909,9 +1932,25 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       currentAttempt,
       terminalOutcome: status,
     });
+    // 放弃必须出声:此前这里只置 paused 就返回,前端永远停在「已发送」
+    // (2026-08-31 webmtd63p5mm747zh 实锤)。幂等 id 保证重复放弃只写一张卡。
+    await appendRecoveryGiveUpTerminalCard(client, {
+      sessionId: input.sessionId,
+      sessionUserId: input.sessionUserId,
+      rootClientMessageId,
+      reason: "silent_no_progress",
+    });
     return;
   }
-  if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) return;
+  if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) {
+    await appendRecoveryGiveUpTerminalCard(client, {
+      sessionId: input.sessionId,
+      sessionUserId: input.sessionUserId,
+      rootClientMessageId,
+      reason: "retry_exhausted",
+    });
+    return;
+  }
   const semanticRecoveryAttempt = currentAttempt + 1;
   const identity = turnRecoveryAttemptIdentity(
     input.sessionId,
@@ -4231,6 +4270,27 @@ function directTapeProcessRow(anchor: MessageLike, header: DirectTapeHeader): Me
 }
 
 /**
+ * Hydration readers run 3 correlated cost/waiver subqueries per record row, so
+ * one statement covering an entire fat session (1k+ tapes) can exceed the pool
+ * statement_timeout and kill engine-context recovery reads. Chunk by tapeId so
+ * every single statement stays bounded regardless of session size. Chunks run
+ * sequentially to avoid pool starvation; each chunk is one indexed statement.
+ */
+const HYDRATE_TAPE_ID_CHUNK = 64;
+
+async function runHydrationChunked<R>(
+  ids: string[],
+  fn: (chunk: string[]) => Promise<R[]>,
+): Promise<R[]> {
+  if (ids.length <= HYDRATE_TAPE_ID_CHUNK) return fn(ids);
+  const out: R[] = [];
+  for (let i = 0; i < ids.length; i += HYDRATE_TAPE_ID_CHUNK) {
+    out.push(...await fn(ids.slice(i, i + HYDRATE_TAPE_ID_CHUNK)));
+  }
+  return out;
+}
+
+/**
  * Exact/admin reads hydrate every physical and logical record. Browser chat
  * reads return metadata-only assistant/error locators and add one typed
  * process control before them. Mounted viewport rows fetch exact immutable
@@ -4281,17 +4341,29 @@ async function hydrateTurnTapeMessages(
     readDirectTapeHeaders(pool, sessionId, userId, completeTapeIds),
     deferTimelineNarrative
       ? Promise.resolve([] as HydratedTapeRow[])
-      : readHydratedTapeRows(
-          pool,
-          sessionId,
-          userId,
-          completeTapeIds,
-          exact ? undefined : timelineRoles,
-        ),
+      : runHydrationChunked(completeTapeIds, (chunk) =>
+          readHydratedTapeRows(
+            pool,
+            sessionId,
+            userId,
+            chunk,
+            exact ? undefined : timelineRoles,
+          )),
     deferTimelineNarrative
-      ? readDirectTapeVisibleHeads(pool, sessionId, userId, completeTapeIds)
+      ? runHydrationChunked(completeTapeIds, (chunk) =>
+          readDirectTapeVisibleHeads(pool, sessionId, userId, chunk))
       : Promise.resolve([] as DirectTapeVisibleHead[]),
-    readHydratedTapeRows(pool, sessionId, userId, rollingTapeIds, undefined, rollingRefs),
+    runHydrationChunked(rollingTapeIds, (chunk) => {
+      const chunkSet = new Set(chunk);
+      return readHydratedTapeRows(
+        pool,
+        sessionId,
+        userId,
+        chunk,
+        undefined,
+        rollingRefs.filter((ref) => chunkSet.has(ref.tapeId)),
+      );
+    }),
   ]);
   const rows = [...completeRows, ...rollingRows];
   const byKey = new Map(rows.map((row) => [`${row.tape_id}\0${row.msg_id}`, row]));
