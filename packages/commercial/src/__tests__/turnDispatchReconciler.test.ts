@@ -1178,7 +1178,7 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.ok(sql.includes("first_visible_at"), "scan must select first_visible_at")
   })
 
-  test("OCV5-43 hydrate-dead engine zero frames no first_visible still interrupts and fences", async () => {
+  test("OCV5-43 hydrate-dead engine attempts interrupt fence even if CAS misses", async () => {
     _resetVisibleOrphanScanOffset()
     const pool = makeFakePool({
       visibleOrphans: [orphanRow({
@@ -1191,6 +1191,7 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
         accepted_at: new Date(nowMs - 15 * 60_000),
         container_running: true,
       })],
+      casToTerminalMiss: true,
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -1198,10 +1199,13 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
-    assert.equal(counts.visibleOrphans, 1)
-    assert.ok(pool.writes.includes("COMMIT"))
-    assert.ok(pool.writes.some((sql) => sql.includes("producer_fenced_at")), "interrupt_tapeless must fence producer")
-    assert.ok(pool.writes.some((sql) => sql.includes("visible-fallback")))
+    assert.equal(counts.visibleOrphans, 0)
+    assert.ok(pool.writes.includes("ROLLBACK"))
+    assert.ok(!pool.writes.includes("COMMIT"))
+    assert.ok(
+      pool.attemptedWrites.some((sql) => sql.includes("producer_fenced_at")),
+      "interrupt_tapeless must attempt producer fence",
+    )
   })
 
   test("OCV5-57 first_visible plus zero dispatch frames skips and does not fence", async () => {
