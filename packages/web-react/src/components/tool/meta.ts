@@ -465,6 +465,15 @@ function ocCommandSummary(cli: OcCli, command: string): string {
   return "";
 }
 
+/** TaskOutput 在等已有后台命令（task_ids / task_id）时标「等待输出」，spawn 结果才叫「子任务结果」。 */
+export function isAwaitingBackgroundOutput(input?: Record<string, unknown> | null): boolean {
+  if (!input) return false;
+  if (typeof input.task_id === "string" && input.task_id.trim()) return true;
+  if (typeof input.task_id === "number" && Number.isFinite(input.task_id)) return true;
+  const ids = input.task_ids;
+  return Array.isArray(ids) && ids.some((id) => id != null && String(id).trim() !== "");
+}
+
 /**
  * 为工具名解析图标 + 标签（处理 MCP 名）。
  * 优先级：builtin > MCP per-op > MCP server 兜底 > 通用扳手。
@@ -473,6 +482,10 @@ export function resolveToolMeta(
   name: string,
   input?: Record<string, unknown> | null,
 ): ToolMeta {
+  if ((name === "TaskOutput" || name === "get_command_or_subagent_output" || name === "get_task_output") &&
+    isAwaitingBackgroundOutput(input)) {
+    return { icon: Clock, label: "等待输出", tone: "accent" };
+  }
   // Bash 命令若调用 oc-* CLI,给专属语义卡而非通用"终端"卡。
   if (isShellToolName(name) && input) {
     // 展示层剥壳兜底(历史消息带 /bin/bash -lc 包装),否则 oc-*/写文件检测在包装内失配。

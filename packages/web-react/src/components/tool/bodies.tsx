@@ -1227,8 +1227,22 @@ function ScanSciBody({ op, input, tool }: BodyProps & { op: string }) {
   );
 }
 
-function TaskBody({ input, tool }: BodyProps) {
-  const title = safeSubtaskDescription(input) || "运行子任务";
+function shortBackgroundTaskId(input: Input): string {
+  const ids = input && Array.isArray(input.task_ids) ? input.task_ids : [];
+  const first =
+    (typeof ids[0] === "string" && ids[0]) ||
+    (typeof input?.task_id === "string" && input.task_id) ||
+    (typeof input?.task_id === "number" && Number.isFinite(input.task_id) ? String(input.task_id) : "");
+  if (!first) return "";
+  return first.length > 16 ? `${first.slice(0, 16)}…` : first;
+}
+
+function TaskBody({ input, tool, name }: BodyProps & { name?: string }) {
+  const desc = safeSubtaskDescription(input);
+  const waitId = shortBackgroundTaskId(input);
+  const title =
+    desc ||
+    (waitId ? `等待后台命令 · ${waitId}` : name === "TaskOutput" ? "等待后台命令" : "运行子任务");
   return (
     <>
       <div className="mt-1.5 text-xs text-muted">{title}</div>
@@ -1284,7 +1298,7 @@ export function ToolBody({ name, input, tool }: { name: string; input: Input; to
     case "Agent":
     case "TaskOutput":
     case "TaskStop":
-      return <TaskBody input={input} tool={tool} />;
+      return <TaskBody name={name} input={input} tool={tool} />;
   }
   const codexType = parseCodexTypeName(name);
   if (codexType) return <CodexBody type={codexType} input={input} tool={tool} />;

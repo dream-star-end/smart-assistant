@@ -69,6 +69,25 @@ describe("researchToolCard 分派", () => {
     expect(container.textContent).not.toContain("$ ");
   });
 
+  test("oc-memory delegate 空输出未完成 → 委派运行中，不是操作已完成", () => {
+    const node = researchToolCard(
+      "oc-memory delegate --goal x",
+      tool({ output: undefined, _completed: false }),
+    );
+    expect(node).not.toBeNull();
+    render(<div>{node}</div>);
+    expect(screen.getByText("委派运行中…")).toBeInTheDocument();
+    expect(screen.queryByText("操作已完成。")).toBeNull();
+    cleanup();
+    const still = researchToolCard(
+      "oc-memory delegate --goal x",
+      tool({ output: "Moved to background. Process is still running.", _completed: true }),
+    );
+    render(<div>{still}</div>);
+    expect(screen.getByText("委派运行中…")).toBeInTheDocument();
+    expect(screen.queryByText("操作已完成。")).toBeNull();
+  });
+
   test("输出非 JSON / 空 → 友好正文兜底(不回落裸终端,不泄漏命令)", () => {
     const n1 = researchToolCard('oc-lit search "x"', tool({ output: "command not found" }));
     expect(n1).not.toBeNull();
