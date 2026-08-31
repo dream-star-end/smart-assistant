@@ -8,7 +8,8 @@
 - `src/lib/tutorialCatalog.ts`：与能力 ID 一一对应的正文、步骤、注意事项、媒体和关联教程。
 - `data-product-feature={PRODUCT_CAPABILITIES.<key>.id}`：真实可操作入口或对应功能内容。
 - `data-product-entry-scope`：顶层入口区域。范围内新增的原生交互或 `Button` / `IconButton` /
-  `Switch` 必须标注 `data-product-feature`；纯关闭、退出等非能力控件标 `data-product-control`。
+  `Switch` / `DropdownMenuItem` / `DropdownMenuSubTrigger` 必须标注 `data-product-feature`；
+  纯关闭、退出等非能力控件标 `data-product-control`。`asChild` 时属性要写在菜单项本身，不能只写在子节点。
 - `tutorial-sync.json`：经人工确认后的语义快照；`tutorial-sync-history.jsonl`：带序号与前向哈希链的
   追加式接受审计；`tutorial-sync-history-head.json`：当前历史的条数与字节/头记录锚点。CI 会同时
   校验内部哈希链、历史锚点、最后一项对应当前快照，以及当前文件必须以 PR/推送前的 Git 基线历史
@@ -41,12 +42,15 @@ npm run tutorials:accept -- --retire <稳定-id> --note "说明下线原因与�
    npm run tutorials:accept -- --note "说明功能变化与教程如何对应"
    ```
 
-5. 若只是重命名局部变量或等价重构、用户行为完全未变，可显式接受源变化：
+5. 若只是同一入口内部的等价 JSX 重构、入口身份（文件/组件/asChild/条件包裹）未变、
+   用户行为完全未变，可显式接受源变化，且必须列出每一个 sourceHash 变化的能力 ID：
 
    ```bash
-   npm run tutorials:accept -- --source-only --note "说明为何用户行为与教程均未变化"
+   npm run tutorials:accept -- --source-only --ids chat-basics,files-media --note "说明为何用户行为与教程均未变化"
    ```
 
+   `--source-only` 不能接受入口身份变化、能力增删、案例变化或注册表语义变化。
+   新增、挪走、改组件类型或改条件包裹的入口，必须普通 `tutorials:accept` 并同步教程正文/媒体。
    该模式仍会写入 JSONL 审计记录，不应被用来绕过真实教程更新。
 
 ## 媒体更新
