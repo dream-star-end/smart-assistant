@@ -40,6 +40,14 @@ import { buildPromptContext } from './promptSlots.js'
 import { getPlatformPrompt } from './platformPrompts.js'
 import { resolveMcpMemoryEntry, resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
+import { isPatrolSessionKey } from './taskboard/domain.js'
+
+/** 阶段 agent / 巡检会话不挂平台 MCP skills(TEST-10 / OCV5-46)。上下文走 prompt。 */
+export function shouldOmitPlatformMcp(agentId: string, sessionKey?: string): boolean {
+  if (agentId.startsWith('stage-')) return true
+  if (sessionKey && isPatrolSessionKey(sessionKey)) return true
+  return false
+}
 
 const overridesLog = createLogger({ module: 'codexLaunchOverrides' })
 
@@ -365,7 +373,10 @@ export async function buildCodexLaunchOverrides(
   // same as web-context/browser. mcp-memory below is the only remaining
   // codex-side MCP server, so the prompt must advertise it iff the entry that
   // will actually be registered resolves.
-  const mcpLaunch = resolveMcpMemoryLaunch(ctx.claudeCodePath, { fallback: 'npx-tsx' })
+  const omitPlatformMcp = shouldOmitPlatformMcp(ctx.agentId, ctx.sessionKey)
+  const mcpLaunch = omitPlatformMcp
+    ? null
+    : resolveMcpMemoryLaunch(ctx.claudeCodePath, { fallback: 'npx-tsx' })
   const availableMcpTools = mcpLaunch
     ? [
         'skill_search', 'skill_list', 'skill_view', 'skill_save', 'skill_delete',
@@ -435,6 +446,16 @@ export async function buildCodexLaunchOverrides(
   }
 
   const argvOverrides: string[] = ['-c', `model_instructions_file=${tomlValue(instructionsFile)}`]
+  if (omitPlatformMcp) {
+    argvOverrides.push(
+      '-c',
+      'mcp_servers={}',
+      '-c',
+      'features.apps=false',
+      '-c',
+      'features.plugins=false',
+    )
+  }
 
   // codex 原生生图(imagegen,gpt-image-2)= 平台生图首选(boss 裁决 2026-07-11,画质优先;
   // minimax-media 退居备选/非 codex 引擎)。egress relay 白名单已放行 POST /images/generations|edits

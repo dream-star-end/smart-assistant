@@ -70,6 +70,27 @@ describe('renderPrompt 占位符', () => {
     assert.match(prompt, /暂无评论/)
   })
 
+  it('有 projectContextText 时附加项目上下文段,且声明无 MCP skills', () => {
+    const { prompt } = renderPrompt({
+      template: '单号 {{ticket.identifier}}',
+      ticket,
+      stage,
+      projectContextText: '项目偏好：优先修 gateway。',
+    })
+    assert.match(prompt, /项目上下文（系统附加，本阶段无 MCP skills）/)
+    assert.match(prompt, /项目偏好：优先修 gateway。/)
+  })
+
+  it('空 projectContextText 不附加项目上下文段', () => {
+    const { prompt } = renderPrompt({
+      template: '单号 {{ticket.identifier}}',
+      ticket,
+      stage,
+      projectContextText: '  ',
+    })
+    assert.doesNotMatch(prompt, /项目上下文/)
+  })
+
   it('{{last_run.output}} 注入上次 run 的 output_md 全文', () => {
     const body = '完整产出\n## 结论\n改了 X'
     const { prompt, unknownPlaceholders } = renderPrompt({

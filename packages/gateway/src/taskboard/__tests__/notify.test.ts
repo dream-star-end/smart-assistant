@@ -416,6 +416,72 @@ describe('每日简报', () => {
     assert.equal(cap.inbox.length, 1, '同一天简报幂等')
     db.close()
   })
+
+  it('微信永久失败停止重试并落 inbox 死信', async () => {
+    const db = freshDb()
+    const project = createProject(db, { key: 'DL', name: '死信' })
+    const ticket = createTicket(db, {
+      projectId: project.id,
+      type: 'chore',
+      title: '已完成',
+      reporter: 'user:default',
+      status: 'done',
+    })
+    updateTicket(db, ticket.id, ticket.version, { closedAt: ticket.createdAt })
+    const day = zonedYmd(new Date(ticket.createdAt))
+    const [y, m, d] = day.split('-').map(Number)
+    const digestAt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0))
+    const cap = capture({
+      wechatResult: { kind: 'failure', retryable: false, code: 'WECHAT_MASTER_REJECTED' },
+    })
+    const n = new TaskboardNotifier({
+      getDb: () => db,
+      transport: cap.transport,
+      now: () => digestAt.getTime(),
+    })
+    const settings = updateSettings(db, { quietHoursStart: 23, quietHoursEnd: 8 })
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.wechat.length, 1)
+    assert.equal(cap.inbox.length, 1)
+    assert.equal(cap.inbox[0].deliveryKey, digestOutboundId(day))
+    assert.equal(n.hasSent(digestOutboundId(day)), true)
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.wechat.length, 1, '永久失败不再重试微信')
+    assert.equal(cap.inbox.length, 1)
+    db.close()
+  })
+
+  it('微信可重试失败不标记终态,下次 tick 再试', async () => {
+    const db = freshDb()
+    const project = createProject(db, { key: 'RT', name: '重试' })
+    const ticket = createTicket(db, {
+      projectId: project.id,
+      type: 'chore',
+      title: '已完成',
+      reporter: 'user:default',
+      status: 'done',
+    })
+    updateTicket(db, ticket.id, ticket.version, { closedAt: ticket.createdAt })
+    const day = zonedYmd(new Date(ticket.createdAt))
+    const [y, m, d] = day.split('-').map(Number)
+    const digestAt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0))
+    const cap = capture({
+      wechatResult: { kind: 'failure', retryable: true, code: 'WECHAT_MASTER_UNAVAILABLE' },
+    })
+    const n = new TaskboardNotifier({
+      getDb: () => db,
+      transport: cap.transport,
+      now: () => digestAt.getTime(),
+    })
+    const settings = updateSettings(db, { quietHoursStart: 23, quietHoursEnd: 8 })
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.wechat.length, 1)
+    assert.equal(cap.inbox.length, 0)
+    assert.equal(n.hasSent(digestOutboundId(day)), false)
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.wechat.length, 2)
+    db.close()
+  })
 })
 
 describe('通知抛异常不影响 run 收尾', () => {

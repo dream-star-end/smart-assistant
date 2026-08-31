@@ -32,6 +32,7 @@ import {
   type PatrolDelegateResult,
   PatrolEngine,
   type RunUsageLookup,
+  formatStageProjectContext,
   resetSharedPatrolState,
 } from '../patrol.js'
 import { assertTransition } from '../stateMachine.js'
@@ -118,6 +119,21 @@ function makeStagesAlwaysDue(db: TaskboardDb, pipelineId: string): void {
     })
   }
 }
+
+describe('formatStageProjectContext', () => {
+  it('空快照返回 null;有 instructions / overlay 则拼只读段', () => {
+    assert.equal(formatStageProjectContext({}), null)
+    assert.equal(formatStageProjectContext({ instructions: '  ' }), null)
+    const text = formatStageProjectContext({
+      instructions: '优先修 gateway。',
+      skillOverlay: ['board-ops'],
+    })
+    assert.ok(text)
+    assert.match(text, /优先修 gateway。/)
+    assert.match(text, /本阶段无 MCP skills/)
+    assert.match(text, /board-ops/)
+  })
+})
 
 describe('端到端:需求单无人干预走到 waiting_human', () => {
   it('建单 → 批准 → 两轮 tick 自动推进需求澄清与方案设计', async () => {
@@ -545,6 +561,9 @@ describe('依赖 / 日配额 / 准入', () => {
     assert.equal(report.started, 0)
     const skipped = listRuns(db, { ticketId: ticket.id, status: 'skipped' }).items
     assert.ok(skipped.some((r) => r.skipReason === 'entry_condition'))
+    const skippedRun = skipped.find((r) => r.skipReason === 'entry_condition')
+    assert.ok(skippedRun)
+    assert.ok(skippedRun.finishedAt != null, 'skipped run 必须写 finished_at')
     db.close()
   })
 })

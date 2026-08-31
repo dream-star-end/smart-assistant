@@ -299,6 +299,26 @@ describe('buildCodexLaunchOverrides', () => {
     assert.match(out.instructionsContent, /list_reminders/)
   })
 
+  it('stage / taskboard patrol sessions omit platform MCP skills', async () => {
+    const { buildCodexLaunchOverrides, shouldOmitPlatformMcp } = await import('../codexLaunchOverrides.js')
+    assert.equal(shouldOmitPlatformMcp('stage-triage', 'agent:stage-triage:taskboard:t:s:r'), true)
+    assert.equal(shouldOmitPlatformMcp('main', 'agent:main:webchat:dm:x'), false)
+    const out = await buildCodexLaunchOverrides({
+      agentId: 'stage-triage',
+      sessionKey: 'agent:stage-triage:taskboard:ticket:stage:run',
+      sessionDir: dir,
+      gatewayPort: 18789,
+      gatewayToken: 'tok-xyz',
+    })
+    assert.equal(
+      out.argvOverrides.some((s) => s.startsWith('mcp_servers.openclaude_memory.')),
+      false,
+    )
+    assert.ok(out.argvOverrides.includes('mcp_servers={}'))
+    assert.ok(out.argvOverrides.includes('features.apps=false'))
+    assert.equal(out.tokenFile, null)
+  })
+
   it('mcp-memory keys appear in stable order when entry resolves', async () => {
     const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
     const out = await buildCodexLaunchOverrides({
