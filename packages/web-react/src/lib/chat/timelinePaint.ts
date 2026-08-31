@@ -2,9 +2,8 @@
  * Chat timeline paint-window geometry.
  *
  * Indexing uses measured row-height prefix sums (unmeasured rows fall back to
- * 200px). Idle warmup reads offsetHeight on already-mounted rows so
- * `content-visibility: auto` remembers real heights before the first upward
- * scroll.
+ * 200px). Idle warmup force-visibles already-mounted rows for one frame so
+ * `content-visibility: auto` records last remembered size, then measures.
  */
 
 export const PAINT_ESTIMATE_PX = 200;
@@ -120,21 +119,65 @@ export function measuredRangePx(
   return height;
 }
 
-export function measureRowSlice(
+/**
+ * `content-visibility: auto` skips off-screen layout. Reading offsetHeight on a
+ * skipped row returns the 200px intrinsic estimate and does not record last
+ * remembered size. Warmup must force `visible`, wait a frame, then measure.
+ */
+export function restoreWarmupReveal(el: HTMLElement): void {
+  if (el.style.contentVisibility === "visible") {
+    el.style.removeProperty("content-visibility");
+  }
+}
+
+export function isRevealedForMeasure(el: HTMLElement): boolean {
+  if (el.style.contentVisibility !== "visible") return false;
+  if (typeof el.checkVisibility === "function") {
+    return el.checkVisibility({ contentVisibilityAuto: true });
+  }
+  return true;
+}
+
+/** Force-visible the next uncached slice (bottom-first). Caller waits a frame. */
+export function revealWarmupSlice(
   rows: ArrayLike<HTMLElement>,
   cache: Map<string, number>,
+  pending: HTMLElement[],
   sliceSize: number = ROW_WARMUP_SLICE,
+  attempted?: Set<string>,
 ): number {
   const limit = Math.max(1, sliceSize);
-  let cached = 0;
-  for (let i = rows.length - 1; i >= 0 && cached < limit; i -= 1) {
+  let revealed = 0;
+  for (let i = rows.length - 1; i >= 0 && revealed < limit; i -= 1) {
     const row = rows[i];
     const key = row.getAttribute("data-chat-virtual-key");
-    if (!key || cache.has(key)) continue;
-    const height = row.offsetHeight;
-    if (height <= 0) continue;
-    cache.set(key, height);
-    cached += 1;
+    if (!key || cache.has(key) || attempted?.has(key)) continue;
+    row.style.contentVisibility = "visible";
+    pending.push(row);
+    attempted?.add(key);
+    revealed += 1;
+  }
+  return revealed;
+}
+
+/** Measure rows already forced visible. Skipped reads never enter the cache. */
+export function measureRevealedSlice(
+  slice: HTMLElement[],
+  cache: Map<string, number>,
+): number {
+  let cached = 0;
+  for (const row of slice) {
+    try {
+      const key = row.getAttribute("data-chat-virtual-key");
+      if (!key || cache.has(key)) continue;
+      if (!isRevealedForMeasure(row)) continue;
+      const height = row.offsetHeight;
+      if (height <= 0) continue;
+      cache.set(key, height);
+      cached += 1;
+    } finally {
+      restoreWarmupReveal(row);
+    }
   }
   return cached;
 }
@@ -165,12 +208,39 @@ export function createRowGeometryWarmup(opts: {
   const schedule = opts.schedule ?? scheduleIdle;
   let aborted = false;
   let cancel: IdleCancel | null = null;
+  let pending: HTMLElement[] = [];
+  const attempted = new Set<string>();
+
+  const clearPending = () => {
+    for (const row of pending) restoreWarmupReveal(row);
+    pending = [];
+  };
 
   const tick = () => {
     cancel = null;
     if (aborted) return;
-    const measured = measureRowSlice(opts.getRows(), opts.cache, sliceSize);
-    if (aborted || measured <= 0) return;
+
+    if (pending.length > 0) {
+      const revealed = pending;
+      pending = [];
+      measureRevealedSlice(revealed, opts.cache);
+      if (aborted) return;
+      cancel = schedule(tick);
+      return;
+    }
+
+    const revealed = revealWarmupSlice(
+      opts.getRows(),
+      opts.cache,
+      pending,
+      sliceSize,
+      attempted,
+    );
+    if (aborted) {
+      clearPending();
+      return;
+    }
+    if (revealed <= 0) return;
     cancel = schedule(tick);
   };
 
@@ -183,6 +253,7 @@ export function createRowGeometryWarmup(opts: {
       aborted = true;
       cancel?.();
       cancel = null;
+      clearPending();
     },
     aborted: () => aborted,
   };

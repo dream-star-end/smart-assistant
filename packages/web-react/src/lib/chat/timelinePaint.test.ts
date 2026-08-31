@@ -5,7 +5,8 @@ import {
   computePaintRange,
   createRowGeometryWarmup,
   indexAtOffsetPx,
-  measureRowSlice,
+  measureRevealedSlice,
+  revealWarmupSlice,
 } from "./timelinePaint";
 
 function keys(count: number): string[] {
@@ -88,14 +89,23 @@ describe("computePaintRange prefix sums", () => {
 });
 
 describe("idle row-geometry warmup", () => {
-  function fakeRow(key: string, height: number): HTMLElement {
+  function fakeRow(key: string, realHeight: number): HTMLElement {
+    const style = {
+      contentVisibility: "",
+      removeProperty(name: string) {
+        if (name === "content-visibility") this.contentVisibility = "";
+      },
+    };
     return {
       getAttribute: (name: string) => (name === "data-chat-virtual-key" ? key : null),
-      offsetHeight: height,
-    } as HTMLElement;
+      style,
+      get offsetHeight() {
+        return style.contentVisibility === "visible" ? realHeight : PAINT_ESTIMATE_PX;
+      },
+    } as unknown as HTMLElement;
   }
 
-  test("slice fills the cache from the bottom and stops when idle work is done", () => {
+  test("片内行先被置 visible、隔帧测量、测完恢复 auto", () => {
     const rows = [
       fakeRow("a", 120),
       fakeRow("b", 240),
@@ -103,18 +113,44 @@ describe("idle row-geometry warmup", () => {
       fakeRow("d", 480),
     ];
     const cache = new Map<string, number>();
-    expect(measureRowSlice(rows, cache, 2)).toBe(2);
+    const queued: Array<() => void> = [];
+    const warmup = createRowGeometryWarmup({
+      getRows: () => rows,
+      cache,
+      sliceSize: 2,
+      schedule: (cb) => {
+        queued.push(cb);
+        return () => {
+          const at = queued.indexOf(cb);
+          if (at >= 0) queued.splice(at, 1);
+        };
+      },
+    });
+    warmup.start();
+    queued.shift()?.();
+    expect(rows[3]!.style.contentVisibility).toBe("visible");
+    expect(rows[2]!.style.contentVisibility).toBe("visible");
+    expect(rows[1]!.style.contentVisibility).toBe("");
+    expect(cache.size).toBe(0);
+
+    queued.shift()?.();
     expect(cache.get("d")).toBe(480);
     expect(cache.get("c")).toBe(360);
+    expect(rows.every((row) => row.style.contentVisibility === "")).toBe(true);
+
+    queued.shift()?.();
+    expect(rows[1]!.style.contentVisibility).toBe("visible");
+    expect(rows[0]!.style.contentVisibility).toBe("visible");
     expect(cache.has("b")).toBe(false);
-    expect(measureRowSlice(rows, cache, 2)).toBe(2);
-    expect(cache.get("a")).toBe(120);
+
+    queued.shift()?.();
     expect(cache.get("b")).toBe(240);
-    expect(measureRowSlice(rows, cache, 2)).toBe(0);
+    expect(cache.get("a")).toBe(120);
+    expect(rows.every((row) => row.style.contentVisibility === "")).toBe(true);
   });
 
-  test("user abort stops further slices", () => {
-    const rows = Array.from({ length: 20 }, (_, i) => fakeRow(`r${i}`, 220 + i));
+  test("abort 时同步清掉强制 visible 的内联样式", () => {
+    const rows = Array.from({ length: 8 }, (_, i) => fakeRow(`r${i}`, 220 + i));
     const cache = new Map<string, number>();
     const queued: Array<() => void> = [];
     const warmup = createRowGeometryWarmup({
@@ -130,33 +166,58 @@ describe("idle row-geometry warmup", () => {
       },
     });
     warmup.start();
-    expect(queued).toHaveLength(1);
     queued.shift()?.();
-    expect(cache.size).toBe(4);
-    expect(queued).toHaveLength(1);
+    expect(rows.filter((row) => row.style.contentVisibility === "visible")).toHaveLength(4);
+    expect(cache.size).toBe(0);
     warmup.abort();
     expect(warmup.aborted()).toBe(true);
     expect(queued).toHaveLength(0);
-    expect(cache.size).toBe(4);
+    expect(rows.every((row) => row.style.contentVisibility === "")).toBe(true);
+    expect(cache.size).toBe(0);
   });
 
-  test("unmeasured 0-height rows do not spin the idle loop", () => {
+  test("skipped 状态下的 200px 读数不会入 cache", () => {
+    const rows = [fakeRow("z", 480), fakeRow("y", 360)];
+    const cache = new Map<string, number>();
+    expect(rows[0]!.offsetHeight).toBe(PAINT_ESTIMATE_PX);
+    expect(measureRevealedSlice(rows, cache)).toBe(0);
+    expect(cache.size).toBe(0);
+
+    const pending: HTMLElement[] = [];
+    expect(revealWarmupSlice(rows, cache, pending, 2)).toBe(2);
+    expect(rows[0]!.style.contentVisibility).toBe("visible");
+    expect(rows[0]!.offsetHeight).toBe(480);
+    expect(measureRevealedSlice(pending, cache)).toBe(2);
+    expect(cache.get("z")).toBe(480);
+    expect(cache.get("y")).toBe(360);
+    expect(rows.every((row) => row.style.contentVisibility === "")).toBe(true);
+  });
+
+  test("0 高行测完不再入队，避免 idle 空转", () => {
     const rows = [fakeRow("z", 0), fakeRow("y", 0)];
     const cache = new Map<string, number>();
     const queued: Array<() => void> = [];
     const warmup = createRowGeometryWarmup({
       getRows: () => rows,
       cache,
-      sliceSize: 4,
+      sliceSize: 2,
       schedule: (cb) => {
         queued.push(cb);
-        return () => undefined;
+        return () => {
+          const at = queued.indexOf(cb);
+          if (at >= 0) queued.splice(at, 1);
+        };
       },
     });
     warmup.start();
     queued.shift()?.();
+    expect(rows.every((row) => row.style.contentVisibility === "visible")).toBe(true);
+    queued.shift()?.();
     expect(cache.size).toBe(0);
+    expect(rows.every((row) => row.style.contentVisibility === "")).toBe(true);
+    queued.shift()?.();
     expect(queued).toHaveLength(0);
+    expect(cache.size).toBe(0);
   });
 
   test("fallback estimate is the documented 200px", () => {
