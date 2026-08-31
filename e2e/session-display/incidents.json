@@ -624,6 +624,10 @@
       "coverageCommits": [
         "8f04bb2d"
       ],
+      "proofPending": {
+        "reason": "触发链=上下文耗尽→ENGINE_ERROR→自动恢复→source_not_recoverable→REST 同步后重复排程。10-stop-turn 只证用户 Stop 终态,语义不匹配,已撤销;恢复围栏跨刷新持久化目前只有 unit 覆盖,尚无覆盖该恢复重试环的 live-e2e/browser/deploy-gate。",
+        "since": "2026-07-26"
+      },
       "regressions": [
         {
           "layer": "unit",
@@ -634,11 +638,6 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
           "assertion": "automatic checkpoint keeps the exact old tape and skipped ACK removes only its optimistic child"
-        },
-        {
-          "layer": "live-e2e",
-          "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
-          "assertion": "停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活"
         }
       ]
     },
@@ -723,17 +722,21 @@
       "severity": "P0",
       "symptom": "内容大半已 spill 到归档、热行只剩 anchor 的长会话首次打开即 500:首页无 cursor → beforeOrderSeq=Number.MAX_SAFE_INTEGER 被绑进 `WHERE first_seq < $3`,而该列是 integer → PG 22003 integer out of range。紧邻的 last_seq 已有 ::bigint,$3 漏了。既有 spill 用例全用 limit=10、热行即可填满,从不进归档循环,所以一直没被发现。",
       "rootFixCommit": "c5031461",
+      "coverageCommits": [
+        "eb5a0758"
+      ],
       "regressions": [
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
           "assertion": "归档会话首页 timeline 不因 MAX_SAFE_INTEGER 游标而炸(22003 回归)"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/12-archive-cursor-overflow.spec.ts",
+          "assertion": "spilled archive session first open does not 500 on MAX_SAFE_INTEGER cursor"
         }
-      ],
-      "proofPending": {
-        "reason": "回归锁目前只到 integration 层(真 PG 复现首页 22003)。活体证明需要一个内容大半已 spill、热行只剩 anchor 的长会话——e2e 的 v5-evals 账号每条用例结束即删会话,凑不出这种形态;seedPagedArchivedSession 已具备直写 PG 的能力但刻意未 seed archive chunks(见 lib/seed.ts 注释)。补活体证据 = 扩 seed 造真实 spill 后走 UI 打开该会话。",
-        "since": "2026-07-26"
-      }
+      ]
     },
     {
       "id": "INC-20260728-WEIBO-QR-HIDDEN",
@@ -2123,7 +2126,8 @@
       "symptom": "委派显式 --model 传未知 slug 时静默 inherit 默认模型。fail-loud 判定已存在但被 OC_MODEL_AUTHORITY flag 门住，flag 关时错误 slug 不报 DELEGATE_MODEL_UNKNOWN。",
       "rootFixCommit": "8170334e",
       "coverageCommits": [
-        "886e4dfa"
+        "886e4dfa",
+        "eb5a0758"
       ],
       "regressions": [
         {
