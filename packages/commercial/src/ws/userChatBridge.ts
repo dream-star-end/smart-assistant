@@ -3663,7 +3663,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         void releaseRecoveryPreReceipt(pool, {
           job: record.recoveryJob,
           dispatchId: record.dispatchId,
-          dispatchOwner: connId,
+          dispatchOwner: record.leaseOwnerId,
           dispatchLeaseEpoch: record.leaseEpoch,
         }).catch(() => {});
         return;
@@ -4572,7 +4572,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             job: recoveryJob,
             dispatchId: record.dispatchId,
             dispatchAttemptNo: record.attemptNo,
-            dispatchOwner: connId,
+            dispatchOwner: record.leaseOwnerId,
             dispatchLeaseEpoch: record.leaseEpoch,
           },
           () => forwardInboundFrame(frameData, frameIsBinary, frameLength),
@@ -6765,7 +6765,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   dispatchModel: typeof enrichedParsed.model === "string" ? enrichedParsed.model : null,
                   canonicalModel: authorityExec!.canonicalModel,
                   attemptNo: dispatchRecordC.attemptNo,
-                  ownerId: connId,
+                  ownerId: dispatchRecordC.leaseOwnerId,
                   leaseEpoch: dispatchRecordC.leaseEpoch,
                 });
               } catch (err) {
