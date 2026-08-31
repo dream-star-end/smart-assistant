@@ -41,11 +41,15 @@ for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
   /usr/bin/mktemp /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat \
   /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/mv /bin/date /bin/ln \
   /usr/bin/cut /usr/bin/find /usr/bin/mkfifo /usr/bin/sha256sum \
-  /usr/bin/tail /usr/bin/tee; do
+  /usr/bin/tail /usr/bin/tee /usr/bin/curl /usr/bin/flock; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
 cursor_bin=/opt/cursor-agent/versions/2026.08.11-e8db854/cursor-agent
+cursor_probe_bin=/usr/bin/curl
+cursor_probe_url=https://api2.cursor.sh
+cursor_select_budget=45
+cursor_proxy_lease_seconds=900
 auth_file=/run/oc/cursor-auth/api-key
 [ -x "$cursor_bin" ] || die "pinned Cursor Agent CLI is unavailable"
 /usr/bin/sudo -n /usr/bin/test -f "$auth_file" 2>/dev/null \
@@ -59,11 +63,13 @@ auth_file=/run/oc/cursor-auth/api-key
 # resolve against workspace filenames.
 auth_dir=${auth_file%/*}
 
-# Optional host-authored Cursor-only HTTPS egress. The sidecar lives beside
-# the root-owned API key, so the gateway never needs to inherit generic proxy
-# variables and CCB/Codex/Grok keep their existing transports. The wrapper
-# accepts only a credential-free http:// origin and pins NO_PROXY for every
-# local OpenClaude control path that Cursor or its MCP children may call.
+# Optional host-authored Cursor-only HTTPS egress. The sidecar is a fixed,
+# root-approved backup route; direct egress is always the primary. A two-lock
+# admission protocol lets same-route turns overlap while preventing a
+# direct/proxy transition until every old-route CLI has drained. Route changes
+# are sticky for 15 minutes and are never triggered by CLI/auth/quota errors.
+unset HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY
+unset https_proxy http_proxy all_proxy no_proxy
 cursor_https_proxy=""
 cursor_proxy_file=$auth_dir/.https-proxy
 flavor_assert=""
@@ -88,6 +94,7 @@ if [ -z "$flavor_assert" ]; then
     die "flavor helper missing on guarded artifact"
   fi
 fi
+
 if /usr/bin/sudo -n /usr/bin/test -f "$cursor_proxy_file" 2>/dev/null; then
   cursor_proxy_type=$(/usr/bin/sudo -n /usr/bin/stat -c %F -- "$cursor_proxy_file" 2>/dev/null) \
     || die "Cursor HTTPS proxy metadata is unavailable"
@@ -126,10 +133,209 @@ if /usr/bin/sudo -n /usr/bin/test -f "$cursor_proxy_file" 2>/dev/null; then
     assert_allows selfhost-cursor-egress --sidecar 1 --effector "$SELF_ROOT" \
       || die "flavor identity refused Cursor HTTPS proxy sidecar"
   fi
-  HTTPS_PROXY=$cursor_https_proxy
-  HTTP_PROXY=$cursor_https_proxy
-  NO_PROXY=127.0.0.1,localhost,::1,172.31.0.1
-  export HTTPS_PROXY HTTP_PROXY NO_PROXY
+
+  cursor_runtime_uid=$(/usr/bin/id -u) || die "current uid is unavailable"
+  cursor_route_dir=/tmp/openclaude-cursor-egress.$cursor_runtime_uid
+  cursor_gate_file=$cursor_route_dir/admission.lock
+  cursor_route_lock_file=$cursor_route_dir/route.lock
+  cursor_route_state_file=$cursor_route_dir/route.state
+
+  if [ ! -e "$cursor_route_dir" ]; then
+    /bin/mkdir -m 700 -- "$cursor_route_dir" 2>/dev/null || true
+  fi
+  [ -d "$cursor_route_dir" ] && [ ! -L "$cursor_route_dir" ] \
+    || die "Cursor egress state directory is invalid"
+  cursor_route_dir_type=$(/usr/bin/stat -c %F -- "$cursor_route_dir" 2>/dev/null) \
+    || die "Cursor egress state directory metadata is unavailable"
+  cursor_route_dir_uid=$(/usr/bin/stat -c %u -- "$cursor_route_dir" 2>/dev/null) \
+    || die "Cursor egress state directory metadata is unavailable"
+  cursor_route_dir_mode=$(/usr/bin/stat -c %a -- "$cursor_route_dir" 2>/dev/null) \
+    || die "Cursor egress state directory metadata is unavailable"
+  [ "$cursor_route_dir_type" = "directory" ] \
+    && [ "$cursor_route_dir_uid" = "$cursor_runtime_uid" ] \
+    && [ "$cursor_route_dir_mode" = "700" ] \
+    || die "Cursor egress state directory is invalid"
+
+  ensure_cursor_lock_file() {
+    cursor_lock_path=$1
+    [ ! -L "$cursor_lock_path" ] || die "Cursor egress lock file is invalid"
+    if [ ! -e "$cursor_lock_path" ]; then
+      (umask 077; : > "$cursor_lock_path") 2>/dev/null || true
+    fi
+    cursor_lock_type=$(/usr/bin/stat -c %F -- "$cursor_lock_path" 2>/dev/null) \
+      || die "Cursor egress lock metadata is unavailable"
+    cursor_lock_uid=$(/usr/bin/stat -c %u -- "$cursor_lock_path" 2>/dev/null) \
+      || die "Cursor egress lock metadata is unavailable"
+    cursor_lock_mode=$(/usr/bin/stat -c %a -- "$cursor_lock_path" 2>/dev/null) \
+      || die "Cursor egress lock metadata is unavailable"
+    [ "$cursor_lock_type" = "regular empty file" ] \
+      && [ "$cursor_lock_uid" = "$cursor_runtime_uid" ] \
+      && [ "$cursor_lock_mode" = "600" ] \
+      || die "Cursor egress lock file is invalid"
+  }
+
+  ensure_cursor_lock_file "$cursor_gate_file"
+  ensure_cursor_lock_file "$cursor_route_lock_file"
+  exec 9>>"$cursor_gate_file"
+  exec 8>>"$cursor_route_lock_file"
+
+  cursor_selector_started=$(/bin/date +%s) || die "Cursor egress clock is unavailable"
+  cursor_selector_deadline=$((cursor_selector_started + cursor_select_budget))
+  refresh_cursor_budget() {
+    cursor_selector_now=$(/bin/date +%s) || return 1
+    cursor_selector_remaining=$((cursor_selector_deadline - cursor_selector_now))
+    [ "$cursor_selector_remaining" -gt 0 ]
+  }
+
+  refresh_cursor_budget || die "Cursor egress selection deadline exceeded"
+  /usr/bin/flock -x -w "$cursor_selector_remaining" 9 \
+    || die "Cursor egress admission deadline exceeded"
+  refresh_cursor_budget || die "Cursor egress selection deadline exceeded"
+  /usr/bin/flock -s -w "$cursor_selector_remaining" 8 \
+    || die "Cursor egress route-lock deadline exceeded"
+
+  write_cursor_route_state() {
+    cursor_state_route=$1
+    cursor_state_expiry=$2
+    cursor_state_tmp=$(/usr/bin/mktemp "$cursor_route_dir/route.state.tmp.XXXXXXXX") \
+      || die "cannot create Cursor egress state"
+    /bin/chmod 600 -- "$cursor_state_tmp" \
+      || { /bin/rm -f -- "$cursor_state_tmp"; die "cannot secure Cursor egress state"; }
+    if ! printf '%s %s\n' "$cursor_state_route" "$cursor_state_expiry" > "$cursor_state_tmp"; then
+      /bin/rm -f -- "$cursor_state_tmp"
+      die "cannot write Cursor egress state"
+    fi
+    /bin/mv -f -- "$cursor_state_tmp" "$cursor_route_state_file" \
+      || { /bin/rm -f -- "$cursor_state_tmp"; die "cannot commit Cursor egress state"; }
+  }
+
+  cursor_route=direct
+  cursor_route_expiry=0
+  if [ -e "$cursor_route_state_file" ] || [ -L "$cursor_route_state_file" ]; then
+    [ -f "$cursor_route_state_file" ] && [ ! -L "$cursor_route_state_file" ] \
+      || die "Cursor egress state file is invalid"
+    cursor_state_type=$(/usr/bin/stat -c %F -- "$cursor_route_state_file" 2>/dev/null) \
+      || die "Cursor egress state metadata is unavailable"
+    cursor_state_uid=$(/usr/bin/stat -c %u -- "$cursor_route_state_file" 2>/dev/null) \
+      || die "Cursor egress state metadata is unavailable"
+    cursor_state_mode=$(/usr/bin/stat -c %a -- "$cursor_route_state_file" 2>/dev/null) \
+      || die "Cursor egress state metadata is unavailable"
+    [ "$cursor_state_type" = "regular file" ] \
+      && [ "$cursor_state_uid" = "$cursor_runtime_uid" ] \
+      && [ "$cursor_state_mode" = "600" ] \
+      || die "Cursor egress state file is invalid"
+    cursor_state_text=$(/bin/cat -- "$cursor_route_state_file" 2>/dev/null) \
+      || die "Cursor egress state file is unreadable"
+    case "$cursor_state_text" in *"
+"*) die "Cursor egress state file is invalid" ;; esac
+    cursor_state_extra=""
+    IFS=' ' read -r cursor_route cursor_route_expiry cursor_state_extra <<STATE
+$cursor_state_text
+STATE
+    case "$cursor_route" in direct|proxy) ;; *) die "Cursor egress state route is invalid" ;; esac
+    [ -z "$cursor_state_extra" ] || die "Cursor egress state file is invalid"
+    case "$cursor_route_expiry" in ''|*[!0-9]*) die "Cursor egress state expiry is invalid" ;; esac
+    [ "${#cursor_route_expiry}" -le 10 ] || die "Cursor egress state expiry is invalid"
+    cursor_state_now=$(/bin/date +%s) || die "Cursor egress clock is unavailable"
+    cursor_state_max=$((cursor_state_now + cursor_proxy_lease_seconds))
+    [ "$cursor_route_expiry" -le "$cursor_state_max" ] \
+      || die "Cursor egress state lease is invalid"
+  else
+    write_cursor_route_state direct 0
+  fi
+
+  cursor_probe_timeout() {
+    refresh_cursor_budget || return 1
+    cursor_probe_seconds=3
+    if [ "$cursor_selector_remaining" -lt "$cursor_probe_seconds" ]; then
+      cursor_probe_seconds=$cursor_selector_remaining
+    fi
+    [ "$cursor_probe_seconds" -gt 0 ]
+  }
+  cursor_probe_direct() {
+    cursor_probe_timeout || return 1
+    "$cursor_probe_bin" -q -4 -sS -o /dev/null \
+      --connect-timeout 2 --max-time "$cursor_probe_seconds" \
+      --noproxy '*' "$cursor_probe_url" >/dev/null 2>&1
+  }
+  cursor_probe_proxy() {
+    cursor_probe_timeout || return 1
+    "$cursor_probe_bin" -q -4 -sS -o /dev/null \
+      --connect-timeout 2 --max-time "$cursor_probe_seconds" \
+      --proxy "$cursor_https_proxy" --noproxy '' \
+      "$cursor_probe_url" >/dev/null 2>&1
+  }
+  cursor_direct_any_success() {
+    cursor_probe_direct || cursor_probe_direct
+  }
+  cursor_direct_two_successes() {
+    cursor_probe_direct && cursor_probe_direct
+  }
+
+  cursor_selected_route=$cursor_route
+  cursor_switch_target=""
+  cursor_route_now=$(/bin/date +%s) || die "Cursor egress clock is unavailable"
+  if [ "$cursor_route" = direct ]; then
+    if cursor_direct_any_success; then
+      cursor_selected_route=direct
+    elif cursor_probe_proxy; then
+      cursor_switch_target=proxy
+    else
+      die "Cursor direct and backup proxy routes are unreachable"
+    fi
+  elif [ "$cursor_route_expiry" -gt "$cursor_route_now" ]; then
+    if cursor_probe_proxy; then
+      cursor_selected_route=proxy
+    elif cursor_direct_two_successes; then
+      cursor_switch_target=direct
+    else
+      die "Cursor backup proxy is unavailable and direct recovery is unconfirmed"
+    fi
+  elif cursor_direct_two_successes; then
+    cursor_switch_target=direct
+  elif cursor_probe_proxy; then
+    cursor_route_now=$(/bin/date +%s) || die "Cursor egress clock is unavailable"
+    cursor_route_expiry=$((cursor_route_now + cursor_proxy_lease_seconds))
+    write_cursor_route_state proxy "$cursor_route_expiry"
+    cursor_selected_route=proxy
+  else
+    die "Cursor direct recovery is unconfirmed and backup proxy is unreachable"
+  fi
+
+  if [ -n "$cursor_switch_target" ]; then
+    /usr/bin/flock -u 8 || die "cannot release Cursor egress route lock"
+    refresh_cursor_budget || die "Cursor egress selection deadline exceeded"
+    /usr/bin/flock -x -w "$cursor_selector_remaining" 8 \
+      || die "Cursor egress drain deadline exceeded"
+
+    # The target may have failed while old-route invocations drained. Re-probe
+    # under the exclusive lock before committing a process-wide IP change.
+    if [ "$cursor_switch_target" = direct ]; then
+      cursor_direct_two_successes \
+        || die "Cursor direct route failed post-drain validation"
+      cursor_route_expiry=0
+    else
+      cursor_probe_proxy \
+        || die "Cursor backup proxy failed post-drain validation"
+      cursor_route_now=$(/bin/date +%s) || die "Cursor egress clock is unavailable"
+      cursor_route_expiry=$((cursor_route_now + cursor_proxy_lease_seconds))
+    fi
+    write_cursor_route_state "$cursor_switch_target" "$cursor_route_expiry"
+    cursor_selected_route=$cursor_switch_target
+    /usr/bin/flock -s 8 || die "cannot downgrade Cursor egress route lock"
+  fi
+
+  /usr/bin/flock -u 9 || die "cannot release Cursor egress admission lock"
+  exec 9>&-
+  if [ "$cursor_selected_route" = proxy ]; then
+    HTTPS_PROXY=$cursor_https_proxy
+    HTTP_PROXY=$cursor_https_proxy
+    NO_PROXY=127.0.0.1,localhost,::1,172.31.0.1
+    export HTTPS_PROXY HTTP_PROXY NO_PROXY
+  else
+    NO_PROXY=127.0.0.1,localhost,::1,172.31.0.1
+    export NO_PROXY
+  fi
 fi
 
 set -f
@@ -658,7 +864,7 @@ if [ "${OPENCLAUDE_CURSOR_AGENT_DEBUG:-}" = "1" ] && [ -n "$oc_home" ] && [ -d "
             # tee is a wrapper child, NOT in the CLI process group: Stop kills
             # the group, the fifo write end closes, tee exits on EOF. stderr
             # keeps flowing to the gateway via >&2.
-            /usr/bin/tee -a -- "$debug_log" < "$debug_fifo" >&2 &
+            /usr/bin/tee -a -- "$debug_log" < "$debug_fifo" >&2 8>&- &
             tee_pid=$!
             cursor_debug=1
           fi
@@ -736,13 +942,13 @@ if [ "$cursor_debug" -eq 1 ]; then
   HOME="$cursor_home" \
   XDG_CONFIG_HOME="$cursor_home/.config" \
   CURSOR_API_KEY="$api_key" \
-  /usr/bin/setsid "$cursor_bin" "$@" 2> "$debug_fifo" &
+  /usr/bin/setsid "$cursor_bin" "$@" 8>&- 2> "$debug_fifo" &
 else
   HOME="$cursor_home" \
   XDG_CONFIG_HOME="$cursor_home/.config" \
   CURSOR_AGENT_DISABLE_DEBUG_LOG=1 \
   CURSOR_API_KEY="$api_key" \
-  /usr/bin/setsid "$cursor_bin" "$@" &
+  /usr/bin/setsid "$cursor_bin" "$@" 8>&- &
 fi
 child_pid=$!
 wait "$child_pid"

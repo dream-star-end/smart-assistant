@@ -41,6 +41,7 @@ function fixture(): {
   const dir = mkdtempSync(join(tmpdir(), 'oc-cursor-wrapper-test-'))
   tempRoots.push(dir)
   const fakeBin = join(dir, 'cursor-agent')
+  const fakeProbe = join(dir, 'curl')
   const authDir = join(dir, 'auth')
   const auth = join(authDir, 'api-key')
   const capture = join(dir, 'capture')
@@ -83,6 +84,11 @@ fi
 /bin/mkdir -p "$HOME/.config/cursor"
 printf '%s\\n' "\${CURSOR_API_KEY}" > "$HOME/.config/cursor/auth.json"
 printf '%s\\n' "\${CURSOR_API_KEY}" > "$OC_CURSOR_TEST_CAPTURE/key"
+[ ! -e /proc/self/fd/8 ] || : > "$OC_CURSOR_TEST_CAPTURE/cli-fd8-leaked"
+case "\${HTTPS_PROXY:-}" in
+  http://*) printf '%s\\n' proxy >> "$OC_CURSOR_TEST_CAPTURE/child-routes" ;;
+  *) printf '%s\\n' direct >> "$OC_CURSOR_TEST_CAPTURE/child-routes" ;;
+esac
 if [ -n "\${OC_CURSOR_TEST_FAIL_ON_KEY:-}" ] && [ "\${CURSOR_API_KEY}" = "\${OC_CURSOR_TEST_FAIL_ON_KEY}" ]; then
   printf '%s\\n' '{"type":"result","subtype":"error_during_execution","error":"injected"}'
   exit 1
@@ -100,6 +106,16 @@ if [ "\${OC_CURSOR_TEST_ORPHAN:-0}" = 1 ]; then
   while [ ! -f "$OC_CURSOR_TEST_CAPTURE/orphan-ready" ]; do sleep 0.01; done
   exit 0
 fi
+if [ "\${OC_CURSOR_TEST_DETACHED_LOCK:-0}" = 1 ]; then
+  /usr/bin/setsid /bin/sh -c '
+    [ ! -e /proc/self/fd/8 ] || : > "$1/descendant-fd8-leaked"
+    : > "$1/detached-ready"
+    /bin/sleep 10
+  ' sh "$OC_CURSOR_TEST_CAPTURE" </dev/null >/dev/null 2>&1 &
+  printf '%s\n' "$!" > "$OC_CURSOR_TEST_CAPTURE/detached-pid"
+  while [ ! -f "$OC_CURSOR_TEST_CAPTURE/detached-ready" ]; do sleep 0.01; done
+  exit 0
+fi
 printf '%s\\n' '{"type":"thinking","text":"checking"}'
 printf '%s\\n' '{"type":"assistant","text":"done"}'
 printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"outputTokens":1}}'
@@ -108,6 +124,40 @@ printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"o
   )
   chmodSync(fakeBin, 0o755)
 
+  writeFileSync(
+    fakeProbe,
+    `#!/bin/sh
+set -eu
+kind=direct
+for arg in "$@"; do
+  [ "$arg" != "--proxy" ] || kind=proxy
+done
+count_file="$OC_CURSOR_TEST_CAPTURE/$kind-probe-count"
+count=0
+[ ! -f "$count_file" ] || count=$(/bin/cat "$count_file")
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+printf '%s\n' "$@" > "$OC_CURSOR_TEST_CAPTURE/$kind-probe-argv.$count"
+/usr/bin/env > "$OC_CURSOR_TEST_CAPTURE/$kind-probe-env.$count"
+[ -z "\${OC_CURSOR_TEST_PROBE_SLEEP:-}" ] || /bin/sleep "$OC_CURSOR_TEST_PROBE_SLEEP"
+if [ "$kind" = direct ]; then
+  mode=\${OC_CURSOR_TEST_DIRECT_MODE:-ok}
+else
+  mode=\${OC_CURSOR_TEST_PROXY_MODE:-ok}
+fi
+case "$mode" in
+  ok) exit 0 ;;
+  fail) exit 7 ;;
+  fail-once) [ "$count" -gt 1 ] ;;
+  fail-after-one) [ "$count" -le 1 ] ;;
+  fail-after-two) [ "$count" -le 2 ] ;;
+  *) exit 64 ;;
+esac
+`,
+    { mode: 0o755 },
+  )
+  chmodSync(fakeProbe, 0o755)
+
   const wrapper = join(dir, 'oc-cursor')
   const rewritten = readFileSync(sourceWrapper, 'utf8')
     .replace(
@@ -115,6 +165,11 @@ printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"o
       `cursor_bin=${fakeBin}`,
     )
     .replace('auth_file=/run/oc/cursor-auth/api-key', `auth_file=${auth}`)
+    .replace('cursor_probe_bin=/usr/bin/curl', `cursor_probe_bin=${fakeProbe}`)
+    .replace(
+      'cursor_route_dir=/tmp/openclaude-cursor-egress.$cursor_runtime_uid',
+      `cursor_route_dir=${join(dir, 'egress-state')}`,
+    )
     .replaceAll('/usr/bin/sudo -n /usr/bin/test -f', '/usr/bin/test -f')
     .replaceAll('/usr/bin/sudo -n /bin/ls', '/bin/ls')
     .replaceAll('/usr/bin/sudo -n /bin/cat', '/bin/cat')
@@ -293,26 +348,309 @@ describe('oc-cursor wrapper', () => {
     assert.equal(readFileSync(join(f.capture, 'hooks-env'), 'utf8').trim(), 'unset')
   })
 
-  test('injects a credential-free Cursor-only proxy from the root-authored sidecar', () => {
+  test('prefers direct egress and scrubs inherited proxy variables', () => {
     const f = fixture()
     const proxySidecar = join(dirname(f.auth), '.https-proxy')
     writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
     chmodSync(proxySidecar, 0o600)
-    const env = { ...f.env }
-    delete env.HTTPS_PROXY
-    delete env.HTTP_PROXY
-    delete env.NO_PROXY
+    const polluted = {
+      ...f.env,
+      HTTPS_PROXY: 'http://attacker.invalid:1',
+      HTTP_PROXY: 'http://attacker.invalid:2',
+      ALL_PROXY: 'socks5://attacker.invalid:3',
+      NO_PROXY: 'attacker.invalid',
+      https_proxy: 'http://attacker.invalid:4',
+      http_proxy: 'http://attacker.invalid:5',
+      all_proxy: 'socks5://attacker.invalid:6',
+      no_proxy: 'attacker.invalid',
+    }
 
     const result = spawnSync(f.wrapper, ['--model', 'cursor-grok-4.6-high', '--', 'hello'], {
       cwd: f.dir,
-      env,
+      env: polluted,
       encoding: 'utf8',
     })
     assert.equal(result.status, 0, result.stderr)
     const childEnv = readFileSync(join(f.capture, 'env'), 'utf8')
-    assert.match(childEnv, /^HTTPS_PROXY=http:\/\/172\.31\.0\.1:18992$/m)
-    assert.match(childEnv, /^HTTP_PROXY=http:\/\/172\.31\.0\.1:18992$/m)
+    assert.doesNotMatch(childEnv, /^(?:https?|all)_proxy=/im)
     assert.match(childEnv, /^NO_PROXY=127\.0\.0\.1,localhost,::1,172\.31\.0\.1$/m)
+    const probeEnv = readFileSync(join(f.capture, 'direct-probe-env.1'), 'utf8')
+    assert.doesNotMatch(probeEnv, /^(?:https?|all|no)_proxy=/im)
+    const probeArgv = readFileSync(join(f.capture, 'direct-probe-argv.1'), 'utf8').trim().split('\n')
+    assert.equal(probeArgv[0], '-q')
+    assert.ok(probeArgv.includes('--noproxy'))
+    assert.ok(probeArgv.includes('*'))
+    assert.equal(existsSync(join(f.capture, 'proxy-probe-count')), false)
+    assert.equal(existsSync(join(f.capture, 'cli-fd8-leaked')), false)
+  })
+
+  test('requires two direct failures, validates the fixed proxy twice, then holds it sticky', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+
+    const failedOver = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_DIRECT_MODE: 'fail' },
+      encoding: 'utf8',
+    })
+    assert.equal(failedOver.status, 0, failedOver.stderr)
+    assert.equal(readFileSync(join(f.capture, 'direct-probe-count'), 'utf8').trim(), '2')
+    assert.equal(readFileSync(join(f.capture, 'proxy-probe-count'), 'utf8').trim(), '2')
+    assert.match(readFileSync(join(f.dir, 'egress-state', 'route.state'), 'utf8'), /^proxy \d+\n$/)
+    assert.match(readFileSync(join(f.capture, 'env'), 'utf8'), /^HTTPS_PROXY=http:\/\/172\.31\.0\.1:18992$/m)
+
+    const sticky = spawnSync(f.wrapper, ['--', 'hello again'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_DIRECT_MODE: 'ok' },
+      encoding: 'utf8',
+    })
+    assert.equal(sticky.status, 0, sticky.stderr)
+    assert.equal(readFileSync(join(f.capture, 'direct-probe-count'), 'utf8').trim(), '2')
+    assert.equal(readFileSync(join(f.capture, 'proxy-probe-count'), 'utf8').trim(), '3')
+    assert.deepEqual(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim().split('\n'), [
+      'proxy',
+      'proxy',
+    ])
+  })
+
+  test('one direct probe failure does not switch IP or touch the backup', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const result = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_DIRECT_MODE: 'fail-once' },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(readFileSync(join(f.capture, 'direct-probe-count'), 'utf8').trim(), '2')
+    assert.equal(existsSync(join(f.capture, 'proxy-probe-count')), false)
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+  })
+
+  test('expired proxy lease needs two direct successes before a drained switch back', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    mkdirSync(join(f.dir, 'egress-state'), { mode: 0o700 })
+    writeFileSync(join(f.dir, 'egress-state', 'route.state'), 'proxy 1\n', { mode: 0o600 })
+    const result = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(readFileSync(join(f.capture, 'direct-probe-count'), 'utf8').trim(), '4')
+    assert.equal(readFileSync(join(f.dir, 'egress-state', 'route.state'), 'utf8'), 'direct 0\n')
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+  })
+
+  test('does not renew an expired lease when direct is unconfirmed and proxy is dead', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    mkdirSync(join(f.dir, 'egress-state'), { mode: 0o700 })
+    const state = join(f.dir, 'egress-state', 'route.state')
+    writeFileSync(state, 'proxy 1\n', { mode: 0o600 })
+    const result = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env: {
+        ...f.env,
+        OC_CURSOR_TEST_DIRECT_MODE: 'fail',
+        OC_CURSOR_TEST_PROXY_MODE: 'fail',
+      },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 2)
+    assert.match(result.stderr, /direct recovery is unconfirmed and backup proxy is unreachable/)
+    assert.equal(readFileSync(state, 'utf8'), 'proxy 1\n')
+    assert.equal(existsSync(join(f.capture, 'child-routes')), false)
+  })
+
+  test('rejects tampered route state and a lease beyond the 15 minute bound', () => {
+    for (const stateBody of ['proxy 9999999999\n', 'proxy 1 extra\n', 'proxy 1\nsecond line\n']) {
+      const f = fixture()
+      const proxySidecar = join(dirname(f.auth), '.https-proxy')
+      writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+      chmodSync(proxySidecar, 0o600)
+      mkdirSync(join(f.dir, 'egress-state'), { mode: 0o700 })
+      writeFileSync(join(f.dir, 'egress-state', 'route.state'), stateBody, { mode: 0o600 })
+      const result = spawnSync(f.wrapper, ['--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 2, stateBody)
+      assert.match(result.stderr, /Cursor egress state/, stateBody)
+      assert.equal(existsSync(join(f.capture, 'child-routes')), false, stateBody)
+    }
+  })
+
+  test('post-drain target failure preserves the old route and never overlaps IPs', async () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const first = spawn(f.wrapper, ['--', 'long direct'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_SLEEP: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    for (let i = 0; i < 100 && !existsSync(join(f.capture, 'child-routes')); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+
+    const second = spawn(f.wrapper, ['--', 'switch attempt'], {
+      cwd: f.dir,
+      env: {
+        ...f.env,
+        OC_CURSOR_TEST_DIRECT_MODE: 'fail',
+        OC_CURSOR_TEST_PROXY_MODE: 'fail-after-one',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let secondStderr = ''
+    second.stderr?.on('data', (chunk) => (secondStderr += String(chunk)))
+    const secondExit = new Promise<number | null>((resolve) =>
+      second.once('exit', (code) => resolve(code)),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+    first.kill('SIGTERM')
+    await new Promise<void>((resolve) => first.once('exit', () => resolve()))
+    const secondStatus = await secondExit
+    assert.equal(secondStatus, 2, secondStderr)
+    assert.match(secondStderr, /failed post-drain validation/)
+    assert.equal(readFileSync(join(f.dir, 'egress-state', 'route.state'), 'utf8'), 'direct 0\n')
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+  })
+
+  test('same-route invocations overlap safely under shared route locks', async () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const first = spawn(f.wrapper, ['--', 'long direct'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_SLEEP: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    for (let i = 0; i < 100 && !existsSync(join(f.capture, 'child-routes')); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+
+    const second = spawnSync(f.wrapper, ['--', 'second direct'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+      timeout: 2_000,
+    })
+    assert.equal(second.status, 0, second.stderr)
+    assert.equal(first.exitCode, null)
+    assert.deepEqual(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim().split('\n'), [
+      'direct',
+      'direct',
+    ])
+    first.kill('SIGTERM')
+    await new Promise<void>((resolve) => first.once('exit', () => resolve()))
+  })
+
+  test('admission contention consumes one absolute selection deadline and never probes', async () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const first = spawn(f.wrapper, ['--', 'slow selector'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_PROBE_SLEEP: '3' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const firstExit = new Promise<void>((resolve) => first.once('exit', () => resolve()))
+    for (let i = 0; i < 100 && !existsSync(join(f.capture, 'direct-probe-count')); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.equal(readFileSync(join(f.capture, 'direct-probe-count'), 'utf8').trim(), '1')
+
+    const shortWrapper = join(f.dir, 'oc-cursor-short-budget')
+    writeFileSync(
+      shortWrapper,
+      readFileSync(f.wrapper, 'utf8').replace('cursor_select_budget=45', 'cursor_select_budget=1'),
+      { mode: 0o755 },
+    )
+    chmodSync(shortWrapper, 0o755)
+    const started = Date.now()
+    const blocked = spawnSync(shortWrapper, ['--', 'must not start'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+      timeout: 3_000,
+    })
+    const elapsed = Date.now() - started
+    assert.equal(blocked.status, 2, blocked.stderr)
+    assert.match(blocked.stderr, /admission deadline exceeded/)
+    assert.ok(elapsed < 2_500, `selector exceeded bounded deadline: ${elapsed}ms`)
+    assert.equal(readFileSync(join(f.capture, 'direct-probe-count'), 'utf8').trim(), '1')
+    await firstExit
+  })
+
+  test('CLI execution failure does not change the direct route or probe the backup', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const result = spawnSync(f.wrapper, ['--', 'business failure'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_FAIL_ON_KEY: 'crsr_dummy' },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 1)
+    assert.equal(readFileSync(join(f.dir, 'egress-state', 'route.state'), 'utf8'), 'direct 0\n')
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+    assert.equal(existsSync(join(f.capture, 'proxy-probe-count')), false)
+  })
+
+  test('Cursor and detached descendants cannot retain or unlock the route FD', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const first = spawnSync(f.wrapper, ['--', 'spawn detached'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_DETACHED_LOCK: '1' },
+      encoding: 'utf8',
+    })
+    assert.equal(first.status, 0, first.stderr)
+    assert.equal(existsSync(join(f.capture, 'cli-fd8-leaked')), false)
+    assert.equal(existsSync(join(f.capture, 'descendant-fd8-leaked')), false)
+
+    const shortWrapper = join(f.dir, 'oc-cursor-short-drain')
+    writeFileSync(
+      shortWrapper,
+      readFileSync(f.wrapper, 'utf8').replace('cursor_select_budget=45', 'cursor_select_budget=2'),
+      { mode: 0o755 },
+    )
+    chmodSync(shortWrapper, 0o755)
+    const switched = spawnSync(shortWrapper, ['--', 'switch while detached lives'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_DIRECT_MODE: 'fail' },
+      encoding: 'utf8',
+      timeout: 3_000,
+    })
+    assert.equal(switched.status, 0, switched.stderr)
+    assert.match(readFileSync(join(f.dir, 'egress-state', 'route.state'), 'utf8'), /^proxy \d+\n$/)
+    const detachedPid = Number(readFileSync(join(f.capture, 'detached-pid'), 'utf8').trim())
+    if (Number.isInteger(detachedPid) && detachedPid > 1) {
+      try {
+        process.kill(detachedPid, 'SIGTERM')
+      } catch {}
+    }
   })
 
   test('fails closed on an unsafe Cursor proxy sidecar', () => {
