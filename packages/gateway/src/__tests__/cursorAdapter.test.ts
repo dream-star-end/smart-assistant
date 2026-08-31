@@ -576,7 +576,10 @@ for(const e of [
         'command',
         'env',
       ])
-      // spawn MCP json contains delegate-context path with mode 0600 and the file is removed after the turn
+      const launchedDelegateContextFile =
+        launched.config.mcpServers['openclaude-memory'].env.OPENCLAUDE_DELEGATE_CONTEXT_FILE
+      assert.equal(typeof launchedDelegateContextFile, 'string')
+      assert.ok(launchedDelegateContextFile.endsWith('/delegate-context'))
       const mcpEnv = launched.config.mcpServers['openclaude-memory'].env as Record<string, string>
       assert.equal(typeof launched.delegateContextFile, 'string')
       assert.equal(mcpEnv.OPENCLAUDE_DELEGATE_CONTEXT_FILE, launched.delegateContextFile)
@@ -1482,7 +1485,7 @@ for(const e of [
         bundled: false,
       },
       tokenFile: '/tmp/openclaude-cursor-context-test/gateway-token',
-      contextFile: '/tmp/openclaude-cursor-context-test/delegate-context',
+      delegateContextFile: '/tmp/openclaude-cursor-context-test/delegate-context',
       agentId: 'main',
       sessionKey: 'agent:main:webchat:dm:test',
       gatewayPort: 18789,
@@ -1515,27 +1518,6 @@ for(const e of [
     assert.equal(server.env.OPENCLAUDE_SKILL_EVAL_EXCLUDE, 'hidden-skill')
     assert.equal(server.env.OPENCLAUDE_SKILL_EVAL_DRAFT_NAME, 'draft-skill')
     assert.equal(server.env.OPENCLAUDE_SKILL_TRAIN_RUN_ID, 'train-1')
-  })
-
-  test('MCP child env omits delegate context file when caller did not pass one', () => {
-    const config = _internals.buildCursorMemoryMcpConfig({
-      launch: {
-        command: '/usr/local/bin/node',
-        args: ['/opt/openclaude/packages/mcp-memory/src/index.ts'],
-        entry: '/opt/openclaude/packages/mcp-memory/src/index.ts',
-        bundled: false,
-      },
-      tokenFile: '/tmp/openclaude-cursor-context-test/gateway-token',
-      agentId: 'main',
-      sessionKey: 'agent:main:webchat:dm:test',
-      gatewayPort: 18789,
-      delegationDepth: 0,
-    }) as any
-    assert.equal(config.mcpServers['openclaude-memory'].env.OPENCLAUDE_DELEGATE_CONTEXT_FILE, undefined)
-    assert.equal(
-      config.mcpServers['openclaude-memory'].env.OPENCLAUDE_GATEWAY_TOKEN_FILE,
-      '/tmp/openclaude-cursor-context-test/gateway-token',
-    )
   })
 
   test('always pins OPENCLAUDE_HOME on the rebuilt Cursor spawn env', () => {
@@ -2426,6 +2408,36 @@ for(const e of [
     } finally {
       await rm(cursorResumeStoreDir(oldDir, resumeId), { recursive: true, force: true })
       await rm(cursorResumeStoreDir(newDir, resumeId), { recursive: true, force: true })
+      await rm(oldDir, { recursive: true, force: true })
+      await rm(newDir, { recursive: true, force: true })
+    }
+  })
+
+  test('relocateCursorResumeStore clears empty destDir then migrates', async () => {
+    const oldDir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-relocate-emptydest-old-'))
+    const newDir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-relocate-emptydest-new-'))
+    const resumeId = 'aaaaaaaa-bbbb-cccc-dddd-666666666666'
+    const srcStore = cursorResumeStorePath(oldDir, resumeId)
+    const destDir = cursorResumeStoreDir(newDir, resumeId)
+    const destStore = cursorResumeStorePath(newDir, resumeId)
+    await mkdir(path.dirname(srcStore), { recursive: true })
+    await writeFile(srcStore, 'turn1-store')
+    await mkdir(destDir, { recursive: true })
+    await writeFile(path.join(destDir, 'leftover.txt'), 'not-a-store')
+    try {
+      const result = relocateCursorResumeStore({
+        resumeId,
+        currentWorkspacePath: newDir,
+        previousWorkspacePaths: [oldDir],
+      })
+      assert.deepEqual(result, { resumeId, relocated: true })
+      assert.equal(existsSync(destStore), true)
+      assert.equal(await readFile(destStore, 'utf8'), 'turn1-store')
+      assert.equal(existsSync(srcStore), false)
+      assert.equal(existsSync(path.join(destDir, 'leftover.txt')), false)
+    } finally {
+      await rm(cursorResumeStoreDir(oldDir, resumeId), { recursive: true, force: true })
+      await rm(destDir, { recursive: true, force: true })
       await rm(oldDir, { recursive: true, force: true })
       await rm(newDir, { recursive: true, force: true })
     }

@@ -222,6 +222,10 @@ body {
   .no-scrollbar::-webkit-scrollbar { display: none; }
   .no-scrollbar { scrollbar-width: none; }
   .chat-scroll-area { overflow-anchor: none; /* single-writer: disable browser scroll anchoring */ }
+  /* 委派过程卡内 scroller 也单一写手，禁止 overflow-anchor 改 scrollTop。 */
+  .delegate-process-scroller { overflow-anchor: none; }
+  /* 卡内子卡不得走时间线的 content-visibility:auto（否则重复 200px 估高首滑跳）。 */
+  .delegate-process-child { content-visibility: visible; }
   /* Timeline rows stay motion-stable: entrance animation would flash when a
      tail window expands or live→tape reconciles in place. */
   .chat-virtual-item .animate-in { animation: none; }

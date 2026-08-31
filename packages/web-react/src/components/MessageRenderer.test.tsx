@@ -7,6 +7,8 @@ import { applyOutboundMessage } from "../lib/chat/reducer";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS } from "./MessageRenderer";
+import * as MarkdownMod from "./Markdown";
+import { PAINT_MIN_ITEMS } from "../lib/chat/timelinePaint";
 import { createStickToBottomController } from "./chat/stickToBottom";
 import { resetPermissionAutoOpenMemory, type PermissionRespond } from "./chat/PermissionCard";
 import { ResponseRatingProvider } from "./chat/ResponseRating";
@@ -2392,7 +2394,7 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     scroller.remove();
   });
 
-  test("视口足够高且窗口≥160 时只绘制附近行，数据窗口计数仍完整", async () => {
+  test("视口足够高且窗口≥80 时只绘制附近行，数据窗口计数仍完整", async () => {
     const scroller = document.createElement("div");
     document.body.appendChild(scroller);
     Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 600 });
@@ -2417,9 +2419,14 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     const list = screen.getByTestId("timeline-short-list");
     expect(list.getAttribute("data-timeline-window-count")).toBe("220");
     const painted = Number(list.getAttribute("data-timeline-paint-count"));
-    expect(painted).toBeGreaterThanOrEqual(36);
+    // PAINT_ENABLE_ITEMS 160→80, overscan 改按像素后 PAINT_MIN_ITEMS 36→12；
+    // 600px 视口邻域远小于整段 220 行，spacer 仍在。
+    expect(painted).toBeGreaterThanOrEqual(PAINT_MIN_ITEMS);
     expect(painted).toBeLessThan(220);
-    expect(scroller.querySelector("[data-testid=timeline-paint-spacer-bottom]")).toBeTruthy();
+    expect(
+      scroller.querySelector("[data-testid=timeline-paint-spacer-bottom]") ||
+      scroller.querySelector("[data-testid=timeline-paint-spacer-top]"),
+    ).toBeTruthy();
     scroller.remove();
   });
 
@@ -2541,6 +2548,96 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     expect(screen.queryByTestId("timeline-fatal-error")).toBeNull();
     visibilitySpy.mockRestore();
     view.unmount();
+    scroller.remove();
+  });
+
+  test("贴底后空闲预热行高，用户手势立即中止", async () => {
+    const queued: Array<() => void> = [];
+    const cancelIdle = vi.fn();
+    vi.stubGlobal("requestIdleCallback", (cb: () => void) => {
+      queued.push(cb);
+      return queued.length;
+    });
+    vi.stubGlobal("cancelIdleCallback", cancelIdle);
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = Array.from({ length: 40 }, (_, index) =>
+      mk("user", { id: "warm-row-" + index, text: "预热 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    await act(async () => {});
+    expect(queued.length).toBeGreaterThan(0);
+    fireEvent.wheel(scroller);
+    expect(cancelIdle).toHaveBeenCalled();
+    vi.unstubAllGlobals();
+    scroller.remove();
+  });
+
+  test("进会话即预取 MarkdownImpl chunk", () => {
+    const spy = vi.spyOn(MarkdownMod, "prefetchMarkdownImpl");
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    render(
+      <MessageList
+        messages={[mk("user", { id: "prefetch-user", text: "hi", status: "sent" })]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    expect(spy).toHaveBeenCalled();
+    spy.mockRestore();
+    scroller.remove();
+  });
+
+  test("初始尾部 deferred locator 不等 IntersectionObserver 即兑付", async () => {
+    vi.stubGlobal("IntersectionObserver", class {
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+      takeRecords() { return []; }
+    });
+    const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([
+      mk("assistant", { id: "eager-body", text: "提前兑付的正文" }),
+    ]);
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = [
+      ...Array.from({ length: 12 }, (_, index) =>
+        mk("user", { id: "eager-early-" + index, text: "早记录 " + index, status: "sent" }),
+      ),
+      mk("assistant", {
+        id: "eager-body",
+        text: "",
+        _payloadDeferred: true,
+        _turnTapeId: "tape-eager",
+        _recordOrdinal: 3,
+      }),
+    ];
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{ onFetchTapeRecordPayload }}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    await waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalled());
+    expect(await screen.findByText("提前兑付的正文")).toBeInTheDocument();
+    vi.unstubAllGlobals();
     scroller.remove();
   });
 });

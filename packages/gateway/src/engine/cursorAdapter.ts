@@ -1336,8 +1336,7 @@ function validateCursorFinalPrompt(prompt: string, payloadBytes: number): void {
 interface CursorMemoryMcpConfigInput {
   launch: McpMemoryLaunch
   tokenFile: string
-  /** Signed delegate-context file; MCP send_to_agent / async /delegate auth. */
-  contextFile?: string
+  delegateContextFile: string
   agentId: string
   projectId?: string
   sessionKey: string
@@ -1356,7 +1355,7 @@ function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<s
     OPENCLAUDE_SESSION_KEY: input.sessionKey,
     OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
     OPENCLAUDE_GATEWAY_TOKEN_FILE: input.tokenFile,
-    ...(input.contextFile ? { OPENCLAUDE_DELEGATE_CONTEXT_FILE: input.contextFile } : {}),
+    OPENCLAUDE_DELEGATE_CONTEXT_FILE: input.delegateContextFile,
     OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),
     OPENCLAUDE_ENGINE: 'cursor',
     ...(process.env.OPENCLAUDE_HOME ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME } : {}),
@@ -1598,7 +1597,14 @@ export function relocateCursorResumeStore(opts: {
     const destDir = cursorResumeStoreDir(currentWorkspacePath, resumeId)
     const destStore = join(destDir, 'store.db')
     if (existsSync(destDir)) {
-      return cursorStoreDbReady(destStore) ? { resumeId, relocated: false } : undefined
+      if (cursorStoreDbReady(destStore)) return { resumeId, relocated: false }
+      // destDir exists but has no usable store.db file. Clear leftover then continue.
+      try {
+        rmSync(destDir, { recursive: true, force: true })
+      } catch {
+        return undefined
+      }
+      if (existsSync(destDir) || cursorStoreDbReady(destStore)) return undefined
     }
 
     const env = opts.env ?? process.env
@@ -1914,7 +1920,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         const mcpConfig = buildCursorMemoryMcpConfig({
           launch: mcpLaunch,
           tokenFile,
-          contextFile,
+          delegateContextFile: contextFile,
           agentId: this.opts.agentId,
           projectId: this.opts.projectId,
           sessionKey: this.opts.sessionKey,

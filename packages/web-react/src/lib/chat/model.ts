@@ -509,6 +509,8 @@ export type ChatMessage = {
   summary?: string;
   /** 已被某 agent-group adopt（待移除）。*/
   _adoptedInto?: string;
+  /** 已从时间线摘掉的父工具 blockId（如 oc-memory delegate-wait），其 tool_result 不得再新建卡。*/
+  _swallowedToolBlockIds?: string[];
 
   // ── plan ──
   explanation?: string;
@@ -828,9 +830,14 @@ export function rebuildIndexes(sess: ChatSession): void {
       typeof m._turnTapeProcessLoadedFrom === "string"
     ) continue;
     if (m.blockId) sess._blockIdToMsgId.set(m.blockId, m.id);
-    if (m.role === "agent-group" && m.blockId) {
-      sess._agentGroups.set(m.blockId, m.id);
-      if (Array.isArray(m.childBlocks)) {
+    if (m.role === "agent-group") {
+      if (m.blockId) sess._agentGroups.set(m.blockId, m.id);
+      if (Array.isArray(m._swallowedToolBlockIds)) {
+        for (const id of m._swallowedToolBlockIds) {
+          if (id) sess._blockIdToMsgId.set(id, m.id);
+        }
+      }
+      if (m.blockId && Array.isArray(m.childBlocks)) {
         for (const ch of m.childBlocks) {
           if (ch && ch.kind === "tool_use" && ch.blockId && /^Agent$/i.test(ch.toolName || "")) {
             sess._agentGroups.set(ch.blockId, m.id);

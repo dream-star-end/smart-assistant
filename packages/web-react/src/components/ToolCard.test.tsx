@@ -7,6 +7,21 @@ import { ToolCard } from "./ToolCard";
 afterEach(cleanup);
 
 describe("ToolCard 二级分派 + 状态 (P5)", () => {
+  test("带 task_ids 的 TaskOutput 标签是等待输出", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "TaskOutput",
+          inputJson: { task_ids: ["call-7fc87448-146b-411e-973e-a9271d19fe32-63"], description: "" },
+          _completed: false,
+        }}
+      />,
+    );
+    expect(screen.getByText("等待输出")).toBeInTheDocument();
+    expect(screen.queryByText("子任务结果")).toBeNull();
+    expect(screen.getByText(/等待后台命令/)).toBeInTheDocument();
+  });
+
   test("Bash 运行中：spinner + 默认展开终端命令", () => {
     const { container } = render(
       <ToolCard message={{ toolName: "Bash", inputJson: { command: "ls -la" }, _completed: false }} />,
@@ -1430,7 +1445,7 @@ describe("缺陷 #8：Cursor 工具卡正文不得退化成字面 Bash", () => {
         }}
       />,
     );
-    expect(screen.getByText("委派子任务")).toBeInTheDocument();
+    expect(screen.getAllByText("委派子任务").length).toBeGreaterThan(0);
     expect(screen.queryByText("Bash")).not.toBeInTheDocument();
     expect(document.body.textContent || "").not.toMatch(/\$\s*oc-memory/);
   });
