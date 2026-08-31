@@ -1805,7 +1805,11 @@ async function appendRecoveryGiveUpTerminalCard(
     role: "assistant",
     text,
     ts: Date.now(),
+    // status:"completed" 是前端把用户角标从「已发送」翻成「已回复」的唯一谓词
+    // (web/modules/messages.js _deriveUserMsgStatus);缺了它这张卡等于没发。
+    status: "completed",
     _source: "server",
+    _clientMessageId: input.rootClientMessageId,
   });
 }
 
