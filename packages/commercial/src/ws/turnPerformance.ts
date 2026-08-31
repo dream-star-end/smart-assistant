@@ -203,6 +203,8 @@ export class FirstVisiblePersistGate {
   /** True iff this frame should start a persist round. */
   begin(traceId: string): boolean {
     if (this.persisted.has(traceId) || this.inflight.has(traceId)) return false;
+    // Per bridge generation, 9 attempts (maxRounds=3 x 3). Reconnect / failedRounds
+    // eviction re-grants budget on purpose so a recovered PG can still persist.
     if ((this.failedRounds.get(traceId) ?? 0) >= this.maxRounds) return false;
     this.inflight.add(traceId);
     return true;

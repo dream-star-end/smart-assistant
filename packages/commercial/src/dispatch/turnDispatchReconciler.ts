@@ -673,18 +673,31 @@ type VisibleOrphanScanRow = {
  * OCV5-57 r3 W2: one prefetch per tick instead of a correlated subquery
  * per open dispatch. Session matching uses exact suffix (r3 W1), then
  * firstVisibleAtMsForDispatch attributes in memory.
+ *
+ * OCV5-57 r5 W1: NULL-dispatch arm filters this page's
+ * (user_id, session_id, admitted_at) pairs in SQL (exact suffix via
+ * equality / right(), no LIKE). Each pair uses its own admitted lower
+ * bound instead of the page-wide earliest admitted_at. Do not LIMIT the
+ * result set — that would truncate liveness evidence.
  */
 async function prefetchFirstVisibleTraces(
   pool: Pool,
   dispatches: VisibleOrphanScanRow[],
 ): Promise<TraceFirstVisibleRow[] | null> {
   if (dispatches.length === 0) return []
-  const userIds = [...new Set(dispatches.map((d) => d.user_id))]
   const dispatchIds = [...new Set(dispatches.map((d) => d.dispatch_id))]
-  let minAdmitted = dispatches[0]!.admitted_at
+  const pairByKey = new Map<string, { userId: string; sessionId: string; admittedAt: Date }>()
   for (const d of dispatches) {
-    if (d.admitted_at < minAdmitted) minAdmitted = d.admitted_at
+    const key = `${d.user_id}\t${d.session_id}`
+    const prev = pairByKey.get(key)
+    if (!prev || d.admitted_at < prev.admittedAt) {
+      pairByKey.set(key, { userId: d.user_id, sessionId: d.session_id, admittedAt: d.admitted_at })
+    }
   }
+  const pairs = [...pairByKey.values()]
+  const userIds = pairs.map((p) => p.userId)
+  const sessionIds = pairs.map((p) => p.sessionId)
+  const admittedAts = pairs.map((p) => p.admittedAt)
   try {
     const result = await pool.query<{
       dispatch_id: string | null
@@ -708,9 +721,19 @@ async function prefetchFirstVisibleTraces(
           FROM turn_traces tr
          WHERE tr.first_visible_at IS NOT NULL
            AND tr.dispatch_id IS NULL
-           AND tr.user_id = ANY($2::bigint[])
-           AND tr.first_visible_at >= $3`,
-      [dispatchIds, userIds, minAdmitted],
+           AND EXISTS (
+             SELECT 1
+               FROM unnest($2::bigint[], $3::text[], $4::timestamptz[])
+                 AS cand(user_id, session_id, admitted_at)
+              WHERE tr.user_id = cand.user_id
+                AND (
+                  tr.session_key = cand.session_id
+                  OR right(tr.session_key, char_length(cand.session_id) + 1)
+                     = ':' || cand.session_id
+                )
+                AND tr.first_visible_at >= cand.admitted_at
+           )`,
+      [dispatchIds, userIds, sessionIds, admittedAts],
     )
     return result.rows.map((row) => ({
       dispatchId: row.dispatch_id,

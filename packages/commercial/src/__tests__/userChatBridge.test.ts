@@ -3895,7 +3895,7 @@ describe("userChatBridge — first_visible persist is not permanently suppressed
           if (n <= 3) throw new Error("pg blip");
           return { rowCount: 1, rows: [] };
         }
-        return innerQuery(sql, params);
+        return innerQuery(s, params);
       },
     } as UserChatBridgeDeps["pgPool"];
     const rig = await startRig({
@@ -3934,7 +3934,7 @@ describe("userChatBridge — first_visible persist is not permanently suppressed
           n += 1;
           throw new Error("pg down");
         }
-        return innerQuery(sql, params);
+        return innerQuery(s, params);
       },
     } as UserChatBridgeDeps["pgPool"];
     const rig = await startRig({

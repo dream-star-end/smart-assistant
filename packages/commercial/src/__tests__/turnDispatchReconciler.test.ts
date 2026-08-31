@@ -1212,7 +1212,12 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.ok(prefetch.includes("session_key"), "prefetch matches session_key")
     assert.ok(prefetch.includes("UNION ALL"), "prefetch is one-shot UNION, not per-row subquery")
     assert.equal(/LIKE/i.test(prefetch), false, "prefetch must not use LIKE wildcards")
-    assert.equal(prefetch.includes("right("), false, "session suffix is applied in memory")
+    assert.ok(prefetch.includes("unnest("), "NULL-dispatch arm binds this page's candidate pairs")
+    assert.ok(prefetch.includes("right("), "NULL-dispatch arm uses exact suffix via right(), not LIKE")
+    assert.ok(
+      prefetch.includes("char_length(cand.session_id) + 1"),
+      "suffix length is ':' + session_id, matching visibleOrphan endsWith",
+    )
   })
 
   test("OCV5-43 hydrate-dead engine attempts interrupt fence even if CAS misses", async () => {
