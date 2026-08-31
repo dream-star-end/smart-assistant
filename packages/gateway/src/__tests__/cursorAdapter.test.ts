@@ -463,6 +463,7 @@ const fs=require('node:fs'); const crypto=require('node:crypto');
 const configPath=process.env.OPENCLAUDE_CURSOR_MCP_CONFIG;
 const configText=fs.readFileSync(configPath,'utf8'); const config=JSON.parse(configText);
 const mcpEnv=config.mcpServers['openclaude-memory'].env; const tokenFile=mcpEnv.OPENCLAUDE_GATEWAY_TOKEN_FILE;
+const delegateContextFile=mcpEnv.OPENCLAUDE_DELEGATE_CONTEXT_FILE;
 fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({
   argv:process.argv.slice(2), key:process.env.CURSOR_API_KEY,
   gatewayTokenEnv:process.env.OPENCLAUDE_GATEWAY_TOKEN, configPath, configText, config,
@@ -471,6 +472,7 @@ fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({
   tokenHash:crypto.createHash('sha256').update(fs.readFileSync(tokenFile)).digest('hex'),
   configMode:fs.statSync(configPath).mode & 0o777, tokenMode:fs.statSync(tokenFile).mode & 0o777,
   contextMode:fs.statSync(require('node:path').dirname(configPath)).mode & 0o777,
+  delegateContextFile, delegateContextMode:fs.statSync(delegateContextFile).mode & 0o777,
 }))
 for(const e of [
   {type:'system',subtype:'init',apiKeySource:'env',model:'Auto'},
@@ -569,6 +571,13 @@ for(const e of [
         'command',
         'env',
       ])
+      // spawn MCP json contains delegate-context path with mode 0600 and the file is removed after the turn
+      const mcpEnv = launched.config.mcpServers['openclaude-memory'].env as Record<string, string>
+      assert.equal(typeof launched.delegateContextFile, 'string')
+      assert.equal(mcpEnv.OPENCLAUDE_DELEGATE_CONTEXT_FILE, launched.delegateContextFile)
+      assert.equal(path.basename(launched.delegateContextFile), 'delegate-context')
+      assert.equal(path.dirname(launched.delegateContextFile), path.dirname(launched.configPath))
+      assert.equal(launched.delegateContextMode, 0o600)
       assert.equal(launched.configText.includes(GATEWAY_SECRET), false)
       assert.equal(JSON.stringify(launched.argv).includes(GATEWAY_SECRET), false)
       const prompt = launched.argv.at(-1) as string
@@ -585,6 +594,7 @@ for(const e of [
       )
       assert.equal(JSON.stringify(events).includes(sentinel), false)
       await assert.rejects(stat(launched.configPath))
+      await assert.rejects(stat(launched.delegateContextFile))
     } finally {
       restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
       restoreEnv('OPENCLAUDE_BASELINE_SKILLS_DIR', oldBaselineSkills)

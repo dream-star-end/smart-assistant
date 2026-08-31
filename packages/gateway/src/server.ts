@@ -711,7 +711,7 @@ export function resolveExecutionModel(
   ) {
     throw new LocalExecutionRejected(
       'DELEGATE_MODEL_UNKNOWN',
-      `model '${preferred}' is not in the current catalog projection (not inherited)`,
+      `unknown explicit delegate model '${preferred}' (not inherited)`,
     )
   }
   for (const m of [preferred, fallback, ...EXECUTION_MODEL_FALLBACK_ROUTE]) {
