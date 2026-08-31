@@ -1508,6 +1508,8 @@ export interface UserChatBridgeHandler {
     uid: string,
     executor: CronOriginExecutor,
   ): void;
+  /** @internal test seam: inspect the real executor registered by attestation. */
+  _testGetCronOriginExecutor(uid: string): CronOriginExecutor | null;
 }
 
 export type CronOriginInjectInput = {
@@ -2883,7 +2885,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (containerHasDurableDispatch && deps.admitUserTurn && cronOriginExecutor === null) {
         cronOriginExecutor = (payload) => {
           admittedDispatches.set(payload.admitted.clientMessageId, payload.admitted);
-          executeAdmittedTurn(payload.encoded, false, "cron_origin");
+          const enrichment = trackEnrichmentDispatch(
+            payload.admitted,
+            "bridge_closed_before_cron_enrichment",
+          );
+          if (!isEnriching(enrichment)) return;
+          ensureDispatchHeartbeat();
+          executeAdmittedTurn(
+            payload.encoded,
+            false,
+            "cron_origin",
+            undefined,
+            undefined,
+            Date.now(),
+            enrichment,
+          );
         };
         const key = uid.toString();
         let executors = uidToCronOriginExecutors.get(key);
@@ -3457,6 +3473,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     interface EnrichmentDispatchState {
       record: AdmittedDispatch;
       phase: EnrichmentDispatchPhase;
+      /** Absolute authority; timer is only a wake-up mechanism. */
+      deadlineAt: number;
       timer: ReturnType<typeof setTimeout> | null;
     }
     // Linearization boundary for the only proven unsafe window: a durable
@@ -3465,6 +3483,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // timeout may terminalize only `enriching`; once `transferred`, the existing
     // durable receipt/recovery/billing state machine remains authoritative.
     const enrichmentDispatches = new Map<string, EnrichmentDispatchState>();
+    const enrichmentDeadlineChecks = new WeakMap<EnrichmentDispatchState, () => boolean>();
     const preparedEnrichmentFrames = new WeakMap<Record<string, unknown>, EnrichmentDispatchState>();
     const transferredDispatches = new Set<string>();
     let dispatchHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -3490,6 +3509,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     ): boolean => {
       if (state.phase !== "enriching") return false;
       state.phase = "terminalizing";
+      enrichmentDeadlineChecks.delete(state);
       if (state.timer !== null) {
         clearTimeout(state.timer);
         state.timer = null;
@@ -3538,20 +3558,29 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     ): EnrichmentDispatchState => {
       const existing = enrichmentDispatches.get(record.clientMessageId);
       if (existing && existing.record === record) return existing;
-      const state: EnrichmentDispatchState = { record, phase: "enriching", timer: null };
+      const state: EnrichmentDispatchState = {
+        record,
+        phase: "enriching",
+        deadlineAt: Date.now() + promptQueuePreparationTimeoutMs,
+        timer: null,
+      };
       enrichmentDispatches.set(record.clientMessageId, state);
-      state.timer = setTimeout(() => {
-        if (terminalizeEnrichmentDispatch(state, "dispatch_enrichment_timeout")) {
-          if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-            sendErrorFrame(
-              userWs,
-              "DISPATCH_ENRICHMENT_TIMEOUT",
-              "session context took too long to prepare; retry this turn",
-              { peerId: record.sessionId, clientMessageId: record.clientMessageId },
-            );
-          }
+      const expireIfDue = (): boolean => {
+        if (state.phase !== "enriching" || Date.now() < state.deadlineAt) return false;
+        if (!terminalizeEnrichmentDispatch(state, "dispatch_enrichment_timeout")) return false;
+        if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+          sendErrorFrame(
+            userWs,
+            "DISPATCH_ENRICHMENT_TIMEOUT",
+            "session context took too long to prepare; retry this turn",
+            { peerId: record.sessionId, clientMessageId: record.clientMessageId },
+          );
         }
-      }, promptQueuePreparationTimeoutMs);
+        return true;
+      };
+      // Store the absolute check on the state without exposing it to callers.
+      enrichmentDeadlineChecks.set(state, expireIfDue);
+      state.timer = setTimeout(expireIfDue, Math.max(0, state.deadlineAt - Date.now()));
       state.timer.unref?.();
       // Admission may commit after this bridge already completed cleanup. Own
       // the row first, then terminalize in the same synchronous continuation;
@@ -3629,7 +3658,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (prepared !== undefined) {
         preparedEnrichmentFrames.delete(frameObj);
         if (prepared.phase !== "enriching") return undefined;
+        // A blocked event loop may delay the timer callback. The absolute
+        // deadline is the authority at the transfer CAS, not setTimeout.
+        if (enrichmentDeadlineChecks.get(prepared)?.() === true) return undefined;
+        if (prepared.phase !== "enriching") return undefined;
         prepared.phase = "transferred";
+        enrichmentDeadlineChecks.delete(prepared);
         if (prepared.timer !== null) {
           clearTimeout(prepared.timer);
           prepared.timer = null;
@@ -3754,6 +3788,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       onReject?: (code: string) => void,
       historyModel: string | null = typeof frameObj.model === "string" ? frameObj.model : null,
       recoveryJob?: ClaimedRecoveryJob,
+      pretrackedEnrichment?: EnrichmentDispatchState,
     ): Promise<Record<string, unknown> | null> => {
       const peer = frameObj.peer;
       const peerId =
@@ -3912,9 +3947,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // B3(R3):本帧受理成功后落此(= 刚受理 dispatch 的 clientMessageId)。受理**之后**的任何 pre-forward
       // 失败出口(goal unavailable / sanitize 抛 / 任意异常 / 未预期早 return)必须据此 CAS terminal +
       // drop,否则留 admitted 永续租孤儿 + 无可见终态(违反 I1)。成功交棒调用方前置空(所有权移交)。
-      let admittedThisFrame: EnrichmentDispatchState | null = null;
+      let admittedThisFrame: EnrichmentDispatchState | null = pretrackedEnrichment ?? null;
       let sessionWorkspaceMode: SessionWorkspaceMode | null = null;
-      if (clientMessageId !== null) {
+      if (admittedThisFrame !== null && !isEnriching(admittedThisFrame)) return null;
+      if (clientMessageId !== null && admittedThisFrame === null) {
         const preAdmitted = admittedDispatches.get(clientMessageId);
         if (preAdmitted !== undefined) {
           admittedThisFrame = trackEnrichmentDispatch(preAdmitted);
@@ -4436,6 +4472,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       dispatchRequest?: PromptQueueDispatchRequest,
       recoveryJob?: ClaimedRecoveryJob,
       receivedAtMs = Date.now(),
+      pretrackedEnrichment?: EnrichmentDispatchState,
     ): void => {
       const isPromptQueueDispatch = ingress === "prompt_queue";
       const isCronOriginDispatch = ingress === "cron_origin";
@@ -5473,7 +5510,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor requires the account-owned local runtime', cursorTurnIdentity);
               return;
             }
-            const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch && !isCronOriginDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob);
+            const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch && !isCronOriginDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob, pretrackedEnrichment);
             if (enriched === null) return;
             dispatchRecord = lookupAdmittedDispatch(enriched);
             let authorityExec: ResolvedTurnExecution | null = null;
@@ -5562,7 +5599,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               return;
             }
             const zcodeModelId = modelCapture;
-            const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch && !isCronOriginDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob);
+            const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch && !isCronOriginDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob, pretrackedEnrichment);
             if (enriched === null) return;
             dispatchRecord = lookupAdmittedDispatch(enriched);
             let authorityExec: ResolvedTurnExecution | null = null;
@@ -5692,6 +5729,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               rejectPromptQueueDispatch,
               authorityModelCapture,
               recoveryJob,
+              pretrackedEnrichment,
             );
             // null:attachMasterTurnState 已在内部拒轮(含 dispatch 终态化 + onReject);此处直接 return。
             if (enrichedParsed === null) return;
@@ -5884,6 +5922,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               rejectPromptQueueDispatch,
               authorityModelCapture,
               recoveryJob,
+              pretrackedEnrichment,
             );
             if (preparedInbound === null || !isCurrentCodexTurnState(codexTurnState)) return;
             dispatchRecordB = lookupAdmittedDispatch(preparedInbound);
@@ -6667,6 +6706,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               rejectPromptQueueDispatch,
               authorityModelCapture,
               recoveryJob,
+              pretrackedEnrichment,
             );
             if (enrichedParsed === null) return;
             dispatchRecordC = lookupAdmittedDispatch(enrichedParsed);
@@ -9117,6 +9157,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     set.add(executor);
   }
 
+  function _testGetCronOriginExecutor(uid: string): CronOriginExecutor | null {
+    const set = uidToCronOriginExecutors.get(uid);
+    return set ? [...set][0] ?? null : null;
+  }
+
   return {
     handleUpgrade,
     shutdown,
@@ -9128,6 +9173,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     onlineUserSubset,
     injectCronOriginTurn,
     _testRegisterCronOriginExecutor,
+    _testGetCronOriginExecutor,
   };
 }
 

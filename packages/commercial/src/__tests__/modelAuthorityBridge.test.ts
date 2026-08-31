@@ -1649,6 +1649,105 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       await stopRig(rig);
     }
   });
+
+
+  test("R4-B4 event loop 阻塞越过 deadline → transfer 同步拒绝，不依赖 timer callback", async () => {
+    const queries: { sql: string; params: unknown[] }[] = [];
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        return { rows: [], rowCount: 1 };
+      },
+    };
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      pgPool,
+      admitUserTurn: async (input) => fakeAdmittedDispatch(input),
+      loadMasterSessionMessages: async () => {
+        const until = Date.now() + 80;
+        while (Date.now() < until) { /* block timers intentionally */ }
+        return [];
+      },
+      promptQueuePreparationTimeoutMs: 20,
+    });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(inboundFrame({
+        clientMessageId: "cm-history-blocked-loop",
+        idempotencyKey: "web:cm-history-blocked-loop:0",
+        peer: { id: "sess-history-blocked-loop", kind: "dm" },
+      }));
+      await waitFor(() => queries.some((q) => q.params[2] === "dispatch_enrichment_timeout"), 500);
+      assert.equal(rig.containerSeen.some((row) => row.includes('"type":"inbound.message"')), false);
+      ws.terminate();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+
+  test("R4-B5 cron 预置 dispatch 在 attach 前即受 lifecycle 保护", async () => {
+    const queries: { sql: string; params: unknown[] }[] = [];
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        return { rows: [], rowCount: 1 };
+      },
+    };
+    let historyStarted = false;
+    let releaseHistory: ((rows: unknown[]) => void) | null = null;
+    const historyGate = new Promise<unknown[]>((resolve) => { releaseHistory = resolve; });
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      pgPool,
+      admitUserTurn: async (input) => fakeAdmittedDispatch(input),
+      loadMasterSessionMessages: async () => {
+        historyStarted = true;
+        return await historyGate;
+      },
+      promptQueuePreparationTimeoutMs: 2_000,
+    });
+    try {
+      const ws = await openClient(rig.port);
+      let executor = rig.bridge._testGetCronOriginExecutor(String(UID));
+      await waitFor(() => {
+        executor = rig.bridge._testGetCronOriginExecutor(String(UID));
+        return executor !== null;
+      });
+      executor!({
+        encoded: Buffer.from(inboundFrame({
+          clientMessageId: "cron-origin-enrichment-race",
+          peer: { id: "sess-cron-enrichment", kind: "dm" },
+          model: "glm-5.2",
+        }), "utf8"),
+        admitted: {
+          clientMessageId: "cron-origin-enrichment-race",
+          sessionId: "sess-cron-enrichment",
+          dispatchId: "11111111-2222-4333-8444-555555555555",
+          billingRequestId: "0123456789abcdef0123456789abcdef",
+          attemptNo: 1,
+          leaseEpoch: 1,
+          anchorSeq: 1n,
+          requestHash: "a".repeat(64),
+        },
+      });
+      await waitFor(() => historyStarted);
+      ws.close();
+      await waitFor(() => queries.some((q) => q.params[2] === "client_disconnected_before_enrichment_transfer"), 500);
+      const casQ = queries.find((q) => q.params[2] === "client_disconnected_before_enrichment_transfer")!;
+      assert.deepEqual(casQ.params[5], ["admitted"]);
+      releaseHistory!([]);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(rig.containerSeen.some((row) => row.includes('"type":"inbound.message"')), false);
+      ws.terminate();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      await stopRig(rig);
+    }
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
