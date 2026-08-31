@@ -38,5 +38,17 @@ export function classifyVisibleOrphan(row: VisibleOrphanEvidence): VisibleOrphan
   if (!partsComplete && quietMs >= ENGINE_DEAD_QUIET_MS && !row.containerRunning) {
     return "interrupt_tapeless";
   }
+  // 引擎进程死了但容器还活着（容器内崩溃/被杀）时，containerRunning 永远为 true，
+  // 旧判据会把这种 tapeless dispatch 永远 skip：不中断、不恢复、不出终态卡，用户端
+  // 永远停在「已发送」（2026-08-31 webmtd63p5mm747zh 实锤）。存活的引擎在 accepted
+  // 后必会尽快发出至少一帧（ack/thinking）；从无任何帧且静默超阈 = 引擎已死，
+  // 与容器存活与否无关。
+  if (
+    !partsComplete &&
+    row.lastFrameAtMs === null &&
+    quietMs >= ENGINE_DEAD_QUIET_MS
+  ) {
+    return "interrupt_tapeless";
+  }
   return "skip";
 }

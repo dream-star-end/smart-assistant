@@ -706,6 +706,22 @@ describe("kick — single-flight", () => {
 });
 
 describe("drainOnce — settlement handoff retry cap (rev2 B1)", () => {
+  test("quarantines fatal 409 immutable conflict instead of retrying forever", async () => {
+    // 2026-08-31 settlement conflict 风暴:409 重试恒失败,必须一次即隔离。
+    const q = makeV3MasterRetryQueue({
+      dir,
+      attemptSend: async () => {
+        throw new V3SinkError("immutable_conflict: TURN_TAPE_CONFLICT", "fatal", 409);
+      },
+    });
+    await writeEntryDirect(entry());
+    const stats = await q.drainOnce();
+    assert.equal(stats.fatalDropped, 1);
+    assert.equal(stats.retried, 0);
+    const names = await readdir(dir);
+    assert.ok(names.some((n) => n.includes("quarantine-immutable_conflict-")));
+  });
+
   test("does not cap before settlementHandoff even at high attempts", async () => {
     const q = makeV3MasterRetryQueue({
       dir,

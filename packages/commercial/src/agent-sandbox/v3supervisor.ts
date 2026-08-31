@@ -2857,7 +2857,7 @@ export async function provisionV3Container(
           assertFlavorIdentity();
         } catch (err) {
           if (err instanceof FlavorIdentityError) {
-            throw new SupervisorError(`selfhost engine-local-turn env refused: ${err.message}`);
+            throw new SupervisorError("InvalidArgument", `selfhost engine-local-turn env refused: ${err.message}`);
           }
           throw err;
         }

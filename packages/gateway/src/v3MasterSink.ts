@@ -519,9 +519,16 @@ async function postLosslessTurnTapeEnvelope(
   if (status === 410) {
     throw new V3SinkError(`session_deleted: ${truncateForLog(bodyText)}`, 'fatal', status)
   }
-  // Contract conflicts, auth errors, body errors and server errors are all
-  // operationally repairable. Keep retrying the immutable local tape; 410 is
-  // the sole deletion acknowledgement allowed to discard it.
+  if (status === 409) {
+    // 409 TURN_TAPE_CONFLICT = master 侧同 tapeId 已有不可变且内容不同的裁定
+    // (header/dispatch identity/settlement)。本地 tape 字节同样不可变,重试永远
+    // 得到同一冲突——归类 fatal 交给 drainer quarantine,不再无限重试
+    // (2026-08-31 settlement conflict 后台风暴实锤;永久失败不重试红线)。
+    throw new V3SinkError(`immutable_conflict: ${truncateForLog(bodyText)}`, 'fatal', status)
+  }
+  // Auth errors, body errors and server errors are all operationally
+  // repairable. Keep retrying the immutable local tape; 410 is the sole
+  // deletion acknowledgement and 409 the sole quarantine acknowledgement.
   throw new V3SinkError(`master ${status}: ${truncateForLog(bodyText)}`, 'transient', status)
 }
 
@@ -650,6 +657,10 @@ async function postServerAuthoredJson(body: unknown, deps: AttemptSendDeps): Pro
   }
   if (status === 410) {
     throw new V3SinkError(`session_deleted: ${truncateForLog(bodyText)}`, 'fatal', status)
+  }
+  if (status === 409) {
+    // 与 postLosslessTurnTapeEnvelope 一致:不可变冲突重试恒失败,交 drainer quarantine。
+    throw new V3SinkError(`immutable_conflict: ${truncateForLog(bodyText)}`, 'fatal', status)
   }
   throw new V3SinkError(`master ${status}: ${truncateForLog(bodyText)}`, 'transient', status)
 }
