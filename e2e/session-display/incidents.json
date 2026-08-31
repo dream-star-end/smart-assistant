@@ -2043,6 +2043,45 @@
           "assertion": "restart_cmd 失败;摘录 egress/master 最近日志"
         }
       ]
+    },
+    {
+      "id": "INC-20260831-TURNEND-ORDER-COLLAPSE",
+      "occurredAt": "2026-08-31",
+      "severity": "P1",
+      "symptom": "V5 selfhost 正常结束轮后，交错在 thinking/工具卡之间的正文段全部挤到整轮末尾，Phase-B 精确 tape 到达后恢复。内容不丢。根因是 Phase-A unpublished fallback 显式 drop live assistant，pending-exact 排除 assistant，owner reset 不认 text unit；fallback 无 ordinal 排在 tape 槽末。",
+      "rootFixCommit": "46380d50",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "Phase-A unpublished keeps interleaved live assistant fragments and omits fallback body"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "Phase-B ordinal assistants replace live fragments without duplicates"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "Phase-A unpublished then empty live-units reset keeps interleaved live assistant fragments"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "Phase-A unpublished then retired live-frames reset keeps interleaved live assistant fragments"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "Phase-B ordinal assistants replace interleaved live fragments without duplicates"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T59 Phase-A unpublished 后交错 live assistant 段仍保持 thinking/正文1/tool/正文2"
+        }
+      ]
     }
   ]
 }
