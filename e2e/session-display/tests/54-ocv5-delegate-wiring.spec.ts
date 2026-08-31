@@ -61,9 +61,9 @@ function snapshotJobs(db) {
     'con = sqlite3.connect(sys.argv[1])',
     'try:',
     '    ids = [row[0] for row in con.execute("SELECT job_id FROM delegate_jobs ORDER BY job_id")]',
-    'except sqlite3.OperationalError:',
-    '    ids = []',
-    'print(json.dumps({"exists": True, "count": len(ids), "ids": ids}))',
+    '    print(json.dumps({"exists": True, "readable": True, "count": len(ids), "ids": ids}))',
+    'except sqlite3.OperationalError as err:',
+    '    print(json.dumps({"exists": True, "readable": False, "count": 0, "ids": [], "error": str(err)}))',
   ].join('\n')
   const bins = ['python3', 'python']
   for (const bin of bins) {
