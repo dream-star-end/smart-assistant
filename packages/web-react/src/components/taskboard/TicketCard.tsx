@@ -170,6 +170,15 @@ export function TicketCard({
               {agent}
             </span>
           )}
+          {ticket.approvedBy && ticket.status !== 'backlog' && (
+            <span
+              data-testid="ticket-approver"
+              className="min-w-0 truncate text-caption text-muted"
+              title={ticket.approvedBy}
+            >
+              批准人 {assigneeLabel(ticket.approvedBy) ?? ticket.approvedBy}
+            </span>
+          )}
           {showUpdatedAt && (
             <TimeAgo
               value={ticket.updatedAt}

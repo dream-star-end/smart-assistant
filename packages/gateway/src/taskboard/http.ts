@@ -21,10 +21,8 @@ import {
 } from '@openclaude/storage'
 import { filterUserVisibleAgentsForManagement, isHiddenSystemAgentId } from '../agentVisibility.js'
 import { verifyJwt } from '../auth.js'
-import {
-  ModelCatalogUnavailableError,
-  getLocalCatalogView,
-} from '../modelCatalogClient.js'
+import { ModelCatalogUnavailableError, getLocalCatalogView } from '../modelCatalogClient.js'
+import { previewProjectContext, summarizeProjectContext } from '../projectContextPreview.js'
 import { createActivity, listActivities } from './db/activity.js'
 import { createComment, listComments } from './db/comments.js'
 import { COST_GROUP_BY, queryCostStats, ymdRangeMs } from './db/costStats.js'
@@ -79,8 +77,6 @@ import {
   getUsage,
   updateSettings,
 } from './db/settings.js'
-import { dispatchProjectMemory } from './projectMemoryHttp.js'
-import { previewProjectContext, summarizeProjectContext } from '../projectContextPreview.js'
 import {
   applyTemplate,
   applyTemplates,
@@ -134,6 +130,7 @@ import {
 } from './moveIntent.js'
 import { zonedYmd } from './notify.js'
 import { hasOpenBlockers, listOpenBlockers } from './patrol.js'
+import { dispatchProjectMemory } from './projectMemoryHttp.js'
 import { TaskboardTransitionDenied, assertTransition } from './stateMachine.js'
 
 export type { TaskboardSettings, TaskboardUsage }
@@ -218,8 +215,9 @@ export interface ResolveActorOptions {
  * ⚠ `bridgeVerified` 必须由 server.ts 传入 `checkBridgeBypass()` 的**真实校验结果**,
  * 不能在本层嗅 `X-OpenClaude-Bridge-Nonce` 请求头。该头是纯客户端可控输入:容器内的
  * agent 持有 gateway token,走回环调用时鉴权本就能过,再随手加一行伪造的 nonce 头就会
- * 被判成 human,从而给自己的单据点「完成」或自行批准开工 —— 正好击穿本系统
- * 「done 永远不属于 AI」的红线。真正的校验在 server.ts `checkBridgeBypass()`:
+ * 被判成 human,从而给自己的单据点「完成」—— 正好击穿本系统
+ * 「done 永远不属于 AI」的红线。积压批准(backlog→ready)对 agent 是合法的显式动作。
+ * 真正的校验在 server.ts `checkBridgeBypass()`:
  * 源 IP 必须是 docker 网桥网关、container-id 绑定、nonce 走 timingSafeEqual,
  * 回环调用方无法满足源 IP 这一条。
  *
@@ -688,7 +686,8 @@ async function dispatch(
   if (projectContext) {
     const id = decodeURIComponent(projectContext[1])
     if (method === 'GET') return handleGetProjectContext(res, db, id)
-    if (method === 'PUT') return handlePutProjectContext(res, await readJsonBody(req), db, actor, id)
+    if (method === 'PUT')
+      return handlePutProjectContext(res, await readJsonBody(req), db, actor, id)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -766,7 +765,8 @@ async function dispatch(
   if (pipelineStages) {
     const id = decodeURIComponent(pipelineStages[1])
     if (method === 'GET') return handleListStages(res, db, id)
-    if (method === 'POST') return handleCreateStage(res, await readJsonBody(req), db, id, actor, ctx)
+    if (method === 'POST')
+      return handleCreateStage(res, await readJsonBody(req), db, id, actor, ctx)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -782,7 +782,8 @@ async function dispatch(
   if (stageItem) {
     const id = decodeURIComponent(stageItem[1])
     if (method === 'GET') return handleGetStage(res, db, id)
-    if (method === 'PATCH') return handlePatchStage(res, await readJsonBody(req), db, id, actor, ctx)
+    if (method === 'PATCH')
+      return handlePatchStage(res, await readJsonBody(req), db, id, actor, ctx)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -1010,7 +1011,8 @@ async function handleGetRunContext(
     contextSha256: run.contextSha256 ?? null,
     contextVersion: run.contextVersion ?? null,
     currentVersion,
-    changed: run.contextVersion != null && currentVersion != null && run.contextVersion !== currentVersion,
+    changed:
+      run.contextVersion != null && currentVersion != null && run.contextVersion !== currentVersion,
     snapshot,
     disclaimer: '仅审计、不可逐字重放',
   })
@@ -1030,7 +1032,7 @@ async function handlePutProjectContext(
     throw new TaskboardValidationError('expectedVersion is required')
   }
   if (body.instructions !== undefined) {
-    const text = body.instructions === null ? null : asString(body.instructions) ?? ''
+    const text = body.instructions === null ? null : (asString(body.instructions) ?? '')
     const written = await writeProjectInstructions(project.id, text, expectedVersion, {
       key: project.key,
     })
@@ -1637,6 +1639,8 @@ function handleMove(
         nextStageId,
         intent.toStatus,
       )
+      const approving = ticket.status === 'backlog' && intent.toStatus === 'ready'
+      const returning = intent.toStatus === 'backlog'
       updated = updateTicket(db, ticket.id, expectedVersion, {
         status: intent.toStatus,
         stageId: nextStageId,
@@ -1646,7 +1650,21 @@ function handleMove(
             ? null
             : undefined,
         blockedReason: intent.action === 'return_to_backlog' ? null : undefined,
+        approvedBy: approving ? actorId : returning ? null : undefined,
+        approvedAt: approving ? Date.now() : returning ? null : undefined,
       })
+      if (approving) {
+        recordActivity(
+          db,
+          ticket.id,
+          actor,
+          actorId,
+          'ticket_approved',
+          'status',
+          ticket.status,
+          'ready',
+        )
+      }
     }
 
     const comment = createComment(db, {
@@ -1700,6 +1718,48 @@ function handleMove(
       commentId: result.commentId,
     },
   })
+}
+
+/**
+ * 积压批准:backlog→ready,留在当前站(缺 stage 则补流水线第一站)。
+ * 人与 agent 都可走;system 被状态机拦住。必须带 expectedVersion。
+ */
+function applyBacklogApproval(
+  db: TaskboardDb,
+  ticket: Ticket,
+  expectedVersion: number,
+  actor: Actor,
+  actorId: string,
+): Ticket {
+  assertTransition({
+    from: ticket.status,
+    to: 'ready',
+    actor,
+  })
+  let nextStageId = ticket.stageId
+  if (!nextStageId && ticket.pipelineId) {
+    nextStageId = listStages(db, ticket.pipelineId)[0]?.id ?? null
+  }
+  const now = Date.now()
+  return db.transaction(() => {
+    const updated = updateTicket(db, ticket.id, expectedVersion, {
+      status: 'ready',
+      stageId: nextStageId,
+      approvedBy: actorId,
+      approvedAt: now,
+    })
+    recordActivity(
+      db,
+      ticket.id,
+      actor,
+      actorId,
+      'ticket_approved',
+      'status',
+      ticket.status,
+      'ready',
+    )
+    return updated
+  })()
 }
 
 /** 与 POST …/approve 非关单路径同一套:下一站 + status=ready。 */
@@ -1786,6 +1846,12 @@ function handleReady(
   ticket: Ticket,
 ): void {
   const expectedVersion = requireExpectedVersion(body)
+  const actorId = actorIdOf(actor, asString(body.owner) ?? asString(body.author))
+  if (ticket.status === 'backlog') {
+    const updated = applyBacklogApproval(db, ticket, expectedVersion, actor, actorId)
+    sendJson(res, 200, { ok: true, ticket: updated })
+    return
+  }
   const stage = currentStage(db, ticket)
   assertTransition({
     from: ticket.status,
@@ -1795,16 +1861,7 @@ function handleReady(
     stageOnSuccess: stage?.onSuccess,
   })
   const updated = updateTicket(db, ticket.id, expectedVersion, { status: 'ready' })
-  recordActivity(
-    db,
-    ticket.id,
-    actor,
-    actorIdOf(actor),
-    'status_changed',
-    'status',
-    ticket.status,
-    'ready',
-  )
+  recordActivity(db, ticket.id, actor, actorId, 'status_changed', 'status', ticket.status, 'ready')
   sendJson(res, 200, { ok: true, ticket: updated })
 }
 
@@ -1990,6 +2047,16 @@ function handleApprove(
   ticket: Ticket,
 ): void {
   const expectedVersion = requireExpectedVersion(body)
+  const actorId = actorIdOf(
+    actor,
+    asString(body.owner) ?? asString(body.author),
+    currentStage(db, ticket)?.agentId,
+  )
+  if (ticket.status === 'backlog') {
+    const updated = applyBacklogApproval(db, ticket, expectedVersion, actor, actorId)
+    sendJson(res, 200, { ok: true, ticket: updated })
+    return
+  }
   const close = asBoolean(body.close) ?? false
   const stage = currentStage(db, ticket)
   const nxt = stage ? nextStage(db, stage) : null
@@ -2005,16 +2072,7 @@ function handleApprove(
       status: 'done',
       closedAt: Date.now(),
     })
-    recordActivity(
-      db,
-      ticket.id,
-      actor,
-      actorIdOf(actor),
-      'status_changed',
-      'status',
-      ticket.status,
-      'done',
-    )
+    recordActivity(db, ticket.id, actor, actorId, 'status_changed', 'status', ticket.status, 'done')
     sendJson(res, 200, { ok: true, ticket: updated })
     return
   }
@@ -2024,7 +2082,7 @@ function handleApprove(
     actor,
     autoClose: stage?.autoClose,
   })
-  const updated = applyHumanAckAdvance(db, ticket, expectedVersion, actor, actorIdOf(actor))
+  const updated = applyHumanAckAdvance(db, ticket, expectedVersion, actor, actorId)
   sendJson(res, 200, { ok: true, ticket: updated })
 }
 

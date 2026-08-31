@@ -84,6 +84,11 @@ export function migrate(db: TaskboardDb): void {
     if (current < 8) {
       ensureProjectSkillLedger(db)
     }
+    if (current < 9) {
+      // v9:积压批准履历。可空 = 尚未批准或旧行未知。禁止破坏性迁移。
+      db.exec('ALTER TABLE tb_ticket ADD COLUMN approved_by TEXT')
+      db.exec('ALTER TABLE tb_ticket ADD COLUMN approved_at INTEGER')
+    }
     db.pragma(`user_version = ${TASKBOARD_SCHEMA_VERSION}`)
     ensureSettingsRow(db)
   })

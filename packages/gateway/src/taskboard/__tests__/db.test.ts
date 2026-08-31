@@ -70,7 +70,7 @@ describe('schema / migrate', () => {
   it('建表后 user_version=5,重复 migrate 不报错不改版本', () => {
     const { db } = freshDb()
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
-    assert.equal(TASKBOARD_SCHEMA_VERSION, 8)
+    assert.equal(TASKBOARD_SCHEMA_VERSION, 9)
     migrate(db)
     migrate(db)
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
@@ -82,6 +82,9 @@ describe('schema / migrate', () => {
     const projCols = db.prepare(`PRAGMA table_info(tb_project)`).all() as Array<{ name: string }>
     assert.ok(projCols.some((c) => c.name === 'workspace_json'))
     assert.ok(projCols.some((c) => c.name === 'context_version'))
+    const ticketCols = db.prepare(`PRAGMA table_info(tb_ticket)`).all() as Array<{ name: string }>
+    assert.ok(ticketCols.some((c) => c.name === 'approved_by'))
+    assert.ok(ticketCols.some((c) => c.name === 'approved_at'))
     const tables = db
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tb_%'`)
       .all() as { name: string }[]
@@ -199,9 +202,7 @@ describe('schema / migrate', () => {
     const cols = db.prepare(`PRAGMA table_info(tb_pipeline_stage)`).all() as Array<{ name: string }>
     assert.ok(cols.some((c) => c.name === 'model'))
     const after = db
-      .prepare(
-        `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
-      )
+      .prepare(`SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`)
       .all() as Array<{
       id: string
       name: string
@@ -291,9 +292,7 @@ describe('schema / migrate', () => {
       )
       .run()
     const stageFpBefore = raw
-      .prepare(
-        `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
-      )
+      .prepare(`SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`)
       .all()
     const runFpBefore = raw
       .prepare(
@@ -315,9 +314,7 @@ describe('schema / migrate', () => {
       40,
     )
     const stageFpAfter = db
-      .prepare(
-        `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
-      )
+      .prepare(`SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`)
       .all()
     const runFpAfter = db
       .prepare(
@@ -326,9 +323,9 @@ describe('schema / migrate', () => {
       .all()
     assert.deepEqual(stageFpAfter, stageFpBefore)
     assert.deepEqual(runFpAfter, runFpBefore)
-    const imprecise = db
-      .prepare(`SELECT cost_imprecise FROM tb_ticket_run`)
-      .all() as Array<{ cost_imprecise: number | null }>
+    const imprecise = db.prepare(`SELECT cost_imprecise FROM tb_ticket_run`).all() as Array<{
+      cost_imprecise: number | null
+    }>
     assert.ok(imprecise.length > 0)
     assert.ok(imprecise.every((row) => row.cost_imprecise == null))
 

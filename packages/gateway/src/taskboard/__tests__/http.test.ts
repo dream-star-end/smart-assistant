@@ -241,7 +241,7 @@ describe('建项目自动 seed / 建单挂默认流水线', () => {
 })
 
 describe('状态机越权 403', () => {
-  it('agent 调 POST …/done → 403;agent 调 POST …/ready → 403', async () => {
+  it('agent 调 POST …/done → 403;积压可走 /ready 批准但不能关单', async () => {
     const db = freshDb()
     let ticketId = ''
     let version = 0
@@ -253,10 +253,12 @@ describe('状态机越权 403', () => {
     await withServer(agentCtx(db), async (base) => {
       const ready = await call(base, 'POST', `/api/board/tickets/${ticketId}/ready`, {
         expectedVersion: version,
+        owner: 'agent:main',
       })
-      assert.equal(ready.status, 403, JSON.stringify(ready.body))
-      assert.equal(ready.body.error, 'forbidden')
-      assert.equal(ready.body.code, 'forbidden')
+      assert.equal(ready.status, 200, JSON.stringify(ready.body))
+      assert.equal((ready.body.ticket as { status: string }).status, 'ready')
+      assert.equal((ready.body.ticket as { approvedBy: string }).approvedBy, 'agent:main')
+      version = (ready.body.ticket as { version: number }).version
 
       const done = await call(base, 'POST', `/api/board/tickets/${ticketId}/done`, {
         expectedVersion: version,
@@ -1145,11 +1147,14 @@ describe('stage ops actor hardening', () => {
   it('agent 不能创建阶段、套模板或在建项目时走 templateIds 旁路', async () => {
     const db = freshDb()
     await withServer(agentCtx(db), async (base) => {
-      const created = await call(base, 'POST', '/api/board/projects', { key: 'AGT', name: 'Agent project' })
+      const created = await call(base, 'POST', '/api/board/projects', {
+        key: 'AGT',
+        name: 'Agent project',
+      })
       assert.equal(created.status, 201)
       const projectId = (created.body.project as { id: string }).id
       const pipelines = await call(base, 'GET', `/api/board/pipelines?projectId=${projectId}`)
-      const pipelineId = ((pipelines.body.items as Array<{ id: string }>)[0]).id
+      const pipelineId = (pipelines.body.items as Array<{ id: string }>)[0].id
 
       const stage = await call(base, 'POST', `/api/board/pipelines/${pipelineId}/stages`, {
         name: '绕过阶段',
@@ -1187,7 +1192,7 @@ describe('stage ops actor hardening', () => {
       const created = await call(base, 'POST', '/api/board/projects', { key: 'UX', name: 'UX' })
       const projectId = (created.body.project as { id: string }).id
       const pipelines = await call(base, 'GET', `/api/board/pipelines?projectId=${projectId}`)
-      const pipelineId = ((pipelines.body.items as Array<{ id: string }>)[0]).id
+      const pipelineId = (pipelines.body.items as Array<{ id: string }>)[0].id
       const stage = await call(base, 'POST', `/api/board/pipelines/${pipelineId}/stages`, {
         name: '额外阶段',
         kind: 'ai',
@@ -1199,14 +1204,123 @@ describe('stage ops actor hardening', () => {
       stageId = (stage.body.stage as { id: string }).id
     })
 
-    await withServer(humanCtx(db, {
-      isAvailableStageModel: async () => { throw new Error('catalog down') },
-    }), async (base) => {
-      const patched = await call(base, 'PATCH', `/api/board/stages/${stageId}`, {
-        model: 'glm-5.2',
-        timeoutSec: 600,
+    await withServer(
+      humanCtx(db, {
+        isAvailableStageModel: async () => {
+          throw new Error('catalog down')
+        },
+      }),
+      async (base) => {
+        const patched = await call(base, 'PATCH', `/api/board/stages/${stageId}`, {
+          model: 'glm-5.2',
+          timeoutSec: 600,
+        })
+        assert.equal(patched.status, 200, JSON.stringify(patched.body))
+      },
+    )
+    db.close()
+  })
+})
+
+describe('POST /tickets/:id/approve 积压批准', () => {
+  it('human 把 backlog 批成 ready,记下批准人;旧 version 409', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const seeded = await seedProject(base)
+      const ticket = seeded.ticket as {
+        identifier: string
+        version: number
+        status: string
+      }
+      assert.equal(ticket.status, 'backlog')
+      const stale = await call(base, 'POST', `/api/board/tickets/${ticket.identifier}/approve`, {
+        expectedVersion: ticket.version - 1,
       })
-      assert.equal(patched.status, 200, JSON.stringify(patched.body))
+      assert.equal(stale.status, 409)
+      const res = await call(base, 'POST', `/api/board/tickets/${ticket.identifier}/approve`, {
+        expectedVersion: ticket.version,
+      })
+      assert.equal(res.status, 200, JSON.stringify(res.body))
+      const approved = res.body.ticket as {
+        status: string
+        approvedBy: string | null
+        approvedAt: number | null
+      }
+      assert.equal(approved.status, 'ready')
+      assert.equal(approved.approvedBy, 'user:default')
+      assert.ok(typeof approved.approvedAt === 'number' && approved.approvedAt > 0)
+    })
+    db.close()
+  })
+
+  it('agent 可批准积压并写 activity;已是 ready 再批准 403', async () => {
+    const db = freshDb()
+    let projectId = ''
+    await withServer(humanCtx(db), async (base) => {
+      const seeded = await seedProject(base)
+      projectId = seeded.projectId
+    })
+    await withServer(agentCtx(db), async (base) => {
+      const created = await call(base, 'POST', '/api/board/tickets', {
+        projectId,
+        type: 'bug',
+        title: 'AI 批准积压',
+      })
+      const ticket = created.body.ticket as {
+        identifier: string
+        version: number
+        status: string
+      }
+      assert.equal(created.status, 201, JSON.stringify(created.body))
+      assert.equal(ticket.status, 'backlog')
+      const res = await call(base, 'POST', `/api/board/tickets/${ticket.identifier}/approve`, {
+        expectedVersion: ticket.version,
+        owner: 'agent:main',
+      })
+      assert.equal(res.status, 200, JSON.stringify(res.body))
+      const approved = res.body.ticket as {
+        status: string
+        approvedBy: string | null
+        version: number
+      }
+      assert.equal(approved.status, 'ready')
+      assert.equal(approved.approvedBy, 'agent:main')
+      const timeline = await call(base, 'GET', `/api/board/tickets/${ticket.identifier}/activity`)
+      const items = timeline.body.items as Array<{ action: string; actor: string; actorId: string }>
+      assert.ok(
+        items.some(
+          (a) =>
+            a.action === 'ticket_approved' && a.actor === 'agent' && a.actorId === 'agent:main',
+        ),
+        JSON.stringify(items),
+      )
+      const again = await call(base, 'POST', `/api/board/tickets/${ticket.identifier}/approve`, {
+        expectedVersion: approved.version,
+      })
+      assert.equal(again.status, 403)
+    })
+    db.close()
+  })
+
+  it('agent 不能用 /approve 把 waiting_human 当人确认过站', async () => {
+    const db = freshDb()
+    let ident = ''
+    let version = 0
+    await withServer(humanCtx(db), async (base) => {
+      const seeded = await seedProject(base)
+      ident = (seeded.ticket as { identifier: string; id: string }).identifier
+      const id = (seeded.ticket as { id: string }).id
+      version = (seeded.ticket as { version: number }).version
+      updateTicket(db, id, version, { status: 'waiting_human' })
+      const fresh = await call(base, 'GET', `/api/board/tickets/${ident}`)
+      version = (fresh.body.ticket as { version: number }).version
+    })
+    await withServer(agentCtx(db), async (base) => {
+      const res = await call(base, 'POST', `/api/board/tickets/${ident}/approve`, {
+        expectedVersion: version,
+        owner: 'agent:main',
+      })
+      assert.equal(res.status, 403)
     })
     db.close()
   })

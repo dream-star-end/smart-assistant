@@ -20,6 +20,7 @@ export const SKILL_EVAL_BLOCKED_TOOL_NAMES = [
   'task_comment',
   'task_list',
   'task_get',
+  'task_approve',
   'ask_user',
   'present_options',
 ] as const satisfies readonly MemoryMcpToolName[]

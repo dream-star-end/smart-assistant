@@ -29,6 +29,7 @@ export const GROK_MEMORY_MCP_TOOLS = [
   'task_comment',
   'task_list',
   'task_get',
+  'task_approve',
 ] as const
 
 export const GROK_PREAMBLE = `# OpenClaude Platform Context (Grok adapter)

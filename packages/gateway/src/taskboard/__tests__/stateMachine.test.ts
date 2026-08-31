@@ -43,7 +43,8 @@ const DEFAULT_ALLOWS = new Set<string>([
   'human:done>waiting_human',
   'human:canceled>ready',
   'human:canceled>waiting_human',
-  // agent:默认上下文只剩执行中的两条(认领/推进/关单都要额外条件)
+  // agent:默认上下文可显式批准积压;认领/推进/关单仍要额外条件
+  'agent:backlog>ready',
   'agent:running>waiting_human',
   'agent:running>blocked',
   // system:熔断可把待执行/执行中打成受阻
@@ -78,14 +79,10 @@ describe('canTransition 全组合遍历(默认上下文,防意外放行)', () =>
   }
 })
 
-describe('重点:AI 不能给 done、不能从 backlog 开工', () => {
-  it('agent 不能 backlog → ready', () => {
+describe('重点:AI 不能给 done、不能自动批准积压', () => {
+  it('agent 可以 backlog → ready(显式批准,必须留痕)', () => {
     const v = canTransition({ from: 'backlog', to: 'ready', actor: 'agent' })
-    assert.equal(v.ok, false)
-    if (!v.ok) {
-      assert.equal(v.code, 'actor_denied')
-      assert.match(v.reason, /只有人能批准开工/)
-    }
+    assert.equal(v.ok, true)
   })
 
   it('system 也不能 backlog → ready', () => {
@@ -205,11 +202,11 @@ describe('终态与自转', () => {
 describe('assertTransition / listAllowedTransitions / 表完整性', () => {
   it('拒绝时抛 TaskboardTransitionDenied 且带 code', () => {
     assert.throws(
-      () => assertTransition({ from: 'backlog', to: 'ready', actor: 'agent' }),
+      () => assertTransition({ from: 'backlog', to: 'ready', actor: 'system' }),
       (err: unknown) => {
         assert.ok(err instanceof TaskboardTransitionDenied)
         assert.equal(err.code, 'actor_denied')
-        assert.match(err.message, /只有人能批准开工/)
+        assert.match(err.message, /不能自动批准/)
         return true
       },
     )

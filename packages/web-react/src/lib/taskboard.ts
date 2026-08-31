@@ -178,6 +178,9 @@ export interface Ticket {
   createdAt: number
   updatedAt: number
   closedAt: number | null
+  /** 最近一次 backlog→ready 的批准人。未批准为 null；旧响应可缺席。 */
+  approvedBy?: string | null
+  approvedAt?: number | null
   /** board 接口装饰；列表接口可能没有。合法落点一律以它为准，前端不重算。 */
   allowedMoves?: AllowedMove[]
 }
@@ -767,7 +770,10 @@ const VALIDATION_ZH: Array<{ test: (msg: string) => boolean; zh: string }> = [
     zh: `无活动超时不能超过 ${DELEGATE_IDLE_TIMEOUT_MAX_SEC} 秒（45 分钟）`,
   },
   { test: (m) => /invalid kind/i.test(m), zh: '阶段类型只能是 AI、人工或闸门' },
-  { test: (m) => /model not available/i.test(m), zh: '该模型当前不可用，请换一个或留空用 agent 默认' },
+  {
+    test: (m) => /model not available/i.test(m),
+    zh: '该模型当前不可用，请换一个或留空用 agent 默认',
+  },
   { test: (m) => /model catalog unavailable/i.test(m), zh: '模型目录暂时不可用，稍后再改模型覆盖' },
   { test: (m) => /invalid ticketType/i.test(m), zh: '单据类型无效' },
   { test: (m) => /cannot delete builtin template/i.test(m), zh: '内置模板不能删除' },
@@ -871,6 +877,7 @@ export const RUN_SKIP_REASON_LABEL: Record<RunSkipReason, string> = {
 
 const ACTIVITY_ACTION_LABEL: Record<string, string> = {
   ticket_created: '创建了单据',
+  ticket_approved: '批准了开工',
   status_changed: '变更了状态',
   stage_advanced: '推进了阶段',
   field_updated: '更新了字段',
@@ -911,6 +918,35 @@ export function sortTimelineDesc(items: TimelineItem[]): TimelineItem[] {
   return [...items].sort((a, b) => b.createdAt - a.createdAt || b.kind.localeCompare(a.kind))
 }
 
+/** 讨论/系统活动默认按时间正序（旧→新），同刻按 kind 稳定排序。 */
+export function sortTimelineAsc(items: TimelineItem[]): TimelineItem[] {
+  return [...items].sort((a, b) => a.createdAt - b.createdAt || a.kind.localeCompare(b.kind))
+}
+
+export const LONG_COMMENT_CHARS = 280
+export const LONG_COMMENT_LINES = 6
+
+export function isLongComment(body: string): boolean {
+  if (body.length > LONG_COMMENT_CHARS) return true
+  return body.split('\n').length > LONG_COMMENT_LINES
+}
+
+export type DiscussionItem = Extract<TimelineItem, { kind: 'comment' }>
+export type SystemTimelineItem = Exclude<TimelineItem, { kind: 'comment' }>
+
+export function partitionTimeline(items: TimelineItem[]): {
+  discussion: DiscussionItem[]
+  system: SystemTimelineItem[]
+} {
+  const discussion: DiscussionItem[] = []
+  const system: SystemTimelineItem[] = []
+  for (const item of sortTimelineAsc(items)) {
+    if (item.kind === 'comment') discussion.push(item)
+    else system.push(item)
+  }
+  return { discussion, system }
+}
+
 export function mergeTimelineSources(input: {
   activities?: TicketActivity[]
   runs?: TicketRun[]
@@ -929,7 +965,7 @@ export function mergeTimelineSources(input: {
       comment,
     })),
   ]
-  return sortTimelineDesc(items)
+  return sortTimelineAsc(items)
 }
 
 export function formatDurationMs(ms: number | null | undefined): string | null {
@@ -1013,10 +1049,9 @@ export function writeLastProjectId(id: string): void {
   }
 }
 
-export function pickInitialProject<T extends { id: string; key: string; archivedAt: number | null }>(
-  projects: T[],
-  rememberedId: string | null,
-): T | undefined {
+export function pickInitialProject<
+  T extends { id: string; key: string; archivedAt: number | null },
+>(projects: T[], rememberedId: string | null): T | undefined {
   const live = projects.filter((p) => !p.archivedAt)
   if (rememberedId) {
     const hit = live.find((p) => p.id === rememberedId)
@@ -1028,10 +1063,7 @@ export function pickInitialProject<T extends { id: string; key: string; archived
 /** 看板阶段列里的在办状态。积压/待确认/终态走自己的桶。 */
 export function isStageColumnStatus(status: string): boolean {
   return (
-    status !== 'backlog' &&
-    status !== 'waiting_human' &&
-    status !== 'done' &&
-    status !== 'canceled'
+    status !== 'backlog' && status !== 'waiting_human' && status !== 'done' && status !== 'canceled'
   )
 }
 
@@ -1445,10 +1477,7 @@ export const taskboardApi = {
       projectId: string
       official: ProjectMemoryItem[]
       candidates: ProjectMemoryItem[]
-    }>(
-      a,
-      `/api/board/projects/${encodeURIComponent(projectId)}/memories${qs({ status })}`,
-    ),
+    }>(a, `/api/board/projects/${encodeURIComponent(projectId)}/memories${qs({ status })}`),
 
   createProjectMemory: (
     a: AuthSession,
@@ -1502,7 +1531,7 @@ export const taskboardApi = {
     boardSend<{ ok: boolean; context: { version: number; instructions: string | null } }>(
       a,
       `/api/board/projects/${encodeURIComponent(id)}/context`,
-      "PUT",
+      'PUT',
       body,
     ),
 

@@ -84,6 +84,7 @@ import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPol
 // 让「TOOLS ↔ toolNames.ts」锁步单测能直接 import 校验,而不触发本入口模块顶层的
 // server.connect(见 toolDefs.ts / __tests__/toolNames.test.ts)。
 import {
+  handleTaskApprove,
   handleTaskComment,
   handleTaskCreate,
   handleTaskGet,
@@ -278,6 +279,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleTaskList(args as any)
       case 'task_get':
         return await handleTaskGet(args as any)
+      case 'task_approve':
+        return await handleTaskApprove(args as any)
       case 'ask_user':
         return await handleAskUser(args as any)
       case 'present_options': {
