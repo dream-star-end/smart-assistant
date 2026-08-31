@@ -20,6 +20,11 @@ import {
 } from '../engine/cursorAdapter.js'
 import type { EngineEvent, EngineExternalBillingEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
+import {
+  DELEGATE_CONTEXT_HEADER,
+  verifyDelegateContextToken,
+} from '../delegateContext.js'
+import { Gateway, PerTurnDelegationGuard } from '../server.js'
 
 const REQUEST = 'b'.repeat(32)
 const GATEWAY_SECRET = 'gateway_secret_must_only_be_in_token_file'
@@ -599,6 +604,139 @@ for(const e of [
       restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
       restoreEnv('OPENCLAUDE_BASELINE_SKILLS_DIR', oldBaselineSkills)
       for (const key of AMBIENT_SECRET_KEYS) restoreEnv(key, oldAmbientSecrets[key])
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('spawned Cursor MCP config injects delegate-context file mode 0600 and cleans it up', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-mcp-ctx-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const capture = path.join(dir, 'capture.json')
+    await writeFile(path.join(dir, 'persona.md'), 'CURSOR_PERSONA_MARKER')
+    const baselineSkills = await createBaselineSkills(dir)
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+const fs=require('node:fs');
+const configPath=process.env.OPENCLAUDE_CURSOR_MCP_CONFIG;
+const config=JSON.parse(fs.readFileSync(configPath,'utf8'));
+const mcpEnv=config.mcpServers['openclaude-memory'].env;
+const delegateContextFile=mcpEnv.OPENCLAUDE_DELEGATE_CONTEXT_FILE;
+fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({
+  configPath, mcpEnv, delegateContextFile,
+  delegateContextMode:fs.statSync(delegateContextFile).mode & 0o777,
+  delegateContextToken:fs.readFileSync(delegateContextFile,'utf8').trim(),
+}))
+console.log(JSON.stringify({type:'assistant',message:{role:'assistant',content:[{type:'text',text:'CTX_OK'}]}}));
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'CTX_OK'}));
+`,
+    )
+    await chmod(fake, 0o755)
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldBaselineSkills = process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
+    const prevAuthority = process.env.OC_MODEL_AUTHORITY
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.OPENCLAUDE_BASELINE_SKILLS_DIR = baselineSkills
+    Reflect.deleteProperty(process.env, 'OC_MODEL_AUTHORITY')
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'context-file wiring probe',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      assert.equal((await run.summary)?.assistantText, 'CTX_OK')
+      await adapter.waitForOutputDrain()
+      const launched = JSON.parse(await readFile(capture, 'utf8')) as {
+        configPath: string
+        mcpEnv: Record<string, string>
+        delegateContextFile: string
+        delegateContextMode: number
+        delegateContextToken: string
+      }
+      assert.equal(path.basename(launched.delegateContextFile), 'delegate-context')
+      assert.equal(launched.mcpEnv.OPENCLAUDE_DELEGATE_CONTEXT_FILE, launched.delegateContextFile)
+      assert.equal(launched.delegateContextMode, 0o600)
+      const claims = verifyDelegateContextToken(launched.delegateContextToken)
+      assert.ok(claims, 'spawned context file must verify as a signed delegate token')
+      assert.equal(claims.agentId, 'main')
+      assert.equal(claims.sessionKey, 'agent:main:webchat:dm:cursor-test')
+      const gw = Object.create(Gateway.prototype) as any
+      gw._shuttingDown = false
+      gw._activeDelegations = 0
+      gw._activeDelegationsByParent = new Map()
+      gw._hiddenDelegateGuard = new PerTurnDelegationGuard()
+      gw.log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+      gw.deps = {
+        config: {
+          version: 1,
+          gateway: { bind: '127.0.0.1', port: 18789, accessToken: 'test' },
+          auth: { mode: 'subscription', claudeCodePath: '/tmp/ccb' },
+          defaults: { model: 'glm-5.2', permissionMode: 'default' },
+          channels: { webchat: { enabled: true } },
+        },
+      }
+      gw._getAgentsConfig = async () => ({
+        default: 'main',
+        agents: [{ id: 'main', model: 'glm-5.2' }, { id: 'coding-assistant', model: 'glm-5.2' }],
+      })
+      gw._runLog = { start: () => ({}), complete: () => {} }
+      gw.sessions = {
+        destroySession: async () => {},
+        getByKey: () => ({ _teamModeTurn: true, _currentTurnUserText: 'probe' }),
+        getOrCreate: async () => ({
+          agentId: 'coding-assistant',
+          currentTurnStatus: null,
+          runner: { interrupt: () => {}, sendPermissionResponse: () => {}, on: () => {}, off: () => {} },
+        }),
+        retireKeepResume: async () => {},
+        forgetResume: () => {},
+        submit: async (_s: unknown, _p: string, onEvent: (e: any) => void) => {
+          onEvent({ kind: 'block', block: { kind: 'text', text: 'ok' } })
+          onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
+        },
+        bufferPendingAgentGroup: () => true,
+      }
+      gw.deliver = () => {}
+      const call = async (body: Record<string, unknown>, headers: Record<string, string>) => {
+        const req: any = { method: 'POST', headers }
+        gw.readBody = async () => JSON.stringify(body)
+        let status = 0
+        let raw = ''
+        const res: any = {
+          writeHead: (code: number) => {
+            status = code
+          },
+          end: (chunk?: unknown) => {
+            raw = String(chunk ?? '')
+          },
+        }
+        await gw.handleDelegateTask(req, res, 'coding-assistant')
+        return { status, body: raw ? JSON.parse(raw) : {} }
+      }
+      const missing = await call(
+        { goal: 'async needs context', async: true, sourceAgent: 'main' },
+        {},
+      )
+      assert.equal(missing.status, 401)
+      assert.match(String(missing.body.error), /async delegate requires delegate context/)
+      const authed = await call(
+        { goal: 'async with spawned context', async: true, sourceAgent: 'main' },
+        { [DELEGATE_CONTEXT_HEADER]: launched.delegateContextToken },
+      )
+      assert.notEqual(authed.status, 401)
+      assert.notEqual(authed.body.error, 'async delegate requires delegate context')
+      assert.equal(typeof authed.body.jobId, 'string')
+      await assert.rejects(stat(launched.configPath))
+      await assert.rejects(stat(launched.delegateContextFile))
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('OPENCLAUDE_BASELINE_SKILLS_DIR', oldBaselineSkills)
+      restoreEnv('OC_MODEL_AUTHORITY', prevAuthority)
       await rm(dir, { recursive: true, force: true })
     }
   })
