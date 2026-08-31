@@ -2169,12 +2169,53 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
           "assertion": "container stamped frame with fenced clientMessageId never reaches user websocket"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnFirstVisible.test.ts",
+          "assertion": "first reject then success writes first_visible and onSettled(true)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnFirstVisible.test.ts",
+          "assertion": "continuous failure is bounded to 3 attempts and onSettled(false)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnFirstVisible.test.ts",
+          "assertion": "does not permanently suppress until persist succeeds"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/ws/__tests__/turnTraces.test.ts",
+          "assertion": "insert 首次 reject 随后成功 → 最终落库且不 warn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "session_id containing underscore does not LIKE-match a sibling (OCV5-57 r3 W1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "SQL prefetches turn_traces first_visible_at without LIKE or per-row subquery"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "first reject then a later visible frame writes first_visible"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "continuous failure is bounded and does not query on every frame"
         }
       ],
       "coverageCommits": [
         "3e80a4a7",
         "568fb53b",
-        "1c7e4aae"
+        "1c7e4aae",
+        "2295a322"
       ]
     }
   ]
