@@ -35,6 +35,7 @@ import {
   formatStageProjectContext,
   resetSharedPatrolState,
 } from '../patrol.js'
+import { alignedLeaseTtlMs } from '../domain.js'
 import { assertTransition } from '../stateMachine.js'
 
 const dirs: string[] = []
@@ -132,6 +133,11 @@ describe('formatStageProjectContext', () => {
     assert.match(text, /优先修 gateway。/)
     assert.match(text, /本阶段无 MCP skills/)
     assert.match(text, /board-ops/)
+    const fromSkills = formatStageProjectContext({
+      instructions: 'x',
+      skills: [{ name: 'alpha' }],
+    })
+    assert.match(fromSkills ?? '', /alpha/)
   })
 })
 
@@ -277,6 +283,49 @@ describe('lease 互斥', () => {
     finish()
     await pending
     assert.ok(listRuns(db, { ticketId: ticket.id }).items.some((r) => r.status === 'succeeded'))
+    db.close()
+  })
+
+  it('短 timeout 的 claim 与第一次 renew 使用同一对齐 TTL', async () => {
+    const db = freshDb()
+    const { ticket } = seedReadyAi(db, { timeoutSec: 600 })
+    let now = WORK.getTime()
+    let started!: () => void
+    let finish!: () => void
+    const didStart = new Promise<void>((resolve) => { started = resolve })
+    const delegated = new Promise<void>((resolve) => { finish = resolve })
+    const engineLease = 50 * 60 * 1000
+    const renewEvery = 40
+    const expectedTtl = alignedLeaseTtlMs(600, engineLease, renewEvery)
+    const eng = engine(
+      db,
+      async () => {
+        started()
+        await delegated
+        return { ok: true, output: '对齐 TTL' }
+      },
+      { now: () => now, leaseTtlMs: engineLease, leaseRenewIntervalMs: renewEvery },
+    )
+    const pending = eng.tick(new Date(now))
+    await didStart
+    const initial = listRuns(db, { ticketId: ticket.id, status: 'running' }).items[0]
+    assert.ok(initial?.leaseExpiresAt)
+    assert.equal(initial.leaseExpiresAt - now, expectedTtl)
+    now += 80
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    const renewed = getRun(db, initial.id)
+    assert.ok(renewed?.leaseExpiresAt)
+    const remaining = renewed.leaseExpiresAt - now
+    assert.ok(
+      remaining <= expectedTtl + 5,
+      `renew remaining ${remaining} exceeded aligned ${expectedTtl}`,
+    )
+    assert.ok(
+      remaining < engineLease / 2,
+      `renew jumped back toward default 50min: remaining=${remaining}`,
+    )
+    finish()
+    await pending
     db.close()
   })
 
@@ -779,6 +828,7 @@ function seedReadyAi(
     maxRunsPerDay?: number
     entryCondition?: string | null
     model?: string | null
+    timeoutSec?: number
   } = {},
 ): {
   ticket: ReturnType<typeof createTicket>
@@ -812,6 +862,7 @@ function seedReadyAi(
     onFailure: stageOver.onFailure ?? 'retry',
     entryCondition: stageOver.entryCondition ?? null,
     model: stageOver.model ?? null,
+    timeoutSec: stageOver.timeoutSec,
   })
   const ticket = createTicket(db, {
     projectId: project.id,

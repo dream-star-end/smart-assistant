@@ -70,7 +70,7 @@ describe('schema / migrate', () => {
   it('建表后 user_version=5,重复 migrate 不报错不改版本', () => {
     const { db } = freshDb()
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
-    assert.equal(TASKBOARD_SCHEMA_VERSION, 8)
+    assert.equal(TASKBOARD_SCHEMA_VERSION, 9)
     migrate(db)
     migrate(db)
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
@@ -102,6 +102,34 @@ describe('schema / migrate', () => {
       'tb_ticket_relation',
       'tb_ticket_run',
     ])
+    db.close()
+  })
+
+  it('v9 幂等回填 skipped 的 finished_at', () => {
+    const { db } = freshDb()
+    const project = createProject(db, { key: 'SKP', name: '跳过' })
+    const ticket = createTicket(db, {
+      projectId: project.id,
+      type: 'chore',
+      title: '旧 skip',
+      reporter: 'user:default',
+    })
+    db.prepare(
+      `INSERT INTO tb_ticket_run (
+         id, ticket_id, stage_id, agent_id, trigger, status, skip_reason,
+         started_at, finished_at, created_at
+       ) VALUES (?, ?, ?, 'stage-diagnose', 'patrol', 'skipped', 'entry_condition', ?, NULL, ?)`,
+    ).run('skip-old', ticket.id, 'stage-x', 111, 111)
+    assert.equal(
+      (db.prepare(`SELECT finished_at AS f FROM tb_ticket_run WHERE id='skip-old'`).get() as { f: number | null }).f,
+      null,
+    )
+    db.pragma('user_version = 8')
+    migrate(db)
+    const after = db.prepare(`SELECT finished_at AS f FROM tb_ticket_run WHERE id='skip-old'`).get() as { f: number }
+    assert.equal(after.f, 111)
+    migrate(db)
+    assert.equal(getSchemaVersion(db), 9)
     db.close()
   })
 

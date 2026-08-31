@@ -31,9 +31,11 @@
 import {
   getUsageSummary,
   isProjectContextEnabled,
+  loadFrozenProjectContext,
   loadProjectContext,
   parseProjectWorkspace,
   resolveProjectCwd,
+  type FrozenProjectContext,
 } from '@openclaude/storage'
 import { createRunContextDescriptor } from '../runContextPersist.js'
 import { getProject } from './db/projects.js'
@@ -75,6 +77,7 @@ import {
   type TicketPriority,
   type TicketRun,
   type TicketStatus,
+  alignedLeaseTtlMs,
   buildPatrolSessionKey,
 } from './domain.js'
 import { evaluateEntryCondition, parseEntryCondition } from './entryCondition.js'
@@ -108,6 +111,7 @@ const STAGE_PROJECT_CONTEXT_MAX_CHARS = 4000
 export function formatStageProjectContext(snap: {
   instructions?: string | null
   skillOverlay?: readonly string[]
+  skills?: readonly { name: string }[]
 }): string | null {
   const parts: string[] = []
   const instructions = snap.instructions?.trim()
@@ -118,8 +122,11 @@ export function formatStageProjectContext(snap: {
         : instructions,
     )
   }
-  if (snap.skillOverlay && snap.skillOverlay.length > 0) {
-    parts.push(`项目技能索引（只读，本阶段无 MCP skills）：${snap.skillOverlay.join('、')}`)
+  const overlay =
+    snap.skillOverlay ??
+    (snap.skills && snap.skills.length > 0 ? snap.skills.map((s) => s.name) : undefined)
+  if (overlay && overlay.length > 0) {
+    parts.push(`项目技能索引（只读，本阶段无 MCP skills）：${overlay.join('、')}`)
   }
   return parts.length > 0 ? parts.join('\n\n') : null
 }
@@ -137,6 +144,7 @@ export interface PatrolDelegateInput {
   projectId?: string
   workspaceCwd?: string
   runContext?: import('../runContextPersist.js').RunContextDescriptor
+  frozenProjectContext?: FrozenProjectContext | null
 }
 
 export interface PatrolDelegateResult {
@@ -556,10 +564,7 @@ export class PatrolEngine {
       hasLease: true,
       autoClose: stage.autoClose,
     })
-    const ttlMs = Math.min(
-      this.leaseTtlMs,
-      Math.max(60_000, stage.timeoutSec * 1000 + this.leaseRenewIntervalMs),
-    )
+    const ttlMs = alignedLeaseTtlMs(stage.timeoutSec, this.leaseTtlMs, this.leaseRenewIntervalMs)
     const run = acquireLease(db, ticket.id, stage.id, owner, ttlMs, {
       agentId: stage.agentId,
       trigger: 'patrol',
@@ -605,10 +610,17 @@ export class PatrolEngine {
       if (cwd.ok) workspaceCwd = cwd.cwd
     }
     let projectContextText: string | null = null
+    let frozenProjectContext: FrozenProjectContext | null = null
     if (projectEnabled && boardProject) {
       try {
-        const live = await loadProjectContext(boardProject.id)
-        projectContextText = formatStageProjectContext(live)
+        frozenProjectContext = await loadFrozenProjectContext({
+          boardProjectId: boardProject.id,
+          workspaceSpec: parseProjectWorkspace(boardProject.workspaceSpec ?? boardProject.workspace),
+          workspaceCwd: workspaceCwd ?? null,
+          cwdSource: workspaceCwd ? 'project_workspace' : 'default',
+          db,
+        })
+        projectContextText = formatStageProjectContext(frozenProjectContext)
       } catch (err) {
         this.log('taskboard project context load failed', {
           projectId: boardProject.id,
@@ -640,10 +652,11 @@ export class PatrolEngine {
     }
 
     let leaseLost = !owner
+    const leaseTtlMs = alignedLeaseTtlMs(stage.timeoutSec, this.leaseTtlMs, this.leaseRenewIntervalMs)
     const renewTimer = owner
       ? setInterval(() => {
           try {
-            if (!renewLease(db, run.id, owner, this.leaseTtlMs, this.nowFn())) {
+            if (!renewLease(db, run.id, owner, leaseTtlMs, this.nowFn())) {
               leaseLost = true
               this.log('taskboard lease renewal lost', { runId: run.id, owner })
             }
@@ -668,6 +681,7 @@ export class PatrolEngine {
           timeoutSec: stage.timeoutSec,
           projectId: boardProject?.id,
           workspaceCwd,
+          frozenProjectContext,
           runContext: createRunContextDescriptor({
             runId: run.id,
             boardProjectId: boardProject?.id ?? null,

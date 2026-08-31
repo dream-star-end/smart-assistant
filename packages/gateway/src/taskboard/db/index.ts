@@ -84,6 +84,13 @@ export function migrate(db: TaskboardDb): void {
     if (current < 8) {
       ensureProjectSkillLedger(db)
     }
+    if (current < 9) {
+      db.exec(
+        `UPDATE tb_ticket_run
+            SET finished_at = COALESCE(started_at, created_at)
+          WHERE status = 'skipped' AND finished_at IS NULL`,
+      )
+    }
     db.pragma(`user_version = ${TASKBOARD_SCHEMA_VERSION}`)
     ensureSettingsRow(db)
   })

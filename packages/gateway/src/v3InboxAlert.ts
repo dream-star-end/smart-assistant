@@ -9,7 +9,7 @@
 import { request as undiciRequest } from 'undici'
 
 import { createLogger } from './logger.js'
-import { type PostInboxOpts, readV3InboxPostConfig } from './v3InboxPost.js'
+import { InboxPostDeliveryError, type PostInboxOpts, readV3InboxPostConfig } from './v3InboxPost.js'
 
 const log = createLogger({ module: 'v3InboxAlert' })
 
@@ -74,6 +74,72 @@ export async function postInboxAlert(
     }
   } catch {
     // 网络 / DNS / TCP / TLS / abort → 静默
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Durable ACK for taskboard dead-letter. Missing config → false. HTTP/transport errors throw. */
+export async function postInboxAlertDurable(
+  args: InboxAlertArgs,
+  opts: PostInboxOpts = {},
+): Promise<boolean> {
+  const config = opts.config !== undefined ? opts.config : readV3InboxPostConfig()
+  if (!config) return false
+  const fetcher = opts.fetcher ?? undiciRequest
+  const timeoutMs = opts.timeoutMs ?? ATTEMPT_TIMEOUT_MS
+  const body = JSON.stringify({
+    title: cap(args.title, MAX_TITLE_CHARS),
+    bodyMd: cap(args.bodyMd, MAX_BODY_CHARS),
+    level: args.level,
+    deliveryKey: args.deliveryKey,
+  })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetcher(`${config.baseUrl}${INBOX_ALERT_PATH}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        authorization: `Bearer ${config.bearer}`,
+      },
+      body,
+      signal: controller.signal,
+    })
+    let responseText = ''
+    try {
+      const chunks: Buffer[] = []
+      for await (const chunk of res.body) {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as ArrayBuffer)
+        chunks.push(bytes)
+      }
+      responseText = Buffer.concat(chunks).toString('utf8')
+    } catch {
+      responseText = ''
+    }
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw new InboxPostDeliveryError(
+        `inbox alert master status ${res.statusCode}`,
+        res.statusCode >= 500 || res.statusCode === 408 || res.statusCode === 429
+          ? 'INBOX_MASTER_UNAVAILABLE'
+          : 'INBOX_MASTER_REJECTED',
+        res.statusCode >= 500 || res.statusCode === 408 || res.statusCode === 429,
+      )
+    }
+    try {
+      const parsed = JSON.parse(responseText) as { ok?: unknown; reason?: unknown }
+      if (parsed.ok === true || parsed.reason === 'duplicate') return true
+      if (parsed.reason === 'rate_limited') {
+        throw new InboxPostDeliveryError('inbox alert rate limited', 'INBOX_RATE_LIMITED', true)
+      }
+    } catch (err) {
+      if (err instanceof InboxPostDeliveryError) throw err
+      throw new InboxPostDeliveryError('inbox alert response invalid', 'INBOX_RESPONSE_INVALID', true)
+    }
+    throw new InboxPostDeliveryError('inbox alert rejected delivery', 'INBOX_MASTER_REJECTED', false)
+  } catch (err) {
+    if (err instanceof InboxPostDeliveryError) throw err
+    throw new InboxPostDeliveryError('inbox alert transport failed', 'INBOX_TRANSPORT_FAILED', true)
   } finally {
     clearTimeout(timer)
   }

@@ -363,7 +363,7 @@ import { TaskboardNotifier } from './taskboard/notify.js'
 import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
 import { sendV3QqProactive, readV3QqProactiveConfig } from './v3QqProactive.js'
 import { postInboxMessage, postInboxMessageDurable } from './v3InboxPost.js'
-import { postInboxAlert } from './v3InboxAlert.js'
+import { postInboxAlert, postInboxAlertDurable } from './v3InboxAlert.js'
 import { parseDocument } from './documentParser.js'
 import { tryExtractProjectAssetExcerpt } from './projectAssetCollector.js'
 import {
@@ -1869,6 +1869,7 @@ interface RunDelegateInput {
   projectId?: string
   workspaceCwd?: string
   runContext?: import('./runContextPersist.js').RunContextDescriptor
+  frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
   /** 覆盖默认 channel 'delegate'。taskboard 传 'taskboard',且不得加入
    *  MASTER_SINK_PERSIST_CHANNELS,否则巡检文本会写进 client_sessions 刷屏。 */
   channel?: string
@@ -3203,9 +3204,28 @@ export class Gateway {
           if (!cfg) return { kind: 'fallback' as const, marked: false }
           return sendV3WechatProactive({ config: cfg, text, outboundId })
         },
-        postInbox: ({ title, bodyMd, deliveryKey }) =>
-          postInboxMessage({ title, bodyMd, deliveryKey }),
-        createInboxMessage: (args) => postInboxAlert(args),
+        postInbox: async ({ title, bodyMd, deliveryKey }) => {
+          try {
+            return await postInboxMessageDurable({ title, bodyMd, deliveryKey })
+          } catch (err) {
+            this.log.warn('taskboard inbox durable failed', {
+              deliveryKey,
+              err: String(err),
+            })
+            return false
+          }
+        },
+        createInboxMessage: async (args) => {
+          try {
+            return await postInboxAlertDurable(args)
+          } catch (err) {
+            this.log.warn('taskboard inbox-alert durable failed', {
+              deliveryKey: args.deliveryKey,
+              err: String(err),
+            })
+            return false
+          }
+        },
       },
     })
     this._taskboardPatrol = new PatrolEngine({
@@ -12437,6 +12457,7 @@ export class Gateway {
         workspaceCwd: input.workspaceCwd,
         projectId: input.projectId,
         runContext: input.runContext,
+        frozenProjectContext: input.frozenProjectContext,
         // 物化直接父指针(已校验的父会话键),供本 delegate 的子委派沿父链向上追溯 webchat 祖先。
         parentSessionKey: delegateParent?.sessionKey,
         title: `[delegate] ${goal.slice(0, 40)}`,
@@ -12982,6 +13003,7 @@ export class Gateway {
       projectId: input.projectId,
       workspaceCwd: input.workspaceCwd,
       runContext: input.runContext,
+      frozenProjectContext: input.frozenProjectContext,
     })
     if (result.kind === 'rejected') {
       return { ok: false, output: '', error: result.message }
