@@ -113,6 +113,7 @@ export interface CreateRunInput {
   leaseOwner?: string | null
   leaseExpiresAt?: number | null
   startedAt?: number | null
+  finishedAt?: number | null
 }
 
 export interface UpdateRunPatch {
@@ -209,7 +210,7 @@ export function insertRun(db: TaskboardDb, input: CreateRunInput): TicketRun {
        error, created_at
      ) VALUES (
        @id, @ticketId, @stageId, @agentId, @trigger, @sessionKey, @status,
-       @skipReason, @leaseOwner, @leaseExpiresAt, @startedAt, NULL,
+       @skipReason, @leaseOwner, @leaseExpiresAt, @startedAt, @finishedAt,
        NULL, NULL, NULL, NULL, NULL, NULL,
        NULL, @now
      )`,
@@ -225,6 +226,10 @@ export function insertRun(db: TaskboardDb, input: CreateRunInput): TicketRun {
     leaseOwner: input.leaseOwner ?? null,
     leaseExpiresAt: input.leaseExpiresAt ?? null,
     startedAt: input.startedAt ?? null,
+    finishedAt:
+      input.status === 'skipped'
+        ? (input.finishedAt ?? input.startedAt ?? now)
+        : (input.finishedAt ?? null),
     now,
   })
   return getRun(db, id) as TicketRun

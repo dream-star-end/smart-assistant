@@ -62,6 +62,8 @@ export interface PromptRenderInput {
   project?: { key?: string | null; name?: string | null; workspace?: string | null } | null
   /** When PROJECT slot already carries instructions/assets, placeholders stay short. */
   projectSlotInjected?: boolean
+  /** Compact project instructions / memory index. Stage agents have no MCP skills. */
+  projectContextText?: string | null
 }
 
 export interface PromptRenderResult {
@@ -183,8 +185,12 @@ export function renderPrompt(input: PromptRenderInput): PromptRenderResult {
     ? input.stage.exitChecklist.trim()
     : '（本阶段未配置 exit checklist）'
 
+  const projectBlock = input.projectContextText?.trim()
   const prompt = [
     body.trim(),
+    ...(projectBlock
+      ? ['', '## 项目上下文（系统附加，本阶段无 MCP skills）', projectBlock]
+      : []),
     '',
     '## 本阶段 exit checklist（系统附加）',
     checklist,

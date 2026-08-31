@@ -800,6 +800,19 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     if (routeReq.route === false) {
       mapped = mapCodexRelayUrlMulti(req.url ?? '/', method, upstreamBaseUrls)
       if ('error' in mapped) {
+        if (mapped.error.code === 'PATH_NOT_ALLOWED' || mapped.error.code === 'BAD_PATH') {
+          let pathname = req.url ?? '/'
+          try {
+            pathname = new URL(req.url ?? '/', 'http://internal').pathname
+          } catch {
+            /* keep raw */
+          }
+          reqLog.warn('codex_relay_path_rejected', {
+            path: pathname,
+            method,
+            code: mapped.error.code,
+          })
+        }
         sendJsonError(res, mapped.error.status, mapped.error.code, mapped.error.message, requestId)
         return
       }

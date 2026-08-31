@@ -53,6 +53,11 @@ import {
   normalizeCodexReasoningEffort,
 } from './codexShared.js'
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
+import {
+  isCodexRelayPathDeniedLine,
+  shouldAbortOnRelayPathDenied,
+} from './codexRelayPathGuard.js'
+import { isPatrolSessionKey } from '../taskboard/domain.js'
 import { issueDelegateContextToken } from '../delegateContext.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
@@ -1261,6 +1266,8 @@ export class CodexAppServerRunner extends EventEmitter {
   // ── SubprocessRunner interface parity (referenced by sessionManager.ts) ──
   public lastActivityAt: number = Date.now()
   public effortLevel: string | undefined = undefined
+  /** Consecutive PATH_NOT_ALLOWED stderr lines on the current proc. */
+  private relayPathDeniedCount = 0
 
   get isRunning(): boolean {
     return this.proc != null || this.processing
@@ -2021,6 +2028,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // get prepended to the new proc's first stdout chunk and corrupt the
     // initialize response.
     this.stdoutBuf = ''
+    this.relayPathDeniedCount = 0
     // Build platform context overrides BEFORE spawn so the long-lived
     // app-server proc has model_instructions_file + mcp-memory available
     // from its very first turn. Failure here is non-fatal — fall back to
@@ -2103,6 +2111,18 @@ export class CodexAppServerRunner extends EventEmitter {
         ? `http://127.0.0.1:${relayPort}${V3_CODEX_RELAY_PREFIX}/backend-api/codex`
         : undefined
     const telemetryArgs = buildCodexTelemetryHardeningArgs(chatgptRelayBaseUrl)
+    // 阶段 agent / 巡检会话不挂平台 MCP skills。chatgpt_base_url 仍指向 relay,
+    // 但 apps/plugins/MCP 关闭后 rmcp 不应再打 allowlist 外路径。放在 argv 末尾
+    // 覆盖 launch overrides 里可能注入的 mcp_servers.openclaude_memory.*。
+    const omitPlatformMcp =
+      this.opts.agentId.startsWith('stage-') || isPatrolSessionKey(this.opts.sessionKey)
+    const stageAgentArgs = omitPlatformMcp
+      ? [
+          '-c', 'mcp_servers={}',
+          '-c', 'features.apps=false',
+          '-c', 'features.plugins=false',
+        ]
+      : []
     const args = [
       'app-server',
       ...argvOverrides,
@@ -2115,6 +2135,7 @@ export class CodexAppServerRunner extends EventEmitter {
       ...requestUserInputArgs,
       ...applyPatchStreamingArgs,
       ...telemetryArgs,
+      ...stageAgentArgs,
       '--listen',
       'stdio://',
     ]
@@ -2175,14 +2196,18 @@ export class CodexAppServerRunner extends EventEmitter {
       // log, but mis-attributing an old proc's stderr to the current session
       // is misleading in the journal.
       if (this.proc !== proc) return
-      this.lastActivityAt = Date.now()
+      const line = chunk.toString('utf8').trim()
+      const relayDenied = isCodexRelayPathDeniedLine(line)
+      // PATH_NOT_ALLOWED 重连刷屏不能刷新 idle 时钟,否则 taskboard 会空转撞租约墙。
+      if (!relayDenied) this.lastActivityAt = Date.now()
       // Codex app-server logs structured errors to stderr; surface them at
       // warn level so the journal has them but they don't fail the turn —
       // the JSON-RPC error response is the source of truth for failures.
       log.warn('codex app-server stderr', {
         sessionKey: this.opts.sessionKey,
-        line: chunk.toString('utf8').trim().slice(0, 1024),
+        line: line.slice(0, 1024),
       })
+      if (relayDenied) this.noteRelayPathDenied()
     })
     proc.on('error', (err) => {
       // Identity check: a delayed error from a discarded proc must not corrupt
@@ -3717,6 +3742,25 @@ export class CodexAppServerRunner extends EventEmitter {
     this.attemptHadObservableOutput = false
     this.attemptHadToolOrPermission = false
     this.attemptEmittedTerminal = false
+    this.relayPathDeniedCount = 0
+  }
+
+  private noteRelayPathDenied(): void {
+    this.relayPathDeniedCount += 1
+    log.warn('codex relay path denied', {
+      sessionKey: this.opts.sessionKey,
+      count: this.relayPathDeniedCount,
+    })
+    if (!shouldAbortOnRelayPathDenied(this.relayPathDeniedCount)) return
+    const err = new Error(
+      'CODEX_RELAY_PATH_DENIED: MCP/relay path not allowed; aborting turn',
+    )
+    err.name = 'CodexRelayPathDeniedError'
+    if (this.currentTurnCompleter) {
+      this.currentTurnCompleter.reject(err)
+      this.currentTurnCompleter = null
+    }
+    void this.shutdown()
   }
 
   private _isZeroBreakdown(b: CodexTokenBreakdown): boolean {
