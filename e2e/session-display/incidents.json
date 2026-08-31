@@ -2082,6 +2082,50 @@
           "assertion": "T59 Phase-A unpublished 后交错 live assistant 段仍保持 thinking/正文1/tool/正文2"
         }
       ]
+    },
+    {
+      "id": "INC-20260831-VISIBLE-ORPHAN-FALSE-KILL",
+      "occurredAt": "2026-08-31",
+      "severity": "P1",
+      "symptom": "V5 selfhost 对账器 closeVisibleOrphans 在 accepted 满 15min 且 PG 无 dispatch 流帧时走 interrupt_tapeless，把 persist 积压下仍活着的引擎(已有 turn_traces.first_visible_at / thinking+text，卡在长委派)误杀成 turn interrupted (visible fallback)；且该路径不写 producer_fenced_at，僵尸 producer 继续跑。实锤 dispatch 89f18ffe-c2a8-4412-9ce8-97c69f17ef22。",
+      "rootFixCommit": "19e9d471",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "skip live engine with first_visible but zero dispatch frames (OCV5-57 89f18ffe)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "interrupt_tapeless when engine never emitted a frame even with container running"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "fence_hard_cap still fires at 6h even with first_visible and zero frames"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "scan must select first_visible_at"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "OCV5-43 hydrate-dead engine attempts interrupt fence even if CAS misses"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "OCV5-57 first_visible plus zero dispatch frames skips and does not fence"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-visible-orphan-liveness.ts",
+          "assertion": "OCV5-57: first_visible + zero dispatch frames must skip interrupt_tapeless"
+        }
+      ]
     }
   ]
 }
