@@ -2089,6 +2089,9 @@
       "severity": "P1",
       "symptom": "Cursor 回合 MCP send_to_agent 报 401 async delegate requires delegate context。根因是 buildCursorMemoryMcpConfig 漏注 OPENCLAUDE_DELEGATE_CONTEXT_FILE，MCP 子进程无法带签名 context 调 /delegate。",
       "rootFixCommit": "1bfa85be",
+      "coverageCommits": [
+        "886e4dfa"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -2098,13 +2101,14 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
-          "assertion": "spawn MCP json contains delegate-context path with mode 0600 and the file is removed after the turn"
+          "assertion": "spawned Cursor MCP config injects delegate-context file mode 0600 and cleans it up"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/54-ocv5-delegate-wiring.spec.ts",
+          "assertion": "spawned Cursor MCP config injects delegate-context file mode 0600 and cleans it up"
         }
-      ],
-      "proofPending": {
-        "reason": "T1 gateway 接线修复，回归锁在 cursorAdapter spawn 单测（MCP env 注入 + 0600 + 回合清理）。无独立 browser/live-e2e 旅程覆盖 Cursor MCP send_to_agent 401。",
-        "since": "2026-08-31"
-      }
+      ]
     },
     {
       "id": "INC-20260831-DELEGATE-MODEL-UNKNOWN",
@@ -2112,12 +2116,10 @@
       "severity": "P1",
       "symptom": "委派显式 --model 传未知 slug 时静默 inherit 默认模型。fail-loud 判定已存在但被 OC_MODEL_AUTHORITY flag 门住，flag 关时错误 slug 不报 DELEGATE_MODEL_UNKNOWN。",
       "rootFixCommit": "8170334e",
+      "coverageCommits": [
+        "886e4dfa"
+      ],
       "regressions": [
-        {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/modelAuthorityLocalPath.test.ts",
-          "assertion": "assertKnownExplicitDelegateModel:未知 slug 拒,合法 slug 与 inherit 通过"
-        },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/modelAuthorityLocalPath.test.ts",
@@ -2126,18 +2128,14 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateAsyncJobs.test.ts",
-          "assertion": "flag-off explicit unknown model returns 400 DELEGATE_MODEL_UNKNOWN"
+          "assertion": "async flag-off explicit unknown model rejects at entry (no job)"
         },
         {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/delegateAsyncJobs.test.ts",
-          "assertion": "async flag-off explicit unknown model rejects at entry (no job)"
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/54-ocv5-delegate-wiring.spec.ts",
+          "assertion": "explicit unknown slug returns 400 DELEGATE_MODEL_UNKNOWN without a job"
         }
-      ],
-      "proofPending": {
-        "reason": "T1 gateway 接线修复，回归锁在 handleDelegateTask / resolveLocalExecutionIfEnforced 单测。无独立 live-e2e 覆盖错误 slug 委派。",
-        "since": "2026-08-31"
-      }
+      ]
     }
   ]
 }
