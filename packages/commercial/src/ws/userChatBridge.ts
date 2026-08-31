@@ -3453,12 +3453,122 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       recoveryJob?: ClaimedRecoveryJob;
     }
     const admittedDispatches = new Map<string, AdmittedDispatch>();
+    type EnrichmentDispatchPhase = "enriching" | "terminalizing" | "transferred";
+    interface EnrichmentDispatchState {
+      record: AdmittedDispatch;
+      phase: EnrichmentDispatchPhase;
+      timer: ReturnType<typeof setTimeout> | null;
+    }
+    // Linearization boundary for the only proven unsafe window: a durable
+    // dispatch has committed, but master history/workspace/goal enrichment has
+    // not yet transferred ownership to the engine-specific lane. Cleanup and
+    // timeout may terminalize only `enriching`; once `transferred`, the existing
+    // durable receipt/recovery/billing state machine remains authoritative.
+    const enrichmentDispatches = new Map<string, EnrichmentDispatchState>();
+    const preparedEnrichmentFrames = new WeakMap<Record<string, unknown>, EnrichmentDispatchState>();
+    const transferredDispatches = new Set<string>();
     let dispatchHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
     /** 删记录并在 drain 期推进完成判定(map 空 + inflight 空才收尾)。 */
     const dropAdmittedDispatch = (clientMessageId: string): void => {
+      transferredDispatches.delete(clientMessageId);
       if (admittedDispatches.delete(clientMessageId)) checkDrainComplete();
     };
+
+    const isEnriching = (state: EnrichmentDispatchState | null | undefined): state is EnrichmentDispatchState =>
+      state !== null && state !== undefined && state.phase === "enriching";
+
+    /**
+     * Single-winner pre-transfer terminalization. The synchronous phase CAS is
+     * the fence for every late workspace/history/goal continuation; the DB CAS
+     * is deliberately restricted to admitted+epoch, so a concurrent owner that
+     * already accepted the dispatch always wins.
+     */
+    const terminalizeEnrichmentDispatch = (
+      state: EnrichmentDispatchState,
+      failureCode: string,
+    ): boolean => {
+      if (state.phase !== "enriching") return false;
+      state.phase = "terminalizing";
+      if (state.timer !== null) {
+        clearTimeout(state.timer);
+        state.timer = null;
+      }
+      const record = state.record;
+      const pool = deps.pgPool;
+      void (async (): Promise<void> => {
+        try {
+          if (!pool) return;
+          if (record.recoveryJob) {
+            await releaseRecoveryPreReceipt(pool, {
+              job: record.recoveryJob,
+              dispatchId: record.dispatchId,
+              dispatchOwner: connId,
+              dispatchLeaseEpoch: record.leaseEpoch,
+            });
+          } else {
+            await casToTerminal(pool, {
+              dispatchId: record.dispatchId,
+              outcome: "executed_error",
+              failureCode,
+              clientNotified: false,
+              fromStatuses: ["admitted"],
+              expectedEpoch: record.leaseEpoch,
+            });
+          }
+        } catch (err) {
+          bridgeLog?.error("user-chat-bridge: pre-transfer dispatch terminalization failed", {
+            dispatchId: record.dispatchId,
+            failureCode,
+            err,
+          });
+        } finally {
+          if (enrichmentDispatches.get(record.clientMessageId) === state) {
+            enrichmentDispatches.delete(record.clientMessageId);
+          }
+          dropAdmittedDispatch(record.clientMessageId);
+        }
+      })();
+      return true;
+    };
+
+    const trackEnrichmentDispatch = (
+      record: AdmittedDispatch,
+      closedFailureCode = "bridge_closed_during_admission",
+    ): EnrichmentDispatchState => {
+      const existing = enrichmentDispatches.get(record.clientMessageId);
+      if (existing && existing.record === record) return existing;
+      const state: EnrichmentDispatchState = { record, phase: "enriching", timer: null };
+      enrichmentDispatches.set(record.clientMessageId, state);
+      state.timer = setTimeout(() => {
+        if (terminalizeEnrichmentDispatch(state, "dispatch_enrichment_timeout")) {
+          if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+            sendErrorFrame(
+              userWs,
+              "DISPATCH_ENRICHMENT_TIMEOUT",
+              "session context took too long to prepare; retry this turn",
+              { peerId: record.sessionId, clientMessageId: record.clientMessageId },
+            );
+          }
+        }
+      }, promptQueuePreparationTimeoutMs);
+      state.timer.unref?.();
+      // Admission may commit after this bridge already completed cleanup. Own
+      // the row first, then terminalize in the same synchronous continuation;
+      // never start heartbeat/history on a dead bridge.
+      if (cleaned || userDetached) {
+        terminalizeEnrichmentDispatch(state, closedFailureCode);
+      }
+      return state;
+    };
+
+    const terminalizeAllEnriching = (failureCode: string): void => {
+      for (const state of [...enrichmentDispatches.values()]) {
+        terminalizeEnrichmentDispatch(state, failureCode);
+      }
+    };
+
+    const hasTransferredDispatches = (): boolean => transferredDispatches.size > 0;
     /** 首次受理时惰性起心跳(unref);legacy 连接从不受理 → 永不建 timer(行为不变)。 */
     const ensureDispatchHeartbeat = (): void => {
       if (dispatchHeartbeatTimer !== null || !deps.pgPool) return;
@@ -3515,6 +3625,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const lookupAdmittedDispatch = (
       frameObj: Record<string, unknown>,
     ): AdmittedDispatch | undefined => {
+      const prepared = preparedEnrichmentFrames.get(frameObj);
+      if (prepared !== undefined) {
+        preparedEnrichmentFrames.delete(frameObj);
+        if (prepared.phase !== "enriching") return undefined;
+        prepared.phase = "transferred";
+        if (prepared.timer !== null) {
+          clearTimeout(prepared.timer);
+          prepared.timer = null;
+        }
+        enrichmentDispatches.delete(prepared.record.clientMessageId);
+        transferredDispatches.add(prepared.record.clientMessageId);
+        return prepared.record;
+      }
       const cmid = isClientMessageId(frameObj.clientMessageId)
         ? frameObj.clientMessageId
         : null;
@@ -3789,8 +3912,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // B3(R3):本帧受理成功后落此(= 刚受理 dispatch 的 clientMessageId)。受理**之后**的任何 pre-forward
       // 失败出口(goal unavailable / sanitize 抛 / 任意异常 / 未预期早 return)必须据此 CAS terminal +
       // drop,否则留 admitted 永续租孤儿 + 无可见终态(违反 I1)。成功交棒调用方前置空(所有权移交)。
-      let admittedThisFrame: string | null = null;
+      let admittedThisFrame: EnrichmentDispatchState | null = null;
       let sessionWorkspaceMode: SessionWorkspaceMode | null = null;
+      if (clientMessageId !== null) {
+        const preAdmitted = admittedDispatches.get(clientMessageId);
+        if (preAdmitted !== undefined) {
+          admittedThisFrame = trackEnrichmentDispatch(preAdmitted);
+          if (!isEnriching(admittedThisFrame)) return null;
+          ensureDispatchHeartbeat();
+        }
+      }
 
       // 主会话历史**只读一次**,给「dispatch 受理前 dedup」与「受理/持久化后 enrichment」共用。
       // fail-open:读失败绝不阻断受理/转发(历史只是 UX 上下文,不是 authz/billing)。
@@ -3798,15 +3929,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       //   - legacy 路径:保持「先持久 user 行,再读历史」的既有顺序不变(权威 user 行先于历史注入)。
       let rawHistory: unknown[] | null = null;
       let historyLoaded = false;
-      const ensureHistory = async (): Promise<void> => {
-        if (historyLoaded) return;
+      let historyAvailable = deps.loadMasterSessionMessages === undefined;
+      const ensureHistory = async (): Promise<boolean> => {
+        if (historyLoaded) return historyAvailable;
         historyLoaded = true;
-        if (!deps.loadMasterSessionMessages) return;
+        if (!deps.loadMasterSessionMessages) return true;
         try {
           let contextWindow: number | null = null;
           let engine = historyModel && isCodexEngineModel(historyModel) ? "codex" : "ccb";
           if (authorityDeps !== undefined) {
-            if (historyModel === null) return;
+            if (historyModel === null) return false;
             const execution = await resolveTurnExecution(authorityDeps.catalog, historyModel);
             contextWindow = projectContextWindowForRole(
               execution.canonicalModel,
@@ -3821,12 +3953,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             currentUserText,
             ...(clientMessageId ? { excludeClientMessageId: clientMessageId } : {}),
           });
-          if (Array.isArray(raw)) rawHistory = raw;
+          if (!Array.isArray(raw)) return false;
+          rawHistory = raw;
+          historyAvailable = true;
+          return true;
         } catch (err) {
           turnLog?.warn("user-chat-bridge: load master history failed", {
             sessionId: peerId,
             err,
           });
+          return false;
         }
       };
       // 该 clientMessageId 是否早已产出 completed assistant 行(legacy 完成、无 dispatch;或
@@ -4003,7 +4139,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           switch (admit.kind) {
             case "admitted": {
               const d = admit.dispatch;
-              admittedDispatches.set(clientMessageId, {
+              const admittedRecord: AdmittedDispatch = {
                 clientMessageId,
                 sessionId: peerId,
                 dispatchId: d.dispatchId,
@@ -4013,14 +4149,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 anchorSeq: d.anchorSeq,
                 requestHash,
                 ...(recoveryJob ? { recoveryJob } : {}),
-              });
-              // B3(R3):标记本帧已受理 —— 受理后任何 pre-forward 失败出口据此终态化(下方 try/finally)。
-              admittedThisFrame = clientMessageId;
-              if (cleaned) {
-                failDispatchPreForward(
-                  admittedDispatches.get(clientMessageId),
-                  "bridge_closed_during_admission",
-                );
+              };
+              admittedDispatches.set(clientMessageId, admittedRecord);
+              // Own the enrichment phase before observing cleanup. If admission
+              // committed after finalCleanup, tracking synchronously claims the
+              // row for strict admitted-only terminalization.
+              admittedThisFrame = trackEnrichmentDispatch(admittedRecord);
+              if (!isEnriching(admittedThisFrame)) {
                 admittedThisFrame = null;
                 return null;
               }
@@ -4178,6 +4313,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           if (deps.loadSessionWorkspaceMode) {
             try {
               sessionWorkspaceMode = await deps.loadSessionWorkspaceMode(uid, peerId);
+              if (admittedThisFrame !== null && !isEnriching(admittedThisFrame)) return null;
             } catch (err) {
               turnLog?.error("user-chat-bridge: load session workspace mode failed", {
                 sessionId: peerId,
@@ -4199,7 +4335,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             sessionWorkspaceMode = "legacy";
           }
         }
-        await ensureHistory();
+        const historyOk = await ensureHistory();
+        if (admittedThisFrame !== null && !isEnriching(admittedThisFrame)) return null;
+        if (!historyOk && admittedThisFrame !== null) {
+          onReject?.("HISTORY_ENRICHMENT_UNAVAILABLE");
+          const state = admittedThisFrame;
+          admittedThisFrame = null;
+          if (terminalizeEnrichmentDispatch(state, "history_enrichment_unavailable")) {
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+              sendErrorFrame(
+                userWs,
+                "HISTORY_ENRICHMENT_UNAVAILABLE",
+                "session context is temporarily unavailable; retry this turn",
+                { peerId, clientMessageId },
+              );
+            }
+          }
+          return null;
+        }
         // legacy 路径的 dedup 在持久之后判定(dispatch 路径已在受理前 dedup,useDispatchAdmission 分支
         // 内 tryDedupCompleted 已消费;此处仅对 legacy 生效,避免二次 dedup 同一轮)。
         if (!useDispatchAdmission && await tryDedupCompleted()) return null;
@@ -4223,6 +4376,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           // 二分语义收敛到 resolveTurnGoalState 单一权威(NOT_FOUND=确定性放行 vs 其它=拒轮);
           // 副作用(错误帧/日志/回滚)仍留在此调用点。见该函数头注释。
           const resolved = await resolveTurnGoalState(deps.loadGoalState, uid, peerId);
+          if (admittedThisFrame !== null && !isEnriching(admittedThisFrame)) return null;
           if (resolved.kind === "unavailable") {
             // prompt-queue lane:回执让协调器取消 grant(browser lane 无 dispatchRequest → no-op)。
             onReject?.("GOAL_STATE_UNAVAILABLE");
@@ -4246,22 +4400,27 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             // B3(R3):受理后 goal 出口 —— 就地终态化(明确失败码),置空后 finally 不再重复。
             if (admittedThisFrame !== null) {
-              failDispatchPreForward(admittedDispatches.get(admittedThisFrame), "goal_state_unavailable");
+              const state = admittedThisFrame;
               admittedThisFrame = null;
+              terminalizeEnrichmentDispatch(state, "goal_state_unavailable");
             }
             return null;
           }
           // NOT_FOUND → resolved.goalState===null(放行,归因仍可修复);否则真实快照。
           enriched = { ...enriched, _goalState: resolved.goalState };
         }
-        // 成功:所有权移交调用方(它据返回帧 lookupAdmittedDispatch 后接管 pre-forward 终态化)。
+        // The caller claims transfer synchronously through lookupAdmittedDispatch.
+        // No event-loop turn exists between this return and that lookup, while
+        // cleanup/timeout winners observed during an await already changed phase.
+        if (admittedThisFrame !== null) {
+          if (!isEnriching(admittedThisFrame)) return null;
+          preparedEnrichmentFrames.set(enriched, admittedThisFrame);
+        }
         admittedThisFrame = null;
         return enriched;
       } finally {
-        // 未交棒即离开(sanitize/goal 读抛 / 任何未预期早 return)→ 终态化,绝不留孤儿 admitted。
-        // casToTerminal 幂等(CAS on epoch),即便调用方 catch 再兜底一次也安全。
         if (admittedThisFrame !== null) {
-          failDispatchPreForward(admittedDispatches.get(admittedThisFrame), "history_injection_failed");
+          terminalizeEnrichmentDispatch(admittedThisFrame, "history_injection_failed");
         }
       }
     };
@@ -8025,6 +8184,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         return;
       }
 
+      // A dispatch still in master enrichment has never been handed to the
+      // container. Claim it now, before drain classification, so client_close
+      // cannot leave an admitted orphan for the five-minute authority timeout.
+      terminalizeAllEnriching("client_disconnected_before_enrichment_transfer");
+
       // 还没进 drain
       // drain 适用条件:user-side 故障(client_close / backpressure / internal_error)
       // 同时有在飞 codex turn(等 billing)或在飞 durable dispatch(保 lease / 等终态)。
@@ -8034,7 +8198,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         (triggerCause === "client_close" ||
           triggerCause === "backpressure" ||
           triggerCause === "internal_error") &&
-        (inflightCodexTurns.size > 0 || admittedDispatches.size > 0);
+        (inflightCodexTurns.size > 0 || hasTransferredDispatches());
 
       if (!shouldDrain) {
         finalCleanup(triggerCause);
@@ -8052,13 +8216,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       // RFC §2.2 B1:有在飞 admitted dispatch → 取 max(billing, dispatch drain,默认 60s / 上限 120s);
       // 无 dispatch(纯 codex billing drain)→ 沿用 5s billing 窗口。
-      const drainMs = admittedDispatches.size > 0
+      const drainMs = hasTransferredDispatches()
         ? Math.max(readDrainBillingMs(), readDispatchDrainMs())
         : readDrainBillingMs();
       drainTimer = setTimeout(() => {
         bridgeLog?.warn("user-chat-bridge: drain timeout", {
           leftover: inflightCodexTurns.size,
-          admittedLeftover: admittedDispatches.size,
+          admittedLeftover: transferredDispatches.size,
         });
         for (const [requestId, snap] of inflightCodexTurns) {
           recordBillingRecovery(requestId, "failed", snap);
@@ -8073,7 +8237,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * 双 map 均空才提前结束 drain。不在 drain 期 / 任一 map 非空时 no-op。
      */
     function checkDrainComplete(): void {
-      if (drainTimer !== null && inflightCodexTurns.size === 0 && admittedDispatches.size === 0) {
+      if (drainTimer !== null && inflightCodexTurns.size === 0 && !hasTransferredDispatches()) {
         clearTimeout(drainTimer);
         drainTimer = null;
         finalCleanup(drainCause ?? "client_close");
@@ -8725,8 +8889,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }).then(() => undefined),
         );
       }
-      // durable dispatch 本地簿记清空(权威在 turn_dispatches;reconciler 兜底 open 行)。
+      // Enrichment states were terminalized at cleanup entry. Transferred
+      // dispatches remain under the existing durable recovery authority.
       admittedDispatches.clear();
+      transferredDispatches.clear();
 
       // Release every session-scoped admission state. Awaiting acquire/route
       // continuations carry the state identity fence and release any resource

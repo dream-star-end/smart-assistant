@@ -220,6 +220,7 @@ async function startRig(opts: {
   hasCompletedClientTurn?: UserChatBridgeDeps["hasCompletedClientTurn"];
   getFrontendBuildId?: UserChatBridgeDeps["getFrontendBuildId"];
   loadGoalState?: (uid: bigint, sessionId: string) => Promise<unknown>;
+  promptQueuePreparationTimeoutMs?: number;
   /** B3(R3):注入 mock pgPool 观察受理后 pre-forward 失败出口的 casToTerminal(需三件套齐)。 */
   pgPool?: unknown;
 }): Promise<Rig> {
@@ -456,6 +457,9 @@ async function startRig(opts: {
       : {}),
     ...(opts.loadGoalState
       ? { loadGoalState: opts.loadGoalState as UserChatBridgeDeps["loadGoalState"] }
+      : {}),
+    ...(opts.promptQueuePreparationTimeoutMs
+      ? { promptQueuePreparationTimeoutMs: opts.promptQueuePreparationTimeoutMs }
       : {}),
     // B3(R3):注入 pgPool 时必须补齐 codex 计费三件套(bridge fail-closed 校验);glm-5.2(CCB)
     // 在 goal 失败(转发前)短路,故 preCheckRedis/pricing 永不被调用,空桩即可满足类型。
@@ -1538,6 +1542,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       );
       const casQ = queries.find((q) => q.params[2] === "bridge_closed_during_admission")!;
       assert.equal(casQ.params[3], false, "client_notified=false(连接已死,durable 告知交 reconciler)");
+      assert.deepEqual(casQ.params[5], ["admitted"], "只允许 admitted→terminal");
       // 绝不转发:连接死于受理期,帧不得进容器。
       assert.equal(
         rig.containerSeen.some((s2) => {
@@ -1556,6 +1561,90 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
         false,
         "无 late heartbeat(interval 未被启动)",
       );
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("R4-B2 history enrichment 中 client_close → drain 前立即 admitted-only terminal，late history 永不转发", async () => {
+    const queries: { sql: string; params: unknown[] }[] = [];
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        return { rows: [], rowCount: 1 };
+      },
+    };
+    let historyStarted = false;
+    let releaseHistory: ((rows: unknown[]) => void) | null = null;
+    const historyGate = new Promise<unknown[]>((resolve) => { releaseHistory = resolve; });
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      pgPool,
+      admitUserTurn: async (input) => fakeAdmittedDispatch(input),
+      loadMasterSessionMessages: async () => {
+        historyStarted = true;
+        return await historyGate;
+      },
+      promptQueuePreparationTimeoutMs: 2_000,
+    });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(inboundFrame({
+        clientMessageId: "cm-history-close",
+        idempotencyKey: "web:cm-history-close:0",
+        peer: { id: "sess-history-close", kind: "dm" },
+      }));
+      await waitFor(() => historyStarted);
+      const closedAt = Date.now();
+      ws.close();
+      await waitFor(() => queries.some((q) => q.params[2] === "client_disconnected_before_enrichment_transfer"), 500);
+      assert.ok(Date.now() - closedAt < 1_000, "close 必须在 dispatch drain 前启动终态 CAS");
+      const casQ = queries.find((q) => q.params[2] === "client_disconnected_before_enrichment_transfer")!;
+      assert.deepEqual(casQ.params[5], ["admitted"]);
+      assert.equal(casQ.params[6], "1", "strict expectedEpoch");
+      assert.equal(rig.containerSeen.some((row) => row.includes('"type":"inbound.message"')), false);
+      releaseHistory!([{ id: "old", role: "assistant", text: "late" }]);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(rig.containerSeen.some((row) => row.includes('"type":"inbound.message"')), false, "late history 不得转发");
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("R4-B3 enrichment deadline → terminal；history 晚成功仍不执行", async () => {
+    const queries: { sql: string; params: unknown[] }[] = [];
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        return { rows: [], rowCount: 1 };
+      },
+    };
+    let releaseHistory: ((rows: unknown[]) => void) | null = null;
+    const historyGate = new Promise<unknown[]>((resolve) => { releaseHistory = resolve; });
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      pgPool,
+      admitUserTurn: async (input) => fakeAdmittedDispatch(input),
+      loadMasterSessionMessages: async () => await historyGate,
+      promptQueuePreparationTimeoutMs: 40,
+    });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(inboundFrame({
+        clientMessageId: "cm-history-timeout",
+        idempotencyKey: "web:cm-history-timeout:0",
+        peer: { id: "sess-history-timeout", kind: "dm" },
+      }));
+      await waitFor(() => queries.some((q) => q.params[2] === "dispatch_enrichment_timeout"), 500);
+      const casQ = queries.find((q) => q.params[2] === "dispatch_enrichment_timeout")!;
+      assert.deepEqual(casQ.params[5], ["admitted"]);
+      releaseHistory!([]);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(rig.containerSeen.some((row) => row.includes('"type":"inbound.message"')), false);
+      ws.terminate();
+      await new Promise((resolve) => setTimeout(resolve, 50));
     } finally {
       await stopRig(rig);
     }
