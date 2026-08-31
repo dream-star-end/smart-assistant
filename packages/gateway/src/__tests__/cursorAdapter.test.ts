@@ -1334,6 +1334,7 @@ for(const e of [
         bundled: false,
       },
       tokenFile: '/tmp/openclaude-cursor-context-test/gateway-token',
+      contextFile: '/tmp/openclaude-cursor-context-test/delegate-context',
       agentId: 'main',
       sessionKey: 'agent:main:webchat:dm:test',
       gatewayPort: 18789,
@@ -1357,11 +1358,36 @@ for(const e of [
       server.env.OPENCLAUDE_GATEWAY_TOKEN_FILE,
       '/tmp/openclaude-cursor-context-test/gateway-token',
     )
+    assert.equal(
+      server.env.OPENCLAUDE_DELEGATE_CONTEXT_FILE,
+      '/tmp/openclaude-cursor-context-test/delegate-context',
+    )
     assert.equal(server.env.OPENCLAUDE_GATEWAY_TOKEN, undefined)
     assert.equal(server.env.OPENCLAUDE_SKILL_EVAL_MODE, '1')
     assert.equal(server.env.OPENCLAUDE_SKILL_EVAL_EXCLUDE, 'hidden-skill')
     assert.equal(server.env.OPENCLAUDE_SKILL_EVAL_DRAFT_NAME, 'draft-skill')
     assert.equal(server.env.OPENCLAUDE_SKILL_TRAIN_RUN_ID, 'train-1')
+  })
+
+  test('MCP child env omits delegate context file when caller did not pass one', () => {
+    const config = _internals.buildCursorMemoryMcpConfig({
+      launch: {
+        command: '/usr/local/bin/node',
+        args: ['/opt/openclaude/packages/mcp-memory/src/index.ts'],
+        entry: '/opt/openclaude/packages/mcp-memory/src/index.ts',
+        bundled: false,
+      },
+      tokenFile: '/tmp/openclaude-cursor-context-test/gateway-token',
+      agentId: 'main',
+      sessionKey: 'agent:main:webchat:dm:test',
+      gatewayPort: 18789,
+      delegationDepth: 0,
+    }) as any
+    assert.equal(config.mcpServers['openclaude-memory'].env.OPENCLAUDE_DELEGATE_CONTEXT_FILE, undefined)
+    assert.equal(
+      config.mcpServers['openclaude-memory'].env.OPENCLAUDE_GATEWAY_TOKEN_FILE,
+      '/tmp/openclaude-cursor-context-test/gateway-token',
+    )
   })
 
   test('always pins OPENCLAUDE_HOME on the rebuilt Cursor spawn env', () => {

@@ -1336,6 +1336,8 @@ function validateCursorFinalPrompt(prompt: string, payloadBytes: number): void {
 interface CursorMemoryMcpConfigInput {
   launch: McpMemoryLaunch
   tokenFile: string
+  /** Signed delegate-context file; MCP send_to_agent / async /delegate auth. */
+  contextFile?: string
   agentId: string
   projectId?: string
   sessionKey: string
@@ -1354,6 +1356,7 @@ function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<s
     OPENCLAUDE_SESSION_KEY: input.sessionKey,
     OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
     OPENCLAUDE_GATEWAY_TOKEN_FILE: input.tokenFile,
+    ...(input.contextFile ? { OPENCLAUDE_DELEGATE_CONTEXT_FILE: input.contextFile } : {}),
     OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),
     OPENCLAUDE_ENGINE: 'cursor',
     ...(process.env.OPENCLAUDE_HOME ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME } : {}),
@@ -1897,9 +1900,21 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         const configFile = resolve(contextDir, 'mcp.json')
         writeFileSync(tokenFile, gatewayToken, { mode: 0o600 })
         chmodSync(tokenFile, 0o600)
+        const contextFile = resolve(contextDir, 'delegate-context')
+        writeFileSync(
+          contextFile,
+          `${issueDelegateContextToken({
+            agentId: this.opts.agentId,
+            sessionKey: this.opts.sessionKey,
+            depth: this.opts.delegationDepth ?? 0,
+          })}\n`,
+          { mode: 0o600 },
+        )
+        chmodSync(contextFile, 0o600)
         const mcpConfig = buildCursorMemoryMcpConfig({
           launch: mcpLaunch,
           tokenFile,
+          contextFile,
           agentId: this.opts.agentId,
           projectId: this.opts.projectId,
           sessionKey: this.opts.sessionKey,
@@ -1913,17 +1928,6 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         writeFileSync(configFile, `${JSON.stringify(mcpConfig, null, 2)}\n`, { mode: 0o600 })
         chmodSync(configFile, 0o600)
         env.OPENCLAUDE_CURSOR_MCP_CONFIG = configFile
-        const contextFile = resolve(contextDir, 'delegate-context')
-        writeFileSync(
-          contextFile,
-          `${issueDelegateContextToken({
-            agentId: this.opts.agentId,
-            sessionKey: this.opts.sessionKey,
-            depth: this.opts.delegationDepth ?? 0,
-          })}\n`,
-          { mode: 0o600 },
-        )
-        chmodSync(contextFile, 0o600)
         attachCursorGatewayRouting(env, {
           gatewayPort: this.opts.config.gateway.port,
           contextFile,
