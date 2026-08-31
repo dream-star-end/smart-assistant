@@ -33,6 +33,8 @@ import {
   PatrolEngine,
   type RunUsageLookup,
   formatStageProjectContext,
+  STAGE_PROJECT_CONTEXT_MAX_CHARS,
+  STAGE_PROJECT_CONTEXT_TRUNC,
   resetSharedPatrolState,
 } from '../patrol.js'
 import { alignedLeaseTtlMs } from '../domain.js'
@@ -138,6 +140,28 @@ describe('formatStageProjectContext', () => {
       skills: [{ name: 'alpha' }],
     })
     assert.match(fromSkills ?? '', /alpha/)
+  })
+
+  it('最终注入串整体 ≤4k：说明优先，技能按需裁剪并留截断标记', () => {
+    const longIns = '项'.repeat(STAGE_PROJECT_CONTEXT_MAX_CHARS + 1)
+    const clipped = formatStageProjectContext({ instructions: longIns, skillOverlay: ['board-ops'] })
+    assert.ok(clipped)
+    assert.ok(clipped.length <= STAGE_PROJECT_CONTEXT_MAX_CHARS)
+    assert.equal(clipped.endsWith(STAGE_PROJECT_CONTEXT_TRUNC), true)
+    assert.match(clipped, /^项+/)
+    assert.doesNotMatch(clipped, /board-ops/)
+
+    const exact = formatStageProjectContext({ instructions: '优'.repeat(STAGE_PROJECT_CONTEXT_MAX_CHARS) })
+    assert.equal(exact?.length, STAGE_PROJECT_CONTEXT_MAX_CHARS)
+
+    const many = Array.from({ length: 1000 }, (_, i) => `skill-${String(i).padStart(4, '0')}`)
+    const listed = formatStageProjectContext({ instructions: '短说明', skillOverlay: many })
+    assert.ok(listed)
+    assert.ok(listed.length <= STAGE_PROJECT_CONTEXT_MAX_CHARS, `got ${listed.length}`)
+    assert.match(listed, /短说明/)
+    assert.match(listed, new RegExp(STAGE_PROJECT_CONTEXT_TRUNC.replace(/[[\]]/g, '\\$&')))
+    assert.match(listed, /skill-0000/)
+    assert.doesNotMatch(listed, /skill-0999/)
   })
 })
 
