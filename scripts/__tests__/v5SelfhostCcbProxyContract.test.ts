@@ -97,4 +97,18 @@ describe('v5 selfhost CCB HTTPS proxy deployment contract', () => {
       false,
     )
   })
+
+  it('keeps the selfhost host wrapper independent from Cursor ephemeral HOME', () => {
+    const setup = read('scripts/selfhost-setup-host-access.sh')
+    const wrapperBody = setup.match(/wrapper_body='([\s\S]*?)'\nif \[\[ -f "\$wrapper"/u)?.[1]
+
+    assert.ok(wrapperBody, 'host wrapper body must remain statically inspectable')
+    assert.match(wrapperBody, /PERSISTENT_HOME=\/home\/agent/)
+    assert.match(wrapperBody, /KEY="\$PERSISTENT_HOME\/\.openclaude\/\.ssh\/id_ed25519"/)
+    assert.match(
+      wrapperBody,
+      /UserKnownHostsFile="\$PERSISTENT_HOME\/\.openclaude\/\.ssh\/known_hosts"/,
+    )
+    assert.doesNotMatch(wrapperBody, /\$HOME/)
+  })
 })

@@ -168,10 +168,12 @@ done
 wrapper="$local_mount/bin/host"
 wrapper_body='#!/bin/sh
 # 到宿主机的固定通道。无参数=交互 shell,带参数=远程执行。
-KEY="$HOME/.openclaude/.ssh/id_ed25519"
+# Cursor 会为每个回合换成临时 HOME；宿主凭据始终在持久 home。
+PERSISTENT_HOME=/home/agent
+KEY="$PERSISTENT_HOME/.openclaude/.ssh/id_ed25519"
 exec /usr/bin/ssh -i "$KEY" \
   -o StrictHostKeyChecking=accept-new \
-  -o UserKnownHostsFile="$HOME/.openclaude/.ssh/known_hosts" \
+  -o UserKnownHostsFile="$PERSISTENT_HOME/.openclaude/.ssh/known_hosts" \
   -o ConnectTimeout=10 \
   root@172.31.0.1 "$@"
 '
