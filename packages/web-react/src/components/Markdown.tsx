@@ -26,7 +26,15 @@ export type MarkdownProps = {
   blockImages?: boolean;
 };
 
-const MarkdownImpl = lazy(() => import("./MarkdownImpl"));
+let markdownImplLoader: Promise<typeof import("./MarkdownImpl")> | null = null;
+
+/** Kick the lazy chunk as soon as a session mounts, before the first Suspense. */
+export function prefetchMarkdownImpl(): Promise<typeof import("./MarkdownImpl")> {
+  markdownImplLoader ??= import("./MarkdownImpl");
+  return markdownImplLoader;
+}
+
+const MarkdownImpl = lazy(() => prefetchMarkdownImpl());
 
 type HtmlFenceFallback = {
   before: string;

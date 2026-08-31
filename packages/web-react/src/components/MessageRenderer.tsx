@@ -34,6 +34,17 @@ import {
 import { isRecoveryControlUserTurn } from "../lib/chat/pure";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
+  EAGER_MEDIA_TAIL_ITEMS,
+  EAGER_PAYLOAD_TAIL_ITEMS,
+  PAINT_MIN_ITEMS,
+  computePaintRange,
+  createRowGeometryWarmup,
+  measuredRangePx,
+  paintRangeSettled,
+  paintWindowEnabled,
+} from "../lib/chat/timelinePaint";
+import { prefetchMarkdownImpl } from "./Markdown";
+import {
   AssistantCard,
   type CardCallbacks,
   DelegateProgressCard,
@@ -45,6 +56,7 @@ import {
   UserCard,
 } from "./chat/cards";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
+import { TimelineEagerMediaContext } from "./chat/timelineEager";
 import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
 import { TeamPanel } from "./chat/TeamPanel";
 import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
@@ -140,6 +152,8 @@ type RendererProps = {
   readOnly?: boolean;
   /** 同一可见轮已有错误卡/状态卡，用户行不再重复展示失败标签和重试。 */
   failurePresentedBelow?: boolean;
+  /** 初始尾部 locator：跳过 600px IO，进会话即兑付正文。 */
+  eagerPayload?: boolean;
 };
 
 export const MessageRenderer = memo(
@@ -160,6 +174,7 @@ export const MessageRenderer = memo(
     onRespondPermission,
     readOnly = false,
     failurePresentedBelow = false,
+    eagerPayload = false,
   }: RendererProps) {
     const ctx = {
       isLast,
@@ -191,6 +206,7 @@ export const MessageRenderer = memo(
           onRespondPermission={onRespondPermission}
           readOnly={readOnly}
           failurePresentedBelow={failurePresentedBelow}
+          eagerPayload={eagerPayload}
         />
       );
     }
@@ -302,6 +318,7 @@ export const MessageRenderer = memo(
     a.processPaging === b.processPaging &&
     a.readOnly === b.readOnly &&
     a.failurePresentedBelow === b.failurePresentedBelow &&
+    a.eagerPayload === b.eagerPayload &&
     a.cb === b.cb &&
     a.onRespondPermission === b.onRespondPermission,
 );
@@ -424,6 +441,7 @@ function DeferredTapeRecordCard({
   readOnly,
   turnFinalAssistant,
   failurePresentedBelow,
+  eagerPayload = false,
 }: Omit<RendererProps, "sig" | "delegateCost">) {
   const ref = useRef<HTMLDivElement>(null);
   const isUserPayload = message._userPayloadDeferred === true;
@@ -508,7 +526,7 @@ function DeferredTapeRecordCard({
       started.current = false;
       controller.abort();
     };
-    if (typeof IntersectionObserver === "undefined") {
+    if (eagerPayload || typeof IntersectionObserver === "undefined") {
       void load();
       return cancel;
     }
@@ -526,7 +544,7 @@ function DeferredTapeRecordCard({
       observer.disconnect();
       cancel();
     };
-  }, [load]);
+  }, [load, eagerPayload]);
 
   if (records) {
     return (
@@ -907,53 +925,9 @@ function coalesceTeam(
 export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
 const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
 const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
-const PAINT_ESTIMATE_PX = 200;
-const PAINT_OVERSCAN = 28;
-const PAINT_MIN_ITEMS = 36;
-const PAINT_ENABLE_ITEMS = 160;
-const PAINT_ENABLE_VIEWPORT_PX = 360;
 
 function defaultTailStart(length: number): number {
   return Math.max(0, length - TIMELINE_INITIAL_TAIL_ITEMS);
-}
-
-function paintWindowEnabled(scroller: HTMLElement | null | undefined, count: number): boolean {
-  return Boolean(
-    scroller &&
-    scroller.clientHeight >= PAINT_ENABLE_VIEWPORT_PX &&
-    count >= PAINT_ENABLE_ITEMS,
-  );
-}
-
-function computePaintRange(
-  count: number,
-  scrollTop: number,
-  clientHeight: number,
-  followBottom: boolean,
-): { start: number; end: number } {
-  const visible = Math.max(
-    PAINT_MIN_ITEMS,
-    Math.ceil(clientHeight / PAINT_ESTIMATE_PX) + PAINT_OVERSCAN * 2,
-  );
-  if (followBottom) {
-    return { start: Math.max(0, count - visible), end: count };
-  }
-  const start = Math.max(0, Math.floor(scrollTop / PAINT_ESTIMATE_PX) - PAINT_OVERSCAN);
-  const end = Math.min(count, Math.max(start + PAINT_MIN_ITEMS, start + visible));
-  return { start, end };
-}
-
-function measuredRangePx(
-  from: number,
-  to: number,
-  keyAt: (index: number) => string,
-  heights: Map<string, number>,
-): number {
-  let height = 0;
-  for (let i = from; i < to; i += 1) {
-    height += heights.get(keyAt(i)) ?? PAINT_ESTIMATE_PX;
-  }
-  return height;
 }
 
 function renderItemKey(item: RenderItem): string {
@@ -1071,6 +1045,9 @@ export function MessageList({
   const followBottomRefBox = useRef(followBottomRef);
   followBottomRefBox.current = followBottomRef;
   const rowHeightCacheRef = useRef<Map<string, number>>(new Map());
+  const visibleKeysRef = useRef<string[]>([]);
+  const eagerPayloadKeysRef = useRef<Set<string> | null>(null);
+  const eagerMediaKeysRef = useRef<Set<string> | null>(null);
   const lastViewportAnchorRef = useRef<VisibleVirtualRowAnchor | null>(null);
   const lastPaintSpanRef = useRef({ start: -1, end: -1 });
   const beginViewportPreserve = () => {
@@ -1096,6 +1073,9 @@ export function MessageList({
     didSnapToBottomRef.current = false;
     viewportPreserveLockRef.current = false;
     rowHeightCacheRef.current = new Map();
+    visibleKeysRef.current = [];
+    eagerPayloadKeysRef.current = null;
+    eagerMediaKeysRef.current = null;
     lastViewportAnchorRef.current = null;
     lastPaintSpanRef.current = { start: -1, end: -1 };
   }
@@ -1235,17 +1215,16 @@ export function MessageList({
       raf = 0;
       const count = visibleCountRef.current;
       if (!paintWindowEnabled(el, count)) return;
-      const next = computePaintRange(
+      const keys = visibleKeysRef.current;
+      const next = computePaintRange({
         count,
-        el.scrollTop,
-        el.clientHeight,
-        followBottomRefBox.current?.current === true,
-      );
-      setPaintRange((prev) => {
-        if (prev.start === next.start && prev.end === next.end) return prev;
-        if (Math.abs(prev.start - next.start) < 8 && Math.abs(prev.end - next.end) < 8) return prev;
-        return next;
+        scrollTop: el.scrollTop,
+        clientHeight: el.clientHeight,
+        followBottom: followBottomRefBox.current?.current === true,
+        keyAt: (index) => keys[index] ?? "",
+        heights: rowHeightCacheRef.current,
       });
+      setPaintRange((prev) => (paintRangeSettled(prev, next) ? prev : next));
     };
     const onScroll = () => {
       lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(el);
@@ -1260,6 +1239,35 @@ export function MessageList({
       if (raf) cancelAnimationFrame(raf);
     };
   }, [scrollParent, windowVersion, sessionId]);
+
+  useEffect(() => {
+    if (!scrollParent) return;
+    void prefetchMarkdownImpl();
+  }, [sessionId, scrollParent]);
+
+  useEffect(() => {
+    const root = listRootRef.current;
+    const scroller = scrollParent;
+    if (!root || !scroller || !didSnapToBottomRef.current) return;
+    if (visibleCountRef.current === 0) return;
+    const warmup = createRowGeometryWarmup({
+      getRows: () => root.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
+      cache: rowHeightCacheRef.current,
+    });
+    const abort = () => warmup.abort();
+    scroller.addEventListener("wheel", abort, { passive: true });
+    scroller.addEventListener("touchstart", abort, { passive: true });
+    scroller.addEventListener("pointerdown", abort);
+    scroller.addEventListener("keydown", abort);
+    warmup.start();
+    return () => {
+      abort();
+      scroller.removeEventListener("wheel", abort);
+      scroller.removeEventListener("touchstart", abort);
+      scroller.removeEventListener("pointerdown", abort);
+      scroller.removeEventListener("keydown", abort);
+    };
+  }, [scrollParent, sessionId, windowVersion, messages.length]);
 
   // Drop legacy substitute rows from an old IndexedDB cache and duplicate
   // engine transport envelopes. The latter remain byte-complete in the tape;
@@ -1471,6 +1479,15 @@ export function MessageList({
     );
   const visibleItems = renderItems.slice(windowStart);
   visibleCountRef.current = visibleItems.length;
+  visibleKeysRef.current = visibleItems.map(itemKey);
+  if (eagerPayloadKeysRef.current === null && visibleItems.length > 0) {
+    eagerPayloadKeysRef.current = new Set(
+      visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS).map(itemKey),
+    );
+    eagerMediaKeysRef.current = new Set(
+      visibleItems.slice(-EAGER_MEDIA_TAIL_ITEMS).map(itemKey),
+    );
+  }
   const paintOn = paintWindowEnabled(scrollParent, visibleItems.length)
     && !archive?.loading
     && !archiveQueued;
@@ -1478,12 +1495,16 @@ export function MessageList({
   let paintEnd = visibleItems.length;
   if (paintOn && scrollParent) {
     if (followBottomRef?.current) {
-      const vis = Math.max(
-        PAINT_MIN_ITEMS,
-        Math.ceil(scrollParent.clientHeight / PAINT_ESTIMATE_PX) + PAINT_OVERSCAN * 2,
-      );
-      paintStart = Math.max(0, visibleItems.length - vis);
-      paintEnd = visibleItems.length;
+      const next = computePaintRange({
+        count: visibleItems.length,
+        scrollTop: scrollParent.scrollTop,
+        clientHeight: scrollParent.clientHeight,
+        followBottom: true,
+        keyAt: (index) => itemKey(visibleItems[index]),
+        heights: rowHeightCacheRef.current,
+      });
+      paintStart = next.start;
+      paintEnd = next.end;
     } else {
       paintStart = Math.min(paintRange.start, Math.max(0, visibleItems.length - PAINT_MIN_ITEMS));
       paintEnd = Math.min(visibleItems.length, Math.max(paintRange.end, paintStart + PAINT_MIN_ITEMS));
@@ -1605,6 +1626,7 @@ export function MessageList({
           onRespondPermission={onRespondPermission}
           readOnly={readOnly}
           failurePresentedBelow={failurePresentedBelow}
+          eagerPayload={eagerPayloadKeysRef.current?.has(rowId) === true}
         />
       </MessageBoundary>
     );
@@ -1700,15 +1722,20 @@ export function MessageList({
           style={{ height: topSpacerPx }}
         />
       ) : null}
-      {paintedItems.map((item) => (
-        <div
-          key={itemKey(item)}
-          className="chat-virtual-item chat-timeline-row"
-          data-chat-virtual-key={itemKey(item)}
-        >
-          {renderItem(item)}
-        </div>
-      ))}
+      {paintedItems.map((item) => {
+        const key = itemKey(item);
+        const eagerMedia = eagerMediaKeysRef.current?.has(key) === true;
+        return (
+          <TimelineEagerMediaContext.Provider key={key} value={eagerMedia}>
+            <div
+              className="chat-virtual-item chat-timeline-row"
+              data-chat-virtual-key={key}
+            >
+              {renderItem(item)}
+            </div>
+          </TimelineEagerMediaContext.Provider>
+        );
+      })}
       {paintEnd < visibleItems.length ? (
         <div
           aria-hidden
