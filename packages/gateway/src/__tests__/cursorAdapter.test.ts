@@ -569,6 +569,10 @@ for(const e of [
         'command',
         'env',
       ])
+      const launchedDelegateContextFile =
+        launched.config.mcpServers['openclaude-memory'].env.OPENCLAUDE_DELEGATE_CONTEXT_FILE
+      assert.equal(typeof launchedDelegateContextFile, 'string')
+      assert.ok(launchedDelegateContextFile.endsWith('/delegate-context'))
       assert.equal(launched.configText.includes(GATEWAY_SECRET), false)
       assert.equal(JSON.stringify(launched.argv).includes(GATEWAY_SECRET), false)
       const prompt = launched.argv.at(-1) as string
@@ -1334,6 +1338,7 @@ for(const e of [
         bundled: false,
       },
       tokenFile: '/tmp/openclaude-cursor-context-test/gateway-token',
+      delegateContextFile: '/tmp/openclaude-cursor-context-test/delegate-context',
       agentId: 'main',
       sessionKey: 'agent:main:webchat:dm:test',
       gatewayPort: 18789,
@@ -1356,6 +1361,10 @@ for(const e of [
     assert.equal(
       server.env.OPENCLAUDE_GATEWAY_TOKEN_FILE,
       '/tmp/openclaude-cursor-context-test/gateway-token',
+    )
+    assert.equal(
+      server.env.OPENCLAUDE_DELEGATE_CONTEXT_FILE,
+      '/tmp/openclaude-cursor-context-test/delegate-context',
     )
     assert.equal(server.env.OPENCLAUDE_GATEWAY_TOKEN, undefined)
     assert.equal(server.env.OPENCLAUDE_SKILL_EVAL_MODE, '1')

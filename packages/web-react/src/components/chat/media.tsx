@@ -23,6 +23,7 @@ import { cn } from "../../lib/utils";
 import { authScopedImageIdentity, pickThumbnailWidth } from "../../lib/chat/imageBytes";
 import { useProgressiveImage } from "../../lib/chat/useProgressiveImage";
 import { ImageViewer } from "../ImageViewer";
+import { useTimelineEagerMedia } from "./timelineEager";
 
 /** 气泡缩略默认按 dpr 选档:标屏 640,retina 1280(与服务端白名单一致)。 */
 function defaultThumbWidth(): 640 | 1280 {
@@ -293,13 +294,15 @@ export function ZoomableImage({
 
   // 缩略分级 + 流式进度 + 字节复用(单一 hook 收口)。签名 URL 请求 ?w=<640|1280>;
   // 直链/本地 blob 零网络透传。懒加载:进视口才拉,避免长会话多图打爆 per-uid 6 并发闸。
+  // 初始贴底邻近视口的极少行(见 TimelineEagerMediaContext)才 lazy=false。
+  const eagerMedia = useTimelineEagerMedia();
   const width = thumbWidth === undefined ? defaultThumbWidth() : thumbWidth;
   const { containerRef, objectUrl, percent, status, reload } = useProgressiveImage({
     src,
     width,
     cacheIdentity,
     resolveSrc: get,
-    lazy: true,
+    lazy: !eagerMedia,
   });
 
   // 灯箱内用的最新签名 URL:开灯箱那一刻刷新(挂载 >5min 后再看大图,旧 URL 已死)。
