@@ -377,6 +377,20 @@ export const GUARDRAIL_DEFAULTS = {
   idleBackoffIntervalMs: 10 * 60 * 1000,
 } as const
 
+/**
+ * claim 与 renew 共用的有效租约 TTL。
+ * min(引擎上限, max(60s, timeoutSec + 一次续租间隔)),避免短 timeout 阶段
+ * 首次对齐后被 renew 写回默认 50 分钟。
+ */
+export function alignedLeaseTtlMs(
+  stageTimeoutSec: number,
+  engineLeaseTtlMs: number = GUARDRAIL_DEFAULTS.leaseTtlMs,
+  renewIntervalMs: number = GUARDRAIL_DEFAULTS.leaseRenewIntervalMs,
+): number {
+  const aligned = Math.max(60_000, stageTimeoutSec * 1000 + renewIntervalMs)
+  return Math.min(engineLeaseTtlMs, aligned)
+}
+
 // ── sessionKey ──────────────────────────────────────────────────────────────
 
 /**

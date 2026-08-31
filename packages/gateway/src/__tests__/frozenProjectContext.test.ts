@@ -122,4 +122,42 @@ describe('single frozen project context', () => {
     assert.equal(next.instructions, 'new-ins')
     assert.notEqual(next.contextVersion, frozen.contextVersion)
   })
+
+  it('stage prompt and PROJECT slot consume the same frozen snapshot', async () => {
+    const db = getTaskboardDb()
+    const project = createProject(db, { key: 'SFZ', name: 'single-freeze' })
+    const first = await writeProjectInstructions(project.id, 'freeze-v1', 0)
+    assert.equal(first.ok, true)
+    const frozen = await loadFrozenProjectContext({ boardProjectId: project.id, db })
+    await writeProjectInstructions(project.id, 'freeze-v2', frozen.contextVersion)
+    const { formatStageProjectContext } = await import('../taskboard/patrol.js')
+    const { renderPrompt } = await import('../taskboard/promptRender.js')
+    const block = formatStageProjectContext(frozen)
+    assert.match(block ?? '', /freeze-v1/)
+    assert.doesNotMatch(block ?? '', /freeze-v2/)
+    const { prompt } = renderPrompt({
+      template: '单 {{ticket.identifier}}',
+      ticket: { identifier: 'SFZ-1', title: 't', body: 'b' },
+      stage: { name: '复现确认', exitChecklist: 'x' },
+      projectContextText: block,
+    })
+    assert.match(prompt, /freeze-v1/)
+    assert.doesNotMatch(prompt, /freeze-v2/)
+    const slot = await buildProjectSlot({
+      agentId: 'stage-triage',
+      projectId: project.id,
+      frozenProjectContext: frozen,
+      projectContext: {
+        boardProjectId: project.id,
+        chatProjectId: null,
+        name: 'single-freeze',
+        instructions: frozen.instructions,
+        assets: [],
+        assetsRevision: 0,
+        bound: true,
+      },
+    })
+    assert.match(slot?.content ?? '', /freeze-v1/)
+    assert.doesNotMatch(slot?.content ?? '', /freeze-v2/)
+  })
 })

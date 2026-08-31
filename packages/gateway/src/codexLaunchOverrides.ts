@@ -43,8 +43,8 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { isPatrolSessionKey } from './taskboard/domain.js'
 
 /** 阶段 agent / 巡检会话不挂平台 MCP skills(TEST-10 / OCV5-46)。上下文走 prompt。 */
-export function shouldOmitPlatformMcp(agentId: string, sessionKey?: string): boolean {
-  if (agentId.startsWith('stage-')) return true
+export function shouldOmitPlatformMcp(agentId?: string, sessionKey?: string): boolean {
+  if (agentId?.startsWith('stage-')) return true
   if (sessionKey && isPatrolSessionKey(sessionKey)) return true
   return false
 }
@@ -301,6 +301,7 @@ export interface CodexLaunchOverridesContext {
   /** 当前 client session id,用于注入 PROJECT 项目指令 slot。 */
   sessionId?: string
   runContext?: import('./runContextPersist.js').RunContextDescriptor
+  frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
   cwd?: string
 }
 
@@ -399,6 +400,7 @@ export async function buildCodexLaunchOverrides(
     availableMcpTools,
     sessionId: ctx.sessionId,
     projectId: ctx.projectId,
+    frozenProjectContext: ctx.frozenProjectContext,
   })
   await persistRunContextSnapshot({
     descriptor: ctx.runContext,

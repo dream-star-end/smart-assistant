@@ -101,6 +101,7 @@ import {
   type Actor,
   type AuthorKind,
   GUARDRAIL_DEFAULTS,
+  alignedLeaseTtlMs,
   type OnFailureAction,
   type OnSuccessAction,
   type PipelineStage,
@@ -1831,7 +1832,7 @@ function handleClaim(
     autoClose: stage.autoClose,
   })
   const result = db.transaction(() => {
-    const run = acquireLease(db, ticket.id, stage.id, owner, GUARDRAIL_DEFAULTS.leaseTtlMs, {
+    const run = acquireLease(db, ticket.id, stage.id, owner, alignedLeaseTtlMs(stage.timeoutSec), {
       agentId: stage.agentId,
       trigger: 'transition',
     })
@@ -2199,7 +2200,7 @@ function handlePatrol(
 
   const owner = actorIdOf(actor, asString(body.owner), stage.agentId)
   const result = db.transaction(() => {
-    const run = acquireLease(db, ticket.id, stage.id, owner, GUARDRAIL_DEFAULTS.leaseTtlMs, {
+    const run = acquireLease(db, ticket.id, stage.id, owner, alignedLeaseTtlMs(stage.timeoutSec), {
       agentId: stage.agentId,
       trigger: 'manual',
     })

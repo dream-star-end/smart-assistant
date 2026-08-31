@@ -77,13 +77,17 @@ export interface InboxCreateArgs {
 export interface NotifyTransport {
   /** 缺省或返回 fallback → 走站内信兜底。delivered → 不再推站内信。 */
   sendWechat?: (args: { text: string; outboundId: string }) => Promise<WechatDeliveryResult>
-  /** info 级兜底。对应容器 inbox-post(限频 + 6h 去重)。 */
-  postInbox: (args: { title: string; bodyMd: string; deliveryKey: string }) => Promise<void>
+  /** info 级兜底。true = master ACK/duplicate;false = 未落盘,应保留重试。 */
+  postInbox: (args: {
+    title: string
+    bodyMd: string
+    deliveryKey: string
+  }) => Promise<boolean>
   /**
    * warning 级必须走这条(master createInboxMessage),不能复用 postInbox。
-   * 熔断 / 预算触顶用。
+   * 熔断 / 预算触顶用。true = ACK/duplicate。
    */
-  createInboxMessage: (args: InboxCreateArgs) => Promise<void>
+  createInboxMessage: (args: InboxCreateArgs) => Promise<boolean>
 }
 
 export interface TaskboardNotifyHooks {
@@ -135,6 +139,8 @@ export class TaskboardNotifier implements TaskboardNotifyHooks {
   private readonly digestHour: number
   private readonly log: (msg: string, extra?: Record<string, unknown>) => void
   private readonly sent = new Set<string>()
+  /** WeChat permanently failed; inbox dead-letter still pending ACK. */
+  private readonly wechatDead = new Set<string>()
   private readonly deferredAwaits = new Map<string, DeferredAwait>()
 
   constructor(opts: TaskboardNotifierOptions) {
@@ -149,6 +155,11 @@ export class TaskboardNotifier implements TaskboardNotifyHooks {
   /** 测试用:某 outboundId 是否已视为送达。 */
   hasSent(outboundId: string): boolean {
     return this.sent.has(outboundId)
+  }
+
+  /** 测试用:微信已永久失败、inbox 死信尚未 ACK。 */
+  hasWechatDead(outboundId: string): boolean {
+    return this.wechatDead.has(outboundId)
   }
 
   async onWaitingHuman(info: {
@@ -285,6 +296,10 @@ export class TaskboardNotifier implements TaskboardNotifyHooks {
   }): Promise<void> {
     if (this.sent.has(args.outboundId)) return
     try {
+      if (this.wechatDead.has(args.outboundId)) {
+        if (await this.ackInbox(args)) this.sent.add(args.outboundId)
+        return
+      }
       if (this.transport.sendWechat) {
         const result = await this.transport.sendWechat({
           text: `${args.title}\n\n${args.bodyMd}`,
@@ -301,30 +316,8 @@ export class TaskboardNotifier implements TaskboardNotifyHooks {
             retryable: result.retryable,
           })
           if (!result.retryable) {
-            // 永久失败(如 WECHAT_MASTER_REJECTED):停止重试并落站内信死信。
-            // 4xx 表示 master 未入队,回退 inbox 不会双推。
-            try {
-              if (args.warning) {
-                await this.transport.createInboxMessage({
-                  title: args.title,
-                  bodyMd: args.bodyMd,
-                  level: 'warning',
-                  deliveryKey: args.outboundId,
-                })
-              } else {
-                await this.transport.postInbox({
-                  title: args.title,
-                  bodyMd: args.bodyMd,
-                  deliveryKey: args.outboundId,
-                })
-              }
-            } catch (err) {
-              this.log('taskboard notify dead-letter inbox failed', {
-                outboundId: args.outboundId,
-                err: String(err),
-              })
-            }
-            this.sent.add(args.outboundId)
+            this.wechatDead.add(args.outboundId)
+            if (await this.ackInbox(args)) this.sent.add(args.outboundId)
           }
           return
         }
@@ -336,26 +329,41 @@ export class TaskboardNotifier implements TaskboardNotifyHooks {
         }
       }
 
-      if (args.warning) {
-        await this.transport.createInboxMessage({
-          title: args.title,
-          bodyMd: args.bodyMd,
-          level: 'warning',
-          deliveryKey: args.outboundId,
-        })
-      } else {
-        await this.transport.postInbox({
-          title: args.title,
-          bodyMd: args.bodyMd,
-          deliveryKey: args.outboundId,
-        })
-      }
-      this.sent.add(args.outboundId)
+      if (await this.ackInbox(args)) this.sent.add(args.outboundId)
     } catch (err) {
       this.log('taskboard notify deliver failed', {
         outboundId: args.outboundId,
         err: String(err),
       })
+    }
+  }
+
+  private async ackInbox(args: {
+    outboundId: string
+    title: string
+    bodyMd: string
+    warning: boolean
+  }): Promise<boolean> {
+    try {
+      if (args.warning) {
+        return await this.transport.createInboxMessage({
+          title: args.title,
+          bodyMd: args.bodyMd,
+          level: 'warning',
+          deliveryKey: args.outboundId,
+        })
+      }
+      return await this.transport.postInbox({
+        title: args.title,
+        bodyMd: args.bodyMd,
+        deliveryKey: args.outboundId,
+      })
+    } catch (err) {
+      this.log('taskboard notify dead-letter inbox failed', {
+        outboundId: args.outboundId,
+        err: String(err),
+      })
+      return false
     }
   }
 

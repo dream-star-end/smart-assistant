@@ -737,6 +737,7 @@ export interface SubprocessRunnerOpts {
   projectId?: string
   /** Unique run-context authority. Engines must not invent runId/projectId. */
   runContext?: import('./runContextPersist.js').RunContextDescriptor
+  frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
   /** Phase 5:读 SessionRepoWorkspaceManager 的 RepoSnapshot(单进程下即权威 state)。
    *  在 start() 内调用一次,用于:
    *    1) 决定 effective addDir(ready 时切到 workspaceDir,其它情况 fall-back agentBaseDir)

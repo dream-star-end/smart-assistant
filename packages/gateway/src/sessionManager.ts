@@ -781,6 +781,7 @@ export interface AgentSession {
   /** projectId + contextVersion + assetsRevision + manifest hashes. */
   contextFingerprint?: string
   runContext?: import('./runContextPersist.js').RunContextDescriptor
+  frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
   /**
    * 直接父会话键。仅 delegate 子会话在创建时物化(handleDelegateTask 传入已校验的
    * 直接父 sessionKey);webchat 根会话为 undefined。用于委派进度**沿父链向上追溯**到
@@ -3325,6 +3326,7 @@ export class SessionManager {
     contextFingerprint?: string
     assetsRevision?: number
     runContext?: import('./runContextPersist.js').RunContextDescriptor
+    frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
     /**
      * 直接父会话键(仅 delegate 子会话传入,已由 handleDelegateTask 经 _resolveDelegateParent
      * 校验存在于内存 + channel 合法 + sourceAgent 匹配)。物化到 AgentSession.parentSessionKey,
@@ -3649,6 +3651,7 @@ export class SessionManager {
       sessionId: repoSessionId,
       projectId: opts.projectId ?? undefined,
       runContext: opts.runContext,
+      frozenProjectContext: opts.frozenProjectContext,
       getRepoSnapshot: this._getRepoSnapshot,
       workload: opts.workload,
       skillTrainRunId: opts.skillTrainRunId,
@@ -3673,6 +3676,7 @@ export class SessionManager {
         opts.contextFingerprint ??
         (await computeSessionContextFingerprint(opts.projectId, opts.assetsRevision)),
       runContext: opts.runContext,
+      frozenProjectContext: opts.frozenProjectContext,
       repoSessionId,
       title: opts.title ?? 'New conversation',
       // delegate 子会话的直接父指针(webchat/普通会话为 undefined)。物化父链使委派进度
