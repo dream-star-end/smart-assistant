@@ -1,8 +1,8 @@
 /**
- * V3 commercial — master→container 委派并发旋钮透传。
+ * V3 commercial — master→container 委派并发旋钮与 OC_DELEGATE 特性 flag 透传。
  *
- * 仅当 master env 值匹配 /^[0-9]+$/ 才注入;缺省/非法不注入任何键,
- * 容器侧 gateway 回落自身默认值。
+ * 仅当 master env 值匹配 /^[0-9]+$/ 才注入(flag 值 "1"/"0" 走同一数值门);
+ * 缺省/非法不注入任何键,容器侧 gateway 回落自身默认值。
  *
  * Run: npx tsx --test packages/commercial/src/__tests__/v3SupervisorDelegateKnobEnv.test.ts
  */
@@ -21,10 +21,19 @@ const KEYS = [
   'OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN',
   'OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN',
   'OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS',
+  'OC_DELEGATE_SM',
+  'OC_DELEGATE_DURABLE',
+  'OC_DELEGATE_NOTIFIER',
+  'OC_DELEGATE_CUTOVER',
+  'OC_DELEGATE_INFLIGHT_SURFACE',
+  'OC_DELEGATE_INLINE_PUSH_CCB',
+  'OC_DELEGATE_INLINE_PUSH_CODEX',
+  'OC_DELEGATE_CURSOR_MCP_WAIT',
 ] as const
 
 describe('buildDelegateKnobContainerEnv', () => {
-  test('exported key list matches the six knobs', () => {
+  test('exported key list matches the fourteen knobs and feature flags', () => {
+    assert.equal(KEYS.length, 14)
     assert.deepEqual([...DELEGATE_KNOB_CONTAINER_ENV_KEYS], [...KEYS])
   })
 
@@ -91,5 +100,38 @@ describe('buildDelegateKnobContainerEnv', () => {
     ])
     assert.equal(out.some((v) => v.includes('OC_CODEX_API_KEY')), false)
     assert.equal(out.some((v) => v.includes('OC_LOCAL_')), false)
+  })
+
+  test('feature flag key 值 "1" 被注入', () => {
+    const out = buildDelegateKnobContainerEnv({
+      OC_DELEGATE_SM: '1',
+      OC_DELEGATE_DURABLE: '0',
+      OC_DELEGATE_NOTIFIER: '1',
+      OC_DELEGATE_CUTOVER: '0',
+      OC_DELEGATE_INFLIGHT_SURFACE: '1',
+      OC_DELEGATE_INLINE_PUSH_CCB: '1',
+      OC_DELEGATE_INLINE_PUSH_CODEX: '0',
+      OC_DELEGATE_CURSOR_MCP_WAIT: '1',
+    })
+    assert.deepEqual(out, [
+      'OC_DELEGATE_SM=1',
+      'OC_DELEGATE_DURABLE=0',
+      'OC_DELEGATE_NOTIFIER=1',
+      'OC_DELEGATE_CUTOVER=0',
+      'OC_DELEGATE_INFLIGHT_SURFACE=1',
+      'OC_DELEGATE_INLINE_PUSH_CCB=1',
+      'OC_DELEGATE_INLINE_PUSH_CODEX=0',
+      'OC_DELEGATE_CURSOR_MCP_WAIT=1',
+    ])
+  })
+
+  test('feature flag key 值 "true" 被省略', () => {
+    const out = buildDelegateKnobContainerEnv({
+      OC_DELEGATE_SM: 'true',
+      OC_DELEGATE_DURABLE: 'false',
+      OC_DELEGATE_NOTIFIER: 'on',
+      OC_DELEGATE_CURSOR_MCP_WAIT: 'yes',
+    })
+    assert.deepEqual(out, [])
   })
 })
