@@ -221,6 +221,7 @@ async function startRig(opts: {
   getFrontendBuildId?: UserChatBridgeDeps["getFrontendBuildId"];
   loadGoalState?: (uid: bigint, sessionId: string) => Promise<unknown>;
   promptQueuePreparationTimeoutMs?: number;
+  dispatchLeaseHeartbeatMs?: number;
   /** B3(R3):注入 mock pgPool 观察受理后 pre-forward 失败出口的 casToTerminal(需三件套齐)。 */
   pgPool?: unknown;
 }): Promise<Rig> {
@@ -460,6 +461,9 @@ async function startRig(opts: {
       : {}),
     ...(opts.promptQueuePreparationTimeoutMs
       ? { promptQueuePreparationTimeoutMs: opts.promptQueuePreparationTimeoutMs }
+      : {}),
+    ...(opts.dispatchLeaseHeartbeatMs
+      ? { dispatchLeaseHeartbeatMs: opts.dispatchLeaseHeartbeatMs }
       : {}),
     // B3(R3):注入 pgPool 时必须补齐 codex 计费三件套(bridge fail-closed 校验);glm-5.2(CCB)
     // 在 goal 失败(转发前)短路,故 preCheckRedis/pricing 永不被调用,空桩即可满足类型。
@@ -1709,6 +1713,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
         return await historyGate;
       },
       promptQueuePreparationTimeoutMs: 2_000,
+      dispatchLeaseHeartbeatMs: 30,
     });
     try {
       const ws = await openClient(rig.port);
@@ -1730,11 +1735,15 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
           billingRequestId: "0123456789abcdef0123456789abcdef",
           attemptNo: 1,
           leaseEpoch: 1,
+          leaseOwnerId: "cron-origin:cron-origin-enrichment-race",
           anchorSeq: 1n,
           requestHash: "a".repeat(64),
         },
       });
       await waitFor(() => historyStarted);
+      await waitFor(() => queries.some((q) =>
+        /SET lease_until/.test(q.sql) && q.params[1] === "cron-origin:cron-origin-enrichment-race"
+      ), 500);
       ws.close();
       await waitFor(() => queries.some((q) => q.params[2] === "client_disconnected_before_enrichment_transfer"), 500);
       const casQ = queries.find((q) => q.params[2] === "client_disconnected_before_enrichment_transfer")!;

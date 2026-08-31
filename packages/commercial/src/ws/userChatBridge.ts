@@ -875,6 +875,8 @@ export interface UserChatBridgeDeps {
   promptQueueEnabled?: boolean;
   /** Internal queue preparation deadline; override only for focused tests. */
   promptQueuePreparationTimeoutMs?: number;
+  /** Durable dispatch heartbeat cadence; override only for focused tests. */
+  dispatchLeaseHeartbeatMs?: number;
   /**
    * 模型执行权威签发(方案 §2)。注入即开启 flag —— 见 BridgeModelAuthorityDeps。
    * 缺省(v3 / 测试 / flag 未开)→ bridge 行为与本批次之前**完全一致**。
@@ -1464,6 +1466,8 @@ export type CronOriginExecutor = (payload: {
     billingRequestId: string
     attemptNo: number
     leaseEpoch: number
+    /** Exact DB lease owner; cron-origin is not the bridge connId. */
+    leaseOwnerId: string
     anchorSeq: bigint | null
     requestHash: string
   }
@@ -1633,6 +1637,22 @@ export async function executeCronOriginInject(opts: {
     return { kind: "injected" };
   }
   const d = admit.dispatch;
+  if (typeof d.ownerId !== "string" || d.ownerId.length === 0) {
+    log?.error("user-chat-bridge: cron origin admitted row missing lease owner", {
+      dispatchId: d.dispatchId,
+    });
+    if (pgPool) {
+      await casToTerminal(pgPool, {
+        dispatchId: d.dispatchId,
+        outcome: "executed_error",
+        failureCode: "dispatch_lease_owner_missing",
+        clientNotified: false,
+        fromStatuses: ["admitted"],
+        expectedEpoch: d.leaseEpoch,
+      });
+    }
+    return { kind: "failed", reason: "dispatch_lease_owner_missing" };
+  }
   const frame = {
     type: "inbound.message",
     channel: "webchat",
@@ -1653,6 +1673,7 @@ export async function executeCronOriginInject(opts: {
       billingRequestId: d.billingRequestId,
       attemptNo: d.attemptNo,
       leaseEpoch: d.leaseEpoch,
+      leaseOwnerId: d.ownerId,
       anchorSeq: d.anchorSeq,
       requestHash: d.requestHash,
     },
@@ -1977,6 +1998,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       (deps.promptQueuePreparationTimeoutMs ?? 0) > 0
       ? deps.promptQueuePreparationTimeoutMs!
       : DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS;
+  const dispatchLeaseHeartbeatMs =
+    Number.isSafeInteger(deps.dispatchLeaseHeartbeatMs) && (deps.dispatchLeaseHeartbeatMs ?? 0) > 0
+      ? deps.dispatchLeaseHeartbeatMs!
+      : DISPATCH_LEASE_HEARTBEAT_MS;
   const log = deps.logger;
   const metrics = deps.metrics ?? {};
   const createContainerSocket = deps.createContainerSocket
@@ -3462,6 +3487,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       billingRequestId: string;
       attemptNo: number;
       leaseEpoch: number;
+      leaseOwnerId: string;
       anchorSeq: bigint | null;
       /** = envelope payloadHash(sha256 内容身份;容器验帧体 hash 用)。 */
       requestHash: string;
@@ -3523,7 +3549,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             await releaseRecoveryPreReceipt(pool, {
               job: record.recoveryJob,
               dispatchId: record.dispatchId,
-              dispatchOwner: connId,
+              dispatchOwner: record.leaseOwnerId,
               dispatchLeaseEpoch: record.leaseEpoch,
             });
           } else {
@@ -3607,7 +3633,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         for (const rec of [...admittedDispatches.values()]) {
           void heartbeatLease(pool, {
             dispatchId: rec.dispatchId,
-            ownerId: connId,
+            ownerId: rec.leaseOwnerId,
             leaseEpoch: rec.leaseEpoch,
             leaseTtlMs: DISPATCH_LEASE_TTL_MS,
           })
@@ -3617,7 +3643,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             })
             .catch(() => {});
         }
-      }, DISPATCH_LEASE_HEARTBEAT_MS);
+      }, dispatchLeaseHeartbeatMs);
       dispatchHeartbeatTimer.unref?.();
     };
     /** pre-forward 失败出口:CAS terminal(executed_error)+ 移除记录。fire-and-forget。
@@ -4175,6 +4201,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           switch (admit.kind) {
             case "admitted": {
               const d = admit.dispatch;
+              if (typeof d.ownerId !== "string" || d.ownerId.length === 0) {
+                onReject?.("DURABLE_DISPATCH_UNAVAILABLE");
+                if (deps.pgPool) {
+                  void casToTerminal(deps.pgPool, {
+                    dispatchId: d.dispatchId,
+                    outcome: "executed_error",
+                    failureCode: "dispatch_lease_owner_missing",
+                    clientNotified: false,
+                    fromStatuses: ["admitted"],
+                    expectedEpoch: d.leaseEpoch,
+                  }).catch(() => {});
+                }
+                return null;
+              }
               const admittedRecord: AdmittedDispatch = {
                 clientMessageId,
                 sessionId: peerId,
@@ -4182,6 +4222,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 billingRequestId: d.billingRequestId,
                 attemptNo: d.attemptNo,
                 leaseEpoch: d.leaseEpoch,
+                leaseOwnerId: d.ownerId,
                 anchorSeq: d.anchorSeq,
                 requestHash,
                 ...(recoveryJob ? { recoveryJob } : {}),

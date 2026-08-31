@@ -85,8 +85,10 @@ describe("injectCronOriginTurn stamps admit + inbound.model", () => {
   }) {
     const admits: AdmitUserTurnInput[] = [];
     const frames: Array<{ type?: string; model?: string }> = [];
-    const executor: CronOriginExecutor = ({ encoded }) => {
+    const owners: string[] = [];
+    const executor: CronOriginExecutor = ({ encoded, admitted }) => {
       frames.push(JSON.parse(encoded.toString("utf8")) as { type?: string; model?: string });
+      owners.push(admitted.leaseOwnerId);
     };
     const run = () => executeCronOriginInject({
       input,
@@ -97,11 +99,11 @@ describe("injectCronOriginTurn stamps admit + inbound.model", () => {
       },
       executor,
     });
-    return { run, admits, frames };
+    return { run, admits, frames, owners };
   }
 
   test("grok-build session stamps admitUserTurn.model and inbound.message.model", async () => {
-    const { run, admits, frames } = setup({
+    const { run, admits, frames, owners } = setup({
       lookupSessionModel: async (sessionId, sessionUserId) => {
         assert.equal(sessionId, input.sessionId);
         assert.equal(sessionUserId, "c:3");
@@ -116,6 +118,7 @@ describe("injectCronOriginTurn stamps admit + inbound.model", () => {
     assert.equal(frames.length, 1);
     assert.equal(frames[0]!.type, "inbound.message");
     assert.equal(frames[0]!.model, "grok-build");
+    assert.equal(owners[0], `cron-origin:${input.clientMessageId}`);
   });
 
   test("lookup failure falls back to model:null and still injects", async () => {
