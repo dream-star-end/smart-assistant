@@ -516,6 +516,7 @@ export function AssistantCard({
   tokenUsage?: DisplayTokenUsage;
 }) {
   const live = isLive(msg, ctx);
+  if (msg._hideUnpublishedFallback === true) return null;
   const hasError = !!msg._errorCode;
   const presentedError = hasError
     ? errorPresentation(msg._errorCode, msg.text, msg._errorDetail, msg.usage?.waived === true)

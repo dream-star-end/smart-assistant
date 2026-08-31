@@ -233,6 +233,10 @@
     {
       "id": "T58",
       "proves": "P0 shadow：1MiB×6 双槽、乱序 epoch 101>100、Range 注入 exact 收敛为 1 行、四入口均有采样（B1/B3/B4/B5）"
+    },
+    {
+      "id": "T59",
+      "proves": "真 Chromium 中 Phase-A unpublished fallback 到达后，交错 live assistant 段仍保持 thinking/正文1/tool/正文2，空 live-units reset 不把 visible_head 整块挤到末尾"
     }
   ]
 }

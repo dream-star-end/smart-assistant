@@ -230,6 +230,15 @@ declare global {
         planId?: string;
         unpublished: boolean;
       }>;
+      /** Phase-A unpublished + interleaved live assistant fragments + empty reset. */
+      runPhaseAInterleavedAssistantReset: () => Promise<{
+        sending: boolean;
+        ids: string[];
+        unpublished: boolean;
+        a1Text?: string;
+        a2Text?: string;
+        fallbackText?: string;
+      }>;
       /** Phase-B deferred agent-group stub + empty live-units reset must keep live agent-group. */
       runPhaseBDeferredAgentGroupReset: () => Promise<{
         sending: boolean;
@@ -379,6 +388,9 @@ window.__replayDrive = {
   },
   runPhaseAEmptyUnitsReset: async () => {
     throw new Error("phase-a empty units reset probe 未挂载");
+  },
+  runPhaseAInterleavedAssistantReset: async () => {
+    throw new Error("phase-a interleaved assistant reset probe 未挂载");
   },
   runPhaseBDeferredAgentGroupReset: async () => {
     throw new Error("phase-b deferred agent-group reset probe 未挂载");
@@ -2145,6 +2157,106 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         planId: session.messages.find((message) => message.id === "browser-phase-a-plan")?.id,
         unpublished: session.messages.some((message) =>
           message.role === "assistant" && message._displayDegradeReason === "records_unpublished"),
+      };
+    },
+    runPhaseAInterleavedAssistantReset: async () => {
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        "phase-a interleaved assistant reset",
+      );
+      const clientMessageId = "m-browser-phase-a-interleave";
+      const user = {
+        id: clientMessageId,
+        role: "user" as const,
+        text: "BROWSER_PHASE_A_INTERLEAVE_USER",
+        ts: 1,
+        status: "sent" as const,
+        _source: "server" as const,
+        _seq: 1,
+        _orderSeq: 1,
+        _timelineRecord: true,
+        _timelineUnitKey: `outer:${REPLAY_SESSION_ID}:1`,
+      };
+      session._sendingInFlight = true;
+      session._activeClientMessageId = clientMessageId;
+      session.messages = [
+        user,
+        {
+          id: "browser-phase-a-thinking",
+          role: "thinking",
+          text: "BROWSER_PHASE_A_INTERLEAVE_THINKING",
+          ts: 2,
+          _clientMessageId: clientMessageId,
+        },
+        {
+          id: "browser-phase-a-a1",
+          role: "assistant",
+          text: "BROWSER_PHASE_A_INTERLEAVE_A1",
+          ts: 3,
+          _clientMessageId: clientMessageId,
+        },
+        {
+          id: "browser-phase-a-tool",
+          role: "tool",
+          text: "",
+          toolName: "Bash",
+          output: "BROWSER_PHASE_A_INTERLEAVE_TOOL",
+          ts: 4,
+          _clientMessageId: clientMessageId,
+        },
+        {
+          id: "browser-phase-a-a2",
+          role: "assistant",
+          text: "BROWSER_PHASE_A_INTERLEAVE_A2",
+          ts: 5,
+          _clientMessageId: clientMessageId,
+        },
+      ];
+      replaySocket.applyServerMessages(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        [
+          user,
+          {
+            id: "browser-phase-a-answer",
+            role: "assistant",
+            text: "BROWSER_PHASE_A_INTERLEAVE_FALLBACK",
+            ts: 5,
+            _source: "server",
+            _seq: 2,
+            _orderSeq: 2,
+            _clientMessageId: clientMessageId,
+            _turnTapeId: "tape-browser-phase-a-interleave",
+            _turnTapeSha256: "a".repeat(64),
+            _turnTapeComplete: true,
+            _dispatchOutcome: "completed",
+            _timelineRecord: true,
+            _timelineUnitKey: "tape-fallback:tape-browser-phase-a-interleave",
+            _displayDegraded: true,
+            _displayDegradeReason: "records_unpublished",
+          },
+        ],
+        true,
+        2,
+        {
+          serverUpdatedAt: 2,
+          historyRevision: 1,
+          timelineGeneration: 2,
+          completedClientMessageId: clientMessageId,
+        },
+      );
+      replaySocket.applyLiveUnits(REPLAY_SESSION_ID, [], [clientMessageId]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return {
+        sending: session._sendingInFlight === true,
+        ids: session.messages.filter((message) => !message._hideUnpublishedFallback).map((message) => message.id),
+        unpublished: session.messages.some((message) =>
+          message.role === "assistant" && message._hideUnpublishedFallback === true),
+        a1Text: session.messages.find((message) => message.id === "browser-phase-a-a1")?.text,
+        a2Text: session.messages.find((message) => message.id === "browser-phase-a-a2")?.text,
+        fallbackText: session.messages.find((message) => message.id === "browser-phase-a-answer")?.text,
       };
     },
     runPhaseBDeferredAgentGroupReset: async () => {

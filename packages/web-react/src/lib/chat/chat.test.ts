@@ -4505,6 +4505,223 @@ describe("Phase-A final-only tape projection retry", () => {
     sock.stop();
   });
 
+  test("Phase-A unpublished then empty live-units reset keeps interleaved live assistant fragments", () => {
+    const sessionId = "s-interleave-units";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess._sendingInFlight = true;
+    sess._activeClientMessageId = clientMessageId;
+    sess.messages = [
+      unpublishedTimeline(sessionId)[0]!,
+      {
+        id: `live-thinking-${sessionId}`,
+        role: "thinking",
+        text: "live reasoning",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-a1-${sessionId}`,
+        role: "assistant",
+        text: "mid-1",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        output: "ok",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-a2-${sessionId}`,
+        role: "assistant",
+        text: "mid-2",
+        ts: 5,
+        _clientMessageId: clientMessageId,
+      },
+    ];
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+      completedClientMessageId: clientMessageId,
+    });
+    expect(sess._sendingInFlight).toBe(false);
+    sock.applyLiveUnits(sessionId, [], [clientMessageId]);
+    expect(sess.messages.filter((message) => !message._hideUnpublishedFallback).map((message) => message.id)).toEqual([
+      `u-${sessionId}`,
+      `live-thinking-${sessionId}`,
+      `live-a1-${sessionId}`,
+      `live-tool-${sessionId}`,
+      `live-a2-${sessionId}`,
+    ]);
+    expect(sess.messages.some((message) =>
+      message.role === "assistant" && message._hideUnpublishedFallback === true,
+    )).toBe(true);
+    sock.stop();
+  });
+
+  test("Phase-A unpublished then retired live-frames reset keeps interleaved live assistant fragments", () => {
+    const sessionId = "s-interleave-frames";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess._sendingInFlight = true;
+    sess._activeClientMessageId = clientMessageId;
+    sess.messages = [
+      unpublishedTimeline(sessionId)[0]!,
+      {
+        id: `live-thinking-${sessionId}`,
+        role: "thinking",
+        text: "live reasoning",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-a1-${sessionId}`,
+        role: "assistant",
+        text: "mid-1",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-a2-${sessionId}`,
+        role: "assistant",
+        text: "mid-2",
+        ts: 5,
+        _clientMessageId: clientMessageId,
+      },
+    ];
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+      completedClientMessageId: clientMessageId,
+    });
+    sock.applyDurableLiveFrames(sessionId, [], [clientMessageId]);
+    expect(sess.messages.filter((message) => !message._hideUnpublishedFallback).map((message) => message.id)).toEqual([
+      `u-${sessionId}`,
+      `live-thinking-${sessionId}`,
+      `live-a1-${sessionId}`,
+      `live-tool-${sessionId}`,
+      `live-a2-${sessionId}`,
+    ]);
+    expect(sess.messages.some((message) =>
+      message.role === "assistant" && message._hideUnpublishedFallback === true,
+    )).toBe(true);
+    sock.stop();
+  });
+
+  test("Phase-B ordinal assistants replace interleaved live fragments without duplicates", () => {
+    const sessionId = "s-interleave-exact";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    const user = unpublishedTimeline(sessionId)[0]!;
+    sess.messages = [
+      user,
+      {
+        id: `live-a1-${sessionId}`,
+        role: "assistant",
+        text: "mid-1",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-a2-${sessionId}`,
+        role: "assistant",
+        text: "mid-2",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+      },
+    ];
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+      completedClientMessageId: clientMessageId,
+    });
+    const common = {
+      _source: "server" as const,
+      _seq: 2,
+      _orderSeq: 2,
+      _clientMessageId: clientMessageId,
+      _turnTapeId: `tape-${sessionId}`,
+      _turnTapeSha256: "a".repeat(64),
+      _turnTapeComplete: true,
+      _dispatchOutcome: "completed" as const,
+      _timelineRecord: true,
+    };
+    sock.applyServerMessages(sessionId, "main", [
+      user,
+      {
+        id: `tape-a1-${sessionId}`,
+        role: "assistant",
+        text: "mid-1",
+        ts: 2,
+        ...common,
+        _turnTapeOrdinal: 0,
+        _timelineUnitKey: `tape:${sessionId}:0`,
+      },
+      {
+        id: `tape-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        ts: 3,
+        ...common,
+        _turnTapeOrdinal: 1,
+        _timelineUnitKey: `tape:${sessionId}:1`,
+      },
+      {
+        id: `tape-a2-${sessionId}`,
+        role: "assistant",
+        text: "mid-2",
+        ts: 4,
+        ...common,
+        _turnTapeOrdinal: 2,
+        _timelineUnitKey: `tape:${sessionId}:2`,
+      },
+    ], true, 2, {
+      serverUpdatedAt: 3,
+      historyRevision: 2,
+      timelineGeneration: 3,
+      completedClientMessageId: clientMessageId,
+    });
+    expect(sess.messages.map((message) => message.id)).toEqual([
+      `u-${sessionId}`,
+      `tape-a1-${sessionId}`,
+      `tape-tool-${sessionId}`,
+      `tape-a2-${sessionId}`,
+    ]);
+    expect(sess.messages.some((message) => message.id === `live-a1-${sessionId}`)).toBe(false);
+    expect(sess.messages.some((message) =>
+      message.role === "assistant" && message._displayDegradeReason === "records_unpublished",
+    )).toBe(false);
+    sock.stop();
+  });
+
   test("Phase-B deferred agent-group then empty live-units reset keeps live agent-group", () => {
     const sessionId = "s-phase-b-defer-ag";
     const sock = makeSocket();

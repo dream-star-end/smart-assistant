@@ -2714,6 +2714,38 @@ await check("T45 中断 turn 刷新后仍显示 requestId/积分，空窗给出�
   }
 });
 
+await check("T59 Phase-A unpublished 后交错 live assistant 段仍保持 thinking/正文1/tool/正文2", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runPhaseAInterleavedAssistantReset());
+  const expected = [
+    "m-browser-phase-a-interleave",
+    "browser-phase-a-thinking",
+    "browser-phase-a-a1",
+    "browser-phase-a-tool",
+    "browser-phase-a-a2",
+  ];
+  if (JSON.stringify(result.ids) !== JSON.stringify(expected)) {
+    throw new Error(`Phase-A interleaved reset 顺序坍塌:${JSON.stringify(result)}`);
+  }
+  if (result.sending) throw new Error("Phase-A 完成后仍在发送");
+  if (!result.unpublished || result.fallbackText) {
+    throw new Error(`Phase-A interleaved reset fallback 未隐藏或仍有正文:${JSON.stringify(result)}`);
+  }
+  if (result.a1Text !== "BROWSER_PHASE_A_INTERLEAVE_A1" || result.a2Text !== "BROWSER_PHASE_A_INTERLEAVE_A2") {
+    throw new Error(`Phase-A interleaved reset 丢正文段:${JSON.stringify(result)}`);
+  }
+  await replayRoot.getByText("BROWSER_PHASE_A_INTERLEAVE_A1", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await replayRoot.getByText("BROWSER_PHASE_A_INTERLEAVE_A2", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  if ((await replayRoot.getByText("BROWSER_PHASE_A_INTERLEAVE_FALLBACK", { exact: true }).count()) !== 0) {
+    throw new Error("Phase-A interleaved reset 渲染了 fallback 整块正文");
+  }
+});
+
 await check("T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runPhaseAEmptyUnitsReset());
   if (JSON.stringify(result.roles) !== JSON.stringify(["user", "thinking", "tool", "plan", "assistant"])) {

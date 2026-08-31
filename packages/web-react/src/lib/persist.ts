@@ -676,11 +676,12 @@ export function isIncompleteDurableToolRow(message: ChatMessage | null | undefin
   return extra._partial === true || extra.partial === true || extra._completed === false || extra.completed === false;
 }
 
-/** Exact, displayable tape process — not unpublished, not a deferred stub. */
+/** Exact, displayable tape process — not unpublished, not a deferred stub.
+ *  Segmented exact assistants count so live text fragments can be replaced. */
 export function isDisplayableExactProcessRow(message: ChatMessage): boolean {
   if (!message || isDeferredExactProcessStub(message)) return false;
   if (isIncompleteDurableToolRow(message)) return false;
-  if (!isTapeBackedAgentProcessRole(message.role) || message.role === "assistant") return false;
+  if (!isTapeBackedAgentProcessRole(message.role)) return false;
   if (message._displayDegradeReason === "records_unpublished") return false;
   if (message._timelineRecord === true) return true;
   return message._source === "server" &&
@@ -706,9 +707,10 @@ function hasDisplayableExactRole(
 }
 
 /**
- * Live tape-backed process (not assistant) that must stay visible until exact
- * tape process rows positively supersede them. `authorityRows` is the server
- * payload during merge, or the current transcript during journal reset.
+ * Live tape-backed process — including interleaved assistant fragments —
+ * that must stay visible until exact tape rows of the same role positively
+ * supersede them. `authorityRows` is the server payload during merge, or the
+ * current transcript during journal reset.
  *
  * Hits when:
  *  - the owner matches a `records_unpublished` assistant, or
@@ -716,10 +718,13 @@ function hasDisplayableExactRole(
  *    and this owner still has no displayable exact process rows, or
  *  - Phase-B already landed a non-degrade assistant, but this live row's role
  *    still has no non-deferred exact process (thinking/tool/plan/agent-group/
- *    delegate-progress/runtime-event). Deferred stubs do not count.
+ *    delegate-progress/runtime-event/assistant). Deferred stubs do not count.
  *
  * Default is false: ordinary P2 / completion replacement still drops live
  * copies once a displayable exact row of the same role is present.
+ *
+ * INC-20260831-TURNEND-ORDER-COLLAPSE: live assistant fragments are pending
+ * until a displayable exact assistant (timeline record / tape ordinal) arrives.
  */
 export function isLiveProcessPendingExactTape(
   message: ChatMessage,
@@ -728,7 +733,6 @@ export function isLiveProcessPendingExactTape(
   if (
     !message ||
     !isTapeBackedAgentProcessRole(message.role) ||
-    message.role === "assistant" ||
     message._timelineRecord === true
   ) {
     return false;
@@ -814,6 +818,54 @@ export function shouldRetainLiveProcessOnOwnerReset(
   if (typeof owner !== "string") return true;
   if (incomingProcessOwners.has(ownerRoleKey(owner, message.role))) return false;
   return !incomingProcessOwners.has(owner);
+}
+
+function isLiveAssistantFragment(message: ChatMessage): boolean {
+  return message.role === "assistant"
+    && message._source !== "server"
+    && message._timelineRecord !== true
+    && message._displayDegradeReason !== "records_unpublished";
+}
+
+/** Phase-A unpublished fallback is one concatenated visible_head blob. Keep it
+ *  visible when there are no live assistant fragments (reload / other device).
+ *  When interleaved live text is still pending exact tape, hide the blob so it
+ *  cannot pile up at the end of the turn, but keep the unpublished row in the
+ *  transcript so owner-reset pending-exact still sees Phase-A authority.
+ *  Fold usage onto the last live fragment so MetaRow/cost survive the window.
+ *  INC-20260831-TURNEND-ORDER-COLLAPSE */
+export function omitUnpublishedFallbackWhenLiveAssistantsExist(
+  rows: ChatMessage[],
+): ChatMessage[] {
+  const lastLiveByOwner = new Map<string, ChatMessage>();
+  let lastUnownedLive: ChatMessage | undefined;
+  for (const row of rows) {
+    if (!isLiveAssistantFragment(row)) continue;
+    const owner = turnOwnerId(row);
+    if (typeof owner === "string") lastLiveByOwner.set(owner, row);
+    else lastUnownedLive = row;
+  }
+  if (lastLiveByOwner.size === 0 && !lastUnownedLive) return rows;
+
+  const replace = new Map<ChatMessage, ChatMessage>();
+  for (const row of rows) {
+    if (row.role !== "assistant" || row._displayDegradeReason !== "records_unpublished") {
+      continue;
+    }
+    const owner = turnOwnerId(row);
+    const target = typeof owner === "string" ? lastLiveByOwner.get(owner) : lastUnownedLive;
+    if (!target) continue;
+    replace.set(row, {
+      ...row,
+      text: "",
+      _hideUnpublishedFallback: true,
+    });
+    if (!target.usage && row.usage && !replace.has(target)) {
+      replace.set(target, { ...target, usage: row.usage });
+    }
+  }
+  if (replace.size === 0) return rows;
+  return rows.map((row) => replace.get(row) ?? row);
 }
 
 function validHistoryOrder(value: unknown): value is number {
@@ -955,9 +1007,10 @@ export function mergeFullServerWins(
   const shadowInput = [...server, ...local];
   const shadowStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
   const finishShadow = (result: ChatMessage[]): ChatMessage[] => {
+    const visible = omitUnpublishedFallbackWhenLiveAssistantsExist(result);
     const oldMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - shadowStarted;
-    observeTimelineShadow({ entry: "full", input: shadowInput, oldOutput: result, oldMs });
-    return result;
+    observeTimelineShadow({ entry: "full", input: shadowInput, oldOutput: visible, oldMs });
+    return visible;
   };
   local = repairPostFinalProcessOrder(local);
   const legacyActiveRows = new Set<ChatMessage>();
@@ -1007,22 +1060,6 @@ export function mergeFullServerWins(
       isLiveProcessPendingExactTape(m, server) ||
       !isSupersededLocalTurnRow(m, completedClientMessageId),
     );
-  }
-  if (unpublishedFinalOwners.size > 0) {
-    // Phase-A degrade page is not a complete tape: keep local live
-    // thinking/tool/plan, drop only the live assistant so the final can land.
-    local = local.filter((m) => {
-      const owner = turnOwnerId(m);
-      if (
-        m.role === "assistant" &&
-        m._source !== "server" &&
-        typeof owner === "string" &&
-        unpublishedFinalOwners.has(owner)
-      ) {
-        return false;
-      }
-      return true;
-    });
   }
   const serverIdsForAuthority = new Set<string>();
   for (const m of server) if (m?.id) serverIdsForAuthority.add(m.id);
@@ -1211,9 +1248,10 @@ export function applyServerIncremental(
   const shadowInput = [...local, ...incoming];
   const shadowStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
   const finishShadow = (result: ChatMessage[]): ChatMessage[] => {
+    const visible = omitUnpublishedFallbackWhenLiveAssistantsExist(result);
     const oldMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - shadowStarted;
-    observeTimelineShadow({ entry: "incremental", input: shadowInput, oldOutput: result, oldMs });
-    return result;
+    observeTimelineShadow({ entry: "incremental", input: shadowInput, oldOutput: visible, oldMs });
+    return visible;
   };
   local = repairPostFinalProcessOrder(local);
   if (!incoming.length) return finishShadow(local);

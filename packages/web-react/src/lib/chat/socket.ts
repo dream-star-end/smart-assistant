@@ -578,15 +578,16 @@ const STREAM_NOTIFY_MS = 120;
 
 
 const LIVE_PROCESS_UNIT_KINDS = new Set([
-  "thinking", "tool", "plan", "goal", "agent_group", "delegate_progress",
+  "thinking", "tool", "plan", "goal", "agent_group", "delegate_progress", "text",
 ]);
 const LIVE_PROCESS_FRAME_KINDS = new Set([
-  "thinking", "tool_use", "plan", "goal", "agent_group", "delegate_progress",
+  "thinking", "tool_use", "plan", "goal", "agent_group", "delegate_progress", "text",
 ]);
 
 function liveProcessRoleForUnitKind(kind: string | undefined): ChatMessage["role"] | undefined {
   if (kind === "agent_group") return "agent-group";
   if (kind === "delegate_progress") return "delegate-progress";
+  if (kind === "text") return "assistant";
   if (kind === "thinking" || kind === "tool" || kind === "plan" || kind === "goal") return kind;
   return undefined;
 }

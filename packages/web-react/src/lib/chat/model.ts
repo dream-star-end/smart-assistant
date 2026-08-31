@@ -406,6 +406,10 @@ export type ChatMessage = {
   /** Per-tape display degrade (visible_head/anchor fallback). */
   _displayDegraded?: boolean;
   _displayDegradeReason?: string;
+  /** Phase-A unpublished fallback kept as pending-exact authority but not
+   *  rendered: live assistant fragments already occupy the visible text slots.
+   *  INC-20260831-TURNEND-ORDER-COLLAPSE */
+  _hideUnpublishedFallback?: boolean;
   /** Sanitizer placeholder for a structurally invalid history/socket row. */
   _corruptPlaceholder?: boolean;
   _corruptReason?: "missing-id" | "malformed";
