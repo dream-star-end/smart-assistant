@@ -26,6 +26,7 @@ export const ZCODE_MEMORY_MCP_TOOLS = [
   'task_comment',
   'task_list',
   'task_get',
+  'task_approve',
 ] as const
 
 const CONTEXT_PREFIX = join(tmpdir(), 'oc-zcode-context-')

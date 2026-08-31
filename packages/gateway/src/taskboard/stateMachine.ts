@@ -103,8 +103,8 @@ function cancelRule(from: TicketStatus): TransitionRule {
  * 不含自转。终态只留「人重开 → ready」。
  */
 export const TRANSITION_TABLE: readonly TransitionRule[] = [
-  // backlog:人没批准,AI 不许碰
-  { from: 'backlog', to: 'ready', actors: ['human'], label: '批准开工' },
+  // backlog:未批准不许认领;人/agent 可显式批准(必须留痕)。system 不能自动批准。
+  { from: 'backlog', to: 'ready', actors: ['human', 'agent'], label: '批准开工' },
   closeRule('backlog'),
   cancelRule('backlog'),
 
@@ -185,7 +185,7 @@ function deny(code: TransitionDeniedCode, reason: string): TransitionVerdict {
 
 function actorDeniedReason(from: TicketStatus, to: TicketStatus, actor: Actor): string {
   if (from === 'backlog' && to === 'ready') {
-    return '待立项的单据只有人能批准开工，AI 不能自行转到待执行。'
+    return '待立项的单据只有人或 agent 能显式批准开工，系统角色不能自动批准。'
   }
   if (to === 'canceled') {
     return '取消单据只有人能做。'

@@ -23,6 +23,7 @@ export const MEMORY_MCP_TOOL_NAMES = [
   'task_comment',
   'task_list',
   'task_get',
+  'task_approve',
   'ask_user',
   'present_options',
 ] as const

@@ -4,9 +4,10 @@ import type { ComponentProps } from 'react'
 import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
 import { workspaceWantPath } from '../../hooks/useAppRoute'
 import { ProjectScopeProvider } from '../../hooks/useProjectScope'
-import { api, ApiError } from '../../lib/api'
+import { ApiError, api } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
 import {
+  LAST_PROJECT_STORAGE_KEY,
   type PipelineStage,
   type Project,
   TICKET_TYPE_LABEL,
@@ -18,13 +19,15 @@ import {
   isConcurrencyFull,
   isForbidden,
   isLeaseHeld,
+  isLongComment,
   isVersionConflict,
   mergeTimelineSources,
+  partitionTimeline,
   pickInitialProject,
-  LAST_PROJECT_STORAGE_KEY,
   resolveOriginSessionId,
   sessionIdFromOriginKey,
   skipReasonLabel,
+  sortTimelineAsc,
   taskboardApi,
   taskboardErrorMessage,
 } from '../../lib/taskboard'
@@ -98,6 +101,8 @@ function sampleTicket(over: Partial<Ticket> = {}): Ticket {
     createdAt: 1_700_000_000_000,
     updatedAt: 1_700_000_100_000,
     closedAt: null,
+    approvedBy: null,
+    approvedAt: null,
     ...over,
   }
 }
@@ -266,6 +271,23 @@ describe('TicketCard 类型 / 优先级映射', () => {
     const card = screen.getByTestId('ticket-card')
     expect(card.className).toMatch(/opacity-60/)
     expect(screen.getByText('已取消的空单').className).toMatch(/line-through/)
+  })
+
+  test('批准后的卡片显示批准人', () => {
+    render(
+      <ToastProvider>
+        <TooltipProvider>
+          <TicketCard
+            ticket={sampleTicket({
+              status: 'ready',
+              approvedBy: 'agent:main',
+              approvedAt: 1,
+            })}
+          />
+        </TooltipProvider>
+      </ToastProvider>,
+    )
+    expect(screen.getByTestId('ticket-approver')).toHaveTextContent('批准人 main')
   })
 })
 
@@ -551,13 +573,27 @@ describe('429 concurrency_full 与 settings 客户端', () => {
 })
 
 describe('时间线合并', () => {
-  test('activity + run + comment 按时间倒序', () => {
+  test('activity + run + comment 按时间正序', () => {
     const items = mergeTimelineSources({
       activities: [sampleActivity({ createdAt: 10 })],
       runs: [sampleRun({ createdAt: 30 })],
       comments: [sampleComment({ createdAt: 20 })],
     })
-    expect(items.map((i) => i.kind)).toEqual(['run', 'comment', 'activity'])
+    expect(items.map((i) => i.kind)).toEqual(['activity', 'comment', 'run'])
+    expect(sortTimelineAsc(items).map((i) => i.kind)).toEqual(['activity', 'comment', 'run'])
+  })
+
+  test('讨论与系统活动分流，长评论可识别', () => {
+    const items = mergeTimelineSources({
+      activities: [sampleActivity({ createdAt: 10 })],
+      runs: [sampleRun({ createdAt: 30 })],
+      comments: [sampleComment({ createdAt: 20, body: '短评' })],
+    })
+    const { discussion, system } = partitionTimeline(items)
+    expect(discussion.map((i) => i.kind)).toEqual(['comment'])
+    expect(system.map((i) => i.kind)).toEqual(['activity', 'run'])
+    expect(isLongComment('短评')).toBe(false)
+    expect(isLongComment('x'.repeat(300))).toBe(true)
   })
 })
 
@@ -630,6 +666,29 @@ describe('TicketDrawer 详情', () => {
     )
   })
 
+  test('讨论区显示评论，系统活动默认折叠', async () => {
+    const ticket = sampleTicket()
+    mockDrawerApis(ticket)
+    vi.spyOn(taskboardApi, 'listTimeline').mockResolvedValue(
+      mergeTimelineSources({
+        runs: [sampleRun({ createdAt: 30 })],
+        comments: [sampleComment({ createdAt: 20, author: 'agent:main', body: '改了 **X**' })],
+        activities: [
+          sampleActivity({ createdAt: 10, action: 'ticket_approved', actorId: 'user:default' }),
+        ],
+      }),
+    )
+    renderDrawer(ticket)
+    expect(await screen.findByTestId('ticket-discussion')).toBeInTheDocument()
+    expect(screen.getByTestId('ticket-comment-md').textContent).toMatch(/改了/)
+    expect(screen.queryByTestId('ticket-run-detail')).not.toBeInTheDocument()
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('ticket-system-toggle'))
+    })
+    expect(await screen.findByTestId('ticket-run-detail')).toBeInTheDocument()
+    expect(screen.getByText(/批准了开工/)).toBeInTheDocument()
+  })
+
   test('正文与评论按 Markdown 渲染', async () => {
     const ticket = sampleTicket({
       body: '## 验收\n\n- **粗体**\n- `code`',
@@ -693,6 +752,9 @@ describe('TicketDrawer 详情', () => {
     const run = sampleRun({ skipReason: 'concurrency_full', durationMs: null, costUsd: null })
     mockDrawerApis(ticket, [run])
     renderDrawer(ticket)
+    await act(async () => {
+      fireEvent.click(await screen.findByTestId('ticket-system-toggle'))
+    })
     expect(await screen.findByText('跳过：巡检并发已满')).toBeInTheDocument()
     expect(screen.getByText(/耗时未记录/)).toBeInTheDocument()
     expect(screen.getByText(/用量未记录/)).toBeInTheDocument()
@@ -711,6 +773,9 @@ describe('TicketDrawer 详情', () => {
     })
     mockDrawerApis(ticket, [run])
     renderDrawer(ticket)
+    await act(async () => {
+      fireEvent.click(await screen.findByTestId('ticket-system-toggle'))
+    })
     expect(await screen.findByText(/\$0\.0000（不精确）/)).toBeInTheDocument()
   })
 })
@@ -1206,7 +1271,11 @@ describe('流水线 / 阶段配置', () => {
       '/api/board/pipelines/pipe1/reorder',
     )
     expect((fetchMock.mock.calls as unknown as [string, RequestInit][])[0]?.[1]?.method).toBe('PUT')
-    expect(JSON.parse(String((fetchMock.mock.calls as unknown as [string, RequestInit][])[0]?.[1]?.body))).toEqual({
+    expect(
+      JSON.parse(
+        String((fetchMock.mock.calls as unknown as [string, RequestInit][])[0]?.[1]?.body),
+      ),
+    ).toEqual({
       orderedIds: ['s2', 's1'],
     })
   })

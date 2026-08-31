@@ -30,7 +30,7 @@ export const TICKET_TYPE_LABEL: Record<TicketType, string> = {
 
 /**
  * 单据状态。语义是「现在卡在谁那里」:
- *   backlog       待立项  —— 人没批准,AI 不许碰
+ *   backlog       待立项  —— 未批准,不许认领;人/agent 可显式批准(必须留痕),禁止自动批准
  *   ready         待执行  —— 已批准,等当前 stage 的 agent 认领
  *   running       执行中  —— 某个 run 持有 lease
  *   waiting_human 等人确认 —— AI 做完了,等人拍板(主界面第一泳道)
@@ -193,6 +193,10 @@ export interface Ticket {
   createdAt: number
   updatedAt: number
   closedAt: number | null
+  /** 最近一次 backlog→ready 的批准人,`user:<id>` 或 `agent:<id>`。未批准为 null。 */
+  approvedBy: string | null
+  /** 最近一次批准的 epoch 毫秒。未批准为 null。 */
+  approvedAt: number | null
 }
 
 export interface Pipeline {

@@ -60,13 +60,15 @@ interface TicketRow {
   created_at: number
   updated_at: number
   closed_at: number | null
+  approved_by: string | null
+  approved_at: number | null
 }
 
 const TICKET_COLS = `
   id, identifier, project_id, type, title, body, status, stage_id, pipeline_id,
   priority, severity, labels, assignee, reporter, source, origin_session_key,
   due_date, start_date, version, blocked_reason, stage_loop_count,
-  created_at, updated_at, closed_at
+  created_at, updated_at, closed_at, approved_by, approved_at
 `
 
 function mapTicket(row: TicketRow): Ticket {
@@ -95,6 +97,8 @@ function mapTicket(row: TicketRow): Ticket {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     closedAt: row.closed_at,
+    approvedBy: row.approved_by ?? null,
+    approvedAt: row.approved_at ?? null,
   }
 }
 
@@ -132,6 +136,8 @@ export interface UpdateTicketPatch {
   dueDate?: number | null
   startDate?: number | null
   closedAt?: number | null
+  approvedBy?: string | null
+  approvedAt?: number | null
 }
 
 export interface TicketListQuery {
@@ -392,6 +398,8 @@ export function updateTicket(
          due_date = @dueDate,
          start_date = @startDate,
          closed_at = @closedAt,
+         approved_by = @approvedBy,
+         approved_at = @approvedAt,
          version = version + 1,
          updated_at = @now
        WHERE id = @id AND version = @expectedVersion`,
@@ -414,6 +422,8 @@ export function updateTicket(
       dueDate: patch.dueDate === undefined ? existing.dueDate : patch.dueDate,
       startDate: patch.startDate === undefined ? existing.startDate : patch.startDate,
       closedAt: patch.closedAt === undefined ? existing.closedAt : patch.closedAt,
+      approvedBy: patch.approvedBy === undefined ? existing.approvedBy : patch.approvedBy,
+      approvedAt: patch.approvedAt === undefined ? existing.approvedAt : patch.approvedAt,
       now,
     })
 

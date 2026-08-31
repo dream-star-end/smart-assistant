@@ -156,6 +156,8 @@ function ticket(
     createdAt: now - 3 * 86_400_000,
     updatedAt: now - updatedMinutesAgo * 60_000,
     closedAt: status === 'done' ? now - updatedMinutesAgo * 60_000 : null,
+    approvedBy: null,
+    approvedAt: null,
   }
 }
 

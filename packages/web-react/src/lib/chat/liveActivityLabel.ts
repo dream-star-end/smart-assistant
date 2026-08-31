@@ -43,6 +43,7 @@ const TOOL_ACTIVITY_LABEL: Record<string, LiveActivityLabel> = {
   task_create: "更新任务",
   task_list: "更新任务",
   task_get: "更新任务",
+  task_approve: "更新任务",
   enterplanmode: "更新任务",
   enter_plan_mode: "更新任务",
   exitplanmode: "更新任务",
