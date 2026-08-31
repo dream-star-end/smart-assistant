@@ -624,10 +624,6 @@
       "coverageCommits": [
         "8f04bb2d"
       ],
-      "proofPending": {
-        "reason": "恢复围栏的跨刷新持久化目前只有 unit 覆盖;真实浏览器/live 会话里的『失败轮不再无限自动重试』尚无活体证据。",
-        "since": "2026-07-26"
-      },
       "regressions": [
         {
           "layer": "unit",
@@ -638,6 +634,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
           "assertion": "automatic checkpoint keeps the exact old tape and skipped ACK removes only its optimistic child"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
+          "assertion": "停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活"
         }
       ]
     },
@@ -2090,7 +2091,8 @@
       "symptom": "Cursor 回合 MCP send_to_agent 报 401 async delegate requires delegate context。根因是 buildCursorMemoryMcpConfig 漏注 OPENCLAUDE_DELEGATE_CONTEXT_FILE，MCP 子进程无法带签名 context 调 /delegate。",
       "rootFixCommit": "1bfa85be",
       "coverageCommits": [
-        "886e4dfa"
+        "886e4dfa",
+        "6ea6b0f0"
       ],
       "regressions": [
         {
@@ -2104,11 +2106,15 @@
           "assertion": "spawned Cursor MCP config injects delegate-context file mode 0600 and cleans it up"
         },
         {
-          "layer": "live-e2e",
-          "path": "e2e/session-display/tests/54-ocv5-delegate-wiring.spec.ts",
-          "assertion": "spawned Cursor MCP config injects delegate-context file mode 0600 and cleans it up"
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateHttpRouting.test.ts",
+          "assertion": "async POST without delegate context is 401; signed context is not that 401"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "Cursor MCP context 注入无法在商业候选 HTTP 上诚实复现(/delegate 对 user JWT 403,且无法从 Playwright 读取候选容器 MCP child env)。回归锁在 spawn 单测 + handleHttp 监听器单测。",
+        "since": "2026-08-31"
+      }
     },
     {
       "id": "INC-20260831-DELEGATE-MODEL-UNKNOWN",
@@ -2129,6 +2135,11 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateAsyncJobs.test.ts",
           "assertion": "async flag-off explicit unknown model rejects at entry (no job)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateHttpRouting.test.ts",
+          "assertion": "POST unknown explicit slug returns 400 DELEGATE_MODEL_UNKNOWN without a job"
         },
         {
           "layer": "live-e2e",
