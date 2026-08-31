@@ -822,6 +822,18 @@ export type PermissionResponse =
   | { behavior: 'deny'; message: string; toolUseID?: string }
 
 /**
+ * CCB builtin tools the platform strips from every non-hermetic session.
+ *
+ * `SendMessage` only writes `~/.claude/teams/<team>/inboxes/<agent>.json`.
+ * OpenClaude never consumes that mailbox (OCV5-45). `--disallowedTools`
+ * lands in CCB `alwaysDenyRules.cliArg`, so `filterToolsByDenyRules`
+ * removes it from the model-visible pool and permission step 1a still
+ * denies it under bypassPermissions. In-process Agent/Task/teammates
+ * inherit the same permission context / filtered pool.
+ */
+export const CCB_PLATFORM_DISALLOWED_TOOLS = ['SendMessage'] as const
+
+/**
  * Inputs for `buildCcbCliArgs`. Everything that influences the subprocess's
  * CLI argv lives here so the argv construction is a pure function — trivially
  * unit-testable, no side effects, no file I/O.
@@ -917,7 +929,14 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
   // emits `can_use_tool` control_requests on stdout that the gateway bridges
   // to the web frontend. Required even under bypassPermissions for
   // interactive tools like AskUserQuestion.
-  if (!hermeticNoTools) args.push('--permission-prompt-tool', 'stdio')
+  //
+  // `--disallowedTools` is variadic (`<tools...>`). Place it immediately
+  // before another `--flag` so Commander cannot swallow the trailing empty
+  // prompt placeholder as a second tool name.
+  if (!hermeticNoTools) {
+    args.push('--disallowedTools', ...CCB_PLATFORM_DISALLOWED_TOOLS)
+    args.push('--permission-prompt-tool', 'stdio')
+  }
   if (hermeticNoTools) {
     args.push('--bare', '--tools', '', '--strict-mcp-config')
   }
