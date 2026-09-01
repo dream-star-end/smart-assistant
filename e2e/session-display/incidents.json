@@ -2387,12 +2387,12 @@
           "assertion": "[cursor-sand-inference] PASS — Sand keys use the real InferenceService relay; native Cursor remains isolated to native keys and Auto"
         }
       ],
-    "coverageCommits": [
-      "8a92b682",
-      "4d678dda",
-      "cfb6c7c6",
-      "968f4836",
-      "ccc58f05",
+      "coverageCommits": [
+        "8a92b682",
+        "4d678dda",
+        "cfb6c7c6",
+        "968f4836",
+        "ccc58f05",
         "a32e9bb6",
         "38596146",
         "5834df20",
@@ -2404,6 +2404,53 @@
         "5ff831e4",
         "a5da8cea",
         "e3f11e62"
+      ]
+    },
+    {
+      "id": "INC-20260902-TIMELINE-PAINT-VISION-HINT",
+      "occurredAt": "2026-09-02",
+      "severity": "P1",
+      "symptom": "V5 selfhost Web 时间线:离底后新发送的用户消息落入底 spacer 迟迟不显示;流式回合中 content-visibility:auto skipped 行的 200px 估高写回高度缓存,视口内已渲染内容变空白,滚动后才恢复。同批:catalog supports_vision=false 使 cursor 家族(Read 可原生看图)的上传图片提示把 oc-vision CLI 排在 Read 之前,agent 绕过原生识图。",
+      "rootFixCommit": "db14273e",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/timelinePaint.test.ts",
+          "assertion": "selectPaintRange absorbs tail append instead of leaving the new row in the spacer"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/timelinePaint.test.ts",
+          "assertion": "D: pin 不生效时近底 append 仍吸收 end，结果含新 user 下标 80"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/timelinePaint.test.ts",
+          "assertion": "C: sending 但用户在顶部时，远处 pin 不把画窗 union 到 lastUser"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/timelinePaint.test.ts",
+          "assertion": "skipped content-visibility rows do not enter the height cache"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/imageAttachmentHint.test.ts",
+          "assertion": "cursor-fable-5.1-high + catalog supportsVision=false → Read 第 1、CLI 第 2"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/imageAttachmentHint.test.ts",
+          "assertion": "deepseek(确定纯文本)+hasUnderstandImage → CLI 第 1、Read 第 2"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/promptSlotsDeepseekVision.test.ts",
+          "assertion": "cursor-fable-5.1-high + catalog supportsVision=false 不声称看不到图,先 Read 再 oc-vision"
+        }
+      ],
+      "coverageCommits": [
+        "db14273e"
       ]
     }
   ]
