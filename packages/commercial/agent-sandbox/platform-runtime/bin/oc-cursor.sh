@@ -875,40 +875,14 @@ if [ "${OPENCLAUDE_CURSOR_AGENT_DEBUG:-}" = "1" ] && [ -n "$oc_home" ] && [ -d "
 fi
 unset OPENCLAUDE_CURSOR_AGENT_DEBUG
 
-# When Sand mode is enabled for Other Models (Opus, etc.), install ephemeral preload
-# hook to guarantee x-cursor-client-type is sand and pass -H argument.
-# Cursor Models (Grok 4.6 / Grok 4.5 / Composer 2.5) always run in native CLI mode.
+# When Sand mode is enabled for Other Models (Opus, etc.), use the Cursor CLI's
+# request-scoped -H support. Do not monkey-patch global Headers: that also marks
+# endpoint discovery / AgentService control requests as Sand traffic, which the
+# upstream rejects before the CLI can reach the Sand inference stream.
+# Cursor Models (Grok 4.6 / Grok 4.5 / Composer 2.5) stay in native CLI mode.
 effective_sand=0
 if [ "$sand_enabled" -eq 1 ] && [ "$cursor_family" = "other_models" ]; then
   effective_sand=1
-fi
-
-if [ "$effective_sand" -eq 1 ]; then
-  sand_hook="$cursor_home/.sand-hook.cjs"
-  /bin/cat <<'EOF' > "$sand_hook"
-const origSet = globalThis.Headers?.prototype?.set;
-if (origSet) {
-  globalThis.Headers.prototype.set = function(k, v) {
-    if (typeof k === "string" && k.toLowerCase() === "x-cursor-client-type") {
-      return origSet.call(this, k, "sand");
-    }
-    return origSet.call(this, k, v);
-  };
-}
-const origAppend = globalThis.Headers?.prototype?.append;
-if (origAppend) {
-  globalThis.Headers.prototype.append = function(k, v) {
-    if (typeof k === "string" && k.toLowerCase() === "x-cursor-client-type") {
-      return origAppend.call(this, k, "sand");
-    }
-    return origAppend.call(this, k, v);
-  };
-}
-EOF
-  /bin/chmod 600 -- "$sand_hook" 2>/dev/null || true
-  node_opts="${NODE_OPTIONS:-}"
-  [ -z "$node_opts" ] && node_opts="--require $sand_hook" || node_opts="$node_opts --require $sand_hook"
-  export NODE_OPTIONS="$node_opts"
 fi
 
 prompt=$1
