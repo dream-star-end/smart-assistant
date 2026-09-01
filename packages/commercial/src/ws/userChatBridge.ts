@@ -7101,6 +7101,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                         modelId,
                         terminalCode,
                         slotResults: external.cursorSlotResults,
+                        stableAccountId: external.cursorAccountId ? cursorAccountId : undefined,
                       });
                     } catch (learnErr) {
                       bridgeLog?.warn('user-chat-bridge: Cursor quota-class learn failed', { requestId, err: learnErr });

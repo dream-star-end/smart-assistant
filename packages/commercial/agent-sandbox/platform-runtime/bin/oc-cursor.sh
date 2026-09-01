@@ -361,6 +361,15 @@ else
   auth_dir=$generation_dir
   auth_file=$auth_dir/api-key
 fi
+identity_text=""
+if [ "$pool_generation" != legacy ]; then
+  identity_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.slot-identities" 2>/dev/null) \
+    || die "Cursor pool identity sidecar is unreadable"
+  identity_header=${identity_text%%
+*}
+  [ "$identity_header" = "# cursor-pool-identity v1 $pool_generation" ] \
+    || die "Cursor pool identity generation mismatch"
+fi
 
 set -f
 primary_present=0
@@ -593,23 +602,65 @@ if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null \
     || sand_sidecar_text=""
 fi
 
+identity_account_for_key() {
+  _identity_target=$1
+  if [ "$pool_generation" = legacy ]; then printf '0\n'; return 0; fi
+  while IFS= read -r _identity_line || [ -n "$_identity_line" ]; do
+    case "$_identity_line" in ''|'#'*) continue ;; esac
+    _identity_name=${_identity_line%% *}
+    _identity_rest=${_identity_line#"$_identity_name" }
+    _identity_account=${_identity_rest%% *}
+    if [ "$_identity_name" = "$_identity_target" ]; then
+      printf '%s\n' "$_identity_account"
+      return 0
+    fi
+  done <<IDENTITY_LOOKUP
+$identity_text
+IDENTITY_LOOKUP
+  return 1
+}
+
 if [ "$eligible_count" -gt 1 ]; then
   rotation_state=$(/bin/cat -- "$rotation_file" 2>/dev/null) || rotation_state=""
-  rotation_first=${rotation_state%% *}
-  rotation_rest=${rotation_state#* }
-  if [ "$rotation_rest" = "$rotation_state" ]; then rotation_rest=""; fi
-  case "$rotation_first" in
-    ''|*[!0-9]*) rotation_first=0 ;;
-  esac
-  case "$rotation_rest" in
-    ''|*[!0-9]*) rotation_rest=0 ;;
-  esac
-  rotation_idx=$rotation_first
-  rotation_exp=$rotation_rest
-  if [ "$rotation_idx" -ge "$eligible_count" ]; then rotation_idx=0; fi
-  # Cooldown elapsed (or legacy single-int state): return to the primary eligible.
-  if [ "$rotation_idx" -gt 0 ] && [ "$(/bin/date +%s)" -ge "$rotation_exp" ]; then
-    rotation_idx=0
+  rotation_version=${rotation_state%% *}
+  if [ "$rotation_version" = v2 ]; then
+    rotation_rest=${rotation_state#v2 }
+    rotation_failed_account=${rotation_rest%% *}
+    rotation_rest=${rotation_rest#"$rotation_failed_account" }
+    rotation_family=${rotation_rest%% *}
+    rotation_exp=${rotation_rest#"$rotation_family" }
+    case "$rotation_failed_account" in ''|*[!0-9]*) rotation_failed_account=0 ;; esac
+    case "$rotation_family" in cursor_models|other_models) ;; *) rotation_family=invalid ;; esac
+    case "$rotation_exp" in ''|*[!0-9]*) rotation_exp=0 ;; esac
+    if [ "$rotation_family" = "$cursor_family" ] \
+      && [ "$(/bin/date +%s)" -lt "$rotation_exp" ]; then
+      failed_position=0
+      slot_position=0
+      for key_name in $eligible_names; do
+        slot_position=$((slot_position + 1))
+        slot_account=$(identity_account_for_key "$key_name" 2>/dev/null) || slot_account=0
+        if [ "$slot_account" = "$rotation_failed_account" ]; then
+          failed_position=$slot_position
+          break
+        fi
+      done
+      rotation_idx=$failed_position
+      if [ "$rotation_idx" -ge "$eligible_count" ]; then rotation_idx=0; fi
+    else
+      rotation_idx=0
+    fi
+  else
+    rotation_first=${rotation_state%% *}
+    rotation_rest=${rotation_state#* }
+    if [ "$rotation_rest" = "$rotation_state" ]; then rotation_rest=""; fi
+    case "$rotation_first" in ''|*[!0-9]*) rotation_first=0 ;; esac
+    case "$rotation_rest" in ''|*[!0-9]*) rotation_rest=0 ;; esac
+    rotation_idx=$rotation_first
+    rotation_exp=$rotation_rest
+    if [ "$rotation_idx" -ge "$eligible_count" ]; then rotation_idx=0; fi
+    if [ "$rotation_idx" -gt 0 ] && [ "$(/bin/date +%s)" -ge "$rotation_exp" ]; then
+      rotation_idx=0
+    fi
   fi
   chosen_slot=$((rotation_idx + 1))
   slot_position=0
@@ -657,10 +708,17 @@ fi
 
 rotation_advance() {
   [ "$eligible_count" -gt 1 ] || return 0
-  rotation_next=$((rotation_idx + 1))
-  if [ "$rotation_next" -ge "$eligible_count" ]; then rotation_next=0; fi
-  printf '%s %s\n' "$rotation_next" "$(( $(/bin/date +%s) + rotation_cooldown ))" \
-    > "$rotation_file" 2>/dev/null || :
+  rotation_deadline=$(( $(/bin/date +%s) + rotation_cooldown ))
+  failed_key_name=${chosen_key_file##*/}
+  failed_account=$(identity_account_for_key "$failed_key_name" 2>/dev/null) || failed_account=0
+  if [ "$pool_generation" != legacy ] && [ "$failed_account" != 0 ]; then
+    printf 'v2 %s %s %s\n' "$failed_account" "$cursor_family" "$rotation_deadline" \
+      > "$rotation_file" 2>/dev/null || :
+  else
+    rotation_next=$((rotation_idx + 1))
+    if [ "$rotation_next" -ge "$eligible_count" ]; then rotation_next=0; fi
+    printf '%s %s\n' "$rotation_next" "$rotation_deadline" > "$rotation_file" 2>/dev/null || :
+  fi
 }
 mark_other_models_recheck_failure() {
   [ "$other_models_recheck" -eq 1 ] || return 0
@@ -707,12 +765,6 @@ fi
 selected_account_id=0
 selected_fingerprint=0000000000000000
 if [ "$pool_generation" != legacy ]; then
-  identity_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.slot-identities" 2>/dev/null) \
-    || die "Cursor pool identity sidecar is unreadable"
-  identity_header=${identity_text%%
-*}
-  [ "$identity_header" = "# cursor-pool-identity v1 $pool_generation" ] \
-    || die "Cursor pool identity generation mismatch"
   identity_found=0
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac

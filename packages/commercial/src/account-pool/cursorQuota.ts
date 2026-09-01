@@ -121,6 +121,27 @@ export function planCursorQuotaUpdates(
   return [...planned.values()];
 }
 
+/** Stable-generation path: slot numbers belong to the historical generation,
+ * so use the already verified account identity and only the terminal result
+ * kind. Never reinterpret an old slot against the current compacted pool. */
+export function planStableCursorQuotaUpdate(
+  rows: Array<{ id: bigint; cursor_quota_class: CursorQuotaClass }>,
+  stableAccountId: bigint,
+  results: CursorSlotResult[],
+  family: CursorModelFamily,
+  terminalCode: string | null | undefined,
+): Array<{ id: bigint; from: CursorQuotaClass; to: CursorQuotaClass }> {
+  const row = rows.find((candidate) => candidate.id === stableAccountId);
+  const terminal = results[results.length - 1];
+  if (!row || !terminal) return [];
+  return planCursorQuotaUpdates(
+    [row],
+    [{ slot: 1, result: terminal.result }],
+    family,
+    terminalCode,
+  );
+}
+
 export function renderQuotaClassSidecar(slots: Array<{ name: string; quotaClass: CursorQuotaClass }>): string {
   const lines = ["# quota-class v1"];
   for (const slot of slots) {

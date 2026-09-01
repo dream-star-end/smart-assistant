@@ -36,6 +36,7 @@ import {
   asCursorSlotResults,
   cursorModelFamily,
   planCursorQuotaUpdates,
+  planStableCursorQuotaUpdate,
   renderQuotaClassSidecar,
   renderSandModeSidecar,
   uniqueCursorAccountIdFromSlotResults,
@@ -391,18 +392,25 @@ export async function applyLearnedCursorQuota(opts: {
   modelId: string | null;
   terminalCode: string | null;
   slotResults: unknown;
+  stableAccountId?: bigint | null;
 }): Promise<number> {
   const results = asCursorSlotResults(opts.slotResults);
   if (!opts.modelId || results.length === 0) return 0;
   const family = cursorModelFamily(opts.modelId);
   if (family === "cursor_models") return 0;
   const rows = eligibleCursorRows(await listAccounts({ provider: "cursor", limit: 500 }), new Date());
-  const updates = planCursorQuotaUpdates(
-    rows.map((row) => ({ id: row.id, cursor_quota_class: row.cursor_quota_class })),
-    results,
-    family,
-    opts.terminalCode,
-  );
+  const projectedRows = rows.map((row) => ({ id: row.id, cursor_quota_class: row.cursor_quota_class }));
+  const updates = opts.stableAccountId !== undefined
+    ? opts.stableAccountId === null
+      ? []
+      : planStableCursorQuotaUpdate(
+          projectedRows,
+          opts.stableAccountId,
+          results,
+          family,
+          opts.terminalCode,
+        )
+    : planCursorQuotaUpdates(projectedRows, results, family, opts.terminalCode);
   for (const update of updates) {
     await updateAccount(update.id, { cursor_quota_class: update.to });
   }

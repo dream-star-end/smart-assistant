@@ -12,6 +12,8 @@ const wrapper = readFileSync(resolve(root, 'packages/commercial/agent-sandbox/pl
 const tests = readFileSync(resolve(root, 'packages/gateway/src/__tests__/cursorSandRelay.test.ts'), 'utf8')
 const wrapperTests = readFileSync(resolve(root, 'packages/commercial/src/__tests__/cursorCliWrapper.test.ts'), 'utf8')
 const materializer = readFileSync(resolve(root, 'packages/commercial/src/account-pool/cursorMaterializer.ts'), 'utf8')
+const quota = readFileSync(resolve(root, 'packages/commercial/src/account-pool/cursorQuota.ts'), 'utf8')
+const bridge = readFileSync(resolve(root, 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
 const commercialDeploy = readFileSync(resolve(root, 'scripts/deploy-v5.sh'), 'utf8')
 const selfhostRelease = readFileSync(resolve(root, 'scripts/v5-selfhost-master-release-lib.sh'), 'utf8')
 
@@ -52,6 +54,9 @@ assert.match(wrapperTests, /an immutable generation keeps a bound Sand account s
 assert.match(tests, /pool generation changes rebind stable account identity before reading a reused slot/)
 assert.match(materializer, /CURSOR_POOL_GENERATIONS_DIR/)
 assert.match(materializer, /CURSOR_POOL_IDENTITIES_FILE/)
+assert.match(wrapper, /printf 'v2 %s %s %s\\n'/)
+assert.match(quota, /planStableCursorQuotaUpdate/)
+assert.match(bridge, /stableAccountId: external\.cursorAccountId \? cursorAccountId : undefined/)
 assert.match(commercialDeploy, /check-v5-cursor-sand-inference\.ts/)
 assert.match(selfhostRelease, /check-v5-cursor-sand-inference\.ts/)
 

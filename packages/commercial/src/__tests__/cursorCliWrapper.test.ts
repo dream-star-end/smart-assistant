@@ -1324,6 +1324,42 @@ describe('oc-cursor wrapper', () => {
     )
     assert.equal(launched.status, 0, launched.stderr)
     assert.equal(readFileSync(join(f.capture, 'key'), 'utf8').trim(), keyB)
+
+    const recorded = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__record_old_failure__'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_CURSOR_SELECTED_KEY: 'api-key.2',
+          OPENCLAUDE_CURSOR_POOL_GENERATION: gen1,
+          OPENCLAUDE_CURSOR_ACCOUNT_ID: '2',
+          OPENCLAUDE_CURSOR_KEY_FINGERPRINT: fp(keyB),
+          OPENCLAUDE_CURSOR_RECORD_RESULT: 'fail',
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(recorded.status, 0, recorded.stderr)
+    assert.match(readFileSync(rotationFile, 'utf8'), /^v2 2 other_models /)
+
+    const afterFailure = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__select_after_compaction__'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_CURSOR_SELECT_ONLY: '1',
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(afterFailure.status, 0, afterFailure.stderr)
+    assert.match(afterFailure.stdout, new RegExp(`selected_slot 2 api-key\\.2 native ${gen2} 3 ${fp(keyC)}`))
   })
 
   test('Cursor Models (Grok 4.6) stay in native CLI mode and do NOT pass -H even when .sand-mode is enabled', () => {
