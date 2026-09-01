@@ -496,6 +496,7 @@ async function resolveTurnRuntime(
   authority: TurnModelAuthority | undefined,
   model: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
+  expectedEngine: 'ccb' | 'cursor' = 'ccb',
 ): Promise<{ headers?: TurnUpstreamHeaders; descriptor?: CcbExecutionDescriptor }> {
   if (authority) {
     return {
@@ -513,8 +514,8 @@ async function resolveTurnRuntime(
   if (!model) throw new ModelCatalogUnavailableError('local CCB turn has no canonical model')
   const view = await client.getView()
   const row = view.resolve(view.canonicalize(model))
-  if (!row || row.engine !== 'ccb') {
-    throw new ModelCatalogUnavailableError('local CCB model missing from current projection')
+  if (!row || row.engine !== expectedEngine) {
+    throw new ModelCatalogUnavailableError(`local ${expectedEngine} model missing from current projection`)
   }
   return {
     headers: { localCatalog: await client.getToken() },
@@ -706,6 +707,13 @@ export interface SubprocessRunnerOpts {
   config: OpenClaudeConfig
   persona?: string // 注入 system prompt 的文件
   model?: string
+  /** Platform-owned per-adapter provider route. Never populated from user or
+   * catalog text. Applied after the normal provider policy so a specialized
+   * engine can bind CCB to a capability-scoped loopback relay. */
+  providerEnvOverride?: Record<string, string>
+  /** Engine expected in the signed/local catalog descriptor when CCB is used
+   * as another engine's local tool loop. Defaults to ccb. */
+  authorityEngine?: 'ccb' | 'cursor'
   permissionMode?: string
   resumeSessionId?: string // 续上之前的 CCB session
   // Per-agent overrides
@@ -1314,6 +1322,13 @@ export class SubprocessRunner extends EventEmitter {
         provider: hostSpawnRouting.providerId,
       })
     }
+    const finalizedProviderEnv = finalizeCcbSpawnEnv({
+      providerEnv,
+      routing: hostSpawnRouting.routing,
+    })
+    if (this.opts.providerEnvOverride) {
+      Object.assign(finalizedProviderEnv, this.opts.providerEnvOverride)
+    }
 
     let proc: ReturnType<TerminalBackend['spawn']>
     try {
@@ -1331,10 +1346,7 @@ export class SubprocessRunner extends EventEmitter {
         // 与 Bash 工具的 working directory 都跟系统提示对齐。
         subprocessCwd: learningContext.workingDir ?? effectiveAddDir,
         env: {
-          ...finalizeCcbSpawnEnv({
-            providerEnv,
-            routing: hostSpawnRouting.routing,
-          }),
+          ...finalizedProviderEnv,
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
           ...(this.delegateContextFile
@@ -1704,7 +1716,12 @@ export class SubprocessRunner extends EventEmitter {
   ): Promise<void> {
     // 先解析 + 校验凭据:抛在这里 = 一行都没写 = 本 turn 没发出去(fail-closed)。
     // 也保证下方两次 write 之间**没有 await**(不给交叠 turn 插队的窗口)。
-    const runtime = await resolveTurnRuntime(authority, this.opts.model)
+    const runtime = await resolveTurnRuntime(
+      authority,
+      this.opts.model,
+      process.env,
+      this.opts.authorityEngine ?? 'ccb',
+    )
     if (
       this.proc &&
       shouldRecycleForVisionCapability(this.spawnedExecutionDescriptor, runtime.descriptor)

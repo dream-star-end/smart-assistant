@@ -245,7 +245,7 @@ const FORWARDED_RUNNER_EVENTS = [
 ] as const
 
 export class CcbAdapter extends EventEmitter implements EngineAdapter {
-  readonly engineId = 'ccb'
+  readonly engineId: string = 'ccb'
   readonly capabilities: EngineCapabilities = {
     billingMode: 'proxy',
     supportsEffort: true,

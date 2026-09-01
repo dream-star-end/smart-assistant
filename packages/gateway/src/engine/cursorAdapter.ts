@@ -32,6 +32,7 @@ import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { issueDelegateContextToken } from '../delegateContext.js'
 import { formatPresentOptionsFence } from './presentOptions.js'
+import { CursorRoutingAdapter } from './cursorRoutingAdapter.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
 
 const log = createLogger({ module: 'cursorAdapter' })
@@ -2619,4 +2620,4 @@ export const _internals = {
   isBlockingOcMemoryDelegateCommand,
 }
 
-registerEngine('cursor', (opts) => new CursorAdapter(opts))
+registerEngine('cursor', (opts) => new CursorRoutingAdapter(opts))
