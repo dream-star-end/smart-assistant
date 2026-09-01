@@ -583,7 +583,7 @@ test('tool recovery accepts XML and bounded compact control but rejects unknown 
   assert.equal(wrongType.tools.length, 0)
 })
 
-test('Anthropic request encodes the concrete Fable model, history and tools', () => {
+test('Fable Sand encodes native tool schemas and structured tool-result history', () => {
   const encoded = encodeCursorSandRequest({
     model: 'cursor-fable-5-high',
     max_tokens: 512,
@@ -606,13 +606,21 @@ test('Anthropic request encodes the concrete Fable model, history and tools', ()
   assert.equal(request.modelId, 'claude-fable-5-thinking-high')
   assert.equal(request.modelConfig.maxTokens, 512)
   assert.equal(request.messages[0].role, 4)
-  assert.match(request.messages[0].text, /<tool_use name="TOOL_NAME">/)
-  assert.match(request.messages[0].text, /"name":"Read"/)
+  assert.doesNotMatch(request.messages[0].text, /<tool_use name="TOOL_NAME">/)
+  assert.equal(request.tools.length, 1)
+  assert.equal(request.tools[0].name, 'Read')
   assert.equal(
-    request.messages.some((message: { text?: string }) => message.text?.includes('<tool_result id="toolu_1"')),
-    true,
+    request.tools[0].parameters.fields.jsonSchema.structValue.fields.type.stringValue,
+    'object',
   )
-  assert.deepEqual(request.tools ?? [], [])
+  const assistant = request.messages.find((message: { role?: number }) => message.role === 2)
+  assert.equal(assistant.toolCalls[0].toolCallId, 'toolu_1')
+  assert.equal(assistant.toolCalls[0].toolName, 'Read')
+  assert.equal(assistant.toolCalls[0].rawToolCallArgs, '{"path":"a.txt"}')
+  const toolResult = request.messages.find((message: { role?: number }) => message.role === 3)
+  assert.equal(toolResult.toolContent.parts[0].toolCallId, 'toolu_1')
+  assert.equal(toolResult.toolContent.parts[0].toolName, 'Read')
+  assert.equal(toolResult.toolContent.parts[0].result.stringValue, 'contents')
 })
 
 test('Grok Sand encodes native tool schemas and structured tool-result history', () => {
@@ -646,11 +654,10 @@ test('Grok Sand encodes native tool schemas and structured tool-result history',
   assert.doesNotMatch(request.messages[0].text, /<tool_use name="TOOL_NAME">/)
   assert.equal(request.tools.length, 1)
   assert.equal(request.tools[0].name, 'Bash')
-  assert.deepEqual(JSON.parse(request.tools[0].parametersJsonSchema), {
-    type: 'object',
-    properties: { command: { type: 'string' } },
-    required: ['command'],
-  })
+  const schema = request.tools[0].parameters.fields.jsonSchema.structValue.fields
+  assert.equal(schema.type.stringValue, 'object')
+  assert.equal(schema.properties.structValue.fields.command.structValue.fields.type.stringValue, 'string')
+  assert.equal(schema.required.listValue.values[0].stringValue, 'command')
   const assistant = request.messages.find((message: { role?: number }) => message.role === 2)
   assert.equal(assistant.toolCalls[0].toolCallId, 'call_1')
   assert.equal(assistant.toolCalls[0].toolName, 'Bash')
@@ -704,15 +711,20 @@ test('loopback relay hits InferenceService/Stream with Sand identity and emits A
       { oneofs: true },
     )
     assert.equal(request.modelId, 'claude-fable-5-thinking-high')
+    assert.equal(request.tools.length, 1)
+    assert.equal(request.tools[0].name, 'Read')
+    assert.equal(
+      request.tools[0].parameters.fields.jsonSchema.structValue.fields.type.stringValue,
+      'object',
+    )
     const response = Buffer.concat([
       responseFrame('thinkingPart', { text: 'thought' }),
       responseFrame('textPart', { text: 'done' }),
+      responseFrame('toolCallPart', { toolCallId: 'toolu_x', toolName: 'Read' }),
+      responseFrame('toolCallPart', { toolCallId: 'toolu_x', args: '{"path":' }),
+      responseFrame('toolCallPart', { toolCallId: 'toolu_x', args: '"a.txt"}' }),
       responseFrame('toolCallPart', {
-        toolCallId: 'toolu_x',
-        toolName: 'Read',
-        args: '{"path":"a.txt"}',
-        isComplete: true,
-        toolIndex: 0,
+        toolCallId: 'toolu_x', toolName: 'Read', args: '{"path":"a.txt"}', isComplete: true,
       }),
       responseFrame('usage', { promptTokens: 10, completionTokens: 4, totalTokens: 14 }),
       envelope(Buffer.from('{}'), 0x02),
@@ -747,6 +759,8 @@ test('loopback relay hits InferenceService/Stream with Sand identity and emits A
     assert.match(text, /"type":"text_delta","text":"done"/)
     assert.match(text, /"type":"tool_use"/)
     assert.match(text, /"type":"input_json_delta"/)
+    assert.match(text, /"partial_json":"\{\\"path\\":\\"a.txt\\"\}"/)
+    assert.equal((text.match(/"type":"tool_use"/g) ?? []).length, 1)
     assert.match(text, /"stop_reason":"tool_use"/)
     assert.match(text, /event: message_stop/)
     assert.equal(calls.length, 2)

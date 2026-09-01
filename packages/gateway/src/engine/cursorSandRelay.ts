@@ -98,6 +98,68 @@ interface StreamState {
   recoveredToolCount: number
 }
 
+function nextToolIndex(tools: ReadonlyMap<number, ToolStreamState>): number {
+  let next = 0
+  for (const index of tools.keys()) next = Math.max(next, index + 1)
+  return next
+}
+
+function toolIndexForPart(
+  tools: ReadonlyMap<number, ToolStreamState>,
+  part: JsonObject,
+): number {
+  if (typeof part.toolIndex === 'number' && Number.isInteger(part.toolIndex) && part.toolIndex >= 0) {
+    return part.toolIndex
+  }
+  if (typeof part.toolCallId === 'string' && part.toolCallId) {
+    for (const [index, tool] of tools) {
+      if (tool.id === part.toolCallId) return index
+    }
+  }
+  for (const [index, tool] of [...tools].reverse()) {
+    if (!tool.closed) return index
+  }
+  return nextToolIndex(tools)
+}
+
+function mergeToolPart(
+  tools: Map<number, ToolStreamState>,
+  part: JsonObject,
+): ToolStreamState {
+  const index = toolIndexForPart(tools, part)
+  let tool = tools.get(index)
+  if (!tool) {
+    tool = {
+      index,
+      id: typeof part.toolCallId === 'string' && part.toolCallId
+        ? part.toolCallId
+        : `toolu_${randomBytes(12).toString('hex')}`,
+      name: typeof part.toolName === 'string' ? part.toolName : '',
+      args: '', opened: false, closed: false,
+    }
+    tools.set(index, tool)
+  }
+  if (typeof part.toolCallId === 'string' && part.toolCallId) tool.id = part.toolCallId
+  if (typeof part.toolName === 'string' && part.toolName) tool.name = part.toolName
+  if (typeof part.args === 'string' && part.args) {
+    if (part.isComplete === true) {
+      try {
+        JSON.parse(part.args)
+        // Current Cursor emits streamed argument fragments followed by one
+        // complete JSON snapshot. The snapshot replaces—not appends to—the
+        // fragments or Anthropic consumers see `{}` / invalid concatenation.
+        tool.args = part.args
+      } catch {
+        tool.args += part.args
+      }
+    } else {
+      tool.args += part.args
+    }
+  }
+  if (part.isComplete === true) tool.closed = true
+  return tool
+}
+
 let protocolTypes: { request: protobuf.Type; response: protobuf.Type } | null = null
 
 function resolveProtocolPath(): string {
@@ -295,10 +357,11 @@ function toolProtocolPrompt(tools: unknown): string {
 }
 
 function nativeInferenceTools(upstreamModel: string): boolean {
-  // Live-proven against InferenceService/tool_call_part. Fable/Opus currently
-  // reject the same native tool declaration with provider HTTP 400, so they
-  // remain on the explicit compatibility bridge instead of silently failing.
-  return upstreamModel.startsWith('cursor-grok-')
+  // Every concrete Sand route uses InferenceService's native tool protocol.
+  // The wire contract is intentionally guarded by the official Cursor 3.18
+  // shape: InferenceAgentTool.parameters is a Struct containing a
+  // `jsonSchema` member, not the JSON Schema document at the Struct root.
+  return upstreamModel.length > 0
 }
 
 function inferenceTools(tools: unknown): JsonObject[] {
@@ -313,7 +376,11 @@ function inferenceTools(tools: unknown): JsonObject[] {
     return [{
       name: tool.name,
       description: typeof tool.description === 'string' ? tool.description : '',
-      parametersJsonSchema: JSON.stringify(schema),
+      parameters: {
+        fields: {
+          jsonSchema: protoValue(schema),
+        },
+      },
     }]
   })
 }
@@ -1133,23 +1200,7 @@ export class CursorSandRelay {
         thinking: (_text, signature) => {
           if (signature) thinkingSignature = signature
         },
-        tool: (part) => {
-          const toolIndex = typeof part.toolIndex === 'number' ? part.toolIndex : state.tools.size
-          let tool = state.tools.get(toolIndex)
-          if (!tool) {
-            tool = {
-              index: -1,
-              id: typeof part.toolCallId === 'string' && part.toolCallId
-                ? part.toolCallId
-                : `toolu_${randomBytes(12).toString('hex')}`,
-              name: typeof part.toolName === 'string' ? part.toolName : '',
-              args: '', opened: false, closed: false,
-            }
-            state.tools.set(toolIndex, tool)
-          }
-          if (typeof part.args === 'string') tool.args += part.args
-          if (part.isComplete === true) tool.closed = true
-        },
+        tool: (part) => { mergeToolPart(state.tools, part) },
         error: (message) => {
           streamError ??= message
           state.failed = true
@@ -1321,18 +1372,7 @@ export class CursorSandRelay {
       (frame) => this.applyFrame(state, frame, {
         text: () => {},
         thinking: () => {},
-        tool: (part) => {
-          const index = typeof part.toolIndex === 'number' ? part.toolIndex : tools.size
-          const current = tools.get(index) ?? {
-            index,
-            id: typeof part.toolCallId === 'string' ? part.toolCallId : `toolu_${randomBytes(12).toString('hex')}`,
-            name: typeof part.toolName === 'string' ? part.toolName : '',
-            args: '', opened: true, closed: false,
-          }
-          if (typeof part.args === 'string') current.args += part.args
-          current.closed = part.isComplete === true
-          tools.set(index, current)
-        },
+        tool: (part) => { mergeToolPart(tools, part) },
         error: (message) => { error = message },
       }),
       (message) => { error = message },
