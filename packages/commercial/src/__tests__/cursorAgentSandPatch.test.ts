@@ -1,12 +1,24 @@
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { resolve } from 'node:path'
 
 const patcherUrl = pathToFileURL(resolve(
   process.cwd(),
-  'packages/commercial/agent-sandbox/platform-runtime/bin/patch-cursor-agent-sand.mjs',
+  'packages/commercial/agent-sandbox/scripts/patch-cursor-agent-sand.mjs',
 )).href
+
+test('Cursor Agent Sand build helper stays outside the hot-config platform bundle', () => {
+  assert.equal(existsSync(resolve(
+    process.cwd(),
+    'packages/commercial/agent-sandbox/scripts/patch-cursor-agent-sand.mjs',
+  )), true)
+  assert.equal(existsSync(resolve(
+    process.cwd(),
+    'packages/commercial/agent-sandbox/platform-runtime/bin/patch-cursor-agent-sand.mjs',
+  )), false)
+})
 
 test('Cursor Agent Sand patch is env-gated and scopes headers away from AgentService', async () => {
   const patcher = await import(patcherUrl) as {
