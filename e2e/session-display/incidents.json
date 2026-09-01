@@ -2299,7 +2299,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
-          "assertion": "cursor engine factory selects Sand CCB only when the primary sidecar enables Fable"
+          "assertion": "cursor engine factory binds transport to the selected key and preserves it across concrete models"
         },
         {
           "layer": "unit",
@@ -2327,6 +2327,21 @@
           "assertion": "downstream abort cancels the Cursor stream and relay close does not hang"
         },
         {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "every concrete catalog Cursor model maps to its Sand InferenceService id"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "credential selector parses a high-numbered Sand slot and records the same binding"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorCliWrapper.test.ts",
+          "assertion": "metadata selection and a pinned native launch use the same account-pool Sand slot"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-cursor-sand-inference.ts",
           "assertion": "[cursor-sand-inference] PASS — InferenceService endpoint, Sand identity, cold-submit, billing, variant and abort guards present"
@@ -2338,8 +2353,9 @@
       "cfb6c7c6",
       "968f4836",
       "ccc58f05",
-      "a32e9bb6"
-    ]
+        "a32e9bb6",
+        "38596146"
+      ]
     }
   ]
 }
