@@ -1070,6 +1070,13 @@ build_frontend() {
   # 自己 serve SPA(Gateway spa 模式 + index.html fallback)。无 Caddy;产物不必进
   # runtime-releases(那是容器源,runtime-src-excludes 排除 /dist/)。
   local dist="$REPO_ROOT/packages/web-react/dist"
+  log "── Cursor Sand InferenceService contract gate ──"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts"
+  else
+    ( cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ) \
+      || die "Cursor Sand InferenceService contract gate 失败。"
+  fi
   log "── 构建 web-react SPA (npm run build → tsc -b && vite build) ──"
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] NODE_OPTIONS=--max-old-space-size=4096 npm run build --workspace packages/web-react"

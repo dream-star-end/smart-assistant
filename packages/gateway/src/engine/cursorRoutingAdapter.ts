@@ -160,6 +160,7 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   waitForOutputDrain(): Promise<void> { return this.inner.waitForOutputDrain() }
 
   get nativeSessionId(): string | null {
+    if (variantFor(this.opts.model) !== this.variant) return null
     const id = this.inner.nativeSessionId
     return id && this.variant === 'sand' ? `${SAND_RESUME_PREFIX}${id}` : id
   }
@@ -171,6 +172,10 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   setModel(model: string | undefined): void {
     this.opts.model = model
     if (variantFor(model) === this.variant) this.inner.setModel(model)
+    else {
+      this.opts.resumeSessionId = undefined
+      this.inner.clearSessionId()
+    }
   }
   get model(): string | undefined { return this.opts.model }
   setEffortLevel(level: string | undefined): void {
