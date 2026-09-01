@@ -181,29 +181,108 @@ export function extractFirstVisibleAttribution(
   return { traceId: String(frame.traceId), kind };
 }
 
+export const TURN_FIRST_VISIBLE_RETRY_DELAYS_MS = [0, 50, 250] as const;
+export const FIRST_VISIBLE_PERSIST_MAX_ROUNDS = 3;
+
+/**
+ * Bridge-side gate so a failed first_visible write is not permanently
+ * suppressed. A trace is marked persisted only after UPDATE succeeds.
+ * Inflight coalesces frames during one 3-attempt round; maxRounds caps
+ * later-frame retries so a dead PG is not hit on every visible token.
+ */
+export class FirstVisiblePersistGate {
+  private readonly persisted = new Set<string>();
+  private readonly inflight = new Set<string>();
+  private readonly failedRounds = new Map<string, number>();
+
+  constructor(
+    private readonly maxEntries = 512,
+    private readonly maxRounds = FIRST_VISIBLE_PERSIST_MAX_ROUNDS,
+  ) {}
+
+  /** True iff this frame should start a persist round. */
+  begin(traceId: string): boolean {
+    if (this.persisted.has(traceId) || this.inflight.has(traceId)) return false;
+    // Per bridge generation, 9 attempts (maxRounds=3 x 3). Reconnect / failedRounds
+    // eviction re-grants budget on purpose so a recovered PG can still persist.
+    if ((this.failedRounds.get(traceId) ?? 0) >= this.maxRounds) return false;
+    this.inflight.add(traceId);
+    return true;
+  }
+
+  settle(traceId: string, ok: boolean): void {
+    this.inflight.delete(traceId);
+    if (ok) {
+      if (this.persisted.size >= this.maxEntries) this.persisted.clear();
+      this.persisted.add(traceId);
+      this.failedRounds.delete(traceId);
+      return;
+    }
+    this.failedRounds.set(traceId, (this.failedRounds.get(traceId) ?? 0) + 1);
+    if (this.failedRounds.size > this.maxEntries) {
+      const oldest = this.failedRounds.keys().next().value;
+      if (oldest) this.failedRounds.delete(oldest);
+    }
+  }
+}
+
 export function recordTurnFirstVisible(
   pool: Pool | undefined,
   warn: ((message: string, fields?: Record<string, unknown>) => void) | undefined,
-  input: { traceId: string; kind: FirstVisibleKind },
+  input: { traceId: string; kind: FirstVisibleKind; dispatchId?: string | null },
+  onSettled?: (ok: boolean) => void,
 ): void {
-  if (!pool || !/^[0-9a-f]{32}$/.test(input.traceId)) return;
-  const attempt = async (remaining: number): Promise<void> => {
-    try {
-      const result = await pool.query(
-        `UPDATE turn_traces
-            SET first_visible_at=COALESCE(first_visible_at,NOW()),
-                first_visible_kind=COALESCE(first_visible_kind,$2)
-          WHERE trace_id=$1`,
-        [input.traceId, input.kind],
-      );
-      if ((result.rowCount ?? 0) > 0 || remaining <= 0) return;
-      const timer = setTimeout(() => { void attempt(remaining - 1); }, remaining === 2 ? 50 : 250);
-      timer.unref?.();
-    } catch (err) {
-      warn?.("turn first-visible record failed", { err: String(err) });
-    }
+  if (!pool || !/^[0-9a-f]{32}$/.test(input.traceId)) {
+    onSettled?.(false);
+    return;
+  }
+  const dispatchId =
+    typeof input.dispatchId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.dispatchId)
+      ? input.dispatchId
+      : null;
+  const delays = TURN_FIRST_VISIBLE_RETRY_DELAYS_MS;
+  const attempt = (index: number): void => {
+    void pool
+      .query(
+        dispatchId
+          ? `UPDATE turn_traces
+                SET first_visible_at=COALESCE(first_visible_at,NOW()),
+                    first_visible_kind=COALESCE(first_visible_kind,$2),
+                    dispatch_id=COALESCE(dispatch_id,$3::uuid)
+              WHERE trace_id=$1`
+          : `UPDATE turn_traces
+                SET first_visible_at=COALESCE(first_visible_at,NOW()),
+                    first_visible_kind=COALESCE(first_visible_kind,$2)
+              WHERE trace_id=$1`,
+        dispatchId ? [input.traceId, input.kind, dispatchId] : [input.traceId, input.kind],
+      )
+      .then((result) => {
+        if ((result.rowCount ?? 0) > 0) {
+          onSettled?.(true);
+          return;
+        }
+        scheduleRetry(index, undefined);
+      })
+      .catch((err) => {
+        scheduleRetry(index, err);
+      });
   };
-  void attempt(2);
+  const scheduleRetry = (index: number, err: unknown | undefined): void => {
+    const next = index + 1;
+    if (next >= delays.length) {
+      warn?.("turn first-visible record failed", {
+        err: err !== undefined ? String(err) : "missed",
+        traceId: input.traceId,
+        attempts: next,
+      });
+      onSettled?.(false);
+      return;
+    }
+    const timer = setTimeout(() => attempt(next), delays[next]);
+    timer.unref?.();
+  };
+  attempt(0);
 }
 
 export function recordUpstreamPerformance(

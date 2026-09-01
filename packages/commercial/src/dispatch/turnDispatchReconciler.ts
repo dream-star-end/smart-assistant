@@ -28,7 +28,11 @@ import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBack
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
   classifyVisibleOrphan,
+  firstVisibleAtMsForDispatch,
+  shouldFenceProducer,
+  type TraceFirstVisibleRow,
 } from './visibleOrphan.js'
+import { registerProducerFence } from '../db/liveTurnFrames.js'
 import {
   casAdmittedToRejecting,
   casRejectingToAccepted,
@@ -633,6 +637,13 @@ async function finalizeOrphanDispatch(input: {
       return false
     }
     await client.query('COMMIT')
+    if (input.fence) {
+      registerProducerFence({
+        dispatchId: input.row.dispatch_id,
+        sessionId: input.row.session_id,
+        clientMessageId: input.row.client_message_id,
+      })
+    }
     return true
   } catch (err) {
     try { await client.query('ROLLBACK') } catch { /* ignore */ }
@@ -642,27 +653,107 @@ async function finalizeOrphanDispatch(input: {
   }
 }
 
+type VisibleOrphanScanRow = {
+  dispatch_id: string
+  user_id: string
+  session_id: string
+  client_message_id: string
+  status: string
+  admitted_at: Date
+  accepted_at: Date | null
+  tape_visible_at: string | null
+  tape_part_count: number | null
+  tape_id: string | null
+  tape_parts_rows: string
+  last_frame_at: Date | null
+  container_running: boolean
+}
+
+/**
+ * OCV5-57 r3 W2: one prefetch per tick instead of a correlated subquery
+ * per open dispatch. Session matching uses exact suffix (r3 W1), then
+ * firstVisibleAtMsForDispatch attributes in memory.
+ *
+ * OCV5-57 r5 W1: NULL-dispatch arm filters this page's
+ * (user_id, session_id, admitted_at) pairs in SQL (exact suffix via
+ * equality / right(), no LIKE). Each pair uses its own admitted lower
+ * bound instead of the page-wide earliest admitted_at. Do not LIMIT the
+ * result set — that would truncate liveness evidence.
+ */
+async function prefetchFirstVisibleTraces(
+  pool: Pool,
+  dispatches: VisibleOrphanScanRow[],
+): Promise<TraceFirstVisibleRow[] | null> {
+  if (dispatches.length === 0) return []
+  const dispatchIds = [...new Set(dispatches.map((d) => d.dispatch_id))]
+  const pairByKey = new Map<string, { userId: string; sessionId: string; admittedAt: Date }>()
+  for (const d of dispatches) {
+    const key = `${d.user_id}\t${d.session_id}`
+    const prev = pairByKey.get(key)
+    if (!prev || d.admitted_at < prev.admittedAt) {
+      pairByKey.set(key, { userId: d.user_id, sessionId: d.session_id, admittedAt: d.admitted_at })
+    }
+  }
+  const pairs = [...pairByKey.values()]
+  const userIds = pairs.map((p) => p.userId)
+  const sessionIds = pairs.map((p) => p.sessionId)
+  const admittedAts = pairs.map((p) => p.admittedAt)
+  try {
+    const result = await pool.query<{
+      dispatch_id: string | null
+      user_id: string
+      session_key: string
+      first_visible_at: Date | null
+    }>(
+      `SELECT -- firstVisiblePrefetch
+              tr.dispatch_id::text AS dispatch_id,
+              tr.user_id::text AS user_id,
+              tr.session_key,
+              tr.first_visible_at
+         FROM turn_traces tr
+        WHERE tr.first_visible_at IS NOT NULL
+          AND tr.dispatch_id = ANY($1::uuid[])
+        UNION ALL
+        SELECT tr.dispatch_id::text,
+               tr.user_id::text,
+               tr.session_key,
+               tr.first_visible_at
+          FROM turn_traces tr
+         WHERE tr.first_visible_at IS NOT NULL
+           AND tr.dispatch_id IS NULL
+           AND EXISTS (
+             SELECT 1
+               FROM unnest($2::bigint[], $3::text[], $4::timestamptz[])
+                 AS cand(user_id, session_id, admitted_at)
+              WHERE tr.user_id = cand.user_id
+                AND (
+                  tr.session_key = cand.session_id
+                  OR right(tr.session_key, char_length(cand.session_id) + 1)
+                     = ':' || cand.session_id
+                )
+                AND tr.first_visible_at >= cand.admitted_at
+           )`,
+      [dispatchIds, userIds, sessionIds, admittedAts],
+    )
+    return result.rows.map((row) => ({
+      dispatchId: row.dispatch_id,
+      userId: row.user_id,
+      sessionKey: row.session_key,
+      firstVisibleAtMs: row.first_visible_at ? row.first_visible_at.getTime() : null,
+    }))
+  } catch {
+    // Conservative: skip this tick rather than classify without liveness evidence.
+    return null
+  }
+}
+
 async function closeVisibleOrphans(
   deps: TurnDispatchReconcilerDeps,
   nowMs: number,
   limit: number,
 ): Promise<number> {
   const scanLimit = Math.min(200, Math.max(limit * 4, limit))
-  const queryVisible = async (offset: number) => deps.pool.query<{
-    dispatch_id: string
-    user_id: string
-    session_id: string
-    client_message_id: string
-    status: string
-    admitted_at: Date
-    accepted_at: Date | null
-    tape_visible_at: string | null
-    tape_part_count: number | null
-    tape_id: string | null
-    tape_parts_rows: string
-    last_frame_at: Date | null
-    container_running: boolean
-  }>(
+  const queryVisible = async (offset: number) => deps.pool.query<VisibleOrphanScanRow>(
     `SELECT -- closeVisibleOrphans
             d.dispatch_id, d.user_id::text AS user_id, d.session_id, d.client_message_id,
             d.status, d.admitted_at, d.accepted_at,
@@ -700,6 +791,8 @@ async function closeVisibleOrphans(
   }
   if (rows.rows.length < scanLimit) visibleOrphanScanOffset = 0
   else visibleOrphanScanOffset += rows.rows.length
+  const traces = await prefetchFirstVisibleTraces(deps.pool, rows.rows)
+  if (traces === null) return 0
   let closed = 0
   for (const row of rows.rows) {
     const action = classifyVisibleOrphan({
@@ -707,6 +800,13 @@ async function closeVisibleOrphans(
       tapePartCount: row.tape_part_count,
       tapePartsRows: Number(row.tape_parts_rows ?? '0'),
       lastFrameAtMs: row.last_frame_at ? row.last_frame_at.getTime() : null,
+      firstVisibleAtMs: firstVisibleAtMsForDispatch(traces, {
+        dispatchId: row.dispatch_id,
+        userId: row.user_id,
+        sessionId: row.session_id,
+        admittedAtMs: row.admitted_at.getTime(),
+      }),
+      persistBacklogUndetermined: false,
       acceptedOrAdmittedAtMs: (row.accepted_at ?? row.admitted_at).getTime(),
       containerRunning: row.container_running === true,
       nowMs,
@@ -756,7 +856,7 @@ async function closeVisibleOrphans(
       row,
       outcome,
       nowMs,
-      fence: action === 'fence_hard_cap',
+      fence: shouldFenceProducer(action),
       projectFallback,
       fallbackText: text,
     })

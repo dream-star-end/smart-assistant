@@ -2152,6 +2152,142 @@
           "assertion": "explicit unknown slug returns 400 DELEGATE_MODEL_UNKNOWN without a job"
         }
       ]
+    },
+    {
+      "id": "INC-20260831-VISIBLE-ORPHAN-FALSE-KILL",
+      "occurredAt": "2026-08-31",
+      "severity": "P1",
+      "symptom": "V5 selfhost 对账器 closeVisibleOrphans 在 accepted 满 15min 且 PG 无 dispatch 流帧时走 interrupt_tapeless，把 persist 积压下仍活着的引擎(已有 turn_traces.first_visible_at / thinking+text，卡在长委派)误杀成 turn interrupted (visible fallback)；且该路径不写 producer_fenced_at，僵尸 producer 继续跑。实锤 dispatch 89f18ffe-c2a8-4412-9ce8-97c69f17ef22。",
+      "rootFixCommit": "19e9d471",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "skip live engine with first_visible but zero dispatch frames (OCV5-57 89f18ffe)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "interrupt_tapeless when engine never emitted a frame even with container running"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "fence_hard_cap still fires at 6h even with first_visible and zero frames"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "scan must select first_visible_at"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "OCV5-43 hydrate-dead engine attempts interrupt fence even if CAS misses"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "OCV5-57 first_visible plus zero dispatch frames skips and does not fence"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-visible-orphan-liveness.ts",
+          "assertion": "OCV5-57: first_visible + zero dispatch frames must skip interrupt_tapeless"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "dispatch_id NULL but same-turn first_visible still matches"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "another turn first_visible does not match this dispatch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveTurnFrames.producerFence.test.ts",
+          "assertion": "register then drop persist and forward for same clientMessageId"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "interrupt fence COMMIT writes producer_fenced_at and terminal together"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/ws/__tests__/turnTraces.test.ts",
+          "assertion": "retries on failure then succeeds without blocking the caller"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "overlapping admits share a late first_visible (auditor A@1000 B@2000 vis@3000)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveTurnFrames.producerFence.test.ts",
+          "assertion": "fenced manual_reconcile still drops after registry clear (restart)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnFirstVisible.test.ts",
+          "assertion": "writes dispatch_id in the same UPDATE when provided"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "container stamped frame with fenced clientMessageId never reaches user websocket"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnFirstVisible.test.ts",
+          "assertion": "first reject then success writes first_visible and onSettled(true)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnFirstVisible.test.ts",
+          "assertion": "continuous failure is bounded to 3 attempts and onSettled(false)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnFirstVisible.test.ts",
+          "assertion": "does not permanently suppress until persist succeeds"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/ws/__tests__/turnTraces.test.ts",
+          "assertion": "insert 首次 reject 随后成功 → 最终落库且不 warn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "session_id containing underscore does not LIKE-match a sibling (OCV5-57 r3 W1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "SQL prefetches turn_traces first_visible_at without LIKE or per-row subquery"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "first reject then a later visible frame writes first_visible"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "continuous failure is bounded and does not query on every frame"
+        }
+      ],
+      "coverageCommits": [
+        "3e80a4a7",
+        "568fb53b",
+        "1c7e4aae",
+        "2295a322",
+        "bfcc174e"
+      ]
     }
   ]
 }

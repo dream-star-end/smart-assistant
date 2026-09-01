@@ -23,6 +23,113 @@ import {
   upsertLiveUnitCheckpoint,
 } from "./liveUnitCheckpoints.js";
 
+/** OCV5-57 audit r1 B3: in-process producer fence + terminal cache. */
+export const PRODUCER_FENCE_TTL_MS = 6 * 60 * 60_000;
+export const PRODUCER_FENCE_CAP = 4096;
+const PRODUCER_FENCE_LOG_EVERY_MS = 30_000;
+
+type ProducerFenceEntry = { expiresAtMs: number };
+const producerFences = new Map<string, ProducerFenceEntry>();
+let producerFenceDropCount = 0;
+let lastProducerFenceDropLogMs = 0;
+
+function fenceKeyDispatch(dispatchId: string): string {
+  return `d:${dispatchId}`;
+}
+function fenceKeyCmid(sessionId: string, clientMessageId: string): string {
+  return `c:${sessionId}:${clientMessageId}`;
+}
+
+function pruneProducerFences(nowMs: number): void {
+  for (const [key, entry] of producerFences) {
+    if (entry.expiresAtMs <= nowMs) producerFences.delete(key);
+  }
+  while (producerFences.size > PRODUCER_FENCE_CAP) {
+    const oldest = producerFences.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    producerFences.delete(oldest);
+  }
+}
+
+export function registerProducerFence(input: {
+  dispatchId: string;
+  sessionId: string;
+  clientMessageId: string;
+  nowMs?: number;
+}): void {
+  const nowMs = input.nowMs ?? Date.now();
+  pruneProducerFences(nowMs);
+  const entry = { expiresAtMs: nowMs + PRODUCER_FENCE_TTL_MS };
+  const keys = [fenceKeyDispatch(input.dispatchId)];
+  if (input.sessionId && input.clientMessageId) {
+    keys.push(fenceKeyCmid(input.sessionId, input.clientMessageId));
+  }
+  for (const key of keys) {
+    producerFences.delete(key);
+    producerFences.set(key, entry);
+  }
+  pruneProducerFences(nowMs);
+}
+
+export function isProducerFenced(input: {
+  dispatchId?: string | null;
+  sessionId?: string | null;
+  clientMessageId?: string | null;
+  nowMs?: number;
+}): boolean {
+  const nowMs = input.nowMs ?? Date.now();
+  const keys: string[] = [];
+  if (input.dispatchId) keys.push(fenceKeyDispatch(input.dispatchId));
+  if (input.sessionId && input.clientMessageId) {
+    keys.push(fenceKeyCmid(input.sessionId, input.clientMessageId));
+  }
+  for (const key of keys) {
+    const entry = producerFences.get(key);
+    if (!entry) continue;
+    if (entry.expiresAtMs <= nowMs) {
+      producerFences.delete(key);
+      continue;
+    }
+    producerFences.delete(key);
+    producerFences.set(key, entry);
+    return true;
+  }
+  return false;
+}
+
+export function shouldForwardLiveFrameToBrowser(input: {
+  dispatchId?: string | null;
+  sessionId?: string | null;
+  clientMessageId?: string | null;
+}): boolean {
+  return !isProducerFenced(input);
+}
+
+export function noteProducerFenceDrop(source: string): void {
+  producerFenceDropCount += 1;
+  const nowMs = Date.now();
+  if (nowMs - lastProducerFenceDropLogMs < PRODUCER_FENCE_LOG_EVERY_MS) return;
+  lastProducerFenceDropLogMs = nowMs;
+  console.warn(
+    `[producer-fence] dropped leftover frames source=${source} count=${producerFenceDropCount}`,
+  );
+}
+
+export function resetProducerFenceForTests(): void {
+  producerFences.clear();
+  producerFenceDropCount = 0;
+  lastProducerFenceDropLogMs = 0;
+}
+
+export function producerFenceSizeForTests(): number {
+  return producerFences.size;
+}
+
+export function producerFenceDropCountForTests(): number {
+  return producerFenceDropCount;
+}
+
+
 export interface PersistGatewayLiveFrameInput {
   uid: bigint;
   sessionId: string;
@@ -122,6 +229,13 @@ export async function persistGatewayLiveFrame(
   if (!Number.isSafeInteger(input.frameSeq) || input.frameSeq <= 0) {
     throw new TypeError("invalid frameSeq");
   }
+  if (isProducerFenced({
+    sessionId: input.sessionId,
+    clientMessageId: input.clientMessageId,
+  })) {
+    noteProducerFenceDrop("persist-memory");
+    return;
+  }
   const payload = Buffer.from(input.payload, "utf8");
   const payloadSha256 = sha256(payload);
   const sessionUserId = `c:${input.uid.toString()}`;
@@ -136,14 +250,32 @@ export async function persistGatewayLiveFrame(
     const dispatch = input.clientMessageId === null
       ? null
       : (
-          await client.query<{ dispatch_id: string; attempt_no: number }>(
-            `SELECT dispatch_id::text,attempt_no
+          await client.query<{
+            dispatch_id: string;
+            attempt_no: number;
+            status: string;
+            producer_fenced_at: Date | null;
+          }>(
+            `SELECT dispatch_id::text,attempt_no,status,producer_fenced_at
                FROM turn_dispatches
               WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3
               FOR UPDATE`,
             [input.uid.toString(), input.sessionId, input.clientMessageId],
           )
         ).rows[0] ?? null;
+    if (
+      dispatch !== null &&
+      dispatch.producer_fenced_at != null &&
+      input.clientMessageId !== null
+    ) {
+      registerProducerFence({
+        dispatchId: dispatch.dispatch_id,
+        sessionId: input.sessionId,
+        clientMessageId: input.clientMessageId,
+      });
+      noteProducerFenceDrop("persist-pg");
+      return { streamKey: `dispatch:${dispatch.dispatch_id}:${dispatch.attempt_no}`, live: false };
+    }
     const streamKey = dispatch
       ? `dispatch:${dispatch.dispatch_id}:${dispatch.attempt_no}`
       : `legacy:${input.agentContainerId}:${input.sessionKey}`;

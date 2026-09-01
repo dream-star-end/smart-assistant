@@ -9,6 +9,10 @@ import { describe, test } from 'node:test'
 
 import type { Pool } from 'pg'
 import {
+  isProducerFenced,
+  resetProducerFenceForTests,
+} from '../db/liveTurnFrames.js'
+import {
   assessDispatchBilling,
   buildTurnDispatchReconcileFrame,
   DEFAULT_ACCEPTED_STUCK_FLOOR_MS,
@@ -65,18 +69,22 @@ interface Canned {
   openAged?: Raw[]
   openSessionGone?: Raw[]
   visibleOrphans?: Raw[]
+  firstVisibleTraces?: Raw[]
   casToTerminalMiss?: boolean
 }
 
 function makeFakePool(canned: Canned) {
   const writes: string[] = []
   const writeParams: unknown[][] = []
+  const queries: string[] = []
   // accepted 扫描的 SQL 时间参数捕获(Codex R1 MAJOR 回归锁:扫描下限必须是
   // ACCEPTED_UNREACHABLE_ALERT_MS 而非 stuckMs,否则求证瘫痪要等 90min+ 才首告)。
   const acceptedScanCutoffs: Date[] = []
   let txDepth = 0
   let txBuf: string[] = []
+  const attemptedWrites: string[] = []
   const recordWrite = (s: string) => {
+    attemptedWrites.push(s)
     if (txDepth > 0) txBuf.push(s)
     else writes.push(s)
   }
@@ -85,6 +93,7 @@ function makeFakePool(canned: Canned) {
   // 故 fake 必须提供 connect() + 事务 client。
   const route = (sql: string, params?: unknown[]) => {
     const s = sql.replace(/\s+/g, ' ')
+    queries.push(s)
     if (s === 'BEGIN') {
       txDepth += 1
       txBuf = []
@@ -135,6 +144,22 @@ function makeFakePool(canned: Canned) {
       if (params?.[0] instanceof Date) acceptedScanCutoffs.push(params[0] as Date)
       return { rows: canned.acceptedStuck ?? [], rowCount: (canned.acceptedStuck ?? []).length }
     }
+    if (s.includes('-- firstVisiblePrefetch')) {
+      if (canned.firstVisibleTraces) {
+        return { rows: canned.firstVisibleTraces, rowCount: canned.firstVisibleTraces.length }
+      }
+      const traces = (canned.visibleOrphans ?? [])
+        .filter((row) => row.first_visible_at)
+        .map((row) => ({
+          dispatch_id: row.dispatch_id,
+          user_id: row.user_id,
+          session_key: typeof row.session_id === 'string'
+            ? `agent:main:webchat:dm:${row.session_id}`
+            : String(row.session_id ?? ''),
+          first_visible_at: row.first_visible_at,
+        }))
+      return { rows: traces, rowCount: traces.length }
+    }
     // rev2 closeVisibleOrphans must win before session-gone: its SQL joins
     // client_session_turn_tapes (substring of client_sessions).
     if (s.includes('-- closeVisibleOrphans')) {
@@ -159,6 +184,8 @@ function makeFakePool(canned: Canned) {
     },
     writes,
     writeParams,
+    queries,
+    attemptedWrites,
     acceptedScanCutoffs,
   }
   return pool
@@ -1064,6 +1091,7 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       tape_id: null,
       tape_parts_rows: '0',
       last_frame_at: new Date(nowMs - 10 * 60_000),
+      first_visible_at: null,
       container_running: false,
       ...over,
     }
@@ -1155,4 +1183,228 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.ok(!pool.writes.includes('COMMIT'))
     assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')))
   })
+
+  test("SQL prefetches turn_traces first_visible_at without LIKE or per-row subquery", async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        last_frame_at: new Date(nowMs),
+        admitted_at: new Date(nowMs),
+        accepted_at: new Date(nowMs),
+        container_running: true,
+      })],
+    })
+    await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    const scan = pool.queries.find((query) => query.includes("-- closeVisibleOrphans") && !query.includes("lock"))
+    const prefetch = pool.queries.find((query) => query.includes("-- firstVisiblePrefetch"))
+    assert.ok(scan, "closeVisibleOrphans scan SQL must run")
+    assert.ok(prefetch, "firstVisiblePrefetch SQL must run")
+    assert.equal(scan.includes("turn_traces"), false, "scan must not correlate turn_traces")
+    assert.equal(/LIKE/i.test(scan), false)
+    assert.ok(prefetch.includes("turn_traces"), "prefetch must read turn_traces")
+    assert.ok(prefetch.includes("first_visible_at"), "scan must select first_visible_at")
+    assert.ok(prefetch.includes("dispatch_id IS NULL"), "prefetch includes NULL-dispatch fallback")
+    assert.ok(prefetch.includes("session_key"), "prefetch matches session_key")
+    assert.ok(prefetch.includes("UNION ALL"), "prefetch is one-shot UNION, not per-row subquery")
+    assert.equal(/LIKE/i.test(prefetch), false, "prefetch must not use LIKE wildcards")
+    assert.ok(prefetch.includes("unnest("), "NULL-dispatch arm binds this page's candidate pairs")
+    assert.ok(prefetch.includes("right("), "NULL-dispatch arm uses exact suffix via right(), not LIKE")
+    assert.ok(
+      prefetch.includes("char_length(cand.session_id) + 1"),
+      "suffix length is ':' + session_id, matching visibleOrphan endsWith",
+    )
+  })
+
+  test("OCV5-43 hydrate-dead engine attempts interrupt fence even if CAS misses", async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: "0",
+        last_frame_at: null,
+        first_visible_at: null,
+        admitted_at: new Date(nowMs - 15 * 60_000),
+        accepted_at: new Date(nowMs - 15 * 60_000),
+        container_running: true,
+      })],
+      casToTerminalMiss: true,
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 0)
+    assert.ok(pool.writes.includes("ROLLBACK"))
+    assert.ok(!pool.writes.includes("COMMIT"))
+    assert.ok(
+      pool.attemptedWrites.some((sql) => sql.includes("producer_fenced_at")),
+      "interrupt_tapeless must attempt producer fence",
+    )
+  })
+
+  test("OCV5-57 first_visible plus zero dispatch frames skips and does not fence", async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: "0",
+        last_frame_at: null,
+        first_visible_at: new Date(nowMs - 14 * 60_000),
+        admitted_at: new Date(nowMs - 15 * 60_000),
+        accepted_at: new Date(nowMs - 15 * 60_000),
+        container_running: true,
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 0)
+    assert.ok(!pool.writes.includes("COMMIT"))
+    assert.ok(!pool.writes.some((sql) => sql.includes("producer_fenced_at")))
+    assert.ok(!pool.writes.some((sql) => sql.includes("visible-fallback")))
+  })
+
+  test("interrupt fence COMMIT writes producer_fenced_at and terminal together", async () => {
+    resetProducerFenceForTests()
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: "tape-present",
+        tape_part_count: 3,
+        tape_parts_rows: "1",
+        last_frame_at: null,
+        first_visible_at: null,
+        admitted_at: new Date(nowMs - 15 * 60_000),
+        accepted_at: new Date(nowMs - 15 * 60_000),
+        container_running: true,
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 1)
+    assert.ok(pool.writes.includes("COMMIT"))
+    assert.ok(pool.writes.some((sql) => sql.includes("producer_fenced_at")))
+    assert.ok(pool.writes.some((sql) => sql.includes("status = 'terminal'")))
+    assert.equal(
+      pool.writes.indexOf("COMMIT") >
+        Math.max(
+          pool.writes.findIndex((sql) => sql.includes("producer_fenced_at")),
+          pool.writes.findIndex((sql) => sql.includes("status = 'terminal'")),
+        ),
+      true,
+    )
+    assert.equal(isProducerFenced({
+      dispatchId: "d-vis-1",
+      sessionId: "sess-vis",
+      clientMessageId: "cm-vis",
+    }), true)
+  })
+
+
+  test("overlapping admits: late first_visible skips both A and B", async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [
+        orphanRow({
+          dispatch_id: "disp-a",
+          last_frame_at: null,
+          first_visible_at: new Date(nowMs - 12 * 60_000),
+          admitted_at: new Date(nowMs - 15 * 60_000),
+          accepted_at: new Date(nowMs - 15 * 60_000),
+          container_running: true,
+        }),
+        orphanRow({
+          dispatch_id: "disp-b",
+          last_frame_at: null,
+          first_visible_at: new Date(nowMs - 12 * 60_000),
+          admitted_at: new Date(nowMs - 13 * 60_000),
+          accepted_at: new Date(nowMs - 13 * 60_000),
+          container_running: true,
+        }),
+      ],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 0)
+    assert.ok(!pool.writes.includes("COMMIT"))
+  })
+
+  test("session_id underscore does not steal a sibling NULL-dispatch first_visible", async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        dispatch_id: "disp-under",
+        session_id: "sess_001",
+        last_frame_at: null,
+        first_visible_at: null,
+        admitted_at: new Date(nowMs - 15 * 60_000),
+        accepted_at: new Date(nowMs - 15 * 60_000),
+        container_running: true,
+      })],
+      firstVisibleTraces: [{
+        dispatch_id: null,
+        user_id: "42",
+        session_key: "agent:main:webchat:dm:sessX001",
+        first_visible_at: new Date(nowMs - 12 * 60_000),
+      }],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 1, "LIKE '_' must not credit sibling sessX001")
+    assert.ok(pool.writes.some((sql) => sql.includes("producer_fenced_at")))
+  })
+
+  test("exact session_key suffix with underscore is still credited", async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        dispatch_id: "disp-under-hit",
+        session_id: "sess_001",
+        last_frame_at: null,
+        first_visible_at: null,
+        admitted_at: new Date(nowMs - 15 * 60_000),
+        accepted_at: new Date(nowMs - 15 * 60_000),
+        container_running: true,
+      })],
+      firstVisibleTraces: [{
+        dispatch_id: null,
+        user_id: "42",
+        session_key: "agent:main:webchat:dm:sess_001",
+        first_visible_at: new Date(nowMs - 12 * 60_000),
+      }],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 0)
+    assert.ok(!pool.writes.includes("COMMIT"))
+  })
+
 })

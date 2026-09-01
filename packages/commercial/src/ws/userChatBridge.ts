@@ -50,6 +50,7 @@ import type { Logger } from "../logging/logger.js";
 import { recordTurnTrace, updateTurnTraceDispatch } from "./turnTraces.js";
 import {
   extractFirstVisibleAttribution,
+  FirstVisiblePersistGate,
   recordTurnFirstVisible,
   TurnResponseMilestoneTracker,
 } from "./turnPerformance.js";
@@ -163,6 +164,8 @@ import {
   HELLO_LIVE_CATCHUP_MAX_BYTES,
   liveCatchupSendDecision,
   readOpenDispatchLiveFramePayloadsAfterSeq,
+  noteProducerFenceDrop,
+  shouldForwardLiveFrameToBrowser,
 } from "../db/liveTurnFrames.js";
 import {
   admitDurableControl,
@@ -2772,7 +2775,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // - 守卫 firstUserFrameAtMs !== null 是防御"容器在用户发帧前主动 push"导致负值
     let firstUserFrameAtMs: number | null = null;
     let firstContainerFrameAtMs: number | null = null;
-    const firstVisibleTraceIds = new Set<string>();
+    const firstVisiblePersist = new FirstVisiblePersistGate();
     const responseMilestoneTracker = new TurnResponseMilestoneTracker();
     const ttftKind: "cold" | "warm" = endpoint.coldStart === true ? "cold" : "warm";
     // plan v3 review v1 §F4 follow-up:per-bridge 最后一次"用户主动声明"的 modelId。
@@ -7734,18 +7737,29 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // Engine-neutral first-visible boundary: ignore ACK/status/billing/attestation and
       // stop the clock only when an outbound.message contains a user-visible block.
       const firstVisible = extractFirstVisibleAttribution(parsedMasterFrameCandidate);
-      if (firstVisible && !firstVisibleTraceIds.has(firstVisible.traceId)) {
-        if (firstVisibleTraceIds.size >= 512) firstVisibleTraceIds.clear();
-        firstVisibleTraceIds.add(firstVisible.traceId);
+      if (firstVisible) {
         if (firstContainerFrameAtMs === null && firstUserFrameAtMs !== null) {
           firstContainerFrameAtMs = Date.now();
           metrics.onTtft?.(uid, ttftKind, (firstContainerFrameAtMs - firstUserFrameAtMs) / 1000);
         }
-        recordTurnFirstVisible(
-          deps.pgPool,
-          (message, fields) => bridgeLog?.warn(message, fields),
-          firstVisible,
-        );
+        if (deps.pgPool && firstVisiblePersist.begin(firstVisible.traceId)) {
+          let firstVisibleDispatchId: string | null = null;
+          if (parsedMasterFrameCandidate && typeof parsedMasterFrameCandidate === "object") {
+            const cmid = (parsedMasterFrameCandidate as { clientMessageId?: unknown }).clientMessageId;
+            if (isClientMessageId(cmid)) {
+              firstVisibleDispatchId =
+                admittedDispatches.get(cmid)?.dispatchId
+                ?? enrichmentDispatches.get(cmid)?.record.dispatchId
+                ?? null;
+            }
+          }
+          recordTurnFirstVisible(
+            deps.pgPool,
+            (message, fields) => bridgeLog?.warn(message, fields),
+            { ...firstVisible, dispatchId: firstVisibleDispatchId },
+            (ok) => firstVisiblePersist.settle(firstVisible.traceId, ok),
+          );
+        }
       }
       responseMilestoneTracker.observe(
         parsedMasterFrameCandidate,
@@ -7908,6 +7922,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       }
       const forwardCommittedFrame = (): void => {
+        if (!shouldForwardLiveFrameToBrowser({
+          sessionId: durableStampedFrame?.sessionId ?? null,
+          clientMessageId: durableStampedFrame?.clientMessageId ?? null,
+        })) {
+          noteProducerFenceDrop("bridge-forward");
+          return;
+        }
+
         if (
           durableStampedFrame !== null
           && durableStampedFrame.clientMessageId === null
@@ -7974,6 +7996,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         deps.persistOutboundFrame
       ) {
         const stamped = durableStampedFrame;
+        if (!shouldForwardLiveFrameToBrowser({
+          sessionId: durableSessionId,
+          clientMessageId: stamped.clientMessageId,
+        })) {
+          noteProducerFenceDrop("bridge-enqueue");
+          return;
+        }
         // Fallback for old/non-browser peers that produce stamped output before
         // sending an inbound.hello subscription.
         retainOutboundPersistQueueKey(stamped.storeKey);
