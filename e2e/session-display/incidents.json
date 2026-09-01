@@ -2363,6 +2363,16 @@
         },
         {
           "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "mixed tool JSON and fabricated result is corrected to structured tool_use without leaking raw text"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerResumeMap.test.ts",
+          "assertion": "Cursor Sand resume ids validate against CCB JSONL instead of Cursor workspace store"
+        },
+        {
+          "layer": "unit",
           "path": "packages/commercial/src/account-pool/cursorQuota.test.ts",
           "assertion": "stable account identity never reinterprets an old slot after pool compaction"
         },
@@ -2383,7 +2393,9 @@
         "5834df20",
         "4c423197",
         "42c51537",
-        "9cc8dedc"
+        "9cc8dedc",
+        "cd25a50a",
+        "cd7ec21d"
       ]
     }
   ]
