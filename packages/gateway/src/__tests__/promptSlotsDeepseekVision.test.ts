@@ -72,4 +72,18 @@ describe('buildAgentsSlot 纯文本模型 vision hint(oc-vision CLI)', () => {
     assert.doesNotMatch(slot.content, /图片理解提示/)
     assert.doesNotMatch(slot.content, /oc-vision/)
   })
+
+  it('cursor-fable-5.1-high + catalog supportsVision=false 不声称看不到图,先 Read 再 oc-vision', async () => {
+    const slot = await buildAgentsSlot({
+      agentId: 'main',
+      provider: 'cursor',
+      model: 'cursor-fable-5.1-high',
+      modelSupportsVision: false,
+    })
+    assert.doesNotMatch(slot.content, /当前模型按纯文本接入、看不到图/)
+    assert.doesNotMatch(slot.content, /## 图片理解提示/)
+    assert.doesNotMatch(slot.content, /GPT\/Codex 图片理解提示/)
+    assert.match(slot.content, /先用 Read 工具读图/)
+    assert.match(slot.content, /oc-vision understand/)
+  })
 })

@@ -5,8 +5,11 @@ import {
   computePaintRange,
   createRowGeometryWarmup,
   indexAtOffsetPx,
+  measureMountedRowHeight,
   measureRevealedSlice,
+  paintRangeCoversViewport,
   revealWarmupSlice,
+  selectPaintRange,
 } from "./timelinePaint";
 
 function keys(count: number): string[] {
@@ -85,6 +88,156 @@ describe("computePaintRange prefix sums", () => {
     expect(range.start).toBeGreaterThan(0);
     expect(range.start).toBeLessThan(20);
     expect(range.end - range.start).toBeGreaterThanOrEqual(PAINT_MIN_ITEMS);
+  });
+
+  test("pinStart keeps the in-flight user row mounted when it is near the paint window", () => {
+    const ids = keys(80);
+    const heights = new Map<string, number>(ids.map((id) => [id, 200]));
+    const range = computePaintRange({
+      count: 80,
+      scrollTop: 14_000,
+      clientHeight: 600,
+      followBottom: true,
+      keyAt: keyAt(ids),
+      heights,
+      pinStart: 60,
+    });
+    expect(range.end).toBe(80);
+    expect(range.start).toBeLessThanOrEqual(60);
+    expect(range.start).toBe(60);
+  });
+
+  test("C: sending 但用户在顶部时，远处 pin 不把画窗 union 到 lastUser", () => {
+    const ids = keys(300);
+    const heights = new Map<string, number>();
+    const base = computePaintRange({
+      count: 300,
+      scrollTop: 0,
+      clientHeight: 600,
+      followBottom: false,
+      keyAt: keyAt(ids),
+      heights,
+    });
+    const pinned = computePaintRange({
+      count: 300,
+      scrollTop: 0,
+      clientHeight: 600,
+      followBottom: false,
+      keyAt: keyAt(ids),
+      heights,
+      pinStart: 280,
+    });
+    expect(pinned.start).toBe(base.start);
+    expect(pinned.end).toBe(base.end);
+    expect(pinned.end).toBeLessThanOrEqual(base.end + PAINT_MIN_ITEMS);
+  });
+
+  test("E: 不传 pinStart 时贴底画窗不钉上轮 user", () => {
+    const ids = keys(80);
+    const heights = new Map<string, number>(ids.map((id) => [id, 200]));
+    const idle = computePaintRange({
+      count: 80,
+      scrollTop: 14_000,
+      clientHeight: 600,
+      followBottom: true,
+      keyAt: keyAt(ids),
+      heights,
+    });
+    const wouldPin = computePaintRange({
+      count: 80,
+      scrollTop: 14_000,
+      clientHeight: 600,
+      followBottom: true,
+      keyAt: keyAt(ids),
+      heights,
+      pinStart: 20,
+    });
+    expect(idle.end).toBe(80);
+    expect(idle.start).toBeGreaterThan(20);
+    expect(wouldPin.start).toBe(idle.start);
+    expect(wouldPin.end).toBe(idle.end);
+  });
+
+  test("viewport coverage is false when the painted span sits in a spacer below the view", () => {
+    const ids = keys(81);
+    const heights = new Map<string, number>();
+    expect(paintRangeCoversViewport({
+      start: 0,
+      end: 80,
+      count: 81,
+      scrollTop: 15_600,
+      clientHeight: 600,
+      keyAt: keyAt(ids),
+      heights,
+    })).toBe(false);
+    expect(paintRangeCoversViewport({
+      start: 69,
+      end: 81,
+      count: 81,
+      scrollTop: 15_600,
+      clientHeight: 600,
+      keyAt: keyAt(ids),
+      heights,
+    })).toBe(true);
+  });
+
+  test("selectPaintRange absorbs tail append instead of leaving the new row in the spacer", () => {
+    const ids = keys(81);
+    const heights = new Map<string, number>();
+    const chosen = selectPaintRange({
+      prev: { start: 55, end: 80 },
+      next: { start: 56, end: 81 },
+      followBottom: false,
+      count: 81,
+      scrollTop: 15_600,
+      clientHeight: 600,
+      keyAt: keyAt(ids),
+      heights,
+      pinStart: 80,
+    });
+    expect(chosen.end).toBe(81);
+    expect(chosen.start).toBeLessThanOrEqual(80);
+  });
+
+  test("D: pin 不生效时近底 append 仍吸收 end，结果含新 user 下标 80", () => {
+    const ids = keys(81);
+    const heights = new Map<string, number>();
+    const next = computePaintRange({
+      count: 81,
+      scrollTop: 15_600,
+      clientHeight: 600,
+      followBottom: false,
+      keyAt: keyAt(ids),
+      heights,
+    });
+    const chosen = selectPaintRange({
+      prev: { start: 68, end: 80 },
+      next,
+      followBottom: false,
+      count: 81,
+      scrollTop: 15_600,
+      clientHeight: 600,
+      keyAt: keyAt(ids),
+      heights,
+    });
+    expect(chosen.end).toBeGreaterThan(80);
+    expect(chosen.start).toBeLessThanOrEqual(80);
+  });
+
+  test("hysteresis still holds when the previous window covers the viewport", () => {
+    const ids = keys(80);
+    const heights = new Map<string, number>();
+    const chosen = selectPaintRange({
+      prev: { start: 20, end: 50 },
+      next: { start: 21, end: 51 },
+      followBottom: false,
+      count: 80,
+      scrollTop: 6_000,
+      clientHeight: 600,
+      keyAt: keyAt(ids),
+      heights,
+    });
+    expect(chosen).toEqual({ start: 20, end: 51 });
   });
 });
 
@@ -222,5 +375,22 @@ describe("idle row-geometry warmup", () => {
 
   test("fallback estimate is the documented 200px", () => {
     expect(PAINT_ESTIMATE_PX).toBe(200);
+  });
+
+  test("skipped content-visibility rows do not enter the height cache", () => {
+    const skipped = {
+      offsetHeight: PAINT_ESTIMATE_PX,
+      checkVisibility: ({ contentVisibilityAuto }: { contentVisibilityAuto?: boolean }) => {
+        expect(contentVisibilityAuto).toBe(true);
+        return false;
+      },
+    } as unknown as HTMLElement;
+    expect(measureMountedRowHeight(skipped)).toBeNull();
+
+    const relevant = {
+      offsetHeight: 480,
+      checkVisibility: () => true,
+    } as unknown as HTMLElement;
+    expect(measureMountedRowHeight(relevant)).toBe(480);
   });
 });

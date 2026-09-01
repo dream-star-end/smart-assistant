@@ -582,8 +582,10 @@ import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
   OPENCLAUDE_VISION_TOOLS,
+  isTextOnlyDefinite,
   shouldEnableOpenClaudeVision,
 } from './mcpVisionServer.js'
+import { buildImageAttachmentHint } from './imageAttachmentHint.js'
 import {
   AUTO_DREAM_PROPOSAL_JSON_SCHEMA,
   AutoDreamService,
@@ -18643,22 +18645,23 @@ export class Gateway {
       const lines = [text]
 
       if (images.length > 0) {
-        lines.push('', '---', '用户附带了以下图片(已保存到服务器本地):')
-        for (const ip of images) {
-          lines.push(`- \`${ip.path}\` (${ip.mimeType}, ${ip.sizeHint}, 原名: ${ip.name})`)
-        }
-        lines.push('')
-        lines.push('如果需要看图片内容,按以下顺序尝试:')
-        let step = 1
-        if (hasUnderstandImage) {
-          lines.push(
-            `${step}. 优先用 Bash 调 \`oc-vision understand <图片本地绝对路径> --prompt "<问题>"\` 命令识图(纯文本模型看不到图时的兜底;细节见 \`skill_view("oc-vision")\`)。`,
-          )
-          step++
-        }
-        lines.push(`${step}. 用 Read 工具读图片路径(原生多模态 provider 会直接看到图像)。`)
-        step++
-        lines.push(`${step}. 如果都不可用,告诉用户当前 provider 不支持图片识别。`)
+        lines.push(
+          '',
+          '---',
+          buildImageAttachmentHint({
+            paths: images.map((ip) => ({
+              path: ip.path,
+              mimeType: ip.mimeType,
+              sizeHint: ip.sizeHint,
+              name: ip.name,
+            })),
+            textOnlyDefinite: isTextOnlyDefinite(
+              effectiveAgent?.provider ?? this.deps.config.provider,
+              safeModel,
+            ),
+            hasUnderstandImage,
+          }),
+        )
       }
 
       if (audios.length > 0) {

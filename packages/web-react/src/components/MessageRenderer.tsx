@@ -39,9 +39,10 @@ import {
   PAINT_MIN_ITEMS,
   computePaintRange,
   createRowGeometryWarmup,
+  measureMountedRowHeight,
   measuredRangePx,
-  paintRangeSettled,
   paintWindowEnabled,
+  selectPaintRange,
 } from "../lib/chat/timelinePaint";
 import { prefetchMarkdownImpl } from "./Markdown";
 import {
@@ -936,6 +937,14 @@ function renderItemKey(item: RenderItem): string {
     : item.members[0]?._timelineUnitKey ?? item.members[0]?.id ?? item.kind;
 }
 
+function lastUserItemIndex(items: RenderItem[]): number {
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const item = items[i];
+    if (item?.kind === "single" && item.m.role === "user") return i;
+  }
+  return -1;
+}
+
 function isNonEmptyId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
@@ -1050,6 +1059,7 @@ export function MessageList({
   const eagerMediaKeysRef = useRef<Set<string> | null>(null);
   const lastViewportAnchorRef = useRef<VisibleVirtualRowAnchor | null>(null);
   const lastPaintSpanRef = useRef({ start: -1, end: -1 });
+  const pinStartRef = useRef<number | undefined>(undefined);
   const beginViewportPreserve = () => {
     viewportPreserveLockRef.current = true;
     const follow = followBottomRefBox.current;
@@ -1216,15 +1226,27 @@ export function MessageList({
       const count = visibleCountRef.current;
       if (!paintWindowEnabled(el, count)) return;
       const keys = visibleKeysRef.current;
+      const followBottom = followBottomRefBox.current?.current === true;
       const next = computePaintRange({
         count,
         scrollTop: el.scrollTop,
         clientHeight: el.clientHeight,
-        followBottom: followBottomRefBox.current?.current === true,
+        followBottom,
         keyAt: (index) => keys[index] ?? "",
         heights: rowHeightCacheRef.current,
+        pinStart: pinStartRef.current,
       });
-      setPaintRange((prev) => (paintRangeSettled(prev, next) ? prev : next));
+      setPaintRange((prev) => selectPaintRange({
+        prev,
+        next,
+        followBottom,
+        count,
+        scrollTop: el.scrollTop,
+        clientHeight: el.clientHeight,
+        keyAt: (index) => keys[index] ?? "",
+        heights: rowHeightCacheRef.current,
+        pinStart: pinStartRef.current,
+      }));
     };
     const onScroll = () => {
       lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(el);
@@ -1238,7 +1260,7 @@ export function MessageList({
       el.removeEventListener("scroll", onScroll);
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [scrollParent, windowVersion, sessionId]);
+  }, [scrollParent, windowVersion, sessionId, messages.length]);
 
   useEffect(() => {
     if (!scrollParent) return;
@@ -1491,24 +1513,38 @@ export function MessageList({
   const paintOn = paintWindowEnabled(scrollParent, visibleItems.length)
     && !archive?.loading
     && !archiveQueued;
+  const lastUserVisible = lastUserItemIndex(visibleItems);
+  const pinPaintStart = sending && lastUserVisible >= 0
+    ? lastUserVisible
+    : undefined;
+  pinStartRef.current = pinPaintStart;
   let paintStart = 0;
   let paintEnd = visibleItems.length;
   if (paintOn && scrollParent) {
-    if (followBottomRef?.current) {
-      const next = computePaintRange({
-        count: visibleItems.length,
-        scrollTop: scrollParent.scrollTop,
-        clientHeight: scrollParent.clientHeight,
-        followBottom: true,
-        keyAt: (index) => itemKey(visibleItems[index]),
-        heights: rowHeightCacheRef.current,
-      });
-      paintStart = next.start;
-      paintEnd = next.end;
-    } else {
-      paintStart = Math.min(paintRange.start, Math.max(0, visibleItems.length - PAINT_MIN_ITEMS));
-      paintEnd = Math.min(visibleItems.length, Math.max(paintRange.end, paintStart + PAINT_MIN_ITEMS));
-    }
+    const followBottom = followBottomRef?.current === true;
+    const keyAt = (index: number) => itemKey(visibleItems[index]);
+    const desired = computePaintRange({
+      count: visibleItems.length,
+      scrollTop: scrollParent.scrollTop,
+      clientHeight: scrollParent.clientHeight,
+      followBottom,
+      keyAt,
+      heights: rowHeightCacheRef.current,
+      pinStart: pinPaintStart,
+    });
+    const chosen = selectPaintRange({
+      prev: paintRange,
+      next: desired,
+      followBottom,
+      count: visibleItems.length,
+      scrollTop: scrollParent.scrollTop,
+      clientHeight: scrollParent.clientHeight,
+      keyAt,
+      heights: rowHeightCacheRef.current,
+      pinStart: pinPaintStart,
+    });
+    paintStart = chosen.start;
+    paintEnd = chosen.end;
   }
   const paintedItems = visibleItems.slice(paintStart, paintEnd);
   const topSpacerPx = paintStart > 0
@@ -1522,8 +1558,8 @@ export function MessageList({
     if (root) {
       for (const row of root.querySelectorAll<HTMLElement>("[data-chat-virtual-key]")) {
         const key = row.getAttribute("data-chat-virtual-key");
-        const height = row.offsetHeight;
-        if (key && height > 0) rowHeightCacheRef.current.set(key, height);
+        const height = measureMountedRowHeight(row);
+        if (key && height !== null) rowHeightCacheRef.current.set(key, height);
       }
     }
     const el = scrollParent;
@@ -1722,13 +1758,21 @@ export function MessageList({
           style={{ height: topSpacerPx }}
         />
       ) : null}
-      {paintedItems.map((item) => {
+      {paintedItems.map((item, paintedIndex) => {
         const key = itemKey(item);
         const eagerMedia = eagerMediaKeysRef.current?.has(key) === true;
+        const visibleIndex = paintStart + paintedIndex;
+        const liveRow =
+          (typeof pinPaintStart === "number" && visibleIndex >= pinPaintStart) ||
+          visibleIndex >= visibleItems.length - PAINT_MIN_ITEMS;
         return (
           <TimelineEagerMediaContext.Provider key={key} value={eagerMedia}>
             <div
-              className="chat-virtual-item chat-timeline-row"
+              className={
+                liveRow
+                  ? "chat-virtual-item chat-timeline-row chat-timeline-row-live"
+                  : "chat-virtual-item chat-timeline-row"
+              }
               data-chat-virtual-key={key}
             >
               {renderItem(item)}

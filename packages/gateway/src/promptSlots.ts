@@ -56,7 +56,7 @@ import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
-import { isTextOnlyStaticVisionModel, shouldEnableOpenClaudeVision } from './mcpVisionServer.js'
+import { isTextOnlyDefinite, shouldEnableOpenClaudeVision } from './mcpVisionServer.js'
 import { getPlatformPrompt } from './platformPrompts.js'
 import {
   resolveTurnProjectContext,
@@ -74,7 +74,8 @@ import type { FrozenProjectContextDigests } from './runContextPersist.js'
 // (__tests__/platformPrompts.test.ts 的「文件 === 常量」断言会在漂移时变红)。
 
 /** `# Platform capabilities` 静态头部;{{WECHAT_VISION_HINT}} 由 buildAgentsSlot 按
- *  needsVisionCli 注入下面两个变体之一。对应 prompts/platform-capabilities.md。 */
+ *  needsVisionCli + 确定纯文本判定注入 CLI / Read-then-CLI / 原生三个变体之一。
+ *  对应 prompts/platform-capabilities.md。 */
 const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 
 你是 OpenClaude 平台上的 AI 助手,用户通过 Web 浏览器与你交互。
@@ -180,8 +181,10 @@ const MEMORY_INSTRUCTIONS_FALLBACK = `# Memory
 `
 
 const WECHAT_VISION_HINT_PLACEHOLDER = '{{WECHAT_VISION_HINT}}'
-/** needsVisionCli=true:模型看不到图,提示走 oc-vision CLI 识图。 */
+/** 确定纯文本:模型看不到图,提示走 oc-vision CLI 识图。 */
 const WECHAT_VISION_HINT_CLI = '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。当前模型看不到图,看到本地图片路径时,先用 Bash 调 `oc-vision understand <该路径> --prompt "<问题>"` 识别,再据此回答,不要说“不支持图片/没有上传图片”。'
+/** 非确定纯文本但 catalog 仍可能注入识图兜底(cursor 等):先 Read,看不到再 oc-vision。 */
+const WECHAT_VISION_HINT_READ_THEN_CLI = '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。看到本地图片路径时,先用 Read 工具读图;若 Read 返回的不是图像内容/提示图片被省略/看不到图,再用 Bash 调 `oc-vision understand <该路径> --prompt "<问题>"` 识别,再据此回答,不要说“不支持图片/没有上传图片”。'
 /** needsVisionCli=false:原生多模态模型,直接读图。 */
 const WECHAT_VISION_HINT_NATIVE = '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。看到本地图片路径时,直接读图回答,不要说“不支持图片/没有上传图片”。'
 
@@ -192,6 +195,7 @@ export const _platformPromptFallbacks = {
   MEMORY_INSTRUCTIONS_FALLBACK,
   WECHAT_VISION_HINT_PLACEHOLDER,
   WECHAT_VISION_HINT_CLI,
+  WECHAT_VISION_HINT_READ_THEN_CLI,
   WECHAT_VISION_HINT_NATIVE,
 }
 
@@ -544,6 +548,9 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     ctx.model,
     ctx.modelSupportsVision,
   )
+  // 微信/图片提示的「看不到图」文案只给确定纯文本;catalog supportsVision=false
+  // 仍可能让 needsVisionCli=true(cursor 家族),那种情况先 Read 再 oc-vision。
+  const textOnlyDefinite = isTextOnlyDefinite(provider, ctx.model)
   // 平台静态能力文案(`# Platform capabilities` 头部 + 多媒体/微信/富内容/子 Agent/
   // 浏览器/网页提取诸段)已上移 platform bundle(商业版真热),商业版权威 =
   // prompts/platform-capabilities.md,个人版权威 = 下方 PLATFORM_CAPABILITIES_FALLBACK。
@@ -553,7 +560,11 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     'platform-capabilities',
     PLATFORM_CAPABILITIES_FALLBACK,
   ).replaceAll(WECHAT_VISION_HINT_PLACEHOLDER, () =>
-    needsVisionCli ? WECHAT_VISION_HINT_CLI : WECHAT_VISION_HINT_NATIVE,
+    !needsVisionCli
+      ? WECHAT_VISION_HINT_NATIVE
+      : textOnlyDefinite
+        ? WECHAT_VISION_HINT_CLI
+        : WECHAT_VISION_HINT_READ_THEN_CLI,
   )
   const lines = [staticHeader]
 
@@ -619,14 +630,9 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     // MiniMax-M3 原生支持图像识别(2026-06-17 放开 strip):用户上传的图片会直接进入对话,
     // **无需** understand_image 工具,直接读图回答即可。
   }
-  // 纯文本静态模型(deepseek/glm/qwen/kimi 等)的识图提示。判定权威 = protocol
-  // staticKeyProviders 的 supportsVision(经 isTextOnlyStaticVisionModel 派生),与
-  // mcpVisionServer 注入侧同源 —— 消掉此前逐字面量硬编码的第二权威源(新增静态
-  // 模型忘同步就漏发提示的漂移)。
-  if (
-    needsVisionCli &&
-    (ctx.modelSupportsVision === false || isTextOnlyStaticVisionModel(ctx.model))
-  ) {
+  // 纯文本静态模型(deepseek/glm/qwen/kimi 等)的识图提示。只在「确定纯文本」
+  // 时声称看不到图;catalog supportsVision=false 的 cursor 家族不走本段。
+  if (needsVisionCli && textOnlyDefinite) {
     lines.push('')
     lines.push('## 图片理解提示')
     lines.push('')

@@ -62,6 +62,18 @@ export function overscanPx(clientHeight: number): number {
   return Math.max(height, Math.round(PAINT_OVERSCAN_VIEWPORTS * height));
 }
 
+/** Pin is in the painted span or within PAINT_MIN_ITEMS of either edge. */
+export function pinNearPaintRange(
+  pin: number,
+  start: number,
+  end: number,
+  slack: number = PAINT_MIN_ITEMS,
+): boolean {
+  if (pin < start) return start - pin <= slack;
+  if (pin >= end) return pin - end <= slack;
+  return true;
+}
+
 export function computePaintRange(args: {
   count: number;
   scrollTop: number;
@@ -69,29 +81,40 @@ export function computePaintRange(args: {
   followBottom: boolean;
   keyAt: (index: number) => string;
   heights: Map<string, number>;
+  /** Inclusive index that must stay mounted (e.g. the in-flight user bubble). */
+  pinStart?: number;
 }): { start: number; end: number } {
-  const { count, scrollTop, clientHeight, followBottom, keyAt, heights } = args;
+  const { count, scrollTop, clientHeight, followBottom, keyAt, heights, pinStart } = args;
   if (count <= 0) return { start: 0, end: 0 };
   const extra = overscanPx(clientHeight);
 
+  let start: number;
+  let end: number;
   if (followBottom) {
     let acc = 0;
-    let start = count;
+    start = count;
     const target = clientHeight + extra;
     while (start > 0 && acc < target) {
       start -= 1;
       acc += itemHeightPx(keyAt(start), heights);
     }
     start = Math.min(start, Math.max(0, count - PAINT_MIN_ITEMS));
-    return { start, end: count };
+    end = count;
+  } else {
+    start = indexAtOffsetPx(count, Math.max(0, scrollTop - extra), keyAt, heights);
+    end = indexAtOffsetPx(count, Math.max(0, scrollTop) + clientHeight + extra, keyAt, heights);
+    if (end < count) end += 1;
+    end = Math.min(count, Math.max(end, start + PAINT_MIN_ITEMS));
+    start = Math.min(start, Math.max(0, count - PAINT_MIN_ITEMS));
   }
-
-  const start = indexAtOffsetPx(count, Math.max(0, scrollTop - extra), keyAt, heights);
-  let end = indexAtOffsetPx(count, Math.max(0, scrollTop) + clientHeight + extra, keyAt, heights);
-  if (end < count) end += 1;
-  end = Math.min(count, Math.max(end, start + PAINT_MIN_ITEMS));
-  const clampedStart = Math.min(start, Math.max(0, count - PAINT_MIN_ITEMS));
-  return { start: clampedStart, end };
+  if (typeof pinStart === "number" && Number.isFinite(pinStart)) {
+    const pin = Math.max(0, Math.min(Math.floor(pinStart), count - 1));
+    if (pinNearPaintRange(pin, start, end)) {
+      start = Math.min(start, pin);
+      end = Math.max(end, pin + 1);
+    }
+  }
+  return { start, end };
 }
 
 export function paintRangeSettled(
@@ -117,6 +140,73 @@ export function measuredRangePx(
     height += itemHeightPx(keyAt(i), heights);
   }
   return height;
+}
+
+/** True when [start, end) still covers the viewport. Slack is 1px for subpixel clamp. */
+export function paintRangeCoversViewport(args: {
+  start: number;
+  end: number;
+  count: number;
+  scrollTop: number;
+  clientHeight: number;
+  keyAt: (index: number) => string;
+  heights: Map<string, number>;
+}): boolean {
+  const { start, end, count, scrollTop, clientHeight, keyAt, heights } = args;
+  if (count <= 0 || end <= start) return false;
+  const top = measuredRangePx(0, start, keyAt, heights);
+  const painted = measuredRangePx(start, end, keyAt, heights);
+  const total = top + painted + measuredRangePx(end, count, keyAt, heights);
+  const viewEnd = Math.min(scrollTop + Math.max(0, clientHeight), total);
+  return top <= scrollTop + 1 && top + painted >= viewEnd - 1;
+}
+
+/**
+ * Keep hysteresis only when the previous window still covers the viewport
+ * (and any pinned row). Always absorb a tail `end` growth so a newly appended
+ * optimistic user row cannot sit in the bottom spacer until the next scroll.
+ */
+export function selectPaintRange(args: {
+  prev: { start: number; end: number };
+  next: { start: number; end: number };
+  followBottom: boolean;
+  count: number;
+  scrollTop: number;
+  clientHeight: number;
+  keyAt: (index: number) => string;
+  heights: Map<string, number>;
+  pinStart?: number;
+}): { start: number; end: number } {
+  const { prev, next, followBottom, pinStart } = args;
+  if (followBottom) return next;
+  const pinOk =
+    typeof pinStart !== "number" ||
+    !pinNearPaintRange(pinStart, prev.start, prev.end) ||
+    (pinStart >= prev.start && pinStart < prev.end);
+  if (
+    pinOk &&
+    paintRangeCoversViewport({ ...args, start: prev.start, end: prev.end }) &&
+    paintRangeSettled(prev, next)
+  ) {
+    return { start: prev.start, end: Math.max(prev.end, next.end) };
+  }
+  return next;
+}
+
+/**
+ * Cache only relevant row heights. `content-visibility: auto` skipped rows
+ * report contain-intrinsic-size (200px); writing that back poisons spacers.
+ */
+export function measureMountedRowHeight(el: HTMLElement): number | null {
+  if (typeof el.checkVisibility === "function") {
+    try {
+      if (!el.checkVisibility({ contentVisibilityAuto: true })) return null;
+    } catch {
+      /* jsdom / engines without the contentVisibilityAuto flag */
+    }
+  }
+  const height = el.offsetHeight;
+  return height > 0 ? height : null;
 }
 
 /**

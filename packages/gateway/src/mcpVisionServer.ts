@@ -97,6 +97,26 @@ export function isTextOnlyStaticVisionModel(model?: string): boolean {
   return !!spec && spec.supportsVision !== true
 }
 
+/** `OPENCLAUDE_VISION_MCP_PROVIDERS` 显式 opt-in 的自定义纯文本上游。 */
+export function isOpenClaudeVisionProviderOptIn(provider?: string): boolean {
+  const p = provider?.trim().toLowerCase()
+  if (!p) return false
+  const optInProviders = (process.env.OPENCLAUDE_VISION_MCP_PROVIDERS ?? '')
+    .split(',')
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean)
+  return optInProviders.includes(p)
+}
+
+/**
+ * 是否为「确定纯文本」:静态路由表 supportsVision!==true,或 provider 显式 opt-in。
+ * **不含** catalog `supportsVision=false` —— cursor 等引擎可能仍能经 Read 原生看图,
+ * 不能把描述符 false 当成「模型看不到图」。
+ */
+export function isTextOnlyDefinite(provider?: string, model?: string): boolean {
+  return isTextOnlyStaticVisionModel(model) || isOpenClaudeVisionProviderOptIn(provider)
+}
+
 /**
  * 是否给该 provider/model 注入 understand_image 工具。
  * **纯文本静态模型**(看不到图)启用;**原生多模态模型不启用**。
@@ -117,12 +137,7 @@ export function shouldEnableOpenClaudeVision(
   // 已注册静态模型:protocol supportsVision 是唯一权威(纯文本 → 注入)。
   if (isTextOnlyStaticVisionModel(model)) return true
   // 非静态 provider 的显式 opt-in(自定义 Anthropic 兼容纯文本上游)。
-  const p = provider?.trim().toLowerCase()
-  const optInProviders = (process.env.OPENCLAUDE_VISION_MCP_PROVIDERS ?? '')
-    .split(',')
-    .map((v) => v.trim().toLowerCase())
-    .filter(Boolean)
-  return !!p && optInProviders.includes(p)
+  return isOpenClaudeVisionProviderOptIn(provider)
 }
 
 export type VisionToolArgs = {
