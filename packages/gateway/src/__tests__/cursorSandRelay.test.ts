@@ -31,6 +31,21 @@ function fakeJwt(): string {
   return `x.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.y`
 }
 
+function inertRun() {
+  return {
+    submitted: Promise.resolve(),
+    summary: Promise.resolve(null),
+    end() {},
+    getPartialSnapshot: () => ({
+      assistantText: '', thinkingText: '', completedTools: [],
+      assistantSegments: [], thinkingSegments: [], runtimeEvents: [],
+    }),
+    getPhantomSignals: () => ({ apiState: 'unknown' as const, skipReason: null }),
+    finalized: true,
+    pendingToolCalls: 0,
+  }
+}
+
 test('Sand sidecar selects only primary-key Fable models', () => {
   const sidecar = '# sand-mode v1\napi-key 1\napi-key.2 0\n'
   assert.equal(cursorSandEnabledForModel('cursor-fable-5-high', sidecar), true)
@@ -196,7 +211,7 @@ test('shutdown during cold Sand preparation waits and prevents resurrection', as
     config: {} as never, model: 'cursor-fable-5-high',
   }, relay, () => {
     submissions++
-    throw new Error('shutdown cold submit must not reach the inner adapter')
+    return inertRun() as never
   })
   const run = adapter.submitTurn({
     input: 'hello', sessionTotals: { totalCostUSD: 0, turns: 0 },
@@ -217,6 +232,13 @@ test('shutdown during cold Sand preparation waits and prevents resurrection', as
   await shutdown
   assert.equal(submissions, 0)
   assert.equal(adapter.isRunning, false)
+  const restarted = adapter.submitTurn({
+    input: 'after recycle', sessionTotals: { totalCostUSD: 0, turns: 0 },
+    toolUseIdToName: new Map(), onEvent() {}, onPostTerminalRuntimeEvent() {},
+  })
+  await restarted.submitted
+  assert.equal(submissions, 1)
+  await adapter.shutdown()
 })
 
 test('shutdown during Sand preheat waits and leaves no revived runner', async () => {
@@ -235,7 +257,7 @@ test('shutdown during Sand preheat waits and leaves no revived runner', async ()
   const adapter = new CursorSandAdapter({
     sessionKey: 'agent:main:test:sand-preheat-shutdown', agentId: 'main', agentBaseDir: process.cwd(),
     config: {} as never, model: 'cursor-fable-5-high',
-  }, relay)
+  }, relay, () => inertRun() as never)
   const preheat = adapter.preheat()
   const preheatFailure = preheat.then(
     () => null,
@@ -250,6 +272,12 @@ test('shutdown during Sand preheat waits and leaves no revived runner', async ()
   assert.match(String(await preheatFailure), /CURSOR_SAND_ADAPTER_SHUTDOWN/)
   await shutdown
   assert.equal(adapter.isRunning, false)
+  const restarted = adapter.submitTurn({
+    input: 'after preheat recycle', sessionTotals: { totalCostUSD: 0, turns: 0 },
+    toolUseIdToName: new Map(), onEvent() {}, onPostTerminalRuntimeEvent() {},
+  })
+  await restarted.submitted
+  await adapter.shutdown()
 })
 
 test('routing interrupt during deferred variant preparation prevents inner submission', async () => {
@@ -270,7 +298,7 @@ test('routing interrupt during deferred variant preparation prevents inner submi
     let submissions = 0
     const testRouter = router as unknown as {
       ensureVariant: () => Promise<void>
-      inner: { submitTurn: () => never }
+      inner: { submitTurn: () => ReturnType<typeof inertRun> }
     }
     testRouter.ensureVariant = async () => { markVariant(); await variantGate }
     testRouter.inner.submitTurn = () => {
@@ -313,12 +341,12 @@ test('routing shutdown during deferred preparation prevents resurrection', async
     let submissions = 0
     const testRouter = router as unknown as {
       ensureVariant: () => Promise<void>
-      inner: { submitTurn: () => never }
+      inner: { submitTurn: () => ReturnType<typeof inertRun> }
     }
     testRouter.ensureVariant = async () => { markVariant(); await variantGate }
     testRouter.inner.submitTurn = () => {
       submissions++
-      throw new Error('shutdown routing submit must not reach the inner adapter')
+      return inertRun()
     }
     const run = router.submitTurn({
       input: 'hello', sessionTotals: { totalCostUSD: 0, turns: 0 },
@@ -338,6 +366,14 @@ test('routing shutdown during deferred preparation prevents resurrection', async
     assert.equal(await run.summary, null)
     await shutdown
     assert.equal(submissions, 0)
+    router.setModel('cursor-grok-4.6-high')
+    router.setToolsets(['browser'])
+    const restarted = router.submitTurn({
+      input: 'after same-variant recycle', sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(), onEvent() {}, onPostTerminalRuntimeEvent() {},
+    })
+    await restarted.submitted
+    assert.equal(submissions, 1)
   } finally {
     await router.shutdown()
     if (previous === undefined) delete process.env.OC_CURSOR_SAND_SIDECAR

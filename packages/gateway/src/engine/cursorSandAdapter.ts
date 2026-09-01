@@ -316,11 +316,22 @@ export class CursorSandAdapter extends CcbAdapter {
     this.lifecycleGeneration++
     this.activeCancel?.()
     this.shutdownPromise = (async () => {
-      await Promise.allSettled([...this.pendingLifecycle])
       try {
-        await super.shutdown()
+        await Promise.allSettled([...this.pendingLifecycle])
+        try {
+          await super.shutdown()
+        } finally {
+          await this.relay.close()
+        }
       } finally {
-        await this.relay.close()
+        // EngineAdapter.shutdown() is a restartable recycle boundary. Bump a
+        // second time so calls admitted during shutdown stay stale, then allow
+        // a later same-session turn to start a fresh relay/runner generation.
+        this.lifecycleGeneration++
+        this.lifecycleClosed = false
+        this.activeCancel = null
+        this.prepareInFlight = null
+        this.shutdownPromise = null
       }
     })()
     return this.shutdownPromise

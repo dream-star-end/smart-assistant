@@ -225,8 +225,18 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     this.lifecycleGeneration++
     this.activeCancel?.()
     this.shutdownPromise = (async () => {
-      await Promise.allSettled([...this.pendingLifecycle])
-      await this.inner.shutdown()
+      try {
+        await Promise.allSettled([...this.pendingLifecycle])
+        await this.inner.shutdown()
+      } finally {
+        // shutdown is also used for same-session model/toolset recycle. Calls
+        // that entered during the closed window remain stale (second bump),
+        // while a later turn may restart the retained inner adapter.
+        this.lifecycleGeneration++
+        this.lifecycleClosed = false
+        this.activeCancel = null
+        this.shutdownPromise = null
+      }
     })()
     return this.shutdownPromise
   }
