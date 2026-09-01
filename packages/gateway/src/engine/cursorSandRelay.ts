@@ -18,7 +18,10 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Ajv2020 from 'ajv/dist/2020.js'
-import * as protobuf from 'protobufjs'
+// protobufjs is CommonJS. Node's native ESM loader exposes it only through
+// `default`; a namespace import works under the TS test loader but becomes
+// `{ default: ... }` in the precompiled production gateway.
+import protobuf from 'protobufjs'
 import { cursorModelById } from '@openclaude/protocol'
 import { createLogger } from '../logger.js'
 
