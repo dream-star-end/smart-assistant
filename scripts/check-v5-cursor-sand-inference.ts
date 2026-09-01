@@ -31,4 +31,4 @@ assert.match(tests, /routing shutdown during deferred preparation prevents resur
 assert.match(commercialDeploy, /check-v5-cursor-sand-inference\.ts/)
 assert.match(selfhostRelease, /check-v5-cursor-sand-inference\.ts/)
 
-console.log('[cursor-sand-inference] PASS — endpoint, Sand identity, cold-submit/cancel, billing, variant, abort and both deploy-path guards present')
+console.log('[cursor-sand-inference] PASS — InferenceService endpoint, Sand identity, cold-submit, billing, variant and abort guards present')

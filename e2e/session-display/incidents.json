@@ -2332,9 +2332,14 @@
           "assertion": "[cursor-sand-inference] PASS — InferenceService endpoint, Sand identity, cold-submit, billing, variant and abort guards present"
         }
       ],
-      "coverageCommits": [
-        "4d678dda"
-      ]
+    "coverageCommits": [
+      "8a92b682",
+      "4d678dda",
+      "cfb6c7c6",
+      "968f4836",
+      "ccc58f05",
+      "a32e9bb6"
+    ]
     }
   ]
 }
