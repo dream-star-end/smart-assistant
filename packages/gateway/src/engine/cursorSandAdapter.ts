@@ -77,7 +77,10 @@ export class CursorSandAdapter extends CcbAdapter {
     permissionModel: 'native',
     emitsCallUsage: true,
     emitsToolInputDeltas: true,
-    supportsNativeCompact: true,
+    // Cursor has no side-effect-free Sand compaction/export surface. Model
+    // switches must fail closed and reopen instead of running a hidden agent
+    // turn with tools and no server-owned billing identity.
+    supportsNativeCompact: false,
     multimodalInput: 'native',
   }
 
@@ -85,6 +88,12 @@ export class CursorSandAdapter extends CcbAdapter {
   private readonly relay: CursorSandRelay
   private readonly submitDelegate?: (params: TurnParams) => EngineTurnRun
   private activeCancel: (() => boolean) | null = null
+  private lifecycleGeneration = 0
+  private lifecycleClosed = false
+  private shutdownPromise: Promise<void> | null = null
+  private prepareInFlight: { generation: number; promise: Promise<void> } | null = null
+  private readonly pendingLifecycle = new Set<Promise<unknown>>()
+  private lifecycleTail: Promise<void> = Promise.resolve()
 
   constructor(
     opts: EngineCreateOpts,
@@ -98,32 +107,74 @@ export class CursorSandAdapter extends CcbAdapter {
     this.submitDelegate = submitDelegate
   }
 
-  private async prepareRelay(): Promise<void> {
-    const baseUrl = await this.relay.start()
-    const model = this.model ?? ''
-    Object.assign(this.providerEnv, {
-      CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1',
-      ANTHROPIC_BASE_URL: baseUrl,
-      ANTHROPIC_AUTH_TOKEN: 'cursor-sand-loopback',
-      ANTHROPIC_API_KEY: '',
-      ANTHROPIC_MODEL: model,
-      ANTHROPIC_SMALL_FAST_MODEL: model,
-      ENABLE_TOOL_SEARCH: 'true',
-      _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: '1',
-      NO_PROXY: appendNoProxy(process.env.NO_PROXY, '127.0.0.1', 'localhost'),
-      no_proxy: appendNoProxy(process.env.no_proxy, '127.0.0.1', 'localhost'),
-      OPENCLAUDE_CCB_NO_PROXY: appendNoProxy(
-        process.env.OPENCLAUDE_CCB_NO_PROXY,
-        '127.0.0.1',
-        'localhost',
-      ),
-    })
+  private assertLifecycle(generation: number): void {
+    if (this.lifecycleClosed || generation !== this.lifecycleGeneration) {
+      throw new Error('CURSOR_SAND_ADAPTER_SHUTDOWN')
+    }
+  }
+
+  private trackLifecycle<T>(promise: Promise<T>): Promise<T> {
+    this.pendingLifecycle.add(promise)
+    void promise.then(
+      () => this.pendingLifecycle.delete(promise),
+      () => this.pendingLifecycle.delete(promise),
+    )
+    return promise
+  }
+
+  private withLifecycleLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.lifecycleTail
+    let release!: () => void
+    this.lifecycleTail = new Promise<void>((resolvePromise) => { release = resolvePromise })
+    return previous.then(operation).finally(release)
+  }
+
+  private async prepareRelay(generation = this.lifecycleGeneration): Promise<void> {
+    this.assertLifecycle(generation)
+    let preparation = this.prepareInFlight
+    if (!preparation || preparation.generation !== generation) {
+      const promise = (async () => {
+        const baseUrl = await this.relay.start()
+        this.assertLifecycle(generation)
+        const model = this.model ?? ''
+        Object.assign(this.providerEnv, {
+          CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1',
+          ANTHROPIC_BASE_URL: baseUrl,
+          ANTHROPIC_AUTH_TOKEN: 'cursor-sand-loopback',
+          ANTHROPIC_API_KEY: '',
+          ANTHROPIC_MODEL: model,
+          ANTHROPIC_SMALL_FAST_MODEL: model,
+          ENABLE_TOOL_SEARCH: 'true',
+          _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: '1',
+          NO_PROXY: appendNoProxy(process.env.NO_PROXY, '127.0.0.1', 'localhost'),
+          no_proxy: appendNoProxy(process.env.no_proxy, '127.0.0.1', 'localhost'),
+          OPENCLAUDE_CCB_NO_PROXY: appendNoProxy(
+            process.env.OPENCLAUDE_CCB_NO_PROXY,
+            '127.0.0.1', 'localhost',
+          ),
+        })
+      })()
+      preparation = { generation, promise }
+      this.prepareInFlight = preparation
+      void promise.then(
+        () => { if (this.prepareInFlight?.promise === promise) this.prepareInFlight = null },
+        () => { if (this.prepareInFlight?.promise === promise) this.prepareInFlight = null },
+      )
+    }
+    await preparation.promise
+    this.assertLifecycle(generation)
   }
 
   override async start(): Promise<void> {
-    await this.prepareRelay()
-    try {
+    const generation = this.lifecycleGeneration
+    const operation = this.trackLifecycle(this.withLifecycleLock(async () => {
+      await this.prepareRelay(generation)
+      this.assertLifecycle(generation)
       await super.start()
+      this.assertLifecycle(generation)
+    }))
+    try {
+      await operation
       log.info('cursor sand inference runner started', { model: this.model ?? '', endpoint: 'InferenceService/Stream' })
     } catch (error) {
       await this.relay.close()
@@ -132,9 +183,15 @@ export class CursorSandAdapter extends CcbAdapter {
   }
 
   override async preheat(): Promise<void> {
-    await this.prepareRelay()
-    try {
+    const generation = this.lifecycleGeneration
+    const operation = this.trackLifecycle(this.withLifecycleLock(async () => {
+      await this.prepareRelay(generation)
+      this.assertLifecycle(generation)
       await super.preheat()
+      this.assertLifecycle(generation)
+    }))
+    try {
+      await operation
     } catch (error) {
       await this.relay.close()
       throw error
@@ -142,6 +199,7 @@ export class CursorSandAdapter extends CcbAdapter {
   }
 
   override submitTurn(params: TurnParams): EngineTurnRun {
+    const generation = this.lifecycleGeneration
     const startedAt = Date.now()
     let inner: EngineTurnRun | null = null
     let ended = false
@@ -199,9 +257,11 @@ export class CursorSandAdapter extends CcbAdapter {
       return true
     }
     this.activeCancel = cancel
-    const submitted = (async () => {
+    const submitted = this.trackLifecycle(this.withLifecycleLock(async () => {
       try {
-        await this.prepareRelay()
+        this.assertLifecycle(generation)
+        await this.prepareRelay(generation)
+        this.assertLifecycle(generation)
         if (ended) {
           emitBilling(null)
           resolveSummary(null)
@@ -222,7 +282,7 @@ export class CursorSandAdapter extends CcbAdapter {
         clearActiveCancel()
         throw error
       }
-    })()
+    }))
     return {
       submitted,
       summary,
@@ -251,10 +311,18 @@ export class CursorSandAdapter extends CcbAdapter {
   }
 
   override async shutdown(): Promise<void> {
-    try {
-      await super.shutdown()
-    } finally {
-      await this.relay.close()
-    }
+    if (this.shutdownPromise) return this.shutdownPromise
+    this.lifecycleClosed = true
+    this.lifecycleGeneration++
+    this.activeCancel?.()
+    this.shutdownPromise = (async () => {
+      await Promise.allSettled([...this.pendingLifecycle])
+      try {
+        await super.shutdown()
+      } finally {
+        await this.relay.close()
+      }
+    })()
+    return this.shutdownPromise
   }
 }

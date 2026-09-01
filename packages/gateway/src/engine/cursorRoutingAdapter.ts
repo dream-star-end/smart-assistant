@@ -8,7 +8,6 @@ import type {
   EngineAdapter,
   EngineCapabilities,
   EngineTurnRun,
-  NativeModelHandoffArtifact,
   TurnParams,
 } from './engineAdapter.js'
 import type { PartialSnapshot, PhantomSignals } from './engineEvents.js'
@@ -59,6 +58,11 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   private goal: GoalStateSnapshot | null = null
   private readonly innerListeners = new Map<string, (...args: unknown[]) => void>()
   private activeCancel: (() => boolean) | null = null
+  private lifecycleGeneration = 0
+  private lifecycleClosed = false
+  private shutdownPromise: Promise<void> | null = null
+  private readonly pendingLifecycle = new Set<Promise<unknown>>()
+  private lifecycleTail: Promise<void> = Promise.resolve()
 
   constructor(opts: EngineCreateOpts) {
     super()
@@ -103,34 +107,61 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     this.innerListeners.clear()
   }
 
-  private async ensureVariant(): Promise<void> {
+  private assertLifecycle(generation: number): void {
+    if (this.lifecycleClosed || generation !== this.lifecycleGeneration) {
+      throw new Error('CURSOR_ROUTER_SHUTDOWN')
+    }
+  }
+
+  private trackLifecycle<T>(promise: Promise<T>): Promise<T> {
+    this.pendingLifecycle.add(promise)
+    void promise.then(
+      () => this.pendingLifecycle.delete(promise),
+      () => this.pendingLifecycle.delete(promise),
+    )
+    return promise
+  }
+
+  private withLifecycleLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.lifecycleTail
+    let release!: () => void
+    this.lifecycleTail = new Promise<void>((resolvePromise) => { release = resolvePromise })
+    return previous.then(operation).finally(release)
+  }
+
+  private async ensureVariant(generation = this.lifecycleGeneration): Promise<void> {
+    this.assertLifecycle(generation)
     const desired = variantFor(this.opts.model)
     if (desired === this.variant) return
-    if (this.inner.model === this.opts.model) {
-      throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
-    }
-    await this.inner.shutdown()
-    await this.inner.waitForOutputDrain()
-    this.unbindInner()
-    this.variant = desired
-    this.opts.resumeSessionId = undefined
-    this.inner = this.createInner(desired)
-    this.bindInner()
-    if (this.goal) await this.inner.setGoalState(this.goal)
+    // Neither native Cursor nor Sand exposes a side-effect-free, billable
+    // compaction/export surface. Never swap a live session's underlying
+    // protocol; the caller must reopen on the desired variant.
+    throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
   }
 
   async start(): Promise<void> {
-    await this.ensureVariant()
-    await this.inner.start()
+    const generation = this.lifecycleGeneration
+    await this.trackLifecycle(this.withLifecycleLock(async () => {
+      await this.ensureVariant(generation)
+      this.assertLifecycle(generation)
+      await this.inner.start()
+      this.assertLifecycle(generation)
+    }))
   }
 
   async preheat(): Promise<void> {
-    await this.ensureVariant()
-    if (this.inner.preheat) await this.inner.preheat()
-    else await this.inner.start()
+    const generation = this.lifecycleGeneration
+    await this.trackLifecycle(this.withLifecycleLock(async () => {
+      await this.ensureVariant(generation)
+      this.assertLifecycle(generation)
+      if (this.inner.preheat) await this.inner.preheat()
+      else await this.inner.start()
+      this.assertLifecycle(generation)
+    }))
   }
 
   submitTurn(params: TurnParams): EngineTurnRun {
+    const generation = this.lifecycleGeneration
     let innerRun: EngineTurnRun | null = null
     let ended = false
     let resolveSummary!: (summary: Awaited<EngineTurnRun['summary']>) => void
@@ -148,9 +179,10 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
       return true
     }
     this.activeCancel = cancel
-    const submitted = (async () => {
+    const submitted = this.trackLifecycle(this.withLifecycleLock(async () => {
       try {
-        await this.ensureVariant()
+        await this.ensureVariant(generation)
+        this.assertLifecycle(generation)
         if (ended) {
           resolveSummary(null)
           clearActiveCancel()
@@ -167,7 +199,7 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
         clearActiveCancel()
         throw error
       }
-    })()
+    }))
     return {
       submitted,
       summary,
@@ -187,28 +219,18 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   }
 
   interrupt(): boolean { return this.activeCancel?.() ?? this.inner.interrupt() }
-  async shutdown(): Promise<void> { await this.inner.shutdown() }
-  waitForOutputDrain(): Promise<void> { return this.inner.waitForOutputDrain() }
-
-  async compactForHandoff(): Promise<NativeModelHandoffArtifact> {
-    await this.ensureVariant()
-    const compactStartedAt = Date.now()
-    const run = this.inner.submitTurn({
-      input:
-        'Summarize the user goal, decisions, constraints, current work, relevant files, errors, and exact next steps for another model. Return only the handoff summary.',
-      sessionTotals: { totalCostUSD: 0, turns: 0 },
-      toolUseIdToName: new Map(),
-      onEvent() {},
-      onPostTerminalRuntimeEvent() {},
-    })
-    await run.submitted
-    const summary = await run.summary
-    const summaryText = summary?.nativeCompactionSummary?.trim()
-      || summary?.assistantText.trim()
-      || ''
-    if (!summaryText) throw new Error('MODEL_SWITCH_NATIVE_COMPACTION_UNAVAILABLE')
-    return { summaryText, source: 'cursor', compactStartedAt }
+  async shutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise
+    this.lifecycleClosed = true
+    this.lifecycleGeneration++
+    this.activeCancel?.()
+    this.shutdownPromise = (async () => {
+      await Promise.allSettled([...this.pendingLifecycle])
+      await this.inner.shutdown()
+    })()
+    return this.shutdownPromise
   }
+  waitForOutputDrain(): Promise<void> { return this.inner.waitForOutputDrain() }
 
   get nativeSessionId(): string | null {
     if (variantFor(this.opts.model) !== this.variant) return null
@@ -221,12 +243,11 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   }
 
   setModel(model: string | undefined): void {
-    this.opts.model = model
-    if (variantFor(model) === this.variant) this.inner.setModel(model)
-    else {
-      this.opts.resumeSessionId = undefined
-      this.inner.clearSessionId()
+    if (variantFor(model) !== this.variant) {
+      throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
     }
+    this.opts.model = model
+    this.inner.setModel(model)
   }
   get model(): string | undefined { return this.opts.model }
   setEffortLevel(level: string | undefined): void {

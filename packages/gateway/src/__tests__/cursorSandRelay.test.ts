@@ -56,12 +56,12 @@ test('cursor engine factory selects Sand CCB only when the primary sidecar enabl
     const sand = createEngine('cursor', opts)
     assert.equal(sand instanceof CursorRoutingAdapter, true)
     assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand')
-    assert.equal(typeof sand.compactForHandoff, 'function')
-    sand.setModel('cursor-grok-4.6-high')
-    await (sand as unknown as CursorRoutingAdapter).refreshVariantForTest()
-    assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'native')
-    sand.setModel('cursor-fable-5-high')
-    await (sand as unknown as CursorRoutingAdapter).refreshVariantForTest()
+    assert.equal(sand.capabilities.supportsNativeCompact, false)
+    assert.equal(typeof sand.compactForHandoff, 'undefined')
+    assert.throws(
+      () => sand.setModel('cursor-grok-4.6-high'),
+      /CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION/,
+    )
     assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand')
     await sand.shutdown()
 
@@ -70,7 +70,6 @@ test('cursor engine factory selects Sand CCB only when the primary sidecar enabl
     assert.equal(native instanceof CursorRoutingAdapter, true)
     assert.equal((native as unknown as CursorRoutingAdapter).currentVariant, 'native')
     writeFileSync(sidecar, 'api-key 1\n')
-    native.setModel('cursor-fable-5-high')
     await assert.rejects(
       (native as unknown as CursorRoutingAdapter).refreshVariantForTest(),
       /CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION/,
@@ -178,6 +177,81 @@ test('interrupt before cold Sand preparation prevents submission', async () => {
   await adapter.shutdown()
 })
 
+test('shutdown during cold Sand preparation waits and prevents resurrection', async () => {
+  let releaseStart!: () => void
+  let markStart!: () => void
+  const startGate = new Promise<void>((resolvePromise) => { releaseStart = resolvePromise })
+  const startEntered = new Promise<void>((resolvePromise) => { markStart = resolvePromise })
+  let submissions = 0
+  const relay = {
+    async start() {
+      markStart()
+      await startGate
+      return 'http://127.0.0.1:12345/route/test'
+    },
+    async close() {},
+  } as unknown as CursorSandRelay
+  const adapter = new CursorSandAdapter({
+    sessionKey: 'agent:main:test:cold-sand-shutdown', agentId: 'main', agentBaseDir: process.cwd(),
+    config: {} as never, model: 'cursor-fable-5-high',
+  }, relay, () => {
+    submissions++
+    throw new Error('shutdown cold submit must not reach the inner adapter')
+  })
+  const run = adapter.submitTurn({
+    input: 'hello', sessionTotals: { totalCostUSD: 0, turns: 0 },
+    toolUseIdToName: new Map(), onEvent() {}, onPostTerminalRuntimeEvent() {},
+  })
+  const submittedFailure = run.submitted.then(
+    () => null,
+    (error: unknown) => error,
+  )
+  await startEntered
+  let shutdownSettled = false
+  const shutdown = adapter.shutdown().then(() => { shutdownSettled = true })
+  await new Promise((resolvePromise) => setImmediate(resolvePromise))
+  assert.equal(shutdownSettled, false)
+  releaseStart()
+  assert.match(String(await submittedFailure), /CURSOR_SAND_ADAPTER_SHUTDOWN/)
+  assert.equal(await run.summary, null)
+  await shutdown
+  assert.equal(submissions, 0)
+  assert.equal(adapter.isRunning, false)
+})
+
+test('shutdown during Sand preheat waits and leaves no revived runner', async () => {
+  let releaseStart!: () => void
+  let markStart!: () => void
+  const startGate = new Promise<void>((resolvePromise) => { releaseStart = resolvePromise })
+  const startEntered = new Promise<void>((resolvePromise) => { markStart = resolvePromise })
+  const relay = {
+    async start() {
+      markStart()
+      await startGate
+      return 'http://127.0.0.1:12345/route/test'
+    },
+    async close() {},
+  } as unknown as CursorSandRelay
+  const adapter = new CursorSandAdapter({
+    sessionKey: 'agent:main:test:sand-preheat-shutdown', agentId: 'main', agentBaseDir: process.cwd(),
+    config: {} as never, model: 'cursor-fable-5-high',
+  }, relay)
+  const preheat = adapter.preheat()
+  const preheatFailure = preheat.then(
+    () => null,
+    (error: unknown) => error,
+  )
+  await startEntered
+  let shutdownSettled = false
+  const shutdown = adapter.shutdown().then(() => { shutdownSettled = true })
+  await new Promise((resolvePromise) => setImmediate(resolvePromise))
+  assert.equal(shutdownSettled, false)
+  releaseStart()
+  assert.match(String(await preheatFailure), /CURSOR_SAND_ADAPTER_SHUTDOWN/)
+  await shutdown
+  assert.equal(adapter.isRunning, false)
+})
+
 test('routing interrupt during deferred variant preparation prevents inner submission', async () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-routing-cancel-'))
   const sidecar = resolve(dir, '.sand-mode')
@@ -190,13 +264,15 @@ test('routing interrupt during deferred variant preparation prevents inner submi
   })
   try {
     let releaseVariant!: () => void
+    let markVariant!: () => void
     const variantGate = new Promise<void>((resolvePromise) => { releaseVariant = resolvePromise })
+    const variantEntered = new Promise<void>((resolvePromise) => { markVariant = resolvePromise })
     let submissions = 0
     const testRouter = router as unknown as {
       ensureVariant: () => Promise<void>
       inner: { submitTurn: () => never }
     }
-    testRouter.ensureVariant = async () => { await variantGate }
+    testRouter.ensureVariant = async () => { markVariant(); await variantGate }
     testRouter.inner.submitTurn = () => {
       submissions++
       throw new Error('cancelled routing submit must not reach the inner adapter')
@@ -205,10 +281,62 @@ test('routing interrupt during deferred variant preparation prevents inner submi
       input: 'hello', sessionTotals: { totalCostUSD: 0, turns: 0 },
       toolUseIdToName: new Map(), onEvent() {}, onPostTerminalRuntimeEvent() {},
     })
+    await variantEntered
     assert.equal(router.interrupt(), true)
     releaseVariant()
     await run.submitted
     assert.equal(await run.summary, null)
+    assert.equal(submissions, 0)
+  } finally {
+    await router.shutdown()
+    if (previous === undefined) delete process.env.OC_CURSOR_SAND_SIDECAR
+    else process.env.OC_CURSOR_SAND_SIDECAR = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('routing shutdown during deferred preparation prevents resurrection', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-routing-shutdown-'))
+  const sidecar = resolve(dir, '.sand-mode')
+  const previous = process.env.OC_CURSOR_SAND_SIDECAR
+  process.env.OC_CURSOR_SAND_SIDECAR = sidecar
+  writeFileSync(sidecar, 'api-key 0\n')
+  const router = new CursorRoutingAdapter({
+    sessionKey: 'agent:main:test:routing-shutdown', agentId: 'main', agentBaseDir: dir,
+    config: {} as never, model: 'cursor-grok-4.6-high',
+  })
+  try {
+    let releaseVariant!: () => void
+    let markVariant!: () => void
+    const variantGate = new Promise<void>((resolvePromise) => { releaseVariant = resolvePromise })
+    const variantEntered = new Promise<void>((resolvePromise) => { markVariant = resolvePromise })
+    let submissions = 0
+    const testRouter = router as unknown as {
+      ensureVariant: () => Promise<void>
+      inner: { submitTurn: () => never }
+    }
+    testRouter.ensureVariant = async () => { markVariant(); await variantGate }
+    testRouter.inner.submitTurn = () => {
+      submissions++
+      throw new Error('shutdown routing submit must not reach the inner adapter')
+    }
+    const run = router.submitTurn({
+      input: 'hello', sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(), onEvent() {}, onPostTerminalRuntimeEvent() {},
+    })
+    const submittedFailure = run.submitted.then(
+      () => null,
+      (error: unknown) => error,
+    )
+    await variantEntered
+    let shutdownSettled = false
+    const shutdown = router.shutdown().then(() => { shutdownSettled = true })
+    await new Promise((resolvePromise) => setImmediate(resolvePromise))
+    assert.equal(shutdownSettled, false)
+    releaseVariant()
+    assert.match(String(await submittedFailure), /CURSOR_ROUTER_SHUTDOWN/)
+    assert.equal(await run.summary, null)
+    await shutdown
     assert.equal(submissions, 0)
   } finally {
     await router.shutdown()
