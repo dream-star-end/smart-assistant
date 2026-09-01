@@ -294,23 +294,120 @@ function toolProtocolPrompt(tools: unknown): string {
   ].join('\n')
 }
 
-function systemMessages(system: unknown, tools: unknown): JsonObject[] {
-  const text = [contentText(system), toolProtocolPrompt(tools)].filter(Boolean).join('\n\n')
+function nativeInferenceTools(upstreamModel: string): boolean {
+  // Live-proven against InferenceService/tool_call_part. Fable/Opus currently
+  // reject the same native tool declaration with provider HTTP 400, so they
+  // remain on the explicit compatibility bridge instead of silently failing.
+  return upstreamModel.startsWith('cursor-grok-')
+}
+
+function inferenceTools(tools: unknown): JsonObject[] {
+  if (!Array.isArray(tools)) return []
+  return tools.flatMap((raw) => {
+    if (!raw || typeof raw !== 'object') return []
+    const tool = raw as AnthropicTool
+    if (typeof tool.name !== 'string' || !tool.name) return []
+    const schema = tool.input_schema && typeof tool.input_schema === 'object'
+      ? tool.input_schema
+      : { type: 'object', properties: {} }
+    return [{
+      name: tool.name,
+      description: typeof tool.description === 'string' ? tool.description : '',
+      parametersJsonSchema: JSON.stringify(schema),
+    }]
+  })
+}
+
+function systemMessages(system: unknown, tools: unknown, nativeTools: boolean): JsonObject[] {
+  const text = [contentText(system), nativeTools ? '' : toolProtocolPrompt(tools)].filter(Boolean).join('\n\n')
   return text ? [{ role: 4, text }] : []
 }
 
-function translateMessages(messages: unknown): JsonObject[] {
+function protoValue(value: unknown): JsonObject {
+  if (value === null || value === undefined) return { nullValue: 0 }
+  if (typeof value === 'string') return { stringValue: value }
+  if (typeof value === 'number') return { numberValue: value }
+  if (typeof value === 'boolean') return { boolValue: value }
+  if (Array.isArray(value)) return { listValue: { values: value.map(protoValue) } }
+  if (typeof value === 'object') {
+    return {
+      structValue: {
+        fields: Object.fromEntries(Object.entries(value as JsonObject).map(([key, item]) => [key, protoValue(item)])),
+      },
+    }
+  }
+  return { stringValue: String(value) }
+}
+
+function translateMessages(messages: unknown, nativeTools: boolean): JsonObject[] {
   if (!Array.isArray(messages)) return []
   const out: JsonObject[] = []
+  const toolNames = new Map<string, string>()
+  if (nativeTools) {
+    for (const raw of messages) {
+      if (!raw || typeof raw !== 'object') continue
+      const message = raw as AnthropicMessage
+      if (message.role !== 'assistant' || !Array.isArray(message.content)) continue
+      for (const block of message.content) {
+        if (!block || typeof block !== 'object') continue
+        const record = block as JsonObject
+        if (record.type === 'tool_use' && typeof record.id === 'string' && typeof record.name === 'string') {
+          toolNames.set(record.id, record.name)
+        }
+      }
+    }
+  }
   for (const raw of messages) {
     if (!raw || typeof raw !== 'object') continue
     const message = raw as AnthropicMessage
     if (message.role === 'assistant') {
+      if (nativeTools && Array.isArray(message.content)) {
+        const text = message.content.flatMap((block) => {
+          if (!block || typeof block !== 'object') return []
+          const record = block as JsonObject
+          return record.type === 'text' && typeof record.text === 'string' ? [record.text] : []
+        }).join('\n')
+        const toolCalls = message.content.flatMap((block) => {
+          if (!block || typeof block !== 'object') return []
+          const record = block as JsonObject
+          if (record.type !== 'tool_use' || typeof record.id !== 'string' || typeof record.name !== 'string') return []
+          return [{
+            toolCallId: record.id,
+            toolName: record.name,
+            rawToolCallArgs: JSON.stringify(record.input ?? {}),
+          }]
+        })
+        if (text || toolCalls.length > 0) out.push({ role: 2, ...(text ? { text } : {}), ...(toolCalls.length ? { toolCalls } : {}) })
+        continue
+      }
       const text = assistantHistoryText(message.content)
       if (text) out.push({ role: 2, text })
       continue
     }
     if (message.role !== 'user') continue
+    if (nativeTools && Array.isArray(message.content)) {
+      const textBlocks: string[] = []
+      for (const block of message.content) {
+        if (!block || typeof block !== 'object') continue
+        const record = block as JsonObject
+        if (record.type === 'text' && typeof record.text === 'string') textBlocks.push(record.text)
+        if (record.type === 'tool_result' && typeof record.tool_use_id === 'string') {
+          out.push({
+            role: 3,
+            toolContent: {
+              parts: [{
+                toolCallId: record.tool_use_id,
+                toolName: toolNames.get(record.tool_use_id) ?? '',
+                result: protoValue(contentText(record.content)),
+                isError: record.is_error === true,
+              }],
+            },
+          })
+        }
+      }
+      if (textBlocks.length > 0) out.push({ role: 1, text: textBlocks.join('\n') })
+      continue
+    }
     const text = userHistoryText(message.content)
     const parts = contentParts(message.content)
     const hasMedia = parts.some((part) => 'image' in part || 'file' in part)
@@ -333,7 +430,11 @@ export function encodeCursorSandRequest(body: AnthropicMessagesBody): {
     throw new Error(`CURSOR_SAND_MODEL_NOT_SUPPORTED:${body.model}`)
   }
   const invocationId = randomUUID()
-  const messages = [...systemMessages(body.system, body.tools), ...translateMessages(body.messages)]
+  const useNativeTools = nativeInferenceTools(model.upstreamModel)
+  const messages = [
+    ...systemMessages(body.system, body.tools, useNativeTools),
+    ...translateMessages(body.messages, useNativeTools),
+  ]
   if (messages.length === 0) throw new Error('CURSOR_SAND_MESSAGES_REQUIRED')
   const requestedModel: JsonObject = {
     modelId: model.upstreamModel,
@@ -342,11 +443,7 @@ export function encodeCursorSandRequest(body: AnthropicMessagesBody): {
   const { request } = getProtocolTypes()
   const payload = request.encode(request.fromObject({
     messages,
-    // Grok Bot OAuth sessions advertise native InferenceAgentTool rows, but
-    // Cursor API-key Sand rejects the same field with provider HTTP 400. Keep
-    // this path on the validated Anthropic↔control bridge above; never silently
-    // switch API-key accounts to an OAuth-only wire contract.
-    tools: [],
+    tools: useNativeTools ? inferenceTools(body.tools) : [],
     modelConfig: {
       maxTokens: typeof body.max_tokens === 'number' ? Math.max(1, Math.floor(body.max_tokens)) : 4096,
       ...(typeof body.temperature === 'number' ? { temperature: body.temperature } : {}),

@@ -615,6 +615,52 @@ test('Anthropic request encodes the concrete Fable model, history and tools', ()
   assert.deepEqual(request.tools ?? [], [])
 })
 
+test('Grok Sand encodes native tool schemas and structured tool-result history', () => {
+  const encoded = encodeCursorSandRequest({
+    model: 'cursor-grok-4.6-high',
+    system: [{ type: 'text', text: 'system' }],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'run it' }] },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'call_1', name: 'Bash', input: { command: 'printf ok' } }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'call_1', content: 'ok' }],
+      },
+    ],
+    tools: [{
+      name: 'Bash',
+      description: 'run a command',
+      input_schema: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+      },
+    }],
+  })
+  const request = StreamRequest.toObject(StreamRequest.decode(encoded.bytes), { oneofs: true })
+  assert.equal(request.modelId, 'cursor-grok-4.6-high')
+  assert.equal(request.messages[0].role, 4)
+  assert.doesNotMatch(request.messages[0].text, /<tool_use name="TOOL_NAME">/)
+  assert.equal(request.tools.length, 1)
+  assert.equal(request.tools[0].name, 'Bash')
+  assert.deepEqual(JSON.parse(request.tools[0].parametersJsonSchema), {
+    type: 'object',
+    properties: { command: { type: 'string' } },
+    required: ['command'],
+  })
+  const assistant = request.messages.find((message: { role?: number }) => message.role === 2)
+  assert.equal(assistant.toolCalls[0].toolCallId, 'call_1')
+  assert.equal(assistant.toolCalls[0].toolName, 'Bash')
+  assert.equal(assistant.toolCalls[0].rawToolCallArgs, '{"command":"printf ok"}')
+  const toolResult = request.messages.find((message: { role?: number }) => message.role === 3)
+  assert.equal(toolResult.toolContent.parts[0].toolCallId, 'call_1')
+  assert.equal(toolResult.toolContent.parts[0].toolName, 'Bash')
+  assert.equal(toolResult.toolContent.parts[0].result.stringValue, 'ok')
+})
+
 test('every concrete catalog Cursor model maps to its Sand InferenceService id', () => {
   const unique = [...new Map(CURSOR_ENGINE_MODELS.map((model) => [model.id, model])).values()]
   for (const model of unique) {

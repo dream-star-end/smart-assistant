@@ -123,6 +123,8 @@ message InferenceAgentTool {
   string description = 2;
   Struct parameters = 3;
   InferenceCustomToolFormat custom_tool_format = 4;
+  // Current Grok Bot/Sand wire uses a bare JSON Schema document here.
+  string parameters_json_schema = 5;
 }
 
 message InferenceCustomToolFormat {
