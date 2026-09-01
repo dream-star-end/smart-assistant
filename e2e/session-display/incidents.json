@@ -2368,6 +2368,11 @@
         },
         {
           "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "Grok Sand encodes native tool schemas and structured tool-result history"
+        },
+        {
+          "layer": "unit",
           "path": "packages/gateway/src/__tests__/sessionManagerResumeMap.test.ts",
           "assertion": "Cursor Sand resume ids validate against CCB JSONL instead of Cursor workspace store"
         },
@@ -2397,7 +2402,8 @@
         "cd25a50a",
         "cd7ec21d",
         "5ff831e4",
-        "a5da8cea"
+        "a5da8cea",
+        "e3f11e62"
       ]
     }
   ]
