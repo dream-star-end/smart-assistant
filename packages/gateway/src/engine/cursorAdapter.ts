@@ -1428,6 +1428,20 @@ export function attachCursorGatewayRouting(
 }
 
 export const CURSOR_CHATS_DIR_NAME = 'cursor-chats'
+export const CURSOR_SAND_RESUME_PREFIX = 'sand-ccb:'
+const CURSOR_RESUME_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export function isCursorSandResumeId(sessionId: string | null | undefined): sessionId is string {
+  return typeof sessionId === 'string' && sessionId.startsWith(CURSOR_SAND_RESUME_PREFIX)
+}
+
+/** Sand runs the Cursor model through a CCB agent loop. Its durable resume id
+ * therefore lives in CLAUDE_CONFIG_DIR, not Cursor's chats/<cwd-hash> store. */
+export function cursorSandResumeInnerId(sessionId: string | null | undefined): string | undefined {
+  if (!isCursorSandResumeId(sessionId)) return undefined
+  const inner = sessionId.slice(CURSOR_SAND_RESUME_PREFIX.length)
+  return CURSOR_RESUME_ID_RE.test(inner) ? inner : undefined
+}
 
 /** Durable Cursor chat store, deliberately OUTSIDE the per-turn ephemeral HOME
  *  so resume survives while auth.json/JWT still dies with the turn. */
@@ -1471,7 +1485,6 @@ export function cursorResumeStoreDir(workspacePath: string, sessionId: string): 
   return dirname(cursorResumeStorePath(workspacePath, sessionId))
 }
 
-const CURSOR_RESUME_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const WEBCHAT_DM_SESSION_RE = /:webchat:dm:([A-Za-z0-9_-]{8,50})$/
 
 export function webChatSessionIdFromSessionKey(sessionKey: string): string | undefined {

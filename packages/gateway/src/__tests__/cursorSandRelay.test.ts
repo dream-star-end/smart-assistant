@@ -550,6 +550,15 @@ test('tool recovery accepts XML and bounded compact control but rejects unknown 
   assert.deepEqual(colon.tools[0].input, { command: 'printf ok' })
   assert.equal(colon.text, '')
 
+  const cursorCardText = recoverXmlToolCalls(
+    'name Bash\ninput {"command":"printf ok"}\n\nresult\nFAKE_RESULT\nfinal answer',
+    [bash],
+  )
+  assert.equal(cursorCardText.tools.length, 1)
+  assert.equal(cursorCardText.tools[0].name, 'Bash')
+  assert.deepEqual(cursorCardText.tools[0].input, { command: 'printf ok' })
+  assert.equal(cursorCardText.text, '')
+
   const rejected = recoverXmlToolCalls(
     'tool_call: {"name":"Unadvertised","arguments":{}}',
     [bash],
@@ -742,6 +751,56 @@ test('ordinary tool examples remain text and do not trigger a correction request
     assert.match(body, /Example:/)
     assert.match(body, /"stop_reason":"end_turn"/)
     assert.equal(inferenceCalls, 1)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('mixed tool JSON and fabricated result is corrected to structured tool_use without leaking raw text', async () => {
+  let inferenceCalls = 0
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    inferenceCalls++
+    const text = inferenceCalls === 1
+      ? '{"command":"printf ok"}\n\nFAKE_RESULT'
+      : '<tool_use name="Bash">{"command":"printf ok"}</tool_use>'
+    return new Response(Buffer.concat([
+      responseFrame('textPart', { text }),
+      responseFrame('usage', { promptTokens: 8, completionTokens: 6, totalTokens: 14 }),
+      envelope(Buffer.from('{}'), 0x02),
+    ]), {
+      status: 200,
+      headers: { 'content-type': 'application/connect+proto' },
+    })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-fable-5-high', stream: true, max_tokens: 64,
+        messages: [{ role: 'user', content: 'run it' }],
+        tools: [{
+          name: 'Bash',
+          input_schema: {
+            type: 'object', properties: { command: { type: 'string' } }, required: ['command'],
+          },
+        }],
+      }),
+    })
+    assert.equal(response.status, 200)
+    const body = await response.text()
+    assert.match(body, /"type":"tool_use"/)
+    assert.match(body, /"stop_reason":"tool_use"/)
+    assert.doesNotMatch(body, /FAKE_RESULT/)
+    assert.equal(inferenceCalls, 2)
   } finally {
     await relay.close()
   }

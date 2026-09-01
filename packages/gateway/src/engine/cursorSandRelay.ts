@@ -342,6 +342,10 @@ export function encodeCursorSandRequest(body: AnthropicMessagesBody): {
   const { request } = getProtocolTypes()
   const payload = request.encode(request.fromObject({
     messages,
+    // Grok Bot OAuth sessions advertise native InferenceAgentTool rows, but
+    // Cursor API-key Sand rejects the same field with provider HTTP 400. Keep
+    // this path on the validated Anthropic↔control bridge above; never silently
+    // switch API-key accounts to an OAuth-only wire contract.
     tools: [],
     modelConfig: {
       maxTokens: typeof body.max_tokens === 'number' ? Math.max(1, Math.floor(body.max_tokens)) : 4096,
@@ -524,6 +528,42 @@ export function recoverXmlToolCalls(
     tools.push({ id: `toolu_${randomBytes(16).toString('hex')}`, name: canonical, input: object })
     return ''
   }) : text
+  // Cursor/Fable sometimes serializes the host tool card as plain control text
+  // and then hallucinates a result/final answer in the same response. Recover
+  // only the first validated call and discard everything after it; the real
+  // host result must arrive on the next Anthropic turn.
+  if (tools.length === 0) {
+    const nameInput = /^\s*name\s+([A-Za-z0-9_.:-]+)\s*\ninput\s*:?[ \t]*/i.exec(visible)
+    if (nameInput) {
+      const rawName = nameInput[1]
+      const rest = visible.slice(nameInput[0].length)
+      const object = firstJsonObject(rest)
+      try {
+        const input = object && rest.trimStart().startsWith(object)
+          ? JSON.parse(object) as unknown
+          : null
+        const canonical = allowed.get(rawName.toLowerCase())
+        const schema = schemas.get(rawName.toLowerCase())
+        if (
+          canonical
+          && schema
+          && input
+          && typeof input === 'object'
+          && !Array.isArray(input)
+          && schemaMatchesInput(schema, input as JsonObject)
+        ) {
+          tools.push({
+            id: `toolu_${randomBytes(16).toString('hex')}`,
+            name: canonical,
+            input: input as JsonObject,
+          })
+          visible = ''
+        }
+      } catch {
+        // Malformed name/input control is corrected once by the caller.
+      }
+    }
+  }
   // Fable occasionally emits the same control in a compact single-line form
   // despite the XML instruction. Accept only a bounded JSON object on one
   // line, validate the advertised name, and discard all speculative text after
@@ -615,10 +655,25 @@ function looksLikeInvalidToolIntent(
   // Correction is reserved for a whole-response control attempt. Prose that
   // merely documents an XML/tool_call example must remain ordinary text.
   if (/^<tool_(?:use|call)\b/i.test(trimmed)) return true
+  // Prose before an otherwise valid XML control is still unsafe: executing it
+  // would mix speculative text with a side effect. Ask once for control-only.
+  if (!/^(?:example|for example)\s*:/i.test(trimmed) && /<tool_(?:use|call)\b/i.test(trimmed)) return true
   if (/^tool_call\s*:/i.test(trimmed)) return true
   if (/^:\s*[A-Za-z0-9_.:-]+\s*\ninput:/i.test(trimmed)) return true
+  if (/^name\s+[A-Za-z0-9_.:-]+\s*\ninput\s*:?/i.test(trimmed)) return true
+  const compactName = /^([A-Za-z0-9_.:-]+)\s*:/i.exec(trimmed)?.[1]
+  if (compactName && allowedTools.some((tool) => tool.name.toLowerCase() === compactName.toLowerCase())) return true
+  const bashAdvertised = allowedTools.some((tool) => tool.name.toLowerCase() === 'bash')
+  if (
+    bashAdvertised
+    && trimmed.length > 0
+    && trimmed.length <= 2_000
+    && !trimmed.includes('\n')
+    && !trimmed.includes('```')
+    && (/\s(?:&&|\|\||;)\s/.test(trimmed) || /\s\|\s/.test(trimmed))
+  ) return true
   const object = firstJsonObject(trimmed)
-  if (!object || object !== trimmed) return false
+  if (!object || !trimmed.startsWith(object)) return false
   try {
     const parsed = JSON.parse(object) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
@@ -634,9 +689,11 @@ function correctedToolBody(body: AnthropicMessagesBody, invalidResponse: string)
   messages.push({
     role: 'user',
     content:
-      'FORMAT ERROR: your previous response attempted a tool call but was not executable. '
-      + 'Return your ENTIRE response as exactly one <tool_use name="TOOL_NAME">{"argument":"value"}</tool_use> block. '
-      + 'No prose, no Markdown, no bare JSON, and do not invent a tool result.',
+      'FORMAT ERROR: your previous response attempted or ambiguously resembled a tool call but was not executable. '
+      + 'If a tool is intended, return your ENTIRE response as exactly one '
+      + '<tool_use name="TOOL_NAME">{"argument":"value"}</tool_use> block. '
+      + 'If no tool is intended, answer as a normal explanatory sentence. '
+      + 'Never emit prose around a tool block, a bare command/control, or an invented tool result.',
   })
   return { ...body, messages }
 }

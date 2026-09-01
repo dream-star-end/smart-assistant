@@ -17,7 +17,12 @@ import type {
 } from './engineAdapter.js'
 import type { PartialSnapshot, PhantomSignals } from './engineEvents.js'
 import type { EngineCreateOpts } from './registry.js'
-import { CursorAdapter } from './cursorAdapter.js'
+import {
+  CursorAdapter,
+  CURSOR_SAND_RESUME_PREFIX,
+  cursorSandResumeInnerId,
+  isCursorSandResumeId,
+} from './cursorAdapter.js'
 import { CursorSandAdapter } from './cursorSandAdapter.js'
 import {
   cursorSandEnabledForSelection,
@@ -46,8 +51,6 @@ const EMPTY_SNAPSHOT: PartialSnapshot = {
   assistantSegments: [], thinkingSegments: [], runtimeEvents: [],
 }
 const EMPTY_PHANTOM: PhantomSignals = { apiState: 'unknown', skipReason: null }
-const SAND_RESUME_PREFIX = 'sand-ccb:'
-
 function variantFor(
   model: string | undefined,
   selection: CursorCredentialSelection,
@@ -57,10 +60,8 @@ function variantFor(
 
 function resumeForVariant(resume: string | undefined, variant: CursorVariant): string | undefined {
   if (!resume) return undefined
-  if (variant === 'sand') return resume.startsWith(SAND_RESUME_PREFIX)
-    ? resume.slice(SAND_RESUME_PREFIX.length)
-    : undefined
-  return resume.startsWith(SAND_RESUME_PREFIX) ? undefined : resume
+  if (variant === 'sand') return cursorSandResumeInnerId(resume)
+  return isCursorSandResumeId(resume) ? undefined : resume
 }
 
 export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter {
@@ -126,7 +127,7 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
           ) this.credentialNeedsRefresh = true
         }
         if (event === 'session_id' && this.variant === 'sand' && typeof args[0] === 'string') {
-          this.emit(event, `${SAND_RESUME_PREFIX}${args[0]}`)
+          this.emit(event, `${CURSOR_SAND_RESUME_PREFIX}${args[0]}`)
         } else {
           this.emit(event, ...args)
         }
@@ -211,7 +212,7 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
         this.credentialSelection = next
         this.opts.cursorCredentialSelection = next
         this.opts.resumeSessionId = nativeId
-          ? this.variant === 'sand' ? `${SAND_RESUME_PREFIX}${nativeId}` : nativeId
+          ? this.variant === 'sand' ? `${CURSOR_SAND_RESUME_PREFIX}${nativeId}` : nativeId
           : undefined
         this.inner = this.createInner(this.variant)
         this.bindInner()
@@ -333,7 +334,7 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   get nativeSessionId(): string | null {
     if (variantFor(this.opts.model, this.credentialSelection) !== this.variant) return null
     const id = this.inner.nativeSessionId
-    return id && this.variant === 'sand' ? `${SAND_RESUME_PREFIX}${id}` : id
+    return id && this.variant === 'sand' ? `${CURSOR_SAND_RESUME_PREFIX}${id}` : id
   }
   clearSessionId(): void {
     this.opts.resumeSessionId = undefined

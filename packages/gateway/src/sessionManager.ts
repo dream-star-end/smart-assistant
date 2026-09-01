@@ -34,7 +34,13 @@ import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
 import { decideEngineCwd } from './engineCwd.js'
-import { cursorResumeStoreExists, relocateCursorResumeStore, usableCursorResumeId } from './engine/cursorAdapter.js'
+import {
+  cursorResumeStoreExists,
+  cursorSandResumeInnerId,
+  isCursorSandResumeId,
+  relocateCursorResumeStore,
+  usableCursorResumeId,
+} from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
 import type {
   AutomaticRetryState,
@@ -2963,6 +2969,34 @@ export class SessionManager {
       this._saveResumeMap()
       return undefined
     }
+    const sandCcbId = tag === 'cursor' ? cursorSandResumeInnerId(id) : undefined
+    if (sandCcbId) {
+      if (this._ccbJsonlExists(sandCcbId)) return id
+      log.warn('resume-map Sand CCB entry points to missing JSONL — dropping silently', {
+        sessionKey,
+        resumeId: id,
+      })
+      this._resumeMap.delete(sessionKey)
+      this._resumeMapTimestamps.delete(sessionKey)
+      this._resumeMapProvider.delete(sessionKey)
+      this._resumeMapLastCost.delete(sessionKey)
+      this._resumeMapCostImprecise.delete(sessionKey)
+      this._saveResumeMap()
+      return undefined
+    }
+    if (tag === 'cursor' && isCursorSandResumeId(id)) {
+      log.warn('resume-map Sand CCB entry is malformed — dropping silently', {
+        sessionKey,
+        resumeId: id,
+      })
+      this._resumeMap.delete(sessionKey)
+      this._resumeMapTimestamps.delete(sessionKey)
+      this._resumeMapProvider.delete(sessionKey)
+      this._resumeMapLastCost.delete(sessionKey)
+      this._resumeMapCostImprecise.delete(sessionKey)
+      this._saveResumeMap()
+      return undefined
+    }
     if (tag === 'cursor' && workspacePath && !cursorResumeStoreExists(workspacePath, id)) {
       // Do not drop the map: spawn cwd is the resume authority, and a
       // recomputed overlay can hash to a different chats/ dir than the live
@@ -4497,12 +4531,18 @@ export class SessionManager {
         })
       }
       const spawnCwd = this._cursorWorkspacePathForSession(session)
+      const liveNativeId = session.runner.nativeSessionId
+      const liveSandCcbId = session.providerTag === 'cursor'
+        ? cursorSandResumeInnerId(liveNativeId)
+        : undefined
       const usableCursorId = session.providerTag === 'cursor'
-        ? usableCursorResumeId({
-            workspacePath: spawnCwd,
-            liveId: session.runner.nativeSessionId,
-            mappedId: this._resumeMap.get(session.sessionKey),
-          })
+        ? liveSandCcbId && this._ccbJsonlExists(liveSandCcbId)
+          ? liveNativeId ?? undefined
+          : usableCursorResumeId({
+              workspacePath: spawnCwd,
+              liveId: liveNativeId,
+              mappedId: this._resumeMap.get(session.sessionKey),
+            })
         : undefined
       let providerResumeId = usableCursorId ?? this._resumeIdFor(
         session.sessionKey,
