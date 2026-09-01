@@ -73,7 +73,7 @@ test('CCB resume map rebuilds obsolete history contexts while preserving current
   }
 })
 
-test('Cursor Sand resume ids validate against CCB JSONL instead of Cursor workspace store', async () => {
+test('legacy Sand CCB resume ids retire once Sand returns to native Cursor resume', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'oc-sand-resume-map-'))
   const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
   try {
@@ -91,12 +91,6 @@ test('Cursor Sand resume ids validate against CCB JSONL instead of Cursor worksp
     internals._resumeMap.set('sand-session', prefixedId)
     internals._resumeMapProvider.set('sand-session', 'cursor')
 
-    assert.equal(
-      internals._resumeIdFor('sand-session', 'cursor', join(dir, 'workspace-with-no-cursor-store')),
-      prefixedId,
-    )
-
-    rmSync(join(projectDir, `${innerId}.jsonl`))
     assert.equal(
       internals._resumeIdFor('sand-session', 'cursor', join(dir, 'workspace-with-no-cursor-store')),
       undefined,

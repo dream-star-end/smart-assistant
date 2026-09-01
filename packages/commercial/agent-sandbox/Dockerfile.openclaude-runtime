@@ -299,6 +299,7 @@ RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
 ARG OC_CURSOR_AGENT_VERSION=2026.08.11-e8db854
 ARG OC_CURSOR_AGENT_SHA256=bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a
 ARG OC_INCLUDE_CURSOR=0
+COPY --chown=root:root ./platform-runtime/bin/patch-cursor-agent-sand.mjs /usr/local/lib/openclaude/patch-cursor-agent-sand.mjs
 RUN if [ "$OC_INCLUDE_CURSOR" = "1" ]; then set -eux; \
     test "$(dpkg --print-architecture)" = amd64; \
     archive=/tmp/cursor-agent-cli.tar.gz; \
@@ -311,6 +312,9 @@ RUN if [ "$OC_INCLUDE_CURSOR" = "1" ]; then set -eux; \
     tar --strip-components=1 -xzf "$archive" -C "$install_root"; \
     rm -f "$archive"; \
     test -x "$install_root/cursor-agent"; \
+    node /usr/local/lib/openclaude/patch-cursor-agent-sand.mjs "$install_root"; \
+    node --check "$install_root/index.js"; \
+    grep -q '^OPENCLAUDE_SCOPED_SAND_V1 ' "$install_root/.openclaude-scoped-sand-v1"; \
     chmod -R a-w "$install_root"; \
     ln -s "$install_root/cursor-agent" /usr/local/bin/cursor-agent; \
     test "$(/usr/local/bin/cursor-agent --version)" = "$OC_CURSOR_AGENT_VERSION"; \

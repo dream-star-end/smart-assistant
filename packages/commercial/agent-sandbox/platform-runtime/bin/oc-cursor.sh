@@ -1080,10 +1080,22 @@ unset OPENCLAUDE_CURSOR_AGENT_DEBUG
 unset OPENCLAUDE_CURSOR_SELECT_ONLY OPENCLAUDE_CURSOR_RECORD_RESULT OPENCLAUDE_CURSOR_SELECTED_KEY
 unset OPENCLAUDE_CURSOR_POOL_GENERATION OPENCLAUDE_CURSOR_ACCOUNT_ID OPENCLAUDE_CURSOR_KEY_FINGERPRINT
 
-# Sand is a credential transport property handled by CursorRoutingAdapter.
-# This native wrapper must never try to turn AgentService into Sand by adding a
-# header; when it is invoked, the bound route is deliberately native (or Auto,
-# which has no concrete InferenceService model id).
+# Sand remains a credential transport property, but the official Cursor CLI
+# keeps the native agent/tool loop. The pinned image carries a fail-closed,
+# build-time patch that changes only InferenceService/ChatService/AiService
+# requests to Sand; AgentService and every other control-plane RPC stay `cli`.
+# Auto has no concrete model id and therefore remains native.
+cursor_sand_child=0
+if [ "$sand_enabled" -eq 1 ] && [ -n "$model" ]; then
+  cursor_patch_marker=${cursor_bin%/*}/.openclaude-scoped-sand-v1
+  cursor_patch_text=$(/bin/cat -- "$cursor_patch_marker" 2>/dev/null) \
+    || die "Sand-capable Cursor CLI patch marker is unavailable"
+  case "$cursor_patch_text" in
+    "OPENCLAUDE_SCOPED_SAND_V1 "[0-9a-f][0-9a-f]*) ;;
+    *) die "Sand-capable Cursor CLI patch marker is invalid" ;;
+  esac
+  cursor_sand_child=1
+fi
 
 prompt=$1
 shift
@@ -1114,11 +1126,15 @@ set +e
 if [ "$cursor_debug" -eq 1 ]; then
   HOME="$cursor_home" \
   XDG_CONFIG_HOME="$cursor_home/.config" \
+  OPENCLAUDE_CURSOR_SAND_MODE="$cursor_sand_child" \
+  OPENCLAUDE_CURSOR_SAND_CLIENT_VERSION="0.30.0" \
   CURSOR_API_KEY="$api_key" \
   /usr/bin/setsid "$cursor_bin" "$@" 8>&- 2> "$debug_fifo" &
 else
   HOME="$cursor_home" \
   XDG_CONFIG_HOME="$cursor_home/.config" \
+  OPENCLAUDE_CURSOR_SAND_MODE="$cursor_sand_child" \
+  OPENCLAUDE_CURSOR_SAND_CLIENT_VERSION="0.30.0" \
   CURSOR_AGENT_DISABLE_DEBUG_LOG=1 \
   CURSOR_API_KEY="$api_key" \
   /usr/bin/setsid "$cursor_bin" "$@" 8>&- &

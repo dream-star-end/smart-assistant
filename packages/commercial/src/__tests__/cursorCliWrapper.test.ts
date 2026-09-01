@@ -124,6 +124,11 @@ printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"o
     { mode: 0o755 },
   )
   chmodSync(fakeBin, 0o755)
+  writeFileSync(
+    join(dir, '.openclaude-scoped-sand-v1'),
+    `OPENCLAUDE_SCOPED_SAND_V1 ${'a'.repeat(64)}\n`,
+    { mode: 0o444 },
+  )
 
   writeFileSync(
     fakeProbe,
@@ -206,6 +211,8 @@ describe('oc-cursor wrapper', () => {
     assert.match(source, /sha256sum -c -/)
     assert.match(source, /chmod -R a-w "\$install_root"/)
     assert.match(source, /cursor-agent --version/)
+    assert.match(source, /patch-cursor-agent-sand\.mjs/)
+    assert.match(source, /OPENCLAUDE_SCOPED_SAND_V1/)
     assert.match(buildSource, /CURSOR_AGENT_VERSION="2026\.08\.11-e8db854"/)
     assert.match(
       wrapperSource,
@@ -1154,7 +1161,7 @@ describe('oc-cursor wrapper', () => {
   })
 
 
-  test('native wrapper never forges Sand onto AgentService even for a Sand-enabled Opus key', () => {
+  test('Sand-enabled concrete models scope Sand inside the patched CLI without argv/global header hooks', () => {
     const f = fixture()
     const authDir = dirname(f.auth)
     writeFileSync(
@@ -1176,6 +1183,14 @@ describe('oc-cursor wrapper', () => {
       'the wrapper must not force Sand onto endpoint discovery/control requests',
     )
     assert.doesNotMatch(readFileSync(sourceWrapper, 'utf8'), /Headers\.prototype/)
+    assert.match(
+      readFileSync(join(f.capture, 'env'), 'utf8'),
+      /^OPENCLAUDE_CURSOR_SAND_MODE=1$/m,
+    )
+    assert.match(
+      readFileSync(join(f.capture, 'env'), 'utf8'),
+      /^OPENCLAUDE_CURSOR_SAND_CLIENT_VERSION=0\.30\.0$/m,
+    )
   })
 
   test('metadata selection and a pinned native launch use the same account-pool Sand slot', () => {
@@ -1218,7 +1233,21 @@ describe('oc-cursor wrapper', () => {
     assert.equal(readFileSync(join(f.capture, 'key'), 'utf8').trim(), 'crsr_second')
     assert.match(launched.stderr, /slot_result 2 ok/)
     assert.equal(readFileSync(join(f.capture, 'argv'), 'utf8').includes('-H'), false)
+    assert.match(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SAND_MODE=1$/m)
     assert.doesNotMatch(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SELECTED_KEY=/m)
+  })
+
+  test('Cursor Auto remains native even when the selected key has Sand enabled', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, '.sand-mode'), '# sand-mode v1\napi-key 1\n', { mode: 0o600 })
+    const result = spawnSync(f.wrapper, ['--', 'auto prompt'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SAND_MODE=0$/m)
   })
 
   test('ten-key selection stays numeric and resolves billing to the tenth account', () => {

@@ -36,7 +36,6 @@ import './engine/grokAdapter.js'
 import { decideEngineCwd } from './engineCwd.js'
 import {
   cursorResumeStoreExists,
-  cursorSandResumeInnerId,
   isCursorSandResumeId,
   relocateCursorResumeStore,
   usableCursorResumeId,
@@ -2969,23 +2968,8 @@ export class SessionManager {
       this._saveResumeMap()
       return undefined
     }
-    const sandCcbId = tag === 'cursor' ? cursorSandResumeInnerId(id) : undefined
-    if (sandCcbId) {
-      if (this._ccbJsonlExists(sandCcbId)) return id
-      log.warn('resume-map Sand CCB entry points to missing JSONL — dropping silently', {
-        sessionKey,
-        resumeId: id,
-      })
-      this._resumeMap.delete(sessionKey)
-      this._resumeMapTimestamps.delete(sessionKey)
-      this._resumeMapProvider.delete(sessionKey)
-      this._resumeMapLastCost.delete(sessionKey)
-      this._resumeMapCostImprecise.delete(sessionKey)
-      this._saveResumeMap()
-      return undefined
-    }
     if (tag === 'cursor' && isCursorSandResumeId(id)) {
-      log.warn('resume-map Sand CCB entry is malformed — dropping silently', {
+      log.info('retiring legacy Sand CCB resume before native Cursor rebuild', {
         sessionKey,
         resumeId: id,
       })
@@ -4532,17 +4516,12 @@ export class SessionManager {
       }
       const spawnCwd = this._cursorWorkspacePathForSession(session)
       const liveNativeId = session.runner.nativeSessionId
-      const liveSandCcbId = session.providerTag === 'cursor'
-        ? cursorSandResumeInnerId(liveNativeId)
-        : undefined
       const usableCursorId = session.providerTag === 'cursor'
-        ? liveSandCcbId && this._ccbJsonlExists(liveSandCcbId)
-          ? liveNativeId ?? undefined
-          : usableCursorResumeId({
-              workspacePath: spawnCwd,
-              liveId: liveNativeId,
-              mappedId: this._resumeMap.get(session.sessionKey),
-            })
+        ? usableCursorResumeId({
+            workspacePath: spawnCwd,
+            liveId: isCursorSandResumeId(liveNativeId) ? null : liveNativeId,
+            mappedId: this._resumeMap.get(session.sessionKey),
+          })
         : undefined
       let providerResumeId = usableCursorId ?? this._resumeIdFor(
         session.sessionKey,
