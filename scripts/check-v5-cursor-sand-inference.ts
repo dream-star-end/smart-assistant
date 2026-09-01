@@ -14,6 +14,7 @@ const wrapperTests = readFileSync(resolve(root, 'packages/commercial/src/__tests
 const materializer = readFileSync(resolve(root, 'packages/commercial/src/account-pool/cursorMaterializer.ts'), 'utf8')
 const quota = readFileSync(resolve(root, 'packages/commercial/src/account-pool/cursorQuota.ts'), 'utf8')
 const bridge = readFileSync(resolve(root, 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
+const frames = readFileSync(resolve(root, 'packages/protocol/src/frames.ts'), 'utf8')
 const commercialDeploy = readFileSync(resolve(root, 'scripts/deploy-v5.sh'), 'utf8')
 const selfhostRelease = readFileSync(resolve(root, 'scripts/v5-selfhost-master-release-lib.sh'), 'utf8')
 
@@ -56,7 +57,9 @@ assert.match(materializer, /CURSOR_POOL_GENERATIONS_DIR/)
 assert.match(materializer, /CURSOR_POOL_IDENTITIES_FILE/)
 assert.match(wrapper, /printf 'v2 %s %s %s\\n'/)
 assert.match(quota, /planStableCursorQuotaUpdate/)
-assert.match(bridge, /stableAccountId: external\.cursorAccountId \? cursorAccountId : undefined/)
+assert.match(bridge, /stableAccountId: stableIdentityProvided \? cursorAccountId : undefined/)
+assert.match(bridge, /stableIdentityProvided && !stableIdentityComplete/)
+assert.match(frames, /CursorStablePoolIdentity/)
 assert.match(commercialDeploy, /check-v5-cursor-sand-inference\.ts/)
 assert.match(selfhostRelease, /check-v5-cursor-sand-inference\.ts/)
 

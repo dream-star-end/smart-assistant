@@ -544,6 +544,13 @@ describe('OutboundExternalEngineBilling Cursor pool identity', () => {
       { cursorAccountId: '0' },
       { cursorPoolGeneration: 'legacy' },
       { cursorKeyFingerprint: 'XYZ' },
+      { cursorAccountId: '42' },
+      { cursorPoolGeneration: 'gen-0123456789abcdef01234567' },
+      { cursorKeyFingerprint: '0123456789abcdef' },
+      {
+        cursorAccountId: '42',
+        cursorPoolGeneration: 'gen-0123456789abcdef01234567',
+      },
     ]) {
       assert.equal(Value.Check(OutboundExternalEngineBilling, {
         ...(baseOutboundExternalBilling() as object), ...patch,

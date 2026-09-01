@@ -7058,14 +7058,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     sessionId = existing.rows[0]?.session_id ?? sessionId;
                   }
                   let cursorAccountId: bigint | null = null;
+                  const stableIdentityParts = [
+                    external.cursorAccountId,
+                    external.cursorPoolGeneration,
+                    external.cursorKeyFingerprint,
+                  ];
+                  const stableIdentityCount = stableIdentityParts.filter((value) => value !== undefined).length;
+                  const stableIdentityProvided = stableIdentityCount > 0;
+                  const stableIdentityComplete = stableIdentityCount === stableIdentityParts.length;
                   try {
-                    if (external.cursorAccountId) {
+                    if (stableIdentityProvided && !stableIdentityComplete) {
+                      bridgeLog?.warn('user-chat-bridge: partial Cursor stable identity rejected', { requestId });
+                    } else if (
+                      external.cursorAccountId
+                      && external.cursorPoolGeneration
+                      && external.cursorKeyFingerprint
+                    ) {
                       const stable = await pool.query<{ id: string }>(
                         `SELECT id::text AS id FROM claude_accounts WHERE id=$1 AND provider='cursor'`,
                         [external.cursorAccountId],
                       );
                       cursorAccountId = stable.rows[0]?.id ? BigInt(stable.rows[0].id) : null;
-                      if (cursorAccountId !== null && external.cursorKeyFingerprint) {
+                      if (cursorAccountId !== null) {
                         const snapshot = await getCursorTokenSnapshot(cursorAccountId);
                         try {
                           const currentFingerprint = snapshot?.token
@@ -7089,7 +7103,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                           poolGeneration: external.cursorPoolGeneration ?? null,
                         });
                       }
-                    } else {
+                    } else if (!stableIdentityProvided) {
                       cursorAccountId = await resolveUsedCursorAccountId(external.cursorSlotResults);
                     }
                   } catch (resolveErr) {
@@ -7101,7 +7115,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                         modelId,
                         terminalCode,
                         slotResults: external.cursorSlotResults,
-                        stableAccountId: external.cursorAccountId ? cursorAccountId : undefined,
+                        stableAccountId: stableIdentityProvided ? cursorAccountId : undefined,
                       });
                     } catch (learnErr) {
                       bridgeLog?.warn('user-chat-bridge: Cursor quota-class learn failed', { requestId, err: learnErr });

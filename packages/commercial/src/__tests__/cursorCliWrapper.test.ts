@@ -1269,11 +1269,14 @@ describe('oc-cursor wrapper', () => {
     const fp = (key: string): string => createHash('sha256').update(`${key}\n`).digest('hex').slice(0, 16)
     const writeGeneration = (
       generation: string,
-      slots: Array<{ name: string; key: string; account: string; sand: boolean }>,
+      slots: Array<{
+        name: string; key: string; account: string; sand: boolean;
+        quota?: 'unknown' | 'other_ok' | 'cursor_only';
+      }>,
     ): void => {
       const dir = join(generations, generation)
       mkdirSync(dir, { recursive: true, mode: 0o700 })
-      writeFileSync(join(dir, '.quota-class'), `# quota-class v1\n${slots.map((s) => `${s.name} unknown`).join('\n')}\n`, { mode: 0o600 })
+      writeFileSync(join(dir, '.quota-class'), `# quota-class v1\n${slots.map((s) => `${s.name} ${s.quota ?? 'unknown'}`).join('\n')}\n`, { mode: 0o600 })
       writeFileSync(join(dir, '.sand-mode'), `# sand-mode v1\n${slots.map((s) => `${s.name} ${s.sand ? 1 : 0}`).join('\n')}\n`, { mode: 0o600 })
       writeFileSync(
         join(dir, '.slot-identities'),
@@ -1360,6 +1363,43 @@ describe('oc-cursor wrapper', () => {
     )
     assert.equal(afterFailure.status, 0, afterFailure.stderr)
     assert.match(afterFailure.stdout, new RegExp(`selected_slot 2 api-key\\.2 native ${gen2} 3 ${fp(keyC)}`))
+
+    const gen3 = 'gen-333333333333333333333333'
+    writeGeneration(gen3, [
+      { name: 'api-key', key: keyA, account: '1', sand: true },
+      { name: 'api-key.2', key: keyC, account: '3', sand: false },
+    ])
+    writeFileSync(join(authDir, '.pool-active'), `${gen3}\n`, { mode: 0o600 })
+    const removedFailure = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__select_removed_failure__'],
+      {
+        cwd: f.dir,
+        env: { ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1', OC_CURSOR_KEY_ROTATION_FILE: rotationFile },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(removedFailure.status, 0, removedFailure.stderr)
+    assert.match(removedFailure.stdout, new RegExp(`selected_slot 2 api-key\\.2 native ${gen3} 3 ${fp(keyC)}`))
+
+    const gen4 = 'gen-444444444444444444444444'
+    writeGeneration(gen4, [
+      { name: 'api-key', key: keyA, account: '1', sand: true },
+      { name: 'api-key.2', key: keyB, account: '2', sand: false, quota: 'cursor_only' },
+      { name: 'api-key.3', key: keyC, account: '3', sand: false },
+    ])
+    writeFileSync(join(authDir, '.pool-active'), `${gen4}\n`, { mode: 0o600 })
+    const filteredFailure = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__select_filtered_failure__'],
+      {
+        cwd: f.dir,
+        env: { ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1', OC_CURSOR_KEY_ROTATION_FILE: rotationFile },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(filteredFailure.status, 0, filteredFailure.stderr)
+    assert.match(filteredFailure.stdout, new RegExp(`selected_slot 3 api-key\\.3 native ${gen4} 3 ${fp(keyC)}`))
   })
 
   test('Cursor Models (Grok 4.6) stay in native CLI mode and do NOT pass -H even when .sand-mode is enabled', () => {

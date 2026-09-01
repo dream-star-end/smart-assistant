@@ -19198,6 +19198,21 @@ export class Gateway {
         }
         this.deliver(billingFrame, adapter)
       } else if (e.kind === 'external_billing') {
+        const cursorStableIdentity: {
+          cursorAccountId: string
+          cursorPoolGeneration: string
+          cursorKeyFingerprint: string
+        } | {
+          cursorAccountId?: never
+          cursorPoolGeneration?: never
+          cursorKeyFingerprint?: never
+        } = e.cursorAccountId && e.cursorPoolGeneration && e.cursorKeyFingerprint
+          ? {
+              cursorAccountId: e.cursorAccountId,
+              cursorPoolGeneration: e.cursorPoolGeneration,
+              cursorKeyFingerprint: e.cursorKeyFingerprint,
+            }
+          : {}
         const billingFrame: OutboundExternalEngineBilling & { _userId?: string } = {
           type: 'outbound.external_engine_billing',
           ..._inheritOutboundRouting(out),
@@ -19208,9 +19223,7 @@ export class Gateway {
           durationMs: e.durationMs,
           ...(e.usage ? { usage: e.usage } : {}),
           ...(e.cursorSlotResults && e.cursorSlotResults.length ? { cursorSlotResults: e.cursorSlotResults } : {}),
-          ...(e.cursorAccountId ? { cursorAccountId: e.cursorAccountId } : {}),
-          ...(e.cursorPoolGeneration ? { cursorPoolGeneration: e.cursorPoolGeneration } : {}),
-          ...(e.cursorKeyFingerprint ? { cursorKeyFingerprint: e.cursorKeyFingerprint } : {}),
+          ...cursorStableIdentity,
         }
         this.deliver(billingFrame, adapter)
       } else if (e.kind === 'error') {

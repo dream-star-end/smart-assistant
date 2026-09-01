@@ -619,6 +619,13 @@ $identity_text
 IDENTITY_LOOKUP
   return 1
 }
+decimal_account_gt() {
+  _decimal_left=$1
+  _decimal_right=$2
+  if [ "${#_decimal_left}" -gt "${#_decimal_right}" ]; then return 0; fi
+  if [ "${#_decimal_left}" -lt "${#_decimal_right}" ]; then return 1; fi
+  [ "$_decimal_left" \> "$_decimal_right" ]
+}
 
 if [ "$eligible_count" -gt 1 ]; then
   rotation_state=$(/bin/cat -- "$rotation_file" 2>/dev/null) || rotation_state=""
@@ -634,18 +641,22 @@ if [ "$eligible_count" -gt 1 ]; then
     case "$rotation_exp" in ''|*[!0-9]*) rotation_exp=0 ;; esac
     if [ "$rotation_family" = "$cursor_family" ] \
       && [ "$(/bin/date +%s)" -lt "$rotation_exp" ]; then
-      failed_position=0
+      successor_position=0
       slot_position=0
       for key_name in $eligible_names; do
         slot_position=$((slot_position + 1))
         slot_account=$(identity_account_for_key "$key_name" 2>/dev/null) || slot_account=0
-        if [ "$slot_account" = "$rotation_failed_account" ]; then
-          failed_position=$slot_position
+        if [ "$slot_account" != 0 ] \
+          && decimal_account_gt "$slot_account" "$rotation_failed_account"; then
+          successor_position=$slot_position
           break
         fi
       done
-      rotation_idx=$failed_position
-      if [ "$rotation_idx" -ge "$eligible_count" ]; then rotation_idx=0; fi
+      if [ "$successor_position" -gt 0 ]; then
+        rotation_idx=$((successor_position - 1))
+      else
+        rotation_idx=0
+      fi
     else
       rotation_idx=0
     fi
