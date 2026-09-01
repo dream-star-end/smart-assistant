@@ -79,17 +79,21 @@ test('cursor engine factory binds transport to the selected key and preserves it
     assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand')
     assert.equal(sand.capabilities.supportsNativeCompact, false)
     assert.equal(typeof sand.compactForHandoff, 'undefined')
-    sand.setModel('cursor-grok-4.6-high')
+    sand.setModel('cursor-opus-5-high')
     await (sand as CursorRoutingAdapter).refreshVariantForTest()
     assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand')
     assert.deepEqual((sand as CursorRoutingAdapter).currentCredentialForTest, SAND_SELECTION)
     assert.throws(() => sand.setModel('cursor-auto'), /CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION/)
     await sand.shutdown()
 
-    const native = createEngine('cursor', { ...opts, cursorCredentialSelection: NATIVE_SELECTION })
+    const native = createEngine('cursor', {
+      ...opts,
+      model: 'cursor-grok-4.6-high',
+      cursorCredentialSelection: NATIVE_SELECTION,
+    })
     assert.equal(native instanceof CursorRoutingAdapter, true)
     assert.equal((native as unknown as CursorRoutingAdapter).currentVariant, 'native')
-    native.setModel('cursor-opus-5-high')
+    native.setModel('cursor-composer-2.5')
     await (native as CursorRoutingAdapter).refreshVariantForTest()
     assert.equal((native as CursorRoutingAdapter).currentVariant, 'native')
     await native.shutdown()
@@ -155,6 +159,26 @@ test('failed credential rebinds within the same transport but refuses a native-t
     await assert.rejects(mixed.refreshVariantForTest(), /CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION/)
     assert.deepEqual(mixed.currentCredentialForTest, NATIVE_SELECTION)
     await mixed.shutdown()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('concrete model quota-family changes reselect an eligible key before the next turn', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-model-family-reselect-'))
+  try {
+    const nextSand = { slot: 3, keyName: 'api-key.3', sandEnabled: true }
+    let selections = 0
+    const router = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:model-family-reselect', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-grok-4.6-high', cursorCredentialSelection: SAND_SELECTION,
+    }, () => { selections++; return nextSand })
+    router.setModel('cursor-opus-5-high')
+    await router.refreshVariantForTest()
+    assert.equal(selections, 1)
+    assert.deepEqual(router.currentCredentialForTest, nextSand)
+    assert.equal(router.currentVariant, 'sand')
+    await router.shutdown()
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

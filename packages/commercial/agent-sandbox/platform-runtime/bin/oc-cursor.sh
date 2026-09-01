@@ -41,7 +41,7 @@ for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
   /usr/bin/mktemp /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat \
   /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/mv /bin/date /bin/ln \
   /usr/bin/cut /usr/bin/find /usr/bin/mkfifo /usr/bin/sha256sum \
-  /usr/bin/tail /usr/bin/tee /usr/bin/curl /usr/bin/flock; do
+  /usr/bin/tail /usr/bin/tee /usr/bin/curl /usr/bin/flock /usr/bin/sort; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
@@ -341,26 +341,37 @@ STATE
 fi
 
 set -f
-key_names=""
-key_count=0
+primary_present=0
+extra_suffixes=""
 auth_entries=$(/usr/bin/sudo -n /bin/ls -1 -- "$auth_dir" 2>/dev/null) \
   || auth_entries=""
 for auth_entry in $auth_entries; do
   case "$auth_entry" in
     api-key)
-      key_names="$key_names $auth_entry"
-      key_count=$((key_count + 1))
+      primary_present=1
       ;;
     api-key.*)
       key_suffix=${auth_entry#api-key.}
       case "$key_suffix" in
         ''|*[!0-9]*|0*|1) continue ;;
       esac
-      key_names="$key_names $auth_entry"
-      key_count=$((key_count + 1))
+      extra_suffixes="$extra_suffixes $key_suffix"
       ;;
   esac
 done
+key_names=""
+key_count=0
+if [ "$primary_present" -eq 1 ]; then
+  key_names=" api-key"
+  key_count=1
+fi
+if [ -n "$extra_suffixes" ]; then
+  sorted_suffixes=$(printf '%s\n' $extra_suffixes | /usr/bin/sort -n)
+  for key_suffix in $sorted_suffixes; do
+    key_names="$key_names api-key.$key_suffix"
+    key_count=$((key_count + 1))
+  done
+fi
 set +f
 [ "$key_count" -gt 0 ] || die "Cursor CLI is not enabled for this account"
 

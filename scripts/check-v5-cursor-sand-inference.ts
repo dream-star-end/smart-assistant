@@ -10,6 +10,7 @@ const selection = readFileSync(resolve(root, 'packages/gateway/src/engine/cursor
 const registry = readFileSync(resolve(root, 'packages/gateway/src/engine/cursorAdapter.ts'), 'utf8')
 const wrapper = readFileSync(resolve(root, 'packages/commercial/agent-sandbox/platform-runtime/bin/oc-cursor.sh'), 'utf8')
 const tests = readFileSync(resolve(root, 'packages/gateway/src/__tests__/cursorSandRelay.test.ts'), 'utf8')
+const wrapperTests = readFileSync(resolve(root, 'packages/commercial/src/__tests__/cursorCliWrapper.test.ts'), 'utf8')
 const commercialDeploy = readFileSync(resolve(root, 'scripts/deploy-v5.sh'), 'utf8')
 const selfhostRelease = readFileSync(resolve(root, 'scripts/v5-selfhost-master-release-lib.sh'), 'utf8')
 
@@ -42,6 +43,9 @@ assert.match(tests, /routing shutdown during deferred preparation prevents resur
 assert.match(tests, /every concrete catalog Cursor model maps to its Sand InferenceService id/)
 assert.match(tests, /credential selector parses a high-numbered Sand slot and records the same binding/)
 assert.match(tests, /failed credential rebinds within the same transport but refuses a native-to-Sand failover/)
+assert.match(tests, /concrete model quota-family changes reselect an eligible key before the next turn/)
+assert.match(wrapper, /\/usr\/bin\/sort -n/)
+assert.match(wrapperTests, /ten-key selection stays numeric and resolves billing to the tenth account/)
 assert.match(commercialDeploy, /check-v5-cursor-sand-inference\.ts/)
 assert.match(selfhostRelease, /check-v5-cursor-sand-inference\.ts/)
 

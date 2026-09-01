@@ -3,7 +3,11 @@
  * same-transport credential failover preserves native history. */
 import { EventEmitter } from 'node:events'
 import type { OpenClaudeConfig } from '@openclaude/storage'
-import type { GoalStateSnapshot, JobTerminal } from '@openclaude/protocol'
+import {
+  cursorCredentialModelFamily,
+  type GoalStateSnapshot,
+  type JobTerminal,
+} from '@openclaude/protocol'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type {
   EngineAdapter,
@@ -315,8 +319,11 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     if (variantFor(model, this.credentialSelection) !== this.variant) {
       throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
     }
+    const familyChanged = cursorCredentialModelFamily(this.opts.model)
+      !== cursorCredentialModelFamily(model)
     this.opts.model = model
     this.inner.setModel(model)
+    if (familyChanged) this.credentialNeedsRefresh = true
   }
   get model(): string | undefined { return this.opts.model }
   setEffortLevel(level: string | undefined): void {

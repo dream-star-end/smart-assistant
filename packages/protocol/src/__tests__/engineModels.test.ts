@@ -9,6 +9,7 @@ import {
   cursorFamilyDefaultFast,
   cursorFamilyEfforts,
   cursorFamilySupportsFast,
+  cursorCredentialModelFamily,
   findCursorEngineModel,
   isCodexEngineModel,
   isCodexLongContextModel,
@@ -99,6 +100,11 @@ describe('Cursor engine model authority', () => {
     assert.equal(isCursorEngineModel('gpt-5.6-sol-medium'), false)
     assert.equal(isCursorEngineModel('gpt-5.3-codex'), false)
     assert.equal(isCursorEngineModel('cursor-auto --force'), false)
+    assert.equal(cursorCredentialModelFamily('cursor-auto'), 'cursor_models')
+    assert.equal(cursorCredentialModelFamily('cursor-grok-4.6-high'), 'cursor_models')
+    assert.equal(cursorCredentialModelFamily('composer-2.5-fast'), 'cursor_models')
+    assert.equal(cursorCredentialModelFamily('cursor-opus-5-high'), 'other_models')
+    assert.equal(cursorCredentialModelFamily('claude-fable-5-thinking-high'), 'other_models')
   })
 })
 

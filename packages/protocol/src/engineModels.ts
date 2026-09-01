@@ -674,6 +674,24 @@ export function cursorModelById(modelId: string | null | undefined): CursorEngin
   return CURSOR_ENGINE_MODELS.find((model) => model.id === modelId)
 }
 
+export type CursorCredentialModelFamily = 'cursor_models' | 'other_models'
+
+/** Cursor's account pool has separate quota eligibility for built-in Cursor
+ * Models versus Other Models. Accept canonical platform ids or the pinned
+ * CLI upstream ids so wrapper learning and gateway credential refresh consume
+ * one classification contract. */
+export function cursorCredentialModelFamily(
+  modelId: string | null | undefined,
+): CursorCredentialModelFamily {
+  const raw = typeof modelId === 'string' ? modelId.trim() : ''
+  const known = cursorModelById(raw)
+  const upstream = known ? known.upstreamModel ?? 'auto' : raw
+  if (!upstream || upstream === 'auto') return 'cursor_models'
+  return /^(?:cursor-grok-4\.[56]|composer-2\.5)(?:-|$)/.test(upstream)
+    ? 'cursor_models'
+    : 'other_models'
+}
+
 export function cursorFamilyDefaultEffort(
   family: CursorEngineFamilyId,
 ): PlatformReasoningEffort | null {

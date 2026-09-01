@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { uniqueCursorAccountIdFromSlotResults } from '../account-pool/cursorQuota.js'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..')
 const sourceWrapper = join(
@@ -1217,6 +1218,42 @@ describe('oc-cursor wrapper', () => {
     assert.match(launched.stderr, /slot_result 2 ok/)
     assert.equal(readFileSync(join(f.capture, 'argv'), 'utf8').includes('-H'), false)
     assert.doesNotMatch(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SELECTED_KEY=/m)
+  })
+
+  test('ten-key selection stays numeric and resolves billing to the tenth account', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    const rotationFile = join(f.dir, 'ten-key-rotation')
+    const sidecar = ['# sand-mode v1', 'api-key 0']
+    for (let suffix = 2; suffix <= 10; suffix += 1) {
+      writeFileSync(join(authDir, `api-key.${suffix}`), `crsr_key_${suffix}\n`, { mode: 0o600 })
+      sidecar.push(`api-key.${suffix} ${suffix === 10 ? 1 : 0}`)
+    }
+    writeFileSync(join(authDir, '.sand-mode'), `${sidecar.join('\n')}\n`, { mode: 0o600 })
+    writeFileSync(rotationFile, `9 ${Math.floor(Date.now() / 1000) + 300}\n`, { mode: 0o600 })
+    const selected = spawnSync(
+      f.wrapper,
+      ['--model', 'cursor-grok-4.6-high', '--', '__select_tenth__'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_CURSOR_SELECT_ONLY: '1',
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(selected.status, 0, selected.stderr)
+    const matched = /selected_slot (\d+) (\S+) sand/.exec(selected.stdout)
+    assert.ok(matched)
+    assert.equal(Number(matched[1]), 10)
+    assert.equal(matched[2], 'api-key.10')
+    const rows = Array.from({ length: 10 }, (_, index) => ({ id: BigInt(index + 1) }))
+    assert.equal(
+      uniqueCursorAccountIdFromSlotResults(rows, [{ slot: Number(matched[1]), result: 'ok' }]),
+      10n,
+    )
   })
 
   test('Cursor Models (Grok 4.6) stay in native CLI mode and do NOT pass -H even when .sand-mode is enabled', () => {
