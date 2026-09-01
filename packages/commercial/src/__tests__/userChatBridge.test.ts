@@ -3239,6 +3239,10 @@ describe("Cursor external authority regression tripwire", () => {
       /sendErrorFrame\(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity\)/,
     );
     assert.match(source, /settleCursorExternalUsage/);
+    assert.match(source, /if \(external\.cursorAccountId\)/);
+    assert.match(source, /WHERE id=\$1 AND provider='cursor'/);
+    assert.match(source, /fingerprintCursorKey\(snapshot\.token\.toString\("utf8"\)\)/);
+    assert.match(source, /else \{\s*cursorAccountId = await resolveUsedCursorAccountId\(external\.cursorSlotResults\)/);
   });
 
   test("ZCode uses an independent admission/audit branch and does not reuse Cursor gates", async () => {

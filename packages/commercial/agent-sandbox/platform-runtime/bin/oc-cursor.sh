@@ -340,6 +340,28 @@ STATE
   fi
 fi
 
+auth_root=$auth_dir
+pool_generation=${OPENCLAUDE_CURSOR_POOL_GENERATION:-}
+if [ -z "$pool_generation" ]; then
+  pool_generation=$(/usr/bin/sudo -n /bin/cat -- "$auth_root/.pool-active" 2>/dev/null) \
+    || pool_generation=""
+fi
+if [ -z "$pool_generation" ]; then
+  [ "${OC_CURSOR_ALLOW_LEGACY_POOL:-}" = 1 ] \
+    || die "Cursor immutable pool generation is unavailable"
+  pool_generation=legacy
+else
+  case "$pool_generation" in gen-*) ;; *) die "Cursor pool generation is invalid" ;; esac
+  pool_generation_hex=${pool_generation#gen-}
+  [ "${#pool_generation_hex}" -eq 24 ] || die "Cursor pool generation is invalid"
+  case "$pool_generation_hex" in *[!0-9a-f]*) die "Cursor pool generation is invalid" ;; esac
+  generation_dir=$auth_root/.pool-generations/$pool_generation
+  /usr/bin/sudo -n /usr/bin/test -d "$generation_dir" 2>/dev/null \
+    || die "Cursor pool generation directory is unavailable"
+  auth_dir=$generation_dir
+  auth_file=$auth_dir/api-key
+fi
+
 set -f
 primary_present=0
 extra_suffixes=""
@@ -682,6 +704,41 @@ $sand_sidecar_text
 SAND_SIDECAR
 fi
 
+selected_account_id=0
+selected_fingerprint=0000000000000000
+if [ "$pool_generation" != legacy ]; then
+  identity_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.slot-identities" 2>/dev/null) \
+    || die "Cursor pool identity sidecar is unreadable"
+  identity_header=${identity_text%%
+*}
+  [ "$identity_header" = "# cursor-pool-identity v1 $pool_generation" ] \
+    || die "Cursor pool identity generation mismatch"
+  identity_found=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    identity_name=${line%% *}
+    identity_rest=${line#"$identity_name" }
+    identity_account=${identity_rest%% *}
+    identity_rest=${identity_rest#"$identity_account" }
+    identity_fingerprint=${identity_rest%% *}
+    identity_sand=${identity_rest#"$identity_fingerprint" }
+    if [ "$identity_name" = "$chosen_key_name" ]; then
+      case "$identity_account" in ''|*[!0-9]*) die "Cursor pool account identity is invalid" ;; esac
+      [ "${#identity_fingerprint}" -eq 16 ] || die "Cursor pool key fingerprint is invalid"
+      case "$identity_fingerprint" in *[!0-9a-f]*) die "Cursor pool key fingerprint is invalid" ;; esac
+      case "$identity_sand" in 0|1) ;; *) die "Cursor pool Sand identity is invalid" ;; esac
+      [ "$identity_sand" -eq "$sand_enabled" ] || die "Cursor pool Sand sidecars disagree"
+      selected_account_id=$identity_account
+      selected_fingerprint=$identity_fingerprint
+      identity_found=1
+      break
+    fi
+  done <<IDENTITY_SIDECAR
+$identity_text
+IDENTITY_SIDECAR
+  [ "$identity_found" -eq 1 ] || die "Cursor selected credential identity is unavailable"
+fi
+
 chosen_full_slot=0
 full_slot_cursor=0
 for key_name in $key_names; do
@@ -698,7 +755,9 @@ done
 # authority instead of reimplementing rotation and quota filtering in TS.
 if [ "${OPENCLAUDE_CURSOR_SELECT_ONLY:-}" = 1 ]; then
   if [ "$sand_enabled" -eq 1 ]; then selected_mode=sand; else selected_mode=native; fi
-  printf 'oc-cursor: selected_slot %s %s %s\n' "$chosen_full_slot" "$chosen_key_name" "$selected_mode"
+  printf 'oc-cursor: selected_slot %s %s %s %s %s %s\n' \
+    "$chosen_full_slot" "$chosen_key_name" "$selected_mode" "$pool_generation" \
+    "$selected_account_id" "$selected_fingerprint"
   exit 0
 fi
 if [ -n "${OPENCLAUDE_CURSOR_RECORD_RESULT:-}" ]; then
@@ -739,6 +798,17 @@ case "$api_key" in
     die "Cursor credential is malformed"
     ;;
 esac
+actual_fingerprint=$(printf '%s\n' "$api_key" | /usr/bin/sha256sum | /usr/bin/cut -c1-16)
+expected_fingerprint=${OPENCLAUDE_CURSOR_KEY_FINGERPRINT:-$selected_fingerprint}
+if [ "$pool_generation" != legacy ] && [ "$actual_fingerprint" != "$expected_fingerprint" ]; then
+  emit_slot_result fail
+  die "Cursor credential fingerprint changed after selection"
+fi
+if [ -n "${OPENCLAUDE_CURSOR_ACCOUNT_ID:-}" ] \
+  && [ "$OPENCLAUDE_CURSOR_ACCOUNT_ID" != "$selected_account_id" ]; then
+  emit_slot_result fail
+  die "Cursor credential account identity changed after selection"
+fi
 
 umask 077
 cursor_home=$(/usr/bin/mktemp -d /tmp/openclaude-cursor.XXXXXXXX) \
@@ -945,6 +1015,7 @@ if [ "${OPENCLAUDE_CURSOR_AGENT_DEBUG:-}" = "1" ] && [ -n "$oc_home" ] && [ -d "
 fi
 unset OPENCLAUDE_CURSOR_AGENT_DEBUG
 unset OPENCLAUDE_CURSOR_SELECT_ONLY OPENCLAUDE_CURSOR_RECORD_RESULT OPENCLAUDE_CURSOR_SELECTED_KEY
+unset OPENCLAUDE_CURSOR_POOL_GENERATION OPENCLAUDE_CURSOR_ACCOUNT_ID OPENCLAUDE_CURSOR_KEY_FINGERPRINT
 
 # Sand is a credential transport property handled by CursorRoutingAdapter.
 # This native wrapper must never try to turn AgentService into Sand by adding a

@@ -58,6 +58,8 @@ interface RelayDeps {
   fetchImpl?: typeof fetch
   readApiKey?: () => Buffer
   credentialName?: string
+  poolGeneration?: string
+  keyFingerprint?: string
   upstreamBaseUrl?: string
   clientVersion?: string
   now?: () => number
@@ -129,13 +131,26 @@ function trimSecretBuffer(raw: Buffer): Buffer {
   return out
 }
 
-export function readCursorApiKey(credentialName = 'api-key'): Buffer {
+export function readCursorApiKey(
+  credentialName = 'api-key',
+  poolGeneration?: string,
+  keyFingerprint?: string,
+): Buffer {
   if (!/^api-key(?:\.(?:[2-9]|[1-9][0-9]+))?$/.test(credentialName)) {
     throw new Error('CURSOR_SAND_CREDENTIAL_NAME_INVALID')
   }
+  if (poolGeneration !== undefined && !/^gen-[0-9a-f]{24}$/.test(poolGeneration)) {
+    throw new Error('CURSOR_SAND_POOL_GENERATION_INVALID')
+  }
+  if (keyFingerprint !== undefined && !/^[0-9a-f]{16}$/.test(keyFingerprint)) {
+    throw new Error('CURSOR_SAND_KEY_FINGERPRINT_INVALID')
+  }
+  const credentialPath = poolGeneration
+    ? `/run/oc/cursor-auth/.pool-generations/${poolGeneration}/${credentialName}`
+    : `/run/oc/cursor-auth/${credentialName}`
   const result = spawnSync(
     '/usr/bin/sudo',
-    ['-n', '/bin/cat', `/run/oc/cursor-auth/${credentialName}`],
+    ['-n', '/bin/cat', credentialPath],
     {
       encoding: null,
       maxBuffer: 4096,
@@ -146,7 +161,15 @@ export function readCursorApiKey(credentialName = 'api-key'): Buffer {
   if (result.status !== 0 || !Buffer.isBuffer(result.stdout)) {
     throw new Error('CURSOR_SAND_CREDENTIAL_UNAVAILABLE')
   }
-  return trimSecretBuffer(Buffer.from(result.stdout))
+  const key = trimSecretBuffer(Buffer.from(result.stdout))
+  if (keyFingerprint) {
+    const actual = createHash('sha256').update(key).update('\n').digest('hex').slice(0, 16)
+    if (actual !== keyFingerprint) {
+      key.fill(0)
+      throw new Error('CURSOR_SAND_CREDENTIAL_FINGERPRINT_CHANGED')
+    }
+  }
+  return key
 }
 
 export function readPrimaryCursorApiKey(): Buffer {
@@ -628,7 +651,11 @@ export class CursorSandRelay {
   constructor(deps: RelayDeps = {}) {
     this.deps = {
       fetchImpl: deps.fetchImpl ?? fetch,
-      readApiKey: deps.readApiKey ?? (() => readCursorApiKey(deps.credentialName ?? 'api-key')),
+      readApiKey: deps.readApiKey ?? (() => readCursorApiKey(
+        deps.credentialName ?? 'api-key',
+        deps.poolGeneration,
+        deps.keyFingerprint,
+      )),
       upstreamBaseUrl: (deps.upstreamBaseUrl ?? DEFAULT_UPSTREAM).replace(/\/+$/, ''),
       clientVersion: deps.clientVersion ?? DEFAULT_CLIENT_VERSION,
       now: deps.now ?? Date.now,

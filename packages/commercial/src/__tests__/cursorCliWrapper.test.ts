@@ -186,6 +186,7 @@ esac
       ...process.env,
       PATH: `${binDir}:${process.env.PATH ?? ''}`,
       OC_CURSOR_TEST_CAPTURE: capture,
+      OC_CURSOR_ALLOW_LEGACY_POOL: '1',
     },
   }
 }
@@ -1198,7 +1199,7 @@ describe('oc-cursor wrapper', () => {
       },
     )
     assert.equal(selected.status, 0, selected.stderr)
-    assert.match(selected.stdout, /^oc-cursor: selected_slot 2 api-key\.2 sand$/m)
+    assert.match(selected.stdout, /^oc-cursor: selected_slot 2 api-key\.2 sand legacy 0 0000000000000000$/m)
 
     const launched = spawnSync(
       f.wrapper,
@@ -1254,6 +1255,75 @@ describe('oc-cursor wrapper', () => {
       uniqueCursorAccountIdFromSlotResults(rows, [{ slot: Number(matched[1]), result: 'ok' }]),
       10n,
     )
+  })
+
+  test('an immutable generation keeps a bound Sand account stable after pool compaction', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    const generations = join(authDir, '.pool-generations')
+    const gen1 = 'gen-111111111111111111111111'
+    const gen2 = 'gen-222222222222222222222222'
+    const keyA = 'crsr_alpha'
+    const keyB = 'crsr_bravo'
+    const keyC = 'crsr_charlie'
+    const fp = (key: string): string => createHash('sha256').update(`${key}\n`).digest('hex').slice(0, 16)
+    const writeGeneration = (
+      generation: string,
+      slots: Array<{ name: string; key: string; account: string; sand: boolean }>,
+    ): void => {
+      const dir = join(generations, generation)
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      writeFileSync(join(dir, '.quota-class'), `# quota-class v1\n${slots.map((s) => `${s.name} unknown`).join('\n')}\n`, { mode: 0o600 })
+      writeFileSync(join(dir, '.sand-mode'), `# sand-mode v1\n${slots.map((s) => `${s.name} ${s.sand ? 1 : 0}`).join('\n')}\n`, { mode: 0o600 })
+      writeFileSync(
+        join(dir, '.slot-identities'),
+        `# cursor-pool-identity v1 ${generation}\n${slots.map((s) => `${s.name} ${s.account} ${fp(s.key)} ${s.sand ? 1 : 0}`).join('\n')}\n`,
+        { mode: 0o600 },
+      )
+      for (const slot of slots) writeFileSync(join(dir, slot.name), `${slot.key}\n`, { mode: 0o600 })
+    }
+    writeGeneration(gen1, [
+      { name: 'api-key', key: keyA, account: '1', sand: false },
+      { name: 'api-key.2', key: keyB, account: '2', sand: true },
+    ])
+    writeGeneration(gen2, [
+      { name: 'api-key', key: keyB, account: '2', sand: true },
+      { name: 'api-key.2', key: keyC, account: '3', sand: false },
+    ])
+    const rotationFile = join(f.dir, 'generation-rotation')
+    writeFileSync(rotationFile, `1 ${Math.floor(Date.now() / 1000) + 300}\n`, { mode: 0o600 })
+    writeFileSync(join(authDir, '.pool-active'), `${gen1}\n`, { mode: 0o600 })
+    const selected = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__select_generation__'],
+      {
+        cwd: f.dir,
+        env: { ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1', OC_CURSOR_KEY_ROTATION_FILE: rotationFile },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(selected.status, 0, selected.stderr)
+    assert.match(selected.stdout, new RegExp(`selected_slot 2 api-key\\.2 sand ${gen1} 2 ${fp(keyB)}`))
+
+    writeFileSync(join(authDir, '.pool-active'), `${gen2}\n`, { mode: 0o600 })
+    const launched = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'bound old generation'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_CURSOR_SELECTED_KEY: 'api-key.2',
+          OPENCLAUDE_CURSOR_POOL_GENERATION: gen1,
+          OPENCLAUDE_CURSOR_ACCOUNT_ID: '2',
+          OPENCLAUDE_CURSOR_KEY_FINGERPRINT: fp(keyB),
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(launched.status, 0, launched.stderr)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8').trim(), keyB)
   })
 
   test('Cursor Models (Grok 4.6) stay in native CLI mode and do NOT pass -H even when .sand-mode is enabled', () => {

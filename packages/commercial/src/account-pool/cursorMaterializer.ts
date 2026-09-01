@@ -76,6 +76,9 @@ export function slotFileName(index: number): string {
 /** Written once the account pool owns this auth dir. Distinguishes first-time
  *  import from "admin deleted the last cursor row" (empty pool + leftover files). */
 export const CURSOR_POOL_OWNED_MARKER = ".account-pool-owned";
+export const CURSOR_POOL_GENERATIONS_DIR = ".pool-generations";
+export const CURSOR_POOL_ACTIVE_FILE = ".pool-active";
+export const CURSOR_POOL_IDENTITIES_FILE = ".slot-identities";
 export { CURSOR_QUOTA_CLASS_FILE, CURSOR_SAND_MODE_FILE };
 
 export function isCanonicalCursorKeyFile(name: string): boolean {
@@ -167,13 +170,66 @@ async function importHostKeysIfEmpty(deps: Required<Pick<CursorAuthSyncDeps, "li
 
 function writeAtomicSlots(
   authDir: string,
-  slots: Array<{ key: string; quotaClass: CursorQuotaClass; sandEnabled: boolean }>,
+  slots: Array<{
+    key: string;
+    accountId: string;
+    quotaClass: CursorQuotaClass;
+    sandEnabled: boolean;
+  }>,
 ): string[] {
   mkdirSync(authDir, { recursive: true, mode: 0o700 });
+  const fingerprints = slots.map((slot) => fingerprintCursorKey(slot.key));
+  const generationDigest = createHash("sha256");
+  for (let i = 0; i < slots.length; i += 1) {
+    generationDigest.update([
+      slotFileName(i),
+      slots[i].accountId,
+      fingerprints[i],
+      slots[i].quotaClass,
+      slots[i].sandEnabled ? "1" : "0",
+    ].join("\0"));
+    generationDigest.update("\n");
+  }
+  const generation = `gen-${generationDigest.digest("hex").slice(0, 24)}`;
+  const generationsDir = join(authDir, CURSOR_POOL_GENERATIONS_DIR);
+  mkdirSync(generationsDir, { recursive: true, mode: 0o700 });
+  const generationDir = join(generationsDir, generation);
+  if (!existsSync(generationDir)) {
+    const generationStaging = join(generationsDir, `.staging-${process.pid}-${Date.now()}`);
+    mkdirSync(generationStaging, { mode: 0o700 });
+    try {
+      const quotaSlots: Array<{ name: string; quotaClass: CursorQuotaClass }> = [];
+      const sandSlots: Array<{ name: string; sandEnabled: boolean }> = [];
+      const identities = [`# cursor-pool-identity v1 ${generation}`];
+      for (let i = 0; i < slots.length; i += 1) {
+        const name = slotFileName(i);
+        writeFileSync(join(generationStaging, name), `${slots[i].key}\n`, { mode: 0o600 });
+        chmodSync(join(generationStaging, name), 0o600);
+        quotaSlots.push({ name, quotaClass: slots[i].quotaClass });
+        sandSlots.push({ name, sandEnabled: slots[i].sandEnabled });
+        identities.push(`${name} ${slots[i].accountId} ${fingerprints[i]} ${slots[i].sandEnabled ? "1" : "0"}`);
+      }
+      writeFileSync(join(generationStaging, CURSOR_QUOTA_CLASS_FILE), renderQuotaClassSidecar(quotaSlots), { mode: 0o600 });
+      writeFileSync(join(generationStaging, CURSOR_SAND_MODE_FILE), renderSandModeSidecar(sandSlots), { mode: 0o600 });
+      writeFileSync(join(generationStaging, CURSOR_POOL_IDENTITIES_FILE), `${identities.join("\n")}\n`, { mode: 0o600 });
+      chmodSync(join(generationStaging, CURSOR_QUOTA_CLASS_FILE), 0o600);
+      chmodSync(join(generationStaging, CURSOR_SAND_MODE_FILE), 0o600);
+      chmodSync(join(generationStaging, CURSOR_POOL_IDENTITIES_FILE), 0o600);
+      renameSync(generationStaging, generationDir);
+    } finally {
+      rmSync(generationStaging, { recursive: true, force: true });
+    }
+  }
+  const activeTemp = join(authDir, `${CURSOR_POOL_ACTIVE_FILE}.tmp-${process.pid}`);
+  writeFileSync(activeTemp, `${generation}\n`, { mode: 0o600 });
+  chmodSync(activeTemp, 0o600);
+  renameSync(activeTemp, join(authDir, CURSOR_POOL_ACTIVE_FILE));
+
+  // Legacy root projection remains for already-running pre-generation
+  // containers. New wrappers resolve the immutable active generation above.
   const staging = join(authDir, ".materializing");
   rmSync(staging, { recursive: true, force: true });
   mkdirSync(staging, { mode: 0o700 });
-  const fingerprints: string[] = [];
   try {
     const sidecarSlots: Array<{ name: string; quotaClass: CursorQuotaClass }> = [];
     const sandSlots: Array<{ name: string; sandEnabled: boolean }> = [];
@@ -182,7 +238,6 @@ function writeAtomicSlots(
       const dest = join(staging, name);
       writeFileSync(dest, `${slots[i].key}\n`, { mode: 0o600, encoding: "utf8" });
       chmodSync(dest, 0o600);
-      fingerprints.push(fingerprintCursorKey(slots[i].key));
       sidecarSlots.push({ name, quotaClass: slots[i].quotaClass });
       sandSlots.push({ name, sandEnabled: slots[i].sandEnabled });
     }
@@ -244,7 +299,12 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
     return { imported, written: 0, skipped: "empty-pool-keep-files", fingerprints: [] };
   }
 
-  const slots: Array<{ key: string; quotaClass: CursorQuotaClass; sandEnabled: boolean }> = [];
+  const slots: Array<{
+    key: string;
+    accountId: string;
+    quotaClass: CursorQuotaClass;
+    sandEnabled: boolean;
+  }> = [];
   try {
     for (const row of rows) {
       const snap = await resolved.getCursorTokenSnapshot(row.id);
@@ -252,6 +312,7 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
       const key = normalizeCursorApiKey(snap.token.toString("utf8"));
       slots.push({
         key,
+        accountId: row.id.toString(),
         quotaClass: row.cursor_quota_class === "other_ok" || row.cursor_quota_class === "cursor_only"
           ? row.cursor_quota_class
           : "unknown",

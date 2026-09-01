@@ -722,6 +722,9 @@ export interface SubprocessRunnerOpts {
     slot: number
     keyName: string
     sandEnabled: boolean
+    poolGeneration: string
+    accountId: string
+    keyFingerprint: string
   }
   permissionMode?: string
   resumeSessionId?: string // 续上之前的 CCB session

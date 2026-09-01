@@ -13,7 +13,7 @@ const IMAGE_WRAPPER = '/usr/local/bin/oc-cursor'
 const KEY_NAME_SOURCE = String.raw`api-key(?:\.(?:[2-9]|[1-9][0-9]+))?`
 const KEY_NAME_RE = new RegExp(`^${KEY_NAME_SOURCE}$`)
 const SELECTION_RE = new RegExp(
-  `^oc-cursor: selected_slot ([1-9][0-9]*) (${KEY_NAME_SOURCE}) (sand|native)$`,
+  `^oc-cursor: selected_slot ([1-9][0-9]*) (${KEY_NAME_SOURCE}) (sand|native) (legacy|gen-[0-9a-f]{24}) ([0-9]+) ([0-9a-f]{16})$`,
   'm',
 )
 
@@ -21,6 +21,9 @@ export interface CursorCredentialSelection {
   slot: number
   keyName: string
   sandEnabled: boolean
+  poolGeneration: string
+  accountId: string
+  keyFingerprint: string
 }
 
 function wrapperBin(): string {
@@ -81,7 +84,14 @@ export function selectCursorCredential(opts: {
   if (!Number.isSafeInteger(slot) || slot < 1 || !KEY_NAME_RE.test(keyName)) {
     throw new Error('CURSOR_CREDENTIAL_SELECTION_MALFORMED')
   }
-  return { slot, keyName, sandEnabled: matched[3] === 'sand' }
+  return {
+    slot,
+    keyName,
+    sandEnabled: matched[3] === 'sand',
+    poolGeneration: matched[4],
+    accountId: matched[5],
+    keyFingerprint: matched[6],
+  }
 }
 
 export function recordCursorCredentialResult(opts: {
@@ -100,6 +110,9 @@ export function recordCursorCredentialResult(opts: {
       cwd: existsSync(opts.agentBaseDir) ? opts.agentBaseDir : process.cwd(),
       env: selectorEnv(opts.agentId, opts.sessionKey, {
         OPENCLAUDE_CURSOR_SELECTED_KEY: opts.selection.keyName,
+        OPENCLAUDE_CURSOR_POOL_GENERATION: opts.selection.poolGeneration,
+        OPENCLAUDE_CURSOR_ACCOUNT_ID: opts.selection.accountId,
+        OPENCLAUDE_CURSOR_KEY_FINGERPRINT: opts.selection.keyFingerprint,
         OPENCLAUDE_CURSOR_RECORD_RESULT: opts.result,
       }),
       encoding: 'utf8',

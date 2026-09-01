@@ -19208,6 +19208,9 @@ export class Gateway {
           durationMs: e.durationMs,
           ...(e.usage ? { usage: e.usage } : {}),
           ...(e.cursorSlotResults && e.cursorSlotResults.length ? { cursorSlotResults: e.cursorSlotResults } : {}),
+          ...(e.cursorAccountId ? { cursorAccountId: e.cursorAccountId } : {}),
+          ...(e.cursorPoolGeneration ? { cursorPoolGeneration: e.cursorPoolGeneration } : {}),
+          ...(e.cursorKeyFingerprint ? { cursorKeyFingerprint: e.cursorKeyFingerprint } : {}),
         }
         this.deliver(billingFrame, adapter)
       } else if (e.kind === 'error') {

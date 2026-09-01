@@ -20,8 +20,19 @@ const root = protobuf.loadSync(
 )
 const StreamRequest = root.lookupType('aiserver.v1.InferenceStreamRequest')
 const StreamResponse = root.lookupType('aiserver.v1.InferenceStreamResponse')
-const SAND_SELECTION = { slot: 2, keyName: 'api-key.2', sandEnabled: true }
-const NATIVE_SELECTION = { slot: 1, keyName: 'api-key', sandEnabled: false }
+const SAND_SELECTION = {
+  slot: 2, keyName: 'api-key.2', sandEnabled: true,
+  poolGeneration: 'legacy', accountId: '0', keyFingerprint: '0000000000000000',
+}
+const NATIVE_SELECTION = {
+  slot: 1, keyName: 'api-key', sandEnabled: false,
+  poolGeneration: 'legacy', accountId: '0', keyFingerprint: '0000000000000000',
+}
+const STABLE_SAND_SELECTION = {
+  slot: 2, keyName: 'api-key.2', sandEnabled: true,
+  poolGeneration: 'gen-0123456789abcdef01234567',
+  accountId: '42', keyFingerprint: '0123456789abcdef',
+}
 
 function envelope(payload: Uint8Array, flags = 0): Buffer {
   const out = Buffer.alloc(5 + payload.length)
@@ -110,10 +121,13 @@ test('credential selector parses a high-numbered Sand slot and records the same 
   writeFileSync(wrapper, `#!/bin/sh
 set -eu
 if [ "\${OPENCLAUDE_CURSOR_SELECT_ONLY:-}" = 1 ]; then
-  echo 'oc-cursor: selected_slot 10 api-key.10 sand'
+  echo 'oc-cursor: selected_slot 10 api-key.10 sand gen-0123456789abcdef01234567 42 0123456789abcdef'
   exit 0
 fi
-printf '%s %s\n' "\${OPENCLAUDE_CURSOR_SELECTED_KEY:-}" "\${OPENCLAUDE_CURSOR_RECORD_RESULT:-}" > ${capture}
+printf '%s %s %s %s %s\n' \
+  "\${OPENCLAUDE_CURSOR_SELECTED_KEY:-}" "\${OPENCLAUDE_CURSOR_RECORD_RESULT:-}" \
+  "\${OPENCLAUDE_CURSOR_POOL_GENERATION:-}" "\${OPENCLAUDE_CURSOR_ACCOUNT_ID:-}" \
+  "\${OPENCLAUDE_CURSOR_KEY_FINGERPRINT:-}" > ${capture}
 `, { mode: 0o755 })
   chmodSync(wrapper, 0o755)
   process.env.OC_CURSOR_WRAPPER_BIN = wrapper
@@ -122,12 +136,22 @@ printf '%s %s\n' "\${OPENCLAUDE_CURSOR_SELECTED_KEY:-}" "\${OPENCLAUDE_CURSOR_RE
       agentId: 'main', sessionKey: 'agent:main:test:credential-selector',
       agentBaseDir: dir, model: 'cursor-opus-5-high',
     })
-    assert.deepEqual(selection, { slot: 10, keyName: 'api-key.10', sandEnabled: true })
+    assert.deepEqual(selection, {
+      slot: 10,
+      keyName: 'api-key.10',
+      sandEnabled: true,
+      poolGeneration: 'gen-0123456789abcdef01234567',
+      accountId: '42',
+      keyFingerprint: '0123456789abcdef',
+    })
     recordCursorCredentialResult({
       agentId: 'main', sessionKey: 'agent:main:test:credential-selector',
       agentBaseDir: dir, model: 'cursor-opus-5-high', selection, result: 'ok',
     })
-    assert.equal(readFileSync(capture, 'utf8').trim(), 'api-key.10 ok')
+    assert.equal(
+      readFileSync(capture, 'utf8').trim(),
+      'api-key.10 ok gen-0123456789abcdef01234567 42 0123456789abcdef',
+    )
   } finally {
     if (previous === undefined) delete process.env.OC_CURSOR_WRAPPER_BIN
     else process.env.OC_CURSOR_WRAPPER_BIN = previous
@@ -138,7 +162,7 @@ printf '%s %s\n' "\${OPENCLAUDE_CURSOR_SELECTED_KEY:-}" "\${OPENCLAUDE_CURSOR_RE
 test('failed credential rebinds within the same transport but refuses a native-to-Sand failover', async () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'cursor-credential-rebind-'))
   try {
-    const nextNative = { slot: 2, keyName: 'api-key.2', sandEnabled: false }
+    const nextNative = { ...NATIVE_SELECTION, slot: 2, keyName: 'api-key.2' }
     const native = new CursorRoutingAdapter({
       sessionKey: 'agent:main:test:credential-rebind-native', agentId: 'main', agentBaseDir: dir,
       config: {} as never, model: 'cursor-grok-4.6-high', cursorCredentialSelection: NATIVE_SELECTION,
@@ -167,7 +191,7 @@ test('failed credential rebinds within the same transport but refuses a native-t
 test('concrete model quota-family changes reselect an eligible key before the next turn', async () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'cursor-model-family-reselect-'))
   try {
-    const nextSand = { slot: 3, keyName: 'api-key.3', sandEnabled: true }
+    const nextSand = { ...SAND_SELECTION, slot: 3, keyName: 'api-key.3' }
     let selections = 0
     const router = new CursorRoutingAdapter({
       sessionKey: 'agent:main:test:model-family-reselect', agentId: 'main', agentBaseDir: dir,
@@ -177,6 +201,32 @@ test('concrete model quota-family changes reselect an eligible key before the ne
     await router.refreshVariantForTest()
     assert.equal(selections, 1)
     assert.deepEqual(router.currentCredentialForTest, nextSand)
+    assert.equal(router.currentVariant, 'sand')
+    await router.shutdown()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('pool generation changes rebind stable account identity before reading a reused slot', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-generation-rebind-'))
+  try {
+    const generationOne = {
+      slot: 2, keyName: 'api-key.2', sandEnabled: true,
+      poolGeneration: 'gen-111111111111111111111111',
+      accountId: '2', keyFingerprint: 'aaaaaaaaaaaaaaaa',
+    }
+    const generationTwo = {
+      slot: 1, keyName: 'api-key', sandEnabled: true,
+      poolGeneration: 'gen-222222222222222222222222',
+      accountId: '2', keyFingerprint: 'aaaaaaaaaaaaaaaa',
+    }
+    const router = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:generation-rebind', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-opus-5-high', cursorCredentialSelection: generationOne,
+    }, () => generationTwo)
+    await router.refreshVariantForTest()
+    assert.deepEqual(router.currentCredentialForTest, generationTwo)
     assert.equal(router.currentVariant, 'sand')
     await router.shutdown()
   } finally {
@@ -215,7 +265,7 @@ test('cold submit starts the relay and emits one external billing terminal with 
   }
   const adapter = new CursorSandAdapter({
     sessionKey: 'agent:main:test:cold-sand', agentId: 'main', agentBaseDir: process.cwd(),
-    config: {} as never, model: 'cursor-fable-5-high', cursorCredentialSelection: SAND_SELECTION,
+    config: {} as never, model: 'cursor-fable-5-high', cursorCredentialSelection: STABLE_SAND_SELECTION,
   }, relay, () => fakeRun as never, () => {})
   const billing: unknown[] = []
   adapter.on('external_billing', (event) => billing.push(event))
@@ -237,6 +287,9 @@ test('cold submit starts the relay and emits one external billing terminal with 
       cache_read_input_tokens: 3, cache_creation_input_tokens: 2,
     },
     cursorSlotResults: [{ slot: 2, result: 'ok' }],
+    cursorAccountId: '42',
+    cursorPoolGeneration: 'gen-0123456789abcdef01234567',
+    cursorKeyFingerprint: '0123456789abcdef',
   })
   await adapter.shutdown()
   assert.equal(closes, 1)

@@ -115,7 +115,12 @@ import {
 } from "../billing/zcodeExternalAudit.js";
 import { recordProductFrictionEvent } from "../productFriction/events.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
-import { applyLearnedCursorQuota, resolveUsedCursorAccountId } from "../account-pool/cursorMaterializer.js";
+import {
+  applyLearnedCursorQuota,
+  fingerprintCursorKey,
+  resolveUsedCursorAccountId,
+} from "../account-pool/cursorMaterializer.js";
+import { getCursorTokenSnapshot } from "../account-pool/store.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
@@ -7054,7 +7059,39 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   }
                   let cursorAccountId: bigint | null = null;
                   try {
-                    cursorAccountId = await resolveUsedCursorAccountId(external.cursorSlotResults);
+                    if (external.cursorAccountId) {
+                      const stable = await pool.query<{ id: string }>(
+                        `SELECT id::text AS id FROM claude_accounts WHERE id=$1 AND provider='cursor'`,
+                        [external.cursorAccountId],
+                      );
+                      cursorAccountId = stable.rows[0]?.id ? BigInt(stable.rows[0].id) : null;
+                      if (cursorAccountId !== null && external.cursorKeyFingerprint) {
+                        const snapshot = await getCursorTokenSnapshot(cursorAccountId);
+                        try {
+                          const currentFingerprint = snapshot?.token
+                            ? fingerprintCursorKey(snapshot.token.toString("utf8"))
+                            : null;
+                          if (currentFingerprint !== external.cursorKeyFingerprint) {
+                            cursorAccountId = null;
+                            bridgeLog?.warn('user-chat-bridge: stable Cursor account fingerprint mismatch', {
+                              requestId,
+                              poolGeneration: external.cursorPoolGeneration ?? null,
+                            });
+                          }
+                        } finally {
+                          snapshot?.token.fill(0);
+                        }
+                      }
+                      if (cursorAccountId === null) {
+                        bridgeLog?.warn('user-chat-bridge: stable Cursor account identity no longer exists', {
+                          requestId,
+                          cursorAccountId: external.cursorAccountId,
+                          poolGeneration: external.cursorPoolGeneration ?? null,
+                        });
+                      }
+                    } else {
+                      cursorAccountId = await resolveUsedCursorAccountId(external.cursorSlotResults);
+                    }
                   } catch (resolveErr) {
                     bridgeLog?.warn('user-chat-bridge: Cursor account attribution failed', { requestId, err: resolveErr });
                   }

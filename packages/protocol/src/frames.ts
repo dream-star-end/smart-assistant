@@ -1159,6 +1159,9 @@ export const OutboundExternalEngineBilling = Type.Object({
       Type.Literal('fail_quota'), Type.Literal('fail'),
     ]),
   }))),
+  cursorAccountId: Type.Optional(Type.String({ pattern: '^[1-9][0-9]*$' })),
+  cursorPoolGeneration: Type.Optional(Type.String({ pattern: '^gen-[0-9a-f]{24}$' })),
+  cursorKeyFingerprint: Type.Optional(Type.String({ pattern: '^[0-9a-f]{16}$' })),
   traceId: Type.Optional(TraceIdString),
 })
 export type OutboundExternalEngineBilling = Static<typeof OutboundExternalEngineBilling>

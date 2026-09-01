@@ -78,7 +78,11 @@ export class CursorSandAdapter extends CcbAdapter {
     super({ ...opts, providerEnvOverride: providerEnv, authorityEngine: 'cursor' })
     this.providerEnv = providerEnv
     this.selection = selection
-    this.relay = relay ?? new CursorSandRelay({ credentialName: selection.keyName })
+    this.relay = relay ?? new CursorSandRelay({
+      credentialName: selection.keyName,
+      poolGeneration: selection.poolGeneration,
+      keyFingerprint: selection.keyFingerprint,
+    })
     this.submitDelegate = submitDelegate
     this.recordResult = recordResult ?? ((result) => recordCursorCredentialResult({
       agentId: opts.agentId,
@@ -240,6 +244,11 @@ export class CursorSandAdapter extends CcbAdapter {
             slot: this.selection.slot,
             result: status === 'success' ? 'ok' as const : 'fail' as const,
           }],
+        } : {}),
+        ...(!interrupted && this.selection.accountId !== '0' ? {
+          cursorAccountId: this.selection.accountId,
+          cursorPoolGeneration: this.selection.poolGeneration,
+          cursorKeyFingerprint: this.selection.keyFingerprint,
         } : {}),
         ...(terminalCode ? { terminalCode } : {}),
       } satisfies EngineExternalBillingEvent)

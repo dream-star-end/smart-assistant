@@ -1901,6 +1901,9 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       const env = buildCursorSpawnEnv(this.opts.agentId, this.opts.sessionKey)
       if (this.opts.cursorCredentialSelection) {
         env.OPENCLAUDE_CURSOR_SELECTED_KEY = this.opts.cursorCredentialSelection.keyName
+        env.OPENCLAUDE_CURSOR_POOL_GENERATION = this.opts.cursorCredentialSelection.poolGeneration
+        env.OPENCLAUDE_CURSOR_ACCOUNT_ID = this.opts.cursorCredentialSelection.accountId
+        env.OPENCLAUDE_CURSOR_KEY_FINGERPRINT = this.opts.cursorCredentialSelection.keyFingerprint
       }
 
       if (mcpLaunch) {
@@ -2230,7 +2233,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       : 'Cursor CLI failed'
     const status: EngineExternalBillingEvent['status'] = cls ? 'unavailable' : detail ? 'error' : 'success'
     const slotResults = parseCursorSlotResults(ctx.stderr)
-    if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs: Date.now() - ctx.startedAt, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : errorClass === 'context_too_long' ? {} : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
+    if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs: Date.now() - ctx.startedAt, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(this.opts.cursorCredentialSelection && this.opts.cursorCredentialSelection.accountId !== '0' ? { cursorAccountId: this.opts.cursorCredentialSelection.accountId, cursorPoolGeneration: this.opts.cursorCredentialSelection.poolGeneration, cursorKeyFingerprint: this.opts.cursorCredentialSelection.keyFingerprint } : {}), ...(ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : errorClass === 'context_too_long' ? {} : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
     if (detail) ctx.params.onEvent({ kind: 'error', error: safeDetail!, errorClass, ...(ctx.interrupted ? { errorCode: 'user_cancelled' as const } : {}) })
     if (ctx.usage) ctx.params.onEvent({ kind: 'usage', usage: { inputTokens: ctx.usage.input_tokens ?? 0, outputTokens: ctx.usage.output_tokens ?? 0, cacheReadTokens: ctx.usage.cache_read_input_tokens ?? 0, cacheCreationTokens: ctx.usage.cache_creation_input_tokens ?? 0, totalTokens: Object.values(ctx.usage).reduce((a, b) => a + (b ?? 0), 0) } })
     ctx.params.onEvent({ kind: 'final', meta: { ...finalUsageMeta(ctx.usage), ...(ctx.interrupted ? { stopReason: 'interrupted' } : {}) } })

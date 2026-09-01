@@ -165,8 +165,27 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
 
   private async ensureVariant(generation = this.lifecycleGeneration): Promise<void> {
     this.assertLifecycle(generation)
+    let observedSelection: CursorCredentialSelection | null = null
+    if (this.credentialSelection.poolGeneration !== 'legacy') {
+      observedSelection = this.selectCredential({
+        agentId: this.opts.agentId,
+        sessionKey: this.opts.sessionKey,
+        agentBaseDir: this.opts.agentBaseDir,
+        model: this.opts.model,
+      })
+      if (
+        observedSelection.poolGeneration !== this.credentialSelection.poolGeneration
+        || observedSelection.keyName !== this.credentialSelection.keyName
+        || observedSelection.slot !== this.credentialSelection.slot
+        || observedSelection.accountId !== this.credentialSelection.accountId
+        || observedSelection.keyFingerprint !== this.credentialSelection.keyFingerprint
+        || observedSelection.sandEnabled !== this.credentialSelection.sandEnabled
+      ) {
+        this.credentialNeedsRefresh = true
+      }
+    }
     if (this.credentialNeedsRefresh) {
-      const next = this.selectCredential({
+      const next = observedSelection ?? this.selectCredential({
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         agentBaseDir: this.opts.agentBaseDir,
@@ -177,7 +196,13 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
         throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
       }
       this.credentialNeedsRefresh = false
-      if (next.keyName !== this.credentialSelection.keyName || next.slot !== this.credentialSelection.slot) {
+      if (
+        next.keyName !== this.credentialSelection.keyName
+        || next.slot !== this.credentialSelection.slot
+        || next.poolGeneration !== this.credentialSelection.poolGeneration
+        || next.accountId !== this.credentialSelection.accountId
+        || next.keyFingerprint !== this.credentialSelection.keyFingerprint
+      ) {
         const nativeId = this.inner.nativeSessionId
         await this.inner.shutdown()
         await this.inner.waitForOutputDrain()
