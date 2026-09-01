@@ -2369,7 +2369,17 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/sessionManagerResumeMap.test.ts",
-          "assertion": "Cursor Sand resume ids validate against CCB JSONL instead of Cursor workspace store"
+          "assertion": "legacy Sand CCB resume ids retire once Sand returns to native Cursor resume"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorAgentSandPatch.test.ts",
+          "assertion": "Cursor Agent Sand patch is env-gated and scopes headers away from AgentService"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorCliWrapper.test.ts",
+          "assertion": "Sand-enabled concrete models scope Sand inside the patched CLI without argv/global header hooks"
         },
         {
           "layer": "unit",
@@ -2379,7 +2389,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-cursor-sand-inference.ts",
-          "assertion": "[cursor-sand-inference] PASS — InferenceService endpoint, Sand identity, cold-submit, billing, variant and abort guards present"
+          "assertion": "[cursor-sand-inference] PASS — native Cursor tool loop, scoped Sand inference headers, billing, resume and fallback guards present"
         }
       ],
     "coverageCommits": [
@@ -2395,7 +2405,8 @@
         "42c51537",
         "9cc8dedc",
         "cd25a50a",
-        "cd7ec21d"
+        "cd7ec21d",
+        "5ff831e4"
       ]
     }
   ]
