@@ -2299,33 +2299,41 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
-          "assertion": "Sand Fable factory routes through the CCB/InferenceService variant while non-Sand Cursor stays native"
+          "assertion": "cursor engine factory selects Sand CCB only when the primary sidecar enables Fable"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
-          "assertion": "relay posts InferenceService/Stream with x-cursor-client-type sand and preserves exact input/output usage"
+          "assertion": "loopback relay hits InferenceService/Stream with Sand identity and emits Anthropic SSE"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
-          "assertion": "cold submit starts relay and emits exactly one external Cursor billing terminal"
+          "assertion": "cold submit starts the relay and emits one external billing terminal with usage"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
-          "assertion": "tool recovery requires a control-only response and full draft-2020-12 JSON Schema validation"
+          "assertion": "tool recovery accepts XML and bounded compact control but rejects unknown tools"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
-          "assertion": "cursor variant switches native to Sand and back without sharing resume namespace"
+          "assertion": "currentVariant"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
-          "assertion": "downstream abort cancels upstream inference and relay close is bounded"
+          "assertion": "downstream abort cancels the Cursor stream and relay close does not hang"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cursor-sand-inference.ts",
+          "assertion": "[cursor-sand-inference] PASS — InferenceService endpoint, Sand identity, cold-submit, billing, variant and abort guards present"
         }
+      ],
+      "coverageCommits": [
+        "4d678dda"
       ]
     }
   ]
