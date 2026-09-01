@@ -527,6 +527,11 @@ build_master_release() {
     cleanup_master_staging
     die "staging 缺 node_modules/tsx"
   }
+  mlog "  Cursor Sand InferenceService contract gate @ pinned staging"
+  if ! ( cd "$staging" && npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ); then
+    cleanup_master_staging
+    die "pinned Cursor Sand InferenceService contract gate 失败"
+  fi
 
   t0="$(date +%s)"
   mlog "  web-react official build @ staging(不碰工作树 dist)"

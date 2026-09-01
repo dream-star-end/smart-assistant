@@ -56,6 +56,13 @@ test('cursor engine factory selects Sand CCB only when the primary sidecar enabl
     const sand = createEngine('cursor', opts)
     assert.equal(sand instanceof CursorRoutingAdapter, true)
     assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand')
+    assert.equal(typeof sand.compactForHandoff, 'function')
+    sand.setModel('cursor-grok-4.6-high')
+    await (sand as unknown as CursorRoutingAdapter).refreshVariantForTest()
+    assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'native')
+    sand.setModel('cursor-fable-5-high')
+    await (sand as unknown as CursorRoutingAdapter).refreshVariantForTest()
+    assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand')
     await sand.shutdown()
 
     writeFileSync(sidecar, 'api-key 0\n')
@@ -64,11 +71,10 @@ test('cursor engine factory selects Sand CCB only when the primary sidecar enabl
     assert.equal((native as unknown as CursorRoutingAdapter).currentVariant, 'native')
     writeFileSync(sidecar, 'api-key 1\n')
     native.setModel('cursor-fable-5-high')
-    await (native as unknown as CursorRoutingAdapter).refreshVariantForTest()
-    assert.equal((native as unknown as CursorRoutingAdapter).currentVariant, 'sand')
-    native.setModel('cursor-grok-4.6-high')
-    await (native as unknown as CursorRoutingAdapter).refreshVariantForTest()
-    assert.equal((native as unknown as CursorRoutingAdapter).currentVariant, 'native')
+    await assert.rejects(
+      (native as unknown as CursorRoutingAdapter).refreshVariantForTest(),
+      /CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION/,
+    )
     await native.shutdown()
   } finally {
     if (previous === undefined) delete process.env.OC_CURSOR_SAND_SIDECAR
@@ -132,6 +138,84 @@ test('cold submit starts the relay and emits one external billing terminal with 
   })
   await adapter.shutdown()
   assert.equal(closes, 1)
+})
+
+test('interrupt before cold Sand preparation prevents submission', async () => {
+  let releaseStart!: () => void
+  const startGate = new Promise<void>((resolvePromise) => { releaseStart = resolvePromise })
+  let starts = 0
+  let submissions = 0
+  const relay = {
+    async start() {
+      starts++
+      await startGate
+      return 'http://127.0.0.1:12345/route/test'
+    },
+    async close() {},
+  } as unknown as CursorSandRelay
+  const adapter = new CursorSandAdapter({
+    sessionKey: 'agent:main:test:cold-sand-cancel', agentId: 'main', agentBaseDir: process.cwd(),
+    config: {} as never, model: 'cursor-fable-5-high',
+  }, relay, () => {
+    submissions++
+    throw new Error('cancelled cold submit must not reach the inner adapter')
+  })
+  const billing: Array<{ terminalCode?: string }> = []
+  adapter.on('external_billing', (event) => billing.push(event as { terminalCode?: string }))
+  const run = adapter.submitTurn({
+    input: 'hello', requestId: 'b'.repeat(32),
+    sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map(),
+    onEvent() {}, onPostTerminalRuntimeEvent() {},
+  })
+  assert.equal(adapter.interrupt(), true)
+  releaseStart()
+  await run.submitted
+  assert.equal(await run.summary, null)
+  assert.equal(starts, 1)
+  assert.equal(submissions, 0)
+  assert.equal(billing.length, 1)
+  assert.equal(billing[0].terminalCode, 'USER_CANCELLED')
+  await adapter.shutdown()
+})
+
+test('routing interrupt during deferred variant preparation prevents inner submission', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-routing-cancel-'))
+  const sidecar = resolve(dir, '.sand-mode')
+  const previous = process.env.OC_CURSOR_SAND_SIDECAR
+  process.env.OC_CURSOR_SAND_SIDECAR = sidecar
+  writeFileSync(sidecar, 'api-key 0\n')
+  const router = new CursorRoutingAdapter({
+    sessionKey: 'agent:main:test:routing-cancel', agentId: 'main', agentBaseDir: dir,
+    config: {} as never, model: 'cursor-grok-4.6-high',
+  })
+  try {
+    let releaseVariant!: () => void
+    const variantGate = new Promise<void>((resolvePromise) => { releaseVariant = resolvePromise })
+    let submissions = 0
+    const testRouter = router as unknown as {
+      ensureVariant: () => Promise<void>
+      inner: { submitTurn: () => never }
+    }
+    testRouter.ensureVariant = async () => { await variantGate }
+    testRouter.inner.submitTurn = () => {
+      submissions++
+      throw new Error('cancelled routing submit must not reach the inner adapter')
+    }
+    const run = router.submitTurn({
+      input: 'hello', sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(), onEvent() {}, onPostTerminalRuntimeEvent() {},
+    })
+    assert.equal(router.interrupt(), true)
+    releaseVariant()
+    await run.submitted
+    assert.equal(await run.summary, null)
+    assert.equal(submissions, 0)
+  } finally {
+    await router.shutdown()
+    if (previous === undefined) delete process.env.OC_CURSOR_SAND_SIDECAR
+    else process.env.OC_CURSOR_SAND_SIDECAR = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('tool recovery accepts XML and bounded compact control but rejects unknown tools', () => {
@@ -298,6 +382,53 @@ test('loopback relay hits InferenceService/Stream with Sand identity and emits A
     assert.match(text, /"stop_reason":"tool_use"/)
     assert.match(text, /event: message_stop/)
     assert.equal(calls.length, 2)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('ordinary tool examples remain text and do not trigger a correction request', async () => {
+  let inferenceCalls = 0
+  const ordinary = 'Example: <tool_use name="Bash">{"command":"printf unsafe"}</tool_use>'
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    inferenceCalls++
+    return new Response(Buffer.concat([
+      responseFrame('textPart', { text: ordinary }),
+      responseFrame('usage', { promptTokens: 8, completionTokens: 6, totalTokens: 14 }),
+      envelope(Buffer.from('{}'), 0x02),
+    ]), {
+      status: 200,
+      headers: { 'content-type': 'application/connect+proto' },
+    })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-fable-5-high', stream: true, max_tokens: 64,
+        messages: [{ role: 'user', content: 'show a tool example' }],
+        tools: [{
+          name: 'Bash',
+          input_schema: {
+            type: 'object', properties: { command: { type: 'string' } }, required: ['command'],
+          },
+        }],
+      }),
+    })
+    assert.equal(response.status, 200)
+    const body = await response.text()
+    assert.match(body, /Example:/)
+    assert.match(body, /"stop_reason":"end_turn"/)
+    assert.equal(inferenceCalls, 1)
   } finally {
     await relay.close()
   }

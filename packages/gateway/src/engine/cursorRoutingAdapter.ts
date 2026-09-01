@@ -8,6 +8,7 @@ import type {
   EngineAdapter,
   EngineCapabilities,
   EngineTurnRun,
+  NativeModelHandoffArtifact,
   TurnParams,
 } from './engineAdapter.js'
 import type { PartialSnapshot, PhantomSignals } from './engineEvents.js'
@@ -57,6 +58,7 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   private variant: CursorVariant
   private goal: GoalStateSnapshot | null = null
   private readonly innerListeners = new Map<string, (...args: unknown[]) => void>()
+  private activeCancel: (() => boolean) | null = null
 
   constructor(opts: EngineCreateOpts) {
     super()
@@ -104,6 +106,9 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   private async ensureVariant(): Promise<void> {
     const desired = variantFor(this.opts.model)
     if (desired === this.variant) return
+    if (this.inner.model === this.opts.model) {
+      throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
+    }
     await this.inner.shutdown()
     await this.inner.waitForOutputDrain()
     this.unbindInner()
@@ -132,22 +137,48 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     const summary = new Promise<Awaited<EngineTurnRun['summary']>>((resolvePromise) => {
       resolveSummary = resolvePromise
     })
+    const clearActiveCancel = (): void => {
+      if (this.activeCancel === cancel) this.activeCancel = null
+    }
+    const cancel = (): boolean => {
+      ended = true
+      if (!innerRun) return true
+      this.inner.interrupt()
+      innerRun.end()
+      return true
+    }
+    this.activeCancel = cancel
     const submitted = (async () => {
       try {
         await this.ensureVariant()
+        if (ended) {
+          resolveSummary(null)
+          clearActiveCancel()
+          return
+        }
         innerRun = this.inner.submitTurn(params)
-        if (ended) innerRun.end()
-        void innerRun.summary.then(resolveSummary)
+        void innerRun.summary.then((result) => {
+          resolveSummary(result)
+          clearActiveCancel()
+        })
         await innerRun.submitted
       } catch (error) {
         resolveSummary(null)
+        clearActiveCancel()
         throw error
       }
     })()
     return {
       submitted,
       summary,
-      end(): void { ended = true; innerRun?.end() },
+      end(): void {
+        ended = true
+        innerRun?.end()
+        if (!innerRun) {
+          resolveSummary(null)
+          clearActiveCancel()
+        }
+      },
       getPartialSnapshot: () => innerRun?.getPartialSnapshot() ?? structuredClone(EMPTY_SNAPSHOT),
       getPhantomSignals: () => innerRun?.getPhantomSignals() ?? { ...EMPTY_PHANTOM },
       get finalized(): boolean { return innerRun?.finalized ?? false },
@@ -155,9 +186,29 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     }
   }
 
-  interrupt(): boolean { return this.inner.interrupt() }
+  interrupt(): boolean { return this.activeCancel?.() ?? this.inner.interrupt() }
   async shutdown(): Promise<void> { await this.inner.shutdown() }
   waitForOutputDrain(): Promise<void> { return this.inner.waitForOutputDrain() }
+
+  async compactForHandoff(): Promise<NativeModelHandoffArtifact> {
+    await this.ensureVariant()
+    const compactStartedAt = Date.now()
+    const run = this.inner.submitTurn({
+      input:
+        'Summarize the user goal, decisions, constraints, current work, relevant files, errors, and exact next steps for another model. Return only the handoff summary.',
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+      onEvent() {},
+      onPostTerminalRuntimeEvent() {},
+    })
+    await run.submitted
+    const summary = await run.summary
+    const summaryText = summary?.nativeCompactionSummary?.trim()
+      || summary?.assistantText.trim()
+      || ''
+    if (!summaryText) throw new Error('MODEL_SWITCH_NATIVE_COMPACTION_UNAVAILABLE')
+    return { summaryText, source: 'cursor', compactStartedAt }
+  }
 
   get nativeSessionId(): string | null {
     if (variantFor(this.opts.model) !== this.variant) return null

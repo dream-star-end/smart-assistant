@@ -577,9 +577,14 @@ function looksLikeInvalidToolIntent(
   text: string,
   allowedTools: readonly ToolRecoveryDefinition[],
 ): boolean {
-  if (/<tool_(?:use|call)\b/i.test(text) || /(?:^|\n)\s*tool_call\s*:/i.test(text)) return true
-  const object = firstJsonObject(text)
-  if (!object) return /^\s*:\s*[A-Za-z0-9_.:-]+\s*\ninput:/i.test(text)
+  const trimmed = text.trim()
+  // Correction is reserved for a whole-response control attempt. Prose that
+  // merely documents an XML/tool_call example must remain ordinary text.
+  if (/^<tool_(?:use|call)\b/i.test(trimmed)) return true
+  if (/^tool_call\s*:/i.test(trimmed)) return true
+  if (/^:\s*[A-Za-z0-9_.:-]+\s*\ninput:/i.test(trimmed)) return true
+  const object = firstJsonObject(trimmed)
+  if (!object || object !== trimmed) return false
   try {
     const parsed = JSON.parse(object) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false

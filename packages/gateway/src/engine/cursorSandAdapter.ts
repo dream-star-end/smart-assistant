@@ -84,7 +84,7 @@ export class CursorSandAdapter extends CcbAdapter {
   private readonly providerEnv: Record<string, string>
   private readonly relay: CursorSandRelay
   private readonly submitDelegate?: (params: TurnParams) => EngineTurnRun
-  private activeInterrupted = false
+  private activeCancel: (() => boolean) | null = null
 
   constructor(
     opts: EngineCreateOpts,
@@ -145,8 +145,8 @@ export class CursorSandAdapter extends CcbAdapter {
     const startedAt = Date.now()
     let inner: EngineTurnRun | null = null
     let ended = false
+    let interrupted = false
     let billingEmitted = false
-    this.activeInterrupted = false
     let resolveSummary!: (summary: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((resolvePromise) => {
       resolveSummary = resolvePromise
@@ -162,7 +162,7 @@ export class CursorSandAdapter extends CcbAdapter {
         : result?.isError || !result
           ? 'error'
           : 'success'
-      const terminalCode: EngineExternalBillingEvent['terminalCode'] | undefined = this.activeInterrupted
+      const terminalCode: EngineExternalBillingEvent['terminalCode'] | undefined = interrupted
         ? 'USER_CANCELLED'
         : /quota|rate.?limit|usage limit|subscription|\b429\b/i.test(errorDetail)
           ? 'QUOTA_UNAVAILABLE'
@@ -187,20 +187,39 @@ export class CursorSandAdapter extends CcbAdapter {
         ...(terminalCode ? { terminalCode } : {}),
       } satisfies EngineExternalBillingEvent)
     }
+    const clearActiveCancel = (): void => {
+      if (this.activeCancel === cancel) this.activeCancel = null
+    }
+    const cancel = (): boolean => {
+      interrupted = true
+      ended = true
+      if (!inner) return true
+      super.interrupt()
+      inner.end()
+      return true
+    }
+    this.activeCancel = cancel
     const submitted = (async () => {
       try {
         await this.prepareRelay()
+        if (ended) {
+          emitBilling(null)
+          resolveSummary(null)
+          clearActiveCancel()
+          return
+        }
         inner = this.submitDelegate ? this.submitDelegate(params) : super.submitTurn(params)
-        if (ended) inner.end()
         void inner.summary.then((result) => {
           emitBilling(result)
           resolveSummary(result)
+          clearActiveCancel()
         })
         await inner.submitted
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error)
         emitBilling(null, detail)
         resolveSummary(null)
+        clearActiveCancel()
         throw error
       }
     })()
@@ -210,6 +229,11 @@ export class CursorSandAdapter extends CcbAdapter {
       end(): void {
         ended = true
         inner?.end()
+        if (!inner) {
+          emitBilling(null)
+          resolveSummary(null)
+          clearActiveCancel()
+        }
       },
       getPartialSnapshot(): PartialSnapshot {
         return inner?.getPartialSnapshot() ?? structuredClone(EMPTY_SNAPSHOT)
@@ -223,8 +247,7 @@ export class CursorSandAdapter extends CcbAdapter {
   }
 
   override interrupt(): boolean {
-    this.activeInterrupted = true
-    return super.interrupt()
+    return this.activeCancel?.() ?? super.interrupt()
   }
 
   override async shutdown(): Promise<void> {
