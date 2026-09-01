@@ -796,6 +796,30 @@ describe('oc-cursor wrapper', () => {
     assert.match(argv, /--model\ncursor-grok-4.6-high-fast\n/)
   })
 
+  test('accepts the Fable 5.1 thinking upstream ids', () => {
+    const f = fixture()
+    for (const model of [
+      'claude-fable-5-1-thinking-low',
+      'claude-fable-5-1-thinking-high',
+      'claude-fable-5-1-thinking-max',
+    ]) {
+      const result = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, result.stderr)
+    }
+    // Non-thinking Fable 5.1 CLI variants stay outside the pinned allowlist.
+    const blocked = spawnSync(f.wrapper, ['--model', 'claude-fable-5-1-high', '--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(blocked.status, 2)
+    assert.match(blocked.stderr, /model is not allowlisted/)
+  })
+
   test('does not assume an undocumented Cursor API-key prefix', () => {
     const f = fixture()
     const key = 'cursor-key.with-punctuation=='

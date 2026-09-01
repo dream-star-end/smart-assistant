@@ -477,6 +477,8 @@ case "$model" in
   claude-opus-4-8-thinking-max|claude-opus-4-8-thinking-max-fast|\
   claude-fable-5-thinking-low|claude-fable-5-thinking-medium|claude-fable-5-thinking-high|\
   claude-fable-5-thinking-xhigh|claude-fable-5-thinking-max|\
+  claude-fable-5-1-thinking-low|claude-fable-5-1-thinking-medium|claude-fable-5-1-thinking-high|\
+  claude-fable-5-1-thinking-xhigh|claude-fable-5-1-thinking-max|\
   cursor-grok-4.5-high) ;;
   *) die "model is not allowlisted" ;;
 esac

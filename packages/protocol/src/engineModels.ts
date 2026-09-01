@@ -230,6 +230,7 @@ export type CursorEngineFamilyId =
   | 'opus-5'
   | 'opus-4.8'
   | 'fable-5'
+  | 'fable-5.1'
   | 'grok-4.5'
 
 export const CURSOR_ENGINE_MODELS = [
@@ -645,6 +646,51 @@ export const CURSOR_ENGINE_MODELS = [
     upstreamModel: 'claude-fable-5-thinking-max',
     family: 'fable-5',
     familyLabel: 'Cursor Fable 5',
+    effort: 'max',
+    fast: false,
+  },
+  {
+    id: 'cursor-fable-5.1-low',
+    displayName: 'Cursor Fable 5.1 Low (Non-ZDR)',
+    upstreamModel: 'claude-fable-5-1-thinking-low',
+    family: 'fable-5.1',
+    familyLabel: 'Cursor Fable 5.1',
+    effort: 'low',
+    fast: false,
+  },
+  {
+    id: 'cursor-fable-5.1-medium',
+    displayName: 'Cursor Fable 5.1 Medium (Non-ZDR)',
+    upstreamModel: 'claude-fable-5-1-thinking-medium',
+    family: 'fable-5.1',
+    familyLabel: 'Cursor Fable 5.1',
+    effort: 'medium',
+    fast: false,
+  },
+  {
+    id: 'cursor-fable-5.1-high',
+    displayName: 'Cursor Fable 5.1 High (Non-ZDR)',
+    upstreamModel: 'claude-fable-5-1-thinking-high',
+    family: 'fable-5.1',
+    familyLabel: 'Cursor Fable 5.1',
+    effort: 'high',
+    fast: false,
+  },
+  {
+    id: 'cursor-fable-5.1-xhigh',
+    displayName: 'Cursor Fable 5.1 Extra High (Non-ZDR)',
+    upstreamModel: 'claude-fable-5-1-thinking-xhigh',
+    family: 'fable-5.1',
+    familyLabel: 'Cursor Fable 5.1',
+    effort: 'xhigh',
+    fast: false,
+  },
+  {
+    id: 'cursor-fable-5.1-max',
+    displayName: 'Cursor Fable 5.1 Max (Non-ZDR)',
+    upstreamModel: 'claude-fable-5-1-thinking-max',
+    family: 'fable-5.1',
+    familyLabel: 'Cursor Fable 5.1',
     effort: 'max',
     fast: false,
   },

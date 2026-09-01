@@ -21,6 +21,8 @@ const CURSOR_PUBLIC: PublicModel[] = [
   { id: 'cursor-opus-4.8-high', display_name: 'Cursor Opus 4.8 High' },
   { id: 'cursor-opus-4.8-high-fast', display_name: 'Cursor Opus 4.8 High Fast' },
   { id: 'cursor-fable-5-high', display_name: 'Cursor Fable 5 High (Non-ZDR)' },
+  { id: 'cursor-fable-5.1-high', display_name: 'Cursor Fable 5.1 High (Non-ZDR)' },
+  { id: 'cursor-fable-5.1-max', display_name: 'Cursor Fable 5.1 Max (Non-ZDR)' },
 ]
 
 describe('cursorModelPicker', () => {
@@ -34,7 +36,15 @@ describe('cursorModelPicker', () => {
       'opus-5',
       'opus-4.8',
       'fable-5',
+      'fable-5.1',
     ])
+  })
+
+  it('drops Fast when switching from Grok Fast onto Fable 5.1 (family without Fast)', () => {
+    const fable51 = CURSOR_PUBLIC.filter((m) => m.id.startsWith('cursor-fable-5.1'))
+    expect(resolveCursorPickerSelection(fable51, 'fable-5.1', 'cursor-grok-4.6-high-fast')).toBe(
+      'cursor-fable-5.1-high',
+    )
   })
 
   it('picks High Fast when staying on Grok and requesting fast', () => {
