@@ -1152,7 +1152,7 @@ describe('oc-cursor wrapper', () => {
   })
 
 
-  test('Other Models (Opus) pass -H x-cursor-client-type: sand and set NODE_OPTIONS hook when .sand-mode is enabled', () => {
+  test('Other Models (Opus) pass a request-scoped Sand header without a global Headers hook', () => {
     const f = fixture()
     const authDir = dirname(f.auth)
     writeFileSync(
@@ -1170,6 +1170,12 @@ describe('oc-cursor wrapper', () => {
     const headerIdx = argv.indexOf('-H')
     assert.ok(headerIdx >= 0, 'argv must include -H flag')
     assert.equal(argv[headerIdx + 1], 'x-cursor-client-type: sand')
+    assert.doesNotMatch(
+      readFileSync(join(f.capture, 'env'), 'utf8'),
+      /^NODE_OPTIONS=.*sand-hook\.cjs$/m,
+      'the wrapper must not force Sand onto endpoint discovery/control requests',
+    )
+    assert.doesNotMatch(readFileSync(sourceWrapper, 'utf8'), /Headers\.prototype/)
   })
 
   test('Cursor Models (Grok 4.6) stay in native CLI mode and do NOT pass -H even when .sand-mode is enabled', () => {
