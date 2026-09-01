@@ -2288,6 +2288,45 @@
         "2295a322",
         "bfcc174e"
       ]
+    },
+    {
+      "id": "INC-20260901-CURSOR-SAND-INFERENCE",
+      "occurredAt": "2026-09-01",
+      "severity": "P1",
+      "symptom": "V5 selfhost 将 Cursor Fable Sand 误实现为 AgentService CLI -H/global Headers hook；前者被 CLI 覆盖回 cli，后者把 sand 污染到 agent.v1.AgentService/Run 并被上游拒绝。人工抓包确认未命中 aiserver.v1.InferenceService/Stream。",
+      "rootFixCommit": "a7b00110",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "Sand Fable factory routes through the CCB/InferenceService variant while non-Sand Cursor stays native"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "relay posts InferenceService/Stream with x-cursor-client-type sand and preserves exact input/output usage"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "cold submit starts relay and emits exactly one external Cursor billing terminal"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "tool recovery requires a control-only response and full draft-2020-12 JSON Schema validation"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "cursor variant switches native to Sand and back without sharing resume namespace"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "downstream abort cancels upstream inference and relay close is bounded"
+        }
+      ]
     }
   ]
 }
