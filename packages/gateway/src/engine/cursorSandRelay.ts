@@ -78,6 +78,7 @@ interface RelayAuthCache {
 
 interface ToolStreamState {
   index: number
+  contentIndex: number | null
   id: string
   name: string
   args: string
@@ -115,6 +116,7 @@ function toolIndexForPart(
     for (const [index, tool] of tools) {
       if (tool.id === part.toolCallId) return index
     }
+    return nextToolIndex(tools)
   }
   for (const [index, tool] of [...tools].reverse()) {
     if (!tool.closed) return index
@@ -131,6 +133,7 @@ function mergeToolPart(
   if (!tool) {
     tool = {
       index,
+      contentIndex: null,
       id: typeof part.toolCallId === 'string' && part.toolCallId
         ? part.toolCallId
         : `toolu_${randomBytes(12).toString('hex')}`,
@@ -1076,18 +1079,29 @@ export class CursorSandRelay {
       await this.pipeNonStreaming(upstream, opened.upstreamModel, advertisedTools(body.tools), res)
       return
     }
+    const retryInvalidTool = async (invalidResponse: string): Promise<Response> => {
+      const retry = await this.openInference(correctedToolBody(body, invalidResponse), signal)
+      if (!retry.response.ok || !retry.response.body) {
+        throw new Error(`CURSOR_SAND_RETRY_HTTP_${retry.response.status}`)
+      }
+      return retry.response
+    }
+    if (nativeInferenceTools(opened.upstreamModel)) {
+      await this.pipeNativeStreaming(
+        upstream,
+        opened.upstreamModel,
+        advertisedTools(body.tools),
+        res,
+        retryInvalidTool,
+      )
+      return
+    }
     await this.pipeStreaming(
       upstream,
       opened.upstreamModel,
       advertisedTools(body.tools),
       res,
-      async (invalidResponse) => {
-        const retry = await this.openInference(correctedToolBody(body, invalidResponse), signal)
-        if (!retry.response.ok || !retry.response.body) {
-          throw new Error(`CURSOR_SAND_RETRY_HTTP_${retry.response.status}`)
-        }
-        return retry.response
-      },
+      retryInvalidTool,
     )
   }
 
@@ -1155,7 +1169,7 @@ export class CursorSandRelay {
 
   private async consumeFrames(
     response: Response,
-    onFrame: (frame: JsonObject) => void,
+    onFrame: (frame: JsonObject) => void | Promise<void>,
     onEndError: (message: string) => void,
   ): Promise<void> {
     const reader = response.body!.getReader()
@@ -1175,13 +1189,274 @@ export class CursorSandRelay {
             const error = parseEndTrailer(payload)
             if (error) onEndError(error)
           } else {
-            onFrame(decodeFrame(payload))
+            await onFrame(decodeFrame(payload))
           }
         }
       }
       if (buffer.length !== 0) throw new Error('CURSOR_SAND_TRUNCATED_FRAME')
     } finally {
       await reader.cancel().catch(() => {})
+    }
+  }
+
+  private async pipeNativeStreaming(
+    upstream: Response,
+    model: string,
+    allowedTools: readonly ToolRecoveryDefinition[],
+    res: ServerResponse,
+    retryInvalidTool: (invalidResponse: string) => Promise<Response>,
+  ): Promise<void> {
+    const state = this.initialState()
+    const messageId = `msg_${randomBytes(16).toString('hex')}`
+    let streamError: string | null = null
+    let pendingText = ''
+    let textStreaming = false
+    res.statusCode = 200
+    res.setHeader('content-type', 'text/event-stream; charset=utf-8')
+    res.setHeader('cache-control', 'no-cache, no-transform')
+    res.setHeader('connection', 'keep-alive')
+    const ping = setInterval(() => {
+      if (!res.destroyed && !res.writableEnded && !res.writableNeedDrain) {
+        res.write(sseChunk('ping', { type: 'ping' }))
+      }
+    }, PING_MS)
+    ping.unref()
+
+    const closeThinking = async (): Promise<void> => {
+      if (state.thinkingIndex === null) return
+      const index = state.thinkingIndex
+      state.thinkingIndex = null
+      await stopBlock(res, index)
+    }
+    const closeText = async (): Promise<void> => {
+      if (state.textIndex === null) return
+      const index = state.textIndex
+      state.textIndex = null
+      await stopBlock(res, index)
+    }
+    const shouldHoldText = (value: string): boolean => {
+      const text = value.trimStart()
+      if (!text) return true
+      return text.startsWith('{')
+        || text.startsWith('<tool')
+        || /^tool[_ ]?call\s*:/i.test(text)
+        || /^:\s*[A-Za-z][A-Za-z0-9_.-]*\s*(?:\n|$)/.test(text)
+    }
+    const emitText = async (value: string): Promise<void> => {
+      if (!value) return
+      await closeThinking()
+      if (state.textIndex === null) {
+        state.textIndex = state.nextIndex++
+        await startBlock(res, state.textIndex, { type: 'text', text: '' })
+      }
+      await emitSse(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: state.textIndex,
+        delta: { type: 'text_delta', text: value },
+      })
+    }
+    const openTool = async (tool: ToolStreamState): Promise<void> => {
+      if (tool.opened || !tool.name) return
+      await closeThinking()
+      await closeText()
+      tool.contentIndex = state.nextIndex++
+      tool.opened = true
+      await startBlock(res, tool.contentIndex, {
+        type: 'tool_use', id: tool.id, name: tool.name, input: {},
+      })
+    }
+    const finishTool = async (tool: ToolStreamState): Promise<void> => {
+      await openTool(tool)
+      if (tool.contentIndex === null) return
+      await emitSse(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: tool.contentIndex,
+        delta: { type: 'input_json_delta', partial_json: tool.args || '{}' },
+      })
+      await stopBlock(res, tool.contentIndex)
+      tool.contentIndex = null
+      tool.closed = true
+    }
+
+    try {
+      await emitSse(res, 'message_start', {
+        type: 'message_start',
+        message: {
+          id: messageId,
+          type: 'message',
+          role: 'assistant',
+          model,
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          // Inference usage arrives after content; message_delta below carries
+          // the authoritative totals.
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      })
+      await this.consumeFrames(
+        upstream,
+        async (frame) => {
+          let text = ''
+          let thinking = ''
+          let signature = ''
+          let toolPart: JsonObject | null = null
+          this.applyFrame(state, frame, {
+            text: (value) => { text = value },
+            thinking: (value, valueSignature) => {
+              thinking = value
+              signature = valueSignature
+            },
+            tool: (part) => { toolPart = part },
+            error: (message) => { streamError ??= message },
+          })
+          if (thinking || signature) {
+            await closeText()
+            if (state.thinkingIndex === null) {
+              state.thinkingIndex = state.nextIndex++
+              await startBlock(res, state.thinkingIndex, {
+                type: 'thinking', thinking: '', signature: '',
+              })
+            }
+            if (thinking) {
+              await emitSse(res, 'content_block_delta', {
+                type: 'content_block_delta',
+                index: state.thinkingIndex,
+                delta: { type: 'thinking_delta', thinking },
+              })
+            }
+            if (signature) {
+              await emitSse(res, 'content_block_delta', {
+                type: 'content_block_delta',
+                index: state.thinkingIndex,
+                delta: { type: 'signature_delta', signature },
+              })
+            }
+          }
+          if (text) {
+            if (textStreaming) {
+              await emitText(text)
+            } else {
+              pendingText += text
+              if (!shouldHoldText(pendingText)) {
+                textStreaming = true
+                await emitText(pendingText)
+                pendingText = ''
+              }
+            }
+          }
+          const currentToolPart = toolPart as JsonObject | null
+          if (currentToolPart) {
+            const tool = mergeToolPart(state.tools, currentToolPart)
+            await openTool(tool)
+            if (currentToolPart.isComplete === true) await finishTool(tool)
+          }
+        },
+        (message) => { streamError ??= message },
+      )
+      this.onRawTextForTest?.(state.text, 1)
+      if (pendingText) {
+        let recovered = recoverXmlToolCalls(pendingText, allowedTools)
+        if (
+          allowedTools.length > 0
+          && recovered.tools.length === 0
+          && looksLikeInvalidToolIntent(pendingText, allowedTools)
+        ) {
+          const retry = await retryInvalidTool(pendingText)
+          const collected = await this.collectInference(retry)
+          this.onRawTextForTest?.(collected.state.text, 2)
+          state.inputTokens += collected.state.inputTokens
+          state.outputTokens += collected.state.outputTokens
+          streamError ??= collected.streamError
+          if (collected.state.thinking) {
+            await closeText()
+            if (state.thinkingIndex === null) {
+              state.thinkingIndex = state.nextIndex++
+              await startBlock(res, state.thinkingIndex, {
+                type: 'thinking', thinking: '', signature: '',
+              })
+            }
+            await emitSse(res, 'content_block_delta', {
+              type: 'content_block_delta',
+              index: state.thinkingIndex,
+              delta: { type: 'thinking_delta', thinking: collected.state.thinking },
+            })
+            if (collected.thinkingSignature) {
+              await emitSse(res, 'content_block_delta', {
+                type: 'content_block_delta',
+                index: state.thinkingIndex,
+                delta: { type: 'signature_delta', signature: collected.thinkingSignature },
+              })
+            }
+          }
+          for (const retryTool of collected.state.tools.values()) {
+            const index = nextToolIndex(state.tools)
+            state.tools.set(index, {
+              ...retryTool,
+              index,
+              contentIndex: null,
+              opened: false,
+              closed: false,
+            })
+          }
+          recovered = recoverXmlToolCalls(collected.state.text, allowedTools)
+          pendingText = recovered.text
+          if (
+            !collected.state.failed
+            && collected.state.tools.size === 0
+            && recovered.tools.length === 0
+            && looksLikeInvalidToolIntent(collected.state.text, allowedTools)
+          ) {
+            state.failed = true
+            streamError = 'Cursor Sand tool protocol remained invalid after one correction'
+          }
+        } else {
+          pendingText = recovered.text
+        }
+        for (const recoveredTool of recovered.tools) {
+          const index = nextToolIndex(state.tools)
+          state.tools.set(index, {
+            index,
+            contentIndex: null,
+            id: recoveredTool.id,
+            name: recoveredTool.name,
+            args: JSON.stringify(recoveredTool.input),
+            opened: false,
+            closed: false,
+          })
+          state.recoveredToolCount++
+        }
+        if (pendingText) {
+          textStreaming = true
+          await emitText(pendingText)
+          pendingText = ''
+        }
+      }
+      await closeThinking()
+      await closeText()
+      for (const tool of state.tools.values()) {
+        if (!tool.closed || tool.contentIndex !== null) await finishTool(tool)
+      }
+      if (state.failed || streamError) {
+        await emitSse(res, 'error', {
+          type: 'error',
+          error: { type: 'api_error', message: streamError ?? 'Cursor Sand inference failed' },
+        })
+        return
+      }
+      const toolCount = [...state.tools.values()].filter((tool) => tool.name).length
+      await emitSse(res, 'message_delta', {
+        type: 'message_delta',
+        delta: {
+          stop_reason: toolCount > 0 ? 'tool_use' : 'end_turn',
+          stop_sequence: null,
+        },
+        usage: { input_tokens: state.inputTokens, output_tokens: state.outputTokens },
+      })
+      await emitSse(res, 'message_stop', { type: 'message_stop' })
+    } finally {
+      clearInterval(ping)
+      if (!res.writableEnded) res.end()
     }
   }
 

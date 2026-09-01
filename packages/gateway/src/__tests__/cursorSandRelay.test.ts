@@ -754,7 +754,8 @@ test('loopback relay hits InferenceService/Stream with Sand identity and emits A
     assert.equal(response.status, 200)
     const text = await response.text()
     assert.match(text, /event: message_start/)
-    assert.match(text, /"usage":\{"input_tokens":10,"output_tokens":0\}/)
+    assert.match(text, /"usage":\{"input_tokens":0,"output_tokens":0\}/)
+    assert.match(text, /"usage":\{"input_tokens":10,"output_tokens":4\}/)
     assert.match(text, /"type":"thinking_delta"/)
     assert.match(text, /"type":"text_delta","text":"done"/)
     assert.match(text, /"type":"tool_use"/)
@@ -765,6 +766,76 @@ test('loopback relay hits InferenceService/Stream with Sand identity and emits A
     assert.match(text, /event: message_stop/)
     assert.equal(calls.length, 2)
   } finally {
+    await relay.close()
+  }
+})
+
+test('native Fable forwards thinking before the upstream stream ends', async () => {
+  let releaseUpstream!: () => void
+  const upstreamGate = new Promise<void>((resolvePromise) => { releaseUpstream = resolvePromise })
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(responseFrame('thinkingPart', { text: 'EARLY_THINKING' }))
+        void upstreamGate.then(() => {
+          controller.enqueue(responseFrame('textPart', { text: 'LATE_ANSWER' }))
+          controller.enqueue(responseFrame('usage', {
+            promptTokens: 5, completionTokens: 2, totalTokens: 7,
+          }))
+          controller.enqueue(envelope(Buffer.from('{}'), 0x02))
+          controller.close()
+        })
+      },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/connect+proto' },
+    })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  let released = false
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-fable-5-high', stream: true, max_tokens: 64,
+        messages: [{ role: 'user', content: 'answer' }],
+      }),
+    })
+    assert.equal(response.status, 200)
+    const reader = response.body!.getReader()
+    let prefix = ''
+    while (!prefix.includes('EARLY_THINKING')) {
+      const next = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error('early thinking timeout')),
+          1_000,
+        )),
+      ])
+      assert.equal(next.done, false)
+      prefix += Buffer.from(next.value!).toString('utf8')
+    }
+    assert.doesNotMatch(prefix, /LATE_ANSWER/)
+    releaseUpstream()
+    released = true
+    let suffix = ''
+    while (true) {
+      const next = await reader.read()
+      if (next.done) break
+      suffix += Buffer.from(next.value).toString('utf8')
+    }
+    assert.match(prefix + suffix, /LATE_ANSWER/)
+    assert.match(prefix + suffix, /"usage":\{"input_tokens":5,"output_tokens":2\}/)
+  } finally {
+    if (!released) releaseUpstream()
     await relay.close()
   }
 })
