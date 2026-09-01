@@ -57,6 +57,7 @@ interface AnthropicMessagesBody extends JsonObject {
 interface RelayDeps {
   fetchImpl?: typeof fetch
   readApiKey?: () => Buffer
+  credentialName?: string
   upstreamBaseUrl?: string
   clientVersion?: string
   now?: () => number
@@ -128,10 +129,13 @@ function trimSecretBuffer(raw: Buffer): Buffer {
   return out
 }
 
-export function readPrimaryCursorApiKey(): Buffer {
+export function readCursorApiKey(credentialName = 'api-key'): Buffer {
+  if (!/^api-key(?:\.(?:[2-9]|[1-9][0-9]+))?$/.test(credentialName)) {
+    throw new Error('CURSOR_SAND_CREDENTIAL_NAME_INVALID')
+  }
   const result = spawnSync(
     '/usr/bin/sudo',
-    ['-n', '/bin/cat', '/run/oc/cursor-auth/api-key'],
+    ['-n', '/bin/cat', `/run/oc/cursor-auth/${credentialName}`],
     {
       encoding: null,
       maxBuffer: 4096,
@@ -143,6 +147,10 @@ export function readPrimaryCursorApiKey(): Buffer {
     throw new Error('CURSOR_SAND_CREDENTIAL_UNAVAILABLE')
   }
   return trimSecretBuffer(Buffer.from(result.stdout))
+}
+
+export function readPrimaryCursorApiKey(): Buffer {
+  return readCursorApiKey('api-key')
 }
 
 function decodeJwtExpiry(token: string, fallback: number): number {
@@ -295,7 +303,7 @@ export function encodeCursorSandRequest(body: AnthropicMessagesBody): {
 } {
   if (typeof body.model !== 'string' || !body.model) throw new Error('CURSOR_SAND_MODEL_REQUIRED')
   const model = cursorModelById(body.model)
-  if (!model?.upstreamModel || !model.upstreamModel.startsWith('claude-fable-5')) {
+  if (!model?.upstreamModel) {
     throw new Error(`CURSOR_SAND_MODEL_NOT_SUPPORTED:${body.model}`)
   }
   const invocationId = randomUUID()
@@ -620,7 +628,7 @@ export class CursorSandRelay {
   constructor(deps: RelayDeps = {}) {
     this.deps = {
       fetchImpl: deps.fetchImpl ?? fetch,
-      readApiKey: deps.readApiKey ?? readPrimaryCursorApiKey,
+      readApiKey: deps.readApiKey ?? (() => readCursorApiKey(deps.credentialName ?? 'api-key')),
       upstreamBaseUrl: (deps.upstreamBaseUrl ?? DEFAULT_UPSTREAM).replace(/\/+$/, ''),
       clientVersion: deps.clientVersion ?? DEFAULT_CLIENT_VERSION,
       now: deps.now ?? Date.now,

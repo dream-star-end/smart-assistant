@@ -1,5 +1,6 @@
-/** Stable cursor-engine facade that can replace the underlying native CLI or
- * Sand/CCB runner when the model or primary sidecar route changes. */
+/** Stable cursor-engine facade. One account-pool credential is bound at a
+ * time; its admin-authored Sand flag pins the session transport while
+ * same-transport credential failover preserves native history. */
 import { EventEmitter } from 'node:events'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { GoalStateSnapshot, JobTerminal } from '@openclaude/protocol'
@@ -13,7 +14,12 @@ import type {
 import type { PartialSnapshot, PhantomSignals } from './engineEvents.js'
 import type { EngineCreateOpts } from './registry.js'
 import { CursorAdapter } from './cursorAdapter.js'
-import { CursorSandAdapter, cursorSandEnabledForModel } from './cursorSandAdapter.js'
+import { CursorSandAdapter } from './cursorSandAdapter.js'
+import {
+  cursorSandEnabledForSelection,
+  selectCursorCredential,
+  type CursorCredentialSelection,
+} from './cursorCredentialSelection.js'
 
 type CursorVariant = 'native' | 'sand'
 
@@ -38,8 +44,11 @@ const EMPTY_SNAPSHOT: PartialSnapshot = {
 const EMPTY_PHANTOM: PhantomSignals = { apiState: 'unknown', skipReason: null }
 const SAND_RESUME_PREFIX = 'sand-ccb:'
 
-function variantFor(model: string | undefined): CursorVariant {
-  return cursorSandEnabledForModel(model) ? 'sand' : 'native'
+function variantFor(
+  model: string | undefined,
+  selection: CursorCredentialSelection,
+): CursorVariant {
+  return cursorSandEnabledForSelection(model, selection) ? 'sand' : 'native'
 }
 
 function resumeForVariant(resume: string | undefined, variant: CursorVariant): string | undefined {
@@ -55,6 +64,9 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   private opts: EngineCreateOpts
   private inner: EngineAdapter
   private variant: CursorVariant
+  private credentialSelection: CursorCredentialSelection
+  private credentialNeedsRefresh = false
+  private readonly selectCredential: typeof selectCursorCredential
   private goal: GoalStateSnapshot | null = null
   private readonly innerListeners = new Map<string, (...args: unknown[]) => void>()
   private activeCancel: (() => boolean) | null = null
@@ -64,15 +76,26 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   private readonly pendingLifecycle = new Set<Promise<unknown>>()
   private lifecycleTail: Promise<void> = Promise.resolve()
 
-  constructor(opts: EngineCreateOpts) {
+  constructor(
+    opts: EngineCreateOpts,
+    selector: typeof selectCursorCredential = selectCursorCredential,
+  ) {
     super()
-    this.opts = { ...opts }
-    this.variant = variantFor(opts.model)
+    this.selectCredential = selector
+    this.credentialSelection = opts.cursorCredentialSelection ?? selector({
+      agentId: opts.agentId,
+      sessionKey: opts.sessionKey,
+      agentBaseDir: opts.agentBaseDir,
+      model: opts.model,
+    })
+    this.opts = { ...opts, cursorCredentialSelection: this.credentialSelection }
+    this.variant = variantFor(opts.model, this.credentialSelection)
     this.inner = this.createInner(this.variant)
     this.bindInner()
   }
 
   get currentVariant(): CursorVariant { return this.variant }
+  get currentCredentialForTest(): CursorCredentialSelection { return { ...this.credentialSelection } }
   /** Deterministic test seam; production reaches the same gate through
    * start/preheat/submitTurn. */
   async refreshVariantForTest(): Promise<void> { await this.ensureVariant() }
@@ -91,6 +114,13 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   private bindInner(): void {
     for (const event of FORWARDED_EVENTS) {
       const listener = (...args: unknown[]): void => {
+        if (event === 'external_billing') {
+          const billing = args[0] as { status?: unknown; terminalCode?: unknown } | undefined
+          if (
+            billing?.status !== 'success'
+            && billing?.terminalCode !== 'USER_CANCELLED'
+          ) this.credentialNeedsRefresh = true
+        }
         if (event === 'session_id' && this.variant === 'sand' && typeof args[0] === 'string') {
           this.emit(event, `${SAND_RESUME_PREFIX}${args[0]}`)
         } else {
@@ -131,7 +161,36 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
 
   private async ensureVariant(generation = this.lifecycleGeneration): Promise<void> {
     this.assertLifecycle(generation)
-    const desired = variantFor(this.opts.model)
+    if (this.credentialNeedsRefresh) {
+      const next = this.selectCredential({
+        agentId: this.opts.agentId,
+        sessionKey: this.opts.sessionKey,
+        agentBaseDir: this.opts.agentBaseDir,
+        model: this.opts.model,
+      })
+      const nextVariant = variantFor(this.opts.model, next)
+      if (nextVariant !== this.variant) {
+        throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
+      }
+      this.credentialNeedsRefresh = false
+      if (next.keyName !== this.credentialSelection.keyName || next.slot !== this.credentialSelection.slot) {
+        const nativeId = this.inner.nativeSessionId
+        await this.inner.shutdown()
+        await this.inner.waitForOutputDrain()
+        this.assertLifecycle(generation)
+        this.unbindInner()
+        this.credentialSelection = next
+        this.opts.cursorCredentialSelection = next
+        this.opts.resumeSessionId = nativeId
+          ? this.variant === 'sand' ? `${SAND_RESUME_PREFIX}${nativeId}` : nativeId
+          : undefined
+        this.inner = this.createInner(this.variant)
+        this.bindInner()
+        if (this.goal) await this.inner.setGoalState(this.goal)
+        this.assertLifecycle(generation)
+      }
+    }
+    const desired = variantFor(this.opts.model, this.credentialSelection)
     if (desired === this.variant) return
     // Neither native Cursor nor Sand exposes a side-effect-free, billable
     // compaction/export surface. Never swap a live session's underlying
@@ -243,7 +302,7 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   waitForOutputDrain(): Promise<void> { return this.inner.waitForOutputDrain() }
 
   get nativeSessionId(): string | null {
-    if (variantFor(this.opts.model) !== this.variant) return null
+    if (variantFor(this.opts.model, this.credentialSelection) !== this.variant) return null
     const id = this.inner.nativeSessionId
     return id && this.variant === 'sand' ? `${SAND_RESUME_PREFIX}${id}` : id
   }
@@ -253,7 +312,7 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   }
 
   setModel(model: string | undefined): void {
-    if (variantFor(model) !== this.variant) {
+    if (variantFor(model, this.credentialSelection) !== this.variant) {
       throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
     }
     this.opts.model = model

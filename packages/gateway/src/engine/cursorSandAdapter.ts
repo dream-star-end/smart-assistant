@@ -1,10 +1,5 @@
 /** Cursor Sand engine: CCB supplies the local agent/tool loop while a
  * capability-scoped loopback relay speaks Cursor InferenceService/Stream. */
-import { spawnSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
-import {
-  cursorModelById,
-} from '@openclaude/protocol'
 import type { EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
 import type {
   EngineExternalBillingEvent,
@@ -15,10 +10,13 @@ import type {
 import type { EngineCreateOpts } from './registry.js'
 import { CcbAdapter } from './ccbAdapter.js'
 import { CursorSandRelay } from './cursorSandRelay.js'
+import {
+  recordCursorCredentialResult,
+  type CursorCredentialSelection,
+} from './cursorCredentialSelection.js'
 import { createLogger } from '../logger.js'
 
 const log = createLogger({ module: 'cursorSandAdapter' })
-const DEFAULT_SAND_SIDECAR = '/run/oc/cursor-auth/.sand-mode'
 const REQUEST_ID_RE = /^[0-9a-f]{32}$/
 const EMPTY_SNAPSHOT: PartialSnapshot = {
   assistantText: '',
@@ -29,35 +27,6 @@ const EMPTY_SNAPSHOT: PartialSnapshot = {
   runtimeEvents: [],
 }
 const EMPTY_PHANTOM: PhantomSignals = { apiState: 'unknown', skipReason: null }
-
-function readSandSidecar(path = process.env.OC_CURSOR_SAND_SIDECAR ?? DEFAULT_SAND_SIDECAR): string {
-  if (path !== DEFAULT_SAND_SIDECAR) {
-    if (!existsSync(path)) return ''
-    return readFileSync(path, 'utf8')
-  }
-  const result = spawnSync(
-    '/usr/bin/sudo',
-    ['-n', '/bin/cat', DEFAULT_SAND_SIDECAR],
-    { encoding: 'utf8', maxBuffer: 16 * 1024, env: { PATH: '/usr/bin:/bin' }, stdio: ['ignore', 'pipe', 'ignore'] },
-  )
-  return result.status === 0 && typeof result.stdout === 'string' ? result.stdout : ''
-}
-
-export function cursorSandEnabledForModel(
-  modelId: string | undefined,
-  sidecar = readSandSidecar(),
-): boolean {
-  if (!modelId) return false
-  const model = cursorModelById(modelId)
-  if (!model?.upstreamModel || !model.upstreamModel.startsWith('claude-fable-5')) return false
-  for (const raw of sidecar.split(/\r?\n/)) {
-    const line = raw.trim()
-    if (!line || line.startsWith('#')) continue
-    const [slot, enabled, ...extra] = line.split(/\s+/)
-    if (extra.length === 0 && slot === 'api-key' && enabled === '1') return true
-  }
-  return false
-}
 
 function appendNoProxy(current: string | undefined, ...hosts: string[]): string {
   const values = (current ?? '').split(',').map((value) => value.trim()).filter(Boolean)
@@ -87,6 +56,8 @@ export class CursorSandAdapter extends CcbAdapter {
   private readonly providerEnv: Record<string, string>
   private readonly relay: CursorSandRelay
   private readonly submitDelegate?: (params: TurnParams) => EngineTurnRun
+  private readonly selection: CursorCredentialSelection
+  private readonly recordResult: (result: 'ok' | 'fail') => void
   private activeCancel: (() => boolean) | null = null
   private lifecycleGeneration = 0
   private lifecycleClosed = false
@@ -97,14 +68,26 @@ export class CursorSandAdapter extends CcbAdapter {
 
   constructor(
     opts: EngineCreateOpts,
-    relay = new CursorSandRelay(),
+    relay?: CursorSandRelay,
     submitDelegate?: (params: TurnParams) => EngineTurnRun,
+    recordResult?: (result: 'ok' | 'fail') => void,
   ) {
+    const selection = opts.cursorCredentialSelection
+    if (!selection?.sandEnabled) throw new Error('CURSOR_SAND_CREDENTIAL_BINDING_REQUIRED')
     const providerEnv: Record<string, string> = {}
     super({ ...opts, providerEnvOverride: providerEnv, authorityEngine: 'cursor' })
     this.providerEnv = providerEnv
-    this.relay = relay
+    this.selection = selection
+    this.relay = relay ?? new CursorSandRelay({ credentialName: selection.keyName })
     this.submitDelegate = submitDelegate
+    this.recordResult = recordResult ?? ((result) => recordCursorCredentialResult({
+      agentId: opts.agentId,
+      sessionKey: opts.sessionKey,
+      agentBaseDir: opts.agentBaseDir,
+      model: this.model,
+      selection,
+      result,
+    }))
   }
 
   private assertLifecycle(generation: number): void {
@@ -212,7 +195,6 @@ export class CursorSandAdapter extends CcbAdapter {
     const emitBilling = (result: TurnSummary | null, detail?: string): void => {
       if (billingEmitted) return
       billingEmitted = true
-      if (!params.requestId || !REQUEST_ID_RE.test(params.requestId)) return
       const errorDetail = detail ?? result?.errorDetail ?? ''
       const unavailable = /auth|credential|unauthorized|forbidden|quota|rate.?limit|usage limit|subscription|\b40[13]\b|\b429\b/i.test(errorDetail)
       const status: EngineExternalBillingEvent['status'] = unavailable
@@ -229,6 +211,17 @@ export class CursorSandAdapter extends CcbAdapter {
             : status === 'error'
               ? 'ENGINE_ERROR'
               : undefined
+      if (!interrupted) {
+        try {
+          this.recordResult(status === 'success' ? 'ok' : 'fail')
+        } catch (error) {
+          log.warn('cursor sand credential result recording threw', {
+            slot: this.selection.slot,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      }
+      if (!params.requestId || !REQUEST_ID_RE.test(params.requestId)) return
       this.emit('external_billing', {
         requestId: params.requestId,
         engine: 'cursor',
@@ -241,6 +234,12 @@ export class CursorSandAdapter extends CcbAdapter {
             cache_read_input_tokens: result.usage.cacheReadTokens,
             cache_creation_input_tokens: result.usage.cacheCreationTokens,
           },
+        } : {}),
+        ...(!interrupted ? {
+          cursorSlotResults: [{
+            slot: this.selection.slot,
+            result: status === 'success' ? 'ok' as const : 'fail' as const,
+          }],
         } : {}),
         ...(terminalCode ? { terminalCode } : {}),
       } satisfies EngineExternalBillingEvent)

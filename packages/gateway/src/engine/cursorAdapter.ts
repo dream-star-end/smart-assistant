@@ -1899,6 +1899,9 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // every present/future credential name. The MCP child receives only its
       // explicit config env below; shell tools get non-secret agent routing.
       const env = buildCursorSpawnEnv(this.opts.agentId, this.opts.sessionKey)
+      if (this.opts.cursorCredentialSelection) {
+        env.OPENCLAUDE_CURSOR_SELECTED_KEY = this.opts.cursorCredentialSelection.keyName
+      }
 
       if (mcpLaunch) {
         const gatewayToken = this.opts.config.gateway.accessToken

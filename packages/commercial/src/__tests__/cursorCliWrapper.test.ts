@@ -1152,7 +1152,7 @@ describe('oc-cursor wrapper', () => {
   })
 
 
-  test('Other Models (Opus) pass a request-scoped Sand header without a global Headers hook', () => {
+  test('native wrapper never forges Sand onto AgentService even for a Sand-enabled Opus key', () => {
     const f = fixture()
     const authDir = dirname(f.auth)
     writeFileSync(
@@ -1167,15 +1167,56 @@ describe('oc-cursor wrapper', () => {
     )
     assert.equal(result.status, 0, result.stderr)
     const argv = readFileSync(join(f.capture, 'argv'), 'utf8').trim().split('\n')
-    const headerIdx = argv.indexOf('-H')
-    assert.ok(headerIdx >= 0, 'argv must include -H flag')
-    assert.equal(argv[headerIdx + 1], 'x-cursor-client-type: sand')
+    assert.equal(argv.includes('-H'), false, 'native AgentService argv must not include a Sand header')
     assert.doesNotMatch(
       readFileSync(join(f.capture, 'env'), 'utf8'),
       /^NODE_OPTIONS=.*sand-hook\.cjs$/m,
       'the wrapper must not force Sand onto endpoint discovery/control requests',
     )
     assert.doesNotMatch(readFileSync(sourceWrapper, 'utf8'), /Headers\.prototype/)
+  })
+
+  test('metadata selection and a pinned native launch use the same account-pool Sand slot', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    const rotationFile = join(f.dir, 'selection-rotation')
+    writeFileSync(join(authDir, 'api-key.2'), 'crsr_second\n', { mode: 0o600 })
+    writeFileSync(join(authDir, '.sand-mode'), '# sand-mode v1\napi-key 0\napi-key.2 1\n', { mode: 0o600 })
+    writeFileSync(rotationFile, `1 ${Math.floor(Date.now() / 1000) + 300}\n`, { mode: 0o600 })
+    const selected = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__select__'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_CURSOR_SELECT_ONLY: '1',
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(selected.status, 0, selected.stderr)
+    assert.match(selected.stdout, /^oc-cursor: selected_slot 2 api-key\.2 sand$/m)
+
+    const launched = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'pinned launch'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_CURSOR_SELECTED_KEY: 'api-key.2',
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(launched.status, 0, launched.stderr)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8').trim(), 'crsr_second')
+    assert.match(launched.stderr, /slot_result 2 ok/)
+    assert.equal(readFileSync(join(f.capture, 'argv'), 'utf8').includes('-H'), false)
+    assert.doesNotMatch(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SELECTED_KEY=/m)
   })
 
   test('Cursor Models (Grok 4.6) stay in native CLI mode and do NOT pass -H even when .sand-mode is enabled', () => {

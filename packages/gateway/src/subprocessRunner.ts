@@ -714,6 +714,15 @@ export interface SubprocessRunnerOpts {
   /** Engine expected in the signed/local catalog descriptor when CCB is used
    * as another engine's local tool loop. Defaults to ccb. */
   authorityEngine?: 'ccb' | 'cursor'
+  /** Platform-selected Cursor account-pool binding. It is minted by the
+   * root-owned oc-cursor selector, never from user/catalog input. The binding
+   * stays fixed for one EngineAdapter session so Sand/native transport changes
+   * are invisible to the user and cannot silently discard native history. */
+  cursorCredentialSelection?: {
+    slot: number
+    keyName: string
+    sandEnabled: boolean
+  }
   permissionMode?: string
   resumeSessionId?: string // 续上之前的 CCB session
   // Per-agent overrides

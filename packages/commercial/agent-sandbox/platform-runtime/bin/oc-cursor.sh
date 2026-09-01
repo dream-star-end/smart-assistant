@@ -95,7 +95,9 @@ if [ -z "$flavor_assert" ]; then
   fi
 fi
 
-if /usr/bin/sudo -n /usr/bin/test -f "$cursor_proxy_file" 2>/dev/null; then
+if [ "${OPENCLAUDE_CURSOR_SELECT_ONLY:-}" != 1 ] \
+  && [ -z "${OPENCLAUDE_CURSOR_RECORD_RESULT:-}" ] \
+  && /usr/bin/sudo -n /usr/bin/test -f "$cursor_proxy_file" 2>/dev/null; then
   cursor_proxy_type=$(/usr/bin/sudo -n /usr/bin/stat -c %F -- "$cursor_proxy_file" 2>/dev/null) \
     || die "Cursor HTTPS proxy metadata is unavailable"
   cursor_proxy_uid=$(/usr/bin/sudo -n /usr/bin/stat -c %u -- "$cursor_proxy_file" 2>/dev/null) \
@@ -595,6 +597,28 @@ if [ "$eligible_count" -gt 1 ]; then
   done
 fi
 
+# Gateway routing may pin the exact slot returned by an immediately preceding
+# metadata-only selection. Revalidate against this model family's eligible
+# pool; never accept an arbitrary path or a key excluded by quota class.
+if [ -n "${OPENCLAUDE_CURSOR_SELECTED_KEY:-}" ]; then
+  case "$OPENCLAUDE_CURSOR_SELECTED_KEY" in
+    api-key|api-key.[2-9]|api-key.[1-9][0-9]*) ;;
+    *) die "Cursor selected credential name is invalid" ;;
+  esac
+  selected_found=0
+  selected_position=0
+  for key_name in $eligible_names; do
+    selected_position=$((selected_position + 1))
+    if [ "$key_name" = "$OPENCLAUDE_CURSOR_SELECTED_KEY" ]; then
+      chosen_key_file=$auth_dir/$key_name
+      rotation_idx=$((selected_position - 1))
+      selected_found=1
+      break
+    fi
+  done
+  [ "$selected_found" -eq 1 ] || die "Cursor selected credential is not eligible"
+fi
+
 # Advance the eligible pool past the slot that just failed. No-op for
 # single-eligible accounts, so their failure path stays byte-identical.
 
@@ -645,6 +669,41 @@ if [ -n "${sand_sidecar_text:-}" ]; then
   done <<SAND_SIDECAR
 $sand_sidecar_text
 SAND_SIDECAR
+fi
+
+chosen_full_slot=0
+full_slot_cursor=0
+for key_name in $key_names; do
+  full_slot_cursor=$((full_slot_cursor + 1))
+  if [ "$auth_dir/$key_name" = "$chosen_key_file" ]; then
+    chosen_full_slot=$full_slot_cursor
+    break
+  fi
+done
+[ "$chosen_full_slot" -gt 0 ] || die "Cursor selected credential slot is unavailable"
+
+# Internal metadata/settlement modes never read or print the credential. They
+# let the gateway bind native/Sand routing to the wrapper's existing pool
+# authority instead of reimplementing rotation and quota filtering in TS.
+if [ "${OPENCLAUDE_CURSOR_SELECT_ONLY:-}" = 1 ]; then
+  if [ "$sand_enabled" -eq 1 ]; then selected_mode=sand; else selected_mode=native; fi
+  printf 'oc-cursor: selected_slot %s %s %s\n' "$chosen_full_slot" "$chosen_key_name" "$selected_mode"
+  exit 0
+fi
+if [ -n "${OPENCLAUDE_CURSOR_RECORD_RESULT:-}" ]; then
+  case "$OPENCLAUDE_CURSOR_RECORD_RESULT" in
+    ok)
+      emit_slot_result ok
+      clear_other_models_recheck
+      ;;
+    fail)
+      emit_slot_result fail
+      mark_other_models_recheck_failure
+      rotation_advance
+      ;;
+    *) die "Cursor record result is invalid" ;;
+  esac
+  exit 0
 fi
 
 if ! api_key=$(/usr/bin/sudo -n /bin/cat -- "$chosen_key_file" 2>/dev/null); then
@@ -874,16 +933,12 @@ if [ "${OPENCLAUDE_CURSOR_AGENT_DEBUG:-}" = "1" ] && [ -n "$oc_home" ] && [ -d "
   fi
 fi
 unset OPENCLAUDE_CURSOR_AGENT_DEBUG
+unset OPENCLAUDE_CURSOR_SELECT_ONLY OPENCLAUDE_CURSOR_RECORD_RESULT OPENCLAUDE_CURSOR_SELECTED_KEY
 
-# When Sand mode is enabled for Other Models (Opus, etc.), use the Cursor CLI's
-# request-scoped -H support. Do not monkey-patch global Headers: that also marks
-# endpoint discovery / AgentService control requests as Sand traffic, which the
-# upstream rejects before the CLI can reach the Sand inference stream.
-# Cursor Models (Grok 4.6 / Grok 4.5 / Composer 2.5) stay in native CLI mode.
-effective_sand=0
-if [ "$sand_enabled" -eq 1 ] && [ "$cursor_family" = "other_models" ]; then
-  effective_sand=1
-fi
+# Sand is a credential transport property handled by CursorRoutingAdapter.
+# This native wrapper must never try to turn AgentService into Sand by adding a
+# header; when it is invoked, the bound route is deliberately native (or Auto,
+# which has no concrete InferenceService model id).
 
 prompt=$1
 shift
@@ -902,7 +957,6 @@ fi
 [ -z "$model" ] || set -- --model "$model" "$@"
 [ -z "$mode" ] || set -- --mode "$mode" "$@"
 [ "$force" -eq 0 ] || set -- --force "$@"
-[ "$effective_sand" -eq 0 ] || set -- -H "x-cursor-client-type: sand" "$@"
 
 # setsid gives the CLI and every tool child one process group so Stop cannot
 # leave a shell command running after the wrapper exits. HOME is per-call and

@@ -1,11 +1,17 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { test } from 'node:test'
 import * as protobuf from 'protobufjs'
+import { CURSOR_ENGINE_MODELS } from '@openclaude/protocol'
 import { CursorSandRelay, encodeCursorSandRequest, recoverXmlToolCalls } from '../engine/cursorSandRelay.js'
-import { CursorSandAdapter, cursorSandEnabledForModel } from '../engine/cursorSandAdapter.js'
+import { CursorSandAdapter } from '../engine/cursorSandAdapter.js'
+import {
+  cursorSandEnabledForSelection,
+  recordCursorCredentialResult,
+  selectCursorCredential,
+} from '../engine/cursorCredentialSelection.js'
 import { CursorRoutingAdapter } from '../engine/cursorRoutingAdapter.js'
 import { createEngine } from '../engine/registry.js'
 
@@ -14,6 +20,8 @@ const root = protobuf.loadSync(
 )
 const StreamRequest = root.lookupType('aiserver.v1.InferenceStreamRequest')
 const StreamResponse = root.lookupType('aiserver.v1.InferenceStreamResponse')
+const SAND_SELECTION = { slot: 2, keyName: 'api-key.2', sandEnabled: true }
+const NATIVE_SELECTION = { slot: 1, keyName: 'api-key', sandEnabled: false }
 
 function envelope(payload: Uint8Array, flags = 0): Buffer {
   const out = Buffer.alloc(5 + payload.length)
@@ -46,53 +54,108 @@ function inertRun() {
   }
 }
 
-test('Sand sidecar selects only primary-key Fable models', () => {
-  const sidecar = '# sand-mode v1\napi-key 1\napi-key.2 0\n'
-  assert.equal(cursorSandEnabledForModel('cursor-fable-5-high', sidecar), true)
-  assert.equal(cursorSandEnabledForModel('cursor-grok-4.6-high', sidecar), false)
-  assert.equal(cursorSandEnabledForModel('cursor-fable-5-high', 'api-key 0\n'), false)
-  assert.equal(cursorSandEnabledForModel('cursor-fable-5-high', 'api-key.2 1\n'), false)
+test('Sand credential selects every concrete Cursor model while Auto stays native', () => {
+  assert.equal(cursorSandEnabledForSelection('cursor-fable-5-high', SAND_SELECTION), true)
+  assert.equal(cursorSandEnabledForSelection('cursor-grok-4.6-high', SAND_SELECTION), true)
+  assert.equal(cursorSandEnabledForSelection('cursor-opus-5-max-fast', SAND_SELECTION), true)
+  assert.equal(cursorSandEnabledForSelection('cursor-composer-2.5-fast', SAND_SELECTION), true)
+  assert.equal(cursorSandEnabledForSelection('cursor-auto', SAND_SELECTION), false)
+  assert.equal(cursorSandEnabledForSelection('cursor-fable-5-high', NATIVE_SELECTION), false)
 })
 
-test('cursor engine factory selects Sand CCB only when the primary sidecar enables Fable', async () => {
+test('cursor engine factory binds transport to the selected key and preserves it across concrete models', async () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-factory-'))
-  const sidecar = resolve(dir, '.sand-mode')
-  const previous = process.env.OC_CURSOR_SAND_SIDECAR
-  process.env.OC_CURSOR_SAND_SIDECAR = sidecar
   const opts = {
     sessionKey: 'agent:main:test:cursor-sand-factory',
     agentId: 'main',
     agentBaseDir: dir,
     config: {} as never,
     model: 'cursor-fable-5-high',
+    cursorCredentialSelection: SAND_SELECTION,
   }
   try {
-    writeFileSync(sidecar, 'api-key 1\n')
     const sand = createEngine('cursor', opts)
     assert.equal(sand instanceof CursorRoutingAdapter, true)
     assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand')
     assert.equal(sand.capabilities.supportsNativeCompact, false)
     assert.equal(typeof sand.compactForHandoff, 'undefined')
-    assert.throws(
-      () => sand.setModel('cursor-grok-4.6-high'),
-      /CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION/,
-    )
+    sand.setModel('cursor-grok-4.6-high')
+    await (sand as CursorRoutingAdapter).refreshVariantForTest()
     assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand')
+    assert.deepEqual((sand as CursorRoutingAdapter).currentCredentialForTest, SAND_SELECTION)
+    assert.throws(() => sand.setModel('cursor-auto'), /CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION/)
     await sand.shutdown()
 
-    writeFileSync(sidecar, 'api-key 0\n')
-    const native = createEngine('cursor', opts)
+    const native = createEngine('cursor', { ...opts, cursorCredentialSelection: NATIVE_SELECTION })
     assert.equal(native instanceof CursorRoutingAdapter, true)
     assert.equal((native as unknown as CursorRoutingAdapter).currentVariant, 'native')
-    writeFileSync(sidecar, 'api-key 1\n')
-    await assert.rejects(
-      (native as unknown as CursorRoutingAdapter).refreshVariantForTest(),
-      /CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION/,
-    )
+    native.setModel('cursor-opus-5-high')
+    await (native as CursorRoutingAdapter).refreshVariantForTest()
+    assert.equal((native as CursorRoutingAdapter).currentVariant, 'native')
     await native.shutdown()
   } finally {
-    if (previous === undefined) delete process.env.OC_CURSOR_SAND_SIDECAR
-    else process.env.OC_CURSOR_SAND_SIDECAR = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('credential selector parses a high-numbered Sand slot and records the same binding', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-credential-selector-'))
+  const wrapper = resolve(dir, 'oc-cursor')
+  const capture = resolve(dir, 'recorded')
+  const previous = process.env.OC_CURSOR_WRAPPER_BIN
+  writeFileSync(wrapper, `#!/bin/sh
+set -eu
+if [ "\${OPENCLAUDE_CURSOR_SELECT_ONLY:-}" = 1 ]; then
+  echo 'oc-cursor: selected_slot 10 api-key.10 sand'
+  exit 0
+fi
+printf '%s %s\n' "\${OPENCLAUDE_CURSOR_SELECTED_KEY:-}" "\${OPENCLAUDE_CURSOR_RECORD_RESULT:-}" > ${capture}
+`, { mode: 0o755 })
+  chmodSync(wrapper, 0o755)
+  process.env.OC_CURSOR_WRAPPER_BIN = wrapper
+  try {
+    const selection = selectCursorCredential({
+      agentId: 'main', sessionKey: 'agent:main:test:credential-selector',
+      agentBaseDir: dir, model: 'cursor-opus-5-high',
+    })
+    assert.deepEqual(selection, { slot: 10, keyName: 'api-key.10', sandEnabled: true })
+    recordCursorCredentialResult({
+      agentId: 'main', sessionKey: 'agent:main:test:credential-selector',
+      agentBaseDir: dir, model: 'cursor-opus-5-high', selection, result: 'ok',
+    })
+    assert.equal(readFileSync(capture, 'utf8').trim(), 'api-key.10 ok')
+  } finally {
+    if (previous === undefined) delete process.env.OC_CURSOR_WRAPPER_BIN
+    else process.env.OC_CURSOR_WRAPPER_BIN = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('failed credential rebinds within the same transport but refuses a native-to-Sand failover', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-credential-rebind-'))
+  try {
+    const nextNative = { slot: 2, keyName: 'api-key.2', sandEnabled: false }
+    const native = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:credential-rebind-native', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-grok-4.6-high', cursorCredentialSelection: NATIVE_SELECTION,
+    }, () => nextNative)
+    ;(native as unknown as { inner: { emit: (event: string, value: unknown) => void } })
+      .inner.emit('external_billing', { status: 'error', terminalCode: 'ENGINE_ERROR' })
+    await native.refreshVariantForTest()
+    assert.deepEqual(native.currentCredentialForTest, nextNative)
+    assert.equal(native.currentVariant, 'native')
+    await native.shutdown()
+
+    const mixed = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:credential-rebind-mixed', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-grok-4.6-high', cursorCredentialSelection: NATIVE_SELECTION,
+    }, () => SAND_SELECTION)
+    ;(mixed as unknown as { inner: { emit: (event: string, value: unknown) => void } })
+      .inner.emit('external_billing', { status: 'unavailable', terminalCode: 'AUTH_UNAVAILABLE' })
+    await assert.rejects(mixed.refreshVariantForTest(), /CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION/)
+    assert.deepEqual(mixed.currentCredentialForTest, NATIVE_SELECTION)
+    await mixed.shutdown()
+  } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
@@ -128,8 +191,8 @@ test('cold submit starts the relay and emits one external billing terminal with 
   }
   const adapter = new CursorSandAdapter({
     sessionKey: 'agent:main:test:cold-sand', agentId: 'main', agentBaseDir: process.cwd(),
-    config: {} as never, model: 'cursor-fable-5-high',
-  }, relay, () => fakeRun as never)
+    config: {} as never, model: 'cursor-fable-5-high', cursorCredentialSelection: SAND_SELECTION,
+  }, relay, () => fakeRun as never, () => {})
   const billing: unknown[] = []
   adapter.on('external_billing', (event) => billing.push(event))
   const run = adapter.submitTurn({
@@ -149,6 +212,7 @@ test('cold submit starts the relay and emits one external billing terminal with 
       input_tokens: 11, output_tokens: 7,
       cache_read_input_tokens: 3, cache_creation_input_tokens: 2,
     },
+    cursorSlotResults: [{ slot: 2, result: 'ok' }],
   })
   await adapter.shutdown()
   assert.equal(closes, 1)
@@ -169,11 +233,11 @@ test('interrupt before cold Sand preparation prevents submission', async () => {
   } as unknown as CursorSandRelay
   const adapter = new CursorSandAdapter({
     sessionKey: 'agent:main:test:cold-sand-cancel', agentId: 'main', agentBaseDir: process.cwd(),
-    config: {} as never, model: 'cursor-fable-5-high',
+    config: {} as never, model: 'cursor-fable-5-high', cursorCredentialSelection: SAND_SELECTION,
   }, relay, () => {
     submissions++
     throw new Error('cancelled cold submit must not reach the inner adapter')
-  })
+  }, () => {})
   const billing: Array<{ terminalCode?: string }> = []
   adapter.on('external_billing', (event) => billing.push(event as { terminalCode?: string }))
   const run = adapter.submitTurn({
@@ -208,11 +272,11 @@ test('shutdown during cold Sand preparation waits and prevents resurrection', as
   } as unknown as CursorSandRelay
   const adapter = new CursorSandAdapter({
     sessionKey: 'agent:main:test:cold-sand-shutdown', agentId: 'main', agentBaseDir: process.cwd(),
-    config: {} as never, model: 'cursor-fable-5-high',
+    config: {} as never, model: 'cursor-fable-5-high', cursorCredentialSelection: SAND_SELECTION,
   }, relay, () => {
     submissions++
     return inertRun() as never
-  })
+  }, () => {})
   const run = adapter.submitTurn({
     input: 'hello', sessionTotals: { totalCostUSD: 0, turns: 0 },
     toolUseIdToName: new Map(), onEvent() {}, onPostTerminalRuntimeEvent() {},
@@ -256,8 +320,8 @@ test('shutdown during Sand preheat waits and leaves no revived runner', async ()
   } as unknown as CursorSandRelay
   const adapter = new CursorSandAdapter({
     sessionKey: 'agent:main:test:sand-preheat-shutdown', agentId: 'main', agentBaseDir: process.cwd(),
-    config: {} as never, model: 'cursor-fable-5-high',
-  }, relay, () => inertRun() as never)
+    config: {} as never, model: 'cursor-fable-5-high', cursorCredentialSelection: SAND_SELECTION,
+  }, relay, () => inertRun() as never, () => {})
   const preheat = adapter.preheat()
   const preheatFailure = preheat.then(
     () => null,
@@ -282,13 +346,9 @@ test('shutdown during Sand preheat waits and leaves no revived runner', async ()
 
 test('routing interrupt during deferred variant preparation prevents inner submission', async () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-routing-cancel-'))
-  const sidecar = resolve(dir, '.sand-mode')
-  const previous = process.env.OC_CURSOR_SAND_SIDECAR
-  process.env.OC_CURSOR_SAND_SIDECAR = sidecar
-  writeFileSync(sidecar, 'api-key 0\n')
   const router = new CursorRoutingAdapter({
     sessionKey: 'agent:main:test:routing-cancel', agentId: 'main', agentBaseDir: dir,
-    config: {} as never, model: 'cursor-grok-4.6-high',
+    config: {} as never, model: 'cursor-grok-4.6-high', cursorCredentialSelection: NATIVE_SELECTION,
   })
   try {
     let releaseVariant!: () => void
@@ -317,21 +377,15 @@ test('routing interrupt during deferred variant preparation prevents inner submi
     assert.equal(submissions, 0)
   } finally {
     await router.shutdown()
-    if (previous === undefined) delete process.env.OC_CURSOR_SAND_SIDECAR
-    else process.env.OC_CURSOR_SAND_SIDECAR = previous
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
 test('routing shutdown during deferred preparation prevents resurrection', async () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-routing-shutdown-'))
-  const sidecar = resolve(dir, '.sand-mode')
-  const previous = process.env.OC_CURSOR_SAND_SIDECAR
-  process.env.OC_CURSOR_SAND_SIDECAR = sidecar
-  writeFileSync(sidecar, 'api-key 0\n')
   const router = new CursorRoutingAdapter({
     sessionKey: 'agent:main:test:routing-shutdown', agentId: 'main', agentBaseDir: dir,
-    config: {} as never, model: 'cursor-grok-4.6-high',
+    config: {} as never, model: 'cursor-grok-4.6-high', cursorCredentialSelection: NATIVE_SELECTION,
   })
   try {
     let releaseVariant!: () => void
@@ -376,8 +430,6 @@ test('routing shutdown during deferred preparation prevents resurrection', async
     assert.equal(submissions, 1)
   } finally {
     await router.shutdown()
-    if (previous === undefined) delete process.env.OC_CURSOR_SAND_SIDECAR
-    else process.env.OC_CURSOR_SAND_SIDECAR = previous
     rmSync(dir, { recursive: true, force: true })
   }
 })
@@ -475,6 +527,26 @@ test('Anthropic request encodes the concrete Fable model, history and tools', ()
     true,
   )
   assert.deepEqual(request.tools ?? [], [])
+})
+
+test('every concrete catalog Cursor model maps to its Sand InferenceService id', () => {
+  const unique = [...new Map(CURSOR_ENGINE_MODELS.map((model) => [model.id, model])).values()]
+  for (const model of unique) {
+    if (model.upstreamModel === null) continue
+    const encoded = encodeCursorSandRequest({
+      model: model.id,
+      messages: [{ role: 'user', content: 'OK' }],
+      max_tokens: 64,
+    })
+    const request = StreamRequest.toObject(StreamRequest.decode(encoded.bytes), { oneofs: true })
+    assert.equal(encoded.upstreamModel, model.upstreamModel, model.id)
+    assert.equal(request.modelId, model.upstreamModel, model.id)
+    assert.equal(request.requestedModel.modelId, model.upstreamModel, model.id)
+  }
+  assert.throws(
+    () => encodeCursorSandRequest({ model: 'cursor-auto', messages: [{ role: 'user', content: 'OK' }] }),
+    /CURSOR_SAND_MODEL_NOT_SUPPORTED/,
+  )
 })
 
 test('loopback relay hits InferenceService/Stream with Sand identity and emits Anthropic SSE', async () => {
