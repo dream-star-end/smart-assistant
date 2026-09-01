@@ -2367,6 +2367,11 @@
           "assertion": "stable account identity never reinterprets an old slot after pool compaction"
         },
         {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/frames.test.ts",
+          "assertion": "rejects malformed stable account, generation, or fingerprint values"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-cursor-sand-inference.ts",
           "assertion": "[cursor-sand-inference] PASS — InferenceService endpoint, Sand identity, cold-submit, billing, variant and abort guards present"
@@ -2382,7 +2387,8 @@
         "38596146",
         "5834df20",
         "4c423197",
-        "42c51537"
+        "42c51537",
+        "9cc8dedc"
       ]
     }
   ]
