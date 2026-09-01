@@ -2352,6 +2352,16 @@
           "assertion": "concrete model quota-family changes reselect an eligible key before the next turn"
         },
         {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorCliWrapper.test.ts",
+          "assertion": "an immutable generation keeps a bound Sand account stable after pool compaction"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "pool generation changes rebind stable account identity before reading a reused slot"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-cursor-sand-inference.ts",
           "assertion": "[cursor-sand-inference] PASS — InferenceService endpoint, Sand identity, cold-submit, billing, variant and abort guards present"
@@ -2365,7 +2375,8 @@
       "ccc58f05",
         "a32e9bb6",
         "38596146",
-        "5834df20"
+        "5834df20",
+        "4c423197"
       ]
     }
   ]
