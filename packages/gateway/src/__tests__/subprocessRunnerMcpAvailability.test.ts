@@ -13,6 +13,7 @@ import {
   CCB_SKILL_EVAL_HIDDEN_PLATFORM_TOOLS,
   projectCcbMcpAvailability,
 } from '../ccbMcpAvailability.js'
+import { inspectCcbPromptContextAvailability } from '../ccbMcpAvailabilitySourceContract.js'
 import {
   buildPromptContext,
   PLATFORM_MCP_TOOL_NAMES,
@@ -104,22 +105,37 @@ describe('subprocessRunner MCP availability wiring', () => {
 
   test('buildPromptContext consumes projectedMcpTools from projectCcbMcpAvailability', () => {
     const src = readFileSync(new URL('../subprocessRunner.ts', import.meta.url), 'utf8')
-    assert.ok(
-      src.includes('const projectedMcpTools = projectCcbMcpAvailability('),
-      'const projectedMcpTools = projectCcbMcpAvailability( must exist',
+    const binding = inspectCcbPromptContextAvailability(src)
+    assert.equal(binding.projectionDeclared, true, 'projectionDeclared')
+    assert.equal(
+      binding.consumesProjection,
+      true,
+      `buildPromptContext must consume projectedMcpTools (availableMcpTools initializer: ${binding.availableMcpToolsInitializer})`,
     )
-    const projectedCount = src.match(/projectedMcpTools/g)?.length ?? 0
-    assert.ok(
-      projectedCount >= 2,
-      `projectedMcpTools must appear at least twice (define + consume), got ${projectedCount}`,
-    )
-    const promptIdx = src.indexOf('buildPromptContext(')
-    assert.ok(promptIdx >= 0, 'buildPromptContext( call site not found')
-    const afterPrompt = src.slice(promptIdx, promptIdx + 1500)
-    assert.ok(
-      afterPrompt.includes('availableMcpTools: projectedMcpTools'),
-      'availableMcpTools: projectedMcpTools must appear within 1500 chars after buildPromptContext(',
-    )
+  })
+
+  test('inspectCcbPromptContextAvailability ignores comment bait and missing call sites', () => {
+    const correct = [
+      'const projectedMcpTools = projectCcbMcpAvailability({ configuredTools: [], mcpLaunch: null })',
+      'void buildPromptContext({ availableMcpTools: projectedMcpTools })',
+    ].join('\n')
+    const correctBinding = inspectCcbPromptContextAvailability(correct)
+    assert.equal(correctBinding.projectionDeclared, true)
+    assert.equal(correctBinding.consumesProjection, true)
+    assert.equal(correctBinding.availableMcpToolsInitializer, 'projectedMcpTools')
+
+    const commentBait = [
+      'const projectedMcpTools = projectCcbMcpAvailability({ configuredTools: [], mcpLaunch: null })',
+      'void buildPromptContext({ availableMcpTools: [...availableMcpTools] }) // availableMcpTools: projectedMcpTools',
+    ].join('\n')
+    const baitBinding = inspectCcbPromptContextAvailability(commentBait)
+    assert.equal(baitBinding.consumesProjection, false)
+    assert.equal(baitBinding.availableMcpToolsInitializer, '[...availableMcpTools]')
+
+    const missing = 'const projectedMcpTools = projectCcbMcpAvailability({ configuredTools: [], mcpLaunch: null })'
+    const missingBinding = inspectCcbPromptContextAvailability(missing)
+    assert.equal(missingBinding.availableMcpToolsInitializer, null)
+    assert.equal(missingBinding.consumesProjection, false)
   })
 
   test('skill-eval filtering does not drop same-named configured tools', () => {

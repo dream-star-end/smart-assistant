@@ -21,6 +21,9 @@ process.env.OPENCLAUDE_HOME = testHome;
 const promptSlots = await import("../packages/gateway/src/promptSlots.js");
 const { buildPromptContext, PLATFORM_MCP_TOOL_NAMES, sanitizeUnavailableMcpClaims } = promptSlots;
 const { projectCcbMcpAvailability } = await import("../packages/gateway/src/ccbMcpAvailability.js");
+const { inspectCcbPromptContextAvailability } = await import(
+  "../packages/gateway/src/ccbMcpAvailabilitySourceContract.js"
+);
 
 // promptSlots pulls mcpVisionServer → mcpStdioGuard, which keeps the process
 // alive on uncaughtException. This gate must still fail-closed.
@@ -160,19 +163,16 @@ assert.ok(
   subprocess.slice(Math.max(0, launchIdx - 200), launchIdx).includes("try {"),
   "resolveMcpMemoryLaunch( must be wrapped in try { within 200 chars",
 );
-assert.ok(
-  subprocess.includes("const projectedMcpTools = projectCcbMcpAvailability("),
-  "const projectedMcpTools = projectCcbMcpAvailability( must exist",
+const binding = inspectCcbPromptContextAvailability(subprocess);
+assert.equal(
+  binding.projectionDeclared,
+  true,
+  "const projectedMcpTools = projectCcbMcpAvailability(...) must be declared",
 );
-const projectedCount = subprocess.match(/projectedMcpTools/g)?.length ?? 0;
-assert.ok(
-  projectedCount >= 2,
-  `projectedMcpTools must appear at least twice (define + consume), got ${projectedCount}`,
-);
-const afterPrompt = subprocess.slice(promptIdx, promptIdx + 1500);
-assert.ok(
-  afterPrompt.includes("availableMcpTools: projectedMcpTools"),
-  "availableMcpTools: projectedMcpTools must appear within 1500 chars after buildPromptContext(",
+assert.equal(
+  binding.consumesProjection,
+  true,
+  `buildPromptContext must consume projectedMcpTools (availableMcpTools initializer: ${binding.availableMcpToolsInitializer})`,
 );
 
 const codexOverrides = readFileSync(
