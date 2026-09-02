@@ -269,8 +269,11 @@ declare global {
       runShadowPermissionReset: () => Promise<{
         permissionKeptOld: boolean;
         permissionKeptProjected: boolean;
+        projectedLifecycle: string;
         shadowEntry: string;
+        /** shadow diff 对 permission 身份:无 mismatch(新旧一致保留)或 newKeep=true 都算投影器保留。 */
         shadowNewKeep: boolean;
+        shadowAgreed: boolean;
       }>;
       /** T58: dual-slot 1MiB×6, out-of-order epoch, four-entry shadow stats. */
       runShadowDualSlotAndEpoch: () => Promise<{
@@ -2650,11 +2653,19 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
       const liveShadow = lastShadowFor("live-units");
       const permId = timelineIdentity(cmid, "permission", "req-t57");
       const shadowHit = liveShadow?.mismatches.find((row) => row.identity === permId);
+      // 投影器直接证据:与 socket live-units 入口同一输入([...preReset, ...mapped],mapped 为空)。
+      // 原写法只靠 shadow mismatch 的 newKeep 推断投影器保留,那依赖旧 reset 路径丢 permission;
+      // INC-20260903-PENDING-PERMISSION-LOST 起旧路径也保留未决 permission,新旧一致 → 无
+      // mismatch,不能再把「没有 mismatch」误判为投影器丢行。
+      const projected = projectTimeline(preReset);
+      const projectedPermission = projected.find((message) => identityOf(message) === permId);
       return {
         permissionKeptOld: session.messages.some((message) => message.role === "permission"),
-        permissionKeptProjected: shadowHit?.newKeep === true,
+        permissionKeptProjected: Boolean(projectedPermission),
+        projectedLifecycle: projectedPermission ? lifecycleOf(projectedPermission) : "none",
         shadowEntry: liveShadow?.entry ?? "none",
-        shadowNewKeep: shadowHit?.newKeep === true,
+        shadowNewKeep: shadowHit ? shadowHit.newKeep === true : true,
+        shadowAgreed: !shadowHit,
       };
     },
     runShadowDualSlotAndEpoch: async () => {

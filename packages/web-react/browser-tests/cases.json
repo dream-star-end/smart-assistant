@@ -228,7 +228,7 @@
     },
     {
       "id": "T57",
-      "proves": "P0 shadow：Phase-A empty live-units reset 前快照上 permission 进入投影器 live_open 槽；与旧 reset 的 diff 计入允许清单（B5/I5）"
+      "proves": "P0 shadow：Phase-A empty live-units reset 前快照上 permission 进入投影器 live_open 槽（projectTimeline 直证）；旧 owner-reset 路径同样保留未决 permission（INC-20260903-PENDING-PERMISSION-LOST），shadow diff 对该身份无 mismatch 或 newKeep=true"
     },
     {
       "id": "T58",

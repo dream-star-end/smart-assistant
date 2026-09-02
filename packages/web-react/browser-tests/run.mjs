@@ -2966,8 +2966,15 @@ await check("T57 permission 在 live-units shadow 投影中保留", async () => 
   if (result.shadowEntry !== "live-units") {
     throw new Error(`T57 未命中 live-units 入口:${JSON.stringify(result)}`);
   }
-  if (!result.permissionKeptProjected || !result.shadowNewKeep) {
-    throw new Error(`T57 投影器丢掉 permission:${JSON.stringify(result)}`);
+  if (!result.permissionKeptProjected || result.projectedLifecycle !== "live_open") {
+    throw new Error(`T57 投影器丢掉 permission 或未进 live_open 槽:${JSON.stringify(result)}`);
+  }
+  if (!result.shadowNewKeep) {
+    throw new Error(`T57 shadow diff 记录投影器丢弃 permission:${JSON.stringify(result)}`);
+  }
+  // INC-20260903-PENDING-PERMISSION-LOST:旧 owner-reset 路径也必须保留未决 permission。
+  if (!result.permissionKeptOld) {
+    throw new Error(`T57 旧 reset 路径丢掉未决 permission:${JSON.stringify(result)}`);
   }
 });
 
