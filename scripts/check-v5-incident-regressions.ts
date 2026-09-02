@@ -380,6 +380,9 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // fix(v5)(画窗/HUD/委派计费批)；源提交不可改写,只豁免其不可变祖先,证据以
   // T60/T61 浏览器用例 + check-v5-delegate-billing-requestid.ts 部署门补齐。
   "ce6b91692c8b87a59be81e50fdc145e0da045ace",
+  // 2026-09-03 反合期间 selfhost 又上线 rel-7a5617aaa(63ecbf9d8 Cursor Fable 卡死 /
+  // e309f2a59 委派转录合并,均缺 trailer);源提交不可改写,只豁免其不可变祖先。
+  "7a5617aaa50f06d13d2b9da8ec8d3d2e4a5d2a25",
 ] as const;
 
 function checkTrailerClosure(): number {
