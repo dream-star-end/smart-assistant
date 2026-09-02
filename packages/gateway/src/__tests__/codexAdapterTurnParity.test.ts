@@ -721,6 +721,10 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
     });
 
     assert.equal(h.adapter.interrupt(), true);
+    assert.deepEqual(await h.adapter.writeDelegateTerminal({} as never, "late child"), {
+      ok: false,
+      processAlive: true,
+    });
     await waitForRequest(h, "turn/interrupt");
     const ir = h.proc().written.find((r) => r.method === "turn/interrupt")!;
     assert.deepEqual(ir.params, { threadId: "thr-new-1", turnId: "turn-1" });

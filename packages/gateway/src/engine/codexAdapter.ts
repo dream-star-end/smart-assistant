@@ -554,8 +554,10 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   }
 
   interrupt(): boolean {
+    // Keep the active turn routed until the interrupted terminal result.
+    // `_interrupting` already revokes InlinePush eligibility; clearing
+    // `_activeTurn` here would also suppress partial-usage billing.
     this._interrupting = true
-    if (this._activeTurn) this._activeTurn = null
     return this.kernel.interrupt()
   }
 
