@@ -537,6 +537,11 @@ build_master_release() {
     cleanup_master_staging
     die "pinned CCB MCP availability contract gate 失败"
   fi
+  mlog "  delegate engine billing requestId contract gate @ pinned staging"
+  if ! ( cd "$staging" && npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts ); then
+    cleanup_master_staging
+    die "pinned delegate engine billing requestId contract gate 失败"
+  fi
 
   t0="$(date +%s)"
   mlog "  web-react official build @ staging(不碰工作树 dist)"
