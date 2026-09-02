@@ -19,7 +19,7 @@ const selfhostProfile = readFileSync(
 describe('official Claude Code runtime pin', () => {
   test('Dockerfile keeps the stock CLI opt-in, pinned, and build-verified', () => {
     assert.match(dockerfile, /ARG OC_INCLUDE_OFFICIAL_CLAUDE=0/)
-    assert.match(dockerfile, /ARG OC_OFFICIAL_CLAUDE_VERSION=2\.1\.258/)
+    assert.match(dockerfile, /ARG OC_OFFICIAL_CLAUDE_VERSION=2\.1\.259/)
     assert.match(dockerfile, /@anthropic-ai\/claude-code@\$\{OC_OFFICIAL_CLAUDE_VERSION\}/)
     assert.match(dockerfile, /claude --version/)
     assert.match(dockerfile, /test -x \/usr\/local\/bin\/claude/)
@@ -42,6 +42,6 @@ describe('official Claude Code runtime pin', () => {
 
   test('selfhost rebuild profile opts into exactly the audited official version', () => {
     assert.match(selfhostProfile, /^OC_INCLUDE_OFFICIAL_CLAUDE=1$/m)
-    assert.match(selfhostProfile, /^OC_OFFICIAL_CLAUDE_VERSION=2\.1\.258$/m)
+    assert.match(selfhostProfile, /^OC_OFFICIAL_CLAUDE_VERSION=2\.1\.259$/m)
   })
 })

@@ -296,7 +296,7 @@ RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
 # pinned and verified at build time; gateway additionally gates every spawn to
 # a credential-bound loopback Cursor relay.
 ARG OC_INCLUDE_OFFICIAL_CLAUDE=0
-ARG OC_OFFICIAL_CLAUDE_VERSION=2.1.258
+ARG OC_OFFICIAL_CLAUDE_VERSION=2.1.259
 RUN if [ "$OC_INCLUDE_OFFICIAL_CLAUDE" = "1" ]; then set -eux; \
       npm install -g "@anthropic-ai/claude-code@${OC_OFFICIAL_CLAUDE_VERSION}" --no-audit --no-fund; \
       test "$(claude --version | awk '{print $1}')" = "$OC_OFFICIAL_CLAUDE_VERSION"; \

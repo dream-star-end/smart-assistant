@@ -1934,7 +1934,7 @@ export class SubprocessRunner extends EventEmitter {
       },
     }
     // Writable.write 的失败大多经 callback 异步报告，try/catch 只能抓同步 throw。
-    // CCB 两行逐一等 callback。Official CC 2.1.258 does not implement CCB's
+    // CCB 两行逐一等 callback。Official CC 2.1.259 does not implement CCB's
     // private update_environment_variables control line; its only allowed
     // deployment is the credential-bound Cursor loopback relay, which does not
     // consume the authority headers. We still resolved runtime above on every
