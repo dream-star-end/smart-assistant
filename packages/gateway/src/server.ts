@@ -10953,6 +10953,7 @@ export class Gateway {
                   agentId: event.agentId || 'unknown',
                   goal: event.goal || '',
                   ...injectPayloadFromJobTerminal(event),
+                  userId: event.callbackOriginUserId,
                   clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
                   once: true,
                 })
