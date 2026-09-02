@@ -175,9 +175,19 @@ assert.equal(
   `projectedMcpTools must have exactly one declaration (projectionDeclarationCount: ${binding.projectionDeclarationCount}, overrideAfterProjection: ${binding.overrideAfterProjection})`,
 );
 assert.equal(
+  binding.projectionIsConst,
+  true,
+  `projectedMcpTools must be declared with const (projectionIsConst: ${binding.projectionIsConst}, projectionMutation: ${binding.projectionMutation})`,
+);
+assert.equal(
+  binding.projectionMutation,
+  null,
+  `projectedMcpTools must not be mutated (projectionMutation: ${binding.projectionMutation}, projectionIsConst: ${binding.projectionIsConst})`,
+);
+assert.equal(
   binding.consumesProjection,
   true,
-  `buildPromptContext must consume projectedMcpTools (availableMcpTools initializer: ${binding.availableMcpToolsInitializer}, projectionDeclarationCount: ${binding.projectionDeclarationCount}, overrideAfterProjection: ${binding.overrideAfterProjection})`,
+  `buildPromptContext must consume projectedMcpTools (availableMcpTools initializer: ${binding.availableMcpToolsInitializer}, projectionDeclarationCount: ${binding.projectionDeclarationCount}, overrideAfterProjection: ${binding.overrideAfterProjection}, projectionIsConst: ${binding.projectionIsConst}, projectionMutation: ${binding.projectionMutation})`,
 );
 
 const codexOverrides = readFileSync(

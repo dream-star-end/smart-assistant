@@ -109,10 +109,12 @@ describe('subprocessRunner MCP availability wiring', () => {
     assert.equal(binding.projectionDeclared, true, 'projectionDeclared')
     assert.equal(binding.projectionDeclarationCount, 1, 'projectionDeclarationCount')
     assert.equal(binding.overrideAfterProjection, null, 'overrideAfterProjection')
+    assert.equal(binding.projectionIsConst, true, 'projectionIsConst')
+    assert.equal(binding.projectionMutation, null, 'projectionMutation')
     assert.equal(
       binding.consumesProjection,
       true,
-      `buildPromptContext must consume projectedMcpTools (availableMcpTools initializer: ${binding.availableMcpToolsInitializer}, projectionDeclarationCount: ${binding.projectionDeclarationCount}, overrideAfterProjection: ${binding.overrideAfterProjection})`,
+      `buildPromptContext must consume projectedMcpTools (availableMcpTools initializer: ${binding.availableMcpToolsInitializer}, projectionDeclarationCount: ${binding.projectionDeclarationCount}, overrideAfterProjection: ${binding.overrideAfterProjection}, projectionIsConst: ${binding.projectionIsConst}, projectionMutation: ${binding.projectionMutation})`,
     )
   })
 
@@ -185,6 +187,40 @@ describe('subprocessRunner MCP availability wiring', () => {
     assert.equal(qualifiedBinding.projectionDeclarationCount, 1)
     assert.equal(qualifiedBinding.overrideAfterProjection, null)
     assert.equal(qualifiedBinding.consumesProjection, true)
+
+    const letReassign = [
+      'let projectedMcpTools = projectCcbMcpAvailability({})',
+      'projectedMcpTools = [...availableMcpTools]',
+      'void buildPromptContext({ availableMcpTools: projectedMcpTools })',
+    ].join('\n')
+    const letBinding = inspectCcbPromptContextAvailability(letReassign)
+    assert.equal(letBinding.consumesProjection, false)
+    assert.equal(letBinding.projectionIsConst, false)
+    assert.ok(
+      (letBinding.projectionMutation ?? '').includes('projectedMcpTools ='),
+      `projectionMutation should include assignment, got ${letBinding.projectionMutation}`,
+    )
+
+    const spliceMut = [
+      'const projectedMcpTools = projectCcbMcpAvailability({})',
+      'projectedMcpTools.splice(0)',
+      'void buildPromptContext({ availableMcpTools: projectedMcpTools })',
+    ].join('\n')
+    const spliceBinding = inspectCcbPromptContextAvailability(spliceMut)
+    assert.equal(spliceBinding.consumesProjection, false)
+    assert.ok(spliceBinding.projectionMutation !== null, 'splice must be recorded as mutation')
+
+    const readOnly = [
+      'const projectedMcpTools = projectCcbMcpAvailability({})',
+      'void projectedMcpTools.length',
+      "void projectedMcpTools.includes('x')",
+      'console.log(projectedMcpTools)',
+      'void buildPromptContext({ availableMcpTools: projectedMcpTools })',
+    ].join('\n')
+    const readBinding = inspectCcbPromptContextAvailability(readOnly)
+    assert.equal(readBinding.projectionIsConst, true)
+    assert.equal(readBinding.projectionMutation, null)
+    assert.equal(readBinding.consumesProjection, true)
   })
 
   test('skill-eval filtering does not drop same-named configured tools', () => {

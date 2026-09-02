@@ -3,7 +3,8 @@
  * 仅供测试/deploy-gate 使用，不要从运行时代码导入。
  *
  * Structural rules only (no type checker). Fail closed on shadowing,
- * shorthand/computed keys, duplicate keys, and post-property spreads.
+ * shorthand/computed keys, duplicate keys, post-property spreads,
+ * non-const projection bindings, and later writes/mutations.
  */
 import ts from 'typescript'
 
@@ -16,12 +17,27 @@ export type CcbPromptContextAvailabilityBinding = {
   projectionDeclarationCount: number
   /** 合格 availableMcpTools 之后的 spread / 同名覆盖节点文本 */
   overrideAfterProjection: string | null
-  /** projectionDeclared 且唯一声明且每个调用都消费 Identifier projectedMcpTools 且无后置覆盖 */
+  /** 唯一合格声明位于 const VariableDeclarationList */
+  projectionIsConst: boolean
+  /** 第一个对 projectedMcpTools 的写入/变异节点文本 */
+  projectionMutation: string | null
+  /** 声明为 const、无写入、唯一声明且每个调用都消费 Identifier projectedMcpTools 且无后置覆盖 */
   consumesProjection: boolean
 }
 
 const PROJECTED = 'projectedMcpTools'
 const AVAILABLE = 'availableMcpTools'
+const MUTATING_METHODS = new Set([
+  'push',
+  'pop',
+  'shift',
+  'unshift',
+  'splice',
+  'sort',
+  'reverse',
+  'fill',
+  'copyWithin',
+])
 
 function isProjectedIdentifier(node: ts.Node | undefined): boolean {
   return !!node && ts.isIdentifier(node) && node.text === PROJECTED
@@ -40,6 +56,97 @@ function isProjectedMcpToolsDeclaration(node: ts.VariableDeclaration): boolean {
     ts.isIdentifier(node.initializer.expression) &&
     node.initializer.expression.text === 'projectCcbMcpAvailability'
   )
+}
+
+function isConstVariableDeclaration(decl: ts.VariableDeclaration): boolean {
+  const list = decl.parent
+  return ts.isVariableDeclarationList(list) && (list.flags & ts.NodeFlags.Const) !== 0
+}
+
+function isAssignmentOperatorKind(kind: ts.SyntaxKind): boolean {
+  return kind >= ts.SyntaxKind.FirstAssignment && kind <= ts.SyntaxKind.LastAssignment
+}
+
+function unwrapExpr(node: ts.Expression): ts.Expression {
+  if (ts.isParenthesizedExpression(node)) return unwrapExpr(node.expression)
+  if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) || ts.isSatisfiesExpression(node)) {
+    return unwrapExpr(node.expression)
+  }
+  if (ts.isNonNullExpression(node)) return unwrapExpr(node.expression)
+  return node
+}
+
+function assignmentPatternContainsProjected(node: ts.Expression): boolean {
+  const expr = unwrapExpr(node)
+  if (isProjectedIdentifier(expr)) return true
+  if (ts.isArrayLiteralExpression(expr)) {
+    for (const el of expr.elements) {
+      if (ts.isOmittedExpression(el)) continue
+      if (ts.isSpreadElement(el) && assignmentPatternContainsProjected(el.expression)) return true
+      if (ts.isBinaryExpression(el) && el.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        if (assignmentPatternContainsProjected(el.left)) return true
+        continue
+      }
+      if (assignmentPatternContainsProjected(el)) return true
+    }
+    return false
+  }
+  if (ts.isObjectLiteralExpression(expr)) {
+    for (const prop of expr.properties) {
+      if (ts.isShorthandPropertyAssignment(prop) && isProjectedIdentifier(prop.name)) return true
+      if (ts.isSpreadAssignment(prop) && assignmentPatternContainsProjected(prop.expression)) return true
+      if (ts.isPropertyAssignment(prop)) {
+        let target = prop.initializer
+        if (ts.isBinaryExpression(target) && target.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+          target = target.left
+        }
+        if (assignmentPatternContainsProjected(target)) return true
+      }
+    }
+  }
+  return false
+}
+
+function isProjectedWriteTarget(left: ts.Expression): boolean {
+  const expr = unwrapExpr(left)
+  if (isProjectedIdentifier(expr)) return true
+  if (ts.isPropertyAccessExpression(expr) && isProjectedIdentifier(expr.expression)) return true
+  if (ts.isElementAccessExpression(expr) && isProjectedIdentifier(expr.expression)) return true
+  return assignmentPatternContainsProjected(expr)
+}
+
+function mutatingMethodName(callee: ts.Expression): string | null {
+  const expr = unwrapExpr(callee)
+  if (ts.isPropertyAccessExpression(expr) && isProjectedIdentifier(expr.expression)) {
+    return expr.name.text
+  }
+  if (
+    ts.isElementAccessExpression(expr) &&
+    isProjectedIdentifier(expr.expression) &&
+    expr.argumentExpression &&
+    (ts.isStringLiteral(expr.argumentExpression) || ts.isNoSubstitutionTemplateLiteral(expr.argumentExpression))
+  ) {
+    return expr.argumentExpression.text
+  }
+  return null
+}
+
+function inspectProjectionMutation(node: ts.Node): string | null {
+  if (ts.isBinaryExpression(node) && isAssignmentOperatorKind(node.operatorToken.kind)) {
+    if (isProjectedWriteTarget(node.left)) return node.getText()
+  }
+  if (
+    (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+    (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken) &&
+    isProjectedIdentifier(unwrapExpr(node.operand))
+  ) {
+    return node.getText()
+  }
+  if (ts.isCallExpression(node)) {
+    const method = mutatingMethodName(node.expression)
+    if (method && MUTATING_METHODS.has(method)) return node.getText()
+  }
+  return null
 }
 
 function staticPropertyName(name: ts.PropertyName): string | null {
@@ -156,6 +263,8 @@ export function inspectCcbPromptContextAvailability(
   )
   let projectionDeclared = false
   let projectionDeclarationCount = 0
+  let projectionIsConst = false
+  let projectionMutation: string | null = null
   let firstUnqualified: string | null = null
   let firstQualified: string | null = null
   let overrideAfterProjection: string | null = null
@@ -166,7 +275,9 @@ export function inspectCcbPromptContextAvailability(
     projectionDeclarationCount += declarationSiteCount(node)
     if (ts.isVariableDeclaration(node) && isProjectedMcpToolsDeclaration(node)) {
       projectionDeclared = true
+      projectionIsConst = isConstVariableDeclaration(node)
     }
+    projectionMutation ??= inspectProjectionMutation(node)
     if (ts.isCallExpression(node)) {
       const hit = inspectBuildPromptContextCall(node)
       if (hit) {
@@ -187,6 +298,8 @@ export function inspectCcbPromptContextAvailability(
   const consumesProjection =
     projectionDeclared &&
     projectionDeclarationCount === 1 &&
+    projectionIsConst &&
+    projectionMutation === null &&
     sawCall &&
     allCallsConsume &&
     firstQualified !== null &&
@@ -197,6 +310,8 @@ export function inspectCcbPromptContextAvailability(
     projectionDeclared,
     projectionDeclarationCount,
     overrideAfterProjection,
+    projectionIsConst,
+    projectionMutation,
     consumesProjection,
   }
 }
