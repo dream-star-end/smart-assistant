@@ -1,8 +1,17 @@
+-- order-dependency: 0253_active_claude_proxy_uniqueness
 -- 0254_agent_audit_error_msg.sql
+--
+-- Commercial next after requiredMigrations 0253_active_claude_proxy_uniqueness
+-- (same number as selfhost 0254; canonical sequence, not a copy of desktop's
+-- unmerged 0254_desktop_virtual_container).
 --
 -- Allowlist / sentinel error_msg on failed agent_audit rows (≤240 Unicode code
 -- points) plus three new rollup error_class values. Same transaction:
 --   1) expand agent_tool_rollup_counts.error_class CHECK by exactly +3
+--      (DROP CONSTRAINT is breaking DDL; commercial apply is V5_DEV_PLAYBOOK
+--      §4.5 under production mutation lease. Set
+--      OC_V5_ALLOW_BREAKING_MIGRATION=1 only if the apply wrapper still
+--      scans DROP CONSTRAINT; deploy-v5.sh itself does not auto-apply.)
 --   2) replace agent_audit_privacy_guard
 --   3) no other table-structure changes
 --
