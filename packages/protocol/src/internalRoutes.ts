@@ -96,6 +96,9 @@ export const TURN_REJECT_IF_ABSENT_PATH = '/internal/v3/turn-reject-if-absent'
 export const TURN_DISPATCH_STATE_PATH = '/internal/v3/turn-dispatch-state'
 export const RUNTIME_RECYCLE_DRAIN_PATH = '/internal/v3/runtime-recycle-drain'
 export const ENGINE_PREHEAT_PATH = '/internal/v3/engine-preheat'
+/** OCV5-22 stage 3:宿主 cutover 冻结/解冻信号(POST,容器 gateway 服务,inbound bypass 鉴权)。 */
+export const DELEGATE_BEGIN_CUTOVER_PATH = '/internal/v3/delegate-begin-cutover'
+export const DELEGATE_END_CUTOVER_PATH = '/internal/v3/delegate-end-cutover'
 
 // ── v3 容器 gateway loopback 本地面(容器内工具→gateway,不出容器边界)────────
 export const MARKETPLACE_LOCAL_RELAY_PREFIX = '/internal/v3/marketplace/agent-local'
@@ -490,6 +493,18 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v3',
     sources: ['gateway/src/server.ts', 'commercial/src/dispatch/enginePreheatClient.ts'],
+  },
+  {
+    path: DELEGATE_BEGIN_CUTOVER_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/server.ts', 'gateway/src/delegateCutover.ts'],
+  },
+  {
+    path: DELEGATE_END_CUTOVER_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/server.ts', 'gateway/src/delegateCutover.ts'],
   },
   // ── v3:容器 gateway loopback 本地 relay(不出容器;登记以锁扫描面)─────────
   {
