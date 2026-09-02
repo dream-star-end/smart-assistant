@@ -2236,27 +2236,26 @@ export class CronScheduler {
     let output = ''
     let submitError: unknown = null
     try {
-      await durability.markSubmitStarted?.()
-    } catch (err) {
-      await this.sessions.destroySession(sessionKey).catch(() => {})
-      if (isCronDelegateClaimDenied(err)) {
-        logger.warn(`job ${job.id} delegate claim denied before submit`, {
-          jobId: job.id,
-          reason: err.reason,
-          state: err.state,
-        })
-        return {
-          kind: 'terminal_failure',
-          code: err.reason === 'terminal' ? 'DELEGATE_JOB_TERMINAL' : 'DELEGATE_CLAIM_DENIED',
+      try {
+        await durability.markSubmitStarted?.()
+      } catch (err) {
+        if (isCronDelegateClaimDenied(err)) {
+          logger.warn(`job ${job.id} delegate claim denied before submit`, {
+            jobId: job.id,
+            reason: err.reason,
+            state: err.state,
+          })
+          // finally 下方统一 destroySession。
+          return {
+            kind: 'terminal_failure',
+            code: err.reason === 'terminal' ? 'DELEGATE_JOB_TERMINAL' : 'DELEGATE_CLAIM_DENIED',
+          }
         }
+        // 其余 markSubmitStarted 失败保持既有 fail-closed 契约:occurrence 可能已记为
+        // executing,与 submit 失败同样处置(EXECUTION_ERROR;仅完整只读 checkpoint 才
+        // 允许 SAFE_CHECKPOINT_RECOVERY),绝不盲目 retryable 重放。
+        throw err
       }
-      logger.warn(`job ${job.id} markSubmitStarted failed before submit`, {
-        jobId: job.id,
-        errorClass: stableCronErrorClass(err),
-      })
-      return { kind: 'retryable_failure', code: 'SUBMIT_START_FAILED' }
-    }
-    try {
       await this.sessions.submit(
         session,
         job.prompt,
