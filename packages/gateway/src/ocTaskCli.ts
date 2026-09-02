@@ -40,6 +40,7 @@ ticket   list [--project-id ID] [--status S] [--type T] [--priority P] [--assign
          update <idOrIdent> --expected-version N [--title T] [--body MD] [--priority P]
                 [--severity S] [--labels a,b] [--assignee A] [--blocked-reason R]
          claim <idOrIdent> --expected-version N [--owner agent:<id>]
+         approve <idOrIdent> --expected-version N [--owner agent:<id>]
          advance <idOrIdent> --expected-version N [--summary TEXT] [--output-md MD] [--run-id ID]
          block <idOrIdent> --expected-version N --reason TEXT
          comment <idOrIdent> --body MD [--run-id ID]
@@ -322,6 +323,16 @@ function planTicket(
       if (owner) body.owner = owner
       return request('POST', `/tickets/${encodeSeg(id)}/claim`, { body })
     }
+    case 'approve': {
+      const id = positional[0]
+      const ver = requireIntFlag(flags, 'expected-version')
+      if (!id) return usage('ticket approve <idOrIdent> --expected-version N')
+      if (!ver.ok) return usage(ver.message)
+      const body: Record<string, unknown> = { expectedVersion: ver.value }
+      const owner = optionalFlag(flags, 'owner') ?? ambientAgentOwner(env)
+      if (owner) body.owner = owner
+      return request('POST', `/tickets/${encodeSeg(id)}/approve`, { body })
+    }
     case 'advance': {
       const id = positional[0]
       const ver = requireIntFlag(flags, 'expected-version')
@@ -362,7 +373,7 @@ function planTicket(
       return request('POST', `/tickets/${encodeSeg(id)}/comment`, { body })
     }
     default:
-      return usage('ticket list|get|create|update|claim|advance|block|comment')
+      return usage('ticket list|get|create|update|claim|approve|advance|block|comment')
   }
 }
 

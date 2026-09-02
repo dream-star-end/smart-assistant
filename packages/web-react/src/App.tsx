@@ -22,6 +22,7 @@ import {
   type ImageEditSubmit,
 } from "./components/chat/imageEditActions";
 import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
+import { PinnedDelegateTracker } from "./components/chat/PinnedDelegateTracker";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
@@ -92,6 +93,7 @@ import { useSidebarWidth } from "./hooks/useSidebarWidth";
 import { useMdViewport } from "./hooks/useMdViewport";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
+import { useInflightDelegates } from "./hooks/useInflightDelegates";
 import { useOptimizerPending } from "./hooks/useOptimizerPending";
 import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
@@ -151,7 +153,8 @@ import {
   resolveSessionModel,
 } from "./lib/modelPreferences";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
-import type { ChatProject, Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
+import type { ChatProject, LockedPublicModel, Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
+import type { LockedSelectInfo } from "./components/ModelSelector";
 import { modelSwitchCompactionReason } from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
 
@@ -310,6 +313,8 @@ export function App() {
   // 对话模型/默认思考深度:模型能力来自 GET /api/public/models；用户默认来自
   // /api/me/preferences。两者同批 hydrate 后才决定初始值,避免迟到偏好覆盖人工选择。
   const [models, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
+  const [lockedModels, setLockedModels] = useState<LockedPublicModel[]>([]);
+  const [subscribeOpenSignal, setSubscribeOpenSignal] = useState(0);
   const [modelId, setModelId] = useState<string | undefined>(demo ? DEMO_MODELS[0]?.id : undefined);
   // 最近一次 preferences 快照(default_model 解析用):per-session 模型恢复的回落基准。
   // 写入点 = models 装载批 + SettingsCenter onPreferencesChange;下方 resolver effect 消费。
@@ -1153,6 +1158,16 @@ export function App() {
     setSettingsOpen(true);
   }, [refreshMe]);
 
+  const handleLockedSelect = useCallback(
+    (info: LockedSelectInfo) => {
+      const plan = info.minPlanName?.trim() || info.minPlanCode;
+      toast(`「${info.label}」需订阅 ${plan} 及以上套餐解锁，前往订阅…`);
+      openSettings("account");
+      setSubscribeOpenSignal((n) => n + 1);
+    },
+    [openSettings, toast],
+  );
+
   const applyConversationPreferences = useCallback(
     (prefs: PrefsView, _patch?: Record<string, unknown>) => {
       setPreferenceEffort(prefs.default_effort);
@@ -1445,9 +1460,10 @@ export function App() {
       api.getPublicModels(auth),
       api.getPreferences(auth).then(extractPrefs).catch(() => ({} as PrefsView)),
     ])
-      .then(([ms, prefs]) => {
+      .then(([catalog, prefs]) => {
         if (cancelled) return;
-        setModels(ms);
+        setModels(catalog.models);
+        setLockedModels(catalog.lockedModels);
         // 初始 modelId 不在此直接写:models/modelPrefs 落定会触发 per-session resolver
         // effect,按「活动会话持久化选择 > default_model > 首个健康模型」统一解析。
         setModelPrefs(prefs);
@@ -1567,6 +1583,12 @@ export function App() {
   const wsSending = !demo && chat.isSending(activeId);
   // 统一“本轮进行中”信号：demo 用本地 busy，非 demo 用 WS in-flight。
   const sending = demo ? busy : wsSending;
+  const inflightDelegates = useInflightDelegates({
+    sessionId: !demo && activeId ? activeId : null,
+    messages: wsMessages,
+    enabled: !demo && gate.access && !!activeId,
+    auth,
+  });
 
   const sendingIdsRef = useRef(new Set<string>());
   const liveTerminalsRef = useRef(
@@ -2871,8 +2893,10 @@ export function App() {
           })()}
           onOpenProjectScope={() => openManage(DEFAULT_MANAGE_TAB)}
           models={models}
+          lockedModels={lockedModels}
           selectedModelId={modelId}
           onSelectModel={selectModel}
+          onLockedSelect={demo ? undefined : handleLockedSelect}
           modelsLoading={modelsLoading || modelSwitchPreparing}
           effortSupported={effortSupported}
           effortActive={effortActive}
@@ -3041,6 +3065,12 @@ export function App() {
               tokenUsage={activeSess?._liveTurnUsage?.usage}
             />
           )}
+          {!demo && !gated && (
+            <PinnedDelegateTracker
+              items={inflightDelegates.items}
+              onDismiss={inflightDelegates.dismiss}
+            />
+          )}
           {!demo && gate.phase.kind === "dormant" && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
@@ -3170,6 +3200,7 @@ export function App() {
             onOpenMemory={() => openManage("optimization")}
             onOpenManage={() => openManage("connectors")}
             onOpenRepo={demo ? undefined : openRepo}
+            subscribeOpenSignal={subscribeOpenSignal}
           />
         </LazyBoundary>
       )}

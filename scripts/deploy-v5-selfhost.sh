@@ -45,6 +45,15 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=scripts/lib/assert-flavor.sh
+source "$SCRIPT_DIR/lib/assert-flavor.sh"
+if [[ "${1:-}" == "--mint-flavor-manifest" ]]; then
+  dest="${2:?usage: --mint-flavor-manifest DIR [flavor] [commit]}"
+  flavor="${3:-selfhost}"
+  commit="${4:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+  write_flavor_manifest "$dest" "$flavor" "$commit"
+  exit $?
+fi
 
 INSTANCE_ID="v5-selfhost-sg"
 V5_HOME="/root/.openclaude-v5-selfhost"
@@ -53,6 +62,7 @@ V5_UNIT="openclaude-v5-selfhost.service"
 V5_EGRESS_UNIT="openclaude-v5-selfhost-egress.service"
 V5_HOSTNET_UNIT="openclaude-v5-selfhost-hostnet.service"
 V5_CCB_PROXY_UNIT="openclaude-v5-selfhost-ccb-proxy.service"
+V5_CURSOR_PROXY_UNIT="openclaude-v5-selfhost-cursor-proxy.service"
 V5_SSHGATE_UNIT="openclaude-v5-selfhost-sshgate.service"
 V5_TUNNEL_UNIT="cloudflared-v5-selfhost.service"
 V5_PORT="18790"
@@ -70,8 +80,8 @@ CATALOG_ADMIN_ROLE="${PG_ROLE}_catalog_admin"
 MODEL_AUTHORITY_DEPLOY_ROLE="${PG_ROLE}_model_deploy"
 REDIS_URL="redis://127.0.0.1:6379/3"
 # Runtime image pin. Rebuild with:
-#   packages/commercial/agent-sandbox/build-image.sh v5-cli-codex0149-grok105-zcode381-slim
-# which auto-sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1).
+#   OC_FLAVOR=selfhost packages/commercial/agent-sandbox/build-image.sh v5-cli-codex0149-grok105-zcode381-slim
+# which sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1).
 RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-codex0149-grok105-zcode381-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
@@ -926,6 +936,8 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_PROJECT_CONTEXT 1
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_HTTPS_PROXY "http://172.31.0.1:18991"
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_TZ "Asia/Tokyo"
+  ensure_env_kv "$V5_ENV" OC_SELFHOST_ENGINE_LOCAL_TURNS 1
+  ensure_env_kv "$V5_ENV" SELFHOST_CURSOR_EGRESS 1
   log "  ✓ 制品根 / PG sessions / privacy-safe telemetry / CCB Japan transport keys"
 }
 
@@ -1097,24 +1109,38 @@ install_unit() {
 
 # 把开机 oneshot 脚本拷到固定目录。ExecStart 不跟 rel-* 变,也不钉 git 工作树。
 sync_boot_scripts_from() {
-  local src="$1" hostnet_src sshgate_src tmp
+  local src="$1" hostnet_src sshgate_src flavor_lib_src flavor_rules_src tmp have_flavor=0
   [[ -n "$src" && -d "$src" ]] || die "sync_boot_scripts_from: 缺源目录 $src"
   hostnet_src="$src/packages/commercial/scripts/setup-host-net.sh"
   sshgate_src="$src/deploy/v5-selfhost/sshgate-insert.sh"
+  flavor_lib_src="$src/scripts/lib/assert-flavor.sh"
+  flavor_rules_src="$src/scripts/lib/flavor-rules.json"
   [[ -f "$hostnet_src" && ! -L "$hostnet_src" ]] || die "缺 setup-host-net.sh: $hostnet_src"
   [[ -f "$sshgate_src" && ! -L "$sshgate_src" ]] || die "缺 sshgate-insert.sh: $sshgate_src"
+  if [[ -f "$flavor_lib_src" && ! -L "$flavor_lib_src" && -f "$flavor_rules_src" && ! -L "$flavor_rules_src" ]]; then
+    have_flavor=1
+  fi
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] install $hostnet_src + $sshgate_src → $BOOT_SCRIPT_DIR"
+    echo "  [dry-run] install $hostnet_src + $sshgate_src + flavor helper → $BOOT_SCRIPT_DIR"
     return 0
   fi
-  mkdir -p -- "$BOOT_SCRIPT_DIR"
+  mkdir -p -- "$BOOT_SCRIPT_DIR/scripts/lib"
   tmp="$(mktemp -d -- "$BOOT_SCRIPT_DIR/.staging.XXXXXX")"
+  mkdir -p -- "$tmp/scripts/lib"
   install -m 0755 "$hostnet_src" "$tmp/setup-host-net.sh"
   install -m 0755 "$sshgate_src" "$tmp/sshgate-insert.sh"
   mv -f -- "$tmp/setup-host-net.sh" "$BOOT_SCRIPT_DIR/setup-host-net.sh"
   mv -f -- "$tmp/sshgate-insert.sh" "$BOOT_SCRIPT_DIR/sshgate-insert.sh"
-  rmdir -- "$tmp"
-  log "  ✓ 已同步开机脚本 → $BOOT_SCRIPT_DIR (from $src)"
+  if [[ "$have_flavor" == 1 ]]; then
+    install -m 0755 "$flavor_lib_src" "$tmp/scripts/lib/assert-flavor.sh"
+    install -m 0644 "$flavor_rules_src" "$tmp/scripts/lib/flavor-rules.json"
+    mv -f -- "$tmp/scripts/lib/assert-flavor.sh" "$BOOT_SCRIPT_DIR/scripts/lib/assert-flavor.sh"
+    mv -f -- "$tmp/scripts/lib/flavor-rules.json" "$BOOT_SCRIPT_DIR/scripts/lib/flavor-rules.json"
+    log "  ✓ 已同步开机脚本 → $BOOT_SCRIPT_DIR (from $src; flavor helper included)"
+  else
+    log "  ⚠ src $src 无 flavor helper, boot 仅同步 hostnet/sshgate (setup-host-net will skip flavor check)"
+  fi
+  rm -rf -- "$tmp"
 }
 
 # 优先当前 live;尚未翻转时用工作树(仅 bootstrap)。
@@ -1133,7 +1159,7 @@ sync_boot_scripts_best_effort() {
 assert_aux_execstart_not_worktree() {
   local u line
   [[ "$DRY" == 1 ]] && return 0
-  for u in "$V5_HOSTNET_UNIT" "$V5_CCB_PROXY_UNIT" "$V5_SSHGATE_UNIT"; do
+  for u in "$V5_HOSTNET_UNIT" "$V5_CCB_PROXY_UNIT" "$V5_CURSOR_PROXY_UNIT" "$V5_SSHGATE_UNIT"; do
     line="$(grep -E '^ExecStart=' "/etc/systemd/system/$u" || true)"
     [[ -n "$line" ]] || die "aux unit $u 缺 ExecStart"
     if [[ "$line" == *"/opt/openclaude/openclaude-v5-selfhost/"* && "$line" != *"-live"* ]]; then
@@ -1147,10 +1173,11 @@ install_aux_units() {
   sync_boot_scripts_best_effort
   install_unit "$UNIT_DIR/$V5_HOSTNET_UNIT"
   install_unit "$UNIT_DIR/$V5_CCB_PROXY_UNIT"
+  install_unit "$UNIT_DIR/$V5_CURSOR_PROXY_UNIT"
   install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
   install_unit "$UNIT_DIR/$V5_TUNNEL_UNIT"
   run "systemctl daemon-reload"
-  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_CCB_PROXY_UNIT' '$V5_SSHGATE_UNIT'"
+  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_CCB_PROXY_UNIT' '$V5_CURSOR_PROXY_UNIT' '$V5_SSHGATE_UNIT'"
   assert_aux_execstart_not_worktree
 }
 
@@ -1160,12 +1187,13 @@ install_units() {
   sync_boot_scripts_best_effort
   install_unit "$UNIT_DIR/$V5_HOSTNET_UNIT"
   install_unit "$UNIT_DIR/$V5_CCB_PROXY_UNIT"
+  install_unit "$UNIT_DIR/$V5_CURSOR_PROXY_UNIT"
   install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
   install_unit "$UNIT_DIR/$V5_EGRESS_UNIT"
   install_unit "$UNIT_DIR/$V5_UNIT"
   install_unit "$UNIT_DIR/$V5_TUNNEL_UNIT"
   run "systemctl daemon-reload"
-  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_CCB_PROXY_UNIT' '$V5_SSHGATE_UNIT'"
+  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_CCB_PROXY_UNIT' '$V5_CURSOR_PROXY_UNIT' '$V5_SSHGATE_UNIT'"
   assert_aux_execstart_not_worktree
 }
 
@@ -1191,11 +1219,22 @@ refresh_ccb_proxy_path() {
     || die "$V5_CCB_PROXY_UNIT failed to start"
   systemctl restart "$V5_SSHGATE_UNIT" \
     || die "$V5_SSHGATE_UNIT restart failed after hostnet flush"
-  iptables -C V5_EGRESS_IN -d 172.31.0.1 -p tcp --dport 18991 -j RETURN \
-    -m comment --comment "v5 CCB -> stable HTTPS proxy" \
+  iptables -C V5_EGRESS_IN -d 172.31.0.1 -p tcp --dport 18991 \
+    -m comment --comment "v5 CCB -> stable HTTPS proxy" -j RETURN \
     || die "V5_EGRESS_IN missing 172.31.0.1:18991 RETURN"
   timeout 10 bash -c 'exec 3<>/dev/tcp/172.31.0.1/18991' \
     || die "CCB HTTPS proxy listener 172.31.0.1:18991 is unreachable"
+  if [[ -f /etc/sing-box/openclaude-cursor-egress-proxy.json ]]; then
+    assert_allows selfhost-unit-install \
+      || die "flavor identity refused $V5_CURSOR_PROXY_UNIT"
+    systemctl enable --now "$V5_CURSOR_PROXY_UNIT" \
+      || die "$V5_CURSOR_PROXY_UNIT failed to start"
+    iptables -C V5_EGRESS_IN -d 172.31.0.1 -p tcp --dport 18992 \
+      -m comment --comment "v5 Cursor -> dedicated HTTPS proxy" -j RETURN \
+      || die "V5_EGRESS_IN missing 172.31.0.1:18992 RETURN"
+    timeout 10 bash -c 'exec 3<>/dev/tcp/172.31.0.1/18992' \
+      || die "Cursor HTTPS proxy listener 172.31.0.1:18992 is unreachable"
+  fi
   log "  ✓ CCB HTTPS proxy listener + firewall ready"
 }
 
@@ -1287,6 +1326,8 @@ build_runtime_release() {
   rsync -a --exclude-from="$EXCLUDES" "$raw/" "$staging/" \
     || { rm -rf "$raw" "$staging"; die "rsync prune 失败"; }
   rm -rf "$raw"
+  write_flavor_manifest "$staging" selfhost "$sha" \
+    || { rm -rf "$staging"; die "写 runtime flavor.manifest.json 失败"; }
   BUILT_RUNTIME_RELEASE="$(oc_hotcfg_finalize_release "$staging" "$image_id" "$sha" "${prev:-}" "$caps")" \
     || { rm -rf "$staging"; die "release finalize 失败(npm ci / ccb bun build / MANIFEST)"; }
   BUILT_RUNTIME_RELEASE="$(printf '%s' "$BUILT_RUNTIME_RELEASE" | tr -d '[:space:]')"
@@ -1344,7 +1385,9 @@ activate_tuple_joint() { # <master-rel> <prev-master-or-none>
   [[ -n "$BUILT_RUNTIME_RELEASE" ]] || { cutover_clog "joint: 缺 BUILT_RUNTIME_RELEASE"; return 1; }
   [[ -n "$BUILT_BUNDLE_REV" ]] || { cutover_clog "joint: 缺 BUILT_BUNDLE_REV"; return 1; }
   restart_cmd="$(egress_then_master_restart_cmd)"
-  smoke_cmd="cutover_smoke_against_release $(printf '%q' "$master_rel")"
+  # 正向 smoke 比新 rel dist;saga 回滚时 lib 置 HOTCFG_SAGA_ROLLING_BACK=1,
+  # 只验旧现场 healthz(不得拿新 dist 比已回滚的旧进程)。
+  smoke_cmd="if [[ \"\${HOTCFG_SAGA_ROLLING_BACK:-}\" == 1 ]]; then cutover_smoke_healthz_only; else cutover_smoke_against_release $(printf '%q' "$master_rel"); fi"
   prev_arg="$prev_master"
   if [[ "$prev_arg" == "none" || "$prev_arg" == "NONE" ]]; then
     prev_arg=""
@@ -1684,9 +1727,17 @@ cutover_persist_phase_or_compensate() { # <phase> <reason>
 }
 
 cutover_arm_survivor() { # <backup-dir>
-  local backup="$1" script
+  local backup="$1" script src
+  src="$SCRIPT_DIR/v5-selfhost-cutover-survivor.sh"
+  [[ -f "$src" ]] || { cutover_clog "缺仓库 survivor 脚本 $src"; return 1; }
+  mkdir -p -- "$BREAKGLASS_ROOT"
+  install -m 0755 "$src" "$BREAKGLASS_ROOT/cutover-survivor.sh" || return 1
   script="$(cutover_survivor_script)"
   [[ -x "$script" ]] || { cutover_clog "缺 survivor 脚本 $script"; return 1; }
+  if [[ "$backup" == *"/pre-cutover-20260818-144626" ]]; then
+    cutover_clog "拒绝武装:backup 是陈旧 Aug18 工作树路径 $backup"
+    return 1
+  fi
   CUTOVER_SURVIVOR_ARMED=1
   bash "$script" --arm "$$" "$backup" || return 1
 }
@@ -1700,12 +1751,31 @@ cutover_disarm_survivor() {
   CUTOVER_SURVIVOR_ARMED=0
 }
 
+cutover_backup_units_are_live_wd() { # <backup-dir>
+  local backup="$1" wd_m wd_e
+  [[ -d "$backup" && -f "$backup/$V5_UNIT" && -f "$backup/$V5_EGRESS_UNIT" ]] || return 1
+  wd_m="$(unit_template_working_directory "$backup/$V5_UNIT")"
+  wd_e="$(unit_template_working_directory "$backup/$V5_EGRESS_UNIT")"
+  [[ "$wd_m" == "$MASTER_LIVE_LINK" && "$wd_e" == "$MASTER_LIVE_LINK" ]]
+}
+
 cutover_tier2_restore() { # <backup-dir>
   local backup="$1" restore
   restore="/opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh"
   [[ -d "$backup" ]] || { cutover_clog "二级失败:备份目录不存在 $backup"; return 1; }
+  if ! cutover_backup_units_are_live_wd "$backup"; then
+    cutover_clog "二级拒绝:备份 $backup 不是本次 live WD forensics(禁止装工作树 unit)"
+    printf 'reason=cutover-tier2-refused-worktree-backup\nbackup=%s\nwritten=%s\n' \
+      "$backup" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      >"$MASTER_RELEASES_ROOT/.manual-recovery-required"
+    return 1
+  fi
   [[ -x "$restore" ]] || { cutover_clog "二级失败:缺 $restore"; return 1; }
   bash "$restore" --backup-dir "$backup"
+  if ! cutover_smoke_healthz_only; then
+    cutover_clog "二级恢复后 healthz 未绿 backup=$backup"
+    return 1
+  fi
 }
 
 cutover_rollback_inplace() { # <failed-rel> <backup-dir>
@@ -1733,16 +1803,16 @@ cutover_rollback_inplace() { # <failed-rel> <backup-dir>
   else
     cutover_clog "  一级无合法 prev(首次 none 或 digest/路径失败),降二级"
   fi
-  cutover_clog "  二级: 从 $backup 恢复工作树 unit"
+  cutover_clog "  二级: 从本次 forensics $backup 恢复 live unit"
   if cutover_tier2_restore "$backup"; then
     cutover_clog "  二级恢复且健康确认"
     return 0
   fi
   printf 'reason=cutover-rollback-smoke-failed\nwritten=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >"$MASTER_RELEASES_ROOT/.manual-recovery-required"
-  die "两级补偿后仍失败。已写 $MASTER_RELEASES_ROOT/.manual-recovery-required
-应急: export HOME=/home/agent; export PATH=\"\$HOME/.local/bin:\$PATH\"
-host '/opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh'"
+  cutover_clog "两级补偿后仍失败。已写 $MASTER_RELEASES_ROOT/.manual-recovery-required"
+  cutover_clog "应急: 从 pre-cutover-<本次> 装 live unit,并 cutover-survivor.sh --disarm"
+  return 1
 }
 
 cutover_compensate() { # <reason>
@@ -1752,8 +1822,10 @@ cutover_compensate() { # <reason>
     cutover_clog "尚未覆盖 installed unit,无需回滚"
     return 1
   fi
-  cutover_rollback_inplace "${CUTOVER_REL:-}" "${CUTOVER_BACKUP:-missing}"
-  cutover_disarm_survivor || cutover_clog "补偿后 disarm 失败(不掩盖补偿失败)"
+  local rb_rc=0
+  cutover_rollback_inplace "${CUTOVER_REL:-}" "${CUTOVER_BACKUP:-missing}" || rb_rc=$?
+  # 无论补偿成败都必须解除幸存者布防,否则 timeout 会在健康 live 上再装陈旧备份。
+  cutover_disarm_survivor || cutover_clog "补偿后 disarm 失败(不掩盖补偿结果 rc=$rb_rc)"
   return 1
 }
 

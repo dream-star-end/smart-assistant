@@ -10,11 +10,12 @@ import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { Check, ChevronRight, Clock, Users, X } from "lucide-react";
 import { memo, useState } from "react";
 import { type ChatMessage, type ChildBlock, isServerAuthoredRow } from "../../lib/chat/model";
-import { agentTerminalStatus, childSignature, reviewVerdictBadge } from "../../lib/chat/render";
+import { agentTerminalStatus, reviewVerdictBadge } from "../../lib/chat/render";
 import { cn, groupDigits } from "../../lib/utils";
 import { Badge, Spinner } from "../ui";
 import { Markdown } from "../Markdown";
 import { ToolCardSlot } from "./toolCardSlot";
+import { DelegateProcessList } from "./delegateProcessList";
 import { delegateTokenUsage, TokenUsageBadge } from "./tokenUsage";
 
 /** 终态图标(与 agentTerminalStatus tone 对齐):完成→Users、失败→X、超时→Clock。 */
@@ -78,7 +79,12 @@ function RawChildEventView({ child }: { child: ChildBlock }) {
     bulk.push({ name, text: value });
     delete metadata[name];
   }
-  const serialized = JSON.stringify(metadata, null, 2) ?? "{}";
+  let serialized = "{}";
+  try {
+    serialized = JSON.stringify(metadata, null, 2) ?? "{}";
+  } catch {
+    serialized = "{}";
+  }
   const label = child.kind === "tool_result"
     ? `${child.toolName || "工具"} · 原始结果`
     : child.kind === "tool_output_tail"
@@ -122,10 +128,10 @@ function RawChildEventView({ child }: { child: ChildBlock }) {
 export const ChildBlockView = memo(
   function ChildBlockView({
     child,
-    tokenUsage,
   }: {
     child: ChildBlock;
     sig: string;
+    /** 子卡不再展示父组用量；保留参数以免旧调用方类型立刻裂开。 */
     tokenUsage?: TurnTokenUsageSnapshot;
   }) {
     const [visibleChars, setVisibleChars] = useState(64 * 1024);
@@ -168,7 +174,7 @@ export const ChildBlockView = memo(
       const nested = /^Agent$/i.test(child.toolName || "");
       return (
         <div className={cn(nested && "border-l-2 border-accent/30 pl-2")}>
-          <ToolCardSlot message={child} tokenUsage={tokenUsage} />
+          <ToolCardSlot message={child} />
         </div>
       );
     }
@@ -177,7 +183,7 @@ export const ChildBlockView = memo(
     // on the live reducer's combined tool card representation.
     return <RawChildEventView child={child} />;
   },
-  (a, b) => a.sig === b.sig && a.tokenUsage?.totalTokens === b.tokenUsage?.totalTokens,
+  (a, b) => a.sig === b.sig,
 );
 
 // 不外包 memo:本卡只收 {msg, delegateCost},而 reducer 就地 mutate(msg 引用不变)→ 默认浅比较会永不
@@ -193,9 +199,8 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
   // 审查裁决徽记:仅隐藏审查员行返回非 null(PASS/未通过),与执行态徽记并列。
   const verdict = reviewVerdictBadge(msg);
   const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
-  const [visibleChildren, setVisibleChildren] = useState(100);
   const collapsed = userCollapsed ?? (!!msg._completed || isServerRow);
-  const children = msg.childBlocks ?? [];
+  const children = Array.isArray(msg.childBlocks) ? msg.childBlocks : [];
   const tokenUsage = delegateTokenUsage(msg);
   const terminalNoChildren = !running && children.length === 0;
 
@@ -234,16 +239,16 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
       </button>
 
       {!collapsed && (
-        <div className="space-y-2 border-t border-border px-3.5 py-2.5">
+        <div className="border-t border-border">
           {children.length === 0 && running && (
-            <div className="flex items-center gap-2 text-[12.5px] text-faint">
+            <div className="flex items-center gap-2 px-3.5 py-2.5 text-[12.5px] text-faint">
               <Spinner size={12} /> 子智能体启动中…
             </div>
           )}
           {/* 任何无 childBlocks 的终态卡展开态展示真实结果摘要。 */}
-          {terminalNoChildren && (msg._resultPreview || isServerRow) && (
-            <div className="space-y-1.5">
-              {msg._resultPreview && (
+          {terminalNoChildren && (typeof msg._resultPreview === "string" || isServerRow) && (
+            <div className="space-y-1.5 px-3.5 py-2.5">
+              {typeof msg._resultPreview === "string" && msg._resultPreview && (
                 <ProgressivePlainText
                   text={msg._resultPreview}
                   className="text-[12.5px] leading-relaxed text-muted"
@@ -251,28 +256,12 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
               )}
             </div>
           )}
-          {children.slice(0, visibleChildren).map((ch, i) => (
-            <ChildBlockView
-              key={`${i}-${ch.blockId ?? ch.kind}`}
-              child={ch}
-              sig={childSignature(ch)}
-              tokenUsage={tokenUsage}
-            />
-          ))}
-          {visibleChildren < children.length && (
-            <button
-              type="button"
-              onClick={() => setVisibleChildren((value) => value + 100)}
-              className="mx-auto block rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
-            >
-              继续加载过程（还有 {children.length - visibleChildren} 条）
-            </button>
-          )}
+          {children.length > 0 && <DelegateProcessList childBlocks={children} />}
         </div>
       )}
 
       {/* 折叠态下展示结果摘要（完成后） */}
-      {collapsed && !running && msg._resultPreview && (
+      {collapsed && !running && typeof msg._resultPreview === "string" && msg._resultPreview && (
         <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
           <Check size={13} className="mt-0.5 shrink-0 text-success" />
           <span className="line-clamp-2">

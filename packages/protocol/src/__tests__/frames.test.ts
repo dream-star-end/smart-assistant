@@ -18,6 +18,7 @@ import {
   InboundPermissionResponse,
   OutboundCallUsage,
   OutboundCodexBilling,
+  OutboundExternalEngineBilling,
   OutboundError,
   OutboundMessage,
   OutboundPermissionRequest,
@@ -77,6 +78,14 @@ function baseOutboundCodexBilling(): unknown {
     requestId: 'req-1',
     status: 'success',
     durationMs: 100,
+  }
+}
+
+function baseOutboundExternalBilling(): unknown {
+  return {
+    type: 'outbound.external_engine_billing',
+    sessionKey: 'sess-1', channel: 'webchat', peer,
+    requestId: 'a'.repeat(32), engine: 'cursor', status: 'success', durationMs: 100,
   }
 }
 
@@ -516,6 +525,36 @@ describe('OutboundCodexBilling schema', () => {
         false,
         `must reject: ${bad}`,
       )
+    }
+  })
+})
+
+describe('OutboundExternalEngineBilling Cursor pool identity', () => {
+  it('accepts a complete immutable generation identity', () => {
+    assert.equal(Value.Check(OutboundExternalEngineBilling, {
+      ...(baseOutboundExternalBilling() as object),
+      cursorAccountId: '42',
+      cursorPoolGeneration: 'gen-0123456789abcdef01234567',
+      cursorKeyFingerprint: '0123456789abcdef',
+      cursorSlotResults: [{ slot: 2, result: 'ok' }],
+    }), true)
+  })
+  it('rejects malformed stable account, generation, or fingerprint values', () => {
+    for (const patch of [
+      { cursorAccountId: '0' },
+      { cursorPoolGeneration: 'legacy' },
+      { cursorKeyFingerprint: 'XYZ' },
+      { cursorAccountId: '42' },
+      { cursorPoolGeneration: 'gen-0123456789abcdef01234567' },
+      { cursorKeyFingerprint: '0123456789abcdef' },
+      {
+        cursorAccountId: '42',
+        cursorPoolGeneration: 'gen-0123456789abcdef01234567',
+      },
+    ]) {
+      assert.equal(Value.Check(OutboundExternalEngineBilling, {
+        ...(baseOutboundExternalBilling() as object), ...patch,
+      }), false)
     }
   })
 })

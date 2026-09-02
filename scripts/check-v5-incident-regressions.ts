@@ -191,6 +191,9 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
   if (/^packages\/storage\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
     return requireCi("test:storage", "CI job storage → npm run test:storage");
   }
+  if (/^packages\/mcp-memory\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
+    return requireCi("test:mcp-memory", "CI job storage → npm run test:mcp-memory");
+  }
   if (/^packages\/web-react\/src\/.+\.test\.(ts|tsx)$/.test(path)) {
     return requireCi("test:web-react", "CI job web-react → npm run test:web-react");
   }
@@ -367,6 +370,19 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // 2026-08-28 全量正向同步冻结:selfhost 874786599 已上线；只豁免其不可变祖先。
   // 含 cron 送达置顶、教程/案例四条、cron-triad 批；禁止 amend 源提交。
   "8747865996b5075e19d6aad5c9bf54bca72d0c01",
+  // 2026-08-28 selfhost rel-e9496b174 已上线；其源提交不可改写。只冻结 e949
+  // 及祖先，后续 892bac026/CCB overflow/permission restore 仍逐条走 trailer 门。
+  "e9496b17426877f5163cdbb37ffaa3d4b255bff9",
+  // 2026-09-02 selfhost rel-58ae73030 已上线且缺 Incident trailer；只冻结其不可变祖先，
+  // 后续 3bda58c5a 起逐条走 trailer 门。
+  "58ae730303f3ad11d56e15fea49270256ee0c6e8",
+  // 2026-09-02 双向全量同步冻结:selfhost tip ce6b91692(rel 已上线)含 9 条缺 trailer 的
+  // fix(v5)(画窗/HUD/委派计费批)；源提交不可改写,只豁免其不可变祖先,证据以
+  // T60/T61 浏览器用例 + check-v5-delegate-billing-requestid.ts 部署门补齐。
+  "ce6b91692c8b87a59be81e50fdc145e0da045ace",
+  // 2026-09-03 反合期间 selfhost 又上线 rel-7a5617aaa(63ecbf9d8 Cursor Fable 卡死 /
+  // e309f2a59 委派转录合并,均缺 trailer);源提交不可改写,只豁免其不可变祖先。
+  "7a5617aaa50f06d13d2b9da8ec8d3d2e4a5d2a25",
 ] as const;
 
 function checkTrailerClosure(): number {

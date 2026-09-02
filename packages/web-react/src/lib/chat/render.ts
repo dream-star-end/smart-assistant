@@ -244,8 +244,8 @@ export function isRedundantRuntimeEnvelope(message: ChatMessage): boolean {
 
 /** 文本采样：长度 + 尾 16 字符。就地 append（长度单调增）下，长度即可探测增量；
  *  尾采样兜住"等长替换"这类非 append 编辑（现网 audit 提过的边角）。 */
-function textSig(t: string | undefined): string {
-  if (!t) return "0";
+function textSig(t: unknown): string {
+  if (typeof t !== "string" || !t) return t ? "1" : "0";
   return `${t.length}:${t.slice(-16)}`;
 }
 
@@ -256,31 +256,41 @@ function bashTailSig(tail: BashTail | undefined): string {
     : "";
 }
 
-/** 子块（agent-group childBlocks 项）渲染签名。per-child 比较的最小充分集。 */
+/** 子块（agent-group childBlocks 项）渲染签名。per-child 比较的最小充分集。Never throws. */
 export function childSignature(ch: ChildBlock): string {
-  const raw = ch as ChildBlock & { error?: unknown };
-  return [
-    ch.kind,
-    ch.blockId ?? "",
-    textSig(ch.text),
-    ch.toolName ?? "",
-    ch._partial ? 1 : 0,
-    ch._completed ? 1 : 0,
-    textSig(ch.output),
-    textSig(ch.preview),
-    textSig(ch.tail),
-    typeof raw.error === "string" ? textSig(raw.error) : raw.error ? 1 : 0,
-    ch.partialJson ? ch.partialJson.length : 0,
-    ch._inputRevision ?? 0,
-    bashTailSig(ch.bashTail),
-    ch.explanation ? textSig(ch.explanation) : "",
-    ch.objective ? textSig(ch.objective) : "",
-    ch.steps?.map((step) => `${step.status}:${textSig(step.step)}`).join(",") ?? "",
-  ].join("|");
+  try {
+    const raw = ch as ChildBlock & { error?: unknown };
+    const steps = Array.isArray(ch.steps) ? ch.steps : [];
+    return [
+      ch.kind,
+      ch.blockId ?? "",
+      textSig(ch.text),
+      ch.toolName ?? "",
+      ch._partial ? 1 : 0,
+      ch._completed ? 1 : 0,
+      textSig(ch.output),
+      textSig(ch.preview),
+      textSig(ch.tail),
+      typeof raw.error === "string" ? textSig(raw.error) : raw.error ? 1 : 0,
+      typeof ch.partialJson === "string" ? ch.partialJson.length : 0,
+      ch._inputRevision ?? 0,
+      bashTailSig(ch.bashTail),
+      ch.explanation ? textSig(ch.explanation) : "",
+      ch.objective ? textSig(ch.objective) : "",
+      steps
+        .map((step) => {
+          if (!step || typeof step !== "object") return "invalid";
+          return `${typeof step.status === "string" ? step.status : ""}:${textSig(step.step)}`;
+        })
+        .join(","),
+    ].join("|");
+  } catch {
+    return `corrupt-child|${typeof ch?.kind === "string" ? ch.kind : ""}`;
+  }
 }
 
 function childBlocksSignature(message: ChatMessage): string {
-  const blocks = message.childBlocks ?? [];
+  const blocks = Array.isArray(message.childBlocks) ? message.childBlocks : [];
   // Finalized tape payloads are immutable and already hash-addressed. Avoid
   // walking tens of thousands of children on every unrelated UI render; the
   // children are still all present and are progressively mounted by the card.

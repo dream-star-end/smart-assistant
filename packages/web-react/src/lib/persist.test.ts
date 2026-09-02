@@ -6,6 +6,7 @@ import {
   dispatchDbNameForUser,
   mergeArchivedHistory,
   isIncompleteDurableToolRow,
+  isUnresolvedPermissionPrompt,
   coalesceProcessIdentities,
   mergeFullServerWins,
   mergeTimelineHistoryPage,
@@ -1877,6 +1878,120 @@ describe("mergeFullServerWins — records_unpublished degrade page", () => {
     expect(remerged.some((m) => m.id === "live-plan")).toBe(true);
   });
 
+  test("Phase-A unpublished keeps interleaved live assistant fragments and omits fallback body", () => {
+    const cmid = "u-interleave";
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1 };
+    const thinking: ChatMessage = {
+      id: "live-th", role: "thinking", text: "reason", ts: 2, _clientMessageId: cmid,
+    };
+    const a1: ChatMessage = {
+      id: "live-a1", role: "assistant", text: "mid-1", ts: 3, _clientMessageId: cmid,
+    };
+    const tool: ChatMessage = {
+      id: "live-tool", role: "tool", text: "", ts: 4, _clientMessageId: cmid, toolName: "Bash",
+    };
+    const a2: ChatMessage = {
+      id: "live-a2", role: "assistant", text: "mid-2", ts: 5, _clientMessageId: cmid,
+    };
+    const fallback: ChatMessage = {
+      id: "answer-1",
+      role: "assistant",
+      text: "mid-1mid-2",
+      ts: 10,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _displayDegraded: true,
+      _displayDegradeReason: "records_unpublished",
+      usage: { totalTokens: 9 },
+    };
+    const merged = mergeFullServerWins(
+      [user, fallback],
+      [user, thinking, a1, tool, a2],
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    expect(merged.filter((m) => !m._hideUnpublishedFallback).map((m) => m.id)).toEqual([
+      "u-interleave", "live-th", "live-a1", "live-tool", "live-a2",
+    ]);
+    const hidden = merged.find((m) => m._displayDegradeReason === "records_unpublished");
+    expect(hidden?._hideUnpublishedFallback).toBe(true);
+    expect(hidden?.text).toBe("");
+    expect(merged.find((m) => m.id === "live-a2")?.usage).toEqual({ totalTokens: 9 });
+
+    const remerged = mergeFullServerWins([user, fallback], merged, 0, cmid, {
+      deletionAuthority: true,
+    });
+    expect(remerged.filter((m) => !m._hideUnpublishedFallback).map((m) => m.id)).toEqual([
+      "u-interleave", "live-th", "live-a1", "live-tool", "live-a2",
+    ]);
+  });
+
+  test("Phase-B ordinal assistants replace live fragments without duplicates", () => {
+    const cmid = "u-exact-assist";
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1, _source: "server", _orderSeq: 1 };
+    const liveA1: ChatMessage = {
+      id: "live-a1", role: "assistant", text: "mid-1", ts: 2, _clientMessageId: cmid,
+    };
+    const liveTool: ChatMessage = {
+      id: "live-tool", role: "tool", text: "", ts: 3, _clientMessageId: cmid, toolName: "Bash",
+    };
+    const liveA2: ChatMessage = {
+      id: "live-a2", role: "assistant", text: "mid-2", ts: 4, _clientMessageId: cmid,
+    };
+    const tapeA1: ChatMessage = {
+      id: "tape-a1",
+      role: "assistant",
+      text: "mid-1",
+      ts: 2,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _turnTapeOrdinal: 0,
+      _timelineRecord: true,
+      _orderSeq: 2,
+    };
+    const tapeTool: ChatMessage = {
+      id: "tape-tool",
+      role: "tool",
+      text: "",
+      ts: 3,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _turnTapeOrdinal: 1,
+      _timelineRecord: true,
+      _orderSeq: 2,
+      toolName: "Bash",
+    };
+    const tapeA2: ChatMessage = {
+      id: "tape-a2",
+      role: "assistant",
+      text: "mid-2",
+      ts: 4,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _turnTapeOrdinal: 2,
+      _timelineRecord: true,
+      _orderSeq: 2,
+    };
+    const merged = mergeFullServerWins(
+      [user, tapeA1, tapeTool, tapeA2],
+      [user, liveA1, liveTool, liveA2],
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    expect(merged.map((m) => m.id)).toEqual(["u-exact-assist", "tape-a1", "tape-tool", "tape-a2"]);
+    expect(merged.some((m) => m.id === "live-a1" || m.id === "live-a2")).toBe(false);
+  });
+
   test("a complete tape without degrade replaces the live process rows", () => {
     const cmid = "u-exact";
     const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1, _source: "server" };
@@ -2372,5 +2487,39 @@ describe("mergeFullServerWins — records_unpublished degrade page", () => {
     );
     expect(merged.some((m) => m.id === "live-tool")).toBe(true);
     expect(merged.some((m) => m.id === "tape-tool")).toBe(true);
+  });
+});
+
+describe("isUnresolvedPermissionPrompt (INC-20260903-PENDING-PERMISSION-LOST)", () => {
+  const base: ChatMessage = {
+    id: "perm-1",
+    role: "permission",
+    text: "",
+    ts: 10,
+    _turnOwnerId: "owner-a",
+    _clientMessageId: "u-perm",
+  } as ChatMessage;
+
+  test("true for an unresolved permission row (explicit _resolved:false)", () => {
+    expect(isUnresolvedPermissionPrompt({ ...base, _resolved: false } as ChatMessage, 1_000)).toBe(true);
+  });
+
+  test("true when _resolved is absent", () => {
+    expect(isUnresolvedPermissionPrompt(base, 1_000)).toBe(true);
+  });
+
+  test("false once resolved", () => {
+    expect(isUnresolvedPermissionPrompt({ ...base, _resolved: true } as ChatMessage, 1_000)).toBe(false);
+  });
+
+  test("false for non-permission roles", () => {
+    expect(isUnresolvedPermissionPrompt({ ...base, role: "tool" } as ChatMessage, 1_000)).toBe(false);
+    expect(isUnresolvedPermissionPrompt({ ...base, role: "assistant" } as ChatMessage, 1_000)).toBe(false);
+  });
+
+  test("false once the ask_user deadline has passed, true while still live", () => {
+    const withDeadline = { ...base, _askUserExpiresAt: 5_000 } as ChatMessage;
+    expect(isUnresolvedPermissionPrompt(withDeadline, 5_000)).toBe(false);
+    expect(isUnresolvedPermissionPrompt(withDeadline, 4_999)).toBe(true);
   });
 });

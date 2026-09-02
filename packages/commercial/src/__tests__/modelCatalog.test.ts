@@ -446,6 +446,158 @@ describe("per-uid 投影", () => {
     }
   });
 
+  test("listLockedForUser is canUseModel minus the plan floor only", () => {
+    const gated = snap({
+      entries: [
+        GLM,
+        entry({ entryId: 10, modelId: "opus-lite-gate" }),
+        entry({ entryId: 11, modelId: "hidden-gated" }),
+        entry({ entryId: 12, modelId: "denied-gated" }),
+      ],
+      pricing: [
+        price("glm-5.2"),
+        price("opus-lite-gate", {
+          visibility: "public",
+          minPlanCode: "lite",
+          minPlanTier: 1,
+          minPlanName: "Lite",
+          promoLabel: "限时半价",
+          sortOrder: 5,
+        }),
+        price("hidden-gated", {
+          visibility: "hidden",
+          minPlanCode: "lite",
+          minPlanTier: 1,
+          minPlanName: "Lite",
+          sortOrder: 6,
+        }),
+        price("denied-gated", {
+          visibility: "public",
+          minPlanCode: "lite",
+          minPlanTier: 1,
+          minPlanName: "Lite",
+          sortOrder: 7,
+        }),
+      ],
+    });
+    const below = { uid: 9, role: "user" as const, grantedModelIds: new Set<string>(), userPlanTier: 0 };
+    const lite = { ...below, userPlanTier: 1 };
+    const anon = { uid: 0, role: "user" as const, grantedModelIds: new Set<string>(), userPlanTier: null };
+    const denied = { ...below, deniedModelIds: new Set(["denied-gated"]) };
+
+    assert.equal(gated.canUseModel(below, "opus-lite-gate"), false);
+    assert.deepEqual(gated.listForUser(below).map((row) => row.modelId), ["glm-5.2"]);
+    assert.deepEqual(
+      gated.listLockedForUser(below).map((row) => row.modelId),
+      ["opus-lite-gate", "denied-gated"],
+    );
+    assert.equal(gated.listLockedForUser(below)[0]?.promoLabel, "限时半价");
+    assert.equal(gated.listLockedForUser(below)[0]?.minPlanName, "Lite");
+
+    assert.equal(gated.canUseModel(lite, "opus-lite-gate"), true);
+    assert.deepEqual(
+      gated.listForUser(lite).map((row) => row.modelId),
+      ["opus-lite-gate", "denied-gated", "glm-5.2"],
+    );
+    assert.deepEqual(gated.listLockedForUser(lite).map((row) => row.modelId), []);
+    assert.equal(gated.listForUser(lite).find((row) => row.modelId === "opus-lite-gate")?.promoLabel, "限时半价");
+
+    assert.deepEqual(gated.listForUser(anon).map((row) => row.modelId), ["glm-5.2"]);
+    assert.deepEqual(
+      gated.listLockedForUser(anon).map((row) => row.modelId),
+      ["opus-lite-gate", "denied-gated"],
+    );
+
+    assert.deepEqual(
+      gated.listLockedForUser({ ...below, grantedModelIds: new Set() }).filter((row) => row.modelId === "hidden-gated"),
+      [],
+    );
+    assert.equal(gated.canUseModel(below, "hidden-gated"), false);
+    assert.ok(!gated.listForUser(below).some((row) => row.modelId === "hidden-gated"));
+
+    assert.equal(gated.canUseModel(denied, "denied-gated"), false);
+    assert.ok(!gated.listForUser(denied).some((row) => row.modelId === "denied-gated"));
+    assert.ok(!gated.listLockedForUser(denied).some((row) => row.modelId === "denied-gated"));
+  });
+
+  test("listLockedForUser keeps Cursor credential gate: uid 0 + all included, list without uid excluded", () => {
+    const previous = process.env.OC_V5_CURSOR_CREDENTIAL_UIDS;
+    const cursor = snap({
+      entries: [GLM, CURSOR],
+      pricing: [
+        price("glm-5.2"),
+        price("cursor-opus-5-high", {
+          visibility: "public",
+          minPlanCode: "lite",
+          minPlanTier: 1,
+          minPlanName: "Lite",
+        }),
+      ],
+    });
+    const anon = { uid: 0, role: "user" as const, grantedModelIds: new Set<string>(), userPlanTier: null };
+    const uid3Free = { uid: 3, role: "user" as const, grantedModelIds: new Set<string>(), userPlanTier: 0 };
+    const uid3Lite = { ...uid3Free, userPlanTier: 1 };
+    try {
+      process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = "all";
+      assert.deepEqual(
+        cursor.listLockedForUser(anon).map((row) => row.modelId),
+        ["cursor-opus-5-high"],
+      );
+      assert.deepEqual(cursor.listForUser(anon).map((row) => row.modelId), ["glm-5.2"]);
+
+      process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = "3";
+      assert.deepEqual(cursor.listLockedForUser(anon).map((row) => row.modelId), []);
+      assert.ok(!cursor.listForUser(anon).some((row) => row.modelId === "cursor-opus-5-high"));
+      assert.deepEqual(
+        cursor.listLockedForUser(uid3Free).map((row) => row.modelId),
+        ["cursor-opus-5-high"],
+      );
+      assert.deepEqual(
+        cursor.listForUser(uid3Lite).map((row) => row.modelId),
+        ["cursor-opus-5-high", "glm-5.2"],
+      );
+      assert.deepEqual(cursor.listLockedForUser(uid3Lite).map((row) => row.modelId), []);
+    } finally {
+      if (previous === undefined) process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = undefined;
+      else process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = previous;
+    }
+  });
+
+  test("policy all + uid 0: canUseModel/listForUser stay strict; listLockedForUser still upsells", () => {
+    const previous = process.env.OC_V5_CURSOR_CREDENTIAL_UIDS;
+    process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = "all";
+    try {
+      const cursor = snap({
+        entries: [GLM, CURSOR],
+        pricing: [
+          price("glm-5.2"),
+          price("cursor-opus-5-high", {
+            visibility: "public",
+            minPlanCode: "lite",
+            minPlanTier: 1,
+            minPlanName: "Lite",
+          }),
+        ],
+      });
+      const anonPaid = {
+        uid: 0,
+        role: "user" as const,
+        grantedModelIds: new Set<string>(),
+        userPlanTier: 1,
+      };
+      const anon = { ...anonPaid, userPlanTier: null };
+      assert.equal(cursor.canUseModel(anonPaid, "cursor-opus-5-high"), false);
+      assert.ok(!cursor.listForUser(anonPaid).some((row) => row.modelId === "cursor-opus-5-high"));
+      assert.deepEqual(
+        cursor.listLockedForUser(anon).map((row) => row.modelId),
+        ["cursor-opus-5-high"],
+      );
+    } finally {
+      if (previous === undefined) process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = undefined;
+      else process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = previous;
+    }
+  });
+
   test("projectionRevision 是 per-uid 的:同内容不同 uid → 不同 hash", () => {
     const a = s.projectionRevisionFor({ uid: 1, role: "user", grantedModelIds: new Set() });
     const b = s.projectionRevisionFor({ uid: 2, role: "user", grantedModelIds: new Set() });

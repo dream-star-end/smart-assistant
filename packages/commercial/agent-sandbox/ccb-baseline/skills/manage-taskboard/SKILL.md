@@ -10,7 +10,7 @@ priority: 6
 # 管理任务面板
 
 任务面板是当前所有在途工作的唯一状态源。对话、巡检、CLI、MCP 共用同一套 `/api/board`。
-你是面板的一等公民用户,但**人是闸门**:`backlog` 未批准不许碰,`done` 永远不属于 AI。
+你是面板的一等公民用户,但**人是闸门**:`done` 永远不属于 AI。`backlog` 未批准不许认领;当前要做的那张单可用 `task_approve` / `oc-task ticket approve` 显式批准并留痕,**禁止批量自动批准积压队列**。
 
 日常对话里一句话建单用 MCP `task_create`(会自动挂上当前会话)。
 认领、推进、列单、查评论用容器内 CLI `oc-task`(单行 JSON,带 `schemaVersion`)。
@@ -19,12 +19,12 @@ priority: 6
 
 1. **identifier 只用面板返回的**。形如 `OCV5-42` 由服务端生成。绝不自己拼前缀、绝不猜下一个编号。
 2. **动手前必须先 `ticket get` + 看评论**。评论里可能有人的返工要求;不读就开工等于无视打回。
-3. **`backlog` 是未批准状态,不许认领**。等人点「批准开工」变成 `ready` 再 claim。
+3. **`backlog` 是未批准状态,不许认领**。当前会话就是为这张积压单而来时,用 `task_approve` 或 `oc-task ticket approve` 显式批准(必须带 `expectedVersion`,活动流会记下你),再 claim。禁止扫积压队列自动批准。
 4. **先 claim 拿到 lease,再读代码**。没 lease 就改文件 = 和别人(或下一轮巡检)双跑。
 5. **版本冲突只重试一次**。`oc-task` 退出码 `5` = HTTP 409,重读 `ticket get` 拿新 `version` 再试一次。再 409 就停,写评论等人。
 6. **禁止抢别人的 lease**。退出码 `6` = HTTP 423 `lease_held`,别人正在跑,重试无用,等。
 7. **做完先写评论再 advance**。评论必须写:改了什么 / 怎么验的 / 有什么风险。然后 `advance` 进 `waiting_human`(或下一站 `ready`,由 stage.onSuccess 决定)。
-8. **`done` 永远不属于 AI**。不要调 `POST …/done` / `…/approve` / `…/ready` / `…/cancel`。越权 403。
+8. **`done` 永远不属于 AI**。不要调 `POST …/done` / `…/cancel`。`POST …/approve` 只用于把 **backlog → ready**,不能拿来给人确认过站或关单。
 
 ## 触发场景
 
@@ -36,7 +36,7 @@ priority: 6
 ## 前提
 
 - 容器内能跑 `oc-task`(不在 PATH 时用绝对路径 `/run/oc/platform/current/bin/oc-task` 或 `~/.local/bin/oc-task`)
-- MCP 工具 `task_create` / `task_update` / `task_comment` / `task_list` / `task_get` 已挂在本会话
+- MCP 工具 `task_create` / `task_update` / `task_comment` / `task_list` / `task_get` / `task_approve` 已挂在本会话
 - 不要假设环境变量 `OPENCLAUDE_GATEWAY_TOKEN` 存在;`oc-task` 会自己读 token file / `openclaude.json`
 
 ## 步骤
@@ -67,7 +67,7 @@ oc-task ticket create --project-id OCV5 --type bug --title "登录 500" --body "
 ### B. 动手做一张已有的卡
 
 1. `oc-task ticket get <identifier>`(同时带回评论)。先读 `status`、`version`、评论。
-2. `status=backlog` → 停。告诉用户「还没批准,请在面板点开工」。
+2. `status=backlog` → 若用户要你做这张单,先 `task_approve` / `ticket approve`(带 version)再 claim;否则告诉用户还没批准。禁止批量自动批准。
 3. `status=running` 且不是你的 lease → 停。423/退出码 6 同理。
 4. `status=ready` → `oc-task ticket claim <identifier> --expected-version <version> --owner agent:<你的 agentId>`
 5. claim 成功后再读代码、改文件、跑验证。
@@ -123,7 +123,7 @@ stdout 永远是**单行 JSON**,带 `schemaVersion`。不要用 `jq` 美化后�
 - **409 死循环重试**:只一次。再冲突说明有并发,停。
 - **423 当 409 重试**:423 重试只会打到别人的 lease,无用。
 - **做完不写评论就 advance**:人在待确认收件箱里看不到你干了什么。
-- **调 done/approve/ready**:403,而且破坏「人是闸门」。
+- **调 done/cancel,或对非 backlog 调 approve**:403,而且破坏「人是闸门」。
 - **在 MCP 参数里传 userId**:没有这个字段,自用单租户由 gateway token 定身份。
 - **把旧 `/api/tasks` 或 `create_reminder` 当任务面板**:那是定时任务,不是看板。
 
@@ -137,7 +137,8 @@ oc-task ticket list --project-id OCV5 --status ready,running,waiting_human
 oc-task ticket get OCV5-42
 oc-task ticket create --project-id OCV5 --type feature --title "…" --body "…"
 oc-task ticket update OCV5-42 --expected-version 3 --priority P0
-oc-task ticket claim OCV5-42 --expected-version 3 --owner agent:main
+oc-task ticket approve OCV5-42 --expected-version 3 --owner agent:main
+oc-task ticket claim OCV5-42 --expected-version 4 --owner agent:main
 oc-task ticket comment OCV5-42 --body "改了 X;用 Y 验证;风险 Z"
 oc-task ticket advance OCV5-42 --expected-version 4 --summary "已修,待确认"
 oc-task ticket block OCV5-42 --expected-version 4 --reason "被 OCV5-7 blocks"
@@ -157,4 +158,5 @@ task_get(id="OCV5-42")
 task_create(projectId="OCV5", type="bug", title="…", body="…")
 task_update(id="OCV5-42", expectedVersion=3, priority="P0")
 task_comment(id="OCV5-42", body="改了什么 / 怎么验的 / 风险")
+task_approve(id="OCV5-42", expectedVersion=3)
 ```

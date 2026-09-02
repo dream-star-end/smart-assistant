@@ -26,6 +26,34 @@ set -e
 export LANG=C
 export LC_ALL=C
 
+# Flavor identity (OCV5-20 §2.7). Helper is discovered from this script's
+# realpath (release root / breakglass boot), never from cwd.
+# Missing helper is a loud skip (same as no-manifest skip) so a breakglass
+# copy without scripts/lib cannot take hostnet down. Helper present +
+# identity fail stays fail-closed ABORT.
+SETUP_HOST_NET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_flavor_lib=""
+_flavor_probe="$SETUP_HOST_NET_DIR"
+for _ in 1 2 3 4 5 6 7 8; do
+  if [ -f "$_flavor_probe/scripts/lib/assert-flavor.sh" ]; then
+    _flavor_lib="$_flavor_probe/scripts/lib/assert-flavor.sh"
+    break
+  fi
+  _flavor_next="$(dirname "$_flavor_probe")"
+  [ "$_flavor_next" = "$_flavor_probe" ] && break
+  _flavor_probe="$_flavor_next"
+done
+if [ -n "$_flavor_lib" ]; then
+  # shellcheck disable=SC1090
+  . "$_flavor_lib"
+elif [ -f "$SETUP_HOST_NET_DIR/../../../scripts/lib/assert-flavor.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$SETUP_HOST_NET_DIR/../../../scripts/lib/assert-flavor.sh"
+else
+  echo "[WARN] flavor helper missing for setup-host-net.sh; skipping flavor identity check" >&2
+fi
+unset _flavor_lib _flavor_probe _flavor_next
+
 # P1b channel 化:同一脚本以同等安全姿态(ICC=false + egress 守卫链)建 v3/v5 两套隔离网络。
 # channel 取值优先级:$1 > $OC_RUNTIME_CHANNEL > 默认 v3。v3 取值与历史完全一致(向后兼容)。
 CHANNEL="${1:-${OC_RUNTIME_CHANNEL:-v3}}"
@@ -37,6 +65,7 @@ case "$CHANNEL" in
     INTERNAL_PROXY_PORT="18791"
     V3_HOST_GUARD_CHAIN="V3_EGRESS_IN"
     CCB_HTTPS_PROXY_PORT=""
+    CURSOR_HTTPS_PROXY_PORT=""
     ;;
   v5)
     NET_NAME="openclaude-v5-net"
@@ -45,13 +74,36 @@ case "$CHANNEL" in
     INTERNAL_PROXY_PORT="18892"
     V3_HOST_GUARD_CHAIN="V5_EGRESS_IN"
     CCB_HTTPS_PROXY_PORT="18991"
+    CURSOR_HTTPS_PROXY_PORT="18992"
+    if type assert_flavor_identity >/dev/null 2>&1; then
+      if ! assert_flavor_identity --effector "$SETUP_HOST_NET_DIR"; then
+        echo "[ABORT] flavor identity refused setup-host-net.sh"
+        exit 1
+      fi
+      if [ "${FLAVOR_RESOLVED:-}" = "commercial" ]; then
+        if [ "${SELFHOST_CURSOR_EGRESS:-}" = "1" ] || [ "${OC_SELFHOST_CURSOR_EGRESS:-}" = "1" ]; then
+          echo "[ABORT] commercial identity cannot open 18992 (SELFHOST_CURSOR_EGRESS set)"
+          exit 1
+        fi
+        CURSOR_HTTPS_PROXY_PORT=""
+      elif [ "${FLAVOR_RESOLVED:-}" = "selfhost" ]; then
+        if [ "${SELFHOST_CURSOR_EGRESS:-}" = "1" ] || [ "${OC_SELFHOST_CURSOR_EGRESS:-}" = "1" ]; then
+          if ! assert_allows selfhost-cursor-egress; then
+            echo "[ABORT] selfhost-cursor-egress refused"
+            exit 1
+          fi
+        else
+          CURSOR_HTTPS_PROXY_PORT=""
+        fi
+      fi
+    fi
     ;;
   *)
     echo "[ABORT] 未知 channel: $CHANNEL (仅支持 v3 / v5)"
     exit 1
     ;;
 esac
-echo "[CHANNEL] $CHANNEL → net=$NET_NAME subnet=$SUBNET gw=$GATEWAY proxy_port=$INTERNAL_PROXY_PORT ccb_https_proxy_port=${CCB_HTTPS_PROXY_PORT:-off} chain=$V3_HOST_GUARD_CHAIN"
+echo "[CHANNEL] $CHANNEL → net=$NET_NAME subnet=$SUBNET gw=$GATEWAY proxy_port=$INTERNAL_PROXY_PORT ccb_https_proxy_port=${CCB_HTTPS_PROXY_PORT:-off} cursor_https_proxy_port=${CURSOR_HTTPS_PROXY_PORT:-off} chain=$V3_HOST_GUARD_CHAIN"
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -128,6 +180,12 @@ ensure_ufw_rule() {
     apply_ufw "deny v4/v6 → ${CCB_HTTPS_PROXY_PORT}/tcp (除 ${SUBNET} 外)" \
       deny in proto tcp to any port "$CCB_HTTPS_PROXY_PORT"
   fi
+  if [[ -n "$CURSOR_HTTPS_PROXY_PORT" ]]; then
+    apply_ufw "allow ${SUBNET} -> ${CURSOR_HTTPS_PROXY_PORT}/tcp" \
+      allow proto tcp from "$SUBNET" to any port "$CURSOR_HTTPS_PROXY_PORT" comment "openclaude-${CHANNEL} Cursor HTTPS proxy (${GATEWAY}:${CURSOR_HTTPS_PROXY_PORT})"
+    apply_ufw "deny external -> ${CURSOR_HTTPS_PROXY_PORT}/tcp" \
+      deny in proto tcp to any port "$CURSOR_HTTPS_PROXY_PORT"
+  fi
 }
 
 ensure_v3_host_guard() {
@@ -187,6 +245,11 @@ ensure_v3_host_guard() {
       -m comment --comment "${CHANNEL} CCB -> stable HTTPS proxy"
   fi
   # ICMP echo 留着,容器内 ping 网关用作 readiness 检测可以;ICMP 不会泄露敏感
+  if [[ -n "$CURSOR_HTTPS_PROXY_PORT" ]]; then
+    iptables -A "$V3_HOST_GUARD_CHAIN" \
+      -d "$GATEWAY" -p tcp --dport "$CURSOR_HTTPS_PROXY_PORT" -j RETURN \
+      -m comment --comment "${CHANNEL} Cursor -> dedicated HTTPS proxy"
+  fi
   iptables -A "$V3_HOST_GUARD_CHAIN" \
     -d "$GATEWAY" -p icmp --icmp-type echo-request -j RETURN \
     -m comment --comment "${CHANNEL} container -> gateway icmp (readiness)"
@@ -194,7 +257,7 @@ ensure_v3_host_guard() {
     -d "$GATEWAY" -j DROP \
     -m comment --comment "${CHANNEL} container -> any other host port: deny"
   # 注意:不在链内匹配 src=172.30.0.0/16,src 已在 INPUT jump 时过滤
-  echo "[ADDED] $V3_HOST_GUARD_CHAIN allow $GATEWAY:$INTERNAL_PROXY_PORT${CCB_HTTPS_PROXY_PORT:+,$GATEWAY:$CCB_HTTPS_PROXY_PORT}, deny rest"
+  echo "[ADDED] $V3_HOST_GUARD_CHAIN allow $GATEWAY:$INTERNAL_PROXY_PORT${CCB_HTTPS_PROXY_PORT:+,$GATEWAY:$CCB_HTTPS_PROXY_PORT}${CURSOR_HTTPS_PROXY_PORT:+,$GATEWAY:$CURSOR_HTTPS_PROXY_PORT}, deny rest"
 
   # 3) INPUT 入口 jump(真正幂等 — 2026-04-22 R2 B2 修复)
   #
@@ -213,6 +276,15 @@ ensure_v3_host_guard() {
   iptables -I INPUT 1 -s "$SUBNET" -j "$V3_HOST_GUARD_CHAIN" \
     -m comment --comment "${CHANNEL} container egress isolation"
   echo "[ADDED] INPUT -s $SUBNET -j $V3_HOST_GUARD_CHAIN (at position 1, deduped)"
+
+  # uid3 `host` SSH: flush rebuild would otherwise drop
+  # 172.31.0.0/16 → 172.31.0.1 tcp/22 RETURN until sshgate oneshot re-runs.
+  # Keep the exact match sshgate-insert.sh uses so later -C is idempotent.
+  if [ "$CHANNEL" = "v5" ]; then
+    iptables -C "$V3_HOST_GUARD_CHAIN" -s "$SUBNET" -d "$GATEWAY" -p tcp --dport 22 -j RETURN 2>/dev/null \
+      || iptables -I "$V3_HOST_GUARD_CHAIN" 1 -s "$SUBNET" -d "$GATEWAY" -p tcp --dport 22 -j RETURN
+    echo "[ADDED] $V3_HOST_GUARD_CHAIN SSH RETURN $SUBNET → $GATEWAY:22 (chain head)"
+  fi
 }
 
 main() {

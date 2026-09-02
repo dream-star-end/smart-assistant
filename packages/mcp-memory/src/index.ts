@@ -55,6 +55,8 @@ import {
   normalizeFanoutTasks,
 } from './delegateFanout.js'
 import { normalizeDelegateAgentId, normalizeDelegateModel } from './delegateArgs.js'
+import { normalizeSkillSaveArgs } from './skillSaveArgs.js'
+import { delegateResumeIdempotencyKey } from './delegateStartCli.js'
 import {
   formatDelegateFanoutRunning,
   resolveCursorFastWaitMs,
@@ -83,6 +85,7 @@ import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPol
 // 让「TOOLS ↔ toolNames.ts」锁步单测能直接 import 校验,而不触发本入口模块顶层的
 // server.connect(见 toolDefs.ts / __tests__/toolNames.test.ts)。
 import {
+  handleTaskApprove,
   handleTaskComment,
   handleTaskCreate,
   handleTaskGet,
@@ -97,8 +100,15 @@ import {
 } from './presentOptions.js'
 import {
   cursorDelegateCliHint,
+  delegateWaitDisabledText,
+  filterListedDelegateTools,
   isCursorHiddenDelegateTool,
+  shouldExposeDelegateWait,
 } from './cursorDelegatePolicy.js'
+import {
+  mcpDelegateWaitHttpTimeoutMs,
+  runMcpDelegateWait,
+} from './delegateWaitMcp.js'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
 /** 本 MCP 子进程的委派深度(由网关 spawn env 注入)。>0 = 子 agent 环境,
@@ -207,9 +217,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (!shouldListPresentOptions(ENGINE_ID, DELEGATION_DEPTH)) {
     base = base.filter((t) => t.name !== 'present_options')
   }
-  if (ENGINE_ID === 'cursor') {
-    base = base.filter((t) => !isCursorHiddenDelegateTool(t.name, 'cursor'))
-  }
+  base = filterListedDelegateTools(base, ENGINE_ID)
   return { tools: filterSkillEvalTools(base, SKILL_EVAL_MODE) }
 })
 
@@ -227,6 +235,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     if (isCursorHiddenDelegateTool(name)) {
       return toolError(cursorDelegateCliHint(name))
+    }
+    if (name === 'delegate_wait' && !shouldExposeDelegateWait()) {
+      return toolError(delegateWaitDisabledText())
     }
     switch (name) {
       case 'skill_list':
@@ -255,6 +266,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleDelegateTask(args as any)
       case 'delegate_tasks':
         return await handleDelegateTasks(args as any)
+      case 'delegate_wait':
+        return await handleDelegateWait(args as any)
       case 'request_review':
         return await handleRequestReview(args as any)
       case 'task_create':
@@ -267,6 +280,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleTaskList(args as any)
       case 'task_get':
         return await handleTaskGet(args as any)
+      case 'task_approve':
+        return await handleTaskApprove(args as any)
       case 'ask_user':
         return await handleAskUser(args as any)
       case 'present_options': {
@@ -512,13 +527,7 @@ async function findNearDuplicateSkill(
   }
 }
 
-async function handleSkillSave(args: {
-  name: string
-  description: string
-  body: string
-  tags?: string[]
-  force?: boolean
-}) {
+async function handleSkillSave(rawArgs: unknown) {
   // Defense in depth: training sessions must never write the authoritative library
   // (the tool is also removed from the training tool list above).
   if (SKILL_TRAIN_RUN_ID) {
@@ -526,6 +535,9 @@ async function handleSkillSave(args: {
       'skill_save is disabled during a training run — use skill_propose (draft only)',
     )
   }
+  const normalized = normalizeSkillSaveArgs(rawArgs)
+  if (!normalized.ok) return toolError(normalized.error)
+  const args = normalized.args
   // Near-duplicate soft gate: steer toward updating an existing similar skill
   // rather than growing the library uncontrolled. force:true bypasses. Only the
   // v3 path (master configured) runs it — personal version skips entirely (no
@@ -927,6 +939,13 @@ async function runAsyncDelegateToAgent(
     toolsets: args.toolsets,
     async: true,
     ...(args.resumeSessionKey ? { resumeSessionKey: args.resumeSessionKey } : {}),
+    ...(args.resumeSessionKey
+      ? {
+          idempotencyKey: delegateResumeIdempotencyKey({
+            resumeSessionKey: args.resumeSessionKey,
+          }),
+        }
+      : {}),
     ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
   })
   const fastWaitMs = resolveCursorFastWaitMs()
@@ -949,6 +968,28 @@ async function runAsyncDelegateToAgent(
         }),
     },
   })
+}
+
+async function handleDelegateWait(args: { jobId?: unknown; waitMs?: unknown }) {
+  if (!shouldExposeDelegateWait()) {
+    return toolError(delegateWaitDisabledText())
+  }
+  const jobId = typeof args?.jobId === 'string' ? args.jobId : ''
+  try {
+    const r = await runMcpDelegateWait({
+      jobId,
+      waitMs: args?.waitMs,
+      waitOnce: (id, waitMs) =>
+        postJsonToGateway(`${gatewayBaseUrl()}/api/delegate/wait`, {
+          headers: gatewayDelegateHeaders(),
+          body: JSON.stringify({ jobId: id, waitMs }),
+          timeoutMs: mcpDelegateWaitHttpTimeoutMs(waitMs),
+        }),
+    })
+    return r.isError ? toolError(r.text) : toolOk(r.text)
+  } catch (err: any) {
+    return toolError(`等待委派结果失败: ${describeDelegateTransportError(err)}`)
+  }
 }
 
 async function handleDelegateTaskToAgent(

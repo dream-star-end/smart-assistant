@@ -40,6 +40,10 @@ import {
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
 import {
+  registerProducerFence,
+  resetProducerFenceForTests,
+} from "../db/liveTurnFrames.js";
+import {
   appendScanSciPaperIntentHintToFrame,
   detectScanSciPaperIntent,
   SCANSCI_PAPER_HINT_MARKER,
@@ -3235,6 +3239,11 @@ describe("Cursor external authority regression tripwire", () => {
       /sendErrorFrame\(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity\)/,
     );
     assert.match(source, /settleCursorExternalUsage/);
+    assert.match(source, /stableIdentityProvided && !stableIdentityComplete/);
+    assert.match(source, /stableIdentityCount === stableIdentityParts\.length/);
+    assert.match(source, /WHERE id=\$1 AND provider='cursor'/);
+    assert.match(source, /fingerprintCursorKey\(snapshot\.token\.toString\("utf8"\)\)/);
+    assert.match(source, /else if \(!stableIdentityProvided\) \{\s*cursorAccountId = await resolveUsedCursorAccountId\(external\.cursorSlotResults\)/);
   });
 
   test("ZCode uses an independent admission/audit branch and does not reuse Cursor gates", async () => {
@@ -3816,5 +3825,143 @@ describe("inbound turn identity is frozen onto every parsed-turn error exit", ()
     assert.match(source, /maxFrameBytes}`,[\s\S]{0,20}ccbTurnIdentity/);
     assert.match(source, /"internal error", ccbTurnIdentity/);
     assert.doesNotMatch(source, /firstSession\(\)/);
+  });
+});
+
+describe("userChatBridge — fenced leftover frames are not forwarded", () => {
+  test("container stamped frame with fenced clientMessageId never reaches user websocket", async () => {
+    resetProducerFenceForTests();
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.p, containerId: 91 }),
+    });
+    portRef.p = rig.containerPort;
+    try {
+      const token = await makeJwt("8801");
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      const containerWs = await containerOpenP;
+      const seen: string[] = [];
+      ws.on("message", (data) => {
+        seen.push(typeof data === "string" ? data : Buffer.from(data as Buffer).toString("utf8"));
+      });
+      registerProducerFence({
+        dispatchId: "11111111-1111-4111-8111-111111111111",
+        sessionId: "sess-fence",
+        clientMessageId: "cm-fence-1",
+      });
+      containerWs.send(JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sess-fence",
+        frameSeq: 1,
+        clientMessageId: "cm-fence-1",
+        peer: { id: "sess-fence" },
+        blocks: [{ kind: "text", text: "should-not-forward" }],
+      }));
+      await new Promise((r) => setTimeout(r, 200));
+      assert.equal(
+        seen.some((row) => row.includes("should-not-forward")),
+        false,
+        "fenced leftover must not reach the user websocket",
+      );
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      resetProducerFenceForTests();
+      await stopRig(rig);
+    }
+  });
+});
+
+describe("userChatBridge — first_visible persist is not permanently suppressed on one PG blip", () => {
+  const TRACE = "aa".repeat(16);
+  function visibleFrame(text: string) {
+    return JSON.stringify({
+      type: "outbound.message",
+      sessionKey: "agent:main:webchat:dm:sess-fv",
+      frameSeq: 1,
+      peer: { id: "sess-fv" },
+      traceId: TRACE,
+      blocks: [{ kind: "text", text }],
+    });
+  }
+
+  test("first reject then a later visible frame writes first_visible", async () => {
+    const portRef = { p: 0 };
+    let n = 0;
+    const trio = helloTerminalBillingTrio({ row: null, lookups: [] });
+    const innerQuery = trio.pgPool!.query.bind(trio.pgPool);
+    trio.pgPool = {
+      query: async (sql: unknown, params?: unknown[]) => {
+        const s = String(sql);
+        if (s.includes("first_visible_at") && /UPDATE/i.test(s)) {
+          n += 1;
+          if (n <= 3) throw new Error("pg blip");
+          return { rowCount: 1, rows: [] };
+        }
+        return innerQuery(s, params);
+      },
+    } as UserChatBridgeDeps["pgPool"];
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.p, containerId: 95 }),
+      ...trio,
+    });
+    portRef.p = rig.containerPort;
+    try {
+      const token = await makeJwt("9501");
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      const containerWs = await containerOpenP;
+      containerWs.send(visibleFrame("hello-1"));
+      await new Promise((r) => setTimeout(r, 400));
+      assert.equal(n, 3, "first round exhausts handler retries");
+      containerWs.send(visibleFrame("hello-2"));
+      await new Promise((r) => setTimeout(r, 400));
+      assert.equal(n, 4, "later frame retries and succeeds");
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("continuous failure is bounded and does not query on every frame", async () => {
+    const portRef = { p: 0 };
+    let n = 0;
+    const trio = helloTerminalBillingTrio({ row: null, lookups: [] });
+    const innerQuery = trio.pgPool!.query.bind(trio.pgPool);
+    trio.pgPool = {
+      query: async (sql: unknown, params?: unknown[]) => {
+        const s = String(sql);
+        if (s.includes("first_visible_at") && /UPDATE/i.test(s)) {
+          n += 1;
+          throw new Error("pg down");
+        }
+        return innerQuery(s, params);
+      },
+    } as UserChatBridgeDeps["pgPool"];
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.p, containerId: 96 }),
+      ...trio,
+    });
+    portRef.p = rig.containerPort;
+    try {
+      const token = await makeJwt("9601");
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      const containerWs = await containerOpenP;
+      for (let i = 0; i < 8; i++) {
+        containerWs.send(visibleFrame(`tok-${i}`));
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      assert.equal(n, 9, "3 rounds × 3 attempts, not per-frame");
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
   });
 });

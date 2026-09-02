@@ -122,4 +122,133 @@ describe('single frozen project context', () => {
     assert.equal(next.instructions, 'new-ins')
     assert.notEqual(next.contextVersion, frozen.contextVersion)
   })
+
+  it('stage prompt and PROJECT slot consume the same frozen snapshot', async () => {
+    const db = getTaskboardDb()
+    const project = createProject(db, { key: 'SFZ', name: 'single-freeze' })
+    const first = await writeProjectInstructions(project.id, 'freeze-v1', 0)
+    assert.equal(first.ok, true)
+    const frozen = await loadFrozenProjectContext({ boardProjectId: project.id, db })
+    await writeProjectInstructions(project.id, 'freeze-v2', frozen.contextVersion)
+    const { formatStageProjectContext } = await import('../taskboard/patrol.js')
+    const { renderPrompt } = await import('../taskboard/promptRender.js')
+    const block = formatStageProjectContext(frozen)
+    assert.match(block ?? '', /freeze-v1/)
+    assert.doesNotMatch(block ?? '', /freeze-v2/)
+    const { prompt } = renderPrompt({
+      template: '单 {{ticket.identifier}}',
+      ticket: { identifier: 'SFZ-1', title: 't', body: 'b' },
+      stage: { name: '复现确认', exitChecklist: 'x' },
+      projectContextText: block,
+    })
+    assert.match(prompt, /freeze-v1/)
+    assert.doesNotMatch(prompt, /freeze-v2/)
+    const slot = await buildProjectSlot({
+      agentId: 'stage-triage',
+      projectId: project.id,
+      frozenProjectContext: frozen,
+      projectContext: {
+        boardProjectId: project.id,
+        chatProjectId: null,
+        name: 'single-freeze',
+        instructions: frozen.instructions,
+        assets: [],
+        assetsRevision: 0,
+        bound: true,
+      },
+    })
+    assert.match(slot?.content ?? '', /freeze-v1/)
+    assert.doesNotMatch(slot?.content ?? '', /freeze-v2/)
+  })
+
+  it('new bind: master instructions + pinned assets freeze once after resolve', async () => {
+    const db = getTaskboardDb()
+    const project = createProject(db, { key: 'MST', name: 'master-first' })
+    const pinned = {
+      id: 'asset-pin-1',
+      projectId: project.id,
+      source: 'upload' as const,
+      sessionId: null,
+      name: 'pin.png',
+      url: null,
+      containerPath: '/home/agent/.openclaude/generated/pin.png',
+      mime: 'image/png',
+      sizeBytes: 12,
+      digest: null,
+      excerpt: 'pinned-excerpt',
+      pinned: true,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const prevUrl = process.env.OPENCLAUDE_V3_MASTER_BASE_URL
+    const prevTok = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+    process.env.OPENCLAUDE_V3_MASTER_BASE_URL = 'http://127.0.0.1:9'
+    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'test-token'
+    try {
+      const { freezeStageProjectContext } = await import('../taskboard/patrol.js')
+      const { frozen, projectContextText } = await freezeStageProjectContext({
+        boardProjectId: project.id,
+        db,
+        env: process.env,
+        fetcher: (async () => ({
+          statusCode: 200,
+          body: {
+            text: async () =>
+              JSON.stringify({
+                boardProjectId: project.id,
+                name: 'master-first',
+                instructions: 'from-master-only',
+                pinnedAssets: [pinned],
+                assetsRevision: 7,
+              }),
+          },
+        })) as never,
+      })
+      assert.equal(frozen.instructions, 'from-master-only')
+      assert.equal(frozen.assetsRevision, 7)
+      assert.equal(frozen.assets.length, 1)
+      assert.equal(frozen.assets[0]?.name, 'pin.png')
+      assert.match(projectContextText ?? '', /from-master-only/)
+
+      const slot = await buildProjectSlot({
+        agentId: 'stage-triage',
+        projectId: project.id,
+        frozenProjectContext: frozen,
+        projectContext: {
+          boardProjectId: project.id,
+          chatProjectId: null,
+          name: 'master-first',
+          instructions: 'should-not-win',
+          assets: [],
+          assetsRevision: 0,
+          bound: true,
+        },
+      })
+      assert.match(slot?.content ?? '', /from-master-only/)
+      assert.match(slot?.content ?? '', /pin\.png/)
+      assert.match(slot?.content ?? '', /pinned-excerpt/)
+
+      await writeProjectInstructions(project.id, 'later-local-v2', frozen.contextVersion)
+      const built = await buildPromptContext({
+        agentId: 'stage-triage',
+        projectId: project.id,
+        frozenProjectContext: frozen,
+      })
+      assert.equal(built.frozenProjectContext?.projectMdSha256, frozen.projectMdSha256)
+      assert.equal(built.frozenProjectContext?.assetsRevision, 7)
+      const laterSlot = await buildProjectSlot({
+        agentId: 'stage-triage',
+        projectId: project.id,
+        frozenProjectContext: frozen,
+      })
+      assert.match(laterSlot?.content ?? '', /from-master-only/)
+      assert.doesNotMatch(laterSlot?.content ?? '', /later-local-v2/)
+      assert.match(laterSlot?.content ?? '', /pin\.png/)
+    } finally {
+      if (prevUrl === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL
+      else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = prevUrl
+      if (prevTok === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+      else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = prevTok
+    }
+  })
 })

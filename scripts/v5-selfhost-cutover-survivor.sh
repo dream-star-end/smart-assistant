@@ -161,8 +161,33 @@ write_committed_marker() {
   grep -q '^committed_at=' "$SURVIVOR_COMMITTED" || return 1
 }
 
+master_cwd_is_live_rel() {
+  if [[ -n "${SURVIVOR_LIVE_WD_CMD:-}" ]]; then
+    eval "$SURVIVOR_LIVE_WD_CMD"
+    return
+  fi
+  local pid cwd wd live
+  pid="$(systemctl show -p MainPID --value "$SURVIVOR_MASTER_UNIT" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+  wd="$(systemctl show -p WorkingDirectory --value "$SURVIVOR_MASTER_UNIT" 2>/dev/null || true)"
+  live="$(readlink -f /opt/openclaude/openclaude-v5-selfhost-live 2>/dev/null || true)"
+  case "$cwd" in
+    /opt/openclaude/openclaude-v5-selfhost-releases/rel-*) return 0 ;;
+  esac
+  [[ -n "$live" && "$cwd" == "$live" ]] && return 0
+  [[ "$wd" == /opt/openclaude/openclaude-v5-selfhost-live ]] || return 1
+  [[ -n "$live" && "$live" == /opt/openclaude/openclaude-v5-selfhost-releases/rel-* ]]
+}
+
+backup_units_are_live_wd() {
+  local backup="$1" unit="${SURVIVOR_MASTER_UNIT}"
+  [[ -n "$backup" && -d "$backup" && -f "$backup/$unit" ]] || return 1
+  grep -q '^WorkingDirectory=/opt/openclaude/openclaude-v5-selfhost-live$' "$backup/$unit"
+}
+
 do_restore() {
-  local backup
+  local backup rc
   log "执行首次二级恢复"
   if [[ -n "$SURVIVOR_RESTORE_CMD" ]]; then
     # shellcheck disable=SC2086
@@ -170,13 +195,23 @@ do_restore() {
     return
   fi
   backup="$(parse_state backup_dir || true)"
-  if [[ -n "$backup" ]]; then
-    log "restore --backup-dir=$backup"
-    bash "$SURVIVOR_RESTORE" --backup-dir "$backup"
-    return
+  if [[ -z "$backup" ]]; then
+    log "FAIL loud: state 无 backup_dir,拒绝默认 restore-worktree-units(会装工作树 unit)"
+    return 1
   fi
-  log "state 无 backup_dir,走 restore 默认路径"
-  bash "$SURVIVOR_RESTORE"
+  if ! backup_units_are_live_wd "$backup"; then
+    log "FAIL loud: backup $backup 不是 live WD forensics,拒绝装工作树 unit"
+    return 1
+  fi
+  log "restore --backup-dir=$backup"
+  bash "$SURVIVOR_RESTORE" --backup-dir "$backup"
+  rc=$?
+  if ! compound_health_green; then
+    log "FAIL loud: 恢复后 healthz 未绿 backup=$backup rc=$rc"
+    return 1
+  fi
+  log "恢复后 healthz 绿 backup=$backup"
+  return 0
 }
 
 maybe_restore() {
@@ -186,8 +221,14 @@ maybe_restore() {
     return 0
   fi
   phase="$(parse_state phase || true)"
+  # 2026-08-29 11:21: timeout 在 phase=symlink-flipped + 人工已恢复 live 健康时
+  # 仍「无视健康」装 Aug18 工作树 unit。健康且 WD=live rel → 只报警不动手。
+  if compound_health_green && master_cwd_is_live_rel; then
+    log "ALARM: executor 已消失 phase=${phase:-none} 但 master 已在 live rel 且健康,只报警不恢复"
+    return 0
+  fi
   if phase_is_uncommitted_mutation "$phase"; then
-    log "phase=${phase} 尚未 smoked/committed,executor 已消失,无视健康直接二级恢复"
+    log "phase=${phase} 尚未 smoked/committed 且现场不健康/非 live WD,二级恢复"
     do_restore
     return
   fi
@@ -269,6 +310,7 @@ selftest() {
   export SURVIVOR_POLL_SEC=1
   export SURVIVOR_MAX_LOOPS=30
   export SURVIVOR_HEALTH_CMD='false'
+  export SURVIVOR_LIVE_WD_CMD='false'
   export SURVIVOR_RESTORE_CMD="printf RESTORED\\\\n >>'$base/restored'"
 
   echo "===== survivor 场景: 假 executor 被 kill 且健康未绿 → 必须恢复 ====="
@@ -347,26 +389,41 @@ selftest() {
     echo "FAIL smoked 后健康绿仍恢复"
     return 1
   fi
-  grep -q '复合健康绿,不恢复' "$base/watch-smoked.log"
+  grep -q '不恢复' "$base/watch-smoked.log"
   echo "PASS survivor: smoked 后健康绿不恢复"
 
-  echo "===== survivor 场景: phase=units-installed + executor 消失 + 健康绿 → 必须恢复 ====="
+  echo "===== survivor 场景: phase=symlink-flipped + 健康绿 + live WD → 只报警不恢复 ====="
   rm -f -- "$base/restored" "$base/committed"
   export SURVIVOR_HEALTH_CMD='true'
-  write_state 999999999 "$base/backup" units-installed
+  export SURVIVOR_LIVE_WD_CMD='true'
+  write_state 999999999 "$base/backup" symlink-flipped
   rc=0
   "$0" --watch >"$base/watch-b2.log" 2>&1 || rc=$?
   echo "B2_REPRO_RC=$rc"
   echo "B2_REPRO_LOG:"
   cat "$base/watch-b2.log"
+  if [[ -f "$base/restored" ]]; then
+    echo "FAIL symlink-flipped + 健康 live WD 仍恢复"
+    return 1
+  fi
+  grep -q '只报警不恢复' "$base/watch-b2.log"
+  echo "PASS survivor: symlink-flipped + 健康绿 + live WD → 不恢复"
+
+  echo "===== survivor 场景: phase=units-installed + 不健康 → 必须恢复 ====="
+  rm -f -- "$base/restored" "$base/committed"
+  export SURVIVOR_HEALTH_CMD='false'
+  export SURVIVOR_LIVE_WD_CMD='false'
+  write_state 999999999 "$base/backup" units-installed
+  rc=0
+  "$0" --watch >"$base/watch-unhealthy.log" 2>&1 || rc=$?
+  echo "UNHEALTHY_RC=$rc"
+  cat "$base/watch-unhealthy.log"
   if [[ ! -f "$base/restored" ]]; then
-    echo "FAIL units-installed + 健康绿 未恢复"
+    echo "FAIL units-installed + 不健康 未恢复"
     return 1
   fi
   grep -q RESTORED "$base/restored"
-  grep -q '无视健康直接二级恢复' "$base/watch-b2.log"
-  echo "restored=yes"
-  echo "PASS survivor: units-installed + 健康绿 → 已恢复"
+  echo "PASS survivor: units-installed + 不健康 → 已恢复"
 
   echo "===== survivor 场景: --disarm 写 committed marker 失败必须非 0 ====="
   rm -f -- "$base/restored"

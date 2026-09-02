@@ -198,17 +198,22 @@ describe("migrate.runMigrations", () => {
          FROM model_catalog c
          JOIN model_pricing p ON p.model_id = c.model_id
         WHERE c.engine = 'cursor'
-        ORDER BY c.model_id`,
+        ORDER BY c.model_id COLLATE "C"`,
     );
     assert.deepEqual(cursorModels.rows, [
       { model_id: "cursor-auto", upstream_model_id: null, state: "active", enabled: true, visibility: "hidden" },
-      { model_id: "cursor-composer-2.5", upstream_model_id: "composer-2.5", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-composer-2.5-fast", upstream_model_id: "composer-2.5-fast", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-composer-2.5", upstream_model_id: "composer-2.5", state: "disabled", enabled: false, visibility: "hidden" },
+      { model_id: "cursor-composer-2.5-fast", upstream_model_id: "composer-2.5-fast", state: "disabled", enabled: false, visibility: "hidden" },
       { model_id: "cursor-fable-5-high", upstream_model_id: "claude-fable-5-thinking-high", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-fable-5-low", upstream_model_id: "claude-fable-5-thinking-low", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-fable-5-max", upstream_model_id: "claude-fable-5-thinking-max", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-fable-5-medium", upstream_model_id: "claude-fable-5-thinking-medium", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-fable-5-xhigh", upstream_model_id: "claude-fable-5-thinking-xhigh", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-fable-5.1-high", upstream_model_id: "claude-fable-5-1-thinking-high", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-fable-5.1-low", upstream_model_id: "claude-fable-5-1-thinking-low", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-fable-5.1-max", upstream_model_id: "claude-fable-5-1-thinking-max", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-fable-5.1-medium", upstream_model_id: "claude-fable-5-1-thinking-medium", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-fable-5.1-xhigh", upstream_model_id: "claude-fable-5-1-thinking-xhigh", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-grok-4.5-high", upstream_model_id: "cursor-grok-4.5-high", state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-grok-4.6-high", upstream_model_id: "cursor-grok-4.6-high", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-grok-4.6-high-fast", upstream_model_id: "cursor-grok-4.6-high-fast", state: "active", enabled: true, visibility: "public" },

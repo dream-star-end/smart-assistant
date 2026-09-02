@@ -18,7 +18,7 @@ import * as assert from 'node:assert/strict'
  * Run: npx tsx --test packages/gateway/src/__tests__/subprocessRunnerArgs.test.ts
  */
 import { describe, it } from 'node:test'
-import { buildCcbCliArgs } from '../subprocessRunner.js'
+import { buildCcbCliArgs, CCB_PLATFORM_DISALLOWED_TOOLS } from '../subprocessRunner.js'
 
 const BASE = {
   runtime: 'bun',
@@ -228,6 +228,7 @@ describe('buildCcbCliArgs', () => {
       '--permission-mode',
       '--dangerously-skip-permissions',
       '--permission-prompt-tool',
+      '--disallowedTools',
       '--append-system-prompt-file',
       '--add-dir',
       '--resume',
@@ -247,6 +248,36 @@ describe('buildCcbCliArgs', () => {
         `workload=${String(w)} should not produce --workload`,
       )
     }
+  })
+
+  it('non-hermetic sessions deny CCB SendMessage even under bypassPermissions', () => {
+    // OCV5-45: platform mailbox is a black hole. CLI deny must survive the
+    // default OpenClaude spawn (bypassPermissions + --dangerously-skip-permissions)
+    // and must not take Agent/Task/Bash/Read/Write with it.
+    const args = buildCcbCliArgs({ ...BASE, permissionMode: 'bypassPermissions' })
+    assert.ok(
+      hasFlagWithValue(args, '--disallowedTools', 'SendMessage'),
+      'non-hermetic CCB argv must include --disallowedTools SendMessage',
+    )
+    assert.deepEqual([...CCB_PLATFORM_DISALLOWED_TOOLS], ['SendMessage'])
+    const denyIdx = args.indexOf('--disallowedTools')
+    assert.equal(args[denyIdx + 1], 'SendMessage')
+    assert.ok(
+      typeof args[denyIdx + 2] === 'string' && args[denyIdx + 2].startsWith('--'),
+      'variadic --disallowedTools must be followed by another flag, not the empty prompt',
+    )
+    assert.equal(args[denyIdx + 2], '--permission-prompt-tool')
+    for (const kept of ['Agent', 'Task', 'Bash', 'Read', 'Write']) {
+      assert.equal(args.includes(kept), false, `${kept} must not appear as a disallowed tool`)
+    }
+    assert.ok(args.includes('--dangerously-skip-permissions'))
+    assert.equal(args[args.length - 1], '')
+  })
+
+  it('default non-hermetic path still denies SendMessage without permissionMode', () => {
+    const args = buildCcbCliArgs({ ...BASE })
+    assert.ok(hasFlagWithValue(args, '--disallowedTools', 'SendMessage'))
+    assert.ok(hasFlagWithValue(args, '--permission-prompt-tool', 'stdio'))
   })
 
   it('always terminates args with the empty prompt placeholder', () => {

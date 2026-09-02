@@ -321,7 +321,8 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
     --arg metadataSha256 "$metadata_sha" \
     --arg artifactSha256 "$artifact_sha" \
     '{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
-      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256}' >"$marker_tmp"; then
+      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
+      flavorGuardGeneration:1}' >"$marker_tmp"; then
     rm -f -- "$marker_tmp"
     return 1
   fi
@@ -526,6 +527,21 @@ build_master_release() {
     cleanup_master_staging
     die "staging 缺 node_modules/tsx"
   }
+  mlog "  Cursor Sand InferenceService contract gate @ pinned staging"
+  if ! ( cd "$staging" && npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ); then
+    cleanup_master_staging
+    die "pinned Cursor Sand InferenceService contract gate 失败"
+  fi
+  mlog "  CCB MCP availability contract gate @ pinned staging"
+  if ! ( cd "$staging" && npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts ); then
+    cleanup_master_staging
+    die "pinned CCB MCP availability contract gate 失败"
+  fi
+  mlog "  delegate engine billing requestId contract gate @ pinned staging"
+  if ! ( cd "$staging" && npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts ); then
+    cleanup_master_staging
+    die "pinned delegate engine billing requestId contract gate 失败"
+  fi
 
   t0="$(date +%s)"
   mlog "  web-react official build @ staging(不碰工作树 dist)"
@@ -573,6 +589,8 @@ build_master_release() {
     cleanup_master_staging
     die "写 VERSION.json 失败"
   fi
+  write_flavor_manifest "$staging" selfhost "$full_sha" \
+    || { cleanup_master_staging; die "写 flavor.manifest.json 失败"; }
   if ! harden_unique_release_tree "$staging"; then
     cleanup_master_staging
     die "harden unique files 失败"
@@ -691,7 +709,13 @@ assert_master_release_tsx_selfcheck() { # <rel>
   out="$(cd "$rel" && npx --no-install tsx -e '
 import { readFileSync } from "node:fs";
 import { transformSync } from "esbuild";
-for (const f of ["packages/cli/src/commands/gateway.ts", "packages/commercial/src/index.ts"]) {
+for (const f of [
+  "packages/cli/src/index.ts",
+  "packages/cli/src/commands/gateway.ts",
+  "packages/commercial/src/index.ts",
+  "packages/commercial/src/egress/main.ts",
+  "packages/commercial/src/db/pgSessionsBackend.ts",
+]) {
   transformSync(readFileSync(f, "utf8"), { loader: "ts", format: "esm", target: "es2022" });
 }
 console.log("transform-ok");
@@ -1056,12 +1080,10 @@ backup_installed_units_for_cutover() { # <out-var>
   fi
 
   if [[ "$wd_m" == "$MASTER_LIVE_LINK" && "$wd_e" == "$MASTER_LIVE_LINK" ]]; then
-    wt="$(resolve_worktree_unit_backup)" || {
-      mlog "当前 unit 已是 live WD,但 worktree-current 缺失或不是工作树备份。二级回滚不可用。"
-      return 1
-    }
-    mlog "  当前 unit 已是 live WD;forensics=$dest;二级回滚仍用工作树备份 $wt(不覆盖 worktree-current)"
-    printf -v "$dest_var" '%s' "$wt"
+    # 二级补偿/幸存者必须用「本次切流前」这份 forensics。禁止再把 dest_var
+    # 指回陈旧 worktree-current(2026-08-29 11:21 用 Aug18 工作树 unit 拉倒 18790)。
+    mlog "  当前 unit 已是 live WD;forensics=$dest (本次切流备份,不改 worktree-current)"
+    printf -v "$dest_var" '%s' "$dest"
     return 0
   fi
 

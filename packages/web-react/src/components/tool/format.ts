@@ -2,6 +2,11 @@
  * 工具卡格式化与输入解析的纯函数集（无 React，可单测）。
  * 端口自现网 messages.js 的 `_safeInput` / `_shortPath` / `_formatValue` 语义。
  */
+import {
+  executeExtraToolResultText,
+  isExecuteExtraToolName,
+  unwrapExecuteExtraToolInput,
+} from "../../lib/chat/extraTool";
 import type { BashTail } from "../../lib/chat/model";
 import { normalizeGrokToolForDisplay } from "./grokDisplay";
 import { parsePartialJson } from "./partialJson";
@@ -316,7 +321,38 @@ export function normalizeToolForDisplay(message: ToolLike): DisplayTool {
     if (normalized) return stripToolAnsi(normalized);
   }
   const input = resolveToolInput(message);
+  const unwrapped = unwrapExecuteExtraTool(originalName, input, message);
+  if (unwrapped) {
+    return stripToolAnsi(normalizeGrokToolForDisplay(unwrapped.name, unwrapped.input, unwrapped.tool));
+  }
   return stripToolAnsi(normalizeGrokToolForDisplay(originalName, input, message));
+}
+
+/**
+ * CCB `ExecuteExtraTool {tool_name, params}` → the inner tool, so a deferred
+ * `mcp__openclaude-memory__skill_save` renders the same Memory card as a direct
+ * MCP call. Output: CCB's `{"result":[{"type":"text","text"}],"tool_name"}`
+ * envelope collapses to its text; plain `error: …` text stays as-is. Same
+ * positioning as the Codex/Grok wrappers above: backend owns new frames, the
+ * display layer repairs the durable tape.
+ */
+function unwrapExecuteExtraTool(name: string, input: ToolInput, message: ToolLike): DisplayTool | null {
+  if (!isExecuteExtraToolName(name)) return null;
+  const call = unwrapExecuteExtraToolInput(input);
+  if (!call) return null;
+  const rawOutput = message.outputJson ?? message.output;
+  const text = executeExtraToolResultText(rawOutput);
+  const output = rawOutput === undefined || rawOutput === null ? message.output : text;
+  const tool: ToolLike = {
+    ...message,
+    toolName: call.name,
+    inputJson: call.params,
+    partialJson: undefined,
+    inputPreview: undefined,
+    output: typeof output === "string" ? output : message.output,
+    outputJson: undefined,
+  };
+  return { name: call.name, input: call.params, tool };
 }
 
 /** 展示层剥 stdout/stderr/bashTail 里的 CSI，历史 tape 刷新即可去乱码。 */
@@ -607,6 +643,9 @@ const EXTRA_OPAQUE_ARG_TOOLS = new Set([
   "get_mcp_tools",
   "fetchmcpresource",
   "fetch_mcp_resource",
+  // CCB wrapper still streaming (tool_name not yet parsed): params are partial JSON, not user-facing.
+  "executeextratool",
+  "execute_extra_tool",
 ]);
 
 /** True when a title looks like an internal prompt, command, path, or JSON dump. */

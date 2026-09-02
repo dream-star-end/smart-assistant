@@ -160,9 +160,9 @@ export function pagedSeedMessageId(seq: number): string {
  * 紧邻的 `last_seq < $4::bigint` 恰好写了 cast,所以只有 $3 中弹。
  * 影响面 = 任何 archived_through_seq > 0 的会话(该 while 循环只在有归档时进入):
  * 其 timeline 读会抛 → GET /api/sessions/:id 落 500,长会话直接打不开。
- * 修复属存储层(不在本批文件所有权内),已作为 P0 上报;修好后把归档形态加回来只需
- * 在这里补 chunk 注入(SQL 已验证可用,见交付说明)。在那之前**不注入归档**:
- * 让 06 红在一个别人负责的存储 bug 上,只会让门变成噪音。
+ * 修复属存储层(不在本批文件所有权内),已作为 P0 上报。06 仍不注入归档,避免把分页
+ * 门绑到另一条事故;INC-20260726-ARCHIVE-CURSOR-OVERFLOW 的 spill 形态见
+ * seedSpilledArchiveSession。
  */
 export function seedPagedArchivedSession(numericUserId: string, sessionId: string): void {
   requireDirectTimeline();
@@ -193,6 +193,83 @@ export function seedPagedArchivedSession(numericUserId: string, sessionId: strin
        message_count=EXCLUDED.message_count, next_seq=EXCLUDED.next_seq,
        archived_through_seq=EXCLUDED.archived_through_seq, archived_count=EXCLUDED.archived_count,
        deleted_at=NULL`,
+  );
+}
+
+/**
+ * INC-20260726-ARCHIVE-CURSOR-OVERFLOW 夹具:内容大半已 spill、热行只剩少量
+ * anchor。首页无 cursor 时 beforeOrderSeq=MAX_SAFE_INTEGER,必须下潜
+ * client_session_archive_chunks.first_seq(integer);修复前这里 22003 → GET
+ * /api/sessions/:id 500。热行远小于首页 limit,防止「热行已填满、归档循环根本不进」。
+ */
+export const SPILL_SEED = {
+  archivedRows: 80,
+  hotRows: 5,
+} as const;
+export const SPILL_SEED_TOTAL_ROWS = SPILL_SEED.archivedRows + SPILL_SEED.hotRows;
+export function spilledHotMessageId(seq: number): string {
+  return `e2e-spill-hot-${String(seq).padStart(6, '0')}`;
+}
+export function spilledArchMessageId(seq: number): string {
+  return `e2e-spill-arch-${String(seq).padStart(6, '0')}`;
+}
+
+export function seedSpilledArchiveSession(numericUserId: string, sessionId: string): void {
+  requireDirectTimeline();
+  const uid = pgUserId(numericUserId);
+  const now = Date.now();
+  const archived = SPILL_SEED.archivedRows;
+  const hot = SPILL_SEED.hotRows;
+  const total = archived + hot;
+  const archJson = `
+    jsonb_build_object(
+      'id','e2e-spill-arch-'||lpad(i::text,6,'0'),
+      'role',CASE WHEN i % 2 = 1 THEN 'user' ELSE 'assistant' END,
+      'text','e2e-spill arch '||lpad(i::text,6,'0'),
+      'ts',${now} - (${total} - i) * 1000,
+      '_source','server',
+      '_seq',i,
+      '_orderSeq',i
+    )`;
+  const hotJson = `
+    jsonb_build_object(
+      'id','e2e-spill-hot-'||lpad(i::text,6,'0'),
+      'role',CASE WHEN i % 2 = 1 THEN 'user' ELSE 'assistant' END,
+      'text','e2e-spill hot '||lpad(i::text,6,'0'),
+      'ts',${now} - (${total} - i) * 1000,
+      '_source','server',
+      '_seq',i,
+      '_orderSeq',i
+    )`;
+
+  runSql(
+    `INSERT INTO client_sessions
+       (id,user_id,agent_id,title,created_at,last_at,messages,message_count,updated_at,next_seq,
+        archived_through_seq,archived_count)
+     SELECT ${q(sessionId)},${q(uid)},'main','e2e-spill-archive',${now - total * 1000},${now},
+            (SELECT jsonb_agg(${hotJson} ORDER BY i)::text
+               FROM generate_series(${archived + 1},${total}) AS g(i)),
+            ${total},${now},${total + 1},${archived},${archived}
+     ON CONFLICT (id) DO UPDATE SET user_id=EXCLUDED.user_id, messages=EXCLUDED.messages,
+       message_count=EXCLUDED.message_count, next_seq=EXCLUDED.next_seq,
+       archived_through_seq=EXCLUDED.archived_through_seq, archived_count=EXCLUDED.archived_count,
+       deleted_at=NULL`,
+  );
+  runSql(`DELETE FROM client_session_archive_chunks WHERE session_id=${q(sessionId)}`);
+  runSql(
+    `INSERT INTO client_session_archive_chunks
+       (session_id,user_id,first_seq,last_seq,message_count,messages,created_at)
+     SELECT ${q(sessionId)},${q(uid)},1,${archived},${archived},
+            (SELECT jsonb_agg(${archJson} ORDER BY i)::text
+               FROM generate_series(1,${archived}) AS g(i)),
+            ${now - total * 1000}`,
+  );
+  runSql(`DELETE FROM client_session_archived_ids WHERE session_id=${q(sessionId)}`);
+  runSql(
+    `INSERT INTO client_session_archived_ids (session_id, msg_id)
+     SELECT ${q(sessionId)}, 'e2e-spill-arch-'||lpad(i::text,6,'0')
+       FROM generate_series(1,${archived}) AS g(i)
+     ON CONFLICT DO NOTHING`,
   );
 }
 

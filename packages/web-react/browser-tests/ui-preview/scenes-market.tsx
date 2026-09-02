@@ -1269,7 +1269,7 @@ const publishApi = (publishes: MarketplaceMyPublish[]): ApiMockTable => ({
   searchMarketplace: searchByKind,
   listMarketplaceInstalled: ok(INSTALLED_ROWS),
   listSkills: ok(MY_SKILLS),
-  getPublicModels: ok(PUBLIC_MODELS),
+  getPublicModels: ok({ models: PUBLIC_MODELS, lockedModels: [] }),
   getDeclarativeManagement: ok(DECLARATIVE_MANAGEMENT),
 })
 

@@ -28,7 +28,6 @@ import { memo, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
   CONTINUE_PROMPT,
-  childSignature,
   defaultCollapsed,
   errorPresentation,
   isLive,
@@ -39,7 +38,8 @@ import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
 import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
-import { ChildBlockView, ProgressivePlainText } from "./AgentGroupCard";
+import { ProgressivePlainText } from "./AgentGroupCard";
+import { DelegateProcessList } from "./delegateProcessList";
 import { Media } from "./media";
 import { ResponseRatingCard } from "./ResponseRating";
 import { TurnActivity, type TurnActivityInfo } from "./TurnActivity";
@@ -516,6 +516,7 @@ export function AssistantCard({
   tokenUsage?: DisplayTokenUsage;
 }) {
   const live = isLive(msg, ctx);
+  if (msg._hideUnpublishedFallback === true) return null;
   const hasError = !!msg._errorCode;
   const presentedError = hasError
     ? errorPresentation(msg._errorCode, msg.text, msg._errorDetail, msg.usage?.waived === true)
@@ -948,7 +949,6 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
   const children = msg.childBlocks ?? [];
   const done = !!msg._completed;
   const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
-  const [visibleChildren, setVisibleChildren] = useState(100);
   const [visibleEntries, setVisibleEntries] = useState(100);
   const collapsed = userCollapsed ?? done;
   const tokenUsage = delegateTokenUsage(msg);
@@ -978,24 +978,8 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
         </span>
       </button>
       {!collapsed && children.length > 0 && (
-        <div className="space-y-2 border-t border-border px-3.5 py-2.5">
-          {children.slice(0, visibleChildren).map((ch, i) => (
-            <ChildBlockView
-              key={`${i}-${ch.blockId ?? ch.kind}`}
-              child={ch}
-              sig={childSignature(ch)}
-              tokenUsage={tokenUsage}
-            />
-          ))}
-          {visibleChildren < children.length && (
-            <button
-              type="button"
-              onClick={() => setVisibleChildren((value) => value + 100)}
-              className="mx-auto block rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
-            >
-              继续加载过程（还有 {children.length - visibleChildren} 条）
-            </button>
-          )}
+        <div className="border-t border-border">
+          <DelegateProcessList childBlocks={children} />
         </div>
       )}
       {!collapsed && entries.length > 0 && (

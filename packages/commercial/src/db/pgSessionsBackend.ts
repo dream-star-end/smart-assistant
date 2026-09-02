@@ -68,6 +68,14 @@ import {
   turnRecoveryIdentity,
   parseSessionWorkspaceMode,
   losslessBillingAnchorId,
+  applyTimelineStamp,
+  copyProcessKeyFromLiveUnits,
+  deriveProcessKeyFromRecord,
+  packEpoch,
+  packTapeSeq,
+  timelineIdentity,
+  EPOCH_BAND,
+  type TimelineLifecycle,
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
@@ -233,6 +241,7 @@ import {
   reconcileLiveStreamWithFinalTape,
   convergeFinalizedTapeLiveStreams,
 } from "./liveTurnFrames.js";
+import { loadSessionLiveCheckpointUnits } from "./liveUnitCheckpoints.js";
 
 // ── BIGINT codec(RFC D7)─────────────────────────────────────────────────────
 // node-postgres 默认把 int8/BIGINT 返回 string(避免 JS number 精度丢失)。这些列全是
@@ -1777,6 +1786,33 @@ function replayMediaIsDurable(media: unknown[]): boolean {
  * tape while its session/dispatch transaction is still open. This is the
  * primary publication path; the table's lineage UNIQUE key makes finalize
  * ACK-loss replays harmless. */
+/** 恢复链放弃时给用户写一张可见终态卡。幂等 id = rootClientMessageId 级:
+ * 同一根消息的多次放弃判定(并发 master/重复 finalize)只落一张卡。 */
+async function appendRecoveryGiveUpTerminalCard(
+  client: PoolClient,
+  input: {
+    sessionId: string;
+    sessionUserId: string;
+    rootClientMessageId: string;
+    reason: "silent_no_progress" | "retry_exhausted";
+  },
+): Promise<void> {
+  const text = input.reason === "silent_no_progress"
+    ? "自动恢复已停止：连续多次从断点恢复都没有取得进展，为避免重复执行已暂停。请直接再发一条消息继续，或新开一个会话。"
+    : "自动恢复已停止：已达到自动恢复次数上限。请直接再发一条消息继续，或新开一个会话。";
+  await pgAppendServerAuthoredCore(client, input.sessionId, input.sessionUserId, {
+    id: `m-recovery-giveup-${input.rootClientMessageId}`,
+    role: "assistant",
+    text,
+    ts: Date.now(),
+    // status:"completed" 是前端把用户角标从「已发送」翻成「已回复」的唯一谓词
+    // (web/modules/messages.js _deriveUserMsgStatus);缺了它这张卡等于没发。
+    status: "completed",
+    _source: "server",
+    _clientMessageId: input.rootClientMessageId,
+  });
+}
+
 async function scheduleAutomaticRecoveryForFinalizedTurn(
   client: PoolClient,
   input: {
@@ -1900,9 +1936,25 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       currentAttempt,
       terminalOutcome: status,
     });
+    // 放弃必须出声:此前这里只置 paused 就返回,前端永远停在「已发送」
+    // (2026-08-31 webmtd63p5mm747zh 实锤)。幂等 id 保证重复放弃只写一张卡。
+    await appendRecoveryGiveUpTerminalCard(client, {
+      sessionId: input.sessionId,
+      sessionUserId: input.sessionUserId,
+      rootClientMessageId,
+      reason: "silent_no_progress",
+    });
     return;
   }
-  if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) return;
+  if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) {
+    await appendRecoveryGiveUpTerminalCard(client, {
+      sessionId: input.sessionId,
+      sessionUserId: input.sessionUserId,
+      rootClientMessageId,
+      reason: "retry_exhausted",
+    });
+    return;
+  }
   const semanticRecoveryAttempt = currentAttempt + 1;
   const identity = turnRecoveryAttemptIdentity(
     input.sessionId,
@@ -4222,6 +4274,27 @@ function directTapeProcessRow(anchor: MessageLike, header: DirectTapeHeader): Me
 }
 
 /**
+ * Hydration readers run 3 correlated cost/waiver subqueries per record row, so
+ * one statement covering an entire fat session (1k+ tapes) can exceed the pool
+ * statement_timeout and kill engine-context recovery reads. Chunk by tapeId so
+ * every single statement stays bounded regardless of session size. Chunks run
+ * sequentially to avoid pool starvation; each chunk is one indexed statement.
+ */
+const HYDRATE_TAPE_ID_CHUNK = 64;
+
+async function runHydrationChunked<R>(
+  ids: string[],
+  fn: (chunk: string[]) => Promise<R[]>,
+): Promise<R[]> {
+  if (ids.length <= HYDRATE_TAPE_ID_CHUNK) return fn(ids);
+  const out: R[] = [];
+  for (let i = 0; i < ids.length; i += HYDRATE_TAPE_ID_CHUNK) {
+    out.push(...await fn(ids.slice(i, i + HYDRATE_TAPE_ID_CHUNK)));
+  }
+  return out;
+}
+
+/**
  * Exact/admin reads hydrate every physical and logical record. Browser chat
  * reads return metadata-only assistant/error locators and add one typed
  * process control before them. Mounted viewport rows fetch exact immutable
@@ -4272,17 +4345,29 @@ async function hydrateTurnTapeMessages(
     readDirectTapeHeaders(pool, sessionId, userId, completeTapeIds),
     deferTimelineNarrative
       ? Promise.resolve([] as HydratedTapeRow[])
-      : readHydratedTapeRows(
-          pool,
-          sessionId,
-          userId,
-          completeTapeIds,
-          exact ? undefined : timelineRoles,
-        ),
+      : runHydrationChunked(completeTapeIds, (chunk) =>
+          readHydratedTapeRows(
+            pool,
+            sessionId,
+            userId,
+            chunk,
+            exact ? undefined : timelineRoles,
+          )),
     deferTimelineNarrative
-      ? readDirectTapeVisibleHeads(pool, sessionId, userId, completeTapeIds)
+      ? runHydrationChunked(completeTapeIds, (chunk) =>
+          readDirectTapeVisibleHeads(pool, sessionId, userId, chunk))
       : Promise.resolve([] as DirectTapeVisibleHead[]),
-    readHydratedTapeRows(pool, sessionId, userId, rollingTapeIds, undefined, rollingRefs),
+    runHydrationChunked(rollingTapeIds, (chunk) => {
+      const chunkSet = new Set(chunk);
+      return readHydratedTapeRows(
+        pool,
+        sessionId,
+        userId,
+        chunk,
+        undefined,
+        rollingRefs.filter((ref) => chunkSet.has(ref.tapeId)),
+      );
+    }),
   ]);
   const rows = [...completeRows, ...rollingRows];
   const byKey = new Map(rows.map((row) => [`${row.tape_id}\0${row.msg_id}`, row]));
@@ -5437,13 +5522,76 @@ async function hasCompletedClientTurnImpl(
   }
 }
 
+function identityFieldsOf(record: MessageLike): import("@openclaude/protocol").EngineIdentityFields {
+  return {
+    role: typeof record.role === "string" ? record.role : undefined,
+    messageId: typeof record.messageId === "string" ? record.messageId : undefined,
+    blockId: typeof record.blockId === "string" ? record.blockId : undefined,
+    runId: typeof record.runId === "string" ? record.runId : undefined,
+    jobId: typeof record.jobId === "string" ? record.jobId : undefined,
+    requestId: typeof record.requestId === "string" ? record.requestId : undefined,
+    _delegateRunId: typeof record._delegateRunId === "string" ? record._delegateRunId : undefined,
+    _timelineProcessKey: typeof record._timelineProcessKey === "string"
+      ? record._timelineProcessKey
+      : undefined,
+    _turnTapeId: typeof record._turnTapeId === "string" ? record._turnTapeId : undefined,
+    _turnTapeOrdinal: typeof record._turnTapeOrdinal === "number" ? record._turnTapeOrdinal : undefined,
+    _recordOrdinal: typeof record._recordOrdinal === "number" ? record._recordOrdinal : undefined,
+    _timelineLogicalOrdinal: typeof record._timelineLogicalOrdinal === "number"
+      ? record._timelineLogicalOrdinal
+      : undefined,
+    _clientMessageId: typeof record._clientMessageId === "string" ? record._clientMessageId : undefined,
+    _turnOwnerId: typeof record._turnOwnerId === "string" ? record._turnOwnerId : undefined,
+  };
+}
+
+/** Stamp hydrated MessageLike fields only. Never rewrite tape BYTEA / content_sha256. */
+function stampTapeLifecycle(
+  record: MessageLike,
+  lifecycle: TimelineLifecycle,
+  opts: {
+    processKey?: string;
+    historyRevision?: number;
+    ordinal?: number;
+    exactBit?: 0 | 1;
+    liveUnits?: import("@openclaude/protocol").LiveProcessIdentitySeed[];
+    sameRoleIndex?: number;
+    logicalIndex?: number;
+  } = {},
+): MessageLike {
+  const fields = identityFieldsOf(record);
+  const owner = fields._turnOwnerId || fields._clientMessageId || "";
+  const role = fields.role || "";
+  const ordinal = opts.ordinal ?? (
+    typeof record._recordOrdinal === "number"
+      ? record._recordOrdinal
+      : typeof record._turnTapeOrdinal === "number"
+        ? record._turnTapeOrdinal
+        : 0
+  );
+  const copied = opts.liveUnits
+    ? copyProcessKeyFromLiveUnits(opts.liveUnits, fields, opts.sameRoleIndex ?? 0)
+    : undefined;
+  const processKey = opts.processKey
+    ?? copied
+    ?? deriveProcessKeyFromRecord(fields, typeof record._turnTapeId === "string" ? record._turnTapeId : undefined, ordinal, opts.logicalIndex);
+  const seq = packTapeSeq(opts.historyRevision ?? 0, ordinal);
+  const exactBit = opts.exactBit ?? (lifecycle === "exact_displayable" ? 1 : 0);
+  return applyTimelineStamp(record as Record<string, unknown>, {
+    _lifecycle: lifecycle,
+    _lifecycleEpoch: packEpoch(EPOCH_BAND.TAPE, 0, seq, exactBit),
+    _timelineIdentity: timelineIdentity(String(owner), role, processKey),
+    _timelineProcessKey: processKey,
+  }) as MessageLike;
+}
+
 function deferredTapeRecord(
   tapeId: string,
   tapeSha256: string,
   head: { msg_id: string; ordinal: number; role: string; ts: string; content_sha256?: string },
   payloadBytes: number,
 ): MessageLike {
-  return {
+  return stampTapeLifecycle({
     id: head.msg_id,
     role: head.role,
     text: "",
@@ -5458,7 +5606,7 @@ function deferredTapeRecord(
     _payloadDeferred: true,
     _payloadBytes: payloadBytes,
     ...(head.content_sha256 ? { _payloadSha256: head.content_sha256 } : {}),
-  };
+  }, "exact_deferred", { ordinal: head.ordinal, exactBit: 0 });
 }
 
 type DirectTapePageHead = {
@@ -6117,7 +6265,7 @@ function unifiedTimelineTapeFallbackMessages(
   const ts = typeof head?.ts === "number" && Number.isFinite(head.ts)
     ? head.ts
     : (typeof unit.anchor.ts === "number" && Number.isFinite(unit.anchor.ts) ? unit.anchor.ts : 0);
-  return [attachFallbackSettlementUsage({
+  return [stampTapeLifecycle(attachFallbackSettlementUsage({
     id,
     role: "assistant",
     text: picked.text,
@@ -6145,7 +6293,11 @@ function unifiedTimelineTapeFallbackMessages(
     ...(typeof head?.errorCode === "string" ? { _errorCode: head.errorCode } : {}),
     ...(reason === "records_unpublished" ? { _recordsPending: true } : {}),
     ...(head?.partial === true ? { _visibleHeadPartial: true } : {}),
-  }, unit.header, unit.anchor.usage)];
+  }, unit.header, unit.anchor.usage), "phase_a", {
+    processKey: "",
+    historyRevision: unit.orderSeq,
+    exactBit: 0,
+  })];
 }
 
 async function hydrateUnifiedTimelineTapeUnits(
@@ -6156,6 +6308,8 @@ async function hydrateUnifiedTimelineTapeUnits(
 ): Promise<Map<string, MessageLike[]>> {
   const result = new Map<string, MessageLike[]>();
   if (units.length === 0) return result;
+  const liveUnits = await loadSessionLiveCheckpointUnits(client, sessionId, userId);
+  const roleIndex = new Map<string, number>();
   const tapeIds = [...new Set(units.map((unit) => unit.header.tapeId))];
   const billingHeads = await readDirectTapeVisibleHeads(client, sessionId, userId, tapeIds);
   const billingByTape = new Map(billingHeads.map((head) => [head.tape_id, head]));
@@ -6310,7 +6464,32 @@ async function hydrateUnifiedTimelineTapeUnits(
       _timelineRecord: true,
       _timelineLogicalOrdinal: logicalIndex,
       _timelineUnitKey: timelineTapeKey(header.tapeId, head.ordinal, logicalIndex, record.id),
-    }));
+    })).map((record) => {
+      const row = record as MessageLike;
+      const deferred = row._payloadDeferred === true;
+      const owner = typeof row._turnOwnerId === "string" && row._turnOwnerId
+        ? row._turnOwnerId
+        : typeof row._clientMessageId === "string" ? row._clientMessageId : "";
+      const role = typeof row.role === "string" ? row.role : "";
+      const idxKey = `${owner}\0${role}`;
+      const sameRoleIndex = roleIndex.get(idxKey) ?? 0;
+      roleIndex.set(idxKey, sameRoleIndex + 1);
+      const logicalIndex = typeof row._timelineLogicalOrdinal === "number"
+        ? row._timelineLogicalOrdinal
+        : 0;
+      return stampTapeLifecycle(
+        row,
+        deferred ? "exact_deferred" : "exact_displayable",
+        {
+          historyRevision: unit.orderSeq,
+          ordinal: head.ordinal,
+          exactBit: deferred ? 0 : 1,
+          liveUnits,
+          sameRoleIndex,
+          logicalIndex,
+        },
+      );
+    });
     result.set(physicalKey, logicalRecords);
     } catch (error) {
       result.set(physicalKey, unifiedTimelineTapeFallbackMessages(sessionId, {
@@ -12246,4 +12425,21 @@ async function sweepOnce(
     pendingUnreachableExpired: delUnreachable.rowCount ?? 0,
     tapePartsPurged: delParts.rowCount ?? 0,
   };
+}
+
+/**
+ * cron origin-session inject 用的单行索引读:只取 model_id,不 hydrate 会话。
+ * client_sessions 属 master 六张权威表,直读 SQL 只允许落在本 backend
+ * (sixTablesSqlArchitecture 门);userChatBridge.lookupCronOriginSessionModel 委托到这里。
+ */
+export async function readClientSessionModelId(
+  pool: Pick<Pool, "query">,
+  sessionId: string,
+  sessionUserId: string,
+): Promise<string | null> {
+  const res = await pool.query<{ model_id: string | null }>(
+    "SELECT model_id FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+    [sessionId, sessionUserId],
+  );
+  return res.rows[0]?.model_id ?? null;
 }

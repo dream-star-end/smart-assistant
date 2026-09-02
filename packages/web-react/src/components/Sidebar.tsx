@@ -774,7 +774,7 @@ export function Sidebar({
                 </DropdownMenuItem>
               )}
               {showAdmin && (
-                <DropdownMenuItem asChild>
+                <DropdownMenuItem asChild data-product-control>
                   <a data-product-control href="/admin.html">
                     <ShieldCheck size={16} className="shrink-0 text-muted" />
                     管理后台

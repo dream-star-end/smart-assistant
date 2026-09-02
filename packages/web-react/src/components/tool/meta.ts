@@ -44,6 +44,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { agentDisplayName } from "../chat/agentNames";
+import { searchExtraToolsQuery } from "../../lib/chat/extraTool";
 import { mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
 import { asArr, asStr, detectShellFileWrites, parseCodexTypeName, safeSubtaskDescription, shortPath, stripShellWrapperForDisplay } from "./format";
 
@@ -64,6 +65,10 @@ const TOOL_META: Record<string, ToolMeta> = {
   McpSearch: { icon: Search, label: "查找工具", tone: "info" },
   search_tool: { icon: Search, label: "查找工具", tone: "info" },
   use_tool: { icon: Plug, label: "调用工具", tone: "info" },
+  // CCB 延迟工具包装:SearchExtraTools 找工具;ExecuteExtraTool 正常由展示层拆成内层工具,
+  // 只有 tool_name 还没流到时才会以包装名落到这里。
+  SearchExtraTools: { icon: Search, label: "查找工具", tone: "info" },
+  ExecuteExtraTool: { icon: Plug, label: "调用工具", tone: "info" },
   TodoWrite: { icon: ListChecks, label: "任务列表", tone: "accent" },
   NotebookEdit: { icon: NotebookPen, label: "笔记本", tone: "neutral" },
   Task: { icon: Bot, label: "子任务", tone: "accent" },
@@ -84,6 +89,7 @@ const TOOL_META: Record<string, ToolMeta> = {
   TaskStop: { icon: Bot, label: "停止子任务", tone: "warning" },
   delegate_task: { icon: Bot, label: "委托子任务", tone: "accent" },
   delegate_tasks: { icon: Users, label: "并行委派", tone: "accent" },
+  delegate_wait: { icon: Clock, label: "等待委派", tone: "accent" },
 };
 
 const CODEX_TYPE_META: Record<string, ToolMeta> = {
@@ -251,6 +257,7 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:delete_reminder": { icon: Clock, label: "删除定时任务" },
   "openclaude-memory:delegate_task": { icon: Bot, label: "委托子任务" },
   "openclaude-memory:delegate_tasks": { icon: Users, label: "并行委派" },
+  "openclaude-memory:delegate_wait": { icon: Clock, label: "等待委派" },
   "openclaude-memory:send_to_agent": { icon: Send, label: "发送给子 Agent" },
   "openclaude-memory:skill_list": { icon: Sparkles, label: "技能列表" },
   "openclaude-memory:skill_search": { icon: Sparkles, label: "技能检索" },
@@ -267,6 +274,7 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:task_comment": { icon: NotebookPen, label: "任务单评论" },
   "openclaude-memory:task_list": { icon: ListChecks, label: "任务单列表" },
   "openclaude-memory:task_get": { icon: FileText, label: "查看任务单" },
+  "openclaude-memory:task_approve": { icon: ListChecks, label: "批准任务单" },
   // codex 内建 MCP 资源清单(op 无摘要,空态即全部信息)。
   "codex:list_mcp_resources": { icon: Boxes, label: "MCP 资源列表" },
   "codex:list_mcp_resource_templates": { icon: Layers, label: "MCP 资源模板" },
@@ -463,6 +471,15 @@ function ocCommandSummary(cli: OcCli, command: string): string {
   return "";
 }
 
+/** TaskOutput 在等已有后台命令（task_ids / task_id）时标「等待输出」，spawn 结果才叫「子任务结果」。 */
+export function isAwaitingBackgroundOutput(input?: Record<string, unknown> | null): boolean {
+  if (!input) return false;
+  if (typeof input.task_id === "string" && input.task_id.trim()) return true;
+  if (typeof input.task_id === "number" && Number.isFinite(input.task_id)) return true;
+  const ids = input.task_ids;
+  return Array.isArray(ids) && ids.some((id) => id != null && String(id).trim() !== "");
+}
+
 /**
  * 为工具名解析图标 + 标签（处理 MCP 名）。
  * 优先级：builtin > MCP per-op > MCP server 兜底 > 通用扳手。
@@ -471,6 +488,10 @@ export function resolveToolMeta(
   name: string,
   input?: Record<string, unknown> | null,
 ): ToolMeta {
+  if ((name === "TaskOutput" || name === "get_command_or_subagent_output" || name === "get_task_output") &&
+    isAwaitingBackgroundOutput(input)) {
+    return { icon: Clock, label: "等待输出", tone: "accent" };
+  }
   // Bash 命令若调用 oc-* CLI,给专属语义卡而非通用"终端"卡。
   if (isShellToolName(name) && input) {
     // 展示层剥壳兜底(历史消息带 /bin/bash -lc 包装),否则 oc-*/写文件检测在包装内失配。
@@ -554,6 +575,10 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
     case "McpSearch":
     case "search_tool":
       return asStr(input.query).slice(0, 60);
+    case "SearchExtraTools":
+      return searchExtraToolsQuery(input).slice(0, 60);
+    case "ExecuteExtraTool":
+      return asStr(input.tool_name).slice(0, 60);
     case "TodoWrite": {
       const todos = asArr(input.todos);
       const done = todos.filter(
@@ -585,6 +610,8 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
     }
     case "delegate_tasks":
       return delegateTasksSummary(input);
+    case "delegate_wait":
+      return asStr(input.jobId);
   }
   const codexType = parseCodexTypeName(name);
   if (codexType) return codexSummary(codexType, input).slice(0, 80);
@@ -630,6 +657,7 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
       return (asStr(input.message) || asStr(input.label) || asStr(input.id)).slice(0, 50);
     }
     if (op === "delegate_tasks") return delegateTasksSummary(input);
+    if (op === "delegate_wait") return asStr(input.jobId);
     if (op === "delegate_task" || op === "send_to_agent") {
       // 同 toolSummary 的 delegate_task:系统 agent(如 hidden-reviewer)显示映射名而非裸 id。
       const tgt = input.agentId ? `→ ${agentDisplayName(asStr(input.agentId))} ` : "";
@@ -642,7 +670,7 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     if (op === "skill_search") return asStr(input.query);
     if (op === "ask_gpt55_codex") return (asStr(input.goal) || asStr(input.context)).slice(0, 60);
     if (op === "task_create") return asStr(input.title);
-    if (op === "task_update" || op === "task_comment" || op === "task_get") {
+    if (op === "task_update" || op === "task_comment" || op === "task_get" || op === "task_approve") {
       return (asStr(input.id) || asStr(input.identifier) || asStr(input.title)).slice(0, 50);
     }
     if (op === "task_list") return asStr(input.q) || asStr(input.status) || asStr(input.projectId);

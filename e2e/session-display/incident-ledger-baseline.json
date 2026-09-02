@@ -1,0 +1,576 @@
+{
+  "schema": 1,
+  "frozenAt": "2026-09-03",
+  "auroraTip": "362d5041484c818db5e02cd54ec8e338832bf6e7",
+  "selfhostTip": "e047c18020ef1a9d3e7ce4a3fc781ad4d26b3b4b",
+  "incidentIds": [
+    "INC-20260717-HISTORY-STUCK",
+    "INC-20260718-ATTACH-NOOP",
+    "INC-20260718-DISPATCH-LOST",
+    "INC-20260718-FIRST-TURN-REJECTED",
+    "INC-20260718-RESEND-DUPLICATE",
+    "INC-20260718-ZERO-TERMINAL",
+    "INC-20260719-POISONED-IDB-ORDER",
+    "INC-20260719-PROCESS-AFTER-FINAL",
+    "INC-20260720-BASH-TAIL-HIDDEN",
+    "INC-20260721-HISTORICAL-THINKING-OPEN",
+    "INC-20260721-LAZY-TIMELINE-LOSS",
+    "INC-20260721-RUNTIME-RAW-LEAK",
+    "INC-20260721-STAGED-FINALIZE-STUCK",
+    "INC-20260721-WEIBO-IMAGE-BROKEN",
+    "INC-20260721-WEIBO-WORKER-OOM",
+    "INC-20260722-FINALIZE-GLOBAL-BLOCK",
+    "INC-20260723-ASK-MARKDOWN-DEADEND",
+    "INC-20260723-E2E-MODEL-DRIFT",
+    "INC-20260723-FINALIZE-STALE-ACTIVE",
+    "INC-20260723-KIMI-QUOTA-EXHAUSTED",
+    "INC-20260723-LEASE-DISPATCH-UNLINKED",
+    "INC-20260723-PG-NUL-SIDECAR",
+    "INC-20260723-RUNTIME-FINALIZE-UNBOUNDED",
+    "INC-20260725-CONTEXT-OVERFLOW",
+    "INC-20260725-LEGACY-RECOVERY-LOOP",
+    "INC-20260725-RECOVERY-RETRY-LOOP",
+    "INC-20260725-STOP-RETRY-LINEAGE",
+    "INC-20260725-USER-IMPACT-LOOPS",
+    "INC-20260726-ARCHIVE-CURSOR-OVERFLOW",
+    "INC-20260728-AUTODREAM-USAGE-SIDEBAND",
+    "INC-20260728-WEIBO-QR-HIDDEN",
+    "INC-20260803-MOBILE-WECHAT-QR",
+    "INC-20260804-DEPLOY-RETRY-RECOVERY",
+    "INC-20260804-NEW-USER-FREE-CREDITS",
+    "INC-20260804-QWEN38-CODEX-ADAPTER",
+    "INC-20260804-RETRY-ERROR-REDCARD",
+    "INC-20260805-OCR-CLI-PATH",
+    "INC-20260805-OCR-SMOKE-STDIN",
+    "INC-20260805-OCR-TUNNEL-IDLE",
+    "INC-20260805-V5-IP-RETRY-TX",
+    "INC-20260807-CLIENT-ERROR-REPLAY",
+    "INC-20260807-LIVE-PROCESS-LOSS",
+    "INC-20260808-CRON-INBOX-DELIVERY",
+    "INC-20260808-WEIBO-RELINK",
+    "INC-20260809-CCB-CONTEXT-OVERFLOW",
+    "INC-20260810-AUTODREAM-STALE-REPORT",
+    "INC-20260810-LIVE-FRAME-SEQUENCE-RESET",
+    "INC-20260810-LIVE-TURN-VISIBILITY",
+    "INC-20260810-TURN-WAIVER-PARAM-TYPE",
+    "INC-20260811-INTERRUPTED-TOOL-STATUS",
+    "INC-20260812-H3-WORKER-MIGRATION-CANCEL",
+    "INC-20260813-CURSOR-AUTHORITY-REJECTED",
+    "INC-20260813-CURSOR-STREAM-JSON",
+    "INC-20260813-GROK-AUTHORITY-REJECTED",
+    "INC-20260813-LIVE-REPLAY-GENERATION",
+    "INC-20260814-CURSOR-HOTCFG-WRAPPER",
+    "INC-20260815-ENGINE-STOP-DRAIN-HANG",
+    "INC-20260815-ZAI-AUDIT-JSON-NULL",
+    "INC-20260821-SESSION-LIST-NUL-READ-STORM",
+    "INC-20260822-GROK-TOOL-JSON-CARD-LEAK",
+    "INC-20260823-SELFHOST-AUDIT-CLOSURE",
+    "INC-20260823-TAPE-ANCHOR-DRIFT",
+    "INC-20260824-AUTOMATIC-WAIVER-LOOP",
+    "INC-20260825-HOST-FULL-POOL-SATURATION",
+    "INC-20260826-UPLOAD-COLDSTART-503",
+    "INC-20260827-LIVE-RESET-PROCESS-VANISH",
+    "INC-20260827-PAPER-HINT-LEAK",
+    "INC-20260827-PHASE-B-DEFER-VANISH",
+    "INC-20260827-WEIBO-ERRCODE-ACTIONABLE",
+    "INC-20260827-WEIBO-SETUP-PIN-DRIFT",
+    "INC-20260828-CCB-PROMPT-TOO-LONG",
+    "INC-20260829-CUTOVER-SURVIVOR-STALE-WD",
+    "INC-20260831-TURNEND-ORDER-COLLAPSE",
+    "INC-20260831-CURSOR-MCP-DELEGATE-CONTEXT",
+    "INC-20260831-DELEGATE-MODEL-UNKNOWN",
+    "INC-20260831-VISIBLE-ORPHAN-FALSE-KILL",
+    "INC-20260901-CURSOR-SAND-INFERENCE",
+    "INC-20260902-TIMELINE-PAINT-VISION-HINT",
+    "INC-20260902-CCB-DEFERRED-TOOL-ADAPT",
+    "INC-20260902-WEB-TASKBOARD-TIMELINE-HUD",
+    "INC-20260902-DELEGATE-ENGINE-BILLING-REQUESTID",
+    "INC-20260829-FAIL-LOUD-ERROR-MSG"
+  ],
+  "incidents": {
+    "INC-20260717-HISTORY-STUCK": {
+      "rootFixCommit": "e6f89f7e",
+      "coverageCommits": []
+    },
+    "INC-20260718-ATTACH-NOOP": {
+      "rootFixCommit": "1ebb9e07",
+      "coverageCommits": []
+    },
+    "INC-20260718-DISPATCH-LOST": {
+      "rootFixCommit": "8a655b2c",
+      "coverageCommits": []
+    },
+    "INC-20260718-FIRST-TURN-REJECTED": {
+      "rootFixCommit": "9cbbb1df",
+      "coverageCommits": [
+        "137c6a67"
+      ]
+    },
+    "INC-20260718-RESEND-DUPLICATE": {
+      "rootFixCommit": "f53dd893",
+      "coverageCommits": []
+    },
+    "INC-20260718-ZERO-TERMINAL": {
+      "rootFixCommit": "5b243bcb",
+      "coverageCommits": []
+    },
+    "INC-20260719-POISONED-IDB-ORDER": {
+      "rootFixCommit": "5e4f0481",
+      "coverageCommits": []
+    },
+    "INC-20260719-PROCESS-AFTER-FINAL": {
+      "rootFixCommit": "575fcf42",
+      "coverageCommits": []
+    },
+    "INC-20260720-BASH-TAIL-HIDDEN": {
+      "rootFixCommit": "f3261725",
+      "coverageCommits": []
+    },
+    "INC-20260721-HISTORICAL-THINKING-OPEN": {
+      "rootFixCommit": "0f416b5c",
+      "coverageCommits": []
+    },
+    "INC-20260721-LAZY-TIMELINE-LOSS": {
+      "rootFixCommit": "e198a9f8",
+      "coverageCommits": []
+    },
+    "INC-20260721-RUNTIME-RAW-LEAK": {
+      "rootFixCommit": "02737240",
+      "coverageCommits": []
+    },
+    "INC-20260721-STAGED-FINALIZE-STUCK": {
+      "rootFixCommit": "5790a7e6",
+      "coverageCommits": []
+    },
+    "INC-20260721-WEIBO-IMAGE-BROKEN": {
+      "rootFixCommit": "efabb603",
+      "coverageCommits": [
+        "53a4e840",
+        "e7f96b4d",
+        "60e024ab",
+        "7558fc12"
+      ]
+    },
+    "INC-20260721-WEIBO-WORKER-OOM": {
+      "rootFixCommit": "869fb3c9",
+      "coverageCommits": []
+    },
+    "INC-20260722-FINALIZE-GLOBAL-BLOCK": {
+      "rootFixCommit": "f48441b5",
+      "coverageCommits": []
+    },
+    "INC-20260723-ASK-MARKDOWN-DEADEND": {
+      "rootFixCommit": "cd6b7f71",
+      "coverageCommits": []
+    },
+    "INC-20260723-E2E-MODEL-DRIFT": {
+      "rootFixCommit": "5f2f96b7",
+      "coverageCommits": []
+    },
+    "INC-20260723-FINALIZE-STALE-ACTIVE": {
+      "rootFixCommit": "b9a1773c",
+      "coverageCommits": []
+    },
+    "INC-20260723-KIMI-QUOTA-EXHAUSTED": {
+      "rootFixCommit": "7476df04",
+      "coverageCommits": []
+    },
+    "INC-20260723-LEASE-DISPATCH-UNLINKED": {
+      "rootFixCommit": "5f2f96b7",
+      "coverageCommits": []
+    },
+    "INC-20260723-PG-NUL-SIDECAR": {
+      "rootFixCommit": "7904bcf9",
+      "coverageCommits": []
+    },
+    "INC-20260723-RUNTIME-FINALIZE-UNBOUNDED": {
+      "rootFixCommit": "5ade39bf",
+      "coverageCommits": []
+    },
+    "INC-20260725-CONTEXT-OVERFLOW": {
+      "rootFixCommit": "e5f5abe3",
+      "coverageCommits": [
+        "4617f2a5",
+        "30f2ed7a",
+        "edef2d27"
+      ]
+    },
+    "INC-20260725-LEGACY-RECOVERY-LOOP": {
+      "rootFixCommit": "40281ce9",
+      "coverageCommits": [
+        "d7817e40"
+      ]
+    },
+    "INC-20260725-RECOVERY-RETRY-LOOP": {
+      "rootFixCommit": "83681d59",
+      "coverageCommits": [
+        "8f04bb2d"
+      ]
+    },
+    "INC-20260725-STOP-RETRY-LINEAGE": {
+      "rootFixCommit": "6796ff82",
+      "coverageCommits": [
+        "d007c3d7",
+        "016019a0",
+        "6e02eacf",
+        "11882440",
+        "4e601005"
+      ]
+    },
+    "INC-20260725-USER-IMPACT-LOOPS": {
+      "rootFixCommit": "29503944",
+      "coverageCommits": [
+        "0b928cb5",
+        "cc33f30d",
+        "51eda7ca"
+      ]
+    },
+    "INC-20260726-ARCHIVE-CURSOR-OVERFLOW": {
+      "rootFixCommit": "c5031461",
+      "coverageCommits": []
+    },
+    "INC-20260728-AUTODREAM-USAGE-SIDEBAND": {
+      "rootFixCommit": "506874f2",
+      "coverageCommits": []
+    },
+    "INC-20260728-WEIBO-QR-HIDDEN": {
+      "rootFixCommit": "9027a6da",
+      "coverageCommits": [
+        "72e134df"
+      ]
+    },
+    "INC-20260803-MOBILE-WECHAT-QR": {
+      "rootFixCommit": "d5208edd",
+      "coverageCommits": []
+    },
+    "INC-20260804-DEPLOY-RETRY-RECOVERY": {
+      "rootFixCommit": "6ef8add7",
+      "coverageCommits": []
+    },
+    "INC-20260804-NEW-USER-FREE-CREDITS": {
+      "rootFixCommit": "aa74a0eb",
+      "coverageCommits": []
+    },
+    "INC-20260804-QWEN38-CODEX-ADAPTER": {
+      "rootFixCommit": "ece3f5f8",
+      "coverageCommits": [
+        "7767576a",
+        "7f0d03eb",
+        "eb3bd177"
+      ]
+    },
+    "INC-20260804-RETRY-ERROR-REDCARD": {
+      "rootFixCommit": "aa583b70",
+      "coverageCommits": [
+        "0ced65d4",
+        "d500d037",
+        "820b5c34"
+      ]
+    },
+    "INC-20260805-OCR-CLI-PATH": {
+      "rootFixCommit": "ee3b2e6e",
+      "coverageCommits": [
+        "c8b146e9"
+      ]
+    },
+    "INC-20260805-OCR-SMOKE-STDIN": {
+      "rootFixCommit": "e3958999",
+      "coverageCommits": []
+    },
+    "INC-20260805-OCR-TUNNEL-IDLE": {
+      "rootFixCommit": "ef5bc3e8",
+      "coverageCommits": []
+    },
+    "INC-20260805-V5-IP-RETRY-TX": {
+      "rootFixCommit": "43da0df4",
+      "coverageCommits": []
+    },
+    "INC-20260807-CLIENT-ERROR-REPLAY": {
+      "rootFixCommit": "03adb5f1",
+      "coverageCommits": [
+        "788ecc51",
+        "6ac77ac1",
+        "58dacb06",
+        "e6930cfe",
+        "793f7fe2",
+        "f50bbc59",
+        "01a0f277",
+        "67d8ed4e"
+      ]
+    },
+    "INC-20260807-LIVE-PROCESS-LOSS": {
+      "rootFixCommit": "640ed19b",
+      "coverageCommits": [
+        "120e850d"
+      ]
+    },
+    "INC-20260808-CRON-INBOX-DELIVERY": {
+      "rootFixCommit": "48717c15",
+      "coverageCommits": []
+    },
+    "INC-20260808-WEIBO-RELINK": {
+      "rootFixCommit": "169c06f7",
+      "coverageCommits": []
+    },
+    "INC-20260809-CCB-CONTEXT-OVERFLOW": {
+      "rootFixCommit": "1b7c4c07",
+      "coverageCommits": [
+        "3ef0ecec"
+      ]
+    },
+    "INC-20260810-AUTODREAM-STALE-REPORT": {
+      "rootFixCommit": "27611390",
+      "coverageCommits": [
+        "da945b0c",
+        "d7d746c7"
+      ]
+    },
+    "INC-20260810-LIVE-FRAME-SEQUENCE-RESET": {
+      "rootFixCommit": "6d2c930c",
+      "coverageCommits": [
+        "bab6c8c6",
+        "d8b81aae",
+        "54014c3d",
+        "d76aae91"
+      ]
+    },
+    "INC-20260810-LIVE-TURN-VISIBILITY": {
+      "rootFixCommit": "6d4e70b1",
+      "coverageCommits": []
+    },
+    "INC-20260810-TURN-WAIVER-PARAM-TYPE": {
+      "rootFixCommit": "eef1a6c1",
+      "coverageCommits": [
+        "5c781c06",
+        "7667982a"
+      ]
+    },
+    "INC-20260811-INTERRUPTED-TOOL-STATUS": {
+      "rootFixCommit": "276bd969",
+      "coverageCommits": []
+    },
+    "INC-20260812-H3-WORKER-MIGRATION-CANCEL": {
+      "rootFixCommit": "abffc3ab",
+      "coverageCommits": [
+        "702885fd",
+        "b6234527"
+      ]
+    },
+    "INC-20260813-CURSOR-AUTHORITY-REJECTED": {
+      "rootFixCommit": "db7332ff",
+      "coverageCommits": []
+    },
+    "INC-20260813-CURSOR-STREAM-JSON": {
+      "rootFixCommit": "f63f06c1",
+      "coverageCommits": [
+        "35defe79",
+        "96b40ae5",
+        "dd86a3e8",
+        "793ad326",
+        "523c09af",
+        "ba962e0c"
+      ]
+    },
+    "INC-20260813-GROK-AUTHORITY-REJECTED": {
+      "rootFixCommit": "78eaad0b",
+      "coverageCommits": []
+    },
+    "INC-20260813-LIVE-REPLAY-GENERATION": {
+      "rootFixCommit": "7d44e0a4",
+      "coverageCommits": []
+    },
+    "INC-20260814-CURSOR-HOTCFG-WRAPPER": {
+      "rootFixCommit": "e5486e43",
+      "coverageCommits": []
+    },
+    "INC-20260815-ENGINE-STOP-DRAIN-HANG": {
+      "rootFixCommit": "425b283a",
+      "coverageCommits": [
+        "5a5aa310",
+        "b48f8b73",
+        "5adf5d6f"
+      ]
+    },
+    "INC-20260815-ZAI-AUDIT-JSON-NULL": {
+      "rootFixCommit": "2948a259",
+      "coverageCommits": []
+    },
+    "INC-20260821-SESSION-LIST-NUL-READ-STORM": {
+      "rootFixCommit": "c04a6e14",
+      "coverageCommits": [
+        "40fa7030"
+      ]
+    },
+    "INC-20260822-GROK-TOOL-JSON-CARD-LEAK": {
+      "rootFixCommit": "b4404d1d",
+      "coverageCommits": []
+    },
+    "INC-20260823-SELFHOST-AUDIT-CLOSURE": {
+      "rootFixCommit": "4a564bc8",
+      "coverageCommits": [
+        "eaa0a406",
+        "8aa58948"
+      ]
+    },
+    "INC-20260823-TAPE-ANCHOR-DRIFT": {
+      "rootFixCommit": "4d41029d",
+      "coverageCommits": []
+    },
+    "INC-20260824-AUTOMATIC-WAIVER-LOOP": {
+      "rootFixCommit": "51cecd2a",
+      "coverageCommits": []
+    },
+    "INC-20260825-HOST-FULL-POOL-SATURATION": {
+      "rootFixCommit": "c1598ce6",
+      "coverageCommits": [
+        "d0171a2d",
+        "9d5aca4d"
+      ]
+    },
+    "INC-20260826-UPLOAD-COLDSTART-503": {
+      "rootFixCommit": "dc2e4623",
+      "coverageCommits": []
+    },
+    "INC-20260827-LIVE-RESET-PROCESS-VANISH": {
+      "rootFixCommit": "75a50179",
+      "coverageCommits": []
+    },
+    "INC-20260827-PAPER-HINT-LEAK": {
+      "rootFixCommit": "a1414343",
+      "coverageCommits": []
+    },
+    "INC-20260827-PHASE-B-DEFER-VANISH": {
+      "rootFixCommit": "0002df13",
+      "coverageCommits": []
+    },
+    "INC-20260827-WEIBO-ERRCODE-ACTIONABLE": {
+      "rootFixCommit": "0d4d8d09",
+      "coverageCommits": [
+        "b5b2820d"
+      ]
+    },
+    "INC-20260827-WEIBO-SETUP-PIN-DRIFT": {
+      "rootFixCommit": "9c542d82",
+      "coverageCommits": [
+        "8807ea1a"
+      ]
+    },
+    "INC-20260828-CCB-PROMPT-TOO-LONG": {
+      "rootFixCommit": "0633e7a7",
+      "coverageCommits": []
+    },
+    "INC-20260829-CUTOVER-SURVIVOR-STALE-WD": {
+      "rootFixCommit": "2190563c",
+      "coverageCommits": null
+    },
+    "INC-20260831-TURNEND-ORDER-COLLAPSE": {
+      "rootFixCommit": "46380d50",
+      "coverageCommits": null
+    },
+    "INC-20260831-CURSOR-MCP-DELEGATE-CONTEXT": {
+      "rootFixCommit": "1bfa85be",
+      "coverageCommits": [
+        "886e4dfa",
+        "6ea6b0f0",
+        "75f9953e"
+      ]
+    },
+    "INC-20260831-DELEGATE-MODEL-UNKNOWN": {
+      "rootFixCommit": "8170334e",
+      "coverageCommits": [
+        "886e4dfa",
+        "eb5a0758"
+      ]
+    },
+    "INC-20260831-VISIBLE-ORPHAN-FALSE-KILL": {
+      "rootFixCommit": "19e9d471",
+      "coverageCommits": [
+        "3e80a4a7",
+        "568fb53b",
+        "1c7e4aae",
+        "2295a322",
+        "bfcc174e"
+      ]
+    },
+    "INC-20260901-CURSOR-SAND-INFERENCE": {
+      "rootFixCommit": "a5da8cea",
+      "coverageCommits": [
+        "8a92b682",
+        "4d678dda",
+        "cfb6c7c6",
+        "968f4836",
+        "ccc58f05",
+        "a32e9bb6",
+        "38596146",
+        "5834df20",
+        "4c423197",
+        "42c51537",
+        "9cc8dedc",
+        "cd25a50a",
+        "cd7ec21d",
+        "5ff831e4",
+        "a5da8cea",
+        "e3f11e62"
+      ]
+    },
+    "INC-20260902-TIMELINE-PAINT-VISION-HINT": {
+      "rootFixCommit": "db14273e",
+      "coverageCommits": [
+        "db14273e",
+        "2a38336c"
+      ]
+    },
+    "INC-20260902-CCB-DEFERRED-TOOL-ADAPT": {
+      "rootFixCommit": "58ae7303",
+      "coverageCommits": [
+        "84849fd5",
+        "b70cfd0b",
+        "26eb5dc9",
+        "c0a871bf",
+        "5885ecfe",
+        "f5b267e9"
+      ]
+    },
+    "INC-20260902-WEB-TASKBOARD-TIMELINE-HUD": {
+      "rootFixCommit": "51674b8c",
+      "coverageCommits": [
+        "51674b8c",
+        "226edfac",
+        "d18bd587"
+      ]
+    },
+    "INC-20260902-DELEGATE-ENGINE-BILLING-REQUESTID": {
+      "rootFixCommit": "654ca01f",
+      "coverageCommits": [
+        "654ca01f",
+        "97677249",
+        "de1dd178",
+        "6c2ee090"
+      ]
+    },
+    "INC-20260829-FAIL-LOUD-ERROR-MSG": {
+      "rootFixCommit": "2491a190",
+      "coverageCommits": [
+        "1eae3d23",
+        "5806c952",
+        "ec03f2b1"
+      ]
+    }
+  },
+  "importedTrailerHistoryTips": [
+    "7ad3910346d03f072db5b4debd9e29b43f13de30",
+    "5ecb3ead3fb07d8506d62c0d3ffc282d0170ae61",
+    "655a47da520b87419353774bb9ffd77290a05460",
+    "e1077dfd4b99ff28dd17cb77e627e5bc534e738e",
+    "28962cf36f60afdf3cca10f5a6d51beafcea2724",
+    "654a56f0b370cf5b1530e9861b79d7d10976f836",
+    "8747865996b5075e19d6aad5c9bf54bca72d0c01",
+    "e9496b17426877f5163cdbb37ffaa3d4b255bff9",
+    "58ae730303f3ad11d56e15fea49270256ee0c6e8",
+    "ce6b91692c8b87a59be81e50fdc145e0da045ace",
+    "7a5617aaa50f06d13d2b9da8ec8d3d2e4a5d2a25"
+  ],
+  "historicallyPresentIds": [
+    "INC-20260827-PHASE-B-DEFER-VANISH"
+  ]
+}

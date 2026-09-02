@@ -49,12 +49,16 @@ SANDBOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # 本脚本所在�
 # Present in this tree → subsequent builds keep ZCode/Grok/Cursor/Codex pins.
 # agent-sandbox -> commercial -> packages -> repo root (three levels, not two).
 SELHOST_BUILD_ENV="$(cd "$SANDBOX_DIR/../../.." && pwd)/deploy/v5-selfhost/runtime-build.env"
-if [ -f "$SELHOST_BUILD_ENV" ]; then
-  echo "[build-image] sourcing persistent profile $SELHOST_BUILD_ENV"
+# OCV5-20 §2.9.2: do not source selfhost pins just because the file exists.
+# Explicit OC_FLAVOR=selfhost (or --flavor via OC_FLAVOR) required; default = commercial pins.
+if [ "${OC_FLAVOR:-}" = "selfhost" ] && [ -f "$SELHOST_BUILD_ENV" ]; then
+  echo "[build-image] sourcing persistent profile $SELHOST_BUILD_ENV (OC_FLAVOR=selfhost)"
   set -a
   # shellcheck disable=SC1090
   . "$SELHOST_BUILD_ENV"
   set +a
+elif [ -f "$SELHOST_BUILD_ENV" ]; then
+  echo "[build-image] skip $SELHOST_BUILD_ENV (set OC_FLAVOR=selfhost to source)"
 fi
 BUILD_CTX="/tmp/oc-runtime-build"
 IMAGE_REPO="openclaude/openclaude-runtime"

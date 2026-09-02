@@ -18,7 +18,8 @@ import {
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { EngineAdapter, EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
-import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
+import type { EngineBillingEvent, EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
+import { engineSessionId } from './engineSessionId.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { classifyRunError } from '../errorClassify.js'
@@ -32,6 +33,7 @@ import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { issueDelegateContextToken } from '../delegateContext.js'
 import { formatPresentOptionsFence } from './presentOptions.js'
+import { CursorRoutingAdapter } from './cursorRoutingAdapter.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
 
 const log = createLogger({ module: 'cursorAdapter' })
@@ -503,6 +505,13 @@ function parseLastJsonlObjects(tail: string, maxRecords = 12): Record<string, un
 function toolProgressFromArgs(toolName: string, args: Record<string, unknown> | null): string {
   const name = toolName.trim() || 'Tool'
   if (!args) return name
+  // CCB deferred-tool wrapper: report the inner tool (`mcp__…__delegate_task …`)
+  // so the live activity row can classify it instead of showing "ExecuteExtraTool".
+  if (/^execute[-_]?extra[-_]?tool$/i.test(name)) {
+    const inner = textOf(args.tool_name ?? args.toolName)
+    const params = recordOf(args.params ?? args.arguments ?? args.input)
+    if (inner) return toolProgressFromArgs(inner, params)
+  }
   const filePath = textOf(args.path ?? args.file_path ?? args.filePath ?? args.targetDirectory)
   const pattern = textOf(args.pattern ?? args.query ?? args.searchTerm ?? args.globPattern)
   const command = textOf(args.command)
@@ -1336,6 +1345,7 @@ function validateCursorFinalPrompt(prompt: string, payloadBytes: number): void {
 interface CursorMemoryMcpConfigInput {
   launch: McpMemoryLaunch
   tokenFile: string
+  delegateContextFile: string
   agentId: string
   projectId?: string
   sessionKey: string
@@ -1354,6 +1364,7 @@ function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<s
     OPENCLAUDE_SESSION_KEY: input.sessionKey,
     OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
     OPENCLAUDE_GATEWAY_TOKEN_FILE: input.tokenFile,
+    OPENCLAUDE_DELEGATE_CONTEXT_FILE: input.delegateContextFile,
     OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),
     OPENCLAUDE_ENGINE: 'cursor',
     ...(process.env.OPENCLAUDE_HOME ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME } : {}),
@@ -1425,6 +1436,20 @@ export function attachCursorGatewayRouting(
 }
 
 export const CURSOR_CHATS_DIR_NAME = 'cursor-chats'
+export const CURSOR_SAND_RESUME_PREFIX = 'sand-ccb:'
+const CURSOR_RESUME_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export function isCursorSandResumeId(sessionId: string | null | undefined): sessionId is string {
+  return typeof sessionId === 'string' && sessionId.startsWith(CURSOR_SAND_RESUME_PREFIX)
+}
+
+/** Sand runs the Cursor model through a CCB agent loop. Its durable resume id
+ * therefore lives in CLAUDE_CONFIG_DIR, not Cursor's chats/<cwd-hash> store. */
+export function cursorSandResumeInnerId(sessionId: string | null | undefined): string | undefined {
+  if (!isCursorSandResumeId(sessionId)) return undefined
+  const inner = sessionId.slice(CURSOR_SAND_RESUME_PREFIX.length)
+  return CURSOR_RESUME_ID_RE.test(inner) ? inner : undefined
+}
 
 /** Durable Cursor chat store, deliberately OUTSIDE the per-turn ephemeral HOME
  *  so resume survives while auth.json/JWT still dies with the turn. */
@@ -1468,7 +1493,6 @@ export function cursorResumeStoreDir(workspacePath: string, sessionId: string): 
   return dirname(cursorResumeStorePath(workspacePath, sessionId))
 }
 
-const CURSOR_RESUME_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const WEBCHAT_DM_SESSION_RE = /:webchat:dm:([A-Za-z0-9_-]{8,50})$/
 
 export function webChatSessionIdFromSessionKey(sessionKey: string): string | undefined {
@@ -1595,7 +1619,14 @@ export function relocateCursorResumeStore(opts: {
     const destDir = cursorResumeStoreDir(currentWorkspacePath, resumeId)
     const destStore = join(destDir, 'store.db')
     if (existsSync(destDir)) {
-      return cursorStoreDbReady(destStore) ? { resumeId, relocated: false } : undefined
+      if (cursorStoreDbReady(destStore)) return { resumeId, relocated: false }
+      // destDir exists but has no usable store.db file. Clear leftover then continue.
+      try {
+        rmSync(destDir, { recursive: true, force: true })
+      } catch {
+        return undefined
+      }
+      if (existsSync(destDir) || cursorStoreDbReady(destStore)) return undefined
     }
 
     const env = opts.env ?? process.env
@@ -1712,6 +1743,8 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     multimodalInput: 'text-only',
   }
   private readonly opts: EngineCreateOpts
+  /** Stable usage_records.session_id for the durable tape billing (same helper as grok/codex). */
+  private readonly stableEngineSessionId: string
   private active: TurnCtx | null = null
   private currentModel: string | undefined
   private currentEffort: string | undefined
@@ -1735,6 +1768,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   constructor(opts: EngineCreateOpts) {
     super()
     this.opts = { ...opts }
+    this.stableEngineSessionId = engineSessionId(opts.sessionKey)
     this.nativeId = opts.resumeSessionId ?? null
     this.setModel(opts.model)
     this.currentToolsets = opts.agentToolsets
@@ -1889,6 +1923,12 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // every present/future credential name. The MCP child receives only its
       // explicit config env below; shell tools get non-secret agent routing.
       const env = buildCursorSpawnEnv(this.opts.agentId, this.opts.sessionKey)
+      if (this.opts.cursorCredentialSelection) {
+        env.OPENCLAUDE_CURSOR_SELECTED_KEY = this.opts.cursorCredentialSelection.keyName
+        env.OPENCLAUDE_CURSOR_POOL_GENERATION = this.opts.cursorCredentialSelection.poolGeneration
+        env.OPENCLAUDE_CURSOR_ACCOUNT_ID = this.opts.cursorCredentialSelection.accountId
+        env.OPENCLAUDE_CURSOR_KEY_FINGERPRINT = this.opts.cursorCredentialSelection.keyFingerprint
+      }
 
       if (mcpLaunch) {
         const gatewayToken = this.opts.config.gateway.accessToken
@@ -1897,9 +1937,21 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         const configFile = resolve(contextDir, 'mcp.json')
         writeFileSync(tokenFile, gatewayToken, { mode: 0o600 })
         chmodSync(tokenFile, 0o600)
+        const contextFile = resolve(contextDir, 'delegate-context')
+        writeFileSync(
+          contextFile,
+          `${issueDelegateContextToken({
+            agentId: this.opts.agentId,
+            sessionKey: this.opts.sessionKey,
+            depth: this.opts.delegationDepth ?? 0,
+          })}\n`,
+          { mode: 0o600 },
+        )
+        chmodSync(contextFile, 0o600)
         const mcpConfig = buildCursorMemoryMcpConfig({
           launch: mcpLaunch,
           tokenFile,
+          delegateContextFile: contextFile,
           agentId: this.opts.agentId,
           projectId: this.opts.projectId,
           sessionKey: this.opts.sessionKey,
@@ -1913,17 +1965,6 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         writeFileSync(configFile, `${JSON.stringify(mcpConfig, null, 2)}\n`, { mode: 0o600 })
         chmodSync(configFile, 0o600)
         env.OPENCLAUDE_CURSOR_MCP_CONFIG = configFile
-        const contextFile = resolve(contextDir, 'delegate-context')
-        writeFileSync(
-          contextFile,
-          `${issueDelegateContextToken({
-            agentId: this.opts.agentId,
-            sessionKey: this.opts.sessionKey,
-            depth: this.opts.delegationDepth ?? 0,
-          })}\n`,
-          { mode: 0o600 },
-        )
-        chmodSync(contextFile, 0o600)
         attachCursorGatewayRouting(env, {
           gatewayPort: this.opts.config.gateway.port,
           contextFile,
@@ -2204,16 +2245,58 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private finish(ctx: TurnCtx, detail: string | null): void {
     this.stopPendingKeepalive()
     if (ctx.terminal) return; ctx.terminal = true; const cls = detail ? unavailable(detail) : null
-    const safeDetail = detail === null ? null : ctx.interrupted ? 'Cursor turn cancelled' : cls === 'auth' ? 'Cursor authentication unavailable' : cls === 'quota' ? 'Cursor quota unavailable' : 'Cursor CLI failed'
+    const errorClass = detail ? classifyRunError(detail).code : undefined
+    const keepRawForTape =
+      detail != null &&
+      (errorClass === 'context_too_long' || /PROMPT_TOO_LONG/.test(detail))
+    const safeDetail = detail === null ? null
+      : ctx.interrupted ? 'Cursor turn cancelled'
+      : cls === 'auth' ? 'Cursor authentication unavailable'
+      : cls === 'quota' ? 'Cursor quota unavailable'
+      : keepRawForTape ? detail
+      : 'Cursor CLI failed'
     const status: EngineExternalBillingEvent['status'] = cls ? 'unavailable' : detail ? 'error' : 'success'
     const slotResults = parseCursorSlotResults(ctx.stderr)
-    if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs: Date.now() - ctx.startedAt, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
-    const errorClass = detail ? classifyRunError(detail).code : undefined
+    if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) {
+      const durationMs = Date.now() - ctx.startedAt
+      // Volatile fast path: WS frame → master userChatBridge (live settle + quota learning).
+      this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(this.opts.cursorCredentialSelection && this.opts.cursorCredentialSelection.accountId !== '0' ? { cursorAccountId: this.opts.cursorCredentialSelection.accountId, cursorPoolGeneration: this.opts.cursorCredentialSelection.poolGeneration, cursorKeyFingerprint: this.opts.cursorCredentialSelection.keyFingerprint } : {}), ...(ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : errorClass === 'context_too_long' ? {} : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
+      // Durable path (2026-09-02 fix): the WS frame is lost whenever the user's
+      // bridge WS is gone at turn end (switched session / closed tab), leaving
+      // cursor_external_usage_audit pending forever and no credits badge. Emit
+      // the same evidence as a DurableCodexBilling so sessionManager co-locates
+      // it in the immutable turn tape (engineBilling) and master settles it via
+      // the settlement job path, idempotent with the live frame on
+      // usage_records UNIQUE(user_id, request_id). `engine:'cursor'` tells master
+      // to settle against the audit row instead of request_finalize_journal.
+      this.emit('billing', this.buildDurableBilling(ctx, status, durationMs))
+    }
     if (detail) ctx.params.onEvent({ kind: 'error', error: safeDetail!, errorClass, ...(ctx.interrupted ? { errorCode: 'user_cancelled' as const } : {}) })
     if (ctx.usage) ctx.params.onEvent({ kind: 'usage', usage: { inputTokens: ctx.usage.input_tokens ?? 0, outputTokens: ctx.usage.output_tokens ?? 0, cacheReadTokens: ctx.usage.cache_read_input_tokens ?? 0, cacheCreationTokens: ctx.usage.cache_creation_input_tokens ?? 0, totalTokens: Object.values(ctx.usage).reduce((a, b) => a + (b ?? 0), 0) } })
     ctx.params.onEvent({ kind: 'final', meta: { ...finalUsageMeta(ctx.usage), ...(ctx.interrupted ? { stopReason: 'interrupted' } : {}) } })
     ctx.params.sessionTotals.turns += 1
     const u = ctx.usage; ctx.resolve({ usage: { cost: 0, inputTokens: u?.input_tokens ?? 0, outputTokens: u?.output_tokens ?? 0, cacheReadTokens: u?.cache_read_input_tokens ?? 0, cacheCreationTokens: u?.cache_creation_input_tokens ?? 0, totalTokens: u ? Object.values(u).reduce((a, b) => a + (b ?? 0), 0) : 0 }, assistantText: ctx.assistantText, thinkingText: ctx.thinkingText, assistantSegments: ctx.assistantSegments.map((v) => ({ ...v })), thinkingSegments: ctx.thinkingSegments.map((v) => ({ ...v })), tools: [...ctx.tools.values()].map((v) => structuredClone(v)), runtimeEvents: [], stopReason: ctx.interrupted ? 'interrupted' : null, numTurns: 1, isError: !!detail, ...(detail ? { errorKind: 'other' as const, errorClass, errorDetail: safeDetail! } : {}), staleResumeId: false, phantomSignals: { ...EMPTY_SIGNALS } })
+  }
+  private buildDurableBilling(ctx: TurnCtx, status: EngineExternalBillingEvent['status'], durationMs: number): EngineBillingEvent {
+    const u = ctx.usage
+    const durableStatus: 'success' | 'error' = status === 'success' ? 'success' : 'error'
+    return {
+      requestId: ctx.params.requestId!,
+      engine: 'cursor',
+      ...(ctx.params.turnKey && /^[0-9a-f]{64}$/.test(ctx.params.turnKey) ? { turnKey: ctx.params.turnKey } : {}),
+      ...(ctx.params.usageAttribution?.parentTurnKey ? { parentTurnKey: ctx.params.usageAttribution.parentTurnKey } : {}),
+      ...(ctx.params.usageAttribution?.parentSessionId ? { parentSessionId: ctx.params.usageAttribution.parentSessionId } : {}),
+      ...(ctx.params.usageAttribution?.delegateAgentId ? { delegateAgentId: ctx.params.usageAttribution.delegateAgentId } : {}),
+      engineSessionId: this.stableEngineSessionId,
+      status: durableStatus,
+      // Durable wire contract only knows USER_CANCELLED | CODEX_ERROR; the
+      // finer cursor terminalCode (AUTH/QUOTA/ENGINE) lives in the audit row
+      // written by the live frame and is not needed for settlement (non-success
+      // is never charged).
+      ...(durableStatus === 'error' ? { terminalCode: ctx.interrupted ? 'USER_CANCELLED' as const : 'CODEX_ERROR' as const } : {}),
+      durationMs,
+      ...(u ? { usage: { ...u } } : {}),
+    }
   }
   private forceEnd(ctx: TurnCtx): void {
     this.stopPendingKeepalive()
@@ -2601,4 +2684,4 @@ export const _internals = {
   isBlockingOcMemoryDelegateCommand,
 }
 
-registerEngine('cursor', (opts) => new CursorAdapter(opts))
+registerEngine('cursor', (opts) => new CursorRoutingAdapter(opts))

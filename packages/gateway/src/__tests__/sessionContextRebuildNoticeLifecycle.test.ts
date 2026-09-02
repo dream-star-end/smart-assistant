@@ -4,8 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
 
+import { installFakeCursorWrapper } from './helpers/fakeCursorWrapper.js'
+
 const testHome = await mkdtemp(join(tmpdir(), 'oc-context-notice-'))
 process.env.OPENCLAUDE_HOME = testHome
+installFakeCursorWrapper()
 
 const {
   closeSessionsDb,

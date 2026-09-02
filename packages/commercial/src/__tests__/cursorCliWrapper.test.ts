@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { uniqueCursorAccountIdFromSlotResults } from '../account-pool/cursorQuota.js'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..')
 const sourceWrapper = join(
@@ -41,6 +42,7 @@ function fixture(): {
   const dir = mkdtempSync(join(tmpdir(), 'oc-cursor-wrapper-test-'))
   tempRoots.push(dir)
   const fakeBin = join(dir, 'cursor-agent')
+  const fakeProbe = join(dir, 'curl')
   const authDir = join(dir, 'auth')
   const auth = join(authDir, 'api-key')
   const capture = join(dir, 'capture')
@@ -62,6 +64,7 @@ printf '%s\\n' "$@" > "$OC_CURSOR_TEST_CAPTURE/argv"
 printf '%s\\n' "\${OPENCLAUDE_CURSOR_MCP_CONFIG-unset}" > "$OC_CURSOR_TEST_CAPTURE/mcp-env"
 printf '%s\\n' "\${OPENCLAUDE_CURSOR_RESUME_ID-unset}" > "$OC_CURSOR_TEST_CAPTURE/resume-env"
 printf '%s\\n' "\${CURSOR_AGENT_DISABLE_DEBUG_LOG-unset}" > "$OC_CURSOR_TEST_CAPTURE/disable-debug"
+/usr/bin/env > "$OC_CURSOR_TEST_CAPTURE/env"
 if [ "\${OC_CURSOR_TEST_STDERR:-0}" = 1 ]; then
   printf 'FAKE_DEBUG_LINE\\n' >&2
 fi
@@ -82,6 +85,11 @@ fi
 /bin/mkdir -p "$HOME/.config/cursor"
 printf '%s\\n' "\${CURSOR_API_KEY}" > "$HOME/.config/cursor/auth.json"
 printf '%s\\n' "\${CURSOR_API_KEY}" > "$OC_CURSOR_TEST_CAPTURE/key"
+[ ! -e /proc/self/fd/8 ] || : > "$OC_CURSOR_TEST_CAPTURE/cli-fd8-leaked"
+case "\${HTTPS_PROXY:-}" in
+  http://*) printf '%s\\n' proxy >> "$OC_CURSOR_TEST_CAPTURE/child-routes" ;;
+  *) printf '%s\\n' direct >> "$OC_CURSOR_TEST_CAPTURE/child-routes" ;;
+esac
 if [ -n "\${OC_CURSOR_TEST_FAIL_ON_KEY:-}" ] && [ "\${CURSOR_API_KEY}" = "\${OC_CURSOR_TEST_FAIL_ON_KEY}" ]; then
   printf '%s\\n' '{"type":"result","subtype":"error_during_execution","error":"injected"}'
   exit 1
@@ -99,6 +107,16 @@ if [ "\${OC_CURSOR_TEST_ORPHAN:-0}" = 1 ]; then
   while [ ! -f "$OC_CURSOR_TEST_CAPTURE/orphan-ready" ]; do sleep 0.01; done
   exit 0
 fi
+if [ "\${OC_CURSOR_TEST_DETACHED_LOCK:-0}" = 1 ]; then
+  /usr/bin/setsid /bin/sh -c '
+    [ ! -e /proc/self/fd/8 ] || : > "$1/descendant-fd8-leaked"
+    : > "$1/detached-ready"
+    /bin/sleep 10
+  ' sh "$OC_CURSOR_TEST_CAPTURE" </dev/null >/dev/null 2>&1 &
+  printf '%s\n' "$!" > "$OC_CURSOR_TEST_CAPTURE/detached-pid"
+  while [ ! -f "$OC_CURSOR_TEST_CAPTURE/detached-ready" ]; do sleep 0.01; done
+  exit 0
+fi
 printf '%s\\n' '{"type":"thinking","text":"checking"}'
 printf '%s\\n' '{"type":"assistant","text":"done"}'
 printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"outputTokens":1}}'
@@ -106,6 +124,45 @@ printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"o
     { mode: 0o755 },
   )
   chmodSync(fakeBin, 0o755)
+  writeFileSync(
+    join(dir, '.openclaude-scoped-sand-v1'),
+    `OPENCLAUDE_SCOPED_SAND_V1 ${'a'.repeat(64)}\n`,
+    { mode: 0o444 },
+  )
+
+  writeFileSync(
+    fakeProbe,
+    `#!/bin/sh
+set -eu
+kind=direct
+for arg in "$@"; do
+  [ "$arg" != "--proxy" ] || kind=proxy
+done
+count_file="$OC_CURSOR_TEST_CAPTURE/$kind-probe-count"
+count=0
+[ ! -f "$count_file" ] || count=$(/bin/cat "$count_file")
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+printf '%s\n' "$@" > "$OC_CURSOR_TEST_CAPTURE/$kind-probe-argv.$count"
+/usr/bin/env > "$OC_CURSOR_TEST_CAPTURE/$kind-probe-env.$count"
+[ -z "\${OC_CURSOR_TEST_PROBE_SLEEP:-}" ] || /bin/sleep "$OC_CURSOR_TEST_PROBE_SLEEP"
+if [ "$kind" = direct ]; then
+  mode=\${OC_CURSOR_TEST_DIRECT_MODE:-ok}
+else
+  mode=\${OC_CURSOR_TEST_PROXY_MODE:-ok}
+fi
+case "$mode" in
+  ok) exit 0 ;;
+  fail) exit 7 ;;
+  fail-once) [ "$count" -gt 1 ] ;;
+  fail-after-one) [ "$count" -le 1 ] ;;
+  fail-after-two) [ "$count" -le 2 ] ;;
+  *) exit 64 ;;
+esac
+`,
+    { mode: 0o755 },
+  )
+  chmodSync(fakeProbe, 0o755)
 
   const wrapper = join(dir, 'oc-cursor')
   const rewritten = readFileSync(sourceWrapper, 'utf8')
@@ -114,9 +171,15 @@ printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"o
       `cursor_bin=${fakeBin}`,
     )
     .replace('auth_file=/run/oc/cursor-auth/api-key', `auth_file=${auth}`)
+    .replace('cursor_probe_bin=/usr/bin/curl', `cursor_probe_bin=${fakeProbe}`)
+    .replace(
+      'cursor_route_dir=/tmp/openclaude-cursor-egress.$cursor_runtime_uid',
+      `cursor_route_dir=${join(dir, 'egress-state')}`,
+    )
     .replaceAll('/usr/bin/sudo -n /usr/bin/test -f', '/usr/bin/test -f')
     .replaceAll('/usr/bin/sudo -n /bin/ls', '/bin/ls')
     .replaceAll('/usr/bin/sudo -n /bin/cat', '/bin/cat')
+    .replaceAll('/usr/bin/sudo -n /usr/bin/stat', '/usr/bin/stat')
   writeFileSync(wrapper, rewritten, { mode: 0o755 })
   chmodSync(wrapper, 0o755)
   return {
@@ -128,6 +191,7 @@ printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"o
       ...process.env,
       PATH: `${binDir}:${process.env.PATH ?? ''}`,
       OC_CURSOR_TEST_CAPTURE: capture,
+      OC_CURSOR_ALLOW_LEGACY_POOL: '1',
     },
   }
 }
@@ -147,6 +211,8 @@ describe('oc-cursor wrapper', () => {
     assert.match(source, /sha256sum -c -/)
     assert.match(source, /chmod -R a-w "\$install_root"/)
     assert.match(source, /cursor-agent --version/)
+    assert.match(source, /patch-cursor-agent-sand\.mjs/)
+    assert.match(source, /OPENCLAUDE_SCOPED_SAND_V1/)
     assert.match(buildSource, /CURSOR_AGENT_VERSION="2026\.08\.11-e8db854"/)
     assert.match(
       wrapperSource,
@@ -291,6 +357,334 @@ describe('oc-cursor wrapper', () => {
     assert.equal(readFileSync(join(f.capture, 'hooks-env'), 'utf8').trim(), 'unset')
   })
 
+  test('prefers direct egress and scrubs inherited proxy variables', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const polluted = {
+      ...f.env,
+      HTTPS_PROXY: 'http://attacker.invalid:1',
+      HTTP_PROXY: 'http://attacker.invalid:2',
+      ALL_PROXY: 'socks5://attacker.invalid:3',
+      NO_PROXY: 'attacker.invalid',
+      https_proxy: 'http://attacker.invalid:4',
+      http_proxy: 'http://attacker.invalid:5',
+      all_proxy: 'socks5://attacker.invalid:6',
+      no_proxy: 'attacker.invalid',
+    }
+
+    const result = spawnSync(f.wrapper, ['--model', 'cursor-grok-4.6-high', '--', 'hello'], {
+      cwd: f.dir,
+      env: polluted,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    const childEnv = readFileSync(join(f.capture, 'env'), 'utf8')
+    assert.doesNotMatch(childEnv, /^(?:https?|all)_proxy=/im)
+    assert.match(childEnv, /^NO_PROXY=127\.0\.0\.1,localhost,::1,172\.31\.0\.1$/m)
+    const probeEnv = readFileSync(join(f.capture, 'direct-probe-env.1'), 'utf8')
+    assert.doesNotMatch(probeEnv, /^(?:https?|all|no)_proxy=/im)
+    const probeArgv = readFileSync(join(f.capture, 'direct-probe-argv.1'), 'utf8').trim().split('\n')
+    assert.equal(probeArgv[0], '-q')
+    assert.ok(probeArgv.includes('--noproxy'))
+    assert.ok(probeArgv.includes('*'))
+    assert.equal(existsSync(join(f.capture, 'proxy-probe-count')), false)
+    assert.equal(existsSync(join(f.capture, 'cli-fd8-leaked')), false)
+  })
+
+  test('requires two direct failures, validates the fixed proxy twice, then holds it sticky', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+
+    const failedOver = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_DIRECT_MODE: 'fail' },
+      encoding: 'utf8',
+    })
+    assert.equal(failedOver.status, 0, failedOver.stderr)
+    assert.equal(readFileSync(join(f.capture, 'direct-probe-count'), 'utf8').trim(), '2')
+    assert.equal(readFileSync(join(f.capture, 'proxy-probe-count'), 'utf8').trim(), '2')
+    assert.match(readFileSync(join(f.dir, 'egress-state', 'route.state'), 'utf8'), /^proxy \d+\n$/)
+    assert.match(readFileSync(join(f.capture, 'env'), 'utf8'), /^HTTPS_PROXY=http:\/\/172\.31\.0\.1:18992$/m)
+
+    const sticky = spawnSync(f.wrapper, ['--', 'hello again'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_DIRECT_MODE: 'ok' },
+      encoding: 'utf8',
+    })
+    assert.equal(sticky.status, 0, sticky.stderr)
+    assert.equal(readFileSync(join(f.capture, 'direct-probe-count'), 'utf8').trim(), '2')
+    assert.equal(readFileSync(join(f.capture, 'proxy-probe-count'), 'utf8').trim(), '3')
+    assert.deepEqual(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim().split('\n'), [
+      'proxy',
+      'proxy',
+    ])
+  })
+
+  test('one direct probe failure does not switch IP or touch the backup', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const result = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_DIRECT_MODE: 'fail-once' },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(readFileSync(join(f.capture, 'direct-probe-count'), 'utf8').trim(), '2')
+    assert.equal(existsSync(join(f.capture, 'proxy-probe-count')), false)
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+  })
+
+  test('expired proxy lease needs two direct successes before a drained switch back', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    mkdirSync(join(f.dir, 'egress-state'), { mode: 0o700 })
+    writeFileSync(join(f.dir, 'egress-state', 'route.state'), 'proxy 1\n', { mode: 0o600 })
+    const result = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(readFileSync(join(f.capture, 'direct-probe-count'), 'utf8').trim(), '4')
+    assert.equal(readFileSync(join(f.dir, 'egress-state', 'route.state'), 'utf8'), 'direct 0\n')
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+  })
+
+  test('does not renew an expired lease when direct is unconfirmed and proxy is dead', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    mkdirSync(join(f.dir, 'egress-state'), { mode: 0o700 })
+    const state = join(f.dir, 'egress-state', 'route.state')
+    writeFileSync(state, 'proxy 1\n', { mode: 0o600 })
+    const result = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env: {
+        ...f.env,
+        OC_CURSOR_TEST_DIRECT_MODE: 'fail',
+        OC_CURSOR_TEST_PROXY_MODE: 'fail',
+      },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 2)
+    assert.match(result.stderr, /direct recovery is unconfirmed and backup proxy is unreachable/)
+    assert.equal(readFileSync(state, 'utf8'), 'proxy 1\n')
+    assert.equal(existsSync(join(f.capture, 'child-routes')), false)
+  })
+
+  test('rejects tampered route state and a lease beyond the 15 minute bound', () => {
+    for (const stateBody of ['proxy 9999999999\n', 'proxy 1 extra\n', 'proxy 1\nsecond line\n']) {
+      const f = fixture()
+      const proxySidecar = join(dirname(f.auth), '.https-proxy')
+      writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+      chmodSync(proxySidecar, 0o600)
+      mkdirSync(join(f.dir, 'egress-state'), { mode: 0o700 })
+      writeFileSync(join(f.dir, 'egress-state', 'route.state'), stateBody, { mode: 0o600 })
+      const result = spawnSync(f.wrapper, ['--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 2, stateBody)
+      assert.match(result.stderr, /Cursor egress state/, stateBody)
+      assert.equal(existsSync(join(f.capture, 'child-routes')), false, stateBody)
+    }
+  })
+
+  test('post-drain target failure preserves the old route and never overlaps IPs', async () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const first = spawn(f.wrapper, ['--', 'long direct'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_SLEEP: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    for (let i = 0; i < 100 && !existsSync(join(f.capture, 'child-routes')); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+
+    const second = spawn(f.wrapper, ['--', 'switch attempt'], {
+      cwd: f.dir,
+      env: {
+        ...f.env,
+        OC_CURSOR_TEST_DIRECT_MODE: 'fail',
+        OC_CURSOR_TEST_PROXY_MODE: 'fail-after-one',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let secondStderr = ''
+    second.stderr?.on('data', (chunk) => (secondStderr += String(chunk)))
+    const secondExit = new Promise<number | null>((resolve) =>
+      second.once('exit', (code) => resolve(code)),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+    first.kill('SIGTERM')
+    await new Promise<void>((resolve) => first.once('exit', () => resolve()))
+    const secondStatus = await secondExit
+    assert.equal(secondStatus, 2, secondStderr)
+    assert.match(secondStderr, /failed post-drain validation/)
+    assert.equal(readFileSync(join(f.dir, 'egress-state', 'route.state'), 'utf8'), 'direct 0\n')
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+  })
+
+  test('same-route invocations overlap safely under shared route locks', async () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const first = spawn(f.wrapper, ['--', 'long direct'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_SLEEP: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    for (let i = 0; i < 100 && !existsSync(join(f.capture, 'child-routes')); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+
+    const second = spawnSync(f.wrapper, ['--', 'second direct'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+      timeout: 2_000,
+    })
+    assert.equal(second.status, 0, second.stderr)
+    assert.equal(first.exitCode, null)
+    assert.deepEqual(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim().split('\n'), [
+      'direct',
+      'direct',
+    ])
+    first.kill('SIGTERM')
+    await new Promise<void>((resolve) => first.once('exit', () => resolve()))
+  })
+
+  test('admission contention consumes one absolute selection deadline and never probes', async () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const first = spawn(f.wrapper, ['--', 'slow selector'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_PROBE_SLEEP: '3' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const firstExit = new Promise<void>((resolve) => first.once('exit', () => resolve()))
+    for (let i = 0; i < 100 && !existsSync(join(f.capture, 'direct-probe-count')); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.equal(readFileSync(join(f.capture, 'direct-probe-count'), 'utf8').trim(), '1')
+
+    const shortWrapper = join(f.dir, 'oc-cursor-short-budget')
+    writeFileSync(
+      shortWrapper,
+      readFileSync(f.wrapper, 'utf8').replace('cursor_select_budget=45', 'cursor_select_budget=1'),
+      { mode: 0o755 },
+    )
+    chmodSync(shortWrapper, 0o755)
+    const started = Date.now()
+    const blocked = spawnSync(shortWrapper, ['--', 'must not start'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+      timeout: 3_000,
+    })
+    const elapsed = Date.now() - started
+    assert.equal(blocked.status, 2, blocked.stderr)
+    assert.match(blocked.stderr, /admission deadline exceeded/)
+    assert.ok(elapsed < 2_500, `selector exceeded bounded deadline: ${elapsed}ms`)
+    assert.equal(readFileSync(join(f.capture, 'direct-probe-count'), 'utf8').trim(), '1')
+    await firstExit
+  })
+
+  test('CLI execution failure does not change the direct route or probe the backup', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const result = spawnSync(f.wrapper, ['--', 'business failure'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_FAIL_ON_KEY: 'crsr_dummy' },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 1)
+    assert.equal(readFileSync(join(f.dir, 'egress-state', 'route.state'), 'utf8'), 'direct 0\n')
+    assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
+    assert.equal(existsSync(join(f.capture, 'proxy-probe-count')), false)
+  })
+
+  test('Cursor and detached descendants cannot retain or unlock the route FD', () => {
+    const f = fixture()
+    const proxySidecar = join(dirname(f.auth), '.https-proxy')
+    writeFileSync(proxySidecar, 'http://172.31.0.1:18992\n', { mode: 0o600 })
+    chmodSync(proxySidecar, 0o600)
+    const first = spawnSync(f.wrapper, ['--', 'spawn detached'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_DETACHED_LOCK: '1' },
+      encoding: 'utf8',
+    })
+    assert.equal(first.status, 0, first.stderr)
+    assert.equal(existsSync(join(f.capture, 'cli-fd8-leaked')), false)
+    assert.equal(existsSync(join(f.capture, 'descendant-fd8-leaked')), false)
+
+    const shortWrapper = join(f.dir, 'oc-cursor-short-drain')
+    writeFileSync(
+      shortWrapper,
+      readFileSync(f.wrapper, 'utf8').replace('cursor_select_budget=45', 'cursor_select_budget=2'),
+      { mode: 0o755 },
+    )
+    chmodSync(shortWrapper, 0o755)
+    const switched = spawnSync(shortWrapper, ['--', 'switch while detached lives'], {
+      cwd: f.dir,
+      env: { ...f.env, OC_CURSOR_TEST_DIRECT_MODE: 'fail' },
+      encoding: 'utf8',
+      timeout: 3_000,
+    })
+    assert.equal(switched.status, 0, switched.stderr)
+    assert.match(readFileSync(join(f.dir, 'egress-state', 'route.state'), 'utf8'), /^proxy \d+\n$/)
+    const detachedPid = Number(readFileSync(join(f.capture, 'detached-pid'), 'utf8').trim())
+    if (Number.isInteger(detachedPid) && detachedPid > 1) {
+      try {
+        process.kill(detachedPid, 'SIGTERM')
+      } catch {}
+    }
+  })
+
+  test('fails closed on an unsafe Cursor proxy sidecar', () => {
+    const cases = [
+      ['credentialed', 'http://user:pass@172.31.0.1:18992\n', 0o600],
+      ['non-http', 'socks5://172.31.0.1:18992\n', 0o600],
+      ['world-readable', 'http://172.31.0.1:18992\n', 0o644],
+      ['missing-port', 'http://172.31.0.1\n', 0o600],
+    ] as const
+    for (const [label, value, mode] of cases) {
+      const f = fixture()
+      const proxySidecar = join(dirname(f.auth), '.https-proxy')
+      writeFileSync(proxySidecar, value, { mode })
+      chmodSync(proxySidecar, mode)
+      const result = spawnSync(f.wrapper, ['--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 2, label)
+      assert.match(result.stderr, /Cursor HTTPS proxy/, label)
+      assert.equal(existsSync(join(f.capture, 'env')), false, label)
+    }
+  })
+
   test('copies one validated adapter MCP config, approves it, and unsets the source env', () => {
     const f = fixture()
     const config = join(f.dir, 'adapter-mcp.json')
@@ -400,6 +794,30 @@ describe('oc-cursor wrapper', () => {
     assert.equal(result.status, 0, result.stderr)
     const argv = readFileSync(join(f.capture, 'argv'), 'utf8')
     assert.match(argv, /--model\ncursor-grok-4.6-high-fast\n/)
+  })
+
+  test('accepts the Fable 5.1 thinking upstream ids', () => {
+    const f = fixture()
+    for (const model of [
+      'claude-fable-5-1-thinking-low',
+      'claude-fable-5-1-thinking-high',
+      'claude-fable-5-1-thinking-max',
+    ]) {
+      const result = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, result.stderr)
+    }
+    // Non-thinking Fable 5.1 CLI variants stay outside the pinned allowlist.
+    const blocked = spawnSync(f.wrapper, ['--model', 'claude-fable-5-1-high', '--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(blocked.status, 2)
+    assert.match(blocked.stderr, /model is not allowlisted/)
   })
 
   test('does not assume an undocumented Cursor API-key prefix', () => {
@@ -767,7 +1185,7 @@ describe('oc-cursor wrapper', () => {
   })
 
 
-  test('Other Models (Opus) pass -H x-cursor-client-type: sand and set NODE_OPTIONS hook when .sand-mode is enabled', () => {
+  test('Sand-enabled concrete models scope Sand inside the patched CLI without argv/global header hooks', () => {
     const f = fixture()
     const authDir = dirname(f.auth)
     writeFileSync(
@@ -782,9 +1200,259 @@ describe('oc-cursor wrapper', () => {
     )
     assert.equal(result.status, 0, result.stderr)
     const argv = readFileSync(join(f.capture, 'argv'), 'utf8').trim().split('\n')
-    const headerIdx = argv.indexOf('-H')
-    assert.ok(headerIdx >= 0, 'argv must include -H flag')
-    assert.equal(argv[headerIdx + 1], 'x-cursor-client-type: sand')
+    assert.equal(argv.includes('-H'), false, 'native AgentService argv must not include a Sand header')
+    assert.doesNotMatch(
+      readFileSync(join(f.capture, 'env'), 'utf8'),
+      /^NODE_OPTIONS=.*sand-hook\.cjs$/m,
+      'the wrapper must not force Sand onto endpoint discovery/control requests',
+    )
+    assert.doesNotMatch(readFileSync(sourceWrapper, 'utf8'), /Headers\.prototype/)
+    assert.match(
+      readFileSync(join(f.capture, 'env'), 'utf8'),
+      /^OPENCLAUDE_CURSOR_SAND_MODE=1$/m,
+    )
+    assert.match(
+      readFileSync(join(f.capture, 'env'), 'utf8'),
+      /^OPENCLAUDE_CURSOR_SAND_CLIENT_VERSION=0\.30\.0$/m,
+    )
+  })
+
+  test('metadata selection and a pinned native launch use the same account-pool Sand slot', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    const rotationFile = join(f.dir, 'selection-rotation')
+    writeFileSync(join(authDir, 'api-key.2'), 'crsr_second\n', { mode: 0o600 })
+    writeFileSync(join(authDir, '.sand-mode'), '# sand-mode v1\napi-key 0\napi-key.2 1\n', { mode: 0o600 })
+    writeFileSync(rotationFile, `1 ${Math.floor(Date.now() / 1000) + 300}\n`, { mode: 0o600 })
+    const selected = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__select__'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_CURSOR_SELECT_ONLY: '1',
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(selected.status, 0, selected.stderr)
+    assert.match(selected.stdout, /^oc-cursor: selected_slot 2 api-key\.2 sand legacy 0 0000000000000000$/m)
+
+    const launched = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'pinned launch'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_CURSOR_SELECTED_KEY: 'api-key.2',
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(launched.status, 0, launched.stderr)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8').trim(), 'crsr_second')
+    assert.match(launched.stderr, /slot_result 2 ok/)
+    assert.equal(readFileSync(join(f.capture, 'argv'), 'utf8').includes('-H'), false)
+    assert.match(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SAND_MODE=1$/m)
+    assert.doesNotMatch(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SELECTED_KEY=/m)
+  })
+
+  test('Cursor Auto remains native even when the selected key has Sand enabled', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, '.sand-mode'), '# sand-mode v1\napi-key 1\n', { mode: 0o600 })
+    const result = spawnSync(f.wrapper, ['--', 'auto prompt'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SAND_MODE=0$/m)
+  })
+
+  test('ten-key selection stays numeric and resolves billing to the tenth account', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    const rotationFile = join(f.dir, 'ten-key-rotation')
+    const sidecar = ['# sand-mode v1', 'api-key 0']
+    for (let suffix = 2; suffix <= 10; suffix += 1) {
+      writeFileSync(join(authDir, `api-key.${suffix}`), `crsr_key_${suffix}\n`, { mode: 0o600 })
+      sidecar.push(`api-key.${suffix} ${suffix === 10 ? 1 : 0}`)
+    }
+    writeFileSync(join(authDir, '.sand-mode'), `${sidecar.join('\n')}\n`, { mode: 0o600 })
+    writeFileSync(rotationFile, `9 ${Math.floor(Date.now() / 1000) + 300}\n`, { mode: 0o600 })
+    const selected = spawnSync(
+      f.wrapper,
+      ['--model', 'cursor-grok-4.6-high', '--', '__select_tenth__'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_CURSOR_SELECT_ONLY: '1',
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(selected.status, 0, selected.stderr)
+    const matched = /selected_slot (\d+) (\S+) sand/.exec(selected.stdout)
+    assert.ok(matched)
+    assert.equal(Number(matched[1]), 10)
+    assert.equal(matched[2], 'api-key.10')
+    const rows = Array.from({ length: 10 }, (_, index) => ({ id: BigInt(index + 1) }))
+    assert.equal(
+      uniqueCursorAccountIdFromSlotResults(rows, [{ slot: Number(matched[1]), result: 'ok' }]),
+      10n,
+    )
+  })
+
+  test('an immutable generation keeps a bound Sand account stable after pool compaction', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    const generations = join(authDir, '.pool-generations')
+    const gen1 = 'gen-111111111111111111111111'
+    const gen2 = 'gen-222222222222222222222222'
+    const keyA = 'crsr_alpha'
+    const keyB = 'crsr_bravo'
+    const keyC = 'crsr_charlie'
+    const fp = (key: string): string => createHash('sha256').update(`${key}\n`).digest('hex').slice(0, 16)
+    const writeGeneration = (
+      generation: string,
+      slots: Array<{
+        name: string; key: string; account: string; sand: boolean;
+        quota?: 'unknown' | 'other_ok' | 'cursor_only';
+      }>,
+    ): void => {
+      const dir = join(generations, generation)
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      writeFileSync(join(dir, '.quota-class'), `# quota-class v1\n${slots.map((s) => `${s.name} ${s.quota ?? 'unknown'}`).join('\n')}\n`, { mode: 0o600 })
+      writeFileSync(join(dir, '.sand-mode'), `# sand-mode v1\n${slots.map((s) => `${s.name} ${s.sand ? 1 : 0}`).join('\n')}\n`, { mode: 0o600 })
+      writeFileSync(
+        join(dir, '.slot-identities'),
+        `# cursor-pool-identity v1 ${generation}\n${slots.map((s) => `${s.name} ${s.account} ${fp(s.key)} ${s.sand ? 1 : 0}`).join('\n')}\n`,
+        { mode: 0o600 },
+      )
+      for (const slot of slots) writeFileSync(join(dir, slot.name), `${slot.key}\n`, { mode: 0o600 })
+    }
+    writeGeneration(gen1, [
+      { name: 'api-key', key: keyA, account: '1', sand: false },
+      { name: 'api-key.2', key: keyB, account: '2', sand: true },
+    ])
+    writeGeneration(gen2, [
+      { name: 'api-key', key: keyB, account: '2', sand: true },
+      { name: 'api-key.2', key: keyC, account: '3', sand: false },
+    ])
+    const rotationFile = join(f.dir, 'generation-rotation')
+    writeFileSync(rotationFile, `1 ${Math.floor(Date.now() / 1000) + 300}\n`, { mode: 0o600 })
+    writeFileSync(join(authDir, '.pool-active'), `${gen1}\n`, { mode: 0o600 })
+    const selected = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__select_generation__'],
+      {
+        cwd: f.dir,
+        env: { ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1', OC_CURSOR_KEY_ROTATION_FILE: rotationFile },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(selected.status, 0, selected.stderr)
+    assert.match(selected.stdout, new RegExp(`selected_slot 2 api-key\\.2 sand ${gen1} 2 ${fp(keyB)}`))
+
+    writeFileSync(join(authDir, '.pool-active'), `${gen2}\n`, { mode: 0o600 })
+    const launched = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'bound old generation'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_CURSOR_SELECTED_KEY: 'api-key.2',
+          OPENCLAUDE_CURSOR_POOL_GENERATION: gen1,
+          OPENCLAUDE_CURSOR_ACCOUNT_ID: '2',
+          OPENCLAUDE_CURSOR_KEY_FINGERPRINT: fp(keyB),
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(launched.status, 0, launched.stderr)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8').trim(), keyB)
+
+    const recorded = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__record_old_failure__'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_CURSOR_SELECTED_KEY: 'api-key.2',
+          OPENCLAUDE_CURSOR_POOL_GENERATION: gen1,
+          OPENCLAUDE_CURSOR_ACCOUNT_ID: '2',
+          OPENCLAUDE_CURSOR_KEY_FINGERPRINT: fp(keyB),
+          OPENCLAUDE_CURSOR_RECORD_RESULT: 'fail',
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(recorded.status, 0, recorded.stderr)
+    assert.match(readFileSync(rotationFile, 'utf8'), /^v2 2 other_models /)
+
+    const afterFailure = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__select_after_compaction__'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_CURSOR_SELECT_ONLY: '1',
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(afterFailure.status, 0, afterFailure.stderr)
+    assert.match(afterFailure.stdout, new RegExp(`selected_slot 2 api-key\\.2 native ${gen2} 3 ${fp(keyC)}`))
+
+    const gen3 = 'gen-333333333333333333333333'
+    writeGeneration(gen3, [
+      { name: 'api-key', key: keyA, account: '1', sand: true },
+      { name: 'api-key.2', key: keyC, account: '3', sand: false },
+    ])
+    writeFileSync(join(authDir, '.pool-active'), `${gen3}\n`, { mode: 0o600 })
+    const removedFailure = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__select_removed_failure__'],
+      {
+        cwd: f.dir,
+        env: { ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1', OC_CURSOR_KEY_ROTATION_FILE: rotationFile },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(removedFailure.status, 0, removedFailure.stderr)
+    assert.match(removedFailure.stdout, new RegExp(`selected_slot 2 api-key\\.2 native ${gen3} 3 ${fp(keyC)}`))
+
+    const gen4 = 'gen-444444444444444444444444'
+    writeGeneration(gen4, [
+      { name: 'api-key', key: keyA, account: '1', sand: true },
+      { name: 'api-key.2', key: keyB, account: '2', sand: false, quota: 'cursor_only' },
+      { name: 'api-key.3', key: keyC, account: '3', sand: false },
+    ])
+    writeFileSync(join(authDir, '.pool-active'), `${gen4}\n`, { mode: 0o600 })
+    const filteredFailure = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__select_filtered_failure__'],
+      {
+        cwd: f.dir,
+        env: { ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1', OC_CURSOR_KEY_ROTATION_FILE: rotationFile },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(filteredFailure.status, 0, filteredFailure.stderr)
+    assert.match(filteredFailure.stdout, new RegExp(`selected_slot 3 api-key\\.3 native ${gen4} 3 ${fp(keyC)}`))
   })
 
   test('Cursor Models (Grok 4.6) stay in native CLI mode and do NOT pass -H even when .sand-mode is enabled', () => {

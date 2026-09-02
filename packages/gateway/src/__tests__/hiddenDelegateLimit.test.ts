@@ -13,13 +13,36 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/hiddenDelegateLimit.test.ts
  */
 import assert from 'node:assert/strict'
-import { describe, it } from 'node:test'
+import { after, afterEach, describe, it } from 'node:test'
 
 import type { InboundFrame } from '@openclaude/protocol'
 
 import { Gateway, PerTurnDelegationGuard, MAX_HIDDEN_DELEGATIONS_PER_TURN } from '../server.js'
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-hidden-limit'
+
+const ENV_KEYS = [
+  'OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN',
+  'OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN',
+] as const
+const ORIG_ENV: Record<string, string | undefined> = {}
+for (const k of ENV_KEYS) ORIG_ENV[k] = process.env[k]
+function restoreHiddenLimitEnv(): void {
+  for (const k of ENV_KEYS) {
+    if (ORIG_ENV[k] === undefined) delete process.env[k]
+    else process.env[k] = ORIG_ENV[k]
+  }
+}
+function clearHiddenLimitEnv(): void {
+  for (const k of ENV_KEYS) delete process.env[k]
+}
+clearHiddenLimitEnv()
+afterEach(() => {
+  clearHiddenLimitEnv()
+})
+after(() => {
+  restoreHiddenLimitEnv()
+})
 
 // ── 测试脚手架 ───────────────────────────────────────────────────────────────
 
@@ -230,5 +253,38 @@ describe('handleDelegateTask — hidden 审查员串行硬上限', () => {
     })
     assert.equal(blocked.status, 409)
     assert.match(blocked.body.error, /仅在团队模式/)
+  })
+
+  it('env OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN 覆盖上限(call-time 读 env)', async () => {
+    process.env.OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN = '5'
+    const gw = makeGateway()
+    for (let i = 0; i < 5; i++) {
+      const r = await delegate(gw, 'hidden-reviewer', reviewBody())
+      assert.equal(r.status, 200, `env=5 时第 ${i + 1} 次委派应放行`)
+      assert.equal(r.body.ok, true)
+    }
+    const blocked = await delegate(gw, 'hidden-reviewer', reviewBody())
+    assert.equal(blocked.status, 429, '第 6 次必须 429')
+    assert.match(blocked.body.error, /审查委派已达本轮上限/)
+    assert.match(blocked.body.error, /上限\(5次\)/)
+    assert.equal((await delegate(gw, 'hidden-reviewer', reviewBody())).status, 429)
+  })
+
+  it('env 非法值回落默认 3', async () => {
+    for (const raw of ['abc', '0', '-1', '']) {
+      process.env.OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN = raw
+      const gw = makeGateway()
+      for (let i = 0; i < MAX_HIDDEN_DELEGATIONS_PER_TURN; i++) {
+        assert.equal(
+          (await delegate(gw, 'hidden-reviewer', reviewBody())).status,
+          200,
+          `非法 env=${JSON.stringify(raw)} 第 ${i + 1} 次应放行(默认 3)`,
+        )
+      }
+      const blocked = await delegate(gw, 'hidden-reviewer', reviewBody())
+      assert.equal(blocked.status, 429, `非法 env=${JSON.stringify(raw)} 第 4 次应 429`)
+      assert.match(blocked.body.error, /审查委派已达本轮上限/)
+      assert.match(blocked.body.error, new RegExp(String(MAX_HIDDEN_DELEGATIONS_PER_TURN)))
+    }
   })
 })

@@ -3718,13 +3718,14 @@ describe('v5 release safety lanes', () => {
         'DRY=0',
         'git() {',
         '  case "$*" in',
-        '    *"rev-parse HEAD"*) printf "%s\\n" pinned-commit ;;',
-        '    *"show pinned-commit:deploy/v5/release-metadata.json"*) printf "%s\\n" "$PINNED_METADATA" ;;',
-        '    *"archive --format=tar pinned-commit"*) : ;;',
+        '    *"rev-parse HEAD"*) printf "%s\\n" 0123456789abcdef0123456789abcdef01234567 ;;',
+        '    *"show 0123456789abcdef0123456789abcdef01234567:deploy/v5/release-metadata.json"*) printf "%s\\n" "$PINNED_METADATA" ;;',
+        '    *"archive --format=tar 0123456789abcdef0123456789abcdef01234567"*) : ;;',
         '    *) return 97 ;;',
         '  esac',
         '}',
         'hotcfg_ship_lib() { :; }',
+        'scp() { printf "%s\\n" "$*" >>"$CAPTURE.scp"; }',
         'ssh() {',
         '  case "$*" in',
         '    *"grep \'^OC_RUNTIME_IMAGE=\'"*) printf "%s\\n" runtime:test ;;',
@@ -3749,6 +3750,7 @@ describe('v5 release safety lanes', () => {
       return {
         result,
         args: (await readFile(capture, 'utf8')).trim().split('\n').filter(Boolean),
+        scp: await readFile(`${capture}.scp`, 'utf8').catch(() => ''),
       }
     }
 
@@ -3756,6 +3758,8 @@ describe('v5 release safety lanes', () => {
     assert.equal(valid.result.status, 0, valid.result.stderr || valid.result.stdout)
     assert.equal(valid.args[0], 'oc_hotcfg_finalize_release')
     assert.equal(valid.args[5], 'model_authority_v1 future.runtime-cap')
+    // flavor 身份门:runtime staging 在 finalize 前必须已收到 commercial flavor.manifest.json
+    assert.match(valid.scp, /-q \S+\/flavor\.manifest\.json \S+:\S+\/\.staging-[0-9a-f]{16}\/flavor\.manifest\.json/)
 
     for (const invalid of [
       'model_authority_v1',
@@ -3804,14 +3808,15 @@ describe('v5 release safety lanes', () => {
       '  case "$*" in',
       `    *"cat-file -e ${sourceCommit}^"*) return 0 ;;`,
       `    *"merge-base --is-ancestor ${sourceCommit} HEAD"*) return "\${ANCESTOR_RC:-0}" ;;`,
-      '    *"rev-parse HEAD"*) printf "%s\\n" pinned-commit ;;',
-      '    *"show pinned-commit:deploy/v5/release-metadata.json"*) printf "%s\\n" "$PINNED_METADATA" ;;',
-      '    *"archive --format=tar pinned-commit"*) : ;;',
+      '    *"rev-parse HEAD"*) printf "%s\\n" 0123456789abcdef0123456789abcdef01234567 ;;',
+      '    *"show 0123456789abcdef0123456789abcdef01234567:deploy/v5/release-metadata.json"*) printf "%s\\n" "$PINNED_METADATA" ;;',
+      '    *"archive --format=tar 0123456789abcdef0123456789abcdef01234567"*) : ;;',
       '    *) return 97 ;;',
       '  esac',
       '}',
       'hotcfg_release_axis_on() { return 0; }',
       'hotcfg_ship_lib() { :; }',
+      'scp() { printf "%s\\n" "$*" >>"$CAPTURE.scp"; }',
       'ssh() {',
       '  if [[ "$*" == *"docker image inspect"* && "$*" == *"source_commit"* ]]; then',
       `    printf '%s|%s|%s|%s\\n' "\${ACTUAL_ID:-${imageId}}" "\${SOURCE_COMMIT:-${sourceCommit}}" "\${EMBED_SOURCE:-0}" "\${INCLUDE_GROK:-1}"`,

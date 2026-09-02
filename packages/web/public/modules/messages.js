@@ -477,7 +477,9 @@ const _MCP_OP_META = {
   'openclaude-memory:task_comment': { icon: _ICON_NOTEBOOK, label: '任务单评论' },
   'openclaude-memory:task_list': { icon: _ICON_CHECK_LIST, label: '任务单列表' },
   'openclaude-memory:task_get': { icon: _ICON_FILE_TEXT, label: '查看任务单' },
+  'openclaude-memory:task_approve': { icon: _ICON_CHECK_LIST, label: '批准任务单' },
   'openclaude-memory:delegate_task': { icon: _ICON_BOT, label: '委托子任务' },
+  'openclaude-memory:delegate_wait': { icon: _ICON_CLOCK, label: '等待委派' },
   'openclaude-memory:send_to_agent': { icon: _ICON_SEND, label: '发送给子 Agent' },
   'openclaude-memory:skill_list': { icon: _ICON_SPARKLE, label: '技能列表' },
   'openclaude-memory:skill_view': { icon: _ICON_SPARKLE, label: '查看技能' },
@@ -1412,10 +1414,11 @@ function _mcpSummary(server, op, input) {
     if (op === 'session_search') return input.query || ''
     if (op === 'create_reminder') return input.message || input.label || input.schedule || ''
     if (op === 'task_create') return input.title || ''
-    if (op === 'task_update' || op === 'task_comment' || op === 'task_get') {
+    if (op === 'task_update' || op === 'task_comment' || op === 'task_get' || op === 'task_approve') {
       return (input.id || input.identifier || input.title || '').slice(0, 50)
     }
     if (op === 'task_list') return input.q || input.status || input.projectId || ''
+    if (op === 'delegate_wait') return input.jobId || ''
     if (op === 'delegate_task' || op === 'send_to_agent') {
       const tgt = input.agentId ? `→ ${input.agentId} ` : ''
       return `${tgt}${(input.goal || input.message || input.prompt || '').slice(0, 60)}`

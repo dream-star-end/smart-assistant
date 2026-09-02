@@ -33,7 +33,7 @@ function evalsFor(name: string): Awaited<ReturnType<typeof api.getSkillEvals>> {
 
 /** 装配 SkillsPanel + 全部依赖桩;返回 getSkillEvals spy 供断言探测行为。 */
 function mountPanel(opts: { skills?: SkillSummary[]; onOpenMarketplace?: () => void } = {}) {
-  vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
+  vi.spyOn(api, "getPublicModels").mockResolvedValue({ models: [], lockedModels: [] });
   vi.spyOn(api, "listSkills").mockResolvedValue(opts.skills ?? SKILLS);
   vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
   vi.spyOn(api, "getSkillHistory").mockResolvedValue({ history: [], writable: true });
@@ -59,7 +59,7 @@ async function expandRow(name: string) {
 
 describe("SkillsPanel 加载 / 空态 / 出口", () => {
   test("首次加载失败不显示假空态，可原地重试后显示真实空态", async () => {
-    vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
+    vi.spyOn(api, "getPublicModels").mockResolvedValue({ models: [], lockedModels: [] });
     const listSkills = vi
       .spyOn(api, "listSkills")
       .mockRejectedValueOnce(new Error("backend unavailable"))
@@ -157,7 +157,7 @@ describe("SkillsPanel 未配评测提示", () => {
 
 describe("SkillsPanel 行内预览只做轻量摘要", () => {
   test("正文只给前 20 行 + 「在工作台中打开」,不再把评测/训练塞进行手风琴", async () => {
-    vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
+    vi.spyOn(api, "getPublicModels").mockResolvedValue({ models: [], lockedModels: [] });
     vi.spyOn(api, "listSkills").mockResolvedValue([SKILLS[0]]);
     vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
     vi.spyOn(api, "getSkillEvals").mockImplementation(async (_a, name) => evalsFor(name));
@@ -180,7 +180,7 @@ describe("SkillsPanel 行内预览只做轻量摘要", () => {
   });
 
   test("正文加载失败:行内 Alert 带「重试」,不再是一行裸红字", async () => {
-    vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
+    vi.spyOn(api, "getPublicModels").mockResolvedValue({ models: [], lockedModels: [] });
     vi.spyOn(api, "listSkills").mockResolvedValue([SKILLS[0]]);
     vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
     vi.spyOn(api, "getSkillEvals").mockImplementation(async (_a, name) => evalsFor(name));

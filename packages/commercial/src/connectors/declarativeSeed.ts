@@ -9,6 +9,7 @@
 
 import type { Pool } from 'pg'
 import { getPool } from '../db/index.js'
+import { assertFlavorIdentity } from '../flavor/assertFlavor.js'
 import { tx } from '../db/queries.js'
 import { approveMarketplaceConnectorVersionWithRunner } from '../marketplace/connectorReview.js'
 import { DEFAULT_CONNECTORS } from './defaults/index.js'
@@ -60,6 +61,7 @@ export interface SeedResult {
 }
 
 export async function seedDefaultConnectors(pool: Pool = getPool()): Promise<SeedResult> {
+  assertFlavorIdentity()
   const author = await ensureSystemUser(SEED_AUTHOR_EMAIL, 'user', pool)
   const reviewer = await ensureSystemUser(SEED_REVIEWER_EMAIL, 'admin', pool)
   const seeded: string[] = []

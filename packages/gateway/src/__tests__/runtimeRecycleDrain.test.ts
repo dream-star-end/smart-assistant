@@ -137,6 +137,89 @@ describe('planned runtime recycle drain', () => {
     assert.equal(h.state().sessionUntil, 0)
   })
 
+  test('optional runningDelegateJobs 计入 409,缺省钩子不改 flag-off 形状', async () => {
+    const withJobs = harness({ countRunningDelegateJobs: async () => 2 })
+    const busy = await attemptRuntimeRecycleDrain(withJobs.deps)
+    assert.equal(busy.ok, false)
+    assert.equal(busy.status, 409)
+    if (!busy.ok) {
+      assert.equal(busy.runningDelegateJobs, 2)
+      assert.equal(busy.durableRunning, 2)
+    }
+
+    const flagOff = harness()
+    const ok = await attemptRuntimeRecycleDrain(flagOff.deps)
+    assert.deepEqual(ok, { ok: true, status: 200, drainTtlMs: 10_000 })
+    assert.equal('runningDelegateJobs' in ok, false)
+  })
+
+  test('freeze 在 await 前持有,409/503 释放,200 保留 holder', async () => {
+    const holders = new Set<string>()
+    const busy = harness({
+      freezeDelegateDispatch: (holder) => {
+        holders.add(holder)
+      },
+      thawDelegateDispatch: (holder) => {
+        holders.delete(holder)
+      },
+      countDurableRunning: async () => 1,
+    })
+    const busyDecision = await attemptRuntimeRecycleDrain(busy.deps)
+    assert.equal(busyDecision.ok, false)
+    assert.equal(busyDecision.status, 409)
+    assert.equal(holders.size, 0)
+
+    const okHolders = new Set<string>()
+    const ok = harness({
+      freezeDelegateDispatch: (holder) => {
+        okHolders.add(holder)
+      },
+      thawDelegateDispatch: (holder) => {
+        okHolders.delete(holder)
+      },
+    })
+    const okDecision = await attemptRuntimeRecycleDrain(ok.deps)
+    assert.equal(okDecision.ok, true)
+    assert.equal(okHolders.size, 1)
+    if (okDecision.ok) assert.equal(typeof okDecision.freezeHolder, 'string')
+  })
+
+  test('freeze 后未预期抛错必须 thaw,不得留下哑 freeze', async () => {
+    const holders = new Set<string>()
+    const h = harness({
+      freezeDelegateDispatch: (holder) => {
+        holders.add(holder)
+      },
+      thawDelegateDispatch: (holder) => {
+        holders.delete(holder)
+      },
+      armGatewayDrain: () => {
+        throw new Error('boom')
+      },
+    })
+    await assert.rejects(() => attemptRuntimeRecycleDrain(h.deps), /boom/)
+    assert.equal(holders.size, 0)
+  })
+
+  test('ACK 前同步 peek 看到 running 则 409,即使 await count 返回 0', async () => {
+    let running = 0
+    const h = harness({
+      freezeDelegateDispatch: () => {},
+      thawDelegateDispatch: () => {},
+      countRunningDelegateJobs: async () => {
+        queueMicrotask(() => {
+          running = 1
+        })
+        return 0
+      },
+      peekRunningDelegateJobs: () => running,
+    })
+    const decision = await attemptRuntimeRecycleDrain(h.deps)
+    assert.equal(decision.ok, false)
+    assert.equal(decision.status, 409)
+    if (!decision.ok) assert.equal(decision.runningDelegateJobs, 1)
+  })
+
   test('重叠握手串行化:后请求不得释放先请求已受理的双闸', async () => {
     const h = harness()
     let durableReads = 0
@@ -184,5 +267,23 @@ describe('planned runtime recycle drain', () => {
     assert.equal(durableReads, 2)
     assert.equal(h.state().gatewayReleases, 1)
     assert.equal(h.state().sessionReleases, 1)
+  })
+
+  test('200 attaches holder expiry at ACK now + ttlMs; pending freeze has none', async () => {
+    const calls: Array<{ holder: string; expiresAt?: number }> = []
+    const h = harness({
+      freezeDelegateDispatch: (holder, expiresAt) => {
+        calls.push({ holder, expiresAt })
+      },
+      thawDelegateDispatch: () => {},
+    })
+    const decision = await attemptRuntimeRecycleDrain(h.deps)
+    assert.equal(decision.ok, true)
+    if (decision.ok) assert.equal(decision.freezeHolder, 'drain:1000')
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0]?.holder, 'drain:1000')
+    assert.equal(calls[0]?.expiresAt, undefined)
+    assert.equal(calls[1]?.holder, 'drain:1000')
+    assert.equal(calls[1]?.expiresAt, 11_000)
   })
 })

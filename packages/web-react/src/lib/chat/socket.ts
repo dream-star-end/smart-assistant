@@ -58,6 +58,7 @@ import {
 import {
   applyServerIncremental,
   detectServerTerminalTurns,
+  isUnresolvedPermissionPrompt,
   mergeArchivedHistory,
   mergeFullServerWins,
   mergeTimelineHistoryPage,
@@ -69,6 +70,7 @@ import {
   type StoredSession,
 } from "../persist";
 import { appUpdate } from "../appUpdate";
+import { observeTimelineShadow } from "../timeline/shadowLifecycle";
 import {
   AUTO_CONTINUE_DISPLAY,
   AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY,
@@ -577,15 +579,16 @@ const STREAM_NOTIFY_MS = 120;
 
 
 const LIVE_PROCESS_UNIT_KINDS = new Set([
-  "thinking", "tool", "plan", "goal", "agent_group", "delegate_progress",
+  "thinking", "tool", "plan", "goal", "agent_group", "delegate_progress", "text",
 ]);
 const LIVE_PROCESS_FRAME_KINDS = new Set([
-  "thinking", "tool_use", "plan", "goal", "agent_group", "delegate_progress",
+  "thinking", "tool_use", "plan", "goal", "agent_group", "delegate_progress", "text",
 ]);
 
 function liveProcessRoleForUnitKind(kind: string | undefined): ChatMessage["role"] | undefined {
   if (kind === "agent_group") return "agent-group";
   if (kind === "delegate_progress") return "delegate-progress";
+  if (kind === "text") return "assistant";
   if (kind === "thinking" || kind === "tool" || kind === "plan" || kind === "goal") return kind;
   return undefined;
 }
@@ -2413,6 +2416,9 @@ export class ChatSocket {
           return;
         }
         if (frame.admitted && frame.peer?.id && frame.clientMessageId) {
+          if (frame.recovery?.automatic === true) {
+            this.adoptMasterAutomaticRecovery(frame.peer.id, frame.clientMessageId, frame.recovery);
+          }
           this.confirmDispatchAdmission(frame.peer.id, frame.clientMessageId);
         }
         if (frame.deduplicated) {
@@ -2524,6 +2530,141 @@ export class ChatSocket {
     void this.deps.syncSession?.(sessId, { clientMessageId });
     this.scheduleNotify();
     return true;
+  }
+
+  /**
+   * Master-scheduled automatic recovery was durably admitted. The browser did
+   * not author that `m-recover-*` cmid, so without adoption the source turn's
+   * terminal red card stays on screen while the retry silently runs and no
+   * activity line is mounted. Mirror exactly what `dispatchTurnRecovery` does
+   * for a browser-owned retry: add the hidden recovery-control user row (so
+   * MessageRenderer hides the source error card), claim the turn as in-flight
+   * and show the unified「模型繁忙，正在重试中（n/10）」soft hint. Idempotent:
+   * every tab of the uid receives the broadcast, REST sync may already have
+   * merged the row, and the same dispatch may ack twice.
+   */
+  private adoptMasterAutomaticRecovery(
+    sessId: string,
+    clientMessageId: string,
+    recovery: NonNullable<AckWire["recovery"]>,
+  ): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    if (!isClientMessageId(recovery.sourceClientMessageId)) return;
+    const attempt = Number.isSafeInteger(recovery.attempt) && recovery.attempt >= 1
+      ? Math.min(recovery.attempt, AUTOMATIC_TURN_RETRY_MAX)
+      : 1;
+    const rootClientMessageId = isClientMessageId(recovery.rootClientMessageId)
+      ? recovery.rootClientMessageId
+      : recovery.sourceClientMessageId;
+    const source = sess.messages.find(
+      (message) => message.role === "user" && message.id === recovery.sourceClientMessageId,
+    );
+    if (source) source._automaticRecoveryAttempted = true;
+    const routing: ChatRoutingSnapshot = {
+      ...(source?._routing ?? sess._lastRouting ?? {}),
+      ...(recovery.model ? { model: recovery.model } : {}),
+    };
+    delete routing.modelSwitchId;
+    const displayText = recovery.displayText ||
+      (recovery.mode === "checkpoint"
+        ? AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY
+        : AUTOMATIC_RECOVERY_REPLAY_DISPLAY);
+    const existing = sess.messages.find(
+      (message) => message.role === "user" && message.id === clientMessageId,
+    );
+    if (!existing) {
+      addMessage(sess, "user", displayText, {
+        id: clientMessageId,
+        status: "sent",
+        _source: "server",
+        _isAutoRetry: true,
+        _routing: routing,
+        _continuationOfClientMessageId: recovery.sourceClientMessageId,
+        _recoveryOfClientMessageId: recovery.sourceClientMessageId,
+        _recoveryMode: recovery.mode,
+        _automaticRecovery: true,
+        _automaticRecoveryRootClientMessageId: rootClientMessageId,
+        _automaticRecoveryAttempt: attempt,
+        _automaticRecoveryMax: AUTOMATIC_TURN_RETRY_MAX,
+      });
+    } else if (existing.status !== "sent") {
+      existing.status = "sent";
+    }
+    // Claim the turn so live frames stamped with this cmid project normally
+    // and TurnActivity mounts; the soft hint replaces the terminal card.
+    const alreadyActive =
+      sess._sendingInFlight && sess._activeClientMessageId === clientMessageId;
+    if (!alreadyActive) {
+      sess._streamingAssistant = null;
+      sess._streamingThinking = null;
+      sess._blockIdToMsgId = new Map();
+      sess._agentSwitchedAt = null;
+      sess._localTeardownAt = undefined;
+      sess._sendingInFlight = true;
+      sess._activeClientMessageId = clientMessageId;
+      sess._activeAgentId = recovery.agentId || sess.agentId;
+      sess._turnStartedAt = Date.now();
+      sess._pendingCostCredits = "0";
+      sess._lastFinaledAssistantId = null;
+      sess._lastFinaledAt = 0;
+      this.resetThinkingSafety(sessId);
+    }
+    this.dispatchSlots.set(sessId, clientMessageId);
+    sess._turnStatus = {
+      kind: "retrying",
+      attempt,
+      max: AUTOMATIC_TURN_RETRY_MAX,
+      retryAt: Date.now(),
+    };
+    sess._lastRouting = { ...routing };
+    this.clearTransientNotice(sessId);
+    this.deps.persistSession?.(sessId);
+    this.scheduleNotify();
+  }
+
+  private adoptPendingAutomaticRecoveryFromHistory(sess: ChatSession): void {
+    if (sess._sendingInFlight) return;
+    let lastUser: ChatMessage | undefined;
+    let terminalAfterUser = false;
+    for (let index = sess.messages.length - 1; index >= 0; index -= 1) {
+      const message = sess.messages[index]!;
+      if (message.role === "user") {
+        lastUser = message;
+        break;
+      }
+      if (
+        message.role === "assistant" &&
+        (message._source === "server" || !!message._turnTapeId) &&
+        (!!message._errorCode || (typeof message.text === "string" && message.text.trim().length > 0))
+      ) {
+        terminalAfterUser = true;
+      }
+    }
+    if (
+      !lastUser ||
+      terminalAfterUser ||
+      lastUser._automaticRecovery !== true ||
+      !isClientMessageId(lastUser._recoveryOfClientMessageId) ||
+      !isClientMessageId(lastUser.id) ||
+      (lastUser._source !== "server" && !lastUser._turnTapeId)
+    ) return;
+    const attempt = typeof lastUser._automaticRecoveryAttempt === "number" &&
+        Number.isSafeInteger(lastUser._automaticRecoveryAttempt) &&
+        lastUser._automaticRecoveryAttempt >= 1
+      ? lastUser._automaticRecoveryAttempt
+      : 1;
+    this.adoptMasterAutomaticRecovery(sess.id, lastUser.id, {
+      automatic: true,
+      mode: lastUser._recoveryMode === "replay" ? "replay" : "checkpoint",
+      sourceClientMessageId: lastUser._recoveryOfClientMessageId,
+      rootClientMessageId: isClientMessageId(lastUser._automaticRecoveryRootClientMessageId)
+        ? lastUser._automaticRecoveryRootClientMessageId
+        : lastUser._recoveryOfClientMessageId,
+      attempt,
+      max: AUTOMATIC_TURN_RETRY_MAX,
+      ...(lastUser._routing?.model ? { model: lastUser._routing.model } : {}),
+    });
   }
 
   /** Atomic master lineage rejection: remove only the deterministic recovery
@@ -3539,6 +3680,12 @@ export class ChatSocket {
         0,
       );
     }
+    // Reload / reconnect fallback for a master-scheduled retry that is still
+    // running: the broadcast ack may have been missed, but the persisted
+    // `m-recover-*` row is in the sync payload. If it is the last user row and
+    // no terminal assistant row follows it, adopt it so the source red card is
+    // hidden and「模型繁忙，正在重试中（n/10）」shows, same as the live path.
+    if (this.masterOwnsAutomaticRecovery) this.adoptPendingAutomaticRecoveryFromHistory(s);
     // Login/reload can open WS before REST history arrives. If that initial
     // shell hello had no user-row identity it can only produce a generic
     // resume_failed. Once full history exposes trailing persisted user rows,
@@ -3665,7 +3812,13 @@ export class ChatSocket {
                   raw.tapeProjectionVersion,
                 );
               }
-              this.applyLiveUnits(sessId, raw.units, [...resetOwnerIds], raw.resume);
+              this.applyLiveUnits(
+                sessId,
+                raw.units,
+                [...resetOwnerIds],
+                raw.resume,
+                raw.streamGeneration,
+              );
               if (raw.resume) {
                 cursor = raw.resume.recordId;
                 const sessionKey = raw.resume.sessionKey;
@@ -3957,6 +4110,11 @@ export class ChatSocket {
     sess.messages = sess.messages.filter((message) => {
       if (message.role === "user") return true;
       if (message._source === "server" || !!message._turnTapeId) return true;
+      // INC-20260903-PENDING-PERMISSION-LOST: the journal cursor is already
+      // past the request frame; dropping the card here loses the only handle
+      // the user has to unblock the engine. mergeFullServerWins keeps the same
+      // rows on the REST path.
+      if (isUnresolvedPermissionPrompt(message)) return true;
       if (preserveStreamingPointer && message === streamingAssistant) return true;
       if (shouldRetainLiveProcessOnOwnerReset(message, authority, incomingProcessOwners)) {
         return true;
@@ -3987,13 +4145,18 @@ export class ChatSocket {
     units: import("@openclaude/protocol").LiveUnit[],
     resetClientMessageIds: string[] = [],
     resume?: { sessionKey: string; frameSeq: number; recordId: string },
+    streamGeneration = 0,
   ): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
+    const preReset = sess.messages.slice();
+    const generation = typeof streamGeneration === "number" && Number.isSafeInteger(streamGeneration)
+      ? Math.max(0, streamGeneration)
+      : 0;
+    const mapped = units.map((unit) => liveUnitToMessage(unit, { streamGeneration: generation }));
     if (resetClientMessageIds.length > 0) {
       this.resetOwnerLocalRows(sess, resetClientMessageIds, liveProcessOwnersFromUnits(units));
     }
-    const mapped = units.map(liveUnitToMessage);
     sess.messages = prependLiveUnitMessages(sess.messages, mapped);
     restoreLiveUnitStreamingState(sess, units);
     if (resume?.sessionKey && resume.frameSeq > 0) {
@@ -4007,6 +4170,12 @@ export class ChatSocket {
     normalizeDelegateCards(sess);
     normalizeGoalCards(sess);
     sess.messages = repairPostFinalProcessOrder(sess.messages);
+    observeTimelineShadow({
+      entry: "live-units",
+      sessionId: sessId,
+      input: [...preReset, ...mapped],
+      oldOutput: sess.messages,
+    });
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
   }
@@ -4014,7 +4183,7 @@ export class ChatSocket {
   prependLiveUnits(sessId: string, units: import("@openclaude/protocol").LiveUnit[]): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
-    sess.messages = prependLiveUnitMessages(sess.messages, units.map(liveUnitToMessage));
+    sess.messages = prependLiveUnitMessages(sess.messages, units.map((unit) => liveUnitToMessage(unit)));
     rebuildIndexes(sess);
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
@@ -4038,6 +4207,7 @@ export class ChatSocket {
   ): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
+    const preReset = sess.messages.slice();
     if (resetClientMessageIds.length > 0) {
       const resetSessionKeys = new Set<string>();
       for (const record of frames) {
@@ -4112,6 +4282,12 @@ export class ChatSocket {
     normalizeDelegateCards(sess);
     normalizeGoalCards(sess);
     sess.messages = repairPostFinalProcessOrder(sess.messages);
+    observeTimelineShadow({
+      entry: "durable-frames",
+      sessionId: sessId,
+      input: [...preReset, ...sess.messages],
+      oldOutput: sess.messages,
+    });
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
   }

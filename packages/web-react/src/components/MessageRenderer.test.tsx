@@ -7,6 +7,8 @@ import { applyOutboundMessage } from "../lib/chat/reducer";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS } from "./MessageRenderer";
+import * as MarkdownMod from "./Markdown";
+import { PAINT_MIN_ITEMS } from "../lib/chat/timelinePaint";
 import { createStickToBottomController } from "./chat/stickToBottom";
 import { resetPermissionAutoOpenMemory, type PermissionRespond } from "./chat/PermissionCard";
 import { ResponseRatingProvider } from "./chat/ResponseRating";
@@ -2392,7 +2394,7 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     scroller.remove();
   });
 
-  test("视口足够高且窗口≥160 时只绘制附近行，数据窗口计数仍完整", async () => {
+  test("视口足够高且窗口≥80 时只绘制附近行，数据窗口计数仍完整", async () => {
     const scroller = document.createElement("div");
     document.body.appendChild(scroller);
     Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 600 });
@@ -2417,9 +2419,14 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     const list = screen.getByTestId("timeline-short-list");
     expect(list.getAttribute("data-timeline-window-count")).toBe("220");
     const painted = Number(list.getAttribute("data-timeline-paint-count"));
-    expect(painted).toBeGreaterThanOrEqual(36);
+    // PAINT_ENABLE_ITEMS 160→80, overscan 改按像素后 PAINT_MIN_ITEMS 36→12；
+    // 600px 视口邻域远小于整段 220 行，spacer 仍在。
+    expect(painted).toBeGreaterThanOrEqual(PAINT_MIN_ITEMS);
     expect(painted).toBeLessThan(220);
-    expect(scroller.querySelector("[data-testid=timeline-paint-spacer-bottom]")).toBeTruthy();
+    expect(
+      scroller.querySelector("[data-testid=timeline-paint-spacer-bottom]") ||
+      scroller.querySelector("[data-testid=timeline-paint-spacer-top]"),
+    ).toBeTruthy();
     scroller.remove();
   });
 
@@ -2505,6 +2512,116 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     scroller.remove();
   });
 
+  test("画窗开启且已离底时，乐观用户行仍绘制，不落进底 spacer", () => {
+    const stick = createStickToBottomController();
+    stick.following.current = false;
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 600 });
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 20_000 });
+    scroller.scrollTop = 19_400;
+    const history = Array.from({ length: 90 }, (_, index) =>
+      mk("user", { id: "echo-hist-" + index, text: "历史记录 " + index, status: "sent" }),
+    );
+    const view = render(
+      <MessageList
+        messages={history}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={stick.canRestick}
+      />,
+      { container: scroller },
+    );
+    view.rerender(
+      <MessageList
+        messages={[
+          ...history,
+          mk("user", { id: "echo-user", text: "刚刚发送", status: "sending" }),
+        ]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={stick.canRestick}
+      />,
+    );
+    expect(screen.getByText("刚刚发送")).toBeInTheDocument();
+    const userRow = scroller.querySelector('[data-chat-virtual-key="echo-user"]');
+    expect(userRow).toBeInstanceOf(HTMLElement);
+    expect(userRow).toHaveClass("chat-timeline-row-live");
+    scroller.remove();
+  });
+
+  test("贴底流式且本轮 user 靠近画窗时仍绘制用户气泡", () => {
+    const stick = createStickToBottomController();
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 600 });
+    const history = Array.from({ length: 80 }, (_, index) =>
+      mk("user", { id: "stream-hist-" + index, text: "历史记录 " + index, status: "sent" }),
+    );
+    const user = mk("user", { id: "stream-user", text: "本轮问题", status: "sent" });
+    const tools = Array.from({ length: 8 }, (_, index) =>
+      mk("tool", {
+        id: "stream-tool-" + index,
+        toolName: "Bash",
+        inputJson: { command: "echo " + index },
+        _completed: true,
+      }),
+    );
+    render(
+      <MessageList
+        messages={[...history, user, ...tools]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={stick.canRestick}
+      />,
+      { container: scroller },
+    );
+    expect(screen.getByText("本轮问题")).toBeInTheDocument();
+    expect(scroller.querySelector('[data-chat-virtual-key="stream-user"]')).toBeInstanceOf(HTMLElement);
+    scroller.remove();
+  });
+
+  test("空闲贴底不钉上轮 user：尾部很长时用户行可卸出画窗", () => {
+    const stick = createStickToBottomController();
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 600 });
+    const history = Array.from({ length: 80 }, (_, index) =>
+      mk("user", { id: "idle-hist-" + index, text: "历史记录 " + index, status: "sent" }),
+    );
+    const user = mk("user", { id: "idle-user", text: "上轮问题", status: "sent" });
+    const tools = Array.from({ length: 40 }, (_, index) =>
+      mk("tool", {
+        id: "idle-tool-" + index,
+        toolName: "Bash",
+        inputJson: { command: "echo " + index },
+        _completed: true,
+      }),
+    );
+    render(
+      <MessageList
+        messages={[...history, user, ...tools]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={stick.canRestick}
+      />,
+      { container: scroller },
+    );
+    expect(screen.queryByText("上轮问题")).toBeNull();
+    expect(scroller.querySelector('[data-chat-virtual-key="idle-user"]')).toBeNull();
+    scroller.remove();
+  });
+
   test("后台恢复不重挂时间线，hidden→visible 后活动 Footer 身份保持", async () => {
     const scroller = document.createElement("div");
     document.body.appendChild(scroller);
@@ -2541,6 +2658,96 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     expect(screen.queryByTestId("timeline-fatal-error")).toBeNull();
     visibilitySpy.mockRestore();
     view.unmount();
+    scroller.remove();
+  });
+
+  test("贴底后空闲预热行高，用户手势立即中止", async () => {
+    const queued: Array<() => void> = [];
+    const cancelIdle = vi.fn();
+    vi.stubGlobal("requestIdleCallback", (cb: () => void) => {
+      queued.push(cb);
+      return queued.length;
+    });
+    vi.stubGlobal("cancelIdleCallback", cancelIdle);
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = Array.from({ length: 40 }, (_, index) =>
+      mk("user", { id: "warm-row-" + index, text: "预热 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    await act(async () => {});
+    expect(queued.length).toBeGreaterThan(0);
+    fireEvent.wheel(scroller);
+    expect(cancelIdle).toHaveBeenCalled();
+    vi.unstubAllGlobals();
+    scroller.remove();
+  });
+
+  test("进会话即预取 MarkdownImpl chunk", () => {
+    const spy = vi.spyOn(MarkdownMod, "prefetchMarkdownImpl");
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    render(
+      <MessageList
+        messages={[mk("user", { id: "prefetch-user", text: "hi", status: "sent" })]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    expect(spy).toHaveBeenCalled();
+    spy.mockRestore();
+    scroller.remove();
+  });
+
+  test("初始尾部 deferred locator 不等 IntersectionObserver 即兑付", async () => {
+    vi.stubGlobal("IntersectionObserver", class {
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+      takeRecords() { return []; }
+    });
+    const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([
+      mk("assistant", { id: "eager-body", text: "提前兑付的正文" }),
+    ]);
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = [
+      ...Array.from({ length: 12 }, (_, index) =>
+        mk("user", { id: "eager-early-" + index, text: "早记录 " + index, status: "sent" }),
+      ),
+      mk("assistant", {
+        id: "eager-body",
+        text: "",
+        _payloadDeferred: true,
+        _turnTapeId: "tape-eager",
+        _recordOrdinal: 3,
+      }),
+    ];
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{ onFetchTapeRecordPayload }}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    await waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalled());
+    expect(await screen.findByText("提前兑付的正文")).toBeInTheDocument();
+    vi.unstubAllGlobals();
     scroller.remove();
   });
 });

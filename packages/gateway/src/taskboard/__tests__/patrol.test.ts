@@ -32,8 +32,12 @@ import {
   type PatrolDelegateResult,
   PatrolEngine,
   type RunUsageLookup,
+  formatStageProjectContext,
+  STAGE_PROJECT_CONTEXT_MAX_CHARS,
+  STAGE_PROJECT_CONTEXT_TRUNC,
   resetSharedPatrolState,
 } from '../patrol.js'
+import { alignedLeaseTtlMs } from '../domain.js'
 import { assertTransition } from '../stateMachine.js'
 
 const dirs: string[] = []
@@ -118,6 +122,48 @@ function makeStagesAlwaysDue(db: TaskboardDb, pipelineId: string): void {
     })
   }
 }
+
+describe('formatStageProjectContext', () => {
+  it('空快照返回 null;有 instructions / overlay 则拼只读段', () => {
+    assert.equal(formatStageProjectContext({}), null)
+    assert.equal(formatStageProjectContext({ instructions: '  ' }), null)
+    const text = formatStageProjectContext({
+      instructions: '优先修 gateway。',
+      skillOverlay: ['board-ops'],
+    })
+    assert.ok(text)
+    assert.match(text, /优先修 gateway。/)
+    assert.match(text, /本阶段无 MCP skills/)
+    assert.match(text, /board-ops/)
+    const fromSkills = formatStageProjectContext({
+      instructions: 'x',
+      skills: [{ name: 'alpha' }],
+    })
+    assert.match(fromSkills ?? '', /alpha/)
+  })
+
+  it('最终注入串整体 ≤4k：说明优先，技能按需裁剪并留截断标记', () => {
+    const longIns = '项'.repeat(STAGE_PROJECT_CONTEXT_MAX_CHARS + 1)
+    const clipped = formatStageProjectContext({ instructions: longIns, skillOverlay: ['board-ops'] })
+    assert.ok(clipped)
+    assert.ok(clipped.length <= STAGE_PROJECT_CONTEXT_MAX_CHARS)
+    assert.equal(clipped.endsWith(STAGE_PROJECT_CONTEXT_TRUNC), true)
+    assert.match(clipped, /^项+/)
+    assert.doesNotMatch(clipped, /board-ops/)
+
+    const exact = formatStageProjectContext({ instructions: '优'.repeat(STAGE_PROJECT_CONTEXT_MAX_CHARS) })
+    assert.equal(exact?.length, STAGE_PROJECT_CONTEXT_MAX_CHARS)
+
+    const many = Array.from({ length: 1000 }, (_, i) => `skill-${String(i).padStart(4, '0')}`)
+    const listed = formatStageProjectContext({ instructions: '短说明', skillOverlay: many })
+    assert.ok(listed)
+    assert.ok(listed.length <= STAGE_PROJECT_CONTEXT_MAX_CHARS, `got ${listed.length}`)
+    assert.match(listed, /短说明/)
+    assert.match(listed, new RegExp(STAGE_PROJECT_CONTEXT_TRUNC.replace(/[[\]]/g, '\\$&')))
+    assert.match(listed, /skill-0000/)
+    assert.doesNotMatch(listed, /skill-0999/)
+  })
+})
 
 describe('端到端:需求单无人干预走到 waiting_human', () => {
   it('建单 → 批准 → 两轮 tick 自动推进需求澄清与方案设计', async () => {
@@ -261,6 +307,49 @@ describe('lease 互斥', () => {
     finish()
     await pending
     assert.ok(listRuns(db, { ticketId: ticket.id }).items.some((r) => r.status === 'succeeded'))
+    db.close()
+  })
+
+  it('短 timeout 的 claim 与第一次 renew 使用同一对齐 TTL', async () => {
+    const db = freshDb()
+    const { ticket } = seedReadyAi(db, { timeoutSec: 600 })
+    let now = WORK.getTime()
+    let started!: () => void
+    let finish!: () => void
+    const didStart = new Promise<void>((resolve) => { started = resolve })
+    const delegated = new Promise<void>((resolve) => { finish = resolve })
+    const engineLease = 50 * 60 * 1000
+    const renewEvery = 40
+    const expectedTtl = alignedLeaseTtlMs(600, engineLease, renewEvery)
+    const eng = engine(
+      db,
+      async () => {
+        started()
+        await delegated
+        return { ok: true, output: '对齐 TTL' }
+      },
+      { now: () => now, leaseTtlMs: engineLease, leaseRenewIntervalMs: renewEvery },
+    )
+    const pending = eng.tick(new Date(now))
+    await didStart
+    const initial = listRuns(db, { ticketId: ticket.id, status: 'running' }).items[0]
+    assert.ok(initial?.leaseExpiresAt)
+    assert.equal(initial.leaseExpiresAt - now, expectedTtl)
+    now += 80
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    const renewed = getRun(db, initial.id)
+    assert.ok(renewed?.leaseExpiresAt)
+    const remaining = renewed.leaseExpiresAt - now
+    assert.ok(
+      remaining <= expectedTtl + 5,
+      `renew remaining ${remaining} exceeded aligned ${expectedTtl}`,
+    )
+    assert.ok(
+      remaining < engineLease / 2,
+      `renew jumped back toward default 50min: remaining=${remaining}`,
+    )
+    finish()
+    await pending
     db.close()
   })
 
@@ -545,6 +634,9 @@ describe('依赖 / 日配额 / 准入', () => {
     assert.equal(report.started, 0)
     const skipped = listRuns(db, { ticketId: ticket.id, status: 'skipped' }).items
     assert.ok(skipped.some((r) => r.skipReason === 'entry_condition'))
+    const skippedRun = skipped.find((r) => r.skipReason === 'entry_condition')
+    assert.ok(skippedRun)
+    assert.ok(skippedRun.finishedAt != null, 'skipped run 必须写 finished_at')
     db.close()
   })
 })
@@ -760,6 +852,7 @@ function seedReadyAi(
     maxRunsPerDay?: number
     entryCondition?: string | null
     model?: string | null
+    timeoutSec?: number
   } = {},
 ): {
   ticket: ReturnType<typeof createTicket>
@@ -793,6 +886,7 @@ function seedReadyAi(
     onFailure: stageOver.onFailure ?? 'retry',
     entryCondition: stageOver.entryCondition ?? null,
     model: stageOver.model ?? null,
+    timeoutSec: stageOver.timeoutSec,
   })
   const ticket = createTicket(db, {
     projectId: project.id,

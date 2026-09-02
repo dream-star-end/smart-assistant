@@ -732,6 +732,36 @@ describe("materializeLosslessTurn", () => {
     }), /does not match requestId/);
   });
 
+  test("retains the cursor engine discriminator and rejects unknown engines", () => {
+    const sessionId = "web-lossless-cursor";
+    const cursorBilling = {
+      requestId: "7".repeat(32),
+      engine: "cursor" as const,
+      turnKey: TURN_KEY,
+      engineSessionId: `oceng-${"8".repeat(48)}`,
+      status: "success" as const,
+      durationMs: 42,
+      usage: { input_tokens: 1129142, output_tokens: 10524, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    };
+    const base = {
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed" as const,
+      turnKey: TURN_KEY,
+      requestId: cursorBilling.requestId,
+      text: "cursor answer",
+      createdAt: 1_788_327_689_956,
+    };
+    const turn = materializeLosslessTurn({ ...base, engineBilling: cursorBilling });
+    assert.deepEqual(turn.engineBillings, [cursorBilling]);
+    assert.equal(turn.engineBillings[0]!.engine, "cursor");
+    assert.throws(
+      () => materializeLosslessTurn({ ...base, engineBilling: { ...cursorBilling, engine: "ccb" } }),
+      /engine is invalid/,
+    );
+  });
+
   test("sums root plus mixed nested delegate goal usage exactly once", () => {
     const turn = materializeLosslessTurn({
       sessionId: "web-lossless-123",

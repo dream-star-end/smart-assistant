@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
+  coalesceDelegateTranscript,
   formatDelegateLiveWorkingDetail,
   formatDelegateParentWorkingDetail,
   makeDelegateBlockPassthrough,
@@ -14,6 +15,92 @@ import {
   summarizeDelegateProgressEvent,
   summarizeDelegateToolForLiveHint,
 } from '../delegateProgress.js'
+
+describe('coalesceDelegateTranscript', () => {
+  it('merges per-token text deltas into one block (Cursor grok regression)', () => {
+    // Real shape from a cursor-grok-4.6-high delegate: one block per token.
+    const tokens = ['我', '先', '读取', '这两个', '环境', '变量', '，', '再', '按', '要求', '只', '回', '一行', '。']
+    const transcript = tokens.map((text) => ({ kind: 'text', text, messageId: 'a-1-s0' }))
+    const out = coalesceDelegateTranscript(transcript)
+    assert.deepEqual(out, [{ kind: 'text', text: '我先读取这两个环境变量，再按要求只回一行。', messageId: 'a-1-s0' }])
+  })
+
+  it('keeps tool blocks as boundaries and merges around them', () => {
+    const out = coalesceDelegateTranscript([
+      { kind: 'thinking', text: 'a' },
+      { kind: 'thinking', text: 'b' },
+      { kind: 'text', text: 'hel' },
+      { kind: 'text', text: 'lo' },
+      { kind: 'tool_use', blockId: 't1', toolName: 'Bash', inputJson: { command: 'env' } },
+      { kind: 'tool_result', toolUseBlockId: 't1', output: 'x=1' },
+      { kind: 'text', text: 'done' },
+      { kind: 'text', text: '.' },
+      { kind: 'final', meta: {} },
+    ])
+    assert.deepEqual(out, [
+      { kind: 'thinking', text: 'ab' },
+      { kind: 'text', text: 'hello' },
+      { kind: 'tool_use', blockId: 't1', toolName: 'Bash', inputJson: { command: 'env' } },
+      { kind: 'tool_result', toolUseBlockId: 't1', output: 'x=1' },
+      { kind: 'text', text: 'done.' },
+      { kind: 'final', meta: {} },
+    ])
+  })
+
+  it('does not merge text into or across a thinking block', () => {
+    const out = coalesceDelegateTranscript([
+      { kind: 'text', text: 'a' },
+      { kind: 'thinking', text: 'hmm' },
+      { kind: 'text', text: 'b' },
+    ])
+    assert.deepEqual(out, [
+      { kind: 'text', text: 'a' },
+      { kind: 'thinking', text: 'hmm' },
+      { kind: 'text', text: 'b' },
+    ])
+  })
+
+  it('treats nested-delegate marker blocks as hard boundaries', () => {
+    const marker = {
+      kind: 'text',
+      text: '【嵌套委派 · researcher】\n目标：x\n状态：ok',
+      _nestedDelegateRunId: 'dlg-2',
+      _nestedDelegateAgentId: 'researcher',
+      _nestedDelegateStatus: 'ok',
+    }
+    const out = coalesceDelegateTranscript([
+      { kind: 'text', text: 'parent ' },
+      { kind: 'text', text: 'says' },
+      marker,
+      { kind: 'text', text: 'child ' },
+      { kind: 'text', text: 'says' },
+    ])
+    assert.deepEqual(out, [
+      { kind: 'text', text: 'parent says' },
+      marker,
+      { kind: 'text', text: 'child says' },
+    ])
+  })
+
+  it('drops empty text/thinking blocks and passes through non-object entries', () => {
+    const out = coalesceDelegateTranscript([
+      { kind: 'text', text: '' },
+      { kind: 'thinking' },
+      null,
+      { kind: 'text', text: 'ok' },
+      { kind: 'error', error: 'boom' },
+    ])
+    assert.deepEqual(out, [null, { kind: 'text', text: 'ok' }, { kind: 'error', error: 'boom' }])
+  })
+
+  it('does not mutate the input blocks', () => {
+    const first = { kind: 'text', text: 'a' }
+    const input = [first, { kind: 'text', text: 'b' }]
+    coalesceDelegateTranscript(input)
+    assert.equal(first.text, 'a')
+    assert.equal(input.length, 2)
+  })
+})
 
 describe('delegate progress sanitization', () => {
   it('strips control chars and truncates text', () => {

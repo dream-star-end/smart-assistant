@@ -298,6 +298,66 @@ export function summarizeDelegateProgressEvent(
  * block can be forwarded byte-for-byte. Presentation summaries remain a
  * separate legacy field and never rewrite the authoritative `block`.
  */
+/**
+ * Coalesce a delegate child's durable transcript before it becomes the
+ * server-authored team card's `childBlocks`.
+ *
+ * Engines stream `text` / `thinking` as one block per delta (Cursor grok is
+ * one block per token). The live path already merges adjacent same-kind text
+ * (`protocol/liveUnits.appendSubagentBlock`, `web-react reducer.appendSubagentBlock`),
+ * but `DurableAgentGroup.transcript` was persisted raw and master maps it 1:1
+ * to `childBlocks`. The web client then prefers the longer server array over
+ * its merged local card, so a 12-token sentence rendered as 12 one-word rows.
+ *
+ * Rules (mirror the live reducers):
+ *   - adjacent `text`/`text` and `thinking`/`thinking` blocks merge into one;
+ *     `messageId` of the first block is kept (segment identity), text is
+ *     concatenated byte-for-byte.
+ *   - a block carrying nested-delegate markers (`_nestedDelegate*`) never merges
+ *     into a neighbour — it is a structural boundary, not model prose.
+ *   - empty-text blocks are dropped (same as the live reducers' `if (!text) return`).
+ *   - everything else (tool_use / tool_result / tool_output_tail / plan / goal /
+ *     error / final / unknown) is passed through unchanged, in order.
+ */
+export function coalesceDelegateTranscript(transcript: readonly unknown[]): unknown[] {
+  const out: unknown[] = []
+  for (const raw of transcript) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      out.push(raw)
+      continue
+    }
+    const block = raw as Record<string, unknown>
+    const kind = block.kind
+    if (kind !== 'text' && kind !== 'thinking') {
+      out.push(raw)
+      continue
+    }
+    const text = typeof block.text === 'string' ? block.text : ''
+    if (!text) continue
+    const isBoundary = Object.keys(block).some((key) => key.startsWith('_nestedDelegate'))
+    const last = out[out.length - 1]
+    const lastBlock =
+      last && typeof last === 'object' && !Array.isArray(last)
+        ? (last as Record<string, unknown>)
+        : null
+    const lastIsBoundary = lastBlock
+      ? Object.keys(lastBlock).some((key) => key.startsWith('_nestedDelegate'))
+      : false
+    if (
+      lastBlock &&
+      !isBoundary &&
+      !lastIsBoundary &&
+      lastBlock.kind === kind &&
+      typeof lastBlock.text === 'string'
+    ) {
+      out[out.length - 1] = { ...lastBlock, text: lastBlock.text + text }
+      continue
+    }
+    out.push({ ...block })
+  }
+  return out
+}
+
 export function makeDelegateBlockPassthrough(
   event: any,
   runId: string,

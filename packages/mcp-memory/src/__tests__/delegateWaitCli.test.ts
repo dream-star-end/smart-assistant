@@ -8,6 +8,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import {
+  delegateWaitExitCode,
   isTransientDelegateWaitError,
   resolveDelegateCliForegroundBudgetMs,
   runDelegateWaitLoop,
@@ -180,5 +181,81 @@ describe('runDelegateWaitLoop', () => {
       resolveDelegateCliForegroundBudgetMs({ OPENCLAUDE_DELEGATE_CLI_FOREGROUND_BUDGET_MS: '999999999' }),
       55 * 60_000,
     )
+  })
+
+  it('exit != 0 only when no job is still running', () => {
+    assert.equal(delegateWaitExitCode({ pendingCount: 1, results: [{ kind: 'error', text: 'x' }] }), 0)
+    assert.equal(delegateWaitExitCode({ pendingCount: 0, results: [{ kind: 'error', text: 'x' }] }), 2)
+    assert.equal(delegateWaitExitCode({ pendingCount: 0, results: [{ kind: 'ok', text: 'x' }] }), 0)
+  })
+
+  it('queued wait is still-running, not a failed exit', async () => {
+    let n = 0
+    const r = await runDelegateWaitLoop({
+      jobIds: ['dlgjob-q'],
+      pollWaitMs: 20,
+      waitOnce: async (jobId) => {
+        n++
+        if (n === 1) {
+          return { statusCode: 200, body: JSON.stringify({ status: 'queued', jobId }) }
+        }
+        return { statusCode: 200, body: doneBody(jobId, '放行后完成') }
+      },
+    })
+    assert.equal(r.exitCode, 0, r.stderr)
+    assert.match(r.stdout, /放行后完成/)
+  })
+
+  it('capacity 429 failed is a terminal error only when no sibling is running', async () => {
+    const r = await runDelegateWaitLoop({
+      jobIds: ['dlgjob-dead'],
+      pollWaitMs: 20,
+      waitOnce: async (jobId) => ({
+        statusCode: 429,
+        body: JSON.stringify({
+          status: 'failed',
+          jobId,
+          httpStatus: 429,
+          error: 'too many concurrent delegations (max 4 non-review; in-use 4/4); 已等待 90s 资源仍紧张,请稍后重试',
+          failure_class: 'capacity_timeout',
+        }),
+      }),
+    })
+    assert.equal(r.exitCode, 2)
+    assert.match(r.stdout, /委派失败/)
+    assert.match(r.stdout, /max 4 non-review/)
+    assert.doesNotMatch(r.stdout, /仍在运行/)
+  })
+
+  it('fanout: one capacity fail + one still running → exit 0 and resume the live job', async () => {
+    let now = 0
+    const r = await runDelegateWaitLoop({
+      jobIds: ['dlgjob-dead', 'dlgjob-live'],
+      pollWaitMs: 250,
+      foregroundBudgetMs: 250,
+      now: () => now,
+      sleep: async () => {},
+      waitOnce: async (jobId, waitMs) => {
+        now = Math.max(now, waitMs)
+        if (jobId === 'dlgjob-dead') {
+          return {
+            statusCode: 429,
+            body: JSON.stringify({
+              status: 'failed',
+              jobId,
+              httpStatus: 429,
+              error: 'too many concurrent delegations (max 4 non-review; in-use 4/4)',
+              failure_class: 'capacity_timeout',
+            }),
+          }
+        }
+        return { statusCode: 200, body: JSON.stringify({ status: 'running', jobId }) }
+      },
+    })
+    assert.equal(r.exitCode, 0, 'live sibling forbids a failed exit')
+    assert.match(r.stdout, /委派失败|too many concurrent/)
+    assert.match(r.stdout, /status=running jobId=dlgjob-live/)
+    assert.match(r.stdout, /oc-memory delegate-wait dlgjob-live/)
+    assert.doesNotMatch(r.stdout, /delegate-wait dlgjob-dead/)
   })
 })

@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "flavor": "selfhost",
+  "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "builder": "deploy-v5-selfhost.sh",
+  "expectedHosts": ["v3-dev-sg"],
+  "expectedRoots": ["/opt/openclaude/openclaude-v5-selfhost"],
+  "expectedDbNames": ["openclaude_v5_selfhost"],
+  "guardGeneration": 1
+}

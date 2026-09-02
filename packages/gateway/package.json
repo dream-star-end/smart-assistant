@@ -16,9 +16,11 @@
     "@openclaude/plugin-sdk": "*",
     "@openclaude/protocol": "*",
     "@openclaude/storage": "*",
+    "ajv": "^8.20.0",
     "better-sqlite3": "^11.3.0",
     "mammoth": "^1.12.0",
     "pdf-parse": "^2.4.5",
+    "protobufjs": "^8.8.0",
     "sharp": "^0.34.3",
     "ws": "^8.18.0",
     "yaml": "^2.6.0"

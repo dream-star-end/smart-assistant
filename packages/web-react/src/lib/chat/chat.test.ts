@@ -4399,6 +4399,53 @@ describe("Phase-A final-only tape projection retry", () => {
     sock.stop();
   });
 
+  test("owner reset keeps an unresolved permission card and drops a resolved one (INC-20260903-PENDING-PERMISSION-LOST)", () => {
+    const sessionId = "s-frames-reset-keep-permission";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess.messages = [
+      { id: clientMessageId, role: "user", text: "q", ts: 1, _source: "server" },
+      {
+        id: `perm-open-${sessionId}`,
+        role: "permission",
+        text: "",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+        _turnOwnerId: clientMessageId,
+        toolName: "AskUserQuestion",
+        _resolved: false,
+      } as ChatMessage,
+      {
+        id: `perm-done-${sessionId}`,
+        role: "permission",
+        text: "",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+        _turnOwnerId: clientMessageId,
+        toolName: "Bash",
+        _resolved: true,
+      } as ChatMessage,
+      {
+        id: `perm-expired-${sessionId}`,
+        role: "permission",
+        text: "",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+        _turnOwnerId: clientMessageId,
+        toolName: "AskUserQuestion",
+        _resolved: false,
+        _askUserExpiresAt: 1,
+      } as ChatMessage,
+    ];
+    sock.applyDurableLiveFrames(sessionId, [], [clientMessageId]);
+    expect(sess.messages.map((message) => message.id)).toEqual([
+      clientMessageId,
+      `perm-open-${sessionId}`,
+    ]);
+    sock.stop();
+  });
+
   test("live-units reset with thinking/tool for the same turn replaces live copies without duplicates", () => {
     const sessionId = "s-units-reset-replace-live";
     const sock = makeSocket();
@@ -4502,6 +4549,223 @@ describe("Phase-A final-only tape projection retry", () => {
     ]);
     expect(sess.messages.some((message) => message.id === `live-thinking-${sessionId}`)).toBe(false);
     expect(sess.messages.some((message) => message.id === `thinking-${sessionId}`)).toBe(true);
+    sock.stop();
+  });
+
+  test("Phase-A unpublished then empty live-units reset keeps interleaved live assistant fragments", () => {
+    const sessionId = "s-interleave-units";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess._sendingInFlight = true;
+    sess._activeClientMessageId = clientMessageId;
+    sess.messages = [
+      unpublishedTimeline(sessionId)[0]!,
+      {
+        id: `live-thinking-${sessionId}`,
+        role: "thinking",
+        text: "live reasoning",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-a1-${sessionId}`,
+        role: "assistant",
+        text: "mid-1",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        output: "ok",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-a2-${sessionId}`,
+        role: "assistant",
+        text: "mid-2",
+        ts: 5,
+        _clientMessageId: clientMessageId,
+      },
+    ];
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+      completedClientMessageId: clientMessageId,
+    });
+    expect(sess._sendingInFlight).toBe(false);
+    sock.applyLiveUnits(sessionId, [], [clientMessageId]);
+    expect(sess.messages.filter((message) => !message._hideUnpublishedFallback).map((message) => message.id)).toEqual([
+      `u-${sessionId}`,
+      `live-thinking-${sessionId}`,
+      `live-a1-${sessionId}`,
+      `live-tool-${sessionId}`,
+      `live-a2-${sessionId}`,
+    ]);
+    expect(sess.messages.some((message) =>
+      message.role === "assistant" && message._hideUnpublishedFallback === true,
+    )).toBe(true);
+    sock.stop();
+  });
+
+  test("Phase-A unpublished then retired live-frames reset keeps interleaved live assistant fragments", () => {
+    const sessionId = "s-interleave-frames";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess._sendingInFlight = true;
+    sess._activeClientMessageId = clientMessageId;
+    sess.messages = [
+      unpublishedTimeline(sessionId)[0]!,
+      {
+        id: `live-thinking-${sessionId}`,
+        role: "thinking",
+        text: "live reasoning",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-a1-${sessionId}`,
+        role: "assistant",
+        text: "mid-1",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-a2-${sessionId}`,
+        role: "assistant",
+        text: "mid-2",
+        ts: 5,
+        _clientMessageId: clientMessageId,
+      },
+    ];
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+      completedClientMessageId: clientMessageId,
+    });
+    sock.applyDurableLiveFrames(sessionId, [], [clientMessageId]);
+    expect(sess.messages.filter((message) => !message._hideUnpublishedFallback).map((message) => message.id)).toEqual([
+      `u-${sessionId}`,
+      `live-thinking-${sessionId}`,
+      `live-a1-${sessionId}`,
+      `live-tool-${sessionId}`,
+      `live-a2-${sessionId}`,
+    ]);
+    expect(sess.messages.some((message) =>
+      message.role === "assistant" && message._hideUnpublishedFallback === true,
+    )).toBe(true);
+    sock.stop();
+  });
+
+  test("Phase-B ordinal assistants replace interleaved live fragments without duplicates", () => {
+    const sessionId = "s-interleave-exact";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    const user = unpublishedTimeline(sessionId)[0]!;
+    sess.messages = [
+      user,
+      {
+        id: `live-a1-${sessionId}`,
+        role: "assistant",
+        text: "mid-1",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-a2-${sessionId}`,
+        role: "assistant",
+        text: "mid-2",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+      },
+    ];
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+      completedClientMessageId: clientMessageId,
+    });
+    const common = {
+      _source: "server" as const,
+      _seq: 2,
+      _orderSeq: 2,
+      _clientMessageId: clientMessageId,
+      _turnTapeId: `tape-${sessionId}`,
+      _turnTapeSha256: "a".repeat(64),
+      _turnTapeComplete: true,
+      _dispatchOutcome: "completed" as const,
+      _timelineRecord: true,
+    };
+    sock.applyServerMessages(sessionId, "main", [
+      user,
+      {
+        id: `tape-a1-${sessionId}`,
+        role: "assistant",
+        text: "mid-1",
+        ts: 2,
+        ...common,
+        _turnTapeOrdinal: 0,
+        _timelineUnitKey: `tape:${sessionId}:0`,
+      },
+      {
+        id: `tape-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        ts: 3,
+        ...common,
+        _turnTapeOrdinal: 1,
+        _timelineUnitKey: `tape:${sessionId}:1`,
+      },
+      {
+        id: `tape-a2-${sessionId}`,
+        role: "assistant",
+        text: "mid-2",
+        ts: 4,
+        ...common,
+        _turnTapeOrdinal: 2,
+        _timelineUnitKey: `tape:${sessionId}:2`,
+      },
+    ], true, 2, {
+      serverUpdatedAt: 3,
+      historyRevision: 2,
+      timelineGeneration: 3,
+      completedClientMessageId: clientMessageId,
+    });
+    expect(sess.messages.map((message) => message.id)).toEqual([
+      `u-${sessionId}`,
+      `tape-a1-${sessionId}`,
+      `tape-tool-${sessionId}`,
+      `tape-a2-${sessionId}`,
+    ]);
+    expect(sess.messages.some((message) => message.id === `live-a1-${sessionId}`)).toBe(false);
+    expect(sess.messages.some((message) =>
+      message.role === "assistant" && message._displayDegradeReason === "records_unpublished",
+    )).toBe(false);
     sock.stop();
   });
 
@@ -6198,6 +6462,205 @@ describe("ChatSocket interrupted continuation", () => {
     expect(sentRecoveries()).toBe(1);
     expect(sock.toStored("s-auto-checkpoint")?.messages[0]._automaticRecoveryAttempted).toBe(true);
     expect(sock.toStored("s-auto-checkpoint")?._automaticRecoveryDecisions?.["u-auto-checkpoint"]).toBe(true);
+    sock.stop();
+  });
+
+  function masterRecoveryTape(sessionId: string): ChatMessage[] {
+    const source = `u-${sessionId}`;
+    return [
+      {
+        id: source,
+        role: "user",
+        text: "long task",
+        ts: 1,
+        status: "error",
+        _source: "server",
+        _routing: { model: "kimi-k3-ark", teamMode: false, effortLevel: "high" },
+      },
+      {
+        id: `tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        ts: 2,
+        _source: "server",
+        _turnTapeId: `tape-${sessionId}`,
+        _clientMessageId: source,
+      },
+      {
+        id: `error-${sessionId}`,
+        role: "assistant",
+        text: "",
+        ts: 3,
+        _source: "server",
+        _turnTapeId: `tape-${sessionId}`,
+        _clientMessageId: source,
+        _errorCode: "upstream_failed",
+      },
+    ];
+  }
+
+  test("master-owned automatic recovery ack adopts the m-recover row, hides the source card and shows the unified retrying hint", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: async () => {} });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    ws.onmessage?.({
+      data: JSON.stringify({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1" }),
+    });
+    const session = sock.ensureSession("s-master-recover", "main");
+    session.messages.push(...masterRecoveryTape("s-master-recover"));
+    const oldRows = structuredClone(session.messages);
+    // Browser cedes automatic recovery to master: no browser-authored retry.
+    await (sock as any).autoRecoverTerminalTurn("s-master-recover", "u-s-master-recover");
+    await Promise.resolve();
+    expect(ws.sent.map((raw) => JSON.parse(raw).type)).not.toContain("inbound.message");
+    expect(session._sendingInFlight).toBeFalsy();
+
+    const ack = {
+      type: "outbound.ack",
+      admitted: true,
+      idempotencyKey: "recover-1",
+      peer: { id: "s-master-recover", kind: "dm" },
+      clientMessageId: "m-recover-abc123",
+      recovery: {
+        automatic: true,
+        mode: "checkpoint",
+        sourceClientMessageId: "u-s-master-recover",
+        rootClientMessageId: "u-s-master-recover",
+        attempt: 2,
+        max: 10,
+        agentId: "main",
+        model: "kimi-k3-ark",
+        displayText: "↻ 自动从断点继续",
+      },
+    };
+    ws.onmessage?.({ data: JSON.stringify(ack) });
+
+    expect(session.messages.slice(0, oldRows.length)).toEqual([
+      { ...oldRows[0], _automaticRecoveryAttempted: true },
+      ...oldRows.slice(1),
+    ]);
+    expect(session.messages).toHaveLength(oldRows.length + 1);
+    const recovery = session.messages.at(-1)!;
+    expect(recovery).toMatchObject({
+      id: "m-recover-abc123",
+      role: "user",
+      text: "↻ 自动从断点继续",
+      status: "sent",
+      _source: "server",
+      _isAutoRetry: true,
+      _recoveryOfClientMessageId: "u-s-master-recover",
+      _recoveryMode: "checkpoint",
+      _automaticRecovery: true,
+      _automaticRecoveryRootClientMessageId: "u-s-master-recover",
+      _automaticRecoveryAttempt: 2,
+      _automaticRecoveryMax: 10,
+      _routing: { model: "kimi-k3-ark", teamMode: false, effortLevel: "high" },
+    });
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._activeClientMessageId).toBe("m-recover-abc123");
+    expect(session._activeAgentId).toBe("main");
+    expect(session._turnStatus).toMatchObject({ kind: "retrying", attempt: 2, max: 10 });
+    expect(sock.getTransientNotice("s-master-recover")).toBeNull();
+
+    // Same broadcast reaching this tab twice (or REST sync already merged the
+    // row) must not duplicate the recovery row nor reset the claimed turn.
+    const startedAt = session._turnStartedAt;
+    ws.onmessage?.({ data: JSON.stringify(ack) });
+    expect(session.messages).toHaveLength(oldRows.length + 1);
+    expect(session._activeClientMessageId).toBe("m-recover-abc123");
+    expect(session._turnStartedAt).toBe(startedAt);
+
+    // A plain admitted ack for a cmid the browser does not own is still ignored.
+    const other = sock.ensureSession("s-master-plain", "main");
+    other.messages.push(...masterRecoveryTape("s-master-plain"));
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.ack",
+        admitted: true,
+        peer: { id: "s-master-plain", kind: "dm" },
+        clientMessageId: "m-recover-plain",
+      }),
+    });
+    expect(other.messages).toHaveLength(3);
+    expect(other._sendingInFlight).toBeFalsy();
+    sock.stop();
+  });
+
+  test("sync history adopts a still-running master recovery row when master owns automatic recovery", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: async () => {} });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    ws.onmessage?.({
+      data: JSON.stringify({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1" }),
+    });
+    const session = sock.ensureSession("s-master-sync", "main");
+    const rows: ChatMessage[] = [
+      ...masterRecoveryTape("s-master-sync"),
+      {
+        id: "m-recover-sync1",
+        role: "user",
+        text: "↻ 自动从断点继续",
+        ts: 4,
+        status: "sent",
+        _source: "server",
+        _isAutoRetry: true,
+        _routing: { model: "kimi-k3-ark", teamMode: false, effortLevel: "high" },
+        _recoveryOfClientMessageId: "u-s-master-sync",
+        _recoveryMode: "checkpoint",
+        _automaticRecovery: true,
+        _automaticRecoveryRootClientMessageId: "u-s-master-sync",
+        _automaticRecoveryAttempt: 3,
+        _automaticRecoveryMax: 10,
+      },
+    ];
+    sock.applyServerMessages(
+      "s-master-sync",
+      "main",
+      structuredClone(rows),
+      true,
+      undefined,
+      { serverUpdatedAt: 10 },
+    );
+    expect(session.messages.filter((m) => m.role === "user")).toHaveLength(2);
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._activeClientMessageId).toBe("m-recover-sync1");
+    expect(session._turnStatus).toMatchObject({ kind: "retrying", attempt: 3, max: 10 });
+    expect(session.messages[0]._automaticRecoveryAttempted).toBe(true);
+
+    // Once the recovery row is followed by a terminal assistant row the turn
+    // is over: history sync must not re-claim it.
+    const done = sock.ensureSession("s-master-done", "main");
+    sock.applyServerMessages(
+      "s-master-done",
+      "main",
+      [
+        ...structuredClone(rows).map((m) => ({
+          ...m,
+          id: m.id.replace("s-master-sync", "s-master-done").replace("sync1", "done1"),
+          _clientMessageId: m._clientMessageId?.replace("s-master-sync", "s-master-done"),
+          _recoveryOfClientMessageId: m._recoveryOfClientMessageId?.replace("s-master-sync", "s-master-done"),
+          _automaticRecoveryRootClientMessageId: m._automaticRecoveryRootClientMessageId?.replace("s-master-sync", "s-master-done"),
+        })),
+        {
+          id: "answer-s-master-done",
+          role: "assistant",
+          text: "final answer",
+          ts: 5,
+          _source: "server",
+          _turnTapeId: "tape-s-master-done-2",
+          _clientMessageId: "m-recover-done1",
+        },
+      ],
+      true,
+      undefined,
+      { serverUpdatedAt: 10 },
+    );
+    expect(done._sendingInFlight).toBeFalsy();
+    expect(done._turnStatus).toBeFalsy();
     sock.stop();
   });
 
@@ -9697,5 +10160,131 @@ describe("send_to_agent exact job correlation", () => {
     }
     groups = s.messages.filter((message) => message.role === "agent-group");
     expect(groups.every((group) => group._completed)).toBe(true);
+  });
+});
+
+describe("CCB ExecuteExtraTool wrapper → delegate agent-group", () => {
+  const envelope = (text: string, toolName: string) =>
+    JSON.stringify({ result: [{ type: "text", text }], tool_name: toolName });
+
+  test("ExecuteExtraTool{delegate_task} live frames become an agent-group with friendly preview", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "ExecuteExtraTool",
+            blockId: "tool-eet-1",
+            inputJson: {
+              tool_name: "mcp__openclaude-memory__delegate_task",
+              params: { agentId: "auditor", goal: "审计方案" },
+            },
+          },
+        ],
+      }),
+    );
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group).toBeTruthy();
+    expect(group?._delegate).toBe(true);
+    expect(group?._delegateAgentId).toBe("auditor");
+    expect(group?.text).toBe("审计方案");
+    expect(group?._background).toBeFalsy();
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_result",
+            toolUseBlockId: "tool-eet-1",
+            output: envelope("审计通过,无 blocker。", "mcp__openclaude-memory__delegate_task"),
+          },
+        ],
+      }),
+    );
+    expect(group?._completed).toBe(true);
+    expect(group?._resultPreview).toBe("审计通过,无 blocker。");
+    expect(s.messages.filter((m) => m.role === "tool" && m.toolName === "ExecuteExtraTool")).toHaveLength(0);
+  });
+
+  test("ExecuteExtraTool{send_to_agent} running envelope keeps the group background with jobId", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "ExecuteExtraTool",
+            blockId: "tool-eet-2",
+            inputJson: {
+              tool_name: "mcp__openclaude-memory__send_to_agent",
+              params: { agentId: "research-assistant", message: "查资料" },
+            },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_result",
+            toolUseBlockId: "tool-eet-2",
+            output: envelope(
+              JSON.stringify({ status: "running", jobId: "dlgjob-eet" }),
+              "mcp__openclaude-memory__send_to_agent",
+            ),
+          },
+        ],
+      }),
+    );
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?._background).toBe(true);
+    expect(group?._completed).toBeFalsy();
+    expect(group?._delegateJobId).toBe("dlgjob-eet");
+    expect(group?._resultPreview ?? "").not.toMatch(/^\{/);
+  });
+
+  test("persisted ExecuteExtraTool{delegate_task} tool row normalizes into an agent-group; fan-out stays a tool card", () => {
+    const s = sess();
+    s.messages.push({
+      id: "t-eet-hist",
+      text: "",
+      role: "tool",
+      toolName: "ExecuteExtraTool",
+      blockId: "b-eet-hist",
+      inputJson: { tool_name: "mcp__openclaude-memory__delegate_task", params: { agentId: "main", goal: "历史委派" } },
+      output: envelope("done", "mcp__openclaude-memory__delegate_task"),
+      _completed: true,
+      ts: 1,
+    } as ChatMessage);
+    s.messages.push({
+      id: "t-eet-fanout",
+      text: "",
+      role: "tool",
+      toolName: "ExecuteExtraTool",
+      blockId: "b-eet-fanout",
+      inputJson: { tool_name: "mcp__openclaude-memory__delegate_tasks", params: { tasks: [{ agentId: "a", goal: "g" }] } },
+      output: envelope("并行委派 1 个子任务已全部返回", "mcp__openclaude-memory__delegate_tasks"),
+      _completed: true,
+      ts: 2,
+    } as ChatMessage);
+    normalizeDelegateCards(s);
+    const hist = s.messages.find((m) => m.id === "t-eet-hist");
+    expect(hist?.role).toBe("agent-group");
+    expect(hist?._delegateAgentId).toBe("main");
+    expect(hist?._resultPreview).toBe("done");
+    const fanout = s.messages.find((m) => m.id === "t-eet-fanout");
+    expect(fanout?.role).toBe("tool");
   });
 });

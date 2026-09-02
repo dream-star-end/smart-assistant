@@ -141,13 +141,17 @@ describe("TeamPanel 团队协作面板", () => {
       />,
     );
 
-    expect(screen.getByText("team-child-0")).toBeInTheDocument();
-    expect(screen.queryByText("team-child-100")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /继续加载过程/ }));
-    expect(screen.getByText("team-child-100")).toBeInTheDocument();
-    expect(screen.queryByText("team-child-204")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /继续加载过程/ }));
+    // 默认只挂尾部窗口，最早的步骤不在 DOM；最新一步立刻可见。
+    expect(screen.queryByText("team-child-0")).not.toBeInTheDocument();
+    expect(screen.queryByText("team-child-165")).not.toBeInTheDocument();
     expect(screen.getByText("team-child-204")).toBeInTheDocument();
+    expect(screen.getByText(/已加载 30 \/ 205 步/)).toBeInTheDocument();
+    const scroller = screen.getByTestId("delegate-process-scroller");
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, get: () => 200 });
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => 800 });
+    scroller.scrollTop = 10;
+    fireEvent.scroll(scroller);
+    expect(screen.getByText("team-child-165")).toBeInTheDocument();
   });
 
   test("队员卡不显示冗余原始记录入口，真实过程仍可查看", () => {

@@ -1,5 +1,6 @@
 export * from './frames.js'
 export * from './liveUnits.js'
+export * from './timelineLifecycle.js'
 
 export * from './goalState.js'
 export * from './events.js'
@@ -27,3 +28,4 @@ export * from './modelHistory.js'
 export * from './messageReply.js'
 export * from './mediaGeneration.js'
 export * from './tutorialSnapshot.js'
+export * from './delegation.js'

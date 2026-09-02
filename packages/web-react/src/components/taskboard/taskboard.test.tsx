@@ -4,9 +4,10 @@ import type { ComponentProps } from 'react'
 import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
 import { workspaceWantPath } from '../../hooks/useAppRoute'
 import { ProjectScopeProvider } from '../../hooks/useProjectScope'
-import { api, ApiError } from '../../lib/api'
+import { ApiError, api } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
 import {
+  LAST_PROJECT_STORAGE_KEY,
   type PipelineStage,
   type Project,
   TICKET_TYPE_LABEL,
@@ -15,16 +16,19 @@ import {
   type TicketActivity,
   type TicketComment,
   type TicketRun,
+  collectInboxTickets,
   isConcurrencyFull,
   isForbidden,
   isLeaseHeld,
+  isLongComment,
   isVersionConflict,
   mergeTimelineSources,
+  partitionTimeline,
   pickInitialProject,
-  LAST_PROJECT_STORAGE_KEY,
   resolveOriginSessionId,
   sessionIdFromOriginKey,
   skipReasonLabel,
+  sortTimelineAsc,
   taskboardApi,
   taskboardErrorMessage,
 } from '../../lib/taskboard'
@@ -98,6 +102,8 @@ function sampleTicket(over: Partial<Ticket> = {}): Ticket {
     createdAt: 1_700_000_000_000,
     updatedAt: 1_700_000_100_000,
     closedAt: null,
+    approvedBy: null,
+    approvedAt: null,
     ...over,
   }
 }
@@ -266,6 +272,23 @@ describe('TicketCard 类型 / 优先级映射', () => {
     const card = screen.getByTestId('ticket-card')
     expect(card.className).toMatch(/opacity-60/)
     expect(screen.getByText('已取消的空单').className).toMatch(/line-through/)
+  })
+
+  test('批准后的卡片显示批准人', () => {
+    render(
+      <ToastProvider>
+        <TooltipProvider>
+          <TicketCard
+            ticket={sampleTicket({
+              status: 'ready',
+              approvedBy: 'agent:main',
+              approvedAt: 1,
+            })}
+          />
+        </TooltipProvider>
+      </ToastProvider>,
+    )
+    expect(screen.getByTestId('ticket-approver')).toHaveTextContent('批准人 main')
   })
 })
 
@@ -551,13 +574,27 @@ describe('429 concurrency_full 与 settings 客户端', () => {
 })
 
 describe('时间线合并', () => {
-  test('activity + run + comment 按时间倒序', () => {
+  test('activity + run + comment 按时间正序', () => {
     const items = mergeTimelineSources({
       activities: [sampleActivity({ createdAt: 10 })],
       runs: [sampleRun({ createdAt: 30 })],
       comments: [sampleComment({ createdAt: 20 })],
     })
-    expect(items.map((i) => i.kind)).toEqual(['run', 'comment', 'activity'])
+    expect(items.map((i) => i.kind)).toEqual(['activity', 'comment', 'run'])
+    expect(sortTimelineAsc(items).map((i) => i.kind)).toEqual(['activity', 'comment', 'run'])
+  })
+
+  test('讨论与系统活动分流，长评论可识别', () => {
+    const items = mergeTimelineSources({
+      activities: [sampleActivity({ createdAt: 10 })],
+      runs: [sampleRun({ createdAt: 30 })],
+      comments: [sampleComment({ createdAt: 20, body: '短评' })],
+    })
+    const { discussion, system } = partitionTimeline(items)
+    expect(discussion.map((i) => i.kind)).toEqual(['comment'])
+    expect(system.map((i) => i.kind)).toEqual(['activity', 'run'])
+    expect(isLongComment('短评')).toBe(false)
+    expect(isLongComment('x'.repeat(300))).toBe(true)
   })
 })
 
@@ -630,6 +667,29 @@ describe('TicketDrawer 详情', () => {
     )
   })
 
+  test('讨论区显示评论，系统活动默认折叠', async () => {
+    const ticket = sampleTicket()
+    mockDrawerApis(ticket)
+    vi.spyOn(taskboardApi, 'listTimeline').mockResolvedValue(
+      mergeTimelineSources({
+        runs: [sampleRun({ createdAt: 30 })],
+        comments: [sampleComment({ createdAt: 20, author: 'agent:main', body: '改了 **X**' })],
+        activities: [
+          sampleActivity({ createdAt: 10, action: 'ticket_approved', actorId: 'user:default' }),
+        ],
+      }),
+    )
+    renderDrawer(ticket)
+    expect(await screen.findByTestId('ticket-discussion')).toBeInTheDocument()
+    expect(screen.getByTestId('ticket-comment-md').textContent).toMatch(/改了/)
+    expect(screen.queryByTestId('ticket-run-detail')).not.toBeInTheDocument()
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('ticket-system-toggle'))
+    })
+    expect(await screen.findByTestId('ticket-run-detail')).toBeInTheDocument()
+    expect(screen.getByText(/批准了开工/)).toBeInTheDocument()
+  })
+
   test('正文与评论按 Markdown 渲染', async () => {
     const ticket = sampleTicket({
       body: '## 验收\n\n- **粗体**\n- `code`',
@@ -693,6 +753,9 @@ describe('TicketDrawer 详情', () => {
     const run = sampleRun({ skipReason: 'concurrency_full', durationMs: null, costUsd: null })
     mockDrawerApis(ticket, [run])
     renderDrawer(ticket)
+    await act(async () => {
+      fireEvent.click(await screen.findByTestId('ticket-system-toggle'))
+    })
     expect(await screen.findByText('跳过：巡检并发已满')).toBeInTheDocument()
     expect(screen.getByText(/耗时未记录/)).toBeInTheDocument()
     expect(screen.getByText(/用量未记录/)).toBeInTheDocument()
@@ -711,6 +774,9 @@ describe('TicketDrawer 详情', () => {
     })
     mockDrawerApis(ticket, [run])
     renderDrawer(ticket)
+    await act(async () => {
+      fireEvent.click(await screen.findByTestId('ticket-system-toggle'))
+    })
     expect(await screen.findByText(/\$0\.0000（不精确）/)).toBeInTheDocument()
   })
 })
@@ -942,6 +1008,97 @@ describe('任务展示模式切换', () => {
   })
 })
 
+describe('任务面板项目范围切换', () => {
+  test('collectInboxTickets 容忍 columns.tickets 缺失', () => {
+    const waiting = sampleTicket({ id: 'w1', status: 'waiting_human' })
+    const rows = collectInboxTickets({
+      inbox: [waiting],
+      columns: [
+        { tickets: undefined as unknown as Ticket[] },
+        null as unknown as { tickets: Ticket[] },
+        { tickets: [sampleTicket({ id: 'w2', status: 'waiting_human' })] },
+      ],
+    })
+    expect(rows.map((t) => t.id).sort()).toEqual(['w1', 'w2'])
+  })
+
+  test('在两个 work 项目与 all/none 之间来回切换 ≥5 次不崩', async () => {
+    const p1 = sampleProject({ id: 'p1', key: 'OCV5', name: 'V5 自用' })
+    const p2 = sampleProject({ id: 'p2', key: 'OTHER', name: '另一个' })
+    vi.spyOn(taskboardApi, 'listProjects').mockResolvedValue([p1, p2])
+    vi.spyOn(taskboardApi, 'listTickets').mockResolvedValue({ items: [], total: 0 })
+    vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([])
+    vi.spyOn(taskboardApi, 'getProjectBoard').mockImplementation(async (_a, pid) => {
+      const project = pid === 'p2' ? p2 : p1
+      return {
+        project,
+        pipeline: samplePipeline({ projectId: project.id }),
+        ticketType: 'bug' as const,
+        // p2 模拟切换窗口里 columns.tickets 缺失：旧代码 collectInboxTickets / columns.flatMap 会抛。
+        columns:
+          pid === 'p2'
+            ? [{ stage: sampleStage({ pipelineId: 'pipe2' }), tickets: undefined as unknown as Ticket[] }]
+            : [
+                {
+                  stage: sampleStage(),
+                  tickets: [sampleTicket({ projectId: 'p1' })],
+                },
+              ],
+        inbox: [],
+        backlog: { tickets: null as unknown as Ticket[] },
+      }
+    })
+
+    history.replaceState({}, '', '/board?project=chat-project-p1')
+    const view = render(
+      <ProjectScopeProvider
+        auth={auth}
+        chatProjects={[
+          { id: 'chat-project-p1', name: 'V5 会话', boardProjectId: 'p1' },
+          { id: 'chat-project-p2', name: '另一会话', boardProjectId: 'p2' },
+        ]}
+        userId="taskboard-switch"
+      >
+        <ToastProvider>
+          <TooltipProvider>
+            <TaskboardView
+              auth={auth}
+              view="board"
+              ticketId={null}
+              onViewChange={() => {}}
+              onOpenTicket={() => {}}
+              onOpenMobileNav={() => {}}
+            />
+          </TooltipProvider>
+        </ToastProvider>
+      </ProjectScopeProvider>,
+    )
+
+    expect(await screen.findByTestId('taskboard-root')).toBeInTheDocument()
+    const select = await screen.findByTestId('project-scope-select-work')
+    await waitFor(() => {
+      expect(select).not.toBeDisabled()
+    })
+    const cycle = ['all', 'p2', 'none', 'p1', 'p2', 'all', 'p1'] as const
+    expect(cycle.length).toBeGreaterThanOrEqual(5)
+    for (const token of cycle) {
+      await act(async () => {
+        fireEvent.change(select, { target: { value: token } })
+      })
+      expect(screen.getByTestId('taskboard-root')).toBeInTheDocument()
+      expect(screen.queryByText('此页面加载出错')).not.toBeInTheDocument()
+      if (token === 'all' || token === 'none') {
+        expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
+      } else {
+        await waitFor(() => {
+          expect(screen.queryByText('该会话项目未绑定看板')).not.toBeInTheDocument()
+        })
+      }
+    }
+    view.unmount()
+  })
+})
+
 describe('项目管理', () => {
   test('空库时能通过界面建项目并自动切过去', async () => {
     let stored: ReturnType<typeof sampleProject>[] = []
@@ -1020,10 +1177,13 @@ describe('流水线 / 阶段配置', () => {
       { id: 'coding-assistant', name: '编码助手' },
       { id: 'research', name: '调研助手' },
     ])
-    vi.spyOn(api, 'getPublicModels').mockResolvedValue([
-      { id: 'glm-5.2', display_name: 'GLM 5.2' },
-      { id: 'deepseek-v4-pro', display_name: 'DeepSeek V4 Pro' },
-    ])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({
+      models: [
+        { id: 'glm-5.2', display_name: 'GLM 5.2' },
+        { id: 'deepseek-v4-pro', display_name: 'DeepSeek V4 Pro' },
+      ],
+      lockedModels: [],
+    })
     return { pipeline, stage }
   }
 
@@ -1206,7 +1366,11 @@ describe('流水线 / 阶段配置', () => {
       '/api/board/pipelines/pipe1/reorder',
     )
     expect((fetchMock.mock.calls as unknown as [string, RequestInit][])[0]?.[1]?.method).toBe('PUT')
-    expect(JSON.parse(String((fetchMock.mock.calls as unknown as [string, RequestInit][])[0]?.[1]?.body))).toEqual({
+    expect(
+      JSON.parse(
+        String((fetchMock.mock.calls as unknown as [string, RequestInit][])[0]?.[1]?.body),
+      ),
+    ).toEqual({
       orderedIds: ['s2', 's1'],
     })
   })

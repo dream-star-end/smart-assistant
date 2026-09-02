@@ -3,6 +3,7 @@
     "agents": {
       "contentHash": "960d76fc609c8d968d8b75cc486824de68fa969634d7311f45fa86f5da397177",
       "contentVersion": 1,
+      "entryIdentityHash": "a042cf675bc8d45ba26715bf7ce51fa48f62b399092d22a5aeed422d6ac8d2e9",
       "mediaHash": "5a661d2749d2bf385aec95274728409cf3d4fda24350815da24ffb09d7ce0dfd",
       "mediaKey": "agents",
       "mediaVersion": 3,
@@ -12,6 +13,7 @@
     "artifacts-download": {
       "contentHash": "3c4e0d07709579bddddd1309d257599c2d4a8aec7e2ba633c4d1480a19402e33",
       "contentVersion": 3,
+      "entryIdentityHash": "a72e84688008f5b830cc81d97420a352cdcced392438ff63170fedfb5e0c2bae",
       "mediaHash": "cf841a08397ddbc1e6e309edf069a5d0be8e9724000cf19f1ef158d05553a5bd",
       "mediaKey": "artifacts-download",
       "mediaVersion": 3,
@@ -21,6 +23,7 @@
     "billing-usage": {
       "contentHash": "56f33a84f3970b14004a48e7fc2c8996a39c473bbbb3d9a406facad9c6539d5e",
       "contentVersion": 2,
+      "entryIdentityHash": "bc2f485c67dce2f455a5201a91ef9d8c331ea0f02f2798d0143c8a80fcaeef9f",
       "mediaHash": "80ecd31eb9468e8862cd6841fa7bd59005568ceecda9878a9b18c80a47ac71b8",
       "mediaKey": "billing-usage",
       "mediaVersion": 2,
@@ -30,6 +33,7 @@
     "chat-basics": {
       "contentHash": "387cd97eec61939fcbc8ec2170b84aa7922ce1ba43fb8d243fdf5ec1bb18add2",
       "contentVersion": 6,
+      "entryIdentityHash": "2b1c6269476ce53585a517e4fba7e81f540de79ae897ba04ec17ae8394829ff8",
       "mediaHash": "0cc612d377280f73f9fcc131c43e8ebde31ec42226e82a8745b0cb6534649779",
       "mediaKey": "chat-basics",
       "mediaVersion": 3,
@@ -39,6 +43,7 @@
     "connectors": {
       "contentHash": "3273aeac669b33e701c19aad3473ab19adc5e6f0db455d0a975ea2927b0d3b48",
       "contentVersion": 4,
+      "entryIdentityHash": "3133475439e0b890626c1e7026c495f4b6097dedd172cb43cd973aea3109cd5d",
       "mediaHash": "21341baac82984bc62506d5c70f5a2b428aaea3a4392681430539d5f40fd21dc",
       "mediaKey": "connectors",
       "mediaVersion": 3,
@@ -48,6 +53,7 @@
     "container-web-preview": {
       "contentHash": "ca686071086113580f85631621baadf2bb19a870cc9cdbf56128acae0995ff33",
       "contentVersion": 5,
+      "entryIdentityHash": "9cfe1c0da576e30faaacb4ac598d892d8bf840c6a69c42acc024523d6b640cca",
       "mediaHash": "1d7bdfe42edb9499bcd1af4bd322f3dbeb52f45f1487db6d24b6dff6c7fc852f",
       "mediaKey": "container-web-preview",
       "mediaVersion": 5,
@@ -57,6 +63,7 @@
     "feedback-support": {
       "contentHash": "1d526a0e5a42110a7105e47ede265fea647106782f2f5a6547daafd9afc260c0",
       "contentVersion": 4,
+      "entryIdentityHash": "bd8c7d95b6afdb03dd7c2c6f462b96c9de5183f9f7148ab79b7c0b8781e681a9",
       "mediaHash": "70c7bbe3205a44cc0595c2eb75c96af66aa44c824d2d31114d388e542f54437a",
       "mediaKey": "feedback-support",
       "mediaVersion": 2,
@@ -66,6 +73,7 @@
     "files-media": {
       "contentHash": "fe18dee5d554d68a75ea19a409461d893a715a4b918056751b6faa6d94d9cfc5",
       "contentVersion": 3,
+      "entryIdentityHash": "52997b4632532e691b05807b8ee2a60a6eeb6a256a9ca42a6cd2cacdf68a2ef9",
       "mediaHash": "0a4e678112498ae49805dd9e408f9ec1b8c42ada9b993cb70a9e8dd07b891d70",
       "mediaKey": "files-media",
       "mediaVersion": 3,
@@ -75,6 +83,7 @@
     "github-repository": {
       "contentHash": "98494ec3b35e6b93ac1309f0313dc1b07cc47da79cd3722c9ba8f98458c70250",
       "contentVersion": 2,
+      "entryIdentityHash": "fdaac6442183ac96eb4c90dfc521553a8784b95b55faaed82ad0fbbb070e8704",
       "mediaHash": "3e289b11edeaf27153d685ad919d800ed8bf3be849ccdb8cc8a280859bda775b",
       "mediaKey": "github-repository",
       "mediaVersion": 2,
@@ -84,6 +93,7 @@
     "image-create-edit": {
       "contentHash": "c540c520a658661ef339bdcdea74c6c8d6b7681ae4786a8c109fc9c54b0a6026",
       "contentVersion": 4,
+      "entryIdentityHash": "260f789850060502eb9cf2940ffced1e017c7d7431b11ce314841d2b94fafb7e",
       "mediaHash": "6010712e61cba1d6029b2c02dd3e3643ed8875cdbc0e5d0510df387476ca1bb2",
       "mediaKey": "image-create-edit",
       "mediaVersion": 3,
@@ -93,6 +103,7 @@
     "inbox": {
       "contentHash": "de7c3342fcf16d577fab2d7636e378af5a73180e02b409aec6197d2fff525f6f",
       "contentVersion": 2,
+      "entryIdentityHash": "33d325de9b35a44d675125850dcc68aed55c3cd1ae69ad462cb410faeb143090",
       "mediaHash": "b42d3d2017a4afc550449a031a46fc5fa4974dc50d1540958c6aceb2480b616b",
       "mediaKey": "inbox",
       "mediaVersion": 2,
@@ -102,6 +113,7 @@
     "marketplace-discovery": {
       "contentHash": "414203beaf81ed85661ecc3ce0eede57b1ef7d4af8336d76d76c90dfbee9d7c4",
       "contentVersion": 3,
+      "entryIdentityHash": "91da0e123108730ae9887e4df9a2e956c5953bb9a22745d8a5b0e014d650f1d7",
       "mediaHash": "952b9f8d6f58d93a7604736b20b83e4482aa0e9e332235c51463c2a209e21f16",
       "mediaKey": "marketplace-discovery",
       "mediaVersion": 2,
@@ -111,6 +123,7 @@
     "marketplace-publishing": {
       "contentHash": "061da931977e26ad137107c676fc8e3234f3f8b250b1359e63ec284227d0faec",
       "contentVersion": 3,
+      "entryIdentityHash": "e19c22fc483c4eb1ab4eab08110351d794c402269c0a4de5230b2e7ad87e35af",
       "mediaHash": "a82a0ce0066876b1e9c84fd8689105f5a71d74952ba94631231d993a272c158a",
       "mediaKey": "marketplace-publishing",
       "mediaVersion": 3,
@@ -120,6 +133,7 @@
     "memory-auto-dream": {
       "contentHash": "3b7f98f3dddf15428a4da35bace61f351f444f42d76af491b788aa5b6fd62c10",
       "contentVersion": 8,
+      "entryIdentityHash": "3ff6b5cf09a7cacc3ea8033b3de14e0f29fd906a8e6cbd6406ed6c36717e9572",
       "mediaHash": "ea8238104ece9dd33f817cc09a1abfe79a0e5aea0e27fcdc196278087b44dce1",
       "mediaKey": "memory-auto-dream",
       "mediaVersion": 3,
@@ -129,15 +143,17 @@
     "models-reasoning": {
       "contentHash": "6dacdc44bb76b8a3772a6234d5ea94395ec14d1fd68db1bf43fcbae24502cf47",
       "contentVersion": 5,
+      "entryIdentityHash": "4083cf539ec861234296b7d70c3b75791ac011c0aca59d11c36580dd965672f7",
       "mediaHash": "e331e8565a68475c57c08ed1742c7b8b4a512cd154c83b7f0e8e270563733a3c",
       "mediaKey": "models-reasoning",
       "mediaVersion": 2,
       "registryHash": "05d9024636c1060f19b7670c735a8a5bc39bf7dfdacd83a719260e898df68ee2",
-      "sourceHash": "75077d83e9711f4d293e511ac5c89affafecdf279ee753610e60028f61a7fadf"
+      "sourceHash": "bf3a59e0a38c26432e90c67a17f79a7413d2e35840cf204e849508a3c146b04a"
     },
     "organization": {
       "contentHash": "7cb835c5e2b81ac2543f0f161a8e706139b7f5bafc5dae6080ab475b95e7e0dd",
       "contentVersion": 1,
+      "entryIdentityHash": "3af8821fa9cd0d826e26393d824b215ae26b0d522cc4dfa3442274a11fc7b32a",
       "mediaHash": "56322d58dfa47ff64c35b36c6647ea52d7bf4bd5a81803a2bd0679e4005efed1",
       "mediaKey": "organization",
       "mediaVersion": 3,
@@ -147,6 +163,7 @@
     "preferences": {
       "contentHash": "017ae0e408a3f4586aa21330349f9e054f97526e6eea4b196fe550659c9924d0",
       "contentVersion": 2,
+      "entryIdentityHash": "4cf894bdbd5a48de9cefe545e7cbe3a8b6d15661a57db05824e0f7ff6959256d",
       "mediaHash": "2a146a93cad99a147b91cfe03af5288725d5774443228da1ab5e7d908fda3631",
       "mediaKey": "preferences",
       "mediaVersion": 3,
@@ -156,6 +173,7 @@
     "schedules-reminders": {
       "contentHash": "8a998eca2fdcc6a90e1216892d2f4a7c3dab42d5874178689f92a7e94c8e4fd3",
       "contentVersion": 4,
+      "entryIdentityHash": "3133475439e0b890626c1e7026c495f4b6097dedd172cb43cd973aea3109cd5d",
       "mediaHash": "240f98f76eb862376c66510f45832bb7cc994b992b3eab76ab61fb05d8e66991",
       "mediaKey": "schedules-reminders",
       "mediaVersion": 3,
@@ -165,6 +183,7 @@
     "session-goal": {
       "contentHash": "21b0b50439449039ab0e7be29e3e97f707431f4e11f453d37424927ca66f390b",
       "contentVersion": 1,
+      "entryIdentityHash": "0078fd28fc30a5f5e33acc932d76b3d091a138b7a7b54f63e5f50a92f2180a9b",
       "mediaHash": "fc6225d5869710e09d87c11d9238320751f6f330a07fe5128712e94a9b6317d4",
       "mediaKey": "session-goal",
       "mediaVersion": 2,
@@ -174,6 +193,7 @@
     "sessions-history": {
       "contentHash": "ae055e00f6cda07668e7f0f2332e65ac52e5fc5b875673046e1940fdfaff68ad",
       "contentVersion": 3,
+      "entryIdentityHash": "e1282c657296e588fc6d05e4134780fc76f1cb2ae4857bbee40e989e841efd7d",
       "mediaHash": "ff30df1636efc5dfd95f414f46ff689252bd0b11be1ddc43b31111186e4eab9e",
       "mediaKey": "sessions-history",
       "mediaVersion": 2,
@@ -183,6 +203,7 @@
     "skills-training": {
       "contentHash": "e2153ef7ccb7bbd46b3ddcfac3368e004dfff463d95c1f9f805d75c4a06846e2",
       "contentVersion": 4,
+      "entryIdentityHash": "3133475439e0b890626c1e7026c495f4b6097dedd172cb43cd973aea3109cd5d",
       "mediaHash": "c71747f458c6e4284c6a154a5865f4db74e1da3ce71f5d313cc63b8a9862a27e",
       "mediaKey": "skills-training",
       "mediaVersion": 3,
@@ -192,6 +213,7 @@
     "taskboard": {
       "contentHash": "759fdef5188979b87ee3a35fb169a266f763c63a9d40e10eca03e0485db8c0c6",
       "contentVersion": 1,
+      "entryIdentityHash": "4b7bc995ba3c9751f03ec65aacd261f439ff676e75d2f816b5bfd0dcc5c158a2",
       "mediaHash": "b1283b2f8dd9848de674a12a2523c022f5ad2996da6421a63086d3ab3d5f7936",
       "mediaKey": "taskboard",
       "mediaVersion": 2,
@@ -201,6 +223,7 @@
     "team-mode": {
       "contentHash": "99be643adaf53c612cfcdcd8d0cddebd89c3e2f01b98329fa4b683aab38927d3",
       "contentVersion": 3,
+      "entryIdentityHash": "8523bda4824b3f48290dbb2e0529b26d373fdecba8bfdd64953a450443a82736",
       "mediaHash": "65c7d1266d9d4476c2751ae8d320a2c256e155293f4f8e591a479bd6b9def4eb",
       "mediaKey": "team-mode",
       "mediaVersion": 3,
@@ -210,6 +233,7 @@
     "voice-input": {
       "contentHash": "144229b18b8fdb8b87305b9d050c6b60245f0eeb110b4b3396da1aad19ac808e",
       "contentVersion": 2,
+      "entryIdentityHash": "ccfc0660beae642e40b93a88751bbac183327884985e60178101dc7b47b0d296",
       "mediaHash": "a3a5c8fc37de75b84e977f05312aa10556dd5ab009550efef64b23066644e872",
       "mediaKey": "voice-input",
       "mediaVersion": 2,
@@ -219,6 +243,7 @@
     "web-research": {
       "contentHash": "011e1d283623978ab9673f70580d54afa351a9215c92bbb1ed9b039ad2a76257",
       "contentVersion": 3,
+      "entryIdentityHash": "3133475439e0b890626c1e7026c495f4b6097dedd172cb43cd973aea3109cd5d",
       "mediaHash": "a7e379942dc54705bbcdd2f9d098f3d3c01064c809575f75577424ec59fa90ef",
       "mediaKey": "web-research",
       "mediaVersion": 2,

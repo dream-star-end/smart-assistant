@@ -6,7 +6,8 @@
  * 并要求当前语义快照与仓库内 tutorial-sync.json 完全一致。
  *
  * `accept` 是显式维护动作：功能语义变化时，正常模式要求同步提高教程内容版本或媒体版本；
- * 仅源代码重构可用 `--source-only --note "..."` 接受，但会追加不可覆盖的 JSONL 审计记录。
+ * 仅入口 JSX 内部等价重构可用 `--source-only --ids <id,...> --note "..."` 接受，且入口
+ * 身份（文件/组件/asChild/条件包裹）不得变；否则必须普通 tutorial-sync。审计写入 JSONL。
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -82,6 +83,8 @@ type CapabilitySnapshot = {
   contentHash: string;
   registryHash: string;
   sourceHash: string;
+  /** 入口身份：文件 + JSX 组件 + asChild + 是否条件包裹。与 sourceHash 分离，避免 --source-only 吞新增/挪走入口。 */
+  entryIdentityHash: string;
   mediaKey: TutorialMediaKey;
   mediaVersion: number;
   mediaHash: string;
@@ -114,6 +117,8 @@ type TutorialAudit = {
   mediaChanged: string[];
   /** Added after the case-first tutorial catalog; absent on historical rows. */
   caseChanged?: string[];
+  /** Added in OCV5-16 stage C; absent on historical rows. */
+  identityChanged?: string[];
   added: string[];
   retired: string[];
   snapshotSha256: string;
@@ -131,6 +136,7 @@ type Marker = {
   file: string;
   line: number;
   semantic: string;
+  identity: string;
 };
 
 type CaptureActionTrace = {
@@ -285,13 +291,70 @@ function markerSlice(opening: ts.JsxOpeningLikeElement): ts.Node {
     : opening;
 }
 
+const NATIVE_INTERACTIVE_TAGS = new Set([
+  "button",
+  "input",
+  "select",
+  "textarea",
+  "summary",
+]);
+
+/** 设计系统里可被用户点选、且历史上可绕过入口登记的组件。 */
+export const INTERACTIVE_COMPONENT_NAMES = new Set([
+  "Button",
+  "IconButton",
+  "Switch",
+  "DropdownMenuItem",
+  "DropdownMenuSubTrigger",
+]);
+
+export function isInteractiveJsxName(name: string): boolean {
+  return (
+    NATIVE_INTERACTIVE_TAGS.has(name) || INTERACTIVE_COMPONENT_NAMES.has(name)
+  );
+}
+
 function isInteractive(opening: ts.JsxOpeningLikeElement): boolean {
   const name = jsxName(opening.tagName);
-  if (["button", "input", "select", "textarea", "summary"].includes(name))
-    return true;
   if (name === "a")
     return !!jsxAttribute(opening, "href") || !!jsxAttribute(opening, "role");
-  return ["Button", "IconButton", "Switch"].includes(name);
+  return isInteractiveJsxName(name);
+}
+
+function isConditionallyWrapped(node: ts.Node): boolean {
+  let current: ts.Node | undefined = node.parent;
+  while (current && !ts.isSourceFile(current)) {
+    if (ts.isConditionalExpression(current)) return true;
+    if (
+      ts.isBinaryExpression(current) &&
+      (current.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ||
+        current.operatorToken.kind === ts.SyntaxKind.BarBarToken)
+    ) {
+      return true;
+    }
+    current = current.parent;
+  }
+  return false;
+}
+
+export function entryIdentityKey(file: string, node: ts.Node): string {
+  let tag = "unknown";
+  let asChild = false;
+  if (ts.isJsxElement(node)) {
+    tag = jsxName(node.openingElement.tagName);
+    asChild = !!jsxAttribute(node.openingElement, "asChild");
+  } else if (ts.isJsxSelfClosingElement(node) || ts.isJsxOpeningElement(node)) {
+    tag = jsxName(node.tagName);
+    asChild = !!jsxAttribute(node, "asChild");
+  } else if (ts.isObjectLiteralExpression(node)) {
+    tag = "object-featureId";
+  }
+  return [
+    file,
+    tag,
+    asChild ? "asChild" : "own",
+    isConditionallyWrapped(node) ? "conditional" : "always",
+  ].join("|");
 }
 
 function validateScope(
@@ -342,11 +405,13 @@ function collectMarkers(): Marker[] {
       const pos = sourceFile.getLineAndCharacterOfPosition(
         node.getStart(sourceFile),
       );
+      const rel = relative(ROOT, file);
       markers.push({
         id,
-        file: relative(ROOT, file),
+        file: rel,
         line: pos.line + 1,
         semantic: semanticNode(node, sourceFile),
+        identity: entryIdentityKey(rel, node),
       });
     };
 
@@ -1621,12 +1686,17 @@ function buildSnapshot(): TutorialSnapshot {
   )) {
     const id = feature.id as ProductFeatureId;
     const topic = TUTORIAL_TOPICS[id];
-    const markerSemantics = markers
+    const markersForId = markers
       .filter((marker) => marker.id === id)
       .sort((a, b) =>
         `${a.file}:${a.line}`.localeCompare(`${b.file}:${b.line}`),
-      )
-      .map((marker) => `${marker.file}\n${marker.semantic}`);
+      );
+    const markerSemantics = markersForId.map(
+      (marker) => `${marker.file}\n${marker.semantic}`,
+    );
+    const markerIdentities = markersForId
+      .map((marker) => marker.identity)
+      .sort();
     const mediaItem = media[topic.media];
     const { contentVersion: _contentVersion, ...contentBody } = topic;
     capabilities[id] = {
@@ -1636,6 +1706,7 @@ function buildSnapshot(): TutorialSnapshot {
       // 标题、搜索别名、分类、CTA 目的地与权限都是教程语义，必须进入版本化快照。
       registryHash: sha256(stable(feature)),
       sourceHash: sha256(markerSemantics.join("\n---\n")),
+      entryIdentityHash: sha256(markerIdentities.join("\n")),
       mediaKey: topic.media,
       mediaVersion: mediaItem.version,
       mediaHash: sha256(
@@ -1673,6 +1744,7 @@ function parseArgs(): {
   bootstrap: boolean;
   note: string;
   retire: string[];
+  ids: string[];
 } {
   const args = process.argv.slice(2);
   const command = args[0] === "accept" ? "accept" : "check";
@@ -1686,7 +1758,62 @@ function parseArgs(): {
     )
     .map((id) => id.trim())
     .filter(Boolean);
-  return { command, sourceOnly, bootstrap, note, retire };
+  const ids = args
+    .flatMap((arg, index) => {
+      if (arg !== "--ids") return [];
+      const value = args[index + 1] ?? "";
+      if (!value || value.startsWith("--")) return [];
+      return value.split(",");
+    })
+    .map((id) => id.trim())
+    .filter(Boolean);
+  return { command, sourceOnly, bootstrap, note, retire, ids };
+}
+
+export function sourceOnlyPolicyErrors(input: {
+  sourceChanged: string[];
+  identityChanged: string[];
+  ids: string[];
+  added: string[];
+  retired: string[];
+  caseChanged: string[];
+  registryChanged: string[];
+}): string[] {
+  const errors: string[] = [];
+  if (input.added.length > 0 || input.retired.length > 0) {
+    errors.push("--source-only 不能接受能力新增或下线");
+  }
+  if (input.caseChanged.length > 0) {
+    errors.push("--source-only 不能接受场景案例变化");
+  }
+  if (input.registryChanged.length > 0) {
+    errors.push("--source-only 不能接受能力标题、分类、别名、CTA 或权限变化");
+  }
+  if (input.identityChanged.length > 0) {
+    errors.push(
+      `--source-only 不能接受入口身份变化（文件/组件/asChild/条件包裹）：${input.identityChanged.join(", ")}；新增、挪走或改组件类型的入口必须普通 tutorials:accept 并同步教程`,
+    );
+  }
+  if (input.sourceChanged.length === 0) {
+    errors.push("--source-only 仅用于存在真实功能源语义变化的情况");
+  } else {
+    if (input.ids.length === 0) {
+      errors.push(
+        `--source-only 必须用 --ids 列出每一个 sourceHash 变化的能力 ID：${input.sourceChanged.join(",")}`,
+      );
+    } else if (new Set(input.ids).size !== input.ids.length) {
+      errors.push("--ids 不得重复同一个稳定 ID");
+    } else {
+      const listed = [...input.ids].sort();
+      const actual = [...input.sourceChanged].sort();
+      if (stable(listed) !== stable(actual)) {
+        errors.push(
+          `--source-only --ids 必须与功能源变化完全一致：ids=${listed.join(",")} sourceChanged=${actual.join(",")}`,
+        );
+      }
+    }
+  }
+  return errors;
 }
 
 function snapshotCapabilityIds(
@@ -1885,6 +2012,15 @@ function readAndValidateHistory(manifest: TutorialSnapshot): TutorialAudit[] {
     ) {
       fail(`tutorial-sync-history.jsonl 第 ${index + 1} 行 caseChanged 无效`);
     }
+    if (
+      audit.identityChanged !== undefined &&
+      (!Array.isArray(audit.identityChanged) ||
+        audit.identityChanged.some((id) => typeof id !== "string"))
+    ) {
+      fail(
+        `tutorial-sync-history.jsonl 第 ${index + 1} 行 identityChanged 无效`,
+      );
+    }
     audits.push(audit);
   }
   const expectedSnapshot = sha256(stable(manifest));
@@ -1949,6 +2085,7 @@ function accept(
   const registryChanged = changedIds(before, after, "registryHash");
   const contentChanged = changedIds(before, after, "contentHash");
   const mediaChanged = changedIds(before, after, "mediaHash");
+  const identityChanged = changedIds(before, after, "entryIdentityHash");
   const allIds = new Set(changedCapabilityIds(before, after));
   const caseChanged = changedCaseIds(before, after);
   const added = addedCapabilityIds(before, after);
@@ -1969,11 +2106,17 @@ function accept(
   if (unexpectedRetirements.length) {
     fail(`--retire 与实际删除能力不一致：${unexpectedRetirements.join(", ")}`);
   }
-  if (args.sourceOnly && (added.length > 0 || retired.length > 0)) {
-    fail("--source-only 不能接受能力新增或下线");
-  }
-  if (args.sourceOnly && caseChanged.length > 0) {
-    fail("--source-only 不能接受场景案例变化");
+  if (args.sourceOnly) {
+    const policyErrors = sourceOnlyPolicyErrors({
+      sourceChanged,
+      identityChanged,
+      ids: args.ids,
+      added,
+      retired,
+      caseChanged,
+      registryChanged,
+    });
+    if (policyErrors.length) fail(policyErrors.join("\n"));
   }
 
   if (before) {
@@ -2017,9 +2160,22 @@ function accept(
           `${id}: 能力标题/分类/别名/CTA/权限已变化，必须同步更新教程正文或媒体并提高对应版本`,
         );
       }
+      const identityIntroduced =
+        !oldValue.entryIdentityHash && !!newValue.entryIdentityHash;
+      if (
+        identityChanged.includes(id) &&
+        !identityIntroduced &&
+        !tutorialUpdated
+      ) {
+        fail(
+          `${id}: 入口身份已变化；请同步更新教程正文/媒体并提高版本后用普通 tutorials:accept（不可 --source-only）`,
+        );
+      }
       if (sourceChanged.includes(id) && !args.sourceOnly && !tutorialUpdated) {
         fail(
-          `${id}: 真实入口语义已变化；请同步更新教程正文/媒体并提高版本，或以 --source-only --note 审计接受等价重构`,
+          identityChanged.includes(id) && !identityIntroduced
+            ? `${id}: 入口身份已变化；请同步更新教程正文/媒体并提高版本后用普通 tutorials:accept（不可 --source-only）`
+            : `${id}: 真实入口语义已变化；请同步更新教程正文/媒体并提高版本，或以 --source-only --ids ${id} --note 审计接受等价重构`,
         );
       }
     }
@@ -2041,10 +2197,6 @@ function accept(
     }
   }
 
-  if (args.sourceOnly && registryChanged.length > 0)
-    fail("--source-only 不能接受能力标题、分类、别名、CTA 或权限变化");
-  if (args.sourceOnly && sourceChanged.length === 0)
-    fail("--source-only 仅用于存在真实功能源语义变化的情况");
   if (before && allIds.size === 0 && caseChanged.length === 0)
     fail("当前能力、教程、入口、案例与媒体没有待接受的变化");
   const serialized = `${JSON.stringify(JSON.parse(stable(after)), null, 2)}\n`;
@@ -2066,6 +2218,7 @@ function accept(
     contentChanged,
     mediaChanged,
     caseChanged,
+    identityChanged,
     added,
     retired,
     snapshotSha256: sha256(stable(after)),
@@ -2103,6 +2256,7 @@ function main(): void {
     const registryChanged = changedIds(manifest, snapshot, "registryHash");
     const contentChanged = changedIds(manifest, snapshot, "contentHash");
     const mediaChanged = changedIds(manifest, snapshot, "mediaHash");
+    const identityChanged = changedIds(manifest, snapshot, "entryIdentityHash");
     const added = addedCapabilityIds(manifest, snapshot);
     const retired = retiredCapabilityIds(manifest, snapshot);
     const caseChanged = changedCaseIds(manifest, snapshot);
@@ -2111,12 +2265,13 @@ function main(): void {
         "教程同步快照已漂移，CI 不会自动改写文件。",
         `能力注册表变化: ${registryChanged.join(", ") || "无"}`,
         `功能源变化: ${sourceChanged.join(", ") || "无"}`,
+        `入口身份变化: ${identityChanged.join(", ") || "无"}`,
         `教程正文变化: ${contentChanged.join(", ") || "无"}`,
         `教程媒体变化: ${mediaChanged.join(", ") || "无"}`,
         `场景案例变化: ${caseChanged.join(", ") || "无"}`,
         `新增能力: ${added.join(", ") || "无"}`,
         `待确认下线: ${retired.join(", ") || "无"}`,
-        '确认教程同步后运行 npm run tutorials:accept -- --note "说明"。',
+        '确认教程同步后运行 npm run tutorials:accept -- --note "说明"。入口身份变化不可用 --source-only。',
       ].join("\n"),
     );
   }

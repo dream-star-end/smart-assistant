@@ -136,7 +136,7 @@ const PUBLIC_MODELS: PublicModel[] = [
 /** 每个场景都可能被面板顺手调用的通用只读接口。 */
 const BASE: ApiMockTable = {
   listMyAgents: ok(MY_AGENTS),
-  getPublicModels: ok(PUBLIC_MODELS),
+  getPublicModels: ok({ models: PUBLIC_MODELS, lockedModels: [] }),
 };
 
 function shell(tab: ManageTab): ReactNode {

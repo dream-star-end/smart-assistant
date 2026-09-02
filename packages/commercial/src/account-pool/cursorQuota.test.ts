@@ -10,6 +10,7 @@ import {
   parseCursorSlotResults,
   parseQuotaClassSidecar,
   planCursorQuotaUpdates,
+  planStableCursorQuotaUpdate,
   renderQuotaClassSidecar,
   uniqueCursorAccountIdFromSlotResults,
 } from "./cursorQuota.js";
@@ -23,6 +24,23 @@ describe("cursorQuota", () => {
     assert.equal(cursorModelFamily("gpt-5.6-sol-high"), "other_models");
     assert.equal(cursorModelFamily(""), "cursor_models");
     assert.equal(cursorModelFamily("auto"), "cursor_models");
+  });
+
+  test("stable account identity never reinterprets an old slot after pool compaction", () => {
+    const compacted = [
+      { id: 2n, cursor_quota_class: "unknown" as const },
+      { id: 3n, cursor_quota_class: "cursor_only" as const },
+    ];
+    assert.deepEqual(
+      planStableCursorQuotaUpdate(
+        compacted,
+        2n,
+        [{ slot: 2, result: "ok" }],
+        "other_models",
+        null,
+      ),
+      [{ id: 2n, from: "unknown", to: "other_ok" }],
+    );
   });
 
   test("plans Other Models updates by 1-based full-pool slot", () => {

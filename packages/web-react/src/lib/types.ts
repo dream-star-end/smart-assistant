@@ -314,7 +314,20 @@ export type PublicModel = {
    * (只注解不过滤)。ModelSelector 据此标「暂不可用」徽记 + 禁选。
    */
   degraded?: boolean;
+  /** Limited-time promo copy from model_pricing.promo_label (e.g. 限时半价). */
+  promo_label?: string;
   [k: string]: unknown;
+};
+
+/** GET /api/public/models locked_models: visible except for the subscription floor. */
+export type LockedPublicModel = {
+  id: string;
+  display_name?: string;
+  engine?: string;
+  min_plan_code: string;
+  min_plan_name?: string;
+  cost_x?: number;
+  promo_label?: string;
 };
 
 /** 用户偏好快照（GET/PATCH /api/me/preferences）。strict allowlist 在后端，前端宽松透传。 */

@@ -108,6 +108,16 @@ describe('vision gating 派生自 protocol supportsVision(反漂移)', () => {
     assert.equal(vision.isTextOnlyStaticVisionModel('totally-unknown-model'), false)
     assert.equal(vision.isTextOnlyStaticVisionModel(undefined), false)
   })
+  it('isTextOnlyDefinite:静态纯文本 true;cursor/claude/gpt false;opt-in provider true', async () => {
+    assert.equal(vision.isTextOnlyDefinite('deepseek', 'deepseek-v4-pro'), true)
+    assert.equal(vision.isTextOnlyDefinite('cursor', 'cursor-fable-5.1-high'), false)
+    assert.equal(vision.isTextOnlyDefinite('claude-subscription', 'claude-opus-4-7'), false)
+    assert.equal(vision.isTextOnlyDefinite('codex-native', 'gpt-5.5'), false)
+    await withEnv({ OPENCLAUDE_VISION_MCP_PROVIDERS: 'customtext' }, () => {
+      assert.equal(vision.isTextOnlyDefinite('customtext', 'some-text-model'), true)
+      assert.equal(vision.isTextOnlyDefinite('otherprov', 'some-text-model'), false)
+    })
+  })
 })
 
 describe('vision backend cap/timeout(商业版与 selfhost 默认 MiniMax-M3)', () => {

@@ -71,7 +71,7 @@ export function SkillsPanel({
     let alive = true;
     api
       .getPublicModels(auth)
-      .then((ms) => alive && setRates(ratesFromPublicModel(ms.find((m) => m.id === SKILL_RUN_MODEL))))
+      .then(({ models: ms }) => alive && setRates(ratesFromPublicModel(ms.find((m) => m.id === SKILL_RUN_MODEL))))
       .catch(() => {});
     return () => {
       alive = false;

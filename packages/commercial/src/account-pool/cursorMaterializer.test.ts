@@ -6,6 +6,9 @@ import { describe, test } from "node:test";
 
 import {
   CURSOR_POOL_OWNED_MARKER,
+  CURSOR_POOL_ACTIVE_FILE,
+  CURSOR_POOL_GENERATIONS_DIR,
+  CURSOR_POOL_IDENTITIES_FILE,
   fingerprintCursorKey,
   isCanonicalCursorKeyFile,
   normalizeCursorApiKey,
@@ -124,6 +127,15 @@ describe("syncCursorAuthDir", () => {
     assert.match(sidecar, /^# sand-mode v1\n/);
     assert.match(sidecar, /api-key 1/);
     assert.match(sidecar, /api-key\.2 0/);
+    const generation = readFileSync(join(authDir, CURSOR_POOL_ACTIVE_FILE), "utf8").trim();
+    assert.match(generation, /^gen-[0-9a-f]{24}$/);
+    const generationDir = join(authDir, CURSOR_POOL_GENERATIONS_DIR, generation);
+    assert.equal(readFileSync(join(generationDir, "api-key"), "utf8"), `${KEY_A}\n`);
+    assert.equal(readFileSync(join(generationDir, "api-key.2"), "utf8"), `${KEY_B}\n`);
+    const identities = readFileSync(join(generationDir, CURSOR_POOL_IDENTITIES_FILE), "utf8");
+    assert.match(identities, new RegExp(`^# cursor-pool-identity v1 ${generation}\\n`));
+    assert.match(identities, new RegExp(`api-key 1 ${fingerprintCursorKey(KEY_A)} 1`));
+    assert.match(identities, new RegExp(`api-key\\.2 2 ${fingerprintCursorKey(KEY_B)} 0`));
   });
 
 

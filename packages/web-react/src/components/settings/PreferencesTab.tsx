@@ -88,7 +88,7 @@ export function PreferencesTab({
     let alive = true
     api
       .getPublicModels(auth)
-      .then((m) => {
+      .then(({ models: m }) => {
         if (alive) setModels(m)
       })
       .catch(() => {

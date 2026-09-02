@@ -33,6 +33,7 @@ import { EventEmitter } from 'node:events'
 import type {
   CallTokenUsageSnapshot,
   GoalStateSnapshot,
+  JobTerminal,
   TurnTokenUsageSnapshot,
 } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
@@ -60,6 +61,7 @@ import type {
 } from './engineEvents.js'
 import { engineSessionId } from './engineSessionId.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
+import { buildCodexDelegateTerminalNotification } from '../engineNotifier.js'
 
 const log = createLogger({ module: 'codexAdapter' })
 
@@ -336,6 +338,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
    *  经 identity guard 清空。 */
   private _routeTurn: CodexTurnContext | null = null
   private _activeTurn: CodexTurnContext | null = null
+  /** InlinePush eligibility is revoked at interrupt / terminal persistence. */
+  private _interrupting = false
   /** Goal sync happens at the session lock boundary before submitTurn installs
    * its parser. Codex may synchronously notify from thread/goal/set, so retain
    * the latest such notification and replay it into the next turn boundary. */
@@ -370,6 +374,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         sessionId: opts.sessionId,
         projectId: opts.projectId,
         runContext: opts.runContext,
+        frozenProjectContext: opts.frozenProjectContext,
         getRepoSnapshot: opts.getRepoSnapshot,
         hermeticNoTools: opts.hermeticNoTools,
         structuredOutputSchema: opts.structuredOutputSchema,
@@ -499,19 +504,38 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     })
     ctx.parser = parser
     this._routeTurn = ctx
-    this._activeTurn = ctx
+    this._interrupting = false
+    // kernel.submit() covers the full turn, so do not wait for it to arm
+    // stdout routing. InlinePush eligibility is kernel.hasIngestedParentTurn
+    // (turn/start ACK), not this microtask or queue/processing.
     if (this._pendingGoalMessage) {
       const pendingGoal = this._pendingGoalMessage
       this._pendingGoalMessage = null
       parser.parse(pendingGoal as unknown as SdkMessage)
     }
-    const submitted = this.kernel.submit(
-      params.input as string | Array<{ type: string; text?: string }>,
-      params.requestId,
-      params.collabAgentPolicy,
-      params.queueTurn,
-      params.automaticRetryState,
-    )
+    let submitted: Promise<void>
+    try {
+      submitted = this.kernel.submit(
+        params.input as string | Array<{ type: string; text?: string }>,
+        params.requestId,
+        params.collabAgentPolicy,
+        params.queueTurn,
+        params.automaticRetryState,
+      )
+    } catch (err) {
+      submitted = Promise.reject(err)
+    }
+    let rejectedEarly = false
+    void submitted.catch(() => {
+      rejectedEarly = true
+      if (this._activeTurn === ctx) this._activeTurn = null
+    })
+    queueMicrotask(() => {
+      if (rejectedEarly) return
+      if (this._routeTurn === ctx && !ctx.parser.finalized && !this._interrupting) {
+        this._activeTurn = ctx
+      }
+    })
     return {
       submitted,
       summary,
@@ -530,6 +554,11 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   }
 
   interrupt(): boolean {
+    // 只撤 InlinePush 资格(writeDelegateTerminal 先查 _interrupting),不清 _activeTurn:
+    // codex 是 engine-reported 计费,interrupted 终态的 result 帧仍要经 `_activeTurn === turn`
+    // 门 emit billing(上游已烧的 token 必须入账),usage/call_usage 与 getPartialSnapshot
+    // 也依赖它路由到收尾。终态由 parser.finalized / 下一次 submitTurn 自然收口。
+    this._interrupting = true
     return this.kernel.interrupt()
   }
 
@@ -658,6 +687,25 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
 
   getBoundRepoBinding(): { selectionVersion: number; workspaceDir: string } | null {
     return this.kernel.getBoundRepoBinding()
+  }
+
+  /**
+   * R3 档 A. Notification is only useful while a turn is routing (`_activeTurn`);
+   * idle → degrade to ResumeInject. Write failures do not kill app-server.
+   */
+  async writeDelegateTerminal(
+    event: JobTerminal,
+    body: string,
+  ): Promise<{ ok: boolean; processAlive: boolean; unknown?: boolean }> {
+    if (!this.kernel.isRunning) return { ok: false, processAlive: false }
+    if (this._interrupting) return { ok: false, processAlive: true }
+    const turn = this._activeTurn
+    if (!turn || !turn.parser || turn.parser.finalized) return { ok: false, processAlive: true }
+    // queue/processing is not ingest; reject after A write would orphan.
+    if (this.kernel.hasIngestedParentTurn === false) return { ok: false, processAlive: true }
+    return this.kernel.writeDelegateTerminalNotification(
+      buildCodexDelegateTerminalNotification(event, body),
+    )
   }
 }
 

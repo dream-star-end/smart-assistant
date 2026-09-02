@@ -180,9 +180,19 @@ export function useTaskboard(
   }, [])
 
   const applyBoardSnap = useCallback((snap: BoardSnapshot) => {
+    const columns = Array.isArray(snap.columns)
+      ? snap.columns
+          .filter((col): col is NonNullable<typeof col> => !!col && !!col.stage)
+          .map((col) => ({
+            ...col,
+            tickets: Array.isArray(col.tickets) ? col.tickets : [],
+          }))
+      : []
     setBoard({
       ...snap,
-      backlog: snap.backlog ?? { tickets: [] },
+      columns,
+      inbox: Array.isArray(snap.inbox) ? snap.inbox : [],
+      backlog: { tickets: Array.isArray(snap.backlog?.tickets) ? snap.backlog.tickets : [] },
     })
     if (!explicitType.current && snap.ticketType) {
       setTicketType(snap.ticketType)
@@ -295,7 +305,10 @@ export function useTaskboard(
       setProjects(null)
       setBoard(null)
       setBacklogTickets([])
+      setProjectId(null)
+      projectIdRef.current = null
       setLoading(false)
+      setError(null)
       return
     }
     void loadInitial()

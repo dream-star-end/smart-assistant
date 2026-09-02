@@ -41,11 +41,15 @@ for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
   /usr/bin/mktemp /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat \
   /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/mv /bin/date /bin/ln \
   /usr/bin/cut /usr/bin/find /usr/bin/mkfifo /usr/bin/sha256sum \
-  /usr/bin/tail /usr/bin/tee; do
+  /usr/bin/tail /usr/bin/tee /usr/bin/curl /usr/bin/flock /usr/bin/sort; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
 cursor_bin=/opt/cursor-agent/versions/2026.08.11-e8db854/cursor-agent
+cursor_probe_bin=/usr/bin/curl
+cursor_probe_url=https://api2.cursor.sh
+cursor_select_budget=45
+cursor_proxy_lease_seconds=900
 auth_file=/run/oc/cursor-auth/api-key
 [ -x "$cursor_bin" ] || die "pinned Cursor Agent CLI is unavailable"
 /usr/bin/sudo -n /usr/bin/test -f "$auth_file" 2>/dev/null \
@@ -58,27 +62,347 @@ auth_file=/run/oc/cursor-auth/api-key
 # auth directory is root-authored, but a stray glob-shaped entry must not
 # resolve against workspace filenames.
 auth_dir=${auth_file%/*}
+
+# Optional host-authored Cursor-only HTTPS egress. The sidecar is a fixed,
+# root-approved backup route; direct egress is always the primary. A two-lock
+# admission protocol lets same-route turns overlap while preventing a
+# direct/proxy transition until every old-route CLI has drained. Route changes
+# are sticky for 15 minutes and are never triggered by CLI/auth/quota errors.
+unset HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY
+unset https_proxy http_proxy all_proxy no_proxy
+cursor_https_proxy=""
+cursor_proxy_file=$auth_dir/.https-proxy
+flavor_assert=""
+if [ -f "$SELF_ROOT/assert-flavor.sh" ]; then
+  flavor_assert=$SELF_ROOT/assert-flavor.sh
+elif [ -f "$SELF_ROOT/../../../../../scripts/lib/assert-flavor.sh" ]; then
+  flavor_assert=$SELF_ROOT/../../../../../scripts/lib/assert-flavor.sh
+fi
+if [ -z "$flavor_assert" ]; then
+  flavor_probe=$SELF_ROOT
+  flavor_guarded=0
+  while [ "$flavor_probe" != / ]; do
+    if [ -f "$flavor_probe/flavor.manifest.json" ] || [ -f "$flavor_probe/.complete" ]; then
+      if grep -q 'guardGeneration\|flavorGuardGeneration' "$flavor_probe/flavor.manifest.json" "$flavor_probe/.complete" 2>/dev/null; then
+        flavor_guarded=1
+      fi
+      break
+    fi
+    flavor_probe=$(/usr/bin/dirname "$flavor_probe")
+  done
+  if [ "$flavor_guarded" = 1 ]; then
+    die "flavor helper missing on guarded artifact"
+  fi
+fi
+
+if [ "${OPENCLAUDE_CURSOR_SELECT_ONLY:-}" != 1 ] \
+  && [ -z "${OPENCLAUDE_CURSOR_RECORD_RESULT:-}" ] \
+  && /usr/bin/sudo -n /usr/bin/test -f "$cursor_proxy_file" 2>/dev/null; then
+  cursor_proxy_type=$(/usr/bin/sudo -n /usr/bin/stat -c %F -- "$cursor_proxy_file" 2>/dev/null) \
+    || die "Cursor HTTPS proxy metadata is unavailable"
+  cursor_proxy_uid=$(/usr/bin/sudo -n /usr/bin/stat -c %u -- "$cursor_proxy_file" 2>/dev/null) \
+    || die "Cursor HTTPS proxy metadata is unavailable"
+  cursor_auth_uid=$(/usr/bin/sudo -n /usr/bin/stat -c %u -- "$auth_file" 2>/dev/null) \
+    || die "Cursor credential metadata is unavailable"
+  cursor_proxy_mode=$(/usr/bin/sudo -n /usr/bin/stat -c %a -- "$cursor_proxy_file" 2>/dev/null) \
+    || die "Cursor HTTPS proxy metadata is unavailable"
+  [ "$cursor_proxy_type" = "regular file" ] \
+    && [ "$cursor_proxy_uid" = "$cursor_auth_uid" ] \
+    && [ "$cursor_proxy_mode" = "600" ] \
+    || die "Cursor HTTPS proxy sidecar is invalid"
+  cursor_https_proxy=$(/usr/bin/sudo -n /bin/cat -- "$cursor_proxy_file" 2>/dev/null) \
+    || die "Cursor HTTPS proxy sidecar is unreadable"
+  case "$cursor_https_proxy" in
+    http://*) ;;
+    *) die "Cursor HTTPS proxy must be a credential-free http origin" ;;
+  esac
+  cursor_proxy_authority=${cursor_https_proxy#http://}
+  case "$cursor_proxy_authority" in
+    ''|*/*|*\?*|*\#*|*@*|*[!A-Za-z0-9._:-]*)
+      die "Cursor HTTPS proxy must be a credential-free http origin"
+      ;;
+  esac
+  cursor_proxy_host=${cursor_proxy_authority%:*}
+  cursor_proxy_port=${cursor_proxy_authority##*:}
+  [ -n "$cursor_proxy_host" ] && [ "$cursor_proxy_port" != "$cursor_proxy_authority" ] \
+    || die "Cursor HTTPS proxy must include host and port"
+  case "$cursor_proxy_port" in ''|*[!0-9]*) die "Cursor HTTPS proxy port is invalid" ;; esac
+  [ "$cursor_proxy_port" -ge 1 ] && [ "$cursor_proxy_port" -le 65535 ] \
+    || die "Cursor HTTPS proxy port is invalid"
+  if [ -n "$flavor_assert" ]; then
+    # shellcheck disable=SC1090
+    . "$flavor_assert"
+    assert_allows selfhost-cursor-egress --sidecar 1 --effector "$SELF_ROOT" \
+      || die "flavor identity refused Cursor HTTPS proxy sidecar"
+  fi
+
+  cursor_runtime_uid=$(/usr/bin/id -u) || die "current uid is unavailable"
+  cursor_route_dir=/tmp/openclaude-cursor-egress.$cursor_runtime_uid
+  cursor_gate_file=$cursor_route_dir/admission.lock
+  cursor_route_lock_file=$cursor_route_dir/route.lock
+  cursor_route_state_file=$cursor_route_dir/route.state
+
+  if [ ! -e "$cursor_route_dir" ]; then
+    /bin/mkdir -m 700 -- "$cursor_route_dir" 2>/dev/null || true
+  fi
+  [ -d "$cursor_route_dir" ] && [ ! -L "$cursor_route_dir" ] \
+    || die "Cursor egress state directory is invalid"
+  cursor_route_dir_type=$(/usr/bin/stat -c %F -- "$cursor_route_dir" 2>/dev/null) \
+    || die "Cursor egress state directory metadata is unavailable"
+  cursor_route_dir_uid=$(/usr/bin/stat -c %u -- "$cursor_route_dir" 2>/dev/null) \
+    || die "Cursor egress state directory metadata is unavailable"
+  cursor_route_dir_mode=$(/usr/bin/stat -c %a -- "$cursor_route_dir" 2>/dev/null) \
+    || die "Cursor egress state directory metadata is unavailable"
+  [ "$cursor_route_dir_type" = "directory" ] \
+    && [ "$cursor_route_dir_uid" = "$cursor_runtime_uid" ] \
+    && [ "$cursor_route_dir_mode" = "700" ] \
+    || die "Cursor egress state directory is invalid"
+
+  ensure_cursor_lock_file() {
+    cursor_lock_path=$1
+    [ ! -L "$cursor_lock_path" ] || die "Cursor egress lock file is invalid"
+    if [ ! -e "$cursor_lock_path" ]; then
+      (umask 077; : > "$cursor_lock_path") 2>/dev/null || true
+    fi
+    cursor_lock_type=$(/usr/bin/stat -c %F -- "$cursor_lock_path" 2>/dev/null) \
+      || die "Cursor egress lock metadata is unavailable"
+    cursor_lock_uid=$(/usr/bin/stat -c %u -- "$cursor_lock_path" 2>/dev/null) \
+      || die "Cursor egress lock metadata is unavailable"
+    cursor_lock_mode=$(/usr/bin/stat -c %a -- "$cursor_lock_path" 2>/dev/null) \
+      || die "Cursor egress lock metadata is unavailable"
+    [ "$cursor_lock_type" = "regular empty file" ] \
+      && [ "$cursor_lock_uid" = "$cursor_runtime_uid" ] \
+      && [ "$cursor_lock_mode" = "600" ] \
+      || die "Cursor egress lock file is invalid"
+  }
+
+  ensure_cursor_lock_file "$cursor_gate_file"
+  ensure_cursor_lock_file "$cursor_route_lock_file"
+  exec 9>>"$cursor_gate_file"
+  exec 8>>"$cursor_route_lock_file"
+
+  cursor_selector_started=$(/bin/date +%s) || die "Cursor egress clock is unavailable"
+  cursor_selector_deadline=$((cursor_selector_started + cursor_select_budget))
+  refresh_cursor_budget() {
+    cursor_selector_now=$(/bin/date +%s) || return 1
+    cursor_selector_remaining=$((cursor_selector_deadline - cursor_selector_now))
+    [ "$cursor_selector_remaining" -gt 0 ]
+  }
+
+  refresh_cursor_budget || die "Cursor egress selection deadline exceeded"
+  /usr/bin/flock -x -w "$cursor_selector_remaining" 9 \
+    || die "Cursor egress admission deadline exceeded"
+  refresh_cursor_budget || die "Cursor egress selection deadline exceeded"
+  /usr/bin/flock -s -w "$cursor_selector_remaining" 8 \
+    || die "Cursor egress route-lock deadline exceeded"
+
+  write_cursor_route_state() {
+    cursor_state_route=$1
+    cursor_state_expiry=$2
+    cursor_state_tmp=$(/usr/bin/mktemp "$cursor_route_dir/route.state.tmp.XXXXXXXX") \
+      || die "cannot create Cursor egress state"
+    /bin/chmod 600 -- "$cursor_state_tmp" \
+      || { /bin/rm -f -- "$cursor_state_tmp"; die "cannot secure Cursor egress state"; }
+    if ! printf '%s %s\n' "$cursor_state_route" "$cursor_state_expiry" > "$cursor_state_tmp"; then
+      /bin/rm -f -- "$cursor_state_tmp"
+      die "cannot write Cursor egress state"
+    fi
+    /bin/mv -f -- "$cursor_state_tmp" "$cursor_route_state_file" \
+      || { /bin/rm -f -- "$cursor_state_tmp"; die "cannot commit Cursor egress state"; }
+  }
+
+  cursor_route=direct
+  cursor_route_expiry=0
+  if [ -e "$cursor_route_state_file" ] || [ -L "$cursor_route_state_file" ]; then
+    [ -f "$cursor_route_state_file" ] && [ ! -L "$cursor_route_state_file" ] \
+      || die "Cursor egress state file is invalid"
+    cursor_state_type=$(/usr/bin/stat -c %F -- "$cursor_route_state_file" 2>/dev/null) \
+      || die "Cursor egress state metadata is unavailable"
+    cursor_state_uid=$(/usr/bin/stat -c %u -- "$cursor_route_state_file" 2>/dev/null) \
+      || die "Cursor egress state metadata is unavailable"
+    cursor_state_mode=$(/usr/bin/stat -c %a -- "$cursor_route_state_file" 2>/dev/null) \
+      || die "Cursor egress state metadata is unavailable"
+    [ "$cursor_state_type" = "regular file" ] \
+      && [ "$cursor_state_uid" = "$cursor_runtime_uid" ] \
+      && [ "$cursor_state_mode" = "600" ] \
+      || die "Cursor egress state file is invalid"
+    cursor_state_text=$(/bin/cat -- "$cursor_route_state_file" 2>/dev/null) \
+      || die "Cursor egress state file is unreadable"
+    case "$cursor_state_text" in *"
+"*) die "Cursor egress state file is invalid" ;; esac
+    cursor_state_extra=""
+    IFS=' ' read -r cursor_route cursor_route_expiry cursor_state_extra <<STATE
+$cursor_state_text
+STATE
+    case "$cursor_route" in direct|proxy) ;; *) die "Cursor egress state route is invalid" ;; esac
+    [ -z "$cursor_state_extra" ] || die "Cursor egress state file is invalid"
+    case "$cursor_route_expiry" in ''|*[!0-9]*) die "Cursor egress state expiry is invalid" ;; esac
+    [ "${#cursor_route_expiry}" -le 10 ] || die "Cursor egress state expiry is invalid"
+    cursor_state_now=$(/bin/date +%s) || die "Cursor egress clock is unavailable"
+    cursor_state_max=$((cursor_state_now + cursor_proxy_lease_seconds))
+    [ "$cursor_route_expiry" -le "$cursor_state_max" ] \
+      || die "Cursor egress state lease is invalid"
+  else
+    write_cursor_route_state direct 0
+  fi
+
+  cursor_probe_timeout() {
+    refresh_cursor_budget || return 1
+    cursor_probe_seconds=3
+    if [ "$cursor_selector_remaining" -lt "$cursor_probe_seconds" ]; then
+      cursor_probe_seconds=$cursor_selector_remaining
+    fi
+    [ "$cursor_probe_seconds" -gt 0 ]
+  }
+  cursor_probe_direct() {
+    cursor_probe_timeout || return 1
+    "$cursor_probe_bin" -q -4 -sS -o /dev/null \
+      --connect-timeout 2 --max-time "$cursor_probe_seconds" \
+      --noproxy '*' "$cursor_probe_url" >/dev/null 2>&1
+  }
+  cursor_probe_proxy() {
+    cursor_probe_timeout || return 1
+    "$cursor_probe_bin" -q -4 -sS -o /dev/null \
+      --connect-timeout 2 --max-time "$cursor_probe_seconds" \
+      --proxy "$cursor_https_proxy" --noproxy '' \
+      "$cursor_probe_url" >/dev/null 2>&1
+  }
+  cursor_direct_any_success() {
+    cursor_probe_direct || cursor_probe_direct
+  }
+  cursor_direct_two_successes() {
+    cursor_probe_direct && cursor_probe_direct
+  }
+
+  cursor_selected_route=$cursor_route
+  cursor_switch_target=""
+  cursor_route_now=$(/bin/date +%s) || die "Cursor egress clock is unavailable"
+  if [ "$cursor_route" = direct ]; then
+    if cursor_direct_any_success; then
+      cursor_selected_route=direct
+    elif cursor_probe_proxy; then
+      cursor_switch_target=proxy
+    else
+      die "Cursor direct and backup proxy routes are unreachable"
+    fi
+  elif [ "$cursor_route_expiry" -gt "$cursor_route_now" ]; then
+    if cursor_probe_proxy; then
+      cursor_selected_route=proxy
+    elif cursor_direct_two_successes; then
+      cursor_switch_target=direct
+    else
+      die "Cursor backup proxy is unavailable and direct recovery is unconfirmed"
+    fi
+  elif cursor_direct_two_successes; then
+    cursor_switch_target=direct
+  elif cursor_probe_proxy; then
+    cursor_route_now=$(/bin/date +%s) || die "Cursor egress clock is unavailable"
+    cursor_route_expiry=$((cursor_route_now + cursor_proxy_lease_seconds))
+    write_cursor_route_state proxy "$cursor_route_expiry"
+    cursor_selected_route=proxy
+  else
+    die "Cursor direct recovery is unconfirmed and backup proxy is unreachable"
+  fi
+
+  if [ -n "$cursor_switch_target" ]; then
+    /usr/bin/flock -u 8 || die "cannot release Cursor egress route lock"
+    refresh_cursor_budget || die "Cursor egress selection deadline exceeded"
+    /usr/bin/flock -x -w "$cursor_selector_remaining" 8 \
+      || die "Cursor egress drain deadline exceeded"
+
+    # The target may have failed while old-route invocations drained. Re-probe
+    # under the exclusive lock before committing a process-wide IP change.
+    if [ "$cursor_switch_target" = direct ]; then
+      cursor_direct_two_successes \
+        || die "Cursor direct route failed post-drain validation"
+      cursor_route_expiry=0
+    else
+      cursor_probe_proxy \
+        || die "Cursor backup proxy failed post-drain validation"
+      cursor_route_now=$(/bin/date +%s) || die "Cursor egress clock is unavailable"
+      cursor_route_expiry=$((cursor_route_now + cursor_proxy_lease_seconds))
+    fi
+    write_cursor_route_state "$cursor_switch_target" "$cursor_route_expiry"
+    cursor_selected_route=$cursor_switch_target
+    /usr/bin/flock -s 8 || die "cannot downgrade Cursor egress route lock"
+  fi
+
+  /usr/bin/flock -u 9 || die "cannot release Cursor egress admission lock"
+  exec 9>&-
+  if [ "$cursor_selected_route" = proxy ]; then
+    HTTPS_PROXY=$cursor_https_proxy
+    HTTP_PROXY=$cursor_https_proxy
+    NO_PROXY=127.0.0.1,localhost,::1,172.31.0.1
+    export HTTPS_PROXY HTTP_PROXY NO_PROXY
+  else
+    NO_PROXY=127.0.0.1,localhost,::1,172.31.0.1
+    export NO_PROXY
+  fi
+fi
+
+auth_root=$auth_dir
+pool_generation=${OPENCLAUDE_CURSOR_POOL_GENERATION:-}
+if [ -z "$pool_generation" ]; then
+  pool_generation=$(/usr/bin/sudo -n /bin/cat -- "$auth_root/.pool-active" 2>/dev/null) \
+    || pool_generation=""
+fi
+if [ -z "$pool_generation" ]; then
+  [ "${OC_CURSOR_ALLOW_LEGACY_POOL:-}" = 1 ] \
+    || die "Cursor immutable pool generation is unavailable"
+  pool_generation=legacy
+else
+  case "$pool_generation" in gen-*) ;; *) die "Cursor pool generation is invalid" ;; esac
+  pool_generation_hex=${pool_generation#gen-}
+  [ "${#pool_generation_hex}" -eq 24 ] || die "Cursor pool generation is invalid"
+  case "$pool_generation_hex" in *[!0-9a-f]*) die "Cursor pool generation is invalid" ;; esac
+  generation_dir=$auth_root/.pool-generations/$pool_generation
+  /usr/bin/sudo -n /usr/bin/test -d "$generation_dir" 2>/dev/null \
+    || die "Cursor pool generation directory is unavailable"
+  auth_dir=$generation_dir
+  auth_file=$auth_dir/api-key
+fi
+identity_text=""
+if [ "$pool_generation" != legacy ]; then
+  identity_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.slot-identities" 2>/dev/null) \
+    || die "Cursor pool identity sidecar is unreadable"
+  identity_header=${identity_text%%
+*}
+  [ "$identity_header" = "# cursor-pool-identity v1 $pool_generation" ] \
+    || die "Cursor pool identity generation mismatch"
+fi
+
 set -f
-key_names=""
-key_count=0
+primary_present=0
+extra_suffixes=""
 auth_entries=$(/usr/bin/sudo -n /bin/ls -1 -- "$auth_dir" 2>/dev/null) \
   || auth_entries=""
 for auth_entry in $auth_entries; do
   case "$auth_entry" in
     api-key)
-      key_names="$key_names $auth_entry"
-      key_count=$((key_count + 1))
+      primary_present=1
       ;;
     api-key.*)
       key_suffix=${auth_entry#api-key.}
       case "$key_suffix" in
         ''|*[!0-9]*|0*|1) continue ;;
       esac
-      key_names="$key_names $auth_entry"
-      key_count=$((key_count + 1))
+      extra_suffixes="$extra_suffixes $key_suffix"
       ;;
   esac
 done
+key_names=""
+key_count=0
+if [ "$primary_present" -eq 1 ]; then
+  key_names=" api-key"
+  key_count=1
+fi
+if [ -n "$extra_suffixes" ]; then
+  sorted_suffixes=$(printf '%s\n' $extra_suffixes | /usr/bin/sort -n)
+  for key_suffix in $sorted_suffixes; do
+    key_names="$key_names api-key.$key_suffix"
+    key_count=$((key_count + 1))
+  done
+fi
 set +f
 [ "$key_count" -gt 0 ] || die "Cursor CLI is not enabled for this account"
 
@@ -153,6 +477,8 @@ case "$model" in
   claude-opus-4-8-thinking-max|claude-opus-4-8-thinking-max-fast|\
   claude-fable-5-thinking-low|claude-fable-5-thinking-medium|claude-fable-5-thinking-high|\
   claude-fable-5-thinking-xhigh|claude-fable-5-thinking-max|\
+  claude-fable-5-1-thinking-low|claude-fable-5-1-thinking-medium|claude-fable-5-1-thinking-high|\
+  claude-fable-5-1-thinking-xhigh|claude-fable-5-1-thinking-max|\
   cursor-grok-4.5-high) ;;
   *) die "model is not allowlisted" ;;
 esac
@@ -278,23 +604,76 @@ if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null \
     || sand_sidecar_text=""
 fi
 
+identity_account_for_key() {
+  _identity_target=$1
+  if [ "$pool_generation" = legacy ]; then printf '0\n'; return 0; fi
+  while IFS= read -r _identity_line || [ -n "$_identity_line" ]; do
+    case "$_identity_line" in ''|'#'*) continue ;; esac
+    _identity_name=${_identity_line%% *}
+    _identity_rest=${_identity_line#"$_identity_name" }
+    _identity_account=${_identity_rest%% *}
+    if [ "$_identity_name" = "$_identity_target" ]; then
+      printf '%s\n' "$_identity_account"
+      return 0
+    fi
+  done <<IDENTITY_LOOKUP
+$identity_text
+IDENTITY_LOOKUP
+  return 1
+}
+decimal_account_gt() {
+  _decimal_left=$1
+  _decimal_right=$2
+  if [ "${#_decimal_left}" -gt "${#_decimal_right}" ]; then return 0; fi
+  if [ "${#_decimal_left}" -lt "${#_decimal_right}" ]; then return 1; fi
+  [ "$_decimal_left" \> "$_decimal_right" ]
+}
+
 if [ "$eligible_count" -gt 1 ]; then
   rotation_state=$(/bin/cat -- "$rotation_file" 2>/dev/null) || rotation_state=""
-  rotation_first=${rotation_state%% *}
-  rotation_rest=${rotation_state#* }
-  if [ "$rotation_rest" = "$rotation_state" ]; then rotation_rest=""; fi
-  case "$rotation_first" in
-    ''|*[!0-9]*) rotation_first=0 ;;
-  esac
-  case "$rotation_rest" in
-    ''|*[!0-9]*) rotation_rest=0 ;;
-  esac
-  rotation_idx=$rotation_first
-  rotation_exp=$rotation_rest
-  if [ "$rotation_idx" -ge "$eligible_count" ]; then rotation_idx=0; fi
-  # Cooldown elapsed (or legacy single-int state): return to the primary eligible.
-  if [ "$rotation_idx" -gt 0 ] && [ "$(/bin/date +%s)" -ge "$rotation_exp" ]; then
-    rotation_idx=0
+  rotation_version=${rotation_state%% *}
+  if [ "$rotation_version" = v2 ]; then
+    rotation_rest=${rotation_state#v2 }
+    rotation_failed_account=${rotation_rest%% *}
+    rotation_rest=${rotation_rest#"$rotation_failed_account" }
+    rotation_family=${rotation_rest%% *}
+    rotation_exp=${rotation_rest#"$rotation_family" }
+    case "$rotation_failed_account" in ''|*[!0-9]*) rotation_failed_account=0 ;; esac
+    case "$rotation_family" in cursor_models|other_models) ;; *) rotation_family=invalid ;; esac
+    case "$rotation_exp" in ''|*[!0-9]*) rotation_exp=0 ;; esac
+    if [ "$rotation_family" = "$cursor_family" ] \
+      && [ "$(/bin/date +%s)" -lt "$rotation_exp" ]; then
+      successor_position=0
+      slot_position=0
+      for key_name in $eligible_names; do
+        slot_position=$((slot_position + 1))
+        slot_account=$(identity_account_for_key "$key_name" 2>/dev/null) || slot_account=0
+        if [ "$slot_account" != 0 ] \
+          && decimal_account_gt "$slot_account" "$rotation_failed_account"; then
+          successor_position=$slot_position
+          break
+        fi
+      done
+      if [ "$successor_position" -gt 0 ]; then
+        rotation_idx=$((successor_position - 1))
+      else
+        rotation_idx=0
+      fi
+    else
+      rotation_idx=0
+    fi
+  else
+    rotation_first=${rotation_state%% *}
+    rotation_rest=${rotation_state#* }
+    if [ "$rotation_rest" = "$rotation_state" ]; then rotation_rest=""; fi
+    case "$rotation_first" in ''|*[!0-9]*) rotation_first=0 ;; esac
+    case "$rotation_rest" in ''|*[!0-9]*) rotation_rest=0 ;; esac
+    rotation_idx=$rotation_first
+    rotation_exp=$rotation_rest
+    if [ "$rotation_idx" -ge "$eligible_count" ]; then rotation_idx=0; fi
+    if [ "$rotation_idx" -gt 0 ] && [ "$(/bin/date +%s)" -ge "$rotation_exp" ]; then
+      rotation_idx=0
+    fi
   fi
   chosen_slot=$((rotation_idx + 1))
   slot_position=0
@@ -315,15 +694,44 @@ if [ "$eligible_count" -gt 1 ]; then
   done
 fi
 
+# Gateway routing may pin the exact slot returned by an immediately preceding
+# metadata-only selection. Revalidate against this model family's eligible
+# pool; never accept an arbitrary path or a key excluded by quota class.
+if [ -n "${OPENCLAUDE_CURSOR_SELECTED_KEY:-}" ]; then
+  case "$OPENCLAUDE_CURSOR_SELECTED_KEY" in
+    api-key|api-key.[2-9]|api-key.[1-9][0-9]*) ;;
+    *) die "Cursor selected credential name is invalid" ;;
+  esac
+  selected_found=0
+  selected_position=0
+  for key_name in $eligible_names; do
+    selected_position=$((selected_position + 1))
+    if [ "$key_name" = "$OPENCLAUDE_CURSOR_SELECTED_KEY" ]; then
+      chosen_key_file=$auth_dir/$key_name
+      rotation_idx=$((selected_position - 1))
+      selected_found=1
+      break
+    fi
+  done
+  [ "$selected_found" -eq 1 ] || die "Cursor selected credential is not eligible"
+fi
+
 # Advance the eligible pool past the slot that just failed. No-op for
 # single-eligible accounts, so their failure path stays byte-identical.
 
 rotation_advance() {
   [ "$eligible_count" -gt 1 ] || return 0
-  rotation_next=$((rotation_idx + 1))
-  if [ "$rotation_next" -ge "$eligible_count" ]; then rotation_next=0; fi
-  printf '%s %s\n' "$rotation_next" "$(( $(/bin/date +%s) + rotation_cooldown ))" \
-    > "$rotation_file" 2>/dev/null || :
+  rotation_deadline=$(( $(/bin/date +%s) + rotation_cooldown ))
+  failed_key_name=${chosen_key_file##*/}
+  failed_account=$(identity_account_for_key "$failed_key_name" 2>/dev/null) || failed_account=0
+  if [ "$pool_generation" != legacy ] && [ "$failed_account" != 0 ]; then
+    printf 'v2 %s %s %s\n' "$failed_account" "$cursor_family" "$rotation_deadline" \
+      > "$rotation_file" 2>/dev/null || :
+  else
+    rotation_next=$((rotation_idx + 1))
+    if [ "$rotation_next" -ge "$eligible_count" ]; then rotation_next=0; fi
+    printf '%s %s\n' "$rotation_next" "$rotation_deadline" > "$rotation_file" 2>/dev/null || :
+  fi
 }
 mark_other_models_recheck_failure() {
   [ "$other_models_recheck" -eq 1 ] || return 0
@@ -367,6 +775,72 @@ $sand_sidecar_text
 SAND_SIDECAR
 fi
 
+selected_account_id=0
+selected_fingerprint=0000000000000000
+if [ "$pool_generation" != legacy ]; then
+  identity_found=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    identity_name=${line%% *}
+    identity_rest=${line#"$identity_name" }
+    identity_account=${identity_rest%% *}
+    identity_rest=${identity_rest#"$identity_account" }
+    identity_fingerprint=${identity_rest%% *}
+    identity_sand=${identity_rest#"$identity_fingerprint" }
+    if [ "$identity_name" = "$chosen_key_name" ]; then
+      case "$identity_account" in ''|*[!0-9]*) die "Cursor pool account identity is invalid" ;; esac
+      [ "${#identity_fingerprint}" -eq 16 ] || die "Cursor pool key fingerprint is invalid"
+      case "$identity_fingerprint" in *[!0-9a-f]*) die "Cursor pool key fingerprint is invalid" ;; esac
+      case "$identity_sand" in 0|1) ;; *) die "Cursor pool Sand identity is invalid" ;; esac
+      [ "$identity_sand" -eq "$sand_enabled" ] || die "Cursor pool Sand sidecars disagree"
+      selected_account_id=$identity_account
+      selected_fingerprint=$identity_fingerprint
+      identity_found=1
+      break
+    fi
+  done <<IDENTITY_SIDECAR
+$identity_text
+IDENTITY_SIDECAR
+  [ "$identity_found" -eq 1 ] || die "Cursor selected credential identity is unavailable"
+fi
+
+chosen_full_slot=0
+full_slot_cursor=0
+for key_name in $key_names; do
+  full_slot_cursor=$((full_slot_cursor + 1))
+  if [ "$auth_dir/$key_name" = "$chosen_key_file" ]; then
+    chosen_full_slot=$full_slot_cursor
+    break
+  fi
+done
+[ "$chosen_full_slot" -gt 0 ] || die "Cursor selected credential slot is unavailable"
+
+# Internal metadata/settlement modes never read or print the credential. They
+# let the gateway bind native/Sand routing to the wrapper's existing pool
+# authority instead of reimplementing rotation and quota filtering in TS.
+if [ "${OPENCLAUDE_CURSOR_SELECT_ONLY:-}" = 1 ]; then
+  if [ "$sand_enabled" -eq 1 ]; then selected_mode=sand; else selected_mode=native; fi
+  printf 'oc-cursor: selected_slot %s %s %s %s %s %s\n' \
+    "$chosen_full_slot" "$chosen_key_name" "$selected_mode" "$pool_generation" \
+    "$selected_account_id" "$selected_fingerprint"
+  exit 0
+fi
+if [ -n "${OPENCLAUDE_CURSOR_RECORD_RESULT:-}" ]; then
+  case "$OPENCLAUDE_CURSOR_RECORD_RESULT" in
+    ok)
+      emit_slot_result ok
+      clear_other_models_recheck
+      ;;
+    fail)
+      emit_slot_result fail
+      mark_other_models_recheck_failure
+      rotation_advance
+      ;;
+    *) die "Cursor record result is invalid" ;;
+  esac
+  exit 0
+fi
+
 if ! api_key=$(/usr/bin/sudo -n /bin/cat -- "$chosen_key_file" 2>/dev/null); then
   emit_slot_result fail
   mark_other_models_recheck_failure
@@ -389,6 +863,17 @@ case "$api_key" in
     die "Cursor credential is malformed"
     ;;
 esac
+actual_fingerprint=$(printf '%s\n' "$api_key" | /usr/bin/sha256sum | /usr/bin/cut -c1-16)
+expected_fingerprint=${OPENCLAUDE_CURSOR_KEY_FINGERPRINT:-$selected_fingerprint}
+if [ "$pool_generation" != legacy ] && [ "$actual_fingerprint" != "$expected_fingerprint" ]; then
+  emit_slot_result fail
+  die "Cursor credential fingerprint changed after selection"
+fi
+if [ -n "${OPENCLAUDE_CURSOR_ACCOUNT_ID:-}" ] \
+  && [ "$OPENCLAUDE_CURSOR_ACCOUNT_ID" != "$selected_account_id" ]; then
+  emit_slot_result fail
+  die "Cursor credential account identity changed after selection"
+fi
 
 umask 077
 cursor_home=$(/usr/bin/mktemp -d /tmp/openclaude-cursor.XXXXXXXX) \
@@ -584,7 +1069,7 @@ if [ "${OPENCLAUDE_CURSOR_AGENT_DEBUG:-}" = "1" ] && [ -n "$oc_home" ] && [ -d "
             # tee is a wrapper child, NOT in the CLI process group: Stop kills
             # the group, the fifo write end closes, tee exits on EOF. stderr
             # keeps flowing to the gateway via >&2.
-            /usr/bin/tee -a -- "$debug_log" < "$debug_fifo" >&2 &
+            /usr/bin/tee -a -- "$debug_log" < "$debug_fifo" >&2 8>&- &
             tee_pid=$!
             cursor_debug=1
           fi
@@ -594,41 +1079,24 @@ if [ "${OPENCLAUDE_CURSOR_AGENT_DEBUG:-}" = "1" ] && [ -n "$oc_home" ] && [ -d "
   fi
 fi
 unset OPENCLAUDE_CURSOR_AGENT_DEBUG
+unset OPENCLAUDE_CURSOR_SELECT_ONLY OPENCLAUDE_CURSOR_RECORD_RESULT OPENCLAUDE_CURSOR_SELECTED_KEY
+unset OPENCLAUDE_CURSOR_POOL_GENERATION OPENCLAUDE_CURSOR_ACCOUNT_ID OPENCLAUDE_CURSOR_KEY_FINGERPRINT
 
-# When Sand mode is enabled for Other Models (Opus, etc.), install ephemeral preload
-# hook to guarantee x-cursor-client-type is sand and pass -H argument.
-# Cursor Models (Grok 4.6 / Grok 4.5 / Composer 2.5) always run in native CLI mode.
-effective_sand=0
-if [ "$sand_enabled" -eq 1 ] && [ "$cursor_family" = "other_models" ]; then
-  effective_sand=1
-fi
-
-if [ "$effective_sand" -eq 1 ]; then
-  sand_hook="$cursor_home/.sand-hook.cjs"
-  /bin/cat <<'EOF' > "$sand_hook"
-const origSet = globalThis.Headers?.prototype?.set;
-if (origSet) {
-  globalThis.Headers.prototype.set = function(k, v) {
-    if (typeof k === "string" && k.toLowerCase() === "x-cursor-client-type") {
-      return origSet.call(this, k, "sand");
-    }
-    return origSet.call(this, k, v);
-  };
-}
-const origAppend = globalThis.Headers?.prototype?.append;
-if (origAppend) {
-  globalThis.Headers.prototype.append = function(k, v) {
-    if (typeof k === "string" && k.toLowerCase() === "x-cursor-client-type") {
-      return origAppend.call(this, k, "sand");
-    }
-    return origAppend.call(this, k, v);
-  };
-}
-EOF
-  /bin/chmod 600 -- "$sand_hook" 2>/dev/null || true
-  node_opts="${NODE_OPTIONS:-}"
-  [ -z "$node_opts" ] && node_opts="--require $sand_hook" || node_opts="$node_opts --require $sand_hook"
-  export NODE_OPTIONS="$node_opts"
+# Sand remains a credential transport property, but the official Cursor CLI
+# keeps the native agent/tool loop. The pinned image carries a fail-closed,
+# build-time patch that changes only InferenceService/ChatService/AiService
+# requests to Sand; AgentService and every other control-plane RPC stay `cli`.
+# Auto has no concrete model id and therefore remains native.
+cursor_sand_child=0
+if [ "$sand_enabled" -eq 1 ] && [ -n "$model" ]; then
+  cursor_patch_marker=${cursor_bin%/*}/.openclaude-scoped-sand-v1
+  cursor_patch_text=$(/bin/cat -- "$cursor_patch_marker" 2>/dev/null) \
+    || die "Sand-capable Cursor CLI patch marker is unavailable"
+  case "$cursor_patch_text" in
+    "OPENCLAUDE_SCOPED_SAND_V1 "[0-9a-f][0-9a-f]*) ;;
+    *) die "Sand-capable Cursor CLI patch marker is invalid" ;;
+  esac
+  cursor_sand_child=1
 fi
 
 prompt=$1
@@ -648,7 +1116,6 @@ fi
 [ -z "$model" ] || set -- --model "$model" "$@"
 [ -z "$mode" ] || set -- --mode "$mode" "$@"
 [ "$force" -eq 0 ] || set -- --force "$@"
-[ "$effective_sand" -eq 0 ] || set -- -H "x-cursor-client-type: sand" "$@"
 
 # setsid gives the CLI and every tool child one process group so Stop cannot
 # leave a shell command running after the wrapper exits. HOME is per-call and
@@ -661,14 +1128,18 @@ set +e
 if [ "$cursor_debug" -eq 1 ]; then
   HOME="$cursor_home" \
   XDG_CONFIG_HOME="$cursor_home/.config" \
+  OPENCLAUDE_CURSOR_SAND_MODE="$cursor_sand_child" \
+  OPENCLAUDE_CURSOR_SAND_CLIENT_VERSION="0.30.0" \
   CURSOR_API_KEY="$api_key" \
-  /usr/bin/setsid "$cursor_bin" "$@" 2> "$debug_fifo" &
+  /usr/bin/setsid "$cursor_bin" "$@" 8>&- 2> "$debug_fifo" &
 else
   HOME="$cursor_home" \
   XDG_CONFIG_HOME="$cursor_home/.config" \
+  OPENCLAUDE_CURSOR_SAND_MODE="$cursor_sand_child" \
+  OPENCLAUDE_CURSOR_SAND_CLIENT_VERSION="0.30.0" \
   CURSOR_AGENT_DISABLE_DEBUG_LOG=1 \
   CURSOR_API_KEY="$api_key" \
-  /usr/bin/setsid "$cursor_bin" "$@" &
+  /usr/bin/setsid "$cursor_bin" "$@" 8>&- &
 fi
 child_pid=$!
 wait "$child_pid"

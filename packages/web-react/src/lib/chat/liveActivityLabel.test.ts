@@ -132,3 +132,17 @@ describe("formatLiveActivityAction（活动行只显示中文动作，不堆工�
     expect(mappedLiveActivityLabel("CallMcpTool")).toBeNull();
   });
 });
+
+describe("CCB ExecuteExtraTool wrapper in working-detail", () => {
+  test("uses the inner tool token for classification", () => {
+    expect(
+      formatLiveActivityAction("ExecuteExtraTool mcp__openclaude-memory__delegate_task 审计"),
+    ).toBe("运行子任务 · 审计");
+    expect(
+      formatLiveActivityAction("ExecuteExtraTool mcp__openclaude-memory__skill_view v5-x"),
+    ).toBe("搜索代码");
+    expect(formatLiveActivityAction("ExecuteExtraTool TeamCreate review")).toBe("执行操作");
+    expect(formatLiveActivityAction("ExecuteExtraTool")).toBe("执行操作");
+    expect(formatLiveActivityAction("SearchExtraTools select:x")).toBe("执行操作");
+  });
+});

@@ -18,6 +18,7 @@ import { renderSkillListCard, renderSkillSearchCard, renderSkillViewCard } from 
 import { renderDelegateFanoutCard } from "./delegateFanoutCard";
 import { renderMcpResourcesCard } from "./mcpResourceCards";
 import { ToolBodyFullContext, ToolInspectOpenContext, useToolCardActions } from "./context";
+import { parseSearchExtraToolsResult, searchExtraToolsQuery } from "../../lib/chat/extraTool";
 import { formatLiveActivityAction, mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
 import {
   asArr,
@@ -1227,12 +1228,65 @@ function ScanSciBody({ op, input, tool }: BodyProps & { op: string }) {
   );
 }
 
-function TaskBody({ input, tool }: BodyProps) {
-  const title = safeSubtaskDescription(input) || "运行子任务";
+function shortBackgroundTaskId(input: Input): string {
+  const ids = input && Array.isArray(input.task_ids) ? input.task_ids : [];
+  const first =
+    (typeof ids[0] === "string" && ids[0]) ||
+    (typeof input?.task_id === "string" && input.task_id) ||
+    (typeof input?.task_id === "number" && Number.isFinite(input.task_id) ? String(input.task_id) : "");
+  if (!first) return "";
+  return first.length > 16 ? `${first.slice(0, 16)}…` : first;
+}
+
+function TaskBody({ input, tool, name }: BodyProps & { name?: string }) {
+  const desc = safeSubtaskDescription(input);
+  const waitId = shortBackgroundTaskId(input);
+  const title =
+    desc ||
+    (waitId ? `等待后台命令 · ${waitId}` : name === "TaskOutput" ? "等待后台命令" : "运行子任务");
   return (
     <>
       <div className="mt-1.5 text-xs text-muted">{title}</div>
       <OutputBlock output={tool.output} />
+    </>
+  );
+}
+
+/** 工具名短显示:mcp__server__op → server: op;其它原样。 */
+function shortToolName(name: string): string {
+  const mcp = parseMcpName(name);
+  return mcp ? `${mcp.server}: ${mcp.op}` : name;
+}
+
+/**
+ * CCB `SearchExtraTools {query}`:查找延迟工具。结果文本 "Found N deferred tool(s): a, b.\nUse
+ * ExecuteExtraTool …" 只展示找到的工具名列表,不回显给模型看的使用提示。
+ */
+function SearchExtraToolsBody({ input, tool }: BodyProps) {
+  const query = searchExtraToolsQuery(input);
+  const parsed = parseSearchExtraToolsResult(tool.output);
+  return (
+    <>
+      {query && (
+        <div className="mt-1.5 text-xs text-muted">
+          查找 <span className="font-mono text-fg">{clampStr(query, 120)}</span>
+        </div>
+      )}
+      {parsed ? (
+        parsed.none ? (
+          <FileMeta>未找到匹配的工具</FileMeta>
+        ) : (
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            {parsed.found.map((name) => (
+              <Badge key={name} tone="neutral" className="font-mono">
+                {shortToolName(name)}
+              </Badge>
+            ))}
+          </div>
+        )
+      ) : (
+        <OutputBlock output={tool.output} />
+      )}
     </>
   );
 }
@@ -1280,11 +1334,13 @@ export function ToolBody({ name, input, tool }: { name: string; input: Input; to
       return <WebFetchBody input={input} tool={tool} />;
     case "WebSearch":
       return <WebSearchBody input={input} tool={tool} />;
+    case "SearchExtraTools":
+      return <SearchExtraToolsBody input={input} tool={tool} />;
     case "Task":
     case "Agent":
     case "TaskOutput":
     case "TaskStop":
-      return <TaskBody input={input} tool={tool} />;
+      return <TaskBody name={name} input={input} tool={tool} />;
   }
   const codexType = parseCodexTypeName(name);
   if (codexType) return <CodexBody type={codexType} input={input} tool={tool} />;

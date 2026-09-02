@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import '@testing-library/jest-dom/vitest'
-import type { PublicModel } from '../lib/types'
+import type { LockedPublicModel, PublicModel } from '../lib/types'
 import { ModelSelector, modelLabel, teamEngineLabel } from './ModelSelector'
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
@@ -144,12 +144,12 @@ describe('ModelSelector provider 健康度降级(0108)', () => {
 describe('ModelSelector Cursor 家族 + 思考档 + Fast', () => {
   const CURSOR_MODELS: PublicModel[] = [
     { id: 'cursor-auto', display_name: 'Cursor Auto' },
-    { id: 'cursor-grok-4.6-high', display_name: 'Cursor Grok 4.6 High' },
-    { id: 'cursor-grok-4.6-high-fast', display_name: 'Cursor Grok 4.6 High Fast' },
-    { id: 'cursor-grok-4.6-low', display_name: 'Cursor Grok 4.6 Low' },
-    { id: 'cursor-grok-4.6-low-fast', display_name: 'Cursor Grok 4.6 Low Fast' },
+    { id: 'cursor-grok-4.6-high', display_name: 'Grok 4.6 High' },
+    { id: 'cursor-grok-4.6-high-fast', display_name: 'Grok 4.6 High Fast' },
+    { id: 'cursor-grok-4.6-low', display_name: 'Grok 4.6 Low' },
+    { id: 'cursor-grok-4.6-low-fast', display_name: 'Grok 4.6 Low Fast' },
     { id: 'glm-5.2', display_name: 'GLM-5.2' },
-    { id: 'cursor-fable-5-high', display_name: 'Cursor Fable 5 High (Non-ZDR)' },
+    { id: 'cursor-fable-5-high', display_name: 'Fable 5 High (Non-ZDR)' },
   ]
 
   it('触发器显示家族名而不是 High Fast 组合名', () => {
@@ -161,7 +161,8 @@ describe('ModelSelector Cursor 家族 + 思考档 + Fast', () => {
       />,
     )
     const trigger = screen.getByRole('button', { name: '选择对话模型' })
-    expect(trigger.textContent).toContain('Cursor Grok 4.6')
+    expect(trigger.textContent).toContain('Grok 4.6')
+    expect(trigger.textContent).not.toContain('Cursor Grok')
     expect(trigger.textContent).not.toContain('High Fast')
   })
 
@@ -177,8 +178,8 @@ describe('ModelSelector Cursor 家族 + 思考档 + Fast', () => {
     openMenu(screen.getByRole('button', { name: '选择对话模型' }))
     await screen.findAllByRole('menuitem')
     expect(document.querySelector('[data-cursor-family="grok-4.6"]')).toBeTruthy()
-    expect(screen.getAllByText('Cursor Grok 4.6').length).toBeGreaterThan(0)
-    expect(screen.queryByText('Cursor Grok 4.6 High Fast')).toBeNull()
+    expect(screen.getAllByText('Grok 4.6').length).toBeGreaterThan(0)
+    expect(screen.queryByText('Grok 4.6 High Fast')).toBeNull()
 
     const standard = document.querySelector('[data-fast="false"]')
     expect(standard).toBeTruthy()
@@ -201,6 +202,112 @@ describe('ModelSelector Cursor 家族 + 思考档 + Fast', () => {
     openMenu(screen.getByRole('button', { name: '选择对话模型' }))
     await screen.findAllByRole('menuitem')
     expect(document.querySelector('[data-fast="true"]')).toBeNull()
+  })
+})
+
+describe('ModelSelector locked rows + promo badge', () => {
+  const MODELS: PublicModel[] = [
+    { id: 'glm-5.2', display_name: 'GLM-5.2', promo_label: '限时半价' },
+    { id: 'cursor-grok-4.6-high', display_name: 'Grok 4.6 High' },
+    { id: 'glm-5.3', display_name: 'GLM-5.3', degraded: true },
+  ]
+  const LOCKED: LockedPublicModel[] = [
+    {
+      id: 'cursor-opus-5-high',
+      display_name: 'Opus 5 High',
+      min_plan_code: 'lite',
+      min_plan_name: 'Lite',
+      promo_label: '限时半价',
+      cost_x: 6.5,
+    },
+    {
+      id: 'cursor-opus-5-high-fast',
+      display_name: 'Opus 5 High Fast',
+      min_plan_code: 'lite',
+      min_plan_name: 'Lite',
+    },
+  ]
+
+  it('usable row with promo_label shows the badge in the menu and trigger', async () => {
+    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger.textContent).toContain('限时半价')
+    openMenu(trigger)
+    const items = await screen.findAllByRole('menuitem')
+    const glm = items.find((i) => i.getAttribute('data-model-id') === 'glm-5.2')
+    expect(glm?.textContent).toContain('限时半价')
+  })
+
+  it('locked family renders with data-locked + lock icon after usable and before degraded', async () => {
+    render(
+      <ModelSelector
+        models={MODELS}
+        lockedModels={LOCKED}
+        selectedId="glm-5.2"
+        onSelect={() => {}}
+      />,
+    )
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const items = await screen.findAllByRole('menuitem')
+    const ids = items.map(
+      (i) => i.getAttribute('data-cursor-family') || i.getAttribute('data-model-id'),
+    )
+    expect(ids).toEqual(['glm-5.2', 'grok-4.6', 'opus-5', 'glm-5.3'])
+    const locked = document.querySelector('[data-locked="true"][data-cursor-family="opus-5"]')
+    expect(locked).toBeTruthy()
+    expect(locked?.textContent).toContain('Opus 5')
+    expect(locked?.textContent).toContain('限时半价')
+    expect(locked?.querySelector('svg')).toBeTruthy()
+    expect(locked?.getAttribute('aria-disabled')).not.toBe('true')
+  })
+
+  it('clicking a locked row calls onLockedSelect and not onSelect', async () => {
+    const onSelect = vi.fn()
+    const onLockedSelect = vi.fn()
+    render(
+      <ModelSelector
+        models={MODELS}
+        lockedModels={LOCKED}
+        selectedId="glm-5.2"
+        onSelect={onSelect}
+        onLockedSelect={onLockedSelect}
+      />,
+    )
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    const locked = document.querySelector('[data-locked="true"][data-cursor-family="opus-5"]')
+    expect(locked).toBeTruthy()
+    if (locked) fireEvent.click(locked)
+    expect(onSelect).not.toHaveBeenCalled()
+    expect(onLockedSelect).toHaveBeenCalledWith({
+      label: 'Opus 5',
+      minPlanCode: 'lite',
+      minPlanName: 'Lite',
+      modelId: 'cursor-opus-5-high',
+    })
+  })
+
+  it('models empty + one locked cursor family: trigger enabled, click locked calls onLockedSelect only', async () => {
+    const onSelect = vi.fn()
+    const onLockedSelect = vi.fn()
+    render(
+      <ModelSelector
+        models={[]}
+        lockedModels={LOCKED}
+        onSelect={onSelect}
+        onLockedSelect={onLockedSelect}
+      />,
+    )
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).toBeEnabled()
+    expect(trigger.textContent).toContain('暂无可用模型')
+    openMenu(trigger)
+    await screen.findAllByRole('menuitem')
+    const locked = document.querySelector('[data-locked="true"][data-cursor-family="opus-5"]')
+    expect(locked).toBeTruthy()
+    if (locked) fireEvent.click(locked)
+    expect(onLockedSelect).toHaveBeenCalledTimes(1)
+    expect(onSelect).not.toHaveBeenCalled()
   })
 })
 

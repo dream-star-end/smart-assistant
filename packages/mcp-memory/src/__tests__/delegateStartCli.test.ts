@@ -55,6 +55,22 @@ describe('delegateStartCli', () => {
     assert.equal(body.allowSelf, true)
   })
 
+  it('resume start body carries an opaque per-request idempotencyKey, not a content hash', () => {
+    const args = {
+      agentId: 'auditor',
+      goal: '复审',
+      resumeSessionKey: 'agent:auditor:delegate:main:1:abcd',
+    }
+    const a = buildDelegateStartBody(args)
+    const b = buildDelegateStartBody(args)
+    assert.equal(a.resumeSessionKey, args.resumeSessionKey)
+    assert.equal(typeof a.idempotencyKey, 'string')
+    assert.match(String(a.idempotencyKey), /^resume:agent:auditor:delegate:main:1:abcd:[0-9a-f]{16}$/)
+    assert.notEqual(a.idempotencyKey, b.idempotencyKey)
+    const pinned = buildDelegateStartBody({ ...args, idempotencyKey: 'resume:agent:auditor:delegate:main:1:abcd:fixedkey01' })
+    assert.equal(pinned.idempotencyKey, 'resume:agent:auditor:delegate:main:1:abcd:fixedkey01')
+  })
+
   it('start+wait: one start then wait loop until done', async () => {
     let starts = 0
     const r = await runDelegateStartAndWait({
@@ -85,6 +101,58 @@ describe('delegateStartCli', () => {
     assert.equal(starts, 1)
     assert.equal(r.exitCode, 0)
     assert.match(r.stdout, /审查 PASS/)
+  })
+
+  it('start 429 with a live jobId continues into wait instead of exiting 1', async () => {
+    const r = await runDelegateStartAndWait({
+      args: { agentId: 'auditor', goal: '审' },
+      contextToken: 'tok',
+      pollWaitMs: 20,
+      start: async () => ({
+        statusCode: 429,
+        body: JSON.stringify({
+          error: 'too many concurrent delegations (max 4 non-review; in-use 4/4)',
+          status: 'running',
+          jobId: 'dlgjob-split',
+        }),
+      }),
+      waitOnce: async () => ({
+        statusCode: 200,
+        body: JSON.stringify({
+          status: 'done',
+          jobId: 'dlgjob-split',
+          httpStatus: 200,
+          ok: true,
+          output: '实际在跑并完成了',
+        }),
+      }),
+    })
+    assert.equal(r.exitCode, 0, r.stderr)
+    assert.match(r.stdout, /实际在跑并完成了/)
+  })
+
+  it('true start reject without a jobId still exits non-zero with no wait', async () => {
+    let waits = 0
+    const r = await runDelegateStartAndWait({
+      args: { agentId: 'auditor', goal: '审' },
+      contextToken: 'tok',
+      pollWaitMs: 20,
+      start: async () => ({
+        statusCode: 429,
+        body: JSON.stringify({
+          error: 'too many concurrent delegations (max 4 non-review; in-use 4/4); 排队等待者已满(8 个)',
+          failure_class: 'capacity_queue_full',
+        }),
+      }),
+      waitOnce: async () => {
+        waits++
+        return { statusCode: 500, body: '{}' }
+      },
+    })
+    assert.equal(r.exitCode, 1)
+    assert.equal(waits, 0)
+    assert.match(r.stderr, /委派失败/)
+    assert.match(r.stderr, /max 4 non-review/)
   })
 
   it('request-review wraps hidden-reviewer and keeps the draft in context', () => {

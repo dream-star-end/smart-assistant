@@ -10,6 +10,7 @@ import {
   buildCreateTicketBody,
   currentAgentRef,
   currentSessionKey,
+  handleTaskApprove,
   handleTaskComment,
   handleTaskCreate,
   handleTaskGet,
@@ -173,6 +174,28 @@ describe('每个 task_* 工具正常路径', () => {
     assert.match(calls[0]!.url, /status=ready/)
   })
 
+  it('task_approve 成功 POST /approve 并带 owner', async () => {
+    const { fetchImpl, calls } = jsonFetch(() => ({
+      status: 200,
+      body: {
+        ok: true,
+        ticket: { ...SAMPLE_TICKET, status: 'ready', version: 4, approvedBy: 'agent:main' },
+      },
+    }))
+    const result = await handleTaskApprove(
+      { id: 'OCV5-42', expectedVersion: 3 },
+      MCP_ENV,
+      fetchImpl,
+    )
+    assert.equal(result.isError, undefined)
+    assert.match(result.content[0]!.text, /已批准/)
+    assert.match(result.content[0]!.text, /OCV5-42/)
+    assert.equal(calls[0]!.method, 'POST')
+    assert.match(calls[0]!.url, /\/tickets\/OCV5-42\/approve$/)
+    assert.equal(calls[0]!.body?.expectedVersion, 3)
+    assert.equal(calls[0]!.body?.owner, 'agent:main')
+  })
+
   it('task_get 成功拼 ticket + comments', async () => {
     const { fetchImpl } = jsonFetch((req) => {
       if (req.url.includes('/comments')) {
@@ -322,17 +345,17 @@ describe('toolNames.ts ↔ toolDefs.ts 的 task_* 锁步', () => {
     }
   })
 
-  it('task_* 工具集不含 done/claim/ready/cancel/advance 等状态机动作', () => {
+  it('task_* 工具集含 approve,不含 done/claim/ready/cancel/advance', () => {
     const names = TOOLS.map((t) => t.name).filter((n) => n.startsWith('task_'))
-    assert.deepEqual(names, ['task_create', 'task_update', 'task_comment', 'task_list', 'task_get'])
-    for (const banned of [
-      'task_done',
-      'task_claim',
-      'task_ready',
-      'task_cancel',
-      'task_advance',
+    assert.deepEqual(names, [
+      'task_create',
+      'task_update',
+      'task_comment',
+      'task_list',
+      'task_get',
       'task_approve',
-    ]) {
+    ])
+    for (const banned of ['task_done', 'task_claim', 'task_ready', 'task_cancel', 'task_advance']) {
       assert.equal(names.includes(banned), false, banned)
     }
   })

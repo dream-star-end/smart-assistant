@@ -214,6 +214,12 @@
       "expiresAt": "2026-09-28"
     },
     {
+      "commit": "3db9f1d99",
+      "reason": "OCV5-22 EngineNotifier R0/R1 review-blocker closeout on unreleased feat/delegation-unify-notifier-20260830. Triple flag default off; never deployed; not a live user-visible incident.",
+      "approvedBy": "boss 2026-08-30 OCV5-22 审查 blocker 修复任务（未发布、不 deploy）",
+      "expiresAt": "2026-09-30"
+    },
+    {
       "commit": "11340da6d",
       "reason": "selfhost-proven port of cron heartbeat skip-webchat + HEARTBEAT_OK last-line silent. OCV5-11 boss-approved semantics; no commercial production incident id. Do not deploy.",
       "approvedBy": "dx 2026-08-28 OCV5-11: selfhost f5947b198+17103fc0c 正向搬运到商业 canonical（只合代码不发布）",
@@ -224,6 +230,24 @@
       "reason": "selfhost-proven port follow-up: HEARTBEAT_OK relaxed last-line/suffix match is heartbeat-only; non-heartbeat keeps exact trimmed match. OCV5-11 boss-approved. Do not deploy.",
       "approvedBy": "dx 2026-08-28 OCV5-11: selfhost f5947b198+17103fc0c 正向搬运到商业 canonical（只合代码不发布）",
       "expiresAt": "2026-09-28"
+    },
+    {
+      "commit": "927d2e35d30a46b71af6b003fdc157c34a7f6a66",
+      "reason": "Restores the cron fail-closed contract that selfhost 8b55338d6 had loosened to retryable SUBMIT_START_FAILED. Caught by the commercial gateway gate on PR #521 before merge; never deployed to claudeai.chat; no observed production incident. selfhost reflow pending.",
+      "approvedBy": "boss 2026-09-02 指示「反合和正向都要全量搞，拉齐两边代码，然后把商业版和个人版都发布」；2026-09-03 选项 1「补真证据再同步」(PR #521)",
+      "expiresAt": "2026-10-03"
+    },
+    {
+      "commit": "0a6e5ddc49d8c66d2d25ff3f6ff4a59ae4871938",
+      "reason": "Restores billing for interrupted codex turns that selfhost 3b2aab714 dropped by nulling _activeTurn in interrupt(). Caught by the commercial gateway gate on PR #521 before merge; never deployed to claudeai.chat; no observed production incident. selfhost reflow pending.",
+      "approvedBy": "boss 2026-09-02 指示「反合和正向都要全量搞，拉齐两边代码，然后把商业版和个人版都发布」；2026-09-03 选项 1「补真证据再同步」(PR #521)",
+      "expiresAt": "2026-10-03"
+    },
+    {
+      "commit": "67eb18619c8a2c95631a8a55c805e6b3e4ab31a5",
+      "reason": "Registers the two delegate cutover internal routes (selfhost e65da2a10) in the protocol INTERNAL_ROUTES registry; registry completeness fix caught by internalRouteRegistry.test on PR #521, no runtime behaviour change, never deployed to claudeai.chat.",
+      "approvedBy": "boss 2026-09-02 指示「反合和正向都要全量搞，拉齐两边代码，然后把商业版和个人版都发布」；2026-09-03 选项 1「补真证据再同步」(PR #521)",
+      "expiresAt": "2026-10-03"
     }
   ]
 }

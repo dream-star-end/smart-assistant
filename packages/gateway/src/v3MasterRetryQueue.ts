@@ -403,6 +403,23 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
           await ackDurable(name)
           continue
         }
+        if (
+          err instanceof V3SinkError &&
+          err.errorClass === 'fatal' &&
+          err.httpStatus === 409
+        ) {
+          // 不可变冲突(同 tapeId 内容相异裁定):重试恒失败。字节保留在
+          // *.quarantine-immutable_conflict-* 供人工核对,不再占用重试循环。
+          stats.fatalDropped++
+          log.warn('v3MasterRetryQueue: immutable conflict, quarantining', {
+            name,
+            sessionId: entry.payload.sessionId,
+            turnIndex: entry.payload.turnIndex,
+          })
+          await quarantine(filepath, 'immutable_conflict')
+          await fsyncDir()
+          continue
+        }
         const errMsg = err instanceof Error ? err.message : String(err)
         const billingOrWaiverPending = BILLING_OR_WAIVER_PENDING_RE.test(errMsg)
         // Cap non-financial retries only after settlement jobs were handed off.

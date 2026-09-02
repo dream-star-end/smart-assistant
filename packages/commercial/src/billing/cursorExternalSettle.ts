@@ -29,11 +29,18 @@ export function mapCursorReportedUsage(usage: unknown): TokenUsage {
   };
 }
 
+/** Stable snapshot marker for historical pending audits settled by the
+ * durable reconciler after the fact: record usage/credits for the ledger and
+ * UI but never debit (operator decision 2026-09-02). */
+export const CURSOR_HISTORICAL_BACKFILL_WAIVER = "historical_backfill_no_charge" as const;
+
 export function planCursorExternalSettle(args: {
   engineStatus: CursorEngineStatus;
   usage: TokenUsage;
   pricing: ModelPricing;
   terminalCode?: string | null;
+  /** Record the would-have-charged amount but settle at 0 credits. */
+  zeroCharge?: boolean;
 }): {
   settleStatus: "success" | "error";
   costCredits: bigint;
@@ -43,7 +50,9 @@ export function planCursorExternalSettle(args: {
   const engineOk = args.engineStatus === "success";
   const waivedNoOutput =
     engineOk && BigInt(args.usage.output_tokens ?? 0) === 0n && cost_credits > 0n;
-  const costCredits = engineOk && !waivedNoOutput ? cost_credits : 0n;
+  const wouldCharge = engineOk && !waivedNoOutput ? cost_credits : 0n;
+  const zeroCharged = args.zeroCharge === true && wouldCharge > 0n;
+  const costCredits = zeroCharged ? 0n : wouldCharge;
   const settleStatus: "success" | "error" = engineOk ? "success" : "error";
   const snapshotJson = JSON.stringify({
     ...snapshot,
@@ -54,6 +63,9 @@ export function planCursorExternalSettle(args: {
       : {}),
     ...(!engineOk && cost_credits > 0n
       ? { waived: "cursor_engine_not_success", wouldHaveCharged: cost_credits.toString() }
+      : {}),
+    ...(zeroCharged
+      ? { waived: CURSOR_HISTORICAL_BACKFILL_WAIVER, wouldHaveCharged: wouldCharge.toString() }
       : {}),
   });
   return { settleStatus, costCredits, snapshotJson };
@@ -95,6 +107,17 @@ export async function settleCursorExternalUsage(args: {
   usage: unknown;
   /** Eligible cursor pool row actually used this turn; null if unknown. */
   accountId?: bigint | null;
+  /** Exact logical-turn locators (durable tape path). When present the cost
+   * is staged into the pending usage patch table inside the same transaction so the
+   * tape finalize / appendCostCredits fold it into turn_tape_cost_components. */
+  turnKey?: string | null;
+  parentTurnKey?: string | null;
+  parentSessionId?: string | null;
+  delegateAgentId?: string | null;
+  dispatchId?: string | null;
+  attemptNo?: number | null;
+  /** Historical backfill: usage row + 0-credit ledger truth, no debit. */
+  zeroCharge?: boolean;
 }): Promise<SettleResult | null> {
   const pricing = args.pricing.get(args.modelId);
   if (pricing === null) return null;
@@ -104,6 +127,7 @@ export async function settleCursorExternalUsage(args: {
     usage,
     pricing,
     terminalCode: args.terminalCode ?? null,
+    zeroCharge: args.zeroCharge === true,
   });
   const accountId = args.accountId ?? null;
   const settled = await settleUsageAndLedger(args.pool, {
@@ -116,6 +140,13 @@ export async function settleCursorExternalUsage(args: {
     costCredits: plan.costCredits,
     status: plan.settleStatus,
     sessionId: args.sessionId,
+    mode: args.parentTurnKey || args.parentSessionId || args.delegateAgentId ? "delegate" : "chat",
+    parentSessionId: args.parentSessionId ?? null,
+    delegateAgentId: args.delegateAgentId ?? null,
+    turnKey: args.turnKey ?? null,
+    parentTurnKey: args.parentTurnKey ?? null,
+    dispatchId: args.dispatchId ?? null,
+    attemptNo: args.attemptNo ?? null,
   });
   if (accountId !== null) {
     try {

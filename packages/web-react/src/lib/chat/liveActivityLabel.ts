@@ -43,6 +43,7 @@ const TOOL_ACTIVITY_LABEL: Record<string, LiveActivityLabel> = {
   task_create: "更新任务",
   task_list: "更新任务",
   task_get: "更新任务",
+  task_approve: "更新任务",
   enterplanmode: "更新任务",
   enter_plan_mode: "更新任务",
   exitplanmode: "更新任务",
@@ -181,13 +182,15 @@ export function formatLiveActivityAction(hint: string | undefined | null): strin
   if (mapped === SUBTASK_LABEL) return formatSubtaskAction(parts.slice(1).join(" "));
   if (mapped) return mapped;
 
-  // Cursor CallMcpTool / similar wrappers: try the next token as the real op.
+  // Cursor CallMcpTool / CCB ExecuteExtraTool / similar wrappers: try the next token as the real op.
   const wrapper = normalizeToolToken(first);
   if (
     (wrapper === "callmcptool" ||
       wrapper === "call_mcp_tool" ||
       wrapper === "getmcptools" ||
-      wrapper === "use_tool") &&
+      wrapper === "use_tool" ||
+      wrapper === "executeextratool" ||
+      wrapper === "execute_extra_tool") &&
     parts.length > 1
   ) {
     const inner = labelForToken(parts[1] ?? "");

@@ -58,6 +58,7 @@ interface Capture {
   inbox: { title: string; bodyMd: string; deliveryKey: string }[]
   alerts: InboxCreateArgs[]
   wechatResult: WechatDeliveryResult
+  inboxOk: boolean
 }
 
 function capture(over: Partial<Capture> = {}): Capture & { transport: NotifyTransport } {
@@ -66,6 +67,7 @@ function capture(over: Partial<Capture> = {}): Capture & { transport: NotifyTran
     inbox: [],
     alerts: [],
     wechatResult: over.wechatResult ?? { kind: 'fallback', marked: false },
+    inboxOk: over.inboxOk ?? true,
   }
   const transport: NotifyTransport = {
     sendWechat: async (args) => {
@@ -74,12 +76,14 @@ function capture(over: Partial<Capture> = {}): Capture & { transport: NotifyTran
     },
     postInbox: async (args) => {
       c.inbox.push(args)
+      return c.inboxOk
     },
     createInboxMessage: async (args) => {
       c.alerts.push(args)
+      return c.inboxOk
     },
   }
-  return { ...c, transport }
+  return Object.assign(c, { transport })
 }
 
 function seedAwaitReady(db: TaskboardDb): {
@@ -414,6 +418,115 @@ describe('每日简报', () => {
       settings: updateSettings(db, { quietHoursStart: 23, quietHoursEnd: 8 }),
     })
     assert.equal(cap.inbox.length, 1, '同一天简报幂等')
+    db.close()
+  })
+
+  it('微信永久失败且 inbox ACK 后才标终态,不再打微信', async () => {
+    const db = freshDb()
+    const project = createProject(db, { key: 'DL', name: '死信' })
+    const ticket = createTicket(db, {
+      projectId: project.id,
+      type: 'chore',
+      title: '已完成',
+      reporter: 'user:default',
+      status: 'done',
+    })
+    updateTicket(db, ticket.id, ticket.version, { closedAt: ticket.createdAt })
+    const day = zonedYmd(new Date(ticket.createdAt))
+    const [y, m, d] = day.split('-').map(Number)
+    const digestAt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0))
+    const cap = capture({
+      wechatResult: { kind: 'failure', retryable: false, code: 'WECHAT_MASTER_REJECTED' },
+    })
+    const n = new TaskboardNotifier({
+      getDb: () => db,
+      transport: cap.transport,
+      now: () => digestAt.getTime(),
+    })
+    const settings = updateSettings(db, { quietHoursStart: 23, quietHoursEnd: 8 })
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.wechat.length, 1)
+    assert.equal(cap.inbox.length, 1)
+    assert.equal(cap.inbox[0].deliveryKey, digestOutboundId(day))
+    assert.equal(n.hasSent(digestOutboundId(day)), true)
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.wechat.length, 1, '永久失败不再重试微信')
+    assert.equal(cap.inbox.length, 1)
+    db.close()
+  })
+
+  it('inbox 未 ACK 时不标 sent,下次只重试 inbox 不打微信', async () => {
+    const db = freshDb()
+    const project = createProject(db, { key: 'NA', name: '未确认' })
+    const ticket = createTicket(db, {
+      projectId: project.id,
+      type: 'chore',
+      title: '已完成',
+      reporter: 'user:default',
+      status: 'done',
+    })
+    updateTicket(db, ticket.id, ticket.version, { closedAt: ticket.createdAt })
+    const day = zonedYmd(new Date(ticket.createdAt))
+    const [y, m, d] = day.split('-').map(Number)
+    const digestAt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0))
+    const cap = capture({
+      wechatResult: { kind: 'failure', retryable: false, code: 'WECHAT_MASTER_REJECTED' },
+      inboxOk: false,
+    })
+    const n = new TaskboardNotifier({
+      getDb: () => db,
+      transport: cap.transport,
+      now: () => digestAt.getTime(),
+    })
+    const settings = updateSettings(db, { quietHoursStart: 23, quietHoursEnd: 8 })
+    const id = digestOutboundId(day)
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.wechat.length, 1)
+    assert.equal(cap.inbox.length, 1)
+    assert.equal(n.hasSent(id), false)
+    assert.equal(n.hasWechatDead(id), true)
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.wechat.length, 1, '微信永久失败后不再打微信')
+    assert.equal(cap.inbox.length, 2, 'inbox 未 ACK 继续重试')
+    cap.inboxOk = true
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.inbox.length, 3)
+    assert.equal(n.hasSent(id), true)
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.wechat.length, 1)
+    assert.equal(cap.inbox.length, 3)
+    db.close()
+  })
+
+  it('微信可重试失败不标记终态,下次 tick 再试', async () => {
+    const db = freshDb()
+    const project = createProject(db, { key: 'RT', name: '重试' })
+    const ticket = createTicket(db, {
+      projectId: project.id,
+      type: 'chore',
+      title: '已完成',
+      reporter: 'user:default',
+      status: 'done',
+    })
+    updateTicket(db, ticket.id, ticket.version, { closedAt: ticket.createdAt })
+    const day = zonedYmd(new Date(ticket.createdAt))
+    const [y, m, d] = day.split('-').map(Number)
+    const digestAt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0))
+    const cap = capture({
+      wechatResult: { kind: 'failure', retryable: true, code: 'WECHAT_MASTER_UNAVAILABLE' },
+    })
+    const n = new TaskboardNotifier({
+      getDb: () => db,
+      transport: cap.transport,
+      now: () => digestAt.getTime(),
+    })
+    const settings = updateSettings(db, { quietHoursStart: 23, quietHoursEnd: 8 })
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.wechat.length, 1)
+    assert.equal(cap.inbox.length, 0)
+    assert.equal(n.hasSent(digestOutboundId(day)), false)
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.wechat.length, 2)
     db.close()
   })
 })
