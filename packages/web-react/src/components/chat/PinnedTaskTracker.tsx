@@ -4,7 +4,8 @@
  * 取代 inline 的 TodoWrite 工具卡(后者会随消息流滚走):把当前任务列表钉在 composer 上方,
  * 始终可见。交互按 boss 要求:任务集首次出现/变化时**展开全部**,随后 ~3s **自动折叠**成
  * 只显示「正在执行的一条」;用户点击可手动展开/折叠(手动后不再自动折叠)。无未完成任务
- * (全部完成或无任务)→ 直接不渲染:不留"完成"残条,打开旧会话也不会闪一下。
+ * (全部完成或无任务)→ 直接不渲染:不留"完成"残条。当前轮仍有未完成任务时刷新后也钉住;
+ * 上一轮已收口则提取为空,打开旧会话不闪。
  *
  * 数据来自上层从 wsMessages 提取的最新顶层 TodoWrite todos 或 Codex structured plan steps
  * (replace 语义,最后一次=权威)。
@@ -144,10 +145,9 @@ export function PinnedTaskTracker({
     return () => clearTimeout(id);
   }, [active, expanded, userTouched, sig]);
 
-  // 只在当前 turn 仍在执行时显示。停止/收尾/打开旧会话后,历史 plan/TodoWrite
-  // 可能仍保留 pending/in_progress 状态用于 transcript,但不能继续钉在输入框上方误导用户。
-  if (!active) return null;
-  // 只在有未完成任务时显示:全部完成(或无任务)即隐藏,不留"完成"残条、不在打开旧会话时闪。
+  // 刷新后 wsSending=false,但当前轮若仍有未完成任务,HUD 必须钉住(打开已收口旧会话
+  // 时 extractLatestTodos 拿不到未完成项,hasIncomplete=false,不会误闪)。
+  // `active` 只驱动自动折叠计时,不再一刀切隐藏。
   if (!hasIncomplete) return null;
 
   const toggle = () => {
