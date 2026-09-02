@@ -65,6 +65,10 @@ export function laneForCallback(
 ): NotifyLane {
   if (callback === 'none') return 'skipped_silent'
   if (callback === 'stdout-wait') return 'stdout-wait'
+  // Cron origin-session inject targets the webchat tape, not the parent
+  // engine stdin. A CCB/Codex cron child and the origin session are
+  // different process lifetimes — InlinePush would write the dead child.
+  if (callback === 'cron-origin-inject') return 'resume-inject'
   if (!engine) return 'resume-inject'
   return classifyNotifyLane(engine)
 }

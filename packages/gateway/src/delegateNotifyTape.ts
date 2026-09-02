@@ -6,6 +6,8 @@
  * proof that the parent model consumed `notifyId` is a tape row whose id or
  * body carries that id (or the paired ResumeInject `dlgcb.*` clientMessageId).
  */
+import { parseOriginWebchatSessionKey } from './cronOriginSession.js'
+
 export type ParentTapeMessage = {
   id?: unknown
   text?: unknown
@@ -15,8 +17,45 @@ export type ParentTapeMessage = {
 /**
  * Tape ingest oracle result. Dual-send is judged by model-visible consumption
  * (design v3 §10-9). A thrown / incomplete read is `unknown`, never absence.
+ * A complete read that finds no session (missing or deleted) is `not_ingested`.
  */
 export type ParentTapeIngestState = 'ingested' | 'not_ingested' | 'unknown'
+
+export type ParentTapeSession = {
+  messages?: ReadonlyArray<ParentTapeMessage> | null
+}
+
+/**
+ * Authoritative parent-tape lookup. Missing identity / parse failure /
+ * thrown IO stay `unknown` (probe failed ≠ absence). A successful load
+ * that returns no row is `not_ingested`.
+ */
+export async function resolveParentTapeIngestState(args: {
+  notifyId: string
+  parentSessionKey: string | undefined
+  clientMessageId?: string
+  callbackOriginUserId?: string | null
+  liveSessionUserId?: string | null
+  envUserId?: string | null
+  loadSession: (peerId: string, userId: string) => Promise<ParentTapeSession | null | undefined>
+}): Promise<ParentTapeIngestState> {
+  const origin = parseOriginWebchatSessionKey(args.parentSessionKey ?? '')
+  if (!origin) return 'unknown'
+  const userId =
+    args.callbackOriginUserId?.trim() ||
+    args.liveSessionUserId?.trim() ||
+    args.envUserId?.trim()
+  if (!userId) return 'unknown'
+  try {
+    const session = await args.loadSession(origin.peerId, userId)
+    if (!session) return 'not_ingested'
+    return parentTapeHasNotifyId(session.messages, args.notifyId, args.clientMessageId)
+      ? 'ingested'
+      : 'not_ingested'
+  } catch {
+    return 'unknown'
+  }
+}
 
 export function parentTapeHasNotifyId(
   messages: ReadonlyArray<ParentTapeMessage> | undefined | null,

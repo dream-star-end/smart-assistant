@@ -20,7 +20,13 @@ import {
 import { decideSendToAgentIntentRecovery } from '../delegateCallbackOwner.js'
 import { DelegateDurableDb } from '../delegateDurable.js'
 import { cutoverFreezeHolder } from '../delegateCutover.js'
-import { DelegateJobStore, nextNotifyBackoffMs, NOTIFY_CLAIM_LEASE_MS } from '../delegateJobs.js'
+import {
+  DelegateJobStore,
+  nextNotifyBackoffMs,
+  NOTIFY_ABANDON_AFTER_TERMINAL_MS,
+  NOTIFY_ABANDON_MIN_ATTEMPTS,
+  NOTIFY_CLAIM_LEASE_MS,
+} from '../delegateJobs.js'
 import { SubprocessRunner } from '../subprocessRunner.js'
 import { CodexAppServerRunner } from '../engine/codexAppServerRunner.js'
 import {
@@ -44,6 +50,7 @@ import {
   formatJobTerminalMarkdown,
   injectPayloadFromJobTerminal,
   isJobTerminalFailure,
+  laneForCallback,
 } from '../jobTerminal.js'
 import {
   buildCronContinuationEnvelope,
@@ -68,7 +75,11 @@ import {
   isDelegateInlinePushCodexEnabled,
   isDelegateInlinePushEnabled,
 } from '../delegateSmFlag.js'
-import { parentTapeHasNotifyId, type ParentTapeIngestState } from '../delegateNotifyTape.js'
+import {
+  parentTapeHasNotifyId,
+  resolveParentTapeIngestState,
+  type ParentTapeIngestState,
+} from '../delegateNotifyTape.js'
 
 function terminalEvent(over: Partial<JobTerminal> = {}): JobTerminal {
   return {
@@ -2984,6 +2995,258 @@ describe('stage 2 review blockers: cron generation migration + continuation', ()
       assert.equal(snap.callbackState, 'delivered')
       assert.equal(snap.result?.body.output, output)
       assert.deepEqual(snap.result?.body.cronContinuation, continuation)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('OCV5 notify terminate: cron lane + tape oracle + abandon', () => {
+  it('laneForCallback sends cron-origin-inject to resume-inject even for ccb', () => {
+    assert.equal(laneForCallback('cron-origin-inject', 'ccb'), 'resume-inject')
+    assert.equal(laneForCallback('cron-origin-inject', 'codex'), 'resume-inject')
+    assert.equal(laneForCallback('origin-inject', 'ccb'), 'inline-push')
+    assert.equal(laneForCallback('origin-inject', 'cursor'), 'resume-inject')
+  })
+
+  it('cron-origin-inject + ccb never writes parent stdin', async () => {
+    let writes = 0
+    let injected = 0
+    const notifier = new DefaultEngineNotifier({
+      inlinePush: {
+        write: async () => {
+          writes += 1
+          return { ok: true, processAlive: true }
+        },
+      },
+      resumeInject: {
+        inject: async () => {
+          injected += 1
+          return { ok: true }
+        },
+      },
+    })
+    const result = await notifier.notify(
+      terminalEvent({ callback: 'cron-origin-inject', parentEngine: 'ccb' }),
+    )
+    assert.equal(result.ok, true)
+    if (result.ok) assert.equal(result.lane, 'resume-inject')
+    assert.deepEqual({ writes, injected }, { writes: 0, injected: 1 })
+  })
+
+  it('oracle missing session is not_ingested: dead A degrades to B delivered', async () => {
+    const missing = await resolveParentTapeIngestState({
+      notifyId: 'dlgnfy.dlgjob-n1.1',
+      parentSessionKey: 'agent:main:webchat:dm:p1',
+      clientMessageId: delegateCallbackMessageId('dlgjob-n1', 1),
+      callbackOriginUserId: 'default',
+      loadSession: async () => null,
+    })
+    assert.equal(missing, 'not_ingested')
+    const thrown = await resolveParentTapeIngestState({
+      notifyId: 'dlgnfy.dlgjob-n1.1',
+      parentSessionKey: 'agent:main:webchat:dm:p1',
+      callbackOriginUserId: 'default',
+      loadSession: async () => {
+        throw new Error('tape backend unavailable')
+      },
+    })
+    assert.equal(thrown, 'unknown')
+
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-oracle-gone-'))
+    try {
+      const store = openStore(dir)
+      const { snap } = await seededTerminal(store, { parentEngine: 'ccb' })
+      let writes = 0
+      let injected = 0
+      const result = await dispatchJobTerminalNotify(
+        store,
+        snap,
+        new DefaultEngineNotifier({
+          inlinePush: {
+            write: async () => {
+              writes += 1
+              return { ok: false, processAlive: false }
+            },
+          },
+          resumeInject: {
+            inject: async () => {
+              injected += 1
+              return { ok: true }
+            },
+          },
+          parentTapeIngestState: (notifyId, event) =>
+            resolveParentTapeIngestState({
+              notifyId,
+              parentSessionKey: event.parentSessionKey,
+              clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
+              callbackOriginUserId: event.callbackOriginUserId ?? 'default',
+              loadSession: async () => null,
+            }),
+        }),
+      )
+      assert.equal('ok' in result && result.ok, true)
+      if (!('skipped' in result) && result.ok) assert.equal(result.lane, 'resume-inject')
+      assert.deepEqual({ writes, injected }, { writes: 1, injected: 1 })
+      assert.equal(store.snapshotOf(snap.id)?.callbackState, 'delivered')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('a_attempted past unknown window degrades even after notifier restart', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-unknown-window-'))
+    let now = 5_000
+    const clock = () => now
+    let writes = 0
+    let injected = 0
+    try {
+      const s1 = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable: new DelegateDurableDb(join(dir, 'delegate-jobs.db')),
+        bootId: 'gw:a',
+        now: clock,
+      })
+      const seeded = await seededTerminal(s1, { parentEngine: 'ccb' })
+      const first = await dispatchJobTerminalNotify(
+        s1,
+        seeded.snap,
+        new DefaultEngineNotifier({
+          now: clock,
+          inlinePush: {
+            write: async () => {
+              writes += 1
+              return { ok: false, processAlive: true, unknown: true }
+            },
+          },
+          resumeInject: {
+            inject: async () => {
+              injected += 1
+              return { ok: true }
+            },
+          },
+          parentTapeIngestState: async () => 'unknown',
+        }),
+      )
+      assert.ok(!('skipped' in first) && !first.ok)
+      if (!('skipped' in first)) assert.equal(first.hold, true)
+      assert.equal(s1.snapshotOf(seeded.jobId)?.callbackState, 'injecting')
+      assert.equal(injected, 0)
+      const stamped = s1.snapshotOf(seeded.jobId)?.notifyAAttemptedAt
+      assert.ok(typeof stamped === 'number' && stamped > 0)
+      s1.close()
+
+      now = stamped! + TAPE_ORACLE_UNKNOWN_HOLD_MS + 1
+      const s2 = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable: new DelegateDurableDb(join(dir, 'delegate-jobs.db')),
+        bootId: 'gw:b',
+        now: clock,
+      })
+      s2.hydrateFromDurable()
+      const live = s2.snapshotOf(seeded.jobId)
+      assert.ok(live)
+      const result = await dispatchJobTerminalNotify(
+        s2,
+        live,
+        new DefaultEngineNotifier({
+          now: clock,
+          inlinePush: {
+            write: async () => {
+              writes += 1
+              return { ok: true, processAlive: true }
+            },
+          },
+          resumeInject: {
+            inject: async () => {
+              injected += 1
+              return { ok: true }
+            },
+          },
+          parentTapeIngestState: async () => 'unknown',
+        }),
+      )
+      assert.ok(!('skipped' in result) && result.ok)
+      if (!('skipped' in result) && result.ok) assert.equal(result.lane, 'resume-inject')
+      assert.equal(writes, 1)
+      assert.equal(injected, 1)
+      assert.equal(s2.snapshotOf(seeded.jobId)?.callbackState, 'delivered')
+      s2.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('resume-inject failures past attempt+24h abandon and leave listDueNotify', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-abandon-'))
+    let now = 1_000
+    try {
+      const store = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable: new DelegateDurableDb(join(dir, 'delegate-jobs.db')),
+        bootId: 'gw:abandon',
+        now: () => now,
+      })
+      const { snap, fence } = await seededTerminal(store, {
+        parentEngine: 'ccb',
+        callback: 'cron-origin-inject',
+      })
+      const execFence = { claimToken: fence.claimToken, fencingEpoch: fence.fencingEpoch }
+      for (let i = 0; i < NOTIFY_ABANDON_MIN_ATTEMPTS; i++) {
+        assert.equal(store.deferPendingNotify(snap.id, execFence), true)
+      }
+      const afterDefer = store.snapshotOf(snap.id)!
+      assert.equal(afterDefer.notifyAttempt, NOTIFY_ABANDON_MIN_ATTEMPTS)
+      now = (afterDefer.terminalCommittedAt ?? now) + NOTIFY_ABANDON_AFTER_TERMINAL_MS + 1
+      let injected = 0
+      const result = await dispatchJobTerminalNotify(
+        store,
+        store.snapshotOf(snap.id)!,
+        new DefaultEngineNotifier({
+          now: () => now,
+          inlinePush: {
+            write: async () => {
+              throw new Error('cron-origin-inject must not inline-push')
+            },
+          },
+          resumeInject: {
+            inject: async () => {
+              injected += 1
+              return { ok: false, failureClass: 'transport', gone: true }
+            },
+          },
+        }),
+      )
+      assert.equal('ok' in result && result.ok, true)
+      assert.equal(injected, 1)
+      const abandoned = store.snapshotOf(snap.id)!
+      assert.equal(abandoned.callbackState, 'abandoned')
+      assert.equal(abandoned.notifyRetryAt, null)
+      assert.equal(store.listPendingNotify().length, 0)
+      assert.equal(store.listDueNotify(now).length, 0)
+      const again = await dispatchJobTerminalNotify(
+        store,
+        abandoned,
+        new DefaultEngineNotifier({
+          resumeInject: {
+            inject: async () => {
+              injected += 1
+              return { ok: true }
+            },
+          },
+        }),
+      )
+      assert.equal('ok' in again && again.ok, true)
+      assert.equal(injected, 1)
+      assert.equal(store.snapshotOf(snap.id)?.callbackState, 'abandoned')
       store.close()
     } finally {
       await rm(dir, { recursive: true, force: true })

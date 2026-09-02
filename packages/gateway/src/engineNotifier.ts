@@ -4,7 +4,6 @@
  * Notifier must not mint a second message id or a parallel failure_class.
  */
 import {
-  classifyNotifyLane,
   delegateNotifyId,
   isDelegateParentEngine,
   type DelegateFailureClass,
@@ -16,7 +15,7 @@ import {
 import { ccbStdinUserContent } from './ccbNativeCompaction.js'
 import { isDelegateInlinePushEnabled } from './delegateSmFlag.js'
 import type { ParentTapeIngestState } from './delegateNotifyTape.js'
-import { isHeartbeatSilentOutput } from './jobTerminal.js'
+import { isHeartbeatSilentOutput, laneForCallback } from './jobTerminal.js'
 
 /** Prefer not-lose: after this window of only-unknown tape reads, send B once. */
 export const TAPE_ORACLE_UNKNOWN_HOLD_MS = 60_000
@@ -60,8 +59,9 @@ export type EngineNotifierOptions = {
   /** Cursor/Grok/zcode: missing nativeId is transport (no silent empty chat). */
   requireNativeId?: boolean
   /**
-   * Parent-session tape ingest oracle. `not_ingested` only after a complete
-   * authoritative read; query failures / missing identity are `unknown`.
+   * Parent-session tape ingest oracle. `not_ingested` after a complete
+   * authoritative read (including "session missing/deleted"). Query
+   * failures and missing lookup identity stay `unknown`.
    */
   parentTapeIngestState?: (
     notifyId: string,
@@ -132,7 +132,7 @@ export class DefaultEngineNotifier implements EngineNotifier {
       return finish({ ok: false, failureClass: 'internal' })
     }
 
-    const preferred = classifyNotifyLane(event.parentEngine)
+    const preferred = laneForCallback(event.callback, event.parentEngine)
     if (preferred === 'inline-push') {
       const pushed = await this.tryInlinePush(event)
       if (pushed === 'delivered') {
@@ -191,10 +191,15 @@ export class DefaultEngineNotifier implements EngineNotifier {
 
   /** First unknown always holds; later unknowns hold until a_attempted + window. */
   private unknownShouldHold(fence: NotifyClaimFence | undefined, notifyId: string): boolean {
-    const stamped = fence?.aAttemptedAt?.()
-    const origin =
-      typeof stamped === 'number' && stamped > 0 ? stamped : this.unknownSince.get(notifyId)
     const t = this.now()
+    const stamped = fence?.aAttemptedAt?.()
+    if (typeof stamped === 'number' && stamped > 0) {
+      return t - stamped < TAPE_ORACLE_UNKNOWN_HOLD_MS
+    }
+    // Durable a_attempted exists but this process cannot read the stamp
+    // (restart dropped unknownSince; snapshot miss). Prefer not-lose: B.
+    if (fence?.hasAAttempted?.()) return false
+    const origin = this.unknownSince.get(notifyId)
     if (origin == null) {
       this.unknownSince.set(notifyId, t)
       return true
@@ -293,10 +298,10 @@ export class DefaultEngineNotifier implements EngineNotifier {
 }
 
 function classifySafe(event: JobTerminal): NotifyLane {
-  if (event.callback === 'none') return 'skipped_silent'
-  if (event.callback === 'stdout-wait') return 'stdout-wait'
-  if (!isDelegateParentEngine(event.parentEngine)) return 'resume-inject'
-  return classifyNotifyLane(event.parentEngine)
+  return laneForCallback(
+    event.callback,
+    isDelegateParentEngine(event.parentEngine) ? event.parentEngine : undefined,
+  )
 }
 
 export type InlinePushSession = {

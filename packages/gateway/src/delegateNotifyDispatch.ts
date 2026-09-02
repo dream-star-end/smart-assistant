@@ -14,7 +14,12 @@ import {
   type NotifyLane,
   type NotifyResult,
 } from '@openclaude/protocol'
-import { isResumeInjectCallback, type DelegateJobSnapshot, type DelegateJobStore } from './delegateJobs.js'
+import {
+  isResumeInjectCallback,
+  type DelegateJobSnapshot,
+  type DelegateJobStore,
+} from './delegateJobs.js'
+import { createLogger } from './logger.js'
 import {
   buildJobTerminalFromSnapshot,
   isHeartbeatSilentOutput,
@@ -27,6 +32,8 @@ import {
   parseOriginWebchatSessionKey,
 } from './cronOriginSession.js'
 import { NOTIFY_CLAIM_FENCE, type NotifyClaimFence } from './engineNotifier.js'
+
+const log = createLogger({ module: 'delegateNotifyDispatch' })
 
 export type NotifyFence = { claimToken: string; fencingEpoch: number }
 
@@ -211,6 +218,18 @@ export async function dispatchJobTerminalNotify(
         store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(live))
       }
     }
+    if (owned && store.shouldAbandonNotify(job.id)) {
+      const latest = store.snapshotOf(job.id) ?? live
+      store.abandonNotify(latest.id, fenceOf(latest))
+      log.warn('delegate notify abandoned after retry budget', {
+        jobId: latest.id,
+        callback: latest.callback,
+        notifyAttempt: latest.notifyAttempt,
+        terminalCommittedAt: latest.terminalCommittedAt,
+      })
+      const lane = (latest.notifyLane as NotifyLane | undefined) ?? preferred
+      return ackDelivered(store, store.snapshotOf(job.id) ?? latest, hooks, notifyId, lane)
+    }
     throw err
   }
   if (result.ok) {
@@ -239,6 +258,19 @@ export async function dispatchJobTerminalNotify(
     }
   } else if (owned) {
     store.deferPendingNotify(job.id, fenceOf(live))
+  }
+  if (owned && !result.hold && store.shouldAbandonNotify(job.id)) {
+    const latest = store.snapshotOf(job.id) ?? live
+    store.abandonNotify(latest.id, fenceOf(latest))
+    log.warn('delegate notify abandoned after retry budget', {
+      jobId: latest.id,
+      callback: latest.callback,
+      notifyAttempt: latest.notifyAttempt,
+      terminalCommittedAt: latest.terminalCommittedAt,
+      failureClass: result.failureClass,
+    })
+    const lane = (latest.notifyLane as NotifyLane | undefined) ?? preferred
+    return ackDelivered(store, store.snapshotOf(job.id) ?? latest, hooks, notifyId, lane)
   }
   return result
 }

@@ -409,7 +409,7 @@ import {
   resolveDelegateCutoverFreezeMs,
 } from './delegateCutover.js'
 import { DefaultEngineNotifier, writeInlinePushForSession, type InlinePushSession } from './engineNotifier.js'
-import { parentTapeHasNotifyId, type ParentTapeIngestState } from './delegateNotifyTape.js'
+import { resolveParentTapeIngestState, type ParentTapeIngestState } from './delegateNotifyTape.js'
 import {
   delayUntilNextNotifyRetry,
   dispatchJobTerminalNotify,
@@ -10914,28 +10914,16 @@ export class Gateway {
           )
         },
       },
-      parentTapeIngestState: async (notifyId, event): Promise<ParentTapeIngestState> => {
-        const origin = parseOriginWebchatSessionKey(event.parentSessionKey)
-        if (!origin) return 'unknown'
-        const userId =
-          event.callbackOriginUserId?.trim() ||
-          this.sessions?.getByKey?.(event.parentSessionKey)?.userId ||
-          process.env.OC_USER_ID?.trim()
-        if (!userId) return 'unknown'
-        try {
-          const session = await getClientSession(origin.peerId, userId)
-          if (!session) return 'unknown'
-          return parentTapeHasNotifyId(
-            session.messages as Array<{ id?: unknown; text?: unknown; content?: unknown }> | undefined,
-            notifyId,
-            delegateCallbackMessageId(event.jobId, event.callbackEpoch),
-          )
-            ? 'ingested'
-            : 'not_ingested'
-        } catch {
-          return 'unknown'
-        }
-      },
+      parentTapeIngestState: async (notifyId, event): Promise<ParentTapeIngestState> =>
+        resolveParentTapeIngestState({
+          notifyId,
+          parentSessionKey: event.parentSessionKey,
+          clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
+          callbackOriginUserId: event.callbackOriginUserId,
+          liveSessionUserId: this.sessions?.getByKey?.(event.parentSessionKey)?.userId,
+          envUserId: process.env.OC_USER_ID,
+          loadSession: (peerId, userId) => getClientSession(peerId, userId),
+        }),
       resumeInject: {
         inject: async (event) => {
           const result =

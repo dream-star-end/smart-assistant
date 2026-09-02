@@ -39,6 +39,14 @@ export const DELEGATE_LEASE_HEARTBEAT_MAX_BEATS = 480
 export const NOTIFY_CLAIM_LEASE_MS = 30_000
 export const NOTIFY_RETRY_INITIAL_MS = 1_000
 export const NOTIFY_RETRY_MAX_MS = 30_000
+/**
+ * ResumeInject retry budget. Both floors must trip: attempt count stops a
+ * fast-fail storm, and the 24h terminal age stops a still-reachable origin
+ * from being abandoned during a long BUSY window. Dispatch warns and
+ * callback_state='abandoned'; listDueNotify already excludes that state.
+ */
+export const NOTIFY_ABANDON_MIN_ATTEMPTS = 48
+export const NOTIFY_ABANDON_AFTER_TERMINAL_MS = 24 * 60 * 60_000
 
 export function nextNotifyBackoffMs(attempt: number): number {
   const exp = Math.min(16, Math.max(0, Math.floor(attempt)))
@@ -236,6 +244,17 @@ function isLegalCallbackTransition(from: DelegateCallbackState, to: DelegateCall
 /** Completer/Notifier owned ResumeInject callbacks. */
 export function isResumeInjectCallback(callback: string | undefined): boolean {
   return callback === 'origin-inject' || callback === 'cron-origin-inject'
+}
+
+export function shouldAbandonPendingNotify(
+  job: { notifyAttempt?: number | null; terminalCommittedAt?: number | null },
+  now: number,
+): boolean {
+  const attempts = job.notifyAttempt ?? 0
+  if (attempts < NOTIFY_ABANDON_MIN_ATTEMPTS) return false
+  const terminalAt = job.terminalCommittedAt
+  if (typeof terminalAt !== 'number' || terminalAt <= 0) return false
+  return now - terminalAt >= NOTIFY_ABANDON_AFTER_TERMINAL_MS
 }
 
 function initTerminalCallback(draft: {
@@ -1302,6 +1321,38 @@ export class DelegateJobStore {
     job.notifyAttempt = nextAttempt
     job.lastActivityAt = now
     return true
+  }
+
+  shouldAbandonNotify(jobId: string): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job) return false
+    return shouldAbandonPendingNotify(job, this.now())
+  }
+
+  /**
+   * Terminal notify budget exhausted. Clears the claim/retry so the
+   * scheduler never picks the row again. pending|injecting → abandoned.
+   */
+  abandonNotify(
+    jobId: string,
+    fence?: { claimToken: string; fencingEpoch: number },
+  ): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job) return false
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        return false
+      }
+    }
+    if (job.callbackState === 'abandoned') return true
+    if (!isLegalCallbackTransition(job.callbackState, 'abandoned')) return false
+    const draft = this.cloneEntry(job)
+    draft.callbackState = 'abandoned'
+    draft.notifyDeliveryToken = undefined
+    draft.notifyClaimedUntil = null
+    draft.notifyRetryAt = null
+    draft.lastActivityAt = this.now()
+    return this.commit(job, draft, false)
   }
 
   deferPendingNotify(
