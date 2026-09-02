@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "frozenAt": "2026-08-29",
-  "auroraTip": "71f404783f1a6c95bb4c24354e1b4abda49d7576",
-  "selfhostTip": "486a8681e461dcceb0cbae89c6fdad950f5ee63e",
+  "frozenAt": "2026-09-03",
+  "auroraTip": "362d5041484c818db5e02cd54ec8e338832bf6e7",
+  "selfhostTip": "e047c18020ef1a9d3e7ce4a3fc781ad4d26b3b4b",
   "incidentIds": [
     "INC-20260717-HISTORY-STUCK",
     "INC-20260718-ATTACH-NOOP",
@@ -74,7 +74,18 @@
     "INC-20260827-PHASE-B-DEFER-VANISH",
     "INC-20260827-WEIBO-ERRCODE-ACTIONABLE",
     "INC-20260827-WEIBO-SETUP-PIN-DRIFT",
-    "INC-20260828-CCB-PROMPT-TOO-LONG"
+    "INC-20260828-CCB-PROMPT-TOO-LONG",
+    "INC-20260829-CUTOVER-SURVIVOR-STALE-WD",
+    "INC-20260831-TURNEND-ORDER-COLLAPSE",
+    "INC-20260831-CURSOR-MCP-DELEGATE-CONTEXT",
+    "INC-20260831-DELEGATE-MODEL-UNKNOWN",
+    "INC-20260831-VISIBLE-ORPHAN-FALSE-KILL",
+    "INC-20260901-CURSOR-SAND-INFERENCE",
+    "INC-20260902-TIMELINE-PAINT-VISION-HINT",
+    "INC-20260902-CCB-DEFERRED-TOOL-ADAPT",
+    "INC-20260902-WEB-TASKBOARD-TIMELINE-HUD",
+    "INC-20260902-DELEGATE-ENGINE-BILLING-REQUESTID",
+    "INC-20260829-FAIL-LOUD-ERROR-MSG"
   ],
   "incidents": {
     "INC-20260717-HISTORY-STUCK": {
@@ -447,6 +458,103 @@
     "INC-20260828-CCB-PROMPT-TOO-LONG": {
       "rootFixCommit": "0633e7a7",
       "coverageCommits": []
+    },
+    "INC-20260829-CUTOVER-SURVIVOR-STALE-WD": {
+      "rootFixCommit": "2190563c",
+      "coverageCommits": null
+    },
+    "INC-20260831-TURNEND-ORDER-COLLAPSE": {
+      "rootFixCommit": "46380d50",
+      "coverageCommits": null
+    },
+    "INC-20260831-CURSOR-MCP-DELEGATE-CONTEXT": {
+      "rootFixCommit": "1bfa85be",
+      "coverageCommits": [
+        "886e4dfa",
+        "6ea6b0f0",
+        "75f9953e"
+      ]
+    },
+    "INC-20260831-DELEGATE-MODEL-UNKNOWN": {
+      "rootFixCommit": "8170334e",
+      "coverageCommits": [
+        "886e4dfa",
+        "eb5a0758"
+      ]
+    },
+    "INC-20260831-VISIBLE-ORPHAN-FALSE-KILL": {
+      "rootFixCommit": "19e9d471",
+      "coverageCommits": [
+        "3e80a4a7",
+        "568fb53b",
+        "1c7e4aae",
+        "2295a322",
+        "bfcc174e"
+      ]
+    },
+    "INC-20260901-CURSOR-SAND-INFERENCE": {
+      "rootFixCommit": "a5da8cea",
+      "coverageCommits": [
+        "8a92b682",
+        "4d678dda",
+        "cfb6c7c6",
+        "968f4836",
+        "ccc58f05",
+        "a32e9bb6",
+        "38596146",
+        "5834df20",
+        "4c423197",
+        "42c51537",
+        "9cc8dedc",
+        "cd25a50a",
+        "cd7ec21d",
+        "5ff831e4",
+        "a5da8cea",
+        "e3f11e62"
+      ]
+    },
+    "INC-20260902-TIMELINE-PAINT-VISION-HINT": {
+      "rootFixCommit": "db14273e",
+      "coverageCommits": [
+        "db14273e",
+        "2a38336c"
+      ]
+    },
+    "INC-20260902-CCB-DEFERRED-TOOL-ADAPT": {
+      "rootFixCommit": "58ae7303",
+      "coverageCommits": [
+        "84849fd5",
+        "b70cfd0b",
+        "26eb5dc9",
+        "c0a871bf",
+        "5885ecfe",
+        "f5b267e9"
+      ]
+    },
+    "INC-20260902-WEB-TASKBOARD-TIMELINE-HUD": {
+      "rootFixCommit": "51674b8c",
+      "coverageCommits": [
+        "51674b8c",
+        "226edfac",
+        "d18bd587"
+      ]
+    },
+    "INC-20260902-DELEGATE-ENGINE-BILLING-REQUESTID": {
+      "rootFixCommit": "654ca01f",
+      "coverageCommits": [
+        "654ca01f",
+        "97677249",
+        "de1dd178",
+        "6c2ee090"
+      ]
+    },
+    "INC-20260829-FAIL-LOUD-ERROR-MSG": {
+      "rootFixCommit": "2491a190",
+      "coverageCommits": [
+        "1eae3d23",
+        "5806c952",
+        "ec03f2b1"
+      ]
     }
   },
   "importedTrailerHistoryTips": [
@@ -457,7 +565,10 @@
     "28962cf36f60afdf3cca10f5a6d51beafcea2724",
     "654a56f0b370cf5b1530e9861b79d7d10976f836",
     "8747865996b5075e19d6aad5c9bf54bca72d0c01",
-    "e9496b17426877f5163cdbb37ffaa3d4b255bff9"
+    "e9496b17426877f5163cdbb37ffaa3d4b255bff9",
+    "58ae730303f3ad11d56e15fea49270256ee0c6e8",
+    "ce6b91692c8b87a59be81e50fdc145e0da045ace",
+    "7a5617aaa50f06d13d2b9da8ec8d3d2e4a5d2a25"
   ],
   "historicallyPresentIds": [
     "INC-20260827-PHASE-B-DEFER-VANISH"
