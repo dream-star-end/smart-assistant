@@ -194,6 +194,7 @@ import type {
   AdmitUserTurnInput,
   AdmitUserTurnResult,
 } from "../db/pgSessionsBackend.js";
+import { readClientSessionModelId } from "../db/pgSessionsBackend.js";
 import type { AuthoritySigner } from "./authoritySigner.js";
 import { type AuthorityKeyCensus, authorityKeyCensus } from "./authorityKeyCensus.js";
 import { platformAuxModels, readSecurityEpoch } from "../billing/modelCatalog.js";
@@ -1566,11 +1567,7 @@ export async function lookupCronOriginSessionModel(
   sessionId: string,
   sessionUserId: string,
 ): Promise<string | null> {
-  const res = await pool.query<{ model_id: string | null }>(
-    "SELECT model_id FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-    [sessionId, sessionUserId],
-  );
-  return res.rows[0]?.model_id ?? null;
+  return readClientSessionModelId(pool, sessionId, sessionUserId);
 }
 
 /** Shared origin-session inject path used by the bridge and unit tests. */
