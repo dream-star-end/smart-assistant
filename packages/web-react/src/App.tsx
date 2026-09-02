@@ -22,6 +22,7 @@ import {
   type ImageEditSubmit,
 } from "./components/chat/imageEditActions";
 import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
+import { PinnedDelegateTracker } from "./components/chat/PinnedDelegateTracker";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
@@ -92,6 +93,7 @@ import { useSidebarWidth } from "./hooks/useSidebarWidth";
 import { useMdViewport } from "./hooks/useMdViewport";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
+import { useInflightDelegates } from "./hooks/useInflightDelegates";
 import { useOptimizerPending } from "./hooks/useOptimizerPending";
 import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
@@ -1567,6 +1569,12 @@ export function App() {
   const wsSending = !demo && chat.isSending(activeId);
   // 统一“本轮进行中”信号：demo 用本地 busy，非 demo 用 WS in-flight。
   const sending = demo ? busy : wsSending;
+  const inflightDelegates = useInflightDelegates({
+    sessionId: !demo && activeId ? activeId : null,
+    messages: wsMessages,
+    enabled: !demo && gate.access && !!activeId,
+    auth,
+  });
 
   const sendingIdsRef = useRef(new Set<string>());
   const liveTerminalsRef = useRef(
@@ -3039,6 +3047,12 @@ export function App() {
               todos={extractLatestTodos(wsMessages)}
               active={wsSending}
               tokenUsage={activeSess?._liveTurnUsage?.usage}
+            />
+          )}
+          {!demo && !gated && (
+            <PinnedDelegateTracker
+              items={inflightDelegates.items}
+              onDismiss={inflightDelegates.dismiss}
             />
           )}
           {!demo && gate.phase.kind === "dormant" && (
