@@ -188,7 +188,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #timeline-paint-anchor-root [data-chat-virtual-key*="paint-short"]{min-height:80px}
   #timeline-paint-anchor-root [data-chat-virtual-key*="paint-tall"]{min-height:420px}
   #timeline-estimate-anchor-root .chat-timeline-row{min-height:420px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="timeline-paint-anchor-root"></div><div id="timeline-estimate-anchor-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="timeline-paint-anchor-root"></div><div id="timeline-estimate-anchor-root"></div><div id="hud-refresh-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -939,6 +939,15 @@ async function expandPaintAnchorWindow() {
   return page.evaluate(() => window.__paintAnchor.snapshot().windowCount);
 }
 
+// armSticky 会 bumpPaint 触发一次 React 渲染;若紧接着在同一任务里写 scrollTop,该渲染会先于
+// scroll 事件提交,MessageList 只能拿到贴底时捕获的旧锚点做校正(真 App 里 following 只在
+// scroll 事件内翻转,不存在这种顺序)。等两帧让 arm 的渲染落地,再做用户滚动。
+async function settlePaintFrames() {
+  await page.evaluate(() => new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve(undefined)));
+  }));
+}
+
 await check("T52 follow→unfollow 画窗从尾窗切换时锚点不跳", async () => {
   await page.evaluate(() => window.__mountPaintProbes());
   const root = page.locator("#timeline-paint-anchor-root .timeline-scroll-probe");
@@ -948,19 +957,35 @@ await check("T52 follow→unfollow 画窗从尾窗切换时锚点不跳", async 
   try {
     await page.waitForFunction(() => {
       const snap = window.__paintAnchor.snapshot();
-      return snap.following && snap.windowCount >= 160 && snap.paintCount >= 50 && snap.paintCount < snap.windowCount;
+      // 画窗启用契约(timelinePaint.ts):PAINT_MIN_ITEMS=12、overscan 1.5 视口;400px 视口下
+      // 稳定画窗 = 12 行(旧夹具 >=50 对应已废弃的 PAINT_MIN_ITEMS=36 常量)。
+      return snap.following && snap.windowCount >= 160 && snap.paintCount >= 12 && snap.paintCount < snap.windowCount;
     }, null, { timeout: 3000 });
   } catch (err) {
     const snap = await page.evaluate(() => window.__paintAnchor.snapshot());
     throw new Error(`贴底后画窗未启用: ${err.message}; snap=${JSON.stringify(snap)}`);
   }
+  await settlePaintFrames();
+  // 尾窗 = PAINT_MIN_ITEMS(12)行 + 1.5 视口 overscan;-80px 已不足以让画窗离开尾窗
+  // (旧 PAINT_MIN_ITEMS=36 时代的写法)。改为把视口顶落到尾窗首行上方 200px:视口上部是
+  // 估高 spacer、首行可见于 y≈200,旧尾窗不再覆盖视口 → 画窗必须切到滚动窗;首行就是
+  // "上滑前可见的那条消息",其像素位置在 spacer 估高变真实高度时不得跳动。
   const before = await page.evaluate(() => {
-    window.__paintAnchor.armSticky();
-    window.__paintAnchor.userScrollBy(-80);
+    const scroller = document.querySelector("#timeline-paint-anchor-root .timeline-scroll-probe");
+    const first = scroller?.querySelector("[data-chat-virtual-key]");
+    if (!(scroller instanceof HTMLElement) || !(first instanceof HTMLElement)) {
+      throw new Error("missing paint scroller / first painted row");
+    }
+    const firstOffset =
+      first.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
+    window.__paintAnchor.userScrollBy(Math.max(0, firstOffset - 200) - scroller.scrollTop);
     return window.__paintAnchor.snapshot();
   });
   if (!before.key || before.top == null) {
     throw new Error(`unfollow 前未捕获可见锚点:${JSON.stringify(before)}`);
+  }
+  if (before.top < 0 || before.top > before.clientHeight) {
+    throw new Error(`unfollow 前锚点不在视口内:${JSON.stringify(before)}`);
   }
   try {
     await page.waitForFunction((prev) => {
@@ -990,17 +1015,24 @@ await check("T53 继续上滑画窗滑动时锚点不跳", async () => {
   const root = page.locator("#timeline-paint-anchor-root .timeline-scroll-probe");
   await root.waitFor({ state: "visible", timeout: 3000 });
   await expandPaintAnchorWindow();
+  await page.evaluate(() => window.__paintAnchor.armSticky());
+  await page.waitForFunction(() => window.__paintAnchor.snapshot().following === true, null, { timeout: 3000 });
+  await settlePaintFrames();
   await page.evaluate(() => {
-    window.__paintAnchor.armSticky();
     const node = document.querySelector("#timeline-paint-anchor-root .timeline-scroll-probe");
     if (!(node instanceof HTMLElement)) throw new Error("missing paint scroller");
     window.__paintAnchor.userScrollBy(-(Math.max(0, node.scrollTop - 12000)));
   });
   await page.waitForFunction(() => window.__paintAnchor.snapshot().following === false, null, { timeout: 3000 });
+  await settlePaintFrames();
   let sawPaintSlide = false;
-  for (let step = 0; step < 4; step += 1) {
+  // 每步 500px < 1.5 视口 overscan(600px):滚动后视口仍与已挂载行相邻,snapshot 捕到的
+  // 首个挂载行在画窗滑动后必须仍挂载且不动(旧 2500px 步长对应已废弃的 36 行最小画窗,
+  // 在 12 行画窗下会整段越过已挂载区,锚点必卸,不是产品契约)。6 步共 3000px ≈ 12 行,
+  // 足以越过 PAINT_HYSTERESIS_ITEMS=3 触发至少一次画窗滑动。
+  for (let step = 0; step < 6; step += 1) {
     const before = await page.evaluate(() => {
-      window.__paintAnchor.userScrollBy(-2500);
+      window.__paintAnchor.userScrollBy(-500);
       return window.__paintAnchor.snapshot();
     });
     if (!before.key || before.top == null) {
@@ -1064,6 +1096,122 @@ await check("T54 短会话滚入时 200px 估高变真实高度不把内容推�
   const dist = after.scrollHeight - after.scrollTop - after.clientHeight;
   if (dist < 8) {
     throw new Error(`短会话估高结算把内容推到底部: dist=${dist}; ${JSON.stringify({ before, after })}`);
+  }
+});
+
+await check("T60 离底后新追加的 user 行立刻进入画窗而非落入底 spacer", async () => {
+  await page.evaluate(() => window.__mountPaintProbes());
+  const root = page.locator("#timeline-paint-anchor-root .timeline-scroll-probe");
+  await root.waitFor({ state: "visible", timeout: 3000 });
+  await expandPaintAnchorWindow();
+  await page.evaluate(() => window.__paintAnchor.armSticky());
+  try {
+    await page.waitForFunction(() => {
+      const snap = window.__paintAnchor.snapshot();
+      return snap.following && snap.windowCount >= 160 && snap.paintCount >= 12 && snap.paintCount < snap.windowCount;
+    }, null, { timeout: 3000 });
+  } catch (err) {
+    const snap = await page.evaluate(() => window.__paintAnchor.snapshot());
+    throw new Error(`贴底后画窗未启用: ${err.message}; snap=${JSON.stringify(snap)}`);
+  }
+  await settlePaintFrames();
+  // 离底后追加一条乐观 user 行(与 App 发送同形:local/sending),不滚动、不 follow。
+  // 断言:该行立刻挂载并渲染正文、底 spacer 为 0(end 吸收到尾部)、画窗不缩、
+  // 不误恢复贴底、原可见锚点像素不跳。
+  const appendAndAssert = async (label, stable) => {
+    const appendedKey = await page.evaluate(() => window.__paintAnchor.appendUserRow("PAINT_TAIL_APPEND_ROW"));
+    if (!appendedKey) throw new Error(`${label}: appendUserRow 未返回 virtual key`);
+    try {
+      await page.waitForFunction((key) => {
+        const row = document.querySelector(`#timeline-paint-anchor-root [data-chat-virtual-key="${key}"]`);
+        return row instanceof HTMLElement;
+      }, appendedKey, { timeout: 3000 });
+    } catch (err) {
+      const now = await page.evaluate(() => window.__paintAnchor.snapshot());
+      throw new Error(`${label}: 离底后新追加的 user 行落在底 spacer 未渲染: ${err.message}; before=${JSON.stringify(stable)}; now=${JSON.stringify(now)}`);
+    }
+    await settlePaintFrames();
+    const after = await page.evaluate(() => window.__paintAnchor.snapshot());
+    if (after.following) throw new Error(`${label}: 追加后错误恢复贴底:${JSON.stringify(after)}`);
+    if (after.windowCount !== stable.windowCount + 1) {
+      throw new Error(`${label}: 追加后 windowCount 应 +1: ${stable.windowCount} → ${after.windowCount}`);
+    }
+    const bottomSpacer = await page.evaluate(() => {
+      const spacer = document.querySelector("#timeline-paint-anchor-root [data-testid='timeline-paint-spacer-bottom']");
+      return spacer instanceof HTMLElement ? spacer.getBoundingClientRect().height : 0;
+    });
+    if (bottomSpacer > 0) {
+      throw new Error(`${label}: 追加后底 spacer 仍有 ${bottomSpacer}px:新行未被画窗 end 吸收; ${JSON.stringify({ stable, after })}`);
+    }
+    if (after.paintCount < stable.paintCount) {
+      throw new Error(`${label}: 追加后画窗收缩: paintCount ${stable.paintCount} → ${after.paintCount}`);
+    }
+    const anchorTop = await page.evaluate((key) => window.__paintAnchor.rowTop(key), stable.key);
+    if (anchorTop == null) throw new Error(`${label}: 追加后原可见锚点行丢失:${JSON.stringify({ stable, after })}`);
+    const delta = Math.abs(anchorTop - stable.top);
+    if (delta > 2) {
+      throw new Error(`${label}: 追加吸收 end 时可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px; ${JSON.stringify({ stable, after, anchorTop })}`);
+    }
+    const text = await page.evaluate((key) => {
+      const row = document.querySelector(`#timeline-paint-anchor-root [data-chat-virtual-key="${key}"]`);
+      return row ? row.textContent : null;
+    }, appendedKey);
+    if (!text || !text.includes("PAINT_TAIL_APPEND_ROW")) {
+      throw new Error(`${label}: 追加行已挂载但正文未渲染: ${JSON.stringify(text)}`);
+    }
+    return after;
+  };
+  const unfollowBy = async (delta) => {
+    const moved = await page.evaluate((d) => {
+      window.__paintAnchor.userScrollBy(d);
+      return window.__paintAnchor.snapshot();
+    }, delta);
+    if (!moved.key || moved.top == null) throw new Error(`离底 ${delta}px 后未捕获可见锚点:${JSON.stringify(moved)}`);
+    await page.waitForFunction(() => window.__paintAnchor.snapshot().following === false, null, { timeout: 3000 });
+    await settlePaintFrames();
+    const stable = await page.evaluate(() => window.__paintAnchor.snapshot());
+    if (stable.following) throw new Error(`离底 ${delta}px 后仍贴底:${JSON.stringify(stable)}`);
+    if (stable.paintCount !== moved.paintCount || stable.spacerTop !== moved.spacerTop) {
+      throw new Error(`离底 ${delta}px 不应让画窗滑动(前提失效):${JSON.stringify({ moved, stable })}`);
+    }
+    return stable;
+  };
+  // (A) 距底 80px:模型内旧尾窗未覆盖视口 → 画窗随追加整体后移一位(start+1)。修复前
+  //     ResizeObserver effect 在 messages.length 变化时用已位移的 DOM 重捕锚点,span 校正
+  //     误判「未动」被跳过,视口内容上跳一行间距(16px)。
+  await appendAndAssert("A(-80)", await unfollowBy(-80));
+  // (B) 再上移 420px(距底约 500px):旧尾窗仍覆盖视口、end 只 +1(< PAINT_HYSTERESIS_ITEMS)。
+  //     修复前 selectPaintRange 的 hysteresis 保住旧 end,新行只落到底 spacer,滚动前不渲染。
+  await appendAndAssert("B(-500)", await unfollowBy(-420));
+});
+
+await check("T61 刷新后 HUD 仍钉住且畸形 agent-group 只落 MessageBoundary 邻居仍在", async () => {
+  await page.evaluate(() => window.__mountHudProbe());
+  const probe = page.locator("#hud-refresh-root [data-testid='hud-refresh-probe']");
+  await probe.waitFor({ state: "visible", timeout: 3000 });
+  // (a) sending=false(刷新形态)下当前轮有未完成任务 → HUD 钉住并显示进度与待办。
+  const tracker = probe.locator("[data-testid='hud-refresh-tracker']");
+  await tracker.getByText("任务 1/2", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  await tracker.getByText("容器重建后真机验证", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  // (b) 邻居行仍在:用户「继续」与终稿「已处理完毕。」
+  await probe.getByText("继续", { exact: true }).first().waitFor({ state: "visible", timeout: 3000 });
+  await probe.getByText("已处理完毕。", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  // (c) 整棵时间线未被畸形行打穿。
+  if ((await probe.getByText("会话内容渲染失败", { exact: true }).count()) !== 0) {
+    throw new Error("畸形 agent-group 打穿 SessionTimelineBoundary:整棵时间线渲染失败");
+  }
+  if ((await probe.locator("[data-testid='timeline-fatal-error']").count()) !== 0) {
+    throw new Error("畸形 agent-group 触发 timeline-fatal-error");
+  }
+  // (d) 同轮两条 agent-group(含畸形 ag-bad-steps)并入一张团队面板行(key=ag-coding);
+  //     该行必须仍在列表里且列表未坍塌:畸形成员只能落 per-message MessageBoundary,不吞整行。
+  const teamRow = probe.locator("[data-chat-virtual-key='ag-coding']");
+  if ((await teamRow.count()) !== 1) {
+    throw new Error(`含畸形成员的团队面板行未渲染: count=${await teamRow.count()}`);
+  }
+  const rowCount = await probe.locator("[data-chat-virtual-key]").count();
+  if (rowCount < 4) {
+    throw new Error(`时间线行数异常(应含 user/tool/team/assistant): ${rowCount}`);
   }
 });
 

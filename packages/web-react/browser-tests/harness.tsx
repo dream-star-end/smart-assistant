@@ -25,6 +25,9 @@ import { MemoryPanel } from "../src/components/manage/MemoryPanel";
 import { MediaTaskCenter } from "../src/components/MediaTaskCenter";
 import { Markdown } from "../src/components/Markdown";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
+import { SessionTimelineBoundary } from "../src/components/SessionTimelineBoundary";
+import { extractLatestTodos, PinnedTaskTracker } from "../src/components/chat/PinnedTaskTracker";
+import ocv570TimelineFixture from "../src/components/chat/__fixtures__/ocv5-70-timeline-repro.json";
 import { createStickToBottomController } from "../src/components/chat/stickToBottom";
 import { ModelSelector } from "../src/components/ModelSelector";
 import { ToolCard } from "../src/components/ToolCard";
@@ -128,8 +131,12 @@ declare global {
       };
       rowTop: (key: string) => number | null;
       growAboveViewport: (deltaPx: number) => boolean;
+      /** T60:向真实 MessageList 尾部追加一条 user 行(模拟离底后新发送),返回其 virtual key。 */
+      appendUserRow: (text: string) => string;
     };
     __mountPaintProbes: () => void;
+    /** T61:刷新形态(sending=false)HUD + 畸形 agent-group 行的真实 MessageList 探针。 */
+    __mountHudProbe: () => void;
     __estimateAnchor: {
       following: boolean;
       armSticky: () => void;
@@ -335,7 +342,9 @@ window.__paintAnchor = {
   }),
   rowTop: () => null,
   growAboveViewport: () => false,
+  appendUserRow: () => "",
 };
+window.__mountHudProbe = () => {};
 window.__estimateAnchor = {
   following: true,
   armSticky: () => {},
@@ -1296,6 +1305,9 @@ function bindTimelineAnchorApi(
     if (!(row instanceof HTMLElement)) return null;
     return row.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
   };
+  if (typeof target.appendUserRow !== "function") {
+    target.appendUserRow = () => "";
+  }
   target.growAboveViewport = (deltaPx: number) => {
     if (!scroller) return false;
     const viewport = scroller.getBoundingClientRect();
@@ -1326,7 +1338,7 @@ function PaintWindowAnchorProbe() {
     scrollToBottom: stick.scrollToBottom,
     correctTo: stick.correctTo,
   }), [stick]);
-  const messages = useMemo<ChatMessage[]>(() => Array.from({ length: 180 }, (_, index) => ({
+  const [messages, setMessages] = useState<ChatMessage[]>(() => Array.from({ length: 180 }, (_, index) => ({
     id: `paint-row-${index}`,
     role: "user" as const,
     text: index % 2 === 0 ? "PAINT_SHORT" : "PAINT_TALL",
@@ -1335,7 +1347,27 @@ function PaintWindowAnchorProbe() {
     _source: "server" as const,
     _timelineRecord: true,
     _timelineUnitKey: `outer:${index}:paint-${index % 2 === 0 ? "short" : "tall"}-${index}`,
-  })), []);
+  })));
+  // T60:离底(unfollow)后模拟用户新发送 —— 与 App 乐观追加同形(local、sending)。修复前
+  // selectPaintRange 的 hysteresis 保住旧 end,这条行只落到底部 spacer 里,滚动前不渲染。
+  window.__paintAnchor.appendUserRow = (text: string) => {
+    const index = messages.length;
+    const key = `outer:${index}:paint-append-${index}`;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `paint-append-${index}`,
+        role: "user" as const,
+        text,
+        ts: index,
+        status: "sending" as const,
+        _source: "local" as const,
+        _timelineRecord: true,
+        _timelineUnitKey: key,
+      },
+    ]);
+    return key;
+  };
   bindTimelineAnchorApi(window.__paintAnchor, scroller, stick, () => {
     bumpPaint((value) => value + 1);
   });
@@ -1426,6 +1458,41 @@ window.__mountPaintProbes = () => {
   );
   createRoot(document.getElementById("timeline-estimate-anchor-root")!).render(
     <StrictMode><EstimateAnchorProbe /></StrictMode>,
+  );
+};
+
+// ── T61 刷新后 HUD 钉住 + 畸形 agent-group 只落 MessageBoundary ─────────────────
+//
+// 复用 OCV5-70 真实会话精简 fixture(与 ocv5-70TimelineRender.test.tsx 同一权威):
+// 含 hydration 形态 TodoWrite(inputJson.todos,一条 pending)与畸形 agent-group
+// (steps 非数组 / 含 null)。刷新后 wsSending=false,App 以 active={false} 挂 HUD;
+// 修复前 PinnedTaskTracker 依赖 active 一刀切隐藏,HUD 消失;畸形行修复前打穿整棵
+// SessionTimelineBoundary 报「会话内容渲染失败」。
+const HUD_PROBE_MESSAGES = ocv570TimelineFixture as unknown as ChatMessage[];
+function HudRefreshProbe() {
+  const todos = extractLatestTodos(HUD_PROBE_MESSAGES);
+  return (
+    <div data-testid="hud-refresh-probe">
+      <div data-testid="hud-refresh-tracker">
+        <PinnedTaskTracker todos={todos} active={false} />
+      </div>
+      <SessionTimelineBoundary resetKey="browser-hud-refresh">
+        <MessageList
+          messages={HUD_PROBE_MESSAGES}
+          sending={false}
+          cb={{}}
+          onRespondPermission={() => {}}
+        />
+      </SessionTimelineBoundary>
+    </div>
+  );
+}
+let hudProbeMounted = false;
+window.__mountHudProbe = () => {
+  if (hudProbeMounted) return;
+  hudProbeMounted = true;
+  createRoot(document.getElementById("hud-refresh-root")!).render(
+    <StrictMode><HudRefreshProbe /></StrictMode>,
   );
 };
 

@@ -237,6 +237,14 @@
     {
       "id": "T59",
       "proves": "真 Chromium 中 Phase-A unpublished fallback 到达后，交错 live assistant 段仍保持 thinking/正文1/tool/正文2，空 live-units reset 不把 visible_head 整块挤到末尾"
+    },
+    {
+      "id": "T60",
+      "proves": "真 Chromium 中离底(unfollow)后向真实 MessageList 尾部追加新 user 行(乐观 sending):距底 80px(画窗整体后移一位)与距底约 500px(旧尾窗仍覆盖视口、end 只 +1)两种形态下,新行都立刻挂载并渲染正文、底 spacer 为 0(selectPaintRange 吸收尾部 end 增长)、画窗不缩、不误恢复贴底、原可见锚点像素不跳(≤2px)"
+    },
+    {
+      "id": "T61",
+      "proves": "真 Chromium 中刷新形态(sending=false)下当前轮仍有未完成 TodoWrite(hydration inputJson.todos)时 PinnedTaskTracker HUD 仍钉住;OCV5-70 真实 fixture 的畸形 agent-group 只落 per-message MessageBoundary,邻居 user/assistant 行仍在,不打穿 SessionTimelineBoundary"
     }
   ]
 }
