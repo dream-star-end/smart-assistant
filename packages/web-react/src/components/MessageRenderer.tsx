@@ -1471,7 +1471,11 @@ export function MessageList({
     };
     const observer = new ResizeObserver(follow);
     observer.observe(root);
-    recapture();
+    // 只在尚无锚点时初始化。本 effect 因 messages.length 重跑时 DOM 已提交:此刻重捕会用
+    // 已位移的几何覆盖 scroll 时捕获的锚点,让同一 commit 里后面的画窗 span 校正误判
+    // 「锚点未动」而跳过 —— 离底后每追加一行、画窗 start 后移一位就漏掉一行间距(16px),
+    // 视口内容随之上跳。span 校正 effect 结束时会自己重捕最新锚点。
+    if (!lastViewportAnchorRef.current) recapture();
     return () => observer.disconnect();
   }, [scrollParent, followBottomRef, windowVersion, messages.length]);
   useLayoutEffect(() => {
