@@ -99,6 +99,19 @@ assert.equal(trainNames.includes("skill_delete"), false, "skill-train must hide 
 assert.ok(trainNames.includes("delegate_task"), "skill-train must keep delegate_task");
 assert.equal(trainNames.includes("skill_propose"), false, "skill_propose must not be advertised");
 
+const evalKeepsConfigured = projectCcbMcpAvailability({
+  configuredTools: ["skill_save", "browser"],
+  mcpLaunch: {},
+  skillEvalMode: true,
+});
+assert.ok(evalKeepsConfigured.includes("skill_save"), "skill-eval must keep configured skill_save");
+assert.ok(evalKeepsConfigured.includes("browser"), "skill-eval must keep configured browser");
+assert.equal(
+  evalKeepsConfigured.includes("delegate_task"),
+  false,
+  "skill-eval must still hide platform delegate_task",
+);
+
 const sample = "走 MCP delegate_task/delegate_tasks";
 const redacted = sanitizeUnavailableMcpClaims(
   sample,
@@ -146,6 +159,20 @@ assert.ok(launchIdx >= 0, "resolveMcpMemoryLaunch( call site not found");
 assert.ok(
   subprocess.slice(Math.max(0, launchIdx - 200), launchIdx).includes("try {"),
   "resolveMcpMemoryLaunch( must be wrapped in try { within 200 chars",
+);
+assert.ok(
+  subprocess.includes("const projectedMcpTools = projectCcbMcpAvailability("),
+  "const projectedMcpTools = projectCcbMcpAvailability( must exist",
+);
+const projectedCount = subprocess.match(/projectedMcpTools/g)?.length ?? 0;
+assert.ok(
+  projectedCount >= 2,
+  `projectedMcpTools must appear at least twice (define + consume), got ${projectedCount}`,
+);
+const afterPrompt = subprocess.slice(promptIdx, promptIdx + 1500);
+assert.ok(
+  afterPrompt.includes("availableMcpTools: projectedMcpTools"),
+  "availableMcpTools: projectedMcpTools must appear within 1500 chars after buildPromptContext(",
 );
 
 const codexOverrides = readFileSync(

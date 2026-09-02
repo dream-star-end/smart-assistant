@@ -102,6 +102,37 @@ describe('subprocessRunner MCP availability wiring', () => {
     assert.ok(tryWindow.includes('try {'), 'resolveMcpMemoryLaunch( must be wrapped in try {')
   })
 
+  test('buildPromptContext consumes projectedMcpTools from projectCcbMcpAvailability', () => {
+    const src = readFileSync(new URL('../subprocessRunner.ts', import.meta.url), 'utf8')
+    assert.ok(
+      src.includes('const projectedMcpTools = projectCcbMcpAvailability('),
+      'const projectedMcpTools = projectCcbMcpAvailability( must exist',
+    )
+    const projectedCount = src.match(/projectedMcpTools/g)?.length ?? 0
+    assert.ok(
+      projectedCount >= 2,
+      `projectedMcpTools must appear at least twice (define + consume), got ${projectedCount}`,
+    )
+    const promptIdx = src.indexOf('buildPromptContext(')
+    assert.ok(promptIdx >= 0, 'buildPromptContext( call site not found')
+    const afterPrompt = src.slice(promptIdx, promptIdx + 1500)
+    assert.ok(
+      afterPrompt.includes('availableMcpTools: projectedMcpTools'),
+      'availableMcpTools: projectedMcpTools must appear within 1500 chars after buildPromptContext(',
+    )
+  })
+
+  test('skill-eval filtering does not drop same-named configured tools', () => {
+    const names = projectCcbMcpAvailability({
+      configuredTools: ['skill_save', 'browser'],
+      mcpLaunch: {},
+      skillEvalMode: true,
+    })
+    assert.ok(names.includes('skill_save'), 'configured skill_save must be kept')
+    assert.ok(names.includes('browser'), 'configured browser must be kept')
+    assert.equal(names.includes('delegate_task'), false, 'platform delegate_task must stay hidden')
+  })
+
   test('advertising the full platform MCP set does not redact tools as unregistered', async () => {
     const result = await buildPromptContext({
       agentId: 'main',

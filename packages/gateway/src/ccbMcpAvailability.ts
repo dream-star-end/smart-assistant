@@ -2,6 +2,10 @@
  * Pure projection of CCB availableMcpTools from configured servers + the
  * built-in openclaude-memory launch result.
  *
+ * Eval/train hidden-name filtering applies only to the built-in platform
+ * set (PLATFORM_MCP_TOOL_NAMES). User-configured MCP tools are kept as-is
+ * even when they share a name with a hidden platform tool.
+ *
  * Kept I/O-free so unit tests and the deploy-gate can execute the same
  * function subprocessRunner uses before buildPromptContext. Do not import
  * mcp-memory here: gateway tsconfig has no project ref to it, and a relative
@@ -45,15 +49,17 @@ export const CCB_SKILL_EVAL_HIDDEN_PLATFORM_TOOLS = [
 const SKILL_TRAIN_HIDDEN_PLATFORM_TOOLS = ['skill_save', 'skill_delete'] as const
 
 export function projectCcbMcpAvailability(input: CcbMcpAvailabilityInput): string[] {
-  const names = new Set<string>(input.configuredTools)
+  const platform = new Set<string>()
   if (input.mcpLaunch != null) {
-    for (const name of PLATFORM_MCP_TOOL_NAMES) names.add(name)
+    for (const name of PLATFORM_MCP_TOOL_NAMES) platform.add(name)
+    if (input.skillEvalMode) {
+      for (const name of CCB_SKILL_EVAL_HIDDEN_PLATFORM_TOOLS) platform.delete(name)
+    }
+    if (input.skillTrainRunId) {
+      for (const name of SKILL_TRAIN_HIDDEN_PLATFORM_TOOLS) platform.delete(name)
+    }
   }
-  if (input.skillEvalMode) {
-    for (const name of CCB_SKILL_EVAL_HIDDEN_PLATFORM_TOOLS) names.delete(name)
-  }
-  if (input.skillTrainRunId) {
-    for (const name of SKILL_TRAIN_HIDDEN_PLATFORM_TOOLS) names.delete(name)
-  }
+  const names = new Set<string>(input.configuredTools)
+  for (const name of platform) names.add(name)
   return [...names].sort()
 }
