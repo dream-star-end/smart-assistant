@@ -818,6 +818,62 @@ test('loopback relay hits InferenceService/Stream with Sand identity and emits A
   }
 })
 
+test('relay passes non-Sand models (CCB sub-agent pin) through to the internal proxy verbatim', async () => {
+  const seen: { url: string; auth: string | null; body: string }[] = []
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = String(input)
+    if (url.endsWith('/auth/exchange_user_api_key') || url.includes('InferenceService')) {
+      throw new Error(`Sand upstream must not be touched for passthrough: ${url}`)
+    }
+    const headers = new Headers(init?.headers)
+    seen.push({ url, auth: headers.get('authorization'), body: Buffer.from(init?.body as Uint8Array).toString('utf8') })
+    const sse = 'event: message_start\ndata: {"type":"message_start"}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'
+    return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  }
+  const relay = new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from('crsr_test'),
+    passthrough: { baseUrl: 'http://proxy.internal:18892', authToken: 'container-bearer' },
+  })
+  const baseUrl = await relay.start()
+  try {
+    const payload = JSON.stringify({
+      model: 'glm-5.3-zai', stream: true, max_tokens: 64,
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: payload,
+    })
+    assert.equal(response.status, 200)
+    assert.match(await response.text(), /event: message_stop/)
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0].url, 'http://proxy.internal:18892/v1/messages')
+    assert.equal(seen[0].auth, 'Bearer container-bearer')
+    assert.equal(seen[0].body, payload)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('relay rejects non-Sand models with 400 (not 502) when no passthrough proxy exists', async () => {
+  const relay = new CursorSandRelay({
+    fetchImpl: async () => { throw new Error('unreachable') },
+    readApiKey: () => Buffer.from('crsr_test'),
+    passthrough: null,
+  })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'glm-5.3-zai', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(response.status, 400)
+    assert.match(await response.text(), /not a Cursor Sand route/)
+  } finally {
+    await relay.close()
+  }
+})
+
 test('native Fable forwards thinking before the upstream stream ends', async () => {
   let releaseUpstream!: () => void
   const upstreamGate = new Promise<void>((resolvePromise) => { releaseUpstream = resolvePromise })

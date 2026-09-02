@@ -68,6 +68,31 @@ interface RelayDeps {
   now?: () => number
   onRequestForTest?: (body: AnthropicMessagesBody) => void
   onRawTextForTest?: (text: string, attempt: number) => void
+  /**
+   * Where to send Anthropic-format requests whose `model` is not a Sand
+   * route (e.g. CCB sub-agents pinned to `CLAUDE_CODE_SUBAGENT_MODEL`
+   * such as glm-5.3-zai). Defaults to the gateway's own internal proxy
+   * (`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`); `null` disables.
+   */
+  passthrough?: RelayPassthrough | null
+}
+
+export interface RelayPassthrough {
+  baseUrl: string
+  authToken: string
+}
+
+export function defaultRelayPassthrough(env: NodeJS.ProcessEnv = process.env): RelayPassthrough | null {
+  const baseUrl = env.ANTHROPIC_BASE_URL?.trim().replace(/\/+$/, '')
+  const authToken = env.ANTHROPIC_AUTH_TOKEN?.trim()
+  if (!baseUrl || !authToken) return null
+  return { baseUrl, authToken }
+}
+
+/** True when the Sand relay would reject this model (not a concrete Cursor route). */
+export function isSandRoutableModel(model: unknown): boolean {
+  if (typeof model !== 'string' || !model) return false
+  return Boolean(cursorModelById(model)?.upstreamModel)
 }
 
 interface RelayAuthCache {
@@ -901,6 +926,7 @@ export class CursorSandRelay {
   private readonly activeRequests = new Set<AbortController>()
   private readonly onRequestForTest?: (body: AnthropicMessagesBody) => void
   private readonly onRawTextForTest?: (text: string, attempt: number) => void
+  private readonly passthrough: RelayPassthrough | null
 
   constructor(deps: RelayDeps = {}) {
     this.deps = {
@@ -916,6 +942,64 @@ export class CursorSandRelay {
     }
     this.onRequestForTest = deps.onRequestForTest
     this.onRawTextForTest = deps.onRawTextForTest
+    this.passthrough = deps.passthrough === undefined ? defaultRelayPassthrough() : deps.passthrough
+  }
+
+  /**
+   * Forward a non-Sand model request to the gateway's internal Anthropic
+   * proxy verbatim (streaming or not). CCB sub-agents inherit this relay as
+   * ANTHROPIC_BASE_URL but are pinned to a catalog CCB model; without this
+   * every Agent tool call under a Cursor session died with a 502 that hid
+   * the real CURSOR_SAND_MODEL_NOT_SUPPORTED cause.
+   */
+  private async passthroughMessages(
+    body: AnthropicMessagesBody,
+    raw: Buffer,
+    res: ServerResponse,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const target = this.passthrough
+    if (!target) {
+      res.statusCode = 400
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: `model ${String(body.model)} is not a Cursor Sand route and no passthrough proxy is configured` },
+      }))
+      return
+    }
+    log.info('cursor sand relay passthrough', { model: String(body.model), stream: body.stream !== false })
+    const upstream = await this.deps.fetchImpl(`${target.baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        authorization: `Bearer ${target.authToken}`,
+        'x-api-key': target.authToken,
+        accept: body.stream === false ? 'application/json' : 'text/event-stream',
+      },
+      body: new Uint8Array(raw),
+      signal,
+    })
+    res.statusCode = upstream.status
+    const contentType = upstream.headers.get('content-type')
+    if (contentType) res.setHeader('content-type', contentType)
+    res.setHeader('cache-control', 'no-cache')
+    if (!upstream.body) {
+      res.end()
+      return
+    }
+    const reader = upstream.body.getReader()
+    try {
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) break
+        if (value && value.length > 0) res.write(Buffer.from(value))
+      }
+    } finally {
+      reader.releaseLock()
+      res.end()
+    }
   }
 
   async start(): Promise<string> {
@@ -1015,6 +1099,10 @@ export class CursorSandRelay {
     req.once('aborted', abort)
     res.once('close', abort)
     try {
+      if (!isSandRoutableModel(body.model)) {
+        await this.passthroughMessages(body, raw, res, controller.signal)
+        return
+      }
       await this.handleMessages(body, res, controller.signal)
     } finally {
       req.off('aborted', abort)
