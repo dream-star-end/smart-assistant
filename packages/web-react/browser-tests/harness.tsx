@@ -1298,6 +1298,13 @@ function bindTimelineAnchorApi(
     if (!scroller) return;
     stick.markUserIntent();
     scroller.scrollTop = Math.max(0, scroller.scrollTop + delta);
+    // 真实用户滚动时主线程看到的 scrollTop 与 scroll 事件在同一渲染步同步更新;程序化写
+    // scrollTop 则要等下一帧才派发 scroll 事件。若上一步画窗 setPaintRange 的 React commit
+    // 恰好落在这个窗口(高负载下常见),MessageRenderer 的 span 校正会拿 scroll 事件里捕获的
+    // 旧锚点把本步滚动整段回拨(T53 间歇 500px「跳动」)。同步派发一次 scroll 事件,让
+    // 监听器立刻在新位置重捕锚点,与真实滚动的可观测顺序一致;随后浏览器原生事件在同位置
+    // 重复捕获一次,无副作用。
+    scroller.dispatchEvent(new Event("scroll"));
     stick.onScroll(scroller);
     target.following = stick.following.current;
   };
