@@ -262,6 +262,18 @@ function bashCommandOf(tool: { name: string; input?: Record<string, unknown> }):
   return null
 }
 
+/** delegate_* / send_to_agent by bare, `mcp__<server>__` or CCB `ExecuteExtraTool {tool_name}` wrapper name. */
+function isDelegateTool(tool: { name: string; input?: Record<string, unknown> }): boolean {
+  let name = tool.name
+  if (/^execute[-_]?extra[-_]?tool$/i.test(name)) {
+    const inner = tool.input?.tool_name ?? tool.input?.toolName
+    if (typeof inner !== 'string' || !inner) return false
+    name = inner
+  }
+  const bare = name.startsWith('mcp__') ? name.slice(name.lastIndexOf('__') + 2) : name
+  return DELEGATE_TOOLS.has(bare)
+}
+
 function isReadProbe(tool: { name: string; input?: Record<string, unknown> }, command: string | null): boolean {
   if (READ_ONLY_TOOLS.has(tool.name)) return true
   if (!command) return false
@@ -283,7 +295,7 @@ export function observeToolUse(
     hits.push(...lintBashCommand(command, mode))
   }
 
-  if (DELEGATE_TOOLS.has(tool.name)) {
+  if (isDelegateTool(tool)) {
     state.delegatedThisTurn = true
     state.consecutiveReadProbes = 0
   } else if (isReadProbe(tool, command)) {

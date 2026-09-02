@@ -55,6 +55,7 @@ import {
   normalizeFanoutTasks,
 } from './delegateFanout.js'
 import { normalizeDelegateAgentId, normalizeDelegateModel } from './delegateArgs.js'
+import { normalizeSkillSaveArgs } from './skillSaveArgs.js'
 import { delegateResumeIdempotencyKey } from './delegateStartCli.js'
 import {
   formatDelegateFanoutRunning,
@@ -526,13 +527,7 @@ async function findNearDuplicateSkill(
   }
 }
 
-async function handleSkillSave(args: {
-  name: string
-  description: string
-  body: string
-  tags?: string[]
-  force?: boolean
-}) {
+async function handleSkillSave(rawArgs: unknown) {
   // Defense in depth: training sessions must never write the authoritative library
   // (the tool is also removed from the training tool list above).
   if (SKILL_TRAIN_RUN_ID) {
@@ -540,6 +535,9 @@ async function handleSkillSave(args: {
       'skill_save is disabled during a training run — use skill_propose (draft only)',
     )
   }
+  const normalized = normalizeSkillSaveArgs(rawArgs)
+  if (!normalized.ok) return toolError(normalized.error)
+  const args = normalized.args
   // Near-duplicate soft gate: steer toward updating an existing similar skill
   // rather than growing the library uncontrolled. force:true bypasses. Only the
   // v3 path (master configured) runs it — personal version skips entirely (no

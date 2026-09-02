@@ -642,3 +642,78 @@ describe("Grok 原生工具卡归一化", () => {
     expect(d.input?.content).toBe("hello");
   });
 });
+
+describe("CCB ExecuteExtraTool / SearchExtraTools 包装归一化", () => {
+  const envelope = (text: string, toolName: string) =>
+    JSON.stringify({ result: [{ type: "text", text }], tool_name: toolName });
+
+  test("ExecuteExtraTool → 内层 MCP 工具名 + params,输出取信封 text", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "ExecuteExtraTool",
+      inputJson: {
+        tool_name: "mcp__openclaude-memory__skill_save",
+        params: { name: "v5-x", description: "d", body: "# b", tags: ["a"] },
+      },
+      output: envelope('Saved skill "v5-x".', "mcp__openclaude-memory__skill_save"),
+      _completed: true,
+    });
+    expect(d.name).toBe("mcp__openclaude-memory__skill_save");
+    expect(d.input).toEqual({ name: "v5-x", description: "d", body: "# b", tags: ["a"] });
+    expect(d.tool.output).toBe('Saved skill "v5-x".');
+    expect(d.tool.toolName).toBe("mcp__openclaude-memory__skill_save");
+    const meta = resolveToolMeta(d.name, d.input);
+    expect(meta.label).toBe("保存技能");
+  });
+
+  test("ExecuteExtraTool 失败:error 文本原样保留,error 标志不丢", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "ExecuteExtraTool",
+      inputJson: { tool_name: "mcp__openclaude-memory__skill_save", params: { name: "x", content: "c" } },
+      output: "error: Cannot read properties of undefined (reading 'trim')",
+      error: true,
+      _completed: true,
+    });
+    expect(d.name).toBe("mcp__openclaude-memory__skill_save");
+    expect(d.tool.output).toBe("error: Cannot read properties of undefined (reading 'trim')");
+    expect(d.tool.error).toBe(true);
+  });
+
+  test("ExecuteExtraTool 内层为 CCB 内建(TeamCreate)时按内层名走通用卡", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "ExecuteExtraTool",
+      inputJson: { tool_name: "TeamCreate", params: { team_name: "review" } },
+      output: envelope("Team created", "TeamCreate"),
+      _completed: true,
+    });
+    expect(d.name).toBe("TeamCreate");
+    expect(d.input).toEqual({ team_name: "review" });
+    expect(d.tool.output).toBe("Team created");
+  });
+
+  test("ExecuteExtraTool 流式尚无 tool_name 时保留包装名(调用工具),不 dump 半截 params", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "ExecuteExtraTool",
+      partialJson: '{"params": {"na',
+      _partial: true,
+    });
+    expect(d.name).toBe("ExecuteExtraTool");
+    expect(resolveToolMeta(d.name, d.input).label).toBe("调用工具");
+  });
+
+  test("ExecuteExtraTool 运行中(output 缺省)不伪造输出", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "ExecuteExtraTool",
+      inputJson: { tool_name: "mcp__openclaude-memory__delegate_task", params: { agentId: "auditor", goal: "g" } },
+    });
+    expect(d.name).toBe("mcp__openclaude-memory__delegate_task");
+    expect(d.tool.output == null).toBe(true);
+  });
+
+  test("SearchExtraTools:查找工具 meta,摘要剥 select: 前缀", () => {
+    expect(resolveToolMeta("SearchExtraTools", { query: "x" }).label).toBe("查找工具");
+    expect(toolSummary("SearchExtraTools", { query: "select:mcp__openclaude-memory__skill_view" })).toBe(
+      "mcp__openclaude-memory__skill_view",
+    );
+    expect(toolSummary("ExecuteExtraTool", { tool_name: "TeamCreate" })).toBe("TeamCreate");
+  });
+});

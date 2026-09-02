@@ -18,6 +18,7 @@ import { renderSkillListCard, renderSkillSearchCard, renderSkillViewCard } from 
 import { renderDelegateFanoutCard } from "./delegateFanoutCard";
 import { renderMcpResourcesCard } from "./mcpResourceCards";
 import { ToolBodyFullContext, ToolInspectOpenContext, useToolCardActions } from "./context";
+import { parseSearchExtraToolsResult, searchExtraToolsQuery } from "../../lib/chat/extraTool";
 import { formatLiveActivityAction, mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
 import {
   asArr,
@@ -1251,6 +1252,45 @@ function TaskBody({ input, tool, name }: BodyProps & { name?: string }) {
   );
 }
 
+/** 工具名短显示:mcp__server__op → server: op;其它原样。 */
+function shortToolName(name: string): string {
+  const mcp = parseMcpName(name);
+  return mcp ? `${mcp.server}: ${mcp.op}` : name;
+}
+
+/**
+ * CCB `SearchExtraTools {query}`:查找延迟工具。结果文本 "Found N deferred tool(s): a, b.\nUse
+ * ExecuteExtraTool …" 只展示找到的工具名列表,不回显给模型看的使用提示。
+ */
+function SearchExtraToolsBody({ input, tool }: BodyProps) {
+  const query = searchExtraToolsQuery(input);
+  const parsed = parseSearchExtraToolsResult(tool.output);
+  return (
+    <>
+      {query && (
+        <div className="mt-1.5 text-xs text-muted">
+          查找 <span className="font-mono text-fg">{clampStr(query, 120)}</span>
+        </div>
+      )}
+      {parsed ? (
+        parsed.none ? (
+          <FileMeta>未找到匹配的工具</FileMeta>
+        ) : (
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            {parsed.found.map((name) => (
+              <Badge key={name} tone="neutral" className="font-mono">
+                {shortToolName(name)}
+              </Badge>
+            ))}
+          </div>
+        )
+      ) : (
+        <OutputBlock output={tool.output} />
+      )}
+    </>
+  );
+}
+
 function GenericBody({ name, input, tool }: BodyProps & { name: string }) {
   const mapped = mappedLiveActivityLabel(name);
   const hideArgs = !!mapped || isOpaqueArgToolName(name) || isInternalSubtaskInput(input);
@@ -1294,6 +1334,8 @@ export function ToolBody({ name, input, tool }: { name: string; input: Input; to
       return <WebFetchBody input={input} tool={tool} />;
     case "WebSearch":
       return <WebSearchBody input={input} tool={tool} />;
+    case "SearchExtraTools":
+      return <SearchExtraToolsBody input={input} tool={tool} />;
     case "Task":
     case "Agent":
     case "TaskOutput":

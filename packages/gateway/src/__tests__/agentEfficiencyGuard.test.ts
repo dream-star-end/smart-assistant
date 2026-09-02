@@ -180,6 +180,26 @@ describe('observeToolUse — fan-out + counters', () => {
     assert.equal(state.delegatedThisTurn, true)
   })
 
+  it('recognizes delegate through mcp__ names and the CCB ExecuteExtraTool wrapper', () => {
+    const viaMcp = createTurnGuardState()
+    observeToolUse(viaMcp, { name: 'mcp__openclaude-memory__delegate_task', input: { goal: 'x' } })
+    assert.equal(viaMcp.delegatedThisTurn, true)
+
+    const viaWrapper = createTurnGuardState()
+    observeToolUse(viaWrapper, {
+      name: 'ExecuteExtraTool',
+      input: { tool_name: 'mcp__openclaude-memory__delegate_tasks', params: { tasks: [] } },
+    })
+    assert.equal(viaWrapper.delegatedThisTurn, true)
+
+    const nonDelegate = createTurnGuardState()
+    observeToolUse(nonDelegate, {
+      name: 'ExecuteExtraTool',
+      input: { tool_name: 'mcp__openclaude-memory__skill_save', params: {} },
+    })
+    assert.equal(nonDelegate.delegatedThisTurn, false)
+  })
+
   it('warns once when bash count hits the threshold', () => {
     const state = createTurnGuardState()
     let last: { code: string }[] = []

@@ -41,6 +41,11 @@ import {
   resetReplyTracker,
   trackServerTs,
 } from "./model";
+import {
+  isExecuteExtraToolName,
+  parseExecuteExtraToolResult,
+  unwrapExecuteExtraToolInput,
+} from "./extraTool";
 import { repairPostFinalProcessOrder } from "./order";
 import {
   isOcMemoryDelegateVerb,
@@ -204,6 +209,9 @@ function collectBackgroundResultPayloads(output?: string, outputJson?: unknown):
     const parsed = parseJsonObject(raw);
     if (!parsed) continue;
     if (parsed.isBackground === true) payloads.push({ status: "running", jobId: parsed.jobId });
+    // CCB ExecuteExtraTool 信封:{"result":[{"type":"text","text":"{\"status\":\"running\",\"jobId\":…}"}],…}
+    const extra = parseExecuteExtraToolResult(parsed);
+    if (extra?.text) payloads.push(extra.text);
     const success = asPlainObject(parsed.success);
     if (typeof success?.stdout === "string" && success.stdout.trim()) payloads.push(success.stdout);
     if (typeof success?.stderr === "string" && success.stderr.trim()) payloads.push(success.stderr);
@@ -356,9 +364,20 @@ function parseDelegateWaitJobId(toolName?: string, inputJson?: unknown, inputPre
   return jobId || null;
 }
 
+/** CCB `ExecuteExtraTool {tool_name, params}` → 内层 (name, input);非包装原样返回。 */
+function unwrapExtraToolCall(
+  toolName: string,
+  input: Record<string, unknown>,
+): { name: string; input: Record<string, unknown> } {
+  if (!isExecuteExtraToolName(toolName)) return { name: toolName, input };
+  const call = unwrapExecuteExtraToolInput(input);
+  return call ? { name: call.name, input: call.params } : { name: toolName, input };
+}
+
 function parseDelegateToolInfo(toolName?: string, inputJson?: unknown, inputPreview?: string): DelegateToolInfo | null {
-  const name = toolName || "";
-  const input = parseToolInputObject(inputJson, inputPreview) ?? {};
+  const wrapped = unwrapExtraToolCall(toolName || "", parseToolInputObject(inputJson, inputPreview) ?? {});
+  const name = wrapped.name;
+  const input = wrapped.input;
   if (isShellToolName(name)) {
     const command = str(input.command);
     // 只认动词 delegate；delegate-wait / core-search 等绝不收成新组。
@@ -388,7 +407,7 @@ function parseDelegateToolInfo(toolName?: string, inputJson?: unknown, inputPrev
  */
 function isFanoutDelegateToolRow(msg: ChatMessage): boolean {
   if (msg.role !== "tool") return false;
-  const name = msg.toolName || "";
+  const name = unwrapExtraToolCall(msg.toolName || "", parseToolInputObject(msg.inputJson, msg.inputPreview) ?? {}).name;
   const mcp = parseMcpToolName(name);
   if (mcp?.server === "openclaude-memory" && mcp.op === "delegate_tasks") return true;
   if (/(?:^|_)delegate_tasks$/.test(name) && parseCodexTypeName(name) !== "mcpToolCall") return true;
@@ -430,6 +449,8 @@ export function friendlyDelegateResultPreview(raw: unknown): string {
   const text = typeof raw === "string" ? raw : "";
   const parsed = parseJsonObject(raw);
   if (!parsed) return text.trim().startsWith("{") ? "" : text;
+  const extra = parseExecuteExtraToolResult(parsed);
+  if (extra) return extra.text.trim().startsWith("{") ? "" : extra.text;
   const server = normalizeMcpServerName(str(parsed.server) || str(parsed.serverName));
   const op = str(parsed.tool) || str(parsed.toolName) || str(parsed.name);
   const content = extractMcpContentText(parsed);
@@ -440,6 +461,8 @@ export function friendlyDelegateResultPreview(raw: unknown): string {
 function isDelegateResultWrapper(raw: unknown): boolean {
   const parsed = parseJsonObject(raw);
   if (!parsed) return false;
+  const extra = parseExecuteExtraToolResult(parsed);
+  if (extra) return /(?:^|_)(delegate_task|send_to_agent)$/.test(extra.toolName);
   const server = normalizeMcpServerName(str(parsed.server) || str(parsed.serverName));
   const op = str(parsed.tool) || str(parsed.toolName) || str(parsed.name);
   return server === "openclaude-memory" && (op === "delegate_task" || op === "send_to_agent");

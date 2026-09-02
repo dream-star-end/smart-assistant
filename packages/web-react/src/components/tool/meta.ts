@@ -44,6 +44,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { agentDisplayName } from "../chat/agentNames";
+import { searchExtraToolsQuery } from "../../lib/chat/extraTool";
 import { mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
 import { asArr, asStr, detectShellFileWrites, parseCodexTypeName, safeSubtaskDescription, shortPath, stripShellWrapperForDisplay } from "./format";
 
@@ -64,6 +65,10 @@ const TOOL_META: Record<string, ToolMeta> = {
   McpSearch: { icon: Search, label: "查找工具", tone: "info" },
   search_tool: { icon: Search, label: "查找工具", tone: "info" },
   use_tool: { icon: Plug, label: "调用工具", tone: "info" },
+  // CCB 延迟工具包装:SearchExtraTools 找工具;ExecuteExtraTool 正常由展示层拆成内层工具,
+  // 只有 tool_name 还没流到时才会以包装名落到这里。
+  SearchExtraTools: { icon: Search, label: "查找工具", tone: "info" },
+  ExecuteExtraTool: { icon: Plug, label: "调用工具", tone: "info" },
   TodoWrite: { icon: ListChecks, label: "任务列表", tone: "accent" },
   NotebookEdit: { icon: NotebookPen, label: "笔记本", tone: "neutral" },
   Task: { icon: Bot, label: "子任务", tone: "accent" },
@@ -570,6 +575,10 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
     case "McpSearch":
     case "search_tool":
       return asStr(input.query).slice(0, 60);
+    case "SearchExtraTools":
+      return searchExtraToolsQuery(input).slice(0, 60);
+    case "ExecuteExtraTool":
+      return asStr(input.tool_name).slice(0, 60);
     case "TodoWrite": {
       const todos = asArr(input.todos);
       const done = todos.filter(

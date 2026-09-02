@@ -504,6 +504,13 @@ function parseLastJsonlObjects(tail: string, maxRecords = 12): Record<string, un
 function toolProgressFromArgs(toolName: string, args: Record<string, unknown> | null): string {
   const name = toolName.trim() || 'Tool'
   if (!args) return name
+  // CCB deferred-tool wrapper: report the inner tool (`mcp__…__delegate_task …`)
+  // so the live activity row can classify it instead of showing "ExecuteExtraTool".
+  if (/^execute[-_]?extra[-_]?tool$/i.test(name)) {
+    const inner = textOf(args.tool_name ?? args.toolName)
+    const params = recordOf(args.params ?? args.arguments ?? args.input)
+    if (inner) return toolProgressFromArgs(inner, params)
+  }
   const filePath = textOf(args.path ?? args.file_path ?? args.filePath ?? args.targetDirectory)
   const pattern = textOf(args.pattern ?? args.query ?? args.searchTerm ?? args.globPattern)
   const command = textOf(args.command)

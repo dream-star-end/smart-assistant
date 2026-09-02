@@ -9916,3 +9916,129 @@ describe("send_to_agent exact job correlation", () => {
     expect(groups.every((group) => group._completed)).toBe(true);
   });
 });
+
+describe("CCB ExecuteExtraTool wrapper → delegate agent-group", () => {
+  const envelope = (text: string, toolName: string) =>
+    JSON.stringify({ result: [{ type: "text", text }], tool_name: toolName });
+
+  test("ExecuteExtraTool{delegate_task} live frames become an agent-group with friendly preview", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "ExecuteExtraTool",
+            blockId: "tool-eet-1",
+            inputJson: {
+              tool_name: "mcp__openclaude-memory__delegate_task",
+              params: { agentId: "auditor", goal: "审计方案" },
+            },
+          },
+        ],
+      }),
+    );
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group).toBeTruthy();
+    expect(group?._delegate).toBe(true);
+    expect(group?._delegateAgentId).toBe("auditor");
+    expect(group?.text).toBe("审计方案");
+    expect(group?._background).toBeFalsy();
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_result",
+            toolUseBlockId: "tool-eet-1",
+            output: envelope("审计通过,无 blocker。", "mcp__openclaude-memory__delegate_task"),
+          },
+        ],
+      }),
+    );
+    expect(group?._completed).toBe(true);
+    expect(group?._resultPreview).toBe("审计通过,无 blocker。");
+    expect(s.messages.filter((m) => m.role === "tool" && m.toolName === "ExecuteExtraTool")).toHaveLength(0);
+  });
+
+  test("ExecuteExtraTool{send_to_agent} running envelope keeps the group background with jobId", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "ExecuteExtraTool",
+            blockId: "tool-eet-2",
+            inputJson: {
+              tool_name: "mcp__openclaude-memory__send_to_agent",
+              params: { agentId: "research-assistant", message: "查资料" },
+            },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_result",
+            toolUseBlockId: "tool-eet-2",
+            output: envelope(
+              JSON.stringify({ status: "running", jobId: "dlgjob-eet" }),
+              "mcp__openclaude-memory__send_to_agent",
+            ),
+          },
+        ],
+      }),
+    );
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?._background).toBe(true);
+    expect(group?._completed).toBeFalsy();
+    expect(group?._delegateJobId).toBe("dlgjob-eet");
+    expect(group?._resultPreview ?? "").not.toMatch(/^\{/);
+  });
+
+  test("persisted ExecuteExtraTool{delegate_task} tool row normalizes into an agent-group; fan-out stays a tool card", () => {
+    const s = sess();
+    s.messages.push({
+      id: "t-eet-hist",
+      text: "",
+      role: "tool",
+      toolName: "ExecuteExtraTool",
+      blockId: "b-eet-hist",
+      inputJson: { tool_name: "mcp__openclaude-memory__delegate_task", params: { agentId: "main", goal: "历史委派" } },
+      output: envelope("done", "mcp__openclaude-memory__delegate_task"),
+      _completed: true,
+      ts: 1,
+    } as ChatMessage);
+    s.messages.push({
+      id: "t-eet-fanout",
+      text: "",
+      role: "tool",
+      toolName: "ExecuteExtraTool",
+      blockId: "b-eet-fanout",
+      inputJson: { tool_name: "mcp__openclaude-memory__delegate_tasks", params: { tasks: [{ agentId: "a", goal: "g" }] } },
+      output: envelope("并行委派 1 个子任务已全部返回", "mcp__openclaude-memory__delegate_tasks"),
+      _completed: true,
+      ts: 2,
+    } as ChatMessage);
+    normalizeDelegateCards(s);
+    const hist = s.messages.find((m) => m.id === "t-eet-hist");
+    expect(hist?.role).toBe("agent-group");
+    expect(hist?._delegateAgentId).toBe("main");
+    expect(hist?._resultPreview).toBe("done");
+    const fanout = s.messages.find((m) => m.id === "t-eet-fanout");
+    expect(fanout?.role).toBe("tool");
+  });
+});
