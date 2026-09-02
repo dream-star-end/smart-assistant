@@ -102,7 +102,7 @@ describe('cron continuation envelope', () => {
       },
     })
     assert.ok(payload)
-    assert.equal(payload.override.clientMessageId, 'dlgcb.dlgjob-x.1')
+    assert.equal(payload.override.clientMessageId, 'dlgcb-dlgjob-x-1')
     assert.ok(payload.override.text.endsWith('UNIQUE_SUFFIX'))
     assert.equal(payload.job.sourceUserId, 'uid-3')
     assert.equal(payload.job.projectMode, 'fixed')

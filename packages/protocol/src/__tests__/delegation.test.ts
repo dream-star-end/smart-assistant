@@ -9,20 +9,21 @@ import { describe, it } from 'node:test'
 import {
   DELEGATE_CURSOR_MCP_WAIT_MS,
   DELEGATE_CUTOVER_FREEZE_MS,
-  DELEGATE_FAILURE_CLASS_VERSION,
   DELEGATE_FAILURE_CLASSES,
+  DELEGATE_FAILURE_CLASS_VERSION,
   DELEGATE_JOB_STATES,
+  type InflightDelegateSurface,
   assertDelegateTransition,
-  cronDelegateIdempotencyKey,
   classifyNotifyLane,
+  cronDelegateIdempotencyKey,
   delegateCallbackMessageId,
   delegateNotifyId,
   failureClassFromLocalExecutionCode,
   isDelegateParentEngine,
   isDelegateTerminalState,
   isLegalDelegateTransition,
-  type InflightDelegateSurface,
 } from '../delegation.js'
+import { isClientMessageId } from '../frames.js'
 
 describe('OCV5-22 delegation protocol', () => {
   it('freezes failure_class version 1 and the owned name set', () => {
@@ -71,7 +72,11 @@ describe('OCV5-22 delegation protocol', () => {
       cronDelegateIdempotencyKey('remind-mtd9f0ng-pgki', 1767225600),
       'cron:remind-mtd9f0ng-pgki:1767225600',
     )
-    assert.equal(delegateCallbackMessageId('dlgjob-abc', 1), 'dlgcb.dlgjob-abc.1')
+    assert.equal(delegateCallbackMessageId('dlgjob-abc', 1), 'dlgcb-dlgjob-abc-1')
+    // Master /internal/v3/cron-origin-inject gates on isClientMessageId; a dotted
+    // id was rejected as invalid_payload and the callback retried forever.
+    assert.ok(isClientMessageId(delegateCallbackMessageId('dlgjob-abc', 1)))
+    assert.ok(isClientMessageId(delegateCallbackMessageId('dlgjob-rs-53149d9143e6', 12)))
     assert.equal(delegateNotifyId('dlgjob-abc', 1), 'dlgnfy.dlgjob-abc.1')
     assert.equal(classifyNotifyLane('ccb'), 'inline-push')
     assert.equal(classifyNotifyLane('codex'), 'inline-push')

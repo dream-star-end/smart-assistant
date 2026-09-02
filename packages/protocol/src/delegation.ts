@@ -171,8 +171,16 @@ export function cronDelegateIdempotencyKey(cronJobId: string, dueMinuteKey: numb
   return `cron:${cronJobId}:${dueMinuteKey}`
 }
 
+/**
+ * ResumeInject clientMessageId for a delegate callback. Must satisfy
+ * `CLIENT_MESSAGE_ID_PATTERN` (`[A-Za-z0-9_-]` only): the master's
+ * `/internal/v3/cron-origin-inject` rejects anything else as `invalid_payload`,
+ * which is why the earlier dotted `dlgcb.<job>.<epoch>` form never delivered.
+ * Job ids are `dlgjob-…` (already dash-only), so a dash separator is unambiguous.
+ */
 export function delegateCallbackMessageId(jobId: string, callbackEpoch: number): string {
-  return `dlgcb.${jobId}.${callbackEpoch}`
+  const compact = jobId.replace(/[^A-Za-z0-9_-]/g, '')
+  return `dlgcb-${compact}-${callbackEpoch}`
 }
 
 export const DELEGATE_PARENT_ENGINES = ['ccb', 'codex', 'cursor', 'grok', 'zcode'] as const
