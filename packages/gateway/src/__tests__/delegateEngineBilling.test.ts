@@ -5,7 +5,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/delegateEngineBilling.test.ts
  */
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
@@ -179,5 +179,177 @@ describe('createDelegateEngineBillingClient', () => {
     assert.deepEqual(drained.pending, [])
     await client.retryPending?.()
     assert.equal(settlePosts, 2, 'drained queue must not POST the same requestId again')
+  })
+
+  it('drains a leftover queue file on construct', async () => {
+    const queuePath = join(await mkdtemp(join(tmpdir(), 'oc-dlg-boot-')), 'queue.json')
+    const leftover = {
+      requestId: '1'.repeat(32),
+      engineSessionId: `oceng-${'a'.repeat(48)}`,
+      status: 'success' as const,
+      durationMs: 1,
+    }
+    await writeFile(
+      queuePath,
+      `${JSON.stringify({ schemaVersion: 1, pending: [leftover] })}\n`,
+    )
+    let settlePosts = 0
+    let release!: () => void
+    const sawSettle = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    createDelegateEngineBillingClient({
+      env: ENV,
+      queuePath,
+      retryMs: 10,
+      fetcher: (async (url: string) => {
+        if (new URL(url).pathname.endsWith('/settle')) {
+          settlePosts += 1
+          release()
+          return response(200, { settled: true })
+        }
+        return response(200, { ok: true })
+      }) as any,
+    })
+    await sawSettle
+    for (let i = 0; i < 40; i++) {
+      const drained = JSON.parse(await readFile(queuePath, 'utf8')) as { pending: unknown[] }
+      if (drained.pending.length === 0) {
+        assert.equal(settlePosts, 1)
+        return
+      }
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    assert.fail('startup recovery did not drain leftover pending')
+  })
+
+  it('drains pending before admit; settle failure does not block admit', async () => {
+    const queuePath = join(await mkdtemp(join(tmpdir(), 'oc-dlg-adm-')), 'queue.json')
+    const leftover = {
+      requestId: '2'.repeat(32),
+      engineSessionId: `oceng-${'a'.repeat(48)}`,
+      status: 'success' as const,
+      durationMs: 1,
+    }
+    await writeFile(
+      queuePath,
+      `${JSON.stringify({ schemaVersion: 1, pending: [leftover] })}\n`,
+    )
+    const paths: string[] = []
+    const client = createDelegateEngineBillingClient({
+      env: ENV,
+      queuePath,
+      startupRecovery: false,
+      fetcher: (async (url: string) => {
+        const path = new URL(url).pathname
+        paths.push(path)
+        if (path.endsWith('/settle')) return response(200, { settled: true })
+        return response(200, {
+          requestId: 'a'.repeat(32),
+          engineSessionId: `oceng-${'b'.repeat(48)}`,
+        })
+      }) as any,
+    })
+    await client.admit({
+      model: 'gpt-5.6-sol',
+      engine: 'codex',
+      agentId: 'auditor',
+      delegateAgentId: 'auditor',
+      sessionKey: 'agent:auditor:delegate:main:1',
+    })
+    assert.ok(paths[0]?.endsWith('/settle'), `expected settle before admit, got ${paths.join(',')}`)
+    assert.ok(paths[1]?.endsWith('/admit'))
+
+    await writeFile(
+      queuePath,
+      `${JSON.stringify({ schemaVersion: 1, pending: [leftover] })}\n`,
+    )
+    const failClient = createDelegateEngineBillingClient({
+      env: ENV,
+      queuePath,
+      startupRecovery: false,
+      fetcher: (async (url: string) => {
+        const path = new URL(url).pathname
+        if (path.endsWith('/settle')) {
+          return response(500, { error: { code: 'DELEGATE_ENGINE_BILLING_HTTP_500' } })
+        }
+        return response(200, {
+          requestId: 'a'.repeat(32),
+          engineSessionId: `oceng-${'b'.repeat(48)}`,
+        })
+      }) as any,
+    })
+    const admitted = await failClient.admit({
+      model: 'gpt-5.6-sol',
+      engine: 'codex',
+      agentId: 'auditor',
+      delegateAgentId: 'auditor',
+      sessionKey: 'agent:auditor:delegate:main:2',
+    })
+    assert.equal(admitted.requestId, 'a'.repeat(32))
+    const still = JSON.parse(await readFile(queuePath, 'utf8')) as {
+      pending: Array<{ requestId: string }>
+    }
+    assert.equal(still.pending.length, 1)
+    assert.equal(still.pending[0]?.requestId, leftover.requestId)
+  })
+
+  it('serializes concurrent settle persist and retryPending rewrite', async () => {
+    const queuePath = join(await mkdtemp(join(tmpdir(), 'oc-dlg-race-')), 'queue.json')
+    const a = {
+      requestId: 'a'.repeat(32),
+      engineSessionId: `oceng-${'a'.repeat(48)}`,
+      status: 'success' as const,
+      durationMs: 1,
+    }
+    const b = {
+      requestId: 'b'.repeat(32),
+      engineSessionId: `oceng-${'b'.repeat(48)}`,
+      status: 'success' as const,
+      durationMs: 1,
+    }
+    const c = {
+      requestId: 'c'.repeat(32),
+      engineSessionId: `oceng-${'c'.repeat(48)}`,
+      status: 'success' as const,
+      durationMs: 1,
+    }
+    const liveFailed = new Set<string>()
+    const client = createDelegateEngineBillingClient({
+      env: ENV,
+      queuePath,
+      startupRecovery: false,
+      fetcher: (async (url: string, options: { body: string }) => {
+        const path = new URL(url).pathname
+        if (!path.endsWith('/settle')) return response(200, { ok: true })
+        const id = (JSON.parse(options.body) as { requestId: string }).requestId
+        if (id === c.requestId) {
+          return response(500, { error: { code: 'DELEGATE_ENGINE_BILLING_HTTP_500' } })
+        }
+        if (!liveFailed.has(id)) {
+          liveFailed.add(id)
+          return response(500, { error: { code: 'DELEGATE_ENGINE_BILLING_HTTP_500' } })
+        }
+        return response(200, { settled: true })
+      }) as any,
+    })
+    const first = await Promise.allSettled([client.settle(a), client.settle(b)])
+    assert.equal(first.every((row) => row.status === 'rejected'), true)
+    const queued = JSON.parse(await readFile(queuePath, 'utf8')) as {
+      pending: Array<{ requestId: string }>
+    }
+    const queuedIds = new Set(queued.pending.map((row) => row.requestId))
+    assert.equal(queuedIds.has(a.requestId), true)
+    assert.equal(queuedIds.has(b.requestId), true)
+    assert.equal(queued.pending.length, 2)
+    await Promise.allSettled([client.retryPending?.() ?? Promise.resolve(), client.settle(c)])
+    const final = JSON.parse(await readFile(queuePath, 'utf8')) as {
+      pending: Array<{ requestId: string }>
+    }
+    const ids = new Set(final.pending.map((row) => row.requestId))
+    assert.equal(ids.size, final.pending.length, 'queue must not duplicate requestId')
+    assert.equal(ids.has(c.requestId), true)
+    assert.equal(ids.has(a.requestId), false)
+    assert.equal(ids.has(b.requestId), false)
   })
 })

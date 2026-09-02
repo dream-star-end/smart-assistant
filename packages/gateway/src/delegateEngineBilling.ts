@@ -153,14 +153,23 @@ export function createDelegateEngineBillingClient(args?: {
   fetcher?: typeof undiciRequest
   queuePath?: string
   retryMs?: number
+  /** Default true: drain leftover queue files after construct (C1). Tests may set false. */
+  startupRecovery?: boolean
 }): DelegateEngineBillingClient {
   const env = args?.env ?? process.env
   const fetcher = args?.fetcher ?? undiciRequest
   const queuePath =
     args?.queuePath ?? join(paths.agentDir('_platform'), 'delegate-engine-billing.json')
   const retryMs = args?.retryMs ?? 60_000
+  const startupRecovery = args?.startupRecovery !== false
   let retryTimer: NodeJS.Timeout | null = null
   let retryChain: Promise<void> = Promise.resolve()
+  // Serializes read-modify-write of the JSON queue so concurrent settle
+  // persist / successful-settle delete / retryPending rewrite cannot drop
+  // a requestId. retryPending holds the lock for the whole drain (including
+  // POSTs): a failed live settle that needs to persist waits, which is the
+  // simple-and-correct choice vs snapshot-merge.
+  let queueChain: Promise<void> = Promise.resolve()
 
   const post = async (path: string, body: unknown): Promise<Record<string, unknown>> => {
     const base = env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim().replace(/\/+$/, '')
@@ -196,17 +205,40 @@ export function createDelegateEngineBillingClient(args?: {
     return parsed
   }
 
-  const persistBilling = async (billing: DurableCodexBilling): Promise<void> => {
-    const queue = await readBillingQueue(queuePath)
-    const index = queue.pending.findIndex((row) => row.requestId === billing.requestId)
-    if (index >= 0) queue.pending[index] = billing
-    else queue.pending.push(billing)
-    await writeDurableJson(queuePath, queue)
+  const withQueueLock = async <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = queueChain.then(fn, fn)
+    queueChain = run.then(
+      () => {},
+      () => {},
+    )
+    return run
   }
+
+  const persistBilling = async (billing: DurableCodexBilling): Promise<void> =>
+    withQueueLock(async () => {
+      const queue = await readBillingQueue(queuePath)
+      const index = queue.pending.findIndex((row) => row.requestId === billing.requestId)
+      if (index >= 0) queue.pending[index] = billing
+      else queue.pending.push(billing)
+      await writeDurableJson(queuePath, queue)
+    })
+
+  const dropSettled = async (requestId: string): Promise<void> =>
+    withQueueLock(async () => {
+      const queue = await readBillingQueue(queuePath)
+      const next = queue.pending.filter((row) => row.requestId !== requestId)
+      if (next.length !== queue.pending.length) {
+        await writeDurableJson(queuePath, { schemaVersion: 1, pending: next })
+      }
+    })
 
   const client: DelegateEngineBillingClient = {
     async admit(input) {
       validateAdmitInput(input)
+      // Drain leftover paid evidence before minting a new requestId.
+      // A stuck pending must not DoS new delegates: swallow retry errors here.
+      // Admit's own POST hits the same master, so unavailability still fail-closes.
+      await drainOnce()
       const result = await post(ADMIT_PATH, {
         model: input.model,
         engine: input.engine,
@@ -235,11 +267,7 @@ export function createDelegateEngineBillingClient(args?: {
       }
       try {
         await post(SETTLE_PATH, billing)
-        const queue = await readBillingQueue(queuePath)
-        const next = queue.pending.filter((row) => row.requestId !== billing.requestId)
-        if (next.length !== queue.pending.length) {
-          await writeDurableJson(queuePath, { schemaVersion: 1, pending: next })
-        }
+        await dropSettled(billing.requestId)
       } catch (err) {
         // Same durable-boundary pattern as Auto-Dream: persist then retry.
         // UNIQUE(user_id, request_id) makes a later successful POST idempotent.
@@ -255,25 +283,27 @@ export function createDelegateEngineBillingClient(args?: {
       await post(ABANDON_PATH, { requestId })
     },
     async retryPending() {
-      const queue = await readBillingQueue(queuePath)
-      if (queue.pending.length === 0) {
-        clearRetry()
-        return
-      }
-      const remaining: DurableCodexBilling[] = []
-      for (const billing of queue.pending) {
-        try {
-          await post(SETTLE_PATH, billing)
-        } catch {
-          remaining.push(billing)
+      return withQueueLock(async () => {
+        const queue = await readBillingQueue(queuePath)
+        if (queue.pending.length === 0) {
+          clearRetry()
+          return
         }
-      }
-      await writeDurableJson(queuePath, { schemaVersion: 1, pending: remaining })
-      if (remaining.length > 0) {
-        scheduleRetry()
-        throw new Error('DELEGATE_ENGINE_BILLING_RECOVERY_PENDING')
-      }
-      clearRetry()
+        const remaining: DurableCodexBilling[] = []
+        for (const billing of queue.pending) {
+          try {
+            await post(SETTLE_PATH, billing)
+          } catch {
+            remaining.push(billing)
+          }
+        }
+        await writeDurableJson(queuePath, { schemaVersion: 1, pending: remaining })
+        if (remaining.length > 0) {
+          scheduleRetry()
+          throw new Error('DELEGATE_ENGINE_BILLING_RECOVERY_PENDING')
+        }
+        clearRetry()
+      })
     },
   }
 
@@ -294,6 +324,25 @@ export function createDelegateEngineBillingClient(args?: {
     retryTimer = null
   }
 
+  function kickRecovery(): void {
+    retryChain = retryChain
+      .catch(() => {})
+      .then(() => client.retryPending?.())
+      .catch(() => {})
+  }
+
+  async function drainOnce(): Promise<void> {
+    retryChain = retryChain
+      .catch(() => {})
+      .then(() => client.retryPending?.())
+    try {
+      await retryChain
+    } catch {
+      // Individual pending rows stay queued / scheduled; new admits still go out.
+    }
+  }
+
+  if (startupRecovery) void kickRecovery()
   return client
 }
 

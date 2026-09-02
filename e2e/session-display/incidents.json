@@ -2604,6 +2604,16 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateEngineBilling.test.ts",
+          "assertion": "drains a leftover queue file on construct"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBilling.test.ts",
+          "assertion": "serializes concurrent settle persist and retryPending rewrite"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBilling.test.ts",
           "assertion": "admits catalog engine codex/grok and skips ccb"
         },
         {
