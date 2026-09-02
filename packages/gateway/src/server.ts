@@ -370,6 +370,7 @@ import {
   makeDelegateProgressBlock,
   makeDelegateUsageProgressBlock,
   makeDelegateBlockPassthrough,
+  coalesceDelegateTranscript,
   resolveDelegateProgressRouting,
   toNestedDelegateProgressLine,
   formatDelegateParentWorkingDetail,
@@ -13075,13 +13076,19 @@ export class Gateway {
       ...(ownGoalUsageRecord ? [ownGoalUsageRecord] : []),
       ...durableGoalUsageRecords,
     ]
+    // Engines push one `text` block per streaming delta into durableTranscript
+    // (Cursor grok: one per token). Master maps `transcript` 1:1 to the team
+    // card's `childBlocks`, and the web client prefers the longer server array
+    // over its live-merged local card — so persist the merged form, matching
+    // what the live reducers already render.
+    const coalescedTranscript = coalesceDelegateTranscript(durableTranscript)
     const durableGroup: DurableAgentGroup = {
       runId: progressRunId,
       agentId: targetAgentId,
       goal,
       status,
       ...(resultSummary.length > 0 ? { resultSummary } : {}),
-      ...(durableTranscript.length > 0 ? { transcript: durableTranscript } : {}),
+      ...(coalescedTranscript.length > 0 ? { transcript: coalescedTranscript } : {}),
       ...(durableRuntimeEvents.length > 0 ? { runtimeEvents: durableRuntimeEvents } : {}),
       ...((durableEngineBillings.length > 0 || (engineBillingAdmission && !submitSettled))
         ? { engineBillings: durableEngineBillings }
