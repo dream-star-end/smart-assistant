@@ -8,6 +8,7 @@ import { describe, test } from "node:test";
 import type { AdmitUserTurnInput, AdmitUserTurnResult } from "../db/pgSessionsBackend.js";
 import {
   executeCronOriginInject,
+  lookupCronOriginSessionModel,
   resolveCronOriginAdmitModel,
   type CronOriginExecutor,
 } from "../ws/userChatBridge.js";
@@ -119,6 +120,40 @@ describe("injectCronOriginTurn stamps admit + inbound.model", () => {
     assert.equal(frames[0]!.type, "inbound.message");
     assert.equal(frames[0]!.model, "grok-build");
     assert.equal(owners[0], `cron-origin:${input.clientMessageId}`);
+  });
+
+  test("pgPool path reads only client_sessions.model_id (no tape hydration)", async () => {
+    const queries: Array<{ sql: string; params: unknown[] }> = [];
+    const pool = {
+      query: async (sql: string, params?: unknown[]) => {
+        queries.push({ sql, params: params ?? [] });
+        return { rows: [{ model_id: "grok-build" }], rowCount: 1 };
+      },
+    };
+    assert.equal(await lookupCronOriginSessionModel(pool as never, input.sessionId, "c:3"), "grok-build");
+    assert.equal(queries.length, 1);
+    assert.match(queries[0]!.sql, /^SELECT model_id FROM client_sessions WHERE/);
+    assert.doesNotMatch(queries[0]!.sql, /messages|tape/i);
+    assert.deepEqual(queries[0]!.params, [input.sessionId, "c:3"]);
+
+    const admits: AdmitUserTurnInput[] = [];
+    const result = await executeCronOriginInject({
+      input,
+      pgPool: pool as never,
+      admitUserTurn: async (admitInput) => {
+        admits.push(admitInput);
+        return fakeAdmitted(admitInput);
+      },
+      executor: () => {},
+    });
+    assert.equal(result.kind, "injected");
+    assert.equal(admits[0]!.model, "grok-build");
+    assert.equal(queries.length, 2);
+  });
+
+  test("missing/deleted session row yields model:null", async () => {
+    const pool = { query: async () => ({ rows: [], rowCount: 0 }) };
+    assert.equal(await lookupCronOriginSessionModel(pool as never, "gone", "c:3"), null);
   });
 
   test("lookup failure falls back to model:null and still injects", async () => {

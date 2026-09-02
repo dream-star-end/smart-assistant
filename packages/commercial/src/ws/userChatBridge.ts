@@ -42,7 +42,6 @@ import { randomUUID, randomBytes } from "node:crypto";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { Pool } from "pg";
 import { isCursorCredentialMember } from "../cursor/access.js";
-import { getClientSession } from "@openclaude/storage";
 
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
@@ -1552,6 +1551,26 @@ export function resolveCronOriginAdmitModel(
   return trimmed;
 }
 
+/**
+ * Cron-origin inject only needs the origin session's `model_id`. Do NOT go
+ * through `getClientSession` here: that hydrates every turn tape of the
+ * session (hundreds of MB for long-lived parents), routinely trips the 30s
+ * `statement_timeout`, and keeps the container's 15s POST waiting past its
+ * deadline — the container then retries the same id every minute and the
+ * repeated hydrations saturate the master. One indexed row read is enough.
+ */
+export async function lookupCronOriginSessionModel(
+  pool: Pick<Pool, "query">,
+  sessionId: string,
+  sessionUserId: string,
+): Promise<string | null> {
+  const res = await pool.query<{ model_id: string | null }>(
+    "SELECT model_id FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+    [sessionId, sessionUserId],
+  );
+  return res.rows[0]?.model_id ?? null;
+}
+
 /** Shared origin-session inject path used by the bridge and unit tests. */
 export async function executeCronOriginInject(opts: {
   input: CronOriginInjectInput
@@ -1577,9 +1596,8 @@ export async function executeCronOriginInject(opts: {
     if (lookupSessionModel) {
       raw = await lookupSessionModel(input.sessionId, sessionUserId);
     } else if (pgPool) {
-      // Commercial path: go through the sessions backend, not a raw six-table SQL.
-      const session = await getClientSession(input.sessionId, sessionUserId);
-      raw = session?.modelId;
+      // Single-row model read; never the tape-hydrating getClientSession.
+      raw = await lookupCronOriginSessionModel(pgPool, input.sessionId, sessionUserId);
     }
     originModel = resolveCronOriginAdmitModel(raw);
   } catch (err) {
