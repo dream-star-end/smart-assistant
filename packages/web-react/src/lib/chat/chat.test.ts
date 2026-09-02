@@ -6418,6 +6418,205 @@ describe("ChatSocket interrupted continuation", () => {
     sock.stop();
   });
 
+  function masterRecoveryTape(sessionId: string): ChatMessage[] {
+    const source = `u-${sessionId}`;
+    return [
+      {
+        id: source,
+        role: "user",
+        text: "long task",
+        ts: 1,
+        status: "error",
+        _source: "server",
+        _routing: { model: "kimi-k3-ark", teamMode: false, effortLevel: "high" },
+      },
+      {
+        id: `tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        ts: 2,
+        _source: "server",
+        _turnTapeId: `tape-${sessionId}`,
+        _clientMessageId: source,
+      },
+      {
+        id: `error-${sessionId}`,
+        role: "assistant",
+        text: "",
+        ts: 3,
+        _source: "server",
+        _turnTapeId: `tape-${sessionId}`,
+        _clientMessageId: source,
+        _errorCode: "upstream_failed",
+      },
+    ];
+  }
+
+  test("master-owned automatic recovery ack adopts the m-recover row, hides the source card and shows the unified retrying hint", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: async () => {} });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    ws.onmessage?.({
+      data: JSON.stringify({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1" }),
+    });
+    const session = sock.ensureSession("s-master-recover", "main");
+    session.messages.push(...masterRecoveryTape("s-master-recover"));
+    const oldRows = structuredClone(session.messages);
+    // Browser cedes automatic recovery to master: no browser-authored retry.
+    await (sock as any).autoRecoverTerminalTurn("s-master-recover", "u-s-master-recover");
+    await Promise.resolve();
+    expect(ws.sent.map((raw) => JSON.parse(raw).type)).not.toContain("inbound.message");
+    expect(session._sendingInFlight).toBeFalsy();
+
+    const ack = {
+      type: "outbound.ack",
+      admitted: true,
+      idempotencyKey: "recover-1",
+      peer: { id: "s-master-recover", kind: "dm" },
+      clientMessageId: "m-recover-abc123",
+      recovery: {
+        automatic: true,
+        mode: "checkpoint",
+        sourceClientMessageId: "u-s-master-recover",
+        rootClientMessageId: "u-s-master-recover",
+        attempt: 2,
+        max: 10,
+        agentId: "main",
+        model: "kimi-k3-ark",
+        displayText: "↻ 自动从断点继续",
+      },
+    };
+    ws.onmessage?.({ data: JSON.stringify(ack) });
+
+    expect(session.messages.slice(0, oldRows.length)).toEqual([
+      { ...oldRows[0], _automaticRecoveryAttempted: true },
+      ...oldRows.slice(1),
+    ]);
+    expect(session.messages).toHaveLength(oldRows.length + 1);
+    const recovery = session.messages.at(-1)!;
+    expect(recovery).toMatchObject({
+      id: "m-recover-abc123",
+      role: "user",
+      text: "↻ 自动从断点继续",
+      status: "sent",
+      _source: "server",
+      _isAutoRetry: true,
+      _recoveryOfClientMessageId: "u-s-master-recover",
+      _recoveryMode: "checkpoint",
+      _automaticRecovery: true,
+      _automaticRecoveryRootClientMessageId: "u-s-master-recover",
+      _automaticRecoveryAttempt: 2,
+      _automaticRecoveryMax: 10,
+      _routing: { model: "kimi-k3-ark", teamMode: false, effortLevel: "high" },
+    });
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._activeClientMessageId).toBe("m-recover-abc123");
+    expect(session._activeAgentId).toBe("main");
+    expect(session._turnStatus).toMatchObject({ kind: "retrying", attempt: 2, max: 10 });
+    expect(sock.getTransientNotice("s-master-recover")).toBeNull();
+
+    // Same broadcast reaching this tab twice (or REST sync already merged the
+    // row) must not duplicate the recovery row nor reset the claimed turn.
+    const startedAt = session._turnStartedAt;
+    ws.onmessage?.({ data: JSON.stringify(ack) });
+    expect(session.messages).toHaveLength(oldRows.length + 1);
+    expect(session._activeClientMessageId).toBe("m-recover-abc123");
+    expect(session._turnStartedAt).toBe(startedAt);
+
+    // A plain admitted ack for a cmid the browser does not own is still ignored.
+    const other = sock.ensureSession("s-master-plain", "main");
+    other.messages.push(...masterRecoveryTape("s-master-plain"));
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.ack",
+        admitted: true,
+        peer: { id: "s-master-plain", kind: "dm" },
+        clientMessageId: "m-recover-plain",
+      }),
+    });
+    expect(other.messages).toHaveLength(3);
+    expect(other._sendingInFlight).toBeFalsy();
+    sock.stop();
+  });
+
+  test("sync history adopts a still-running master recovery row when master owns automatic recovery", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: async () => {} });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    ws.onmessage?.({
+      data: JSON.stringify({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1" }),
+    });
+    const session = sock.ensureSession("s-master-sync", "main");
+    const rows: ChatMessage[] = [
+      ...masterRecoveryTape("s-master-sync"),
+      {
+        id: "m-recover-sync1",
+        role: "user",
+        text: "↻ 自动从断点继续",
+        ts: 4,
+        status: "sent",
+        _source: "server",
+        _isAutoRetry: true,
+        _routing: { model: "kimi-k3-ark", teamMode: false, effortLevel: "high" },
+        _recoveryOfClientMessageId: "u-s-master-sync",
+        _recoveryMode: "checkpoint",
+        _automaticRecovery: true,
+        _automaticRecoveryRootClientMessageId: "u-s-master-sync",
+        _automaticRecoveryAttempt: 3,
+        _automaticRecoveryMax: 10,
+      },
+    ];
+    sock.applyServerMessages(
+      "s-master-sync",
+      "main",
+      structuredClone(rows),
+      true,
+      undefined,
+      { serverUpdatedAt: 10 },
+    );
+    expect(session.messages.filter((m) => m.role === "user")).toHaveLength(2);
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._activeClientMessageId).toBe("m-recover-sync1");
+    expect(session._turnStatus).toMatchObject({ kind: "retrying", attempt: 3, max: 10 });
+    expect(session.messages[0]._automaticRecoveryAttempted).toBe(true);
+
+    // Once the recovery row is followed by a terminal assistant row the turn
+    // is over: history sync must not re-claim it.
+    const done = sock.ensureSession("s-master-done", "main");
+    sock.applyServerMessages(
+      "s-master-done",
+      "main",
+      [
+        ...structuredClone(rows).map((m) => ({
+          ...m,
+          id: m.id.replace("s-master-sync", "s-master-done").replace("sync1", "done1"),
+          _clientMessageId: m._clientMessageId?.replace("s-master-sync", "s-master-done"),
+          _recoveryOfClientMessageId: m._recoveryOfClientMessageId?.replace("s-master-sync", "s-master-done"),
+          _automaticRecoveryRootClientMessageId: m._automaticRecoveryRootClientMessageId?.replace("s-master-sync", "s-master-done"),
+        })),
+        {
+          id: "answer-s-master-done",
+          role: "assistant",
+          text: "final answer",
+          ts: 5,
+          _source: "server",
+          _turnTapeId: "tape-s-master-done-2",
+          _clientMessageId: "m-recover-done1",
+        },
+      ],
+      true,
+      undefined,
+      { serverUpdatedAt: 10 },
+    );
+    expect(done._sendingInFlight).toBeFalsy();
+    expect(done._turnStatus).toBeFalsy();
+    sock.stop();
+  });
+
   test("recoverySkipped removes a lineage-only child after _isAutoRetry is lost and leaves the source error visible", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket({ syncSession: async () => {} });

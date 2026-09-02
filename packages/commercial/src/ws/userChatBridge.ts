@@ -4247,6 +4247,41 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // Browser may clear its exact replay journal only after this
               // transaction-backed admission boundary, never after ws.send().
               sendAdmissionAck();
+              // Master-scheduled automatic recovery: no browser owns this
+              // `m-recover-*` cmid, so the plain ack above is ignored and the
+              // user keeps staring at the source turn's terminal red card while
+              // the retry silently runs. Broadcast the lineage to every tab so
+              // the browser can adopt this dispatch as the in-flight turn and
+              // render one「模型繁忙，正在重试中（n/10）」line instead. Old
+              // browsers ignore the extra `recovery` field.
+              if (recoveryJob && validatedRecovery?.automatic === true) {
+                const idempotencyKey = typeof frameObj.idempotencyKey === "string"
+                  ? frameObj.idempotencyKey
+                  : undefined;
+                const displayText = typeof frameContent?.displayText === "string"
+                  ? frameContent.displayText
+                  : undefined;
+                try {
+                  broadcastToUser(uid, {
+                    type: "outbound.ack",
+                    admitted: true,
+                    ...(idempotencyKey ? { idempotencyKey } : {}),
+                    peer: { id: peerId, kind: "dm" },
+                    clientMessageId,
+                    recovery: {
+                      automatic: true,
+                      mode: validatedRecovery.mode,
+                      sourceClientMessageId: validatedRecovery.sourceClientMessageId,
+                      rootClientMessageId: validatedRecovery.rootClientMessageId,
+                      attempt: validatedRecovery.attempt,
+                      max: validatedRecovery.max,
+                      agentId: admitAgentId,
+                      ...(admitModel ? { model: admitModel } : {}),
+                      ...(displayText ? { displayText } : {}),
+                    },
+                  });
+                } catch { /* sideband only; durable admission is unaffected */ }
+              }
               // R5 note:heartbeat 只在确认连接存活后才起 —— finalCleanup 已跑过的话,此刻新建的
               // interval 无人清理,会把整个 bridge 闭包钉在内存里。顺序=登记→cleaned→heartbeat。
               ensureDispatchHeartbeat();

@@ -246,6 +246,20 @@ export type AckWire = {
   idempotencyKey?: string;
   peer?: Peer;
   clientMessageId?: string;
+  /** Master-scheduled automatic recovery lineage (broadcast to every tab of
+   * the uid). The browser does not own `m-recover-*` cmids, so without this it
+   * would keep the source terminal card while the retry silently runs. */
+  recovery?: {
+    automatic: true;
+    mode: "checkpoint" | "replay";
+    sourceClientMessageId: string;
+    rootClientMessageId: string;
+    attempt: number;
+    max: number;
+    agentId?: string;
+    model?: string;
+    displayText?: string;
+  };
 };
 
 /** keepalive pong（按 id 匹配，先于一切 session handler 处理）。*/
