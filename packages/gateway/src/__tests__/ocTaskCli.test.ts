@@ -212,6 +212,17 @@ describe('planTaskCommand', () => {
       path: '/tickets/OCV5-1/comment',
       body: { body: 'done, please review' },
     })
+
+    const approve = planTaskCommand(
+      ['ticket', 'approve', 'OCV5-1', '--expected-version', '3', '--owner', 'agent:main'],
+      {},
+    )
+    assert.deepEqual(approve, {
+      kind: 'request',
+      method: 'POST',
+      path: '/tickets/OCV5-1/approve',
+      body: { expectedVersion: 3, owner: 'agent:main' },
+    })
   })
 
   test('ambient OPENCLAUDE_AGENT_ID 自动写入 claim/advance/comment 身份', () => {
@@ -235,6 +246,12 @@ describe('planTaskCommand', () => {
     assert.equal(comment.kind, 'request')
     if (comment.kind === 'request') {
       assert.equal((comment.body as Record<string, unknown>).author, 'agent:coding-assistant')
+    }
+
+    const approve = planTaskCommand(['ticket', 'approve', 'OCV5-1', '--expected-version', '3'], env)
+    assert.equal(approve.kind, 'request')
+    if (approve.kind === 'request') {
+      assert.equal((approve.body as Record<string, unknown>).owner, 'agent:coding-assistant')
     }
   })
 

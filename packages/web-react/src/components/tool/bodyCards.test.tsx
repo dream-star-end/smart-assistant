@@ -117,4 +117,20 @@ describe("TaskBody 隐藏内部指令", () => {
     expect(document.body.textContent).not.toContain("INTERNAL");
     expect(document.body.textContent).not.toContain("HOME=");
   });
+
+  test("TaskOutput 空 description → 等待后台命令 + 短 id", () => {
+    render(
+      <ToolBody
+        name="TaskOutput"
+        input={{
+          task_ids: ["call-7fc87448-146b-411e-973e-a9271d19fe32-63"],
+          description: "",
+        }}
+        tool={tool({ output: "" })}
+      />,
+    );
+    expect(screen.getByText(/等待后台命令/)).toBeInTheDocument();
+    expect(screen.getByText(/call-7fc87448/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("运行子任务");
+  });
 });

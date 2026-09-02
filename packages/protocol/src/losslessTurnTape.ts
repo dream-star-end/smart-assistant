@@ -38,6 +38,11 @@ export type TurnWaiveReason =
  * identity; this payload supplies the final usage and exact turn locators. */
 export interface DurableCodexBilling {
   requestId: string
+  /** Engine discriminator for non-journal engines. Absent = codex/grok
+   * (master settles via request_finalize_journal). 'cursor' = subscription
+   * engine whose durable evidence is settled against cursor_external_usage_audit
+   * (no journal row exists). Survives master parse / DB canonicalization. */
+  engine?: 'cursor'
   turnKey?: string
   parentTurnKey?: string
   parentSessionId?: string

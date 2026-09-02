@@ -111,4 +111,27 @@ describe('DelegateJobStore', () => {
     assert.deepEqual(store.create('b'), { error: 'capacity' })
     store.close()
   })
+
+  it('SM queued view and illegal complete without claim is ignored when fenced', () => {
+    const store = new DelegateJobStore({ sm: true, ttlMs: 60_000, now: () => 1 })
+    const created = store.create('coding-assistant', { queued: true })
+    assert.ok('jobId' in created)
+    assert.equal(store.get(created.jobId).status, 'queued')
+    const claimed = store.claimQueued(created.jobId)
+    assert.equal(claimed.ok, true)
+    if (!claimed.ok) return
+    store.complete(
+      created.jobId,
+      { httpStatus: 200, body: { ok: true } },
+      { claimToken: 'nope', fencingEpoch: claimed.fencingEpoch },
+    )
+    assert.equal(store.snapshotOf(created.jobId)?.state, 'running')
+    store.complete(
+      created.jobId,
+      { httpStatus: 200, body: { ok: true } },
+      { claimToken: claimed.claimToken, fencingEpoch: claimed.fencingEpoch },
+    )
+    assert.equal(store.snapshotOf(created.jobId)?.state, 'completed')
+    store.close()
+  })
 })

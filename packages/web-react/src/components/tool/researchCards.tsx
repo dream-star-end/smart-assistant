@@ -40,6 +40,7 @@ import {
 } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import type { EvidenceManifest } from "@openclaude/protocol/research";
+import { shouldShowDelegateRunning } from "../../lib/chat/ocMemoryCli";
 import { cn } from "../../lib/utils";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, useSignedSrc } from "../chat/media";
 import { ClaimList, CoverageBadge, GatesRow, LiteratureLibraryPanel } from "../chat/researchEvidence";
@@ -1257,7 +1258,17 @@ function PromptChip({ text }: { text: string }) {
  * 通用 oc-* 卡:任何 oc-* CLI 无专属卡 / 解析失败 / 出错时的**兜底**,保证永不回落裸终端块
  * (不泄漏 `$ command`)。用该工具 OC_TOOLS 的图标/标签 + 干净状态行 + 可选折叠详细输出。
  */
-function GenericOcCard({ cli, tool, error }: { cli: OcCli; tool: ToolLike; error?: boolean }) {
+function GenericOcCard({
+  cli,
+  tool,
+  error,
+  command,
+}: {
+  cli: OcCli;
+  tool: ToolLike;
+  error?: boolean;
+  command?: string;
+}) {
   const out = outputText(tool);
   const clean = out ? stripExternalEnvelope(stripCommandEcho(out)).trim() : "";
   let object: Record<string, unknown> | null = null;
@@ -1269,9 +1280,19 @@ function GenericOcCard({ cli, tool, error }: { cli: OcCli; tool: ToolLike; error
       /* 文本预览兜底 */
     }
   }
+  const delegateRunning =
+    !error &&
+    shouldShowDelegateRunning({
+      command,
+      output: out,
+      completed: tool._completed,
+      stripped: clean,
+    });
   return (
     <div className={cn("rounded-lg px-3 py-2.5", error ? "bg-danger-soft" : "bg-hover/70") }>
-      {object ? (
+      {delegateRunning ? (
+        <div className="text-xs text-faint">委派运行中…</div>
+      ) : object ? (
         <FriendlyObjectPreview value={object} />
       ) : clean ? (
         <div className={cn("whitespace-pre-wrap break-words text-[13px] leading-relaxed", error ? "text-danger" : "text-fg") }>
@@ -1372,10 +1393,26 @@ function MemoryCliCard({ command, tool }: { command: string; tool: ToolLike }): 
   const sub = memorySubcommand(command);
   const delegateSpec = MEMORY_DELEGATE_SPEC[sub];
   if (delegateSpec) {
-    const streams = cursorCliStreams(outputText(tool));
+    const raw = outputText(tool);
+    const streams = cursorCliStreams(raw);
     const stdout = streams.stdout.trim();
     const stderr = streams.stderr.trim();
     const body = stdout || (stderr ? firstParagraph(stderr) : "");
+    if (
+      sub === "delegate" &&
+      shouldShowDelegateRunning({
+        command,
+        output: raw,
+        completed: tool._completed,
+        stripped: body,
+      })
+    ) {
+      return (
+        <CardShell icon={delegateSpec.icon} title={delegateSpec.title}>
+          <div className="text-xs text-faint">委派运行中…</div>
+        </CardShell>
+      );
+    }
     if (!body) return null;
     return (
       <CardShell icon={delegateSpec.icon} title={delegateSpec.title}>
@@ -1687,8 +1724,10 @@ export function researchToolCard(command: string, tool: ToolLike): ReactNode | n
   if (!cli) return null;
   if (detectShellFileWrites(command)) return null;
   const key = cli as OcCli;
-  if (tool.error && !ERROR_AWARE_OC_CARDS.has(key)) return <GenericOcCard cli={key} tool={tool} error />;
+  if (tool.error && !ERROR_AWARE_OC_CARDS.has(key)) {
+    return <GenericOcCard cli={key} tool={tool} error command={command} />;
+  }
   const body = OC_BODY_CARDS[key];
   const card = body ? body(command, tool) : null;
-  return card ?? <GenericOcCard cli={key} tool={tool} error={!!tool.error} />;
+  return card ?? <GenericOcCard cli={key} tool={tool} error={!!tool.error} command={command} />;
 }

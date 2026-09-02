@@ -214,6 +214,12 @@
       "expiresAt": "2026-09-28"
     },
     {
+      "commit": "3db9f1d99",
+      "reason": "OCV5-22 EngineNotifier R0/R1 review-blocker closeout on unreleased feat/delegation-unify-notifier-20260830. Triple flag default off; never deployed; not a live user-visible incident.",
+      "approvedBy": "boss 2026-08-30 OCV5-22 审查 blocker 修复任务（未发布、不 deploy）",
+      "expiresAt": "2026-09-30"
+    },
+    {
       "commit": "11340da6d",
       "reason": "selfhost-proven port of cron heartbeat skip-webchat + HEARTBEAT_OK last-line silent. OCV5-11 boss-approved semantics; no commercial production incident id. Do not deploy.",
       "approvedBy": "dx 2026-08-28 OCV5-11: selfhost f5947b198+17103fc0c 正向搬运到商业 canonical（只合代码不发布）",

@@ -1,43 +1,27 @@
-import { History } from 'lucide-react'
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
   type BoardAgent,
   type PipelineStage,
-  RUN_STATUS_LABEL,
-  RUN_TRIGGER_LABEL,
   TICKET_PRIORITIES,
   TICKET_STATUS_LABEL,
   TICKET_TYPE_LABEL,
   type Ticket,
   type TicketComment,
   type TicketPriority,
-  type TicketRun,
   type TimelineItem,
-  formatActivityLine,
-  formatDurationMs,
-  formatRunCostUsd,
+  assigneeLabel,
   isVersionConflict,
   mergeTimelineSources,
   resolveOriginSessionId,
-  skipReasonLabel,
-  sortTimelineDesc,
+  sortTimelineAsc,
   taskboardApi,
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
 import { Markdown } from '../Markdown'
-import {
-  Badge,
-  Button,
-  EmptyState,
-  Input,
-  ListSkeleton,
-  Select,
-  Sheet,
-  TimeAgo,
-  useToast,
-} from '../ui'
+import { Button, Input, ListSkeleton, Select, Sheet, useToast } from '../ui'
+import { TicketTimeline } from './TicketTimeline'
 
 function TicketMarkdown({
   children,
@@ -54,14 +38,6 @@ function TicketMarkdown({
       <Markdown readOnly>{children}</Markdown>
     </div>
   )
-}
-
-function runStatusTone(status: string): 'success' | 'danger' | 'warning' | 'info' | 'neutral' {
-  if (status === 'succeeded') return 'success'
-  if (status === 'failed' || status === 'timeout') return 'danger'
-  if (status === 'skipped') return 'warning'
-  if (status === 'running' || status === 'queued') return 'info'
-  return 'neutral'
 }
 
 export function TicketDrawer({
@@ -175,7 +151,7 @@ export function TicketDrawer({
           })
         }
         if (cancelled) return
-        setTimeline(sortTimelineDesc(items))
+        setTimeline(sortTimelineAsc(items))
       } catch (e) {
         if (e instanceof AuthEpochStaleError || cancelled) return
         toast(taskboardErrorMessage(e, '加载单据详情失败'), 'error')
@@ -208,7 +184,7 @@ export function TicketDrawer({
       ])
       setDetail(fresh.ticket)
       setStageName(fresh.stage?.name ?? null)
-      setTimeline(sortTimelineDesc(items))
+      setTimeline(sortTimelineAsc(items))
       onTicketUpdated(fresh.ticket)
     } catch (e) {
       if (e instanceof AuthEpochStaleError) return
@@ -271,8 +247,8 @@ export function TicketDrawer({
     setComment('')
     setCommenting(true)
     setTimeline((cur) => [
-      { kind: 'comment', createdAt: optimistic.createdAt, comment: optimistic },
       ...cur,
+      { kind: 'comment', createdAt: optimistic.createdAt, comment: optimistic },
     ])
     try {
       const out = await taskboardApi.comment(auth, current.id, { body })
@@ -407,6 +383,9 @@ export function TicketDrawer({
                   {TICKET_TYPE_LABEL[current.type]} · {current.priority} ·{' '}
                   {TICKET_STATUS_LABEL[current.status]}
                   {stageName ? ` · ${stageName}` : ''}
+                  {current.approvedBy
+                    ? ` · 批准人 ${assigneeLabel(current.approvedBy) ?? current.approvedBy}`
+                    : ''}
                 </p>
               </>
             )}
@@ -487,62 +466,12 @@ export function TicketDrawer({
             </Button>
           </div>
 
-          <div
-            className="flex flex-col gap-2 border-t border-border pt-3"
-            data-testid="ticket-timeline"
-          >
-            <p className="text-meta font-medium text-muted">时间线</p>
-            {loading && timeline.length === 0 ? (
-              <ListSkeleton rows={4} variant="row" />
-            ) : timeline.length === 0 ? (
-              <EmptyState
-                icon={History}
-                title="还没有动态"
-                hint="巡检、评论和状态变更会出现在这里。"
-              />
-            ) : (
-              <ol className="flex flex-col gap-2">
-                {timeline.map((item) => (
-                  <li
-                    key={`${item.kind}-${item.kind === 'run' ? item.run.id : item.kind === 'comment' ? item.comment.id : item.activity.id}`}
-                    data-testid="ticket-timeline-item"
-                    data-kind={item.kind}
-                    className="rounded-lg border border-border bg-surface px-3 py-2"
-                  >
-                    {item.kind === 'comment' && (
-                      <div className="flex flex-col gap-1">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-caption text-muted">
-                            {item.comment.authorKind === 'human' ? '评论' : 'agent 评论'}
-                          </span>
-                          <TimeAgo
-                            value={item.comment.createdAt}
-                            className="text-caption text-faint"
-                          />
-                        </div>
-                        <TicketMarkdown testId="ticket-comment-md">{item.comment.body}</TicketMarkdown>
-                      </div>
-                    )}
-                    {item.kind === 'activity' && (
-                      <div className="flex items-start justify-between gap-2">
-                        <p className="text-body text-fg">{formatActivityLine(item.activity)}</p>
-                        <TimeAgo
-                          value={item.activity.createdAt}
-                          className="shrink-0 text-caption text-faint"
-                        />
-                      </div>
-                    )}
-                    {item.kind === 'run' && (
-                      <RunDetail
-                        run={item.run}
-                        stageName={stageById.get(item.run.stageId) ?? stageName}
-                      />
-                    )}
-                  </li>
-                ))}
-              </ol>
-            )}
-          </div>
+          <TicketTimeline
+            items={timeline}
+            loading={loading}
+            stageName={stageName}
+            stageById={stageById}
+          />
         </div>
       ) : (
         <div className="p-4">
@@ -550,51 +479,5 @@ export function TicketDrawer({
         </div>
       )}
     </Sheet>
-  )
-}
-
-function RunDetail({
-  run,
-  stageName,
-}: {
-  run: TicketRun
-  stageName: string | null | undefined
-}) {
-  const duration = formatDurationMs(run.durationMs)
-  const cost = formatRunCostUsd(run.costUsd)
-  const costText = `${cost ?? '成本未记录'}${run.costImprecise ? '（不精确）' : ''}`
-  const skip = skipReasonLabel(run.skipReason)
-  const tokens =
-    run.tokensIn == null && run.tokensOut == null
-      ? null
-      : `token ${run.tokensIn ?? '—'} / ${run.tokensOut ?? '—'}`
-  return (
-    <div className="flex flex-col gap-1.5" data-testid="ticket-run-detail">
-      <div className="flex flex-wrap items-center gap-1.5">
-        <Badge tone={runStatusTone(run.status)} size="sm">
-          {RUN_STATUS_LABEL[run.status] ?? run.status}
-        </Badge>
-        <span className="text-body text-fg">{stageName || '未知阶段'}</span>
-        <span className="text-caption text-faint">
-          {RUN_TRIGGER_LABEL[run.trigger] ?? run.trigger}
-        </span>
-        <TimeAgo value={run.createdAt} className="ml-auto text-caption text-faint" />
-      </div>
-      <p className="text-caption text-muted">
-        {[duration ?? '耗时未记录', tokens ?? '用量未记录', costText].filter(Boolean).join(' · ')}
-      </p>
-      {skip && <p className="text-body text-warning">跳过：{skip}</p>}
-      {(run.contextSha256 || run.contextVersion != null) && (
-        <p className="text-caption text-muted" data-testid="ticket-run-context">
-          快照 {run.contextSha256 ? run.contextSha256.slice(0, 12) : '—'} · 启动 v
-          {run.contextVersion ?? '—'}
-          。仅审计、不可逐字重放。
-        </p>
-      )}
-      {(run.outputMd?.trim() || run.summary) && (
-        <TicketMarkdown testId="ticket-run-md">{run.outputMd?.trim() || run.summary || ''}</TicketMarkdown>
-      )}
-      {run.error && <p className="whitespace-pre-wrap text-body text-danger">{run.error}</p>}
-    </div>
   )
 }

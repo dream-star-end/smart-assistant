@@ -26,6 +26,7 @@ import {
 } from './processGroupShutdown.js'
 import { decideEngineCwd } from './engineCwd.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
+import { projectCcbMcpAvailability } from './ccbMcpAvailability.js'
 import { buildPromptContext } from './promptSlots.js'
 import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
@@ -36,6 +37,16 @@ import { issueDelegateContextToken } from './delegateContext.js'
 export { renderCcbGoalPrompt }
 
 const runnerLog = createLogger({ module: 'subprocessRunner' })
+
+const guardedStdin = new WeakSet<object>()
+function guardStdinErrors(stdin: { on?: (event: 'error', fn: (err: Error) => void) => unknown } | null | undefined): void {
+  if (!stdin || typeof stdin.on !== 'function') return
+  if (guardedStdin.has(stdin)) return
+  guardedStdin.add(stdin)
+  stdin.on('error', () => {
+    /* swallow async EPIPE so a settled write cannot become uncaughtException */
+  })
+}
 
 const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
@@ -148,9 +159,10 @@ export interface UsageAttributionTag {
  *     基础键 ~200 字节;parentSessionId ≤128 / delegateAgentId ≤64 兜底防超预算
  *     把 delegate 请求整条 400 掉(正常值远短于此:web-* ~21 字符,agent id 常
  *     ≤32 字符)。
- *   - **codex 引擎不消费此 env**(gpt-5.5 delegate 成员走 bridge journal 计费,
- *     mode 维持 'chat',已知缺口 —— 当前 v5 组队成员与 hidden-reviewer 全部
- *     锁定 glm-5.2/CCB 路径)。
+ *   - **codex/grok 引擎不消费此 env**:engine-reported 委派改走 master 签发的
+ *     32-hex requestId + request_finalize_journal(见 handleDelegateTask admit),
+ *     adapter 据此 emit billing,codexFinalizer 按 attribution 写 mode=delegate。
+ *     本 env 仍只服务 CCB/GLM anthropicProxy 路径。
  */
 export function _buildCcbUsageAttributionEnv(
   tag: UsageAttributionTag | undefined,
@@ -486,6 +498,7 @@ async function resolveTurnRuntime(
   authority: TurnModelAuthority | undefined,
   model: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
+  expectedEngine: 'ccb' | 'cursor' = 'ccb',
 ): Promise<{ headers?: TurnUpstreamHeaders; descriptor?: CcbExecutionDescriptor }> {
   if (authority) {
     return {
@@ -503,8 +516,8 @@ async function resolveTurnRuntime(
   if (!model) throw new ModelCatalogUnavailableError('local CCB turn has no canonical model')
   const view = await client.getView()
   const row = view.resolve(view.canonicalize(model))
-  if (!row || row.engine !== 'ccb') {
-    throw new ModelCatalogUnavailableError('local CCB model missing from current projection')
+  if (!row || row.engine !== expectedEngine) {
+    throw new ModelCatalogUnavailableError(`local ${expectedEngine} model missing from current projection`)
   }
   return {
     headers: { localCatalog: await client.getToken() },
@@ -696,6 +709,25 @@ export interface SubprocessRunnerOpts {
   config: OpenClaudeConfig
   persona?: string // 注入 system prompt 的文件
   model?: string
+  /** Platform-owned per-adapter provider route. Never populated from user or
+   * catalog text. Applied after the normal provider policy so a specialized
+   * engine can bind CCB to a capability-scoped loopback relay. */
+  providerEnvOverride?: Record<string, string>
+  /** Engine expected in the signed/local catalog descriptor when CCB is used
+   * as another engine's local tool loop. Defaults to ccb. */
+  authorityEngine?: 'ccb' | 'cursor'
+  /** Platform-selected Cursor account-pool binding. It is minted by the
+   * root-owned oc-cursor selector, never from user/catalog input. The binding
+   * stays fixed for one EngineAdapter session so Sand/native transport changes
+   * are invisible to the user and cannot silently discard native history. */
+  cursorCredentialSelection?: {
+    slot: number
+    keyName: string
+    sandEnabled: boolean
+    poolGeneration: string
+    accountId: string
+    keyFingerprint: string
+  }
   permissionMode?: string
   resumeSessionId?: string // 续上之前的 CCB session
   // Per-agent overrides
@@ -727,6 +759,7 @@ export interface SubprocessRunnerOpts {
   projectId?: string
   /** Unique run-context authority. Engines must not invent runId/projectId. */
   runContext?: import('./runContextPersist.js').RunContextDescriptor
+  frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
   /** Phase 5:读 SessionRepoWorkspaceManager 的 RepoSnapshot(单进程下即权威 state)。
    *  在 start() 内调用一次,用于:
    *    1) 决定 effective addDir(ready 时切到 workspaceDir,其它情况 fall-back agentBaseDir)
@@ -810,6 +843,18 @@ export interface SdkMessage {
 export type PermissionResponse =
   | { behavior: 'allow'; updatedInput: Record<string, unknown>; toolUseID?: string }
   | { behavior: 'deny'; message: string; toolUseID?: string }
+
+/**
+ * CCB builtin tools the platform strips from every non-hermetic session.
+ *
+ * `SendMessage` only writes `~/.claude/teams/<team>/inboxes/<agent>.json`.
+ * OpenClaude never consumes that mailbox (OCV5-45). `--disallowedTools`
+ * lands in CCB `alwaysDenyRules.cliArg`, so `filterToolsByDenyRules`
+ * removes it from the model-visible pool and permission step 1a still
+ * denies it under bypassPermissions. In-process Agent/Task/teammates
+ * inherit the same permission context / filtered pool.
+ */
+export const CCB_PLATFORM_DISALLOWED_TOOLS = ['SendMessage'] as const
 
 /**
  * Inputs for `buildCcbCliArgs`. Everything that influences the subprocess's
@@ -907,7 +952,14 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
   // emits `can_use_tool` control_requests on stdout that the gateway bridges
   // to the web frontend. Required even under bypassPermissions for
   // interactive tools like AskUserQuestion.
-  if (!hermeticNoTools) args.push('--permission-prompt-tool', 'stdio')
+  //
+  // `--disallowedTools` is variadic (`<tools...>`). Place it immediately
+  // before another `--flag` so Commander cannot swallow the trailing empty
+  // prompt placeholder as a second tool name.
+  if (!hermeticNoTools) {
+    args.push('--disallowedTools', ...CCB_PLATFORM_DISALLOWED_TOOLS)
+    args.push('--permission-prompt-tool', 'stdio')
+  }
   if (hermeticNoTools) {
     args.push('--bare', '--tools', '', '--strict-mcp-config')
   }
@@ -1284,6 +1336,13 @@ export class SubprocessRunner extends EventEmitter {
         provider: hostSpawnRouting.providerId,
       })
     }
+    const finalizedProviderEnv = finalizeCcbSpawnEnv({
+      providerEnv,
+      routing: hostSpawnRouting.routing,
+    })
+    if (this.opts.providerEnvOverride) {
+      Object.assign(finalizedProviderEnv, this.opts.providerEnvOverride)
+    }
 
     let proc: ReturnType<TerminalBackend['spawn']>
     try {
@@ -1301,10 +1360,7 @@ export class SubprocessRunner extends EventEmitter {
         // 与 Bash 工具的 working directory 都跟系统提示对齐。
         subprocessCwd: learningContext.workingDir ?? effectiveAddDir,
         env: {
-          ...finalizeCcbSpawnEnv({
-            providerEnv,
-            routing: hostSpawnRouting.routing,
-          }),
+          ...finalizedProviderEnv,
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
           ...(this.delegateContextFile
@@ -1674,7 +1730,12 @@ export class SubprocessRunner extends EventEmitter {
   ): Promise<void> {
     // 先解析 + 校验凭据:抛在这里 = 一行都没写 = 本 turn 没发出去(fail-closed)。
     // 也保证下方两次 write 之间**没有 await**(不给交叠 turn 插队的窗口)。
-    const runtime = await resolveTurnRuntime(authority, this.opts.model)
+    const runtime = await resolveTurnRuntime(
+      authority,
+      this.opts.model,
+      process.env,
+      this.opts.authorityEngine ?? 'ccb',
+    )
     if (
       this.proc &&
       shouldRecycleForVisionCapability(this.spawnedExecutionDescriptor, runtime.descriptor)
@@ -1762,6 +1823,76 @@ export class SubprocessRunner extends EventEmitter {
     })
   }
 
+  /**
+   * R3 档 A: write a CCB stdin `type:user` line without starting SessionManager
+   * submit() and without destroying the process on failure. Caller (CcbAdapter
+   * / EngineNotifier) degrades to ResumeInject when this returns ok:false.
+   */
+  async writeDelegateUserMessage(
+    content: string,
+  ): Promise<{ ok: boolean; processAlive: boolean; unknown?: boolean }> {
+    const proc = this.proc
+    if (!this.isInlinePushProcLive(proc) || !proc) return { ok: false, processAlive: false }
+    const stdin = proc.stdin
+    if (!stdin || stdin.writable === false || stdin.destroyed) {
+      return { ok: false, processAlive: true }
+    }
+    guardStdinErrors(stdin)
+    const userMsg = {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: ccbStdinUserContent(content),
+      },
+      parent_tool_use_id: null,
+    }
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false
+        const timer = setTimeout(() => finish(new Error('ccb stdin write timeout')), 2_000)
+        timer.unref?.()
+        const finish = (err?: Error | null): void => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          if (typeof proc.off === 'function') proc.off('close', onClose)
+          if (typeof stdin.off === 'function') stdin.off('error', onError)
+          if (err) reject(err)
+          else resolve()
+        }
+        const onClose = (): void => finish(new Error('ccb process closed during inline push'))
+        const onError = (err: Error): void => finish(err)
+        if (typeof proc.once === 'function') proc.once('close', onClose)
+        if (typeof stdin.once === 'function') stdin.once('error', onError)
+        try {
+          // write()===false is backpressure: the chunk is already in the
+          // buffer. Wait for the callback/error; do not treat false as failure.
+          stdin.write(`${JSON.stringify(userMsg)}\n`, (err) => finish(err))
+        } catch (err) {
+          finish(err as Error)
+        }
+      })
+      if (!this.isInlinePushProcLive(proc) || this.proc !== proc) {
+        return { ok: false, processAlive: false }
+      }
+      return { ok: true, processAlive: true }
+    } catch (err) {
+      const live = this.isInlinePushProcLive(this.proc)
+      const message = err instanceof Error ? err.message : ''
+      if (live && message.includes('stdin write timeout')) {
+        return { ok: false, processAlive: true, unknown: true }
+      }
+      return { ok: false, processAlive: live }
+    }
+  }
+
+  private isInlinePushProcLive(proc: ChildProcessWithoutNullStreams | null): boolean {
+    if (!proc || this.proc !== proc || this.closed) return false
+    if (proc.killed || proc.exitCode != null) return false
+    if (proc.signalCode != null) return false
+    return true
+  }
+
   // ─── Build per-session learning-loop context files ───
   // Writes temp files under /tmp/openclaude-<sessionKey>-XXXXXX/:
   //   extra-prompt.md   — USER.md content + skill metadata digest
@@ -1838,6 +1969,30 @@ export class SubprocessRunner extends EventEmitter {
       addAvailableTools(srv.tools)
     }
 
+    // Built-in openclaude-memory is registered later into mcp-config.json, not
+    // via config.mcpServers. Resolve the launch once here so the prompt
+    // advertises its tools, then reuse the same result when writing mcp-config.
+    // Fail-soft: resolveMcpMemoryLaunch calls process.cwd() and can throw
+    // ENOENT: uv_cwd when the working directory has been deleted.
+    let mcpLaunch: ReturnType<typeof resolveMcpMemoryLaunch> = null
+    try {
+      mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
+        fallback: 'npx-tsx',
+      })
+    } catch (err) {
+      runnerLog.warn(
+        'failed to resolve built-in mcp-memory launch',
+        { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
+        err,
+      )
+    }
+    const projectedMcpTools = projectCcbMcpAvailability({
+      configuredTools: [...availableMcpTools],
+      mcpLaunch,
+      skillEvalMode: this.opts.skillEvalMode,
+      skillTrainRunId: this.opts.skillTrainRunId,
+    })
+
     // (Marketplace skills/agents are reconciled deterministically in
     //  dispatchInbound BEFORE agent resolution — earlier in the same turn than
     //  this spawn — so the hub overlay is already fresh here. mcp-memory also kicks
@@ -1852,7 +2007,7 @@ export class SubprocessRunner extends EventEmitter {
         provider: effectiveProvider,
         model: this.opts.model,
         modelSupportsVision: this.currentExecutionDescriptor?.supportsVision,
-        availableMcpTools: [...availableMcpTools],
+        availableMcpTools: projectedMcpTools,
         // 把当前 effort 传进 slot builder 决定是否注入"科研模式守则"。
         // effort 切换本就会 recycle subprocess,新 runner 启动时会重建 extra-prompt.md。
         effortLevel: this.opts.effortLevel,
@@ -1932,9 +2087,7 @@ export class SubprocessRunner extends EventEmitter {
       // is intentionally NOT shared (v3 subprocessRunner has tighter
       // OPENCLAUDE_HOME semantics — only forward when host process actually
       // set it; codex side passes empty-string default).
-      const mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
-        fallback: 'npx-tsx',
-      })
+      // mcpLaunch was resolved above so availableMcpTools matches this config.
       if (mcpLaunch) {
         const delegateContextFile = resolve(sessionDir, 'delegate-context')
         writeFileSync(

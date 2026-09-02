@@ -625,7 +625,7 @@
         "8f04bb2d"
       ],
       "proofPending": {
-        "reason": "恢复围栏的跨刷新持久化目前只有 unit 覆盖;真实浏览器/live 会话里的『失败轮不再无限自动重试』尚无活体证据。",
+        "reason": "触发链=上下文耗尽→ENGINE_ERROR→自动恢复→source_not_recoverable→REST 同步后重复排程。10-stop-turn 只证用户 Stop 终态,语义不匹配,已撤销;恢复围栏跨刷新持久化目前只有 unit 覆盖,尚无覆盖该恢复重试环的 live-e2e/browser/deploy-gate。",
         "since": "2026-07-26"
       },
       "regressions": [
@@ -722,17 +722,21 @@
       "severity": "P0",
       "symptom": "内容大半已 spill 到归档、热行只剩 anchor 的长会话首次打开即 500:首页无 cursor → beforeOrderSeq=Number.MAX_SAFE_INTEGER 被绑进 `WHERE first_seq < $3`,而该列是 integer → PG 22003 integer out of range。紧邻的 last_seq 已有 ::bigint,$3 漏了。既有 spill 用例全用 limit=10、热行即可填满,从不进归档循环,所以一直没被发现。",
       "rootFixCommit": "c5031461",
+      "coverageCommits": [
+        "eb5a0758"
+      ],
       "regressions": [
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
           "assertion": "归档会话首页 timeline 不因 MAX_SAFE_INTEGER 游标而炸(22003 回归)"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/12-archive-cursor-overflow.spec.ts",
+          "assertion": "spilled archive session first open does not 500 on MAX_SAFE_INTEGER cursor"
         }
-      ],
-      "proofPending": {
-        "reason": "回归锁目前只到 integration 层(真 PG 复现首页 22003)。活体证明需要一个内容大半已 spill、热行只剩 anchor 的长会话——e2e 的 v5-evals 账号每条用例结束即删会话,凑不出这种形态;seedPagedArchivedSession 已具备直写 PG 的能力但刻意未 seed archive chunks(见 lib/seed.ts 注释)。补活体证据 = 扩 seed 造真实 spill 后走 UI 打开该会话。",
-        "since": "2026-07-26"
-      }
+      ]
     },
     {
       "id": "INC-20260728-WEIBO-QR-HIDDEN",
@@ -1942,7 +1946,7 @@
       "occurredAt": "2026-08-28",
       "severity": "P1",
       "symptom": "CCB 长会话在用户回答 AskUserQuestion 后恢复执行时，上游以 subtype=success + result=\"Prompt is too long\" 返回上下文溢出；gateway 未把该规范诊断识别为 context_too_long，也未清除 poisoned native resume，导致进程反复崩溃、原轮被中断且继续尝试仍落回同一失败点。",
-      "rootFixCommit": "5ca165fc",
+      "rootFixCommit": "0633e7a7",
       "regressions": [
         {
           "layer": "unit",
@@ -1969,6 +1973,689 @@
           "path": "scripts/v5-runtime-release-lib.sh",
           "assertion": "oc_hotcfg_build_ccb_dist"
         }
+      ],
+      "coverageCommits": [
+        "5ca165fc"
+      ]
+    },
+    {
+      "id": "INC-20260827-PHASE-B-DEFER-VANISH",
+      "occurredAt": "2026-08-27",
+      "severity": "P1",
+      "symptom": "V5 自用实例 Phase-B 精确 assistant 到达后，`_payloadDeferred` 空壳（agent-group/tool）被当成「精确过程已到」，hasExactCompletionEvidence 与 journal owner-reset 删掉 live thinking/tool/agent-group，屏幕只剩虚线「正在读取真实 Agent 记录…」，直到 IntersectionObserver + Range 206 水合才补回。",
+      "rootFixCommit": "0002df13",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "Phase-B exact assistant + deferred agent-group keeps live agent-group"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "Phase-B exact assistant without thinking/tool keeps live thinking/tool"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "Phase-B hydrated non-deferred agent-group replaces live copy without duplicates"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "Phase-B deferred agent-group then empty live-units reset keeps live agent-group"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "Phase-B assistant without thinking/tool keeps live thinking/tool"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "Phase-B hydrated agent-group replaces live copy without duplicates"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T55 Phase-B deferred agent-group 后空 live-units reset 仍保留委派过程行"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260829-CUTOVER-SURVIVOR-STALE-WD",
+      "occurredAt": "2026-08-29",
+      "severity": "P0",
+      "symptom": "selfhost --cutover 失败后 cutover-survivor timeout 无视已恢复的 live master 健康，用布防时写死的 Aug18 工作树 unit 覆盖 master/egress，18790 宕约 11 分钟（11:22-11:33Z）。根因链：新 rel pgSessionsBackend.ts 链式 map 缺括号 → tsx TransformError 让 egress 崩溃 → saga 回滚后仍用新 dist 做 smoke → 补偿 die 未 disarm 幸存者。",
+      "rootFixCommit": "2190563c",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5SelfhostCutoverSurvivor.test.ts",
+          "assertion": "survivor alarms instead of restoring a healthy live rel"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5SelfhostCutoverSurvivor.test.ts",
+          "assertion": "this-cutover forensics is the backup dest, not stale worktree-current"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5SelfhostCutoverSurvivor.test.ts",
+          "assertion": "unified timeline stamp chain is parseable by esbuild"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-runtime-release-lib.sh",
+          "assertion": "restart_cmd 失败;摘录 egress/master 最近日志"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260831-TURNEND-ORDER-COLLAPSE",
+      "occurredAt": "2026-08-31",
+      "severity": "P1",
+      "symptom": "V5 selfhost 正常结束轮后，交错在 thinking/工具卡之间的正文段全部挤到整轮末尾，Phase-B 精确 tape 到达后恢复。内容不丢。根因是 Phase-A unpublished fallback 显式 drop live assistant，pending-exact 排除 assistant，owner reset 不认 text unit；fallback 无 ordinal 排在 tape 槽末。",
+      "rootFixCommit": "46380d50",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "Phase-A unpublished keeps interleaved live assistant fragments and omits fallback body"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "Phase-B ordinal assistants replace live fragments without duplicates"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "Phase-A unpublished then empty live-units reset keeps interleaved live assistant fragments"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "Phase-A unpublished then retired live-frames reset keeps interleaved live assistant fragments"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "Phase-B ordinal assistants replace interleaved live fragments without duplicates"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T59 Phase-A unpublished 后交错 live assistant 段仍保持 thinking/正文1/tool/正文2"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260831-CURSOR-MCP-DELEGATE-CONTEXT",
+      "occurredAt": "2026-08-31",
+      "severity": "P1",
+      "symptom": "Cursor 回合 MCP send_to_agent 报 401 async delegate requires delegate context。根因是 buildCursorMemoryMcpConfig 漏注 OPENCLAUDE_DELEGATE_CONTEXT_FILE，MCP 子进程无法带签名 context 调 /delegate。",
+      "rootFixCommit": "1bfa85be",
+      "coverageCommits": [
+        "886e4dfa",
+        "6ea6b0f0",
+        "75f9953e"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "builds an openclaude-memory-only MCP config with token-file and eval gates"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "spawned Cursor MCP config injects delegate-context file mode 0600 and cleans it up"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateHttpRouting.test.ts",
+          "assertion": "async POST without delegate context is 401; signed context is not that 401"
+        }
+      ],
+      "proofPending": {
+        "reason": "Cursor MCP context 注入无法在商业候选 HTTP 上诚实复现(/delegate 对 user JWT 403,且无法从 Playwright 读取候选容器 MCP child env)。回归锁在 spawn 单测 + handleHttp 监听器单测。",
+        "since": "2026-08-31"
+      }
+    },
+    {
+      "id": "INC-20260831-DELEGATE-MODEL-UNKNOWN",
+      "occurredAt": "2026-08-31",
+      "severity": "P1",
+      "symptom": "委派显式 --model 传未知 slug 时静默 inherit 默认模型。fail-loud 判定已存在但被 OC_MODEL_AUTHORITY flag 门住，flag 关时错误 slug 不报 DELEGATE_MODEL_UNKNOWN。",
+      "rootFixCommit": "8170334e",
+      "coverageCommits": [
+        "886e4dfa",
+        "eb5a0758"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityLocalPath.test.ts",
+          "assertion": "HTTP delegate:flag 未开 + 显式未知型号 → 400 DELEGATE_MODEL_UNKNOWN,不得 inherit"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateAsyncJobs.test.ts",
+          "assertion": "async flag-off explicit unknown model rejects at entry (no job)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateHttpRouting.test.ts",
+          "assertion": "POST unknown explicit slug returns 400 DELEGATE_MODEL_UNKNOWN without a job"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/54-ocv5-delegate-wiring.spec.ts",
+          "assertion": "explicit unknown slug returns 400 DELEGATE_MODEL_UNKNOWN without a job"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260831-VISIBLE-ORPHAN-FALSE-KILL",
+      "occurredAt": "2026-08-31",
+      "severity": "P1",
+      "symptom": "V5 selfhost 对账器 closeVisibleOrphans 在 accepted 满 15min 且 PG 无 dispatch 流帧时走 interrupt_tapeless，把 persist 积压下仍活着的引擎(已有 turn_traces.first_visible_at / thinking+text，卡在长委派)误杀成 turn interrupted (visible fallback)；且该路径不写 producer_fenced_at，僵尸 producer 继续跑。实锤 dispatch 89f18ffe-c2a8-4412-9ce8-97c69f17ef22。",
+      "rootFixCommit": "19e9d471",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "skip live engine with first_visible but zero dispatch frames (OCV5-57 89f18ffe)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "interrupt_tapeless when engine never emitted a frame even with container running"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "fence_hard_cap still fires at 6h even with first_visible and zero frames"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "scan must select first_visible_at"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "OCV5-43 hydrate-dead engine attempts interrupt fence even if CAS misses"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "OCV5-57 first_visible plus zero dispatch frames skips and does not fence"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-visible-orphan-liveness.ts",
+          "assertion": "OCV5-57: first_visible + zero dispatch frames must skip interrupt_tapeless"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "dispatch_id NULL but same-turn first_visible still matches"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "another turn first_visible does not match this dispatch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveTurnFrames.producerFence.test.ts",
+          "assertion": "register then drop persist and forward for same clientMessageId"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "interrupt fence COMMIT writes producer_fenced_at and terminal together"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/ws/__tests__/turnTraces.test.ts",
+          "assertion": "retries on failure then succeeds without blocking the caller"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "overlapping admits share a late first_visible (auditor A@1000 B@2000 vis@3000)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveTurnFrames.producerFence.test.ts",
+          "assertion": "fenced manual_reconcile still drops after registry clear (restart)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnFirstVisible.test.ts",
+          "assertion": "writes dispatch_id in the same UPDATE when provided"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "container stamped frame with fenced clientMessageId never reaches user websocket"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnFirstVisible.test.ts",
+          "assertion": "first reject then success writes first_visible and onSettled(true)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnFirstVisible.test.ts",
+          "assertion": "continuous failure is bounded to 3 attempts and onSettled(false)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnFirstVisible.test.ts",
+          "assertion": "does not permanently suppress until persist succeeds"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/ws/__tests__/turnTraces.test.ts",
+          "assertion": "insert 首次 reject 随后成功 → 最终落库且不 warn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleOrphan.test.ts",
+          "assertion": "session_id containing underscore does not LIKE-match a sibling (OCV5-57 r3 W1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "SQL prefetches turn_traces first_visible_at without LIKE or per-row subquery"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "first reject then a later visible frame writes first_visible"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "continuous failure is bounded and does not query on every frame"
+        }
+      ],
+      "coverageCommits": [
+        "3e80a4a7",
+        "568fb53b",
+        "1c7e4aae",
+        "2295a322",
+        "bfcc174e"
+      ]
+    },
+    {
+      "id": "INC-20260901-CURSOR-SAND-INFERENCE",
+      "occurredAt": "2026-09-01",
+      "severity": "P1",
+      "symptom": "V5 selfhost 将 Cursor Fable Sand 误实现为 AgentService CLI -H/global Headers hook；前者被 CLI 覆盖回 cli，后者把 sand 污染到 agent.v1.AgentService/Run 并被上游拒绝。人工抓包确认未命中 aiserver.v1.InferenceService/Stream。",
+      "rootFixCommit": "a5da8cea",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "cursor engine factory binds transport to the selected key and preserves it across concrete models"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "loopback relay hits InferenceService/Stream with Sand identity and emits Anthropic SSE"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "cold submit starts the relay and emits one external billing terminal with usage"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "tool recovery accepts XML and bounded compact control but rejects unknown tools"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "currentVariant"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "downstream abort cancels the Cursor stream and relay close does not hang"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "every concrete catalog Cursor model maps to its Sand InferenceService id"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "credential selector parses a high-numbered Sand slot and records the same binding"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorCliWrapper.test.ts",
+          "assertion": "metadata selection and a pinned native launch use the same account-pool Sand slot"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorCliWrapper.test.ts",
+          "assertion": "ten-key selection stays numeric and resolves billing to the tenth account"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "concrete model quota-family changes reselect an eligible key before the next turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorCliWrapper.test.ts",
+          "assertion": "an immutable generation keeps a bound Sand account stable after pool compaction"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "pool generation changes rebind stable account identity before reading a reused slot"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "mixed tool JSON and fabricated result is corrected to structured tool_use without leaking raw text"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "Grok Sand encodes native tool schemas and structured tool-result history"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerResumeMap.test.ts",
+          "assertion": "Cursor Sand resume ids validate against CCB JSONL instead of Cursor workspace store"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorQuota.test.ts",
+          "assertion": "stable account identity never reinterprets an old slot after pool compaction"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cursor-sand-inference.ts",
+          "assertion": "[cursor-sand-inference] PASS — Sand keys use InferenceService with native tool schemas; native Cursor stays isolated to native keys and Auto"
+        }
+      ],
+      "coverageCommits": [
+        "8a92b682",
+        "4d678dda",
+        "cfb6c7c6",
+        "968f4836",
+        "ccc58f05",
+        "a32e9bb6",
+        "38596146",
+        "5834df20",
+        "4c423197",
+        "42c51537",
+        "9cc8dedc",
+        "cd25a50a",
+        "cd7ec21d",
+        "5ff831e4",
+        "a5da8cea",
+        "e3f11e62"
+      ]
+    },
+    {
+      "id": "INC-20260902-TIMELINE-PAINT-VISION-HINT",
+      "occurredAt": "2026-09-02",
+      "severity": "P1",
+      "symptom": "V5 selfhost Web 时间线:离底后新发送的用户消息落入底 spacer 迟迟不显示;流式回合中 content-visibility:auto skipped 行的 200px 估高写回高度缓存,视口内已渲染内容变空白,滚动后才恢复。同批:catalog supports_vision=false 使 cursor 家族(Read 可原生看图)的上传图片提示把 oc-vision CLI 排在 Read 之前,agent 绕过原生识图。 反合复现:距底 80px 时追加乐观 user 行,ResizeObserver effect 在 messages.length 变化时用已位移 DOM 重捕锚点,画窗 span 校正被跳过,视口内容上跳一行间距。",
+      "rootFixCommit": "db14273e",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/timelinePaint.test.ts",
+          "assertion": "selectPaintRange absorbs tail append instead of leaving the new row in the spacer"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/timelinePaint.test.ts",
+          "assertion": "D: pin 不生效时近底 append 仍吸收 end，结果含新 user 下标 80"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/timelinePaint.test.ts",
+          "assertion": "C: sending 但用户在顶部时，远处 pin 不把画窗 union 到 lastUser"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/timelinePaint.test.ts",
+          "assertion": "skipped content-visibility rows do not enter the height cache"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/imageAttachmentHint.test.ts",
+          "assertion": "cursor-fable-5.1-high + catalog supportsVision=false → Read 第 1、CLI 第 2"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/imageAttachmentHint.test.ts",
+          "assertion": "deepseek(确定纯文本)+hasUnderstandImage → CLI 第 1、Read 第 2"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/promptSlotsDeepseekVision.test.ts",
+          "assertion": "cursor-fable-5.1-high + catalog supportsVision=false 不声称看不到图,先 Read 再 oc-vision"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T60 离底后新追加的 user 行立刻进入画窗而非落入底 spacer"
+        }
+      ],
+      "coverageCommits": [
+        "db14273e",
+        "2a38336c"
+      ]
+    },
+    {
+      "id": "INC-20260902-CCB-DEFERRED-TOOL-ADAPT",
+      "occurredAt": "2026-09-02",
+      "severity": "P1",
+      "symptom": "Fable/CCB（claude-code-best）个人版会话里 SearchExtraTools/ExecuteExtraTool 被前端渲染成裸扳手卡、delegate 不成 agent-group、mcp-memory skill_save 因 CCB 跳过 zod 校验报 reading 'trim' / tags.join is not a function；同时 CCB availableMcpTools 只取 config.mcpServers、内置 openclaude-memory 未登记，sanitizeUnavailableMcpClaims 把 user.md/SOUL/SKILLS 分工规则里的 delegate_task/delegate_tasks 等 19 个平台工具名抹成「（当前未注册）」，规则注入了但不可读，Fable 回合自己执行而不委派。",
+      "rootFixCommit": "58ae7303",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/subprocessRunnerMcpAvailability.test.ts",
+          "assertion": "CCB prompt path registers platform MCP tools before buildPromptContext"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/subprocessRunnerMcpAvailability.test.ts",
+          "assertion": "advertising the full platform MCP set does not redact tools as unregistered"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/agentEfficiencyGuard.test.ts",
+          "assertion": "recognizes delegate through mcp__ names and the CCB ExecuteExtraTool wrapper"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/mcp-memory/src/__tests__/skillSaveArgs.test.ts",
+          "assertion": "accepts `content` as an alias for body (CCB ExecuteExtraTool skips schema validation)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/mcp-memory/src/__tests__/skillSaveArgs.test.ts",
+          "assertion": "coerces comma-separated tags string instead of crashing on tags.join"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/extraTool.test.ts",
+          "assertion": "parseExecuteExtraToolResult decodes the {result:[{text}],tool_name} envelope"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/tool/meta.test.ts",
+          "assertion": "ExecuteExtraTool → 内层 MCP 工具名 + params,输出取信封 text"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "ExecuteExtraTool{delegate_task} live frames become an agent-group with friendly preview"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-ccb-mcp-availability.ts",
+          "assertion": "[ccb-mcp-availability] PASS — CCB prompt advertises built-in openclaude-memory tools; ExecuteExtraTool wrapper unwraps to inner MCP tool"
+        }
+      ],
+      "coverageCommits": [
+        "84849fd5",
+        "b70cfd0b",
+        "26eb5dc9",
+        "c0a871bf",
+        "5885ecfe",
+        "f5b267e9"
+      ]
+    },
+    {
+      "id": "INC-20260902-WEB-TASKBOARD-TIMELINE-HUD",
+      "occurredAt": "2026-09-02",
+      "severity": "P1",
+      "symptom": "任务面板切换项目固定报「此页面加载出错」；打开部分会话报「会话内容渲染失败」；刷新后对话输入框上方的任务列表 HUD 消失。",
+      "rootFixCommit": "51674b8c",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/taskboard/taskboard.test.tsx",
+          "assertion": "在两个 work 项目与 all/none 之间来回切换 ≥5 次不崩"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/taskboard/taskboard.test.tsx",
+          "assertion": "collectInboxTickets 容忍 columns.tickets 缺失"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/ocv5-70TimelineRender.test.tsx",
+          "assertion": "真实会话精简 fixture 不打穿 SessionTimelineBoundary"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/ocv5-70TimelineRender.test.tsx",
+          "assertion": "单条畸形 agent-group 只落到 MessageBoundary，邻居仍在"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/render.test.ts",
+          "assertion": "childSignature: steps 非数组或含 null 不抛"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/PinnedTaskTracker.test.tsx",
+          "assertion": "刷新后当前轮仍有未完成任务 → HUD 钉住(不依赖 sending)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/PinnedTaskTracker.test.tsx",
+          "assertion": "hydration 形态 TodoWrite(inputJson.todos) 在当前轮未完成时仍可提取"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T61 刷新后 HUD 仍钉住且畸形 agent-group 只落 MessageBoundary 邻居仍在"
+        }
+      ],
+      "coverageCommits": [
+        "51674b8c",
+        "226edfac",
+        "d18bd587"
+      ]
+    },
+    {
+      "id": "INC-20260902-DELEGATE-ENGINE-BILLING-REQUESTID",
+      "occurredAt": "2026-09-02",
+      "severity": "P1",
+      "symptom": "Codex/Grok 引擎委派子任务从不写入 usage_records.mode=delegate：adapter 只在 master 签发 32-hex requestId 时才 emit billing，handleDelegateTask 的 sessions.submit 第 6 参写死 undefined。GLM/CCB 委派走 anthropicProxy 不受影响。",
+      "rootFixCommit": "654ca01f",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
+          "assertion": "(a) codex 委派 submit 收到 32-hex requestId"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
+          "assertion": "(b) 收到 codex_billing 后 live settle 一次且带 delegate 归因"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
+          "assertion": "(c) glm 委派仍不签 requestId、不调 admit"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
+          "assertion": "(d) 委派失败时 journal 被收口"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
+          "assertion": "(d) 超时未决不 abandon；父 tape 已 drain 后迟到帧仍 live settle 一次"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBilling.test.ts",
+          "assertion": "queues a failed live settle and retries the same requestId once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBilling.test.ts",
+          "assertion": "drains a leftover queue file on construct"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBilling.test.ts",
+          "assertion": "serializes concurrent settle persist and retryPending rewrite"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBilling.test.ts",
+          "assertion": "admits catalog engine codex/grok and skips ccb"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/delegateEngineBillingRuntime.test.ts",
+          "assertion": "admits a codex delegate with source + attribution in journal ctx"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/delegateEngineBillingRuntime.test.ts",
+          "assertion": "settles with journal-owned attribution that finalizer uses for mode=delegate"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/delegateEngineBillingRuntime.test.ts",
+          "assertion": "prefers journal attribution when the billing frame disagrees"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-delegate-billing-requestid.ts",
+          "assertion": "handleDelegateTask must pass the minted requestId to sessions.submit (was undefined pre-fix)"
+        }
+      ],
+      "coverageCommits": [
+        "654ca01f",
+        "97677249",
+        "de1dd178",
+        "6c2ee090"
       ]
     },
     {
@@ -1978,7 +2665,9 @@
       "symptom": "gateway 上报的 tool-failure error_msg 被四层抹成 NULL/空串，admin 审计与 product_friction 无法定位真实失败；显式未知 --model 在 flag 关路径被映射成 HTTP 500 并 inherit 默认模型。根治：v5 只持久化 allowlist/哨兵 error_msg（≤240 code point）、三新 class 投影到 v4 other、0254 扩 CHECK+privacy_guard、未知型号 400 DELEGATE_MODEL_UNKNOWN。",
       "rootFixCommit": "2491a190",
       "coverageCommits": [
-        "1eae3d23"
+        "1eae3d23",
+        "5806c952",
+        "ec03f2b1"
       ],
       "regressions": [
         {

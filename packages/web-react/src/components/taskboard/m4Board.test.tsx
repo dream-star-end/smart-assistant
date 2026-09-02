@@ -514,7 +514,7 @@ describe('阶段拖拽排序', () => {
     vi.spyOn(taskboardApi, 'listPipelines').mockResolvedValue([pipeline])
     vi.spyOn(taskboardApi, 'getPipeline').mockResolvedValue({ pipeline, stages: [s1, s2] })
     vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([])
-    vi.spyOn(api, 'getPublicModels').mockResolvedValue([])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
     const reorderStages = vi
       .spyOn(taskboardApi, 'reorderStages')
       .mockResolvedValue({ ok: true, items: [s2, s1] })

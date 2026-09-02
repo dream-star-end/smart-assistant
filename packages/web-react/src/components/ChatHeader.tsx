@@ -3,18 +3,20 @@ import { useState } from "react";
 import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
-import { AgentAvatar } from "./AgentAvatar";
-import type { PublicModel } from "../lib/types";
+import type { LockedPublicModel, PublicModel } from "../lib/types";
 import { formatCredits } from "../lib/utils";
-import { ModelSelector, teamEngineLabel } from "./ModelSelector";
+import { AgentAvatar } from "./AgentAvatar";
+import { type LockedSelectInfo, ModelSelector, teamEngineLabel } from "./ModelSelector";
 import { Button, IconButton, Popover, PopoverContent, PopoverTrigger } from "./ui";
 
 export function ChatHeader({
   agent,
   onAgentClick,
   models,
+  lockedModels,
   selectedModelId,
   onSelectModel,
+  onLockedSelect,
   modelsLoading,
   effortSupported,
   effortActive,
@@ -37,8 +39,11 @@ export function ChatHeader({
   onAgentClick: () => void;
   /** 对话模型列表（GET /api/public/models 驱动；省略则不渲染选择器）。 */
   models?: PublicModel[];
+  /** 订阅门槛锁定行；永不并入 models。 */
+  lockedModels?: LockedPublicModel[];
   selectedModelId?: string;
   onSelectModel?: (id: string) => void;
+  onLockedSelect?: (info: LockedSelectInfo) => void;
   modelsLoading?: boolean;
   /** 当前执行模型支持的思考档位（空/省略 = 模型不暴露档位,菜单内不渲染档位区块）。 */
   effortSupported?: readonly string[];
@@ -169,8 +174,10 @@ export function ChatHeader({
       {models && onSelectModel && (
         <ModelSelector
           models={models}
+          lockedModels={lockedModels}
           selectedId={selectedModelId}
           onSelect={onSelectModel}
+          onLockedSelect={onLockedSelect}
           loading={modelsLoading}
           teamEngineActive={teamModeActive}
           effortSupported={effortSupported}

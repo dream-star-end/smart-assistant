@@ -2,11 +2,15 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import {
+  buildCronContinuationEnvelope,
   buildCronOriginResumeText,
   cronOriginClientMessageId,
   cronOriginIdempotencyKey,
+  decideCronOriginDispatchAfterPersist,
+  isCronOriginInjectAcked,
   isCronIsolatedSessionKey,
   parseOriginWebchatSessionKey,
+  resolveCronOriginInjectPayload,
 } from '../cronOriginSession.js'
 
 describe('parseOriginWebchatSessionKey', () => {
@@ -50,6 +54,87 @@ describe('buildCronOriginResumeText', () => {
     assert.match(text, /定时续跑「升级插件」/)
     assert.match(text, /确认发布完成后升级插件并短文配图/)
     assert.match(text, /带着本对话已有上下文/)
+  })
+})
+
+describe('cron continuation envelope', () => {
+  it('keeps full prompt and stamps user/project fields', () => {
+    const prompt = `${'B'.repeat(9000)}TAIL`
+    const envelope = buildCronContinuationEnvelope(
+      {
+        id: 'remind-1',
+        prompt,
+        label: '长任务',
+        sourceUserId: 'uid-3',
+        sourceSessionKey: 'agent:main:webchat:dm:p1',
+        projectMode: 'follow_session',
+      },
+      { mode: 'fixed', boardProjectId: 'board-9' },
+    )
+    assert.ok(envelope.resumeText.includes('TAIL'))
+    assert.ok(envelope.resumeText.length > 8_000)
+    assert.equal(envelope.sourceUserId, 'uid-3')
+    assert.equal(envelope.projectMode, 'fixed')
+    assert.equal(envelope.boardProjectId, 'board-9')
+    assert.equal(envelope.cronJobId, 'remind-1')
+  })
+
+  it('resolveCronOriginInjectPayload uses dlgcb id and untruncated text', () => {
+    const resumeText = `${'C'.repeat(8010)}UNIQUE_SUFFIX`
+    const payload = resolveCronOriginInjectPayload({
+      jobId: 'dlgjob-x',
+      state: 'completed',
+      parentSessionKey: 'agent:main:webchat:dm:p1',
+      parentEngine: 'cursor',
+      callback: 'cron-origin-inject',
+      callbackEpoch: 1,
+      parallelPolicy: 'all',
+      agentId: 'main',
+      resultRef: resumeText.slice(0, 8_000),
+      callbackOriginUserId: 'uid-3',
+      cronContinuation: {
+        resumeText,
+        sourceUserId: 'uid-3',
+        projectMode: 'fixed',
+        boardProjectId: 'board-9',
+        cronJobId: 'remind-1',
+        sourceSessionKey: 'agent:main:webchat:dm:p1',
+      },
+    })
+    assert.ok(payload)
+    assert.equal(payload.override.clientMessageId, 'dlgcb-dlgjob-x-1')
+    assert.ok(payload.override.text.endsWith('UNIQUE_SUFFIX'))
+    assert.equal(payload.job.sourceUserId, 'uid-3')
+    assert.equal(payload.job.projectMode, 'fixed')
+    assert.equal(payload.job.boardProjectId, 'board-9')
+  })
+})
+
+describe('cron origin inject receipts', () => {
+  it('acks delivered/skipped/abandoned and not none/pending', () => {
+    assert.equal(isCronOriginInjectAcked('delivered'), true)
+    assert.equal(isCronOriginInjectAcked('skipped_silent'), true)
+    assert.equal(isCronOriginInjectAcked('abandoned'), true)
+    assert.equal(isCronOriginInjectAcked('none'), false)
+    assert.equal(isCronOriginInjectAcked('pending'), false)
+    assert.equal(isCronOriginInjectAcked('injecting'), false)
+    assert.equal(isCronOriginInjectAcked(undefined), false)
+  })
+
+  it('already_exists is a durable ACK and does not dispatch', () => {
+    assert.equal(decideCronOriginDispatchAfterPersist({ applied: true }), 'dispatch')
+    assert.equal(
+      decideCronOriginDispatchAfterPersist({ applied: false, reason: 'already_exists' }),
+      'ack_injected',
+    )
+    assert.equal(
+      decideCronOriginDispatchAfterPersist({ applied: false, reason: 'session_deleted' }),
+      'fallback',
+    )
+    assert.equal(
+      decideCronOriginDispatchAfterPersist({ applied: false, reason: 'malformed' }),
+      'retry_persist',
+    )
   })
 })
 

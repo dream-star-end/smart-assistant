@@ -84,6 +84,20 @@ export function migrate(db: TaskboardDb): void {
     if (current < 8) {
       ensureProjectSkillLedger(db)
     }
+    if (current < 9) {
+      // v9:幂等回填 skipped run 的 finished_at(OCV5-46)。
+      db.exec(
+        `UPDATE tb_ticket_run
+            SET finished_at = COALESCE(started_at, created_at)
+          WHERE status = 'skipped' AND finished_at IS NULL`,
+      )
+    }
+    if (current < 10) {
+      // v10:积压批准履历。可空 = 尚未批准或旧行未知。禁止破坏性迁移。
+      // B2 原占 v9,与 B1 回填撞号,合入时让到 v10。
+      db.exec('ALTER TABLE tb_ticket ADD COLUMN approved_by TEXT')
+      db.exec('ALTER TABLE tb_ticket ADD COLUMN approved_at INTEGER')
+    }
     db.pragma(`user_version = ${TASKBOARD_SCHEMA_VERSION}`)
     ensureSettingsRow(db)
   })

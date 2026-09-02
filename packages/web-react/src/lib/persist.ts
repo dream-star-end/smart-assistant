@@ -35,6 +35,7 @@ import {
 } from "./chat/render";
 import { friendlyDelegateResultPreview } from "./chat/reducer";
 import { sessionTitleFromText } from "./sessionTitle";
+import { observeTimelineShadow } from "./timeline/shadowLifecycle";
 
 /** turn 终态收敛(RFC §5 M5):server 载荷自证的 turn 终态类别。 */
 export type ServerTurnTerminal = "completed" | "error" | "interrupted";
@@ -675,11 +676,12 @@ export function isIncompleteDurableToolRow(message: ChatMessage | null | undefin
   return extra._partial === true || extra.partial === true || extra._completed === false || extra.completed === false;
 }
 
-/** Exact, displayable tape process — not unpublished, not a deferred stub. */
+/** Exact, displayable tape process — not unpublished, not a deferred stub.
+ *  Segmented exact assistants count so live text fragments can be replaced. */
 export function isDisplayableExactProcessRow(message: ChatMessage): boolean {
   if (!message || isDeferredExactProcessStub(message)) return false;
   if (isIncompleteDurableToolRow(message)) return false;
-  if (!isTapeBackedAgentProcessRole(message.role) || message.role === "assistant") return false;
+  if (!isTapeBackedAgentProcessRole(message.role)) return false;
   if (message._displayDegradeReason === "records_unpublished") return false;
   if (message._timelineRecord === true) return true;
   return message._source === "server" &&
@@ -705,9 +707,10 @@ function hasDisplayableExactRole(
 }
 
 /**
- * Live tape-backed process (not assistant) that must stay visible until exact
- * tape process rows positively supersede them. `authorityRows` is the server
- * payload during merge, or the current transcript during journal reset.
+ * Live tape-backed process — including interleaved assistant fragments —
+ * that must stay visible until exact tape rows of the same role positively
+ * supersede them. `authorityRows` is the server payload during merge, or the
+ * current transcript during journal reset.
  *
  * Hits when:
  *  - the owner matches a `records_unpublished` assistant, or
@@ -715,10 +718,13 @@ function hasDisplayableExactRole(
  *    and this owner still has no displayable exact process rows, or
  *  - Phase-B already landed a non-degrade assistant, but this live row's role
  *    still has no non-deferred exact process (thinking/tool/plan/agent-group/
- *    delegate-progress/runtime-event). Deferred stubs do not count.
+ *    delegate-progress/runtime-event/assistant). Deferred stubs do not count.
  *
  * Default is false: ordinary P2 / completion replacement still drops live
  * copies once a displayable exact row of the same role is present.
+ *
+ * INC-20260831-TURNEND-ORDER-COLLAPSE: live assistant fragments are pending
+ * until a displayable exact assistant (timeline record / tape ordinal) arrives.
  */
 export function isLiveProcessPendingExactTape(
   message: ChatMessage,
@@ -727,7 +733,6 @@ export function isLiveProcessPendingExactTape(
   if (
     !message ||
     !isTapeBackedAgentProcessRole(message.role) ||
-    message.role === "assistant" ||
     message._timelineRecord === true
   ) {
     return false;
@@ -813,6 +818,67 @@ export function shouldRetainLiveProcessOnOwnerReset(
   if (typeof owner !== "string") return true;
   if (incomingProcessOwners.has(ownerRoleKey(owner, message.role))) return false;
   return !incomingProcessOwners.has(owner);
+}
+
+/** Unresolved permission prompts are user-blocking control state owned by the
+ * runtime, not replayable message blocks. An owner reset driven by the durable
+ * journal must never delete them: the journal cursor may already be past the
+ * request frame, so nothing would re-materialize the card while the engine
+ * (waitingForUserInput) waits forever. Resolved or expired cards fall back to
+ * the ordinary owner-reset rules. INC-20260903-PENDING-PERMISSION-LOST */
+export function isUnresolvedPermissionPrompt(message: ChatMessage, nowMs: number = Date.now()): boolean {
+  if (message.role !== "permission" || message._resolved === true) return false;
+  const expiresAt = (message as ChatMessage & { _askUserExpiresAt?: unknown })._askUserExpiresAt;
+  if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt <= nowMs) return false;
+  return true;
+}
+
+function isLiveAssistantFragment(message: ChatMessage): boolean {
+  return message.role === "assistant"
+    && message._source !== "server"
+    && message._timelineRecord !== true
+    && message._displayDegradeReason !== "records_unpublished";
+}
+
+/** Phase-A unpublished fallback is one concatenated visible_head blob. Keep it
+ *  visible when there are no live assistant fragments (reload / other device).
+ *  When interleaved live text is still pending exact tape, hide the blob so it
+ *  cannot pile up at the end of the turn, but keep the unpublished row in the
+ *  transcript so owner-reset pending-exact still sees Phase-A authority.
+ *  Fold usage onto the last live fragment so MetaRow/cost survive the window.
+ *  INC-20260831-TURNEND-ORDER-COLLAPSE */
+export function omitUnpublishedFallbackWhenLiveAssistantsExist(
+  rows: ChatMessage[],
+): ChatMessage[] {
+  const lastLiveByOwner = new Map<string, ChatMessage>();
+  let lastUnownedLive: ChatMessage | undefined;
+  for (const row of rows) {
+    if (!isLiveAssistantFragment(row)) continue;
+    const owner = turnOwnerId(row);
+    if (typeof owner === "string") lastLiveByOwner.set(owner, row);
+    else lastUnownedLive = row;
+  }
+  if (lastLiveByOwner.size === 0 && !lastUnownedLive) return rows;
+
+  const replace = new Map<ChatMessage, ChatMessage>();
+  for (const row of rows) {
+    if (row.role !== "assistant" || row._displayDegradeReason !== "records_unpublished") {
+      continue;
+    }
+    const owner = turnOwnerId(row);
+    const target = typeof owner === "string" ? lastLiveByOwner.get(owner) : lastUnownedLive;
+    if (!target) continue;
+    replace.set(row, {
+      ...row,
+      text: "",
+      _hideUnpublishedFallback: true,
+    });
+    if (!target.usage && row.usage && !replace.has(target)) {
+      replace.set(target, { ...target, usage: row.usage });
+    }
+  }
+  if (replace.size === 0) return rows;
+  return rows.map((row) => replace.get(row) ?? row);
 }
 
 function validHistoryOrder(value: unknown): value is number {
@@ -951,6 +1017,14 @@ export function mergeFullServerWins(
     adoptUnifiedTimeline?: boolean;
   },
 ): ChatMessage[] {
+  const shadowInput = [...server, ...local];
+  const shadowStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
+  const finishShadow = (result: ChatMessage[]): ChatMessage[] => {
+    const visible = omitUnpublishedFallbackWhenLiveAssistantsExist(result);
+    const oldMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - shadowStarted;
+    observeTimelineShadow({ entry: "full", input: shadowInput, oldOutput: visible, oldMs });
+    return visible;
+  };
   local = repairPostFinalProcessOrder(local);
   const legacyActiveRows = new Set<ChatMessage>();
   if (opts?.adoptUnifiedTimeline === true && opts.activeClientMessageId) {
@@ -999,22 +1073,6 @@ export function mergeFullServerWins(
       isLiveProcessPendingExactTape(m, server) ||
       !isSupersededLocalTurnRow(m, completedClientMessageId),
     );
-  }
-  if (unpublishedFinalOwners.size > 0) {
-    // Phase-A degrade page is not a complete tape: keep local live
-    // thinking/tool/plan, drop only the live assistant so the final can land.
-    local = local.filter((m) => {
-      const owner = turnOwnerId(m);
-      if (
-        m.role === "assistant" &&
-        m._source !== "server" &&
-        typeof owner === "string" &&
-        unpublishedFinalOwners.has(owner)
-      ) {
-        return false;
-      }
-      return true;
-    });
   }
   const serverIdsForAuthority = new Set<string>();
   for (const m of server) if (m?.id) serverIdsForAuthority.add(m.id);
@@ -1120,9 +1178,9 @@ export function mergeFullServerWins(
           isUnpublishedProcessRow(m)),
     );
   if (!tail.length && !preservedMid.length) {
-    return coalesceProcessIdentities(repairPostFinalProcessOrder(
+    return finishShadow(coalesceProcessIdentities(repairPostFinalProcessOrder(
       stableSortByTs(serverChanged ? serverMerged : server),
-    ));
+    )));
   }
   const safeByOriginal = new Map<ChatMessage, ChatMessage>();
   for (const m of [...preservedMid, ...tail]) safeByOriginal.set(m, sanitizePreservedLocalRow(m));
@@ -1133,9 +1191,9 @@ export function mergeFullServerWins(
   );
   if (!hasDurableOrderAxis) {
     // 兼容尚无 `_orderSeq` 的旧 server 快照：沿用 server→mid→tail 插入序，再按 ts 排列。
-    return coalesceProcessIdentities(repairPostFinalProcessOrder(
+    return finishShadow(coalesceProcessIdentities(repairPostFinalProcessOrder(
       stableSortByTs([...serverMerged, ...safePreservedMid, ...safeTail]),
-    ));
+    )));
   }
   // 中段 client-owned 行若在拼接时离开本地原槽，会错误继承 server 尾行的排序锚点。
   // 一方面按原 local 插入序重建槽位；另一方面保留一次性 anchor override，明确冻结其
@@ -1180,9 +1238,9 @@ export function mergeFullServerWins(
       if (m?.id) emittedServerIds.add(m.id);
     }
   }
-  return coalesceProcessIdentities(repairPostFinalProcessOrder(
+  return finishShadow(coalesceProcessIdentities(repairPostFinalProcessOrder(
     stableSortByTs(inLocalOrder, anchorOverrides),
-  ));
+  )));
 }
 
 /**
@@ -1200,8 +1258,16 @@ export function applyServerIncremental(
     activeClientMessageId?: string;
   },
 ): ChatMessage[] {
+  const shadowInput = [...local, ...incoming];
+  const shadowStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
+  const finishShadow = (result: ChatMessage[]): ChatMessage[] => {
+    const visible = omitUnpublishedFallbackWhenLiveAssistantsExist(result);
+    const oldMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - shadowStarted;
+    observeTimelineShadow({ entry: "incremental", input: shadowInput, oldOutput: visible, oldMs });
+    return visible;
+  };
   local = repairPostFinalProcessOrder(local);
-  if (!incoming.length) return local;
+  if (!incoming.length) return finishShadow(local);
   if (
     completedClientMessageId &&
     incoming.some(
@@ -1234,14 +1300,14 @@ export function applyServerIncremental(
   );
   // 债A：增量带回的 server 团队骨架行,若本地富卡已拥有同 run → 丢弃(local-wins,同 full 合并)。
   incoming = dropServerTeamSkeletonsOwnedLocally(incoming, local);
-  if (!incoming.length) return local;
+  if (!incoming.length) return finishShadow(local);
   const byId = new Map<string, ChatMessage>();
   for (const m of incoming) if (m?.id) byId.set(m.id, m);
   const merged = local.map((m) => (m?.id && byId.has(m.id) ? mergeLocalClientFields(byId.get(m.id)!, m) : m));
   const seen = new Set<string>();
   for (const m of local) if (m?.id) seen.add(m.id);
   for (const m of incoming) if (m?.id && !seen.has(m.id)) merged.push(m);
-  return repairPostFinalProcessOrder(stableSortByTs(merged));
+  return finishShadow(repairPostFinalProcessOrder(stableSortByTs(merged)));
 }
 
 /**

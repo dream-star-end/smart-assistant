@@ -263,6 +263,9 @@ function parseEngineBillingValue(value: unknown, path: string): DurableCodexBill
   if (value.status !== "success" && value.status !== "error") {
     throw new Error(`${prefix}.status is invalid`);
   }
+  if (value.engine !== undefined && value.engine !== "cursor") {
+    throw new Error(`${prefix}.engine is invalid`);
+  }
   if (value.terminalCode !== undefined &&
       value.terminalCode !== "USER_CANCELLED" && value.terminalCode !== "CODEX_ERROR") {
     throw new Error(`${prefix}.terminalCode is invalid`);

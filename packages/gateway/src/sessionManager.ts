@@ -34,7 +34,13 @@ import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
 import { decideEngineCwd } from './engineCwd.js'
-import { cursorResumeStoreExists, relocateCursorResumeStore, usableCursorResumeId } from './engine/cursorAdapter.js'
+import {
+  cursorResumeStoreExists,
+  cursorSandResumeInnerId,
+  isCursorSandResumeId,
+  relocateCursorResumeStore,
+  usableCursorResumeId,
+} from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
 import type {
   AutomaticRetryState,
@@ -781,6 +787,7 @@ export interface AgentSession {
   /** projectId + contextVersion + assetsRevision + manifest hashes. */
   contextFingerprint?: string
   runContext?: import('./runContextPersist.js').RunContextDescriptor
+  frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
   /**
    * 直接父会话键。仅 delegate 子会话在创建时物化(handleDelegateTask 传入已校验的
    * 直接父 sessionKey);webchat 根会话为 undefined。用于委派进度**沿父链向上追溯**到
@@ -2962,6 +2969,34 @@ export class SessionManager {
       this._saveResumeMap()
       return undefined
     }
+    const sandCcbId = tag === 'cursor' ? cursorSandResumeInnerId(id) : undefined
+    if (sandCcbId) {
+      if (this._ccbJsonlExists(sandCcbId)) return id
+      log.warn('resume-map Sand CCB entry points to missing JSONL — dropping silently', {
+        sessionKey,
+        resumeId: id,
+      })
+      this._resumeMap.delete(sessionKey)
+      this._resumeMapTimestamps.delete(sessionKey)
+      this._resumeMapProvider.delete(sessionKey)
+      this._resumeMapLastCost.delete(sessionKey)
+      this._resumeMapCostImprecise.delete(sessionKey)
+      this._saveResumeMap()
+      return undefined
+    }
+    if (tag === 'cursor' && isCursorSandResumeId(id)) {
+      log.warn('resume-map Sand CCB entry is malformed — dropping silently', {
+        sessionKey,
+        resumeId: id,
+      })
+      this._resumeMap.delete(sessionKey)
+      this._resumeMapTimestamps.delete(sessionKey)
+      this._resumeMapProvider.delete(sessionKey)
+      this._resumeMapLastCost.delete(sessionKey)
+      this._resumeMapCostImprecise.delete(sessionKey)
+      this._saveResumeMap()
+      return undefined
+    }
     if (tag === 'cursor' && workspacePath && !cursorResumeStoreExists(workspacePath, id)) {
       // Do not drop the map: spawn cwd is the resume authority, and a
       // recomputed overlay can hash to a different chats/ dir than the live
@@ -3325,6 +3360,7 @@ export class SessionManager {
     contextFingerprint?: string
     assetsRevision?: number
     runContext?: import('./runContextPersist.js').RunContextDescriptor
+    frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
     /**
      * 直接父会话键(仅 delegate 子会话传入,已由 handleDelegateTask 经 _resolveDelegateParent
      * 校验存在于内存 + channel 合法 + sourceAgent 匹配)。物化到 AgentSession.parentSessionKey,
@@ -3649,6 +3685,7 @@ export class SessionManager {
       sessionId: repoSessionId,
       projectId: opts.projectId ?? undefined,
       runContext: opts.runContext,
+      frozenProjectContext: opts.frozenProjectContext,
       getRepoSnapshot: this._getRepoSnapshot,
       workload: opts.workload,
       skillTrainRunId: opts.skillTrainRunId,
@@ -3673,6 +3710,7 @@ export class SessionManager {
         opts.contextFingerprint ??
         (await computeSessionContextFingerprint(opts.projectId, opts.assetsRevision)),
       runContext: opts.runContext,
+      frozenProjectContext: opts.frozenProjectContext,
       repoSessionId,
       title: opts.title ?? 'New conversation',
       // delegate 子会话的直接父指针(webchat/普通会话为 undefined)。物化父链使委派进度
@@ -4493,12 +4531,18 @@ export class SessionManager {
         })
       }
       const spawnCwd = this._cursorWorkspacePathForSession(session)
+      const liveNativeId = session.runner.nativeSessionId
+      const liveSandCcbId = session.providerTag === 'cursor'
+        ? cursorSandResumeInnerId(liveNativeId)
+        : undefined
       const usableCursorId = session.providerTag === 'cursor'
-        ? usableCursorResumeId({
-            workspacePath: spawnCwd,
-            liveId: session.runner.nativeSessionId,
-            mappedId: this._resumeMap.get(session.sessionKey),
-          })
+        ? liveSandCcbId && this._ccbJsonlExists(liveSandCcbId)
+          ? liveNativeId ?? undefined
+          : usableCursorResumeId({
+              workspacePath: spawnCwd,
+              liveId: liveNativeId,
+              mappedId: this._resumeMap.get(session.sessionKey),
+            })
         : undefined
       let providerResumeId = usableCursorId ?? this._resumeIdFor(
         session.sessionKey,
@@ -6698,7 +6742,9 @@ export class SessionManager {
                         terminalOverride?.errorCode ??
                         (result.errorKind === 'auth'
                           ? 'AUTH_ERROR'
-                          : _tapeErrorCodeForGenericFailure(result.errorDetail)),
+                          : (result.errorClass && result.errorClass !== 'unknown'
+                              ? result.errorClass
+                              : _tapeErrorCodeForGenericFailure(result.errorDetail))),
                       errorDetail:
                         terminalOverride?.reason ??
                         result.errorDetail ??

@@ -1,0 +1,10 @@
+{
+  "schema": true,
+  "flavor": "commercial",
+  "sourceCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "builder": "deploy-v5.sh",
+  "expectedHosts": ["kl-mirror", "ser135234097086"],
+  "expectedRoots": ["/opt/openclaude/openclaude-v5", "/opt/openclaude/openclaude-v5-b"],
+  "expectedDbNames": ["openclaude"],
+  "guardGeneration": 1
+}

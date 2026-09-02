@@ -324,12 +324,52 @@ export async function handleTaskGet(
         `originSessionKey: ${ticket.originSessionKey ?? '—'}`,
         `body:\n${ticket.body ?? ''}`,
         `comments:\n${commentBlock}`,
-        ticket.status === 'backlog' ? '⚠ backlog 未批准,不许认领。' : '',
+        ticket.status === 'backlog'
+          ? '⚠ backlog 未批准,不许认领。当前要做这张单时用 task_approve 显式批准,不要批量自动批准。'
+          : '',
       ]
         .filter(Boolean)
         .join('\n'),
     )
   } catch (err: any) {
     return toolError(`读取任务单失败: ${err?.message ?? String(err)}`)
+  }
+}
+
+export interface TaskApproveArgs {
+  id: string
+  expectedVersion: number
+}
+
+export async function handleTaskApprove(
+  args: TaskApproveArgs,
+  env: NodeJS.ProcessEnv = process.env,
+  fetchImpl: typeof fetch = fetch,
+): Promise<TaskToolResult> {
+  if (!args.id?.trim()) return toolError('id 必填(用面板返回的 identifier 或 uuid)')
+  if (!Number.isInteger(args.expectedVersion)) return toolError('expectedVersion 必填(整数)')
+  const { base, headers } = gatewayBoardBase(env)
+  try {
+    const res = await fetchImpl(`${base}/tickets/${encodeURIComponent(args.id)}/approve`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        expectedVersion: args.expectedVersion,
+        owner: currentAgentRef(env),
+      }),
+    })
+    const data = await readJson(res)
+    if (res.status === 409) {
+      return toolError(
+        `版本冲突(409): ${formatApiError(res, data)}。请 task_get 重读后只重试一次,不要抢 lease。`,
+      )
+    }
+    if (!res.ok) return toolError(`批准任务单失败: ${formatApiError(res, data)}`)
+    const ticket = data.ticket ?? data
+    return toolOk(
+      `✅ 已批准 \`${ticket?.identifier ?? args.id}\` → status=\`${ticket?.status ?? 'ready'}\` v${ticket?.version ?? '?'} 批准人=${ticket?.approvedBy ?? currentAgentRef(env)}`,
+    )
+  } catch (err: any) {
+    return toolError(`批准任务单失败: ${err?.message ?? String(err)}`)
   }
 }

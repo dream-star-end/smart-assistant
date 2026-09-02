@@ -26,7 +26,7 @@ test('leftover send_to_agent intents become one terminal notice and are removed'
       delivered.push(intent.jobId)
       return true
     }, env)
-    assert.deepEqual(summary, { recovered: 1, retained: 0, malformed: 0 })
+    assert.deepEqual(summary, { recovered: 1, retained: 0, malformed: 0, skippedShadow: 0 })
     assert.deepEqual(delivered, ['dlgjob-one'])
     assert.deepEqual(await readdir(dir), [])
   } finally {
@@ -48,7 +48,7 @@ test('failed terminal notice remains durable for the next boot', async () => {
     }, env)
     await writeFile(join(dir, 'dlgjob-bad.json'), '{broken')
     const summary = await recoverInterruptedSendToAgentIntents(async () => false, env)
-    assert.deepEqual(summary, { recovered: 0, retained: 1, malformed: 1 })
+    assert.deepEqual(summary, { recovered: 0, retained: 1, malformed: 1, skippedShadow: 0 })
     assert.deepEqual(await readdir(dir), ['dlgjob-two.json'])
   } finally {
     await rm(dir, { recursive: true, force: true })

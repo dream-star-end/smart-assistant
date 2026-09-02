@@ -1137,7 +1137,20 @@ export const OutboundCodexBilling = Type.Object({
 export type OutboundCodexBilling = Static<typeof OutboundCodexBilling>
 
 /** Internal, non-chargeable audit terminal for user-subscription engines. */
-export const OutboundExternalEngineBilling = Type.Object({
+const CursorStablePoolIdentity = Type.Union([
+  Type.Object({
+    cursorAccountId: Type.String({ pattern: '^[1-9][0-9]*$' }),
+    cursorPoolGeneration: Type.String({ pattern: '^gen-[0-9a-f]{24}$' }),
+    cursorKeyFingerprint: Type.String({ pattern: '^[0-9a-f]{16}$' }),
+  }),
+  Type.Object({
+    cursorAccountId: Type.Optional(Type.Never()),
+    cursorPoolGeneration: Type.Optional(Type.Never()),
+    cursorKeyFingerprint: Type.Optional(Type.Never()),
+  }),
+])
+
+export const OutboundExternalEngineBilling = Type.Intersect([Type.Object({
   type: Type.Literal('outbound.external_engine_billing'),
   sessionKey: Type.String(), channel: Type.String(), peer: Peer,
   requestId: Type.String({ pattern: '^[0-9a-f]{32}$' }),
@@ -1160,7 +1173,7 @@ export const OutboundExternalEngineBilling = Type.Object({
     ]),
   }))),
   traceId: Type.Optional(TraceIdString),
-})
+}), CursorStablePoolIdentity])
 export type OutboundExternalEngineBilling = Static<typeof OutboundExternalEngineBilling>
 
 // ───────────────────────────────────────────────

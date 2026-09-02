@@ -2110,6 +2110,57 @@ describe('lossless Codex JSON-RPC side channel', () => {
   })
 })
 
+describe('stderr PATH_NOT_ALLOWED line buffer', () => {
+  const denied =
+    'rmcp::transport::worker: HTTP 404: {"error":{"code":"PATH_NOT_ALLOWED","message":"codex relay path not allowed"}}\n'
+
+  it('split chunks do not refresh activity; 3 complete denied lines abort patrol session', async () => {
+    const runner = new CodexAppServerRunner({
+      sessionKey: 'agent:stage-triage:taskboard:ticket:stage:run',
+      agentId: 'stage-triage',
+      cwd: await mkdtemp(join(tmpdir(), 'codex-aps-stderr-')),
+    })
+    const t0 = runner.lastActivityAt
+    await new Promise((r) => setTimeout(r, 5))
+    const mid = denied.indexOf('PATH_NOT_ALLOWED') + 8
+    runner.feedStderrForTests(denied.slice(0, mid))
+    assert.equal(runner.lastActivityAt, t0)
+    runner.feedStderrForTests(denied.slice(mid))
+    assert.equal(runner.lastActivityAt, t0)
+    let aborted = false
+    ;(runner as any).currentTurnCompleter = {
+      resolve: () => {},
+      reject: (err: Error) => {
+        aborted = err.name === 'CodexRelayPathDeniedError'
+      },
+    }
+    const origShutdown = runner.shutdown.bind(runner)
+    ;(runner as any).shutdown = async () => {}
+    runner.feedStderrForTests(denied)
+    runner.feedStderrForTests(denied)
+    assert.equal(aborted, true)
+    await origShutdown()
+  })
+
+  it('webchat session never aborts on PATH_NOT_ALLOWED burst', async () => {
+    const runner = new CodexAppServerRunner({
+      sessionKey: 'agent:main:webchat:dm:abc',
+      agentId: 'main',
+      cwd: await mkdtemp(join(tmpdir(), 'codex-aps-web-')),
+    })
+    let aborted = false
+    ;(runner as any).currentTurnCompleter = {
+      resolve: () => {},
+      reject: () => {
+        aborted = true
+      },
+    }
+    runner.feedStderrForTests(denied + denied + denied)
+    assert.equal(aborted, false)
+    await runner.shutdown()
+  })
+})
+
 describe('SubprocessRunner interface parity', () => {
   it('exposes lastActivityAt + effortLevel + isRunning', async () => {
     const h = await makeHarness()

@@ -289,6 +289,11 @@ export interface EngineExternalBillingEvent {
   }
   /** 1-based oc-cursor slot results for passive quota-class learning. */
   cursorSlotResults?: Array<{ slot: number; result: 'ok' | 'fail_auth' | 'fail_quota' | 'fail' }>
+  /** Stable root-authored account identity from an immutable pool generation.
+   * Slot-only attribution remains as backward-compatible fallback. */
+  cursorAccountId?: string
+  cursorPoolGeneration?: string
+  cursorKeyFingerprint?: string
 }
 
 /**

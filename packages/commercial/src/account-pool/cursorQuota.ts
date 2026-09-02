@@ -4,6 +4,8 @@
  * We never probe Other Models on purpose; we only learn from real turns.
  */
 
+import { cursorCredentialModelFamily } from "@openclaude/protocol";
+
 export const CURSOR_QUOTA_CLASSES = ["unknown", "other_ok", "cursor_only"] as const;
 export type CursorQuotaClass = (typeof CURSOR_QUOTA_CLASSES)[number];
 
@@ -15,16 +17,12 @@ export type CursorModelFamily = "cursor_models" | "other_models";
 
 export const CURSOR_QUOTA_CLASS_FILE = ".quota-class";
 
-const CURSOR_MODELS_RE = /^(cursor-grok-4\.[56]|composer-2\.5)(-|$)/;
-
 export function isCursorQuotaClass(value: unknown): value is CursorQuotaClass {
   return typeof value === "string" && (CURSOR_QUOTA_CLASSES as readonly string[]).includes(value);
 }
 
 export function cursorModelFamily(model: string): CursorModelFamily {
-  const trimmed = model.trim();
-  if (!trimmed || trimmed === "auto") return "cursor_models";
-  return CURSOR_MODELS_RE.test(trimmed) ? "cursor_models" : "other_models";
+  return cursorCredentialModelFamily(model);
 }
 
 export function parseCursorSlotResults(text: string): CursorSlotResult[] {
@@ -121,6 +119,27 @@ export function planCursorQuotaUpdates(
     planned.set(String(row.id), { id: row.id, from: row.cursor_quota_class, to: next });
   }
   return [...planned.values()];
+}
+
+/** Stable-generation path: slot numbers belong to the historical generation,
+ * so use the already verified account identity and only the terminal result
+ * kind. Never reinterpret an old slot against the current compacted pool. */
+export function planStableCursorQuotaUpdate(
+  rows: Array<{ id: bigint; cursor_quota_class: CursorQuotaClass }>,
+  stableAccountId: bigint,
+  results: CursorSlotResult[],
+  family: CursorModelFamily,
+  terminalCode: string | null | undefined,
+): Array<{ id: bigint; from: CursorQuotaClass; to: CursorQuotaClass }> {
+  const row = rows.find((candidate) => candidate.id === stableAccountId);
+  const terminal = results[results.length - 1];
+  if (!row || !terminal) return [];
+  return planCursorQuotaUpdates(
+    [row],
+    [{ slot: 1, result: terminal.result }],
+    family,
+    terminalCode,
+  );
 }
 
 export function renderQuotaClassSidecar(slots: Array<{ name: string; quotaClass: CursorQuotaClass }>): string {

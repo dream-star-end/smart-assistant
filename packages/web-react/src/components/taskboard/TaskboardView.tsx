@@ -11,6 +11,8 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import type { BoardViewParam } from '../../hooks/useAppRoute'
 import { useMdViewport } from '../../hooks/useMdViewport'
+import { useProjectScope } from '../../hooks/useProjectScope'
+import { UNBOUND_BOARD_COPY, boardWorkQuery } from '../../lib/projectScope'
 import {
   TICKET_TYPES,
   TICKET_TYPE_LABEL,
@@ -20,8 +22,6 @@ import {
   taskboardApi,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
-import { useProjectScope } from '../../hooks/useProjectScope'
-import { UNBOUND_BOARD_COPY, boardWorkQuery } from '../../lib/projectScope'
 import {
   Button,
   DropdownMenu,
@@ -94,7 +94,8 @@ export function TaskboardView({
   const lockedProjectId = 'projectId' in workQuery ? workQuery.projectId : null
   const board = useTaskboard(auth, Boolean(lockedProjectId), ticketTypeFromUrl, lockedProjectId)
   useEffect(() => {
-    if (lockedProjectId && lockedProjectId !== board.projectId) void board.selectProject(lockedProjectId)
+    if (lockedProjectId && lockedProjectId !== board.projectId)
+      void board.selectProject(lockedProjectId)
   }, [lockedProjectId, board.projectId, board.selectProject])
   const toast = useToast()
   const [confirm, confirmEl] = useConfirm()
@@ -120,11 +121,11 @@ export function TaskboardView({
     const match = (t: Ticket) => t.identifier === ticketId || t.id === ticketId
     const fromList = board.tickets?.find(match)
     if (fromList) return fromList
-    const fromBacklogTab = board.backlogTickets.find(match)
+    const fromBacklogTab = board.backlogTickets?.find(match)
     if (fromBacklogTab) return fromBacklogTab
-    const fromBacklog = board.board?.backlog?.tickets.find(match)
+    const fromBacklog = board.board?.backlog?.tickets?.find(match)
     if (fromBacklog) return fromBacklog
-    return board.board?.columns.flatMap((c) => c.tickets).find(match) ?? null
+    return (board.board?.columns ?? []).flatMap((c) => c.tickets ?? []).find(match) ?? null
   }, [board.backlogTickets, board.board, board.tickets, ticketId])
 
   const openTicket = (ticket: Ticket) => onOpenTicket(ticket.identifier)
@@ -224,32 +225,6 @@ export function TaskboardView({
     return false
   }
 
-  const promoteTicket = async (ticket: Ticket) => {
-    const fromMoves = ticket.allowedMoves?.find((m) => m.action === 'promote')?.toStageId
-    if (fromMoves) {
-      await runMove(ticket, fromMoves)
-      return
-    }
-    if (ticket.type === board.board?.ticketType) {
-      const first = board.board.columns[0]?.stage.id
-      if (first) {
-        await runMove(ticket, first)
-        return
-      }
-    }
-    try {
-      const snap = await taskboardApi.getProjectBoard(auth, ticket.projectId, ticket.type)
-      const first = snap.columns[0]?.stage.id
-      if (!first) {
-        toast('这条流水线还没有阶段，无法开工', 'error')
-        return
-      }
-      await runMove(ticket, first)
-    } catch {
-      toast('无法解析开工目标站', 'error')
-    }
-  }
-
   type ActionTone = 'secondary' | 'danger' | 'ghost'
   type TicketAction = {
     label: string
@@ -263,9 +238,9 @@ export function TaskboardView({
     const items: TicketAction[] = []
     if (ticket.status === 'backlog') {
       items.push({
-        label: '批准开工',
-        testId: 'ticket-ready',
-        onClick: () => void promoteTicket(ticket),
+        label: '批准',
+        testId: 'ticket-approve',
+        onClick: () => void board.runAction(ticket, { kind: 'approve' }),
         variant: 'secondary',
         kind: 'primary',
       })
@@ -437,8 +412,9 @@ export function TaskboardView({
   }
 
   const visibleBacklogTickets = useMemo(() => {
-    if (!backlogTypeFilter) return board.backlogTickets
-    return board.backlogTickets.filter((t) => t.type === backlogTypeFilter)
+    const rows = board.backlogTickets ?? []
+    if (!backlogTypeFilter) return rows
+    return rows.filter((t) => t.type === backlogTypeFilter)
   }, [backlogTypeFilter, board.backlogTickets])
 
   const submitCreate = async () => {
@@ -611,7 +587,10 @@ export function TaskboardView({
           data-testid="taskboard-responsive-toolbar"
           className="order-3 flex w-full min-w-0 items-center gap-2 md:order-2 md:ml-auto md:w-auto"
         >
-          <ProjectScopeSelect variant="work" className="min-w-0 flex-1 md:w-56 md:max-w-[16rem] md:flex-none" />
+          <ProjectScopeSelect
+            variant="work"
+            className="min-w-0 flex-1 md:w-56 md:max-w-[16rem] md:flex-none"
+          />
           <ProjectSettings
             auth={auth}
             current={board.projects?.find((p) => p.id === board.projectId) ?? null}
@@ -745,7 +724,7 @@ export function TaskboardView({
           title={UNBOUND_BOARD_COPY}
           hint="看板只绑定工作项目。请选择 all/none 以外的工作项目，或把当前会话绑定到看板。"
         />
-      ) : !board.projectId ? (
+      ) : !board.projectId || (lockedProjectId && board.projectId !== lockedProjectId && !board.board) ? (
         <EmptyState
           icon={Kanban}
           title="还没有项目"
@@ -844,7 +823,7 @@ export function TaskboardView({
         open={!!ticketId}
         desktop={desktop}
         agents={board.agents}
-        stages={board.board?.columns.map((c) => c.stage) ?? []}
+        stages={(board.board?.columns ?? []).map((c) => c.stage).filter(Boolean)}
         sessionIds={sessionIds}
         startEditing={reviseOpen}
         actions={selected ? renderActions(selected, desktop ? 'full' : 'board') : null}

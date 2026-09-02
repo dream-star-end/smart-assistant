@@ -70,6 +70,7 @@ import { codexBindingAffinityKey, dockerContainerOwnedByChannel, getRuntimeChann
 import { rootLogger } from "../logging/logger.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
 import { SupervisorError } from "./types.js";
+import { assertFlavorIdentity, FlavorIdentityError } from "../flavor/assertFlavor.js";
 import { getCodexTokenSnapshot } from "../account-pool/store.js";
 import { pickCodexAccountForBinding } from "../account-pool/scheduler.js";
 import { buildCodexRelayLocalBaseUrl, readCodexUpstreamBaseUrl } from "../http/internalCodexRelay.js";
@@ -521,6 +522,39 @@ export function buildCodexRelayContainerEnv(
 
 function appendCodexRelayEnv(env: string[]): void {
   env.push(...buildCodexRelayContainerEnv(process.env));
+}
+
+/** Master→container passthrough of gateway delegate concurrency knobs
+ *  and OC_DELEGATE feature flags.
+ *  Only inject when the master process env value matches /^[0-9]+$/
+ *  (feature flags use "1"/"0" through the same numeric gate);
+ *  omit the key otherwise so the container gateway falls back to defaults. */
+export const DELEGATE_KNOB_CONTAINER_ENV_KEYS = [
+  "OPENCLAUDE_DELEGATE_MAX_CONCURRENT",
+  "OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS",
+  "OPENCLAUDE_DELEGATE_MAX_PER_PARENT",
+  "OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN",
+  "OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN",
+  "OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS",
+  "OC_DELEGATE_SM",
+  "OC_DELEGATE_DURABLE",
+  "OC_DELEGATE_NOTIFIER",
+  "OC_DELEGATE_CUTOVER",
+  "OC_DELEGATE_INFLIGHT_SURFACE",
+  "OC_DELEGATE_INLINE_PUSH_CCB",
+  "OC_DELEGATE_INLINE_PUSH_CODEX",
+  "OC_DELEGATE_CURSOR_MCP_WAIT",
+] as const;
+
+export function buildDelegateKnobContainerEnv(
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const out: string[] = [];
+  for (const key of DELEGATE_KNOB_CONTAINER_ENV_KEYS) {
+    const value = sourceEnv[key];
+    if (value && /^[0-9]+$/.test(value)) out.push(`${key}=${value}`);
+  }
+  return out;
 }
 
 /**
@@ -2766,6 +2800,7 @@ export async function provisionV3Container(
       const value = process.env[key];
       if (value && /^[0-9]+$/.test(value)) env.push(`${key}=${value}`);
     }
+    env.push(...buildDelegateKnobContainerEnv(process.env));
 
     // 市场技能使用信号门控透传:与 tool-failure 相反 = **默认开**(低敏产品质量信号,
     // 只记 slug/agent/trace 不记内容)。master 未显式设 → 恒注入 '1';仅当 master 显式
@@ -2818,6 +2853,14 @@ export async function provisionV3Container(
       // decideLocalExecution / CODEX_BILLING_GUARD 与 master 同源读它,不允许两侧各自
       // 解释。master 未设 -> 不注入,容器行为与生产完全一致(fail-closed 不变)。
       if (process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1") {
+        try {
+          assertFlavorIdentity();
+        } catch (err) {
+          if (err instanceof FlavorIdentityError) {
+            throw new SupervisorError("InvalidArgument", `selfhost engine-local-turn env refused: ${err.message}`);
+          }
+          throw err;
+        }
         env.push("OC_SELFHOST_ENGINE_LOCAL_TURNS=1");
       }
       // 次级模型(WebFetch/WebSearch 等隐藏调用走的 ANTHROPIC_SMALL_FAST_MODEL)由 **master

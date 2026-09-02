@@ -382,6 +382,23 @@ export type ChatMessage = {
   _timelineUnitKey?: string;
   /** Exact logical order inside one immutable physical tape record. */
   _timelineLogicalOrdinal?: number;
+  /** Server-authored lifecycle stamp (OCV5-21). Absent on legacy rows. */
+  _lifecycle?:
+    | "optimistic_local"
+    | "live_open"
+    | "live_closed"
+    | "phase_a"
+    | "exact_deferred"
+    | "exact_displayable"
+    | "retired";
+  /** Packed packEpoch() safe-int. Independent of reducerEpoch. */
+  _lifecycleEpoch?: number;
+  /** `${owner}\\0${role}\\0${processKey}` */
+  _timelineIdentity?: string;
+  /** Stable per-role process identity. Empty only for the narrative assistant slot. */
+  _timelineProcessKey?: string;
+  /** Live stream generation for packEpoch streamGen. */
+  _timelineStreamGen?: number;
   /** Client page identity used only by virtualization/scroll anchoring. */
   _historyPageKey?: string;
   /** Opaque cursor that produced this older in-memory page. */
@@ -389,6 +406,10 @@ export type ChatMessage = {
   /** Per-tape display degrade (visible_head/anchor fallback). */
   _displayDegraded?: boolean;
   _displayDegradeReason?: string;
+  /** Phase-A unpublished fallback kept as pending-exact authority but not
+   *  rendered: live assistant fragments already occupy the visible text slots.
+   *  INC-20260831-TURNEND-ORDER-COLLAPSE */
+  _hideUnpublishedFallback?: boolean;
   /** Sanitizer placeholder for a structurally invalid history/socket row. */
   _corruptPlaceholder?: boolean;
   _corruptReason?: "missing-id" | "malformed";
@@ -488,6 +509,8 @@ export type ChatMessage = {
   summary?: string;
   /** 已被某 agent-group adopt（待移除）。*/
   _adoptedInto?: string;
+  /** 已从时间线摘掉的父工具 blockId（如 oc-memory delegate-wait），其 tool_result 不得再新建卡。*/
+  _swallowedToolBlockIds?: string[];
 
   // ── plan ──
   explanation?: string;
@@ -807,9 +830,14 @@ export function rebuildIndexes(sess: ChatSession): void {
       typeof m._turnTapeProcessLoadedFrom === "string"
     ) continue;
     if (m.blockId) sess._blockIdToMsgId.set(m.blockId, m.id);
-    if (m.role === "agent-group" && m.blockId) {
-      sess._agentGroups.set(m.blockId, m.id);
-      if (Array.isArray(m.childBlocks)) {
+    if (m.role === "agent-group") {
+      if (m.blockId) sess._agentGroups.set(m.blockId, m.id);
+      if (Array.isArray(m._swallowedToolBlockIds)) {
+        for (const id of m._swallowedToolBlockIds) {
+          if (id) sess._blockIdToMsgId.set(id, m.id);
+        }
+      }
+      if (m.blockId && Array.isArray(m.childBlocks)) {
         for (const ch of m.childBlocks) {
           if (ch && ch.kind === "tool_use" && ch.blockId && /^Agent$/i.test(ch.toolName || "")) {
             sess._agentGroups.set(ch.blockId, m.id);

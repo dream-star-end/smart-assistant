@@ -1347,7 +1347,7 @@ function AgentPublishForm({
     setCapState("loading");
     api
       .getPublicModels(auth)
-      .then((ms) => {
+      .then(({ models: ms }) => {
         if (!alive) return;
         setModels(ms);
         setModelsState("ready");

@@ -1,0 +1,24 @@
+[Unit]
+Description=OpenClaude v5 selfhost Cursor-only HTTPS egress
+After=network-online.target docker.service openclaude-v5-selfhost-hostnet.service
+Wants=network-online.target
+Requires=docker.service openclaude-v5-selfhost-hostnet.service
+ConditionPathExists=/etc/sing-box/openclaude-cursor-egress-proxy.json
+
+[Service]
+Type=simple
+# Skip-if-missing: live may not yet have assert-flavor.sh when this unit is
+# installed pre-cutover. Helper present + identity fail is still fail-closed.
+# systemd expands $$ -> $ so bash sees "$h".
+ExecStartPre=/usr/bin/bash -c 'h=/opt/openclaude/openclaude-v5-selfhost-live/scripts/lib/assert-flavor.sh; if [ -x "$$h" ]; then exec "$$h" allows selfhost-unit-install --effector /opt/openclaude/openclaude-v5-selfhost-live/scripts/lib; fi; echo "[WARN] flavor helper missing on live; skip cursor-proxy flavor check" >&2'
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/openclaude-cursor-egress-proxy.json
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

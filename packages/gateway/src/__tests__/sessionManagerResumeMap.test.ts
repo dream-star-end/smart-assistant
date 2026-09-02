@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -26,6 +26,7 @@ type ResumeMapInternals = {
   _loadResumeMap: () => void
   _saveResumeMap: () => void
   awaitResumeMapFlush: () => Promise<void>
+  _resumeIdFor: (sessionKey: string, wantProvider: string, workspacePath?: string) => string | undefined
 }
 
 test('CCB resume map rebuilds obsolete history contexts while preserving current CCB and Codex resumes', async () => {
@@ -68,6 +69,51 @@ test('CCB resume map rebuilds obsolete history contexts while preserving current
     assert.equal(saved['codex-unversioned']?.historyContextVersion, undefined)
     assert.equal(saved['codex-unversioned']?.provider, 'codex')
   } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Cursor Sand resume ids validate against CCB JSONL instead of Cursor workspace store', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-sand-resume-map-'))
+  const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+  try {
+    const configDir = join(dir, 'claude-config')
+    const projectDir = join(configDir, 'projects', 'sand-project')
+    mkdirSync(projectDir, { recursive: true })
+    const innerId = '463989eb-daba-4a13-a32d-4ef00261ea08'
+    const prefixedId = `sand-ccb:${innerId}`
+    writeFileSync(join(projectDir, `${innerId}.jsonl`), '{"type":"user"}\n')
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    const manager = new SessionManager(makeConfigStub())
+    const internals = manager as unknown as ResumeMapInternals
+    internals.resumeMapPath = join(dir, 'resume-map.json')
+    internals._resumeMap.set('sand-session', prefixedId)
+    internals._resumeMapProvider.set('sand-session', 'cursor')
+
+    assert.equal(
+      internals._resumeIdFor('sand-session', 'cursor', join(dir, 'workspace-with-no-cursor-store')),
+      prefixedId,
+    )
+
+    rmSync(join(projectDir, `${innerId}.jsonl`))
+    assert.equal(
+      internals._resumeIdFor('sand-session', 'cursor', join(dir, 'workspace-with-no-cursor-store')),
+      undefined,
+    )
+    assert.equal(internals._resumeMap.has('sand-session'), false)
+
+    internals._resumeMap.set('malformed-sand-session', 'sand-ccb:../../escape')
+    internals._resumeMapProvider.set('malformed-sand-session', 'cursor')
+    assert.equal(
+      internals._resumeIdFor('malformed-sand-session', 'cursor', join(dir, 'workspace')),
+      undefined,
+    )
+    assert.equal(internals._resumeMap.has('malformed-sand-session'), false)
+    await internals.awaitResumeMapFlush()
+  } finally {
+    if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
     rmSync(dir, { recursive: true, force: true })
   }
 })

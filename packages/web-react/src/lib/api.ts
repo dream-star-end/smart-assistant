@@ -67,6 +67,7 @@ import type {
   PaymentPlan,
   Preferences,
   PublicConfig,
+  LockedPublicModel,
   PublicModel,
   PatchSessionMetaInput,
   SessionBatchInput,
@@ -1471,15 +1472,21 @@ export const api = {
   /**
    * 公开模型列表（GET /api/public/models）。可选带 Bearer（登录用户走
    * visibility/grants 视图）；每项含后端投影的 supported_efforts 能力。
+   * `locked_models` 是订阅门槛挡住的可见行，缺省/非数组时按 []，永不并入 models。
    */
-  async getPublicModels(a?: AuthSession): Promise<PublicModel[]> {
+  async getPublicModels(
+    a?: AuthSession,
+  ): Promise<{ models: PublicModel[]; lockedModels: LockedPublicModel[] }> {
     const run = (t?: string) =>
       fetch("/api/public/models", {
         headers: t ? bearerHeaders(t) : { Accept: "application/json" },
       });
     const res = a ? await callWithRefresh(a, (t) => run(t)) : await run();
-    const b = await jsonOrThrow<{ models: PublicModel[] }>(res);
-    return b.models || [];
+    const b = await jsonOrThrow<{ models?: PublicModel[]; locked_models?: LockedPublicModel[] }>(res);
+    return {
+      models: Array.isArray(b.models) ? b.models : [],
+      lockedModels: Array.isArray(b.locked_models) ? b.locked_models : [],
+    };
   },
 
   // ── 对话前置（Agent 订阅 / 容器） ────────────────────────────────────

@@ -39,6 +39,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   writeFileSync,
 } from 'node:fs'
@@ -78,12 +79,26 @@ import {
 } from './server.js'
 import { localExecutionRejectCode, type LocalExecutionRejectCode } from './modelCatalogClient.js'
 import {
+  claimCronDelegateExecution,
+  enqueueCronOccurrenceJob,
+  isCronDelegateClaimDenied,
+  settleCronDelegateJob,
+} from './delegateCronIdempotency.js'
+import { cronDelegateIdempotencyKey, delegateNotifyId } from '@openclaude/protocol'
+import { isDelegateNotifierEffective, isDelegateSmEnabled } from './delegateSmFlag.js'
+import type { DelegateJobStore } from './delegateJobs.js'
+import {
   postCronIndex,
   readV3CronIndexConfig,
   type CronIndexPayload,
 } from './v3CronIndexPush.js'
 import type { V3WechatOutboundConfig } from './v3WechatOutbound.js'
 import {
+  buildCronContinuationEnvelope,
+  buildCronOriginResumeText,
+  CRON_CALLBACK_LEGACY_LANE,
+  isLegacyCronOriginLane,
+  parseOriginWebchatSessionKey,
   type CronOriginFireResult,
 } from './cronOriginSession.js'
 
@@ -118,6 +133,11 @@ interface CronOccurrenceRecord {
   tapeEvents: number
   outputFile?: string
   updatedAt: number
+  /** OCV5-22 B3: projection of the unique Enqueue job. */
+  delegateJobId?: string
+  /** Fence captured at claimQueued for this occurrence; never re-read from the live job. */
+  delegateClaimToken?: string
+  delegateFencingEpoch?: number
 }
 
 export function classifyCronOccurrenceRecovery(
@@ -733,6 +753,42 @@ async function saveRetryState(map: Map<string, CronRetryEntry>): Promise<void> {
   await rename(tmp, RETRY_STATE_FILE)
 }
 
+/**
+ * Stage 1: fill occurrence.delegateJobId from the durable job UNIQUE key when
+ * Enqueue succeeded and the JSON projection crashed before write.
+ */
+export function backfillCronOccurrenceDelegateJobs(
+  store: DelegateJobStore,
+  occurrenceDir: string = OCCURRENCE_DIR,
+): number {
+  if (!existsSync(occurrenceDir)) return 0
+  let n = 0
+  let names: string[]
+  try {
+    names = readdirSync(occurrenceDir)
+  } catch {
+    return 0
+  }
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const filePath = join(occurrenceDir, name)
+    let row: CronOccurrenceRecord
+    try {
+      row = JSON.parse(readFileSync(filePath, 'utf8')) as CronOccurrenceRecord
+    } catch {
+      continue
+    }
+    if (row?.version !== 1 || row.delegateJobId) continue
+    if (typeof row.jobId !== 'string' || !Number.isSafeInteger(row.dueMinuteKey)) continue
+    const key = cronDelegateIdempotencyKey(row.jobId, row.dueMinuteKey)
+    const job = store.findByIdempotencyKey(key)
+    if (!job) continue
+    durableJsonWrite(filePath, { ...row, delegateJobId: job.id, updatedAt: Date.now() })
+    n += 1
+  }
+  return n
+}
+
 async function loadOccurrenceRecords(): Promise<CronOccurrenceRecord[]> {
   if (!existsSync(OCCURRENCE_DIR)) return []
   const records: CronOccurrenceRecord[] = []
@@ -1070,6 +1126,8 @@ export function frequencyQuotaError(
 }
 
 export class CronScheduler {
+  /** OCV5-22 phase 0: optional shared job store. Unset = today's occurrence JSON is still the execution right. */
+  public delegateJobs?: DelegateJobStore
   private timer: NodeJS.Timeout | null = null
   private bootTickTimer: NodeJS.Timeout | null = null
   private stopped = false
@@ -1398,6 +1456,8 @@ export class CronScheduler {
             dueMinuteKey,
             deliveryId: existingRetry?.deliveryId ?? cronDeliveryId(job.id, dueMinuteKey),
           }
+          let cronClaimFence: { claimToken: string; fencingEpoch: number } | undefined
+          let cronDelegateJobId: string | undefined
           let outcome: CronRunOutcome
           if (existingRetry?.phase === 'delivery') {
             outcome = await this.retryArchivedDelivery(job, existingRetry)
@@ -1419,6 +1479,25 @@ export class CronScheduler {
               try {
                 outcome = await this.runJob(job, agent, {
                   consumeOccurrence: async () => {
+                    let delegateJobId: string | undefined
+                    if (isDelegateSmEnabled() && this.delegateJobs) {
+                      const origin =
+                        job.resume === 'origin-session'
+                          ? parseOriginWebchatSessionKey(job.sourceSessionKey || '')
+                          : null
+                      const enq = enqueueCronOccurrenceJob(this.delegateJobs, {
+                        cronJobId: job.id,
+                        dueMinuteKey,
+                        agentId: agent.id,
+                        sessionKey: `agent:${agent.id}:cron:dm:${job.id}:${deliveryContext.deliveryId}`,
+                        parentSessionKey: origin?.sessionKey,
+                        callbackOriginSessionKey: origin?.sessionKey,
+                        callbackOriginUserId: job.sourceUserId,
+                      })
+                      if ('error' in enq) throw new Error('cron delegate enqueue capacity')
+                      delegateJobId = enq.jobId
+                      cronDelegateJobId = enq.jobId
+                    }
                     const record: CronOccurrenceRecord = {
                       version: 1,
                       deliveryId: deliveryContext.deliveryId,
@@ -1429,6 +1508,7 @@ export class CronScheduler {
                       sessionKey: `agent:${agent.id}:cron:dm:${job.id}:${deliveryContext.deliveryId}`,
                       tapeEvents: 0,
                       updatedAt: Date.now(),
+                      ...(delegateJobId ? { delegateJobId } : {}),
                     }
                     const existing = readOccurrence(deliveryContext.deliveryId)
                     if (!existing) writeOccurrence(record)
@@ -1460,7 +1540,21 @@ export class CronScheduler {
                       (record?.state === 'executing' || record?.state === 'completed')
                     if (!record || (record.state !== 'prepared' && !tolerated))
                       throw new Error('cron occurrence is not prepared')
-                    if (record.state === 'prepared') {
+                    if (isDelegateSmEnabled() && this.delegateJobs && record?.delegateJobId) {
+                      const claimed = claimCronDelegateExecution(
+                        this.delegateJobs,
+                        record.delegateJobId,
+                      )
+                      cronClaimFence = claimed
+                      const latest = readOccurrence(deliveryContext.deliveryId) ?? record
+                      writeOccurrence({
+                        ...latest,
+                        state: latest.state === 'prepared' ? 'executing' : latest.state,
+                        delegateClaimToken: claimed.claimToken,
+                        delegateFencingEpoch: claimed.fencingEpoch,
+                        updatedAt: Date.now(),
+                      })
+                    } else if (record.state === 'prepared') {
                       writeOccurrence({ ...record, state: 'executing', updatedAt: Date.now() })
                     }
                     if (!isOrigin) {
@@ -1601,6 +1695,54 @@ export class CronScheduler {
               settleOccurrence(occurrence, 'execution_terminal')
             }
           }
+          const occ = readOccurrence(deliveryContext.deliveryId)
+          const dlg =
+            occ?.delegateJobId ??
+            cronDelegateJobId ??
+            (isDelegateSmEnabled() && this.delegateJobs
+              ? this.delegateJobs.findByIdempotencyKey(
+                  cronDelegateIdempotencyKey(job.id, dueMinuteKey),
+                )?.id
+              : undefined)
+          if (isDelegateSmEnabled() && this.delegateJobs && dlg) {
+            const silent = outcome.kind === 'silent'
+            const failed = outcome.kind === 'terminal_failure'
+            let fence = cronClaimFence
+            if (
+              !fence &&
+              occ?.delegateClaimToken &&
+              occ.delegateFencingEpoch !== undefined
+            ) {
+              fence = {
+                claimToken: occ.delegateClaimToken,
+                fencingEpoch: occ.delegateFencingEpoch,
+              }
+            }
+            const originCompleted =
+              !failed && !silent && job.resume === 'origin-session'
+            const extraBody = originCompleted
+              ? {
+                  output: buildCronOriginResumeText(job),
+                  cronContinuation: buildCronContinuationEnvelope(job, {
+                    mode: job.projectMode,
+                    boardProjectId: job.boardProjectId,
+                  }),
+                }
+              : undefined
+            const snapAtSettle = this.delegateJobs.snapshotOf(dlg)
+            const keepDelivered =
+              snapAtSettle?.callbackState === 'delivered' ||
+              (originCompleted && !isDelegateNotifierEffective())
+            settleCronDelegateJob(
+              this.delegateJobs,
+              dlg,
+              failed ? 'failed' : silent ? 'skipped_silent' : 'completed',
+              fence,
+              failed && 'code' in outcome ? String(outcome.code) : undefined,
+              extraBody,
+              keepDelivered ? { callbackState: 'delivered' } : undefined,
+            )
+          }
           // A one-shot remains enabled across retryable failures. Completed,
           // silent, permanent and explicitly exhausted outcomes consume it.
           if (job.oneshot) {
@@ -1690,21 +1832,81 @@ export class CronScheduler {
   }
 
   /**
+   * Enqueue job id for this occurrence. Prefers the JSON projection, then the
+   * durable UNIQUE key so a mocked/crashed consumeOccurrence still stamps.
+   */
+  private resolveCronDelegateJobId(
+    job: CronJob,
+    deliveryContext: CronDeliveryContext,
+  ): string | undefined {
+    const occ = readOccurrence(deliveryContext.deliveryId)
+    if (occ?.delegateJobId) return occ.delegateJobId
+    if (!this.delegateJobs) return undefined
+    return this.delegateJobs.findByIdempotencyKey(
+      cronDelegateIdempotencyKey(job.id, deliveryContext.dueMinuteKey),
+    )?.id
+  }
+
+  /**
+   * Durable generation lock for the Completer origin-session leg. Must land
+   * before the inject side effect so a crash cannot leave a marker-free row
+   * for a later Notifier generation to dlgcb-replay. Does not claim the
+   * execution lease: claiming first would make retryable inject failures
+   * unclaimable and would let boot AdoptOrKill silence a prepared occurrence.
+   */
+  private stampLegacyCronGeneration(jobId: string): boolean {
+    if (!this.delegateJobs) return false
+    const snap = this.delegateJobs.snapshotOf(jobId)
+    if (!snap) return false
+    const fence = snap.claimToken
+      ? { claimToken: snap.claimToken, fencingEpoch: snap.fencingEpoch }
+      : undefined
+    return this.delegateJobs.patchNotifyIntent(
+      jobId,
+      {
+        notifyLane: CRON_CALLBACK_LEGACY_LANE,
+        notifyId: delegateNotifyId(jobId, 1),
+      },
+      fence,
+    )
+  }
+
+  /**
+   * Durable inject-success receipt. Written immediately after Completer
+   * origin-session fire returns injected, still without claiming the
+   * execution lease. Restart seeing callback_state=delivered must settle
+   * without calling onOriginSessionFire again.
+   */
+  private ackLegacyCronInject(jobId: string): boolean {
+    if (!this.delegateJobs) return false
+    if (!this.stampLegacyCronGeneration(jobId)) return false
+    const snap = this.delegateJobs.snapshotOf(jobId)
+    if (!snap) return false
+    if (snap.callbackState === 'delivered') return true
+    const fence = snap.claimToken
+      ? { claimToken: snap.claimToken, fencingEpoch: snap.fencingEpoch }
+      : undefined
+    return this.delegateJobs.patchCallbackState(jobId, 'delivered', fence)
+  }
+
+  /**
    * origin-session fire: inject a new inbound into the creating conversation.
    * If that conversation is gone, skip (do not isolated-run / lastActive-broadcast),
    * disable recurring jobs (the origin can never come back) and leave a status
    * notice so the task does not vanish silently.
    *
-   * Ordering: inject BEFORE markSubmitStarted. A retryable inject failure
-   * (session busy, network, master down) leaves the occurrence 'prepared' and
-   * lastRun untouched, so the normal retry planner really re-fires this exact
-   * deliveryId on a later tick. Replay safety comes from the stable
-   * clientMessageId: master dedupes durably in turn_dispatches, the local path
-   * dedupes on the persisted message id. After a restart, 'executing' and
-   * 'completed' origin occurrences settle without re-dispatch (at-most-once,
-   * see the recovery block in checkAndRun); the crash window between a
-   * successful inject and markSubmitStarted re-injects the same
-   * clientMessageId, which master absorbs as a duplicate.
+   * Ordering: stamp the Completer generation (legacy-completer) BEFORE inject;
+   * write callback_state=delivered immediately AFTER inject success; claim via
+   * markSubmitStarted only after that receipt. A retryable inject failure
+   * (session busy, network, master down) leaves the occurrence 'prepared',
+   * lastRun untouched, and the job queued, so the same leg retries this
+   * deliveryId. Restart distinguishes:
+   *   - stamped + callback none → retry Completer key once (inject not done)
+   *   - stamped + callback delivered → ACK, do not re-fire (inject done)
+   * Flag-on boot seeing legacy-completer still keeps the Completer key instead
+   * of dlgcb-replay. After a restart, 'executing' and 'completed' origin
+   * occurrences settle without re-dispatch (at-most-once, see the recovery
+   * block in checkAndRun).
    */
   private async runOriginSessionJob(
     job: CronJob,
@@ -1712,6 +1914,8 @@ export class CronScheduler {
     deliveryContext: CronDeliveryContext,
     project: Extract<CronProjectResolution, { ok: true }>,
   ): Promise<CronRunOutcome> {
+    job.projectMode = project.mode
+    job.boardProjectId = project.mode === 'fixed' ? project.boardProjectId : null
     try {
       await durability.consumeOccurrence()
     } catch (err) {
@@ -1721,14 +1925,35 @@ export class CronScheduler {
       })
       return { kind: 'retryable_failure', code: 'OCCURRENCE_PERSIST_FAILED' }
     }
+    const dlgJobId = this.resolveCronDelegateJobId(job, deliveryContext)
+    const dlgSnap =
+      dlgJobId && this.delegateJobs ? this.delegateJobs.snapshotOf(dlgJobId) : undefined
+    const injectAcked = dlgSnap?.callbackState === 'delivered'
+    const legacyOwned = isLegacyCronOriginLane(dlgSnap?.notifyLane)
+    // Flag-on Completer skips inject only when this occurrence is not already
+    // owned by the Completer generation. A pre-inject crash that stamped
+    // legacy-completer must retry the same leg / same cron-origin-* key.
+    // A post-inject crash that already wrote delivered must not re-fire.
+    const useLegacyLeg = !isDelegateNotifierEffective() || (legacyOwned && !injectAcked)
     let result: CronOriginFireResult
     try {
-      const fireJob: CronJob = {
-        ...job,
-        projectMode: project.mode,
-        boardProjectId: project.mode === 'fixed' ? project.boardProjectId : null,
+      if (injectAcked) {
+        result = { kind: 'injected' }
+      } else {
+        if (useLegacyLeg && dlgJobId) this.stampLegacyCronGeneration(dlgJobId)
+        if (!useLegacyLeg) {
+          result = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
+            ? { kind: 'injected' }
+            : { kind: 'fallback' }
+        } else {
+          const fireJob: CronJob = {
+            ...job,
+            projectMode: project.mode,
+            boardProjectId: project.mode === 'fixed' ? project.boardProjectId : null,
+          }
+          result = await this.onOriginSessionFire!(fireJob, deliveryContext)
+        }
       }
-      result = await this.onOriginSessionFire!(fireJob, deliveryContext)
     } catch (err) {
       logger.warn(`job ${job.id} origin-session inject threw`, {
         jobId: job.id,
@@ -1739,15 +1964,64 @@ export class CronScheduler {
     if (result.kind === 'retryable_failure' || result.kind === 'terminal_failure') {
       return result
     }
+    if (
+      !injectAcked &&
+      useLegacyLeg &&
+      result.kind === 'injected' &&
+      dlgJobId &&
+      this.delegateJobs
+    ) {
+      if (!this.ackLegacyCronInject(dlgJobId)) {
+        logger.warn(`job ${job.id} origin-session inject ack failed`, {
+          jobId: job.id,
+        })
+        return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_ACK_FAILED' }
+      }
+    }
     const skipped = result.kind === 'fallback'
     try {
       await durability.markSubmitStarted?.()
     } catch (err) {
+      if (isCronDelegateClaimDenied(err)) {
+        logger.warn(`job ${job.id} origin-session delegate claim denied`, {
+          jobId: job.id,
+          reason: err.reason,
+          state: err.state,
+        })
+        return {
+          kind: 'terminal_failure',
+          code: err.reason === 'terminal' ? 'DELEGATE_JOB_TERMINAL' : 'DELEGATE_CLAIM_DENIED',
+        }
+      }
       logger.warn(`job ${job.id} origin-session markSubmitStarted failed`, {
         jobId: job.id,
         errorClass: stableCronErrorClass(err),
       })
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_SETTLE_FAILED' }
+    }
+    if (
+      !isDelegateNotifierEffective() &&
+      result.kind === 'injected' &&
+      this.delegateJobs
+    ) {
+      const stamped = readOccurrence(deliveryContext.deliveryId)
+      if (
+        stamped?.delegateJobId &&
+        stamped.delegateClaimToken &&
+        stamped.delegateFencingEpoch !== undefined
+      ) {
+        this.delegateJobs.patchNotifyIntent(
+          stamped.delegateJobId,
+          {
+            notifyLane: CRON_CALLBACK_LEGACY_LANE,
+            notifyId: delegateNotifyId(stamped.delegateJobId, 1),
+          },
+          {
+            claimToken: stamped.delegateClaimToken,
+            fencingEpoch: stamped.delegateFencingEpoch,
+          },
+        )
+      }
     }
     const ts = new Date().toISOString().replace(/[:.]/g, '-')
     const outPath = join(paths.cronOutputsDir, `${job.id}-${ts}.md`)
@@ -1963,6 +2237,26 @@ export class CronScheduler {
     let submitError: unknown = null
     try {
       await durability.markSubmitStarted?.()
+    } catch (err) {
+      await this.sessions.destroySession(sessionKey).catch(() => {})
+      if (isCronDelegateClaimDenied(err)) {
+        logger.warn(`job ${job.id} delegate claim denied before submit`, {
+          jobId: job.id,
+          reason: err.reason,
+          state: err.state,
+        })
+        return {
+          kind: 'terminal_failure',
+          code: err.reason === 'terminal' ? 'DELEGATE_JOB_TERMINAL' : 'DELEGATE_CLAIM_DENIED',
+        }
+      }
+      logger.warn(`job ${job.id} markSubmitStarted failed before submit`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'SUBMIT_START_FAILED' }
+    }
+    try {
       await this.sessions.submit(
         session,
         job.prompt,

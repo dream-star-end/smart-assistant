@@ -113,6 +113,29 @@ describe("extractLatestTodos", () => {
       ]),
     ).toEqual([]);
   });
+
+  test("hydration 形态 TodoWrite(inputJson.todos) 在当前轮未完成时仍可提取", () => {
+    const msgs: ChatMessage[] = [
+      { id: "u1", role: "user", text: "继续", ts: 0 } as ChatMessage,
+      {
+        id: "t-hydrated",
+        role: "tool",
+        toolName: "TodoWrite",
+        text: "",
+        ts: 1,
+        inputJson: {
+          todos: [
+            { content: "已完成", status: "completed" },
+            { content: "容器重建后真机验证", status: "pending", activeForm: "真机验证" },
+          ],
+        },
+      } as ChatMessage,
+    ];
+    expect(extractLatestTodos(msgs).map((t) => `${t.content}:${t.status}`)).toEqual([
+      "已完成:completed",
+      "容器重建后真机验证:pending",
+    ]);
+  });
 });
 
 describe("PinnedTaskTracker 交互", () => {
@@ -161,8 +184,9 @@ describe("PinnedTaskTracker 交互", () => {
     expect(container.firstChild).toBeNull();
   });
 
-  test("当前 turn 非运行态 → 未完成历史任务也不渲染", () => {
-    const { container } = render(<PinnedTaskTracker todos={TODOS} active={false} />);
-    expect(container.firstChild).toBeNull();
+  test("刷新后当前轮仍有未完成任务 → HUD 钉住(不依赖 sending)", () => {
+    render(<PinnedTaskTracker todos={TODOS} active={false} />);
+    expect(screen.getByText("任务 1/3")).toBeInTheDocument();
+    expect(screen.getByText("任务三")).toBeInTheDocument();
   });
 });

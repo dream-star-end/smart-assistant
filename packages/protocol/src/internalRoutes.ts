@@ -75,6 +75,9 @@ export const AUTO_DREAM_OPTIMIZER_SETTLE_PATH = '/internal/v3/auto-dream/settle'
 export const AUTO_DREAM_OPTIMIZER_ABANDON_PATH = '/internal/v3/auto-dream/abandon'
 export const AUTO_DREAM_OPTIMIZER_FINDINGS_PATH = '/internal/v3/auto-dream/findings'
 export const AUTO_DREAM_OPTIMIZER_ACTION_PATH = '/internal/v3/auto-dream/action'
+export const DELEGATE_ENGINE_BILLING_ADMIT_PATH = '/internal/v3/delegate/engine-billing/admit'
+export const DELEGATE_ENGINE_BILLING_SETTLE_PATH = '/internal/v3/delegate/engine-billing/settle'
+export const DELEGATE_ENGINE_BILLING_ABANDON_PATH = '/internal/v3/delegate/engine-billing/abandon'
 export const WECHAT_OUTBOUND_PATH = '/internal/v3/wechat-outbound'
 export const WECHAT_PROACTIVE_PATH = '/internal/v3/wechat-proactive'
 export const QQ_OUTBOUND_PATH = '/internal/v3/qq-outbound'
@@ -365,6 +368,33 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v3',
     sources: ['gateway/src/autoDreamOptimizerClient.ts', 'commercial/src/http/internalAutoDreamOptimizer.ts'],
+  },
+  {
+    path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: [
+      'gateway/src/delegateEngineBilling.ts',
+      'commercial/src/http/internalDelegateEngineBilling.ts',
+    ],
+  },
+  {
+    path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: [
+      'gateway/src/delegateEngineBilling.ts',
+      'commercial/src/http/internalDelegateEngineBilling.ts',
+    ],
+  },
+  {
+    path: DELEGATE_ENGINE_BILLING_ABANDON_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: [
+      'gateway/src/delegateEngineBilling.ts',
+      'commercial/src/http/internalDelegateEngineBilling.ts',
+    ],
   },
   {
     path: WECHAT_OUTBOUND_PATH,

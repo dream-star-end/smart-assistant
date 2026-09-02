@@ -41,7 +41,18 @@ import {
   resetReplyTracker,
   trackServerTs,
 } from "./model";
+import {
+  isExecuteExtraToolName,
+  parseExecuteExtraToolResult,
+  unwrapExecuteExtraToolInput,
+} from "./extraTool";
 import { repairPostFinalProcessOrder } from "./order";
+import {
+  isOcMemoryDelegateVerb,
+  isOcMemoryDelegateWait,
+  isShellToolName,
+  parseOcMemoryCommand,
+} from "./ocMemoryCli";
 import { errorLabel } from "./render";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
@@ -192,12 +203,41 @@ function isSendToAgentToolName(name?: string): boolean {
   return mcp?.server === "openclaude-memory" && mcp.op === "send_to_agent";
 }
 
-function isRunningBackgroundToolResult(output?: string, outputJson?: unknown): boolean {
+function collectBackgroundResultPayloads(output?: string, outputJson?: unknown): unknown[] {
   const payloads: unknown[] = [outputJson, output];
-  for (const raw of payloads) {
+  for (const raw of [outputJson, output]) {
     const parsed = parseJsonObject(raw);
     if (!parsed) continue;
-    if (parsed.status === "running") return true;
+    if (parsed.isBackground === true) payloads.push({ status: "running", jobId: parsed.jobId });
+    // CCB ExecuteExtraTool 信封:{"result":[{"type":"text","text":"{\"status\":\"running\",\"jobId\":…}"}],…}
+    const extra = parseExecuteExtraToolResult(parsed);
+    if (extra?.text) payloads.push(extra.text);
+    const success = asPlainObject(parsed.success);
+    if (typeof success?.stdout === "string" && success.stdout.trim()) payloads.push(success.stdout);
+    if (typeof success?.stderr === "string" && success.stderr.trim()) payloads.push(success.stderr);
+  }
+  return payloads;
+}
+
+function isCliRunningStatusText(raw: unknown): boolean {
+  return typeof raw === "string" && /(?:^|[\s,;])status=running(?:\s|$)/i.test(raw);
+}
+
+function jobIdFromLooseText(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const match = /(?:^|[\s,;])jobId=([A-Za-z0-9._:-]+)/.exec(raw);
+  return match?.[1] ?? null;
+}
+
+function isRunningBackgroundToolResult(output?: string, outputJson?: unknown): boolean {
+  if (typeof output === "string" && /process is still running|moved to background/i.test(output)) {
+    return true;
+  }
+  for (const raw of collectBackgroundResultPayloads(output, outputJson)) {
+    if (isCliRunningStatusText(raw)) return true;
+    const parsed = parseJsonObject(raw);
+    if (!parsed) continue;
+    if (parsed.status === "running" || parsed.isBackground === true) return true;
     const wrapped = extractMcpContentText(parsed);
     const inner = parseJsonObject(wrapped);
     if (inner?.status === "running") return true;
@@ -206,15 +246,17 @@ function isRunningBackgroundToolResult(output?: string, outputJson?: unknown): b
 }
 
 function backgroundDelegateJobId(output?: string, outputJson?: unknown): string | null {
-  for (const raw of [outputJson, output]) {
-    const parsed = parseJsonObject(raw)
-    const direct = typeof parsed?.jobId === "string" ? parsed.jobId : null
-    if (direct) return direct
-    const wrapped = parsed ? extractMcpContentText(parsed) : null
-    const inner = parseJsonObject(wrapped)
-    if (typeof inner?.jobId === "string") return inner.jobId
+  for (const raw of collectBackgroundResultPayloads(output, outputJson)) {
+    const parsed = parseJsonObject(raw);
+    const direct = typeof parsed?.jobId === "string" ? parsed.jobId : null;
+    if (direct) return direct;
+    const wrapped = parsed ? extractMcpContentText(parsed) : null;
+    const inner = parseJsonObject(wrapped);
+    if (typeof inner?.jobId === "string") return inner.jobId;
+    const fromText = jobIdFromLooseText(raw);
+    if (fromText) return fromText;
   }
-  return null
+  return null;
 }
 
 function normalizeDelegateGoalKey(raw: unknown): string {
@@ -224,7 +266,22 @@ function normalizeDelegateGoalKey(raw: unknown): string {
     .slice(0, 1024);
 }
 
-type DelegateToolInfo = { agentId: string; goalRaw: string; goalKey: string; background?: boolean };
+/** heredoc 全文 vs 首行：任一侧是前缀即视为同一目标（仍要求唯一候选）。 */
+function delegateGoalsMatch(a: unknown, b: unknown): boolean {
+  const ka = normalizeDelegateGoalKey(a);
+  const kb = normalizeDelegateGoalKey(b);
+  if (!ka || !kb) return false;
+  if (ka === kb) return true;
+  return ka.startsWith(kb) || kb.startsWith(ka);
+}
+
+type DelegateToolInfo = {
+  agentId: string;
+  goalRaw: string;
+  goalKey: string;
+  background?: boolean;
+  model?: string;
+};
 
 function asPlainObject(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
@@ -282,9 +339,51 @@ function delegateInfoFromArgs(args: Record<string, unknown>, background = false)
   };
 }
 
-function parseDelegateToolInfo(toolName?: string, inputJson?: unknown, inputPreview?: string): DelegateToolInfo | null {
-  const name = toolName || "";
+function shellCommandFromInput(inputJson?: unknown, inputPreview?: string): string {
   const input = parseToolInputObject(inputJson, inputPreview) ?? {};
+  return str(input.command);
+}
+
+function delegateInfoFromOcMemoryCommand(command: string): DelegateToolInfo | null {
+  const parsed = parseOcMemoryCommand(command);
+  if (!parsed || parsed.op !== "delegate") return null;
+  const goalFull = parsed.goalFull || parsed.goalRaw;
+  return {
+    agentId: parsed.agentId || "main",
+    goalRaw: parsed.goalRaw || goalFull,
+    goalKey: normalizeDelegateGoalKey(goalFull || parsed.goalRaw),
+    ...(parsed.model ? { model: parsed.model } : {}),
+  };
+}
+
+function parseDelegateWaitJobId(toolName?: string, inputJson?: unknown, inputPreview?: string): string | null {
+  if (!isShellToolName(toolName)) return null;
+  const command = shellCommandFromInput(inputJson, inputPreview);
+  if (!isOcMemoryDelegateWait(command)) return null;
+  const jobId = parseOcMemoryCommand(command)?.jobId?.trim() || "";
+  return jobId || null;
+}
+
+/** CCB `ExecuteExtraTool {tool_name, params}` → 内层 (name, input);非包装原样返回。 */
+function unwrapExtraToolCall(
+  toolName: string,
+  input: Record<string, unknown>,
+): { name: string; input: Record<string, unknown> } {
+  if (!isExecuteExtraToolName(toolName)) return { name: toolName, input };
+  const call = unwrapExecuteExtraToolInput(input);
+  return call ? { name: call.name, input: call.params } : { name: toolName, input };
+}
+
+function parseDelegateToolInfo(toolName?: string, inputJson?: unknown, inputPreview?: string): DelegateToolInfo | null {
+  const wrapped = unwrapExtraToolCall(toolName || "", parseToolInputObject(inputJson, inputPreview) ?? {});
+  const name = wrapped.name;
+  const input = wrapped.input;
+  if (isShellToolName(name)) {
+    const command = str(input.command);
+    // 只认动词 delegate；delegate-wait / core-search 等绝不收成新组。
+    if (!isOcMemoryDelegateVerb(command)) return null;
+    return delegateInfoFromOcMemoryCommand(command);
+  }
   const mcp = parseMcpToolName(name);
   if (mcp?.server === "openclaude-memory" && (mcp.op === "delegate_task" || mcp.op === "send_to_agent")) {
     return delegateInfoFromArgs(input, mcp.op === "send_to_agent");
@@ -308,7 +407,7 @@ function parseDelegateToolInfo(toolName?: string, inputJson?: unknown, inputPrev
  */
 function isFanoutDelegateToolRow(msg: ChatMessage): boolean {
   if (msg.role !== "tool") return false;
-  const name = msg.toolName || "";
+  const name = unwrapExtraToolCall(msg.toolName || "", parseToolInputObject(msg.inputJson, msg.inputPreview) ?? {}).name;
   const mcp = parseMcpToolName(name);
   if (mcp?.server === "openclaude-memory" && mcp.op === "delegate_tasks") return true;
   if (/(?:^|_)delegate_tasks$/.test(name) && parseCodexTypeName(name) !== "mcpToolCall") return true;
@@ -350,6 +449,8 @@ export function friendlyDelegateResultPreview(raw: unknown): string {
   const text = typeof raw === "string" ? raw : "";
   const parsed = parseJsonObject(raw);
   if (!parsed) return text.trim().startsWith("{") ? "" : text;
+  const extra = parseExecuteExtraToolResult(parsed);
+  if (extra) return extra.text.trim().startsWith("{") ? "" : extra.text;
   const server = normalizeMcpServerName(str(parsed.server) || str(parsed.serverName));
   const op = str(parsed.tool) || str(parsed.toolName) || str(parsed.name);
   const content = extractMcpContentText(parsed);
@@ -360,6 +461,8 @@ export function friendlyDelegateResultPreview(raw: unknown): string {
 function isDelegateResultWrapper(raw: unknown): boolean {
   const parsed = parseJsonObject(raw);
   if (!parsed) return false;
+  const extra = parseExecuteExtraToolResult(parsed);
+  if (extra) return /(?:^|_)(delegate_task|send_to_agent)$/.test(extra.toolName);
   const server = normalizeMcpServerName(str(parsed.server) || str(parsed.serverName));
   const op = str(parsed.tool) || str(parsed.toolName) || str(parsed.name);
   return server === "openclaude-memory" && (op === "delegate_task" || op === "send_to_agent");
@@ -486,6 +589,7 @@ function bindDelegateRunToGroup(sess: ChatSession, block: { agentId?: string; go
   const agentId = block.agentId || "";
   const goal = typeof block.goal === "string" ? block.goal : "";
   if (!agentId || !goal) return null;
+  const goalKey = normalizeDelegateGoalKey(goal);
   const candidates = sess.messages.filter(
     (m) =>
       m.role === "agent-group" &&
@@ -494,7 +598,7 @@ function bindDelegateRunToGroup(sess: ChatSession, block: { agentId?: string; go
       m._delegate &&
       !m._delegateRunId &&
       m._delegateAgentId === agentId &&
-      m._delegateGoal === goal,
+      delegateGoalsMatch(m._delegateGoal, goalKey),
   );
   if (candidates.length !== 1) return null;
   const groupMsg = candidates[0];
@@ -602,7 +706,8 @@ function matchesDelegateProgress(groupMsg: ChatMessage, progress: ChatMessage): 
   if (groupMsg._delegateRunId && progress.runId && groupMsg._delegateRunId !== progress.runId) return false;
   const agentId = groupMsg._delegateAgentId || "";
   const goal = groupMsg._delegateGoal || "";
-  return !!agentId && !!goal && (progress.agentId || "") === agentId && progress._delegateGoal === goal;
+  return !!agentId && !!goal && (progress.agentId || "") === agentId &&
+    delegateGoalsMatch(progress._delegateGoal, goal);
 }
 
 function findSingleMatchingDelegateGroup(sess: ChatSession, progress: ChatMessage): ChatMessage | null {
@@ -633,7 +738,7 @@ function adoptMaterializedFanoutGroupForTool(
       !m._completed &&
       typeof m._delegateRunId === "string" &&
       m._delegateAgentId === info.agentId &&
-      m._delegateGoal === info.goalKey,
+      delegateGoalsMatch(m._delegateGoal, info.goalKey),
   );
   if (candidates.length !== 1) return null;
   const groupMsg = candidates[0];
@@ -653,9 +758,37 @@ function adoptStandaloneDelegateRun(sess: ChatSession, groupMsg: ChatMessage): b
   return mergeDelegateProgressIntoGroup(sess, groupMsg, candidates[0]);
 }
 
+/** Bash `oc-memory delegate-wait <jobId>`：能对上已有组则从时间线摘掉（不新建组）；对不上保持普通工具卡。 */
+function bindDelegateWaitToolRow(sess: ChatSession, msg: ChatMessage): boolean {
+  if (isImmutableTapeViewportRow(msg)) return false;
+  if (msg.role !== "tool") return false;
+  const jobId = parseDelegateWaitJobId(msg.toolName, msg.inputJson, msg.inputPreview);
+  if (!jobId) return false;
+  const groups = sess.messages.filter(
+    (m) =>
+      m.role === "agent-group" &&
+      m._delegate &&
+      !isServerAuthoredRow(m) &&
+      !isImmutableTapeViewportRow(m) &&
+      m._delegateJobId === jobId,
+  );
+  if (groups.length !== 1) return false;
+  const group = groups[0];
+  msg._adoptedInto = group.id;
+  if (msg.blockId) {
+    const ids = group._swallowedToolBlockIds ?? [];
+    if (!ids.includes(msg.blockId)) group._swallowedToolBlockIds = [...ids, msg.blockId];
+    sess._blockIdToMsgId?.set(msg.blockId, group.id);
+  }
+  const idx = sess.messages.indexOf(msg);
+  if (idx >= 0) sess.messages.splice(idx, 1);
+  return true;
+}
+
 function normalizeDelegateToolRow(sess: ChatSession, msg: ChatMessage): boolean {
   if (isImmutableTapeViewportRow(msg)) return false;
   if (msg.role !== "tool") return false;
+  if (bindDelegateWaitToolRow(sess, msg)) return true;
   const info = parseDelegateToolInfo(msg.toolName, msg.inputJson, msg.inputPreview);
   if (!info) return false;
   const existingGroup = msg.blockId
@@ -1137,7 +1270,8 @@ function handleDelegateProgressBlock(
       if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map();
       sess._delegateRunGroups.set(block.runId, bound.id);
       groupMsgId = bound.id;
-    } else if (block.phase === "start") {
+    } else {
+      // start 以外的 progress 也可能带 goal/jobId；Bash 组卡尚未绑 runId 时仍应收进组。
       groupMsgId = bindDelegateRunToGroup(sess, block) ?? undefined;
     }
   }
@@ -1952,6 +2086,7 @@ export function applyOutboundMessage(
             delete existing.partialJson;
             existing._partialRafPending = false;
           }
+          bindDelegateWaitToolRow(sess, existing);
         }
       } else {
         // 新建 tool 卡（§9 canonical id 条件 spread）。
@@ -1972,6 +2107,7 @@ export function applyOutboundMessage(
           ...(frameTurnOwnerId ? { _turnOwnerId: frameTurnOwnerId } : {}),
         });
         if (tb.blockId) sess._blockIdToMsgId?.set(tb.blockId, m.id);
+        bindDelegateWaitToolRow(sess, m);
       }
     } else if (b.kind === "tool_result") {
       if (sess._streamingAssistant) sess._streamingAssistant.completedAt = Date.now();
@@ -2005,6 +2141,7 @@ export function applyOutboundMessage(
             if (jobId) {
               groupMsg._delegateJobId = jobId
               adoptStandaloneDelegateRun(sess, groupMsg)
+              for (const row of [...sess.messages]) bindDelegateWaitToolRow(sess, row)
             }
           } else {
             groupMsg._completed = true;
@@ -2020,6 +2157,8 @@ export function applyOutboundMessage(
         const mid = sess._blockIdToMsgId.get(toolUseId);
         const existing = sess.messages.find((m) => m.id === mid);
         if (existing) {
+          // delegate-wait 已并入组卡：结果既不改写组输出，也不再新建工具行。
+          if (existing.role === "agent-group") continue;
           if (frameTurnOwnerId && !existing._turnOwnerId) existing._turnOwnerId = frameTurnOwnerId;
           existing._completed = true;
           existing.output = rb.output ?? rb.preview ?? "";
@@ -2028,6 +2167,12 @@ export function applyOutboundMessage(
           existing._partial = false;
           continue;
         }
+        if (sess.messages.some((m) => m.role === "agent-group" && m._swallowedToolBlockIds?.includes(toolUseId))) {
+          continue;
+        }
+      }
+      if (toolUseId && sess.messages.some((m) => m.role === "agent-group" && m._swallowedToolBlockIds?.includes(toolUseId))) {
+        continue;
       }
       if (rb.output === undefined && rb.preview === undefined) continue;
       const m = addMessage(sess, "tool", rb.toolName || "unknown", {

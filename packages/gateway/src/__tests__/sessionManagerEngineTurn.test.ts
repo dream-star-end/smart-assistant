@@ -2591,6 +2591,39 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("Cursor context_too_long tape errorCode survives washed errorDetail", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            result: "Cursor CLI failed",
+            errorClass: "context_too_long",
+          });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        providerTag: "cursor",
+      } as Partial<AgentSession>);
+
+      await runOneTurn(sm, session, events);
+      await sm.awaitPendingPersistence();
+
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.errorCode, "context_too_long");
+      assert.match(captured.payloads[0]!.errorDetail ?? "", /Cursor CLI failed/);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("Codex context_too_long 终态清掉 native resume,下一轮不复用已耗尽 thread", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);

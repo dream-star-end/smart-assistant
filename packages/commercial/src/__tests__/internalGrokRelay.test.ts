@@ -180,6 +180,10 @@ describe('internal Grok relay', () => {
         headers: { authorization: `Bearer ${CONTAINER_TOKEN}` },
       })
       assert.equal(response.status, 405)
+      const payload = await response.json() as { error?: { code?: string; message?: string } }
+      assert.equal(payload.error?.code, 'METHOD_NOT_ALLOWED')
+      assert.equal(payload.error?.message, 'grok relay method not allowed')
+      assert.notEqual(payload.error?.message, 'grok relay unavailable')
       assert.equal(contextCalls, 0)
     } finally {
       await close(server)

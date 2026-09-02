@@ -223,6 +223,35 @@ export async function loadOpenDispatchLiveUnitCheckpoint(
   return { streamKey: row.stream_key, sessionId, userId, state };
 }
 
+export async function loadSessionLiveCheckpointUnits(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+): Promise<import("@openclaude/protocol").LiveUnit[]> {
+  const rows = (
+    await client.query<{
+      reducer_epoch: string;
+      through_frame_seq: string;
+      through_record_id: string;
+      units_jsonb: unknown;
+      session_key: string | null;
+    }>(
+      `SELECT c.reducer_epoch,c.through_frame_seq::text,c.through_record_id::text,
+              c.units_jsonb,c.session_key
+         FROM client_session_live_unit_checkpoints c
+         JOIN client_session_live_streams s ON s.stream_key=c.stream_key
+        WHERE s.session_id=$1 AND s.user_id=$2`,
+      [sessionId, userId],
+    )
+  ).rows;
+  const units: import("@openclaude/protocol").LiveUnit[] = [];
+  for (const row of rows) {
+    const state = parseCheckpointRow(row);
+    if (state) units.push(...state.units);
+  }
+  return units;
+}
+
 function parseCheckpointRow(row: {
   reducer_epoch: string;
   through_frame_seq: string;

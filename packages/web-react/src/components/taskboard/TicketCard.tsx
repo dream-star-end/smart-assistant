@@ -65,7 +65,7 @@ export function TicketCard({
   onDragStart?: (e: DragEvent<HTMLDivElement>) => void
   onDragEnd?: (e: DragEvent<HTMLDivElement>) => void
 }) {
-  const Icon = TYPE_ICON[ticket.type]
+  const Icon = TYPE_ICON[ticket.type] ?? Bug
   const runHint = latestRunHint(ticket.status, latestRunStatus)
   const agent = assigneeLabel(ticket.assignee)
   return (
@@ -168,6 +168,15 @@ export function TicketCard({
               title={agent}
             >
               {agent}
+            </span>
+          )}
+          {ticket.approvedBy && ticket.status !== 'backlog' && (
+            <span
+              data-testid="ticket-approver"
+              className="min-w-0 truncate text-caption text-muted"
+              title={ticket.approvedBy}
+            >
+              批准人 {assigneeLabel(ticket.approvedBy) ?? ticket.approvedBy}
             </span>
           )}
           {showUpdatedAt && (

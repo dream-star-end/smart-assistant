@@ -39,7 +39,7 @@ import { query, type QueryRunner } from "../db/queries.js";
 import { getPool } from "../db/index.js";
 import { projectContextWindowForRole } from "./modelRolePolicy.js";
 import type { ModelPricing, ModelVisibility } from "./pricing.js";
-import { isCursorCredentialMember } from "../cursor/access.js";
+import { isCursorCredentialMember, parseCursorCredentialUids } from "../cursor/access.js";
 import { meetsMinPlan } from "./planEntitlement.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,6 +105,8 @@ export interface ModelCatalogPricing {
   defaultEffort: string | null;
   minPlanCode?: string | null;
   minPlanTier?: number | null;
+  minPlanName?: string | null;
+  promoLabel?: string | null;
 }
 
 /**
@@ -137,6 +139,18 @@ export interface ModelProjectionRow {
   capabilityZero: boolean;
   supportsThinking: boolean;
   defaultEffort: string | null;
+  sortOrder: number;
+  promoLabel?: string | null;
+}
+
+/** Rows the caller could use if they met the subscription floor (picker lock list). */
+export interface LockedModelProjectionRow {
+  modelId: string;
+  displayName: string;
+  engine: ModelEngine;
+  minPlanCode: string;
+  minPlanName: string | null;
+  promoLabel: string | null;
   sortOrder: number;
 }
 
@@ -253,6 +267,8 @@ type PricingRow = {
   default_effort: string | null;
   min_plan_code: string | null;
   min_plan_tier: string | number | null;
+  min_plan_name: string | null;
+  promo_label: string | null;
 };
 
 const EFFORT_SET: ReadonlySet<string> = new Set(PLATFORM_REASONING_EFFORTS);
@@ -341,6 +357,8 @@ function rowToPricing(r: PricingRow): ModelCatalogPricing {
     defaultEffort: r.default_effort,
     minPlanCode: r.min_plan_code,
     minPlanTier: r.min_plan_tier == null || r.min_plan_tier === "" ? null : Number(r.min_plan_tier),
+    minPlanName: r.min_plan_name == null || r.min_plan_name === "" ? null : r.min_plan_name,
+    promoLabel: r.promo_label == null || r.promo_label === "" ? null : r.promo_label,
   };
 }
 
@@ -545,33 +563,64 @@ export class ModelCatalogSnapshot {
   }
 
   /**
+   * Shared authorization components for canUseModel / listLockedForUser.
+   * Locked = every canUseModel condition except the subscription floor,
+   * plus the anonymous Cursor upsell exception (`lockedCursorOk`).
+   */
+  private evaluateUse(scope: UserModelScope, modelIdOrAlias: string): {
+    canonical: string;
+    pricing: ModelCatalogPricing | undefined;
+    routable: boolean;
+    cursorOk: boolean;
+    lockedCursorOk: boolean;
+    denied: boolean;
+    meetsPlan: boolean;
+    visible: boolean;
+  } {
+    const canonical = this.aliasToCanonical(modelIdOrAlias);
+    const entry = this.activeByModel.get(canonical);
+    const pricing = this.pricing.get(canonical);
+    const schemaOk =
+      entry !== undefined && entry.capabilitySchemaVersion <= CAPABILITY_SCHEMA_VERSION;
+    const routable = entry !== undefined && schemaOk && pricing !== undefined;
+    const cursorOk = entry?.engine !== "cursor" || isCursorCredentialMember(scope.uid);
+    // `isCursorCredentialMember(0, "all")` is false (uid 0 is not a valid
+    // credential uid). Anonymous is a placeholder identity: after subscribe
+    // they get a real uid, and policy `all` accepts every real uid. Advertise
+    // locked Cursor rows to uid 0 only in that commercial config; a numeric
+    // allow-list that does not contain the uid stays excluded. Execution
+    // (`canUseModel` / `listForUser`) stays on strict `cursorOk`.
+    const lockedCursorOk =
+      cursorOk ||
+      (entry?.engine === "cursor" &&
+        scope.uid === 0 &&
+        parseCursorCredentialUids(process.env.OC_V5_CURSOR_CREDENTIAL_UIDS) === "all");
+    const denied = scope.deniedModelIds?.has(canonical) === true;
+    const meetsPlan = pricing
+      ? meetsMinPlan({
+          minPlanCode: pricing.minPlanCode,
+          minPlanTier: pricing.minPlanTier,
+          userPlanTier: scope.userPlanTier,
+          orgPlanCode: scope.orgPlanCode,
+        })
+      : false;
+    const visible = pricing
+      ? pricing.visibility === "public" ||
+        (pricing.visibility === "admin" &&
+          (scope.role === "admin" || scope.grantedModelIds.has(canonical))) ||
+        (pricing.visibility === "hidden" && scope.grantedModelIds.has(canonical))
+      : false;
+    return { canonical, pricing, routable, cursorOk, lockedCursorOk, denied, meetsPlan, visible };
+  }
+
+  /**
    * fenced 快照内的最终模型授权判定。visibility 与 role/grants 必须和 securityEpoch
    * 来自同一次安全版本；执行面不能再回读异步 PricingCache，否则 public→hidden 时会
    * 在 pricing reload 失败后无限沿用旧 public 结论。
    */
   canUseModel(scope: UserModelScope, modelIdOrAlias: string): boolean {
-    const canonical = this.aliasToCanonical(modelIdOrAlias);
-    if (!this.isRoutable(canonical)) return false;
-    // Grok follows catalog visibility (public / admin / hidden + grants).
-    // Cursor still requires an explicit credential-UID membership.
-    if (this.activeByModel.get(canonical)?.engine === "cursor") {
-      if (!isCursorCredentialMember(scope.uid)) return false;
-    }
-    if (scope.deniedModelIds?.has(canonical)) return false;
-    const p = this.pricing.get(canonical);
-    if (!p) return false;
-    if (!meetsMinPlan({
-      minPlanCode: p.minPlanCode,
-      minPlanTier: p.minPlanTier,
-      userPlanTier: scope.userPlanTier,
-      orgPlanCode: scope.orgPlanCode,
-    })) return false;
-    return (
-      p.visibility === "public" ||
-      (p.visibility === "admin" &&
-        (scope.role === "admin" || scope.grantedModelIds.has(canonical))) ||
-      (p.visibility === "hidden" && scope.grantedModelIds.has(canonical))
-    );
+    const use = this.evaluateUse(scope, modelIdOrAlias);
+    return use.routable && use.cursorOk && !use.denied && use.meetsPlan && use.visible;
   }
 
   /**
@@ -600,6 +649,40 @@ export class ModelCatalogSnapshot {
         capabilityZero: e.capabilityProfile.ccb.capabilityZero,
         supportsThinking: e.capabilityProfile.ccb.supportsThinking,
         defaultEffort: p.defaultEffort,
+        sortOrder: p.sortOrder,
+        promoLabel: p.promoLabel ?? null,
+      });
+    }
+    return rows.sort((a, b) => a.sortOrder - b.sortOrder || (a.modelId < b.modelId ? -1 : 1));
+  }
+
+  /**
+   * Rows that pass every canUseModel condition except meetsMinPlan.
+   * Hidden-without-grant, denied, unroutable, and Cursor-credential misses
+   * stay out of both `listForUser` and this lock list.
+   *
+   * Locked rows are an upsell ("subscribe to unlock"). A uid that fails the
+   * Cursor credential-UID gate could never use the row even after
+   * subscribing, so it is not advertised. Anonymous uid 0 + policy `all`
+   * (commercial) → included; policy list that does not contain the uid
+   * (selfhost `=3` and uid 0) → excluded.
+   */
+  listLockedForUser(scope: UserModelScope): LockedModelProjectionRow[] {
+    const rows: LockedModelProjectionRow[] = [];
+    for (const e of this.activeByModel.values()) {
+      const use = this.evaluateUse(scope, e.modelId);
+      if (!use.routable || !use.lockedCursorOk || use.denied || !use.visible || use.meetsPlan) {
+        continue;
+      }
+      const p = use.pricing;
+      if (!p?.minPlanCode) continue;
+      rows.push({
+        modelId: e.modelId,
+        displayName: p.displayName,
+        engine: e.engine,
+        minPlanCode: p.minPlanCode,
+        minPlanName: p.minPlanName ?? null,
+        promoLabel: p.promoLabel ?? null,
         sortOrder: p.sortOrder,
       });
     }
@@ -749,7 +832,9 @@ export async function loadCatalogSnapshot(pool = getPool()): Promise<ModelCatalo
               p.multiplier::text           AS multiplier,
               p.visibility, p.sort_order, p.default_effort,
               p.min_plan_code,
-              sp.tier AS min_plan_tier
+              sp.tier AS min_plan_tier,
+              sp.name AS min_plan_name,
+              p.promo_label
          FROM model_pricing p
          LEFT JOIN subscription_plans sp ON sp.code = p.min_plan_code`,
     );

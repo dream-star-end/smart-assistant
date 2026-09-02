@@ -17,10 +17,28 @@ export interface RuntimeRecycleDrainDeps {
   releaseSessionDrain: () => void
   activeIngress: () => number
   countDurableRunning: () => Promise<number>
+  /**
+   * Stage 3: running durable delegate jobs. Absent = flag-off (do not count).
+   * `paused_for_cutover` is not running and must not block drain.
+   */
+  countRunningDelegateJobs?: () => Promise<number> | number
+  /**
+   * Synchronous ACK-time snapshot. Used after every await so a queued job
+   * cannot sneak `queued→running` between count and 200.
+   */
+  peekRunningDelegateJobs?: () => number
+  /**
+   * Generation-owned freeze of `claimQueued`. Flag-off omits both freeze/thaw.
+   * Pass `expiresAt` (absolute ms) so an accepted drain cannot freeze dispatch
+   * forever if recycle never happens. Omit on the pending freeze; 200 attaches
+   * expiry ≥ the dual-gate window.
+   */
+  freezeDelegateDispatch?: (holder: string, expiresAt?: number) => void
+  thawDelegateDispatch?: (holder: string) => void
 }
 
 export type RuntimeRecycleDrainDecision =
-  | { ok: true; status: 200; drainTtlMs: number }
+  | { ok: true; status: 200; drainTtlMs: number; freezeHolder?: string }
   | {
       ok: false
       status: 409 | 503
@@ -32,63 +50,100 @@ export type RuntimeRecycleDrainDecision =
       activeIngress?: number
       activeTurns?: number
       durableRunning?: number
+      runningDelegateJobs?: number
     }
 
 export async function attemptRuntimeRecycleDrain(
   deps: RuntimeRecycleDrainDeps,
 ): Promise<RuntimeRecycleDrainDecision> {
+  const holder = deps.freezeDelegateDispatch ? `drain:${deps.now()}` : undefined
+  const thaw = (): void => {
+    if (holder) deps.thawDelegateDispatch?.(holder)
+  }
   const release = (): void => {
     deps.releaseGatewayDrain()
     deps.releaseSessionDrain()
   }
-
-  deps.armGatewayDrain(deps.now() + deps.ttlMs)
-  const sessionDrain = deps.armSessionDrain(deps.ttlMs)
-  const initialIngress = deps.activeIngress()
-  if (!sessionDrain.accepted || initialIngress > 0) {
+  const fail = (decision: Extract<RuntimeRecycleDrainDecision, { ok: false }>): RuntimeRecycleDrainDecision => {
+    thaw()
     release()
-    return {
-      ok: false,
-      status: 409,
-      reason: 'active_turn',
-      activeIngress: initialIngress,
-      activeTurns: sessionDrain.activeTurns,
-    }
+    return decision
   }
 
-  let durableRunning: number
   try {
-    durableRunning = await deps.countDurableRunning()
-  } catch {
-    release()
-    return { ok: false, status: 503, reason: 'drain_state_unavailable' }
-  }
+    // Freeze claimQueued before any await so a queued job cannot promote during
+    // durable / delegate count continuations (TOCTOU). Flag-off omits freeze.
+    if (holder) deps.freezeDelegateDispatch!(holder)
 
-  // Re-read ingress after the awaited SQLite acquisition. New ingress cannot
-  // pass while the gateway gate is armed; this catches any work that entered
-  // immediately before the gate was set and had not yet been observed.
-  const activeIngress = deps.activeIngress()
-  if (activeIngress > 0 || durableRunning > 0) {
-    release()
-    return {
-      ok: false,
-      status: 409,
-      reason: 'active_turn',
-      activeIngress,
-      activeTurns: sessionDrain.activeTurns,
-      durableRunning,
+    deps.armGatewayDrain(deps.now() + deps.ttlMs)
+    const sessionDrain = deps.armSessionDrain(deps.ttlMs)
+    const initialIngress = deps.activeIngress()
+    if (!sessionDrain.accepted || initialIngress > 0) {
+      return fail({
+        ok: false,
+        status: 409,
+        reason: 'active_turn',
+        activeIngress: initialIngress,
+        activeTurns: sessionDrain.activeTurns,
+      })
     }
-  }
 
-  // SQLite can wait close to its busy timeout. Never answer 200 using a gate
-  // that expired while the durable read was pending.
-  const finalNow = deps.now()
-  if (!deps.isGatewayDrainActive(finalNow) || !deps.isSessionDrainActive(finalNow)) {
+    let durableRunning: number
+    try {
+      durableRunning = await deps.countDurableRunning()
+    } catch {
+      return fail({ ok: false, status: 503, reason: 'drain_state_unavailable' })
+    }
+
+    let runningDelegateJobs = 0
+    if (deps.countRunningDelegateJobs) {
+      try {
+        runningDelegateJobs = await deps.countRunningDelegateJobs()
+      } catch {
+        return fail({ ok: false, status: 503, reason: 'drain_state_unavailable' })
+      }
+    }
+
+    // No await after this point. Peek is the ACK-time snapshot.
+    if (deps.peekRunningDelegateJobs) {
+      runningDelegateJobs = deps.peekRunningDelegateJobs()
+    }
+    const activeIngress = deps.activeIngress()
+    if (activeIngress > 0 || durableRunning > 0 || runningDelegateJobs > 0) {
+      return fail({
+        ok: false,
+        status: 409,
+        reason: 'active_turn',
+        activeIngress,
+        activeTurns: sessionDrain.activeTurns,
+        durableRunning: durableRunning + runningDelegateJobs,
+        ...(deps.countRunningDelegateJobs || deps.peekRunningDelegateJobs
+          ? { runningDelegateJobs }
+          : {}),
+      })
+    }
+
+    const finalNow = deps.now()
+    if (!deps.isGatewayDrainActive(finalNow) || !deps.isSessionDrainActive(finalNow)) {
+      return fail({ ok: false, status: 503, reason: 'drain_fence_expired' })
+    }
+
+    // Pending freeze has no TTL (TOCTOU). Accepted freeze expires with, or
+    // slightly after, the dual gates so a lost 200 cannot deadlock dispatch,
+    // and cannot thaw before the gates and admit a new running job.
+    if (holder) deps.freezeDelegateDispatch!(holder, finalNow + deps.ttlMs)
+
+    return {
+      ok: true,
+      status: 200,
+      drainTtlMs: deps.ttlMs,
+      ...(holder ? { freezeHolder: holder } : {}),
+    }
+  } catch (err) {
+    thaw()
     release()
-    return { ok: false, status: 503, reason: 'drain_fence_expired' }
+    throw err
   }
-
-  return { ok: true, status: 200, drainTtlMs: deps.ttlMs }
 }
 
 /**
@@ -100,7 +155,7 @@ export async function attemptRuntimeRecycleDrain(
  * busy response without touching either gate.
  */
 export class RuntimeRecycleDrainCoordinator {
-  private current: { state: 'pending' | 'accepted' } | null = null
+  private current: { state: 'pending' | 'accepted'; freezeHolder?: string } | null = null
 
   constructor(private readonly deps: RuntimeRecycleDrainDeps) {}
 
@@ -119,15 +174,17 @@ export class RuntimeRecycleDrainCoordinator {
           reason: 'drain_in_progress',
         })
       }
+      if (current.freezeHolder) this.deps.thawDelegateDispatch?.(current.freezeHolder)
       this.current = null
     }
 
-    const entry: { state: 'pending' | 'accepted' } = { state: 'pending' }
+    const entry: { state: 'pending' | 'accepted'; freezeHolder?: string } = { state: 'pending' }
     this.current = entry
     return attemptRuntimeRecycleDrain(this.deps).then(
       (decision) => {
         if (decision.ok) {
           entry.state = 'accepted'
+          entry.freezeHolder = decision.freezeHolder
         } else if (this.current === entry) {
           this.current = null
         }

@@ -53,12 +53,24 @@ import {
   normalizeCodexReasoningEffort,
 } from './codexShared.js'
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
+import { CodexRelayPathDeniedTracker } from './codexRelayPathGuard.js'
+import { shouldOmitPlatformMcp } from '../codexLaunchOverrides.js'
 import { issueDelegateContextToken } from '../delegateContext.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
 import type { AutomaticRetryState, CollabAgentPolicy, NativeModelHandoffArtifact } from './engineAdapter.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
+
+const guardedStdin = new WeakSet<object>()
+function guardStdinErrors(stdin: { on?: (event: 'error', fn: (err: Error) => void) => unknown }): void {
+  if (guardedStdin.has(stdin)) return
+  guardedStdin.add(stdin)
+  if (typeof stdin.on !== 'function') return
+  stdin.on('error', () => {
+    /* swallow async EPIPE so a settled write cannot become uncaughtException */
+  })
+}
 
 const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
@@ -246,6 +258,7 @@ export interface CodexAppServerRunnerOpts {
   sessionId?: string
   projectId?: string
   runContext?: import('../runContextPersist.js').RunContextDescriptor
+  frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
   /** snapshot provider。由 SessionManager 注入(`this._getRepoSnapshot`),
    *  内部读 `_repoWorkspace.getRepoSnapshot(sessionId)`。返 null = 无绑定;
    *  返 ready = 已绑定可用;返 cloning/failed/pending = 不可用,运行时回退 opts.cwd。 */
@@ -1251,6 +1264,7 @@ export class CodexAppServerRunner extends EventEmitter {
   // ── SubprocessRunner interface parity (referenced by sessionManager.ts) ──
   public lastActivityAt: number = Date.now()
   public effortLevel: string | undefined = undefined
+  private relayDeniedTracker: CodexRelayPathDeniedTracker
 
   get isRunning(): boolean {
     return this.proc != null || this.processing
@@ -1636,6 +1650,9 @@ export class CodexAppServerRunner extends EventEmitter {
     this.threadId = opts.resumeSessionId ?? null
     this.effortLevel = opts.effortLevel
     this.setConversationMode(opts.conversationMode)
+    this.relayDeniedTracker = new CodexRelayPathDeniedTracker(
+      shouldOmitPlatformMcp(opts.agentId, opts.sessionKey),
+    )
     // attached is intentionally false on construction even if we have a
     // resumed threadId — the first turn must explicitly thread/resume into
     // the freshly spawned proc.
@@ -1689,6 +1706,7 @@ export class CodexAppServerRunner extends EventEmitter {
         sessionId: this.opts.sessionId,
         projectId: this.opts.projectId,
         runContext: this.opts.runContext,
+        frozenProjectContext: this.opts.frozenProjectContext,
         cwd: this.opts.cwd,
       })
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
@@ -2011,6 +2029,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // get prepended to the new proc's first stdout chunk and corrupt the
     // initialize response.
     this.stdoutBuf = ''
+    this.relayDeniedTracker.reset()
     // Build platform context overrides BEFORE spawn so the long-lived
     // app-server proc has model_instructions_file + mcp-memory available
     // from its very first turn. Failure here is non-fatal — fall back to
@@ -2093,6 +2112,17 @@ export class CodexAppServerRunner extends EventEmitter {
         ? `http://127.0.0.1:${relayPort}${V3_CODEX_RELAY_PREFIX}/backend-api/codex`
         : undefined
     const telemetryArgs = buildCodexTelemetryHardeningArgs(chatgptRelayBaseUrl)
+    // 阶段 agent / 巡检会话不挂平台 MCP skills。chatgpt_base_url 仍指向 relay,
+    // 但 apps/plugins/MCP 关闭后 rmcp 不应再打 allowlist 外路径。放在 argv 末尾
+    // 覆盖 launch overrides 里可能注入的 mcp_servers.openclaude_memory.*。
+    const omitPlatformMcp = shouldOmitPlatformMcp(this.opts.agentId, this.opts.sessionKey)
+    const stageAgentArgs = omitPlatformMcp
+      ? [
+          '-c', 'mcp_servers={}',
+          '-c', 'features.apps=false',
+          '-c', 'features.plugins=false',
+        ]
+      : []
     const args = [
       'app-server',
       ...argvOverrides,
@@ -2105,6 +2135,7 @@ export class CodexAppServerRunner extends EventEmitter {
       ...requestUserInputArgs,
       ...applyPatchStreamingArgs,
       ...telemetryArgs,
+      ...stageAgentArgs,
       '--listen',
       'stdio://',
     ]
@@ -2131,6 +2162,14 @@ export class CodexAppServerRunner extends EventEmitter {
       },
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
+    proc.stdin.on('error', (err: NodeJS.ErrnoException) => {
+      if (this.proc !== proc) return
+      log.warn('codex app-server stdin error', {
+        sessionKey: this.opts.sessionKey,
+        err: err.message,
+        code: err.code,
+      })
+    })
     this.outputDrainPromise = new Promise<void>((resolve) => {
       this.resolveOutputDrain = resolve
     })
@@ -2153,18 +2192,7 @@ export class CodexAppServerRunner extends EventEmitter {
       }
     })
     proc.stderr.on('data', (chunk: Buffer) => {
-      // Same identity guard rationale as stdout — stderr is just structured
-      // log, but mis-attributing an old proc's stderr to the current session
-      // is misleading in the journal.
-      if (this.proc !== proc) return
-      this.lastActivityAt = Date.now()
-      // Codex app-server logs structured errors to stderr; surface them at
-      // warn level so the journal has them but they don't fail the turn —
-      // the JSON-RPC error response is the source of truth for failures.
-      log.warn('codex app-server stderr', {
-        sessionKey: this.opts.sessionKey,
-        line: chunk.toString('utf8').trim().slice(0, 1024),
-      })
+      this.handleStderrChunk(proc, chunk.toString('utf8'))
     })
     proc.on('error', (err) => {
       // Identity check: a delayed error from a discarded proc must not corrupt
@@ -2213,6 +2241,7 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       this.resolveOutputDrain?.()
       this.resolveOutputDrain = null
+      this.handleStderrChunk(proc, '\n', true)
       const wasShutdown = this.shuttingDown
       // Reject any remaining pending JSON-RPC requests AND the in-flight turn
       // promise so callers don't hang. emitResult is the responsibility of
@@ -2434,9 +2463,9 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private writeRaw(line: string): boolean {
-    if (!this.proc || this.proc.killed) return false
+    if (!this.isInlinePushProcLive(this.proc)) return false
     try {
-      this.proc.stdin.write(`${line}\n`)
+      this.proc!.stdin.write(`${line}\n`)
       return true
     } catch (err) {
       // EPIPE if proc died between our check and write — fail pending so
@@ -2446,6 +2475,78 @@ export class CodexAppServerRunner extends EventEmitter {
       })
       return false
     }
+  }
+
+  /**
+   * R3 档 A: JSON-RPC notification `delegate/terminal` over the existing
+   * app-server stdin. Official mechanism only — does not patch the Codex
+   * binary. Unknown notifications may be ignored by app-server (gap reported).
+   */
+  async writeDelegateTerminalNotification(
+    line: string,
+  ): Promise<{ ok: boolean; processAlive: boolean; unknown?: boolean }> {
+    const proc = this.proc
+    if (!this.isInlinePushProcLive(proc) || !proc) return { ok: false, processAlive: false }
+    const stdin = proc.stdin
+    if (!stdin || stdin.writable === false || stdin.destroyed) {
+      return { ok: false, processAlive: true }
+    }
+    guardStdinErrors(stdin)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false
+        const timer = setTimeout(() => finish(new Error('codex stdin write timeout')), 2_000)
+        timer.unref?.()
+        const finish = (err?: Error | null): void => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          if (typeof stdin.off === 'function') stdin.off('error', onError)
+          if (typeof proc.off === 'function') proc.off('close', onClose)
+          if (err) reject(err)
+          else resolve()
+        }
+        const onError = (err: Error): void => finish(err)
+        const onClose = (): void => finish(new Error('codex process closed during inline push'))
+        if (typeof stdin.once === 'function') stdin.once('error', onError)
+        if (typeof proc.once === 'function') proc.once('close', onClose)
+        try {
+          // write()===false is backpressure: the chunk is already in the
+          // buffer and the caller must wait for drain/callback. It is not
+          // a failure (Node 22 Writable.write). Only the callback/error
+          // path settles this chunk.
+          stdin.write(`${line}\n`, (err) => finish(err))
+        } catch (err) {
+          finish(err as Error)
+        }
+      })
+      if (!this.isInlinePushProcLive(proc) || this.proc !== proc) {
+        return { ok: false, processAlive: false }
+      }
+      return { ok: true, processAlive: true }
+    } catch (err) {
+      const live = this.isInlinePushProcLive(this.proc)
+      const message = err instanceof Error ? err.message : ''
+      if (live && message.includes('stdin write timeout')) {
+        return { ok: false, processAlive: true, unknown: true }
+      }
+      return { ok: false, processAlive: live }
+    }
+  }
+
+  private isInlinePushProcLive(proc: ChildProcessWithoutNullStreams | null): boolean {
+    if (!proc || this.proc !== proc) return false
+    if (proc.killed || proc.exitCode != null || proc.signalCode != null) return false
+    return true
+  }
+
+  /**
+   * Parent-turn ingest proof for InlinePush. queue/processing/completer are
+   * admission, not ingest: turn/start may still reject. The only ACK is a
+   * turn id returned by turn/start (activeTurnId).
+   */
+  get hasIngestedParentTurn(): boolean {
+    return this.activeTurnId != null
   }
 
   private sendRequest(method: string, params: unknown): Promise<unknown> {
@@ -3627,6 +3728,47 @@ export class CodexAppServerRunner extends EventEmitter {
     this.attemptHadObservableOutput = false
     this.attemptHadToolOrPermission = false
     this.attemptEmittedTerminal = false
+  }
+
+  /**
+   * Parse stderr by complete lines. Split PATH_NOT_ALLOWED packets must not
+   * refresh idle; only stage/patrol sessions abort after consecutive denials.
+   * @internal tests call this via feedStderrForTests.
+   */
+  private handleStderrChunk(proc: unknown, chunk: string, ignoreIdentity = false): void {
+    if (!ignoreIdentity && this.proc !== proc) return
+    const result = this.relayDeniedTracker.consume(chunk)
+    for (const line of result.completeLines) {
+      log.warn('codex app-server stderr', {
+        sessionKey: this.opts.sessionKey,
+        line: line.slice(0, 1024),
+      })
+    }
+    if (result.deniedLines > 0) {
+      log.warn('codex relay path denied', {
+        sessionKey: this.opts.sessionKey,
+        count: result.consecutiveDenied,
+      })
+    }
+    if (result.activityLines > 0) this.lastActivityAt = Date.now()
+    if (result.abort) this.abortTurnForRelayPathDenied()
+  }
+
+  /** @internal */
+  feedStderrForTests(chunk: string): void {
+    this.handleStderrChunk(this.proc, chunk, true)
+  }
+
+  private abortTurnForRelayPathDenied(): void {
+    const err = new Error(
+      'CODEX_RELAY_PATH_DENIED: MCP/relay path not allowed; aborting turn',
+    )
+    err.name = 'CodexRelayPathDeniedError'
+    if (this.currentTurnCompleter) {
+      this.currentTurnCompleter.reject(err)
+      this.currentTurnCompleter = null
+    }
+    void this.shutdown()
   }
 
   private _isZeroBreakdown(b: CodexTokenBreakdown): boolean {

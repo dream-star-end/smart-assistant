@@ -34,6 +34,18 @@ import {
 import { isRecoveryControlUserTurn } from "../lib/chat/pure";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
+  EAGER_MEDIA_TAIL_ITEMS,
+  EAGER_PAYLOAD_TAIL_ITEMS,
+  PAINT_MIN_ITEMS,
+  computePaintRange,
+  createRowGeometryWarmup,
+  measureMountedRowHeight,
+  measuredRangePx,
+  paintWindowEnabled,
+  selectPaintRange,
+} from "../lib/chat/timelinePaint";
+import { prefetchMarkdownImpl } from "./Markdown";
+import {
   AssistantCard,
   type CardCallbacks,
   DelegateProgressCard,
@@ -45,6 +57,7 @@ import {
   UserCard,
 } from "./chat/cards";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
+import { TimelineEagerMediaContext } from "./chat/timelineEager";
 import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
 import { TeamPanel } from "./chat/TeamPanel";
 import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
@@ -140,6 +153,8 @@ type RendererProps = {
   readOnly?: boolean;
   /** 同一可见轮已有错误卡/状态卡，用户行不再重复展示失败标签和重试。 */
   failurePresentedBelow?: boolean;
+  /** 初始尾部 locator：跳过 600px IO，进会话即兑付正文。 */
+  eagerPayload?: boolean;
 };
 
 export const MessageRenderer = memo(
@@ -160,6 +175,7 @@ export const MessageRenderer = memo(
     onRespondPermission,
     readOnly = false,
     failurePresentedBelow = false,
+    eagerPayload = false,
   }: RendererProps) {
     const ctx = {
       isLast,
@@ -191,6 +207,7 @@ export const MessageRenderer = memo(
           onRespondPermission={onRespondPermission}
           readOnly={readOnly}
           failurePresentedBelow={failurePresentedBelow}
+          eagerPayload={eagerPayload}
         />
       );
     }
@@ -302,6 +319,7 @@ export const MessageRenderer = memo(
     a.processPaging === b.processPaging &&
     a.readOnly === b.readOnly &&
     a.failurePresentedBelow === b.failurePresentedBelow &&
+    a.eagerPayload === b.eagerPayload &&
     a.cb === b.cb &&
     a.onRespondPermission === b.onRespondPermission,
 );
@@ -424,6 +442,7 @@ function DeferredTapeRecordCard({
   readOnly,
   turnFinalAssistant,
   failurePresentedBelow,
+  eagerPayload = false,
 }: Omit<RendererProps, "sig" | "delegateCost">) {
   const ref = useRef<HTMLDivElement>(null);
   const isUserPayload = message._userPayloadDeferred === true;
@@ -508,7 +527,7 @@ function DeferredTapeRecordCard({
       started.current = false;
       controller.abort();
     };
-    if (typeof IntersectionObserver === "undefined") {
+    if (eagerPayload || typeof IntersectionObserver === "undefined") {
       void load();
       return cancel;
     }
@@ -526,7 +545,7 @@ function DeferredTapeRecordCard({
       observer.disconnect();
       cancel();
     };
-  }, [load]);
+  }, [load, eagerPayload]);
 
   if (records) {
     return (
@@ -786,6 +805,7 @@ function coalesceTeam(
   for (let i = 0; i < slice.length; i++) {
     const m = slice[i];
     const absIdx = start + i;
+    if (!m) continue;
     if (consumedThinking.has(absIdx)) continue; // 已并入上方某思考卡 → 吸收跳过
     // Persisted historical records are already the Agent's exact ordered
     // logical stream. Never regroup, reorder or fold one record into another.
@@ -907,59 +927,30 @@ function coalesceTeam(
 export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
 const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
 const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
-const PAINT_ESTIMATE_PX = 200;
-const PAINT_OVERSCAN = 28;
-const PAINT_MIN_ITEMS = 36;
-const PAINT_ENABLE_ITEMS = 160;
-const PAINT_ENABLE_VIEWPORT_PX = 360;
 
 function defaultTailStart(length: number): number {
   return Math.max(0, length - TIMELINE_INITIAL_TAIL_ITEMS);
 }
 
-function paintWindowEnabled(scroller: HTMLElement | null | undefined, count: number): boolean {
-  return Boolean(
-    scroller &&
-    scroller.clientHeight >= PAINT_ENABLE_VIEWPORT_PX &&
-    count >= PAINT_ENABLE_ITEMS,
-  );
-}
-
-function computePaintRange(
-  count: number,
-  scrollTop: number,
-  clientHeight: number,
-  followBottom: boolean,
-): { start: number; end: number } {
-  const visible = Math.max(
-    PAINT_MIN_ITEMS,
-    Math.ceil(clientHeight / PAINT_ESTIMATE_PX) + PAINT_OVERSCAN * 2,
-  );
-  if (followBottom) {
-    return { start: Math.max(0, count - visible), end: count };
-  }
-  const start = Math.max(0, Math.floor(scrollTop / PAINT_ESTIMATE_PX) - PAINT_OVERSCAN);
-  const end = Math.min(count, Math.max(start + PAINT_MIN_ITEMS, start + visible));
-  return { start, end };
-}
-
-function measuredRangePx(
-  from: number,
-  to: number,
-  keyAt: (index: number) => string,
-  heights: Map<string, number>,
-): number {
-  let height = 0;
-  for (let i = from; i < to; i += 1) {
-    height += heights.get(keyAt(i)) ?? PAINT_ESTIMATE_PX;
-  }
-  return height;
-}
-
 function renderItemKey(item: RenderItem): string {
-  return item.kind === "single"
-    ? (item.m._timelineUnitKey ?? item.m.id)
-    : item.members[0]?._timelineUnitKey ?? item.members[0]?.id ?? item.kind;
+  try {
+    if (item.kind === "single") {
+      const key = item.m?._timelineUnitKey ?? item.m?.id;
+      return typeof key === "string" && key.length > 0 ? key : "single-missing";
+    }
+    const key = item.members[0]?._timelineUnitKey ?? item.members[0]?.id ?? item.kind;
+    return typeof key === "string" && key.length > 0 ? key : item.kind;
+  } catch {
+    return "corrupt-item";
+  }
+}
+
+function lastUserItemIndex(items: RenderItem[]): number {
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const item = items[i];
+    if (item?.kind === "single" && item.m.role === "user") return i;
+  }
+  return -1;
 }
 
 function isNonEmptyId(value: unknown): value is string {
@@ -1071,8 +1062,12 @@ export function MessageList({
   const followBottomRefBox = useRef(followBottomRef);
   followBottomRefBox.current = followBottomRef;
   const rowHeightCacheRef = useRef<Map<string, number>>(new Map());
+  const visibleKeysRef = useRef<string[]>([]);
+  const eagerPayloadKeysRef = useRef<Set<string> | null>(null);
+  const eagerMediaKeysRef = useRef<Set<string> | null>(null);
   const lastViewportAnchorRef = useRef<VisibleVirtualRowAnchor | null>(null);
   const lastPaintSpanRef = useRef({ start: -1, end: -1 });
+  const pinStartRef = useRef<number | undefined>(undefined);
   const beginViewportPreserve = () => {
     viewportPreserveLockRef.current = true;
     const follow = followBottomRefBox.current;
@@ -1096,6 +1091,9 @@ export function MessageList({
     didSnapToBottomRef.current = false;
     viewportPreserveLockRef.current = false;
     rowHeightCacheRef.current = new Map();
+    visibleKeysRef.current = [];
+    eagerPayloadKeysRef.current = null;
+    eagerMediaKeysRef.current = null;
     lastViewportAnchorRef.current = null;
     lastPaintSpanRef.current = { start: -1, end: -1 };
   }
@@ -1235,17 +1233,28 @@ export function MessageList({
       raf = 0;
       const count = visibleCountRef.current;
       if (!paintWindowEnabled(el, count)) return;
-      const next = computePaintRange(
+      const keys = visibleKeysRef.current;
+      const followBottom = followBottomRefBox.current?.current === true;
+      const next = computePaintRange({
         count,
-        el.scrollTop,
-        el.clientHeight,
-        followBottomRefBox.current?.current === true,
-      );
-      setPaintRange((prev) => {
-        if (prev.start === next.start && prev.end === next.end) return prev;
-        if (Math.abs(prev.start - next.start) < 8 && Math.abs(prev.end - next.end) < 8) return prev;
-        return next;
+        scrollTop: el.scrollTop,
+        clientHeight: el.clientHeight,
+        followBottom,
+        keyAt: (index) => keys[index] ?? "",
+        heights: rowHeightCacheRef.current,
+        pinStart: pinStartRef.current,
       });
+      setPaintRange((prev) => selectPaintRange({
+        prev,
+        next,
+        followBottom,
+        count,
+        scrollTop: el.scrollTop,
+        clientHeight: el.clientHeight,
+        keyAt: (index) => keys[index] ?? "",
+        heights: rowHeightCacheRef.current,
+        pinStart: pinStartRef.current,
+      }));
     };
     const onScroll = () => {
       lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(el);
@@ -1259,7 +1268,36 @@ export function MessageList({
       el.removeEventListener("scroll", onScroll);
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [scrollParent, windowVersion, sessionId]);
+  }, [scrollParent, windowVersion, sessionId, messages.length]);
+
+  useEffect(() => {
+    if (!scrollParent) return;
+    void prefetchMarkdownImpl();
+  }, [sessionId, scrollParent]);
+
+  useEffect(() => {
+    const root = listRootRef.current;
+    const scroller = scrollParent;
+    if (!root || !scroller || !didSnapToBottomRef.current) return;
+    if (visibleCountRef.current === 0) return;
+    const warmup = createRowGeometryWarmup({
+      getRows: () => root.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
+      cache: rowHeightCacheRef.current,
+    });
+    const abort = () => warmup.abort();
+    scroller.addEventListener("wheel", abort, { passive: true });
+    scroller.addEventListener("touchstart", abort, { passive: true });
+    scroller.addEventListener("pointerdown", abort);
+    scroller.addEventListener("keydown", abort);
+    warmup.start();
+    return () => {
+      abort();
+      scroller.removeEventListener("wheel", abort);
+      scroller.removeEventListener("touchstart", abort);
+      scroller.removeEventListener("pointerdown", abort);
+      scroller.removeEventListener("keydown", abort);
+    };
+  }, [scrollParent, sessionId, windowVersion, messages.length]);
 
   // Drop legacy substitute rows from an old IndexedDB cache and duplicate
   // engine transport envelopes. The latter remain byte-complete in the tape;
@@ -1433,7 +1471,11 @@ export function MessageList({
     };
     const observer = new ResizeObserver(follow);
     observer.observe(root);
-    recapture();
+    // 只在尚无锚点时初始化。本 effect 因 messages.length 重跑时 DOM 已提交:此刻重捕会用
+    // 已位移的几何覆盖 scroll 时捕获的锚点,让同一 commit 里后面的画窗 span 校正误判
+    // 「锚点未动」而跳过 —— 离底后每追加一行、画窗 start 后移一位就漏掉一行间距(16px),
+    // 视口内容随之上跳。span 校正 effect 结束时会自己重捕最新锚点。
+    if (!lastViewportAnchorRef.current) recapture();
     return () => observer.disconnect();
   }, [scrollParent, followBottomRef, windowVersion, messages.length]);
   useLayoutEffect(() => {
@@ -1453,8 +1495,20 @@ export function MessageList({
   const turnStart = currentTurnStartIndex(renderableMessages);
   // 每条消息是否为「所在轮末条 assistant 正文」(评价反馈行唯一可见位)。按全量 messages 下标对齐,
   // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
-  const ratingFinal = turnFinalAssistantFlags(renderableMessages);
-  const renderItems = coalesceTeam(renderableMessages, 0, sending, liveTurnUsage);
+  let ratingFinal: boolean[] = [];
+  let renderItems: RenderItem[] = [];
+  try {
+    ratingFinal = turnFinalAssistantFlags(renderableMessages);
+    renderItems = coalesceTeam(renderableMessages, 0, sending, liveTurnUsage);
+  } catch {
+    ratingFinal = renderableMessages.map(() => false);
+    renderItems = renderableMessages.map((m, absIdx) => ({
+      kind: "single" as const,
+      m,
+      isLast: absIdx === renderableMessages.length - 1,
+      idx: absIdx,
+    }));
+  }
   itemCountRef.current = renderItems.length;
   const itemKey = renderItemKey;
   // Production scroll surfaces freeze a start index on first content so streaming
@@ -1471,23 +1525,50 @@ export function MessageList({
     );
   const visibleItems = renderItems.slice(windowStart);
   visibleCountRef.current = visibleItems.length;
+  visibleKeysRef.current = visibleItems.map(itemKey);
+  if (eagerPayloadKeysRef.current === null && visibleItems.length > 0) {
+    eagerPayloadKeysRef.current = new Set(
+      visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS).map(itemKey),
+    );
+    eagerMediaKeysRef.current = new Set(
+      visibleItems.slice(-EAGER_MEDIA_TAIL_ITEMS).map(itemKey),
+    );
+  }
   const paintOn = paintWindowEnabled(scrollParent, visibleItems.length)
     && !archive?.loading
     && !archiveQueued;
+  const lastUserVisible = lastUserItemIndex(visibleItems);
+  const pinPaintStart = sending && lastUserVisible >= 0
+    ? lastUserVisible
+    : undefined;
+  pinStartRef.current = pinPaintStart;
   let paintStart = 0;
   let paintEnd = visibleItems.length;
   if (paintOn && scrollParent) {
-    if (followBottomRef?.current) {
-      const vis = Math.max(
-        PAINT_MIN_ITEMS,
-        Math.ceil(scrollParent.clientHeight / PAINT_ESTIMATE_PX) + PAINT_OVERSCAN * 2,
-      );
-      paintStart = Math.max(0, visibleItems.length - vis);
-      paintEnd = visibleItems.length;
-    } else {
-      paintStart = Math.min(paintRange.start, Math.max(0, visibleItems.length - PAINT_MIN_ITEMS));
-      paintEnd = Math.min(visibleItems.length, Math.max(paintRange.end, paintStart + PAINT_MIN_ITEMS));
-    }
+    const followBottom = followBottomRef?.current === true;
+    const keyAt = (index: number) => itemKey(visibleItems[index]);
+    const desired = computePaintRange({
+      count: visibleItems.length,
+      scrollTop: scrollParent.scrollTop,
+      clientHeight: scrollParent.clientHeight,
+      followBottom,
+      keyAt,
+      heights: rowHeightCacheRef.current,
+      pinStart: pinPaintStart,
+    });
+    const chosen = selectPaintRange({
+      prev: paintRange,
+      next: desired,
+      followBottom,
+      count: visibleItems.length,
+      scrollTop: scrollParent.scrollTop,
+      clientHeight: scrollParent.clientHeight,
+      keyAt,
+      heights: rowHeightCacheRef.current,
+      pinStart: pinPaintStart,
+    });
+    paintStart = chosen.start;
+    paintEnd = chosen.end;
   }
   const paintedItems = visibleItems.slice(paintStart, paintEnd);
   const topSpacerPx = paintStart > 0
@@ -1501,8 +1582,8 @@ export function MessageList({
     if (root) {
       for (const row of root.querySelectorAll<HTMLElement>("[data-chat-virtual-key]")) {
         const key = row.getAttribute("data-chat-virtual-key");
-        const height = row.offsetHeight;
-        if (key && height > 0) rowHeightCacheRef.current.set(key, height);
+        const height = measureMountedRowHeight(row);
+        if (key && height !== null) rowHeightCacheRef.current.set(key, height);
       }
     }
     const el = scrollParent;
@@ -1605,6 +1686,7 @@ export function MessageList({
           onRespondPermission={onRespondPermission}
           readOnly={readOnly}
           failurePresentedBelow={failurePresentedBelow}
+          eagerPayload={eagerPayloadKeysRef.current?.has(rowId) === true}
         />
       </MessageBoundary>
     );
@@ -1700,15 +1782,28 @@ export function MessageList({
           style={{ height: topSpacerPx }}
         />
       ) : null}
-      {paintedItems.map((item) => (
-        <div
-          key={itemKey(item)}
-          className="chat-virtual-item chat-timeline-row"
-          data-chat-virtual-key={itemKey(item)}
-        >
-          {renderItem(item)}
-        </div>
-      ))}
+      {paintedItems.map((item, paintedIndex) => {
+        const key = itemKey(item);
+        const eagerMedia = eagerMediaKeysRef.current?.has(key) === true;
+        const visibleIndex = paintStart + paintedIndex;
+        const liveRow =
+          (typeof pinPaintStart === "number" && visibleIndex >= pinPaintStart) ||
+          visibleIndex >= visibleItems.length - PAINT_MIN_ITEMS;
+        return (
+          <TimelineEagerMediaContext.Provider key={key} value={eagerMedia}>
+            <div
+              className={
+                liveRow
+                  ? "chat-virtual-item chat-timeline-row chat-timeline-row-live"
+                  : "chat-virtual-item chat-timeline-row"
+              }
+              data-chat-virtual-key={key}
+            >
+              {renderItem(item)}
+            </div>
+          </TimelineEagerMediaContext.Provider>
+        );
+      })}
       {paintEnd < visibleItems.length ? (
         <div
           aria-hidden

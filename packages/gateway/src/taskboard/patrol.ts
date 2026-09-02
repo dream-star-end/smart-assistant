@@ -31,11 +31,17 @@
 import {
   getUsageSummary,
   isProjectContextEnabled,
+  loadFrozenProjectContext,
   loadProjectContext,
   parseProjectWorkspace,
   resolveProjectCwd,
+  type FrozenProjectContext,
 } from '@openclaude/storage'
 import { createRunContextDescriptor } from '../runContextPersist.js'
+import {
+  resolveTurnProjectContext,
+  type ResolveTurnProjectContextOpts,
+} from '../projectContextRuntime.js'
 import { getProject } from './db/projects.js'
 import { createActivity } from './db/activity.js'
 import { createComment, listComments } from './db/comments.js'
@@ -75,6 +81,7 @@ import {
   type TicketPriority,
   type TicketRun,
   type TicketStatus,
+  alignedLeaseTtlMs,
   buildPatrolSessionKey,
 } from './domain.js'
 import { evaluateEntryCondition, parseEntryCondition } from './entryCondition.js'
@@ -102,6 +109,91 @@ import { assertTransition } from './stateMachine.js'
 
 const PRIORITY_RANK: Record<TicketPriority, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
 const TERMINAL = new Set(['done', 'canceled'])
+export const STAGE_PROJECT_CONTEXT_MAX_CHARS = 4000
+export const STAGE_PROJECT_CONTEXT_TRUNC = '…[截断]'
+
+function clipStageProjectContext(text: string, max = STAGE_PROJECT_CONTEXT_MAX_CHARS): string {
+  if (text.length <= max) return text
+  const keep = Math.max(0, max - STAGE_PROJECT_CONTEXT_TRUNC.length)
+  return `${text.slice(0, keep)}${STAGE_PROJECT_CONTEXT_TRUNC}`
+}
+
+/** Compact project instructions for stage agents (no MCP skills). */
+export function formatStageProjectContext(snap: {
+  instructions?: string | null
+  skillOverlay?: readonly string[]
+  skills?: readonly { name: string }[]
+}): string | null {
+  const instructions = snap.instructions?.trim() ?? ''
+  const overlay =
+    snap.skillOverlay ??
+    (snap.skills && snap.skills.length > 0 ? snap.skills.map((s) => s.name) : undefined)
+  const names = overlay && overlay.length > 0 ? [...overlay] : []
+  if (!instructions && names.length === 0) return null
+
+  const skillHeader = '项目技能索引（只读，本阶段无 MCP skills）：'
+  const render = (instr: string, kept: string[], omitted: number): string => {
+    const parts: string[] = []
+    if (instr) parts.push(instr)
+    if (kept.length > 0 || omitted > 0) {
+      let line = `${skillHeader}${kept.join('、')}`
+      if (omitted > 0) line += STAGE_PROJECT_CONTEXT_TRUNC
+      parts.push(line)
+    }
+    return parts.join('\n\n')
+  }
+
+  if (names.length === 0) return clipStageProjectContext(instructions)
+
+  let kept = names
+  let omitted = 0
+  let out = render(instructions, kept, omitted)
+  while (out.length > STAGE_PROJECT_CONTEXT_MAX_CHARS && kept.length > 0) {
+    kept = kept.slice(0, -1)
+    omitted += 1
+    out = render(instructions, kept, omitted)
+  }
+  if (out.length <= STAGE_PROJECT_CONTEXT_MAX_CHARS) return out
+  return clipStageProjectContext(out)
+}
+
+/**
+ * Authoritative resolve (master seed + pinned assets) then a single freeze.
+ * Stage prompt and Codex PROJECT slot must consume this same snapshot.
+ */
+export async function freezeStageProjectContext(opts: {
+  boardProjectId: string
+  workspaceSpec?: Parameters<typeof loadFrozenProjectContext>[0]['workspaceSpec']
+  workspaceCwd?: string | null
+  cwdSource?: string | null
+  db?: Parameters<typeof loadFrozenProjectContext>[0]['db']
+  env?: NodeJS.ProcessEnv
+  fetcher?: ResolveTurnProjectContextOpts['fetcher']
+}): Promise<{
+  frozen: FrozenProjectContext
+  projectContextText: string | null
+  resolved: Awaited<ReturnType<typeof resolveTurnProjectContext>>
+}> {
+  const resolved = await resolveTurnProjectContext({
+    boardProjectId: opts.boardProjectId,
+    env: opts.env,
+    fetcher: opts.fetcher,
+  })
+  const frozen = await loadFrozenProjectContext({
+    boardProjectId: opts.boardProjectId,
+    assets: resolved?.assets,
+    assetsRevision: resolved?.assetsRevision,
+    workspaceSpec: opts.workspaceSpec ?? null,
+    workspaceCwd: opts.workspaceCwd ?? null,
+    cwdSource: opts.cwdSource ?? null,
+    db: opts.db ?? null,
+  })
+  return {
+    frozen,
+    projectContextText: formatStageProjectContext(frozen),
+    resolved,
+  }
+}
 
 export interface PatrolDelegateInput {
   agentId: string
@@ -116,6 +208,7 @@ export interface PatrolDelegateInput {
   projectId?: string
   workspaceCwd?: string
   runContext?: import('../runContextPersist.js').RunContextDescriptor
+  frozenProjectContext?: FrozenProjectContext | null
 }
 
 export interface PatrolDelegateResult {
@@ -535,7 +628,8 @@ export class PatrolEngine {
       hasLease: true,
       autoClose: stage.autoClose,
     })
-    const run = acquireLease(db, ticket.id, stage.id, owner, this.leaseTtlMs, {
+    const ttlMs = alignedLeaseTtlMs(stage.timeoutSec, this.leaseTtlMs, this.leaseRenewIntervalMs)
+    const run = acquireLease(db, ticket.id, stage.id, owner, ttlMs, {
       agentId: stage.agentId,
       trigger: 'patrol',
       now,
@@ -579,6 +673,26 @@ export class PatrolEngine {
       const cwd = resolveProjectCwd(spec, boardProject.id)
       if (cwd.ok) workspaceCwd = cwd.cwd
     }
+    let projectContextText: string | null = null
+    let frozenProjectContext: FrozenProjectContext | null = null
+    if (projectEnabled && boardProject) {
+      try {
+        const freeze = await freezeStageProjectContext({
+          boardProjectId: boardProject.id,
+          workspaceSpec: parseProjectWorkspace(boardProject.workspaceSpec ?? boardProject.workspace),
+          workspaceCwd: workspaceCwd ?? null,
+          cwdSource: workspaceCwd ? 'project_workspace' : 'default',
+          db,
+        })
+        frozenProjectContext = freeze.frozen
+        projectContextText = freeze.projectContextText
+      } catch (err) {
+        this.log('taskboard project context load failed', {
+          projectId: boardProject.id,
+          err: String(err),
+        })
+      }
+    }
     let prompt: string
     try {
       prompt = renderPrompt({
@@ -591,6 +705,7 @@ export class PatrolEngine {
           ? { key: boardProject.key, name: boardProject.name, workspace: workspaceCwd ?? null }
           : null,
         projectSlotInjected: projectEnabled,
+        projectContextText,
       }).prompt
     } catch (err) {
       await this.finishRun(db, ticket, stage, run, settings, {
@@ -602,10 +717,11 @@ export class PatrolEngine {
     }
 
     let leaseLost = !owner
+    const leaseTtlMs = alignedLeaseTtlMs(stage.timeoutSec, this.leaseTtlMs, this.leaseRenewIntervalMs)
     const renewTimer = owner
       ? setInterval(() => {
           try {
-            if (!renewLease(db, run.id, owner, this.leaseTtlMs, this.nowFn())) {
+            if (!renewLease(db, run.id, owner, leaseTtlMs, this.nowFn())) {
               leaseLost = true
               this.log('taskboard lease renewal lost', { runId: run.id, owner })
             }
@@ -630,6 +746,7 @@ export class PatrolEngine {
           timeoutSec: stage.timeoutSec,
           projectId: boardProject?.id,
           workspaceCwd,
+          frozenProjectContext,
           runContext: createRunContextDescriptor({
             runId: run.id,
             boardProjectId: boardProject?.id ?? null,

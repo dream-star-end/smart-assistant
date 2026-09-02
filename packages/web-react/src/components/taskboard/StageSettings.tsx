@@ -570,7 +570,7 @@ export function StageSettings({
       const [pipes, agentList, modelList] = await Promise.all([
         taskboardApi.listPipelines(auth, projectId),
         taskboardApi.listAgents(auth),
-        api.getPublicModels(auth).catch(() => [] as PublicModel[]),
+        api.getPublicModels(auth).then((r) => r.models).catch(() => [] as PublicModel[]),
       ])
       const details = await Promise.all(pipes.map((p) => taskboardApi.getPipeline(auth, p.id)))
       if (!mounted.current || epoch.current !== gate) return
