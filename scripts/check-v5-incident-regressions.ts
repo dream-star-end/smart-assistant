@@ -376,6 +376,10 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // 2026-09-02 selfhost rel-58ae73030 已上线且缺 Incident trailer；只冻结其不可变祖先，
   // 后续 3bda58c5a 起逐条走 trailer 门。
   "58ae730303f3ad11d56e15fea49270256ee0c6e8",
+  // 2026-09-02 双向全量同步冻结:selfhost tip ce6b91692(rel 已上线)含 9 条缺 trailer 的
+  // fix(v5)(画窗/HUD/委派计费批)；源提交不可改写,只豁免其不可变祖先,证据以
+  // T60/T61 浏览器用例 + check-v5-delegate-billing-requestid.ts 部署门补齐。
+  "ce6b91692c8b87a59be81e50fdc145e0da045ace",
 ] as const;
 
 function checkTrailerClosure(): number {

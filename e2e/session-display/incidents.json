@@ -2413,7 +2413,7 @@
       "id": "INC-20260902-TIMELINE-PAINT-VISION-HINT",
       "occurredAt": "2026-09-02",
       "severity": "P1",
-      "symptom": "V5 selfhost Web 时间线:离底后新发送的用户消息落入底 spacer 迟迟不显示;流式回合中 content-visibility:auto skipped 行的 200px 估高写回高度缓存,视口内已渲染内容变空白,滚动后才恢复。同批:catalog supports_vision=false 使 cursor 家族(Read 可原生看图)的上传图片提示把 oc-vision CLI 排在 Read 之前,agent 绕过原生识图。",
+      "symptom": "V5 selfhost Web 时间线:离底后新发送的用户消息落入底 spacer 迟迟不显示;流式回合中 content-visibility:auto skipped 行的 200px 估高写回高度缓存,视口内已渲染内容变空白,滚动后才恢复。同批:catalog supports_vision=false 使 cursor 家族(Read 可原生看图)的上传图片提示把 oc-vision CLI 排在 Read 之前,agent 绕过原生识图。 反合复现:距底 80px 时追加乐观 user 行,ResizeObserver effect 在 messages.length 变化时用已位移 DOM 重捕锚点,画窗 span 校正被跳过,视口内容上跳一行间距。",
       "rootFixCommit": "db14273e",
       "regressions": [
         {
@@ -2450,10 +2450,16 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/promptSlotsDeepseekVision.test.ts",
           "assertion": "cursor-fable-5.1-high + catalog supportsVision=false 不声称看不到图,先 Read 再 oc-vision"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T60 离底后新追加的 user 行立刻进入画窗而非落入底 spacer"
         }
       ],
       "coverageCommits": [
-        "db14273e"
+        "db14273e",
+        "2a38336c"
       ]
     },
     {
@@ -2559,6 +2565,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/PinnedTaskTracker.test.tsx",
           "assertion": "hydration 形态 TodoWrite(inputJson.todos) 在当前轮未完成时仍可提取"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T61 刷新后 HUD 仍钉住且畸形 agent-group 只落 MessageBoundary 邻居仍在"
         }
       ],
       "coverageCommits": [
@@ -2572,7 +2583,7 @@
       "occurredAt": "2026-09-02",
       "severity": "P1",
       "symptom": "Codex/Grok 引擎委派子任务从不写入 usage_records.mode=delegate：adapter 只在 master 签发 32-hex requestId 时才 emit billing，handleDelegateTask 的 sessions.submit 第 6 参写死 undefined。GLM/CCB 委派走 anthropicProxy 不受影响。",
-      "rootFixCommit": "ed9bd509",
+      "rootFixCommit": "654ca01f",
       "regressions": [
         {
           "layer": "unit",
@@ -2633,13 +2644,18 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/delegateEngineBillingRuntime.test.ts",
           "assertion": "prefers journal attribution when the billing frame disagrees"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-delegate-billing-requestid.ts",
+          "assertion": "handleDelegateTask must pass the minted requestId to sessions.submit (was undefined pre-fix)"
         }
       ],
       "coverageCommits": [
-        "ed9bd509",
-        "3c0360f1d",
-        "a4cfd2d02",
-        "e05ad9492"
+        "654ca01f",
+        "97677249",
+        "de1dd178",
+        "6c2ee090"
       ]
     },
     {
