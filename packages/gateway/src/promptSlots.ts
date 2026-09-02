@@ -296,7 +296,7 @@ function hasMcpTool(ctx: Pick<PromptSlotContext, 'availableMcpTools'>, name: str
   return ctx.availableMcpTools === undefined || ctx.availableMcpTools.includes(name)
 }
 
-function sanitizeUnavailableMcpClaims(
+export function sanitizeUnavailableMcpClaims(
   content: string,
   availableMcpTools: string[] | undefined,
 ): string {

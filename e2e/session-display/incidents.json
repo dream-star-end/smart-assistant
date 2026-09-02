@@ -2384,7 +2384,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-cursor-sand-inference.ts",
-          "assertion": "[cursor-sand-inference] PASS — Sand keys use the real InferenceService relay; native Cursor remains isolated to native keys and Auto"
+          "assertion": "[cursor-sand-inference] PASS — Sand keys use InferenceService with native tool schemas; native Cursor stays isolated to native keys and Auto"
         }
       ],
       "coverageCommits": [
@@ -2451,6 +2451,63 @@
       ],
       "coverageCommits": [
         "db14273e"
+      ]
+    },
+    {
+      "id": "INC-20260902-CCB-DEFERRED-TOOL-ADAPT",
+      "occurredAt": "2026-09-02",
+      "severity": "P1",
+      "symptom": "Fable/CCB（claude-code-best）个人版会话里 SearchExtraTools/ExecuteExtraTool 被前端渲染成裸扳手卡、delegate 不成 agent-group、mcp-memory skill_save 因 CCB 跳过 zod 校验报 reading 'trim' / tags.join is not a function；同时 CCB availableMcpTools 只取 config.mcpServers、内置 openclaude-memory 未登记，sanitizeUnavailableMcpClaims 把 user.md/SOUL/SKILLS 分工规则里的 delegate_task/delegate_tasks 等 19 个平台工具名抹成「（当前未注册）」，规则注入了但不可读，Fable 回合自己执行而不委派。",
+      "rootFixCommit": "58ae7303",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/subprocessRunnerMcpAvailability.test.ts",
+          "assertion": "CCB prompt path registers platform MCP tools before buildPromptContext"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/subprocessRunnerMcpAvailability.test.ts",
+          "assertion": "advertising the full platform MCP set does not redact tools as unregistered"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/agentEfficiencyGuard.test.ts",
+          "assertion": "recognizes delegate through mcp__ names and the CCB ExecuteExtraTool wrapper"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/mcp-memory/src/__tests__/skillSaveArgs.test.ts",
+          "assertion": "accepts `content` as an alias for body (CCB ExecuteExtraTool skips schema validation)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/mcp-memory/src/__tests__/skillSaveArgs.test.ts",
+          "assertion": "coerces comma-separated tags string instead of crashing on tags.join"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/extraTool.test.ts",
+          "assertion": "parseExecuteExtraToolResult decodes the {result:[{text}],tool_name} envelope"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/tool/meta.test.ts",
+          "assertion": "ExecuteExtraTool → 内层 MCP 工具名 + params,输出取信封 text"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "ExecuteExtraTool{delegate_task} live frames become an agent-group with friendly preview"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-ccb-mcp-availability.ts",
+          "assertion": "[ccb-mcp-availability] PASS — CCB prompt advertises built-in openclaude-memory tools; ExecuteExtraTool wrapper unwraps to inner MCP tool"
+        }
+      ],
+      "coverageCommits": [
+        "3bda58c5"
       ]
     }
   ]

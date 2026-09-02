@@ -191,6 +191,9 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
   if (/^packages\/storage\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
     return requireCi("test:storage", "CI job storage → npm run test:storage");
   }
+  if (/^packages\/mcp-memory\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
+    return requireCi("test:mcp-memory", "CI job storage → npm run test:mcp-memory");
+  }
   if (/^packages\/web-react\/src\/.+\.test\.(ts|tsx)$/.test(path)) {
     return requireCi("test:web-react", "CI job web-react → npm run test:web-react");
   }
@@ -370,6 +373,9 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // 2026-08-28 selfhost rel-e9496b174 已上线；其源提交不可改写。只冻结 e949
   // 及祖先，后续 892bac026/CCB overflow/permission restore 仍逐条走 trailer 门。
   "e9496b17426877f5163cdbb37ffaa3d4b255bff9",
+  // 2026-09-02 selfhost rel-58ae73030 已上线且缺 Incident trailer；只冻结其不可变祖先，
+  // 后续 3bda58c5a 起逐条走 trailer 门。
+  "58ae730303f3ad11d56e15fea49270256ee0c6e8",
 ] as const;
 
 function checkTrailerClosure(): number {
