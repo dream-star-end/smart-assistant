@@ -20,10 +20,13 @@ afterEach(() => {
 
 describe('PreferencesTab · 对话行为', () => {
   test('默认模型切到 1M 前确认长上下文累计计费风险', async () => {
-    vi.spyOn(api, 'getPublicModels').mockResolvedValue([
-      { id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol' },
-      { id: 'gpt-5.6-sol-1m', display_name: 'GPT-5.6-Sol' },
-    ])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({
+      models: [
+        { id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol' },
+        { id: 'gpt-5.6-sol-1m', display_name: 'GPT-5.6-Sol' },
+      ],
+      lockedModels: [],
+    })
     const onPatch = vi.fn(async () => {})
     render(
       <PreferencesTab
@@ -48,7 +51,7 @@ describe('PreferencesTab · 对话行为', () => {
   })
 
   test('不再提供自动继续执行设置', () => {
-    vi.spyOn(api, 'getPublicModels').mockResolvedValue([])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
     render(
       <PreferencesTab
         auth={auth}
@@ -69,7 +72,7 @@ describe('PreferencesTab · 对话行为', () => {
 
 describe('PreferencesTab · Auto-Dream', () => {
   test('API Key 管理只为管理员挂载', () => {
-    vi.spyOn(api, 'getPublicModels').mockResolvedValue([])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
     const common = {
       auth,
       prefs: {},
@@ -89,7 +92,7 @@ describe('PreferencesTab · Auto-Dream', () => {
   })
 
   test('显示 MiniMax 全面审计范围，并提供优化建议入口', async () => {
-    vi.spyOn(api, 'getPublicModels').mockResolvedValue([])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
     const openMemory = vi.fn()
 
     render(
@@ -129,7 +132,7 @@ describe('PreferencesTab · Auto-Dream', () => {
   })
 
   test('开启全面优化前必须确认审计、计费和匿名上报', async () => {
-    vi.spyOn(api, 'getPublicModels').mockResolvedValue([])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
     const onPatch = vi.fn(async () => {})
     render(
       <PreferencesTab
@@ -163,7 +166,7 @@ describe('PreferencesTab · Auto-Dream', () => {
   })
 
   test('不可用提示也不解释后台模型身份', () => {
-    vi.spyOn(api, 'getPublicModels').mockResolvedValue([])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
     render(
       <PreferencesTab
         auth={auth}

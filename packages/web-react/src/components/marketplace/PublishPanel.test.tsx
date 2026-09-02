@@ -127,7 +127,10 @@ test("校验失败的错误落在出错字段上(aria-invalid),而不是只在�
 test("切换发布类型不丢草稿:写好的 SKILL.md 正文切走再切回仍在", async () => {
   listSkills.mockResolvedValue([]);
   listMarketplaceMyPublishes.mockResolvedValue([]);
-  getPublicModels.mockResolvedValue([{ id: "glm-5.2", displayName: "GLM" }]);
+  getPublicModels.mockResolvedValue({
+    models: [{ id: "glm-5.2", displayName: "GLM" }],
+    lockedModels: [],
+  });
   listMarketplaceInstalled.mockResolvedValue([]);
 
   render(<PublishPanel auth={auth} />);
@@ -163,7 +166,10 @@ test("API 插件展示 AI 创建入口，同时保持 connector kind 的旧调�
 test("智能体可从已安装 Skill / Plugin 选择必需或可选组合能力", async () => {
   listSkills.mockResolvedValue([]);
   listMarketplaceMyPublishes.mockResolvedValue([]);
-  getPublicModels.mockResolvedValue([{ id: "glm-5.2", displayName: "GLM" }]);
+  getPublicModels.mockResolvedValue({
+    models: [{ id: "glm-5.2", displayName: "GLM" }],
+    lockedModels: [],
+  });
   listMarketplaceInstalled.mockResolvedValue([
     { slug: "writer-skill", name: "写作 Skill", kind: "skill", listingState: "active" },
     { slug: "paper-plugin", name: "论文 Plugin", kind: "connector", listingState: "active" },
@@ -247,7 +253,10 @@ test("技能:只改过版本号与标签,载入旧提交前也必须二次确认
 
 test("智能体:只改过工具集,载入旧提交前也必须二次确认", async () => {
   listSkills.mockResolvedValue([]);
-  getPublicModels.mockResolvedValue([{ id: "glm-5.2", displayName: "GLM" }]);
+  getPublicModels.mockResolvedValue({
+    models: [{ id: "glm-5.2", displayName: "GLM" }],
+    lockedModels: [],
+  });
   listMarketplaceInstalled.mockResolvedValue([]);
 
   renderPanel(
@@ -270,7 +279,10 @@ test("智能体:只改过工具集,载入旧提交前也必须二次确认", asy
 
 test("智能体:模型是系统自动选中的默认项,空白表单不该被当成「已填写」", async () => {
   listSkills.mockResolvedValue([]);
-  getPublicModels.mockResolvedValue([{ id: "glm-5.2", displayName: "GLM" }]);
+  getPublicModels.mockResolvedValue({
+    models: [{ id: "glm-5.2", displayName: "GLM" }],
+    lockedModels: [],
+  });
   listMarketplaceInstalled.mockResolvedValue([]);
 
   renderPanel(

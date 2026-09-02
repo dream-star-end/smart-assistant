@@ -68,6 +68,7 @@ export function SettingsCenter({
   onOpenRepo,
   feedbackContext,
   initialSection = "account",
+  subscribeOpenSignal = 0,
 }: {
   open: boolean;
   auth: AuthSession | null;
@@ -85,10 +86,13 @@ export function SettingsCenter({
   onOpenRepo?: () => void;
   feedbackContext?: { sessionId: string | null; requestId: string | null };
   initialSection?: SettingsSection;
+  /** Increment to programmatically open SubscriptionDialog on the account tab. */
+  subscribeOpenSignal?: number;
 }) {
   const desktop = useMdViewport();
   const [section, setSection] = useState<SettingsSection>(initialSection);
   const [subOpen, setSubOpen] = useState(false);
+  const lastSubscribeSignal = useRef(0);
   const [ledgerReload, setLedgerReload] = useState(0);
 
   const [prefs, setPrefs] = useState<PrefsView | null>(null);
@@ -102,11 +106,15 @@ export function SettingsCenter({
   useEffect(() => {
     if (open) {
       setSection(initialSection);
+      if (subscribeOpenSignal > 0 && subscribeOpenSignal !== lastSubscribeSignal.current) {
+        lastSubscribeSignal.current = subscribeOpenSignal;
+        setSubOpen(true);
+      }
     } else {
       setSection("account");
       setSubOpen(false);
     }
-  }, [open, initialSection]);
+  }, [open, initialSection, subscribeOpenSignal]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: prefsReloadTick 是显式重试触发器。
   useEffect(() => {

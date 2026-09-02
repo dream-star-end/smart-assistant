@@ -12,7 +12,7 @@ import {
   cursorModelById,
   formatCostX,
 } from '@openclaude/protocol'
-import type { PublicModel } from './types'
+import type { LockedPublicModel, PublicModel } from './types'
 
 export type CursorPickerRow = {
   family: CursorEngineFamilyId
@@ -27,16 +27,26 @@ export type ContextPickerRow = {
   spec: ContextTierFamily
 }
 
+export type LockedCursorFamilyRow = {
+  family: CursorEngineFamilyId
+  label: string
+  minPlanCode: string
+  minPlanName?: string
+  representative: LockedPublicModel
+}
+
 export type ModelPickerRow =
   | { kind: 'plain'; model: PublicModel }
   | { kind: 'cursor-family'; row: CursorPickerRow }
   | { kind: 'context-family'; row: ContextPickerRow }
+  | { kind: 'locked-cursor-family'; row: LockedCursorFamilyRow }
+  | { kind: 'locked-plain'; model: LockedPublicModel }
 
 export function cursorDefFor(modelId: string | null | undefined): CursorEngineModel | undefined {
   return cursorModelById(modelId)
 }
 
-export function modelCostLabel(model: PublicModel | undefined): string | undefined {
+export function modelCostLabel(model: { cost_x?: number } | undefined): string | undefined {
   const raw = model?.cost_x
   return formatCostX(typeof raw === 'number' ? raw : undefined)
 }
@@ -52,11 +62,68 @@ export function isModelDegraded(m: PublicModel): boolean {
 /** 整行(plain 模型或家族全员)是否降级——降级行在 picker 里沉底。 */
 function rowDegraded(row: ModelPickerRow): boolean {
   if (row.kind === 'plain') return isModelDegraded(row.model)
+  if (row.kind === 'locked-plain' || row.kind === 'locked-cursor-family') return false
   return row.row.members.length > 0 && row.row.members.every(isModelDegraded)
 }
 
+function pickLockedCursorRepresentative(members: readonly LockedPublicModel[]): LockedPublicModel {
+  const family = cursorModelById(members[0]?.id)?.family
+  const desiredEffort = family ? cursorFamilyDefaultEffort(family) : null
+  const desiredFast = family ? cursorFamilyDefaultFast(family) : false
+  const match = (effort: ReturnType<typeof cursorFamilyDefaultEffort>, fast: boolean) =>
+    members.find((model) => {
+      const def = cursorModelById(model.id)
+      return Boolean(def && def.effort === effort && def.fast === fast)
+    })
+  return (
+    match(desiredEffort, desiredFast) ??
+    members.find((model) => cursorModelById(model.id)?.fast === false) ??
+    members[0]!
+  )
+}
+
+function lockedPickerRows(
+  models: readonly PublicModel[],
+  lockedModels: readonly LockedPublicModel[],
+  usableCursorFamilies: ReadonlySet<CursorEngineFamilyId>,
+): ModelPickerRow[] {
+  const usableIds = new Set(models.map((model) => model.id))
+  const rows: ModelPickerRow[] = []
+  const seenLockedCursor = new Set<CursorEngineFamilyId>()
+  const seenLockedPlain = new Set<string>()
+  for (const locked of lockedModels) {
+    const cursor = cursorModelById(locked.id)
+    if (cursor) {
+      if (usableCursorFamilies.has(cursor.family) || seenLockedCursor.has(cursor.family)) continue
+      seenLockedCursor.add(cursor.family)
+      const members = lockedModels.filter(
+        (item) => cursorModelById(item.id)?.family === cursor.family,
+      )
+      const representative = pickLockedCursorRepresentative(members)
+      rows.push({
+        kind: 'locked-cursor-family',
+        row: {
+          family: cursor.family,
+          label: cursor.familyLabel,
+          minPlanCode: representative.min_plan_code,
+          minPlanName: representative.min_plan_name,
+          representative,
+        },
+      })
+      continue
+    }
+    if (usableIds.has(locked.id) || seenLockedPlain.has(locked.id)) continue
+    seenLockedPlain.add(locked.id)
+    rows.push({ kind: 'locked-plain', model: locked })
+  }
+  return rows
+}
+
 /** Collapse public Cursor / GPT / Kimi catalog rows into one picker row per family. */
-export function modelPickerRows(models: readonly PublicModel[]): ModelPickerRow[] {
+export function modelPickerRows(
+  models: readonly PublicModel[],
+  lockedModels: readonly LockedPublicModel[] = [],
+): ModelPickerRow[] {
   const seenCursor = new Set<CursorEngineFamilyId>()
   const seenContext = new Set<ContextTierFamilyId>()
   const rows: ModelPickerRow[] = []
@@ -93,9 +160,10 @@ export function modelPickerRows(models: readonly PublicModel[]): ModelPickerRow[
     }
     rows.push({ kind: 'plain', model })
   }
-  // 降级(暂不可用)的行沉到列表底部:坏路由长期钉在首位会抢走可用模型的视觉焦点。
-  // 稳定分区,组内保持后端目录原始顺序。
-  return [...rows.filter((row) => !rowDegraded(row)), ...rows.filter(rowDegraded)]
+  // 可用 → 订阅锁定 → 降级沉底。家族只要 models 里有任一成员就不渲染锁定行。
+  const usable = rows.filter((row) => !rowDegraded(row))
+  const degraded = rows.filter(rowDegraded)
+  return [...usable, ...lockedPickerRows(models, lockedModels, seenCursor), ...degraded]
 }
 
 export function availableCursorEfforts(members: readonly PublicModel[]): PlatformReasoningEffort[] {

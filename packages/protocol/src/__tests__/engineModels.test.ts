@@ -72,14 +72,39 @@ describe('Cursor engine model authority', () => {
       CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),
       {
         id: 'cursor-grok-4.6-high',
-        displayName: 'Cursor Grok 4.6 High',
+        displayName: 'Grok 4.6 High',
         upstreamModel: 'cursor-grok-4.6-high',
         family: 'grok-4.6',
-        familyLabel: 'Cursor Grok 4.6',
+        familyLabel: 'Grok 4.6',
         effort: 'high',
         fast: false,
       },
     )
+    assert.equal(
+      CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-auto')?.familyLabel,
+      'Cursor Auto',
+    )
+    assert.equal(
+      CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-auto')?.displayName,
+      'Cursor Auto',
+    )
+    assert.equal(
+      CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-opus-5-high')?.displayName,
+      'Opus 5 High',
+    )
+    assert.equal(
+      CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-fable-5.1-xhigh')?.displayName,
+      'Fable 5.1 Extra High (Non-ZDR)',
+    )
+    assert.equal(
+      CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-composer-2.5')?.familyLabel,
+      'Composer 2.5',
+    )
+    for (const model of CURSOR_ENGINE_MODELS) {
+      if (model.family === 'auto') continue
+      assert.equal(model.familyLabel.startsWith('Cursor '), false, model.id)
+      assert.equal(model.displayName.startsWith('Cursor '), false, model.id)
+    }
     assert.equal(
       findCursorEngineModel('opus-5', 'high', true)?.upstreamModel,
       'claude-opus-5-thinking-high-fast',

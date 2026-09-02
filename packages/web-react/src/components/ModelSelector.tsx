@@ -8,7 +8,7 @@ import {
   cursorFamilySupportsFast,
   cursorModelById,
 } from '@openclaude/protocol'
-import { AlertTriangle, Check, ChevronDown, Cpu, Users } from 'lucide-react'
+import { AlertTriangle, Check, ChevronDown, Cpu, Lock, Users } from 'lucide-react'
 import {
   availableCursorEfforts,
   contextFamilyHasLong,
@@ -24,7 +24,7 @@ import {
 } from '../lib/cursorModelPicker'
 import type { PreferenceEffort } from '../lib/modelPreferences'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
-import type { PublicModel } from '../lib/types'
+import type { LockedPublicModel, PublicModel } from '../lib/types'
 import { cn } from '../lib/utils'
 import {
   LONG_CONTEXT_CANCEL_TEXT,
@@ -62,10 +62,33 @@ export function modelLabel(m: PublicModel): string {
   return typeof dn === 'string' && dn.trim() ? dn : m.id
 }
 
-function CostMark({ model }: { model?: PublicModel }) {
+function CostMark({ model }: { model?: { cost_x?: number } }) {
   const label = modelCostLabel(model)
   if (!label) return null
   return <span className="text-[11px] font-normal text-faint">{label}</span>
+}
+
+function promoLabelOf(model: { promo_label?: unknown } | undefined): string | undefined {
+  const value = model?.promo_label
+  return typeof value === 'string' && value.trim() ? value : undefined
+}
+
+function PromoBadge({ label }: { label?: string }) {
+  if (!label) return null
+  return <Badge tone="warning">{label}</Badge>
+}
+
+export type LockedSelectInfo = {
+  label: string
+  minPlanCode: string
+  minPlanName?: string
+  modelId: string
+}
+
+function lockedPlainLabel(model: LockedPublicModel): string {
+  return typeof model.display_name === 'string' && model.display_name.trim()
+    ? model.display_name
+    : model.id
 }
 
 /**
@@ -107,8 +130,10 @@ function triggerLabel(
  */
 export function ModelSelector({
   models,
+  lockedModels = [],
   selectedId,
   onSelect,
+  onLockedSelect,
   loading,
   teamEngineActive,
   effortSupported,
@@ -116,8 +141,10 @@ export function ModelSelector({
   onSelectEffort,
 }: {
   models: PublicModel[]
+  lockedModels?: LockedPublicModel[]
   selectedId?: string
   onSelect: (id: string) => void
+  onLockedSelect?: (info: LockedSelectInfo) => void
   loading?: boolean
   teamEngineActive?: boolean
   effortSupported?: readonly string[]
@@ -133,7 +160,8 @@ export function ModelSelector({
   const baseLabel = triggerLabel(models, selectedId, loading)
   const label = teamEngineActive ? engineLabel : baseLabel
   const disabled = loading || models.length === 0
-  const rows = modelPickerRows(models)
+  const rows = modelPickerRows(models, lockedModels)
+  const selectedPromo = promoLabelOf(selected)
   const selectedFamilyRow = rows.find(
     (row) => row.kind === 'cursor-family' && row.row.family === selectedCursor?.family,
   )
@@ -215,6 +243,7 @@ export function ModelSelector({
             {teamEngineActive && <span className="hidden sm:inline">{'团队模式 · '}</span>}
             <span className="max-w-[6.5rem] truncate sm:max-w-[180px]">{label}</span>
             {!teamEngineActive && <CostMark model={selected} />}
+            {!teamEngineActive && <PromoBadge label={selectedPromo} />}
             <ChevronDown size={14} className="text-faint" />
           </button>
         </DropdownMenuTrigger>
@@ -269,6 +298,7 @@ export function ModelSelector({
                     <span className="truncate">{modelLabel(m)}</span>
                     <span className="flex shrink-0 items-center gap-1.5">
                       <CostMark model={m} />
+                      <PromoBadge label={promoLabelOf(m)} />
                       {degraded && <Badge tone="danger">暂不可用</Badge>}
                       {active && !degraded && (
                         <>
@@ -309,6 +339,7 @@ export function ModelSelector({
                     <span className="truncate">{row.row.label}</span>
                     <span className="flex shrink-0 items-center gap-1.5">
                       <CostMark model={representativeModel} />
+                      <PromoBadge label={promoLabelOf(representativeModel)} />
                       {degraded && <Badge tone="danger">暂不可用</Badge>}
                       {familyActive && !degraded && (
                         <>
@@ -318,6 +349,63 @@ export function ModelSelector({
                           <Check size={14} className="shrink-0 text-accent" />
                         </>
                       )}
+                    </span>
+                  </DropdownMenuItem>
+                )
+              }
+              if (row.kind === 'locked-plain') {
+                const locked = row.model
+                const labelText = lockedPlainLabel(locked)
+                return (
+                  <DropdownMenuItem
+                    key={`locked-${locked.id}`}
+                    data-model-id={locked.id}
+                    data-locked="true"
+                    onSelect={() =>
+                      onLockedSelect?.({
+                        label: labelText,
+                        minPlanCode: locked.min_plan_code,
+                        minPlanName: locked.min_plan_name,
+                        modelId: locked.id,
+                      })
+                    }
+                    className="justify-between text-faint opacity-80"
+                  >
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <Lock size={14} className="shrink-0" aria-hidden />
+                      <span className="truncate">{labelText}</span>
+                    </span>
+                    <span className="flex shrink-0 items-center gap-1.5">
+                      <CostMark model={locked} />
+                      <PromoBadge label={promoLabelOf(locked)} />
+                    </span>
+                  </DropdownMenuItem>
+                )
+              }
+              if (row.kind === 'locked-cursor-family') {
+                return (
+                  <DropdownMenuItem
+                    key={`locked-family-${row.row.family}`}
+                    data-model-id={row.row.representative.id}
+                    data-cursor-family={row.row.family}
+                    data-locked="true"
+                    onSelect={() =>
+                      onLockedSelect?.({
+                        label: row.row.label,
+                        minPlanCode: row.row.minPlanCode,
+                        minPlanName: row.row.minPlanName,
+                        modelId: row.row.representative.id,
+                      })
+                    }
+                    className="justify-between text-faint opacity-80"
+                  >
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <Lock size={14} className="shrink-0" aria-hidden />
+                      <span className="truncate">{row.row.label}</span>
+                    </span>
+                    <span className="flex shrink-0 items-center gap-1.5">
+                      <CostMark model={row.row.representative} />
+                      <PromoBadge label={promoLabelOf(row.row.representative)} />
                     </span>
                   </DropdownMenuItem>
                 )
@@ -342,6 +430,7 @@ export function ModelSelector({
                   <span className="truncate">{row.row.label}</span>
                   <span className="flex shrink-0 items-center gap-1.5">
                     <CostMark model={representativeModel} />
+                    <PromoBadge label={promoLabelOf(representativeModel)} />
                     {degraded && <Badge tone="danger">暂不可用</Badge>}
                     {familyActive && !degraded && (
                       <>

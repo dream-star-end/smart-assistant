@@ -1177,10 +1177,13 @@ describe('流水线 / 阶段配置', () => {
       { id: 'coding-assistant', name: '编码助手' },
       { id: 'research', name: '调研助手' },
     ])
-    vi.spyOn(api, 'getPublicModels').mockResolvedValue([
-      { id: 'glm-5.2', display_name: 'GLM 5.2' },
-      { id: 'deepseek-v4-pro', display_name: 'DeepSeek V4 Pro' },
-    ])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({
+      models: [
+        { id: 'glm-5.2', display_name: 'GLM 5.2' },
+        { id: 'deepseek-v4-pro', display_name: 'DeepSeek V4 Pro' },
+      ],
+      lockedModels: [],
+    })
     return { pipeline, stage }
   }
 

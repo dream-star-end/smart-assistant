@@ -1,3 +1,4 @@
+import { cursorModelById } from '@openclaude/protocol'
 import { describe, expect, it } from 'vitest'
 import {
   longContextCostConfirmationRequired,
@@ -6,29 +7,34 @@ import {
   resolveContextPickerSelection,
   resolveCursorPickerSelection,
 } from './cursorModelPicker'
-import type { PublicModel } from './types'
+import type { LockedPublicModel, PublicModel } from './types'
 
 const CURSOR_PUBLIC: PublicModel[] = [
   { id: 'cursor-auto', display_name: 'Cursor Auto' },
-  { id: 'cursor-grok-4.6-high', display_name: 'Cursor Grok 4.6 High' },
-  { id: 'cursor-grok-4.6-high-fast', display_name: 'Cursor Grok 4.6 High Fast' },
-  { id: 'cursor-grok-4.6-low', display_name: 'Cursor Grok 4.6 Low' },
+  { id: 'cursor-grok-4.6-high', display_name: 'Grok 4.6 High' },
+  { id: 'cursor-grok-4.6-high-fast', display_name: 'Grok 4.6 High Fast' },
+  { id: 'cursor-grok-4.6-low', display_name: 'Grok 4.6 Low' },
   { id: 'glm-5.2', display_name: 'GLM-5.2' },
-  { id: 'cursor-composer-2.5-fast', display_name: 'Cursor Composer 2.5 Fast' },
-  { id: 'cursor-composer-2.5', display_name: 'Cursor Composer 2.5' },
-  { id: 'cursor-opus-5-high', display_name: 'Cursor Opus 5 High' },
-  { id: 'cursor-opus-5-high-fast', display_name: 'Cursor Opus 5 High Fast' },
-  { id: 'cursor-opus-4.8-high', display_name: 'Cursor Opus 4.8 High' },
-  { id: 'cursor-opus-4.8-high-fast', display_name: 'Cursor Opus 4.8 High Fast' },
-  { id: 'cursor-fable-5-high', display_name: 'Cursor Fable 5 High (Non-ZDR)' },
-  { id: 'cursor-fable-5.1-high', display_name: 'Cursor Fable 5.1 High (Non-ZDR)' },
-  { id: 'cursor-fable-5.1-max', display_name: 'Cursor Fable 5.1 Max (Non-ZDR)' },
+  { id: 'cursor-composer-2.5-fast', display_name: 'Composer 2.5 Fast' },
+  { id: 'cursor-composer-2.5', display_name: 'Composer 2.5' },
+  { id: 'cursor-opus-5-high', display_name: 'Opus 5 High' },
+  { id: 'cursor-opus-5-high-fast', display_name: 'Opus 5 High Fast' },
+  { id: 'cursor-opus-4.8-high', display_name: 'Opus 4.8 High' },
+  { id: 'cursor-opus-4.8-high-fast', display_name: 'Opus 4.8 High Fast' },
+  { id: 'cursor-fable-5-high', display_name: 'Fable 5 High (Non-ZDR)' },
+  { id: 'cursor-fable-5.1-high', display_name: 'Fable 5.1 High (Non-ZDR)' },
+  { id: 'cursor-fable-5.1-max', display_name: 'Fable 5.1 Max (Non-ZDR)' },
 ]
+
+function rowKey(row: ReturnType<typeof modelPickerRows>[number]): string {
+  if (row.kind === 'plain' || row.kind === 'locked-plain') return row.model.id
+  return row.row.family
+}
 
 describe('cursorModelPicker', () => {
   it('collapses Cursor combos into one row per family and keeps non-cursor models', () => {
     const rows = modelPickerRows(CURSOR_PUBLIC)
-    expect(rows.map((row) => (row.kind === 'plain' ? row.model.id : row.row.family))).toEqual([
+    expect(rows.map(rowKey)).toEqual([
       'auto',
       'grok-4.6',
       'glm-5.2',
@@ -89,11 +95,7 @@ describe('cursorModelPicker', () => {
       { id: 'minimax-m3', display_name: 'MiniMax M3' },
     ]
     const rows = modelPickerRows(models)
-    expect(rows.map((row) => (row.kind === 'plain' ? row.model.id : row.row.family))).toEqual([
-      'glm-5.3-zai',
-      'minimax-m3',
-      'glm-5.3',
-    ])
+    expect(rows.map(rowKey)).toEqual(['glm-5.3-zai', 'minimax-m3', 'glm-5.3'])
   })
 
   it('sinks a family row only when every member is degraded', () => {
@@ -104,20 +106,90 @@ describe('cursorModelPicker', () => {
     ]
     const rows = modelPickerRows(models)
     // 家族仅部分成员降级时不沉底
-    expect(rows.map((row) => (row.kind === 'plain' ? row.model.id : row.row.family))).toEqual([
-      'grok-4.6',
-      'glm-5.2',
-    ])
+    expect(rows.map(rowKey)).toEqual(['grok-4.6', 'glm-5.2'])
     const allDegraded: PublicModel[] = [
       { id: 'cursor-grok-4.6-high', display_name: 'Grok High', degraded: true } as PublicModel,
       { id: 'cursor-grok-4.6-low', display_name: 'Grok Low', degraded: true } as PublicModel,
       { id: 'glm-5.2', display_name: 'GLM-5.2' },
     ]
     const rows2 = modelPickerRows(allDegraded)
-    expect(rows2.map((row) => (row.kind === 'plain' ? row.model.id : row.row.family))).toEqual([
+    expect(rows2.map(rowKey)).toEqual(['glm-5.2', 'grok-4.6'])
+  })
+
+  it('uses protocol family labels without the Cursor prefix (except Auto)', () => {
+    expect(cursorModelById('cursor-grok-4.6-high')?.familyLabel).toBe('Grok 4.6')
+    expect(cursorModelById('cursor-opus-5-high')?.displayName).toBe('Opus 5 High')
+    expect(cursorModelById('cursor-fable-5.1-xhigh')?.displayName).toBe(
+      'Fable 5.1 Extra High (Non-ZDR)',
+    )
+    expect(cursorModelById('cursor-auto')?.familyLabel).toBe('Cursor Auto')
+    const grok = modelPickerRows(CURSOR_PUBLIC).find(
+      (row) => row.kind === 'cursor-family' && row.row.family === 'grok-4.6',
+    )
+    expect(grok && grok.kind === 'cursor-family' ? grok.row.label : undefined).toBe('Grok 4.6')
+  })
+
+  it('appends locked rows after usable models and before degraded, skipping families with a usable member', () => {
+    const models: PublicModel[] = [
+      { id: 'glm-5.2', display_name: 'GLM-5.2' },
+      { id: 'cursor-grok-4.6-high', display_name: 'Grok 4.6 High' },
+      { id: 'glm-5.3', display_name: 'GLM-5.3', degraded: true } as PublicModel,
+    ]
+    const locked: LockedPublicModel[] = [
+      {
+        id: 'cursor-opus-5-high',
+        display_name: 'Opus 5 High',
+        min_plan_code: 'lite',
+        min_plan_name: 'Lite',
+        promo_label: '限时半价',
+      },
+      {
+        id: 'cursor-opus-5-high-fast',
+        display_name: 'Opus 5 High Fast',
+        min_plan_code: 'lite',
+        min_plan_name: 'Lite',
+      },
+      {
+        id: 'cursor-fable-5.1-high',
+        display_name: 'Fable 5.1 High (Non-ZDR)',
+        min_plan_code: 'lite',
+        min_plan_name: 'Lite',
+      },
+      {
+        id: 'secret-model',
+        display_name: 'Secret',
+        min_plan_code: 'pro',
+        min_plan_name: 'Pro',
+      },
+      {
+        id: 'cursor-grok-4.6-low',
+        display_name: 'Grok 4.6 Low',
+        min_plan_code: 'lite',
+        min_plan_name: 'Lite',
+      },
+    ]
+    const rows = modelPickerRows(models, locked)
+    expect(rows.map(rowKey)).toEqual([
       'glm-5.2',
       'grok-4.6',
+      'opus-5',
+      'fable-5.1',
+      'secret-model',
+      'glm-5.3',
     ])
+    const opus = rows.find(
+      (row) => row.kind === 'locked-cursor-family' && row.row.family === 'opus-5',
+    )
+    expect(opus && opus.kind === 'locked-cursor-family' ? opus.row.label : undefined).toBe('Opus 5')
+    expect(opus && opus.kind === 'locked-cursor-family' ? opus.row.minPlanCode : undefined).toBe(
+      'lite',
+    )
+    expect(
+      opus && opus.kind === 'locked-cursor-family' ? opus.row.representative.id : undefined,
+    ).toBe('cursor-opus-5-high')
+    expect(
+      rows.some((row) => row.kind === 'locked-cursor-family' && row.row.family === 'grok-4.6'),
+    ).toBe(false)
   })
 })
 
@@ -146,11 +218,7 @@ describe('context family picker', () => {
 
   it('collapses GPT and Kimi context twins into one row each', () => {
     const rows = modelPickerRows(MODELS)
-    expect(rows.map((row) => (row.kind === 'plain' ? row.model.id : row.row.family))).toEqual([
-      'glm-5.3',
-      'gpt-5.6-sol',
-      'kimi-k3',
-    ])
+    expect(rows.map(rowKey)).toEqual(['glm-5.3', 'gpt-5.6-sol', 'kimi-k3'])
   })
 
   it('defaults GPT/Kimi to the standard window', () => {
