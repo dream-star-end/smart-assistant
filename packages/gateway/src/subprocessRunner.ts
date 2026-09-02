@@ -26,7 +26,7 @@ import {
 } from './processGroupShutdown.js'
 import { decideEngineCwd } from './engineCwd.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
-import { buildPromptContext } from './promptSlots.js'
+import { buildPromptContext, PLATFORM_MCP_TOOL_NAMES } from './promptSlots.js'
 import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -1967,6 +1967,14 @@ export class SubprocessRunner extends EventEmitter {
       addAvailableTools(srv.tools)
     }
 
+    // Built-in openclaude-memory is registered later into mcp-config.json, not
+    // via config.mcpServers. Resolve the launch once here so the prompt
+    // advertises its tools, then reuse the same result when writing mcp-config.
+    const mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
+      fallback: 'npx-tsx',
+    })
+    if (mcpLaunch) addAvailableTools(PLATFORM_MCP_TOOL_NAMES)
+
     // (Marketplace skills/agents are reconciled deterministically in
     //  dispatchInbound BEFORE agent resolution — earlier in the same turn than
     //  this spawn — so the hub overlay is already fresh here. mcp-memory also kicks
@@ -2061,9 +2069,7 @@ export class SubprocessRunner extends EventEmitter {
       // is intentionally NOT shared (v3 subprocessRunner has tighter
       // OPENCLAUDE_HOME semantics — only forward when host process actually
       // set it; codex side passes empty-string default).
-      const mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
-        fallback: 'npx-tsx',
-      })
+      // mcpLaunch was resolved above so availableMcpTools matches this config.
       if (mcpLaunch) {
         const delegateContextFile = resolve(sessionDir, 'delegate-context')
         writeFileSync(

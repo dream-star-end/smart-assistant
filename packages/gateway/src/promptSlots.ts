@@ -268,7 +268,7 @@ export interface PromptSlot {
   content: string
 }
 
-const PLATFORM_MCP_TOOL_NAMES = [
+export const PLATFORM_MCP_TOOL_NAMES = [
   'skill_search',
   'skill_list',
   'skill_view',

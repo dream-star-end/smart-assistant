@@ -36,7 +36,7 @@ import { createLogger } from './logger.js'
 import { issueDelegateContextToken } from './delegateContext.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
-import { buildPromptContext } from './promptSlots.js'
+import { buildPromptContext, PLATFORM_MCP_TOOL_NAMES } from './promptSlots.js'
 import { getPlatformPrompt } from './platformPrompts.js'
 import { resolveMcpMemoryEntry, resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -378,14 +378,7 @@ export async function buildCodexLaunchOverrides(
   const mcpLaunch = omitPlatformMcp
     ? null
     : resolveMcpMemoryLaunch(ctx.claudeCodePath, { fallback: 'npx-tsx' })
-  const availableMcpTools = mcpLaunch
-    ? [
-        'skill_search', 'skill_list', 'skill_view', 'skill_save', 'skill_delete',
-        'create_reminder', 'list_reminders', 'update_reminder', 'delete_reminder',
-        'send_to_agent', 'delegate_task', 'delegate_tasks', 'request_review',
-        'task_create', 'task_update', 'task_comment', 'task_list', 'task_get', 'task_approve',
-      ]
-    : []
+  const availableMcpTools = mcpLaunch ? [...PLATFORM_MCP_TOOL_NAMES] : []
   const platformResult = await buildPromptContext({
     agentId: ctx.agentId,
     ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
