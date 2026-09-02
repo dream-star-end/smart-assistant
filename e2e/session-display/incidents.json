@@ -2569,7 +2569,7 @@
       "occurredAt": "2026-09-02",
       "severity": "P1",
       "symptom": "Codex/Grok 引擎委派子任务从不写入 usage_records.mode=delegate：adapter 只在 master 签发 32-hex requestId 时才 emit billing，handleDelegateTask 的 sessions.submit 第 6 参写死 undefined。GLM/CCB 委派走 anthropicProxy 不受影响。",
-      "rootFixCommit": "25fdf2904",
+      "rootFixCommit": "ed9bd509",
       "regressions": [
         {
           "layer": "unit",
@@ -2603,7 +2603,7 @@
         }
       ],
       "coverageCommits": [
-        "25fdf2904"
+        "ed9bd509"
       ]
     }
   ]
