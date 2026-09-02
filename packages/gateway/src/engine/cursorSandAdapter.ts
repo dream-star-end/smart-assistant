@@ -59,6 +59,7 @@ export class CursorSandAdapter extends CcbAdapter {
   private readonly selection: CursorCredentialSelection
   private readonly recordResult: (result: 'ok' | 'fail') => void
   private activeCancel: (() => boolean) | null = null
+  private activeFinalize: (() => void) | null = null
   private lifecycleGeneration = 0
   private lifecycleClosed = false
   private shutdownPromise: Promise<void> | null = null
@@ -255,16 +256,27 @@ export class CursorSandAdapter extends CcbAdapter {
     }
     const clearActiveCancel = (): void => {
       if (this.activeCancel === cancel) this.activeCancel = null
+      if (this.activeFinalize === finalizeAfterShutdown) this.activeFinalize = null
     }
+    // Cooperative cancel only. Forcing `inner.end()` here would resolve the
+    // turn summary synchronously and make the session's Stop/idle-timeout
+    // grace window believe CCB answered, so the hung subprocess (e.g. a tool
+    // blocked on a never-settling network read) is never recycled and every
+    // later turn is silently queued behind it. Leave the parser open: either
+    // CCB emits its own result, or the caller escalates to shutdown(), which
+    // finalizes the run after the process is gone.
     const cancel = (): boolean => {
       interrupted = true
       ended = true
       if (!inner) return true
       super.interrupt()
-      inner.end()
       return true
     }
+    const finalizeAfterShutdown = (): void => {
+      if (inner && !inner.finalized) inner.end()
+    }
     this.activeCancel = cancel
+    this.activeFinalize = finalizeAfterShutdown
     const submitted = this.trackLifecycle(this.withLifecycleLock(async () => {
       try {
         this.assertLifecycle(generation)
@@ -329,6 +341,9 @@ export class CursorSandAdapter extends CcbAdapter {
         try {
           await super.shutdown()
         } finally {
+          // The process generation is gone; a still-open run can no longer
+          // receive a result, so settle it now with whatever it accumulated.
+          try { this.activeFinalize?.() } catch {}
           await this.relay.close()
         }
       } finally {
@@ -338,6 +353,7 @@ export class CursorSandAdapter extends CcbAdapter {
         this.lifecycleGeneration++
         this.lifecycleClosed = false
         this.activeCancel = null
+        this.activeFinalize = null
         this.prepareInFlight = null
         this.shutdownPromise = null
       }

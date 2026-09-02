@@ -6,6 +6,7 @@ import {
   dispatchDbNameForUser,
   mergeArchivedHistory,
   isIncompleteDurableToolRow,
+  isUnresolvedPermissionPrompt,
   coalesceProcessIdentities,
   mergeFullServerWins,
   mergeTimelineHistoryPage,
@@ -2486,5 +2487,39 @@ describe("mergeFullServerWins — records_unpublished degrade page", () => {
     );
     expect(merged.some((m) => m.id === "live-tool")).toBe(true);
     expect(merged.some((m) => m.id === "tape-tool")).toBe(true);
+  });
+});
+
+describe("isUnresolvedPermissionPrompt (INC-20260903-PENDING-PERMISSION-LOST)", () => {
+  const base: ChatMessage = {
+    id: "perm-1",
+    role: "permission",
+    text: "",
+    ts: 10,
+    _turnOwnerId: "owner-a",
+    _clientMessageId: "u-perm",
+  } as ChatMessage;
+
+  test("true for an unresolved permission row (explicit _resolved:false)", () => {
+    expect(isUnresolvedPermissionPrompt({ ...base, _resolved: false } as ChatMessage, 1_000)).toBe(true);
+  });
+
+  test("true when _resolved is absent", () => {
+    expect(isUnresolvedPermissionPrompt(base, 1_000)).toBe(true);
+  });
+
+  test("false once resolved", () => {
+    expect(isUnresolvedPermissionPrompt({ ...base, _resolved: true } as ChatMessage, 1_000)).toBe(false);
+  });
+
+  test("false for non-permission roles", () => {
+    expect(isUnresolvedPermissionPrompt({ ...base, role: "tool" } as ChatMessage, 1_000)).toBe(false);
+    expect(isUnresolvedPermissionPrompt({ ...base, role: "assistant" } as ChatMessage, 1_000)).toBe(false);
+  });
+
+  test("false once the ask_user deadline has passed, true while still live", () => {
+    const withDeadline = { ...base, _askUserExpiresAt: 5_000 } as ChatMessage;
+    expect(isUnresolvedPermissionPrompt(withDeadline, 5_000)).toBe(false);
+    expect(isUnresolvedPermissionPrompt(withDeadline, 4_999)).toBe(true);
   });
 });

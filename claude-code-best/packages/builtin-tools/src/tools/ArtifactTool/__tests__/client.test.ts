@@ -107,3 +107,79 @@ describe('uploadArtifact', () => {
     ).rejects.toThrow()
   })
 })
+
+describe('uploadArtifact hang protection', () => {
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  test('requests identity encoding and passes an abort signal', async () => {
+    const fetchMock = mockFetch({
+      id: 'x',
+      url: 'https://x',
+      expiresAt: '2026-07-20T00:00:00.000Z',
+    })
+    globalThis.fetch = fetchMock
+
+    await uploadArtifact({
+      html: '<p>x</p>',
+      token: 't',
+      uploadUrl: 'https://example.test/upload',
+    })
+
+    const init = (
+      fetchMock as unknown as {
+        mock: { calls: [string | URL | Request, RequestInit][] }
+      }
+    ).mock.calls[0][1]
+    expect((init.headers as Record<string, string>)['Accept-Encoding']).toBe(
+      'identity',
+    )
+    expect(init.signal).toBeInstanceOf(AbortSignal)
+  })
+
+  test('rejects instead of hanging when the body stream never settles', async () => {
+    // Simulates the Node 22 undici failure mode: headers arrive, but the body
+    // read never resolves even after abort().
+    const neverEndingBody = new ReadableStream<Uint8Array>({
+      start() {},
+    })
+    globalThis.fetch = mock((_u: string | URL | Request) =>
+      Promise.resolve(
+        new Response(neverEndingBody, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    ) as unknown as typeof fetch
+
+    await expect(
+      uploadArtifact({
+        html: '<p/>',
+        token: 't',
+        uploadUrl: 'https://example.test/upload',
+        timeoutMs: 50,
+      }),
+    ).rejects.toThrow(/timed out.*reading response body/)
+  })
+
+  test('rejects when the request never yields headers', async () => {
+    globalThis.fetch = mock(
+      (_u: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(new Error('aborted')),
+          )
+        }),
+    ) as unknown as typeof fetch
+
+    await expect(
+      uploadArtifact({
+        html: '<p/>',
+        token: 't',
+        uploadUrl: 'https://example.test/upload',
+        timeoutMs: 50,
+      }),
+    ).rejects.toThrow(/timed out.*response headers/)
+  })
+})

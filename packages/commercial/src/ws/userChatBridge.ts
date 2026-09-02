@@ -175,7 +175,9 @@ import {
   admitDurableControl,
   claimDueTurnControls,
   markTurnControlReceipt,
+  pendingPermissionPromptToFrame,
   persistPermissionAuthority,
+  readPendingPermissionPrompts,
   releaseTurnControlForRetry,
   resolvePermissionExpiresAt,
   TurnControlConflictError,
@@ -5023,6 +5025,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const terminalNotifySeen = new Set<string>();
             const liveCatchupSessions: Array<{ sessionId: string; afterFrameSeq: number }> = [];
             const liveCatchupSeen = new Set<string>();
+            // INC-20260903-PENDING-PERMISSION-LOST: durable pending prompts to
+            // re-materialise for this browser (same bound/dedupe as live catch-up).
+            const pendingPermissionSessions: Array<{ peerId: string; sessionKey: string }> = [];
             for (const p of visiblePeers) {
               if (typeof p !== "object" || p === null) continue;
               const peer = p as {
@@ -5077,6 +5082,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const safeId = peer.peerId.replace(/[^a-zA-Z0-9_-]/g, "_");
               const sessionKey = `agent:${aid}:webchat:dm:${safeId}`;
               const storeKey = `${uidStr}:${cidStr}:${sessionKey}`;
+              if (
+                liveCatchupSeen.has(peer.peerId) &&
+                !pendingPermissionSessions.some((entry) => entry.peerId === peer.peerId)
+              ) {
+                pendingPermissionSessions.push({ peerId: peer.peerId, sessionKey });
+              }
               // Hello is the browser's subscription authority. Register every
               // visible peer before forwarding/replay so a second attached tab
               // protects an existing failed-sequence barrier even if it has not
@@ -5221,6 +5232,46 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   }
                 } catch {
                   // hello 补齐失败只能静默:不得挡转发、不得关连接。
+                }
+              })().catch(() => {});
+            }
+            // INC-20260903-PENDING-PERMISSION-LOST:permission_request 只在容器
+            // 发出那一刻投给当时已登记的 socket;bridge/浏览器处于重连窗口时这帧
+            // 就永久丢失,而引擎停在 waitingForUserInput(看门狗被抑制)——
+            // 用户看不到卡片、也点不出来。turn_permission_requests 是落盘在前的
+            // 权威,这里把仍可作答(pending 且未过期)的提示按原帧形状补发给
+            // 本条 hello 的 userWs。不打 frameSeq(前端 reducer 按 requestId 幂等,
+            // 无 seq 的帧不推游标);容器侧 autoResumeFromHello 也会补一份,重复
+            // 到达无害。同样只能是浮动 promise,绝不能挡 hello 转发。
+            if (pendingPermissionSessions.length > 0 && deps.pgPool) {
+              const pgPool = deps.pgPool;
+              void (async () => {
+                try {
+                  await Promise.resolve();
+                  for (const { peerId, sessionKey } of pendingPermissionSessions) {
+                    if (userWs.readyState !== WebSocket.OPEN) break;
+                    const rows = await readPendingPermissionPrompts(pgPool, {
+                      userId: uid,
+                      sessionId: peerId,
+                    });
+                    if (rows.length === 0) continue;
+                    let sent = 0;
+                    for (const row of rows) {
+                      if (userWs.readyState !== WebSocket.OPEN) break;
+                      const frame = pendingPermissionPromptToFrame(row, { sessionKey, peerId });
+                      if (frame === null) continue;
+                      try { userWs.send(JSON.stringify(frame)); sent += 1; } catch { break; }
+                    }
+                    if (sent > 0) {
+                      bridgeLog?.info("user-chat-bridge: hello replayed pending permission prompts", {
+                        uid: uidStr,
+                        sessionId: peerId,
+                        count: sent,
+                      });
+                    }
+                  }
+                } catch {
+                  // 补发失败只能静默:不得挡转发、不得关连接。
                 }
               })().catch(() => {});
             }

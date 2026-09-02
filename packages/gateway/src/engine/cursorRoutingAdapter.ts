@@ -260,12 +260,14 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     const clearActiveCancel = (): void => {
       if (this.activeCancel === cancel) this.activeCancel = null
     }
+    // Cooperative cancel only: never force-finalize a live inner run. A
+    // synchronous end() would short-circuit the session's Stop grace window
+    // and leave a hung CCB/Sand process alive for the next turn. Shutdown of
+    // the inner adapter is what settles an unanswered run.
     const cancel = (): boolean => {
       ended = true
       if (!innerRun) return true
-      this.inner.interrupt()
-      innerRun.end()
-      return true
+      return this.inner.interrupt()
     }
     this.activeCancel = cancel
     const submitted = this.trackLifecycle(this.withLifecycleLock(async () => {

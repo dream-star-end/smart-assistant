@@ -335,6 +335,50 @@ test('interrupt before cold Sand preparation prevents submission', async () => {
   await adapter.shutdown()
 })
 
+test('interrupting a live Sand turn stays cooperative until shutdown finalizes it', async () => {
+  // Regression: a synchronous inner.end() on interrupt resolved the summary
+  // before the process was gone, so SessionManager never escalated to
+  // shutdown and a CCB process hung on a blocked tool survived into the next
+  // turn (deep-thinking spinner with zero frames).
+  const relay = {
+    async start() { return 'http://127.0.0.1:12345/route/test' },
+    async close() {},
+  } as unknown as CursorSandRelay
+  let resolveInner!: (value: null) => void
+  let innerEnds = 0
+  let innerFinalized = false
+  const liveRun = {
+    ...inertRun(),
+    summary: new Promise<null>((resolvePromise) => { resolveInner = resolvePromise }),
+    end() { innerEnds++; innerFinalized = true; resolveInner(null) },
+    get finalized() { return innerFinalized },
+  }
+  const adapter = new CursorSandAdapter({
+    sessionKey: 'agent:main:test:live-sand-cancel', agentId: 'main', agentBaseDir: process.cwd(),
+    config: {} as never, model: 'cursor-fable-5-high', cursorCredentialSelection: SAND_SELECTION,
+  }, relay, () => liveRun as never, () => {})
+  const billing: Array<{ terminalCode?: string }> = []
+  adapter.on('external_billing', (event) => billing.push(event as { terminalCode?: string }))
+  const run = adapter.submitTurn({
+    input: 'hello', requestId: 'c'.repeat(32),
+    sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map(),
+    onEvent() {}, onPostTerminalRuntimeEvent() {},
+  })
+  await run.submitted
+  assert.equal(adapter.interrupt(), true)
+  let settled = false
+  void run.summary.then(() => { settled = true })
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 20))
+  assert.equal(innerEnds, 0, 'interrupt must not force-finalize a live run')
+  assert.equal(settled, false, 'summary must stay pending so the caller can escalate')
+  assert.equal(run.finalized, false)
+  await adapter.shutdown()
+  assert.equal(await run.summary, null)
+  assert.equal(innerEnds, 1, 'shutdown settles the unanswered run exactly once')
+  assert.equal(billing.length, 1)
+  assert.equal(billing[0].terminalCode, 'USER_CANCELLED')
+})
+
 test('shutdown during cold Sand preparation waits and prevents resurrection', async () => {
   let releaseStart!: () => void
   let markStart!: () => void
@@ -454,6 +498,50 @@ test('routing interrupt during deferred variant preparation prevents inner submi
     await run.submitted
     assert.equal(await run.summary, null)
     assert.equal(submissions, 0)
+  } finally {
+    await router.shutdown()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('routing interrupt of a live inner run delegates to the inner adapter without ending it', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-routing-live-cancel-'))
+  const router = new CursorRoutingAdapter({
+    sessionKey: 'agent:main:test:routing-live-cancel', agentId: 'main', agentBaseDir: dir,
+    config: {} as never, model: 'cursor-grok-4.6-high', cursorCredentialSelection: NATIVE_SELECTION,
+  })
+  try {
+    let innerEnds = 0
+    let innerInterrupts = 0
+    let resolveInner!: (value: null) => void
+    const liveRun = {
+      ...inertRun(),
+      summary: new Promise<null>((resolvePromise) => { resolveInner = resolvePromise }),
+      end() { innerEnds++; resolveInner(null) },
+      finalized: false,
+    }
+    const testRouter = router as unknown as {
+      ensureVariant: () => Promise<void>
+      inner: { submitTurn: () => typeof liveRun; interrupt: () => boolean }
+    }
+    testRouter.ensureVariant = async () => {}
+    testRouter.inner.submitTurn = () => liveRun
+    testRouter.inner.interrupt = () => { innerInterrupts++; return true }
+    const run = router.submitTurn({
+      input: 'hello', sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(), onEvent() {}, onPostTerminalRuntimeEvent() {},
+    })
+    await run.submitted
+    assert.equal(router.interrupt(), true)
+    assert.equal(innerInterrupts, 1)
+    assert.equal(innerEnds, 0, 'routing cancel must not force-finalize the inner run')
+    let settled = false
+    void run.summary.then(() => { settled = true })
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20))
+    assert.equal(settled, false)
+    run.end()
+    assert.equal(innerEnds, 1)
+    assert.equal(await run.summary, null)
   } finally {
     await router.shutdown()
     rmSync(dir, { recursive: true, force: true })

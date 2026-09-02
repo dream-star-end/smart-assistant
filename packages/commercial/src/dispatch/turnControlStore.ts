@@ -1,5 +1,7 @@
 import type { Pool, PoolClient } from 'pg'
 
+import { isClientMessageId } from '@openclaude/protocol'
+
 import { canonicalDigestHex } from '../connectors/canonicalJson.js'
 
 export type TurnControlKind = 'stop' | 'permission'
@@ -380,4 +382,96 @@ export async function markTurnControlReceipt(
     [input.controlId, input.userId.toString(), input.status, input.attempt ?? null, input.errorCode ?? null],
   )
   return result.rowCount === 1
+}
+
+// ---------------------------------------------------------------------------
+// INC-20260903-PENDING-PERMISSION-LOST — hello-time replay of durable prompts.
+//
+// persistPermissionAuthority makes the prompt durable *before* the browser
+// sees it, but nothing ever re-read that authority for a browser that attached
+// after the frame was emitted (bridge/container reconnect window). The engine
+// then waits in waitingForUserInput with the watchdog suppressed and the user
+// has no card to answer. The bridge hello handler now re-materialises still
+// answerable rows through these pure helpers.
+// ---------------------------------------------------------------------------
+
+/** Bound per hello peer; a session realistically has 0-1 open prompts. */
+export const HELLO_PENDING_PERMISSION_MAX_ROWS = 8
+
+export interface PendingPermissionPromptRow {
+  requestId: string
+  clientMessageId: string | null
+  toolUseId: string | null
+  toolName: string
+  input: Record<string, unknown>
+  expiresAt: Date
+}
+
+export async function readPendingPermissionPrompts(
+  pool: Pick<Pool, 'query'>,
+  input: { userId: bigint; sessionId: string; limit?: number },
+): Promise<PendingPermissionPromptRow[]> {
+  const limit = Math.max(1, Math.min(input.limit ?? HELLO_PENDING_PERMISSION_MAX_ROWS, 64))
+  const result = await pool.query<{
+    request_id: string
+    client_message_id: string | null
+    tool_use_id: string | null
+    tool_name: string
+    input_json: unknown
+    expires_at: Date | string
+  }>(
+    `SELECT request_id,client_message_id,tool_use_id,tool_name,input_json,expires_at
+       FROM turn_permission_requests
+      WHERE user_id=$1 AND session_id=$2 AND status='pending' AND expires_at>NOW()
+      ORDER BY created_at ASC
+      LIMIT $3`,
+    [input.userId.toString(), input.sessionId, limit],
+  )
+  const rows: PendingPermissionPromptRow[] = []
+  for (const row of result.rows) {
+    let inputJson: unknown = row.input_json
+    if (typeof inputJson === 'string') {
+      try { inputJson = JSON.parse(inputJson) } catch { continue }
+    }
+    if (typeof inputJson !== 'object' || inputJson === null || Array.isArray(inputJson)) continue
+    const expiresAt = row.expires_at instanceof Date ? row.expires_at : new Date(row.expires_at)
+    if (Number.isNaN(expiresAt.getTime())) continue
+    rows.push({
+      requestId: row.request_id,
+      clientMessageId: row.client_message_id,
+      toolUseId: row.tool_use_id,
+      toolName: row.tool_name,
+      input: inputJson as Record<string, unknown>,
+      expiresAt,
+    })
+  }
+  return rows
+}
+
+/** Rebuild the wire frame the container originally emitted. No frameSeq: the
+ * browser reducer is idempotent by requestId and ignores unstamped frames for
+ * cursor purposes, so a catch-up copy can never move the ring cursor. */
+export function pendingPermissionPromptToFrame(
+  row: PendingPermissionPromptRow,
+  target: { sessionKey: string; peerId: string },
+  nowMs: number = Date.now(),
+): Record<string, unknown> | null {
+  const expiresAt = row.expiresAt.getTime()
+  if (!(expiresAt > nowMs)) return null
+  const clientMessageId = isClientMessageId(row.clientMessageId) ? row.clientMessageId : null
+  return {
+    type: 'outbound.permission_request',
+    sessionKey: target.sessionKey,
+    channel: 'webchat',
+    peer: { id: target.peerId, kind: 'dm' },
+    requestId: row.requestId,
+    toolName: row.toolName,
+    ...(row.toolUseId ? { toolUseId: row.toolUseId } : {}),
+    ...(clientMessageId ? { clientMessageId } : {}),
+    inputPreview: JSON.stringify(row.input).slice(0, 400),
+    inputJson: row.input,
+    expiresAt,
+    ...(row.requestId.startsWith('ask-user:') ? { detachedAskUser: true } : {}),
+    ts: nowMs,
+  }
 }

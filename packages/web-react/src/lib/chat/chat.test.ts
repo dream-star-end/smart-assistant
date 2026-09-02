@@ -4399,6 +4399,53 @@ describe("Phase-A final-only tape projection retry", () => {
     sock.stop();
   });
 
+  test("owner reset keeps an unresolved permission card and drops a resolved one (INC-20260903-PENDING-PERMISSION-LOST)", () => {
+    const sessionId = "s-frames-reset-keep-permission";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess.messages = [
+      { id: clientMessageId, role: "user", text: "q", ts: 1, _source: "server" },
+      {
+        id: `perm-open-${sessionId}`,
+        role: "permission",
+        text: "",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+        _turnOwnerId: clientMessageId,
+        toolName: "AskUserQuestion",
+        _resolved: false,
+      } as ChatMessage,
+      {
+        id: `perm-done-${sessionId}`,
+        role: "permission",
+        text: "",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+        _turnOwnerId: clientMessageId,
+        toolName: "Bash",
+        _resolved: true,
+      } as ChatMessage,
+      {
+        id: `perm-expired-${sessionId}`,
+        role: "permission",
+        text: "",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+        _turnOwnerId: clientMessageId,
+        toolName: "AskUserQuestion",
+        _resolved: false,
+        _askUserExpiresAt: 1,
+      } as ChatMessage,
+    ];
+    sock.applyDurableLiveFrames(sessionId, [], [clientMessageId]);
+    expect(sess.messages.map((message) => message.id)).toEqual([
+      clientMessageId,
+      `perm-open-${sessionId}`,
+    ]);
+    sock.stop();
+  });
+
   test("live-units reset with thinking/tool for the same turn replaces live copies without duplicates", () => {
     const sessionId = "s-units-reset-replace-live";
     const sock = makeSocket();
