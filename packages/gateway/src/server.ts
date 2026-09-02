@@ -444,6 +444,14 @@ import {
   shouldMintDelegateGrokRoute,
   type DelegateGrokRouteLease,
 } from './delegateGrokRoute.js'
+import {
+  defaultDelegateEngineBilling,
+  mapDelegateEngineBillingError,
+  resolveDelegateEngineBillingEngine,
+  shouldAdmitDelegateEngineBilling,
+  type DelegateEngineBillingAdmission,
+  type DelegateEngineBillingClient,
+} from './delegateEngineBilling.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { startMemoryTurnObserver } from './memoryTurnObserver.js'
@@ -10659,6 +10667,8 @@ export class Gateway {
   /** Cursor MCP 60s 上限的异步委派作业句柄。测试脚手架 Object.create 不跑字段
    *  初始化,使用处惰性 ??=。 */
   private _delegateJobs: DelegateJobStore | undefined
+  /** Test seam for engine-reported delegate admit/settle/abandon. */
+  private _delegateEngineBilling: DelegateEngineBillingClient | undefined
   /** Stage 1: durable boot reconciler has finished (or durable is off). */
   private _delegateReconcileReady = false
   private _delegateDurablePath: string | undefined
@@ -12460,6 +12470,61 @@ export class Gateway {
       grokRoute = { baseUrl: acquired.lease.baseUrl, routeToken: acquired.lease.routeToken }
       grokRouteLease = acquired.lease
     }
+    // engine-reported (codex/grok) 委派必须先向 master 签 32-hex requestId +
+    // inflight journal,否则 adapter 不 emit billing,usage_records.mode=delegate
+    // 永远为空。CCB/GLM 走 anthropicProxy,不进这条。失败 fail-closed,禁止白跑。
+    const billingApi = this._delegateEngineBilling ?? defaultDelegateEngineBilling
+    const engineReported = shouldAdmitDelegateEngineBilling({
+      delegateEngine: delegateExec?.engine,
+      requestedModel,
+      agentModel: execAgent.model,
+    })
+    let engineBillingAdmission: DelegateEngineBillingAdmission | null = null
+    let liveEngineBilling: DurableCodexBilling | null = null
+    if (engineReported) {
+      const billingModel = delegateExec?.canonicalModel || requestedModel || execAgent.model
+      if (!billingModel) {
+        if (grokRouteLease) grokRouteLease.release().catch(() => {})
+        this._releaseDelegateSlot(slotOpts)
+        unregisterDelegation?.()
+        return {
+          kind: 'rejected',
+          httpStatus: 500,
+          message: 'engine-reported 委派暂不可用: missing model id',
+        }
+      }
+      try {
+        engineBillingAdmission = await billingApi.admit({
+          model: billingModel,
+          engine: resolveDelegateEngineBillingEngine({
+            delegateEngine: delegateExec?.engine,
+            model: billingModel,
+          }),
+          agentId: targetAgentId,
+          delegateAgentId: targetAgentId,
+          sessionKey,
+          ...(parentClientSessionId ? { parentSessionId: parentClientSessionId } : {}),
+          ...(delegateParent?.billingParentTurnKey
+            ? { parentTurnKey: delegateParent.billingParentTurnKey }
+            : {}),
+        })
+      } catch (err) {
+        if (grokRouteLease) grokRouteLease.release().catch(() => {})
+        this._releaseDelegateSlot(slotOpts)
+        unregisterDelegation?.()
+        const mapped = mapDelegateEngineBillingError(err)
+        this.log.warn('delegate_engine_billing_admit_failed', {
+          targetAgentId,
+          model: billingModel,
+          err: String(err),
+        })
+        return {
+          kind: 'rejected',
+          httpStatus: mapped.httpStatus,
+          message: mapped.message,
+        }
+      }
+    }
     // 已过闸:并发名额已在 _tryReserveDelegateSlot 同步预占,此后所有路径必须释放
     // —— 正常路径走下方 finally,session 创建/开始帧投递抛错走本 catch。
     const durableTranscript: unknown[] = []
@@ -12546,6 +12611,9 @@ export class Gateway {
         )
       }
     } catch (err) {
+      if (engineBillingAdmission) {
+        await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
+      }
       if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
@@ -12639,20 +12707,27 @@ export class Gateway {
                 e.meta?.cacheCreationTokens ?? ownGoalUsageRecord?.cacheCreationTokens ?? 0,
             }
           }
-        } else if (e.kind === 'codex_billing' && session._platformGoal?.status === 'active') {
-          // Billing is emitted before the parser's final event. Preserve it as
-          // a crash/exit fallback; a later final event overwrites only fields
-          // it actually observed.
-          ownGoalUsageRecord = {
-            runId: progressRunId,
-            agentId: targetAgentId,
-            engine: 'codex',
-            inputTokens: e.usage?.input_tokens ?? ownGoalUsageRecord?.inputTokens ?? 0,
-            outputTokens: e.usage?.output_tokens ?? ownGoalUsageRecord?.outputTokens ?? 0,
-            cacheReadTokens:
-              e.usage?.cache_read_input_tokens ?? ownGoalUsageRecord?.cacheReadTokens ?? 0,
-            cacheCreationTokens:
-              e.usage?.cache_creation_input_tokens ?? ownGoalUsageRecord?.cacheCreationTokens ?? 0,
+        } else if (e.kind === 'codex_billing') {
+          if (session._platformGoal?.status === 'active') {
+            // Billing is emitted before the parser's final event. Preserve it as
+            // a crash/exit fallback; a later final event overwrites only fields
+            // it actually observed.
+            ownGoalUsageRecord = {
+              runId: progressRunId,
+              agentId: targetAgentId,
+              engine: 'codex',
+              inputTokens: e.usage?.input_tokens ?? ownGoalUsageRecord?.inputTokens ?? 0,
+              outputTokens: e.usage?.output_tokens ?? ownGoalUsageRecord?.outputTokens ?? 0,
+              cacheReadTokens:
+                e.usage?.cache_read_input_tokens ?? ownGoalUsageRecord?.cacheReadTokens ?? 0,
+              cacheCreationTokens:
+                e.usage?.cache_creation_input_tokens ?? ownGoalUsageRecord?.cacheCreationTokens ?? 0,
+            }
+          }
+          if (engineBillingAdmission) {
+            const billing = { ...e } as DurableCodexBilling & { kind?: string }
+            delete billing.kind
+            liveEngineBilling = billing
           }
         }
         const progressBlock = e.kind === 'usage'
@@ -12674,7 +12749,7 @@ export class Gateway {
       // spawn 前生效(与顶层会话 safeEffortLevel 同法)。undefined = 不指定 → 成员默认档位。
       input.effort,
       delegateExec?.canonicalModel ?? requestedModel,
-      undefined,
+      engineBillingAdmission?.requestId,
       undefined,
       undefined,
       { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}) },
@@ -12814,6 +12889,22 @@ export class Gateway {
     } finally {
       clearTimeoutTimer()
       detachAncestorActivity?.()
+      if (engineBillingAdmission) {
+        if (liveEngineBilling) {
+          try {
+            await billingApi.settle(liveEngineBilling)
+          } catch (err) {
+            this.log.warn('delegate_engine_billing_settle_failed', {
+              targetAgentId,
+              sessionKey,
+              requestId: engineBillingAdmission.requestId,
+              err: String(err),
+            })
+          }
+        } else {
+          await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
+        }
+      }
       // F4:委派子会话 bg bash 的后终态 tail 经 per-session 串行链**异步**持久化,其入
       // _durableDelegateRuntimeEvents 收集器发生在持久化 acked|queued **之后**;下方
       // 摘取该收集器构造 DurableAgentGroup 前,必须 await 该链(且在清收集器引用之前),

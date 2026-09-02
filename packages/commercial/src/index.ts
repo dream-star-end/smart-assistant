@@ -380,6 +380,12 @@ import {
   type AutoDreamOptimizerRuntime,
 } from "./http/internalAutoDreamOptimizer.js";
 import {
+  isDelegateEngineBillingInternalPath,
+  makeDelegateEngineBillingHandler,
+  type DelegateEngineBillingRuntime,
+} from "./http/internalDelegateEngineBilling.js";
+import { createDelegateEngineBillingRuntime } from "./billing/delegateEngineBillingRuntime.js";
+import {
   applyAutoDreamPreferenceAction,
   reportAutoDreamPlatformFindings,
 } from "./autoDream/optimizerStore.js";
@@ -1874,6 +1880,9 @@ export async function registerCommercial(
   const autoDreamOptimizerRuntimeRef: { current: AutoDreamOptimizerRuntime | null } = {
     current: null,
   };
+  const delegateEngineBillingRuntimeRef: { current: DelegateEngineBillingRuntime | null } = {
+    current: null,
+  };
   // 主动微信投递接收点(cron/提醒 → master 权威解析收件人 → outbox)。与 broker 同生命周期,
   // 同条件块内装配;未装配时 dispatchInternal 显式 404(同 wechat-outbound 语义)。
   const wechatProactiveRef: { current: ProactiveReceiverHandler | null } = { current: null };
@@ -2344,6 +2353,15 @@ export async function registerCommercial(
         identityRepo,
         runtimeRef: autoDreamOptimizerRuntimeRef,
       });
+      delegateEngineBillingRuntimeRef.current = createDelegateEngineBillingRuntime({
+        getPool,
+        preCheckRedis,
+        pricing,
+      });
+      const delegateEngineBillingHandler = makeDelegateEngineBillingHandler({
+        identityRepo,
+        runtimeRef: delegateEngineBillingRuntimeRef,
+      });
       // 平台 preset seed 会写双 slot 共享的 marketplace current 指针，必须跟随唯一
       // leadership，而非 candidate process startup。初次 acquire / finalize 接管 / abort
       // 后旧 slot re-acquire 都 await 同一幂等逻辑；单个 seed 仍沿用原 fail-soft 语义。
@@ -2608,6 +2626,9 @@ export async function registerCommercial(
         }
         if (isAutoDreamOptimizerInternalPath(path)) {
           return autoDreamOptimizerHandler(req, res, ctx, path);
+        }
+        if (isDelegateEngineBillingInternalPath(path)) {
+          return delegateEngineBillingHandler(req, res, ctx, path);
         }
         if (path === CRON_INDEX_PATH) {
           return cronIndexHandler(req, res, ctx);

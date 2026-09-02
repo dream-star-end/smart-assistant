@@ -159,9 +159,10 @@ export interface UsageAttributionTag {
  *     基础键 ~200 字节;parentSessionId ≤128 / delegateAgentId ≤64 兜底防超预算
  *     把 delegate 请求整条 400 掉(正常值远短于此:web-* ~21 字符,agent id 常
  *     ≤32 字符)。
- *   - **codex 引擎不消费此 env**(gpt-5.5 delegate 成员走 bridge journal 计费,
- *     mode 维持 'chat',已知缺口 —— 当前 v5 组队成员与 hidden-reviewer 全部
- *     锁定 glm-5.2/CCB 路径)。
+ *   - **codex/grok 引擎不消费此 env**:engine-reported 委派改走 master 签发的
+ *     32-hex requestId + request_finalize_journal(见 handleDelegateTask admit),
+ *     adapter 据此 emit billing,codexFinalizer 按 attribution 写 mode=delegate。
+ *     本 env 仍只服务 CCB/GLM anthropicProxy 路径。
  */
 export function _buildCcbUsageAttributionEnv(
   tag: UsageAttributionTag | undefined,

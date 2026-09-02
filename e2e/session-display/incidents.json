@@ -2563,6 +2563,48 @@
         "226edfac",
         "d18bd587"
       ]
+    },
+    {
+      "id": "INC-20260902-DELEGATE-ENGINE-BILLING-REQUESTID",
+      "occurredAt": "2026-09-02",
+      "severity": "P1",
+      "symptom": "Codex/Grok 引擎委派子任务从不写入 usage_records.mode=delegate：adapter 只在 master 签发 32-hex requestId 时才 emit billing，handleDelegateTask 的 sessions.submit 第 6 参写死 undefined。GLM/CCB 委派走 anthropicProxy 不受影响。",
+      "rootFixCommit": "25fdf2904",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
+          "assertion": "(a) codex 委派 submit 收到 32-hex requestId"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
+          "assertion": "(b) 收到 codex_billing 后 live settle 一次且带 delegate 归因"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
+          "assertion": "(c) glm 委派仍不签 requestId、不调 admit"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
+          "assertion": "(d) 委派失败时 journal 被收口"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBilling.test.ts",
+          "assertion": "admits catalog engine codex/grok and skips ccb"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/delegateEngineBillingRuntime.test.ts",
+          "assertion": "admits a codex delegate with source + attribution in journal ctx"
+        }
+      ],
+      "coverageCommits": [
+        "25fdf2904"
+      ]
     }
   ]
 }
