@@ -3,7 +3,9 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { test } from 'node:test'
-import * as protobuf from 'protobufjs'
+// protobufjs is CommonJS; a namespace import yields `{ default }` under tsx and
+// `loadSync` is undefined (see the same note in engine/cursorSandRelay.ts).
+import protobuf from 'protobufjs'
 import { CURSOR_ENGINE_MODELS } from '@openclaude/protocol'
 import { CursorSandRelay, encodeCursorSandRequest, recoverXmlToolCalls } from '../engine/cursorSandRelay.js'
 import { CursorSandAdapter } from '../engine/cursorSandAdapter.js'
@@ -621,6 +623,52 @@ test('Fable Sand encodes native tool schemas and structured tool-result history'
   assert.equal(toolResult.toolContent.parts[0].toolCallId, 'toolu_1')
   assert.equal(toolResult.toolContent.parts[0].toolName, 'Read')
   assert.equal(toolResult.toolContent.parts[0].result.stringValue, 'contents')
+})
+
+test('Sand keeps Read image blocks in tool results and user turns (vision regression)', () => {
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+  const encoded = encodeCursorSandRequest({
+    model: 'cursor-fable-5.1-high',
+    system: [{ type: 'text', text: 'system' }],
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'look at this' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } },
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_img', name: 'Read', input: { file_path: '/tmp/shot.png' } }],
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'toolu_img',
+          content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } }],
+        }],
+      },
+    ],
+    tools: [{ name: 'Read', description: 'read a file', input_schema: { type: 'object' } }],
+  })
+  const request = StreamRequest.toObject(StreamRequest.decode(encoded.bytes), { oneofs: true })
+  // Plain user turn with an inline image keeps both text and pixels.
+  const userTurn = request.messages.find((message: { role?: number }) => message.role === 1)
+  assert.equal(userTurn.parts.parts.length, 2)
+  assert.equal(userTurn.parts.parts[0].text.text, 'look at this')
+  assert.equal(userTurn.parts.parts[1].image.mimeType, 'image/png')
+  assert.equal(userTurn.parts.parts[1].image.data, png)
+  // Read tool result with an image block is not squashed to an empty string.
+  const toolResult = request.messages.find((message: { role?: number }) => message.role === 3)
+  const part = toolResult.toolContent.parts[0]
+  assert.equal(part.toolCallId, 'toolu_img')
+  assert.equal(part.toolName, 'Read')
+  assert.notEqual(part.result.stringValue, '')
+  assert.equal(part.experimentalContent.length, 1)
+  assert.equal(part.experimentalContent[0].image.mimeType, 'image/png')
+  assert.equal(part.experimentalContent[0].image.data, png)
 })
 
 test('Grok Sand encodes native tool schemas and structured tool-result history', () => {

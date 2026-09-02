@@ -300,6 +300,29 @@ function contentParts(content: unknown): JsonObject[] {
   return parts
 }
 
+/**
+ * Encode one Anthropic `tool_result` block as an InferenceToolResultPart.
+ *
+ * `result` (google.protobuf.Value) only carries text. Image/document blocks
+ * returned by tools — the Read tool answers image files with an `image`
+ * block — go to `experimental_content`, which is the InferenceContentPart
+ * list the proto reserves for multimodal tool output. Without this the
+ * relay used to squash a screenshot Read into an empty string and the
+ * model reported the picture as "(omitted)".
+ */
+function toolResultPart(record: JsonObject, toolName: string): JsonObject {
+  const text = contentText(record.content)
+  const media = contentParts(record.content).filter((part) => 'image' in part || 'file' in part)
+  const part: JsonObject = {
+    toolCallId: record.tool_use_id,
+    toolName,
+    result: protoValue(text || (media.length > 0 ? `[${media.length} attached media part(s)]` : '')),
+    isError: record.is_error === true,
+  }
+  if (media.length > 0) part.experimentalContent = media
+  return part
+}
+
 function assistantHistoryText(content: unknown): string {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return ''
@@ -456,26 +479,30 @@ function translateMessages(messages: unknown, nativeTools: boolean): JsonObject[
     }
     if (message.role !== 'user') continue
     if (nativeTools && Array.isArray(message.content)) {
-      const textBlocks: string[] = []
+      const userBlocks: JsonObject[] = []
       for (const block of message.content) {
         if (!block || typeof block !== 'object') continue
         const record = block as JsonObject
-        if (record.type === 'text' && typeof record.text === 'string') textBlocks.push(record.text)
         if (record.type === 'tool_result' && typeof record.tool_use_id === 'string') {
           out.push({
             role: 3,
-            toolContent: {
-              parts: [{
-                toolCallId: record.tool_use_id,
-                toolName: toolNames.get(record.tool_use_id) ?? '',
-                result: protoValue(contentText(record.content)),
-                isError: record.is_error === true,
-              }],
-            },
+            toolContent: { parts: [toolResultPart(record, toolNames.get(record.tool_use_id) ?? '')] },
           })
+          continue
         }
+        userBlocks.push(record)
       }
-      if (textBlocks.length > 0) out.push({ role: 1, text: textBlocks.join('\n') })
+      // Text, image and document blocks that ride alongside tool results
+      // (or make up a plain user turn) keep their media: Anthropic image
+      // blocks become InferenceImagePart so vision-capable Sand models see
+      // the pixels instead of an empty text turn.
+      const parts = contentParts(userBlocks)
+      const hasMedia = parts.some((part) => 'image' in part || 'file' in part)
+      if (hasMedia) out.push({ role: 1, parts: { parts } })
+      else {
+        const text = contentText(userBlocks)
+        if (text) out.push({ role: 1, text })
+      }
       continue
     }
     const text = userHistoryText(message.content)
