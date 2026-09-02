@@ -65,7 +65,7 @@ export function TicketCard({
   onDragStart?: (e: DragEvent<HTMLDivElement>) => void
   onDragEnd?: (e: DragEvent<HTMLDivElement>) => void
 }) {
-  const Icon = TYPE_ICON[ticket.type]
+  const Icon = TYPE_ICON[ticket.type] ?? Bug
   const runHint = latestRunHint(ticket.status, latestRunStatus)
   const agent = assigneeLabel(ticket.assignee)
   return (

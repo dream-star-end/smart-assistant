@@ -16,6 +16,7 @@ import {
   type TicketActivity,
   type TicketComment,
   type TicketRun,
+  collectInboxTickets,
   isConcurrencyFull,
   isForbidden,
   isLeaseHeld,
@@ -1004,6 +1005,97 @@ describe('任务展示模式切换', () => {
     )
     fireEvent.click(screen.getByRole('button', { name: '切换到看板展示' }))
     expect(onViewChange).toHaveBeenCalledWith('board')
+  })
+})
+
+describe('任务面板项目范围切换', () => {
+  test('collectInboxTickets 容忍 columns.tickets 缺失', () => {
+    const waiting = sampleTicket({ id: 'w1', status: 'waiting_human' })
+    const rows = collectInboxTickets({
+      inbox: [waiting],
+      columns: [
+        { tickets: undefined as unknown as Ticket[] },
+        null as unknown as { tickets: Ticket[] },
+        { tickets: [sampleTicket({ id: 'w2', status: 'waiting_human' })] },
+      ],
+    })
+    expect(rows.map((t) => t.id).sort()).toEqual(['w1', 'w2'])
+  })
+
+  test('在两个 work 项目与 all/none 之间来回切换 ≥5 次不崩', async () => {
+    const p1 = sampleProject({ id: 'p1', key: 'OCV5', name: 'V5 自用' })
+    const p2 = sampleProject({ id: 'p2', key: 'OTHER', name: '另一个' })
+    vi.spyOn(taskboardApi, 'listProjects').mockResolvedValue([p1, p2])
+    vi.spyOn(taskboardApi, 'listTickets').mockResolvedValue({ items: [], total: 0 })
+    vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([])
+    vi.spyOn(taskboardApi, 'getProjectBoard').mockImplementation(async (_a, pid) => {
+      const project = pid === 'p2' ? p2 : p1
+      return {
+        project,
+        pipeline: samplePipeline({ projectId: project.id }),
+        ticketType: 'bug' as const,
+        // p2 模拟切换窗口里 columns.tickets 缺失：旧代码 collectInboxTickets / columns.flatMap 会抛。
+        columns:
+          pid === 'p2'
+            ? [{ stage: sampleStage({ pipelineId: 'pipe2' }), tickets: undefined as unknown as Ticket[] }]
+            : [
+                {
+                  stage: sampleStage(),
+                  tickets: [sampleTicket({ projectId: 'p1' })],
+                },
+              ],
+        inbox: [],
+        backlog: { tickets: null as unknown as Ticket[] },
+      }
+    })
+
+    history.replaceState({}, '', '/board?project=chat-project-p1')
+    const view = render(
+      <ProjectScopeProvider
+        auth={auth}
+        chatProjects={[
+          { id: 'chat-project-p1', name: 'V5 会话', boardProjectId: 'p1' },
+          { id: 'chat-project-p2', name: '另一会话', boardProjectId: 'p2' },
+        ]}
+        userId="taskboard-switch"
+      >
+        <ToastProvider>
+          <TooltipProvider>
+            <TaskboardView
+              auth={auth}
+              view="board"
+              ticketId={null}
+              onViewChange={() => {}}
+              onOpenTicket={() => {}}
+              onOpenMobileNav={() => {}}
+            />
+          </TooltipProvider>
+        </ToastProvider>
+      </ProjectScopeProvider>,
+    )
+
+    expect(await screen.findByTestId('taskboard-root')).toBeInTheDocument()
+    const select = await screen.findByTestId('project-scope-select-work')
+    await waitFor(() => {
+      expect(select).not.toBeDisabled()
+    })
+    const cycle = ['all', 'p2', 'none', 'p1', 'p2', 'all', 'p1'] as const
+    expect(cycle.length).toBeGreaterThanOrEqual(5)
+    for (const token of cycle) {
+      await act(async () => {
+        fireEvent.change(select, { target: { value: token } })
+      })
+      expect(screen.getByTestId('taskboard-root')).toBeInTheDocument()
+      expect(screen.queryByText('此页面加载出错')).not.toBeInTheDocument()
+      if (token === 'all' || token === 'none') {
+        expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
+      } else {
+        await waitFor(() => {
+          expect(screen.queryByText('该会话项目未绑定看板')).not.toBeInTheDocument()
+        })
+      }
+    }
+    view.unmount()
   })
 })
 

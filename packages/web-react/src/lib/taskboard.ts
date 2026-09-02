@@ -1067,14 +1067,14 @@ export function isStageColumnStatus(status: string): boolean {
   )
 }
 
-export function stageColumnTickets<T extends { status: string }>(tickets: T[]): T[] {
-  return tickets.filter((t) => isStageColumnStatus(t.status))
+export function stageColumnTickets<T extends { status: string }>(tickets: T[] | null | undefined): T[] {
+  return (tickets ?? []).filter((t) => isStageColumnStatus(t.status))
 }
 
 /** inbox 与阶段列里的 waiting_human 并集，避免旧 API 只停在 AI 列时人找不到。 */
 export function collectInboxTickets<T extends { id: string; status: string }>(board: {
-  inbox?: T[]
-  columns?: Array<{ tickets: T[] }>
+  inbox?: T[] | null
+  columns?: Array<{ tickets?: T[] | null } | null | undefined> | null
 }): T[] {
   const seen = new Set<string>()
   const out: T[] = []
@@ -1085,7 +1085,7 @@ export function collectInboxTickets<T extends { id: string; status: string }>(bo
   }
   for (const ticket of board.inbox ?? []) push(ticket)
   for (const col of board.columns ?? []) {
-    for (const ticket of col.tickets) push(ticket)
+    for (const ticket of col?.tickets ?? []) push(ticket)
   }
   return out
 }

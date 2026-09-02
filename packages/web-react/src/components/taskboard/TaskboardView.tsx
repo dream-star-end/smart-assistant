@@ -121,11 +121,11 @@ export function TaskboardView({
     const match = (t: Ticket) => t.identifier === ticketId || t.id === ticketId
     const fromList = board.tickets?.find(match)
     if (fromList) return fromList
-    const fromBacklogTab = board.backlogTickets.find(match)
+    const fromBacklogTab = board.backlogTickets?.find(match)
     if (fromBacklogTab) return fromBacklogTab
-    const fromBacklog = board.board?.backlog?.tickets.find(match)
+    const fromBacklog = board.board?.backlog?.tickets?.find(match)
     if (fromBacklog) return fromBacklog
-    return board.board?.columns.flatMap((c) => c.tickets).find(match) ?? null
+    return (board.board?.columns ?? []).flatMap((c) => c.tickets ?? []).find(match) ?? null
   }, [board.backlogTickets, board.board, board.tickets, ticketId])
 
   const openTicket = (ticket: Ticket) => onOpenTicket(ticket.identifier)
@@ -412,8 +412,9 @@ export function TaskboardView({
   }
 
   const visibleBacklogTickets = useMemo(() => {
-    if (!backlogTypeFilter) return board.backlogTickets
-    return board.backlogTickets.filter((t) => t.type === backlogTypeFilter)
+    const rows = board.backlogTickets ?? []
+    if (!backlogTypeFilter) return rows
+    return rows.filter((t) => t.type === backlogTypeFilter)
   }, [backlogTypeFilter, board.backlogTickets])
 
   const submitCreate = async () => {
@@ -723,7 +724,7 @@ export function TaskboardView({
           title={UNBOUND_BOARD_COPY}
           hint="看板只绑定工作项目。请选择 all/none 以外的工作项目，或把当前会话绑定到看板。"
         />
-      ) : !board.projectId ? (
+      ) : !board.projectId || (lockedProjectId && board.projectId !== lockedProjectId && !board.board) ? (
         <EmptyState
           icon={Kanban}
           title="还没有项目"
@@ -822,7 +823,7 @@ export function TaskboardView({
         open={!!ticketId}
         desktop={desktop}
         agents={board.agents}
-        stages={board.board?.columns.map((c) => c.stage) ?? []}
+        stages={(board.board?.columns ?? []).map((c) => c.stage).filter(Boolean)}
         sessionIds={sessionIds}
         startEditing={reviseOpen}
         actions={selected ? renderActions(selected, desktop ? 'full' : 'board') : null}
