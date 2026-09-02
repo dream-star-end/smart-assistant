@@ -2594,7 +2594,12 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
-          "assertion": "(d) 超时未决不 abandon，迟到 billing 仍进入 tape collector"
+          "assertion": "(d) 超时未决不 abandon；父 tape 已 drain 后迟到帧仍 live settle 一次"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBilling.test.ts",
+          "assertion": "queues a failed live settle and retries the same requestId once"
         },
         {
           "layer": "unit",

@@ -12484,6 +12484,7 @@ export class Gateway {
     })
     let engineBillingAdmission: DelegateEngineBillingAdmission | null = null
     let liveEngineBilling: DurableCodexBilling | null = null
+    let liveSettleTask: Promise<void> | null = null
     if (engineReported) {
       const billingModel = delegateExec?.canonicalModel || requestedModel || execAgent.model
       if (!billingModel) {
@@ -12733,6 +12734,18 @@ export class Gateway {
             const billing = { ...e } as DurableCodexBilling & { kind?: string }
             delete billing.kind
             liveEngineBilling = billing
+            // Settle immediately so a frame that arrives after the parent
+            // tape was already drained still hits the live v3 settle route
+            // (UNIQUE request_id). Failure is persisted to the Auto-Dream-
+            // shaped retry queue inside the client.
+            liveSettleTask = billingApi.settle(billing).catch((err) => {
+              this.log.warn('delegate_engine_billing_settle_failed', {
+                targetAgentId,
+                sessionKey,
+                requestId: billing.requestId,
+                err: String(err),
+              })
+            })
           }
         }
         const progressBlock = e.kind === 'usage'
@@ -12900,7 +12913,9 @@ export class Gateway {
       clearTimeoutTimer()
       detachAncestorActivity?.()
       if (engineBillingAdmission) {
-        if (liveEngineBilling) {
+        if (liveSettleTask) {
+          await liveSettleTask
+        } else if (liveEngineBilling) {
           try {
             await billingApi.settle(liveEngineBilling)
           } catch (err) {

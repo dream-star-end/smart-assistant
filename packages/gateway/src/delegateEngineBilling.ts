@@ -12,11 +12,16 @@
  * UNIQUE(request_id) makes the two idempotent.
  */
 
+import { randomUUID } from 'node:crypto'
+import { mkdir, open, readFile, rename, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+
 import {
   CODEX_ENGINE_MODEL_IDS,
   isGrokEngineModel,
   type DurableCodexBilling,
 } from '@openclaude/protocol'
+import { paths } from '@openclaude/storage'
 import { request as undiciRequest } from 'undici'
 
 // Concatenated so the internal-route scanner does not treat these as new
@@ -52,6 +57,7 @@ export interface DelegateEngineBillingClient {
   admit(input: DelegateEngineBillingAdmitInput): Promise<DelegateEngineBillingAdmission>
   settle(billing: DurableCodexBilling): Promise<void>
   abandon(requestId: string): Promise<void>
+  retryPending?(): Promise<void>
 }
 
 export function shouldAdmitDelegateEngineBilling(args: {
@@ -107,12 +113,55 @@ export function mapDelegateEngineBillingError(err: unknown): {
   }
 }
 
+interface BillingQueue {
+  schemaVersion: 1
+  pending: DurableCodexBilling[]
+}
+
+function isNotFound(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as NodeJS.ErrnoException).code === 'ENOENT'
+}
+
+async function writeDurableJson(path: string, value: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true })
+  const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`
+  await writeFile(tmp, `${JSON.stringify(value)}\n`, { mode: 0o600 })
+  const file = await open(tmp, 'r')
+  try {
+    await file.sync()
+  } finally {
+    await file.close()
+  }
+  await rename(tmp, path)
+}
+
+async function readBillingQueue(queuePath: string): Promise<BillingQueue> {
+  try {
+    const raw = JSON.parse(await readFile(queuePath, 'utf8')) as Partial<BillingQueue>
+    if (raw?.schemaVersion !== 1 || !Array.isArray(raw.pending)) {
+      throw new Error('DELEGATE_ENGINE_BILLING_QUEUE_INVALID')
+    }
+    return { schemaVersion: 1, pending: raw.pending }
+  } catch (err) {
+    if (isNotFound(err)) return { schemaVersion: 1, pending: [] }
+    throw err
+  }
+}
+
 export function createDelegateEngineBillingClient(args?: {
   env?: NodeJS.ProcessEnv
   fetcher?: typeof undiciRequest
+  queuePath?: string
+  retryMs?: number
 }): DelegateEngineBillingClient {
   const env = args?.env ?? process.env
   const fetcher = args?.fetcher ?? undiciRequest
+  const queuePath =
+    args?.queuePath ?? join(paths.agentDir('_platform'), 'delegate-engine-billing.json')
+  const retryMs = args?.retryMs ?? 60_000
+  let retryTimer: NodeJS.Timeout | null = null
+  let retryChain: Promise<void> = Promise.resolve()
+
   const post = async (path: string, body: unknown): Promise<Record<string, unknown>> => {
     const base = env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim().replace(/\/+$/, '')
     const token = env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
@@ -147,7 +196,15 @@ export function createDelegateEngineBillingClient(args?: {
     return parsed
   }
 
-  return {
+  const persistBilling = async (billing: DurableCodexBilling): Promise<void> => {
+    const queue = await readBillingQueue(queuePath)
+    const index = queue.pending.findIndex((row) => row.requestId === billing.requestId)
+    if (index >= 0) queue.pending[index] = billing
+    else queue.pending.push(billing)
+    await writeDurableJson(queuePath, queue)
+  }
+
+  const client: DelegateEngineBillingClient = {
     async admit(input) {
       validateAdmitInput(input)
       const result = await post(ADMIT_PATH, {
@@ -176,7 +233,20 @@ export function createDelegateEngineBillingClient(args?: {
       if (!REQUEST_ID_RE.test(billing.requestId)) {
         throw new Error('DELEGATE_ENGINE_BILLING_INVALID_REQUEST_ID')
       }
-      await post(SETTLE_PATH, billing)
+      try {
+        await post(SETTLE_PATH, billing)
+        const queue = await readBillingQueue(queuePath)
+        const next = queue.pending.filter((row) => row.requestId !== billing.requestId)
+        if (next.length !== queue.pending.length) {
+          await writeDurableJson(queuePath, { schemaVersion: 1, pending: next })
+        }
+      } catch (err) {
+        // Same durable-boundary pattern as Auto-Dream: persist then retry.
+        // UNIQUE(user_id, request_id) makes a later successful POST idempotent.
+        await persistBilling(billing)
+        scheduleRetry()
+        throw err
+      }
     },
     async abandon(requestId) {
       if (!REQUEST_ID_RE.test(requestId)) {
@@ -184,7 +254,47 @@ export function createDelegateEngineBillingClient(args?: {
       }
       await post(ABANDON_PATH, { requestId })
     },
+    async retryPending() {
+      const queue = await readBillingQueue(queuePath)
+      if (queue.pending.length === 0) {
+        clearRetry()
+        return
+      }
+      const remaining: DurableCodexBilling[] = []
+      for (const billing of queue.pending) {
+        try {
+          await post(SETTLE_PATH, billing)
+        } catch {
+          remaining.push(billing)
+        }
+      }
+      await writeDurableJson(queuePath, { schemaVersion: 1, pending: remaining })
+      if (remaining.length > 0) {
+        scheduleRetry()
+        throw new Error('DELEGATE_ENGINE_BILLING_RECOVERY_PENDING')
+      }
+      clearRetry()
+    },
   }
+
+  function scheduleRetry(): void {
+    if (retryTimer) return
+    retryTimer = setTimeout(() => {
+      retryTimer = null
+      retryChain = retryChain
+        .catch(() => {})
+        .then(() => client.retryPending?.())
+        .catch(() => scheduleRetry())
+    }, retryMs)
+    retryTimer.unref?.()
+  }
+
+  function clearRetry(): void {
+    if (retryTimer) clearTimeout(retryTimer)
+    retryTimer = null
+  }
+
+  return client
 }
 
 export const defaultDelegateEngineBilling: DelegateEngineBillingClient =

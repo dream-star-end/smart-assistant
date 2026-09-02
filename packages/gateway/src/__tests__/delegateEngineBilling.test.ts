@@ -5,6 +5,9 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/delegateEngineBilling.test.ts
  */
 import assert from 'node:assert/strict'
+import { mkdtemp, readFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it } from 'node:test'
 
 import {
@@ -138,5 +141,43 @@ describe('createDelegateEngineBillingClient', () => {
     assert.equal(calls[0]?.body.delegateAgentId, 'auditor')
     assert.equal(calls[1]?.path, '/internal/v3/delegate/engine-billing/abandon')
     assert.equal(calls[1]?.body.requestId, requestId)
+  })
+
+  it('queues a failed live settle and retries the same requestId once', async () => {
+    const queuePath = join(await mkdtemp(join(tmpdir(), 'oc-dlg-bill-')), 'queue.json')
+    let settlePosts = 0
+    const client = createDelegateEngineBillingClient({
+      env: ENV,
+      queuePath,
+      retryMs: 60_000,
+      fetcher: (async (url: string) => {
+        const path = new URL(url).pathname
+        if (path.endsWith('/settle')) {
+          settlePosts += 1
+          if (settlePosts === 1) return response(500, { error: { code: 'DELEGATE_ENGINE_BILLING_HTTP_500' } })
+          return response(200, { settled: true })
+        }
+        return response(200, { ok: true })
+      }) as any,
+    })
+    const billing = {
+      requestId: 'f'.repeat(32),
+      engineSessionId: `oceng-${'a'.repeat(48)}`,
+      status: 'success' as const,
+      durationMs: 4,
+      delegateAgentId: 'auditor',
+    }
+    await assert.rejects(() => client.settle(billing), /HTTP_500/)
+    const queued = JSON.parse(await readFile(queuePath, 'utf8')) as {
+      pending: Array<{ requestId: string }>
+    }
+    assert.equal(queued.pending.length, 1)
+    assert.equal(queued.pending[0]?.requestId, billing.requestId)
+    await client.retryPending?.()
+    assert.equal(settlePosts, 2)
+    const drained = JSON.parse(await readFile(queuePath, 'utf8')) as { pending: unknown[] }
+    assert.deepEqual(drained.pending, [])
+    await client.retryPending?.()
+    assert.equal(settlePosts, 2, 'drained queue must not POST the same requestId again')
   })
 })

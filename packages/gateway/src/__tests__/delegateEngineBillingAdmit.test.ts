@@ -253,7 +253,7 @@ describe('handleDelegateTask engine-reported billing', () => {
     assert.deepEqual(billing.abandons, [REQUEST_ID])
   })
 
-  it('(d) 超时未决不 abandon，迟到 billing 仍进入 tape collector', async () => {
+  it('(d) 超时未决不 abandon；父 tape 已 drain 后迟到帧仍 live settle 一次', async () => {
     const orig = {
       drain: process.env.OPENCLAUDE_DELEGATE_INTERRUPT_DRAIN_MS,
       shutdown: process.env.OPENCLAUDE_DELEGATE_SHUTDOWN_WAIT_MS,
@@ -274,20 +274,31 @@ describe('handleDelegateTask engine-reported billing', () => {
       assert.equal(billing.admits.length, 1)
       assert.equal(billing.abandons.length, 0, 'timeout must leave journal inflight')
       assert.equal(billing.settles.length, 0)
-      const collector = gw._session?._durableDelegateEngineBillings
-      assert.ok(Array.isArray(collector), 'billing collector stays attached')
-      const late = {
+      // Parent turn already persisted+drained its tape: collector gone.
+      gw._session._durableDelegateEngineBillings = undefined
+      gw._bufferedGroup = undefined
+      const onEvent = gw._submitOnEvent as (e: unknown) => void
+      onEvent({
+        kind: 'codex_billing',
         requestId: REQUEST_ID,
         engineSessionId: `oceng-${'b'.repeat(48)}`,
-        status: 'success' as const,
+        status: 'success',
         durationMs: 9,
         usage: { input_tokens: 4, output_tokens: 2 },
         delegateAgentId: 'auditor',
+        parentSessionId: 'wsess-engine-billing',
+      })
+      await Promise.resolve()
+      assert.equal(billing.abandons.length, 0)
+      assert.equal(billing.settles.length, 1)
+      const settled = billing.settles[0] as {
+        requestId: string
+        delegateAgentId?: string
+        kind?: string
       }
-      collector.push(late)
-      assert.equal(gw._bufferedGroup?.engineBillings, collector)
-      assert.equal(gw._bufferedGroup.engineBillings.length, 1)
-      assert.equal(gw._bufferedGroup.engineBillings[0].requestId, REQUEST_ID)
+      assert.equal(settled.requestId, REQUEST_ID)
+      assert.equal(settled.delegateAgentId, 'auditor')
+      assert.equal(settled.kind, undefined)
     } finally {
       for (const [key, value] of Object.entries({
         OPENCLAUDE_DELEGATE_INTERRUPT_DRAIN_MS: orig.drain,
