@@ -789,6 +789,13 @@ function makeDelegateGateway(): any {
   gw._activeDelegations = 0
   gw._activeDelegationsByParent = new Map()
   gw._hiddenDelegateGuard = new PerTurnDelegationGuard()
+  // codex/grok 目标是 engine-reported 委派:server 先向 master admit requestId,
+  // 拿不到就 503 fail-closed。本测试只验模型权威裁决,计费用确定性 stub。
+  gw._delegateEngineBilling = {
+    admit: async () => ({ requestId: '0123456789abcdef0123456789abcdef', engineSessionId: 'engine-test' }),
+    settle: async () => {},
+    abandon: async () => {},
+  }
   gw.log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
   gw.rateLimiter = { check: () => true }
   gw.deps = {

@@ -58,6 +58,11 @@ function makeFake(opts: FakeClientOptions): FakeHandles {
       if (/INSERT INTO schema_migrations/i.test(sql)) {
         return { rows: [], rowCount: 0 };
       }
+      // schema_migrations 自举 DDL 现在在 client 上、advisory lock 之前执行(flavor 门之后),
+      // 不属于 migration 本身,不参与 failMigrationSql。
+      if (/CREATE TABLE IF NOT EXISTS schema_migrations/i.test(sql)) {
+        return { rows: [], rowCount: 0 };
+      }
       // 其余视为 migration 的 DDL:可选失败
       if (opts.failMigrationSql) {
         throw new Error("simulated migration SQL failure");

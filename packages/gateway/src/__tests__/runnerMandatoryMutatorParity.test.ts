@@ -45,6 +45,8 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
+import { installFakeCursorWrapper } from './helpers/fakeCursorWrapper.js'
+
 // 导入即注册(adapter 模块底部各自 registerEngine)。
 import '../engine/ccbAdapter.js'
 import '../engine/codexAdapter.js'
@@ -53,6 +55,8 @@ import '../engine/grokAdapter.js'
 import '../engine/zcodeAdapter.js'
 import type { EngineAdapter } from '../engine/engineAdapter.js'
 import { type EngineCreateOpts, createEngine, registeredEngines } from '../engine/registry.js'
+
+installFakeCursorWrapper()
 
 const here = dirname(fileURLToPath(import.meta.url))
 const sessionManagerSource = readFileSync(join(here, '..', 'sessionManager.ts'), 'utf8')

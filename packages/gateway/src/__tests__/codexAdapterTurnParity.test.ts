@@ -51,6 +51,9 @@ class FakeCodexProc extends EventEmitter {
       this.onRequest?.(req);
       return true;
     },
+    // runner 在 spawn 后立刻挂 stdin 'error' 监听(EPIPE 不得升级为 uncaughtException)。
+    on: (_event: string, _fn: (...args: unknown[]) => void) => this.stdin,
+    once: (_event: string, _fn: (...args: unknown[]) => void) => this.stdin,
   };
   kill(_sig?: string): void {
     this.killed = true;

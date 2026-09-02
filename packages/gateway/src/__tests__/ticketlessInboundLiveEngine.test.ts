@@ -33,6 +33,9 @@ import {
   resolveLocalExecutionIfEnforced,
 } from '../server.js'
 import { SessionManager } from '../sessionManager.js'
+import { installFakeCursorWrapper } from './helpers/fakeCursorWrapper.js'
+
+installFakeCursorWrapper()
 
 const MASTER_ENV = {
   OPENCLAUDE_V3_MASTER_BASE_URL: 'http://master.invalid:18791',
