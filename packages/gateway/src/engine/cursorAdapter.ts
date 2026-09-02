@@ -18,7 +18,8 @@ import {
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { EngineAdapter, EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
-import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
+import type { EngineBillingEvent, EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
+import { engineSessionId } from './engineSessionId.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { classifyRunError } from '../errorClassify.js'
@@ -1742,6 +1743,8 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     multimodalInput: 'text-only',
   }
   private readonly opts: EngineCreateOpts
+  /** Stable usage_records.session_id for the durable tape billing (same helper as grok/codex). */
+  private readonly stableEngineSessionId: string
   private active: TurnCtx | null = null
   private currentModel: string | undefined
   private currentEffort: string | undefined
@@ -1765,6 +1768,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   constructor(opts: EngineCreateOpts) {
     super()
     this.opts = { ...opts }
+    this.stableEngineSessionId = engineSessionId(opts.sessionKey)
     this.nativeId = opts.resumeSessionId ?? null
     this.setModel(opts.model)
     this.currentToolsets = opts.agentToolsets
@@ -2253,12 +2257,46 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       : 'Cursor CLI failed'
     const status: EngineExternalBillingEvent['status'] = cls ? 'unavailable' : detail ? 'error' : 'success'
     const slotResults = parseCursorSlotResults(ctx.stderr)
-    if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs: Date.now() - ctx.startedAt, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(this.opts.cursorCredentialSelection && this.opts.cursorCredentialSelection.accountId !== '0' ? { cursorAccountId: this.opts.cursorCredentialSelection.accountId, cursorPoolGeneration: this.opts.cursorCredentialSelection.poolGeneration, cursorKeyFingerprint: this.opts.cursorCredentialSelection.keyFingerprint } : {}), ...(ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : errorClass === 'context_too_long' ? {} : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
+    if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) {
+      const durationMs = Date.now() - ctx.startedAt
+      // Volatile fast path: WS frame → master userChatBridge (live settle + quota learning).
+      this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(this.opts.cursorCredentialSelection && this.opts.cursorCredentialSelection.accountId !== '0' ? { cursorAccountId: this.opts.cursorCredentialSelection.accountId, cursorPoolGeneration: this.opts.cursorCredentialSelection.poolGeneration, cursorKeyFingerprint: this.opts.cursorCredentialSelection.keyFingerprint } : {}), ...(ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : errorClass === 'context_too_long' ? {} : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
+      // Durable path (2026-09-02 fix): the WS frame is lost whenever the user's
+      // bridge WS is gone at turn end (switched session / closed tab), leaving
+      // cursor_external_usage_audit pending forever and no credits badge. Emit
+      // the same evidence as a DurableCodexBilling so sessionManager co-locates
+      // it in the immutable turn tape (engineBilling) and master settles it via
+      // the settlement job path, idempotent with the live frame on
+      // usage_records UNIQUE(user_id, request_id). `engine:'cursor'` tells master
+      // to settle against the audit row instead of request_finalize_journal.
+      this.emit('billing', this.buildDurableBilling(ctx, status, durationMs))
+    }
     if (detail) ctx.params.onEvent({ kind: 'error', error: safeDetail!, errorClass, ...(ctx.interrupted ? { errorCode: 'user_cancelled' as const } : {}) })
     if (ctx.usage) ctx.params.onEvent({ kind: 'usage', usage: { inputTokens: ctx.usage.input_tokens ?? 0, outputTokens: ctx.usage.output_tokens ?? 0, cacheReadTokens: ctx.usage.cache_read_input_tokens ?? 0, cacheCreationTokens: ctx.usage.cache_creation_input_tokens ?? 0, totalTokens: Object.values(ctx.usage).reduce((a, b) => a + (b ?? 0), 0) } })
     ctx.params.onEvent({ kind: 'final', meta: { ...finalUsageMeta(ctx.usage), ...(ctx.interrupted ? { stopReason: 'interrupted' } : {}) } })
     ctx.params.sessionTotals.turns += 1
     const u = ctx.usage; ctx.resolve({ usage: { cost: 0, inputTokens: u?.input_tokens ?? 0, outputTokens: u?.output_tokens ?? 0, cacheReadTokens: u?.cache_read_input_tokens ?? 0, cacheCreationTokens: u?.cache_creation_input_tokens ?? 0, totalTokens: u ? Object.values(u).reduce((a, b) => a + (b ?? 0), 0) : 0 }, assistantText: ctx.assistantText, thinkingText: ctx.thinkingText, assistantSegments: ctx.assistantSegments.map((v) => ({ ...v })), thinkingSegments: ctx.thinkingSegments.map((v) => ({ ...v })), tools: [...ctx.tools.values()].map((v) => structuredClone(v)), runtimeEvents: [], stopReason: ctx.interrupted ? 'interrupted' : null, numTurns: 1, isError: !!detail, ...(detail ? { errorKind: 'other' as const, errorClass, errorDetail: safeDetail! } : {}), staleResumeId: false, phantomSignals: { ...EMPTY_SIGNALS } })
+  }
+  private buildDurableBilling(ctx: TurnCtx, status: EngineExternalBillingEvent['status'], durationMs: number): EngineBillingEvent {
+    const u = ctx.usage
+    const durableStatus: 'success' | 'error' = status === 'success' ? 'success' : 'error'
+    return {
+      requestId: ctx.params.requestId!,
+      engine: 'cursor',
+      ...(ctx.params.turnKey && /^[0-9a-f]{64}$/.test(ctx.params.turnKey) ? { turnKey: ctx.params.turnKey } : {}),
+      ...(ctx.params.usageAttribution?.parentTurnKey ? { parentTurnKey: ctx.params.usageAttribution.parentTurnKey } : {}),
+      ...(ctx.params.usageAttribution?.parentSessionId ? { parentSessionId: ctx.params.usageAttribution.parentSessionId } : {}),
+      ...(ctx.params.usageAttribution?.delegateAgentId ? { delegateAgentId: ctx.params.usageAttribution.delegateAgentId } : {}),
+      engineSessionId: this.stableEngineSessionId,
+      status: durableStatus,
+      // Durable wire contract only knows USER_CANCELLED | CODEX_ERROR; the
+      // finer cursor terminalCode (AUTH/QUOTA/ENGINE) lives in the audit row
+      // written by the live frame and is not needed for settlement (non-success
+      // is never charged).
+      ...(durableStatus === 'error' ? { terminalCode: ctx.interrupted ? 'USER_CANCELLED' as const : 'CODEX_ERROR' as const } : {}),
+      durationMs,
+      ...(u ? { usage: { ...u } } : {}),
+    }
   }
   private forceEnd(ctx: TurnCtx): void {
     this.stopPendingKeepalive()

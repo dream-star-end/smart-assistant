@@ -74,6 +74,24 @@ describe("planCursorExternalSettle", () => {
     assert.match(plan.snapshotJson, /"waived":"no_output"/);
   });
 
+  test("zeroCharge (historical backfill) records would-have-charged but settles at 0", () => {
+    const usage = { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const plan = planCursorExternalSettle({ engineStatus: "success", usage, pricing: grok, zeroCharge: true });
+    assert.equal(plan.settleStatus, "success");
+    assert.equal(plan.costCredits, 0n);
+    assert.match(plan.snapshotJson, /"waived":"historical_backfill_no_charge"/);
+    assert.match(plan.snapshotJson, /"wouldHaveCharged":"800"/);
+    // zeroCharge is a no-op when nothing would have been charged anyway.
+    const zeroOut = planCursorExternalSettle({
+      engineStatus: "success",
+      usage: { ...usage, output_tokens: 0 },
+      pricing: grok,
+      zeroCharge: true,
+    });
+    assert.match(zeroOut.snapshotJson, /"waived":"no_output"/);
+    assert.doesNotMatch(zeroOut.snapshotJson, /historical_backfill_no_charge/);
+  });
+
   test("error/unavailable never debit even with tokens", () => {
     const usage = { input_tokens: 1_000_000, output_tokens: 10, cache_read_tokens: 0, cache_write_tokens: 0 };
     for (const engineStatus of ["error", "unavailable"] as const) {

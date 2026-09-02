@@ -12783,7 +12783,9 @@ export class Gateway {
             ownGoalUsageRecord = {
               runId: progressRunId,
               agentId: targetAgentId,
-              engine: 'codex',
+              // cursorAdapter also emits durable billing (engine:'cursor');
+              // codex/grok billing carries no discriminator.
+              engine: e.engine === 'cursor' ? 'cursor' : 'codex',
               inputTokens: e.usage?.input_tokens ?? ownGoalUsageRecord?.inputTokens ?? 0,
               outputTokens: e.usage?.output_tokens ?? ownGoalUsageRecord?.outputTokens ?? 0,
               cacheReadTokens:
@@ -19341,6 +19343,11 @@ export class Gateway {
         // ts / frameSeq 由 deliver() 在 ring 落地时一并 stamp,这里不预填
         // (与 outbound.codex_billing / outbound.error 同 wire stamp 模式)。
         this.deliver(turnStatusFrame, adapter)
+      } else if (e.kind === 'codex_billing' && e.engine === 'cursor') {
+        // Cursor durable billing rides the tape (engine_billings) only. Master
+        // has no request_finalize_journal row for cursor turns, so the live
+        // codex_billing frame would just be dropped with a warning; the live
+        // low-latency path for cursor is the separate external_billing frame.
       } else if (e.kind === 'codex_billing') {
         // M1a 复活(原 PR2 v1.0.66)— codex turn 终态侧信道。CodexAdapter 在内核
         // result 帧上经 'billing' 通道 emit,sessionManager 包装成 'codex_billing'

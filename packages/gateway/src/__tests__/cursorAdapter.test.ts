@@ -18,7 +18,7 @@ import {
   usableCursorResumeId,
   _internals,
 } from '../engine/cursorAdapter.js'
-import type { EngineEvent, EngineExternalBillingEvent } from '../engine/engineEvents.js'
+import type { EngineBillingEvent, EngineEvent, EngineExternalBillingEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 import {
   DELEGATE_CONTEXT_HEADER,
@@ -1720,6 +1720,104 @@ console.log(JSON.stringify({type:'result',subtype:'error',is_error:true,result:'
       await adapter.waitForOutputDrain()
       assert.equal(billing[0]?.status, 'unavailable')
       assert.equal(billing[0]?.terminalCode, 'QUOTA_UNAVAILABLE')
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('durable billing frame rides alongside external_billing with the cursor engine marker', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-durable-billing-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'ok',usage:{inputTokens:10,outputTokens:4,cacheReadTokens:3,cacheWriteTokens:2}}))
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      const external: EngineExternalBillingEvent[] = []
+      const durable: EngineBillingEvent[] = []
+      adapter.on('external_billing', (event) => external.push(event))
+      adapter.on('billing', (event) => durable.push(event))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        turnKey: 'c'.repeat(64),
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(external.length, 1)
+      assert.equal(durable.length, 1)
+      const frame = durable[0]!
+      // The durable frame is what the tape carries into engine_billings[]; the
+      // master routes it to the cursor settlement path via the engine marker.
+      assert.equal(frame.engine, 'cursor')
+      assert.equal(frame.requestId, REQUEST)
+      assert.equal(frame.turnKey, 'c'.repeat(64))
+      assert.equal(frame.status, 'success')
+      assert.equal(frame.terminalCode, undefined)
+      assert.equal(typeof frame.engineSessionId, 'string')
+      assert.ok(frame.engineSessionId.length > 0)
+      assert.equal(frame.durationMs, external[0]!.durationMs)
+      assert.deepEqual(frame.usage, external[0]!.usage)
+      assert.deepEqual(frame.usage, {
+        input_tokens: 10,
+        output_tokens: 4,
+        cache_read_input_tokens: 3,
+        cache_creation_input_tokens: 2,
+      })
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('durable billing frame maps external unavailable/error to a non-charging error status', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-durable-billing-err-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+console.log(JSON.stringify({type:'error',message:'401 authentication credential unavailable'}))
+console.log(JSON.stringify({type:'result',subtype:'error',is_error:true}))
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      const external: EngineExternalBillingEvent[] = []
+      const durable: EngineBillingEvent[] = []
+      adapter.on('external_billing', (event) => external.push(event))
+      adapter.on('billing', (event) => durable.push(event))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(external[0]?.status, 'unavailable')
+      assert.equal(durable.length, 1)
+      assert.equal(durable[0]!.engine, 'cursor')
+      assert.equal(durable[0]!.status, 'error')
+      assert.equal(durable[0]!.terminalCode, 'CODEX_ERROR')
+      assert.equal('usage' in durable[0]!, false)
     } finally {
       restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
       await rm(dir, { recursive: true, force: true })

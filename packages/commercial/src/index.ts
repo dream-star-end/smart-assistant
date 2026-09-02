@@ -607,6 +607,8 @@ import {
   type CodexFinalizeHandle,
 } from "./billing/codexFinalizer.js";
 import { settleDurableCodexBilling } from "./billing/durableCodexBilling.js";
+import { isCursorDurableBilling, settleDurableCursorBilling } from "./billing/durableCursorBilling.js";
+import { parseZeroChargeCutoff, startCursorAuditReconciler } from "./billing/cursorAuditReconciler.js";
 import { serializeBillingPricing } from "./billing/persistedBillingPricing.js";
 import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
 import {
@@ -1871,6 +1873,38 @@ export async function registerCommercial(
       turnKey,
       parentTurnKey,
     );
+  // Tape engine_billings settlement entry shared by the finalize sync path and
+  // the held settlement job. Codex/grok frames carry no discriminator and go
+  // through the journal finalizer; `engine:'cursor'` frames (2026-09-02 fix for
+  // the missing credits badge when the user WS was gone at turn end) settle
+  // against cursor_external_usage_audit via the durable cursor path.
+  const durableCursorBillingDeps = () => ({
+    pgPool: getPool(),
+    pricing,
+    logger: rootLogger.child({ subsys: "durableCursorBilling" }),
+    appendCostCredits: appendCostCreditsForUser,
+    broadcastToUser: (uid: bigint, payload: Record<string, unknown>) =>
+      bridgeBroadcastRef.current(uid, payload),
+  });
+  const settleTapeEngineBilling = async (
+    userId: bigint,
+    billing: import("@openclaude/protocol").DurableCodexBilling,
+  ): Promise<void> => {
+    if (isCursorDurableBilling(billing)) {
+      await settleDurableCursorBilling(durableCursorBillingDeps(), userId, billing);
+      return;
+    }
+    await settleDurableCodexBilling(
+      {
+        pgPool: getPool(),
+        preCheckRedis,
+        pricing,
+        logger: rootLogger.child({ subsys: "durableCodexBilling" }),
+      },
+      userId,
+      billing,
+    );
+  };
   // P1.7 slice 7c — broker 前向引用。dispatchInternal 在 line ~883 装配,需要路由
   // `/internal/v3/wechat-outbound` → broker.outboundHandler;但 broker 本身依赖
   // resolveContainerEndpoint(line ~1529)装配完才能 makeInboundDispatcher → makeWechatBroker。
@@ -2062,18 +2096,7 @@ export async function registerCommercial(
       const serverAuthoredHandler: ServerAuthoredHandler = makeServerAuthoredHandler({
         identityRepo,
         losslessTurnTapeStorage,
-        settleCodexBilling: async (userId, billing) => {
-          await settleDurableCodexBilling(
-            {
-              pgPool: getPool(),
-              preCheckRedis,
-              pricing,
-              logger: rootLogger.child({ subsys: "durableCodexBilling" }),
-            },
-            userId,
-            billing,
-          );
-        },
+        settleCodexBilling: settleTapeEngineBilling,
         applyTurnWaiver: (input) => applyTurnWaiver(getPool(), input),
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
         storage: {
@@ -5724,16 +5747,7 @@ export async function registerCommercial(
                 ? (job.payload as { engineBillings: import("@openclaude/protocol").DurableCodexBilling[] }).engineBillings
                 : [];
               for (const billing of billings) {
-                await settleDurableCodexBilling(
-                  {
-                    pgPool: getPool(),
-                    preCheckRedis,
-                    pricing,
-                    logger: rootLogger.child({ subsys: "durableCodexBilling" }),
-                  },
-                  uid,
-                  billing,
-                );
+                await settleTapeEngineBilling(uid, billing);
               }
               return;
             }
@@ -5888,6 +5902,36 @@ export async function registerCommercial(
           ...reconcilerDeps,
           budgetMs: DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
           limit: 8,
+        });
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
+  // Cursor pending-audit reconciler(2026-09-02):兜底 cursor_external_usage_audit 长期
+  // pending 的行(live WS 帧丢失 + 旧 gateway tape 无 engine_billings),从 finalized tape
+  // 重建 usage 走 durable cursor settle。cutoff 之前的历史行只补 usage_records/cost
+  // component、0 扣款(运营决策)。cutoff 缺省 = 进程启动时刻(保守:宁少扣不多扣)。
+  if (runtimeChannel === "v5" && process.env.COMMERCIAL_CURSOR_AUDIT_RECONCILER_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "cursorAuditReconciler",
+      domain: "shared",
+      start: () => {
+        const rawInterval = Number(process.env.COMMERCIAL_CURSOR_AUDIT_RECONCILER_INTERVAL_MS);
+        const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 5000 ? rawInterval : 60_000;
+        const zeroChargeBefore =
+          parseZeroChargeCutoff(process.env.COMMERCIAL_CURSOR_AUDIT_BACKFILL_ZERO_CHARGE_BEFORE)
+          ?? new Date();
+        const h = trackScheduler("cursorAuditReconciler", "shared", startCursorAuditReconciler({
+          ...durableCursorBillingDeps(),
+          pool: getPool(),
+          zeroChargeBefore,
+          intervalMs,
+          runOnStart: true,
+        }));
+        rootLogger.info("cursorAuditReconciler started", {
+          intervalMs,
+          zeroChargeBefore: zeroChargeBefore.toISOString(),
         });
         return { stop: () => h.stop() };
       },
