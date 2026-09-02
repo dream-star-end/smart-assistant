@@ -4258,9 +4258,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 const idempotencyKey = typeof frameObj.idempotencyKey === "string"
                   ? frameObj.idempotencyKey
                   : undefined;
-                const displayText = typeof frameContent?.displayText === "string"
-                  ? frameContent.displayText
-                  : undefined;
+                const rawDisplayText = (frameContent as { displayText?: unknown } | null)?.displayText;
+                const displayText = typeof rawDisplayText === "string" ? rawDisplayText : undefined;
                 try {
                   broadcastToUser(uid, {
                     type: "outbound.ack",
