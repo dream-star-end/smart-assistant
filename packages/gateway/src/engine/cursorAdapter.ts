@@ -1437,6 +1437,7 @@ export function attachCursorGatewayRouting(
 
 export const CURSOR_CHATS_DIR_NAME = 'cursor-chats'
 export const CURSOR_SAND_RESUME_PREFIX = 'sand-ccb:'
+export const CURSOR_SAND_OFFICIAL_CC_RESUME_PREFIX = 'sand-official-cc:'
 const CURSOR_RESUME_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export function isCursorSandResumeId(sessionId: string | null | undefined): sessionId is string {
@@ -1449,6 +1450,28 @@ export function cursorSandResumeInnerId(sessionId: string | null | undefined): s
   if (!isCursorSandResumeId(sessionId)) return undefined
   const inner = sessionId.slice(CURSOR_SAND_RESUME_PREFIX.length)
   return CURSOR_RESUME_ID_RE.test(inner) ? inner : undefined
+}
+
+export function isCursorSandOfficialCcResumeId(
+  sessionId: string | null | undefined,
+): sessionId is string {
+  return typeof sessionId === 'string'
+    && sessionId.startsWith(CURSOR_SAND_OFFICIAL_CC_RESUME_PREFIX)
+}
+
+/** Official Claude Code persists the same UUID-shaped JSONL identity as CCB,
+ * but the prefix is deliberately distinct so a flag rollback can never feed
+ * one harness the other harness's native transcript. */
+export function cursorSandOfficialCcResumeInnerId(
+  sessionId: string | null | undefined,
+): string | undefined {
+  if (!isCursorSandOfficialCcResumeId(sessionId)) return undefined
+  const inner = sessionId.slice(CURSOR_SAND_OFFICIAL_CC_RESUME_PREFIX.length)
+  return CURSOR_RESUME_ID_RE.test(inner) ? inner : undefined
+}
+
+export function isAnyCursorSandResumeId(sessionId: string | null | undefined): sessionId is string {
+  return isCursorSandResumeId(sessionId) || isCursorSandOfficialCcResumeId(sessionId)
 }
 
 /** Durable Cursor chat store, deliberately OUTSIDE the per-turn ephemeral HOME

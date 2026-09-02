@@ -35,9 +35,10 @@ import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
 import { decideEngineCwd } from './engineCwd.js'
 import {
+  cursorSandOfficialCcResumeInnerId,
   cursorResumeStoreExists,
   cursorSandResumeInnerId,
-  isCursorSandResumeId,
+  isAnyCursorSandResumeId,
   relocateCursorResumeStore,
   usableCursorResumeId,
 } from './engine/cursorAdapter.js'
@@ -953,6 +954,11 @@ export interface AgentSession {
    * set this for an engine switch or a lost native id so the fallback replay
    * can announce a rebuild. Do not set it on a successful native resume. */
   _contextRebuildNotice?: 'engine-switch' | 'native-resume-loss'
+  /** A same-engine resume-map entry existed, but the newly selected transport
+   * cannot consume it (for example Cursor Sand CCB -> official CC). Preheat may
+   * mint a fresh native id before the first real turn; that empty id must not
+   * suppress bounded history reconstruction. */
+  _forceHistoricalContextOnFirstTurn?: boolean
   /**
    * getOrCreate 跨 engine / workspace 替换期间置位:旧 session 在 runner.shutdown()
    * 完成前仍留在 sessions map。无票 inbound 取样到此标记则不得沿用其 model。
@@ -2969,10 +2975,12 @@ export class SessionManager {
       this._saveResumeMap()
       return undefined
     }
-    const sandCcbId = tag === 'cursor' ? cursorSandResumeInnerId(id) : undefined
-    if (sandCcbId) {
-      if (this._ccbJsonlExists(sandCcbId)) return id
-      log.warn('resume-map Sand CCB entry points to missing JSONL — dropping silently', {
+    const sandJsonlId = tag === 'cursor'
+      ? cursorSandResumeInnerId(id) ?? cursorSandOfficialCcResumeInnerId(id)
+      : undefined
+    if (sandJsonlId) {
+      if (this._ccbJsonlExists(sandJsonlId)) return id
+      log.warn('resume-map Cursor Sand entry points to missing JSONL — dropping silently', {
         sessionKey,
         resumeId: id,
       })
@@ -2984,8 +2992,8 @@ export class SessionManager {
       this._saveResumeMap()
       return undefined
     }
-    if (tag === 'cursor' && isCursorSandResumeId(id)) {
-      log.warn('resume-map Sand CCB entry is malformed — dropping silently', {
+    if (tag === 'cursor' && isAnyCursorSandResumeId(id)) {
+      log.warn('resume-map Cursor Sand entry is malformed — dropping silently', {
         sessionKey,
         resumeId: id,
       })
@@ -3522,6 +3530,10 @@ export class SessionManager {
         opts.projectId === undefined ? existing.projectId ?? null : opts.projectId
       const projectIdChanged =
         opts.projectId !== undefined && (existing.projectId ?? null) !== (opts.projectId ?? null)
+      const cursorTransportChanged = Boolean(
+        (opts.model !== undefined || opts.executionAuthority !== undefined)
+        && existing.runner.requiresReopenForModel?.(executionModel),
+      )
       const nextFingerprint =
         opts.contextFingerprint ??
         (await computeSessionContextFingerprint(nextProjectId, opts.assetsRevision))
@@ -3530,6 +3542,7 @@ export class SessionManager {
       // native session and force a visible history replay on ordinary follow-ups.
       if (
         existing.providerTag !== desiredEngine ||
+        cursorTransportChanged ||
         workspaceModeChanged ||
         workspaceCwdChanged ||
         projectIdChanged
@@ -3565,6 +3578,10 @@ export class SessionManager {
                 : canonical.providerTag
             const stillNeedsReplace =
               canonical.providerTag !== desiredEngineNow ||
+              Boolean(
+                (opts.model !== undefined || opts.executionAuthority !== undefined)
+                && canonical.runner.requiresReopenForModel?.(executionModel),
+              ) ||
               (opts.workspaceMode !== undefined && canonical.workspaceMode !== workspaceMode) ||
               (opts.workspaceCwd !== undefined && canonical.workspaceCwd !== opts.workspaceCwd) ||
               (opts.projectId !== undefined && (canonical.projectId ?? null) !== (opts.projectId ?? null))
@@ -3655,6 +3672,15 @@ export class SessionManager {
     //     teardown 判定与构造用同一份解析结果,不会出现"比较用 A、spawn 用 B"。
     //   - createEngine 对未注册 engine fail-closed 抛错(原 v5 channel 硬闸的
     //     语义升级形态:任何 channel 都不会把未注册 engine 静默落到 CCB)。
+    const hadSameProviderResume = Boolean(this._resumeMap.get(opts.sessionKey))
+      && SessionManager.normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === engineId
+    const mappedResumeId = opts.hermeticNoTools
+      ? undefined
+      : this._resumeIdFor(
+          opts.sessionKey,
+          engineId,
+          this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
+        )
     const runner = createEngine(engineId, {
       sessionKey: opts.sessionKey,
       agentId: opts.agent.id,
@@ -3671,13 +3697,7 @@ export class SessionManager {
       // (resume-map 按 engine 维度隔离,防 codex thread_id 与 CCB session_id
       // 互喂)。_resumeIdFor also drops the entry silently when the CCB JSONL
       // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
-      resumeSessionId: opts.hermeticNoTools
-        ? undefined
-        : this._resumeIdFor(
-            opts.sessionKey,
-            engineId,
-            this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
-          ),
+      resumeSessionId: mappedResumeId,
       effortLevel: initialEffort,
       // Phase 5:repoSessionId 默认等于 peerId;delegate_task 可传父 webchat
       // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
@@ -3696,6 +3716,14 @@ export class SessionManager {
       hermeticNoTools: opts.hermeticNoTools,
       structuredOutputSchema: opts.structuredOutputSchema,
     })
+    const resumeTransportMismatch = !opts.hermeticNoTools && hadSameProviderResume && (
+      !mappedResumeId
+      || Boolean(
+        runner.isResumeIdCompatible
+        && !runner.isResumeIdCompatible(mappedResumeId),
+      )
+    )
+    if (resumeTransportMismatch) contextRebuildNotice = 'native-resume-loss'
     const now = Date.now()
     const session: AgentSession = {
       sessionKey: opts.sessionKey,
@@ -3758,6 +3786,7 @@ export class SessionManager {
       providerTag: engineId,
       agentProvider: opts.agent.provider,
       _contextRebuildNotice: contextRebuildNotice,
+      _forceHistoricalContextOnFirstTurn: resumeTransportMismatch || undefined,
     }
     runner.on('task_notification', (payload: {
       taskId: string
@@ -4532,11 +4561,12 @@ export class SessionManager {
       }
       const spawnCwd = this._cursorWorkspacePathForSession(session)
       const liveNativeId = session.runner.nativeSessionId
-      const liveSandCcbId = session.providerTag === 'cursor'
+      const liveSandJsonlId = session.providerTag === 'cursor'
         ? cursorSandResumeInnerId(liveNativeId)
+          ?? cursorSandOfficialCcResumeInnerId(liveNativeId)
         : undefined
       const usableCursorId = session.providerTag === 'cursor'
-        ? liveSandCcbId && this._ccbJsonlExists(liveSandCcbId)
+        ? liveSandJsonlId && this._ccbJsonlExists(liveSandJsonlId)
           ? liveNativeId ?? undefined
           : usableCursorResumeId({
               workspacePath: spawnCwd,
@@ -4549,6 +4579,20 @@ export class SessionManager {
         session.providerTag,
         spawnCwd,
       )
+      if (
+        providerResumeId
+        && session.runner.isResumeIdCompatible
+        && !session.runner.isResumeIdCompatible(providerResumeId)
+      ) {
+        log.info('native resume belongs to a different engine transport — rebuilding bounded history', {
+          sessionKey: session.sessionKey,
+          provider: session.providerTag,
+        })
+        session._forceHistoricalContextOnFirstTurn = true
+        session._contextRebuildNotice ??= 'native-resume-loss'
+        providerResumeId = undefined
+      }
+      if (session._forceHistoricalContextOnFirstTurn) providerResumeId = undefined
       const injectionKey = historicalContextInjectionKey({
         messages: effectiveMasterHistoricalMessages,
         peerId: session.peerId,
@@ -4620,6 +4664,7 @@ export class SessionManager {
         session._historicalContextInjected = true
         session._historicalContextInjectedKey = `native-switch:${nativeHandoff.id}`
         session._contextRebuildNotice = undefined
+        session._forceHistoricalContextOnFirstTurn = false
       }
       if (
         !nativeHandoff &&
@@ -4692,6 +4737,7 @@ export class SessionManager {
               }
             }
             session._contextRebuildNotice = undefined
+            session._forceHistoricalContextOnFirstTurn = false
           } else if (!hasHistoricalContextRows) {
             // A replacement runner owns this reason only for its first
             // successful history lookup. A fresh conversation can have no
@@ -4703,6 +4749,7 @@ export class SessionManager {
             // history exists but does not fit the provider's byte cap. Keep
             // the reason in that case for a later successful rebuild notice.
             session._contextRebuildNotice = undefined
+            session._forceHistoricalContextOnFirstTurn = false
           }
         } catch (err) {
           log.warn('historical context injection failed', { sessionKey: session.sessionKey }, err)
@@ -6308,12 +6355,16 @@ export class SessionManager {
               result.errorDetail ===
                 '{"subtype":"error_during_execution","errors":["[ede_diagnostic] result_type=undefined last_content_type=n/a stop_reason=null"]}'
             )
+          const engineUserCancellationResult = result
+            ? session.runner.isUserCancellationResult?.(result) === true
+            : false
           const userCancellationOverride =
             requestedTerminal?.status === 'interrupted' &&
             requestedTerminal.errorCode === 'USER_CANCELLED' &&
             (
               result?.stopReason === 'interrupted' ||
               ccbUserCancellationResult ||
+              engineUserCancellationResult ||
               (
                 terminalRequestEscalated &&
                 result?.isError === true &&
@@ -7182,7 +7233,7 @@ export class SessionManager {
         session.ccbSessionId = null
         session.runner.clearSessionId?.()
         this._saveResumeMap()
-        session.runner.setExecutionTarget(newTarget)
+        await session.runner.setExecutionTarget(newTarget)
       } catch (err) {
         if (newTarget.kind === 'remote' && session.userId) {
           await this._remoteTargetController

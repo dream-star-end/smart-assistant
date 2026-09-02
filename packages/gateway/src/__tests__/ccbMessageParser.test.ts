@@ -861,6 +861,40 @@ describe('CcbMessageParser: result', () => {
     assert.equal(sessionTotals._lastCcbCumulativeCost, 0.03)
   })
 
+  it('external cost mode ignores official Claude Code USD but preserves tokens and turns', () => {
+    const sessionTotals = { totalCostUSD: 0.25, turns: 4, _lastCcbCumulativeCost: 0.125 }
+    let result: any = null
+    const parser = new CcbMessageParser({
+      toolUseIdToName: new Map(),
+      onEvent: () => {},
+      onFinish: (value) => { result = value },
+      sessionTotals,
+      costMode: 'external',
+    })
+
+    parser.parse({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      total_cost_usd: 0.000525,
+      usage: {
+        input_tokens: 120,
+        output_tokens: 30,
+        cache_read_input_tokens: 10,
+        cache_creation_input_tokens: 5,
+      },
+    } as any)
+
+    assert.equal(result.cost, 0)
+    assert.equal(result.inputTokens, 120)
+    assert.equal(result.outputTokens, 30)
+    assert.equal(result.cacheReadTokens, 10)
+    assert.equal(result.cacheCreationTokens, 5)
+    assert.equal(sessionTotals.totalCostUSD, 0.25, 'stock Anthropic USD must not pollute Cursor')
+    assert.equal(sessionTotals._lastCcbCumulativeCost, 0.125, 'external mode must not move CCB baseline')
+    assert.equal(sessionTotals.turns, 5)
+  })
+
   it('attributes full cost after gateway-initiated CCB restart (cumulative ≥ old prev)', () => {
     // Simulates gateway flow: after AUTH_ERROR / PHANTOM_TURN / effort-change
     // the gateway shuts down CCB and resets _lastCcbCumulativeCost to 0 before

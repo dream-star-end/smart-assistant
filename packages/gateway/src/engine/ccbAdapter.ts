@@ -188,6 +188,7 @@ function buildTurnSummary(
       ? redactModelAuthorityRuntimeEvents(result.runtimeEvents)
       : result.runtimeEvents,
     stopReason: result.stopReason,
+    ...(result.terminalReason !== undefined ? { terminalReason: result.terminalReason } : {}),
     numTurns: result.numTurns,
     isError: result.isError,
     ...(nativeCompactionSummary ? { nativeCompactionSummary } : {}),
@@ -260,6 +261,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private readonly runner: SubprocessRunner
+  private readonly harness: 'ccb' | 'official-cc'
 
   /**
    * stdout 路由目标 = 最近一次 submitTurn 的 turn 上下文。turn 结束后**保留**
@@ -294,6 +296,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   /** @param runnerOverride 测试注入结构等价 fake(生产恒为内部构造的 SubprocessRunner)。 */
   constructor(opts: EngineCreateOpts, runnerOverride?: SubprocessRunner) {
     super()
+    this.harness = opts.harness ?? 'ccb'
     this.runner = runnerOverride ?? new SubprocessRunner(opts)
     // 常驻 stdout 路由(每 session 恰一个,替代旧 per-turn 'message' 闭包链)。
     // 'activity' 先于 parse emit —— 对位旧 handleMessage 里 timer.refresh() 在
@@ -377,6 +380,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       // CCB 成本 delta 基线:parser 直接 mutate session 引用,行为逐字节不变
       // (见 TurnParams.sessionTotals / CcbSessionTotals 注释)。
       sessionTotals: asCcbSessionTotals(params.sessionTotals),
+      costMode: this.harness === 'official-cc' ? 'external' : 'native',
     })
     const ctx: CcbTurnContext = {
       parser,
@@ -598,6 +602,14 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 
   get model(): string | undefined {
     return this.runner.model
+  }
+
+  isUserCancellationResult(summary: TurnSummary): boolean {
+    return this.harness === 'official-cc'
+      && summary.isError
+      && summary.stopReason === null
+      && summary.terminalReason === 'aborted_streaming'
+      && summary.errorDetail?.includes('"subtype":"error_during_execution"') === true
   }
 
   setEffortLevel(level: string | undefined): void {

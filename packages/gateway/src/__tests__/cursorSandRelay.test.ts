@@ -14,7 +14,11 @@ import {
   recordCursorCredentialResult,
   selectCursorCredential,
 } from '../engine/cursorCredentialSelection.js'
-import { CursorRoutingAdapter } from '../engine/cursorRoutingAdapter.js'
+import {
+  cursorOfficialCcEnabledForModel,
+  cursorVariantFor,
+  CursorRoutingAdapter,
+} from '../engine/cursorRoutingAdapter.js'
 import { createEngine } from '../engine/registry.js'
 
 const root = protobuf.loadSync(
@@ -76,6 +80,123 @@ test('Sand credential selects every concrete Cursor model while Auto stays nativ
   assert.equal(cursorSandEnabledForSelection('cursor-fable-5-high', NATIVE_SELECTION), false)
 })
 
+test('official Claude Code flag selects only local Sand Opus/Fable models', () => {
+  const on = { OC_CURSOR_SAND_OFFICIAL_CC: '1' }
+  const off = { OC_CURSOR_SAND_OFFICIAL_CC: '0' }
+  for (const model of [
+    'cursor-opus-4.8-high',
+    'cursor-opus-5-max-fast',
+    'cursor-fable-5-high',
+    'cursor-fable-5.1-xhigh',
+  ]) {
+    assert.equal(cursorOfficialCcEnabledForModel(model, on), true, model)
+    assert.equal(cursorVariantFor(model, SAND_SELECTION, { kind: 'local' }, on), 'sand-official-cc')
+    assert.equal(cursorVariantFor(model, SAND_SELECTION, { kind: 'local' }, off), 'sand-ccb')
+    assert.equal(cursorVariantFor(model, NATIVE_SELECTION, { kind: 'local' }, on), 'native')
+    assert.equal(
+      cursorVariantFor(model, SAND_SELECTION, {
+        kind: 'remote', hostId: 'host-1', hostMeta: {} as never,
+      }, on),
+      'sand-ccb',
+    )
+  }
+  for (const model of [
+    'cursor-grok-4.6-high',
+    'cursor-composer-2.5-fast',
+    'cursor-auto',
+  ]) {
+    assert.equal(cursorOfficialCcEnabledForModel(model, on), false, model)
+    const expected = model === 'cursor-auto' ? 'native' : 'sand-ccb'
+    assert.equal(cursorVariantFor(model, SAND_SELECTION, { kind: 'local' }, on), expected)
+  }
+})
+
+test('Cursor routing adapter keeps native, CCB Sand, and official Sand resume ids mutually exclusive', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-resume-discriminator-'))
+  const previous = process.env.OC_CURSOR_SAND_OFFICIAL_CC
+  const ccbId = 'sand-ccb:463989eb-daba-4a13-a32d-4ef00261ea08'
+  const officialId = 'sand-official-cc:3bdc1a6e-63e3-4a3b-a29f-9aeb4e08c1cd'
+  const nativeId = 'cursor-native-session-id'
+  try {
+    process.env.OC_CURSOR_SAND_OFFICIAL_CC = '0'
+    const ccb = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:ccb-resume-discriminator', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-fable-5.1-high', cursorCredentialSelection: SAND_SELECTION,
+    })
+    assert.equal(ccb.currentVariant, 'sand-ccb')
+    assert.equal(ccb.isResumeIdCompatible(ccbId), true)
+    assert.equal(ccb.isResumeIdCompatible(officialId), false)
+    assert.equal(ccb.isResumeIdCompatible(nativeId), false)
+    await ccb.shutdown()
+
+    process.env.OC_CURSOR_SAND_OFFICIAL_CC = '1'
+    const official = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:official-resume-discriminator', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-fable-5.1-high', cursorCredentialSelection: SAND_SELECTION,
+    })
+    assert.equal(official.currentVariant, 'sand-official-cc')
+    assert.equal(official.isResumeIdCompatible(officialId), true)
+    assert.equal(official.isResumeIdCompatible(ccbId), false)
+    assert.equal(official.isResumeIdCompatible(nativeId), false)
+    await official.shutdown()
+
+    const native = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:native-resume-discriminator', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-fable-5.1-high', cursorCredentialSelection: NATIVE_SELECTION,
+    })
+    assert.equal(native.currentVariant, 'native')
+    assert.equal(native.isResumeIdCompatible(nativeId), true)
+    assert.equal(native.isResumeIdCompatible(ccbId), false)
+    assert.equal(native.isResumeIdCompatible(officialId), false)
+    await native.shutdown()
+  } finally {
+    if (previous === undefined) delete process.env.OC_CURSOR_SAND_OFFICIAL_CC
+    else process.env.OC_CURSOR_SAND_OFFICIAL_CC = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('official local and remote CCB execution targets rebuild the Cursor transport in both directions', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-execution-target-switch-'))
+  const previous = process.env.OC_CURSOR_SAND_OFFICIAL_CC
+  const remote = {
+    kind: 'remote' as const,
+    hostId: 'host-1',
+    hostMeta: {
+      sessionId: 'agent:main:test:target-switch',
+      userId: 'user-1',
+      hostId: 'host-1',
+      controlPath: '/run/ccb-ssh/host-1/ctl.sock',
+      knownHostsPath: '/run/ccb-ssh/host-1/known_hosts',
+      username: 'runner',
+      host: '127.0.0.2',
+      port: 22,
+      remoteWorkdir: '/workspace',
+    },
+  }
+  try {
+    process.env.OC_CURSOR_SAND_OFFICIAL_CC = '1'
+    const router = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:target-switch', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-fable-5.1-high', cursorCredentialSelection: SAND_SELECTION,
+    })
+    assert.equal(router.currentVariant, 'sand-official-cc')
+
+    await router.setExecutionTarget(remote)
+    assert.equal(router.currentVariant, 'sand-ccb')
+    assert.deepEqual(router.executionTarget, remote)
+
+    await router.setExecutionTarget({ kind: 'local' })
+    assert.equal(router.currentVariant, 'sand-official-cc')
+    assert.deepEqual(router.executionTarget, { kind: 'local' })
+    await router.shutdown()
+  } finally {
+    if (previous === undefined) delete process.env.OC_CURSOR_SAND_OFFICIAL_CC
+    else process.env.OC_CURSOR_SAND_OFFICIAL_CC = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('cursor engine factory binds transport to the selected key and preserves it across concrete models', async () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-factory-'))
   const opts = {
@@ -89,12 +210,12 @@ test('cursor engine factory binds transport to the selected key and preserves it
   try {
     const sand = createEngine('cursor', opts)
     assert.equal(sand instanceof CursorRoutingAdapter, true)
-    assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand')
+    assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand-ccb')
     assert.equal(sand.capabilities.supportsNativeCompact, false)
     assert.equal(typeof sand.compactForHandoff, 'undefined')
     sand.setModel('cursor-opus-5-high')
     await (sand as CursorRoutingAdapter).refreshVariantForTest()
-    assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand')
+    assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand-ccb')
     assert.deepEqual((sand as CursorRoutingAdapter).currentCredentialForTest, SAND_SELECTION)
     assert.throws(() => sand.setModel('cursor-auto'), /CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION/)
     await sand.shutdown()
@@ -203,7 +324,7 @@ test('concrete model quota-family changes reselect an eligible key before the ne
     await router.refreshVariantForTest()
     assert.equal(selections, 1)
     assert.deepEqual(router.currentCredentialForTest, nextSand)
-    assert.equal(router.currentVariant, 'sand')
+    assert.equal(router.currentVariant, 'sand-ccb')
     await router.shutdown()
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -229,7 +350,7 @@ test('pool generation changes rebind stable account identity before reading a re
     }, () => generationTwo)
     await router.refreshVariantForTest()
     assert.deepEqual(router.currentCredentialForTest, generationTwo)
-    assert.equal(router.currentVariant, 'sand')
+    assert.equal(router.currentVariant, 'sand-ccb')
     await router.shutdown()
   } finally {
     rmSync(dir, { recursive: true, force: true })

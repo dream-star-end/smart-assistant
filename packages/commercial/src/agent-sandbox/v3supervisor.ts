@@ -524,8 +524,7 @@ function appendCodexRelayEnv(env: string[]): void {
   env.push(...buildCodexRelayContainerEnv(process.env));
 }
 
-/** Master→container passthrough of gateway delegate concurrency knobs
- *  and OC_DELEGATE feature flags.
+/** Master→container passthrough of numeric gateway knobs and feature flags.
  *  Only inject when the master process env value matches /^[0-9]+$/
  *  (feature flags use "1"/"0" through the same numeric gate);
  *  omit the key otherwise so the container gateway falls back to defaults. */
@@ -544,6 +543,7 @@ export const DELEGATE_KNOB_CONTAINER_ENV_KEYS = [
   "OC_DELEGATE_INLINE_PUSH_CCB",
   "OC_DELEGATE_INLINE_PUSH_CODEX",
   "OC_DELEGATE_CURSOR_MCP_WAIT",
+  "OC_CURSOR_SAND_OFFICIAL_CC",
 ] as const;
 
 export function buildDelegateKnobContainerEnv(

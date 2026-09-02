@@ -1,4 +1,5 @@
-/** Cursor Sand engine: CCB supplies the local agent/tool loop while a
+/** Cursor Sand engine: a selected local harness (CCB by default, official
+ * Claude Code behind the rollout flag) supplies the agent/tool loop while a
  * capability-scoped loopback relay speaks Cursor InferenceService/Stream. */
 import type { EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
 import type {
@@ -34,7 +35,7 @@ function appendNoProxy(current: string | undefined, ...hosts: string[]): string 
   return values.join(',')
 }
 
-/** CCB adapter with Cursor's external-billing/session identity at its boundary. */
+/** CCB-compatible stream adapter with Cursor external billing/session identity. */
 export class CursorSandAdapter extends CcbAdapter {
   override readonly engineId = 'cursor'
   override readonly capabilities: EngineCapabilities = {

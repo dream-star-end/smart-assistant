@@ -84,6 +84,7 @@ fi
 IMAGE_FULL="${IMAGE_REPO}:${TAG}"
 TAR_PATH="${IMAGE_OUT_DIR}/openclaude-runtime-${TAG}.tar.gz"
 CODEX_VERSION="0.149.0"
+OFFICIAL_CLAUDE_VERSION="${OC_OFFICIAL_CLAUDE_VERSION:-2.1.258}"
 CURSOR_AGENT_VERSION="2026.08.11-e8db854"
 CURSOR_AGENT_SHA256="bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a"
 GROK_VERSION="1.0.5"
@@ -126,6 +127,7 @@ fi
 echo "[build-image] tag=$TAG"
 echo "[build-image] image=$IMAGE_FULL"
 echo "[build-image] source_commit=$SOURCE_COMMIT codex=$CODEX_VERSION"
+echo "[build-image] official_claude=$OFFICIAL_CLAUDE_VERSION include_official_claude=${OC_INCLUDE_OFFICIAL_CLAUDE:-0}"
 echo "[build-image] cursor_agent=$CURSOR_AGENT_VERSION"
 echo "[build-image] grok=$GROK_VERSION"
 echo "[build-image] zcode_app=$ZCODE_APPIMAGE_VERSION zcode_cli=$ZCODE_CLI_VERSION include_zcode=${OC_INCLUDE_ZCODE:-0}"
@@ -460,10 +462,12 @@ PY
     "args" \
     "OC_EMBED_SOURCE=${OC_EMBED_SOURCE:-1}" \
     "OC_INCLUDE_CODEX=${OC_INCLUDE_CODEX:-1}" \
+    "OC_INCLUDE_OFFICIAL_CLAUDE=${OC_INCLUDE_OFFICIAL_CLAUDE:-0}" \
     "OC_INCLUDE_CURSOR=${OC_INCLUDE_CURSOR:-0}" \
     "OC_INCLUDE_GROK=${OC_INCLUDE_GROK:-0}" \
     "OC_INCLUDE_ZCODE=${OC_INCLUDE_ZCODE:-0}" \
     "CODEX_VERSION=${CODEX_VERSION}" \
+    "OC_OFFICIAL_CLAUDE_VERSION=${OFFICIAL_CLAUDE_VERSION}" \
     "OC_CURSOR_AGENT_VERSION=${CURSOR_AGENT_VERSION}" \
     "OC_CURSOR_AGENT_SHA256=${CURSOR_AGENT_SHA256}" \
     "OC_GROK_VERSION=${GROK_VERSION}" \
@@ -503,6 +507,9 @@ echo "[build-image] docker build → $IMAGE_FULL"
 #   的 MANIFEST.capabilities(见 scripts/v5-runtime-release-lib.sh)。deploy 的兼容地板
 #   (cutover 后)按这两处之一验证容器面能力,拒绝把 baked 判定的旧容器翻回来。
 RUNTIME_FEATURES="v3-sink"
+if [ "${OC_INCLUDE_OFFICIAL_CLAUDE:-0}" = "1" ]; then
+  RUNTIME_FEATURES="$RUNTIME_FEATURES official_claude_code_v1"
+fi
 if [ "${OC_EMBED_SOURCE:-1}" != "0" ]; then
   RUNTIME_FEATURES="$RUNTIME_FEATURES model_authority_v1 lossless-turn-tape-v2"
 fi
@@ -575,6 +582,8 @@ if [ "$SKIPPED_BUILD" != "1" ]; then
     --label "oc.runtime.git_sha=$TAG" \
     --label "oc.runtime.source_commit=$SOURCE_COMMIT" \
     --label "oc.runtime.codex_version=$CODEX_VERSION" \
+    --label "oc.runtime.include_official_claude=${OC_INCLUDE_OFFICIAL_CLAUDE:-0}" \
+    --label "oc.runtime.official_claude_version=$OFFICIAL_CLAUDE_VERSION" \
     --label "oc.runtime.cursor_agent_version=$CURSOR_AGENT_VERSION" \
     --label "oc.runtime.include_cursor=${OC_INCLUDE_CURSOR:-0}" \
     --label "oc.runtime.include_codex=${OC_INCLUDE_CODEX:-1}" \
@@ -586,6 +595,8 @@ if [ "$SKIPPED_BUILD" != "1" ]; then
     --label "oc.runtime.embed_source=${OC_EMBED_SOURCE:-1}" \
     "${LABEL_DIGEST_ARGS[@]+"${LABEL_DIGEST_ARGS[@]}"}" \
     --build-arg "OC_INCLUDE_CODEX=${OC_INCLUDE_CODEX:-1}" \
+    --build-arg "OC_INCLUDE_OFFICIAL_CLAUDE=${OC_INCLUDE_OFFICIAL_CLAUDE:-0}" \
+    --build-arg "OC_OFFICIAL_CLAUDE_VERSION=$OFFICIAL_CLAUDE_VERSION" \
     --build-arg "OC_CURSOR_AGENT_VERSION=$CURSOR_AGENT_VERSION" \
     --build-arg "OC_CURSOR_AGENT_SHA256=$CURSOR_AGENT_SHA256" \
     --build-arg "OC_INCLUDE_CURSOR=${OC_INCLUDE_CURSOR:-0}" \

@@ -36,6 +36,7 @@ import {
   AuthorityHeaderRejected,
   MODEL_EXECUTION_DESCRIPTOR_ENV,
   SubprocessRunner,
+  isOfficialClaudeCursorSandLoopbackEnv,
   shouldRecycleForVisionCapability,
   type TurnModelAuthority,
   _buildAnthropicCustomHeadersEnv,
@@ -65,13 +66,25 @@ interface Harness {
   destroyed: { value: boolean }
 }
 
-function createHarness(failWrite?: number, spawnedDescriptor: unknown = EXECUTION_DESCRIPTOR): Harness {
+function createHarness(
+  failWrite?: number,
+  spawnedDescriptor: unknown = EXECUTION_DESCRIPTOR,
+  official = false,
+): Harness {
   const runner = new SubprocessRunner({
     sessionKey: 'test',
     agentId: 'test',
     agentBaseDir: '/tmp',
     model: 'glm-5.2',
     config: {} as never,
+    ...(official ? {
+      harness: 'official-cc' as const,
+      authorityEngine: 'cursor' as const,
+      providerEnvOverride: {
+        ANTHROPIC_BASE_URL: `http://127.0.0.1:43123/route/${'a'.repeat(64)}`,
+        ANTHROPIC_AUTH_TOKEN: 'cursor-sand-loopback',
+      },
+    } : {}),
   } as never)
   const writes: string[] = []
   const destroyed = { value: false }
@@ -187,6 +200,43 @@ describe('CCB authority headers — stdin 写入序列', () => {
     assert.equal(userMsg.message.role, 'user')
     // 每行一条 JSON(CCB stream-json 输入格式)。
     for (const w of writes) assert.ok(w.endsWith('\n'), 'stdin 每次写入必须以换行结尾')
+  })
+})
+
+describe('official Claude Code Cursor Sand lane', () => {
+  it('still resolves turn authority but writes only the stock stream-json user message', async () => {
+    const { runner, writes } = createHarness(undefined, EXECUTION_DESCRIPTOR, true)
+    await runner.submit('hello', 'req-official', authority('AUTH1', 'LEASE1'), 'turn-key')
+
+    assert.equal(writes.length, 1)
+    const userMsg = JSON.parse(writes[0]!) as { type: string; message: { role: string } }
+    assert.equal(userMsg.type, 'user')
+    assert.equal(userMsg.message.role, 'user')
+    assert.equal(writes[0]!.includes('update_environment_variables'), false)
+
+    await runner.updateTurnLease('LEASE2')
+    assert.equal(writes.length, 1, 'official CLI lease renewal must remain a subprocess no-op')
+  })
+
+  it('accepts only a credential-bound 64-hex loopback route', async () => {
+    const valid = {
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:43123/route/${'b'.repeat(64)}`,
+      ANTHROPIC_AUTH_TOKEN: 'cursor-sand-loopback',
+    }
+    assert.equal(isOfficialClaudeCursorSandLoopbackEnv(valid), true)
+    for (const invalid of [
+      { ...valid, ANTHROPIC_BASE_URL: `http://localhost:43123/route/${'b'.repeat(64)}` },
+      { ...valid, ANTHROPIC_BASE_URL: 'http://127.0.0.1:43123/route/short' },
+      { ...valid, ANTHROPIC_AUTH_TOKEN: 'wrong' },
+    ]) assert.equal(isOfficialClaudeCursorSandLoopbackEnv(invalid), false)
+
+    const { runner } = createHarness(undefined, EXECUTION_DESCRIPTOR, true)
+    ;(runner as unknown as { opts: { providerEnvOverride: Record<string, string> } })
+      .opts.providerEnvOverride.ANTHROPIC_AUTH_TOKEN = 'wrong'
+    await assert.rejects(
+      runner.updateTurnLease('LEASE2'),
+      /OFFICIAL_CC_LEASE_NOOP_OUTSIDE_CURSOR_SAND/,
+    )
   })
 })
 

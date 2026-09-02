@@ -155,8 +155,9 @@ class FakeCcbRunner extends EventEmitter {
 function makeSession(
   runner: FakeCcbRunner,
   over: Partial<AgentSession> = {},
+  adapterOpts: EngineCreateOpts = {} as EngineCreateOpts,
 ): AgentSession {
-  const adapter = new CcbAdapter({} as EngineCreateOpts, runner as unknown as SubprocessRunner);
+  const adapter = new CcbAdapter(adapterOpts, runner as unknown as SubprocessRunner);
   return {
     sessionKey: "agent:main:webchat:dm:engine-peer",
     agentId: "main",
@@ -1850,6 +1851,70 @@ describe("crash/interrupt partial persistence", () => {
       assert.equal(payload.errorDetail, "本轮已由用户停止。");
       assert.equal(payload.text, "partial CCB answer before Stop");
       assert.equal(payload.dispatchId, dispatchId);
+      assert.deepEqual(
+        events.filter((event) => event.kind === "error"),
+        [{ kind: "error", error: "本轮已由用户停止。", errorCode: "user_cancelled" }],
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("browser Stop maps official Claude Code aborted_streaming to USER_CANCELLED", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => { startedResolve = resolve; });
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("partial official answer before Stop");
+          startedResolve();
+        });
+      });
+      runner.interrupt = () => {
+        setImmediate(() => {
+          runner.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            terminal_reason: "aborted_streaming",
+            stop_reason: null,
+            total_cost_usd: 0.000525,
+            usage: { input_tokens: 13, output_tokens: 2 },
+          });
+        });
+        return true;
+      };
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        model: "cursor-fable-5.1-high",
+        providerTag: "cursor",
+        _currentDispatch: {
+          userId: "user-1",
+          sessionId: "engine-peer",
+          clientMessageId: "msg-stop-official-abort",
+          dispatchId: "77777777-7777-4777-8777-777777777777",
+          attemptNo: 1,
+        },
+      } as Partial<AgentSession>, { harness: "official-cc" } as EngineCreateOpts);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      assert.equal(payload.status, "interrupted");
+      assert.equal(payload.errorCode, "USER_CANCELLED");
+      assert.equal(payload.errorDetail, "本轮已由用户停止。");
+      assert.equal(payload.text, "partial official answer before Stop");
+      assert.equal(session.totalCostUSD, 0, "official CLI pseudo-USD must remain ignored on Stop");
       assert.deepEqual(
         events.filter((event) => event.kind === "error"),
         [{ kind: "error", error: "本轮已由用户停止。", errorCode: "user_cancelled" }],

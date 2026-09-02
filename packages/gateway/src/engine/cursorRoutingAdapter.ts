@@ -5,6 +5,7 @@ import { EventEmitter } from 'node:events'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import {
   cursorCredentialModelFamily,
+  cursorModelById,
   type GoalStateSnapshot,
   type JobTerminal,
 } from '@openclaude/protocol'
@@ -15,13 +16,15 @@ import type {
   EngineTurnRun,
   TurnParams,
 } from './engineAdapter.js'
-import type { PartialSnapshot, PhantomSignals } from './engineEvents.js'
+import type { PartialSnapshot, PhantomSignals, TurnSummary } from './engineEvents.js'
 import type { EngineCreateOpts } from './registry.js'
 import {
   CursorAdapter,
+  CURSOR_SAND_OFFICIAL_CC_RESUME_PREFIX,
   CURSOR_SAND_RESUME_PREFIX,
+  cursorSandOfficialCcResumeInnerId,
   cursorSandResumeInnerId,
-  isCursorSandResumeId,
+  isAnyCursorSandResumeId,
 } from './cursorAdapter.js'
 import { CursorSandAdapter } from './cursorSandAdapter.js'
 import {
@@ -30,7 +33,7 @@ import {
   type CursorCredentialSelection,
 } from './cursorCredentialSelection.js'
 
-type CursorVariant = 'native' | 'sand'
+export type CursorVariant = 'native' | 'sand-ccb' | 'sand-official-cc'
 
 const FORWARDED_EVENTS = [
   'session_id',
@@ -51,17 +54,43 @@ const EMPTY_SNAPSHOT: PartialSnapshot = {
   assistantSegments: [], thinkingSegments: [], runtimeEvents: [],
 }
 const EMPTY_PHANTOM: PhantomSignals = { apiState: 'unknown', skipReason: null }
-function variantFor(
+export function cursorOfficialCcEnabledForModel(
+  model: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (env.OC_CURSOR_SAND_OFFICIAL_CC !== '1') return false
+  const family = cursorModelById(model)?.family
+  return family === 'opus-5'
+    || family === 'opus-4.8'
+    || family === 'fable-5'
+    || family === 'fable-5.1'
+}
+
+export function cursorVariantFor(
   model: string | undefined,
   selection: CursorCredentialSelection,
+  executionTarget?: ExecutionTarget,
+  env: NodeJS.ProcessEnv = process.env,
 ): CursorVariant {
-  return cursorSandEnabledForSelection(model, selection) ? 'sand' : 'native'
+  if (!cursorSandEnabledForSelection(model, selection)) return 'native'
+  if (
+    executionTarget?.kind !== 'remote'
+    && cursorOfficialCcEnabledForModel(model, env)
+  ) return 'sand-official-cc'
+  return 'sand-ccb'
 }
 
 function resumeForVariant(resume: string | undefined, variant: CursorVariant): string | undefined {
   if (!resume) return undefined
-  if (variant === 'sand') return cursorSandResumeInnerId(resume)
-  return isCursorSandResumeId(resume) ? undefined : resume
+  if (variant === 'sand-ccb') return cursorSandResumeInnerId(resume)
+  if (variant === 'sand-official-cc') return cursorSandOfficialCcResumeInnerId(resume)
+  return isAnyCursorSandResumeId(resume) ? undefined : resume
+}
+
+function prefixResumeId(id: string, variant: CursorVariant): string {
+  if (variant === 'sand-ccb') return `${CURSOR_SAND_RESUME_PREFIX}${id}`
+  if (variant === 'sand-official-cc') return `${CURSOR_SAND_OFFICIAL_CC_RESUME_PREFIX}${id}`
+  return id
 }
 
 export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter {
@@ -94,7 +123,7 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
       model: opts.model,
     })
     this.opts = { ...opts, cursorCredentialSelection: this.credentialSelection }
-    this.variant = variantFor(opts.model, this.credentialSelection)
+    this.variant = cursorVariantFor(opts.model, this.credentialSelection, opts.executionTarget)
     this.inner = this.createInner(this.variant)
     this.bindInner()
   }
@@ -110,8 +139,9 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     const innerOpts = {
       ...this.opts,
       resumeSessionId: resumeForVariant(this.opts.resumeSessionId, variant),
+      harness: variant === 'sand-official-cc' ? 'official-cc' as const : 'ccb' as const,
     }
-    return variant === 'sand'
+    return variant !== 'native'
       ? new CursorSandAdapter(innerOpts)
       : new CursorAdapter(innerOpts)
   }
@@ -126,8 +156,8 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
             && billing?.terminalCode !== 'USER_CANCELLED'
           ) this.credentialNeedsRefresh = true
         }
-        if (event === 'session_id' && this.variant === 'sand' && typeof args[0] === 'string') {
-          this.emit(event, `${CURSOR_SAND_RESUME_PREFIX}${args[0]}`)
+        if (event === 'session_id' && this.variant !== 'native' && typeof args[0] === 'string') {
+          this.emit(event, prefixResumeId(args[0], this.variant))
         } else {
           this.emit(event, ...args)
         }
@@ -192,7 +222,7 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
         agentBaseDir: this.opts.agentBaseDir,
         model: this.opts.model,
       })
-      const nextVariant = variantFor(this.opts.model, next)
+      const nextVariant = cursorVariantFor(this.opts.model, next, this.opts.executionTarget)
       if (nextVariant !== this.variant) {
         throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
       }
@@ -211,16 +241,14 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
         this.unbindInner()
         this.credentialSelection = next
         this.opts.cursorCredentialSelection = next
-        this.opts.resumeSessionId = nativeId
-          ? this.variant === 'sand' ? `${CURSOR_SAND_RESUME_PREFIX}${nativeId}` : nativeId
-          : undefined
+        this.opts.resumeSessionId = nativeId ? prefixResumeId(nativeId, this.variant) : undefined
         this.inner = this.createInner(this.variant)
         this.bindInner()
         if (this.goal) await this.inner.setGoalState(this.goal)
         this.assertLifecycle(generation)
       }
     }
-    const desired = variantFor(this.opts.model, this.credentialSelection)
+    const desired = cursorVariantFor(this.opts.model, this.credentialSelection, this.opts.executionTarget)
     if (desired === this.variant) return
     // Neither native Cursor nor Sand exposes a side-effect-free, billable
     // compaction/export surface. Never swap a live session's underlying
@@ -334,17 +362,26 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   waitForOutputDrain(): Promise<void> { return this.inner.waitForOutputDrain() }
 
   get nativeSessionId(): string | null {
-    if (variantFor(this.opts.model, this.credentialSelection) !== this.variant) return null
+    if (cursorVariantFor(this.opts.model, this.credentialSelection, this.opts.executionTarget) !== this.variant) return null
     const id = this.inner.nativeSessionId
-    return id && this.variant === 'sand' ? `${CURSOR_SAND_RESUME_PREFIX}${id}` : id
+    return id ? prefixResumeId(id, this.variant) : id
+  }
+  isResumeIdCompatible(sessionId: string): boolean {
+    return resumeForVariant(sessionId, this.variant) !== undefined
   }
   clearSessionId(): void {
     this.opts.resumeSessionId = undefined
     this.inner.clearSessionId()
   }
 
+  requiresReopenForModel(model: string | undefined): boolean {
+    return cursorVariantFor(model, this.credentialSelection, this.opts.executionTarget) !== this.variant
+  }
+  isUserCancellationResult(summary: TurnSummary): boolean {
+    return this.inner.isUserCancellationResult?.(summary) ?? false
+  }
   setModel(model: string | undefined): void {
-    if (variantFor(model, this.credentialSelection) !== this.variant) {
+    if (this.requiresReopenForModel(model)) {
       throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
     }
     const familyChanged = cursorCredentialModelFamily(this.opts.model)
@@ -376,9 +413,27 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     this.inner.setToolsets(toolsets)
   }
   get toolsets(): string[] | undefined { return this.opts.agentToolsets }
-  setExecutionTarget(target: ExecutionTarget): void {
+  async setExecutionTarget(target: ExecutionTarget): Promise<void> {
+    const desired = cursorVariantFor(this.opts.model, this.credentialSelection, target)
+    if (desired === this.variant) {
+      this.opts.executionTarget = target
+      await this.inner.setExecutionTarget(target)
+      return
+    }
+
+    // Official Claude Code is deliberately local-only; remote Cursor Sand
+    // uses CCB. SessionManager has already drained/shut down the old inner and
+    // cleared its incompatible resume id before this setter runs. Replace the
+    // transport atomically instead of throwing after that destructive cleanup.
+    await this.inner.shutdown()
+    await this.inner.waitForOutputDrain()
+    this.unbindInner()
     this.opts.executionTarget = target
-    this.inner.setExecutionTarget(target)
+    this.opts.resumeSessionId = undefined
+    this.variant = desired
+    this.inner = this.createInner(desired)
+    this.bindInner()
+    if (this.goal) await this.inner.setGoalState(this.goal)
   }
   get executionTarget(): ExecutionTarget { return this.inner.executionTarget }
   sendPermissionResponse(requestId: string, response: unknown): boolean {

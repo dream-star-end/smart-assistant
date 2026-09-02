@@ -183,6 +183,8 @@ export interface TurnResult {
    *  populate it (older CCB or pre-termination crash). Used for three-state
    *  phantom judgment and for precise empty-turn UI notices. */
   stopReason: string | null
+  /** Stock Claude Code's result-level terminal_reason. CCB normally omits it. */
+  terminalReason?: string
   /** num_turns from CCB result row, for diagnostics. null when absent. */
   numTurns: number | null
   /** True when CCB's result row contains an error indicating the --resume
@@ -526,6 +528,10 @@ export class CcbMessageParser {
       turns: number
       _lastCcbCumulativeCost: number
     }
+    /** `external` preserves token usage but ignores CLI-reported USD. Cursor
+     * Sand settles from the platform catalog, not Claude Code's Anthropic
+     * model price table. */
+    costMode?: 'native' | 'external'
     /** V3 v7 — canonical assistant/thinking message ids minted by caller
      *  (`runOneTurnWithRetry`) once per user turn. See field-level docs. */
     assistantMessageId?: string
@@ -552,6 +558,7 @@ export class CcbMessageParser {
     this.onPostFinalRuntimeEvent = opts.onPostFinalRuntimeEvent
     this.onFinish = opts.onFinish
     this._sessionTotals = opts.sessionTotals
+    this.costMode = opts.costMode ?? 'native'
     this.assistantMessageId = opts.assistantMessageId
     this.thinkingMessageId = opts.thinkingMessageId
     this.toolMessageIdFactory = opts.toolMessageIdFactory
@@ -564,6 +571,7 @@ export class CcbMessageParser {
     turns: number
     _lastCcbCumulativeCost: number
   }
+  private readonly costMode: 'native' | 'external'
 
   /** Capture an opaque runtime/protocol event without routing it through the
    * SDK projection parser. Codex app-server uses a dedicated side channel so
@@ -1466,10 +1474,13 @@ export class CcbMessageParser {
     // safely without losing track of new charges. Long-term cost telemetry
     // will be slightly low in that case but never inflated.
     const cumulativeCost = (msg as any).total_cost_usd ?? 0
-    let turnCost = cumulativeCost - this._sessionTotals._lastCcbCumulativeCost
-    if (turnCost < 0) turnCost = cumulativeCost
-    this._sessionTotals._lastCcbCumulativeCost = cumulativeCost
-    this._sessionTotals.totalCostUSD += turnCost
+    let turnCost = 0
+    if (this.costMode === 'native') {
+      turnCost = cumulativeCost - this._sessionTotals._lastCcbCumulativeCost
+      if (turnCost < 0) turnCost = cumulativeCost
+      this._sessionTotals._lastCcbCumulativeCost = cumulativeCost
+      this._sessionTotals.totalCostUSD += turnCost
+    }
     this._sessionTotals.turns += 1
 
     // CCB result row already carries `stop_reason` (end_turn / max_tokens /
@@ -1479,6 +1490,9 @@ export class CcbMessageParser {
     const stopReason = typeof (msg as any).stop_reason === 'string'
       ? ((msg as any).stop_reason as string)
       : null
+    const terminalReason = typeof (msg as any).terminal_reason === 'string'
+      ? ((msg as any).terminal_reason as string)
+      : undefined
     const numTurns = typeof (msg as any).num_turns === 'number'
       ? ((msg as any).num_turns as number)
       : null
@@ -1502,6 +1516,7 @@ export class CcbMessageParser {
           subtype: (msg as any).subtype,
           result: (msg as any).result,
           errors: errorsField,
+          ...(terminalReason !== undefined ? { terminal_reason: terminalReason } : {}),
         })
       : undefined
     const staleResumeId =
@@ -1528,6 +1543,7 @@ export class CcbMessageParser {
       ...(errorClass !== undefined ? { errorClass } : {}),
       ...(errorDetail !== undefined ? { errorDetail } : {}),
       stopReason,
+      ...(terminalReason !== undefined ? { terminalReason } : {}),
       numTurns,
       staleResumeId,
       tools: this.snapshotToolsForPersistence(),
