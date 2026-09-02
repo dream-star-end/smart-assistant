@@ -376,7 +376,7 @@ mkdir -p "$BUILD_CTX"
 # m4:EMBED=0 = 纯工具链镜像 —— Dockerfile 走 embed-0 阶段(不 COPY personal-version),故 build
 # context **无需**个人源码,跳过 ccb prebuild(不依赖 bun)与源码 rsync,彻底解除工具链镜像↔源码/bun 耦合。
 if [ "$OC_EMBED_SOURCE_VAL" = "0" ]; then
-  echo "[build-image] OC_EMBED_SOURCE=0 → 跳过 ccb prebuild + personal-version rsync(纯工具链镜像,context 只含 Dockerfile+runtime+platform-runtime)"
+  echo "[build-image] OC_EMBED_SOURCE=0 → 跳过 ccb prebuild + personal-version rsync(纯工具链镜像,context 只含 Dockerfile+runtime+platform-runtime+固定构建脚本)"
 else
   mkdir -p "$BUILD_CTX/personal-version"
   # 0. **预构建 claude-code-best dist** (容器内只有 node,没有 bun,需 prebuild)
@@ -412,8 +412,12 @@ else
 fi
 
 # 2. Dockerfile + runtime/(镜像薄壳+构建期文件) + platform-runtime/(bundle 源,dev fallback COPY)
+#    + Dockerfile 无条件 COPY 的固定构建脚本。即使 OC_EMBED_SOURCE=0，也不能依赖
+#    上一次 BUILD_CTX 残留；上方会先 wipe context。
 cp "$SANDBOX_DIR/Dockerfile.openclaude-runtime" "$BUILD_CTX/Dockerfile.openclaude-runtime"
 cp "$SANDBOX_DIR/playwright-cli.config.json" "$BUILD_CTX/playwright-cli.config.json"
+mkdir -p "$BUILD_CTX/scripts"
+cp "$SANDBOX_DIR/scripts/patch-cursor-agent-sand.mjs" "$BUILD_CTX/scripts/patch-cursor-agent-sand.mjs"
 rm -rf "$BUILD_CTX/runtime"
 cp -r "$SANDBOX_DIR/runtime" "$BUILD_CTX/runtime"
 rm -rf "$BUILD_CTX/platform-runtime"

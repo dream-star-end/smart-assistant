@@ -33,6 +33,13 @@ describe('official Claude Code runtime pin', () => {
     assert.match(buildScript, /official_claude_code_v1/)
   })
 
+  test('slim image build context includes unconditional Dockerfile helper inputs', () => {
+    assert.match(
+      buildScript,
+      /cp "\$SANDBOX_DIR\/scripts\/patch-cursor-agent-sand\.mjs" "\$BUILD_CTX\/scripts\/patch-cursor-agent-sand\.mjs"/,
+    )
+  })
+
   test('selfhost rebuild profile opts into exactly the audited official version', () => {
     assert.match(selfhostProfile, /^OC_INCLUDE_OFFICIAL_CLAUDE=1$/m)
     assert.match(selfhostProfile, /^OC_OFFICIAL_CLAUDE_VERSION=2\.1\.258$/m)
