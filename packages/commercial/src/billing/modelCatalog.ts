@@ -39,7 +39,7 @@ import { query, type QueryRunner } from "../db/queries.js";
 import { getPool } from "../db/index.js";
 import { projectContextWindowForRole } from "./modelRolePolicy.js";
 import type { ModelPricing, ModelVisibility } from "./pricing.js";
-import { isCursorCredentialMember } from "../cursor/access.js";
+import { isCursorCredentialMember, parseCursorCredentialUids } from "../cursor/access.js";
 import { meetsMinPlan } from "./planEntitlement.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -582,7 +582,16 @@ export class ModelCatalogSnapshot {
     const schemaOk =
       entry !== undefined && entry.capabilitySchemaVersion <= CAPABILITY_SCHEMA_VERSION;
     const routable = entry !== undefined && schemaOk && pricing !== undefined;
-    const cursorOk = entry?.engine !== "cursor" || isCursorCredentialMember(scope.uid);
+    // `isCursorCredentialMember(0, "all")` is false (uid 0 is not a valid
+    // credential uid). Anonymous is a placeholder identity: after subscribe
+    // they get a real uid, and policy `all` accepts every real uid. Advertise
+    // locked Cursor rows to uid 0 only in that commercial config; a numeric
+    // allow-list that does not contain the uid stays excluded.
+    const cursorOk =
+      entry?.engine !== "cursor" ||
+      isCursorCredentialMember(scope.uid) ||
+      (scope.uid === 0 &&
+        parseCursorCredentialUids(process.env.OC_V5_CURSOR_CREDENTIAL_UIDS) === "all");
     const denied = scope.deniedModelIds?.has(canonical) === true;
     const meetsPlan = pricing
       ? meetsMinPlan({
@@ -648,6 +657,12 @@ export class ModelCatalogSnapshot {
    * Rows that pass every canUseModel condition except meetsMinPlan.
    * Hidden-without-grant, denied, unroutable, and Cursor-credential misses
    * stay out of both `listForUser` and this lock list.
+   *
+   * Locked rows are an upsell ("subscribe to unlock"). A uid that fails the
+   * Cursor credential-UID gate could never use the row even after
+   * subscribing, so it is not advertised. Anonymous uid 0 + policy `all`
+   * (commercial) → included; policy list that does not contain the uid
+   * (selfhost `=3` and uid 0) → excluded.
    */
   listLockedForUser(scope: UserModelScope): LockedModelProjectionRow[] {
     const rows: LockedModelProjectionRow[] = [];

@@ -9,6 +9,10 @@
 --   42 cursor-* pricing rows including cursor-auto
 --   41 display-name strips (every cursor-* row except cursor-auto)
 --   30 half-price / min_plan targets = opus-4.8(10)+opus-5(10)+fable-5(5)+fable-5.1(5)
+--   Composer 2.5: 2 active/enabled/public pricing rows; N official_oauth/cursor
+--   groups (live N=1) with exactly {(g, composer), (g, composer-fast)} = 2*N
+--   bindings, all inside those groups. Rollback hard-codes visibility=public
+--   and re-inserts into every such group, so any other before-state RAISES.
 -- The product brief said "40/43"; unique protocol CURSOR_ENGINE_MODELS plus the
 -- 0255 catalog snapshot are 42/41/30. Replay is refused by the durable backup
 -- table (re-halving would double-apply). Compensation keeps the
@@ -51,6 +55,7 @@
 --   snapshot_count BIGINT;
 --   live_count BIGINT;
 --   affected_count BIGINT;
+--   cursor_oauth_n BIGINT;
 --   rec RECORD;
 -- BEGIN
 --   SELECT count(*) INTO snapshot_count FROM model_pricing_0256_backup;
@@ -81,12 +86,22 @@
 --   ) THEN
 --     RAISE EXCEPTION '0256 rollback refuses post-migration drift';
 --   END IF;
+--   SELECT count(*) INTO cursor_oauth_n
+--     FROM account_groups
+--    WHERE kind = 'official_oauth' AND provider = 'cursor';
+--   IF cursor_oauth_n < 1 THEN
+--     RAISE EXCEPTION '0256 rollback requires at least one official_oauth/cursor account group';
+--   END IF;
 --   IF (SELECT count(*) FROM model_catalog
 --        WHERE model_id IN ('cursor-composer-2.5','cursor-composer-2.5-fast')
 --          AND state = 'disabled') <> 2
 --      OR (SELECT count(*) FROM model_pricing
 --           WHERE model_id IN ('cursor-composer-2.5','cursor-composer-2.5-fast')
---             AND enabled IS FALSE AND visibility = 'hidden') <> 2 THEN
+--             AND enabled IS FALSE AND visibility = 'hidden') <> 2
+--      OR EXISTS (
+--        SELECT 1 FROM account_group_models
+--         WHERE model_id IN ('cursor-composer-2.5','cursor-composer-2.5-fast')
+--      ) THEN
 --     RAISE EXCEPTION '0256 rollback refuses composer disable drift';
 --   END IF;
 --
@@ -141,6 +156,25 @@
 --     ) AS m(model_id)
 --    WHERE g.kind = 'official_oauth' AND g.provider = 'cursor'
 --   ON CONFLICT DO NOTHING;
+--   IF (SELECT count(*) FROM account_group_models
+--        WHERE model_id IN ('cursor-composer-2.5','cursor-composer-2.5-fast'))
+--        <> (2 * cursor_oauth_n)
+--      OR EXISTS (
+--        SELECT 1 FROM account_groups g
+--         WHERE g.kind = 'official_oauth' AND g.provider = 'cursor'
+--           AND (
+--             NOT EXISTS (
+--               SELECT 1 FROM account_group_models agm
+--                WHERE agm.group_id = g.id AND agm.model_id = 'cursor-composer-2.5'
+--             )
+--             OR NOT EXISTS (
+--               SELECT 1 FROM account_group_models agm
+--                WHERE agm.group_id = g.id AND agm.model_id = 'cursor-composer-2.5-fast'
+--             )
+--           )
+--      ) THEN
+--     RAISE EXCEPTION '0256 rollback failed to restore Composer 2.5 group bindings';
+--   END IF;
 -- END
 -- $compensation$;
 -- COMMIT;
@@ -254,6 +288,7 @@ DECLARE
   strip_count BIGINT;
   group_count BIGINT;
   affected_count BIGINT;
+  cursor_oauth_n BIGINT;
   rec RECORD;
 BEGIN
   IF NOT EXISTS (
@@ -341,8 +376,38 @@ BEGIN
          AND state = 'active') <> 2
      OR (SELECT count(*) FROM model_pricing
           WHERE model_id IN ('cursor-composer-2.5', 'cursor-composer-2.5-fast')
-            AND enabled IS TRUE) <> 2 THEN
-    RAISE EXCEPTION '0256 requires two active enabled Composer 2.5 catalog/pricing rows';
+            AND enabled IS TRUE
+            AND visibility = 'public') <> 2 THEN
+    RAISE EXCEPTION '0256 requires two active enabled public Composer 2.5 catalog/pricing rows';
+  END IF;
+
+  SELECT count(*) INTO cursor_oauth_n
+    FROM account_groups
+   WHERE kind = 'official_oauth' AND provider = 'cursor';
+  IF cursor_oauth_n < 1 THEN
+    RAISE EXCEPTION '0256 requires at least one official_oauth/cursor account group';
+  END IF;
+
+  IF (SELECT count(*) FROM account_group_models
+       WHERE model_id IN ('cursor-composer-2.5', 'cursor-composer-2.5-fast'))
+       <> (2 * cursor_oauth_n)
+     OR EXISTS (
+       SELECT 1
+         FROM account_groups g
+        WHERE g.kind = 'official_oauth'
+          AND g.provider = 'cursor'
+          AND (
+            NOT EXISTS (
+              SELECT 1 FROM account_group_models agm
+               WHERE agm.group_id = g.id AND agm.model_id = 'cursor-composer-2.5'
+            )
+            OR NOT EXISTS (
+              SELECT 1 FROM account_group_models agm
+               WHERE agm.group_id = g.id AND agm.model_id = 'cursor-composer-2.5-fast'
+            )
+          )
+     ) THEN
+    RAISE EXCEPTION '0256 requires Composer 2.5 and 2.5-fast bound to every official_oauth/cursor group and nowhere else (expected % rows)', 2 * cursor_oauth_n;
   END IF;
 
   UPDATE model_pricing
@@ -360,8 +425,8 @@ BEGIN
   DELETE FROM account_group_models
    WHERE model_id IN ('cursor-composer-2.5', 'cursor-composer-2.5-fast');
   GET DIAGNOSTICS group_count = ROW_COUNT;
-  IF group_count <> 2 THEN
-    RAISE EXCEPTION '0256 expected to delete 2 Composer account_group_models rows, deleted %', group_count;
+  IF group_count <> (2 * cursor_oauth_n) THEN
+    RAISE EXCEPTION '0256 expected to delete % Composer account_group_models rows, deleted %', 2 * cursor_oauth_n, group_count;
   END IF;
 
   FOR rec IN

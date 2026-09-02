@@ -159,7 +159,7 @@ export function ModelSelector({
   const engineLabel = teamEngineLabel(models)
   const baseLabel = triggerLabel(models, selectedId, loading)
   const label = teamEngineActive ? engineLabel : baseLabel
-  const disabled = loading || models.length === 0
+  const disabled = loading || (models.length === 0 && lockedModels.length === 0)
   const rows = modelPickerRows(models, lockedModels)
   const selectedPromo = promoLabelOf(selected)
   const selectedFamilyRow = rows.find(

@@ -286,6 +286,29 @@ describe('ModelSelector locked rows + promo badge', () => {
       modelId: 'cursor-opus-5-high',
     })
   })
+
+  it('models empty + one locked cursor family: trigger enabled, click locked calls onLockedSelect only', async () => {
+    const onSelect = vi.fn()
+    const onLockedSelect = vi.fn()
+    render(
+      <ModelSelector
+        models={[]}
+        lockedModels={LOCKED}
+        onSelect={onSelect}
+        onLockedSelect={onLockedSelect}
+      />,
+    )
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).toBeEnabled()
+    expect(trigger.textContent).toContain('暂无可用模型')
+    openMenu(trigger)
+    await screen.findAllByRole('menuitem')
+    const locked = document.querySelector('[data-locked="true"][data-cursor-family="opus-5"]')
+    expect(locked).toBeTruthy()
+    if (locked) fireEvent.click(locked)
+    expect(onLockedSelect).toHaveBeenCalledTimes(1)
+    expect(onSelect).not.toHaveBeenCalled()
+  })
 })
 
 describe('ModelSelector GPT/Kimi 上下文档', () => {

@@ -36,6 +36,7 @@ DECLARE
   snapshot_count BIGINT;
   live_count BIGINT;
   affected_count BIGINT;
+  cursor_oauth_n BIGINT;
   rec RECORD;
 BEGIN
   SELECT count(*) INTO snapshot_count FROM model_pricing_0256_backup;
@@ -70,13 +71,28 @@ BEGIN
     RAISE EXCEPTION '0256 rollback refuses post-migration drift';
   END IF;
 
+  -- Mirror the forward Composer exact-shape precondition: restore is
+  -- visibility='public' plus {(g, composer), (g, composer-fast)} for every
+  -- official_oauth/cursor group g. Fail closed if post-0256 Composer image
+  -- drifted or those groups disappeared (rollback would otherwise widen).
+  SELECT count(*) INTO cursor_oauth_n
+    FROM account_groups
+   WHERE kind = 'official_oauth' AND provider = 'cursor';
+  IF cursor_oauth_n < 1 THEN
+    RAISE EXCEPTION '0256 rollback requires at least one official_oauth/cursor account group';
+  END IF;
+
   IF (SELECT count(*) FROM model_catalog
        WHERE model_id IN ('cursor-composer-2.5', 'cursor-composer-2.5-fast')
          AND state = 'disabled') <> 2
      OR (SELECT count(*) FROM model_pricing
           WHERE model_id IN ('cursor-composer-2.5', 'cursor-composer-2.5-fast')
             AND enabled IS FALSE
-            AND visibility = 'hidden') <> 2 THEN
+            AND visibility = 'hidden') <> 2
+     OR EXISTS (
+       SELECT 1 FROM account_group_models
+        WHERE model_id IN ('cursor-composer-2.5', 'cursor-composer-2.5-fast')
+     ) THEN
     RAISE EXCEPTION '0256 rollback refuses composer disable drift';
   END IF;
 
@@ -133,6 +149,27 @@ BEGIN
    WHERE g.kind = 'official_oauth'
      AND g.provider = 'cursor'
   ON CONFLICT DO NOTHING;
+
+  IF (SELECT count(*) FROM account_group_models
+       WHERE model_id IN ('cursor-composer-2.5', 'cursor-composer-2.5-fast'))
+       <> (2 * cursor_oauth_n)
+     OR EXISTS (
+       SELECT 1 FROM account_groups g
+        WHERE g.kind = 'official_oauth'
+          AND g.provider = 'cursor'
+          AND (
+            NOT EXISTS (
+              SELECT 1 FROM account_group_models agm
+               WHERE agm.group_id = g.id AND agm.model_id = 'cursor-composer-2.5'
+            )
+            OR NOT EXISTS (
+              SELECT 1 FROM account_group_models agm
+               WHERE agm.group_id = g.id AND agm.model_id = 'cursor-composer-2.5-fast'
+            )
+          )
+     ) THEN
+    RAISE EXCEPTION '0256 rollback failed to restore Composer 2.5 group bindings';
+  END IF;
 
   IF EXISTS (
     SELECT 1

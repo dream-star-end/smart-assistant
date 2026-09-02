@@ -408,6 +408,58 @@ describe('0256_cursor_picker_plan_gate_half_price', () => {
     assert.equal(backup.backup_table, null)
   })
 
+  test('refuses Composer pricing that is not public without changing live rows', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    await resetAndMigrateBefore('0256')
+    await query(
+      `UPDATE model_pricing SET visibility = 'hidden' WHERE model_id='cursor-composer-2.5'`,
+    )
+    const before = byId((await query<PriceRow>(priceSelect(false))).rows)
+    const groupBefore = (
+      await query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM account_group_models
+          WHERE model_id IN ('cursor-composer-2.5','cursor-composer-2.5-fast')`,
+      )
+    ).rows[0]!.count
+
+    await assert.rejects(
+      tx(async (client) => {
+        await client.query(await readFile(migrationPath, 'utf8'))
+      }),
+      /0256 requires two active enabled public Composer 2.5 catalog\/pricing rows/,
+    )
+
+    const after = byId((await query<PriceRow>(priceSelect(false))).rows)
+    assert.equal(after.size, before.size)
+    for (const [id, previous] of before) {
+      const actual = after.get(id)
+      assert.ok(actual, id)
+      assertExactPrices(actual, previous)
+      assert.equal(actual.lock_version, previous.lock_version, id)
+      assert.equal(actual.display_name, previous.display_name, id)
+      assert.equal(actual.visibility, previous.visibility, id)
+      assert.equal(actual.enabled, previous.enabled, id)
+    }
+    assert.equal(after.get('cursor-composer-2.5')!.visibility, 'hidden')
+    const groupAfter = (
+      await query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM account_group_models
+          WHERE model_id IN ('cursor-composer-2.5','cursor-composer-2.5-fast')`,
+      )
+    ).rows[0]!.count
+    assert.equal(groupAfter, groupBefore)
+    const catalogState = await query<{ state: string }>(
+      `SELECT state FROM model_catalog WHERE model_id='cursor-composer-2.5'`,
+    )
+    assert.equal(catalogState.rows[0]!.state, 'active')
+    const backup = (
+      await query<{ backup_table: string | null }>(
+        "SELECT to_regclass('public.model_pricing_0256_backup')::text AS backup_table",
+      )
+    ).rows[0]!
+    assert.equal(backup.backup_table, null)
+  })
+
   test('compensation locks the ledger and refuses later migrations', async (t) => {
     if (db.skipIfUnavailable(t)) return
     await resetAndMigrateBefore('0256')

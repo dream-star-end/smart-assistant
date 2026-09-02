@@ -420,6 +420,116 @@ describe("/api/public/models — promo_label 与 locked_models", () => {
   });
 });
 
+describe("/api/public/models — Cursor credential-UID gate on locked_models", () => {
+  const cursorEngineSnap = new ModelCatalogSnapshot({
+    entries: [
+      ACTIVE,
+      entry({
+        entryId: 30,
+        modelId: "cursor-opus-5-high",
+        engine: "cursor",
+        providerId: "cursor",
+      }),
+    ],
+    aliases: new Map(),
+    pricing: new Map(
+      [
+        price("glm-5.2", { sortOrder: 10 }),
+        price("cursor-opus-5-high", {
+          displayName: "Opus 5 High",
+          sortOrder: 5,
+          minPlanCode: "lite",
+          minPlanTier: 1,
+          minPlanName: "Lite",
+          promoLabel: "限时半价",
+        }),
+      ].map((p) => [p.modelId, p]),
+    ),
+    securityEpoch: 11n,
+  });
+
+  async function withCursorCredentialUids<T>(
+    value: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const previous = process.env.OC_V5_CURSOR_CREDENTIAL_UIDS;
+    process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = value;
+    try {
+      return await fn();
+    } finally {
+      if (previous === undefined) process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = undefined;
+      else process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = previous;
+    }
+  }
+
+  test("policy all：匿名 uid 0 在 locked_models 里看到 cursor-opus-5-high", async () => {
+    await withCursorCredentialUids("all", async () => {
+      const body = await listCatalogBody(deps({ modelCatalog: catalogOf(cursorEngineSnap) }));
+      assert.deepEqual(body.models.map((m) => m.id), ["glm-5.2"]);
+      assert.deepEqual(
+        (body.locked_models ?? []).map((m) => m.id),
+        ["cursor-opus-5-high"],
+      );
+      assert.equal(body.locked_models![0]!.engine, "cursor");
+      assert.equal(body.locked_models![0]!.min_plan_code, "lite");
+    });
+  });
+
+  test("policy 3：匿名 uid 0 在 models 与 locked_models 里都看不到 Cursor 行", async () => {
+    await withCursorCredentialUids("3", async () => {
+      const body = await listCatalogBody(deps({ modelCatalog: catalogOf(cursorEngineSnap) }));
+      assert.deepEqual(body.models.map((m) => m.id), ["glm-5.2"]);
+      assert.ok(!(body.models ?? []).some((m) => m.id === "cursor-opus-5-high"));
+      assert.ok(!(body.locked_models ?? []).some((m) => m.id === "cursor-opus-5-high"));
+    });
+  });
+
+  test("policy 3：uid 3 free-tier 在 locked_models 里看到 cursor-opus-5-high", async () => {
+    await withCursorCredentialUids("3", async () => {
+      const secret = new Uint8Array(32);
+      const token = await authToken(secret, "3");
+      const body = await listCatalogBody(
+        deps({
+          jwtSecret: secret,
+          modelCatalog: catalogOf(cursorEngineSnap),
+          loadUserModelAuthz: async () => ({
+            role: "user",
+            grantedModelIds: new Set<string>(),
+            userPlanTier: 0,
+          }),
+        }),
+        `Bearer ${token}`,
+      );
+      assert.deepEqual(body.models.map((m) => m.id), ["glm-5.2"]);
+      assert.deepEqual(
+        (body.locked_models ?? []).map((m) => m.id),
+        ["cursor-opus-5-high"],
+      );
+    });
+  });
+
+  test("policy 3：uid 3 plan ≥ lite 在 models 里看到 cursor-opus-5-high，不在 locked_models", async () => {
+    await withCursorCredentialUids("3", async () => {
+      const secret = new Uint8Array(32);
+      const token = await authToken(secret, "3");
+      const body = await listCatalogBody(
+        deps({
+          jwtSecret: secret,
+          modelCatalog: catalogOf(cursorEngineSnap),
+          loadUserModelAuthz: async () => ({
+            role: "user",
+            grantedModelIds: new Set<string>(),
+            userPlanTier: 1,
+          }),
+        }),
+        `Bearer ${token}`,
+      );
+      assert.deepEqual(body.models.map((m) => m.id), ["cursor-opus-5-high", "glm-5.2"]);
+      assert.deepEqual(body.locked_models, []);
+    });
+  });
+});
+
 describe("/api/public/models — catalog 未注入 → legacy 投影(兼容)", () => {
   test("走 PricingCache.listPublic;无 provider_id 字段", async () => {
     const pricing = new PricingCache();
