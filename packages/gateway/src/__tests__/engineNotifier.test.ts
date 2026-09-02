@@ -1565,6 +1565,246 @@ describe('JobTerminal dispatch + durable columns', () => {
   })
 })
 
+describe('turn-end adoption of orphaned stdout-wait delegate_task jobs', () => {
+  const PARENT = 'agent:main:webchat:dm:p1'
+
+  it('terminal + unconsumed stdout-wait row → origin-inject pending; notifier resume-injects once', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-adopt-'))
+    try {
+      const store = openStore(dir)
+      const { snap } = await seededTerminal(store, { parentEngine: 'cursor', callback: 'stdout-wait' })
+      assert.equal(snap.callbackState, 'none')
+      const adopted = store.adoptOrphanedStdoutWait(PARENT, {
+        callbackOriginUserId: 'u1',
+        parentEngine: 'cursor',
+        terminalCreatedAfter: 0,
+      })
+      assert.equal(adopted.length, 1)
+      assert.equal(adopted[0].callback, 'origin-inject')
+      assert.equal(adopted[0].callbackState, 'pending')
+      assert.equal(adopted[0].callbackEpoch, 1)
+      assert.equal(adopted[0].callbackOriginSessionKey, PARENT)
+      assert.equal(adopted[0].callbackOriginUserId, 'u1')
+      assert.equal(adopted[0].kind, 'delegate')
+      // Idempotent: nothing left to adopt.
+      assert.equal(store.adoptOrphanedStdoutWait(PARENT, { terminalCreatedAfter: 0 }).length, 0)
+      assert.equal(store.listPendingNotify().length, 1)
+
+      const seen: JobTerminal[] = []
+      const notifier = new DefaultEngineNotifier({
+        resumeInject: {
+          inject: async (event) => {
+            seen.push(event)
+            return { ok: true }
+          },
+        },
+      })
+      const result = await dispatchJobTerminalNotify(store, adopted[0], notifier)
+      assert.equal('ok' in result && result.ok, true)
+      if (!('ok' in result) || !result.ok) return
+      assert.equal(result.lane, 'resume-inject')
+      assert.equal(seen.length, 1)
+      assert.equal(seen[0].callback, 'origin-inject')
+      assert.equal(seen[0].parentSessionKey, PARENT)
+      assert.equal(seen[0].callbackOriginUserId, 'u1')
+      assert.equal(seen[0].resultRef, 'UNIQUE_OUTPUT')
+      const after = store.snapshotOf(snap.id)!
+      assert.equal(after.callbackState, 'delivered')
+      assert.equal(store.listPendingNotify().length, 0)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('non-terminal stdout-wait row flips callback now; later complete() inits pending and fires onTerminal', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-adopt-live-'))
+    try {
+      const durable = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const terminals: string[] = []
+      const store = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable,
+        bootId: 'gw:adopt',
+        onTerminal: (job) => {
+          terminals.push(`${job.id}:${job.callback}:${job.callbackState}`)
+        },
+      })
+      const created = store.create('coding-assistant', {
+        queued: true,
+        parentSessionKey: PARENT,
+        callback: 'stdout-wait',
+        parentEngine: 'cursor',
+      })
+      assert.ok('jobId' in created)
+      const claimed = store.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      if (!claimed.ok) return
+
+      const adopted = store.adoptOrphanedStdoutWait(PARENT, { callbackOriginUserId: 'u1' })
+      assert.equal(adopted.length, 1)
+      assert.equal(adopted[0].state, 'running')
+      assert.equal(adopted[0].callback, 'origin-inject')
+      // Not terminal yet: callback_state stays none, no notify scheduled.
+      assert.equal(adopted[0].callbackState, 'none')
+      assert.equal(store.listPendingNotify().length, 0)
+
+      assert.equal(
+        store.complete(created.jobId, { httpStatus: 200, body: { output: 'later' } }, claimed),
+        true,
+      )
+      const after = store.snapshotOf(created.jobId)!
+      assert.equal(after.callbackState, 'pending')
+      assert.equal(after.callbackEpoch, 1)
+      assert.deepEqual(terminals, [`${created.jobId}:origin-inject:pending`])
+      assert.equal(store.listPendingNotify().length, 1)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('fail() on an adopted row also lands pending (not skipped_silent)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-adopt-fail-'))
+    try {
+      const store = openStore(dir)
+      const created = store.create('coding-assistant', {
+        queued: true,
+        parentSessionKey: PARENT,
+        callback: 'stdout-wait',
+      })
+      assert.ok('jobId' in created)
+      const claimed = store.claimQueued(created.jobId)
+      assert.equal(claimed.ok, true)
+      if (!claimed.ok) return
+      assert.equal(store.adoptOrphanedStdoutWait(PARENT).length, 1)
+      assert.equal(
+        store.fail(created.jobId, {
+          failureClass: 'child_error',
+          detail: 'boom',
+          httpStatus: 500,
+          claimToken: claimed.claimToken,
+          fencingEpoch: claimed.fencingEpoch,
+        }),
+        true,
+      )
+      const after = store.snapshotOf(created.jobId)!
+      assert.equal(after.state, 'failed')
+      assert.equal(after.callback, 'origin-inject')
+      assert.equal(after.callbackState, 'pending')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('markResultConsumed (delegate_wait read it) blocks adoption; explicit send_to_agent rows are untouched', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-adopt-consumed-'))
+    try {
+      const store = openStore(dir)
+      const { snap } = await seededTerminal(store, { parentEngine: 'cursor', callback: 'stdout-wait' })
+      assert.equal(store.markResultConsumed(snap.id), true)
+      assert.equal(store.snapshotOf(snap.id)!.callbackState, 'skipped_silent')
+      assert.equal(store.adoptOrphanedStdoutWait(PARENT, { terminalCreatedAfter: 0 }).length, 0)
+      // Idempotent second mark.
+      assert.equal(store.markResultConsumed(snap.id), true)
+
+      // Explicit send_to_agent origin-inject: consume mark must not cancel it.
+      const sta = store.create('coding-assistant', {
+        queued: true,
+        parentSessionKey: PARENT,
+        callback: 'origin-inject',
+        kind: 'send_to_agent',
+        callbackOriginSessionKey: PARENT,
+      })
+      assert.ok('jobId' in sta)
+      const claimed = store.claimQueued(sta.jobId)
+      assert.equal(claimed.ok, true)
+      if (!claimed.ok) return
+      store.complete(sta.jobId, { httpStatus: 200, body: { output: 'x' } }, claimed)
+      assert.equal(store.snapshotOf(sta.jobId)!.callbackState, 'pending')
+      assert.equal(store.markResultConsumed(sta.jobId), false)
+      assert.equal(store.snapshotOf(sta.jobId)!.callbackState, 'pending')
+
+      // Running row: nothing to consume.
+      const live = store.create('coding-assistant', { queued: true, parentSessionKey: PARENT, callback: 'stdout-wait' })
+      assert.ok('jobId' in live)
+      assert.equal(store.markResultConsumed(live.jobId), false)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('adopted-then-waited: a late delegate_wait read cancels the pending inject', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-adopt-late-'))
+    try {
+      const store = openStore(dir)
+      const { snap } = await seededTerminal(store, { parentEngine: 'cursor', callback: 'stdout-wait' })
+      const adopted = store.adoptOrphanedStdoutWait(PARENT, { terminalCreatedAfter: 0 })
+      assert.equal(adopted.length, 1)
+      assert.equal(store.snapshotOf(snap.id)!.callbackState, 'pending')
+      assert.equal(store.markResultConsumed(snap.id), true)
+      const after = store.snapshotOf(snap.id)!
+      assert.equal(after.callbackState, 'skipped_silent')
+      assert.equal(store.listPendingNotify().length, 0)
+      // Dispatch on the stale snapshot is a silent no-op.
+      const notifier = new DefaultEngineNotifier({
+        resumeInject: {
+          inject: async () => {
+            throw new Error('consumed row must not inject')
+          },
+        },
+      })
+      const result = await dispatchJobTerminalNotify(store, after, notifier)
+      assert.equal('ok' in result && result.ok && result.lane === 'skipped_silent', true)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('terminalCreatedAfter fences out pre-turn terminal rows; other parents and none-callback rows never match', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-adopt-fence-'))
+    try {
+      let now = 1_700_000_000_000
+      const durable = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const store = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 1_000,
+        durable,
+        bootId: 'gw:fence',
+        now: () => now,
+      })
+      const mk = (meta: { parentSessionKey: string; callback: 'stdout-wait' | 'none' }) => {
+        const c = store.create('coding-assistant', { queued: true, ...meta })
+        assert.ok('jobId' in c)
+        const cl = store.claimQueued(c.jobId)
+        assert.equal(cl.ok, true)
+        if (!cl.ok) throw new Error('claim')
+        store.complete(c.jobId, { httpStatus: 200, body: { output: 'o' } }, cl)
+        return c.jobId
+      }
+      const old = mk({ parentSessionKey: PARENT, callback: 'stdout-wait' })
+      now += 10_000
+      const turnStart = now
+      const fresh = mk({ parentSessionKey: PARENT, callback: 'stdout-wait' })
+      mk({ parentSessionKey: 'agent:main:webchat:dm:other', callback: 'stdout-wait' })
+      mk({ parentSessionKey: PARENT, callback: 'none' })
+      const adopted = store.adoptOrphanedStdoutWait(PARENT, { terminalCreatedAfter: turnStart })
+      assert.deepEqual(adopted.map((j) => j.id), [fresh])
+      assert.equal(store.snapshotOf(old)!.callback, 'stdout-wait')
+      assert.equal(store.snapshotOf(old)!.callbackState, 'none')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('review blockers: claim / retry / origin / outcome', () => {
   it('online failure schedules retry without waiting for restart', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-nfy-sched-'))
@@ -3129,7 +3369,7 @@ describe('OCV5 notify terminate: cron lane + tape oracle + abandon', () => {
               return { ok: true }
             },
           },
-          parentTapeIngestState: async () => 'unknown',
+          parentTapeIngestState: async () => 'unknown' as const,
         }),
       )
       assert.ok(!('skipped' in first) && !first.ok)
@@ -3169,7 +3409,7 @@ describe('OCV5 notify terminate: cron lane + tape oracle + abandon', () => {
               return { ok: true }
             },
           },
-          parentTapeIngestState: async () => 'unknown',
+          parentTapeIngestState: async () => 'unknown' as const,
         }),
       )
       assert.ok(!('skipped' in result) && result.ok)

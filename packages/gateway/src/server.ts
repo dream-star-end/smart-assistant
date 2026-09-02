@@ -10900,7 +10900,12 @@ export class Gateway {
       resolveParentEngine: (job: DelegateJobSnapshot) =>
         this._resolveDelegateParentEngine(job.callbackOriginSessionKey ?? job.parentSessionKey) ??
         parseParentEngine(job.parentEngine),
-      resolveGoal: (job: DelegateJobSnapshot) => this._activeSendToAgentCallbacks?.get(job.id)?.goal,
+      resolveGoal: (job: DelegateJobSnapshot) =>
+        this._activeSendToAgentCallbacks?.get(job.id)?.goal ??
+        // Adopted delegate_task rows never registered a send_to_agent intent;
+        // the inflight projection still carries the goal (flag-on only).
+        this._delegateInflightSurface?.get(job.id)?.goal ??
+        undefined,
       resolveCallbackOrigin: (job: DelegateJobSnapshot) => job.callbackOriginSessionKey,
       onDelivered: async (job: DelegateJobSnapshot) => {
         this._activeSendToAgentCallbacks.delete(job.id)
@@ -10991,6 +10996,53 @@ export class Gateway {
       this.log.warn('delegate notify threw', { jobId: job.id }, err as Error)
     } finally {
       this._armNotifyRetryScheduler()
+    }
+  }
+
+  /**
+   * Turn-end adoption of `delegate_task` background jobs.
+   *
+   * `delegate_task` rows are created as callback `stdout-wait`: the parent is
+   * expected to long-poll `/api/delegate/wait`. When the parent turn ends
+   * first (Cursor MCP 60s ceiling, model chose not to wait, user interrupted),
+   * nothing ever wakes the parent — the sub-task finishes into the void.
+   * Flip those rows to origin-inject so the EngineNotifier ResumeInject path
+   * (same one `send_to_agent callbackOnComplete` uses) opens a fresh parent
+   * turn on terminal. Consumed results (`/api/delegate/wait` returned
+   * done/failed) are already skipped_silent and never match.
+   *
+   * Only webchat dm parents (ResumeInject target) and only when the notifier
+   * side channel is effective; otherwise the flip would strand a pending row.
+   */
+  private _adoptOrphanedStdoutWaitDelegates(
+    parentSessionKey: string | undefined,
+    meta: { userId?: string; turnStartedAt?: number },
+  ): void {
+    if (!parentSessionKey || !isDelegateNotifierEffective()) return
+    const store = this._delegateJobs
+    if (!store || !this._delegateReconcileReady) return
+    if (!parseOriginWebchatSessionKey(parentSessionKey)) return
+    let adopted: DelegateJobSnapshot[]
+    try {
+      adopted = store.adoptOrphanedStdoutWait(parentSessionKey, {
+        callbackOriginUserId: meta.userId,
+        parentEngine: this._resolveDelegateParentEngine(parentSessionKey),
+        terminalCreatedAfter: meta.turnStartedAt,
+      })
+    } catch (err) {
+      this.log.warn('delegate stdout-wait adoption failed', { parentSessionKey }, err as Error)
+      return
+    }
+    if (adopted.length === 0) return
+    this.log.info('delegate stdout-wait jobs adopted for origin-inject', {
+      parentSessionKey,
+      jobIds: adopted.map((j) => j.id),
+      terminal: adopted.filter((j) => isDelegateTerminalState(j.state)).length,
+    })
+    for (const job of adopted) {
+      if (!isDelegateTerminalState(job.state)) continue
+      // Already terminal: commit() does not re-fire onTerminal, dispatch now.
+      void this._dispatchDelegateNotify(job)
     }
   }
 
@@ -11874,6 +11926,15 @@ export class Gateway {
     const waitMs = resolveDelegateWaitMs(parsed.waitMs)
     const store = this._ensureDelegateJobStore()
     const view = await store.wait(jobId, waitMs)
+    if (view.status === 'done' || view.status === 'failed') {
+      // The parent read this result in-turn; turn-end adoption must not
+      // resume-inject it a second time.
+      try {
+        store.markResultConsumed(jobId)
+      } catch (err) {
+        this.log.warn('delegate wait consume mark failed', { jobId }, err as Error)
+      }
+    }
     if (view.status === 'expired') {
       return this.sendJson(res, 404, {
         status: 'expired',
@@ -19556,6 +19617,7 @@ export class Gateway {
       this._promptQueueExecutionFenceByFrame.delete(frame as object)
     }
     this.sessions.beginClientTurn(session)
+    const clientTurnStartedAt = Date.now()
     let clientTurnThrew = false
     let clientTurnError: unknown | undefined
     try {
@@ -19590,6 +19652,13 @@ export class Gateway {
         turnErrored || clientTurnThrew ? 'errored' : 'completed',
         safeClientMessageId,
       )
+      // Parent turn is over. Any `delegate_task` (stdout-wait) job this turn
+      // spawned and did not wait out has no one left to read it — hand it to
+      // the Notifier so a later terminal wakes this webchat session.
+      this._adoptOrphanedStdoutWaitDelegates(sessionKey, {
+        userId: activeUserId,
+        turnStartedAt: clientTurnStartedAt,
+      })
       if (promptQueueLifecycle) {
         try {
           await promptQueueLifecycle.onSettled(clientTurnError)

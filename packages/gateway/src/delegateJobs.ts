@@ -1129,6 +1129,85 @@ export class DelegateJobStore {
     return this.listPendingNotify().filter((job) => this.isNotifyDue(job, now))
   }
 
+  /**
+   * A waiter (`POST /api/delegate/wait`) read this terminal result. Record it
+   * on callback_state so turn-end adoption (below) never resume-injects a
+   * result the parent already consumed in-turn:
+   *   stdout-wait/none        → skipped_silent
+   *   promoted delegate row still pending (origin-inject + kind 'delegate')
+   *                           → skipped_silent (cancels the queued inject)
+   * Explicit send_to_agent rows (kind 'send_to_agent') are untouched — the
+   * caller asked for a callback. Already-injecting/delivered rows are left
+   * alone; the notifier owns them.
+   */
+  markResultConsumed(jobId: string): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job || !job.result) return false
+    if (job.callback === 'stdout-wait') {
+      if (job.callbackState !== 'none') return job.callbackState === 'skipped_silent'
+    } else if (job.callback === 'origin-inject' && job.kind === 'delegate') {
+      if (job.callbackState !== 'pending') return job.callbackState === 'skipped_silent'
+    } else {
+      return false
+    }
+    const draft = this.cloneEntry(job)
+    draft.callbackState = 'skipped_silent'
+    draft.notifyRetryAt = null
+    draft.lastActivityAt = this.now()
+    return this.commit(job, draft, false)
+  }
+
+  /**
+   * Parent turn ended with `delegate_task` (stdout-wait) jobs nobody is
+   * waiting on. Nothing would ever wake the parent, so hand them to the
+   * Completer/Notifier as origin-inject:
+   *   - non-terminal: callback flips now; complete()/fail() will init
+   *     pending as for any ResumeInject row and onTerminal dispatches.
+   *   - terminal + unconsumed (callback_state still none): pending/epoch 1
+   *     immediately; caller must dispatch (commit does not re-fire
+   *     onTerminal for an already-terminal row). Restricted to rows created
+   *     at/after `terminalCreatedAfter` (this turn) so pre-existing rows that
+   *     were read before consumption tracking existed are not replayed.
+   * Returns the promoted snapshots. Idempotent: a promoted row is no longer
+   * stdout-wait and will not match again.
+   */
+  adoptOrphanedStdoutWait(
+    parentSessionKey: string,
+    meta: { callbackOriginUserId?: string; parentEngine?: string; terminalCreatedAfter?: number } = {},
+  ): DelegateJobSnapshot[] {
+    if (!parentSessionKey) return []
+    if (this.durable) {
+      for (const row of this.durable.loadAll()) this.ingestDurableRow(row)
+    }
+    const out: DelegateJobSnapshot[] = []
+    for (const job of [...this.jobs.values()]) {
+      if (job.parentSessionKey !== parentSessionKey) continue
+      if (job.callback !== 'stdout-wait' || job.callbackState !== 'none') continue
+      const terminal = job.result != null || isDelegateTerminalState(job.state)
+      if (
+        terminal &&
+        meta.terminalCreatedAfter !== undefined &&
+        job.createdAt < meta.terminalCreatedAfter
+      ) {
+        continue
+      }
+      const draft = this.cloneEntry(job)
+      draft.callback = 'origin-inject'
+      draft.callbackOriginSessionKey = parentSessionKey
+      if (meta.callbackOriginUserId) draft.callbackOriginUserId = meta.callbackOriginUserId
+      if (meta.parentEngine) draft.parentEngine = meta.parentEngine
+      if (terminal) {
+        draft.callbackState = 'pending'
+        if (draft.callbackEpoch === 0) draft.callbackEpoch = 1
+        draft.notifyRetryAt = null
+        draft.notifyAttempt = 0
+      }
+      draft.lastActivityAt = this.now()
+      if (this.commit(job, draft, false)) out.push(this.snapshot(job))
+    }
+    return out
+  }
+
   private isNotifyDue(job: DelegateJobSnapshot, now: number): boolean {
     if (job.callbackState === 'injecting') {
       return job.notifyClaimedUntil == null || job.notifyClaimedUntil <= now

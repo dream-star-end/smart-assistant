@@ -21,8 +21,9 @@ export type ParentTapeMessage = {
  */
 export type ParentTapeIngestState = 'ingested' | 'not_ingested' | 'unknown'
 
+/** Persisted `ClientSession.messages` is `unknown[]`; rows are narrowed per-message. */
 export type ParentTapeSession = {
-  messages?: ReadonlyArray<ParentTapeMessage> | null
+  messages?: ReadonlyArray<unknown> | null
 }
 
 /**
@@ -42,9 +43,7 @@ export async function resolveParentTapeIngestState(args: {
   const origin = parseOriginWebchatSessionKey(args.parentSessionKey ?? '')
   if (!origin) return 'unknown'
   const userId =
-    args.callbackOriginUserId?.trim() ||
-    args.liveSessionUserId?.trim() ||
-    args.envUserId?.trim()
+    args.callbackOriginUserId?.trim() || args.liveSessionUserId?.trim() || args.envUserId?.trim()
   if (!userId) return 'unknown'
   try {
     const session = await args.loadSession(origin.peerId, userId)
@@ -58,13 +57,14 @@ export async function resolveParentTapeIngestState(args: {
 }
 
 export function parentTapeHasNotifyId(
-  messages: ReadonlyArray<ParentTapeMessage> | undefined | null,
+  messages: ReadonlyArray<unknown> | undefined | null,
   notifyId: string,
   clientMessageId?: string,
 ): boolean {
   if (!notifyId) return false
   for (const msg of messages ?? []) {
-    if (messageCarriesNotifyId(msg, notifyId, clientMessageId)) return true
+    if (!msg || typeof msg !== 'object') continue
+    if (messageCarriesNotifyId(msg as ParentTapeMessage, notifyId, clientMessageId)) return true
   }
   return false
 }
@@ -89,8 +89,10 @@ function textCarriesNotifyId(value: unknown, notifyId: string): boolean {
     return value.some((part) => {
       if (typeof part === 'string') return part.includes(notifyId)
       if (part && typeof part === 'object' && 'text' in part) {
-        return typeof (part as { text?: unknown }).text === 'string'
-          && (part as { text: string }).text.includes(notifyId)
+        return (
+          typeof (part as { text?: unknown }).text === 'string' &&
+          (part as { text: string }).text.includes(notifyId)
+        )
       }
       return false
     })
