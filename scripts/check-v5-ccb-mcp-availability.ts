@@ -170,9 +170,14 @@ assert.equal(
   "const projectedMcpTools = projectCcbMcpAvailability(...) must be declared",
 );
 assert.equal(
+  binding.projectionDeclarationCount,
+  1,
+  `projectedMcpTools must have exactly one declaration (projectionDeclarationCount: ${binding.projectionDeclarationCount}, overrideAfterProjection: ${binding.overrideAfterProjection})`,
+);
+assert.equal(
   binding.consumesProjection,
   true,
-  `buildPromptContext must consume projectedMcpTools (availableMcpTools initializer: ${binding.availableMcpToolsInitializer})`,
+  `buildPromptContext must consume projectedMcpTools (availableMcpTools initializer: ${binding.availableMcpToolsInitializer}, projectionDeclarationCount: ${binding.projectionDeclarationCount}, overrideAfterProjection: ${binding.overrideAfterProjection})`,
 );
 
 const codexOverrides = readFileSync(

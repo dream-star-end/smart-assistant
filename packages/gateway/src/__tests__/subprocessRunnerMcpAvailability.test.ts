@@ -107,10 +107,12 @@ describe('subprocessRunner MCP availability wiring', () => {
     const src = readFileSync(new URL('../subprocessRunner.ts', import.meta.url), 'utf8')
     const binding = inspectCcbPromptContextAvailability(src)
     assert.equal(binding.projectionDeclared, true, 'projectionDeclared')
+    assert.equal(binding.projectionDeclarationCount, 1, 'projectionDeclarationCount')
+    assert.equal(binding.overrideAfterProjection, null, 'overrideAfterProjection')
     assert.equal(
       binding.consumesProjection,
       true,
-      `buildPromptContext must consume projectedMcpTools (availableMcpTools initializer: ${binding.availableMcpToolsInitializer})`,
+      `buildPromptContext must consume projectedMcpTools (availableMcpTools initializer: ${binding.availableMcpToolsInitializer}, projectionDeclarationCount: ${binding.projectionDeclarationCount}, overrideAfterProjection: ${binding.overrideAfterProjection})`,
     )
   })
 
@@ -136,6 +138,53 @@ describe('subprocessRunner MCP availability wiring', () => {
     const missingBinding = inspectCcbPromptContextAvailability(missing)
     assert.equal(missingBinding.availableMcpToolsInitializer, null)
     assert.equal(missingBinding.consumesProjection, false)
+
+    const shadow = [
+      'const projectedMcpTools = projectCcbMcpAvailability({})',
+      'try {',
+      '  const projectedMcpTools = [...availableMcpTools]',
+      '  void buildPromptContext({ availableMcpTools: projectedMcpTools })',
+      '} catch (e) {}',
+    ].join('\n')
+    const shadowBinding = inspectCcbPromptContextAvailability(shadow)
+    assert.equal(shadowBinding.consumesProjection, false)
+    assert.equal(shadowBinding.projectionDeclarationCount, 2)
+
+    const paramShadow = [
+      'const projectedMcpTools = projectCcbMcpAvailability({})',
+      'function f(projectedMcpTools) {',
+      '  void buildPromptContext({ availableMcpTools: projectedMcpTools })',
+      '}',
+    ].join('\n')
+    const paramBinding = inspectCcbPromptContextAvailability(paramShadow)
+    assert.equal(paramBinding.consumesProjection, false)
+    assert.equal(paramBinding.projectionDeclarationCount, 2)
+
+    const spreadOverride = [
+      'const projectedMcpTools = projectCcbMcpAvailability({})',
+      'void buildPromptContext({ availableMcpTools: projectedMcpTools, ...{ availableMcpTools: [...availableMcpTools] } })',
+    ].join('\n')
+    const spreadBinding = inspectCcbPromptContextAvailability(spreadOverride)
+    assert.equal(spreadBinding.consumesProjection, false)
+    assert.ok(spreadBinding.overrideAfterProjection !== null, 'spread override must be recorded')
+
+    const dupKey = [
+      'const projectedMcpTools = projectCcbMcpAvailability({})',
+      'void buildPromptContext({ availableMcpTools: projectedMcpTools, availableMcpTools: raw })',
+    ].join('\n')
+    const dupBinding = inspectCcbPromptContextAvailability(dupKey)
+    assert.equal(dupBinding.consumesProjection, false)
+
+    const qualified = [
+      'const projectedMcpTools = projectCcbMcpAvailability({})',
+      'const otherOpts = { persona: "x" }',
+      'void buildPromptContext({ agentId: "main", ...otherOpts, availableMcpTools: projectedMcpTools, effortLevel: "high" })',
+    ].join('\n')
+    const qualifiedBinding = inspectCcbPromptContextAvailability(qualified)
+    assert.equal(qualifiedBinding.projectionDeclared, true)
+    assert.equal(qualifiedBinding.projectionDeclarationCount, 1)
+    assert.equal(qualifiedBinding.overrideAfterProjection, null)
+    assert.equal(qualifiedBinding.consumesProjection, true)
   })
 
   test('skill-eval filtering does not drop same-named configured tools', () => {
