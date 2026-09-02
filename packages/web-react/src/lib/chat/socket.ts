@@ -58,6 +58,7 @@ import {
 import {
   applyServerIncremental,
   detectServerTerminalTurns,
+  isUnresolvedPermissionPrompt,
   mergeArchivedHistory,
   mergeFullServerWins,
   mergeTimelineHistoryPage,
@@ -4109,6 +4110,11 @@ export class ChatSocket {
     sess.messages = sess.messages.filter((message) => {
       if (message.role === "user") return true;
       if (message._source === "server" || !!message._turnTapeId) return true;
+      // INC-20260903-PENDING-PERMISSION-LOST: the journal cursor is already
+      // past the request frame; dropping the card here loses the only handle
+      // the user has to unblock the engine. mergeFullServerWins keeps the same
+      // rows on the REST path.
+      if (isUnresolvedPermissionPrompt(message)) return true;
       if (preserveStreamingPointer && message === streamingAssistant) return true;
       if (shouldRetainLiveProcessOnOwnerReset(message, authority, incomingProcessOwners)) {
         return true;

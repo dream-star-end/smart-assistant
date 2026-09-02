@@ -820,6 +820,19 @@ export function shouldRetainLiveProcessOnOwnerReset(
   return !incomingProcessOwners.has(owner);
 }
 
+/** Unresolved permission prompts are user-blocking control state owned by the
+ * runtime, not replayable message blocks. An owner reset driven by the durable
+ * journal must never delete them: the journal cursor may already be past the
+ * request frame, so nothing would re-materialize the card while the engine
+ * (waitingForUserInput) waits forever. Resolved or expired cards fall back to
+ * the ordinary owner-reset rules. INC-20260903-PENDING-PERMISSION-LOST */
+export function isUnresolvedPermissionPrompt(message: ChatMessage, nowMs: number = Date.now()): boolean {
+  if (message.role !== "permission" || message._resolved === true) return false;
+  const expiresAt = (message as ChatMessage & { _askUserExpiresAt?: unknown })._askUserExpiresAt;
+  if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt <= nowMs) return false;
+  return true;
+}
+
 function isLiveAssistantFragment(message: ChatMessage): boolean {
   return message.role === "assistant"
     && message._source !== "server"

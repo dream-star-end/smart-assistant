@@ -2181,6 +2181,59 @@ export function _permissionRequestExpiresAt(
   )
 }
 
+export interface PendingPermissionCatchupEntry {
+  sessionKey: string
+  peerKey: string
+  toolName: string
+  input: Record<string, unknown>
+  toolUseId?: string
+  clientMessageId?: string
+  channel: string
+  peer: { id: string; kind: 'dm' | 'group' }
+  expiresAt: number
+  detachedAskUser?: boolean
+}
+
+/**
+ * INC-20260903-PENDING-PERMISSION-LOST — hello-time catch-up for prompts that
+ * are still waiting for the user. `_sendStampedSessionFrame` only reaches
+ * sockets registered at emit time; a browser that (re)attaches during the
+ * bridge reconnect window never sees the request, while the engine sits in
+ * waitingForUserInput with the watchdog legitimately suppressed. The pending
+ * map is the gateway's authority for "still answerable", so replay it to the
+ * newly registered socket. Frames are deliberately unstamped (no frameSeq):
+ * the reducer dedupes permission prompts by requestId and a fresh ring seq
+ * would collide with the client cursor.
+ */
+export function _pendingPermissionCatchupFrames(
+  pending: ReadonlyMap<string, PendingPermissionCatchupEntry>,
+  sessionKey: string,
+  peerKey: string,
+  nowMs: number = Date.now(),
+): Array<Record<string, unknown>> {
+  const frames: Array<Record<string, unknown>> = []
+  for (const [requestId, entry] of pending) {
+    if (entry.sessionKey !== sessionKey || entry.peerKey !== peerKey) continue
+    if (!(typeof entry.expiresAt === 'number' && entry.expiresAt > nowMs)) continue
+    frames.push({
+      type: 'outbound.permission_request',
+      sessionKey,
+      channel: entry.channel,
+      peer: entry.peer,
+      requestId,
+      toolName: entry.toolName,
+      ...(entry.toolUseId ? { toolUseId: entry.toolUseId } : {}),
+      ...(entry.clientMessageId ? { clientMessageId: entry.clientMessageId } : {}),
+      inputPreview: JSON.stringify(entry.input).slice(0, 400),
+      inputJson: entry.input,
+      expiresAt: entry.expiresAt,
+      ...(entry.detachedAskUser ? { detachedAskUser: true } : {}),
+      ts: nowMs,
+    })
+  }
+  return frames
+}
+
 export class Gateway {
   private wss!: WebSocketServer
   private httpServer!: ReturnType<typeof createServer>
@@ -2421,6 +2474,9 @@ export class Gateway {
     toolName: string
     input: Record<string, unknown>
     toolUseId?: string
+    /** Browser-authored user row that owns the requesting turn. Carried so
+     *  hello-time catch-up can re-attach the replayed card to its turn. */
+    clientMessageId?: string
     peerKey: string
     /** Authenticated userId that owns this pending request — carried so that
      *  _recordSettlement can stamp the settlement with the owner, and
@@ -17476,6 +17532,30 @@ export class Gateway {
         } catch {}
       }
 
+      // INC-20260903-PENDING-PERMISSION-LOST — a prompt emitted while this
+      // socket was not yet registered is otherwise never re-sent, and the
+      // engine waits in waitingForUserInput indefinitely. Replay the still
+      // answerable pending prompts scoped to this exact sessionKey+peerKey to
+      // the newly registered socket only (no ring/frameSeq, no other tabs).
+      if (ws.readyState === WebSocket.OPEN) {
+        const catchup = _pendingPermissionCatchupFrames(this._pendingPermissions, sessionKey, peerKey)
+        let sentCount = 0
+        for (const frame of catchup) {
+          try {
+            ws.send(JSON.stringify(frame))
+            sentCount += 1
+          } catch {
+            break
+          }
+        }
+        if (sentCount > 0) {
+          this.log.info('auto-resume replayed pending permission prompts', {
+            sessionKey,
+            count: sentCount,
+          })
+        }
+      }
+
       // Push a synthetic isFinal to the reconnected client for sessions that the client
       // reports as in-flight (had _sendingInFlight=true) but whose subprocess is not
       // currently running. This clears the client's stuck _sendingInFlight state from
@@ -19303,6 +19383,7 @@ export class Gateway {
             toolName: e.request.toolName,
             input: e.request.input,
             toolUseId: e.request.toolUseId,
+            ...(isClientMessageId(out.clientMessageId) ? { clientMessageId: out.clientMessageId } : {}),
             peerKey,
             userId: dispatchUserId,
             channel: frame.channel,
