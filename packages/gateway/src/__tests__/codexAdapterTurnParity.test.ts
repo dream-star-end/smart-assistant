@@ -44,14 +44,15 @@ class FakeCodexProc extends EventEmitter {
   written: JsonRpcRequest[] = [];
   /** auto-responder:内核每写一个 request 调用一次;返回 result 或抛错形状。 */
   onRequest: ((req: JsonRpcRequest) => void) | null = null;
-  stdin = {
-    write: (line: string) => {
+  stdin = Object.assign(new EventEmitter(), {
+    write: (line: string, callback?: (error?: Error | null) => void) => {
       const req = JSON.parse(line) as JsonRpcRequest;
       this.written.push(req);
       this.onRequest?.(req);
+      if (callback) setImmediate(() => callback());
       return true;
     },
-  };
+  });
   kill(_sig?: string): void {
     this.killed = true;
   }
