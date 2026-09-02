@@ -47,7 +47,8 @@ function lastBashTailBytes(children: ChildBlock[]): number | null {
 }
 
 export function DelegateProcessList({ childBlocks }: { childBlocks: ChildBlock[] }) {
-  const total = childBlocks.length;
+  const blocks = Array.isArray(childBlocks) ? childBlocks : [];
+  const total = blocks.length;
   const [windowStart, setWindowStart] = useState(() => windowStartForTail(total));
   const [followBottom, setFollowBottom] = useState(true);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
@@ -64,12 +65,12 @@ export function DelegateProcessList({ childBlocks }: { childBlocks: ChildBlock[]
   }, [total]);
 
   const start = Math.min(windowStart, windowStartForTail(total));
-  const mounted = childBlocks.slice(start);
+  const mounted = blocks.slice(start);
   const mountedCount = mounted.length;
   const progress = total === 0 ? 0 : mountedCount / total;
-  const tailBytes = lastBashTailBytes(childBlocks);
+  const tailBytes = lastBashTailBytes(blocks);
   // 末条 output/bashTail 变长时 total 不变，也要贴底。
-  const lastChild = total > 0 ? childBlocks[total - 1] : undefined;
+  const lastChild = total > 0 ? blocks[total - 1] : undefined;
   const liveSig = lastChild ? childSignature(lastChild) : "";
 
   const scrollToBottom = useCallback(() => {

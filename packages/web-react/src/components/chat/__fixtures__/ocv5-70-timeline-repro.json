@@ -1,0 +1,105 @@
+[
+  {
+    "id": "user-repro-1",
+    "role": "user",
+    "text": "继续",
+    "ts": 1,
+    "_source": "server",
+    "_timelineRecord": true
+  },
+  {
+    "id": "tool-execute-extra",
+    "role": "tool",
+    "toolName": "ExecuteExtraTool",
+    "text": "",
+    "ts": 2,
+    "_completed": true,
+    "_source": "server",
+    "_timelineRecord": true,
+    "inputJson": {
+      "tool_name": "mcp__openclaude-memory__skill_view",
+      "params": { "name": "v5-cursor-tool-card-normalize" }
+    },
+    "output": "{\"result\":[{\"type\":\"text\",\"text\":\"[source: user]\\n---\\nname: demo\\ntags: [a, b]\\n---\\nbody\"}],\"tool_name\":\"mcp__openclaude-memory__skill_view\"}"
+  },
+  {
+    "id": "tool-todowrite",
+    "role": "tool",
+    "toolName": "TodoWrite",
+    "text": "",
+    "ts": 3,
+    "_completed": true,
+    "_source": "server",
+    "_timelineRecord": true,
+    "inputJson": {
+      "todos": [
+        { "content": "已完成", "status": "completed" },
+        { "content": "容器重建后真机验证", "status": "pending", "activeForm": "真机验证" }
+      ]
+    }
+  },
+  {
+    "id": "tool-ask",
+    "role": "tool",
+    "toolName": "AskUserQuestion",
+    "text": "",
+    "ts": 4,
+    "_completed": true,
+    "_source": "server",
+    "_timelineRecord": true,
+    "inputJson": {
+      "questions": [
+        {
+          "question": "现在重建吗?",
+          "header": "容器重建",
+          "options": [{ "label": "现在重建" }, { "label": "稍后" }]
+        }
+      ]
+    }
+  },
+  {
+    "id": "ag-coding",
+    "role": "agent-group",
+    "text": "修 CCB MCP 可用性",
+    "ts": 5,
+    "_completed": true,
+    "_source": "server",
+    "_delegateAgentId": "coding-assistant",
+    "_resultPreview": "已提交修复",
+    "childBlocks": [
+      { "kind": "thinking", "text": "Planning" },
+      {
+        "kind": "plan",
+        "steps": [
+          { "step": "读代码", "status": "completed" },
+          { "step": "修复", "status": "inProgress" }
+        ]
+      },
+      { "kind": "goal", "blockId": "codex-goal-pending", "cleared": true },
+      { "kind": "error", "error": "{\"subtype\":\"error_during_execution\"}" },
+      { "kind": "tool_use", "toolName": "Read", "inputJson": { "file_path": "/x.ts" } },
+      { "kind": "tool_result", "toolName": "Read", "output": "ok" },
+      { "kind": "final", "meta": { "totalTokens": 12, "inputTokens": 8, "outputTokens": 4 } }
+    ]
+  },
+  {
+    "id": "ag-bad-steps",
+    "role": "agent-group",
+    "text": "畸形 plan steps",
+    "ts": 6,
+    "_completed": false,
+    "_delegateAgentId": "coding-assistant",
+    "childBlocks": [
+      { "kind": "plan", "steps": { "not": "array" } },
+      { "kind": "plan", "steps": [null, { "status": "pending" }] }
+    ]
+  },
+  {
+    "id": "assistant-final",
+    "role": "assistant",
+    "text": "已处理完毕。",
+    "ts": 7,
+    "_source": "server",
+    "_timelineRecord": true
+  }
+]

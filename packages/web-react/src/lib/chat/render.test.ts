@@ -83,6 +83,12 @@ describe("messageSignature 流式防闪签名", () => {
     expect(safeMessageSignature(m, CTX)).toContain("plan");
   });
 
+  test("childSignature: steps 非数组或含 null 不抛", () => {
+    expect(() => childSignature({ kind: "plan", steps: { not: "array" } as never })).not.toThrow();
+    expect(() => childSignature({ kind: "plan", steps: [null] as never })).not.toThrow();
+    expect(childSignature({ kind: "plan", steps: [null] as never })).toContain("plan");
+  });
+
   test("assistant 文本增量 → 签名变化（触发重渲）", () => {
     const a = mk("assistant", { text: "hel" });
     const b = mk("assistant", { text: "hello" });

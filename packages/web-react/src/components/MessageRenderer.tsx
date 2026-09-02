@@ -805,6 +805,7 @@ function coalesceTeam(
   for (let i = 0; i < slice.length; i++) {
     const m = slice[i];
     const absIdx = start + i;
+    if (!m) continue;
     if (consumedThinking.has(absIdx)) continue; // 已并入上方某思考卡 → 吸收跳过
     // Persisted historical records are already the Agent's exact ordered
     // logical stream. Never regroup, reorder or fold one record into another.
@@ -932,9 +933,16 @@ function defaultTailStart(length: number): number {
 }
 
 function renderItemKey(item: RenderItem): string {
-  return item.kind === "single"
-    ? (item.m._timelineUnitKey ?? item.m.id)
-    : item.members[0]?._timelineUnitKey ?? item.members[0]?.id ?? item.kind;
+  try {
+    if (item.kind === "single") {
+      const key = item.m?._timelineUnitKey ?? item.m?.id;
+      return typeof key === "string" && key.length > 0 ? key : "single-missing";
+    }
+    const key = item.members[0]?._timelineUnitKey ?? item.members[0]?.id ?? item.kind;
+    return typeof key === "string" && key.length > 0 ? key : item.kind;
+  } catch {
+    return "corrupt-item";
+  }
 }
 
 function lastUserItemIndex(items: RenderItem[]): number {
@@ -1483,8 +1491,20 @@ export function MessageList({
   const turnStart = currentTurnStartIndex(renderableMessages);
   // 每条消息是否为「所在轮末条 assistant 正文」(评价反馈行唯一可见位)。按全量 messages 下标对齐,
   // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
-  const ratingFinal = turnFinalAssistantFlags(renderableMessages);
-  const renderItems = coalesceTeam(renderableMessages, 0, sending, liveTurnUsage);
+  let ratingFinal: boolean[] = [];
+  let renderItems: RenderItem[] = [];
+  try {
+    ratingFinal = turnFinalAssistantFlags(renderableMessages);
+    renderItems = coalesceTeam(renderableMessages, 0, sending, liveTurnUsage);
+  } catch {
+    ratingFinal = renderableMessages.map(() => false);
+    renderItems = renderableMessages.map((m, absIdx) => ({
+      kind: "single" as const,
+      m,
+      isLast: absIdx === renderableMessages.length - 1,
+      idx: absIdx,
+    }));
+  }
   itemCountRef.current = renderItems.length;
   const itemKey = renderItemKey;
   // Production scroll surfaces freeze a start index on first content so streaming

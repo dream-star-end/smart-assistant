@@ -79,7 +79,12 @@ function RawChildEventView({ child }: { child: ChildBlock }) {
     bulk.push({ name, text: value });
     delete metadata[name];
   }
-  const serialized = JSON.stringify(metadata, null, 2) ?? "{}";
+  let serialized = "{}";
+  try {
+    serialized = JSON.stringify(metadata, null, 2) ?? "{}";
+  } catch {
+    serialized = "{}";
+  }
   const label = child.kind === "tool_result"
     ? `${child.toolName || "工具"} · 原始结果`
     : child.kind === "tool_output_tail"
@@ -195,7 +200,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
   const verdict = reviewVerdictBadge(msg);
   const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
   const collapsed = userCollapsed ?? (!!msg._completed || isServerRow);
-  const children = msg.childBlocks ?? [];
+  const children = Array.isArray(msg.childBlocks) ? msg.childBlocks : [];
   const tokenUsage = delegateTokenUsage(msg);
   const terminalNoChildren = !running && children.length === 0;
 
@@ -241,9 +246,9 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
             </div>
           )}
           {/* 任何无 childBlocks 的终态卡展开态展示真实结果摘要。 */}
-          {terminalNoChildren && (msg._resultPreview || isServerRow) && (
+          {terminalNoChildren && (typeof msg._resultPreview === "string" || isServerRow) && (
             <div className="space-y-1.5 px-3.5 py-2.5">
-              {msg._resultPreview && (
+              {typeof msg._resultPreview === "string" && msg._resultPreview && (
                 <ProgressivePlainText
                   text={msg._resultPreview}
                   className="text-[12.5px] leading-relaxed text-muted"
@@ -256,7 +261,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
       )}
 
       {/* 折叠态下展示结果摘要（完成后） */}
-      {collapsed && !running && msg._resultPreview && (
+      {collapsed && !running && typeof msg._resultPreview === "string" && msg._resultPreview && (
         <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
           <Check size={13} className="mt-0.5 shrink-0 text-success" />
           <span className="line-clamp-2">

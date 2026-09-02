@@ -51,7 +51,7 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
   const verdict = reviewVerdictBadge(msg);
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const open = userOpen ?? running;
-  const children = msg.childBlocks ?? [];
+  const children = Array.isArray(msg.childBlocks) ? msg.childBlocks : [];
   const name = memberName(msg, idx);
   const goal = msg._delegateGoal || msg.text || "";
   const terminalNoChildren = !running && children.length === 0;
@@ -116,9 +116,9 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
             </div>
           )}
           {/* 无 childBlocks 的终态行仍展示其结果摘要。 */}
-          {terminalNoChildren && (msg._resultPreview || isServerRow) && (
+          {terminalNoChildren && (typeof msg._resultPreview === "string" || isServerRow) && (
             <div className="space-y-1.5 px-3 py-2.5">
-              {msg._resultPreview && (
+              {typeof msg._resultPreview === "string" && msg._resultPreview && (
                 <ProgressivePlainText
                   text={msg._resultPreview}
                   className="text-[12px] leading-relaxed text-muted"
@@ -130,7 +130,7 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
         </div>
       )}
 
-      {!open && !running && msg._resultPreview && (
+      {!open && !running && typeof msg._resultPreview === "string" && msg._resultPreview && (
         <div className="flex items-start gap-1.5 border-t border-border/70 px-3 py-1.5 text-[12px] text-muted">
           <Check size={12} className="mt-0.5 shrink-0 text-success" />
           <span className="line-clamp-1">
