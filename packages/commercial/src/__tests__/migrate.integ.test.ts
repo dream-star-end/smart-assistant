@@ -202,8 +202,8 @@ describe("migrate.runMigrations", () => {
     );
     assert.deepEqual(cursorModels.rows, [
       { model_id: "cursor-auto", upstream_model_id: null, state: "active", enabled: true, visibility: "hidden" },
-      { model_id: "cursor-composer-2.5", upstream_model_id: "composer-2.5", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-composer-2.5-fast", upstream_model_id: "composer-2.5-fast", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-composer-2.5", upstream_model_id: "composer-2.5", state: "disabled", enabled: false, visibility: "hidden" },
+      { model_id: "cursor-composer-2.5-fast", upstream_model_id: "composer-2.5-fast", state: "disabled", enabled: false, visibility: "hidden" },
       { model_id: "cursor-fable-5-high", upstream_model_id: "claude-fable-5-thinking-high", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-fable-5-low", upstream_model_id: "claude-fable-5-thinking-low", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-fable-5-max", upstream_model_id: "claude-fable-5-thinking-max", state: "active", enabled: true, visibility: "public" },

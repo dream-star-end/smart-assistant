@@ -32,6 +32,7 @@ import { getDegradedProviders, _resetGateForTest } from "../admin/providerHealth
 import {
   handleListPublicModels,
   type CommercialHttpDeps,
+  type LockedPublicModelProjection,
   type PublicModelProjection,
 } from "../http/handlers.js";
 import { HttpError } from "../http/util.js";
@@ -182,6 +183,19 @@ async function listAnon(d: CommercialHttpDeps): Promise<PublicModelProjection[]>
   await handleListPublicModels(makeReq(), res, {} as never, d);
   assert.equal(res.statusCode, 200);
   return res.body.models as PublicModelProjection[];
+}
+
+async function listCatalogBody(
+  d: CommercialHttpDeps,
+  auth?: string,
+): Promise<{ models: PublicModelProjection[]; locked_models?: LockedPublicModelProjection[] }> {
+  const res = makeRes();
+  await handleListPublicModels(makeReq(auth), res, {} as never, d);
+  assert.equal(res.statusCode, 200);
+  return res.body as {
+    models: PublicModelProjection[];
+    locked_models?: LockedPublicModelProjection[];
+  };
 }
 
 async function authToken(secret: Uint8Array, sub = "42"): Promise<string> {
@@ -338,6 +352,74 @@ function legacyRow(modelId: string, over: Partial<ModelPricing> = {}): ModelPric
   };
 }
 
+describe("/api/public/models — promo_label 与 locked_models", () => {
+  const gatedSnap = new ModelCatalogSnapshot({
+    entries: [
+      ACTIVE,
+      entry({ entryId: 20, modelId: "cursor-opus-5-high", engine: "ccb", providerId: "ark" }),
+      entry({ entryId: 21, modelId: "deepseek-v4-pro", providerId: "deepseek" }),
+    ],
+    aliases: new Map(),
+    pricing: new Map(
+      [
+        price("glm-5.2", { sortOrder: 10, promoLabel: "限时半价" }),
+        price("cursor-opus-5-high", {
+          displayName: "Opus 5 High",
+          sortOrder: 5,
+          minPlanCode: "lite",
+          minPlanTier: 1,
+          minPlanName: "Lite",
+          promoLabel: "限时半价",
+        }),
+        price("deepseek-v4-pro", {
+          sortOrder: 80,
+          inputPerMtok: 400n,
+          outputPerMtok: 1500n,
+          cacheReadPerMtok: 50n,
+        }),
+      ].map((p) => [p.modelId, p]),
+    ),
+    securityEpoch: 9n,
+  });
+
+  test("catalog 分支发出 locked_models；promo_label 仅在非空时出现", async () => {
+    const body = await listCatalogBody(deps({ modelCatalog: catalogOf(gatedSnap) }));
+    assert.deepEqual(body.models.map((m) => m.id), ["glm-5.2", "deepseek-v4-pro"]);
+    assert.equal(body.models[0]!.promo_label, "限时半价");
+    assert.equal(body.models[1]!.promo_label, undefined);
+    assert.deepEqual(
+      (body.locked_models ?? []).map((m) => m.id),
+      ["cursor-opus-5-high"],
+    );
+    const locked = body.locked_models![0]!;
+    assert.equal(locked.display_name, "Opus 5 High");
+    assert.equal(locked.engine, "ccb");
+    assert.equal(locked.min_plan_code, "lite");
+    assert.equal(locked.min_plan_name, "Lite");
+    assert.equal(locked.promo_label, "限时半价");
+    assert.equal(typeof locked.cost_x, "number");
+  });
+
+  test("lite 用户看到 gated 行在 models 里，不在 locked_models", async () => {
+    const secret = new Uint8Array(32);
+    const token = await authToken(secret);
+    const body = await listCatalogBody(
+      deps({
+        jwtSecret: secret,
+        modelCatalog: catalogOf(gatedSnap),
+        loadUserModelAuthz: async () => ({
+          role: "user",
+          grantedModelIds: new Set<string>(),
+          userPlanTier: 1,
+        }),
+      }),
+      `Bearer ${token}`,
+    );
+    assert.deepEqual(body.models.map((m) => m.id), ["cursor-opus-5-high", "glm-5.2", "deepseek-v4-pro"]);
+    assert.deepEqual(body.locked_models, []);
+  });
+});
+
 describe("/api/public/models — catalog 未注入 → legacy 投影(兼容)", () => {
   test("走 PricingCache.listPublic;无 provider_id 字段", async () => {
     const pricing = new PricingCache();
@@ -345,6 +427,13 @@ describe("/api/public/models — catalog 未注入 → legacy 投影(兼容)", (
     const models = await listAnon(deps({ pricing }));
     assert.deepEqual(models.map((m) => m.id), ["glm-5.2"]);
     assert.equal(models[0].provider_id, undefined);
+  });
+
+  test("legacy 分支不发 locked_models", async () => {
+    const pricing = new PricingCache();
+    pricing._setForTests([legacyRow("glm-5.2")]);
+    const body = await listCatalogBody(deps({ pricing }));
+    assert.equal(body.locked_models, undefined);
   });
 
   test("pricing 与 catalog 都没有 → 503 PRICING_NOT_READY", async () => {

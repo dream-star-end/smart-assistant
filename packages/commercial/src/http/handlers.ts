@@ -1283,7 +1283,10 @@ export async function handleListPublicModels(
     const effective = claims
       ? await loadPublicModelScope(deps, claims, snapshot.securityEpoch)
       : anonymousModelScope();
-    sendJson(res, 200, { models: projectPublicModels(snapshot, effective, degraded) });
+    sendJson(res, 200, {
+      models: projectPublicModels(snapshot, effective, degraded),
+      locked_models: projectLockedModels(snapshot, effective),
+    });
     return;
   }
 
@@ -1387,6 +1390,56 @@ function projectPublicModels(
       provider_id: row.providerId,
       ...(costX !== undefined ? { cost_x: costX } : {}),
       ...(row.providerId && degraded.has(row.providerId) ? { degraded: true } : {}),
+      ...(row.promoLabel ? { promo_label: row.promoLabel } : {}),
+    });
+  }
+  return out;
+}
+
+/** Locked picker rows: visible except for the subscription floor. */
+export interface LockedPublicModelProjection {
+  id: string;
+  display_name?: string;
+  engine?: string;
+  min_plan_code: string;
+  min_plan_name?: string;
+  cost_x?: number;
+  promo_label?: string;
+}
+
+function projectLockedModels(
+  snapshot: ModelCatalogSnapshot,
+  scope: UserModelScope,
+): LockedPublicModelProjection[] {
+  const out: LockedPublicModelProjection[] = [];
+  for (const row of snapshot.listLockedForUser(scope)) {
+    const p = snapshot.pricing.get(row.modelId);
+    if (!p) continue;
+    const baseline = snapshot.pricing.get(COST_INDEX_BASELINE_MODEL_ID);
+    const costX = costXVsBaseline(
+      {
+        inputPerMtok: p.inputPerMtok,
+        cacheReadPerMtok: p.cacheReadPerMtok,
+        outputPerMtok: p.outputPerMtok,
+        multiplier: p.multiplier,
+      },
+      baseline
+        ? {
+            inputPerMtok: baseline.inputPerMtok,
+            cacheReadPerMtok: baseline.cacheReadPerMtok,
+            outputPerMtok: baseline.outputPerMtok,
+            multiplier: baseline.multiplier,
+          }
+        : null,
+    );
+    out.push({
+      id: row.modelId,
+      display_name: row.displayName,
+      engine: row.engine,
+      min_plan_code: row.minPlanCode,
+      ...(row.minPlanName ? { min_plan_name: row.minPlanName } : {}),
+      ...(costX !== undefined ? { cost_x: costX } : {}),
+      ...(row.promoLabel ? { promo_label: row.promoLabel } : {}),
     });
   }
   return out;

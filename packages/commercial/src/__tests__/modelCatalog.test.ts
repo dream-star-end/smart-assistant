@@ -446,6 +446,80 @@ describe("per-uid 投影", () => {
     }
   });
 
+  test("listLockedForUser is canUseModel minus the plan floor only", () => {
+    const gated = snap({
+      entries: [
+        GLM,
+        entry({ entryId: 10, modelId: "opus-lite-gate" }),
+        entry({ entryId: 11, modelId: "hidden-gated" }),
+        entry({ entryId: 12, modelId: "denied-gated" }),
+      ],
+      pricing: [
+        price("glm-5.2"),
+        price("opus-lite-gate", {
+          visibility: "public",
+          minPlanCode: "lite",
+          minPlanTier: 1,
+          minPlanName: "Lite",
+          promoLabel: "限时半价",
+          sortOrder: 5,
+        }),
+        price("hidden-gated", {
+          visibility: "hidden",
+          minPlanCode: "lite",
+          minPlanTier: 1,
+          minPlanName: "Lite",
+          sortOrder: 6,
+        }),
+        price("denied-gated", {
+          visibility: "public",
+          minPlanCode: "lite",
+          minPlanTier: 1,
+          minPlanName: "Lite",
+          sortOrder: 7,
+        }),
+      ],
+    });
+    const below = { uid: 9, role: "user" as const, grantedModelIds: new Set<string>(), userPlanTier: 0 };
+    const lite = { ...below, userPlanTier: 1 };
+    const anon = { uid: 0, role: "user" as const, grantedModelIds: new Set<string>(), userPlanTier: null };
+    const denied = { ...below, deniedModelIds: new Set(["denied-gated"]) };
+
+    assert.equal(gated.canUseModel(below, "opus-lite-gate"), false);
+    assert.deepEqual(gated.listForUser(below).map((row) => row.modelId), ["glm-5.2"]);
+    assert.deepEqual(
+      gated.listLockedForUser(below).map((row) => row.modelId),
+      ["opus-lite-gate", "denied-gated"],
+    );
+    assert.equal(gated.listLockedForUser(below)[0]?.promoLabel, "限时半价");
+    assert.equal(gated.listLockedForUser(below)[0]?.minPlanName, "Lite");
+
+    assert.equal(gated.canUseModel(lite, "opus-lite-gate"), true);
+    assert.deepEqual(
+      gated.listForUser(lite).map((row) => row.modelId),
+      ["opus-lite-gate", "denied-gated", "glm-5.2"],
+    );
+    assert.deepEqual(gated.listLockedForUser(lite).map((row) => row.modelId), []);
+    assert.equal(gated.listForUser(lite).find((row) => row.modelId === "opus-lite-gate")?.promoLabel, "限时半价");
+
+    assert.deepEqual(gated.listForUser(anon).map((row) => row.modelId), ["glm-5.2"]);
+    assert.deepEqual(
+      gated.listLockedForUser(anon).map((row) => row.modelId),
+      ["opus-lite-gate", "denied-gated"],
+    );
+
+    assert.deepEqual(
+      gated.listLockedForUser({ ...below, grantedModelIds: new Set() }).filter((row) => row.modelId === "hidden-gated"),
+      [],
+    );
+    assert.equal(gated.canUseModel(below, "hidden-gated"), false);
+    assert.ok(!gated.listForUser(below).some((row) => row.modelId === "hidden-gated"));
+
+    assert.equal(gated.canUseModel(denied, "denied-gated"), false);
+    assert.ok(!gated.listForUser(denied).some((row) => row.modelId === "denied-gated"));
+    assert.ok(!gated.listLockedForUser(denied).some((row) => row.modelId === "denied-gated"));
+  });
+
   test("projectionRevision 是 per-uid 的:同内容不同 uid → 不同 hash", () => {
     const a = s.projectionRevisionFor({ uid: 1, role: "user", grantedModelIds: new Set() });
     const b = s.projectionRevisionFor({ uid: 2, role: "user", grantedModelIds: new Set() });

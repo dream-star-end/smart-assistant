@@ -105,6 +105,8 @@ export interface PublicModel {
    * (健康是 provider_ops 独立权威,与 pricing.enabled/visibility 正交,不入定价缓存)。
    */
   degraded?: boolean;
+  /** Optional picker badge; omitted when the catalog promo_label is NULL. */
+  promo_label?: string;
 }
 
 type RawRow = {
