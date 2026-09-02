@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { createDelegateEngineBillingRuntime } from '../billing/delegateEngineBillingRuntime.js'
+import {
+  createDelegateEngineBillingRuntime,
+  resolveDelegateBillingAttribution,
+} from '../billing/delegateEngineBillingRuntime.js'
 import {
   DELEGATE_ENGINE_BILLING_ABANDON_PATH,
   DELEGATE_ENGINE_BILLING_ADMIT_PATH,
@@ -186,12 +189,18 @@ describe('delegate engine-billing runtime', () => {
     assert.equal(journalCalls.length, 0)
   })
 
-  it('settles with delegate attribution from the billing frame', async () => {
+  it('settles with journal-owned attribution that finalizer uses for mode=delegate', async () => {
     const { runtime, settleCalls, journals } = makeRuntime()
     journals.set(REQUEST_ID, {
       user_id: '42',
       container_id: '7',
-      ctx: { source: 'delegate_codex', engineSessionId: `oceng-${'b'.repeat(48)}` },
+      ctx: {
+        source: 'delegate_codex',
+        engineSessionId: `oceng-${'b'.repeat(48)}`,
+        delegateAgentId: 'auditor',
+        parentSessionId: 'web-parent',
+        parentTurnKey: 'c'.repeat(64),
+      },
     })
     const result = await runtime.handle({
       path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
@@ -202,19 +211,86 @@ describe('delegate engine-billing runtime', () => {
         status: 'success',
         durationMs: 12,
         usage: { input_tokens: 8, output_tokens: 3 },
-        delegateAgentId: 'auditor',
-        parentSessionId: 'web-parent',
       },
     })
     assert.deepEqual(result, { settled: true })
     const frame = settleCalls[0] as {
       delegateAgentId?: string
       parentSessionId?: string
+      parentTurnKey?: string
       requestId: string
     }
     assert.equal(frame.requestId, REQUEST_ID)
     assert.equal(frame.delegateAgentId, 'auditor')
     assert.equal(frame.parentSessionId, 'web-parent')
+    assert.equal(frame.parentTurnKey, 'c'.repeat(64))
+    const finalizerAttribution = {
+      parentTurnKey: frame.parentTurnKey ?? null,
+      parentSessionId: frame.parentSessionId ?? null,
+      delegateAgentId: frame.delegateAgentId ?? null,
+    }
+    const mode =
+      finalizerAttribution.parentTurnKey ||
+      finalizerAttribution.parentSessionId ||
+      finalizerAttribution.delegateAgentId
+        ? 'delegate'
+        : 'chat'
+    assert.equal(mode, 'delegate')
+    assert.equal(finalizerAttribution.delegateAgentId, 'auditor')
+  })
+
+  it('prefers journal attribution when the billing frame disagrees', async () => {
+    const { runtime, settleCalls, journals } = makeRuntime()
+    journals.set(REQUEST_ID, {
+      user_id: '42',
+      container_id: '7',
+      ctx: {
+        source: 'delegate_codex',
+        delegateAgentId: 'auditor',
+        parentSessionId: 'web-journal',
+        parentTurnKey: 'c'.repeat(64),
+      },
+    })
+    await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+      identity: IDENTITY,
+      body: {
+        requestId: REQUEST_ID,
+        engineSessionId: `oceng-${'b'.repeat(48)}`,
+        status: 'success',
+        durationMs: 3,
+        delegateAgentId: 'coding-assistant',
+        parentSessionId: 'web-frame',
+        parentTurnKey: 'd'.repeat(64),
+      },
+    })
+    const frame = settleCalls[0] as {
+      delegateAgentId?: string
+      parentSessionId?: string
+      parentTurnKey?: string
+    }
+    assert.equal(frame.delegateAgentId, 'auditor')
+    assert.equal(frame.parentSessionId, 'web-journal')
+    assert.equal(frame.parentTurnKey, 'c'.repeat(64))
+    assert.deepEqual(
+      resolveDelegateBillingAttribution(
+        {
+          delegateAgentId: 'auditor',
+          parentSessionId: 'web-journal',
+          parentTurnKey: 'c'.repeat(64),
+        },
+        {
+          delegateAgentId: 'coding-assistant',
+          parentSessionId: 'web-frame',
+          parentTurnKey: 'd'.repeat(64),
+        },
+      ),
+      {
+        delegateAgentId: 'auditor',
+        parentSessionId: 'web-journal',
+        parentTurnKey: 'c'.repeat(64),
+      },
+    )
   })
 
   it('abandons the inflight journal', async () => {

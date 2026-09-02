@@ -379,6 +379,7 @@ import {
 import {
   getDelegateTimeoutReason,
   resolveDelegateTimeoutConfig,
+  type DelegateTimeoutConfig,
 } from './delegateTimeout.js'
 import {
   DelegateJobStore,
@@ -10669,6 +10670,8 @@ export class Gateway {
   private _delegateJobs: DelegateJobStore | undefined
   /** Test seam for engine-reported delegate admit/settle/abandon. */
   private _delegateEngineBilling: DelegateEngineBillingClient | undefined
+  /** Test seam: skip the 60s idle-timeout floor so timeout/billing races are unit-testable. */
+  private _delegateTimeoutConfig: DelegateTimeoutConfig | undefined
   /** Stage 1: durable boot reconciler has finished (or durable is off). */
   private _delegateReconcileReady = false
   private _delegateDurablePath: string | undefined
@@ -12667,7 +12670,9 @@ export class Gateway {
     // 非 review / 解析不出 → undefined(编排据 undefined 走降级放行)。
     let verdict: ReviewVerdict | undefined
     let ownGoalUsageRecord: DurableGoalUsageRecord | undefined
-    const timeoutConfig = resolveDelegateTimeoutConfig(process.env, input.idleTimeoutMs)
+    let submitSettled = false
+    const timeoutConfig =
+      this._delegateTimeoutConfig ?? resolveDelegateTimeoutConfig(process.env, input.idleTimeoutMs)
     let timeoutTimer: NodeJS.Timeout | null = null
     const clearTimeoutTimer = () => {
       if (timeoutTimer) clearInterval(timeoutTimer)
@@ -12756,6 +12761,7 @@ export class Gateway {
     )
     try {
       await Promise.race([submitPromise, timeoutPromise])
+      submitSettled = true
       clearTimeoutTimer()
       if (!error) {
         const delegatedApiError = classifyDelegateOutputError(output)
@@ -12865,6 +12871,7 @@ export class Gateway {
             })
           }
         }
+        submitSettled = settlement.settled
         if (settlement.error !== undefined && settlement.error !== err) {
           this.log.warn('delegate submit settled after timeout with error', {
             targetAgentId,
@@ -12872,6 +12879,9 @@ export class Gateway {
             error: (settlement.error as Error)?.message ?? String(settlement.error),
           })
         }
+      } else {
+        // submit() rejected: the engine has a terminal outcome even if it is an error.
+        submitSettled = true
       }
       if (streamProgress) {
         emitProgress(
@@ -12901,8 +12911,19 @@ export class Gateway {
               err: String(err),
             })
           }
-        } else {
+        } else if (submitSettled) {
+          // Engine reached a terminal state with no usage: close the journal.
+          // Timeout/unsettled must NOT abandon — aborted journals are not
+          // reopened by the durable reconciler, and a late codex_billing
+          // frame would leak. Leave inflight for tape settle / 24h waiver.
           await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
+        } else {
+          this.log.warn('delegate_engine_billing_kept_inflight', {
+            targetAgentId,
+            sessionKey,
+            requestId: engineBillingAdmission.requestId,
+            timedOut,
+          })
         }
       }
       // F4:委派子会话 bg bash 的后终态 tail 经 per-session 串行链**异步**持久化,其入
@@ -12925,7 +12946,7 @@ export class Gateway {
       if (session._durableDelegateRuntimeEvents === durableRuntimeEvents) {
         session._durableDelegateRuntimeEvents = undefined
       }
-      if (session._durableDelegateEngineBillings === durableEngineBillings) {
+      if (submitSettled && session._durableDelegateEngineBillings === durableEngineBillings) {
         session._durableDelegateEngineBillings = undefined
       }
       if (session._durableDelegateGoalUsageRecords === durableGoalUsageRecords) {
@@ -12983,7 +13004,9 @@ export class Gateway {
       ...(resultSummary.length > 0 ? { resultSummary } : {}),
       ...(durableTranscript.length > 0 ? { transcript: durableTranscript } : {}),
       ...(durableRuntimeEvents.length > 0 ? { runtimeEvents: durableRuntimeEvents } : {}),
-      ...(durableEngineBillings.length > 0 ? { engineBillings: durableEngineBillings } : {}),
+      ...((durableEngineBillings.length > 0 || (engineBillingAdmission && !submitSettled))
+        ? { engineBillings: durableEngineBillings }
+        : {}),
       ...(goalUsageRecords.length > 0 ? { goalUsageRecords } : {}),
       completedAt: Date.now(),
       // P2 债C — 审查员委派行带上裁决,前端渲染「质量审查员 · PASS/未通过」。

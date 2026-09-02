@@ -62,6 +62,7 @@ function makeGateway(opts?: {
   billing?: DelegateEngineBillingClient
   emitBilling?: boolean
   submitError?: Error
+  hangSubmit?: boolean
 }): any {
   const billing = opts?.billing ?? makeBillingClient()
   const agent = { id: 'main', provider: 'anthropic', model: 'glm-5.2' }
@@ -74,6 +75,7 @@ function makeGateway(opts?: {
   gw._activeDelegationsByParent = new Map()
   gw._hiddenDelegateGuard = new PerTurnDelegationGuard()
   gw._delegateEngineBilling = billing
+  gw._bufferedGroup = undefined
   gw.log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
   gw.rateLimiter = { check: () => true }
   gw.router = { route: () => ({ sessionKey: PARENT_KEY, agent }) }
@@ -109,12 +111,25 @@ function makeGateway(opts?: {
       sessionKey: PARENT_KEY,
       channel: 'webchat',
       peerId: 'wsess-engine-billing',
+      agentId: 'main',
+      userId: '1',
     }),
-    getOrCreate: async () => ({
-      agentId: 'auditor',
-      currentTurnStatus: null,
-      runner: { interrupt: () => {}, sendPermissionResponse: () => {}, off: () => {}, on: () => {} },
-    }),
+    getOrCreate: async () => {
+      const session = {
+        agentId: 'auditor',
+        currentTurnStatus: null,
+        runner: {
+          interrupt: () => {},
+          shutdown: () => {},
+          waitForOutputDrain: async () => {},
+          sendPermissionResponse: () => {},
+          off: () => {},
+          on: () => {},
+        },
+      }
+      gw._session = session
+      return session
+    },
     submit: async (
       _session: unknown,
       _payload: string,
@@ -124,7 +139,12 @@ function makeGateway(opts?: {
       requestId?: string,
     ) => {
       gw._lastSubmitRequestId = requestId
+      gw._submitOnEvent = onEvent
       if (opts?.submitError) throw opts.submitError
+      if (opts?.hangSubmit) {
+        await new Promise(() => {})
+        return
+      }
       if (opts?.emitBilling) {
         onEvent({
           kind: 'codex_billing',
@@ -140,7 +160,10 @@ function makeGateway(opts?: {
       onEvent({ kind: 'block', block: { kind: 'text', text: '子任务完成' } })
       onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
     },
-    bufferPendingAgentGroup: () => true,
+    bufferPendingAgentGroup: (_key: string, group: unknown) => {
+      gw._bufferedGroup = group
+      return true
+    },
   }
   gw.deliver = () => {}
   return gw
@@ -228,5 +251,53 @@ describe('handleDelegateTask engine-reported billing', () => {
     assert.equal(billing.admits.length, 1)
     assert.equal(billing.settles.length, 0)
     assert.deepEqual(billing.abandons, [REQUEST_ID])
+  })
+
+  it('(d) 超时未决不 abandon，迟到 billing 仍进入 tape collector', async () => {
+    const orig = {
+      drain: process.env.OPENCLAUDE_DELEGATE_INTERRUPT_DRAIN_MS,
+      shutdown: process.env.OPENCLAUDE_DELEGATE_SHUTDOWN_WAIT_MS,
+      output: process.env.OPENCLAUDE_DELEGATE_OUTPUT_DRAIN_WAIT_MS,
+      settle: process.env.OPENCLAUDE_DELEGATE_SUBMIT_SETTLE_MS,
+    }
+    process.env.OPENCLAUDE_DELEGATE_INTERRUPT_DRAIN_MS = '0'
+    process.env.OPENCLAUDE_DELEGATE_SHUTDOWN_WAIT_MS = '0'
+    process.env.OPENCLAUDE_DELEGATE_OUTPUT_DRAIN_WAIT_MS = '0'
+    process.env.OPENCLAUDE_DELEGATE_SUBMIT_SETTLE_MS = '0'
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing, hangSubmit: true })
+    gw._delegateTimeoutConfig = { idleTimeoutMs: 20, checkIntervalMs: 5 }
+    try {
+      const r = await delegate(gw, 'auditor', memberBody({ model: 'gpt-5.6-sol' }))
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(r.body.ok, false)
+      assert.equal(billing.admits.length, 1)
+      assert.equal(billing.abandons.length, 0, 'timeout must leave journal inflight')
+      assert.equal(billing.settles.length, 0)
+      const collector = gw._session?._durableDelegateEngineBillings
+      assert.ok(Array.isArray(collector), 'billing collector stays attached')
+      const late = {
+        requestId: REQUEST_ID,
+        engineSessionId: `oceng-${'b'.repeat(48)}`,
+        status: 'success' as const,
+        durationMs: 9,
+        usage: { input_tokens: 4, output_tokens: 2 },
+        delegateAgentId: 'auditor',
+      }
+      collector.push(late)
+      assert.equal(gw._bufferedGroup?.engineBillings, collector)
+      assert.equal(gw._bufferedGroup.engineBillings.length, 1)
+      assert.equal(gw._bufferedGroup.engineBillings[0].requestId, REQUEST_ID)
+    } finally {
+      for (const [key, value] of Object.entries({
+        OPENCLAUDE_DELEGATE_INTERRUPT_DRAIN_MS: orig.drain,
+        OPENCLAUDE_DELEGATE_SHUTDOWN_WAIT_MS: orig.shutdown,
+        OPENCLAUDE_DELEGATE_OUTPUT_DRAIN_WAIT_MS: orig.output,
+        OPENCLAUDE_DELEGATE_SUBMIT_SETTLE_MS: orig.settle,
+      })) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
   })
 })

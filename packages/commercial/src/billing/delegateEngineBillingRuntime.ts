@@ -75,6 +75,49 @@ function sourceForEngine(engine: 'codex' | 'grok'): 'delegate_codex' | 'delegate
   return engine === 'grok' ? 'delegate_grok' : 'delegate_codex'
 }
 
+function journalString(
+  ctx: Record<string, unknown> | null | undefined,
+  key: string,
+  re: RegExp,
+): string | undefined {
+  const value = ctx?.[key]
+  if (typeof value === 'string' && re.test(value)) return value
+  return undefined
+}
+
+/**
+ * Journal ctx is the master-owned attribution authority for delegate
+ * engine-reported settles. Frame fields fill only gaps; a mismatch keeps
+ * the journal value so codexFinalizer writes mode=delegate.
+ */
+export function resolveDelegateBillingAttribution(
+  journalCtx: Record<string, unknown> | null | undefined,
+  frame: {
+    delegateAgentId?: unknown
+    parentSessionId?: unknown
+    parentTurnKey?: unknown
+  },
+): {
+  delegateAgentId?: string
+  parentSessionId?: string
+  parentTurnKey?: string
+} {
+  const fromFrame = (value: unknown, re: RegExp): string | undefined =>
+    typeof value === 'string' && re.test(value) ? value : undefined
+  const pick = (
+    key: 'delegateAgentId' | 'parentSessionId' | 'parentTurnKey',
+    re: RegExp,
+  ): string | undefined => journalString(journalCtx, key, re) ?? fromFrame(frame[key], re)
+  const delegateAgentId = pick('delegateAgentId', AGENT_ID_RE)
+  const parentSessionId = pick('parentSessionId', /^.{1,128}$/)
+  const parentTurnKey = pick('parentTurnKey', PARENT_TURN_KEY_RE)
+  return {
+    ...(delegateAgentId ? { delegateAgentId } : {}),
+    ...(parentSessionId ? { parentSessionId } : {}),
+    ...(parentTurnKey ? { parentTurnKey } : {}),
+  }
+}
+
 function usageFromBody(body: Record<string, unknown>): DurableCodexBilling['usage'] {
   const usage =
     body.usage && typeof body.usage === 'object' && !Array.isArray(body.usage)
@@ -212,13 +255,7 @@ export function createDelegateEngineBillingRuntime(
               ? { terminalCode: body.terminalCode }
               : {}),
             ...(typeof body.turnKey === 'string' ? { turnKey: body.turnKey } : {}),
-            ...(typeof body.parentTurnKey === 'string' ? { parentTurnKey: body.parentTurnKey } : {}),
-            ...(typeof body.parentSessionId === 'string'
-              ? { parentSessionId: body.parentSessionId }
-              : {}),
-            ...(typeof body.delegateAgentId === 'string'
-              ? { delegateAgentId: body.delegateAgentId }
-              : {}),
+            ...resolveDelegateBillingAttribution(journalRow.ctx, body),
             ...(body.rateLimits !== undefined ? { rateLimits: body.rateLimits as DurableCodexBilling['rateLimits'] } : {}),
           },
         )

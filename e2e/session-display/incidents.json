@@ -2593,6 +2593,11 @@
         },
         {
           "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
+          "assertion": "(d) 超时未决不 abandon，迟到 billing 仍进入 tape collector"
+        },
+        {
+          "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateEngineBilling.test.ts",
           "assertion": "admits catalog engine codex/grok and skips ccb"
         },
@@ -2600,6 +2605,16 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/delegateEngineBillingRuntime.test.ts",
           "assertion": "admits a codex delegate with source + attribution in journal ctx"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/delegateEngineBillingRuntime.test.ts",
+          "assertion": "settles with journal-owned attribution that finalizer uses for mode=delegate"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/delegateEngineBillingRuntime.test.ts",
+          "assertion": "prefers journal attribution when the billing frame disagrees"
         }
       ],
       "coverageCommits": [
