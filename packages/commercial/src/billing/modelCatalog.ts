@@ -564,14 +564,15 @@ export class ModelCatalogSnapshot {
 
   /**
    * Shared authorization components for canUseModel / listLockedForUser.
-   * The two public methods must not drift: locked = every canUseModel
-   * condition except the subscription floor.
+   * Locked = every canUseModel condition except the subscription floor,
+   * plus the anonymous Cursor upsell exception (`lockedCursorOk`).
    */
   private evaluateUse(scope: UserModelScope, modelIdOrAlias: string): {
     canonical: string;
     pricing: ModelCatalogPricing | undefined;
     routable: boolean;
     cursorOk: boolean;
+    lockedCursorOk: boolean;
     denied: boolean;
     meetsPlan: boolean;
     visible: boolean;
@@ -582,15 +583,17 @@ export class ModelCatalogSnapshot {
     const schemaOk =
       entry !== undefined && entry.capabilitySchemaVersion <= CAPABILITY_SCHEMA_VERSION;
     const routable = entry !== undefined && schemaOk && pricing !== undefined;
+    const cursorOk = entry?.engine !== "cursor" || isCursorCredentialMember(scope.uid);
     // `isCursorCredentialMember(0, "all")` is false (uid 0 is not a valid
     // credential uid). Anonymous is a placeholder identity: after subscribe
     // they get a real uid, and policy `all` accepts every real uid. Advertise
     // locked Cursor rows to uid 0 only in that commercial config; a numeric
-    // allow-list that does not contain the uid stays excluded.
-    const cursorOk =
-      entry?.engine !== "cursor" ||
-      isCursorCredentialMember(scope.uid) ||
-      (scope.uid === 0 &&
+    // allow-list that does not contain the uid stays excluded. Execution
+    // (`canUseModel` / `listForUser`) stays on strict `cursorOk`.
+    const lockedCursorOk =
+      cursorOk ||
+      (entry?.engine === "cursor" &&
+        scope.uid === 0 &&
         parseCursorCredentialUids(process.env.OC_V5_CURSOR_CREDENTIAL_UIDS) === "all");
     const denied = scope.deniedModelIds?.has(canonical) === true;
     const meetsPlan = pricing
@@ -607,7 +610,7 @@ export class ModelCatalogSnapshot {
           (scope.role === "admin" || scope.grantedModelIds.has(canonical))) ||
         (pricing.visibility === "hidden" && scope.grantedModelIds.has(canonical))
       : false;
-    return { canonical, pricing, routable, cursorOk, denied, meetsPlan, visible };
+    return { canonical, pricing, routable, cursorOk, lockedCursorOk, denied, meetsPlan, visible };
   }
 
   /**
@@ -668,7 +671,7 @@ export class ModelCatalogSnapshot {
     const rows: LockedModelProjectionRow[] = [];
     for (const e of this.activeByModel.values()) {
       const use = this.evaluateUse(scope, e.modelId);
-      if (!use.routable || !use.cursorOk || use.denied || !use.visible || use.meetsPlan) {
+      if (!use.routable || !use.lockedCursorOk || use.denied || !use.visible || use.meetsPlan) {
         continue;
       }
       const p = use.pricing;

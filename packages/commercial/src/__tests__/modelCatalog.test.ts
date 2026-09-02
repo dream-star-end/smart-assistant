@@ -563,6 +563,41 @@ describe("per-uid 投影", () => {
     }
   });
 
+  test("policy all + uid 0: canUseModel/listForUser stay strict; listLockedForUser still upsells", () => {
+    const previous = process.env.OC_V5_CURSOR_CREDENTIAL_UIDS;
+    process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = "all";
+    try {
+      const cursor = snap({
+        entries: [GLM, CURSOR],
+        pricing: [
+          price("glm-5.2"),
+          price("cursor-opus-5-high", {
+            visibility: "public",
+            minPlanCode: "lite",
+            minPlanTier: 1,
+            minPlanName: "Lite",
+          }),
+        ],
+      });
+      const anonPaid = {
+        uid: 0,
+        role: "user" as const,
+        grantedModelIds: new Set<string>(),
+        userPlanTier: 1,
+      };
+      const anon = { ...anonPaid, userPlanTier: null };
+      assert.equal(cursor.canUseModel(anonPaid, "cursor-opus-5-high"), false);
+      assert.ok(!cursor.listForUser(anonPaid).some((row) => row.modelId === "cursor-opus-5-high"));
+      assert.deepEqual(
+        cursor.listLockedForUser(anon).map((row) => row.modelId),
+        ["cursor-opus-5-high"],
+      );
+    } finally {
+      if (previous === undefined) process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = undefined;
+      else process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = previous;
+    }
+  });
+
   test("projectionRevision 是 per-uid 的:同内容不同 uid → 不同 hash", () => {
     const a = s.projectionRevisionFor({ uid: 1, role: "user", grantedModelIds: new Set() });
     const b = s.projectionRevisionFor({ uid: 2, role: "user", grantedModelIds: new Set() });
