@@ -2514,6 +2514,55 @@
         "5885ecfe",
         "f5b267e9"
       ]
+    },
+    {
+      "id": "INC-20260902-WEB-TASKBOARD-TIMELINE-HUD",
+      "occurredAt": "2026-09-02",
+      "severity": "P1",
+      "symptom": "任务面板切换项目固定报「此页面加载出错」；打开部分会话报「会话内容渲染失败」；刷新后对话输入框上方的任务列表 HUD 消失。",
+      "rootFixCommit": "51674b8c",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/taskboard/taskboard.test.tsx",
+          "assertion": "在两个 work 项目与 all/none 之间来回切换 ≥5 次不崩"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/taskboard/taskboard.test.tsx",
+          "assertion": "collectInboxTickets 容忍 columns.tickets 缺失"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/ocv5-70TimelineRender.test.tsx",
+          "assertion": "真实会话精简 fixture 不打穿 SessionTimelineBoundary"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/ocv5-70TimelineRender.test.tsx",
+          "assertion": "单条畸形 agent-group 只落到 MessageBoundary，邻居仍在"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/render.test.ts",
+          "assertion": "childSignature: steps 非数组或含 null 不抛"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/PinnedTaskTracker.test.tsx",
+          "assertion": "刷新后当前轮仍有未完成任务 → HUD 钉住(不依赖 sending)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/PinnedTaskTracker.test.tsx",
+          "assertion": "hydration 形态 TodoWrite(inputJson.todos) 在当前轮未完成时仍可提取"
+        }
+      ],
+      "coverageCommits": [
+        "51674b8c",
+        "226edfac",
+        "d18bd587"
+      ]
     }
   ]
 }
