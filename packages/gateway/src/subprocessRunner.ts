@@ -26,7 +26,8 @@ import {
 } from './processGroupShutdown.js'
 import { decideEngineCwd } from './engineCwd.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
-import { buildPromptContext, PLATFORM_MCP_TOOL_NAMES } from './promptSlots.js'
+import { projectCcbMcpAvailability } from './ccbMcpAvailability.js'
+import { buildPromptContext } from './promptSlots.js'
 import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -1970,10 +1971,26 @@ export class SubprocessRunner extends EventEmitter {
     // Built-in openclaude-memory is registered later into mcp-config.json, not
     // via config.mcpServers. Resolve the launch once here so the prompt
     // advertises its tools, then reuse the same result when writing mcp-config.
-    const mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
-      fallback: 'npx-tsx',
+    // Fail-soft: resolveMcpMemoryLaunch calls process.cwd() and can throw
+    // ENOENT: uv_cwd when the working directory has been deleted.
+    let mcpLaunch: ReturnType<typeof resolveMcpMemoryLaunch> = null
+    try {
+      mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
+        fallback: 'npx-tsx',
+      })
+    } catch (err) {
+      runnerLog.warn(
+        'failed to resolve built-in mcp-memory launch',
+        { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
+        err,
+      )
+    }
+    const projectedMcpTools = projectCcbMcpAvailability({
+      configuredTools: [...availableMcpTools],
+      mcpLaunch,
+      skillEvalMode: this.opts.skillEvalMode,
+      skillTrainRunId: this.opts.skillTrainRunId,
     })
-    if (mcpLaunch) addAvailableTools(PLATFORM_MCP_TOOL_NAMES)
 
     // (Marketplace skills/agents are reconciled deterministically in
     //  dispatchInbound BEFORE agent resolution — earlier in the same turn than
@@ -1989,7 +2006,7 @@ export class SubprocessRunner extends EventEmitter {
         provider: effectiveProvider,
         model: this.opts.model,
         modelSupportsVision: this.currentExecutionDescriptor?.supportsVision,
-        availableMcpTools: [...availableMcpTools],
+        availableMcpTools: projectedMcpTools,
         // 把当前 effort 传进 slot builder 决定是否注入"科研模式守则"。
         // effort 切换本就会 recycle subprocess,新 runner 启动时会重建 extra-prompt.md。
         effortLevel: this.opts.effortLevel,

@@ -20,6 +20,14 @@ process.env.OPENCLAUDE_HOME = testHome;
 
 const promptSlots = await import("../packages/gateway/src/promptSlots.js");
 const { buildPromptContext, PLATFORM_MCP_TOOL_NAMES, sanitizeUnavailableMcpClaims } = promptSlots;
+const { projectCcbMcpAvailability } = await import("../packages/gateway/src/ccbMcpAvailability.js");
+
+// promptSlots pulls mcpVisionServer → mcpStdioGuard, which keeps the process
+// alive on uncaughtException. This gate must still fail-closed.
+process.on("uncaughtException", (err) => {
+  console.error(err);
+  process.exit(1);
+});
 
 const REQUIRED_PLATFORM_TOOLS = [
   "delegate_task",
@@ -46,13 +54,82 @@ for (const name of PLATFORM_MCP_TOOL_NAMES) {
   );
 }
 
+const UNREGISTERED = "（当前未注册）";
+const LAUNCH = { command: "node", args: ["mcp"] };
+const configured = ["browser", "search"];
+assert.deepEqual(
+  projectCcbMcpAvailability({ configuredTools: configured, mcpLaunch: null }),
+  configured,
+);
+assert.equal(
+  projectCcbMcpAvailability({
+    configuredTools: configured,
+    mcpLaunch: null,
+  }).includes("delegate_task"),
+  false,
+);
+
+const withLaunch = projectCcbMcpAvailability({
+  configuredTools: [],
+  mcpLaunch: LAUNCH,
+});
+for (const name of PLATFORM_MCP_TOOL_NAMES) {
+  assert.ok(withLaunch.includes(name), `launch advertised set missing ${name}`);
+}
+
+const evalNames = projectCcbMcpAvailability({
+  configuredTools: [],
+  mcpLaunch: LAUNCH,
+  skillEvalMode: true,
+});
+for (const name of ["delegate_task", "skill_save", "task_create"]) {
+  assert.equal(evalNames.includes(name), false, `skill-eval must hide ${name}`);
+}
+for (const name of ["skill_search", "skill_view", "skill_list", "list_reminders"]) {
+  assert.ok(evalNames.includes(name), `skill-eval must keep ${name}`);
+}
+
+const trainNames = projectCcbMcpAvailability({
+  configuredTools: [],
+  mcpLaunch: LAUNCH,
+  skillTrainRunId: "run-1",
+});
+assert.equal(trainNames.includes("skill_save"), false, "skill-train must hide skill_save");
+assert.equal(trainNames.includes("skill_delete"), false, "skill-train must hide skill_delete");
+assert.ok(trainNames.includes("delegate_task"), "skill-train must keep delegate_task");
+assert.equal(trainNames.includes("skill_propose"), false, "skill_propose must not be advertised");
+
+const sample = "走 MCP delegate_task/delegate_tasks";
+const redacted = sanitizeUnavailableMcpClaims(
+  sample,
+  projectCcbMcpAvailability({ configuredTools: [], mcpLaunch: null }),
+);
+assert.ok(
+  redacted.includes(UNREGISTERED),
+  "sanitizer must redact delegate_task when launch is null",
+);
+assert.equal(redacted.includes("delegate_task"), false);
+assert.equal(
+  sanitizeUnavailableMcpClaims(
+    sample,
+    projectCcbMcpAvailability({ configuredTools: [], mcpLaunch: LAUNCH }),
+  ),
+  sample,
+  "sanitizer must keep delegate_task when launch is present",
+);
+
 const subprocess = readFileSync(join(root, "packages/gateway/src/subprocessRunner.ts"), "utf8");
 const promptIdx = subprocess.indexOf("buildPromptContext(");
 assert.ok(promptIdx >= 0, "subprocessRunner.ts: buildPromptContext( call site not found");
 const before = subprocess.slice(0, promptIdx);
 assert.ok(
-  before.includes("addAvailableTools(PLATFORM_MCP_TOOL_NAMES)"),
-  "addAvailableTools(PLATFORM_MCP_TOOL_NAMES) must appear before buildPromptContext(",
+  before.includes("projectCcbMcpAvailability("),
+  "projectCcbMcpAvailability( must appear before buildPromptContext(",
+);
+assert.equal(
+  subprocess.includes("if (mcpLaunch) addAvailableTools("),
+  false,
+  "if (mcpLaunch) addAvailableTools( must not exist",
 );
 assert.ok(
   before.includes("resolveMcpMemoryLaunch("),
@@ -63,6 +140,12 @@ assert.equal(
   launchCalls.length,
   1,
   `resolveMcpMemoryLaunch( must be called once and reused (got ${launchCalls.length})`,
+);
+const launchIdx = before.indexOf("resolveMcpMemoryLaunch(");
+assert.ok(launchIdx >= 0, "resolveMcpMemoryLaunch( call site not found");
+assert.ok(
+  subprocess.slice(Math.max(0, launchIdx - 200), launchIdx).includes("try {"),
+  "resolveMcpMemoryLaunch( must be wrapped in try { within 200 chars",
 );
 
 const codexOverrides = readFileSync(
@@ -79,7 +162,6 @@ assert.doesNotMatch(
   "codexLaunchOverrides.ts must not keep a hardcoded 'task_approve', list",
 );
 
-const UNREGISTERED = "（当前未注册）";
 const result = await buildPromptContext({
   agentId: "main",
   provider: "anthropic",
@@ -93,7 +175,6 @@ assert.equal(
 
 // Prove the sanitizer is still armed (empty list redacts) and that the fix is
 // purely "supply the right list" (full list leaves the rule text intact).
-const sample = "走 MCP delegate_task/delegate_tasks";
 assert.ok(
   sanitizeUnavailableMcpClaims(sample, []).includes(UNREGISTERED),
   "sanitizer must still redact when the advertised set is empty",
