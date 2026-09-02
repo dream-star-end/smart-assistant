@@ -64,14 +64,19 @@ describe("billingFrameFromTape", () => {
     assert.equal(crashed.turnKey, undefined);
   });
 
-  test("refuses a tape whose traceId is not the billing requestId, or with no usage", () => {
-    assert.equal(
-      billingFrameFromTape({
-        request_id: REQ, session_id: null, tape_turn_key: TURN_KEY, tape_status: "completed",
-        tape_usage: { ...tapeUsage, traceId: "0".repeat(32) }, tape_created_at: "1", tape_finalized_at: "2",
-      }),
-      null,
-    );
+  test("tape traceId is the client trace chip, not the billing requestId: never a refusal", () => {
+    // Live data: every tape's usage.traceId differs from the dispatch's
+    // billing_request_id. The dispatch join is authoritative.
+    const frame = billingFrameFromTape({
+      request_id: REQ, session_id: null, tape_turn_key: TURN_KEY, tape_status: "completed",
+      tape_usage: { ...tapeUsage, traceId: "0".repeat(32) }, tape_created_at: "1", tape_finalized_at: "2",
+    });
+    assert.ok(frame);
+    assert.equal(frame.requestId, REQ);
+    assert.equal(frame.usage?.output_tokens, 10524);
+  });
+
+  test("refuses a tape with no usage", () => {
     assert.equal(
       billingFrameFromTape({
         request_id: REQ, session_id: null, tape_turn_key: TURN_KEY, tape_status: "completed",

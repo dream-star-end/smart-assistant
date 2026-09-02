@@ -13,8 +13,9 @@
  * Each tick joins pending audits -> turn_dispatches (billing_request_id) ->
  * client_session_turn_tapes (dispatch_id, finalized). The tape `usage` column
  * is the same engine-reported final usage the live frame would have carried
- * (traceId == requestId), so a DurableCodexBilling frame is rebuilt from it and
- * handed to settleDurableCursorBilling. Rows created before the operator
+ * (its traceId is the client-visible trace chip, not the billing requestId; the
+ * dispatch join is the authoritative link), so a DurableCodexBilling frame is
+ * rebuilt from it and handed to settleDurableCursorBilling. Rows created before the operator
  * cutoff are settled with costCredits forced to 0 (record, never debit).
  *
  * Rows whose dispatch is still open are skipped (turn in flight). Rows with a
@@ -97,10 +98,11 @@ export function billingFrameFromTape(row: {
 }): DurableCodexBilling | null {
   const usage = row.tape_usage;
   if (!usage || typeof usage !== "object") return null;
-  const traceId = typeof usage.traceId === "string" ? usage.traceId : null;
-  // The tape usage.traceId is the server-authored billing requestId. A
-  // mismatch means the dispatch/tape join is not the paid turn; refuse.
-  if (traceId !== null && traceId !== row.request_id) return null;
+  // NOTE: tape usage.traceId is the client-visible trace id (the `#xxxx`
+  // footer chip), NOT the server-authored billing requestId, so it must not
+  // be compared against audit.request_id. The authoritative link is the join
+  // the caller already made: audit.request_id = turn_dispatches.
+  // billing_request_id (UNIQUE) -> client_session_turn_tapes.dispatch_id.
   const interrupted = row.tape_status === "interrupted";
   const crashed = row.tape_status === "crashed";
   const createdAt = Number(row.tape_created_at ?? 0);
