@@ -2867,7 +2867,7 @@ version_commit="$(jq -er '.commit | select(type == "string")' "$version")" || ex
 if [[ "$kind" == strong ]]; then
   row="$(jq -er --argjson schema "$schema" '
     if (((["artifactSha256","builtAt","metadataSha256","schemaVersion","sourceCommit"] - keys) | length) == 0
-      and ((keys - ["artifactSha256","builtAt","distReuse","flavorGuardGeneration","metadataSha256","schemaVersion","sourceCommit"]) | length) == 0)
+      and ((keys - ["artifactSha256","builtAt","distReuse","flavorGuardGeneration","metadataSha256","schemaVersion","sourceCommit"]) | length) == 0
       and .schemaVersion == $schema
       and (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
       and (.builtAt | type == "string" and test("^[0-9]{8}-[0-9]{6}$"))
