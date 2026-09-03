@@ -693,6 +693,61 @@ describe('Aurora v5 — P3 对话前置（模型选择器 + 订阅/容器门）'
     expect(screen.getByRole('button', { name: /去充值/ })).toBeInTheDocument()
     expect(screen.getByPlaceholderText('和「全能助手」对话…')).toBeDisabled()
   })
+
+  test('locked model row → 说明对话框先弹出;暂不 → 不开设置;前往订阅 → 打开设置中心', async () => {
+    const LOCKED_MODELS = {
+      ...MODELS,
+      locked_models: [
+        {
+          id: 'cursor-opus-5-high',
+          display_name: 'Opus 5 High',
+          min_plan_code: 'lite',
+          min_plan_name: 'Lite',
+        },
+      ],
+    }
+    fetchMock = routedFetch({ models: LOCKED_MODELS })
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+    await waitFor(() => expect(screen.getAllByText('GPT-5.6-Sol').length).toBeGreaterThan(0))
+
+    const openLocked = async () => {
+      const trigger = screen.getAllByRole('button', { name: '选择对话模型' })[0]
+      fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerType: 'mouse' })
+      await screen.findAllByRole('menuitem')
+      const locked = document.querySelector('[data-locked="true"]')
+      expect(locked).toBeTruthy()
+      await act(async () => {
+        if (locked) fireEvent.click(locked)
+      })
+      return screen.findByTestId('locked-model-unlock-notice')
+    }
+
+    // 1) 先弹说明,而不是直接跳订阅。
+    const notice = await openLocked()
+    expect(notice.textContent).toContain('任意订阅套餐')
+    expect(notice.textContent).toContain('即可解锁')
+    // cursor 家族锁定行上抛的是家族名(Opus 5),标题据此生成。
+    expect(screen.getByText('「Opus 5」为订阅专享模型')).toBeTruthy()
+    expect(screen.queryByLabelText('设置分区')).toBeNull()
+
+    // 2) 暂不 → 对话框关、设置中心不开。
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '暂不' }))
+    })
+    await waitFor(() => expect(screen.queryByTestId('locked-model-unlock-notice')).toBeNull())
+    expect(screen.queryByLabelText('设置分区')).toBeNull()
+
+    // 3) 前往订阅 → 设置中心打开。
+    await openLocked()
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '前往订阅' }))
+    })
+    await waitFor(() => expect(screen.queryByTestId('locked-model-unlock-notice')).toBeNull())
+    await screen.findByLabelText('设置分区')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -772,6 +827,84 @@ describe('Aurora v5 — P6 历史会话加载', () => {
     )
     // 合并进 WS service 后渲染历史正文。
     await waitFor(() => expect(screen.getByText('历史答复正文')).toBeInTheDocument())
+  })
+
+  test('已有会话(非 Opus/Fable)切 Opus → 弹「仅新会话可用」说明;留在当前会话不切;新建会话以 Opus 起手', async () => {
+    const MODELS_WITH_OPUS = {
+      models: [
+        ...MODELS.models,
+        { id: 'cursor-opus-5-high', display_name: 'Opus 5 High' },
+      ],
+    }
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/auth/login')) return LOGIN_OK
+      if (u.includes('/api/public/config')) return okJson({ turnstile_bypass: true })
+      if (u.includes('/api/public/models')) return okJson(MODELS_WITH_OPUS)
+      if (u.includes('/api/sessions/list')) return okJson(HIST_META)
+      if (/\/api\/sessions\/webhist01/.test(u)) return okJson(HIST_DETAIL)
+      if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+      if (u.includes('/api/me/preferences')) return okJson({ prefs: {} })
+      if (u.includes('/api/me'))
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+    await waitFor(() => expect(screen.getByText('历史会话甲')).toBeInTheDocument())
+    await act(async () => {
+      fireEvent.click(screen.getByText('历史会话甲'))
+    })
+    await waitFor(() => expect(screen.getByText('历史答复正文')).toBeInTheDocument())
+    // 会话模型 = 默认首项 GPT-5.6-Sol(非 Opus/Fable)。
+    await waitFor(() => expect(screen.getAllByText('GPT-5.6-Sol').length).toBeGreaterThan(0))
+
+    const pickOpus = async () => {
+      const trigger = screen.getAllByRole('button', { name: '选择对话模型' })[0]
+      fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerType: 'mouse' })
+      await screen.findAllByRole('menuitem')
+      const row = document.querySelector('[data-model-id="cursor-opus-5-high"]:not([data-locked])')
+      expect(row).toBeTruthy()
+      await act(async () => {
+        if (row) fireEvent.click(row)
+      })
+      return screen.findByTestId('fresh-session-switch-notice')
+    }
+
+    // 1) 弹说明,不切换;不出现压缩确认。
+    const notice = await pickOpus()
+    expect(screen.getByText('「Opus 5」仅支持在新会话中使用')).toBeTruthy()
+    expect(notice.textContent).toContain('无法命中提示缓存')
+    expect(screen.queryByText('切换模型？')).toBeNull()
+    expect(fetchMock.mock.calls.some(([u, init]) =>
+      /\/api\/sessions\/webhist01/.test(String(u)) && (init as RequestInit | undefined)?.method === 'PATCH',
+    )).toBe(false)
+
+    // 2) 留在当前会话 → 对话框关、仍在历史会话、模型不变。
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '留在当前会话' }))
+    })
+    await waitFor(() => expect(screen.queryByTestId('fresh-session-switch-notice')).toBeNull())
+    expect(screen.getByText('历史答复正文')).toBeInTheDocument()
+    expect(screen.getAllByText('GPT-5.6-Sol').length).toBeGreaterThan(0)
+
+    // 3) 新建会话 → 离开历史会话(空白草稿),选择器以 Opus 5 起手。
+    const notice2 = await pickOpus()
+    const dialog = notice2.closest('[role="dialog"]') as HTMLElement
+    const goNew = Array.from(dialog.querySelectorAll('button')).find((b) => b.textContent?.trim() === '新建会话')
+    expect(goNew).toBeTruthy()
+    await act(async () => {
+      if (goNew) fireEvent.click(goNew)
+    })
+    await waitFor(() => expect(screen.queryByTestId('fresh-session-switch-notice')).toBeNull())
+    await waitFor(() => expect(screen.queryByText('历史答复正文')).toBeNull())
+    await waitFor(() => {
+      const trigger = screen.getAllByRole('button', { name: '选择对话模型' })[0]
+      expect(trigger.textContent ?? '').toMatch(/Opus/)
+    })
   })
 })
 

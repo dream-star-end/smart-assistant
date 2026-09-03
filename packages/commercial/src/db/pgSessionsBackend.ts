@@ -12426,3 +12426,20 @@ async function sweepOnce(
     tapePartsPurged: delParts.rowCount ?? 0,
   };
 }
+
+/**
+ * cron origin-session inject 用的单行索引读:只取 model_id,不 hydrate 会话。
+ * client_sessions 属 master 六张权威表,直读 SQL 只允许落在本 backend
+ * (sixTablesSqlArchitecture 门);userChatBridge.lookupCronOriginSessionModel 委托到这里。
+ */
+export async function readClientSessionModelId(
+  pool: Pick<Pool, "query">,
+  sessionId: string,
+  sessionUserId: string,
+): Promise<string | null> {
+  const res = await pool.query<{ model_id: string | null }>(
+    "SELECT model_id FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+    [sessionId, sessionUserId],
+  );
+  return res.rows[0]?.model_id ?? null;
+}

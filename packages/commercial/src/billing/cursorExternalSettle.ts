@@ -108,7 +108,7 @@ export async function settleCursorExternalUsage(args: {
   /** Eligible cursor pool row actually used this turn; null if unknown. */
   accountId?: bigint | null;
   /** Exact logical-turn locators (durable tape path). When present the cost
-   * is staged into pending_usage_patches inside the same transaction so the
+   * is staged into the pending usage patch table inside the same transaction so the
    * tape finalize / appendCostCredits fold it into turn_tape_cost_components. */
   turnKey?: string | null;
   parentTurnKey?: string | null;

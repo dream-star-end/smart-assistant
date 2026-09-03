@@ -32,6 +32,10 @@ import "../engine/codexAdapter.js";
 import { cursorResumeStoreDir, cursorResumeStoreExists, cursorResumeStorePath, _internals } from "../engine/cursorAdapter.js";
 import type { AgentDef, OpenClaudeConfig } from "@openclaude/storage";
 
+import { installFakeCursorWrapper } from "./helpers/fakeCursorWrapper.js";
+
+installFakeCursorWrapper();
+
 function makeConfigStub(): OpenClaudeConfig {
   return {
     version: 1,
