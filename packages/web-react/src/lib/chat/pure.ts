@@ -572,7 +572,7 @@ export function nonAuthPolicyCloseInfo(code: number, reason: unknown): NonAuthPo
     return { status: "连接数超限", toast: "连接数已达上限，请关闭其他标签页或设备后再试。" };
   }
   if (code === 4506 || r === "insufficient_credits") {
-    return { status: "余额不足", toast: "余额不足，请充值后继续。", billing: true };
+    return { status: "积分已耗尽", toast: "积分已耗尽，请充值。", billing: true };
   }
   if (code === 4507 || r === "unauthorized_model") {
     return { status: "模型未开通", toast: "当前账号尚未开通该模型，请切换模型或联系管理员。" };
@@ -705,7 +705,7 @@ export function isBridgeAuthControlError(code: unknown): boolean {
  */
 export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   // ── 计费/配额 ──
-  insufficient_credits: "余额不足，充值后即可继续使用。",
+  insufficient_credits: "积分已耗尽，请充值。",
   rate_limited: "请求暂时较多，请稍后直接重试本条消息。",
   // ── 上游模型服务 ──
   model_capacity: "当前模型访问量较大，请稍后重试，或在上方切换到其他模型立即继续。",

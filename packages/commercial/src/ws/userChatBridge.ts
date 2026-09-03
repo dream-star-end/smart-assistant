@@ -63,6 +63,7 @@ import {
   releasePreCheck,
   estimateMaxCost,
   InsufficientCreditsError,
+  readTotalSpendableBalance,
 } from "../billing/preCheck.js";
 import type { PricingCache, ModelPricing } from "../billing/pricing.js";
 import { projectContextWindowForRole } from "../billing/modelRolePolicy.js";
@@ -5726,6 +5727,32 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
             }
             const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
+            let cursorSpendable: bigint;
+            try {
+              cursorSpendable = await readTotalSpendableBalance(uid);
+            } catch (err) {
+              logCapture?.error('user-chat-bridge: cursor spendable lookup failed', { err });
+              rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
+              failDispatchPreForward(dispatchRecord, 'cursor_spendable_unavailable');
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor billing is temporarily unavailable', cursorTurnIdentity);
+              }
+              return;
+            }
+            if (cursorSpendable <= 0n) {
+              rejectPromptQueueDispatch('ERR_INSUFFICIENT_CREDITS');
+              failDispatchPreForward(dispatchRecord, 'insufficient_credits');
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  'ERR_INSUFFICIENT_CREDITS',
+                  `insufficient credits: balance=${cursorSpendable} required=1`,
+                  cursorTurnIdentity,
+                );
+                try { userWs.close(CLOSE_BRIDGE.BILLING_POLICY, 'insufficient_credits'); } catch { /* */ }
+              }
+              return;
+            }
             await deps.pgPool.query(
               `INSERT INTO cursor_external_usage_audit(request_id,user_id,container_id,session_id,model_id,status)
                VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT (request_id) DO NOTHING`,
@@ -5744,7 +5771,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (sealed === null) { failDispatchPreForward(dispatchRecord, 'cursor_authority_seal_rejected'); return; }
               authorityFields = sealed;
             }
-            const forwarded = { ...enriched, requestId, traceId: traceCapture, ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
+            const forwarded = { ...enriched, requestId, traceId: traceCapture, _creditBudget: cursorSpendable.toString(), ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
             const encoded = JSON.stringify(forwarded); const len = Buffer.byteLength(encoded);
             if (len > maxFrameBytes) { failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG'); rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG'); return; }
             await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len);
@@ -6676,6 +6703,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ...enrichedParsed,
                 requestId,
                 traceId: turnTraceIdCapture,
+                _creditBudget: preCheckResult.balance.toString(),
                 ...(codexRouteFrame !== null ? { __oc_codex_route: codexRouteFrame } : {}),
                 ...(grokRouteFrame !== null ? { __oc_grok_route: grokRouteFrame } : {}),
                 // 模型执行权威:签票绑定本 turn 的 server-owned requestId(billingRequestId),

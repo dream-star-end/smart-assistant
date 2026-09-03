@@ -41,6 +41,11 @@ import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { GROK_PREAMBLE, prepareGrokHome, projectGrokPlatform } from './grokPlatform.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
+import {
+  CREDIT_EXHAUSTED_DETAIL,
+  runningCostFenForUsage,
+  shouldAbortForCreditBudget,
+} from '../creditExhaustion.js'
 
 const log = createLogger({ module: 'grokAdapter' })
 
@@ -273,6 +278,7 @@ interface GrokTurnContext {
   abandoned: boolean
   resolveDrain: (() => void) | null
   interrupted: boolean
+  creditExhausted: boolean
   errorDetail: string | null
   lastUsage: ReturnType<typeof grokUsage>
   resolveSummary: (summary: TurnSummary | null) => void
@@ -370,6 +376,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       abandoned: false,
       resolveDrain: null,
       interrupted: false,
+      creditExhausted: false,
       errorDetail: null,
       lastUsage: grokUsage({}),
       resolveSummary,
@@ -742,6 +749,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         cacheReadTokens: ctx.lastUsage.cacheReadTokens,
         cacheCreationTokens: ctx.lastUsage.cacheWriteTokens,
       } })
+      void this.maybeAbortForCredits(ctx)
       return
     }
     if (type === 'error') {
@@ -872,18 +880,48 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     this.emit('billing', billing)
   }
 
+  private async maybeAbortForCredits(ctx: GrokTurnContext): Promise<void> {
+    if (ctx.creditExhausted || ctx.terminal || ctx.interrupted) return
+    const budget = ctx.params.creditBudgetFen
+    if (budget === undefined) return
+    const fen = await runningCostFenForUsage({
+      modelId: this.currentModel,
+      usage: {
+        inputTokens: ctx.lastUsage.inputTokens,
+        outputTokens: ctx.lastUsage.outputTokens,
+        cacheReadTokens: ctx.lastUsage.cacheReadTokens,
+        cacheCreationTokens: ctx.lastUsage.cacheWriteTokens,
+      },
+    })
+    if (fen === null || !shouldAbortForCreditBudget(fen, budget)) return
+    ctx.creditExhausted = true
+    ctx.errorDetail = CREDIT_EXHAUSTED_DETAIL
+    this.interrupt()
+  }
+
   private finish(ctx: GrokTurnContext, end: GrokEvent | null): void {
     if (this.active === ctx) this.stopProcessKeepalive()
     if (ctx.terminal) return
+    const creditExhausted = ctx.creditExhausted
     const upstreamStopReason = typeof end?.stopReason === 'string' ? end.stopReason : null
-    if (upstreamStopReason === 'cancelled') ctx.interrupted = true
-    if (ctx.interrupted && ctx.errorDetail === null) ctx.errorDetail = 'Grok turn cancelled'
-    const stopReason = ctx.interrupted ? 'interrupted' : upstreamStopReason
+    if (upstreamStopReason === 'cancelled' && !creditExhausted) ctx.interrupted = true
+    if (ctx.interrupted && ctx.errorDetail === null && !creditExhausted) ctx.errorDetail = 'Grok turn cancelled'
+    const stopReason = creditExhausted ? 'error' : ctx.interrupted ? 'interrupted' : upstreamStopReason
     ctx.terminal = true
     const isError = ctx.errorDetail !== null
     ctx.params.sessionTotals.turns += 1
-    this.emitBilling(ctx, isError ? 'error' : 'success')
-    if (isError) ctx.params.onEvent({ kind: 'error', error: ctx.errorDetail! })
+    // Charge the tokens already consumed; master clamp still applies. Do not
+    // mark USER_CANCELLED or the remaining work would be a free overage.
+    this.emitBilling(ctx, creditExhausted ? 'success' : isError ? 'error' : 'success')
+    if (creditExhausted) {
+      ctx.params.onEvent({
+        kind: 'error',
+        error: ctx.errorDetail || CREDIT_EXHAUSTED_DETAIL,
+        errorClass: 'insufficient_credits',
+      })
+    } else if (isError) {
+      ctx.params.onEvent({ kind: 'error', error: ctx.errorDetail! })
+    }
     ctx.params.onEvent({ kind: 'final', meta: {
       inputTokens: ctx.lastUsage.inputTokens,
       outputTokens: ctx.lastUsage.outputTokens,

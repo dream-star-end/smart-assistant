@@ -6642,6 +6642,7 @@ export type {
 export {
   preCheck,
   preCheckWithCost,
+  readTotalSpendableBalance,
   releasePreCheck,
   estimateMaxCost,
   InsufficientCreditsError as PreCheckInsufficientCreditsError,

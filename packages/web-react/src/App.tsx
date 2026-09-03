@@ -2057,7 +2057,12 @@ export function App() {
     () => ({
       onRegenerate: regenerate,
       onContinue: () => send(CONTINUE_PROMPT),
-      onTopUp: demo ? undefined : () => openSettings(),
+      onTopUp: demo
+        ? undefined
+        : () => {
+            openSettings("account");
+            setSubscribeOpenSignal((n) => n + 1);
+          },
       onStartNewSession: demo ? undefined : newSession,
       onFeedback,
       onFirstTextPaint: demo
@@ -2987,7 +2992,10 @@ export function App() {
               phase={gate.phase}
               onOpen={gate.open}
               onRetry={gate.check}
-              onTopUp={() => openSettings()}
+              onTopUp={() => {
+                openSettings("account");
+                setSubscribeOpenSignal((n) => n + 1);
+              }}
             />
           ) : loadingHistory || historySurface === "skeleton" ? (
             // 冷会话历史拉取期：消息形骨架占位，避免「空白 → 突然填满」的突变。

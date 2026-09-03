@@ -96,6 +96,7 @@ import {
   classifyDelegateOutputError,
   classifyRunError,
 } from './errorClassify.js'
+import { parseCreditBudgetFen } from './creditExhaustion.js'
 import {
   DELEGATE_CONTEXT_HEADER,
   verifyDelegateContextToken,
@@ -19271,6 +19272,11 @@ export class Gateway {
             detail: _b0.text,
             isFinal: false,
           }
+          // Balance exhaustion is not retryable. Kill the rest of the agent
+          // loop immediately instead of waiting for CCB to wind down.
+          if (_cls.code === 'insufficient_credits') {
+            try { session.runner.interrupt() } catch { /* */ }
+          }
           return
         }
 
@@ -19712,6 +19718,12 @@ export class Gateway {
         ? { collabAgentPolicy: 'team-mode-prefer-delegate' as const }
         : {}),
       ...(effectiveToolsets !== undefined ? { toolsets: effectiveToolsets } : {}),
+      // Master overwrites `_creditBudget` after spreading the client frame, so
+      // a browser-forged value cannot survive commercial admission.
+      ...(() => {
+        const budget = parseCreditBudgetFen((frame as { _creditBudget?: unknown })._creditBudget)
+        return budget !== undefined ? { creditBudgetFen: budget } : {}
+      })(),
       ...(promptQueueLifecycle ? { queueLifecycle: promptQueueLifecycle } : {}),
       ...(promptQueueExecutionFence ? { queueExecutionFence: promptQueueExecutionFence } : {}),
       // §2.3 boss 硬指标 3:sessionManager 走"最近 N 条历史"兜底注入成功后回调,

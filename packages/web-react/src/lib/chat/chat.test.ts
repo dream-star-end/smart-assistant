@@ -339,7 +339,7 @@ describe("onopenSetInitialStatus / bridge error", () => {
   });
   test("normalize + friendly", () => {
     expect(normalizeBridgeErrorCode("ERR_INSUFFICIENT_CREDITS")).toBe("insufficient_credits");
-    expect(friendlyBridgeErrorMessage("INSUFFICIENT_CREDITS")).toMatch(/余额不足/);
+    expect(friendlyBridgeErrorMessage("INSUFFICIENT_CREDITS")).toMatch(/积分已耗尽/);
   });
 });
 

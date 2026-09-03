@@ -186,7 +186,7 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     renderMsg(mk("assistant", { _errorCode: "insufficient_credits", _errorDetail: "shortfall 120" }), {
       cb: { onTopUp },
     });
-    expect(screen.getByText("积分余额不足")).toBeInTheDocument();
+    expect(screen.getByText("积分已耗尽")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /去充值/ }));
     expect(onTopUp).toHaveBeenCalledTimes(1);
   });

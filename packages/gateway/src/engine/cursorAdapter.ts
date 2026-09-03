@@ -35,6 +35,11 @@ import { issueDelegateContextToken } from '../delegateContext.js'
 import { formatPresentOptionsFence } from './presentOptions.js'
 import { CursorRoutingAdapter } from './cursorRoutingAdapter.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
+import {
+  CREDIT_EXHAUSTED_DETAIL,
+  runningCostFenForUsage,
+  shouldAbortForCreditBudget,
+} from '../creditExhaustion.js'
 
 const log = createLogger({ module: 'cursorAdapter' })
 
@@ -693,7 +698,7 @@ interface TurnCtx {
   assistantText: string; thinkingText: string; assistantSegments: SegmentRecord[]; thinkingSegments: SegmentRecord[]
   tools: Map<string, TurnToolEntry>; pending: Set<string>; startedTools: Map<string, number>
   silentToolIds: Set<string>; presentOptionsCount: number
-  stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; resolveDrain: (() => void) | null; interrupted: boolean; error: string | null; resultSeen: boolean; resultDetail: string | null; usage?: ReportedUsage
+  stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; resolveDrain: (() => void) | null; interrupted: boolean; creditExhausted: boolean; error: string | null; resultSeen: boolean; resultDetail: string | null; usage?: ReportedUsage
   assistantPartialText: string; pendingAssistantText: string | null
   assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
   lastContentKind: 'text' | 'thinking' | null
@@ -1809,7 +1814,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.stopPendingKeepalive()
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), silentToolIds: new Set(), presentOptionsCount: 0, stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, resultSeen: false, resultDetail: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), silentToolIds: new Set(), presentOptionsCount: 0, stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, creditExhausted: false, error: null, resultSeen: false, resultDetail: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { ctx.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => {
       // Only ever settle this turn's own barrier: shutdown() may have already
@@ -2178,7 +2183,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     }
     if (type === 'tool_use' || type === 'tool_start') { this.toolStart(ctx, event); return }
     if (type === 'tool_result' || type === 'tool_call_update' || type === 'tool_end') { this.toolResult(ctx, event); return }
-    const reported = usageOf(event); if (reported) ctx.usage = reported
+    const reported = usageOf(event); if (reported) { ctx.usage = reported; void this.maybeAbortForCredits(ctx) }
     if (type === 'error') { ctx.error = textOf(event.message ?? event.error ?? event.data) || 'Cursor CLI error'; return }
     if (type === 'result') {
       const failed = event.is_error === true || ['error', 'failed', 'failure'].includes(textOf(event.subtype).toLowerCase())
@@ -2265,20 +2270,47 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.pending.size === 0) this.stopPendingKeepalive()
     ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output: preview || output, outputJson: structuredClone(outputJson), preview } }); ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview, isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview, ...(exitCode !== undefined ? { exitCode } : {}), ...(terminationReason ? { terminationReason } : {}) } })
   }
+  private async maybeAbortForCredits(ctx: TurnCtx): Promise<void> {
+    if (ctx.creditExhausted || ctx.terminal || ctx.interrupted) return
+    const budget = ctx.params.creditBudgetFen
+    if (budget === undefined || !ctx.usage) return
+    const fen = await runningCostFenForUsage({
+      modelId: this.currentModel,
+      usage: {
+        inputTokens: ctx.usage.input_tokens ?? 0,
+        outputTokens: ctx.usage.output_tokens ?? 0,
+        cacheReadTokens: ctx.usage.cache_read_input_tokens ?? 0,
+        cacheCreationTokens: ctx.usage.cache_creation_input_tokens ?? 0,
+      },
+    })
+    if (fen === null || !shouldAbortForCreditBudget(fen, budget)) return
+    ctx.creditExhausted = true
+    ctx.error = CREDIT_EXHAUSTED_DETAIL
+    this.interrupt()
+  }
+
   private finish(ctx: TurnCtx, detail: string | null): void {
     this.stopPendingKeepalive()
-    if (ctx.terminal) return; ctx.terminal = true; const cls = detail ? unavailable(detail) : null
-    const errorClass = detail ? classifyRunError(detail).code : undefined
+    if (ctx.terminal) return; ctx.terminal = true
+    const creditExhausted = ctx.creditExhausted
+    const cls = !creditExhausted && detail ? unavailable(detail) : null
+    const errorClass = creditExhausted
+      ? 'insufficient_credits' as const
+      : detail ? classifyRunError(detail).code : undefined
     const keepRawForTape =
+      !creditExhausted &&
       detail != null &&
       (errorClass === 'context_too_long' || /PROMPT_TOO_LONG/.test(detail))
-    const safeDetail = detail === null ? null
+    const safeDetail = creditExhausted ? CREDIT_EXHAUSTED_DETAIL
+      : detail === null ? null
       : ctx.interrupted ? 'Cursor turn cancelled'
       : cls === 'auth' ? 'Cursor authentication unavailable'
       : cls === 'quota' ? 'Cursor quota unavailable'
       : keepRawForTape ? detail
       : 'Cursor CLI failed'
-    const status: EngineExternalBillingEvent['status'] = cls ? 'unavailable' : detail ? 'error' : 'success'
+    const status: EngineExternalBillingEvent['status'] = creditExhausted
+      ? 'success'
+      : cls ? 'unavailable' : detail ? 'error' : 'success'
     const slotResults = parseCursorSlotResults(ctx.stderr)
     if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) {
       const durationMs = Date.now() - ctx.startedAt
@@ -2294,11 +2326,15 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // to settle against the audit row instead of request_finalize_journal.
       this.emit('billing', this.buildDurableBilling(ctx, status, durationMs))
     }
-    if (detail) ctx.params.onEvent({ kind: 'error', error: safeDetail!, errorClass, ...(ctx.interrupted ? { errorCode: 'user_cancelled' as const } : {}) })
+    if (creditExhausted) {
+      ctx.params.onEvent({ kind: 'error', error: CREDIT_EXHAUSTED_DETAIL, errorClass: 'insufficient_credits' })
+    } else if (detail) {
+      ctx.params.onEvent({ kind: 'error', error: safeDetail!, errorClass, ...(ctx.interrupted ? { errorCode: 'user_cancelled' as const } : {}) })
+    }
     if (ctx.usage) ctx.params.onEvent({ kind: 'usage', usage: { inputTokens: ctx.usage.input_tokens ?? 0, outputTokens: ctx.usage.output_tokens ?? 0, cacheReadTokens: ctx.usage.cache_read_input_tokens ?? 0, cacheCreationTokens: ctx.usage.cache_creation_input_tokens ?? 0, totalTokens: Object.values(ctx.usage).reduce((a, b) => a + (b ?? 0), 0) } })
-    ctx.params.onEvent({ kind: 'final', meta: { ...finalUsageMeta(ctx.usage), ...(ctx.interrupted ? { stopReason: 'interrupted' } : {}) } })
+    ctx.params.onEvent({ kind: 'final', meta: { ...finalUsageMeta(ctx.usage), ...(creditExhausted ? { stopReason: 'error' } : ctx.interrupted ? { stopReason: 'interrupted' } : {}) } })
     ctx.params.sessionTotals.turns += 1
-    const u = ctx.usage; ctx.resolve({ usage: { cost: 0, inputTokens: u?.input_tokens ?? 0, outputTokens: u?.output_tokens ?? 0, cacheReadTokens: u?.cache_read_input_tokens ?? 0, cacheCreationTokens: u?.cache_creation_input_tokens ?? 0, totalTokens: u ? Object.values(u).reduce((a, b) => a + (b ?? 0), 0) : 0 }, assistantText: ctx.assistantText, thinkingText: ctx.thinkingText, assistantSegments: ctx.assistantSegments.map((v) => ({ ...v })), thinkingSegments: ctx.thinkingSegments.map((v) => ({ ...v })), tools: [...ctx.tools.values()].map((v) => structuredClone(v)), runtimeEvents: [], stopReason: ctx.interrupted ? 'interrupted' : null, numTurns: 1, isError: !!detail, ...(detail ? { errorKind: 'other' as const, errorClass, errorDetail: safeDetail! } : {}), staleResumeId: false, phantomSignals: { ...EMPTY_SIGNALS } })
+    const u = ctx.usage; ctx.resolve({ usage: { cost: 0, inputTokens: u?.input_tokens ?? 0, outputTokens: u?.output_tokens ?? 0, cacheReadTokens: u?.cache_read_input_tokens ?? 0, cacheCreationTokens: u?.cache_creation_input_tokens ?? 0, totalTokens: u ? Object.values(u).reduce((a, b) => a + (b ?? 0), 0) : 0 }, assistantText: ctx.assistantText, thinkingText: ctx.thinkingText, assistantSegments: ctx.assistantSegments.map((v) => ({ ...v })), thinkingSegments: ctx.thinkingSegments.map((v) => ({ ...v })), tools: [...ctx.tools.values()].map((v) => structuredClone(v)), runtimeEvents: [], stopReason: creditExhausted ? 'error' : ctx.interrupted ? 'interrupted' : null, numTurns: 1, isError: creditExhausted || !!detail, ...(creditExhausted || detail ? { errorKind: 'other' as const, errorClass, errorDetail: safeDetail! } : {}), staleResumeId: false, phantomSignals: { ...EMPTY_SIGNALS } })
   }
   private buildDurableBilling(ctx: TurnCtx, status: EngineExternalBillingEvent['status'], durationMs: number): EngineBillingEvent {
     const u = ctx.usage

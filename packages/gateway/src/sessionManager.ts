@@ -824,6 +824,12 @@ export interface AgentSession {
   _pendingAgentGroups?: DurableAgentGroup[]
   /** Turn-wide monotonic sequence shared by engine output and delegation cards. */
   _nextDurableEventOrdinal?: number
+  /**
+   * Remaining spendable credits (fen) for the in-flight turn, injected by
+   * master at admission. Engine-reported adapters abort once running cost
+   * reaches this budget.
+   */
+  _turnCreditBudgetFen?: bigint
   /** Active turn's fail-safe tape finalizer. The outer liveness watchdog uses
    * this instead of emitting an unpersisted error and abandoning the parser. */
   _persistActiveTurn?: (
@@ -4141,6 +4147,8 @@ export class SessionManager {
        *  原样取出);cron/synthetic/delegate/train 等本地路径 submit 不传 —— CCB runner
        *  自取 `x-oc-local-catalog` token(方案 §3/§4),清位语义在 runner 内单一收口。 */
       modelAuthority?: TurnModelAuthority
+      /** Remaining spendable credits (fen) captured at master admission. */
+      creditBudgetFen?: bigint
       /** 长会话热尾巴+归档 §2.3:历史上下文兜底注入**成功后**回调,让上层
        *  (server.ts)发 sys.context_rebuilt 提示帧(boss 硬指标 3:引擎无法原生续接、
        *  走兜底注入时主动提醒用户)。仅 webchat leader turn 传;delegate/cron/train
@@ -4258,6 +4266,10 @@ export class SessionManager {
       }
       transition.state = 'consuming'
       consumingModelSwitch = true
+    }
+
+    if (opts?.creditBudgetFen !== undefined) {
+      session._turnCreditBudgetFen = opts.creditBudgetFen
     }
 
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
@@ -4941,6 +4953,7 @@ export class SessionManager {
           session._activeTurnCount = Math.max(0, (session._activeTurnCount ?? 0) - 1)
           session._currentTurnKey = undefined
           session._currentDispatch = undefined
+          session._turnCreditBudgetFen = undefined
           if (queueTurn) {
             this._promptQueueExecutions.delete(session)
             this._promptQueueExecutionKeys.delete(session.sessionKey)
@@ -7031,6 +7044,9 @@ export class SessionManager {
         automaticRetryState,
         ...(session._usageAttribution
           ? { usageAttribution: session._usageAttribution }
+          : {}),
+        ...(session._turnCreditBudgetFen !== undefined
+          ? { creditBudgetFen: session._turnCreditBudgetFen }
           : {}),
         onEvent: handleEngineEvent,
         // CCB 成本 delta 基线:parser 直接读写 session.totalCostUSD / turns /

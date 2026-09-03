@@ -104,6 +104,13 @@ export interface TurnParams {
   queueTurn?: boolean
   /** PR2 v1.0.66 — server-owned requestId(engine-reported 计费关联用;CCB noop 透传)。 */
   requestId?: string
+  /**
+   * Remaining spendable credits (fen) captured at master admission.
+   * Engine-reported adapters abort the in-flight process once running
+   * platform cost reaches this budget instead of finishing the whole
+   * agentic loop and clamping at settle.
+   */
+  creditBudgetFen?: bigint
   /** Stable logical paid-turn key shared by persistence and proxy billing. */
   turnKey?: string
   /** Trusted delegate billing attribution captured when the AgentSession was

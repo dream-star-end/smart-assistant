@@ -3228,6 +3228,9 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(cursorBranch, /authorityExec\.canonicalModel !== modelCapture/);
     assert.match(cursorBranch, /isCursorContainerOnSelfHost/);
     assert.match(cursorBranch, /INSERT INTO cursor_external_usage_audit/);
+    assert.match(cursorBranch, /readTotalSpendableBalance\(uid\)/);
+    assert.match(cursorBranch, /ERR_INSUFFICIENT_CREDITS/);
+    assert.match(cursorBranch, /_creditBudget: cursorSpendable\.toString\(\)/);
     assert.match(cursorBranch, /peerCapture, modelCapture/);
     assert.match(cursorBranch, /cursorTurnIdentity/);
     assert.match(
