@@ -2719,6 +2719,15 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
       }),
     }),
   );
+  // OCV5-96(selfhost 435c29adc):用量页 best-effort 拉 listSessions 补会话标题;
+  // 失败静默,但 harness 对未登记请求 404 会计入运行时错误,这里登记空列表。
+  await page.route("**/api/sessions/list**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ sessions: [] }),
+    }),
+  );
   await page.route("**/api/me/**", (route, request) => {
     const pathname = new URL(request.url()).pathname;
     if (pathname.startsWith("/api/me/preferences")) {
