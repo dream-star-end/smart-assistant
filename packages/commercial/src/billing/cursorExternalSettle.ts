@@ -10,11 +10,38 @@
  * 零输出免单对齐 f3818040 / codexFinalizer。
  */
 import type { Pool } from "pg";
+import { composeMultiplier } from "@openclaude/protocol";
 import { computeCost, type TokenUsage } from "./calculator.js";
 import type { ModelPricing, PricingCache } from "./pricing.js";
 import { settleUsageAndLedger, type SettleResult } from "./proxyBilling.js";
 
 export type CursorEngineStatus = "success" | "error" | "unavailable";
+
+/**
+ * Settle-time surcharge for Cursor Sand Opus/Fable families (operator decision
+ * 2026-09-03): the credits actually debited are 2x the catalog price, but the
+ * public catalog (`model_pricing.multiplier`, cost_x badge, per_ktok_credits)
+ * is left untouched so nothing user-facing advertises the markup. Composed on
+ * top of the row multiplier (so `-fast` siblings keep their own 2x) and
+ * recorded in price_snapshot as `cursor_settle_multiplier` for reconciliation.
+ */
+export const CURSOR_SETTLE_SURCHARGE_FAMILIES: ReadonlyArray<string> = ["cursor-opus-", "cursor-fable-"];
+export const CURSOR_SETTLE_SURCHARGE_MULTIPLIER = "2.000";
+
+export function cursorSettleMultiplier(modelId: string): string | null {
+  return CURSOR_SETTLE_SURCHARGE_FAMILIES.some((prefix) => modelId.startsWith(prefix))
+    ? CURSOR_SETTLE_SURCHARGE_MULTIPLIER
+    : null;
+}
+
+function applyCursorSettleMultiplier(pricing: ModelPricing): { pricing: ModelPricing; surcharge: string | null } {
+  const surcharge = cursorSettleMultiplier(pricing.model_id);
+  if (surcharge === null) return { pricing, surcharge: null };
+  return {
+    pricing: { ...pricing, multiplier: composeMultiplier(pricing.multiplier, surcharge) },
+    surcharge,
+  };
+}
 
 function asTokens(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
@@ -48,7 +75,8 @@ export function planCursorExternalSettle(args: {
   costCredits: bigint;
   snapshotJson: string;
 } {
-  const { cost_credits, snapshot } = computeCost(args.usage, args.pricing);
+  const { pricing: effectivePricing, surcharge } = applyCursorSettleMultiplier(args.pricing);
+  const { cost_credits, snapshot } = computeCost(args.usage, effectivePricing);
   const engineOk = args.engineStatus === "success";
   // A user-initiated Stop is not an engine failure: the tokens the engine
   // reported were really consumed upstream before the abort landed, so the
@@ -67,6 +95,9 @@ export function planCursorExternalSettle(args: {
   const snapshotJson = JSON.stringify({
     ...snapshot,
     cursor_status: args.engineStatus,
+    ...(surcharge !== null
+      ? { cursor_settle_multiplier: surcharge, catalog_multiplier: args.pricing.multiplier }
+      : {}),
     ...(args.terminalCode ? { cursor_terminal_code: args.terminalCode } : {}),
     ...(userCancelled ? { charged_on_user_cancel: true } : {}),
     ...(waivedNoOutput
