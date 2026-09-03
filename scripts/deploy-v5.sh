@@ -6618,8 +6618,14 @@ smoke() {
   #     分别收敛生图旅程与临时 GitHub workspace；只允许 v5 leader 启动。
   #   sessionsGcSweep(P2 会话权威迁 PG:usage 聚合 pending/map 老化 GC,advisory lease fencing,
   #     仅 OC_SESSIONS_STORE=pg 时启动——白名单允许≠必然存在。RFC-v5-sessions-pg D3)
+  #   cursorAuditReconciler(2026-09-02 selfhost 3598fcc3d 正向同步 PR #521 引入:兜底
+  #     cursor_external_usage_audit(0208,v5 引入表/v3 无代码)里 settle 失败的 pending 行,
+  #     从已 finalized 的 client_session_turn_tapes 重建 usage 走 durable cursor settle;
+  #     只 UPDATE 该 audit 表。index.ts 门在 runtimeChannel=v5 且挂 LeaderBundle 单 leader。
+  #     首发 b34e7e925 因本白名单漏登被 smoke 拒、对称补偿回滚——名单与 trackScheduler
+  #     登记必须同批更新。关停:COMMERCIAL_CURSOR_AUDIT_RECONCILER_DISABLED=1)
   allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot cursorAuthSync"
-  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration"
+  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do
