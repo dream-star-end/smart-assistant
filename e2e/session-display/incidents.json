@@ -2737,6 +2737,11 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-cron-submit-boundary.ts",
           "assertion": "[cron-submit-boundary] PASS — unknown submit-start durability failures are terminal and never auto-replayed"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/cronSubmitBoundaryGate.test.ts",
+          "assertion": "cron submit-boundary gate rejects deletion of the regular runJob boundary"
         }
       ]
     }
