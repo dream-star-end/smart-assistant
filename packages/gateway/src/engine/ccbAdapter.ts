@@ -93,6 +93,52 @@ function redactModelAuthorityRuntimeEvents(
   )
 }
 
+/**
+ * CCB 协作式 abort 的 result 帧指纹。CCB 没有 stopReason='interrupted',而是
+ * 从 QueryEngine 发一条 error_during_execution,errors[0] 是 isResultSuccessful
+ * 的诊断行。用户点 Stop 时有两种形态,都是同一个用户动作:
+ *   - 流式阶段(query.ts aborted_streaming):最后一条是 user 提示或空,
+ *     stop_reason=null;
+ *   - 工具执行阶段(query.ts aborted_tools):CCB 先 yield
+ *     "[Request interrupted by user for tool use]" 这条 user 文本消息,
+ *     最近一次 API 的 stop_reason 仍是 tool_use。
+ * errors[] 里若还有别的条目(如 "Error: upstream request failed"),说明不是
+ * 干净的 abort,不得当成取消。仅 "Error: Request was aborted." 允许尾随。
+ * 本函数只看 result 形状;调用方仍必须要求浏览器确实发过 USER_CANCELLED。
+ */
+const CCB_EDE_CANCEL_DIAGNOSTIC_RE =
+  /^\[ede_diagnostic\] result_type=(?:user|undefined) last_content_type=n\/a stop_reason=(?:null|tool_use)$/
+
+export function isCcbUserCancellationDiagnostic(
+  errorDetail: string | undefined,
+  stopReason: string | null | undefined,
+): boolean {
+  if (!errorDetail || !errorDetail.includes('"subtype":"error_during_execution"')) return false
+  let parsed: unknown
+  try { parsed = JSON.parse(errorDetail) } catch { return false }
+  const errors = (parsed as { errors?: unknown } | null)?.errors
+  if (!Array.isArray(errors) || errors.length === 0) return false
+  const first = errors[0]
+  if (typeof first !== 'string') return false
+  if (first.startsWith('Error: Request was aborted.')) {
+    // Legacy shape without a diagnostic line only ever came from the
+    // streaming-phase AbortController path, whose result frame carries
+    // stop_reason=null. An authoritative terminal such as stop_reason=refusal
+    // that merely lists an abort error is CCB's own verdict, not the user's
+    // Stop, and must keep painting ENGINE_ERROR.
+    if ((stopReason ?? null) !== null) return false
+    return errors.every((e) => typeof e === 'string' && e.startsWith('Error: Request was aborted.'))
+  }
+  const m = CCB_EDE_CANCEL_DIAGNOSTIC_RE.exec(first)
+  if (!m) return false
+  const diagStopReason = first.endsWith('stop_reason=tool_use') ? 'tool_use' : null
+  // stopReason on the TurnResult mirrors the result frame's stop_reason.
+  if ((stopReason ?? null) !== diagStopReason) return false
+  return errors.slice(1).every(
+    (e) => typeof e === 'string' && e.startsWith('Error: Request was aborted.'),
+  )
+}
+
 /** CCB 错误字符串分类(底座私有知识,从 sessionManager 下沉)。
  *  与迁移前 sessionManager.onFinish 的 isAuthError 判定逐条件一致。 */
 export function classifyCcbErrorKind(result: {
@@ -100,9 +146,16 @@ export function classifyCcbErrorKind(result: {
   assistantText: string
   errorDetail?: string
 }): 'auth' | 'model_authority' | 'other' | undefined {
+  // 只有 CCB 自己报错(is_error)时,MODEL_AUTHORITY_INVALID 才是 egress 拒了本 turn 的
+  // 上游请求。正常完成的 turn 里模型正文提到这串字(复述子 agent 的 403、讨论代码)
+  // 不是平台凭证失效;此前无条件扫正文会把成功轮改写成 crashed + 自动免单
+  // (2026-09-02/03 selfhost 6 轮 cursor-fable 零计费,见 turn_waivers 48-58)。
   if (
-    containsModelAuthorityInvalid(result.assistantText) ||
-    containsModelAuthorityInvalid(result.errorDetail)
+    result.isError &&
+    (
+      containsModelAuthorityInvalid(result.errorDetail) ||
+      containsModelAuthorityInvalid(result.assistantText)
+    )
   ) {
     return 'model_authority'
   }
@@ -188,6 +241,7 @@ function buildTurnSummary(
       ? redactModelAuthorityRuntimeEvents(result.runtimeEvents)
       : result.runtimeEvents,
     stopReason: result.stopReason,
+    ...(result.terminalReason !== undefined ? { terminalReason: result.terminalReason } : {}),
     numTurns: result.numTurns,
     isError: result.isError,
     ...(nativeCompactionSummary ? { nativeCompactionSummary } : {}),
@@ -260,6 +314,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private readonly runner: SubprocessRunner
+  private readonly harness: 'ccb' | 'official-cc'
 
   /**
    * stdout 路由目标 = 最近一次 submitTurn 的 turn 上下文。turn 结束后**保留**
@@ -294,6 +349,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   /** @param runnerOverride 测试注入结构等价 fake(生产恒为内部构造的 SubprocessRunner)。 */
   constructor(opts: EngineCreateOpts, runnerOverride?: SubprocessRunner) {
     super()
+    this.harness = opts.harness ?? 'ccb'
     this.runner = runnerOverride ?? new SubprocessRunner(opts)
     // 常驻 stdout 路由(每 session 恰一个,替代旧 per-turn 'message' 闭包链)。
     // 'activity' 先于 parse emit —— 对位旧 handleMessage 里 timer.refresh() 在
@@ -377,6 +433,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       // CCB 成本 delta 基线:parser 直接 mutate session 引用,行为逐字节不变
       // (见 TurnParams.sessionTotals / CcbSessionTotals 注释)。
       sessionTotals: asCcbSessionTotals(params.sessionTotals),
+      costMode: this.harness === 'official-cc' ? 'external' : 'native',
     })
     const ctx: CcbTurnContext = {
       parser,
@@ -598,6 +655,18 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 
   get model(): string | undefined {
     return this.runner.model
+  }
+
+  isUserCancellationResult(summary: TurnSummary): boolean {
+    if (this.harness === 'ccb') {
+      return summary.isError
+        && isCcbUserCancellationDiagnostic(summary.errorDetail, summary.stopReason)
+    }
+    return this.harness === 'official-cc'
+      && summary.isError
+      && summary.stopReason === null
+      && summary.terminalReason === 'aborted_streaming'
+      && summary.errorDetail?.includes('"subtype":"error_during_execution"') === true
   }
 
   setEffortLevel(level: string | undefined): void {

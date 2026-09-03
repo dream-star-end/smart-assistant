@@ -92,6 +92,7 @@ export type UseChatSocket = {
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;
+    contextTier?: InboundMessage["contextTier"];
   }) => void;
   stop: (sessId: string) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/

@@ -1,9 +1,9 @@
-import { useEffect, useState } from "react";
-import { Badge, Modal, Spinner } from "../../../components/ui";
+import { useCallback, useEffect, useState } from "react";
+import { Badge, Button, DescriptionList, DescriptionRow, Modal, Progress, Spinner } from "../../../components/ui";
 import { DataTable, type Column } from "../../components";
 import { adminGet, apiErrorMessage } from "../../lib/adminApi";
 import { fmtDateTime } from "./cells";
-import type { RecentUser, RefreshEvent } from "./types";
+import type { CursorUsageSnapshot, RecentUser, RefreshEvent } from "./types";
 
 function errMsg(e: unknown): string {
   return apiErrorMessage(e, "请求失败");
@@ -173,6 +173,238 @@ export function RecentUsersModal({
           <p className="mt-2 text-[11.5px] text-faint">仅近 24h、Top 20。</p>
         </>
       )}
+    </Modal>
+  );
+}
+
+// ─── Cursor 账号会话额度 ────────────────────────────────────────────────────
+
+function fmtCents(cents: number | null | undefined): string {
+  if (cents == null || !Number.isFinite(cents)) return "—";
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+function fmtPct(pct: number | null | undefined): string {
+  if (pct == null || !Number.isFinite(pct)) return "—";
+  return `${pct.toFixed(pct >= 10 ? 0 : 1)}%`;
+}
+
+function fmtTokens(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
+function fmtDate(iso: string | null): string {
+  return iso ? fmtDateTime(iso).slice(0, 10) : "—";
+}
+
+const USAGE_SOURCE_LABEL: Record<string, string> = {
+  current_period: "api2 当前账期",
+  plan_info: "api2 套餐",
+  hard_limit: "api2 花费上限",
+  aggregated_usage: "api2 按模型聚合",
+  usage_summary: "cursor.com 用量摘要",
+  stripe_profile: "cursor.com 订阅状态",
+};
+
+type CursorUsageResponse = { usage: CursorUsageSnapshot; cached: boolean };
+
+/**
+ * Cursor 账号会话(Sand)的额度/用量。数据来自 Cursor 内部 dashboard 接口
+ * (随时可能变),字段缺失一律显示 "—";仅供查看,不是计费依据。
+ */
+export function CursorUsageModal({
+  open,
+  onOpenChange,
+  accountId,
+  accountLabel,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  accountId: string | null;
+  accountLabel: string;
+}) {
+  const [data, setData] = useState<CursorUsageResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(
+    async (force: boolean) => {
+      if (!accountId) return;
+      setLoading(true);
+      setError(null);
+      try {
+        const r = await adminGet<CursorUsageResponse>(
+          `/accounts/${encodeURIComponent(accountId)}/cursor-usage`,
+          force ? { refresh: 1 } : undefined,
+        );
+        setData(r);
+      } catch (e) {
+        setError(errMsg(e));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [accountId],
+  );
+
+  useEffect(() => {
+    if (!open || !accountId) return;
+    setData(null);
+    void load(false);
+  }, [open, accountId, load]);
+
+  const u = data?.usage ?? null;
+  const pct = u?.included.total_percent_used ?? null;
+  const errorEntries = u ? Object.entries(u.errors) : [];
+
+  type ModelRow = CursorUsageSnapshot["cycle_usage"]["models"][number];
+  const modelColumns: Column<ModelRow>[] = [
+    { key: "model", title: "模型", render: (m) => <span className="font-mono text-[12px]">{m.model}</span> },
+    { key: "cost", title: "费用", align: "right", cellClassName: "tabular-nums", render: (m) => fmtCents(m.cost_cents) },
+    { key: "in", title: "输入", align: "right", cellClassName: "tabular-nums", render: (m) => fmtTokens(m.input_tokens) },
+    { key: "out", title: "输出", align: "right", cellClassName: "tabular-nums", render: (m) => fmtTokens(m.output_tokens) },
+    { key: "cw", title: "缓存写", align: "right", cellClassName: "tabular-nums", render: (m) => fmtTokens(m.cache_write_tokens) },
+    { key: "cr", title: "缓存读", align: "right", cellClassName: "tabular-nums", render: (m) => fmtTokens(m.cache_read_tokens) },
+  ];
+
+  return (
+    <Modal
+      open={open}
+      onOpenChange={onOpenChange}
+      title={`账号 #${accountId ?? ""} — Cursor 额度 / 用量`}
+      description={accountLabel}
+      className="max-w-3xl"
+    >
+      {loading && !u ? (
+        <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted">
+          <Spinner className="size-4" /> 正在向 Cursor 查询…
+        </div>
+      ) : error && !u ? (
+        <div className="flex flex-col items-center gap-3 py-8 text-center text-sm text-danger">
+          <span>查询失败:{error}</span>
+          <Button size="sm" variant="secondary" onClick={() => void load(true)}>
+            重试
+          </Button>
+        </div>
+      ) : u ? (
+        <div className="flex flex-col gap-4">
+          <div className="flex items-center justify-between gap-3 text-[12px] text-faint">
+            <span>
+              拉取于 {fmtDateTime(u.fetched_at)}
+              {data?.cached ? "(缓存,60s)" : ""}
+            </span>
+            <Button size="sm" variant="ghost" disabled={loading} onClick={() => void load(true)}>
+              {loading ? <Spinner className="size-3.5" /> : null} 强制刷新
+            </Button>
+          </div>
+
+          <section className="rounded-md border border-border p-3">
+            <div className="mb-2 flex items-center gap-2">
+              <span className="text-sm font-medium">套餐内额度</span>
+              {u.plan.name && <Badge tone="neutral">{u.plan.name}</Badge>}
+              {u.plan.membership_type && u.plan.membership_type !== u.plan.name?.toLowerCase() && (
+                <Badge tone="neutral">{u.plan.membership_type}</Badge>
+              )}
+              {u.plan.subscription_status && (
+                <Badge tone={u.plan.subscription_status === "active" ? "success" : "warning"}>
+                  {u.plan.subscription_status}
+                </Badge>
+              )}
+              {u.included.is_unlimited === true && <Badge tone="success">无限</Badge>}
+            </div>
+            {pct != null && (
+              <div className="mb-2 flex items-center gap-3">
+                <Progress value={pct} thresholds={{ warning: 75, danger: 90 }} className="flex-1" />
+                <span className="w-12 text-right text-sm tabular-nums">{fmtPct(pct)}</span>
+              </div>
+            )}
+            <DescriptionList>
+              <DescriptionRow label="已用 / 上限" value={`${fmtCents(u.included.used_cents)} / ${fmtCents(u.included.limit_cents)}`} />
+              <DescriptionRow
+                label="剩余"
+                value={
+                  u.included.remaining_cents != null ? (
+                    <span className={u.included.remaining_cents <= 0 ? "text-danger" : undefined}>
+                      {fmtCents(u.included.remaining_cents)}
+                    </span>
+                  ) : (
+                    "—"
+                  )
+                }
+              />
+              <DescriptionRow
+                label="Auto / 指定模型 占比"
+                value={`${fmtPct(u.included.auto_percent_used)} / ${fmtPct(u.included.api_percent_used)}`}
+              />
+              <DescriptionRow
+                label="账期"
+                value={`${fmtDate(u.plan.billing_cycle_start)} → ${fmtDate(u.plan.billing_cycle_end)}`}
+              />
+              {u.included.display_message && (
+                <DescriptionRow label="Cursor 提示" value={<span className="text-faint">{u.included.display_message}</span>} />
+              )}
+            </DescriptionList>
+          </section>
+
+          <section className="rounded-md border border-border p-3">
+            <div className="mb-1 text-sm font-medium">按需付费(On-demand)</div>
+            <DescriptionList>
+              <DescriptionRow
+                label="状态"
+                value={
+                  u.on_demand.usage_based_allowed === false
+                    ? "不允许(套餐不支持)"
+                    : u.on_demand.enabled === true
+                      ? "已开启"
+                      : u.on_demand.enabled === false
+                        ? "未开启"
+                        : "—"
+                }
+              />
+              <DescriptionRow
+                label="已用 / 上限 / 剩余"
+                value={`${fmtCents(u.on_demand.used_cents)} / ${fmtCents(u.on_demand.limit_cents)} / ${fmtCents(u.on_demand.remaining_cents)}`}
+              />
+            </DescriptionList>
+          </section>
+
+          <section className="rounded-md border border-border p-3">
+            <div className="mb-2 flex items-baseline justify-between gap-2">
+              <span className="text-sm font-medium">本账期消耗(按模型)</span>
+              <span className="text-[12px] text-faint">
+                {fmtDate(u.cycle_usage.range_start)} → {fmtDate(u.cycle_usage.range_end)} · 合计{" "}
+                {fmtCents(u.cycle_usage.total_cost_cents)} · 输出 {fmtTokens(u.cycle_usage.total_output_tokens)} · 缓存读{" "}
+                {fmtTokens(u.cycle_usage.total_cache_read_tokens)}
+              </span>
+            </div>
+            <DataTable
+              columns={modelColumns}
+              rows={u.cycle_usage.models}
+              rowKey={(m) => m.model}
+              emptyTitle="本账期暂无消耗"
+              emptyHint="Cursor 尚未返回该账期的模型聚合数据。"
+            />
+          </section>
+
+          {errorEntries.length > 0 && (
+            <div className="rounded-md border border-warning/40 bg-warning/5 p-2 text-[12px] text-warning">
+              部分来源不可用:
+              {errorEntries.map(([k, v]) => (
+                <span key={k} className="ml-2 font-mono">
+                  {USAGE_SOURCE_LABEL[k] ?? k}={v}
+                </span>
+              ))}
+            </div>
+          )}
+          <p className="text-[11.5px] text-faint">
+            数据来自 Cursor 内部 dashboard 接口,字段可能随 Cursor 变更;金额为 Cursor 侧计价(美元),仅供查看,不作为平台计费依据。
+            Sand 请求消耗的就是这份账号额度。
+          </p>
+        </div>
+      ) : null}
     </Modal>
   );
 }

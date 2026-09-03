@@ -81,12 +81,28 @@ describe('readPendingPermissionPrompts', () => {
     const rows = await readPendingPermissionPrompts(pool, { userId: 3n, sessionId: PEER_ID })
     assert.equal(calls.length, 1)
     const { sql, params } = calls[0]!
-    assert.match(sql, /FROM turn_permission_requests/)
-    assert.match(sql, /user_id=\$1 AND session_id=\$2 AND status='pending' AND expires_at>NOW\(\)/)
+    assert.match(sql, /FROM turn_permission_requests p/)
+    assert.match(sql, /p\.user_id=\$1 AND p\.session_id=\$2 AND p\.status='pending' AND p\.expires_at>NOW\(\)/)
     assert.deepEqual(params, ['3', PEER_ID, HELLO_PENDING_PERMISSION_MAX_ROWS])
     assert.deepEqual(rows.map((r) => r.requestId), ['toolu_01', 'ask-user:abc'])
     assert.deepEqual(rows[1]!.input, { questions: [{ question: 'q' }] })
     assert.equal(rows[1]!.expiresAt.getTime(), NOW + 120_000)
+  })
+
+  test('INC-…-ZOMBIE: excludes prompts of turns the user already stopped, but never detached ask_user', async () => {
+    let sql = ''
+    const pool = {
+      async query(text: string) { sql = text.replace(/\s+/g, ' ').trim(); return { rows: [], rowCount: 0 } },
+    } as unknown as Pool
+    await readPendingPermissionPrompts(pool, { userId: 3n, sessionId: PEER_ID })
+    // Detached prompts and legacy rows without a turn are always replayed.
+    assert.match(sql, /p\.request_id LIKE 'ask-user:%' OR p\.client_message_id IS NULL/)
+    // A live (non-cancelled) durable Stop for the prompt's turn hides the row.
+    assert.match(sql, /NOT EXISTS \( SELECT 1 FROM turn_control_requests c/)
+    assert.match(sql, /c\.kind='stop' AND c\.status<>'cancelled'/)
+    assert.match(sql, /c\.root_client_message_id=p\.client_message_id/)
+    // A peer-wide Stop (null root) issued after the prompt was created also hides it.
+    assert.match(sql, /c\.root_client_message_id IS NULL AND c\.created_at>=p\.created_at/)
   })
 
   test('clamps the limit into [1,64]', async () => {

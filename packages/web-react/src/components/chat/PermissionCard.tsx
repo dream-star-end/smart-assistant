@@ -5,13 +5,15 @@
  *    (Bash→命令、文件类→路径、浏览器→URL/动作),其余回落可折叠的格式化 JSON。
  *  - 审批 modal：普通工具 allow/deny；AskUserQuestion 走专用答题（单选/多选/其他/预览），
  *    提交把 `{ answers, annotations }` 经 updatedInput 回送（gateway 白名单校验）。
- *    两个 modal 窄屏均为贴底 sheet(mobile="sheet")。
+ *    ExitPlanMode 走计划确认框（markdown 计划书 + 按此执行/继续规划），不能无决策关掉。
+ *    modal 窄屏均为贴底 sheet(mobile="sheet")。
  *  - 全部经 props.onRespond（= useChatSocket.respondPermission，已绑 sessId）。
  */
 import { Check, Clock, HelpCircle, ShieldCheck, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import { cn } from "../../lib/utils";
+import { Markdown } from "../Markdown";
 import { asStr } from "../tool/format";
 import { resolveToolMeta, toolSummary } from "../tool/meta";
 import { Button, Modal } from "../ui";
@@ -62,14 +64,30 @@ function isDetachedAskUserCard(msg: ChatMessage): boolean {
   );
 }
 
-/** Page-session memory of requestIds that already auto-opened a modal.
- *  Timeline rows can still remount across session switches (`key={activeId}`);
- *  useEffect+useState would re-popup without this. Module-level Set survives
- *  remount and is not persisted (refresh = new page session). */
-const autoOpenedPermissionRequestIds = new Set<string>();
+/** Page-session memory of requestIds the user dismissed without answering.
+ *  Live prompts must re-open after a timeline remount (CCB still waits);
+ *  only an explicit close without allow/deny suppresses the next auto-open.
+ *  ExitPlanMode never enters this set — the engine cannot proceed until the
+ *  user picks 按此计划执行 / 继续规划. Refresh clears the set. */
+const dismissedPermissionRequestIds = new Set<string>();
 
 export function resetPermissionAutoOpenMemory(): void {
-  autoOpenedPermissionRequestIds.clear();
+  dismissedPermissionRequestIds.clear();
+}
+
+function rememberDismissedPermissionRequest(requestId: string | undefined): void {
+  if (requestId) dismissedPermissionRequestIds.add(requestId);
+}
+
+export function isExitPlanModeTool(toolName: string | undefined): boolean {
+  return toolName === "ExitPlanMode";
+}
+
+/** CCB injects `plan` via normalizeToolInput before can_use_tool. */
+export function extractExitPlanMarkdown(input: Record<string, unknown> | null | undefined): string {
+  if (!input) return "";
+  const plan = input.plan;
+  return typeof plan === "string" && plan.trim().length > 0 ? plan : "";
 }
 
 /** Prefer the server-carried absolute expiry; fall back to ts + role TTL for
@@ -82,6 +100,19 @@ export function permissionHasExpired(msg: ChatMessage, now = Date.now()): boolea
   if (!Number.isFinite(msg.ts)) return false;
   const ttlMs = isDetachedAskUserCard(msg) ? DETACHED_ASK_USER_TTL_MS : PENDING_PERMISSION_TTL_MS;
   return now - msg.ts > ttlMs;
+}
+
+/** A prompt the runtime is (as far as this browser can tell) still blocked on:
+ *  unresolved, no durable response in flight, and inside the server TTL.
+ *  MessageRenderer uses it to decide whether an unresolved card in the current
+ *  segment may be treated as live even when `sending` is false — the
+ *  INC-20260904 case where the turn belongs to a master-authored `m-recover-*`
+ *  row this tab never adopted, so `_sendingInFlight` stayed false while the
+ *  engine sat in waitingForUserInput. */
+export function isAwaitingPermissionPrompt(msg: ChatMessage, now = Date.now()): boolean {
+  if (msg.role !== "permission") return false;
+  if (msg._resolved === true || msg._controlPending === true) return false;
+  return !permissionHasExpired(msg, now);
 }
 
 function asAskUserQuestion(msg: ChatMessage): AqQuestion[] | null {
@@ -186,23 +217,28 @@ export function PermissionCard({
   const pending = msg._controlPending === true;
   const behavior = msg._behavior;
   const [open, setOpen] = useState(false);
+  const isExitPlan = isExitPlanModeTool(msg.toolName);
+  const input = permissionInput(msg);
+  const planMarkdown = isExitPlan ? extractExitPlanMarkdown(input) : "";
 
   const expired = !resolved && permissionHasExpired(msg);
   const canAnswer = !resolved && !pending && !readOnly && (!expired || livePrompt);
 
-  // 自动弹窗：仅活提问、且本页会话内每个 requestId 最多一次。
-  // 用 setTimeout(0) 记下「已弹过」，让 React StrictMode 的同步 double-effect
-  // 仍能打开（cleanup 会清掉未触发的 timer）。
+  // 自动弹窗：仅活提问。时间线重挂会丢掉 useState(open)，必须再弹，
+  // 否则 CCB waitingForUserInput 会卡死而用户看不到确认框。
+  // 用户主动关掉（问答/普通权限）才记入 dismissed 集，阻止下一次自动弹。
   useEffect(() => {
     if (!livePrompt || resolved || pending || readOnly || expired) return;
     const requestId = msg.requestId;
-    if (!requestId || autoOpenedPermissionRequestIds.has(requestId)) return;
+    if (!requestId) return;
+    if (!isExitPlan && dismissedPermissionRequestIds.has(requestId)) return;
     setOpen(true);
-    const timer = window.setTimeout(() => {
-      autoOpenedPermissionRequestIds.add(requestId);
-    }, 0);
-    return () => window.clearTimeout(timer);
-  }, [resolved, pending, readOnly, expired, livePrompt, msg.requestId]);
+  }, [resolved, pending, readOnly, expired, livePrompt, isExitPlan, msg.requestId]);
+
+  const handleDismissableOpenChange = (next: boolean) => {
+    if (!next) rememberDismissedPermissionRequest(msg.requestId);
+    setOpen(next);
+  };
 
   // 状态图标(M7):lucide 替代 emoji。等待→Clock / 已允许→Check / 已拒绝→X。
   const StatusIcon = !resolved ? Clock : behavior === "allow" ? Check : X;
@@ -214,18 +250,23 @@ export function PermissionCard({
         ? "已过期"
         : questions
           ? "等待回答…"
-          : "等待审批…"
+          : isExitPlan
+            ? "等待确认计划…"
+            : "等待审批…"
     : behavior === "allow"
       ? questions
         ? "已提交"
-        : "已允许"
+        : isExitPlan
+          ? "已确认计划"
+          : "已允许"
       : questions
         ? "已跳过"
-        : "已拒绝";
+        : isExitPlan
+          ? "继续规划"
+          : "已拒绝";
   const tone = !resolved ? "neutral" : behavior === "allow" ? "allow" : "deny";
 
   // 工具中文标签 + 图标(F5):resolveToolMeta 单一权威;无 toolName → 「未知工具」。
-  const input = permissionInput(msg);
   const meta = msg.toolName ? resolveToolMeta(msg.toolName, input) : null;
   const toolLabel = meta ? meta.label : "未知工具";
   const ToolIcon = meta?.icon ?? null;
@@ -245,7 +286,7 @@ export function PermissionCard({
           {questions ? <HelpCircle size={14} /> : <ShieldCheck size={14} />}
         </span>
         <span className="text-[13px] font-medium text-fg">
-          {questions ? "用户问答" : "权限请求"}
+          {questions ? "用户问答" : isExitPlan ? "退出计划模式" : "权限请求"}
         </span>
         {!questions && (
           <span className="inline-flex min-w-0 items-center gap-1 rounded bg-hover px-1.5 py-0.5 text-[12px] text-muted">
@@ -263,9 +304,9 @@ export function PermissionCard({
       {canAnswer && (
         <div className="flex items-center gap-2 border-t border-border px-3.5 py-2">
           <Button size="sm" variant="accent" shape="pill" onClick={() => setOpen(true)}>
-            {questions ? "回答" : "审批"}
+            {questions ? "回答" : isExitPlan ? "审阅计划" : "审批"}
           </Button>
-          {!questions && (
+          {!questions && !isExitPlan && (
             <Button
               size="sm"
               variant="ghost"
@@ -288,6 +329,15 @@ export function PermissionCard({
         </div>
       )}
 
+      {!resolved && isExitPlan && planMarkdown && (
+        <div
+          data-testid="exit-plan-preview"
+          className="max-h-28 overflow-hidden border-t border-border px-3.5 py-2 text-[12.5px] text-muted"
+        >
+          <Markdown>{planMarkdown}</Markdown>
+        </div>
+      )}
+
       {/* 已解析：AskUserQuestion 展示问答摘要；普通展示 inputPreview */}
       {resolved && questions && behavior === "allow" && (
         <div className="space-y-1.5 border-t border-border px-3.5 py-2.5">
@@ -299,7 +349,15 @@ export function PermissionCard({
           ))}
         </div>
       )}
-      {resolved && !questions && (input || msg.inputPreview) && (
+      {resolved && !questions && isExitPlan && planMarkdown && (
+        <div
+          data-testid="exit-plan-markdown"
+          className="max-h-64 overflow-auto border-t border-border px-3.5 py-2"
+        >
+          <Markdown>{planMarkdown}</Markdown>
+        </div>
+      )}
+      {resolved && !questions && !isExitPlan && (input || msg.inputPreview) && (
         <div className="border-t border-border px-3.5 py-2">
           <PermissionInputSummary
             toolName={msg.toolName || ""}
@@ -319,16 +377,25 @@ export function PermissionCard({
         (questions ? (
           <AskUserQuestionModal
             open={open}
-            onOpenChange={setOpen}
+            onOpenChange={handleDismissableOpenChange}
             requestId={msg.requestId!}
             questions={questions}
             inputJson={(msg.inputJson as AqInput) ?? { questions }}
             onRespond={onRespond}
           />
+        ) : isExitPlan ? (
+          <ExitPlanModeModal
+            open={open}
+            onOpenChange={setOpen}
+            requestId={msg.requestId!}
+            plan={planMarkdown}
+            planFilePath={asStr(input?.planFilePath)}
+            onRespond={onRespond}
+          />
         ) : (
           <GenericPermissionModal
             open={open}
-            onOpenChange={setOpen}
+            onOpenChange={handleDismissableOpenChange}
             requestId={msg.requestId!}
             toolName={msg.toolName || ""}
             toolLabel={toolLabel}
@@ -350,6 +417,8 @@ function settledReasonLabel(reason: string): string {
       return "连接断开，已自动拒绝";
     case "crashed":
       return "进程异常，已自动拒绝";
+    case "user_stop":
+      return "本轮已停止，提问已关闭";
     case "already_settled":
       return "请求已处理";
     default:
@@ -415,6 +484,75 @@ function GenericPermissionModal({
           {toolLabel}
         </div>
         <PermissionInputSummary toolName={toolName} input={input} inputPreview={inputPreview} />
+      </div>
+    </Modal>
+  );
+}
+
+// ═══════════════ ExitPlanMode 计划确认框 ═══════════════
+function ExitPlanModeModal({
+  open,
+  onOpenChange,
+  requestId,
+  plan,
+  planFilePath,
+  onRespond,
+}: {
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+  requestId: string;
+  plan: string;
+  planFilePath?: string;
+  onRespond: PermissionRespond;
+}) {
+  const decide = (behavior: "allow" | "deny") => {
+    onRespond({
+      requestId,
+      behavior,
+      ...(behavior === "deny" ? { message: "User rejected the plan" } : {}),
+    });
+    onOpenChange(false);
+  };
+  return (
+    <Modal
+      open={open}
+      onOpenChange={(next) => {
+        if (next) onOpenChange(true);
+      }}
+      mobile="sheet"
+      size="lg"
+      fixedHeight
+      hideClose
+      onEscapeKeyDown={(event) => event.preventDefault()}
+      title="退出计划模式"
+      description="请审阅计划后再决定是否开始执行。关掉窗口不会取消等待。"
+      footer={
+        <>
+          <Button variant="ghost" onClick={() => decide("deny")}>
+            继续规划
+          </Button>
+          <Button variant="accent" onClick={() => decide("allow")}>
+            按此计划执行
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-2">
+        {plan ? (
+          <div
+            data-testid="exit-plan-markdown"
+            className="max-h-[min(56dvh,28rem)] overflow-auto rounded-md border border-border bg-surface px-3 py-2"
+          >
+            <Markdown>{plan}</Markdown>
+          </div>
+        ) : (
+          <p data-testid="exit-plan-missing" className="text-sm text-muted">
+            计划文件已写好，但这次审批请求没有带上正文。批准后模型会按计划文件执行。
+          </p>
+        )}
+        {planFilePath ? (
+          <p className="truncate font-mono text-[11px] text-faint">{planFilePath}</p>
+        ) : null}
       </div>
     </Modal>
   );

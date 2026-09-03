@@ -265,14 +265,7 @@ export async function preCheckWithCost(
   // 会被 402 误拒(企业版核心场景)。
   // org 可用额是**加法项**:查询失败绝不阻断聊天(fail-open 到纯个人余额,最坏=
   // 零个人余额的 org 成员被 402,等价于无此特性;可用性优先于该边缘精度)。
-  const [personal, orgSpendable] = await Promise.all([
-    getSpendableBalance(input.userId),
-    getOrgSpendableForUser(input.userId).catch((err) => {
-      console.error("[preCheck] org spendable lookup failed, fail-open to personal", err);
-      return 0n;
-    }),
-  ]);
-  const balance = personal + orgSpendable;
+  const balance = await readTotalSpendableBalance(input.userId);
 
   // 余额 ≤ 0 hard reject(不受 race 窗口影响 — PG 单点权威)。
   // 防止 0 余额用户绕过 cap 路径刷请求。负余额(adminAdjust 把人调过头)同走此路 →
@@ -319,11 +312,7 @@ export async function preCheckExactCost(
 ): Promise<PreCheckResult> {
   assertRequestId(input.requestId)
   assertSafeBigInt('maxCost', input.maxCost)
-  const [personal, orgSpendable] = await Promise.all([
-    getSpendableBalance(input.userId),
-    getOrgSpendableForUser(input.userId).catch(() => 0n),
-  ])
-  const balance = personal + orgSpendable
+  const balance = await readTotalSpendableBalance(input.userId)
   if (balance < input.maxCost) throw new InsufficientCreditsError(balance, input.maxCost)
   assertSafeBigInt('balance', balance)
   const result = await redis.atomicReserve({
@@ -341,6 +330,24 @@ export async function preCheckExactCost(
     capped: false,
     originalMaxCost: input.maxCost,
   }
+}
+
+/**
+ * Personal wallet + org spendable, same total preCheck uses.
+ * Org lookup failures fail-open to personal so a downed org query cannot
+ * 402 every chat.
+ */
+export async function readTotalSpendableBalance(
+  userId: bigint | number | string,
+): Promise<bigint> {
+  const [personal, orgSpendable] = await Promise.all([
+    getSpendableBalance(userId),
+    getOrgSpendableForUser(userId).catch((err) => {
+      console.error("[preCheck] org spendable lookup failed, fail-open to personal", err);
+      return 0n;
+    }),
+  ]);
+  return personal + orgSpendable;
 }
 
 /** 释放预扣(按 handle)。成功返回 true / 不存在(过期或已释放)返回 false。 */

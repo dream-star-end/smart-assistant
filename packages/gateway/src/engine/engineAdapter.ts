@@ -104,6 +104,13 @@ export interface TurnParams {
   queueTurn?: boolean
   /** PR2 v1.0.66 — server-owned requestId(engine-reported 计费关联用;CCB noop 透传)。 */
   requestId?: string
+  /**
+   * Remaining spendable credits (fen) captured at master admission.
+   * Engine-reported adapters abort the in-flight process once running
+   * platform cost reaches this budget instead of finishing the whole
+   * agentic loop and clamping at settle.
+   */
+  creditBudgetFen?: bigint
   /** Stable logical paid-turn key shared by persistence and proxy billing. */
   turnKey?: string
   /** Trusted delegate billing attribution captured when the AgentSession was
@@ -218,9 +225,22 @@ export interface EngineAdapter extends EventEmitter {
   // ── resume ──
   /** 底座原生可续传 id(CCB session_id / codex thread_id);未知为 null。 */
   readonly nativeSessionId: string | null
+  /** Optional transport-level discriminator for engines that multiplex more
+   * than one incompatible native transcript format behind the same engine id.
+   * SessionManager uses it before deciding that a mapped id suppresses
+   * bounded history reconstruction. */
+  isResumeIdCompatible?(sessionId: string): boolean
   clearSessionId(): void
 
   // ── setters(与原 SubprocessRunner 对齐;均为 opts mutator,重启后生效)──
+  /** True when applying this model would change an incompatible transport and
+   * therefore requires SessionManager to replace the adapter, not merely
+   * restart its current subprocess. */
+  requiresReopenForModel?(model: string | undefined): boolean
+  /** Engine-owned recognition of an exact native cancellation result. The
+   * gateway still requires a matching browser USER_CANCELLED request before
+   * it may override a terminal summary. */
+  isUserCancellationResult?(summary: TurnSummary): boolean
   setModel(model: string | undefined): void
   readonly model: string | undefined
   setEffortLevel(level: string | undefined): void
@@ -232,7 +252,7 @@ export interface EngineAdapter extends EventEmitter {
   updateConfig(config: OpenClaudeConfig): void
   setToolsets(toolsets: string[] | undefined): void
   readonly toolsets: string[] | undefined
-  setExecutionTarget(target: ExecutionTarget): void
+  setExecutionTarget(target: ExecutionTarget): void | Promise<void>
   readonly executionTarget: ExecutionTarget
 
   // ── permission ──

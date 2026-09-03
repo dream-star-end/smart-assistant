@@ -23,6 +23,7 @@ import {
   PROMPT_QUEUE_SNAPSHOT_PATH,
   PROMPT_QUEUE_DETAIL_PATH,
   PROMPT_QUEUE_CLAIM_PATH,
+  isCursorContextTier,
 } from '@openclaude/protocol'
 
 export {
@@ -235,9 +236,15 @@ function validateMutation(value: unknown, owner: PromptQueueOwner): void {
       if (!isRecord(value.requestedExecution)) {
         throw new InvalidPromptQueueBodyError('requestedExecution object required')
       }
-      assertOnlyKeys(value.requestedExecution, ['model', 'effortLevel', 'teamMode'])
+      assertOnlyKeys(value.requestedExecution, ['model', 'effortLevel', 'teamMode', 'contextTier'])
       assertOptionalString('model', value.requestedExecution.model, 256)
       assertOptionalString('effortLevel', value.requestedExecution.effortLevel, 64, true)
+      if (
+        value.requestedExecution.contextTier !== undefined &&
+        !isCursorContextTier(value.requestedExecution.contextTier)
+      ) {
+        throw new InvalidPromptQueueBodyError('contextTier invalid')
+      }
       if (value.observedVersion !== undefined) assertString('observedVersion', value.observedVersion, 20, VERSION_RE)
       assertString('clientMessageId', value.clientMessageId, 128, ITEM_ID_RE)
       break

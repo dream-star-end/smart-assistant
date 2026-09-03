@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  cursorSettleMultiplier,
   mapCursorReportedUsage,
   planCursorExternalSettle,
 } from "../billing/cursorExternalSettle.js";
@@ -100,5 +101,85 @@ describe("planCursorExternalSettle", () => {
       assert.equal(plan.costCredits, 0n);
       assert.match(plan.snapshotJson, /cursor_engine_not_success/);
     }
+  });
+
+  test("user Stop (error + USER_CANCELLED) charges the tokens actually consumed", () => {
+    const usage = { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const plan = planCursorExternalSettle({ engineStatus: "error", usage, pricing: grok, terminalCode: "USER_CANCELLED" });
+    assert.equal(plan.settleStatus, "success");
+    assert.equal(plan.costCredits, 800n);
+    assert.match(plan.snapshotJson, /"cursor_status":"error"/);
+    assert.match(plan.snapshotJson, /"cursor_terminal_code":"USER_CANCELLED"/);
+    assert.match(plan.snapshotJson, /"charged_on_user_cancel":true/);
+    assert.doesNotMatch(plan.snapshotJson, /cursor_engine_not_success/);
+  });
+
+  test("user Stop with zero output is still waived as no_output", () => {
+    const usage = { input_tokens: 1_000_000, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const plan = planCursorExternalSettle({ engineStatus: "error", usage, pricing: grok, terminalCode: "USER_CANCELLED" });
+    assert.equal(plan.settleStatus, "success");
+    assert.equal(plan.costCredits, 0n);
+    assert.match(plan.snapshotJson, /"waived":"no_output"/);
+  });
+
+  test("user Stop under historical zeroCharge still settles at 0", () => {
+    const usage = { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const plan = planCursorExternalSettle({
+      engineStatus: "error",
+      usage,
+      pricing: grok,
+      terminalCode: "USER_CANCELLED",
+      zeroCharge: true,
+    });
+    assert.equal(plan.costCredits, 0n);
+    assert.match(plan.snapshotJson, /"waived":"historical_backfill_no_charge"/);
+  });
+
+  test("USER_CANCELLED does not rescue an unavailable (auth/quota) engine", () => {
+    const usage = { input_tokens: 1_000_000, output_tokens: 10, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const plan = planCursorExternalSettle({ engineStatus: "unavailable", usage, pricing: grok, terminalCode: "USER_CANCELLED" });
+    assert.equal(plan.settleStatus, "error");
+    assert.equal(plan.costCredits, 0n);
+  });
+
+  test("cursor opus/fable settle at 2x catalog price without touching the catalog multiplier", () => {
+    const usage = { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_tokens: 1_000_000, cache_write_tokens: 1_000_000 };
+    const fable = pricing({
+      model_id: "cursor-fable-5.1-high",
+      multiplier: "1.000",
+      input_per_mtok: 1524n,
+      output_per_mtok: 7621n,
+      cache_read_per_mtok: 152n,
+      cache_write_per_mtok: 1905n,
+    });
+    const opusFast = pricing({ model_id: "cursor-opus-5-high-fast", multiplier: "2.000" });
+    assert.equal(cursorSettleMultiplier("cursor-fable-5.1-high"), "2.000");
+    assert.equal(cursorSettleMultiplier("cursor-opus-5-high"), "2.000");
+    assert.equal(cursorSettleMultiplier("cursor-grok-4.6-high"), null);
+    assert.equal(cursorSettleMultiplier("claude-opus-5"), null);
+
+    const plan = planCursorExternalSettle({ engineStatus: "success", usage, pricing: fable });
+    // (1524 + 7621 + 152 + 1905) * 2
+    assert.equal(plan.costCredits, 22_404n);
+    assert.match(plan.snapshotJson, /"multiplier":"2.000"/);
+    assert.match(plan.snapshotJson, /"cursor_settle_multiplier":"2.000"/);
+    assert.match(plan.snapshotJson, /"catalog_multiplier":"1.000"/);
+    assert.equal(fable.multiplier, "1.000");
+
+    // -fast sibling composes: catalog 2x * surcharge 2x = 4x of base
+    const noCache = { ...usage, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const fast = planCursorExternalSettle({ engineStatus: "success", usage: noCache, pricing: opusFast });
+    assert.equal(fast.costCredits, 3_200n);
+    assert.match(fast.snapshotJson, /"multiplier":"4.000"/);
+
+    // grok untouched
+    const g = planCursorExternalSettle({ engineStatus: "success", usage: noCache, pricing: grok });
+    assert.equal(g.costCredits, 800n);
+    assert.doesNotMatch(g.snapshotJson, /cursor_settle_multiplier/);
+
+    // waiver bookkeeping reflects the surcharged amount
+    const err = planCursorExternalSettle({ engineStatus: "error", usage, pricing: fable });
+    assert.equal(err.costCredits, 0n);
+    assert.match(err.snapshotJson, /"wouldHaveCharged":"22404"/);
   });
 });

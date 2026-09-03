@@ -14,7 +14,7 @@ test('commercial foreground turns hold the shared memory barrier until submit fi
   assert.ok(submitStart >= 0 && submitEnd > submitStart, 'submit method must be extractable')
   const serialized = submit.indexOf('await prev')
   const acquired = submit.indexOf(
-    'memoryTurnBarrier = await new MemoryDir(session.agentId).acquireSharedBarrier()',
+    'memoryTurnBarrier = await new MemoryDir(session.agentId).acquireSharedBarrier({',
   )
   const modelRun = submit.indexOf('this.runOneTurnWithRetry(')
   const released = submit.indexOf('await memoryTurnBarrier?.release().catch(() => {})')
@@ -25,6 +25,11 @@ test('commercial foreground turns hold the shared memory barrier until submit fi
     'barrier is acquired only after turn serialization',
   )
   assert.ok(modelRun > acquired, 'barrier must cover the native model/tool turn')
+  assert.match(
+    submit,
+    /acquireSharedBarrier\(\{\s*totalBudgetMs: 60_000,\s*perAttemptMs: 5_000,\s*retryDelayMs: 100,/,
+    'foreground turns retry lock contention within a bounded one-minute budget',
+  )
   assert.ok(released > modelRun, 'barrier must remain held through model/tool completion')
   assert.ok(
     sessionReleased > released,

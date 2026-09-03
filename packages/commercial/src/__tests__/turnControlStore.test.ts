@@ -4,11 +4,13 @@ import type { Pool } from 'pg'
 
 import {
   admitDurableControl,
+  cancelPendingPermissionPromptsForTurn,
   claimDueTurnControls,
   DEFAULT_PERMISSION_TTL_MS,
   durableRetryDelayMs,
   MAX_PERMISSION_TTL_MS,
   resolvePermissionExpiresAt,
+  settlePermissionPromptFromRuntime,
   settleStopControlsForTurn,
   TurnControlConflictError,
 } from '../dispatch/turnControlStore.js'
@@ -39,7 +41,8 @@ function fakeTransactionalPool(
 
 describe('Master durable turn controls', () => {
   test('Stop commit cancels the exact recovery root in the same transaction', async () => {
-    const { pool, calls } = fakeTransactionalPool((sql) => {
+    const permissionCancels: unknown[][] = []
+    const { pool, calls } = fakeTransactionalPool((sql, params) => {
       if (sql.includes('pg_advisory_xact_lock')) return { rowCount: 1 }
       if (sql.includes('SELECT root_client_message_id FROM turn_recovery_jobs')) {
         return { rows: [{ root_client_message_id: 'message-1' }] }
@@ -49,6 +52,10 @@ describe('Master durable turn controls', () => {
       }
       if (sql.includes('SELECT status,dispatch_id,dispatch_attempt_no')) {
         return { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('UPDATE turn_permission_requests p')) {
+        permissionCancels.push(params)
+        return { rowCount: 1 }
       }
       if (sql.includes('UPDATE turn_recovery_jobs')) return { rowCount: 2 }
       throw new Error(`unexpected SQL: ${sql}`)
@@ -67,9 +74,18 @@ describe('Master durable turn controls', () => {
     assert.ok(calls[2]?.startsWith('SELECT root_client_message_id'))
     assert.ok(calls[3]?.startsWith('SELECT pg_advisory_xact_lock'))
     assert.ok(calls[4]?.startsWith('INSERT INTO turn_control_requests'))
-    assert.ok(calls[5]?.startsWith('SELECT status,dispatch_id,dispatch_attempt_no'))
-    assert.ok(calls[6]?.startsWith('UPDATE turn_recovery_jobs'))
+    // INC-20260903-PENDING-PERMISSION-ZOMBIE: the pending prompts of the
+    // stopped turn are closed inside the same Stop transaction.
+    assert.ok(calls[5]?.startsWith('UPDATE turn_permission_requests p'))
+    assert.ok(calls[6]?.startsWith('SELECT status,dispatch_id,dispatch_attempt_no'))
+    assert.ok(calls[7]?.startsWith('UPDATE turn_recovery_jobs'))
     assert.equal(calls.at(-1), 'COMMIT')
+    assert.equal(permissionCancels.length, 1)
+    const [uid, sid, root, controlId, responseJson] = permissionCancels[0]!
+    assert.deepEqual([uid, sid, root, controlId], ['7', 'session-1', 'message-1', 'ctrl-stop-1'])
+    assert.deepEqual(JSON.parse(responseJson as string), {
+      behavior: 'deny', settledBy: 'master', reason: 'user_stop',
+    })
   })
 
   test('permission response cannot be admitted without a live durable request authority', async () => {
@@ -108,6 +124,7 @@ describe('Master durable turn controls', () => {
           { status: 'sent', dispatch_id: 'dispatch-sent', dispatch_attempt_no: 2 },
         ] }
       }
+      if (sql.includes('UPDATE turn_permission_requests p')) return { rowCount: 0 }
       if (sql.includes('UPDATE turn_recovery_jobs')) return { rowCount: 2 }
       if (sql.includes('UPDATE turn_dispatches')) {
         terminalized.push(params)
@@ -167,6 +184,86 @@ describe('Master durable turn controls', () => {
     assert.equal(durableRetryDelayMs(1), 2_000)
     assert.equal(durableRetryDelayMs(20), 300_000)
     assert.equal(durableRetryDelayMs(1, 45_000), 45_000)
+  })
+})
+
+describe('INC-20260903-PENDING-PERMISSION-ZOMBIE — durable prompt settlement', () => {
+  function recordingQuery(rowCount = 1) {
+    const queries: Array<{ sql: string; params: unknown[] }> = []
+    const q = {
+      async query(sql: string, params: unknown[]) {
+        queries.push({ sql: sql.replace(/\s+/g, ' ').trim(), params })
+        return { rows: [], rowCount }
+      },
+    }
+    return { q: q as never, queries }
+  }
+
+  test('turn-scoped cancel closes only pending, non-detached rows of the lineage', async () => {
+    const { q, queries } = recordingQuery(2)
+    assert.equal(await cancelPendingPermissionPromptsForTurn(q, {
+      userId: 7n, sessionId: 'session-1', clientMessageId: 'message-root', reason: 'turn_finalized',
+    }), 2)
+    const { sql, params } = queries[0]!
+    assert.match(sql, /^UPDATE turn_permission_requests p SET status='cancelled'/)
+    assert.match(sql, /p\.status='pending'/)
+    assert.match(sql, /request_id NOT LIKE 'ask-user:%'/, 'detached ask_user must survive turn settlement')
+    assert.match(sql, /\$3::text IS NULL OR p\.client_message_id=\$3/)
+    // Recovery children of the root (and the root of a child) are covered the
+    // same way settleStopControlsForTurn walks the lineage.
+    assert.match(sql, /j\.root_client_message_id=\$3 AND j\.request_json->>'clientMessageId'=p\.client_message_id/)
+    assert.match(sql, /j\.root_client_message_id=p\.client_message_id AND j\.request_json->>'clientMessageId'=\$3/)
+    // Existing response metadata is never overwritten.
+    assert.match(sql, /response_control_id=COALESCE\(p\.response_control_id,\$4\)/)
+    assert.match(sql, /response_json=COALESCE\(p\.response_json,\$5::jsonb\)/)
+    assert.deepEqual(params.slice(0, 4), ['7', 'session-1', 'message-root', null])
+    assert.deepEqual(JSON.parse(params[4] as string), {
+      behavior: 'deny', settledBy: 'master', reason: 'turn_finalized',
+    })
+  })
+
+  test('legacy peer-wide Stop (null root) passes NULL so every turn prompt of the session closes', async () => {
+    const { q, queries } = recordingQuery(0)
+    assert.equal(await cancelPendingPermissionPromptsForTurn(q, {
+      userId: 7n, sessionId: 'session-1', clientMessageId: null, reason: 'user_stop', controlId: 'ctrl-1',
+    }), 0)
+    assert.deepEqual(queries[0]!.params.slice(0, 4), ['7', 'session-1', null, 'ctrl-1'])
+  })
+
+  test('runtime allow settlement moves the exact row to responded and keeps answers', async () => {
+    const { q, queries } = recordingQuery(1)
+    assert.equal(await settlePermissionPromptFromRuntime(q, {
+      userId: 7n, sessionId: 'webmtk6eghge4d8zo', requestId: 'toolu_01',
+      behavior: 'allow', reason: 'remote', answers: { 'How?': 'B' },
+    }), true)
+    const { sql, params } = queries[0]!
+    assert.match(sql, /^UPDATE turn_permission_requests SET status=\$4/)
+    assert.match(sql, /WHERE user_id=\$1 AND request_id=\$2 AND session_id=\$3 AND status='pending'$/)
+    assert.match(sql, /response_json=COALESCE\(response_json,\$5::jsonb\)/)
+    assert.deepEqual(params.slice(0, 4), ['7', 'toolu_01', 'webmtk6eghge4d8zo', 'responded'])
+    assert.deepEqual(JSON.parse(params[4] as string), {
+      behavior: 'allow', settledBy: 'runtime', reason: 'remote', answers: { 'How?': 'B' },
+    })
+  })
+
+  test('runtime deny settlement (disconnect/timeout/crashed/already_settled) cancels the row', async () => {
+    for (const reason of ['disconnect', 'timeout', 'crashed', 'already_settled']) {
+      const { q, queries } = recordingQuery(1)
+      assert.equal(await settlePermissionPromptFromRuntime(q, {
+        userId: 7n, sessionId: 'session-1', requestId: 'toolu_02', behavior: 'deny', reason,
+      }), true)
+      assert.equal(queries[0]!.params[3], 'cancelled')
+      assert.deepEqual(JSON.parse(queries[0]!.params[4] as string), {
+        behavior: 'deny', settledBy: 'runtime', reason,
+      })
+    }
+  })
+
+  test('runtime settlement of an already-closed row is a no-op and reports false', async () => {
+    const { q } = recordingQuery(0)
+    assert.equal(await settlePermissionPromptFromRuntime(q, {
+      userId: 7n, sessionId: 'session-1', requestId: 'toolu_03', behavior: 'deny', reason: 'timeout',
+    }), false)
   })
 })
 

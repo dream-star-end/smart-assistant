@@ -58,7 +58,7 @@ const PATTERNS: Array<{
   {
     re: /(?:insufficient[_ ]credits|INSUFFICIENT_CREDITS|\b402\b.*credit)/i,
     code: 'insufficient_credits',
-    message: '余额不足，请充值后继续',
+    message: '积分已耗尽，请充值',
   },
   // 认证/凭据失效 —— 401 / unauthorized / invalid api key / AUTH_ERROR 词族。
   // 不可自动重试(不进 TRANSIENT_RETRY_ERROR_CODES):凭据坏了重试只会再 401。

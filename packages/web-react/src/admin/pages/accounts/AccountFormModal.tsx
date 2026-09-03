@@ -74,8 +74,16 @@ export function AccountFormModal({
   const [grokVerificationUrl, setGrokVerificationUrl] = useState<string | null>(null);
   const [grokPrincipalType, setGrokPrincipalType] = useState<string | null>(null);
   const [grokPrincipalId, setGrokPrincipalId] = useState<string | null>(null);
+  // Cursor 账号登录会话(0257 Sand session 凭证)。machine id 由后端在登录时生成并随凭证一起入库。
+  const [cursorCredentialKind, setCursorCredentialKind] = useState<"api_key" | "session">("api_key");
+  const [cursorSessionId, setCursorSessionId] = useState<string | null>(null);
+  const [cursorSessionUrl, setCursorSessionUrl] = useState<string | null>(null);
+  const [cursorMachineId, setCursorMachineId] = useState<string | null>(null);
+  const [cursorAuthId, setCursorAuthId] = useState<string | null>(null);
+  const [cursorSessionEmail, setCursorSessionEmail] = useState<string | null>(null);
 
   const provider = isCreate ? providerCreate : account?.provider || "claude";
+  const isCursorSession = provider === "cursor" && (isCreate ? cursorCredentialKind === "session" : account?.cursor_credential_kind === "session");
   const prefillEgress = account?.egress_proxy_id != null ? String(account.egress_proxy_id) : "";
   const prefillGroup = account?.group_id != null ? String(account.group_id) : "";
 
@@ -105,6 +113,12 @@ export function AccountFormModal({
     setGrokVerificationUrl(null);
     setGrokPrincipalType(null);
     setGrokPrincipalId(null);
+    setCursorCredentialKind("api_key");
+    setCursorSessionId(null);
+    setCursorSessionUrl(null);
+    setCursorMachineId(null);
+    setCursorAuthId(null);
+    setCursorSessionEmail(null);
     setDepsError(null);
     setDepsLoading(true);
     let alive = true;
@@ -242,10 +256,116 @@ export function AccountFormModal({
     setGrokSessionId(null);
   }, [open, grokSessionId]);
 
+  // Cursor 账号登录(Sand PKCE / loginDeepControl):后端生成 verifier + machine id 并轮询 /auth/poll,
+  // 前端只拿 verification_url 打开、再轮询登录会话状态,完成后 access/refresh/machine id 回填表单。
+  const startCursorSessionLogin = useCallback(async () => {
+    setExchanging(true);
+    try {
+      const r = await adminSend<{ status?: string; session_id?: string; verification_url?: string }>(
+        "POST",
+        "/accounts/cursor-session/start",
+        {},
+      );
+      if (!r.session_id || !r.verification_url) {
+        toast("Cursor 登录启动返回不完整", "error");
+        return;
+      }
+      setCursorSessionId(r.session_id);
+      setCursorSessionUrl(r.verification_url);
+      const win = window.open(r.verification_url, "_blank", "noopener");
+      setOauthHint(win ? "Cursor 登录页已打开，登录并确认后，本页会自动回填会话凭证。" : "弹窗被拦截，请手动打开下方链接。");
+    } catch (e) {
+      toast(`Cursor 登录启动失败: ${errMsg(e)}`, "error");
+    } finally {
+      setExchanging(false);
+    }
+  }, [toast]);
+
+  useEffect(() => {
+    if (!open || !cursorSessionId) return;
+    let alive = true;
+    let polling = false;
+    const poll = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const r = await adminGet<{
+          status: "pending" | "complete" | "failed";
+          access_token?: string;
+          refresh_token?: string;
+          expires_at?: string;
+          machine_id?: string;
+          auth_id?: string | null;
+          email?: string | null;
+          error?: string;
+        }>(`/accounts/cursor-session/${encodeURIComponent(cursorSessionId)}`);
+        if (!alive || r.status === "pending") return;
+        if (r.status === "complete" && r.access_token && r.refresh_token && r.expires_at && r.machine_id) {
+          setToken(r.access_token);
+          setRefresh(r.refresh_token);
+          setExpires(r.expires_at);
+          setCursorMachineId(r.machine_id);
+          setCursorAuthId(r.auth_id ?? null);
+          setCursorSessionEmail(r.email ?? null);
+          setCursorCredentialKind("session");
+          setCursorSandEnabled(true);
+          setTokenFilled(true);
+          setCursorSessionId(null);
+          toast("Cursor 账号登录已完成，会话凭证已写入表单。", "success");
+          return;
+        }
+        setCursorSessionId(null);
+        toast(`Cursor 登录失败: ${r.error || "未知错误"}`, "error");
+      } catch (e) {
+        if (alive) {
+          setCursorSessionId(null);
+          toast(`Cursor 登录状态读取失败: ${errMsg(e)}`, "error");
+        }
+      } finally {
+        polling = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1500);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [open, cursorSessionId, toast]);
+
+  useEffect(() => {
+    if (open || !cursorSessionId) return;
+    void adminSend("DELETE", `/accounts/cursor-session/${encodeURIComponent(cursorSessionId)}`).catch(() => {});
+    setCursorSessionId(null);
+  }, [open, cursorSessionId]);
+
+  const resetCursorSessionFields = useCallback(() => {
+    if (cursorSessionId) {
+      void adminSend("DELETE", `/accounts/cursor-session/${encodeURIComponent(cursorSessionId)}`).catch(() => {});
+    }
+    setCursorCredentialKind("api_key");
+    setCursorSessionId(null);
+    setCursorSessionUrl(null);
+    setCursorMachineId(null);
+    setCursorAuthId(null);
+    setCursorSessionEmail(null);
+  }, [cursorSessionId]);
+
+  /** 从 session 形态退回 API Key 形态:会话凭证一并清掉,避免 JWT 被当成 crsr_ 提交。 */
+  const switchToCursorApiKey = useCallback(() => {
+    resetCursorSessionFields();
+    setToken("");
+    setRefresh("");
+    setExpires("");
+    setTokenFilled(false);
+    setOauthHint(null);
+  }, [resetCursorSessionFields]);
+
   const changeProvider = useCallback((next: "claude" | "codex" | "grok" | "cursor") => {
     if (grokSessionId) {
       void adminSend("DELETE", `/accounts/grok-device/${encodeURIComponent(grokSessionId)}`).catch(() => {});
     }
+    resetCursorSessionFields();
     setProviderCreate(next);
     setCursorSandEnabled(false);
     setCursorQuotaClass("unknown");
@@ -311,7 +431,16 @@ export function AccountFormModal({
     if (isCreate) {
       const tk = token.trim();
       if (!tk) {
-        toast(provider === "cursor" ? "Cursor API Key 必填" : "oauth_token 必填", "error");
+        toast(
+          provider === "cursor"
+            ? (isCursorSession ? "请先完成 Cursor 账号登录，会话凭证会自动填入" : "Cursor API Key 必填")
+            : "oauth_token 必填",
+          "error",
+        );
+        return;
+      }
+      if (isCursorSession && (!cursorMachineId || !refresh.trim())) {
+        toast("Cursor 会话凭证不完整（缺 machine id 或 refresh token），请重新登录", "error");
         return;
       }
       if (provider !== "cursor" && !egressId) {
@@ -330,12 +459,21 @@ export function AccountFormModal({
       if (subEnd.trim()) body.subscription_end_at = isNull(subEnd) ? null : subEnd.trim();
       if (groupId) body.group_id = groupId;
       if (provider === "cursor") {
-        body.cursor_sand_enabled = cursorSandEnabled;
         body.cursor_quota_class = cursorQuotaClass;
+        if (isCursorSession) {
+          // 0257 — 会话凭证只服务 Sand 直连,后端强制 sand=true;machine id 必须与登录时一致。
+          body.cursor_credential_kind = "session";
+          body.cursor_machine_id = cursorMachineId;
+          body.cursor_auth_id = cursorAuthId;
+          body.cursor_sand_enabled = true;
+        } else {
+          body.cursor_credential_kind = "api_key";
+          body.cursor_sand_enabled = cursorSandEnabled;
+        }
       }
     } else {
       if (provider === "cursor") {
-        body.cursor_sand_enabled = cursorSandEnabled;
+        body.cursor_sand_enabled = isCursorSession ? true : cursorSandEnabled;
         body.cursor_quota_class = cursorQuotaClass;
       }
       body.status = statusEdit;
@@ -368,7 +506,7 @@ export function AccountFormModal({
     }
   }, [
     label, plan, isCreate, token, egressId, provider, refresh, expires, subEnd, groupId,
-    grokPrincipalType, grokPrincipalId,
+    grokPrincipalType, grokPrincipalId, isCursorSession, cursorMachineId, cursorAuthId,
     statusEdit, prefillEgress, prefillGroup, account, cursorSandEnabled, cursorQuotaClass, onOpenChange, onSaved, toast,
   ]);
 
@@ -450,8 +588,56 @@ export function AccountFormModal({
           </Field>}
 
           {isCreate && provider === "cursor" && (
+            <div className="rounded-lg border border-accent/40 bg-accent-soft/50 p-3.5">
+              <div className="mb-2 flex items-center gap-1.5 text-[13px] font-semibold text-fg">
+                <KeyRound size={15} className="text-accent" /> 登录 Cursor 账号（Sand 会话，无需 API Key）
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="accent"
+                  onClick={startCursorSessionLogin}
+                  disabled={exchanging || !!cursorSessionId || isCursorSession}
+                >
+                  {exchanging || cursorSessionId ? <Spinner className="size-4" /> : isCursorSession ? "已登录" : "打开 Cursor 登录页"}
+                </Button>
+                <span className="text-[12px] text-muted">
+                  与 Grok Bot 客户端同一套 PKCE 登录，拿到的是 Cursor 账号会话（accessToken / refreshToken），只服务 Sand 直连；Grok 4.6 / Composer 等原生 CLI 模型不走该凭证。
+                </span>
+              </div>
+              {cursorSessionUrl && cursorSessionId && (
+                <p className="mt-2 break-all font-mono text-[11px] text-muted">{cursorSessionUrl}</p>
+              )}
+              {oauthHint && <p className="mt-2 text-[12px] text-muted">{oauthHint}</p>}
+              {isCursorSession && tokenFilled && (
+                <div className="mt-2 flex flex-col gap-1 text-[12px]">
+                  <p className="flex items-center gap-1 text-success">
+                    <CheckCircle2 size={13} /> 会话凭证已写入下方表单
+                    {cursorSessionEmail ? `（${cursorSessionEmail}）` : cursorAuthId ? `（${cursorAuthId}）` : ""}
+                    ，核对 label/plan 后点"创建"。
+                  </p>
+                  {cursorMachineId && (
+                    <p className="text-muted">
+                      machine id: <span className="font-mono text-fg">{cursorMachineId}</span>（随凭证一起入库，后续请求 checksum 由它派生）
+                    </p>
+                  )}
+                  <button type="button" className="self-start text-accent hover:underline" onClick={switchToCursorApiKey}>
+                    改用 API Key（crsr_…）
+                  </button>
+                </div>
+              )}
+              {!isCursorSession && (
+                <p className="mt-2 text-[12px] text-muted">
+                  或者在下方直接粘贴官方订阅 API Key（`crsr_…`）：密钥加密进账号池，再物化到宿主机 auth 目录供 oc-cursor 轮询，与 CCB 账号池同一套启用 / 冷却 / 分组。
+                </p>
+              )}
+            </div>
+          )}
+
+          {!isCreate && isCursorSession && (
             <div className="rounded-lg border border-accent/40 bg-accent-soft/50 p-3.5 text-[13px] text-muted">
-              Cursor 使用官方订阅 API Key（`crsr_…`）。密钥加密进账号池，再物化到宿主机 auth 目录供 oc-cursor 轮询，与 CCB 账号池同一套启用 / 冷却 / 分组。
+              该账号为 Cursor 账号登录会话凭证（Sand）{account?.cursor_auth_id ? `，auth id ${account.cursor_auth_id}` : ""}。
+              Sand 模式固定开启；如需换 token，请粘贴同一账号重新登录得到的 accessToken / refreshToken。
             </div>
           )}
 
@@ -520,15 +706,18 @@ export function AccountFormModal({
               <div className="flex flex-col">
                 <span className="text-[13px] font-medium text-fg">启用 Sand 客户端模式</span>
                 <span className="text-[11px] text-muted">
-                  Opus 5 / Opus 4.8 / Fable 5 等高级模型携带 Sand 客户端请求头 (x-cursor-client-type: sand)；Grok 4.6 / Composer 2.5 保持原生 CLI 模式
+                  {isCursorSession
+                    ? "会话凭证只服务 Sand 直连，此项固定开启"
+                    : "Opus 5 / Opus 4.8 / Fable 5 等高级模型携带 Sand 客户端请求头 (x-cursor-client-type: sand)；Grok 4.6 / Composer 2.5 保持原生 CLI 模式"}
                 </span>
               </div>
               <label className="relative inline-flex cursor-pointer items-center">
                 <input
                   type="checkbox"
-                  checked={cursorSandEnabled}
+                  checked={isCursorSession ? true : cursorSandEnabled}
+                  disabled={isCursorSession}
                   onChange={(e) => setCursorSandEnabled(e.target.checked)}
-                  className="size-4 rounded border-border text-accent focus:ring-accent"
+                  className="size-4 rounded border-border text-accent focus:ring-accent disabled:opacity-60"
                 />
               </label>
             </div>
@@ -578,23 +767,37 @@ export function AccountFormModal({
           </div>
 
           <Field label={provider === "cursor"
-            ? `Cursor API Key ${isCreate ? "(必填)" : "(留空则不修改)"}`
+            ? (isCursorSession
+              ? `Cursor 会话 accessToken ${isCreate ? "(由登录自动填入)" : "(留空则不修改)"}`
+              : `Cursor API Key ${isCreate ? "(必填)" : "(留空则不修改)"}`)
             : `oauth_token ${isCreate ? "(必填)" : "(留空则不修改)"}`}>
             <Textarea
               value={token}
               rows={2}
               onChange={(e) => setToken(e.target.value)}
+              readOnly={isCreate && isCursorSession}
               placeholder={isCreate
-                ? (provider === "cursor" ? "粘贴 crsr_ 开头的 Cursor API Key" : "粘贴 OAuth access token")
+                ? (provider === "cursor"
+                  ? (isCursorSession ? "登录完成后自动填入" : "粘贴 crsr_ 开头的 Cursor API Key")
+                  : "粘贴 OAuth access token")
                 : "不动 → 留空"}
             />
           </Field>
 
-          {provider !== "cursor" && <Field label={`oauth_refresh_token ${isCreate ? "(可选)" : "(留空不改;输入 NULL 清空)"}`}>
-            <Input value={refresh} onChange={(e) => setRefresh(e.target.value)} placeholder="可选" />
+          {(provider !== "cursor" || isCursorSession) && <Field
+            label={isCursorSession
+              ? `Cursor 会话 refreshToken ${isCreate ? "(由登录自动填入)" : "(留空不改)"}`
+              : `oauth_refresh_token ${isCreate ? "(可选)" : "(留空不改;输入 NULL 清空)"}`}
+          >
+            <Input
+              value={refresh}
+              onChange={(e) => setRefresh(e.target.value)}
+              readOnly={isCreate && isCursorSession}
+              placeholder={isCursorSession ? (isCreate ? "登录完成后自动填入" : "不动 → 留空") : "可选"}
+            />
           </Field>}
 
-          {provider !== "cursor" && <Field label={`oauth_expires_at ${isCreate ? "(可选 ISO 时间)" : "(留空不动;输入 NULL 清空)"}`}>
+          {(provider !== "cursor" || isCursorSession) && <Field label={`oauth_expires_at ${isCreate ? "(可选 ISO 时间)" : "(留空不动;输入 NULL 清空)"}`}>
             <Input
               value={expires}
               onChange={(e) => setExpires(e.target.value)}

@@ -4,15 +4,44 @@
  * Cursor adapter 仍是 billingMode='external'（订阅 CLI 上报 usage），
  * 但 selfhost 要从 0221 官方价走 settleUsageAndLedger 扣积分。
  * 不做 Codex 式 preCheck/journal；不足则 spendTwoBucket clamp。
- * 只对 engine status='success' 扣费；error/unavailable 落 audit 痕、0 扣。
+ * engine status='success' 按实扣费；用户主动 Stop（status='error' +
+ * terminalCode=USER_CANCELLED）同样按引擎上报的真实 token 扣费（2026-09-03 起）；
+ * 其余 error/unavailable 落 audit 痕、0 扣。
  * 零输出免单对齐 f3818040 / codexFinalizer。
  */
 import type { Pool } from "pg";
+import { composeMultiplier } from "@openclaude/protocol";
 import { computeCost, type TokenUsage } from "./calculator.js";
 import type { ModelPricing, PricingCache } from "./pricing.js";
 import { settleUsageAndLedger, type SettleResult } from "./proxyBilling.js";
 
 export type CursorEngineStatus = "success" | "error" | "unavailable";
+
+/**
+ * Settle-time surcharge for Cursor Sand Opus/Fable families (operator decision
+ * 2026-09-03): the credits actually debited are 2x the catalog price, but the
+ * public catalog (`model_pricing.multiplier`, cost_x badge, per_ktok_credits)
+ * is left untouched so nothing user-facing advertises the markup. Composed on
+ * top of the row multiplier (so `-fast` siblings keep their own 2x) and
+ * recorded in price_snapshot as `cursor_settle_multiplier` for reconciliation.
+ */
+export const CURSOR_SETTLE_SURCHARGE_FAMILIES: ReadonlyArray<string> = ["cursor-opus-", "cursor-fable-"];
+export const CURSOR_SETTLE_SURCHARGE_MULTIPLIER = "2.000";
+
+export function cursorSettleMultiplier(modelId: string): string | null {
+  return CURSOR_SETTLE_SURCHARGE_FAMILIES.some((prefix) => modelId.startsWith(prefix))
+    ? CURSOR_SETTLE_SURCHARGE_MULTIPLIER
+    : null;
+}
+
+function applyCursorSettleMultiplier(pricing: ModelPricing): { pricing: ModelPricing; surcharge: string | null } {
+  const surcharge = cursorSettleMultiplier(pricing.model_id);
+  if (surcharge === null) return { pricing, surcharge: null };
+  return {
+    pricing: { ...pricing, multiplier: composeMultiplier(pricing.multiplier, surcharge) },
+    surcharge,
+  };
+}
 
 function asTokens(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
@@ -46,22 +75,35 @@ export function planCursorExternalSettle(args: {
   costCredits: bigint;
   snapshotJson: string;
 } {
-  const { cost_credits, snapshot } = computeCost(args.usage, args.pricing);
+  const { pricing: effectivePricing, surcharge } = applyCursorSettleMultiplier(args.pricing);
+  const { cost_credits, snapshot } = computeCost(args.usage, effectivePricing);
   const engineOk = args.engineStatus === "success";
+  // A user-initiated Stop is not an engine failure: the tokens the engine
+  // reported were really consumed upstream before the abort landed, so the
+  // turn settles at its actual cost (operator decision 2026-09-03). Only the
+  // adapter's `error` status qualifies; `unavailable` (auth/quota) still
+  // means the upstream call never went through.
+  const userCancelled =
+    args.engineStatus === "error" && args.terminalCode === "USER_CANCELLED";
+  const chargeable = engineOk || userCancelled;
   const waivedNoOutput =
-    engineOk && BigInt(args.usage.output_tokens ?? 0) === 0n && cost_credits > 0n;
-  const wouldCharge = engineOk && !waivedNoOutput ? cost_credits : 0n;
+    chargeable && BigInt(args.usage.output_tokens ?? 0) === 0n && cost_credits > 0n;
+  const wouldCharge = chargeable && !waivedNoOutput ? cost_credits : 0n;
   const zeroCharged = args.zeroCharge === true && wouldCharge > 0n;
   const costCredits = zeroCharged ? 0n : wouldCharge;
-  const settleStatus: "success" | "error" = engineOk ? "success" : "error";
+  const settleStatus: "success" | "error" = chargeable ? "success" : "error";
   const snapshotJson = JSON.stringify({
     ...snapshot,
     cursor_status: args.engineStatus,
+    ...(surcharge !== null
+      ? { cursor_settle_multiplier: surcharge, catalog_multiplier: args.pricing.multiplier }
+      : {}),
     ...(args.terminalCode ? { cursor_terminal_code: args.terminalCode } : {}),
+    ...(userCancelled ? { charged_on_user_cancel: true } : {}),
     ...(waivedNoOutput
       ? { waived: "no_output", wouldHaveCharged: cost_credits.toString() }
       : {}),
-    ...(!engineOk && cost_credits > 0n
+    ...(!chargeable && cost_credits > 0n
       ? { waived: "cursor_engine_not_success", wouldHaveCharged: cost_credits.toString() }
       : {}),
     ...(zeroCharged

@@ -1,10 +1,13 @@
 import {
   type ContextTierFamily,
+  type CursorContextTier,
   type CursorEngineFamilyId,
   DEFAULT_CODEX_ENGINE_MODEL,
   DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME,
+  DEFAULT_CURSOR_CONTEXT_TIER,
   type PlatformReasoningEffort,
   contextFamilyByModelId,
+  cursorFamilySupportsContextTier,
   cursorFamilySupportsFast,
   cursorModelById,
 } from '@openclaude/protocol'
@@ -139,6 +142,8 @@ export function ModelSelector({
   effortSupported,
   effortActive,
   onSelectEffort,
+  contextTier,
+  onSelectContextTier,
 }: {
   models: PublicModel[]
   lockedModels?: LockedPublicModel[]
@@ -150,6 +155,13 @@ export function ModelSelector({
   effortSupported?: readonly string[]
   effortActive?: PreferenceEffort | null
   onSelectEffort?: (value: PreferenceEffort | null) => void
+  /**
+   * Cursor Opus/Fable 上下文档位(300k 默认 / 1M)。不是 model id 的一部分:master 按
+   * InboundMessage.contextTier 逐 turn 收窄签名 descriptor.contextWindow(protocol
+   * projectContextWindowForCursorTier),目录只带 1M 上限。undefined = 300k 默认。
+   */
+  contextTier?: CursorContextTier | null
+  onSelectContextTier?: (tier: CursorContextTier) => void
 }) {
   const selected = models.find((m) => m.id === selectedId)
   const selectedCursor = cursorModelById(selectedId)
@@ -187,6 +199,11 @@ export function ModelSelector({
     selectedContext != null &&
     contextFamilyHasStandard(contextMembers, selectedContext) &&
     contextFamilyHasLong(contextMembers, selectedContext)
+  const showCursorContextTier =
+    selectedCursor != null &&
+    cursorFamilySupportsContextTier(selectedCursor.family) &&
+    onSelectContextTier != null
+  const activeCursorContextTier: CursorContextTier = contextTier ?? DEFAULT_CURSOR_CONTEXT_TIER
   const showPlatformEffort =
     !selectedCursor && Boolean(effortSupported && effortSupported.length > 0 && onSelectEffort)
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
@@ -499,6 +516,37 @@ export function ModelSelector({
               >
                 <span>Fast</span>
                 {selectedCursor.fast && <Check size={14} className="shrink-0 text-accent" />}
+              </DropdownMenuItem>
+            </div>
+          )}
+          {showCursorContextTier && onSelectContextTier && (
+            <div className="shrink-0">
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel className="flex items-center justify-between">
+                上下文
+                <span className="text-[11px] font-normal text-faint">
+                  {activeCursorContextTier === '1m' ? '1M' : '300k'}
+                </span>
+              </DropdownMenuLabel>
+              <DropdownMenuItem
+                data-cursor-context="300k"
+                onSelect={() => onSelectContextTier('300k')}
+                className="justify-between"
+              >
+                <span>300k（默认）</span>
+                {activeCursorContextTier === '300k' && (
+                  <Check size={14} className="shrink-0 text-accent" />
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                data-cursor-context="1m"
+                onSelect={() => onSelectContextTier('1m')}
+                className="justify-between"
+              >
+                <span>1M（更少压缩，单轮消耗更高）</span>
+                {activeCursorContextTier === '1m' && (
+                  <Check size={14} className="shrink-0 text-accent" />
+                )}
               </DropdownMenuItem>
             </div>
           )}

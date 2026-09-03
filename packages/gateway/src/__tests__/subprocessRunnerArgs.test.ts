@@ -18,7 +18,14 @@ import * as assert from 'node:assert/strict'
  * Run: npx tsx --test packages/gateway/src/__tests__/subprocessRunnerArgs.test.ts
  */
 import { describe, it } from 'node:test'
-import { buildCcbCliArgs, CCB_PLATFORM_DISALLOWED_TOOLS } from '../subprocessRunner.js'
+import {
+  buildCcbCliArgs,
+  buildOfficialClaudeCliArgs,
+  CCB_PLATFORM_DISALLOWED_TOOLS,
+  OFFICIAL_CC_PLATFORM_DISALLOWED_TOOLS,
+  _isExpectedOfficialClaudeAbortExit,
+  _isOfficialClaudeAbortResult,
+} from '../subprocessRunner.js'
 
 const BASE = {
   runtime: 'bun',
@@ -295,6 +302,38 @@ describe('buildCcbCliArgs', () => {
   })
 })
 
+describe('official Claude Code cooperative Stop exit', () => {
+  const abortResult = {
+    type: 'result',
+    subtype: 'error_during_execution',
+    is_error: true,
+    stop_reason: null,
+    terminal_reason: 'aborted_streaming',
+  }
+
+  it('recognizes only the exact aborted_streaming result and following exit 1', () => {
+    assert.equal(_isOfficialClaudeAbortResult(abortResult), true)
+    assert.equal(_isOfficialClaudeAbortResult({ ...abortResult, terminal_reason: 'error' }), false)
+    assert.equal(_isOfficialClaudeAbortResult({ ...abortResult, is_error: false }), false)
+
+    assert.equal(_isExpectedOfficialClaudeAbortExit({
+      harness: 'official-cc', code: 1, signal: null, abortResultObserved: true,
+    }), true)
+    assert.equal(_isExpectedOfficialClaudeAbortExit({
+      harness: 'ccb', code: 1, signal: null, abortResultObserved: true,
+    }), false)
+    assert.equal(_isExpectedOfficialClaudeAbortExit({
+      harness: 'official-cc', code: 2, signal: null, abortResultObserved: true,
+    }), false)
+    assert.equal(_isExpectedOfficialClaudeAbortExit({
+      harness: 'official-cc', code: 1, signal: 'SIGTERM', abortResultObserved: true,
+    }), false)
+    assert.equal(_isExpectedOfficialClaudeAbortExit({
+      harness: 'official-cc', code: 1, signal: null, abortResultObserved: false,
+    }), false)
+  })
+})
+
   it('non-hermetic settingsFile emits --settings for PreToolUse hooks', () => {
     const args = buildCcbCliArgs({
       ...BASE,
@@ -303,3 +342,55 @@ describe('buildCcbCliArgs', () => {
     assert.ok(hasFlagWithValue(args, '--settings', '/tmp/efficiency-hooks.json'))
     assert.equal(args.includes('--bare'), false)
   })
+
+describe('buildOfficialClaudeCliArgs', () => {
+  it('uses only stock Claude Code flags and has no CCB positional placeholder', () => {
+    const args = buildOfficialClaudeCliArgs({
+      model: 'cursor-fable-5.1-high',
+      permissionMode: 'bypassPermissions',
+      extraPromptFile: '/tmp/persona.md',
+      mcpConfigFile: '/tmp/mcp.json',
+      settingsFile: '/tmp/settings.json',
+      resumeSessionId: '463989eb-daba-4a13-a32d-4ef00261ea08',
+      restrictedMemorySources: true,
+      addDir: '/workspace/project',
+    })
+
+    assert.deepEqual(args.slice(0, 5), [
+      '-p',
+      '--input-format=stream-json',
+      '--output-format=stream-json',
+      '--include-partial-messages',
+      '--verbose',
+    ])
+    for (const ccbOnly of ['run', '--workload', '--bare', '--json-schema', '']) {
+      assert.equal(args.includes(ccbOnly), false, `CCB-only token ${JSON.stringify(ccbOnly)} must be absent`)
+    }
+    assert.ok(hasFlagWithValue(args, '--model', 'cursor-fable-5.1-high'))
+    assert.ok(hasFlagWithValue(args, '--resume', '463989eb-daba-4a13-a32d-4ef00261ea08'))
+    assert.ok(hasFlagWithValue(args, '--permission-prompt-tool', 'stdio'))
+    assert.ok(hasFlagWithValue(args, '--settings', '/tmp/settings.json'))
+    assert.ok(hasFlagWithValue(args, '--append-system-prompt-file', '/tmp/persona.md'))
+    assert.ok(hasFlagWithValue(args, '--mcp-config', '/tmp/mcp.json'))
+    assert.ok(hasFlagWithValue(args, '--setting-sources', 'user'))
+    assert.ok(args.includes('--dangerously-skip-permissions'))
+    assert.deepEqual([...OFFICIAL_CC_PLATFORM_DISALLOWED_TOOLS], [
+      'SendMessage', 'CronList', 'CronCreate', 'CronDelete', 'ScheduleWakeup',
+    ])
+    const denyIdx = args.indexOf('--disallowedTools')
+    assert.deepEqual(
+      args.slice(denyIdx + 1, denyIdx + 1 + OFFICIAL_CC_PLATFORM_DISALLOWED_TOOLS.length),
+      [...OFFICIAL_CC_PLATFORM_DISALLOWED_TOOLS],
+    )
+    assert.deepEqual(args.slice(-2), ['--add-dir', '/workspace/project'])
+  })
+
+  it('omits optional stock flags when values are absent', () => {
+    const args = buildOfficialClaudeCliArgs({})
+    for (const flag of [
+      '--model', '--permission-mode', '--dangerously-skip-permissions', '--settings',
+      '--append-system-prompt-file', '--mcp-config', '--resume', '--setting-sources', '--add-dir',
+    ]) assert.equal(args.includes(flag), false, `${flag} must be absent`)
+    assert.ok(hasFlagWithValue(args, '--permission-prompt-tool', 'stdio'))
+  })
+})

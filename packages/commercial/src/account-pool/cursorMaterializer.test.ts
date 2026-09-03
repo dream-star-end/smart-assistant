@@ -138,6 +138,75 @@ describe("syncCursorAuthDir", () => {
     assert.match(identities, new RegExp(`api-key\\.2 2 ${fingerprintCursorKey(KEY_B)} 0`));
   });
 
+  test("materializes session rows with .credential-kind sidecar and skips malformed/expired ones", async () => {
+    const authDir = mkdtempSync(join(tmpdir(), "oc-cursor-auth-"));
+    const machineId = "abcdefghijklmnopqrstuvwxyz";
+    const futureExp = Math.floor(Date.now() / 1000) + 60 * 86400;
+    const pastExp = Math.floor(Date.now() / 1000) - 60;
+    const jwt = (exp: number) =>
+      `${Buffer.from('{"alg":"RS256","typ":"JWT"}').toString("base64url")}.${Buffer.from(JSON.stringify({ sub: "auth0|x", exp, type: "session" })).toString("base64url")}.${"s".repeat(40)}`;
+    const SESSION_OK = jwt(futureExp);
+    const result = await syncCursorAuthDir({
+      authDir,
+      listAccounts: async () =>
+        [
+          { id: 1n, provider: "cursor", status: "active", cooldown_until: null, cursor_quota_class: "unknown", cursor_sand_enabled: false },
+          { id: 2n, provider: "cursor", status: "active", cooldown_until: null, cursor_quota_class: "unknown", cursor_sand_enabled: true },
+          { id: 3n, provider: "cursor", status: "active", cooldown_until: null, cursor_quota_class: "unknown", cursor_sand_enabled: true },
+          { id: 4n, provider: "cursor", status: "active", cooldown_until: null, cursor_quota_class: "unknown", cursor_sand_enabled: false },
+        ] as never,
+      createAccount: async () => {
+        throw new Error("must not import when pool already has rows");
+      },
+      getCursorTokenSnapshot: async (id) => {
+        switch (String(id)) {
+          case "1":
+            return { token: Buffer.from(KEY_A, "utf8"), credential_kind: "api_key", machine_id: null, refresh: null, expires_at: null } as never;
+          case "2":
+            return {
+              token: Buffer.from(SESSION_OK, "utf8"),
+              credential_kind: "session",
+              machine_id: machineId,
+              refresh: Buffer.from("r", "utf8"),
+              expires_at: new Date(futureExp * 1000),
+            } as never;
+          case "3":
+            // expired session → skipped
+            return {
+              token: Buffer.from(jwt(pastExp), "utf8"),
+              credential_kind: "session",
+              machine_id: machineId,
+              refresh: null,
+              expires_at: new Date(pastExp * 1000),
+            } as never;
+          default:
+            // session row not sand-enabled → skipped, never downgraded
+            return {
+              token: Buffer.from(SESSION_OK, "utf8"),
+              credential_kind: "session",
+              machine_id: machineId,
+              refresh: null,
+              expires_at: new Date(futureExp * 1000),
+            } as never;
+        }
+      },
+    });
+    assert.equal(result.written, 2);
+    assert.equal(readFileSync(join(authDir, "api-key"), "utf8"), `${KEY_A}\n`);
+    assert.equal(readFileSync(join(authDir, "api-key.2"), "utf8"), `${SESSION_OK}\n`);
+    assert.equal(existsSync(join(authDir, "api-key.3")), false);
+    const kinds = readFileSync(join(authDir, ".credential-kind"), "utf8");
+    assert.match(kinds, /^# credential-kind v1\n/);
+    assert.match(kinds, /^api-key api_key -$/m);
+    assert.match(kinds, new RegExp(`^api-key\\.2 session ${machineId}$`, "m"));
+    assert.doesNotMatch(kinds, /eyJ/);
+    const sand = readFileSync(join(authDir, ".sand-mode"), "utf8");
+    assert.match(sand, /^api-key\.2 1$/m);
+    const generation = readFileSync(join(authDir, CURSOR_POOL_ACTIVE_FILE), "utf8").trim();
+    const generationDir = join(authDir, CURSOR_POOL_GENERATIONS_DIR, generation);
+    assert.equal(readFileSync(join(generationDir, ".credential-kind"), "utf8"), kinds);
+  });
+
 
   test("after first import, deleting the last pool row does not re-import leftover host files", async () => {
     const authDir = mkdtempSync(join(tmpdir(), "oc-cursor-auth-"));

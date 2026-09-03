@@ -634,6 +634,12 @@ export interface ServerAuthoredHandlerDeps {
   broadcastToUser?: (uid: bigint, payload: Record<string, unknown>) => void;
   /** Synchronous fire-and-forget signal hook; override only for tests. */
   recordProviderHealth?: (model: string, kind: "timeout") => void;
+  /** Fire-and-forget nudge after a *new* Phase A finalize committed. Lets the
+   * tape job scheduler start Phase B (materialize + automatic-recovery
+   * decision) at once instead of waiting for its polling interval, so the
+   * browser's 「正在重试中」 soft state resolves within a second rather than
+   * up to 5s. Never awaited; failures are the scheduler's own concern. */
+  onTapeFinalized?: (input: { userId: string; sessionId: string; tapeId: string }) => void;
   logger?: Logger;
   /** Override only for tests; real callers use Date.now via default. */
   now?: () => number;
@@ -846,6 +852,7 @@ export function makeServerAuthoredHandler(
           applyTurnWaiver: deps.applyTurnWaiver,
           broadcastToUser: deps.broadcastToUser,
           recordProviderHealth: deps.recordProviderHealth ?? recordProviderHealthSample,
+          onTapeFinalized: deps.onTapeFinalized,
           userLog,
           metric,
         });
@@ -2294,6 +2301,7 @@ async function handleLosslessTurnTapeRequest(args: {
   applyTurnWaiver?: (input: TurnWaiverInput) => Promise<TurnWaiverResult>;
   broadcastToUser?: (uid: bigint, payload: Record<string, unknown>) => void;
   recordProviderHealth?: (model: string, kind: "timeout") => void;
+  onTapeFinalized?: (input: { userId: string; sessionId: string; tapeId: string }) => void;
   userLog: Logger;
   metric: (outcome: V3SinkPersistOutcome, role?: V3SinkPersistRole) => void;
 }): Promise<void> {
@@ -2476,6 +2484,11 @@ async function handleLosslessTurnTapeRequest(args: {
         body.model
       ) {
         args.recordProviderHealth?.(body.model, "timeout");
+      }
+      if (result.applied === "finalized") {
+        try {
+          args.onTapeFinalized?.({ userId: args.userId, sessionId: body.sessionId, tapeId: body.tapeId });
+        } catch { /* scheduler nudge is best-effort; the interval tick still runs */ }
       }
       // late true tape(RFC §2.4):reconciler 已宣告 not_accepted、error 卡已投影,tape 迟到。
       // storage 已在同一 tx 撤 projection + 转 dispatch → manual_reconcile,内容仍完整 materialize

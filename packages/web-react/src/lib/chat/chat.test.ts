@@ -49,9 +49,12 @@ import {
   applyResumeFailed,
   applyTurnStatus,
   applyTurnUsage,
+  isSettledPermissionRequestId,
   normalizeDelegateCards,
   normalizeGoalCards,
+  rememberSettledPermissionRequestId,
   resetFrameSeqCursor,
+  SETTLED_PERMISSION_REQUEST_IDS_MAX,
   type FrameEffects,
 } from "./reducer";
 import {
@@ -336,7 +339,7 @@ describe("onopenSetInitialStatus / bridge error", () => {
   });
   test("normalize + friendly", () => {
     expect(normalizeBridgeErrorCode("ERR_INSUFFICIENT_CREDITS")).toBe("insufficient_credits");
-    expect(friendlyBridgeErrorMessage("INSUFFICIENT_CREDITS")).toMatch(/余额不足/);
+    expect(friendlyBridgeErrorMessage("INSUFFICIENT_CREDITS")).toMatch(/积分已耗尽/);
   });
 });
 
@@ -4424,6 +4427,7 @@ describe("Phase-A final-only tape projection retry", () => {
         _clientMessageId: clientMessageId,
         _turnOwnerId: clientMessageId,
         toolName: "Bash",
+        requestId: `toolu-done-${sessionId}`,
         _resolved: true,
       } as ChatMessage,
       {
@@ -4443,6 +4447,19 @@ describe("Phase-A final-only tape projection retry", () => {
       clientMessageId,
       `perm-open-${sessionId}`,
     ]);
+    // INC-20260903-PENDING-PERMISSION-ZOMBIE: the dropped resolved card's
+    // requestId stays known-settled so a stale hello replay cannot re-open it.
+    expect(isSettledPermissionRequestId(sess, `toolu-done-${sessionId}`)).toBe(true);
+    expect(applyPermissionRequest(sess, {
+      type: "outbound.permission_request",
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+      channel: "webchat",
+      peer: { id: sessionId, kind: "dm" },
+      requestId: `toolu-done-${sessionId}`,
+      toolName: "Bash",
+      clientMessageId,
+    } as OutboundPermissionRequestWire)).toBeNull();
+    expect(sess.messages.filter((m) => m.role === "permission")).toHaveLength(1);
     sock.stop();
   });
 
@@ -6880,6 +6897,260 @@ describe("ChatSocket interrupted continuation", () => {
     expect(
       reloaded.sessions.get("s-stop-recovery")?._cancelledAutomaticRecoveryIds?.[user.id],
     ).toBe(true);
+    sock.stop();
+    reloaded.stop();
+  });
+
+  test("known-settled permission requestIds survive toStored/loadStored so a post-reload hello replay cannot re-open them (INC-20260903-PENDING-PERMISSION-ZOMBIE)", () => {
+    const sessionId = "s-settled-permission-persist";
+    const sock = makeSocket();
+    const session = sock.ensureSession(sessionId, "main");
+    const frameBase = {
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+      channel: "webchat",
+      peer: { id: sessionId, kind: "dm" },
+    };
+    applyPermissionRequest(session, {
+      ...frameBase, type: "outbound.permission_request", requestId: "toolu_persist", toolName: "Bash",
+    } as OutboundPermissionRequestWire);
+    applyPermissionSettled(session, {
+      ...frameBase, type: "outbound.permission_settled", requestId: "toolu_persist", behavior: "deny", reason: "disconnect",
+    } as OutboundPermissionSettledWire);
+
+    const stored = sock.toStored(sessionId)!;
+    expect(stored._settledPermissionRequestIds).toEqual({ toolu_persist: true });
+    // Serialisable (no class instances / functions).
+    expect(JSON.parse(JSON.stringify(stored))._settledPermissionRequestIds).toEqual({ toolu_persist: true });
+
+    const reloaded = makeSocket();
+    reloaded.loadStored(JSON.parse(JSON.stringify(stored)));
+    const restored = reloaded.sessions.get(sessionId)!;
+    expect(isSettledPermissionRequestId(restored, "toolu_persist")).toBe(true);
+    restored.messages = restored.messages.filter((m) => m.role !== "permission");
+    expect(applyPermissionRequest(restored, {
+      ...frameBase, type: "outbound.permission_request", requestId: "toolu_persist", toolName: "Bash",
+    } as OutboundPermissionRequestWire)).toBeNull();
+
+    // A stored session without the field loads cleanly (older persisted shape).
+    const legacy = makeSocket();
+    const { _settledPermissionRequestIds: _dropped, ...legacyStored } = stored;
+    legacy.loadStored({ ...legacyStored, _settledPermissionRequestIds: "garbage" } as unknown as typeof stored);
+    expect(legacy.sessions.get(sessionId)!._settledPermissionRequestIds).toBeUndefined();
+    sock.stop();
+    reloaded.stop();
+    legacy.stop();
+  });
+});
+
+describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡延后)", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  /** 起一条 master 拥有自动恢复、已 admitted 的在飞 turn,再喂一条可自动恢复的 outbound.error。 */
+  function deferredErrorFixture(sessId: string, opts: { masterOwns?: boolean } = {}) {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: async () => {} });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    if (opts.masterOwns !== false) {
+      ws.onmessage?.({
+        data: JSON.stringify({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1" }),
+      });
+    }
+    sock.sendMessage({ sessId, agentId: "main", text: "long task", model: "kimi-k3-ark" });
+    const session = sock.sessions.get(sessId)!;
+    const user = session.messages.find((m) => m.role === "user")!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack", admitted: true, peer: { id: sessId, kind: "dm" }, clientMessageId: user.id,
+    }) });
+    ws.sent.length = 0;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.error", peer: { id: sessId, kind: "dm" }, clientMessageId: user.id,
+      code: "model_capacity", message: "at capacity", frameSeq: 1, ts: Date.now(),
+    }) });
+    return { sock, ws, session, user };
+  }
+
+  const errorCards = (session: { messages: ChatMessage[] }) =>
+    session.messages.filter((m) => m.role === "assistant" && !!m._errorCode);
+
+  test("master owns recovery → outbound.error paints no red card, keeps in-flight with the retrying soft hint", () => {
+    const { sock, session, user } = deferredErrorFixture("s-defer-soft");
+    expect(errorCards(session)).toHaveLength(0);
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._activeClientMessageId).toBe(user.id);
+    expect(session._turnStatus).toMatchObject({ kind: "retrying", attempt: 1, max: 10 });
+    expect(user.status).toBe("sent");
+    // 兼容 [error] text final(frameSeq+1)只是终结符:不得清软状态。
+    (sock as any).ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.message", sessionKey: "agent:main:webchat:dm:s-defer-soft", channel: "webchat",
+      peer: { id: "s-defer-soft", kind: "dm" }, clientMessageId: user.id, isFinal: true,
+      frameSeq: 2, ts: Date.now(), blocks: [{ kind: "text", text: "[error] at capacity" }],
+    }) });
+    expect(session._sendingInFlight).toBe(true);
+    expect(isRetryingTurnStatus(session._turnStatus)).toBe(true);
+    expect(errorCards(session)).toHaveLength(0);
+    expect(session.messages.some((m) => m.role === "assistant" && m.text.startsWith("[error]"))).toBe(false);
+    sock.stop();
+  });
+
+  test("legacy gateway (master does not own recovery) still paints the red card immediately", () => {
+    const { sock, session, user } = deferredErrorFixture("s-defer-legacy", { masterOwns: false });
+    expect(errorCards(session)).toHaveLength(1);
+    expect(errorCards(session)[0]).toMatchObject({ _errorCode: "model_capacity", _clientMessageId: user.id });
+    expect(session._sendingInFlight).toBe(false);
+    expect(user.status).toBe("error");
+    sock.stop();
+  });
+
+  test("sys.recovery_decision{scheduled:true} refines the attempt and extends the grace; ack adoption discards the deferred card", () => {
+    const { sock, ws, session, user } = deferredErrorFixture("s-defer-sched");
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "sys.recovery_decision", peer: { id: "s-defer-sched", kind: "dm" },
+      sourceClientMessageId: user.id, errorCode: "model_capacity", scheduled: true,
+      rootClientMessageId: user.id, mode: "checkpoint", attempt: 3, max: 10,
+    }) });
+    expect(session._turnStatus).toMatchObject({ kind: "retrying", attempt: 3 });
+    // 决策宽限(20s)过去后仍在等 ack 领养(30s):不物化。
+    vi.advanceTimersByTime(25_000);
+    expect(errorCards(session)).toHaveLength(0);
+    expect(session._sendingInFlight).toBe(true);
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack", admitted: true, peer: { id: "s-defer-sched", kind: "dm" },
+      clientMessageId: "m-recover-sched1",
+      recovery: {
+        automatic: true, mode: "checkpoint", sourceClientMessageId: user.id, rootClientMessageId: user.id,
+        attempt: 3, max: 10, agentId: "main", model: "kimi-k3-ark",
+      },
+    }) });
+    expect(session._activeClientMessageId).toBe("m-recover-sched1");
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._deferredTerminalErrorClientMessageId).toBeUndefined();
+    expect(session.messages.at(-1)).toMatchObject({ id: "m-recover-sched1", _automaticRecovery: true });
+    // 领养后即便所有宽限耗尽也不再补红卡。
+    vi.advanceTimersByTime(60_000);
+    expect(errorCards(session)).toHaveLength(0);
+    sock.stop();
+  });
+
+  test("sys.recovery_decision{scheduled:false} materializes the red card through the same painter", () => {
+    const { sock, ws, session, user } = deferredErrorFixture("s-defer-decline");
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "sys.recovery_decision", peer: { id: "s-defer-decline", kind: "dm" },
+      sourceClientMessageId: user.id, errorCode: "model_capacity", scheduled: false, reason: "exhausted",
+    }) });
+    const cards = errorCards(session);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ _errorCode: "model_capacity", _clientMessageId: user.id });
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._activeClientMessageId).toBeUndefined();
+    expect(session._turnStatus).toBeFalsy();
+    expect(user.status).toBe("error");
+    expect(session._deferredTerminalErrorClientMessageId).toBeUndefined();
+    // 幂等:同一裁决重复到达不叠卡。
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "sys.recovery_decision", peer: { id: "s-defer-decline", kind: "dm" },
+      sourceClientMessageId: user.id, errorCode: "model_capacity", scheduled: false, reason: "exhausted",
+    }) });
+    expect(errorCards(session)).toHaveLength(1);
+    sock.stop();
+  });
+
+  test("no decision within the grace window materializes the red card (backend silent fallback)", () => {
+    const { sock, session, user } = deferredErrorFixture("s-defer-timeout");
+    vi.advanceTimersByTime(19_999);
+    expect(errorCards(session)).toHaveLength(0);
+    expect(session._sendingInFlight).toBe(true);
+    vi.advanceTimersByTime(1);
+    expect(errorCards(session)).toHaveLength(1);
+    expect(errorCards(session)[0]._clientMessageId).toBe(user.id);
+    expect(session._sendingInFlight).toBe(false);
+    expect(user.status).toBe("error");
+    sock.stop();
+  });
+
+  test("recoverySkipped ack for the deferred lineage lands the red card before the skip notice", () => {
+    const { sock, ws, session, user } = deferredErrorFixture("s-defer-skip");
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack", admitted: false, recoverySkipped: true, recoverySkippedReason: "stale_tape",
+      peer: { id: "s-defer-skip", kind: "dm" }, clientMessageId: "m-recover-skip1",
+      sourceClientMessageId: user.id,
+    }) });
+    expect(errorCards(session)).toHaveLength(1);
+    expect(session._sendingInFlight).toBe(false);
+    sock.stop();
+  });
+
+  test("user Stop during the soft state fences the lineage, paints the card, sends a fence-only stop and rejects a late ack adoption", () => {
+    const { sock, ws, session, user } = deferredErrorFixture("s-defer-stop");
+    sock.stopTurn("s-defer-stop");
+    expect(errorCards(session)).toHaveLength(1);
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._stopSettlement).toBeUndefined();
+    expect(session._recoveryStatus).toEqual({ kind: "completed" });
+    expect(session._cancelledAutomaticRecoveryIds?.[user.id]).toBe(true);
+    expect(sock.isSessionBusy("s-defer-stop")).toBe(false);
+    // 围栏 stop 控制确实上送 master(取消已入队的恢复子轮)。
+    const stops = ws.sent.map((raw) => JSON.parse(raw)).filter((f) => f.type === "inbound.control.stop");
+    expect(stops).toHaveLength(1);
+    expect(stops[0]).toMatchObject({ clientMessageId: user.id, peer: { id: "s-defer-stop", kind: "dm" } });
+    // 围栏 stop 的回执不改 UI 状态(不清任何发送态、不进入停止态)。
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt", controlId: stops[0].controlId, controlKind: "stop",
+      status: "persisted", peer: { id: "s-defer-stop", kind: "dm" }, clientMessageId: user.id,
+    }) });
+    expect(session._recoveryStatus).toEqual({ kind: "completed" });
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt", controlId: stops[0].controlId, controlKind: "stop",
+      status: "terminal", peer: { id: "s-defer-stop", kind: "dm" }, clientMessageId: user.id,
+    }) });
+    expect(session._sendingInFlight).toBe(false);
+
+    // master 在 stop 落库前已发出的 ack 领养:不得重新拉回 in-flight。
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack", admitted: true, peer: { id: "s-defer-stop", kind: "dm" },
+      clientMessageId: "m-recover-stop1",
+      recovery: {
+        automatic: true, mode: "checkpoint", sourceClientMessageId: user.id, rootClientMessageId: user.id,
+        attempt: 1, max: 10, agentId: "main",
+      },
+    }) });
+    expect(session._sendingInFlight).toBe(false);
+    expect(session.messages.some((m) => m.id === "m-recover-stop1")).toBe(false);
+    // 后续的 scheduled 裁决同样无效(无 pending,且本轮不在飞)。
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "sys.recovery_decision", peer: { id: "s-defer-stop", kind: "dm" },
+      sourceClientMessageId: user.id, errorCode: "model_capacity", scheduled: true,
+      rootClientMessageId: user.id, mode: "checkpoint", attempt: 1, max: 10,
+    }) });
+    expect(session._sendingInFlight).toBe(false);
+    expect(errorCards(session)).toHaveLength(1);
+    sock.stop();
+  });
+
+  test("a fence-only stop survives reload without resurrecting in-flight / stopping state", () => {
+    const { sock, session, user } = deferredErrorFixture("s-defer-fence-reload");
+    // 让控制停在 queued(未发出)以便被持久化后重放。
+    (sock as any).ws.readyState = 0;
+    sock.stopTurn("s-defer-fence-reload");
+    const stored = sock.toStored("s-defer-fence-reload")!;
+    const controls = (sock as any).controlQueue.filter((c: { sessId: string }) => c.sessId === "s-defer-fence-reload");
+    expect(controls).toHaveLength(1);
+    expect(controls[0].fenceOnly).toBe(true);
+    const reloaded = makeSocket();
+    reloaded.loadStored({ ...stored, _pendingControls: controls.map((c: object) => ({ ...c, status: "queued" })) });
+    const restored = reloaded.sessions.get("s-defer-fence-reload")!;
+    expect(restored._sendingInFlight).toBeFalsy();
+    expect(restored._stopSettlement).toBeUndefined();
+    expect(restored._recoveryStatus?.kind).not.toBe("stopping");
+    expect(restored._cancelledAutomaticRecoveryIds?.[user.id]).toBe(true);
+    expect(session._sendingInFlight).toBe(false);
     sock.stop();
     reloaded.stop();
   });
@@ -9892,6 +10163,109 @@ describe("applyPermissionSettled — frameSeq exemption + requestId idempotency"
     expect(s.messages.filter((m) => m.role === "permission" && m.requestId === requestId)).toHaveLength(1);
     expect(card._resolved).toBe(true);
     expect(card._behavior).toBe("allow");
+  });
+});
+
+describe("INC-20260903-PENDING-PERMISSION-ZOMBIE — a settled requestId never re-opens a waiting card", () => {
+  const sessionKey = "agent:main:webchat:dm:webmtk6eghge4d8zo";
+  const requestId = "toolu_01ZombieBash";
+  const clientMessageId = "m-mtk6eghg-7p-lxal";
+
+  function permFrame(over: Record<string, unknown> = {}): OutboundPermissionRequestWire {
+    return {
+      type: "outbound.permission_request",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "webmtk6eghge4d8zo", kind: "dm" },
+      requestId,
+      toolName: "Bash",
+      toolUseId: requestId,
+      clientMessageId,
+      inputPreview: "git status",
+      ...over,
+    } as OutboundPermissionRequestWire;
+  }
+
+  function settledFrame(over: Record<string, unknown> = {}): OutboundPermissionSettledWire {
+    return {
+      type: "outbound.permission_settled",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "webmtk6eghge4d8zo", kind: "dm" },
+      requestId,
+      behavior: "deny",
+      reason: "disconnect",
+      ...over,
+    } as OutboundPermissionSettledWire;
+  }
+
+  test("hello catch-up re-sending a request the browser saw settled creates no card (card dropped by full-sync)", () => {
+    const s = sess();
+    const card = applyPermissionRequest(s, permFrame())!;
+    expect(card._resolved).toBe(false);
+    applyPermissionSettled(s, settledFrame());
+    expect(card._resolved).toBe(true);
+    expect(isSettledPermissionRequestId(s, requestId)).toBe(true);
+
+    // Full-sync / owner reset dropped the resolved card; the stale Master row
+    // is replayed at the next hello.
+    s.messages = s.messages.filter((m) => m.role !== "permission");
+    const zombie = applyPermissionRequest(s, permFrame());
+    expect(zombie).toBeNull();
+    expect(s.messages.filter((m) => m.role === "permission")).toHaveLength(0);
+  });
+
+  test("while the resolved card is still present, a re-sent request returns it unchanged (no second card)", () => {
+    const s = sess();
+    const card = applyPermissionRequest(s, permFrame())!;
+    applyPermissionSettled(s, settledFrame({ behavior: "allow", reason: "remote" }));
+    const again = applyPermissionRequest(s, permFrame());
+    expect(again).toBe(card);
+    expect(card._resolved).toBe(true);
+    expect(s.messages.filter((m) => m.role === "permission")).toHaveLength(1);
+  });
+
+  test("settled overtaking its request still materialises exactly one card, already resolved", () => {
+    const s = sess();
+    applyPermissionSettled(s, settledFrame({ behavior: "deny", reason: "timeout" }));
+    expect(isSettledPermissionRequestId(s, requestId)).toBe(true);
+    const card = applyPermissionRequest(s, permFrame());
+    expect(card).not.toBeNull();
+    expect(card!._resolved).toBe(true);
+    expect(card!._settledReason).toBe("timeout");
+    // The stash is consumed; a later replay of the same request is now a zombie.
+    s.messages = s.messages.filter((m) => m.role !== "permission");
+    expect(applyPermissionRequest(s, permFrame())).toBeNull();
+  });
+
+  test("detached ask_user prompts are exempt: a settled id may still be re-materialised by the tape", () => {
+    const s = sess();
+    const askId = "ask-user:" + "ab".repeat(16);
+    rememberSettledPermissionRequestId(s, askId);
+    const card = applyPermissionRequest(s, permFrame({
+      requestId: askId, toolName: "AskUserQuestion", detachedAskUser: true, clientMessageId: undefined, toolUseId: undefined,
+    }));
+    expect(card).not.toBeNull();
+    expect(card!.id).toBe(askId);
+  });
+
+  test("the remembered set is bounded FIFO and ignores empty ids", () => {
+    const s = sess();
+    rememberSettledPermissionRequestId(s, undefined);
+    rememberSettledPermissionRequestId(s, "");
+    expect(s._settledPermissionRequestIds).toBeUndefined();
+    for (let i = 0; i < SETTLED_PERMISSION_REQUEST_IDS_MAX + 5; i++) {
+      rememberSettledPermissionRequestId(s, `req-${i}`);
+    }
+    const keys = Object.keys(s._settledPermissionRequestIds!);
+    expect(keys).toHaveLength(SETTLED_PERMISSION_REQUEST_IDS_MAX);
+    expect(isSettledPermissionRequestId(s, "req-0")).toBe(false);
+    expect(isSettledPermissionRequestId(s, "req-4")).toBe(false);
+    expect(isSettledPermissionRequestId(s, "req-5")).toBe(true);
+    expect(isSettledPermissionRequestId(s, `req-${SETTLED_PERMISSION_REQUEST_IDS_MAX + 4}`)).toBe(true);
+    // Re-remembering an existing id does not evict anything.
+    rememberSettledPermissionRequestId(s, "req-5");
+    expect(Object.keys(s._settledPermissionRequestIds!)).toHaveLength(SETTLED_PERMISSION_REQUEST_IDS_MAX);
   });
 });
 

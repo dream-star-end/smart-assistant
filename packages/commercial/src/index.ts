@@ -450,6 +450,7 @@ import {
   createPgSessionsBackend,
   commitVisibleLosslessTurnPhaseA,
   _setAfterLosslessStageBatch,
+  type AutomaticRecoveryDecision,
   type DispatchAdmissionBackend,
   startSessionsGcSweeper,
   type LosslessTurnTapeStorage,
@@ -1302,6 +1303,18 @@ export async function registerCommercial(
   const goalUsageRefreshRef: {
     current: (userId: string, sessionId: string) => void | Promise<void>;
   } = { current: () => { /* GoalState service is assembled below. */ } };
+  // Phase B finalize decides (inside its tx) whether the master will retry the
+  // terminal turn. The browser learns the verdict through this post-commit
+  // sideband so it can keep showing 「正在重试中」 instead of flashing a red card
+  // until outbound.ack{recovery} arrives — or materialize the red card at once
+  // when no recovery will follow. Forward-ref: the bridge is assembled below.
+  const recoveryDecisionBroadcastRef: {
+    current: (userId: string, sessionId: string, decision: AutomaticRecoveryDecision) => void;
+  } = { current: () => { /* bridge not assembled yet — browser converges via ack/history */ } };
+  // HTTP finalize (Phase A) nudges the leader-owned tape job scheduler so Phase B
+  // (and therefore the recovery verdict above) runs now, not on the next 5s tick.
+  // Non-leader masters keep the noop: the leader's interval still converges.
+  const tapeSchedulerKickRef: { current: () => void } = { current: () => { /* no scheduler here */ } };
   let sessionsStoreGeneration = 0;
   if (runtimeChannel === "v5") {
     const decision = await resolveSessionsStoreAuthority({ pool: getPool() });
@@ -1310,6 +1323,8 @@ export async function registerCommercial(
       const pgSessionsBackend = createPgSessionsBackend(getPool(), {
         expectedGeneration: decision.generation,
         onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
+        onAutomaticRecoveryDecision: (userId, sessionId, verdict) =>
+          recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
       });
       setClientSessionsBackend(pgSessionsBackend);
       losslessTurnTapeStorage = pgSessionsBackend;
@@ -2099,6 +2114,7 @@ export async function registerCommercial(
         settleCodexBilling: settleTapeEngineBilling,
         applyTurnWaiver: (input) => applyTurnWaiver(getPool(), input),
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
+        onTapeFinalized: () => tapeSchedulerKickRef.current(),
         storage: {
           appendServerAuthoredMessage,
           appendServerAuthoredMessageForRequest,
@@ -5380,6 +5396,24 @@ export async function registerCommercial(
   bridgeBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };
+  recoveryDecisionBroadcastRef.current = (userId, sessionId, verdict) => {
+    // Session owners are `c:<uid>`; personal/test namespaces have no bridge user.
+    const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
+    if (!uidMatch) return;
+    const payload = {
+      type: "sys.recovery_decision",
+      peer: { id: sessionId, kind: "dm" },
+      ...verdict,
+      ts: Date.now(),
+    };
+    // Phase B runs on the leader slot only; the user's WS may live on the
+    // other slot. Same dual-master fan-out as outbound.cost_charged.
+    if (dualMasterEnabled) {
+      void slotRelayClient.broadcastToUsers([uidMatch[1]!], payload).catch(() => undefined);
+      return;
+    }
+    userChatBridge.broadcastToUser(BigInt(uidMatch[1]!), payload);
+  };
   goalBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };
@@ -5666,6 +5700,10 @@ export async function registerCommercial(
         });
         const materializeBackend = createPgSessionsBackend(materializePool, {
           expectedGeneration: sessionsStoreGeneration,
+          // Phase B runs here, not on the request-path backend, so the recovery
+          // verdict sideband must be wired on this instance too.
+          onAutomaticRecoveryDecision: (userId, sessionId, verdict) =>
+            recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
         });
         const rawInterval = Number(process.env.COMMERCIAL_TAPE_MATERIALIZATION_INTERVAL_MS);
         const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 1000 ? rawInterval : 5_000;
@@ -5762,8 +5800,25 @@ export async function registerCommercial(
             });
           },
         }));
+        // Coalesce: a burst of finalizes runs at most one extra tick at a time;
+        // kicks that arrive mid-tick fold into a single follow-up tick (each
+        // tick claims one materialization job, so the follow-up is needed for
+        // the second finalize of a burst; anything beyond that waits for the
+        // interval). runNow() itself serialises against the scheduler's inFlight.
+        let kickRunning = false;
+        let kickRequested = false;
+        const drainKicks = (): void => {
+          if (kickRunning) { kickRequested = true; return; }
+          kickRunning = true;
+          void h.runNow().catch(() => undefined).finally(() => {
+            kickRunning = false;
+            if (kickRequested) { kickRequested = false; drainKicks(); }
+          });
+        };
+        tapeSchedulerKickRef.current = drainKicks;
         return {
           stop: async () => {
+            tapeSchedulerKickRef.current = () => { /* scheduler stopped */ };
             await h.stop();
             await materializePool.end();
           },
@@ -6642,6 +6697,7 @@ export type {
 export {
   preCheck,
   preCheckWithCost,
+  readTotalSpendableBalance,
   releasePreCheck,
   estimateMaxCost,
   InsufficientCreditsError as PreCheckInsufficientCreditsError,

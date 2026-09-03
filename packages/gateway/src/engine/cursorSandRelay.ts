@@ -22,8 +22,16 @@ import Ajv2020 from 'ajv/dist/2020.js'
 // `default`; a namespace import works under the TS test loader but becomes
 // `{ default: ... }` in the precompiled production gateway.
 import protobuf from 'protobufjs'
-import { cursorModelById } from '@openclaude/protocol'
+import {
+  CURSOR_SESSION_CLIENT_VERSION,
+  CURSOR_SESSION_TOKEN_PATTERN,
+  cursorModelById,
+  cursorSessionChecksum,
+  cursorSessionTokenExpiryMs,
+  isCursorMachineId,
+} from '@openclaude/protocol'
 import { createLogger } from '../logger.js'
+import { AUTHORITY_HEADER, LOCAL_CATALOG_HEADER, TURN_LEASE_HEADER } from '../modelCatalogClient.js'
 
 const log = createLogger({ module: 'cursorSandRelay' })
 const DEFAULT_UPSTREAM = 'https://api2.cursor.sh'
@@ -57,12 +65,22 @@ interface AnthropicMessagesBody extends JsonObject {
   tools?: unknown
 }
 
+export type RelayCredentialKind = 'api_key' | 'session'
+
 interface RelayDeps {
   fetchImpl?: typeof fetch
   readApiKey?: () => Buffer
   credentialName?: string
   poolGeneration?: string
   keyFingerprint?: string
+  /**
+   * `api_key` (default): slot holds a `crsr_` key exchanged via
+   * `/auth/exchange_user_api_key`. `session`: slot holds a Cursor account
+   * session accessToken (PKCE login) used directly as Bearer together with
+   * `x-cursor-checksum` derived from the persisted `machineId`.
+   */
+  credentialKind?: RelayCredentialKind
+  machineId?: string | null
   upstreamBaseUrl?: string
   clientVersion?: string
   now?: () => number
@@ -81,6 +99,15 @@ export interface RelayPassthrough {
   baseUrl: string
   authToken: string
 }
+
+/** Per-turn model-authority headers CCB puts on every upstream request
+ *  (`ANTHROPIC_CUSTOM_HEADERS`, see subprocessRunner `_buildAnthropicCustomHeadersEnv`).
+ *  Passthrough must carry them to the internal proxy or the egress gate rejects. */
+export const PASSTHROUGH_FORWARDED_HEADERS = [
+  AUTHORITY_HEADER,
+  TURN_LEASE_HEADER,
+  LOCAL_CATALOG_HEADER,
+] as const
 
 export function defaultRelayPassthrough(env: NodeJS.ProcessEnv = process.env): RelayPassthrough | null {
   const baseUrl = env.ANTHROPIC_BASE_URL?.trim().replace(/\/+$/, '')
@@ -118,10 +145,43 @@ interface StreamState {
   tools: Map<number, ToolStreamState>
   inputTokens: number
   outputTokens: number
+  /** From `extendedUsage.cacheReadTokens` (InferenceExtendedUsageInfo.cache_read_tokens).
+   * Zero when upstream only sends the legacy `usage` frame. */
+  cacheReadTokens: number
+  /** From `extendedUsage.cacheWriteTokens` (InferenceExtendedUsageInfo.cache_write_tokens). */
+  cacheWriteTokens: number
   text: string
   thinking: string
   failed: boolean
   recoveredToolCount: number
+}
+
+/** Anthropic-shaped usage block for the SSE / JSON responses the relay emits.
+ * Cache fields are only present when upstream reported them, so callers that
+ * only ever saw `{input_tokens, output_tokens}` keep their exact wire shape.
+ *
+ * Sand's `InferenceExtendedUsageInfo.input_tokens` is the *total* prompt size
+ * (cache hits and cache writes included); Anthropic's `input_tokens` excludes
+ * both. Downstream (ccbMessageParser -> usageCost / computeCostFen) prices the
+ * three buckets independently, so forwarding the inclusive figure charged the
+ * cached context twice (full input rate + cache rate; observed post-ec9335b41
+ * rows had input - cache_read - cache_write of only 28..652 tokens). Convert
+ * to Anthropic's exclusive convention here so the wire shape stays canonical. */
+function usageBlock(
+  state: Pick<StreamState, 'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'>,
+  overrides: { output_tokens?: number } = {},
+): Record<string, number> {
+  const cached = state.cacheReadTokens + state.cacheWriteTokens
+  const uncachedInput = cached > 0
+    ? Math.max(0, state.inputTokens - cached)
+    : state.inputTokens
+  const usage: Record<string, number> = {
+    input_tokens: uncachedInput,
+    output_tokens: overrides.output_tokens ?? state.outputTokens,
+  }
+  if (state.cacheReadTokens > 0) usage.cache_read_input_tokens = state.cacheReadTokens
+  if (state.cacheWriteTokens > 0) usage.cache_creation_input_tokens = state.cacheWriteTokens
+  return usage
 }
 
 function nextToolIndex(tools: ReadonlyMap<number, ToolStreamState>): number {
@@ -614,6 +674,37 @@ function decodeFrame(bytes: Buffer): JsonObject {
   }) as JsonObject
 }
 
+/**
+ * Canonical prefix the CCB runtime keys reactive compaction on
+ * (claude-code-best services/api/errors.ts: `message.toLowerCase().includes('prompt is too long')`)
+ * and the gateway taxonomy classifies as `context_too_long` (errorClassify.ts).
+ * Every Cursor Sand overflow surface — HTTP 413, INPUT_TOKEN_LIMIT stream error,
+ * end-trailer text — must be normalised to start with this string, otherwise the
+ * harness treats the failure as a generic api_error and never compacts.
+ */
+export const CURSOR_SAND_PROMPT_TOO_LONG_PREFIX = 'Prompt is too long'
+
+/** InferenceStreamErrorType.INFERENCE_STREAM_ERROR_TYPE_INPUT_TOKEN_LIMIT (cursorSandInference.proto). */
+const SAND_ERROR_TYPE_INPUT_TOKEN_LIMIT = 2
+
+const SAND_OVERFLOW_TEXT = /input[_ ]token[_ ]limit|prompt is too long|prompt[_ ]too[_ ]long|context[_ ](?:length|window)[_ ]?(?:exceeded|too long|limit)|too many input tokens|exceeds? (?:the )?(?:model(?:'s)? )?(?:maximum )?context|request entity too large|payload too large/i
+
+/** True when a Sand error surface (status/code/text) denotes prompt/context overflow. */
+export function isCursorSandOverflow(input: { status?: number; code?: unknown; errorType?: unknown; text?: unknown }): boolean {
+  if (input.status === 413) return true
+  if (input.errorType === SAND_ERROR_TYPE_INPUT_TOKEN_LIMIT) return true
+  if (typeof input.code === 'string' && SAND_OVERFLOW_TEXT.test(input.code)) return true
+  return typeof input.text === 'string' && SAND_OVERFLOW_TEXT.test(input.text)
+}
+
+/** `Prompt is too long: <detail>` — detail retained so operators still see the upstream cause. */
+export function cursorSandPromptTooLongMessage(detail: string): string {
+  const trimmed = detail.trim()
+  if (!trimmed) return CURSOR_SAND_PROMPT_TOO_LONG_PREFIX
+  if (trimmed.toLowerCase().startsWith(CURSOR_SAND_PROMPT_TOO_LONG_PREFIX.toLowerCase())) return trimmed
+  return `${CURSOR_SAND_PROMPT_TOO_LONG_PREFIX}: ${trimmed}`
+}
+
 function errorMessage(value: unknown): string {
   if (value && typeof value === 'object') {
     const record = value as JsonObject
@@ -623,7 +714,10 @@ function errorMessage(value: unknown): string {
       : typeof record.errorType === 'number' && record.errorType > 0
         ? `error_type_${record.errorType}`
         : ''
-    return prefix ? `${prefix}: ${message}` : message
+    const composed = prefix ? `${prefix}: ${message}` : message
+    return isCursorSandOverflow({ code: record.code, errorType: record.errorType, text: message })
+      ? cursorSandPromptTooLongMessage(composed)
+      : composed
   }
   return 'Cursor Sand inference failed'
 }
@@ -634,9 +728,11 @@ function parseEndTrailer(bytes: Buffer): string | null {
     const parsed = JSON.parse(bytes.toString('utf8')) as JsonObject
     const error = parsed.error
     if (!error || typeof error !== 'object') return null
-    return typeof (error as JsonObject).message === 'string'
-      ? (error as JsonObject).message as string
-      : 'Cursor Sand transport error'
+    const record = error as JsonObject
+    const message = typeof record.message === 'string' ? record.message : 'Cursor Sand transport error'
+    return isCursorSandOverflow({ code: record.code, text: message })
+      ? cursorSandPromptTooLongMessage(message)
+      : message
   } catch {
     return 'Cursor Sand transport trailer was malformed'
   }
@@ -919,6 +1015,9 @@ function correctedToolBody(body: AnthropicMessagesBody, invalidResponse: string)
 
 export class CursorSandRelay {
   private readonly deps: Required<Pick<RelayDeps, 'fetchImpl' | 'readApiKey' | 'upstreamBaseUrl' | 'clientVersion' | 'now'>>
+  private readonly credentialKind: RelayCredentialKind
+  /** Persisted machine id for `session` credentials; never regenerated. */
+  private readonly machineId: string | null
   private readonly routeToken = randomBytes(32).toString('hex')
   private server: Server | null = null
   private origin: string | null = null
@@ -929,6 +1028,16 @@ export class CursorSandRelay {
   private readonly passthrough: RelayPassthrough | null
 
   constructor(deps: RelayDeps = {}) {
+    this.credentialKind = deps.credentialKind ?? 'api_key'
+    if (this.credentialKind === 'session') {
+      // Fail closed at construction: a session slot without its persisted
+      // machine id would either be rejected upstream or, worse, tempt a
+      // per-request regeneration that trips Cursor's "Too many computers".
+      if (!isCursorMachineId(deps.machineId)) throw new Error('CURSOR_SAND_SESSION_MACHINE_ID_INVALID')
+      this.machineId = deps.machineId
+    } else {
+      this.machineId = null
+    }
     this.deps = {
       fetchImpl: deps.fetchImpl ?? fetch,
       readApiKey: deps.readApiKey ?? (() => readCursorApiKey(
@@ -937,7 +1046,8 @@ export class CursorSandRelay {
         deps.keyFingerprint,
       )),
       upstreamBaseUrl: (deps.upstreamBaseUrl ?? DEFAULT_UPSTREAM).replace(/\/+$/, ''),
-      clientVersion: deps.clientVersion ?? DEFAULT_CLIENT_VERSION,
+      clientVersion: deps.clientVersion
+        ?? (this.credentialKind === 'session' ? CURSOR_SESSION_CLIENT_VERSION : DEFAULT_CLIENT_VERSION),
       now: deps.now ?? Date.now,
     }
     this.onRequestForTest = deps.onRequestForTest
@@ -955,6 +1065,7 @@ export class CursorSandRelay {
   private async passthroughMessages(
     body: AnthropicMessagesBody,
     raw: Buffer,
+    incoming: IncomingMessage['headers'],
     res: ServerResponse,
     signal: AbortSignal,
   ): Promise<void> {
@@ -969,15 +1080,26 @@ export class CursorSandRelay {
       return
     }
     log.info('cursor sand relay passthrough', { model: String(body.model), stream: body.stream !== false })
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      authorization: `Bearer ${target.authToken}`,
+      'x-api-key': target.authToken,
+      accept: body.stream === false ? 'application/json' : 'text/event-stream',
+    }
+    // CCB attaches the turn's model-authority envelopes via ANTHROPIC_CUSTOM_HEADERS;
+    // the egress gate is fail-closed, so a passthrough that dropped them made every
+    // sub-agent call 403 MODEL_AUTHORITY_INVALID ("request carries no model authority").
+    for (const name of PASSTHROUGH_FORWARDED_HEADERS) {
+      const value = incoming[name]
+      const single = Array.isArray(value) ? value[0] : value
+      if (typeof single === 'string' && single !== '' && !/[^\x21-\x7e]/.test(single)) {
+        headers[name] = single
+      }
+    }
     const upstream = await this.deps.fetchImpl(`${target.baseUrl}/v1/messages`, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'anthropic-version': '2023-06-01',
-        authorization: `Bearer ${target.authToken}`,
-        'x-api-key': target.authToken,
-        accept: body.stream === false ? 'application/json' : 'text/event-stream',
-      },
+      headers,
       body: new Uint8Array(raw),
       signal,
     })
@@ -1100,7 +1222,7 @@ export class CursorSandRelay {
     res.once('close', abort)
     try {
       if (!isSandRoutableModel(body.model)) {
-        await this.passthroughMessages(body, raw, res, controller.signal)
+        await this.passthroughMessages(body, raw, req.headers, res, controller.signal)
         return
       }
       await this.handleMessages(body, res, controller.signal)
@@ -1121,6 +1243,18 @@ export class CursorSandRelay {
         && this.authCache.fingerprint === fingerprint
         && this.authCache.expiresAt > now + 60_000
       ) return this.authCache.accessToken
+      if (this.credentialKind === 'session') {
+        // The slot already holds the account session accessToken. There is
+        // no exchange step; expiry is enforced here and fails loud instead
+        // of silently degrading to another credential.
+        const sessionToken = key.toString('utf8').trim()
+        if (!CURSOR_SESSION_TOKEN_PATTERN.test(sessionToken)) throw new Error('CURSOR_SAND_SESSION_TOKEN_MALFORMED')
+        const expiresAt = cursorSessionTokenExpiryMs(sessionToken)
+        if (expiresAt === null) throw new Error('CURSOR_SAND_SESSION_TOKEN_MALFORMED')
+        if (expiresAt <= now + 60_000) throw new Error('CURSOR_SAND_SESSION_EXPIRED')
+        this.authCache = { fingerprint, accessToken: sessionToken, expiresAt }
+        return sessionToken
+      }
       const response = await this.deps.fetchImpl(`${this.deps.upstreamBaseUrl}/auth/exchange_user_api_key`, {
         method: 'POST',
         headers: {
@@ -1155,20 +1289,24 @@ export class CursorSandRelay {
   ): Promise<{ response: Response; upstreamModel: string }> {
     const { bytes, upstreamModel, invocationId } = encodeCursorSandRequest(body)
     const token = await this.accessToken(signal)
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/connect+proto',
+      'connect-protocol-version': '1',
+      'x-cursor-client-type': 'sand',
+      'x-cursor-client-version': this.deps.clientVersion,
+      'x-ghost-mode': 'true',
+      'x-request-id': invocationId,
+      'x-session-id': randomUUID(),
+    }
+    if (this.credentialKind === 'session' && this.machineId !== null) {
+      headers['x-cursor-checksum'] = cursorSessionChecksum(this.machineId, this.deps.now())
+    }
     const response = await this.deps.fetchImpl(
       `${this.deps.upstreamBaseUrl}/aiserver.v1.InferenceService/Stream`,
       {
         method: 'POST',
-        headers: {
-          authorization: `Bearer ${token}`,
-          'content-type': 'application/connect+proto',
-          'connect-protocol-version': '1',
-          'x-cursor-client-type': 'sand',
-          'x-cursor-client-version': this.deps.clientVersion,
-          'x-ghost-mode': 'true',
-          'x-request-id': invocationId,
-          'x-session-id': randomUUID(),
-        },
+        headers,
         body: new Uint8Array(connectEnvelope(bytes)),
         signal,
       },
@@ -1182,12 +1320,41 @@ export class CursorSandRelay {
     signal: AbortSignal,
   ): Promise<void> {
     this.onRequestForTest?.(structuredClone(body))
-    const opened = await this.openInference(body, signal)
+    let opened: { response: Response; upstreamModel: string }
+    try {
+      opened = await this.openInference(body, signal)
+    } catch (error: unknown) {
+      // Credential failures (expired/malformed session token, exchange
+      // rejected) are operator problems, not transient inference faults:
+      // surface the code so the turn error names the real cause.
+      const message = error instanceof Error ? error.message : ''
+      if (/^CURSOR_SAND_(?:SESSION|AUTH)_/.test(message)) {
+        log.warn('cursor sand credential rejected', { code: message, credentialKind: this.credentialKind })
+        res.statusCode = 401
+        res.setHeader('content-type', 'application/json')
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'authentication_error', message: `Cursor Sand credential rejected: ${message}` },
+        }))
+        return
+      }
+      throw error
+    }
     const upstream = opened.response
     if (!upstream.ok || !upstream.body) {
-      res.statusCode = upstream.status || 502
+      // Context overflow must reach CCB as "Prompt is too long" (413 or an
+      // overflow body) so reactive compaction fires instead of a dead api_error.
+      const bodyText = await upstream.text().then((text) => text.slice(0, 2000), () => '')
+      const overflow = isCursorSandOverflow({ status: upstream.status, text: bodyText })
+      res.statusCode = overflow ? 413 : (upstream.status || 502)
       res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: `Cursor Sand HTTP ${upstream.status}` } }))
+      const message = overflow
+        ? cursorSandPromptTooLongMessage(`Cursor Sand HTTP ${upstream.status}${bodyText ? ` ${bodyText}` : ''}`)
+        : `Cursor Sand HTTP ${upstream.status}`
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: overflow ? 'invalid_request_error' : 'api_error', message },
+      }))
       return
     }
     if (body.stream === false) {
@@ -1228,6 +1395,8 @@ export class CursorSandRelay {
       tools: new Map(),
       inputTokens: 0,
       outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
       text: '',
       thinking: '',
       failed: false,
@@ -1274,6 +1443,11 @@ export class CursorSandRelay {
     if (kind === 'extendedUsage') {
       if (typeof value.inputTokens === 'number') state.inputTokens = value.inputTokens
       if (typeof value.outputTokens === 'number') state.outputTokens = value.outputTokens
+      // cache_read_tokens / cache_write_tokens are carried on the same frame;
+      // dropping them here is what made every Sand-routed Fable turn bill as
+      // 100% uncached input (usage_log.cache_read_tokens = 0).
+      if (typeof value.cacheReadTokens === 'number') state.cacheReadTokens = value.cacheReadTokens
+      if (typeof value.cacheWriteTokens === 'number') state.cacheWriteTokens = value.cacheWriteTokens
       return
     }
     if (kind === 'error') {
@@ -1482,6 +1656,8 @@ export class CursorSandRelay {
           this.onRawTextForTest?.(collected.state.text, 2)
           state.inputTokens += collected.state.inputTokens
           state.outputTokens += collected.state.outputTokens
+          state.cacheReadTokens += collected.state.cacheReadTokens
+          state.cacheWriteTokens += collected.state.cacheWriteTokens
           streamError ??= collected.streamError
           if (collected.state.thinking) {
             await closeText()
@@ -1566,7 +1742,7 @@ export class CursorSandRelay {
           stop_reason: toolCount > 0 ? 'tool_use' : 'end_turn',
           stop_sequence: null,
         },
-        usage: { input_tokens: state.inputTokens, output_tokens: state.outputTokens },
+        usage: usageBlock(state),
       })
       await emitSse(res, 'message_stop', { type: 'message_stop' })
     } finally {
@@ -1640,12 +1816,16 @@ export class CursorSandRelay {
       ) {
         const firstInput = state.inputTokens
         const firstOutput = state.outputTokens
+        const firstCacheRead = state.cacheReadTokens
+        const firstCacheWrite = state.cacheWriteTokens
         const retry = await retryInvalidTool(state.text)
         collected = await this.collectInference(retry)
         this.onRawTextForTest?.(collected.state.text, 2)
         state = collected.state
         state.inputTokens += firstInput
         state.outputTokens += firstOutput
+        state.cacheReadTokens += firstCacheRead
+        state.cacheWriteTokens += firstCacheWrite
         streamError = collected.streamError
         thinkingSignature = collected.thinkingSignature
         recovered = recoverXmlToolCalls(state.text, allowedTools)
@@ -1677,7 +1857,7 @@ export class CursorSandRelay {
           content: [],
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: state.inputTokens, output_tokens: 0 },
+          usage: usageBlock(state, { output_tokens: 0 }),
         },
       })
 
@@ -1739,7 +1919,7 @@ export class CursorSandRelay {
           stop_reason: state.tools.size + state.recoveredToolCount > 0 ? 'tool_use' : 'end_turn',
           stop_sequence: null,
         },
-        usage: { input_tokens: state.inputTokens, output_tokens: state.outputTokens },
+        usage: usageBlock(state),
       })
       await emitSse(res, 'message_stop', { type: 'message_stop' })
     } finally {
@@ -1793,7 +1973,7 @@ export class CursorSandRelay {
       content,
       stop_reason: tools.size + recovered.tools.length > 0 ? 'tool_use' : 'end_turn',
       stop_sequence: null,
-      usage: { input_tokens: state.inputTokens, output_tokens: state.outputTokens },
+      usage: usageBlock(state),
     }))
   }
 }

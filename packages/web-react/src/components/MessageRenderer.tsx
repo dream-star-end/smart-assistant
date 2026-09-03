@@ -31,7 +31,7 @@ import {
   messageKind,
   safeMessageSignature,
 } from "../lib/chat/render";
-import { isRecoveryControlUserTurn } from "../lib/chat/pure";
+import { isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
   EAGER_MEDIA_TAIL_ITEMS,
@@ -60,7 +60,11 @@ import { AgentGroupCard } from "./chat/AgentGroupCard";
 import { TimelineEagerMediaContext } from "./chat/timelineEager";
 import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
 import { TeamPanel } from "./chat/TeamPanel";
-import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
+import {
+  PermissionCard,
+  type PermissionRespond,
+  isAwaitingPermissionPrompt,
+} from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
@@ -281,15 +285,28 @@ export const MessageRenderer = memo(
             <ExactTapeRecordDisclosure messages={[message]} label="目标" />
           </TapeBackedCard>
         );
-      case "permission":
+      case "permission": {
+        // INC-20260904-STOP-LEAVES-PERMISSION-PENDING (fix C):
+        // A permission card owned by a master automatic-recovery turn
+        // (`m-recover-*`) may arrive while this tab is NOT `sending` — the
+        // recovery was not adopted locally, so `_sendingInFlight` stayed false
+        // even though the engine is genuinely blocked waiting on the answer.
+        // Treat such an unresolved, unexpired card as live so the question
+        // dialog auto-opens instead of silently sitting in the timeline.
+        const recoveryOwned = isRecoveryTurnClientMessageId(message._turnOwnerId);
+        const live =
+          !readOnly &&
+          inActiveTurn &&
+          (sending || (recoveryOwned && isAwaitingPermissionPrompt(message)));
         return (
           <PermissionCard
             msg={message}
             onRespond={onRespondPermission}
             readOnly={readOnly}
-            livePrompt={!readOnly && inActiveTurn && sending}
+            livePrompt={live}
           />
         );
+      }
       case "agent-group":
         return <AgentGroupCard msg={message} delegateCost={delegateCost} />;
       case "delegate-progress":

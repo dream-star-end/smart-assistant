@@ -1238,7 +1238,7 @@ describe('oc-cursor wrapper', () => {
       },
     )
     assert.equal(selected.status, 0, selected.stderr)
-    assert.match(selected.stdout, /^oc-cursor: selected_slot 2 api-key\.2 sand legacy 0 0000000000000000$/m)
+    assert.match(selected.stdout, /^oc-cursor: selected_slot 2 api-key\.2 sand legacy 0 0000000000000000 api_key -$/m)
 
     const launched = spawnSync(
       f.wrapper,
@@ -1259,6 +1259,68 @@ describe('oc-cursor wrapper', () => {
     assert.equal(readFileSync(join(f.capture, 'argv'), 'utf8').includes('-H'), false)
     assert.match(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SAND_MODE=1$/m)
     assert.doesNotMatch(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SELECTED_KEY=/m)
+  })
+
+  test('a session slot reports its kind and machine id on selection and refuses native launch', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    const rotationFile = join(f.dir, 'session-rotation')
+    const machineId = 'abcdefghijklmnopqrstuvwxyz'
+    const sessionToken = `${'e'.repeat(20)}.${'p'.repeat(40)}.${'s'.repeat(40)}`
+    writeFileSync(join(authDir, 'api-key.2'), `${sessionToken}\n`, { mode: 0o600 })
+    writeFileSync(join(authDir, '.sand-mode'), '# sand-mode v1\napi-key 0\napi-key.2 1\n', { mode: 0o600 })
+    writeFileSync(
+      join(authDir, '.credential-kind'),
+      `# credential-kind v1\napi-key api_key -\napi-key.2 session ${machineId}\n`,
+      { mode: 0o600 },
+    )
+    writeFileSync(rotationFile, `1 ${Math.floor(Date.now() / 1000) + 300}\n`, { mode: 0o600 })
+    const selected = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__select_session__'],
+      {
+        cwd: f.dir,
+        env: { ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1', OC_CURSOR_KEY_ROTATION_FILE: rotationFile },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(selected.status, 0, selected.stderr)
+    assert.match(
+      selected.stdout,
+      new RegExp(`^oc-cursor: selected_slot 2 api-key\\.2 sand legacy 0 0000000000000000 session ${machineId}$`, 'm'),
+    )
+    assert.doesNotMatch(selected.stdout, /ppppp/, 'selection must never print the credential')
+
+    const launched = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'must not launch'],
+      {
+        cwd: f.dir,
+        env: { ...f.env, OPENCLAUDE_CURSOR_SELECTED_KEY: 'api-key.2', OC_CURSOR_KEY_ROTATION_FILE: rotationFile },
+        encoding: 'utf8',
+      },
+    )
+    assert.notEqual(launched.status, 0)
+    assert.match(launched.stderr, /Sand-only/)
+    assert.equal(existsSync(join(f.capture, 'key')), false, 'session token must never reach the native CLI')
+  })
+
+  test('a session slot whose .sand-mode says native fails closed', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, '.sand-mode'), '# sand-mode v1\napi-key 0\n', { mode: 0o600 })
+    writeFileSync(
+      join(authDir, '.credential-kind'),
+      '# credential-kind v1\napi-key session abcdefghijklmnopqrstuvwxyz\n',
+      { mode: 0o600 },
+    )
+    const selected = spawnSync(f.wrapper, ['--model', 'claude-opus-5-thinking-high', '--', '__select__'], {
+      cwd: f.dir,
+      env: { ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1' },
+      encoding: 'utf8',
+    })
+    assert.notEqual(selected.status, 0)
+    assert.match(selected.stderr, /credential sidecars disagree/)
   })
 
   test('Cursor Auto remains native even when the selected key has Sand enabled', () => {
@@ -1453,6 +1515,136 @@ describe('oc-cursor wrapper', () => {
     )
     assert.equal(filteredFailure.status, 0, filteredFailure.stderr)
     assert.match(filteredFailure.stdout, new RegExp(`selected_slot 3 api-key\\.3 native ${gen4} 3 ${fp(keyC)}`))
+  })
+
+  test('an all-Sand generation spreads users over accounts by rendezvous hash and keeps each user sticky', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    const gen = 'gen-555555555555555555555555'
+    const dir = join(authDir, '.pool-generations', gen)
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const fp = (key: string): string => createHash('sha256').update(`${key}\n`).digest('hex').slice(0, 16)
+    const slots = [
+      { name: 'api-key', key: 'sess_a', account: '11' },
+      { name: 'api-key.2', key: 'sess_b', account: '12' },
+      { name: 'api-key.3', key: 'sess_c', account: '13' },
+    ]
+    writeFileSync(join(dir, '.sand-mode'), `# sand-mode v1\n${slots.map((s) => `${s.name} 1`).join('\n')}\n`, { mode: 0o600 })
+    writeFileSync(
+      join(dir, '.slot-identities'),
+      `# cursor-pool-identity v1 ${gen}\n${slots.map((s) => `${s.name} ${s.account} ${fp(s.key)} 1`).join('\n')}\n`,
+      { mode: 0o600 },
+    )
+    for (const s of slots) writeFileSync(join(dir, s.name), `${s.key}\n`, { mode: 0o600 })
+    writeFileSync(join(authDir, '.pool-active'), `${gen}\n`, { mode: 0o600 })
+    const rotationFile = join(f.dir, 'sticky-rotation')
+    // Reference ranking: sha256("<uid>:<account>") hex prefix, lowest wins.
+    const rank = (uid: string, account: string): string =>
+      createHash('sha256').update(`${uid}:${account}`).digest('hex').slice(0, 16)
+    const expectedFor = (uid: string, excluded = ''): { name: string; slot: number } => {
+      const ranked = slots
+        .filter((s) => s.account !== excluded)
+        .sort((a, b) => (rank(uid, a.account) < rank(uid, b.account) ? -1 : 1))
+      const best = ranked[0]!
+      return { name: best.name, slot: slots.indexOf(best) + 1 }
+    }
+    const select = (uid: string | undefined, model = 'claude-opus-5-thinking-high') => {
+      const env: NodeJS.ProcessEnv = { ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1', OC_CURSOR_KEY_ROTATION_FILE: rotationFile }
+      if (uid === undefined) delete env.OC_USER_ID
+      else env.OC_USER_ID = uid
+      const r = spawnSync(f.wrapper, ['--model', model, '--', '__select_sticky__'], { cwd: f.dir, env, encoding: 'utf8' })
+      assert.equal(r.status, 0, r.stderr)
+      const m = /selected_slot (\d+) (\S+) sand/.exec(r.stdout)
+      assert.ok(m, r.stdout)
+      return { slot: Number(m[1]), name: m[2], stderr: r.stderr }
+    }
+
+    // Deterministic per user, and the same user gets the same slot across turns.
+    const uids = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12']
+    const seen = new Set<number>()
+    for (const uid of uids) {
+      const expected = expectedFor(uid)
+      const first = select(uid)
+      const second = select(uid)
+      assert.deepEqual({ slot: first.slot, name: first.name }, expected, `uid ${uid}`)
+      assert.deepEqual({ slot: second.slot, name: second.name }, expected, `uid ${uid} second turn`)
+      assert.match(first.stderr, /credential slot \d\/3 \(sticky\)/)
+      seen.add(first.slot)
+    }
+    assert.equal(seen.size, 3, 'twelve users must not all land on the primary')
+    assert.equal(existsSync(rotationFile), false, 'successful selections never write rotation state')
+
+    // Without an owner uid the pool keeps the legacy primary-first policy.
+    const anonymous = select(undefined)
+    assert.equal(anonymous.slot, 1)
+    assert.doesNotMatch(anonymous.stderr, /sticky/)
+    const junk = select('not-a-uid')
+    assert.equal(junk.slot, 1)
+
+    // A failure on the sticky account moves only that user to its ranked
+    // successor for the cooldown, then returns it to the preferred account.
+    const uid = uids.find((u) => expectedFor(u).slot !== 1)!
+    const preferred = expectedFor(uid)
+    const preferredAccount = slots[preferred.slot - 1]!.account
+    const recorded = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__record_sticky_failure__'],
+      {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OC_USER_ID: uid,
+          OPENCLAUDE_CURSOR_SELECTED_KEY: preferred.name,
+          OPENCLAUDE_CURSOR_POOL_GENERATION: gen,
+          OPENCLAUDE_CURSOR_ACCOUNT_ID: preferredAccount,
+          OPENCLAUDE_CURSOR_KEY_FINGERPRINT: fp(slots[preferred.slot - 1]!.key),
+          OPENCLAUDE_CURSOR_RECORD_RESULT: 'fail',
+          OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(recorded.status, 0, recorded.stderr)
+    assert.match(readFileSync(rotationFile, 'utf8'), new RegExp(`^v2 ${preferredAccount} other_models `))
+    const failedOver = select(uid)
+    assert.deepEqual({ slot: failedOver.slot, name: failedOver.name }, expectedFor(uid, preferredAccount))
+    assert.notEqual(failedOver.slot, preferred.slot)
+    // Another user whose preferred account is healthy is unaffected.
+    const other = uids.find((u) => expectedFor(u).slot !== preferred.slot)!
+    assert.deepEqual({ slot: select(other).slot, name: select(other).name }, expectedFor(other))
+    // The cooldown is per model family: Cursor Models ignore an other_models failure.
+    assert.equal(select(uid, 'cursor-grok-4.6-high').slot, preferred.slot)
+    // Cooldown elapsed → back to the preferred account.
+    writeFileSync(rotationFile, `v2 ${preferredAccount} other_models 1\n`)
+    assert.equal(select(uid).slot, preferred.slot)
+  })
+
+  test('a mixed native/Sand pool keeps primary-first even with an owner uid', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    const gen = 'gen-666666666666666666666666'
+    const dir = join(authDir, '.pool-generations', gen)
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const fp = (key: string): string => createHash('sha256').update(`${key}\n`).digest('hex').slice(0, 16)
+    writeFileSync(join(dir, '.sand-mode'), '# sand-mode v1\napi-key 0\napi-key.2 1\n', { mode: 0o600 })
+    writeFileSync(
+      join(dir, '.slot-identities'),
+      `# cursor-pool-identity v1 ${gen}\napi-key 1 ${fp('crsr_a')} 0\napi-key.2 2 ${fp('sess_b')} 1\n`,
+      { mode: 0o600 },
+    )
+    writeFileSync(join(dir, 'api-key'), 'crsr_a\n', { mode: 0o600 })
+    writeFileSync(join(dir, 'api-key.2'), 'sess_b\n', { mode: 0o600 })
+    writeFileSync(join(authDir, '.pool-active'), `${gen}\n`, { mode: 0o600 })
+    for (const uid of ['1', '2', '3', '4', '5', '6', '7', '8']) {
+      const r = spawnSync(f.wrapper, ['--model', 'claude-opus-5-thinking-high', '--', '__select_mixed__'], {
+        cwd: f.dir,
+        env: { ...f.env, OC_USER_ID: uid, OPENCLAUDE_CURSOR_SELECT_ONLY: '1', OC_CURSOR_KEY_ROTATION_FILE: join(f.dir, 'mixed-rotation') },
+        encoding: 'utf8',
+      })
+      assert.equal(r.status, 0, r.stderr)
+      assert.match(r.stdout, new RegExp(`selected_slot 1 api-key native ${gen} 1 `))
+      assert.doesNotMatch(r.stderr, /sticky/)
+    }
   })
 
   test('Cursor Models (Grok 4.6) stay in native CLI mode and do NOT pass -H even when .sand-mode is enabled', () => {

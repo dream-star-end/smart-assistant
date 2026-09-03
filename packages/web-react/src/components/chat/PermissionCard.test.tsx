@@ -10,7 +10,7 @@
  * 修法：超过服务端 TTL 的未决卡视为孤儿，不再自动弹；但手动回答入口必须保留（fail-safe）。
  */
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -19,6 +19,7 @@ import {
   DETACHED_ASK_USER_TTL_MS,
   PENDING_PERMISSION_TTL_MS,
   PermissionCard,
+  isAwaitingPermissionPrompt,
   resetPermissionAutoOpenMemory,
 } from "./PermissionCard";
 
@@ -26,12 +27,6 @@ afterEach(() => {
   cleanup();
   resetPermissionAutoOpenMemory();
 });
-
-async function flushAutoOpenMemory(): Promise<void> {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
-}
 
 function askMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
   return {
@@ -145,11 +140,22 @@ describe("PermissionCard 自动弹框的存活边界", () => {
 });
 
 describe("PermissionCard 自动弹窗：活提问 vs 历史 vs 重挂", () => {
-  test("列表行重挂同一 requestId 不再自动弹，手动回答仍可用", async () => {
+  test("活提问时间线重挂仍自动弹（CCB 仍在等，不能把确认框弄丢）", () => {
     const msg = askMsg({ requestId: "req-remount" });
     const { unmount } = render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
-    await flushAutoOpenMemory();
+    unmount();
+
+    render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  test("用户关掉问答后重挂不再自动弹，手动回答仍可用", () => {
+    const msg = askMsg({ requestId: "req-dismissed" });
+    const { unmount } = render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
     unmount();
 
     render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
@@ -202,11 +208,10 @@ describe("PermissionCard 自动弹窗：活提问 vs 历史 vs 重挂", () => {
     expect(screen.getByText("已提交")).toBeInTheDocument();
   });
 
-  test("不同 requestId 互不影响，各自仍能自动弹一次", async () => {
+  test("不同 requestId 互不影响，各自仍能自动弹一次", () => {
     const first = askMsg({ requestId: "req-a" });
     const { unmount } = render(<PermissionCard msg={first} onRespond={vi.fn()} livePrompt />);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
-    await flushAutoOpenMemory();
     unmount();
 
     render(<PermissionCard msg={askMsg({ requestId: "req-b" })} onRespond={vi.fn()} livePrompt />);
@@ -359,6 +364,81 @@ describe("PermissionCard 工具展示(F5/M7)", () => {
   });
 });
 
+function exitPlanMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
+  return {
+    id: "p-exit",
+    role: "permission",
+    text: "退出计划模式",
+    ts: Date.now() - 1_000,
+    requestId: "req-exit-plan",
+    toolName: "ExitPlanMode",
+    inputJson: {
+      plan: "## 目标\n\n改 PermissionCard，让退出计划弹窗展示 markdown。\n\n1. 修重挂\n2. 渲染计划书",
+      planFilePath: "/tmp/plan.md",
+    },
+    _resolved: false,
+    ...overrides,
+  } as ChatMessage;
+}
+
+describe("ExitPlanMode 计划确认", () => {
+  test("活提问自动弹出 markdown 计划书", () => {
+    render(<PermissionCard msg={exitPlanMsg()} onRespond={vi.fn()} livePrompt />);
+    expect(screen.getByRole("heading", { name: "退出计划模式" })).toBeInTheDocument();
+    expect(screen.getByTestId("exit-plan-markdown").textContent).toContain("改 PermissionCard");
+    expect(screen.getByRole("button", { name: "按此计划执行" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续规划" })).toBeInTheDocument();
+  });
+
+  test("没有关闭按钮，Escape 不能把弹窗关掉", () => {
+    render(<PermissionCard msg={exitPlanMsg()} onRespond={vi.fn()} livePrompt />);
+    expect(screen.queryByRole("button", { name: "关闭" })).toBeNull();
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape", code: "Escape" });
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  test("按此计划执行 → allow", () => {
+    const onRespond = vi.fn();
+    render(<PermissionCard msg={exitPlanMsg()} onRespond={onRespond} livePrompt />);
+    fireEvent.click(screen.getByRole("button", { name: "按此计划执行" }));
+    expect(onRespond).toHaveBeenCalledWith({ requestId: "req-exit-plan", behavior: "allow" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("继续规划 → deny", () => {
+    const onRespond = vi.fn();
+    render(<PermissionCard msg={exitPlanMsg()} onRespond={onRespond} livePrompt />);
+    fireEvent.click(screen.getByRole("button", { name: "继续规划" }));
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: "req-exit-plan",
+      behavior: "deny",
+      message: "User rejected the plan",
+    });
+  });
+
+  test("时间线重挂未答计划确认仍自动弹", () => {
+    const msg = exitPlanMsg();
+    const { unmount } = render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    unmount();
+    render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("exit-plan-markdown").textContent).toContain("markdown");
+  });
+
+  test("缺少 plan 正文时仍可批准，给出说明", () => {
+    render(
+      <PermissionCard
+        msg={exitPlanMsg({ inputJson: { planFilePath: "/tmp/plan.md" } })}
+        onRespond={vi.fn()}
+        livePrompt
+      />,
+    );
+    expect(screen.getByTestId("exit-plan-missing")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "按此计划执行" })).toBeInTheDocument();
+  });
+});
+
 describe("AskUserQuestion 选项可及性(M12)", () => {
   test("单选题:radiogroup + role=radio + aria-checked 跟随选中", () => {
     render(<PermissionCard msg={askMsg()} onRespond={vi.fn()} livePrompt />);
@@ -394,6 +474,46 @@ describe("AskUserQuestion 选项可及性(M12)", () => {
     expect(boxes.length).toBeGreaterThanOrEqual(2);
     fireEvent.click(screen.getByRole("checkbox", { name: /检索/ }));
     expect(screen.getByRole("checkbox", { name: /检索/ })).toHaveAttribute("aria-checked", "true");
+  });
+});
+
+describe("isAwaitingPermissionPrompt（INC-20260904 fix C 的活提问判据）", () => {
+  const now = Date.now();
+
+  test("未决、未过期、非控制中 → true", () => {
+    expect(isAwaitingPermissionPrompt(askMsg(), now)).toBe(true);
+  });
+
+  test("非 permission 行 → false", () => {
+    expect(isAwaitingPermissionPrompt({ id: "a", role: "assistant", text: "hi", ts: now } as ChatMessage, now)).toBe(false);
+  });
+
+  test("已结清 / 控制中 → false", () => {
+    expect(isAwaitingPermissionPrompt(askMsg({ _resolved: true, _behavior: "deny" }), now)).toBe(false);
+    expect(isAwaitingPermissionPrompt(askMsg({ _controlPending: true }), now)).toBe(false);
+  });
+
+  test("超过 TTL 的孤儿卡 → false；_askUserExpiresAt 仍在未来 → true", () => {
+    expect(
+      isAwaitingPermissionPrompt(askMsg({ ts: now - PENDING_PERMISSION_TTL_MS - 60_000 }), now),
+    ).toBe(false);
+    expect(
+      isAwaitingPermissionPrompt(
+        askMsg({ ts: now - PENDING_PERMISSION_TTL_MS - 60_000, _askUserExpiresAt: now + 60_000 }),
+        now,
+      ),
+    ).toBe(true);
+  });
+
+  test("user_stop 结清的卡展示「本轮已停止，提问已关闭」且不再弹框", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({ _resolved: true, _behavior: "deny", _settledReason: "user_stop" })}
+        onRespond={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("本轮已停止，提问已关闭")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 });
 

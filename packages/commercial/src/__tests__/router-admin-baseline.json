@@ -415,6 +415,24 @@
   },
   {
     "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/accounts/cursor-session/start",
+    "handler": "handleAdminCursorSessionStart"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/accounts/cursor-session/",
+    "handler": "handleAdminCursorSessionStatus"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/accounts/cursor-session/",
+    "handler": "handleAdminCursorSessionCancel"
+  },
+  {
+    "method": "POST",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/accounts/",
     "handler": "handleAdminResetAccountCooldown"

@@ -12,6 +12,7 @@
  *    卡,历史段渲染只读卡 → 翻历史会话仍能看到当时的计划与完成状态。
  */
 import type { ChatMessage } from "../../lib/chat/model";
+import { isCollapsedAnchorTerminalEvidence } from "../../lib/chat/render";
 
 /** 当前活跃段的起始下标(最后一条 user 消息的下一条;无 user 消息 → 0)。 */
 export function currentTurnStartIndex(messages: ChatMessage[]): number {
@@ -19,6 +20,44 @@ export function currentTurnStartIndex(messages: ChatMessage[]): number {
     if (messages[i]?.role === "user") return i + 1;
   }
   return 0;
+}
+
+/**
+ * 当前 turn 是否已收口(消息层终态证据版)。放在 turnSegment 而非组件内:轮边界必须与
+ * currentTurnStartIndex 同源 —— HUD 判「当前段已收口」与 extractLatestTodos 判「任务属于
+ * 当前段」用同一段定义,否则会出现「任务取自本轮、收口却按别轮判」的语义分叉。
+ *
+ * 只看消息层证据,不看「是否在发送」(时间轴):刷新/重开会话时没有 live 下降沿,靠本函数
+ * 判收口。两路证据任一命中即收口:
+ *  1. 当前段前一行(最后一条 user 行)status ∈ {replied, error} —— server 在 turn finalize
+ *     时把 user 行置 replied,是最直接的轮收口标记;
+ *  2. 当前段 [turnStart, end) 内任一行带终态存在证据(_turnTapeComplete / _turnStatusRecord /
+ *     _dispatchTerminal / 非空 _errorCode / 过程控制折叠锚终态)。
+ *
+ * 注意:「在飞优先」不在此处判定 —— active(sending)时由调用方(PinnedTaskTracker)压住
+ * 本结果,旧行残留终态标记不得盖过恢复中的 openDispatch。
+ */
+export function currentTurnSettled(messages: ChatMessage[]): boolean {
+  const turnStart = currentTurnStartIndex(messages);
+  if (turnStart > 0) {
+    const lastUserRow = messages[turnStart - 1];
+    const status = lastUserRow?.status;
+    if (status === "replied" || status === "error") return true;
+  }
+  for (let i = turnStart; i < messages.length; i++) {
+    const m = messages[i];
+    if (!m) continue;
+    if (
+      m._turnTapeComplete === true ||
+      m._turnStatusRecord === true ||
+      m._dispatchTerminal === true ||
+      (typeof m._errorCode === "string" && m._errorCode) ||
+      isCollapsedAnchorTerminalEvidence(m)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**

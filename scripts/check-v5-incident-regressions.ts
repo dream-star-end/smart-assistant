@@ -383,6 +383,11 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // 2026-09-03 反合期间 selfhost 又上线 rel-7a5617aaa(63ecbf9d8 Cursor Fable 卡死 /
   // e309f2a59 委派转录合并,均缺 trailer);源提交不可改写,只豁免其不可变祖先。
   "7a5617aaa50f06d13d2b9da8ec8d3d2e4a5d2a25",
+  // 2026-09-04 全量正向同步冻结:selfhost tip c8e4e8b6e(rel-c8e4e8b6e-20260903-182849
+  // 已上线)含 6 条缺 trailer 的 fix(v5)(OCV5-94 lazy read path 1f0598984/4e1541c49、
+  // Sand extendedUsage 计费 9315cd2fd/ec9335b41、proxy sponsorship d70acbdff、terminal
+  // red card c8e4e8b6e);源提交不可改写,只豁免其不可变祖先,后续 commit 逐条走 trailer 门。
+  "c8e4e8b6e29906ed9369c5ad5fe0f4dcc07b3b11",
 ] as const;
 
 function checkTrailerClosure(): number {

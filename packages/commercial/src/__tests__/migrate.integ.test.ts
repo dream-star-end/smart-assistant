@@ -194,12 +194,21 @@ describe("migrate.runMigrations", () => {
       enabled: boolean;
       visibility: string;
     }>(
+      // 0258 用 fn_model_switch_version 把 opus/fable 家族切到 1M:旧 entry 变 retired、
+      // 新 entry active。这里锁的是「当前生效谱系」,retired 历史行由下方 0194/0195/
+      // 0215 断言与 migration0258.integ.test.ts 单独覆盖。
       `SELECT c.model_id, c.upstream_model_id, c.state, p.enabled, p.visibility
          FROM model_catalog c
          JOIN model_pricing p ON p.model_id = c.model_id
-        WHERE c.engine = 'cursor'
+        WHERE c.engine = 'cursor' AND c.state <> 'retired'
         ORDER BY c.model_id COLLATE "C"`,
     );
+    const cursorOpusFable1m = await query<{ cnt: string }>(
+      `SELECT COUNT(*)::text AS cnt FROM model_catalog
+        WHERE engine = 'cursor' AND state = 'active' AND context_window = 1000000
+          AND model_id ~ '^cursor-(opus-5|opus-4\\.8|fable-5|fable-5\\.1)-'`,
+    );
+    assert.equal(cursorOpusFable1m.rows[0].cnt, "30", "0258: every active cursor opus/fable row must be 1M");
     assert.deepEqual(cursorModels.rows, [
       { model_id: "cursor-auto", upstream_model_id: null, state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-composer-2.5", upstream_model_id: "composer-2.5", state: "disabled", enabled: false, visibility: "hidden" },

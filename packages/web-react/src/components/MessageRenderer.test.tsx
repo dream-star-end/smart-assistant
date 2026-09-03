@@ -186,7 +186,7 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     renderMsg(mk("assistant", { _errorCode: "insufficient_credits", _errorDetail: "shortfall 120" }), {
       cb: { onTopUp },
     });
-    expect(screen.getByText("积分余额不足")).toBeInTheDocument();
+    expect(screen.getByText("积分已耗尽")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /去充值/ }));
     expect(onTopUp).toHaveBeenCalledTimes(1);
   });
@@ -681,6 +681,104 @@ describe("permission 审批", () => {
     fireEvent.click(screen.getByRole("button", { name: "回答" }));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(onRespond).not.toHaveBeenCalled();
+  });
+
+  // INC-20260904-STOP-LEAVES-PERMISSION-PENDING (fix C)：master 自动恢复 turn
+  // (`m-recover-*`) 未被本标签页 adopt 时 sending=false，但引擎确实阻塞在提问上。
+  test("未 adopt 的恢复 turn 所属 AskUserQuestion：sending=false 也自动弹答题框", () => {
+    const onRespond = vi.fn();
+    renderMsg(
+      mk("permission", {
+        toolName: "AskUserQuestion",
+        ts: Date.now(),
+        requestId: "r-recover-live",
+        _resolved: false,
+        _turnOwnerId: "m-recover-abc123",
+        inputJson: {
+          questions: [{ question: "现在部署吗？", options: [{ label: "是" }, { label: "否" }] }],
+        },
+      }),
+      { onRespond, sending: false, inActiveTurn: true },
+    );
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("是"));
+    fireEvent.click(screen.getByRole("button", { name: "提交" }));
+    expect(onRespond).toHaveBeenCalledTimes(1);
+    expect(onRespond.mock.calls[0][0].requestId).toBe("r-recover-live");
+  });
+
+  test("恢复 turn 所属权限行：已结清 / 已过期 / 只读 / 非当前段 均不自动弹", () => {
+    const base = {
+      toolName: "AskUserQuestion",
+      _turnOwnerId: "m-recover-abc123",
+      inputJson: {
+        questions: [{ question: "现在部署吗？", options: [{ label: "是" }, { label: "否" }] }],
+      },
+    } satisfies Partial<ChatMessage>;
+
+    renderMsg(
+      mk("permission", { ...base, ts: Date.now(), requestId: "r-recover-resolved", _resolved: true, _behavior: "deny" }),
+      { sending: false },
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    cleanup();
+    resetPermissionAutoOpenMemory();
+
+    // ts 远早于 TTL → 孤儿卡，不自动弹。
+    renderMsg(
+      mk("permission", { ...base, ts: Date.now() - 3 * 60 * 60_000, requestId: "r-recover-expired", _resolved: false }),
+      { sending: false },
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    cleanup();
+    resetPermissionAutoOpenMemory();
+
+    renderMsg(
+      mk("permission", { ...base, ts: Date.now(), requestId: "r-recover-readonly", _resolved: false }),
+      { sending: false, readOnly: true },
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    cleanup();
+    resetPermissionAutoOpenMemory();
+
+    renderMsg(
+      mk("permission", { ...base, ts: Date.now(), requestId: "r-recover-past-turn", _resolved: false }),
+      { sending: false, inActiveTurn: false },
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("非恢复 turn 所属的权限行 sending=false 仍不自动弹（保持原语义）", () => {
+    renderMsg(
+      mk("permission", {
+        toolName: "AskUserQuestion",
+        ts: Date.now(),
+        requestId: "r-normal-owner",
+        _resolved: false,
+        _turnOwnerId: "m-abc123def456",
+        inputJson: {
+          questions: [{ question: "现在部署吗？", options: [{ label: "是" }, { label: "否" }] }],
+        },
+      }),
+      { sending: false, inActiveTurn: true },
+    );
+    expect(screen.getByTestId("permission-card")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("user_stop 结清的提问卡展示「本轮已停止」状态", () => {
+    renderMsg(
+      mk("permission", {
+        toolName: "AskUserQuestion",
+        requestId: "r-user-stop",
+        _resolved: true,
+        _behavior: "deny",
+        _settledReason: "user_stop",
+        inputJson: { questions: [{ question: "现在部署吗？", options: [{ label: "是" }] }] },
+      }),
+    );
+    expect(screen.getByText("本轮已停止，提问已关闭")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   test("AskUserQuestion 已提交 → 展示问答摘要", () => {

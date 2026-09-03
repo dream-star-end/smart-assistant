@@ -6,15 +6,20 @@ import { test } from 'node:test'
 // protobufjs is CommonJS; a namespace import yields `{ default }` under tsx and
 // `loadSync` is undefined (see the same note in engine/cursorSandRelay.ts).
 import protobuf from 'protobufjs'
-import { CURSOR_ENGINE_MODELS } from '@openclaude/protocol'
+import { CURSOR_ENGINE_MODELS, CURSOR_SESSION_CLIENT_VERSION, cursorSessionChecksum } from '@openclaude/protocol'
 import { CursorSandRelay, encodeCursorSandRequest, recoverXmlToolCalls } from '../engine/cursorSandRelay.js'
 import { CursorSandAdapter } from '../engine/cursorSandAdapter.js'
 import {
   cursorSandEnabledForSelection,
+  cursorSelectionUserId,
   recordCursorCredentialResult,
   selectCursorCredential,
 } from '../engine/cursorCredentialSelection.js'
-import { CursorRoutingAdapter } from '../engine/cursorRoutingAdapter.js'
+import {
+  cursorOfficialCcEnabledForModel,
+  cursorVariantFor,
+  CursorRoutingAdapter,
+} from '../engine/cursorRoutingAdapter.js'
 import { createEngine } from '../engine/registry.js'
 
 const root = protobuf.loadSync(
@@ -25,15 +30,18 @@ const StreamResponse = root.lookupType('aiserver.v1.InferenceStreamResponse')
 const SAND_SELECTION = {
   slot: 2, keyName: 'api-key.2', sandEnabled: true,
   poolGeneration: 'legacy', accountId: '0', keyFingerprint: '0000000000000000',
+  credentialKind: 'api_key' as const, machineId: null,
 }
 const NATIVE_SELECTION = {
   slot: 1, keyName: 'api-key', sandEnabled: false,
   poolGeneration: 'legacy', accountId: '0', keyFingerprint: '0000000000000000',
+  credentialKind: 'api_key' as const, machineId: null,
 }
 const STABLE_SAND_SELECTION = {
   slot: 2, keyName: 'api-key.2', sandEnabled: true,
   poolGeneration: 'gen-0123456789abcdef01234567',
   accountId: '42', keyFingerprint: '0123456789abcdef',
+  credentialKind: 'api_key' as const, machineId: null,
 }
 
 function envelope(payload: Uint8Array, flags = 0): Buffer {
@@ -76,6 +84,123 @@ test('Sand credential selects every concrete Cursor model while Auto stays nativ
   assert.equal(cursorSandEnabledForSelection('cursor-fable-5-high', NATIVE_SELECTION), false)
 })
 
+test('official Claude Code flag selects only local Sand Opus/Fable models', () => {
+  const on = { OC_CURSOR_SAND_OFFICIAL_CC: '1' }
+  const off = { OC_CURSOR_SAND_OFFICIAL_CC: '0' }
+  for (const model of [
+    'cursor-opus-4.8-high',
+    'cursor-opus-5-max-fast',
+    'cursor-fable-5-high',
+    'cursor-fable-5.1-xhigh',
+  ]) {
+    assert.equal(cursorOfficialCcEnabledForModel(model, on), true, model)
+    assert.equal(cursorVariantFor(model, SAND_SELECTION, { kind: 'local' }, on), 'sand-official-cc')
+    assert.equal(cursorVariantFor(model, SAND_SELECTION, { kind: 'local' }, off), 'sand-ccb')
+    assert.equal(cursorVariantFor(model, NATIVE_SELECTION, { kind: 'local' }, on), 'native')
+    assert.equal(
+      cursorVariantFor(model, SAND_SELECTION, {
+        kind: 'remote', hostId: 'host-1', hostMeta: {} as never,
+      }, on),
+      'sand-ccb',
+    )
+  }
+  for (const model of [
+    'cursor-grok-4.6-high',
+    'cursor-composer-2.5-fast',
+    'cursor-auto',
+  ]) {
+    assert.equal(cursorOfficialCcEnabledForModel(model, on), false, model)
+    const expected = model === 'cursor-auto' ? 'native' : 'sand-ccb'
+    assert.equal(cursorVariantFor(model, SAND_SELECTION, { kind: 'local' }, on), expected)
+  }
+})
+
+test('Cursor routing adapter keeps native, CCB Sand, and official Sand resume ids mutually exclusive', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-resume-discriminator-'))
+  const previous = process.env.OC_CURSOR_SAND_OFFICIAL_CC
+  const ccbId = 'sand-ccb:463989eb-daba-4a13-a32d-4ef00261ea08'
+  const officialId = 'sand-official-cc:3bdc1a6e-63e3-4a3b-a29f-9aeb4e08c1cd'
+  const nativeId = 'cursor-native-session-id'
+  try {
+    process.env.OC_CURSOR_SAND_OFFICIAL_CC = '0'
+    const ccb = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:ccb-resume-discriminator', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-fable-5.1-high', cursorCredentialSelection: SAND_SELECTION,
+    })
+    assert.equal(ccb.currentVariant, 'sand-ccb')
+    assert.equal(ccb.isResumeIdCompatible(ccbId), true)
+    assert.equal(ccb.isResumeIdCompatible(officialId), false)
+    assert.equal(ccb.isResumeIdCompatible(nativeId), false)
+    await ccb.shutdown()
+
+    process.env.OC_CURSOR_SAND_OFFICIAL_CC = '1'
+    const official = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:official-resume-discriminator', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-fable-5.1-high', cursorCredentialSelection: SAND_SELECTION,
+    })
+    assert.equal(official.currentVariant, 'sand-official-cc')
+    assert.equal(official.isResumeIdCompatible(officialId), true)
+    assert.equal(official.isResumeIdCompatible(ccbId), false)
+    assert.equal(official.isResumeIdCompatible(nativeId), false)
+    await official.shutdown()
+
+    const native = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:native-resume-discriminator', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-fable-5.1-high', cursorCredentialSelection: NATIVE_SELECTION,
+    })
+    assert.equal(native.currentVariant, 'native')
+    assert.equal(native.isResumeIdCompatible(nativeId), true)
+    assert.equal(native.isResumeIdCompatible(ccbId), false)
+    assert.equal(native.isResumeIdCompatible(officialId), false)
+    await native.shutdown()
+  } finally {
+    if (previous === undefined) delete process.env.OC_CURSOR_SAND_OFFICIAL_CC
+    else process.env.OC_CURSOR_SAND_OFFICIAL_CC = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('official local and remote CCB execution targets rebuild the Cursor transport in both directions', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-execution-target-switch-'))
+  const previous = process.env.OC_CURSOR_SAND_OFFICIAL_CC
+  const remote = {
+    kind: 'remote' as const,
+    hostId: 'host-1',
+    hostMeta: {
+      sessionId: 'agent:main:test:target-switch',
+      userId: 'user-1',
+      hostId: 'host-1',
+      controlPath: '/run/ccb-ssh/host-1/ctl.sock',
+      knownHostsPath: '/run/ccb-ssh/host-1/known_hosts',
+      username: 'runner',
+      host: '127.0.0.2',
+      port: 22,
+      remoteWorkdir: '/workspace',
+    },
+  }
+  try {
+    process.env.OC_CURSOR_SAND_OFFICIAL_CC = '1'
+    const router = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:target-switch', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-fable-5.1-high', cursorCredentialSelection: SAND_SELECTION,
+    })
+    assert.equal(router.currentVariant, 'sand-official-cc')
+
+    await router.setExecutionTarget(remote)
+    assert.equal(router.currentVariant, 'sand-ccb')
+    assert.deepEqual(router.executionTarget, remote)
+
+    await router.setExecutionTarget({ kind: 'local' })
+    assert.equal(router.currentVariant, 'sand-official-cc')
+    assert.deepEqual(router.executionTarget, { kind: 'local' })
+    await router.shutdown()
+  } finally {
+    if (previous === undefined) delete process.env.OC_CURSOR_SAND_OFFICIAL_CC
+    else process.env.OC_CURSOR_SAND_OFFICIAL_CC = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('cursor engine factory binds transport to the selected key and preserves it across concrete models', async () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'cursor-sand-factory-'))
   const opts = {
@@ -89,12 +214,12 @@ test('cursor engine factory binds transport to the selected key and preserves it
   try {
     const sand = createEngine('cursor', opts)
     assert.equal(sand instanceof CursorRoutingAdapter, true)
-    assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand')
+    assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand-ccb')
     assert.equal(sand.capabilities.supportsNativeCompact, false)
     assert.equal(typeof sand.compactForHandoff, 'undefined')
     sand.setModel('cursor-opus-5-high')
     await (sand as CursorRoutingAdapter).refreshVariantForTest()
-    assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand')
+    assert.equal((sand as unknown as CursorRoutingAdapter).currentVariant, 'sand-ccb')
     assert.deepEqual((sand as CursorRoutingAdapter).currentCredentialForTest, SAND_SELECTION)
     assert.throws(() => sand.setModel('cursor-auto'), /CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION/)
     await sand.shutdown()
@@ -145,6 +270,8 @@ printf '%s %s %s %s %s\n' \
       poolGeneration: 'gen-0123456789abcdef01234567',
       accountId: '42',
       keyFingerprint: '0123456789abcdef',
+      credentialKind: 'api_key',
+      machineId: null,
     })
     recordCursorCredentialResult({
       agentId: 'main', sessionKey: 'agent:main:test:credential-selector',
@@ -157,6 +284,42 @@ printf '%s %s %s %s %s\n' \
   } finally {
     if (previous === undefined) delete process.env.OC_CURSOR_WRAPPER_BIN
     else process.env.OC_CURSOR_WRAPPER_BIN = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('credential selector hands the container owner uid to the wrapper for sticky Sand selection', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-credential-selector-uid-'))
+  const wrapper = resolve(dir, 'oc-cursor')
+  const capture = resolve(dir, 'seen-uid')
+  const previousBin = process.env.OC_CURSOR_WRAPPER_BIN
+  const previousUid = process.env.OC_USER_ID
+  writeFileSync(wrapper, `#!/bin/sh
+set -eu
+printf '%s\n' "\${OC_USER_ID-unset}" > ${capture}
+echo 'oc-cursor: selected_slot 2 api-key.2 sand gen-0123456789abcdef01234567 12 0123456789abcdef session abcdefghijklmnopqrstuvwxyz'
+`, { mode: 0o755 })
+  chmodSync(wrapper, 0o755)
+  process.env.OC_CURSOR_WRAPPER_BIN = wrapper
+  try {
+    process.env.OC_USER_ID = '7'
+    const selection = selectCursorCredential({
+      agentId: 'main', sessionKey: 'agent:main:test:credential-selector-uid',
+      agentBaseDir: dir, model: 'cursor-opus-5-high',
+    })
+    assert.equal(selection.accountId, '12')
+    assert.equal(readFileSync(capture, 'utf8').trim(), '7')
+
+    // Junk never reaches the wrapper env; the probe fallback is consulted instead.
+    assert.equal(cursorSelectionUserId({ OC_USER_ID: 'not-a-uid' }, () => ({ uid: null })), null)
+    assert.equal(cursorSelectionUserId({ OC_USER_ID: '' }, () => ({ uid: '9' })), '9')
+    assert.equal(cursorSelectionUserId({ OC_USER_ID: ' 42 ' }, () => { throw new Error('unused') }), '42')
+    assert.equal(cursorSelectionUserId({ OC_USER_ID: '1234567890123' }, () => ({ uid: null })), null)
+  } finally {
+    if (previousBin === undefined) delete process.env.OC_CURSOR_WRAPPER_BIN
+    else process.env.OC_CURSOR_WRAPPER_BIN = previousBin
+    if (previousUid === undefined) delete process.env.OC_USER_ID
+    else process.env.OC_USER_ID = previousUid
     rmSync(dir, { recursive: true, force: true })
   }
 })
@@ -203,7 +366,7 @@ test('concrete model quota-family changes reselect an eligible key before the ne
     await router.refreshVariantForTest()
     assert.equal(selections, 1)
     assert.deepEqual(router.currentCredentialForTest, nextSand)
-    assert.equal(router.currentVariant, 'sand')
+    assert.equal(router.currentVariant, 'sand-ccb')
     await router.shutdown()
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -217,11 +380,13 @@ test('pool generation changes rebind stable account identity before reading a re
       slot: 2, keyName: 'api-key.2', sandEnabled: true,
       poolGeneration: 'gen-111111111111111111111111',
       accountId: '2', keyFingerprint: 'aaaaaaaaaaaaaaaa',
+      credentialKind: 'api_key' as const, machineId: null,
     }
     const generationTwo = {
       slot: 1, keyName: 'api-key', sandEnabled: true,
       poolGeneration: 'gen-222222222222222222222222',
       accountId: '2', keyFingerprint: 'aaaaaaaaaaaaaaaa',
+      credentialKind: 'api_key' as const, machineId: null,
     }
     const router = new CursorRoutingAdapter({
       sessionKey: 'agent:main:test:generation-rebind', agentId: 'main', agentBaseDir: dir,
@@ -229,7 +394,7 @@ test('pool generation changes rebind stable account identity before reading a re
     }, () => generationTwo)
     await router.refreshVariantForTest()
     assert.deepEqual(router.currentCredentialForTest, generationTwo)
-    assert.equal(router.currentVariant, 'sand')
+    assert.equal(router.currentVariant, 'sand-ccb')
     await router.shutdown()
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -906,15 +1071,237 @@ test('loopback relay hits InferenceService/Stream with Sand identity and emits A
   }
 })
 
+// Regression: Sand-routed Fable turns billed as 100% uncached input because the
+// relay only copied inputTokens/outputTokens off the extendedUsage frame and
+// dropped cache_read_tokens/cache_write_tokens. The CCB parser downstream keys
+// on Anthropic's cache_read_input_tokens/cache_creation_input_tokens, so the
+// relay must surface them in message_delta (stream) and the JSON body (non-stream).
+async function relayUsageResponse(
+  frames: Buffer[],
+  stream: boolean,
+): Promise<string> {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(Buffer.concat([...frames, envelope(Buffer.from('{}'), 0x02)]), {
+      status: 200,
+      headers: { 'content-type': 'application/connect+proto' },
+    })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-fable-5.1-high', stream, max_tokens: 64,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    assert.equal(response.status, 200)
+    return await response.text()
+  } finally {
+    await relay.close()
+  }
+}
+
+// Sand reports input_tokens *inclusive* of cache_read/cache_write; Anthropic's
+// input_tokens is exclusive. The relay must subtract so usageCost does not bill
+// the cached context at the full input rate on top of the cache rate.
+test('extendedUsage cache counters surface as Anthropic cache fields with input_tokens made exclusive', async () => {
+  const frames = [
+    responseFrame('textPart', { text: 'done' }),
+    responseFrame('extendedUsage', {
+      inputTokens: 102_620, outputTokens: 9, cacheReadTokens: 100_000, cacheWriteTokens: 2_500, maxTokens: 64,
+    }),
+  ]
+  const streamed = await relayUsageResponse(frames, true)
+  assert.match(
+    streamed,
+    /"usage":\{"input_tokens":120,"output_tokens":9,"cache_read_input_tokens":100000,"cache_creation_input_tokens":2500\}/,
+  )
+  const json = JSON.parse(await relayUsageResponse(frames, false)) as { usage: Record<string, number> }
+  assert.deepEqual(json.usage, {
+    input_tokens: 120, output_tokens: 9, cache_read_input_tokens: 100000, cache_creation_input_tokens: 2500,
+  })
+})
+
+test('extendedUsage with cache counters exceeding input_tokens clamps input_tokens to 0', async () => {
+  const frames = [
+    responseFrame('textPart', { text: 'done' }),
+    responseFrame('extendedUsage', {
+      inputTokens: 50, outputTokens: 1, cacheReadTokens: 40, cacheWriteTokens: 20, maxTokens: 64,
+    }),
+  ]
+  const json = JSON.parse(await relayUsageResponse(frames, false)) as { usage: Record<string, number> }
+  assert.deepEqual(json.usage, {
+    input_tokens: 0, output_tokens: 1, cache_read_input_tokens: 40, cache_creation_input_tokens: 20,
+  })
+})
+
+test('extendedUsage without cache counters leaves input_tokens untouched', async () => {
+  const frames = [
+    responseFrame('textPart', { text: 'done' }),
+    responseFrame('extendedUsage', { inputTokens: 777, outputTokens: 3, maxTokens: 64 }),
+  ]
+  const json = JSON.parse(await relayUsageResponse(frames, false)) as { usage: Record<string, number> }
+  assert.deepEqual(json.usage, { input_tokens: 777, output_tokens: 3 })
+})
+
+test('legacy usage frame without cache counters keeps the bare {input_tokens, output_tokens} shape', async () => {
+  const frames = [
+    responseFrame('textPart', { text: 'done' }),
+    responseFrame('usage', { promptTokens: 10, completionTokens: 4, totalTokens: 14 }),
+  ]
+  const streamed = await relayUsageResponse(frames, true)
+  assert.match(streamed, /"usage":\{"input_tokens":10,"output_tokens":4\}/)
+  assert.doesNotMatch(streamed, /cache_read_input_tokens/)
+  const json = JSON.parse(await relayUsageResponse(frames, false)) as { usage: Record<string, number> }
+  assert.deepEqual(json.usage, { input_tokens: 10, output_tokens: 4 })
+})
+
+// 0257 — a `session` slot holds a Cursor account session accessToken (PKCE
+// login). The relay must present it directly as Bearer with x-cursor-checksum
+// derived from the persisted machine id, never call the API-key exchange, and
+// fail loud once the JWT is expired instead of degrading to another credential.
+function sessionJwt(expSeconds: number): string {
+  const header = Buffer.from('{"alg":"RS256","typ":"JWT"}').toString('base64url')
+  const payload = Buffer.from(JSON.stringify({ sub: 'auth0|x', exp: expSeconds, type: 'session' })).toString('base64url')
+  return `${header}.${payload}.${'s'.repeat(40)}`
+}
+
+test('session credential is sent as Bearer with x-cursor-checksum and skips the API-key exchange', async () => {
+  const machineId = 'abcdefghijklmnopqrstuvwxyz'
+  const token = sessionJwt(Math.floor(Date.now() / 1000) + 30 * 86400)
+  const seen: { url: string; headers: Headers }[] = []
+  const fetchImpl: typeof fetch = async (input, init) => {
+    seen.push({ url: String(input), headers: new Headers(init?.headers) })
+    return new Response(Buffer.concat([responseFrame('textPart', { text: 'ok' }), envelope(Buffer.from('{}'), 0x02)]), {
+      status: 200,
+      headers: { 'content-type': 'application/connect+proto' },
+    })
+  }
+  const relay = new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from(`${token}\n`),
+    credentialKind: 'session',
+    machineId,
+    now: () => 1_700_000_000_000,
+  })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-fable-5.1-high', stream: false, max_tokens: 64,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    assert.equal(response.status, 200)
+    assert.equal(seen.length, 1)
+    assert.equal(seen.some((call) => call.url.endsWith('/auth/exchange_user_api_key')), false)
+    const inference = seen[0]!
+    assert.match(inference.url, /InferenceService\/Stream$/)
+    // readApiKey returns the raw slot bytes (trailing newline); Bearer must be the trimmed token.
+    assert.equal(inference.headers.get('authorization'), `Bearer ${token.trim()}`)
+    assert.equal(inference.headers.get('x-cursor-client-type'), 'sand')
+    assert.equal(inference.headers.get('x-cursor-client-version'), CURSOR_SESSION_CLIENT_VERSION)
+    const checksum = inference.headers.get('x-cursor-checksum')
+    assert.equal(checksum, cursorSessionChecksum(machineId, 1_700_000_000_000))
+    assert.ok(checksum?.endsWith(machineId))
+  } finally {
+    await relay.close()
+  }
+})
+
+test('expired session credential fails loud and never falls back to the API-key exchange', async () => {
+  const seen: string[] = []
+  const fetchImpl: typeof fetch = async (input) => {
+    seen.push(String(input))
+    return new Response('{}', { status: 200 })
+  }
+  const relay = new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from(sessionJwt(Math.floor(Date.now() / 1000) - 60)),
+    credentialKind: 'session',
+    machineId: 'abcdefghijklmnopqrstuvwxyz',
+  })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-fable-5.1-high', stream: false, max_tokens: 64,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    assert.notEqual(response.status, 200)
+    assert.match(await response.text(), /CURSOR_SAND_SESSION_EXPIRED/)
+    assert.deepEqual(seen, [])
+  } finally {
+    await relay.close()
+  }
+})
+
+test('session relay refuses to start without a persisted machine id', () => {
+  assert.throws(
+    () => new CursorSandRelay({ readApiKey: () => Buffer.from('x'), credentialKind: 'session', machineId: null }),
+    /CURSOR_SAND_SESSION_MACHINE_ID_INVALID/,
+  )
+})
+
+test('credential selector parses the 0257 session columns and fails closed on inconsistent ones', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-credential-selector-session-'))
+  const wrapper = resolve(dir, 'oc-cursor')
+  const previous = process.env.OC_CURSOR_WRAPPER_BIN
+  const run = (line: string) => {
+    writeFileSync(wrapper, `#!/bin/sh\necho '${line}'\n`, { mode: 0o755 })
+    chmodSync(wrapper, 0o755)
+    return selectCursorCredential({
+      agentId: 'main', sessionKey: 'agent:main:test:credential-selector-session',
+      agentBaseDir: dir, model: 'cursor-opus-5-high',
+    })
+  }
+  process.env.OC_CURSOR_WRAPPER_BIN = wrapper
+  try {
+    const session = run('oc-cursor: selected_slot 3 api-key.3 sand gen-0123456789abcdef01234567 7 0123456789abcdef session abcdefghijklmnopqrstuvwxyz')
+    assert.equal(session.credentialKind, 'session')
+    assert.equal(session.machineId, 'abcdefghijklmnopqrstuvwxyz')
+    assert.equal(session.sandEnabled, true)
+    const apiKey = run('oc-cursor: selected_slot 1 api-key native legacy 0 0000000000000000 api_key -')
+    assert.equal(apiKey.credentialKind, 'api_key')
+    assert.equal(apiKey.machineId, null)
+    assert.throws(
+      () => run('oc-cursor: selected_slot 3 api-key.3 native legacy 0 0000000000000000 session abcdefghijklmnopqrstuvwxyz'),
+      /CURSOR_CREDENTIAL_SELECTION_MALFORMED/,
+    )
+    assert.throws(
+      () => run('oc-cursor: selected_slot 3 api-key.3 sand legacy 0 0000000000000000 session -'),
+      /CURSOR_CREDENTIAL_SELECTION_MALFORMED/,
+    )
+  } finally {
+    if (previous === undefined) delete process.env.OC_CURSOR_WRAPPER_BIN
+    else process.env.OC_CURSOR_WRAPPER_BIN = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('relay passes non-Sand models (CCB sub-agent pin) through to the internal proxy verbatim', async () => {
-  const seen: { url: string; auth: string | null; body: string }[] = []
+  const seen: { url: string; auth: string | null; headers: Headers; body: string }[] = []
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = String(input)
     if (url.endsWith('/auth/exchange_user_api_key') || url.includes('InferenceService')) {
       throw new Error(`Sand upstream must not be touched for passthrough: ${url}`)
     }
     const headers = new Headers(init?.headers)
-    seen.push({ url, auth: headers.get('authorization'), body: Buffer.from(init?.body as Uint8Array).toString('utf8') })
+    seen.push({ url, auth: headers.get('authorization'), headers, body: Buffer.from(init?.body as Uint8Array).toString('utf8') })
     const sse = 'event: message_start\ndata: {"type":"message_start"}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'
     return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
   }
@@ -930,14 +1317,61 @@ test('relay passes non-Sand models (CCB sub-agent pin) through to the internal p
       messages: [{ role: 'user', content: 'hi' }],
     })
     const response = await fetch(`${baseUrl}/v1/messages`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: payload,
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        // CCB puts the turn's authority envelopes on every request via
+        // ANTHROPIC_CUSTOM_HEADERS; the fail-closed egress gate needs them.
+        'x-oc-model-authority': 'authority.envelope.b64url',
+        'x-oc-turn-lease': 'lease.envelope.b64url',
+        'x-oc-local-catalog': 'local.catalog.token',
+        // Never forwarded: caller identity is the relay's own bearer.
+        authorization: 'Bearer cursor-sand-loopback',
+        'x-api-key': 'cursor-sand-loopback',
+        'x-oc-not-an-authority-header': 'ignored',
+      },
+      body: payload,
     })
     assert.equal(response.status, 200)
     assert.match(await response.text(), /event: message_stop/)
     assert.equal(seen.length, 1)
     assert.equal(seen[0].url, 'http://proxy.internal:18892/v1/messages')
     assert.equal(seen[0].auth, 'Bearer container-bearer')
+    assert.equal(seen[0].headers.get('x-api-key'), 'container-bearer')
+    assert.equal(seen[0].headers.get('x-oc-model-authority'), 'authority.envelope.b64url')
+    assert.equal(seen[0].headers.get('x-oc-turn-lease'), 'lease.envelope.b64url')
+    assert.equal(seen[0].headers.get('x-oc-local-catalog'), 'local.catalog.token')
+    assert.equal(seen[0].headers.get('x-oc-not-an-authority-header'), null)
     assert.equal(seen[0].body, payload)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('relay passthrough without authority headers sends none (no empty/forged values)', async () => {
+  const captured: Headers[] = []
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    captured.push(new Headers(init?.headers))
+    return new Response('{"type":"message"}', { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  const relay = new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from('crsr_test'),
+    passthrough: { baseUrl: 'http://proxy.internal:18892', authToken: 'container-bearer' },
+  })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'glm-5.3-zai', stream: false, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(response.status, 200)
+    assert.equal(captured.length, 1)
+    const forwarded = captured[0]
+    assert.equal(forwarded.has('x-oc-model-authority'), false)
+    assert.equal(forwarded.has('x-oc-turn-lease'), false)
+    assert.equal(forwarded.has('x-oc-local-catalog'), false)
   } finally {
     await relay.close()
   }
@@ -1196,4 +1630,121 @@ test('downstream abort cancels the Cursor stream and relay close does not hang',
     new Promise((_, reject) => setTimeout(() => reject(new Error('relay close timeout')), 500)),
   ])
   assert.equal(upstreamAborted, true)
+})
+
+// ── Context overflow → "Prompt is too long" (reactive compaction contract) ──────
+// CCB keys reactive compaction on `message.toLowerCase().includes('prompt is too long')`
+// (claude-code-best services/api/errors.ts). Every Sand overflow surface must land there.
+
+test('relay maps upstream HTTP 413 to a "Prompt is too long" invalid_request_error', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response('request entity too large', { status: 413 })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(response.status, 413)
+    const body = JSON.parse(await response.text()) as { error: { type: string; message: string } }
+    assert.equal(body.error.type, 'invalid_request_error')
+    assert.match(body.error.message, /^Prompt is too long: Cursor Sand HTTP 413/)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('relay keeps non-overflow upstream failures as plain api_error', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response('upstream unavailable', { status: 503 })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(response.status, 503)
+    const body = JSON.parse(await response.text()) as { error: { type: string; message: string } }
+    assert.equal(body.error.type, 'api_error')
+    assert.equal(body.error.message, 'Cursor Sand HTTP 503')
+    assert.doesNotMatch(body.error.message, /prompt is too long/i)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('relay maps INPUT_TOKEN_LIMIT stream error to a "Prompt is too long" SSE error', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        // InferenceStreamErrorType.INFERENCE_STREAM_ERROR_TYPE_INPUT_TOKEN_LIMIT = 2
+        controller.enqueue(responseFrame('error', { message: 'input exceeds model limit', errorType: 2 }))
+        controller.enqueue(envelope(Buffer.from('{}'), 0x02))
+        controller.close()
+      },
+    }), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(response.status, 200)
+    const text = await response.text()
+    assert.match(text, /event: error/)
+    assert.match(text, /"message":"Prompt is too long: error_type_2: input exceeds model limit"/)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('relay maps overflow end-trailer text to "Prompt is too long"', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(envelope(Buffer.from(JSON.stringify({
+          error: { code: 'resource_exhausted', message: 'context length exceeded for this model' },
+        })), 0x02))
+        controller.close()
+      },
+    }), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const text = await response.text()
+    assert.match(text, /"message":"Prompt is too long: context length exceeded for this model"/)
+  } finally {
+    await relay.close()
+  }
 })

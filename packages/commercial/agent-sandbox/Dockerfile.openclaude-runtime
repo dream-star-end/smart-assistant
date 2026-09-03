@@ -291,6 +291,20 @@ RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
       && rm -rf /root/.npm; \
     else echo "[v5 ccb-only] skip codex CLI install (OC_INCLUDE_CODEX=0)"; fi
 
+# Official Claude Code lane for Cursor Sand. This is opt-in because ordinary
+# commercial/runtime images still use the in-tree CCB harness. The version is
+# pinned and verified at build time; gateway additionally gates every spawn to
+# a credential-bound loopback Cursor relay.
+ARG OC_INCLUDE_OFFICIAL_CLAUDE=0
+ARG OC_OFFICIAL_CLAUDE_VERSION=2.1.259
+RUN if [ "$OC_INCLUDE_OFFICIAL_CLAUDE" = "1" ]; then set -eux; \
+      npm install -g "@anthropic-ai/claude-code@${OC_OFFICIAL_CLAUDE_VERSION}" --no-audit --no-fund; \
+      test "$(claude --version | awk '{print $1}')" = "$OC_OFFICIAL_CLAUDE_VERSION"; \
+      test -x /usr/local/bin/claude; \
+      npm cache clean --force; \
+      rm -rf /root/.npm; \
+    else echo "[runtime] skip official Claude Code install (OC_INCLUDE_OFFICIAL_CLAUDE=0)"; fi
+
 # Cursor Agent CLI — owner-scoped tool capability, not a V5 model engine.
 # Keep the executable outside HOME/PATH-managed install locations so the
 # account-scoped wrapper always resolves this exact, checksum-pinned build.

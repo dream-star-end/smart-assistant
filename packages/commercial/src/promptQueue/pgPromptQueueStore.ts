@@ -2,6 +2,8 @@ import { createHash, randomBytes } from 'node:crypto'
 import {
   MAX_ATTACHMENTS_PER_MESSAGE,
   PROMPT_QUEUE_MAX_TOTAL_CONTENT_BYTES,
+  isCursorContextTier,
+  type CursorContextTier,
   type PromptQueueAttachmentRef,
   type PromptQueueMutationFrame,
   type PromptQueueMutationOperation,
@@ -1149,6 +1151,7 @@ async function readSnapshot(
         model?: string
         effortLevel?: string | null
         teamMode?: boolean
+        contextTier?: CursorContextTier
       },
       createdAt: row.created_at.getTime(),
       updatedAt: row.updated_at.getTime(),
@@ -1386,6 +1389,9 @@ function validateRequestedExecution(value: Record<string, unknown>): void {
   }
   if (value.teamMode !== undefined && typeof value.teamMode !== 'boolean') {
     throw new PromptQueueStoreError('INVALID_REQUEST', 'requestedExecution.teamMode is invalid')
+  }
+  if (value.contextTier !== undefined && !isCursorContextTier(value.contextTier)) {
+    throw new PromptQueueStoreError('INVALID_REQUEST', 'requestedExecution.contextTier is invalid')
   }
 }
 

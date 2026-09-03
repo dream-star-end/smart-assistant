@@ -1,6 +1,6 @@
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { capitalize } from '../stringUtils.js'
-import { MODEL_ALIASES, type ModelAlias } from './aliases.js'
+import { isModelAlias, MODEL_ALIASES } from './aliases.js'
 import { applyBedrockRegionPrefix, getBedrockRegionPrefix } from './bedrock.js'
 import {
   getCanonicalName,
@@ -33,14 +33,23 @@ export function getDefaultSubagentModel(): string {
  * that prefix is inherited by subagents using alias models (e.g., "sonnet", "haiku", "opus").
  * This ensures subagents use the same region as the parent, which is necessary when
  * IAM permissions are scoped to specific cross-region inference profiles.
+ *
+ * `CLAUDE_CODE_SUBAGENT_MODEL` (the platform's default pin for subagents) wins over
+ * everything except an explicit, non-alias `model` passed to the Agent tool. Bare
+ * aliases (sonnet/opus/haiku) stay pinned: on a platform deployment those aliases
+ * resolve to models that are not in the turn's allow-set and would 403.
  */
 export function getAgentModel(
   agentModel: string | undefined,
   parentModel: string,
-  toolSpecifiedModel?: ModelAlias,
+  toolSpecifiedModel?: string,
   permissionMode?: PermissionMode,
 ): string {
-  if (process.env.CLAUDE_CODE_SUBAGENT_MODEL) {
+  const explicitNonAliasModel =
+    toolSpecifiedModel !== undefined &&
+    toolSpecifiedModel !== '' &&
+    !isModelAlias(toolSpecifiedModel)
+  if (process.env.CLAUDE_CODE_SUBAGENT_MODEL && !explicitNonAliasModel) {
     return parseUserSpecifiedModel(process.env.CLAUDE_CODE_SUBAGENT_MODEL)
   }
 

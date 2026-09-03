@@ -9,7 +9,7 @@
  * 重要：reducer 对 `session.messages` **就地 mutation**（push / 改字段），不每帧
  * 重建数组（streaming delta 频率极高）。订阅侧靠 `version` 单调递增触发重渲。
  */
-import type { MessageReplyQuote } from "@openclaude/protocol";
+import type { CursorContextTier, MessageReplyQuote } from "@openclaude/protocol";
 import type {
   CallTokenUsageSnapshot,
   TurnTokenUsageSnapshot,
@@ -58,6 +58,8 @@ export type ChatRoutingSnapshot = {
   modelSwitchId?: string;
   teamMode?: boolean;
   effortLevel?: string | null;
+  /** Cursor Opus/Fable 上下文档位(300k / 1m);非分档模型不带。重试/合成续写原样复用。 */
+  contextTier?: CursorContextTier;
 };
 
 export type RecoveryStatusState = {
@@ -410,6 +412,12 @@ export type ChatMessage = {
    *  rendered: live assistant fragments already occupy the visible text slots.
    *  INC-20260831-TURNEND-ORDER-COLLAPSE */
   _hideUnpublishedFallback?: boolean;
+  /** Phase-A fallback shares its id with the last live assistant segment
+   *  (`visible_head.messageId` = `…-tN-sK`). Server-wins keeps the fallback
+   *  row, but the segment text streamed into that id must survive so the
+   *  final answer does not vanish until Phase-B exact rows arrive.
+   *  INC-20260903-TURNEND-LAST-SEGMENT-FLASH */
+  _unpublishedFallbackLiveText?: string;
   /** Sanitizer placeholder for a structurally invalid history/socket row. */
   _corruptPlaceholder?: boolean;
   _corruptReason?: "missing-id" | "malformed";
@@ -578,6 +586,12 @@ export type ChatSession = {
     reason?: string | null;
     answers?: Record<string, string>;
   }>;
+  /** requestIds this browser has already seen settled (settled frame, own
+   *  durable response, resolved card). A later `outbound.permission_request`
+   *  for one of these — e.g. Master hello catch-up replaying a stale durable
+   *  row after the card was dropped by full-sync — must never open a fresh
+   *  "waiting" card. Persisted with StoredSession; bounded FIFO. */
+  _settledPermissionRequestIds?: Record<string, true>;
   /** server canonical 增量游标（历史加载 getSession 的 sinceSeq；随 StoredSession 落地）。*/
   _maxSeq?: number;
   /** Server history revision paired with `_maxSeq`; persisted across reload. */
@@ -689,6 +703,12 @@ export type ChatSession = {
 
   // ── 双帧 error 抑制（§11）──
   _suppressErrorBubbleAtSeq?: number;
+  /**
+   * Master 拥有自动恢复时被**延后**的终态错误所属 cmid(浏览器内存态,不持久化)。存在期间本轮
+   * 保持 `_sendingInFlight` + retrying 软状态,兼容 [error] final 不得收尾;由 socket 在
+   * `sys.recovery_decision` / `outbound.ack{recovery}` 领养 / 宽限超时时清除。
+   */
+  _deferredTerminalErrorClientMessageId?: string;
 
   // ── 计费归因（§7 isFinal drain）──
   _pendingCostCredits?: string;

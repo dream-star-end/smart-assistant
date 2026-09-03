@@ -8,9 +8,9 @@
  *      CCB;CCB 对空串按未设置处理)。
  *   2. 值截断:parentSessionId ≤128 / delegateAgentId ≤64,守 proxy 侧
  *      metadata.user_id 512 字节 zod 预算。
- *   3. **结构**断言:backend.spawn({ env: { … } }) 调用点 spread
- *      `_buildCcbUsageAttributionEnv(this.opts.usageAttribution)` 恰好一次 ——
- *      重构丢 spread 会静默丢掉整条 delegate 归因链,这里强制可见。
+ *   3. **结构**断言:backend.spawn({ env: { … } }) 调用点只在 CCB
+ *      harness spread `_buildCcbUsageAttributionEnv`;official Claude Code
+ *      harness 显式写空串,避免把 CCB 专属归因元数据泄给官方 CLI。
  *
  * 与 resolveDelegateParentClientSessionId(server.ts,注入值的解析链)的测试
  * 在 delegateUsageAttribution.test.ts。
@@ -91,17 +91,17 @@ test('buildCcbUsageAttributionEnv: 超长值截断(parent ≤128 / agent ≤64,�
 
 // ── 结构断言:spawn env 块 spread 恰好一次 ──
 
-test('subprocessRunner.ts spawn env 块 spread _buildCcbUsageAttributionEnv(this.opts.usageAttribution) 恰好一次', () => {
+test('subprocessRunner.ts spawn env: CCB 注入归因，official Claude Code 显式清空', () => {
   const src = readFileSync(
     new URL('../subprocessRunner.ts', import.meta.url),
     'utf8',
   )
-  const spreads = src.match(
-    /\.\.\._buildCcbUsageAttributionEnv\(this\.opts\.usageAttribution\)/g,
+  const guardedSpreads = src.match(
+    /harness\s*===\s*['"]ccb['"]\s*\?\s*_buildCcbUsageAttributionEnv\(this\.opts\.usageAttribution\)\s*:\s*\{\s*CLAUDE_CODE_EXTRA_METADATA:\s*['"]{2}\s*\}/g,
   )
   assert.equal(
-    spreads?.length,
+    guardedSpreads?.length,
     1,
-    'backend.spawn env 必须 spread _buildCcbUsageAttributionEnv 恰好一次(丢 spread = 整条 delegate 归因链静默失效)',
+    'backend.spawn env 必须且只能有一个 harness 守卫：CCB 注入归因，official Claude Code 清空继承值',
   )
 })

@@ -1,5 +1,5 @@
 import { type Static, Type } from '@sinclair/typebox'
-import { PLATFORM_REASONING_EFFORTS } from './engineModels.js'
+import { CURSOR_CONTEXT_TIERS, PLATFORM_REASONING_EFFORTS } from './engineModels.js'
 import { GOAL_STATUSES, type GoalStateSnapshot } from './goalState.js'
 import { MessageReplyQuote } from './messageReply.js'
 import { SysMediaJob } from './mediaGeneration.js'
@@ -237,6 +237,14 @@ export const InboundMessage = Type.Object({
   /** Server-issued generation binding a prepared native model handoff to the
    * first turn on the selected target model. */
   modelSwitchId: Type.Optional(ControlId),
+  // Cursor Opus/Fable 上下文档位(turn 级,2026-09 起)。只对 CURSOR_CONTEXT_TIER_FAMILIES
+  // 生效:master 在签发 executionDescriptor 前把 catalog 机制窗口(1M)按档位收窄
+  // (300k → 300_000;1m → 原值),CCB auto-compact 阈值随之变化。不换 canonical id、
+  // 不重启 CCB 进程、不影响 Sand resume。缺省 = DEFAULT_CURSOR_CONTEXT_TIER('300k')。
+  // 非 tier 模型收到此字段静默忽略。
+  contextTier: Type.Optional(
+    Type.Union(CURSOR_CONTEXT_TIERS.map((tier) => Type.Literal(tier))),
+  ),
   // 团队模式(v5 轻量组队):main 队长收到此 flag 的 turn 会被鼓励按任务复杂度自主
   // delegate_task 给已安装 agent 组队,简单任务自己答。turn 级、可中途切,只对 main 生效。
   teamMode: Type.Optional(Type.Boolean()),
@@ -426,6 +434,9 @@ export const PromptQueueItem = Type.Object({
     modelSwitchId: Type.Optional(ControlId),
     effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
     teamMode: Type.Optional(Type.Boolean()),
+    contextTier: Type.Optional(
+      Type.Union(CURSOR_CONTEXT_TIERS.map((tier) => Type.Literal(tier))),
+    ),
   }),
   createdAt: Type.Number(),
   updatedAt: Type.Number(),
@@ -510,6 +521,9 @@ export const InboundPromptQueueEnqueue = Type.Object({
     model: Type.Optional(Type.String()),
     effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
     teamMode: Type.Optional(Type.Boolean()),
+    contextTier: Type.Optional(
+      Type.Union(CURSOR_CONTEXT_TIERS.map((tier) => Type.Literal(tier))),
+    ),
   }),
 })
 export type InboundPromptQueueEnqueue = Static<typeof InboundPromptQueueEnqueue>
@@ -908,7 +922,9 @@ export const OutboundPermissionSettled = Type.Object({
    *  'already_settled' = duplicate response arrived after first consumer won,
    *  'disconnect' = auto-denied by server on peer disconnect,
    *  'timeout' = auto-denied after exceeding max wait time (janitor),
-   *  'crashed' = auto-denied because the CCB subprocess died */
+   *  'crashed' = auto-denied because the CCB subprocess died,
+   *  'user_stop' = auto-denied because the user pressed Stop on the turn
+   *  that was blocked waiting for this permission */
   reason: Type.Optional(
     Type.Union([
       Type.Literal('remote'),
@@ -916,6 +932,7 @@ export const OutboundPermissionSettled = Type.Object({
       Type.Literal('disconnect'),
       Type.Literal('timeout'),
       Type.Literal('crashed'),
+      Type.Literal('user_stop'),
     ]),
   ),
   /** Present only for AskUserQuestion allow settlements. Carries the

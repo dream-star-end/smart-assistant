@@ -230,6 +230,16 @@ export interface ModelAuthorityDecision {
   securityEpoch: bigint;
   /** bridge 路径的 turn 标识(日志/对账用;本地路径 null)。 */
   authorityTurnId: string | null;
+  /**
+   * bridge 路径票据(authority / lease)里 master 签发的 **turn 主模型**;local_catalog 路径 null。
+   *
+   * 与 `canonicalModel`(= 本请求 body.model 归一)的区别:一个 turn 内 aux 请求(CCB
+   * SMALL_FAST、cursor 主模型下子 agent 钉的 DEFAULT_CCB_SUBAGENT_MODEL)的 canonicalModel
+   * 是次级模型,而 `authority_turn_dispatches.canonical_model` 记的是主模型。lease-only
+   * 请求回收 dispatch 身份 / 判 verification sponsorship 必须用这个字段比对,拿请求模型比
+   * 会把所有 aux 请求判成 identity conflict(2026-09-03 cursor 子 agent 一律 409)。
+   */
+  authorityCanonicalModel: string | null;
   /** 已验签 turn lease 的签发时间(ms);authority-only/local_catalog 路径为 null。 */
   turnLeaseIssuedAtMs: number | null;
   /** 本次请求在 egress 完成 turn lease 验签的服务端时间(ms);无 lease 时为 null。 */
@@ -380,6 +390,7 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
       claimedProjectionRevision: token.projectionRevision,
       securityEpoch: snapshot.securityEpoch,
       authorityTurnId: null,
+      authorityCanonicalModel: null,
       turnLeaseIssuedAtMs: null,
       turnLeaseVerifiedAtMs: null,
     };
@@ -550,6 +561,7 @@ function verifyBridgeAuthority(a: {
     claimedProjectionRevision: null,
     securityEpoch: a.snapshot.securityEpoch,
     authorityTurnId: principal.authorityTurnId,
+    authorityCanonicalModel: principal.canonicalModel,
     // 只投影真正通过 verifyTurnLease 的局部变量。principal 可能是短 authority，
     // 其 issuedAt 不能冒充长 lease 的 rollout 续跑证据。
     turnLeaseIssuedAtMs: lease?.issuedAt ?? null,

@@ -32,6 +32,9 @@ export type AccountRow = {
   has_refresh_token: boolean;
   cursor_quota_class: "unknown" | "other_ok" | "cursor_only" | null;
   cursor_sand_enabled: boolean | null;
+  /** 0257 — Sand 凭证形态:api_key(crsr_ 换 token)| session(Cursor 账号登录会话)。 */
+  cursor_credential_kind: "api_key" | "session" | null;
+  cursor_auth_id: string | null;
   created_at: string;
   updated_at: string;
   today_requests?: number;
@@ -79,6 +82,54 @@ export type RecentUser = {
   email: string | null;
   request_count: number;
   last_used_at: string;
+};
+
+/** GET /api/admin/accounts/:id/cursor-usage — Cursor 账号会话(Sand)额度快照。 */
+export type CursorUsageSnapshot = {
+  fetched_at: string;
+  errors: Record<string, string>;
+  plan: {
+    name: string | null;
+    price: string | null;
+    membership_type: string | null;
+    subscription_status: string | null;
+    billing_cycle_start: string | null;
+    billing_cycle_end: string | null;
+  };
+  included: {
+    used_cents: number | null;
+    limit_cents: number | null;
+    remaining_cents: number | null;
+    total_percent_used: number | null;
+    auto_percent_used: number | null;
+    api_percent_used: number | null;
+    is_unlimited: boolean | null;
+    display_message: string | null;
+  };
+  on_demand: {
+    enabled: boolean | null;
+    used_cents: number | null;
+    limit_cents: number | null;
+    remaining_cents: number | null;
+    usage_based_allowed: boolean | null;
+  };
+  cycle_usage: {
+    range_start: string | null;
+    range_end: string | null;
+    total_cost_cents: number | null;
+    total_input_tokens: number | null;
+    total_output_tokens: number | null;
+    total_cache_write_tokens: number | null;
+    total_cache_read_tokens: number | null;
+    models: Array<{
+      model: string;
+      cost_cents: number | null;
+      input_tokens: number | null;
+      output_tokens: number | null;
+      cache_write_tokens: number | null;
+      cache_read_tokens: number | null;
+    }>;
+  };
 };
 
 /** 创建/编辑账号表单依赖:active 代理池条目。 */
