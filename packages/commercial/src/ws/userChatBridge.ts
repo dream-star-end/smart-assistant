@@ -838,6 +838,20 @@ interface ResolvedTurnExecution {
   securityEpoch: number;
 }
 
+/**
+ * 哪些引擎的 turn 会以平台次级模型(见 subprocessRunner DEFAULT_SECONDARY_UTILITY_MODEL)
+ * 打 anthropic proxy `/v1/messages`,因此 authority/lease 必须签上 aux 放行集。
+ *
+ * - `ccb`:自托管 Claude Code,SMALL_FAST / 子 agent 直打 anthropic proxy。
+ * - `cursor`:官方 Claude Code 经 Cursor Sand relay;relay 只接管 Sand 主模型,
+ *   子 agent 钉的次级模型经 passthroughMessages 原样转发到同一 anthropic proxy。
+ *
+ * codex/grok/zcode 走各自 relay,不产生 `/v1/messages`,按最小权限不签。
+ */
+export function engineUsesAnthropicAuxModels(engine: ModelAuthorityEngine): boolean {
+  return engine === "ccb" || engine === "cursor";
+}
+
 /** 模型不可路由(catalog 无 active 行 / 无价 / capability schema 未来版本)。 */
 class ModelNotAvailableError extends Error {
   constructor(readonly modelId: string) {
@@ -867,11 +881,15 @@ async function resolveTurnExecution(
     descriptor: toProtocolDescriptor(descriptor),
     pricing,
     billingRevision: snapshot.billingRevision,
-    // 次级模型只对 **ccb** 引擎有意义:CCB 的 WebFetch/WebSearch 等隐藏调用读
-    // ANTHROPIC_SMALL_FAST_MODEL 打 anthropic proxy;codex turn 走 /internal/v3/codex-relay,
-    // 根本不产生 `/v1/messages` —— 给它签 aux 只会白白撑大放行集合(最小权限)。
+    // 次级模型只对会打 anthropic proxy `/v1/messages` 的引擎有意义(最小权限):
+    // - ccb:WebFetch/WebSearch 等隐藏调用读 ANTHROPIC_SMALL_FAST_MODEL,子 agent 钉
+    //   CLAUDE_CODE_SUBAGENT_MODEL,都直打 anthropic proxy;
+    // - cursor:官方 Claude Code 经 Sand relay 跑,relay 只接管 Sand 主模型,子 agent 钉的
+    //   次级模型经 passthroughMessages 打同一 anthropic proxy —— lease 不签 aux 就会被
+    //   egress modelAuthorityGate 以 "authority model mismatch" 403 拒掉(Agent 工具全灭)。
+    // codex/grok/zcode 走各自 relay,不产生 `/v1/messages`,签 aux 只会白白撑大放行集合。
     // platformAuxModels 对"aux 不在 catalog active"fail-closed 抛 → 调用方拒帧。
-    auxModels: descriptor.engine === "ccb" ? platformAuxModels(snapshot) : [],
+    auxModels: engineUsesAnthropicAuxModels(descriptor.engine) ? platformAuxModels(snapshot) : [],
     executionRevision: snapshot.executionRevision,
     securityEpoch: Number(snapshot.securityEpoch),
   };

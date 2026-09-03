@@ -15,6 +15,7 @@
 import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as http from "node:http";
+import { readFile } from "node:fs/promises";
 import { WebSocket, WebSocketServer } from "ws";
 
 import {
@@ -26,6 +27,7 @@ import {
   assertLeaseMatchesAuthority,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
+  type ModelAuthorityEngine,
 } from "@openclaude/protocol";
 
 import {
@@ -45,6 +47,7 @@ import {
   CONTAINER_ATTEST_FRAME_TYPE,
   _isAuthorizedRecoveryNativeReset,
   _readDispatchDrainMs,
+  engineUsesAnthropicAuxModels,
   type BridgeModelAuthorityDeps,
   type UserChatBridgeDeps,
   type UserChatBridgeHandler,
@@ -684,6 +687,23 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     assert.deepEqual([...(lease.auxModels ?? [])], [DEFAULT_SECONDARY_UTILITY_MODEL]);
     assert.doesNotThrow(() => assertLeaseMatchesAuthority(lease, payload));
     ws.close();
+  });
+
+  test("cursor turn:auxModels 与 ccb 同款(Sand relay passthrough 的子 agent 要过 egress)", async () => {
+    // 回归:曾只对 engine=ccb 签 aux。cursor-fable 父 turn 下 Agent 工具钉 deepseek-v4-flash,
+    // 经 relay passthroughMessages 打 anthropic proxy,egress modelAuthorityGate 以
+    // "authority model mismatch" 403 拒 → 子 agent 全灭。cursor 转发分支要 pgPool /
+    // 凭据成员 / self-host 行三件套,rig 不建;这里钉判定谓词 + resolveTurnExecution 用它。
+    const engines: ModelAuthorityEngine[] = ["ccb", "codex", "grok", "cursor", "zcode"];
+    assert.deepEqual(
+      engines.filter((e) => engineUsesAnthropicAuxModels(e)),
+      ["ccb", "cursor"],
+    );
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const fn = source.slice(source.indexOf("async function resolveTurnExecution("));
+    const body = fn.slice(0, fn.indexOf("\n}\n"));
+    assert.match(body, /auxModels: engineUsesAnthropicAuxModels\(descriptor\.engine\) \? platformAuxModels\(snapshot\) : \[\]/);
+    assert.doesNotMatch(body, /descriptor\.engine === "ccb" \?/);
   });
 
   test("codex turn:auxModels 为空(codex 不经 anthropic proxy → 最小权限)", async () => {
