@@ -246,6 +246,14 @@ declare global {
         a2Text?: string;
         fallbackText?: string;
       }>;
+      /** Phase-A fallback whose id equals the last live assistant segment id
+       *  (visible_head.messageId = …-sK). INC-20260903-TURNEND-LAST-SEGMENT-FLASH */
+      runPhaseALastSegmentIdCollision: () => Promise<{
+        sending: boolean;
+        visibleAssistant: Array<{ id: string; text: string }>;
+        unpublishedRowText?: string;
+        unpublishedRowHidden: boolean;
+      }>;
       /** Phase-B deferred agent-group stub + empty live-units reset must keep live agent-group. */
       runPhaseBDeferredAgentGroupReset: () => Promise<{
         sending: boolean;
@@ -403,6 +411,9 @@ window.__replayDrive = {
   },
   runPhaseAInterleavedAssistantReset: async () => {
     throw new Error("phase-a interleaved assistant reset probe 未挂载");
+  },
+  runPhaseALastSegmentIdCollision: async () => {
+    throw new Error("phase-a last-segment id collision probe 未挂载");
   },
   runPhaseBDeferredAgentGroupReset: async () => {
     throw new Error("phase-b deferred agent-group reset probe 未挂载");
@@ -2334,6 +2345,102 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         a1Text: session.messages.find((message) => message.id === "browser-phase-a-a1")?.text,
         a2Text: session.messages.find((message) => message.id === "browser-phase-a-a2")?.text,
         fallbackText: session.messages.find((message) => message.id === "browser-phase-a-answer")?.text,
+      };
+    },
+    runPhaseALastSegmentIdCollision: async () => {
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        "phase-a last-segment id collision",
+      );
+      const clientMessageId = "m-browser-phase-a-collide";
+      const lastSegmentId = `srv-${REPLAY_SESSION_ID}-main-t1-s1`;
+      const user = {
+        id: clientMessageId,
+        role: "user" as const,
+        text: "BROWSER_PHASE_A_COLLIDE_USER",
+        ts: 1,
+        status: "sent" as const,
+        _source: "server" as const,
+        _seq: 1,
+        _orderSeq: 1,
+        _timelineRecord: true,
+        _timelineUnitKey: `outer:${REPLAY_SESSION_ID}:1`,
+      };
+      session._sendingInFlight = true;
+      session._activeClientMessageId = clientMessageId;
+      session.messages = [
+        user,
+        {
+          id: `srv-${REPLAY_SESSION_ID}-main-t1-s0`,
+          role: "assistant",
+          text: "BROWSER_PHASE_A_COLLIDE_A1",
+          ts: 3,
+          _clientMessageId: clientMessageId,
+        },
+        {
+          id: "browser-phase-a-collide-tool",
+          role: "tool",
+          text: "",
+          toolName: "Bash",
+          output: "BROWSER_PHASE_A_COLLIDE_TOOL",
+          _completed: true,
+          ts: 4,
+          _clientMessageId: clientMessageId,
+        },
+        {
+          id: lastSegmentId,
+          role: "assistant",
+          text: "BROWSER_PHASE_A_COLLIDE_FINAL",
+          ts: 5,
+          _clientMessageId: clientMessageId,
+        },
+      ];
+      replaySocket.applyServerMessages(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        [
+          user,
+          {
+            id: lastSegmentId,
+            role: "assistant",
+            text: "BROWSER_PHASE_A_COLLIDE_A1BROWSER_PHASE_A_COLLIDE_FINAL",
+            ts: 5,
+            _source: "server",
+            _seq: 2,
+            _orderSeq: 2,
+            _clientMessageId: clientMessageId,
+            _turnTapeId: "tape-browser-phase-a-collide",
+            _turnTapeSha256: "b".repeat(64),
+            _turnTapeComplete: true,
+            _dispatchOutcome: "completed",
+            _timelineRecord: true,
+            _timelineUnitKey: "tape-fallback:tape-browser-phase-a-collide",
+            _displayDegraded: true,
+            _displayDegradeReason: "records_unpublished",
+          },
+        ],
+        true,
+        2,
+        {
+          serverUpdatedAt: 2,
+          historyRevision: 1,
+          timelineGeneration: 2,
+          completedClientMessageId: clientMessageId,
+        },
+      );
+      replaySocket.applyLiveUnits(REPLAY_SESSION_ID, [], [clientMessageId]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const unpublishedRow = session.messages.find((message) =>
+        message.role === "assistant" && message._displayDegradeReason === "records_unpublished");
+      return {
+        sending: session._sendingInFlight === true,
+        visibleAssistant: session.messages
+          .filter((message) => message.role === "assistant" && !message._hideUnpublishedFallback)
+          .map((message) => ({ id: message.id, text: message.text })),
+        unpublishedRowText: unpublishedRow?.text,
+        unpublishedRowHidden: unpublishedRow?._hideUnpublishedFallback === true,
       };
     },
     runPhaseBDeferredAgentGroupReset: async () => {

@@ -2894,6 +2894,29 @@ await check("T59 Phase-A unpublished 后交错 live assistant 段仍保持 think
   }
 });
 
+await check("T62 Phase-A fallback 与最后一段 live 正文同 id 时最后一段正文不闪没", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runPhaseALastSegmentIdCollision());
+  if (result.sending) throw new Error("Phase-A 完成后仍在发送");
+  const texts = result.visibleAssistant.map((row) => row.text);
+  if (JSON.stringify(texts) !== JSON.stringify(["BROWSER_PHASE_A_COLLIDE_A1", "BROWSER_PHASE_A_COLLIDE_FINAL"])) {
+    throw new Error(`Phase-A 同 id fallback 吞掉最后一段正文:${JSON.stringify(result)}`);
+  }
+  if (result.unpublishedRowHidden || result.unpublishedRowText !== "BROWSER_PHASE_A_COLLIDE_FINAL") {
+    throw new Error(`unpublished 行应承载最后一段正文而非隐藏:${JSON.stringify(result)}`);
+  }
+  await replayRoot.getByText("BROWSER_PHASE_A_COLLIDE_A1", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await replayRoot.getByText("BROWSER_PHASE_A_COLLIDE_FINAL", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  if ((await replayRoot.getByText("BROWSER_PHASE_A_COLLIDE_A1BROWSER_PHASE_A_COLLIDE_FINAL", { exact: true }).count()) !== 0) {
+    throw new Error("渲染了 fallback 拼接整块正文");
+  }
+});
+
 await check("T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runPhaseAEmptyUnitsReset());
   if (JSON.stringify(result.roles) !== JSON.stringify(["user", "thinking", "tool", "plan", "assistant"])) {

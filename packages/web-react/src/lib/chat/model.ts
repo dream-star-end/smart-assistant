@@ -410,6 +410,12 @@ export type ChatMessage = {
    *  rendered: live assistant fragments already occupy the visible text slots.
    *  INC-20260831-TURNEND-ORDER-COLLAPSE */
   _hideUnpublishedFallback?: boolean;
+  /** Phase-A fallback shares its id with the last live assistant segment
+   *  (`visible_head.messageId` = `…-tN-sK`). Server-wins keeps the fallback
+   *  row, but the segment text streamed into that id must survive so the
+   *  final answer does not vanish until Phase-B exact rows arrive.
+   *  INC-20260903-TURNEND-LAST-SEGMENT-FLASH */
+  _unpublishedFallbackLiveText?: string;
   /** Sanitizer placeholder for a structurally invalid history/socket row. */
   _corruptPlaceholder?: boolean;
   _corruptReason?: "missing-id" | "malformed";

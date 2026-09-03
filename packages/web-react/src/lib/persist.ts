@@ -871,6 +871,16 @@ export function omitUnpublishedFallbackWhenLiveAssistantsExist(
     const owner = turnOwnerId(row);
     const target = typeof owner === "string" ? lastLiveByOwner.get(owner) : lastUnownedLive;
     if (!target) continue;
+    // INC-20260903-TURNEND-LAST-SEGMENT-FLASH: this fallback replaced (by id)
+    // the live row of the final segment. The earlier fragments stay live rows;
+    // this slot must keep showing the final segment text, not go blank.
+    const liveText = row._unpublishedFallbackLiveText;
+    if (typeof liveText === "string" && liveText.length > 0) {
+      if (row.text !== liveText || row._hideUnpublishedFallback) {
+        replace.set(row, { ...row, text: liveText, _hideUnpublishedFallback: false });
+      }
+      continue;
+    }
     replace.set(row, {
       ...row,
       text: "",
@@ -1630,6 +1640,24 @@ function mergeLocalClientFields(
   preserveTapeProcessExpansion = true,
 ): ChatMessage {
   if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
+  // INC-20260903-TURNEND-LAST-SEGMENT-FLASH: the Phase-A fallback is stamped
+  // with visible_head.messageId = the LAST assistant segment id, so server-wins
+  // by id swallows the live row that streamed that segment. Carry the segment
+  // text on the fallback so omitUnpublishedFallbackWhenLiveAssistantsExist can
+  // keep rendering it instead of blanking the final answer until Phase-B.
+  if (
+    serverMsg.role === "assistant" &&
+    serverMsg._displayDegradeReason === "records_unpublished"
+  ) {
+    const liveText = isLiveAssistantFragment(localMsg) && typeof localMsg.text === "string" && localMsg.text
+      ? localMsg.text
+      : typeof localMsg._unpublishedFallbackLiveText === "string" && localMsg._unpublishedFallbackLiveText
+        ? localMsg._unpublishedFallbackLiveText
+        : undefined;
+    if (liveText && serverMsg._unpublishedFallbackLiveText !== liveText) {
+      serverMsg = { ...serverMsg, _unpublishedFallbackLiveText: liveText };
+    }
+  }
   // Unified timeline rows are exact persisted Agent records. Never transform
   // one back into a live client team card or enrich it with cached substitute
   // fields; server exact wins byte-for-byte at the semantic field layer.

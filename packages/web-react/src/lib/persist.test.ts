@@ -1929,6 +1929,81 @@ describe("mergeFullServerWins — records_unpublished degrade page", () => {
     ]);
   });
 
+  test("Phase-A fallback sharing the last live segment id keeps that segment text visible (INC-20260903-TURNEND-LAST-SEGMENT-FLASH)", () => {
+    const cmid = "u-collide";
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1 };
+    const a1: ChatMessage = {
+      id: "srv-sess-main-t1-s0", role: "assistant", text: "mid-1", ts: 3, _clientMessageId: cmid,
+    };
+    const tool: ChatMessage = {
+      id: "live-tool", role: "tool", text: "", ts: 4, _clientMessageId: cmid, toolName: "Bash", _completed: true,
+    };
+    const a2: ChatMessage = {
+      id: "srv-sess-main-t1-s1", role: "assistant", text: "FINAL", ts: 5, _clientMessageId: cmid,
+    };
+    const fallback: ChatMessage = {
+      id: "srv-sess-main-t1-s1",
+      role: "assistant",
+      text: "mid-1FINAL",
+      ts: 10,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _orderSeq: 2,
+      _timelineRecord: true,
+      _displayDegraded: true,
+      _displayDegradeReason: "records_unpublished",
+      usage: { totalTokens: 9 },
+    };
+    const merged = mergeFullServerWins([user, fallback], [user, a1, tool, a2], 0, cmid, {
+      deletionAuthority: true,
+    });
+    const visible = merged.filter((m) => m.role === "assistant" && !m._hideUnpublishedFallback);
+    expect(visible.map((m) => [m.id, m.text])).toEqual([
+      ["srv-sess-main-t1-s0", "mid-1"],
+      ["srv-sess-main-t1-s1", "FINAL"],
+    ]);
+    const last = merged.find((m) => m.id === "srv-sess-main-t1-s1");
+    expect(last?._displayDegradeReason).toBe("records_unpublished");
+    expect(last?._source).toBe("server");
+    expect(last?.usage).toEqual({ totalTokens: 9 });
+
+    // Repeated Phase-A poll: local row is now the fallback itself; text must not regress.
+    const remerged = mergeFullServerWins([user, fallback], merged, 0, cmid, { deletionAuthority: true });
+    expect(
+      remerged.filter((m) => m.role === "assistant" && !m._hideUnpublishedFallback).map((m) => m.text),
+    ).toEqual(["mid-1", "FINAL"]);
+    const incremental = applyServerIncremental(merged, [fallback], cmid);
+    expect(
+      incremental.filter((m) => m.role === "assistant" && !m._hideUnpublishedFallback).map((m) => m.text),
+    ).toEqual(["mid-1", "FINAL"]);
+
+    // Phase-B exact rows: same ids, no unpublished marker → exact text wins, helper field gone.
+    const exact0: ChatMessage = {
+      id: "srv-sess-main-t1-s0", role: "assistant", text: "mid-1", ts: 3, _source: "server",
+      _clientMessageId: cmid, _orderSeq: 2, _timelineRecord: true, _turnTapeOrdinal: 1,
+    };
+    const exactTool: ChatMessage = {
+      id: "tape-tool", role: "tool", text: "", ts: 4, _source: "server", toolName: "Bash", output: "ok",
+      _clientMessageId: cmid, _orderSeq: 3, _timelineRecord: true, _turnTapeOrdinal: 2,
+    };
+    const exact1: ChatMessage = {
+      id: "srv-sess-main-t1-s1", role: "assistant", text: "FINAL", ts: 5, _source: "server",
+      _clientMessageId: cmid, _orderSeq: 4, _timelineRecord: true, _turnTapeOrdinal: 3,
+    };
+    const phaseB = mergeFullServerWins([user, exact0, exactTool, exact1], remerged, 0, cmid, {
+      deletionAuthority: true,
+    });
+    expect(phaseB.map((m) => [m.id, m.text])).toEqual([
+      [cmid, "q"],
+      ["srv-sess-main-t1-s0", "mid-1"],
+      ["tape-tool", ""],
+      ["srv-sess-main-t1-s1", "FINAL"],
+    ]);
+    expect(phaseB.some((m) => m._unpublishedFallbackLiveText !== undefined)).toBe(false);
+  });
+
   test("Phase-B ordinal assistants replace live fragments without duplicates", () => {
     const cmid = "u-exact-assist";
     const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1, _source: "server", _orderSeq: 1 };
