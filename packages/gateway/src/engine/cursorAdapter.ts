@@ -23,6 +23,10 @@ import { engineSessionId } from './engineSessionId.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { classifyRunError } from '../errorClassify.js'
+import {
+  formatCursorCliFailureDetail,
+  formatCursorCliFailureLog,
+} from './cursorCliErrorSanitize.js'
 import { createLogger } from '../logger.js'
 import { type McpMemoryLaunch, resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
 import { getPlatformPrompt } from '../platformPrompts.js'
@@ -2320,7 +2324,17 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       : cls === 'auth' ? 'Cursor authentication unavailable'
       : cls === 'quota' ? 'Cursor quota unavailable'
       : keepRawForTape ? detail
-      : 'Cursor CLI failed'
+      : formatCursorCliFailureDetail(detail)
+    if (detail && !creditExhausted && !ctx.interrupted && cls !== 'auth' && cls !== 'quota' && !keepRawForTape) {
+      log.warn('cursor CLI failed', {
+        sessionId: this.opts.sessionId,
+        sessionKey: this.opts.sessionKey,
+        traceId: ctx.params.traceId,
+        requestId: ctx.params.requestId,
+        errorClass,
+        error: formatCursorCliFailureLog(detail),
+      })
+    }
     const status: EngineExternalBillingEvent['status'] = creditExhausted
       ? 'success'
       : cls ? 'unavailable' : detail ? 'error' : 'success'
