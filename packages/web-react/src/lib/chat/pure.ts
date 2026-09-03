@@ -397,6 +397,14 @@ export function isRecoveryControlUserTurn(
   return message._isAutoRetry === true;
 }
 
+/** Master-authored recovery turns carry the deterministic `m-recover-<hash>`
+ * client message id minted by `turnRecoveryAttemptIdentity` (protocol
+ * turnErrorTaxonomy). The browser never authors these ids, so a row owned by
+ * one belongs to a turn this tab may not have adopted as `_sendingInFlight`. */
+export function isRecoveryTurnClientMessageId(value: unknown): value is string {
+  return typeof value === "string" && value.startsWith("m-recover-");
+}
+
 /** Walk newest-first to the last user utterance that is not a recovery control row. */
 export function lastRealUserTurn<T extends RecoveryControlUserTurn>(
   messages: readonly T[],

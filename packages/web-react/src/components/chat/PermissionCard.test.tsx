@@ -19,6 +19,7 @@ import {
   DETACHED_ASK_USER_TTL_MS,
   PENDING_PERMISSION_TTL_MS,
   PermissionCard,
+  isAwaitingPermissionPrompt,
   resetPermissionAutoOpenMemory,
 } from "./PermissionCard";
 
@@ -473,6 +474,46 @@ describe("AskUserQuestion 选项可及性(M12)", () => {
     expect(boxes.length).toBeGreaterThanOrEqual(2);
     fireEvent.click(screen.getByRole("checkbox", { name: /检索/ }));
     expect(screen.getByRole("checkbox", { name: /检索/ })).toHaveAttribute("aria-checked", "true");
+  });
+});
+
+describe("isAwaitingPermissionPrompt（INC-20260904 fix C 的活提问判据）", () => {
+  const now = Date.now();
+
+  test("未决、未过期、非控制中 → true", () => {
+    expect(isAwaitingPermissionPrompt(askMsg(), now)).toBe(true);
+  });
+
+  test("非 permission 行 → false", () => {
+    expect(isAwaitingPermissionPrompt({ id: "a", role: "assistant", text: "hi", ts: now } as ChatMessage, now)).toBe(false);
+  });
+
+  test("已结清 / 控制中 → false", () => {
+    expect(isAwaitingPermissionPrompt(askMsg({ _resolved: true, _behavior: "deny" }), now)).toBe(false);
+    expect(isAwaitingPermissionPrompt(askMsg({ _controlPending: true }), now)).toBe(false);
+  });
+
+  test("超过 TTL 的孤儿卡 → false；_askUserExpiresAt 仍在未来 → true", () => {
+    expect(
+      isAwaitingPermissionPrompt(askMsg({ ts: now - PENDING_PERMISSION_TTL_MS - 60_000 }), now),
+    ).toBe(false);
+    expect(
+      isAwaitingPermissionPrompt(
+        askMsg({ ts: now - PENDING_PERMISSION_TTL_MS - 60_000, _askUserExpiresAt: now + 60_000 }),
+        now,
+      ),
+    ).toBe(true);
+  });
+
+  test("user_stop 结清的卡展示「本轮已停止，提问已关闭」且不再弹框", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({ _resolved: true, _behavior: "deny", _settledReason: "user_stop" })}
+        onRespond={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("本轮已停止，提问已关闭")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 });
 

@@ -922,7 +922,9 @@ export const OutboundPermissionSettled = Type.Object({
    *  'already_settled' = duplicate response arrived after first consumer won,
    *  'disconnect' = auto-denied by server on peer disconnect,
    *  'timeout' = auto-denied after exceeding max wait time (janitor),
-   *  'crashed' = auto-denied because the CCB subprocess died */
+   *  'crashed' = auto-denied because the CCB subprocess died,
+   *  'user_stop' = auto-denied because the user pressed Stop on the turn
+   *  that was blocked waiting for this permission */
   reason: Type.Optional(
     Type.Union([
       Type.Literal('remote'),
@@ -930,6 +932,7 @@ export const OutboundPermissionSettled = Type.Object({
       Type.Literal('disconnect'),
       Type.Literal('timeout'),
       Type.Literal('crashed'),
+      Type.Literal('user_stop'),
     ]),
   ),
   /** Present only for AskUserQuestion allow settlements. Carries the

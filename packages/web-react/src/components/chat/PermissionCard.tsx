@@ -102,6 +102,19 @@ export function permissionHasExpired(msg: ChatMessage, now = Date.now()): boolea
   return now - msg.ts > ttlMs;
 }
 
+/** A prompt the runtime is (as far as this browser can tell) still blocked on:
+ *  unresolved, no durable response in flight, and inside the server TTL.
+ *  MessageRenderer uses it to decide whether an unresolved card in the current
+ *  segment may be treated as live even when `sending` is false — the
+ *  INC-20260904 case where the turn belongs to a master-authored `m-recover-*`
+ *  row this tab never adopted, so `_sendingInFlight` stayed false while the
+ *  engine sat in waitingForUserInput. */
+export function isAwaitingPermissionPrompt(msg: ChatMessage, now = Date.now()): boolean {
+  if (msg.role !== "permission") return false;
+  if (msg._resolved === true || msg._controlPending === true) return false;
+  return !permissionHasExpired(msg, now);
+}
+
 function asAskUserQuestion(msg: ChatMessage): AqQuestion[] | null {
   if (msg.toolName !== "AskUserQuestion") return null;
   const input = msg.inputJson as AqInput | null | undefined;
@@ -404,6 +417,8 @@ function settledReasonLabel(reason: string): string {
       return "连接断开，已自动拒绝";
     case "crashed":
       return "进程异常，已自动拒绝";
+    case "user_stop":
+      return "本轮已停止，提问已关闭";
     case "already_settled":
       return "请求已处理";
     default:

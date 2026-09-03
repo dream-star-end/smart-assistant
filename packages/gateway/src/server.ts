@@ -16051,6 +16051,9 @@ export class Gateway {
         if (!selfInterrupted) continue
         const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
         const ok = selfInterrupted || delegateInterrupted
+        // The turn is gone; any permission it was blocked on must not
+        // outlive it as a dead card (browser) / pending row (master).
+        this._settlePendingPermissionsForStop(live.sessionKey, clientMessageId)
         this.log.info('interrupt', {
           sessionKey: live.sessionKey,
           clientMessageId,
@@ -16074,6 +16077,7 @@ export class Gateway {
           if (!live.sessionKey.endsWith(suffix)) continue
           const selfInterrupted = this.sessions.interrupt(live.sessionKey)
           const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
+          if (selfInterrupted) this._settlePendingPermissionsForStop(live.sessionKey)
           interrupted = selfInterrupted || delegateInterrupted || interrupted
         }
         if (interrupted) {
@@ -16093,6 +16097,7 @@ export class Gateway {
     }
     const selfInterrupted = this.sessions.interrupt(sessionKey)
     const delegateInterrupted = this._interruptDelegationsForParent(sessionKey)
+    if (selfInterrupted) this._settlePendingPermissionsForStop(sessionKey)
     let ok = selfInterrupted || delegateInterrupted
     // Compatibility containment for already-open clients: if their selector
     // changed before Stop, the legacy frame names the new agent. Only on a
@@ -16102,6 +16107,7 @@ export class Gateway {
         if (!live.sessionKey.endsWith(suffix)) continue
         const fallbackSelf = this.sessions.interrupt(live.sessionKey)
         const fallbackDelegates = this._interruptDelegationsForParent(live.sessionKey)
+        if (fallbackSelf) this._settlePendingPermissionsForStop(live.sessionKey)
         ok = fallbackSelf || fallbackDelegates || ok
       }
     }
@@ -16402,7 +16408,7 @@ export class Gateway {
       peer: { id: string; kind: 'dm' | 'group' }
       requestId: string
       behavior: 'allow' | 'deny'
-      reason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed'
+      reason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed' | 'user_stop'
       answers?: Record<string, string>
     },
   ): void {
@@ -16973,7 +16979,8 @@ export class Gateway {
       patch._settledReason === 'already_settled' ||
       patch._settledReason === 'disconnect' ||
       patch._settledReason === 'timeout' ||
-      patch._settledReason === 'crashed'
+      patch._settledReason === 'crashed' ||
+      patch._settledReason === 'user_stop'
         ? patch._settledReason
         : 'remote'
     const answers =
@@ -17122,7 +17129,7 @@ export class Gateway {
 
   private _forceDenyPendingPermission(
     requestId: string,
-    reason: 'disconnect' | 'timeout' | 'crashed',
+    reason: 'disconnect' | 'timeout' | 'crashed' | 'user_stop',
     denyMessage: string,
   ): boolean {
     const pending = this._pendingPermissions.get(requestId)
@@ -17196,6 +17203,57 @@ export class Gateway {
     for (const requestId of pendingToReap) {
       this._forceDenyPendingPermission(requestId, 'crashed', 'Session crashed')
     }
+  }
+
+  /**
+   * Settle pending permission requests for a turn the user just stopped.
+   *
+   * `interruptClientTurn` / `sessions.interrupt` only abort the CCB turn; the
+   * `_pendingPermissions` entry created for a blocking `can_use_tool` (incl.
+   * AskUserQuestion) otherwise survives until the 10-minute janitor. During
+   * that window every hello replays the dead card to the browser (which
+   * renders it read-only since the turn is no longer `sending`) and the
+   * durable master row stays `pending` until the reconciler runs. Force-deny
+   * here so the runtime map, the master row and every connected tab converge
+   * on the same `user_stop` settlement the moment Stop is acknowledged.
+   *
+   * Detached ask_user cards are exempt (same contract as crash/disconnect/
+   * sweep): they outlive the turn by design and are answered later as a new
+   * inbound message.
+   *
+   * When `clientMessageId` is given, only entries owned by that browser turn
+   * are settled (entries recorded without a clientMessageId are assumed to
+   * belong to the stopped turn — the runtime never holds two blocking
+   * permissions for different turns of one session at once). Returns the
+   * number of settled requests.
+   */
+  private _settlePendingPermissionsForStop(
+    sessionKey: string,
+    clientMessageId?: string,
+  ): number {
+    const toSettle: string[] = []
+    for (const [requestId, pending] of this._pendingPermissions) {
+      if (isDetachedAskUserPending(pending)) continue
+      if (pending.sessionKey !== sessionKey) continue
+      if (clientMessageId && pending.clientMessageId && pending.clientMessageId !== clientMessageId) {
+        continue
+      }
+      toSettle.push(requestId)
+    }
+    let settled = 0
+    for (const requestId of toSettle) {
+      if (this._forceDenyPendingPermission(requestId, 'user_stop', 'User stopped the turn')) {
+        settled += 1
+      }
+    }
+    if (settled > 0) {
+      this.log.info('stop settled pending permissions', {
+        sessionKey,
+        clientMessageId,
+        count: settled,
+      })
+    }
+    return settled
   }
 
   /** Auto-deny all pending permission requests associated with a peerKey (on disconnect) */

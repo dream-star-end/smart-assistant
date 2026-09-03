@@ -263,7 +263,7 @@ export interface V3MasterSinkWirePayload {
   permissionPatches?: Array<{
     requestId: string
     behavior: 'allow' | 'deny'
-    settledReason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed'
+    settledReason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed' | 'user_stop'
     answers?: Record<string, string>
   }>
   /** Optional user-answer rows that accompany an allow settlement. */
