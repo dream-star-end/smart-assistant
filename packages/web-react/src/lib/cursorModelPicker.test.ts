@@ -1,6 +1,7 @@
 import { cursorModelById } from '@openclaude/protocol'
 import { describe, expect, it } from 'vitest'
 import {
+  lockedModelUnlockNotice,
   longContextCostConfirmationRequired,
   modelPickerRows,
   pickCursorPublicModel,
@@ -252,5 +253,35 @@ describe('context family picker', () => {
       longId: 'gpt-5.6-terra-1m',
     } as const
     expect(resolveContextPickerSelection(terra, spec, 'gpt-5.6-sol-1m')).toBe('gpt-5.6-terra-1m')
+  })
+})
+
+describe('lockedModelUnlockNotice (OCV5-86)', () => {
+  it('lite gate says any paid subscription unlocks and offers 前往订阅 / 暂不', () => {
+    const n = lockedModelUnlockNotice({ label: 'Opus 5', minPlanCode: 'lite', minPlanName: 'Lite' })
+    expect(n.title).toBe('「Opus 5」为订阅专享模型')
+    expect(n.paragraphs[0]).toContain('任意订阅套餐')
+    expect(n.paragraphs[0]).toContain('Lite 及以上任一档')
+    expect(n.paragraphs[0]).toContain('即可解锁')
+    expect(n.paragraphs.join('\n')).toContain('订阅后立即生效')
+    expect(n.confirmText).toBe('前往订阅')
+    expect(n.cancelText).toBe('暂不')
+  })
+
+  it('higher gate names the plan tier instead of 任意', () => {
+    const n = lockedModelUnlockNotice({
+      label: 'Fable 5.1 Max',
+      minPlanCode: 'pro',
+      minPlanName: 'Pro',
+    })
+    expect(n.paragraphs[0]).toContain('需订阅 Pro 及以上套餐')
+    expect(n.paragraphs[0]).not.toContain('任意')
+  })
+
+  it('falls back to plan code and generic label when names are missing', () => {
+    const n = lockedModelUnlockNotice({ label: '  ', minPlanCode: 'LITE' })
+    expect(n.title).toBe('「该模型」为订阅专享模型')
+    expect(n.paragraphs[0]).toContain('LITE 及以上任一档')
+    expect(n.paragraphs[0]).toContain('任意订阅套餐')
   })
 })

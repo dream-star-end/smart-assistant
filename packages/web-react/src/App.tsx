@@ -155,6 +155,7 @@ import {
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
 import type { ChatProject, LockedPublicModel, Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
 import type { LockedSelectInfo } from "./components/ModelSelector";
+import { lockedModelUnlockNotice } from "./lib/cursorModelPicker";
 import { modelSwitchCompactionReason } from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
 
@@ -1158,14 +1159,28 @@ export function App() {
     setSettingsOpen(true);
   }, [refreshMe]);
 
+  // OCV5-86:锁定模型先弹说明(为什么锁、任意订阅即可解锁),用户确认后才跳订阅面板;
+  // 之前一句 toast 直接跳转,用户不知道任何一档订阅都够。
   const handleLockedSelect = useCallback(
     (info: LockedSelectInfo) => {
-      const plan = info.minPlanName?.trim() || info.minPlanCode;
-      toast(`「${info.label}」需订阅 ${plan} 及以上套餐解锁，前往订阅…`);
-      openSettings("account");
-      setSubscribeOpenSignal((n) => n + 1);
+      const notice = lockedModelUnlockNotice(info);
+      void (async () => {
+        const go = await confirmDialog({
+          title: notice.title,
+          body: (
+            <div className="space-y-2 text-sm text-muted" data-testid="locked-model-unlock-notice">
+              {notice.paragraphs.map((text) => <p key={text}>{text}</p>)}
+            </div>
+          ),
+          confirmText: notice.confirmText,
+          cancelText: notice.cancelText,
+        });
+        if (go !== true) return;
+        openSettings("account");
+        setSubscribeOpenSignal((n) => n + 1);
+      })();
     },
-    [openSettings, toast],
+    [confirmDialog, openSettings],
   );
 
   const applyConversationPreferences = useCallback(

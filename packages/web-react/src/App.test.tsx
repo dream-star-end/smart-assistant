@@ -693,6 +693,61 @@ describe('Aurora v5 — P3 对话前置（模型选择器 + 订阅/容器门）'
     expect(screen.getByRole('button', { name: /去充值/ })).toBeInTheDocument()
     expect(screen.getByPlaceholderText('和「全能助手」对话…')).toBeDisabled()
   })
+
+  test('locked model row → 说明对话框先弹出;暂不 → 不开设置;前往订阅 → 打开设置中心', async () => {
+    const LOCKED_MODELS = {
+      ...MODELS,
+      locked_models: [
+        {
+          id: 'cursor-opus-5-high',
+          display_name: 'Opus 5 High',
+          min_plan_code: 'lite',
+          min_plan_name: 'Lite',
+        },
+      ],
+    }
+    fetchMock = routedFetch({ models: LOCKED_MODELS })
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+    await waitFor(() => expect(screen.getAllByText('GPT-5.6-Sol').length).toBeGreaterThan(0))
+
+    const openLocked = async () => {
+      const trigger = screen.getAllByRole('button', { name: '选择对话模型' })[0]
+      fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerType: 'mouse' })
+      await screen.findAllByRole('menuitem')
+      const locked = document.querySelector('[data-locked="true"]')
+      expect(locked).toBeTruthy()
+      await act(async () => {
+        if (locked) fireEvent.click(locked)
+      })
+      return screen.findByTestId('locked-model-unlock-notice')
+    }
+
+    // 1) 先弹说明,而不是直接跳订阅。
+    const notice = await openLocked()
+    expect(notice.textContent).toContain('任意订阅套餐')
+    expect(notice.textContent).toContain('即可解锁')
+    // cursor 家族锁定行上抛的是家族名(Opus 5),标题据此生成。
+    expect(screen.getByText('「Opus 5」为订阅专享模型')).toBeTruthy()
+    expect(screen.queryByLabelText('设置分区')).toBeNull()
+
+    // 2) 暂不 → 对话框关、设置中心不开。
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '暂不' }))
+    })
+    await waitFor(() => expect(screen.queryByTestId('locked-model-unlock-notice')).toBeNull())
+    expect(screen.queryByLabelText('设置分区')).toBeNull()
+
+    // 3) 前往订阅 → 设置中心打开。
+    await openLocked()
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '前往订阅' }))
+    })
+    await waitFor(() => expect(screen.queryByTestId('locked-model-unlock-notice')).toBeNull())
+    await screen.findByLabelText('设置分区')
+  })
 })
 
 // ---------------------------------------------------------------------------
