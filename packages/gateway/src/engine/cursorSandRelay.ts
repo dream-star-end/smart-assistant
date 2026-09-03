@@ -118,10 +118,31 @@ interface StreamState {
   tools: Map<number, ToolStreamState>
   inputTokens: number
   outputTokens: number
+  /** From `extendedUsage.cacheReadTokens` (InferenceExtendedUsageInfo.cache_read_tokens).
+   * Zero when upstream only sends the legacy `usage` frame. */
+  cacheReadTokens: number
+  /** From `extendedUsage.cacheWriteTokens` (InferenceExtendedUsageInfo.cache_write_tokens). */
+  cacheWriteTokens: number
   text: string
   thinking: string
   failed: boolean
   recoveredToolCount: number
+}
+
+/** Anthropic-shaped usage block for the SSE / JSON responses the relay emits.
+ * Cache fields are only present when upstream reported them, so callers that
+ * only ever saw `{input_tokens, output_tokens}` keep their exact wire shape. */
+function usageBlock(
+  state: Pick<StreamState, 'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'>,
+  overrides: { output_tokens?: number } = {},
+): Record<string, number> {
+  const usage: Record<string, number> = {
+    input_tokens: state.inputTokens,
+    output_tokens: overrides.output_tokens ?? state.outputTokens,
+  }
+  if (state.cacheReadTokens > 0) usage.cache_read_input_tokens = state.cacheReadTokens
+  if (state.cacheWriteTokens > 0) usage.cache_creation_input_tokens = state.cacheWriteTokens
+  return usage
 }
 
 function nextToolIndex(tools: ReadonlyMap<number, ToolStreamState>): number {
@@ -1228,6 +1249,8 @@ export class CursorSandRelay {
       tools: new Map(),
       inputTokens: 0,
       outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
       text: '',
       thinking: '',
       failed: false,
@@ -1274,6 +1297,11 @@ export class CursorSandRelay {
     if (kind === 'extendedUsage') {
       if (typeof value.inputTokens === 'number') state.inputTokens = value.inputTokens
       if (typeof value.outputTokens === 'number') state.outputTokens = value.outputTokens
+      // cache_read_tokens / cache_write_tokens are carried on the same frame;
+      // dropping them here is what made every Sand-routed Fable turn bill as
+      // 100% uncached input (usage_log.cache_read_tokens = 0).
+      if (typeof value.cacheReadTokens === 'number') state.cacheReadTokens = value.cacheReadTokens
+      if (typeof value.cacheWriteTokens === 'number') state.cacheWriteTokens = value.cacheWriteTokens
       return
     }
     if (kind === 'error') {
@@ -1482,6 +1510,8 @@ export class CursorSandRelay {
           this.onRawTextForTest?.(collected.state.text, 2)
           state.inputTokens += collected.state.inputTokens
           state.outputTokens += collected.state.outputTokens
+          state.cacheReadTokens += collected.state.cacheReadTokens
+          state.cacheWriteTokens += collected.state.cacheWriteTokens
           streamError ??= collected.streamError
           if (collected.state.thinking) {
             await closeText()
@@ -1566,7 +1596,7 @@ export class CursorSandRelay {
           stop_reason: toolCount > 0 ? 'tool_use' : 'end_turn',
           stop_sequence: null,
         },
-        usage: { input_tokens: state.inputTokens, output_tokens: state.outputTokens },
+        usage: usageBlock(state),
       })
       await emitSse(res, 'message_stop', { type: 'message_stop' })
     } finally {
@@ -1640,12 +1670,16 @@ export class CursorSandRelay {
       ) {
         const firstInput = state.inputTokens
         const firstOutput = state.outputTokens
+        const firstCacheRead = state.cacheReadTokens
+        const firstCacheWrite = state.cacheWriteTokens
         const retry = await retryInvalidTool(state.text)
         collected = await this.collectInference(retry)
         this.onRawTextForTest?.(collected.state.text, 2)
         state = collected.state
         state.inputTokens += firstInput
         state.outputTokens += firstOutput
+        state.cacheReadTokens += firstCacheRead
+        state.cacheWriteTokens += firstCacheWrite
         streamError = collected.streamError
         thinkingSignature = collected.thinkingSignature
         recovered = recoverXmlToolCalls(state.text, allowedTools)
@@ -1677,7 +1711,7 @@ export class CursorSandRelay {
           content: [],
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: state.inputTokens, output_tokens: 0 },
+          usage: usageBlock(state, { output_tokens: 0 }),
         },
       })
 
@@ -1739,7 +1773,7 @@ export class CursorSandRelay {
           stop_reason: state.tools.size + state.recoveredToolCount > 0 ? 'tool_use' : 'end_turn',
           stop_sequence: null,
         },
-        usage: { input_tokens: state.inputTokens, output_tokens: state.outputTokens },
+        usage: usageBlock(state),
       })
       await emitSse(res, 'message_stop', { type: 'message_stop' })
     } finally {
@@ -1793,7 +1827,7 @@ export class CursorSandRelay {
       content,
       stop_reason: tools.size + recovered.tools.length > 0 ? 'tool_use' : 'end_turn',
       stop_sequence: null,
-      usage: { input_tokens: state.inputTokens, output_tokens: state.outputTokens },
+      usage: usageBlock(state),
     }))
   }
 }

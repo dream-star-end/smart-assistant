@@ -1027,6 +1027,75 @@ test('loopback relay hits InferenceService/Stream with Sand identity and emits A
   }
 })
 
+// Regression: Sand-routed Fable turns billed as 100% uncached input because the
+// relay only copied inputTokens/outputTokens off the extendedUsage frame and
+// dropped cache_read_tokens/cache_write_tokens. The CCB parser downstream keys
+// on Anthropic's cache_read_input_tokens/cache_creation_input_tokens, so the
+// relay must surface them in message_delta (stream) and the JSON body (non-stream).
+async function relayUsageResponse(
+  frames: Buffer[],
+  stream: boolean,
+): Promise<string> {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(Buffer.concat([...frames, envelope(Buffer.from('{}'), 0x02)]), {
+      status: 200,
+      headers: { 'content-type': 'application/connect+proto' },
+    })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-fable-5.1-high', stream, max_tokens: 64,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    assert.equal(response.status, 200)
+    return await response.text()
+  } finally {
+    await relay.close()
+  }
+}
+
+test('extendedUsage cache_read/cache_write tokens surface as Anthropic cache usage fields', async () => {
+  const frames = [
+    responseFrame('textPart', { text: 'done' }),
+    responseFrame('extendedUsage', {
+      inputTokens: 120, outputTokens: 9, cacheReadTokens: 100_000, cacheWriteTokens: 2_500, maxTokens: 64,
+    }),
+  ]
+  const streamed = await relayUsageResponse(frames, true)
+  assert.match(
+    streamed,
+    /"usage":\{"input_tokens":120,"output_tokens":9,"cache_read_input_tokens":100000,"cache_creation_input_tokens":2500\}/,
+  )
+  const json = JSON.parse(await relayUsageResponse(frames, false)) as { usage: Record<string, number> }
+  assert.deepEqual(json.usage, {
+    input_tokens: 120, output_tokens: 9, cache_read_input_tokens: 100000, cache_creation_input_tokens: 2500,
+  })
+})
+
+test('legacy usage frame without cache counters keeps the bare {input_tokens, output_tokens} shape', async () => {
+  const frames = [
+    responseFrame('textPart', { text: 'done' }),
+    responseFrame('usage', { promptTokens: 10, completionTokens: 4, totalTokens: 14 }),
+  ]
+  const streamed = await relayUsageResponse(frames, true)
+  assert.match(streamed, /"usage":\{"input_tokens":10,"output_tokens":4\}/)
+  assert.doesNotMatch(streamed, /cache_read_input_tokens/)
+  const json = JSON.parse(await relayUsageResponse(frames, false)) as { usage: Record<string, number> }
+  assert.deepEqual(json.usage, { input_tokens: 10, output_tokens: 4 })
+})
+
 test('relay passes non-Sand models (CCB sub-agent pin) through to the internal proxy verbatim', async () => {
   const seen: { url: string; auth: string | null; body: string }[] = []
   const fetchImpl: typeof fetch = async (input, init) => {
