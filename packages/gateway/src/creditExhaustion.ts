@@ -10,7 +10,8 @@
  * Missing pricing fails open (do not kill the turn). Admission still
  * rejects balance ≤ 0 before any engine work starts.
  */
-import { computeCostFen } from '@openclaude/protocol'
+import { composeMultiplier, computeCostFen } from '@openclaude/protocol'
+import { getModelCatalogClient, lookupCatalogAgentMultiplier } from './modelCatalogClient.js'
 import { lookupPlatformPricing } from './usageCost.js'
 
 export const CREDIT_EXHAUSTED_DETAIL = 'INSUFFICIENT_CREDITS: credit budget exhausted'
@@ -45,11 +46,24 @@ export async function runningCostFenForUsage(args: {
     cacheReadTokens?: number
     cacheCreationTokens?: number
   }
+  agentId?: string
+  /** Grok/Codex settlement composes agent_cost_overrides; Cursor does not. */
+  composeAgentMultiplier?: boolean
 }): Promise<bigint | null> {
   const modelId = args.modelId?.trim()
   if (!modelId) return null
   const pricing = await lookupPlatformPricing(modelId)
   if (!pricing) return null
+  let multiplier = pricing.multiplier
+  if (args.composeAgentMultiplier) {
+    const agentMul = await lookupAgentMultiplier(args.agentId)
+    if (!agentMul) return null
+    try {
+      multiplier = composeMultiplier(pricing.multiplier, agentMul)
+    } catch {
+      return null
+    }
+  }
   try {
     return computeCostFen(
       {
@@ -63,9 +77,22 @@ export async function runningCostFenForUsage(args: {
         output_per_mtok: pricing.outputPerMtok,
         cache_read_per_mtok: pricing.cacheReadPerMtok,
         cache_write_per_mtok: pricing.cacheWritePerMtok,
-        multiplier: pricing.multiplier,
+        multiplier,
       },
     )
+  } catch {
+    return null
+  }
+}
+
+async function lookupAgentMultiplier(agentId: string | undefined): Promise<string | null> {
+  const id = agentId?.trim()
+  if (!id) return null
+  const client = getModelCatalogClient()
+  if (!client.configured) return null
+  try {
+    const view = await client.getView()
+    return lookupCatalogAgentMultiplier(view, id)
   } catch {
     return null
   }

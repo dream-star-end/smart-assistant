@@ -2138,6 +2138,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       }
     }
     const type = textOf(event.type).toLowerCase()
+    const reported = usageOf(event)
+    if (reported) {
+      ctx.usage = reported
+      void this.maybeAbortForCredits(ctx)
+    }
     const aggregateBoundary = type === 'retry'
       || (type === 'interaction_query' && textOf(event.subtype).toLowerCase() === 'request')
     this.flushPendingAssistant(ctx, aggregateBoundary)
@@ -2183,8 +2188,10 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     }
     if (type === 'tool_use' || type === 'tool_start') { this.toolStart(ctx, event); return }
     if (type === 'tool_result' || type === 'tool_call_update' || type === 'tool_end') { this.toolResult(ctx, event); return }
-    const reported = usageOf(event); if (reported) { ctx.usage = reported; void this.maybeAbortForCredits(ctx) }
-    if (type === 'error') { ctx.error = textOf(event.message ?? event.error ?? event.data) || 'Cursor CLI error'; return }
+    if (type === 'error') {
+      if (!ctx.creditExhausted) ctx.error = textOf(event.message ?? event.error ?? event.data) || 'Cursor CLI error'
+      return
+    }
     if (type === 'result') {
       const failed = event.is_error === true || ['error', 'failed', 'failure'].includes(textOf(event.subtype).toLowerCase())
       // The account wrapper emits slot_result only after the official CLI
@@ -2270,8 +2277,15 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.pending.size === 0) this.stopPendingKeepalive()
     ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output: preview || output, outputJson: structuredClone(outputJson), preview } }); ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview, isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview, ...(exitCode !== undefined ? { exitCode } : {}), ...(terminationReason ? { terminationReason } : {}) } })
   }
+  private abortTurnForCredits(ctx: TurnCtx): void {
+    if (ctx.terminal || ctx.creditExhausted) return
+    ctx.creditExhausted = true
+    ctx.error = CREDIT_EXHAUSTED_DETAIL
+    if (ctx.proc && !ctx.proc.killed) killProcessGroup(ctx.proc, 'SIGINT')
+  }
+
   private async maybeAbortForCredits(ctx: TurnCtx): Promise<void> {
-    if (ctx.creditExhausted || ctx.terminal || ctx.interrupted) return
+    if (ctx.creditExhausted || ctx.terminal) return
     const budget = ctx.params.creditBudgetFen
     if (budget === undefined || !ctx.usage) return
     const fen = await runningCostFenForUsage({
@@ -2283,10 +2297,9 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         cacheCreationTokens: ctx.usage.cache_creation_input_tokens ?? 0,
       },
     })
+    if (this.active !== ctx || ctx.terminal || ctx.creditExhausted) return
     if (fen === null || !shouldAbortForCreditBudget(fen, budget)) return
-    ctx.creditExhausted = true
-    ctx.error = CREDIT_EXHAUSTED_DETAIL
-    this.interrupt()
+    this.abortTurnForCredits(ctx)
   }
 
   private finish(ctx: TurnCtx, detail: string | null): void {
@@ -2315,7 +2328,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) {
       const durationMs = Date.now() - ctx.startedAt
       // Volatile fast path: WS frame → master userChatBridge (live settle + quota learning).
-      this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(this.opts.cursorCredentialSelection && this.opts.cursorCredentialSelection.accountId !== '0' ? { cursorAccountId: this.opts.cursorCredentialSelection.accountId, cursorPoolGeneration: this.opts.cursorCredentialSelection.poolGeneration, cursorKeyFingerprint: this.opts.cursorCredentialSelection.keyFingerprint } : {}), ...(ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : errorClass === 'context_too_long' ? {} : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
+      this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(this.opts.cursorCredentialSelection && this.opts.cursorCredentialSelection.accountId !== '0' ? { cursorAccountId: this.opts.cursorCredentialSelection.accountId, cursorPoolGeneration: this.opts.cursorCredentialSelection.poolGeneration, cursorKeyFingerprint: this.opts.cursorCredentialSelection.keyFingerprint } : {}), ...(creditExhausted ? {} : ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : errorClass === 'context_too_long' ? {} : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
       // Durable path (2026-09-02 fix): the WS frame is lost whenever the user's
       // bridge WS is gone at turn end (switched session / closed tab), leaving
       // cursor_external_usage_audit pending forever and no credits badge. Emit
@@ -2352,7 +2365,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // finer cursor terminalCode (AUTH/QUOTA/ENGINE) lives in the audit row
       // written by the live frame and is not needed for settlement (non-success
       // is never charged).
-      ...(durableStatus === 'error' ? { terminalCode: ctx.interrupted ? 'USER_CANCELLED' as const : 'CODEX_ERROR' as const } : {}),
+      ...(durableStatus === 'error' && !ctx.creditExhausted ? { terminalCode: ctx.interrupted ? 'USER_CANCELLED' as const : 'CODEX_ERROR' as const } : {}),
       durationMs,
       ...(u ? { usage: { ...u } } : {}),
     }

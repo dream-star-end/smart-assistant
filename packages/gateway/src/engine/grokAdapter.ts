@@ -753,7 +753,9 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       return
     }
     if (type === 'error') {
-      ctx.errorDetail = asText(event.message) || asText(event.data) || 'Grok CLI error'
+      if (!ctx.creditExhausted) {
+        ctx.errorDetail = asText(event.message) || asText(event.data) || 'Grok CLI error'
+      }
       if (event.usage && typeof event.usage === 'object') ctx.lastUsage = grokUsage(event)
       return
     }
@@ -880,8 +882,15 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     this.emit('billing', billing)
   }
 
+  private abortTurnForCredits(ctx: GrokTurnContext): void {
+    if (ctx.terminal || ctx.creditExhausted) return
+    ctx.creditExhausted = true
+    ctx.errorDetail = CREDIT_EXHAUSTED_DETAIL
+    if (ctx.proc && !ctx.proc.killed) killProcessGroup(ctx.proc, 'SIGINT')
+  }
+
   private async maybeAbortForCredits(ctx: GrokTurnContext): Promise<void> {
-    if (ctx.creditExhausted || ctx.terminal || ctx.interrupted) return
+    if (ctx.creditExhausted || ctx.terminal) return
     const budget = ctx.params.creditBudgetFen
     if (budget === undefined) return
     const fen = await runningCostFenForUsage({
@@ -892,11 +901,12 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         cacheReadTokens: ctx.lastUsage.cacheReadTokens,
         cacheCreationTokens: ctx.lastUsage.cacheWriteTokens,
       },
+      agentId: this.opts.agentId,
+      composeAgentMultiplier: true,
     })
+    if (this.active !== ctx || ctx.terminal || ctx.creditExhausted) return
     if (fen === null || !shouldAbortForCreditBudget(fen, budget)) return
-    ctx.creditExhausted = true
-    ctx.errorDetail = CREDIT_EXHAUSTED_DETAIL
-    this.interrupt()
+    this.abortTurnForCredits(ctx)
   }
 
   private finish(ctx: GrokTurnContext, end: GrokEvent | null): void {
