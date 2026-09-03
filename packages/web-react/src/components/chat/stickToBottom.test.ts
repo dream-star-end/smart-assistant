@@ -154,6 +154,42 @@ describe("stickToBottom", () => {
     expect(el.scrollTop).toBe(pinnedTop);
   });
 
+  test("按住滚动条连续拖动时 scroll 事件不解锁，视口校正不能抢写", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 2000, scrollTop: 1920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+
+    stick.beginDirectManipulation();
+    el.scrollTop = 1500;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(false);
+    expect(stick.directManipulation.current).toBe(true);
+
+    stick.correctTo(el, 1580);
+    expect(el.scrollTop).toBe(1500);
+    el.scrollTop = 900;
+    stick.onScroll(el);
+    stick.correctTo(el, 980);
+    expect(el.scrollTop).toBe(900);
+    expect(stick.canRestick.current).toBe(false);
+
+    stick.endDirectManipulation();
+    stick.correctTo(el, 940);
+    expect(el.scrollTop).toBe(940);
+  });
+
+  test("触摸按下但尚未产生 scroll 时，贴底与校正都不得夺走手势", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.beginDirectManipulation();
+    el.scrollHeight = 1300;
+    stick.scrollToBottom(el);
+    stick.correctTo(el, 1220);
+    expect(el.scrollTop).toBe(920);
+  });
+
   test("无 mark 的滚动条离底解除跟随", () => {
     const stick = createStickToBottomController();
     const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });

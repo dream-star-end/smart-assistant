@@ -36,8 +36,10 @@ declare global {
       navOpens: number;
       sends: Array<{ text: string; mediaCount: number }>;
       following: boolean;
+      directManipulation: boolean;
       armSticky: () => void;
       growTimeline: () => void;
+      attemptViewportCorrection: (delta: number) => void;
     };
   }
 }
@@ -46,8 +48,10 @@ window.__mobilePage = {
   navOpens: 0,
   sends: [],
   following: true,
+  directManipulation: false,
   armSticky: () => {},
   growTimeline: () => {},
+  attemptViewportCorrection: () => {},
 };
 
 // 宽内容样本:每一条都是线上真实出现过的形态,且都是移动端最容易被裁的东西。
@@ -123,6 +127,7 @@ function MobileChatPage() {
   const stick = useRef(createStickToBottomController()).current;
   const syncFollowing = useCallback(() => {
     window.__mobilePage.following = stick.following.current;
+    window.__mobilePage.directManipulation = stick.directManipulation.current;
   }, [stick]);
   window.__mobilePage.armSticky = () => {
     if (!scroller) return;
@@ -130,6 +135,11 @@ function MobileChatPage() {
     syncFollowing();
   };
   window.__mobilePage.growTimeline = () => setGrowCount((value) => value + 1);
+  window.__mobilePage.attemptViewportCorrection = (delta) => {
+    if (!scroller) return;
+    stick.correctTo(scroller, scroller.scrollTop + delta);
+    syncFollowing();
+  };
   useLayoutEffect(() => {
     if (!scroller) return;
     stick.reset();
@@ -174,9 +184,18 @@ function MobileChatPage() {
             syncFollowing();
           }}
           onWheel={() => stick.markUserIntent()}
-          onTouchStart={() => stick.markUserIntent()}
-          onTouchMove={() => stick.markUserIntent()}
-          onPointerDown={() => stick.markUserIntent()}
+          onTouchStart={() => stick.beginDirectManipulation()}
+          onTouchMove={() => stick.beginDirectManipulation()}
+          onTouchEnd={() => {
+            stick.endDirectManipulation();
+            syncFollowing();
+          }}
+          onTouchCancel={() => stick.endDirectManipulation()}
+          onPointerDown={() => stick.beginDirectManipulation()}
+          onPointerUp={() => stick.endDirectManipulation()}
+          onPointerCancel={(event) => {
+            if (event.pointerType !== "touch") stick.endDirectManipulation();
+          }}
           onKeyDown={() => stick.markUserIntent()}
           data-testid="mobile-chat-scroll"
           className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden"

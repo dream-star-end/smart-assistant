@@ -2307,9 +2307,37 @@ export function App() {
     stick.markUserIntent();
     cancelArchiveCorrection();
   }, [stick, cancelArchiveCorrection]);
-  const releaseUserChatScroll = useCallback(() => {
-    stick.releaseUserIntent();
+  const beginDirectUserChatScroll = useCallback(() => {
+    stick.beginDirectManipulation();
+    cancelArchiveCorrection();
+  }, [stick, cancelArchiveCorrection]);
+  const endDirectUserChatScroll = useCallback(() => {
+    stick.endDirectManipulation();
   }, [stick]);
+  // Native scrollbar capture may deliver pointerup outside the scroller. Keep
+  // the direct-manipulation lifetime tied to the actual press, not to whether
+  // React happens to receive the matching end event on the chat element.
+  useEffect(() => {
+    const end = () => endDirectUserChatScroll();
+    // Native touch scrolling intentionally emits pointercancel when the browser
+    // takes ownership of panning. The finger is still down at that point; the
+    // matching touchend/touchcancel is the actual direct-manipulation boundary.
+    const endPointer = (event: PointerEvent) => {
+      if (event.pointerType !== "touch") end();
+    };
+    window.addEventListener("pointerup", endPointer);
+    window.addEventListener("pointercancel", endPointer);
+    window.addEventListener("touchend", end);
+    window.addEventListener("touchcancel", end);
+    window.addEventListener("blur", end);
+    return () => {
+      window.removeEventListener("pointerup", endPointer);
+      window.removeEventListener("pointercancel", endPointer);
+      window.removeEventListener("touchend", end);
+      window.removeEventListener("touchcancel", end);
+      window.removeEventListener("blur", end);
+    };
+  }, [endDirectUserChatScroll]);
   const onChatScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -2979,11 +3007,18 @@ export function App() {
           ref={bindChatScroll}
           onScroll={onChatScroll}
           onWheel={markUserChatScroll}
-          onTouchStart={markUserChatScroll}
-          onTouchMove={markUserChatScroll}
-          onTouchEnd={releaseUserChatScroll}
-          onPointerDown={markUserChatScroll}
-          onPointerUp={releaseUserChatScroll}
+          onTouchStart={beginDirectUserChatScroll}
+          onTouchMove={beginDirectUserChatScroll}
+          onTouchEnd={endDirectUserChatScroll}
+          onTouchCancel={endDirectUserChatScroll}
+          onPointerDown={beginDirectUserChatScroll}
+          onPointerUp={endDirectUserChatScroll}
+          onPointerCancel={(event) => {
+            if (event.pointerType !== "touch") endDirectUserChatScroll();
+          }}
+          onLostPointerCapture={(event) => {
+            if (event.pointerType !== "touch") endDirectUserChatScroll();
+          }}
           onKeyDown={markUserChatScroll}
           className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
         >

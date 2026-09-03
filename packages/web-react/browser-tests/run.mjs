@@ -1968,6 +1968,31 @@ await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹
     touchPoints: [{ x, y: y + 24, radiusX: 4, radiusY: 4, force: 1, id: 1 }],
   });
   await mobilePage.waitForTimeout(80);
+  const duringGesture = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    directManipulation: window.__mobilePage.directManipulation,
+  }));
+  if (!duringGesture.directManipulation) {
+    throw new Error("触摸仍按住时 direct-manipulation 已被首个 scroll 事件错误释放");
+  }
+  await mobilePage.evaluate(() => window.__mobilePage.attemptViewportCorrection(120));
+  const afterCorrection = await scroll.evaluate((node) => node.scrollTop);
+  if (Math.abs(afterCorrection - duringGesture.top) > 2) {
+    throw new Error(
+      `触摸拖动期间 viewport correction 抢写 scrollTop: before=${duringGesture.top}, after=${afterCorrection}`,
+    );
+  }
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchMove",
+    touchPoints: [{ x, y: y + 56, radiusX: 4, radiusY: 4, force: 1, id: 1 }],
+  });
+  await mobilePage.waitForTimeout(80);
+  const afterSecondMove = await scroll.evaluate((node) => node.scrollTop);
+  if (afterSecondMove >= duringGesture.top - 2) {
+    throw new Error(
+      `触摸连续拖动未继续跟手: first=${duringGesture.top}, second=${afterSecondMove}`,
+    );
+  }
   await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
   await cdp.detach();
   await mobilePage.waitForTimeout(80);
@@ -1975,12 +2000,16 @@ await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹
   const afterGesture = await scroll.evaluate((node) => ({
     top: node.scrollTop,
     following: window.__mobilePage.following,
+    directManipulation: window.__mobilePage.directManipulation,
   }));
   if (afterGesture.top >= before.top - 2) {
     throw new Error(`触控上滑没有离开底部: before=${before.top}, after=${afterGesture.top}`);
   }
   if (afterGesture.following) {
     throw new Error("触控首次上滑后仍处于贴底态");
+  }
+  if (afterGesture.directManipulation) {
+    throw new Error("触摸松手后 direct-manipulation 未释放");
   }
 
   await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
