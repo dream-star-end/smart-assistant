@@ -2744,6 +2744,30 @@
           "assertion": "cron submit-boundary gate rejects deletion of the regular runJob boundary"
         }
       ]
+    },
+    {
+      "id": "INC-20260903-OCV5-87-RELEASE-MARKER-GATE",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "V5 商业发布的 strong release marker 在校验 distReuse 时 jq 条件多一个右括号，合法 marker 也会编译失败并阻断发布；同时 runtime/ledger ops fixtures 已漂移，完整门无法给出可靠绿灯。",
+      "rootFixCommit": "8d2b5211",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5ReleaseSafety.test.ts",
+          "assertion": "strong release markers detect tampering and legacy trust is exact-invocation predecessor only"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5ReleaseSafety.test.ts",
+          "assertion": "B4: strong marker probe accepts distReuse without reindexing the string context"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "invalid strong release marker"
+        }
+      ]
     }
   ]
 }
