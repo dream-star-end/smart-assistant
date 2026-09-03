@@ -789,6 +789,16 @@ function makeDelegateGateway(): any {
   gw._activeDelegations = 0
   gw._activeDelegationsByParent = new Map()
   gw._hiddenDelegateGuard = new PerTurnDelegationGuard()
+  // Engine-reported delegate lanes must admit billing before runner creation.
+  // Keep this local-path test hermetic instead of calling default master.invalid.
+  gw._delegateEngineBilling = {
+    admit: async () => ({
+      requestId: "ab".repeat(16),
+      engineSessionId: "oceng-" + "b".repeat(48),
+    }),
+    settle: async () => {},
+    abandon: async () => {},
+  }
   gw.log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
   gw.rateLimiter = { check: () => true }
   gw.deps = {

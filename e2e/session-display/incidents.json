@@ -2720,6 +2720,30 @@
           "assertion": "Codex 已产出可见内容后强制停止必须恰好结算一笔 partial usage"
         }
       ]
+    },
+    {
+      "id": "INC-20260903-OCV5-84-CRON-SUBMIT-BOUNDARY",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "Cron occurrence 已持久化为 executing 后，last-run 写失败被统一映射为 SUBMIT_START_FAILED 可重试；同一外部副作用任务可能在未知提交边界后被自动重放。",
+      "rootFixCommit": "960a640f",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cron.test.ts",
+          "assertion": "fails closed without replay when the submit-started record precedes a last-run write failure"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cron-submit-boundary.ts",
+          "assertion": "[cron-submit-boundary] PASS — unknown submit-start durability failures are terminal and never auto-replayed"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/cronSubmitBoundaryGate.test.ts",
+          "assertion": "cron submit-boundary gate rejects deletion of the regular runJob boundary"
+        }
+      ]
     }
   ]
 }

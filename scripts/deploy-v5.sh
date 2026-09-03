@@ -3868,6 +3868,11 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts"; then
+    echo "✗ pinned cron submit durability boundary gate failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   # dist:--with-dist 时**在 staging(archive pinned 源)上跑官方 workspace build**
   # (`tsc -b && vite build`;R2#2:不从共用工作树构建,
   # 彻底消 dist 与 archive 不同源);否则硬链继承当前 release 的 dist(前端未变)。两路 DIST_BUILD_ID
