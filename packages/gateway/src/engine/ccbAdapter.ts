@@ -93,6 +93,46 @@ function redactModelAuthorityRuntimeEvents(
   )
 }
 
+/**
+ * CCB 协作式 abort 的 result 帧指纹。CCB 没有 stopReason='interrupted',而是
+ * 从 QueryEngine 发一条 error_during_execution,errors[0] 是 isResultSuccessful
+ * 的诊断行。用户点 Stop 时有两种形态,都是同一个用户动作:
+ *   - 流式阶段(query.ts aborted_streaming):最后一条是 user 提示或空,
+ *     stop_reason=null;
+ *   - 工具执行阶段(query.ts aborted_tools):CCB 先 yield
+ *     "[Request interrupted by user for tool use]" 这条 user 文本消息,
+ *     最近一次 API 的 stop_reason 仍是 tool_use。
+ * errors[] 里若还有别的条目(如 "Error: upstream request failed"),说明不是
+ * 干净的 abort,不得当成取消。仅 "Error: Request was aborted." 允许尾随。
+ * 本函数只看 result 形状;调用方仍必须要求浏览器确实发过 USER_CANCELLED。
+ */
+const CCB_EDE_CANCEL_DIAGNOSTIC_RE =
+  /^\[ede_diagnostic\] result_type=(?:user|undefined) last_content_type=n\/a stop_reason=(?:null|tool_use)$/
+
+export function isCcbUserCancellationDiagnostic(
+  errorDetail: string | undefined,
+  stopReason: string | null | undefined,
+): boolean {
+  if (!errorDetail || !errorDetail.includes('"subtype":"error_during_execution"')) return false
+  let parsed: unknown
+  try { parsed = JSON.parse(errorDetail) } catch { return false }
+  const errors = (parsed as { errors?: unknown } | null)?.errors
+  if (!Array.isArray(errors) || errors.length === 0) return false
+  const first = errors[0]
+  if (typeof first !== 'string') return false
+  if (first.startsWith('Error: Request was aborted.')) {
+    return errors.every((e) => typeof e === 'string' && e.startsWith('Error: Request was aborted.'))
+  }
+  const m = CCB_EDE_CANCEL_DIAGNOSTIC_RE.exec(first)
+  if (!m) return false
+  const diagStopReason = first.endsWith('stop_reason=tool_use') ? 'tool_use' : null
+  // stopReason on the TurnResult mirrors the result frame's stop_reason.
+  if ((stopReason ?? null) !== diagStopReason) return false
+  return errors.slice(1).every(
+    (e) => typeof e === 'string' && e.startsWith('Error: Request was aborted.'),
+  )
+}
+
 /** CCB 错误字符串分类(底座私有知识,从 sessionManager 下沉)。
  *  与迁移前 sessionManager.onFinish 的 isAuthError 判定逐条件一致。 */
 export function classifyCcbErrorKind(result: {
@@ -612,6 +652,10 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   isUserCancellationResult(summary: TurnSummary): boolean {
+    if (this.harness === 'ccb') {
+      return summary.isError
+        && isCcbUserCancellationDiagnostic(summary.errorDetail, summary.stopReason)
+    }
     return this.harness === 'official-cc'
       && summary.isError
       && summary.stopReason === null

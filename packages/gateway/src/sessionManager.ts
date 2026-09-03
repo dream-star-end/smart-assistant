@@ -30,7 +30,7 @@ import {
 // 本文件只消费 engine 中立契约(EngineAdapter / EngineEvent / TurnSummary /
 // PartialSnapshot)。ccbAdapter / codexAdapter 的 import 兼有 registry 注册副作用
 // ('ccb' / 'codex' factory)。
-import './engine/ccbAdapter.js'
+import { isCcbUserCancellationDiagnostic } from './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
 import { decideEngineCwd } from './engineCwd.js'
@@ -6358,20 +6358,16 @@ export class SessionManager {
           // that diagnostic runtime event, but only a platform-owned waiver or
           // an engine-confirmed user cancellation may override the summary.
           // If Stop races a natural end_turn, completion remains authoritative.
-          // CCB confirms its cooperative AbortController path with this exact
-          // null-stop-reason result shape instead of stopReason='interrupted'.
+          // CCB confirms its cooperative AbortController path with an
+          // error_during_execution result instead of stopReason='interrupted'.
+          // Streaming-phase aborts carry stop_reason=null; a Stop that lands
+          // while a tool call is executing (query.ts aborted_tools) yields the
+          // "[Request interrupted by user for tool use]" user message and keeps
+          // the last API stop_reason=tool_use. Both are the same user action.
           const ccbUserCancellationResult =
             session.providerTag === 'ccb' &&
             result?.isError === true &&
-            result.stopReason === null &&
-            result.errorDetail?.includes('"subtype":"error_during_execution"') === true &&
-            (
-              result.errorDetail.includes('Error: Request was aborted.') ||
-              result.errorDetail ===
-                '{"subtype":"error_during_execution","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"]}' ||
-              result.errorDetail ===
-                '{"subtype":"error_during_execution","errors":["[ede_diagnostic] result_type=undefined last_content_type=n/a stop_reason=null"]}'
-            )
+            isCcbUserCancellationDiagnostic(result.errorDetail, result.stopReason)
           const engineUserCancellationResult = result
             ? session.runner.isUserCancellationResult?.(result) === true
             : false

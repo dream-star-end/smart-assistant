@@ -101,4 +101,43 @@ describe("planCursorExternalSettle", () => {
       assert.match(plan.snapshotJson, /cursor_engine_not_success/);
     }
   });
+
+  test("user Stop (error + USER_CANCELLED) charges the tokens actually consumed", () => {
+    const usage = { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const plan = planCursorExternalSettle({ engineStatus: "error", usage, pricing: grok, terminalCode: "USER_CANCELLED" });
+    assert.equal(plan.settleStatus, "success");
+    assert.equal(plan.costCredits, 800n);
+    assert.match(plan.snapshotJson, /"cursor_status":"error"/);
+    assert.match(plan.snapshotJson, /"cursor_terminal_code":"USER_CANCELLED"/);
+    assert.match(plan.snapshotJson, /"charged_on_user_cancel":true/);
+    assert.doesNotMatch(plan.snapshotJson, /cursor_engine_not_success/);
+  });
+
+  test("user Stop with zero output is still waived as no_output", () => {
+    const usage = { input_tokens: 1_000_000, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const plan = planCursorExternalSettle({ engineStatus: "error", usage, pricing: grok, terminalCode: "USER_CANCELLED" });
+    assert.equal(plan.settleStatus, "success");
+    assert.equal(plan.costCredits, 0n);
+    assert.match(plan.snapshotJson, /"waived":"no_output"/);
+  });
+
+  test("user Stop under historical zeroCharge still settles at 0", () => {
+    const usage = { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const plan = planCursorExternalSettle({
+      engineStatus: "error",
+      usage,
+      pricing: grok,
+      terminalCode: "USER_CANCELLED",
+      zeroCharge: true,
+    });
+    assert.equal(plan.costCredits, 0n);
+    assert.match(plan.snapshotJson, /"waived":"historical_backfill_no_charge"/);
+  });
+
+  test("USER_CANCELLED does not rescue an unavailable (auth/quota) engine", () => {
+    const usage = { input_tokens: 1_000_000, output_tokens: 10, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const plan = planCursorExternalSettle({ engineStatus: "unavailable", usage, pricing: grok, terminalCode: "USER_CANCELLED" });
+    assert.equal(plan.settleStatus, "error");
+    assert.equal(plan.costCredits, 0n);
+  });
 });

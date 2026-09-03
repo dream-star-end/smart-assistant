@@ -4,7 +4,9 @@
  * Cursor adapter 仍是 billingMode='external'（订阅 CLI 上报 usage），
  * 但 selfhost 要从 0221 官方价走 settleUsageAndLedger 扣积分。
  * 不做 Codex 式 preCheck/journal；不足则 spendTwoBucket clamp。
- * 只对 engine status='success' 扣费；error/unavailable 落 audit 痕、0 扣。
+ * engine status='success' 按实扣费；用户主动 Stop（status='error' +
+ * terminalCode=USER_CANCELLED）同样按引擎上报的真实 token 扣费（2026-09-03 起）；
+ * 其余 error/unavailable 落 audit 痕、0 扣。
  * 零输出免单对齐 f3818040 / codexFinalizer。
  */
 import type { Pool } from "pg";
@@ -48,20 +50,29 @@ export function planCursorExternalSettle(args: {
 } {
   const { cost_credits, snapshot } = computeCost(args.usage, args.pricing);
   const engineOk = args.engineStatus === "success";
+  // A user-initiated Stop is not an engine failure: the tokens the engine
+  // reported were really consumed upstream before the abort landed, so the
+  // turn settles at its actual cost (operator decision 2026-09-03). Only the
+  // adapter's `error` status qualifies; `unavailable` (auth/quota) still
+  // means the upstream call never went through.
+  const userCancelled =
+    args.engineStatus === "error" && args.terminalCode === "USER_CANCELLED";
+  const chargeable = engineOk || userCancelled;
   const waivedNoOutput =
-    engineOk && BigInt(args.usage.output_tokens ?? 0) === 0n && cost_credits > 0n;
-  const wouldCharge = engineOk && !waivedNoOutput ? cost_credits : 0n;
+    chargeable && BigInt(args.usage.output_tokens ?? 0) === 0n && cost_credits > 0n;
+  const wouldCharge = chargeable && !waivedNoOutput ? cost_credits : 0n;
   const zeroCharged = args.zeroCharge === true && wouldCharge > 0n;
   const costCredits = zeroCharged ? 0n : wouldCharge;
-  const settleStatus: "success" | "error" = engineOk ? "success" : "error";
+  const settleStatus: "success" | "error" = chargeable ? "success" : "error";
   const snapshotJson = JSON.stringify({
     ...snapshot,
     cursor_status: args.engineStatus,
     ...(args.terminalCode ? { cursor_terminal_code: args.terminalCode } : {}),
+    ...(userCancelled ? { charged_on_user_cancel: true } : {}),
     ...(waivedNoOutput
       ? { waived: "no_output", wouldHaveCharged: cost_credits.toString() }
       : {}),
-    ...(!engineOk && cost_credits > 0n
+    ...(!chargeable && cost_credits > 0n
       ? { waived: "cursor_engine_not_success", wouldHaveCharged: cost_credits.toString() }
       : {}),
     ...(zeroCharged
