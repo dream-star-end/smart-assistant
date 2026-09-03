@@ -155,7 +155,12 @@ import {
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
 import type { ChatProject, LockedPublicModel, Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
 import type { LockedSelectInfo } from "./components/ModelSelector";
-import { modelSwitchCompactionReason } from "./lib/modelSwitch";
+import { lockedModelUnlockNotice } from "./lib/cursorModelPicker";
+import {
+  freshSessionRequiredForSwitch,
+  freshSessionSwitchNotice,
+  modelSwitchCompactionReason,
+} from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
 
 // 首屏瘦身:营销首页 + 设置/管理/市场/组织/教程中心按需异步加载,移出 entry chunk。
@@ -662,10 +667,19 @@ export function App() {
     if (demo || models.length === 0 || !activeId) return;
     setModelId(resolveSessionModel(models, activeSessionModelId, modelPrefs));
   }, [demo, models, activeId, activeSessionModelId, modelPrefs]);
+  // 「新建会话并以目标模型起手」的一次性意图(Opus/Fable 只能新会话使用的弹窗确认后写入):
+  // 空态 effect 消费一次即清空,下一次新建仍回默认解析。
+  const nextSessionModelRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     // 空会话态默认:boot 初值与 default_model 变更传导(= 下一个新会话的初始意图)。
     // 空态的显式选择(selectModel 只 setModelId)不改本 effect 依赖,不会被覆盖。
     if (demo || models.length === 0 || activeId !== undefined) return;
+    const pinned = nextSessionModelRef.current;
+    nextSessionModelRef.current = undefined;
+    if (pinned && models.some((m) => m.id === pinned)) {
+      setModelId(pinned);
+      return;
+    }
     setModelId(resolveSessionModel(models, undefined, modelPrefs));
   }, [demo, models, activeId, modelPrefs]);
 
@@ -698,6 +712,24 @@ export function App() {
         currentMessages.some((message) =>
           message.role === "user" || message.role === "assistant" ||
           message.role === "tool" || message.role === "agent-group");
+      // Opus / Fable 只能新会话起手(见 lib/modelSwitch):已有上下文的非 Opus/Fable 会话
+      // 不切换,先说明原因(初始上下文过大 + 吃不到缓存),给「新建会话」快捷入口。
+      if (freshSessionRequiredForSwitch(modelId, id, hasContent)) {
+        const targetName = models.find((m) => m.id === id)?.display_name;
+        const notice = freshSessionSwitchNotice(id, typeof targetName === "string" ? targetName : undefined);
+        const go = await confirmDialog({
+          title: notice.title,
+          body: <div className="space-y-2 text-sm text-muted" data-testid="fresh-session-switch-notice">
+            {notice.paragraphs.map((text) => <p key={text}>{text}</p>)}
+          </div>,
+          confirmText: notice.confirmText,
+          cancelText: notice.cancelText,
+        });
+        if (go !== true) return;
+        nextSessionModelRef.current = id;
+        handleNew();
+        return;
+      }
       const reason = modelSwitchCompactionReason(models, modelId, id, hasContent);
       if (!reason || !modelId) {
         commit();
@@ -736,7 +768,7 @@ export function App() {
         setModelSwitchPreparing(false);
       }
     },
-    [demo, activeId, modelId, modelSwitchPreparing, models, sessions, setSessions, queueModelPatch, confirmDialog, toast],
+    [demo, activeId, modelId, modelSwitchPreparing, models, sessions, setSessions, queueModelPatch, confirmDialog, toast, handleNew],
   );
   // 回填给 useAuth 的 chat 域收尾（onClearAuth/onLoginSuccess 经 sessionsResetRef 调用）。
   sessionsResetRef.current = resetSessionList;
@@ -1158,14 +1190,28 @@ export function App() {
     setSettingsOpen(true);
   }, [refreshMe]);
 
+  // OCV5-86:锁定模型先弹说明(为什么锁、任意订阅即可解锁),用户确认后才跳订阅面板;
+  // 之前一句 toast 直接跳转,用户不知道任何一档订阅都够。
   const handleLockedSelect = useCallback(
     (info: LockedSelectInfo) => {
-      const plan = info.minPlanName?.trim() || info.minPlanCode;
-      toast(`「${info.label}」需订阅 ${plan} 及以上套餐解锁，前往订阅…`);
-      openSettings("account");
-      setSubscribeOpenSignal((n) => n + 1);
+      const notice = lockedModelUnlockNotice(info);
+      void (async () => {
+        const go = await confirmDialog({
+          title: notice.title,
+          body: (
+            <div className="space-y-2 text-sm text-muted" data-testid="locked-model-unlock-notice">
+              {notice.paragraphs.map((text) => <p key={text}>{text}</p>)}
+            </div>
+          ),
+          confirmText: notice.confirmText,
+          cancelText: notice.cancelText,
+        });
+        if (go !== true) return;
+        openSettings("account");
+        setSubscribeOpenSignal((n) => n + 1);
+      })();
     },
-    [openSettings, toast],
+    [confirmDialog, openSettings],
   );
 
   const applyConversationPreferences = useCallback(

@@ -251,6 +251,44 @@ export function resolveCursorPickerSelection(
   return pickCursorPublicModel(members, family, effort, fast)?.id
 }
 
+/** 订阅门槛最低档:任何付费档都能解锁时,说明文案强调「任意订阅」。 */
+export const LOWEST_PAID_PLAN_CODE = 'lite'
+
+export type LockedModelUnlockNotice = {
+  title: string
+  /** 说明段落,按顺序渲染。 */
+  paragraphs: string[]
+  confirmText: string
+  cancelText: string
+}
+
+/**
+ * 点击锁定模型行时的说明文案(OCV5-86)。之前只 toast 一句就直接跳订阅面板,用户不知道为什么
+ * 被锁、也不知道任意一档订阅都够。min_plan_code=lite(最低付费档)→ 明说「开通任意订阅套餐即可
+ * 解锁」;更高门槛 → 「需 {plan} 及以上套餐」。纯函数,方便单测锁死措辞。
+ */
+export function lockedModelUnlockNotice(info: {
+  label: string
+  minPlanCode: string
+  minPlanName?: string
+}): LockedModelUnlockNotice {
+  const label = info.label.trim() || '该模型'
+  const planName = info.minPlanName?.trim() || info.minPlanCode
+  const anyPaid = info.minPlanCode.trim().toLowerCase() === LOWEST_PAID_PLAN_CODE
+  const gate = anyPaid
+    ? `开通任意订阅套餐(${planName} 及以上任一档)即可解锁,无需选择特定档位。`
+    : `需订阅 ${planName} 及以上套餐后解锁。`
+  return {
+    title: `「${label}」为订阅专享模型`,
+    paragraphs: [
+      `${label} 当前对免费账户锁定。${gate}`,
+      '订阅后立即生效:模型选择器中的锁标消失,可直接切换使用;已有会话与积分余额不受影响。',
+    ],
+    confirmText: '前往订阅',
+    cancelText: '暂不',
+  }
+}
+
 export function longContextCostConfirmationRequired(
   sourceModelId: string | null | undefined,
   targetModelId: string | null | undefined,
