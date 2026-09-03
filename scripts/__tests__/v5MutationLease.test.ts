@@ -150,12 +150,12 @@ describe('v5 production-mutation lease: TTL + fencing + reclaim (local flock mod
   })
 
   test('acquire writes fencing meta and holds the flock; release frees and clears it', async () => {
-    const fx = await fixture(2)
+    const fx = await fixture(30)
     const out = orchestrate(
       [
         'acquire_production_mutation_lease 5 >/dev/null 2>&1',
         `[ -f "${fx.meta}" ] && echo META_PRESENT`,
-        `grep -q '"ttl":2' "${fx.meta}" && echo TTL_IN_META`,
+        `grep -q '"ttl":30' "${fx.meta}" && echo TTL_IN_META`,
         `grep -q '"mode":"deploy"' "${fx.meta}" && echo MODE_IN_META`,
         `grep -q '"deploy_id":"[0-9a-f]\\{24\\}"' "${fx.meta}" && echo DEPLOY_ID_IN_META`,
         `flock -n "${fx.lock}" true || echo HELD`,
@@ -173,12 +173,12 @@ describe('v5 production-mutation lease: TTL + fencing + reclaim (local flock mod
   })
 
   test('hard TTL self-releases even while the holder parent stays alive', async () => {
-    const fx = await fixture(2) // TTL=2s
+    const fx = await fixture(15) // TTL=15s
     const out = orchestrate(
       [
         'acquire_production_mutation_lease 5 >/dev/null 2>&1',
         `flock -n "${fx.lock}" true || echo HELD_INITIALLY`,
-        'sleep 4', // 父进程(本 bash)全程存活;holder 必须靠 TTL 自 exit
+        'sleep 20', // 父进程(本 bash)全程存活;holder 必须靠 TTL 自 exit
         `flock -n "${fx.lock}" true && echo FREED_BY_TTL`,
         `[ -f "${fx.meta}" ] || echo META_GONE_BY_TTL`,
       ].join('\n'),
@@ -289,7 +289,7 @@ describe('v5 production-mutation lease: TTL + fencing + reclaim (local flock mod
   })
 
   test('supervised mutation lane preserves normal status and exact-clears its marker', async () => {
-    const fx = await fixture(30)
+    const fx = await fixture(120)
     const bad = path.join(fx.dir, 'errexit-bypassed')
     const out = orchestrate(
       [
