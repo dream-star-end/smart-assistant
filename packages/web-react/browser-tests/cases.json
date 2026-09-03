@@ -245,6 +245,10 @@
     {
       "id": "T61",
       "proves": "真 Chromium 中刷新形态(sending=false)下当前轮仍有未完成 TodoWrite(hydration inputJson.todos)时 PinnedTaskTracker HUD 仍钉住;OCV5-70 真实 fixture 的畸形 agent-group 只落 per-message MessageBoundary,邻居 user/assistant 行仍在,不打穿 SessionTimelineBoundary"
+    },
+    {
+      "id": "T62",
+      "proves": "真 Chromium 中 Phase-A unpublished fallback 的 id 等于最后一段 live assistant 行 id(visible_head.messageId=…-sK)时，最后一段正文仍渲染在原槽位而不是被清空隐藏；更早的 live 段照常保留，fallback 拼接整块不渲染(INC-20260903-TURNEND-LAST-SEGMENT-FLASH)"
     }
   ]
 }

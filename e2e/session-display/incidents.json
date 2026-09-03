@@ -2866,6 +2866,25 @@
           "assertion": "user Stop (error + USER_CANCELLED) charges the tokens actually consumed"
         }
       ]
+    },
+    {
+      "id": "INC-20260903-TURNEND-LAST-SEGMENT-FLASH",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "V5 selfhost 多段正文（text→tool→text）轮正常结束时，最后一段正文闪一下消失，几秒到几十秒后 Phase-B 精确 tape 到达才重新出现。根因：Phase-A unpublished fallback 的 id = visible_head.messageId = 最后一段 live assistant 行 id（srv-…-tN-sK），server-wins 按 id 吞掉该 live 行；omitUnpublishedFallbackWhenLiveAssistantsExist 又因仍有更早 live 段而把 fallback 正文清空隐藏，最后一段文本无人渲染。",
+      "rootFixCommit": "ab3f5c20",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "Phase-A fallback sharing the last live segment id keeps that segment text visible (INC-20260903-TURNEND-LAST-SEGMENT-FLASH)"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T62 Phase-A fallback 与最后一段 live 正文同 id 时最后一段正文不闪没"
+        }
+      ]
     }
   ]
 }
