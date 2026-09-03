@@ -235,7 +235,9 @@ describe('buildHostSpawnProviderEnv — 路由决策对称性(MAJOR/MINOR 2026-0
       assert.equal(r.routing, 'settings-default')
       assert.equal(r.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, '1')
       assert.equal(r.env.ANTHROPIC_SMALL_FAST_MODEL, 'deepseek-v4-flash')
-      assert.equal(r.env.CLAUDE_CODE_SUBAGENT_MODEL, 'glm-5.3-zai')
+      // 非可路由父模型 → 子 agent 落到平台 aux 槽(与 SMALL_FAST 同一模型),
+      // 这是 egress turn-lease 门唯一放行的跨模型 slot。
+      assert.equal(r.env.CLAUDE_CODE_SUBAGENT_MODEL, 'deepseek-v4-flash')
     } finally {
       if (prev === undefined) delete process.env.OPENCLAUDE_SECONDARY_MODEL
       else process.env.OPENCLAUDE_SECONDARY_MODEL = prev

@@ -307,7 +307,34 @@ describe('CCB subagent model env (CLAUDE_CODE_SUBAGENT_MODEL)', () => {
     assert.equal(resolveCcbSubagentModel('haiku'), DEFAULT_CCB_SUBAGENT_MODEL)
     assert.equal(resolveCcbSubagentModel('claude-haiku-4-5-20251001'), DEFAULT_CCB_SUBAGENT_MODEL)
     assert.equal(resolveCcbSubagentModel('grok-build'), DEFAULT_CCB_SUBAGENT_MODEL)
-    assert.equal(DEFAULT_CCB_SUBAGENT_MODEL, 'glm-5.3-zai')
+  })
+
+  it('cursor-* parents fall back to the platform aux model — the only one the turn-lease gate admits besides the parent', () => {
+    // egress modelAuthorityGate allowed set = {lease.canonicalModel} ∪ PLATFORM_AUX_MODEL_IDS
+    // (= [DEFAULT_SECONDARY_UTILITY_MODEL]). A glm pin under a cursor-fable lease 403'd
+    // MODEL_AUTHORITY_INVALID on every Agent tool call (selfhost 2026-09-02).
+    assert.equal(DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL)
+    assert.equal(DEFAULT_CCB_SUBAGENT_MODEL, 'deepseek-v4-flash')
+    const prevSub = process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL
+    const prevSec = process.env.OPENCLAUDE_SECONDARY_MODEL
+    delete process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL
+    delete process.env.OPENCLAUDE_SECONDARY_MODEL
+    try {
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'deepseek-v4-flash')
+      assert.deepEqual(
+        _buildCcbSubagentModelEnv({ sessionModel: 'cursor-fable-5.1-high', routing: 'settings-default' }),
+        { CLAUDE_CODE_SUBAGENT_MODEL: 'deepseek-v4-flash' },
+      )
+      // Ops override of the aux slot moves the sub-agent pin with it.
+      process.env.OPENCLAUDE_SECONDARY_MODEL = 'deepseek-v4-lite'
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'deepseek-v4-lite')
+      assert.equal(_buildSecondaryUtilityModelEnv().ANTHROPIC_SMALL_FAST_MODEL, 'deepseek-v4-lite')
+    } finally {
+      if (prevSub === undefined) delete process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL
+      else process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL = prevSub
+      if (prevSec === undefined) delete process.env.OPENCLAUDE_SECONDARY_MODEL
+      else process.env.OPENCLAUDE_SECONDARY_MODEL = prevSec
+    }
   })
 
   it('leaves oauth-direct unpinned so real Anthropic keeps Haiku', () => {
