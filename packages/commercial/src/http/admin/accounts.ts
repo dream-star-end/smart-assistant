@@ -50,7 +50,7 @@ import {
   OAuthExchangeError,
   type OAuthProvider,
 } from "../../admin/oauth.js";
-import { AccountNotFoundError, type AccountRow } from "../../account-pool/store.js";
+import { AccountNotFoundError, getCursorTokenSnapshot, type AccountRow } from "../../account-pool/store.js";
 import { getEgressProxy } from "../../admin/egressProxies.js";
 import {
   cancelGrokDeviceAuth,
@@ -62,6 +62,12 @@ import {
   getCursorSessionAuthStatus,
   startCursorSessionAuth,
 } from "../../admin/cursorSessionAuth.js";
+import {
+  CursorUsageUnavailableError,
+  fetchCursorSessionUsage,
+  getCachedCursorUsage,
+  setCachedCursorUsage,
+} from "../../admin/cursorSessionUsage.js";
 import {
   listRefreshEvents,
   MAX_LIST_LIMIT as REFRESH_EVENTS_MAX_LIMIT,
@@ -246,6 +252,9 @@ export async function handleAdminGetAccount(
   if (action === "recent-users") {
     return handleAccountRecentUsers(idRaw, url, res);
   }
+  if (action === "cursor-usage") {
+    return handleAccountCursorUsage(idRaw, url, res);
+  }
   if (action !== "") {
     throw new HttpError(404, "NOT_FOUND", "endpoint not found");
   }
@@ -284,6 +293,65 @@ async function handleAccountRecentUsers(
     const rows = await getAccountRecentUsers(id, hours, limit);
     sendJson(res, 200, { rows });
   } catch (err) { translateRangeError(err); }
+}
+
+/**
+ * 0257 — GET /api/admin/accounts/:id/cursor-usage[?refresh=1]
+ * Cursor 账号会话(Sand)的额度/用量快照:套餐、账期、已用/剩余、按模型聚合。
+ * 只对 provider=cursor 且 cursor_credential_kind=session 的行有意义;api_key 行
+ * 没有会话 cookie,返回 409。60s 缓存,refresh=1 强制回源。快照不含任何凭证。
+ */
+async function handleAccountCursorUsage(
+  id: string,
+  url: URL,
+  res: ServerResponse,
+): Promise<void> {
+  const a = await adminGetAccount(id);
+  if (!a) throw new HttpError(404, "NOT_FOUND", "account not found");
+  if (a.provider !== "cursor" || a.cursor_credential_kind !== "session") {
+    throw new HttpError(409, "CONFLICT", "cursor usage is only available for Cursor account-session credentials");
+  }
+  const force = url.searchParams.get("refresh") === "1";
+  if (!force) {
+    const cached = getCachedCursorUsage(id);
+    if (cached) {
+      sendJson(res, 200, { usage: cached, cached: true });
+      return;
+    }
+  }
+  const snap = await getCursorTokenSnapshot(id);
+  if (!snap) throw new HttpError(404, "NOT_FOUND", "account not found");
+  if (snap.expires_at && snap.expires_at.getTime() <= Date.now()) {
+    snap.token.fill(0);
+    snap.refresh?.fill(0);
+    throw new HttpError(409, "CONFLICT", "cursor session expired; log in again");
+  }
+  let accessToken: string | null = snap.token.toString("utf8");
+  snap.token.fill(0);
+  snap.refresh?.fill(0);
+  try {
+    const usage = await fetchCursorSessionUsage({
+      accessToken,
+      authId: a.cursor_auth_id,
+      machineId: snap.machine_id,
+    });
+    accessToken = null;
+    setCachedCursorUsage(id, usage);
+    sendJson(res, 200, { usage, cached: false });
+  } catch (err) {
+    accessToken = null;
+    if (err instanceof CursorUsageUnavailableError) {
+      throw new HttpError(
+        err.code === "session_rejected" ? 409 : 502,
+        err.code === "session_rejected" ? "CONFLICT" : "UPSTREAM",
+        err.code === "session_rejected"
+          ? "Cursor rejected the account session; log in again"
+          : "Cursor usage endpoints unavailable",
+        { issues: Object.entries(err.details).map(([path, message]) => ({ path, message })) },
+      );
+    }
+    throw err;
+  }
 }
 
 /**
