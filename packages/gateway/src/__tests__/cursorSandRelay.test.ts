@@ -11,6 +11,7 @@ import { CursorSandRelay, encodeCursorSandRequest, recoverXmlToolCalls } from '.
 import { CursorSandAdapter } from '../engine/cursorSandAdapter.js'
 import {
   cursorSandEnabledForSelection,
+  cursorSelectionUserId,
   recordCursorCredentialResult,
   selectCursorCredential,
 } from '../engine/cursorCredentialSelection.js'
@@ -283,6 +284,42 @@ printf '%s %s %s %s %s\n' \
   } finally {
     if (previous === undefined) delete process.env.OC_CURSOR_WRAPPER_BIN
     else process.env.OC_CURSOR_WRAPPER_BIN = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('credential selector hands the container owner uid to the wrapper for sticky Sand selection', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-credential-selector-uid-'))
+  const wrapper = resolve(dir, 'oc-cursor')
+  const capture = resolve(dir, 'seen-uid')
+  const previousBin = process.env.OC_CURSOR_WRAPPER_BIN
+  const previousUid = process.env.OC_USER_ID
+  writeFileSync(wrapper, `#!/bin/sh
+set -eu
+printf '%s\n' "\${OC_USER_ID-unset}" > ${capture}
+echo 'oc-cursor: selected_slot 2 api-key.2 sand gen-0123456789abcdef01234567 12 0123456789abcdef session abcdefghijklmnopqrstuvwxyz'
+`, { mode: 0o755 })
+  chmodSync(wrapper, 0o755)
+  process.env.OC_CURSOR_WRAPPER_BIN = wrapper
+  try {
+    process.env.OC_USER_ID = '7'
+    const selection = selectCursorCredential({
+      agentId: 'main', sessionKey: 'agent:main:test:credential-selector-uid',
+      agentBaseDir: dir, model: 'cursor-opus-5-high',
+    })
+    assert.equal(selection.accountId, '12')
+    assert.equal(readFileSync(capture, 'utf8').trim(), '7')
+
+    // Junk never reaches the wrapper env; the probe fallback is consulted instead.
+    assert.equal(cursorSelectionUserId({ OC_USER_ID: 'not-a-uid' }, () => ({ uid: null })), null)
+    assert.equal(cursorSelectionUserId({ OC_USER_ID: '' }, () => ({ uid: '9' })), '9')
+    assert.equal(cursorSelectionUserId({ OC_USER_ID: ' 42 ' }, () => { throw new Error('unused') }), '42')
+    assert.equal(cursorSelectionUserId({ OC_USER_ID: '1234567890123' }, () => ({ uid: null })), null)
+  } finally {
+    if (previousBin === undefined) delete process.env.OC_CURSOR_WRAPPER_BIN
+    else process.env.OC_CURSOR_WRAPPER_BIN = previousBin
+    if (previousUid === undefined) delete process.env.OC_USER_ID
+    else process.env.OC_USER_ID = previousUid
     rmSync(dir, { recursive: true, force: true })
   }
 })

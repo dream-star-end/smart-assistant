@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { cursorModelById } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
+import { probeEnvFacts } from '../envProbe.js'
 import { createLogger } from '../logger.js'
 
 const log = createLogger({ module: 'cursorCredentialSelection' })
@@ -40,6 +41,22 @@ function wrapperBin(): string {
   return existsSync(HOT_WRAPPER) ? HOT_WRAPPER : IMAGE_WRAPPER
 }
 
+/** Container owner uid for the wrapper's sticky per-user Sand slot selection.
+ * Not a secret (a plain integer the sandbox supervisor injects); resolved via
+ * the env probe so a hollowed process env still falls back to PID 1. */
+export function cursorSelectionUserId(
+  env: NodeJS.ProcessEnv = process.env,
+  facts: () => { uid: string | null } = probeEnvFacts,
+): string | null {
+  const direct = env.OC_USER_ID?.trim() ?? ''
+  if (/^\d{1,12}$/.test(direct)) return direct
+  try {
+    return facts().uid
+  } catch {
+    return null
+  }
+}
+
 function selectorEnv(
   agentId: string,
   sessionKey: string,
@@ -52,6 +69,8 @@ function selectorEnv(
     OC_SESSION_KEY: sessionKey,
     ...extra,
   }
+  const userId = cursorSelectionUserId()
+  if (userId) env.OC_USER_ID = userId
   for (const key of ['LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'TZ'] as const) {
     if (process.env[key] !== undefined) env[key] = process.env[key]
   }
