@@ -1073,11 +1073,14 @@ async function relayUsageResponse(
   }
 }
 
-test('extendedUsage cache_read/cache_write tokens surface as Anthropic cache usage fields', async () => {
+// Sand reports input_tokens *inclusive* of cache_read/cache_write; Anthropic's
+// input_tokens is exclusive. The relay must subtract so usageCost does not bill
+// the cached context at the full input rate on top of the cache rate.
+test('extendedUsage cache counters surface as Anthropic cache fields with input_tokens made exclusive', async () => {
   const frames = [
     responseFrame('textPart', { text: 'done' }),
     responseFrame('extendedUsage', {
-      inputTokens: 120, outputTokens: 9, cacheReadTokens: 100_000, cacheWriteTokens: 2_500, maxTokens: 64,
+      inputTokens: 102_620, outputTokens: 9, cacheReadTokens: 100_000, cacheWriteTokens: 2_500, maxTokens: 64,
     }),
   ]
   const streamed = await relayUsageResponse(frames, true)
@@ -1089,6 +1092,28 @@ test('extendedUsage cache_read/cache_write tokens surface as Anthropic cache usa
   assert.deepEqual(json.usage, {
     input_tokens: 120, output_tokens: 9, cache_read_input_tokens: 100000, cache_creation_input_tokens: 2500,
   })
+})
+
+test('extendedUsage with cache counters exceeding input_tokens clamps input_tokens to 0', async () => {
+  const frames = [
+    responseFrame('textPart', { text: 'done' }),
+    responseFrame('extendedUsage', {
+      inputTokens: 50, outputTokens: 1, cacheReadTokens: 40, cacheWriteTokens: 20, maxTokens: 64,
+    }),
+  ]
+  const json = JSON.parse(await relayUsageResponse(frames, false)) as { usage: Record<string, number> }
+  assert.deepEqual(json.usage, {
+    input_tokens: 0, output_tokens: 1, cache_read_input_tokens: 40, cache_creation_input_tokens: 20,
+  })
+})
+
+test('extendedUsage without cache counters leaves input_tokens untouched', async () => {
+  const frames = [
+    responseFrame('textPart', { text: 'done' }),
+    responseFrame('extendedUsage', { inputTokens: 777, outputTokens: 3, maxTokens: 64 }),
+  ]
+  const json = JSON.parse(await relayUsageResponse(frames, false)) as { usage: Record<string, number> }
+  assert.deepEqual(json.usage, { input_tokens: 777, output_tokens: 3 })
 })
 
 test('legacy usage frame without cache counters keeps the bare {input_tokens, output_tokens} shape', async () => {

@@ -158,13 +158,25 @@ interface StreamState {
 
 /** Anthropic-shaped usage block for the SSE / JSON responses the relay emits.
  * Cache fields are only present when upstream reported them, so callers that
- * only ever saw `{input_tokens, output_tokens}` keep their exact wire shape. */
+ * only ever saw `{input_tokens, output_tokens}` keep their exact wire shape.
+ *
+ * Sand's `InferenceExtendedUsageInfo.input_tokens` is the *total* prompt size
+ * (cache hits and cache writes included); Anthropic's `input_tokens` excludes
+ * both. Downstream (ccbMessageParser -> usageCost / computeCostFen) prices the
+ * three buckets independently, so forwarding the inclusive figure charged the
+ * cached context twice (full input rate + cache rate; observed post-ec9335b41
+ * rows had input - cache_read - cache_write of only 28..652 tokens). Convert
+ * to Anthropic's exclusive convention here so the wire shape stays canonical. */
 function usageBlock(
   state: Pick<StreamState, 'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'>,
   overrides: { output_tokens?: number } = {},
 ): Record<string, number> {
+  const cached = state.cacheReadTokens + state.cacheWriteTokens
+  const uncachedInput = cached > 0
+    ? Math.max(0, state.inputTokens - cached)
+    : state.inputTokens
   const usage: Record<string, number> = {
-    input_tokens: state.inputTokens,
+    input_tokens: uncachedInput,
     output_tokens: overrides.output_tokens ?? state.outputTokens,
   }
   if (state.cacheReadTokens > 0) usage.cache_read_input_tokens = state.cacheReadTokens
