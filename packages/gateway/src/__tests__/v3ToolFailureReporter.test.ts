@@ -43,6 +43,19 @@ afterEach(() => {
   _resetAdvertisedToolAuditSchemaHintForTests()
 })
 
+async function readQueuePayloadEventually<T>(file: string): Promise<T> {
+  let lastError: unknown
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    try {
+      return (JSON.parse(await readFile(file, 'utf8')) as { payload: T }).payload
+    } catch (err) {
+      lastError = err
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+  }
+  throw lastError
+}
+
 /** Snapshot of 0aaf1a98a validateBody: 14 classes, no errorMsg. */
 function legacyValidateBodyV4(raw: unknown): boolean {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
@@ -601,7 +614,7 @@ describe('v3ToolFailureReporter', () => {
 
     const reports: ToolCallRollupPayload[] = []
     for (const file of (await readdir(tmp)).filter((name) => name.startsWith('rollup-'))) {
-      reports.push(JSON.parse(await readFile(join(tmp, file), 'utf8')).payload)
+      reports.push(await readQueuePayloadEventually<ToolCallRollupPayload>(join(tmp, file)))
     }
     reports.sort((a, b) => a.sequence - b.sequence)
     assert.deepEqual(
