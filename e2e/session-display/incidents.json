@@ -2567,6 +2567,16 @@
           "assertion": "hydration 形态 TodoWrite(inputJson.todos) 在当前轮未完成时仍可提取"
         },
         {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/PinnedTaskTracker.test.tsx",
+          "assertion": "turn 收口(active true→false 下降沿)后,仍有未完成任务也不再钉住"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "user 行 status=replied → 收口"
+        },
+        {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T61 刷新后 HUD 仍钉住且畸形 agent-group 只落 MessageBoundary 邻居仍在"
@@ -2575,7 +2585,8 @@
       "coverageCommits": [
         "51674b8c",
         "226edfac",
-        "d18bd587"
+        "d18bd587",
+        "0d6a19ea"
       ]
     },
     {

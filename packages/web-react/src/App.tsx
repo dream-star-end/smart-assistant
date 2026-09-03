@@ -51,7 +51,7 @@ import {
   type VisibleVirtualRowAnchor,
 } from "./components/chat/archivePaging";
 import { createStickToBottomController } from "./components/chat/stickToBottom";
-import { turnFinalAssistantFlags } from "./components/chat/turnSegment";
+import { currentTurnSettled, turnFinalAssistantFlags } from "./components/chat/turnSegment";
 import type { CardCallbacks, FeedbackContext } from "./components/chat/cards";
 import { MessageFeedbackDialog } from "./components/chat/MessageFeedbackDialog";
 import {
@@ -3103,11 +3103,13 @@ export function App() {
         {/* composer-safe-b:底部 Home 指示条安全区(叠在原 pb-3 上),否则发送区被遮 */}
         <div className="shrink-0 composer-safe-b">
           {/* 任务列表 HUD:钉在输入框上方,始终可见(取代会滚走的 inline TodoWrite 卡)。
-              初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务时组件自渲染 null。 */}
+              初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务或本轮已收口时组件自渲染
+              null(收口后由 MessageRenderer 的 inline 只读 TodoWrite/plan 卡兜底)。 */}
           {!demo && !gated && (
             <PinnedTaskTracker
               todos={extractLatestTodos(wsMessages)}
               active={wsSending}
+              settled={currentTurnSettled(wsMessages)}
               tokenUsage={activeSess?._liveTurnUsage?.usage}
             />
           )}
