@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "frozenAt": "2026-09-03",
-  "auroraTip": "362d5041484c818db5e02cd54ec8e338832bf6e7",
-  "selfhostTip": "e047c18020ef1a9d3e7ce4a3fc781ad4d26b3b4b",
+  "frozenAt": "2026-09-04",
+  "auroraTip": "76537f48fbbc3cf38b15953f8df3896c20b9c729",
+  "selfhostTip": "c8e4e8b6e29906ed9369c5ad5fe0f4dcc07b3b11",
   "incidentIds": [
     "INC-20260717-HISTORY-STUCK",
     "INC-20260718-ATTACH-NOOP",
@@ -86,7 +86,13 @@
     "INC-20260902-WEB-TASKBOARD-TIMELINE-HUD",
     "INC-20260902-DELEGATE-ENGINE-BILLING-REQUESTID",
     "INC-20260829-FAIL-LOUD-ERROR-MSG",
-    "INC-20260903-CURSOR-CLI-ERROR-WASH"
+    "INC-20260903-CURSOR-CLI-ERROR-WASH",
+    "INC-20260903-OCV5-81-CODEX-INTERRUPT-BILLING",
+    "INC-20260903-OCV5-84-CRON-SUBMIT-BOUNDARY",
+    "INC-20260903-OCV5-87-RELEASE-MARKER-GATE",
+    "INC-20260903-OCV5-82-SESSION-UNAVAILABLE",
+    "INC-20260903-CCB-TOOL-PHASE-STOP-RED-CARD",
+    "INC-20260903-TURNEND-LAST-SEGMENT-FLASH"
   ],
   "incidents": {
     "INC-20260717-HISTORY-STUCK": {
@@ -228,7 +234,9 @@
     },
     "INC-20260726-ARCHIVE-CURSOR-OVERFLOW": {
       "rootFixCommit": "c5031461",
-      "coverageCommits": []
+      "coverageCommits": [
+        "eb5a0758"
+      ]
     },
     "INC-20260728-AUTODREAM-USAGE-SIDEBAND": {
       "rootFixCommit": "506874f2",
@@ -458,15 +466,17 @@
     },
     "INC-20260828-CCB-PROMPT-TOO-LONG": {
       "rootFixCommit": "0633e7a7",
-      "coverageCommits": []
+      "coverageCommits": [
+        "5ca165fc"
+      ]
     },
     "INC-20260829-CUTOVER-SURVIVOR-STALE-WD": {
       "rootFixCommit": "2190563c",
-      "coverageCommits": null
+      "coverageCommits": []
     },
     "INC-20260831-TURNEND-ORDER-COLLAPSE": {
       "rootFixCommit": "46380d50",
-      "coverageCommits": null
+      "coverageCommits": []
     },
     "INC-20260831-CURSOR-MCP-DELEGATE-CONTEXT": {
       "rootFixCommit": "1bfa85be",
@@ -537,7 +547,8 @@
       "coverageCommits": [
         "51674b8c",
         "226edfac",
-        "d18bd587"
+        "d18bd587",
+        "0d6a19ea"
       ]
     },
     "INC-20260902-DELEGATE-ENGINE-BILLING-REQUESTID": {
@@ -558,7 +569,31 @@
       ]
     },
     "INC-20260903-CURSOR-CLI-ERROR-WASH": {
-      "rootFixCommit": "de8aed4cf",
+      "rootFixCommit": "de8aed4c",
+      "coverageCommits": []
+    },
+    "INC-20260903-OCV5-81-CODEX-INTERRUPT-BILLING": {
+      "rootFixCommit": "ad72b788",
+      "coverageCommits": []
+    },
+    "INC-20260903-OCV5-84-CRON-SUBMIT-BOUNDARY": {
+      "rootFixCommit": "960a640f",
+      "coverageCommits": []
+    },
+    "INC-20260903-OCV5-87-RELEASE-MARKER-GATE": {
+      "rootFixCommit": "8d2b5211",
+      "coverageCommits": []
+    },
+    "INC-20260903-OCV5-82-SESSION-UNAVAILABLE": {
+      "rootFixCommit": "82bfb777",
+      "coverageCommits": []
+    },
+    "INC-20260903-CCB-TOOL-PHASE-STOP-RED-CARD": {
+      "rootFixCommit": "ae967d03",
+      "coverageCommits": []
+    },
+    "INC-20260903-TURNEND-LAST-SEGMENT-FLASH": {
+      "rootFixCommit": "ab3f5c20",
       "coverageCommits": []
     }
   },
@@ -573,7 +608,8 @@
     "e9496b17426877f5163cdbb37ffaa3d4b255bff9",
     "58ae730303f3ad11d56e15fea49270256ee0c6e8",
     "ce6b91692c8b87a59be81e50fdc145e0da045ace",
-    "7a5617aaa50f06d13d2b9da8ec8d3d2e4a5d2a25"
+    "7a5617aaa50f06d13d2b9da8ec8d3d2e4a5d2a25",
+    "c8e4e8b6e29906ed9369c5ad5fe0f4dcc07b3b11"
   ],
   "historicallyPresentIds": [
     "INC-20260827-PHASE-B-DEFER-VANISH"

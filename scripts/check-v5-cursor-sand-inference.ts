@@ -86,4 +86,16 @@ assert.match(frames, /CursorStablePoolIdentity/)
 assert.match(commercialDeploy, /check-v5-cursor-sand-inference\.ts/)
 assert.match(selfhostRelease, /check-v5-cursor-sand-inference\.ts/)
 
+// INC-20260903-CURSOR-CLI-ERROR-WASH: finish() must keep sanitized Cursor CLI error text on tape.
+// The washed literal 'Cursor CLI failed' must not come back as the ENGINE_ERROR detail; the
+// redacted first-line summary goes through cursorCliErrorSanitize and the raw is only warn-logged.
+const sanitizer = readFileSync(resolve(root, 'packages/gateway/src/engine/cursorCliErrorSanitize.ts'), 'utf8')
+const sanitizerTests = readFileSync(resolve(root, 'packages/gateway/src/__tests__/cursorCliErrorSanitize.test.ts'), 'utf8')
+assert.match(registry, /formatCursorCliFailureDetail\(detail\)/)
+assert.match(registry, /error: formatCursorCliFailureLog\(detail\)/)
+assert.doesNotMatch(registry, /: 'Cursor CLI failed'/)
+assert.match(sanitizer, /export const CURSOR_CLI_FAILURE_DETAIL_MAX = 200/)
+assert.match(sanitizer, /export const CURSOR_CLI_FAILURE_LOG_MAX = 2000/)
+assert.match(sanitizerTests, /keeps the first-line Sand root cause under the tape cap/)
+
 console.log('[cursor-sand-inference] PASS — Sand keys use InferenceService with native tool schemas; native Cursor stays isolated to native keys and Auto')
