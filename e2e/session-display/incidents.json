@@ -2701,6 +2701,25 @@
           "assertion": "requiredMigrations mismatch; expected="
         }
       ]
+    },
+    {
+      "id": "INC-20260903-OCV5-81-CODEX-INTERRUPT-BILLING",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "Codex interrupt() 为撤销 InlinePush 资格提前清空 active turn，导致 interrupted 终态的 partial token usage 被当前-turn billing 守卫抑制，已发生的调用没有进入结算侧信道。",
+      "rootFixCommit": "ad72b788",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "interrupt:活跃 turn → turn/interrupt 请求;interrupted 终态仍带 usage billing"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
+          "assertion": "Codex 已产出可见内容后强制停止必须恰好结算一笔 partial usage"
+        }
+      ]
     }
   ]
 }
