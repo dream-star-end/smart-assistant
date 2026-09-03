@@ -160,6 +160,7 @@ import {
   getUsageSummary,
   queryEvents,
   listClientSessions,
+  classifyClientSessions,
   getClientSession,
   getClientSessionPartial,
   readArchivedMessages,
@@ -2008,6 +2009,19 @@ function resolveMemberDelegationsPerTurn(): number {
 function resolveHiddenDelegationsPerTurn(): number {
   const raw = Number(process.env.OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN)
   return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : MAX_HIDDEN_DELEGATIONS_PER_TURN
+}
+
+/**
+ * Existence/ownership probe that never hydrates turn tapes. `getClientSession`
+ * (exact view) materializes every tape payload of the session — hundreds of
+ * MB on long sessions — which is what pushed the inflight-delegates poll and
+ * cron/delegate callback lookups into the 30s PG statement budget
+ * (OCV5-94). One indexed `client_sessions` row is enough to answer
+ * "does this active session belong to this user".
+ */
+async function clientSessionIsActive(sessionId: string, userId: string): Promise<boolean> {
+  const [state] = await classifyClientSessions([{ sessionId, userId }])
+  return state?.state === 'active'
 }
 
 /** 「每 turn、按父会话」的委派计数器 —— 一套通用机制,当前服务两条策略:
@@ -5384,7 +5398,8 @@ export class Gateway {
         userId,
         enabled,
         searchParams: url.searchParams,
-        loadSession: (id, uid) => getClientSession(id, uid),
+        loadSession: async (id, uid) =>
+          (await clientSessionIsActive(id, uid)) ? { id, userId: uid } : null,
         store: enabled ? this._ensureDelegateInflightSurface() : null,
         overlayJobs: () => this._delegateJobs?.listNonTerminal() ?? [],
         resolveJob: (jobId) => this._delegateJobs?.snapshotOf(jobId),
@@ -13834,7 +13849,7 @@ export class Gateway {
       'default'
     let existing
     try {
-      existing = await getClientSession(origin.peerId, userId)
+      existing = await clientSessionIsActive(origin.peerId, userId)
     } catch (err) {
       this.log.warn('origin-session lookup failed', { jobId: job.id }, err as Error)
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_LOOKUP_FAILED' }
@@ -14205,7 +14220,7 @@ export class Gateway {
       return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
     }
     try {
-      const existing = await getClientSession(args.origin.peerId, args.userId)
+      const existing = await clientSessionIsActive(args.origin.peerId, args.userId)
       if (existing) {
         const persisted = await appendServerAuthoredMessage(args.origin.peerId, args.userId, {
           id: args.clientMessageId,
@@ -14402,7 +14417,7 @@ export class Gateway {
       return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
     }
     try {
-      const existing = await getClientSession(args.origin.peerId, args.userId)
+      const existing = await clientSessionIsActive(args.origin.peerId, args.userId)
       if (existing) {
         const persisted = await appendServerAuthoredMessage(args.origin.peerId, args.userId, {
           id: args.clientMessageId,

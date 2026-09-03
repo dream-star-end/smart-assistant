@@ -273,6 +273,115 @@ function bigIntNumOrNull(v: unknown): number | null {
 // ── withTx:BEGIN/COMMIT/ROLLBACK 包装(RFC D3)────────────────────────────────
 // 每个写方法 = 一个事务(与 SQLite db.transaction 边界一一对应)。fn 收 client,fn 抛出 →
 // ROLLBACK 并透传;正常返回 → COMMIT。client 用完必还回池(release)。
+/**
+ * OCV5-94 — automatic-recovery reconcile must not re-read whole tapes.
+ *
+ * `reconcileAutomaticRecoveryJobs` runs every 30s per connected user and used
+ * to `SELECT payload … ORDER BY ordinal` for every finalized crashed/interrupted
+ * tape without a recovery job, only to discover (again) that the turn is not
+ * recoverable. On this instance that was 94 tapes / 364MB per sweep, the main
+ * source of PG statement timeouts and buffer-cache eviction behind the
+ * "系统暂时不可用" cards. Finalized tapes are immutable, so a negative verdict is
+ * stable: remember it and answer the cheap questions first (terminal assistant
+ * error code, latest hot user row) before touching the full payload. Verdicts
+ * that depend only on the immutable tape are kept for hours; verdicts that
+ * depend on the mutable hot session row (or on the full scheduler run) are
+ * kept for minutes so a rollback/new turn can still be picked up.
+ */
+const AUTOMATIC_RECOVERY_RECONCILE_SKIP_MAX = 8192;
+const AUTOMATIC_RECOVERY_RECONCILE_SKIP_TERMINAL_TTL_MS = 6 * 60 * 60 * 1000;
+const AUTOMATIC_RECOVERY_RECONCILE_SKIP_TRANSIENT_TTL_MS = 10 * 60 * 1000;
+const automaticRecoveryReconcileSkips = new Map<string, number>();
+
+function automaticRecoveryReconcileSkipKey(
+  sessionUserId: string,
+  sessionId: string,
+  tapeId: string,
+): string {
+  return `${sessionUserId}\0${sessionId}\0${tapeId}`;
+}
+
+function automaticRecoveryReconcileSkipped(key: string, now = Date.now()): boolean {
+  const until = automaticRecoveryReconcileSkips.get(key);
+  if (until === undefined) return false;
+  if (until > now) return true;
+  automaticRecoveryReconcileSkips.delete(key);
+  return false;
+}
+
+function rememberAutomaticRecoveryReconcileSkip(key: string, ttlMs: number): void {
+  if (automaticRecoveryReconcileSkips.size >= AUTOMATIC_RECOVERY_RECONCILE_SKIP_MAX) {
+    const oldest = automaticRecoveryReconcileSkips.keys().next();
+    if (!oldest.done) automaticRecoveryReconcileSkips.delete(oldest.value);
+  }
+  automaticRecoveryReconcileSkips.delete(key);
+  automaticRecoveryReconcileSkips.set(key, Date.now() + ttlMs);
+}
+
+/** Test seam: forget every remembered negative reconcile verdict. */
+export function _resetAutomaticRecoveryReconcileSkipsForTest(): void {
+  automaticRecoveryReconcileSkips.clear();
+}
+
+/**
+ * Cheap pre-check mirroring the hard exits of
+ * `scheduleAutomaticRecoveryForFinalizedTurn` that do not need the tape body:
+ *   - "terminal": the verdict can never change for this finalized tape
+ *     (malformed client_message_id, or the terminal assistant record's error
+ *     code does not support automatic recovery — one indexed row, assistant
+ *     records are small);
+ *   - "transient": the latest hot user row is not this turn's client message
+ *     (can flip after a rollback, so it is remembered only briefly);
+ *   - "pass": fall through to the full read + scheduler.
+ * The caller still runs `settleFinalizedTurnControls` once on a non-pass
+ * verdict, so no durable settlement depends on the full read.
+ */
+async function automaticRecoveryCandidateCheapVerdict(
+  pool: Pool,
+  sessionUserId: string,
+  candidate: { session_id: string; tape_id: string; client_message_id: string },
+): Promise<"pass" | "terminal" | "transient"> {
+  if (!isClientMessageId(candidate.client_message_id)) return "terminal";
+  const terminal = (
+    await pool.query<{ payload: Buffer }>(
+      `SELECT payload FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND role='assistant'
+        ORDER BY ordinal DESC
+        LIMIT 1`,
+      [candidate.session_id, sessionUserId, candidate.tape_id],
+    )
+  ).rows[0];
+  let errorCode = "";
+  if (terminal) {
+    try {
+      const parsed = JSON.parse(Buffer.from(terminal.payload).toString("utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "terminal";
+      errorCode = terminalTurnRecordErrorCode([parsed]);
+    } catch {
+      return "terminal";
+    }
+  }
+  if (!supportsAutomaticTurnRecovery(errorCode)) return "terminal";
+  const session = (
+    await pool.query<{ messages: string }>(
+      `SELECT messages FROM client_sessions
+        WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+      [candidate.session_id, sessionUserId],
+    )
+  ).rows[0];
+  if (!session) return "transient";
+  let latestUser: MessageLike | undefined;
+  try {
+    const parsed = JSON.parse(session.messages);
+    if (!Array.isArray(parsed)) return "transient";
+    latestUser = [...(parsed as MessageLike[])].reverse()
+      .find((message) => message?.role === "user");
+  } catch {
+    return "transient";
+  }
+  return latestUser && latestUser.id === candidate.client_message_id ? "pass" : "transient";
+}
+
 async function withTx<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   let destroyed = false;
@@ -1816,6 +1925,46 @@ async function appendRecoveryGiveUpTerminalCard(
   });
 }
 
+/**
+ * Durable settlement that a finalized tape proves for its turn, independent of
+ * whether the turn is recoverable: stop controls are terminal, tool prompts can
+ * no longer be answered, and the recovery job that produced this turn (if any)
+ * reached its outcome. Idempotent; runs from finalize and from the reconcile
+ * sweep (OCV5-94: also on the cheap "not recoverable" exit, so skipping the
+ * full tape read never starves these updates).
+ */
+async function settleFinalizedTurnControls(
+  client: PoolClient,
+  input: {
+    uid: bigint;
+    sessionId: string;
+    clientMessageId: string;
+    outcome: "completed" | "interrupted" | "crashed";
+  },
+): Promise<void> {
+  await settleStopControlsForTurn(client, {
+    userId: input.uid,
+    sessionId: input.sessionId,
+    clientMessageId: input.clientMessageId,
+  });
+  // INC-20260903-PENDING-PERMISSION-ZOMBIE — the final tape proves the runtime
+  // is no longer waiting on any tool prompt of this turn (the tool either got
+  // its answer or was aborted). Close leftover pending rows so hello replay
+  // never resurrects them. Detached ask_user rows are exempt inside.
+  await cancelPendingPermissionPromptsForTurn(client, {
+    userId: input.uid,
+    sessionId: input.sessionId,
+    clientMessageId: input.clientMessageId,
+    reason: "turn_finalized",
+  });
+  await settleRecoveryJobForTape(client, {
+    userId: input.uid,
+    sessionId: input.sessionId,
+    clientMessageId: input.clientMessageId,
+    outcome: input.outcome,
+  });
+}
+
 async function scheduleAutomaticRecoveryForFinalizedTurn(
   client: PoolClient,
   input: {
@@ -1842,24 +1991,8 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   const clientMessageId = input.clientMessageId;
   if (!clientMessageId || !isClientMessageId(clientMessageId)) return;
 
-  await settleStopControlsForTurn(client, {
-    userId: input.uid,
-    sessionId: input.sessionId,
-    clientMessageId,
-  });
-  // INC-20260903-PENDING-PERMISSION-ZOMBIE — the final tape proves the runtime
-  // is no longer waiting on any tool prompt of this turn (the tool either got
-  // its answer or was aborted). Close leftover pending rows so hello replay
-  // never resurrects them. Detached ask_user rows are exempt inside.
-  await cancelPendingPermissionPromptsForTurn(client, {
-    userId: input.uid,
-    sessionId: input.sessionId,
-    clientMessageId,
-    reason: "turn_finalized",
-  });
-
-  await settleRecoveryJobForTape(client, {
-    userId: input.uid,
+  await settleFinalizedTurnControls(client, {
+    uid: input.uid,
     sessionId: input.sessionId,
     clientMessageId,
     outcome: input.turn.payload.status,
@@ -8334,6 +8467,31 @@ export function createPgSessionsBackend(
       );
       let scheduled = 0;
       for (const candidate of candidates.rows) {
+        const skipKey = automaticRecoveryReconcileSkipKey(
+          sessionUserId,
+          candidate.session_id,
+          candidate.tape_id,
+        );
+        if (automaticRecoveryReconcileSkipped(skipKey)) continue;
+        const verdict = await automaticRecoveryCandidateCheapVerdict(pool, sessionUserId, candidate);
+        if (verdict !== "pass") {
+          if (isClientMessageId(candidate.client_message_id)) {
+            await withTx(pool, (client) =>
+              settleFinalizedTurnControls(client, {
+                uid: userId,
+                sessionId: candidate.session_id,
+                clientMessageId: candidate.client_message_id,
+                outcome: candidate.status,
+              }));
+          }
+          rememberAutomaticRecoveryReconcileSkip(
+            skipKey,
+            verdict === "terminal"
+              ? AUTOMATIC_RECOVERY_RECONCILE_SKIP_TERMINAL_TTL_MS
+              : AUTOMATIC_RECOVERY_RECONCILE_SKIP_TRANSIENT_TTL_MS,
+          );
+          continue;
+        }
         const inserted = await withTx(pool, async (client): Promise<boolean> => {
           const tape = (
             await client.query<typeof candidate & { finalized_at: string | null }>(
@@ -8409,6 +8567,12 @@ export function createPgSessionsBackend(
           return (exists.rowCount ?? 0) === 1;
         });
         if (inserted) scheduled++;
+        else {
+          rememberAutomaticRecoveryReconcileSkip(
+            skipKey,
+            AUTOMATIC_RECOVERY_RECONCILE_SKIP_TRANSIENT_TTL_MS,
+          );
+        }
       }
       return scheduled;
     },
