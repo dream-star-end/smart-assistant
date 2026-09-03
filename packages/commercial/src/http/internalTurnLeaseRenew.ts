@@ -151,17 +151,40 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
           FOR UPDATE`,
         [identity.userId, identity.containerId, lease.authorityTurnId],
       )
+      // Lease-only engines (Cursor Sand) never send main-model traffic through
+      // the egress proxy, so no request_finalize_journal row exists for the
+      // turn. The bridge binds the minted authorityTurnId to the durable
+      // dispatch instead; an open (non-terminal) dispatch binding is therefore
+      // equally valid proof that the turn is still active.
+      let evidenceSource: 'journal' | 'dispatch' = 'journal'
+      let dispatchStartedAt: number | null = null
       if (!evidence.rowCount) {
-        await client.query('ROLLBACK')
-        sendJson(res, 409, {
-          error: { code: 'TURN_NOT_ACTIVE', message: 'active turn evidence not found' },
-        })
-        return
+        const dispatchEvidence = await client.query<{ created_at_ms: string }>(
+          `SELECT FLOOR(EXTRACT(EPOCH FROM atd.created_at) * 1000)::bigint::text AS created_at_ms
+             FROM authority_turn_dispatches atd
+             JOIN turn_dispatches td ON td.dispatch_id = atd.dispatch_id
+            WHERE atd.authority_turn_id=$1 AND atd.user_id=$2
+              AND td.status IN ('admitted','accepted')
+              AND td.terminal_at IS NULL
+              AND atd.created_at >= NOW() - INTERVAL '13 hours'
+            FOR UPDATE OF td`,
+          [lease.authorityTurnId, identity.userId],
+        )
+        if (!dispatchEvidence.rowCount) {
+          await client.query('ROLLBACK')
+          sendJson(res, 409, {
+            error: { code: 'TURN_NOT_ACTIVE', message: 'active turn evidence not found' },
+          })
+          return
+        }
+        evidenceSource = 'dispatch'
+        dispatchStartedAt = Number(dispatchEvidence.rows[0]!.created_at_ms)
       }
 
-      const evidenceStartedAt = Math.min(
-        ...evidence.rows.map((row) => Number(row.created_at_ms)),
-      )
+      const evidenceStartedAt =
+        dispatchStartedAt !== null
+          ? dispatchStartedAt
+          : Math.min(...evidence.rows.map((row) => Number(row.created_at_ms)))
       if (!Number.isSafeInteger(evidenceStartedAt)) {
         await client.query('ROLLBACK')
         sendJson(res, 409, {
@@ -192,9 +215,12 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
       // the gateway derives its lossless key), so the first authenticated
       // renewal binds that one still-inflight row exactly once. Thereafter a
       // different key is rejected rather than creating a second billing lane.
-      const conflicting = evidence.rows.some(
-        (row) => row.turn_key !== null && row.turn_key !== raw.turnKey,
-      )
+      // Dispatch-bound evidence carries no turnKey (the dispatch row is the
+      // billing anchor), so the journal key binding below only applies to
+      // journal evidence.
+      const conflicting =
+        evidenceSource === 'journal'
+        && evidence.rows.some((row) => row.turn_key !== null && row.turn_key !== raw.turnKey)
       if (conflicting) {
         await client.query('ROLLBACK')
         sendJson(res, 409, {
@@ -202,7 +228,7 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
         })
         return
       }
-      if (!evidence.rows.some((row) => row.turn_key === raw.turnKey)) {
+      if (evidenceSource === 'journal' && !evidence.rows.some((row) => row.turn_key === raw.turnKey)) {
         const bindable = evidence.rows.filter(
           (row) =>
             row.turn_key === null && row.state === 'inflight' && row.source === 'codex_bridge',
@@ -259,6 +285,7 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
         containerId: identity.containerId,
         turnKey: raw.turnKey,
         authorityTurnId: lease.authorityTurnId,
+        evidence: evidenceSource,
         expiresAt,
       })
       sendJson(res, 200, { ok: true, lease: envelope, expiresAt })

@@ -86,6 +86,8 @@ function fakePool(
     evidenceState?: string
     evidenceSource?: string
     evidenceCreatedAtMs?: number
+    dispatchEvidence?: boolean
+    dispatchCreatedAtMs?: number
     epoch?: bigint
   } = {},
 ): { pool: Pool; sql: Array<{ text: string; params: readonly unknown[] }> } {
@@ -119,6 +121,13 @@ function fakePool(
                 },
               ]
             : [],
+        }
+      }
+      if (/FROM authority_turn_dispatches atd JOIN turn_dispatches td/.test(text)) {
+        const found = opts.dispatchEvidence ?? false
+        return {
+          rowCount: found ? 1 : 0,
+          rows: found ? [{ created_at_ms: String(opts.dispatchCreatedAtMs ?? ORIGINAL) }] : [],
         }
       }
       if (/UPDATE request_finalize_journal/.test(text)) {
@@ -242,6 +251,54 @@ describe('internal turn-lease renewal', () => {
     const bind = db.sql.find((q) => /UPDATE request_finalize_journal/.test(q.text))
     assert.deepEqual(bind?.params, ['renew-journal-1', TURN_KEY])
     assert.ok(bind?.text.includes("ctx->>'turnKey' IS NULL"))
+  })
+
+  test('lease-only cursor turn renews from an open dispatch binding when the journal is empty', async () => {
+    const signer = AuthoritySigner.createEphemeral()
+    const initial = mint(signer)
+    const db = fakePool({ evidence: false, dispatchEvidence: true })
+    const now = ORIGINAL + 30 * 60_000
+    const handler = makeTurnLeaseRenewHandler({
+      identityRepo: identityRepo(),
+      pgPool: db.pool,
+      getSigner: () => signer,
+      now: () => now,
+    })
+
+    const res = await run(handler, { turnKey: TURN_KEY, lease: initial.bundle.lease })
+    assert.equal(res.statusCode, 200)
+    const renewed = verifyTurnLease(res.json().lease, signer.publicKeyring(), now)
+    assert.equal(renewed.authorityTurnId, initial.lease.authorityTurnId)
+    assert.equal(renewed.expiresAt, now + TURN_LEASE_TTL_MS)
+    const dispatch = db.sql.find((q) => /FROM authority_turn_dispatches/.test(q.text))
+    assert.deepEqual(dispatch?.params, [initial.lease.authorityTurnId, 42])
+    assert.ok(dispatch?.text.includes("td.status IN ('admitted','accepted')"))
+    assert.ok(dispatch?.text.includes('td.terminal_at IS NULL'))
+    // no journal turnKey binding is attempted for dispatch-anchored evidence
+    assert.equal(db.sql.some((q) => /UPDATE request_finalize_journal/.test(q.text)), false)
+    assert.equal(db.sql.at(-1)?.text, 'COMMIT')
+  })
+
+  test('dispatch-anchored 12h deadline still caps and rejects lease-only renewals', async () => {
+    const signer = AuthoritySigner.createEphemeral()
+    const initial = mint(signer)
+    const late = signer.signTurnLease({
+      ...initial.lease,
+      issuedAt: ORIGINAL + AUTHORITY_TURN_MAX_LIFETIME_MS - 60_000,
+      expiresAt: ORIGINAL + AUTHORITY_TURN_MAX_LIFETIME_MS + TURN_LEASE_TTL_MS,
+    })
+    const db = fakePool({ evidence: false, dispatchEvidence: true, dispatchCreatedAtMs: ORIGINAL })
+    const handler = makeTurnLeaseRenewHandler({
+      identityRepo: identityRepo(),
+      pgPool: db.pool,
+      getSigner: () => signer,
+      now: () => ORIGINAL + AUTHORITY_TURN_MAX_LIFETIME_MS,
+    })
+
+    const res = await run(handler, { turnKey: TURN_KEY, lease: late })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'TURN_LIFETIME_EXCEEDED')
+    assert.equal(db.sql.at(-1)?.text, 'ROLLBACK')
   })
 
   test('a previously bound authority turn rejects a different billing turn key', async () => {

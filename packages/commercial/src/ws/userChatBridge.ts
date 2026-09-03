@@ -5695,6 +5695,36 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 return;
               }
             }
+            // Cursor Sand main-model traffic never reaches the anthropic egress
+            // proxy, so no request_finalize_journal evidence is ever written for
+            // this turn. Bind the minted authorityTurnId to the durable dispatch
+            // (same as the CCB path) so rolling lease renewal can prove the turn
+            // is still open; otherwise the 50 min lease silently expires and the
+            // sub-agent passthrough starts failing with 403 MODEL_AUTHORITY_INVALID.
+            const cursorAuthorityTurnId = authorityExec === null ? undefined : authorityDeps!.signer.mintAuthorityTurnId();
+            if (cursorAuthorityTurnId !== undefined && dispatchRecord !== undefined) {
+              try {
+                await bindAuthorityTurnDispatch(deps.pgPool, {
+                  authorityTurnId: cursorAuthorityTurnId,
+                  dispatchId: dispatchRecord.dispatchId,
+                  userId: uid,
+                  sessionId: dispatchRecord.sessionId,
+                  dispatchModel: typeof enriched.model === 'string' ? enriched.model : null,
+                  canonicalModel: authorityExec!.canonicalModel,
+                  attemptNo: dispatchRecord.attemptNo,
+                  ownerId: dispatchRecord.leaseOwnerId,
+                  leaseEpoch: dispatchRecord.leaseEpoch,
+                });
+              } catch (err) {
+                logCapture?.error('user-chat-bridge: cursor authority turn dispatch binding failed', { err, dispatchId: dispatchRecord.dispatchId });
+                rejectPromptQueueDispatch('DURABLE_DISPATCH_UNAVAILABLE');
+                failDispatchPreForward(dispatchRecord, 'authority_turn_dispatch_unavailable');
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(userWs, 'DURABLE_DISPATCH_UNAVAILABLE', 'durable dispatch attribution unavailable, retry this turn shortly', cursorTurnIdentity);
+                }
+                return;
+              }
+            }
             const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
             await deps.pgPool.query(
               `INSERT INTO cursor_external_usage_audit(request_id,user_id,container_id,session_id,model_id,status)
@@ -5703,7 +5733,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             );
             let authorityFields: Record<string, unknown> = {};
             if (authorityExec !== null) {
-              const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch, turn: cursorTurnIdentity });
+              const sealed = await sealAuthorityFieldsOrReject({
+                exec: authorityExec,
+                billingRequestId: requestId,
+                ...(cursorAuthorityTurnId === undefined ? {} : { authorityTurnId: cursorAuthorityTurnId }),
+                log: logCapture,
+                onReject: rejectPromptQueueDispatch,
+                turn: cursorTurnIdentity,
+              });
               if (sealed === null) { failDispatchPreForward(dispatchRecord, 'cursor_authority_seal_rejected'); return; }
               authorityFields = sealed;
             }

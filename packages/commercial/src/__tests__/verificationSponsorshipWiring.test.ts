@@ -20,6 +20,29 @@ describe("V5 release verification wiring", () => {
     assert.match(source.slice(seal, seal + 900), /authorityTurnId/);
   });
 
+  test("Cursor bridge persists the freshly minted turn id before sealing the same id", () => {
+    const source = read("packages/commercial/src/ws/userChatBridge.ts");
+    const cursor = source.indexOf("failDispatchPreForward(dispatchRecord, 'cursor_authority_rejected')");
+    const mint = source.indexOf("signer.mintAuthorityTurnId()", cursor);
+    const admit = source.indexOf("bindAuthorityTurnDispatch", mint);
+    const seal = source.indexOf("sealAuthorityFieldsOrReject", admit);
+    assert.ok(cursor >= 0 && cursor < mint && mint < admit && admit < seal);
+    const bindingBlock = source.slice(admit, seal);
+    assert.match(bindingBlock, /authorityTurnId: cursorAuthorityTurnId/);
+    assert.match(bindingBlock, /rejectPromptQueueDispatch\('DURABLE_DISPATCH_UNAVAILABLE'\)/);
+    assert.match(source.slice(seal, seal + 400), /authorityTurnId: cursorAuthorityTurnId/);
+  });
+
+  test("lease-only renewal accepts an open dispatch binding when the journal has no evidence", () => {
+    const source = read("packages/commercial/src/http/internalTurnLeaseRenew.ts");
+    const journal = source.indexOf("FROM request_finalize_journal");
+    const dispatch = source.indexOf("FROM authority_turn_dispatches atd", journal);
+    assert.ok(journal >= 0 && journal < dispatch);
+    const block = source.slice(dispatch, dispatch + 600);
+    assert.match(block, /td\.status IN \('admitted','accepted'\)/);
+    assert.match(block, /td\.terminal_at IS NULL/);
+  });
+
   test("lease-only proxy restores both sponsorship and exact dispatch identity", () => {
     const source = read("packages/commercial/src/http/proxy/index.ts");
     const lease = source.indexOf("const leaseAdmission = await resolveAuthorityTurnDispatchSponsorship");
