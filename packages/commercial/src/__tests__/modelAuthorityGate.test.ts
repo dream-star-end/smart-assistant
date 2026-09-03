@@ -23,6 +23,7 @@ import { describe, test } from "node:test";
 
 import {
   AUTHORITY_HEADER as GW_AUTHORITY_HEADER,
+  DEFAULT_CCB_SUBAGENT_MODEL,
   DEFAULT_SECONDARY_UTILITY_MODEL,
   LOCAL_CATALOG_HEADER as GW_LOCAL_CATALOG_HEADER,
   LOCAL_CATALOG_KIND as GW_LOCAL_CATALOG_KIND,
@@ -113,7 +114,7 @@ const SOL = entry({
 });
 const DISABLED = entry({ entryId: 3, modelId: "glm-5.1", state: "disabled" });
 /**
- * 平台次级模型(PLATFORM_AUX_MODEL_IDS 的唯一成员;权威源 = gateway
+ * 平台次级模型(PLATFORM_AUX_MODEL_IDS 的首位成员;权威源 = gateway
  * DEFAULT_SECONDARY_UTILITY_MODEL,即容器 ANTHROPIC_SMALL_FAST_MODEL 的实际取值)。
  * 故意给它**不同的 provider + 不同的价格**:据此断言 aux 请求按自己的行路由/计费,
  * 而不是被主模型的 descriptor 顶替。
@@ -124,10 +125,21 @@ const FLASH = entry({
   providerId: "deepseek",
   contextWindow: 1_000_000,
 });
+/**
+ * PLATFORM_AUX_MODEL_IDS 的第二位成员(2026-09-03):CCB 内置 Agent 子 agent 的默认钉
+ * (gateway DEFAULT_CCB_SUBAGENT_MODEL,即容器 CLAUDE_CODE_SUBAGENT_MODEL 的实际取值)。
+ * platformAuxModels() 对集合成员 fail-closed,所以每个快照都必须带这一行。
+ */
+const ZAI = entry({
+  entryId: 5,
+  modelId: DEFAULT_CCB_SUBAGENT_MODEL,
+  providerId: "zai",
+  contextWindow: 200_000,
+});
 
 function snap(epoch = EPOCH, over: { entries?: ModelCatalogEntry[] } = {}): ModelCatalogSnapshot {
   return new ModelCatalogSnapshot({
-    entries: over.entries ?? [GLM, SOL, DISABLED, FLASH],
+    entries: over.entries ?? [GLM, SOL, DISABLED, FLASH, ZAI],
     aliases: new Map([["glm-latest", 1]]),
     pricing: new Map(
       [
@@ -140,6 +152,7 @@ function snap(epoch = EPOCH, over: { entries?: ModelCatalogEntry[] } = {}): Mode
           outputPerMtok: 202n,
           cacheReadPerMtok: 3n,
         }),
+        price(DEFAULT_CCB_SUBAGENT_MODEL),
       ].map((p) => [p.modelId, p]),
     ),
     securityEpoch: epoch,
@@ -153,7 +166,7 @@ function snap(epoch = EPOCH, over: { entries?: ModelCatalogEntry[] } = {}): Mode
 function snapWithAdminModel(epoch = EPOCH): ModelCatalogSnapshot {
   const HAIKU = entry({ entryId: 9, modelId: "claude-haiku-4-5", providerId: null });
   return new ModelCatalogSnapshot({
-    entries: [GLM, SOL, DISABLED, FLASH, HAIKU],
+    entries: [GLM, SOL, DISABLED, FLASH, ZAI, HAIKU],
     aliases: new Map([["glm-latest", 1]]),
     pricing: new Map(
       [
@@ -161,6 +174,7 @@ function snapWithAdminModel(epoch = EPOCH): ModelCatalogSnapshot {
         price("gpt-5.6-sol"),
         price("glm-5.1"),
         price(DEFAULT_SECONDARY_UTILITY_MODEL),
+        price(DEFAULT_CCB_SUBAGENT_MODEL),
         price("claude-haiku-4-5", { visibility: "admin" }),
       ].map((p) => [p.modelId, p]),
     ),
@@ -589,6 +603,26 @@ describe("modelAuthorityGate — auxModels 次级模型", () => {
     assert.equal(d.authorityKind, "bridge_signed");
   });
 
+  test("CCB 子 agent 默认钉(CLAUDE_CODE_SUBAGENT_MODEL = glm-5.3-zai)在非同模型父 turn 下 → 放行", async () => {
+    // cursor-*/其他父模型的 turn lease 只签了主模型;子 agent 走 passthrough 打同一 egress,
+    // 其模型必须在 aux 集里,否则每次 Agent 工具调用 403(selfhost 2026-09-02 事故)。
+    const s = snap();
+    const { minted, keyring } = signerFor(s); // 主模型 glm-5.2 + aux=[deepseek-v4-flash, glm-5.3-zai]
+    assert.deepEqual(minted.payload.auxModels, [DEFAULT_SECONDARY_UTILITY_MODEL, DEFAULT_CCB_SUBAGENT_MODEL].sort());
+    const d = await enforceModelAuthority({
+      catalog: source(s),
+      keyring,
+      headers: headers({ [TURN_LEASE_HEADER]: minted.bundle.lease }),
+      uid: UID,
+      containerId: CONTAINER_ID,
+      model: DEFAULT_CCB_SUBAGENT_MODEL,
+    });
+    assert.equal(d.canonicalModel, DEFAULT_CCB_SUBAGENT_MODEL);
+    assert.equal(d.descriptor.providerId, "zai");
+    assert.equal(d.authorityKind, "bridge_signed");
+    assert.equal(d.authorityCanonicalModel, "glm-5.2");
+  });
+
   test("aux 请求按**自己的行**路由与计费,不被主模型 descriptor 顶替", async () => {
     const s = snap();
     const { minted, keyring } = signerFor(s);
@@ -659,7 +693,7 @@ describe("modelAuthorityGate — auxModels 次级模型", () => {
     const before = snap();
     const { minted, keyring } = signerFor(before);
     const after = snap(EPOCH, {
-      entries: [GLM, SOL, DISABLED, entry({ ...FLASH, state: "disabled" })],
+      entries: [GLM, SOL, DISABLED, entry({ ...FLASH, state: "disabled" }), ZAI],
     });
     await expectReject(
       enforceModelAuthority({

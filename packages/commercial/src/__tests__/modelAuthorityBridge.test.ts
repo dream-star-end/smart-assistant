@@ -32,6 +32,7 @@ import {
 
 import {
   CONTAINER_ATTEST_FRAME_TYPE as GATEWAY_ATTEST_FRAME_TYPE,
+  DEFAULT_CCB_SUBAGENT_MODEL,
   DEFAULT_SECONDARY_UTILITY_MODEL,
   GATEWAY_CAPABILITY_SCHEMA_VERSION,
   ModelAuthorityConsumer,
@@ -139,10 +140,21 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
       },
     }),
   );
+  // CCB 子 agent 默认钉(glm-5.3-zai)是平台 aux 集第二成员;platformAuxModels 对所有声明
+  // 成员 fail-closed,所以夹具必须常驻它 —— 用 auxState 只演练首位成员(deepseek)的缺失/禁用。
+  entries.push(
+    entry({
+      entryId: 4,
+      modelId: DEFAULT_CCB_SUBAGENT_MODEL,
+      providerId: "zai",
+      contextWindow: 200_000,
+    }),
+  );
   const pricing = new Map([
     ["glm-5.2", price("glm-5.2")],
     ["gpt-5.6-sol", price("gpt-5.6-sol")],
     ["kimi-k3", price("kimi-k3")],
+    [DEFAULT_CCB_SUBAGENT_MODEL, price(DEFAULT_CCB_SUBAGENT_MODEL)],
   ]);
   if (auxState !== "absent") {
     entries.push(
@@ -682,9 +694,11 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     const payload = verifyAuthority(bundle.authority, keyring, Date.now());
     const lease = verifyTurnLease(bundle.lease, keyring, Date.now());
     // 权威源 = gateway DEFAULT_SECONDARY_UTILITY_MODEL(容器 ANTHROPIC_SMALL_FAST_MODEL 的实际取值)
-    assert.deepEqual([...(payload.auxModels ?? [])], [DEFAULT_SECONDARY_UTILITY_MODEL]);
+    // + DEFAULT_CCB_SUBAGENT_MODEL(容器 CLAUDE_CODE_SUBAGENT_MODEL 的默认钉);platformAuxModels 排序输出。
+    const expectedAux = [DEFAULT_SECONDARY_UTILITY_MODEL, DEFAULT_CCB_SUBAGENT_MODEL].sort();
+    assert.deepEqual([...(payload.auxModels ?? [])], expectedAux);
     // lease 必须同值:WebFetch 常发生在 turn 中段,那时只有 lease 在飞
-    assert.deepEqual([...(lease.auxModels ?? [])], [DEFAULT_SECONDARY_UTILITY_MODEL]);
+    assert.deepEqual([...(lease.auxModels ?? [])], expectedAux);
     assert.doesNotThrow(() => assertLeaseMatchesAuthority(lease, payload));
     ws.close();
   });

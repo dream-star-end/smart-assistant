@@ -70,14 +70,14 @@ const OFF = { ...MASTER_ENV } as NodeJS.ProcessEnv
 
 function row(
   model_id: string,
-  engine: 'ccb' | 'codex',
+  engine: 'ccb' | 'codex' | 'grok',
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
     model_id,
     display_name: model_id,
     engine,
-    provider_id: engine === 'codex' ? 'codex' : 'ark',
+    provider_id: engine === 'codex' ? 'codex' : engine === 'grok' ? 'grok' : 'ark',
     context_window: 200_000,
     supported_efforts: ['high'],
     supports_vision: false,
@@ -129,7 +129,9 @@ function fetcherFor(body: unknown, opts: { fail?: boolean; calls?: string[] } = 
   }) as any
 }
 
-function installCatalog(opts: { fail?: boolean; calls?: string[] } = {}): void {
+function installCatalog(
+  opts: { fail?: boolean; calls?: string[]; extraModels?: Array<Record<string, unknown>> } = {},
+): void {
   _setModelCatalogClientForTests(
     new ModelCatalogClient({
       env: MASTER_ENV,
@@ -140,6 +142,7 @@ function installCatalog(opts: { fail?: boolean; calls?: string[] } = {}): void {
             row('glm-5.2', 'ccb'),
             row('deepseek-v4-flash', 'ccb'),
             row('gpt-5.6-sol', 'codex'),
+            ...(opts.extraModels ?? []),
           ],
           projection_revision: 'proj-1',
           security_epoch: '7',
@@ -739,6 +742,177 @@ describe('⑥ cron/synthetic 的 codex 意图 → 降级为非 codex(既有语�
   })
 })
 
+// ── ⑦ delegate 默认 grok-build 优先 → mint 失败回落 glm-5.3-zai ─────────────
+
+describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落 glm-5.3-zai,显式指定不变', () => {
+  const GROK_ROWS = [row('grok-build', 'grok'), row('glm-5.3-zai', 'ccb', { provider_id: 'zai' })]
+
+  function withFlags<T>(flags: { authority: boolean; exempt: boolean }, fn: () => Promise<T>): Promise<T> {
+    const prev = process.env.OC_MODEL_AUTHORITY
+    const prevExempt = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+    if (flags.authority) process.env.OC_MODEL_AUTHORITY = '1'
+    else Reflect.deleteProperty(process.env, 'OC_MODEL_AUTHORITY')
+    if (flags.exempt) process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = '1'
+    else Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+    return fn().finally(() => {
+      restoreFlag(prev)
+      if (prevExempt === undefined) Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+      else process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = prevExempt
+    })
+  }
+
+  const okMint = async () => ({
+    ok: true as const,
+    lease: { baseUrl: 'http://grok.invalid', routeToken: 'rt-1', release: async () => {} },
+  })
+  const deniedMint = async () => ({ ok: false as const, httpStatus: 409, reason: 'subscription busy' })
+
+  test('默认(不带 model)→ 选 grok-build,runner 以 grok 引擎创建,submit 注入 grokRoute', async () => {
+    installCatalog({ extraModels: GROK_ROWS })
+    await withFlags({ authority: true, exempt: true }, async () => {
+      const gw = makeDelegateGateway()
+      gw._acquireDelegateGrokRoute = okMint
+      const r = await runDelegate(gw, 'coding-assistant', { goal: '默认子任务', sourceAgent: 'main' })
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(gw.sessions.getOrCreateCalls, 1)
+      const opts = gw.sessions.getOrCreateArgs[0]
+      assert.equal(opts.model, 'grok-build')
+      assert.equal(opts.executionAuthority?.engine, 'grok')
+      assert.equal(opts.executionAuthority?.canonicalModel, 'grok-build')
+      assert.deepEqual(gw.sessions.submitExtras[0]?.grokRoute, { baseUrl: 'http://grok.invalid', routeToken: 'rt-1' })
+      assert.equal(
+        gw._testWarns.some((w: any) => w.msg === 'delegate_grok_fallback'),
+        false,
+        'mint 成功不得记 fallback',
+      )
+    })
+  })
+
+  test('默认 + mint 失败(409)→ 不拒,同请求回落 glm-5.3-zai(ccb),记 delegate_grok_fallback,无 grokRoute', async () => {
+    installCatalog({ extraModels: GROK_ROWS })
+    await withFlags({ authority: true, exempt: true }, async () => {
+      const gw = makeDelegateGateway()
+      gw._acquireDelegateGrokRoute = deniedMint
+      const r = await runDelegate(gw, 'coding-assistant', { goal: '默认子任务', sourceAgent: 'main' })
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(gw.sessions.getOrCreateCalls, 1, '回落仍只创建一次 runner')
+      const opts = gw.sessions.getOrCreateArgs[0]
+      assert.equal(opts.model, 'glm-5.3-zai')
+      assert.equal(opts.agent?.model, 'glm-5.3-zai', 'execAgent 同步改成回落模型')
+      assert.equal(opts.executionAuthority?.engine, 'ccb')
+      assert.equal(opts.executionAuthority?.canonicalModel, 'glm-5.3-zai')
+      assert.equal(gw.sessions.submitExtras[0]?.grokRoute, undefined, '回落后不注入 grokRoute')
+      const fb = gw._testWarns.find((w: any) => w.msg === 'delegate_grok_fallback')
+      assert.ok(fb, '必须记 delegate_grok_fallback')
+      assert.equal(fb.fields?.from, 'grok-build')
+      assert.equal(fb.fields?.to, 'glm-5.3-zai')
+      assert.equal(fb.fields?.httpStatus, 409)
+      assert.equal(
+        gw._testWarns.some((w: any) => w.msg === 'delegate_grok_route_denied'),
+        false,
+        '默认路径不走硬拒日志',
+      )
+      // 名额已随正常完成释放。
+      assert.equal(gw._activeDelegations, 0)
+    })
+  })
+
+  test('显式 model: grok-build + mint 失败 → 仍硬拒 409(显式指定行为不变)', async () => {
+    installCatalog({ extraModels: GROK_ROWS })
+    await withFlags({ authority: true, exempt: true }, async () => {
+      const gw = makeDelegateGateway()
+      gw._acquireDelegateGrokRoute = deniedMint
+      const r = await runDelegate(gw, 'coding-assistant', {
+        goal: '显式 grok',
+        sourceAgent: 'main',
+        model: 'grok-build',
+      })
+      assert.equal(r.status, 409)
+      assert.match(String(r.body.error), /Grok 委派暂不可用/)
+      assert.equal(gw.sessions.getOrCreateCalls, 0)
+      assert.equal(gw._testWarns.some((w: any) => w.msg === 'delegate_grok_fallback'), false)
+      assert.ok(gw._testWarns.some((w: any) => w.msg === 'delegate_grok_route_denied'))
+      assert.equal(gw._activeDelegations, 0, '拒绝路径释放名额')
+    })
+  })
+
+  test('显式 model: glm-5.3-zai → 不碰 grok(mint 不被调用)', async () => {
+    installCatalog({ extraModels: GROK_ROWS })
+    await withFlags({ authority: true, exempt: true }, async () => {
+      const gw = makeDelegateGateway()
+      let mintCalls = 0
+      gw._acquireDelegateGrokRoute = async () => {
+        mintCalls++
+        return okMint()
+      }
+      const r = await runDelegate(gw, 'coding-assistant', {
+        goal: '显式 glm',
+        sourceAgent: 'main',
+        model: 'glm-5.3-zai',
+      })
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(mintCalls, 0)
+      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'glm-5.3-zai')
+      assert.equal(gw.sessions.getOrCreateArgs[0].executionAuthority?.engine, 'ccb')
+    })
+  })
+
+  test('引擎本地豁免未开 → 默认不选 grok-build(走 agent.model 旧梯子,mint 不被调用)', async () => {
+    installCatalog({ extraModels: GROK_ROWS })
+    await withFlags({ authority: true, exempt: false }, async () => {
+      const gw = makeDelegateGateway()
+      let mintCalls = 0
+      gw._acquireDelegateGrokRoute = async () => {
+        mintCalls++
+        return okMint()
+      }
+      const r = await runDelegate(gw, 'coding-assistant', { goal: '默认子任务', sourceAgent: 'main' })
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(mintCalls, 0)
+      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'glm-5.2')
+      assert.equal(gw.sessions.getOrCreateArgs[0].executionAuthority?.engine, 'ccb')
+    })
+  })
+
+  test('catalog 没有 grok-build 行 → 默认静默落 agent.model(不 throw、mint 不被调用)', async () => {
+    installCatalog({ extraModels: [row('glm-5.3-zai', 'ccb', { provider_id: 'zai' })] })
+    await withFlags({ authority: true, exempt: true }, async () => {
+      const gw = makeDelegateGateway()
+      let mintCalls = 0
+      gw._acquireDelegateGrokRoute = async () => {
+        mintCalls++
+        return okMint()
+      }
+      const r = await runDelegate(gw, 'coding-assistant', { goal: '默认子任务', sourceAgent: 'main' })
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(mintCalls, 0)
+      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'glm-5.2')
+    })
+  })
+
+  test('decideLocalExecution:preferredModels 排在 agent.model 之前,但不可路由时静默跳过', () => {
+    const v = view([row('glm-5.2', 'ccb'), row('grok-build', 'grok')])
+    const exempt = { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' } as NodeJS.ProcessEnv
+    const d = decideLocalExecution({
+      view: v,
+      agent: { id: 'x', model: 'glm-5.2' },
+      kind: 'turn',
+      env: exempt,
+      preferredModels: ['grok-build'],
+    })
+    assert.equal(d.canonicalModel, 'grok-build')
+    assert.equal(d.engine, 'grok')
+    const d2 = decideLocalExecution({
+      view: v,
+      agent: { id: 'x', model: 'glm-5.2' },
+      kind: 'turn',
+      env: exempt,
+      preferredModels: ['not-in-projection'],
+    })
+    assert.equal(d2.canonicalModel, 'glm-5.2')
+  })
+})
+
 // ── 脚手架 ───────────────────────────────────────────────────────────────────
 
 function makeConfig(): OpenClaudeConfig {
@@ -799,7 +973,16 @@ function makeDelegateGateway(): any {
     settle: async () => {},
     abandon: async () => {},
   }
-  gw.log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+  const warns: Array<{ msg: string; fields?: Record<string, unknown> }> = []
+  gw.log = {
+    debug: () => {},
+    info: () => {},
+    warn: (msg: string, fields?: Record<string, unknown>) => {
+      warns.push({ msg, fields })
+    },
+    error: () => {},
+  }
+  gw._testWarns = warns
   gw.rateLimiter = { check: () => true }
   gw.deps = {
     config: {
@@ -816,19 +999,25 @@ function makeDelegateGateway(): any {
   gw._runLog = { start: () => ({}), complete: () => {} }
   gw.sessions = {
     getOrCreateCalls: 0,
+    getOrCreateArgs: [] as Array<Record<string, any>>,
     destroySession: async () => {},
     beginClientTurn: () => {},
     endClientTurn: () => {},
     getByKey: () => undefined,
-    getOrCreate: async () => {
+    getOrCreate: async (opts: Record<string, any>) => {
       gw.sessions.getOrCreateCalls++
+      gw.sessions.getOrCreateArgs.push(opts)
       return {
         agentId: 'x',
         currentTurnStatus: null,
         runner: { interrupt: () => {}, sendPermissionResponse: () => {} },
       }
     },
-    submit: async (_s: unknown, _p: string, onEvent: (e: any) => void) => {
+    submitExtras: [] as unknown[],
+    submit: async (_s: unknown, _p: string, onEvent: (e: any) => void, ...rest: unknown[]) => {
+      // rest[5] = 第 9 个位置参数 { platformGoal, grokRoute? }(server.ts submit 调用形参:
+      // session, prompt, onEvent, effort, model, requestId, undefined, undefined, extras)。
+      gw.sessions.submitExtras.push(rest[5])
       onEvent({ kind: 'block', block: { kind: 'text', text: 'done' } })
       onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
     },

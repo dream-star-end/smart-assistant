@@ -248,12 +248,17 @@ export const DEFAULT_SECONDARY_UTILITY_MODEL = 'deepseek-v4-flash'
  *  anthropic proxy. Official CCB honors CLAUDE_CODE_SUBAGENT_MODEL above the
  *  tool-specified alias (claude-code-best/src/utils/model/agent.ts).
  *
- *  Must equal the platform aux model: egress `modelAuthorityGate` only admits
- *  `{turn lease canonical model} ∪ PLATFORM_AUX_MODEL_IDS` for a turn, and the
- *  aux set is exactly `[DEFAULT_SECONDARY_UTILITY_MODEL]`. Pinning anything else
- *  (glm-5.3-zai before 2026-09-03) made every sub-agent under a cursor-* parent
- *  403 `MODEL_AUTHORITY_INVALID` ("authority model mismatch"). */
-export const DEFAULT_CCB_SUBAGENT_MODEL = DEFAULT_SECONDARY_UTILITY_MODEL
+ *  Must be a member of the platform aux set: egress `modelAuthorityGate` only
+ *  admits `{turn lease canonical model} ∪ PLATFORM_AUX_MODEL_IDS` for a turn,
+ *  and that set is `[DEFAULT_SECONDARY_UTILITY_MODEL, DEFAULT_CCB_SUBAGENT_MODEL]`
+ *  (commercial/billing/modelCatalog.ts imports both constants). Pinning a model
+ *  outside the set (glm-5.3-zai before it was added on 2026-09-03) made every
+ *  sub-agent under a cursor-* parent 403 `MODEL_AUTHORITY_INVALID`.
+ *
+ *  2026-09-03: sub-tasks default to grok-build (platform delegate_task) with
+ *  glm-5.3-zai as the fallback; CCB Agent sub-agents cannot reach grok (no
+ *  Anthropic-compatible grok backend), so they pin the fallback directly. */
+export const DEFAULT_CCB_SUBAGENT_MODEL = 'glm-5.3-zai'
 
 export function isCcbRoutableSubagentModel(model: string | undefined): boolean {
   if (typeof model !== 'string') return false
@@ -266,15 +271,15 @@ export function isCcbRoutableSubagentModel(model: string | undefined): boolean {
 }
 
 /** Sub-agent model for a CCB turn. Parent model when it is catalog-routable
- *  (same turn lease → always admitted); otherwise the ops override, else the
- *  secondary utility model, which is the only cross-turn aux model the egress
- *  gate accepts. `OPENCLAUDE_SECONDARY_MODEL` follows the same override the
- *  utility pin uses so both stay inside one aux slot. */
+ *  (same turn lease → always admitted); otherwise the ops override, else
+ *  DEFAULT_CCB_SUBAGENT_MODEL — a member of the cross-turn aux set the egress
+ *  gate accepts. An ops override must also be inside PLATFORM_AUX_MODEL_IDS or
+ *  the sub-agent 403s. */
 export function resolveCcbSubagentModel(sessionModel?: string): string {
   if (isCcbRoutableSubagentModel(sessionModel)) return sessionModel!.trim()
   const override = process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL?.trim()
   if (isCcbRoutableSubagentModel(override)) return override!
-  return resolveSecondaryUtilityModel()
+  return DEFAULT_CCB_SUBAGENT_MODEL
 }
 
 export function resolveSecondaryUtilityModel(): string {

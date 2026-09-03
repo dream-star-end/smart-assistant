@@ -691,6 +691,15 @@ export const EXECUTION_MODEL_FALLBACK_ROUTE = [
 export const EXECUTION_MODEL_FALLBACK = EXECUTION_MODEL_FALLBACK_ROUTE[0]
 
 /**
+ * delegate_task(s) 未显式指定 model 时的默认优先模型:先试 grok-build(上游 grok-4.6)。
+ * 只在 selfhost 豁免门(isEngineLocalTurnExempt)开着时插入候选;catalog 无该行 / 不可路由
+ * 会被 decideLocalExecution 的候选循环静默跳过,mint 失败则由 handleDelegateTask 回落到
+ * DELEGATE_GROK_FALLBACK_MODEL(日志 delegate_grok_fallback)。显式 model 完全不受影响。
+ */
+export const DELEGATE_DEFAULT_PREFERRED_MODELS = ['grok-build'] as const
+export const DELEGATE_GROK_FALLBACK_MODEL = 'glm-5.3-zai'
+
+/**
  * 把 agent/config 级模型收敛到平台真实支持的集合。
  *
  * ALLOWED_INBOUND_MODELS 只拦**入站帧**;但 agent.model(marketplace manifest / seed /
@@ -941,6 +950,11 @@ export function decideLocalExecution(args: {
   liveSessionSkipReason?: string
   /** config.defaults.model。 */
   defaultModel?: string | null
+  /**
+   * 无显式 model 时、插在 liveSessionModel 之后 / agent.model 之前的优先候选(delegate 默认
+   * grok-build 优先)。不可路由 / 非 ccb 且未豁免的条目由候选循环静默跳过。
+   */
+  preferredModels?: readonly string[]
   kind: LocalTurnKind
   env?: NodeJS.ProcessEnv
   /** 沿用会话模型失败并回退时调用(dispatchInbound 接到 this.log.warn)。 */
@@ -1019,6 +1033,7 @@ export function decideLocalExecution(args: {
     ? [explicitModel]
     : [
         ticketlessReuse && liveSessionModel && liveSkipReason === undefined ? liveSessionModel : undefined,
+        ...(args.preferredModels ?? []),
         agent.model,
         args.defaultModel,
         ...EXECUTION_MODEL_FALLBACK_ROUTE,
@@ -1140,6 +1155,8 @@ export async function resolveLocalExecutionIfEnforced(args: {
   /** 与 resolveLiveSessionModel 同时、在 catalog 之后取样。 */
   resolveLiveSessionSkipReason?: () => string | undefined
   defaultModel?: string | null
+  /** 见 decideLocalExecution.preferredModels(仅 delegate 默认路径传)。 */
+  preferredModels?: readonly string[]
   env?: NodeJS.ProcessEnv
   warn?: (message: string, fields?: Record<string, unknown>) => void
 }): Promise<LocalExecutionDecision | undefined> {
@@ -10727,6 +10744,8 @@ export class Gateway {
   private _delegateJobs: DelegateJobStore | undefined
   /** Test seam for engine-reported delegate admit/settle/abandon. */
   private _delegateEngineBilling: DelegateEngineBillingClient | undefined
+  /** Test seam: grok relay route mint(默认 grok-build 优先 → mint 失败回落 glm 的用例注入)。 */
+  private _acquireDelegateGrokRoute: typeof acquireDelegateGrokRoute | undefined
   /** Test seam: skip the 60s idle-timeout floor so timeout/billing races are unit-testable. */
   private _delegateTimeoutConfig: DelegateTimeoutConfig | undefined
   /** Stage 1: durable boot reconciler has finished (or durable is off). */
@@ -12222,14 +12241,18 @@ export class Gateway {
     // 也因此,这里必然**先于 getOrCreate/createEngine** —— 结构化拒绝时不会有任何 runner
     // 被 spawn(方案 §3 要求的"创建 runner 前拒",测试 ④/⑤ 断言未 spawn)。
     const requestedModel = isReview ? undefined : input.model
-    const execAgent = requestedModel ? { ...delegatedAgent, model: requestedModel } : delegatedAgent
+    let execAgent = requestedModel ? { ...delegatedAgent, model: requestedModel } : delegatedAgent
     let delegateExec: LocalExecutionDecision | undefined
+    // 默认(未显式指定 model、非 review)委派优先 grok-build;只在 selfhost 引擎本地豁免门
+    // 开着时插入(生产没有 grok 本地 turn),catalog 无该行时候选循环自然跳过。
+    const preferGrokDefault = !requestedModel && !isReview && isEngineLocalTurnExempt(process.env)
     try {
       delegateExec = await resolveLocalExecutionIfEnforced({
         agent: execAgent,
         kind: 'turn',
         model: requestedModel,
         defaultModel: this.deps.config.defaults.model,
+        preferredModels: preferGrokDefault ? DELEGATE_DEFAULT_PREFERRED_MODELS : undefined,
       })
     } catch (err) {
       const mapped = this._mapLocalExecutionError(err)
@@ -12569,13 +12592,49 @@ export class Gateway {
           message: 'Grok 委派暂不可用: missing grok model id',
         }
       }
-      const acquired = await acquireDelegateGrokRoute({
+      const acquired = await (this._acquireDelegateGrokRoute ?? acquireDelegateGrokRoute)({
         modelId: grokMintModelId,
         sessionId: sessionKey,
         log: this.log,
       })
-      if (!acquired.ok) {
-        // 与排队被拒同形:已过闸的并发名额必须在此释放(下方 finally 不会执行)。
+      if (!acquired.ok && !requestedModel) {
+        // 默认路径(用户没显式要 grok):mint 失败(订阅并发满 / 容器租约上限 / 无账号 /
+        // master 通道缺失)不拒,同一请求内回落到 ccb 的 DELEGATE_GROK_FALLBACK_MODEL,
+        // 名额继续持有,下方 billing admit(ccb 不进 engine-reported)与 getOrCreate 照常。
+        this.log.warn('delegate_grok_fallback', {
+          targetAgentId,
+          httpStatus: acquired.httpStatus,
+          reason: acquired.reason,
+          from: grokMintModelId,
+          to: DELEGATE_GROK_FALLBACK_MODEL,
+        })
+        try {
+          delegateExec = await resolveLocalExecutionIfEnforced({
+            agent: { ...delegatedAgent, model: DELEGATE_GROK_FALLBACK_MODEL },
+            kind: 'turn',
+            model: DELEGATE_GROK_FALLBACK_MODEL,
+            defaultModel: this.deps.config.defaults.model,
+          })
+        } catch (err) {
+          const mapped = this._mapLocalExecutionError(err)
+          if (!mapped) {
+            this._releaseDelegateSlot(slotOpts)
+            unregisterDelegation?.()
+            throw err
+          }
+          this._releaseDelegateSlot(slotOpts)
+          unregisterDelegation?.()
+          return {
+            kind: 'rejected',
+            httpStatus: mapped.httpStatus,
+            message: mapped.message,
+            code: mapped.code,
+          }
+        }
+        // 之后 grokRoute/grokRouteLease 保持 null:submit 不注入 grok route,ccb runner 正常起。
+        execAgent = { ...delegatedAgent, model: DELEGATE_GROK_FALLBACK_MODEL }
+      } else if (!acquired.ok) {
+        // 显式 model 指定 grok:与排队被拒同形,已过闸的并发名额必须在此释放(下方 finally 不会执行)。
         this._releaseDelegateSlot(slotOpts)
         unregisterDelegation?.()
         this.log.warn('delegate_grok_route_denied', {
@@ -12588,9 +12647,10 @@ export class Gateway {
           httpStatus: acquired.httpStatus,
           message: `Grok 委派暂不可用: ${acquired.reason}`,
         }
+      } else {
+        grokRoute = { baseUrl: acquired.lease.baseUrl, routeToken: acquired.lease.routeToken }
+        grokRouteLease = acquired.lease
       }
-      grokRoute = { baseUrl: acquired.lease.baseUrl, routeToken: acquired.lease.routeToken }
-      grokRouteLease = acquired.lease
     }
     // engine-reported (codex/grok) 委派必须先向 master 签 32-hex requestId +
     // inflight journal,否则 adapter 不 emit billing,usage_records.mode=delegate

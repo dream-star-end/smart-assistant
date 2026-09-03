@@ -22,7 +22,7 @@ import * as http from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 
 import { MODEL_AUTHORITY_CAPABILITY, MODEL_AUTHORITY_FIELD } from "@openclaude/protocol";
-import { DEFAULT_SECONDARY_UTILITY_MODEL } from "@openclaude/gateway";
+import { DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL } from "@openclaude/gateway";
 
 import { signAccess } from "../auth/jwt.js";
 import {
@@ -87,11 +87,13 @@ function snapshotAt(epoch: bigint): ModelCatalogSnapshot {
     entries: [
       entry({ entryId: 1, modelId: MODEL }),
       entry({ entryId: 2, modelId: DEFAULT_SECONDARY_UTILITY_MODEL, providerId: "deepseek" }),
+      entry({ entryId: 3, modelId: DEFAULT_CCB_SUBAGENT_MODEL, providerId: "zai" }),
     ],
     aliases: new Map(),
     pricing: new Map([
       [MODEL, price(MODEL)],
       [DEFAULT_SECONDARY_UTILITY_MODEL, price(DEFAULT_SECONDARY_UTILITY_MODEL)],
+      [DEFAULT_CCB_SUBAGENT_MODEL, price(DEFAULT_CCB_SUBAGENT_MODEL)],
     ]),
     securityEpoch: epoch,
   });
@@ -170,7 +172,8 @@ async function startRig(): Promise<Rig> {
       loads += 1;
       if (loaderBroken) throw new Error("grants db down");
       const snapAllowed = allowed;
-      return (modelId: string) => snapAllowed || modelId === DEFAULT_SECONDARY_UTILITY_MODEL;
+      return (modelId: string) =>
+        snapAllowed || modelId === DEFAULT_SECONDARY_UTILITY_MODEL || modelId === DEFAULT_CCB_SUBAGENT_MODEL;
     },
     modelAuthority,
   });

@@ -140,10 +140,10 @@ const baseInputSchema = lazySchema(() =>
     prompt: z.string().describe('The task for the agent to perform'),
     subagent_type: z.string().optional().describe('The type of specialized agent to use for this task'),
     model: z
-      .enum(['sonnet', 'opus', 'haiku'])
+      .string()
       .optional()
       .describe(
-        "Optional model override for this agent. Takes precedence over the agent definition's model frontmatter. If omitted, uses the agent definition's model, or inherits from the parent.",
+        "Optional model override for this agent: an alias (sonnet/opus/haiku) or a platform model id (e.g. glm-5.3-zai, deepseek-v4-flash). Takes precedence over the agent definition's model frontmatter. If omitted, uses the platform default subagent model, else the agent definition's model, else inherits from the parent. On a platform deployment only the parent's model or the platform aux models are admitted; other ids are rejected with 403.",
       ),
     run_in_background: z
       .boolean()

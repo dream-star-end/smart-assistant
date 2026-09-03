@@ -29,7 +29,7 @@
 
 import { createHash } from "node:crypto";
 import { Client } from "pg";
-import { DEFAULT_SECONDARY_UTILITY_MODEL } from "@openclaude/gateway";
+import { DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL } from "@openclaude/gateway";
 import {
   PLATFORM_REASONING_EFFORTS,
   type PlatformReasoningEffort,
@@ -749,8 +749,17 @@ export class ModelCatalogSnapshot {
  * 也不在 master config 里另抄一份字面量(那才是造第二权威源:DB/config 说 A、容器发 B,
  * 漂移无人发现)。catalog 的角色是**校验**而非声明:`platformAuxModels()` 断言这些 id 在
  * 快照里可路由(active + 有价 + capability schema 可理解),不满足 → fail-closed 抛。
+ *
+ * **2026-09-03 扩为两员**:CCB 内置 `Agent` 子 agent 由 gateway `resolveCcbSubagentModel()` 钉
+ * `CLAUDE_CODE_SUBAGENT_MODEL = DEFAULT_CCB_SUBAGENT_MODEL`('glm-5.3-zai',与 SMALL_FAST 解耦),
+ * 子 agent 请求经 passthrough 打同一 anthropic proxy,所以钉的模型也必须进 lease 放行集。
+ * **顺序有语义**:v3supervisor 取 `aux[0]` 注 `OPENCLAUDE_SECONDARY_MODEL`,deepseek 必须在首位。
+ * 两个常量都是 gateway 侧的既存权威,这里仍只 import 不另抄字面量。
  */
-export const PLATFORM_AUX_MODEL_IDS: readonly string[] = [DEFAULT_SECONDARY_UTILITY_MODEL];
+export const PLATFORM_AUX_MODEL_IDS: readonly string[] = [
+  DEFAULT_SECONDARY_UTILITY_MODEL,
+  DEFAULT_CCB_SUBAGENT_MODEL,
+];
 
 /** 平台次级模型不可路由(被 disable / 无价 / capability schema 未来版本)→ 签发期拒。 */
 export class PlatformAuxModelUnavailableError extends Error {
