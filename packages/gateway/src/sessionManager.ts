@@ -4342,7 +4342,11 @@ export class SessionManager {
       // model edit. The hermetic Auto-Dream model turn has no tools/memory and
       // must release before its later exclusive apply phase.
       if (isCommercialManagedRuntime() && session.channel !== 'auto-dream') {
-        memoryTurnBarrier = await new MemoryDir(session.agentId).acquireSharedBarrier()
+        memoryTurnBarrier = await new MemoryDir(session.agentId).acquireSharedBarrier({
+          totalBudgetMs: 60_000,
+          perAttemptMs: 5_000,
+          retryDelayMs: 100,
+        })
       }
       // V3 S12e CG8 — contract C(best-effort)stash latest turn trace on runner
       // so that ANY re-spawn triggered inside this turn — effort/model change

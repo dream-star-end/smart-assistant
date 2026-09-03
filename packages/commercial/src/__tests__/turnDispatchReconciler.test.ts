@@ -517,10 +517,11 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
     )
   })
 
-  test('探测窗(15min~stuckMs)可达行零状态迁移:容器回 rejected 也不得提前终态', async () => {
-    // 扫描下限降到 15min 只为告警探测;所有状态迁移仍由 stuckMs 门守住(零侵入承诺)。
+  test('young accepted + durable rejected tombstone → immediate not_accepted convergence', async () => {
+    // rejected is an irreversible container tombstone, not an absence guess;
+    // it must bypass the generic 90-minute age gate.
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 20 * 60_000) })],
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 5_000) })],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -529,9 +530,9 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
         getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
       },
     })
-    assert.equal(counts.rejectedTerminal, 0, '探测窗内不做 not_accepted 终态迁移')
+    assert.equal(counts.rejectedTerminal, 1, '明确 negative proof 要立即收敛')
     assert.equal(counts.manualReconcile, 0)
-    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")), '零状态写入')
+    assert.ok(pool.writes.some((w) => w.includes("status = 'terminal'")), '写 not_accepted 终态')
   })
 
   test('accepted dispatch still running → no terminal (keep waiting)', async () => {

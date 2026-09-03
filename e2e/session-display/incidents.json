@@ -2779,6 +2779,70 @@
           "assertion": "invalid strong release marker"
         }
       ]
+    },
+    {
+      "id": "INC-20260903-OCV5-82-SESSION-UNAVAILABLE",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "多条 webchat 会话因浏览器瞬断误杀已受理 enrichment、cron stale executor/假 ACK、容器 rejected 与 Master accepted 长时间分叉，以及前台 memory flock 5 秒竞争失败而显示「系统暂时不可用」。",
+      "rootFixCommit": "82bfb777",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "R4-B1 受理 await 期间 client detach → drain 保活并在 admission 后只转发一次"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "R4-B7 container close after lookup but during authority bind keeps pre-forward ownership"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "R4-B8 rejected duplicate receipt never becomes cron injected success"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "R4-B9 accepted receipt synchronously beats close before delayed send callback"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cronOriginAdmitModel.test.ts",
+          "assertion": "production preparation budget is not shorter than the legal PG statement budget"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cronOriginAdmitModel.test.ts",
+          "assertion": "stale executor may reselect only after explicit not_claimed and keeps one envelope"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cronOriginAdmitModel.test.ts",
+          "assertion": "rejected executor receipt returns a non-success result and stops reselection"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "young accepted + durable rejected tombstone → immediate not_accepted convergence"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/storage/src/__tests__/kernelFileLock.test.ts",
+          "assertion": "retries foreground shared-barrier contention within one bounded budget"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/autoDreamTurnBarrier.test.ts",
+          "assertion": "commercial foreground turns hold the shared memory barrier until submit finally"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "[session-unavailable-rootfix] PASS — detach drain, durable cron receipt, rejected convergence and bounded memory retry are locked"
+        }
+      ]
     }
   ]
 }
