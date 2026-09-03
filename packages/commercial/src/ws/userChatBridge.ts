@@ -7934,7 +7934,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           : null;
       if (
         masterOnlyFrameType === "sys.incident" || masterOnlyFrameType === "sys.goal_snapshot" ||
-        masterOnlyFrameType === "sys.media_job"
+        masterOnlyFrameType === "sys.media_job" || masterOnlyFrameType === "sys.recovery_decision"
       ) {
         if (!loggedRejectedContainerIncident) {
           loggedRejectedContainerIncident = true;

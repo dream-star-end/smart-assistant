@@ -91,6 +91,12 @@ export type FrameEffects = {
   /** Terminal recoverable error: sync the finalized exact tape, then let the
    * socket attempt one safety-gated checkpoint/replay child turn. */
   scheduleAutomaticRecovery?: (sessId: string, clientMessageId?: string) => void;
+  /**
+   * Master 拥有自动恢复时,可恢复的终态错误**先不画红卡**:返回 true 表示 socket 已接管这条
+   * 延后的错误(持 `sys.recovery_decision` / `outbound.ack{recovery}` / 宽限计时器三选一收口),
+   * reducer 只把本轮保持在软状态「模型繁忙,正在重试中」。返回 false / 缺省 → 立即落红卡。
+   */
+  deferTerminalErrorForRecovery?: (sessId: string, paint: DeferredTerminalErrorPaint) => boolean;
   /** 非 final 且 in-flight：socket 重置 thinking-safety（证明后端活着）。*/
   onLiveFrame?: (sess: ChatSession) => void;
   /** 空轮 end_turn → deferred(setTimeout 0) 自动续写。*/
@@ -1542,6 +1548,18 @@ export function applyOutboundMessage(
     suppressLegacyErrorText = true;
     sess._suppressErrorBubbleAtSeq = undefined;
   }
+  // 红卡已被延后(master 拥有自动恢复):这条兼容 [error] final 只是终结符,**不得**清发送态 /
+  // retrying 软状态,否则「正在重试中」会在裁决到达前闪成空闲。socket 的 outbound.error 分支已
+  // 释放 dispatch slot;真正的收口由 sys.recovery_decision / ack 领养 / 宽限超时三者之一完成。
+  if (
+    suppressLegacyErrorText &&
+    sess._deferredTerminalErrorClientMessageId !== undefined &&
+    (!frame.clientMessageId || frame.clientMessageId === sess._deferredTerminalErrorClientMessageId)
+  ) {
+    markFrameReceived(sess);
+    effects.persistSession?.(sess.id);
+    return;
+  }
 
   // refresh 后从 messages 重建 blockId/agentGroup 索引（§7）。
   if (!sess._blockIdToMsgId) rebuildIndexes(sess);
@@ -2461,30 +2479,31 @@ export function shouldSuppressStaleOutboundError(sess: ChatSession, frame: Outbo
   );
 }
 
-export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, effects: FrameEffects = {}): void {
-  if (shouldSuppressStaleOutboundError(sess, frame)) return;
-  if (typeof frame.frameSeq === "number" && frame.frameSeq > 0) {
-    if (!acceptFrameSeq(sess, frame)) return;
-    sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1;
-  }
-  // The rolling gateway wire enum cannot carry user_cancelled yet, so the
-  // container's proven Stop terminal arrives as this exact legacy pair.
-  const normalized = normalizeBridgeErrorCode(frame.code) === "upstream_failed" &&
-      frame.detail === "本轮已由用户停止。"
-    ? "user_cancelled"
-    : normalizeBridgeErrorCode(frame.code);
-  const userCancelled = normalized === "stopped" || normalized === "user_cancelled";
-  addMessage(sess, "assistant", friendlyBridgeErrorMessage(normalized, frame.message || "出错了"), {
-    _errorCode: normalized,
-    _errorDetail: safeBridgeErrorDetail(normalized, frame.traceId),
-    ...(frame.clientMessageId ? { _clientMessageId: frame.clientMessageId } : {}),
-    ...(frame.traceId ? { usage: { traceId: frame.traceId } } : {}),
+/**
+ * 已归一化、可直接落卡的终态错误描述。`applyOutboundError` / `applyLegacyBridgeError` 先算出它,
+ * 再决定「立即画红卡」还是「交给 socket 延后」;延后时 socket 原样保存,裁决为否 / 宽限超时后
+ * 用同一份数据调 `paintDeferredTerminalError` 物化,保证两条路径画出的卡一字不差。
+ */
+export type DeferredTerminalErrorPaint = {
+  normalized: string;
+  text: string;
+  detail?: string;
+  clientMessageId?: string;
+  traceId?: string;
+};
+
+function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint, userCancelled: boolean): void {
+  addMessage(sess, "assistant", paint.text, {
+    _errorCode: paint.normalized,
+    _errorDetail: paint.detail,
+    ...(paint.clientMessageId ? { _clientMessageId: paint.clientMessageId } : {}),
+    ...(paint.traceId ? { usage: { traceId: paint.traceId } } : {}),
   });
   // outbound.error is the structured error card; the following [error] text final is only a
   // compatibility terminator. Clear/persist locally now so a refresh in that tiny gap does not
   // resurrect the stop button or let late non-final frames revive the failed turn.
-  const ownsActiveTurn = frame.clientMessageId
-    ? sess._activeClientMessageId === frame.clientMessageId
+  const ownsActiveTurn = paint.clientMessageId
+    ? sess._activeClientMessageId === paint.clientMessageId
     : true; // rolling compatibility for old gateways
   if (ownsActiveTurn) {
     sess._sendingInFlight = false;
@@ -2494,14 +2513,14 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     sess._localTeardownAt = sess._trackerResetAt;
     // 用户主动停止不应留下失败卡；真正错误仍把运行中生成占位转为失败态。
     if (userCancelled) resolveGenPlaceholders(sess);
-    else failGenPlaceholders(sess, errorLabel(normalized));
+    else failGenPlaceholders(sess, errorLabel(paint.normalized));
   }
-  const exactUser = frame.clientMessageId
-    ? sess.messages.find((m) => m?.role === "user" && m.id === frame.clientMessageId)
+  const exactUser = paint.clientMessageId
+    ? sess.messages.find((m) => m?.role === "user" && m.id === paint.clientMessageId)
     : undefined;
   if (exactUser) {
     exactUser.status = userCancelled ? "sent" : "error";
-  } else if (!frame.clientMessageId) {
+  } else if (!paint.clientMessageId) {
     for (let i = sess.messages.length - 1; i >= 0; i--) {
       const m = sess.messages[i];
       if (m?.role !== "user") continue;
@@ -2515,6 +2534,93 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
       }
     }
   }
+}
+
+/**
+ * 延后红卡的物化入口(socket 在 `sys.recovery_decision{scheduled:false}` 或宽限超时时调用)。
+ * 与实时路径同一 painter;若期间该轮已被 master 恢复子轮领养(`_activeClientMessageId` 已切到
+ * 子 cmid)或已出现同 cmid 的完整 tape,则不再补卡。
+ */
+export function paintDeferredTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint, effects: FrameEffects = {}): void {
+  const cmid = paint.clientMessageId;
+  if (cmid) {
+    const adopted = sess.messages.some((m) =>
+      m.role === "user" && m._automaticRecovery === true && m._recoveryOfClientMessageId === cmid);
+    if (adopted) return;
+    if (sess.messages.some((m) => m.role === "assistant" && m._clientMessageId === cmid && !!m._errorCode)) return;
+    if (sess.messages.some((m) => m.role === "assistant" && m._clientMessageId === cmid && m._turnTapeComplete === true)) return;
+  }
+  paintTerminalError(sess, paint, false);
+  effects.persistSession?.(sess.id);
+}
+
+/**
+ * 软状态「模型繁忙,正在重试中(n/10)」:保持 `_sendingInFlight`,只把 `_turnStatus` 切到
+ * retrying。attempt 按源轮血统推导(源 user 行已是恢复子轮 → 其 attempt+1,否则 1);后续
+ * `sys.recovery_decision` / `outbound.ack{recovery}` 带权威 attempt 再覆盖。
+ */
+function enterDeferredRecoverySoftState(sess: ChatSession, clientMessageId: string | undefined): void {
+  const source = clientMessageId
+    ? sess.messages.find((m) => m.role === "user" && m.id === clientMessageId)
+    : undefined;
+  const sourceAttempt = typeof source?._automaticRecoveryAttempt === "number" &&
+      Number.isSafeInteger(source._automaticRecoveryAttempt) &&
+      source._automaticRecoveryAttempt >= 1
+    ? source._automaticRecoveryAttempt
+    : 0;
+  const attempt = Math.min(sourceAttempt + 1, AUTOMATIC_TURN_RETRY_MAX);
+  sess._sendingInFlight = true;
+  if (clientMessageId && !sess._activeClientMessageId) sess._activeClientMessageId = clientMessageId;
+  sess._streamingAssistant = null;
+  sess._streamingThinking = null;
+  sess._turnStatus = {
+    kind: "retrying",
+    attempt,
+    max: AUTOMATIC_TURN_RETRY_MAX,
+    retryAt: Date.now(),
+  };
+}
+
+export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, effects: FrameEffects = {}): void {
+  if (shouldSuppressStaleOutboundError(sess, frame)) return;
+  if (typeof frame.frameSeq === "number" && frame.frameSeq > 0) {
+    if (!acceptFrameSeq(sess, frame)) return;
+    sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1;
+  }
+  // The rolling gateway wire enum cannot carry user_cancelled yet, so the
+  // container's proven Stop terminal arrives as this exact legacy pair.
+  const normalized = normalizeBridgeErrorCode(frame.code) === "upstream_failed" &&
+      frame.detail === "本轮已由用户停止。"
+    ? "user_cancelled"
+    : normalizeBridgeErrorCode(frame.code);
+  const userCancelled = normalized === "stopped" || normalized === "user_cancelled";
+  const paint: DeferredTerminalErrorPaint = {
+    normalized,
+    text: friendlyBridgeErrorMessage(normalized, frame.message || "出错了"),
+    detail: safeBridgeErrorDetail(normalized, frame.traceId),
+    ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
+    ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
+  };
+  // Master 拥有恢复且错误可自动恢复:红卡延后,本轮保持软状态直到 master 裁决。遥测仍照常上报。
+  if (
+    !userCancelled &&
+    supportsAutomaticTurnRecovery(normalized) &&
+    effects.deferTerminalErrorForRecovery?.(sess.id, paint) === true
+  ) {
+    sess._deferredTerminalErrorClientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
+    enterDeferredRecoverySoftState(sess, sess._deferredTerminalErrorClientMessageId);
+    effects.persistSession?.(sess.id);
+    if (!REPORT_EXEMPT_TURN_ERR_CODES.has(normalized)) {
+      effects.reportTurnError?.({
+        code: normalized,
+        message: `${normalized}: ${frame.message || frame.detail || ""}`,
+        traceId: typeof frame.traceId === "string" ? frame.traceId : undefined,
+        sessionId: sess.id,
+      });
+    }
+    return;
+  }
+  paintTerminalError(sess, paint, userCancelled);
   effects.persistSession?.(sess.id);
   // 遥测上报口径用**遥测豁免集**(reportable===false),与"预期业务态"(expected)解耦
   // (Codex 审计 R5c):rate_limited/model_capacity/service_restart/image_server_busy 虽对用户预期,
@@ -2541,45 +2647,25 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
   }
   const normalized = normalizeBridgeErrorCode(frame.code);
   const userCancelled = normalized === "stopped" || normalized === "user_cancelled";
-  const text = friendlyBridgeErrorMessage(frame.code, frame.message);
-  addMessage(sess, "assistant", text, {
-    _errorCode: normalized,
-    _errorDetail: safeBridgeErrorDetail(frame.code, frame.traceId),
-    ...(frame.clientMessageId ? { _clientMessageId: frame.clientMessageId } : {}),
-    ...(frame.traceId ? { usage: { traceId: frame.traceId } } : {}),
-  });
-  // legacy error 无后续 final，前端自己收尾本轮 UI。
-  const ownsActiveTurn = frame.clientMessageId
-    ? sess._activeClientMessageId === frame.clientMessageId
-    : true;
-  if (ownsActiveTurn) {
-    sess._sendingInFlight = false;
-    sess._activeClientMessageId = undefined;
-    clearTurnTiming(sess);
-    resetReplyTracker(sess);
-    sess._localTeardownAt = sess._trackerResetAt;
-    if (userCancelled) resolveGenPlaceholders(sess);
-    else failGenPlaceholders(sess, errorLabel(normalized));
+  const paint: DeferredTerminalErrorPaint = {
+    normalized,
+    text: friendlyBridgeErrorMessage(frame.code, frame.message),
+    detail: safeBridgeErrorDetail(frame.code, frame.traceId),
+    ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
+    ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
+  };
+  // legacy error 无后续 final,前端自己收尾本轮 UI;master 拥有恢复时同样延后红卡。
+  if (
+    !userCancelled &&
+    supportsAutomaticTurnRecovery(normalized) &&
+    effects.deferTerminalErrorForRecovery?.(sess.id, paint) === true
+  ) {
+    sess._deferredTerminalErrorClientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
+    enterDeferredRecoverySoftState(sess, sess._deferredTerminalErrorClientMessageId);
+    effects.persistSession?.(sess.id);
+    return;
   }
-  const exactUser = frame.clientMessageId
-    ? sess.messages.find((m) => m?.role === "user" && m.id === frame.clientMessageId)
-    : undefined;
-  if (exactUser) {
-    exactUser.status = userCancelled ? "sent" : "error";
-  } else if (!frame.clientMessageId) {
-    for (let i = sess.messages.length - 1; i >= 0; i--) {
-      const m = sess.messages[i];
-      if (m?.role !== "user") continue;
-      if (userCancelled) {
-        if (m.status === "sending" || m.status === "queued") m.status = "sent";
-        break;
-      }
-      if (m.status === "sending" || m.status === "sent" || m.status === "queued") {
-        m.status = "error";
-        break;
-      }
-    }
-  }
+  paintTerminalError(sess, paint, userCancelled);
   effects.persistSession?.(sess.id);
   if (normalized === "insufficient_credits") effects.refreshBalance?.();
   if (supportsAutomaticTurnRecovery(normalized)) {

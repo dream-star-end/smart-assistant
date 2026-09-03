@@ -68,6 +68,12 @@ export type StoredPendingControl = {
   enqueuedAt: number;
   attempt: number;
   status?: "queued" | "awaiting_receipt" | "persisted";
+  /**
+   * 仅作服务端围栏的 stop(「正在重试中」软状态下用户按停止):源轮在服务端已终态,这条控制只为
+   * 让 master 取消已入队的自动恢复子轮。它**不**代表一个待收尾的在飞 turn:reload 不据此恢复
+   * in-flight / 「正在停止…」,回执也不清当前(可能已是下一轮的)发送态。
+   */
+  fenceOnly?: true;
 };
 
 /**

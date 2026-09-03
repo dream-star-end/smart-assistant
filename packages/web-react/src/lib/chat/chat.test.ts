@@ -6942,6 +6942,220 @@ describe("ChatSocket interrupted continuation", () => {
   });
 });
 
+describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡延后)", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  /** 起一条 master 拥有自动恢复、已 admitted 的在飞 turn,再喂一条可自动恢复的 outbound.error。 */
+  function deferredErrorFixture(sessId: string, opts: { masterOwns?: boolean } = {}) {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: async () => {} });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    if (opts.masterOwns !== false) {
+      ws.onmessage?.({
+        data: JSON.stringify({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1" }),
+      });
+    }
+    sock.sendMessage({ sessId, agentId: "main", text: "long task", model: "kimi-k3-ark" });
+    const session = sock.sessions.get(sessId)!;
+    const user = session.messages.find((m) => m.role === "user")!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack", admitted: true, peer: { id: sessId, kind: "dm" }, clientMessageId: user.id,
+    }) });
+    ws.sent.length = 0;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.error", peer: { id: sessId, kind: "dm" }, clientMessageId: user.id,
+      code: "model_capacity", message: "at capacity", frameSeq: 1, ts: Date.now(),
+    }) });
+    return { sock, ws, session, user };
+  }
+
+  const errorCards = (session: { messages: ChatMessage[] }) =>
+    session.messages.filter((m) => m.role === "assistant" && !!m._errorCode);
+
+  test("master owns recovery → outbound.error paints no red card, keeps in-flight with the retrying soft hint", () => {
+    const { sock, session, user } = deferredErrorFixture("s-defer-soft");
+    expect(errorCards(session)).toHaveLength(0);
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._activeClientMessageId).toBe(user.id);
+    expect(session._turnStatus).toMatchObject({ kind: "retrying", attempt: 1, max: 10 });
+    expect(user.status).toBe("sent");
+    // 兼容 [error] text final(frameSeq+1)只是终结符:不得清软状态。
+    (sock as any).ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.message", sessionKey: "agent:main:webchat:dm:s-defer-soft", channel: "webchat",
+      peer: { id: "s-defer-soft", kind: "dm" }, clientMessageId: user.id, isFinal: true,
+      frameSeq: 2, ts: Date.now(), blocks: [{ kind: "text", text: "[error] at capacity" }],
+    }) });
+    expect(session._sendingInFlight).toBe(true);
+    expect(isRetryingTurnStatus(session._turnStatus)).toBe(true);
+    expect(errorCards(session)).toHaveLength(0);
+    expect(session.messages.some((m) => m.role === "assistant" && m.text.startsWith("[error]"))).toBe(false);
+    sock.stop();
+  });
+
+  test("legacy gateway (master does not own recovery) still paints the red card immediately", () => {
+    const { sock, session, user } = deferredErrorFixture("s-defer-legacy", { masterOwns: false });
+    expect(errorCards(session)).toHaveLength(1);
+    expect(errorCards(session)[0]).toMatchObject({ _errorCode: "model_capacity", _clientMessageId: user.id });
+    expect(session._sendingInFlight).toBe(false);
+    expect(user.status).toBe("error");
+    sock.stop();
+  });
+
+  test("sys.recovery_decision{scheduled:true} refines the attempt and extends the grace; ack adoption discards the deferred card", () => {
+    const { sock, ws, session, user } = deferredErrorFixture("s-defer-sched");
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "sys.recovery_decision", peer: { id: "s-defer-sched", kind: "dm" },
+      sourceClientMessageId: user.id, errorCode: "model_capacity", scheduled: true,
+      rootClientMessageId: user.id, mode: "checkpoint", attempt: 3, max: 10,
+    }) });
+    expect(session._turnStatus).toMatchObject({ kind: "retrying", attempt: 3 });
+    // 决策宽限(20s)过去后仍在等 ack 领养(30s):不物化。
+    vi.advanceTimersByTime(25_000);
+    expect(errorCards(session)).toHaveLength(0);
+    expect(session._sendingInFlight).toBe(true);
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack", admitted: true, peer: { id: "s-defer-sched", kind: "dm" },
+      clientMessageId: "m-recover-sched1",
+      recovery: {
+        automatic: true, mode: "checkpoint", sourceClientMessageId: user.id, rootClientMessageId: user.id,
+        attempt: 3, max: 10, agentId: "main", model: "kimi-k3-ark",
+      },
+    }) });
+    expect(session._activeClientMessageId).toBe("m-recover-sched1");
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._deferredTerminalErrorClientMessageId).toBeUndefined();
+    expect(session.messages.at(-1)).toMatchObject({ id: "m-recover-sched1", _automaticRecovery: true });
+    // 领养后即便所有宽限耗尽也不再补红卡。
+    vi.advanceTimersByTime(60_000);
+    expect(errorCards(session)).toHaveLength(0);
+    sock.stop();
+  });
+
+  test("sys.recovery_decision{scheduled:false} materializes the red card through the same painter", () => {
+    const { sock, ws, session, user } = deferredErrorFixture("s-defer-decline");
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "sys.recovery_decision", peer: { id: "s-defer-decline", kind: "dm" },
+      sourceClientMessageId: user.id, errorCode: "model_capacity", scheduled: false, reason: "exhausted",
+    }) });
+    const cards = errorCards(session);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ _errorCode: "model_capacity", _clientMessageId: user.id });
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._activeClientMessageId).toBeUndefined();
+    expect(session._turnStatus).toBeFalsy();
+    expect(user.status).toBe("error");
+    expect(session._deferredTerminalErrorClientMessageId).toBeUndefined();
+    // 幂等:同一裁决重复到达不叠卡。
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "sys.recovery_decision", peer: { id: "s-defer-decline", kind: "dm" },
+      sourceClientMessageId: user.id, errorCode: "model_capacity", scheduled: false, reason: "exhausted",
+    }) });
+    expect(errorCards(session)).toHaveLength(1);
+    sock.stop();
+  });
+
+  test("no decision within the grace window materializes the red card (backend silent fallback)", () => {
+    const { sock, session, user } = deferredErrorFixture("s-defer-timeout");
+    vi.advanceTimersByTime(19_999);
+    expect(errorCards(session)).toHaveLength(0);
+    expect(session._sendingInFlight).toBe(true);
+    vi.advanceTimersByTime(1);
+    expect(errorCards(session)).toHaveLength(1);
+    expect(errorCards(session)[0]._clientMessageId).toBe(user.id);
+    expect(session._sendingInFlight).toBe(false);
+    expect(user.status).toBe("error");
+    sock.stop();
+  });
+
+  test("recoverySkipped ack for the deferred lineage lands the red card before the skip notice", () => {
+    const { sock, ws, session, user } = deferredErrorFixture("s-defer-skip");
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack", admitted: false, recoverySkipped: true, recoverySkippedReason: "stale_tape",
+      peer: { id: "s-defer-skip", kind: "dm" }, clientMessageId: "m-recover-skip1",
+      sourceClientMessageId: user.id,
+    }) });
+    expect(errorCards(session)).toHaveLength(1);
+    expect(session._sendingInFlight).toBe(false);
+    sock.stop();
+  });
+
+  test("user Stop during the soft state fences the lineage, paints the card, sends a fence-only stop and rejects a late ack adoption", () => {
+    const { sock, ws, session, user } = deferredErrorFixture("s-defer-stop");
+    sock.stopTurn("s-defer-stop");
+    expect(errorCards(session)).toHaveLength(1);
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._stopSettlement).toBeUndefined();
+    expect(session._recoveryStatus).toEqual({ kind: "completed" });
+    expect(session._cancelledAutomaticRecoveryIds?.[user.id]).toBe(true);
+    expect(sock.isSessionBusy("s-defer-stop")).toBe(false);
+    // 围栏 stop 控制确实上送 master(取消已入队的恢复子轮)。
+    const stops = ws.sent.map((raw) => JSON.parse(raw)).filter((f) => f.type === "inbound.control.stop");
+    expect(stops).toHaveLength(1);
+    expect(stops[0]).toMatchObject({ clientMessageId: user.id, peer: { id: "s-defer-stop", kind: "dm" } });
+    // 围栏 stop 的回执不改 UI 状态(不清任何发送态、不进入停止态)。
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt", controlId: stops[0].controlId, controlKind: "stop",
+      status: "persisted", peer: { id: "s-defer-stop", kind: "dm" }, clientMessageId: user.id,
+    }) });
+    expect(session._recoveryStatus).toEqual({ kind: "completed" });
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt", controlId: stops[0].controlId, controlKind: "stop",
+      status: "terminal", peer: { id: "s-defer-stop", kind: "dm" }, clientMessageId: user.id,
+    }) });
+    expect(session._sendingInFlight).toBe(false);
+
+    // master 在 stop 落库前已发出的 ack 领养:不得重新拉回 in-flight。
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack", admitted: true, peer: { id: "s-defer-stop", kind: "dm" },
+      clientMessageId: "m-recover-stop1",
+      recovery: {
+        automatic: true, mode: "checkpoint", sourceClientMessageId: user.id, rootClientMessageId: user.id,
+        attempt: 1, max: 10, agentId: "main",
+      },
+    }) });
+    expect(session._sendingInFlight).toBe(false);
+    expect(session.messages.some((m) => m.id === "m-recover-stop1")).toBe(false);
+    // 后续的 scheduled 裁决同样无效(无 pending,且本轮不在飞)。
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "sys.recovery_decision", peer: { id: "s-defer-stop", kind: "dm" },
+      sourceClientMessageId: user.id, errorCode: "model_capacity", scheduled: true,
+      rootClientMessageId: user.id, mode: "checkpoint", attempt: 1, max: 10,
+    }) });
+    expect(session._sendingInFlight).toBe(false);
+    expect(errorCards(session)).toHaveLength(1);
+    sock.stop();
+  });
+
+  test("a fence-only stop survives reload without resurrecting in-flight / stopping state", () => {
+    const { sock, session, user } = deferredErrorFixture("s-defer-fence-reload");
+    // 让控制停在 queued(未发出)以便被持久化后重放。
+    (sock as any).ws.readyState = 0;
+    sock.stopTurn("s-defer-fence-reload");
+    const stored = sock.toStored("s-defer-fence-reload")!;
+    const controls = (sock as any).controlQueue.filter((c: { sessId: string }) => c.sessId === "s-defer-fence-reload");
+    expect(controls).toHaveLength(1);
+    expect(controls[0].fenceOnly).toBe(true);
+    const reloaded = makeSocket();
+    reloaded.loadStored({ ...stored, _pendingControls: controls.map((c: object) => ({ ...c, status: "queued" })) });
+    const restored = reloaded.sessions.get("s-defer-fence-reload")!;
+    expect(restored._sendingInFlight).toBeFalsy();
+    expect(restored._stopSettlement).toBeUndefined();
+    expect(restored._recoveryStatus?.kind).not.toBe("stopping");
+    expect(restored._cancelledAutomaticRecoveryIds?.[user.id]).toBe(true);
+    expect(session._sendingInFlight).toBe(false);
+    sock.stop();
+    reloaded.stop();
+  });
+});
+
 describe("ChatSocket 1008 auth recovery", () => {
   afterEach(() => {
     FakeWS.instances = [];

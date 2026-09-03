@@ -1319,12 +1319,57 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["wechat_bindings", "bot_token", "text"],
 ];
 
+/**
+ * Master-owned automatic recovery verdict for one finalized terminal turn.
+ * Emitted to the browser after the finalize tx commits so the UI can show
+ * "retrying (n/max)" instead of a terminal red card while the durable job
+ * waits for its drain/claim/admit cycle — or paint the red card right away
+ * when the master has decided no automatic recovery will follow.
+ */
+export type AutomaticRecoveryDecision =
+  | {
+      scheduled: true;
+      sourceClientMessageId: string;
+      rootClientMessageId: string;
+      errorCode: string;
+      mode: "checkpoint" | "replay";
+      attempt: number;
+      max: number;
+      displayText: string;
+      agentId: string;
+      model?: string;
+    }
+  | {
+      scheduled: false;
+      sourceClientMessageId: string;
+      errorCode: string;
+      reason:
+        | "not_recoverable"
+        | "source_not_latest"
+        | "no_routing"
+        | "completed_without_checkpoint"
+        | "checkpoint_unsafe"
+        | "replay_not_proven"
+        | "silent_no_progress"
+        | "retry_exhausted"
+        | "media_not_durable"
+        | "enqueue_rejected";
+    };
+
 export interface PgSessionsBackendOptions {
   /** 启动时快照的权威 generation(RFC D5:probe 复核 marker 未漂移)。 */
   expectedGeneration: number;
   /** Runs only after the owning tape/cost transaction commits. Callback
    * failures must never turn a committed billing write into retry. */
   onGoalUsageChanged?: (userId: string, sessionId: string) => void | Promise<void>;
+  /** Runs only after the Phase B finalize tx that evaluated automatic
+   * recovery commits. Purely a UI sideband: failures are swallowed and
+   * never affect the committed tape, job row or billing. */
+  onAutomaticRecoveryDecision?: (
+    userId: string,
+    sessionId: string,
+    decision: AutomaticRecoveryDecision,
+  ) => void | Promise<void>;
 }
 
 type GoalUsageChange = { userId: string; sessionId: string };
@@ -1987,9 +2032,22 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     tapeSha256: string;
     currentMessages: MessageLike[];
   },
-): Promise<void> {
+): Promise<AutomaticRecoveryDecision | null> {
   const clientMessageId = input.clientMessageId;
-  if (!clientMessageId || !isClientMessageId(clientMessageId)) return;
+  if (!clientMessageId || !isClientMessageId(clientMessageId)) return null;
+  // Every negative early-exit below reports *why* the master will not recover
+  // this turn, so the browser can stop waiting and materialize the terminal
+  // card instead of guessing from a timer. The decision is a post-commit
+  // sideband (`sys.recovery_decision`); nothing here reads it back.
+  const declined = (
+    reason: Extract<AutomaticRecoveryDecision, { scheduled: false }>["reason"],
+    errorCode: string,
+  ): AutomaticRecoveryDecision => ({
+    scheduled: false,
+    sourceClientMessageId: clientMessageId,
+    errorCode,
+    reason,
+  });
 
   await settleFinalizedTurnControls(client, {
     uid: input.uid,
@@ -2007,23 +2065,32 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     status !== "crashed" &&
     status !== "interrupted" &&
     !completedWithRecoverableError
-  ) return;
+  ) {
+    // A clean completion is not a recovery candidate at all; no sideband.
+    return null;
+  }
   const errorCode = terminalRecordErrorCode ||
     input.turn.payload.errorCode || input.turn.payload.waiveReason || "";
-  if (!supportsAutomaticTurnRecovery(errorCode)) return;
+  if (!supportsAutomaticTurnRecovery(errorCode)) {
+    return declined("not_recoverable", errorCode);
+  }
 
   const latestUser = [...input.currentMessages].reverse()
     .find((message) => message?.role === "user");
-  if (!latestUser || latestUser.id !== clientMessageId) return;
+  if (!latestUser || latestUser.id !== clientMessageId) {
+    return declined("source_not_latest", errorCode);
+  }
   const source = await hydrateRecoverySourceUser(
     client,
     input.sessionId,
     input.sessionUserId,
     latestUser,
   );
-  if (!source) return;
+  if (!source) return declined("no_routing", errorCode);
   const routing = source._routing;
-  if (!routing || typeof routing !== "object" || Array.isArray(routing)) return;
+  if (!routing || typeof routing !== "object" || Array.isArray(routing)) {
+    return declined("no_routing", errorCode);
+  }
   const route = routing as Record<string, unknown>;
 
   const leftoverRecords = await loadLeftoverRecoveryRecords(
@@ -2042,19 +2109,25 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   // prompt requires observable-state verification before any repeated write.
   // Exact replay remains fail-closed and is never inferred from a completed
   // tape whose header contradicts its terminal error record.
-  if (status === "completed" && assessment.mode !== "checkpoint") return;
+  if (status === "completed" && assessment.mode !== "checkpoint") {
+    return declined("completed_without_checkpoint", errorCode);
+  }
   if (
     assessment.mode === "checkpoint" &&
     !assessment.checkpointSafe &&
     !allowUnsafeAutomaticCheckpoint(status, errorCode, assessment.leftoverBacked)
-  ) return;
+  ) {
+    return declined("checkpoint_unsafe", errorCode);
+  }
   if (
     assessment.mode === "replay" &&
     (
       !assessment.checkpointSafe ||
       !recoveryWithoutCheckpointIsProven(errorCode)
     )
-  ) return;
+  ) {
+    return declined("replay_not_proven", errorCode);
+  }
   const mode = assessment.mode;
   const rootClientMessageId = isClientMessageId(source._automaticRecoveryRootClientMessageId)
     ? source._automaticRecoveryRootClientMessageId
@@ -2090,7 +2163,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       rootClientMessageId,
       reason: "silent_no_progress",
     });
-    return;
+    return declined("silent_no_progress", errorCode);
   }
   if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) {
     await appendRecoveryGiveUpTerminalCard(client, {
@@ -2099,7 +2172,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       rootClientMessageId,
       reason: "retry_exhausted",
     });
-    return;
+    return declined("retry_exhausted", errorCode);
   }
   const semanticRecoveryAttempt = currentAttempt + 1;
   const identity = turnRecoveryAttemptIdentity(
@@ -2115,7 +2188,9 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   const sourceMedia = Array.isArray(source._retryMedia)
     ? source._retryMedia
     : Array.isArray(source._media) ? source._media : undefined;
-  if (mode === "replay" && sourceMedia && !replayMediaIsDurable(sourceMedia)) return;
+  if (mode === "replay" && sourceMedia && !replayMediaIsDurable(sourceMedia)) {
+    return declined("media_not_durable", errorCode);
+  }
   const replyTo = source._replyTo && typeof source._replyTo === "object" &&
       !Array.isArray(source._replyTo)
     ? source._replyTo as Record<string, unknown>
@@ -2164,7 +2239,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     ts: Date.now(),
     clientMessageId: identity.clientMessageId,
   };
-  await enqueueAutomaticRecoveryJob(client, {
+  const enqueued = await enqueueAutomaticRecoveryJob(client, {
     userId: input.uid,
     sessionId: input.sessionId,
     rootClientMessageId,
@@ -2176,6 +2251,21 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     request,
     tapeSha256: input.tapeSha256,
   });
+  if (!enqueued) return declined("enqueue_rejected", errorCode);
+  return {
+    scheduled: true,
+    sourceClientMessageId: clientMessageId,
+    rootClientMessageId,
+    errorCode,
+    mode,
+    attempt: semanticRecoveryAttempt,
+    max: AUTOMATIC_TURN_RETRY_MAX,
+    displayText,
+    agentId: input.turn.payload.agentId,
+    ...(typeof route.model === "string" && route.model.length > 0
+      ? { model: route.model }
+      : {}),
+  };
 }
 
 function tapeAnchor(
@@ -8784,6 +8874,9 @@ export function createPgSessionsBackend(
         _losslessFinalizeSingleflightKey(userId, request),
         async (): Promise<LosslessTurnTapeFinalizeResult> => {
       let goalUsageChanged = false;
+      // Decided inside the Phase B tx, published only after commit so the
+      // browser never learns about a recovery job that later rolled back.
+      let recoveryDecision: AutomaticRecoveryDecision | null = null;
       // Personal/test namespaces also use this backend in some deployments,
       // but only `c:<uid>` sessions participate in commercial settlement.
       const billingUserId = /^c:[1-9][0-9]*$/.test(userId)
@@ -9651,7 +9744,7 @@ export function createPgSessionsBackend(
           });
         }
         if (billingUserId !== null && !turn.payload.continuationOfTurnKey) {
-          await scheduleAutomaticRecoveryForFinalizedTurn(client, {
+          recoveryDecision = await scheduleAutomaticRecoveryForFinalizedTurn(client, {
             uid: billingUserId,
             sessionUserId: userId,
             sessionId: request.sessionId,
@@ -9684,6 +9777,16 @@ export function createPgSessionsBackend(
       }
       if (goalUsageChanged && result.applied === "finalized") {
         await notifyGoalUsageChanges(options.onGoalUsageChanged, [{ userId, sessionId: request.sessionId }]);
+      }
+      if (recoveryDecision && result.applied === "finalized" && options.onAutomaticRecoveryDecision) {
+        // Sideband only: a failed broadcast must not fail the finalize (the
+        // durable job / terminal card already committed; the browser will
+        // converge via outbound.ack{recovery} or history sync instead).
+        await Promise.allSettled([
+          Promise.resolve(
+            options.onAutomaticRecoveryDecision(userId, request.sessionId, recoveryDecision),
+          ),
+        ]);
       }
       return result;
         },
