@@ -103,6 +103,10 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   const [expandedDelegates, setExpandedDelegates] = useState<ReadonlySet<string>>(
     () => new Set<string>(),
   );
+  /** best-effort 会话标题（listSessions 失败则保持空 Map）。 */
+  const [sessionTitles, setSessionTitles] = useState<ReadonlyMap<string, string>>(
+    () => new Map(),
+  );
 
   // 窗口口径图表（默认 7d）。
   const [window, setWindow] = useState<UsageReportWindow>("7d");
@@ -181,6 +185,26 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
       alive = false;
     };
   }, [auth, window, reportReloadTick, boardProjectId, scopeQuery.blocked]);
+
+  // 会话标题：与用量首屏解耦，缺 listSessions / 失败均静默。
+  useEffect(() => {
+    let alive = true;
+    if (typeof api.listSessions !== "function") return;
+    api
+      .listSessions(auth)
+      .then((list) => {
+        if (!alive) return;
+        const map = new Map<string, string>();
+        for (const session of list) {
+          map.set(session.id, session.title);
+        }
+        setSessionTitles(map);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [auth]);
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMore) return;
@@ -308,31 +332,32 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
 
   return (
     <div className="flex flex-col">
-      {/* 视图 + 窗口切换 pill（作用于下面整个图表区 / 按模型表） */}
-      <div className="flex items-center justify-between gap-3 px-5 pt-4">
-        <div className="min-w-0">
-          <div className="text-[11px] font-medium uppercase tracking-wide text-faint">
-            {usageView === "overview" ? "用量总览" : "按模型统计"} · 近 {REPORT_WINDOW_NOUN[window]}
-          </div>
-          <p className="mt-1 text-caption text-muted">
-            按运行时项目归属 / 迁移回填。会话后来移动不会改写已入账行；delegate 归入父会话项目。
-          </p>
+      {/* 标题 + 项目范围；窗口/视图分两行，避免窄 Modal 截断 */}
+      <div className="flex flex-col gap-2 px-5 pt-4">
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-section font-medium text-fg">用量统计</div>
+          <ProjectScopeSelect className="w-44 shrink-0" />
         </div>
-        <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
-          <ProjectScopeSelect className="w-40 shrink-0" />
-          <Tabs
-            aria-label="用量视图"
-            value={usageView}
-            onValueChange={(v) => setUsageView(v as "overview" | "by-model")}
-            items={VIEWS}
-          />
+        <div className="flex flex-wrap items-center gap-2">
           <Tabs
             aria-label="统计窗口"
             value={window}
             onValueChange={(v) => setWindow(v as UsageReportWindow)}
             items={WINDOWS}
           />
+          <Tabs
+            aria-label="用量视图"
+            value={usageView}
+            onValueChange={(v) => setUsageView(v as "overview" | "by-model")}
+            items={VIEWS}
+            className="ml-auto"
+          />
         </div>
+        {scope.kind !== "all" && (
+          <p className="text-caption text-muted">
+            按会话当时所属项目统计，后续移动会话不改写历史；组队成员的消耗计入发起会话。
+          </p>
+        )}
       </div>
 
       {reportLoading ? (
@@ -365,15 +390,20 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         report && rs && (
           <>
             {/* 窗口口径 4 张 Stat 卡 */}
-            <div className="grid grid-cols-2 gap-2 px-5 py-4">
-              <Stat label={`请求数 · 近${REPORT_WINDOW_NOUN[window]}`} value={groupDigits(rs.requests)} />
-              <Stat
-                label={`消耗积分 · 近${REPORT_WINDOW_NOUN[window]}`}
-                value={`${formatCredits(rs.credits)} 积分`}
-                accent
-              />
-              <Stat label={`输入 token · 近${REPORT_WINDOW_NOUN[window]}`} value={formatCompactCount(rs.input_tokens)} />
-              <Stat label={`输出 token · 近${REPORT_WINDOW_NOUN[window]}`} value={formatCompactCount(rs.output_tokens)} />
+            <div className="px-5 py-4">
+              <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
+                近 {REPORT_WINDOW_NOUN[window]}
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <Stat label="请求数" value={groupDigits(rs.requests)} />
+                <Stat
+                  label="消耗积分"
+                  value={`${formatCredits(rs.credits)} 积分`}
+                  accent
+                />
+                <Stat label="输入 token" value={formatCompactCount(rs.input_tokens)} />
+                <Stat label="输出 token" value={formatCompactCount(rs.output_tokens)} />
+              </div>
             </div>
 
             {usageView === "by-model" ? (
@@ -418,7 +448,6 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
             <div className="grid grid-cols-1 gap-3 px-5 pb-4 sm:grid-cols-2">
               <ChartCard
                 title="积分消耗趋势"
-                hint={`近 ${REPORT_WINDOW_NOUN[window]}`}
                 height={200}
                 ariaLabel={`积分消耗趋势，近 ${REPORT_WINDOW_NOUN[window]}`}
                 dataTable={{
@@ -434,7 +463,6 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
               </ChartCard>
               <ChartCard
                 title="请求次数"
-                hint={`近 ${REPORT_WINDOW_NOUN[window]}`}
                 height={200}
                 ariaLabel={`请求次数趋势，近 ${REPORT_WINDOW_NOUN[window]}`}
                 dataTable={{
@@ -450,7 +478,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
               </ChartCard>
               <ChartCard
                 title="按模型积分构成"
-                hint="扣费前 5 · 余并「其他」"
+                hint="消耗最高的 5 个模型，其余合并为「其他」"
                 height={220}
                 ariaLabel={`按模型积分构成，近 ${REPORT_WINDOW_NOUN[window]}`}
                 dataTable={{
@@ -472,7 +500,6 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
               </ChartCard>
               <ChartCard
                 title="Token 构成"
-                hint={`近 ${REPORT_WINDOW_NOUN[window]}`}
                 height={220}
                 ariaLabel={`Token 构成，近 ${REPORT_WINDOW_NOUN[window]}`}
                 dataTable={{
@@ -500,8 +527,11 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         )
       )}
 
-      {/* 缓存命中率 + 节省（全生命周期口径） */}
+      {/* 累计口径（全生命周期，独立于窗口） */}
       <div className="border-t border-border px-5 py-4">
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
+          累计 · 自开通以来
+        </div>
         <div className="flex items-center justify-between pb-1.5">
           <span className="text-[12.5px] text-muted">缓存命中率</span>
           <span className="text-[12.5px] font-medium tabular-nums text-fg">
@@ -555,27 +585,40 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                 const delegates = row.delegates ?? [];
                 const hasDelegate = delegates.length > 0;
                 const isOpen = hasDelegate && expandedDelegates.has(row.session_id);
+                const title = sessionTitles.get(row.session_id);
+                const hasTitle = Boolean(title);
                 return (
                   <li key={row.session_id} className="rounded-lg px-2 py-2 hover:bg-hover">
                     <div className="flex items-center gap-3">
                       <span className="min-w-0 flex-1">
                         <span className="flex min-w-0 items-center gap-1.5">
-                          <span className="truncate font-mono text-[12.5px] text-fg">
-                            {row.session_id}
-                          </span>
+                          {hasTitle ? (
+                            <span className="truncate text-body text-fg">{title}</span>
+                          ) : (
+                            <span className="truncate font-mono text-[12.5px] text-fg">
+                              {row.session_id}
+                            </span>
+                          )}
                           {row.delegate_only ? (
                             <span className="shrink-0 rounded-full bg-hover px-1.5 py-px text-[10.5px] text-muted">
                               组队
                             </span>
                           ) : null}
                         </span>
-                        <span className="block truncate text-[11.5px] text-faint">
+                        <span className="block truncate text-caption text-faint">
                           {groupDigits(row.requests)} 次 · {formatCompactCount(tok)} token ·{" "}
                           {shortTime(row.last_used_at)}
+                          {hasTitle ? (
+                            <>
+                              {" · "}
+                              <span>{row.session_id.slice(0, 12)}</span>
+                            </>
+                          ) : null}
                         </span>
                       </span>
                       <span className="shrink-0 text-[13px] font-medium tabular-nums text-fg">
-                        {formatCredits(row.billed_credits)}
+                        <span>{formatCredits(row.billed_credits)}</span>
+                        <span className="ml-0.5 text-caption text-faint">积分</span>
                       </span>
                     </div>
                     {hasDelegate && (
@@ -611,7 +654,8 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                               </span>
                             </span>
                             <span className="shrink-0 tabular-nums text-muted">
-                              {formatCredits(d.billed_credits)}
+                              <span>{formatCredits(d.billed_credits)}</span>
+                              <span className="ml-0.5 text-caption text-faint">积分</span>
                             </span>
                           </li>
                         ))}
