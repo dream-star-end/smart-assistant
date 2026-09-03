@@ -26,6 +26,7 @@ import {
   expireGenPlaceholdersAgainstServerRows,
   normalizeDelegateCards,
   normalizeGoalCards,
+  rememberSettledPermissionRequestId,
   resetAgentFrameSeqCursorsForSession,
   resetFrameSeqCursor,
   type FrameEffects,
@@ -3294,6 +3295,9 @@ export class ChatSocket {
       ...(s._cancelledAutomaticRecoveryIds
         ? { _cancelledAutomaticRecoveryIds: { ...s._cancelledAutomaticRecoveryIds } }
         : {}),
+      ...(s._settledPermissionRequestIds
+        ? { _settledPermissionRequestIds: { ...s._settledPermissionRequestIds } }
+        : {}),
       ...(s._automaticRecoveryDecisions
         ? { _automaticRecoveryDecisions: { ...s._automaticRecoveryDecisions } }
         : {}),
@@ -3381,6 +3385,11 @@ export class ChatSocket {
       stored._cancelledAutomaticRecoveryIds &&
       typeof stored._cancelledAutomaticRecoveryIds === "object"
         ? { ...stored._cancelledAutomaticRecoveryIds }
+        : undefined;
+    s._settledPermissionRequestIds =
+      stored._settledPermissionRequestIds &&
+      typeof stored._settledPermissionRequestIds === "object"
+        ? { ...stored._settledPermissionRequestIds }
         : undefined;
     s._automaticRecoveryDecisions =
       stored._automaticRecoveryDecisions &&
@@ -4115,6 +4124,12 @@ export class ChatSocket {
       // the user has to unblock the engine. mergeFullServerWins keeps the same
       // rows on the REST path.
       if (isUnresolvedPermissionPrompt(message)) return true;
+      // INC-20260903-PENDING-PERMISSION-ZOMBIE: a resolved card may be dropped
+      // here, but its requestId must stay known-settled so a stale hello
+      // catch-up cannot re-open it as a fresh "waiting" prompt.
+      if (message.role === "permission" && message._resolved === true) {
+        rememberSettledPermissionRequestId(sess, message.requestId);
+      }
       if (preserveStreamingPointer && message === streamingAssistant) return true;
       if (shouldRetainLiveProcessOnOwnerReset(message, authority, incomingProcessOwners)) {
         return true;
@@ -5162,6 +5177,9 @@ export class ChatSocket {
       sess._stopSettlement = undefined;
       this.clearSendingState(sess, { clearThinking: true });
     } else if (item.requestId) {
+      // Our own durable answer is a settlement too: a stale hello catch-up
+      // must not re-open this prompt after full-sync dropped the card.
+      rememberSettledPermissionRequestId(sess, item.requestId);
       const permission = sess.messages.find((message) => message.requestId === item.requestId);
       if (permission) {
         permission._resolved = true;

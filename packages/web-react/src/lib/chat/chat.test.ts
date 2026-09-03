@@ -49,9 +49,12 @@ import {
   applyResumeFailed,
   applyTurnStatus,
   applyTurnUsage,
+  isSettledPermissionRequestId,
   normalizeDelegateCards,
   normalizeGoalCards,
+  rememberSettledPermissionRequestId,
   resetFrameSeqCursor,
+  SETTLED_PERMISSION_REQUEST_IDS_MAX,
   type FrameEffects,
 } from "./reducer";
 import {
@@ -4424,6 +4427,7 @@ describe("Phase-A final-only tape projection retry", () => {
         _clientMessageId: clientMessageId,
         _turnOwnerId: clientMessageId,
         toolName: "Bash",
+        requestId: `toolu-done-${sessionId}`,
         _resolved: true,
       } as ChatMessage,
       {
@@ -4443,6 +4447,19 @@ describe("Phase-A final-only tape projection retry", () => {
       clientMessageId,
       `perm-open-${sessionId}`,
     ]);
+    // INC-20260903-PENDING-PERMISSION-ZOMBIE: the dropped resolved card's
+    // requestId stays known-settled so a stale hello replay cannot re-open it.
+    expect(isSettledPermissionRequestId(sess, `toolu-done-${sessionId}`)).toBe(true);
+    expect(applyPermissionRequest(sess, {
+      type: "outbound.permission_request",
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+      channel: "webchat",
+      peer: { id: sessionId, kind: "dm" },
+      requestId: `toolu-done-${sessionId}`,
+      toolName: "Bash",
+      clientMessageId,
+    } as OutboundPermissionRequestWire)).toBeNull();
+    expect(sess.messages.filter((m) => m.role === "permission")).toHaveLength(1);
     sock.stop();
   });
 
@@ -6882,6 +6899,46 @@ describe("ChatSocket interrupted continuation", () => {
     ).toBe(true);
     sock.stop();
     reloaded.stop();
+  });
+
+  test("known-settled permission requestIds survive toStored/loadStored so a post-reload hello replay cannot re-open them (INC-20260903-PENDING-PERMISSION-ZOMBIE)", () => {
+    const sessionId = "s-settled-permission-persist";
+    const sock = makeSocket();
+    const session = sock.ensureSession(sessionId, "main");
+    const frameBase = {
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+      channel: "webchat",
+      peer: { id: sessionId, kind: "dm" },
+    };
+    applyPermissionRequest(session, {
+      ...frameBase, type: "outbound.permission_request", requestId: "toolu_persist", toolName: "Bash",
+    } as OutboundPermissionRequestWire);
+    applyPermissionSettled(session, {
+      ...frameBase, type: "outbound.permission_settled", requestId: "toolu_persist", behavior: "deny", reason: "disconnect",
+    } as OutboundPermissionSettledWire);
+
+    const stored = sock.toStored(sessionId)!;
+    expect(stored._settledPermissionRequestIds).toEqual({ toolu_persist: true });
+    // Serialisable (no class instances / functions).
+    expect(JSON.parse(JSON.stringify(stored))._settledPermissionRequestIds).toEqual({ toolu_persist: true });
+
+    const reloaded = makeSocket();
+    reloaded.loadStored(JSON.parse(JSON.stringify(stored)));
+    const restored = reloaded.sessions.get(sessionId)!;
+    expect(isSettledPermissionRequestId(restored, "toolu_persist")).toBe(true);
+    restored.messages = restored.messages.filter((m) => m.role !== "permission");
+    expect(applyPermissionRequest(restored, {
+      ...frameBase, type: "outbound.permission_request", requestId: "toolu_persist", toolName: "Bash",
+    } as OutboundPermissionRequestWire)).toBeNull();
+
+    // A stored session without the field loads cleanly (older persisted shape).
+    const legacy = makeSocket();
+    const { _settledPermissionRequestIds: _dropped, ...legacyStored } = stored;
+    legacy.loadStored({ ...legacyStored, _settledPermissionRequestIds: "garbage" } as unknown as typeof stored);
+    expect(legacy.sessions.get(sessionId)!._settledPermissionRequestIds).toBeUndefined();
+    sock.stop();
+    reloaded.stop();
+    legacy.stop();
   });
 });
 
@@ -9892,6 +9949,109 @@ describe("applyPermissionSettled — frameSeq exemption + requestId idempotency"
     expect(s.messages.filter((m) => m.role === "permission" && m.requestId === requestId)).toHaveLength(1);
     expect(card._resolved).toBe(true);
     expect(card._behavior).toBe("allow");
+  });
+});
+
+describe("INC-20260903-PENDING-PERMISSION-ZOMBIE — a settled requestId never re-opens a waiting card", () => {
+  const sessionKey = "agent:main:webchat:dm:webmtk6eghge4d8zo";
+  const requestId = "toolu_01ZombieBash";
+  const clientMessageId = "m-mtk6eghg-7p-lxal";
+
+  function permFrame(over: Record<string, unknown> = {}): OutboundPermissionRequestWire {
+    return {
+      type: "outbound.permission_request",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "webmtk6eghge4d8zo", kind: "dm" },
+      requestId,
+      toolName: "Bash",
+      toolUseId: requestId,
+      clientMessageId,
+      inputPreview: "git status",
+      ...over,
+    } as OutboundPermissionRequestWire;
+  }
+
+  function settledFrame(over: Record<string, unknown> = {}): OutboundPermissionSettledWire {
+    return {
+      type: "outbound.permission_settled",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "webmtk6eghge4d8zo", kind: "dm" },
+      requestId,
+      behavior: "deny",
+      reason: "disconnect",
+      ...over,
+    } as OutboundPermissionSettledWire;
+  }
+
+  test("hello catch-up re-sending a request the browser saw settled creates no card (card dropped by full-sync)", () => {
+    const s = sess();
+    const card = applyPermissionRequest(s, permFrame())!;
+    expect(card._resolved).toBe(false);
+    applyPermissionSettled(s, settledFrame());
+    expect(card._resolved).toBe(true);
+    expect(isSettledPermissionRequestId(s, requestId)).toBe(true);
+
+    // Full-sync / owner reset dropped the resolved card; the stale Master row
+    // is replayed at the next hello.
+    s.messages = s.messages.filter((m) => m.role !== "permission");
+    const zombie = applyPermissionRequest(s, permFrame());
+    expect(zombie).toBeNull();
+    expect(s.messages.filter((m) => m.role === "permission")).toHaveLength(0);
+  });
+
+  test("while the resolved card is still present, a re-sent request returns it unchanged (no second card)", () => {
+    const s = sess();
+    const card = applyPermissionRequest(s, permFrame())!;
+    applyPermissionSettled(s, settledFrame({ behavior: "allow", reason: "remote" }));
+    const again = applyPermissionRequest(s, permFrame());
+    expect(again).toBe(card);
+    expect(card._resolved).toBe(true);
+    expect(s.messages.filter((m) => m.role === "permission")).toHaveLength(1);
+  });
+
+  test("settled overtaking its request still materialises exactly one card, already resolved", () => {
+    const s = sess();
+    applyPermissionSettled(s, settledFrame({ behavior: "deny", reason: "timeout" }));
+    expect(isSettledPermissionRequestId(s, requestId)).toBe(true);
+    const card = applyPermissionRequest(s, permFrame());
+    expect(card).not.toBeNull();
+    expect(card!._resolved).toBe(true);
+    expect(card!._settledReason).toBe("timeout");
+    // The stash is consumed; a later replay of the same request is now a zombie.
+    s.messages = s.messages.filter((m) => m.role !== "permission");
+    expect(applyPermissionRequest(s, permFrame())).toBeNull();
+  });
+
+  test("detached ask_user prompts are exempt: a settled id may still be re-materialised by the tape", () => {
+    const s = sess();
+    const askId = "ask-user:" + "ab".repeat(16);
+    rememberSettledPermissionRequestId(s, askId);
+    const card = applyPermissionRequest(s, permFrame({
+      requestId: askId, toolName: "AskUserQuestion", detachedAskUser: true, clientMessageId: undefined, toolUseId: undefined,
+    }));
+    expect(card).not.toBeNull();
+    expect(card!.id).toBe(askId);
+  });
+
+  test("the remembered set is bounded FIFO and ignores empty ids", () => {
+    const s = sess();
+    rememberSettledPermissionRequestId(s, undefined);
+    rememberSettledPermissionRequestId(s, "");
+    expect(s._settledPermissionRequestIds).toBeUndefined();
+    for (let i = 0; i < SETTLED_PERMISSION_REQUEST_IDS_MAX + 5; i++) {
+      rememberSettledPermissionRequestId(s, `req-${i}`);
+    }
+    const keys = Object.keys(s._settledPermissionRequestIds!);
+    expect(keys).toHaveLength(SETTLED_PERMISSION_REQUEST_IDS_MAX);
+    expect(isSettledPermissionRequestId(s, "req-0")).toBe(false);
+    expect(isSettledPermissionRequestId(s, "req-4")).toBe(false);
+    expect(isSettledPermissionRequestId(s, "req-5")).toBe(true);
+    expect(isSettledPermissionRequestId(s, `req-${SETTLED_PERMISSION_REQUEST_IDS_MAX + 4}`)).toBe(true);
+    // Re-remembering an existing id does not evict anything.
+    rememberSettledPermissionRequestId(s, "req-5");
+    expect(Object.keys(s._settledPermissionRequestIds!)).toHaveLength(SETTLED_PERMISSION_REQUEST_IDS_MAX);
   });
 });
 

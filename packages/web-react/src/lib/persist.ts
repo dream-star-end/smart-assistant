@@ -162,6 +162,9 @@ export type StoredSession = {
   _activeAgentId?: string;
   _dispatchPaused?: boolean;
   _cancelledAutomaticRecoveryIds?: Record<string, true>;
+  /** Permission requestIds already settled in this browser; a stale re-sent
+   *  `outbound.permission_request` for them must not open a new card. */
+  _settledPermissionRequestIds?: Record<string, true>;
   _automaticRecoveryDecisions?: Record<string, true>;
   _turnStartedAt?: number;
   _lastFrameAt?: number;

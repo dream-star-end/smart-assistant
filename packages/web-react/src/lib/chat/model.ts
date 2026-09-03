@@ -578,6 +578,12 @@ export type ChatSession = {
     reason?: string | null;
     answers?: Record<string, string>;
   }>;
+  /** requestIds this browser has already seen settled (settled frame, own
+   *  durable response, resolved card). A later `outbound.permission_request`
+   *  for one of these — e.g. Master hello catch-up replaying a stale durable
+   *  row after the card was dropped by full-sync — must never open a fresh
+   *  "waiting" card. Persisted with StoredSession; bounded FIFO. */
+  _settledPermissionRequestIds?: Record<string, true>;
   /** server canonical 增量游标（历史加载 getSession 的 sinceSeq；随 StoredSession 落地）。*/
   _maxSeq?: number;
   /** Server history revision paired with `_maxSeq`; persisted across reload. */

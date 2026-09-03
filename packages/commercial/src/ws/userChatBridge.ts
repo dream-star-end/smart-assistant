@@ -180,6 +180,7 @@ import {
   readPendingPermissionPrompts,
   releaseTurnControlForRetry,
   resolvePermissionExpiresAt,
+  settlePermissionPromptFromRuntime,
   TurnControlConflictError,
 } from "../dispatch/turnControlStore.js";
 import {
@@ -7840,6 +7841,60 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 : null,
               expiresAt: resolvePermissionExpiresAt(parsedPermission.expiresAt),
             }).then(() => {});
+          }
+        } else if (permissionText?.includes('"outbound.permission_settled"')) {
+          // INC-20260903-PENDING-PERMISSION-ZOMBIE — the runtime is the only
+          // authority on whether a prompt is still answerable. Every settlement
+          // it reports (another tab answered, Stop/disconnect/timeout/crash
+          // auto-deny, duplicate already_settled) must close the durable row,
+          // otherwise the hello-time replay re-materialises a dead card on
+          // every reconnect. Side effect only: the frame still flows to userWs
+          // unchanged, and a DB hiccup here must not stall the live stream.
+          let parsedSettled: unknown = null;
+          try { parsedSettled = JSON.parse(permissionText); } catch { /* generic frame */ }
+          if (
+            isPlainRecord(parsedSettled) &&
+            parsedSettled.type === "outbound.permission_settled" &&
+            typeof parsedSettled.requestId === "string" &&
+            (parsedSettled.behavior === "allow" || parsedSettled.behavior === "deny") &&
+            isPlainRecord(parsedSettled.peer) &&
+            typeof parsedSettled.peer.id === "string"
+          ) {
+            const settledRequestId = parsedSettled.requestId;
+            const settledSessionId = parsedSettled.peer.id;
+            const settledBehavior = parsedSettled.behavior;
+            const settledReason = typeof parsedSettled.reason === "string"
+              ? parsedSettled.reason
+              : "unknown";
+            const settledAnswers = isPlainRecord(parsedSettled.answers)
+              ? Object.fromEntries(
+                  Object.entries(parsedSettled.answers)
+                    .filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+                )
+              : null;
+            void settlePermissionPromptFromRuntime(deps.pgPool, {
+              userId: uid,
+              sessionId: settledSessionId,
+              requestId: settledRequestId,
+              behavior: settledBehavior,
+              reason: settledReason,
+              answers: settledAnswers,
+            }).then((closed) => {
+              if (closed) {
+                bridgeLog?.info("user-chat-bridge: runtime settlement closed durable permission prompt", {
+                  sessionId: settledSessionId,
+                  requestId: settledRequestId,
+                  behavior: settledBehavior,
+                  reason: settledReason,
+                });
+              }
+            }).catch((error) => {
+              bridgeLog?.warn("user-chat-bridge: durable permission settlement failed", {
+                sessionId: settledSessionId,
+                requestId: settledRequestId,
+                err: (error as Error)?.message ?? String(error),
+              });
+            });
           }
         }
       }

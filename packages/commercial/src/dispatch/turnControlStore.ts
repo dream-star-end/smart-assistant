@@ -189,6 +189,19 @@ export async function admitDurableControl(
     }
 
     if (input.kind === 'stop') {
+      // INC-20260903-PENDING-PERMISSION-ZOMBIE — a user Stop makes every
+      // still-open prompt of that turn unanswerable (the runtime aborts the
+      // tool). Close the durable authority in the same transaction so the
+      // hello-time replay can never re-materialise a card the runtime already
+      // gave up on. Detached ask_user prompts outlive their turn and are
+      // deliberately left alone.
+      await cancelPendingPermissionPromptsForTurn(client, {
+        userId: input.userId,
+        sessionId: input.sessionId,
+        clientMessageId: effectiveRootClientMessageId,
+        reason: 'user_stop',
+        controlId: input.controlId,
+      })
       const cancellable = await client.query<{
         status: 'queued' | 'leased' | 'sent'
         dispatch_id: string | null
@@ -277,6 +290,115 @@ export async function settleStopControlsForTurn(
     [input.userId.toString(), input.sessionId, input.clientMessageId],
   )
   return result.rowCount ?? 0
+}
+
+// ---------------------------------------------------------------------------
+// INC-20260903-PENDING-PERMISSION-ZOMBIE — durable settlement of prompts.
+//
+// Before this, only the user's own inbound.permission_response ever moved a
+// turn_permission_requests row out of `pending`. Every container-side
+// settlement (Stop → runtime abort, disconnect/timeout/crash auto-deny,
+// another tab answering first) left the Master row `pending` until expires_at,
+// and the hello-time replay from INC-…-LOST then re-sent a prompt whose
+// runtime waiter was long gone: a fresh "等待回答" card on every reconnect.
+// "DB pending" must mean "still answerable". These helpers close the row from
+// every settlement authority Master can observe.
+// ---------------------------------------------------------------------------
+
+export type PermissionPromptCancelReason =
+  | 'user_stop'
+  | 'turn_finalized'
+  | 'runtime_settled'
+
+/** Detached ask_user prompts (`ask-user:` requestIds) are not bound to a turn:
+ * they stay answerable for 24h after Stop / turn end / session eviction and
+ * must never be closed by turn-scoped settlement. */
+const NOT_DETACHED_ASK_USER_SQL = `request_id NOT LIKE 'ask-user:%'`
+
+/** Close every still-pending prompt that belongs to a turn lineage. With a
+ * null clientMessageId (legacy peer-wide Stop) every non-detached prompt of the
+ * session is closed — the runtime interrupts the whole peer in that case.
+ * Matches the root itself and recovery children whose request carried the
+ * root as `clientMessageId`, mirroring settleStopControlsForTurn. */
+export async function cancelPendingPermissionPromptsForTurn(
+  q: Pick<Pool | PoolClient, 'query'>,
+  input: {
+    userId: bigint
+    sessionId: string
+    clientMessageId: string | null
+    reason: PermissionPromptCancelReason
+    controlId?: string | null
+  },
+): Promise<number> {
+  const result = await q.query(
+    `UPDATE turn_permission_requests p
+        SET status='cancelled',
+            response_control_id=COALESCE(p.response_control_id,$4),
+            response_json=COALESCE(p.response_json,$5::jsonb),
+            updated_at=NOW()
+      WHERE p.user_id=$1 AND p.session_id=$2 AND p.status='pending'
+        AND ${NOT_DETACHED_ASK_USER_SQL}
+        AND (
+          $3::text IS NULL
+          OR p.client_message_id=$3
+          OR EXISTS (
+            SELECT 1 FROM turn_recovery_jobs j
+             WHERE j.user_id=p.user_id AND j.session_id=p.session_id
+               AND j.root_client_message_id=$3
+               AND j.request_json->>'clientMessageId'=p.client_message_id
+          )
+          OR EXISTS (
+            SELECT 1 FROM turn_recovery_jobs j
+             WHERE j.user_id=p.user_id AND j.session_id=p.session_id
+               AND j.root_client_message_id=p.client_message_id
+               AND j.request_json->>'clientMessageId'=$3
+          )
+        )`,
+    [
+      input.userId.toString(), input.sessionId, input.clientMessageId,
+      input.controlId ?? null,
+      JSON.stringify({ behavior: 'deny', settledBy: 'master', reason: input.reason }),
+    ],
+  )
+  return result.rowCount ?? 0
+}
+
+export interface RuntimePermissionSettlementInput {
+  userId: bigint
+  sessionId: string
+  requestId: string
+  behavior: 'allow' | 'deny'
+  reason: string
+  answers?: Record<string, string> | null
+}
+
+/** Record a container-emitted `outbound.permission_settled` frame. The runtime
+ * is the only authority on whether a prompt is still answerable; whatever it
+ * reports (remote answer from another tab, disconnect/timeout/crash deny,
+ * duplicate already_settled) means the row must leave `pending`. A row that
+ * the user's own durable response already moved to `responded` is untouched. */
+export async function settlePermissionPromptFromRuntime(
+  q: Pick<Pool | PoolClient, 'query'>,
+  input: RuntimePermissionSettlementInput,
+): Promise<boolean> {
+  const status = input.behavior === 'allow' ? 'responded' : 'cancelled'
+  const result = await q.query(
+    `UPDATE turn_permission_requests
+        SET status=$4,
+            response_json=COALESCE(response_json,$5::jsonb),
+            updated_at=NOW()
+      WHERE user_id=$1 AND request_id=$2 AND session_id=$3 AND status='pending'`,
+    [
+      input.userId.toString(), input.requestId, input.sessionId, status,
+      JSON.stringify({
+        behavior: input.behavior,
+        settledBy: 'runtime',
+        reason: input.reason,
+        ...(input.answers ? { answers: input.answers } : {}),
+      }),
+    ],
+  )
+  return result.rowCount === 1
 }
 
 /** Claim due controls with PostgreSQL row locks. A dead Master's lease expires
@@ -420,10 +542,28 @@ export async function readPendingPermissionPrompts(
     input_json: unknown
     expires_at: Date | string
   }>(
-    `SELECT request_id,client_message_id,tool_use_id,tool_name,input_json,expires_at
-       FROM turn_permission_requests
-      WHERE user_id=$1 AND session_id=$2 AND status='pending' AND expires_at>NOW()
-      ORDER BY created_at ASC
+    // Defence in depth for rows persisted before durable settlement existed
+    // (INC-…-ZOMBIE): a turn the user durably stopped is never answerable
+    // again, even if its row is still `pending`. Detached ask_user survives
+    // Stop by design and is exempt.
+    `SELECT p.request_id,p.client_message_id,p.tool_use_id,p.tool_name,p.input_json,p.expires_at
+       FROM turn_permission_requests p
+      WHERE p.user_id=$1 AND p.session_id=$2 AND p.status='pending' AND p.expires_at>NOW()
+        AND (
+          p.request_id LIKE 'ask-user:%'
+          OR p.client_message_id IS NULL
+          OR NOT EXISTS (
+            SELECT 1 FROM turn_control_requests c
+             WHERE c.user_id=p.user_id AND c.session_id=p.session_id AND c.kind='stop'
+               AND c.status<>'cancelled'
+               AND (
+                 c.root_client_message_id=p.client_message_id
+                 -- legacy peer-wide Stop: only one admitted after the prompt
+                 OR (c.root_client_message_id IS NULL AND c.created_at>=p.created_at)
+               )
+          )
+        )
+      ORDER BY p.created_at ASC
       LIMIT $3`,
     [input.userId.toString(), input.sessionId, limit],
   )

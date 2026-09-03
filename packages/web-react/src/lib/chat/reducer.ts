@@ -2770,6 +2770,26 @@ function consumePendingPermissionSettlement(sess: ChatSession, msg: ChatMessage)
   delete sess._pendingPermissionSettlements[requestId];
 }
 
+/** Bounded so a long-lived session cannot grow the persisted set forever. */
+export const SETTLED_PERMISSION_REQUEST_IDS_MAX = 200;
+
+/** Remember that `requestId` is settled from this browser's point of view.
+ *  Insertion order is preserved by plain-object key order, so trimming the
+ *  first keys drops the oldest entries. */
+export function rememberSettledPermissionRequestId(sess: ChatSession, requestId: string | undefined): void {
+  if (typeof requestId !== "string" || !requestId) return;
+  const set = sess._settledPermissionRequestIds ?? {};
+  if (set[requestId] === true) return;
+  set[requestId] = true;
+  const keys = Object.keys(set);
+  for (let i = 0; i < keys.length - SETTLED_PERMISSION_REQUEST_IDS_MAX; i++) delete set[keys[i]];
+  sess._settledPermissionRequestIds = set;
+}
+
+export function isSettledPermissionRequestId(sess: ChatSession, requestId: string | undefined): boolean {
+  return typeof requestId === "string" && sess._settledPermissionRequestIds?.[requestId] === true;
+}
+
 export function applyPermissionRequest(sess: ChatSession, frame: OutboundPermissionRequestWire): ChatMessage | null {
   noteFrameSeqIfNewer(sess, frame);
   const requestId = frame.requestId;
@@ -2782,6 +2802,21 @@ export function applyPermissionRequest(sess: ChatSession, frame: OutboundPermiss
   if (existing) {
     consumePendingPermissionSettlement(sess, existing);
     return existing;
+  }
+  // INC-20260903-PENDING-PERMISSION-ZOMBIE — a prompt this browser already saw
+  // settled (answered here, settled frame, or resolved card later dropped by
+  // full-sync) is dead: the runtime waiter is gone. A re-sent request for it
+  // (Master hello catch-up of a stale durable row) must not open a fresh
+  // "waiting" card the user can never satisfy. A settled frame that merely
+  // overtook its request (stash present) still materialises once, resolved.
+  // Detached ask_user cards are tape rows merged by id and are exempt.
+  const stashedSettlement = sess._pendingPermissionSettlements?.[requestId];
+  if (
+    !stashedSettlement &&
+    isSettledPermissionRequestId(sess, requestId) &&
+    !(typeof requestId === "string" && requestId.startsWith("ask-user:"))
+  ) {
+    return null;
   }
   const detachedAskUser =
     (frame as { detachedAskUser?: unknown }).detachedAskUser === true ||
@@ -2818,6 +2853,7 @@ export function applyPermissionSettled(sess: ChatSession, frame: OutboundPermiss
     reason: frame.reason || null,
     ...(frame.answers && typeof frame.answers === "object" ? { answers: frame.answers } : {}),
   };
+  rememberSettledPermissionRequestId(sess, requestId);
   if (!msg) {
     sess._pendingPermissionSettlements = sess._pendingPermissionSettlements ?? {};
     sess._pendingPermissionSettlements[requestId] = settlement;

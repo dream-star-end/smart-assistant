@@ -232,7 +232,10 @@ import {
   pauseSilentRecoveryLineage,
   settleRecoveryJobForTape,
 } from "../dispatch/turnRecoveryStore.js";
-import { settleStopControlsForTurn } from "../dispatch/turnControlStore.js";
+import {
+  cancelPendingPermissionPromptsForTurn,
+  settleStopControlsForTurn,
+} from "../dispatch/turnControlStore.js";
 import { filterMonotonicLiveFramePayloads } from "../dispatch/leftoverFrameFence.js";
 import {
   readClientSessionLiveFrames as readDurableClientSessionLiveFrames,
@@ -1843,6 +1846,16 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     userId: input.uid,
     sessionId: input.sessionId,
     clientMessageId,
+  });
+  // INC-20260903-PENDING-PERMISSION-ZOMBIE — the final tape proves the runtime
+  // is no longer waiting on any tool prompt of this turn (the tool either got
+  // its answer or was aborted). Close leftover pending rows so hello replay
+  // never resurrects them. Detached ask_user rows are exempt inside.
+  await cancelPendingPermissionPromptsForTurn(client, {
+    userId: input.uid,
+    sessionId: input.sessionId,
+    clientMessageId,
+    reason: "turn_finalized",
   });
 
   await settleRecoveryJobForTape(client, {
