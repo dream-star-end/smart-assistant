@@ -2250,11 +2250,17 @@ export class CronScheduler {
           code: err.reason === 'terminal' ? 'DELEGATE_JOB_TERMINAL' : 'DELEGATE_CLAIM_DENIED',
         }
       }
-      logger.warn(`job ${job.id} markSubmitStarted failed before submit`, {
+      logger.warn(`job ${job.id} markSubmitStarted failed at durable submit boundary`, {
         jobId: job.id,
         errorClass: stableCronErrorClass(err),
       })
-      return { kind: 'retryable_failure', code: 'SUBMIT_START_FAILED' }
+      // markSubmitStarted is itself the durable boundary: its implementation
+      // may have persisted `executing` before a later fsync/last-run write
+      // failed. The caller cannot distinguish "nothing happened" from "the
+      // owned occurrence crossed the boundary", so automatic replay is unsafe.
+      // Let tick() settle an executing occurrence as needs_confirmation; a
+      // still-prepared occurrence is consumed terminally without replay.
+      return { kind: 'terminal_failure', code: 'EXECUTION_ERROR' }
     }
     try {
       await this.sessions.submit(
