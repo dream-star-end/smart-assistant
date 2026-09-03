@@ -2705,7 +2705,15 @@ describe("userChatBridge / codex relay — route expiry", () => {
     );
   });
 
-  test("route token is expired if the bridge closes while route creation is in flight", async () => {
+  test("browser close while route creation is in flight keeps the preparing turn alive through drain and forwards it once", async () => {
+    // OCV5-82 (INC-20260903-OCV5-82-SESSION-UNAVAILABLE): browser detach is not
+    // transport death. A turn still in preparation (route creation is inside
+    // trackPreparation) keeps the container bridge and lease alive through
+    // drain, resumes after admission and is forwarded exactly once; the route
+    // must NOT be expired by the pre-transfer identity fence. Only a
+    // container_close / container_error / shutdown cause may win that fence
+    // (modelAuthorityBridge R4-B1/R4-B6). This replaces the pre-OCV5-82
+    // expectation that client_close finalCleanup-ed before creation resumed.
     const delayedToken = "c".repeat(64);
     let resolveRoute!: () => void;
     const routeGate = new Promise<void>((resolve) => { resolveRoute = resolve; });
@@ -2729,12 +2737,32 @@ describe("userChatBridge / codex relay — route expiry", () => {
       const closedP = new Promise<void>((resolve) => ws.once("close", () => resolve()));
       ws.close();
       await closedP;
-      const containerClosed = await waitContainerClose(containerWs, 2_000);
-      assert.equal(containerClosed, true, "bridge must finish cleanup before route creation resumes");
+      // drain keep-alive: the container bridge must survive the browser close
+      // while preparation is in flight (DRAIN_BILLING_MS=300 in this rig, so a
+      // pre-OCV5-82 bridge would already be gone).
+      const containerClosedEarly = await waitContainerClose(containerWs, 600);
+      assert.equal(containerClosedEarly, false, "preparing turn must keep the container bridge alive through drain");
+      assert.equal(expiredTokens.includes(delayedToken), false, "route must not be fenced before creation resumes");
+
+      const frameP = waitContainerNextFrame(containerWs, 3_000);
       resolveRoute();
-      // finalCleanup 已先完成,这个 route 从未转发给容器；late creation 必须
-      // 由 identity fence 立即 expire,不能借“跨桥存活”语义泄漏到 TTL。
+      const frameToContainer = await frameP;
+      const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+      const route = parsed.__oc_codex_route as { baseUrl?: string } | undefined;
+      assert.equal(route?.baseUrl?.includes(delayedToken), true, "late-created route is forwarded to the container");
+      assert.equal(expiredTokens.includes(delayedToken), false, "forwarded route stays usable for the continuing turn");
+
+      // The turn settles from the container side; only then does the route
+      // expire and the drained bridge finish cleanup (exactly-once forward).
+      containerWs.send(JSON.stringify({
+        type: "outbound.codex_billing",
+        requestId: parsed.requestId as string,
+        engineSessionId: ENGINE_SID,
+        status: "success",
+        usage: { input_tokens: 5, output_tokens: 7 },
+      }));
       await waitUntil(() => expiredTokens.includes(delayedToken), 3_000);
+      assert.equal(await waitContainerClose(containerWs, 3_000), true, "drained bridge closes once the settled turn is gone");
     } finally {
       delayedRoute = null;
     }
