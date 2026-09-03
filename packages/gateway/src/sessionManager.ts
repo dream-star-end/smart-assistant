@@ -1497,7 +1497,10 @@ function persistServerAuthoredTurnOutcome(args: {
   const messageId = `srv-${args.peerId}-${args.agentId}-t${args.turnIndex}`
   const thinkingMessageId = `srv-${args.peerId}-${args.agentId}-t${args.turnIndex}-thinking`
   const directWrite = async () => {
-    const uid = args.userId ?? ((await getClientSession(args.peerId))?.userId)
+    // OCV5-94: only the owner is needed here; the timeline view is page-bounded
+    // while the default exact view hydrates every turn tape of the session.
+    const uid = args.userId ??
+      ((await getClientSession(args.peerId, undefined, { view: 'timeline' }))?.userId)
     if (!uid) return undefined // cron-style pre-UI, no owner — skip.
     const baseTs = Date.now()
     // Best-effort thinking write: doesn't block assistant. Failures are
