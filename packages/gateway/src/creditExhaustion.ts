@@ -11,7 +11,7 @@
  * rejects balance ≤ 0 before any engine work starts.
  */
 import { composeMultiplier, computeCostFen } from '@openclaude/protocol'
-import { getModelCatalogClient, lookupCatalogAgentMultiplier } from './modelCatalogClient.js'
+import { getModelCatalogClient } from './modelCatalogClient.js'
 import { lookupPlatformPricing } from './usageCost.js'
 
 export const CREDIT_EXHAUSTED_DETAIL = 'INSUFFICIENT_CREDITS: credit budget exhausted'
@@ -91,8 +91,9 @@ async function lookupAgentMultiplier(agentId: string | undefined): Promise<strin
   const client = getModelCatalogClient()
   if (!client.configured) return null
   try {
-    const view = await client.getView()
-    return lookupCatalogAgentMultiplier(view, id)
+    // Override edits do not bump catalog epoch; getView() can reuse a stale
+    // map. lookupAgentCostMultiplier() is the 60s-forced-refresh entry.
+    return await client.lookupAgentCostMultiplier(id)
   } catch {
     return null
   }
