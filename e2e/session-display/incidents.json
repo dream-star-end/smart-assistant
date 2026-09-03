@@ -2843,6 +2843,29 @@
           "assertion": "[session-unavailable-rootfix] PASS — detach drain, durable cron receipt, rejected convergence and bounded memory retry are locked"
         }
       ]
+    },
+    {
+      "id": "INC-20260903-CCB-TOOL-PHASE-STOP-RED-CARD",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "Cursor Opus/Fable(sand-ccb)会话在模型执行工具期间点「停止生成」,终态被判成 ENGINE_ERROR,渲染红色「任务执行失败」卡而非灰色「已停止生成」;同时 Cursor 引擎所有用户主动停止的轮次都被 cursor_engine_not_success 免单,实际消耗的 token 一分未扣。",
+      "rootFixCommit": "ae967d03",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbUserCancellationDiagnostic.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "browser Stop during a CCB tool call (stop_reason=tool_use) maps to USER_CANCELLED"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorExternalSettle.test.ts",
+          "assertion": "user Stop (error + USER_CANCELLED) charges the tokens actually consumed"
+        }
+      ]
     }
   ]
 }
