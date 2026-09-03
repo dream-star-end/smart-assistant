@@ -85,7 +85,8 @@
     "INC-20260902-CCB-DEFERRED-TOOL-ADAPT",
     "INC-20260902-WEB-TASKBOARD-TIMELINE-HUD",
     "INC-20260902-DELEGATE-ENGINE-BILLING-REQUESTID",
-    "INC-20260829-FAIL-LOUD-ERROR-MSG"
+    "INC-20260829-FAIL-LOUD-ERROR-MSG",
+    "INC-20260903-CURSOR-CLI-ERROR-WASH"
   ],
   "incidents": {
     "INC-20260717-HISTORY-STUCK": {
@@ -555,6 +556,10 @@
         "5806c952",
         "ec03f2b1"
       ]
+    },
+    "INC-20260903-CURSOR-CLI-ERROR-WASH": {
+      "rootFixCommit": "de8aed4cf",
+      "coverageCommits": []
     }
   },
   "importedTrailerHistoryTips": [
