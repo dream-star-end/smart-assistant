@@ -280,13 +280,16 @@ describe("incident ledger superset", () => {
     const selfhost = (JSON.parse(
       readFileSync(path.join(root, "e2e/session-display/incidents.json"), "utf8"),
     ) as { incidents: LedgerIncident[] }).incidents;
+    const frozen = baseline();
+    const droppedTip = frozen.importedTrailerHistoryTips.at(-1);
+    assert.ok(droppedTip);
     const result = checkIncidentLedgerSuperset({
       root,
       skipGit: true,
-      baseline: baseline(),
+      baseline: frozen,
       mergedIncidents: selfhost,
       tombstones: [],
-      trailerTips: trailerTips.slice(0, -1),
+      trailerTips: trailerTips.filter((tip) => tip !== droppedTip),
     });
     assert.equal(result.ok, false);
     assert.ok(!result.ok && result.errors.some((err) => err.includes("TRAILER") || err.includes("trailer") || err.includes("missing baseline tips")));

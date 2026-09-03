@@ -2877,7 +2877,7 @@ if [[ "$kind" == strong ]]; then
         or ((.distReuse | type == "object")
           and (.distReuse.fromRelease | type == "string" and startswith("/"))
           and (.distReuse.fromSourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
-          and (.distReuse.comparedPaths | type == "array" and length > 0))))
+          and (.distReuse.comparedPaths | type == "array" and length > 0)))
     then [.sourceCommit,.builtAt,.metadataSha256,.artifactSha256] | @tsv
     else error("invalid strong release marker") end
   ' "$marker")" || exit 1
