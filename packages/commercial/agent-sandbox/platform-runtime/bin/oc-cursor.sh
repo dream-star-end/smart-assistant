@@ -604,6 +604,17 @@ if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null \
     || sand_sidecar_text=""
 fi
 
+# 0257 — .credential-kind sidecar: `name api_key|session machineId|-`.
+# A `session` slot holds a Cursor account session accessToken (Sand-only);
+# it must never be handed to the native CLI as CURSOR_API_KEY.
+kind_sidecar_text=""
+if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.credential-kind" 2>/dev/null \
+  || /usr/bin/test -f "$auth_dir/.credential-kind" 2>/dev/null; then
+  kind_sidecar_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.credential-kind" 2>/dev/null) \
+    || kind_sidecar_text=$(/bin/cat -- "$auth_dir/.credential-kind" 2>/dev/null) \
+    || kind_sidecar_text=""
+fi
+
 identity_account_for_key() {
   _identity_target=$1
   if [ "$pool_generation" = legacy ]; then printf '0\n'; return 0; fi
@@ -775,6 +786,46 @@ $sand_sidecar_text
 SAND_SIDECAR
 fi
 
+# Credential kind for the chosen slot (default api_key when the sidecar is
+# absent, which is what every pre-0257 pool looks like).
+credential_kind=api_key
+machine_id=""
+if [ -n "${kind_sidecar_text:-}" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    kind_name=${line%% *}
+    kind_rest=${line#"$kind_name"}
+    kind_rest=${kind_rest# }
+    kind_value=${kind_rest%% *}
+    kind_rest=${kind_rest#"$kind_value"}
+    kind_rest=${kind_rest# }
+    kind_machine=${kind_rest%% *}
+    if [ "$kind_name" = "$chosen_key_name" ]; then
+      case "$kind_value" in
+        session)
+          credential_kind=session
+          case "$kind_machine" in
+            ''|-) die "Cursor session credential machine id is missing" ;;
+            *[!a-z0-9]*) die "Cursor session credential machine id is invalid" ;;
+          esac
+          [ "${#kind_machine}" -ge 16 ] && [ "${#kind_machine}" -le 64 ] \
+            || die "Cursor session credential machine id is invalid"
+          machine_id=$kind_machine
+          ;;
+        api_key|'') credential_kind=api_key; machine_id="" ;;
+        *) die "Cursor pool credential kind is invalid" ;;
+      esac
+    fi
+  done <<KIND_SIDECAR
+$kind_sidecar_text
+KIND_SIDECAR
+fi
+if [ "$credential_kind" = session ] && [ "$sand_enabled" -ne 1 ]; then
+  die "Cursor pool credential sidecars disagree"
+fi
+
 selected_account_id=0
 selected_fingerprint=0000000000000000
 if [ "$pool_generation" != legacy ]; then
@@ -820,9 +871,11 @@ done
 # authority instead of reimplementing rotation and quota filtering in TS.
 if [ "${OPENCLAUDE_CURSOR_SELECT_ONLY:-}" = 1 ]; then
   if [ "$sand_enabled" -eq 1 ]; then selected_mode=sand; else selected_mode=native; fi
-  printf 'oc-cursor: selected_slot %s %s %s %s %s %s\n' \
+  # Trailing `<kind> <machineId|->` columns are 0257 additions; the gateway
+  # parser tolerates their absence for older wrapper builds.
+  printf 'oc-cursor: selected_slot %s %s %s %s %s %s %s %s\n' \
     "$chosen_full_slot" "$chosen_key_name" "$selected_mode" "$pool_generation" \
-    "$selected_account_id" "$selected_fingerprint"
+    "$selected_account_id" "$selected_fingerprint" "$credential_kind" "${machine_id:--}"
   exit 0
 fi
 if [ -n "${OPENCLAUDE_CURSOR_RECORD_RESULT:-}" ]; then
@@ -839,6 +892,13 @@ if [ -n "${OPENCLAUDE_CURSOR_RECORD_RESULT:-}" ]; then
     *) die "Cursor record result is invalid" ;;
   esac
   exit 0
+fi
+
+# A session accessToken is only valid on the Sand inference plane, which the
+# gateway relay drives after SELECT_ONLY. It must never reach the native CLI
+# as CURSOR_API_KEY, and there is no fallback to a different pool here.
+if [ "$credential_kind" = session ]; then
+  die "Cursor session credential is Sand-only"
 fi
 
 if ! api_key=$(/usr/bin/sudo -n /bin/cat -- "$chosen_key_file" 2>/dev/null); then

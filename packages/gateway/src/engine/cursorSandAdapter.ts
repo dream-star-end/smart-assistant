@@ -84,6 +84,8 @@ export class CursorSandAdapter extends CcbAdapter {
       credentialName: selection.keyName,
       poolGeneration: selection.poolGeneration,
       keyFingerprint: selection.keyFingerprint,
+      credentialKind: selection.credentialKind,
+      machineId: selection.machineId,
     })
     this.submitDelegate = submitDelegate
     this.recordResult = recordResult ?? ((result) => recordCursorCredentialResult({

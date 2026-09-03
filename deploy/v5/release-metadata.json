@@ -137,7 +137,8 @@
     "0253_active_claude_proxy_uniqueness",
     "0254_agent_audit_error_msg",
     "0255_cursor_fable_51",
-    "0256_cursor_picker_plan_gate_half_price"
+    "0256_cursor_picker_plan_gate_half_price",
+    "0257_cursor_session_credential"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

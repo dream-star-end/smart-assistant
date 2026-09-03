@@ -31,16 +31,20 @@ import {
   type AccountRow,
 } from "./store.js";
 import {
+  CURSOR_CREDENTIAL_KIND_FILE,
+  CURSOR_MACHINE_ID_RE,
   CURSOR_QUOTA_CLASS_FILE,
   CURSOR_SAND_MODE_FILE,
   asCursorSlotResults,
   cursorModelFamily,
   planCursorQuotaUpdates,
   planStableCursorQuotaUpdate,
+  renderCredentialKindSidecar,
   renderQuotaClassSidecar,
   renderSandModeSidecar,
   uniqueCursorAccountIdFromSlotResults,
   type CursorQuotaClass,
+  type CursorSlotCredentialKind,
 } from "./cursorQuota.js";
 
 export { uniqueCursorAccountIdFromSlotResults };
@@ -59,6 +63,35 @@ export function normalizeCursorApiKey(raw: string): string {
 
 export function fingerprintCursorKey(key: string): string {
   return createHash("sha256").update(`${key}\n`, "utf8").digest("hex").slice(0, 16);
+}
+
+/**
+ * 0257 — Cursor account session accessToken (JWT from loginDeepControl PKCE).
+ * Validated by shape only: three base64url segments, no whitespace. Never
+ * logged. The same fingerprint function as api keys applies (raw slot
+ * content + "\n"), so stable-identity checks stay uniform across kinds.
+ */
+export const CURSOR_SESSION_TOKEN_RE = /^[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}$/;
+
+export function normalizeCursorSessionToken(raw: string): string {
+  const token = raw.trim();
+  if (!CURSOR_SESSION_TOKEN_RE.test(token)) {
+    throw new RangeError("invalid_cursor_session_token");
+  }
+  return token;
+}
+
+/** JWT `exp` (seconds) → Date, or null when the payload cannot be decoded. */
+export function cursorSessionTokenExpiry(token: string): Date | null {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as { exp?: unknown };
+    if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp) || payload.exp <= 0) return null;
+    return new Date(payload.exp * 1000);
+  } catch {
+    return null;
+  }
 }
 
 export function cursorAuthDirFromEnv(env: NodeJS.ProcessEnv = process.env): string | null {
@@ -80,7 +113,16 @@ export const CURSOR_POOL_OWNED_MARKER = ".account-pool-owned";
 export const CURSOR_POOL_GENERATIONS_DIR = ".pool-generations";
 export const CURSOR_POOL_ACTIVE_FILE = ".pool-active";
 export const CURSOR_POOL_IDENTITIES_FILE = ".slot-identities";
-export { CURSOR_QUOTA_CLASS_FILE, CURSOR_SAND_MODE_FILE };
+export { CURSOR_CREDENTIAL_KIND_FILE, CURSOR_QUOTA_CLASS_FILE, CURSOR_SAND_MODE_FILE };
+
+interface MaterializedCursorSlot {
+  key: string;
+  accountId: string;
+  quotaClass: CursorQuotaClass;
+  sandEnabled: boolean;
+  credentialKind: CursorSlotCredentialKind;
+  machineId: string | null;
+}
 
 export function isCanonicalCursorKeyFile(name: string): boolean {
   if (name === "api-key") return true;
@@ -169,15 +211,17 @@ async function importHostKeysIfEmpty(deps: Required<Pick<CursorAuthSyncDeps, "li
   return imported;
 }
 
-function writeAtomicSlots(
-  authDir: string,
-  slots: Array<{
-    key: string;
-    accountId: string;
-    quotaClass: CursorQuotaClass;
-    sandEnabled: boolean;
-  }>,
-): string[] {
+function credentialKindSlots(
+  slots: MaterializedCursorSlot[],
+): Array<{ name: string; credentialKind: CursorSlotCredentialKind; machineId: string | null }> {
+  return slots.map((slot, i) => ({
+    name: slotFileName(i),
+    credentialKind: slot.credentialKind,
+    machineId: slot.machineId,
+  }));
+}
+
+function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[]): string[] {
   mkdirSync(authDir, { recursive: true, mode: 0o700 });
   const fingerprints = slots.map((slot) => fingerprintCursorKey(slot.key));
   const generationDigest = createHash("sha256");
@@ -188,6 +232,9 @@ function writeAtomicSlots(
       fingerprints[i],
       slots[i].quotaClass,
       slots[i].sandEnabled ? "1" : "0",
+      // 0257: kind/machine id participate so a kind flip (or machine id
+      // change) always yields a fresh immutable generation.
+      ...(slots[i].credentialKind === "session" ? ["session", slots[i].machineId ?? ""] : []),
     ].join("\0"));
     generationDigest.update("\n");
   }
@@ -212,9 +259,11 @@ function writeAtomicSlots(
       }
       writeFileSync(join(generationStaging, CURSOR_QUOTA_CLASS_FILE), renderQuotaClassSidecar(quotaSlots), { mode: 0o600 });
       writeFileSync(join(generationStaging, CURSOR_SAND_MODE_FILE), renderSandModeSidecar(sandSlots), { mode: 0o600 });
+      writeFileSync(join(generationStaging, CURSOR_CREDENTIAL_KIND_FILE), renderCredentialKindSidecar(credentialKindSlots(slots)), { mode: 0o600 });
       writeFileSync(join(generationStaging, CURSOR_POOL_IDENTITIES_FILE), `${identities.join("\n")}\n`, { mode: 0o600 });
       chmodSync(join(generationStaging, CURSOR_QUOTA_CLASS_FILE), 0o600);
       chmodSync(join(generationStaging, CURSOR_SAND_MODE_FILE), 0o600);
+      chmodSync(join(generationStaging, CURSOR_CREDENTIAL_KIND_FILE), 0o600);
       chmodSync(join(generationStaging, CURSOR_POOL_IDENTITIES_FILE), 0o600);
       renameSync(generationStaging, generationDir);
     } finally {
@@ -252,12 +301,18 @@ function writeAtomicSlots(
       encoding: "utf8",
     });
     chmodSync(join(staging, CURSOR_SAND_MODE_FILE), 0o600);
+    writeFileSync(join(staging, CURSOR_CREDENTIAL_KIND_FILE), renderCredentialKindSidecar(credentialKindSlots(slots)), {
+      mode: 0o600,
+      encoding: "utf8",
+    });
+    chmodSync(join(staging, CURSOR_CREDENTIAL_KIND_FILE), 0o600);
     for (let i = 0; i < slots.length; i += 1) {
       const name = slotFileName(i);
       renameSync(join(staging, name), join(authDir, name));
     }
     renameSync(join(staging, CURSOR_QUOTA_CLASS_FILE), join(authDir, CURSOR_QUOTA_CLASS_FILE));
     renameSync(join(staging, CURSOR_SAND_MODE_FILE), join(authDir, CURSOR_SAND_MODE_FILE));
+    renameSync(join(staging, CURSOR_CREDENTIAL_KIND_FILE), join(authDir, CURSOR_CREDENTIAL_KIND_FILE));
     const expected = new Set(slots.map((_, i) => slotFileName(i)));
     for (const name of readdirSync(authDir)) {
       if (!isCanonicalCursorKeyFile(name)) continue;
@@ -300,26 +355,50 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
     return { imported, written: 0, skipped: "empty-pool-keep-files", fingerprints: [] };
   }
 
-  const slots: Array<{
-    key: string;
-    accountId: string;
-    quotaClass: CursorQuotaClass;
-    sandEnabled: boolean;
-  }> = [];
+  const slots: MaterializedCursorSlot[] = [];
   try {
     for (const row of rows) {
       const snap = await resolved.getCursorTokenSnapshot(row.id);
       if (!snap?.token) continue;
-      const key = normalizeCursorApiKey(snap.token.toString("utf8"));
-      slots.push({
-        key,
-        accountId: row.id.toString(),
-        quotaClass: row.cursor_quota_class === "other_ok" || row.cursor_quota_class === "cursor_only"
+      try {
+        const credentialKind: CursorSlotCredentialKind = snap.credential_kind === "session" ? "session" : "api_key";
+        const quotaClass: CursorQuotaClass = row.cursor_quota_class === "other_ok" || row.cursor_quota_class === "cursor_only"
           ? row.cursor_quota_class
-          : "unknown",
-        sandEnabled: row.cursor_sand_enabled === true,
-      });
-      snap.token.fill(0);
+          : "unknown";
+        if (credentialKind === "session") {
+          // Session rows are Sand-only and need their persisted machine id;
+          // a malformed row is skipped (never silently downgraded to api_key).
+          const machineId = snap.machine_id ?? null;
+          if (row.cursor_sand_enabled !== true || !machineId || !CURSOR_MACHINE_ID_RE.test(machineId)) {
+            log.warn("cursor session row skipped: not Sand-enabled or missing machine id", { accountId: row.id.toString() });
+            continue;
+          }
+          if (snap.expires_at && snap.expires_at.getTime() <= Date.now()) {
+            log.warn("cursor session row skipped: session token expired", { accountId: row.id.toString() });
+            continue;
+          }
+          slots.push({
+            key: normalizeCursorSessionToken(snap.token.toString("utf8")),
+            accountId: row.id.toString(),
+            quotaClass,
+            sandEnabled: true,
+            credentialKind: "session",
+            machineId,
+          });
+        } else {
+          slots.push({
+            key: normalizeCursorApiKey(snap.token.toString("utf8")),
+            accountId: row.id.toString(),
+            quotaClass,
+            sandEnabled: row.cursor_sand_enabled === true,
+            credentialKind: "api_key",
+            machineId: null,
+          });
+        }
+      } finally {
+        snap.token.fill(0);
+        snap.refresh?.fill(0);
+      }
     }
     if (slots.length === 0) {
       log.warn("cursor account pool rows had no decryptable keys; leaving host files unchanged");

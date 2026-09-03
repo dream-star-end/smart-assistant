@@ -6,7 +6,7 @@ import { test } from 'node:test'
 // protobufjs is CommonJS; a namespace import yields `{ default }` under tsx and
 // `loadSync` is undefined (see the same note in engine/cursorSandRelay.ts).
 import protobuf from 'protobufjs'
-import { CURSOR_ENGINE_MODELS } from '@openclaude/protocol'
+import { CURSOR_ENGINE_MODELS, CURSOR_SESSION_CLIENT_VERSION, cursorSessionChecksum } from '@openclaude/protocol'
 import { CursorSandRelay, encodeCursorSandRequest, recoverXmlToolCalls } from '../engine/cursorSandRelay.js'
 import { CursorSandAdapter } from '../engine/cursorSandAdapter.js'
 import {
@@ -29,15 +29,18 @@ const StreamResponse = root.lookupType('aiserver.v1.InferenceStreamResponse')
 const SAND_SELECTION = {
   slot: 2, keyName: 'api-key.2', sandEnabled: true,
   poolGeneration: 'legacy', accountId: '0', keyFingerprint: '0000000000000000',
+  credentialKind: 'api_key' as const, machineId: null,
 }
 const NATIVE_SELECTION = {
   slot: 1, keyName: 'api-key', sandEnabled: false,
   poolGeneration: 'legacy', accountId: '0', keyFingerprint: '0000000000000000',
+  credentialKind: 'api_key' as const, machineId: null,
 }
 const STABLE_SAND_SELECTION = {
   slot: 2, keyName: 'api-key.2', sandEnabled: true,
   poolGeneration: 'gen-0123456789abcdef01234567',
   accountId: '42', keyFingerprint: '0123456789abcdef',
+  credentialKind: 'api_key' as const, machineId: null,
 }
 
 function envelope(payload: Uint8Array, flags = 0): Buffer {
@@ -266,6 +269,8 @@ printf '%s %s %s %s %s\n' \
       poolGeneration: 'gen-0123456789abcdef01234567',
       accountId: '42',
       keyFingerprint: '0123456789abcdef',
+      credentialKind: 'api_key',
+      machineId: null,
     })
     recordCursorCredentialResult({
       agentId: 'main', sessionKey: 'agent:main:test:credential-selector',
@@ -338,11 +343,13 @@ test('pool generation changes rebind stable account identity before reading a re
       slot: 2, keyName: 'api-key.2', sandEnabled: true,
       poolGeneration: 'gen-111111111111111111111111',
       accountId: '2', keyFingerprint: 'aaaaaaaaaaaaaaaa',
+      credentialKind: 'api_key' as const, machineId: null,
     }
     const generationTwo = {
       slot: 1, keyName: 'api-key', sandEnabled: true,
       poolGeneration: 'gen-222222222222222222222222',
       accountId: '2', keyFingerprint: 'aaaaaaaaaaaaaaaa',
+      credentialKind: 'api_key' as const, machineId: null,
     }
     const router = new CursorRoutingAdapter({
       sessionKey: 'agent:main:test:generation-rebind', agentId: 'main', agentBaseDir: dir,
@@ -1094,6 +1101,134 @@ test('legacy usage frame without cache counters keeps the bare {input_tokens, ou
   assert.doesNotMatch(streamed, /cache_read_input_tokens/)
   const json = JSON.parse(await relayUsageResponse(frames, false)) as { usage: Record<string, number> }
   assert.deepEqual(json.usage, { input_tokens: 10, output_tokens: 4 })
+})
+
+// 0257 — a `session` slot holds a Cursor account session accessToken (PKCE
+// login). The relay must present it directly as Bearer with x-cursor-checksum
+// derived from the persisted machine id, never call the API-key exchange, and
+// fail loud once the JWT is expired instead of degrading to another credential.
+function sessionJwt(expSeconds: number): string {
+  const header = Buffer.from('{"alg":"RS256","typ":"JWT"}').toString('base64url')
+  const payload = Buffer.from(JSON.stringify({ sub: 'auth0|x', exp: expSeconds, type: 'session' })).toString('base64url')
+  return `${header}.${payload}.${'s'.repeat(40)}`
+}
+
+test('session credential is sent as Bearer with x-cursor-checksum and skips the API-key exchange', async () => {
+  const machineId = 'abcdefghijklmnopqrstuvwxyz'
+  const token = sessionJwt(Math.floor(Date.now() / 1000) + 30 * 86400)
+  const seen: { url: string; headers: Headers }[] = []
+  const fetchImpl: typeof fetch = async (input, init) => {
+    seen.push({ url: String(input), headers: new Headers(init?.headers) })
+    return new Response(Buffer.concat([responseFrame('textPart', { text: 'ok' }), envelope(Buffer.from('{}'), 0x02)]), {
+      status: 200,
+      headers: { 'content-type': 'application/connect+proto' },
+    })
+  }
+  const relay = new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from(`${token}\n`),
+    credentialKind: 'session',
+    machineId,
+    now: () => 1_700_000_000_000,
+  })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-fable-5.1-high', stream: false, max_tokens: 64,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    assert.equal(response.status, 200)
+    assert.equal(seen.length, 1)
+    assert.equal(seen.some((call) => call.url.endsWith('/auth/exchange_user_api_key')), false)
+    const inference = seen[0]!
+    assert.match(inference.url, /InferenceService\/Stream$/)
+    // readApiKey returns the raw slot bytes (trailing newline); Bearer must be the trimmed token.
+    assert.equal(inference.headers.get('authorization'), `Bearer ${token.trim()}`)
+    assert.equal(inference.headers.get('x-cursor-client-type'), 'sand')
+    assert.equal(inference.headers.get('x-cursor-client-version'), CURSOR_SESSION_CLIENT_VERSION)
+    const checksum = inference.headers.get('x-cursor-checksum')
+    assert.equal(checksum, cursorSessionChecksum(machineId, 1_700_000_000_000))
+    assert.ok(checksum?.endsWith(machineId))
+  } finally {
+    await relay.close()
+  }
+})
+
+test('expired session credential fails loud and never falls back to the API-key exchange', async () => {
+  const seen: string[] = []
+  const fetchImpl: typeof fetch = async (input) => {
+    seen.push(String(input))
+    return new Response('{}', { status: 200 })
+  }
+  const relay = new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from(sessionJwt(Math.floor(Date.now() / 1000) - 60)),
+    credentialKind: 'session',
+    machineId: 'abcdefghijklmnopqrstuvwxyz',
+  })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-fable-5.1-high', stream: false, max_tokens: 64,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    assert.notEqual(response.status, 200)
+    assert.match(await response.text(), /CURSOR_SAND_SESSION_EXPIRED/)
+    assert.deepEqual(seen, [])
+  } finally {
+    await relay.close()
+  }
+})
+
+test('session relay refuses to start without a persisted machine id', () => {
+  assert.throws(
+    () => new CursorSandRelay({ readApiKey: () => Buffer.from('x'), credentialKind: 'session', machineId: null }),
+    /CURSOR_SAND_SESSION_MACHINE_ID_INVALID/,
+  )
+})
+
+test('credential selector parses the 0257 session columns and fails closed on inconsistent ones', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'cursor-credential-selector-session-'))
+  const wrapper = resolve(dir, 'oc-cursor')
+  const previous = process.env.OC_CURSOR_WRAPPER_BIN
+  const run = (line: string) => {
+    writeFileSync(wrapper, `#!/bin/sh\necho '${line}'\n`, { mode: 0o755 })
+    chmodSync(wrapper, 0o755)
+    return selectCursorCredential({
+      agentId: 'main', sessionKey: 'agent:main:test:credential-selector-session',
+      agentBaseDir: dir, model: 'cursor-opus-5-high',
+    })
+  }
+  process.env.OC_CURSOR_WRAPPER_BIN = wrapper
+  try {
+    const session = run('oc-cursor: selected_slot 3 api-key.3 sand gen-0123456789abcdef01234567 7 0123456789abcdef session abcdefghijklmnopqrstuvwxyz')
+    assert.equal(session.credentialKind, 'session')
+    assert.equal(session.machineId, 'abcdefghijklmnopqrstuvwxyz')
+    assert.equal(session.sandEnabled, true)
+    const apiKey = run('oc-cursor: selected_slot 1 api-key native legacy 0 0000000000000000 api_key -')
+    assert.equal(apiKey.credentialKind, 'api_key')
+    assert.equal(apiKey.machineId, null)
+    assert.throws(
+      () => run('oc-cursor: selected_slot 3 api-key.3 native legacy 0 0000000000000000 session abcdefghijklmnopqrstuvwxyz'),
+      /CURSOR_CREDENTIAL_SELECTION_MALFORMED/,
+    )
+    assert.throws(
+      () => run('oc-cursor: selected_slot 3 api-key.3 sand legacy 0 0000000000000000 session -'),
+      /CURSOR_CREDENTIAL_SELECTION_MALFORMED/,
+    )
+  } finally {
+    if (previous === undefined) delete process.env.OC_CURSOR_WRAPPER_BIN
+    else process.env.OC_CURSOR_WRAPPER_BIN = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('relay passes non-Sand models (CCB sub-agent pin) through to the internal proxy verbatim', async () => {

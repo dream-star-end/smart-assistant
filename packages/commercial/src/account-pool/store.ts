@@ -126,6 +126,17 @@ export interface AccountRow {
   /** 0226 — Cursor two-pool class. Non-cursor rows stay unknown and are ignored. */
   cursor_quota_class: import("./cursorQuota.js").CursorQuotaClass;
   cursor_sand_enabled: boolean;
+  /** 0257 — api_key (crsr_ key) or session (Cursor account session, Sand-only). */
+  cursor_credential_kind: CursorCredentialKind;
+  /** 0257 — session rows only: authId from /auth/poll (identity, not a secret). */
+  cursor_auth_id: string | null;
+}
+
+export const CURSOR_CREDENTIAL_KINDS = ["api_key", "session"] as const;
+export type CursorCredentialKind = (typeof CURSOR_CREDENTIAL_KINDS)[number];
+
+export function isCursorCredentialKind(value: unknown): value is CursorCredentialKind {
+  return value === "api_key" || value === "session";
 }
 
 /**
@@ -197,6 +208,14 @@ export interface CreateAccountInput {
   oauth_principal_type?: string | null;
   oauth_principal_id?: string | null;
   cursor_sand_enabled?: boolean;
+  /**
+   * 0257 — Cursor credential kind. `session` rows hold a Cursor account
+   * session token (+ refresh) instead of a crsr_ key, are Sand-only and must
+   * carry a stable machine id (DB CHECK enforces the shape).
+   */
+  cursor_credential_kind?: CursorCredentialKind;
+  cursor_machine_id?: string | null;
+  cursor_auth_id?: string | null;
   /**
    * 0064 — 订阅到期日(可选)。undefined / null = 不设置(列保持 NULL)。
    * 解析由 admin layer 完成,store 层只透传 Date | null。
@@ -326,7 +345,9 @@ const META_COLUMNS = `
   created_at,
   updated_at,
   COALESCE(cursor_quota_class, 'unknown') AS cursor_quota_class,
-  COALESCE(cursor_sand_enabled, FALSE) AS cursor_sand_enabled
+  COALESCE(cursor_sand_enabled, FALSE) AS cursor_sand_enabled,
+  COALESCE(cursor_credential_kind, 'api_key') AS cursor_credential_kind,
+  cursor_auth_id
 `;
 
 interface RawMetaRow extends QueryResultRow {
@@ -359,6 +380,8 @@ interface RawMetaRow extends QueryResultRow {
   updated_at: Date;
   cursor_quota_class: string;
   cursor_sand_enabled: boolean;
+  cursor_credential_kind: string;
+  cursor_auth_id: string | null;
 }
 
 interface RawSecretRow extends QueryResultRow {
@@ -428,6 +451,8 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
       ? row.cursor_quota_class
       : "unknown",
     cursor_sand_enabled: row.cursor_sand_enabled === true,
+    cursor_credential_kind: row.cursor_credential_kind === "session" ? "session" : "api_key",
+    cursor_auth_id: row.cursor_auth_id ?? null,
   };
 }
 
@@ -495,6 +520,19 @@ export async function createAccount(
     const persona = generatePersona(undefined, input.persona_region ?? null);
     assertPersona(persona);
 
+    const credentialKind: CursorCredentialKind = input.cursor_credential_kind ?? "api_key";
+    if (!isCursorCredentialKind(credentialKind)) {
+      throw new TypeError(`invalid cursor_credential_kind: ${String(credentialKind)}`);
+    }
+    if (credentialKind === "session") {
+      if (provider !== "cursor") throw new TypeError("cursor_credential_kind=session requires provider=cursor");
+      if (input.cursor_sand_enabled !== true) throw new TypeError("cursor session credentials are Sand-only");
+      if (!input.cursor_machine_id || !/^[a-z0-9]{16,64}$/.test(input.cursor_machine_id)) {
+        throw new TypeError("cursor session credentials require a stable machine id");
+      }
+      if (!input.refresh) throw new TypeError("cursor session credentials require a refresh token");
+    }
+
     const res = await query<RawMetaRow>(
       `INSERT INTO claude_accounts(
          provider, group_id, label, plan,
@@ -507,9 +545,10 @@ export async function createAccount(
          persona,
          runtime_channel,
          oauth_principal_type, oauth_principal_id,
-         cursor_sand_enabled
+         cursor_sand_enabled,
+         cursor_credential_kind, cursor_machine_id, cursor_auth_id
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13::jsonb, $14, $15, $16, $17)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13::jsonb, $14, $15, $16, $17, $18, $19, $20)
        RETURNING ${META_COLUMNS}`,
       [
         provider,
@@ -529,6 +568,9 @@ export async function createAccount(
         input.oauth_principal_type ?? null,
         input.oauth_principal_id ?? null,
         input.cursor_sand_enabled === true,
+        credentialKind,
+        credentialKind === "session" ? (input.cursor_machine_id ?? null) : null,
+        credentialKind === "session" ? (input.cursor_auth_id ?? null) : null,
       ],
     );
     return parseMetaRow(res.rows[0]);
@@ -1271,23 +1313,41 @@ export async function getCodexTokenSnapshot(
 
 export interface CursorTokenSnapshot {
   id: bigint;
-  /** 解密后的 Cursor API key —— **调用方用完必须 .fill(0)** */
+  /**
+   * 解密后的 Cursor 凭据 —— api_key 行是 `crsr_` key,session 行是 Cursor
+   * 账号 session accessToken(直接作 Bearer)。**调用方用完必须 .fill(0)**
+   */
   token: Buffer;
+  /** 0257 — api_key | session */
+  credential_kind: CursorCredentialKind;
+  /** session 行:稳定 machine id(拼进 x-cursor-checksum);api_key 行为 null */
+  machine_id: string | null;
+  /** session 行:解密后的 refreshToken;api_key 行为 null。**调用方用完必须 .fill(0)** */
+  refresh: Buffer | null;
+  /** session 行:accessToken JWT exp;api_key 行为 null */
+  expires_at: Date | null;
+}
+
+interface RawCursorSecretRow extends RawCodexSecretRow {
+  cursor_credential_kind: string | null;
+  cursor_machine_id: string | null;
 }
 
 /**
- * Cursor API key snapshot. Same encrypted columns as OAuth tokens; never
- * logged. Caller must zero the buffer.
+ * Cursor credential snapshot. Same encrypted columns as OAuth tokens; never
+ * logged. Caller must zero `token` (and `refresh` when present).
  */
-export async function getCursorTokenSnapshot(
+export async function getCursorTokenSnapshotInTx(
+  client: PoolClient,
   id: bigint | string,
   keyFn: () => Buffer = loadKmsKey,
 ): Promise<CursorTokenSnapshot | null> {
-  const res = await query<RawCodexSecretRow>(
+  const res = await client.query<RawCursorSecretRow>(
     `SELECT id::text AS id, provider,
        oauth_token_enc, oauth_nonce,
        oauth_refresh_enc, oauth_refresh_nonce,
-       oauth_expires_at
+       oauth_expires_at,
+       cursor_credential_kind, cursor_machine_id
      FROM claude_accounts
      WHERE id = $1`,
     [String(id)],
@@ -1297,16 +1357,82 @@ export async function getCursorTokenSnapshot(
   if (row.provider !== "cursor") {
     throw new TypeError(`getCursorTokenSnapshot called on non-cursor account ${String(id)} (provider=${row.provider})`);
   }
+  const credentialKind: CursorCredentialKind = row.cursor_credential_kind === "session" ? "session" : "api_key";
   const key = keyFn();
   let token: Buffer | null = null;
+  let refresh: Buffer | null = null;
   try {
     token = decryptToBuffer(row.oauth_token_enc, row.oauth_nonce, key);
-    const out: CursorTokenSnapshot = { id: BigInt(row.id), token };
+    if (credentialKind === "session" && row.oauth_refresh_enc && row.oauth_refresh_nonce) {
+      refresh = decryptToBuffer(row.oauth_refresh_enc, row.oauth_refresh_nonce, key);
+    }
+    const out: CursorTokenSnapshot = {
+      id: BigInt(row.id),
+      token,
+      credential_kind: credentialKind,
+      machine_id: credentialKind === "session" ? (row.cursor_machine_id ?? null) : null,
+      refresh,
+      expires_at: credentialKind === "session" ? row.oauth_expires_at : null,
+    };
     token = null;
+    refresh = null;
     return out;
   } catch (err) {
     if (token) zeroBuffer(token);
+    if (refresh) zeroBuffer(refresh);
     throw err instanceof AeadError ? err : new AeadError("decryption failed", { cause: err });
+  } finally {
+    zeroBuffer(key);
+  }
+}
+
+export async function getCursorTokenSnapshot(
+  id: bigint | string,
+  keyFn: () => Buffer = loadKmsKey,
+): Promise<CursorTokenSnapshot | null> {
+  const client = await getPool().connect();
+  try {
+    return await getCursorTokenSnapshotInTx(client, id, keyFn);
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Rotate a Cursor *session* row's accessToken/refreshToken (0257). Refuses
+ * api_key rows: a crsr_ key is never "refreshed" in place. Intended for the
+ * session renewal path that already holds the caller's client / lock.
+ */
+export async function updateCursorTokenSnapshotInTx(
+  client: PoolClient,
+  id: bigint | string,
+  patch: { token: string; refresh?: string | null; expires_at: Date; last_error?: string | null },
+  keyFn: () => Buffer = loadKmsKey,
+): Promise<boolean> {
+  if (!patch.token) throw new TypeError("token must be non-empty string");
+  const key = keyFn();
+  try {
+    const tok = encrypt(patch.token, key);
+    const params: unknown[] = [String(id), tok.ciphertext, tok.nonce, patch.expires_at, patch.last_error ?? null];
+    const sets = ["oauth_token_enc = $2", "oauth_nonce = $3", "oauth_expires_at = $4", "last_error = $5", "updated_at = NOW()"];
+    if (patch.refresh !== undefined) {
+      let enc: Buffer | null = null;
+      let nonce: Buffer | null = null;
+      if (patch.refresh !== null) {
+        if (!patch.refresh) throw new TypeError("refresh must be non-empty string or null");
+        const ref = encrypt(patch.refresh, key);
+        enc = ref.ciphertext;
+        nonce = ref.nonce;
+      }
+      params.push(enc, nonce);
+      sets.push(`oauth_refresh_enc = $${params.length - 1}`, `oauth_refresh_nonce = $${params.length}`);
+    }
+    const res = await client.query(
+      `UPDATE claude_accounts SET ${sets.join(", ")}
+        WHERE id = $1 AND provider = 'cursor' AND cursor_credential_kind = 'session'`,
+      params,
+    );
+    return (res.rowCount ?? 0) > 0;
   } finally {
     zeroBuffer(key);
   }

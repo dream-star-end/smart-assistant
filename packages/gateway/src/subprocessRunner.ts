@@ -767,6 +767,9 @@ export interface SubprocessRunnerOpts {
     poolGeneration: string
     accountId: string
     keyFingerprint: string
+    /** 0257 — `session` slots carry a Cursor account session token (Sand-only). */
+    credentialKind: 'api_key' | 'session'
+    machineId: string | null
   }
   /** Agent-loop implementation. Omitted is the established CCB path. The
    * official CLI lane is intentionally limited to Cursor Sand's loopback

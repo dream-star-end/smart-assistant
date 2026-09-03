@@ -32,6 +32,9 @@ export type AccountRow = {
   has_refresh_token: boolean;
   cursor_quota_class: "unknown" | "other_ok" | "cursor_only" | null;
   cursor_sand_enabled: boolean | null;
+  /** 0257 — Sand 凭证形态:api_key(crsr_ 换 token)| session(Cursor 账号登录会话)。 */
+  cursor_credential_kind: "api_key" | "session" | null;
+  cursor_auth_id: string | null;
   created_at: string;
   updated_at: string;
   today_requests?: number;

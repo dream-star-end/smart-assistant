@@ -83,6 +83,9 @@ import {
 import {
   handleAdminAccountsStats,
   handleAdminCreateAccount,
+  handleAdminCursorSessionCancel,
+  handleAdminCursorSessionStart,
+  handleAdminCursorSessionStatus,
   handleAdminDeleteAccount,
   handleAdminGetAccount,
   handleAdminGrokDeviceCancel,
@@ -1128,6 +1131,9 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/admin/accounts/grok-device/start', handler: handleAdminGrokDeviceStart },
     { method: 'GET', pathPrefix: '/api/admin/accounts/grok-device/', handler: handleAdminGrokDeviceStatus },
     { method: 'DELETE', pathPrefix: '/api/admin/accounts/grok-device/', handler: handleAdminGrokDeviceCancel },
+    { method: 'POST', path: '/api/admin/accounts/cursor-session/start', handler: handleAdminCursorSessionStart },
+    { method: 'GET', pathPrefix: '/api/admin/accounts/cursor-session/', handler: handleAdminCursorSessionStatus },
+    { method: 'DELETE', pathPrefix: '/api/admin/accounts/cursor-session/', handler: handleAdminCursorSessionCancel },
     // R3:reset-cooldown 子资源。pathPrefix 命中 /accounts/,handler 内部用 regex 抠
     //  `/accounts/:id/reset-cooldown`;POST 会先匹配到这条(method 一致),
     //  adjustCredits 走的是不同 prefix。

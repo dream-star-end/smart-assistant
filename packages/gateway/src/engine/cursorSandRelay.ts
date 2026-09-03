@@ -22,7 +22,14 @@ import Ajv2020 from 'ajv/dist/2020.js'
 // `default`; a namespace import works under the TS test loader but becomes
 // `{ default: ... }` in the precompiled production gateway.
 import protobuf from 'protobufjs'
-import { cursorModelById } from '@openclaude/protocol'
+import {
+  CURSOR_SESSION_CLIENT_VERSION,
+  CURSOR_SESSION_TOKEN_PATTERN,
+  cursorModelById,
+  cursorSessionChecksum,
+  cursorSessionTokenExpiryMs,
+  isCursorMachineId,
+} from '@openclaude/protocol'
 import { createLogger } from '../logger.js'
 import { AUTHORITY_HEADER, LOCAL_CATALOG_HEADER, TURN_LEASE_HEADER } from '../modelCatalogClient.js'
 
@@ -58,12 +65,22 @@ interface AnthropicMessagesBody extends JsonObject {
   tools?: unknown
 }
 
+export type RelayCredentialKind = 'api_key' | 'session'
+
 interface RelayDeps {
   fetchImpl?: typeof fetch
   readApiKey?: () => Buffer
   credentialName?: string
   poolGeneration?: string
   keyFingerprint?: string
+  /**
+   * `api_key` (default): slot holds a `crsr_` key exchanged via
+   * `/auth/exchange_user_api_key`. `session`: slot holds a Cursor account
+   * session accessToken (PKCE login) used directly as Bearer together with
+   * `x-cursor-checksum` derived from the persisted `machineId`.
+   */
+  credentialKind?: RelayCredentialKind
+  machineId?: string | null
   upstreamBaseUrl?: string
   clientVersion?: string
   now?: () => number
@@ -950,6 +967,9 @@ function correctedToolBody(body: AnthropicMessagesBody, invalidResponse: string)
 
 export class CursorSandRelay {
   private readonly deps: Required<Pick<RelayDeps, 'fetchImpl' | 'readApiKey' | 'upstreamBaseUrl' | 'clientVersion' | 'now'>>
+  private readonly credentialKind: RelayCredentialKind
+  /** Persisted machine id for `session` credentials; never regenerated. */
+  private readonly machineId: string | null
   private readonly routeToken = randomBytes(32).toString('hex')
   private server: Server | null = null
   private origin: string | null = null
@@ -960,6 +980,16 @@ export class CursorSandRelay {
   private readonly passthrough: RelayPassthrough | null
 
   constructor(deps: RelayDeps = {}) {
+    this.credentialKind = deps.credentialKind ?? 'api_key'
+    if (this.credentialKind === 'session') {
+      // Fail closed at construction: a session slot without its persisted
+      // machine id would either be rejected upstream or, worse, tempt a
+      // per-request regeneration that trips Cursor's "Too many computers".
+      if (!isCursorMachineId(deps.machineId)) throw new Error('CURSOR_SAND_SESSION_MACHINE_ID_INVALID')
+      this.machineId = deps.machineId
+    } else {
+      this.machineId = null
+    }
     this.deps = {
       fetchImpl: deps.fetchImpl ?? fetch,
       readApiKey: deps.readApiKey ?? (() => readCursorApiKey(
@@ -968,7 +998,8 @@ export class CursorSandRelay {
         deps.keyFingerprint,
       )),
       upstreamBaseUrl: (deps.upstreamBaseUrl ?? DEFAULT_UPSTREAM).replace(/\/+$/, ''),
-      clientVersion: deps.clientVersion ?? DEFAULT_CLIENT_VERSION,
+      clientVersion: deps.clientVersion
+        ?? (this.credentialKind === 'session' ? CURSOR_SESSION_CLIENT_VERSION : DEFAULT_CLIENT_VERSION),
       now: deps.now ?? Date.now,
     }
     this.onRequestForTest = deps.onRequestForTest
@@ -1164,6 +1195,18 @@ export class CursorSandRelay {
         && this.authCache.fingerprint === fingerprint
         && this.authCache.expiresAt > now + 60_000
       ) return this.authCache.accessToken
+      if (this.credentialKind === 'session') {
+        // The slot already holds the account session accessToken. There is
+        // no exchange step; expiry is enforced here and fails loud instead
+        // of silently degrading to another credential.
+        const sessionToken = key.toString('utf8').trim()
+        if (!CURSOR_SESSION_TOKEN_PATTERN.test(sessionToken)) throw new Error('CURSOR_SAND_SESSION_TOKEN_MALFORMED')
+        const expiresAt = cursorSessionTokenExpiryMs(sessionToken)
+        if (expiresAt === null) throw new Error('CURSOR_SAND_SESSION_TOKEN_MALFORMED')
+        if (expiresAt <= now + 60_000) throw new Error('CURSOR_SAND_SESSION_EXPIRED')
+        this.authCache = { fingerprint, accessToken: sessionToken, expiresAt }
+        return sessionToken
+      }
       const response = await this.deps.fetchImpl(`${this.deps.upstreamBaseUrl}/auth/exchange_user_api_key`, {
         method: 'POST',
         headers: {
@@ -1198,20 +1241,24 @@ export class CursorSandRelay {
   ): Promise<{ response: Response; upstreamModel: string }> {
     const { bytes, upstreamModel, invocationId } = encodeCursorSandRequest(body)
     const token = await this.accessToken(signal)
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/connect+proto',
+      'connect-protocol-version': '1',
+      'x-cursor-client-type': 'sand',
+      'x-cursor-client-version': this.deps.clientVersion,
+      'x-ghost-mode': 'true',
+      'x-request-id': invocationId,
+      'x-session-id': randomUUID(),
+    }
+    if (this.credentialKind === 'session' && this.machineId !== null) {
+      headers['x-cursor-checksum'] = cursorSessionChecksum(this.machineId, this.deps.now())
+    }
     const response = await this.deps.fetchImpl(
       `${this.deps.upstreamBaseUrl}/aiserver.v1.InferenceService/Stream`,
       {
         method: 'POST',
-        headers: {
-          authorization: `Bearer ${token}`,
-          'content-type': 'application/connect+proto',
-          'connect-protocol-version': '1',
-          'x-cursor-client-type': 'sand',
-          'x-cursor-client-version': this.deps.clientVersion,
-          'x-ghost-mode': 'true',
-          'x-request-id': invocationId,
-          'x-session-id': randomUUID(),
-        },
+        headers,
         body: new Uint8Array(connectEnvelope(bytes)),
         signal,
       },
@@ -1225,7 +1272,26 @@ export class CursorSandRelay {
     signal: AbortSignal,
   ): Promise<void> {
     this.onRequestForTest?.(structuredClone(body))
-    const opened = await this.openInference(body, signal)
+    let opened: { response: Response; upstreamModel: string }
+    try {
+      opened = await this.openInference(body, signal)
+    } catch (error: unknown) {
+      // Credential failures (expired/malformed session token, exchange
+      // rejected) are operator problems, not transient inference faults:
+      // surface the code so the turn error names the real cause.
+      const message = error instanceof Error ? error.message : ''
+      if (/^CURSOR_SAND_(?:SESSION|AUTH)_/.test(message)) {
+        log.warn('cursor sand credential rejected', { code: message, credentialKind: this.credentialKind })
+        res.statusCode = 401
+        res.setHeader('content-type', 'application/json')
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'authentication_error', message: `Cursor Sand credential rejected: ${message}` },
+        }))
+        return
+      }
+      throw error
+    }
     const upstream = opened.response
     if (!upstream.ok || !upstream.body) {
       res.statusCode = upstream.status || 502

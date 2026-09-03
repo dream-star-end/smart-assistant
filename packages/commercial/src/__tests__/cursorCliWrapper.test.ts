@@ -1238,7 +1238,7 @@ describe('oc-cursor wrapper', () => {
       },
     )
     assert.equal(selected.status, 0, selected.stderr)
-    assert.match(selected.stdout, /^oc-cursor: selected_slot 2 api-key\.2 sand legacy 0 0000000000000000$/m)
+    assert.match(selected.stdout, /^oc-cursor: selected_slot 2 api-key\.2 sand legacy 0 0000000000000000 api_key -$/m)
 
     const launched = spawnSync(
       f.wrapper,
@@ -1259,6 +1259,68 @@ describe('oc-cursor wrapper', () => {
     assert.equal(readFileSync(join(f.capture, 'argv'), 'utf8').includes('-H'), false)
     assert.match(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SAND_MODE=1$/m)
     assert.doesNotMatch(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SELECTED_KEY=/m)
+  })
+
+  test('a session slot reports its kind and machine id on selection and refuses native launch', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    const rotationFile = join(f.dir, 'session-rotation')
+    const machineId = 'abcdefghijklmnopqrstuvwxyz'
+    const sessionToken = `${'e'.repeat(20)}.${'p'.repeat(40)}.${'s'.repeat(40)}`
+    writeFileSync(join(authDir, 'api-key.2'), `${sessionToken}\n`, { mode: 0o600 })
+    writeFileSync(join(authDir, '.sand-mode'), '# sand-mode v1\napi-key 0\napi-key.2 1\n', { mode: 0o600 })
+    writeFileSync(
+      join(authDir, '.credential-kind'),
+      `# credential-kind v1\napi-key api_key -\napi-key.2 session ${machineId}\n`,
+      { mode: 0o600 },
+    )
+    writeFileSync(rotationFile, `1 ${Math.floor(Date.now() / 1000) + 300}\n`, { mode: 0o600 })
+    const selected = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', '__select_session__'],
+      {
+        cwd: f.dir,
+        env: { ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1', OC_CURSOR_KEY_ROTATION_FILE: rotationFile },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(selected.status, 0, selected.stderr)
+    assert.match(
+      selected.stdout,
+      new RegExp(`^oc-cursor: selected_slot 2 api-key\\.2 sand legacy 0 0000000000000000 session ${machineId}$`, 'm'),
+    )
+    assert.doesNotMatch(selected.stdout, /ppppp/, 'selection must never print the credential')
+
+    const launched = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'must not launch'],
+      {
+        cwd: f.dir,
+        env: { ...f.env, OPENCLAUDE_CURSOR_SELECTED_KEY: 'api-key.2', OC_CURSOR_KEY_ROTATION_FILE: rotationFile },
+        encoding: 'utf8',
+      },
+    )
+    assert.notEqual(launched.status, 0)
+    assert.match(launched.stderr, /Sand-only/)
+    assert.equal(existsSync(join(f.capture, 'key')), false, 'session token must never reach the native CLI')
+  })
+
+  test('a session slot whose .sand-mode says native fails closed', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, '.sand-mode'), '# sand-mode v1\napi-key 0\n', { mode: 0o600 })
+    writeFileSync(
+      join(authDir, '.credential-kind'),
+      '# credential-kind v1\napi-key session abcdefghijklmnopqrstuvwxyz\n',
+      { mode: 0o600 },
+    )
+    const selected = spawnSync(f.wrapper, ['--model', 'claude-opus-5-thinking-high', '--', '__select__'], {
+      cwd: f.dir,
+      env: { ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1' },
+      encoding: 'utf8',
+    })
+    assert.notEqual(selected.status, 0)
+    assert.match(selected.stderr, /credential sidecars disagree/)
   })
 
   test('Cursor Auto remains native even when the selected key has Sand enabled', () => {

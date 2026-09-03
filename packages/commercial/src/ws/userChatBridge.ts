@@ -7213,6 +7213,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                           }
                         } finally {
                           snapshot?.token.fill(0);
+                          snapshot?.refresh?.fill(0);
                         }
                       }
                       if (cursorAccountId === null) {

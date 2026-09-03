@@ -172,6 +172,51 @@ export function renderSandModeSidecar(slots: Array<{ name: string; sandEnabled: 
   return `${lines.join("\n")}\n`;
 }
 
+/**
+ * 0257 — per-slot credential kind sidecar. `api_key` slots hold a crsr_ key
+ * that the relay exchanges upstream; `session` slots hold a Cursor account
+ * session accessToken used directly as Bearer together with the persisted
+ * machine id (third column; `-` for api_key slots). The machine id is an
+ * identity, not a secret, but it must never be regenerated per request.
+ */
+export const CURSOR_CREDENTIAL_KIND_FILE = ".credential-kind";
+export type CursorSlotCredentialKind = "api_key" | "session";
+export const CURSOR_MACHINE_ID_RE = /^[a-z0-9]{16,64}$/;
+
+export function renderCredentialKindSidecar(
+  slots: Array<{ name: string; credentialKind: CursorSlotCredentialKind; machineId: string | null }>,
+): string {
+  const lines = ["# credential-kind v1"];
+  for (const slot of slots) {
+    const machineId = slot.credentialKind === "session" && slot.machineId && CURSOR_MACHINE_ID_RE.test(slot.machineId)
+      ? slot.machineId
+      : "-";
+    lines.push(`${slot.name} ${slot.credentialKind} ${machineId}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+export function parseCredentialKindSidecar(
+  text: string,
+): Map<string, { credentialKind: CursorSlotCredentialKind; machineId: string | null }> {
+  const out = new Map<string, { credentialKind: CursorSlotCredentialKind; machineId: string | null }>();
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const [name, kind, machineId] = line.split(/\s+/, 3);
+    if (!name) continue;
+    if (kind === "session") {
+      out.set(name, {
+        credentialKind: "session",
+        machineId: machineId && CURSOR_MACHINE_ID_RE.test(machineId) ? machineId : null,
+      });
+    } else {
+      out.set(name, { credentialKind: "api_key", machineId: null });
+    }
+  }
+  return out;
+}
+
 export function parseSandModeSidecar(text: string): Map<string, boolean> {
   const out = new Map<string, boolean>();
   for (const raw of text.split(/\r?\n/)) {

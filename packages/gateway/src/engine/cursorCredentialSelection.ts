@@ -12,10 +12,14 @@ const HOT_WRAPPER = '/run/oc/platform/current/bin/oc-cursor'
 const IMAGE_WRAPPER = '/usr/local/bin/oc-cursor'
 const KEY_NAME_SOURCE = String.raw`api-key(?:\.(?:[2-9]|[1-9][0-9]+))?`
 const KEY_NAME_RE = new RegExp(`^${KEY_NAME_SOURCE}$`)
+// 0257 — trailing `<api_key|session> <machineId|->` columns are optional so a
+// pre-0257 wrapper build (no .credential-kind support) still parses as api_key.
 const SELECTION_RE = new RegExp(
-  `^oc-cursor: selected_slot ([1-9][0-9]*) (${KEY_NAME_SOURCE}) (sand|native) (legacy|gen-[0-9a-f]{24}) ([0-9]+) ([0-9a-f]{16})$`,
+  `^oc-cursor: selected_slot ([1-9][0-9]*) (${KEY_NAME_SOURCE}) (sand|native) (legacy|gen-[0-9a-f]{24}) ([0-9]+) ([0-9a-f]{16})(?: (api_key|session) (-|[a-z0-9]{16,64}))?$`,
   'm',
 )
+
+export type CursorCredentialKind = 'api_key' | 'session'
 
 export interface CursorCredentialSelection {
   slot: number
@@ -24,6 +28,10 @@ export interface CursorCredentialSelection {
   poolGeneration: string
   accountId: string
   keyFingerprint: string
+  /** `session` slots hold a Cursor account session accessToken (Sand-only). */
+  credentialKind: CursorCredentialKind
+  /** Persisted Cursor machine id for `session` slots; null for `api_key`. */
+  machineId: string | null
 }
 
 function wrapperBin(): string {
@@ -84,13 +92,24 @@ export function selectCursorCredential(opts: {
   if (!Number.isSafeInteger(slot) || slot < 1 || !KEY_NAME_RE.test(keyName)) {
     throw new Error('CURSOR_CREDENTIAL_SELECTION_MALFORMED')
   }
+  const sandEnabled = matched[3] === 'sand'
+  const credentialKind: CursorCredentialKind = matched[7] === 'session' ? 'session' : 'api_key'
+  const machineId = credentialKind === 'session' && matched[8] && matched[8] !== '-' ? matched[8] : null
+  // The wrapper already fails closed on these, but the gateway must not trust
+  // a half-formed line: a session slot is only usable on the Sand plane and
+  // only with its persisted machine id.
+  if (credentialKind === 'session' && (!sandEnabled || machineId === null)) {
+    throw new Error('CURSOR_CREDENTIAL_SELECTION_MALFORMED')
+  }
   return {
     slot,
     keyName,
-    sandEnabled: matched[3] === 'sand',
+    sandEnabled,
     poolGeneration: matched[4],
     accountId: matched[5],
     keyFingerprint: matched[6],
+    credentialKind,
+    machineId,
   }
 }
 
