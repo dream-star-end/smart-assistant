@@ -7,6 +7,8 @@ import { describe, test } from "node:test";
 
 import type { AdmitUserTurnInput, AdmitUserTurnResult } from "../db/pgSessionsBackend.js";
 import {
+  DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS,
+  classifyTurnDispatchReceipt,
   executeCronOriginInject,
   lookupCronOriginSessionModel,
   resolveCronOriginAdmitModel,
@@ -14,6 +16,10 @@ import {
 } from "../ws/userChatBridge.js";
 
 describe("resolveCronOriginAdmitModel", () => {
+  test("production preparation budget is not shorter than the legal PG statement budget", () => {
+    assert.ok(DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS >= 30_000);
+  });
+
   test("keeps a grok-build origin session on grok-build", () => {
     assert.equal(resolveCronOriginAdmitModel("grok-build"), "grok-build");
   });
@@ -33,6 +39,36 @@ describe("resolveCronOriginAdmitModel", () => {
     assert.equal(resolveCronOriginAdmitModel("bad model"), null);
     assert.equal(resolveCronOriginAdmitModel("a".repeat(65)), null);
     assert.equal(resolveCronOriginAdmitModel("glm/5.3"), null);
+  });
+});
+
+describe("turn dispatch receipt classification", () => {
+  const expected = {
+    dispatchId: "d-1",
+    attemptNo: 2,
+    sessionId: "s-1",
+    clientMessageId: "c-1",
+  };
+
+  test("queued/running/terminal receipts with the exact identity are accepted", () => {
+    assert.equal(classifyTurnDispatchReceipt({ ...expected, state: "queued", outcome: null }, expected), "accepted");
+    assert.equal(classifyTurnDispatchReceipt({ ...expected, state: "running", outcome: null }, expected), "accepted");
+    assert.equal(classifyTurnDispatchReceipt({ ...expected, state: "terminal", outcome: "completed" }, expected), "accepted");
+  });
+
+  test("rejected duplicate is never accepted; identity/status mismatches are invalid", () => {
+    assert.equal(
+      classifyTurnDispatchReceipt({ ...expected, state: "rejected", outcome: "not_accepted" }, expected),
+      "rejected",
+    );
+    assert.equal(
+      classifyTurnDispatchReceipt({ ...expected, attemptNo: 3, state: "queued", outcome: null }, expected),
+      "invalid",
+    );
+    assert.equal(
+      classifyTurnDispatchReceipt({ ...expected, state: "terminal", outcome: null }, expected),
+      "invalid",
+    );
   });
 });
 
@@ -71,6 +107,21 @@ function fakeAdmitted(input: AdmitUserTurnInput): AdmitUserTurnResult {
   };
 }
 
+function fakeExisting(
+  input: AdmitUserTurnInput,
+  kind: "already_owned" | "in_flight",
+  status: "admitted" | "accepted" | "rejecting",
+): AdmitUserTurnResult {
+  const admitted = fakeAdmitted(input);
+  assert.equal(admitted.kind, "admitted");
+  if (admitted.kind !== "admitted") throw new Error("unreachable");
+  return {
+    kind,
+    workspaceMode: "legacy",
+    dispatch: { ...admitted.dispatch, status },
+  };
+}
+
 describe("injectCronOriginTurn stamps admit + inbound.model", () => {
   const uid = 3n;
   const input = {
@@ -90,6 +141,7 @@ describe("injectCronOriginTurn stamps admit + inbound.model", () => {
     const executor: CronOriginExecutor = ({ encoded, admitted }) => {
       frames.push(JSON.parse(encoded.toString("utf8")) as { type?: string; model?: string });
       owners.push(admitted.leaseOwnerId);
+      return { kind: "claimed" };
     };
     const run = () => executeCronOriginInject({
       input,
@@ -144,7 +196,7 @@ describe("injectCronOriginTurn stamps admit + inbound.model", () => {
         admits.push(admitInput);
         return fakeAdmitted(admitInput);
       },
-      executor: () => {},
+      executor: () => ({ kind: "claimed" }),
     });
     assert.equal(result.kind, "injected");
     assert.equal(admits[0]!.model, "grok-build");
@@ -169,5 +221,76 @@ describe("injectCronOriginTurn stamps admit + inbound.model", () => {
     assert.equal(frames.length, 1);
     assert.equal(frames[0]!.type, "inbound.message");
     assert.equal(frames[0]!.model, undefined);
+  });
+
+  test("already_owned admission is retryable and never becomes a false injected ACK", async () => {
+    let executorCalls = 0;
+    const result = await executeCronOriginInject({
+      input,
+      admitUserTurn: async (admitInput) => fakeExisting(admitInput, "already_owned", "admitted"),
+      executor: () => { executorCalls++; return { kind: "claimed" }; },
+    });
+    assert.equal(result.kind, "in_flight");
+    assert.equal(executorCalls, 0);
+  });
+
+  test("accepted in_flight row is a durable receipt and may ACK without re-send", async () => {
+    let executorCalls = 0;
+    const result = await executeCronOriginInject({
+      input,
+      admitUserTurn: async (admitInput) => fakeExisting(admitInput, "in_flight", "accepted"),
+      executor: () => { executorCalls++; return { kind: "claimed" }; },
+    });
+    assert.equal(result.kind, "injected");
+    assert.equal(executorCalls, 0);
+  });
+
+  test("stale executor may reselect only after explicit not_claimed and keeps one envelope", async () => {
+    const envelopes: Array<{ dispatchId: string; attemptNo: number; leaseEpoch: number }> = [];
+    const result = await executeCronOriginInject({
+      input,
+      admitUserTurn: async (admitInput) => fakeAdmitted(admitInput),
+      getExecutors: () => [
+        ({ admitted }) => {
+          envelopes.push(admitted);
+          return { kind: "not_claimed" };
+        },
+        ({ admitted }) => {
+          envelopes.push(admitted);
+          return { kind: "claimed" };
+        },
+      ],
+    });
+    assert.equal(result.kind, "injected");
+    assert.equal(envelopes.length, 2);
+    assert.deepEqual(envelopes[0], envelopes[1], "reselection reuses dispatch/attempt/epoch");
+  });
+
+  test("delivery_unknown stops reselection because bytes may already be in flight", async () => {
+    let secondCalls = 0;
+    const result = await executeCronOriginInject({
+      input,
+      admitUserTurn: async (admitInput) => fakeAdmitted(admitInput),
+      getExecutors: () => [
+        () => ({ kind: "delivery_unknown" }),
+        () => { secondCalls++; return { kind: "claimed" }; },
+      ],
+    });
+    assert.deepEqual(result, { kind: "failed", reason: "delivery_unknown" });
+    assert.equal(secondCalls, 0);
+  });
+
+  test("rejected executor receipt returns a non-success result and stops reselection", async () => {
+    let secondCalls = 0;
+    const result = await executeCronOriginInject({
+      input,
+      admitUserTurn: async (admitInput) => fakeAdmitted(admitInput),
+      getExecutors: () => [
+        () => ({ kind: "rejected" }),
+        () => { secondCalls++; return { kind: "claimed" }; },
+      ],
+    });
+    assert.deepEqual(result, { kind: "failed", reason: "dispatch_rejected" });
+    assert.equal(secondCalls, 0);
   });
 });

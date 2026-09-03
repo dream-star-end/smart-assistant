@@ -428,12 +428,11 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       }
       continue
     }
-    // 无进程死亡证据时保持 90min 门(防误杀活流);有标记则容器已给出 rejected/absent 即可收敛。
-    if (age < stuckMs && !hasDeadEvidence) continue
     if (res.state === 'rejected') {
-      // 容器把这条 accepted 的 inbox 行终态化为 rejected tombstone(如 boot recovery:
-      // queued/running 被拒)。这是**显式** durable negative proof(I2 允许),→ CAS
-      // terminal(not_accepted)进 fail-visible(下轮 ③ 分支消化,或若已过则次轮)。
+      // A durable rejected inbox tombstone is explicit negative proof, not an
+      // absence inference. It can only be written from queued and is terminal
+      // on the container, so keeping the Master row accepted for the generic
+      // 90-minute stuck window only prolongs a split-brain visible state.
       const terminal = await casToTerminal(deps.pool, {
         dispatchId: row.dispatchId,
         outcome: 'not_accepted',
@@ -446,7 +445,11 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
         counts.rejectedTerminal++
         await clearExitMark(deps, row)
       }
-    } else if (res.state === 'absent' && hasDeadEvidence) {
+      continue
+    }
+    // 无进程死亡证据时保持 90min 门(防误杀活流);有标记则容器已给出 rejected/absent 即可收敛。
+    if (age < stuckMs && !hasDeadEvidence) continue
+    if (res.state === 'absent' && hasDeadEvidence) {
       // 重启后行消失:已执行过,写 SERVICE_RESTART,绝不 not_accepted。
       const closed = await closeAcceptedAsServiceRestart(deps, row, now())
       if (closed) {
