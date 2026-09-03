@@ -10,6 +10,7 @@ import path from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
+import { generatePersona } from '../account-pool/persona.js'
 import { query } from '../db/queries.js'
 import { resetAndMigrateBefore, useDedicatedTestDatabase } from './helpers/db.js'
 
@@ -23,7 +24,8 @@ const MACHINE_ID = 'abcdefghijklmnopqrstuvwxyz'
 type InsertOpts = {
   label: string
   provider?: string
-  sand?: boolean | null
+  /** Omitted → column default (FALSE, 0251: NOT NULL). */
+  sand?: boolean
   kind?: 'api_key' | 'session' | string
   machineId?: string | null
   authId?: string | null
@@ -31,41 +33,40 @@ type InsertOpts = {
 
 /** Minimal claude_accounts row; 0257 columns are only written when explicitly provided. */
 async function insertAccount(opts: InsertOpts): Promise<{ kind: string; machine_id: string | null; auth_id: string | null }> {
-  const cols = ['provider', 'label', 'plan', 'oauth_token_enc', 'oauth_nonce', 'runtime_channel', 'persona', 'cursor_sand_enabled']
-  const vals: string[] = [
-    `'${opts.provider ?? 'cursor'}'`,
-    `'${opts.label}'`,
-    `'max'`,
-    `decode('00','hex')`,
-    `decode('000000000000000000000000','hex')`,
-    `'v5'`,
-    `'{}'::jsonb`,
-    opts.sand === undefined || opts.sand === null ? 'NULL' : opts.sand ? 'TRUE' : 'FALSE',
+  const cols = ['provider', 'label', 'plan', 'oauth_token_enc', 'oauth_nonce', 'runtime_channel', 'persona']
+  const params: unknown[] = [
+    opts.provider ?? 'cursor',
+    opts.label,
+    'max',
+    Buffer.from([0]),
+    Buffer.alloc(12),
+    'v5',
+    JSON.stringify(generatePersona()),
   ]
-  if (opts.kind !== undefined) {
-    cols.push('cursor_credential_kind')
-    vals.push(`'${opts.kind}'`)
+  const vals = ['$1', '$2', '$3', '$4', '$5', '$6', '$7::jsonb']
+  const push = (col: string, value: unknown): void => {
+    cols.push(col)
+    params.push(value)
+    vals.push(`$${params.length}`)
   }
-  if (opts.machineId !== undefined) {
-    cols.push('cursor_machine_id')
-    vals.push(opts.machineId === null ? 'NULL' : `'${opts.machineId}'`)
-  }
-  if (opts.authId !== undefined) {
-    cols.push('cursor_auth_id')
-    vals.push(opts.authId === null ? 'NULL' : `'${opts.authId}'`)
-  }
+  if (opts.sand !== undefined) push('cursor_sand_enabled', opts.sand)
+  if (opts.kind !== undefined) push('cursor_credential_kind', opts.kind)
+  if (opts.machineId !== undefined) push('cursor_machine_id', opts.machineId)
+  if (opts.authId !== undefined) push('cursor_auth_id', opts.authId)
   const r = await query<{ kind: string; machine_id: string | null; auth_id: string | null }>(
     `INSERT INTO claude_accounts(${cols.join(', ')}) VALUES (${vals.join(', ')})
      RETURNING cursor_credential_kind AS kind, cursor_machine_id AS machine_id, cursor_auth_id AS auth_id`,
+    params,
   )
   return r.rows[0]!
 }
 
+/** Only the two 0257 CHECKs (0226 already owns claude_accounts_cursor_quota_class_check). */
 async function constraintNames(): Promise<string[]> {
   const r = await query<{ conname: string }>(
     `SELECT conname FROM pg_constraint
       WHERE conrelid = 'claude_accounts'::regclass
-        AND conname LIKE 'claude_accounts_cursor_%'
+        AND conname IN ('claude_accounts_cursor_credential_kind_check', 'claude_accounts_cursor_session_shape_check')
       ORDER BY conname`,
   )
   return r.rows.map((row) => row.conname)
@@ -79,7 +80,8 @@ describe('0257_cursor_session_credential', () => {
     // Pre-image: a Sand api-key row created before the migration.
     await query(
       `INSERT INTO claude_accounts(provider, label, plan, oauth_token_enc, oauth_nonce, runtime_channel, persona, cursor_sand_enabled)
-       VALUES ('cursor', 'pre-0257-sand', 'max', decode('00','hex'), decode('000000000000000000000000','hex'), 'v5', '{}'::jsonb, TRUE)`,
+       VALUES ('cursor', 'pre-0257-sand', 'max', $1, $2, 'v5', $3::jsonb, TRUE)`,
+      [Buffer.from([0]), Buffer.alloc(12), JSON.stringify(generatePersona())],
     )
 
     const sql = await readFile(migrationPath, 'utf8')
@@ -155,8 +157,9 @@ describe('0257_cursor_session_credential', () => {
       insertAccount({ label: 'session-no-sand', sand: false, kind: 'session', machineId: MACHINE_ID }),
       /claude_accounts_cursor_session_shape_check/,
     )
+    // (default cursor_sand_enabled = FALSE, 0251)
     await assert.rejects(
-      insertAccount({ label: 'session-null-sand', sand: null, kind: 'session', machineId: MACHINE_ID }),
+      insertAccount({ label: 'session-default-sand', kind: 'session', machineId: MACHINE_ID }),
       /claude_accounts_cursor_session_shape_check/,
     )
     // ... and live on provider=cursor only.
