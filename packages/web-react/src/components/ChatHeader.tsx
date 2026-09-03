@@ -1,3 +1,4 @@
+import type { CursorContextTier } from "@openclaude/protocol";
 import { Bell, ChevronDown, Menu, PanelLeft, PenSquare, Users, Wallet } from "lucide-react";
 import { useState } from "react";
 import type { Agent } from "../lib/agents";
@@ -21,6 +22,8 @@ export function ChatHeader({
   effortSupported,
   effortActive,
   onSelectEffort,
+  contextTier,
+  onSelectContextTier,
   teamModeActive,
   onDisableTeamMode,
   credits,
@@ -51,6 +54,9 @@ export function ChatHeader({
   effortActive?: PreferenceEffort | null;
   /** 选择思考档；null = 跟随模型默认。透传给模型菜单的二级档位区块。 */
   onSelectEffort?: (value: PreferenceEffort | null) => void;
+  /** Cursor Opus/Fable 上下文档位(300k 默认 / 1M);透传给模型菜单的「上下文」区块。 */
+  contextTier?: CursorContextTier | null;
+  onSelectContextTier?: (tier: CursorContextTier) => void;
   /**
    * 团队模式已开启且当前会话是 main（队长引擎覆盖生效）。true 时 agent 名旁显示
    * 「团队模式」chip（点击弹说明 + 关闭入口），并让 ModelSelector 切换到如实的
@@ -183,6 +189,8 @@ export function ChatHeader({
           effortSupported={effortSupported}
           effortActive={effortActive}
           onSelectEffort={onSelectEffort}
+          contextTier={contextTier}
+          onSelectContextTier={onSelectContextTier}
         />
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">

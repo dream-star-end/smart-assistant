@@ -138,7 +138,8 @@
     "0254_agent_audit_error_msg",
     "0255_cursor_fable_51",
     "0256_cursor_picker_plan_gate_half_price",
-    "0257_cursor_session_credential"
+    "0257_cursor_session_credential",
+    "0258_cursor_opus_fable_context_1m"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

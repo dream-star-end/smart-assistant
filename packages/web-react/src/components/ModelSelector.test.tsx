@@ -205,6 +205,87 @@ describe('ModelSelector Cursor 家族 + 思考档 + Fast', () => {
   })
 })
 
+describe('ModelSelector Cursor Opus/Fable 上下文档(turn 级 contextTier)', () => {
+  const CURSOR_MODELS: PublicModel[] = [
+    { id: 'cursor-auto', display_name: 'Cursor Auto' },
+    { id: 'cursor-grok-4.6-high', display_name: 'Grok 4.6 High' },
+    { id: 'cursor-fable-5-high', display_name: 'Fable 5 High' },
+    { id: 'cursor-opus-5-high', display_name: 'Opus 5 High' },
+    { id: 'glm-5.2', display_name: 'GLM-5.2' },
+  ]
+
+  it('Fable 选中时渲染 300k / 1M 两档,默认高亮 300k,点击 1M 上抛 onSelectContextTier', async () => {
+    const onSelectContextTier = vi.fn()
+    render(
+      <ModelSelector
+        models={CURSOR_MODELS}
+        selectedId="cursor-fable-5-high"
+        onSelect={() => {}}
+        onSelectContextTier={onSelectContextTier}
+      />,
+    )
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    const std = document.querySelector('[data-cursor-context="300k"]')
+    const long = document.querySelector('[data-cursor-context="1m"]')
+    expect(std).toBeTruthy()
+    expect(long).toBeTruthy()
+    expect(std?.textContent).toContain('默认')
+    // 默认档:300k 行带勾,1M 行不带
+    expect(std?.querySelector('svg')).toBeTruthy()
+    expect(long?.querySelector('svg')).toBeNull()
+    if (long) fireEvent.click(long)
+    expect(onSelectContextTier).toHaveBeenCalledWith('1m')
+  })
+
+  it('contextTier=1m 时高亮 1M 行,且不改写 model id(onSelect 不被调用)', async () => {
+    const onSelect = vi.fn()
+    const onSelectContextTier = vi.fn()
+    render(
+      <ModelSelector
+        models={CURSOR_MODELS}
+        selectedId="cursor-opus-5-high"
+        onSelect={onSelect}
+        contextTier="1m"
+        onSelectContextTier={onSelectContextTier}
+      />,
+    )
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    const std = document.querySelector('[data-cursor-context="300k"]')
+    const long = document.querySelector('[data-cursor-context="1m"]')
+    expect(long?.querySelector('svg')).toBeTruthy()
+    expect(std?.querySelector('svg')).toBeNull()
+    if (std) fireEvent.click(std)
+    expect(onSelectContextTier).toHaveBeenCalledWith('300k')
+    expect(onSelect).not.toHaveBeenCalled()
+  })
+
+  it('非 Opus/Fable(Grok / Auto / 非 Cursor)或未提供回调时不渲染上下文档', async () => {
+    for (const selectedId of ['cursor-grok-4.6-high', 'cursor-auto', 'glm-5.2']) {
+      render(
+        <ModelSelector
+          models={CURSOR_MODELS}
+          selectedId={selectedId}
+          onSelect={() => {}}
+          onSelectContextTier={() => {}}
+        />,
+      )
+      openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findAllByRole('menuitem')
+      expect(document.querySelector('[data-cursor-context]')).toBeNull()
+      cleanup()
+    }
+    // 演示态等场景不传回调 → Fable 也不显示该档位
+    render(
+      <ModelSelector models={CURSOR_MODELS} selectedId="cursor-fable-5-high" onSelect={() => {}} />,
+    )
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-cursor-context]')).toBeNull()
+  })
+})
+
 describe('ModelSelector locked rows + promo badge', () => {
   const MODELS: PublicModel[] = [
     { id: 'glm-5.2', display_name: 'GLM-5.2', promo_label: '限时半价' },

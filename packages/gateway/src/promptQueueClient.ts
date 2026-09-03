@@ -5,6 +5,8 @@ import {
   PROMPT_QUEUE_MAX_TOTAL_CONTENT_BYTES,
   PROMPT_QUEUE_MUTATION_PATH,
   PROMPT_QUEUE_SNAPSHOT_PATH,
+  isCursorContextTier,
+  type CursorContextTier,
   type PromptQueueMutationFrame,
   type PromptQueueSnapshot,
   PromptQueueSnapshot as PromptQueueSnapshotSchema,
@@ -60,6 +62,7 @@ export interface PromptQueueDetail {
     modelSwitchId?: string
     effortLevel?: string | null
     teamMode?: boolean
+    contextTier?: CursorContextTier
   }
   deliveryIntent?: {
     mode?: string
@@ -478,7 +481,7 @@ function assertOwner(value: unknown, expected: PromptQueueWireOwner, userId: str
 
 function assertRequestedExecution(value: unknown, agentId: string): void {
   const execution = record(value, 'requestedExecution')
-  assertOnlyKeys(execution, ['agentId', 'model', 'modelSwitchId', 'effortLevel', 'teamMode'], 'requestedExecution')
+  assertOnlyKeys(execution, ['agentId', 'model', 'modelSwitchId', 'effortLevel', 'teamMode', 'contextTier'], 'requestedExecution')
   if (execution.agentId !== agentId) invalidResponse('requestedExecution.agentId mismatch')
   if (execution.model !== undefined && typeof execution.model !== 'string')
     invalidResponse('requestedExecution.model invalid')
@@ -495,6 +498,9 @@ function assertRequestedExecution(value: unknown, agentId: string): void {
   }
   if (execution.teamMode !== undefined && typeof execution.teamMode !== 'boolean') {
     invalidResponse('requestedExecution.teamMode invalid')
+  }
+  if (execution.contextTier !== undefined && !isCursorContextTier(execution.contextTier)) {
+    invalidResponse('requestedExecution.contextTier invalid')
   }
 }
 

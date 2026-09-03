@@ -9,7 +9,7 @@
  * 重要：reducer 对 `session.messages` **就地 mutation**（push / 改字段），不每帧
  * 重建数组（streaming delta 频率极高）。订阅侧靠 `version` 单调递增触发重渲。
  */
-import type { MessageReplyQuote } from "@openclaude/protocol";
+import type { CursorContextTier, MessageReplyQuote } from "@openclaude/protocol";
 import type {
   CallTokenUsageSnapshot,
   TurnTokenUsageSnapshot,
@@ -58,6 +58,8 @@ export type ChatRoutingSnapshot = {
   modelSwitchId?: string;
   teamMode?: boolean;
   effortLevel?: string | null;
+  /** Cursor Opus/Fable 上下文档位(300k / 1m);非分档模型不带。重试/合成续写原样复用。 */
+  contextTier?: CursorContextTier;
 };
 
 export type RecoveryStatusState = {

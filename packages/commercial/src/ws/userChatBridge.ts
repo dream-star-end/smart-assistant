@@ -134,9 +134,11 @@ import {
   isCodexEngineModel,
   isGrokEngineModel,
   isCursorEngineModel,
+  isCursorContextTier,
   isZcodeEngineModel,
   isClientMessageId,
   formatMessageReplyPrompt,
+  projectContextWindowForCursorTier,
   modelHistorySemanticRole,
   modelHistorySemanticText,
   newTraceId,
@@ -149,6 +151,7 @@ import {
   type ModelAuthorityBundle,
   type ModelAuthorityEngine,
   type ModelExecutionDescriptor,
+  type CursorContextTier,
   type TraceIdIssue,
   type GoalStateSnapshot,
   type MessageReplyQuote,
@@ -361,6 +364,7 @@ export interface PromptQueueDispatchRequest {
       modelSwitchId?: string;
       effortLevel?: string | null;
       teamMode?: boolean;
+      contextTier?: CursorContextTier;
     };
   };
 }
@@ -434,12 +438,13 @@ export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDisp
     !isPlainRecord(item.content) || !isPlainRecord(item.requestedExecution)
   ) return null;
   const execution = item.requestedExecution;
-  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode"])) return null;
+  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode", "contextTier"])) return null;
   if (execution.agentId !== owner.agentId) return null;
   if (execution.model !== undefined && typeof execution.model !== "string") return null;
   if (execution.modelSwitchId !== undefined && (typeof execution.modelSwitchId !== "string" || !/^[A-Za-z0-9:_-]{8,128}$/.test(execution.modelSwitchId))) return null;
   if (execution.effortLevel !== undefined && execution.effortLevel !== null && typeof execution.effortLevel !== "string") return null;
   if (execution.teamMode !== undefined && typeof execution.teamMode !== "boolean") return null;
+  if (execution.contextTier !== undefined && !isCursorContextTier(execution.contextTier)) return null;
   return value as unknown as PromptQueueDispatchRequest;
 }
 
@@ -3263,6 +3268,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       log: Logger | null;
       onReject?: (code: string) => void;
       turn?: InboundTurnIdentity;
+      /** Cursor Opus/Fable turn-level context tier(见 frames.ts InboundMessage.contextTier)。
+       * 只在 cursor 路径传入;非 tier 模型忽略。 */
+      contextTier?: CursorContextTier | null;
     }): Promise<ResolvedTurnExecution | null> => {
       const reject = (code: string, message: string): null => {
         args.onReject?.(code);
@@ -3357,10 +3365,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       //   同一纯函数 projectContextWindowForRole + 两处落点单测(modelRolePolicy.test.ts 纯
       //   函数契约 / modelAuthorityBridge.test.ts:431 bridge 签发)。别删这两个测试,也别新增
       //   旁路投影而不加对应落点单测。
-      const projectedWindow = projectContextWindowForRole(
+      const roleProjectedWindow = projectContextWindowForRole(
         exec.canonicalModel,
         exec.descriptor.contextWindow,
         userRole,
+      );
+      // ── Cursor Opus/Fable 上下文档位(turn 级,执行轴)────────────────────────
+      // catalog 行声明机制上限(1M);用户在前台按 turn 选 300k / 1m。与角色投影同一落点、
+      // 同一纯函数纪律(protocol.projectContextWindowForCursorTier + 落点单测),只收窄不放宽。
+      // 缺省 → DEFAULT_CURSOR_CONTEXT_TIER(300k)。非 tier 模型原样透传。
+      const projectedWindow = projectContextWindowForCursorTier(
+        exec.canonicalModel,
+        roleProjectedWindow,
+        args.contextTier ?? null,
       );
       if (projectedWindow !== exec.descriptor.contextWindow) {
         exec = {
@@ -4253,10 +4270,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           if (authorityDeps !== undefined) {
             if (historyModel === null) return false;
             const execution = await resolveTurnExecution(authorityDeps.catalog, historyModel);
-            contextWindow = projectContextWindowForRole(
+            contextWindow = projectContextWindowForCursorTier(
               execution.canonicalModel,
-              execution.descriptor.contextWindow,
-              userRole,
+              projectContextWindowForRole(
+                execution.canonicalModel,
+                execution.descriptor.contextWindow,
+                userRole,
+              ),
+              isCursorContextTier(frameObj.contextTier) ? frameObj.contextTier : null,
             );
             engine = execution.engine;
           }
@@ -5903,7 +5924,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (authorityOn) {
               // resolveAuthorityExecOrReject's legacy boolean means "non-CCB"
               // (not literally Codex); Cursor is therefore classified true.
-              authorityExec = await resolveAuthorityExecOrReject({ model: authorityModelCapture, classifiedCodex: true, log: logCapture, onReject: rejectPromptQueueDispatch, turn: cursorTurnIdentity });
+              authorityExec = await resolveAuthorityExecOrReject({
+                model: authorityModelCapture,
+                classifiedCodex: true,
+                log: logCapture,
+                onReject: rejectPromptQueueDispatch,
+                turn: cursorTurnIdentity,
+                contextTier: isCursorContextTier(enriched.contextTier) ? enriched.contextTier : null,
+              });
               if (
                 authorityExec === null
                 || authorityExec.engine !== 'cursor'
@@ -7869,6 +7897,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ...(execution.modelSwitchId !== undefined ? { modelSwitchId: execution.modelSwitchId } : {}),
             ...(execution.effortLevel !== undefined ? { effortLevel: execution.effortLevel } : {}),
             ...(execution.teamMode !== undefined ? { teamMode: execution.teamMode } : {}),
+            ...(execution.contextTier !== undefined ? { contextTier: execution.contextTier } : {}),
             [PROMPT_QUEUE_GRANT_FIELD]: {
               grantId: request.grantId,
               itemId: request.item.itemId,

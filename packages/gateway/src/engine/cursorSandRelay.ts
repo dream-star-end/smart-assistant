@@ -674,6 +674,37 @@ function decodeFrame(bytes: Buffer): JsonObject {
   }) as JsonObject
 }
 
+/**
+ * Canonical prefix the CCB runtime keys reactive compaction on
+ * (claude-code-best services/api/errors.ts: `message.toLowerCase().includes('prompt is too long')`)
+ * and the gateway taxonomy classifies as `context_too_long` (errorClassify.ts).
+ * Every Cursor Sand overflow surface — HTTP 413, INPUT_TOKEN_LIMIT stream error,
+ * end-trailer text — must be normalised to start with this string, otherwise the
+ * harness treats the failure as a generic api_error and never compacts.
+ */
+export const CURSOR_SAND_PROMPT_TOO_LONG_PREFIX = 'Prompt is too long'
+
+/** InferenceStreamErrorType.INFERENCE_STREAM_ERROR_TYPE_INPUT_TOKEN_LIMIT (cursorSandInference.proto). */
+const SAND_ERROR_TYPE_INPUT_TOKEN_LIMIT = 2
+
+const SAND_OVERFLOW_TEXT = /input[_ ]token[_ ]limit|prompt is too long|prompt[_ ]too[_ ]long|context[_ ](?:length|window)[_ ]?(?:exceeded|too long|limit)|too many input tokens|exceeds? (?:the )?(?:model(?:'s)? )?(?:maximum )?context|request entity too large|payload too large/i
+
+/** True when a Sand error surface (status/code/text) denotes prompt/context overflow. */
+export function isCursorSandOverflow(input: { status?: number; code?: unknown; errorType?: unknown; text?: unknown }): boolean {
+  if (input.status === 413) return true
+  if (input.errorType === SAND_ERROR_TYPE_INPUT_TOKEN_LIMIT) return true
+  if (typeof input.code === 'string' && SAND_OVERFLOW_TEXT.test(input.code)) return true
+  return typeof input.text === 'string' && SAND_OVERFLOW_TEXT.test(input.text)
+}
+
+/** `Prompt is too long: <detail>` — detail retained so operators still see the upstream cause. */
+export function cursorSandPromptTooLongMessage(detail: string): string {
+  const trimmed = detail.trim()
+  if (!trimmed) return CURSOR_SAND_PROMPT_TOO_LONG_PREFIX
+  if (trimmed.toLowerCase().startsWith(CURSOR_SAND_PROMPT_TOO_LONG_PREFIX.toLowerCase())) return trimmed
+  return `${CURSOR_SAND_PROMPT_TOO_LONG_PREFIX}: ${trimmed}`
+}
+
 function errorMessage(value: unknown): string {
   if (value && typeof value === 'object') {
     const record = value as JsonObject
@@ -683,7 +714,10 @@ function errorMessage(value: unknown): string {
       : typeof record.errorType === 'number' && record.errorType > 0
         ? `error_type_${record.errorType}`
         : ''
-    return prefix ? `${prefix}: ${message}` : message
+    const composed = prefix ? `${prefix}: ${message}` : message
+    return isCursorSandOverflow({ code: record.code, errorType: record.errorType, text: message })
+      ? cursorSandPromptTooLongMessage(composed)
+      : composed
   }
   return 'Cursor Sand inference failed'
 }
@@ -694,9 +728,11 @@ function parseEndTrailer(bytes: Buffer): string | null {
     const parsed = JSON.parse(bytes.toString('utf8')) as JsonObject
     const error = parsed.error
     if (!error || typeof error !== 'object') return null
-    return typeof (error as JsonObject).message === 'string'
-      ? (error as JsonObject).message as string
-      : 'Cursor Sand transport error'
+    const record = error as JsonObject
+    const message = typeof record.message === 'string' ? record.message : 'Cursor Sand transport error'
+    return isCursorSandOverflow({ code: record.code, text: message })
+      ? cursorSandPromptTooLongMessage(message)
+      : message
   } catch {
     return 'Cursor Sand transport trailer was malformed'
   }
@@ -1306,9 +1342,19 @@ export class CursorSandRelay {
     }
     const upstream = opened.response
     if (!upstream.ok || !upstream.body) {
-      res.statusCode = upstream.status || 502
+      // Context overflow must reach CCB as "Prompt is too long" (413 or an
+      // overflow body) so reactive compaction fires instead of a dead api_error.
+      const bodyText = await upstream.text().then((text) => text.slice(0, 2000), () => '')
+      const overflow = isCursorSandOverflow({ status: upstream.status, text: bodyText })
+      res.statusCode = overflow ? 413 : (upstream.status || 502)
       res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: `Cursor Sand HTTP ${upstream.status}` } }))
+      const message = overflow
+        ? cursorSandPromptTooLongMessage(`Cursor Sand HTTP ${upstream.status}${bodyText ? ` ${bodyText}` : ''}`)
+        : `Cursor Sand HTTP ${upstream.status}`
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: overflow ? 'invalid_request_error' : 'api_error', message },
+      }))
       return
     }
     if (body.stream === false) {

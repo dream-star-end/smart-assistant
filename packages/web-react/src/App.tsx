@@ -1,5 +1,7 @@
 import { lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  type CursorContextTier,
+  cursorModelSupportsContextTier,
   isCodexEngineModel,
   normalizeMessageReplyQuote,
   type MessageReplyQuote,
@@ -134,6 +136,11 @@ import {
   readSessionEffort,
   writeSessionEffort,
 } from "./lib/sessionEffort";
+import {
+  clearContextTierForSession,
+  readContextTierForSession,
+  writeContextTier,
+} from "./lib/sessionContextTier";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
 import {
   PRODUCT_CAPABILITIES,
@@ -579,6 +586,7 @@ export function App() {
       localStore.current.delete(id);
       clearTeamModeForSession(id); // 顺手清该会话的团队模式 per-session 键(不留孤儿键)
       clearSessionEffort(id); // 同上:思考档位 per-session 键
+      clearContextTierForSession(id); // 同上:Cursor 上下文档位 per-session 键
     },
     onActiveSessionDeleted: () => {
       setMessages([]);
@@ -811,6 +819,22 @@ export function App() {
     setSessionEffortState(readSessionEffort(activeId));
   }, [activeId]);
 
+  // Cursor Opus/Fable 上下文档位(300k 默认 / 1M;语义见 lib/sessionContextTier)。
+  // per-session 键优先,缺失继承全局最近选择,再缺失回产品默认 300k。
+  const [contextTier, setContextTierState] = useState<CursorContextTier>(() =>
+    readContextTierForSession(activeId),
+  );
+  const setContextTier = useCallback(
+    (tier: CursorContextTier) => {
+      setContextTierState(tier);
+      writeContextTier(activeId, tier);
+    },
+    [activeId],
+  );
+  useEffect(() => {
+    setContextTierState(readContextTierForSession(activeId));
+  }, [activeId]);
+
   const send = useCallback(
     async (
       text: string,
@@ -885,6 +909,7 @@ export function App() {
         writeTeamMode(sessionId, teamMode);
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
+        writeContextTier(sessionId, contextTier);
       }
       const materializedDraft =
         !createdSession && sessions.some((session) => session.id === sessionId && session.messageCount === 0);
@@ -927,6 +952,9 @@ export function App() {
         imageEdit,
         replyTo,
         teamMode: teamLeaderTurn,
+        // Cursor Opus/Fable 上下文档位:只在当前模型支持分档时随帧发送;其它模型不带该字段
+        // (master 对非分档模型本就忽略,但不发送可以让路由快照/日志更干净)。
+        ...(cursorModelSupportsContextTier(modelId) ? { contextTier } : {}),
       });
       // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
       setSessions((c) => {
@@ -972,6 +1000,7 @@ export function App() {
       models,
       preferenceEffort,
       sessionEffort,
+      contextTier,
       teamMode,
       sessions,
       setSessions,
@@ -2980,6 +3009,8 @@ export function App() {
           effortSupported={effortSupported}
           effortActive={effortActive}
           onSelectEffort={demo ? undefined : setSessionEffort}
+          contextTier={contextTier}
+          onSelectContextTier={demo ? undefined : setContextTier}
           // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
           // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}

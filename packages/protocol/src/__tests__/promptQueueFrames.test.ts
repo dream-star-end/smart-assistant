@@ -173,6 +173,27 @@ describe('prompt queue TypeBox frames', () => {
     }
   })
 
+  it('requestedExecution.contextTier accepts only 300k / 1m on enqueue and snapshot items', () => {
+    const enqueueCheck = TypeCompiler.Compile(InboundPromptQueueEnqueue)
+    const withTier = (contextTier: unknown) => ({
+      ...enqueue,
+      requestedExecution: { ...enqueue.requestedExecution, contextTier },
+    })
+    assert.equal(enqueueCheck.Check(withTier('300k')), true)
+    assert.equal(enqueueCheck.Check(withTier('1m')), true)
+    assert.equal(enqueueCheck.Check(withTier('1M')), false)
+    assert.equal(enqueueCheck.Check(withTier(300000)), false)
+
+    const snapshotCheck = TypeCompiler.Compile(PromptQueueSnapshot)
+    const baseItem = snapshot.items[0]!
+    const itemWithTier = (contextTier: unknown) => ({
+      ...snapshot,
+      items: [{ ...baseItem, requestedExecution: { ...baseItem.requestedExecution, contextTier } }],
+    })
+    assert.equal(snapshotCheck.Check(itemWithTier('1m')), true)
+    assert.equal(snapshotCheck.Check(itemWithTier('huge')), false)
+  })
+
   it('rejects non-durable attachment URLs, extra local fields and more than eight refs', () => {
     const check = TypeCompiler.Compile(PromptQueueSnapshot)
     const baseItem = snapshot.items[0]!

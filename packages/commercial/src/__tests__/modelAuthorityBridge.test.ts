@@ -27,6 +27,7 @@ import {
   assertLeaseMatchesAuthority,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
+  projectContextWindowForCursorTier,
   type ModelAuthorityEngine,
 } from "@openclaude/protocol";
 
@@ -692,6 +693,38 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     assert.equal(await grab("admin", "kimi-k3"), 1_048_576);
     // 未登记模型不受策略影响(哪个角色都拿机制窗口)
     assert.equal(await grab("user", "glm-5.2"), 200_000);
+  });
+
+  test("cursor turn:contextTier 落点 — 签发前按 turn 档位收窄 descriptor.contextWindow(300k 默认 / 1m)", async () => {
+    // 结构 guard(与角色投影同款):cursor 转发分支要 pgPool / 凭据成员 / self-host 行三件套,
+    // rig 不建;这里钉 (a) 纯函数契约(engineModels.test.ts)之外的**落点**——签发函数
+    // resolveAuthorityExecOrReject 必须在 role 投影之后再套 projectContextWindowForCursorTier,
+    // 且 cursor 分支把 frame.contextTier 传进去;(b) ensureHistory 的历史窗口用同一投影,
+    // 否则历史预算与执行窗口不一致。删掉任一处 = 1M/300k 档位静默失效。
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const resolveStart = source.indexOf("const resolveAuthorityExecOrReject = async (");
+    assert.ok(resolveStart > 0, "resolveAuthorityExecOrReject must exist");
+    const resolveBody = source.slice(resolveStart, source.indexOf("\n      return exec;\n    };", resolveStart));
+    assert.match(resolveBody, /contextTier\?: CursorContextTier \| null/);
+    assert.match(resolveBody, /const roleProjectedWindow = projectContextWindowForRole\(/);
+    assert.match(
+      resolveBody,
+      /projectContextWindowForCursorTier\(\s*exec\.canonicalModel,\s*roleProjectedWindow,\s*args\.contextTier \?\? null,?\s*\)/,
+    );
+    // cursor 分支实际把 frame 的 contextTier 交给签发函数(其它引擎分支不传 = 透传语义)。
+    assert.match(
+      source,
+      /turn: cursorTurnIdentity,\s*contextTier: isCursorContextTier\(enriched\.contextTier\) \? enriched\.contextTier : null,/,
+    );
+    // ensureHistory:历史加载窗口 = 同一 tier 投影(套在 role 投影之外)。
+    assert.match(
+      source,
+      /contextWindow = projectContextWindowForCursorTier\(\s*execution\.canonicalModel,\s*projectContextWindowForRole\([\s\S]*?\),\s*isCursorContextTier\(frameObj\.contextTier\) \? frameObj\.contextTier : null,\s*\)/,
+    );
+    // 纯函数本身在 protocol 层:默认 300k、显式 1m 保留目录上限、非 tier 模型透传。
+    assert.equal(projectContextWindowForCursorTier("cursor-fable-5.1-high", 1_000_000, null), 300_000);
+    assert.equal(projectContextWindowForCursorTier("cursor-fable-5.1-high", 1_000_000, "1m"), 1_000_000);
+    assert.equal(projectContextWindowForCursorTier("kimi-k3", 1_048_576, "300k"), 1_048_576);
   });
 
   test("ccb turn:auxModels = 平台次级模型集合(WebFetch/WebSearch 的隐藏调用能过 egress)", async () => {

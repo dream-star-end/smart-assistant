@@ -1594,3 +1594,120 @@ test('downstream abort cancels the Cursor stream and relay close does not hang',
   ])
   assert.equal(upstreamAborted, true)
 })
+
+// ── Context overflow → "Prompt is too long" (reactive compaction contract) ──────
+// CCB keys reactive compaction on `message.toLowerCase().includes('prompt is too long')`
+// (claude-code-best services/api/errors.ts). Every Sand overflow surface must land there.
+
+test('relay maps upstream HTTP 413 to a "Prompt is too long" invalid_request_error', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response('request entity too large', { status: 413 })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(response.status, 413)
+    const body = JSON.parse(await response.text()) as { error: { type: string; message: string } }
+    assert.equal(body.error.type, 'invalid_request_error')
+    assert.match(body.error.message, /^Prompt is too long: Cursor Sand HTTP 413/)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('relay keeps non-overflow upstream failures as plain api_error', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response('upstream unavailable', { status: 503 })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(response.status, 503)
+    const body = JSON.parse(await response.text()) as { error: { type: string; message: string } }
+    assert.equal(body.error.type, 'api_error')
+    assert.equal(body.error.message, 'Cursor Sand HTTP 503')
+    assert.doesNotMatch(body.error.message, /prompt is too long/i)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('relay maps INPUT_TOKEN_LIMIT stream error to a "Prompt is too long" SSE error', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        // InferenceStreamErrorType.INFERENCE_STREAM_ERROR_TYPE_INPUT_TOKEN_LIMIT = 2
+        controller.enqueue(responseFrame('error', { message: 'input exceeds model limit', errorType: 2 }))
+        controller.enqueue(envelope(Buffer.from('{}'), 0x02))
+        controller.close()
+      },
+    }), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(response.status, 200)
+    const text = await response.text()
+    assert.match(text, /event: error/)
+    assert.match(text, /"message":"Prompt is too long: error_type_2: input exceeds model limit"/)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('relay maps overflow end-trailer text to "Prompt is too long"', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(envelope(Buffer.from(JSON.stringify({
+          error: { code: 'resource_exhausted', message: 'context length exceeded for this model' },
+        })), 0x02))
+        controller.close()
+      },
+    }), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const text = await response.text()
+    assert.match(text, /"message":"Prompt is too long: context length exceeded for this model"/)
+  } finally {
+    await relay.close()
+  }
+})
