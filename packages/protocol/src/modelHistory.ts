@@ -14,6 +14,14 @@ import {
  * native runner. A null catalog value means "runner-owned", not infinite. */
 export const CODEX_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS = 258_400
 
+/** Cursor-engine catalog rows carry no context_window (the Cursor CLI owns
+ * the physical window). A null value must still bound master-side history
+ * transport: with no window the engine-context reader hydrates every turn
+ * tape of the session (hundreds of MB on long sessions) and the preparation
+ * fence times out. 200k is the smallest window among deployed Cursor models;
+ * the runner still compacts against its real limit. */
+export const CURSOR_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS = 200_000
+
 export const MODEL_HISTORY_EXACT_SUFFIX_MARKER =
   '[Earlier bytes of this exact message exceed the current model context window; exact suffix follows.]\n'
 
@@ -524,9 +532,10 @@ export function resolveModelHistoryContextWindow(
     Number.isSafeInteger(declaredContextWindow) &&
     declaredContextWindow > 0
   ) return declaredContextWindow
-  return declaredContextWindow === null && (engine === 'codex' || engine === 'grok')
-    ? CODEX_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS
-    : null
+  if (declaredContextWindow !== null) return null
+  if (engine === 'codex' || engine === 'grok') return CODEX_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS
+  if (engine === 'cursor') return CURSOR_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS
+  return null
 }
 
 /** Tokens available to prior conversation after bytes and runner-specific

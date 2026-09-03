@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
+  CODEX_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS,
+  CURSOR_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS,
   collectModelHistoryMediaPathHints,
   estimateModelHistoryTokens,
   estimateModelHistoryUtf8Bytes,
   modelHistoryReservedTokens,
   modelHistorySemanticText,
+  resolveModelHistoryContextWindow,
   sanitizePersistedModelHistoryText,
 } from '../modelHistory.js'
 import {
@@ -224,4 +227,20 @@ test('collectModelHistoryMediaPathHints uniques paths from _media and already-pr
     collectModelHistoryMediaPathHints([{ role: 'user', text: '你好' }]),
     '',
   )
+})
+
+test('null catalog context_window still bounds history transport for every native engine (OCV5-94)', () => {
+  // Declared window always wins.
+  assert.equal(resolveModelHistoryContextWindow(400_000, 'cursor'), 400_000)
+  assert.equal(resolveModelHistoryContextWindow(400_000, undefined), 400_000)
+  // Cursor catalog rows carry no window: the master-side default must be a
+  // finite number so enrichment takes the paged sidecar path instead of
+  // hydrating the whole session.
+  assert.equal(resolveModelHistoryContextWindow(null, 'cursor'), CURSOR_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS)
+  assert.equal(resolveModelHistoryContextWindow(null, 'codex'), CODEX_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS)
+  assert.equal(resolveModelHistoryContextWindow(null, 'grok'), CODEX_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS)
+  // Unknown engine / undefined declaration keep the legacy "no bound" answer.
+  assert.equal(resolveModelHistoryContextWindow(null, undefined), null)
+  assert.equal(resolveModelHistoryContextWindow(undefined, 'cursor'), null)
+  assert.equal(resolveModelHistoryContextWindow(0, 'cursor'), null)
 })

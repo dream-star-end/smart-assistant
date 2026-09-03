@@ -275,7 +275,13 @@ describe('R2 gateway wiring (flag-off equivalent + read endpoint)', () => {
     assert.ok(serverSrc.includes("isDelegateInflightSurfaceEffective()"))
     assert.ok(serverSrc.includes("'/api/sessions/:id/inflight-delegates'"))
     assert.match(serverSrc, /handleInflightDelegatesRequest/)
-    assert.match(serverSrc, /getClientSession\(id, uid\)/)
+    // OCV5-94: the read endpoint only needs existence, not the hydrated
+    // tape body — loadSession must go through the cheap classify path.
+    assert.match(serverSrc, /clientSessionIsActive\(id, uid\)/)
+    assert.doesNotMatch(
+      serverSrc.slice(serverSrc.indexOf('handleInflightDelegatesRequest('), serverSrc.indexOf('handleInflightDelegatesRequest(') + 1200),
+      /getClientSession\(/,
+    )
     assert.doesNotMatch(serverSrc, /enabled: false/)
   })
 
