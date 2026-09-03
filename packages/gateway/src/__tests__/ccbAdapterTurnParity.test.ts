@@ -318,6 +318,22 @@ describe("CcbAdapter turn parity", () => {
     assert.match(JSON.stringify(summary?.runtimeEvents), /MODEL_AUTHORITY_EXPIRED/);
   });
 
+  test("正常完成轮的正文提到 MODEL_AUTHORITY_INVALID 不算平台凭证失效(不免单)", async () => {
+    // 回归:2026-09-02/03 selfhost 6 轮 cursor-fable 成功轮因正文复述子 agent 的 403
+    // 被改写成 crashed + platform_authority_expired 免单。
+    const { adapter, runner } = makeAdapter();
+    const events: EngineEvent[] = [];
+    const turn = beginTurn(adapter, events);
+    const prose = '子 agent 刚才报了 403 MODEL_AUTHORITY_INVALID,我改用本地命令继续。';
+    runner.msg(textDelta(prose));
+    runner.msg(resultRow({ is_error: false, result: prose }));
+    const summary = await turn.summary;
+    assert.equal(summary?.isError, false);
+    assert.equal(summary?.errorKind, undefined);
+    assert.equal(summary?.assistantText, prose);
+    assert.notEqual(summary?.errorDetail, "MODEL_AUTHORITY_EXPIRED");
+  });
+
   test("非 auth 的 isError → errorKind='other'", async () => {
     const { adapter, runner } = makeAdapter();
     const events: EngineEvent[] = [];

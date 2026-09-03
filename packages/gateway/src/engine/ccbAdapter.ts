@@ -100,9 +100,16 @@ export function classifyCcbErrorKind(result: {
   assistantText: string
   errorDetail?: string
 }): 'auth' | 'model_authority' | 'other' | undefined {
+  // 只有 CCB 自己报错(is_error)时,MODEL_AUTHORITY_INVALID 才是 egress 拒了本 turn 的
+  // 上游请求。正常完成的 turn 里模型正文提到这串字(复述子 agent 的 403、讨论代码)
+  // 不是平台凭证失效;此前无条件扫正文会把成功轮改写成 crashed + 自动免单
+  // (2026-09-02/03 selfhost 6 轮 cursor-fable 零计费,见 turn_waivers 48-58)。
   if (
-    containsModelAuthorityInvalid(result.assistantText) ||
-    containsModelAuthorityInvalid(result.errorDetail)
+    result.isError &&
+    (
+      containsModelAuthorityInvalid(result.errorDetail) ||
+      containsModelAuthorityInvalid(result.assistantText)
+    )
   ) {
     return 'model_authority'
   }
