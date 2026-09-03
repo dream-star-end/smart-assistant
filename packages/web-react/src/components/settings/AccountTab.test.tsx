@@ -178,9 +178,35 @@ describe("AccountTab 积分收支卡", () => {
     await waitFor(() => expect(mockedGetReport).toHaveBeenCalledWith(auth, "30d"));
     expect(await screen.findByText("收支趋势")).toBeInTheDocument();
     expect(screen.getByText("支出构成")).toBeInTheDocument();
+    expect(screen.getByText("充值/赠送为收入，扣费为支出")).toBeInTheDocument();
+    expect(screen.getByText("按扣费类型")).toBeInTheDocument();
     // 两张图均以 canvas 渲染
     expect(container.querySelectorAll("canvas").length).toBeGreaterThanOrEqual(2);
     const flowTable = screen.getByRole("table", { name: "收支趋势，近 30 天" });
     expect(within(flowTable).getByRole("cell", { name: "1,000" })).toBeInTheDocument();
+  });
+
+  test("账单流水行同时渲染金额与「积分」单位", async () => {
+    mockedGetSub.mockResolvedValue(makeSub("4000", "3000"));
+    const usage = makeUsage();
+    usage.ledger.rows = [
+      {
+        id: "led-1",
+        delta: "1000",
+        balance_after: "6000",
+        reason: "topup",
+        ref_type: null,
+        ref_id: null,
+        memo: null,
+        created_at: "2026-07-04T12:00:00.000Z",
+      },
+    ];
+    mockedGetUsage.mockResolvedValue(usage);
+    renderTab();
+    const amount = await screen.findByText("+1,000");
+    const row = amount.closest("li");
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getByText("积分")).toBeInTheDocument();
+    expect(within(row as HTMLElement).getByText(/余额 6,000 积分/)).toBeInTheDocument();
   });
 });

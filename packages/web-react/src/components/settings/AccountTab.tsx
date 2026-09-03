@@ -334,18 +334,17 @@ export function AccountTab({
 
       {/* 积分收支（窗口口径图表，独立于用量 Tab） */}
       <div className="border-t border-border px-5 py-4">
-        <div className="flex items-center justify-between gap-3 pb-3">
-          <div className="text-[11px] font-medium uppercase tracking-wide text-faint">
-            积分收支 · 近 {REPORT_WINDOW_NOUN[acctWindow]}
-          </div>
-          <div className="overflow-x-auto">
-            <Tabs
-              aria-label="收支统计窗口"
-              value={acctWindow}
-              onValueChange={(v) => setAcctWindow(v as UsageReportWindow)}
-              items={ACCT_WINDOWS}
-            />
-          </div>
+        <div className="flex flex-col gap-2 pb-3">
+          <div className="text-section font-medium text-fg">积分收支</div>
+          <Tabs
+            aria-label="收支统计窗口"
+            value={acctWindow}
+            onValueChange={(v) => setAcctWindow(v as UsageReportWindow)}
+            items={ACCT_WINDOWS}
+          />
+        </div>
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
+          近 {REPORT_WINDOW_NOUN[acctWindow]}
         </div>
         {reportLoading ? (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -369,7 +368,7 @@ export function AccountTab({
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <ChartCard
               title="收支趋势"
-              hint="收入 / 支出"
+              hint="充值/赠送为收入，扣费为支出"
               height={200}
               ariaLabel={`收支趋势，近 ${REPORT_WINDOW_NOUN[acctWindow]}`}
               dataTable={{
@@ -392,7 +391,7 @@ export function AccountTab({
             </ChartCard>
             <ChartCard
               title="支出构成"
-              hint="按类型"
+              hint="按扣费类型"
               height={200}
               ariaLabel={`支出构成，近 ${REPORT_WINDOW_NOUN[acctWindow]}`}
               dataTable={{
@@ -417,7 +416,7 @@ export function AccountTab({
       </div>
 
       <div className="border-t border-border px-5 py-3">
-        <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           账单流水
         </div>
         {err && (
@@ -457,18 +456,18 @@ export function AccountTab({
                         {ledgerReasonLabel(r.reason)}
                         {r.memo ? <span className="text-faint"> · {r.memo}</span> : null}
                       </span>
-                      <span className="block truncate text-[11.5px] text-faint">
-                        {shortTime(r.created_at)} · 余 {formatCredits(r.balance_after)}
+                      <span className="block truncate text-caption text-faint">
+                        {shortTime(r.created_at)} · 余额 {formatCredits(r.balance_after)} 积分
                       </span>
                     </span>
                     <span
                       className={cn(
-                        "shrink-0 text-[13.5px] font-medium tabular-nums",
+                        "shrink-0 text-section font-medium tabular-nums",
                         neg ? "text-fg" : "text-success",
                       )}
                     >
-                      {neg ? "" : "+"}
-                      {formatCredits(r.delta)}
+                      <span>{neg ? "" : "+"}{formatCredits(r.delta)}</span>
+                      <span className="ml-0.5 text-caption font-normal text-faint">积分</span>
                     </span>
                   </li>
                 );
