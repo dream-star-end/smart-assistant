@@ -188,6 +188,15 @@ describe('InboundMessage schema', () => {
       content: { text: '模型正文\n[附件提示]', displayText: '模型正文' },
     }), true)
   })
+  it('accepts only the declared Cursor context tiers (300k / 1m) and stays optional', () => {
+    assert.equal(Value.Check(InboundMessage, baseInbound()), true)
+    assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), contextTier: '300k' }), true)
+    assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), contextTier: '1m' }), true)
+    assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), contextTier: '1M' }), false)
+    assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), contextTier: '200k' }), false)
+    assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), contextTier: 1000000 }), false)
+    assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), contextTier: null }), false)
+  })
   it('accepts complete retry lineage plus the rolling legacy first hop, and rejects partial lineage', () => {
     assert.equal(Value.Check(InboundMessage, {
       ...(baseInbound() as object),

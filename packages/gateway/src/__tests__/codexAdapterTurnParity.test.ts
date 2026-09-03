@@ -44,17 +44,15 @@ class FakeCodexProc extends EventEmitter {
   written: JsonRpcRequest[] = [];
   /** auto-responder:内核每写一个 request 调用一次;返回 result 或抛错形状。 */
   onRequest: ((req: JsonRpcRequest) => void) | null = null;
-  stdin = {
-    write: (line: string) => {
+  stdin = Object.assign(new EventEmitter(), {
+    write: (line: string, callback?: (error?: Error | null) => void) => {
       const req = JSON.parse(line) as JsonRpcRequest;
       this.written.push(req);
       this.onRequest?.(req);
+      if (callback) setImmediate(() => callback());
       return true;
     },
-    // runner 在 spawn 后立刻挂 stdin 'error' 监听(EPIPE 不得升级为 uncaughtException)。
-    on: (_event: string, _fn: (...args: unknown[]) => void) => this.stdin,
-    once: (_event: string, _fn: (...args: unknown[]) => void) => this.stdin,
-  };
+  });
   kill(_sig?: string): void {
     this.killed = true;
   }
@@ -723,6 +721,10 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
     });
 
     assert.equal(h.adapter.interrupt(), true);
+    assert.deepEqual(await h.adapter.writeDelegateTerminal({} as never, "late child"), {
+      ok: false,
+      processAlive: true,
+    });
     await waitForRequest(h, "turn/interrupt");
     const ir = h.proc().written.find((r) => r.method === "turn/interrupt")!;
     assert.deepEqual(ir.params, { threadId: "thr-new-1", turnId: "turn-1" });

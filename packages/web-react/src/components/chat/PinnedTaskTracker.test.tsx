@@ -189,4 +189,38 @@ describe("PinnedTaskTracker 交互", () => {
     expect(screen.getByText("任务 1/3")).toBeInTheDocument();
     expect(screen.getByText("任务三")).toBeInTheDocument();
   });
+
+  test("turn 收口(active true→false 下降沿)后,仍有未完成任务也不再钉住", () => {
+    const view = render(<PinnedTaskTracker todos={TODOS} active={true} />);
+    expect(screen.getByText("任务 1/3")).toBeInTheDocument();
+    view.rerender(<PinnedTaskTracker todos={TODOS} active={false} />);
+    expect(screen.queryByText("任务 1/3")).toBeNull();
+    expect(screen.queryByText("任务三")).toBeNull();
+  });
+
+  test("刷新后打开已收口会话(active=false、settled=true)→ 不渲染,由 inline 只读卡兜底", () => {
+    const { container } = render(<PinnedTaskTracker todos={TODOS} active={false} settled={true} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  test("刷新后当前轮仍在飞(active=false、settled=false)→ 继续钉住(保留 d18bd587 行为)", () => {
+    render(<PinnedTaskTracker todos={TODOS} active={false} settled={false} />);
+    expect(screen.getByText("任务 1/3")).toBeInTheDocument();
+    expect(screen.getByText("任务三")).toBeInTheDocument();
+  });
+
+  test("下降沿隐藏后,新任务集 + active 再变 true → 重新渲染(多轮连续任务)", () => {
+    const NEW_TODOS = [{ content: "新一轮任务", status: "in_progress" }];
+    const view = render(<PinnedTaskTracker todos={TODOS} active={true} />);
+    view.rerender(<PinnedTaskTracker todos={TODOS} active={false} />);
+    expect(screen.queryByText("任务 1/3")).toBeNull();
+    view.rerender(<PinnedTaskTracker todos={NEW_TODOS} active={true} />);
+    expect(screen.getByText("任务 0/1")).toBeInTheDocument();
+    expect(screen.getByText("新一轮任务")).toBeInTheDocument();
+  });
+
+  test("settled=true 但 active=true(在飞优先,残留终态标记不误报)→ 仍渲染", () => {
+    render(<PinnedTaskTracker todos={TODOS} active={true} settled={true} />);
+    expect(screen.getByText("任务 1/3")).toBeInTheDocument();
+  });
 });

@@ -1,10 +1,11 @@
 /**
  * 轮次分段抽象单测:currentTurnStartIndex(活跃段起点)+ turnFinalAssistantFlags(每轮末条
- * assistant 正文 = 评价反馈行唯一可见位)。两者共用「user 消息开启新轮」这一轮边界权威。
+ * assistant 正文 = 评价反馈行唯一可见位)+ currentTurnSettled(当前轮收口的消息层证据判据,
+ * PinnedTaskTracker HUD 隐藏门)。三者共用「user 消息开启新轮」这一轮边界权威。
  */
 import { describe, expect, test } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
-import { currentTurnStartIndex, turnFinalAssistantFlags } from "./turnSegment";
+import { currentTurnSettled, currentTurnStartIndex, turnFinalAssistantFlags } from "./turnSegment";
 
 function mk(role: ChatMessage["role"], extra: Partial<ChatMessage> = {}): ChatMessage {
   return { id: Math.random().toString(36), role, text: "", ts: 1000, ...extra };
@@ -115,5 +116,84 @@ describe("turnFinalAssistantFlags(评价行轮末条判定)", () => {
       mk("agent-group", { text: "委派", _delegate: true }),
     ];
     expect(finals(msgs)).toEqual([]);
+  });
+});
+
+describe("currentTurnSettled(HUD 收口判据,消息层证据)", () => {
+  test("user 行 status=replied → 收口", () => {
+    expect(
+      currentTurnSettled([
+        mk("user", { text: "问", status: "replied" }),
+        mk("tool", { toolName: "TodoWrite" }),
+      ]),
+    ).toBe(true);
+  });
+
+  test("user 行 status=error → 收口", () => {
+    expect(currentTurnSettled([mk("user", { text: "问", status: "error" })])).toBe(true);
+  });
+
+  test("段内 _turnTapeComplete=true → 收口", () => {
+    expect(
+      currentTurnSettled([
+        mk("user", { text: "问", status: "sent" }),
+        mk("assistant", { text: "答", _turnTapeComplete: true }),
+      ]),
+    ).toBe(true);
+  });
+
+  test("段内 _turnStatusRecord / _dispatchTerminal / 非空 _errorCode → 收口", () => {
+    expect(
+      currentTurnSettled([mk("user", { status: "sent" }), mk("assistant", { _turnStatusRecord: true })]),
+    ).toBe(true);
+    expect(
+      currentTurnSettled([mk("user", { status: "sent" }), mk("assistant", { _dispatchTerminal: true })]),
+    ).toBe(true);
+    expect(
+      currentTurnSettled([mk("user", { status: "sent" }), mk("assistant", { _errorCode: "service_restart" })]),
+    ).toBe(true);
+    // 空串 errorCode 不算证据
+    expect(currentTurnSettled([mk("user", { status: "sent" }), mk("assistant", { _errorCode: "" })])).toBe(false);
+  });
+
+  test("段内过程控制折叠锚终态证据(_turnTapeProcess + 终态 outcome)→ 收口;非终态 outcome 不算", () => {
+    expect(
+      currentTurnSettled([
+        mk("user", { status: "sent" }),
+        mk("assistant", { _turnTapeProcess: true, _dispatchOutcome: "completed" }),
+      ]),
+    ).toBe(true);
+    expect(
+      currentTurnSettled([
+        mk("user", { status: "sent" }),
+        mk("assistant", { _turnTapeProcess: true, _dispatchOutcome: "working" }),
+      ]),
+    ).toBe(false);
+  });
+
+  test("无任何终态证据(user 行 sent、段内无标记)→ 未收口(刷新后仍在飞,HUD 继续钉住)", () => {
+    expect(
+      currentTurnSettled([
+        mk("user", { text: "问", status: "sent" }),
+        mk("tool", { toolName: "TodoWrite", _completed: true }),
+        mk("assistant", { text: "部分产出" }),
+      ]),
+    ).toBe(false);
+  });
+
+  test("无 user 行(cron 推送流)→ 只看段内证据", () => {
+    expect(currentTurnSettled([mk("assistant", { text: "推送", _turnTapeComplete: true })])).toBe(true);
+    expect(currentTurnSettled([mk("assistant", { text: "推送" }), mk("tool", { _completed: true })])).toBe(false);
+  });
+
+  test("旧轮的终态证据不污染当前轮:上一轮 replied,当前轮无证据 → 未收口", () => {
+    expect(
+      currentTurnSettled([
+        mk("user", { id: "u1", text: "旧问", status: "replied" }),
+        mk("assistant", { text: "旧答", _turnTapeComplete: true }),
+        mk("user", { id: "u2", text: "新问", status: "sent" }),
+        mk("tool", { toolName: "TodoWrite", _completed: true }),
+      ]),
+    ).toBe(false);
   });
 });

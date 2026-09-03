@@ -1,5 +1,7 @@
 import { lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  type CursorContextTier,
+  cursorModelSupportsContextTier,
   isCodexEngineModel,
   normalizeMessageReplyQuote,
   type MessageReplyQuote,
@@ -51,7 +53,7 @@ import {
   type VisibleVirtualRowAnchor,
 } from "./components/chat/archivePaging";
 import { createStickToBottomController } from "./components/chat/stickToBottom";
-import { turnFinalAssistantFlags } from "./components/chat/turnSegment";
+import { currentTurnSettled, turnFinalAssistantFlags } from "./components/chat/turnSegment";
 import type { CardCallbacks, FeedbackContext } from "./components/chat/cards";
 import { MessageFeedbackDialog } from "./components/chat/MessageFeedbackDialog";
 import {
@@ -134,6 +136,11 @@ import {
   readSessionEffort,
   writeSessionEffort,
 } from "./lib/sessionEffort";
+import {
+  clearContextTierForSession,
+  readContextTierForSession,
+  writeContextTier,
+} from "./lib/sessionContextTier";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
 import {
   PRODUCT_CAPABILITIES,
@@ -579,6 +586,7 @@ export function App() {
       localStore.current.delete(id);
       clearTeamModeForSession(id); // 顺手清该会话的团队模式 per-session 键(不留孤儿键)
       clearSessionEffort(id); // 同上:思考档位 per-session 键
+      clearContextTierForSession(id); // 同上:Cursor 上下文档位 per-session 键
     },
     onActiveSessionDeleted: () => {
       setMessages([]);
@@ -811,6 +819,22 @@ export function App() {
     setSessionEffortState(readSessionEffort(activeId));
   }, [activeId]);
 
+  // Cursor Opus/Fable 上下文档位(300k 默认 / 1M;语义见 lib/sessionContextTier)。
+  // per-session 键优先,缺失继承全局最近选择,再缺失回产品默认 300k。
+  const [contextTier, setContextTierState] = useState<CursorContextTier>(() =>
+    readContextTierForSession(activeId),
+  );
+  const setContextTier = useCallback(
+    (tier: CursorContextTier) => {
+      setContextTierState(tier);
+      writeContextTier(activeId, tier);
+    },
+    [activeId],
+  );
+  useEffect(() => {
+    setContextTierState(readContextTierForSession(activeId));
+  }, [activeId]);
+
   const send = useCallback(
     async (
       text: string,
@@ -885,6 +909,7 @@ export function App() {
         writeTeamMode(sessionId, teamMode);
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
+        writeContextTier(sessionId, contextTier);
       }
       const materializedDraft =
         !createdSession && sessions.some((session) => session.id === sessionId && session.messageCount === 0);
@@ -927,6 +952,9 @@ export function App() {
         imageEdit,
         replyTo,
         teamMode: teamLeaderTurn,
+        // Cursor Opus/Fable 上下文档位:只在当前模型支持分档时随帧发送;其它模型不带该字段
+        // (master 对非分档模型本就忽略,但不发送可以让路由快照/日志更干净)。
+        ...(cursorModelSupportsContextTier(modelId) ? { contextTier } : {}),
       });
       // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
       setSessions((c) => {
@@ -972,6 +1000,7 @@ export function App() {
       models,
       preferenceEffort,
       sessionEffort,
+      contextTier,
       teamMode,
       sessions,
       setSessions,
@@ -2057,7 +2086,12 @@ export function App() {
     () => ({
       onRegenerate: regenerate,
       onContinue: () => send(CONTINUE_PROMPT),
-      onTopUp: demo ? undefined : () => openSettings(),
+      onTopUp: demo
+        ? undefined
+        : () => {
+            openSettings("account");
+            setSubscribeOpenSignal((n) => n + 1);
+          },
       onStartNewSession: demo ? undefined : newSession,
       onFeedback,
       onFirstTextPaint: demo
@@ -2302,9 +2336,37 @@ export function App() {
     stick.markUserIntent();
     cancelArchiveCorrection();
   }, [stick, cancelArchiveCorrection]);
-  const releaseUserChatScroll = useCallback(() => {
-    stick.releaseUserIntent();
+  const beginDirectUserChatScroll = useCallback(() => {
+    stick.beginDirectManipulation();
+    cancelArchiveCorrection();
+  }, [stick, cancelArchiveCorrection]);
+  const endDirectUserChatScroll = useCallback(() => {
+    stick.endDirectManipulation();
   }, [stick]);
+  // Native scrollbar capture may deliver pointerup outside the scroller. Keep
+  // the direct-manipulation lifetime tied to the actual press, not to whether
+  // React happens to receive the matching end event on the chat element.
+  useEffect(() => {
+    const end = () => endDirectUserChatScroll();
+    // Native touch scrolling intentionally emits pointercancel when the browser
+    // takes ownership of panning. The finger is still down at that point; the
+    // matching touchend/touchcancel is the actual direct-manipulation boundary.
+    const endPointer = (event: PointerEvent) => {
+      if (event.pointerType !== "touch") end();
+    };
+    window.addEventListener("pointerup", endPointer);
+    window.addEventListener("pointercancel", endPointer);
+    window.addEventListener("touchend", end);
+    window.addEventListener("touchcancel", end);
+    window.addEventListener("blur", end);
+    return () => {
+      window.removeEventListener("pointerup", endPointer);
+      window.removeEventListener("pointercancel", endPointer);
+      window.removeEventListener("touchend", end);
+      window.removeEventListener("touchcancel", end);
+      window.removeEventListener("blur", end);
+    };
+  }, [endDirectUserChatScroll]);
   const onChatScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -2947,6 +3009,8 @@ export function App() {
           effortSupported={effortSupported}
           effortActive={effortActive}
           onSelectEffort={demo ? undefined : setSessionEffort}
+          contextTier={contextTier}
+          onSelectContextTier={demo ? undefined : setContextTier}
           // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
           // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
@@ -2974,11 +3038,18 @@ export function App() {
           ref={bindChatScroll}
           onScroll={onChatScroll}
           onWheel={markUserChatScroll}
-          onTouchStart={markUserChatScroll}
-          onTouchMove={markUserChatScroll}
-          onTouchEnd={releaseUserChatScroll}
-          onPointerDown={markUserChatScroll}
-          onPointerUp={releaseUserChatScroll}
+          onTouchStart={beginDirectUserChatScroll}
+          onTouchMove={beginDirectUserChatScroll}
+          onTouchEnd={endDirectUserChatScroll}
+          onTouchCancel={endDirectUserChatScroll}
+          onPointerDown={beginDirectUserChatScroll}
+          onPointerUp={endDirectUserChatScroll}
+          onPointerCancel={(event) => {
+            if (event.pointerType !== "touch") endDirectUserChatScroll();
+          }}
+          onLostPointerCapture={(event) => {
+            if (event.pointerType !== "touch") endDirectUserChatScroll();
+          }}
           onKeyDown={markUserChatScroll}
           className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
         >
@@ -2987,7 +3058,10 @@ export function App() {
               phase={gate.phase}
               onOpen={gate.open}
               onRetry={gate.check}
-              onTopUp={() => openSettings()}
+              onTopUp={() => {
+                openSettings("account");
+                setSubscribeOpenSignal((n) => n + 1);
+              }}
             />
           ) : loadingHistory || historySurface === "skeleton" ? (
             // 冷会话历史拉取期：消息形骨架占位，避免「空白 → 突然填满」的突变。
@@ -3103,11 +3177,13 @@ export function App() {
         {/* composer-safe-b:底部 Home 指示条安全区(叠在原 pb-3 上),否则发送区被遮 */}
         <div className="shrink-0 composer-safe-b">
           {/* 任务列表 HUD:钉在输入框上方,始终可见(取代会滚走的 inline TodoWrite 卡)。
-              初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务时组件自渲染 null。 */}
+              初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务或本轮已收口时组件自渲染
+              null(收口后由 MessageRenderer 的 inline 只读 TodoWrite/plan 卡兜底)。 */}
           {!demo && !gated && (
             <PinnedTaskTracker
               todos={extractLatestTodos(wsMessages)}
               active={wsSending}
+              settled={currentTurnSettled(wsMessages)}
               tokenUsage={activeSess?._liveTurnUsage?.usage}
             />
           )}

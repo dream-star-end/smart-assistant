@@ -63,6 +63,7 @@ import {
   releasePreCheck,
   estimateMaxCost,
   InsufficientCreditsError,
+  readTotalSpendableBalance,
 } from "../billing/preCheck.js";
 import type { PricingCache, ModelPricing } from "../billing/pricing.js";
 import { projectContextWindowForRole } from "../billing/modelRolePolicy.js";
@@ -133,9 +134,11 @@ import {
   isCodexEngineModel,
   isGrokEngineModel,
   isCursorEngineModel,
+  isCursorContextTier,
   isZcodeEngineModel,
   isClientMessageId,
   formatMessageReplyPrompt,
+  projectContextWindowForCursorTier,
   modelHistorySemanticRole,
   modelHistorySemanticText,
   newTraceId,
@@ -148,6 +151,7 @@ import {
   type ModelAuthorityBundle,
   type ModelAuthorityEngine,
   type ModelExecutionDescriptor,
+  type CursorContextTier,
   type TraceIdIssue,
   type GoalStateSnapshot,
   type MessageReplyQuote,
@@ -180,6 +184,7 @@ import {
   readPendingPermissionPrompts,
   releaseTurnControlForRetry,
   resolvePermissionExpiresAt,
+  settlePermissionPromptFromRuntime,
   TurnControlConflictError,
 } from "../dispatch/turnControlStore.js";
 import {
@@ -359,6 +364,7 @@ export interface PromptQueueDispatchRequest {
       modelSwitchId?: string;
       effortLevel?: string | null;
       teamMode?: boolean;
+      contextTier?: CursorContextTier;
     };
   };
 }
@@ -432,12 +438,13 @@ export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDisp
     !isPlainRecord(item.content) || !isPlainRecord(item.requestedExecution)
   ) return null;
   const execution = item.requestedExecution;
-  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode"])) return null;
+  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode", "contextTier"])) return null;
   if (execution.agentId !== owner.agentId) return null;
   if (execution.model !== undefined && typeof execution.model !== "string") return null;
   if (execution.modelSwitchId !== undefined && (typeof execution.modelSwitchId !== "string" || !/^[A-Za-z0-9:_-]{8,128}$/.test(execution.modelSwitchId))) return null;
   if (execution.effortLevel !== undefined && execution.effortLevel !== null && typeof execution.effortLevel !== "string") return null;
   if (execution.teamMode !== undefined && typeof execution.teamMode !== "boolean") return null;
+  if (execution.contextTier !== undefined && !isCursorContextTier(execution.contextTier)) return null;
   return value as unknown as PromptQueueDispatchRequest;
 }
 
@@ -541,7 +548,15 @@ const DEFAULT_CONTAINER_CONNECT_TIMEOUT_MS = 5_000;
 /** Queue grants must either reach the container or resolve negative while the
  * server-side claim is still live. The timeout also becomes a cancellation
  * fence: a late async preparation result is never allowed to start a turn. */
-const DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS = 20_000;
+// Commercial PG reads have a legitimate 30s statement budget. A preparation
+// fence shorter than that turns a slow-but-valid history/goal read into a
+// deterministic red card, so production keeps a small completion margin.
+export const DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS = 35_000;
+
+/** HTTP origin-session injection must not ACK until the container receipt is
+ * durably reflected on the Master. Keep this below the caller's 15s request
+ * timeout; delivery_unknown is retryable and later retries observe accepted. */
+const CRON_ORIGIN_RECEIPT_WAIT_MS = 5_000;
 
 /** ConnectionRegistry 默认 maxPerUser(沿用 connections.ts 的 3)。 */
 const DEFAULT_MAX_PER_USER = 3;
@@ -838,6 +853,20 @@ interface ResolvedTurnExecution {
   securityEpoch: number;
 }
 
+/**
+ * 哪些引擎的 turn 会以平台次级模型(见 subprocessRunner DEFAULT_SECONDARY_UTILITY_MODEL)
+ * 打 anthropic proxy `/v1/messages`,因此 authority/lease 必须签上 aux 放行集。
+ *
+ * - `ccb`:自托管 Claude Code,SMALL_FAST / 子 agent 直打 anthropic proxy。
+ * - `cursor`:官方 Claude Code 经 Cursor Sand relay;relay 只接管 Sand 主模型,
+ *   子 agent 钉的次级模型经 passthroughMessages 原样转发到同一 anthropic proxy。
+ *
+ * codex/grok/zcode 走各自 relay,不产生 `/v1/messages`,按最小权限不签。
+ */
+export function engineUsesAnthropicAuxModels(engine: ModelAuthorityEngine): boolean {
+  return engine === "ccb" || engine === "cursor";
+}
+
 /** 模型不可路由(catalog 无 active 行 / 无价 / capability schema 未来版本)。 */
 class ModelNotAvailableError extends Error {
   constructor(readonly modelId: string) {
@@ -867,11 +896,15 @@ async function resolveTurnExecution(
     descriptor: toProtocolDescriptor(descriptor),
     pricing,
     billingRevision: snapshot.billingRevision,
-    // 次级模型只对 **ccb** 引擎有意义:CCB 的 WebFetch/WebSearch 等隐藏调用读
-    // ANTHROPIC_SMALL_FAST_MODEL 打 anthropic proxy;codex turn 走 /internal/v3/codex-relay,
-    // 根本不产生 `/v1/messages` —— 给它签 aux 只会白白撑大放行集合(最小权限)。
+    // 次级模型只对会打 anthropic proxy `/v1/messages` 的引擎有意义(最小权限):
+    // - ccb:WebFetch/WebSearch 等隐藏调用读 ANTHROPIC_SMALL_FAST_MODEL,子 agent 钉
+    //   CLAUDE_CODE_SUBAGENT_MODEL,都直打 anthropic proxy;
+    // - cursor:官方 Claude Code 经 Sand relay 跑,relay 只接管 Sand 主模型,子 agent 钉的
+    //   次级模型经 passthroughMessages 打同一 anthropic proxy —— lease 不签 aux 就会被
+    //   egress modelAuthorityGate 以 "authority model mismatch" 403 拒掉(Agent 工具全灭)。
+    // codex/grok/zcode 走各自 relay,不产生 `/v1/messages`,签 aux 只会白白撑大放行集合。
     // platformAuxModels 对"aux 不在 catalog active"fail-closed 抛 → 调用方拒帧。
-    auxModels: descriptor.engine === "ccb" ? platformAuxModels(snapshot) : [],
+    auxModels: engineUsesAnthropicAuxModels(descriptor.engine) ? platformAuxModels(snapshot) : [],
     executionRevision: snapshot.executionRevision,
     securityEpoch: Number(snapshot.securityEpoch),
   };
@@ -887,6 +920,8 @@ export interface UserChatBridgeDeps {
   promptQueuePreparationTimeoutMs?: number;
   /** Durable dispatch heartbeat cadence; override only for focused tests. */
   dispatchLeaseHeartbeatMs?: number;
+  /** @internal deterministic race-test seam; production never injects this. */
+  deferContainerSendCompletionForTest?: (complete: () => void) => void;
   /**
    * 模型执行权威签发(方案 §2)。注入即开启 flag —— 见 BridgeModelAuthorityDeps。
    * 缺省(v3 / 测试 / flag 未开)→ bridge 行为与本批次之前**完全一致**。
@@ -1467,6 +1502,57 @@ export function codexAbandonFailureCode(reason: string): JournalFailureCode {
   return "INTERNAL_ERROR";
 }
 
+export type CronOriginExecutorClaimResult =
+  | { kind: "claimed" }
+  | { kind: "not_claimed" }
+  | { kind: "rejected" }
+  | { kind: "delivery_unknown" }
+
+export function classifyTurnDispatchReceipt(
+  receipt: {
+    dispatchId?: unknown;
+    attemptNo?: unknown;
+    sessionId?: unknown;
+    clientMessageId?: unknown;
+    state?: unknown;
+    outcome?: unknown;
+  },
+  expected: {
+    dispatchId: string;
+    attemptNo: number;
+    sessionId: string;
+    clientMessageId: string;
+  },
+): "accepted" | "rejected" | "invalid" {
+  if (
+    receipt.dispatchId !== expected.dispatchId ||
+    receipt.attemptNo !== expected.attemptNo ||
+    receipt.sessionId !== expected.sessionId ||
+    receipt.clientMessageId !== expected.clientMessageId
+  ) return "invalid";
+  if (receipt.state === "rejected") {
+    return receipt.outcome === "not_accepted" || receipt.outcome === null
+      ? "rejected"
+      : "invalid";
+  }
+  if (receipt.state === "terminal") {
+    return receipt.outcome === "completed" ||
+        receipt.outcome === "interrupted" ||
+        receipt.outcome === "crashed"
+      ? "accepted"
+      : "invalid";
+  }
+  if (
+    receipt.outcome === null &&
+    (receipt.state === "queued" ||
+      receipt.state === "running" ||
+      receipt.state === "recovery_pending" ||
+      receipt.state === "sink_staged" ||
+      receipt.state === "sink_stage_failed")
+  ) return "accepted";
+  return "invalid";
+}
+
 export type CronOriginExecutor = (payload: {
   encoded: Buffer
   admitted: {
@@ -1481,7 +1567,7 @@ export type CronOriginExecutor = (payload: {
     anchorSeq: bigint | null
     requestHash: string
   }
-}) => void
+}) => CronOriginExecutorClaimResult | Promise<CronOriginExecutorClaimResult>
 
 export interface UserChatBridgeHandler {
   /** Gateway HTTP server 的 'upgrade' 事件入口。返 false → 路径不匹配,gateway 路由别处。 */
@@ -1579,10 +1665,14 @@ export async function executeCronOriginInject(opts: {
     sessionUserId: string,
   ) => Promise<string | null | undefined>
   admitUserTurn: NonNullable<UserChatBridgeDeps["admitUserTurn"]>
-  executor: CronOriginExecutor
+  /** Resolve transport candidates only after durable admission. A bridge that
+   * disappeared during the admission await must never be called as a stale
+   * closure. `executor` remains as a focused-test convenience. */
+  getExecutors?: () => Iterable<CronOriginExecutor>
+  executor?: CronOriginExecutor
   log?: Logger
 }): Promise<CronOriginInjectResult> {
-  const { input, pgPool, lookupSessionModel, admitUserTurn, executor, log } = opts;
+  const { input, pgPool, lookupSessionModel, admitUserTurn, getExecutors, executor, log } = opts;
   if (!isClientMessageId(input.clientMessageId) || input.sessionId.trim() === "" || input.text.trim() === "") {
     return { kind: "failed", reason: "invalid_payload" };
   }
@@ -1654,12 +1744,14 @@ export async function executeCronOriginInject(opts: {
   ) {
     return { kind: "failed", reason: admit.kind };
   }
-  if (
-    admit.kind === "deduplicated" ||
-    admit.kind === "already_owned" ||
-    admit.kind === "in_flight"
-  ) {
-    return { kind: "injected" };
+  if (admit.kind === "deduplicated") return { kind: "injected" };
+  if (admit.kind === "already_owned") return { kind: "in_flight" };
+  if (admit.kind === "in_flight") {
+    // accepted is the durable container receipt. rejecting is not success and
+    // must stay retryable; never ACK from the Master admission lease alone.
+    return admit.dispatch.status === "accepted"
+      ? { kind: "injected" }
+      : { kind: "in_flight" };
   }
   const d = admit.dispatch;
   if (typeof d.ownerId !== "string" || d.ownerId.length === 0) {
@@ -1689,7 +1781,7 @@ export async function executeCronOriginInject(opts: {
     ts: message.ts,
     ...(originModel ? { model: originModel } : {}),
   };
-  executor({
+  const payload = {
     encoded: Buffer.from(JSON.stringify(frame), "utf8"),
     admitted: {
       clientMessageId: d.clientMessageId,
@@ -1702,8 +1794,35 @@ export async function executeCronOriginInject(opts: {
       anchorSeq: d.anchorSeq,
       requestHash: d.requestHash,
     },
-  });
-  return { kind: "injected" };
+  };
+  const candidates = getExecutors
+    ? [...getExecutors()]
+    : executor
+      ? [executor]
+      : [];
+  if (candidates.length === 0) return { kind: "no_transport" };
+  for (const candidate of candidates) {
+    let claim: CronOriginExecutorClaimResult;
+    try {
+      claim = await candidate(payload);
+    } catch (err) {
+      log?.warn("user-chat-bridge: cron executor delivery became unknown", {
+        dispatchId: d.dispatchId,
+        err,
+      });
+      return { kind: "failed", reason: "delivery_unknown" };
+    }
+    if (claim.kind === "claimed") return { kind: "injected" };
+    if (claim.kind === "rejected") {
+      return { kind: "failed", reason: "dispatch_rejected" };
+    }
+    if (claim.kind === "delivery_unknown") {
+      return { kind: "failed", reason: "delivery_unknown" };
+    }
+    // Only a synchronous, explicit not_claimed result may select another
+    // bridge. claimed/delivery_unknown can already have bytes in flight.
+  }
+  return { kind: "no_transport" };
 }
 
 // ---------- 内部工具 --------------------------------------------------------
@@ -2789,6 +2908,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let bufferedUC = 0; // user → container 待发字节
     let bufferedCU = 0; // container → user 待发字节
     let cause: BridgeCloseCause = "internal_error";
+    let requestedCloseCause: BridgeCloseCause | null = null;
     let cleaned = false;
     const skippedRecoveryIds = new Set<string>();
     // Bridge TTFT:首个 user→container 帧 ↔ 首个 container→user 帧。
@@ -2933,13 +3053,38 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         void drainDurableRecoveryForUser(uid);
       }
       if (containerHasDurableDispatch && deps.admitUserTurn && cronOriginExecutor === null) {
-        cronOriginExecutor = (payload) => {
+        cronOriginExecutor = async (payload) => {
+          const registered = cronOriginExecutor;
+          const candidates = uidToCronOriginExecutors.get(uid.toString());
+          if (
+            cleaned ||
+            userDetached ||
+            registered === null ||
+            !candidates?.has(registered)
+          ) {
+            return { kind: "not_claimed" };
+          }
+          const existing = admittedDispatches.get(payload.admitted.clientMessageId);
+          if (existing !== undefined) {
+            // Re-entering the same in-memory claim must wait for its first
+            // receipt rather than sending the physical frame twice.
+            if (
+              existing.dispatchId === payload.admitted.dispatchId &&
+              existing.attemptNo === payload.admitted.attemptNo &&
+              existing.leaseEpoch === payload.admitted.leaseEpoch
+            ) {
+              return cronOriginClaimWaiters.get(existing.dispatchId)?.promise
+                ?? { kind: "delivery_unknown" };
+            }
+            return { kind: "delivery_unknown" };
+          }
           admittedDispatches.set(payload.admitted.clientMessageId, payload.admitted);
+          const receipt = beginCronOriginClaim(payload.admitted.dispatchId);
           const enrichment = trackEnrichmentDispatch(
             payload.admitted,
             "bridge_closed_before_cron_enrichment",
           );
-          if (!isEnriching(enrichment)) return;
+          if (!isEnriching(enrichment)) return { kind: "delivery_unknown" };
           ensureDispatchHeartbeat();
           executeAdmittedTurn(
             payload.encoded,
@@ -2950,6 +3095,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             Date.now(),
             enrichment,
           );
+          return receipt;
         };
         const key = uid.toString();
         let executors = uidToCronOriginExecutors.get(key);
@@ -3122,6 +3268,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       log: Logger | null;
       onReject?: (code: string) => void;
       turn?: InboundTurnIdentity;
+      /** Cursor Opus/Fable turn-level context tier(见 frames.ts InboundMessage.contextTier)。
+       * 只在 cursor 路径传入;非 tier 模型忽略。 */
+      contextTier?: CursorContextTier | null;
     }): Promise<ResolvedTurnExecution | null> => {
       const reject = (code: string, message: string): null => {
         args.onReject?.(code);
@@ -3216,10 +3365,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       //   同一纯函数 projectContextWindowForRole + 两处落点单测(modelRolePolicy.test.ts 纯
       //   函数契约 / modelAuthorityBridge.test.ts:431 bridge 签发)。别删这两个测试,也别新增
       //   旁路投影而不加对应落点单测。
-      const projectedWindow = projectContextWindowForRole(
+      const roleProjectedWindow = projectContextWindowForRole(
         exec.canonicalModel,
         exec.descriptor.contextWindow,
         userRole,
+      );
+      // ── Cursor Opus/Fable 上下文档位(turn 级,执行轴)────────────────────────
+      // catalog 行声明机制上限(1M);用户在前台按 turn 选 300k / 1m。与角色投影同一落点、
+      // 同一纯函数纪律(protocol.projectContextWindowForCursorTier + 落点单测),只收窄不放宽。
+      // 缺省 → DEFAULT_CURSOR_CONTEXT_TIER(300k)。非 tier 模型原样透传。
+      const projectedWindow = projectContextWindowForCursorTier(
+        exec.canonicalModel,
+        roleProjectedWindow,
+        args.contextTier ?? null,
       );
       if (projectedWindow !== exec.descriptor.contextWindow) {
         exec = {
@@ -3520,10 +3678,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       recoveryJob?: ClaimedRecoveryJob;
     }
     const admittedDispatches = new Map<string, AdmittedDispatch>();
-    type EnrichmentDispatchPhase = "enriching" | "terminalizing" | "transferred";
+    type EnrichmentDispatchPhase = "enriching" | "transferring" | "terminalizing" | "transferred";
     interface EnrichmentDispatchState {
       record: AdmittedDispatch;
       phase: EnrichmentDispatchPhase;
+      /** Transport-death code used if this bridge is cleaned before transfer. */
+      closedFailureCode: string;
       /** Absolute authority; timer is only a wake-up mechanism. */
       deadlineAt: number;
       timer: ReturnType<typeof setTimeout> | null;
@@ -3536,12 +3696,45 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const enrichmentDispatches = new Map<string, EnrichmentDispatchState>();
     const enrichmentDeadlineChecks = new WeakMap<EnrichmentDispatchState, () => boolean>();
     const preparedEnrichmentFrames = new WeakMap<Record<string, unknown>, EnrichmentDispatchState>();
-    const transferredDispatches = new Set<string>();
+    let preparationInFlight = 0;
     let dispatchHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    const cronOriginClaimWaiters = new Map<string, {
+      promise: Promise<CronOriginExecutorClaimResult>;
+      resolve: (result: CronOriginExecutorClaimResult) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }>();
+
+    const settleCronOriginClaim = (
+      dispatchId: string,
+      result: CronOriginExecutorClaimResult,
+    ): void => {
+      const waiter = cronOriginClaimWaiters.get(dispatchId);
+      if (!waiter) return;
+      cronOriginClaimWaiters.delete(dispatchId);
+      clearTimeout(waiter.timer);
+      waiter.resolve(result);
+    };
+    const beginCronOriginClaim = (dispatchId: string): Promise<CronOriginExecutorClaimResult> => {
+      const existing = cronOriginClaimWaiters.get(dispatchId);
+      if (existing) return existing.promise;
+      let resolve!: (result: CronOriginExecutorClaimResult) => void;
+      const promise = new Promise<CronOriginExecutorClaimResult>((done) => { resolve = done; });
+      const timer = setTimeout(
+        () => settleCronOriginClaim(dispatchId, { kind: "delivery_unknown" }),
+        CRON_ORIGIN_RECEIPT_WAIT_MS,
+      );
+      timer.unref?.();
+      cronOriginClaimWaiters.set(dispatchId, { promise, resolve, timer });
+      return promise;
+    };
+
+    const hasPendingDispatchWork = (): boolean =>
+      preparationInFlight > 0 || admittedDispatches.size > 0 || enrichmentDispatches.size > 0;
+    const hasPreTransferDispatchWork = (): boolean =>
+      preparationInFlight > 0 || enrichmentDispatches.size > 0;
 
     /** 删记录并在 drain 期推进完成判定(map 空 + inflight 空才收尾)。 */
     const dropAdmittedDispatch = (clientMessageId: string): void => {
-      transferredDispatches.delete(clientMessageId);
       if (admittedDispatches.delete(clientMessageId)) checkDrainComplete();
     };
 
@@ -3554,17 +3747,22 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * is deliberately restricted to admitted+epoch, so a concurrent owner that
      * already accepted the dispatch always wins.
      */
-    const terminalizeEnrichmentDispatch = (
-      state: EnrichmentDispatchState,
-      failureCode: string,
-    ): boolean => {
-      if (state.phase !== "enriching") return false;
+    const claimEnrichmentTerminalization = (state: EnrichmentDispatchState): boolean => {
+      if (state.phase !== "enriching" && state.phase !== "transferring") return false;
       state.phase = "terminalizing";
       enrichmentDeadlineChecks.delete(state);
       if (state.timer !== null) {
         clearTimeout(state.timer);
         state.timer = null;
       }
+      return true;
+    };
+
+    const terminalizeEnrichmentDispatch = (
+      state: EnrichmentDispatchState,
+      failureCode: string,
+    ): boolean => {
+      if (!claimEnrichmentTerminalization(state)) return false;
       const record = state.record;
       const pool = deps.pgPool;
       void (async (): Promise<void> => {
@@ -3594,6 +3792,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             err,
           });
         } finally {
+          settleCronOriginClaim(record.dispatchId, { kind: "delivery_unknown" });
           if (enrichmentDispatches.get(record.clientMessageId) === state) {
             enrichmentDispatches.delete(record.clientMessageId);
           }
@@ -3612,6 +3811,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       const state: EnrichmentDispatchState = {
         record,
         phase: "enriching",
+        closedFailureCode,
         deadlineAt: Date.now() + promptQueuePreparationTimeoutMs,
         timer: null,
       };
@@ -3636,19 +3836,63 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // Admission may commit after this bridge already completed cleanup. Own
       // the row first, then terminalize in the same synchronous continuation;
       // never start heartbeat/history on a dead bridge.
-      if (cleaned || userDetached) {
+      if (cleaned) {
         terminalizeEnrichmentDispatch(state, closedFailureCode);
       }
       return state;
     };
 
-    const terminalizeAllEnriching = (failureCode: string): void => {
+    const terminalizeAllEnriching = (): void => {
       for (const state of [...enrichmentDispatches.values()]) {
-        terminalizeEnrichmentDispatch(state, failureCode);
+        terminalizeEnrichmentDispatch(state, state.closedFailureCode);
       }
     };
 
-    const hasTransferredDispatches = (): boolean => transferredDispatches.size > 0;
+    /** Synchronous fence immediately before ws.send. No await is permitted
+     * between this transition and the call into the websocket implementation. */
+    const beginEnrichmentTransfer = (
+      record: AdmittedDispatch | undefined,
+    ): EnrichmentDispatchState | null => {
+      if (record === undefined) return null;
+      const state = enrichmentDispatches.get(record.clientMessageId);
+      if (!state || state.record !== record) return null;
+      if (enrichmentDeadlineChecks.get(state)?.() === true) return null;
+      if (state.phase !== "enriching") return null;
+      state.phase = "transferring";
+      enrichmentDeadlineChecks.delete(state);
+      if (state.timer !== null) {
+        clearTimeout(state.timer);
+        state.timer = null;
+      }
+      return state;
+    };
+
+    /** The websocket send callback is the physical-transfer linearization
+     * point. Until it succeeds, cleanup may still terminalize this state. */
+    const completeEnrichmentTransfer = (state: EnrichmentDispatchState | null): void => {
+      if (state) acceptEnrichmentReceipt(state.record);
+    };
+
+    /** A fully validated container receipt is stronger than the local
+     * ws.send callback. Win the pre-forward fence synchronously before any PG
+     * await so a following close cannot misclassify an already accepted turn. */
+    const acceptEnrichmentReceipt = (record: AdmittedDispatch): boolean => {
+      const state = enrichmentDispatches.get(record.clientMessageId);
+      if (!state) return true;
+      if (state.record !== record || state.phase === "terminalizing") return false;
+      if (state.phase !== "enriching" && state.phase !== "transferring") {
+        return state.phase === "transferred";
+      }
+      state.phase = "transferred";
+      enrichmentDeadlineChecks.delete(state);
+      if (state.timer !== null) {
+        clearTimeout(state.timer);
+        state.timer = null;
+      }
+      enrichmentDispatches.delete(record.clientMessageId);
+      checkDrainComplete();
+      return true;
+    };
     /** 首次受理时惰性起心跳(unref);legacy 连接从不受理 → 永不建 timer(行为不变)。 */
     const ensureDispatchHeartbeat = (): void => {
       if (dispatchHeartbeatTimer !== null || !deps.pgPool) return;
@@ -3681,7 +3925,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       failureCode: string,
     ): void => {
       if (record === undefined) return;
+      const enrichment = enrichmentDispatches.get(record.clientMessageId);
+      if (enrichment?.record === record) {
+        if (enrichment.phase === "terminalizing") return;
+        if (terminalizeEnrichmentDispatch(enrichment, failureCode)) return;
+      }
       const pool = deps.pgPool;
+      settleCronOriginClaim(record.dispatchId, { kind: "delivery_unknown" });
       dropAdmittedDispatch(record.clientMessageId);
       if (!pool) return;
       if (record.recoveryJob) {
@@ -3713,14 +3963,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // deadline is the authority at the transfer CAS, not setTimeout.
         if (enrichmentDeadlineChecks.get(prepared)?.() === true) return undefined;
         if (prepared.phase !== "enriching") return undefined;
-        prepared.phase = "transferred";
-        enrichmentDeadlineChecks.delete(prepared);
-        if (prepared.timer !== null) {
-          clearTimeout(prepared.timer);
-          prepared.timer = null;
-        }
-        enrichmentDispatches.delete(prepared.record.clientMessageId);
-        transferredDispatches.add(prepared.record.clientMessageId);
         return prepared.record;
       }
       const cmid = isClientMessageId(frameObj.clientMessageId)
@@ -3784,6 +4026,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       opened_at: startedAt,
       close: (_reason, cause) => {
         if (cause === "shutdown") {
+          requestedCloseCause = "shutdown";
           try { userWs.close(CLOSE_BRIDGE.SERVER_RESTART, "server_restart"); } catch { /* */ }
         } else {
           try { userWs.close(CLOSE_BRIDGE.TOO_MANY_CONNECTIONS, "too_many_connections"); } catch { /* */ }
@@ -4027,10 +4270,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           if (authorityDeps !== undefined) {
             if (historyModel === null) return false;
             const execution = await resolveTurnExecution(authorityDeps.catalog, historyModel);
-            contextWindow = projectContextWindowForRole(
+            contextWindow = projectContextWindowForCursorTier(
               execution.canonicalModel,
-              execution.descriptor.contextWindow,
-              userRole,
+              projectContextWindowForRole(
+                execution.canonicalModel,
+                execution.descriptor.contextWindow,
+                userRole,
+              ),
+              isCursorContextTier(frameObj.contextTier) ? frameObj.contextTier : null,
             );
             engine = execution.engine;
           }
@@ -4561,6 +4808,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
     };
 
+    const trackPreparation = (work: () => Promise<void>): void => {
+      preparationInFlight++;
+      void work().finally(() => {
+        preparationInFlight--;
+        checkDrainComplete();
+      });
+    };
+
     // Both the browser legacy lane and the internal PG dispatch grant enter
     // this one preparation pipeline. Consequently catalog/epoch fencing,
     // Codex slot acquisition, preCheck, journal creation and authority sealing
@@ -4604,6 +4859,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         frameData: RawData,
         frameIsBinary: boolean,
         frameLength: number,
+        dispatchRecord?: AdmittedDispatch,
       ): boolean | Promise<boolean> => {
         // `rejectPromptQueueDispatch` is also the cancellation edge. Every
         // async preparation lane funnels through this helper, so a timeout or
@@ -4619,9 +4875,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           return accepted;
         };
         if (!recoveryJob || !deps.pgPool) {
-          return completeForward(forwardInboundFrame(frameData, frameIsBinary, frameLength));
+          return completeForward(
+            forwardInboundFrame(frameData, frameIsBinary, frameLength, dispatchRecord),
+          );
         }
-        const record = [...admittedDispatches.values()].find(
+        const record = dispatchRecord ?? [...admittedDispatches.values()].find(
           (candidate) => candidate.recoveryJob?.jobId === recoveryJob.jobId,
         );
         if (!record) return false;
@@ -4634,7 +4892,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             dispatchOwner: record.leaseOwnerId,
             dispatchLeaseEpoch: record.leaseEpoch,
           },
-          () => forwardInboundFrame(frameData, frameIsBinary, frameLength),
+          () => forwardInboundFrame(frameData, frameIsBinary, frameLength, record),
         ).then(
           (accepted) => {
             if (!accepted) failDispatchPreForward(record, "recovery_forward_fenced");
@@ -5633,7 +5891,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ? parsedCapture.clientMessageId
             : null,
         };
-        void (async () => {
+        trackPreparation(async () => {
           let dispatchRecord: AdmittedDispatch | undefined;
           try {
             if (!deps.pgPool || parsedCapture === null || traceCapture === null || !isCursorEngineModel(modelCapture)) {
@@ -5666,7 +5924,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (authorityOn) {
               // resolveAuthorityExecOrReject's legacy boolean means "non-CCB"
               // (not literally Codex); Cursor is therefore classified true.
-              authorityExec = await resolveAuthorityExecOrReject({ model: authorityModelCapture, classifiedCodex: true, log: logCapture, onReject: rejectPromptQueueDispatch, turn: cursorTurnIdentity });
+              authorityExec = await resolveAuthorityExecOrReject({
+                model: authorityModelCapture,
+                classifiedCodex: true,
+                log: logCapture,
+                onReject: rejectPromptQueueDispatch,
+                turn: cursorTurnIdentity,
+                contextTier: isCursorContextTier(enriched.contextTier) ? enriched.contextTier : null,
+              });
               if (
                 authorityExec === null
                 || authorityExec.engine !== 'cursor'
@@ -5676,7 +5941,63 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 return;
               }
             }
+            // Cursor Sand main-model traffic never reaches the anthropic egress
+            // proxy, so no request_finalize_journal evidence is ever written for
+            // this turn. Bind the minted authorityTurnId to the durable dispatch
+            // (same as the CCB path) so rolling lease renewal can prove the turn
+            // is still open; otherwise the 50 min lease silently expires and the
+            // sub-agent passthrough starts failing with 403 MODEL_AUTHORITY_INVALID.
+            const cursorAuthorityTurnId = authorityExec === null ? undefined : authorityDeps!.signer.mintAuthorityTurnId();
+            if (cursorAuthorityTurnId !== undefined && dispatchRecord !== undefined) {
+              try {
+                await bindAuthorityTurnDispatch(deps.pgPool, {
+                  authorityTurnId: cursorAuthorityTurnId,
+                  dispatchId: dispatchRecord.dispatchId,
+                  userId: uid,
+                  sessionId: dispatchRecord.sessionId,
+                  dispatchModel: typeof enriched.model === 'string' ? enriched.model : null,
+                  canonicalModel: authorityExec!.canonicalModel,
+                  attemptNo: dispatchRecord.attemptNo,
+                  ownerId: dispatchRecord.leaseOwnerId,
+                  leaseEpoch: dispatchRecord.leaseEpoch,
+                });
+              } catch (err) {
+                logCapture?.error('user-chat-bridge: cursor authority turn dispatch binding failed', { err, dispatchId: dispatchRecord.dispatchId });
+                rejectPromptQueueDispatch('DURABLE_DISPATCH_UNAVAILABLE');
+                failDispatchPreForward(dispatchRecord, 'authority_turn_dispatch_unavailable');
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(userWs, 'DURABLE_DISPATCH_UNAVAILABLE', 'durable dispatch attribution unavailable, retry this turn shortly', cursorTurnIdentity);
+                }
+                return;
+              }
+            }
             const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
+            let cursorSpendable: bigint;
+            try {
+              cursorSpendable = await readTotalSpendableBalance(uid);
+            } catch (err) {
+              logCapture?.error('user-chat-bridge: cursor spendable lookup failed', { err });
+              rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
+              failDispatchPreForward(dispatchRecord, 'cursor_spendable_unavailable');
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor billing is temporarily unavailable', cursorTurnIdentity);
+              }
+              return;
+            }
+            if (cursorSpendable <= 0n) {
+              rejectPromptQueueDispatch('ERR_INSUFFICIENT_CREDITS');
+              failDispatchPreForward(dispatchRecord, 'insufficient_credits');
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  'ERR_INSUFFICIENT_CREDITS',
+                  `insufficient credits: balance=${cursorSpendable} required=1`,
+                  cursorTurnIdentity,
+                );
+                try { userWs.close(CLOSE_BRIDGE.BILLING_POLICY, 'insufficient_credits'); } catch { /* */ }
+              }
+              return;
+            }
             await deps.pgPool.query(
               `INSERT INTO cursor_external_usage_audit(request_id,user_id,container_id,session_id,model_id,status)
                VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT (request_id) DO NOTHING`,
@@ -5684,14 +6005,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             );
             let authorityFields: Record<string, unknown> = {};
             if (authorityExec !== null) {
-              const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch, turn: cursorTurnIdentity });
+              const sealed = await sealAuthorityFieldsOrReject({
+                exec: authorityExec,
+                billingRequestId: requestId,
+                ...(cursorAuthorityTurnId === undefined ? {} : { authorityTurnId: cursorAuthorityTurnId }),
+                log: logCapture,
+                onReject: rejectPromptQueueDispatch,
+                turn: cursorTurnIdentity,
+              });
               if (sealed === null) { failDispatchPreForward(dispatchRecord, 'cursor_authority_seal_rejected'); return; }
               authorityFields = sealed;
             }
-            const forwarded = { ...enriched, requestId, traceId: traceCapture, ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
+            const forwarded = { ...enriched, requestId, traceId: traceCapture, _creditBudget: cursorSpendable.toString(), ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
             const encoded = JSON.stringify(forwarded); const len = Buffer.byteLength(encoded);
             if (len > maxFrameBytes) { failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG'); rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG'); return; }
-            await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len);
+            await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len, dispatchRecord);
           } catch (err) {
             logCapture?.error('user-chat-bridge: Cursor external admission failed', { err });
             failDispatchPreForward(dispatchRecord, 'cursor_external_admission_failed');
@@ -5700,7 +6028,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is temporarily unavailable', cursorTurnIdentity);
             }
           }
-        })();
+        });
         return;
       }
       if (isZcodeInboundFrame && containerId !== undefined) {
@@ -5717,7 +6045,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ? parsedCapture.clientMessageId
             : null,
         };
-        void (async () => {
+        trackPreparation(async () => {
           let dispatchRecord: AdmittedDispatch | undefined;
           let insertedRequestId: string | null = null;
           const abortInserted = (step: "seal_rejected" | "frame_too_big" | "send_failed"): Promise<void> => {
@@ -5832,7 +6160,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               await abortInserted("frame_too_big");
               return;
             }
-            await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len);
+            await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len, dispatchRecord);
           } catch (err) {
             logCapture?.error('user-chat-bridge: ZCode external admission failed', { err });
             failDispatchPreForward(dispatchRecord, 'zcode_external_admission_failed');
@@ -5842,7 +6170,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable', zcodeTurnIdentity);
             }
           }
-        })();
+        });
         return;
       }
       if (
@@ -5855,7 +6183,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const turnLogCapture = turnLogForFrame;
         const authorityModelCapture = authorityModelForFrame;
         const annotatedTurnIdentity = inboundTurnIdentityForFrame;
-        void (async () => {
+        trackPreparation(async () => {
           // M6:总括 try/catch —— 本 IIFE 无预扣/journal/槽,一切**意外**异常(签票 crypto /
           // JSON.stringify / forward 抛)必须收敛成「dispatch 终态化 + error 帧 + queue grant 取消」,
           // 禁 unhandled rejection。dispatchRecordA 声明在 try 外,供 catch 兜底终态化。
@@ -5947,7 +6275,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             // forwardPreparedFrame:queue lane 走它兜住 promptQueueResolved(cancel 边);browser
             // lane 无 dispatchRequest → 等价 forwardInboundFrame。dispatch 已 accepted 交容器,不终态化。
-            await forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
+            await forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen, dispatchRecordA);
           } catch (err) {
             bridgeLog?.error("user-chat-bridge: annotated image IIFE unexpected error", { err });
             rejectPromptQueueDispatch("ERR_INTERNAL");
@@ -5956,7 +6284,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, "ERR_INTERNAL", "internal error", annotatedTurnIdentity);
             }
           }
-        })();
+        });
         return;
       }
       if (
@@ -6046,7 +6374,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const turnTraceIdCapture = turnTraceIdForFrame;
         // CG2b — capture turn-scoped logger;同步 set 一并 capture。
         const turnLogCapture = turnLogForFrame;
-        void (async () => {
+        trackPreparation(async () => {
           let turnForwarded = false;
           // durable dispatch 受理记录(attach 后赋值);声明在 try 外供 finally 兜底终态化。
           let dispatchRecordB: AdmittedDispatch | undefined;
@@ -6620,6 +6948,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ...enrichedParsed,
                 requestId,
                 traceId: turnTraceIdCapture,
+                _creditBudget: preCheckResult.balance.toString(),
                 ...(codexRouteFrame !== null ? { __oc_codex_route: codexRouteFrame } : {}),
                 ...(grokRouteFrame !== null ? { __oc_grok_route: grokRouteFrame } : {}),
                 // 模型执行权威:签票绑定本 turn 的 server-owned requestId(billingRequestId),
@@ -6654,6 +6983,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 frameForwardData,
                 frameForwardIsBinary,
                 frameForwardLen,
+                dispatchRecordB,
               );
               turnForwarded = forwardCommitted;
               codexTurnState.turnForwarded = forwardCommitted;
@@ -6743,6 +7073,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               frameForwardData,
               frameForwardIsBinary,
               frameForwardLen,
+              dispatchRecordB,
             );
             codexTurnState.turnForwarded = turnForwarded;
             if (turnForwarded && dispatchRequest) {
@@ -6807,7 +7138,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               failDispatchPreForward(dispatchRecordB, "codex_pre_forward_abandoned");
             }
           }
-        })();
+        });
         return; // 同步路径不再 forward,等 async 完成后由 forwardInboundFrame 走
       }
       // CG2a — 非 codex 路径(claude-* 文本 / hello / repo_bind / 普通透传):若本帧是
@@ -6824,7 +7155,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const authorityModelCapture = authorityModelForFrame;
         const classifiedCodexCapture = isCodexInboundFrame;
         const ccbTurnIdentity = inboundTurnIdentityForFrame;
-        void (async () => {
+        trackPreparation(async () => {
           // M6:总括 try/catch —— CCB turn 无预扣/journal/槽(计费在 egress 逐请求结算),一切
           // **意外**异常必须收敛成「dispatch 终态化 + error 帧 + queue grant 取消」,禁 unhandled rejection。
           // dispatchRecordC 声明在 try 外供 catch 兜底。
@@ -6941,7 +7272,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             // forwardPreparedFrame:queue lane 兜住 promptQueueResolved;browser lane 等价
             // forwardInboundFrame。dispatch 已 accepted 交容器,forward 后不终态化。
-            await forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
+            await forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen, dispatchRecordC);
           } catch (err) {
             bridgeLog?.error("user-chat-bridge: ccb inbound IIFE unexpected error", { err });
             rejectPromptQueueDispatch("ERR_INTERNAL");
@@ -6950,7 +7281,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, "ERR_INTERNAL", "internal error", ccbTurnIdentity);
             }
           }
-        })();
+        });
         return;
       }
       const passthroughForward = forwardPreparedFrame(passthroughData, isBinary, passthroughLen);
@@ -6981,7 +7312,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * 不重复 frame size / authz / codex 单飞校验:那些必须在帧到达 onUserMessage 时
      * 立刻判定(同步上下文),已在调用本函数前完成。本函数只关心"放行后的物理转发"。
      */
-    function forwardInboundFrame(data: RawData, isBinary: boolean, len: number): boolean {
+    function forwardInboundFrame(
+      data: RawData,
+      isBinary: boolean,
+      len: number,
+      dispatchRecord?: AdmittedDispatch,
+    ): boolean {
+      if (cleaned) {
+        failDispatchPreForward(dispatchRecord, "bridge_cleaned_before_physical_forward");
+        return false;
+      }
       if (markActivity && containerId !== undefined) {
         const now = Date.now();
         if (now - lastActivityRefreshAt >= ACTIVITY_REFRESH_INTERVAL_MS) {
@@ -6989,7 +7329,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           try { markActivity(containerId); } catch { /* swallow — bridge 不挂 */ }
         }
       }
-      if (containerWs.readyState !== WebSocket.OPEN) {
+      if (containerWs.readyState === WebSocket.CONNECTING) {
         // 容器还没 OPEN(早到帧场景);ws.send 在 CONNECTING 状态下抛
         // → 暂存到 ws lib 的 send buffer 里 = 不可控。这里直接 buffer 起来,
         // OPEN 后冲刷;若超 buffer 上限 → backpressure
@@ -7003,24 +7343,47 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         bufferedUC += len;
         metrics.onBufferedBytes?.(uid, "user_to_container", bufferedUC);
-        preopenQueue.push({ data, isBinary, len });
+        preopenQueue.push({ data, isBinary, len, dispatchRecord });
         return true;
       }
-      return sendToContainer(data, isBinary, len);
+      if (containerWs.readyState !== WebSocket.OPEN) {
+        failDispatchPreForward(dispatchRecord, "container_forward_rejected");
+        return false;
+      }
+      const transfer = beginEnrichmentTransfer(dispatchRecord);
+      if (dispatchRecord !== undefined && transfer === null) return false;
+      return sendToContainer(data, isBinary, len, transfer);
     }
 
-    const sendToContainer = (data: RawData, isBinary: boolean, len: number): boolean => {
+    const sendToContainer = (
+      data: RawData,
+      isBinary: boolean,
+      len: number,
+      transfer: EnrichmentDispatchState | null = null,
+    ): boolean => {
       try {
         containerWs.send(data, { binary: isBinary }, (err) => {
-          if (err) {
-            bridgeLog?.warn("user-chat-bridge: container send error", { err });
-          }
+          const complete = (): void => {
+            if (err) {
+              bridgeLog?.warn("user-chat-bridge: container send error", { err });
+              if (transfer) {
+                terminalizeEnrichmentDispatch(transfer, "container_forward_rejected");
+                cleanup("container_error", true);
+              }
+            } else {
+              completeEnrichmentTransfer(transfer);
+            }
+          };
+          if (deps.deferContainerSendCompletionForTest) {
+            deps.deferContainerSendCompletionForTest(complete);
+          } else complete();
         });
         bytesUC += len;
         metrics.onUserFrame?.(uid, len, isBinary);
         return true;
       } catch (err) {
         bridgeLog?.warn("user-chat-bridge: container send threw", { err });
+        if (transfer) terminalizeEnrichmentDispatch(transfer, "container_forward_rejected");
         try { userWs.close(CLOSE_BRIDGE.INTERNAL, "agent send failed"); } catch { /* */ }
         // 容器 send 抛 = 容器 socket 已不可用,billing 帧也来不了 → force final
         cleanup("container_error", true);
@@ -7028,7 +7391,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
     };
 
-    const preopenQueue: Array<{ data: RawData; isBinary: boolean; len: number }> = [];
+    const preopenQueue: Array<{
+      data: RawData;
+      isBinary: boolean;
+      len: number;
+      dispatchRecord?: AdmittedDispatch;
+    }> = [];
     let loggedRejectedContainerIncident = false;
 
     const onContainerMessage = (data: RawData, isBinary: boolean): void => {
@@ -7194,6 +7562,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                           }
                         } finally {
                           snapshot?.token.fill(0);
+                          snapshot?.refresh?.fill(0);
                         }
                       }
                       if (cursorAccountId === null) {
@@ -7273,15 +7642,81 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             parsedReceipt !== null && typeof parsedReceipt === "object" &&
             (parsedReceipt as { type?: unknown }).type === "outbound.control.turn_dispatch_receipt"
           ) {
-            const receipt = parsedReceipt as { clientMessageId?: unknown; dispatchId?: unknown };
+            const receipt = parsedReceipt as {
+              clientMessageId?: unknown;
+              dispatchId?: unknown;
+              attemptNo?: unknown;
+              sessionId?: unknown;
+              state?: unknown;
+              outcome?: unknown;
+            };
             const cmid = isClientMessageId(receipt.clientMessageId) ? receipt.clientMessageId : null;
             const rec = cmid !== null ? admittedDispatches.get(cmid) : undefined;
-            if (
-              rec !== undefined &&
-              typeof receipt.dispatchId === "string" &&
-              receipt.dispatchId === rec.dispatchId
-            ) {
+            if (rec !== undefined) {
+              const disposition = classifyTurnDispatchReceipt(receipt, rec);
+              if (disposition === "invalid") {
+                bridgeLog?.warn("user-chat-bridge: invalid dispatch receipt ignored", {
+                  dispatchId: receipt.dispatchId,
+                  clientMessageId: receipt.clientMessageId,
+                  attemptNo: receipt.attemptNo,
+                  state: receipt.state,
+                });
+                return;
+              }
               const pool = deps.pgPool;
+              if (disposition === "rejected") {
+                const rejectedEnrichment = enrichmentDispatches.get(rec.clientMessageId);
+                if (
+                  rejectedEnrichment?.record === rec &&
+                  !claimEnrichmentTerminalization(rejectedEnrichment)
+                ) return;
+                if (!pool) {
+                  settleCronOriginClaim(rec.dispatchId, { kind: "delivery_unknown" });
+                  if (enrichmentDispatches.get(rec.clientMessageId) === rejectedEnrichment) {
+                    enrichmentDispatches.delete(rec.clientMessageId);
+                  }
+                  dropAdmittedDispatch(rec.clientMessageId);
+                  return;
+                }
+                void (async () => {
+                  let persisted = false;
+                  try {
+                    if (rec.recoveryJob) {
+                      persisted = await releaseRecoveryPreReceipt(pool, {
+                        job: rec.recoveryJob,
+                        dispatchId: rec.dispatchId,
+                        dispatchOwner: rec.leaseOwnerId,
+                        dispatchLeaseEpoch: rec.leaseEpoch,
+                      });
+                    } else {
+                      persisted = await casToTerminal(pool, {
+                        dispatchId: rec.dispatchId,
+                        outcome: "not_accepted",
+                        failureCode: "DISPATCH_NOT_ACCEPTED",
+                        clientNotified: false,
+                        fromStatuses: ["admitted"],
+                        expectedEpoch: rec.leaseEpoch,
+                      }) !== null;
+                    }
+                  } catch (err) {
+                    bridgeLog?.warn("user-chat-bridge: rejected receipt convergence failed", {
+                      dispatchId: rec.dispatchId,
+                      err,
+                    });
+                  } finally {
+                    settleCronOriginClaim(
+                      rec.dispatchId,
+                      { kind: persisted ? "rejected" : "delivery_unknown" },
+                    );
+                    if (enrichmentDispatches.get(rec.clientMessageId) === rejectedEnrichment) {
+                      enrichmentDispatches.delete(rec.clientMessageId);
+                    }
+                    dropAdmittedDispatch(rec.clientMessageId);
+                  }
+                })();
+                return;
+              }
+              if (!acceptEnrichmentReceipt(rec)) return;
               if (pool) {
                 if (rec.recoveryJob) {
                   void markRecoveryContainerReceipt(pool, {
@@ -7289,14 +7724,50 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     dispatchAttemptNo: rec.attemptNo,
                     expectedDispatchLeaseEpoch: rec.leaseEpoch,
                   }).catch(() => {});
+                  dropAdmittedDispatch(rec.clientMessageId);
                 } else {
-                  void casAdmittedToAccepted(pool, {
-                    dispatchId: rec.dispatchId,
-                    expectedEpoch: rec.leaseEpoch,
-                  }).catch(() => {});
+                  // Cron injection success is the durable accepted CAS, not
+                  // ws.send and not an in-memory lease. Resolve its HTTP call
+                  // only after that proof is committed; a lost response can
+                  // safely retry and observe this accepted row.
+                  void (async () => {
+                    let claimed = false;
+                    const mustConfirmCronClaim = cronOriginClaimWaiters.has(rec.dispatchId);
+                    try {
+                      const accepted = await casAdmittedToAccepted(pool, {
+                        dispatchId: rec.dispatchId,
+                        expectedEpoch: rec.leaseEpoch,
+                      });
+                      if (accepted !== null) {
+                        claimed = true;
+                      } else if (mustConfirmCronClaim) {
+                        const durable = await getDispatchByLogicalKey(pool, {
+                          userId: uid,
+                          sessionId: rec.sessionId,
+                          clientMessageId: rec.clientMessageId,
+                        });
+                        claimed = durable?.dispatchId === rec.dispatchId &&
+                          durable.attemptNo === rec.attemptNo &&
+                          durable.status === "accepted";
+                      }
+                    } catch (err) {
+                      bridgeLog?.warn("user-chat-bridge: dispatch receipt CAS failed", {
+                        dispatchId: rec.dispatchId,
+                        err,
+                      });
+                    } finally {
+                      settleCronOriginClaim(
+                        rec.dispatchId,
+                        { kind: claimed ? "claimed" : "delivery_unknown" },
+                      );
+                      dropAdmittedDispatch(rec.clientMessageId);
+                    }
+                  })();
                 }
+              } else {
+                settleCronOriginClaim(rec.dispatchId, { kind: "delivery_unknown" });
+                dropAdmittedDispatch(rec.clientMessageId);
               }
-              dropAdmittedDispatch(rec.clientMessageId);
             }
             return;
           }
@@ -7426,6 +7897,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ...(execution.modelSwitchId !== undefined ? { modelSwitchId: execution.modelSwitchId } : {}),
             ...(execution.effortLevel !== undefined ? { effortLevel: execution.effortLevel } : {}),
             ...(execution.teamMode !== undefined ? { teamMode: execution.teamMode } : {}),
+            ...(execution.contextTier !== undefined ? { contextTier: execution.contextTier } : {}),
             [PROMPT_QUEUE_GRANT_FIELD]: {
               grantId: request.grantId,
               itemId: request.item.itemId,
@@ -7462,7 +7934,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           : null;
       if (
         masterOnlyFrameType === "sys.incident" || masterOnlyFrameType === "sys.goal_snapshot" ||
-        masterOnlyFrameType === "sys.media_job"
+        masterOnlyFrameType === "sys.media_job" || masterOnlyFrameType === "sys.recovery_decision"
       ) {
         if (!loggedRejectedContainerIncident) {
           loggedRejectedContainerIncident = true;
@@ -7822,6 +8294,60 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 : null,
               expiresAt: resolvePermissionExpiresAt(parsedPermission.expiresAt),
             }).then(() => {});
+          }
+        } else if (permissionText?.includes('"outbound.permission_settled"')) {
+          // INC-20260903-PENDING-PERMISSION-ZOMBIE — the runtime is the only
+          // authority on whether a prompt is still answerable. Every settlement
+          // it reports (another tab answered, Stop/disconnect/timeout/crash
+          // auto-deny, duplicate already_settled) must close the durable row,
+          // otherwise the hello-time replay re-materialises a dead card on
+          // every reconnect. Side effect only: the frame still flows to userWs
+          // unchanged, and a DB hiccup here must not stall the live stream.
+          let parsedSettled: unknown = null;
+          try { parsedSettled = JSON.parse(permissionText); } catch { /* generic frame */ }
+          if (
+            isPlainRecord(parsedSettled) &&
+            parsedSettled.type === "outbound.permission_settled" &&
+            typeof parsedSettled.requestId === "string" &&
+            (parsedSettled.behavior === "allow" || parsedSettled.behavior === "deny") &&
+            isPlainRecord(parsedSettled.peer) &&
+            typeof parsedSettled.peer.id === "string"
+          ) {
+            const settledRequestId = parsedSettled.requestId;
+            const settledSessionId = parsedSettled.peer.id;
+            const settledBehavior = parsedSettled.behavior;
+            const settledReason = typeof parsedSettled.reason === "string"
+              ? parsedSettled.reason
+              : "unknown";
+            const settledAnswers = isPlainRecord(parsedSettled.answers)
+              ? Object.fromEntries(
+                  Object.entries(parsedSettled.answers)
+                    .filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+                )
+              : null;
+            void settlePermissionPromptFromRuntime(deps.pgPool, {
+              userId: uid,
+              sessionId: settledSessionId,
+              requestId: settledRequestId,
+              behavior: settledBehavior,
+              reason: settledReason,
+              answers: settledAnswers,
+            }).then((closed) => {
+              if (closed) {
+                bridgeLog?.info("user-chat-bridge: runtime settlement closed durable permission prompt", {
+                  sessionId: settledSessionId,
+                  requestId: settledRequestId,
+                  behavior: settledBehavior,
+                  reason: settledReason,
+                });
+              }
+            }).catch((error) => {
+              bridgeLog?.warn("user-chat-bridge: durable permission settlement failed", {
+                sessionId: settledSessionId,
+                requestId: settledRequestId,
+                err: (error as Error)?.message ?? String(error),
+              });
+            });
           }
         }
       }
@@ -8256,7 +8782,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       void drainDurableControlsForUser(uid);
       // 冲刷 preopen queue
-      for (const m of preopenQueue) sendToContainer(m.data, m.isBinary, m.len);
+      for (const m of preopenQueue) {
+        forwardInboundFrame(m.data, m.isBinary, m.len, m.dispatchRecord);
+      }
       preopenQueue.length = 0;
       bufferedUC = 0;
       metrics.onBufferedBytes?.(uid, "user_to_container", 0);
@@ -8388,7 +8916,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 仅在没有 codex inflight 且无在飞 durable dispatch 时才透传 close 给容器
       // (走 force final 路径);有其一时进 drain,container 留着让 turn 跑完 + 收 billing /
       // 保 lease,drain 收尾时由 finalCleanup 统一 terminate。
-      if (inflightCodexTurns.size === 0 && admittedDispatches.size === 0) {
+      if (inflightCodexTurns.size === 0 && !hasPendingDispatchWork()) {
         try {
           if (containerWs.readyState === WebSocket.OPEN
             || containerWs.readyState === WebSocket.CONNECTING) {
@@ -8396,7 +8924,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         } catch { /* */ }
       }
-      cleanup("client_close");
+      const closeCause = requestedCloseCause ?? "client_close";
+      cleanup(closeCause, closeCause === "shutdown");
     });
 
     // 把"upgrade 期间早到的帧"先 emit 一遍 → 走正常 onUserMessage 流程。
@@ -8440,16 +8969,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           bridgeLog?.info("user-chat-bridge: drain pre-empt", {
             triggerCause, leftover: inflightCodexTurns.size,
           });
+          terminalizeAllEnriching();
           finalCleanup(triggerCause);
         }
         // 其它路径(user_close 重入 / heartbeat 抖动)在 drain 期忽略
         return;
       }
 
-      // A dispatch still in master enrichment has never been handed to the
-      // container. Claim it now, before drain classification, so client_close
-      // cannot leave an admitted orphan for the five-minute authority timeout.
-      terminalizeAllEnriching("client_disconnected_before_enrichment_transfer");
+      // Browser detach is not transport death: admitted/preparing turns keep
+      // the container bridge and lease alive through drain. Only a forced or
+      // executor-channel terminal cause may win the pre-transfer fence.
+      if (
+        force ||
+        triggerCause === "container_close" ||
+        triggerCause === "container_error" ||
+        triggerCause === "shutdown"
+      ) {
+        terminalizeAllEnriching();
+      }
 
       // 还没进 drain
       // drain 适用条件:user-side 故障(client_close / backpressure / internal_error)
@@ -8460,7 +8997,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         (triggerCause === "client_close" ||
           triggerCause === "backpressure" ||
           triggerCause === "internal_error") &&
-        (inflightCodexTurns.size > 0 || hasTransferredDispatches());
+        (inflightCodexTurns.size > 0 || hasPendingDispatchWork());
 
       if (!shouldDrain) {
         finalCleanup(triggerCause);
@@ -8472,23 +9009,31 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       detachUserSide(triggerCause);
       bridgeLog?.info("user-chat-bridge: enter drain", {
         inflightCount: inflightCodexTurns.size,
+        preparationCount: preparationInFlight,
+        admittedCount: admittedDispatches.size,
       });
       for (const [requestId, snap] of inflightCodexTurns) {
         recordBillingRecovery(requestId, "pending", snap);
       }
       // RFC §2.2 B1:有在飞 admitted dispatch → 取 max(billing, dispatch drain,默认 60s / 上限 120s);
       // 无 dispatch(纯 codex billing drain)→ 沿用 5s billing 窗口。
-      const drainMs = hasTransferredDispatches()
-        ? Math.max(readDrainBillingMs(), readDispatchDrainMs())
+      const drainMs = hasPendingDispatchWork()
+        ? Math.max(
+            readDrainBillingMs(),
+            readDispatchDrainMs(),
+            hasPreTransferDispatchWork() ? promptQueuePreparationTimeoutMs : 0,
+          )
         : readDrainBillingMs();
       drainTimer = setTimeout(() => {
         bridgeLog?.warn("user-chat-bridge: drain timeout", {
           leftover: inflightCodexTurns.size,
-          admittedLeftover: transferredDispatches.size,
+          admittedLeftover: admittedDispatches.size,
+          preparationLeftover: preparationInFlight,
         });
         for (const [requestId, snap] of inflightCodexTurns) {
           recordBillingRecovery(requestId, "failed", snap);
         }
+        terminalizeAllEnriching();
         finalCleanup(drainCause ?? "client_close");
       }, drainMs);
       drainTimer.unref?.();
@@ -8499,7 +9044,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * 双 map 均空才提前结束 drain。不在 drain 期 / 任一 map 非空时 no-op。
      */
     function checkDrainComplete(): void {
-      if (drainTimer !== null && inflightCodexTurns.size === 0 && !hasTransferredDispatches()) {
+      if (drainTimer !== null && inflightCodexTurns.size === 0 && !hasPendingDispatchWork()) {
         clearTimeout(drainTimer);
         drainTimer = null;
         finalCleanup(drainCause ?? "client_close");
@@ -9139,6 +9684,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         pendingZcodeRelays.clear();
       }
+      for (const dispatchId of [...cronOriginClaimWaiters.keys()]) {
+        settleCronOriginClaim(dispatchId, { kind: "delivery_unknown" });
+      }
       if (deps.pgPool && pendingZcodeRequestIds.size > 0) {
         ensureZcodeStaleReconcile();
         const leftover = [...pendingZcodeRequestIds];
@@ -9151,10 +9699,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }).then(() => undefined),
         );
       }
-      // Enrichment states were terminalized at cleanup entry. Transferred
-      // dispatches remain under the existing durable recovery authority.
+      // Transport-death/drain-timeout paths terminalize enrichment before
+      // final cleanup. Receipt-owning turns remain under durable recovery.
       admittedDispatches.clear();
-      transferredDispatches.clear();
 
       // Release every session-scoped admission state. Awaiting acquire/route
       // continuations carry the state identity fence and release any resource
@@ -9359,13 +9906,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
   async function injectCronOriginTurn(input: CronOriginInjectInput): Promise<CronOriginInjectResult> {
     const executors = uidToCronOriginExecutors.get(input.uid.toString());
-    const executor = executors && [...executors][0];
-    if (!executor || !deps.admitUserTurn) return { kind: "no_transport" };
+    if (!executors || executors.size === 0 || !deps.admitUserTurn) return { kind: "no_transport" };
     return executeCronOriginInject({
       input,
       pgPool: deps.pgPool,
       admitUserTurn: deps.admitUserTurn,
-      executor,
+      // Resolve after admission so a bridge removed while PG was awaited is
+      // never retained as a stale executor closure.
+      getExecutors: () => uidToCronOriginExecutors.get(input.uid.toString()) ?? [],
       log,
     });
   }

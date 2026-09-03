@@ -155,11 +155,22 @@ export function CursorPoolCell({ a }: { a: AccountRow }) {
   return (
     <div className="flex flex-col gap-0.5">
       <span>{poolLabel}</span>
-      {a.cursor_sand_enabled ? (
-        <Badge tone="accent" className="w-fit px-1.5 py-0 text-[10px]">
-          Sand
-        </Badge>
-      ) : null}
+      <div className="flex flex-wrap gap-1">
+        {a.cursor_sand_enabled ? (
+          <Badge tone="accent" className="w-fit px-1.5 py-0 text-[10px]">
+            Sand
+          </Badge>
+        ) : null}
+        {a.cursor_credential_kind === "session" ? (
+          <Badge
+            tone="neutral"
+            className="w-fit px-1.5 py-0 text-[10px]"
+            title={a.cursor_auth_id ? `Cursor 账号登录会话 · ${a.cursor_auth_id}` : "Cursor 账号登录会话"}
+          >
+            账号会话
+          </Badge>
+        ) : null}
+      </div>
     </div>
   );
 }

@@ -34,6 +34,7 @@ import {
   startSessionsGcSweeper,
   _setAfterLosslessStageBatch,
   _setPhaseASqlObserver,
+  _resetAutomaticRecoveryReconcileSkipsForTest,
   LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE,
   type PgSessionsBackend,
 } from "../db/pgSessionsBackend.js";
@@ -5714,23 +5715,35 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     tapeStatus?: "completed" | "crashed" | "interrupted";
     waiveReason?: "idle_timeout" | "turn_limit" | null;
     errorCode?: string;
+    /** Client PUT strips `_routing`; automatic scheduling needs the admitted
+     * source row, so opt into admitUserTurn when the sweep must schedule. */
+    admitSource?: boolean;
   }): Promise<void> {
     const tapeId = sha256(`recoverable-tape\0${args.sessionId}\0${args.sourceClientMessageId}`);
     const turnKey = sha256(`recoverable-turn\0${args.sessionId}\0${args.sourceClientMessageId}`);
-    await backend.upsertClientSession(mkSession({
-      id: args.sessionId,
-      userId: CUSER,
-      messages: [
-        {
-          id: args.sourceClientMessageId,
-          role: "user",
-          text: "source",
-          ts: 1,
-          _routing: { model: "gpt-5.6-sol", effortLevel: null, teamMode: false },
-          ...(args.automaticRecovery ? { _automaticRecovery: true } : {}),
-        },
-      ] as MessageLike[],
-    }));
+    const sourceMessage = {
+      id: args.sourceClientMessageId,
+      role: "user",
+      text: "source",
+      ts: 1,
+      _routing: { model: "gpt-5.6-sol", effortLevel: null, teamMode: false },
+      ...(args.automaticRecovery ? { _automaticRecovery: true } : {}),
+    } as MessageLike & { id: string };
+    if (args.admitSource) {
+      const admission = await backend.admitUserTurn(admitInput({
+        sessionId: args.sessionId,
+        clientMessageId: args.sourceClientMessageId,
+        billingRequestId: `brq-${args.sourceClientMessageId}`,
+        message: sourceMessage,
+      }));
+      assert.equal(admission.kind, "admitted");
+    } else {
+      await backend.upsertClientSession(mkSession({
+        id: args.sessionId,
+        userId: CUSER,
+        messages: [sourceMessage] as MessageLike[],
+      }));
+    }
     await backend.appendServerAuthoredMessage(
       args.sessionId,
       CUSER,
@@ -7628,6 +7641,120 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(finalRecord?.text, "迟到的真回复");
     assert.equal(finalRecord?._timelineRecord, true);
   });
+  // OCV5-94 — the 30s reconcile sweep must not re-read whole tapes for turns it
+  // already knows are not recoverable. Count full-payload reads through a proxy
+  // pool; the cheap verdict path only touches one assistant record.
+  function countingBackend(): { backend: PgSessionsBackend; fullReads: () => number } {
+    let fullReads = 0;
+    const isFullRead = (sql: string) =>
+      /FROM client_session_turn_tape_records/i.test(sql) && /ORDER BY ordinal\s*$/i.test(sql) && !/LIMIT 1/i.test(sql);
+    const wrapQuery = (query: (...a: unknown[]) => Promise<unknown>) =>
+      async (...args: unknown[]) => {
+        const first = args[0] as string | { text?: string } | undefined;
+        const sql = typeof first === "string" ? first : first?.text ?? "";
+        if (isFullRead(sql)) fullReads++;
+        return query(...args);
+      };
+    const proxyPool = {
+      query: wrapQuery((...args) => (pool.query as (...a: unknown[]) => Promise<unknown>)(...args)),
+      connect: async () => {
+        const client = await pool.connect();
+        const query = client.query.bind(client) as (...a: unknown[]) => Promise<unknown>;
+        return new Proxy(client, {
+          get(target, property, receiver) {
+            if (property === "query") return wrapQuery(query);
+            const value = Reflect.get(target, property, receiver) as unknown;
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+    return {
+      backend: createPgSessionsBackend(proxyPool as unknown as Pool, { expectedGeneration: GENERATION }),
+      fullReads: () => fullReads,
+    };
+  }
+
+  maybe("reconcile sweep skips full tape read for non-recoverable terminal error and remembers the verdict", async () => {
+    _resetAutomaticRecoveryReconcileSkipsForTest();
+    const sessionId = "s-dd-reconcile-cheap-terminal";
+    const sourceClientMessageId = "cm-dd-reconcile-cheap-terminal";
+    // USER_CANCELLED is never automatically recoverable — the negative verdict
+    // depends only on the immutable tape.
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      tapeStatus: "crashed",
+      errorCode: "USER_CANCELLED",
+    });
+    const counting = countingBackend();
+    assert.equal(await counting.backend.reconcileAutomaticRecoveryJobs(UID, 100), 0);
+    assert.equal(counting.fullReads(), 0, "cheap verdict must not hydrate the tape body");
+    const jobs = await pool.query(
+      `SELECT 1 FROM turn_recovery_jobs WHERE user_id=$1 AND session_id=$2`,
+      [UID, sessionId],
+    );
+    assert.equal(jobs.rowCount, 0);
+    // Second sweep: remembered — not even the cheap probe runs.
+    let probes = 0;
+    const probing = createPgSessionsBackend({
+      query: async (...args: unknown[]) => {
+        const first = args[0] as string | { text?: string } | undefined;
+        const sql = typeof first === "string" ? first : first?.text ?? "";
+        if (/role='assistant'/i.test(sql)) probes++;
+        return (pool.query as (...a: unknown[]) => Promise<unknown>)(...args);
+      },
+      connect: () => pool.connect(),
+    } as unknown as Pool, { expectedGeneration: GENERATION });
+    assert.equal(await probing.reconcileAutomaticRecoveryJobs(UID, 100), 0);
+    assert.equal(probes, 0, "remembered verdict must short-circuit before any per-candidate SQL");
+  });
+
+  maybe("reconcile sweep still schedules recovery through the cheap gate and settles controls on the skip path", async () => {
+    _resetAutomaticRecoveryReconcileSkipsForTest();
+    const sessionId = "s-dd-reconcile-cheap-pass";
+    const sourceClientMessageId = "cm-dd-reconcile-cheap-pass";
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      tapeStatus: "crashed",
+      errorCode: "upstream_failed",
+      admitSource: true,
+    });
+    const counting = countingBackend();
+    assert.equal(await counting.backend.reconcileAutomaticRecoveryJobs(UID, 100), 1);
+    assert.equal(counting.fullReads(), 1, "recoverable candidate takes exactly one full read");
+    const jobs = await pool.query<{ error_code: string }>(
+      `SELECT error_code FROM turn_recovery_jobs WHERE user_id=$1 AND session_id=$2 AND source_client_message_id=$3`,
+      [UID, sessionId, sourceClientMessageId],
+    );
+    assert.equal(jobs.rowCount, 1);
+    assert.equal(jobs.rows[0]!.error_code, "upstream_failed");
+
+    // Skip path must still run the durable settlement the finalize path would
+    // run: a stop control of a non-recoverable turn goes terminal.
+    const stopSession = "s-dd-reconcile-cheap-settle";
+    const stopSource = "cm-dd-reconcile-cheap-settle";
+    await seedRecoverableSource({
+      sessionId: stopSession,
+      sourceClientMessageId: stopSource,
+      tapeStatus: "crashed",
+      errorCode: "USER_CANCELLED",
+    });
+    await pool.query(
+      `INSERT INTO turn_control_requests
+         (control_id,user_id,session_id,root_client_message_id,kind,payload_json,status)
+       VALUES ($1,$2,$3,$4,'stop','{}'::jsonb,'pending')`,
+      [`ctl-${stopSource}`, UID, stopSession, stopSource],
+    );
+    assert.equal(await counting.backend.reconcileAutomaticRecoveryJobs(UID, 100), 0);
+    const control = await pool.query<{ status: string }>(
+      `SELECT status FROM turn_control_requests WHERE user_id=$1 AND session_id=$2 AND root_client_message_id=$3`,
+      [UID, stopSession, stopSource],
+    );
+    assert.equal(control.rows[0]?.status, "terminal");
+  });
+
 });
 
 // ── Direct immutable timeline + lazy tape paging ─────────────────────────────

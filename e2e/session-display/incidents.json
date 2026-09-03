@@ -2567,6 +2567,16 @@
           "assertion": "hydration 形态 TodoWrite(inputJson.todos) 在当前轮未完成时仍可提取"
         },
         {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/PinnedTaskTracker.test.tsx",
+          "assertion": "turn 收口(active true→false 下降沿)后,仍有未完成任务也不再钉住"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "user 行 status=replied → 收口"
+        },
+        {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T61 刷新后 HUD 仍钉住且畸形 agent-group 只落 MessageBoundary 邻居仍在"
@@ -2575,7 +2585,8 @@
       "coverageCommits": [
         "51674b8c",
         "226edfac",
-        "d18bd587"
+        "d18bd587",
+        "0d6a19ea"
       ]
     },
     {
@@ -2699,6 +2710,193 @@
           "layer": "deploy-gate",
           "path": "scripts/deploy-v5.sh",
           "assertion": "requiredMigrations mismatch; expected="
+        }
+      ]
+    },
+    {
+      "id": "INC-20260903-OCV5-81-CODEX-INTERRUPT-BILLING",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "Codex interrupt() 为撤销 InlinePush 资格提前清空 active turn，导致 interrupted 终态的 partial token usage 被当前-turn billing 守卫抑制，已发生的调用没有进入结算侧信道。",
+      "rootFixCommit": "ad72b788",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "interrupt:活跃 turn → turn/interrupt 请求;interrupted 终态仍带 usage billing"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
+          "assertion": "Codex 已产出可见内容后强制停止必须恰好结算一笔 partial usage"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260903-OCV5-84-CRON-SUBMIT-BOUNDARY",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "Cron occurrence 已持久化为 executing 后，last-run 写失败被统一映射为 SUBMIT_START_FAILED 可重试；同一外部副作用任务可能在未知提交边界后被自动重放。",
+      "rootFixCommit": "960a640f",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cron.test.ts",
+          "assertion": "fails closed without replay when the submit-started record precedes a last-run write failure"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cron-submit-boundary.ts",
+          "assertion": "[cron-submit-boundary] PASS — unknown submit-start durability failures are terminal and never auto-replayed"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/cronSubmitBoundaryGate.test.ts",
+          "assertion": "cron submit-boundary gate rejects deletion of the regular runJob boundary"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260903-OCV5-87-RELEASE-MARKER-GATE",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "V5 商业发布的 strong release marker 在校验 distReuse 时 jq 条件多一个右括号，合法 marker 也会编译失败并阻断发布；同时 runtime/ledger ops fixtures 已漂移，完整门无法给出可靠绿灯。",
+      "rootFixCommit": "8d2b5211",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5ReleaseSafety.test.ts",
+          "assertion": "strong release markers detect tampering and legacy trust is exact-invocation predecessor only"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5ReleaseSafety.test.ts",
+          "assertion": "B4: strong marker probe accepts distReuse without reindexing the string context"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "invalid strong release marker"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260903-OCV5-82-SESSION-UNAVAILABLE",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "多条 webchat 会话因浏览器瞬断误杀已受理 enrichment、cron stale executor/假 ACK、容器 rejected 与 Master accepted 长时间分叉，以及前台 memory flock 5 秒竞争失败而显示「系统暂时不可用」。",
+      "rootFixCommit": "82bfb777",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "R4-B1 受理 await 期间 client detach → drain 保活并在 admission 后只转发一次"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "R4-B7 container close after lookup but during authority bind keeps pre-forward ownership"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "R4-B8 rejected duplicate receipt never becomes cron injected success"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "R4-B9 accepted receipt synchronously beats close before delayed send callback"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cronOriginAdmitModel.test.ts",
+          "assertion": "production preparation budget is not shorter than the legal PG statement budget"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cronOriginAdmitModel.test.ts",
+          "assertion": "stale executor may reselect only after explicit not_claimed and keeps one envelope"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cronOriginAdmitModel.test.ts",
+          "assertion": "rejected executor receipt returns a non-success result and stops reselection"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "young accepted + durable rejected tombstone → immediate not_accepted convergence"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/storage/src/__tests__/kernelFileLock.test.ts",
+          "assertion": "retries foreground shared-barrier contention within one bounded budget"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/autoDreamTurnBarrier.test.ts",
+          "assertion": "commercial foreground turns hold the shared memory barrier until submit finally"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "[session-unavailable-rootfix] PASS — detach drain, durable cron receipt, rejected convergence and bounded memory retry are locked"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260903-CCB-TOOL-PHASE-STOP-RED-CARD",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "Cursor Opus/Fable(sand-ccb)会话在模型执行工具期间点「停止生成」,终态被判成 ENGINE_ERROR,渲染红色「任务执行失败」卡而非灰色「已停止生成」;同时 Cursor 引擎所有用户主动停止的轮次都被 cursor_engine_not_success 免单,实际消耗的 token 一分未扣。",
+      "rootFixCommit": "ae967d03",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbUserCancellationDiagnostic.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "browser Stop during a CCB tool call (stop_reason=tool_use) maps to USER_CANCELLED"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorExternalSettle.test.ts",
+          "assertion": "user Stop (error + USER_CANCELLED) charges the tokens actually consumed"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260903-TURNEND-LAST-SEGMENT-FLASH",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "V5 selfhost 多段正文（text→tool→text）轮正常结束时，最后一段正文闪一下消失，几秒到几十秒后 Phase-B 精确 tape 到达才重新出现。根因：Phase-A unpublished fallback 的 id = visible_head.messageId = 最后一段 live assistant 行 id（srv-…-tN-sK），server-wins 按 id 吞掉该 live 行；omitUnpublishedFallbackWhenLiveAssistantsExist 又因仍有更早 live 段而把 fallback 正文清空隐藏，最后一段文本无人渲染。",
+      "rootFixCommit": "ab3f5c20",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "Phase-A fallback sharing the last live segment id keeps that segment text visible (INC-20260903-TURNEND-LAST-SEGMENT-FLASH)"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T62 Phase-A fallback 与最后一段 live 正文同 id 时最后一段正文不闪没"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260903-CURSOR-CLI-ERROR-WASH",
+      "occurredAt": "2026-09-03",
+      "severity": "P1",
+      "symptom": "Cursor Fable/Opus ENGINE_ERROR 红卡只有「内部错误/暂时中断」，usage_records.error_msg 为空、live_frames.detail 只有 traceId。根因：cursorAdapter.finish() 把非 auth/quota CLI 失败统一洗成 'Cursor CLI failed'，脱敏原文既不入库也不打日志。",
+      "rootFixCommit": "de8aed4cf",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorCliErrorSanitize.test.ts",
+          "assertion": "keeps the first-line Sand root cause under the tape cap"
         }
       ]
     }

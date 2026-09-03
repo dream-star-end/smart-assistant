@@ -57,6 +57,33 @@ type RunnerExitInfo = {
   crashed: boolean
 }
 
+/** Exact official Claude Code 2.1.x cooperative-Stop terminal shape. Keep the
+ * predicate narrow: only this frame may turn its following exit(1) into an
+ * expected recycle. */
+export function _isOfficialClaudeAbortResult(msg: SdkMessage): boolean {
+  const result = msg as SdkMessage & {
+    terminal_reason?: string
+    stop_reason?: string | null
+  }
+  return result.type === 'result'
+    && result.is_error === true
+    && result.subtype === 'error_during_execution'
+    && result.terminal_reason === 'aborted_streaming'
+    && (result.stop_reason === null || result.stop_reason === undefined)
+}
+
+export function _isExpectedOfficialClaudeAbortExit(args: {
+  harness: 'ccb' | 'official-cc'
+  code: number | null
+  signal: NodeJS.Signals | null
+  abortResultObserved: boolean
+}): boolean {
+  return args.harness === 'official-cc'
+    && args.code === 1
+    && args.signal == null
+    && args.abortResultObserved
+}
+
 /**
  * 构造容器侧 OC_REMOTE_* env。
  *
@@ -219,7 +246,18 @@ export const DEFAULT_SECONDARY_UTILITY_MODEL = 'deepseek-v4-flash'
  *  (grok-build / cursor-* / claude-haiku / official Claude aliases). Selfhost
  *  catalog has no haiku; CCB Agent `model: "haiku"` otherwise 403s at the
  *  anthropic proxy. Official CCB honors CLAUDE_CODE_SUBAGENT_MODEL above the
- *  tool-specified alias (claude-code-best/src/utils/model/agent.ts). */
+ *  tool-specified alias (claude-code-best/src/utils/model/agent.ts).
+ *
+ *  Must be a member of the platform aux set: egress `modelAuthorityGate` only
+ *  admits `{turn lease canonical model} ∪ PLATFORM_AUX_MODEL_IDS` for a turn,
+ *  and that set is `[DEFAULT_SECONDARY_UTILITY_MODEL, DEFAULT_CCB_SUBAGENT_MODEL]`
+ *  (commercial/billing/modelCatalog.ts imports both constants). Pinning a model
+ *  outside the set (glm-5.3-zai before it was added on 2026-09-03) made every
+ *  sub-agent under a cursor-* parent 403 `MODEL_AUTHORITY_INVALID`.
+ *
+ *  2026-09-03: sub-tasks default to grok-build (platform delegate_task) with
+ *  glm-5.3-zai as the fallback; CCB Agent sub-agents cannot reach grok (no
+ *  Anthropic-compatible grok backend), so they pin the fallback directly. */
 export const DEFAULT_CCB_SUBAGENT_MODEL = 'glm-5.3-zai'
 
 export function isCcbRoutableSubagentModel(model: string | undefined): boolean {
@@ -232,6 +270,11 @@ export function isCcbRoutableSubagentModel(model: string | undefined): boolean {
   return true
 }
 
+/** Sub-agent model for a CCB turn. Parent model when it is catalog-routable
+ *  (same turn lease → always admitted); otherwise the ops override, else
+ *  DEFAULT_CCB_SUBAGENT_MODEL — a member of the cross-turn aux set the egress
+ *  gate accepts. An ops override must also be inside PLATFORM_AUX_MODEL_IDS or
+ *  the sub-agent 403s. */
 export function resolveCcbSubagentModel(sessionModel?: string): string {
   if (isCcbRoutableSubagentModel(sessionModel)) return sessionModel!.trim()
   const override = process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL?.trim()
@@ -239,10 +282,12 @@ export function resolveCcbSubagentModel(sessionModel?: string): string {
   return DEFAULT_CCB_SUBAGENT_MODEL
 }
 
+export function resolveSecondaryUtilityModel(): string {
+  return process.env.OPENCLAUDE_SECONDARY_MODEL?.trim() || DEFAULT_SECONDARY_UTILITY_MODEL
+}
+
 export function _buildSecondaryUtilityModelEnv(): Record<string, string> {
-  const model =
-    process.env.OPENCLAUDE_SECONDARY_MODEL?.trim() || DEFAULT_SECONDARY_UTILITY_MODEL
-  return { ANTHROPIC_SMALL_FAST_MODEL: model }
+  return { ANTHROPIC_SMALL_FAST_MODEL: resolveSecondaryUtilityModel() }
 }
 
 export const CCB_SUBAGENT_MODEL_ENV = 'CLAUDE_CODE_SUBAGENT_MODEL'
@@ -727,7 +772,14 @@ export interface SubprocessRunnerOpts {
     poolGeneration: string
     accountId: string
     keyFingerprint: string
+    /** 0257 — `session` slots carry a Cursor account session token (Sand-only). */
+    credentialKind: 'api_key' | 'session'
+    machineId: string | null
   }
+  /** Agent-loop implementation. Omitted is the established CCB path. The
+   * official CLI lane is intentionally limited to Cursor Sand's loopback
+   * relay; generic CCB/provider migration is outside this switch. */
+  harness?: 'ccb' | 'official-cc'
   permissionMode?: string
   resumeSessionId?: string // 续上之前的 CCB session
   // Per-agent overrides
@@ -833,6 +885,8 @@ export interface SdkMessage {
     usage?: { input_tokens?: number; output_tokens?: number }
   }
   result?: string
+  stop_reason?: string | null
+  terminal_reason?: string
   total_cost_usd?: number
   duration_ms?: number
   is_error?: boolean
@@ -855,6 +909,29 @@ export type PermissionResponse =
  * inherit the same permission context / filtered pool.
  */
 export const CCB_PLATFORM_DISALLOWED_TOOLS = ['SendMessage'] as const
+
+/** Official Claude Code has its own cron scheduler. OpenClaude's gateway cron
+ * is the only scheduling authority, so the initial official-CC lane removes
+ * both the black-hole team mailbox and the duplicate scheduler surface. */
+export const OFFICIAL_CC_PLATFORM_DISALLOWED_TOOLS = [
+  'SendMessage',
+  'CronList',
+  'CronCreate',
+  'CronDelete',
+  'ScheduleWakeup',
+] as const
+
+const OFFICIAL_CC_CURSOR_SAND_LOOPBACK_RE = /^http:\/\/127\.0\.0\.1:\d+\/route\/[0-9a-f]{64}$/
+
+/** The stock CLI is allowed only behind the capability-scoped Cursor Sand
+ * loopback relay. Keep this pure seam exported so the fail-closed binding is
+ * regression-testable without spawning a real CLI. */
+export function isOfficialClaudeCursorSandLoopbackEnv(
+  env: Readonly<Record<string, string | undefined>>,
+): boolean {
+  return OFFICIAL_CC_CURSOR_SAND_LOOPBACK_RE.test(env.ANTHROPIC_BASE_URL ?? '')
+    && env.ANTHROPIC_AUTH_TOKEN === 'cursor-sand-loopback'
+}
 
 /**
  * Inputs for `buildCcbCliArgs`. Everything that influences the subprocess's
@@ -990,6 +1067,48 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
   return args
 }
 
+export interface OfficialClaudeCliArgsInput {
+  model?: string
+  permissionMode?: string
+  extraPromptFile?: string
+  mcpConfigFile?: string
+  settingsFile?: string
+  addDir?: string
+  resumeSessionId?: string | null
+  restrictedMemorySources?: boolean
+}
+
+/** Build argv for the stock `@anthropic-ai/claude-code` binary. Keep this
+ * separate from buildCcbCliArgs: CCB-only flags (`--workload`, `--bare`,
+ * `--json-schema`) and its trailing prompt placeholder must never leak into
+ * the official CLI. `--add-dir` is last because official CC declares it as a
+ * variadic option and would otherwise consume later tokens as directories. */
+export function buildOfficialClaudeCliArgs(input: OfficialClaudeCliArgsInput): string[] {
+  const args = [
+    '-p',
+    '--input-format=stream-json',
+    '--output-format=stream-json',
+    '--include-partial-messages',
+    '--verbose',
+  ]
+  if (input.model) args.push('--model', input.model)
+  if (input.permissionMode) {
+    args.push('--permission-mode', input.permissionMode)
+    if (input.permissionMode === 'bypassPermissions') {
+      args.push('--dangerously-skip-permissions')
+    }
+  }
+  args.push('--disallowedTools', ...OFFICIAL_CC_PLATFORM_DISALLOWED_TOOLS)
+  args.push('--permission-prompt-tool', 'stdio')
+  if (input.settingsFile) args.push('--settings', input.settingsFile)
+  if (input.extraPromptFile) args.push('--append-system-prompt-file', input.extraPromptFile)
+  if (input.mcpConfigFile) args.push('--mcp-config', input.mcpConfigFile)
+  if (input.resumeSessionId) args.push('--resume', input.resumeSessionId)
+  if (input.restrictedMemorySources) args.push('--setting-sources', 'user')
+  if (input.addDir) args.push('--add-dir', input.addDir)
+  return args
+}
+
 // Stderr is operational logging, not paid model output, so retain a bounded
 // single-line guard for a wedged/corrupt child. Stdout is intentionally NOT
 // capped: every valid stream-json line may contain model-authored text or a
@@ -1054,6 +1173,10 @@ export class SubprocessRunner extends EventEmitter {
   /** Stable path inherited by MCP + Bash; contents are re-minted every turn. */
   private delegateContextFile: string | null = null
   private platformGoal: GoalStateSnapshot | null = null
+  /** Exact stock-CLI abort result observed for the current process. Official
+   * Claude Code exits 1 after emitting it; that is an expected recycle, not a
+   * process crash. Reset on every spawn. */
+  private officialAbortResultObserved = false
   /** Timestamp of last stdout activity — used for liveness detection */
   public lastActivityAt: number = Date.now()
 
@@ -1208,6 +1331,7 @@ export class SubprocessRunner extends EventEmitter {
 
     this.starting = true
     this.closed = false
+    this.officialAbortResultObserved = false
     this.overflowKilled = false
     this.stdoutBuf = ''
     this.stderrBufBytes = 0
@@ -1219,27 +1343,51 @@ export class SubprocessRunner extends EventEmitter {
     // retry immediately and re-throw, burning CPU.
     try {
     const { config } = this.opts
-    let ccbDir: string
-    try {
-      ccbDir = resolve(config.auth.claudeCodePath)
-    } catch (err) {
-      this.starting = false
-      throw err
+    const harness = this.opts.harness ?? 'ccb'
+    let binaryDir: string
+    let command: string
+    let ccbEntry: string | undefined
+    let ccbRuntime: string | undefined
+    if (harness === 'official-cc') {
+      if (
+        this.opts.authorityEngine !== 'cursor'
+        || !this.opts.providerEnvOverride
+        || this.opts.hermeticNoTools
+        || this.opts.executionTarget?.kind === 'remote'
+      ) {
+        this.starting = false
+        throw new Error('OFFICIAL_CC_REQUIRES_LOCAL_CURSOR_SAND_LOOPBACK')
+      }
+      command = process.env.OPENCLAUDE_OFFICIAL_CLAUDE_PATH?.trim() || '/usr/local/bin/claude'
+      if (!isAbsolute(command)) {
+        this.starting = false
+        throw new Error('Official Claude Code binary path must be absolute')
+      }
+      if (!existsSync(command)) {
+        this.starting = false
+        throw new Error(`Official Claude Code binary not found: ${command}`)
+      }
+      binaryDir = dirname(command)
+    } else {
+      try {
+        binaryDir = resolve(config.auth.claudeCodePath)
+      } catch (err) {
+        this.starting = false
+        throw err
+      }
+      if (!existsSync(binaryDir)) {
+        this.starting = false
+        throw new Error(
+          `Claude Code path not found: ${binaryDir}. Set auth.claudeCodePath in ~/.openclaude/openclaude.json`,
+        )
+      }
+      const entryRaw = config.auth.claudeCodeEntry ?? 'src/entrypoints/cli.tsx'
+      // Phase 5:子进程 cwd 即将切到 effectiveAddDir(repo workspaceDir 或 agentBaseDir),
+      // 不再是 ccbBinaryDir。entry 若是相对路径,相对于 CCB binary dir 解析。
+      ccbEntry = isAbsolute(entryRaw) ? entryRaw : resolve(binaryDir, entryRaw)
+      ccbRuntime = config.auth.claudeCodeRuntime ?? 'bun'
+      command = ccbRuntime
     }
-    if (!existsSync(ccbDir)) {
-      this.starting = false
-      throw new Error(
-        `Claude Code path not found: ${ccbDir}. Set auth.claudeCodePath in ~/.openclaude/openclaude.json`,
-      )
-    }
-    const entryRaw = config.auth.claudeCodeEntry ?? 'src/entrypoints/cli.tsx'
-    // Phase 5:子进程 cwd 即将切到 effectiveAddDir(repo workspaceDir 或 agentBaseDir),
-    // 不再是 ccbBinaryDir。entry 若是相对路径(默认 'src/entrypoints/cli.tsx'),
-    // 在新 cwd 下会找不到文件。这里相对于 ccbBinaryDir 解析成绝对路径,无论
-    // 是 'bun run /abs/cli.tsx' 还是 'node --experimental-strip-types /abs/cli.tsx'
-    // 都能正确加载。已经是绝对路径(用户在 openclaude.json 自定义)的就直传。
-    const entry = isAbsolute(entryRaw) ? entryRaw : resolve(ccbDir, entryRaw)
-    const runtime = config.auth.claudeCodeRuntime ?? 'bun'
 
     // ─── Phase 5: read repo snapshot ONCE before learning context + spawn args ──
     // ready 时切到 repo workspaceDir,其它情况(null / cloning / failed)fall-back agentBaseDir。
@@ -1288,23 +1436,35 @@ export class SubprocessRunner extends EventEmitter {
       throw err
     }
 
-    const args = buildCcbCliArgs({
-      runtime,
-      entry,
-      model: this.opts.model,
-      permissionMode: this.opts.permissionMode,
-      extraPromptFile: learningContext.extraPromptFile,
-      mcpConfigFile: learningContext.mcpConfigFile,
-      addDir: effectiveAddDir,
-      resumeSessionId: this.currentSessionId,
-      // v3 商业版用户容器判定 —— 双信号 OR 兜底,单一权威已收口
-      // hostStaticProviders.isV3ContainerRuntime(注释/语义见该函数 JSDoc)。
-      restrictedMemorySources: isV3ContainerRuntime(),
-      workload: this.opts.workload,
-      hermeticNoTools: this.opts.hermeticNoTools,
-      settingsFile: learningContext.settingsFile,
-      structuredOutputSchema: this.opts.structuredOutputSchema,
-    })
+    const restrictedMemorySources = isV3ContainerRuntime()
+    const args = harness === 'official-cc'
+      ? buildOfficialClaudeCliArgs({
+          model: this.opts.model,
+          permissionMode: this.opts.permissionMode,
+          extraPromptFile: learningContext.extraPromptFile,
+          mcpConfigFile: learningContext.mcpConfigFile,
+          settingsFile: learningContext.settingsFile,
+          addDir: effectiveAddDir,
+          resumeSessionId: this.currentSessionId,
+          restrictedMemorySources,
+        })
+      : buildCcbCliArgs({
+          runtime: ccbRuntime!,
+          entry: ccbEntry!,
+          model: this.opts.model,
+          permissionMode: this.opts.permissionMode,
+          extraPromptFile: learningContext.extraPromptFile,
+          mcpConfigFile: learningContext.mcpConfigFile,
+          addDir: effectiveAddDir,
+          resumeSessionId: this.currentSessionId,
+          // v3 商业版用户容器判定 —— 双信号 OR 兜底,单一权威已收口
+          // hostStaticProviders.isV3ContainerRuntime(注释/语义见该函数 JSDoc)。
+          restrictedMemorySources,
+          workload: this.opts.workload,
+          hermeticNoTools: this.opts.hermeticNoTools,
+          settingsFile: learningContext.settingsFile,
+          structuredOutputSchema: this.opts.structuredOutputSchema,
+        })
 
     // ── Provider-aware auth injection ──
     // CCB auth priority: ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN > settings.json
@@ -1343,14 +1503,21 @@ export class SubprocessRunner extends EventEmitter {
     if (this.opts.providerEnvOverride) {
       Object.assign(finalizedProviderEnv, this.opts.providerEnvOverride)
     }
+    if (harness === 'official-cc') {
+      if (!isOfficialClaudeCursorSandLoopbackEnv(finalizedProviderEnv)) {
+        this.starting = false
+        this._boundRepoBinding = null
+        throw new Error('OFFICIAL_CC_CURSOR_SAND_LOOPBACK_BINDING_INVALID')
+      }
+    }
 
     let proc: ReturnType<TerminalBackend['spawn']>
     try {
       const backend: TerminalBackend = createBackend(this.opts.config.terminal)
       proc = backend.spawn({
-        command: runtime,
-        args,
-        ccbBinaryDir: ccbDir,
+          command,
+          args,
+          ccbBinaryDir: binaryDir,
         // Docker /workspace mount + Local --add-dir 内容统一用 effectiveAddDir;
         // ready 时是 repo workspaceDir,其它情况 = agentBaseDir。
         workspaceHostDir: learningContext.workingDir ?? effectiveAddDir,
@@ -1380,7 +1547,7 @@ export class SubprocessRunner extends EventEmitter {
           // sdkEventQueue → gateway ccbMessageParser → web tool_output_tail
           // block), so the model can pick run_in_background:true again.
           IS_SANDBOX: '1',
-          FEATURE_VERIFICATION_AGENT: '1',
+          ...(harness === 'ccb' ? { FEATURE_VERIFICATION_AGENT: '1' } : {}),
           // 禁用 CCB 自带 Kairos cron 工具(CronList/CronCreate/CronDelete)。它们操作
           // CCB 进程内的第二调度器(内存/scheduled_tasks.json),与 gateway cron.yaml
           // (管理中心/create_reminder 的权威源)天然分裂:面板建的任务 CronList 看不到,
@@ -1388,6 +1555,9 @@ export class SubprocessRunner extends EventEmitter {
           // agent 侧读写走 openclaude-memory MCP 的 reminder 工具族(list/create/
           // update/delete,同一 /api/cron)。
           CLAUDE_CODE_DISABLE_CRON: '1',
+          ...(harness === 'official-cc'
+            ? { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' }
+            : {}),
           // memdir 范式:平台记忆的唯一权威是 MEMORY.md 索引 + memory/<slug>.md 文件,
           // 由模型用原生 Write/Edit 直写(指令常驻在 # Memory 段)。CCB 自带的
           // 「自动记忆」写入器会另起一份私有 memory store,与平台记忆分裂 → 关掉它。
@@ -1404,7 +1574,9 @@ export class SubprocessRunner extends EventEmitter {
           // delegate 计费归因 → CCB metadata.user_id JSON(仅 delegate 会话非空;
           // 空串 = 未设置,同 trace env 的"覆盖继承"语义)。见
           // `_buildCcbUsageAttributionEnv` JSDoc。
-          ..._buildCcbUsageAttributionEnv(this.opts.usageAttribution),
+          ...(harness === 'ccb'
+            ? _buildCcbUsageAttributionEnv(this.opts.usageAttribution)
+            : { CLAUDE_CODE_EXTRA_METADATA: '' }),
           // V3 S12e CG8 — contract C 段 trace env(best-effort,放最末永远覆盖
           // process.env 继承)。空串 = "本 spawn 无 trace stash",见
           // `_buildCcbSpawnTraceEnv` JSDoc。
@@ -1524,7 +1696,13 @@ export class SubprocessRunner extends EventEmitter {
       // graceful shutdown from crash. Exit code alone is unreliable:
       // - SIGSEGV/SIGKILL → code=null but NOT graceful
       // - CCB may exit with non-0 code on normal termination
-      const crashed = !this.shuttingDown
+      const expectedOfficialAbortExit = _isExpectedOfficialClaudeAbortExit({
+        harness: this.opts.harness ?? 'ccb',
+        code,
+        signal,
+        abortResultObserved: this.officialAbortResultObserved,
+      })
+      const crashed = !this.shuttingDown && !expectedOfficialAbortExit
       if (crashed) {
         this._recordCrash()
       } else {
@@ -1662,6 +1840,9 @@ export class SubprocessRunner extends EventEmitter {
               this.emit('telemetry', telemetryMsg)
             }
           } else {
+            if (this.opts.harness === 'official-cc' && _isOfficialClaudeAbortResult(msg)) {
+              this.officialAbortResultObserved = true
+            }
             // Always update session ID (CCB may report a new one after --resume)
             if (msg.session_id && msg.session_id !== this.currentSessionId) {
               this.currentSessionId = msg.session_id
@@ -1747,21 +1928,23 @@ export class SubprocessRunner extends EventEmitter {
     this.currentExecutionDescriptorEnv = runtime.descriptor
       ? JSON.stringify(runtime.descriptor)
       : ''
-    const envUpdateLine = _buildUpdateEnvStdinLine(
-      {
-        ..._buildAnthropicCustomHeadersEnv(runtime.headers),
-        ..._buildCcbUsageAttributionEnv(this.opts.usageAttribution, turnKey),
-        [MODEL_EXECUTION_DESCRIPTOR_ENV]: this.currentExecutionDescriptorEnv,
-        // SessionManager owns the one global 1..10 retry budget. CCB's native
-        // withRetry loop is per API call, so leaving it enabled can exceed the
-        // remaining turn budget after tools or a browser recovery hop. Disable
-        // it for this user turn; the outer safety-gated loop performs retries.
-        CLAUDE_CODE_MAX_RETRIES: '0',
-      },
-    )
+    const harness = this.opts.harness ?? 'ccb'
+    const envUpdateLine = harness === 'ccb'
+      ? _buildUpdateEnvStdinLine(
+          {
+            ..._buildAnthropicCustomHeadersEnv(runtime.headers),
+            ..._buildCcbUsageAttributionEnv(this.opts.usageAttribution, turnKey),
+            [MODEL_EXECUTION_DESCRIPTOR_ENV]: this.currentExecutionDescriptorEnv,
+            // SessionManager owns the one global 1..10 retry budget. CCB's native
+            // withRetry loop is per API call, so leaving it enabled can exceed the
+            // remaining turn budget after tools or a browser recovery hop.
+            CLAUDE_CODE_MAX_RETRIES: '0',
+          },
+        )
+      : null
 
     if (!this.proc) await this.start()
-    if (!this.proc) throw new Error('failed to start CCB subprocess')
+    if (!this.proc) throw new Error('failed to start agent subprocess')
     this.refreshDelegateContext()
     const content = ccbStdinUserContent(userTextOrBlocks)
     const userMsg = {
@@ -1772,9 +1955,13 @@ export class SubprocessRunner extends EventEmitter {
       },
     }
     // Writable.write 的失败大多经 callback 异步报告，try/catch 只能抓同步 throw。
-    // 两行都必须逐一等 callback：env 写失败不能继续写 user；user 写失败也必须 reject。
-    // 任一失败都销毁进程，避免它保留“env 已更新但 user 未收到”或旧 header 的半态。
-    await this.writeTurnLineOrDestroy(envUpdateLine, 'authority_env')
+    // CCB 两行逐一等 callback。Official CC 2.1.259 does not implement CCB's
+    // private update_environment_variables control line; its only allowed
+    // deployment is the credential-bound Cursor loopback relay, which does not
+    // consume the authority headers. We still resolved runtime above on every
+    // turn (fail-closed), but do not pretend descriptor/headers/attribution are
+    // hot-updated in the stock process.
+    if (envUpdateLine) await this.writeTurnLineOrDestroy(envUpdateLine, 'authority_env')
     await this.writeTurnLineOrDestroy(`${JSON.stringify(userMsg)}\n`, 'user_message')
   }
 
@@ -1784,6 +1971,21 @@ export class SubprocessRunner extends EventEmitter {
    * live query and every subsequent `/v1/messages` call reads the new header.
    */
   async updateTurnLease(leaseEnvelope: string): Promise<void> {
+    if ((this.opts.harness ?? 'ccb') === 'official-cc') {
+      if (
+        this.opts.authorityEngine !== 'cursor'
+        || !this.opts.providerEnvOverride
+        || !isOfficialClaudeCursorSandLoopbackEnv(this.opts.providerEnvOverride)
+      ) {
+        throw new Error('OFFICIAL_CC_LEASE_NOOP_OUTSIDE_CURSOR_SAND')
+      }
+      // CcbAdapter still renews the master lease to prove control-plane
+      // liveness. The stock CLI cannot hot-apply env changes, and the bound
+      // loopback Cursor relay does not consume this header, so there is no
+      // subprocess write in this narrowly-scoped lane.
+      void leaseEnvelope
+      return
+    }
     const envUpdateLine = _buildUpdateEnvStdinLine(
       _buildAnthropicCustomHeadersEnv({ lease: leaseEnvelope }),
     )

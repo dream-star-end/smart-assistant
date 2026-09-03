@@ -774,6 +774,62 @@ export function findCursorEngineModel(
   )
 }
 
+// ── Cursor Opus/Fable turn-level context tier ────────────────────────────────
+// Upstream Cursor Opus 5 / Opus 4.8 / Fable 5 / Fable 5.1 SKUs run a 1M
+// context window. The platform exposes two execution tiers per turn without
+// minting new canonical ids: the tier only narrows the signed
+// executionDescriptor.contextWindow the master hands to the CCB harness
+// (auto-compact threshold), so switching tiers never recycles the CCB process
+// or changes the Cursor Sand resume id. Catalog context_window for these rows
+// must be the mechanism ceiling (1,000,000); `300k` is the product default
+// because compaction at ~267k keeps per-turn input cost bounded.
+export const CURSOR_CONTEXT_TIERS = ['300k', '1m'] as const
+export type CursorContextTier = (typeof CURSOR_CONTEXT_TIERS)[number]
+export const DEFAULT_CURSOR_CONTEXT_TIER: CursorContextTier = '300k'
+export const CURSOR_CONTEXT_TIER_WINDOW: Readonly<Record<CursorContextTier, number>> = {
+  '300k': 300_000,
+  '1m': 1_000_000,
+}
+export const CURSOR_CONTEXT_TIER_FAMILIES: readonly CursorEngineFamilyId[] = [
+  'opus-5',
+  'opus-4.8',
+  'fable-5',
+  'fable-5.1',
+]
+
+export function isCursorContextTier(value: unknown): value is CursorContextTier {
+  return typeof value === 'string' &&
+    (CURSOR_CONTEXT_TIERS as readonly string[]).includes(value)
+}
+
+export function cursorFamilySupportsContextTier(family: CursorEngineFamilyId): boolean {
+  return CURSOR_CONTEXT_TIER_FAMILIES.includes(family)
+}
+
+/** True when the canonical id belongs to a Cursor family that offers the
+ * 300k/1M tier choice. Any other model ignores `contextTier` entirely. */
+export function cursorModelSupportsContextTier(modelId: string | null | undefined): boolean {
+  const model = cursorModelById(modelId)
+  return model !== undefined && cursorFamilySupportsContextTier(model.family)
+}
+
+/**
+ * Pure projection shared by every consumer that narrows an execution window by
+ * tier. `contextWindow` is the catalog mechanism ceiling (null = no window
+ * semantics → passthrough). Non-tier models or unknown tiers return the input
+ * unchanged; the tier can only narrow (min), never widen past the ceiling.
+ */
+export function projectContextWindowForCursorTier(
+  modelId: string | null | undefined,
+  contextWindow: number | null,
+  tier: CursorContextTier | null | undefined,
+): number | null {
+  if (contextWindow === null) return contextWindow
+  if (!cursorModelSupportsContextTier(modelId)) return contextWindow
+  const effective = tier ?? DEFAULT_CURSOR_CONTEXT_TIER
+  return Math.min(contextWindow, CURSOR_CONTEXT_TIER_WINDOW[effective])
+}
+
 /** codex seed agent(id='codex')的固定模型 —— entrypoint desiredCodexAgent 同值。 */
 export const DEFAULT_CODEX_ENGINE_MODEL: CodexEngineModelId = CODEX_ENGINE_MODELS[0].id
 export const DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME: string =

@@ -94,6 +94,24 @@ interface MemoryBatchJournal {
   entries: Array<{ file: string; original: string | null }>
 }
 
+export interface MemorySharedBarrierOptions {
+  /** Complete wait budget across every flock contention attempt. */
+  totalBudgetMs?: number
+  /** Maximum wait delegated to one flock child before retrying. */
+  perAttemptMs?: number
+  /** Small bounded pause between contention retries. */
+  retryDelayMs?: number
+}
+
+export class MemoryBarrierTimeoutError extends Error {
+  readonly code = 'MEMORY_BARRIER_TIMEOUT'
+
+  constructor(message: string, readonly lastError?: unknown) {
+    super(message)
+    this.name = 'MemoryBarrierTimeoutError'
+  }
+}
+
 /** sha256 前 16 位十六进制:内容指纹,用于乐观并发 version。空串也可算(确定值)。 */
 function sha16(s: string): string {
   return createHash('sha256').update(s).digest('hex').slice(0, 16)
@@ -182,24 +200,57 @@ export class MemoryDir {
    * A journal observed before/after acquisition is recovered under an exclusive
    * barrier first; once shared is held, no Auto-Dream batch can begin.
    */
-  async acquireSharedBarrier(timeoutMs = 5_000): Promise<KernelFileLock> {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (await this.batchJournalExists()) {
-        await this.recoverBatchWithExclusiveBarrier(timeoutMs)
-        continue
+  async acquireSharedBarrier(options: MemorySharedBarrierOptions = {}): Promise<KernelFileLock> {
+    const totalBudgetMs = Math.max(1, options.totalBudgetMs ?? 15_000)
+    const perAttemptMs = Math.max(1, options.perAttemptMs ?? 5_000)
+    const retryDelayMs = Math.max(0, options.retryDelayMs ?? 50)
+    const deadline = Date.now() + totalBudgetMs
+    let quiesceAttempts = 0
+    let lastError: unknown
+
+    while (quiesceAttempts < 3) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) {
+        throw new MemoryBarrierTimeoutError(
+          `memory shared barrier timed out after ${totalBudgetMs}ms`,
+          lastError,
+        )
       }
-      const barrier = await acquireKernelFileLock(
-        paths.agentMemoryBarrier(this.agentId),
-        timeoutMs,
-        'shared',
-      )
+      const attemptBudget = Math.min(perAttemptMs, remaining)
       try {
-        if (!(await this.batchJournalExists())) return barrier
-      } catch (err) {
+        if (await this.batchJournalExists()) {
+          await this.recoverBatchWithExclusiveBarrier(attemptBudget)
+          quiesceAttempts++
+          continue
+        }
+        const barrier = await acquireKernelFileLock(
+          paths.agentMemoryBarrier(this.agentId),
+          attemptBudget,
+          'shared',
+        )
+        try {
+          if (!(await this.batchJournalExists())) return barrier
+        } catch (err) {
+          await barrier.release().catch(() => {})
+          throw err
+        }
         await barrier.release().catch(() => {})
-        throw err
+        quiesceAttempts++
+      } catch (err) {
+        lastError = err
+        const afterAttempt = deadline - Date.now()
+        if (afterAttempt <= 0) {
+          throw new MemoryBarrierTimeoutError(
+            `memory shared barrier timed out after ${totalBudgetMs}ms`,
+            err,
+          )
+        }
+        if (retryDelayMs > 0) {
+          await new Promise<void>((resolve) =>
+            setTimeout(resolve, Math.min(retryDelayMs, afterAttempt)),
+          )
+        }
       }
-      await barrier.release().catch(() => {})
     }
     throw new Error('memory batch recovery did not quiesce')
   }

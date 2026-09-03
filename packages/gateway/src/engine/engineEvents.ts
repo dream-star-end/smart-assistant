@@ -344,6 +344,10 @@ export interface TurnSummary {
   tools: TurnToolEntry[]
   runtimeEvents: DurableRuntimeEvent[]
   stopReason: string | null
+  /** Harness-specific terminal discriminator when the stock CLI reports one
+   * outside Anthropic's message.stop_reason field (for example official
+   * Claude Code's `aborted_streaming`). */
+  terminalReason?: string
   numTurns: number | null
   isError: boolean
   /** Source-engine native compact text, captured only for an explicit compact turn. */

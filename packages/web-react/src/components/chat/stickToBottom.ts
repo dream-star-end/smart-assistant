@@ -33,12 +33,16 @@ export function isNearBottom(el: StickScroller, px: number = STICK_TO_BOTTOM_PX)
  * last observation and the viewport is within 80px of the bottom. A shrink-clamp
  * that lands near the bottom is not re-follow.
  *
- * A marked user scroll leaves as soon as `current < expected`. The 1px write
+ * A transient input mark guards the next scroll event. A direct manipulation
+ * (touch drag or a held scrollbar thumb) survives every intermediate scroll
+ * event until release and blocks both bottom pinning and viewport corrections.
+ * A marked user scroll leaves as soon as `current < expected`; the 1px write
  * tolerance is only for unmarked clamp / subpixel noise.
  */
 export function createStickToBottomController() {
   const following = { current: true };
   const writeSuspended = { current: false };
+  const directManipulation = { current: false };
   const lastWrittenTop = { current: null as number | null };
   const lastObservedTop = { current: null as number | null };
 
@@ -61,6 +65,7 @@ export function createStickToBottomController() {
   const reset = () => {
     following.current = true;
     writeSuspended.current = false;
+    directManipulation.current = false;
     lastWrittenTop.current = null;
     lastObservedTop.current = null;
   };
@@ -73,8 +78,16 @@ export function createStickToBottomController() {
     writeSuspended.current = false;
   };
 
+  const beginDirectManipulation = () => {
+    directManipulation.current = true;
+  };
+
+  const endDirectManipulation = () => {
+    directManipulation.current = false;
+  };
+
   const scrollToBottom = (el: StickScroller) => {
-    if (!following.current || writeSuspended.current) return;
+    if (!following.current || writeSuspended.current || directManipulation.current) return;
     if (userMovedAboveWrite(el)) {
       following.current = false;
       return;
@@ -84,12 +97,13 @@ export function createStickToBottomController() {
   };
 
   const correctTo = (el: StickScroller, nextTop: number) => {
+    if (directManipulation.current) return;
     el.scrollTop = nextTop;
     recordWrite(el);
   };
 
   const onScroll = (el: StickScroller) => {
-    const hadUserIntent = writeSuspended.current;
+    const hadUserIntent = writeSuspended.current || directManipulation.current;
     writeSuspended.current = false;
     const current = el.scrollTop;
     const maxTop = maxScrollTop(el);
@@ -130,7 +144,9 @@ export function createStickToBottomController() {
 
   const canRestick = {
     get current() {
-      return following.current && !writeSuspended.current;
+      return following.current &&
+        !writeSuspended.current &&
+        !directManipulation.current;
     },
     set current(value: boolean) {
       following.current = value;
@@ -146,6 +162,9 @@ export function createStickToBottomController() {
     reset,
     markUserIntent,
     releaseUserIntent,
+    directManipulation,
+    beginDirectManipulation,
+    endDirectManipulation,
     scrollToBottom,
     correctTo,
     onScroll,

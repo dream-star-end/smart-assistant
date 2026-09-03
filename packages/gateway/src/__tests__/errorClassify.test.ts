@@ -35,7 +35,7 @@ describe('classifyRunError', () => {
       '402 INSUFFICIENT_CREDITS: insufficient credits: balance=10 required=500',
     )
     assert.equal(r.code, 'insufficient_credits')
-    assert.equal(r.message, '余额不足，请充值后继续')
+    assert.equal(r.message, '积分已耗尽，请充值')
   })
 
   it('insufficient_credits: 大小写无关', () => {
@@ -189,7 +189,7 @@ describe('classifyRunError', () => {
   it('classifiedMessageForCode 与 PATTERNS 同源(无平行文案表)', () => {
     assert.equal(classifiedMessageForCode('model_capacity'), '模型繁忙，请稍后重试或切换模型')
     assert.equal(classifiedMessageForCode('rate_limited'), '当前账号被限流，请稍后再试')
-    assert.equal(classifiedMessageForCode('insufficient_credits'), '余额不足，请充值后继续')
+    assert.equal(classifiedMessageForCode('insufficient_credits'), '积分已耗尽，请充值')
     // 不绑定具体厂商(E7):同一分类被 CCB/Codex/多提供商路径共用。
     assert.equal(classifiedMessageForCode('upstream_failed'), '模型服务上游暂时异常，请稍后重试')
     assert.equal(classifiedMessageForCode('auth_error'), '模型服务认证失败，请重新登录或检查凭据后重试')
@@ -224,7 +224,7 @@ describe('classifyRunError', () => {
     )
     assert.ok(r)
     assert.equal(r.code, 'insufficient_credits')
-    assert.equal(r.message, '余额不足，请充值后继续')
+    assert.equal(r.message, '积分已耗尽，请充值')
   })
 
   it('delegate output: API Error 400 BAD_BODY is treated as bad_request', () => {

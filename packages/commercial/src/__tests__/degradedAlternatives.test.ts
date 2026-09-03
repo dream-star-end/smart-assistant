@@ -102,6 +102,7 @@ function gateWith(s: ModelCatalogSnapshot): ModelAuthorityDecision {
     claimedProjectionRevision: null,
     securityEpoch: s.securityEpoch,
     authorityTurnId: null,
+    authorityCanonicalModel: null,
     turnLeaseIssuedAtMs: null,
     turnLeaseVerifiedAtMs: null,
   };

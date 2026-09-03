@@ -1117,7 +1117,12 @@ export function makeAnthropicProxyHandler(
             requestId,
             userId: uid,
             model: body.model,
-            canonicalModel: gate.canonicalModel,
+            // 身份比对必须用票据里 master 签发的 turn 主模型,而不是本请求 body.model 的归一值:
+            // 同一 turn 的 aux 请求(CCB SMALL_FAST / cursor 主模型下子 agent 钉的次级模型)
+            // 请求模型 != authority_turn_dispatches.canonical_model,拿请求模型比会把它们
+            // 全判成 identity conflict → 409(2026-09-03 cursor 子 agent 全灭)。
+            // 是否真给 sponsorship 仍由 `model` 与 turn 主模型是否一致决定(aux → ineligible)。
+            canonicalModel: gate.authorityCanonicalModel ?? gate.canonicalModel,
             authorityTurnId: gate.authorityTurnId,
           });
           if (leaseAdmission.kind === "conflict") {

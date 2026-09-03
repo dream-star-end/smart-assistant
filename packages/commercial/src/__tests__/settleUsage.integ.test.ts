@@ -1237,6 +1237,35 @@ describe("settleUsageAndLedger (integ)", () => {
     });
     assert.equal(conflict.kind, "conflict");
 
+    // 同一 turn 的 aux 请求(CCB SMALL_FAST / cursor 子 agent 钉的次级模型):请求模型 != turn 主模型。
+    // 调用方(proxy)必须把票据里的 turn 主模型作 canonicalModel 传入 —— 身份匹配、回收 dispatch
+    // 身份,但因请求模型不是 turn 主模型而 ineligible(不给 sponsorship),**绝不能**是 conflict。
+    const aux = await resolveAuthorityTurnDispatchSponsorship(getPool(), {
+      requestId: "lease-aux",
+      userId: turn.uid,
+      model: "gpt-5.6-luna",
+      canonicalModel: "deepseek-v4-flash",
+      authorityTurnId: turn.binding.authorityTurnId,
+    });
+    assert.equal(aux.kind, "ineligible");
+    if (aux.kind === "ineligible") {
+      assert.equal(aux.dispatchIdentity.dispatchId, turn.dispatchId);
+      assert.equal(aux.dispatchIdentity.sessionId, turn.sessionId);
+    }
+    // 反例:拿请求模型当 canonicalModel 比对(2026-09-03 之前 proxy 的写法)会被判成身份冲突 → 409。
+    const auxAsCanonical = await resolveAuthorityTurnDispatchSponsorship(getPool(), {
+      requestId: "lease-aux-wrong-canonical",
+      userId: turn.uid,
+      model: "gpt-5.6-luna",
+      canonicalModel: "gpt-5.6-luna",
+      authorityTurnId: turn.binding.authorityTurnId,
+    });
+    assert.equal(auxAsCanonical.kind, "conflict");
+    const auxSponsored = await query<{ count: string }>(
+      "SELECT count(*)::text FROM verification_sponsored_requests WHERE request_id IN ('lease-aux','lease-aux-wrong-canonical')",
+    );
+    assert.equal(auxSponsored.rows[0].count, "0");
+
     await query(
       "UPDATE verification_runs SET status='failed',closed_at=NOW() WHERE id=$1",
       [turn.runId],

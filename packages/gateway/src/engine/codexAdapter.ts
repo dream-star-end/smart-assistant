@@ -554,10 +554,9 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   }
 
   interrupt(): boolean {
-    // 只撤 InlinePush 资格(writeDelegateTerminal 先查 _interrupting),不清 _activeTurn:
-    // codex 是 engine-reported 计费,interrupted 终态的 result 帧仍要经 `_activeTurn === turn`
-    // 门 emit billing(上游已烧的 token 必须入账),usage/call_usage 与 getPartialSnapshot
-    // 也依赖它路由到收尾。终态由 parser.finalized / 下一次 submitTurn 自然收口。
+    // Keep the active turn routed until the interrupted terminal result.
+    // `_interrupting` already revokes InlinePush eligibility; clearing
+    // `_activeTurn` here would also suppress partial-usage billing.
     this._interrupting = true
     return this.kernel.interrupt()
   }

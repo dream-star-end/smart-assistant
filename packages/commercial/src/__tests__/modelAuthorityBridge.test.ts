@@ -15,6 +15,7 @@
 import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as http from "node:http";
+import { readFile } from "node:fs/promises";
 import { WebSocket, WebSocketServer } from "ws";
 
 import {
@@ -26,10 +27,13 @@ import {
   assertLeaseMatchesAuthority,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
+  projectContextWindowForCursorTier,
+  type ModelAuthorityEngine,
 } from "@openclaude/protocol";
 
 import {
   CONTAINER_ATTEST_FRAME_TYPE as GATEWAY_ATTEST_FRAME_TYPE,
+  DEFAULT_CCB_SUBAGENT_MODEL,
   DEFAULT_SECONDARY_UTILITY_MODEL,
   GATEWAY_CAPABILITY_SCHEMA_VERSION,
   ModelAuthorityConsumer,
@@ -45,6 +49,7 @@ import {
   CONTAINER_ATTEST_FRAME_TYPE,
   _isAuthorizedRecoveryNativeReset,
   _readDispatchDrainMs,
+  engineUsesAnthropicAuxModels,
   type BridgeModelAuthorityDeps,
   type UserChatBridgeDeps,
   type UserChatBridgeHandler,
@@ -136,10 +141,21 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
       },
     }),
   );
+  // CCB 子 agent 默认钉(glm-5.3-zai)是平台 aux 集第二成员;platformAuxModels 对所有声明
+  // 成员 fail-closed,所以夹具必须常驻它 —— 用 auxState 只演练首位成员(deepseek)的缺失/禁用。
+  entries.push(
+    entry({
+      entryId: 4,
+      modelId: DEFAULT_CCB_SUBAGENT_MODEL,
+      providerId: "zai",
+      contextWindow: 200_000,
+    }),
+  );
   const pricing = new Map([
     ["glm-5.2", price("glm-5.2")],
     ["gpt-5.6-sol", price("gpt-5.6-sol")],
     ["kimi-k3", price("kimi-k3")],
+    [DEFAULT_CCB_SUBAGENT_MODEL, price(DEFAULT_CCB_SUBAGENT_MODEL)],
   ]);
   if (auxState !== "absent") {
     entries.push(
@@ -215,6 +231,14 @@ async function startRig(opts: {
   durableDispatch?: boolean;
   /** M7 专用:容器不回 dispatch receipt，让 admitted lease 保持在 bridge drain map。 */
   holdDispatchReceipt?: boolean;
+  /** Direct real-executor tests bypass admitUserTurn but still need a receipt identity. */
+  receiptIdentity?: {
+    sessionId: string;
+    clientMessageId: string;
+    dispatchId: string;
+    attemptNo: number;
+  };
+  receiptState?: "queued" | "rejected";
   admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
   hasCompletedClientTurn?: UserChatBridgeDeps["hasCompletedClientTurn"];
@@ -222,6 +246,7 @@ async function startRig(opts: {
   loadGoalState?: (uid: bigint, sessionId: string) => Promise<unknown>;
   promptQueuePreparationTimeoutMs?: number;
   dispatchLeaseHeartbeatMs?: number;
+  deferContainerSendCompletionForTest?: (complete: () => void) => void;
   /** B3(R3):注入 mock pgPool 观察受理后 pre-forward 失败出口的 casToTerminal(需三件套齐)。 */
   pgPool?: unknown;
 }): Promise<Rig> {
@@ -401,7 +426,7 @@ async function startRig(opts: {
         let parsed: { type?: unknown } | null = null;
         try { parsed = JSON.parse(raw) as { type?: unknown }; } catch { /* non-JSON frame */ }
         if (parsed?.type === "inbound.message") {
-          const d = admittedForAuthorityBinding;
+          const d = admittedForAuthorityBinding ?? opts.receiptIdentity ?? null;
           assert.ok(d, "dispatch receipt must follow an admitted dispatch");
           ws.send(JSON.stringify({
             type: "outbound.control.turn_dispatch_receipt",
@@ -409,8 +434,8 @@ async function startRig(opts: {
             clientMessageId: d.clientMessageId,
             dispatchId: d.dispatchId,
             attemptNo: d.attemptNo,
-            state: "queued",
-            outcome: null,
+            state: opts.receiptState ?? "queued",
+            outcome: opts.receiptState === "rejected" ? "not_accepted" : null,
             ts: Date.now(),
           }));
         }
@@ -464,6 +489,9 @@ async function startRig(opts: {
       : {}),
     ...(opts.dispatchLeaseHeartbeatMs
       ? { dispatchLeaseHeartbeatMs: opts.dispatchLeaseHeartbeatMs }
+      : {}),
+    ...(opts.deferContainerSendCompletionForTest
+      ? { deferContainerSendCompletionForTest: opts.deferContainerSendCompletionForTest }
       : {}),
     // B3(R3):注入 pgPool 时必须补齐 codex 计费三件套(bridge fail-closed 校验);glm-5.2(CCB)
     // 在 goal 失败(转发前)短路,故 preCheckRedis/pricing 永不被调用,空桩即可满足类型。
@@ -667,6 +695,38 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     assert.equal(await grab("user", "glm-5.2"), 200_000);
   });
 
+  test("cursor turn:contextTier 落点 — 签发前按 turn 档位收窄 descriptor.contextWindow(300k 默认 / 1m)", async () => {
+    // 结构 guard(与角色投影同款):cursor 转发分支要 pgPool / 凭据成员 / self-host 行三件套,
+    // rig 不建;这里钉 (a) 纯函数契约(engineModels.test.ts)之外的**落点**——签发函数
+    // resolveAuthorityExecOrReject 必须在 role 投影之后再套 projectContextWindowForCursorTier,
+    // 且 cursor 分支把 frame.contextTier 传进去;(b) ensureHistory 的历史窗口用同一投影,
+    // 否则历史预算与执行窗口不一致。删掉任一处 = 1M/300k 档位静默失效。
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const resolveStart = source.indexOf("const resolveAuthorityExecOrReject = async (");
+    assert.ok(resolveStart > 0, "resolveAuthorityExecOrReject must exist");
+    const resolveBody = source.slice(resolveStart, source.indexOf("\n      return exec;\n    };", resolveStart));
+    assert.match(resolveBody, /contextTier\?: CursorContextTier \| null/);
+    assert.match(resolveBody, /const roleProjectedWindow = projectContextWindowForRole\(/);
+    assert.match(
+      resolveBody,
+      /projectContextWindowForCursorTier\(\s*exec\.canonicalModel,\s*roleProjectedWindow,\s*args\.contextTier \?\? null,?\s*\)/,
+    );
+    // cursor 分支实际把 frame 的 contextTier 交给签发函数(其它引擎分支不传 = 透传语义)。
+    assert.match(
+      source,
+      /turn: cursorTurnIdentity,\s*contextTier: isCursorContextTier\(enriched\.contextTier\) \? enriched\.contextTier : null,/,
+    );
+    // ensureHistory:历史加载窗口 = 同一 tier 投影(套在 role 投影之外)。
+    assert.match(
+      source,
+      /contextWindow = projectContextWindowForCursorTier\(\s*execution\.canonicalModel,\s*projectContextWindowForRole\([\s\S]*?\),\s*isCursorContextTier\(frameObj\.contextTier\) \? frameObj\.contextTier : null,\s*\)/,
+    );
+    // 纯函数本身在 protocol 层:默认 300k、显式 1m 保留目录上限、非 tier 模型透传。
+    assert.equal(projectContextWindowForCursorTier("cursor-fable-5.1-high", 1_000_000, null), 300_000);
+    assert.equal(projectContextWindowForCursorTier("cursor-fable-5.1-high", 1_000_000, "1m"), 1_000_000);
+    assert.equal(projectContextWindowForCursorTier("kimi-k3", 1_048_576, "300k"), 1_048_576);
+  });
+
   test("ccb turn:auxModels = 平台次级模型集合(WebFetch/WebSearch 的隐藏调用能过 egress)", async () => {
     rig.containerSeen.length = 0;
     const ws = await openClient(rig.port);
@@ -679,11 +739,30 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     const payload = verifyAuthority(bundle.authority, keyring, Date.now());
     const lease = verifyTurnLease(bundle.lease, keyring, Date.now());
     // 权威源 = gateway DEFAULT_SECONDARY_UTILITY_MODEL(容器 ANTHROPIC_SMALL_FAST_MODEL 的实际取值)
-    assert.deepEqual([...(payload.auxModels ?? [])], [DEFAULT_SECONDARY_UTILITY_MODEL]);
+    // + DEFAULT_CCB_SUBAGENT_MODEL(容器 CLAUDE_CODE_SUBAGENT_MODEL 的默认钉);platformAuxModels 排序输出。
+    const expectedAux = [DEFAULT_SECONDARY_UTILITY_MODEL, DEFAULT_CCB_SUBAGENT_MODEL].sort();
+    assert.deepEqual([...(payload.auxModels ?? [])], expectedAux);
     // lease 必须同值:WebFetch 常发生在 turn 中段,那时只有 lease 在飞
-    assert.deepEqual([...(lease.auxModels ?? [])], [DEFAULT_SECONDARY_UTILITY_MODEL]);
+    assert.deepEqual([...(lease.auxModels ?? [])], expectedAux);
     assert.doesNotThrow(() => assertLeaseMatchesAuthority(lease, payload));
     ws.close();
+  });
+
+  test("cursor turn:auxModels 与 ccb 同款(Sand relay passthrough 的子 agent 要过 egress)", async () => {
+    // 回归:曾只对 engine=ccb 签 aux。cursor-fable 父 turn 下 Agent 工具钉 deepseek-v4-flash,
+    // 经 relay passthroughMessages 打 anthropic proxy,egress modelAuthorityGate 以
+    // "authority model mismatch" 403 拒 → 子 agent 全灭。cursor 转发分支要 pgPool /
+    // 凭据成员 / self-host 行三件套,rig 不建;这里钉判定谓词 + resolveTurnExecution 用它。
+    const engines: ModelAuthorityEngine[] = ["ccb", "codex", "grok", "cursor", "zcode"];
+    assert.deepEqual(
+      engines.filter((e) => engineUsesAnthropicAuxModels(e)),
+      ["ccb", "cursor"],
+    );
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const fn = source.slice(source.indexOf("async function resolveTurnExecution("));
+    const body = fn.slice(0, fn.indexOf("\n}\n"));
+    assert.match(body, /auxModels: engineUsesAnthropicAuxModels\(descriptor\.engine\) \? platformAuxModels\(snapshot\) : \[\]/);
+    assert.doesNotMatch(body, /descriptor\.engine === "ccb" \?/);
   });
 
   test("codex turn:auxModels 为空(codex 不经 anthropic proxy → 最小权限)", async () => {
@@ -1494,14 +1573,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
     }
   });
 
-  test("R4-B1 受理 await 期间连接 cleanup → admitted 仍被接管终态化,无孤儿 lease、无转发", async () => {
-    const queries: { sql: string; params: unknown[] }[] = [];
-    const pgPool = {
-      query: async (sql: string, params: unknown[] = []) => {
-        queries.push({ sql, params });
-        return { rows: [], rowCount: 1 };
-      },
-    };
+  test("R4-B1 受理 await 期间 client detach → drain 保活并在 admission 后只转发一次", async () => {
     let dispatchId: string | null = null;
     let admitCalls = 0;
     let releaseAdmit: (() => void) | null = null;
@@ -1509,7 +1581,6 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
     const rig = await startRig({
       attest: "yes",
       durableDispatch: true,
-      pgPool,
       admitUserTurn: async (input) => {
         admitCalls++;
         dispatchId = input.dispatchId;
@@ -1528,63 +1599,29 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
         }),
       );
       await waitFor(() => admitCalls === 1);
-      // admission 挂起中,客户端断连 → bridge cleanup(cleaned=true,双 map 皆空立即 final)。
+      // admission 挂起中,客户端断连。preparation 计数必须让 bridge 进入 drain。
       ws.close();
       await new Promise((r) => setTimeout(r, 80));
-      // 现在才让 admission 提交成功返回 —— 修复前:early return 于登记前,孤儿 admitted;
-      // 修复后:先接管(登记)再判 cleaned → 立即 failDispatchPreForward 终态化。
       releaseAdmit!();
       await waitFor(() =>
-        queries.some(
-          (q) =>
-            /UPDATE turn_dispatches/.test(q.sql) &&
-            /status = 'terminal'/.test(q.sql) &&
-            q.params[0] === dispatchId &&
-            q.params[1] === "executed_error" &&
-            q.params[2] === "bridge_closed_during_admission",
-        ),
-      );
-      const casQ = queries.find((q) => q.params[2] === "bridge_closed_during_admission")!;
-      assert.equal(casQ.params[3], false, "client_notified=false(连接已死,durable 告知交 reconciler)");
-      assert.deepEqual(casQ.params[5], ["admitted"], "只允许 admitted→terminal");
-      // 绝不转发:连接死于受理期,帧不得进容器。
-      assert.equal(
-        rig.containerSeen.some((s2) => {
+        rig.containerSeen.filter((s2) => {
           try { return (JSON.parse(s2) as { type?: string }).type === "inbound.message"; }
           catch { return false; }
-        }),
-        false,
-        "cleanup 后受理成功 → 终态化而非转发",
+        }).length === 1,
       );
-      // R5 note:cleaned 命中路径不得启动 heartbeat interval(finalCleanup 已过,无人清理 = 闭包泄漏)。
-      // 行为断言:终态化后静置 >1 个心跳间隔窗口的缩影,pgPool 不再出现 lease heartbeat UPDATE。
-      const qCountAfterTerminal = queries.length;
-      await new Promise((r) => setTimeout(r, 150));
-      assert.equal(
-        queries.slice(qCountAfterTerminal).some((q) => /lease_until/.test(q.sql) && /UPDATE turn_dispatches/.test(q.sql) && !/status = 'terminal'/.test(q.sql)),
-        false,
-        "无 late heartbeat(interval 未被启动)",
-      );
+      await waitFor(() => rig.receiptCasCalls.some((call) => call.dispatchId === dispatchId));
     } finally {
       await stopRig(rig);
     }
   });
 
-  test("R4-B2 history enrichment 中 client_close → drain 前立即 admitted-only terminal，late history 永不转发", async () => {
-    const queries: { sql: string; params: unknown[] }[] = [];
-    const pgPool = {
-      query: async (sql: string, params: unknown[] = []) => {
-        queries.push({ sql, params });
-        return { rows: [], rowCount: 1 };
-      },
-    };
+  test("R4-B2 history enrichment 中 client_close → drain 等合法 history，完成后只转发一次", async () => {
     let historyStarted = false;
     let releaseHistory: ((rows: unknown[]) => void) | null = null;
     const historyGate = new Promise<unknown[]>((resolve) => { releaseHistory = resolve; });
     const rig = await startRig({
       attest: "yes",
       durableDispatch: true,
-      pgPool,
       admitUserTurn: async (input) => fakeAdmittedDispatch(input),
       loadMasterSessionMessages: async () => {
         historyStarted = true;
@@ -1600,17 +1637,12 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
         peer: { id: "sess-history-close", kind: "dm" },
       }));
       await waitFor(() => historyStarted);
-      const closedAt = Date.now();
       ws.close();
-      await waitFor(() => queries.some((q) => q.params[2] === "client_disconnected_before_enrichment_transfer"), 500);
-      assert.ok(Date.now() - closedAt < 1_000, "close 必须在 dispatch drain 前启动终态 CAS");
-      const casQ = queries.find((q) => q.params[2] === "client_disconnected_before_enrichment_transfer")!;
-      assert.deepEqual(casQ.params[5], ["admitted"]);
-      assert.equal(casQ.params[6], "1", "strict expectedEpoch");
+      await new Promise((resolve) => setTimeout(resolve, 100));
       assert.equal(rig.containerSeen.some((row) => row.includes('"type":"inbound.message"')), false);
       releaseHistory!([{ id: "old", role: "assistant", text: "late" }]);
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      assert.equal(rig.containerSeen.some((row) => row.includes('"type":"inbound.message"')), false, "late history 不得转发");
+      await waitFor(() => rig.containerSeen.filter((row) => row.includes('"type":"inbound.message"')).length === 1);
+      assert.equal(rig.receiptCasCalls.length, 1);
     } finally {
       await stopRig(rig);
     }
@@ -1641,7 +1673,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
         idempotencyKey: "web:cm-history-timeout:0",
         peer: { id: "sess-history-timeout", kind: "dm" },
       }));
-      await waitFor(() => queries.some((q) => q.params[2] === "dispatch_enrichment_timeout"), 500);
+      await waitFor(() => queries.some((q) => q.params[2] === "dispatch_enrichment_timeout"), 5_000);
       const casQ = queries.find((q) => q.params[2] === "dispatch_enrichment_timeout")!;
       assert.deepEqual(casQ.params[5], ["admitted"]);
       releaseHistory!([]);
@@ -1692,13 +1724,46 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
   });
 
 
-  test("R4-B5 cron 预置 dispatch 在 attach 前即受 lifecycle 保护", async () => {
+  test("R4-B5 cron 预置 dispatch 在 client detach 后继续 enrichment 并只转发一次", async () => {
     const queries: { sql: string; params: unknown[] }[] = [];
+    let authorityBinding: Record<string, unknown> | null = null;
     const pgPool = {
       query: async (sql: string, params: unknown[] = []) => {
         queries.push({ sql, params });
         return { rows: [], rowCount: 1 };
       },
+      connect: async () => ({
+        query: async (sql: string, params: unknown[] = []) => {
+          if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [] };
+          if (/FROM turn_dispatches/.test(sql) && /FOR UPDATE/.test(sql)) {
+            return { rows: [{
+              user_id: UID.toString(),
+              session_id: "sess-cron-enrichment",
+              model: "glm-5.2",
+              attempt_no: 1,
+              status: "admitted",
+              owner_id: "cron-origin:cron-origin-enrichment-race",
+              lease_epoch: "1",
+              lease_until: new Date(Date.now() + 60_000),
+            }] };
+          }
+          if (/INSERT INTO authority_turn_dispatches/.test(sql)) {
+            authorityBinding = {
+              authority_turn_id: String(params[0]),
+              user_id: UID.toString(),
+              dispatch_model: "glm-5.2",
+              canonical_model: "glm-5.2",
+              session_id: "sess-cron-enrichment",
+              dispatch_id: "11111111-2222-4333-8444-555555555555",
+              attempt_no: 1,
+            };
+            return { rows: [] };
+          }
+          if (/FROM authority_turn_dispatches/.test(sql)) return { rows: [authorityBinding] };
+          throw new Error(`unexpected authority query: ${sql}`);
+        },
+        release: () => {},
+      }),
     };
     let historyStarted = false;
     let releaseHistory: ((rows: unknown[]) => void) | null = null;
@@ -1714,6 +1779,12 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       },
       promptQueuePreparationTimeoutMs: 2_000,
       dispatchLeaseHeartbeatMs: 30,
+      receiptIdentity: {
+        sessionId: "sess-cron-enrichment",
+        clientMessageId: "cron-origin-enrichment-race",
+        dispatchId: "11111111-2222-4333-8444-555555555555",
+        attemptNo: 1,
+      },
     });
     try {
       const ws = await openClient(rig.port);
@@ -1722,7 +1793,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
         executor = rig.bridge._testGetCronOriginExecutor(String(UID));
         return executor !== null;
       });
-      executor!({
+      const claim = executor!({
         encoded: Buffer.from(inboundFrame({
           clientMessageId: "cron-origin-enrichment-race",
           peer: { id: "sess-cron-enrichment", kind: "dm" },
@@ -1745,15 +1816,312 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
         /SET lease_until/.test(q.sql) && q.params[1] === "cron-origin:cron-origin-enrichment-race"
       ), 500);
       ws.close();
-      await waitFor(() => queries.some((q) => q.params[2] === "client_disconnected_before_enrichment_transfer"), 500);
-      const casQ = queries.find((q) => q.params[2] === "client_disconnected_before_enrichment_transfer")!;
-      assert.deepEqual(casQ.params[5], ["admitted"]);
-      releaseHistory!([]);
       await new Promise((resolve) => setTimeout(resolve, 100));
-      assert.equal(rig.containerSeen.some((row) => row.includes('"type":"inbound.message"')), false);
+      assert.equal(queries.some((q) => q.params[2] === "client_disconnected_before_enrichment_transfer"), false);
+      releaseHistory!([]);
+      await waitFor(() => rig.containerSeen.filter((row) => row.includes('"type":"inbound.message"')).length === 1);
+      assert.equal((await claim).kind, "delivery_unknown", "fake PG did not persist accepted receipt");
       ws.terminate();
       await new Promise((resolve) => setTimeout(resolve, 50));
     } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("R4-B6 container close during enrichment still terminalizes immediately", async () => {
+    const queries: { sql: string; params: unknown[] }[] = [];
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        return { rows: [], rowCount: 1 };
+      },
+    };
+    let historyStarted = false;
+    let releaseHistory: ((rows: unknown[]) => void) | null = null;
+    const historyGate = new Promise<unknown[]>((resolve) => { releaseHistory = resolve; });
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      pgPool,
+      admitUserTurn: async (input) => fakeAdmittedDispatch(input),
+      loadMasterSessionMessages: async () => {
+        historyStarted = true;
+        return await historyGate;
+      },
+      promptQueuePreparationTimeoutMs: 2_000,
+    });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(inboundFrame({
+        clientMessageId: "cm-container-close",
+        idempotencyKey: "web:cm-container-close:0",
+        peer: { id: "sess-container-close", kind: "dm" },
+      }));
+      await waitFor(() => historyStarted);
+      for (const container of rig.containerWss.clients) container.close(1011, "test close");
+      await waitFor(
+        () => queries.some((q) => q.params[2] === "bridge_closed_during_admission"),
+        1_500,
+      );
+      releaseHistory!([]);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(rig.containerSeen.some((row) => row.includes('"clientMessageId":"cm-container-close"')), false);
+      ws.terminate();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("R4-B7 container close after lookup but during authority bind keeps pre-forward ownership", async () => {
+    const queries: { sql: string; params: unknown[] }[] = [];
+    let bindingStarted = false;
+    let releaseBinding: () => void = () => {};
+    const bindingGate = new Promise<void>((resolve) => { releaseBinding = resolve; });
+    let authorityBinding: Record<string, unknown> | null = null;
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        return { rows: [], rowCount: 1 };
+      },
+      connect: async () => ({
+        query: async (sql: string, params: unknown[] = []) => {
+          if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [] };
+          if (/FROM turn_dispatches/.test(sql) && /FOR UPDATE/.test(sql)) {
+            return { rows: [{
+              user_id: UID.toString(),
+              session_id: "sess-post-lookup-close",
+              model: "glm-5.2",
+              attempt_no: 1,
+              status: "admitted",
+              owner_id: "test-owner",
+              lease_epoch: "1",
+              lease_until: new Date(Date.now() + 60_000),
+            }] };
+          }
+          if (/INSERT INTO authority_turn_dispatches/.test(sql)) {
+            bindingStarted = true;
+            await bindingGate;
+            authorityBinding = {
+              authority_turn_id: String(params[0]),
+              user_id: UID.toString(),
+              dispatch_model: "glm-5.2",
+              canonical_model: "glm-5.2",
+              session_id: "sess-post-lookup-close",
+              dispatch_id: String(params[5]),
+              attempt_no: 1,
+            };
+            return { rows: [] };
+          }
+          if (/FROM authority_turn_dispatches/.test(sql)) return { rows: [authorityBinding] };
+          throw new Error(`unexpected authority query: ${sql}`);
+        },
+        release: () => {},
+      }),
+    };
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      holdDispatchReceipt: true,
+      pgPool,
+      admitUserTurn: async (input) => {
+        const admitted = fakeAdmittedDispatch(input);
+        if (admitted.kind !== "admitted") throw new Error("unreachable");
+        return { ...admitted, dispatch: { ...admitted.dispatch, ownerId: "test-owner" } };
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(inboundFrame({
+        clientMessageId: "cm-post-lookup-close",
+        idempotencyKey: "web:cm-post-lookup-close:0",
+        peer: { id: "sess-post-lookup-close", kind: "dm" },
+      }));
+      await waitFor(() => bindingStarted);
+      for (const container of rig.containerWss.clients) container.close(1011, "post lookup close");
+      await waitFor(
+        () => queries.some((q) => q.params[2] === "bridge_closed_during_admission"),
+        1_500,
+      );
+      releaseBinding();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(rig.containerSeen.some((row) => row.includes('"clientMessageId":"cm-post-lookup-close"')), false);
+      ws.terminate();
+    } finally {
+      releaseBinding();
+      await stopRig(rig);
+    }
+  });
+
+  test("R4-B8 rejected duplicate receipt never becomes cron injected success", async () => {
+    const queries: { sql: string; params: unknown[] }[] = [];
+    let admittedRow: TurnDispatchRow | null = null;
+    let authorityBinding: Record<string, unknown> | null = null;
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        if (/SELECT model_id FROM client_sessions/.test(sql)) {
+          return { rows: [{ model_id: "glm-5.2" }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+      connect: async () => ({
+        query: async (sql: string, params: unknown[] = []) => {
+          if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [] };
+          if (/FROM turn_dispatches/.test(sql) && /FOR UPDATE/.test(sql)) {
+            const d = admittedRow;
+            assert.ok(d);
+            return { rows: [{
+              user_id: d.userId.toString(),
+              session_id: d.sessionId,
+              model: d.model,
+              attempt_no: d.attemptNo,
+              status: d.status,
+              owner_id: d.ownerId,
+              lease_epoch: String(d.leaseEpoch),
+              lease_until: d.leaseUntil,
+            }] };
+          }
+          if (/INSERT INTO authority_turn_dispatches/.test(sql)) {
+            authorityBinding = {
+              authority_turn_id: String(params[0]),
+              user_id: String(params[1]),
+              dispatch_model: params[2],
+              canonical_model: String(params[3]),
+              session_id: String(params[4]),
+              dispatch_id: String(params[5]),
+              attempt_no: Number(params[6]),
+            };
+            return { rows: [] };
+          }
+          if (/FROM authority_turn_dispatches/.test(sql)) return { rows: [authorityBinding] };
+          throw new Error(`unexpected authority query: ${sql}`);
+        },
+        release: () => {},
+      }),
+    };
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      receiptState: "rejected",
+      pgPool,
+      admitUserTurn: async (input) => {
+        const admitted = fakeAdmittedDispatch(input);
+        if (admitted.kind !== "admitted") throw new Error("unreachable");
+        admittedRow = admitted.dispatch;
+        return admitted;
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      await waitFor(() => rig.bridge._testGetCronOriginExecutor(String(UID)) !== null);
+      const result = await rig.bridge.injectCronOriginTurn({
+        uid: BigInt(UID),
+        sessionId: "sess-cron-rejected",
+        text: "continue",
+        clientMessageId: "cron-origin-rejected-1",
+        agentId: "main",
+      });
+      assert.notEqual(result.kind, "injected");
+      assert.ok(
+        queries.some((q) => /status = 'terminal'/.test(q.sql) && q.params[1] === "not_accepted"),
+        "rejected receipt converges Master admitted instead of accepted",
+      );
+      assert.equal(
+        queries.some((q) => /SET status = 'accepted'/.test(q.sql)),
+        false,
+        "rejected receipt must never run accepted CAS",
+      );
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("R4-B9 accepted receipt synchronously beats close before delayed send callback", async () => {
+    const queries: { sql: string; params: unknown[] }[] = [];
+    const sendCompletions: Array<() => void> = [];
+    let admittedRow: TurnDispatchRow | null = null;
+    let authorityBinding: Record<string, unknown> | null = null;
+    let receiptCasStarted = false;
+    let releaseReceiptCas: () => void = () => {};
+    const receiptCasGate = new Promise<void>((resolve) => { releaseReceiptCas = resolve; });
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        if (/SET status = 'accepted'/.test(sql)) {
+          receiptCasStarted = true;
+          await receiptCasGate;
+        }
+        return { rows: [], rowCount: 0 };
+      },
+      connect: async () => ({
+        query: async (sql: string, params: unknown[] = []) => {
+          if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [] };
+          if (/FROM turn_dispatches/.test(sql) && /FOR UPDATE/.test(sql)) {
+            const d = admittedRow;
+            assert.ok(d);
+            return { rows: [{
+              user_id: d.userId.toString(),
+              session_id: d.sessionId,
+              model: d.model,
+              attempt_no: d.attemptNo,
+              status: d.status,
+              owner_id: d.ownerId,
+              lease_epoch: String(d.leaseEpoch),
+              lease_until: d.leaseUntil,
+            }] };
+          }
+          if (/INSERT INTO authority_turn_dispatches/.test(sql)) {
+            authorityBinding = {
+              authority_turn_id: String(params[0]),
+              user_id: String(params[1]),
+              dispatch_model: params[2],
+              canonical_model: String(params[3]),
+              session_id: String(params[4]),
+              dispatch_id: String(params[5]),
+              attempt_no: Number(params[6]),
+            };
+            return { rows: [] };
+          }
+          if (/FROM authority_turn_dispatches/.test(sql)) return { rows: [authorityBinding] };
+          throw new Error(`unexpected authority query: ${sql}`);
+        },
+        release: () => {},
+      }),
+    };
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      pgPool,
+      deferContainerSendCompletionForTest: (complete) => sendCompletions.push(complete),
+      admitUserTurn: async (input) => {
+        const admitted = fakeAdmittedDispatch(input);
+        if (admitted.kind !== "admitted") throw new Error("unreachable");
+        admittedRow = admitted.dispatch;
+        return admitted;
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(inboundFrame({
+        clientMessageId: "cm-receipt-close-race",
+        idempotencyKey: "web:cm-receipt-close-race:0",
+        peer: { id: "sess-receipt-close-race", kind: "dm" },
+      }));
+      await waitFor(() => receiptCasStarted && sendCompletions.length === 1);
+      for (const container of rig.containerWss.clients) container.close(1011, "receipt race close");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(
+        queries.some((q) => /status = 'terminal'/.test(q.sql)),
+        false,
+        "validated accepted receipt owns the sync fence before PG await",
+      );
+      releaseReceiptCas();
+      for (const complete of sendCompletions.splice(0)) complete();
+      ws.terminate();
+    } finally {
+      releaseReceiptCas();
+      for (const complete of sendCompletions.splice(0)) complete();
       await stopRig(rig);
     }
   });

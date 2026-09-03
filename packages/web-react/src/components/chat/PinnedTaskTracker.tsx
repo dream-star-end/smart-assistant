@@ -4,8 +4,17 @@
  * 取代 inline 的 TodoWrite 工具卡(后者会随消息流滚走):把当前任务列表钉在 composer 上方,
  * 始终可见。交互按 boss 要求:任务集首次出现/变化时**展开全部**,随后 ~3s **自动折叠**成
  * 只显示「正在执行的一条」;用户点击可手动展开/折叠(手动后不再自动折叠)。无未完成任务
- * (全部完成或无任务)→ 直接不渲染:不留"完成"残条。当前轮仍有未完成任务时刷新后也钉住;
- * 上一轮已收口则提取为空,打开旧会话不闪。
+ * (全部完成或无任务)→ 直接不渲染:不留"完成"残条。
+ *
+ * 渲染三态(收口判据,修复 d18bd587 去掉 active 门后 HUD 永久钉住的缺陷):
+ *  1. 在飞(active)→ 钉住:turn 进行中任务列表始终可见;
+ *  2. 刷新后仍在飞(active=false 且无终态证据:openDispatch 恢复 sending 或消息层无收口
+ *     标记)→ 钉住:保留 d18bd587 的初衷,刷新不打断任务追踪;
+ *  3. turn 收口 → 隐藏,inline 只读 TodoWrite/plan 卡兜底(MessageRenderer 在
+ *     `inActiveTurn && sending` 为假时渲染 inline 卡,翻历史仍可见)。收口证据两路任一:
+ *     a) live 下降沿:组件挂载期间 active 出现 true→false(同一任务集内);
+ *     b) 消息层证据:App 传入 settled=currentTurnSettled(wsMessages)(刷新/重开会话场景,
+ *        此时 active 一直 false,没有下降沿可看)。
  *
  * 数据来自上层从 wsMessages 提取的最新顶层 TodoWrite todos 或 Codex structured plan steps
  * (replace 语义,最后一次=权威)。
@@ -106,10 +115,13 @@ function TodoRow({ t, compact }: { t: TodoItem; compact?: boolean }) {
 export function PinnedTaskTracker({
   todos,
   active,
+  settled = false,
   tokenUsage,
 }: {
   todos: TodoItem[];
   active: boolean;
+  /** 消息层终态证据(App 传 currentTurnSettled(wsMessages)):刷新/重开会话时没有 live 下降沿,靠它判收口。 */
+  settled?: boolean;
   tokenUsage?: TurnTokenUsageSnapshot;
 }) {
   const total = todos.length;
@@ -125,6 +137,24 @@ export function PinnedTaskTracker({
   const [userTouched, setUserTouched] = useState(false);
   const prevSig = useRef(sig);
   const prevActive = useRef(active);
+
+  // live 收口:组件挂载期间 active 出现 true→false 的下降沿(同一任务集内)。必须在渲染期
+  // 检测而非 useEffect —— 否则收口这一帧已按旧值渲染,HUD 会多钉一帧。sig 变化(新任务集)
+  // 或 active 重新变 true(新 turn)时复位;每次重渲染幂等(StrictMode 双渲染安全)。
+  const endedLiveRef = useRef(false);
+  const liveSigRef = useRef<string | null>(null);
+  const liveActiveRef = useRef<boolean | null>(null);
+  if (liveSigRef.current !== sig) {
+    liveSigRef.current = sig;
+    endedLiveRef.current = false;
+  }
+  if (liveActiveRef.current === true && active === false) {
+    endedLiveRef.current = true;
+  }
+  if (active) endedLiveRef.current = false;
+  liveActiveRef.current = active;
+  // 在飞优先:active 时即使旧行残留终态标记(settled 误报)也不算收口。
+  const turnSettled = !active && (endedLiveRef.current || settled);
 
   // 任务集变化 / 新 turn 开始 → 重新展开全部、复位用户态。
   useEffect(() => {
@@ -145,10 +175,10 @@ export function PinnedTaskTracker({
     return () => clearTimeout(id);
   }, [active, expanded, userTouched, sig]);
 
-  // 刷新后 wsSending=false,但当前轮若仍有未完成任务,HUD 必须钉住(打开已收口旧会话
-  // 时 extractLatestTodos 拿不到未完成项,hasIncomplete=false,不会误闪)。
-  // `active` 只驱动自动折叠计时,不再一刀切隐藏。
-  if (!hasIncomplete) return null;
+  // 渲染门:有未完成任务且本轮未收口(三态见文件头)。刷新后当前轮仍在飞
+  // (openDispatch 恢复 sending 或无终态证据 → turnSettled=false)→ 钉住,保留 d18bd587 行为;
+  // 打开已收口旧会话时 extractLatestTodos 拿不到当前段未完成项,hasIncomplete=false,不会误闪。
+  if (!hasIncomplete || turnSettled) return null;
 
   const toggle = () => {
     setUserTouched(true);

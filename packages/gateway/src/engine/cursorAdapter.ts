@@ -23,6 +23,10 @@ import { engineSessionId } from './engineSessionId.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { classifyRunError } from '../errorClassify.js'
+import {
+  formatCursorCliFailureDetail,
+  formatCursorCliFailureLog,
+} from './cursorCliErrorSanitize.js'
 import { createLogger } from '../logger.js'
 import { type McpMemoryLaunch, resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
 import { getPlatformPrompt } from '../platformPrompts.js'
@@ -35,6 +39,11 @@ import { issueDelegateContextToken } from '../delegateContext.js'
 import { formatPresentOptionsFence } from './presentOptions.js'
 import { CursorRoutingAdapter } from './cursorRoutingAdapter.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
+import {
+  CREDIT_EXHAUSTED_DETAIL,
+  runningCostFenForUsage,
+  shouldAbortForCreditBudget,
+} from '../creditExhaustion.js'
 
 const log = createLogger({ module: 'cursorAdapter' })
 
@@ -693,7 +702,7 @@ interface TurnCtx {
   assistantText: string; thinkingText: string; assistantSegments: SegmentRecord[]; thinkingSegments: SegmentRecord[]
   tools: Map<string, TurnToolEntry>; pending: Set<string>; startedTools: Map<string, number>
   silentToolIds: Set<string>; presentOptionsCount: number
-  stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; resolveDrain: (() => void) | null; interrupted: boolean; error: string | null; resultSeen: boolean; resultDetail: string | null; usage?: ReportedUsage
+  stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; resolveDrain: (() => void) | null; interrupted: boolean; creditExhausted: boolean; error: string | null; resultSeen: boolean; resultDetail: string | null; usage?: ReportedUsage
   assistantPartialText: string; pendingAssistantText: string | null
   assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
   lastContentKind: 'text' | 'thinking' | null
@@ -1437,6 +1446,7 @@ export function attachCursorGatewayRouting(
 
 export const CURSOR_CHATS_DIR_NAME = 'cursor-chats'
 export const CURSOR_SAND_RESUME_PREFIX = 'sand-ccb:'
+export const CURSOR_SAND_OFFICIAL_CC_RESUME_PREFIX = 'sand-official-cc:'
 const CURSOR_RESUME_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export function isCursorSandResumeId(sessionId: string | null | undefined): sessionId is string {
@@ -1449,6 +1459,28 @@ export function cursorSandResumeInnerId(sessionId: string | null | undefined): s
   if (!isCursorSandResumeId(sessionId)) return undefined
   const inner = sessionId.slice(CURSOR_SAND_RESUME_PREFIX.length)
   return CURSOR_RESUME_ID_RE.test(inner) ? inner : undefined
+}
+
+export function isCursorSandOfficialCcResumeId(
+  sessionId: string | null | undefined,
+): sessionId is string {
+  return typeof sessionId === 'string'
+    && sessionId.startsWith(CURSOR_SAND_OFFICIAL_CC_RESUME_PREFIX)
+}
+
+/** Official Claude Code persists the same UUID-shaped JSONL identity as CCB,
+ * but the prefix is deliberately distinct so a flag rollback can never feed
+ * one harness the other harness's native transcript. */
+export function cursorSandOfficialCcResumeInnerId(
+  sessionId: string | null | undefined,
+): string | undefined {
+  if (!isCursorSandOfficialCcResumeId(sessionId)) return undefined
+  const inner = sessionId.slice(CURSOR_SAND_OFFICIAL_CC_RESUME_PREFIX.length)
+  return CURSOR_RESUME_ID_RE.test(inner) ? inner : undefined
+}
+
+export function isAnyCursorSandResumeId(sessionId: string | null | undefined): sessionId is string {
+  return isCursorSandResumeId(sessionId) || isCursorSandOfficialCcResumeId(sessionId)
 }
 
 /** Durable Cursor chat store, deliberately OUTSIDE the per-turn ephemeral HOME
@@ -1786,7 +1818,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.stopPendingKeepalive()
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), silentToolIds: new Set(), presentOptionsCount: 0, stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, resultSeen: false, resultDetail: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), silentToolIds: new Set(), presentOptionsCount: 0, stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, creditExhausted: false, error: null, resultSeen: false, resultDetail: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { ctx.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => {
       // Only ever settle this turn's own barrier: shutdown() may have already
@@ -2110,6 +2142,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       }
     }
     const type = textOf(event.type).toLowerCase()
+    const reported = usageOf(event)
+    if (reported) {
+      ctx.usage = reported
+      void this.maybeAbortForCredits(ctx)
+    }
     const aggregateBoundary = type === 'retry'
       || (type === 'interaction_query' && textOf(event.subtype).toLowerCase() === 'request')
     this.flushPendingAssistant(ctx, aggregateBoundary)
@@ -2155,8 +2192,10 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     }
     if (type === 'tool_use' || type === 'tool_start') { this.toolStart(ctx, event); return }
     if (type === 'tool_result' || type === 'tool_call_update' || type === 'tool_end') { this.toolResult(ctx, event); return }
-    const reported = usageOf(event); if (reported) ctx.usage = reported
-    if (type === 'error') { ctx.error = textOf(event.message ?? event.error ?? event.data) || 'Cursor CLI error'; return }
+    if (type === 'error') {
+      if (!ctx.creditExhausted) ctx.error = textOf(event.message ?? event.error ?? event.data) || 'Cursor CLI error'
+      return
+    }
     if (type === 'result') {
       const failed = event.is_error === true || ['error', 'failed', 'failure'].includes(textOf(event.subtype).toLowerCase())
       // The account wrapper emits slot_result only after the official CLI
@@ -2242,25 +2281,68 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.pending.size === 0) this.stopPendingKeepalive()
     ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output: preview || output, outputJson: structuredClone(outputJson), preview } }); ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview, isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview, ...(exitCode !== undefined ? { exitCode } : {}), ...(terminationReason ? { terminationReason } : {}) } })
   }
+  private abortTurnForCredits(ctx: TurnCtx): void {
+    if (ctx.terminal || ctx.creditExhausted) return
+    ctx.creditExhausted = true
+    ctx.error = CREDIT_EXHAUSTED_DETAIL
+    if (ctx.proc && !ctx.proc.killed) killProcessGroup(ctx.proc, 'SIGINT')
+  }
+
+  private async maybeAbortForCredits(ctx: TurnCtx): Promise<void> {
+    if (ctx.creditExhausted || ctx.terminal) return
+    const budget = ctx.params.creditBudgetFen
+    if (budget === undefined || !ctx.usage) return
+    const fen = await runningCostFenForUsage({
+      modelId: this.currentModel,
+      usage: {
+        inputTokens: ctx.usage.input_tokens ?? 0,
+        outputTokens: ctx.usage.output_tokens ?? 0,
+        cacheReadTokens: ctx.usage.cache_read_input_tokens ?? 0,
+        cacheCreationTokens: ctx.usage.cache_creation_input_tokens ?? 0,
+      },
+    })
+    if (this.active !== ctx || ctx.terminal || ctx.creditExhausted) return
+    if (fen === null || !shouldAbortForCreditBudget(fen, budget)) return
+    this.abortTurnForCredits(ctx)
+  }
+
   private finish(ctx: TurnCtx, detail: string | null): void {
     this.stopPendingKeepalive()
-    if (ctx.terminal) return; ctx.terminal = true; const cls = detail ? unavailable(detail) : null
-    const errorClass = detail ? classifyRunError(detail).code : undefined
+    if (ctx.terminal) return; ctx.terminal = true
+    const creditExhausted = ctx.creditExhausted
+    const cls = !creditExhausted && detail ? unavailable(detail) : null
+    const errorClass = creditExhausted
+      ? 'insufficient_credits' as const
+      : detail ? classifyRunError(detail).code : undefined
     const keepRawForTape =
+      !creditExhausted &&
       detail != null &&
       (errorClass === 'context_too_long' || /PROMPT_TOO_LONG/.test(detail))
-    const safeDetail = detail === null ? null
+    const safeDetail = creditExhausted ? CREDIT_EXHAUSTED_DETAIL
+      : detail === null ? null
       : ctx.interrupted ? 'Cursor turn cancelled'
       : cls === 'auth' ? 'Cursor authentication unavailable'
       : cls === 'quota' ? 'Cursor quota unavailable'
       : keepRawForTape ? detail
-      : 'Cursor CLI failed'
-    const status: EngineExternalBillingEvent['status'] = cls ? 'unavailable' : detail ? 'error' : 'success'
+      : formatCursorCliFailureDetail(detail)
+    if (detail && !creditExhausted && !ctx.interrupted && cls !== 'auth' && cls !== 'quota' && !keepRawForTape) {
+      log.warn('cursor CLI failed', {
+        sessionId: this.opts.sessionId,
+        sessionKey: this.opts.sessionKey,
+        traceId: ctx.params.traceId,
+        requestId: ctx.params.requestId,
+        errorClass,
+        error: formatCursorCliFailureLog(detail),
+      })
+    }
+    const status: EngineExternalBillingEvent['status'] = creditExhausted
+      ? 'success'
+      : cls ? 'unavailable' : detail ? 'error' : 'success'
     const slotResults = parseCursorSlotResults(ctx.stderr)
     if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) {
       const durationMs = Date.now() - ctx.startedAt
       // Volatile fast path: WS frame → master userChatBridge (live settle + quota learning).
-      this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(this.opts.cursorCredentialSelection && this.opts.cursorCredentialSelection.accountId !== '0' ? { cursorAccountId: this.opts.cursorCredentialSelection.accountId, cursorPoolGeneration: this.opts.cursorCredentialSelection.poolGeneration, cursorKeyFingerprint: this.opts.cursorCredentialSelection.keyFingerprint } : {}), ...(ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : errorClass === 'context_too_long' ? {} : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
+      this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(this.opts.cursorCredentialSelection && this.opts.cursorCredentialSelection.accountId !== '0' ? { cursorAccountId: this.opts.cursorCredentialSelection.accountId, cursorPoolGeneration: this.opts.cursorCredentialSelection.poolGeneration, cursorKeyFingerprint: this.opts.cursorCredentialSelection.keyFingerprint } : {}), ...(creditExhausted ? {} : ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : errorClass === 'context_too_long' ? {} : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
       // Durable path (2026-09-02 fix): the WS frame is lost whenever the user's
       // bridge WS is gone at turn end (switched session / closed tab), leaving
       // cursor_external_usage_audit pending forever and no credits badge. Emit
@@ -2271,11 +2353,15 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // to settle against the audit row instead of request_finalize_journal.
       this.emit('billing', this.buildDurableBilling(ctx, status, durationMs))
     }
-    if (detail) ctx.params.onEvent({ kind: 'error', error: safeDetail!, errorClass, ...(ctx.interrupted ? { errorCode: 'user_cancelled' as const } : {}) })
+    if (creditExhausted) {
+      ctx.params.onEvent({ kind: 'error', error: CREDIT_EXHAUSTED_DETAIL, errorClass: 'insufficient_credits' })
+    } else if (detail) {
+      ctx.params.onEvent({ kind: 'error', error: safeDetail!, errorClass, ...(ctx.interrupted ? { errorCode: 'user_cancelled' as const } : {}) })
+    }
     if (ctx.usage) ctx.params.onEvent({ kind: 'usage', usage: { inputTokens: ctx.usage.input_tokens ?? 0, outputTokens: ctx.usage.output_tokens ?? 0, cacheReadTokens: ctx.usage.cache_read_input_tokens ?? 0, cacheCreationTokens: ctx.usage.cache_creation_input_tokens ?? 0, totalTokens: Object.values(ctx.usage).reduce((a, b) => a + (b ?? 0), 0) } })
-    ctx.params.onEvent({ kind: 'final', meta: { ...finalUsageMeta(ctx.usage), ...(ctx.interrupted ? { stopReason: 'interrupted' } : {}) } })
+    ctx.params.onEvent({ kind: 'final', meta: { ...finalUsageMeta(ctx.usage), ...(creditExhausted ? { stopReason: 'error' } : ctx.interrupted ? { stopReason: 'interrupted' } : {}) } })
     ctx.params.sessionTotals.turns += 1
-    const u = ctx.usage; ctx.resolve({ usage: { cost: 0, inputTokens: u?.input_tokens ?? 0, outputTokens: u?.output_tokens ?? 0, cacheReadTokens: u?.cache_read_input_tokens ?? 0, cacheCreationTokens: u?.cache_creation_input_tokens ?? 0, totalTokens: u ? Object.values(u).reduce((a, b) => a + (b ?? 0), 0) : 0 }, assistantText: ctx.assistantText, thinkingText: ctx.thinkingText, assistantSegments: ctx.assistantSegments.map((v) => ({ ...v })), thinkingSegments: ctx.thinkingSegments.map((v) => ({ ...v })), tools: [...ctx.tools.values()].map((v) => structuredClone(v)), runtimeEvents: [], stopReason: ctx.interrupted ? 'interrupted' : null, numTurns: 1, isError: !!detail, ...(detail ? { errorKind: 'other' as const, errorClass, errorDetail: safeDetail! } : {}), staleResumeId: false, phantomSignals: { ...EMPTY_SIGNALS } })
+    const u = ctx.usage; ctx.resolve({ usage: { cost: 0, inputTokens: u?.input_tokens ?? 0, outputTokens: u?.output_tokens ?? 0, cacheReadTokens: u?.cache_read_input_tokens ?? 0, cacheCreationTokens: u?.cache_creation_input_tokens ?? 0, totalTokens: u ? Object.values(u).reduce((a, b) => a + (b ?? 0), 0) : 0 }, assistantText: ctx.assistantText, thinkingText: ctx.thinkingText, assistantSegments: ctx.assistantSegments.map((v) => ({ ...v })), thinkingSegments: ctx.thinkingSegments.map((v) => ({ ...v })), tools: [...ctx.tools.values()].map((v) => structuredClone(v)), runtimeEvents: [], stopReason: creditExhausted ? 'error' : ctx.interrupted ? 'interrupted' : null, numTurns: 1, isError: creditExhausted || !!detail, ...(creditExhausted || detail ? { errorKind: 'other' as const, errorClass, errorDetail: safeDetail! } : {}), staleResumeId: false, phantomSignals: { ...EMPTY_SIGNALS } })
   }
   private buildDurableBilling(ctx: TurnCtx, status: EngineExternalBillingEvent['status'], durationMs: number): EngineBillingEvent {
     const u = ctx.usage
@@ -2293,7 +2379,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // finer cursor terminalCode (AUTH/QUOTA/ENGINE) lives in the audit row
       // written by the live frame and is not needed for settlement (non-success
       // is never charged).
-      ...(durableStatus === 'error' ? { terminalCode: ctx.interrupted ? 'USER_CANCELLED' as const : 'CODEX_ERROR' as const } : {}),
+      ...(durableStatus === 'error' && !ctx.creditExhausted ? { terminalCode: ctx.interrupted ? 'USER_CANCELLED' as const : 'CODEX_ERROR' as const } : {}),
       durationMs,
       ...(u ? { usage: { ...u } } : {}),
     }

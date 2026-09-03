@@ -50,13 +50,24 @@ import {
   OAuthExchangeError,
   type OAuthProvider,
 } from "../../admin/oauth.js";
-import { AccountNotFoundError, type AccountRow } from "../../account-pool/store.js";
+import { AccountNotFoundError, getCursorTokenSnapshot, type AccountRow } from "../../account-pool/store.js";
 import { getEgressProxy } from "../../admin/egressProxies.js";
 import {
   cancelGrokDeviceAuth,
   getGrokDeviceAuthStatus,
   startGrokDeviceAuth,
 } from "../../admin/grokDeviceAuth.js";
+import {
+  cancelCursorSessionAuth,
+  getCursorSessionAuthStatus,
+  startCursorSessionAuth,
+} from "../../admin/cursorSessionAuth.js";
+import {
+  CursorUsageUnavailableError,
+  fetchCursorSessionUsage,
+  getCachedCursorUsage,
+  setCachedCursorUsage,
+} from "../../admin/cursorSessionUsage.js";
 import {
   listRefreshEvents,
   MAX_LIST_LIMIT as REFRESH_EVENTS_MAX_LIMIT,
@@ -113,6 +124,9 @@ function serializeAccount(
     has_refresh_token: a.has_refresh_token,
     cursor_quota_class: a.provider === "cursor" ? a.cursor_quota_class : null,
     cursor_sand_enabled: a.provider === "cursor" ? a.cursor_sand_enabled : null,
+    /** 0257 — Sand 凭证形态:api_key(crsr_ 换 token)| session(账号登录会话)。 */
+    cursor_credential_kind: a.provider === "cursor" ? a.cursor_credential_kind : null,
+    cursor_auth_id: a.provider === "cursor" ? a.cursor_auth_id : null,
     created_at: a.created_at.toISOString(),
     updated_at: a.updated_at.toISOString(),
   };
@@ -238,6 +252,9 @@ export async function handleAdminGetAccount(
   if (action === "recent-users") {
     return handleAccountRecentUsers(idRaw, url, res);
   }
+  if (action === "cursor-usage") {
+    return handleAccountCursorUsage(idRaw, url, res);
+  }
   if (action !== "") {
     throw new HttpError(404, "NOT_FOUND", "endpoint not found");
   }
@@ -276,6 +293,65 @@ async function handleAccountRecentUsers(
     const rows = await getAccountRecentUsers(id, hours, limit);
     sendJson(res, 200, { rows });
   } catch (err) { translateRangeError(err); }
+}
+
+/**
+ * 0257 — GET /api/admin/accounts/:id/cursor-usage[?refresh=1]
+ * Cursor 账号会话(Sand)的额度/用量快照:套餐、账期、已用/剩余、按模型聚合。
+ * 只对 provider=cursor 且 cursor_credential_kind=session 的行有意义;api_key 行
+ * 没有会话 cookie,返回 409。60s 缓存,refresh=1 强制回源。快照不含任何凭证。
+ */
+async function handleAccountCursorUsage(
+  id: string,
+  url: URL,
+  res: ServerResponse,
+): Promise<void> {
+  const a = await adminGetAccount(id);
+  if (!a) throw new HttpError(404, "NOT_FOUND", "account not found");
+  if (a.provider !== "cursor" || a.cursor_credential_kind !== "session") {
+    throw new HttpError(409, "CONFLICT", "cursor usage is only available for Cursor account-session credentials");
+  }
+  const force = url.searchParams.get("refresh") === "1";
+  if (!force) {
+    const cached = getCachedCursorUsage(id);
+    if (cached) {
+      sendJson(res, 200, { usage: cached, cached: true });
+      return;
+    }
+  }
+  const snap = await getCursorTokenSnapshot(id);
+  if (!snap) throw new HttpError(404, "NOT_FOUND", "account not found");
+  if (snap.expires_at && snap.expires_at.getTime() <= Date.now()) {
+    snap.token.fill(0);
+    snap.refresh?.fill(0);
+    throw new HttpError(409, "CONFLICT", "cursor session expired; log in again");
+  }
+  let accessToken: string | null = snap.token.toString("utf8");
+  snap.token.fill(0);
+  snap.refresh?.fill(0);
+  try {
+    const usage = await fetchCursorSessionUsage({
+      accessToken,
+      authId: a.cursor_auth_id,
+      machineId: snap.machine_id,
+    });
+    accessToken = null;
+    setCachedCursorUsage(id, usage);
+    sendJson(res, 200, { usage, cached: false });
+  } catch (err) {
+    accessToken = null;
+    if (err instanceof CursorUsageUnavailableError) {
+      throw new HttpError(
+        err.code === "session_rejected" ? 409 : 502,
+        err.code === "session_rejected" ? "CONFLICT" : "UPSTREAM",
+        err.code === "session_rejected"
+          ? "Cursor rejected the account session; log in again"
+          : "Cursor usage endpoints unavailable",
+        { issues: Object.entries(err.details).map(([path, message]) => ({ path, message })) },
+      );
+    }
+    throw err;
+  }
 }
 
 /**
@@ -403,6 +479,27 @@ export async function handleAdminCreateAccount(
       throw new HttpError(400, "VALIDATION", "cursor_sand_enabled must be boolean");
     }
     input.cursor_sand_enabled = b.cursor_sand_enabled;
+  }
+  // 0257 — Cursor 账号登录会话凭证(Grok Bot / Sand PKCE 登录产物)。
+  // oauth_token = 会话 accessToken(JWT),oauth_refresh_token = refreshToken,
+  // cursor_machine_id = 登录时使用的机器 id(checksum 必须由同一 id 派生)。
+  if (b.cursor_credential_kind !== undefined) {
+    if (b.cursor_credential_kind !== "api_key" && b.cursor_credential_kind !== "session") {
+      throw new HttpError(400, "VALIDATION", "cursor_credential_kind must be 'api_key' or 'session'");
+    }
+    input.cursor_credential_kind = b.cursor_credential_kind;
+  }
+  if (b.cursor_machine_id !== undefined) {
+    if (b.cursor_machine_id !== null && typeof b.cursor_machine_id !== "string") {
+      throw new HttpError(400, "VALIDATION", "cursor_machine_id must be string or null");
+    }
+    input.cursor_machine_id = b.cursor_machine_id as string | null;
+  }
+  if (b.cursor_auth_id !== undefined) {
+    if (b.cursor_auth_id !== null && typeof b.cursor_auth_id !== "string") {
+      throw new HttpError(400, "VALIDATION", "cursor_auth_id must be string or null");
+    }
+    input.cursor_auth_id = b.cursor_auth_id as string | null;
   }
 
   try {
@@ -750,5 +847,65 @@ export async function handleAdminGrokDeviceCancel(
   await requireAdminVerifyDb(req, deps.jwtSecret);
   const removed = cancelGrokDeviceAuth(grokDeviceSessionId(req));
   if (!removed) throw new HttpError(404, "NOT_FOUND", "Grok device session not found");
+  sendJson(res, 200, { ok: true });
+}
+
+// ---------------------------------------------------------------------------
+// 0257 — Cursor 账号登录会话(Sand PKCE / loginDeepControl)。
+// start 返回 verification_url,管理员浏览器授权后 status 一次性交出
+// accessToken/refreshToken/machine_id,前端再走普通 POST /api/admin/accounts
+// (cursor_credential_kind=session)入库。会话凭证本身不落审计日志。
+// ---------------------------------------------------------------------------
+
+function cursorSessionAuthId(req: IncomingMessage): string {
+  const parsed = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const prefix = "/api/admin/accounts/cursor-session/";
+  const id = parsed.pathname.startsWith(prefix) ? parsed.pathname.slice(prefix.length) : "";
+  if (!/^[0-9a-f]{32}$/.test(id)) throw new HttpError(400, "VALIDATION", "invalid Cursor session login id");
+  return id;
+}
+
+export async function handleAdminCursorSessionStart(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret);
+  const body = (await readJsonBody(req)) ?? {};
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "request body must be JSON object");
+  }
+  try {
+    // Cursor login polling talks to api2.cursor.sh from the master host; Cursor
+    // accounts never bind an egress proxy so no proxy is required here.
+    sendJson(res, 200, startCursorSessionAuth());
+  } catch (err) {
+    const code = err instanceof Error ? err.message : "CURSOR_SESSION_AUTH_FAILED";
+    throw new HttpError(503, "OAUTH_FAILED", code);
+  }
+}
+
+export async function handleAdminCursorSessionStatus(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret);
+  const status = getCursorSessionAuthStatus(cursorSessionAuthId(req));
+  if (!status) throw new HttpError(404, "NOT_FOUND", "Cursor session login not found");
+  sendJson(res, 200, status);
+}
+
+export async function handleAdminCursorSessionCancel(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret);
+  const removed = cancelCursorSessionAuth(cursorSessionAuthId(req));
+  if (!removed) throw new HttpError(404, "NOT_FOUND", "Cursor session login not found");
   sendJson(res, 200, { ok: true });
 }

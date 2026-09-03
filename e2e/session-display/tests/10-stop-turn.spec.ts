@@ -217,13 +217,17 @@ test('停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活', a
     settled.turnErrorFriction,
     '用户主动停止是预期终态，不得上报 turn_error 产品故障信号',
   ).toBe(0);
-  if (cfg.model === 'gpt-5.6-luna' && settled.usageRows > 0) {
+  if (cfg.model === 'gpt-5.6-luna') {
     if (settled.outcomes === 'interrupted') {
+      expect(
+        settled.usageRows,
+        'Codex 已产出可见内容后强制停止必须恰好结算一笔 partial usage',
+      ).toBe(1);
       expect(
         settled.usageTerminalCodes,
         'Codex 强制停止的 usage 审计必须归类为 USER_CANCELLED，不能记成模型失败',
       ).toBe('USER_CANCELLED');
-    } else {
+    } else if (settled.usageRows > 0) {
       expect(
         settled.usageTerminalCodes,
         '自然完成竞态的 usage 审计不得伪装成 USER_CANCELLED',

@@ -307,7 +307,41 @@ describe('CCB subagent model env (CLAUDE_CODE_SUBAGENT_MODEL)', () => {
     assert.equal(resolveCcbSubagentModel('haiku'), DEFAULT_CCB_SUBAGENT_MODEL)
     assert.equal(resolveCcbSubagentModel('claude-haiku-4-5-20251001'), DEFAULT_CCB_SUBAGENT_MODEL)
     assert.equal(resolveCcbSubagentModel('grok-build'), DEFAULT_CCB_SUBAGENT_MODEL)
+  })
+
+  it('cursor-* parents fall back to the CCB sub-agent default (glm-5.3-zai) — a member of the platform aux set the turn-lease gate admits', () => {
+    // egress modelAuthorityGate allowed set = {lease.canonicalModel} ∪ PLATFORM_AUX_MODEL_IDS
+    // (= [DEFAULT_SECONDARY_UTILITY_MODEL, DEFAULT_CCB_SUBAGENT_MODEL]). The pin
+    // is decoupled from the secondary utility model (deepseek stays the
+    // ANTHROPIC_SMALL_FAST_MODEL); OPENCLAUDE_SECONDARY_MODEL no longer moves it.
     assert.equal(DEFAULT_CCB_SUBAGENT_MODEL, 'glm-5.3-zai')
+    assert.equal(DEFAULT_SECONDARY_UTILITY_MODEL, 'deepseek-v4-flash')
+    assert.notEqual(DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL)
+    const prevSub = process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL
+    const prevSec = process.env.OPENCLAUDE_SECONDARY_MODEL
+    delete process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL
+    delete process.env.OPENCLAUDE_SECONDARY_MODEL
+    try {
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'glm-5.3-zai')
+      assert.deepEqual(
+        _buildCcbSubagentModelEnv({ sessionModel: 'cursor-fable-5.1-high', routing: 'settings-default' }),
+        { CLAUDE_CODE_SUBAGENT_MODEL: 'glm-5.3-zai' },
+      )
+      // Secondary-utility override does NOT move the sub-agent pin any more.
+      process.env.OPENCLAUDE_SECONDARY_MODEL = 'deepseek-v4-lite'
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'glm-5.3-zai')
+      assert.equal(_buildSecondaryUtilityModelEnv().ANTHROPIC_SMALL_FAST_MODEL, 'deepseek-v4-lite')
+      // Dedicated ops override for the sub-agent pin still works (must be routable).
+      process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL = 'deepseek-v4-flash'
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'deepseek-v4-flash')
+      process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL = 'haiku'
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'glm-5.3-zai')
+    } finally {
+      if (prevSub === undefined) delete process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL
+      else process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL = prevSub
+      if (prevSec === undefined) delete process.env.OPENCLAUDE_SECONDARY_MODEL
+      else process.env.OPENCLAUDE_SECONDARY_MODEL = prevSec
+    }
   })
 
   it('leaves oauth-direct unpinned so real Anthropic keeps Haiku', () => {

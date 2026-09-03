@@ -2,18 +2,26 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 import {
   CODEX_ENGINE_MODEL_IDS,
+  CURSOR_CONTEXT_TIERS,
+  CURSOR_CONTEXT_TIER_FAMILIES,
+  CURSOR_CONTEXT_TIER_WINDOW,
   CURSOR_ENGINE_MODELS,
   CURSOR_ENGINE_MODEL_IDS,
+  DEFAULT_CURSOR_CONTEXT_TIER,
   DEFAULT_CODEX_ENGINE_MODEL,
   PLATFORM_REASONING_EFFORTS,
   cursorFamilyDefaultFast,
   cursorFamilyEfforts,
+  cursorFamilySupportsContextTier,
   cursorFamilySupportsFast,
   cursorCredentialModelFamily,
   findCursorEngineModel,
   isCodexEngineModel,
   isCodexLongContextModel,
+  isCursorContextTier,
   isCursorEngineModel,
+  cursorModelSupportsContextTier,
+  projectContextWindowForCursorTier,
   isZcodeEngineModel,
   modelReasoningPolicy,
   codexTransportModelId,
@@ -153,5 +161,54 @@ describe('ZCode experimental engine model authority', () => {
     assert.equal(zcodeTransportModelId('zai-coding-plan/glm-5.3'), undefined)
     assert.equal(ZCODE_HOSTED_PERMISSION_MODE, 'yolo')
     assert.equal(modelReasoningPolicy('zcode-experimental').supported.length, 0)
+  })
+})
+
+describe('Cursor context tier (300k default / 1M opt-in, turn-level execution axis)', () => {
+  test('tier vocabulary + default + windows are pinned', () => {
+    assert.deepEqual([...CURSOR_CONTEXT_TIERS], ['300k', '1m'])
+    assert.equal(DEFAULT_CURSOR_CONTEXT_TIER, '300k')
+    assert.equal(CURSOR_CONTEXT_TIER_WINDOW['300k'], 300_000)
+    assert.equal(CURSOR_CONTEXT_TIER_WINDOW['1m'], 1_000_000)
+    assert.equal(isCursorContextTier('300k'), true)
+    assert.equal(isCursorContextTier('1m'), true)
+    assert.equal(isCursorContextTier('1M'), false)
+    assert.equal(isCursorContextTier('200k'), false)
+    assert.equal(isCursorContextTier(null), false)
+    assert.equal(isCursorContextTier(undefined), false)
+  })
+
+  test('exactly opus-5 / opus-4.8 / fable-5 / fable-5.1 families are tiered', () => {
+    assert.deepEqual([...CURSOR_CONTEXT_TIER_FAMILIES], ['opus-5', 'opus-4.8', 'fable-5', 'fable-5.1'])
+    for (const model of CURSOR_ENGINE_MODELS) {
+      assert.equal(
+        cursorModelSupportsContextTier(model.id),
+        CURSOR_CONTEXT_TIER_FAMILIES.includes(model.family),
+        `${model.id} tier support must follow its family`,
+      )
+    }
+    assert.equal(cursorFamilySupportsContextTier('auto'), false)
+    assert.equal(cursorModelSupportsContextTier('gpt-5.6-sol'), false)
+    assert.equal(cursorModelSupportsContextTier(null), false)
+    assert.equal(cursorModelSupportsContextTier(undefined), false)
+  })
+
+  test('projectContextWindowForCursorTier only narrows, never widens, and passes through non-tier models', () => {
+    // 缺省档 = 300k;显式 1m 保留目录上限(1M)
+    assert.equal(projectContextWindowForCursorTier('cursor-fable-5.1-high', 1_000_000, null), 300_000)
+    assert.equal(projectContextWindowForCursorTier('cursor-fable-5.1-high', 1_000_000, undefined), 300_000)
+    assert.equal(projectContextWindowForCursorTier('cursor-fable-5.1-high', 1_000_000, '300k'), 300_000)
+    assert.equal(projectContextWindowForCursorTier('cursor-fable-5.1-high', 1_000_000, '1m'), 1_000_000)
+    assert.equal(projectContextWindowForCursorTier('cursor-opus-5-high', 1_000_000, '1m'), 1_000_000)
+    assert.equal(projectContextWindowForCursorTier('cursor-opus-4.8-high', 1_000_000, '300k'), 300_000)
+    // 目录窗口低于档位:取 min(不放宽)
+    assert.equal(projectContextWindowForCursorTier('cursor-fable-5-high', 200_000, '1m'), 200_000)
+    assert.equal(projectContextWindowForCursorTier('cursor-fable-5-high', 200_000, '300k'), 200_000)
+    // null 窗口(目录未声明)透传
+    assert.equal(projectContextWindowForCursorTier('cursor-fable-5-high', null, '1m'), null)
+    // 非分档模型原样透传,无论 tier
+    assert.equal(projectContextWindowForCursorTier('cursor-auto', 1_000_000, '300k'), 1_000_000)
+    assert.equal(projectContextWindowForCursorTier('kimi-k3', 1_048_576, '300k'), 1_048_576)
+    assert.equal(projectContextWindowForCursorTier('gpt-5.6-sol', 400_000, '1m'), 400_000)
   })
 })

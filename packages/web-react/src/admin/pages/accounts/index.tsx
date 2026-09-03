@@ -26,7 +26,7 @@ import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { useAdminPoll } from "../../lib/useAdminPoll";
 import { getAdminPage } from "../../registry";
 import { AccountFormModal } from "./AccountFormModal";
-import { RecentUsersModal, RefreshHistoryModal } from "./AccountInfoModals";
+import { CursorUsageModal, RecentUsersModal, RefreshHistoryModal } from "./AccountInfoModals";
 import {
   AccountWarningChips,
   CooldownCell,
@@ -98,6 +98,7 @@ export default function AccountsPage() {
   const [formModal, setFormModal] = useState<{ mode: "create" | "edit"; account?: AccountRow } | null>(null);
   const [historyAcc, setHistoryAcc] = useState<{ id: string; label: string } | null>(null);
   const [recentAcc, setRecentAcc] = useState<{ id: string; label: string } | null>(null);
+  const [cursorUsageAcc, setCursorUsageAcc] = useState<{ id: string; label: string } | null>(null);
 
   const onStatusChange = useCallback((v: string) => {
     setStatus(v);
@@ -237,6 +238,11 @@ export default function AccountsPage() {
               {a.provider === "cursor" && a.cursor_quota_class !== "unknown" && (
                 <DropdownMenuItem onSelect={() => doResetQuotaClass(a)}>
                   重置配额分类 (解除 {a.cursor_quota_class})
+                </DropdownMenuItem>
+              )}
+              {a.provider === "cursor" && a.cursor_credential_kind === "session" && (
+                <DropdownMenuItem onSelect={() => setCursorUsageAcc({ id: a.id, label: a.label })}>
+                  Cursor 额度 / 用量
                 </DropdownMenuItem>
               )}
               <DropdownMenuItem onSelect={() => setRecentAcc({ id: a.id, label: a.label })}>
@@ -397,6 +403,12 @@ export default function AccountsPage() {
         onOpenChange={(o) => !o && setRecentAcc(null)}
         accountId={recentAcc?.id ?? null}
         accountLabel={recentAcc?.label ?? ""}
+      />
+      <CursorUsageModal
+        open={cursorUsageAcc !== null}
+        onOpenChange={(o) => !o && setCursorUsageAcc(null)}
+        accountId={cursorUsageAcc?.id ?? null}
+        accountLabel={cursorUsageAcc?.label ?? ""}
       />
       {confirmEl}
     </div>

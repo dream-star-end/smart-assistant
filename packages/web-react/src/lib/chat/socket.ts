@@ -26,8 +26,11 @@ import {
   expireGenPlaceholdersAgainstServerRows,
   normalizeDelegateCards,
   normalizeGoalCards,
+  paintDeferredTerminalError,
+  rememberSettledPermissionRequestId,
   resetAgentFrameSeqCursorsForSession,
   resetFrameSeqCursor,
+  type DeferredTerminalErrorPaint,
   type FrameEffects,
 } from "./reducer";
 import {
@@ -129,6 +132,7 @@ import type {
   OutboundModelSwitchPreparedWire,
   OutboundWire,
   GoalSnapshotWire,
+  RecoveryDecisionWire,
   RepoBindErrorWire,
   RepoStatusWire,
   RelayReadyWire,
@@ -184,6 +188,11 @@ export const LIVE_JOURNAL_OPEN_CURSOR = "0";
  * hard lifetime covers the server's full recoverable materialization backoff. */
 export const UNPUBLISHED_TAPE_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16_000, 30_000] as const;
 export const UNPUBLISHED_TAPE_RETRY_MAX_MS = 15 * 60_000;
+/** Master 自动恢复裁决(sys.recovery_decision)的等待宽限:Phase A finalize → 调度器被 kick →
+ * Phase B 提交 → 广播,常规在 1-6s 内;超时未见裁决按「不会恢复」物化红卡,绝不让软状态永挂。*/
+export const RECOVERY_DECISION_GRACE_MS = 20_000;
+/** 裁决 scheduled:true 之后等 `outbound.ack{recovery}` 领养的宽限(drain 1s 轮询 + 容器准入)。*/
+export const RECOVERY_ADOPTION_GRACE_MS = 30_000;
 
 export type LiveJournalObservation = {
   frameCount: number;
@@ -815,6 +824,18 @@ export class ChatSocket {
   /** Per-connection negotiation. Legacy remains the default until relay_ready
    * explicitly advertises Master ownership, preventing mixed-version dual retry. */
   private masterOwnsAutomaticRecovery = false;
+  /**
+   * 延后中的终态红卡(每会话至多一条)。master 拥有自动恢复时,`outbound.error` 不立即画卡,
+   * 先存这里并保持 retrying 软状态;三种收口:① `sys.recovery_decision{scheduled:true}` →
+   * 续等 ack 领养(延长宽限);② `{scheduled:false}` / 宽限超时 → `paintDeferredTerminalError`
+   * 物化同一张卡;③ `outbound.ack{recovery}` 领养 → 直接丢弃(子轮接管 UI)。
+   */
+  private readonly pendingRecoveryErrors = new Map<string, {
+    paint: DeferredTerminalErrorPaint;
+    clientMessageId?: string;
+    timer: ReturnType<typeof setTimeout>;
+    decided: boolean;
+  }>();
   private controlQueue: PendingControlItem[] = [];
   private controlPumpScheduled = false;
   private readonly controlPersistRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -1859,6 +1880,7 @@ export class ChatSocket {
           setTimeout(() => void this.autoRecoverTerminalTurn(sessId, clientMessageId), 0);
         }
       },
+      deferTerminalErrorForRecovery: (sessId, paint) => this.deferTerminalErrorForRecovery(sessId, paint),
       refreshBalance: () => this.deps.refreshBalance?.(),
       reportTurnError: (p) =>
         this.deps.reportClientError?.({ type: "turn_error", code: p.code, traceId: p.traceId, sessionId: p.sessionId }),
@@ -2244,8 +2266,13 @@ export class ChatSocket {
           const ownsActiveTurn = !frame.clientMessageId ||
             activeClientMessageId === frame.clientMessageId;
           applyOutboundError(sess, frame, this.effects());
+          // 释放 peer slot(恢复子轮要占同一 slot);红卡若被延后,thinking-safety 只重置不清——
+          // 软状态仍需「后端死了也能兜底收口」。
           this.finishDispatch(sess.id, frame.clientMessageId ?? (ownsActiveTurn ? activeClientMessageId : undefined));
-          if (ownsActiveTurn) this.clearThinkingSafety(sess.id);
+          if (ownsActiveTurn) {
+            if (this.pendingRecoveryErrors.has(sess.id)) this.resetThinkingSafety(sess.id);
+            else this.clearThinkingSafety(sess.id);
+          }
         }
         return;
       }
@@ -2264,7 +2291,10 @@ export class ChatSocket {
             activeClientMessageId === frame.clientMessageId;
           applyLegacyBridgeError(sess, frame, this.effects());
           this.finishDispatch(sess.id, frame.clientMessageId ?? (ownsActiveTurn ? activeClientMessageId : undefined));
-          if (ownsActiveTurn) this.clearThinkingSafety(sess.id);
+          if (ownsActiveTurn) {
+            if (this.pendingRecoveryErrors.has(sess.id)) this.resetThinkingSafety(sess.id);
+            else this.clearThinkingSafety(sess.id);
+          }
           this.deps.persistSession?.(sess.id);
         }
         return;
@@ -2381,6 +2411,10 @@ export class ChatSocket {
       }
       case "sys.media_job": {
         this.deps.onMediaJob?.(f as MediaJobWire);
+        return;
+      }
+      case "sys.recovery_decision": {
+        this.applyRecoveryDecision(f as RecoveryDecisionWire);
         return;
       }
       case "sys.context_rebuilt": {
@@ -2551,6 +2585,18 @@ export class ChatSocket {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
     if (!isClientMessageId(recovery.sourceClientMessageId)) return;
+    // 用户已对该血统按过停止(含「正在重试中」软状态下的停止):master 的 stop 控制可能与
+    // 已入队的恢复子轮竞争,晚到的 ack 领养不得再把这条会话重新拉回 in-flight。
+    if (
+      sess._cancelledAutomaticRecoveryIds?.[recovery.sourceClientMessageId] === true ||
+      (isClientMessageId(recovery.rootClientMessageId) &&
+        sess._cancelledAutomaticRecoveryIds?.[recovery.rootClientMessageId] === true) ||
+      sess._cancelledAutomaticRecoveryIds?.[clientMessageId] === true
+    ) {
+      return;
+    }
+    // 子轮领养 = 延后红卡的正向收口:丢弃暂存的错误,软状态由下方权威 attempt 接管。
+    this.settlePendingRecoveryError(sessId, recovery.sourceClientMessageId, "adopted");
     const attempt = Number.isSafeInteger(recovery.attempt) && recovery.attempt >= 1
       ? Math.min(recovery.attempt, AUTOMATIC_TURN_RETRY_MAX)
       : 1;
@@ -2667,6 +2713,103 @@ export class ChatSocket {
     });
   }
 
+  // ═══════════════ 延后红卡(master 自动恢复裁决)═══════════════
+
+  /**
+   * reducer 钩子:master 拥有自动恢复且错误可恢复时接管这条终态错误。返回 true 后 reducer 不画
+   * 红卡、保持软状态;这里挂宽限计时器等 `sys.recovery_decision`。同会话若已有一条延后中的错误
+   * (理论上不会:一轮只有一个终态),先物化旧的再接新的,不吞卡。
+   */
+  private deferTerminalErrorForRecovery(sessId: string, paint: DeferredTerminalErrorPaint): boolean {
+    if (!this.masterOwnsAutomaticRecovery) return false;
+    const sess = this.sessions.get(sessId);
+    if (!sess) return false;
+    const clientMessageId = paint.clientMessageId ?? sess._activeClientMessageId;
+    // 用户已对该血统按过停止:master 不会再调度,也不该让用户看到"正在重试中"。
+    if (clientMessageId && sess._cancelledAutomaticRecoveryIds?.[clientMessageId] === true) return false;
+    if (clientMessageId && sess._automaticRecoveryDecisions?.[clientMessageId] === true) return false;
+    const previous = this.pendingRecoveryErrors.get(sessId);
+    if (previous) {
+      if (previous.clientMessageId === clientMessageId) {
+        clearTimeout(previous.timer);
+        this.pendingRecoveryErrors.delete(sessId);
+      } else {
+        this.materializePendingRecoveryError(sessId);
+      }
+    }
+    const timer = setTimeout(() => this.materializePendingRecoveryError(sessId), RECOVERY_DECISION_GRACE_MS);
+    this.pendingRecoveryErrors.set(sessId, { paint, clientMessageId, timer, decided: false });
+    return true;
+  }
+
+  /** master 裁决:scheduled → 续等 ack 领养(刷新 attempt,延长宽限);否则立即物化红卡。*/
+  private applyRecoveryDecision(frame: RecoveryDecisionWire): void {
+    const sessId = frame.peer?.id;
+    if (!sessId) return;
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    const pending = this.pendingRecoveryErrors.get(sessId);
+    const matchesPending = !!pending &&
+      (!pending.clientMessageId || pending.clientMessageId === frame.sourceClientMessageId);
+    if (frame.scheduled) {
+      if (matchesPending && pending) {
+        clearTimeout(pending.timer);
+        pending.decided = true;
+        pending.timer = setTimeout(() => this.materializePendingRecoveryError(sessId), RECOVERY_ADOPTION_GRACE_MS);
+      }
+      // 软状态仍在(延后路径)或本轮仍在飞:用权威 attempt 刷新文案;不凭裁决伪造 in-flight。
+      if (sess._sendingInFlight && (matchesPending || sess._activeClientMessageId === frame.sourceClientMessageId)) {
+        const attempt = Number.isSafeInteger(frame.attempt) && frame.attempt >= 1
+          ? Math.min(frame.attempt, AUTOMATIC_TURN_RETRY_MAX)
+          : 1;
+        sess._turnStatus = { kind: "retrying", attempt, max: AUTOMATIC_TURN_RETRY_MAX, retryAt: Date.now() };
+        this.scheduleNotify();
+      }
+      return;
+    }
+    if (matchesPending) this.materializePendingRecoveryError(sessId);
+  }
+
+  /** 正向收口(ack 领养 / lineage 拒绝前置):丢弃暂存错误。`declined` 时先物化红卡再返回。*/
+  private settlePendingRecoveryError(
+    sessId: string,
+    sourceClientMessageId: string | undefined,
+    outcome: "adopted" | "declined",
+  ): void {
+    const pending = this.pendingRecoveryErrors.get(sessId);
+    if (!pending) return;
+    if (pending.clientMessageId && sourceClientMessageId && pending.clientMessageId !== sourceClientMessageId) return;
+    if (outcome === "declined") {
+      this.materializePendingRecoveryError(sessId);
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingRecoveryErrors.delete(sessId);
+    const sess = this.sessions.get(sessId);
+    if (sess) sess._deferredTerminalErrorClientMessageId = undefined;
+  }
+
+  /** 负向收口:用与实时路径完全相同的 painter 补画红卡并清发送态。*/
+  private materializePendingRecoveryError(sessId: string): void {
+    const pending = this.pendingRecoveryErrors.get(sessId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingRecoveryErrors.delete(sessId);
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    sess._deferredTerminalErrorClientMessageId = undefined;
+    const wasActive = sess._sendingInFlight &&
+      (!pending.clientMessageId || sess._activeClientMessageId === pending.clientMessageId);
+    paintDeferredTerminalError(sess, pending.paint, this.effects());
+    if (wasActive && !sess._sendingInFlight) {
+      // painter 已清 in-flight;补齐 socket 侧收尾(thinking-safety / 排队消息续发)。
+      this.clearThinkingSafety(sessId);
+      this.kickQueuedDrainIfIdle();
+    }
+    this.deps.persistSession?.(sessId);
+    this.scheduleNotify();
+  }
+
   /** Atomic master lineage rejection: remove only the deterministic recovery
    * child. The original user/process/error tape remains untouched and visible. */
   private reconcileSkippedRecovery(frame: AckWire): boolean {
@@ -2678,6 +2821,8 @@ export class ChatSocket {
     const sourceClientMessageId = isClientMessageId(frame.sourceClientMessageId)
       ? frame.sourceClientMessageId
       : undefined;
+    // 血统被 master 原子拒绝:延后的红卡必须先落地,下方的 skip 提示才有卡可挂。
+    this.settlePendingRecoveryError(sessId, sourceClientMessageId, "declined");
     if (sourceClientMessageId) {
       sess._automaticRecoveryDecisions = {
         ...(sess._automaticRecoveryDecisions ?? {}),
@@ -3169,6 +3314,11 @@ export class ChatSocket {
     this.maybePromoteToConnected();
     this.pendingRepoBind.delete(sessId);
     this.transientNotices.delete(sessId);
+    const pendingRecoveryError = this.pendingRecoveryErrors.get(sessId);
+    if (pendingRecoveryError) {
+      clearTimeout(pendingRecoveryError.timer);
+      this.pendingRecoveryErrors.delete(sessId);
+    }
     this.lastSyncAt.delete(sessId);
     for (const key of this.activeReplayAttemptKeys) {
       if (key.startsWith(`${sessId}:`)) this.activeReplayAttemptKeys.delete(key);
@@ -3206,6 +3356,8 @@ export class ChatSocket {
     this.unpublishedTapeRetries.clear();
     for (const timer of this.controlPersistRetryTimers.values()) clearTimeout(timer);
     this.controlPersistRetryTimers.clear();
+    for (const pending of this.pendingRecoveryErrors.values()) clearTimeout(pending.timer);
+    this.pendingRecoveryErrors.clear();
     this.activeReplayAttemptKeys.clear();
     this.activeSessionId = undefined;
     if (this.sessions.size === 0) return;
@@ -3293,6 +3445,9 @@ export class ChatSocket {
       ...(s._dispatchPaused ? { _dispatchPaused: true } : {}),
       ...(s._cancelledAutomaticRecoveryIds
         ? { _cancelledAutomaticRecoveryIds: { ...s._cancelledAutomaticRecoveryIds } }
+        : {}),
+      ...(s._settledPermissionRequestIds
+        ? { _settledPermissionRequestIds: { ...s._settledPermissionRequestIds } }
         : {}),
       ...(s._automaticRecoveryDecisions
         ? { _automaticRecoveryDecisions: { ...s._automaticRecoveryDecisions } }
@@ -3382,6 +3537,11 @@ export class ChatSocket {
       typeof stored._cancelledAutomaticRecoveryIds === "object"
         ? { ...stored._cancelledAutomaticRecoveryIds }
         : undefined;
+    s._settledPermissionRequestIds =
+      stored._settledPermissionRequestIds &&
+      typeof stored._settledPermissionRequestIds === "object"
+        ? { ...stored._settledPermissionRequestIds }
+        : undefined;
     s._automaticRecoveryDecisions =
       stored._automaticRecoveryDecisions &&
       typeof stored._automaticRecoveryDecisions === "object"
@@ -3430,7 +3590,9 @@ export class ChatSocket {
       : [];
     for (const control of storedControls) {
       const item: PendingControlItem = { ...control, status: "queued" };
-      if (control.controlKind === "stop") {
+      if (control.controlKind === "stop" && control.fenceOnly === true) {
+        // 围栏 stop 只需重放到 master;不代表在飞 turn,不进入停止态。
+      } else if (control.controlKind === "stop") {
         s._sendingInFlight = true;
         s._activeClientMessageId = control.clientMessageId;
         s._stopSettlement = {
@@ -3450,7 +3612,10 @@ export class ChatSocket {
     // so register the repaired session first.  A clean second load remains a
     // zero-write fast path because the repair is idempotent.
     if (repairedStoredOrder) this.deps.persistSession?.(stored.id);
-    if (restoredExactInFlight && storedControls.every((item) => item.controlKind !== "stop")) {
+    if (
+      restoredExactInFlight &&
+      storedControls.every((item) => item.controlKind !== "stop" || item.fenceOnly === true)
+    ) {
       this.startContinuousReconcile(stored.id);
     }
     if (storedPending.length > 0 && !s._dispatchPaused) this.kickDispatchPump();
@@ -4115,6 +4280,12 @@ export class ChatSocket {
       // the user has to unblock the engine. mergeFullServerWins keeps the same
       // rows on the REST path.
       if (isUnresolvedPermissionPrompt(message)) return true;
+      // INC-20260903-PENDING-PERMISSION-ZOMBIE: a resolved card may be dropped
+      // here, but its requestId must stay known-settled so a stale hello
+      // catch-up cannot re-open it as a fresh "waiting" prompt.
+      if (message.role === "permission" && message._resolved === true) {
+        rememberSettledPermissionRequestId(sess, message.requestId);
+      }
       if (preserveStreamingPointer && message === streamingAssistant) return true;
       if (shouldRetainLiveProcessOnOwnerReset(message, authority, incomingProcessOwners)) {
         return true;
@@ -4572,6 +4743,7 @@ export class ChatSocket {
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;
+    contextTier?: InboundMessage["contextTier"];
   }): void {
     const sess = this.ensureSession(p.sessId, p.agentId);
     if (sess._recoveryStatus?.kind === "completed" || sess._recoveryStatus?.kind === "resumed") {
@@ -4593,11 +4765,12 @@ export class ChatSocket {
     const preparedSwitch = p.model && sess._preparedModelSwitch?.targetModel === p.model
       ? sess._preparedModelSwitch
       : undefined;
-    const routing = {
+    const routing: ChatRoutingSnapshot = {
       model: p.model,
       ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       teamMode: !!p.teamMode,
       effortLevel: p.effortLevel ?? null,
+      ...(p.contextTier ? { contextTier: p.contextTier } : {}),
     };
     sess._lastRouting = routing;
     const media = p.media && p.media.length > 0 ? p.media : undefined;
@@ -4632,6 +4805,8 @@ export class ChatSocket {
       ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
       ...(p.teamMode ? { teamMode: true } : {}),
+      // Cursor Opus/Fable 上下文档位(300k/1m):master 逐 turn 收窄签名 descriptor 的窗口。
+      ...(p.contextTier ? { contextTier: p.contextTier } : {}),
       ts: Date.now(),
     };
     const userMsg = addMessage(sess, "user", p.displayText ?? p.text, {
@@ -4812,6 +4987,7 @@ export class ChatSocket {
       ...(routing.model ? { model: routing.model } : {}),
       ...(routing.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing.teamMode ? { teamMode: true } : {}),
+      ...(routing.contextTier ? { contextTier: routing.contextTier } : {}),
       ts: Date.now(),
       clientMessageId: target.clientMessageId,
     };
@@ -4990,6 +5166,7 @@ export class ChatSocket {
       ...(routing?.model ? { model: routing.model } : {}),
       ...(routing?.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
+      ...(routing?.contextTier ? { contextTier: routing.contextTier } : {}),
       ts: Date.now(),
     };
     // 重试语义分流(RFC §5):
@@ -5156,12 +5333,21 @@ export class ChatSocket {
     if (durableClear) void durableClear.catch(() => {});
     const sess = this.sessions.get(item.sessId);
     if (!sess) return;
+    if (item.controlKind === "stop" && item.fenceOnly === true) {
+      // 围栏 stop 的回执只是 master 已落库取消恢复子轮;红卡早已物化,当前发送态(若有)属于
+      // 之后的新轮,不能被这条回执清掉。
+      this.scheduleNotify();
+      return;
+    }
     if (item.controlKind === "stop") {
       this.clearContinuousReconcile(sess.id);
       this.finishDispatch(sess.id, item.clientMessageId);
       sess._stopSettlement = undefined;
       this.clearSendingState(sess, { clearThinking: true });
     } else if (item.requestId) {
+      // Our own durable answer is a settlement too: a stale hello catch-up
+      // must not re-open this prompt after full-sync dropped the card.
+      rememberSettledPermissionRequestId(sess, item.requestId);
       const permission = sess.messages.find((message) => message.requestId === item.requestId);
       if (permission) {
         permission._resolved = true;
@@ -5186,6 +5372,10 @@ export class ChatSocket {
     const sess = this.sessions.get(item.sessId);
     if (frame.status === "persisted" || (frame.status === "applied" && item.controlKind === "stop")) {
       item.status = "persisted";
+      if (item.controlKind === "stop" && item.fenceOnly === true) {
+        // 围栏 stop:persisted 即 master 已取消恢复子轮,无 UI 状态需要推进。
+        return;
+      }
       const stopSettlement = sess?._stopSettlement;
       if (sess && stopSettlement?.controlId === frame.controlId) {
         stopSettlement.phase = "persisted";
@@ -5313,6 +5503,58 @@ export class ChatSocket {
     if (!sess) return;
     const pending = this.offlineQueue.filter((item) => item.sessId === sessId);
     if (!sess._sendingInFlight && pending.length === 0) return;
+    // 「正在重试中」软状态下按停止:源轮在服务端已是终态,没有可停的在飞 turn。落下用户停止
+    // 围栏(master 随后的 ack 领养会被拒),立即物化延后的红卡让 UI 收口;同时仍以 durable stop
+    // 控制通知 master —— admitDurableControl 会在同一事务里取消该血统已入队的恢复子轮,且此后
+    // enqueueAutomaticRecoveryJob 的 NOT EXISTS(stop) 守卫会拒绝再入队。这条控制**不**进入
+    // _stopSettlement / 「正在停止…」态:服务端回执只是幂等收尾,不应再挂住 composer。
+    const deferred = this.pendingRecoveryErrors.get(sessId);
+    if (deferred && pending.length === 0) {
+      const lineageId = deferred.clientMessageId ?? sess._activeClientMessageId;
+      let rootId: string | undefined;
+      if (lineageId) {
+        sess._cancelledAutomaticRecoveryIds = {
+          ...(sess._cancelledAutomaticRecoveryIds ?? {}),
+          [lineageId]: true,
+        };
+        const sourceUser = sess.messages.find((m) => m.role === "user" && m.id === lineageId);
+        rootId = sourceUser?._automaticRecoveryRootClientMessageId ?? sourceUser?._recoveryOfClientMessageId;
+        if (rootId) sess._cancelledAutomaticRecoveryIds[rootId] = true;
+      }
+      const stopAgentId = sess._activeAgentId || sess.agentId || this.deps.defaultAgentId || "main";
+      this.materializePendingRecoveryError(sessId);
+      sess._recoveryStatus = { kind: "completed" };
+      const fenceId = rootId ?? lineageId;
+      if (fenceId) {
+        const controlId = stableControlId("stop", `${fenceId}:recovery-fence`);
+        if (!this.controlQueue.some((item) => item.controlId === controlId)) {
+          this.enqueueControl({
+            kind: "control",
+            sessId: sess.id,
+            controlId,
+            controlKind: "stop",
+            clientMessageId: fenceId,
+            agentId: stopAgentId,
+            fenceOnly: true,
+            payload: {
+              type: "inbound.control.stop",
+              controlId,
+              channel: "webchat",
+              peer: { id: sess.id, kind: "dm" },
+              agentId: stopAgentId,
+              clientMessageId: fenceId,
+            },
+            enqueuedAt: Date.now(),
+            attempt: 0,
+            status: "queued",
+          });
+        }
+      }
+      this.deps.persistSession?.(sess.id);
+      this.clearTransientNotice(sessId);
+      this.scheduleNotify();
+      return;
+    }
     const slottedClientMessageId = this.dispatchSlots.get(sessId);
     const activeClientMessageId =
       sess._activeClientMessageId ??
@@ -5548,6 +5790,7 @@ export class ChatSocket {
       ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel") ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] } : {}),
       ...(routing?.model ? { model: routing.model } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
+      ...(routing?.contextTier ? { contextTier: routing.contextTier } : {}),
       ts: Date.now(),
     };
     const userMsg = addMessage(sess, "user", AUTO_CONTINUE_DISPLAY, {

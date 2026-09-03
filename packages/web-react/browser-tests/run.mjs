@@ -1968,6 +1968,31 @@ await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹
     touchPoints: [{ x, y: y + 24, radiusX: 4, radiusY: 4, force: 1, id: 1 }],
   });
   await mobilePage.waitForTimeout(80);
+  const duringGesture = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    directManipulation: window.__mobilePage.directManipulation,
+  }));
+  if (!duringGesture.directManipulation) {
+    throw new Error("触摸仍按住时 direct-manipulation 已被首个 scroll 事件错误释放");
+  }
+  await mobilePage.evaluate(() => window.__mobilePage.attemptViewportCorrection(120));
+  const afterCorrection = await scroll.evaluate((node) => node.scrollTop);
+  if (Math.abs(afterCorrection - duringGesture.top) > 2) {
+    throw new Error(
+      `触摸拖动期间 viewport correction 抢写 scrollTop: before=${duringGesture.top}, after=${afterCorrection}`,
+    );
+  }
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchMove",
+    touchPoints: [{ x, y: y + 56, radiusX: 4, radiusY: 4, force: 1, id: 1 }],
+  });
+  await mobilePage.waitForTimeout(80);
+  const afterSecondMove = await scroll.evaluate((node) => node.scrollTop);
+  if (afterSecondMove >= duringGesture.top - 2) {
+    throw new Error(
+      `触摸连续拖动未继续跟手: first=${duringGesture.top}, second=${afterSecondMove}`,
+    );
+  }
   await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
   await cdp.detach();
   await mobilePage.waitForTimeout(80);
@@ -1975,12 +2000,16 @@ await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹
   const afterGesture = await scroll.evaluate((node) => ({
     top: node.scrollTop,
     following: window.__mobilePage.following,
+    directManipulation: window.__mobilePage.directManipulation,
   }));
   if (afterGesture.top >= before.top - 2) {
     throw new Error(`触控上滑没有离开底部: before=${before.top}, after=${afterGesture.top}`);
   }
   if (afterGesture.following) {
     throw new Error("触控首次上滑后仍处于贴底态");
+  }
+  if (afterGesture.directManipulation) {
+    throw new Error("触摸松手后 direct-manipulation 未释放");
   }
 
   await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
@@ -2891,6 +2920,29 @@ await check("T59 Phase-A unpublished 后交错 live assistant 段仍保持 think
   });
   if ((await replayRoot.getByText("BROWSER_PHASE_A_INTERLEAVE_FALLBACK", { exact: true }).count()) !== 0) {
     throw new Error("Phase-A interleaved reset 渲染了 fallback 整块正文");
+  }
+});
+
+await check("T62 Phase-A fallback 与最后一段 live 正文同 id 时最后一段正文不闪没", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runPhaseALastSegmentIdCollision());
+  if (result.sending) throw new Error("Phase-A 完成后仍在发送");
+  const texts = result.visibleAssistant.map((row) => row.text);
+  if (JSON.stringify(texts) !== JSON.stringify(["BROWSER_PHASE_A_COLLIDE_A1", "BROWSER_PHASE_A_COLLIDE_FINAL"])) {
+    throw new Error(`Phase-A 同 id fallback 吞掉最后一段正文:${JSON.stringify(result)}`);
+  }
+  if (result.unpublishedRowHidden || result.unpublishedRowText !== "BROWSER_PHASE_A_COLLIDE_FINAL") {
+    throw new Error(`unpublished 行应承载最后一段正文而非隐藏:${JSON.stringify(result)}`);
+  }
+  await replayRoot.getByText("BROWSER_PHASE_A_COLLIDE_A1", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await replayRoot.getByText("BROWSER_PHASE_A_COLLIDE_FINAL", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  if ((await replayRoot.getByText("BROWSER_PHASE_A_COLLIDE_A1BROWSER_PHASE_A_COLLIDE_FINAL", { exact: true }).count()) !== 0) {
+    throw new Error("渲染了 fallback 拼接整块正文");
   }
 });
 

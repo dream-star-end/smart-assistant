@@ -96,6 +96,7 @@ import {
   classifyDelegateOutputError,
   classifyRunError,
 } from './errorClassify.js'
+import { parseCreditBudgetFen } from './creditExhaustion.js'
 import {
   DELEGATE_CONTEXT_HEADER,
   verifyDelegateContextToken,
@@ -159,6 +160,7 @@ import {
   getUsageSummary,
   queryEvents,
   listClientSessions,
+  classifyClientSessions,
   getClientSession,
   getClientSessionPartial,
   readArchivedMessages,
@@ -691,6 +693,15 @@ export const EXECUTION_MODEL_FALLBACK_ROUTE = [
 export const EXECUTION_MODEL_FALLBACK = EXECUTION_MODEL_FALLBACK_ROUTE[0]
 
 /**
+ * delegate_task(s) 未显式指定 model 时的默认优先模型:先试 grok-build(上游 grok-4.6)。
+ * 只在 selfhost 豁免门(isEngineLocalTurnExempt)开着时插入候选;catalog 无该行 / 不可路由
+ * 会被 decideLocalExecution 的候选循环静默跳过,mint 失败则由 handleDelegateTask 回落到
+ * DELEGATE_GROK_FALLBACK_MODEL(日志 delegate_grok_fallback)。显式 model 完全不受影响。
+ */
+export const DELEGATE_DEFAULT_PREFERRED_MODELS = ['grok-build'] as const
+export const DELEGATE_GROK_FALLBACK_MODEL = 'glm-5.3-zai'
+
+/**
  * 把 agent/config 级模型收敛到平台真实支持的集合。
  *
  * ALLOWED_INBOUND_MODELS 只拦**入站帧**;但 agent.model(marketplace manifest / seed /
@@ -941,6 +952,11 @@ export function decideLocalExecution(args: {
   liveSessionSkipReason?: string
   /** config.defaults.model。 */
   defaultModel?: string | null
+  /**
+   * 无显式 model 时、插在 liveSessionModel 之后 / agent.model 之前的优先候选(delegate 默认
+   * grok-build 优先)。不可路由 / 非 ccb 且未豁免的条目由候选循环静默跳过。
+   */
+  preferredModels?: readonly string[]
   kind: LocalTurnKind
   env?: NodeJS.ProcessEnv
   /** 沿用会话模型失败并回退时调用(dispatchInbound 接到 this.log.warn)。 */
@@ -1019,6 +1035,7 @@ export function decideLocalExecution(args: {
     ? [explicitModel]
     : [
         ticketlessReuse && liveSessionModel && liveSkipReason === undefined ? liveSessionModel : undefined,
+        ...(args.preferredModels ?? []),
         agent.model,
         args.defaultModel,
         ...EXECUTION_MODEL_FALLBACK_ROUTE,
@@ -1140,6 +1157,8 @@ export async function resolveLocalExecutionIfEnforced(args: {
   /** 与 resolveLiveSessionModel 同时、在 catalog 之后取样。 */
   resolveLiveSessionSkipReason?: () => string | undefined
   defaultModel?: string | null
+  /** 见 decideLocalExecution.preferredModels(仅 delegate 默认路径传)。 */
+  preferredModels?: readonly string[]
   env?: NodeJS.ProcessEnv
   warn?: (message: string, fields?: Record<string, unknown>) => void
 }): Promise<LocalExecutionDecision | undefined> {
@@ -1990,6 +2009,19 @@ function resolveMemberDelegationsPerTurn(): number {
 function resolveHiddenDelegationsPerTurn(): number {
   const raw = Number(process.env.OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN)
   return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : MAX_HIDDEN_DELEGATIONS_PER_TURN
+}
+
+/**
+ * Existence/ownership probe that never hydrates turn tapes. `getClientSession`
+ * (exact view) materializes every tape payload of the session — hundreds of
+ * MB on long sessions — which is what pushed the inflight-delegates poll and
+ * cron/delegate callback lookups into the 30s PG statement budget
+ * (OCV5-94). One indexed `client_sessions` row is enough to answer
+ * "does this active session belong to this user".
+ */
+async function clientSessionIsActive(sessionId: string, userId: string): Promise<boolean> {
+  const [state] = await classifyClientSessions([{ sessionId, userId }])
+  return state?.state === 'active'
 }
 
 /** 「每 turn、按父会话」的委派计数器 —— 一套通用机制,当前服务两条策略:
@@ -5366,7 +5398,8 @@ export class Gateway {
         userId,
         enabled,
         searchParams: url.searchParams,
-        loadSession: (id, uid) => getClientSession(id, uid),
+        loadSession: async (id, uid) =>
+          (await clientSessionIsActive(id, uid)) ? { id, userId: uid } : null,
         store: enabled ? this._ensureDelegateInflightSurface() : null,
         overlayJobs: () => this._delegateJobs?.listNonTerminal() ?? [],
         resolveJob: (jobId) => this._delegateJobs?.snapshotOf(jobId),
@@ -10727,6 +10760,8 @@ export class Gateway {
   private _delegateJobs: DelegateJobStore | undefined
   /** Test seam for engine-reported delegate admit/settle/abandon. */
   private _delegateEngineBilling: DelegateEngineBillingClient | undefined
+  /** Test seam: grok relay route mint(默认 grok-build 优先 → mint 失败回落 glm 的用例注入)。 */
+  private _acquireDelegateGrokRoute: typeof acquireDelegateGrokRoute | undefined
   /** Test seam: skip the 60s idle-timeout floor so timeout/billing races are unit-testable. */
   private _delegateTimeoutConfig: DelegateTimeoutConfig | undefined
   /** Stage 1: durable boot reconciler has finished (or durable is off). */
@@ -12222,14 +12257,18 @@ export class Gateway {
     // 也因此,这里必然**先于 getOrCreate/createEngine** —— 结构化拒绝时不会有任何 runner
     // 被 spawn(方案 §3 要求的"创建 runner 前拒",测试 ④/⑤ 断言未 spawn)。
     const requestedModel = isReview ? undefined : input.model
-    const execAgent = requestedModel ? { ...delegatedAgent, model: requestedModel } : delegatedAgent
+    let execAgent = requestedModel ? { ...delegatedAgent, model: requestedModel } : delegatedAgent
     let delegateExec: LocalExecutionDecision | undefined
+    // 默认(未显式指定 model、非 review)委派优先 grok-build;只在 selfhost 引擎本地豁免门
+    // 开着时插入(生产没有 grok 本地 turn),catalog 无该行时候选循环自然跳过。
+    const preferGrokDefault = !requestedModel && !isReview && isEngineLocalTurnExempt(process.env)
     try {
       delegateExec = await resolveLocalExecutionIfEnforced({
         agent: execAgent,
         kind: 'turn',
         model: requestedModel,
         defaultModel: this.deps.config.defaults.model,
+        preferredModels: preferGrokDefault ? DELEGATE_DEFAULT_PREFERRED_MODELS : undefined,
       })
     } catch (err) {
       const mapped = this._mapLocalExecutionError(err)
@@ -12569,13 +12608,49 @@ export class Gateway {
           message: 'Grok 委派暂不可用: missing grok model id',
         }
       }
-      const acquired = await acquireDelegateGrokRoute({
+      const acquired = await (this._acquireDelegateGrokRoute ?? acquireDelegateGrokRoute)({
         modelId: grokMintModelId,
         sessionId: sessionKey,
         log: this.log,
       })
-      if (!acquired.ok) {
-        // 与排队被拒同形:已过闸的并发名额必须在此释放(下方 finally 不会执行)。
+      if (!acquired.ok && !requestedModel) {
+        // 默认路径(用户没显式要 grok):mint 失败(订阅并发满 / 容器租约上限 / 无账号 /
+        // master 通道缺失)不拒,同一请求内回落到 ccb 的 DELEGATE_GROK_FALLBACK_MODEL,
+        // 名额继续持有,下方 billing admit(ccb 不进 engine-reported)与 getOrCreate 照常。
+        this.log.warn('delegate_grok_fallback', {
+          targetAgentId,
+          httpStatus: acquired.httpStatus,
+          reason: acquired.reason,
+          from: grokMintModelId,
+          to: DELEGATE_GROK_FALLBACK_MODEL,
+        })
+        try {
+          delegateExec = await resolveLocalExecutionIfEnforced({
+            agent: { ...delegatedAgent, model: DELEGATE_GROK_FALLBACK_MODEL },
+            kind: 'turn',
+            model: DELEGATE_GROK_FALLBACK_MODEL,
+            defaultModel: this.deps.config.defaults.model,
+          })
+        } catch (err) {
+          const mapped = this._mapLocalExecutionError(err)
+          if (!mapped) {
+            this._releaseDelegateSlot(slotOpts)
+            unregisterDelegation?.()
+            throw err
+          }
+          this._releaseDelegateSlot(slotOpts)
+          unregisterDelegation?.()
+          return {
+            kind: 'rejected',
+            httpStatus: mapped.httpStatus,
+            message: mapped.message,
+            code: mapped.code,
+          }
+        }
+        // 之后 grokRoute/grokRouteLease 保持 null:submit 不注入 grok route,ccb runner 正常起。
+        execAgent = { ...delegatedAgent, model: DELEGATE_GROK_FALLBACK_MODEL }
+      } else if (!acquired.ok) {
+        // 显式 model 指定 grok:与排队被拒同形,已过闸的并发名额必须在此释放(下方 finally 不会执行)。
         this._releaseDelegateSlot(slotOpts)
         unregisterDelegation?.()
         this.log.warn('delegate_grok_route_denied', {
@@ -12588,9 +12663,10 @@ export class Gateway {
           httpStatus: acquired.httpStatus,
           message: `Grok 委派暂不可用: ${acquired.reason}`,
         }
+      } else {
+        grokRoute = { baseUrl: acquired.lease.baseUrl, routeToken: acquired.lease.routeToken }
+        grokRouteLease = acquired.lease
       }
-      grokRoute = { baseUrl: acquired.lease.baseUrl, routeToken: acquired.lease.routeToken }
-      grokRouteLease = acquired.lease
     }
     // engine-reported (codex/grok) 委派必须先向 master 签 32-hex requestId +
     // inflight journal,否则 adapter 不 emit billing,usage_records.mode=delegate
@@ -13773,7 +13849,7 @@ export class Gateway {
       'default'
     let existing
     try {
-      existing = await getClientSession(origin.peerId, userId)
+      existing = await clientSessionIsActive(origin.peerId, userId)
     } catch (err) {
       this.log.warn('origin-session lookup failed', { jobId: job.id }, err as Error)
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_LOOKUP_FAILED' }
@@ -14144,7 +14220,7 @@ export class Gateway {
       return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
     }
     try {
-      const existing = await getClientSession(args.origin.peerId, args.userId)
+      const existing = await clientSessionIsActive(args.origin.peerId, args.userId)
       if (existing) {
         const persisted = await appendServerAuthoredMessage(args.origin.peerId, args.userId, {
           id: args.clientMessageId,
@@ -14341,7 +14417,7 @@ export class Gateway {
       return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
     }
     try {
-      const existing = await getClientSession(args.origin.peerId, args.userId)
+      const existing = await clientSessionIsActive(args.origin.peerId, args.userId)
       if (existing) {
         const persisted = await appendServerAuthoredMessage(args.origin.peerId, args.userId, {
           id: args.clientMessageId,
@@ -15975,6 +16051,9 @@ export class Gateway {
         if (!selfInterrupted) continue
         const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
         const ok = selfInterrupted || delegateInterrupted
+        // The turn is gone; any permission it was blocked on must not
+        // outlive it as a dead card (browser) / pending row (master).
+        this._settlePendingPermissionsForStop(live.sessionKey, clientMessageId)
         this.log.info('interrupt', {
           sessionKey: live.sessionKey,
           clientMessageId,
@@ -15998,6 +16077,7 @@ export class Gateway {
           if (!live.sessionKey.endsWith(suffix)) continue
           const selfInterrupted = this.sessions.interrupt(live.sessionKey)
           const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
+          if (selfInterrupted) this._settlePendingPermissionsForStop(live.sessionKey)
           interrupted = selfInterrupted || delegateInterrupted || interrupted
         }
         if (interrupted) {
@@ -16017,6 +16097,7 @@ export class Gateway {
     }
     const selfInterrupted = this.sessions.interrupt(sessionKey)
     const delegateInterrupted = this._interruptDelegationsForParent(sessionKey)
+    if (selfInterrupted) this._settlePendingPermissionsForStop(sessionKey)
     let ok = selfInterrupted || delegateInterrupted
     // Compatibility containment for already-open clients: if their selector
     // changed before Stop, the legacy frame names the new agent. Only on a
@@ -16026,6 +16107,7 @@ export class Gateway {
         if (!live.sessionKey.endsWith(suffix)) continue
         const fallbackSelf = this.sessions.interrupt(live.sessionKey)
         const fallbackDelegates = this._interruptDelegationsForParent(live.sessionKey)
+        if (fallbackSelf) this._settlePendingPermissionsForStop(live.sessionKey)
         ok = fallbackSelf || fallbackDelegates || ok
       }
     }
@@ -16326,7 +16408,7 @@ export class Gateway {
       peer: { id: string; kind: 'dm' | 'group' }
       requestId: string
       behavior: 'allow' | 'deny'
-      reason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed'
+      reason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed' | 'user_stop'
       answers?: Record<string, string>
     },
   ): void {
@@ -16897,7 +16979,8 @@ export class Gateway {
       patch._settledReason === 'already_settled' ||
       patch._settledReason === 'disconnect' ||
       patch._settledReason === 'timeout' ||
-      patch._settledReason === 'crashed'
+      patch._settledReason === 'crashed' ||
+      patch._settledReason === 'user_stop'
         ? patch._settledReason
         : 'remote'
     const answers =
@@ -17046,7 +17129,7 @@ export class Gateway {
 
   private _forceDenyPendingPermission(
     requestId: string,
-    reason: 'disconnect' | 'timeout' | 'crashed',
+    reason: 'disconnect' | 'timeout' | 'crashed' | 'user_stop',
     denyMessage: string,
   ): boolean {
     const pending = this._pendingPermissions.get(requestId)
@@ -17120,6 +17203,57 @@ export class Gateway {
     for (const requestId of pendingToReap) {
       this._forceDenyPendingPermission(requestId, 'crashed', 'Session crashed')
     }
+  }
+
+  /**
+   * Settle pending permission requests for a turn the user just stopped.
+   *
+   * `interruptClientTurn` / `sessions.interrupt` only abort the CCB turn; the
+   * `_pendingPermissions` entry created for a blocking `can_use_tool` (incl.
+   * AskUserQuestion) otherwise survives until the 10-minute janitor. During
+   * that window every hello replays the dead card to the browser (which
+   * renders it read-only since the turn is no longer `sending`) and the
+   * durable master row stays `pending` until the reconciler runs. Force-deny
+   * here so the runtime map, the master row and every connected tab converge
+   * on the same `user_stop` settlement the moment Stop is acknowledged.
+   *
+   * Detached ask_user cards are exempt (same contract as crash/disconnect/
+   * sweep): they outlive the turn by design and are answered later as a new
+   * inbound message.
+   *
+   * When `clientMessageId` is given, only entries owned by that browser turn
+   * are settled (entries recorded without a clientMessageId are assumed to
+   * belong to the stopped turn — the runtime never holds two blocking
+   * permissions for different turns of one session at once). Returns the
+   * number of settled requests.
+   */
+  private _settlePendingPermissionsForStop(
+    sessionKey: string,
+    clientMessageId?: string,
+  ): number {
+    const toSettle: string[] = []
+    for (const [requestId, pending] of this._pendingPermissions) {
+      if (isDetachedAskUserPending(pending)) continue
+      if (pending.sessionKey !== sessionKey) continue
+      if (clientMessageId && pending.clientMessageId && pending.clientMessageId !== clientMessageId) {
+        continue
+      }
+      toSettle.push(requestId)
+    }
+    let settled = 0
+    for (const requestId of toSettle) {
+      if (this._forceDenyPendingPermission(requestId, 'user_stop', 'User stopped the turn')) {
+        settled += 1
+      }
+    }
+    if (settled > 0) {
+      this.log.info('stop settled pending permissions', {
+        sessionKey,
+        clientMessageId,
+        count: settled,
+      })
+    }
+    return settled
   }
 
   /** Auto-deny all pending permission requests associated with a peerKey (on disconnect) */
@@ -19211,6 +19345,11 @@ export class Gateway {
             detail: _b0.text,
             isFinal: false,
           }
+          // Balance exhaustion is not retryable. Kill the rest of the agent
+          // loop immediately instead of waiting for CCB to wind down.
+          if (_cls.code === 'insufficient_credits') {
+            try { session.runner.interrupt() } catch { /* */ }
+          }
           return
         }
 
@@ -19652,6 +19791,12 @@ export class Gateway {
         ? { collabAgentPolicy: 'team-mode-prefer-delegate' as const }
         : {}),
       ...(effectiveToolsets !== undefined ? { toolsets: effectiveToolsets } : {}),
+      // Master overwrites `_creditBudget` after spreading the client frame, so
+      // a browser-forged value cannot survive commercial admission.
+      ...(() => {
+        const budget = parseCreditBudgetFen((frame as { _creditBudget?: unknown })._creditBudget)
+        return budget !== undefined ? { creditBudgetFen: budget } : {}
+      })(),
       ...(promptQueueLifecycle ? { queueLifecycle: promptQueueLifecycle } : {}),
       ...(promptQueueExecutionFence ? { queueExecutionFence: promptQueueExecutionFence } : {}),
       // §2.3 boss 硬指标 3:sessionManager 走"最近 N 条历史"兜底注入成功后回调,

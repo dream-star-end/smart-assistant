@@ -595,13 +595,26 @@ if [ "$eligible_count" -ge 1 ]; then
   done
 fi
 
-# Parse .sand-mode sidecar if present to determine Sand mode for the chosen slot.
+# Read the .sand-mode sidecar once: sticky selection below needs every slot's
+# flag, the chosen-slot parse further down reuses the same text.
 sand_enabled=0
+sand_sidecar_text=""
 if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null \
   || /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null; then
   sand_sidecar_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.sand-mode" 2>/dev/null) \
     || sand_sidecar_text=$(/bin/cat -- "$auth_dir/.sand-mode" 2>/dev/null) \
     || sand_sidecar_text=""
+fi
+
+# 0257 — .credential-kind sidecar: `name api_key|session machineId|-`.
+# A `session` slot holds a Cursor account session accessToken (Sand-only);
+# it must never be handed to the native CLI as CURSOR_API_KEY.
+kind_sidecar_text=""
+if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.credential-kind" 2>/dev/null \
+  || /usr/bin/test -f "$auth_dir/.credential-kind" 2>/dev/null; then
+  kind_sidecar_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.credential-kind" 2>/dev/null) \
+    || kind_sidecar_text=$(/bin/cat -- "$auth_dir/.credential-kind" 2>/dev/null) \
+    || kind_sidecar_text=""
 fi
 
 identity_account_for_key() {
@@ -628,10 +641,57 @@ decimal_account_gt() {
   if [ "${#_decimal_left}" -lt "${#_decimal_right}" ]; then return 1; fi
   [ "$_decimal_left" \> "$_decimal_right" ]
 }
+sand_flag_for_key() {
+  _sand_target=$1
+  _sand_flag=0
+  while IFS= read -r _sand_line || [ -n "$_sand_line" ]; do
+    case "$_sand_line" in ''|'#'*) continue ;; esac
+    _sand_name=${_sand_line%% *}
+    _sand_value=${_sand_line#"$_sand_name"}
+    _sand_value=${_sand_value# }
+    _sand_value=${_sand_value%% *}
+    if [ "$_sand_name" = "$_sand_target" ]; then
+      case "$_sand_value" in 1|true|sand) _sand_flag=1 ;; *) _sand_flag=0 ;; esac
+    fi
+  done <<SAND_LOOKUP
+$sand_sidecar_text
+SAND_LOOKUP
+  printf '%s\n' "$_sand_flag"
+}
+
+# Sticky per-user selection for all-Sand pools. Sand credentials are
+# interchangeable account sessions with independent Cursor quotas, so the
+# "primary first, extras are failover" policy above would pile every user onto
+# slot 1 and leave the rest idle. When every eligible slot is Sand-enabled and
+# the container carries its owner uid, rank the slots by a rendezvous hash of
+# (uid, account id): the same user keeps landing on the same account (Cursor
+# prompt cache, one account's rate limit per user), different users spread
+# uniformly, and adding/removing an account only moves the users that hashed
+# to it. The failed-account cooldown written by rotation_advance still applies:
+# the ranked walk skips that account until the cooldown elapses, then returns.
+# Legacy pools (no identities), mixed native/Sand pools and single-slot pools
+# keep the byte-identical primary-first path. The uid is a plain integer from
+# the sandbox supervisor, never a secret; it never reaches the CLI child.
+sticky_user=${OC_USER_ID:-}
+case "$sticky_user" in ''|*[!0-9]*) sticky_user="" ;; esac
+[ "${#sticky_user}" -le 12 ] || sticky_user=""
+sticky_pool=0
+if [ -n "$sticky_user" ] && [ "$eligible_count" -gt 1 ] \
+  && [ "$pool_generation" != legacy ] && [ -n "$sand_sidecar_text" ]; then
+  sticky_pool=1
+  for key_name in $eligible_names; do
+    if [ "$(sand_flag_for_key "$key_name")" != 1 ]; then
+      sticky_pool=0
+      break
+    fi
+  done
+fi
 
 if [ "$eligible_count" -gt 1 ]; then
   rotation_state=$(/bin/cat -- "$rotation_file" 2>/dev/null) || rotation_state=""
   rotation_version=${rotation_state%% *}
+  rotation_failed_account=0
+  rotation_family=invalid
   if [ "$rotation_version" = v2 ]; then
     rotation_rest=${rotation_state#v2 }
     rotation_failed_account=${rotation_rest%% *}
@@ -675,6 +735,42 @@ if [ "$eligible_count" -gt 1 ]; then
       rotation_idx=0
     fi
   fi
+  if [ "$sticky_pool" -eq 1 ]; then
+    # Rendezvous (highest-random-weight) hashing over the eligible Sand slots:
+    # rank = sha256("<uid>:<accountId>"), lowest wins. Skip the account that is
+    # under failure cooldown for this model family; with >= 2 eligible slots
+    # and one cooled-down account there is always a ranked successor.
+    cooled_account=0
+    if [ "$rotation_version" = v2 ] && [ "$rotation_family" = "$cursor_family" ] \
+      && [ "$(/bin/date +%s)" -lt "$rotation_exp" ]; then
+      cooled_account=$rotation_failed_account
+    fi
+    sticky_best_rank=""
+    sticky_best_position=0
+    sticky_fallback_rank=""
+    sticky_fallback_position=0
+    slot_position=0
+    for key_name in $eligible_names; do
+      slot_position=$((slot_position + 1))
+      slot_account=$(identity_account_for_key "$key_name" 2>/dev/null) || slot_account=0
+      [ "$slot_account" != 0 ] || die "Cursor pool account identity is unavailable"
+      slot_rank=$(printf '%s:%s' "$sticky_user" "$slot_account" | /usr/bin/sha256sum | /usr/bin/cut -c1-16)
+      if [ -z "$sticky_fallback_rank" ] || [ "$slot_rank" \< "$sticky_fallback_rank" ]; then
+        sticky_fallback_rank=$slot_rank
+        sticky_fallback_position=$slot_position
+      fi
+      [ "$slot_account" != "$cooled_account" ] || continue
+      if [ -z "$sticky_best_rank" ] || [ "$slot_rank" \< "$sticky_best_rank" ]; then
+        sticky_best_rank=$slot_rank
+        sticky_best_position=$slot_position
+      fi
+    done
+    if [ "$sticky_best_position" -gt 0 ]; then
+      rotation_idx=$((sticky_best_position - 1))
+    else
+      rotation_idx=$((sticky_fallback_position - 1))
+    fi
+  fi
   chosen_slot=$((rotation_idx + 1))
   slot_position=0
   for key_name in $eligible_names; do
@@ -688,7 +784,11 @@ if [ "$eligible_count" -gt 1 ]; then
   for key_name in $key_names; do
     full_slot=$((full_slot + 1))
     if [ "$auth_dir/$key_name" = "$chosen_key_file" ]; then
-      echo "oc-cursor: using Cursor credential slot $full_slot/$key_count" >&2
+      if [ "$sticky_pool" -eq 1 ]; then
+        echo "oc-cursor: using Cursor credential slot $full_slot/$key_count (sticky)" >&2
+      else
+        echo "oc-cursor: using Cursor credential slot $full_slot/$key_count" >&2
+      fi
       break
     fi
   done
@@ -775,6 +875,46 @@ $sand_sidecar_text
 SAND_SIDECAR
 fi
 
+# Credential kind for the chosen slot (default api_key when the sidecar is
+# absent, which is what every pre-0257 pool looks like).
+credential_kind=api_key
+machine_id=""
+if [ -n "${kind_sidecar_text:-}" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    kind_name=${line%% *}
+    kind_rest=${line#"$kind_name"}
+    kind_rest=${kind_rest# }
+    kind_value=${kind_rest%% *}
+    kind_rest=${kind_rest#"$kind_value"}
+    kind_rest=${kind_rest# }
+    kind_machine=${kind_rest%% *}
+    if [ "$kind_name" = "$chosen_key_name" ]; then
+      case "$kind_value" in
+        session)
+          credential_kind=session
+          case "$kind_machine" in
+            ''|-) die "Cursor session credential machine id is missing" ;;
+            *[!a-z0-9]*) die "Cursor session credential machine id is invalid" ;;
+          esac
+          [ "${#kind_machine}" -ge 16 ] && [ "${#kind_machine}" -le 64 ] \
+            || die "Cursor session credential machine id is invalid"
+          machine_id=$kind_machine
+          ;;
+        api_key|'') credential_kind=api_key; machine_id="" ;;
+        *) die "Cursor pool credential kind is invalid" ;;
+      esac
+    fi
+  done <<KIND_SIDECAR
+$kind_sidecar_text
+KIND_SIDECAR
+fi
+if [ "$credential_kind" = session ] && [ "$sand_enabled" -ne 1 ]; then
+  die "Cursor pool credential sidecars disagree"
+fi
+
 selected_account_id=0
 selected_fingerprint=0000000000000000
 if [ "$pool_generation" != legacy ]; then
@@ -820,9 +960,11 @@ done
 # authority instead of reimplementing rotation and quota filtering in TS.
 if [ "${OPENCLAUDE_CURSOR_SELECT_ONLY:-}" = 1 ]; then
   if [ "$sand_enabled" -eq 1 ]; then selected_mode=sand; else selected_mode=native; fi
-  printf 'oc-cursor: selected_slot %s %s %s %s %s %s\n' \
+  # Trailing `<kind> <machineId|->` columns are 0257 additions; the gateway
+  # parser tolerates their absence for older wrapper builds.
+  printf 'oc-cursor: selected_slot %s %s %s %s %s %s %s %s\n' \
     "$chosen_full_slot" "$chosen_key_name" "$selected_mode" "$pool_generation" \
-    "$selected_account_id" "$selected_fingerprint"
+    "$selected_account_id" "$selected_fingerprint" "$credential_kind" "${machine_id:--}"
   exit 0
 fi
 if [ -n "${OPENCLAUDE_CURSOR_RECORD_RESULT:-}" ]; then
@@ -839,6 +981,13 @@ if [ -n "${OPENCLAUDE_CURSOR_RECORD_RESULT:-}" ]; then
     *) die "Cursor record result is invalid" ;;
   esac
   exit 0
+fi
+
+# A session accessToken is only valid on the Sand inference plane, which the
+# gateway relay drives after SELECT_ONLY. It must never reach the native CLI
+# as CURSOR_API_KEY, and there is no fallback to a different pool here.
+if [ "$credential_kind" = session ]; then
+  die "Cursor session credential is Sand-only"
 fi
 
 if ! api_key=$(/usr/bin/sudo -n /bin/cat -- "$chosen_key_file" 2>/dev/null); then

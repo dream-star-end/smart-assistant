@@ -170,7 +170,7 @@ export function buildDetachedAskUserSinkPayload(args: {
 export type DetachedAskUserPermissionPatch = {
   requestId: string
   behavior: 'allow' | 'deny'
-  settledReason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed'
+  settledReason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed' | 'user_stop'
   answers?: Record<string, string>
 }
 
@@ -187,7 +187,7 @@ export function buildDetachedAskUserResolvedSinkPayload(args: {
   sessionId: string
   sessionKey: string
   behavior: 'allow' | 'deny'
-  settledReason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed'
+  settledReason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed' | 'user_stop'
   answers?: Record<string, string>
   userAnswer?: DetachedAskUserAnswerMessage
   ts?: number

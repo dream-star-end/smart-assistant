@@ -43,9 +43,16 @@ import {
   type AccountRow,
   type AccountStatus,
   type CreateAccountInput,
+  type CursorCredentialKind,
+  isCursorCredentialKind,
   type ListAccountsOptions,
   type UpdateAccountPatch,
 } from "../account-pool/store.js";
+import {
+  CURSOR_MACHINE_ID_PATTERN,
+  CURSOR_SESSION_TOKEN_PATTERN,
+  cursorSessionTokenExpiryMs,
+} from "@openclaude/protocol";
 import { normalizeCursorApiKey, scheduleCursorAuthSync } from "../account-pool/cursorMaterializer.js";
 import { isCursorQuotaClass, type CursorQuotaClass } from "../account-pool/cursorQuota.js";
 import { writeAdminAuditBestEffort as bestEffortAudit } from "./audit.js";
@@ -120,6 +127,7 @@ function snapshotForAudit(r: AccountRow): Record<string, unknown> {
     egress_proxy: maskEgressProxy(r.egress_proxy),
     egress_proxy_id: r.egress_proxy_id !== null ? r.egress_proxy_id.toString() : null,
     cursor_sand_enabled: r.provider === "cursor" ? r.cursor_sand_enabled : null,
+    cursor_credential_kind: r.provider === "cursor" ? r.cursor_credential_kind : null,
   };
 }
 
@@ -199,6 +207,15 @@ export interface AdminCreateAccountInput {
   group_id?: bigint | string | null;
   cursor_sand_enabled?: boolean;
   cursor_quota_class?: CursorQuotaClass;
+  /**
+   * 0257 — Cursor 凭据类型。默认 'api_key'(crsr_ key,走 exchange)。
+   * 'session' = loginDeepControl PKCE 登录得到的账号 session
+   * (oauth_token=accessToken JWT,oauth_refresh_token=refreshToken JWT),
+   * 仅 Sand 平面可用,必须带登录时使用的 machine id。
+   */
+  cursor_credential_kind?: CursorCredentialKind;
+  cursor_machine_id?: string | null;
+  cursor_auth_id?: string | null;
 }
 
 /**
@@ -315,8 +332,47 @@ export async function adminCreateAccount(
   if (typeof input.oauth_token !== "string" || input.oauth_token.length === 0) {
     throw new RangeError("invalid_oauth_token");
   }
-  const oauthToken = provider === "cursor" ? normalizeCursorApiKey(input.oauth_token) : input.oauth_token;
-  let expiresAt: Date | null = null;
+  // 0257 — Cursor 凭据类型:api_key(默认)走 crsr_ 归一化;session 是账号
+  // session JWT,不能过 normalizeCursorApiKey(会拒),改为校验 JWT 形状 + exp。
+  const cursorCredentialKind: CursorCredentialKind = input.cursor_credential_kind ?? "api_key";
+  if (!isCursorCredentialKind(cursorCredentialKind)) throw new RangeError("invalid_cursor_credential_kind");
+  if (cursorCredentialKind === "session" && provider !== "cursor") {
+    throw new RangeError("cursor_credential_kind_requires_cursor_provider");
+  }
+  if (provider !== "cursor" && (input.cursor_machine_id || input.cursor_auth_id)) {
+    throw new RangeError("cursor_credential_kind_requires_cursor_provider");
+  }
+  let cursorMachineId: string | null = null;
+  let cursorAuthId: string | null = null;
+  let cursorSessionExpiresAt: Date | null = null;
+  if (cursorCredentialKind === "session") {
+    const accessToken = input.oauth_token.trim();
+    if (!CURSOR_SESSION_TOKEN_PATTERN.test(accessToken)) throw new RangeError("invalid_cursor_session_token");
+    const expMs = cursorSessionTokenExpiryMs(accessToken);
+    if (expMs === null) throw new RangeError("invalid_cursor_session_token");
+    if (expMs <= Date.now() + 60_000) throw new RangeError("cursor_session_token_expired");
+    cursorSessionExpiresAt = new Date(expMs);
+    if (typeof input.oauth_refresh_token !== "string" || !CURSOR_SESSION_TOKEN_PATTERN.test(input.oauth_refresh_token.trim())) {
+      throw new RangeError("invalid_cursor_session_refresh_token");
+    }
+    if (typeof input.cursor_machine_id !== "string" || !CURSOR_MACHINE_ID_PATTERN.test(input.cursor_machine_id)) {
+      throw new RangeError("invalid_cursor_machine_id");
+    }
+    cursorMachineId = input.cursor_machine_id;
+    if (input.cursor_auth_id !== undefined && input.cursor_auth_id !== null) {
+      if (typeof input.cursor_auth_id !== "string" || input.cursor_auth_id.length === 0 || input.cursor_auth_id.length > 256) {
+        throw new RangeError("invalid_cursor_auth_id");
+      }
+      cursorAuthId = input.cursor_auth_id;
+    }
+    if (input.cursor_sand_enabled === false) throw new RangeError("cursor_session_requires_sand");
+  } else if (input.cursor_machine_id || input.cursor_auth_id) {
+    throw new RangeError("cursor_machine_id_requires_session_kind");
+  }
+  const oauthToken = provider === "cursor"
+    ? (cursorCredentialKind === "session" ? input.oauth_token.trim() : normalizeCursorApiKey(input.oauth_token))
+    : input.oauth_token;
+  let expiresAt: Date | null = cursorSessionExpiresAt;
   if (input.oauth_expires_at !== undefined && input.oauth_expires_at !== null) {
     const d = typeof input.oauth_expires_at === "string"
       ? new Date(input.oauth_expires_at)
@@ -335,7 +391,9 @@ export async function adminCreateAccount(
   const refresh =
     input.oauth_refresh_token === null || input.oauth_refresh_token === undefined
       ? null
-      : input.oauth_refresh_token;
+      : cursorCredentialKind === "session"
+        ? input.oauth_refresh_token.trim()
+        : input.oauth_refresh_token;
   if (refresh !== null && (typeof refresh !== "string" || refresh.length === 0)) {
     throw new RangeError("invalid_oauth_refresh_token");
   }
@@ -416,7 +474,11 @@ export async function adminCreateAccount(
     runtime_channel: getRuntimeChannel(),
     oauth_principal_type: principalType,
     oauth_principal_id: principalId,
-    cursor_sand_enabled: input.cursor_sand_enabled === true,
+    // 0257 — session 凭据只在 Sand 平面可用,建号强制 sand=true。
+    cursor_sand_enabled: cursorCredentialKind === "session" ? true : input.cursor_sand_enabled === true,
+    cursor_credential_kind: cursorCredentialKind,
+    cursor_machine_id: cursorMachineId,
+    cursor_auth_id: cursorAuthId,
   };
   let row: AccountRow;
   try {
@@ -634,10 +696,35 @@ export async function adminPatchAccount(
   if (patch.plan !== undefined) storePatch.plan = patch.plan;
   if (patch.status !== undefined) storePatch.status = patch.status;
   if (patch.health_score !== undefined) storePatch.health_score = patch.health_score;
-  if (patch.oauth_token !== undefined) {
-    storePatch.token = before.provider === "cursor" ? normalizeCursorApiKey(patch.oauth_token) : patch.oauth_token;
+  // 0257 — session 凭据行:token 是 Cursor session JWT,不能过 crsr_ 归一化;
+  // 只能换成另一条合法 session JWT(同 machine id 下的重新登录),且不可关 Sand。
+  const isCursorSession = before.provider === "cursor" && before.cursor_credential_kind === "session";
+  if (isCursorSession && patch.cursor_sand_enabled === false) {
+    throw new RangeError("cursor_session_requires_sand");
   }
-  if (patch.oauth_refresh_token !== undefined) storePatch.refresh = patch.oauth_refresh_token;
+  if (patch.oauth_token !== undefined) {
+    if (isCursorSession) {
+      const token = patch.oauth_token.trim();
+      if (!CURSOR_SESSION_TOKEN_PATTERN.test(token)) throw new RangeError("invalid_cursor_session_token");
+      const expMs = cursorSessionTokenExpiryMs(token);
+      if (expMs === null) throw new RangeError("invalid_cursor_session_token");
+      if (expMs <= Date.now() + 60_000) throw new RangeError("cursor_session_token_expired");
+      storePatch.token = token;
+      if (expiresAt === undefined) storePatch.oauth_expires_at = new Date(expMs);
+    } else {
+      storePatch.token = before.provider === "cursor" ? normalizeCursorApiKey(patch.oauth_token) : patch.oauth_token;
+    }
+  }
+  if (patch.oauth_refresh_token !== undefined) {
+    if (isCursorSession) {
+      if (typeof patch.oauth_refresh_token !== "string" || !CURSOR_SESSION_TOKEN_PATTERN.test(patch.oauth_refresh_token.trim())) {
+        throw new RangeError("invalid_cursor_session_refresh_token");
+      }
+      storePatch.refresh = patch.oauth_refresh_token.trim();
+    } else {
+      storePatch.refresh = patch.oauth_refresh_token;
+    }
+  }
   if (normalizedEgressProxyId !== undefined) storePatch.egress_proxy_id = normalizedEgressProxyId;
   if (normalizedPatchGroupId !== undefined) storePatch.group_id = normalizedPatchGroupId;
   if (expiresAt !== undefined) storePatch.oauth_expires_at = expiresAt;

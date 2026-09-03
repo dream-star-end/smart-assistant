@@ -534,7 +534,7 @@ export const CONTINUE_PROMPT =
  */
 const ERROR_LABELS: Record<string, string> = {
   // ── 计费/配额 ──
-  insufficient_credits: "积分余额不足",
+  insufficient_credits: "积分已耗尽",
   rate_limited: "请求过于频繁，请稍后再试",
   // ── 上游模型服务 ──
   model_capacity: "模型繁忙",

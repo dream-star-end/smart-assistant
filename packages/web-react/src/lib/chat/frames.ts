@@ -233,6 +233,35 @@ export type MediaJobWire = {
   ts: number;
 };
 
+/**
+ * Master 自动恢复裁决（master 权威，容器伪造会被 bridge 拒绝）。Phase B finalize 提交后广播到
+ * uid 的全部 tab：`scheduled:true` 表示 master 已把恢复子轮入队（随后会有 `outbound.ack{recovery}`
+ * 领养），前端据此把"终态报错"保持为软状态「模型繁忙，正在重试中（n/10）」而不是立刻画红卡；
+ * `scheduled:false` 表示 master 决定不再自动恢复（暂停 / 放弃 / 拒绝），前端立刻物化红卡。
+ */
+export type RecoveryDecisionWire = {
+  type: "sys.recovery_decision";
+  peer?: Peer;
+  sourceClientMessageId: string;
+  errorCode: string;
+  ts?: number;
+} & (
+  | {
+      scheduled: true;
+      rootClientMessageId: string;
+      mode: "checkpoint" | "replay";
+      attempt: number;
+      max: number;
+      displayText?: string;
+      agentId?: string;
+      model?: string;
+    }
+  | {
+      scheduled: false;
+      reason: string;
+    }
+);
+
 /** server durable admission / completed-dedup acknowledgement. */
 export type AckWire = {
   type: "outbound.ack";
@@ -315,6 +344,7 @@ export type OutboundWire =
   | GoalSnapshotWire
   | IncidentWire
   | MediaJobWire
+  | RecoveryDecisionWire
   | AckWire
   | PongWire
   | RepoStatusWire

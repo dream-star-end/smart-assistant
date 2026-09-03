@@ -155,8 +155,9 @@ class FakeCcbRunner extends EventEmitter {
 function makeSession(
   runner: FakeCcbRunner,
   over: Partial<AgentSession> = {},
+  adapterOpts: EngineCreateOpts = {} as EngineCreateOpts,
 ): AgentSession {
-  const adapter = new CcbAdapter({} as EngineCreateOpts, runner as unknown as SubprocessRunner);
+  const adapter = new CcbAdapter(adapterOpts, runner as unknown as SubprocessRunner);
   return {
     sessionKey: "agent:main:webchat:dm:engine-peer",
     agentId: "main",
@@ -1859,6 +1860,70 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("browser Stop maps official Claude Code aborted_streaming to USER_CANCELLED", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => { startedResolve = resolve; });
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("partial official answer before Stop");
+          startedResolve();
+        });
+      });
+      runner.interrupt = () => {
+        setImmediate(() => {
+          runner.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            terminal_reason: "aborted_streaming",
+            stop_reason: null,
+            total_cost_usd: 0.000525,
+            usage: { input_tokens: 13, output_tokens: 2 },
+          });
+        });
+        return true;
+      };
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        model: "cursor-fable-5.1-high",
+        providerTag: "cursor",
+        _currentDispatch: {
+          userId: "user-1",
+          sessionId: "engine-peer",
+          clientMessageId: "msg-stop-official-abort",
+          dispatchId: "77777777-7777-4777-8777-777777777777",
+          attemptNo: 1,
+        },
+      } as Partial<AgentSession>, { harness: "official-cc" } as EngineCreateOpts);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      assert.equal(payload.status, "interrupted");
+      assert.equal(payload.errorCode, "USER_CANCELLED");
+      assert.equal(payload.errorDetail, "本轮已由用户停止。");
+      assert.equal(payload.text, "partial official answer before Stop");
+      assert.equal(session.totalCostUSD, 0, "official CLI pseudo-USD must remain ignored on Stop");
+      assert.deepEqual(
+        events.filter((event) => event.kind === "error"),
+        [{ kind: "error", error: "本轮已由用户停止。", errorCode: "user_cancelled" }],
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("browser Stop maps the DeepSeek CCB null-stop diagnostic to USER_CANCELLED", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
@@ -1989,6 +2054,144 @@ describe("crash/interrupt partial persistence", () => {
       assert.deepEqual(
         events.filter((event) => event.kind === "error"),
         [{ kind: "error", error: "本轮已由用户停止。", errorCode: "user_cancelled" }],
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("browser Stop during a CCB tool call (stop_reason=tool_use) maps to USER_CANCELLED", async () => {
+    // INC-20260903-CCB-TOOL-PHASE-STOP-RED-CARD: query.ts aborted_tools yields
+    // "[Request interrupted by user for tool use]" and keeps the last API
+    // stop_reason=tool_use, so QueryEngine emits error_during_execution with a
+    // tool_use diagnostic. The old exact-string allowlist only knew
+    // stop_reason=null and painted the turn as ENGINE_ERROR.
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const dispatchId = "77777777-7777-4777-8777-777777777777";
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("checking the deploy state");
+          r.msg({
+            type: "assistant",
+            message: { content: [{ type: "tool_use", id: "toolu_stop_1", name: "Bash", input: { command: "git log" } }] },
+          });
+          startedResolve();
+        });
+      });
+      runner.interrupt = () => {
+        setImmediate(() => {
+          runner.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            stop_reason: "tool_use",
+            errors: [
+              "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+            ],
+            usage: { input_tokens: 116_633, output_tokens: 5_545 },
+          });
+        });
+        return true;
+      };
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        _currentDispatch: {
+          userId: "user-1",
+          sessionId: "engine-peer",
+          clientMessageId: "msg-stop-ccb-tool-phase",
+          dispatchId,
+          attemptNo: 1,
+        },
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      assert.equal(payload.status, "interrupted");
+      assert.equal(payload.errorCode, "USER_CANCELLED");
+      assert.equal(payload.errorDetail, "本轮已由用户停止。");
+      assert.equal(payload.text, "checking the deploy state");
+      assert.equal(payload.dispatchId, dispatchId);
+      assert.deepEqual(
+        events.filter((event) => event.kind === "error"),
+        [{ kind: "error", error: "本轮已由用户停止。", errorCode: "user_cancelled" }],
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("a tool_use diagnostic with extra errors is still a real CCB error", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("partial answer before tool failure");
+          startedResolve();
+        });
+      });
+      runner.interrupt = () => {
+        setImmediate(() => {
+          runner.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            stop_reason: "tool_use",
+            errors: [
+              "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+              "Error: upstream request failed",
+            ],
+            usage: { input_tokens: 11, output_tokens: 2 },
+          });
+        });
+        return true;
+      };
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      assert.notEqual(payload.errorCode, "USER_CANCELLED");
+      assert.equal(
+        events.some(
+          (event) => event.kind === "error" && event.errorCode === "user_cancelled",
+        ),
+        false,
       );
     } finally {
       setV3MasterSinkSingleton(null);
