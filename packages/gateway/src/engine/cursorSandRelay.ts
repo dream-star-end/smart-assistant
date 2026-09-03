@@ -24,6 +24,7 @@ import Ajv2020 from 'ajv/dist/2020.js'
 import protobuf from 'protobufjs'
 import { cursorModelById } from '@openclaude/protocol'
 import { createLogger } from '../logger.js'
+import { AUTHORITY_HEADER, LOCAL_CATALOG_HEADER, TURN_LEASE_HEADER } from '../modelCatalogClient.js'
 
 const log = createLogger({ module: 'cursorSandRelay' })
 const DEFAULT_UPSTREAM = 'https://api2.cursor.sh'
@@ -81,6 +82,15 @@ export interface RelayPassthrough {
   baseUrl: string
   authToken: string
 }
+
+/** Per-turn model-authority headers CCB puts on every upstream request
+ *  (`ANTHROPIC_CUSTOM_HEADERS`, see subprocessRunner `_buildAnthropicCustomHeadersEnv`).
+ *  Passthrough must carry them to the internal proxy or the egress gate rejects. */
+export const PASSTHROUGH_FORWARDED_HEADERS = [
+  AUTHORITY_HEADER,
+  TURN_LEASE_HEADER,
+  LOCAL_CATALOG_HEADER,
+] as const
 
 export function defaultRelayPassthrough(env: NodeJS.ProcessEnv = process.env): RelayPassthrough | null {
   const baseUrl = env.ANTHROPIC_BASE_URL?.trim().replace(/\/+$/, '')
@@ -976,6 +986,7 @@ export class CursorSandRelay {
   private async passthroughMessages(
     body: AnthropicMessagesBody,
     raw: Buffer,
+    incoming: IncomingMessage['headers'],
     res: ServerResponse,
     signal: AbortSignal,
   ): Promise<void> {
@@ -990,15 +1001,26 @@ export class CursorSandRelay {
       return
     }
     log.info('cursor sand relay passthrough', { model: String(body.model), stream: body.stream !== false })
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      authorization: `Bearer ${target.authToken}`,
+      'x-api-key': target.authToken,
+      accept: body.stream === false ? 'application/json' : 'text/event-stream',
+    }
+    // CCB attaches the turn's model-authority envelopes via ANTHROPIC_CUSTOM_HEADERS;
+    // the egress gate is fail-closed, so a passthrough that dropped them made every
+    // sub-agent call 403 MODEL_AUTHORITY_INVALID ("request carries no model authority").
+    for (const name of PASSTHROUGH_FORWARDED_HEADERS) {
+      const value = incoming[name]
+      const single = Array.isArray(value) ? value[0] : value
+      if (typeof single === 'string' && single !== '' && !/[^\x21-\x7e]/.test(single)) {
+        headers[name] = single
+      }
+    }
     const upstream = await this.deps.fetchImpl(`${target.baseUrl}/v1/messages`, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'anthropic-version': '2023-06-01',
-        authorization: `Bearer ${target.authToken}`,
-        'x-api-key': target.authToken,
-        accept: body.stream === false ? 'application/json' : 'text/event-stream',
-      },
+      headers,
       body: new Uint8Array(raw),
       signal,
     })
@@ -1121,7 +1143,7 @@ export class CursorSandRelay {
     res.once('close', abort)
     try {
       if (!isSandRoutableModel(body.model)) {
-        await this.passthroughMessages(body, raw, res, controller.signal)
+        await this.passthroughMessages(body, raw, req.headers, res, controller.signal)
         return
       }
       await this.handleMessages(body, res, controller.signal)

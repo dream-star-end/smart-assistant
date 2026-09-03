@@ -1097,14 +1097,14 @@ test('legacy usage frame without cache counters keeps the bare {input_tokens, ou
 })
 
 test('relay passes non-Sand models (CCB sub-agent pin) through to the internal proxy verbatim', async () => {
-  const seen: { url: string; auth: string | null; body: string }[] = []
+  const seen: { url: string; auth: string | null; headers: Headers; body: string }[] = []
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = String(input)
     if (url.endsWith('/auth/exchange_user_api_key') || url.includes('InferenceService')) {
       throw new Error(`Sand upstream must not be touched for passthrough: ${url}`)
     }
     const headers = new Headers(init?.headers)
-    seen.push({ url, auth: headers.get('authorization'), body: Buffer.from(init?.body as Uint8Array).toString('utf8') })
+    seen.push({ url, auth: headers.get('authorization'), headers, body: Buffer.from(init?.body as Uint8Array).toString('utf8') })
     const sse = 'event: message_start\ndata: {"type":"message_start"}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'
     return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
   }
@@ -1120,14 +1120,61 @@ test('relay passes non-Sand models (CCB sub-agent pin) through to the internal p
       messages: [{ role: 'user', content: 'hi' }],
     })
     const response = await fetch(`${baseUrl}/v1/messages`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: payload,
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        // CCB puts the turn's authority envelopes on every request via
+        // ANTHROPIC_CUSTOM_HEADERS; the fail-closed egress gate needs them.
+        'x-oc-model-authority': 'authority.envelope.b64url',
+        'x-oc-turn-lease': 'lease.envelope.b64url',
+        'x-oc-local-catalog': 'local.catalog.token',
+        // Never forwarded: caller identity is the relay's own bearer.
+        authorization: 'Bearer cursor-sand-loopback',
+        'x-api-key': 'cursor-sand-loopback',
+        'x-oc-not-an-authority-header': 'ignored',
+      },
+      body: payload,
     })
     assert.equal(response.status, 200)
     assert.match(await response.text(), /event: message_stop/)
     assert.equal(seen.length, 1)
     assert.equal(seen[0].url, 'http://proxy.internal:18892/v1/messages')
     assert.equal(seen[0].auth, 'Bearer container-bearer')
+    assert.equal(seen[0].headers.get('x-api-key'), 'container-bearer')
+    assert.equal(seen[0].headers.get('x-oc-model-authority'), 'authority.envelope.b64url')
+    assert.equal(seen[0].headers.get('x-oc-turn-lease'), 'lease.envelope.b64url')
+    assert.equal(seen[0].headers.get('x-oc-local-catalog'), 'local.catalog.token')
+    assert.equal(seen[0].headers.get('x-oc-not-an-authority-header'), null)
     assert.equal(seen[0].body, payload)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('relay passthrough without authority headers sends none (no empty/forged values)', async () => {
+  const captured: Headers[] = []
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    captured.push(new Headers(init?.headers))
+    return new Response('{"type":"message"}', { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  const relay = new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from('crsr_test'),
+    passthrough: { baseUrl: 'http://proxy.internal:18892', authToken: 'container-bearer' },
+  })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'glm-5.3-zai', stream: false, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(response.status, 200)
+    assert.equal(captured.length, 1)
+    const forwarded = captured[0]
+    assert.equal(forwarded.has('x-oc-model-authority'), false)
+    assert.equal(forwarded.has('x-oc-turn-lease'), false)
+    assert.equal(forwarded.has('x-oc-local-catalog'), false)
   } finally {
     await relay.close()
   }

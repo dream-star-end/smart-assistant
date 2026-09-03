@@ -246,8 +246,14 @@ export const DEFAULT_SECONDARY_UTILITY_MODEL = 'deepseek-v4-flash'
  *  (grok-build / cursor-* / claude-haiku / official Claude aliases). Selfhost
  *  catalog has no haiku; CCB Agent `model: "haiku"` otherwise 403s at the
  *  anthropic proxy. Official CCB honors CLAUDE_CODE_SUBAGENT_MODEL above the
- *  tool-specified alias (claude-code-best/src/utils/model/agent.ts). */
-export const DEFAULT_CCB_SUBAGENT_MODEL = 'glm-5.3-zai'
+ *  tool-specified alias (claude-code-best/src/utils/model/agent.ts).
+ *
+ *  Must equal the platform aux model: egress `modelAuthorityGate` only admits
+ *  `{turn lease canonical model} ∪ PLATFORM_AUX_MODEL_IDS` for a turn, and the
+ *  aux set is exactly `[DEFAULT_SECONDARY_UTILITY_MODEL]`. Pinning anything else
+ *  (glm-5.3-zai before 2026-09-03) made every sub-agent under a cursor-* parent
+ *  403 `MODEL_AUTHORITY_INVALID` ("authority model mismatch"). */
+export const DEFAULT_CCB_SUBAGENT_MODEL = DEFAULT_SECONDARY_UTILITY_MODEL
 
 export function isCcbRoutableSubagentModel(model: string | undefined): boolean {
   if (typeof model !== 'string') return false
@@ -259,17 +265,24 @@ export function isCcbRoutableSubagentModel(model: string | undefined): boolean {
   return true
 }
 
+/** Sub-agent model for a CCB turn. Parent model when it is catalog-routable
+ *  (same turn lease → always admitted); otherwise the ops override, else the
+ *  secondary utility model, which is the only cross-turn aux model the egress
+ *  gate accepts. `OPENCLAUDE_SECONDARY_MODEL` follows the same override the
+ *  utility pin uses so both stay inside one aux slot. */
 export function resolveCcbSubagentModel(sessionModel?: string): string {
   if (isCcbRoutableSubagentModel(sessionModel)) return sessionModel!.trim()
   const override = process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL?.trim()
   if (isCcbRoutableSubagentModel(override)) return override!
-  return DEFAULT_CCB_SUBAGENT_MODEL
+  return resolveSecondaryUtilityModel()
+}
+
+export function resolveSecondaryUtilityModel(): string {
+  return process.env.OPENCLAUDE_SECONDARY_MODEL?.trim() || DEFAULT_SECONDARY_UTILITY_MODEL
 }
 
 export function _buildSecondaryUtilityModelEnv(): Record<string, string> {
-  const model =
-    process.env.OPENCLAUDE_SECONDARY_MODEL?.trim() || DEFAULT_SECONDARY_UTILITY_MODEL
-  return { ANTHROPIC_SMALL_FAST_MODEL: model }
+  return { ANTHROPIC_SMALL_FAST_MODEL: resolveSecondaryUtilityModel() }
 }
 
 export const CCB_SUBAGENT_MODEL_ENV = 'CLAUDE_CODE_SUBAGENT_MODEL'
