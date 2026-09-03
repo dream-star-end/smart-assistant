@@ -368,6 +368,7 @@ describe("modelAuthorityGate — bridge 签名凭据", () => {
     assert.equal(d.securityEpoch, EPOCH);
     assert.equal(d.projectionRevision, null); // 全局 revision 不下发,bridge 路径无 per-uid 投影
     assert.equal(d.authorityTurnId, minted.payload.authorityTurnId);
+    assert.equal(d.authorityCanonicalModel, "glm-5.2");
     assert.equal(d.turnLeaseIssuedAtMs, issuedAt);
     assert.equal(d.turnLeaseVerifiedAtMs, verifiedAt);
     assert.equal(d.descriptor.providerId, "ark");
@@ -645,6 +646,12 @@ describe("modelAuthorityGate — auxModels 次级模型", () => {
     });
     assert.equal(d.canonicalModel, DEFAULT_SECONDARY_UTILITY_MODEL);
     assert.equal(d.authorityKind, "bridge_signed");
+    // aux 请求的 canonicalModel 是次级模型,但票据里 master 签的 turn 主模型必须原样暴露:
+    // proxy 拿它去 authority_turn_dispatches 比身份 / 判 verification sponsorship。
+    // 若拿 canonicalModel 去比,cursor 子 agent / CCB SMALL_FAST 全部 409(2026-09-03)。
+    assert.equal(d.authorityCanonicalModel, "glm-5.2");
+    assert.equal(d.authorityTurnId, minted.payload.authorityTurnId);
+    assert.notEqual(d.authorityCanonicalModel, d.canonicalModel);
   });
 
   test("aux 模型被 disable → 主模型仍放行,aux 请求 MODEL_NOT_AVAILABLE(可路由性先于验票)", async () => {
@@ -699,6 +706,8 @@ describe("modelAuthorityGate — 本地路径 local_catalog token", () => {
     assert.equal(d.claimedProjectionRevision, expected);
     assert.equal(d.turnLeaseIssuedAtMs, null);
     assert.equal(d.turnLeaseVerifiedAtMs, null);
+    assert.equal(d.authorityTurnId, null);
+    assert.equal(d.authorityCanonicalModel, null);
   });
 
   test("visibility 授权取 fenced snapshot：旧 PricingCache 即使仍 public 也不能放行 admin 模型", async () => {

@@ -49,6 +49,13 @@ describe("V5 release verification wiring", () => {
     assert.ok(lease >= 0);
     const block = source.slice(lease, lease + 5_000);
     assert.match(block, /gate\.authorityTurnId/);
+    // 身份比对用票据里的 turn 主模型,而不是本请求 body.model 的归一值;否则同 turn 的 aux 请求
+    // (CCB SMALL_FAST / cursor 子 agent 次级模型)全部 409 VERIFICATION_SPONSORSHIP_CONFLICT。
+    const callEnd = block.indexOf("});");
+    const callArgs = block.slice(0, callEnd);
+    assert.match(callArgs, /model: body\.model/);
+    assert.match(callArgs, /canonicalModel: gate\.authorityCanonicalModel/);
+    assert.doesNotMatch(callArgs, /canonicalModel: gate\.canonicalModel/);
     assert.match(block, /dispatchIdentity = leaseAdmission\.dispatchIdentity/);
     assert.match(block, /verificationSponsorship = leaseAdmission\.sponsorship/);
     assert.match(block, /VERIFICATION_SPONSORSHIP_CONFLICT/);
