@@ -5,7 +5,7 @@ import { qrDataUrl } from '../../admin/pages/alerts/qr/qr'
 import { type QqBindingStart, type QqBindingStatus, api, apiErrorMessage } from '../../lib/api'
 import type { PrefsView } from '../../lib/modelPreferences'
 import type { AuthSession } from '../../lib/types'
-import { Alert, Button, Spinner, Switch } from '../ui'
+import { Alert, Button, Spinner, Switch, useConfirm } from '../ui'
 
 export function QqBindingCard({
   auth,
@@ -21,6 +21,7 @@ export function QqBindingCard({
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [confirmDialog, confirmDialogEl] = useConfirm()
 
   const refresh = useCallback(async () => {
     const next = await api.getQqBinding(auth)
@@ -67,7 +68,13 @@ export function QqBindingCard({
   }
 
   async function unbind() {
-    if (!window.confirm('解绑后，尚未发出的 QQ 消息会立即取消。确定解绑吗？')) return
+    const ok = await confirmDialog({
+      title: '解绑 QQ？',
+      body: '解绑后，尚未发出的 QQ 消息会立即取消。确定解绑吗？',
+      confirmText: '解绑',
+      danger: true,
+    })
+    if (!ok) return
     setBusy(true)
     setError(null)
     try {
@@ -91,6 +98,7 @@ export function QqBindingCard({
 
   return (
     <div className="overflow-hidden rounded-2xl border border-border bg-surface">
+      {confirmDialogEl}
       <div className="flex items-start gap-3 px-4 py-4">
         <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-[#12b7f5] text-white">
           <Link2 size={20} />

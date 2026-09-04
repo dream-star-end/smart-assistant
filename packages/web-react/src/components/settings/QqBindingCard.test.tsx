@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { api } from '../../lib/api'
@@ -42,7 +42,6 @@ describe('QqBindingCard', () => {
       })
       .mockResolvedValueOnce({ available: true, bound: false })
     vi.spyOn(api, 'deleteQqBinding').mockResolvedValue({ ok: true, unbound: true })
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     const patch = vi.fn(async () => {})
     render(<QqBindingCard auth={auth} prefs={{}} onPatch={patch} />)
     const proactive = await screen.findByRole('switch')
@@ -50,6 +49,9 @@ describe('QqBindingCard', () => {
     fireEvent.click(proactive)
     expect(patch).toHaveBeenCalledWith({ qq_proactive_push: false })
     fireEvent.click(screen.getByRole('button', { name: /解绑/ }))
+    // 解绑走项目内 Promise 式确认对话框（不再用原生 window.confirm）。
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: '解绑' }))
     await waitFor(() => expect(api.deleteQqBinding).toHaveBeenCalled())
   })
 })
