@@ -53,6 +53,7 @@ packages/commercial/src/__tests__/migration0254.integ.test.ts
 packages/commercial/src/__tests__/migration0255CursorFable51.integ.test.ts
 packages/commercial/src/__tests__/migration0256.integ.test.ts
 packages/commercial/src/__tests__/migration0257.integ.test.ts
+packages/commercial/src/__tests__/migration0258.integ.test.ts
 packages/commercial/src/__tests__/migration0259CursorGemini38Flash.integ.test.ts
 packages/commercial/src/__tests__/migration0263Gpt6Astra.integ.test.ts
 packages/commercial/src/__tests__/migration0264.integ.test.ts
