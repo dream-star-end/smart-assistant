@@ -206,6 +206,39 @@ describe('runFetchBatchJob', () => {
     assert.equal(summary.failed, 0)
   })
 
+  it('续跑 keep-last:prior=[a failed, a fetched] → a 视为已完成不重跑,仅单条 fetched(auditor S1)', async () => {
+    const cp = (o: FetchRecordOutcome): CheckpointRow => ({
+      phase: 'pdf_ingested',
+      status: 'pending',
+      output: { outcome: o },
+      error: null,
+      createdAt: new Date(),
+    })
+    const prior: CheckpointRow[] = [
+      cp({ id: 'a', status: 'failed', reason: 'timeout', attempts: [] }),
+      cp(outcome('a')),
+    ]
+    const calls: string[] = []
+    const { ctx } = fakeCtx()
+    const deps: FetchJobHandlerDeps = {
+      readConfig: fetchEnabledCfg(),
+      listCheckpoints: async () => prior,
+      fetchOne: async (input) => {
+        calls.push(input.record.id)
+        return outcome(input.record.id)
+      },
+    }
+    const summary = await runFetchBatchJob(
+      fakeJob({ mode: 'fetch', records: [{ id: 'a' }] }),
+      ctx,
+      deps,
+    )
+    assert.deepEqual(calls, [])
+    assert.equal(summary.records.length, 1)
+    assert.equal(summary.records[0].status, 'fetched')
+    assert.equal(summary.failed, 0)
+  })
+
   it('配置中途关闭 → fail-loud 抛错(failJob)', async () => {
     const { ctx } = fakeCtx()
     const deps: FetchJobHandlerDeps = {
