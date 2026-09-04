@@ -22,7 +22,7 @@ T=<本目录>/<原型名>
 python3 $T/template.py [参数] --style bw|color --out /home/agent/.openclaude/research/<id>/fig.png
 # 产物三件套: fig.png(300dpi) / fig.svg(矢量) / fig.spec.json(物理声明)
 oc-figcheck /home/agent/.openclaude/research/<id>/fig.png --kind schematic --spec .../fig.spec.json
-# VERDICT 的确定性 issues 为 0 才算过;参数不成立模板会直接拒画(exit≠0)并说明原因
+# VERDICT 的确定性 issues 为 0 才算过(自绘代码 3 轮未归零按 SKILL §1 如实交付);参数不成立模板会直接拒画(exit≠0)并说明原因
 ```
 
 - 依赖(容器已预装,缺失会 fail-loud 拒画):`matplotlib`、`scienceplots`(样式)、`--backend pptx` 需 `python-pptx`。
