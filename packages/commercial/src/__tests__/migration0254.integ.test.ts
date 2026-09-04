@@ -43,14 +43,17 @@ describe("splitSqlStatements (0256 preflight + CONCURRENTLY)", () => {
     assert.doesNotMatch(stmts[1]!, /DO \$\$/);
   });
 
-  test("keeps a single CONCURRENTLY file as one statement", async () => {
+  test("0255 fail-loud preflight + CONCURRENTLY are two statements", async () => {
     const sql = await readFile(
       path.join(migrationsDir, "0255_desktop_kind_unique_index.sql"),
       "utf8",
     );
     const stmts = splitSqlStatements(sql);
-    assert.equal(stmts.length, 1);
-    assert.match(stmts[0]!, /CREATE UNIQUE INDEX CONCURRENTLY/i);
+    assert.equal(stmts.length, 2);
+    assert.match(stmts[0]!, /indisvalid=false/);
+    assert.match(stmts[0]!, /RAISE EXCEPTION/);
+    assert.match(stmts[1]!, /CREATE UNIQUE INDEX CONCURRENTLY/i);
+    assert.doesNotMatch(stmts[1]!, /IF NOT EXISTS/i);
   });
 });
 
@@ -218,6 +221,7 @@ describe("0254–0257 desktop virtual container apply", () => {
       "0255_desktop_kind_unique_index",
       "0256_drop_user_channel_active",
       "0257_turn_dispatches_agent_container",
+      "0259_desktop_session_secret_generation",
     ]) {
       assert.ok(metadata.requiredMigrations.includes(v), `requiredMigrations missing ${v}`);
     }
@@ -239,9 +243,10 @@ describe("0254–0257 desktop virtual container apply", () => {
     );
     assert.equal(afterKind.rows[0]!.n, "1");
 
-    await query(
+    const idxStmts = splitSqlStatements(
       await readFile(path.join(migrationsDir, "0255_desktop_kind_unique_index.sql"), "utf8"),
     );
+    for (const stmt of idxStmts) await query(stmt);
     const idxValid = await query<{ indisvalid: boolean }>(
       `SELECT i.indisvalid
          FROM pg_class c

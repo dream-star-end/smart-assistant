@@ -11,8 +11,31 @@
 -- docker+desktop 双 active 仍被旧索引挡住(符合"kind 过滤上线前不放开")。
 --
 -- 真正放开双 active = 0256 DROP 旧索引(preflight 断言本索引 indisvalid)。
--- 幂等:IF NOT EXISTS;若 CONCURRENTLY 中途失败会留 INVALID 索引,需人工 DROP 后重跑。
+--
+-- Fail-loud (P1-IMPL-07, 对照 0180):故意省略 IF NOT EXISTS。CONCURRENTLY 中断会留下
+-- 同名 indisvalid=false 索引;IF NOT EXISTS 会跳过重建并让 migrator 把 0255 记进 ledger,
+-- 此后按注释 DROP 再跑也会因 ledger 已 applied 跳过。preflight 在同名 invalid 索引上
+-- RAISE EXCEPTION,给出精确 runbook,且不会登记 schema_migrations。
+--
+-- Runbook(invalid 同名索引):
+--   1. SELECT indisvalid FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+--      WHERE c.relname='uniq_ac_user_channel_kind_active';
+--   2. 若 indisvalid=false: DROP INDEX CONCURRENTLY uniq_ac_user_channel_kind_active;
+--   3. 确认 schema_migrations 无 0255_desktop_kind_unique_index 后重跑 migrate。
 
-CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uniq_ac_user_channel_kind_active
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+      FROM pg_class c
+      JOIN pg_index i ON i.indexrelid = c.oid
+     WHERE c.relname = 'uniq_ac_user_channel_kind_active'
+       AND NOT i.indisvalid
+  ) THEN
+    RAISE EXCEPTION '0255 fail-loud: uniq_ac_user_channel_kind_active exists but indisvalid=false. Runbook: DROP INDEX CONCURRENTLY uniq_ac_user_channel_kind_active; then re-run migrate. Do not insert into schema_migrations.';
+  END IF;
+END $$;
+
+CREATE UNIQUE INDEX CONCURRENTLY uniq_ac_user_channel_kind_active
   ON agent_containers (user_id, runtime_channel, runtime_kind)
   WHERE state = 'active';
