@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, cancelAuthRefresh, isAuthRecoveryTransient } from "../lib/api";
 import { publishAuthLogout, subscribeAuthLogout } from "../lib/authBroadcast";
 import { createMemoryAuthSession } from "../lib/authSession";
+import { clearAuthHint, hasAuthHint, setAuthHint } from "../lib/authHint";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { AuthSession, User } from "../lib/types";
 import { useLaneGate } from "./useLaneGate";
@@ -113,7 +114,9 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const [authRecoveryAvailable, setAuthRecoveryAvailable] = useState(false);
   const bootstrapMeFriction = useRef<{ id: string; attempts: number } | null>(null);
   // demo/重置链接跳过静默续期（重置场景用户就是要走 reset 流程，不劫持进工作区）。
-  const [booting, setBooting] = useState(!demo && !resetToken);
+  // 从未登录过的浏览器（无 oc_auth_hint）也跳过：它没有 HttpOnly refresh cookie，
+  // boot 必发 /api/auth/refresh 只会得到 400（控制台红错）；直接落未登录态看首页。
+  const [booting, setBooting] = useState(!demo && !resetToken && hasAuthHint());
   // cohort lane 决策信号（P3 RFC D1）：undefined=决策进行中；{lane}=已拿到 auth 响应
   // （lane 为 string 或 null——字段缺失=后端未部署=向后兼容仍算已决策）。login/boot 成功时置，
   // clearAuth 复位。laneReady 由 useLaneGate 据此 + authed + 3s 兜底派生。
@@ -126,6 +129,9 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // 只改 React/chat 状态，不再 bump epoch；调用方必须先 beginIdentity，或来自 expire 的
   // 原子 bump。拆开可避免 invalid 路径重复递增。
   const clearAuthState = useCallback(() => {
+    // 所有落到未登录态的路径（登出/多 tab 登出广播/refresh 明确失效/boot /me 非瞬时失败）
+    // 都经过这里：「登录过」标记一并作废，下次 boot 不再对已死的 cookie 发静默续期。
+    clearAuthHint();
     bootstrapMeFriction.current = null;
     setAuthed(false);
     setUser(null);
@@ -169,6 +175,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
         // refresh token 由后端通过 HttpOnly cookie 下发（api.login credentials:'include'）。
         const res = await api.login(email, password, turnstileToken);
         if (!session.commitToken(loginEpoch, res.accessToken)) return;
+        setAuthHint();
         setAuthed(true);
         setUser(res.user);
         // lane 决策达成（cookie 已随登录响应 Set-Cookie 下发）：解锁 WS 连接前置。
@@ -253,6 +260,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
             setUser(me);
             setAuthed(true);
             setLaneSignal({ lane: me.lane ?? null });
+            // 静默续期成功 = 本浏览器确实登录过（标记可能因旧版本/清理丢失，这里补写）。
+            setAuthHint();
             cbRef.current.onBootAuthed?.();
             setBooting(false);
             return;

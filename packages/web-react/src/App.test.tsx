@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { App } from './App'
 import { ToastProvider } from './components/ui'
 import { byteCacheKey, imageByteCache } from './lib/chat/imageBytes'
+import { setAuthHint } from './lib/authHint'
 
 // ---------------------------------------------------------------------------
 // v5 商业版前端骨架（P2）测试
@@ -205,6 +206,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     }) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
+    // boot 静默续期场景：模拟「登录过的浏览器」（oc_auth_hint），否则匿名访客不再发 refresh。
+    setAuthHint()
     render(<ToastProvider><App /></ToastProvider>)
     fireEvent.click(await screen.findByRole('button', { name: '接受邀请' }))
 
@@ -300,6 +303,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     }) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
+    // 模拟「登录过的浏览器」：静默续期只在有 oc_auth_hint 时发起。
+    setAuthHint()
     render(<App />)
 
     // 工作区标志(新建会话按钮)直接出现,全程没有点过任何登录 UI。
@@ -330,6 +335,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     }) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
+    // 模拟「登录过的浏览器」：静默续期只在有 oc_auth_hint 时发起。
+    setAuthHint()
     render(<App />)
     expect(screen.queryByRole('button', { name: '登录' })).not.toBeInTheDocument()
     await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument(), { timeout: 4_000 })
@@ -350,6 +357,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     }) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
+    // 模拟「登录过的浏览器」：静默续期只在有 oc_auth_hint 时发起。
+    setAuthHint()
     render(<App />)
     await waitFor(
       () => expect(screen.getByRole('button', { name: '重试恢复登录状态' })).toBeInTheDocument(),
@@ -375,6 +384,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     }) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
+    // 模拟「登录过的浏览器」：静默续期只在有 oc_auth_hint 时发起。
+    setAuthHint()
     render(<StrictMode><App /></StrictMode>)
     await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
     expect(refreshCalls).toBe(1)
@@ -950,6 +961,8 @@ const OTHER_DETAIL = {
 
 /** boot 静默续期成功 + 双历史会话的路由用 fetch mock。 */
 function routedFetchTwoSessions() {
+  // 路由用例全部基于「F5 后恢复登录」：模拟登录过的浏览器（oc_auth_hint），否则不发 refresh。
+  setAuthHint()
   return vi.fn(async (url: string) => {
     const u = String(url)
     if (u.includes('/api/auth/refresh')) return REFRESH_OK
