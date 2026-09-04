@@ -27,7 +27,7 @@ const WRITE_ACTIONS = new Set([
   'create_answer', 'edit_answer', 'delete_answer', 'create_comment', 'reply_comment',
   'delete_comment', 'set_vote', 'set_following', 'create_article'
 ]);
-const IMPLEMENTED_WRITES = new Set(['create_answer', 'create_comment', 'set_vote', 'set_following']);
+const IMPLEMENTED_WRITES = new Set(['create_answer', 'edit_answer', 'delete_answer', 'create_comment', 'delete_comment', 'set_vote', 'set_following']);
 const RISK_TEXT = /安全验证|访问异常|操作频繁|账号存在风险|请完成验证|验证码|登录保护|行为异常|系统检测到异常|点击按钮进行验证/;
 const NORMAL_LOGIN_VERIFICATION_TEXT = /验证码登录|获取验证码|短信验证码/g;
 let terminal = false;
@@ -304,6 +304,66 @@ async function uniqueExactControl(locator, labels) {
   }
   return matches.length === 1 ? matches[0] : null;
 }
+function sameZhihuWriteSnapshot(current, snapshot, selfToken, expectedId) {
+  return !!snapshot && snapshot.owned === true && !!current
+    && current.id === expectedId
+    && current.authorUrlToken === selfToken
+    && typeof current.contentDigest === 'string'
+    && current.contentDigest === snapshot.expectedDigest;
+}
+async function rejectIfSnapshotChanged(current, snapshot, selfToken, expectedId) {
+  if (!sameZhihuWriteSnapshot(current, snapshot, selfToken, expectedId))
+    await writeTerminalAndExit({ event: 'not_dispatched', code: 'PRECONDITION_CHANGED' });
+}
+async function findAnswerRoot(page, answerId) {
+  const items = page.locator('[data-zop], .ContentItem, .AnswerItem');
+  const matches = [];
+  const total = Math.min(await items.count(), 50);
+  for (let index = 0; index < total; index += 1) {
+    const item = items.nth(index);
+    if (!await visible(item)) continue;
+    const zop = await item.getAttribute('data-zop').catch(() => null);
+    let idMatch = false;
+    if (zop) {
+      try {
+        const parsed = JSON.parse(zop);
+        idMatch = String(parsed.itemId || parsed.answerId || '') === String(answerId);
+      } catch {}
+    }
+    const hrefCount = await item.locator('a[href*="/answer/' + answerId + '"]').count().catch(() => 0);
+    if (idMatch || hrefCount > 0) matches.push(item);
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+async function findCommentRoot(page, commentId) {
+  const items = page.locator('[class*="CommentItem"], [class*="comment-item"], [data-id]');
+  const matches = [];
+  const total = Math.min(await items.count(), 100);
+  for (let index = 0; index < total; index += 1) {
+    const item = items.nth(index);
+    if (!await visible(item)) continue;
+    const dataId = await item.getAttribute('data-id').catch(() => '');
+    if (String(dataId || '') === String(commentId)) matches.push(item);
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+async function uniqueExactActionControl(root, page, labels) {
+  const scope = root || page;
+  let control = await uniqueExactControl(scope.locator('button, [role="button"], a'), labels);
+  if (control) return control;
+  const more = await uniqueExactControl(scope.locator('button, [role="button"], a'), ['更多']);
+  if (!more) return null;
+  await more.click({ timeout: 10_000 });
+  await page.waitForTimeout(400);
+  return uniqueExactControl(page.locator('button, [role="button"], a, [role="menuitem"]'), labels);
+}
+async function uniqueExactConfirmControl(page) {
+  const dialog = page.locator('[role="dialog"] button, .Modal button, .Modal-wrapper button');
+  return await uniqueExactControl(dialog, ['确定'])
+    || await uniqueExactControl(dialog, ['删除'])
+    || await uniqueExactControl(page.locator('button, [role="button"]'), ['确定'])
+    || await uniqueExactControl(page.locator('button, [role="button"]'), ['删除']);
+}
 async function awaitDispatch() {
   writeFrame({ event: 'prepared' });
   const command = await readFrame();
@@ -483,6 +543,31 @@ async function projectAnswer(page, expectedId) {
       } catch {}
     }
     const authorName = String((zop && zop.authorName) || '').replace(/\s+/g, ' ').trim().slice(0, 128);
+    const item = Array.from(document.querySelectorAll('[data-zop], .ContentItem, .AnswerItem')).find((node) => {
+      if (!visible(node)) return false;
+      try {
+        const parsed = JSON.parse(node.getAttribute('data-zop') || '');
+        if (String(parsed.itemId || parsed.answerId || '') === String(answerId)) return true;
+      } catch {}
+      return Array.from(node.querySelectorAll('a[href]')).some((anchor) => {
+        try { return new URL(anchor.href, location.href).pathname.indexOf('/answer/' + answerId) >= 0; } catch { return false; }
+      });
+    }) || document.body;
+    const authorHref = Array.from(item.querySelectorAll('a[href]')).map((anchor) => {
+      try {
+        const url = new URL(anchor.href, location.href);
+        const match = /^\/people\/([A-Za-z0-9-]{1,64})(?:\/|$)/.exec(url.pathname);
+        return match ? match[1] : null;
+      } catch { return null; }
+    }).find(Boolean) || '';
+    const timeEl = item.querySelector('time[datetime]');
+    let updatedAt = (timeEl && timeEl.getAttribute('datetime') || '').replace(/\s+/g, ' ').trim().slice(0, 128);
+    if (!updatedAt) {
+      const timeNode = item.querySelector('.ContentItem-time, [class*="ContentItem-time"], [class*="AnswerItem-time"]');
+      const timeText = ((timeNode && timeNode.textContent) || '').replace(/\s+/g, ' ').trim();
+      const match = /(?:编辑于|发布于|修改于)[^\n]{0,40}/.exec(timeText || (item.innerText || '').replace(/\s+/g, ' '));
+      updatedAt = match ? match[0].replace(/\s+/g, ' ').trim().slice(0, 128) : '';
+    }
     const body = (document.body && document.body.innerText || '');
     const voteMatch = /([0-9.]+)\s*([万亿]?)\s*赞同/.exec(body);
     const commentMatch = /([0-9.]+)\s*([万亿]?)\s*条评论/.exec(body) || /([0-9.]+)\s*([万亿]?)\s*评论/.exec(body);
@@ -496,15 +581,20 @@ async function projectAnswer(page, expectedId) {
       questionId: qid,
       questionTitle: title,
       authorName,
+      authorUrlToken: authorHref,
       text,
       voteCount,
       commentCount,
       url: qid ? ('https://www.zhihu.com/question/' + qid + '/answer/' + answerId) : ('https://www.zhihu.com/answer/' + answerId),
+      updatedAt,
       contentDigest: null
     };
   }, expectedId || null);
   if (!data) throw new Error('answer');
-  data.contentDigest = digest({ id: data.id, text: data.text, voteCount: data.voteCount });
+  data.contentDigest = digest({
+    id: data.id, text: data.text, authorUrlToken: data.authorUrlToken || '',
+    updatedAt: data.updatedAt || '', voteCount: data.voteCount
+  });
   return data;
 }
 async function collectComments(page, answerId, limit) {
@@ -544,19 +634,32 @@ async function collectComments(page, answerId, limit) {
         } catch { return null; }
       }).find(Boolean) || '';
       const authorName = (node.querySelector('a[href*="/people/"]') && node.querySelector('a[href*="/people/"]').textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
+      const timeEl = node.querySelector('time[datetime]');
+      let updatedAt = (timeEl && timeEl.getAttribute('datetime') || '').replace(/\s+/g, ' ').trim().slice(0, 128);
+      if (!updatedAt) {
+        const timeText = (node.textContent || '').replace(/\s+/g, ' ').trim();
+        const match = /(?:编辑于|发布于|修改于)[^\n]{0,40}/.exec(timeText);
+        updatedAt = match ? match[0].replace(/\s+/g, ' ').trim().slice(0, 128) : '';
+      }
       items.push({
         id: commentId,
         answerId: input.answerId,
         authorName,
         authorUrlToken: authorHref,
         text,
-        url: 'https://www.zhihu.com/answer/' + input.answerId
+        url: 'https://www.zhihu.com/answer/' + input.answerId,
+        updatedAt
       });
       if (items.length >= input.limit) break;
     }
     return items;
   }, { answerId, limit });
-  return rows.map((row) => ({ ...row, contentDigest: digest({ id: row.id, text: row.text }) }));
+  return rows.map((row) => ({
+    ...row,
+    contentDigest: digest({
+      id: row.id, text: row.text, authorUrlToken: row.authorUrlToken || '', updatedAt: row.updatedAt || ''
+    })
+  }));
 }
 async function collectSearch(page, query, type, limit) {
   const typeParam = type === 'question' ? 'question' : type === 'people' ? 'people' : 'content';
@@ -862,6 +965,74 @@ async function writeAction(page, input) {
     await control.click({ timeout: 10_000 }).catch(() => { throw new Error('send-click'); });
     await page.waitForTimeout(800);
     await assertNoChallenge(page);
+    return { ok: true, changed: true };
+  }
+  if (input.actionId === 'edit_answer' || input.actionId === 'delete_answer') {
+    await gotoAuthenticated(page, 'https://www.zhihu.com/answer/' + params.answerId);
+    const current = await projectAnswer(page, params.answerId);
+    await rejectIfSnapshotChanged(current, params.snapshot, selfToken, params.answerId);
+    const root = await findAnswerRoot(page, params.answerId);
+    const actionLabel = input.actionId === 'edit_answer' ? '编辑' : '删除';
+    const control = await uniqueExactActionControl(root, page, [actionLabel]);
+    if (!control) throw new Error('control');
+    await awaitDispatch();
+    await assertNoChallenge(page);
+    const fresh = await projectAnswer(page, params.answerId);
+    await rejectIfSnapshotChanged(fresh, params.snapshot, selfToken, params.answerId);
+    const freshRoot = await findAnswerRoot(page, params.answerId);
+    const freshControl = await uniqueExactActionControl(freshRoot, page, [actionLabel]);
+    if (!freshControl) throw new Error('control');
+    await freshControl.click({ timeout: 10_000 });
+    if (input.actionId === 'delete_answer') {
+      await page.waitForTimeout(400);
+      const confirm = await uniqueExactConfirmControl(page);
+      if (!confirm) throw new Error('control');
+      await confirm.click({ timeout: 10_000 });
+      await page.waitForTimeout(1500);
+      await assertNoChallenge(page);
+      let remains = true;
+      try { await projectAnswer(page, params.answerId); } catch { remains = false; }
+      if (remains) throw new Error('result');
+      return { ok: true, changed: true };
+    }
+    await page.waitForTimeout(500);
+    await fillEditor(page, params.text);
+    const save = await uniqueExactControl(page.locator('button, [role="button"]'), ['确定'])
+      || await uniqueExactControl(page.locator('button, [role="button"]'), ['发布'])
+      || await uniqueExactControl(page.locator('button, [role="button"]'), ['提交']);
+    if (!save) throw new Error('send-button');
+    await save.click({ timeout: 10_000 }).catch(() => { throw new Error('send-click'); });
+    await page.waitForTimeout(1500);
+    await assertNoChallenge(page);
+    const updated = await projectAnswer(page, params.answerId);
+    if (updated.id !== params.answerId || updated.authorUrlToken !== selfToken || !updated.text.includes(cleanText(params.text, 40).slice(0, 20))) throw new Error('result');
+    return { answer: updated };
+  }
+  if (input.actionId === 'delete_comment') {
+    await gotoAuthenticated(page, 'https://www.zhihu.com/answer/' + params.answerId);
+    const comments = await collectComments(page, params.answerId, 50);
+    const current = comments.find((row) => row.id === params.commentId);
+    await rejectIfSnapshotChanged(current, params.snapshot, selfToken, params.commentId);
+    const root = await findCommentRoot(page, params.commentId);
+    const control = await uniqueExactActionControl(root, page, ['删除']);
+    if (!control) throw new Error('control');
+    await awaitDispatch();
+    await assertNoChallenge(page);
+    const freshComments = await collectComments(page, params.answerId, 50);
+    const fresh = freshComments.find((row) => row.id === params.commentId);
+    await rejectIfSnapshotChanged(fresh, params.snapshot, selfToken, params.commentId);
+    const freshRoot = await findCommentRoot(page, params.commentId);
+    const freshControl = await uniqueExactActionControl(freshRoot, page, ['删除']);
+    if (!freshControl) throw new Error('control');
+    await freshControl.click({ timeout: 10_000 });
+    await page.waitForTimeout(400);
+    const confirm = await uniqueExactConfirmControl(page);
+    if (!confirm) throw new Error('control');
+    await confirm.click({ timeout: 10_000 });
+    await page.waitForTimeout(1200);
+    await assertNoChallenge(page);
+    const remains = (await collectComments(page, params.answerId, 50)).some((row) => row.id === params.commentId);
+    if (remains) throw new Error('result');
     return { ok: true, changed: true };
   }
   throw new Error('unsupported');

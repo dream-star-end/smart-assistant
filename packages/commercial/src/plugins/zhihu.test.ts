@@ -75,6 +75,32 @@ function compileWorkerChallengeHarness(writeTerminalAndExit: (event: unknown) =>
   ) as ReturnType<typeof compileWorkerChallengeHarness>
 }
 
+function compileSnapshotGuardHarness(
+  writeTerminalAndExit: (event: unknown) => Promise<void>,
+): {
+  sameZhihuWriteSnapshot(
+    current: unknown,
+    snapshot: unknown,
+    selfToken: string,
+    expectedId: string,
+  ): boolean
+  rejectIfSnapshotChanged(
+    current: unknown,
+    snapshot: unknown,
+    selfToken: string,
+    expectedId: string,
+  ): Promise<void>
+} {
+  const start = ZHIHU_WORKER_SOURCE.indexOf('function sameZhihuWriteSnapshot')
+  const end = ZHIHU_WORKER_SOURCE.indexOf('async function findAnswerRoot', start)
+  assert.ok(start >= 0 && end > start)
+  return new Function(
+    'writeTerminalAndExit',
+    `'use strict'; ${ZHIHU_WORKER_SOURCE.slice(start, end)}
+      return { sameZhihuWriteSnapshot, rejectIfSnapshotChanged };`,
+  )(writeTerminalAndExit) as ReturnType<typeof compileSnapshotGuardHarness>
+}
+
 describe('official Zhihu Plugin', () => {
   test('pins the current artifact and compiles a stable hash', () => {
     assert.equal(ZHIHU_PLUGIN_VERSION, '1.0.0')
@@ -295,7 +321,11 @@ describe('official Zhihu Plugin', () => {
           },
         },
         delete_comment: {
-          params: { commentId: '1', snapshot: { expectedDigest: '0'.repeat(64), owned: true } },
+          params: {
+            answerId: '9',
+            commentId: '1',
+            snapshot: { expectedDigest: '0'.repeat(64), owned: true },
+          },
           result: { ok: true, changed: true },
         },
         set_vote: {
@@ -343,6 +373,9 @@ describe('official Zhihu Plugin', () => {
         error instanceof RuntimePluginContractError && error.code === 'INVALID_PARAMS',
     )
     const edit = ZHIHU_PLUGIN_CONTRACT.actions.find((action) => action.id === 'edit_answer')!
+    assert.doesNotThrow(() =>
+      validateRuntimePluginJson(edit.params, { answerId: '9', text: 'changed' }, 'params'),
+    )
     assert.throws(
       () =>
         validateRuntimePluginJson(
@@ -357,6 +390,16 @@ describe('official Zhihu Plugin', () => {
       (error: unknown) =>
         error instanceof RuntimePluginContractError && error.code === 'INVALID_PARAMS',
     )
+    const deleteComment = ZHIHU_PLUGIN_CONTRACT.actions.find(
+      (action) => action.id === 'delete_comment',
+    )!
+    assert.doesNotThrow(() =>
+      validateRuntimePluginJson(
+        deleteComment.params,
+        { answerId: '9', commentId: '1' },
+        'params',
+      ),
+    )
   })
 
   test('worker source has a handling branch for every action id and is DOM-only', () => {
@@ -369,14 +412,60 @@ describe('official Zhihu Plugin', () => {
     assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'get_self'/)
     assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'create_answer'/)
     assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'create_comment'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'edit_answer'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'delete_answer'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'delete_comment'/)
     assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'set_vote'/)
     assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'set_following'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /IMPLEMENTED_WRITES = new Set\(\['create_answer', 'edit_answer', 'delete_answer'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /PRECONDITION_CHANGED/)
     assert.match(ZHIHU_WORKER_SOURCE, /ZHIHU_UPSTREAM_CHALLENGE/)
     assert.match(ZHIHU_WORKER_SOURCE, /\/account\/unhuman/)
     assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /page\.request/)
     assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /__reactFiber/)
     assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /__INITIAL_STATE__/)
     assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /api\.zhihu\.com/)
+  })
+
+  test('mismatched edit/delete snapshots fail closed as PRECONDITION_CHANGED', async () => {
+    const events: unknown[] = []
+    const { sameZhihuWriteSnapshot, rejectIfSnapshotChanged } = compileSnapshotGuardHarness(
+      async (event) => {
+        events.push(event)
+      },
+    )
+    const snapshot = { expectedDigest: 'a'.repeat(64), owned: true as const }
+    const current = {
+      id: '9',
+      authorUrlToken: 'me',
+      contentDigest: 'a'.repeat(64),
+    }
+    assert.equal(sameZhihuWriteSnapshot(current, snapshot, 'me', '9'), true)
+    await rejectIfSnapshotChanged(current, snapshot, 'me', '9')
+    assert.equal(events.length, 0)
+
+    const stale = { ...current, contentDigest: 'b'.repeat(64) }
+    assert.equal(sameZhihuWriteSnapshot(stale, snapshot, 'me', '9'), false)
+    await rejectIfSnapshotChanged(stale, snapshot, 'me', '9')
+    assert.deepEqual(events.at(-1), {
+      event: 'not_dispatched',
+      code: 'PRECONDITION_CHANGED',
+    })
+
+    events.length = 0
+    assert.equal(sameZhihuWriteSnapshot(current, snapshot, 'other', '9'), false)
+    await rejectIfSnapshotChanged(current, snapshot, 'other', '9')
+    assert.deepEqual(events.at(-1), {
+      event: 'not_dispatched',
+      code: 'PRECONDITION_CHANGED',
+    })
+
+    events.length = 0
+    await rejectIfSnapshotChanged(undefined, snapshot, 'me', '9')
+    assert.deepEqual(events.at(-1), {
+      event: 'not_dispatched',
+      code: 'PRECONDITION_CHANGED',
+    })
   })
 
   test('risk pages and unhuman URLs fail closed as ZHIHU_UPSTREAM_CHALLENGE', async () => {
