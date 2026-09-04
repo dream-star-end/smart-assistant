@@ -271,8 +271,9 @@ export function buildWriteSummary(
     case 'zhihu/create_pin': {
       const text = String(params.text ?? '')
       const media = Array.isArray(params.mediaManifest) ? params.mediaManifest : []
+      const images = media.length > 0 ? `（${media.length} 张图片）` : ''
       return ellipsize(
-        `用知乎${hint}发布想法（${media.length} 张图片）：「${ellipsize(text, 300)}」`,
+        `用知乎${hint}发布想法${images}：「${ellipsize(text, 300)}」`,
         2000,
       )
     }

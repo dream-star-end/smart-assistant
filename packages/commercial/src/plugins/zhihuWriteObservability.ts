@@ -55,6 +55,7 @@ const WORKER_STAGE_TO_CODE: Readonly<Record<string, ZhihuWorkerProtocolFailureCo
   'send-click': 'ZHIHU_WRITE_SEND_CLICK',
   send: 'ZHIHU_WRITE_SEND',
   result: 'ZHIHU_WRITE_RESULT',
+  'result-projection': 'ZHIHU_WRITE_RESULT',
   'media-chooser': 'ZHIHU_WRITE_MEDIA_CHOOSER',
   'media-upload': 'ZHIHU_WRITE_MEDIA_UPLOAD',
   'media-preview-timeout': 'ZHIHU_WRITE_MEDIA_PREVIEW_TIMEOUT',

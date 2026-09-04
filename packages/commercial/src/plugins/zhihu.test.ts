@@ -184,13 +184,16 @@ describe('official Zhihu Plugin', () => {
       assert.match(action.description, /逐次确认/)
     const writePolicy = managedPluginWritePolicy(ZHIHU_PLUGIN_SLUG)
     assert.ok(writePolicy)
-    assert.equal(writePolicy.version, 1)
+    assert.equal(writePolicy.version, 2)
     assert.match(writePolicy.disclaimerText, /默认每一次写操作仍须.*确认卡/)
-    assert.match(writePolicy.disclaimerText, /可代为上传你指定的本地图片/)
+    assert.match(writePolicy.disclaimerText, /发布想法/)
+    assert.match(writePolicy.disclaimerText, /上传你指定的本地图片/)
     const preapprovalPolicy = managedPluginWritePreapprovalPolicy(ZHIHU_PLUGIN_SLUG)
     assert.ok(preapprovalPolicy)
-    assert.equal(preapprovalPolicy.version, 1)
+    assert.equal(preapprovalPolicy.version, 2)
     assert.match(preapprovalPolicy.disclaimerText, /免逐次确认/)
+    assert.match(preapprovalPolicy.disclaimerText, /发布想法/)
+    assert.match(preapprovalPolicy.disclaimerText, /上传你指定的本地图片/)
     assert.match(preapprovalPolicy.disclaimerText, /派发围栏/)
   })
 
@@ -443,6 +446,8 @@ describe('official Zhihu Plugin', () => {
     for (const id of ['create_pin', 'create_answer', 'edit_answer', 'create_article'] as const) {
       const action = ZHIHU_PLUGIN_CONTRACT.actions.find((candidate) => candidate.id === id)
       assert.ok(action, `missing ${id}`)
+      assert.equal(action.timeoutSeconds, 600, `${id} timeout`)
+      assert.match(action.description, /可带图/, `${id} description`)
       const properties = (action.params as { properties?: Record<string, unknown> }).properties
       assert.ok(properties?.images, `${id} missing images`)
       assert.ok(properties?.mediaManifest, `${id} missing mediaManifest`)

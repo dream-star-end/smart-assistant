@@ -57,7 +57,7 @@ function classifyWriteFailure(reason) {
   if (message === 'send-button') return 'ZHIHU_WRITE_SEND_BUTTON';
   if (message === 'send-click') return 'ZHIHU_WRITE_SEND_CLICK';
   if (message === 'send') return 'ZHIHU_WRITE_SEND';
-  if (message === 'result') return 'ZHIHU_WRITE_RESULT';
+  if (message === 'result' || message === 'result-projection') return 'ZHIHU_WRITE_RESULT';
   if (message === 'unsupported') return 'ZHIHU_WRITE_UNSUPPORTED';
   if (message === 'media-chooser') return 'ZHIHU_WRITE_MEDIA_CHOOSER';
   if (message === 'media-upload') return 'ZHIHU_WRITE_MEDIA_UPLOAD';
@@ -400,10 +400,30 @@ async function gotoAuthenticated(page, url) {
   await finishAuthenticatedNav(page, response ? response.status() : 0);
 }
 async function gotoInSite(page, url) {
-  const nav = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => null);
-  await page.evaluate((target) => { location.assign(target); }, url).catch(() => {});
-  await nav;
-  await page.waitForFunction(() => document.body && document.body.innerText.trim().length > 0, null, { timeout: 15_000 }).catch(() => null);
+  let currentOrigin = '';
+  let targetOrigin = '';
+  try { currentOrigin = new URL(page.url()).origin; } catch {}
+  try { targetOrigin = new URL(url).origin; } catch {}
+  if (!currentOrigin || !targetOrigin || currentOrigin !== targetOrigin) {
+    await gotoAuthenticated(page, url);
+    return;
+  }
+  const nav = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+  try {
+    await page.evaluate((target) => { location.assign(target); }, url);
+  } catch {
+    throw new Error('nav');
+  }
+  try {
+    await nav;
+  } catch {
+    throw new Error('nav');
+  }
+  try {
+    await page.waitForFunction(() => document.body && document.body.innerText.trim().length > 0, null, { timeout: 15_000 });
+  } catch {
+    throw new Error('nav');
+  }
   await page.waitForTimeout(2500);
   await finishAuthenticatedNav(page, 0);
 }
@@ -1179,12 +1199,10 @@ function isComposerPreviewSrc(src) {
   if (/zhimg\.com/i.test(src)) return true;
   return false;
 }
-async function awaitComposerMediaReady(page, editor, expectedNew, timeout, beforeSrcs, beforeCount, beforeDelete, beforeNodes) {
-  const scope = (await composerScope(editor)) || editor || page;
-  if (!scope || typeof scope.locator !== 'function') throw new Error('media-preview-timeout');
+async function awaitComposerMediaReady(page, editor, expectedNew, timeout, beforeSrcs) {
+  if (!editor || typeof editor.locator !== 'function' || editor === page) throw new Error('media-chooser');
+  const scope = editor;
   const before = new Set(Array.isArray(beforeSrcs) ? beforeSrcs : []);
-  const baseCount = Number.isFinite(beforeCount) ? beforeCount : before.size;
-  const baseNodes = Number.isFinite(beforeNodes) ? beforeNodes : 0;
   const deadline = Date.now() + timeout;
   const attempts = Math.max(1, Math.ceil(timeout / 250));
   for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -1196,14 +1214,8 @@ async function awaitComposerMediaReady(page, editor, expectedNew, timeout, befor
       seen.add(src);
       added.push(src);
     }
-    const imgs = await countVisibleImgs(scope);
-    const previewNodes = await countPreviewNodes(scope);
     const addedPreview = added.filter((src) => isComposerPreviewSrc(src)).length;
-    const ready = addedPreview >= expectedNew || added.length >= expectedNew
-      || imgs >= baseCount + expectedNew
-      || previewNodes >= baseNodes + expectedNew
-      || (beforeDelete && false);
-    if (ready) return;
+    if (addedPreview >= expectedNew) return;
     const remaining = deadline - Date.now();
     if (attempt < attempts - 1 && remaining > 0) {
       await page.waitForTimeout(Math.min(250, remaining));
@@ -1243,24 +1255,29 @@ async function armFileChooser(page, clickable, files) {
     if (timer) clearTimeout(timer);
   }
 }
-async function uniqueImageTool(scope, page) {
-  const labeled = await uniqueExactControl((scope || page).locator('button, [role="button"], [role="menuitem"], a'), ['图片']);
-  if (labeled) return labeled;
-  const byAttr = (scope || page).locator('button[title="图片"], button[aria-label="图片"], [role="button"][title="图片"], [role="button"][aria-label="图片"]');
-  const unique = await uniqueVisible(byAttr);
-  if (unique) return unique;
-  if (scope) {
-    const pageLabeled = await uniqueExactControl(page.locator('button, [role="button"], [role="menuitem"], a'), ['图片']);
-    if (pageLabeled) return pageLabeled;
-  }
-  return null;
+async function proveImageControl(scope, page) {
+  if (!scope || typeof scope.locator !== 'function' || scope === page) throw new Error('media-chooser');
+  if (await uniqueImageFileInput(scope)) return true;
+  if (await uniqueExactControl(scope.locator('button, [role="button"], [role="menuitem"], a'), ['图片'])) return true;
+  const byAttr = scope.locator('button[title="图片"], button[aria-label="图片"], [role="button"][title="图片"], [role="button"][aria-label="图片"]');
+  if (await uniqueVisible(byAttr)) return true;
+  throw new Error('media-chooser');
 }
-async function attachImages(page, scope, manifest) {
+async function uniqueImageTool(scope, page) {
+  const root = (scope && typeof scope.locator === 'function' && scope !== page) ? scope : null;
+  if (!root) return null;
+  const labeled = await uniqueExactControl(root.locator('button, [role="button"], [role="menuitem"], a'), ['图片']);
+  if (labeled) return labeled;
+  const byAttr = root.locator('button[title="图片"], button[aria-label="图片"], [role="button"][title="图片"], [role="button"][aria-label="图片"]');
+  return uniqueVisible(byAttr);
+}
+async function attachImages(page, scope, manifest, previewBeforeSrcs) {
   const items = Array.isArray(manifest) ? manifest : [];
   if (items.length === 0) return 0;
+  if (!scope || typeof scope.locator !== 'function' || scope === page) throw new Error('media-chooser');
   const files = [];
   let selected = 0;
-  const target = (scope && typeof scope.locator === 'function') ? scope : page;
+  const target = scope;
   try {
     for (const item of items) {
       const inputId = String(item && item.inputId || '');
@@ -1269,9 +1286,7 @@ async function attachImages(page, scope, manifest) {
       if (!/^[A-Za-z0-9-]{1,64}$/.test(inputId) || !ALLOWED_IMAGE_MIME.has(mimeType)) throw new Error('media-upload');
       files.push({ name: filename, mimeType, buffer: await readFile('/inputs/' + inputId) });
     }
-    const previewBefore = await collectVisibleImageSrcs(target);
-    const previewBeforeCount = await countVisibleImgs(target);
-    const previewBeforeNodes = await countPreviewNodes(target);
+    const previewBefore = Array.isArray(previewBeforeSrcs) ? previewBeforeSrcs : await collectVisibleImageSrcs(target);
     let input = await uniqueImageFileInput(target);
     let attached = false;
     if (!input) {
@@ -1289,8 +1304,7 @@ async function attachImages(page, scope, manifest) {
           } catch { throw new Error('media-upload'); }
         }
         if (!attached) {
-          const local = await uniqueExactControl(target.locator('button, [role="button"], [role="menuitem"], a'), ['本地上传'])
-            || await uniqueExactControl(page.locator('button, [role="button"], [role="menuitem"], a'), ['本地上传']);
+          const local = await uniqueExactControl(target.locator('button, [role="button"], [role="menuitem"], a'), ['本地上传']);
           if (local) {
             const localArmed = await armFileChooser(page, local, files);
             if (localArmed.timedOut) throw new Error('media-chooser');
@@ -1298,11 +1312,11 @@ async function attachImages(page, scope, manifest) {
             if (localArmed.attached) { attached = true; selected = files.length; }
           }
         }
-        input = await uniqueImageFileInput(target) || await uniqueImageFileInput(page);
+        input = await uniqueImageFileInput(target);
       }
     }
     if (!attached) {
-      if (!input) input = await uniqueImageFileInput(target) || await uniqueImageFileInput(page);
+      if (!input) input = await uniqueImageFileInput(target);
       if (!input) throw new Error('media-chooser');
       try {
         await wrapFileInput(input).setFiles(files);
@@ -1318,7 +1332,7 @@ async function attachImages(page, scope, manifest) {
       } catch { selected = files.length; }
     }
     if (selected !== files.length) throw new Error('media-upload');
-    await awaitComposerMediaReady(page, target, files.length, 90_000, previewBefore, previewBeforeCount, false, previewBeforeNodes);
+    await awaitComposerMediaReady(page, target, files.length, 90_000, previewBefore);
     emitStep({ step: 'media.attach', ok: true, hits: selected, candidateCount: files.length });
     return selected;
   } catch (error) {
@@ -1330,10 +1344,8 @@ async function attachImages(page, scope, manifest) {
     }
   }
 }
-async function projectCreatedPin(page, selfToken, text) {
-  await gotoAuthenticated(page, 'https://www.zhihu.com/people/' + selfToken + '/pins');
-  const needle = cleanText(text, 40).slice(0, 20);
-  const rows = await page.evaluate((input) => {
+async function scanOwnPinRows(target, selfToken) {
+  return target.evaluate((token) => {
     const visible = (element) => {
       const bounds = element.getBoundingClientRect();
       const style = getComputedStyle(element);
@@ -1349,7 +1361,7 @@ async function projectCreatedPin(page, selfToken, text) {
           return match ? match[1] : null;
         } catch { return null; }
       }).find(Boolean) || '';
-      if (input.selfToken && authorHref && authorHref !== input.selfToken) continue;
+      if (authorHref !== token) continue;
       const excerpt = (node.querySelector('.RichContent-inner, .RichText, [class*="RichContent"]') && node.querySelector('.RichContent-inner, .RichText, [class*="RichContent"]').textContent || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
       let pinId = '';
       for (const anchor of node.querySelectorAll('a[href]')) {
@@ -1364,15 +1376,36 @@ async function projectCreatedPin(page, selfToken, text) {
         id: pinId,
         text: excerpt,
         authorUrlToken: authorHref,
-        recent: /刚刚|分钟前/.test(timeText)
+        justNow: /刚刚/.test(timeText)
       });
     }
     return items;
-  }, { selfToken, needle });
-  const mine = needle
-    ? rows.find((row) => row.authorUrlToken === selfToken && (row.text || '').includes(needle))
-    : rows.find((row) => row.authorUrlToken === selfToken && row.recent) || rows.find((row) => row.recent);
-  if (!mine || !mine.id) throw new Error('result-projection');
+  }, selfToken).catch(() => []);
+}
+async function collectOwnPinIds(page, selfToken) {
+  const context = typeof page.context === 'function' ? page.context() : null;
+  if (context && typeof context.newPage === 'function') {
+    const tab = await context.newPage();
+    try {
+      await gotoAuthenticated(tab, 'https://www.zhihu.com/people/' + selfToken + '/pins');
+      return new Set((await scanOwnPinRows(tab, selfToken)).map((row) => row.id).filter(Boolean));
+    } finally {
+      await tab.close().catch(() => {});
+    }
+  }
+  return new Set((await scanOwnPinRows(page, selfToken)).map((row) => row.id).filter(Boolean));
+}
+async function projectCreatedPin(page, selfToken, text, beforeIds) {
+  await gotoAuthenticated(page, 'https://www.zhihu.com/people/' + selfToken + '/pins');
+  const needle = cleanText(text, 40).slice(0, 20);
+  const baseline = beforeIds instanceof Set ? beforeIds : new Set();
+  const rows = await scanOwnPinRows(page, selfToken);
+  const mine = rows.find((row) => {
+    if (!row.id || row.authorUrlToken !== selfToken || baseline.has(row.id)) return false;
+    if (needle) return (row.text || '').includes(needle);
+    return row.justNow === true;
+  });
+  if (!mine || !mine.id) throw new Error('result');
   const pinText = cleanText(text, 2000);
   return {
     id: mine.id,
@@ -1399,7 +1432,7 @@ async function fillEditor(page, text, existing) {
   if (tag === 'textarea' || tag === 'input') await editor.fill(text);
   else {
     await page.keyboard.press('Control+A').catch(() => {});
-    await page.keyboard.type(text, { delay: 10 });
+    await page.keyboard.insertText(text);
   }
   await page.waitForTimeout(400);
   const readback = cleanText(await editor.innerText().catch(() => ''), 20000);
@@ -1422,9 +1455,15 @@ async function writeAction(page, input) {
     await page.waitForTimeout(800);
     const editor = await fillEditor(page, params.text);
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
+    const scope = await composerScope(editor);
+    let previewBefore = [];
+    if (manifest.length) {
+      await proveImageControl(scope, page);
+      previewBefore = await collectVisibleImageSrcs(scope);
+    }
     await awaitDispatch();
     await assertNoChallenge(page);
-    if (manifest.length) await attachImages(page, (await composerScope(editor)) || page, manifest);
+    if (manifest.length) await attachImages(page, scope, manifest, previewBefore);
     await clickUniqueSend(page, ['发布', '提交回答', '提交']);
     await page.waitForTimeout(1500);
     await assertNoChallenge(page);
@@ -1512,7 +1551,7 @@ async function writeAction(page, input) {
     await page.waitForTimeout(500);
     const editor = await fillEditor(page, params.text);
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
-    if (manifest.length) await attachImages(page, (await composerScope(editor)) || page, manifest);
+    if (manifest.length) await attachImages(page, await composerScope(editor), manifest);
     const save = await uniqueExactControl(page.locator('button, [role="button"]'), ['确定'])
       || await uniqueExactControl(page.locator('button, [role="button"]'), ['发布'])
       || await uniqueExactControl(page.locator('button, [role="button"]'), ['提交']);
@@ -1591,12 +1630,19 @@ async function writeAction(page, input) {
       throw new Error('composer-editor');
     }
     if (text) await fillEditor(page, text, editor);
-    const scope = (await composerScope(editor)) || page;
+    const scope = await composerScope(editor);
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
+    let previewBefore = [];
+    if (manifest.length) {
+      await proveImageControl(scope, page);
+      previewBefore = await collectVisibleImageSrcs(scope);
+    }
+    const beforePinIds = await collectOwnPinIds(page, selfToken);
     await awaitDispatch();
     await assertNoChallenge(page);
-    if (manifest.length) await attachImages(page, scope, manifest);
-    const send = await uniqueExactControl(page.locator('button, [role="button"]'), ['发布']);
+    if (manifest.length) await attachImages(page, scope, manifest, previewBefore);
+    const send = await uniqueExactControl((scope || page).locator('button, [role="button"]'), ['发布'])
+      || await uniqueExactControl(page.locator('button, [role="button"]'), ['发布']);
     if (!send) {
       emitStep({ step: 'write.compose', ok: false, reason: 'no-send' });
       throw new Error('send-button');
@@ -1604,7 +1650,7 @@ async function writeAction(page, input) {
     await send.click({ timeout: 10_000 }).catch(() => { throw new Error('send-click'); });
     await page.waitForTimeout(1500);
     await assertNoChallenge(page);
-    const pin = await projectCreatedPin(page, selfToken, text);
+    const pin = await projectCreatedPin(page, selfToken, text, beforePinIds);
     return { pin };
   }
   if (input.actionId === 'create_article') {
@@ -1641,9 +1687,15 @@ async function writeAction(page, input) {
       throw error;
     }
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
+    const scope = await composerScope(editor);
+    let previewBefore = [];
+    if (manifest.length) {
+      await proveImageControl(scope, page);
+      previewBefore = await collectVisibleImageSrcs(scope);
+    }
     await awaitDispatch();
     await assertNoChallenge(page);
-    if (manifest.length) await attachImages(page, (await composerScope(editor)) || page, manifest);
+    if (manifest.length) await attachImages(page, scope, manifest, previewBefore);
     const send = await uniqueExactControl(page.locator('button, [role="button"]'), ['发布文章', '发布']);
     if (!send) {
       emitStep({ step: 'write.compose', ok: false, reason: 'no-send' });
@@ -1657,10 +1709,10 @@ async function writeAction(page, input) {
       await page.waitForTimeout(750);
       articleId = articleIdOf(page.url());
     }
-    if (!articleId) throw new Error('result-projection');
+    if (!articleId) throw new Error('result');
     const heading = await uniqueVisible(page.locator('h1'));
-    const publishedTitle = cleanText(heading ? await heading.innerText().catch(() => '') : '', 500);
-    if (cleanText(params.title, 500) !== publishedTitle) throw new Error('result-projection');
+    const publishedTitle = cleanText(heading ? await heading.innerText().catch(() => '') : '', 500).replace(/\s*-\s*知乎\s*$/, '');
+    if (cleanText(params.title, 500).replace(/\s*-\s*知乎\s*$/, '') !== publishedTitle) throw new Error('result');
     return {
       article: {
         id: articleId,

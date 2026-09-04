@@ -520,9 +520,9 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'create_answer',
-      description: '使用当前真实知乎身份回答指定问题（默认逐次确认；账号授权后可免确认）',
+      description: '使用当前真实知乎身份回答指定问题（可带图，默认逐次确认；账号授权后可免确认）',
       effect: 'write',
-      timeoutSeconds: 300,
+      timeoutSeconds: 600,
       params: {
         type: 'object',
         properties: {
@@ -543,9 +543,9 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'edit_answer',
-      description: '编辑自己已发布的知乎回答（默认逐次确认；账号授权后可免确认）',
+      description: '编辑自己已发布的知乎回答（可带图，默认逐次确认；账号授权后可免确认）',
       effect: 'write',
-      timeoutSeconds: 300,
+      timeoutSeconds: 600,
       params: {
         type: 'object',
         properties: {
@@ -672,7 +672,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'create_article',
       description: '使用当前真实知乎身份发布文章（可带图，默认逐次确认；账号授权后可免确认）',
       effect: 'write',
-      timeoutSeconds: 300,
+      timeoutSeconds: 600,
       params: {
         type: 'object',
         properties: {

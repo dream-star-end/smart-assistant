@@ -21,6 +21,7 @@ describe('Zhihu write failure mapping', () => {
     assert.equal(mapZhihuWorkerStage(new Error('send')), 'ZHIHU_WRITE_SEND')
     assert.equal(mapZhihuWorkerStage(new Error('send-button')), 'ZHIHU_WRITE_SEND_BUTTON')
     assert.equal(mapZhihuWorkerStage(new Error('result')), 'ZHIHU_WRITE_RESULT')
+    assert.equal(mapZhihuWorkerStage(new Error('result-projection')), 'ZHIHU_WRITE_RESULT')
     assert.equal(mapZhihuWorkerStage(new Error('unsupported')), 'ZHIHU_WRITE_UNSUPPORTED')
     assert.equal(mapZhihuWorkerStage(new Error('media-chooser')), 'ZHIHU_WRITE_MEDIA_CHOOSER')
     assert.equal(mapZhihuWorkerStage(new Error('media-upload')), 'ZHIHU_WRITE_MEDIA_UPLOAD')

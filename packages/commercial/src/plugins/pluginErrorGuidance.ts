@@ -389,7 +389,7 @@ const ROWS: Record<string, Row> = {
     retrySafe: 'no',
     requiresReauth: false,
     message: '知乎发送后未能确认结果',
-    nextAction: '发送未执行。可重开一条新确认',
+    nextAction: '请先到知乎核实是否已发出，不要重放',
   },
   ZHIHU_WRITE_UNSUPPORTED: {
     retrySafe: 'no',
@@ -425,7 +425,7 @@ const ROWS: Record<string, Row> = {
     retrySafe: 'yes',
     requiresReauth: false,
     message: '知乎工作器执行超时',
-    nextAction: '超时发生在发送前，可稍后重试',
+    nextAction: '请先到知乎核实是否已发出',
   },
   ZHIHU_WORKER_INCOMPLETE: {
     retrySafe: 'yes',
