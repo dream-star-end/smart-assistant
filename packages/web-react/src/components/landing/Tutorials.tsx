@@ -21,7 +21,7 @@ import { tutorialHref } from "../../hooks/useAppRoute";
  * 与动态演示职责分离 —— 演示是「看它干活」，这里是「你开口的第一句」。
  */
 const QUICKSTART: { n: string; title: string; desc: string }[] = [
-  { n: "1", title: "邮箱注册", desc: "一分钟拥有专属助手，免费额度即刻到账。" },
+  { n: "1", title: "邮箱注册", desc: "一分钟拥有专属助手，免费额度登录后到账。" },
   { n: "2", title: "像派活一样开口", desc: "不用学提示词，把需求像跟同事说话一样讲出来。" },
   { n: "3", title: "需要时再加装", desc: "更专业的活儿，从 AI 市场一键装上专家智能体。" },
 ];

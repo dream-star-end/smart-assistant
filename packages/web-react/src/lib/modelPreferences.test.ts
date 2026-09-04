@@ -58,6 +58,20 @@ describe("model preferences", () => {
     expect(effectiveEffortModelId("gpt-5.6-terra", false)).toBe("gpt-5.6-terra");
   });
 
+  test("无 default_model 时优先 deepseek-v4-flash（已选模型不动）", () => {
+    const models: PublicModel[] = [
+      { id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol" },
+      { id: "deepseek-v4-flash", display_name: "DeepSeek V4 Flash" },
+      { id: "glm-5.3-zai", display_name: "GLM-5.3" },
+    ];
+    expect(initialModelFromPreferences(models, {})).toBe("deepseek-v4-flash");
+    expect(initialModelFromPreferences(models, { default_model: "glm-5.3-zai" })).toBe("glm-5.3-zai");
+    const degraded = models.map((m) =>
+      m.id === "deepseek-v4-flash" ? { ...m, degraded: true } : m,
+    );
+    expect(initialModelFromPreferences(degraded, {})).toBe("gpt-5.6-sol");
+  });
+
   test("per-session 恢复解析:会话选择 > default_model > 首个健康模型", () => {
     // 会话自己的持久化选择优先(即使与 default_model 不同)
     expect(

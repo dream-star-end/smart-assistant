@@ -36,6 +36,7 @@ import {
 } from "../../lib/chat/render";
 import { lastKnownSubscriptionPaid, requestSubscribeIntent } from "../settings/SubscriptionDialog";
 import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
+import { reportClientFriction, reportClientFrictionOnce } from "../../lib/clientFriction";
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
@@ -84,6 +85,8 @@ export type CardCallbacks = {
   onTopUp?: () => void;
   /** 当前是否付费订阅。缺省按免费用户引导开通 Lite。 */
   subscriptionPaid?: boolean;
+  /** Optional access token for conversion-funnel telemetry (exhausted card/CTA). */
+  getToken?: () => string | null | undefined;
   /** context_too_long 类:在新会话中延续目标(导航非重发,同 onTopUp 不受末轮门控)。 */
   onStartNewSession?: () => void;
   onFeedback?: (ctx: FeedbackContext) => void;
@@ -586,6 +589,19 @@ export function AssistantCard({
     (sem.cta === "retry" || sem.cta === "retry_or_switch") &&
     !!cb.onRegenerate;
   const showTopUp = isInsufficient && !!cb.onTopUp;
+  useEffect(() => {
+    if (!isInsufficient) return;
+    reportClientFrictionOnce(
+      `chat:exhausted_card:${msg.id}`,
+      {
+        surface: "chat",
+        stage: "exhausted_card",
+        code: "EXHAUSTED_CARD",
+        outcome: "succeeded",
+      },
+      cb.getToken?.(),
+    );
+  }, [isInsufficient, msg.id, cb]);
   // cta==='new_session'(上下文超限类):导航非重发,同耗尽 CTA 不受末轮门控。
   const showNewSession =
     !!presentedError && !presentedError.waived && sem.cta === "new_session" && !!cb.onStartNewSession;
@@ -714,6 +730,15 @@ export function AssistantCard({
                       shape="pill"
                       onClick={() => {
                         requestSubscribeIntent(creditsCopy.intent);
+                        reportClientFriction(
+                          {
+                            surface: "chat",
+                            stage: "exhausted_cta",
+                            code: "EXHAUSTED_CTA",
+                            outcome: "succeeded",
+                          },
+                          cb.getToken?.(),
+                        );
                         cb.onTopUp?.();
                       }}
                     >

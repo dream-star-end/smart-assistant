@@ -6,9 +6,18 @@ import { ChatInteractionContext } from "../tool/context";
 import { resetSubscribeUiState } from "../settings/SubscriptionDialog";
 import { AssistantCard, type CardCallbacks, type RenderCtx, UserCard } from "./cards";
 
+const friction = vi.hoisted(() => ({
+  reportClientFriction: vi.fn(() => "eid"),
+  reportClientFrictionOnce: vi.fn(() => "eid"),
+  resetClientFrictionOnceForTests: vi.fn(),
+}));
+vi.mock("../../lib/clientFriction", () => friction);
+
 afterEach(() => {
   cleanup();
   resetSubscribeUiState();
+  friction.reportClientFriction.mockClear();
+  friction.reportClientFrictionOnce.mockClear();
 });
 
 function userMsg(over: Partial<ChatMessage> = {}): ChatMessage {
@@ -206,15 +215,62 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
-  test("insufficient_credits 付费用户 → 「购买加量包」", () => {
+  test("insufficient_credits 付费用户 → 「购买加量包」并触发 exhausted_cta", () => {
     const onTopUp = vi.fn();
+    const getToken = vi.fn(() => "tok");
     renderErr(errMsg({ _errorCode: "insufficient_credits", _clientMessageId: "u1" }), {
       onTopUp,
       subscriptionPaid: true,
+      getToken,
     });
     expect(screen.getByText("本期积分已用完,可购买加量包或升级套餐")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "购买加量包" }));
     expect(onTopUp).toHaveBeenCalledTimes(1);
+    expect(friction.reportClientFriction).toHaveBeenCalledWith(
+      {
+        surface: "chat",
+        stage: "exhausted_cta",
+        code: "EXHAUSTED_CTA",
+        outcome: "succeeded",
+      },
+      "tok",
+    );
+  });
+
+  test("insufficient_credits 曝光与点击各触发一次漏斗埋点", () => {
+    const onTopUp = vi.fn();
+    const getToken = vi.fn(() => "tok");
+    renderErr(errMsg({ id: "a-exhausted", _errorCode: "insufficient_credits", _clientMessageId: "u1" }), {
+      onTopUp,
+      subscriptionPaid: false,
+      getToken,
+      onRetrySend: vi.fn(),
+      onRegenerate: vi.fn(),
+      resolveRetryTarget: () => retryableUser,
+    });
+    expect(friction.reportClientFrictionOnce).toHaveBeenCalledTimes(1);
+    expect(friction.reportClientFrictionOnce).toHaveBeenCalledWith(
+      "chat:exhausted_card:a-exhausted",
+      {
+        surface: "chat",
+        stage: "exhausted_card",
+        code: "EXHAUSTED_CARD",
+        outcome: "succeeded",
+      },
+      "tok",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "开通 Lite" }));
+    expect(onTopUp).toHaveBeenCalledTimes(1);
+    expect(friction.reportClientFriction).toHaveBeenCalledTimes(1);
+    expect(friction.reportClientFriction).toHaveBeenCalledWith(
+      {
+        surface: "chat",
+        stage: "exhausted_cta",
+        code: "EXHAUSTED_CTA",
+        outcome: "succeeded",
+      },
+      "tok",
+    );
   });
 
   test("cta=new_session(context_too_long)→「新建会话继续」导航按钮,无重试类按钮", () => {

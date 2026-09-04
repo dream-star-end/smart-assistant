@@ -152,8 +152,8 @@ export const DEV_FALLBACK_SEED_DOC: PlatformSeedDoc = {
   agents: [
     {
       id: "main",
-      model: "glm-5.3-zai",
-      provider: "zai",
+      model: "deepseek-v4-flash",
+      provider: "opencodego",
       permissionMode: "bypassPermissions",
       displayName: "全能助手",
       avatarEmoji: "🧠",

@@ -1,5 +1,6 @@
 import { Copy, ExternalLink } from "lucide-react";
 import { useEffect, useState } from "react";
+import { reportClientFrictionOnce } from "../../lib/clientFriction";
 import { savePendingPayment, type PendingPayment } from "../../lib/pendingPayment";
 import { formatCentsYuan } from "../../lib/utils";
 import { Alert, Button, Spinner, buttonVariants } from "../ui";
@@ -74,6 +75,7 @@ export function HupijiaoPaymentEntry({
   amountCents,
   expiresAt,
   onReorder,
+  token,
 }: {
   qrcodeUrl: string;
   mobileUrl: string | null;
@@ -81,6 +83,7 @@ export function HupijiaoPaymentEntry({
   amountCents?: string;
   expiresAt?: string;
   onReorder?: () => void;
+  token?: string | null;
 }) {
   const client = paymentClientKind();
   const [now, setNow] = useState(() => Date.now());
@@ -136,6 +139,21 @@ export function HupijiaoPaymentEntry({
       重新下单
     </Button>
   );
+
+  useEffect(() => {
+    if (client !== "desktop" || !qrcodeUrl) return;
+    reportClientFrictionOnce(
+      `payment:qr_shown:${pendingPayment.orderNo}`,
+      {
+        surface: "payment",
+        stage: "qr_shown",
+        code: "QR_SHOWN",
+        outcome: "succeeded",
+        sessionId: pendingPayment.orderNo,
+      },
+      token,
+    );
+  }, [client, qrcodeUrl, pendingPayment.orderNo, token]);
 
   if (client === "wechat") {
     return (

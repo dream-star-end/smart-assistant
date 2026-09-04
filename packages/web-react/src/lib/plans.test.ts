@@ -2,10 +2,11 @@ import { describe, expect, test } from "vitest";
 import { PLANS, TOPUP_PACK } from "./plans";
 
 describe("套餐数据（落地页营销展示权威源）", () => {
-  test("4 档包月套餐价格 / 月度积分与产品定档一致", () => {
+  test("5 档包月套餐价格 / 月度积分与产品定档一致", () => {
     const byId = Object.fromEntries(PLANS.map((p) => [p.id, p]));
-    expect(PLANS).toHaveLength(4);
+    expect(PLANS).toHaveLength(5);
     expect(byId.free).toMatchObject({ price: 0, credits: 300 });
+    expect(byId.lite).toMatchObject({ price: 38, credits: 4000 });
     expect(byId.pro).toMatchObject({ price: 88, credits: 10000 });
     expect(byId.max).toMatchObject({ price: 298, credits: 35000 });
     expect(byId.ultra).toMatchObject({ price: 498, credits: 60000 });

@@ -57,6 +57,30 @@ function clipboardImages(data: DataTransfer): File[] {
   return Array.from(data.files).filter((file) => file.type.startsWith("image/"));
 }
 
+function EnvironmentPrepBar() {
+  const [pct, setPct] = useState(8);
+  useEffect(() => {
+    const started = Date.now();
+    const id = window.setInterval(() => {
+      const next = Math.min(100, 8 + ((Date.now() - started) / 20_000) * 92);
+      setPct(next);
+      if (next >= 100) window.clearInterval(id);
+    }, 200);
+    return () => window.clearInterval(id);
+  }, []);
+  return (
+    <div className="px-4 pt-3" data-testid="composer-env-prep" role="status" aria-live="polite">
+      <div className="mb-1.5 text-[12px] text-muted">环境准备中，约 20 秒</div>
+      <div className="h-1 overflow-hidden rounded-full bg-hover" aria-hidden>
+        <div
+          className="h-full rounded-full bg-accent transition-[width] duration-200"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
 export function Composer({
   onSend,
   busy,
@@ -74,6 +98,7 @@ export function Composer({
   onGoalAction,
   replyTo,
   onCancelReply,
+  environmentPreparing,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
@@ -103,6 +128,8 @@ export function Composer({
   replyTo?: MessageReplyQuote | null;
   /** 取消当前引用，不影响已输入正文和附件。 */
   onCancelReply?: () => void;
+  /** 容器冷启/未就绪：输入区展示「环境准备中，约 20 秒」进度条，避免静默等待。 */
+  environmentPreparing?: boolean;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -317,6 +344,7 @@ export function Composer({
           "focus-within:border-border-strong",
         )}
       >
+        {environmentPreparing && <EnvironmentPrepBar />}
         {replyTo && (
           <div className="mx-3.5 mt-3 flex items-start gap-2 rounded-xl bg-hover px-3 py-2 text-left">
             <div className="min-w-0 flex-1 border-l-2 border-accent/60 pl-2.5">

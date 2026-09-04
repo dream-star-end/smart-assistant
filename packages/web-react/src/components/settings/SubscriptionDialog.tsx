@@ -2,6 +2,7 @@ import { ArrowUpCircle, Check, Loader2, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import type { SubscribeIntent } from "../../lib/chat/pure";
+import { reportClientFrictionOnce } from "../../lib/clientFriction";
 import type { AuthSession, HupiCreateResult, MySubscription, SubscriptionPlanWire } from "../../lib/types";
 import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
 import { HupijiaoPaymentEntry } from "../payment/HupijiaoPaymentEntry";
@@ -94,6 +95,20 @@ export function SubscriptionDialog({
   useEffect(() => {
     openRef.current = open;
   }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    reportClientFrictionOnce(
+      `billing:pricing_exposure:${auth.snapshot().epoch}`,
+      {
+        surface: "billing",
+        stage: "pricing_exposure",
+        code: "PRICING_EXPOSURE",
+        outcome: "succeeded",
+      },
+      auth.snapshot().token,
+    );
+  }, [open, auth]);
   // 下单请求代际：close / backToPlans / 新 choose 都 +1，让旧请求的迟到回调失效。
   // 仅靠 openRef 挡不住「关闭→立刻重开」（重开后 openRef 又为 true，旧请求会误推进）。
   const genRef = useRef(0);
@@ -387,6 +402,7 @@ export function SubscriptionDialog({
               amountCents={stage.order.amountCents}
               expiresAt={stage.order.expiresAt}
               onReorder={backToPlans}
+              token={auth.snapshot().token}
             />
             <Button variant="ghost" size="sm" onClick={backToPlans} className="text-muted">
               <RefreshCw size={14} /> 返回套餐

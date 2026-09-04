@@ -403,8 +403,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(screen.queryByText(/追踪号/)).toBeNull()
   })
 
-  test('Landing「免费开始」进入登录表单（login，非注册）；新用户经登录页「立即注册」不受阻', async () => {
-    // Bug2：「免费开始」入口从 register 改为 login。登录页自带「立即注册」链接，新用户不受阻。
+  test('Landing「免费开始」进入注册表单（register）', async () => {
     fetchMock = vi.fn(async (url: string) =>
       String(url).includes('/api/auth/refresh')
         ? REFRESH_401
@@ -419,11 +418,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     const start = (await screen.findAllByRole('button', { name: /免费开始/ }))[0]
     fireEvent.click(start)
 
-    // 进登录表单：有「登录」提交按钮，无「创建账号」按钮（注册表单标志）。
-    await waitFor(() => expect(screen.getByRole('button', { name: /登录/ })).toBeInTheDocument())
-    expect(screen.queryByRole('button', { name: /创建账号/ })).toBeNull()
-    // 登录页仍提供「立即注册」入口，新用户不受阻。
-    expect(screen.getByRole('button', { name: '立即注册' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: /创建账号/ })).toBeInTheDocument())
   })
 
   test('authenticated send goes through the real WS engine — optimistic user bubble, no SSE/v4 chat', async () => {

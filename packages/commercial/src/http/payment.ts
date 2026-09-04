@@ -49,6 +49,7 @@ import { verifyHupijiao } from "../payment/hupijiao/sign.js";
 import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.js";
 import { HupijiaoError } from "../payment/hupijiao/client.js";
 import { recordQrIssueFailure } from "../payment/qrIssueFailure.js";
+import { recordProductFrictionEvent } from "../productFriction/events.js";
 import { safeEnqueueAlert } from "../admin/alertOutbox.js";
 import { EVENTS } from "../admin/alertEvents.js";
 
@@ -211,6 +212,14 @@ export async function handleCreateHupi(
     throw err;
   }
   const { order, plan } = created;
+  await recordProductFrictionEvent({
+    correlation: order.order_no,
+    userId: order.user_id,
+    surface: "payment",
+    stage: "checkout",
+    code: paymentCheckoutCode(order),
+    outcome: "succeeded",
+  }).catch(() => {});
 
   // 调虎皮椒拿 qrcode_url。若二维码未能交付，立即把本地 pending 单终态化为
   // canceled；否则会被 15min expirer 误算成“用户看了二维码但放弃支付”。
@@ -412,6 +421,15 @@ export async function handleHupiCallback(
       // eslint-disable-next-line no-console
       console.info(`[commercial/payment] duplicate callback for paid order ${orderNo}, replied success`);
     } else {
+      await recordProductFrictionEvent({
+        correlation: r.order.order_no,
+        userId: r.order.user_id,
+        surface: "payment",
+        stage: "paid",
+        code: paymentCheckoutCode(r.order),
+        outcome: "succeeded",
+        latencyMs: paymentPaidLatencyMs(r.order),
+      }).catch(() => {});
       // 告警:本次刚推到 paid,判定首充 / 大额 —— fire-and-forget,失败不影响 callback 回包
       void emitPaymentPaidAlerts(r.order);
     }
@@ -495,6 +513,17 @@ export async function handleGetOrder(
  * 匹配 `/api/payment/orders/<segment>`;多余 path 拒绝。
  */
 const ORDER_NO_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+export function paymentCheckoutCode(order: Pick<OrderRow, "kind" | "plan_code">): string {
+  // product_friction_events.code CHECK is [A-Za-z0-9_]; ticket writes kind:plan_code.
+  const raw = `${order.kind}_${order.plan_code ?? "none"}`;
+  return raw.replace(/[^A-Za-z0-9_]/g, "_").slice(0, 64);
+}
+
+export function paymentPaidLatencyMs(order: Pick<OrderRow, "created_at" | "paid_at">): number | null {
+  if (!order.paid_at) return null;
+  return Math.max(0, order.paid_at.getTime() - order.created_at.getTime());
+}
+
 export function extractOrderNoFromUrl(rawUrl: string): string | null {
   let pathname: string;
   try {

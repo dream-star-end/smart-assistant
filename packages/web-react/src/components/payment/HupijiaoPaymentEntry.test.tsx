@@ -9,6 +9,13 @@ import {
   remainingPaymentMs,
 } from "./HupijiaoPaymentEntry";
 
+const friction = vi.hoisted(() => ({
+  reportClientFrictionOnce: vi.fn(() => "eid"),
+  reportClientFriction: vi.fn(() => "eid"),
+  resetClientFrictionOnceForTests: vi.fn(),
+}));
+vi.mock("../../lib/clientFriction", () => friction);
+
 function setNavigator({
   userAgent,
   mobile,
@@ -31,6 +38,7 @@ function setNavigator({
 afterEach(() => {
   cleanup();
   sessionStorage.clear();
+  friction.reportClientFrictionOnce.mockClear();
   setNavigator({ userAgent: "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0" });
   vi.unstubAllGlobals();
 });
@@ -90,6 +98,18 @@ describe("HupijiaoPaymentEntry 当前微信支付能力", () => {
     expect(screen.queryByTestId("mobile-payment-link")).not.toBeInTheDocument();
     expect(screen.getByTestId("payment-order-amount")).toHaveTextContent("¥38.00");
     expect(screen.getByTestId("payment-countdown")).toHaveTextContent("过期后请重新下单");
+    expect(friction.reportClientFrictionOnce).toHaveBeenCalledTimes(1);
+    expect(friction.reportClientFrictionOnce).toHaveBeenCalledWith(
+      "payment:qr_shown:order-1",
+      {
+        surface: "payment",
+        stage: "qr_shown",
+        code: "QR_SHOWN",
+        outcome: "succeeded",
+        sessionId: "order-1",
+      },
+      undefined,
+    );
   });
 
   test("普通手机只挂载安全的手机支付链接，不请求二维码", () => {
@@ -140,6 +160,7 @@ describe("HupijiaoPaymentEntry 当前微信支付能力", () => {
       order_no: "order-1",
       label: "订阅专业版",
     });
+    expect(friction.reportClientFrictionOnce).not.toHaveBeenCalled();
   });
 
   test("倒计时到 0 后按钮变为重新下单", () => {
