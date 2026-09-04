@@ -500,6 +500,8 @@ describe('official Zhihu Plugin', () => {
     assert.match(ZHIHU_WORKER_SOURCE, /login\.probe/)
     assert.match(ZHIHU_WORKER_SOURCE, /people-page-token-mismatch/)
     assert.match(ZHIHU_WORKER_SOURCE, /profile-projection-null/)
+    assert.match(ZHIHU_WORKER_SOURCE, /people-blocked/)
+    assert.match(ZHIHU_WORKER_SOURCE, /login\.edit_redirect/)
     assert.match(ZHIHU_WORKER_SOURCE, /step: 'login\.qr_refresh'/)
     assert.match(ZHIHU_WORKER_SOURCE, /login\.loop_error/)
     assert.match(ZHIHU_WORKER_SOURCE, /https:\/\/www\.zhihu\.com\/people\/edit/)
