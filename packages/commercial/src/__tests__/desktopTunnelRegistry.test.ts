@@ -64,4 +64,23 @@ describe("DesktopTunnelRegistry", () => {
     assert.equal(reg.drop(9), false);
     assert.equal(reg.get(9), undefined);
   });
+
+  test("drop(g) rejects later attach with generation <= g", () => {
+    const reg = createMemoryDesktopTunnelRegistry();
+    let closedCode: number | undefined;
+    reg.drop(4, "token_rotated", 3);
+    assert.throws(
+      () => {
+        reg.attach(4, { close: (code) => { closedCode = code; } }, {
+          deviceId: "d4", uid: 1, expiresAt: new Date(Date.now() + 60_000), generation: 3,
+        });
+      },
+      /generation 3 <= fence 3/,
+    );
+    assert.equal(closedCode, 1008);
+    reg.attach(4, { close: () => {} }, {
+      deviceId: "d4", uid: 1, expiresAt: new Date(Date.now() + 60_000), generation: 4,
+    });
+    assert.equal(reg.size(), 1);
+  });
 });

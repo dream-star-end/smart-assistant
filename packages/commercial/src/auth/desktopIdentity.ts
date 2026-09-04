@@ -69,6 +69,7 @@ export interface DesktopContainerRow {
   user_id: number;
   secret_hash: Buffer | null;
   session_secret_expires_at: Date | null;
+  session_secret_generation: number;
   issued_by_host_uuid: string | null;
   update_required: boolean;
   runtime_kind: string;

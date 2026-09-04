@@ -12,14 +12,17 @@ import {
   verifyDesktopIdentity,
   type DesktopIdentityRepo,
 } from "../auth/desktopIdentity.js";
+import { compareHash, hashSecret, parseContainerToken } from "../auth/containerIdentity.js";
+import {
+  getDesktopTunnelRegistry,
+  markDesktopTunnelHeartbeat,
+  DesktopTunnelGenerationError,
+} from "./desktopTunnelRegistry.js";
 import { extractDesktopTlsContext, type PeerCertReader } from "../desktop/tlsContext.js";
 import { getDesktopFlagSnapshot } from "../desktop/flags.js";
 import { createPgDesktopIdentityRepo } from "../http/desktopEnroll.js";
 import { DesktopMuxSession, MUX_VERSION, type MuxTransport } from "./desktopMux.js";
-import {
-  getDesktopTunnelRegistry,
-  markDesktopTunnelHeartbeat,
-} from "./desktopTunnelRegistry.js";
+
 import { markV3ContainerActivity, type V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
 import { rootLogger } from "../logging/logger.js";
 
@@ -98,6 +101,14 @@ export function handleDesktopRegisterUpgrade(
       socket.destroy();
       return;
     }
+    const { secret: upgradeSecret } = parseContainerToken(req.headers.authorization);
+    const genAtUpgrade = await query<{ session_secret_generation: number }>(
+      `SELECT COALESCE(session_secret_generation, 0)::int AS session_secret_generation
+         FROM agent_containers
+        WHERE id = $1 AND runtime_kind = 'desktop' AND state = 'active'`,
+      [ident.containerId],
+    );
+    const upgradeGeneration = Number(genAtUpgrade.rows[0]?.session_secret_generation ?? 0);
     wss.handleUpgrade(req, socket, head, (ws) => {
       const timer = setTimeout(() => {
         try { ws.close(1008, "register_timeout"); } catch { /* */ }
@@ -137,18 +148,35 @@ export function handleDesktopRegisterUpgrade(
             ws.close(1008, "update_required");
             return;
           }
-          const expires = await query<{ session_secret_expires_at: Date | null }>(
-            `SELECT session_secret_expires_at FROM agent_containers
+          const expires = await query<{
+            session_secret_expires_at: Date | null;
+            session_secret_generation: number;
+            secret_hash: Buffer | null;
+          }>(
+            `SELECT session_secret_expires_at,
+                    COALESCE(session_secret_generation, 0)::int AS session_secret_generation,
+                    secret_hash
+               FROM agent_containers
               WHERE id = $1 AND runtime_kind = 'desktop' AND state = 'active'`,
             [ident.containerId],
           );
-          const exp = expires.rows[0]?.session_secret_expires_at ?? new Date(Date.now() + 3_600_000);
+          const live = expires.rows[0];
+          if (!live || live.session_secret_generation !== upgradeGeneration) {
+            ws.close(1008, "stale_generation");
+            return;
+          }
+          if (!live.secret_hash || !compareHash(hashSecret(upgradeSecret), live.secret_hash)) {
+            ws.close(1008, "stale_generation");
+            return;
+          }
+          const exp = live.session_secret_expires_at ?? new Date(Date.now() + 3_600_000);
           const mux = new DesktopMuxSession(wsToMux(ws), {
             onHeartbeat: async () => {
               const flagsNow = await getDesktopFlagSnapshot();
               if (flagsNow.killSwitch) return false;
-              const row = await query<{ session_secret_expires_at: Date | null; revoked: string }>(
+              const row = await query<{ session_secret_expires_at: Date | null; revoked: string; session_secret_generation: number }>(
                 `SELECT c.session_secret_expires_at,
+                        COALESCE(c.session_secret_generation, 0)::int AS session_secret_generation,
                         CASE WHEN d.revoked_at IS NULL THEN '0' ELSE '1' END AS revoked
                    FROM agent_containers c
                    JOIN desktop_devices d ON d.container_id = c.id
@@ -158,6 +186,7 @@ export function handleDesktopRegisterUpgrade(
               );
               const r = row.rows[0];
               if (!r || r.revoked === "1") return false;
+              if (r.session_secret_generation !== upgradeGeneration) return false;
               if (r.session_secret_expires_at && r.session_secret_expires_at.getTime() <= Date.now()) return false;
               markDesktopTunnelHeartbeat(ident.containerId);
               if (deps.v3Deps) void markV3ContainerActivity(deps.v3Deps, ident.containerId);
@@ -171,16 +200,25 @@ export function handleDesktopRegisterUpgrade(
               void auditTunnel("tunnel_down", ident.userId, null, ident.containerId);
             },
           });
-          getDesktopTunnelRegistry().attach(ident.containerId, {
-            mux,
-            close: (code, reason) => {
-              try { ws.close(code ?? 4001, reason); } catch { /* */ }
-            },
-          }, {
-            deviceId: extractDeviceId(tls.deviceSpiffe),
-            uid: ident.userId,
-            expiresAt: exp,
-          });
+          try {
+            getDesktopTunnelRegistry().attach(ident.containerId, {
+              mux,
+              close: (code, reason) => {
+                try { ws.close(code ?? 4001, reason); } catch { /* */ }
+              },
+            }, {
+              deviceId: extractDeviceId(tls.deviceSpiffe),
+              uid: ident.userId,
+              expiresAt: exp,
+              generation: upgradeGeneration,
+            });
+          } catch (err) {
+            if (err instanceof DesktopTunnelGenerationError) {
+              ws.close(1008, "stale_generation");
+              return;
+            }
+            throw err;
+          }
           await auditTunnel("tunnel_up", ident.userId, extractDeviceId(tls.deviceSpiffe), ident.containerId);
           if (deps.v3Deps) void markV3ContainerActivity(deps.v3Deps, ident.containerId);
           ws.send(JSON.stringify({

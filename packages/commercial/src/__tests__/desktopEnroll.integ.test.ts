@@ -124,9 +124,9 @@ describe("desktop enrollment integ", () => {
     const drops: number[] = [];
     const registry = createMemoryDesktopTunnelRegistry();
     const origDrop = registry.drop.bind(registry);
-    registry.drop = (id, reason) => {
+    registry.drop = (id, reason, fenceGeneration) => {
       drops.push(id);
-      return origDrop(id, reason);
+      return origDrop(id, reason, fenceGeneration);
     };
     const verifier = generatePkceVerifier();
     const challenge = await pkceChallengeS256(verifier);
@@ -446,6 +446,72 @@ describe("desktop enrollment integ", () => {
         ),
       (e: unknown) => e instanceof HttpError && (e as HttpError).status === 409 && (e as HttpError).code === "ENROLL_EXPIRED",
     );
+    await rm(caDir, { recursive: true, force: true });
+    setDesktopSettingsLoader(null);
+    resetDesktopFlagCache();
+  });
+
+  test("concurrent refresh CAS: one succeeds, one 409; audit event is token_refresh", async (t) => {
+    if (db.skipIfUnavailable(t)) return;
+    const caDir = await mkdtemp(path.join(os.tmpdir(), "oc-dca-"));
+    process.env.OPENCLAUDE_DEVICE_CA_DIR = caDir;
+    process.env.OC_DESKTOP_VIRTUAL_CONTAINER = "1";
+    process.env.OC_DESKTOP_SIM_ENROLL = "1";
+    const u = await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, role, status)
+       VALUES ($1,'x','admin','active') RETURNING id::text`,
+      [`desk-refresh-cas-${Date.now()}@t.local`],
+    );
+    const uid = Number(u.rows[0]!.id);
+    resetDesktopFlagCache();
+    setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [uid] }));
+    const verifier = generatePkceVerifier();
+    const challenge = await pkceChallengeS256(verifier);
+    const deps: CommercialHttpDeps = {
+      jwtSecret: JWT,
+      mailer: { send: async () => {} },
+      redis: memRedis(),
+    } as CommercialHttpDeps;
+    const startOut = response();
+    await handleDesktopEnrollStart(
+      request({ pkce_challenge: challenge, app_id: "chat.claudeai.clarvy", platform: "sim" }),
+      startOut.res, ctx(), deps,
+    );
+    const enrollmentId = String(startOut.body().enrollment_id);
+    const tok = await bearer(uid);
+    const confirmOut = response();
+    await handleDesktopEnrollConfirm(
+      request({ enrollment_id: enrollmentId }, { authorization: `Bearer ${tok}` }),
+      confirmOut.res, ctx(), deps,
+    );
+    const finishOut = response();
+    await handleDesktopEnrollFinish(
+      request({ enrollment_id: enrollmentId, code: String(confirmOut.body().code), pkce_verifier: verifier }),
+      finishOut.res, ctx(), deps,
+    );
+    const deviceCred = String(finishOut.body().device_credential);
+    const deviceCert = String(finishOut.body().device_cert);
+    const deviceId = String(finishOut.body().deviceId);
+    deps.desktopPeerCert = () => ({
+      raw: derFromPem(deviceCert),
+      subjectaltname: `URI:spiffe://openclaude/desktop-device/${deviceId}`,
+    });
+    const mint = response();
+    await handleDesktopTokenMint(request({ device_credential: deviceCred }), mint.res, ctx(), deps);
+    const token = String(mint.body().token);
+    const settled = await Promise.allSettled([
+      handleDesktopTokenRefresh(request({ device_credential: deviceCred, token }), response().res, ctx(), deps),
+      handleDesktopTokenRefresh(request({ device_credential: deviceCred, token }), response().res, ctx(), deps),
+    ]);
+    const ok = settled.filter((s) => s.status === "fulfilled").length;
+    const conflict = settled.filter((s) => s.status === "rejected" && s.reason instanceof HttpError && s.reason.status === 409).length;
+    assert.equal(ok, 1);
+    assert.equal(conflict, 1);
+    const audit = await query<{ event: string }>(
+      `SELECT event FROM desktop_device_audit WHERE user_id = $1 AND event IN ('token_mint','token_refresh') ORDER BY id`,
+      [String(uid)],
+    );
+    assert.ok(audit.rows.some((r) => r.event === "token_refresh"));
     await rm(caDir, { recursive: true, force: true });
     setDesktopSettingsLoader(null);
     resetDesktopFlagCache();

@@ -10,6 +10,18 @@ export interface DesktopTunnelMeta {
   deviceId: string;
   uid: number;
   expiresAt: Date;
+  /** Token generation at attach time. drop(g) rejects later attach with generation ≤ g. */
+  generation?: number;
+}
+
+export class DesktopTunnelGenerationError extends Error {
+  constructor(
+    readonly generation: number,
+    readonly fence: number,
+  ) {
+    super(`desktop tunnel generation ${generation} <= fence ${fence}`);
+    this.name = "DesktopTunnelGenerationError";
+  }
 }
 
 export interface DesktopTunnelHandle {
@@ -26,7 +38,7 @@ export interface DesktopTunnelSlot extends DesktopTunnelMeta {
 export interface DesktopTunnelRegistry {
   attach(containerId: number, handle: DesktopTunnelHandle | null, meta: DesktopTunnelMeta): void;
   get(containerId: number): DesktopTunnelSlot | undefined;
-  drop(containerId: number, reason?: string): boolean;
+  drop(containerId: number, reason?: string, fenceGeneration?: number): boolean;
   dropAll(reason?: string): number;
   markHeartbeat(containerId: number): void;
   size(): number;
@@ -45,9 +57,18 @@ class MemoryDesktopTunnelRegistry implements DesktopTunnelRegistry {
   private readonly slots = new Map<number, DesktopTunnelSlot & {
     handle: DesktopTunnelHandle | null;
     timer: ReturnType<typeof setTimeout> | null;
+    generation: number;
   }>();
+  /** drop(g) fence: any later attach with generation ≤ fence is rejected. */
+  private readonly fence = new Map<number, number>();
 
   attach(containerId: number, handle: DesktopTunnelHandle | null, meta: DesktopTunnelMeta): void {
+    const generation = meta.generation ?? 0;
+    const fence = this.fence.get(containerId) ?? -1;
+    if (generation <= fence) {
+      try { handle?.close?.(1008, "stale_generation"); } catch { /* */ }
+      throw new DesktopTunnelGenerationError(generation, fence);
+    }
     this.drop(containerId, "replaced");
     const ms = Math.max(0, meta.expiresAt.getTime() - Date.now());
     const timer = setTimeout(() => {
@@ -63,6 +84,7 @@ class MemoryDesktopTunnelRegistry implements DesktopTunnelRegistry {
       lastHeartbeatAt: new Date(),
       handle,
       timer,
+      generation,
     });
   }
 
@@ -73,11 +95,15 @@ class MemoryDesktopTunnelRegistry implements DesktopTunnelRegistry {
       this.drop(containerId, "heartbeat_stale");
       return undefined;
     }
-    const { handle: _h, timer: _t, ...slot } = s;
+    const { handle: _h, timer: _t, generation: _g, ...slot } = s;
     return slot;
   }
 
-  drop(containerId: number, reason?: string): boolean {
+  drop(containerId: number, reason?: string, fenceGeneration?: number): boolean {
+    if (fenceGeneration !== undefined) {
+      const prev = this.fence.get(containerId) ?? -1;
+      this.fence.set(containerId, Math.max(prev, fenceGeneration));
+    }
     const s = this.slots.get(containerId);
     if (!s) return false;
     this.slots.delete(containerId);

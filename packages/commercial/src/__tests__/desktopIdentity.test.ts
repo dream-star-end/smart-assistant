@@ -24,6 +24,7 @@ function repo(overrides: Partial<{
     user_id: 7,
     secret_hash: hashSecret(secret),
     session_secret_expires_at: new Date(Date.now() + 60_000),
+    session_secret_generation: 0,
     issued_by_host_uuid: null,
     update_required: false,
     runtime_kind: "desktop",
@@ -81,6 +82,7 @@ describe("verifyDesktopIdentity", () => {
       row: {
         id: 42, user_id: 7, secret_hash: hashSecret(secret),
         session_secret_expires_at: new Date(Date.now() - 1000),
+        session_secret_generation: 0,
         issued_by_host_uuid: null, update_required: false, runtime_kind: "desktop", state: "active",
       },
     });

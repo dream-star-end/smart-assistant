@@ -138,7 +138,8 @@
     "0254_desktop_virtual_container",
     "0255_desktop_kind_unique_index",
     "0256_drop_user_channel_active",
-    "0257_turn_dispatches_agent_container"
+    "0257_turn_dispatches_agent_container",
+    "0259_desktop_session_secret_generation"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

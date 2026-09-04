@@ -4,9 +4,10 @@
 
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { rootLogger } from "../logging/logger.js";
 import type { Pool, PoolClient } from "pg";
 import { pkceChallengeS256 } from "../connectors/pkce.js";
-import { compareHash, hashSecret } from "../auth/containerIdentity.js";
+import { compareHash, hashSecret, parseContainerToken } from "../auth/containerIdentity.js";
 import { verifyDesktopIdentity, type DesktopIdentityRepo, type DesktopIdentityTlsCtx } from "../auth/desktopIdentity.js";
 import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
 import { query, tx } from "../db/queries.js";
@@ -42,6 +43,17 @@ export const DESKTOP_RATE_LIMITS = {
   tokenUid: { scope: "desktop_token_uid", windowSeconds: 600, max: 20 } satisfies RateLimitConfig,
   tokenDevice: { scope: "desktop_token_device", windowSeconds: 600, max: 10 } satisfies RateLimitConfig,
 };
+
+export function desktopTokenRequestContext(req: IncomingMessage): RequestContext {
+  const ip = (req.socket?.remoteAddress ?? "0.0.0.0").replace(/^::ffff:/, "");
+  return {
+    requestId: randomUUID(),
+    clientIp: ip,
+    authBoundIp: ip,
+    userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : null,
+    log: rootLogger.child({ subsys: "desktop-token" }),
+  };
+}
 
 export function parseDeviceCredential(raw: string | undefined): { deviceId: string; secret: string } {
   if (typeof raw !== "string" || raw.length === 0) {
@@ -101,12 +113,14 @@ export function createPgDesktopIdentityRepo(): DesktopIdentityRepo {
         user_id: string;
         secret_hash: Buffer | null;
         session_secret_expires_at: Date | null;
+        session_secret_generation: number;
         issued_by_host_uuid: string | null;
         update_required: boolean;
         runtime_kind: string;
         state: string;
       }>(
         `SELECT id::text AS id, user_id::text AS user_id, secret_hash, session_secret_expires_at,
+                COALESCE(session_secret_generation, 0)::int AS session_secret_generation,
                 issued_by_host_uuid::text AS issued_by_host_uuid, update_required, runtime_kind, state
            FROM agent_containers
           WHERE id = $1 AND state = 'active' AND runtime_kind = 'desktop' AND runtime_channel = $2
@@ -120,6 +134,7 @@ export function createPgDesktopIdentityRepo(): DesktopIdentityRepo {
         user_id: Number(row.user_id),
         secret_hash: row.secret_hash,
         session_secret_expires_at: row.session_secret_expires_at,
+        session_secret_generation: Number(row.session_secret_generation ?? 0),
         issued_by_host_uuid: row.issued_by_host_uuid,
         update_required: row.update_required,
         runtime_kind: row.runtime_kind,
@@ -492,7 +507,7 @@ export async function handleDesktopTokenMint(
     });
     throw new HttpError(401, "UNAUTHORIZED", "device mTLS required");
   }
-  const token = await rotateContainerSecret(device.containerId, device.userId, device.deviceId, ctx, deps);
+  const token = await rotateContainerSecret(device.containerId, device.userId, device.deviceId, ctx, deps, "token_mint");
   sendJson(res, 200, token);
 }
 
@@ -510,12 +525,17 @@ export async function handleDesktopTokenRefresh(
   const cred = typeof body.device_credential === "string" ? body.device_credential : "";
   const ocV3 = typeof body.token === "string" ? body.token : (req.headers.authorization ?? "");
   const device = await loadLiveDeviceByCredential(cred);
+  await enforceRateLimit(deps, DESKTOP_RATE_LIMITS.tokenUid, `u:${device.userId}`);
+  await enforceRateLimit(deps, DESKTOP_RATE_LIMITS.tokenDevice, `d:${device.deviceId}`);
   requireTls(req, deps, device.tlsClientFp);
-  const repo = await createPgDesktopIdentityRepo();
+  const repo = createPgDesktopIdentityRepo();
   await verifyDesktopIdentity(repo, { tls: true, deviceCertFp: device.tlsClientFp, deviceSpiffe: `spiffe://openclaude/desktop-device/${device.deviceId}` }, ocV3);
-  const token = await rotateContainerSecret(device.containerId, device.userId, device.deviceId, ctx, deps);
+  const presented = hashSecret(parseContainerToken(ocV3).secret);
+  const token = await rotateContainerSecret(device.containerId, device.userId, device.deviceId, ctx, deps, "token_refresh", presented);
   sendJson(res, 200, token);
 }
+
+export type DesktopTokenRotateKind = "token_mint" | "token_refresh";
 
 async function rotateContainerSecret(
   containerId: number,
@@ -523,20 +543,52 @@ async function rotateContainerSecret(
   deviceId: string,
   ctx: RequestContext,
   deps: CommercialHttpDeps,
-): Promise<{ token: string; expires_in: number; container_id: number }> {
+  kind: DesktopTokenRotateKind = "token_mint",
+  expectedSecretHash?: Buffer,
+): Promise<{ token: string; expires_in: number; container_id: number; generation: number }> {
   const secret = randomSecretHex();
   const expires = new Date(Date.now() + DESKTOP_TOKEN_TTL_SEC * 1000);
+  let fenceGeneration = 0;
+  let newGeneration = 1;
   await tx(async (client) => {
-    const upd = await client.query(
-      `UPDATE agent_containers
-          SET secret_hash = $2, session_secret_expires_at = $3, updated_at = NOW()
-        WHERE id = $1 AND runtime_kind = 'desktop' AND state = 'active'`,
-      [containerId, hashSecret(secret), expires],
+    const locked = await client.query<{
+      secret_hash: Buffer | null;
+      session_secret_generation: number | null;
+    }>(
+      `SELECT secret_hash, COALESCE(session_secret_generation, 0)::int AS session_secret_generation
+         FROM agent_containers
+        WHERE id = $1 AND runtime_kind = 'desktop' AND state = 'active'
+        FOR UPDATE`,
+      [containerId],
     );
-    if ((upd.rowCount ?? 0) === 0) throw new HttpError(401, "UNAUTHORIZED", "invalid device credential");
+    const row = locked.rows[0];
+    if (!row) throw new HttpError(401, "UNAUTHORIZED", "invalid device credential");
+    if (expectedSecretHash && (!row.secret_hash || !compareHash(expectedSecretHash, row.secret_hash))) {
+      throw new HttpError(409, "TOKEN_ROTATED", "token already rotated");
+    }
+    const oldGen = Number(row.session_secret_generation ?? 0);
+    const upd = await client.query<{ session_secret_generation: number }>(
+      `UPDATE agent_containers
+          SET secret_hash = $2,
+              session_secret_expires_at = $3,
+              session_secret_generation = $4,
+              updated_at = NOW()
+        WHERE id = $1
+          AND runtime_kind = 'desktop'
+          AND state = 'active'
+          AND COALESCE(session_secret_generation, 0) = $5
+          AND ($6::bytea IS NULL OR secret_hash = $6)
+        RETURNING session_secret_generation`,
+      [containerId, hashSecret(secret), expires, oldGen + 1, oldGen, expectedSecretHash ?? null],
+    );
+    if ((upd.rowCount ?? 0) === 0) {
+      throw new HttpError(409, "TOKEN_ROTATED", "token already rotated");
+    }
+    fenceGeneration = oldGen;
+    newGeneration = Number(upd.rows[0]?.session_secret_generation ?? oldGen + 1);
     await client.query(`UPDATE desktop_devices SET last_token_at = NOW(), updated_at = NOW() WHERE id = $1`, [deviceId]);
     await audit(client, {
-      event: "token_mint",
+      event: kind,
       userId,
       deviceId,
       containerId,
@@ -546,8 +598,13 @@ async function rotateContainerSecret(
   });
   const registry: DesktopTunnelRegistry = (deps as CommercialHttpDeps & { desktopTunnelRegistry?: DesktopTunnelRegistry }).desktopTunnelRegistry
     ?? getDesktopTunnelRegistry();
-  registry.drop(containerId, "token_rotated");
-  return { token: `oc-v3.${containerId}.${secret}`, expires_in: DESKTOP_TOKEN_TTL_SEC, container_id: containerId };
+  registry.drop(containerId, "token_rotated", fenceGeneration);
+  return {
+    token: `oc-v3.${containerId}.${secret}`,
+    expires_in: DESKTOP_TOKEN_TTL_SEC,
+    container_id: containerId,
+    generation: newGeneration,
+  };
 }
 
 export async function handleDesktopRevoke(
