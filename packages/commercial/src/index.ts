@@ -184,6 +184,7 @@ import {
   startResearchJobScheduler,
   type ResearchJobSchedulerHandle,
 } from "./research/scheduler.js";
+import { makeResearchFetchJobHandlers } from "./research/fetchJobs.js";
 import {
   startCronWakeScheduler,
   findDueCronWakeUsers,
@@ -6061,8 +6062,8 @@ export async function registerCommercial(
   // channel 的行。若仍 gate 在 controlPlaneEnabled,v5 创建的 job(runtime_channel='v5')
   // 会永远无人认领(v5 不跑、v3 只认领 v3 行)—— 与 channel 纪律自相矛盾。
   // 关闭:COMMERCIAL_RESEARCH_JOBS_DISABLED=1.默认 5s tick.
-  // handler map:Phase 0 暂空(无 proxy 创建 job);Phase 1/2 逐步注入 ingest/index/
-  // cite_check/lit_search/render 真实 handler(DI seam,见 research/scheduler.ts).
+  // handler map:R5 Phase A 起接 research_task(mode=fetch 批量全文下载,见
+  // research/fetchJobs.ts);其余 kind 仍留 DI seam 待后续期注入.
   let researchJobScheduler: ResearchJobSchedulerHandle | undefined;
   if (
     (controlPlaneEnabled || runtimeChannel === "v5") &&
@@ -6071,7 +6072,9 @@ export async function registerCommercial(
     const raw = Number(process.env.COMMERCIAL_RESEARCH_JOBS_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 2000 ? raw : 5_000;
     researchJobScheduler = trackScheduler("researchJobs", "v5-owned", startResearchJobScheduler({
-      handlers: {},
+      // R5 Phase A:research_task(mode=fetch)批量全文下载 —— dormant scheduler 的
+      // 第一个真实 handler(逐条容错 + pdf_ingested 相位 checkpoint 续跑)。
+      handlers: makeResearchFetchJobHandlers(),
       intervalMs,
     }));
   }

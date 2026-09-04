@@ -141,7 +141,8 @@
     "0257_cursor_session_credential",
     "0258_cursor_opus_fable_context_1m",
     "0259_cursor_gemini_38_flash",
-    "0260_research_workspace"
+    "0260_research_workspace",
+    "0261_research_fetch_attempts"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

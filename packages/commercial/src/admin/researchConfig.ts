@@ -99,6 +99,21 @@ export const ResearchConfigJson = Type.Object(
       },
       { additionalProperties: false },
     ),
+    // 全文下载子系统(R5 Phase A;fetchFulltext 链)。默认关:关时 fetch 路由 404、
+    // 行为与未上线前字节一致;unpaywallEmail 缺省回落 litSources.unpaywallEmail(调用方)。
+    // Optional:旧 admin payload 不带 fetch 也过验(读路径由 coerce 补默认)。
+    fetch: Type.Optional(
+      Type.Object(
+        {
+          enabled: Type.Optional(Type.Boolean()),
+          /** Unpaywall API polite email(必须真实邮箱;example.com 类会被 422 拒)。 */
+          unpaywallEmail: Type.Optional(Type.String()),
+          /** 显式机构 proxy URL(EZproxy/forward proxy);仅 fetchFulltext 链内生效。 */
+          proxyUrl: Type.Optional(Type.String()),
+        },
+        { additionalProperties: false },
+      ),
+    ),
   },
   { additionalProperties: false },
 );
@@ -112,6 +127,7 @@ export const DEFAULT_RESEARCH_CONFIG: ResearchConfigJson = {
   cite: { retraction: "crossref", strictDomains: ["bio", "clinical", "policy"] },
   minicheck: { backend: "off" },
   limits: {},
+  fetch: { enabled: false },
 };
 
 // ─── secrets ─────────────────────────────────────────────────────────
@@ -171,6 +187,7 @@ function mergeWithDefault(raw: Record<string, unknown>): ResearchConfigJson {
     cite: sub("cite"),
     minicheck: sub("minicheck"),
     limits: sub("limits"),
+    fetch: sub("fetch"),
   } as ResearchConfigJson;
 }
 

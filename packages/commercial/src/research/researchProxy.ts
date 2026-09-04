@@ -34,12 +34,26 @@ import {
 } from "../admin/researchConfig.js";
 import { getLiteratureConfig } from "../admin/literatureConfig.js";
 import {
+  type FetchAttemptRowInput,
+  createJob,
   getBlob as storeGetBlob,
   getDocument as storeGetDocument,
+  getJob,
+  listCheckpoints,
   putBlob as storePutBlob,
   putDocument as storePutDocument,
+  recordFetchAttempt,
+  requeueInterruptedJob,
 } from "./store.js";
-import { ingestBlob, litragQuery, runCheck, runCiteFix } from "./researchHandlers.js";
+import {
+  type FetchRecordOutcome,
+  fetchRecordIntoLibrary,
+  ingestBlob,
+  litragQuery,
+  runCheck,
+  runCiteFix,
+} from "./researchHandlers.js";
+import type { FetchRecordInput, FetchFulltextConfig } from "./fetchFulltext.js";
 import { type SemanticQueryDeps, queryDocuments } from "./litrag.js";
 import {
   getSkillEmbeddingProvider,
@@ -72,6 +86,8 @@ const MAX_BLOB_BYTES = 25 * 1024 * 1024; // 25 MiB ingest 输入上限
 export const RESEARCH_PREFIX = "/v3/research/";
 
 const MAX_BODY_BYTES = 16 * 1024;
+/** fetch-batch 单独放宽(≤200 条紧凑记录;其余路由维持 16KB,R5 设计 §4.1)。 */
+const MAX_FETCH_BATCH_BYTES = 256 * 1024;
 
 /** 最小 redis 接口(只用 EVAL),同 literatureProxy。 */
 export interface ResearchRedis {
@@ -154,6 +170,8 @@ export interface ResearchStoreDeps {
   readBlobBytes: (storagePath: string) => Promise<Buffer>;
   writeBlobBytes: (storagePath: string, bytes: Buffer) => Promise<void>;
   blobDir: string;
+  /** 下载指标行(research_fetch_attempts,0261);测试注入内存版。 */
+  recordFetchAttempt: (row: FetchAttemptRowInput) => Promise<void>;
 }
 
 export interface ResearchProxyDeps {
@@ -168,6 +186,27 @@ export interface ResearchProxyDeps {
   log?: (level: "warn" | "error", msg: string, fields?: Record<string, unknown>) => void;
   /** ingest/litrag/check 的 store/fs;默认真实实现。 */
   store?: Partial<ResearchStoreDeps>;
+  /** durable job store(fetch-batch/job-status);默认真实实现,测试注入内存版。 */
+  jobStore?: Partial<ResearchJobStoreDeps>;
+  /** lit/fetch 的 ingest 抽取注入(测试;同 researchHandlers.IngestDeps.extract)。 */
+  fetchExtract?: Parameters<typeof ingestBlob>[1]["extract"];
+}
+
+/** fetch-batch / job-status 用的 durable job store 面(注入 seam)。 */
+export interface ResearchJobStoreDeps {
+  createJob: typeof createJob;
+  getJob: typeof getJob;
+  listCheckpoints: typeof listCheckpoints;
+  requeueInterruptedJob: typeof requeueInterruptedJob;
+}
+
+function resolveJobStore(s?: Partial<ResearchJobStoreDeps>): ResearchJobStoreDeps {
+  return {
+    createJob: s?.createJob ?? createJob,
+    getJob: s?.getJob ?? getJob,
+    listCheckpoints: s?.listCheckpoints ?? listCheckpoints,
+    requeueInterruptedJob: s?.requeueInterruptedJob ?? requeueInterruptedJob,
+  };
 }
 
 function resolveStore(s?: Partial<ResearchStoreDeps>): ResearchStoreDeps {
@@ -180,6 +219,7 @@ function resolveStore(s?: Partial<ResearchStoreDeps>): ResearchStoreDeps {
     readBlobBytes: s?.readBlobBytes ?? ((p: string) => readFile(p)),
     writeBlobBytes: s?.writeBlobBytes ?? writeBlobBytesDefault,
     blobDir,
+    recordFetchAttempt: s?.recordFetchAttempt ?? recordFetchAttempt,
   };
 }
 
@@ -228,6 +268,7 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
   const now = deps.now ?? Date.now;
   const log = deps.log ?? (() => {});
   const store = resolveStore(deps.store);
+  const jobStore = resolveJobStore(deps.jobStore);
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res);
@@ -309,7 +350,8 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
 
     let body: Record<string, unknown>;
     try {
-      const parsed = await readBoundedJson(req, MAX_BODY_BYTES);
+      const maxBody = reqPath === `${RESEARCH_PREFIX}lit/fetch-batch` ? MAX_FETCH_BATCH_BYTES : MAX_BODY_BYTES;
+      const parsed = await readBoundedJson(req, maxBody);
       body = (parsed ?? {}) as Record<string, unknown>;
     } catch (err) {
       const tooBig = err instanceof Error && err.message === "body_too_large";
@@ -352,6 +394,27 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
           await handleLibraryAdd(res, body, identity.userId, requestId);
           return;
         }
+      }
+      // ── R5 Phase A:全文下载(默认关;off → 404 FETCH_DISABLED,行为字节不变) ──
+      const fetchRoute =
+        reqPath === `${RESEARCH_PREFIX}lit/fetch` ||
+        reqPath === `${RESEARCH_PREFIX}lit/fetch-batch` ||
+        reqPath === `${RESEARCH_PREFIX}job/status`;
+      if (fetchRoute) {
+        if (cfg.config.fetch?.enabled !== true) {
+          sendErr(res, 404, "FETCH_DISABLED", "fulltext fetch disabled (research_config fetch.enabled)", requestId);
+          return;
+        }
+        if (reqPath === `${RESEARCH_PREFIX}lit/fetch`) {
+          await handleLitFetch(res, body, cfg, identity.userId, deps, store, requestId);
+          return;
+        }
+        if (reqPath === `${RESEARCH_PREFIX}lit/fetch-batch`) {
+          await handleLitFetchBatch(res, body, identity.userId, jobStore, requestId);
+          return;
+        }
+        await handleJobStatus(res, body, identity.userId, jobStore, requestId);
+        return;
       }
       if (reqPath === `${RESEARCH_PREFIX}cite/check`) {
         await handleCiteCheck(res, body, cfg, identity.userId, store, citeDeps, requestId);
@@ -725,6 +788,185 @@ async function handleLibraryAdd(
     }
     throw err;
   }
+}
+
+// ── R5 Phase A:全文下载路由(lit/fetch、lit/fetch-batch、job/status) ──
+
+/** 容器提交的紧凑记录解析(裁剪 + 上限;防滥用字段长度)。 */
+function parseFetchRecords(raw: unknown, max: number): FetchRecordInput[] {
+  if (!Array.isArray(raw)) return [];
+  const out: FetchRecordInput[] = [];
+  for (const item of raw.slice(0, max)) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    const id = typeof o.id === "string" ? o.id.trim() : "";
+    if (!id || id.length > 300) continue;
+    const rec: FetchRecordInput = { id };
+    if (typeof o.title === "string" && o.title.trim()) rec.title = o.title.trim().slice(0, 1000);
+    if (typeof o.doi === "string" && o.doi.trim()) rec.doi = o.doi.trim().toLowerCase().slice(0, 512);
+    if (typeof o.arxivId === "string" && o.arxivId.trim()) rec.arxivId = o.arxivId.trim().slice(0, 64);
+    if (o.oa && typeof o.oa === "object") {
+      const url = (o.oa as Record<string, unknown>).url;
+      if (typeof url === "string" && url.trim()) rec.oa = { url: url.trim().slice(0, 2048) };
+    }
+    out.push(rec);
+  }
+  return out;
+}
+
+function fetchChainConfig(cfg: ResearchConfigPublic): FetchFulltextConfig {
+  return {
+    unpaywallEmail: cfg.config.fetch?.unpaywallEmail ?? cfg.config.litSources.unpaywallEmail,
+    proxyUrl: cfg.config.fetch?.proxyUrl,
+  };
+}
+
+/** 课题解析(workspace flag 关时忽略 projectId;同 handleIngest 语义)。 */
+async function resolveFetchProjectId(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  userId: number,
+  requestId: string,
+): Promise<string | undefined | "error"> {
+  if (!isResearchWorkspaceEnabled()) return undefined;
+  const lib = await import("./library.js");
+  const raw = typeof body.projectId === "string" ? body.projectId.trim() : "";
+  try {
+    await lib.ensureDefaultResearchProject(String(userId));
+    return await lib.resolveWorkspaceProjectId(String(userId), raw || undefined);
+  } catch (err) {
+    if (err instanceof lib.WorkspaceProjectError) {
+      sendErr(res, 400, "BAD_REQUEST", err.message, requestId);
+      return "error";
+    }
+    throw err;
+  }
+}
+
+async function handleLitFetch(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  cfg: ResearchConfigPublic,
+  userId: number,
+  deps: ResearchProxyDeps,
+  store: ResearchStoreDeps,
+  requestId: string,
+): Promise<void> {
+  const records = parseFetchRecords(body.records, 5);
+  if (records.length === 0) {
+    sendErr(res, 400, "BAD_REQUEST", "records[] required (compact {id,doi?,arxivId?,title?,oa?}, max 5)", requestId);
+    return;
+  }
+  const ingest = body.ingest !== false;
+  const projectId = await resolveFetchProjectId(res, body, userId, requestId);
+  if (projectId === "error") return;
+
+  let addMembership:
+    | ((userId: string, docId: string, projectId: string) => Promise<void>)
+    | undefined;
+  if (projectId) {
+    const lib = await import("./library.js");
+    addMembership = (uid, docId, pid) => lib.addMembership(uid, docId, pid);
+  }
+
+  const results: FetchRecordOutcome[] = [];
+  for (const record of records) {
+    results.push(
+      await fetchRecordIntoLibrary(
+        { userId, record, projectId, ingest, engine: cfg.config.ingest.engine },
+        fetchChainConfig(cfg),
+        {
+          http: { fetchImpl: deps.fetchImpl ?? fetch },
+          putBlob: store.putBlob,
+          getBlob: async (uid, bid) => {
+            const b = await store.getBlob(uid, bid);
+            return b ? { storagePath: b.storagePath, mime: b.mime } : null;
+          },
+          readBlobBytes: store.readBlobBytes,
+          putDocument: (uid, doc) => store.putDocument({ userId: uid, doc }),
+          writeBlobBytes: store.writeBlobBytes,
+          blobDir: store.blobDir,
+          recordAttempt: store.recordFetchAttempt,
+          addMembership,
+          extract: deps.fetchExtract,
+        },
+      ),
+    );
+  }
+  sendJson(res, 200, projectId ? { results, projectId } : { results }, requestId);
+}
+
+async function handleLitFetchBatch(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  userId: number,
+  jobStore: ResearchJobStoreDeps,
+  requestId: string,
+): Promise<void> {
+  const records = parseFetchRecords(body.records, 200);
+  if (records.length === 0) {
+    sendErr(res, 400, "BAD_REQUEST", "records[] required (compact {id,doi?,arxivId?,title?,oa?}, max 200)", requestId);
+    return;
+  }
+  const rid = typeof body.requestId === "string" ? body.requestId.trim() : "";
+  if (!rid || rid.length > 128 || !/^[\w.-]+$/.test(rid)) {
+    sendErr(res, 400, "BAD_REQUEST", "requestId required (1-128 chars, [A-Za-z0-9_.-])", requestId);
+    return;
+  }
+  const projectId = await resolveFetchProjectId(res, body, userId, requestId);
+  if (projectId === "error") return;
+
+  // 幂等:同 requestId 已存在 → 返回既有;interrupted → 重新入队(handler 从
+  // 相位 checkpoint 续跑,跳过已完成记录)。
+  const job = await jobStore.createJob({
+    userId,
+    requestId: rid,
+    kind: "research_task",
+    payload: { mode: "fetch", records, ...(projectId ? { projectId } : {}) },
+  });
+  const current =
+    job.status === "interrupted" ? ((await jobStore.requeueInterruptedJob(userId, rid)) ?? job) : job;
+  sendJson(
+    res,
+    200,
+    { job: { requestId: current.requestId, kind: current.kind, status: current.status } },
+    requestId,
+  );
+}
+
+async function handleJobStatus(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  userId: number,
+  jobStore: ResearchJobStoreDeps,
+  requestId: string,
+): Promise<void> {
+  const rid = typeof body.requestId === "string" ? body.requestId.trim() : "";
+  if (!rid || rid.length > 128) {
+    sendErr(res, 400, "BAD_REQUEST", "requestId required", requestId);
+    return;
+  }
+  const job = await jobStore.getJob(userId, rid);
+  if (!job) {
+    sendErr(res, 404, "NOT_FOUND", "job not found", requestId);
+    return;
+  }
+  const checkpoints = await jobStore.listCheckpoints(job.id);
+  const completedPhases = [...new Set(checkpoints.filter((c) => c.status === "completed").map((c) => c.phase))];
+  sendJson(
+    res,
+    200,
+    {
+      requestId: job.requestId,
+      kind: job.kind,
+      status: job.status,
+      ...(job.phase ? { phase: job.phase } : {}),
+      completedPhases,
+      ...(job.result !== null && job.result !== undefined ? { result: job.result } : {}),
+      ...(job.error ? { error: job.error } : {}),
+    },
+    requestId,
+  );
 }
 
 async function handleCiteCheck(
