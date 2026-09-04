@@ -28,7 +28,8 @@ const WRITE_ACTIONS = new Set([
   'delete_comment', 'set_vote', 'set_following', 'create_article'
 ]);
 const IMPLEMENTED_WRITES = new Set(['create_answer', 'edit_answer', 'delete_answer', 'create_comment', 'delete_comment', 'set_vote', 'set_following']);
-const RISK_TEXT = /安全验证|访问异常|操作频繁|账号存在风险|请完成验证|验证码|登录保护|行为异常|系统检测到异常|点击按钮进行验证/;
+const RISK_TEXT = /安全验证|访问异常|操作频繁|账号存在风险|请完成验证|验证码|登录保护|行为异常|系统检测到异常|点击按钮进行验证|请求存在异常|限制本次访问|系统监测到您的网络环境存在异常/;
+const BLOCKED_TEXT = /请求存在异常|限制本次访问|访问异常|系统监测到您的网络环境存在异常/;
 const NORMAL_LOGIN_VERIFICATION_TEXT = /验证码登录|获取验证码|短信验证码/g;
 let terminal = false;
 
@@ -346,6 +347,30 @@ async function selfTokenFromPage(page) {
   const unique = Array.from(new Set(found));
   return unique.length === 1 ? unique[0] : null;
 }
+async function finishAuthenticatedNav(page, status) {
+  const text = await bodyText(page);
+  let pathname = '';
+  try { pathname = new URL(page.url()).pathname; } catch {}
+  if (status === 403 || BLOCKED_TEXT.test(text)) {
+    emitStep({
+      step: 'nav.blocked',
+      ok: false,
+      code: 'http-' + status,
+      pathname,
+      textLen: text.length
+    });
+    await writeTerminalAndExit({ event: 'failed', code: 'ZHIHU_UPSTREAM_CHALLENGE' });
+  }
+  await assertNoChallenge(page);
+  emitStep({
+    step: 'nav.response',
+    ok: status < 400,
+    code: 'http-' + status,
+    pathname,
+    textLen: text.length
+  });
+  if (await isLoginVisible(page)) await writeTerminalAndExit({ event: 'failed', code: 'LOGIN_EXPIRED' });
+}
 async function gotoAuthenticated(page, url) {
   let response = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -359,18 +384,19 @@ async function gotoAuthenticated(page, url) {
     }
   }
   await page.waitForTimeout(2500);
-  await assertNoChallenge(page);
-  const status = response ? response.status() : 0;
-  let pathname = '';
-  try { pathname = new URL(page.url()).pathname; } catch {}
-  emitStep({
-    step: 'nav.response',
-    ok: status < 400,
-    code: 'http-' + status,
-    pathname,
-    textLen: (await bodyText(page)).length
-  });
-  if (await isLoginVisible(page)) await writeTerminalAndExit({ event: 'failed', code: 'LOGIN_EXPIRED' });
+  await finishAuthenticatedNav(page, response ? response.status() : 0);
+}
+async function gotoInSite(page, url) {
+  let sameOrigin = false;
+  try { sameOrigin = new URL(page.url()).origin === 'https://www.zhihu.com'; } catch {}
+  if (!sameOrigin) {
+    await gotoAuthenticated(page, url);
+    return;
+  }
+  await page.evaluate((target) => { location.assign(target); }, url).catch(() => {});
+  await page.waitForLoadState('domcontentloaded', { timeout: 60_000 });
+  await page.waitForTimeout(2500);
+  await finishAuthenticatedNav(page, 0);
 }
 async function ensureSelfToken(page) {
   await gotoAuthenticated(page, 'https://www.zhihu.com/');
@@ -977,13 +1003,13 @@ async function actionRead(page, input) {
   }
   if (input.actionId === 'get_question') {
     await ensureSelfToken(page);
-    await gotoAuthenticated(page, 'https://www.zhihu.com/question/' + params.questionId);
+    await gotoInSite(page, 'https://www.zhihu.com/question/' + params.questionId);
     const question = await projectQuestion(page, params.questionId);
     return { question };
   }
   if (input.actionId === 'list_question_answers') {
     await ensureSelfToken(page);
-    await gotoAuthenticated(page, 'https://www.zhihu.com/question/' + params.questionId);
+    await gotoInSite(page, 'https://www.zhihu.com/question/' + params.questionId);
     await waitQuestionRendered(page);
     const answers = await collectAnswers(page, params.questionId, limit);
     const complete = answers.length < limit;
@@ -991,13 +1017,13 @@ async function actionRead(page, input) {
   }
   if (input.actionId === 'get_answer') {
     await ensureSelfToken(page);
-    await gotoAuthenticated(page, 'https://www.zhihu.com/answer/' + params.answerId);
+    await gotoInSite(page, 'https://www.zhihu.com/answer/' + params.answerId);
     const answer = await projectAnswer(page, params.answerId);
     return { answer };
   }
   if (input.actionId === 'list_answer_comments') {
     await ensureSelfToken(page);
-    await gotoAuthenticated(page, 'https://www.zhihu.com/answer/' + params.answerId);
+    await gotoInSite(page, 'https://www.zhihu.com/answer/' + params.answerId);
     const comments = await collectComments(page, params.answerId, limit);
     return { comments, complete: comments.length < limit, ...(comments.length === 0 ? { degradedReason: 'empty_list' } : {}) };
   }

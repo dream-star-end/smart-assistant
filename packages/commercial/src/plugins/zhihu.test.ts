@@ -471,6 +471,11 @@ describe('official Zhihu Plugin', () => {
     assert.match(ZHIHU_WORKER_SOURCE, /step: 'nav\.response'/)
     assert.match(ZHIHU_WORKER_SOURCE, /typeof event.textLen === 'number'/)
     assert.match(ZHIHU_WORKER_SOURCE, /code: 'http-' \+ status/)
+    assert.match(ZHIHU_WORKER_SOURCE, /nav\.blocked/)
+    assert.match(ZHIHU_WORKER_SOURCE, /gotoInSite/)
+    assert.match(ZHIHU_WORKER_SOURCE, /location\.assign/)
+    assert.match(ZHIHU_WORKER_SOURCE, /请求存在异常/)
+    assert.match(ZHIHU_WORKER_SOURCE, /限制本次访问/)
   })
 
   test('filteredState keeps z_c0 from both .zhihu.com and www.zhihu.com', () => {
