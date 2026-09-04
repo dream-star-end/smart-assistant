@@ -15,16 +15,16 @@ import { query } from "../db/queries.js";
 import { registerCommercial } from "../index.js";
 import { resetDesktopFlagCache, setDesktopSettingsLoader } from "../desktop/flags.js";
 import { getRuntimeChannel } from "../runtimeChannel.js";
-import {
-  createUserChatBridge,
-  CLOSE_BRIDGE,
-} from "../ws/userChatBridge.js";
+import { CLOSE_BRIDGE } from "../ws/userChatBridge.js";
 import {
   getDesktopTunnelRegistry,
   resetDesktopTunnelRegistryForTest,
 } from "../ws/desktopTunnelRegistry.js";
 import { DesktopMuxSession, createMuxLoopbackPair } from "../ws/desktopMux.js";
-import { randomBytes } from "node:crypto";
+import { makeDesktopOrDockerResolver } from "../agent-sandbox/desktopEnsure.js";
+import { admitDispatch } from "../dispatch/turnDispatchStore.js";
+import { getPool } from "../db/index.js";
+import { randomBytes, randomUUID } from "node:crypto";
 import { useDedicatedTestDatabase } from "./helpers/db.js";
 
 const db = useDedicatedTestDatabase("desktop_resolver_p1e_test");
@@ -91,75 +91,76 @@ describe("desktop resolver production composition", () => {
     }
   });
 
-  test("userChatBridge desktop branch writes admit runtimeKind=desktop; grok is ENGINE_NOT_ENABLED", async (t) => {
+  test("production resolver desktop hit writes turn_dispatches.runtime_kind=desktop", async (t) => {
     if (db.skipIfUnavailable(t)) return;
+    process.env.DATABASE_URL = db.url;
+    process.env.OC_DESKTOP_VIRTUAL_CONTAINER = "1";
+    const u = await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, role, status)
+       VALUES ($1,'x','user','active') RETURNING id::text`,
+      [`desk-wr01-${Date.now()}@t.local`],
+    );
+    const uid = Number(u.rows[0]!.id);
+    const inserted = await query<{ id: string }>(
+      `INSERT INTO agent_containers(
+         user_id, host_uuid, bound_ip, secret_hash, state, port, image,
+         runtime_channel, runtime_kind, last_ws_activity
+       ) VALUES ($1, NULL, NULL, $2, 'active', 18789, 'desktop-gateway', $3, 'desktop', NOW())
+       RETURNING id::text`,
+      [uid, Buffer.alloc(32, 4), getRuntimeChannel()],
+    );
+    const desktopId = Number(inserted.rows[0]!.id);
     resetDesktopTunnelRegistryForTest();
+    resetDesktopFlagCache();
+    setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [uid] }));
     const pair = createMuxLoopbackPair();
     const mux = new DesktopMuxSession(pair.master);
-    const registry = getDesktopTunnelRegistry();
-    registry.attach(88, { mux, close: () => {} }, {
+    getDesktopTunnelRegistry().attach(desktopId, { mux, close: () => {} }, {
       deviceId: "11111111-1111-4111-8111-111111111111",
-      uid: 5,
+      uid,
       expiresAt: new Date(Date.now() + 60_000),
       generation: 0,
     });
-    const admits: Array<{ runtimeKind?: string | null; agentContainerId?: number | null }> = [];
-    const errors: string[] = [];
-    const bridge = createUserChatBridge({
-      jwtSecret: JWT,
-      resolveContainerEndpoint: async () => ({
-        host: "desktop-reverse",
-        port: 0,
-        containerId: 88,
-        desktop: { containerId: 88 },
-        coldStart: false,
-      }),
-      admitUserTurn: async (input) => {
-        admits.push({ runtimeKind: input.runtimeKind ?? undefined, agentContainerId: input.agentContainerId ?? null });
-        return { kind: "session_not_found" };
-      },
-      loadAllowedModelChecker: async () => () => true,
-    });
-    const httpServer = createServer();
-    httpServer.on("upgrade", (req, socket, head) => {
-      if (!bridge.handleUpgrade(req, socket, head)) socket.destroy();
-    });
-    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", () => resolve()));
-    const port = (httpServer.address() as AddressInfo).port;
-    const issued = await signAccess({ sub: "5", role: "user" }, JWT);
-    const ws = new WebSocket(
-      `ws://127.0.0.1:${port}/ws/user-chat-bridge`,
-      ["bearer", issued.token],
-    );
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("open timeout")), 5000);
-      ws.on("open", () => { clearTimeout(timer); resolve(); });
-      ws.on("error", reject);
-    });
-    ws.on("message", (raw) => {
-      try {
-        const msg = JSON.parse(String(raw)) as { code?: string };
-        if (typeof msg.code === "string") errors.push(msg.code);
-      } catch { /* */ }
-    });
-    assert.equal(ws.readyState, WebSocket.OPEN, "desktop reverse tunnel should keep the user bridge open");
-    ws.send(JSON.stringify({
-      type: "inbound.message",
-      peer: { id: "p1", kind: "dm" },
-      clientMessageId: "m1",
-      model: "glm-5.2",
-      content: "hi",
-    }));
-    await new Promise((r) => setTimeout(r, 400));
-    assert.ok(
-      ws.readyState === WebSocket.OPEN
-      || admits.some((a) => a.runtimeKind === "desktop" && a.agentContainerId === 88)
-      || errors.length > 0,
-      `expected desktop bridge to stay up or emit a turn error, admits=${JSON.stringify(admits)} errors=${errors.join(",")}`,
-    );
-    ws.close();
-    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
-    mux.close();
-    await bridge.shutdown();
+    try {
+      let dockerCalls = 0;
+      const resolver = makeDesktopOrDockerResolver(async () => {
+        dockerCalls += 1;
+        throw new Error("docker ensure must not run on desktop hit");
+      });
+      const ep = await resolver(BigInt(uid));
+      assert.equal(ep.host, "desktop-reverse");
+      assert.equal(ep.containerId, desktopId);
+      assert.deepEqual(ep.desktop, { containerId: desktopId });
+      assert.equal(dockerCalls, 0, "production chat resolver must not fall through to docker on hit");
+
+      const dispatchId = randomUUID();
+      const admitted = await admitDispatch(getPool(), {
+        dispatchId,
+        userId: BigInt(uid),
+        sessionId: "s-desk-wr01",
+        clientMessageId: "cm-desk-wr01",
+        agentId: "main",
+        model: "glm-5.2",
+        requestHash: "a".repeat(64),
+        billingRequestId: "brq-desk-wr01",
+        ownerId: "conn-wr01",
+        anchorSeq: null,
+        agentContainerId: ep.containerId ?? null,
+        runtimeKind: ep.desktop ? "desktop" : "docker",
+      });
+      assert.equal(admitted.kind, "admitted");
+      const got = await query<{ runtime_kind: string | null; agent_container_id: string | null }>(
+        `SELECT runtime_kind, agent_container_id::text AS agent_container_id
+           FROM turn_dispatches WHERE dispatch_id = $1`,
+        [dispatchId],
+      );
+      assert.equal(got.rows[0]?.runtime_kind, "desktop");
+      assert.equal(Number(got.rows[0]?.agent_container_id), desktopId);
+    } finally {
+      mux.close();
+      setDesktopSettingsLoader(null);
+      resetDesktopFlagCache();
+      delete process.env.OC_DESKTOP_VIRTUAL_CONTAINER;
+    }
   });
 });

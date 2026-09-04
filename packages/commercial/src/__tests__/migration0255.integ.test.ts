@@ -118,5 +118,15 @@ describe("0255_desktop_kind_unique_index fail-loud", () => {
          AND c.relname='uniq_ac_user_channel_kind_active'
     `);
     assert.equal(valid.rows[0]?.indisvalid, true);
+    // Mirror migrate.ts no-transaction success path: ledger INSERT happens only
+    // after every statement succeeds. Fail path above stays 0 rows; success is 1.
+    await pool.query(
+      "INSERT INTO schema_migrations(version) VALUES ($1)",
+      ["0255_desktop_kind_unique_index"],
+    );
+    const successLedger = await pool.query<{ version: string }>(
+      "SELECT version FROM schema_migrations WHERE version = '0255_desktop_kind_unique_index'",
+    );
+    assert.equal(successLedger.rows.length, 1);
   });
 });
