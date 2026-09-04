@@ -3,6 +3,7 @@
  * 二者都在 MarkdownImpl(懒加载 chunk)内按需用：mermaid 库再经 dynamic import 拆成
  * 独立 chunk(只有真出现 ```mermaid 才下载,不拖累首屏与普通对话)。
  */
+import * as Dialog from "@radix-ui/react-dialog";
 import { Maximize2, X } from "lucide-react";
 import { useChatInteraction } from "./tool/context";
 import { useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
@@ -354,15 +355,8 @@ const RENDER_THROTTLE_MS = 800;
 export function HtmlPreview({ code, live }: { code: string; live?: boolean }) {
   const [show, setShow] = useState(true); // 默认预览(boss:html 应默认渲染,而非看源码)
   const [full, setFull] = useState(false);
-  // 全屏时按 Esc 退出。
-  useEffect(() => {
-    if (!full) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setFull(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [full]);
+  // 全屏层走 Radix Dialog:免费获得焦点陷阱 / role=dialog / Esc 关闭与焦点归还,
+  // 替代原先手写的 window keydown 监听(无障碍审计:自研覆盖层缺焦点管理)。
   // 流式渲染节流:iframe 每次换 srcDoc 都会整帧重载(白屏一闪),逐 token 更新会狂闪。
   // committed=喂给 iframe 的代码,只在它变化时才触发重载。两条 effect 各司其职:
   const [committed, setCommitted] = useState(code);
@@ -416,22 +410,30 @@ export function HtmlPreview({ code, live }: { code: string; live?: boolean }) {
       ) : (
         <pre className="max-h-72 overflow-auto bg-code px-3 py-2 font-mono text-xs text-fg">{code}</pre>
       )}
-      {full && (
-        <div className="fixed inset-0 z-[60] flex flex-col bg-black/80 p-3 animate-in sm:p-6">
-          <div className="mb-2 flex items-center justify-between text-white">
-            <span className="text-sm opacity-80">HTML 预览(沙盒) · 按 Esc 退出</span>
-            <button
-              type="button"
-              onClick={() => setFull(false)}
-              aria-label="关闭全屏"
-              className="flex items-center gap-1 rounded-md bg-white/15 px-3 py-1.5 text-sm outline-none hover:bg-white/25 focus-visible:ring-2 focus-visible:ring-white/50"
-            >
-              <X size={16} /> 关闭
-            </button>
-          </div>
-          {frame("min-h-0 flex-1 w-full rounded-lg bg-white")}
-        </div>
-      )}
+      <Dialog.Root open={full} onOpenChange={setFull}>
+        <Dialog.Portal>
+          {/* 全屏内容自身铺满视口(黑底),无需单独 Overlay;样式保持改造前的全屏黑底。 */}
+          <Dialog.Content
+            aria-describedby={undefined}
+            className="fixed inset-0 z-[60] flex flex-col bg-black/80 p-3 animate-in outline-none sm:p-6"
+          >
+            <Dialog.Title className="sr-only">HTML 全屏预览</Dialog.Title>
+            <div className="mb-2 flex items-center justify-between text-white">
+              <span className="text-sm opacity-80">HTML 预览(沙盒) · 按 Esc 退出</span>
+              <Dialog.Close asChild>
+                <button
+                  type="button"
+                  aria-label="关闭全屏"
+                  className="flex items-center gap-1 rounded-md bg-white/15 px-3 py-1.5 text-sm outline-none hover:bg-white/25 focus-visible:ring-2 focus-visible:ring-white/50"
+                >
+                  <X size={16} /> 关闭
+                </button>
+              </Dialog.Close>
+            </div>
+            {frame("min-h-0 flex-1 w-full rounded-lg bg-white")}
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   );
 }
