@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "frozenAt": "2026-09-04",
-  "auroraTip": "76537f48fbbc3cf38b15953f8df3896c20b9c729",
-  "selfhostTip": "c8e4e8b6e29906ed9369c5ad5fe0f4dcc07b3b11",
+  "auroraTip": "3ea881bf08740ad6fbc74bf6924c851606b2012d",
+  "selfhostTip": "e5967df4676e5981a88267cd144c6a9bdc995722",
   "incidentIds": [
     "INC-20260717-HISTORY-STUCK",
     "INC-20260718-ATTACH-NOOP",
@@ -92,7 +92,8 @@
     "INC-20260903-OCV5-87-RELEASE-MARKER-GATE",
     "INC-20260903-OCV5-82-SESSION-UNAVAILABLE",
     "INC-20260903-CCB-TOOL-PHASE-STOP-RED-CARD",
-    "INC-20260903-TURNEND-LAST-SEGMENT-FLASH"
+    "INC-20260903-TURNEND-LAST-SEGMENT-FLASH",
+    "INC-20260904-OFFICIAL-CC-STOP-STALE-PROCESS"
   ],
   "incidents": {
     "INC-20260717-HISTORY-STUCK": {
@@ -594,6 +595,10 @@
     },
     "INC-20260903-TURNEND-LAST-SEGMENT-FLASH": {
       "rootFixCommit": "ab3f5c20",
+      "coverageCommits": []
+    },
+    "INC-20260904-OFFICIAL-CC-STOP-STALE-PROCESS": {
+      "rootFixCommit": "e5967df4",
       "coverageCommits": []
     }
   },
