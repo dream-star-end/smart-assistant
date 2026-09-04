@@ -40,7 +40,13 @@ import { getPhase6AccountUuidEnforce, getSessionPinMode } from "../admin/runtime
 import { createPgIdentityRepo } from "../auth/containerIdentity.js";
 import { makeContainerIdentityStrategy } from "../auth/proxyIdentity.js";
 import { makeLoadUserModelAuthz } from "../auth/userModelAuthz.js";
-import { makeAnthropicProxyHandler } from "../http/anthropicProxy.js";
+import {
+  makeAnthropicProxyHandler,
+  ConcurrencyLimiter,
+  FallbackRateLimiter,
+  DEFAULT_PROXY_RATE_LIMIT,
+  DEFAULT_MAX_CONCURRENT_PER_UID,
+} from "../http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
 import { startLatencyProber } from "./latencyProber.js";
 import { startRecoveryProber } from "./recoveryProber.js";
@@ -207,6 +213,11 @@ export async function startEgress(): Promise<void> {
     executionRevision: modelCatalog.current().executionRevision.slice(0, 12),
   });
 
+  const sharedProxyConcurrency = new ConcurrencyLimiter(DEFAULT_MAX_CONCURRENT_PER_UID);
+  const sharedProxyFallback = new FallbackRateLimiter(
+    DEFAULT_PROXY_RATE_LIMIT.windowSeconds,
+    Math.max(1, Math.floor(DEFAULT_PROXY_RATE_LIMIT.max / 3)),
+  );
   const proxyHandler = makeAnthropicProxyHandler({
     pgPool: getPool(),
     pricing,
@@ -215,6 +226,8 @@ export async function startEgress(): Promise<void> {
     identity: identityStrategy,
     loadUserModelAuthz,
     rateLimitRedis,
+    concurrencyLimiter: sharedProxyConcurrency,
+    fallbackLimiter: sharedProxyFallback,
     modelCatalog,
     modelAuthorityEnforce,
     // 公钥 keyring(验签用)。每请求现取:轮换五步期间 ring 会变,闭包快照会认不出新签名。
@@ -469,6 +482,8 @@ export async function startEgress(): Promise<void> {
       loadUserModelAuthz,
       rateLimitRedis,
       runtimeKind: "desktop",
+      concurrencyLimiter: sharedProxyConcurrency,
+      fallbackLimiter: sharedProxyFallback,
       modelCatalog,
       modelAuthorityEnforce,
       authorityKeyring: authorityKeyringProvider(),

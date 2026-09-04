@@ -230,6 +230,46 @@ function observeCatalogShadow(
   }
 }
 
+export function buildProxyJournalCtxJson(args: {
+  runtimeKind?: "docker" | "desktop";
+  gate: ModelAuthorityDecision | null;
+  dispatchIdentity?: { dispatchId: string; attemptNo: number } | null;
+  turnKey?: string;
+}): Record<string, unknown> | undefined {
+  const dispatchIdentity = args.dispatchIdentity ?? null;
+  const gate = args.gate;
+  const base: Record<string, unknown> = {};
+  if (args.runtimeKind) {
+    base.source = "ccb_proxy";
+    base.runtimeKind = args.runtimeKind;
+    if (dispatchIdentity) {
+      base.dispatchId = dispatchIdentity.dispatchId;
+      base.attemptNo = dispatchIdentity.attemptNo;
+    }
+  }
+  if (!gate) return Object.keys(base).length > 0 ? base : undefined;
+  return {
+    authorityKind: gate.authorityKind,
+    executionRevision: gate.executionRevision,
+    projectionRevision: gate.projectionRevision,
+    billingRevision: gate.snapshot.billingRevision,
+    securityEpoch: gate.securityEpoch.toString(),
+    source: "ccb_proxy",
+    ...(args.runtimeKind ? { runtimeKind: args.runtimeKind } : {}),
+    ...(dispatchIdentity
+      ? { dispatchId: dispatchIdentity.dispatchId, attemptNo: dispatchIdentity.attemptNo }
+      : {}),
+    ...(gate.authorityKind === "bridge_signed"
+      ? {
+          authorityTurnId: gate.authorityTurnId,
+          turnLeaseIssuedAtMs: gate.turnLeaseIssuedAtMs,
+          turnLeaseVerifiedAtMs: gate.turnLeaseVerifiedAtMs,
+          ...(args.turnKey ? { turnKey: args.turnKey } : {}),
+        }
+      : {}),
+  };
+}
+
 // ─── handler 工厂 ─────────────────────────────────────────────────────────
 
 export function makeAnthropicProxyHandler(
@@ -239,14 +279,15 @@ export function makeAnthropicProxyHandler(
   const fetchFn = deps.fetchImpl ?? fetch;
   // upstream endpoint(默认 / 覆盖)由 pickUpstream 内部按 route 选择,详见 proxy/upstream.ts。
   const rateLimitCfg = deps.rateLimit ?? DEFAULT_PROXY_RATE_LIMIT;
-  const concurrency = new ConcurrencyLimiter(
+  const concurrency = deps.concurrencyLimiter ?? new ConcurrencyLimiter(
     deps.maxConcurrentPerUid ?? DEFAULT_MAX_CONCURRENT_PER_UID,
   );
   // 2026-04-21 安全审计 HIGH#3:Redis 抖动时的兜底限流(cap = Redis cap 的 1/3,
   // 向下取整至少 1;窗口同 Redis 以便行为连续)。Redis 正常时这个 map 始终空,
   // 不占资源;Redis 异常时它是最后一道防线。
   const fallbackCap = Math.max(1, Math.floor(rateLimitCfg.max / 3));
-  const fallbackLimiter = new FallbackRateLimiter(rateLimitCfg.windowSeconds, fallbackCap);
+  const fallbackLimiter = deps.fallbackLimiter
+    ?? new FallbackRateLimiter(rateLimitCfg.windowSeconds, fallbackCap);
   const maxBodyBytes = deps.maxBodyBytes ?? MAX_BODY_BYTES_DEFAULT;
 
   return async function handle(req, res, ctx) {
@@ -1182,30 +1223,12 @@ export function makeAnthropicProxyHandler(
           ...(dispatchIdentity
             ? { dispatchId: dispatchIdentity.dispatchId, attemptNo: dispatchIdentity.attemptNo }
             : {}),
-          ctxJson: gate
-            ? {
-                authorityKind: gate.authorityKind,
-                executionRevision: gate.executionRevision,
-                projectionRevision: gate.projectionRevision,
-                billingRevision: gate.snapshot.billingRevision,
-                securityEpoch: gate.securityEpoch.toString(),
-                source: "ccb_proxy",
-                ...(deps.runtimeKind ? { runtimeKind: deps.runtimeKind } : {}),
-                // 0170 durable-turn dispatch 身份(best-effort;非 dispatch → 缺省)。
-                // recovery/observability 据此关联逻辑 turn。
-                ...(dispatchIdentity
-                  ? { dispatchId: dispatchIdentity.dispatchId, attemptNo: dispatchIdentity.attemptNo }
-                  : {}),
-                ...(gate.authorityKind === "bridge_signed"
-                  ? {
-                      authorityTurnId: gate.authorityTurnId,
-                      turnLeaseIssuedAtMs: gate.turnLeaseIssuedAtMs,
-                      turnLeaseVerifiedAtMs: gate.turnLeaseVerifiedAtMs,
-                      ...(attribution.turnKey ? { turnKey: attribution.turnKey } : {}),
-                    }
-                  : {}),
-              }
-            : undefined,
+          ctxJson: buildProxyJournalCtxJson({
+            runtimeKind: deps.runtimeKind,
+            gate,
+            dispatchIdentity,
+            turnKey: attribution.turnKey ?? undefined,
+          }),
         });
         if (!admitted) {
           await releaseUpstreamSession(
