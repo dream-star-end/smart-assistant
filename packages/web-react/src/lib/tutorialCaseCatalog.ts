@@ -1,21 +1,12 @@
 import type { ProductFeatureId } from './productCapabilities'
+import { type TutorialCaseId } from './tutorialCaseId'
 
-export const TUTORIAL_CASE_IDS = [
-  'research-evidence-map',
-  'research-bike-demand',
-  'research-systematic-screening',
-  'research-open-peer-review',
-  'research-replication-audit',
-  'coding-swe-bench-fix',
-  'coding-feature-delivery',
-  'coding-regression-rescue',
-  'coding-frontend-quality',
-  'coding-dependency-upgrade',
-  'general-meeting-actions',
-  'general-public-data-brief',
-] as const
+// 向后兼容 re-export:这两个符号历史上定义在本文件,现拆到 tutorialCaseId.ts
+// (useAppRoute 等首屏路径只需 id 联合类型 + parse,不该连带整份案例数据进首屏闭包)。
+// 已有 import 不必改;新代码若只需要 id/parse,请直接 import './tutorialCaseId'。
+export { TUTORIAL_CASE_IDS, parseTutorialCaseId } from './tutorialCaseId'
+export type { TutorialCaseId } from './tutorialCaseId'
 
-export type TutorialCaseId = (typeof TUTORIAL_CASE_IDS)[number]
 export type TutorialCaseCategory = 'research' | 'coding' | 'general'
 export type TutorialCaseDifficulty = '入门' | '进阶' | '挑战'
 
@@ -1867,10 +1858,11 @@ export const TUTORIAL_CASE_BY_ID = Object.fromEntries(
   TUTORIAL_CASES.map((tutorialCase) => [tutorialCase.id, tutorialCase]),
 ) as unknown as Record<TutorialCaseId, TutorialCase>
 
-const TUTORIAL_CASE_ID_SET = new Set<string>(TUTORIAL_CASE_IDS)
-
-export function parseTutorialCaseId(value: string | null | undefined): TutorialCaseId | null {
-  return typeof value === 'string' && TUTORIAL_CASE_ID_SET.has(value)
-    ? (value as TutorialCaseId)
-    : null
-}
+// 编译期断言(与 tutorialCaseId.ts 的显式 id 列表防漂移,拆分后两处不再天然同源):
+// - 方向一「每个案例 id ∈ 显式列表」由 TutorialCase['id']: TutorialCaseId +
+//   TUTORIAL_CASES 的 satisfies readonly TutorialCase[] 保证;
+// - 方向二「显式列表里每个 id 都有案例」在这里断言:列表新增 id 忘写案例时,
+//   Exclude 产物非 never,下面这行的赋值会直接编译报红。
+type _CatalogCaseIds = (typeof TUTORIAL_CASES)[number]['id']
+const _allIdsHaveCase: Exclude<TutorialCaseId, _CatalogCaseIds> extends never ? true : never = true
+void _allIdsHaveCase
