@@ -23,8 +23,11 @@ import {
   classifyZhihuDeployDecision,
   classifyZhihuExactImageResult,
   findApprovedZhihuPluginForDeploy,
+  parseZhihuSeedCliArgs,
   seedZhihuPlugin,
   zhihuExactImageReadActionIds,
+  ZHIHU_SEED_CLI_USAGE,
+  ZHIHU_SEED_IDENTITY_READ_ACTION_IDS,
 } from '../src/marketplace/seedZhihuPlugin.js'
 import {
   type BrowserStorageStateV1,
@@ -158,14 +161,21 @@ function collectUrls(value: unknown, into: string[]): void {
   }
 }
 
+function isZhihuUpstreamChallengeError(error: unknown): boolean {
+  if (!error || typeof error !== 'object' || !('code' in error)) return false
+  return (error as { code: unknown }).code === 'ZHIHU_UPSTREAM_CHALLENGE'
+}
+
 async function exactImageSmoke(
   service: ZhihuDockerService,
   initialState: BrowserStorageStateV1,
+  allowChallenged: Set<string> = new Set(),
 ): Promise<{
   storageState: BrowserStorageStateV1
   selfId: string
   passed: string[]
   degraded: string[]
+  challenged: string[]
 }> {
   const writeIds = new Set(
     ZHIHU_PLUGIN_CONTRACT.actions
@@ -181,6 +191,12 @@ async function exactImageSmoke(
   let storageState = initialState
   const passed: string[] = []
   const degraded: string[] = []
+  const challenged: string[] = []
+  const identityReads = new Set<string>(ZHIHU_SEED_IDENTITY_READ_ACTION_IDS)
+  const markChallenged = (actionId: string) => {
+    remaining.delete(actionId)
+    if (!challenged.includes(actionId)) challenged.push(actionId)
+  }
   const record = (actionId: string, result: unknown) => {
     if (classifyZhihuExactImageResult(result) === 'degraded') {
       const passedIndex = passed.indexOf(actionId)
@@ -190,23 +206,38 @@ async function exactImageSmoke(
     }
     if (!passed.includes(actionId)) passed.push(actionId)
   }
-  const run = async (actionId: string, params: Record<string, unknown>) => {
+  const run = async (
+    actionId: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown> | null> => {
     if (writeIds.has(actionId)) throw new Error(`exact-image smoke forbids write action ${actionId}`)
-    const executed = await runtime.runReadAction({
-      contract: ZHIHU_PLUGIN_CONTRACT,
-      storageState,
-      actionId,
-      params,
-      signal: new AbortController().signal,
-    })
-    storageState = executed.storageState
-    remaining.delete(actionId)
-    record(actionId, executed.result)
-    return executed.result as Record<string, unknown>
+    try {
+      const executed = await runtime.runReadAction({
+        contract: ZHIHU_PLUGIN_CONTRACT,
+        storageState,
+        actionId,
+        params,
+        signal: new AbortController().signal,
+      })
+      storageState = executed.storageState
+      remaining.delete(actionId)
+      record(actionId, executed.result)
+      return executed.result as Record<string, unknown>
+    } catch (error) {
+      if (
+        allowChallenged.has(actionId) &&
+        !identityReads.has(actionId) &&
+        isZhihuUpstreamChallengeError(error)
+      ) {
+        markChallenged(actionId)
+        return null
+      }
+      throw error
+    }
   }
 
   const self = await run('get_self', {})
-  const user = self.user as Record<string, unknown> | undefined
+  const user = self?.user as Record<string, unknown> | undefined
   const selfId = String(user?.urlToken ?? '')
   if (!/^[A-Za-z0-9-]{1,64}$/.test(selfId))
     throw new Error('get_self did not prove a Zhihu urlToken')
@@ -220,27 +251,54 @@ async function exactImageSmoke(
   const searched = await run('search', { query, type: 'question', limit: 5 })
 
   const urls: string[] = []
-  collectUrls(searched, urls)
+  if (searched) collectUrls(searched, urls)
   let questionId: string | null = null
   let answerId: string | null = null
   for (const url of urls) {
     questionId ??= numericIdFromUrl(url, 'question')
     answerId ??= numericIdFromUrl(url, 'answer')
   }
-  if (!questionId) throw new Error('verified account has no readable question for detail smoke')
-  await run('get_question', { questionId })
-  const answers = await run('list_question_answers', { questionId, limit: 5 })
-  collectUrls(answers, urls)
-  for (const url of urls) answerId ??= numericIdFromUrl(url, 'answer')
-  const listed = Array.isArray(answers.answers) ? (answers.answers as Record<string, unknown>[]) : []
-  answerId ??= listed.map((row) => String(row.id ?? '')).find((id) => /^[0-9]{1,20}$/.test(id)) ?? null
-  if (!answerId) throw new Error('verified account has no readable answer for detail smoke')
-  await run('get_answer', { answerId })
-  await run('list_answer_comments', { answerId, limit: 5 })
+  const detailIds = [
+    'get_question',
+    'list_question_answers',
+    'get_answer',
+    'list_answer_comments',
+  ] as const
+  const markMissingTarget = (ids: readonly string[]) => {
+    for (const id of ids) {
+      if (remaining.has(id) && allowChallenged.has(id)) markChallenged(id)
+    }
+  }
+  if (!questionId) {
+    markMissingTarget(detailIds)
+  } else {
+    await run('get_question', { questionId })
+    const answers = await run('list_question_answers', { questionId, limit: 5 })
+    if (answers) {
+      collectUrls(answers, urls)
+      for (const url of urls) answerId ??= numericIdFromUrl(url, 'answer')
+      const listed = Array.isArray(answers.answers)
+        ? (answers.answers as Record<string, unknown>[])
+        : []
+      answerId ??=
+        listed.map((row) => String(row.id ?? '')).find((id) => /^[0-9]{1,20}$/.test(id)) ?? null
+    }
+  }
+  if (!answerId) {
+    markMissingTarget(['get_answer', 'list_answer_comments'])
+  } else {
+    await run('get_answer', { answerId })
+    await run('list_answer_comments', { answerId, limit: 5 })
+  }
 
-  if (remaining.size !== 0)
-    throw new Error(`exact-image smoke missed read actions: ${[...remaining].sort().join(',')}`)
-  return { storageState, selfId, passed, degraded }
+  const leftover = [...remaining].filter((id) => !challenged.includes(id)).sort()
+  if (leftover.length !== 0)
+    throw new Error(`exact-image smoke missed read actions: ${leftover.join(',')}`)
+  if (challenged.length > 0)
+    process.stderr.write(
+      `warn: Zhihu exact-image allowed challenged reads: ${[...challenged].sort().join(',')}\n`,
+    )
+  return { storageState, selfId, passed, degraded, challenged }
 }
 
 async function qrSmoke(service: ZhihuDockerService): Promise<string> {
@@ -806,7 +864,11 @@ async function classifyCurrentForRelease(targetRelease: string): Promise<void> {
   )
 }
 
-async function verifyLiveUser(operation: 'seed' | 'upgrade', userId: number): Promise<void> {
+async function verifyLiveUser(
+  operation: 'seed' | 'upgrade',
+  userId: number,
+  allowChallenged: Set<string> = new Set(),
+): Promise<void> {
   const imageId = exactImageId()
   const docker = dockerClient()
   await inspectExactImage(docker, imageId)
@@ -828,7 +890,7 @@ async function verifyLiveUser(operation: 'seed' | 'upgrade', userId: number): Pr
   let redis: IORedis | null = null
   let restoreSourceGate = false
   try {
-    const smoke = await exactImageSmoke(service, storageState)
+    const smoke = await exactImageSmoke(service, storageState, allowChallenged)
     const qrDigest = await qrSmoke(service)
     redis = await leaseRedis()
     if (reusable) {
@@ -885,6 +947,7 @@ async function verifyLiveUser(operation: 'seed' | 'upgrade', userId: number): Pr
           selfIdDigest: createHash('sha256').update(smoke.selfId).digest('hex'),
           passedActionIds: smoke.passed,
           degradedActionIds: smoke.degraded,
+          challengedActionIds: [...smoke.challenged].sort(),
           qrDigest,
           imageId,
           artifactHash: COMPILED_ZHIHU_PLUGIN.artifactHash,
@@ -921,7 +984,8 @@ async function verifyLiveUser(operation: 'seed' | 'upgrade', userId: number): Pr
 }
 
 async function main(): Promise<void> {
-  const mode = process.argv[2] ?? ''
+  const parsed = parseZhihuSeedCliArgs(process.argv.slice(2))
+  const mode = parsed.mode
   const liveMatch = /^--verify-and-(seed|upgrade)-user=(\d{1,16})$/.exec(mode)
   const transitionTarget = mode.startsWith('--transition-to-release=')
     ? mode.slice('--transition-to-release='.length)
@@ -937,28 +1001,25 @@ async function main(): Promise<void> {
     ? mode.slice('--classify-current-for-release='.length)
     : null
   if (
-    process.argv.length !== 3 ||
-    (mode !== '--smoke-only' &&
-      mode !== '--advisory-status' &&
-      mode !== '--seed-only' &&
-      mode !== '--close-listing-gate' &&
-      !liveMatch &&
-      !transitionTarget &&
-      !openGateTarget &&
-      !openGateCurrent &&
-      !compatibilityTarget &&
-      !classifyTarget)
+    mode !== '--smoke-only' &&
+    mode !== '--advisory-status' &&
+    mode !== '--seed-only' &&
+    mode !== '--close-listing-gate' &&
+    !liveMatch &&
+    !transitionTarget &&
+    !openGateTarget &&
+    !openGateCurrent &&
+    !compatibilityTarget &&
+    !classifyTarget
   )
-    throw new Error(
-      'usage: seed-zhihu-plugin.ts --verify-and-seed-user=ID|--verify-and-upgrade-user=ID|--smoke-only|--advisory-status|--seed-only|--close-listing-gate|--transition-to-release=PATH|--open-listing-gate-to-release=PATH|--open-listing-gate-current|--assert-current-release-compatible=PATH|--classify-current-for-release=PATH',
-    )
+    throw new Error(ZHIHU_SEED_CLI_USAGE)
   try {
     if (liveMatch) {
       const operation = liveMatch[1] as 'seed' | 'upgrade'
       const userId = Number(liveMatch[2])
       if (!Number.isSafeInteger(userId) || userId <= 0)
         throw new Error('verification user is invalid')
-      await verifyLiveUser(operation, userId)
+      await verifyLiveUser(operation, userId, parsed.allowChallenged)
       return
     }
     if (mode === '--smoke-only') await smokeOnly()
