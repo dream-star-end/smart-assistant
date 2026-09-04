@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
 import {
+  CURSOR_SLOT_WEIGHT_MAX,
+  CURSOR_SLOT_WEIGHT_MIN,
   asCursorSlotResults,
   coerceSlotFail,
+  computeCursorSlotWeight,
+  renderSlotWeightSidecar,
   cursorModelFamily,
   cursorRowForSlot,
   nextCursorQuotaClass,
@@ -146,5 +150,43 @@ describe("sand mode sidecar", () => {
     assert.equal(parsed.get("api-key"), true);
     assert.equal(parsed.get("api-key.2"), false);
     assert.equal(parsed.get("api-key.3"), undefined);
+  });
+});
+
+describe("slot weight (0260)", () => {
+  const now = new Date("2026-09-05T00:00:00.000Z");
+  const h = (hours: number) => new Date(now.getTime() + hours * 3_600_000);
+
+  test("never-observed usage is neutral; headroom scales linearly with a floor", () => {
+    assert.equal(computeCursorSlotWeight({ sandUsagePct: null, sandNextResetAt: null, billingCycleEnd: null, sandAccessState: null }, now), 500);
+    assert.equal(computeCursorSlotWeight({ sandUsagePct: 0, sandNextResetAt: null, billingCycleEnd: null, sandAccessState: null }, now), 1000);
+    assert.equal(computeCursorSlotWeight({ sandUsagePct: 72, sandNextResetAt: null, billingCycleEnd: null, sandAccessState: null }, now), 280);
+    assert.equal(computeCursorSlotWeight({ sandUsagePct: 100, sandNextResetAt: null, billingCycleEnd: null, sandAccessState: null }, now), 20);
+    assert.equal(computeCursorSlotWeight({ sandUsagePct: 130, sandNextResetAt: null, billingCycleEnd: null, sandAccessState: null }, now), 20);
+  });
+
+  test("soon reset and soon plan expiry boost; expired plan and blocked access sink", () => {
+    const base = { sandUsagePct: 50, sandAccessState: null };
+    assert.equal(computeCursorSlotWeight({ ...base, sandNextResetAt: h(200), billingCycleEnd: null }, now), 500);
+    assert.equal(computeCursorSlotWeight({ ...base, sandNextResetAt: h(48), billingCycleEnd: null }, now), 600);
+    assert.equal(computeCursorSlotWeight({ ...base, sandNextResetAt: h(6), billingCycleEnd: null }, now), 750);
+    assert.equal(computeCursorSlotWeight({ ...base, sandNextResetAt: null, billingCycleEnd: h(24 * 5) }, now), 600);
+    assert.equal(computeCursorSlotWeight({ ...base, sandNextResetAt: null, billingCycleEnd: h(24) }, now), 750);
+    assert.equal(computeCursorSlotWeight({ ...base, sandNextResetAt: h(6), billingCycleEnd: h(24) }, now), 1125);
+    assert.equal(computeCursorSlotWeight({ ...base, sandNextResetAt: null, billingCycleEnd: h(-1) }, now), 100);
+    assert.equal(
+      computeCursorSlotWeight({ sandUsagePct: 0, sandNextResetAt: h(1), billingCycleEnd: h(1), sandAccessState: "SAND_ACCESS_STATE_BLOCKED" }, now),
+      CURSOR_SLOT_WEIGHT_MIN,
+    );
+  });
+
+  test("sidecar renders clamped integers and carries no secrets", () => {
+    const text = renderSlotWeightSidecar([
+      { name: "api-key", weight: 750 },
+      { name: "api-key.2", weight: 0 },
+      { name: "api-key.3", weight: 99_999 },
+      { name: "api-key.4", weight: Number.NaN },
+    ]);
+    assert.equal(text, `# slot-weight v1\napi-key 750\napi-key.2 ${CURSOR_SLOT_WEIGHT_MIN}\napi-key.3 ${CURSOR_SLOT_WEIGHT_MAX}\napi-key.4 ${CURSOR_SLOT_WEIGHT_MIN}\n`);
   });
 });

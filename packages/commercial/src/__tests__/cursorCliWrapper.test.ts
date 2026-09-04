@@ -1549,7 +1549,7 @@ describe('oc-cursor wrapper', () => {
     assert.match(filteredFailure.stdout, new RegExp(`selected_slot 3 api-key\\.3 native ${gen4} 3 ${fp(keyC)}`))
   })
 
-  test('an all-Sand generation spreads users over accounts by rendezvous hash and keeps each user sticky', () => {
+  test('an all-Sand generation assigns each user a sticky account by weighted first touch (0260)', () => {
     const f = fixture()
     const authDir = dirname(f.auth)
     const gen = 'gen-555555555555555555555555'
@@ -1557,11 +1557,12 @@ describe('oc-cursor wrapper', () => {
     mkdirSync(dir, { recursive: true, mode: 0o700 })
     const fp = (key: string): string => createHash('sha256').update(`${key}\n`).digest('hex').slice(0, 16)
     const slots = [
-      { name: 'api-key', key: 'sess_a', account: '11' },
-      { name: 'api-key.2', key: 'sess_b', account: '12' },
-      { name: 'api-key.3', key: 'sess_c', account: '13' },
+      { name: 'api-key', key: 'sess_a', account: '11', weight: 1 },
+      { name: 'api-key.2', key: 'sess_b', account: '12', weight: 10000 },
+      { name: 'api-key.3', key: 'sess_c', account: '13', weight: 1 },
     ]
     writeFileSync(join(dir, '.sand-mode'), `# sand-mode v1\n${slots.map((s) => `${s.name} 1`).join('\n')}\n`, { mode: 0o600 })
+    writeFileSync(join(dir, '.slot-weight'), `# slot-weight v1\n${slots.map((s) => `${s.name} ${s.weight}`).join('\n')}\n`, { mode: 0o600 })
     writeFileSync(
       join(dir, '.slot-identities'),
       `# cursor-pool-identity v1 ${gen}\n${slots.map((s) => `${s.name} ${s.account} ${fp(s.key)} 1`).join('\n')}\n`,
@@ -1570,18 +1571,11 @@ describe('oc-cursor wrapper', () => {
     for (const s of slots) writeFileSync(join(dir, s.name), `${s.key}\n`, { mode: 0o600 })
     writeFileSync(join(authDir, '.pool-active'), `${gen}\n`, { mode: 0o600 })
     const rotationFile = join(f.dir, 'sticky-rotation')
-    // Reference ranking: sha256("<uid>:<account>") hex prefix, lowest wins.
-    const rank = (uid: string, account: string): string =>
-      createHash('sha256').update(`${uid}:${account}`).digest('hex').slice(0, 16)
-    const expectedFor = (uid: string, excluded = ''): { name: string; slot: number } => {
-      const ranked = slots
-        .filter((s) => s.account !== excluded)
-        .sort((a, b) => (rank(uid, a.account) < rank(uid, b.account) ? -1 : 1))
-      const best = ranked[0]!
-      return { name: best.name, slot: slots.indexOf(best) + 1 }
-    }
+    const stickyDir = join(f.dir, 'sticky')
     const select = (uid: string | undefined, model = 'claude-opus-5-thinking-high') => {
-      const env: NodeJS.ProcessEnv = { ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1', OC_CURSOR_KEY_ROTATION_FILE: rotationFile }
+      const env: NodeJS.ProcessEnv = {
+        ...f.env, OPENCLAUDE_CURSOR_SELECT_ONLY: '1', OC_CURSOR_KEY_ROTATION_FILE: rotationFile, OC_CURSOR_STICKY_DIR: stickyDir,
+      }
       if (uid === undefined) delete env.OC_USER_ID
       else env.OC_USER_ID = uid
       const r = spawnSync(f.wrapper, ['--model', model, '--', '__select_sticky__'], { cwd: f.dir, env, encoding: 'utf8' })
@@ -1591,33 +1585,47 @@ describe('oc-cursor wrapper', () => {
       return { slot: Number(m[1]), name: m[2], stderr: r.stderr }
     }
 
-    // Deterministic per user, and the same user gets the same slot across turns.
-    const uids = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12']
-    const seen = new Set<number>()
+    // First touch: weights 1 / 10000 / 1 → practically every user lands on
+    // account 12 (P(other) ≈ 2e-4 per draw); the choice is persisted per user.
+    const uids = ['1', '2', '3', '4', '5', '6', '7', '8']
     for (const uid of uids) {
-      const expected = expectedFor(uid)
       const first = select(uid)
-      const second = select(uid)
-      assert.deepEqual({ slot: first.slot, name: first.name }, expected, `uid ${uid}`)
-      assert.deepEqual({ slot: second.slot, name: second.name }, expected, `uid ${uid} second turn`)
-      assert.match(first.stderr, /credential slot \d\/3 \(sticky\)/)
-      seen.add(first.slot)
+      assert.equal(first.slot, 2, `uid ${uid} first touch must follow the weight`)
+      assert.match(first.stderr, /sticky Cursor account assigned \(weighted first touch\)/)
+      assert.match(first.stderr, /credential slot 2\/3 \(sticky\)/)
+      assert.equal(readFileSync(join(stickyDir, `user-${uid}`), 'utf8'), '12\n')
     }
-    assert.equal(seen.size, 3, 'twelve users must not all land on the primary')
     assert.equal(existsSync(rotationFile), false, 'successful selections never write rotation state')
+
+    // Sticky beats weight: flip the weights, existing users do not move; a
+    // brand-new user follows the new weights.
+    writeFileSync(join(dir, '.slot-weight'), '# slot-weight v1\napi-key 10000\napi-key.2 1\napi-key.3 1\n', { mode: 0o600 })
+    for (const uid of uids) {
+      const again = select(uid)
+      assert.equal(again.slot, 2, `uid ${uid} must stay on its sticky account`)
+      assert.doesNotMatch(again.stderr, /weighted first touch/)
+    }
+    assert.equal(select('99').slot, 1, 'new user follows the new weights')
+    assert.equal(readFileSync(join(stickyDir, 'user-99'), 'utf8'), '11\n')
+
+    // Sticky file names the ACCOUNT, not the slot: renumbering keeps the binding.
+    writeFileSync(join(stickyDir, 'user-7'), '13\n')
+    assert.equal(select('7').slot, 3)
+    // Junk / unknown account in the sticky file → redraw and overwrite.
+    writeFileSync(join(stickyDir, 'user-8'), 'garbage\n')
+    assert.equal(select('8').slot, 1)
+    assert.equal(readFileSync(join(stickyDir, 'user-8'), 'utf8'), '11\n')
 
     // Without an owner uid the pool keeps the legacy primary-first policy.
     const anonymous = select(undefined)
     assert.equal(anonymous.slot, 1)
     assert.doesNotMatch(anonymous.stderr, /sticky/)
-    const junk = select('not-a-uid')
-    assert.equal(junk.slot, 1)
+    assert.equal(select('not-a-uid').slot, 1)
 
-    // A failure on the sticky account moves only that user to its ranked
-    // successor for the cooldown, then returns it to the preferred account.
-    const uid = uids.find((u) => expectedFor(u).slot !== 1)!
-    const preferred = expectedFor(uid)
-    const preferredAccount = slots[preferred.slot - 1]!.account
+    // A credential failure on the sticky account (12) moves that user to a
+    // weighted redraw among the healthy accounts and re-pins there; the
+    // cooldown expiring does not bounce the user back.
+    const uid = '1'
     const recorded = spawnSync(
       f.wrapper,
       ['--model', 'claude-opus-5-thinking-high', '--', '__record_sticky_failure__'],
@@ -1626,29 +1634,38 @@ describe('oc-cursor wrapper', () => {
         env: {
           ...f.env,
           OC_USER_ID: uid,
-          OPENCLAUDE_CURSOR_SELECTED_KEY: preferred.name,
+          OPENCLAUDE_CURSOR_SELECTED_KEY: 'api-key.2',
           OPENCLAUDE_CURSOR_POOL_GENERATION: gen,
-          OPENCLAUDE_CURSOR_ACCOUNT_ID: preferredAccount,
-          OPENCLAUDE_CURSOR_KEY_FINGERPRINT: fp(slots[preferred.slot - 1]!.key),
+          OPENCLAUDE_CURSOR_ACCOUNT_ID: '12',
+          OPENCLAUDE_CURSOR_KEY_FINGERPRINT: fp('sess_b'),
           OPENCLAUDE_CURSOR_RECORD_RESULT: 'fail',
           OC_CURSOR_KEY_ROTATION_FILE: rotationFile,
+          OC_CURSOR_STICKY_DIR: stickyDir,
         },
         encoding: 'utf8',
       },
     )
     assert.equal(recorded.status, 0, recorded.stderr)
-    assert.match(readFileSync(rotationFile, 'utf8'), new RegExp(`^v2 ${preferredAccount} other_models `))
+    assert.match(readFileSync(rotationFile, 'utf8'), /^v2 12 other_models /)
     const failedOver = select(uid)
-    assert.deepEqual({ slot: failedOver.slot, name: failedOver.name }, expectedFor(uid, preferredAccount))
-    assert.notEqual(failedOver.slot, preferred.slot)
-    // Another user whose preferred account is healthy is unaffected.
-    const other = uids.find((u) => expectedFor(u).slot !== preferred.slot)!
-    assert.deepEqual({ slot: select(other).slot, name: select(other).name }, expectedFor(other))
-    // The cooldown is per model family: Cursor Models ignore an other_models failure.
-    assert.equal(select(uid, 'cursor-grok-4.6-high').slot, preferred.slot)
-    // Cooldown elapsed → back to the preferred account.
-    writeFileSync(rotationFile, `v2 ${preferredAccount} other_models 1\n`)
-    assert.equal(select(uid).slot, preferred.slot)
+    assert.equal(failedOver.slot, 1, 'weights 10000/1/1 minus cooled 12 → account 11')
+    assert.equal(readFileSync(join(stickyDir, `user-${uid}`), 'utf8'), '11\n')
+    // The cooldown is per model family: Cursor Models see 12 as healthy, but
+    // the user is now pinned to 11 for every family.
+    assert.equal(select(uid, 'cursor-grok-4.6-high').slot, 1)
+    // Other users pinned to 12 are moved too while it cools (the cooldown is
+    // container-wide), and stay where they land.
+    const other = select('2')
+    assert.equal(other.slot, 1)
+    writeFileSync(rotationFile, 'v2 12 other_models 1\n')
+    assert.equal(select(uid).slot, 1, 'cooldown elapsed: no bounce back')
+    assert.equal(select('2').slot, 1)
+
+    // No .slot-weight sidecar → uniform draw still works and pins.
+    rmSync(join(dir, '.slot-weight'))
+    const fresh = select('123')
+    assert.ok([1, 2, 3].includes(fresh.slot))
+    assert.equal(select('123').slot, fresh.slot)
   })
 
   test('a mixed native/Sand pool keeps primary-first even with an owner uid', () => {

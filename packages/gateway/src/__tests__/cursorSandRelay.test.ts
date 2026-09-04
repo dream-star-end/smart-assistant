@@ -332,8 +332,15 @@ test('failed credential rebinds within the same transport but refuses a native-t
       sessionKey: 'agent:main:test:credential-rebind-native', agentId: 'main', agentBaseDir: dir,
       config: {} as never, model: 'cursor-grok-4.6-high', cursorCredentialSelection: NATIVE_SELECTION,
     }, () => nextNative)
+    // A transient engine error is not evidence against the credential: the
+    // router must keep the bound account (legacy pools skip the observe step,
+    // so the only way to rebind here is the failure flag).
     ;(native as unknown as { inner: { emit: (event: string, value: unknown) => void } })
       .inner.emit('external_billing', { status: 'error', terminalCode: 'ENGINE_ERROR' })
+    await native.refreshVariantForTest()
+    assert.deepEqual(native.currentCredentialForTest, NATIVE_SELECTION)
+    ;(native as unknown as { inner: { emit: (event: string, value: unknown) => void } })
+      .inner.emit('external_billing', { status: 'unavailable', terminalCode: 'AUTH_UNAVAILABLE' })
     await native.refreshVariantForTest()
     assert.deepEqual(native.currentCredentialForTest, nextNative)
     assert.equal(native.currentVariant, 'native')
@@ -392,10 +399,26 @@ test('pool generation changes rebind stable account identity before reading a re
       sessionKey: 'agent:main:test:generation-rebind', agentId: 'main', agentBaseDir: dir,
       config: {} as never, model: 'cursor-opus-5-high', cursorCredentialSelection: generationOne,
     }, () => generationTwo)
+    const innerBefore = (router as unknown as { inner: unknown }).inner
     await router.refreshVariantForTest()
     assert.deepEqual(router.currentCredentialForTest, generationTwo)
     assert.equal(router.currentVariant, 'sand-ccb')
+    // Same account + same key bytes: the projection moved, the credential did
+    // not. The live inner adapter must be kept (no mid-turn recycle).
+    assert.equal((router as unknown as { inner: unknown }).inner, innerBefore)
     await router.shutdown()
+
+    // A different account behind the new generation is a real switch.
+    const otherAccount = { ...generationTwo, accountId: '3', keyFingerprint: 'bbbbbbbbbbbbbbbb' }
+    const switching = new CursorRoutingAdapter({
+      sessionKey: 'agent:main:test:generation-rebind-switch', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-opus-5-high', cursorCredentialSelection: generationOne,
+    }, () => otherAccount)
+    const switchingInnerBefore = (switching as unknown as { inner: unknown }).inner
+    await switching.refreshVariantForTest()
+    assert.deepEqual(switching.currentCredentialForTest, otherAccount)
+    assert.notEqual((switching as unknown as { inner: unknown }).inner, switchingInnerBefore)
+    await switching.shutdown()
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -460,6 +483,58 @@ test('cold submit starts the relay and emits one external billing terminal with 
   })
   await adapter.shutdown()
   assert.equal(closes, 1)
+})
+
+test('transient Sand turn errors never record a slot failure; credential rejections do', async () => {
+  const relay = {
+    async start() { return 'http://127.0.0.1:12345/route/test' },
+    async close() {},
+  } as unknown as CursorSandRelay
+  const baseSummary = {
+    usage: { cost: 0, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, totalTokens: 2 },
+    assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [],
+    tools: [], runtimeEvents: [], stopReason: 'error', numTurns: 1,
+    isError: true, staleResumeId: false,
+    phantomSignals: { apiState: 'called', skipReason: null },
+  }
+  const cases: Array<{ detail: string; recorded: Array<'ok' | 'fail'>; terminalCode: string; slotResults: boolean }> = [
+    { detail: 'API Error: 504 {"error":{"message":"Cursor Sand HTTP 504"}}', recorded: [], terminalCode: 'ENGINE_ERROR', slotResults: false },
+    { detail: 'This operation was aborted', recorded: [], terminalCode: 'ENGINE_ERROR', slotResults: false },
+    { detail: 'API Error: 401 Cursor Sand credential rejected: CURSOR_SAND_SESSION_EXPIRED', recorded: ['fail'], terminalCode: 'AUTH_UNAVAILABLE', slotResults: true },
+    { detail: 'API Error: 429 usage limit reached for this Sand pool', recorded: ['fail'], terminalCode: 'QUOTA_UNAVAILABLE', slotResults: true },
+  ]
+  let index = 0
+  for (const testCase of cases) {
+    index++
+    const recorded: Array<'ok' | 'fail'> = []
+    const run = {
+      ...inertRun(),
+      summary: Promise.resolve({ ...baseSummary, errorDetail: testCase.detail }),
+      finalized: true,
+    }
+    const adapter = new CursorSandAdapter({
+      sessionKey: `agent:main:test:sand-slot-result-${index}`, agentId: 'main', agentBaseDir: process.cwd(),
+      config: {} as never, model: 'cursor-fable-5-high', cursorCredentialSelection: STABLE_SAND_SELECTION,
+    }, relay, () => run as never, (result) => recorded.push(result))
+    const billing: Array<Record<string, unknown>> = []
+    adapter.on('external_billing', (event) => billing.push(event as Record<string, unknown>))
+    const submitted = adapter.submitTurn({
+      input: 'hello', requestId: 'd'.repeat(32),
+      sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map(),
+      onEvent() {}, onPostTerminalRuntimeEvent() {},
+    })
+    await submitted.submitted
+    await submitted.summary
+    await new Promise((resolvePromise) => setImmediate(resolvePromise))
+    assert.deepEqual(recorded, testCase.recorded, testCase.detail)
+    assert.equal(billing.length, 1, testCase.detail)
+    assert.equal(billing[0].terminalCode, testCase.terminalCode, testCase.detail)
+    assert.equal('cursorSlotResults' in billing[0], testCase.slotResults, testCase.detail)
+    // Stable account identity is still attributed so the master can settle
+    // usage against the right account even when no slot verdict is emitted.
+    assert.equal(billing[0].cursorAccountId, '42', testCase.detail)
+    await adapter.shutdown()
+  }
 })
 
 test('interrupt before cold Sand preparation prevents submission', async () => {

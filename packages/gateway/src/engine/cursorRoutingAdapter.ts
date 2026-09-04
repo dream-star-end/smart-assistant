@@ -155,10 +155,12 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
       const listener = (...args: unknown[]): void => {
         if (event === 'external_billing') {
           const billing = args[0] as { status?: unknown; terminalCode?: unknown } | undefined
-          if (
-            billing?.status !== 'success'
-            && billing?.terminalCode !== 'USER_CANCELLED'
-          ) this.credentialNeedsRefresh = true
+          // Re-select only when the credential itself was rejected. A plain
+          // engine error (Sand 5xx, aborted stream, SIGKILL on restart, tool
+          // failure) is not evidence against the account; re-selecting on it
+          // used to hop the user's sessions between accounts every time the
+          // wrapper cooldown flipped.
+          if (billing?.status === 'unavailable') this.credentialNeedsRefresh = true
         }
         if (event === 'session_id' && this.variant !== 'native' && typeof args[0] === 'string') {
           this.emit(event, prefixResumeId(args[0], this.variant))
@@ -231,13 +233,32 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
         throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
       }
       this.credentialNeedsRefresh = false
-      if (
-        next.keyName !== this.credentialSelection.keyName
-        || next.slot !== this.credentialSelection.slot
-        || next.poolGeneration !== this.credentialSelection.poolGeneration
-        || next.accountId !== this.credentialSelection.accountId
-        || next.keyFingerprint !== this.credentialSelection.keyFingerprint
-      ) {
+      const sameCredential = next.accountId === this.credentialSelection.accountId
+        && next.keyFingerprint === this.credentialSelection.keyFingerprint
+        && next.credentialKind === this.credentialSelection.credentialKind
+        && next.machineId === this.credentialSelection.machineId
+      if (sameCredential) {
+        // Same account, same secret bytes: only the pool projection moved
+        // (a new immutable generation after an unrelated row update, a slot
+        // renumbering after another account was removed). Pool generations
+        // are never pruned, so the inner adapter can keep reading its bound
+        // generation; adopt the new metadata without tearing down a live
+        // CCB/Sand process mid-turn.
+        if (
+          next.poolGeneration !== this.credentialSelection.poolGeneration
+          || next.slot !== this.credentialSelection.slot
+          || next.keyName !== this.credentialSelection.keyName
+        ) {
+          log.info('cursor credential projection moved: adopting without recycle', {
+            sessionKey: this.opts.sessionKey,
+            accountId: next.accountId,
+            from: { keyName: this.credentialSelection.keyName, poolGeneration: this.credentialSelection.poolGeneration },
+            to: { keyName: next.keyName, poolGeneration: next.poolGeneration },
+          })
+          this.credentialSelection = next
+          this.opts.cursorCredentialSelection = next
+        }
+      } else {
         const nativeId = this.inner.nativeSessionId
         log.info('cursor credential switch: recycling inner adapter', {
           sessionKey: this.opts.sessionKey,

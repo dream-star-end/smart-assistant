@@ -105,6 +105,57 @@ describe("syncCursorAuthDir", () => {
     assert.doesNotMatch(sidecar, /crsr_/);
   });
 
+  test("writes Sand-usage-derived first-touch weights into .slot-weight (root + generation)", async () => {
+    const authDir = mkdtempSync(join(tmpdir(), "oc-cursor-auth-"));
+    const now = new Date("2026-09-05T00:00:00.000Z");
+    const result = await syncCursorAuthDir({
+      authDir,
+      now: () => now,
+      listAccounts: async () =>
+        [
+          // 72% used, reset in 6h → headroom 0.28 × 1.5 = 420
+          { id: 14n, provider: "cursor", status: "active", cooldown_until: null, cursor_quota_class: "other_ok", cursor_sand_enabled: true,
+            cursor_sand_usage_pct: 72, cursor_sand_next_reset_at: new Date(now.getTime() + 6 * 3_600_000), cursor_billing_cycle_end: null, cursor_sand_access_state: "SAND_ACCESS_STATE_GRANTED" },
+          // never observed → neutral 500
+          { id: 15n, provider: "cursor", status: "active", cooldown_until: null, cursor_quota_class: "other_ok", cursor_sand_enabled: true },
+        ] as never,
+      createAccount: async () => {
+        throw new Error("must not import when pool already has rows");
+      },
+      getCursorTokenSnapshot: async (id) => {
+        const key = String(id) === "14" ? KEY_A : KEY_B;
+        return { token: Buffer.from(key, "utf8") } as never;
+      },
+    });
+    assert.equal(result.written, 2);
+    const root = readFileSync(join(authDir, ".slot-weight"), "utf8");
+    assert.equal(root, "# slot-weight v1\napi-key 420\napi-key.2 500\n");
+    assert.doesNotMatch(root, /crsr_/);
+    const generation = readFileSync(join(authDir, CURSOR_POOL_ACTIVE_FILE), "utf8").trim();
+    const generationDir = join(authDir, CURSOR_POOL_GENERATIONS_DIR, generation);
+    assert.equal(readFileSync(join(generationDir, ".slot-weight"), "utf8"), root);
+
+    // A weight change alone yields a new immutable generation.
+    const second = await syncCursorAuthDir({
+      authDir,
+      now: () => now,
+      listAccounts: async () =>
+        [
+          { id: 14n, provider: "cursor", status: "active", cooldown_until: null, cursor_quota_class: "other_ok", cursor_sand_enabled: true,
+            cursor_sand_usage_pct: 20, cursor_sand_next_reset_at: null, cursor_billing_cycle_end: null, cursor_sand_access_state: null },
+          { id: 15n, provider: "cursor", status: "active", cooldown_until: null, cursor_quota_class: "other_ok", cursor_sand_enabled: true },
+        ] as never,
+      createAccount: async () => { throw new Error("no import"); },
+      getCursorTokenSnapshot: async (id) => ({ token: Buffer.from(String(id) === "14" ? KEY_A : KEY_B, "utf8") } as never),
+    });
+    assert.equal(second.written, 2);
+    const generation2 = readFileSync(join(authDir, CURSOR_POOL_ACTIVE_FILE), "utf8").trim();
+    assert.notEqual(generation2, generation);
+    assert.equal(readFileSync(join(authDir, ".slot-weight"), "utf8"), "# slot-weight v1\napi-key 800\napi-key.2 500\n");
+    // Old generation stays readable for containers still bound to it.
+    assert.equal(existsSync(join(generationDir, "api-key")), true);
+  });
+
   test("writes cursor_sand_enabled into .sand-mode sidecar", async () => {
     const authDir = mkdtempSync(join(tmpdir(), "oc-cursor-auth-"));
     const result = await syncCursorAuthDir({

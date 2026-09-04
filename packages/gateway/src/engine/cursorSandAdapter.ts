@@ -222,9 +222,22 @@ export class CursorSandAdapter extends CcbAdapter {
             : status === 'error'
               ? 'ENGINE_ERROR'
               : undefined
-      if (!interrupted) {
+      // Only credential-class outcomes reach the wrapper's rotation state.
+      // `recordResult('fail')` writes a per-container cooldown that makes the
+      // sticky per-user selection skip this account for ten minutes — i.e.
+      // every session of this user hops to another Cursor account. Transient
+      // faults (Sand HTTP 5xx, aborted stream, CCB SIGKILL on service
+      // restart, tool errors) say nothing about the credential, so they must
+      // not scatter a user's sessions across accounts. Observed 2026-09-04:
+      // 185 ENGINE_ERROR vs 128 success in 36h, zero of them auth/quota.
+      const slotResult: 'ok' | 'fail' | null = status === 'success'
+        ? 'ok'
+        : status === 'unavailable'
+          ? 'fail'
+          : null
+      if (!interrupted && slotResult !== null) {
         try {
-          this.recordResult(status === 'success' ? 'ok' : 'fail')
+          this.recordResult(slotResult)
         } catch (error) {
           log.warn('cursor sand credential result recording threw', {
             slot: this.selection.slot,
@@ -246,10 +259,10 @@ export class CursorSandAdapter extends CcbAdapter {
             cache_creation_input_tokens: result.usage.cacheCreationTokens,
           },
         } : {}),
-        ...(!interrupted ? {
+        ...(!interrupted && slotResult !== null ? {
           cursorSlotResults: [{
             slot: this.selection.slot,
-            result: status === 'success' ? 'ok' as const : 'fail' as const,
+            result: slotResult,
           }],
         } : {}),
         ...(!interrupted && this.selection.accountId !== '0' ? {

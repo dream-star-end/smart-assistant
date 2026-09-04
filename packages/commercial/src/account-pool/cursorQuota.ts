@@ -173,6 +173,71 @@ export function renderSandModeSidecar(slots: Array<{ name: string; sandEnabled: 
 }
 
 /**
+ * 0260 — per-slot first-touch weight sidecar (`.slot-weight`), no secrets.
+ *
+ * `name <weight>` with an integer weight in [1, 10000]. The container wrapper
+ * (oc-cursor.sh) uses it only when a user has no sticky account yet: it draws
+ * one slot with probability ∝ weight, then persists that choice per user.
+ * Existing users are never moved by a weight change.
+ *
+ * Weight = headroom × reset-proximity × plan-expiry-proximity, scaled ×1000:
+ *   - headroom: (100 - sand_usage_pct) / 100, floored at 0.02 so an exhausted
+ *     account still has a sliver (the pool may be all-exhausted; someone must
+ *     serve). NULL usage (never observed) → 0.5 neutral.
+ *   - reset proximity: the closer the weekly Sand reset, the less it costs to
+ *     burn what is left (unused quota is wasted at reset). <24h ×1.5,
+ *     <72h ×1.2, else ×1. NULL → ×1.
+ *   - plan expiry proximity: same "use it before it is wasted" logic as the
+ *     CCB scheduler's subscriptionFactor. <3d ×1.5, <7d ×1.2, else ×1;
+ *     already expired ×0.2 (may stop working any moment). NULL → ×1.
+ *   - Sand access blocked (`SAND_ACCESS_STATE_BLOCKED*`) → weight 1 (bottom).
+ */
+export const CURSOR_SLOT_WEIGHT_FILE = ".slot-weight";
+export const CURSOR_SLOT_WEIGHT_MIN = 1;
+export const CURSOR_SLOT_WEIGHT_MAX = 10_000;
+
+export interface CursorSlotWeightInputs {
+  sandUsagePct: number | null;
+  sandNextResetAt: Date | null;
+  billingCycleEnd: Date | null;
+  sandAccessState: string | null;
+}
+
+export function computeCursorSlotWeight(input: CursorSlotWeightInputs, now: Date): number {
+  if (input.sandAccessState && /BLOCKED/i.test(input.sandAccessState)) return CURSOR_SLOT_WEIGHT_MIN;
+  const pct = input.sandUsagePct;
+  const headroom = pct === null || !Number.isFinite(pct)
+    ? 0.5
+    : Math.max(0.02, Math.min(1, (100 - pct) / 100));
+  const hours = (d: Date | null): number | null => {
+    if (!d) return null;
+    const ms = d.getTime() - now.getTime();
+    return Number.isFinite(ms) ? ms / 3_600_000 : null;
+  };
+  const resetH = hours(input.sandNextResetAt);
+  const resetFactor = resetH === null ? 1 : resetH < 24 ? 1.5 : resetH < 72 ? 1.2 : 1;
+  const expiryH = hours(input.billingCycleEnd);
+  const expiryFactor = expiryH === null
+    ? 1
+    : expiryH <= 0
+      ? 0.2
+      : expiryH < 72 ? 1.5 : expiryH < 168 ? 1.2 : 1;
+  const raw = Math.round(headroom * resetFactor * expiryFactor * 1000);
+  return Math.max(CURSOR_SLOT_WEIGHT_MIN, Math.min(CURSOR_SLOT_WEIGHT_MAX, raw));
+}
+
+export function renderSlotWeightSidecar(slots: Array<{ name: string; weight: number }>): string {
+  const lines = ["# slot-weight v1"];
+  for (const slot of slots) {
+    const w = Number.isInteger(slot.weight)
+      ? Math.max(CURSOR_SLOT_WEIGHT_MIN, Math.min(CURSOR_SLOT_WEIGHT_MAX, slot.weight))
+      : CURSOR_SLOT_WEIGHT_MIN;
+    lines.push(`${slot.name} ${w}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/**
  * 0257 — per-slot credential kind sidecar. `api_key` slots hold a crsr_ key
  * that the relay exchanges upstream; `session` slots hold a Cursor account
  * session accessToken used directly as Bearer together with the persisted

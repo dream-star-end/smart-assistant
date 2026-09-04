@@ -167,7 +167,7 @@ function isoDate(v: unknown): string | null {
   return null
 }
 
-function emptySnapshot(nowMs: number): CursorUsageSnapshot {
+export function emptySnapshot(nowMs: number): CursorUsageSnapshot {
   return {
     fetched_at: new Date(nowMs).toISOString(),
     errors: {},

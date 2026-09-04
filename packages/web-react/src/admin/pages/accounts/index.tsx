@@ -30,7 +30,9 @@ import { CursorUsageModal, RecentUsersModal, RefreshHistoryModal } from "./Accou
 import {
   AccountWarningChips,
   CooldownCell,
+  CursorPlanCell,
   CursorPoolCell,
+  CursorSandUsageCell,
   LastUsed,
   LifetimeCell,
   QuotaCell,
@@ -55,6 +57,10 @@ const PROVIDER_SECTIONS = [
   { id: "codex", title: "Codex", desc: "Codex 官方账号池" },
   { id: "grok", title: "Grok", desc: "Grok Build 官方账号池" },
 ] as const;
+
+/** 0260 — 按 provider 段切换的列:Cursor 段隐藏 Anthropic 配额列,其余段隐藏 Sand 列。 */
+const CCB_ONLY_COLUMNS = new Set(["q5h", "q5hr", "q7d", "q7dr", "oauth_exp"]);
+const CURSOR_ONLY_COLUMNS = new Set(["sand_pct", "sand_reset", "cursor_plan", "usage_upd", "cursor_pool"]);
 
 function errMsg(e: unknown): string {
   return apiErrorMessage(e, "请求失败");
@@ -167,6 +173,20 @@ export default function AccountsPage() {
     [confirm, toast, refresh],
   );
 
+  // 0260 — 立即回源刷新一行的 Sand 用量(同 sweeper 路径:落库 + 重算 slot 权重)。
+  const doRefreshCursorUsage = useCallback(
+    async (a: AccountRow) => {
+      try {
+        await adminGet(`/accounts/${encodeURIComponent(a.id)}/cursor-usage?refresh=1`);
+        toast(`#${a.id} Sand 用量已刷新`, "success");
+        refresh();
+      } catch (e) {
+        toast(`刷新失败:${errMsg(e)}`, "error");
+      }
+    },
+    [toast, refresh],
+  );
+
   const columns: Column<AccountRow>[] = [
     { key: "id", title: "id", width: 60, render: (a) => <span className="font-mono text-[12px]">{a.id}</span> },
     {
@@ -198,6 +218,12 @@ export default function AccountsPage() {
     },
     { key: "group", title: "分组", width: 70, render: (a) => (a.group_id ? <span className="font-mono text-[12px]">#{a.group_id}</span> : <span className="text-faint">—</span>) },
     { key: "cursor_pool", title: "Cursor 池", width: 120, render: (a) => <CursorPoolCell a={a} /> },
+    // 0260 — Cursor 段专用:Sand(Grok Bot)池已用 % / 周重置 / 套餐与账期 / 用量刷新时间。
+    // CCB 段专用:Anthropic 5h/7d 滚动配额。两组列语义不同,按 provider 段切换(见 sectionColumns)。
+    { key: "sand_pct", title: "Sand 已用%", align: "right", render: (a) => <CursorSandUsageCell a={a} /> },
+    { key: "sand_reset", title: "Sand 重置", align: "right", render: (a) => <ResetCell resetsAt={a.cursor_sand_next_reset_at ?? null} /> },
+    { key: "cursor_plan", title: "套餐 / 账期", width: 110, render: (a) => <CursorPlanCell a={a} /> },
+    { key: "usage_upd", title: "用量更新", width: 100, render: (a) => <LastUsed iso={a.cursor_usage_updated_at ?? null} /> },
     { key: "q5h", title: "5h%", align: "right", render: (a) => <QuotaCell pct={a.quota_5h_pct} updatedAt={a.quota_updated_at} /> },
     { key: "q5hr", title: "5h 重置", align: "right", render: (a) => <ResetCell resetsAt={a.quota_5h_resets_at} /> },
     { key: "q7d", title: "7d%", align: "right", render: (a) => <QuotaCell pct={a.quota_7d_pct} updatedAt={a.quota_updated_at} /> },
@@ -243,6 +269,11 @@ export default function AccountsPage() {
               {a.provider === "cursor" && a.cursor_credential_kind === "session" && (
                 <DropdownMenuItem onSelect={() => setCursorUsageAcc({ id: a.id, label: a.label })}>
                   Cursor 额度 / 用量
+                </DropdownMenuItem>
+              )}
+              {a.provider === "cursor" && a.cursor_credential_kind === "session" && (
+                <DropdownMenuItem onSelect={() => doRefreshCursorUsage(a)}>
+                  立即刷新 Sand 用量
                 </DropdownMenuItem>
               )}
               <DropdownMenuItem onSelect={() => setRecentAcc({ id: a.id, label: a.label })}>
@@ -364,6 +395,11 @@ export default function AccountsPage() {
         <div className="flex flex-col gap-6">
           {PROVIDER_SECTIONS.filter((section) => !provider || provider === section.id).map((section) => {
             const sectionRows = rows.filter((row) => row.provider === section.id);
+            // Cursor 行没有 Anthropic 5h/7d 配额、OAuth 到期;CCB/Codex/Grok 行没有 Sand 池。
+            const hidden = section.id === "cursor"
+              ? CCB_ONLY_COLUMNS
+              : CURSOR_ONLY_COLUMNS;
+            const sectionColumns = columns.filter((c) => !hidden.has(c.key));
             return (
               <section key={section.id} className="flex flex-col gap-3">
                 <div className="flex items-end justify-between gap-3">
@@ -373,7 +409,7 @@ export default function AccountsPage() {
                   </div>
                 </div>
                 <DataTable
-                  columns={columns}
+                  columns={sectionColumns}
                   rows={sectionRows}
                   rowKey={(a) => a.id}
                   loading={loading && !data}

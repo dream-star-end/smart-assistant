@@ -230,3 +230,66 @@ export function LastUsed({ iso }: { iso: string | null }) {
   if (!iso) return <span className="text-faint">—</span>;
   return <TimeAgo value={iso} className="font-mono text-[12px]" />;
 }
+
+/**
+ * 0260 — Cursor Sand(Grok Bot)池已用 %。每小时 sweeper 刷新;>2h 未刷新灰显。
+ * api_key 行没有 cursor.com 面,永远 —。tooltip 带刷新时间与最近一次失败原因。
+ */
+export function CursorSandUsageCell({ a }: { a: AccountRow }) {
+  if (a.provider !== "cursor") return <span className="text-faint">—</span>;
+  const pct = a.cursor_sand_usage_pct;
+  const updatedAt = a.cursor_usage_updated_at ?? null;
+  const err = a.cursor_usage_error ?? null;
+  if (pct === null || pct === undefined || !Number.isFinite(Number(pct))) {
+    const hint =
+      a.cursor_credential_kind !== "session"
+        ? "API Key 行无 cursor.com 面,无法读取 Sand 池"
+        : err
+          ? `最近刷新失败:${err}`
+          : "尚未刷新(每小时自动;可在更多操作里手动刷新)";
+    return (
+      <Tooltip content={hint}>
+        <span className="text-faint">—</span>
+      </Tooltip>
+    );
+  }
+  const num = Number(pct);
+  const updMs = updatedAt ? new Date(updatedAt).getTime() : Number.NaN;
+  const stale = Number.isFinite(updMs) ? Date.now() - updMs > 2 * 60 * 60 * 1000 : true;
+  const tone: Tone = stale ? "neutral" : num >= 95 ? "danger" : num >= 80 ? "warning" : num <= 40 ? "success" : "info";
+  const title = [
+    `Sand 池已用 ${num.toFixed(1)}%`,
+    updatedAt ? `更新: ${fmtDateTime(updatedAt)}${stale ? " (陈旧)" : ""}` : null,
+    a.cursor_sand_access_state ? `状态: ${a.cursor_sand_access_state.replace("SAND_ACCESS_STATE_", "")}` : null,
+    err ? `最近失败: ${err}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <Tooltip content={title}>
+      <Badge tone={tone} className="px-1.5 py-0 text-[11px] tabular-nums">
+        {num.toFixed(0)}%
+      </Badge>
+    </Tooltip>
+  );
+}
+
+/** 0260 — 套餐 membership(pro/ultra/free)+ 账期到期日。 */
+export function CursorPlanCell({ a }: { a: AccountRow }) {
+  if (a.provider !== "cursor") return <span className="text-faint">—</span>;
+  const membership = a.cursor_plan_membership ?? null;
+  const end = a.cursor_billing_cycle_end ?? null;
+  if (!membership && !end) return <span className="text-faint">—</span>;
+  return (
+    <div className="flex flex-col gap-0.5 leading-tight">
+      {membership ? <span className="text-[12px]">{membership}</span> : null}
+      {end ? (
+        <Tooltip content={`账期到期 ${fmtDateTime(end)}`}>
+          <span className="font-mono text-[11px] text-muted">
+            <ResetCell resetsAt={end} />
+          </span>
+        </Tooltip>
+      ) : null}
+    </div>
+  );
+}

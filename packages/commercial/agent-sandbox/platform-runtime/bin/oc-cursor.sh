@@ -41,7 +41,8 @@ for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
   /usr/bin/mktemp /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat \
   /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/mv /bin/date /bin/ln \
   /usr/bin/cut /usr/bin/find /usr/bin/mkfifo /usr/bin/sha256sum \
-  /usr/bin/tail /usr/bin/tee /usr/bin/curl /usr/bin/flock /usr/bin/sort; do
+  /usr/bin/tail /usr/bin/tee /usr/bin/curl /usr/bin/flock /usr/bin/sort \
+  /usr/bin/od /usr/bin/tr; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
@@ -607,6 +608,43 @@ if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null \
     || sand_sidecar_text=""
 fi
 
+# 0260 — .slot-weight sidecar: `name <int 1..10000>`, first-touch selection
+# weight derived from each account's Sand usage / reset / plan expiry. No
+# secrets. Missing sidecar or missing slot → weight 1 (uniform fallback).
+weight_sidecar_text=""
+if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.slot-weight" 2>/dev/null \
+  || /usr/bin/test -f "$auth_dir/.slot-weight" 2>/dev/null; then
+  weight_sidecar_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.slot-weight" 2>/dev/null) \
+    || weight_sidecar_text=$(/bin/cat -- "$auth_dir/.slot-weight" 2>/dev/null) \
+    || weight_sidecar_text=""
+fi
+weight_for_key() {
+  _weight_target=$1
+  _weight_value=1
+  while IFS= read -r _weight_line || [ -n "$_weight_line" ]; do
+    case "$_weight_line" in ''|'#'*) continue ;; esac
+    _weight_name=${_weight_line%% *}
+    _weight_rest=${_weight_line#"$_weight_name"}
+    _weight_rest=${_weight_rest# }
+    _weight_rest=${_weight_rest%% *}
+    if [ "$_weight_name" = "$_weight_target" ]; then
+      case "$_weight_rest" in
+        ''|*[!0-9]*) _weight_value=1 ;;
+        *)
+          if [ "${#_weight_rest}" -le 5 ] && [ "$_weight_rest" -ge 1 ] && [ "$_weight_rest" -le 10000 ]; then
+            _weight_value=$_weight_rest
+          else
+            _weight_value=1
+          fi
+          ;;
+      esac
+    fi
+  done <<WEIGHT_LOOKUP
+$weight_sidecar_text
+WEIGHT_LOOKUP
+  printf '%s\n' "$_weight_value"
+}
+
 # 0257 — .credential-kind sidecar: `name api_key|session machineId|-`.
 # A `session` slot holds a Cursor account session accessToken (Sand-only);
 # it must never be handed to the native CLI as CURSOR_API_KEY.
@@ -664,18 +702,34 @@ SAND_LOOKUP
 # interchangeable account sessions with independent Cursor quotas, so the
 # "primary first, extras are failover" policy above would pile every user onto
 # slot 1 and leave the rest idle. When every eligible slot is Sand-enabled and
-# the container carries its owner uid, rank the slots by a rendezvous hash of
-# (uid, account id): the same user keeps landing on the same account (Cursor
-# prompt cache, one account's rate limit per user), different users spread
-# uniformly, and adding/removing an account only moves the users that hashed
-# to it. The failed-account cooldown written by rotation_advance still applies:
-# the ranked walk skips that account until the cooldown elapses, then returns.
-# Legacy pools (no identities), mixed native/Sand pools and single-slot pools
-# keep the byte-identical primary-first path. The uid is a plain integer from
-# the sandbox supervisor, never a secret; it never reaches the CLI child.
+# the container carries its owner uid:
+#
+#   1. If this user already has a sticky account (per-user file, keyed by
+#      account id — survives slot renumbering and pool generations) and that
+#      account is still eligible and not under failure cooldown, use it. The
+#      same user keeps landing on the same account (Cursor prompt cache, one
+#      account's rate limit per user) regardless of later weight changes.
+#   2. Otherwise (first touch, account removed, or the sticky account is under
+#      cooldown) draw ONE eligible account with probability proportional to
+#      its `.slot-weight` (0260: more Sand headroom / sooner weekly reset /
+#      sooner plan expiry → higher weight; missing sidecar → uniform), persist
+#      it as the new sticky account and use it. A cooldown-driven redraw is
+#      persisted too: after a real credential failure the user stays on the
+#      healthy account instead of bouncing back when the cooldown elapses.
+#
+# The draw is seeded from /dev/urandom, so it is not a pure function of the
+# uid; determinism per user comes from the sticky file. Legacy pools (no
+# identities), mixed native/Sand pools and single-slot pools keep the
+# byte-identical primary-first path. The uid is a plain integer from the
+# sandbox supervisor, never a secret; it never reaches the CLI child.
 sticky_user=${OC_USER_ID:-}
 case "$sticky_user" in ''|*[!0-9]*) sticky_user="" ;; esac
 [ "${#sticky_user}" -le 12 ] || sticky_user=""
+sticky_file=""
+if [ -n "$sticky_user" ]; then
+  sticky_dir=${OC_CURSOR_STICKY_DIR:-${OPENCLAUDE_HOME:-/tmp}/runtime/cursor-sticky}
+  sticky_file=$sticky_dir/user-$sticky_user
+fi
 sticky_pool=0
 if [ -n "$sticky_user" ] && [ "$eligible_count" -gt 1 ] \
   && [ "$pool_generation" != legacy ] && [ -n "$sand_sidecar_text" ]; then
@@ -737,40 +791,78 @@ if [ "$eligible_count" -gt 1 ]; then
     fi
   fi
   if [ "$sticky_pool" -eq 1 ]; then
-    # Rendezvous (highest-random-weight) hashing over the eligible Sand slots:
-    # rank = sha256("<uid>:<accountId>"), lowest wins. Skip the account that is
-    # under failure cooldown for this model family; with >= 2 eligible slots
-    # and one cooled-down account there is always a ranked successor.
+    # Skip the account that is under failure cooldown for this model family;
+    # with >= 2 eligible slots and one cooled-down account there is always
+    # another candidate.
     cooled_account=0
     if [ "$rotation_version" = v2 ] && [ "$rotation_family" = "$cursor_family" ] \
       && [ "$(/bin/date +%s)" -lt "$rotation_exp" ]; then
       cooled_account=$rotation_failed_account
     fi
-    sticky_best_rank=""
-    sticky_best_position=0
-    sticky_fallback_rank=""
-    sticky_fallback_position=0
+    # 1. Existing sticky account for this user (file holds the account id).
+    sticky_account=""
+    if [ -n "$sticky_file" ] && [ -f "$sticky_file" ]; then
+      sticky_account=$(/bin/cat -- "$sticky_file" 2>/dev/null) || sticky_account=""
+      sticky_account=${sticky_account%%[!0-9]*}
+      case "$sticky_account" in ''|*[!0-9]*) sticky_account="" ;; esac
+      [ "${#sticky_account}" -le 20 ] || sticky_account=""
+    fi
+    sticky_position=0
+    sticky_total_weight=0
+    sticky_candidates=0
     slot_position=0
     for key_name in $eligible_names; do
       slot_position=$((slot_position + 1))
       slot_account=$(identity_account_for_key "$key_name" 2>/dev/null) || slot_account=0
       [ "$slot_account" != 0 ] || die "Cursor pool account identity is unavailable"
-      slot_rank=$(printf '%s:%s' "$sticky_user" "$slot_account" | /usr/bin/sha256sum | /usr/bin/cut -c1-16)
-      if [ -z "$sticky_fallback_rank" ] || [ "$slot_rank" \< "$sticky_fallback_rank" ]; then
-        sticky_fallback_rank=$slot_rank
-        sticky_fallback_position=$slot_position
-      fi
       [ "$slot_account" != "$cooled_account" ] || continue
-      if [ -z "$sticky_best_rank" ] || [ "$slot_rank" \< "$sticky_best_rank" ]; then
-        sticky_best_rank=$slot_rank
-        sticky_best_position=$slot_position
+      sticky_candidates=$((sticky_candidates + 1))
+      if [ -n "$sticky_account" ] && [ "$slot_account" = "$sticky_account" ]; then
+        sticky_position=$slot_position
       fi
+      sticky_total_weight=$((sticky_total_weight + $(weight_for_key "$key_name")))
     done
-    if [ "$sticky_best_position" -gt 0 ]; then
-      rotation_idx=$((sticky_best_position - 1))
-    else
-      rotation_idx=$((sticky_fallback_position - 1))
+    if [ "$sticky_position" -eq 0 ]; then
+      # 2. First touch / sticky account gone or cooling: weighted draw.
+      if [ "$sticky_candidates" -eq 0 ]; then
+        # Every eligible account is the cooled one (cannot happen with >= 2
+        # eligible slots and a single cooled account); fall back to slot 1.
+        sticky_position=1
+      else
+        sticky_random=$(/usr/bin/od -An -N4 -tu4 /dev/urandom 2>/dev/null | /usr/bin/tr -d ' \n') || sticky_random=""
+        case "$sticky_random" in ''|*[!0-9]*) sticky_random=$(/bin/date +%s) ;; esac
+        [ "${#sticky_random}" -le 10 ] || sticky_random=${sticky_random#?}
+        sticky_target=$((sticky_random % sticky_total_weight))
+        sticky_running=0
+        slot_position=0
+        for key_name in $eligible_names; do
+          slot_position=$((slot_position + 1))
+          slot_account=$(identity_account_for_key "$key_name" 2>/dev/null) || slot_account=0
+          [ "$slot_account" != "$cooled_account" ] || continue
+          sticky_running=$((sticky_running + $(weight_for_key "$key_name")))
+          if [ "$sticky_target" -lt "$sticky_running" ]; then
+            sticky_position=$slot_position
+            sticky_account=$slot_account
+            break
+          fi
+        done
+        [ "$sticky_position" -gt 0 ] || sticky_position=1
+      fi
+      # Persist (best-effort; a read-only dir just means a redraw next turn).
+      if [ -n "$sticky_file" ] && [ -n "$sticky_account" ]; then
+        /bin/mkdir -p -- "$sticky_dir" 2>/dev/null || :
+        sticky_tmp=$(/usr/bin/mktemp "$sticky_dir/.user-$sticky_user.XXXXXXXX" 2>/dev/null) || sticky_tmp=""
+        if [ -n "$sticky_tmp" ]; then
+          if printf '%s\n' "$sticky_account" > "$sticky_tmp" 2>/dev/null; then
+            /bin/mv -f -- "$sticky_tmp" "$sticky_file" 2>/dev/null || /bin/rm -f -- "$sticky_tmp" 2>/dev/null || :
+          else
+            /bin/rm -f -- "$sticky_tmp" 2>/dev/null || :
+          fi
+        fi
+        echo "oc-cursor: sticky Cursor account assigned (weighted first touch)" >&2
+      fi
     fi
+    rotation_idx=$((sticky_position - 1))
   fi
   chosen_slot=$((rotation_idx + 1))
   slot_position=0
