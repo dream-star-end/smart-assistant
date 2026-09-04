@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { ChatMessage } from "./model";
-import { repairPostFinalProcessOrder } from "./order";
+import { repairPostFinalProcessOrder, sinkOpenPermissionPrompts } from "./order";
 
 function row(id: string, role: ChatMessage["role"], over: Partial<ChatMessage> = {}): ChatMessage {
   return { id, role, text: id, ts: 1, ...over };
@@ -167,5 +167,61 @@ describe("repairPostFinalProcessOrder", () => {
     expect(repaired.map((message) => message.id)).toEqual(["u1", "g-before", "p-after", "a1"]);
     expect(repaired[1]).toBe(before);
     expect(repaired[2]).toBe(after);
+  });
+});
+
+describe("sinkOpenPermissionPrompts (INC-20260904-EXITPLAN-PROMPT-BURIED)", () => {
+  const NOW = 1_000_000;
+
+  test("an open prompt buried under replayed process rows sinks to its turn tail", () => {
+    const user = row("u1", "user");
+    const prompt = row("p1", "permission", { _turnOwnerId: "u1", _resolved: false, ts: 10 });
+    const t1 = row("t1", "thinking", { _clientMessageId: "u1", _source: "server", ts: 2 });
+    const a1 = row("a1", "assistant", { _clientMessageId: "u1", _source: "server", ts: 3 });
+    const tool = row("k1", "tool", { _clientMessageId: "u1", _source: "server", ts: 4 });
+    const input = [user, prompt, t1, a1, tool];
+
+    const out = sinkOpenPermissionPrompts(input, NOW);
+
+    expect(out.map((m) => m.id)).toEqual(["u1", "t1", "a1", "k1", "p1"]);
+    expect(input.map((m) => m.id)).toEqual(["u1", "p1", "t1", "a1", "k1"]);
+    expect(sinkOpenPermissionPrompts(out, NOW)).toBe(out);
+  });
+
+  test("never crosses into the next user turn and keeps multi-prompt relative order", () => {
+    const rows = [
+      row("u1", "user"),
+      row("p1", "permission", { _resolved: false, ts: 1 }),
+      row("t1", "thinking", { ts: 2 }),
+      row("p2", "permission", { _resolved: false, ts: 3 }),
+      row("t2", "thinking", { ts: 4 }),
+      row("u2", "user"),
+      row("t3", "thinking", { ts: 5 }),
+    ];
+    expect(sinkOpenPermissionPrompts(rows, NOW).map((m) => m.id)).toEqual([
+      "u1", "t1", "t2", "p1", "p2", "u2", "t3",
+    ]);
+  });
+
+  test("resolved, expired or server-authored prompts stay put; clean input is zero-copy", () => {
+    const rows = [
+      row("u1", "user"),
+      row("p-resolved", "permission", { _resolved: true }),
+      row("p-expired", "permission", { _resolved: false, _askUserExpiresAt: NOW - 1 }),
+      row("p-server", "permission", { _resolved: false, _source: "server" }),
+      row("t1", "thinking"),
+    ];
+    expect(sinkOpenPermissionPrompts(rows, NOW)).toBe(rows);
+    const tail = [row("u1", "user"), row("t1", "thinking"), row("p1", "permission", { _resolved: false })];
+    expect(sinkOpenPermissionPrompts(tail, NOW)).toBe(tail);
+  });
+
+  test("repairPostFinalProcessOrder applies the sink on every rebuild path", () => {
+    const rows = [
+      row("u1", "user", { _orderSeq: 1, _source: "server" }),
+      row("p1", "permission", { _turnOwnerId: "u1", _resolved: false, ts: 10 }),
+      row("t1", "thinking", { _clientMessageId: "u1", _source: "server", _orderSeq: 2, ts: 2 }),
+    ];
+    expect(repairPostFinalProcessOrder(rows).map((m) => m.id)).toEqual(["u1", "t1", "p1"]);
   });
 });
