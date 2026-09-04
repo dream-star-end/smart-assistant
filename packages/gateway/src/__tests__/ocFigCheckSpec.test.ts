@@ -3,8 +3,8 @@
  *
  * 两层:
  *  1) figSpec.checkSpec 纯函数:悬空/断链/成环、连线端点未声明、目标在波束锥外、
- *     同组混量纲、大跨度条长不按 log10 归一、缺单位、缺标签、标签 bbox 相交——各必须
- *     产出 fail 级 issue;合法 spec 零 fail。
+ *     同组混量纲、大跨度条长不按 log10 归一、缺单位、缺标签、标签 bbox 相交、
+ *     图例 bbox 与标题相交——各必须产出 fail 级 issue;合法 spec 零 fail。
  *  2) CLI E2E(fake codex stub,同 ocControlCliE2e 模式):--spec 合法 PASS / 违规 FAIL /
  *     坏 JSON FAIL / **无 --spec 时输出结构与旧版完全一致(golden 防回归)**。
  */
@@ -152,6 +152,20 @@ describe('figSpec.checkSpec 确定性物理检查', () => {
     const spec = validPhasedArraySpec()
     spec.labels!.push({ for: 'ghost', text: '?', bbox: [[0, 0], [0.5, 0.5]] })
     assert.ok(fails(spec, 'label-bbox') >= 1)
+  })
+
+  test('R4b 图例 bbox 与标题相交 → FAIL', () => {
+    const spec = validPhasedArraySpec()
+    spec.title = { text: '相控阵干涉观测示意', bbox: [[3.0, 9.0], [7.0, 9.6]] }
+    spec.legend = { bbox: [[3.2, 8.9], [5.2, 9.5]] } // 压在标题上;不碰标签(y<=7.3)与对象锚点
+    assert.equal(fails(spec, 'legend-overlap'), 1)
+  })
+
+  test('R4b 图例锚在空白区(让开标题/标签/对象锚点)→ 零 fail', () => {
+    const spec = validPhasedArraySpec()
+    spec.title = { text: '相控阵干涉观测示意', bbox: [[3.0, 12.8], [7.0, 13.4]] }
+    spec.legend = { bbox: [[11.0, 10.0], [13.5, 11.2]] } // 右上空白区,与标题/标签/锚点都不相交
+    assert.equal(checkSpec(spec).filter((i) => i.severity === 'fail').length, 0)
   })
 
   test('R5 objects 为空 / id 重复 → FAIL', () => {

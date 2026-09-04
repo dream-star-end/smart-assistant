@@ -130,7 +130,12 @@ def build_elevation(p: argparse.Namespace, pal: dict) -> Scene:
     sc.add(Text(cx - 0.45, min(dish_top + 0.42, h - 0.55), f"抛物面 D={p.diameter_m:g} m",
                 size_pt=8, anchor="right", for_id="dish"))
     spec["objects"].append({"id": "feed", "type": "feed", "anchor": [round(focus[0], 4), round(focus[1], 4)], "supports": "dish"})
-    sc.add(Text(focus[0] + 0.35, focus[1] + 0.42, "馈源", size_pt=8, anchor="left", for_id="feed"))
+    # 馈源标签外移到馈源斜下方(让开波束虚线与支撑腿),短线引回馈源圆点
+    sc.add(
+        Text(focus[0] - 0.45, focus[1] - 0.38, "馈源", size_pt=8, anchor="right", for_id="feed"),
+        Polyline([(focus[0] - 0.34, focus[1] - 0.29), (focus[0] - 0.15, focus[1] - 0.13)],
+                 color=pal["second"], lw_pt=0.5),
+    )
 
     # 波束方向:馈源沿轴(开口朝向)虚线箭头,长度裁到画布内
     t_max = min(
@@ -142,6 +147,8 @@ def build_elevation(p: argparse.Namespace, pal: dict) -> Scene:
                     label=f"波束方向({p.elevation_deg:g}°)"))
     sc.legend = True
     sc.legend_loc = "upper left"
+    # 锚到标题带下方的左上空白区(默认几何下该处无对象/标签;偏离默认参数由 --spec 门拦截)
+    sc.legend_anchor = (0.55, h - 1.1)
     # 波束=方向指示,以对象关系入 spec(from/to 均已声明,过端点检查)
     spec["links"].append({"id": "beam-dir", "from": "feed", "to": "dish", "kind": "boresight"})
 

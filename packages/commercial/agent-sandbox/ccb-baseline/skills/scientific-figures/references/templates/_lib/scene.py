@@ -44,13 +44,17 @@ class Text:
     for_id: str | None = None  # 非 None 时把 bbox 记入 spec.labels[fid](供 figcheck 标签检查)
 
 
+def _text_width_cm(s: str, size_pt: float) -> float:
+    """全角字符宽 ≈ 1.0×size,半角 ≈ 0.58×size(text_bbox_cm 与图例/标题估计共用)。"""
+    return sum(1.0 if ord(c) > 0x2E7F else 0.58 for c in s) * size_pt * PT2CM
+
+
 def text_bbox_cm(t: Text) -> tuple[float, float, float, float]:
     """估文字包围盒(cm),mpl/pptx/spec 三处共用同一估计,保证标签检查与渲染一致。
 
-    全角字符宽 ≈ 1.0×size,半角 ≈ 0.58×size;行高 ≈ 1.3×size(保守,利于遮挡检查)。
+    行高 ≈ 1.3×size(保守,利于遮挡检查)。
     """
-    width_pt = sum(1.0 if ord(c) > 0x2E7F else 0.58 for c in t.s) * t.size_pt
-    w = width_pt * PT2CM
+    w = _text_width_cm(t.s, t.size_pt)
     h = 1.3 * t.size_pt * PT2CM
     if t.anchor == "left":
         x0 = t.x
@@ -94,6 +98,9 @@ class Scene:
     texts: list[Text] = field(default_factory=list)
     legend: bool = False
     legend_loc: str = "upper right"
+    # 图例锚点角(legend_loc 指定那个角)的数据坐标(cm);None=按 legend_loc 贴画布边内缩。
+    # 显式锚定后 mpl 的图例与 spec 声明的 bbox 落在同一处,遮挡检查与渲染一致。
+    legend_anchor: tuple[float, float] | None = None
     # spec 元信息;objects/links/magnitudes 在几何函数里填,labels 由 finalize 自动补
     spec_meta: dict = field(default_factory=lambda: {"template": "", "kind": "schematic"})
     spec: dict = field(default_factory=lambda: {"objects": [], "links": [], "magnitudes": [], "labels": []})
@@ -108,6 +115,15 @@ class Scene:
                 self.texts.append(it)
             else:
                 raise TypeError(f"scene.add: 不支持的元素 {type(it)}")
+
+    def legend_anchor_cm(self) -> tuple[float, float]:
+        """图例锚点角的数据坐标;未显式指定时按 legend_loc 贴画布边内缩 0.35cm。"""
+        if self.legend_anchor is not None:
+            return self.legend_anchor
+        inset = 0.35
+        x = inset if "left" in self.legend_loc else (self.w_cm - inset if "right" in self.legend_loc else self.w_cm / 2)
+        y = self.h_cm - inset if "upper" in self.legend_loc else inset
+        return (x, y)
 
     def finalize_spec(self) -> dict:
         """把 for_id 文字的 bbox 收进 spec.labels,并补 meta 字段。"""
@@ -130,7 +146,53 @@ class Scene:
             spec["labels"].append(
                 {"id": f"lbl-{t.for_id}", "for": t.for_id, "text": t.s, "bbox": [[x0, y0], [x1, y1]]}
             )
+        tb = title_bbox_cm(self)
+        if tb:
+            spec["title"] = {"text": self.title, "bbox": [[round(tb[0], 4), round(tb[1], 4)], [round(tb[2], 4), round(tb[3], 4)]]}
+        lb = legend_bbox_cm(self)
+        if lb:
+            spec["legend"] = {"bbox": [[round(lb[0], 4), round(lb[1], 4)], [round(lb[2], 4), round(lb[3], 4)]]}
         return spec
+
+
+LEGEND_FONT_PT = 8.0  # 与 mpl_render 渲染图例的 fontsize 一致
+TITLE_FONT_PT = 11.0  # 与 mpl_render/pptx_render 渲染标题的字号一致
+
+
+def title_bbox_cm(scene: Scene) -> tuple[float, float, float, float] | None:
+    """估标题包围盒(cm):顶部居中、va=top(mpl_render/pptx_render 同一摆法)。"""
+    if not scene.title:
+        return None
+    w = _text_width_cm(scene.title, TITLE_FONT_PT)
+    h = 1.3 * TITLE_FONT_PT * PT2CM
+    cx, top = scene.w_cm / 2, scene.h_cm - 0.35
+    return (cx - w / 2, top - h, cx + w / 2, top)
+
+
+def legend_bbox_cm(scene: Scene) -> tuple[float, float, float, float] | None:
+    """估图例包围盒(cm,保守偏大):锚点角精确、外扩边保守,保证估计 ⊇ 实际渲染。
+
+    宽 = 样条(handlelength+handletextpad ≈ 2.5×字号) + 最长条目文字 + 2×边距;
+    高 = 行数×1.4×字号 + 2×边距(边距取 2×borderpad 再加余量,frameon=False 实际更小)。
+    供 spec.legend.bbox 供 oc-figcheck --spec 遮挡检查,与 mpl 实际摆放共用锚点。
+    """
+    entries = [pl.label for pl in scene.polylines if pl.label]
+    if not scene.legend or not entries:
+        return None
+    pad = 0.35
+    handle = 2.5 * LEGEND_FONT_PT * PT2CM
+    text_w = max(_text_width_cm(e, LEGEND_FONT_PT) for e in entries)
+    w = handle + text_w + 2 * pad
+    h = len(entries) * 1.4 * LEGEND_FONT_PT * PT2CM + 2 * pad
+    ax_, ay_ = scene.legend_anchor_cm()
+    x0 = ax_ if "left" in scene.legend_loc else (ax_ - w if "right" in scene.legend_loc else ax_ - w / 2)
+    if "upper" in scene.legend_loc:
+        y1 = ay_
+        y0 = y1 - h
+    else:
+        y0 = ay_
+        y1 = y0 + h
+    return (x0, y0, x0 + w, y1)
 
 
 def palette(style: str) -> dict[str, str]:

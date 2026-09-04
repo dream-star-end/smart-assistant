@@ -11,6 +11,7 @@
  *   R2 link-endpoints    连线端点必须命中声明对象;must_be_in_beam_of 用锥几何点积判定
  *   R3 magnitude-unit    同组量纲必须一致;同组跨度>10² 时条长必须按 log10 归一
  *   R4 label-bbox        每个非辅助对象必须有标签;标签 bbox 两两相交>20% 违规
+ *   R4b legend-overlap   图例 bbox 与标题相交、与标签相交>20%、覆盖对象锚点 → 违规
  *   R5 structure         objects 非空、id 唯一、数值 finite
  *
  * 本文件为纯函数(不读图、不 IO),单测见 __tests__/ocFigCheckSpec.test.ts;
@@ -62,6 +63,17 @@ export interface FigSpecLabel {
   bbox?: FigSpecBox
 }
 
+/** 图例包围盒声明(模板伴生;声明了才做遮挡检查,不声明=向后兼容不校验) */
+export interface FigSpecLegend {
+  bbox?: FigSpecBox
+}
+
+/** 标题包围盒声明 */
+export interface FigSpecTitle {
+  text?: string
+  bbox?: FigSpecBox
+}
+
 export interface FigSpec {
   template?: string
   kind?: string
@@ -71,6 +83,8 @@ export interface FigSpec {
   links?: FigSpecLink[]
   magnitudes?: FigSpecMagnitude[]
   labels?: FigSpecLabel[]
+  legend?: FigSpecLegend
+  title?: FigSpecTitle
 }
 
 export type SpecIssueSeverity = 'fail' | 'warn'
@@ -120,6 +134,15 @@ function bboxOverlapFrac(a: FigSpecBox, b: FigSpecBox): number {
   if (ix <= 0 || iy <= 0) return 0
   const inter = ix * iy
   return inter / Math.max(Math.min(bboxArea(a), bboxArea(b)), 1e-12)
+}
+
+/** box 结构与数值合法性(spec 里的 bbox 都是可选声明,先验后用)。 */
+function isFiniteBox(box: FigSpecBox | undefined): box is FigSpecBox {
+  if (!Array.isArray(box) || box.length !== 2) return false
+  for (const corner of box) {
+    if (!Array.isArray(corner) || corner.length !== 2 || corner.some((n) => typeof n !== 'number' || !Number.isFinite(n))) return false
+  }
+  return true
 }
 
 /** R1:支撑链接地检查。 */
@@ -314,6 +337,33 @@ function checkLabels(spec: FigSpec, byId: Map<string, FigSpecObject>): SpecIssue
   return issues
 }
 
+/** R4b:图例包围盒遮挡(legend↔title / legend↔labels / legend↔对象锚点)。 */
+function checkLegend(spec: FigSpec): SpecIssue[] {
+  const issues: SpecIssue[] = []
+  const legend = spec.legend?.bbox
+  if (!isFiniteBox(legend)) return issues // 未声明图例 bbox:不校验(向后兼容)
+  const title = spec.title?.bbox
+  if (isFiniteBox(title) && bboxOverlapFrac(legend, title) > 0) {
+    issues.push(issue('legend-overlap', `图例包围盒与标题相交:图例必须让开标题(锚到空白区或图外)。`))
+  }
+  for (const lbl of spec.labels ?? []) {
+    if (!isFiniteBox(lbl.bbox)) continue
+    const frac = bboxOverlapFrac(legend, lbl.bbox)
+    if (frac > LABEL_OVERLAP_FRAC) {
+      issues.push(issue('legend-overlap', `图例与 '${lbl.for}' 的标签交叠 ${(frac * 100).toFixed(0)}%(>${LABEL_OVERLAP_FRAC * 100}%):图例遮挡标注。`))
+    }
+  }
+  for (const obj of spec.objects ?? []) {
+    if (obj.type && LABEL_EXEMPT_TYPES.has(obj.type)) continue // 地面/基座是背景元素,锚点落在图例下属正常
+    const a = obj.anchor
+    if (!Array.isArray(a) || typeof a[0] !== 'number' || typeof a[1] !== 'number') continue
+    if (a[0] > legend[0][0] && a[0] < legend[1][0] && a[1] > legend[0][1] && a[1] < legend[1][1]) {
+      issues.push(issue('legend-overlap', `图例覆盖对象 '${obj.id}' 的锚点:图例压在对象上,请移到空白区。`))
+    }
+  }
+  return issues
+}
+
 /** 入口:对一个 FigureSpec 做全部确定性检查。 */
 export function checkSpec(spec: FigSpec): SpecIssue[] {
   const issues: SpecIssue[] = []
@@ -333,6 +383,7 @@ export function checkSpec(spec: FigSpec): SpecIssue[] {
   issues.push(...checkLinks(spec, byId))
   issues.push(...checkMagnitudes(spec))
   issues.push(...checkLabels(spec, byId))
+  issues.push(...checkLegend(spec))
   return issues
 }
 

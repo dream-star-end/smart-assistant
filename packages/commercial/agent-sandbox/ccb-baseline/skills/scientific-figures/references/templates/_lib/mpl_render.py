@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 import sys
 
@@ -53,11 +54,19 @@ def render_mpl(scene: Scene, out_png: str, style: str = "color", also_svg: bool 
             solid_capstyle="round",
         )
         if line.arrow_end:
+            # 箭头 overlay 只画末端 0.35cm(基本就是三角头本身):线型/虚线相位由 plot
+            # 的完整线段负责,避免 annotate 整段重画虚线造成相位错位、看起来像实线。
+            px, py = (xs[-2], ys[-2]) if len(xs) > 1 else (xs[-1], ys[-1])
+            qx, qy = xs[-1], ys[-1]
+            seg = math.hypot(qx - px, qy - py)
+            if seg > 0.4:
+                px, py = qx - 0.35 * (qx - px) / seg, qy - 0.35 * (qy - py) / seg
             ax.annotate(
                 "",
-                xy=(xs[-1], ys[-1]),
-                xytext=(xs[-2] if len(xs) > 1 else xs[-1], ys[-2] if len(ys) > 1 else ys[-1]),
-                arrowprops=dict(arrowstyle="-|>", color=line.color, lw=line.lw_pt),
+                xy=(qx, qy),
+                xytext=(px, py),
+                arrowprops=dict(arrowstyle="-|>", color=line.color, lw=line.lw_pt,
+                                linestyle=line.dash or "-", shrinkA=0, shrinkB=0),
             )
 
     for t in scene.texts:
@@ -69,7 +78,10 @@ def render_mpl(scene: Scene, out_png: str, style: str = "color", also_svg: bool 
     if scene.legend:
         handles, labels = ax.get_legend_handles_labels()
         if handles:
-            ax.legend(handles, labels, loc=scene.legend_loc, frameon=False, fontsize=8)
+            # 锚点角用数据坐标(cm):图例实际落点与 spec.legend.bbox 的声明共用同一锚
+            # (scene.legend_anchor_cm),遮挡检查(legend↔title/labels/objects)与渲染一致。
+            ax.legend(handles, labels, loc=scene.legend_loc, bbox_to_anchor=scene.legend_anchor_cm(),
+                      bbox_transform=ax.transData, frameon=False, fontsize=8)
 
     fig.savefig(out_png, dpi=300)
     if also_svg:

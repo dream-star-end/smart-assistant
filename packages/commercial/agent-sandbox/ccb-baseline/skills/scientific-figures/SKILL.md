@@ -1,6 +1,6 @@
 ---
 name: scientific-figures
-description: 科研图表规范与**闭环出图工作流**。出图后必须用 `oc-figcheck` 回看自纠(看到重叠/裁切/取景空/背景异常再改),直到 PASS。按图类型选对确定性工具:数据图=matplotlib+SciencePlots/seaborn;网络关系图=networkx+graphviz;复杂热图=PyComplexHeatmap;组合集合=UpSetPlot/venn;精密示意/机制图=Typst+CeTZ(矢量);简单流程=Mermaid;3D工程装置图=matplotlib-3D(信息优先)+闭环。**领域示意图(测站/天线/相控阵观测/雷达链路/光通信/误差预算)优先套参数化模板**并带 `--spec` 过物理一致性门(悬空/指向错/量级混轴确定性 FAIL);PPT 配图用模板 `--backend pptx` 出**可编辑原生 shapes**;期刊黑白/彩色双版样式一键叠加。**严禁生成式 AI 插画**。要给报告/论文/PPT 配图、画数据图/网络图/示意图/装置图时使用。
+description: 科研图表规范与**闭环出图工作流**。出图后必须用 `oc-figcheck` 回看自纠(看到重叠/裁切/取景空/背景异常再改),直到 PASS。按图类型选对确定性工具:数据图=matplotlib+SciencePlots/seaborn;网络关系图=networkx+graphviz;复杂热图=PyComplexHeatmap;组合集合=UpSetPlot/venn;精密示意/机制图=Typst+CeTZ(矢量);简单流程=Mermaid;3D工程装置图=matplotlib-3D(信息优先)+闭环。**领域示意图(测站/天线/相控阵观测/雷达链路/光通信/误差预算)优先套参数化模板**并带 `--spec` 过物理一致性门(悬空/指向错/量级混轴/图例遮挡确定性 FAIL);PPT 配图用模板 `--backend pptx` 出**可编辑原生 shapes**;期刊黑白/彩色双版样式一键叠加。**严禁生成式 AI 插画**。要给报告/论文/PPT 配图、画数据图/网络图/示意图/装置图时使用。
 tags: [research, figures, matplotlib, scienceplots, seaborn, networkx, typst, cetz, figcheck, figspec, pptx, journal-style]
 priority: 5
 ---
@@ -58,7 +58,7 @@ oc-figcheck /home/agent/.openclaude/research/<id>/obs.png --kind schematic --spe
 
 ### 2b. 领域模板优先(测站/天线/观测几何/链路/误差预算)
 
-命中下表领域的示意图,**先套模板改参数,不要从零手摆坐标**——曾有用户为一张相控阵观测示意图返工 10 轮(波束指向画错、连线进基线不进波束),根因就是 LLM 心算坐标。模板构造保证物理关系,伴生 `fig.spec.json` 让 figcheck **确定性**抓悬空/指向错/量级错:
+命中下表领域的示意图,**先套模板改参数,不要从零手摆坐标**——曾有用户为一张相控阵观测示意图返工 10 轮(波束指向画错、连线进基线不进波束),根因就是 LLM 心算坐标。模板构造保证物理关系,伴生 `fig.spec.json` 让 figcheck **确定性**抓悬空/指向错/量级错/图例遮挡:
 
 | 领域 | 模板(`references/templates/`) |
 |---|---|

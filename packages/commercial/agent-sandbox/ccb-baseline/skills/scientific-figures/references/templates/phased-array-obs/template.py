@@ -160,6 +160,8 @@ def build(p: argparse.Namespace, pal: dict) -> Scene:
                               "from": f"mount-{panels[i][0]}", "to": f"mount-{panels[i + 1][0]}", "kind": "baseline"})
     sc.legend = True
     sc.legend_loc = "upper right"
+    # 锚到右上空白区:让开居中标题带与卫星标签(不同参数下越界由 --spec 门拦截)
+    sc.legend_anchor = (w - 0.45, h - 1.05)
     sc.spec_meta = {"template": "phased-array-obs", "kind": "schematic", "units": "m",
                     "scene": {"grounding": "required"}}
     return sc
