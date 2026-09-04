@@ -2756,31 +2756,35 @@ export function App() {
   }
   if (!demo && (!auth || !user)) {
     return (
-      <AuthGate
-        onLogin={login}
-        onRegister={register}
-        onVerifyEmail={verifyEmail}
-        onResendVerification={resendVerification}
-        onRequestReset={requestReset}
-        onConfirmReset={confirmReset}
-        loading={authLoading}
-        error={authError}
-        onRetrySession={authRecoveryAvailable ? retryBoot : undefined}
-        onBack={() => {
-          if (authRecoveryAvailable) clearAuth();
-          setAuthMode("login");
-          setView("home");
-        }}
-        theme={theme}
-        onCycleTheme={cycle}
-        turnstileBypass={publicCfg?.turnstileBypass}
-        turnstileSiteKey={publicCfg?.turnstileSiteKey}
-        onRetryPublicConfig={() => setPublicCfgRetryNonce((n) => n + 1)}
-        allowRegistration={publicCfg?.allowRegistration ?? true}
-        requireEmailVerified={publicCfg?.requireEmailVerified ?? false}
-        initialMode={authMode}
-        resetToken={resetToken}
-      />
+      // 首页(Landing)固定深色,登录页跟随系统主题:系统浅色时直切会闪白。
+      // 外层容器挂 animate-in(styles.css 的 fade-up 0.32s)把硬切柔化成整页淡入。
+      <div className="h-full animate-in">
+        <AuthGate
+          onLogin={login}
+          onRegister={register}
+          onVerifyEmail={verifyEmail}
+          onResendVerification={resendVerification}
+          onRequestReset={requestReset}
+          onConfirmReset={confirmReset}
+          loading={authLoading}
+          error={authError}
+          onRetrySession={authRecoveryAvailable ? retryBoot : undefined}
+          onBack={() => {
+            if (authRecoveryAvailable) clearAuth();
+            setAuthMode("login");
+            setView("home");
+          }}
+          theme={theme}
+          onCycleTheme={cycle}
+          turnstileBypass={publicCfg?.turnstileBypass}
+          turnstileSiteKey={publicCfg?.turnstileSiteKey}
+          onRetryPublicConfig={() => setPublicCfgRetryNonce((n) => n + 1)}
+          allowRegistration={publicCfg?.allowRegistration ?? true}
+          requireEmailVerified={publicCfg?.requireEmailVerified ?? false}
+          initialMode={authMode}
+          resetToken={resetToken}
+        />
+      </div>
     );
   }
 
