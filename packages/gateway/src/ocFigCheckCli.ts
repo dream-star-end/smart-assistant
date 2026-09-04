@@ -19,7 +19,13 @@
  *
  * 用法(baseline skill scientific-figures 文档化):
  *   oc-figcheck <image.png> [--kind figure|schematic|network|3d|composite] [--focus "..."]
+ *               [--spec <fig.spec.json>]
  * 输出:JSON(确定性检查 + vision 审图 + 汇总 verdict),末行单独打印 verdict 供程序判读。
+ *
+ * --spec(可选):领域模板伴生的 FigureSpec(objects/links/magnitudes/labels 物理声明)。
+ * 带上后追加**物理一致性门**(figSpec.ts,确定性规则:支撑链接地/连线端点入波束锥/
+ * 量级单位一致与 log10 归一/标签遮挡),违规同确定性硬伤一样 FAIL;并给 vision 审图
+ * 追加 spec 派生的定向核对问句。不带 --spec 时行为与旧版完全一致(向后兼容即开关)。
  *
  * 图片路径必须落在 agent 可信产物区(uploads/generated/research;见 mcpVisionServer
  * 的 VISION_IMAGE_ROOTS),与 oc-vision 同一 SSRF 边界。
@@ -27,6 +33,7 @@
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { DEFAULT_CODEX_ENGINE_MODEL } from '@openclaude/protocol'
+import { checkSpec, parseFigSpec, specFollowUpQuestions, type FigSpec } from './figSpec.js'
 import { resolveVisionInput, runVision } from './mcpVisionServer.js'
 import { exitWithCliHelp, fail, isCliHelpArg, parseFlags } from './ocResearchClient.js'
 
@@ -130,7 +137,7 @@ print(json.dumps({
   }
 }
 
-function auditPrompt(kind: FigKind, focus: string | undefined): string {
+function auditPrompt(kind: FigKind, focus: string | undefined, followUps: string[] = []): string {
   const common = [
     '你是顶刊科研配图审稿专家。这是一张 agent 刚生成、准备放进论文/报告的图。',
     '只依据图像本身,严格找出所有会被审稿人挑剔、或影响读者理解的问题。逐条列出',
@@ -155,6 +162,7 @@ function auditPrompt(kind: FigKind, focus: string | undefined): string {
       '7) 组合/多面板图必检:各子图 (a)(b)(c) 是否有面板编号;子图间是否对齐、间距是否合理、有无互相压盖;共享图例/色标是否清楚。',
   }
   const tail = [
+    ...followUps.map((q) => `定向核对:${q}`),
     focus ? `额外关注:${focus}` : '',
     '若图已达出版级、无重大问题,请只回复以「PASS:」开头的一句结论;',
     '否则先逐条列问题,最后用一句总体结论说明最该先修的 1-2 个问题。',
@@ -166,21 +174,58 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2)
   if (isCliHelpArg(argv[0])) {
     exitWithCliHelp(
-      'usage: oc-figcheck <image.png> [--kind figure|schematic|network|3d|composite] [--focus "..."]',
+      'usage: oc-figcheck <image.png> [--kind figure|schematic|network|3d|composite] [--focus "..."] [--spec <fig.spec.json>]',
     )
   }
   const { positional, flags } = parseFlags(argv)
   const imageFile = positional[0]
-  if (!imageFile) fail(TOOL, 'usage: oc-figcheck <image.png> [--kind figure|schematic|network|3d|composite] [--focus "..."]')
+  if (!imageFile) fail(TOOL, 'usage: oc-figcheck <image.png> [--kind figure|schematic|network|3d|composite] [--focus "..."] [--spec <fig.spec.json>]')
   const kind: FigKind = (KINDS as readonly string[]).includes(flags.kind ?? '')
     ? (flags.kind as FigKind)
     : 'figure'
 
+  // ── --spec:领域模板伴生的物理声明(可选;不传则完全不启用新代码路径)──
+  let spec: FigSpec | undefined
+  let specError: string | undefined
+  if (flags.spec) {
+    let raw: string | undefined
+    try {
+      raw = readFileSync(flags.spec, 'utf8')
+    } catch (e) {
+      specError = `--spec 文件不可读: ${e instanceof Error ? e.message : String(e)}`
+    }
+    if (raw !== undefined) {
+      const parsed = parseFigSpec(raw)
+      if (parsed.error) specError = parsed.error
+      else spec = parsed.spec
+    }
+  }
+  const followUps = spec ? specFollowUpQuestions(spec) : []
+
   // 复用 oc-vision 的路径白名单 + 大小 + 光栅魔数校验(泛化后含 research 目录)。
-  const resolved = resolveVisionInput({ image_file: imageFile, prompt: auditPrompt(kind, flags.focus) })
+  const resolved = resolveVisionInput({ image_file: imageFile, prompt: auditPrompt(kind, flags.focus, followUps) })
 
   const issues: string[] = []
   const det: Record<string, unknown> = {}
+
+  // ── spec 物理一致性门(确定性;仅 --spec 时启用)────────────
+  let specReport: Record<string, unknown> | undefined
+  if (flags.spec) {
+    const specIssues = specError
+      ? [{ rule: 'spec-parse', severity: 'fail' as const, message: specError }]
+      : spec
+        ? checkSpec(spec)
+        : []
+    const specFails = specIssues.filter((i) => i.severity === 'fail')
+    const specWarns = specIssues.filter((i) => i.severity !== 'fail')
+    specReport = {
+      file: flags.spec,
+      template: spec?.template ?? null,
+      issues: specFails.map((i) => `[${i.rule}] ${i.message}`),
+      warnings: specWarns.map((i) => `[${i.rule}] ${i.message}`),
+    }
+    for (const i of specFails) issues.push(`[spec:${i.rule}] ${i.message}`)
+  }
 
   // ── 确定性检查 ─────────────────────────────────────────────
   const buf = readFileSync(resolved.imagePath)
@@ -232,6 +277,7 @@ async function main(): Promise<void> {
       {
         image: resolved.imagePath,
         kind,
+        ...(specReport ? { spec: specReport } : {}),
         deterministic: { checks: det, issues },
         vision: { backend: process.env.OPENCLAUDE_VISION_BACKEND === 'codex' ? `codex(${DEFAULT_CODEX_ENGINE_MODEL})` : 'minimax-m3', pass: visionPass, review: visionText },
         verdict,
