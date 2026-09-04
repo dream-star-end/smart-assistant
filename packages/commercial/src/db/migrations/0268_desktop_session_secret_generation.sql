@@ -1,5 +1,5 @@
--- 0259_desktop_session_secret_generation.sql
--- order-dependency: none (0258_cursor_opus_fable_context_1m 由 origin/feat/v5-aurora-rewrite 占用且尚未合入本分支;本迁移只给 agent_containers 加 generation 列,不依赖 0258 schema,可独立 apply。)
+-- 0268_desktop_session_secret_generation.sql
+-- order-dependency: 0267_turn_dispatches_agent_container
 --
 -- P1-IMPL-03: persistent token generation fence.
 -- NOT NULL DEFAULT 0 is safe for existing docker and desktop rows.

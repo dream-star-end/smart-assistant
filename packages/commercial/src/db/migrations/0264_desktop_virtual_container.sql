@@ -1,4 +1,6 @@
--- 0254_desktop_virtual_container.sql
+-- 0264_desktop_virtual_container.sql
+-- order-dependency: 0263_gpt6_astra_and_luna_public
+-- gap 0254-0263 occupied by canonical feat/v5-selfhost; desktop chain renumbered from 0254-0259 at merge
 -- P1 桌面虚拟容器底座 A 段:agent_containers 加 runtime_kind / issued_by_host_uuid /
 -- session_secret_expires_at / update_required,以及 enrollment / device / audit 表。
 --

@@ -92,7 +92,7 @@ Device CA：`$OPENCLAUDE_DEVICE_CA_DIR` 或 `/etc/openclaude/device-ca/{ca.key,c
      FROM pg_index i
      JOIN pg_class c ON c.oid = i.indexrelid
     WHERE c.relname = 'uniq_ac_user_channel_kind_active';
-   SELECT version FROM schema_migrations WHERE version = '0255_desktop_kind_unique_index';
+   SELECT version FROM schema_migrations WHERE version = '0265_desktop_kind_unique_index';
    ```
 2. 若 `indisvalid=false`：`DROP INDEX CONCURRENTLY uniq_ac_user_channel_kind_active;`
 3. 确认 ledger 无 0255 行后重跑 migrate。不要手工 INSERT ledger。

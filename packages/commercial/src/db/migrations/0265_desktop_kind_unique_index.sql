@@ -1,5 +1,5 @@
 -- no-transaction
--- 0255_desktop_kind_unique_index.sql
+-- 0265_desktop_kind_unique_index.sql
 -- P1 桌面虚拟容器底座:新建 (user_id, runtime_channel, runtime_kind) 分域 active 唯一索引。
 --
 -- ⚠️ 本迁移带 `-- no-transaction` 标记:CREATE INDEX CONCURRENTLY 不能在事务块内执行
@@ -21,7 +21,7 @@
 --   1. SELECT indisvalid FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
 --      WHERE c.relname='uniq_ac_user_channel_kind_active';
 --   2. 若 indisvalid=false: DROP INDEX CONCURRENTLY uniq_ac_user_channel_kind_active;
---   3. 确认 schema_migrations 无 0255_desktop_kind_unique_index 后重跑 migrate。
+--   3. 确认 schema_migrations 无 0265_desktop_kind_unique_index 后重跑 migrate。
 
 DO $$
 BEGIN

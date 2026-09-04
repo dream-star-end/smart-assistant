@@ -10,7 +10,7 @@ const TEST_DB_URL =
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 const SCHEMA = "oc_migration0255_test";
 const here = path.dirname(fileURLToPath(import.meta.url));
-const MIGRATION = path.resolve(here, "../db/migrations/0255_desktop_kind_unique_index.sql");
+const MIGRATION = path.resolve(here, "../db/migrations/0265_desktop_kind_unique_index.sql");
 
 let pool: Pool;
 let pgAvailable = false;
@@ -69,7 +69,7 @@ async function run0255Sql(sql: string): Promise<void> {
   await pool.query(create[0]);
 }
 
-describe("0255_desktop_kind_unique_index fail-loud", () => {
+describe("0265_desktop_kind_unique_index fail-loud", () => {
   test("omits IF NOT EXISTS and preflights invalid indexes", async () => {
     const sql = await readFile(MIGRATION, "utf8");
     assert.match(sql, /^-- no-transaction\b/m);
@@ -100,7 +100,7 @@ describe("0255_desktop_kind_unique_index fail-loud", () => {
     const sql = await readFile(MIGRATION, "utf8");
     await assert.rejects(() => run0255Sql(sql), /0255 fail-loud/);
     const ledger = await pool.query<{ version: string }>(
-      "SELECT version FROM schema_migrations WHERE version = '0255_desktop_kind_unique_index'",
+      "SELECT version FROM schema_migrations WHERE version = '0265_desktop_kind_unique_index'",
     );
     assert.equal(ledger.rows.length, 0);
 
@@ -122,10 +122,10 @@ describe("0255_desktop_kind_unique_index fail-loud", () => {
     // after every statement succeeds. Fail path above stays 0 rows; success is 1.
     await pool.query(
       "INSERT INTO schema_migrations(version) VALUES ($1)",
-      ["0255_desktop_kind_unique_index"],
+      ["0265_desktop_kind_unique_index"],
     );
     const successLedger = await pool.query<{ version: string }>(
-      "SELECT version FROM schema_migrations WHERE version = '0255_desktop_kind_unique_index'",
+      "SELECT version FROM schema_migrations WHERE version = '0265_desktop_kind_unique_index'",
     );
     assert.equal(successLedger.rows.length, 1);
   });

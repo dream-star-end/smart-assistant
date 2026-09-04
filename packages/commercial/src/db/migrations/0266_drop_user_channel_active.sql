@@ -1,5 +1,5 @@
 -- no-transaction
--- 0256_drop_user_channel_active.sql
+-- 0266_drop_user_channel_active.sql
 -- P1 桌面虚拟容器底座:drop 旧 uniq_ac_user_channel_active,让唯一性改由 0255 的
 -- uniq_ac_user_channel_kind_active (user_id, runtime_channel, runtime_kind) WHERE active
 -- 接管 → 同一 user 同 channel 可同时各有 1 个 docker active + 1 个 desktop active。

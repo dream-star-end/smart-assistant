@@ -135,11 +135,11 @@
     "0251_cursor_sand_mode",
     "0252_grok_route_context_kind",
     "0253_active_claude_proxy_uniqueness",
-    "0254_desktop_virtual_container",
-    "0255_desktop_kind_unique_index",
-    "0256_drop_user_channel_active",
-    "0257_turn_dispatches_agent_container",
-    "0259_desktop_session_secret_generation"
+    "0264_desktop_virtual_container",
+    "0265_desktop_kind_unique_index",
+    "0266_drop_user_channel_active",
+    "0267_turn_dispatches_agent_container",
+    "0268_desktop_session_secret_generation"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

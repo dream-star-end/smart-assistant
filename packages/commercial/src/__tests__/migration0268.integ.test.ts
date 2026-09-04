@@ -3,9 +3,9 @@ import { describe, test } from "node:test";
 import { query } from "../db/queries.js";
 import { useDedicatedTestDatabase } from "./helpers/db.js";
 
-const db = useDedicatedTestDatabase("desktop_gen_0259_test");
+const db = useDedicatedTestDatabase("desktop_gen_0268_test");
 
-describe("0259 session_secret_generation", () => {
+describe("0268 session_secret_generation", () => {
   test("column exists NOT NULL default 0 on existing rows", async (t) => {
     if (db.skipIfUnavailable(t)) return;
     const col = await query<{ column_default: string | null; is_nullable: string }>(

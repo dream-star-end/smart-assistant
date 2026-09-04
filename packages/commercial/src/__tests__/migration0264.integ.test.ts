@@ -32,7 +32,7 @@ async function insertUser(email: string): Promise<string> {
 describe("splitSqlStatements (0256 preflight + CONCURRENTLY)", () => {
   test("does not split dollar-quoted DO bodies and yields two 0256 statements", async () => {
     const sql = await readFile(
-      path.join(migrationsDir, "0256_drop_user_channel_active.sql"),
+      path.join(migrationsDir, "0266_drop_user_channel_active.sql"),
       "utf8",
     );
     const stmts = splitSqlStatements(sql);
@@ -45,7 +45,7 @@ describe("splitSqlStatements (0256 preflight + CONCURRENTLY)", () => {
 
   test("0255 fail-loud preflight + CONCURRENTLY are two statements", async () => {
     const sql = await readFile(
-      path.join(migrationsDir, "0255_desktop_kind_unique_index.sql"),
+      path.join(migrationsDir, "0265_desktop_kind_unique_index.sql"),
       "utf8",
     );
     const stmts = splitSqlStatements(sql);
@@ -217,11 +217,11 @@ describe("0254–0257 desktop virtual container apply", () => {
       requiredMigrations: string[];
     };
     for (const v of [
-      "0254_desktop_virtual_container",
-      "0255_desktop_kind_unique_index",
-      "0256_drop_user_channel_active",
-      "0257_turn_dispatches_agent_container",
-      "0259_desktop_session_secret_generation",
+      "0264_desktop_virtual_container",
+      "0265_desktop_kind_unique_index",
+      "0266_drop_user_channel_active",
+      "0267_turn_dispatches_agent_container",
+      "0268_desktop_session_secret_generation",
     ]) {
       assert.ok(metadata.requiredMigrations.includes(v), `requiredMigrations missing ${v}`);
     }
@@ -235,7 +235,7 @@ describe("0254–0257 desktop virtual container apply", () => {
     assert.equal(beforeKind.rows[0]!.n, "0");
 
     await query(
-      await readFile(path.join(migrationsDir, "0254_desktop_virtual_container.sql"), "utf8"),
+      await readFile(path.join(migrationsDir, "0264_desktop_virtual_container.sql"), "utf8"),
     );
     const afterKind = await query<{ n: string }>(
       `SELECT COUNT(*)::text AS n FROM information_schema.columns
@@ -244,7 +244,7 @@ describe("0254–0257 desktop virtual container apply", () => {
     assert.equal(afterKind.rows[0]!.n, "1");
 
     const idxStmts = splitSqlStatements(
-      await readFile(path.join(migrationsDir, "0255_desktop_kind_unique_index.sql"), "utf8"),
+      await readFile(path.join(migrationsDir, "0265_desktop_kind_unique_index.sql"), "utf8"),
     );
     for (const stmt of idxStmts) await query(stmt);
     const idxValid = await query<{ indisvalid: boolean }>(
@@ -256,7 +256,7 @@ describe("0254–0257 desktop virtual container apply", () => {
     assert.equal(idxValid.rows[0]?.indisvalid, true);
 
     const dropStmts = splitSqlStatements(
-      await readFile(path.join(migrationsDir, "0256_drop_user_channel_active.sql"), "utf8"),
+      await readFile(path.join(migrationsDir, "0266_drop_user_channel_active.sql"), "utf8"),
     );
     for (const stmt of dropStmts) await query(stmt);
     const oldIdxAfterDrop = await query<{ n: string }>(
@@ -265,7 +265,7 @@ describe("0254–0257 desktop virtual container apply", () => {
     assert.equal(oldIdxAfterDrop.rows[0]!.n, "0");
 
     await query(
-      await readFile(path.join(migrationsDir, "0257_turn_dispatches_agent_container.sql"), "utf8"),
+      await readFile(path.join(migrationsDir, "0267_turn_dispatches_agent_container.sql"), "utf8"),
     );
     const td = await query<{ n: string }>(
       `SELECT COUNT(*)::text AS n FROM information_schema.columns
