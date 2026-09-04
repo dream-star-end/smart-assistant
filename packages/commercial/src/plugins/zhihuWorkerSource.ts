@@ -278,8 +278,14 @@ function peopleTokenFromPath(pathname) {
   const token = match ? match[1] : null;
   return token && token !== 'edit' ? token : null;
 }
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((resolve) => setTimeout(() => resolve(fallback), ms))
+  ]);
+}
 async function topBarPeopleTokens(page) {
-  return page.locator('a[href]').evaluateAll((anchors) => {
+  return withTimeout(page.locator('a[href]').evaluateAll((anchors) => {
     const rows = [];
     for (const anchor of anchors) {
       const bounds = anchor.getBoundingClientRect();
@@ -292,11 +298,11 @@ async function topBarPeopleTokens(page) {
       rows.push(match[1]);
     }
     return rows;
-  }).catch(() => []);
+  }).catch(() => []), 15_000, []);
 }
 async function avatarMenuPeopleToken(page) {
   try {
-    const clicked = await page.evaluate(() => {
+    const clicked = await withTimeout(page.evaluate(() => {
       const targets = [];
       const seen = new Set();
       for (const el of document.querySelectorAll('img, button, a, [role="button"]')) {
@@ -315,10 +321,10 @@ async function avatarMenuPeopleToken(page) {
       if (targets.length !== 1) return false;
       targets[0].click();
       return true;
-    });
+    }), 15_000, false);
     if (!clicked) return null;
     await page.waitForTimeout(500);
-    const tokens = await page.locator('a[href*="/people/"]').evaluateAll((anchors) => {
+    const tokens = await withTimeout(page.locator('a[href*="/people/"]').evaluateAll((anchors) => {
       const rows = [];
       for (const anchor of anchors) {
         const text = (anchor.textContent || '').replace(/\s+/g, ' ').trim();
@@ -333,7 +339,7 @@ async function avatarMenuPeopleToken(page) {
         rows.push(match[1]);
       }
       return rows;
-    });
+    }), 15_000, []);
     const unique = Array.from(new Set(tokens));
     return unique.length === 1 ? unique[0] : null;
   } catch {
@@ -342,9 +348,11 @@ async function avatarMenuPeopleToken(page) {
 }
 async function editRedirectPeopleToken(page) {
   try {
-    await page.goto('https://www.zhihu.com/people/edit', { waitUntil: 'domcontentloaded', timeout: 20_000 });
-    await page.waitForTimeout(800);
-    return peopleTokenFromPath(new URL(page.url()).pathname);
+    return await withTimeout((async () => {
+      await page.goto('https://www.zhihu.com/people/edit', { waitUntil: 'domcontentloaded', timeout: 20_000 });
+      await page.waitForTimeout(800);
+      return peopleTokenFromPath(new URL(page.url()).pathname);
+    })(), 15_000, null);
   } catch {
     return null;
   }
@@ -527,7 +535,7 @@ async function awaitDispatch() {
   if (Object.keys(command).sort().join('\0') !== 'event' || command.event !== 'dispatch') throw new Error('dispatch');
 }
 async function projectProfile(page, expectedToken) {
-  const data = await page.evaluate((expected) => {
+  const data = await withTimeout(page.evaluate((expected) => {
     const visible = (element) => {
       const bounds = element.getBoundingClientRect();
       const style = getComputedStyle(element);
@@ -571,7 +579,7 @@ async function projectProfile(page, expectedToken) {
       followerCount: counts.followers,
       followingCount: counts.following
     };
-  }, expectedToken || null);
+  }, expectedToken || null), 15_000, null);
   if (!data) throw new Error('profile');
   return data;
 }
@@ -1858,25 +1866,49 @@ function urlPathname(raw) {
 async function proveSelf(context) {
   const page = await context.newPage();
   try {
-    await gotoAuthenticated(page, 'https://www.zhihu.com/');
-    const topBar = await topBarPeopleTokens(page);
-    const first = await selfTokenFromPage(page);
-    if (!first) {
-      emitStep({ step: 'login.prove_self', ok: false, reason: 'home-no-unique-token', candidateCount: Array.from(new Set(topBar)).length });
+    const timedOut = { timeout: true };
+    const result = await Promise.race([
+      (async () => {
+        await gotoAuthenticated(page, 'https://www.zhihu.com/');
+        let homeText = await bodyText(page);
+        for (let attempt = 1; attempt <= 2 && homeText.length < 50; attempt += 1) {
+          emitStep({ step: 'login.home_retry', ok: false, textLen: homeText.length, hits: attempt });
+          try {
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+            await page.waitForTimeout(2500);
+          } catch {}
+          homeText = await bodyText(page);
+        }
+        if (homeText.length < 50) {
+          emitStep({ step: 'login.prove_self', ok: false, reason: 'home-empty' });
+          return null;
+        }
+        const topBar = await topBarPeopleTokens(page);
+        const first = await selfTokenFromPage(page);
+        if (!first) {
+          emitStep({ step: 'login.prove_self', ok: false, reason: 'home-no-unique-token', candidateCount: Array.from(new Set(topBar)).length });
+          return null;
+        }
+        await gotoAuthenticated(page, 'https://www.zhihu.com/people/' + first);
+        const current = peopleTokenFromPath(new URL(page.url()).pathname) || await selfTokenFromPage(page);
+        if (current !== first) {
+          emitStep({ step: 'login.prove_self', ok: false, reason: 'people-page-token-mismatch' });
+          return null;
+        }
+        const profile = await projectProfile(page, first).catch(() => null);
+        if (!profile || !profile.urlToken) {
+          emitStep({ step: 'login.prove_self', ok: false, reason: 'profile-projection-null' });
+          return null;
+        }
+        return first;
+      })(),
+      new Promise((resolve) => setTimeout(() => resolve(timedOut), 90_000))
+    ]);
+    if (result === timedOut) {
+      emitStep({ step: 'login.prove_self', ok: false, reason: 'timeout' });
       return null;
     }
-    await gotoAuthenticated(page, 'https://www.zhihu.com/people/' + first);
-    const current = peopleTokenFromPath(new URL(page.url()).pathname) || await selfTokenFromPage(page);
-    if (current !== first) {
-      emitStep({ step: 'login.prove_self', ok: false, reason: 'people-page-token-mismatch' });
-      return null;
-    }
-    const profile = await projectProfile(page, first).catch(() => null);
-    if (!profile || !profile.urlToken) {
-      emitStep({ step: 'login.prove_self', ok: false, reason: 'profile-projection-null' });
-      return null;
-    }
-    return first;
+    return result;
   } catch { return null; }
   finally { await page.close().catch(() => {}); }
 }
@@ -1897,6 +1929,7 @@ async function runLogin(input, relay) {
     let nextQr = Date.now() + QR_REFRESH_MS;
     let nextProbe = 0;
     let signalEmitted = false;
+    let probeHits = 0;
     while (Date.now() < input.deadlineMs) {
       await assertNoChallenge(home);
       if (Date.now() >= nextQr) {
@@ -1926,8 +1959,10 @@ async function runLogin(input, relay) {
         });
       }
       if (signal && Date.now() >= nextProbe) {
-        nextProbe = Date.now() + 5_000;
+        probeHits += 1;
+        emitStep({ step: 'login.probe', ok: true, hits: probeHits });
         const selfId = await proveSelf(context);
+        nextProbe = Date.now() + 5_000;
         if (selfId) {
           const state = filteredState(await context.storageState(), input.cookieDomains, input.stateOrigins);
           await writeTerminalAndExit({ event: 'authenticated', storageState: state });

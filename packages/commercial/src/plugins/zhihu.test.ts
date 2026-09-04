@@ -494,6 +494,8 @@ describe('official Zhihu Plugin', () => {
     assert.match(ZHIHU_WORKER_SOURCE, /url-left-signin/)
     assert.match(ZHIHU_WORKER_SOURCE, /step: 'login\.prove_self'/)
     assert.match(ZHIHU_WORKER_SOURCE, /home-no-unique-token/)
+    assert.match(ZHIHU_WORKER_SOURCE, /login\.home_retry/)
+    assert.match(ZHIHU_WORKER_SOURCE, /login\.probe/)
     assert.match(ZHIHU_WORKER_SOURCE, /people-page-token-mismatch/)
     assert.match(ZHIHU_WORKER_SOURCE, /profile-projection-null/)
     assert.match(ZHIHU_WORKER_SOURCE, /step: 'login\.qr_refresh'/)
