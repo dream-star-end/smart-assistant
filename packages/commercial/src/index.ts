@@ -502,6 +502,8 @@ import { KnowledgePlanetAutomationService } from './plugins/knowledgePlanetAutom
 import { startKnowledgePlanetAutomationScheduler } from './plugins/knowledgePlanetAutomationScheduler.js'
 import { WeiboDockerService, createWeiboRuntimeRegistries } from './plugins/weibo.js'
 import { WeiboSetupManager } from './plugins/weiboSetup.js'
+import { ZhihuDockerService, createZhihuRuntimeRegistries } from './plugins/zhihu.js'
+import { ZhihuSetupManager } from './plugins/zhihuSetup.js'
 import { seedDefaultConnectors } from './connectors/declarativeSeed.js'
 import { startConnectorSweeper } from './connectors/sweeper.js'
 import {
@@ -1549,6 +1551,8 @@ export async function registerCommercial(
   let knowledgePlanetSetup: KnowledgePlanetSetupManager | undefined
   let weiboService: WeiboDockerService | undefined
   let weiboSetup: WeiboSetupManager | undefined
+  let zhihuService: ZhihuDockerService | undefined
+  let zhihuSetup: ZhihuSetupManager | undefined
   let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
   let pluginFacade: PluginRuntimeFacade
   if (runtimeChannel === 'v5' && cfg.OC_RUNTIME_IMAGE_ID) {
@@ -1571,11 +1575,28 @@ export async function registerCommercial(
       socketUid: 1000,
       socketGid: 1000,
     })
+    zhihuService = new ZhihuDockerService(pluginDocker, {
+      imageId: cfg.OC_RUNTIME_IMAGE_ID,
+      workerRoot: '/var/lib/openclaude-v5/plugin-workers-zhihu',
+      brokerRoot: '/run/openclaude-v5/plugin-browser-brokers-zhihu',
+      expectedOwnerUid: 0,
+      socketUid: 1000,
+      socketGid: 1000,
+    })
     const knowledgePlanetRegistries = createKnowledgePlanetRuntimeRegistries(knowledgePlanetService)
     const weiboRegistries = createWeiboRuntimeRegistries(weiboService)
+    const zhihuRegistries = createZhihuRuntimeRegistries(zhihuService)
     const browserRuntime = new ManagedBrowserRuntime({
-      drivers: new Map([...knowledgePlanetRegistries.drivers, ...weiboRegistries.drivers]),
-      launchers: new Map([...knowledgePlanetRegistries.launchers, ...weiboRegistries.launchers]),
+      drivers: new Map([
+        ...knowledgePlanetRegistries.drivers,
+        ...weiboRegistries.drivers,
+        ...zhihuRegistries.drivers,
+      ]),
+      launchers: new Map([
+        ...knowledgePlanetRegistries.launchers,
+        ...weiboRegistries.launchers,
+        ...zhihuRegistries.launchers,
+      ]),
       profileRoot: '/var/lib/openclaude-v5/plugin-browser-profiles',
       expectedOwnerUid: 0,
     })
@@ -1588,6 +1609,10 @@ export async function registerCommercial(
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
     weiboSetup = new WeiboSetupManager(weiboService, {
+      redis,
+      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
+    })
+    zhihuSetup = new ZhihuSetupManager(zhihuService, {
       redis,
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
@@ -3814,6 +3839,7 @@ export async function registerCommercial(
     pluginRuntime: pluginFacade,
     knowledgePlanetSetup,
     weiboSetup,
+    zhihuSetup,
     knowledgePlanetAutomation,
     mailer,
     redis: wrapIoredis(redis),
@@ -6434,7 +6460,11 @@ export async function registerCommercial(
       try { await userChatBridge.shutdown(); } catch { /* ignore */ }
       // Managed setup/action workers must drain while PG/Redis and Docker control are alive.
       try {
-        await Promise.all([knowledgePlanetSetup?.closeAndDrain(), weiboSetup?.closeAndDrain()])
+        await Promise.all([
+          knowledgePlanetSetup?.closeAndDrain(),
+          weiboSetup?.closeAndDrain(),
+          zhihuSetup?.closeAndDrain(),
+        ])
       } catch {
         /* ignore */
       }
