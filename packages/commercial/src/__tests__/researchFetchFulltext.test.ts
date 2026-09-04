@@ -628,6 +628,50 @@ describe('fetchFulltext: SSRF 边界', () => {
     assert.equal((await vetFetchTarget('http://localhost/a', PUBLIC_DNS)).ok, false)
     assert.equal((await vetFetchTarget('http://db.local/a', PUBLIC_DNS)).ok, false)
   })
+
+  it('resolver 抖动(ETIMEOUT/EAI_AGAIN)→ timeout(transient,重试一次),不记 blocked_target', async () => {
+    let calls = 0
+    const flaky = {
+      resolve4: async () => {
+        calls++
+        throw Object.assign(new Error('dns'), { code: calls === 1 ? 'ETIMEOUT' : 'EAI_AGAIN' })
+      },
+      resolve6: async () => [] as string[],
+    }
+    const urls: string[] = []
+    const fetchImpl = mockFetch([{ match: 'slow.example', respond: () => pdfResponse() }], urls)
+    const r = await downloadFulltext(
+      record({ oa: { url: 'https://slow.example/p.pdf' } }),
+      {},
+      { fetchImpl, guardResolver: flaky, retryDelayMs: 0 },
+    )
+    assert.equal(r.ok, false)
+    if (!r.ok) {
+      assert.equal(r.reason, 'timeout')
+      const a = r.attempts.find((x) => x.source === 'known_oa')
+      assert.match(String(a?.detail), /dns transient/)
+    }
+    assert.equal(calls, 2, 'transient → 重试一次(共 2 次 vet)')
+    assert.equal(urls.length, 0)
+  })
+
+  it('DNS 挂死受 timeoutMs 预算约束:单次尝试不会拖过 timeoutMs 数倍', async () => {
+    const hang = {
+      resolve4: () => new Promise<string[]>(() => {}),
+      resolve6: async () => [] as string[],
+    }
+    const t0 = Date.now()
+    const r = await downloadFulltext(
+      record({ oa: { url: 'https://hang.example/p.pdf' } }),
+      {},
+      { fetchImpl: mockFetch([]), guardResolver: hang, timeoutMs: 60, retryDelayMs: 0 },
+    )
+    const elapsed = Date.now() - t0
+    assert.equal(r.ok, false)
+    if (!r.ok) assert.equal(r.reason, 'timeout')
+    // 2 次尝试 × 60ms 预算,给调度余量;若不受预算约束会永久挂起(测试本身会超时)。
+    assert.ok(elapsed < 1500, `elapsed ${elapsed}ms`)
+  })
 })
 
 // ── proxy pass ───────────────────────────────────────────────────────

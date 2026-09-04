@@ -34,7 +34,13 @@ const defaultResolver: FetchGuardResolver = {
   resolve6: (h) => resolve6(h),
 }
 
-export type FetchGuardVerdict = { ok: true; url: URL } | { ok: false; reason: string }
+/**
+ * transient=true 表示拒绝源于 DNS 基础设施抖动(超时/EAI_AGAIN/resolver 拒连/超出预算),
+ * 不是策略性拒绝——调用方应归为瞬时错误走重试,不要记成 SSRF 拒绝。
+ */
+export type FetchGuardVerdict =
+  | { ok: true; url: URL }
+  | { ok: false; reason: string; transient?: boolean }
 
 const HOSTNAME_RE =
   /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.?$/
@@ -44,6 +50,41 @@ function isTolerableDnsError(err: unknown): boolean {
   return code === 'ENODATA' || code === 'ENOTFOUND' || code === 'ESERVFAIL'
 }
 
+/** resolver 自身不可用/抖动:与"解到私网"严格区分,归瞬时错误。 */
+function isTransientDnsError(err: unknown): boolean {
+  const code = (err as { code?: string })?.code
+  return (
+    code === 'ETIMEOUT' ||
+    code === 'EAI_AGAIN' ||
+    code === 'ECONNREFUSED' ||
+    code === 'EREFUSED' ||
+    code === 'ECANCELLED' ||
+    code === 'ECANCELED'
+  )
+}
+
+class DnsBudgetExceeded extends Error {
+  code = 'EDNSBUDGET'
+}
+
+/** 给 resolve 套预算(默认 node dns 走 c-ares 自带超时,但可长达数秒×重试,需与下载 timeoutMs 对齐)。 */
+function withBudget<T>(p: Promise<T>, ms: number | undefined): Promise<T> {
+  if (!ms || !Number.isFinite(ms) || ms <= 0) return p
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new DnsBudgetExceeded('dns lookup exceeded budget')), ms)
+    p.then(
+      (v) => {
+        clearTimeout(t)
+        resolve(v)
+      },
+      (e) => {
+        clearTimeout(t)
+        reject(e)
+      },
+    )
+  })
+}
+
 /**
  * 校验一个下载目标 URL 是否允许出站。纯判定,不发请求。
  * 返回 `{ ok:false, reason }` 时 reason 是给 attempts.detail 的短说明(不含敏感信息)。
@@ -51,6 +92,7 @@ function isTolerableDnsError(err: unknown): boolean {
 export async function vetFetchTarget(
   raw: string | URL,
   resolver: FetchGuardResolver = defaultResolver,
+  opts: { dnsTimeoutMs?: number } = {},
 ): Promise<FetchGuardVerdict> {
   let url: URL
   try {
@@ -88,13 +130,27 @@ export async function vetFetchTarget(
   let v4: string[] = []
   let v6: string[] = []
   try {
-    v4 = await resolver.resolve4(lower)
+    v4 = await withBudget(resolver.resolve4(lower), opts.dnsTimeoutMs)
   } catch (err) {
+    if (err instanceof DnsBudgetExceeded || isTransientDnsError(err)) {
+      return {
+        ok: false,
+        reason: 'dns lookup timed out / resolver unavailable (A)',
+        transient: true,
+      }
+    }
     if (!isTolerableDnsError(err)) return { ok: false, reason: 'dns resolution failed (A)' }
   }
   try {
-    v6 = await resolver.resolve6(lower)
+    v6 = await withBudget(resolver.resolve6(lower), opts.dnsTimeoutMs)
   } catch (err) {
+    if (err instanceof DnsBudgetExceeded || isTransientDnsError(err)) {
+      return {
+        ok: false,
+        reason: 'dns lookup timed out / resolver unavailable (AAAA)',
+        transient: true,
+      }
+    }
     if (!isTolerableDnsError(err)) return { ok: false, reason: 'dns resolution failed (AAAA)' }
   }
   if (v4.length === 0 && v6.length === 0) {

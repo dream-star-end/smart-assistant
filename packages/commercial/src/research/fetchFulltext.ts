@@ -297,13 +297,18 @@ async function readBodyCapped(
 async function fetchFollowingVettedRedirects(
   startUrl: string,
   fetchImpl: FetchLike,
-  init: { headers: Record<string, string>; signal: AbortSignal },
+  init: { headers: Record<string, string>; signal: AbortSignal; deadline: number },
   resolver: FetchGuardResolver | undefined,
 ): Promise<{ res: Response } | { code: AttemptFailCode; httpStatus?: number; detail?: string }> {
   let current = startUrl
   for (let hop = 0; hop <= FETCH_MAX_REDIRECTS; hop++) {
-    const vet = await vetFetchTarget(current, resolver)
+    // DNS 预算 = 本次尝试剩余时间,保证 vet 不把单次尝试拖过 timeoutMs(auditor minor-1)。
+    const remaining = init.deadline - Date.now()
+    if (remaining <= 0) return { code: 'timeout', detail: 'attempt deadline exceeded before vet' }
+    const vet = await vetFetchTarget(current, resolver, { dnsTimeoutMs: remaining })
     if (!vet.ok) {
+      // resolver 抖动 ≠ 策略拒绝:归 timeout(transient,可重试),不记成 SSRF(auditor minor-2)。
+      if (vet.transient) return { code: 'timeout', detail: `dns transient: ${vet.reason}` }
       return {
         code: 'blocked_target',
         detail:
@@ -365,7 +370,7 @@ async function attemptDownloadOnce(
     const followed = await fetchFollowingVettedRedirects(
       url,
       fetchImpl,
-      { headers, signal: ctrl.signal },
+      { headers, signal: ctrl.signal, deadline: Date.now() + opts.timeoutMs },
       opts.guardResolver,
     )
     if (!('res' in followed)) return followed
