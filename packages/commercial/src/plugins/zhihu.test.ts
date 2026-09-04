@@ -665,3 +665,15 @@ describe('official Zhihu Plugin', () => {
     assert.equal(decodeZhihuWorkerFramesForTest(chunk), 2)
   })
 })
+
+describe('zhihu worker media source', () => {
+  test('pins DOM-only image upload paths and new write branches', () => {
+    assert.match(ZHIHU_WORKER_SOURCE, /\/inputs\//)
+    assert.match(ZHIHU_WORKER_SOURCE, /media\.attach/)
+    assert.match(ZHIHU_WORKER_SOURCE, /create_pin/)
+    assert.match(ZHIHU_WORKER_SOURCE, /zhuanlan\.zhihu\.com\/write/)
+    assert.match(ZHIHU_WORKER_SOURCE, /ZHIHU_WRITE_MEDIA_UPLOAD/)
+    assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /api\.zhihu\.com/)
+    assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /fetch\(/)
+  })
+})

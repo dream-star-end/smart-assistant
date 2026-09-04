@@ -7,6 +7,7 @@ export const ZHIHU_WORKER_SOURCE = String.raw`
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { createServer, createConnection } from 'node:net';
+import { readFile } from 'node:fs/promises';
 
 const require = createRequire(import.meta.url);
 const playwrightMcpVersion = require('/usr/local/lib/node_modules/@playwright/mcp/package.json').version;
@@ -25,9 +26,10 @@ const ACTION_ORIGINS = new Set([
 ]);
 const WRITE_ACTIONS = new Set([
   'create_answer', 'edit_answer', 'delete_answer', 'create_comment', 'reply_comment',
-  'delete_comment', 'set_vote', 'set_following', 'create_article'
+  'delete_comment', 'set_vote', 'set_following', 'create_article', 'create_pin'
 ]);
-const IMPLEMENTED_WRITES = new Set(['create_answer', 'edit_answer', 'delete_answer', 'create_comment', 'delete_comment', 'set_vote', 'set_following']);
+const IMPLEMENTED_WRITES = new Set(['create_answer', 'edit_answer', 'delete_answer', 'create_comment', 'delete_comment', 'set_vote', 'set_following', 'create_pin', 'create_article', 'reply_comment']);
+const ALLOWED_IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const RISK_TEXT = /安全验证|访问异常|操作频繁|账号存在风险|请完成验证|验证码|登录保护|行为异常|系统检测到异常|点击按钮进行验证|请求存在异常|限制本次访问|系统监测到您的网络环境存在异常/;
 const BLOCKED_TEXT = /请求存在异常|限制本次访问|访问异常|系统监测到您的网络环境存在异常/;
 const NORMAL_LOGIN_VERIFICATION_TEXT = /验证码登录|获取验证码|短信验证码/g;
@@ -57,6 +59,9 @@ function classifyWriteFailure(reason) {
   if (message === 'send') return 'ZHIHU_WRITE_SEND';
   if (message === 'result') return 'ZHIHU_WRITE_RESULT';
   if (message === 'unsupported') return 'ZHIHU_WRITE_UNSUPPORTED';
+  if (message === 'media-chooser') return 'ZHIHU_WRITE_MEDIA_CHOOSER';
+  if (message === 'media-upload') return 'ZHIHU_WRITE_MEDIA_UPLOAD';
+  if (message === 'media-preview-timeout') return 'ZHIHU_WRITE_MEDIA_PREVIEW_TIMEOUT';
   return 'WORKER_FAILED';
 }
 function emitStep(event) {
@@ -241,6 +246,13 @@ function articleIdOf(raw) {
   try {
     const url = new URL(raw, 'https://zhuanlan.zhihu.com/');
     const match = /^\/p\/([0-9]{1,20})(?:\/|$)/.exec(url.pathname);
+    return match ? match[1] : null;
+  } catch { return null; }
+}
+function pinIdOf(raw) {
+  try {
+    const url = new URL(raw, 'https://www.zhihu.com/');
+    const match = /(?:^|\/)pin\/([0-9]{1,20})(?:\/|$)/.exec(url.pathname);
     return match ? match[1] : null;
   } catch { return null; }
 }
@@ -1059,8 +1071,313 @@ async function actionRead(page, input) {
   }
   throw new Error('action');
 }
-async function fillEditor(page, text) {
-  const editor = await uniqueVisible(page.locator('[contenteditable="true"], textarea, .public-DraftEditor-content, .ProseMirror'))
+async function composerScope(editor) {
+  if (!editor || typeof editor.locator !== 'function') return null;
+  const queries = [
+    'xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="发布"]][1]',
+    'xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="图片"]][1]',
+    'xpath=ancestor::*[.//*[@title="图片" or @aria-label="图片"]][1]'
+  ];
+  for (const query of queries) {
+    const scope = editor.locator(query);
+    if (await scope.count() === 1) return scope;
+  }
+  const fileScope = editor.locator('xpath=ancestor::*[.//input[@type="file"]][1]');
+  if (await fileScope.count() === 1) {
+    const tag = String(await fileScope.evaluate((el) => (el && el.tagName) || '').catch(() => '')).toUpperCase();
+    if (tag && tag !== 'HTML' && tag !== 'BODY' && tag !== 'MAIN') return fileScope;
+  }
+  const parent = editor.locator('xpath=ancestor::*[4]');
+  if (await parent.count() === 1) return parent;
+  return editor;
+}
+function wrapFileInput(input) {
+  return {
+    setFiles: async (files) => input.setInputFiles(files),
+    element: () => input,
+  };
+}
+async function countImageFileInputs(scope) {
+  const result = { total: 0, image: 0, attached: 0 };
+  if (!scope || typeof scope.locator !== 'function') return result;
+  const nodes = scope.locator('input[type="file"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return result;
+  const total = Math.min(await nodes.count().catch(() => 0), 40);
+  result.total = total;
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    const attached = await node.evaluate((element) => !!element && element.isConnected).catch(() => false);
+    if (!attached) continue;
+    result.attached += 1;
+    const accept = String(await node.getAttribute('accept').catch(() => '') || '');
+    if (accept && !/image|\*/i.test(accept)) continue;
+    result.image += 1;
+  }
+  return result;
+}
+async function uniqueImageFileInput(scope) {
+  if (!scope || typeof scope.locator !== 'function') return null;
+  const nodes = scope.locator('input[type="file"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return null;
+  const matches = [];
+  const total = Math.min(await nodes.count().catch(() => 0), 40);
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    const attached = await node.evaluate((element) => !!element && element.isConnected).catch(() => false);
+    if (!attached) continue;
+    const accept = String(await node.getAttribute('accept').catch(() => '') || '');
+    if (accept && !/image|\*/i.test(accept)) continue;
+    matches.push(node);
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+async function collectVisibleImageSrcs(scope) {
+  const srcs = [];
+  if (!scope || typeof scope.locator !== 'function') return srcs;
+  const nodes = scope.locator('img');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return srcs;
+  const total = Math.min(await nodes.count().catch(() => 0), 12);
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    if (!await node.isVisible().catch(() => false)) continue;
+    const src = String(await node.getAttribute('src').catch(() => '') || '');
+    if (src) srcs.push(src);
+  }
+  return srcs;
+}
+async function countVisibleImgs(scope) {
+  if (!scope || typeof scope.locator !== 'function') return 0;
+  const nodes = scope.locator('img');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return 0;
+  const total = Math.min(await nodes.count().catch(() => 0), 12);
+  let hits = 0;
+  for (let index = 0; index < total; index += 1) {
+    if (await nodes.nth(index).isVisible().catch(() => false)) hits += 1;
+  }
+  return hits;
+}
+async function countPreviewNodes(scope) {
+  if (!scope || typeof scope.locator !== 'function') return 0;
+  const nodes = scope.locator('img[src^="blob:"], img[src^="data:"], [class*="Preview"], [class*="preview"], [class*="ImagePreview"], [class*="UploadPicture"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return 0;
+  const total = Math.min(await nodes.count().catch(() => 0), 20);
+  let hits = 0;
+  for (let index = 0; index < total; index += 1) {
+    if (await visible(nodes.nth(index))) hits += 1;
+  }
+  return hits;
+}
+function isComposerPreviewSrc(src) {
+  if (!src) return false;
+  if (/^(blob:|data:)/i.test(src)) return true;
+  if (/zhimg\.com/i.test(src)) return true;
+  return false;
+}
+async function awaitComposerMediaReady(page, editor, expectedNew, timeout, beforeSrcs, beforeCount, beforeDelete, beforeNodes) {
+  const scope = (await composerScope(editor)) || editor || page;
+  if (!scope || typeof scope.locator !== 'function') throw new Error('media-preview-timeout');
+  const before = new Set(Array.isArray(beforeSrcs) ? beforeSrcs : []);
+  const baseCount = Number.isFinite(beforeCount) ? beforeCount : before.size;
+  const baseNodes = Number.isFinite(beforeNodes) ? beforeNodes : 0;
+  const deadline = Date.now() + timeout;
+  const attempts = Math.max(1, Math.ceil(timeout / 250));
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (Date.now() >= deadline) break;
+    const added = [];
+    const seen = new Set();
+    for (const src of await collectVisibleImageSrcs(scope)) {
+      if (before.has(src) || seen.has(src)) continue;
+      seen.add(src);
+      added.push(src);
+    }
+    const imgs = await countVisibleImgs(scope);
+    const previewNodes = await countPreviewNodes(scope);
+    const addedPreview = added.filter((src) => isComposerPreviewSrc(src)).length;
+    const ready = addedPreview >= expectedNew || added.length >= expectedNew
+      || imgs >= baseCount + expectedNew
+      || previewNodes >= baseNodes + expectedNew
+      || (beforeDelete && false);
+    if (ready) return;
+    const remaining = deadline - Date.now();
+    if (attempt < attempts - 1 && remaining > 0) {
+      await page.waitForTimeout(Math.min(250, remaining));
+    }
+  }
+  throw new Error('media-preview-timeout');
+}
+async function armFileChooser(page, clickable, files) {
+  if (!page || typeof page.waitForEvent !== 'function' || !clickable || typeof clickable.click !== 'function') {
+    return { chooser: null, timedOut: false, attached: false, attachFailed: false };
+  }
+  let attached = false;
+  let attachFailed = false;
+  const chooserPromise = page.waitForEvent('filechooser', { timeout: 5_000 }).then(async (chooser) => {
+    if (chooser && Array.isArray(files) && files.length > 0 && typeof chooser.setFiles === 'function') {
+      try {
+        await chooser.setFiles(files);
+        attached = true;
+      } catch {
+        attachFailed = true;
+      }
+    }
+    return chooser || null;
+  }).catch(() => null);
+  const clickPromise = clickable.click({ timeout: 5_000, force: true, noWaitAfter: true }).catch(() => null);
+  let timer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve('__timeout__'), 8_000);
+  });
+  try {
+    const raced = await Promise.race([chooserPromise, timeoutPromise]);
+    if (raced === '__timeout__') return { chooser: null, timedOut: true, attached: false, attachFailed: false };
+    if (raced) return { chooser: raced, timedOut: false, attached, attachFailed };
+    await Promise.race([clickPromise, timeoutPromise]);
+    return { chooser: null, timedOut: false, attached: false, attachFailed: false };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+async function uniqueImageTool(scope, page) {
+  const labeled = await uniqueExactControl((scope || page).locator('button, [role="button"], [role="menuitem"], a'), ['图片']);
+  if (labeled) return labeled;
+  const byAttr = (scope || page).locator('button[title="图片"], button[aria-label="图片"], [role="button"][title="图片"], [role="button"][aria-label="图片"]');
+  const unique = await uniqueVisible(byAttr);
+  if (unique) return unique;
+  if (scope) {
+    const pageLabeled = await uniqueExactControl(page.locator('button, [role="button"], [role="menuitem"], a'), ['图片']);
+    if (pageLabeled) return pageLabeled;
+  }
+  return null;
+}
+async function attachImages(page, scope, manifest) {
+  const items = Array.isArray(manifest) ? manifest : [];
+  if (items.length === 0) return 0;
+  const files = [];
+  let selected = 0;
+  const target = (scope && typeof scope.locator === 'function') ? scope : page;
+  try {
+    for (const item of items) {
+      const inputId = String(item && item.inputId || '');
+      const mimeType = String(item && item.mimeType || '');
+      const filename = String(item && item.filename || 'image.png');
+      if (!/^[A-Za-z0-9-]{1,64}$/.test(inputId) || !ALLOWED_IMAGE_MIME.has(mimeType)) throw new Error('media-upload');
+      files.push({ name: filename, mimeType, buffer: await readFile('/inputs/' + inputId) });
+    }
+    const previewBefore = await collectVisibleImageSrcs(target);
+    const previewBeforeCount = await countVisibleImgs(target);
+    const previewBeforeNodes = await countPreviewNodes(target);
+    let input = await uniqueImageFileInput(target);
+    let attached = false;
+    if (!input) {
+      const image = await uniqueImageTool(target, page);
+      if (image) {
+        const armed = await armFileChooser(page, image, files);
+        if (armed.timedOut) throw new Error('media-chooser');
+        if (armed.attachFailed) throw new Error('media-upload');
+        if (armed.attached) { attached = true; selected = files.length; }
+        else if (armed.chooser && typeof armed.chooser.setFiles === 'function') {
+          try {
+            await armed.chooser.setFiles(files);
+            attached = true;
+            selected = files.length;
+          } catch { throw new Error('media-upload'); }
+        }
+        if (!attached) {
+          const local = await uniqueExactControl(target.locator('button, [role="button"], [role="menuitem"], a'), ['本地上传'])
+            || await uniqueExactControl(page.locator('button, [role="button"], [role="menuitem"], a'), ['本地上传']);
+          if (local) {
+            const localArmed = await armFileChooser(page, local, files);
+            if (localArmed.timedOut) throw new Error('media-chooser');
+            if (localArmed.attachFailed) throw new Error('media-upload');
+            if (localArmed.attached) { attached = true; selected = files.length; }
+          }
+        }
+        input = await uniqueImageFileInput(target) || await uniqueImageFileInput(page);
+      }
+    }
+    if (!attached) {
+      if (!input) input = await uniqueImageFileInput(target) || await uniqueImageFileInput(page);
+      if (!input) throw new Error('media-chooser');
+      try {
+        await wrapFileInput(input).setFiles(files);
+      } catch {
+        throw new Error('media-upload');
+      }
+      try {
+        selected = await input.evaluate((node) => node.files ? node.files.length : 0);
+      } catch { selected = 0; }
+    } else if (input) {
+      try {
+        selected = await input.evaluate((node) => node.files ? node.files.length : 0);
+      } catch { selected = files.length; }
+    }
+    if (selected !== files.length) throw new Error('media-upload');
+    await awaitComposerMediaReady(page, target, files.length, 90_000, previewBefore, previewBeforeCount, false, previewBeforeNodes);
+    emitStep({ step: 'media.attach', ok: true, hits: selected, candidateCount: files.length });
+    return selected;
+  } catch (error) {
+    emitStep({ step: 'media.attach', ok: false, hits: selected, candidateCount: items.length });
+    throw error;
+  } finally {
+    for (const file of files) {
+      if (file.buffer && typeof file.buffer.fill === 'function') file.buffer.fill(0);
+    }
+  }
+}
+async function projectCreatedPin(page, selfToken, text) {
+  await gotoAuthenticated(page, 'https://www.zhihu.com/people/' + selfToken + '/pins');
+  const needle = cleanText(text, 40).slice(0, 20);
+  const rows = await page.evaluate((input) => {
+    const visible = (element) => {
+      const bounds = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return bounds.width > 0 && bounds.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const items = [];
+    for (const node of document.querySelectorAll('[data-zop], .PinItem, .ContentItem')) {
+      if (!visible(node)) continue;
+      const authorHref = Array.from(node.querySelectorAll('a[href]')).map((anchor) => {
+        try {
+          const url = new URL(anchor.href, location.href);
+          const match = /^\/people\/([A-Za-z0-9-]{1,64})(?:\/|$)/.exec(url.pathname);
+          return match ? match[1] : null;
+        } catch { return null; }
+      }).find(Boolean) || '';
+      if (input.selfToken && authorHref && authorHref !== input.selfToken) continue;
+      const excerpt = (node.querySelector('.RichContent-inner, .RichText, [class*="RichContent"]') && node.querySelector('.RichContent-inner, .RichText, [class*="RichContent"]').textContent || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
+      let pinId = '';
+      for (const anchor of node.querySelectorAll('a[href]')) {
+        try {
+          const match = /\/pin\/([0-9]{1,20})/.exec(new URL(anchor.href, location.href).pathname);
+          if (match) { pinId = match[1]; break; }
+        } catch {}
+      }
+      if (!pinId) continue;
+      const timeText = (node.textContent || '').replace(/\s+/g, ' ');
+      items.push({
+        id: pinId,
+        text: excerpt,
+        authorUrlToken: authorHref,
+        recent: /刚刚|分钟前/.test(timeText)
+      });
+    }
+    return items;
+  }, { selfToken, needle });
+  const mine = needle
+    ? rows.find((row) => row.authorUrlToken === selfToken && (row.text || '').includes(needle))
+    : rows.find((row) => row.authorUrlToken === selfToken && row.recent) || rows.find((row) => row.recent);
+  if (!mine || !mine.id) throw new Error('result-projection');
+  const pinText = cleanText(text, 2000);
+  return {
+    id: mine.id,
+    text: pinText,
+    url: 'https://www.zhihu.com/pin/' + mine.id,
+    contentDigest: digest({ id: mine.id, text: pinText })
+  };
+}
+async function fillEditor(page, text, existing) {
+  const editor = existing
+    || await uniqueVisible(page.locator('[contenteditable="true"], textarea, .public-DraftEditor-content, .ProseMirror'))
     || await uniqueVisible(page.locator('[role="textbox"]'));
   if (!editor) throw new Error('composer-editor');
   await editor.click({ timeout: 10_000 });
@@ -1090,9 +1407,11 @@ async function writeAction(page, input) {
     const open = await uniqueExactControl(page.locator('button, [role="button"], a'), ['写回答', '添加回答']);
     if (open) await open.click({ timeout: 10_000 });
     await page.waitForTimeout(800);
-    await fillEditor(page, params.text);
+    const editor = await fillEditor(page, params.text);
+    const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
     await awaitDispatch();
     await assertNoChallenge(page);
+    if (manifest.length) await attachImages(page, (await composerScope(editor)) || page, manifest);
     await clickUniqueSend(page, ['发布', '提交回答', '提交']);
     await page.waitForTimeout(1500);
     await assertNoChallenge(page);
@@ -1178,7 +1497,9 @@ async function writeAction(page, input) {
       return { ok: true, changed: true };
     }
     await page.waitForTimeout(500);
-    await fillEditor(page, params.text);
+    const editor = await fillEditor(page, params.text);
+    const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
+    if (manifest.length) await attachImages(page, (await composerScope(editor)) || page, manifest);
     const save = await uniqueExactControl(page.locator('button, [role="button"]'), ['确定'])
       || await uniqueExactControl(page.locator('button, [role="button"]'), ['发布'])
       || await uniqueExactControl(page.locator('button, [role="button"]'), ['提交']);
@@ -1216,6 +1537,131 @@ async function writeAction(page, input) {
     const remains = (await collectComments(page, params.answerId, 50)).some((row) => row.id === params.commentId);
     if (remains) throw new Error('result');
     return { ok: true, changed: true };
+  }
+  if (input.actionId === 'create_pin') {
+    await gotoAuthenticated(page, 'https://www.zhihu.com/');
+    const opener = await uniqueExactControl(page.locator('button, [role="button"], [role="tab"], a'), ['写想法', '发想法', '分享你此刻的想法'])
+      || await uniqueVisible(page.getByPlaceholder(/写想法|发想法|分享你此刻的想法/));
+    if (!opener) {
+      emitStep({ step: 'write.compose', ok: false, reason: 'no-composer' });
+      throw new Error('composer');
+    }
+    await opener.click({ timeout: 10_000 });
+    await page.waitForTimeout(800);
+    const text = cleanText(params.text || '', 2000);
+    let editor;
+    if (text) {
+      try { editor = await fillEditor(page, text); }
+      catch (error) {
+        if (String(error && error.message) === 'composer-editor')
+          emitStep({ step: 'write.compose', ok: false, reason: 'no-editor' });
+        throw error;
+      }
+    } else {
+      editor = await uniqueVisible(page.locator('[contenteditable="true"], textarea, .public-DraftEditor-content, .ProseMirror'))
+        || await uniqueVisible(page.locator('[role="textbox"]'));
+      if (!editor) {
+        emitStep({ step: 'write.compose', ok: false, reason: 'no-editor' });
+        throw new Error('composer-editor');
+      }
+    }
+    const scope = (await composerScope(editor)) || page;
+    const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
+    await awaitDispatch();
+    await assertNoChallenge(page);
+    if (manifest.length) await attachImages(page, scope, manifest);
+    const send = await uniqueExactControl(page.locator('button, [role="button"]'), ['发布']);
+    if (!send) {
+      emitStep({ step: 'write.compose', ok: false, reason: 'no-send' });
+      throw new Error('send-button');
+    }
+    await send.click({ timeout: 10_000 }).catch(() => { throw new Error('send-click'); });
+    await page.waitForTimeout(1500);
+    await assertNoChallenge(page);
+    const pin = await projectCreatedPin(page, selfToken, text);
+    return { pin };
+  }
+  if (input.actionId === 'create_article') {
+    await gotoInSite(page, 'https://zhuanlan.zhihu.com/write');
+    const titleBox = await uniqueVisible(page.getByPlaceholder(/请输入标题/));
+    if (!titleBox) {
+      emitStep({ step: 'write.compose', ok: false, reason: 'no-title' });
+      throw new Error('composer');
+    }
+    await titleBox.fill(params.title);
+    const body = await uniqueVisible(page.locator('.public-DraftEditor-content'))
+      || await uniqueVisible(page.locator('[contenteditable="true"]'));
+    if (!body) {
+      emitStep({ step: 'write.compose', ok: false, reason: 'no-editor' });
+      throw new Error('composer-editor');
+    }
+    let editor;
+    try { editor = await fillEditor(page, params.text, body); }
+    catch (error) {
+      if (String(error && error.message) === 'composer-editor')
+        emitStep({ step: 'write.compose', ok: false, reason: 'no-editor' });
+      throw error;
+    }
+    const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
+    await awaitDispatch();
+    await assertNoChallenge(page);
+    if (manifest.length) await attachImages(page, (await composerScope(editor)) || page, manifest);
+    const send = await uniqueExactControl(page.locator('button, [role="button"]'), ['发布文章', '发布']);
+    if (!send) {
+      emitStep({ step: 'write.compose', ok: false, reason: 'no-send' });
+      throw new Error('send-button');
+    }
+    await send.click({ timeout: 10_000 }).catch(() => { throw new Error('send-click'); });
+    await page.waitForTimeout(2000);
+    await assertNoChallenge(page);
+    let articleId = articleIdOf(page.url());
+    for (let attempt = 0; attempt < 8 && !articleId; attempt += 1) {
+      await page.waitForTimeout(750);
+      articleId = articleIdOf(page.url());
+    }
+    if (!articleId) throw new Error('result-projection');
+    const heading = await uniqueVisible(page.locator('h1'));
+    const publishedTitle = cleanText(heading ? await heading.innerText().catch(() => '') : '', 500);
+    if (cleanText(params.title, 500) !== publishedTitle) throw new Error('result-projection');
+    return {
+      article: {
+        id: articleId,
+        title: publishedTitle,
+        url: 'https://zhuanlan.zhihu.com/p/' + articleId,
+        contentDigest: digest({ id: articleId, title: publishedTitle, text: params.text })
+      }
+    };
+  }
+  if (input.actionId === 'reply_comment') {
+    await gotoAuthenticated(page, 'https://www.zhihu.com/answer/' + params.answerId);
+    const root = await findCommentRoot(page, params.commentId);
+    const reply = await uniqueExactActionControl(root, page, ['回复']);
+    if (!reply) {
+      emitStep({ step: 'write.compose', ok: false, reason: 'no-composer' });
+      throw new Error('composer');
+    }
+    await reply.click({ timeout: 10_000 });
+    await page.waitForTimeout(800);
+    try { await fillEditor(page, params.text); }
+    catch (error) {
+      if (String(error && error.message) === 'composer-editor')
+        emitStep({ step: 'write.compose', ok: false, reason: 'no-editor' });
+      throw error;
+    }
+    await awaitDispatch();
+    await assertNoChallenge(page);
+    const send = await uniqueExactControl(page.locator('button, [role="button"]'), ['发布', '回复']);
+    if (!send) {
+      emitStep({ step: 'write.compose', ok: false, reason: 'no-send' });
+      throw new Error('send-button');
+    }
+    await send.click({ timeout: 10_000 }).catch(() => { throw new Error('send-click'); });
+    await page.waitForTimeout(1200);
+    await assertNoChallenge(page);
+    const comments = await collectComments(page, params.answerId, 20);
+    const mine = comments.find((row) => row.authorUrlToken === selfToken && row.text.includes(cleanText(params.text, 40).slice(0, 20)));
+    if (!mine) throw new Error('result');
+    return { comment: mine };
   }
   throw new Error('unsupported');
 }
