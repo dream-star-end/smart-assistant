@@ -12,6 +12,10 @@
  * 来源模型);stdout 输出 JSON,末行单独打印 `COLLATE: <blocker>/<major>/<minor>/<suggestion>`
  * 供程序判读(照 oc-figcheck 的 VERDICT 模式)。
  *
+ * 容错:某位评审员 429/超时/输出非 JSON 时,默认**跳过该文件并标注缺席**(汇总卡顶部
+ * 缺席块 + JSON.skipped + COLLATE 行 ` skipped=<n>`),不让一位评审员的故障作废其余
+ * 评审;全部无效才 exit 1。`--strict` 恢复任一坏文件即 exit 1。
+ *
  * 聚合策略(R7 设计 §4.2):location 归一(章节/图/表/行号锚点)+ severity 档匹配的
  * 粗聚合;宁可漏聚(分别列出)不误聚(把不同问题合并)——分歧呈现是本功能的价值核心。
  * 无网络、无 DB;schema 为 CLI 本地定义,不进 protocol 包。
@@ -214,6 +218,9 @@ export type ReviewerSummary = {
   counts: Record<ReviewSeverity, number>
 }
 
+/** 被跳过的评审文件(坏 JSON/坏 schema/不可读):汇总照常出,但缺席必须可见。 */
+export type SkippedReview = { file: string; reason: string }
+
 export type CollateResult = {
   reviewers: ReviewerSummary[]
   verdictCounts: Record<ReviewVerdict, number>
@@ -221,6 +228,8 @@ export type CollateResult = {
   consensus: ConsensusEntry[]
   divergent: DivergentEntry[]
   sole: SoleEntry[]
+  /** 缺席评审员(默认宽松模式下跳过的坏文件);--strict 时任何坏文件直接 exit 1,此处恒为空。 */
+  skipped: SkippedReview[]
 }
 
 function emptySeverityCounts(): Record<ReviewSeverity, number> {
@@ -247,7 +256,7 @@ function soleSeverity(entry: SoleEntry): ReviewSeverity {
  *   单发 = 该锚点只有一位评审员命中。
  * 同一 finding 命中多锚点时进入每个锚点的桶(输出可能多处出现,如实呈现)。
  */
-export function collateReviews(files: ReviewFile[]): CollateResult {
+export function collateReviews(files: ReviewFile[], skipped: SkippedReview[] = []): CollateResult {
   const sorted = [...files].sort((a, b) => a.reviewer.model.localeCompare(b.reviewer.model))
   const totals = emptySeverityCounts()
   const verdictCounts = emptyVerdictCounts()
@@ -317,12 +326,15 @@ export function collateReviews(files: ReviewFile[]): CollateResult {
   )
   sole.sort((a, b) => sevRank(soleSeverity(a)) - sevRank(soleSeverity(b)) || a.anchor.localeCompare(b.anchor))
 
-  return { reviewers, verdictCounts, totals, consensus, divergent, sole }
+  const skippedSorted = [...skipped].sort((a, b) => a.file.localeCompare(b.file))
+  return { reviewers, verdictCounts, totals, consensus, divergent, sole, skipped: skippedSorted }
 }
 
+/** 末行 `COLLATE: b/m/mi/s`;有缺席评审员时追加 ` skipped=<n>`,程序判读能一眼看出汇总不完整。 */
 export function collateLine(result: CollateResult): string {
   const t = result.totals
-  return `COLLATE: ${t.blocker}/${t.major}/${t.minor}/${t.suggestion}`
+  const base = `COLLATE: ${t.blocker}/${t.major}/${t.minor}/${t.suggestion}`
+  return result.skipped.length > 0 ? `${base} skipped=${result.skipped.length}` : base
 }
 
 function oneLine(text: string): string {
@@ -339,6 +351,13 @@ export function renderSummaryMd(result: CollateResult): string {
     lines.push(
       `- \`${r.model}\`${role} verdict=${r.verdict},findings: ${SEVERITIES.map((s) => `${s}=${r.counts[s]}`).join(' ')}`,
     )
+  }
+  if (result.skipped.length > 0) {
+    lines.push(
+      '',
+      `> **缺席 ${result.skipped.length} 位评审员**(评审文件坏格式已跳过,本汇总不完整;修文件后重跑可补齐):`,
+    )
+    for (const s of result.skipped) lines.push(`> - \`${s.file}\`: ${oneLine(s.reason)}`)
   }
   const vc = result.verdictCounts
   lines.push(
@@ -397,9 +416,10 @@ export type OcReviewCliResult = { exitCode: number; stdout: string; stderr: stri
 
 const USAGE = [
   'usage: oc-review schema',
-  '       oc-review collate --dir <dir> [--out <summary.md>]',
+  '       oc-review collate --dir <dir> [--out <summary.md>] [--strict]',
   '  schema   打印评审员 JSON schema(贴进委派 prompt)',
   '  collate  读 <dir>/reviews-*.json → 写 review-summary.md/.json,stdout 末行 COLLATE',
+  '           坏格式文件默认跳过并标注缺席(COLLATE 行追加 skipped=<n>);--strict 任一坏文件即 exit 1',
 ].join('\n')
 
 function parseSimpleFlags(args: string[]): Record<string, string> {
@@ -428,22 +448,34 @@ function runCollate(rest: string[]): OcReviewCliResult {
     return err(`cannot read dir: ${dir}`)
   }
   if (names.length === 0) return err(`no reviews-*.json in ${dir}`)
+  // 默认宽松:坏文件跳过并在汇总卡/JSON/COLLATE 行标注缺席(一位评审员 429/超时/输出非 JSON
+  // 不该让其余评审员的结果全部作废);--strict 恢复任一坏文件即 exit 1 的旧行为。
+  const strict = flags.strict !== undefined
   const files: ReviewFile[] = []
+  const skipped: SkippedReview[] = []
   for (const name of names) {
     let text: string
     try {
       text = readFileSync(join(dir, name), 'utf8')
     } catch {
-      return err(`cannot read ${join(dir, name)}`)
+      if (strict) return err(`cannot read ${join(dir, name)}`)
+      skipped.push({ file: name, reason: 'cannot read file' })
+      continue
     }
     try {
       files.push(parseReviewFile(text, name))
     } catch (e) {
       const msg = e instanceof ReviewFormatError ? e.message : String(e)
-      return err(msg)
+      if (strict) return err(msg)
+      const prefix = `${name}: `
+      skipped.push({ file: name, reason: msg.startsWith(prefix) ? msg.slice(prefix.length) : msg })
     }
   }
-  const result = collateReviews(files)
+  if (files.length === 0) {
+    const detail = skipped.map((s) => `${s.file}: ${s.reason}`).join('; ')
+    return err(`no valid reviews-*.json in ${dir} (${detail})`)
+  }
+  const result = collateReviews(files, skipped)
   const md = renderSummaryMd(result)
   const mdPath = flags.out !== undefined && flags.out !== 'true' ? flags.out : join(dir, 'review-summary.md')
   const jsonPath = mdPath.endsWith('.md') ? `${mdPath.slice(0, -3)}.json` : `${mdPath}.json`

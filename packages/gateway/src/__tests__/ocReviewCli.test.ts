@@ -305,27 +305,81 @@ describe('runOcReviewCli collate 端到端(临时目录)', () => {
     }
   })
 
-  it('坏 JSON / 坏枚举文件 → exit 1 且 stderr 带文件名与字段路径', () => {
-    const dir = writeReviews({ 'reviews-a.json': '{oops', 'reviews-b.json': kimiBody })
+  const badSev = {
+    reviewer: { model: 'm' },
+    verdict: 'accept',
+    findings: [{ location: '§1', severity: 'fatal', issue: 'x' }],
+  }
+
+  it('默认宽松:坏文件跳过并标注缺席,其余评审员照常汇总(exit 0,COLLATE 带 skipped=)', () => {
+    const dir = writeReviews({
+      'reviews-a.json': '{oops',
+      'reviews-kimi.json': kimiBody,
+      'reviews-glm.json': glmBody,
+    })
     try {
       const r = runOcReviewCli(['collate', '--dir', dir])
-      assert.equal(r.exitCode, 1)
-      assert.match(r.stderr, /reviews-a\.json: invalid JSON/)
+      assert.equal(r.exitCode, 0, r.stderr)
+      const lines = r.stdout.trimEnd().split('\n')
+      assert.equal(lines[lines.length - 1], 'COLLATE: 1/2/0/0 skipped=1')
+      const json = JSON.parse(readFileSync(join(dir, 'review-summary.json'), 'utf8'))
+      assert.equal(json.reviewers.length, 2)
+      assert.deepEqual(json.skipped, [{ file: 'reviews-a.json', reason: 'invalid JSON' }])
+      const md = readFileSync(join(dir, 'review-summary.md'), 'utf8')
+      assert.match(md, /缺席 1 位评审员/)
+      assert.match(md, /`reviews-a\.json`: invalid JSON/)
+      // 缺席块必须在共识区之前(读者先知道汇总不完整)
+      assert.ok(md.indexOf('缺席 1 位评审员') < md.indexOf('## 共识'))
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
-    const badSev = {
-      reviewer: { model: 'm' },
-      verdict: 'accept',
-      findings: [{ location: '§1', severity: 'fatal', issue: 'x' }],
-    }
-    const dir2 = writeReviews({ 'reviews-c.json': badSev })
+  })
+
+  it('全部文件无效 → exit 1 并逐个列出原因', () => {
+    const dir = writeReviews({ 'reviews-a.json': '{oops', 'reviews-c.json': badSev })
     try {
-      const r = runOcReviewCli(['collate', '--dir', dir2])
+      const r = runOcReviewCli(['collate', '--dir', dir])
+      assert.equal(r.exitCode, 1)
+      assert.match(r.stderr, /no valid reviews-\*\.json/)
+      assert.match(r.stderr, /reviews-a\.json: invalid JSON/)
+      assert.match(r.stderr, /reviews-c\.json: findings\[0\]\.severity/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('--strict:任一坏文件 → exit 1 且 stderr 带文件名与字段路径,不写汇总卡', () => {
+    const dir = writeReviews({ 'reviews-a.json': '{oops', 'reviews-b.json': kimiBody })
+    try {
+      const r = runOcReviewCli(['collate', '--dir', dir, '--strict'])
+      assert.equal(r.exitCode, 1)
+      assert.match(r.stderr, /reviews-a\.json: invalid JSON/)
+      assert.throws(() => readFileSync(join(dir, 'review-summary.md')))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+    const dir2 = writeReviews({ 'reviews-c.json': badSev, 'reviews-d.json': kimiBody })
+    try {
+      const r = runOcReviewCli(['collate', '--dir', dir2, '--strict'])
       assert.equal(r.exitCode, 1)
       assert.match(r.stderr, /reviews-c\.json: findings\[0\]\.severity/)
     } finally {
       rmSync(dir2, { recursive: true, force: true })
+    }
+  })
+
+  it('无缺席时 COLLATE 行与 JSON.skipped 形态不变(向后兼容)', () => {
+    const dir = writeReviews({ 'reviews-kimi.json': kimiBody })
+    try {
+      const r = runOcReviewCli(['collate', '--dir', dir])
+      assert.equal(r.exitCode, 0, r.stderr)
+      assert.match(r.stdout, /\nCOLLATE: 1\/1\/0\/0\n$/)
+      const json = JSON.parse(readFileSync(join(dir, 'review-summary.json'), 'utf8'))
+      assert.deepEqual(json.skipped, [])
+      const md = readFileSync(join(dir, 'review-summary.md'), 'utf8')
+      assert.doesNotMatch(md, /缺席/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 
