@@ -378,4 +378,137 @@ describe('Plugin runtime facade', () => {
       (error: unknown) => error instanceof PluginRuntimeFacadeError && error.code === 'BAD_REQUEST',
     )
   })
+
+  test('seals Zhihu destructive writes only to an owned answer or own comment', async () => {
+    const facade = new PluginRuntimeFacade({
+      pool: { query: async () => result([]) } as never,
+      redis: null,
+    })
+    const prepare = (
+      facade as unknown as {
+        prepareZhihuWriteParams(input: {
+          userId: number
+          targetId: string
+          actionId: string
+          params: Record<string, unknown>
+        }): Promise<Record<string, unknown>>
+      }
+    ).prepareZhihuWriteParams.bind(facade)
+    const base = { userId: 7, targetId: '41' }
+    const digest = 'c'.repeat(64)
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async (input) => {
+      if (input.actionId === 'get_self') return { user: { urlToken: 'me' } }
+      if (input.actionId === 'get_answer')
+        return {
+          answer: {
+            id: '9',
+            authorUrlToken: 'me',
+            contentDigest: digest,
+            updatedAt: '编辑于 2024-01-01',
+          },
+        }
+      throw new Error('unexpected read')
+    }
+    const deleted = await prepare({
+      ...base,
+      actionId: 'delete_answer',
+      params: { answerId: '9' },
+    })
+    assert.deepEqual(deleted.snapshot, { expectedDigest: digest, owned: true })
+    const edited = await prepare({
+      ...base,
+      actionId: 'edit_answer',
+      params: { answerId: '9', text: '改写' },
+    })
+    assert.deepEqual(edited.snapshot, { expectedDigest: digest, owned: true })
+    assert.equal(edited.text, '改写')
+
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async (input) => {
+      if (input.actionId === 'get_self') return { user: { urlToken: 'me' } }
+      if (input.actionId === 'get_answer')
+        return {
+          answer: {
+            id: '9',
+            authorUrlToken: 'other',
+            contentDigest: digest,
+            updatedAt: '编辑于 2024-01-01',
+          },
+        }
+      throw new Error('unexpected read')
+    }
+    await assert.rejects(
+      prepare({
+        ...base,
+        actionId: 'edit_answer',
+        params: { answerId: '9', text: '改写' },
+      }),
+      (error: unknown) =>
+        error instanceof PluginRuntimeFacadeError &&
+        error.code === 'BAD_REQUEST' &&
+        /snapshot/.test(error.message),
+    )
+
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async (input) => {
+      if (input.actionId === 'get_self') return { user: { urlToken: 'me' } }
+      if (input.actionId === 'list_answer_comments')
+        return {
+          comments: [
+            {
+              id: '1',
+              answerId: '9',
+              authorUrlToken: 'me',
+              contentDigest: 'd'.repeat(64),
+              updatedAt: '发布于 2024-01-02',
+            },
+          ],
+        }
+      throw new Error('unexpected read')
+    }
+    const ownComment = await prepare({
+      ...base,
+      actionId: 'delete_comment',
+      params: { answerId: '9', commentId: '1' },
+    })
+    assert.deepEqual(ownComment.snapshot, { expectedDigest: 'd'.repeat(64), owned: true })
+
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async (input) => {
+      if (input.actionId === 'get_self') return { user: { urlToken: 'me' } }
+      if (input.actionId === 'list_answer_comments')
+        return {
+          comments: [
+            {
+              id: '1',
+              answerId: '8',
+              authorUrlToken: 'me',
+              contentDigest: 'd'.repeat(64),
+              updatedAt: '发布于 2024-01-02',
+            },
+          ],
+        }
+      throw new Error('unexpected read')
+    }
+    await assert.rejects(
+      prepare({
+        ...base,
+        actionId: 'delete_comment',
+        params: { answerId: '9', commentId: '1' },
+      }),
+      (error: unknown) =>
+        error instanceof PluginRuntimeFacadeError &&
+        error.code === 'BAD_REQUEST' &&
+        /snapshot/.test(error.message),
+    )
+
+    await assert.rejects(
+      prepare({
+        ...base,
+        actionId: 'delete_answer',
+        params: {
+          answerId: '9',
+          snapshot: { expectedDigest: digest, owned: true },
+        },
+      }),
+      (error: unknown) => error instanceof PluginRuntimeFacadeError && error.code === 'BAD_REQUEST',
+    )
+  })
 })
