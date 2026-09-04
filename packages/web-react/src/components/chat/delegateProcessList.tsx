@@ -5,6 +5,7 @@
 import { useCallback, useLayoutEffect, useRef, useState, type UIEvent, type WheelEvent } from "react";
 import type { ChildBlock } from "../../lib/chat/model";
 import { childSignature } from "../../lib/chat/render";
+import { formatBytes } from "../../lib/chat/download";
 import { groupDigits } from "../../lib/utils";
 import { ChildBlockView } from "./AgentGroupCard";
 
@@ -28,12 +29,6 @@ export function anchoredScrollTop(
   prevScrollTop: number,
 ): number {
   return prevScrollTop + (nextScrollHeight - prevScrollHeight);
-}
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n}B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)}KB`;
-  return `${(n / (1024 * 1024)).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)}MB`;
 }
 
 function lastBashTailBytes(children: ChildBlock[]): number | null {

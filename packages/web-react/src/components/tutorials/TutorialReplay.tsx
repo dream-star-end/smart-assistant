@@ -1,6 +1,7 @@
 import { ChevronDown, Loader2, RotateCcw } from "lucide-react";
 import { Component, type ReactNode, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
+import { formatBytes } from "../../lib/chat/download";
 import type {
   TutorialCase,
   TutorialCaseId,
@@ -67,12 +68,6 @@ function assertExactKeys(
 
 function isNonNegativeInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function parseManifest(payload: unknown, caseId: TutorialCaseId): ReplayManifest {
