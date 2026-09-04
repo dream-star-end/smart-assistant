@@ -54,3 +54,7 @@ packages/commercial/src/__tests__/runtimeKindIsolation.integ.test.ts
 packages/commercial/src/__tests__/desktopEnroll.integ.test.ts
 packages/commercial/src/__tests__/desktopTunnel.integ.test.ts
 packages/commercial/src/__tests__/desktopE2e.integ.test.ts
+packages/commercial/src/__tests__/desktopResolver.integ.test.ts
+packages/commercial/src/__tests__/desktopTokenMtls.integ.test.ts
+packages/commercial/src/__tests__/migration0255.integ.test.ts
+packages/commercial/src/__tests__/migration0259.integ.test.ts

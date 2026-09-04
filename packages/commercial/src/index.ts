@@ -116,13 +116,20 @@ import {
   startRefreshEventsSweeper,
   type SweeperHandle as RefreshEventsSweeperHandle,
 } from "./account-pool/refreshEventsSweeper.js";
-import { startDesktopEnrollmentSweep, createPgDesktopIdentityRepo } from "./http/desktopEnroll.js";
+import {
+  startDesktopEnrollmentSweep,
+  createPgDesktopIdentityRepo,
+  handleDesktopTokenMint,
+  handleDesktopTokenRefresh,
+  desktopTokenRequestContext,
+} from "./http/desktopEnroll.js";
 import { startDesktopTlsListener, makeDesktopRequestVerifier } from "./http/desktopTlsListener.js";
 import { makeDesktopIdentityStrategy } from "./auth/desktopIdentity.js";
 import { extractDesktopTlsContext } from "./desktop/tlsContext.js";
 import { makeDesktopContainerTransport } from "./wechat/desktopContainerTransport.js";
 import { resolveDispatchEndpoint } from "./dispatch/resolveDispatchEndpoint.js";
 import { getDesktopFlagSnapshot } from "./desktop/flags.js";
+import { getDesktopTunnelRegistry } from "./ws/desktopTunnelRegistry.js";
 import {
   startAuditRetentionSweeper,
   type AuditRetentionSweeperHandle,
@@ -225,6 +232,10 @@ import {
 } from "./selfheal/userNoticeApproval.js";
 import {
   makeAnthropicProxyHandler,
+  ConcurrencyLimiter,
+  FallbackRateLimiter,
+  DEFAULT_PROXY_RATE_LIMIT,
+  DEFAULT_MAX_CONCURRENT_PER_UID,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured, STATIC_PROVIDER_META } from "./http/proxy/staticProviderMeta.js";
@@ -626,6 +637,7 @@ import {
   makePrewarmContainer,
   makeUidSingleflight,
   makeV3EnsureRunning,
+  makeDesktopOrDockerResolver,
   preheatV3Image,
   startIdleSweepScheduler,
   INITIAL_SWEEP_BATCH_LIMIT,
@@ -1988,6 +2000,11 @@ export async function registerCommercial(
           err,
         );
       }
+      const sharedProxyConcurrency = new ConcurrencyLimiter(DEFAULT_MAX_CONCURRENT_PER_UID);
+      const sharedProxyFallback = new FallbackRateLimiter(
+        DEFAULT_PROXY_RATE_LIMIT.windowSeconds,
+        Math.max(1, Math.floor(DEFAULT_PROXY_RATE_LIMIT.max / 3)),
+      );
       internalProxyHandler = makeAnthropicProxyHandler({
         pgPool: getPool(),
         pricing,
@@ -1999,6 +2016,8 @@ export async function registerCommercial(
         identity: identityStrategy,
         loadUserModelAuthz,
         rateLimitRedis,
+        concurrencyLimiter: sharedProxyConcurrency,
+        fallbackLimiter: sharedProxyFallback,
         // HOTFIX 2026-04-21: 不传 refreshDeps 导致 anthropicProxy 里
         //   `deps.refreshDeps && pick.expires_at && shouldRefresh(...)` 永远 false,
         // OAuth token 过期后不会自动 refresh,结果上游直接 401。
@@ -2519,12 +2538,22 @@ export async function registerCommercial(
           getPhase6AccountUuidEnforce,
           getSessionPinMode,
           listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
+          concurrencyLimiter: sharedProxyConcurrency,
+          fallbackLimiter: sharedProxyFallback,
         });
+        const deskHttpDeps = {
+          jwtSecret,
+          mailer: stubMailer,
+          redis: wrapIoredis(redis),
+          desktopTunnelRegistry: getDesktopTunnelRegistry(),
+        } as import("./http/handlers.js").CommercialHttpDeps;
         const listener = await startDesktopTlsListener({
           role: "master",
           allowRegister: true,
           handlers: {
             messages: deskMessages,
+            tokenMint: (req, res) => handleDesktopTokenMint(req, res, desktopTokenRequestContext(req), deskHttpDeps),
+            tokenRefresh: (req, res) => handleDesktopTokenRefresh(req, res, desktopTokenRequestContext(req), deskHttpDeps),
             serverAuthored: makeServerAuthoredHandler({
               identityRepo,
               verify: deskVerify,
@@ -3780,12 +3809,15 @@ export async function registerCommercial(
   // One endpoint resolver is shared by chat, legacy screencast and direct
   // iframe transports. Keep it above HTTP handler assembly so the optional
   // direct service can own public preview-host requests from the first byte.
+  //
+  // Desktop vs docker: assembled + active desktop row → desktop resolver
+  // (registry miss is desktop_offline, never silent docker provision).
+  // Flag off / no desktop row → the same sharedEnsureRunning singleflight
+  // instance (not a new wrapper). Desktop has no PSK so it uses its own
+  // lookup singleflight without cloneResult/dispose.
   const resolveContainerEndpoint: ResolveContainerEndpoint =
     options.resolveContainerEndpoint
-    ?? sharedEnsureRunning
-    ?? (async (_uid: bigint) => {
-      throw new ContainerUnreadyError(5, "supervisor_not_wired");
-    });
+    ?? makeDesktopOrDockerResolver(sharedEnsureRunning);
 
   // V5 container-local web preview is intentionally atomic: the HTTP ticket
   // endpoint stays unavailable until the authenticated public WS bridge has

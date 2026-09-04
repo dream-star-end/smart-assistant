@@ -1,5 +1,13 @@
 /**
- * Desktop P1 D-stage live TCP/TLS E2E.
+ * Desktop P1 D-stage live TCP/TLS E2E (transport layer).
+ *
+ * This suite drives a real 18445 listener + loopback fake gateway. It is not a
+ * production full-flow: token mint historically injected desktopPeerCert and
+ * called the handler directly; /v1/messages uses a journal stub, not
+ * makeAnthropicProxyHandler; scene 9 constructs a desktop endpoint by hand.
+ * Full-flow coverage lives in desktopResolver.integ.test.ts (E1 composition
+ * root + userChatBridge) and desktopTokenMtls.integ.test.ts (E2 live mTLS
+ * token paths).
  *
  * REQUIRE_TEST_DB=1 bash scripts/test-mutex.sh commercial \
  *   'npx tsx --test --test-force-exit --test-concurrency=1 --test-timeout=180000 \
