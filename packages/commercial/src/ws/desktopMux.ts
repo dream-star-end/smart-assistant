@@ -7,6 +7,7 @@
 
 import { EventEmitter } from "node:events";
 import WebSocket from "ws";
+import { rootLogger } from "../logging/logger.js";
 
 export const MUX_VERSION = 1;
 export const MUX_PROTOCOL_NAME = "oc-desktop-mux/1";
@@ -17,6 +18,8 @@ export const MAX_STREAMS_PER_TUNNEL = 32;
 export const FLAG_FIN = 0x01;
 export const HEARTBEAT_INTERVAL_MS = 15_000;
 export const HEARTBEAT_TIMEOUT_MS = 45_000;
+export const HEARTBEAT_MIN_INTERVAL_MS = 5_000;
+export const HEARTBEAT_OVERSPEED_LIMIT = 8;
 
 export const MuxType = {
   OPEN_HTTP: 0x01,
@@ -192,6 +195,9 @@ export class DesktopMuxSession {
   private lastBeat = Date.now();
   private readonly beatWatch: ReturnType<typeof setInterval>;
   private readonly maxFrameBytes: number;
+  private hbInflight = false;
+  private hbLastStart = 0;
+  private hbOverSpeed = 0;
 
   constructor(
     private readonly transport: MuxTransport,
@@ -233,6 +239,7 @@ export class DesktopMuxSession {
     const bodyBuf = req.body == null ? Buffer.alloc(0) : Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body, "utf8");
     if (bodyBuf.length > MAX_HTTP_BODY) {
       this.reset(streamId, "BODY_TOO_LARGE", "request body too large");
+      this.finishHttp(streamId);
       throw new MuxProtocolError("BODY_TOO_LARGE", "request body too large", streamId);
     }
     const deadline = req.deadlineMs;
@@ -251,6 +258,7 @@ export class DesktopMuxSession {
     return new Promise<MuxHttpResponse>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.reset(streamId, "TIMEOUT", "OPEN_HTTP deadline");
+        this.finishHttp(streamId);
         reject(new MuxProtocolError("TRANSPORT_TIMEOUT_ERROR", "desktop mux HTTP timeout", streamId));
       }, waitMs);
       this.httpWait.set(streamId, {
@@ -330,7 +338,7 @@ export class DesktopMuxSession {
       return;
     }
     if (frame.type === MuxType.HEARTBEAT) {
-      void this.onHeartbeat(frame);
+      this.dispatchHeartbeat(frame);
       return;
     }
     if (frame.type === MuxType.GOAWAY) {
@@ -369,7 +377,7 @@ export class DesktopMuxSession {
     }
   }
 
-  private async onHeartbeat(frame: MuxFrame): Promise<void> {
+  private dispatchHeartbeat(frame: MuxFrame): void {
     this.lastBeat = Date.now();
     let payload: Record<string, unknown> = {};
     try {
@@ -378,13 +386,42 @@ export class DesktopMuxSession {
       this.failClosed(new MuxProtocolError("PROTOCOL", "bad heartbeat json"));
       return;
     }
-    const ok = this.hooks.onHeartbeat ? await this.hooks.onHeartbeat(payload) : true;
-    if (!ok) {
-      this.failClosed(new MuxProtocolError("EXPIRED", "heartbeat rejected"));
+    const now = Date.now();
+    if (this.hbInflight) {
+      this.send(encodeJsonFrame(MuxType.HEARTBEAT_ACK, 0, { ts: payload.ts ?? Date.now(), serverNow: Date.now() }));
       return;
     }
-    this.hooks.onActivity?.();
-    this.send(encodeJsonFrame(MuxType.HEARTBEAT_ACK, 0, { ts: payload.ts ?? Date.now(), serverNow: Date.now() }));
+    const tooSoon = this.hbLastStart > 0 && now - this.hbLastStart < HEARTBEAT_MIN_INTERVAL_MS;
+    if (tooSoon) {
+      this.hbOverSpeed += 1;
+      if (this.hbOverSpeed >= HEARTBEAT_OVERSPEED_LIMIT) {
+        this.failClosed(new MuxProtocolError("HEARTBEAT_RATE", "heartbeat overspeed"));
+        return;
+      }
+      this.send(encodeJsonFrame(MuxType.HEARTBEAT_ACK, 0, { ts: payload.ts ?? Date.now(), serverNow: Date.now() }));
+      return;
+    }
+    this.hbOverSpeed = 0;
+    this.hbInflight = true;
+    this.hbLastStart = now;
+    void this.runHeartbeatHook(payload);
+  }
+
+  private async runHeartbeatHook(payload: Record<string, unknown>): Promise<void> {
+    try {
+      const ok = this.hooks.onHeartbeat ? await this.hooks.onHeartbeat(payload) : true;
+      if (!ok) {
+        this.failClosed(new MuxProtocolError("EXPIRED", "heartbeat rejected"));
+        return;
+      }
+      this.hooks.onActivity?.();
+      this.send(encodeJsonFrame(MuxType.HEARTBEAT_ACK, 0, { ts: payload.ts ?? Date.now(), serverNow: Date.now() }));
+    } catch (err) {
+      rootLogger.warn("desktop_mux_heartbeat_rejected", { err: (err as Error)?.message });
+      this.failClosed(new MuxProtocolError("EXPIRED", "heartbeat hook failed"));
+    } finally {
+      this.hbInflight = false;
+    }
   }
 
   private onResponseStart(frame: MuxFrame): void {

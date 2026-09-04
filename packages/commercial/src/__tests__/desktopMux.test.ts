@@ -122,4 +122,67 @@ describe("mux codec golden vectors", () => {
     assert.equal(res.bodyText, "abcd");
     master.close();
   });
+
+  test("oversized request body cleans the stream slot (W-03)", async () => {
+    const pair = createMuxLoopbackPair();
+    const master = new DesktopMuxSession(pair.master);
+    const { MAX_HTTP_BODY } = await import("../ws/desktopMux.js");
+    await assert.rejects(
+      () => master.http({
+        method: "POST",
+        path: "/",
+        headers: {},
+        body: Buffer.alloc(MAX_HTTP_BODY + 1),
+        deadlineMs: Date.now() + 2_000,
+      }, 2_000),
+      (e: unknown) => e instanceof MuxProtocolError && e.code === "BODY_TOO_LARGE",
+    );
+    assert.equal(master.size, 0);
+    master.close();
+  });
+
+  test("http timeout cleans the stream slot (W-03)", async () => {
+    const pair = createMuxLoopbackPair();
+    const master = new DesktopMuxSession(pair.master);
+    await assert.rejects(
+      () => master.http({ method: "GET", path: "/", headers: {}, deadlineMs: Date.now() + 30 }, 30),
+      (e: unknown) => e instanceof MuxProtocolError && e.code === "TRANSPORT_TIMEOUT_ERROR",
+    );
+    assert.equal(master.size, 0);
+    master.close();
+  });
+
+  test("1000 HEARTBEAT frames produce a single in-flight hook query", async () => {
+    const pair = createMuxLoopbackPair();
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const master = new DesktopMuxSession(pair.master, {
+      onHeartbeat: async () => {
+        calls += 1;
+        await gate;
+        return true;
+      },
+    });
+    for (let i = 0; i < 1000; i++) {
+      pair.desktop.send(encodeJsonFrame(MuxType.HEARTBEAT, 0, { ts: i }));
+    }
+    await drain();
+    assert.equal(calls, 1);
+    release();
+    await drain();
+    master.close();
+  });
+
+  test("heartbeat hook rejection drops the tunnel and does not throw unhandled", async () => {
+    const pair = createMuxLoopbackPair();
+    let closed = false;
+    const master = new DesktopMuxSession(pair.master, {
+      onHeartbeat: async () => { throw new Error("pg down"); },
+      onClose: () => { closed = true; },
+    });
+    pair.desktop.send(encodeJsonFrame(MuxType.HEARTBEAT, 0, { ts: 1 }));
+    await drain();
+    assert.equal(closed, true);
+  });
 });
