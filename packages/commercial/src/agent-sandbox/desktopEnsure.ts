@@ -47,11 +47,15 @@ export async function makeDesktopEnsureAttached(uid: bigint): Promise<DesktopAtt
 }
 
 /**
- * Production composition root selector.
+ * Production composition root selector for **userChatBridge** (and other
+ * surfaces that are allowed to prefer a live desktop tunnel).
  *
  * assembled + active desktop row → desktop (registry miss is desktop_offline,
  * never silent docker provision). Otherwise the caller-supplied docker ensure
  * (must be the existing sharedEnsureRunning instance).
+ *
+ * WeChat / QQ inbound must **not** use this. Design v2 §1.2 / §4.5.3: channel
+ * inbound stays on the cloud docker container. Use `makeInboundChannelResolver`.
  */
 export function makeDesktopOrDockerResolver(
   dockerEnsure: ResolveContainerEndpoint | undefined,
@@ -63,5 +67,29 @@ export function makeDesktopOrDockerResolver(
     if (desktop) return desktop;
     if (dockerEnsure) return dockerEnsure(uid);
     throw new ContainerUnreadyError(5, "supervisor_not_wired");
+  };
+}
+
+/**
+ * Docker-only resolver for WeChat / QQ inbound (and container-local preview).
+ *
+ * Calls the existing sharedEnsureRunning singleflight instance (never a new
+ * wrapper). A desktop endpoint is fail-closed: inbound must not be hijacked
+ * onto `desktop-reverse` (SSRF) or `desktop_offline` (cold_start while docker
+ * is healthy).
+ */
+export function makeInboundChannelResolver(
+  dockerEnsure: ResolveContainerEndpoint | undefined,
+): ResolveContainerEndpoint {
+  const docker: ResolveContainerEndpoint = dockerEnsure
+    ?? (async () => {
+      throw new ContainerUnreadyError(5, "supervisor_not_wired");
+    });
+  return async (uid) => {
+    const endpoint = await docker(uid);
+    if (endpoint.desktop) {
+      throw new ContainerUnreadyError(5, "desktop_not_allowed_for_inbound");
+    }
+    return endpoint;
   };
 }

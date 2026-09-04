@@ -201,7 +201,11 @@ export { makePrewarmContainer } from "./v3prewarm.js";
 // `resolveContainerEndpoint` 默认共享同一闭包,合并 reload 同瞬间的 ensure race。
 // 详见 ensureContainerSingleflight.ts 文件头注释 + index.ts `sharedEnsureRunning`。
 export { makeUidSingleflight } from "./ensureContainerSingleflight.js";
-export { makeDesktopEnsureAttached, makeDesktopOrDockerResolver } from "./desktopEnsure.js";
+export {
+  makeDesktopEnsureAttached,
+  makeDesktopOrDockerResolver,
+  makeInboundChannelResolver,
+} from "./desktopEnsure.js";
 
 // V5 exact-prompt evaluation overlay. Default path is inert; only the two fixed
 // synthetic UIDs plus a root-owned expiring record can activate it.

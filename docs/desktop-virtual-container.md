@@ -16,6 +16,20 @@
 
 旗子关：enrollment 404、不 bind 18445、docker 路径字节级不变。
 
+## 谁走 desktop、谁只走 docker
+
+组合根把 resolver 拆成两路，不能共用 desktop 优先序：
+
+| 消费者 | resolver | 原因 |
+|---|---|---|
+| `userChatBridge` / 用户 turn 派发 | `makeDesktopOrDockerResolver(sharedEnsureRunning)` | 设计允许网页 chat 走桌面隧道；registry miss → `desktop_offline`，不静默 provision docker |
+| 微信 / QQ inbound dispatcher | `makeInboundChannelResolver(sharedEnsureRunning)`（同一 singleflight） | 设计稿 v2 §1.2 / §4.5.3：渠道仍在云端容器。P1 不对 desktop 调 |
+| container-local preview（direct iframe / preview WS） | 同上 docker-only | preview 打的是容器网段 HTTP；`desktop-reverse` 不是可路由 docker IP |
+| `/api/media-signed`、cron wake、prewarm、uploads 冷启动 | 直接 `sharedEnsureRunning` | 本来就是 docker provision |
+| turn-dispatch reconciler | 独立 `makeDesktopContainerTransport` | 只收敛**已经** admitted 的 desktop turn，不是 inbound 入口 |
+
+inbound 入口若仍收到 `endpoint.desktop` 或 `desktop_offline`：审计后回退 docker ensure；没有回退则 fail-closed（`transport_failed`），**不会**变成 SSRF `TRANSPORT_HOST_BLOCKED` 或 `desktop_offline` cold_start。
+
 ## 端口
 
 | 端口 | 用途 |

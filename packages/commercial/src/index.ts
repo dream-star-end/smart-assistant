@@ -638,6 +638,7 @@ import {
   makeUidSingleflight,
   makeV3EnsureRunning,
   makeDesktopOrDockerResolver,
+  makeInboundChannelResolver,
   preheatV3Image,
   startIdleSweepScheduler,
   INITIAL_SWEEP_BATCH_LIMIT,
@@ -3806,15 +3807,25 @@ export async function registerCommercial(
     }
   };
 
-  // One endpoint resolver is shared by chat, legacy screencast and direct
-  // iframe transports. Keep it above HTTP handler assembly so the optional
-  // direct service can own public preview-host requests from the first byte.
+  // Endpoint resolver split (P1-IMPL-09 / design v2 §1.2 / §4.5.3):
   //
-  // Desktop vs docker: assembled + active desktop row → desktop resolver
-  // (registry miss is desktop_offline, never silent docker provision).
-  // Flag off / no desktop row → the same sharedEnsureRunning singleflight
-  // instance (not a new wrapper). Desktop has no PSK so it uses its own
-  // lookup singleflight without cloneResult/dispose.
+  //   dockerEnsureRunning — WeChat / QQ inbound, container-local preview
+  //     (direct iframe + preview WS), media-signed / cron / prewarm (already
+  //     on sharedEnsureRunning below). Channel inbound must stay on the cloud
+  //     docker container. Same sharedEnsureRunning singleflight instance; the
+  //     wrapper only fail-closes a desktop endpoint, it does not create a
+  //     second in-flight map.
+  //
+  //   resolveContainerEndpoint — userChatBridge only (plus test override).
+  //     assembled + active desktop row → desktop; registry miss is
+  //     desktop_offline, never silent docker provision. Flag off / no desktop
+  //     row → the same sharedEnsureRunning singleflight.
+  //
+  // Turn-dispatch reconciler does **not** use either of these; it injects
+  // makeDesktopContainerTransport separately for already-admitted desktop
+  // turns. Screencast / legacy /ws/agent is gone (v5 uses user-chat-bridge).
+  const dockerEnsureRunning: ResolveContainerEndpoint =
+    makeInboundChannelResolver(sharedEnsureRunning);
   const resolveContainerEndpoint: ResolveContainerEndpoint =
     options.resolveContainerEndpoint
     ?? makeDesktopOrDockerResolver(sharedEnsureRunning);
@@ -3843,7 +3854,9 @@ export async function registerCommercial(
     try {
       directContainerPreview = createDirectContainerPreviewService({
         signer: modelAuthoritySigner,
-        resolveContainerEndpoint,
+        // Preview is container-local HTTP. desktop-reverse is not a routable
+        // docker IP; keep this on dockerEnsureRunning (P1-IMPL-09).
+        resolveContainerEndpoint: dockerEnsureRunning,
         parentOrigin: containerPreviewBaseUrl,
         tunnelOrigin: `http://127.0.0.1:${options.gatewayPort}`,
         cloudflaredBinary: process.env.OC_CONTAINER_PREVIEW_CLOUDFLARED_BIN,
@@ -3946,10 +3959,11 @@ export async function registerCommercial(
 
   // V3 Phase 2 Task 2H + Phase 3D:用户 WS ↔ 容器 WS 桥接(/ws/user-chat-bridge)。
   //
-  // resolveContainerEndpoint 的解析顺序(高优先 → 低优先):
-  //   1. options.resolveContainerEndpoint(测试 / 显式覆盖)
-  //   2. v3 supervisor(env 完备 → makeV3EnsureRunning,见上方 v3Deps 装配)
-  //   3. stub `supervisor_not_wired`(Phase 2 行为,/healthz 仍报 commercial up)
+  // userChatBridge resolveContainerEndpoint 的解析顺序(高优先 → 低优先):
+  //   1. options.resolveContainerEndpoint(测试 / 显式覆盖;只覆盖 chat,不覆盖渠道 inbound)
+  //   2. makeDesktopOrDockerResolver(sharedEnsureRunning)(生产默认)
+  //   3. 无 docker ensure → stub `supervisor_not_wired`
+  // WeChat / QQ / preview 走 dockerEnsureRunning,不受 options stub 影响。
   //
   // 注:v3Deps 已在 createCommercialHandler 之前装配(HIGH#6 admin v3 dispatch 需要)。
 
@@ -4059,7 +4073,8 @@ export async function registerCommercial(
       containerPreviewBridge = createContainerPreviewBridge({
         tickets: containerPreviewTickets,
         signer: modelAuthoritySigner,
-        resolveContainerEndpoint,
+        // Same docker-only contract as direct preview (P1-IMPL-09).
+        resolveContainerEndpoint: dockerEnsureRunning,
         allowedOrigin: containerPreviewBaseUrl,
         maxGlobalSessions: Number(process.env.OC_CONTAINER_PREVIEW_MAX_SESSIONS),
         createTunnelContainerSocket: (tunnel, port, assertion, connectionTraceId, signal) =>
@@ -4743,7 +4758,10 @@ export async function registerCommercial(
     }
     const qqDispatcher = makeInboundDispatcher({
       pgPool: getPool(),
-      resolveContainerEndpoint,
+      // P1-IMPL-09: QQ inbound stays on cloud docker. Same sharedEnsureRunning
+      // singleflight as media-signed / cron; not the desktop-preferring chat resolver.
+      resolveContainerEndpoint: dockerEnsureRunning,
+      fallbackDockerEnsure: dockerEnsureRunning,
       bridgeSecret,
       resolveModel: async (bindingUserId) => {
         const uid = BigInt(bindingUserId);
@@ -4880,7 +4898,9 @@ export async function registerCommercial(
 
     const inboundDispatcher = makeInboundDispatcher({
       pgPool: getPool(),
-      resolveContainerEndpoint,
+      // P1-IMPL-09: WeChat inbound stays on cloud docker (design v2 §1.2 / §4.5.3).
+      resolveContainerEndpoint: dockerEnsureRunning,
+      fallbackDockerEnsure: dockerEnsureRunning,
       bridgeSecret,
       resolveModel: async (bindingUserId) => {
         const uid = BigInt(bindingUserId);
@@ -5307,6 +5327,7 @@ export async function registerCommercial(
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
     promptQueueEnabled: isPromptQueueV1Enabled(),
+    // Chat / turn dispatch may prefer a live desktop tunnel (P1-IMPL-01).
     resolveContainerEndpoint,
     // 模型执行权威(方案 §2):注入即开启 flag —— 签发 + attestation 门 + descriptor 分类。
     ...(modelAuthoritySigner && modelCatalogCache
