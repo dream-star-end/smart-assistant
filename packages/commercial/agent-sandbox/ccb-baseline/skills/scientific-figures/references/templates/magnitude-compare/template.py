@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""coord-error-budget — 坐标系与误差预算图模板(u6 EOP 量级痛点)。
+"""magnitude-compare — 通用量级对比条形图原型。
 
-水平误差条图:**同量纲同组、组内条长按 log10 量级归一**,不同量纲(不同单位)分面板,
-每条误差条带"数值+单位"。EOP 常见量级参考表内置于 constraints.json(数值可查、不进代码)。
+任意"多项数值对比"场景:误差源/贡献项/预算项/灵敏度/能耗/耗时……
+水平条形:**同单位自动同组分面板、组内条长按 log10 量级归一**,每条带"数值+单位",
+不同单位分开面板。由构造保证,伴生 FigureSpec(magnitudes 带 group/rendered_length),
+供 `oc-figcheck fig.png --kind figure --spec fig.spec.json` 复核。
 
 示例:
-  python3 template.py --items "PM-X:0.48:mas,PM-Y:0.35:mas,UT1:0.21:ms,LOD:0.02:ms,对流层延迟:0.15:m,固体潮:0.003:m" \
-      --out fig_err.png
-  python3 template.py --demo
+  python3 template.py --items "项A:0.5:mV,项B:0.02:mV,项C:12:mV,项D:3:ps,项E:80:ps" \
+      --out fig_mag.png
 """
 from __future__ import annotations
 
@@ -19,16 +20,13 @@ from typing import NoReturn
 TEMPLATES_DIR = __file__.rsplit("/", 1)[0] if "/" in __file__ else "."
 sys.path.insert(0, TEMPLATES_DIR + "/../_lib")
 
-from scene import Polyline, Polygon, Scene, Text, palette  # noqa: E402
+from scene import Polygon, Scene, Text, palette  # noqa: E402
 
-DEMO_ITEMS = (
-    "PM-X:0.48:mas,PM-Y:0.35:mas,UT1:0.21:ms,LOD:0.02:ms,"
-    "对流层延迟:0.15:m,固体潮:0.003:m,测站速度:0.001:m"
-)
+DEMO_ITEMS = "项A:0.5:mV,项B:0.02:mV,项C:12:mV,项D:3:ps,项E:80:ps"
 
 
 def fail(msg: str) -> NoReturn:
-    sys.exit(f"[coord-error-budget] {msg}")
+    sys.exit(f"[magnitude-compare] {msg}")
 
 
 def parse_items(raw: str) -> list[tuple[str, float, str]]:
@@ -43,9 +41,11 @@ def parse_items(raw: str) -> list[tuple[str, float, str]]:
         except ValueError:
             fail(f"--items 数值不合法:{val!r}")
         if v <= 0:
-            fail(f"误差量级必须为正(条长取 log10):{name}={val}")
+            fail(f"数值必须为正(条长取 log10):{name}={val}")
         if not unit:
             fail(f"--items 单位不能为空:{name}")
+        if not name:
+            fail(f"--items 名称不能为空:{part!r}")
         out.append((name, v, unit))
     if not out:
         fail("--items 至少一项")
@@ -54,10 +54,10 @@ def parse_items(raw: str) -> list[tuple[str, float, str]]:
 
 def build(p: argparse.Namespace, pal: dict) -> Scene:
     items = parse_items(p.items)
-    # 同量纲(同单位字符串)同组;跨单位(如 s 与 ms)由调用方先换算成一致单位
+    # 同单位(同单位字符串)自动同组;跨单位(如 mV 与 V)由调用方先换算成一致单位
     groups: list[tuple[str, list[tuple[str, float, str]]]] = []
     for name, v, unit in items:
-        for gi, (gunit, gitems) in enumerate(groups):
+        for gunit, gitems in groups:
             if gunit == unit:
                 gitems.append((name, v, unit))
                 break
@@ -72,7 +72,7 @@ def build(p: argparse.Namespace, pal: dict) -> Scene:
     w = label_w + bar_w + 2.6
     h = 1.5 + n_rows_total * row_h + (len(groups) - 1) * panel_gap + 0.9
 
-    sc = Scene(w_cm=w, h_cm=h, title=p.title or "误差预算(条长按 log10 量级归一,组内同量纲)")
+    sc = Scene(w_cm=w, h_cm=h, title=p.title or "量级对比(条长按 log10 归一,同单位同组)")
     spec = sc.spec
 
     y = h - 1.5
@@ -99,42 +99,39 @@ def build(p: argparse.Namespace, pal: dict) -> Scene:
                 Text(label_w - 0.25, y, name, size_pt=8.5, anchor="right", for_id=f"item-{name}"),
                 Text(label_w + L + 0.3, y, f"{v:g} {gunit}", size_pt=8, anchor="left"),
             )
-            spec["objects"].append({"id": f"item-{name}", "type": "error-bar",
+            spec["objects"].append({"id": f"item-{name}", "type": "bar",
                                     "anchor": [round(label_w + L / 2, 4), round(y, 4)]})
             spec["magnitudes"].append({"id": f"item-{name}", "label": name, "value": v, "unit": gunit,
                                        "group": gunit, "rendered_length": round(L, 4)})
             y -= row_h
         y -= panel_gap
 
-    sc.spec_meta = {"template": "coord-error-budget", "kind": "figure", "units": None, "scene": {}}
+    sc.spec_meta = {"template": "magnitude-compare", "kind": "figure", "units": None, "scene": {}}
     return sc
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="坐标系/误差预算图模板(条长 log10 量级归一,输出 png+svg+spec.json 或 pptx)")
+    ap = argparse.ArgumentParser(description="通用量级对比条形图原型(条长 log10 归一,输出 png+svg+spec.json 或 pptx)")
     ap.add_argument("--items", default=DEMO_ITEMS, help="'名:数值:单位,...';同单位自动同组,跨单位请先换算")
-    ap.add_argument("--demo", action="store_true", help="使用内置 VLBI/EOP 演示数据")
     ap.add_argument("--style", choices=["bw", "color"], default="color")
     ap.add_argument("--backend", choices=["mpl", "pptx"], default="mpl", help="mpl=matplotlib;pptx=python-pptx 原生可编辑 shapes")
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", default=None)
     p = ap.parse_args()
-    if p.demo:
-        p.items = DEMO_ITEMS
 
     sc = build(p, palette(p.style))
     if p.backend == "pptx":
         from pptx_render import render_pptx
 
-        render_pptx(sc, p.out or "/tmp/coord-error-budget.pptx")
+        render_pptx(sc, p.out or "/tmp/magnitude-compare.pptx")
         return
     try:
         import matplotlib  # noqa: F401
     except ImportError as e:
-        sys.exit(f"[coord-error-budget] 缺依赖 matplotlib({e});容器应预装,本地请 pip install matplotlib")
+        sys.exit(f"[magnitude-compare] 缺依赖 matplotlib({e});容器应预装,本地请 pip install matplotlib")
     from mpl_render import render_mpl
 
-    render_mpl(sc, p.out or "/tmp/coord-error-budget.png", style=p.style)
+    render_mpl(sc, p.out or "/tmp/magnitude-compare.png", style=p.style)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 ---
 name: scientific-figures
-description: 科研图表规范与**闭环出图工作流**。出图后必须用 `oc-figcheck` 回看自纠(看到重叠/裁切/取景空/背景异常再改),直到 PASS。按图类型选对确定性工具:数据图=matplotlib+SciencePlots/seaborn;网络关系图=networkx+graphviz;复杂热图=PyComplexHeatmap;组合集合=UpSetPlot/venn;精密示意/机制图=Typst+CeTZ(矢量);简单流程=Mermaid;3D工程装置图=matplotlib-3D(信息优先)+闭环。**领域示意图(测站/天线/相控阵观测/雷达链路/光通信/误差预算)优先套参数化模板**并带 `--spec` 过物理一致性门(悬空/指向错/量级混轴/图例遮挡确定性 FAIL);PPT 配图用模板 `--backend pptx` 出**可编辑原生 shapes**;期刊黑白/彩色双版样式一键叠加。**严禁生成式 AI 插画**。要给报告/论文/PPT 配图、画数据图/网络图/示意图/装置图时使用。
+description: 科研图表规范与**闭环出图工作流**。出图后必须用 `oc-figcheck` 回看自纠(看到重叠/裁切/取景空/背景异常再改),直到 PASS。按图类型选对确定性工具:数据图=matplotlib+SciencePlots/seaborn;网络关系图=networkx+graphviz;复杂热图=PyComplexHeatmap;组合集合=UpSetPlot/venn;精密示意/机制图=Typst+CeTZ(矢量);简单流程=Mermaid;3D工程装置图=matplotlib-3D(信息优先)+闭环。**学科无关的通用图形原型(阶段链框图/量级对比/覆盖几何)优先套参数化模板**并带 `--spec` 过物理一致性门(悬空/指向错/量级混轴/图例遮挡确定性 FAIL);PPT 配图用模板 `--backend pptx` 出**可编辑原生 shapes**;期刊黑白/彩色双版样式一键叠加。**严禁生成式 AI 插画**。要给报告/论文/PPT 配图、画数据图/网络图/示意图/装置图时使用。
 tags: [research, figures, matplotlib, scienceplots, seaborn, networkx, typst, cetz, figcheck, figspec, pptx, journal-style]
 priority: 5
 ---
@@ -14,7 +14,7 @@ priority: 5
 - **严禁**生成式 AI 出"插画/示意图/封面图"(Midjourney/DALL·E/SD 类,或让模型吐 base64 图)。一律用下面的确定性工具。
 - **出图必须闭环**:任何要给用户/报告/论文的图,`savefig` 后**必须** `oc-figcheck` 回看自纠(见 §1),不允许画完直接交。这是本 skill 的核心纪律。
 - **按图类型选对工具**(见 §2),不要用 matplotlib 硬画一切(网络图、精密示意图硬画必糊)。
-- **领域示意图先套模板**(见 §2b):测站/天线/相控阵观测/雷达链路/光链路/误差预算命中模板时,改参数而不是从零手摆坐标——物理正确性由模板构造保证、由 `--spec` 门复核。
+- **示意图/量级图先套通用原型**(见 §2b):阶段链框图/量级对比/覆盖几何命中原型时,改参数而不是从零手摆坐标——物理正确性由模板构造保证、由 `--spec` 门复核。
 - 图必须有清晰坐标轴标签+单位、图例、必要标题;字号适配印刷;投稿再出矢量(§6)。
 
 ## 1. 核心工作流:出图 → figcheck → 自纠 → 直到 PASS
@@ -27,12 +27,12 @@ priority: 5
 ```
 
 `oc-figcheck` 两层把关(一条命令搞定):
-- **确定性**(不耗模型额度):分辨率/DPI 不足、**主背景占比过高=取景过空/物体飘散**、**背景主色异常偏色=渲染背景翻车(整张绿/黄)**、**画布边缘内容密集=元素被裁**;带 `--spec` 时追加**物理一致性门**(§2b):天线悬空、连线端点落波束外、同组量纲混轴、大跨度误差条未按 log10 归一、标签互相遮挡——这些"物理错误"像素层看不出来,必须靠 spec 声明确定性判定。
-- **vision 审图**(默认 MiniMax-M3,实测对版式缺陷识别准):按图类型逐条找会被审稿挑剔的问题(裁切/重叠/取景/标注缺失/字号/低级错误);带 `--spec` 时追加模板派生的定向核对问句。
+- **确定性**(不耗模型额度):分辨率/DPI 不足、**主背景占比过高=取景过空/物体飘散**、**背景主色异常偏色=渲染背景翻车(整张绿/黄)**、**画布边缘内容密集=元素被裁**;带 `--spec` 时追加**物理一致性门**(§2b):对象悬空、连线端点落在覆盖锥外、同组量纲混轴、大跨度条长未按 log10 归一、标签互相遮挡——这些"物理错误"像素层看不出来,必须靠 spec 声明确定性判定。
+- **vision 审图**(默认 MiniMax-M3,实测对版式缺陷识别准):按图类型逐条找会被审稿挑剔的问题(裁切/重叠/取景/标注缺失/字号/低级错误);带 `--spec` 时追加 spec 派生的定向核对问句。
 
 ```bash
 oc-figcheck /home/agent/.openclaude/research/<id>/fig1.png --kind figure
-# 领域模板产物(伴生 fig1.spec.json)必须带 --spec 过物理门:
+# 模板产物(伴生 fig1.spec.json)必须带 --spec 过物理门:
 oc-figcheck /home/agent/.openclaude/research/<id>/obs.png --kind schematic --spec /home/agent/.openclaude/research/<id>/obs.spec.json
 # 复杂图表要精确读数核对时(minimax 已够;仅特殊场景)可加 --focus "核对每个数值标注是否正确"
 ```
@@ -56,32 +56,30 @@ oc-figcheck /home/agent/.openclaude/research/<id>/obs.png --kind schematic --spe
 | **3D 工程装置/场景布置图** | matplotlib-3D,**信息优先**(§5) | 3d |
 | 交互式 HTML 图 | plotly(`fig.write_html`,**不要** `write_image`——无 kaleido) | figure |
 
-### 2b. 领域模板优先(测站/天线/观测几何/链路/误差预算)
+### 2b. 通用图形原型优先(阶段链框图 / 量级对比 / 覆盖几何)
 
-命中下表领域的示意图,**先套模板改参数,不要从零手摆坐标**——曾有用户为一张相控阵观测示意图返工 10 轮(波束指向画错、连线进基线不进波束),根因就是 LLM 心算坐标。模板构造保证物理关系,伴生 `fig.spec.json` 让 figcheck **确定性**抓悬空/指向错/量级错/图例遮挡:
+示意图命中下列**学科无关原型**时,**先套模板改参数,不要从零手摆坐标**——物理关系由模板构造保证,伴生 `fig.spec.json` 让 figcheck **确定性**抓悬空/指向错/量级错/图例遮挡:
 
-| 领域 | 模板(`references/templates/`) |
-|---|---|
-| 测站布局/基线网;抛物面天线系统(侧视) | `antenna-station` |
-| 相控阵/干涉观测(波束锥+信号线+基线) | `phased-array-obs` |
-| 雷达系统链路框图(含注入支路) | `radar-system` |
-| 自由空间光通信/光链路规格 | `optical-link` |
-| 坐标系/误差预算条形图(log10 量级归一) | `coord-error-budget` |
+| 图形原型 | 模板(`references/templates/`) | 适用 |
+|---|---|---|
+| 有向阶段链框图(可多条支路) | `block-diagram` | 任何流程/信号链/数据流水线/反应路径/处理链 |
+| 量级对比条形图(同单位同组) | `magnitude-compare` | 误差源/贡献项/预算/灵敏度/能耗等任何量级对比 |
+| 覆盖几何(单元指向+覆盖锥+基线) | `coverage-geometry` | 传感器阵列/光源/声源/相机 FOV/任何覆盖几何 |
 
 ```bash
-T=<skill目录>/references/templates/phased-array-obs
-python3 $T/template.py --panels "P1:0,75;P2:8,90;P3:16,105" --target "SAT:8,30" \
-    --out /home/agent/.openclaude/research/<id>/obs.png        # 伴生 obs.spec.json
-oc-figcheck /home/agent/.openclaude/research/<id>/obs.png --kind schematic --spec /home/agent/.openclaude/research/<id>/obs.spec.json
+T=<skill目录>/references/templates/coverage-geometry
+python3 $T/template.py --emitters "S1:0,75;S2:8,90;S3:16,105" --target "T1:8,30" \
+    --out /home/agent/.openclaude/research/<id>/cov.png        # 伴生 cov.spec.json
+oc-figcheck /home/agent/.openclaude/research/<id>/cov.png --kind schematic --spec /home/agent/.openclaude/research/<id>/cov.spec.json
 ```
 
-- 参数物理不成立(目标不在波束内、仰角越界、链路成环)模板**直接拒画**并说明原因,不会画出错误图。
-- 每个模板的参数表/物理约束清单在同目录 `constraints.json`;FigureSpec 字段格式见 `templates/README.md`。
-- 模板未覆盖的领域仍走 §2 通用路径(自定义代码也可手写 spec json 过 `--spec` 门)。
+- 参数不成立(支路指向上游、数值≤0、目标在锥外)模板**直接拒画**并说明原因,不会画出错误图。
+- **自声明 spec:任何自定义绘图代码也可用** `_lib/scene.py` 的 Scene 声明 objects/links/magnitudes/labels,伴生 spec.json 过 `--spec` 门——校验规则按 spec 数据特征(beam/grounding/group/links)触发,与学科和模板名无关。
+- FigureSpec 字段格式见 `templates/README.md`;原型未覆盖的图仍走 §2 通用路径。
 
 ### 2c. 可编辑交付:用户要 PPT 配图/汇报图时默认走 pptx 后端
 
-用户反馈过"PPT 图片不可编辑"(位图贴进幻灯,改一个字都要重画)。领域模板加 `--backend pptx` 输出**python-pptx 原生 shapes**:每个部件=独立可选中形状/文本框,在 PowerPoint/WPS 里可直接改字改色拖动,零位图。
+用户反馈过"PPT 图片不可编辑"(位图贴进幻灯,改一个字都要重画)。模板加 `--backend pptx` 输出**python-pptx 原生 shapes**:每个部件=独立可选中形状/文本框,在 PowerPoint/WPS 里可直接改字改色拖动,零位图。
 
 ```bash
 python3 $T/template.py [参数] --backend pptx --out /home/agent/.openclaude/research/<id>/fig.pptx
@@ -112,7 +110,7 @@ print('/home/agent/.openclaude/research/<id>/fig1.png')
 import pathlib
 STYLES = pathlib.Path('/run/oc/claude-config/skills/scientific-figures/references/styles')
 plt.style.use(['science', 'no-latex', str(STYLES / 'journal-bw.mplstyle')])      # 或 journal-color.mplstyle
-# 领域模板直接 --style bw|color;marker 双编码需在 plot(marker=...) 显式给
+# 模板直接 --style bw|color;marker 双编码需在 plot(marker=...) 显式给
 ```
 - 保存路径单独成行 print → 前端渲染成图片卡;该路径作为 oc-report ReportSchema 的 figure.path。
 
@@ -157,7 +155,7 @@ oc-figcheck signal_model.png --kind schematic  # 闭环回看:标注是否齐全
 
 - 离散类别用 ColorBrewer `Set2`/`Dark2`(`plt.get_cmap('Set2')`);连续量用 `viridis`/`cividis`(色盲友好)。
 - 不用红绿对比传达关键信息;线型 + 颜色双编码;黑白打印场景用 §3 的 `journal-bw.mplstyle`(灰阶+4 线型)。
-- 投稿双版惯例:正文黑白(`journal-bw`)+补充材料彩色(`journal-color`),领域模板 `--style bw|color` 一键切换。
+- 投稿双版惯例:正文黑白(`journal-bw`)+补充材料彩色(`journal-color`),模板 `--style bw|color` 一键切换。
 - 投稿要矢量:同名再存 `.svg`/`.pdf`(matplotlib 原生,无需 LaTeX);Typst/CeTZ 产物本就是矢量。
 - 图注中文设 `font.family=['Noto Serif CJK SC','serif']`;英文 serif/sans 一致。
 - **networkx 画中文节点/边标签**必须显式传 `nx.draw(..., font_family='Noto Serif CJK SC')` —— 它默认 `sans-serif` 会覆盖 rcParams,导致中文豆腐块(□□□)。graphviz 布局用 `nx.nx_pydot.graphviz_layout(G, prog='dot'|'neato'|'sfdp')`(层次图用 dot,力导向用 neato/sfdp),避免手摆节点糊成一团。

@@ -1,8 +1,8 @@
 /**
- * oc-figcheck --spec 物理一致性门测试(R6 TEST-16 期 B)。
+ * oc-figcheck --spec 物理一致性门测试(R6 TEST-16 期 B;模板泛化为学科无关原型)。
  *
  * 两层:
- *  1) figSpec.checkSpec 纯函数:悬空/断链/成环、连线端点未声明、目标在波束锥外、
+ *  1) figSpec.checkSpec 纯函数:悬空/断链/成环、连线端点未声明、目标在覆盖锥外、
  *     同组混量纲、大跨度条长不按 log10 归一、缺单位、缺标签、标签 bbox 相交、
  *     图例 bbox 与标题相交——各必须产出 fail 级 issue;合法 spec 零 fail。
  *  2) CLI E2E(fake codex stub,同 ocControlCliE2e 模式):--spec 合法 PASS / 违规 FAIL /
@@ -25,78 +25,91 @@ function fails(spec: FigSpec, rule: string): number {
   return checkSpec(spec).filter((i) => i.severity === 'fail' && i.rule === rule).length
 }
 
-function validPhasedArraySpec(): FigSpec & { objects: NonNullable<FigSpec['objects']>; labels: NonNullable<FigSpec['labels']> } {
+function validCoverageSpec(): FigSpec & { objects: NonNullable<FigSpec['objects']>; labels: NonNullable<FigSpec['labels']> } {
   return {
-    template: 'phased-array-obs',
+    template: 'coverage-geometry',
     kind: 'schematic',
     units: 'm',
     scene: { grounding: 'required' },
     objects: [
       { id: 'ground', type: 'ground', anchor: [7, 1] },
       { id: 'mount-1', type: 'mount', anchor: [5, 1.2], supports: 'ground' },
-      { id: 'P1', type: 'phased-array', anchor: [5, 1.65], supports: 'mount-1', orientation_deg: 90, beam: { boresight_deg: 90, half_angle_deg: 12 } },
-      { id: 'SAT', type: 'satellite', anchor: [5, 7] },
+      { id: 'S1', type: 'sensor', anchor: [5, 1.65], supports: 'mount-1', orientation_deg: 90, beam: { boresight_deg: 90, half_angle_deg: 12 } },
+      { id: 'T1', type: 'target', anchor: [5, 7] },
     ],
-    links: [{ id: 'sig-1', from: 'P1', to: 'SAT', kind: 'signal', must_be_in_beam_of: 'P1' }],
+    links: [{ id: 'cov-1', from: 'S1', to: 'T1', kind: 'coverage', must_be_in_beam_of: 'S1' }],
     labels: [
-      { id: 'lbl-P1', for: 'P1', text: 'P1 90°', bbox: [[4.0, 1.4], [4.9, 1.8]] },
-      { id: 'lbl-SAT', for: 'SAT', text: 'SAT', bbox: [[5.2, 6.9], [5.9, 7.3]] },
+      { id: 'lbl-S1', for: 'S1', text: 'S1 90°', bbox: [[4.0, 1.4], [4.9, 1.8]] },
+      { id: 'lbl-T1', for: 'T1', text: 'T1', bbox: [[5.2, 6.9], [5.9, 7.3]] },
     ],
   }
 }
 
 describe('figSpec.checkSpec 确定性物理检查', () => {
   test('合法 spec:零 fail', () => {
-    assert.equal(checkSpec(validPhasedArraySpec()).filter((i) => i.severity === 'fail').length, 0)
+    assert.equal(checkSpec(validCoverageSpec()).filter((i) => i.severity === 'fail').length, 0)
   })
 
   test('R1 悬空:实体无 supports → FAIL', () => {
-    const spec = validPhasedArraySpec()
-    delete (spec.objects[2] as { supports?: string }).supports // P1 悬空
+    const spec = validCoverageSpec()
+    delete (spec.objects[2] as { supports?: string }).supports // S1 悬空
     assert.ok(fails(spec, 'grounding-chain') >= 1)
   })
 
   test('R1 支撑链断裂:supports 指向未声明 id → FAIL', () => {
-    const spec = validPhasedArraySpec()
+    const spec = validCoverageSpec()
     spec.objects[1].supports = 'ghost-tower'
     assert.ok(fails(spec, 'grounding-chain') >= 1)
   })
 
   test('R1 支撑链成环 → FAIL', () => {
-    const spec = validPhasedArraySpec()
+    const spec = validCoverageSpec()
     spec.objects.push({ id: 'a', type: 'box', supports: 'b' })
     spec.objects.push({ id: 'b', type: 'box', supports: 'a' })
     assert.ok(fails(spec, 'grounding-chain') >= 1)
   })
 
-  test('R1 卫星等空中类型豁免接地', () => {
-    const spec = validPhasedArraySpec()
-    spec.objects[3].supports = undefined // SAT 本来就无 supports,不该报
+  test('R1 自由漂浮类型豁免接地', () => {
+    const spec = validCoverageSpec()
+    spec.objects[3].supports = undefined // T1(target)本来就无 supports,不该报
     assert.equal(checkSpec(spec).filter((i) => i.rule === 'grounding-chain').length, 0)
   })
 
+  test('R1 grounded:false 的自定义类型对象豁免落地检查', () => {
+    const spec = validCoverageSpec()
+    // 任何学科的自定义 type 都能用对象级 grounded:false 显式豁免,不必猜 type 名
+    spec.objects.push({ id: 'M1', type: 'marker', anchor: [9, 8], grounded: false })
+    assert.equal(fails(spec, 'grounding-chain'), 0)
+  })
+
+  test('R1 未豁免的自定义类型悬空对象 → FAIL', () => {
+    const spec = validCoverageSpec()
+    spec.objects.push({ id: 'M2', type: 'marker', anchor: [9, 8] }) // 无 supports 也无 grounded:false
+    assert.ok(fails(spec, 'grounding-chain') >= 1)
+  })
+
   test('R2 连线端点未声明对象 → FAIL', () => {
-    const spec = validPhasedArraySpec()
-    spec.links = [{ id: 'bad', from: 'P1', to: 'NOWHERE', kind: 'signal' }]
+    const spec = validCoverageSpec()
+    spec.links = [{ id: 'bad', from: 'S1', to: 'NOWHERE', kind: 'coverage' }]
     assert.ok(fails(spec, 'link-endpoints') >= 1)
   })
 
-  test('R2 目标在波束锥外(连线进基线不进波束)→ FAIL', () => {
-    const spec = validPhasedArraySpec()
-    spec.objects[3].anchor = [11, 1.5] // 目标移到侧面远处,偏离 60° 轴
+  test('R2 目标在覆盖锥外 → FAIL', () => {
+    const spec = validCoverageSpec()
+    spec.objects[3].anchor = [11, 1.5] // 目标移到侧面远处,偏离 90° 轴
     assert.ok(fails(spec, 'link-endpoints') >= 1)
   })
 
   test('R2 must_be_in_beam_of 引用无 beam 对象 → FAIL', () => {
-    const spec = validPhasedArraySpec()
-    spec.links = [{ id: 'sig-1', from: 'P1', to: 'SAT', must_be_in_beam_of: 'mount-1' }]
+    const spec = validCoverageSpec()
+    spec.links = [{ id: 'cov-1', from: 'S1', to: 'T1', must_be_in_beam_of: 'mount-1' }]
     assert.ok(fails(spec, 'link-endpoints') >= 1)
   })
 
   test('R3 同组混量纲(mas 与 ms 同组)→ FAIL', () => {
     const spec: FigSpec = { objects: [{ id: 'o', type: 'device' }], labels: [{ for: 'o', text: 'o', bbox: [[0, 0], [1, 1]] }], magnitudes: [
-      { id: 'pm-x', value: 0.5, unit: 'mas', group: 'eop' },
-      { id: 'ut1', value: 0.2, unit: 'ms', group: 'eop' },
+      { id: 'item-a', value: 0.5, unit: 'mas', group: 'mix' },
+      { id: 'item-b', value: 0.2, unit: 'ms', group: 'mix' },
     ] }
     assert.ok(fails(spec, 'magnitude-unit') >= 1)
   })
@@ -133,44 +146,43 @@ describe('figSpec.checkSpec 确定性物理检查', () => {
   })
 
   test('R4 对象缺标签 → FAIL;ground/mount 豁免', () => {
-    const spec = validPhasedArraySpec()
-    spec.labels = spec.labels!.filter((l) => l.for !== 'P1')
+    const spec = validCoverageSpec()
+    spec.labels = spec.labels!.filter((l) => l.for !== 'S1')
     assert.ok(fails(spec, 'label-bbox') >= 1)
   })
 
   test('R4 标签 bbox 相交>20% → FAIL', () => {
-    const spec = validPhasedArraySpec()
-    spec.labels![0].bbox = [[4.8, 1.4], [5.6, 1.8]] // 与 SAT 标签不重叠?与 P1/SAT 相交测试用重叠对
+    const spec = validCoverageSpec()
     spec.labels = [
-      { for: 'P1', text: 'P1', bbox: [[5.0, 1.4], [6.0, 1.8]] },
-      { for: 'SAT', text: 'SAT', bbox: [[5.4, 1.4], [6.4, 1.8]] }, // 60% 重叠
+      { for: 'S1', text: 'S1', bbox: [[5.0, 1.4], [6.0, 1.8]] },
+      { for: 'T1', text: 'T1', bbox: [[5.4, 1.4], [6.4, 1.8]] }, // 60% 重叠
     ]
     assert.ok(fails(spec, 'label-bbox') >= 1)
   })
 
   test('R4 标签引用未声明对象 → FAIL', () => {
-    const spec = validPhasedArraySpec()
+    const spec = validCoverageSpec()
     spec.labels!.push({ for: 'ghost', text: '?', bbox: [[0, 0], [0.5, 0.5]] })
     assert.ok(fails(spec, 'label-bbox') >= 1)
   })
 
   test('R4b 图例 bbox 与标题相交 → FAIL', () => {
-    const spec = validPhasedArraySpec()
-    spec.title = { text: '相控阵干涉观测示意', bbox: [[3.0, 9.0], [7.0, 9.6]] }
+    const spec = validCoverageSpec()
+    spec.title = { text: '覆盖几何示意', bbox: [[3.0, 9.0], [7.0, 9.6]] }
     spec.legend = { bbox: [[3.2, 8.9], [5.2, 9.5]] } // 压在标题上;不碰标签(y<=7.3)与对象锚点
     assert.equal(fails(spec, 'legend-overlap'), 1)
   })
 
   test('R4b 图例锚在空白区(让开标题/标签/对象锚点)→ 零 fail', () => {
-    const spec = validPhasedArraySpec()
-    spec.title = { text: '相控阵干涉观测示意', bbox: [[3.0, 12.8], [7.0, 13.4]] }
+    const spec = validCoverageSpec()
+    spec.title = { text: '覆盖几何示意', bbox: [[3.0, 12.8], [7.0, 13.4]] }
     spec.legend = { bbox: [[11.0, 10.0], [13.5, 11.2]] } // 右上空白区,与标题/标签/锚点都不相交
     assert.equal(checkSpec(spec).filter((i) => i.severity === 'fail').length, 0)
   })
 
   test('R5 objects 为空 / id 重复 → FAIL', () => {
     assert.ok(fails({ objects: [] }, 'structure') >= 1)
-    const spec = validPhasedArraySpec()
+    const spec = validCoverageSpec()
     spec.objects.push({ ...spec.objects[1] }) // mount-1 重复
     assert.ok(fails(spec, 'structure') >= 1)
   })
@@ -181,10 +193,29 @@ describe('figSpec.checkSpec 确定性物理检查', () => {
     assert.ok(parseFigSpec('{"objects":[]}').spec)
   })
 
-  test('specFollowUpQuestions:模板定向问句 + 数量核对', () => {
-    const qs = specFollowUpQuestions(validPhasedArraySpec())
+  test('specFollowUpQuestions:数据驱动——数量核对 + 覆盖锥/落地/连线问句', () => {
+    const qs = specFollowUpQuestions(validCoverageSpec())
     assert.ok(qs.some((q) => q.includes('4 个声明对象')))
-    assert.ok(qs.some((q) => q.includes('波束锥')))
+    assert.ok(qs.some((q) => q.includes('覆盖锥')), '有 beam → 锥覆盖问句')
+    assert.ok(qs.some((q) => q.includes('悬空')), 'grounding=required → 落地核对问句')
+    assert.ok(qs.some((q) => q.includes('连线两端')), '有 links → 端点/方向问句')
+    assert.ok(!qs.some((q) => q.includes('log10')), '无分组量级 → 不出条长问句')
+  })
+
+  test('specFollowUpQuestions:无 beam 不出覆盖锥问句;分组量级出条长问句', () => {
+    const spec: FigSpec = {
+      objects: [{ id: 'stage-1', type: 'stage' }],
+      magnitudes: [
+        { id: 'a', value: 0.5, unit: 'mV', group: 'mV' },
+        { id: 'b', value: 12, unit: 'mV', group: 'mV' },
+      ],
+    }
+    const qs = specFollowUpQuestions(spec)
+    assert.ok(qs.some((q) => q.includes('1 个声明对象')))
+    assert.ok(!qs.some((q) => q.includes('覆盖锥')), '无 beam → 不出锥覆盖问句')
+    assert.ok(!qs.some((q) => q.includes('悬空')), '无 grounding=required → 不出落地问句')
+    assert.ok(!qs.some((q) => q.includes('连线两端')), '无 links → 不出端点问句')
+    assert.ok(qs.some((q) => q.includes('log10')), '有分组量级 → 条长/单位/面板问句')
   })
 })
 
@@ -338,23 +369,23 @@ fs.writeFileSync(output, 'PASS: spec e2e stub')
     assert.ok(!last.prompt.includes('声明对象'), 'prompt 不应包含 spec 派生问句')
   })
 
-  test('--spec 合法:PASS 且 report 带 spec 段与模板定向问句', async () => {
+  test('--spec 合法:PASS 且 report 带 spec 段与数据驱动定向问句', async () => {
     const specFile = join(work, 'good.spec.json')
-    writeFileSync(specFile, JSON.stringify(validPhasedArraySpec()))
+    writeFileSync(specFile, JSON.stringify(validCoverageSpec()))
     const r = await runTs('packages/gateway/src/ocFigCheckCli.ts', [image, '--kind', 'schematic', '--spec', specFile], env)
     assert.equal(r.code, 0, r.stderr)
     const report = parseReport(r.stdout)
     assert.ok('spec' in report)
     const spec = report.spec as { template: string; issues: unknown[]; warnings: unknown[] }
-    assert.equal(spec.template, 'phased-array-obs')
+    assert.equal(spec.template, 'coverage-geometry')
     assert.deepEqual(spec.issues, [])
     assert.equal(report.verdict, 'PASS')
     const calls = readLogFile(join(work, 'codex-calls.log'))
-    assert.ok(calls[calls.length - 1].prompt.includes('波束锥'), 'vision prompt 应含模板定向核对问句')
+    assert.ok(calls[calls.length - 1].prompt.includes('覆盖锥'), 'vision prompt 应含 spec 派生的覆盖锥核对问句')
   })
 
   test('--spec 悬空对象:verdict FAIL 且 issue 定位到规则', async () => {
-    const spec = validPhasedArraySpec()
+    const spec = validCoverageSpec()
     delete (spec.objects[2] as { supports?: string }).supports
     const specFile = join(work, 'dangling.spec.json')
     writeFileSync(specFile, JSON.stringify(spec))
@@ -363,11 +394,11 @@ fs.writeFileSync(output, 'PASS: spec e2e stub')
     const report = parseReport(r.stdout)
     assert.equal(report.verdict, 'FAIL')
     const issues = (report.deterministic as { issues: string[] }).issues
-    assert.ok(issues.some((m) => m.includes('[spec:grounding-chain]') && m.includes("'P1'")), JSON.stringify(issues))
+    assert.ok(issues.some((m) => m.includes('[spec:grounding-chain]') && m.includes("'S1'")), JSON.stringify(issues))
   })
 
-  test('--spec 目标在波束锥外:FAIL(u6 连线进基线场景)', async () => {
-    const spec = validPhasedArraySpec()
+  test('--spec 目标在覆盖锥外:FAIL', async () => {
+    const spec = validCoverageSpec()
     spec.objects[3].anchor = [11, 1.5]
     const specFile = join(work, 'offbeam.spec.json')
     writeFileSync(specFile, JSON.stringify(spec))

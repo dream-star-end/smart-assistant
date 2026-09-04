@@ -1,10 +1,12 @@
 /**
  * FigureSpec — 示意图物理一致性声明与确定性校验(oc-figcheck --spec 的核心)。
  *
- * 背景:示意图的物理正确性(天线悬空、倒扣、波束指向错、连线进基线不进波束、误差
- * 量级混轴)此前完全靠 LLM 逐轮心算坐标,oc-figcheck 只看渲染像素,零覆盖。领域模板
- * (scientific-figures references/templates)渲染时伴生 FigureSpec:对象/连线/量级/
- * 标签的**结构化声明**,本模块用纯函数做规则化校验——确定性、可证、不耗模型。
+ * 背景:示意图的物理正确性(对象悬空、指向/覆盖锥方向错、连线接不到声明的端点、
+ * 量级混轴)此前完全靠 LLM 逐轮心算坐标,oc-figcheck 只看渲染像素,零覆盖。绘图
+ * 模板(scientific-figures references/templates)渲染时伴生 FigureSpec:对象/连线/
+ * 量级/标签的**结构化声明**,本模块用纯函数做规则化校验——确定性、可证、不耗模型。
+ * 规则与具体学科无关:任何绘图代码只要按此格式声明(objects/links/magnitudes/
+ * labels),都能过同一套门。
  *
  * 规则一览(全部确定性,违规=确定性 issue → verdict FAIL):
  *   R1 grounding-chain   scene.grounding=required 时,实体支撑链必须沿 supports 到 ground
@@ -34,6 +36,8 @@ export interface FigSpecObject {
   supports?: string
   orientation_deg?: number
   beam?: FigSpecBeam
+  /** false = 该对象显式豁免落地检查(自由漂浮元素);任何自定义 type 都能用,不必猜 type 名 */
+  grounded?: boolean
 }
 
 export interface FigSpecLink {
@@ -41,7 +45,7 @@ export interface FigSpecLink {
   from: string
   to: string
   kind?: string
-  /** to 端必须落在该对象的波束锥内(面板 id) */
+  /** to 端必须落在该对象的覆盖锥内(声明 beam 的对象 id) */
   must_be_in_beam_of?: string
 }
 
@@ -95,8 +99,8 @@ export interface SpecIssue {
   message: string
 }
 
-/** 天空中的物体不要求落地(卫星/目标/飞行器/天体源等) */
-const AIRBORNE_TYPES = new Set(['satellite', 'target', 'spacecraft', 'aircraft', 'star', 'celestial', 'sky', 'source'])
+/** 自由漂浮的对象类型不要求落地(目标/飞行器/天体源等;历史 type 集,向后兼容) */
+const FREE_FLOATING_TYPES = new Set(['satellite', 'target', 'spacecraft', 'aircraft', 'star', 'celestial', 'sky', 'source'])
 /** 上下文元素不强制独立标签(地面/基座) */
 const LABEL_EXEMPT_TYPES = new Set(['ground', 'mount'])
 /** 同组量级跨度超过该值时,条长必须按 log10 量级归一(否则线性/任意画都会严重失真) */
@@ -151,7 +155,7 @@ function checkGrounding(spec: FigSpec, byId: Map<string, FigSpecObject>): SpecIs
   if (spec.scene?.grounding !== 'required') return issues
   for (const obj of spec.objects ?? []) {
     const type = obj.type ?? ''
-    if (type === 'ground' || AIRBORNE_TYPES.has(type)) continue
+    if (type === 'ground' || obj.grounded === false || FREE_FLOATING_TYPES.has(type)) continue
     if (!obj.supports) {
       issues.push(issue('grounding-chain', `对象 '${obj.id}' 声明为需要落地场景但无 supports(悬空)。`))
       continue
@@ -185,7 +189,7 @@ function checkGrounding(spec: FigSpec, byId: Map<string, FigSpecObject>): SpecIs
   return issues
 }
 
-/** R2:连线端点与波束锥覆盖。 */
+/** R2:连线端点与覆盖锥几何。 */
 function checkLinks(spec: FigSpec, byId: Map<string, FigSpecObject>): SpecIssue[] {
   const issues: SpecIssue[] = []
   for (const link of spec.links ?? []) {
@@ -208,7 +212,7 @@ function checkLinks(spec: FigSpec, byId: Map<string, FigSpecObject>): SpecIssue[
       }
       const tgt = byId.get(link.to)
       if (!tgt || !Array.isArray(tgt.anchor) || !Array.isArray(panel.anchor)) {
-        issues.push(issue('link-endpoints', `连线 '${lid}' 波束覆盖判定缺少锚点坐标(panel '${panel.id}' 或目标 '${link.to}' 无 anchor)。`))
+        issues.push(issue('link-endpoints', `连线 '${lid}' 覆盖锥判定缺少锚点坐标(对象 '${panel.id}' 或目标 '${link.to}' 无 anchor)。`))
         continue
       }
       const vx = tgt.anchor[0] - panel.anchor[0]
@@ -222,7 +226,7 @@ function checkLinks(spec: FigSpec, byId: Map<string, FigSpecObject>): SpecIssue[
           issues.push(
             issue(
               'link-endpoints',
-              `连线 '${lid}' 的目标 '${link.to}' 偏离面板 '${panel.id}' 波束轴 ${angDeg.toFixed(1)}°(半张角 ${panel.beam.half_angle_deg}°):连线落在波束覆盖外(典型错误:信号线画进基线而没进波束)。`,
+              `连线 '${lid}' 的目标 '${link.to}' 偏离对象 '${panel.id}' 覆盖锥轴 ${angDeg.toFixed(1)}°(半张角 ${panel.beam.half_angle_deg}°):连线落在覆盖锥外。`,
             ),
           )
         }
@@ -388,24 +392,30 @@ export function checkSpec(spec: FigSpec): SpecIssue[] {
 }
 
 /**
- * spec 派生的 VLM 定向核对问句:把通用"有无低级错误"换成领域可核对的具体问句,
- * 降低 VLM 漏检率(确定性规则为主、VLM 兜底)。
+ * spec 派生的 VLM 定向核对问句:按 spec 里**实际出现的数据特征**(beam/grounding/
+ * magnitudes/links)拼装可核对的具体问句,与模板名无关——任何学科的自定义 spec
+ * 都能派生出对口的问句,降低 VLM 漏检率(确定性规则为主、VLM 兜底)。
  */
 export function specFollowUpQuestions(spec: FigSpec): string[] {
+  const objects = spec.objects ?? []
+  const links = spec.links ?? []
+  const magnitudes = spec.magnitudes ?? []
   const qs: string[] = []
-  const n = spec.objects?.length ?? 0
-  const m = spec.links?.length ?? 0
-  qs.push(`请先核对图与规格一致性:图中应有 ${n} 个声明对象、${m} 条连线,数量与角色是否对得上?`)
-  const perTemplate: Record<string, string> = {
-    'phased-array-obs':
-      '请核对:每个面板的波束锥是否从相位中心指向目标?信号连线是否落在波束覆盖内(而非两站基线中段)?基线连线与信号线是否用了不同线型并在图例区分?',
-    'antenna-station':
-      '请核对:每个天线是否坐落在支撑结构(塔架/基墩)顶端而非悬空?抛物面开口是否朝向波束方向(无"倒扣的锅盖")?馈源是否在焦点处且有支撑腿?',
-    'radar-system': '请核对:信号流箭头是否单向无环?每条链路两端是否都是标注的器件?',
-    'optical-link': '请核对:光路是否从发射望远镜经信道连续到接收望远镜(无悬空断口)?波长/功率/发散角标注与数值是否一致?',
-    'coord-error-budget': '请核对:每条误差条是否带数值+单位?同组条长是否按量级(对数)而非线性比例?不同量纲是否分开了面板?',
+  qs.push(`请先核对图与规格一致性:图中应有 ${objects.length} 个声明对象、${links.length} 条连线,数量与角色是否对得上?`)
+  const hasBeam = objects.some(
+    (o) => o.beam && typeof o.beam.boresight_deg === 'number' && typeof o.beam.half_angle_deg === 'number',
+  )
+  if (hasBeam) {
+    qs.push('请核对:每条 must_be_in_beam_of 连线的目标是否真的落在覆盖锥内?锥中轴是否与对象朝向一致?')
   }
-  const q = spec.template ? perTemplate[spec.template] : undefined
-  if (q) qs.push(q)
+  if (spec.scene?.grounding === 'required') {
+    qs.push('请核对:每个需落地的对象是否坐在支撑结构上而非悬空?')
+  }
+  if (magnitudes.some((m) => m.group !== undefined)) {
+    qs.push('请核对:同组条长是否按对数量级(log10)而非线性比例?不同单位是否分开了面板?每条是否带数值+单位?')
+  }
+  if (links.length > 0) {
+    qs.push('请核对:每条连线两端是否都是图上标注的对象?方向是否与声明一致?')
+  }
   return qs
 }

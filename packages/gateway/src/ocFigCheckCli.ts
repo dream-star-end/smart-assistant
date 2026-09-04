@@ -22,7 +22,7 @@
  *               [--spec <fig.spec.json>]
  * 输出:JSON(确定性检查 + vision 审图 + 汇总 verdict),末行单独打印 verdict 供程序判读。
  *
- * --spec(可选):领域模板伴生的 FigureSpec(objects/links/magnitudes/labels 物理声明)。
+ * --spec(可选):绘图模板伴生的 FigureSpec(objects/links/magnitudes/labels 物理声明)。
  * 带上后追加**物理一致性门**(figSpec.ts,确定性规则:支撑链接地/连线端点入波束锥/
  * 量级单位一致与 log10 归一/标签遮挡),违规同确定性硬伤一样 FAIL;并给 vision 审图
  * 追加 spec 派生的定向核对问句。不带 --spec 时行为与旧版完全一致(向后兼容即开关)。
@@ -184,7 +184,7 @@ async function main(): Promise<void> {
     ? (flags.kind as FigKind)
     : 'figure'
 
-  // ── --spec:领域模板伴生的物理声明(可选;不传则完全不启用新代码路径)──
+  // ── --spec:绘图模板伴生的物理声明(可选;不传则完全不启用新代码路径)──
   let spec: FigSpec | undefined
   let specError: string | undefined
   if (flags.spec) {
