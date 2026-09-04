@@ -53,6 +53,7 @@ import {
   type VisibleVirtualRowAnchor,
 } from "./components/chat/archivePaging";
 import { createStickToBottomController } from "./components/chat/stickToBottom";
+import { attachWheelFence } from "./components/chat/wheelFence";
 import { currentTurnSettled, turnFinalAssistantFlags } from "./components/chat/turnSegment";
 import type { CardCallbacks, FeedbackContext } from "./components/chat/cards";
 import { MessageFeedbackDialog } from "./components/chat/MessageFeedbackDialog";
@@ -2356,6 +2357,14 @@ export function App() {
     stick.markUserIntent();
     cancelArchiveCorrection();
   }, [stick, cancelArchiveCorrection]);
+  // Wheel / trackpad fence (see wheelFence.ts). The React `onWheel` above keeps
+  // the zero-tolerance leave mark; the fence itself lives in native listeners so
+  // begin and release share one ordering with the browser's scrollend.
+  useEffect(() => {
+    const el = chatScrollParent;
+    if (!el) return;
+    return attachWheelFence(el, stick);
+  }, [chatScrollParent, stick]);
   const beginDirectUserChatScroll = useCallback(() => {
     stick.beginDirectManipulation();
     cancelArchiveCorrection();

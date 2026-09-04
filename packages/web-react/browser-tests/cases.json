@@ -249,6 +249,10 @@
     {
       "id": "T62",
       "proves": "真 Chromium 中 Phase-A unpublished fallback 的 id 等于最后一段 live assistant 行 id(visible_head.messageId=…-sK)时，最后一段正文仍渲染在原槽位而不是被清空隐藏；更早的 live 段照常保留，fallback 拼接整块不渲染(INC-20260903-TURNEND-LAST-SEGMENT-FLASH)"
+    },
+    {
+      "id": "T63",
+      "proves": "真 Chromium 中滚轮/触控板连续上滑(12 步、间隔小于 quiet window)期间 wheelFence 持续保持(Chromium 每个离散 tick 之间会发 scrollend,不能单靠它释放)、controller 零程序化 scrollTop 写入、逐步位置单调不回弹;滚轮停止后 quiet window 释放篱笆,篱笆期间被拦下的视口校正全部丢弃而不是事后补写(否则是第二次可见跳动,T43 的触摸松手即曾因此被拉回底部),释放后校正即时生效、following=false 且随后内容增长不拉走视口(根治 c00fcf598 未覆盖的滚轮路径一卡一卡回弹)"
     }
   ]
 }

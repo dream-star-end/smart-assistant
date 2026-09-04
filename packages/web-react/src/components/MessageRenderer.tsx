@@ -1879,6 +1879,12 @@ export function MessageList({
         const liveRow =
           (typeof pinPaintStart === "number" && visibleIndex >= pinPaintStart) ||
           visibleIndex >= visibleItems.length - PAINT_MIN_ITEMS;
+        // A row freshly (re)mounted by the paint window has no last-remembered
+        // size, so `content-visibility:auto` lays it out at the 200px estimate
+        // until it scrolls into relevancy, then grows to its real height. That
+        // growth above the viewport is what forces a correction write on every
+        // row while scrolling up. Seed the estimate with the measured height.
+        const cachedHeight = liveRow ? undefined : rowHeightCacheRef.current.get(key);
         return (
           <TimelineEagerMediaContext.Provider key={key} value={eagerMedia}>
             <div
@@ -1888,6 +1894,7 @@ export function MessageList({
                   : "chat-virtual-item chat-timeline-row"
               }
               data-chat-virtual-key={key}
+              style={cachedHeight ? { containIntrinsicSize: `auto ${cachedHeight}px` } : undefined}
             >
               {renderItem(item)}
             </div>

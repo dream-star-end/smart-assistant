@@ -303,4 +303,109 @@ describe("stickToBottom", () => {
     stick.onScroll(el);
     expect(stick.following.current).toBe(true);
   });
+
+  test("滚轮篱笆跨多个 scroll 事件不释放，期间贴底与校正都不写 scrollTop", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 4000, scrollTop: 3920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+
+    stick.beginWheelFence();
+    el.scrollTop = 3800;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(false);
+    expect(stick.wheelFence.current).toBe(true);
+
+    // 上方行从 200px 估高变真实高度 → RO/画窗要求 +60 校正；篱笆期间不得写。
+    stick.correctTo(el, 3860);
+    expect(el.scrollTop).toBe(3800);
+    el.scrollTop = 3600;
+    stick.onScroll(el);
+    stick.correctTo(el, 3660);
+    expect(el.scrollTop).toBe(3600);
+    expect(stick.wheelFence.current).toBe(true);
+    expect(stick.canRestick.current).toBe(false);
+
+    el.scrollHeight = 4400;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(3600);
+  });
+
+  test("滚轮篱笆释放后不补写被丢弃的校正，之后的校正立刻生效", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 4000, scrollTop: 3920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+
+    stick.beginWheelFence();
+    el.scrollTop = 3000;
+    stick.onScroll(el);
+    stick.correctTo(el, 3060);
+    el.scrollTop = 2800;
+    stick.onScroll(el);
+    stick.correctTo(el, 2840);
+    expect(el.scrollTop).toBe(2800);
+
+    stick.endWheelFence();
+    expect(stick.wheelFence.current).toBe(false);
+    expect(el.scrollTop).toBe(2800);
+    expect(stick.following.current).toBe(false);
+
+    stick.correctTo(el, 2820);
+    expect(el.scrollTop).toBe(2820);
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(false);
+  });
+
+  test("篱笆期间用户滚回底部即 re-follow，释放后贴底恢复", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 4000, scrollTop: 3920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+
+    stick.beginWheelFence();
+    el.scrollTop = 3000;
+    stick.onScroll(el);
+    stick.correctTo(el, 3080);
+    el.scrollTop = 3920;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(true);
+
+    el.scrollHeight = 4300;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(3920);
+    stick.endWheelFence();
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(4220);
+  });
+
+  test("直接操作与滚轮篱笆叠加时，任一篱笆在场都不写", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 4000, scrollTop: 3920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+
+    stick.beginDirectManipulation();
+    stick.beginWheelFence();
+    el.scrollTop = 3000;
+    stick.onScroll(el);
+    stick.correctTo(el, 3050);
+    stick.endWheelFence();
+    stick.correctTo(el, 3050);
+    expect(el.scrollTop).toBe(3000);
+    stick.endDirectManipulation();
+    stick.correctTo(el, 3050);
+    expect(el.scrollTop).toBe(3050);
+  });
+
+  test("reset 清掉滚轮篱笆", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 4000, scrollTop: 3000, clientHeight: 80 });
+    stick.beginWheelFence();
+    stick.reset();
+    expect(stick.wheelFence.current).toBe(false);
+    expect(stick.canRestick.current).toBe(true);
+    stick.correctTo(el, 3100);
+    expect(el.scrollTop).toBe(3100);
+  });
 });
