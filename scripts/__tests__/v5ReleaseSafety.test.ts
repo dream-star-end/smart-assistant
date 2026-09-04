@@ -2209,6 +2209,126 @@ describe('v5 release safety lanes', () => {
     assert.match(egress.stdout, /checks=svc_v5,http_v5,public_route,turn_failures,svc_egress,http_egress/)
   })
 
+  describe('egress surface gate (2026-09-04 cursor subagent 409 incident)', () => {
+    async function fixture() {
+      const dir = await mkdtemp(path.join(tmpdir(), 'v5-egress-surface-'))
+      dirs.push(dir)
+      const repo = path.join(dir, 'repo')
+      await mkdir(repo, { recursive: true })
+      const write = async (relative: string, contents = 'fixture\n') => {
+        const target = path.join(repo, relative)
+        await mkdir(path.dirname(target), { recursive: true })
+        await writeFile(target, contents)
+      }
+      const git = (...args: string[]) => {
+        const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
+        assert.equal(result.status, 0, result.stderr || result.stdout)
+        return result.stdout.trim()
+      }
+      await write('packages/commercial/src/http/proxy/index.ts')
+      await write('packages/commercial/src/auth/register.ts')
+      await write('packages/gateway/src/x.ts')
+      git('init', '--initial-branch=main')
+      git('config', 'user.name', 'Egress Test')
+      git('config', 'user.email', 'egress@example.test')
+      git('add', '.')
+      git('commit', '-q', '-m', 'egress-running')
+      const egressSha = git('rev-parse', 'HEAD')
+      const commit = (message: string) => {
+        git('add', '-A')
+        git('commit', '-q', '-m', message)
+        return git('rev-parse', 'HEAD')
+      }
+      // Source-only harness: real assert_egress_surface_covered + real git diff; only the
+      // ssh-backed probes are stubbed.
+      const invoke = (targetSha: string, opts: { egress?: boolean; skip?: boolean; noRelease?: boolean } = {}) => {
+        const harness = [
+          'set -euo pipefail',
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          `REPO_ROOT='${repo}'`,
+          'MODE=deploy',
+          `RESTART_EGRESS=${opts.egress ? 1 : 0}`,
+          'DRY=0',
+          opts.noRelease
+            ? 'current_egress_release() { printf ""; }'
+            : 'current_egress_release() { printf "%s\\n" /rel/egress-running; }',
+          `egress_release_source_commit() { printf "%s\\n" '${egressSha}'; }`,
+          `resolve_release_source_commit() { printf "%s\\n" '${targetSha}'; }`,
+          'assert_egress_surface_covered',
+        ].join('\n')
+        return spawnSync('bash', ['-c', harness], {
+          cwd: root,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            ALLOW_ANY_BRANCH: '1',
+            OC_V5_SKIP_EGRESS_SURFACE_GATE: opts.skip ? '1' : '0',
+          },
+        })
+      }
+      return { write, commit, invoke, egressSha }
+    }
+
+    test('rejects a deploy without --egress when egress-plane files changed since the running egress release', async () => {
+      const f = await fixture()
+      await f.write('packages/commercial/src/http/proxy/index.ts', 'authorityCanonicalModel fix\n')
+      const target = await f.commit('proxy fix')
+      const result = f.invoke(target)
+      assert.equal(result.status, 1, result.stdout + result.stderr)
+      assert.match(result.stderr, /egress surface gate/)
+      assert.match(result.stderr, /packages\/commercial\/src\/http\/proxy\/index\.ts/)
+      assert.match(result.stderr, /--with-dist --egress/)
+    })
+
+    test('passes without --egress when only non-egress files changed', async () => {
+      const f = await fixture()
+      await f.write('packages/commercial/src/auth/register.ts', 'mail copy\n')
+      await f.write('packages/gateway/src/x.ts', 'gateway\n')
+      const target = await f.commit('auth copy')
+      const result = f.invoke(target)
+      assert.equal(result.status, 0, result.stdout + result.stderr)
+      assert.match(result.stdout, /egress surface gate.*无变更/)
+    })
+
+    test('ignores test-only changes under the egress plane', async () => {
+      const f = await fixture()
+      await f.write('packages/commercial/src/__tests__/modelAuthorityGate.test.ts', 'test\n')
+      await f.write('packages/commercial/src/egress/recoveryProber.test.ts', 'test\n')
+      const target = await f.commit('tests only')
+      const result = f.invoke(target)
+      assert.equal(result.status, 0, result.stdout + result.stderr)
+    })
+
+    test('is a no-op when --egress is present and honours the explicit skip knob', async () => {
+      const f = await fixture()
+      await f.write('packages/commercial/src/billing/verificationSponsorship.ts', 'sponsorship\n')
+      const target = await f.commit('billing')
+      const withEgress = f.invoke(target, { egress: true })
+      assert.equal(withEgress.status, 0, withEgress.stdout + withEgress.stderr)
+      assert.doesNotMatch(withEgress.stdout + withEgress.stderr, /egress surface gate/)
+      const skipped = f.invoke(target, { skip: true })
+      assert.equal(skipped.status, 0, skipped.stdout + skipped.stderr)
+      assert.match(skipped.stderr, /OC_V5_SKIP_EGRESS_SURFACE_GATE=1 放行/)
+    })
+
+    test('fails closed when the running egress release cannot be resolved', async () => {
+      const f = await fixture()
+      const result = f.invoke(f.egressSha, { noRelease: true })
+      assert.equal(result.status, 1, result.stdout + result.stderr)
+      assert.match(result.stderr, /fail-closed/)
+    })
+
+    test('deploy main flow wires the gate right after the pre-lease CI green gate', async () => {
+      const body = await readFile(deploy, 'utf8')
+      assert.match(
+        body,
+        /maybe_run_ci_green_gate_for_mode \|\| exit 1\n[^\n]*\nassert_egress_surface_covered \|\| exit 1/,
+      )
+      assert.match(body, /--egress\) RESTART_EGRESS=1 ;;/)
+    })
+  })
+
   test('production smoke allowlist covers every explicitly v5-owned leader scheduler', async () => {
     const [deploySource, indexSource] = await Promise.all([
       readFile(deploy, 'utf8'),
