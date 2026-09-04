@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
+import { SESSION_KEY_MAX_CHARS } from '@openclaude/protocol'
+
 import {
   createDelegateEngineBillingRuntime,
   resolveDelegateBillingAttribution,
@@ -12,6 +14,10 @@ import {
 } from '../http/internalDelegateEngineBilling.js'
 import { InsufficientCreditsError } from '../billing/preCheck.js'
 import type { ModelPricing } from '../billing/pricing.js'
+
+/** Live taskboard patrol key (uid3 2026-09, 155 chars). */
+const TASKBOARD_SESSION_KEY_155 =
+  'agent:stage-triage:taskboard:5bfa0bd1-72de-47a4-b75b-a5a4d75e2eee:852859fa-cf1d-481c-96fd-23f2966b8b5f.stage.feature.0:3057ab8d-4308-46b6-b5f8-09f118294897'
 
 const PRICING: ModelPricing = {
   model_id: 'gpt-5.6-sol',
@@ -307,5 +313,90 @@ describe('delegate engine-billing runtime', () => {
     })
     assert.deepEqual(result, { abandoned: true })
     assert.deepEqual(abortCalls, [REQUEST_ID])
+  })
+
+  it('admits a real 155-char taskboard patrol sessionKey', async () => {
+    assert.equal(TASKBOARD_SESSION_KEY_155.length, 155)
+    const { runtime, journalCalls } = makeRuntime()
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: {
+        model: 'grok-build',
+        engine: 'grok',
+        agentId: 'stage-triage',
+        delegateAgentId: 'stage-triage',
+        sessionKey: TASKBOARD_SESSION_KEY_155,
+      },
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    assert.equal(journalCalls.length, 1)
+  })
+
+  it('rejects illegal sessionKey characters', async () => {
+    const { runtime, journalCalls } = makeRuntime()
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+          identity: IDENTITY,
+          body: {
+            model: 'grok-build',
+            engine: 'grok',
+            agentId: 'stage-triage',
+            delegateAgentId: 'stage-triage',
+            sessionKey: `${TASKBOARD_SESSION_KEY_155.slice(0, 154)}/`,
+          },
+        }),
+      /INVALID_SESSIONKEY/,
+    )
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+          identity: IDENTITY,
+          body: {
+            model: 'grok-build',
+            engine: 'grok',
+            agentId: 'stage-triage',
+            delegateAgentId: 'stage-triage',
+            sessionKey: `${TASKBOARD_SESSION_KEY_155.slice(0, 154)} `,
+          },
+        }),
+      /INVALID_SESSIONKEY/,
+    )
+    assert.equal(journalCalls.length, 0)
+  })
+
+  it('rejects sessionKey longer than SESSION_KEY_MAX_CHARS and accepts the boundary', async () => {
+    const { runtime, journalCalls } = makeRuntime()
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+          identity: IDENTITY,
+          body: {
+            model: 'grok-build',
+            engine: 'grok',
+            agentId: 'stage-triage',
+            delegateAgentId: 'stage-triage',
+            sessionKey: 'a'.repeat(SESSION_KEY_MAX_CHARS + 1),
+          },
+        }),
+      /INVALID_SESSIONKEY/,
+    )
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: {
+        model: 'grok-build',
+        engine: 'grok',
+        agentId: 'stage-triage',
+        delegateAgentId: 'stage-triage',
+        sessionKey: 'a'.repeat(SESSION_KEY_MAX_CHARS),
+      },
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    assert.equal(journalCalls.length, 1)
   })
 })

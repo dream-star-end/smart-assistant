@@ -2,8 +2,26 @@
 //   agent:<agentId>:main                              # 主会话(本机操作)
 //   agent:<agentId>:<channel>:dm:<peerId>             # 私聊
 //   agent:<agentId>:<channel>:group:<peerId>          # 群组
+//   agent:<agentId>:taskboard:<ticketId>:<stageId>:<runId>  # 巡检
 
 export type SessionKey = string
+
+/**
+ * sessionKey 安全上限。对齐 commercial `prompt_queue_* .session_key VARCHAR(512)`
+ * 与 telemetry `CHECK (length(session_key) <= 512)`，不是「刚好盖住 155」。
+ * taskboard 巡检真形状约 151–160 字符（agentId + UUID ticket/run +
+ * `<projectUuid>.stage.<type>.<ordinal>`），64 字 agentId 最坏约 207。
+ */
+export const SESSION_KEY_MAX_CHARS = 512
+
+/**
+ * engine-reported delegate billing 的 sessionKey 白名单。
+ * 字符集沿用 2026-09-02 的 `[A-Za-z0-9_:@.-]`；只把长度从 128 抬到
+ * SESSION_KEY_MAX_CHARS。gateway 与 commercial runtime 必须共用本常量。
+ */
+export const DELEGATE_ENGINE_BILLING_SESSION_KEY_RE = new RegExp(
+  `^[A-Za-z0-9_:@.-]{1,${SESSION_KEY_MAX_CHARS}}$`,
+)
 
 export interface ParsedSessionKey {
   agentId: string

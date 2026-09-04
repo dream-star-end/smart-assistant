@@ -1,6 +1,10 @@
 import { randomBytes } from 'node:crypto'
 
-import { isGrokEngineModel, type DurableCodexBilling } from '@openclaude/protocol'
+import {
+  DELEGATE_ENGINE_BILLING_SESSION_KEY_RE,
+  isGrokEngineModel,
+  type DurableCodexBilling,
+} from '@openclaude/protocol'
 import type { Pool } from 'pg'
 
 import {
@@ -29,7 +33,7 @@ import { abortInflightJournal, startInflightJournal } from './proxyBilling.js'
 const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000
 const REQUEST_ID_RE = /^[0-9a-f]{32}$/
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
-const SESSION_ID_RE = /^[A-Za-z0-9_:@.-]{1,128}$/
+const SESSION_ID_RE = DELEGATE_ENGINE_BILLING_SESSION_KEY_RE
 const PARENT_TURN_KEY_RE = /^[0-9a-f]{64}$/
 const MODEL_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/
 

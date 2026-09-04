@@ -10,10 +10,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 
+import { SESSION_KEY_MAX_CHARS } from '@openclaude/protocol'
+
 import {
   createDelegateEngineBillingClient,
   shouldAdmitDelegateEngineBilling,
 } from '../delegateEngineBilling.js'
+
+/** Live taskboard patrol key (uid3 2026-09, 155 chars). */
+const TASKBOARD_SESSION_KEY_155 =
+  'agent:stage-triage:taskboard:5bfa0bd1-72de-47a4-b75b-a5a4d75e2eee:852859fa-cf1d-481c-96fd-23f2966b8b5f.stage.feature.0:3057ab8d-4308-46b6-b5f8-09f118294897'
 
 function response(statusCode: number, body: unknown) {
   return {
@@ -351,5 +357,58 @@ describe('createDelegateEngineBillingClient', () => {
     assert.equal(ids.has(c.requestId), true)
     assert.equal(ids.has(a.requestId), false)
     assert.equal(ids.has(b.requestId), false)
+  })
+})
+
+describe('delegate engine-billing sessionKey contract', () => {
+  function admittingClient() {
+    return createDelegateEngineBillingClient({
+      env: ENV,
+      startupRecovery: false,
+      fetcher: (async () =>
+        response(200, {
+          requestId: 'a'.repeat(32),
+          engineSessionId: `oceng-${'b'.repeat(48)}`,
+        })) as any,
+    })
+  }
+
+  function admit(sessionKey: string) {
+    return admittingClient().admit({
+      model: 'grok-build',
+      engine: 'grok',
+      agentId: 'stage-triage',
+      delegateAgentId: 'stage-triage',
+      sessionKey,
+    })
+  }
+
+  it('accepts a real 155-char taskboard patrol sessionKey', async () => {
+    assert.equal(TASKBOARD_SESSION_KEY_155.length, 155)
+    const admission = await admit(TASKBOARD_SESSION_KEY_155)
+    assert.equal(admission.requestId, 'a'.repeat(32))
+  })
+
+  it('rejects illegal characters', async () => {
+    await assert.rejects(
+      () => admit(`${TASKBOARD_SESSION_KEY_155.slice(0, 154)}/`),
+      /INVALID_SESSION/,
+    )
+    await assert.rejects(
+      () => admit(`${TASKBOARD_SESSION_KEY_155.slice(0, 154)} `),
+      /INVALID_SESSION/,
+    )
+  })
+
+  it('rejects sessionKey longer than SESSION_KEY_MAX_CHARS', async () => {
+    await assert.rejects(
+      () => admit('a'.repeat(SESSION_KEY_MAX_CHARS + 1)),
+      /INVALID_SESSION/,
+    )
+  })
+
+  it('accepts the SESSION_KEY_MAX_CHARS boundary', async () => {
+    const admission = await admit('a'.repeat(SESSION_KEY_MAX_CHARS))
+    assert.equal(admission.requestId, 'a'.repeat(32))
   })
 })
