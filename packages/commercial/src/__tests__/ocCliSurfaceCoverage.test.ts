@@ -348,6 +348,21 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
   'oc-lit': {
     search: tsFailureProbe('packages/gateway/src/ocLitCli.ts', ['search'], /search <query>/),
     snowball: tsFailureProbe('packages/gateway/src/ocLitCli.ts', ['snowball'], /snowball <DOI/),
+    fetch: tsFailureProbe(
+      'packages/gateway/src/ocLitCli.ts',
+      ['fetch'],
+      /fetch <id\|records\.json>/,
+    ),
+    'fetch-batch': tsFailureProbe(
+      'packages/gateway/src/ocLitCli.ts',
+      ['fetch-batch'],
+      /fetch-batch <records\.json> --request-id/,
+    ),
+    'job-status': tsFailureProbe(
+      'packages/gateway/src/ocLitCli.ts',
+      ['job-status'],
+      /job-status <requestId>/,
+    ),
   },
   'oc-litrag': {
     query: tsFailureProbe('packages/gateway/src/ocLitragCli.ts', ['query'], /query .*--docs/),
