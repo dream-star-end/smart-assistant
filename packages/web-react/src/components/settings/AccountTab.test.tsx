@@ -21,6 +21,7 @@ import type {
   User,
 } from "../../lib/types";
 import { AccountTab } from "./AccountTab";
+import { resetSubscribeUiState } from "./SubscriptionDialog";
 import { createMemoryAuthSession } from "../../lib/authSession";
 
 vi.mock("chart.js/auto", () => ({
@@ -53,18 +54,18 @@ const user = {
   org: null,
 } as unknown as User;
 
-function makeSub(monthlyCredits: string, period: string): MySubscription {
+function makeSub(monthlyCredits: string, period: string, paid = true): MySubscription {
   return {
-    planCode: "lite",
-    planName: "Lite",
+    planCode: paid ? "lite" : "free",
+    planName: paid ? "Lite" : "免费版",
     status: "active",
     periodStart: "2026-07-01T00:00:00.000Z",
     periodEnd: "2026-08-01T00:00:00.000Z",
     periodCredits: period,
     monthlyCredits,
-    priceCents: "3800",
-    tier: 1,
-    paid: true,
+    priceCents: paid ? "3800" : "0",
+    tier: paid ? 1 : 0,
+    paid,
     balance: { wallet: "1000", period, total: "0" },
   };
 }
@@ -130,11 +131,46 @@ function renderTab() {
   );
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  resetSubscribeUiState();
+});
 beforeEach(() => {
   vi.clearAllMocks();
   mockedGetUsage.mockResolvedValue(makeUsage());
   mockedGetReport.mockResolvedValue(makeReport("30d"));
+});
+
+describe("AccountTab 耗尽红条分层", () => {
+  test("免费用户余额为 0 → Lite 引导文案", async () => {
+    mockedGetSub.mockResolvedValue(makeSub("300", "0", false));
+    render(
+      <AccountTab
+        auth={auth}
+        user={{ ...user, credits: "0" }}
+        onManageSub={() => {}}
+        reloadKey={0}
+      />,
+    );
+    expect(
+      await screen.findByText("免费额度已用完,开通 Lite(¥38/月,4000 积分)即可继续"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "开通 Lite" })).toBeInTheDocument();
+  });
+
+  test("付费用户余额为 0 → 加量包引导文案", async () => {
+    mockedGetSub.mockResolvedValue(makeSub("4000", "0", true));
+    render(
+      <AccountTab
+        auth={auth}
+        user={{ ...user, credits: "0" }}
+        onManageSub={() => {}}
+        reloadKey={0}
+      />,
+    );
+    expect(await screen.findByText("本期积分已用完,可购买加量包或升级套餐")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "购买加量包" })).toBeInTheDocument();
+  });
 });
 
 describe("AccountTab 本期套餐积分进度", () => {

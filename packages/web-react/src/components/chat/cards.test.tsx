@@ -3,9 +3,13 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { ChatInteractionContext } from "../tool/context";
+import { resetSubscribeUiState } from "../settings/SubscriptionDialog";
 import { AssistantCard, type CardCallbacks, type RenderCtx, UserCard } from "./cards";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  resetSubscribeUiState();
+});
 
 function userMsg(over: Partial<ChatMessage> = {}): ChatMessage {
   return { id: "u1", role: "user", text: "你好", ts: 1, ...over } as ChatMessage;
@@ -187,17 +191,30 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.getByText(/切换模型/)).toBeInTheDocument();
   });
 
-  test("insufficient_credits → 「去充值」现状不动(无重试/重新尝试)", () => {
+  test("insufficient_credits 免费用户 → 「开通 Lite」无重试/重新尝试", () => {
     const onTopUp = vi.fn();
     renderErr(errMsg({ _errorCode: "insufficient_credits", _clientMessageId: "u1" }), {
       onTopUp,
+      subscriptionPaid: false,
       onRetrySend: vi.fn(),
       onRegenerate: vi.fn(),
       resolveRetryTarget: () => retryableUser,
     });
-    expect(screen.getByRole("button", { name: "去充值" })).toBeInTheDocument();
+    expect(screen.getByText("免费额度已用完,开通 Lite(¥38/月,4000 积分)即可继续")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "开通 Lite" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
+  });
+
+  test("insufficient_credits 付费用户 → 「购买加量包」", () => {
+    const onTopUp = vi.fn();
+    renderErr(errMsg({ _errorCode: "insufficient_credits", _clientMessageId: "u1" }), {
+      onTopUp,
+      subscriptionPaid: true,
+    });
+    expect(screen.getByText("本期积分已用完,可购买加量包或升级套餐")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "购买加量包" }));
+    expect(onTopUp).toHaveBeenCalledTimes(1);
   });
 
   test("cta=new_session(context_too_long)→「新建会话继续」导航按钮,无重试类按钮", () => {
@@ -324,15 +341,15 @@ describe("AssistantCard 重发按钮末轮门控(Codex 审计 R5)", () => {
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
   });
 
-  test("历史 insufficient_credits 错误卡 → 「去充值」仍显(导航非重发,不受门控)", () => {
+  test("历史 insufficient_credits 错误卡 → 「开通 Lite」仍显(导航非重发,不受门控)", () => {
     render(
       <AssistantCard
         msg={errMsg({ _errorCode: "insufficient_credits", _clientMessageId: "u1" })}
         ctx={HIST_CTX}
-        cb={{ onTopUp: vi.fn() }}
+        cb={{ onTopUp: vi.fn(), subscriptionPaid: false }}
       />,
     );
-    expect(screen.getByRole("button", { name: "去充值" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "开通 Lite" })).toBeInTheDocument();
   });
 });
 
