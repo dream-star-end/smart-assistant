@@ -55,9 +55,12 @@ test('首位 Tab 即默认落地页，且顺序/文案为已定案的六个分�
   expect(tabs[0]).toHaveAttribute('aria-selected', 'true')
 })
 
-test('窄屏主导航排成宫格，不靠横滚（6 个中文 tab 单行放不进 390px）', () => {
+test('主导航与市场壳同款：单行横滚（no-scrollbar + overflow-x-auto），不再折成宫格', () => {
   renderShell()
-  expect(screen.getByRole('tablist')).toHaveClass('grid', 'grid-cols-3')
+  // 6 个中文 tab 单行放不进 390px → 靠横滚 + 原语内建的边缘渐隐/选中项居中，
+  // 而不是 3×2 宫格（占两行高度、热区摊薄，移动端审计后弃用）。
+  expect(screen.getByRole('tablist')).toHaveClass('overflow-x-auto', 'no-scrollbar')
+  expect(screen.getByRole('tablist')).not.toHaveClass('grid', 'grid-cols-3')
 })
 
 test('tablist 与面板建立 aria 关联，键盘可聚焦内容区', () => {
