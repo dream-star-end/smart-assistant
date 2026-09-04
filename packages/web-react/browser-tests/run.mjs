@@ -2209,10 +2209,29 @@ await check("T28 iPhone 支付跳 mobile_url，微信 WebView 不误导航", asy
   if (await wechatPaymentPage.getByRole("link", { name: "前往微信支付" }).count()) {
     throw new Error("微信 WebView 暴露了手机支付链接");
   }
-  await wechatPaymentPage.getByText("请在系统浏览器打开本页后重新下单").waitFor({
+  if (await wechatPaymentPage.getByTestId("mobile-payment-link").count()) {
+    throw new Error("微信 WebView 暴露了手机支付链接");
+  }
+  await wechatPaymentPage.getByTestId("wechat-copy-payment-link").waitFor({
     state: "visible",
     timeout: 3000,
   });
+  await wechatPaymentPage.getByTestId("wechat-payment-browser-hint").waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await wechatPaymentPage.getByText("在系统浏览器打开后自动恢复本次订单").waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  const wechatUrlBefore = wechatPaymentPage.url();
+  await wechatPaymentPage.getByTestId("wechat-copy-payment-link").click();
+  if (wechatPaymentPage.url() !== wechatUrlBefore) {
+    throw new Error(`微信 WebView 点击复制链接后发生导航: ${wechatPaymentPage.url()}`);
+  }
+  if (wechatPaymentPage.url().includes("pay.xunhupay.com")) {
+    throw new Error("微信 WebView 误导航到 mobile_url");
+  }
   if (wechatExternalRequests !== 0) {
     throw new Error(`微信 WebView 发生了 ${wechatExternalRequests} 次外部请求`);
   }
