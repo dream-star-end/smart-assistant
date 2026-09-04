@@ -384,6 +384,9 @@ export function Composer({
             multiple
             tabIndex={-1}
             className="sr-only"
+            // 菜单闭合时 htmlFor label 不在 DOM,可访问名退化为空;补 aria-label 供读屏。
+            // 结构红线(T4:type=file/无 accept/非 display:none/tabindex=-1)一项不动。
+            aria-label="选择附件文件"
             onChange={(e) => onFiles(Array.from(e.currentTarget.files ?? []))}
           />
           {/* 「+」选项菜单:聚合附件上传与「设定目标」入口(目标入口由会话头部迁入)。

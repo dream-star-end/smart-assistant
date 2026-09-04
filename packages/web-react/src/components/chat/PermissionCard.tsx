@@ -750,6 +750,8 @@ function AskUserQuestionModal({
                   value={qs.other}
                   autoFocus
                   onChange={(e) => setQ(q.question, { other: e.target.value })}
+                  // placeholder 不构成可访问名(探针 label=null),读屏需要显式名字。
+                  aria-label="其他答案"
                   placeholder="输入你的答案…"
                   className="w-full rounded-lg border border-border bg-bg px-3 py-2 text-[13.5px] text-fg outline-none focus-visible:border-accent"
                 />
