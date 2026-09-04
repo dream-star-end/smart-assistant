@@ -48,9 +48,15 @@ export class ChunkErrorBoundary extends Component<Props, State> {
   render() {
     if (!this.state.failed) return this.props.children;
     return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-bg/95 px-6 backdrop-blur-sm">
-        <div role="alert" className="flex max-w-sm flex-col items-center gap-3 text-center">
-          <p className="text-[15px] font-medium text-fg">
+      <div
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="chunk-error-boundary-title"
+        className="fixed inset-0 z-50 flex items-center justify-center bg-bg/95 px-6 backdrop-blur-sm"
+      >
+        {/* alertdialog 已含 alert 语义(读屏只播报一次),内层不再叠 role=alert。 */}
+        <div className="flex max-w-sm flex-col items-center gap-3 text-center">
+          <p id="chunk-error-boundary-title" className="text-[15px] font-medium text-fg">
             {this.state.stale ? "已发布新版本" : "此页面加载出错"}
           </p>
           <p className="text-[13px] leading-relaxed text-muted">
@@ -60,6 +66,8 @@ export class ChunkErrorBoundary extends Component<Props, State> {
           </p>
           <button
             type="button"
+            // 兜底全屏接管输入焦点:键盘用户不依赖 Tab 也能第一时间落到唯一恢复出口。
+            autoFocus
             onClick={this.reload}
             className="mt-1 rounded-full bg-primary px-5 py-2 text-[13px] font-medium text-primary-fg transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
