@@ -22,6 +22,7 @@ import { Media, MediaSignProvider, SignedFileCard, ZoomableImage } from "./media
 
 afterEach(() => {
   cleanup();
+  delete (globalThis as { __OC_FILECARD_SNIFF?: string }).__OC_FILECARD_SNIFF;
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
@@ -241,6 +242,106 @@ describe("SignedFileCard 点击时签名(410 死循环根因)", () => {
     expect(await screen.findByText("下载失败")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /重试/ })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "直接下载" })).toBeInTheDocument();
+  });
+
+  test("idle href 不暴露挂载态 signed URL；+6min 点击/右键均 t=v2", async () => {
+    const sign = makeSignMock();
+    const fetchMock = vi.fn(async () => mockResponse(200, { "content-length": "10" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const hrefs: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      hrefs.push(this.getAttribute("href") || this.href);
+    });
+
+    render(
+      <MediaSignProvider sign={sign}>
+        <SignedFileCard src={path} filename="报表.html" />
+      </MediaSignProvider>,
+    );
+    const card = await screen.findByRole("link", { name: /报表\.html/ });
+    expect(card.getAttribute("href")).toBe("#");
+    expect(card.getAttribute("href")).not.toContain("media-signed");
+
+    vi.advanceTimersByTime(6 * 60_000);
+    fireEvent.click(card);
+    await waitFor(() => expect(hrefs.length).toBeGreaterThan(0));
+    expect(fetchMock.mock.calls.map((c) => String(c[0]))).toContain("/api/media-signed?t=v2");
+
+    hrefs.length = 0;
+    fireEvent.contextMenu(card);
+    await waitFor(() => expect(fetchMock.mock.calls.some((c) => String(c[0]) === "/api/media-signed?t=v2")).toBe(true));
+  });
+
+  test("flag 关：410 JSON 小文件仍走旧 nativeDownload 路径（不嗅探）", async () => {
+    const sign = makeSignMock();
+    const body = JSON.stringify({ error: { code: "GONE", message: "signed URL expired" } });
+    const fetchMock = vi.fn(async () => mockResponse(200, { "content-length": String(body.length) }));
+    vi.stubGlobal("fetch", fetchMock);
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    render(
+      <MediaSignProvider sign={sign}>
+        <SignedFileCard src="/home/agent/.openclaude/generated/报表.docx" filename="报表.docx" />
+      </MediaSignProvider>,
+    );
+    fireEvent.click(await screen.findByRole("link", { name: /报表\.docx/ }));
+    await waitFor(() => expect(anchorClick).toHaveBeenCalled());
+    expect(screen.queryByText("下载失败")).not.toBeInTheDocument();
+  });
+
+  test("VITE_OC_FILECARD_SNIFF=1：410/JSON blob 不得 saveBlob 成 .docx", async () => {
+    (globalThis as { __OC_FILECARD_SNIFF?: string }).__OC_FILECARD_SNIFF = "1";
+    const sign = makeSignMock();
+    const json = JSON.stringify({
+      error: { code: "GONE", message: "signed URL expired", request_id: "a".repeat(32) },
+    });
+    const jsonBytes = new TextEncoder().encode(json);
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).includes("/api/client-errors")) {
+        return mockResponse(200);
+      }
+      const headers = { "content-length": String(jsonBytes.byteLength), "content-type": "application/json" };
+      if (String(url).includes("t=v1")) {
+        return {
+          ok: false,
+          status: 410,
+          headers: new Headers(headers),
+          arrayBuffer: async () => jsonBytes.buffer,
+          body: null,
+        } as unknown as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(headers),
+        arrayBuffer: async () => jsonBytes.buffer.slice(0),
+        body: {
+          getReader() {
+            let done = false;
+            return {
+              read: async () =>
+                done ? { done: true, value: undefined } : ((done = true), { done: false, value: jsonBytes }),
+            };
+          },
+        },
+      } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const createObjectURL = vi.fn(() => "blob:should-not-save");
+    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL: vi.fn() });
+
+    render(
+      <MediaSignProvider sign={sign}>
+        <SignedFileCard src="/home/agent/.openclaude/generated/报表.docx" filename="报表.docx" />
+      </MediaSignProvider>,
+    );
+    fireEvent.click(await screen.findByRole("link", { name: /报表\.docx/ }));
+    expect(await screen.findByText("下载失败")).toBeInTheDocument();
+    expect(createObjectURL).not.toHaveBeenCalled();
+    const friction = fetchMock.mock.calls.filter((c) => String(c[0]).includes("/api/client-errors"));
+    expect(friction.length).toBeGreaterThan(0);
+    const bodies = friction.map((c) => JSON.parse(String((c[1] as RequestInit).body)));
+    expect(bodies.some((b) => b.code === "EMPTY_OR_MAGIC" && b.surface === "artifacts")).toBe(true);
   });
 });
 

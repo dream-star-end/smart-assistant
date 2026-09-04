@@ -1,11 +1,18 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test } from "vitest";
 import {
   DOWNLOAD_STREAM_MAX_BYTES,
   DOWNLOAD_STREAM_MIN_BYTES,
   downloadPercent,
+  fileCardSniffEnabled,
   formatBytes,
+  OFFICE_PDF_MIN_BYTES,
   pickDownloadStrategy,
+  sniffOfficeOrPdfMagic,
 } from "./download";
+
+afterEach(() => {
+  delete (globalThis as { __OC_FILECARD_SNIFF?: string }).__OC_FILECARD_SNIFF;
+});
 
 describe("pickDownloadStrategy（按 Content-Length 选下载路径）", () => {
   test("未知 / 非法尺寸 → native（无法算百分比，交原生边下边写盘）", () => {
@@ -67,5 +74,49 @@ describe("formatBytes", () => {
   test("非法值 → 空串", () => {
     expect(formatBytes(null)).toBe("");
     expect(formatBytes(-1)).toBe("");
+  });
+});
+
+describe("sniffOfficeOrPdfMagic", () => {
+  const pk = new Uint8Array(OFFICE_PDF_MIN_BYTES);
+  pk[0] = 0x50;
+  pk[1] = 0x4b;
+  pk[2] = 0x03;
+  pk[3] = 0x04;
+  const pdf = new Uint8Array(OFFICE_PDF_MIN_BYTES);
+  const pdfHead = new TextEncoder().encode("%PDF-1.7");
+  pdf.set(pdfHead);
+
+  test("PK / %PDF- 合法", () => {
+    expect(sniffOfficeOrPdfMagic(pk, "a.docx")).toEqual({ ok: true });
+    expect(sniffOfficeOrPdfMagic(pk, "a.pptx")).toEqual({ ok: true });
+    expect(sniffOfficeOrPdfMagic(pk, "a.xlsx")).toEqual({ ok: true });
+    expect(sniffOfficeOrPdfMagic(pdf, "a.pdf")).toEqual({ ok: true });
+  });
+
+  test("`{` / `<!DOC` / 过短 → 拒", () => {
+    const json = new TextEncoder().encode('{"error":{"code":"GONE"}}');
+    expect(sniffOfficeOrPdfMagic(json, "a.docx")).toEqual({ ok: false, reason: "too-small" });
+    const jsonPadded = new Uint8Array(OFFICE_PDF_MIN_BYTES);
+    jsonPadded.set(new TextEncoder().encode('{"error":{"code":"GONE","message":"signed URL expired"}}'));
+    expect(sniffOfficeOrPdfMagic(jsonPadded, "报表.docx")).toEqual({ ok: false, reason: "bad-magic" });
+    const htmlPadded = new Uint8Array(OFFICE_PDF_MIN_BYTES);
+    htmlPadded.set(new TextEncoder().encode("<!DOCTYPE html><html>"));
+    expect(sniffOfficeOrPdfMagic(htmlPadded, "a.pdf")).toEqual({ ok: false, reason: "bad-magic" });
+    expect(sniffOfficeOrPdfMagic(new Uint8Array(100), "a.docx")).toEqual({ ok: false, reason: "too-small" });
+  });
+
+  test("非 office/pdf 不嗅探", () => {
+    expect(sniffOfficeOrPdfMagic(new TextEncoder().encode("hi"), "note.txt")).toEqual({ ok: true });
+  });
+});
+
+describe("fileCardSniffEnabled（flag 默认关）", () => {
+  test("未设置 → false（走旧 nativeDownload 路径）", () => {
+    expect(fileCardSniffEnabled()).toBe(false);
+  });
+  test("__OC_FILECARD_SNIFF=1 → true", () => {
+    (globalThis as { __OC_FILECARD_SNIFF?: string }).__OC_FILECARD_SNIFF = "1";
+    expect(fileCardSniffEnabled()).toBe(true);
   });
 });
