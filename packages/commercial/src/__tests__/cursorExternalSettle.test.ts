@@ -142,7 +142,7 @@ describe("planCursorExternalSettle", () => {
     assert.equal(plan.costCredits, 0n);
   });
 
-  test("cursor opus/fable settle at 2x catalog price without touching the catalog multiplier", () => {
+  test("cursor opus/fable settle at 1.5x catalog price without touching the catalog multiplier", () => {
     const usage = { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_tokens: 1_000_000, cache_write_tokens: 1_000_000 };
     const fable = pricing({
       model_id: "cursor-fable-5.1-high",
@@ -153,24 +153,24 @@ describe("planCursorExternalSettle", () => {
       cache_write_per_mtok: 1905n,
     });
     const opusFast = pricing({ model_id: "cursor-opus-5-high-fast", multiplier: "2.000" });
-    assert.equal(cursorSettleMultiplier("cursor-fable-5.1-high"), "2.000");
-    assert.equal(cursorSettleMultiplier("cursor-opus-5-high"), "2.000");
+    assert.equal(cursorSettleMultiplier("cursor-fable-5.1-high"), "1.500");
+    assert.equal(cursorSettleMultiplier("cursor-opus-5-high"), "1.500");
     assert.equal(cursorSettleMultiplier("cursor-grok-4.6-high"), null);
     assert.equal(cursorSettleMultiplier("claude-opus-5"), null);
 
     const plan = planCursorExternalSettle({ engineStatus: "success", usage, pricing: fable });
-    // (1524 + 7621 + 152 + 1905) * 2
-    assert.equal(plan.costCredits, 22_404n);
-    assert.match(plan.snapshotJson, /"multiplier":"2.000"/);
-    assert.match(plan.snapshotJson, /"cursor_settle_multiplier":"2.000"/);
+    // (1524 + 7621 + 152 + 1905) * 1.5
+    assert.equal(plan.costCredits, 16_803n);
+    assert.match(plan.snapshotJson, /"multiplier":"1.500"/);
+    assert.match(plan.snapshotJson, /"cursor_settle_multiplier":"1.500"/);
     assert.match(plan.snapshotJson, /"catalog_multiplier":"1.000"/);
     assert.equal(fable.multiplier, "1.000");
 
-    // -fast sibling composes: catalog 2x * surcharge 2x = 4x of base
+    // -fast sibling composes: catalog 2x * surcharge 1.5x = 3x of base
     const noCache = { ...usage, cache_read_tokens: 0, cache_write_tokens: 0 };
     const fast = planCursorExternalSettle({ engineStatus: "success", usage: noCache, pricing: opusFast });
-    assert.equal(fast.costCredits, 3_200n);
-    assert.match(fast.snapshotJson, /"multiplier":"4.000"/);
+    assert.equal(fast.costCredits, 2_400n);
+    assert.match(fast.snapshotJson, /"multiplier":"3.000"/);
 
     // grok untouched
     const g = planCursorExternalSettle({ engineStatus: "success", usage: noCache, pricing: grok });
@@ -180,6 +180,6 @@ describe("planCursorExternalSettle", () => {
     // waiver bookkeeping reflects the surcharged amount
     const err = planCursorExternalSettle({ engineStatus: "error", usage, pricing: fable });
     assert.equal(err.costCredits, 0n);
-    assert.match(err.snapshotJson, /"wouldHaveCharged":"22404"/);
+    assert.match(err.snapshotJson, /"wouldHaveCharged":"16803"/);
   });
 });
