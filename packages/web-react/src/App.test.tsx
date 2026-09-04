@@ -224,7 +224,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
     render(<App />)
     await loginViaUi()
-    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
+    // 侧栏空态(暂无会话)有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
     expect(imageByteCache.get(key)).toBeNull()
 
     imageByteCache.set(key, new Blob(['account-b']))
@@ -250,7 +251,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     render(<App />)
     await loginViaUi()
 
-    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
+    // 侧栏空态(暂无会话)有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
     expect(screen.getByText('暂无会话')).toBeInTheDocument()
 
     const call = fetchMock.mock.calls.find(([url]) => String(url) === '/api/auth/login')
@@ -284,7 +286,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(login).not.toBeDisabled()
     fireEvent.click(login)
     await waitFor(() => expect(configCalls).toBe(2))
-    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
+    // 侧栏空态(暂无会话)有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
     const loginCalls = fetchMock.mock.calls.filter(([url]) => String(url) === '/api/auth/login')
     expect(loginCalls).toHaveLength(1)
     expect(screen.queryByRole('button', { name: /重试.*配置/ })).not.toBeInTheDocument()
@@ -308,7 +311,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     render(<App />)
 
     // 工作区标志(新建会话按钮)直接出现,全程没有点过任何登录 UI。
-    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
+    // 侧栏空态(暂无会话)有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
     expect(screen.queryByPlaceholderText('邮箱')).not.toBeInTheDocument()
     // refresh 走了 cookie(credentials include)。
     const refreshCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/api/auth/refresh'))
@@ -339,7 +343,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     setAuthHint()
     render(<App />)
     expect(screen.queryByRole('button', { name: '登录' })).not.toBeInTheDocument()
-    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument(), { timeout: 4_000 })
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0), { timeout: 4_000 })
     expect(refreshCalls).toBe(2)
     expect(screen.queryByPlaceholderText('邮箱')).not.toBeInTheDocument()
   })
@@ -387,7 +391,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     // 模拟「登录过的浏览器」：静默续期只在有 oc_auth_hint 时发起。
     setAuthHint()
     render(<StrictMode><App /></StrictMode>)
-    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
+    // 侧栏空态(暂无会话)有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
     expect(refreshCalls).toBe(1)
   })
 
@@ -516,7 +521,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
     render(<App />)
     await loginViaUi()
-    fireEvent.click(await screen.findByRole('button', { name: /新建会话/ }))
+    fireEvent.click((await screen.findAllByRole('button', { name: /新建会话/ }))[0])
     // 空白态显式换模：随后 Goal 物化会话也必须定格该选择，不能因 activeId 改变回落默认。
     const modelTrigger = screen.getByRole('button', { name: '选择对话模型' })
     fireEvent.pointerDown(modelTrigger, { button: 0, pointerType: 'mouse' })
@@ -990,7 +995,7 @@ describe('Aurora v5 — P7 最小路由', () => {
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: /新建会话/ }))
+    fireEvent.click((await screen.findAllByRole('button', { name: /新建会话/ }))[0])
     await waitFor(() => expect(window.location.pathname).toBe('/'))
 
     await act(async () => {
@@ -1072,7 +1077,7 @@ describe('Aurora v5 — P7 最小路由', () => {
     await waitFor(() => expect(window.location.pathname).toBe('/s/webhist01'))
     // 新建会话（空 draft 不占 URL）→ 回 /。
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /新建会话/ }))
+      fireEvent.click(screen.getAllByRole('button', { name: /新建会话/ })[0])
     })
     await waitFor(() => expect(window.location.pathname).toBe('/'))
   })

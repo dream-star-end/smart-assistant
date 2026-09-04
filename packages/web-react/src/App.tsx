@@ -3030,6 +3030,8 @@ export function App() {
           </LazyBoundary>
         ) : (
         <>
+        {/* 会话标题 h1(读屏定位当前会话;视觉已由顶栏表达,故 sr-only。探针:工作区 h1=0)。 */}
+        <h1 className="sr-only">{activeSess?.title || "新对话"}</h1>
         <ChatHeader
           agent={agent}
           onAgentClick={() => setPickerOpen(true)}

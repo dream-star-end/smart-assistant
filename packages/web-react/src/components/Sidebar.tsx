@@ -63,6 +63,9 @@ import {
 import { SessionRow } from "./sidebar/SessionRow";
 import { VirtualList } from "./sidebar/VirtualList";
 
+/** 空态提示行叠加「新建会话」CTA 后的行高(文字 + gap + 按钮 + 原 py-6 呼吸位)。 */
+const EMPTY_HINT_CTA_HEIGHT = 108;
+
 function useCoarsePointer(): boolean {
   return useSyncExternalStore(
     (onChange) => {
@@ -359,6 +362,19 @@ export function Sidebar({
     ],
   );
 
+  // 空态「暂无会话」行在带 onNew 时叠加 CTA 按钮,行高同步加高(VirtualList 按 item.height 排 offsets)。
+  const listItems = useMemo(
+    () =>
+      onNew
+        ? flatItems.map((it) =>
+            it.kind === "hint" && it.text === "暂无会话"
+              ? { ...it, height: EMPTY_HINT_CTA_HEIGHT }
+              : it,
+          )
+        : flatItems,
+    [flatItems, onNew],
+  );
+
   const emitReorder = (ids: string[]) => {
     setOrderOverride(ids);
     onReorderProjects?.(ids);
@@ -426,7 +442,11 @@ export function Sidebar({
   const renderFlat = (item: FlatItem) => {
     if (item.kind === "header") {
       return (
-        <div className="flex h-full items-end px-3 pb-1 text-caption font-medium uppercase tracking-wide text-faint">
+        <div
+          role="heading"
+          aria-level={2}
+          className="flex h-full items-end px-3 pb-1 text-caption font-medium uppercase tracking-wide text-faint"
+        >
           {item.label}
           {item.label === "项目" && onCreateProject && (
             <IconButton
@@ -445,16 +465,24 @@ export function Sidebar({
     }
     if (item.kind === "hint") {
       const emptyCenter = item.text === "暂无会话" || item.text === "没有匹配的会话";
+      // 空态 CTA:纯文字「暂无会话」对新用户是死胡同;给出与顶部同款 onNew 的直接出口。
+      const showNewCta = item.text === "暂无会话" && Boolean(onNew);
       return (
-        <p
+        <div
           className={cn(
             "flex h-full items-center px-3 text-body text-faint",
             emptyCenter && "justify-center py-6",
             item.text === "消息搜索失败" && "text-danger",
+            showNewCta && "flex-col items-center gap-2",
           )}
         >
-          {item.text}
-        </p>
+          <span>{item.text}</span>
+          {showNewCta && (
+            <Button variant="secondary" size="sm" onClick={onNew}>
+              新建会话
+            </Button>
+          )}
+        </div>
       );
     }
     if (item.kind === "session") {
@@ -700,13 +728,16 @@ export function Sidebar({
         />
       )}
 
-      <VirtualList
-        items={flatItems}
-        threshold={virtualizeThreshold}
-        onEndReached={hasMore && !searching ? onLoadMore : undefined}
-        renderItem={renderFlat}
-        className="no-scrollbar flex-1 overflow-y-auto px-2 pb-3"
-      />
+      {/* 会话列表导航语义:读屏用户按 landmark/region 快速跳到会话区(探针:工作区 nav=0)。 */}
+      <nav aria-label="会话列表" className="flex min-h-0 flex-1 flex-col">
+        <VirtualList
+          items={listItems}
+          threshold={virtualizeThreshold}
+          onEndReached={hasMore && !searching ? onLoadMore : undefined}
+          renderItem={renderFlat}
+          className="no-scrollbar flex-1 overflow-y-auto px-2 pb-3"
+        />
+      </nav>
       {loadingMore && (
         <p className="px-3 pb-2 text-center text-caption text-faint">加载更多…</p>
       )}
