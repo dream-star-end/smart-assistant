@@ -29,7 +29,7 @@ import {
 } from "./cookies.js";
 import { evaluateLaneForUser } from "../deploy/laneEvaluate.js";
 import { register, RegisterError } from "../auth/register.js";
-import { verifyEmail, requestPasswordReset, confirmPasswordReset, resendVerification, VerifyError } from "../auth/verify.js";
+import { verifyEmail, issueVerifiedUserSession, requestPasswordReset, confirmPasswordReset, resendVerification, VerifyError } from "../auth/verify.js";
 import { login, refresh, logout, LoginError, RefreshError } from "../auth/login.js";
 import { recordProductFrictionEvent } from "../productFriction/events.js";
 import { requireAuth } from "./auth.js";
@@ -830,7 +830,7 @@ export async function handleResendVerification(
       outcome: "succeeded",
     });
   }
-  sendJson(res, 200, { accepted: r.accepted });
+  sendJson(res, 200, { accepted: r.accepted, email_sent: r.email_sent });
 }
 
 // ─── GET /api/auth/check-verification?email=xxx ─────────────────────
@@ -1035,6 +1035,19 @@ export async function handleVerifyEmail(
     if (r.newly_verified) {
       deps.prewarmContainer?.(BigInt(r.user_id));
     }
+    // OCV5-101:验证成功即签发 session(同 login 的 cookie/refresh 语义),前端免二次登录。
+    const session = await issueVerifiedUserSession(r.user_id, {
+      jwtSecret: deps.jwtSecret,
+      bindIp: ctx.authBoundIp,
+      userAgent: ctx.userAgent ?? undefined,
+      replaceRefreshToken: readRefreshCookie(req),
+    });
+    const ttl = Math.max(0, session.refresh_exp - Math.floor(Date.now() / 1000));
+    setRefreshCookie(res, session.refresh_token, ttl, {
+      secure: deps.refreshCookieSecure,
+      persistent: session.remember,
+    });
+    const lane = await resolveLaneAndApply(req, res, String(session.user.id), deps.refreshCookieSecure);
     await emitAuthFunnel({
       correlation: ctx.requestId,
       userId: r.user_id,
@@ -1042,7 +1055,16 @@ export async function handleVerifyEmail(
       code: "VERIFIED",
       outcome: "succeeded",
     });
-    sendJson(res, 200, { user_id: r.user_id, newly_verified: r.newly_verified });
+    sendJson(res, 200, {
+      user_id: r.user_id,
+      newly_verified: r.newly_verified,
+      user: session.user,
+      access_token: session.access_token,
+      access_exp: session.access_exp,
+      refresh_exp: session.refresh_exp,
+      remember: session.remember,
+      lane,
+    });
   } catch (err) {
     if (err instanceof VerifyError) {
       await emitAuthFunnel({

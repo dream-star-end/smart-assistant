@@ -339,16 +339,29 @@ describe("AuthGate — 错误文案本地化", () => {
       .mockRejectedValue(
         new ApiError({ status: 409, code: "CONFLICT", message: "email already registered（追踪号 z9x）" }),
       );
-    render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
+    render(
+      <AuthGate
+        {...base}
+        onLogin={vi.fn()}
+        onRegister={onRegister}
+        onRequestReset={vi.fn().mockResolvedValue(undefined)}
+        turnstileBypass={true}
+      />,
+    );
     fillRegister();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /创建账号/ }));
     });
     await waitFor(() =>
-      expect(screen.getByText("该邮箱已注册，可直接登录")).toBeInTheDocument(),
+      expect(screen.getByText(/该邮箱已注册，可直接登录/)).toBeInTheDocument(),
     );
+    expect(screen.getByRole("button", { name: "忘记密码？" })).toBeInTheDocument();
     expect(screen.queryByText(/email already registered/)).toBeNull();
     expect(screen.queryByText(/追踪号/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "忘记密码？" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /发送重置链接/ })).toBeInTheDocument(),
+    );
   });
 
   test("未知 code → 保持原样（原 message + 追踪号），供排障", async () => {
@@ -379,6 +392,85 @@ describe("AuthGate — 忘记密码", () => {
     });
     expect(onRequestReset).toHaveBeenCalledWith("a@b.com", "bypass");
     await waitFor(() => expect(screen.getByText(/重置链接已发出/)).toBeInTheDocument());
+  });
+});
+
+
+describe("AuthGate — 邮箱验证", () => {
+  async function goVerify(extra?: Partial<Parameters<typeof AuthGate>[0]>) {
+    const onRegister = vi.fn().mockResolvedValue({ verifyEmailSent: true });
+    render(
+      <AuthGate
+        {...base}
+        onLogin={vi.fn()}
+        onRegister={onRegister}
+        onRequestReset={vi.fn().mockResolvedValue(undefined)}
+        turnstileBypass={true}
+        {...extra}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
+    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
+    fireEvent.change(screen.getByPlaceholderText("再输一次密码"), { target: { value: "password123" } });
+    fireEvent.click(screen.getByRole("checkbox"));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /创建账号/ }));
+    });
+    await waitFor(() => expect(screen.getByPlaceholderText(/6 位验证码/)).toBeInTheDocument());
+  }
+
+  test("submitVerify 成功后不再跳登录", async () => {
+    const onVerifyEmail = vi.fn().mockResolvedValue(undefined);
+    await goVerify({ onVerifyEmail });
+    fireEvent.change(screen.getByPlaceholderText(/6 位验证码/), { target: { value: "123456" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /验证并继续/ }));
+    });
+    expect(onVerifyEmail).toHaveBeenCalledWith("a@b.com", "123456");
+    expect(screen.getByPlaceholderText(/6 位验证码/)).toBeInTheDocument();
+    expect(screen.queryByText("邮箱验证成功，请登录。")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^登录$/ })).not.toBeInTheDocument();
+  });
+
+  test("resend emailSent=false 显示发送失败且不开 60s 冷却", async () => {
+    const onResendVerification = vi.fn().mockResolvedValue({ emailSent: false });
+    render(
+      <AuthGate
+        {...base}
+        onLogin={vi.fn()}
+        onResendVerification={onResendVerification}
+        initialMode="verify"
+        turnstileBypass={true}
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText(/6 位验证码/), { target: { value: "000000" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /没收到？重新发送验证码/ }));
+    });
+    await waitFor(() =>
+      expect(screen.getByText("发送失败，请稍后重试或更换邮箱")).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: /没收到？重新发送验证码/ })).not.toBeDisabled();
+    expect(screen.queryByText(/重新发送（/)).not.toBeInTheDocument();
+  });
+
+  test("resend 成功才开 60s 冷却", async () => {
+    const onResendVerification = vi.fn().mockResolvedValue({ emailSent: true });
+    render(
+      <AuthGate
+        {...base}
+        onLogin={vi.fn()}
+        onResendVerification={onResendVerification}
+        initialMode="verify"
+        turnstileBypass={true}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /没收到？重新发送验证码/ }));
+    });
+    await waitFor(() => expect(screen.getByText(/验证码已重新发送/)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: /重新发送（/ })).toBeDisabled();
   });
 });
 

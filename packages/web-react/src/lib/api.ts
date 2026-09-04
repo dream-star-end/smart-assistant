@@ -1150,26 +1150,56 @@ export const api = {
     ).then((b) => ({ userId: b.user_id, verifyEmailSent: b.verify_email_sent }));
   },
 
-  /** 邮箱验证（POST /api/auth/verify-email）：{email, code} → 验证结果。 */
-  verifyEmail(email: string, code: string): Promise<VerifyEmailResult> {
-    return jsonOrThrow<{ user_id: string; newly_verified: boolean }>(
-      fetch("/api/auth/verify-email", {
+  /** 邮箱验证（POST /api/auth/verify-email）：成功同时签发 session(同 login cookie 语义)。 */
+  async verifyEmail(email: string, code: string): Promise<VerifyEmailResult> {
+    const res = await withAuthCookieMutation(() =>
+      authCookieFetch("/api/auth/verify-email", {
         method: "POST",
+        credentials: "include",
         headers: { Accept: "application/json", "content-type": "application/json" },
         body: JSON.stringify({ email, code }),
       }),
-    ).then((b) => ({ userId: b.user_id, newlyVerified: b.newly_verified }));
+    );
+    if (!res.ok) {
+      try {
+        await throwApi(res);
+      } catch (e) {
+        throw localizeAuthError(e);
+      }
+    }
+    const b = (await res.json()) as {
+      user_id: string;
+      newly_verified: boolean;
+      user: WireUser;
+      access_token: string;
+      access_exp: number;
+      refresh_exp: number;
+      remember: boolean;
+      lane?: string | null;
+    };
+    const user = adaptUser(b.user);
+    const lane = b.lane ?? user.lane ?? null;
+    return {
+      userId: b.user_id,
+      newlyVerified: b.newly_verified,
+      accessToken: b.access_token,
+      accessExp: b.access_exp,
+      refreshExp: b.refresh_exp,
+      remember: b.remember,
+      user: { ...user, lane },
+      lane,
+    };
   },
 
-  /** 重发验证邮件（POST /api/auth/resend-verification）。后端防枚举，恒 200 + accepted。 */
-  resendVerification(email: string): Promise<{ accepted: boolean }> {
-    return jsonOrThrow<{ accepted: boolean }>(
+  /** 重发验证邮件（POST /api/auth/resend-verification）。恒 200;email_sent 区分真实发信失败。 */
+  resendVerification(email: string): Promise<{ accepted: boolean; emailSent: boolean }> {
+    return jsonOrThrow<{ accepted: boolean; email_sent?: boolean }>(
       fetch("/api/auth/resend-verification", {
         method: "POST",
         headers: { Accept: "application/json", "content-type": "application/json" },
         body: JSON.stringify({ email }),
       }),
-    );
+    ).then((b) => ({ accepted: b.accepted, emailSent: b.email_sent !== false }));
   },
 
   /** 跨设备查邮箱验证态（GET /api/auth/check-verification?email=）。后端防枚举，恒 200。 */
