@@ -34,6 +34,12 @@
   /* Gemini/M3 expressive accent layer (tonal strong + on-accent foreground) */
   --color-accent-strong: var(--accent-strong);
   --color-accent-fg: var(--accent-fg);
+  /* 品牌色(logo/「从」字方块/营销品牌时刻)。刻意**不**走 :root/.dark 双主题变量:
+     它是品牌标识而非语义色,深浅主题下都是同一个绿;压在品牌绿上的深墨同理。
+     发光 shadow 单列 --shadow-brand-glow(BrandMark glow 态专用)。 */
+  --color-brand: #c7ff64;
+  --color-brand-fg: #0a0b09;
+  --shadow-brand-glow: 0 0 30px rgba(199, 255, 100, 0.16);
   /* interaction tokens */
   --color-ring: var(--ring);
   /* code surface (CodeBlock background) — tokenised, no longer hard-coded */
@@ -292,6 +298,17 @@ body {
   animation: oc-shimmer 1.4s ease-in-out infinite;
 }
 @keyframes oc-shimmer { 100% { transform: translateX(100%); } }
+
+/* ── 生成占位卡(GeneratingPlaceholderCard)的粒子场景色。刻意明暗主题一致:
+   粒子发光基面贴 image viewer 黑底质感 —— 浅色主题下也必须是深色,淡蓝粒子才
+   可见,因此不走会随主题翻转的 surface token,固化在 styles.css 单一权威处。
+   -base 是 canvas 基面(reduced-motion 下换 -pulse 的柔和脉冲)。 ── */
+.gen-placeholder-canvas {
+  background: radial-gradient(120% 120% at 50% 30%, #12151d 0%, #0a0c11 100%);
+}
+.gen-placeholder-pulse {
+  background: radial-gradient(60% 60% at 50% 50%, rgba(190, 210, 255, 0.1), transparent);
+}
 
 /* ── 桌面光标:Tailwind v4 preflight 删除了 v3 的 `button,[role=button]{cursor:pointer}`
    默认(v4 breaking change),导致全站桌面按钮/可点元素显示的是箭头光标(非手型),鼠标用户

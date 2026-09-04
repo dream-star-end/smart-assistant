@@ -182,14 +182,14 @@ export function GeneratingPlaceholderCard({
       <div className="min-w-0 flex-1">
         <div
           className={cn(
-            "relative overflow-hidden rounded-lg border",
+            // 深色底：粒子发光基面（贴 image viewer 黑底质感，明暗主题一致）。
+            // 色值收编为 styles.css 的 .gen-placeholder-canvas 单一权威。
+            "relative overflow-hidden rounded-lg border gen-placeholder-canvas",
             failed ? "border-danger/60" : "border-border",
           )}
           style={{
             width: `min(100%, calc(18rem * ${ratio}))`,
             aspectRatio: String(ratio),
-            // 深色底：粒子发光基面（贴 image viewer 黑底质感，明暗主题一致）。
-            background: "radial-gradient(120% 120% at 50% 30%, #12151d 0%, #0a0c11 100%)",
           }}
           role="img"
           aria-label={failed ? "图片生成失败" : "图片生成中"}
@@ -202,12 +202,8 @@ export function GeneratingPlaceholderCard({
             <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" />
           )}
           {!failed && reduced && (
-            // reduced-motion 降级：柔和脉冲（无 rAF）。
-            <div
-              className="absolute inset-0 animate-pulse"
-              aria-hidden="true"
-              style={{ background: "radial-gradient(60% 60% at 50% 50%, rgba(190,210,255,0.10), transparent)" }}
-            />
+            // reduced-motion 降级：柔和脉冲（无 rAF），色值见 .gen-placeholder-pulse。
+            <div className="absolute inset-0 animate-pulse gen-placeholder-pulse" aria-hidden="true" />
           )}
 
           {/* 失败态：danger 图标 + 原因 + 可选重试。 */}
