@@ -111,23 +111,30 @@ def build(p: argparse.Namespace, pal: dict) -> Scene:
 
 
 def main() -> None:
-    try:
-        import matplotlib  # noqa: F401
-    except ImportError as e:
-        sys.exit(f"[coord-error-budget] 缺依赖 matplotlib({e});容器应预装,本地请 pip install matplotlib")
-    ap = argparse.ArgumentParser(description="坐标系/误差预算图模板(条长 log10 量级归一,输出 png+svg+spec.json)")
+    ap = argparse.ArgumentParser(description="坐标系/误差预算图模板(条长 log10 量级归一,输出 png+svg+spec.json 或 pptx)")
     ap.add_argument("--items", default=DEMO_ITEMS, help="'名:数值:单位,...';同单位自动同组,跨单位请先换算")
     ap.add_argument("--demo", action="store_true", help="使用内置 VLBI/EOP 演示数据")
     ap.add_argument("--style", choices=["bw", "color"], default="color")
+    ap.add_argument("--backend", choices=["mpl", "pptx"], default="mpl", help="mpl=matplotlib;pptx=python-pptx 原生可编辑 shapes")
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", default=None)
     p = ap.parse_args()
     if p.demo:
         p.items = DEMO_ITEMS
 
+    sc = build(p, palette(p.style))
+    if p.backend == "pptx":
+        from pptx_render import render_pptx
+
+        render_pptx(sc, p.out or "/tmp/coord-error-budget.pptx")
+        return
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError as e:
+        sys.exit(f"[coord-error-budget] 缺依赖 matplotlib({e});容器应预装,本地请 pip install matplotlib")
     from mpl_render import render_mpl
 
-    render_mpl(build(p, palette(p.style)), p.out or "/tmp/coord-error-budget.png", style=p.style)
+    render_mpl(sc, p.out or "/tmp/coord-error-budget.png", style=p.style)
 
 
 if __name__ == "__main__":

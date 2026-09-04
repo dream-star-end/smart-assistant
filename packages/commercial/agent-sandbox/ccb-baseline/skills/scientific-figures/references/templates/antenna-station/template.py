@@ -224,11 +224,7 @@ def build_layout(p: argparse.Namespace, pal: dict) -> Scene:
 
 
 def main() -> None:
-    try:
-        import matplotlib  # noqa: F401
-    except ImportError as e:
-        sys.exit(f"[antenna-station] 缺依赖 matplotlib({e});容器应预装,本地请 pip install matplotlib")
-    ap = argparse.ArgumentParser(description="测站布局/抛物面天线系统示意图模板(输出 png+svg+spec.json)")
+    ap = argparse.ArgumentParser(description="测站布局/抛物面天线系统示意图模板(输出 png+svg+spec.json 或 pptx)")
     ap.add_argument("--mode", choices=["elevation", "layout"], default="elevation")
     ap.add_argument("--station", default="测站A", help="elevation 模式测站名")
     ap.add_argument("--diameter-m", type=float, default=25.0, help="抛物面口径 D(m)")
@@ -236,17 +232,26 @@ def main() -> None:
     ap.add_argument("--tower-m", type=float, default=12.0, help="塔架高度(m)")
     ap.add_argument("--stations", default="A:0,0;B:120,60;C:200,-40", help="layout 模式:'名:x_km,y_km;...'")
     ap.add_argument("--style", choices=["bw", "color"], default="color")
+    ap.add_argument("--backend", choices=["mpl", "pptx"], default="mpl", help="mpl=matplotlib 位图+矢量;pptx=python-pptx 原生可编辑 shapes")
     ap.add_argument("--title", default=None)
-    ap.add_argument("--out", default=None, help="输出 png 路径(默认 /tmp/antenna-station-<mode>.png)")
+    ap.add_argument("--out", default=None, help="输出路径(默认 /tmp/antenna-station-<mode>.png|.pptx)")
     p = ap.parse_args()
 
-    out = p.out or f"/tmp/antenna-station-{p.mode}.png"
     pal = palette(p.style)
     sc = build_elevation(p, pal) if p.mode == "elevation" else build_layout(p, pal)
 
+    if p.backend == "pptx":
+        from pptx_render import render_pptx
+
+        render_pptx(sc, p.out or f"/tmp/antenna-station-{p.mode}.pptx")
+        return
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError as e:
+        sys.exit(f"[antenna-station] 缺依赖 matplotlib({e});容器应预装,本地请 pip install matplotlib")
     from mpl_render import render_mpl
 
-    render_mpl(sc, out, style=p.style)
+    render_mpl(sc, p.out or f"/tmp/antenna-station-{p.mode}.png", style=p.style)
 
 
 if __name__ == "__main__":

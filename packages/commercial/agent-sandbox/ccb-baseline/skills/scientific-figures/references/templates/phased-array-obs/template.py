@@ -166,21 +166,27 @@ def build(p: argparse.Namespace, pal: dict) -> Scene:
 
 
 def main() -> None:
-    try:
-        import matplotlib  # noqa: F401
-    except ImportError as e:
-        sys.exit(f"[phased-array-obs] 缺依赖 matplotlib({e});容器应预装,本地请 pip install matplotlib")
-    ap = argparse.ArgumentParser(description="相控阵/干涉观测示意图模板(输出 png+svg+spec.json)")
+    ap = argparse.ArgumentParser(description="相控阵/干涉观测示意图模板(输出 png+svg+spec.json 或 pptx)")
     ap.add_argument("--panels", default="P1:0,75;P2:8,90;P3:16,105", help="'名:x_m,boresight_deg;...'(三站干涉构型默认同盯一颗目标)")
     ap.add_argument("--target", default="SAT:8,30", help="'名:x_m,y_m'")
     ap.add_argument("--half-angle-deg", type=float, default=12.0, help="波束半张角(°)")
     ap.add_argument("--style", choices=["bw", "color"], default="color")
+    ap.add_argument("--backend", choices=["mpl", "pptx"], default="mpl", help="mpl=matplotlib;pptx=python-pptx 原生可编辑 shapes")
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", default=None)
     p = ap.parse_args()
 
     pal = palette(p.style)
     sc = build(p, pal)
+    if p.backend == "pptx":
+        from pptx_render import render_pptx
+
+        render_pptx(sc, p.out or "/tmp/phased-array-obs.pptx")
+        return
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError as e:
+        sys.exit(f"[phased-array-obs] 缺依赖 matplotlib({e});容器应预装,本地请 pip install matplotlib")
     from mpl_render import render_mpl
 
     render_mpl(sc, p.out or "/tmp/phased-array-obs.png", style=p.style)

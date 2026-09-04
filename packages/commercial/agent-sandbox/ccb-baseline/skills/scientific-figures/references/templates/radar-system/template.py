@@ -100,24 +100,31 @@ def build(p: argparse.Namespace, pal: dict) -> Scene:
 
 
 def main() -> None:
-    try:
-        import matplotlib  # noqa: F401
-    except ImportError as e:
-        sys.exit(f"[radar-system] 缺依赖 matplotlib({e});容器应预装,本地请 pip install matplotlib")
-    ap = argparse.ArgumentParser(description="雷达系统链路框图模板(输出 png+svg+spec.json)")
+    ap = argparse.ArgumentParser(description="雷达系统链路框图模板(输出 png+svg+spec.json 或 pptx)")
     ap.add_argument("--chain", default="振荡器,功放,发射天线,信道,接收天线,低噪放,混频器,ADC,信号处理",
                     help="逗号分隔,按信号流顺序")
     ap.add_argument("--inject", default=None, help="注入支路 '源:目标'(如 '本振:混频器';源须在目标上游)")
     ap.add_argument("--inject-label", default=None)
     ap.add_argument("--band", default="X 波段 9.4 GHz")
     ap.add_argument("--style", choices=["bw", "color"], default="color")
+    ap.add_argument("--backend", choices=["mpl", "pptx"], default="mpl", help="mpl=matplotlib;pptx=python-pptx 原生可编辑 shapes")
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", default=None)
     p = ap.parse_args()
 
+    sc = build(p, palette(p.style))
+    if p.backend == "pptx":
+        from pptx_render import render_pptx
+
+        render_pptx(sc, p.out or "/tmp/radar-system.pptx")
+        return
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError as e:
+        sys.exit(f"[radar-system] 缺依赖 matplotlib({e});容器应预装,本地请 pip install matplotlib")
     from mpl_render import render_mpl
 
-    render_mpl(build(p, palette(p.style)), p.out or "/tmp/radar-system.png", style=p.style)
+    render_mpl(sc, p.out or "/tmp/radar-system.png", style=p.style)
 
 
 if __name__ == "__main__":

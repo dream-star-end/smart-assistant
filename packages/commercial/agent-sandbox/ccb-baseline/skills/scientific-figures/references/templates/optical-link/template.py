@@ -86,11 +86,7 @@ def build(p: argparse.Namespace, pal: dict) -> Scene:
 
 
 def main() -> None:
-    try:
-        import matplotlib  # noqa: F401
-    except ImportError as e:
-        sys.exit(f"[optical-link] 缺依赖 matplotlib({e});容器应预装,本地请 pip install matplotlib")
-    ap = argparse.ArgumentParser(description="FSOC 光链路规格图模板(输出 png+svg+spec.json)")
+    ap = argparse.ArgumentParser(description="FSOC 光链路规格图模板(输出 png+svg+spec.json 或 pptx)")
     ap.add_argument("--range-km", type=float, default=5.0)
     ap.add_argument("--wavelength-nm", type=float, default=1550)
     ap.add_argument("--tx-aperture-cm", type=float, default=10.0)
@@ -99,13 +95,24 @@ def main() -> None:
     ap.add_argument("--rx-power-dbm", type=float, default=-25.0)
     ap.add_argument("--divergence-mrad", type=float, default=0.05)
     ap.add_argument("--style", choices=["bw", "color"], default="color")
+    ap.add_argument("--backend", choices=["mpl", "pptx"], default="mpl", help="mpl=matplotlib;pptx=python-pptx 原生可编辑 shapes")
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", default=None)
     p = ap.parse_args()
 
+    sc = build(p, palette(p.style))
+    if p.backend == "pptx":
+        from pptx_render import render_pptx
+
+        render_pptx(sc, p.out or "/tmp/optical-link.pptx")
+        return
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError as e:
+        sys.exit(f"[optical-link] 缺依赖 matplotlib({e});容器应预装,本地请 pip install matplotlib")
     from mpl_render import render_mpl
 
-    render_mpl(build(p, palette(p.style)), p.out or "/tmp/optical-link.png", style=p.style)
+    render_mpl(sc, p.out or "/tmp/optical-link.png", style=p.style)
 
 
 if __name__ == "__main__":
