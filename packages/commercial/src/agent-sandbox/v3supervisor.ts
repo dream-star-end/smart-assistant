@@ -2792,6 +2792,15 @@ export async function provisionV3Container(
     if (process.env.OC_PROJECT_CONTEXT === "1") {
       env.push("OC_PROJECT_CONTEXT=1");
     }
+    // R3.0 research workspace (课题): flag is judged on both sides — master
+    // (workspaceFlag.ts) and the container CLIs (ocResearchClient.ts read
+    // process.env). Without this line the container never sees the flag and
+    // `oc-litrag` / `oc-ingest --project` silently stay on the old path.
+    // Same selective-injection discipline as OC_PROJECT_CONTEXT: unset on
+    // commercial production → container keeps legacy behaviour.
+    if (process.env.OC_RESEARCH_WORKSPACE === "1") {
+      env.push("OC_RESEARCH_WORKSPACE=1");
+    }
     for (const key of [
       "OC_LOCAL_OBSERVABILITY_RETENTION",
       "OC_LOCAL_EVENT_RETENTION_DAYS",

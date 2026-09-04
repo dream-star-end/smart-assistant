@@ -1010,6 +1010,48 @@ describe("provisionV3Container", () => {
     }
   });
 
+  test("selfhost master OC_RESEARCH_WORKSPACE=1 is forwarded into v5 container env; unset stays out", async () => {
+    const savedChannel = process.env.OC_RUNTIME_CHANNEL;
+    const savedPromptQueue = process.env.OC_PROMPT_QUEUE_V1;
+    const savedFlag = process.env.OC_RESEARCH_WORKSPACE;
+    try {
+      process.env.OC_RUNTIME_CHANNEL = "v5";
+      process.env.OC_PROMPT_QUEUE_V1 = "1";
+      for (const [flag, expectInjected] of [
+        [undefined, false],
+        ["1", true],
+      ] as const) {
+        if (flag === undefined) delete process.env.OC_RESEARCH_WORKSPACE;
+        else process.env.OC_RESEARCH_WORKSPACE = flag;
+        const { docker, captured } = makeDocker();
+        await provisionV3Container(
+          {
+            docker,
+            pool: pool as unknown as Pool,
+            image: TEST_IMAGE,
+            selfHostId: TEST_HOST,
+            randomIp: () => "172.31.5.44",
+            randomSecret: fixedSecret("d".repeat(64)),
+          },
+          779,
+        );
+        const env = captured.containersCreated[0]?.Env ?? [];
+        assert.equal(
+          env.includes("OC_RESEARCH_WORKSPACE=1"),
+          expectInjected,
+          `OC_RESEARCH_WORKSPACE=${String(flag)} → container env injected should be ${expectInjected}`,
+        );
+      }
+    } finally {
+      if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL;
+      else process.env.OC_RUNTIME_CHANNEL = savedChannel;
+      if (savedPromptQueue === undefined) delete process.env.OC_PROMPT_QUEUE_V1;
+      else process.env.OC_PROMPT_QUEUE_V1 = savedPromptQueue;
+      if (savedFlag === undefined) delete process.env.OC_RESEARCH_WORKSPACE;
+      else process.env.OC_RESEARCH_WORKSPACE = savedFlag;
+    }
+  });
+
   test("v5 Cursor auth bind is mounted only for configured local uid and never enters Docker Env", async () => {
     const keys = [
       "OC_RUNTIME_CHANNEL",
