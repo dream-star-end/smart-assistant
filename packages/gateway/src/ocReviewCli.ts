@@ -90,7 +90,9 @@ function isVerdict(v: unknown): v is ReviewVerdict {
 
 /** 严格校验单份评审 JSON;任何缺字段/坏枚举/坏 JSON 都抛 ReviewFormatError(fail-loud)。 */
 export function parseReviewFile(text: string, label: string): ReviewFile {
-  const bad = (msg: string): never => {
+  // 必须是函数声明(或显式类型标注的标识符):TS 只对这类 never 返回调用做控制流收窄,
+  // 否则下方 obj.findings / rec.model 在 bad() 之后仍是 unknown(tsc -b 报 TS18046)。
+  function bad(msg: string): never {
     throw new ReviewFormatError(`${label}: ${msg}`)
   }
   let data: unknown
