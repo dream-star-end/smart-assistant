@@ -295,6 +295,7 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
   },
   'oc-ingest': {
     parse: tsFailureProbe('packages/gateway/src/ocIngestCli.ts', ['parse'], /parse <file>/),
+    list: tsFailureProbe('packages/gateway/src/ocIngestCli.ts', ['list'], /not in a commercial container/),
   },
   'oc-ocr': {
     run: tsFailureProbe('packages/gateway/src/ocOcrCli.ts', ['run'], /run <file>/),

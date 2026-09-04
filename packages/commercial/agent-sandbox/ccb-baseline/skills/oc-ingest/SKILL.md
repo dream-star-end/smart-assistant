@@ -11,10 +11,13 @@ tags: [research, ingest, parse, pdf, ocr]
 ## 用法
 
 ```bash
-oc-ingest parse <文件路径>
+oc-ingest parse <文件路径> [--project <课题id>]
+oc-ingest list [--project <课题id>]
 ```
 
-- `<文件路径>`:用户上传到容器的文件(常在 `/home/agent/.openclaude/uploads/...`)。
+- `<文件路径>`:用户上传到容器的文件(常在 `/home/agent/.openclaude/uploads/...`)。**禁止**把用户电脑上的绝对路径(`/Users/...`、`C:\...`)当容器路径;收到这类路径先请用户在对话框上传,不要瞎 parse。
+- `oc-ingest list`:列当前课题(或 `--project`)已入库文献元数据(无权威 span 文本)。换会话先 list,不要靠人肉记 docId。
+- `--project`:课题 `chat_projects.id`;省略则走当前/默认课题(`OC_RESEARCH_PROJECT` 或默认课题)。flag 关闭时该参数被忽略。
 - 支持:PDF(有文字层)、TXT、Markdown、HTML。
 - 输出 `{ docId, lang, title, sections, spanCount }`;或 `{ needsOcr: true, reason }`(扫描件无文字层 / CAJ 等需 OCR 引擎)。
 
@@ -42,8 +45,8 @@ oc-ingest parse <原文件名>.ocr.md
 
 ## 引用接地链(必读)
 
-1. `oc-ingest parse 文件` → 得 `docId`(平台铸造权威文档)。
-2. `oc-litrag query "问题" --docs <docId>` → 得 quote handles(平台权威段落子串,写作唯一可引用素材)。
+1. `oc-ingest parse 文件` → 得 `docId`(平台铸造权威文档,并挂当前课题)。
+2. `oc-litrag query "问题"`(默认真课题,不必手填 `--docs`)→ 得 quote handles(平台权威段落子串,写作唯一可引用素材)。
 3. 写 claim 时引用 quote 的 id;最后 `oc-cite check` 校验 → 平台铸造 verified。
 
 ## 工具调用纪律(重要)

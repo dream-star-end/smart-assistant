@@ -32,10 +32,42 @@ function resolveResearchEndpoint(tool: string): {
   }
 }
 
-export function fail(tool: string, msg: string): never {
+export function fail(tool: string, msg: string, exitCode = 1): never {
   process.stderr.write(`${tool}: ${msg}\n`);
-  process.exit(1);
+  process.exit(exitCode);
 }
+
+export const RESEARCH_WORKSPACE_FLAG = "OC_RESEARCH_WORKSPACE";
+export const RESEARCH_PROJECT_ENV = "OC_RESEARCH_PROJECT";
+
+export function isResearchWorkspaceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = (env[RESEARCH_WORKSPACE_FLAG] ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+export function resolveCliResearchProjectId(
+  flags: Record<string, string>,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const fromFlag = flags.project?.trim();
+  if (fromFlag) return fromFlag;
+  const fromEnv = env[RESEARCH_PROJECT_ENV]?.trim();
+  return fromEnv || undefined;
+}
+
+/** 用户本机路径(macOS / Windows / 非 agent home),容器读不到。 */
+export function looksLikeHostUserPath(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/");
+  if (normalized.startsWith("/Users/")) return true;
+  if (/^[A-Za-z]:\//.test(normalized)) return true;
+  if (normalized.startsWith("/Documents/")) return true;
+  const home = normalized.match(/^\/home\/([^/]+)\//);
+  if (home && home[1] !== "agent") return true;
+  return false;
+}
+
+export const HOST_PATH_UPLOAD_HINT =
+  "这是用户电脑上的路径，容器里读不到。请让用户在对话框上传文件或 zip（会落到 /home/agent/.openclaude/uploads/），或把文件拷到该目录后再 oc-ingest parse。";
 
 const HELP_ARGS = new Set(["help", "--help", "-h"]);
 
@@ -119,6 +151,9 @@ export function out(o: unknown): void {
 
 /** 上传文件原始字节到 master /v3/research/blob,返回 { blobId, sha256, sizeBytes }。 */
 export async function uploadBlob(tool: string, filePath: string): Promise<any> {
+  if (looksLikeHostUserPath(filePath)) {
+    fail(tool, HOST_PATH_UPLOAD_HINT, 2);
+  }
   const endpoint = resolveResearchEndpoint(tool);
   let bytes: Buffer;
   try {
