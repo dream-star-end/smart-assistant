@@ -246,7 +246,9 @@ describe("SignedFileCard 点击时签名(410 死循环根因)", () => {
 
   test("idle href 不暴露挂载态 signed URL；+6min 点击/右键均 t=v2", async () => {
     const sign = makeSignMock();
-    const fetchMock = vi.fn(async () => mockResponse(200, { "content-length": "10" }));
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      mockResponse(200, { "content-length": "10" }),
+    );
     vi.stubGlobal("fetch", fetchMock);
     const hrefs: string[] = [];
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
@@ -296,7 +298,7 @@ describe("SignedFileCard 点击时签名(410 死循环根因)", () => {
       error: { code: "GONE", message: "signed URL expired", request_id: "a".repeat(32) },
     });
     const jsonBytes = new TextEncoder().encode(json);
-    const fetchMock = vi.fn(async (url: string) => {
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
       if (String(url).includes("/api/client-errors")) {
         return mockResponse(200);
       }
@@ -340,7 +342,7 @@ describe("SignedFileCard 点击时签名(410 死循环根因)", () => {
     expect(createObjectURL).not.toHaveBeenCalled();
     const friction = fetchMock.mock.calls.filter((c) => String(c[0]).includes("/api/client-errors"));
     expect(friction.length).toBeGreaterThan(0);
-    const bodies = friction.map((c) => JSON.parse(String((c[1] as RequestInit).body)));
+    const bodies = friction.map((c) => JSON.parse(String(c[1]?.body)));
     expect(bodies.some((b) => b.code === "EMPTY_OR_MAGIC" && b.surface === "artifacts")).toBe(true);
   });
 });
