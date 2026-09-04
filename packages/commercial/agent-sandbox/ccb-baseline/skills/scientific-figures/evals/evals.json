@@ -44,6 +44,56 @@
         "运行 oc-figcheck --kind 3d 回看,针对取景空/悬空/背景异常/标注缺失自纠并在回复中说明结论",
         "三个部件(天线1、天线2、控制箱)标注齐全,并给出产物绝对路径"
       ]
+    },
+    {
+      "id": "template-antenna-station-no-floating-dish",
+      "prompt": "给我画一张测站侧视图:25 m 口径抛物面天线,仰角 45°,塔高 12 m,要有基墩、塔架、馈源和波束方向标注。之前别的工具画出来天线悬在半空、抛物面像倒扣的锅盖,绝不能再这样。请在最终回复里给出所用模板与参数、oc-figcheck 的 --spec 结论、产物绝对路径。",
+      "assertions": [
+        "优先使用 scientific-figures references/templates/antenna-station 模板(--mode elevation)而非从零手摆坐标",
+        "抛物面坐落在塔架顶端、支撑链(基墩→塔架)落地,不悬空;开口朝向与波束虚线一致(仰角 45°),无倒扣",
+        "出图后运行 oc-figcheck --kind schematic --spec <伴生 spec.json> 并在回复中给出结论(悬空/倒扣属确定性检查范围)",
+        "给出 png 与 spec.json 的绝对路径(/home/agent/.openclaude/ 下)"
+      ]
+    },
+    {
+      "id": "template-phased-array-obs-beam-coverage",
+      "prompt": "画一张相控阵干涉观测示意图:地面三个平板阵 P1(x=0 m)、P2(x=8 m)、P3(x=16 m),共同观测上方同一颗卫星(8,30),波束半张角 12°。信号连线必须真的落进各自波束锥里,基线用虚线连站点且与信号线区分。之前画了 10 轮连线都进了基线没进波束。请在最终回复里给出模板与面板指向角、oc-figcheck --spec 结论、产物绝对路径。",
+      "assertions": [
+        "优先使用 references/templates/phased-array-obs 模板,面板 boresight 按目标几何设定(P1≈75°,P2=90°,P3≈105°)而非随手角度",
+        "三条信号连线端点都落在各自波束锥内;基线为虚线且只连站点;图例区分信号线与基线",
+        "运行 oc-figcheck --kind schematic --spec <spec.json>,must_be_in_beam_of 覆盖检查通过(或模板因覆盖不到目标而拒画并说明)",
+        "给出产物绝对路径与关键参数"
+      ]
+    },
+    {
+      "id": "template-radar-optical-domain-params",
+      "prompt": "两张系统图:①雷达链路框图:振荡器→功放→发射天线→信道→接收天线→低噪放→混频器→ADC→信号处理,外加本振注入到混频器,标注 X 波段 9.4 GHz;②自由空间光链路:5 km、1550 nm、发射 30 dBm、接收 -25 dBm、发散角 0.05 mrad。要器件级规格标注齐全。请在最终回复里给出所用模板、oc-figcheck --spec 结论与产物路径。",
+      "assertions": [
+        "分别使用 references/templates/radar-system 与 optical-link 模板,链路/光路连续、器件标注齐全、频段与功率规格与参数一致",
+        "雷达注入支路方向上游→下游(本振在混频器上游),无回环",
+        "两张图都运行 oc-figcheck --spec 并给出结论;链路损耗(55 dB)与所给功率参数一致",
+        "给出两张图产物绝对路径"
+      ]
+    },
+    {
+      "id": "template-error-budget-log-magnitudes",
+      "prompt": "画一张误差预算图对比这些误差源量级:PM-X 0.48 mas、PM-Y 0.35 mas、UT1 0.21 ms、LOD 0.02 ms、对流层天顶延迟 0.15 m、固体潮 0.003 m。上次把 0.5 mas 和 0.2 ms 画在同一根轴上条长差不多,量级完全失真。请在最终回复里说明条长如何归一,并给出 oc-figcheck --spec 结论与产物路径。",
+      "assertions": [
+        "优先使用 references/templates/coord-error-budget 模板;同单位同组,mas/ms/m 三组分开面板且各有单位标注",
+        "每条误差条带数值+单位;组内条长按 log10 量级归一(同组内 0.003 与 0.15 m 的条长差异反映对数差而非线性差)",
+        "spec.json 的 magnitudes 带 group 与 rendered_length,oc-figcheck --spec 的量级归一检查通过(0 issues)",
+        "给出产物绝对路径"
+      ]
+    },
+    {
+      "id": "template-pptx-editable-delivery",
+      "prompt": "我要在自己的 PowerPoint 里配一张相控阵观测示意图,但必须能编辑——每个部件能单独选中改字改颜色,不要贴死的图片。参数:P1(0,75°)、P2(8,90°)、P3(16,105°),目标 SAT(8,30),半张角 12°。请在最终回复里说明可编辑性如何保证、oc-artifact-qa 结论,并给出 pptx 绝对路径。",
+      "assertions": [
+        "使用领域模板 --backend pptx(python-pptx 原生 shapes)输出,而非把 png 位图贴入幻灯片",
+        "产物用 oc-artifact-qa inspect 验收零 error;每个部件(面板/波束/连线/标注)为独立 shape,无 picture 部件",
+        "可同时给 png 预览版;物理约束与 mpl 版一致(同参数)",
+        "给出 pptx 绝对路径(/home/agent/.openclaude/ 下)与 QA 结论"
+      ]
     }
   ]
 }
