@@ -109,6 +109,51 @@ export function zhihuExactImageReadActionIds(): string[] {
   return reads
 }
 
+/** Identity proofs; never eligible for --allow-challenged. */
+export const ZHIHU_SEED_IDENTITY_READ_ACTION_IDS = ['get_self', 'get_user'] as const
+
+export const ZHIHU_SEED_CLI_USAGE =
+  'usage: seed-zhihu-plugin.ts --verify-and-seed-user=ID|--verify-and-upgrade-user=ID [--allow-challenged=actionId,...]|--smoke-only|--advisory-status|--seed-only|--close-listing-gate|--transition-to-release=PATH|--open-listing-gate-to-release=PATH|--open-listing-gate-current|--assert-current-release-compatible=PATH|--classify-current-for-release=PATH'
+
+const LIVE_VERIFY_MODE_RE = /^--verify-and-(seed|upgrade)-user=(\d{1,16})$/
+const ALLOW_CHALLENGED_PREFIX = '--allow-challenged='
+
+/** Parse seed-zhihu-plugin.ts argv (process.argv.slice(2)). */
+export function parseZhihuSeedCliArgs(
+  cliArgs: readonly string[],
+  readActionIds: readonly string[] = zhihuExactImageReadActionIds(),
+): { mode: string; allowChallenged: Set<string> } {
+  const mode = cliArgs[0] ?? ''
+  const liveMatch = LIVE_VERIFY_MODE_RE.exec(mode)
+  const extras = cliArgs.slice(1)
+  const allowArgs = extras.filter((arg) => arg.startsWith(ALLOW_CHALLENGED_PREFIX))
+  if (allowArgs.length > 1) throw new Error('--allow-challenged may be specified at most once')
+  if (allowArgs.length === 1) {
+    if (!liveMatch)
+      throw new Error(
+        '--allow-challenged is only valid with --verify-and-seed-user or --verify-and-upgrade-user',
+      )
+    if (extras.length !== 1) throw new Error(ZHIHU_SEED_CLI_USAGE)
+    const raw = allowArgs[0]!.slice(ALLOW_CHALLENGED_PREFIX.length)
+    const ids = raw
+      .split(',')
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0)
+    if (ids.length === 0) throw new Error('--allow-challenged requires at least one action id')
+    const allowedReads = new Set(readActionIds)
+    const identity = new Set<string>(ZHIHU_SEED_IDENTITY_READ_ACTION_IDS)
+    const allowChallenged = new Set<string>()
+    for (const id of ids) {
+      if (!allowedReads.has(id)) throw new Error(`--allow-challenged lists unknown read action: ${id}`)
+      if (identity.has(id)) throw new Error(`--allow-challenged cannot include identity action ${id}`)
+      allowChallenged.add(id)
+    }
+    return { mode, allowChallenged }
+  }
+  if (cliArgs.length !== 1) throw new Error(ZHIHU_SEED_CLI_USAGE)
+  return { mode, allowChallenged: new Set() }
+}
+
 /** Incomplete-but-honest read: complete=false + degradedReason is evidence, not a pass. */
 export function classifyZhihuExactImageResult(result: unknown): 'pass' | 'degraded' {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return 'pass'

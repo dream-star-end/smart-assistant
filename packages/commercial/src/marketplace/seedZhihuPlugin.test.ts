@@ -6,6 +6,7 @@ import {
   assertZhihuUpgradeVerificationScope,
   classifyZhihuDeployDecision,
   classifyZhihuExactImageResult,
+  parseZhihuSeedCliArgs,
   zhihuExactImageReadActionIds,
 } from './seedZhihuPlugin.js'
 import { ZHIHU_PLUGIN_CONTRACT } from '../plugins/zhihuContract.js'
@@ -203,5 +204,56 @@ describe('Zhihu exact-image smoke contract', () => {
     assert.equal(classifyZhihuExactImageResult({ user: { urlToken: 'x' } }), 'pass')
     assert.equal(classifyZhihuExactImageResult({ complete: true, degradedReason: 'empty_list' }), 'pass')
     assert.equal(classifyZhihuExactImageResult({ complete: false }), 'pass')
+  })
+})
+
+describe('Zhihu seed CLI --allow-challenged', () => {
+  const reads = zhihuExactImageReadActionIds()
+
+  test('rejects action ids outside the exact-image read list', () => {
+    assert.throws(
+      () =>
+        parseZhihuSeedCliArgs(['--verify-and-seed-user=3', '--allow-challenged=create_pin'], reads),
+      /unknown read action: create_pin/,
+    )
+    assert.throws(
+      () =>
+        parseZhihuSeedCliArgs(['--verify-and-upgrade-user=3', '--allow-challenged=not_an_action'], reads),
+      /unknown read action/,
+    )
+    assert.throws(
+      () => parseZhihuSeedCliArgs(['--verify-and-seed-user=3', '--allow-challenged=get_self'], reads),
+      /identity action get_self/,
+    )
+    assert.throws(
+      () => parseZhihuSeedCliArgs(['--verify-and-seed-user=3', '--allow-challenged=get_user'], reads),
+      /identity action get_user/,
+    )
+  })
+
+  test('rejects --allow-challenged outside verify-and-*-user modes', () => {
+    assert.throws(
+      () => parseZhihuSeedCliArgs(['--smoke-only', '--allow-challenged=get_question'], reads),
+      /only valid with --verify-and-seed-user or --verify-and-upgrade-user/,
+    )
+    assert.throws(
+      () => parseZhihuSeedCliArgs(['--seed-only', '--allow-challenged=get_question'], reads),
+      /only valid with --verify-and-seed-user or --verify-and-upgrade-user/,
+    )
+    assert.throws(
+      () => parseZhihuSeedCliArgs(['--advisory-status', '--allow-challenged=get_question'], reads),
+      /only valid with --verify-and-seed-user or --verify-and-upgrade-user/,
+    )
+  })
+
+  test('accepts listed challenged reads on verify modes', () => {
+    const parsed = parseZhihuSeedCliArgs(
+      ['--verify-and-upgrade-user=42', '--allow-challenged=get_question,list_question_answers'],
+      reads,
+    )
+    assert.equal(parsed.mode, '--verify-and-upgrade-user=42')
+    assert.deepEqual([...parsed.allowChallenged].sort(), ['get_question', 'list_question_answers'])
+    const bare = parseZhihuSeedCliArgs(['--verify-and-seed-user=3'], reads)
+    assert.equal(bare.allowChallenged.size, 0)
   })
 })
