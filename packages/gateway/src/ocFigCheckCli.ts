@@ -7,7 +7,7 @@
  * 一版"(实测有用户为一张 CAD 装置图手动迭代 7 版)。本工具把出图变成**闭环**:
  *
  *   出图 → oc-figcheck → 确定性质量门 + vision 审图 → 拿到 PASS/WARN/FAIL + 问题清单
- *        → agent 据此改代码重画 → 再 figcheck,直到 PASS。
+ *        → agent 据此改代码重画 → 再 figcheck(skill 约定最多 3 轮,超限如实交付)。
  *
  * 两层检查:
  *   1) 确定性(不靠模型,Node 读 PNG 字节 + 可选 Pillow 像素统计):分辨率/DPI、
@@ -284,7 +284,7 @@ async function main(): Promise<void> {
         hint:
           verdict === 'PASS'
             ? '通过。可作为最终产物。'
-            : '未通过:请按 deterministic.issues 与 vision.review 修改绘图代码后重画,再次 oc-figcheck,直至 PASS。',
+            : '未通过:请按 deterministic.issues 与 vision.review 修改绘图代码后重画,再次 oc-figcheck(最多 3 轮;超限则交付当前版本并如实列出未通过项)。',
       },
       null,
       2,

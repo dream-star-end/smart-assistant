@@ -1,6 +1,6 @@
 ---
 name: scientific-figures
-description: 科研图表规范与**闭环出图工作流**。出图后必须用 `oc-figcheck` 回看自纠(看到重叠/裁切/取景空/背景异常再改),直到 PASS。按图类型选对确定性工具:数据图=matplotlib+SciencePlots/seaborn;网络关系图=networkx+graphviz;复杂热图=PyComplexHeatmap;组合集合=UpSetPlot/venn;精密示意/机制图=Typst+CeTZ(矢量);简单流程=Mermaid;3D工程装置图=matplotlib-3D(信息优先)+闭环。**学科无关的通用图形原型(阶段链框图/量级对比/覆盖几何)优先套参数化模板**并带 `--spec` 过物理一致性门(悬空/指向错/量级混轴/图例遮挡确定性 FAIL);PPT 配图用模板 `--backend pptx` 出**可编辑原生 shapes**;期刊黑白/彩色双版样式一键叠加。**严禁生成式 AI 插画**。要给报告/论文/PPT 配图、画数据图/网络图/示意图/装置图时使用。
+description: 科研图表规范与**闭环出图工作流**。出图后必须用 `oc-figcheck` 回看自纠(看到重叠/裁切/取景空/背景异常再改),最多 3 轮,超限如实交付。按图类型选对确定性工具:数据图=matplotlib+SciencePlots/seaborn;网络关系图=networkx+graphviz;复杂热图=PyComplexHeatmap;组合集合=UpSetPlot/venn;精密示意/机制图=Typst+CeTZ(矢量);简单流程=Mermaid;3D工程装置图=matplotlib-3D(信息优先)+闭环。**学科无关的通用图形原型(阶段链框图/量级对比/覆盖几何)优先套参数化模板**并带 `--spec` 过物理一致性门(悬空/指向错/量级混轴/图例遮挡确定性 FAIL);PPT 配图用模板 `--backend pptx` 出**可编辑原生 shapes**;期刊黑白/彩色双版样式一键叠加。**严禁生成式 AI 插画**。要给报告/论文/PPT 配图、画数据图/网络图/示意图/装置图时使用。
 tags: [research, figures, matplotlib, scienceplots, seaborn, networkx, typst, cetz, figcheck, figspec, pptx, journal-style]
 priority: 5
 ---
@@ -17,14 +17,19 @@ priority: 5
 - **示意图/量级图先套通用原型**(见 §2b):阶段链框图/量级对比/覆盖几何命中原型时,改参数而不是从零手摆坐标——物理正确性由模板构造保证、由 `--spec` 门复核。
 - 图必须有清晰坐标轴标签+单位、图例、必要标题;字号适配印刷;投稿再出矢量(§6)。
 
-## 1. 核心工作流:出图 → figcheck → 自纠 → 直到 PASS
+## 1. 核心工作流:出图 → figcheck → 自纠(最多 3 轮)→ 交付
 
 ```
 1) 选对工具(§2)画图,savefig 到 /home/agent/.openclaude/research/<id>/figN.png,dpi=300,bbox_inches='tight'
 2) oc-figcheck <png> --kind <figure|schematic|network|3d|composite> [--spec <figN.spec.json>]
 3) 读输出:deterministic.issues(确定性硬伤)+ vision.review(审稿意见)+ 末行 VERDICT
-4) VERDICT!=PASS → 按问题改绘图代码重画 → 回到步骤 2;PASS → 交付
+4) VERDICT=PASS/WARN → 交付;FAIL 且未满 3 轮 → 按 issues 改绘图代码重画 → 回到步骤 2
+5) 第 3 轮仍 FAIL → 停止重画,交付当前最好的一版,并在回复里如实列出未通过的 issues 让用户裁决
 ```
+
+**闭环有界**:figcheck 是给你一双看图的眼睛,不是替你决定"能不能交"。同一张图 figcheck 最多跑 3 轮
+(计次以 oc-figcheck 调用为准);oc-figcheck 自身报错/vision 后端不可用时**不算一轮、不阻塞**——
+按 deterministic 结果交付并注明"本次未做 vision 审图"。禁止为一张图无上限地重画烧额度。
 
 `oc-figcheck` 两层把关(一条命令搞定):
 - **确定性**(不耗模型额度):分辨率/DPI 不足、**主背景占比过高=取景过空/物体飘散**、**背景主色异常偏色=渲染背景翻车(整张绿/黄)**、**画布边缘内容密集=元素被裁**;带 `--spec` 时追加**物理一致性门**(§2b):对象悬空、连线端点落在覆盖锥外、同组量纲混轴、大跨度条长未按 log10 归一、标签互相遮挡——这些"物理错误"像素层看不出来,必须靠 spec 声明确定性判定。
@@ -37,7 +42,7 @@ oc-figcheck /home/agent/.openclaude/research/<id>/obs.png --kind schematic --spe
 # 复杂图表要精确读数核对时(minimax 已够;仅特殊场景)可加 --focus "核对每个数值标注是否正确"
 ```
 
-**不要跳过 figcheck 直接交图。** 复杂图尤其要迭代到 PASS——这正是把"7 版手动折腾"变成"机器自纠 2-3 轮"的关键。VERDICT=WARN(确定性干净、vision 给的是建议级意见)时可自行判断是否继续打磨;FAIL 必须修。
+**不要跳过 figcheck 直接交图。** 复杂图靠它把"7 版手动折腾"压成"机器自纠 2-3 轮"。VERDICT=WARN(确定性干净、vision 给的是建议级意见)可直接交付,是否再打磨由你按用户诉求判断;FAIL 的 deterministic.issues 是客观硬伤(裁切/重叠/悬空/锥外/混轴),应当修——但受 §1 的 3 轮上限约束,修不动就如实交付并说明。vision.review 的意见是审稿人视角的建议,与你的判断冲突时以你对用户需求的理解为准,不要为迎合 VLM 改坏图。
 
 ## 2. 图类型 → 工具选型表(选错工具=注定画不好)
 
