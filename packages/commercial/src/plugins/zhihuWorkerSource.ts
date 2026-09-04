@@ -1865,52 +1865,68 @@ function urlPathname(raw) {
 }
 async function proveSelf(context) {
   const page = await context.newPage();
+  let peoplePage = null;
+  let settled = false;
   try {
     const timedOut = { timeout: true };
+    const work = (async () => {
+      await gotoAuthenticated(page, 'https://www.zhihu.com/');
+      let homeText = await bodyText(page);
+      for (let attempt = 1; attempt <= 2 && homeText.length < 50; attempt += 1) {
+        if (!settled) emitStep({ step: 'login.home_retry', ok: false, textLen: homeText.length, hits: attempt });
+        try {
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+          await page.waitForTimeout(2500);
+        } catch {}
+        homeText = await bodyText(page);
+      }
+      if (homeText.length < 50) {
+        if (!settled) emitStep({ step: 'login.prove_self', ok: false, reason: 'home-empty' });
+        return null;
+      }
+      const topBar = await topBarPeopleTokens(page);
+      const first = await selfTokenFromPage(page);
+      if (!first) {
+        if (!settled) emitStep({ step: 'login.prove_self', ok: false, reason: 'home-no-unique-token', candidateCount: Array.from(new Set(topBar)).length });
+        return null;
+      }
+      peoplePage = await context.newPage();
+      await gotoAuthenticated(peoplePage, 'https://www.zhihu.com/people/' + first);
+      const path = urlPathname(peoplePage.url());
+      if (!path.startsWith('/people/' + first)) {
+        if (!settled) emitStep({ step: 'login.prove_self', ok: false, reason: 'people-page-token-mismatch' });
+        return null;
+      }
+      await peoplePage.waitForSelector('h1, [class*="ProfileHeader"]', { timeout: 15_000 }).catch(() => null);
+      const profile = await projectProfile(peoplePage, first).catch(() => null);
+      if (!profile || !profile.urlToken) {
+        if (!settled) {
+          const text = await bodyText(peoplePage);
+          emitStep({ step: 'login.prove_self', ok: false, reason: 'profile-projection-null', textLen: text.length });
+        }
+        return null;
+      }
+      return first;
+    })();
+    work.catch(() => {});
     const result = await Promise.race([
-      (async () => {
-        await gotoAuthenticated(page, 'https://www.zhihu.com/');
-        let homeText = await bodyText(page);
-        for (let attempt = 1; attempt <= 2 && homeText.length < 50; attempt += 1) {
-          emitStep({ step: 'login.home_retry', ok: false, textLen: homeText.length, hits: attempt });
-          try {
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
-            await page.waitForTimeout(2500);
-          } catch {}
-          homeText = await bodyText(page);
-        }
-        if (homeText.length < 50) {
-          emitStep({ step: 'login.prove_self', ok: false, reason: 'home-empty' });
-          return null;
-        }
-        const topBar = await topBarPeopleTokens(page);
-        const first = await selfTokenFromPage(page);
-        if (!first) {
-          emitStep({ step: 'login.prove_self', ok: false, reason: 'home-no-unique-token', candidateCount: Array.from(new Set(topBar)).length });
-          return null;
-        }
-        await gotoAuthenticated(page, 'https://www.zhihu.com/people/' + first);
-        const current = peopleTokenFromPath(new URL(page.url()).pathname) || await selfTokenFromPage(page);
-        if (current !== first) {
-          emitStep({ step: 'login.prove_self', ok: false, reason: 'people-page-token-mismatch' });
-          return null;
-        }
-        const profile = await projectProfile(page, first).catch(() => null);
-        if (!profile || !profile.urlToken) {
-          emitStep({ step: 'login.prove_self', ok: false, reason: 'profile-projection-null' });
-          return null;
-        }
-        return first;
-      })(),
-      new Promise((resolve) => setTimeout(() => resolve(timedOut), 90_000))
+      work,
+      new Promise((resolve) => setTimeout(() => {
+        settled = true;
+        resolve(timedOut);
+      }, 90_000))
     ]);
     if (result === timedOut) {
       emitStep({ step: 'login.prove_self', ok: false, reason: 'timeout' });
       return null;
     }
+    settled = true;
     return result;
   } catch { return null; }
-  finally { await page.close().catch(() => {}); }
+  finally {
+    if (peoplePage) await peoplePage.close().catch(() => {});
+    await page.close().catch(() => {});
+  }
 }
 async function runLogin(input, relay) {
   const allowed = new Set(input.allowedOrigins.map((origin) => new URL(origin).origin));
@@ -1932,18 +1948,22 @@ async function runLogin(input, relay) {
     let probeHits = 0;
     while (Date.now() < input.deadlineMs) {
       await assertNoChallenge(home);
-      if (Date.now() >= nextQr) {
+      if (!signalEmitted && Date.now() >= nextQr) {
         nextQr = Date.now() + QR_REFRESH_MS;
-        await switchToQrLogin(home);
-        const fresh = await captureQr(home).catch(() => null);
-        if (fresh) {
-          const freshHash = digest(fresh.toString('base64'));
-          if (freshHash !== qrHash) {
-            qrHash = freshHash;
-            png = fresh;
-            writeFrame({ event: 'qr', png: png.toString('base64') });
-            emitStep({ step: 'login.qr_refresh' });
+        try {
+          await switchToQrLogin(home);
+          const fresh = await captureQr(home);
+          if (fresh) {
+            const freshHash = digest(fresh.toString('base64'));
+            if (freshHash !== qrHash) {
+              qrHash = freshHash;
+              png = fresh;
+              writeFrame({ event: 'qr', png: png.toString('base64') });
+              emitStep({ step: 'login.qr_refresh' });
+            }
           }
+        } catch {
+          emitStep({ step: 'login.qr_refresh', ok: false });
         }
       }
       const cookieChanged = (await authCookieDigest(context)) !== initialCookies;
