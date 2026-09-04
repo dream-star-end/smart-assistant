@@ -85,8 +85,8 @@ describe("platform-seed.yaml schema v2 + validatePlatformSeed", () => {
     const byId = (id: string) => doc.agents.find((a: { id: string }) => a.id === id);
     const main = byId("main");
     // 执行三元组(声明 = 容器侧唯一权威;值的一致性锚在 runtimeEntrypointPolicy.test.ts)。
-    assert.equal(main.model, "glm-5.3-zai");
-    assert.equal(main.provider, "zai");
+    assert.equal(main.model, "deepseek-v4-flash");
+    assert.equal(main.provider, "opencodego");
     assert.equal(main.runnerKind, undefined, "main 走默认 runner");
     assert.equal(main.persona, "personas/main.md");
     assert.equal(main.permissionMode, "bypassPermissions");
@@ -175,8 +175,8 @@ describe("platform-seed.yaml schema v2 + validatePlatformSeed", () => {
     const doc = pb.validatePlatformSeed(JSON.parse(JSON.stringify(pb.DEV_FALLBACK_SEED_DOC)));
     assert.equal(doc.schemaVersion, 2);
     assert.deepEqual(doc.agents.map((a: { id: string }) => a.id), ["main"]);
-    assert.equal(doc.agents[0].model, "glm-5.3-zai");
-    assert.equal(doc.agents[0].provider, "zai");
+    assert.equal(doc.agents[0].model, "deepseek-v4-flash");
+    assert.equal(doc.agents[0].provider, "opencodego");
   });
 });
 
