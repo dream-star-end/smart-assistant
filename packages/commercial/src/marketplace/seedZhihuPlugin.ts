@@ -20,6 +20,7 @@ import {
 import {
   COMPILED_ZHIHU_PLUGIN,
   ZHIHU_PLUGIN_ARTIFACT,
+  ZHIHU_PLUGIN_CONTRACT,
   ZHIHU_PLUGIN_SLUG,
   ZHIHU_PLUGIN_VERSION,
 } from '../plugins/zhihuContract.js'
@@ -92,6 +93,30 @@ export function assertZhihuUpgradeVerificationScope(
 }
 
 export type ZhihuDeployDecision = 'noop' | 'promote' | 'unverified'
+
+/** Exact-image smoke may only execute these; write ids are excluded by construction. */
+export function zhihuExactImageReadActionIds(): string[] {
+  const reads = ZHIHU_PLUGIN_CONTRACT.actions
+    .filter((action) => action.effect === 'read')
+    .map((action) => action.id)
+  const writes = new Set(
+    ZHIHU_PLUGIN_CONTRACT.actions
+      .filter((action) => action.effect === 'write')
+      .map((action) => action.id),
+  )
+  if (reads.some((id) => writes.has(id))) throw new Error('Zhihu read/write action id collision')
+  if (reads.length === 0) throw new Error('Zhihu contract has no read actions')
+  return reads
+}
+
+/** Incomplete-but-honest read: complete=false + degradedReason is evidence, not a pass. */
+export function classifyZhihuExactImageResult(result: unknown): 'pass' | 'degraded' {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return 'pass'
+  const rec = result as Record<string, unknown>
+  if (rec.complete === false && typeof rec.degradedReason === 'string' && rec.degradedReason.length > 0)
+    return 'degraded'
+  return 'pass'
+}
 
 /** Unattended deploy classifier: pin-aligned active listing is a zero-write no-op. */
 export function classifyZhihuDeployDecision(input: {

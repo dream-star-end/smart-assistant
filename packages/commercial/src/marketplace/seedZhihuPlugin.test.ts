@@ -5,7 +5,10 @@ import type { OfficialManagedBrowserTransitionScope } from '../plugins/officialM
 import {
   assertZhihuUpgradeVerificationScope,
   classifyZhihuDeployDecision,
+  classifyZhihuExactImageResult,
+  zhihuExactImageReadActionIds,
 } from './seedZhihuPlugin.js'
+import { ZHIHU_PLUGIN_CONTRACT } from '../plugins/zhihuContract.js'
 
 const SOURCE_HASH = 'a'.repeat(64)
 const SOURCE_EXEC_HASH = 'b'.repeat(64)
@@ -171,5 +174,34 @@ describe('unattended Zhihu deploy decision', () => {
       }),
       'unverified',
     )
+  })
+})
+
+describe('Zhihu exact-image smoke contract', () => {
+  test('enumerates every read action and never a write action', () => {
+    const reads = zhihuExactImageReadActionIds()
+    const writeIds = ZHIHU_PLUGIN_CONTRACT.actions
+      .filter((action) => action.effect === 'write')
+      .map((action) => action.id)
+    assert.deepEqual(
+      reads,
+      ZHIHU_PLUGIN_CONTRACT.actions
+        .filter((action) => action.effect === 'read')
+        .map((action) => action.id),
+    )
+    assert.ok(reads.includes('get_self'))
+    assert.ok(reads.includes('list_hot'))
+    for (const id of writeIds) assert.equal(reads.includes(id), false)
+    assert.ok(writeIds.includes('create_answer'))
+  })
+
+  test('incomplete reads with degradedReason are degraded, not pass', () => {
+    assert.equal(
+      classifyZhihuExactImageResult({ items: [], complete: false, degradedReason: 'empty_list' }),
+      'degraded',
+    )
+    assert.equal(classifyZhihuExactImageResult({ user: { urlToken: 'x' } }), 'pass')
+    assert.equal(classifyZhihuExactImageResult({ complete: true, degradedReason: 'empty_list' }), 'pass')
+    assert.equal(classifyZhihuExactImageResult({ complete: false }), 'pass')
   })
 })
