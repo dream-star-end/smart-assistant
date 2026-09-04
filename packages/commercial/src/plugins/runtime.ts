@@ -1328,67 +1328,92 @@ export class PluginRuntimeFacade {
     actionId: string
     params: Record<string, unknown>
   }): Promise<Record<string, unknown>> {
-    if (Object.hasOwn(input.params, 'snapshot'))
+    if (Object.hasOwn(input.params, 'snapshot') || Object.hasOwn(input.params, 'mediaManifest'))
       throw new PluginRuntimeFacadeError('BAD_REQUEST', 'server-owned Plugin fields are forbidden')
 
     const prepared: Record<string, unknown> = { ...input.params }
     if (
-      input.actionId !== 'edit_answer' &&
-      input.actionId !== 'delete_answer' &&
-      input.actionId !== 'delete_comment'
-    )
-      return prepared
-
-    const self = (await this.call({
-      userId: input.userId,
-      targetId: input.targetId,
-      actionId: 'get_self',
-      params: {},
-    })) as { user?: Record<string, unknown> }
-    const selfToken = self.user?.urlToken
-    if (typeof selfToken !== 'string' || selfToken.length === 0)
-      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin owned snapshot is unavailable')
-
-    if (input.actionId === 'edit_answer' || input.actionId === 'delete_answer') {
-      const expectedId = String(input.params.answerId ?? '')
-      const read = (await this.call({
+      input.actionId === 'edit_answer' ||
+      input.actionId === 'delete_answer' ||
+      input.actionId === 'delete_comment'
+    ) {
+      const self = (await this.call({
         userId: input.userId,
         targetId: input.targetId,
-        actionId: 'get_answer',
-        params: { answerId: expectedId },
-      })) as { answer?: Record<string, unknown> }
-      const snapshot = zhihuExactTargetSnapshot(read.answer, expectedId, selfToken)
-      if (!snapshot)
-        throw new PluginRuntimeFacadeError(
-          'BAD_REQUEST',
-          'Plugin owned-answer snapshot is unavailable',
-        )
-      prepared.snapshot = snapshot
-      return prepared
+        actionId: 'get_self',
+        params: {},
+      })) as { user?: Record<string, unknown> }
+      const selfToken = self.user?.urlToken
+      if (typeof selfToken !== 'string' || selfToken.length === 0)
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin owned snapshot is unavailable')
+
+      if (input.actionId === 'edit_answer' || input.actionId === 'delete_answer') {
+        const expectedId = String(input.params.answerId ?? '')
+        const read = (await this.call({
+          userId: input.userId,
+          targetId: input.targetId,
+          actionId: 'get_answer',
+          params: { answerId: expectedId },
+        })) as { answer?: Record<string, unknown> }
+        const snapshot = zhihuExactTargetSnapshot(read.answer, expectedId, selfToken)
+        if (!snapshot)
+          throw new PluginRuntimeFacadeError(
+            'BAD_REQUEST',
+            'Plugin owned-answer snapshot is unavailable',
+          )
+        prepared.snapshot = snapshot
+      } else {
+        const expectedAnswerId = String(input.params.answerId ?? '')
+        const expectedCommentId = String(input.params.commentId ?? '')
+        const read = (await this.call({
+          userId: input.userId,
+          targetId: input.targetId,
+          actionId: 'list_answer_comments',
+          params: { answerId: expectedAnswerId, limit: 50 },
+        })) as { comments?: Record<string, unknown>[] }
+        const comment = read.comments?.find((candidate) => candidate.id === expectedCommentId)
+        if (comment && comment.answerId != null && comment.answerId !== expectedAnswerId) {
+          throw new PluginRuntimeFacadeError(
+            'BAD_REQUEST',
+            'Plugin owned-comment snapshot is unavailable',
+          )
+        }
+        const snapshot = zhihuExactTargetSnapshot(comment, expectedCommentId, selfToken)
+        if (!snapshot)
+          throw new PluginRuntimeFacadeError(
+            'BAD_REQUEST',
+            'Plugin owned-comment snapshot is unavailable',
+          )
+        prepared.snapshot = snapshot
+      }
     }
 
-    const expectedAnswerId = String(input.params.answerId ?? '')
-    const expectedCommentId = String(input.params.commentId ?? '')
-    const read = (await this.call({
-      userId: input.userId,
-      targetId: input.targetId,
-      actionId: 'list_answer_comments',
-      params: { answerId: expectedAnswerId, limit: 50 },
-    })) as { comments?: Record<string, unknown>[] }
-    const comment = read.comments?.find((candidate) => candidate.id === expectedCommentId)
-    if (comment && comment.answerId != null && comment.answerId !== expectedAnswerId) {
-      throw new PluginRuntimeFacadeError(
-        'BAD_REQUEST',
-        'Plugin owned-comment snapshot is unavailable',
-      )
+    if (
+      input.actionId === 'create_pin' ||
+      input.actionId === 'create_answer' ||
+      input.actionId === 'edit_answer' ||
+      input.actionId === 'create_article'
+    ) {
+      const imagePaths = Array.isArray(input.params.images)
+        ? (input.params.images as unknown[]).filter(
+            (value): value is string => typeof value === 'string',
+          )
+        : []
+      if (imagePaths.length > 0) {
+        if (!this.opts.knowledgePlanetMedia)
+          throw new PluginRuntimeFacadeError('RUNTIME_UNAVAILABLE', 'Plugin media is unavailable')
+        prepared.mediaManifest = await sealKnowledgePlanetMedia({
+          userId: input.userId,
+          items: imagePaths.map((path) => ({ path, kind: 'image' as const })),
+          deps: this.opts.knowledgePlanetMedia,
+        })
+      } else prepared.mediaManifest = []
+      if (input.actionId === 'create_pin') {
+        prepared.text = typeof input.params.text === 'string' ? input.params.text : ''
+        if (String(prepared.text).length === 0 && imagePaths.length === 0)
+          throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin pin cannot be empty')
+      }
     }
-    const snapshot = zhihuExactTargetSnapshot(comment, expectedCommentId, selfToken)
-    if (!snapshot)
-      throw new PluginRuntimeFacadeError(
-        'BAD_REQUEST',
-        'Plugin owned-comment snapshot is unavailable',
-      )
-    prepared.snapshot = snapshot
     return prepared
   }
 
@@ -1588,7 +1613,9 @@ export class PluginRuntimeFacade {
           : []
         let staged: Awaited<ReturnType<typeof stageKnowledgePlanetMedia>> | null = null
         if (
-          [KNOWLEDGE_PLANET_PLUGIN_SLUG, WEIBO_PLUGIN_SLUG].includes(verified.slug) &&
+          [KNOWLEDGE_PLANET_PLUGIN_SLUG, WEIBO_PLUGIN_SLUG, ZHIHU_PLUGIN_SLUG].includes(
+            verified.slug,
+          ) &&
           manifest.length > 0
         ) {
           const mediaDeps = this.opts.knowledgePlanetMedia

@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { ZHIHU_WORKER_SOURCE } from './zhihuWorkerSource.js'
 
 export const ZHIHU_PLUGIN_SLUG = 'zhihu'
-export const ZHIHU_PLUGIN_VERSION = '1.0.0'
+export const ZHIHU_PLUGIN_VERSION = '1.1.0'
 export const ZHIHU_WORKER_DIGEST = createHash('sha256').update(ZHIHU_WORKER_SOURCE).digest('hex')
 export const ZHIHU_DRIVER_ID = `zhihu-${ZHIHU_WORKER_DIGEST.slice(0, 57)}`
 export const ZHIHU_DRIVER_VERSION = ZHIHU_PLUGIN_VERSION
@@ -38,6 +38,23 @@ const opaqueIdSchema = {
   maxLength: 64,
   pattern: '^[A-Za-z0-9-]{1,64}$',
 }
+const mediaPathSchema = { type: 'string', minLength: 1, maxLength: 512 }
+const sealedImageSchema = {
+  type: 'object',
+  properties: {
+    path: mediaPathSchema,
+    inputId: opaqueIdSchema,
+    filename: { type: 'string', minLength: 1, maxLength: 512 },
+    sizeBytes: { type: 'integer', minimum: 1, maximum: 15 * 1024 * 1024 },
+    sha256: sha256Schema,
+    mimeType: { type: 'string', enum: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'] },
+    kind: { type: 'string', enum: ['image'] },
+  },
+  required: ['path', 'inputId', 'filename', 'sizeBytes', 'sha256', 'mimeType', 'kind'],
+  additionalProperties: false,
+}
+const imageListSchema = { type: 'array', maxItems: 9, items: mediaPathSchema }
+const mediaManifestSchema = { type: 'array', maxItems: 9, items: sealedImageSchema }
 const degradedReasonSchema = {
   type: 'string',
   enum: ['empty_list', 'incomplete_projection'],
@@ -191,6 +208,18 @@ const snapshotSchema = {
   type: 'object',
   properties: { expectedDigest: sha256Schema, owned: { type: 'boolean', enum: [true] } },
   required: ['expectedDigest', 'owned'],
+  additionalProperties: false,
+}
+
+const pinSchema = {
+  type: 'object',
+  properties: {
+    id: numericIdSchema,
+    text: { type: 'string', maxLength: 2_000 },
+    url: { type: 'string', maxLength: 512 },
+    contentDigest: sha256Schema,
+  },
+  required: ['id', 'text', 'url', 'contentDigest'],
   additionalProperties: false,
 }
 
@@ -468,6 +497,28 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       },
     },
     {
+      id: 'create_pin',
+      description:
+        '使用当前真实知乎身份发布想法（可带图，默认逐次确认；账号授权后可免确认）',
+      effect: 'write',
+      timeoutSeconds: 600,
+      params: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', maxLength: 2_000 },
+          images: imageListSchema,
+          mediaManifest: mediaManifestSchema,
+        },
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: { pin: pinSchema },
+        required: ['pin'],
+        additionalProperties: false,
+      },
+    },
+    {
       id: 'create_answer',
       description: '使用当前真实知乎身份回答指定问题（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
@@ -477,6 +528,8 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
         properties: {
           questionId: numericIdSchema,
           text: { type: 'string', minLength: 1, maxLength: 20_000 },
+          images: imageListSchema,
+          mediaManifest: mediaManifestSchema,
         },
         required: ['questionId', 'text'],
         additionalProperties: false,
@@ -499,6 +552,8 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
           answerId: numericIdSchema,
           text: { type: 'string', minLength: 1, maxLength: 20_000 },
           snapshot: snapshotSchema,
+          images: imageListSchema,
+          mediaManifest: mediaManifestSchema,
         },
         required: ['answerId', 'text'],
         additionalProperties: false,
@@ -615,7 +670,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'create_article',
-      description: '使用当前真实知乎身份发布文章（默认逐次确认；账号授权后可免确认）',
+      description: '使用当前真实知乎身份发布文章（可带图，默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 300,
       params: {
@@ -623,6 +678,8 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
         properties: {
           title: { type: 'string', minLength: 1, maxLength: 200 },
           text: { type: 'string', minLength: 1, maxLength: 20_000 },
+          images: imageListSchema,
+          mediaManifest: mediaManifestSchema,
         },
         required: ['title', 'text'],
         additionalProperties: false,

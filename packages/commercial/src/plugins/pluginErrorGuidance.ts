@@ -397,6 +397,24 @@ const ROWS: Record<string, Row> = {
     message: '该知乎写动作尚未实现',
     nextAction: '请改用已实现的回答、评论、投票或关注动作',
   },
+  ZHIHU_WRITE_MEDIA_CHOOSER: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎图片选择控件不可用',
+    nextAction: '图片控件未就绪。可改纯文字发布，或稍后重开一条新确认',
+  },
+  ZHIHU_WRITE_MEDIA_UPLOAD: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎图片上传失败',
+    nextAction: '配图未完成。可改纯文字发布，不要重放同一条确认卡',
+  },
+  ZHIHU_WRITE_MEDIA_PREVIEW_TIMEOUT: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎图片预览超时',
+    nextAction: '图片预览超时。可改纯文字发布，不要重放同一条确认卡',
+  },
   ZHIHU_WORKER_BUSY: {
     retrySafe: 'yes',
     requiresReauth: false,

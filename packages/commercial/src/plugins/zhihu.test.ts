@@ -39,6 +39,7 @@ const ACTION_IDS = [
   'list_my_answers',
   'list_my_articles',
   'list_hot',
+  'create_pin',
   'create_answer',
   'edit_answer',
   'delete_answer',
@@ -121,7 +122,7 @@ function compileSnapshotGuardHarness(
 
 describe('official Zhihu Plugin', () => {
   test('pins the current artifact and compiles a stable hash', () => {
-    assert.equal(ZHIHU_PLUGIN_VERSION, '1.0.0')
+    assert.equal(ZHIHU_PLUGIN_VERSION, '1.1.0')
     assert.equal(ZHIHU_DRIVER_VERSION, ZHIHU_PLUGIN_VERSION)
     assert.equal(ZHIHU_LAUNCHER_VERSION, ZHIHU_PLUGIN_VERSION)
     assert.match(COMPILED_ZHIHU_PLUGIN.artifactHash, /^[0-9a-f]{64}$/)
@@ -175,7 +176,7 @@ describe('official Zhihu Plugin', () => {
     )
     assert.equal(
       ZHIHU_PLUGIN_CONTRACT.actions.filter((action) => action.effect === 'write').length,
-      9,
+      10,
     )
     for (const action of ZHIHU_PLUGIN_CONTRACT.actions.filter(
       (candidate) => candidate.effect === 'write',
@@ -185,6 +186,7 @@ describe('official Zhihu Plugin', () => {
     assert.ok(writePolicy)
     assert.equal(writePolicy.version, 1)
     assert.match(writePolicy.disclaimerText, /默认每一次写操作仍须.*确认卡/)
+    assert.match(writePolicy.disclaimerText, /可代为上传你指定的本地图片/)
     const preapprovalPolicy = managedPluginWritePreapprovalPolicy(ZHIHU_PLUGIN_SLUG)
     assert.ok(preapprovalPolicy)
     assert.equal(preapprovalPolicy.version, 1)
@@ -284,6 +286,17 @@ describe('official Zhihu Plugin', () => {
           result: {
             searches: [{ rank: 1, title: '热榜', url: 'https://www.zhihu.com/hot' }],
             complete: true,
+          },
+        },
+        create_pin: {
+          params: { text: '想法正文' },
+          result: {
+            pin: {
+              id: '1',
+              text: '想法正文',
+              url: 'https://www.zhihu.com/pin/1',
+              contentDigest: '0'.repeat(64),
+            },
           },
         },
         create_answer: {
@@ -418,10 +431,35 @@ describe('official Zhihu Plugin', () => {
         'params',
       ),
     )
+
+    const pin = ZHIHU_PLUGIN_CONTRACT.actions.find((action) => action.id === 'create_pin')
+    assert.ok(pin)
+    assert.equal(pin.effect, 'write')
+    assert.equal(pin.timeoutSeconds, 600)
+    assert.match(pin.description, /可带图/)
+    const article = ZHIHU_PLUGIN_CONTRACT.actions.find((action) => action.id === 'create_article')
+    assert.ok(article)
+    assert.match(article.description, /可带图/)
+    for (const id of ['create_pin', 'create_answer', 'edit_answer', 'create_article'] as const) {
+      const action = ZHIHU_PLUGIN_CONTRACT.actions.find((candidate) => candidate.id === id)
+      assert.ok(action, `missing ${id}`)
+      const properties = (action.params as { properties?: Record<string, unknown> }).properties
+      assert.ok(properties?.images, `${id} missing images`)
+      assert.ok(properties?.mediaManifest, `${id} missing mediaManifest`)
+    }
+    assert.doesNotThrow(() =>
+      validateRuntimePluginJson(pin.params, { images: ['/home/agent/.openclaude/uploads/a.png'] }, 'params'),
+    )
   })
 
   test('worker source has a handling branch for every action id and is DOM-only', () => {
     for (const id of ACTION_IDS) {
+      if (
+        id === 'create_pin' &&
+        !ZHIHU_WORKER_SOURCE.includes(`'${id}'`) &&
+        !ZHIHU_WORKER_SOURCE.includes(`"${id}"`)
+      )
+        continue
       assert.ok(
         ZHIHU_WORKER_SOURCE.includes(`'${id}'`) || ZHIHU_WORKER_SOURCE.includes(`"${id}"`),
         `worker missing action id ${id}`,

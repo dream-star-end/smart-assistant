@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
-import { describe, test } from 'node:test'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { after, describe, test } from 'node:test'
 import type { QueryResult, QueryResultRow } from 'pg'
 
 import { PluginRuntimeFacade, PluginRuntimeFacadeError } from './runtime.js'
@@ -509,6 +512,152 @@ describe('Plugin runtime facade', () => {
         },
       }),
       (error: unknown) => error instanceof PluginRuntimeFacadeError && error.code === 'BAD_REQUEST',
+    )
+  })
+
+  test('seals Zhihu pin/answer/article images and rejects client-owned mediaManifest', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'oc-zhihu-media-'))
+    after(async () => {
+      await rm(root, { recursive: true, force: true })
+    })
+    const uploads = join(root, 'uploads')
+    const generated = join(root, 'generated')
+    const stagingRoot = join(root, 'staging')
+    await Promise.all([mkdir(uploads), mkdir(generated)])
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from('zhihu-image'),
+    ])
+    await writeFile(join(uploads, 'photo.png'), png)
+
+    const facade = new PluginRuntimeFacade({
+      pool: { query: async () => result([]) } as never,
+      redis: null,
+      knowledgePlanetMedia: {
+        resolveUserMediaDirs: async () => ({ kind: 'ok', uid: 7, uploads, generated }),
+        stagingRoot,
+        expectedOwnerUid: process.getuid?.() ?? 0,
+      },
+    })
+    const prepare = (
+      facade as unknown as {
+        prepareZhihuWriteParams(input: {
+          userId: number
+          targetId: string
+          actionId: string
+          params: Record<string, unknown>
+        }): Promise<Record<string, unknown>>
+      }
+    ).prepareZhihuWriteParams.bind(facade)
+    const base = { userId: 7, targetId: '41' }
+
+    await assert.rejects(
+      prepare({
+        ...base,
+        actionId: 'create_pin',
+        params: { text: 'hello', mediaManifest: [] },
+      }),
+      (error: unknown) =>
+        error instanceof PluginRuntimeFacadeError &&
+        error.code === 'BAD_REQUEST' &&
+        /server-owned/.test(error.message),
+    )
+    await assert.rejects(
+      prepare({
+        ...base,
+        actionId: 'create_pin',
+        params: {},
+      }),
+      (error: unknown) =>
+        error instanceof PluginRuntimeFacadeError &&
+        error.code === 'BAD_REQUEST' &&
+        /cannot be empty/.test(error.message),
+    )
+    await assert.rejects(
+      prepare({
+        ...base,
+        actionId: 'create_pin',
+        params: { text: '' },
+      }),
+      (error: unknown) =>
+        error instanceof PluginRuntimeFacadeError &&
+        error.code === 'BAD_REQUEST' &&
+        /cannot be empty/.test(error.message),
+    )
+
+    const imageOnly = await prepare({
+      ...base,
+      actionId: 'create_pin',
+      params: { images: ['/home/agent/.openclaude/uploads/photo.png'] },
+    })
+    assert.equal(imageOnly.text, '')
+    assert.equal((imageOnly.mediaManifest as unknown[]).length, 1)
+
+    const sealed = await prepare({
+      ...base,
+      actionId: 'create_pin',
+      params: { text: '想法', images: ['/home/agent/.openclaude/uploads/photo.png'] },
+    })
+    assert.equal(sealed.text, '想法')
+    const manifest = sealed.mediaManifest as Array<Record<string, unknown>>
+    assert.equal(manifest.length, 1)
+    assert.equal(manifest[0]?.kind, 'image')
+    assert.equal(manifest[0]?.mimeType, 'image/png')
+    assert.equal(manifest[0]?.filename, 'photo.png')
+    assert.match(String(manifest[0]?.inputId ?? ''), /^[A-Za-z0-9-]{1,64}$/)
+    assert.match(String(manifest[0]?.sha256 ?? ''), /^[0-9a-f]{64}$/)
+
+    const emptyImages = await prepare({
+      ...base,
+      actionId: 'create_answer',
+      params: { questionId: '19550225', text: '回答' },
+    })
+    assert.deepEqual(emptyImages.mediaManifest, [])
+
+    const digest = 'c'.repeat(64)
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async (input) => {
+      if (input.actionId === 'get_self') return { user: { urlToken: 'me' } }
+      if (input.actionId === 'get_answer')
+        return {
+          answer: {
+            id: '9',
+            authorUrlToken: 'me',
+            contentDigest: digest,
+            updatedAt: '编辑于 2024-01-01',
+          },
+        }
+      throw new Error('unexpected read')
+    }
+    const edited = await prepare({
+      ...base,
+      actionId: 'edit_answer',
+      params: { answerId: '9', text: '改写', images: ['/home/agent/.openclaude/uploads/photo.png'] },
+    })
+    assert.deepEqual(edited.snapshot, { expectedDigest: digest, owned: true })
+    assert.equal((edited.mediaManifest as unknown[]).length, 1)
+
+    const noMedia = new PluginRuntimeFacade({
+      pool: { query: async () => result([]) } as never,
+      redis: null,
+    })
+    const prepareNoMedia = (
+      noMedia as unknown as {
+        prepareZhihuWriteParams(input: {
+          userId: number
+          targetId: string
+          actionId: string
+          params: Record<string, unknown>
+        }): Promise<Record<string, unknown>>
+      }
+    ).prepareZhihuWriteParams.bind(noMedia)
+    await assert.rejects(
+      prepareNoMedia({
+        ...base,
+        actionId: 'create_pin',
+        params: { text: '想法', images: ['/home/agent/.openclaude/uploads/photo.png'] },
+      }),
+      (error: unknown) =>
+        error instanceof PluginRuntimeFacadeError && error.code === 'RUNTIME_UNAVAILABLE',
     )
   })
 })
