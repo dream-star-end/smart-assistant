@@ -433,6 +433,21 @@ describe("AuthGate — 邮箱验证", () => {
     expect(screen.queryByRole("button", { name: /^登录$/ })).not.toBeInTheDocument();
   });
 
+  test("ACCOUNT_UNAVAILABLE 显示账号不可用，不提示检查验证码", async () => {
+    const onVerifyEmail = vi.fn().mockRejectedValue(
+      new ApiError({ status: 403, code: "ACCOUNT_UNAVAILABLE", message: "account unavailable" }),
+    );
+    await goVerify({ onVerifyEmail });
+    fireEvent.change(screen.getByPlaceholderText(/6 位验证码/), { target: { value: "123456" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /验证并继续/ }));
+    });
+    await waitFor(() =>
+      expect(screen.getByText("账号当前不可用，请联系客服")).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/检查验证码/)).not.toBeInTheDocument();
+  });
+
   test("resend emailSent=false 显示发送失败且不开 60s 冷却", async () => {
     const onResendVerification = vi.fn().mockResolvedValue({ emailSent: false });
     render(

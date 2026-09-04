@@ -4,6 +4,7 @@ import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.j
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { register } from "../auth/register.js";
+import { login } from "../auth/login.js";
 import {
   verifyEmail,
   issueVerifiedUserSession,
@@ -204,6 +205,74 @@ describe("auth.verify.verifyEmail (integ)", () => {
     assert.equal(row.rows.length, 1);
     assert.equal(row.rows[0].remember_me, true);
     assert.equal(row.rows[0].revoked_at, null);
+  });
+
+  test("issueVerifiedUserSession replaceRefreshToken revokes the old family with logout", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const password = "pwd replace family long";
+    const { userId, rawCode, verifyEmail: email } = await registerAndCaptureVerifyToken(
+      "replace-family@example.com",
+      password,
+    );
+    await verifyEmail(email, rawCode);
+    const oldLogin = await login(
+      { email, password, turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true, bindIp: "127.0.0.1" },
+    );
+    const oldHash = refreshTokenHash(oldLogin.refresh_token);
+    const family = await query<{ family_id: string }>(
+      "SELECT family_id::text AS family_id FROM refresh_tokens WHERE token_hash = $1",
+      [oldHash],
+    );
+    assert.equal(family.rows.length, 1);
+    const oldFamilyId = family.rows[0].family_id;
+
+    const session = await issueVerifiedUserSession(userId, {
+      jwtSecret: JWT_SECRET,
+      bindIp: "127.0.0.1",
+      userAgent: "vitest",
+      replaceRefreshToken: oldLogin.refresh_token,
+    });
+    const newHash = refreshTokenHash(session.refresh_token);
+
+    const oldFamilyRows = await query<{ revoked_reason: string | null; token_hash: string }>(
+      `SELECT revoked_reason, token_hash FROM refresh_tokens WHERE family_id = $1::uuid`,
+      [oldFamilyId],
+    );
+    assert.ok(oldFamilyRows.rows.length >= 1);
+    for (const row of oldFamilyRows.rows) {
+      assert.equal(row.revoked_reason, "logout");
+      assert.notEqual(row.token_hash, newHash);
+    }
+    const newRow = await query<{ family_id: string }>(
+      "SELECT family_id::text AS family_id FROM refresh_tokens WHERE token_hash = $1",
+      [newHash],
+    );
+    assert.equal(newRow.rows.length, 1);
+    assert.notEqual(newRow.rows[0].family_id, oldFamilyId);
+  });
+
+  test("issueVerifiedUserSession banned user: ACCOUNT_UNAVAILABLE and no new refresh row", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const { userId, rawCode, verifyEmail: email } = await registerAndCaptureVerifyToken(
+      "banned-session@example.com",
+      "pwd banned session long",
+    );
+    await verifyEmail(email, rawCode);
+    const before = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM refresh_tokens WHERE user_id = $1::bigint",
+      [userId],
+    );
+    await query("UPDATE users SET status = 'banned' WHERE id = $1", [userId]);
+    await assert.rejects(
+      issueVerifiedUserSession(userId, { jwtSecret: JWT_SECRET, bindIp: "127.0.0.1" }),
+      (err: unknown) => err instanceof VerifyError && err.code === "ACCOUNT_UNAVAILABLE",
+    );
+    const after = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM refresh_tokens WHERE user_id = $1::bigint",
+      [userId],
+    );
+    assert.equal(after.rows[0].cnt, before.rows[0].cnt);
   });
 
   test("re-verify after admin reset: email_verified 翻回 TRUE,恒零积分零 ledger(赠金已下线)", async (t) => {

@@ -653,6 +653,7 @@ export const AUTH_ERROR_MESSAGES: Record<string, string> = {
   REGISTRATION_DISABLED: "注册暂未开放，请稍后再来",
   WEAK_PASSWORD: "密码需为 8-72 位，请重新设置",
   INVALID_TOKEN: "验证码或重置链接无效或已过期，请重新获取",
+  ACCOUNT_UNAVAILABLE: "账号当前不可用，请联系客服",
 };
 
 /**

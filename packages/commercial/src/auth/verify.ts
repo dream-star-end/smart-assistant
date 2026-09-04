@@ -71,6 +71,11 @@ export type VerifyErrorCode =
    * 仅在 code 已成功比对后才会抛,防止 verify 成为黑名单枚举口子。
    */
   | 'EMAIL_DOMAIN_BLOCKED'
+  /**
+   * issueVerifiedUserSession 拒发:账号非 active 或尚未 email_verified。
+   * 与 INVALID_TOKEN(码错/过期)分开,避免 verify 已消费码后把签发失败伪装成码错。
+   */
+  | 'ACCOUNT_UNAVAILABLE'
 
 export class VerifyError extends Error {
   readonly code: VerifyErrorCode
@@ -615,8 +620,8 @@ export async function issueVerifiedUserSession(
       [userId],
     )
     const current = currentRes.rows[0]
-    if (!current || current.status !== "active") {
-      throw new VerifyError("INVALID_TOKEN", "verification code invalid or expired")
+    if (!current || current.status !== "active" || current.email_verified !== true) {
+      throw new VerifyError("ACCOUNT_UNAVAILABLE", "account unavailable")
     }
 
     if (replacedTokenHash && replacedTarget) {

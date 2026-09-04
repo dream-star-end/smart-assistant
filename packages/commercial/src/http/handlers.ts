@@ -1073,8 +1073,10 @@ export async function handleVerifyEmail(
         code: err.code,
         outcome: "failed",
       });
-      // INVALID_TOKEN 也是 400(用户改不了的格式错,需前端重新输)
-      throw new HttpError(400, err.code, err.message);
+      // ACCOUNT_UNAVAILABLE:码已消费但账号不能发 session,403 不伪装成码错。
+      // 其余(INVALID_TOKEN/VALIDATION/EMAIL_DOMAIN_BLOCKED)仍 400。
+      const status = err.code === "ACCOUNT_UNAVAILABLE" ? 403 : 400;
+      throw new HttpError(status, err.code, err.message);
     }
     throw err;
   }
