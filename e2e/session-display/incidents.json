@@ -2809,6 +2809,11 @@
         },
         {
           "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "R4-B3 enrichment deadline → terminal；history 晚成功仍不执行"
+        },
+        {
+          "layer": "unit",
           "path": "packages/commercial/src/__tests__/cronOriginAdmitModel.test.ts",
           "assertion": "production preparation budget is not shorter than the legal PG statement budget"
         },
@@ -2842,6 +2847,9 @@
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "[session-unavailable-rootfix] PASS — detach drain, durable cron receipt, rejected convergence and bounded memory retry are locked"
         }
+      ],
+      "coverageCommits": [
+        "8daba1a8"
       ]
     },
     {

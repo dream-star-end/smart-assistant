@@ -17,12 +17,41 @@ import type { DependencyList, RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type {
   AuthSession,
+  SessionMeta,
   UsageReport,
   UsageReportWindow,
   UsageResponse,
   UsageSessionRow,
 } from "../../lib/types";
 import { UsageTab, topModelsWithOther } from "./UsageTab";
+
+const projectScopeState = vi.hoisted(() => ({
+  kind: "all" as "all" | "work" | "ungrouped" | "chat",
+}));
+
+vi.mock("../../hooks/useProjectScope", () => ({
+  useProjectScope: () => ({
+    scope: {
+      kind: projectScopeState.kind,
+      token: projectScopeState.kind === "work" ? "p1" : "all",
+      chatProject: null,
+      workProject: projectScopeState.kind === "work" ? { id: "p1", key: "OCV5", name: "自用" } : null,
+      bound: projectScopeState.kind === "work",
+      chatProjectIdForFilter: undefined,
+      invalid: false,
+    },
+    token: projectScopeState.kind === "work" ? "p1" : "all",
+    setToken: () => {},
+    workProjects: projectScopeState.kind === "work" ? [{ id: "p1", key: "OCV5", name: "自用" }] : [],
+    chatProjects: [],
+    selectOptions: [
+      { value: "all", label: "全部项目" },
+      { value: "p1", label: "自用" },
+    ],
+    loading: false,
+    refreshWorkProjects: async () => [],
+  }),
+}));
 
 const { chartConstructed } = vi.hoisted(() => ({ chartConstructed: vi.fn() }));
 
@@ -49,6 +78,7 @@ vi.mock("../../lib/api", () => ({
   api: {
     getUsage: vi.fn(),
     getMyUsageReport: vi.fn(),
+    listSessions: vi.fn().mockResolvedValue([]),
   },
   apiErrorMessage: (_e: unknown, fallback: string) => fallback,
 }));
@@ -58,6 +88,7 @@ import { createMemoryAuthSession } from "../../lib/authSession";
 
 const mockedGetUsage = vi.mocked(api.getUsage);
 const mockedGetReport = vi.mocked(api.getMyUsageReport);
+const mockedListSessions = vi.mocked(api.listSessions);
 
 const auth: AuthSession = createMemoryAuthSession(() => {}, "t");
 
@@ -151,9 +182,11 @@ function chatRow(overrides: Partial<UsageSessionRow> = {}): UsageSessionRow {
 afterEach(cleanup);
 beforeEach(() => {
   vi.clearAllMocks();
+  projectScopeState.kind = "all";
   // 默认两端点都成功（个别用例可覆盖）。
   mockedGetUsage.mockResolvedValue(makeResponse([chatRow()]));
   mockedGetReport.mockResolvedValue(makeReport("7d"));
+  mockedListSessions.mockResolvedValue([]);
 });
 
 describe("UsageTab 图表化窗口口径", () => {
@@ -380,5 +413,32 @@ describe("UsageTab 总览 / 按模型切换", () => {
     expect(screen.getByText("glm-5.2")).toBeInTheDocument();
     expect(screen.getByText("gpt-5.5")).toBeInTheDocument();
     expect(screen.queryByText("按模型积分构成")).not.toBeInTheDocument();
+  });
+});
+
+describe("UsageTab 会话标题与口径说明", () => {
+  test("listSessions 返回标题时会话行显示标题并保留 session_id", async () => {
+    mockedListSessions.mockResolvedValue([
+      { id: "uuid-chat-1", title: "写周报" } as SessionMeta,
+    ]);
+    render(<UsageTab auth={auth} />);
+    expect(await screen.findByText("写周报")).toBeInTheDocument();
+    expect(screen.getByText("uuid-chat-1")).toBeInTheDocument();
+  });
+
+  test("全局范围时不渲染口径说明文案", async () => {
+    render(<UsageTab auth={auth} />);
+    expect(await screen.findByText("用量统计")).toBeInTheDocument();
+    expect(screen.queryByText(/按会话当时所属项目统计/)).not.toBeInTheDocument();
+  });
+
+  test("项目范围时渲染口径说明文案", async () => {
+    projectScopeState.kind = "work";
+    render(<UsageTab auth={auth} />);
+    expect(
+      await screen.findByText(
+        "按会话当时所属项目统计，后续移动会话不改写历史；组队成员的消耗计入发起会话。",
+      ),
+    ).toBeInTheDocument();
   });
 });

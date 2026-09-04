@@ -1256,7 +1256,14 @@ describe('oc-cursor wrapper', () => {
     assert.equal(launched.status, 0, launched.stderr)
     assert.equal(readFileSync(join(f.capture, 'key'), 'utf8').trim(), 'crsr_second')
     assert.match(launched.stderr, /slot_result 2 ok/)
-    assert.equal(readFileSync(join(f.capture, 'argv'), 'utf8').includes('-H'), false)
+    // Match the argv *token* like the sibling asserts do: a raw substring test
+    // fires whenever the mkdtemp workspace suffix happens to start with `H`
+    // (`--workspace .../oc-cursor-wrapper-test-Hxxxx`), a ~1/62 CI flake.
+    assert.equal(
+      readFileSync(join(f.capture, 'argv'), 'utf8').trim().split('\n').includes('-H'),
+      false,
+      'pinned native launch argv must not include a Sand header',
+    )
     assert.match(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SAND_MODE=1$/m)
     assert.doesNotMatch(readFileSync(join(f.capture, 'env'), 'utf8'), /^OPENCLAUDE_CURSOR_SELECTED_KEY=/m)
   })
