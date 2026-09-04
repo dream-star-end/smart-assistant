@@ -1,0 +1,42 @@
+{
+  "template": "coord-error-budget",
+  "domain": "坐标系/误差预算图(EOP/测站坐标/链路误差分配)",
+  "user_evidence": ["u6: EOP 两分量量级画错;TikZ 地球网格 3 轮(2026-08)"],
+  "constraints": [
+    {
+      "id": "C1-log-normalization",
+      "rule": "同组(同单位)误差分量在同一误差图上,条长按 log10 量级归一,不许线性混画大跨度量级。",
+      "enforced_by": {"layer": "figcheck-spec", "rule": "magnitude-log-scale", "note": "组内跨度>10² 时校验 rendered_length∝log10(value)"}
+    },
+    {
+      "id": "C2-unit-separation",
+      "rule": "同类分量不同量纲(如角量 mas 与时间量 ms)禁止混轴:同组单位必须完全一致,不同单位自动分面板;跨单位(s 与 ms)由调用方先换算。",
+      "enforced_by": {"layer": "figcheck-spec", "rule": "magnitude-unit-consistency"}
+    },
+    {
+      "id": "C3-value-unit-label",
+      "rule": "每条误差条必须带数值+单位。",
+      "enforced_by": {"layer": "template-construction"}
+    },
+    {
+      "id": "C4-dag",
+      "rule": "误差链箭头无环、汇聚到总误差节点(如需 DAG 视图,当前版本为条形图+分组,误差链 DAG 列为后续扩展)。",
+      "enforced_by": {"layer": "manual", "note": "本期不画 DAG"}
+    }
+  ],
+  "reference_magnitudes": {
+    "_doc": "EOP 常见量级参考(IERS 周报量级,人工核对基准,修改须走人审)",
+    "polar_motion_xy_mas": [0.05, 1.0],
+    "ut1_ms": [0.01, 0.5],
+    "lod_ms_per_day": [0.01, 0.5],
+    "nutation_mas": [0.05, 1.0],
+    "station_coord_m": [0.001, 0.05],
+    "troposphere_zenith_m": [0.003, 0.3],
+    "solid_earth_tide_m": [0.0001, 0.4]
+  },
+  "units": "由每条 item 自带(mas/ms/m 等);同单位自动同组",
+  "parameters": {
+    "--items": "'名:数值:单位,...';同单位自动同组,组内条长按 log10 归一",
+    "--demo": "内置 VLBI/EOP 演示数据(PM-X/PM-Y/UT1/LOD/对流层/固体潮/测站速度)"
+  }
+}

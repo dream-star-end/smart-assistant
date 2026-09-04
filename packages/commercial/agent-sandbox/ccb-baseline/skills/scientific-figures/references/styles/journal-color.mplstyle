@@ -1,0 +1,13 @@
+# ── 彩色期刊版(叠加层)──────────────────────────────────────────
+# 与 SciencePlots 的关系:同 journal-bw——版式基底由 science/nature/ieee 提供,
+# 本文件只叠色板与线宽。色板 = ColorBrewer Set2(与 SKILL §6 一致,色盲友好);
+# 连续量仍在代码里用 viridis/cividis。用法:
+#   plt.style.use(['science', 'no-latex', 'journal-color'])
+axes.prop_cycle : cycler('color', ['66c2a5', 'fc8d62', '8da0cb', 'e78ac3', 'a6d854', 'ffd92f', 'e5c494', 'b3b3b3'])
+lines.linewidth : 1.5
+lines.markersize : 5
+patch.linewidth : 0.7
+grid.linestyle : dotted
+grid.linewidth : 0.5
+grid.color : 0.6
+legend.frameon : False

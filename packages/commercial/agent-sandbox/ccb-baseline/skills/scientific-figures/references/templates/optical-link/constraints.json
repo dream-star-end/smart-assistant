@@ -1,0 +1,35 @@
+{
+  "template": "optical-link",
+  "domain": "自由空间光通信(FSOC)/光链路规格图(器件级)",
+  "user_evidence": ["u224: 需要 4 张 FSOC 规格图(器件级示意图)"],
+  "constraints": [
+    {
+      "id": "C1-path-continuity",
+      "rule": "光路连续:发射端口 → 信道 → 接收端口,无悬空断口(spec optical-link 链路两端均为声明端口)。",
+      "enforced_by": {"layer": "figcheck-spec", "rule": "link-endpoints-declared"}
+    },
+    {
+      "id": "C2-divergence",
+      "rule": "光束展宽方向 = 发射→接收;展宽半角与发散角参数一致(视觉放大时标注给真实值)。",
+      "enforced_by": {"layer": "template-construction"}
+    },
+    {
+      "id": "C3-units",
+      "rule": "规格量必须带单位且同组同量纲:功率 dBm、波长 nm、距离 km、发散角 mrad(magnitudes 组内单位一致)。",
+      "enforced_by": {"layer": "figcheck-spec", "rule": "magnitude-unit-consistency"}
+    },
+    {
+      "id": "C4-power-budget",
+      "rule": "链路损耗 = 发射功率 − 接收功率(dBm 代数差),标注三者一致。",
+      "enforced_by": {"layer": "template-construction", "note": "损耗文字由参数现算"}
+    }
+  ],
+  "units": "dBm(功率)/nm(波长)/km(距离)/mrad(发散角)/cm(口径)",
+  "parameters": {
+    "--range-km": "链路距离",
+    "--wavelength-nm": "工作波长,常见 1550/1064",
+    "--tx/rx-aperture-cm": "望远镜口径",
+    "--tx/rx-power-dbm": "发射/接收功率",
+    "--divergence-mrad": "束散角,典型 0.02–0.2 mrad"
+  }
+}
