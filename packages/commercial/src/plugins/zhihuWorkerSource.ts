@@ -352,12 +352,13 @@ async function editRedirectPeopleToken(page) {
       await page.goto('https://www.zhihu.com/people/edit', { waitUntil: 'domcontentloaded', timeout: 20_000 });
       await page.waitForTimeout(800);
       return peopleTokenFromPath(new URL(page.url()).pathname);
-    })(), 15_000, null);
+    })(), 30_000, null);
   } catch {
     return null;
   }
 }
 async function selfTokenFromPage(page) {
+  const started = Date.now();
   const found = [];
   const topBar = Array.from(new Set(await topBarPeopleTokens(page)));
   if (topBar.length === 1) found.push(topBar[0]);
@@ -366,6 +367,7 @@ async function selfTokenFromPage(page) {
   const redirected = await editRedirectPeopleToken(page);
   if (redirected) found.push(redirected);
   const unique = Array.from(new Set(found));
+  emitStep({ step: 'login.self_token', ok: unique.length === 1, hits: found.length, candidateCount: unique.length, ms: Date.now() - started });
   return unique.length === 1 ? unique[0] : null;
 }
 async function finishAuthenticatedNav(page, status) {
@@ -1864,6 +1866,7 @@ function urlPathname(raw) {
   try { return new URL(raw).pathname.slice(0, 96); } catch { return ''; }
 }
 async function proveSelf(context) {
+  const started = Date.now();
   const page = await context.newPage();
   let peoplePage = null;
   let settled = false;
@@ -1872,6 +1875,7 @@ async function proveSelf(context) {
     const work = (async () => {
       await gotoAuthenticated(page, 'https://www.zhihu.com/');
       let homeText = await bodyText(page);
+      if (!settled) emitStep({ step: 'login.home_ready', ok: true, ms: Date.now() - started, textLen: homeText.length });
       for (let attempt = 1; attempt <= 2 && homeText.length < 50; attempt += 1) {
         if (!settled) emitStep({ step: 'login.home_retry', ok: false, textLen: homeText.length, hits: attempt });
         try {
@@ -1906,6 +1910,7 @@ async function proveSelf(context) {
         }
         return null;
       }
+      if (!settled) emitStep({ step: 'login.prove_self', ok: true, ms: Date.now() - started });
       return first;
     })();
     work.catch(() => {});
@@ -1914,7 +1919,7 @@ async function proveSelf(context) {
       new Promise((resolve) => setTimeout(() => {
         settled = true;
         resolve(timedOut);
-      }, 90_000))
+      }, 240_000))
     ]);
     if (result === timedOut) {
       emitStep({ step: 'login.prove_self', ok: false, reason: 'timeout' });
