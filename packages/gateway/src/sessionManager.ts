@@ -2133,13 +2133,23 @@ export class SessionManager {
     session._plannedTeardown = "service_restart"
   }
 
-  /** Deploy/container recycle/SIGTERM → SERVICE_RESTART. Real crash stays RUNNER_CRASHED. */
+  /** Deploy/container recycle/SIGTERM → SERVICE_RESTART. Real crash stays RUNNER_CRASHED.
+   *
+   * `crashed === false` is the runner's own verdict that *we* asked for this
+   * exit (`SubprocessRunner.shutdown()` set `shuttingDown` before the process
+   * died — credential switch, effort/model swap, session replacement, goal
+   * change, preheat deadline …). Even when the grace window expired and the
+   * process had to be SIGKILLed, that is a platform recycle, not a crash.
+   * Reporting it as RUNNER_CRASHED made master's automatic recovery respawn
+   * the runner, hit the same recycle within ~1s, and loop until the 10-retry
+   * budget was exhausted (INC 2026-09-04 webmtmoostmzw8pdg). */
   private shouldClassifyExitAsServiceRestart(
     session: AgentSession,
-    info?: { signal: string | null },
+    info?: { signal: string | null; crashed?: boolean },
   ): boolean {
     if (session._plannedTeardown === "service_restart") return true
     if (this.isRuntimeRecycleDraining()) return true
+    if (info?.crashed === false) return true
     return info?.signal === "SIGTERM"
   }
 

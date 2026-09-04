@@ -32,6 +32,10 @@ import {
   selectCursorCredential,
   type CursorCredentialSelection,
 } from './cursorCredentialSelection.js'
+import { createLogger } from '../logger.js'
+import { _shutdownOriginFrames } from '../subprocessRunner.js'
+
+const log = createLogger({ module: 'cursorRoutingAdapter' })
 
 export type CursorVariant = 'native' | 'sand-ccb' | 'sand-official-cc'
 
@@ -235,6 +239,13 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
         || next.keyFingerprint !== this.credentialSelection.keyFingerprint
       ) {
         const nativeId = this.inner.nativeSessionId
+        log.info('cursor credential switch: recycling inner adapter', {
+          sessionKey: this.opts.sessionKey,
+          variant: this.variant,
+          from: { keyName: this.credentialSelection.keyName, accountId: this.credentialSelection.accountId },
+          to: { keyName: next.keyName, accountId: next.accountId },
+          innerRunning: this.inner.isRunning,
+        })
         await this.inner.shutdown()
         await this.inner.waitForOutputDrain()
         this.assertLifecycle(generation)
@@ -340,6 +351,14 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   interrupt(): boolean { return this.activeCancel?.() ?? this.inner.interrupt() }
   async shutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise
+    // Outermost engine-facade shutdown: this is the frame SessionManager /
+    // server call into, so the synchronous stack here names the real trigger.
+    log.info('cursor routing adapter shutdown requested', {
+      sessionKey: this.opts.sessionKey,
+      variant: this.variant,
+      hasActiveRun: this.activeCancel !== null,
+      origin: _shutdownOriginFrames(new Error().stack),
+    })
     this.lifecycleClosed = true
     this.lifecycleGeneration++
     this.activeCancel?.()
