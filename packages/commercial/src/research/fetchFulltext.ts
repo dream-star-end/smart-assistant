@@ -90,6 +90,8 @@ export interface FetchFulltextHttpDeps {
   proxyFetchImpl?: FetchLike
   timeoutMs?: number
   maxBytes?: number
+  /** 瞬时错误重试退避基数(ms);默认 400,测试可传 0 跑快。 */
+  retryDelayMs?: number
 }
 
 // ─── 常量 ────────────────────────────────────────────────────────────
@@ -431,7 +433,12 @@ export async function downloadFulltext(
     if (tried.has(c.url)) continue
     tried.add(c.url)
     const t0 = Date.now()
-    const r = await attemptDownload(c.url, deps.fetchImpl, { timeoutMs, maxBytes, ua })
+    const r = await attemptDownload(c.url, deps.fetchImpl, {
+      timeoutMs,
+      maxBytes,
+      ua,
+      retryDelayMs: deps.retryDelayMs,
+    })
     const ms = Date.now() - t0
     if ('ok' in r) {
       attempts.push({ source: c.strategy, code: 'ok', httpStatus: 200, ms })
@@ -453,7 +460,12 @@ export async function downloadFulltext(
     if (proxyFetch) {
       for (const c of candidates) {
         const t0 = Date.now()
-        const r = await attemptDownload(c.url, proxyFetch, { timeoutMs, maxBytes, ua })
+        const r = await attemptDownload(c.url, proxyFetch, {
+          timeoutMs,
+          maxBytes,
+          ua,
+          retryDelayMs: deps.retryDelayMs,
+        })
         const ms = Date.now() - t0
         if ('ok' in r) {
           attempts.push({ source: `${c.strategy}:proxy`, code: 'ok', httpStatus: 200, ms })

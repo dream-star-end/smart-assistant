@@ -317,7 +317,7 @@ export async function searchArxiv(query: string, opts: SourceSearchOpts): Promis
 // 两跳:esearch(term → PMID 列表)→ esummary(PMID → 题录)。生医/临床文献主源。
 // ───────────────────────────────────────────────
 
-const EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
+export const EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
 const PUBMED_TOOL = "openclaude-research";
 
 /** esummary 单条记录(retmode=json 的 result[uid] 形态,最小容错子集)。 */

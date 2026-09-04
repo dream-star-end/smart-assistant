@@ -21,30 +21,30 @@ import os from "node:os";
 import path from "node:path";
 import type { EvidenceManifest } from "@openclaude/protocol/research";
 import {
-  ContainerIdentityError,
-  type ContainerIdentityRepo,
-  verifyContainerIdentity,
-} from "../auth/containerIdentity.js";
-import { ensureRequestId, REQUEST_ID_HEADER, setSecurityHeaders } from "../http/util.js";
+  getSkillEmbeddingProvider,
+  isSkillEmbeddingAvailable,
+  skillEmbeddingBackendId,
+  skillEmbeddingConfigFromEnv,
+} from "@openclaude/storage";
+import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
+import { getLiteratureConfig } from "../admin/literatureConfig.js";
 import {
   type ResearchConfigPublic,
   type ResearchSecrets,
   getResearchConfigPublic,
   getResearchSecrets,
 } from "../admin/researchConfig.js";
-import { getLiteratureConfig } from "../admin/literatureConfig.js";
 import {
-  type FetchAttemptRowInput,
-  createJob,
-  getBlob as storeGetBlob,
-  getDocument as storeGetDocument,
-  getJob,
-  listCheckpoints,
-  putBlob as storePutBlob,
-  putDocument as storePutDocument,
-  recordFetchAttempt,
-  requeueInterruptedJob,
-} from "./store.js";
+  ContainerIdentityError,
+  type ContainerIdentityRepo,
+  verifyContainerIdentity,
+} from "../auth/containerIdentity.js";
+import { makePgSkillEmbedCache } from "../http/skillEmbedCachePg.js";
+import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from "../http/util.js";
+import { formatRecord, verifyIdentifier, verifyIdentifiers } from "./cite.js";
+import type { FetchFulltextConfig, FetchRecordInput } from "./fetchFulltext.js";
+import { type LitSourceName, searchMultiSource } from "./litSearch.js";
+import { type SemanticQueryDeps, queryDocuments } from "./litrag.js";
 import {
   type FetchRecordOutcome,
   fetchRecordIntoLibrary,
@@ -53,20 +53,20 @@ import {
   runCheck,
   runCiteFix,
 } from "./researchHandlers.js";
-import type { FetchRecordInput, FetchFulltextConfig } from "./fetchFulltext.js";
-import { type SemanticQueryDeps, queryDocuments } from "./litrag.js";
-import {
-  getSkillEmbeddingProvider,
-  isSkillEmbeddingAvailable,
-  skillEmbeddingBackendId,
-  skillEmbeddingConfigFromEnv,
-} from "@openclaude/storage";
-import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
-import { makePgSkillEmbedCache } from "../http/skillEmbedCachePg.js";
-import type { FetchLike } from "./sources.js";
-import { type LitSourceName, searchMultiSource } from "./litSearch.js";
 import { type SnowballDirection, snowball } from "./snowball.js";
-import { formatRecord, verifyIdentifier, verifyIdentifiers } from "./cite.js";
+import type { FetchLike } from "./sources.js";
+import {
+  type FetchAttemptRowInput,
+  createJob,
+  getJob,
+  listCheckpoints,
+  recordFetchAttempt,
+  requeueInterruptedJob,
+  getBlob as storeGetBlob,
+  getDocument as storeGetDocument,
+  putBlob as storePutBlob,
+  putDocument as storePutDocument,
+} from "./store.js";
 import { isResearchWorkspaceEnabled } from "./workspaceFlag.js";
 
 /** master-owned blob 暂存目录(ingest 输入字节;仅 master worker 读)。
@@ -163,9 +163,12 @@ function utcDayKey(now: Date): string {
 
 /** store/fs 注入点(ingest/litrag/check 用;默认真实实现,测试注入内存版)。 */
 export interface ResearchStoreDeps {
-  putBlob: typeof storePutBlob;
-  getBlob: typeof storeGetBlob;
-  putDocument: typeof storePutDocument;
+  putBlob: (input: import("./store.js").PutBlobInput) => Promise<void>;
+  getBlob: (
+    userId: number,
+    blobId: string,
+  ) => Promise<{ storagePath: string; mime: string | null } | null>;
+  putDocument: (input: import("./store.js").PutDocumentInput) => Promise<void>;
   getDocument: typeof storeGetDocument;
   readBlobBytes: (storagePath: string) => Promise<Buffer>;
   writeBlobBytes: (storagePath: string, bytes: Buffer) => Promise<void>;
@@ -194,10 +197,23 @@ export interface ResearchProxyDeps {
 
 /** fetch-batch / job-status 用的 durable job store 面(注入 seam)。 */
 export interface ResearchJobStoreDeps {
-  createJob: typeof createJob;
-  getJob: typeof getJob;
-  listCheckpoints: typeof listCheckpoints;
-  requeueInterruptedJob: typeof requeueInterruptedJob;
+  createJob: (input: {
+    userId: bigint | number | string;
+    requestId: string;
+    kind: import("@openclaude/protocol/research").ResearchJobKind;
+    payload?: Record<string, unknown>;
+  }) => Promise<import("./store.js").ResearchJobRow>;
+  getJob: (
+    userId: number,
+    requestId: string,
+  ) => Promise<import("./store.js").ResearchJobRow | null>;
+  listCheckpoints: (
+    jobId: bigint | number | string,
+  ) => Promise<import("./store.js").CheckpointRow[]>;
+  requeueInterruptedJob: (
+    userId: number,
+    requestId: string,
+  ) => Promise<import("./store.js").ResearchJobRow | null>;
 }
 
 function resolveJobStore(s?: Partial<ResearchJobStoreDeps>): ResearchJobStoreDeps {
@@ -257,7 +273,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown, requestId:
   res.end(json);
 }
 
-function sendErr(res: ServerResponse, status: number, code: string, message: string, requestId: string): void {
+function sendErr(
+  res: ServerResponse,
+  status: number,
+  code: string,
+  message: string,
+  requestId: string,
+): void {
   sendJson(res, status, { error: { code, message }, request_id: requestId }, requestId);
 }
 
@@ -350,12 +372,19 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
 
     let body: Record<string, unknown>;
     try {
-      const maxBody = reqPath === `${RESEARCH_PREFIX}lit/fetch-batch` ? MAX_FETCH_BATCH_BYTES : MAX_BODY_BYTES;
+      const maxBody =
+        reqPath === `${RESEARCH_PREFIX}lit/fetch-batch` ? MAX_FETCH_BATCH_BYTES : MAX_BODY_BYTES;
       const parsed = await readBoundedJson(req, maxBody);
       body = (parsed ?? {}) as Record<string, unknown>;
     } catch (err) {
       const tooBig = err instanceof Error && err.message === "body_too_large";
-      sendErr(res, tooBig ? 413 : 400, tooBig ? "BODY_TOO_LARGE" : "BAD_REQUEST", "invalid request body", requestId);
+      sendErr(
+        res,
+        tooBig ? 413 : 400,
+        tooBig ? "BODY_TOO_LARGE" : "BAD_REQUEST",
+        "invalid request body",
+        requestId,
+      );
       return;
     }
 
@@ -370,11 +399,11 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
         return;
       }
       if (reqPath === `${RESEARCH_PREFIX}cite/verify`) {
-        await handleCiteVerify(res, body, cfg, deps.fetchImpl, requestId);
+        await handleCiteVerify(res, body, cfg, readSecrets, deps.fetchImpl, requestId);
         return;
       }
       if (reqPath === `${RESEARCH_PREFIX}cite/format`) {
-        await handleCiteFormat(res, body, cfg, deps.fetchImpl, requestId);
+        await handleCiteFormat(res, body, cfg, readSecrets, deps.fetchImpl, requestId);
         return;
       }
       if (reqPath === `${RESEARCH_PREFIX}ingest/parse`) {
@@ -402,7 +431,13 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
         reqPath === `${RESEARCH_PREFIX}job/status`;
       if (fetchRoute) {
         if (cfg.config.fetch?.enabled !== true) {
-          sendErr(res, 404, "FETCH_DISABLED", "fulltext fetch disabled (research_config fetch.enabled)", requestId);
+          sendErr(
+            res,
+            404,
+            "FETCH_DISABLED",
+            "fulltext fetch disabled (research_config fetch.enabled)",
+            requestId,
+          );
           return;
         }
         if (reqPath === `${RESEARCH_PREFIX}lit/fetch`) {
@@ -457,7 +492,13 @@ async function handleBlobUpload(
     bytes = await readBoundedBytes(req, MAX_BLOB_BYTES);
   } catch (err) {
     const tooBig = err instanceof Error && err.message === "body_too_large";
-    sendErr(res, tooBig ? 413 : 400, tooBig ? "BLOB_TOO_LARGE" : "BAD_REQUEST", "invalid blob body", requestId);
+    sendErr(
+      res,
+      tooBig ? 413 : 400,
+      tooBig ? "BLOB_TOO_LARGE" : "BAD_REQUEST",
+      "invalid blob body",
+      requestId,
+    );
     return;
   }
   if (bytes.length === 0) {
@@ -492,7 +533,8 @@ async function handleLitSearch(
     ? (body.sources.filter((s) => VALID_SOURCES.includes(s as LitSourceName)) as LitSourceName[])
     : undefined;
   const size = typeof body.size === "number" && Number.isFinite(body.size) ? body.size : undefined;
-  const yearMin = typeof body.yearMin === "number" && Number.isFinite(body.yearMin) ? body.yearMin : undefined;
+  const yearMin =
+    typeof body.yearMin === "number" && Number.isFinite(body.yearMin) ? body.yearMin : undefined;
   const lang = body.lang === "zh" || body.lang === "en" ? body.lang : undefined;
 
   // secrets 仅在需要时解密(最小权限):只有 s2Enabled 才可能用到 s2ApiKey。
@@ -546,7 +588,10 @@ async function handleLitSnowball(
   const size = typeof body.size === "number" && Number.isFinite(body.size) ? body.size : undefined;
   const result = await snowball(
     { seed, direction, size },
-    { mailto: cfg.config.litSources.openalexMailto ?? cfg.config.litSources.crossrefMailto, fetchImpl },
+    {
+      mailto: cfg.config.litSources.openalexMailto ?? cfg.config.litSources.crossrefMailto,
+      fetchImpl,
+    },
   );
   sendJson(res, 200, result, requestId);
 }
@@ -555,6 +600,7 @@ async function handleCiteVerify(
   res: ServerResponse,
   body: Record<string, unknown>,
   cfg: ResearchConfigPublic,
+  readSecrets: () => Promise<ResearchSecrets>,
   fetchImpl: FetchLike | undefined,
   requestId: string,
 ): Promise<void> {
@@ -568,6 +614,7 @@ async function handleCiteVerify(
   const verdicts = await verifyIdentifiers(ids, {
     mailto: cfg.config.litSources.crossrefMailto,
     fetchImpl,
+    ...(await adsTokenFor(ids, readSecrets)),
   });
   sendJson(res, 200, { verdicts }, requestId);
 }
@@ -576,6 +623,7 @@ async function handleCiteFormat(
   res: ServerResponse,
   body: Record<string, unknown>,
   cfg: ResearchConfigPublic,
+  readSecrets: () => Promise<ResearchSecrets>,
   fetchImpl: FetchLike | undefined,
   requestId: string,
 ): Promise<void> {
@@ -588,12 +636,42 @@ async function handleCiteFormat(
     sendErr(res, 400, "BAD_REQUEST", "identifier required", requestId);
     return;
   }
-  const verdict = await verifyIdentifier(identifier, { mailto: cfg.config.litSources.crossrefMailto, fetchImpl });
+  const verdict = await verifyIdentifier(identifier, {
+    mailto: cfg.config.litSources.crossrefMailto,
+    fetchImpl,
+    ...(await adsTokenFor([identifier], readSecrets)),
+  });
   if (!verdict.resolved || !verdict.record) {
     sendJson(res, 200, { verdict }, requestId);
     return;
   }
-  sendJson(res, 200, { verdict: { ...verdict, formatted: formatRecord(verdict.record, style) } }, requestId);
+  sendJson(
+    res,
+    200,
+    { verdict: { ...verdict, formatted: formatRecord(verdict.record, style) } },
+    requestId,
+  );
+}
+
+/**
+ * ADS token 按需解密:仅当 identifiers 里有 ads scheme 才读 secrets(最小权限,
+ * 同 lit/search 对 s2ApiKey 的惰性解密纪律)。解密失败 fail-soft(无 token →
+ * verifyIdentifier 走结构化指引路径)。
+ */
+async function adsTokenFor(
+  identifiers: string[],
+  readSecrets: () => Promise<ResearchSecrets>,
+): Promise<{ adsApiToken?: string }> {
+  const needsAds = identifiers.some(
+    (id) => /^\s*ads:/i.test(id) || /ui\.adsabs\.harvard\.edu\/abs\//i.test(id),
+  );
+  if (!needsAds) return {};
+  try {
+    const secrets = await readSecrets();
+    return secrets.adsApiToken ? { adsApiToken: secrets.adsApiToken } : {};
+  } catch {
+    return {};
+  }
 }
 
 async function handleIngest(
@@ -724,16 +802,27 @@ async function handleLitragQuery(
     truncated = listed.length > 50;
     docIds = listed.slice(0, 50);
     if (docIds.length === 0) {
-      sendJson(res, 200, { quotes: [], missing: [], truncated: false, docCount: 0, projectId }, requestId);
+      sendJson(
+        res,
+        200,
+        { quotes: [], missing: [], truncated: false, docCount: 0, projectId },
+        requestId,
+      );
       return;
     }
   }
 
   const topK = typeof body.topK === "number" && Number.isFinite(body.topK) ? body.topK : undefined;
-  const result = await litragQuery(userId, docIds, query, { topK }, {
-    getDocument: store.getDocument,
-    semantic: buildLitragSemanticDeps(cfg),
-  });
+  const result = await litragQuery(
+    userId,
+    docIds,
+    query,
+    { topK },
+    {
+      getDocument: store.getDocument,
+      semantic: buildLitragSemanticDeps(cfg),
+    },
+  );
   if (projectId) {
     sendJson(res, 200, { ...result, truncated, docCount: docIds.length, projectId }, requestId);
     return;
@@ -803,8 +892,10 @@ function parseFetchRecords(raw: unknown, max: number): FetchRecordInput[] {
     if (!id || id.length > 300) continue;
     const rec: FetchRecordInput = { id };
     if (typeof o.title === "string" && o.title.trim()) rec.title = o.title.trim().slice(0, 1000);
-    if (typeof o.doi === "string" && o.doi.trim()) rec.doi = o.doi.trim().toLowerCase().slice(0, 512);
-    if (typeof o.arxivId === "string" && o.arxivId.trim()) rec.arxivId = o.arxivId.trim().slice(0, 64);
+    if (typeof o.doi === "string" && o.doi.trim())
+      rec.doi = o.doi.trim().toLowerCase().slice(0, 512);
+    if (typeof o.arxivId === "string" && o.arxivId.trim())
+      rec.arxivId = o.arxivId.trim().slice(0, 64);
     if (o.oa && typeof o.oa === "object") {
       const url = (o.oa as Record<string, unknown>).url;
       if (typeof url === "string" && url.trim()) rec.oa = { url: url.trim().slice(0, 2048) };
@@ -854,7 +945,13 @@ async function handleLitFetch(
 ): Promise<void> {
   const records = parseFetchRecords(body.records, 5);
   if (records.length === 0) {
-    sendErr(res, 400, "BAD_REQUEST", "records[] required (compact {id,doi?,arxivId?,title?,oa?}, max 5)", requestId);
+    sendErr(
+      res,
+      400,
+      "BAD_REQUEST",
+      "records[] required (compact {id,doi?,arxivId?,title?,oa?}, max 5)",
+      requestId,
+    );
     return;
   }
   const ingest = body.ingest !== false;
@@ -905,7 +1002,13 @@ async function handleLitFetchBatch(
 ): Promise<void> {
   const records = parseFetchRecords(body.records, 200);
   if (records.length === 0) {
-    sendErr(res, 400, "BAD_REQUEST", "records[] required (compact {id,doi?,arxivId?,title?,oa?}, max 200)", requestId);
+    sendErr(
+      res,
+      400,
+      "BAD_REQUEST",
+      "records[] required (compact {id,doi?,arxivId?,title?,oa?}, max 200)",
+      requestId,
+    );
     return;
   }
   const rid = typeof body.requestId === "string" ? body.requestId.trim() : "";
@@ -925,7 +1028,9 @@ async function handleLitFetchBatch(
     payload: { mode: "fetch", records, ...(projectId ? { projectId } : {}) },
   });
   const current =
-    job.status === "interrupted" ? ((await jobStore.requeueInterruptedJob(userId, rid)) ?? job) : job;
+    job.status === "interrupted"
+      ? ((await jobStore.requeueInterruptedJob(userId, rid)) ?? job)
+      : job;
   sendJson(
     res,
     200,
@@ -952,7 +1057,9 @@ async function handleJobStatus(
     return;
   }
   const checkpoints = await jobStore.listCheckpoints(job.id);
-  const completedPhases = [...new Set(checkpoints.filter((c) => c.status === "completed").map((c) => c.phase))];
+  const completedPhases = [
+    ...new Set(checkpoints.filter((c) => c.status === "completed").map((c) => c.phase)),
+  ];
   sendJson(
     res,
     200,
@@ -1003,7 +1110,8 @@ async function handleCiteCheck(
     },
   };
   const mc = cfg.config.minicheck;
-  const entail = mc?.backend === "http" && mc.endpoint ? makeEntail(mc.endpoint, citeDeps.fetchImpl) : undefined;
+  const entail =
+    mc?.backend === "http" && mc.endpoint ? makeEntail(mc.endpoint, citeDeps.fetchImpl) : undefined;
   const result = await runCheck(userId, manifest, {
     getDocument: store.getDocument,
     verifyIdentifier: (id) => verifyIdentifier(id, citeDeps),
@@ -1053,7 +1161,8 @@ async function handleCiteFix(
     },
   };
   const mc = cfg.config.minicheck;
-  const entail = mc?.backend === "http" && mc.endpoint ? makeEntail(mc.endpoint, citeDeps.fetchImpl) : undefined;
+  const entail =
+    mc?.backend === "http" && mc.endpoint ? makeEntail(mc.endpoint, citeDeps.fetchImpl) : undefined;
   // docs 预加载一次(避免每 claim 重读 DB);query 在内存权威 docs 上跑 master litrag。
   const docs = (await Promise.all(docIds.map((id) => store.getDocument(userId, id)))).filter(
     (d): d is NonNullable<typeof d> => d != null,

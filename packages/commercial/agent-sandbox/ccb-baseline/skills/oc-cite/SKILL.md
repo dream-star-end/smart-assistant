@@ -1,6 +1,6 @@
 ---
 name: oc-cite
-description: 用 `oc-cite` 命令行做引用接地门禁:DOI/arXiv/OpenAlex 回查校验、撤稿过滤、生成 BibTeX / GB-T7714-2015 / APA 引用。任何要在报告/综述里写 `\cite`、列参考文献、声称某文献支持某结论时,引用必须先过 oc-cite。
+description: 用 `oc-cite` 命令行做引用接地门禁:DOI/arXiv/OpenAlex/PMID/ADS bibcode 回查校验、撤稿过滤、生成 BibTeX / GB-T7714-2015 / APA 引用。任何要在报告/综述里写 `\cite`、列参考文献、声称某文献支持某结论时,引用必须先过 oc-cite。
 tags: [research, citation, grounding, verification]
 ---
 
@@ -11,8 +11,8 @@ tags: [research, citation, grounding, verification]
 ## 用法
 
 ```bash
-# 校验 identifier(可多个):DOI / arXiv id / OpenAlex id
-oc-cite verify 10.1038/s41586-020-2649-2 arxiv:1706.03762 openalex:W2741809809
+# 校验 identifier(可多个):DOI / arXiv id / OpenAlex id / PMID / ADS bibcode
+oc-cite verify 10.1038/s41586-020-2649-2 arxiv:1706.03762 openalex:W2741809809 pmid:23903748 'ads:2015A&A...576A.135S'
 
 # 生成引用格式
 oc-cite format 10.1038/s41586-020-2649-2 --style gb-t-7714-2015   # 中文国标(默认)
@@ -30,11 +30,21 @@ oc-cite fix --manifest manifest.json --docs <docId,docId>
 重新检索更贴的 verbatim quote 并重绑,再自动重校验;命中则可能转 verified,命中不了仍保持
 未核查(诚实)。`changes` 列出每条 claim 重绑到哪个 quote 或 none。
 
-`verify` 输出 `{ verdicts: [{ identifier, resolved, record, retracted, bibtex, gbt7714, apa }] }`。
+`verify` 输出 `{ verdicts: [{ identifier, resolved, record, retracted, bibtex, gbt7714, apa, reason?, hint? }] }`。
+
+### PMID 与 ADS bibcode(R5 Phase B)
+
+- `pmid:<8-9 位数字>`(或裸 8-9 位数字):走 NCBI esummary 官方免费 API,生医文献主用;
+  撤稿标注(pubtype Retracted Publication)同样生效。
+- `ads:<19 字符 bibcode>`(如 `ads:2015A&A...576A.135S`(含 & 等 shell 特殊字符时要加引号))或 ADS 文章 URL:走 ADS
+  **官方 API**(Bearer token),BibTeX 用 ADS 官方 export 端点直接产出 —— 不抓网页,
+  不会被人机验证挡。**无 token 时返回 `reason=ads_token_not_configured` + `hint` 获取
+  指引,如实转告用户**(免费注册:ui.adsabs.harvard.edu → 用户设置 → API Token,
+  交管理员配到 research secret adsApiToken),**不要**伪造结果、**不要**改抓网页。
 
 ## 判定规则(fail-closed)
 
-- `resolved=false` → identifier **未命中任何可信记录(Crossref/OpenAlex/arXiv)** → 视为**假引用/不可信**,**禁止**写进参考文献;要么删掉该论断的引用、把论断标"未核查",要么换一个真实来源。
+- `resolved=false` → identifier **未命中任何可信记录(Crossref/OpenAlex/arXiv/PubMed/ADS)**,或 ADS 无 token(看 reason) → 视为**假引用/不可信**,**禁止**写进参考文献;要么删掉该论断的引用、把论断标"未核查",要么换一个真实来源。
 - `retracted=true` → 文献已撤稿 → **不得**作为正面证据;生医/临床/政策类报告里命中即必须拦截并提示用户。
 - 只有 `resolved=true 且 retracted!=true` 的文献才可进"已验证参考文献"。
 - 撤稿状态 `null` 表示未查到撤稿信息(非"确认未撤稿");高风险领域需谨慎。

@@ -139,6 +139,8 @@ export const RESEARCH_SECRET_NAMES = [
   "mistralApiKey",
   "embedApiKey",
   "qdrantApiKey",
+  /** ADS API token(R5 Phase B:oc-cite ads:<bibcode> 回查/导出;用户级=Phase C)。 */
+  "adsApiToken",
 ] as const;
 export type ResearchSecretName = (typeof RESEARCH_SECRET_NAMES)[number]
 

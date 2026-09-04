@@ -105,8 +105,8 @@ function makeMemoryStore() {
         storagePath: `/tmp/x-${blobId}`,
         mime: 'application/pdf',
       }),
-      putDocument: async (_u: number, doc: unknown) => {
-        docs.push(doc)
+      putDocument: async (input: { doc: unknown }) => {
+        docs.push(input.doc)
       },
       getDocument: async () => null,
       readBlobBytes: async () => PDF,
