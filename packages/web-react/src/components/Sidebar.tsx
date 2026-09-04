@@ -362,17 +362,16 @@ export function Sidebar({
     ],
   );
 
-  // 空态「暂无会话」行在带 onNew 时叠加 CTA 按钮,行高同步加高(VirtualList 按 item.height 排 offsets)。
+  // 空态「暂无会话」行叠加 CTA 按钮,行高同步加高(VirtualList 按 item.height 排 offsets)。
+  // onNew 是 Sidebar 必传 prop,无需再判存在性。
   const listItems = useMemo(
     () =>
-      onNew
-        ? flatItems.map((it) =>
-            it.kind === "hint" && it.text === "暂无会话"
-              ? { ...it, height: EMPTY_HINT_CTA_HEIGHT }
-              : it,
-          )
-        : flatItems,
-    [flatItems, onNew],
+      flatItems.map((it) =>
+        it.kind === "hint" && it.text === "暂无会话"
+          ? { ...it, height: EMPTY_HINT_CTA_HEIGHT }
+          : it,
+      ),
+    [flatItems],
   );
 
   const emitReorder = (ids: string[]) => {
@@ -465,8 +464,9 @@ export function Sidebar({
     }
     if (item.kind === "hint") {
       const emptyCenter = item.text === "暂无会话" || item.text === "没有匹配的会话";
-      // 空态 CTA:纯文字「暂无会话」对新用户是死胡同;给出与顶部同款 onNew 的直接出口。
-      const showNewCta = item.text === "暂无会话" && Boolean(onNew);
+      // 空态 CTA:纯文字「暂无会话」对新用户是死胡同;给出与顶部同款 onNew 的直接出口
+      // (onNew 必传,恒可用)。
+      const showNewCta = item.text === "暂无会话";
       return (
         <div
           className={cn(
