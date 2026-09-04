@@ -13,8 +13,17 @@
  *   Cookie WorkosCursorSessionToken=<authId>::<accessToken> on cursor.com:
  *     GET /api/usage-summary                   → plan used/limit/remaining (cents), onDemand
  *     GET /api/auth/stripe                     → membershipType, subscriptionStatus
- *   (cursor.com/api/dashboard/* answers 403 for a Sand session; api2 is the
- *    reliable surface, cursor.com is used only for the cents breakdown.)
+ *     POST /api/dashboard/get-sand-usage-status  → Grok Bot / Sand pool: % used, weekly reset, SuperGrok plan
+ *     POST /api/dashboard/get-sand-access-status → SAND_ACCESS_STATE_* / block reason
+ *     GET  /api/auth/super-grok/status           → SuperGrok link state (linked / granted / plan)
+ *   (cursor.com/api/dashboard/* POSTs require `origin: https://cursor.com`, otherwise
+ *    403 "Invalid origin for state-changing request"; api2 is the reliable surface
+ *    for included usage, cursor.com adds the cents breakdown and the Sand pool.)
+ *
+ * The Sand / Grok Bot pool (verified 2026-09-04) is a *separate* quota from the
+ * plan's included usage: the same account showed 0% included and 66.8% Sand.
+ * Sand (Opus / Fable via InferenceService) draws from that pool, not from
+ * `planUsage`.
  *
  * These are Cursor-internal endpoints and may change without notice, so every
  * field is optional and parsing is lenient: unknown shape → null, never throw
@@ -82,6 +91,31 @@ export interface CursorUsageSnapshot {
       cache_write_tokens: number | null
       cache_read_tokens: number | null
     }>
+  }
+  /**
+   * Grok Bot / Sand pool — independent of `included`. Weekly reset. All null when
+   * the account has no auth id or every cursor.com Sand endpoint failed.
+   */
+  sand: {
+    /** SAND_ACCESS_STATE_GRANTED / _BLOCKED / … */
+    access_state: string | null
+    /** SAND_ACCESS_BLOCK_REASON_NONE / … */
+    block_reason: string | null
+    usage_percent: number | null
+    has_available_usage: boolean | null
+    has_included_limit: boolean | null
+    period_start: string | null
+    next_reset_at: string | null
+    on_demand_visible: boolean | null
+    on_demand_eligible: boolean | null
+    /** e.g. supergrok-heavy */
+    grok_plan: string | null
+    /** e.g. "SuperGrok Heavy" */
+    grok_plan_label: string | null
+    super_grok_linked: boolean | null
+    super_grok_granted: boolean | null
+    super_grok_linked_at: string | null
+    link_blocked_reason: string | null
   }
 }
 
@@ -165,6 +199,23 @@ function emptySnapshot(nowMs: number): CursorUsageSnapshot {
       total_cache_write_tokens: null,
       total_cache_read_tokens: null,
       models: [],
+    },
+    sand: {
+      access_state: null,
+      block_reason: null,
+      usage_percent: null,
+      has_available_usage: null,
+      has_included_limit: null,
+      period_start: null,
+      next_reset_at: null,
+      on_demand_visible: null,
+      on_demand_eligible: null,
+      grok_plan: null,
+      grok_plan_label: null,
+      super_grok_linked: null,
+      super_grok_granted: null,
+      super_grok_linked_at: null,
+      link_blocked_reason: null,
     },
   }
 }
@@ -263,6 +314,43 @@ export function applyStripeProfile(snap: CursorUsageSnapshot, body: unknown): vo
   snap.plan.subscription_status = str(body.subscriptionStatus) ?? snap.plan.subscription_status
 }
 
+/** cursor.com POST /api/dashboard/get-sand-usage-status — the Grok Bot / Sand pool itself. */
+export function applySandUsageStatus(snap: CursorUsageSnapshot, body: unknown): void {
+  if (!isRecord(body)) return
+  const s = snap.sand
+  s.usage_percent = num(body.usagePercent) ?? s.usage_percent
+  s.has_available_usage = bool(body.hasAvailableUsage) ?? s.has_available_usage
+  s.has_included_limit = bool(body.hasNonZeroIncludedLimit) ?? s.has_included_limit
+  s.period_start = isoDate(body.currentPeriodStart) ?? s.period_start
+  s.next_reset_at = isoDate(body.nextResetTimestampUtc) ?? s.next_reset_at
+  s.grok_plan = str(body.includedUsageSuperGrokPlan) ?? s.grok_plan
+  s.grok_plan_label = str(body.grokPlanLabel) ?? s.grok_plan_label
+  const od = body.onDemandSettings
+  if (isRecord(od)) {
+    s.on_demand_visible = bool(od.visible) ?? s.on_demand_visible
+    s.on_demand_eligible = bool(od.eligible) ?? s.on_demand_eligible
+  }
+}
+
+/** cursor.com POST /api/dashboard/get-sand-access-status. */
+export function applySandAccessStatus(snap: CursorUsageSnapshot, body: unknown): void {
+  if (!isRecord(body)) return
+  snap.sand.access_state = str(body.state) ?? snap.sand.access_state
+  snap.sand.block_reason = str(body.blockReason) ?? snap.sand.block_reason
+}
+
+/** cursor.com GET /api/auth/super-grok/status. */
+export function applySuperGrokStatus(snap: CursorUsageSnapshot, body: unknown): void {
+  if (!isRecord(body)) return
+  const s = snap.sand
+  s.super_grok_linked = bool(body.linked) ?? s.super_grok_linked
+  s.super_grok_granted = bool(body.granted) ?? s.super_grok_granted
+  s.super_grok_linked_at = isoDate(body.linkedAt) ?? s.super_grok_linked_at
+  s.link_blocked_reason = str(body.linkBlockedReason) ?? s.link_blocked_reason
+  s.grok_plan = s.grok_plan ?? str(body.grokPlan)
+  snap.plan.membership_type = snap.plan.membership_type ?? str(body.membershipType)
+}
+
 // ─── transport ─────────────────────────────────────────────────────────────
 
 export function buildCursorApi2Headers(accessToken: string, machineId: string | null, nowMs: number): Record<string, string> {
@@ -284,6 +372,10 @@ export function buildCursorWebHeaders(accessToken: string, authId: string): Reco
     accept: 'application/json',
     cookie: `WorkosCursorSessionToken=${encodeURIComponent(`${authId}::${accessToken}`)}`,
     'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36',
+    // cursor.com/api/dashboard/* POSTs enforce a same-origin check
+    // ("Invalid origin for state-changing request"); GETs ignore these.
+    origin: CURSOR_WEB_ORIGIN,
+    referer: `${CURSOR_WEB_ORIGIN}/dashboard`,
   }
 }
 
@@ -371,9 +463,33 @@ export async function fetchCursorSessionUsage(
         if (r.ok) applyStripeProfile(snap, r.body)
         else snap.errors.stripe_profile = r.reason
       }),
+      // Grok Bot / Sand pool. Dashboard POSTs take an (empty) JSON body.
+      fetchJson(
+        fetchImpl,
+        `${CURSOR_WEB_ORIGIN}/api/dashboard/get-sand-usage-status`,
+        { method: 'POST', headers: { ...webHeaders, 'content-type': 'application/json' }, body: '{}' },
+        timeoutMs,
+      ).then((r) => {
+        if (r.ok) applySandUsageStatus(snap, r.body)
+        else snap.errors.sand_usage = r.reason
+      }),
+      fetchJson(
+        fetchImpl,
+        `${CURSOR_WEB_ORIGIN}/api/dashboard/get-sand-access-status`,
+        { method: 'POST', headers: { ...webHeaders, 'content-type': 'application/json' }, body: '{}' },
+        timeoutMs,
+      ).then((r) => {
+        if (r.ok) applySandAccessStatus(snap, r.body)
+        else snap.errors.sand_access = r.reason
+      }),
+      fetchJson(fetchImpl, `${CURSOR_WEB_ORIGIN}/api/auth/super-grok/status`, { method: 'GET', headers: webHeaders }, timeoutMs).then((r) => {
+        if (r.ok) applySuperGrokStatus(snap, r.body)
+        else snap.errors.super_grok = r.reason
+      }),
     )
   } else {
     snap.errors.usage_summary = 'no_auth_id'
+    snap.errors.sand_usage = 'no_auth_id'
   }
   await Promise.all(tasks)
 

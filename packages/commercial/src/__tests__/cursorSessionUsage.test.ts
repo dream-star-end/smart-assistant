@@ -16,7 +16,10 @@ import {
   applyCurrentPeriodUsage,
   applyHardLimit,
   applyPlanInfo,
+  applySandAccessStatus,
+  applySandUsageStatus,
   applyStripeProfile,
+  applySuperGrokStatus,
   applyUsageSummary,
   buildCursorApi2Headers,
   buildCursorWebHeaders,
@@ -69,6 +72,34 @@ const USAGE_SUMMARY = {
   teamUsage: {},
 }
 const STRIPE = { membershipType: 'free', subscriptionStatus: 'unpaid', isTeamMember: false }
+// Grok Bot / Sand pool — redacted live shapes captured 2026-09-04 (Pro + SuperGrok Heavy link).
+const SAND_USAGE = {
+  currentPeriodStart: '2026-09-03T12:10:19.613Z',
+  nextResetTimestampUtc: '2026-09-10T12:10:19.613Z',
+  usagePercent: 66.799456,
+  hasAvailableUsage: true,
+  hasNonZeroIncludedLimit: true,
+  onDemandSettings: { visible: true, eligible: true, dashboardUrl: 'https://cursor.com/dashboard/spending?for=auth0%7Cuser_01' },
+  includedUsageSuperGrokPlan: 'supergrok-heavy',
+  grokPlanLabel: 'SuperGrok Heavy',
+}
+const SAND_ACCESS = {
+  state: 'SAND_ACCESS_STATE_GRANTED',
+  blockReason: 'SAND_ACCESS_BLOCK_REASON_NONE',
+  purchasableTiers: ['pro', 'pro_plus', 'ultra'],
+  isPaidTrialPlan: false,
+  proAndSuperGrokPlansGrantAccess: true,
+}
+const SUPER_GROK = {
+  enabled: true,
+  linked: true,
+  granted: true,
+  grokPlan: 'supergrok-heavy',
+  linkedAt: '2026-09-03T12:05:15.576Z',
+  membershipType: 'pro',
+  alreadyHasSand: true,
+  linkBlockedReason: null,
+}
 
 type Route = { status: number; body: unknown } | { throws: Error }
 type Call = { url: string; init: RequestInit }
@@ -94,6 +125,9 @@ const ALL_OK: Record<string, Route> = {
   'DashboardService/GetAggregatedUsageEvents': { status: 200, body: AGGREGATED },
   'cursor.com/api/usage-summary': { status: 200, body: USAGE_SUMMARY },
   'cursor.com/api/auth/stripe': { status: 200, body: STRIPE },
+  'cursor.com/api/dashboard/get-sand-usage-status': { status: 200, body: SAND_USAGE },
+  'cursor.com/api/dashboard/get-sand-access-status': { status: 200, body: SAND_ACCESS },
+  'cursor.com/api/auth/super-grok/status': { status: 200, body: SUPER_GROK },
 }
 
 function blank(): CursorUsageSnapshot {
@@ -104,6 +138,11 @@ function blank(): CursorUsageSnapshot {
     included: { used_cents: null, limit_cents: null, remaining_cents: null, total_percent_used: null, auto_percent_used: null, api_percent_used: null, is_unlimited: null, display_message: null },
     on_demand: { enabled: null, used_cents: null, limit_cents: null, remaining_cents: null, usage_based_allowed: null },
     cycle_usage: { range_start: null, range_end: null, total_cost_cents: null, total_input_tokens: null, total_output_tokens: null, total_cache_write_tokens: null, total_cache_read_tokens: null, models: [] },
+    sand: {
+      access_state: null, block_reason: null, usage_percent: null, has_available_usage: null, has_included_limit: null,
+      period_start: null, next_reset_at: null, on_demand_visible: null, on_demand_eligible: null,
+      grok_plan: null, grok_plan_label: null, super_grok_linked: null, super_grok_granted: null, super_grok_linked_at: null, link_blocked_reason: null,
+    },
   }
 }
 
@@ -163,20 +202,65 @@ describe('cursorSessionUsage parsers', () => {
     assert.equal(s.on_demand.remaining_cents, null)
   })
 
+  test('Grok Bot / Sand pool: usage-status + access-status + super-grok fold into snap.sand', () => {
+    const snap = blank()
+    applySandUsageStatus(snap, SAND_USAGE)
+    assert.equal(snap.sand.usage_percent, 66.799456)
+    assert.equal(snap.sand.has_available_usage, true)
+    assert.equal(snap.sand.has_included_limit, true)
+    assert.equal(snap.sand.period_start, '2026-09-03T12:10:19.613Z')
+    assert.equal(snap.sand.next_reset_at, '2026-09-10T12:10:19.613Z')
+    assert.equal(snap.sand.on_demand_visible, true)
+    assert.equal(snap.sand.on_demand_eligible, true)
+    assert.equal(snap.sand.grok_plan, 'supergrok-heavy')
+    assert.equal(snap.sand.grok_plan_label, 'SuperGrok Heavy')
+    // Pool is independent from the plan's included usage: nothing leaks across.
+    assert.equal(snap.included.total_percent_used, null)
+
+    applySandAccessStatus(snap, SAND_ACCESS)
+    assert.equal(snap.sand.access_state, 'SAND_ACCESS_STATE_GRANTED')
+    assert.equal(snap.sand.block_reason, 'SAND_ACCESS_BLOCK_REASON_NONE')
+
+    applySuperGrokStatus(snap, SUPER_GROK)
+    assert.equal(snap.sand.super_grok_linked, true)
+    assert.equal(snap.sand.super_grok_granted, true)
+    assert.equal(snap.sand.super_grok_linked_at, '2026-09-03T12:05:15.576Z')
+    assert.equal(snap.sand.link_blocked_reason, null)
+    // usage-status already set the plan; super-grok only fills gaps.
+    assert.equal(snap.sand.grok_plan, 'supergrok-heavy')
+    assert.equal(snap.plan.membership_type, 'pro')
+  })
+
+  test('super-grok status alone fills grok_plan; not-linked account keeps nulls for usage', () => {
+    const snap = blank()
+    applySuperGrokStatus(snap, { enabled: true, linked: false, granted: false, grokPlan: null, linkedAt: null, membershipType: 'free', linkBlockedReason: 'NOT_ELIGIBLE' })
+    assert.equal(snap.sand.super_grok_linked, false)
+    assert.equal(snap.sand.super_grok_granted, false)
+    assert.equal(snap.sand.link_blocked_reason, 'NOT_ELIGIBLE')
+    assert.equal(snap.sand.grok_plan, null)
+    assert.equal(snap.sand.usage_percent, null)
+  })
+
   test('garbage shapes never throw and never overwrite with junk', () => {
     const s = blank()
     applyUsageSummary(s, USAGE_SUMMARY)
-    for (const junk of [null, undefined, 'x', 42, [], { individualUsage: 'nope' }, { planUsage: [] }, { aggregations: [null, 'x', { modelIntent: 7 }] }]) {
+    applySandUsageStatus(s, SAND_USAGE)
+    for (const junk of [null, undefined, 'x', 42, [], { individualUsage: 'nope' }, { planUsage: [] }, { aggregations: [null, 'x', { modelIntent: 7 }] }, { usagePercent: 'n/a', onDemandSettings: 'x', state: 5 }]) {
       applyCurrentPeriodUsage(s, junk)
       applyPlanInfo(s, junk)
       applyHardLimit(s, junk)
       applyAggregatedUsageEvents(s, junk)
       applyUsageSummary(s, junk)
       applyStripeProfile(s, junk)
+      applySandUsageStatus(s, junk)
+      applySandAccessStatus(s, junk)
+      applySuperGrokStatus(s, junk)
     }
     assert.equal(s.included.remaining_cents, 1750)
     assert.equal(s.plan.membership_type, 'free')
     assert.deepEqual(s.cycle_usage.models, [])
+    assert.equal(s.sand.usage_percent, 66.799456)
+    assert.equal(s.sand.access_state, null)
   })
 })
 
@@ -190,14 +274,16 @@ describe('cursorSessionUsage headers', () => {
     assert.equal('x-cursor-checksum' in buildCursorApi2Headers(ACCESS, null, NOW), false)
   })
 
-  test('web headers: WorkosCursorSessionToken cookie = authId::accessToken', () => {
+  test('web headers: WorkosCursorSessionToken cookie = authId::accessToken; same-origin for dashboard POSTs', () => {
     const h = buildCursorWebHeaders(ACCESS, AUTH_ID)
     assert.equal(h.cookie, `WorkosCursorSessionToken=${encodeURIComponent(`${AUTH_ID}::${ACCESS}`)}`)
+    assert.equal(h.origin, 'https://cursor.com')
+    assert.equal(h.referer, 'https://cursor.com/dashboard')
   })
 })
 
 describe('fetchCursorSessionUsage', () => {
-  test('folds all six sources; aggregated range = billing cycle start → now', async () => {
+  test('folds all nine sources; aggregated range = billing cycle start → now', async () => {
     const calls: Call[] = []
     const snap = await fetchCursorSessionUsage(
       { accessToken: ACCESS, authId: AUTH_ID, machineId: MACHINE_ID },
@@ -214,9 +300,23 @@ describe('fetchCursorSessionUsage', () => {
     assert.equal(snap.cycle_usage.models.length, 2)
     assert.equal(snap.cycle_usage.range_start, '2026-08-26T07:00:33.431Z')
     assert.equal(snap.cycle_usage.range_end, new Date(NOW).toISOString())
-    assert.equal(calls.length, 6)
+    // Grok Bot / Sand pool rides along and stays separate from `included`.
+    assert.equal(snap.sand.usage_percent, 66.799456)
+    assert.equal(snap.sand.access_state, 'SAND_ACCESS_STATE_GRANTED')
+    assert.equal(snap.sand.super_grok_linked, true)
+    assert.equal(snap.sand.grok_plan_label, 'SuperGrok Heavy')
+    assert.equal(calls.length, 9)
     const agg = calls.find((c) => c.url.includes('GetAggregatedUsageEvents'))!
     assert.deepEqual(JSON.parse(String(agg.init.body)), { startDate: '1787727633431', endDate: String(NOW) })
+    // Dashboard POSTs: JSON body + same-origin headers (else Cursor 403s).
+    for (const name of ['get-sand-usage-status', 'get-sand-access-status']) {
+      const c = calls.find((x) => x.url.includes(name))!
+      assert.equal(c.init.method, 'POST')
+      assert.equal(String(c.init.body), '{}')
+      const h = c.init.headers as Record<string, string>
+      assert.equal(h.origin, 'https://cursor.com')
+      assert.equal(h['content-type'], 'application/json')
+    }
     // Secrets: token only in headers, never in URL / body.
     for (const c of calls) {
       assert.equal(c.url.includes(ACCESS), false)
@@ -235,8 +335,29 @@ describe('fetchCursorSessionUsage', () => {
     assert.equal(calls.length, 4)
     assert.equal(calls.some((c) => c.url.includes('cursor.com/api')), false)
     assert.equal(snap.errors.usage_summary, 'no_auth_id')
+    assert.equal(snap.errors.sand_usage, 'no_auth_id')
     assert.equal(snap.included.remaining_cents, null)
     assert.equal(snap.included.total_percent_used, 12.5)
+    assert.equal(snap.sand.usage_percent, null)
+  })
+
+  test('Sand endpoints failing (e.g. origin 403) only land in errors; included usage still returned', async () => {
+    const snap = await fetchCursorSessionUsage(
+      { accessToken: ACCESS, authId: AUTH_ID, machineId: MACHINE_ID },
+      {
+        fetchImpl: mockFetch({
+          ...ALL_OK,
+          'cursor.com/api/dashboard/get-sand-usage-status': { status: 403, body: { error: 'Invalid origin for state-changing request' } },
+          'cursor.com/api/dashboard/get-sand-access-status': { throws: new Error('ECONNRESET') },
+          'cursor.com/api/auth/super-grok/status': { status: 401, body: {} },
+        }),
+        now: () => NOW,
+      },
+    )
+    assert.deepEqual(snap.errors, { sand_usage: 'http_403', sand_access: 'ECONNRESET', super_grok: 'http_401' })
+    assert.equal(snap.included.total_percent_used, 12.5)
+    assert.equal(snap.sand.usage_percent, null)
+    assert.equal(snap.sand.access_state, null)
   })
 
   test('partial failures are reported per source, not thrown; no billing cycle → 30d range', async () => {

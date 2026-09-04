@@ -207,7 +207,16 @@ const USAGE_SOURCE_LABEL: Record<string, string> = {
   aggregated_usage: "api2 按模型聚合",
   usage_summary: "cursor.com 用量摘要",
   stripe_profile: "cursor.com 订阅状态",
+  sand_usage: "cursor.com Grok Bot 池用量",
+  sand_access: "cursor.com Grok Bot 访问状态",
+  super_grok: "cursor.com SuperGrok 关联",
 };
+
+/** SAND_ACCESS_STATE_GRANTED → "GRANTED";未知形态原样返回。 */
+function shortEnum(v: string | null, prefix: string): string | null {
+  if (!v) return null;
+  return v.startsWith(prefix) ? v.slice(prefix.length) : v;
+}
 
 type CursorUsageResponse = { usage: CursorUsageSnapshot; cached: boolean };
 
@@ -259,6 +268,14 @@ export function CursorUsageModal({
   const u = data?.usage ?? null;
   const pct = u?.included.total_percent_used ?? null;
   const errorEntries = u ? Object.entries(u.errors) : [];
+  const sand = u?.sand ?? null;
+  const sandPct = sand?.usage_percent ?? null;
+  const sandAccess = shortEnum(sand?.access_state ?? null, "SAND_ACCESS_STATE_");
+  const sandBlock = shortEnum(sand?.block_reason ?? null, "SAND_ACCESS_BLOCK_REASON_");
+  // 三个来源全没拿到任何字段 → 视为该池不可读(旧后端 / 无 authId / 全部 403)。
+  const sandReadable =
+    sand !== null &&
+    (sandPct !== null || sand.access_state !== null || sand.super_grok_linked !== null || sand.grok_plan !== null);
 
   type ModelRow = CursorUsageSnapshot["cycle_usage"]["models"][number];
   const modelColumns: Column<ModelRow>[] = [
@@ -303,7 +320,76 @@ export function CursorUsageModal({
 
           <section className="rounded-md border border-border p-3">
             <div className="mb-2 flex items-center gap-2">
+              <span className="text-sm font-medium">Grok Bot / Sand 池</span>
+              <span className="text-[11.5px] text-faint">独立额度 · 每周重置</span>
+              {sand?.grok_plan_label && <Badge tone="neutral">{sand.grok_plan_label}</Badge>}
+              {!sand?.grok_plan_label && sand?.grok_plan && <Badge tone="neutral">{sand.grok_plan}</Badge>}
+              {sandAccess && (
+                <Badge tone={sandAccess === "GRANTED" ? "success" : "warning"}>
+                  {sandAccess === "GRANTED" ? "已开通" : sandAccess}
+                </Badge>
+              )}
+              {sand?.super_grok_linked === true && <Badge tone="success">已关联 SuperGrok</Badge>}
+              {sand?.super_grok_linked === false && <Badge tone="neutral">未关联 SuperGrok</Badge>}
+            </div>
+            {!sandReadable ? (
+              <p className="text-[12px] text-faint">
+                未能读取 Grok Bot 池
+                {u.errors.sand_usage === "no_auth_id" ? "(该凭证缺少 auth id,无法访问 cursor.com dashboard)" : "(见下方来源提示)"}。
+              </p>
+            ) : (
+              <>
+                {sandPct != null && (
+                  <div className="mb-2 flex items-center gap-3">
+                    <Progress value={sandPct} thresholds={{ warning: 75, danger: 90 }} className="flex-1" />
+                    <span className="w-12 text-right text-sm tabular-nums">{fmtPct(sandPct)}</span>
+                  </div>
+                )}
+                <DescriptionList>
+                  <DescriptionRow
+                    label="本周期"
+                    value={`${fmtDate(sand?.period_start ?? null)} → ${fmtDate(sand?.next_reset_at ?? null)}(重置)`}
+                  />
+                  <DescriptionRow
+                    label="可用状态"
+                    value={
+                      sand?.has_available_usage === true ? (
+                        "仍有额度"
+                      ) : sand?.has_available_usage === false ? (
+                        <span className="text-danger">额度耗尽,等待重置</span>
+                      ) : (
+                        "—"
+                      )
+                    }
+                  />
+                  {sandBlock && sandBlock !== "NONE" && (
+                    <DescriptionRow label="限制原因" value={<span className="text-warning">{sandBlock}</span>} />
+                  )}
+                  {sand?.link_blocked_reason && (
+                    <DescriptionRow label="SuperGrok 关联受限" value={<span className="text-warning">{sand.link_blocked_reason}</span>} />
+                  )}
+                  <DescriptionRow
+                    label="按需付费"
+                    value={
+                      sand?.on_demand_eligible === true
+                        ? "可开启"
+                        : sand?.on_demand_eligible === false
+                          ? "不可用"
+                          : "—"
+                    }
+                  />
+                  {sand?.super_grok_linked_at && (
+                    <DescriptionRow label="SuperGrok 关联时间" value={fmtDateTime(sand.super_grok_linked_at)} />
+                  )}
+                </DescriptionList>
+              </>
+            )}
+          </section>
+
+          <section className="rounded-md border border-border p-3">
+            <div className="mb-2 flex items-center gap-2">
               <span className="text-sm font-medium">套餐内额度</span>
+              <span className="text-[11.5px] text-faint">Cursor IDE / CLI · 月度</span>
               {u.plan.name && <Badge tone="neutral">{u.plan.name}</Badge>}
               {u.plan.membership_type && u.plan.membership_type !== u.plan.name?.toLowerCase() && (
                 <Badge tone="neutral">{u.plan.membership_type}</Badge>
@@ -336,7 +422,7 @@ export function CursorUsageModal({
                 }
               />
               <DescriptionRow
-                label="Auto / 指定模型 占比"
+                label="Auto(Composer / Grok 4.5)/ 具名模型 占比"
                 value={`${fmtPct(u.included.auto_percent_used)} / ${fmtPct(u.included.api_percent_used)}`}
               />
               <DescriptionRow
@@ -401,7 +487,7 @@ export function CursorUsageModal({
           )}
           <p className="text-[11.5px] text-faint">
             数据来自 Cursor 内部 dashboard 接口,字段可能随 Cursor 变更;金额为 Cursor 侧计价(美元),仅供查看,不作为平台计费依据。
-            Sand 请求消耗的就是这份账号额度。
+            平台 Sand(Opus / Fable)请求消耗的是顶部「Grok Bot / Sand 池」;「套餐内额度」对应 Cursor IDE / CLI 的 Auto 与具名模型,两者互不相通。
           </p>
         </div>
       ) : null}

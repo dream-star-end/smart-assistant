@@ -130,6 +130,24 @@ export type CursorUsageSnapshot = {
       cache_read_tokens: number | null;
     }>;
   };
+  /** Grok Bot / Sand 独立池(与 included 无关,按周重置)。旧后端可能不返回该字段。 */
+  sand?: {
+    access_state: string | null;
+    block_reason: string | null;
+    usage_percent: number | null;
+    has_available_usage: boolean | null;
+    has_included_limit: boolean | null;
+    period_start: string | null;
+    next_reset_at: string | null;
+    on_demand_visible: boolean | null;
+    on_demand_eligible: boolean | null;
+    grok_plan: string | null;
+    grok_plan_label: string | null;
+    super_grok_linked: boolean | null;
+    super_grok_granted: boolean | null;
+    super_grok_linked_at: string | null;
+    link_blocked_reason: string | null;
+  };
 };
 
 /** 创建/编辑账号表单依赖:active 代理池条目。 */
