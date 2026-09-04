@@ -2,12 +2,20 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import { isWorkScope } from "../../lib/projectScope";
 import { taskboardApi } from "../../lib/taskboard";
-import type { AuthSession, SkillSummary } from "../../lib/types";
+import type { AuthSession, MarketplaceMyAgent, SkillSummary } from "../../lib/types";
 import { useProjectScope } from "../../hooks/useProjectScope";
 import { FileText } from "lucide-react";
+import { agentScopeLabels } from "../AgentScopePicker";
 import { Alert, Button, EmptyState, ListSkeleton, useToast } from "../ui";
 
-export function ProjectSkillOverlay({ auth }: { auth: AuthSession }) {
+export function ProjectSkillOverlay({
+  auth,
+  agents,
+}: {
+  auth: AuthSession;
+  /** id→名称映射（SkillsPanel 已拉取）；缺省时适用范围退化为只显示数量。 */
+  agents?: MarketplaceMyAgent[];
+}) {
   const { scope } = useProjectScope();
   const toast = useToast();
   const workId = scope.workProject?.id ?? "";
@@ -48,7 +56,7 @@ export function ProjectSkillOverlay({ auth }: { auth: AuthSession }) {
   if (!isWorkScope(scope) || !workId) {
     return (
       <div className="px-4 py-3" data-testid="project-skill-overlay-disabled">
-        <p className="text-caption text-muted">选择工作项目后可为该项目勾选 overlay 技能（不改全局 agentIds）。</p>
+        <p className="text-caption text-muted">选择工作项目后，可为该项目单独启用技能，不影响其他项目。</p>
       </div>
     );
   }
@@ -56,7 +64,7 @@ export function ProjectSkillOverlay({ auth }: { auth: AuthSession }) {
   return (
     <div className="flex flex-col gap-2 border-t border-border px-4 py-3" data-testid="project-skill-overlay">
       <div className="flex items-center justify-between gap-2">
-        <h3 className="text-section font-semibold">项目技能 overlay</h3>
+        <h3 className="text-section font-semibold">项目专属技能</h3>
         <Button
           size="sm"
           disabled={saving || loading}
@@ -68,14 +76,14 @@ export function ProjectSkillOverlay({ auth }: { auth: AuthSession }) {
                 setVersion(res.context.version);
                 toast("已保存项目技能", "success");
               })
-              .catch((e) => toast(apiErrorMessage(e, "保存失败（整树 CAS，未部分写入）"), "error"))
+              .catch((e) => toast(apiErrorMessage(e, "保存失败，项目设置可能已被更新，请重试"), "error"))
               .finally(() => setSaving(false));
           }}
         >
-          保存 overlay
+          保存
         </Button>
       </div>
-      <p className="text-caption text-muted">同名覆盖 shared；冲突以项目树为准。密钥类技能已排除。</p>
+      <p className="text-caption text-muted">这里勾选的技能只对当前项目生效；与全局设置不一致时，以项目内为准。密钥类技能已排除。</p>
       {loading ? (
         <ListSkeleton rows={4} />
       ) : skills.length === 0 ? (
@@ -102,7 +110,11 @@ export function ProjectSkillOverlay({ auth }: { auth: AuthSession }) {
                   {s.name}
                   {on ? " · 覆盖" : ""}
                   {blocked ? " · 已排除" : ""}
-                  {s.agentIds?.length ? ` · 可见 ${s.agentIds.join(",")}` : ""}
+                  {s.agentIds?.length
+                    ? agents
+                      ? ` · 适用 ${agentScopeLabels(s.agentIds, agents).join("、")}`
+                      : ` · 已限定 ${s.agentIds.length} 个智能体`
+                    : ""}
                 </span>
               </li>
             );
@@ -110,7 +122,7 @@ export function ProjectSkillOverlay({ auth }: { auth: AuthSession }) {
         </ul>
       )}
       <Alert tone="info" className="text-caption">
-        保存走 PUT /api/board/projects/:id/context skillNames，expectedVersion={version}。
+        技能清单会整体保存。若提示保存失败，说明该项目的设置刚被其他地方修改过，刷新后重试即可，不会只保存一半。
       </Alert>
     </div>
   );

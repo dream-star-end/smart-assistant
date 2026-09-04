@@ -76,12 +76,12 @@ function formatBytes(bytes: number): string {
 }
 
 function parseManifest(payload: unknown, caseId: TutorialCaseId): ReplayManifest {
-  if (!isRecord(payload)) throw new Error("轨迹 manifest 必须是对象");
-  assertExactKeys(payload, ["schemaVersion", "caseId", "messageCount", "pages"], "轨迹 manifest");
-  if (payload.schemaVersion !== 1) throw new Error("轨迹 manifest 版本不受支持");
-  if (payload.caseId !== caseId) throw new Error("轨迹 manifest 与当前案例不匹配");
+  if (!isRecord(payload)) throw new Error("教程过程目录格式不正确");
+  assertExactKeys(payload, ["schemaVersion", "caseId", "messageCount", "pages"], "教程过程目录");
+  if (payload.schemaVersion !== 1) throw new Error("教程过程目录版本不受支持");
+  if (payload.caseId !== caseId) throw new Error("教程过程目录与当前案例不匹配");
   if (!isNonNegativeInteger(payload.messageCount)) throw new Error("轨迹总消息数无效");
-  if (!Array.isArray(payload.pages) || payload.pages.length === 0) throw new Error("轨迹 manifest 没有分页");
+  if (!Array.isArray(payload.pages) || payload.pages.length === 0) throw new Error("教程过程目录缺少分页信息");
 
   let nextOrdinal = 0;
   const pages = payload.pages.map((raw, index): ReplayPageDescriptor => {
@@ -113,7 +113,7 @@ function parseManifest(payload: unknown, caseId: TutorialCaseId): ReplayManifest
 }
 
 function validatePublicMedia(value: unknown, caseId: TutorialCaseId, messageId: string): void {
-  if (!Array.isArray(value)) throw new Error(`轨迹消息 ${messageId} _media 无效`);
+  if (!Array.isArray(value)) throw new Error(`轨迹消息 ${messageId} 附件信息无效`);
   const pathPattern = new RegExp(
     `^/tutorials/cases/${caseId}/media/[A-Za-z0-9][A-Za-z0-9._-]*$`,
   );
@@ -127,7 +127,7 @@ function validatePublicMedia(value: unknown, caseId: TutorialCaseId, messageId: 
       media.kind !== "file"
     ) throw new Error(`轨迹消息 ${messageId} 媒体类型无效`);
     if (typeof media.url !== "string" || !pathPattern.test(media.url)) throw new Error(`轨迹消息 ${messageId} 媒体路径未与案例绑定`);
-    if (media.mimeType !== undefined && typeof media.mimeType !== "string") throw new Error(`轨迹消息 ${messageId} 媒体 MIME 无效`);
+    if (media.mimeType !== undefined && typeof media.mimeType !== "string") throw new Error(`轨迹消息 ${messageId} 媒体格式无效`);
     if (media.filename !== undefined && typeof media.filename !== "string") throw new Error(`轨迹消息 ${messageId} 媒体文件名无效`);
   }
 }
@@ -140,12 +140,12 @@ function parseMessage(
 ): ChatMessage {
   if (!isRecord(value)) throw new Error("轨迹消息必须是对象");
   if (hasPrivatePublicReplayField(value)) throw new Error("轨迹消息包含禁止的隐私身份字段");
-  if (typeof value.id !== "string" || !/^(?:msg|tutorial)-[A-Za-z0-9_-]+$/.test(value.id)) throw new Error("轨迹消息 id 未使用脱敏公共格式");
-  if (seenIds.has(value.id)) throw new Error(`轨迹消息 id 重复：${value.id}`);
-  if (typeof value.role !== "string" || !MESSAGE_ROLES.has(value.role as ChatMessage["role"])) throw new Error(`轨迹消息 ${value.id} role 无效`);
-  if (typeof value.text !== "string") throw new Error(`轨迹消息 ${value.id} text 无效`);
-  if (typeof value.ts !== "number" || !Number.isFinite(value.ts) || value.ts < 0) throw new Error(`轨迹消息 ${value.id} ts 无效`);
-  if (previousTs !== null && value.ts < previousTs) throw new Error(`轨迹消息 ${value.id} ts 顺序倒退`);
+  if (typeof value.id !== "string" || !/^(?:msg|tutorial)-[A-Za-z0-9_-]+$/.test(value.id)) throw new Error("轨迹消息编号格式不正确");
+  if (seenIds.has(value.id)) throw new Error(`轨迹消息编号重复：${value.id}`);
+  if (typeof value.role !== "string" || !MESSAGE_ROLES.has(value.role as ChatMessage["role"])) throw new Error(`轨迹消息 ${value.id} 类型无效`);
+  if (typeof value.text !== "string") throw new Error(`轨迹消息 ${value.id} 内容无效`);
+  if (typeof value.ts !== "number" || !Number.isFinite(value.ts) || value.ts < 0) throw new Error(`轨迹消息 ${value.id} 时间无效`);
+  if (previousTs !== null && value.ts < previousTs) throw new Error(`轨迹消息 ${value.id} 时间顺序颠倒`);
   if (value._media !== undefined) validatePublicMedia(value._media, caseId, value.id);
   seenIds.add(value.id);
   return value as ChatMessage;
@@ -162,7 +162,7 @@ function parsePage(
   assertExactKeys(payload, ["schemaVersion", "caseId", "pageIndex", "startOrdinal", "messages"], `轨迹第 ${pageIndex + 1} 页`);
   if (payload.schemaVersion !== 1) throw new Error(`轨迹第 ${pageIndex + 1} 页版本不受支持`);
   if (payload.caseId !== caseId) throw new Error(`轨迹第 ${pageIndex + 1} 页与当前案例不匹配`);
-  if (payload.pageIndex !== pageIndex) throw new Error(`轨迹第 ${pageIndex + 1} 页索引不连续`);
+  if (payload.pageIndex !== pageIndex) throw new Error(`轨迹第 ${pageIndex + 1} 页页码不连续`);
   if (payload.startOrdinal !== descriptor.startOrdinal) throw new Error(`轨迹第 ${pageIndex + 1} 页起始序号不一致`);
   if (!Array.isArray(payload.messages) || payload.messages.length !== descriptor.messageCount) throw new Error(`轨迹第 ${pageIndex + 1} 页消息数不一致`);
   const seenIds = new Set(previousMessages.map((message) => message.id));
@@ -279,10 +279,10 @@ export function TutorialReplay({
     setLoadState({ status: "loading", sourcePath });
     try {
       const manifestRaw = await fetchText(sourcePath, controller.signal);
-      if (manifestRaw.bytes.byteLength !== verifiedProvenance.bytes) throw new Error("轨迹 manifest 字节数与采集凭据不一致");
-      if ((await sha256Hex(manifestRaw.bytes)) !== verifiedProvenance.messagesSha256) throw new Error("轨迹 manifest SHA-256 与采集凭据不一致");
-      const manifest = parseManifest(parseJson(manifestRaw.text, "轨迹 manifest"), caseId);
-      if (manifest.messageCount !== verifiedProvenance.messageCount) throw new Error("轨迹 manifest 与采集凭据消息数不一致");
+      if (manifestRaw.bytes.byteLength !== verifiedProvenance.bytes) throw new Error("教程过程目录大小与采集凭据不一致");
+      if ((await sha256Hex(manifestRaw.bytes)) !== verifiedProvenance.messagesSha256) throw new Error("教程过程目录 SHA-256 与采集凭据不一致");
+      const manifest = parseManifest(parseJson(manifestRaw.text, "教程过程目录"), caseId);
+      if (manifest.messageCount !== verifiedProvenance.messageCount) throw new Error("教程过程目录与采集凭据消息数不一致");
       const firstMessages = await fetchPage(
         manifest.pages[0],
         caseId,
@@ -332,7 +332,7 @@ export function TutorialReplay({
         loadedPages === snapshot.manifest.pages.length &&
         messages.length !== snapshot.manifest.messageCount
       ) {
-        throw new Error("轨迹完整消息数与 manifest 不一致");
+        throw new Error("教程完整消息数与目录不一致");
       }
       setLoadState({
         ...snapshot,
@@ -430,7 +430,7 @@ export function TutorialReplay({
         <Button variant="secondary" size="sm" onClick={() => void loadManifestAndFirstPage()}>
           加载真实完整过程 <ChevronDown size={14} />
         </Button>
-        <p className="mt-2 text-[11.5px] text-faint">首次只读取 manifest 和第一页；后续过程由你逐页展开。</p>
+        <p className="mt-2 text-[11.5px] text-faint">首次只读取目录和第一页；后续过程由你逐页展开。</p>
       </div>
     );
   }

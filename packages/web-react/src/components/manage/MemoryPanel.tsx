@@ -81,7 +81,7 @@ export function MemoryPanel({
     <div className="flex flex-col">
       <PanelHeader
         title="记忆"
-        hint="这些内容会注入智能体的长期上下文。Core 的 type:project 只是标签，不是项目命名空间。"
+        hint="这些内容会作为智能体的长期记忆，在每次对话中生效。"
         action={
           showPicker ? (
             <Select
