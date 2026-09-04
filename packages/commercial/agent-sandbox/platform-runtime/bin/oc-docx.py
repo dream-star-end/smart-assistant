@@ -1020,6 +1020,7 @@ def inspect_docx(input_path: str | Path, render_dir: str | Path | None = None) -
 
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 CP_NS = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
 DC_NS = "http://purl.org/dc/elements/1.1/"
 DCT_NS = "http://purl.org/dc/terms/"
@@ -1148,6 +1149,185 @@ def _inspect_command(args: argparse.Namespace) -> int:
     return 0 if report["zip_integrity_ok"] and report["render_pairing_ok"] else 1
 
 
+def _docxcheck_enabled() -> bool:
+    raw = (os.environ.get("OC_DOCXCHECK") or "off").strip().lower()
+    return raw in {"on", "1", "true", "enforce"}
+
+
+def _check_add_failure(report: dict[str, Any], code: str, message: str) -> None:
+    report.setdefault("failures", []).append({"code": code, "message": message})
+
+
+def _parse_docx_xml(source: Path) -> tuple[Any, Any | None, set[str]]:
+    import xml.etree.ElementTree as ET
+
+    with zipfile.ZipFile(source) as archive:
+        members = set(archive.namelist())
+        document = ET.fromstring(archive.read("word/document.xml"))
+        numbering = ET.fromstring(archive.read("word/numbering.xml")) if "word/numbering.xml" in members else None
+        media = {name for name in members if name.startswith("word/media/")}
+    return document, numbering, media
+
+
+def _check_omml_and_structure(
+    report: dict[str, Any],
+    document: Any,
+    numbering: Any | None,
+    media: set[str],
+    *,
+    expect_formulas: bool,
+    allow_raster_math: bool,
+) -> None:
+    import re
+
+    w = f"{{{W_NS}}}"
+    m = f"{{{M_NS}}}"
+    omml = len(document.findall(f".//{m}oMath"))
+    report["omml_count"] = omml
+    report["media_count"] = len(media)
+    if expect_formulas and omml == 0:
+        if media and not allow_raster_math:
+            _check_add_failure(report, "omml-rasterized", "expected OMML formulas but only raster media were found")
+        else:
+            _check_add_failure(report, "omml-missing", "expected OMML formulas (m:oMath) but none were found")
+
+    abstracts: set[str] = set()
+    num_map: dict[str, str] = {}
+    if numbering is not None:
+        for abstract in numbering.findall(f"{w}abstractNum"):
+            aid = abstract.get(f"{w}abstractNumId")
+            if aid is not None:
+                abstracts.add(aid)
+        for num in numbering.findall(f"{w}num"):
+            nid = num.get(f"{w}numId")
+            abs_el = num.find(f"{w}abstractNumId")
+            if nid is not None and abs_el is not None and abs_el.get(f"{w}val") is not None:
+                num_map[nid] = abs_el.get(f"{w}val") or ""
+    for num_id in document.findall(f".//{w}numPr/{w}numId"):
+        val = num_id.get(f"{w}val")
+        if val in (None, "0"):
+            continue
+        if val not in num_map or num_map[val] not in abstracts:
+            _check_add_failure(report, "numbering-orphan", f"numId {val} is not resolvable in numbering.xml")
+            break
+
+    bookmarks = {el.get(f"{w}name") for el in document.findall(f".//{w}bookmarkStart") if el.get(f"{w}name")}
+    report["bookmark_count"] = len(bookmarks)
+    for instr in document.findall(f".//{w}instrText"):
+        text = instr.text or ""
+        for match in re.finditer(r"\b(REF|PAGEREF)\s+([^\s\\]+)", text, re.I):
+            name = match.group(2)
+            if name not in bookmarks:
+                _check_add_failure(report, "xref-orphan", f"{match.group(1)} {name} has no bookmark")
+                break
+    toc = any("TOC" in ((el.text or "").upper()) for el in document.findall(f".//{w}instrText"))
+    report["has_toc_field"] = toc
+
+
+def _check_render_readback(source: Path, report: dict[str, Any], required_text: list[str]) -> None:
+    import re
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="oc-docx-check-") as temporary:
+            rendered = render_docx(source, temporary, emit_pdf=True)
+            pages = [Path(item) for item in rendered.get("pages") or []]
+            if not pages:
+                _check_add_failure(report, "libreoffice-render", "render produced no page PNGs")
+                return
+            pdf = rendered.get("pdf")
+            rendered_text = ""
+            if pdf and shutil.which("pdftotext"):
+                text_out = Path(temporary) / "rendered.txt"
+                result = subprocess.run(
+                    [shutil.which("pdftotext") or "pdftotext", "-layout", str(pdf), str(text_out)],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0 and text_out.is_file():
+                    rendered_text = text_out.read_text(encoding="utf-8", errors="replace")
+                    report["rendered_text_sample"] = rendered_text[:2000]
+                    compact = re.sub(r"\s+", "", rendered_text)
+                    squares = sum(compact.count(ch) for ch in ("□", "■", "�"))
+                    if "�" in compact or (squares >= 4 and squares / max(1, len(compact)) >= 0.1):
+                        _check_add_failure(report, "suspicious-glyphs", "rendered PDF text contains replacement/tofu glyphs")
+                    for needle in required_text:
+                        if needle and needle not in rendered_text:
+                            _check_add_failure(report, "required-text-rendered", f"missing after render: {needle}")
+            whites = 0
+            for page in pages:
+                try:
+                    if _mostly_white_ratio(page) > 0.995:
+                        whites += 1
+                except Exception:
+                    pass
+            if pages and whites == len(pages) and not rendered_text.strip():
+                _check_add_failure(report, "empty-render", "all rendered pages look blank")
+    except RenderError as error:
+        _check_add_failure(report, "libreoffice-render", str(error))
+
+
+def check_docx(
+    input_path: str | Path,
+    *,
+    expect_formulas: bool = False,
+    allow_raster_math: bool = False,
+    required_text: list[str] | None = None,
+    render_dir: str | Path | None = None,
+    vision: bool = False,
+) -> dict[str, Any]:
+    report = inspect_docx(input_path, render_dir)
+    report["failures"] = []
+    report["passed"] = False
+    report["verdict"] = "FAIL"
+    if not report.get("zip_integrity_ok"):
+        _check_add_failure(report, "package-corrupt", f"corrupt package member: {report.get('bad_zip_member')}")
+    if report.get("non_empty_paragraph_count", 0) == 0 and report.get("table_count", 0) == 0:
+        _check_add_failure(report, "empty-document", "document has no visible paragraphs or tables")
+        report["warnings"] = [item for item in report.get("warnings", []) if "没有可见内容" not in item]
+    source = _resolve_existing_file(input_path, "DOCX")
+    try:
+        document, numbering, media = _parse_docx_xml(source)
+        _check_omml_and_structure(
+            report,
+            document,
+            numbering,
+            media,
+            expect_formulas=expect_formulas,
+            allow_raster_math=allow_raster_math,
+        )
+    except Exception as error:
+        _check_add_failure(report, "docx-xml", f"cannot parse document.xml: {error}")
+    if vision:
+        report.setdefault("warnings", []).append("vision sampling is optional and was not executed")
+    _check_render_readback(source, report, required_text or [])
+    if render_dir and not report.get("render_pairing_ok", True):
+        _check_add_failure(report, "render-pairing", "render directory page pairing failed")
+    report["passed"] = len(report["failures"]) == 0
+    report["verdict"] = "PASS" if report["passed"] else "FAIL"
+    return report
+
+
+def _check_command(args: argparse.Namespace) -> int:
+    if not _docxcheck_enabled():
+        return _inspect_command(args)
+    report = check_docx(
+        args.input,
+        expect_formulas=bool(args.expect_formulas) or str(getattr(args, "kind", "")).lower() == "formula",
+        allow_raster_math=bool(args.allow_raster_math),
+        required_text=list(args.required_text or []),
+        render_dir=args.render_dir,
+        vision=bool(args.vision),
+    )
+    if args.json:
+        output = _resolve_output(args.json)
+        output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        report["report_file"] = str(output)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print("PASS" if report["passed"] else "FAIL")
+    return 0 if report["passed"] else 1
+
+
 def _scrub_command(args: argparse.Namespace) -> int:
     print(scrub_docx(args.input, args.output, keep_title=args.keep_title, keep_author=args.keep_author))
     return 0
@@ -1207,6 +1387,20 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--render-dir", help="包含 page-*.png/vision-page-*.jpg 的目录")
     inspect.add_argument("--json", help="保存检查报告 JSON")
     inspect.set_defaults(func=_inspect_command)
+    check = subparsers.add_parser(
+        "check",
+        help="严格检查 DOCX：OMML/编号/交叉引用，soffice 回读失败即 FAIL",
+        description="严格检查 DOCX：OMML/编号/交叉引用与 soffice 回读（OC_DOCXCHECK=off 时等同 inspect）",
+    )
+    check.add_argument("input", help="输入 DOCX")
+    check.add_argument("--render-dir", help="包含 page-*.png/vision-page-*.jpg 的目录")
+    check.add_argument("--json", help="保存检查报告 JSON")
+    check.add_argument("--expect-formulas", action="store_true", help="源含公式时要求 m:oMath")
+    check.add_argument("--allow-raster-math", action="store_true", help="允许公式以图片存在")
+    check.add_argument("--required-text", action="append", default=[], help="渲染 PDF 中必须出现的文本，可重复")
+    check.add_argument("--vision", action="store_true", help="对公式页做 vision（默认关，最多 8 页）")
+    check.add_argument("--kind", default="document", help="document|formula（formula 时等同 --expect-formulas）")
+    check.set_defaults(func=_check_command)
     scrub = subparsers.add_parser(
         "scrub",
         help="清理 DOCX 隐私元数据和 rsid",
@@ -1222,7 +1416,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     actual = list(sys.argv[1:] if argv is None else argv)
-    commands = {"convert", "build", "render", "inspect", "scrub"}
+    commands = {"convert", "build", "render", "inspect", "check", "scrub"}
     if actual and actual[0] not in commands and actual[0] not in {"-h", "--help"}:
         actual.insert(0, "convert")
     parser = build_parser()

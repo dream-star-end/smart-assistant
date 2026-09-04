@@ -230,9 +230,17 @@ function xlsxCommandProbe(command: string): Probe {
  */
 const OC_SURFACES: Record<string, Record<string, Probe>> = {
   'oc-artifact-qa': {
-    inspect: scriptProbe('oc-artifact-qa.py', ['--help'], {
+    inspect: scriptProbe('oc-artifact-qa.py', ['inspect', '--help'], {
       code: 0,
-      stdout: /Inspect and render PDF\/PPTX\/XLSX artifacts/,
+      stdout: /PDF\/PPTX\/XLSX input file/,
+    }),
+    deliver: scriptProbe('oc-artifact-qa.py', ['deliver', '--help'], {
+      code: 0,
+      stdout: /file to gate/,
+    }),
+    pack: scriptProbe('oc-artifact-qa.py', ['pack', '--help'], {
+      code: 0,
+      stdout: /uncompressed total byte cap/,
     }),
   },
   'oc-browser': {
@@ -266,7 +274,11 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     build: scriptProbe('oc-docx.py', ['build', '--help'], { code: 0, stdout: /YAML/ }),
     render: scriptProbe('oc-docx.py', ['render', '--help'], { code: 0, stdout: /视觉安全 JPEG/ }),
     inspect: scriptProbe('oc-docx.py', ['inspect', '--help'], { code: 0, stdout: /逐页配对/ }),
+    check: scriptProbe('oc-docx.py', ['check', '--help'], { code: 0, stdout: /--expect-formulas/ }),
     scrub: scriptProbe('oc-docx.py', ['scrub', '--help'], { code: 0, stdout: /--keep-author/ }),
+  },
+  'oc-docxcheck': {
+    check: scriptProbe('oc-docxcheck.sh', ['--help'], { code: 0, stdout: /--expect-formulas/ }),
   },
   'oc-figcheck': {
     check: tsFailureProbe('packages/gateway/src/ocFigCheckCli.ts', [], /usage: oc-figcheck/),
@@ -842,10 +854,8 @@ function productionSurfaces(): Record<string, Set<string>> {
   assert.equal(memory.delete('memory'), true, 'oc-memory: retired memory branch not discovered')
   memory.add('memory.retired')
   return {
-    'oc-artifact-qa': singlePurpose(
+    'oc-artifact-qa': pythonArgparseCommands(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-artifact-qa.py',
-      'inspect',
-      /add_parser\("inspect"/,
     ),
     'oc-browser': singlePurpose(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-browser.sh',
@@ -871,6 +881,11 @@ function productionSurfaces(): Record<string, Set<string>> {
     ),
     'oc-docx': pythonArgparseCommands(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docx.py',
+    ),
+    'oc-docxcheck': singlePurpose(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docxcheck.sh',
+      'check',
+      /oc-docx\.py" check/,
     ),
     'oc-figcheck': singlePurpose(
       'packages/gateway/src/ocFigCheckCli.ts',
