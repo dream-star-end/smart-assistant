@@ -101,7 +101,7 @@ def build_elevation(p: argparse.Namespace, pal: dict) -> Scene:
         yb = base_y * (1 - f) + top_y * f
         xl = (cx - tw_bottom / 2) * (1 - f) + (cx - tw_top / 2) * f
         xr = (cx + tw_bottom / 2) * (1 - f) + (cx + tw_top / 2) * f
-        sc.add(Polyline([(xl, yb), (xr, yb)], color=pal["second"], lw_pt=0.7))
+        sc.add(Polyline([(xl, yb), (xr, yb)], color=pal["fill_accent"], lw_pt=0.55))
     spec["objects"].append({"id": "tower", "type": "tower", "anchor": [cx, (base_y + top_y) / 2], "supports": "foundation"})
     sc.add(Text(cx + 0.8, (base_y + top_y) / 2, "塔架", size_pt=8, anchor="left", for_id="tower"))
 
@@ -139,9 +139,9 @@ def build_elevation(p: argparse.Namespace, pal: dict) -> Scene:
     )
     beam_end = (focus[0] + t_max * axis[0], focus[1] + t_max * axis[1])
     sc.add(Polyline([focus, beam_end], color=pal["accent"], lw_pt=1.2, dash="--", arrow_end=True,
-                    label=f"波束方向(仰角 {p.elevation_deg:g}°)"))
+                    label=f"波束方向({p.elevation_deg:g}°)"))
     sc.legend = True
-    sc.legend_loc = "upper right"
+    sc.legend_loc = "upper left"
     # 波束=方向指示,以对象关系入 spec(from/to 均已声明,过端点检查)
     spec["links"].append({"id": "beam-dir", "from": "feed", "to": "dish", "kind": "boresight"})
 
@@ -156,14 +156,35 @@ def build_layout(p: argparse.Namespace, pal: dict) -> Scene:
     ys = [s[2] for s in stations]
     span_x = max(xs) - min(xs) or 1.0
     span_y = max(ys) - min(ys) or 1.0
-    w = 14.0
-    h = min(max(span_y / span_x * w, 5.0), 12.0)
-    pad = 1.4
-    s = min((w - 2 * pad) / span_x, (h - 2 * pad - 0.6) / span_y)
-    x0 = (w - span_x * s) / 2 - min(xs) * s
+    pad = 1.5
+    # 比例尺由横向主导(铺满画布宽),高度随之自适应,避免 x 方向大片留白=取景过空
+    s = min((14.0 - 2 * pad) / span_x, 0.06)
+    w = span_x * s + 2 * pad
+    h = span_y * s + 3.0
+    x0 = pad - min(xs) * s
     y0 = (h - 0.6 - span_y * s) / 2 - min(ys) * s
 
     sc = Scene(w_cm=w, h_cm=h, title=p.title or "测站布局与基线网")
+    # 坐标网格 + 刻度数字(每 span/4):稀疏布局图的内容密度与可读坐标参照
+    grid_step = max(span_x, span_y) / 4
+    n_grid_x = int(round(span_x / grid_step)) + 1
+    n_grid_y = int(round(span_y / grid_step)) + 1
+    for i in range(n_grid_x + 1):
+        xg = min(xs) + i * grid_step
+        gx = x0 + xg * s
+        if 0.6 < gx < w - 0.4:
+            sc.add(
+                Polyline([(gx, 0.75), (gx, h - 0.95)], color=pal["fill_accent"], lw_pt=0.7),
+                Text(gx, 0.48, f"{xg:.0f}", size_pt=6.5, color=pal["second"]),
+            )
+    for j in range(n_grid_y + 1):
+        yg = min(ys) + j * grid_step
+        gy = y0 + yg * s
+        if 0.6 < gy < h - 0.95:
+            sc.add(
+                Polyline([(0.7, gy), (w - 0.45, gy)], color=pal["fill_accent"], lw_pt=0.7),
+                Text(0.32, gy, f"{yg:.0f}", size_pt=6.5, color=pal["second"], anchor="right"),
+            )
     for i in range(len(stations)):
         for j in range(i + 1, len(stations)):
             (na, xa, ya), (nb, xb, yb) = stations[i], stations[j]
@@ -177,15 +198,26 @@ def build_layout(p: argparse.Namespace, pal: dict) -> Scene:
             sc.spec["links"].append({"id": f"baseline-{na}-{nb}", "from": na, "to": nb, "kind": "baseline"})
     for name, xm, ym in stations:
         pos = (x0 + xm * s, y0 + ym * s)
-        ring = arc_pts(pos[0], pos[1], 0.3, 0, 360)
+        ring = arc_pts(pos[0], pos[1], 0.4, 0, 360)
+        ring2 = arc_pts(pos[0], pos[1], 0.55, 0, 360)
+        anchor = "center"
+        if pos[0] > 0.82 * w:
+            anchor = "right"
+        elif pos[0] < 0.18 * w:
+            anchor = "left"
+        label_y = pos[1] - 1.0 if pos[1] > 0.85 * h else pos[1] + 0.95
         sc.add(
-            Polygon(ring, face=pal["fill_accent"], edge=pal["main"], lw_pt=1.2),
-            Text(pos[0], pos[1] + 0.66, f"{name}({xm:g},{ym:g})", size_pt=8, for_id=name),
+            Polygon(ring2, face=pal["fill"], edge=pal["second"], lw_pt=0.6, alpha=0.6),
+            Polygon(ring, face=pal["fill_accent"], edge=pal["main"], lw_pt=1.4),
+            Text(pos[0], label_y, f"{name}({xm:g},{ym:g})", size_pt=8.5, anchor=anchor, for_id=name),
         )
         sc.spec["objects"].append({"id": name, "type": "station", "anchor": [round(pos[0], 4), round(pos[1], 4)],
                                    "supports": "ground"})
-    sc.legend = True
-    sc.legend_loc = "lower right"
+    # 手动图例(单一线型,不占 mpl legend 边角):左上角虚线样例 + 文字
+    sc.add(
+        Polyline([(1.1, h - 1.05), (2.2, h - 1.05)], color=pal["second"], lw_pt=1.0, dash="--"),
+        Text(2.4, h - 1.05, "基线", size_pt=8, color=pal["text"], anchor="left"),
+    )
     sc.spec_meta = {"template": "antenna-station", "kind": "schematic", "units": "km",
                     "scene": {"grounding": "required"}}
     return sc

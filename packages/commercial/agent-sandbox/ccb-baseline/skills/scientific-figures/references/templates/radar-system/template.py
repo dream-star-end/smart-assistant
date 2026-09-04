@@ -52,7 +52,7 @@ def build(p: argparse.Namespace, pal: dict) -> Scene:
     bw, bh = 2.35, 1.05  # 器件框宽高 cm
     gap = 0.95
     w = n * bw + (n - 1) * gap + 1.6
-    h = 5.6
+    h = 6.5  # 300dpi 下 ≥750px,满足 figcheck 分辨率门
     y_mid = h / 2 - 0.45
     x0 = 0.8
 

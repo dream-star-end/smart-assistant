@@ -34,7 +34,7 @@ def build(p: argparse.Namespace, pal: dict) -> Scene:
     sc.add(Text((ch_x0 + ch_x1) / 2, y_opt - 1.35, f"大气信道 L = {p.range_km:g} km", size_pt=8, color=pal["second"], for_id="channel"))
     spec["objects"].append({"id": "channel", "type": "atmosphere-channel", "anchor": [round((ch_x0 + ch_x1) / 2, 4), round(y_opt, 4)]})
 
-    def telescope(cx: float, name: str) -> tuple[float, float]:
+    def telescope(cid: str, cx: float, name: str) -> tuple[float, float]:
         """筒形望远镜(梯形筒身 + 支架落地),返回朝信道端口的口径中心。"""
         tw, th = 1.9, 1.0
         port = (cx + tw / 2 - 0.08, y_opt) if cx < w / 2 else (cx - tw / 2 + 0.08, y_opt)
@@ -46,12 +46,13 @@ def build(p: argparse.Namespace, pal: dict) -> Scene:
             Polyline([(cx - tw / 2 + 0.15, y_opt - th / 2), (cx, base[1])], color=pal["main"], lw_pt=1.0),
             Polyline([(cx + tw / 2 - 0.15, y_opt - th / 2), (cx, base[1])], color=pal["main"], lw_pt=1.0),
             Polyline([(cx - 0.8, base[1]), (cx + 0.8, base[1])], color=pal["main"], lw_pt=1.3),
-            Text(cx, base[1] - 0.45, name, size_pt=8.5, for_id=name),
+            Text(cx, base[1] - 0.45, name, size_pt=8.5, for_id=cid),
         )
+        spec["objects"].append({"id": cid, "type": "optical-terminal", "anchor": [round(port[0], 4), round(port[1], 4)]})
         return port
 
-    tx_port = telescope(2.6, f"发射望远镜 口径 {p.tx_aperture_cm:g} cm")
-    rx_port = telescope(w - 2.6, f"接收望远镜 口径 {p.rx_aperture_cm:g} cm")
+    tx_port = telescope("tx", 2.6, f"发射望远镜 口径 {p.tx_aperture_cm:g} cm")
+    rx_port = telescope("rx", w - 2.6, f"接收望远镜 口径 {p.rx_aperture_cm:g} cm")
 
     # 光束展宽:从 TX 口径到 RX 口径的截锥(发散角 half=divergence×L/2 的简化示意)
     half_tx = 0.16
@@ -62,8 +63,6 @@ def build(p: argparse.Namespace, pal: dict) -> Scene:
     # 光轴(连续,无断口)
     sc.add(Polyline([tx_port, rx_port], color=pal["accent"], lw_pt=1.0, dash="--"))
 
-    spec["objects"].append({"id": "tx", "type": "optical-terminal", "anchor": [round(tx_port[0], 4), round(tx_port[1], 4)]})
-    spec["objects"].append({"id": "rx", "type": "optical-terminal", "anchor": [round(rx_port[0], 4), round(rx_port[1], 4)]})
     spec["links"].append({"id": "optical-path", "from": "tx", "to": "rx", "kind": "optical"})
 
     # 规格标注:发散角(光束上缘)+ 功率预算(下方)
