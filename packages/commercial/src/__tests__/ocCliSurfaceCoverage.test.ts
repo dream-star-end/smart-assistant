@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
 
 import { runOcConnectCli, runOcPluginCli } from '../../../gateway/src/ocConnectCli.js'
+import { runOcReviewCli } from '../../../gateway/src/ocReviewCli.js'
 import { planSkillCommand } from '../../../gateway/src/ocSkillCli.js'
 import { planTaskCommand } from '../../../gateway/src/ocTaskCli.js'
 import { runOcWebCli } from '../../../gateway/src/ocWebCli.js'
@@ -145,6 +146,15 @@ function skillProbe(argv: string[], expectedKind: string): Probe {
 
 function taskProbe(argv: string[], expectedKind: string): Probe {
   return () => assert.equal(planTaskCommand(argv).kind, expectedKind)
+}
+
+function reviewProbe(argv: string[], exitCode: number, expected: RegExp): Probe {
+  return () => {
+    const result = runOcReviewCli(argv)
+    assert.equal(result.exitCode, exitCode, result.stderr)
+    if (exitCode === 0) assert.match(result.stdout, expected)
+    else assert.match(result.stderr, expected)
+  }
 }
 
 const connectDeps = {
@@ -499,6 +509,10 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
   'oc-report': {
     render: tsFailureProbe('packages/gateway/src/ocReportCli.ts', [], /usage: oc-report/),
   },
+  'oc-review': {
+    schema: reviewProbe(['schema'], 0, /ReviewFile/),
+    collate: reviewProbe(['collate'], 2, /collate --dir/),
+  },
   'oc-skill': {
     train: skillProbe(['train', 'demo', '--confirm'], 'request'),
     'train-status': skillProbe(['train-status', 'run-1'], 'request'),
@@ -595,6 +609,7 @@ const THIN_WRAPPERS: Record<string, string> = {
   'oc-poster': 'packages/gateway/src/ocPosterCli.ts',
   'oc-rank': 'packages/gateway/src/ocRankCli.ts',
   'oc-report': 'packages/gateway/src/ocReportCli.ts',
+  'oc-review': 'packages/gateway/src/ocReviewCli.ts',
   'oc-skill': 'packages/gateway/src/ocSkillCli.ts',
   'oc-slides': 'packages/gateway/src/ocSlidesCli.ts',
   'oc-task': 'packages/gateway/src/ocTaskCli.ts',
@@ -909,6 +924,7 @@ function productionSurfaces(): Record<string, Set<string>> {
     'oc-poster': singlePurpose('packages/gateway/src/ocPosterCli.ts', 'render', /usage: oc-poster/),
     'oc-rank': tsDispatchCommands('packages/gateway/src/ocRankCli.ts', 'cmd'),
     'oc-report': singlePurpose('packages/gateway/src/ocReportCli.ts', 'render', /usage: oc-report/),
+    'oc-review': tsDispatchCommands('packages/gateway/src/ocReviewCli.ts', 'cmd'),
     'oc-skill': tsDispatchCommands('packages/gateway/src/ocSkillCli.ts', 'cmd'),
     'oc-slides': singlePurpose('packages/gateway/src/ocSlidesCli.ts', 'render', /usage: oc-slides/),
     'oc-task': tsDispatchCommands('packages/gateway/src/ocTaskCli.ts', 'cmd'),

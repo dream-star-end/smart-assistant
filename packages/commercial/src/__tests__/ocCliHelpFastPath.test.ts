@@ -22,6 +22,7 @@ const TSX_WRAPPERS = [
   'oc-poster.sh',
   'oc-rank.sh',
   'oc-report.sh',
+  'oc-review.sh',
   'oc-skill.sh',
   'oc-slides.sh',
   'oc-task.sh',
