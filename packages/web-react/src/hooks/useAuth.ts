@@ -89,7 +89,7 @@ export type UseAuth = {
     termsVersion: string;
   }) => Promise<{ verifyEmailSent: boolean }>;
   verifyEmail: (email: string, code: string) => Promise<void>;
-  resendVerification: (email: string) => Promise<void>;
+  resendVerification: (email: string) => Promise<{ emailSent: boolean }>;
   requestReset: (email: string, token: string) => Promise<void>;
   confirmReset: (token: string, newPassword: string) => Promise<void>;
   logout: () => void;
@@ -333,12 +333,21 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
         .then((r) => ({ verifyEmailSent: r.verifyEmailSent })),
     [],
   );
-  const verifyEmail = useCallback(
-    (email: string, code: string) => api.verifyEmail(email, code).then(() => undefined),
-    [],
-  );
+  const verifyEmail = useCallback(async (email: string, code: string) => {
+    const session = authRef.current;
+    const epoch = session.beginIdentity();
+    bootstrapMeFriction.current = null;
+    void cancelAuthRefresh(session);
+    const res = await api.verifyEmail(email, code);
+    if (!session.commitToken(epoch, res.accessToken)) return;
+    setAuthed(true);
+    setUser(res.user);
+    setLaneSignal({ lane: res.lane ?? null });
+    cbRef.current.onLoginSuccess?.();
+  }, []);
   const resendVerification = useCallback(
-    (email: string) => api.resendVerification(email).then(() => undefined),
+    (email: string) =>
+      api.resendVerification(email).then((r) => ({ emailSent: r.emailSent })),
     [],
   );
   const requestReset = useCallback(

@@ -208,6 +208,62 @@ describe("auth.register (integ)", () => {
     assert.notEqual(code, hashRow.rows[0].token_hash, "raw code must not equal stored hash");
   });
 
+  test("display_name <=32 is persisted; omitted/blank stays NULL", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const mailer = new CapturingMailer();
+    const named = await register(
+      {
+        email: "nick@example.com",
+        password: "correct horse battery staple",
+        turnstile_token: "tok",
+        display_name: "  小明同学  ",
+      },
+      { mailer, turnstileBypass: true },
+    );
+    const namedRow = await query<{ display_name: string | null }>(
+      "SELECT display_name FROM users WHERE id = $1",
+      [named.user_id],
+    );
+    assert.equal(namedRow.rows[0].display_name, "小明同学");
+
+    const anon = await register(
+      {
+        email: "nonick@example.com",
+        password: "correct horse battery staple",
+        turnstile_token: "tok",
+        display_name: "   ",
+      },
+      { mailer, turnstileBypass: true },
+    );
+    const anonRow = await query<{ display_name: string | null }>(
+      "SELECT display_name FROM users WHERE id = $1",
+      [anon.user_id],
+    );
+    assert.equal(anonRow.rows[0].display_name, null);
+  });
+
+  test("display_name longer than 32 -> VALIDATION, no DB write", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const mailer = new CapturingMailer();
+    await assert.rejects(
+      register(
+        {
+          email: "longnick@example.com",
+          password: "correct horse battery staple",
+          turnstile_token: "tok",
+          display_name: "n".repeat(33),
+        },
+        { mailer, turnstileBypass: true },
+      ),
+      (err: unknown) => err instanceof RegisterError && err.code === "VALIDATION",
+    );
+    const u = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM users WHERE email = $1",
+      ["longnick@example.com"],
+    );
+    assert.equal(u.rows[0].cnt, "0");
+  });
+
   test("terms consent(0125): terms_version 有值 → 两列同落;缺省 → 两列 NULL", async (t) => {
     if (skipIfNoPg(t)) return;
     const mailer = new CapturingMailer();

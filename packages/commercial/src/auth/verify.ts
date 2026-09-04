@@ -23,6 +23,8 @@
 import { z } from 'zod'
 import { createHash } from 'node:crypto'
 import { tx, query } from '../db/queries.js'
+import { getBalanceBreakdown } from '../billing/spend.js'
+import { ensureFreeSubscription } from '../billing/subscription.js'
 import { hashPassword } from './passwords.js'
 import {
   newVerifyToken,
@@ -32,8 +34,13 @@ import {
 } from './register.js'
 import { SYNTHETIC_EMAIL_DOMAIN } from './socialLogin.js'
 import { verifyTurnstile, TurnstileError, resolveTurnstileBypass } from './turnstile.js'
+import { signAccess, issueRefresh, refreshTokenHash, REFRESH_TOKEN_TTL_SECONDS } from './jwt.js'
 import type { Mailer } from './mail.js'
-import { lockRefreshUsers } from './refreshFamilyLock.js'
+import {
+  lockRefreshFamily,
+  lockRefreshUsers,
+  resolveRefreshTokenLockTarget,
+} from './refreshFamilyLock.js'
 
 /** 密码重置 token TTL:1 小时(短于 verify_email)05-SEC §15 */
 export const RESET_PASSWORD_TTL_SECONDS = 60 * 60
@@ -64,6 +71,11 @@ export type VerifyErrorCode =
    * 仅在 code 已成功比对后才会抛,防止 verify 成为黑名单枚举口子。
    */
   | 'EMAIL_DOMAIN_BLOCKED'
+  /**
+   * issueVerifiedUserSession 拒发:账号非 active 或尚未 email_verified。
+   * 与 INVALID_TOKEN(码错/过期)分开,避免 verify 已消费码后把签发失败伪装成码错。
+   */
+  | 'ACCOUNT_UNAVAILABLE'
 
 export class VerifyError extends Error {
   readonly code: VerifyErrorCode
@@ -415,6 +427,12 @@ export interface ResendVerifyDeps extends CommonDeps {
 export interface ResendVerifyResult {
   /** 总是 true:防枚举,接口语义上一律视为"已受理" */
   accepted: true
+  /**
+   * 是否真正把验证码邮件发出去了。
+   * mailer 失败 -> false(前端明示发送失败且不开 60s 冷却)。
+   * 防枚举:email 不存在 / 已验证 / 格式错仍返 true,避免成为存在性预言机。
+   */
+  email_sent: boolean
 }
 
 /**
@@ -440,7 +458,7 @@ export async function resendVerification(
   deps: ResendVerifyDeps,
 ): Promise<ResendVerifyResult> {
   const parsed = emailSchema.safeParse(rawEmail)
-  if (!parsed.success) return { accepted: true }
+  if (!parsed.success) return { accepted: true, email_sent: true }
   const email = parsed.data
 
   const verify = newVerifyCode()
@@ -480,7 +498,7 @@ export async function resendVerification(
     return true
   })
 
-  if (!emailSent) return { accepted: true }
+  if (!emailSent) return { accepted: true, email_sent: true }
 
   try {
     await deps.mailer.send({
@@ -501,10 +519,167 @@ export async function resendVerification(
         `claudeai.chat`,
     })
   } catch {
-    // 邮件失败不影响 accepted 语义 —— 用户可重试
+    // accepted 仍 true(防枚举);email_sent=false 让真实用户看见发送失败。
+    return { accepted: true, email_sent: false }
   }
 
-  return { accepted: true }
+  return { accepted: true, email_sent: true }
+}
+
+
+// ─── issueVerifiedUserSession ─────────────────────────────────────────
+//
+// 邮箱验证成功后签发 access + refresh,语义对齐 login / socialLogin:
+//   - refresh 入库存 sha256,raw 只经 handler Set-Cookie 下发
+//   - 默认 remember=true(验证后免重登,关窗口仍保持)
+//   - 锁序复用 refreshFamilyLock:resolve -> lockRefreshUsers -> family -> row
+//   - 不修改 lock 实现本身;调用既有 advisory lock,避免与 reset/rotate 竞态
+//   - 签发后 ensureFreeSubscription,避免首轮 preCheck 看到 0
+
+export interface IssueVerifiedSessionDeps {
+  jwtSecret: string | Uint8Array
+  bindIp?: string | null
+  userAgent?: string
+  now?: () => number
+  accessTtlSeconds?: number
+  refreshTtlSeconds?: number
+  /** 已有 HttpOnly cookie:成功后吊销其 family,再发新 family(与 login 一致) */
+  replaceRefreshToken?: string | null
+  /** 缺省 true,对齐 SSO / login 默认「记住我」 */
+  remember?: boolean
+}
+
+export interface IssueVerifiedSessionResult {
+  user: {
+    id: string
+    email: string
+    email_verified: boolean
+    role: "user" | "admin"
+    display_name: string | null
+    avatar_url: string | null
+    credits: string
+  }
+  access_token: string
+  access_exp: number
+  refresh_token: string
+  refresh_exp: number
+  remember: boolean
+}
+
+interface VerifiedSessionDbUser {
+  id: string
+  email: string
+  email_verified: boolean
+  role: "user" | "admin"
+  display_name: string | null
+  avatar_url: string | null
+  credits: string
+  status: string
+}
+
+/**
+ * 为已通过 verifyEmail 的用户签发会话。必须在 verifyEmail 事务提交之后调用,
+ * 不要与 verify 的 users FOR UPDATE 叠在同一事务里(锁序不同)。
+ */
+export async function issueVerifiedUserSession(
+  userId: string,
+  deps: IssueVerifiedSessionDeps,
+): Promise<IssueVerifiedSessionResult> {
+  const issueNow = nowSec(deps)
+  const rememberMe = deps.remember !== false
+  const refresh = issueRefresh({
+    now: issueNow,
+    ttlSeconds: deps.refreshTtlSeconds ?? REFRESH_TOKEN_TTL_SECONDS,
+  })
+  let replacedTokenHash: string | null = null
+  if (deps.replaceRefreshToken) {
+    try {
+      replacedTokenHash = refreshTokenHash(deps.replaceRefreshToken)
+    } catch {
+      /* malformed cookie is ignored */
+    }
+  }
+
+  const validatedUser = await tx(async (client): Promise<VerifiedSessionDbUser> => {
+    const replacedTarget = replacedTokenHash
+      ? await resolveRefreshTokenLockTarget(client, replacedTokenHash)
+      : null
+    await lockRefreshUsers(client, [
+      userId,
+      ...(replacedTarget ? [replacedTarget.userId] : []),
+    ])
+    if (replacedTarget) {
+      await lockRefreshFamily(client, replacedTarget.familyId)
+    }
+
+    const currentRes = await client.query<VerifiedSessionDbUser>(
+      `SELECT id::text AS id, email, email_verified, role,
+              display_name, avatar_url, credits::text AS credits, status
+         FROM users WHERE id=$1::bigint
+         FOR UPDATE`,
+      [userId],
+    )
+    const current = currentRes.rows[0]
+    if (!current || current.status !== "active" || current.email_verified !== true) {
+      throw new VerifyError("ACCOUNT_UNAVAILABLE", "account unavailable")
+    }
+
+    if (replacedTokenHash && replacedTarget) {
+      const prior = await client.query<{ family_id: string }>(
+        `SELECT family_id::text AS family_id FROM refresh_tokens
+          WHERE token_hash=$1 AND family_id=$2::uuid
+          FOR UPDATE`,
+        [replacedTokenHash, replacedTarget.familyId],
+      )
+      if (prior.rows[0]) {
+        await client.query(
+          `UPDATE refresh_tokens
+              SET revoked_at=COALESCE(revoked_at,NOW()),
+                  revoked_reason=CASE WHEN revoked_at IS NULL THEN 'logout' ELSE revoked_reason END
+            WHERE family_id=$1::uuid`,
+          [prior.rows[0].family_id],
+        )
+      }
+    }
+    await client.query(
+      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at, remember_me)
+       VALUES ($1, $2, $3, $4, to_timestamp($5), $6)`,
+      [
+        current.id,
+        refresh.hash,
+        deps.userAgent ?? null,
+        deps.bindIp ?? null,
+        refresh.expires_at,
+        rememberMe,
+      ],
+    )
+    return current
+  })
+
+  await ensureFreeSubscription(validatedUser.id)
+  const totalCredits = (await getBalanceBreakdown(validatedUser.id)).total
+  const access = await signAccess(
+    { sub: validatedUser.id, role: validatedUser.role },
+    deps.jwtSecret,
+    { now: issueNow, ttlSeconds: deps.accessTtlSeconds },
+  )
+
+  return {
+    user: {
+      id: validatedUser.id,
+      email: validatedUser.email,
+      email_verified: validatedUser.email_verified,
+      role: validatedUser.role,
+      display_name: validatedUser.display_name,
+      avatar_url: validatedUser.avatar_url,
+      credits: totalCredits.toString(),
+    },
+    access_token: access.token,
+    access_exp: access.exp,
+    refresh_token: refresh.token,
+    refresh_exp: refresh.expires_at,
+    remember: rememberMe,
+  }
 }
 
 // ─── confirmPasswordReset ─────────────────────────────────────────────

@@ -4,13 +4,16 @@ import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.j
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { register } from "../auth/register.js";
+import { login } from "../auth/login.js";
 import {
   verifyEmail,
+  issueVerifiedUserSession,
   requestPasswordReset,
   confirmPasswordReset,
   resendVerification,
   VerifyError,
 } from "../auth/verify.js";
+import { verifyAccess, refreshTokenHash } from "../auth/jwt.js";
 import { verifyPassword } from "../auth/passwords.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
 import { resetTestSchemaForTest } from "./helpers/db.js";
@@ -30,6 +33,8 @@ const TEST_DB_URL =
 
 const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
+
+const JWT_SECRET = "x".repeat(64);
 
 let pgAvailable = false;
 
@@ -164,6 +169,110 @@ describe("auth.verify.verifyEmail (integ)", () => {
       [userId],
     );
     assert.equal(led.rows[0].cnt, "0", "不应产生任何 ledger 行");
+  });
+
+  test("issueVerifiedUserSession: writes refresh_tokens + access JWT (same cookie/refresh semantics as login)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const { userId, rawCode, verifyEmail: email } = await registerAndCaptureVerifyToken(
+      "session-after-verify@example.com",
+      "pwd session after verify",
+    );
+    const v = await verifyEmail(email, rawCode);
+    assert.equal(v.newly_verified, true);
+
+    const session = await issueVerifiedUserSession(v.user_id, {
+      jwtSecret: JWT_SECRET,
+      bindIp: "127.0.0.1",
+      userAgent: "vitest",
+    });
+    assert.equal(session.user.id, userId);
+    assert.equal(session.user.email, email);
+    assert.equal(session.user.email_verified, true);
+    assert.equal(session.remember, true);
+    assert.ok(session.access_token.length > 20);
+    assert.ok(session.refresh_token.length > 20);
+
+    const claims = await verifyAccess(session.access_token, JWT_SECRET);
+    assert.equal(claims.sub, userId);
+    assert.equal(claims.role, "user");
+
+    const hash = refreshTokenHash(session.refresh_token);
+    const row = await query<{ remember_me: boolean; revoked_at: string | null }>(
+      `SELECT remember_me, revoked_at::text AS revoked_at
+         FROM refresh_tokens WHERE token_hash = $1 AND user_id = $2::bigint`,
+      [hash, userId],
+    );
+    assert.equal(row.rows.length, 1);
+    assert.equal(row.rows[0].remember_me, true);
+    assert.equal(row.rows[0].revoked_at, null);
+  });
+
+  test("issueVerifiedUserSession replaceRefreshToken revokes the old family with logout", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const password = "pwd replace family long";
+    const { userId, rawCode, verifyEmail: email } = await registerAndCaptureVerifyToken(
+      "replace-family@example.com",
+      password,
+    );
+    await verifyEmail(email, rawCode);
+    const oldLogin = await login(
+      { email, password, turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true, bindIp: "127.0.0.1" },
+    );
+    const oldHash = refreshTokenHash(oldLogin.refresh_token);
+    const family = await query<{ family_id: string }>(
+      "SELECT family_id::text AS family_id FROM refresh_tokens WHERE token_hash = $1",
+      [oldHash],
+    );
+    assert.equal(family.rows.length, 1);
+    const oldFamilyId = family.rows[0].family_id;
+
+    const session = await issueVerifiedUserSession(userId, {
+      jwtSecret: JWT_SECRET,
+      bindIp: "127.0.0.1",
+      userAgent: "vitest",
+      replaceRefreshToken: oldLogin.refresh_token,
+    });
+    const newHash = refreshTokenHash(session.refresh_token);
+
+    const oldFamilyRows = await query<{ revoked_reason: string | null; token_hash: string }>(
+      `SELECT revoked_reason, token_hash FROM refresh_tokens WHERE family_id = $1::uuid`,
+      [oldFamilyId],
+    );
+    assert.ok(oldFamilyRows.rows.length >= 1);
+    for (const row of oldFamilyRows.rows) {
+      assert.equal(row.revoked_reason, "logout");
+      assert.notEqual(row.token_hash, newHash);
+    }
+    const newRow = await query<{ family_id: string }>(
+      "SELECT family_id::text AS family_id FROM refresh_tokens WHERE token_hash = $1",
+      [newHash],
+    );
+    assert.equal(newRow.rows.length, 1);
+    assert.notEqual(newRow.rows[0].family_id, oldFamilyId);
+  });
+
+  test("issueVerifiedUserSession banned user: ACCOUNT_UNAVAILABLE and no new refresh row", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const { userId, rawCode, verifyEmail: email } = await registerAndCaptureVerifyToken(
+      "banned-session@example.com",
+      "pwd banned session long",
+    );
+    await verifyEmail(email, rawCode);
+    const before = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM refresh_tokens WHERE user_id = $1::bigint",
+      [userId],
+    );
+    await query("UPDATE users SET status = 'banned' WHERE id = $1", [userId]);
+    await assert.rejects(
+      issueVerifiedUserSession(userId, { jwtSecret: JWT_SECRET, bindIp: "127.0.0.1" }),
+      (err: unknown) => err instanceof VerifyError && err.code === "ACCOUNT_UNAVAILABLE",
+    );
+    const after = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM refresh_tokens WHERE user_id = $1::bigint",
+      [userId],
+    );
+    assert.equal(after.rows[0].cnt, before.rows[0].cnt);
   });
 
   test("re-verify after admin reset: email_verified 翻回 TRUE,恒零积分零 ledger(赠金已下线)", async (t) => {
@@ -405,6 +514,7 @@ describe("auth.verify.resendVerification (integ)", () => {
     const mailer = new CapturingMailer();
     const r = await resendVerification("resend@example.com", { mailer });
     assert.equal(r.accepted, true);
+    assert.equal(r.email_sent, true);
     assert.equal(mailer.sent.length, 1, "resend 必须发一封新邮件");
     assert.equal(mailer.sent[0].subject, "[OpenClaude] 新的邮箱验证码（重发）");
     assert.doesNotMatch(mailer.sent[0].subject, /\d{6}/, "subject 不得含验证码");
@@ -444,6 +554,7 @@ describe("auth.verify.resendVerification (integ)", () => {
     const mailer = new CapturingMailer();
     const r = await resendVerification("alreadyok@example.com", { mailer });
     assert.equal(r.accepted, true, "对已验证用户也必须 accepted=true(防枚举)");
+    assert.equal(r.email_sent, true, "已验证用户 email_sent 仍 true(防枚举)");
     assert.equal(mailer.sent.length, 0, "已验证用户不应再收邮件");
 
     const countAfter = await query<{ cnt: string }>(
@@ -458,7 +569,21 @@ describe("auth.verify.resendVerification (integ)", () => {
     const mailer = new CapturingMailer();
     const r = await resendVerification("ghost-resend@example.com", { mailer });
     assert.equal(r.accepted, true);
+    assert.equal(r.email_sent, true, "不存在的 email 仍 email_sent=true(防枚举)");
     assert.equal(mailer.sent.length, 0);
+  });
+
+  test("resend mailer failure: accepted=true, email_sent=false", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await registerAndCaptureVerifyToken("resend-fail@example.com", "pwd resend fail long");
+    const mailer: Mailer = {
+      async send() {
+        throw new Error("smtp down");
+      },
+    };
+    const r = await resendVerification("resend-fail@example.com", { mailer });
+    assert.equal(r.accepted, true);
+    assert.equal(r.email_sent, false);
   });
 
   test("concurrent resend: only one code remains active, serialized by user row lock", async (t) => {
