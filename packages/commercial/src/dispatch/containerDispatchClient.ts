@@ -45,13 +45,15 @@ export interface RunningContainerEndpoint {
   port: number
   containerId: number
   tunnel?: unknown
+  desktop?: { containerId: number }
 }
 
 export interface ContainerDispatchClientDeps {
   transport: ContainerTransport
   bridgeSecret: string
-  /** 解析**当前运行中**容器 endpoint;不在跑 → null(绝不触发 provision)。 */
-  resolveRunningEndpoint: (uid: bigint) => Promise<RunningContainerEndpoint | null>
+  /** 解析**当前运行中**容器 endpoint;不在跑 → null(绝不触发 provision)。按 dispatch 目标 id。 */
+  resolveRunningEndpoint: (id: DispatchIdentity) => Promise<RunningContainerEndpoint | null>
+  desktopTransport?: ContainerTransport
   timeoutMs?: number
 }
 
@@ -77,6 +79,8 @@ export interface DispatchIdentity {
   attemptNo: number
   sessionId: string
   clientMessageId: string
+  agentContainerId?: number | null
+  runtimeKind?: string | null
 }
 
 function parseStateBody(bodyText: string): ContainerDispatchStateResponse | null {
@@ -114,12 +118,13 @@ export function makeContainerDispatchClient(deps: ContainerDispatchClientDeps): 
   ): Promise<ContainerCallResult> => {
     let endpoint: RunningContainerEndpoint | null
     try {
-      endpoint = await deps.resolveRunningEndpoint(id.uid)
+      endpoint = await deps.resolveRunningEndpoint(id)
     } catch (err) {
       return { kind: 'unreachable', detail: `resolve endpoint: ${(err as Error)?.message ?? String(err)}` }
     }
     if (endpoint === null) return { kind: 'unreachable', detail: 'container not running' }
-    if (endpoint.tunnel !== undefined && !deps.transport.supportsTunnel) {
+    const transport = endpoint.desktop && deps.desktopTransport ? deps.desktopTransport : deps.transport
+    if (endpoint.tunnel !== undefined && !transport.supportsTunnel) {
       // remote-host 容器需 tunnel,self-host transport 打不到 → 归 unreachable(v1 self-host 范围)。
       return { kind: 'unreachable', detail: 'remote-host tunnel unsupported' }
     }
@@ -152,10 +157,10 @@ export function makeContainerDispatchClient(deps: ContainerDispatchClientDeps): 
 
     let res: { status: number; bodyText: string }
     try {
-      if (typeof deps.transport.request === 'function') {
-        res = await deps.transport.request(method, endpoint, fullPath, headers, body, timeoutMs)
+      if (typeof transport.request === 'function') {
+        res = await transport.request(method, endpoint, fullPath, headers, body, timeoutMs)
       } else if (method === 'POST' && body !== null) {
-        res = await deps.transport.post(endpoint, fullPath, headers, body, timeoutMs)
+        res = await transport.post(endpoint, fullPath, headers, body, timeoutMs)
       } else {
         return { kind: 'error', detail: 'transport does not support GET' }
       }

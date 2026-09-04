@@ -8,8 +8,10 @@
  * 服务,推迟到 P1 一并落地)。
  *
  * 规则:
- *   `commercial/src/**` 下任意 .ts 文件中,凡出现 `FROM agent_containers` 或
+ *   (a) `commercial/src/**` 下任意 .ts 文件中,凡出现 `FROM agent_containers` 或
  *   `JOIN agent_containers`(大小写不敏感),必须有显式 `state` 字面量为伴。
+ *   (b) 凡 `FROM/JOIN/UPDATE/INTO agent_containers`,字面量内须有 `runtime_kind`
+ *   或行内 waiver `lint-agent-containers-kind: allow — <理由>`(P1 桌面虚拟容器 B-06)。
  *
  *   理由:v3 schema (0012) 把 agent_containers.state ∈ {active, vanished};
  *   user-facing reader 漏 state filter 会把 vanished 行渗给用户视图 / 计费聚合。
@@ -80,6 +82,9 @@ export const WAIVER_LOOKBEHIND_LINES = 6;
 /** 行内 waiver 标记;后面必须跟非空理由。 */
 export const WAIVER_MARKER = "lint-agent-containers-sql: allow";
 
+/** runtime_kind 规则的行内 waiver。 */
+export const KIND_WAIVER_MARKER = "lint-agent-containers-kind: allow";
+
 export interface Violation {
   /** 相对 `packages/commercial/src/` 的路径,跨平台 `/` 分隔 */
   file: string;
@@ -100,12 +105,17 @@ export interface StaleWaiver {
 export interface LintFileResult {
   violations: Violation[];
   staleWaivers: StaleWaiver[];
+  kindViolations: Violation[];
+  staleKindWaivers: StaleWaiver[];
 }
 
 /** 大小写不敏感:FROM/JOIN(LEFT/RIGHT/INNER 等前缀由 \b 兜住)+ 空白 + agent_containers。 */
 const KEYWORD_RE = /\b(?:FROM|JOIN)\s+agent_containers\b/i;
+/** kind 规则额外覆盖 UPDATE/INTO(破坏性写与 INSERT 必须显式 kind 或 waiver)。 */
+const KIND_KEYWORD_RE = /\b(?:FROM|JOIN|UPDATE|INTO)\s+agent_containers\b/i;
 /** `deploy_state` 这类不算(`_` 是词字符,\b 不会在其间成立)。 */
 const STATE_RE = /\bstate\b/;
+const KIND_RE = /\bruntime_kind\b/;
 /** 整行是注释(JS `//`、SQL `--`、块注释续行 `*`)—— 这种行不算 state 证据。 */
 const COMMENT_LINE_RE = /^\s*(?:\/\/|--|\*\/?|\/\*)/;
 
@@ -117,11 +127,6 @@ const COMMENT_LINE_RE = /^\s*(?:\/\/|--|\*\/?|\/\*)/;
  * 关键词本身写在注释里(文档/设计说明里的 SQL 范例)时,证据同样允许来自注释行:
  * 两者在同一个平面上,拿代码平面的标准去要求文档没有意义。
  */
-function isStateEvidence(line: string, keywordInComment: boolean): boolean {
-  if (!keywordInComment && COMMENT_LINE_RE.test(line)) return false;
-  return STATE_RE.test(line);
-}
-
 interface StringLiteralSpan {
   /** 0-based inclusive */
   startLine: number;
@@ -206,31 +211,33 @@ function spanContaining(spans: StringLiteralSpan[], lineIdx: number): StringLite
 }
 
 /** 关键词行 `keywordIdx` 附近有没有带理由的行内 waiver;有则返回 waiver 行号(0-based)。 */
-function findWaiverFor(lines: string[], keywordIdx: number): number | null {
+function findWaiverFor(lines: string[], keywordIdx: number, marker: string): number | null {
   const from = Math.max(0, keywordIdx - WAIVER_LOOKBEHIND_LINES);
   for (let j = keywordIdx; j >= from; j--) {
-    const idx = lines[j]!.indexOf(WAIVER_MARKER);
+    const idx = lines[j]!.indexOf(marker);
     if (idx === -1) continue;
-    const reason = lines[j]!.slice(idx + WAIVER_MARKER.length).replace(/^[\s—:-]+/u, "").trim();
+    const reason = lines[j]!.slice(idx + marker.length).replace(/^[\s—:-]+/u, "").trim();
     if (reason.length > 0) return j;
   }
   return null;
 }
 
-/**
- * 纯函数:对单个文件源码跑 lint,返回违规 + stale waiver。
- * @param relPath 相对 `commercial/src/` 的路径,跨平台 `/`
- * @param source 完整文件文本
- */
-export function lintFileDetailed(relPath: string, source: string): LintFileResult {
-  if (LEGACY_V2_FILES.has(relPath)) return { violations: [], staleWaivers: [] };
-  const lines = source.split(/\r?\n/);
-  const spans = findStringLiteralSpans(source);
+function isTokenEvidence(line: string, keywordInComment: boolean, tokenRe: RegExp): boolean {
+  if (!keywordInComment && COMMENT_LINE_RE.test(line)) return false;
+  return tokenRe.test(line);
+}
 
-  // 先定位所有关键词行,再按"所属字面量"分组,决定判定作用域。
+function scanRule(
+  relPath: string,
+  lines: string[],
+  spans: StringLiteralSpan[],
+  keywordRe: RegExp,
+  evidenceRe: RegExp,
+  waiverMarker: string,
+): { violations: Violation[]; staleWaivers: StaleWaiver[] } {
   const keywordIdxs: number[] = [];
   for (let i = 0; i < lines.length; i++) {
-    if (KEYWORD_RE.test(lines[i]!)) keywordIdxs.push(i);
+    if (keywordRe.test(lines[i]!)) keywordIdxs.push(i);
   }
   const perSpanCount = new Map<StringLiteralSpan, number>();
   const spanOf = new Map<number, StringLiteralSpan | null>();
@@ -245,32 +252,27 @@ export function lintFileDetailed(relPath: string, source: string): LintFileResul
   for (const idx of keywordIdxs) {
     const span = spanOf.get(idx) ?? null;
     let scanFrom: number;
-    let scanTo: number; // exclusive
+    let scanTo: number;
     if (span !== null && (perSpanCount.get(span) ?? 0) === 1) {
-      // 单腿语句:整条 SQL 都算作用域(state 在 SELECT 列表里也算数)。
       scanFrom = span.startLine;
       scanTo = span.endLine + 1;
     } else if (span !== null) {
-      // 多腿语句(多 CTE / UNION):退回原来的**向下** N 行窗口,裁剪到语句范围内。
-      // 一条腿的 state 不替另一条腿背书。这里刻意不往上看:CTE 腿里 WHERE 一定在
-      // FROM 之后,往上看就会读到**上一条腿**的谓词,正是要避免的那种背书。
       scanFrom = idx;
       scanTo = Math.min(span.endLine + 1, idx + STATE_WINDOW_LINES);
     } else {
-      // 不在字面量里(注释 / 拼接片段):沿用原「本行 + 后 N-1 行」窗口。
       scanFrom = idx;
       scanTo = Math.min(lines.length, idx + STATE_WINDOW_LINES);
     }
     const keywordInComment = COMMENT_LINE_RE.test(lines[idx]!);
-    let hasState = false;
+    let hasEvidence = false;
     for (let j = scanFrom; j < scanTo; j++) {
-      if (isStateEvidence(lines[j]!, keywordInComment)) {
-        hasState = true;
+      if (isTokenEvidence(lines[j]!, keywordInComment, evidenceRe)) {
+        hasEvidence = true;
         break;
       }
     }
-    if (hasState) continue;
-    const waiverLine = findWaiverFor(lines, idx);
+    if (hasEvidence) continue;
+    const waiverLine = findWaiverFor(lines, idx, waiverMarker);
     if (waiverLine !== null) {
       consumedWaivers.add(waiverLine);
       continue;
@@ -280,13 +282,38 @@ export function lintFileDetailed(relPath: string, source: string): LintFileResul
 
   const staleWaivers: StaleWaiver[] = [];
   for (let i = 0; i < lines.length; i++) {
-    const at = lines[i]!.indexOf(WAIVER_MARKER);
+    const at = lines[i]!.indexOf(waiverMarker);
     if (at === -1 || consumedWaivers.has(i)) continue;
-    const reason = lines[i]!.slice(at + WAIVER_MARKER.length).replace(/^[\s—:-]+/u, "").trim();
+    const reason = lines[i]!.slice(at + waiverMarker.length).replace(/^[\s—:-]+/u, "").trim();
     staleWaivers.push({ file: relPath, line: i + 1, reason });
   }
-
   return { violations, staleWaivers };
+}
+
+/**
+ * 纯函数:对单个文件源码跑 lint,返回违规 + stale waiver。
+ * @param relPath 相对 `commercial/src/` 的路径,跨平台 `/`
+ * @param source 完整文件文本
+ */
+export function lintFileDetailed(relPath: string, source: string): LintFileResult {
+  const lines = source.split(/\r?\n/);
+  const spans = findStringLiteralSpans(source);
+  const kind = scanRule(relPath, lines, spans, KIND_KEYWORD_RE, KIND_RE, KIND_WAIVER_MARKER);
+  if (LEGACY_V2_FILES.has(relPath)) {
+    return {
+      violations: [],
+      staleWaivers: [],
+      kindViolations: kind.violations,
+      staleKindWaivers: kind.staleWaivers,
+    };
+  }
+  const state = scanRule(relPath, lines, spans, KEYWORD_RE, STATE_RE, WAIVER_MARKER);
+  return {
+    violations: state.violations,
+    staleWaivers: state.staleWaivers,
+    kindViolations: kind.violations,
+    staleKindWaivers: kind.staleWaivers,
+  };
 }
 
 /** 向后兼容的薄封装:只要违规列表。 */
@@ -332,6 +359,8 @@ export function main(srcRoot: string): number {
   const files = listTsFiles(srcRoot);
   const allViolations: Violation[] = [];
   const allStale: StaleWaiver[] = [];
+  const allKindViolations: Violation[] = [];
+  const allKindStale: StaleWaiver[] = [];
   for (const abs of files) {
     const rel = relative(srcRoot, abs).split(sep).join("/");
     let source: string;
@@ -343,8 +372,15 @@ export function main(srcRoot: string): number {
     const res = lintFileDetailed(rel, source);
     allViolations.push(...res.violations);
     allStale.push(...res.staleWaivers);
+    allKindViolations.push(...res.kindViolations);
+    allKindStale.push(...res.staleKindWaivers);
   }
-  if (allViolations.length === 0 && allStale.length === 0) {
+  const clean =
+    allViolations.length === 0 &&
+    allStale.length === 0 &&
+    allKindViolations.length === 0 &&
+    allKindStale.length === 0;
+  if (clean) {
     // eslint-disable-next-line no-console
     console.log(
       `[lint-agent-containers-sql] OK — scanned ${files.length} .ts files, 0 violations`,
@@ -354,7 +390,7 @@ export function main(srcRoot: string): number {
   if (allViolations.length > 0) {
     // eslint-disable-next-line no-console
     console.error(
-      `[lint-agent-containers-sql] FAIL — ${allViolations.length} violation(s):`,
+      `[lint-agent-containers-sql] FAIL — ${allViolations.length} state violation(s):`,
     );
     for (const v of allViolations) {
       // eslint-disable-next-line no-console
@@ -370,6 +406,22 @@ export function main(srcRoot: string): number {
         `\n  // ${WAIVER_MARKER} — <理由:读取流向何处、为什么必须看到 vanished 行>`,
     );
   }
+  if (allKindViolations.length > 0) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[lint-agent-containers-sql] FAIL — ${allKindViolations.length} runtime_kind violation(s):`,
+    );
+    for (const v of allKindViolations) {
+      // eslint-disable-next-line no-console
+      console.error(`  ${v.file}:${v.line}: ${v.match.trim()}`);
+    }
+    // eslint-disable-next-line no-console
+    console.error(
+      `\nQuery of agent_containers must mention \`runtime_kind\` (B-06 docker/desktop isolation)。` +
+        `\n确属按 id 可跨 kind 的例外就在关键词行上方加:` +
+        `\n  // ${KIND_WAIVER_MARKER} — <理由>`,
+    );
+  }
   if (allStale.length > 0) {
     // eslint-disable-next-line no-console
     console.error(
@@ -379,6 +431,18 @@ export function main(srcRoot: string): number {
       // eslint-disable-next-line no-console
       console.error(
         `  ${w.file}:${w.line}: ${w.reason === "" ? "waiver 缺理由(marker 后必须写明理由)" : `没有违规消费它,代码已修好就删掉本行 — ${w.reason}`}`,
+      );
+    }
+  }
+  if (allKindStale.length > 0) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[lint-agent-containers-sql] FAIL — ${allKindStale.length} stale kind waiver:`,
+    );
+    for (const w of allKindStale) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `  ${w.file}:${w.line}: ${w.reason === "" ? "kind waiver 缺理由" : `没有违规消费它,删掉 — ${w.reason}`}`,
       );
     }
   }

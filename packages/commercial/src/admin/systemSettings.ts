@@ -132,6 +132,15 @@ export const KEY_SCHEMAS = {
   session_pin_mode: z.enum(["off", "observe", "enforce"]),
   /** V5 Auto-Dream background consolidator model; validated against the live catalog on write. */
   auto_dream_model: z.string().min(1).max(64),
+  /**
+   * P1 desktop virtual container hot switch. Default off.
+   * Ignored unless OC_DESKTOP_VIRTUAL_CONTAINER=1 (env fail-closed).
+   */
+  desktop_virtual_container: z.boolean(),
+  /** User ids allowed to enroll (admins always allowed). One uid per line in admin UI. */
+  desktop_allowlist: z
+    .array(z.string().trim().regex(/^[1-9][0-9]{0,18}$/))
+    .max(10_000),
 } as const;
 
 export type SystemSettingKey = keyof typeof KEY_SCHEMAS;
@@ -207,6 +216,8 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   // 如需回退观察:admin PUT /api/admin/settings/session_pin_mode = "observe"|"off"。
   session_pin_mode: "enforce",
   auto_dream_model: DEFAULT_AUTO_DREAM_MODEL,
+  desktop_virtual_container: false,
+  desktop_allowlist: [] as string[],
 };
 
 /**
@@ -289,6 +300,15 @@ export const KEY_META: Record<
   auto_dream_model: {
     kind: "model",
     description: "Auto-Dream 整理与全面优化模型（统一使用 active/public 的 MiniMax M3）",
+  },
+  desktop_virtual_container: {
+    kind: "boolean",
+    description: "桌面虚拟容器热开关(还需 OC_DESKTOP_VIRTUAL_CONTAINER=1)",
+  },
+  desktop_allowlist: {
+    kind: "string_array",
+    max: 10_000,
+    description: "允许 enrollment 的用户 uid 列表(admin 默认有权;一行一个)",
   },
 };
 

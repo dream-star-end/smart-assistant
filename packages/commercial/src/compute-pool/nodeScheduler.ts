@@ -62,6 +62,7 @@ async function bridgeCidrFromExisting(hostId: string): Promise<string | null> {
       WHERE host_uuid = $1
         AND bound_ip IS NOT NULL
         AND runtime_channel = $2
+        AND runtime_kind = 'docker'
       LIMIT 1`,
     // P1d:反推 CIDR 只从本 channel 容器取 —— 否则 v3 可能取到 v5 容器的 172.31 IP 推出错网段。
     [hostId, getRuntimeChannel()],
@@ -322,7 +323,8 @@ export async function pickBoundIp(hostId: string): Promise<{ boundIp: string; ci
       WHERE host_uuid = $1
         AND state = 'active'
         AND bound_ip IS NOT NULL
-        AND runtime_channel = $2`,
+        AND runtime_channel = $2
+        AND runtime_kind = 'docker'`,
     // P1d:已用 IP 集合按 channel —— v3 分配只避让 v3 已用 IP(v5 在 172.31 段,互不干涉)。
     [hostId, getRuntimeChannel()],
   );

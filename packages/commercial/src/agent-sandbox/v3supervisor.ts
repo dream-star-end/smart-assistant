@@ -1119,7 +1119,7 @@ export function readPlatformBundleOptionalFromEnv(): boolean {
  * provisionV3Container 的依赖注入。
  *
  * - `docker`:dockerode client(index.ts 单例)
- * - `pool`:pg Pool(用于 INSERT/UPDATE agent_containers,IP 唯一约束在 PG 层)
+ * - `pool`:pg Pool(用于 INSERT/UPDATE agent_containers runtime_kind='docker',IP 唯一约束在 PG 层)
  * - `image`:openclaude/openclaude-runtime:<tag>(由 OC_RUNTIME_IMAGE env 注入)
  *
  * `randomIp` / `randomSecret` 为可选注入,生产用 crypto 默认实现;
@@ -2045,9 +2045,9 @@ async function allocateBoundIpAndInsertRow(
   // 历史 NULL 行不 backfill:v3 ephemeral 容器在 lazy reprovision 时自然修复,
   // 残留 NULL 行均已 vanished / stopped,admin 不再操作。
   const insertSql = `INSERT INTO agent_containers
-       (user_id, host_uuid, bound_ip, secret_hash, state, port, image, runtime_channel, last_ws_activity, created_at, updated_at)
+       (user_id, host_uuid, bound_ip, secret_hash, state, port, image, runtime_channel, runtime_kind, last_ws_activity, created_at, updated_at)
      VALUES
-       ($1::bigint, $2::uuid, $3::inet, $4::bytea, 'active', $5::int, $6::text, $7::text, NOW(), NOW(), NOW())
+       ($1::bigint, $2::uuid, $3::inet, $4::bytea, 'active', $5::int, $6::text, $7::text, 'docker', NOW(), NOW(), NOW())
      RETURNING id`;
 
   // B.4: scheduler 已经为我们选好了 IP — 不 retry,冲突直接 NameConflict。
@@ -2301,7 +2301,7 @@ async function compensateProvisionFailure(
     await deps.pool.query(
       `UPDATE agent_containers
           SET state = 'vanished', updated_at = NOW()
-        WHERE id = $1 AND runtime_channel = $2`,
+        WHERE id = $1 AND runtime_channel = $2 AND runtime_kind = 'docker'`,
       [String(rowId), getRuntimeChannel()],
     );
   } catch (err) {
@@ -2534,6 +2534,7 @@ export async function provisionV3Container(
     const dupQ = await tx1Client.query<{ id: string }>(
       `SELECT id::text AS id FROM agent_containers
         WHERE user_id = $1::bigint AND state = 'active' AND runtime_channel = $2
+          AND runtime_kind = 'docker'
         LIMIT 1`,
       [String(uid), getRuntimeChannel()],
     );
@@ -2561,7 +2562,8 @@ export async function provisionV3Container(
       // P1a 隔离:host 容量计数按 channel(v3/v5 各算各的 active 数)。
       `SELECT
            (SELECT COUNT(*) FROM agent_containers
-             WHERE state = 'active' AND host_uuid = $1::uuid AND runtime_channel = $2)::text AS active,
+             WHERE state = 'active' AND host_uuid = $1::uuid AND runtime_channel = $2
+               AND runtime_kind = 'docker')::text AS active,
            (SELECT max_containers FROM compute_hosts WHERE id = $1::uuid)
              AS max_containers`,
       [effectiveHostUuid, getRuntimeChannel()],
@@ -3554,7 +3556,8 @@ export async function provisionV3Container(
           SET container_internal_id = $2,
               codex_account_id = $3,
               updated_at = NOW()
-        WHERE id = $1 AND state = 'active' AND runtime_channel = $4`,
+        WHERE id = $1 AND state = 'active' AND runtime_channel = $4
+          AND runtime_kind = 'docker'`,
       [
         String(row.id),
         createdDockerId,
@@ -3659,7 +3662,7 @@ export async function markV3ContainerVanished(
     `UPDATE agent_containers
         SET state='vanished',
             updated_at=NOW()
-      WHERE id = $1 AND runtime_channel = $2
+      WHERE id = $1 AND runtime_channel = $2 AND runtime_kind = 'docker'
         AND container_internal_id IS NOT DISTINCT FROM $3${guardSql}${idleSql}
       RETURNING host_uuid`,
     updateParams,
@@ -3798,7 +3801,7 @@ export async function cleanupV3ContainerDocker(
  * 优雅停止并删除一个 active 容器,把 row 标 vanished。
  *
  * 顺序(2026-04-21 codex round 1 finding #4 修复):
- *   1. UPDATE agent_containers SET state='vanished' WHERE id = $1 —— 优先落
+ *   1. UPDATE agent_containers SET state='vanished' WHERE id = $1 AND runtime_kind='docker' —— 优先落
  *      DB,因为这是 admin / idle sweep 的"权威意图":这个行就是要走。
  *      docker 实际清理是否成功是 best-effort;失败留半死容器也是 GC 兜的事
  *      (`v3volumeGc` 见到 vanished 行的 docker_id 还残留时再 force remove)
@@ -3928,6 +3931,7 @@ export async function markV3ContainerActivity(
 ): Promise<void> {
   if (!Number.isInteger(agentContainerId) || agentContainerId <= 0) return;
   try {
+    // lint-agent-containers-kind: allow — 按 id 刷心跳;desktop 隧道复用同一函数,不得加 kind
     await deps.pool.query(
       `UPDATE agent_containers
           SET last_ws_activity = NOW(),
@@ -3988,6 +3992,7 @@ export async function getV3ContainerStatus(
             created_at, last_ws_activity
        FROM agent_containers
       WHERE user_id = $1::bigint AND state='active' AND runtime_channel = $2::text
+        AND runtime_kind = 'docker'
         AND NOT EXISTS (
           SELECT 1 FROM agent_migrations m
            WHERE m.agent_container_id = agent_containers.id

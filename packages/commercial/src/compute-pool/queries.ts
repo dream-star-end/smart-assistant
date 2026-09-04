@@ -147,7 +147,8 @@ export async function listSchedulableHosts(): Promise<SchedulableHost[]> {
               (SELECT COUNT(*) FROM agent_containers ac
                 WHERE ac.host_uuid = compute_hosts.id
                   AND ac.state = 'active'
-                  AND ac.runtime_channel = $1),
+                  AND ac.runtime_channel = $1
+                  AND ac.runtime_kind = 'docker'),
               0
             )::text AS active_containers
        FROM compute_hosts, desired
@@ -189,7 +190,8 @@ export async function getSchedulableHostById(
               (SELECT COUNT(*) FROM agent_containers ac
                 WHERE ac.host_uuid = compute_hosts.id
                   AND ac.state = 'active'
-                  AND ac.runtime_channel = $2),
+                  AND ac.runtime_channel = $2
+                  AND ac.runtime_kind = 'docker'),
               0
             )::text AS active_containers
        FROM compute_hosts, desired
@@ -228,7 +230,8 @@ export async function listAllHostsWithCounts(): Promise<SchedulableHost[]> {
             COALESCE(
               (SELECT COUNT(*) FROM agent_containers ac
                 WHERE ac.host_uuid = compute_hosts.id
-                  AND ac.state = 'active'),
+                  AND ac.state = 'active'
+                  AND ac.runtime_kind = 'docker'),
               0
             )::text AS active_containers
        FROM compute_hosts
@@ -280,7 +283,8 @@ export async function listAllHostsForAdmin(
             COALESCE(
               (SELECT COUNT(*) FROM agent_containers ac
                 WHERE ac.host_uuid = compute_hosts.id
-                  AND ac.state = 'active'),
+                  AND ac.state = 'active'
+                  AND ac.runtime_kind = 'docker'),
               0
             )::text AS active_containers,
             COALESCE((${PLACEMENT_GATE_PREDICATE}), FALSE) AS placement_gate_open
@@ -303,7 +307,8 @@ export async function countActiveContainersOnHost(
   const r = await q.query<{ n: string }>(
     // P1a 隔离:容量计数按 channel —— v3 与 v5 各算各的 host active 数,互不计入。
     `SELECT COUNT(*)::text AS n FROM agent_containers
-      WHERE host_uuid = $1 AND state = 'active' AND runtime_channel = $2`,
+      WHERE host_uuid = $1 AND state = 'active' AND runtime_channel = $2
+        AND runtime_kind = 'docker'`,
     [hostUuid, getRuntimeChannel()],
   );
   return Number.parseInt(r.rows[0]!.n, 10);
@@ -342,6 +347,7 @@ export async function findActiveByHostAndBoundIp(
         AND host_uuid = $1
         AND bound_ip = $2
         AND runtime_channel = $3
+        AND runtime_kind = 'docker'
       LIMIT 1`,
     [hostUuid, boundIp, getRuntimeChannel()],
   );
@@ -1446,7 +1452,7 @@ export async function deleteHost(id: string): Promise<DeletedHostAuditSnapshot |
     const active = await client.query<{ n: string }>(
       `SELECT COUNT(*)::text AS n
          FROM agent_containers
-        WHERE host_uuid = $1 AND state='active'`,
+        WHERE host_uuid = $1 AND state='active' AND runtime_kind = 'docker'`,
       [id],
     );
     const n = active.rows[0]?.n ?? "0";
@@ -1530,6 +1536,7 @@ export async function findUserStickyHost(userId: number): Promise<{
        FROM agent_containers ac
        JOIN compute_hosts ch ON ch.id = ac.host_uuid
       WHERE ac.user_id = $1 AND ac.state='active' AND ac.runtime_channel = $2
+        AND ac.runtime_kind = 'docker'
       LIMIT 1`,
     // P1d:sticky host 解析按 channel —— 否则 sshMux/远程文件操作可能路由到对方 channel 的 host。
     [userId, getRuntimeChannel()],
@@ -1611,6 +1618,7 @@ export async function findUserDataHost(userId: number): Promise<{
         AND ac.state IN ('active', 'vanished')
         AND ac.host_uuid IS NOT NULL
         AND ac.runtime_channel = $2
+        AND ac.runtime_kind = 'docker'
       ORDER BY (ac.state = 'active') DESC,
                ac.created_at DESC,
                ac.id DESC
@@ -1651,6 +1659,7 @@ export async function userHasRunningContainer(userId: number): Promise<boolean> 
         AND state = 'active'
         AND container_internal_id IS NOT NULL
         AND runtime_channel = $2
+        AND runtime_kind = 'docker'
       LIMIT 1`,
     [userId, getRuntimeChannel()],
   );

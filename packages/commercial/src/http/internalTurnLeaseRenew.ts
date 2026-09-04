@@ -31,6 +31,10 @@ export interface TurnLeaseRenewHandlerDeps {
   getSigner: () => AuthoritySigner | undefined
   now?: () => number
   logger?: Logger
+  verify?: (
+    req: IncomingMessage,
+    ctx: { hostUuid: string; boundIp: string },
+  ) => Promise<import('../auth/containerIdentity.js').ContainerIdentity>
 }
 
 export interface TurnLeaseRenewHandlerCtx {
@@ -57,7 +61,9 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
 
     let identity: Awaited<ReturnType<typeof verifyContainerIdentity>>
     try {
-      identity = await verifyContainerIdentity(deps.identityRepo, ctx, req.headers.authorization)
+      identity = await (deps.verify
+        ? deps.verify(req, ctx)
+        : verifyContainerIdentity(deps.identityRepo, ctx, req.headers.authorization))
     } catch (err) {
       if (err instanceof ContainerIdentityError) {
         log.warn('turn_lease_renew_identity_failed', { requestId, errcode: err.code })

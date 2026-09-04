@@ -43,7 +43,13 @@ import { getPhase6AccountUuidEnforce, getSessionPinMode } from "../admin/runtime
 import { createPgIdentityRepo } from "../auth/containerIdentity.js";
 import { makeContainerIdentityStrategy } from "../auth/proxyIdentity.js";
 import { makeLoadUserModelAuthz } from "../auth/userModelAuthz.js";
-import { makeAnthropicProxyHandler } from "../http/anthropicProxy.js";
+import {
+  makeAnthropicProxyHandler,
+  ConcurrencyLimiter,
+  FallbackRateLimiter,
+  DEFAULT_PROXY_RATE_LIMIT,
+  DEFAULT_MAX_CONCURRENT_PER_UID,
+} from "../http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
 import { startLatencyProber } from "./latencyProber.js";
 import { startRecoveryProber } from "./recoveryProber.js";
@@ -76,6 +82,12 @@ import { CostEventSink } from "./costEventSink.js";
 import { makeForwarder } from "./forwarder.js";
 import { shutdownDurableMetricRollups } from "../admin/durableMetricRollups.js";
 import { computeListenPlan, type SlotHealthBody } from "./listenPlan.js";
+import { startDesktopTlsListener } from "../http/desktopTlsListener.js";
+import { createPgDesktopIdentityRepo } from "../http/desktopEnroll.js";
+import { makeDesktopIdentityStrategy } from "../auth/desktopIdentity.js";
+import { extractDesktopTlsContext } from "../desktop/tlsContext.js";
+import { getDesktopFlagSnapshot } from "../desktop/flags.js";
+import { sendJson } from "../http/util.js";
 
 const log = rootLogger.child({ subsys: "egressMain" });
 
@@ -209,6 +221,11 @@ export async function startEgress(): Promise<void> {
     executionRevision: modelCatalog.current().executionRevision.slice(0, 12),
   });
 
+  const sharedProxyConcurrency = new ConcurrencyLimiter(DEFAULT_MAX_CONCURRENT_PER_UID);
+  const sharedProxyFallback = new FallbackRateLimiter(
+    DEFAULT_PROXY_RATE_LIMIT.windowSeconds,
+    Math.max(1, Math.floor(DEFAULT_PROXY_RATE_LIMIT.max / 3)),
+  );
   const proxyHandler = makeAnthropicProxyHandler({
     pgPool: getPool(),
     pricing,
@@ -217,6 +234,8 @@ export async function startEgress(): Promise<void> {
     identity: identityStrategy,
     loadUserModelAuthz,
     rateLimitRedis,
+    concurrencyLimiter: sharedProxyConcurrency,
+    fallbackLimiter: sharedProxyFallback,
     modelCatalog,
     modelAuthorityEnforce,
     // 公钥 keyring(验签用)。每请求现取:轮换五步期间 ring 会变,闭包快照会认不出新签名。
@@ -505,12 +524,83 @@ export async function startEgress(): Promise<void> {
     console.log(`[egress] slot ${slot} health on 127.0.0.1:${listenPlan.privatePort}`);
   }
 
+  let desktopTlsClose: (() => Promise<void>) | undefined;
+  void (async () => {
+    const deskFlags = await getDesktopFlagSnapshot();
+    if (!deskFlags.assembled) return;
+    const deskRepo = createPgDesktopIdentityRepo();
+    const deskIdentity = makeDesktopIdentityStrategy({
+      repo: deskRepo,
+      tlsFromReq: (req) => extractDesktopTlsContext(req),
+      pricing,
+      loadUserModelAuthz,
+    });
+    const deskMessages = makeAnthropicProxyHandler({
+      pgPool: getPool(),
+      pricing,
+      preCheckRedis,
+      scheduler,
+      identity: deskIdentity,
+      loadUserModelAuthz,
+      rateLimitRedis,
+      runtimeKind: "desktop",
+      concurrencyLimiter: sharedProxyConcurrency,
+      fallbackLimiter: sharedProxyFallback,
+      modelCatalog,
+      modelAuthorityEnforce,
+      authorityKeyring: authorityKeyringProvider(),
+      refreshDeps: { health: healthTracker },
+      broadcastToUser: (uid, payload) => {
+        costSink.enqueue({ kind: "broadcast", uid: uid.toString(), payload: payload as Record<string, unknown> });
+      },
+      appendCostCredits: async (requestId, rawUserId, costCredits, sessionId, parentSessionId, delegateAgentId, turnKey, parentTurnKey) => {
+        await costSink.enqueueDurable({
+          kind: "persist",
+          requestId,
+          uid: rawUserId,
+          costCredits,
+          sessionId: sessionId ?? null,
+          parentSessionId: parentSessionId ?? null,
+          delegateAgentId: delegateAgentId ?? null,
+          turnKey: turnKey ?? null,
+          parentTurnKey: parentTurnKey ?? null,
+        });
+      },
+      staticProviderKeys,
+      getPhase6AccountUuidEnforce,
+      getSessionPinMode,
+      listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
+    });
+    const notOnEgress = async (_req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => {
+      sendJson(res, 404, { error: { code: "NOT_FOUND", message: "desktop internal path is served on master 18445" } });
+    };
+    const listener = await startDesktopTlsListener({
+      role: "egress",
+      allowRegister: false,
+      identityRepo: deskRepo,
+      handlers: {
+        messages: deskMessages,
+        serverAuthored: notOnEgress,
+        turnTape: notOnEgress,
+        turnLease: notOnEgress,
+        catalog: notOnEgress,
+      },
+    });
+    if (listener) {
+      desktopTlsClose = () => listener.close();
+      log.info("desktop_tls_egress_listening", listener.address);
+    }
+  })().catch((err) => {
+    log.warn("desktop_tls_egress_not_started", { err: (err as Error)?.message });
+  });
+
   let shuttingDown = false;
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
     latencyProber?.stop();
     recoveryProber?.stop();
+    void desktopTlsClose?.().catch(() => {});
     // eslint-disable-next-line no-console
     console.log(
       `[egress] SIGTERM — draining in-flight streams (max ${EGRESS_DRAIN_MS}ms)${slot ? ` slot ${slot}` : ""}…`,

@@ -144,7 +144,12 @@
     "0260_research_workspace",
     "0261_research_fetch_attempts",
     "0262_cursor_sand_usage_columns",
-    "0263_gpt6_astra_and_luna_public"
+    "0263_gpt6_astra_and_luna_public",
+    "0264_desktop_virtual_container",
+    "0265_desktop_kind_unique_index",
+    "0266_drop_user_channel_active",
+    "0267_turn_dispatches_agent_container",
+    "0268_desktop_session_secret_generation"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

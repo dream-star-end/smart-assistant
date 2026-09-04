@@ -38,6 +38,7 @@
 
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
+import { desktopAllowsEngine } from "./containerTransportKind.js";
 import { randomUUID, randomBytes } from "node:crypto";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { Pool } from "pg";
@@ -638,6 +639,11 @@ export type ResolveContainerEndpoint = (
     containerInternalId: string;
     nodeAgent: NodeAgentTarget;
   };
+  /**
+   * Desktop reverse-tunnel (P1). When set, bridge dials DesktopTunnelRegistry.openWs
+   * instead of host:port. Docker paths must not set this.
+   */
+  desktop?: { containerId: number };
   /**
    * 容器**实际运行**的 platform bundle rev(容器 label `com.openclaude.runtime.bundle_rev`;
    * v3ensureRunning 从 docker inspect labels / provision 实际打的 label 取,不是 master 的
@@ -1991,7 +1997,8 @@ export async function isCursorContainerOnSelfHost(
   if (!trustedHostId) return false;
   const eligible = await pgPool.query<{ ok: number }>(
     `SELECT 1 AS ok FROM agent_containers
-      WHERE id=$1 AND user_id=$2 AND state='active' AND host_uuid=$3::uuid`,
+      WHERE id=$1 AND user_id=$2 AND state='active' AND host_uuid=$3::uuid
+        AND runtime_kind = 'docker'`,
     [containerId, uid, trustedHostId],
   );
   return eligible.rowCount === 1;
@@ -2720,7 +2727,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const connectAbort = new AbortController();
         let containerWs: WebSocket;
         try {
-          if (endpoint.tunnel) {
+          if (endpoint.desktop) {
+            const { getDesktopTunnelRegistry } = await import("./desktopTunnelRegistry.js");
+            containerWs = getDesktopTunnelRegistry().openWs(endpoint.desktop.containerId, "/ws") as unknown as WebSocket;
+          } else if (endpoint.tunnel) {
             if (!deps.createTunnelContainerSocket) {
               // 部署级配置漏注 — 给 4503 让前端别死循环重连(会上报 alert 由 ensureRunning 路径)
               log?.error("user-chat-bridge: tunnel endpoint but factory not injected", {
@@ -2814,7 +2824,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   function startBridge(
     userWs: WebSocket,
     uid: bigint,
-    endpoint: { host: string; port: number; coldStart?: boolean; bundleRev?: string },
+    endpoint: { host: string; port: number; coldStart?: boolean; bundleRev?: string; desktop?: { containerId: number } },
     earlyMessages: Array<{ data: RawData; isBinary: boolean; receivedAtMs: number }>,
     /**
      * 可选 agent_containers.id。来自 ResolveContainerEndpoint;v3 supervisor
@@ -2995,7 +3005,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         sendErrorFrame(
           userWs,
           "CONTAINER_OUTDATED",
-          "运行环境需要更新,已自动重建,请刷新页面后重发",
+          endpoint.desktop
+            ? "请更新本地运行时后重连"
+            : "运行环境需要更新,已自动重建,请刷新页面后重发",
         );
         try {
           userWs.close(CLOSE_BRIDGE.ENV_RECYCLED, "model_authority_unsupported");
@@ -3302,6 +3314,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       if (cleaned) return null;
       const execIsCodex = exec.engine !== "ccb";
+      if (!desktopAllowsEngine(!!endpoint.desktop, exec.engine)) {
+        args.log?.info("user-chat-bridge: desktop rejects non-ccb engine", { engine: exec.engine });
+        return reject("ENGINE_NOT_ENABLED", "desktop runtime only supports the CCB engine");
+      }
       if (execIsCodex !== args.classifiedCodex) {
         args.log?.warn("user-chat-bridge: engine reclassified mid-turn", {
           model: args.model,
@@ -4442,6 +4458,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               billingRequestId,
               dispatchId,
               ownerId: connId,
+              agentContainerId: containerId ?? null,
+              runtimeKind: endpoint.desktop ? "desktop" : "docker",
               message,
               ...(validatedRecovery ? { recovery: validatedRecovery } : {}),
               ...(recoveryJob ? {

@@ -200,6 +200,10 @@ export interface CommercialHttpDeps {
    * 分开 deps.hupijiao 是为了允许 "callback 能 verify,但 create 暂未开"。
    */
   hupijiaoConfig?: Pick<HupijiaoConfig, "appSecret" | "appId">;
+  /** P1 desktop tunnel drop hook (mint/revoke). Default: process registry. */
+  desktopTunnelRegistry?: { drop(containerId: number, reason?: string): boolean };
+  /** Test/sim: supply peer device cert instead of TLS socket. */
+  desktopPeerCert?: (req: IncomingMessage) => { raw?: Buffer; subjectaltname?: string } | null;
   /** 限流配置覆盖(测试用) */
   rateLimits?: Partial<{
     register: RateLimitConfig;

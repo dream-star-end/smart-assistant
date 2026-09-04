@@ -60,6 +60,7 @@ export function serializeContainer(r: AdminContainerRowView): Record<string, unk
     // R3 finding 加固:R1#4 SQL 算出来的 v3 状态字段没在这里输出 → 前端
     // admin.js 取 c.row_kind/c.lifecycle 拿到 undefined,UI 显示 '?' / '—'。
     state: r.state,
+    runtime_kind: r.runtime_kind,
     lifecycle: r.lifecycle,
     row_kind: r.row_kind,
     last_started_at: r.last_started_at?.toISOString() ?? null,

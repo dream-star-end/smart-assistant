@@ -288,7 +288,7 @@ export async function getAgentAuditStats(input: {
   }>(
     `WITH expected AS (
        SELECT id FROM agent_containers
-        WHERE runtime_channel='v5' AND state='active'${expectedExtraWhere}
+        WHERE runtime_channel='v5' AND state='active' AND runtime_kind='docker'${expectedExtraWhere}
      ), latest_run AS (
        SELECT DISTINCT ON (r.container_id)
               r.container_id, r.reporter_run_id

@@ -958,7 +958,8 @@ export async function adminDeleteAccount(
     const activeCount = await query<{ c: string }>(
       `SELECT COUNT(*)::text AS c
        FROM agent_containers
-       WHERE codex_account_id = $1 AND state = 'active' AND runtime_channel = $2`,
+       WHERE codex_account_id = $1 AND state = 'active' AND runtime_channel = $2
+         AND runtime_kind = 'docker'`,
       [String(id), getRuntimeChannel()],
     );
     const n = Number(activeCount.rows[0]?.c ?? "0");
@@ -971,7 +972,8 @@ export async function adminDeleteAccount(
       await query(
         `UPDATE agent_containers
          SET codex_account_id = NULL
-         WHERE codex_account_id = $1 AND state <> 'active' AND runtime_channel = $2`,
+         WHERE codex_account_id = $1 AND state <> 'active' AND runtime_channel = $2
+           AND runtime_kind = 'docker'`,
         [String(id), getRuntimeChannel()],
       );
     }
