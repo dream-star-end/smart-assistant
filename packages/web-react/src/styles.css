@@ -75,7 +75,7 @@
   --text-caption--line-height: 1.45;
   /* 受限档:仅角标/序号等确无空间处。10px 与 10.5px 的存量任意值统一收编到本档
      (半像素差异不构成层次,只会制造不一致);新代码仍不得新增,优先用 caption。
-     ⚠️ 刻意不定义 --text-lg:16px —— Tailwind v4 默认主题的 text-lg(18px)已有 11 处
+     ⚠️ 刻意不把 text-lg 重定义为 16px(designTokens.test 也禁止)—— Tailwind v4 默认主题的 text-lg(18px)已有 11 处
      真实标题用法(admin PageHeader / MediaTaskCenter / MissionReplay / MemoryPanel),
      在这里覆盖成 16px 会把这些页面标题全部悄悄缩小。text-[16px] 存量保持任意值,
      待单独定名(如 --text-lead)后再收敛。 */

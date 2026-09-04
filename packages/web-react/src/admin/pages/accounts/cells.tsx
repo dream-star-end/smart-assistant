@@ -29,7 +29,7 @@ export function StatusBadge({ status }: { status: string }) {
 /** 小号内联百分比芯片(用于今日错误率 / 累计失败率)。 */
 function MiniChip({ tone, children }: { tone: Tone; children: React.ReactNode }) {
   return (
-    <Badge tone={tone} className="ml-1 px-1.5 py-0 text-[11px]">
+    <Badge tone={tone} className="ml-1 px-1.5 py-0 text-caption">
       {children}
     </Badge>
   );
@@ -47,7 +47,7 @@ export function QuotaCell({ pct, updatedAt }: { pct: number | null; updatedAt: s
   const label = `${num.toFixed(0)}%`;
   const title = updatedAt ? `更新: ${fmtDateTime(updatedAt)}${stale ? " (陈旧)" : ""}` : undefined;
   const inner = tone ? (
-    <Badge tone={tone} className="px-1.5 py-0 text-[11px]">
+    <Badge tone={tone} className="px-1.5 py-0 text-caption">
       {label}
     </Badge>
   ) : (
@@ -91,7 +91,7 @@ export function CooldownCell({ cooldownUntil }: { cooldownUntil: string | null }
   if (ms <= 0) {
     return (
       <Tooltip content={fmtDateTime(cooldownUntil)}>
-        <Badge tone="neutral" className="px-1.5 py-0 text-[11px]">
+        <Badge tone="neutral" className="px-1.5 py-0 text-caption">
           已过
         </Badge>
       </Tooltip>
@@ -101,7 +101,7 @@ export function CooldownCell({ cooldownUntil }: { cooldownUntil: string | null }
   const label = mins >= 60 ? `${Math.round(mins / 60)}h` : `${mins}m`;
   return (
     <Tooltip content={fmtDateTime(cooldownUntil)}>
-      <Badge tone="warning" className="px-1.5 py-0 text-[11px]">
+      <Badge tone="warning" className="px-1.5 py-0 text-caption">
         {label}
       </Badge>
     </Tooltip>
@@ -157,14 +157,14 @@ export function CursorPoolCell({ a }: { a: AccountRow }) {
       <span>{poolLabel}</span>
       <div className="flex flex-wrap gap-1">
         {a.cursor_sand_enabled ? (
-          <Badge tone="accent" className="w-fit px-1.5 py-0 text-[10px]">
+          <Badge tone="accent" className="w-fit px-1.5 py-0 text-micro">
             Sand
           </Badge>
         ) : null}
         {a.cursor_credential_kind === "session" ? (
           <Badge
             tone="neutral"
-            className="w-fit px-1.5 py-0 text-[10px]"
+            className="w-fit px-1.5 py-0 text-micro"
             title={a.cursor_auth_id ? `Cursor 账号登录会话 · ${a.cursor_auth_id}` : "Cursor 账号登录会话"}
           >
             账号会话
@@ -211,12 +211,12 @@ export function AccountWarningChips({ a }: { a: AccountRow }) {
       {chips.map((c) =>
         c.title ? (
           <Tooltip key={c.label} content={c.title}>
-            <Badge tone={c.tone} className="px-1.5 py-0 text-[11px]">
+            <Badge tone={c.tone} className="px-1.5 py-0 text-caption">
               {c.label}
             </Badge>
           </Tooltip>
         ) : (
-          <Badge key={c.label} tone={c.tone} className="px-1.5 py-0 text-[11px]">
+          <Badge key={c.label} tone={c.tone} className="px-1.5 py-0 text-caption">
             {c.label}
           </Badge>
         ),
@@ -228,7 +228,7 @@ export function AccountWarningChips({ a }: { a: AccountRow }) {
 /** 最近使用相对时间(空→—)。 */
 export function LastUsed({ iso }: { iso: string | null }) {
   if (!iso) return <span className="text-faint">—</span>;
-  return <TimeAgo value={iso} className="font-mono text-[12px]" />;
+  return <TimeAgo value={iso} className="font-mono text-meta" />;
 }
 
 /**
@@ -267,7 +267,7 @@ export function CursorSandUsageCell({ a }: { a: AccountRow }) {
     .join(" · ");
   return (
     <Tooltip content={title}>
-      <Badge tone={tone} className="px-1.5 py-0 text-[11px] tabular-nums">
+      <Badge tone={tone} className="px-1.5 py-0 text-caption tabular-nums">
         {num.toFixed(0)}%
       </Badge>
     </Tooltip>
@@ -282,10 +282,10 @@ export function CursorPlanCell({ a }: { a: AccountRow }) {
   if (!membership && !end) return <span className="text-faint">—</span>;
   return (
     <div className="flex flex-col gap-0.5 leading-tight">
-      {membership ? <span className="text-[12px]">{membership}</span> : null}
+      {membership ? <span className="text-meta">{membership}</span> : null}
       {end ? (
         <Tooltip content={`账期到期 ${fmtDateTime(end)}`}>
-          <span className="font-mono text-[11px] text-muted">
+          <span className="font-mono text-caption text-muted">
             <ResetCell resetsAt={end} />
           </span>
         </Tooltip>
