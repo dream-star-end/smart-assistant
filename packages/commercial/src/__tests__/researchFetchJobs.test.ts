@@ -173,6 +173,39 @@ describe('runFetchBatchJob', () => {
     assert.deepEqual(calls, ['a'])
   })
 
+  it('failed→requeue→成功 续跑后 records 无重复 id,summary 不计入陈旧 failed(auditor B1)', async () => {
+    // 第 1 轮:a failed、b fetched;第 2 轮(本轮)a 重跑成功。checkpoint 表 append-only,
+    // 两轮各留一行;若第 1 轮之前还有一次中断,a 会有多条 failed 旧行。
+    const cp = (o: FetchRecordOutcome): CheckpointRow => ({
+      phase: 'pdf_ingested',
+      status: 'pending',
+      output: { outcome: o },
+      error: null,
+      createdAt: new Date(),
+    })
+    const prior: CheckpointRow[] = [
+      cp({ id: 'a', status: 'failed', reason: 'timeout', attempts: [] }),
+      cp(outcome('b')),
+      cp({ id: 'a', status: 'failed', reason: 'fetch_error_5xx', attempts: [] }),
+    ]
+    const { ctx } = fakeCtx()
+    const deps: FetchJobHandlerDeps = {
+      readConfig: fetchEnabledCfg(),
+      listCheckpoints: async () => prior,
+      fetchOne: async (input) => outcome(input.record.id),
+    }
+    const summary = await runFetchBatchJob(
+      fakeJob({ mode: 'fetch', records: [{ id: 'a' }, { id: 'b' }] }),
+      ctx,
+      deps,
+    )
+    const ids = summary.records.map((r) => r.id).sort()
+    assert.deepEqual(ids, ['a', 'b'])
+    assert.equal(summary.records.find((r) => r.id === 'a')?.status, 'fetched')
+    assert.equal(summary.fetched, 2)
+    assert.equal(summary.failed, 0)
+  })
+
   it('配置中途关闭 → fail-loud 抛错(failJob)', async () => {
     const { ctx } = fakeCtx()
     const deps: FetchJobHandlerDeps = {

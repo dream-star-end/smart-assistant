@@ -892,8 +892,12 @@ function parseFetchRecords(raw: unknown, max: number): FetchRecordInput[] {
     if (!id || id.length > 300) continue;
     const rec: FetchRecordInput = { id };
     if (typeof o.title === "string" && o.title.trim()) rec.title = o.title.trim().slice(0, 1000);
-    if (typeof o.doi === "string" && o.doi.trim())
-      rec.doi = o.doi.trim().toLowerCase().slice(0, 512);
+    if (typeof o.doi === "string" && o.doi.trim()) {
+      // 形态校验:DOI 进 Europe PMC 查询语法(DOI:"…"),含引号/空白可改写查询取回
+      // 他篇文献并以本记录 id 入库(auditor W1);不合形态直接丢弃该字段(走 title/arxiv)。
+      const doi = o.doi.trim().toLowerCase().slice(0, 512);
+      if (/^10\.\d{4,}\/[^\s"]+$/.test(doi)) rec.doi = doi;
+    }
     if (typeof o.arxivId === "string" && o.arxivId.trim())
       rec.arxivId = o.arxivId.trim().slice(0, 64);
     if (o.oa && typeof o.oa === "object") {

@@ -59,17 +59,23 @@ export interface FetchJobHandlerDeps {
   recordAttempt?: (row: FetchAttemptRowInput) => Promise<void>
 }
 
-/** 从相位 checkpoint 恢复 pdf_ingested 已完成的单条结果(增量行,按序拼接)。 */
+/**
+ * 从相位 checkpoint 恢复 pdf_ingested 已完成的单条结果(增量行,按序拼接)。
+ * checkpoint 表 append-only,同一记录 failed→requeue→成功会留新旧两行;
+ * 按 id 去重保最后一条(listCheckpoints ORDER BY id ASC = 时序),避免续跑后
+ * result.records 出现自相矛盾的重复项、summary 计数虚高(auditor B1)。
+ */
 export function resumeOutcomes(checkpoints: CheckpointRow[]): FetchRecordOutcome[] {
-  const out: FetchRecordOutcome[] = []
+  const latest = new Map<string, FetchRecordOutcome>()
   for (const c of checkpoints) {
     if (c.phase !== 'pdf_ingested' || c.status !== 'pending') continue
     const o = c.output as { outcome?: FetchRecordOutcome } | null
     if (o && typeof o === 'object' && o.outcome && typeof o.outcome.id === 'string') {
-      out.push(o.outcome)
+      latest.delete(o.outcome.id)
+      latest.set(o.outcome.id, o.outcome)
     }
   }
-  return out
+  return [...latest.values()]
 }
 
 export async function runFetchBatchJob(
@@ -129,7 +135,8 @@ export async function runFetchBatchJob(
         recordAttempt: deps.recordAttempt ?? recordFetchAttempt,
       }))
 
-  const results: FetchRecordOutcome[] = [...prior]
+  // 只带入本轮跳过的(非 failed)旧结果;failed 的会重跑并追加新结果,避免同 id 双条。
+  const results: FetchRecordOutcome[] = prior.filter((r) => doneIds.has(r.id))
   for (const rec of records) {
     if (doneIds.has(rec.id)) continue
     const outcome = await fetchOne(

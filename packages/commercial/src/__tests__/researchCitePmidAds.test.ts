@@ -58,6 +58,17 @@ describe('parseIdentifier: pmid/ads 变体', () => {
     )
   })
 
+  it('ads: 前缀非 bibcode 形态(查询注入/含引号/长度不符)→ null(auditor W2)', () => {
+    assert.equal(parseIdentifier('ads:x" OR title:"y'), null)
+    assert.equal(parseIdentifier('ads:2015A&A...576A.135S" OR year:2020'), null)
+    assert.equal(parseIdentifier('ads:not-a-bibcode'), null)
+    assert.equal(parseIdentifier('ads:2015A&A...576A.135'), null) // 18 字符
+    assert.equal(
+      parseIdentifier('https://ui.adsabs.harvard.edu/abs/2015A%26A...576A.13/abstract'),
+      null,
+    )
+  })
+
   it('裸 19 字符 bibcode 含字母期刊代码 → ads;纯数字 19 字符不判 bibcode', () => {
     assert.deepEqual(parseIdentifier('2015A&A...576A.135S'), {
       scheme: 'ads',

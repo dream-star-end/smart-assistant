@@ -217,9 +217,10 @@ describe('researchProxy lit/fetch(flag 开)', () => {
       fetchImpl,
       store: mem.store,
     })
+    // DOI 需合法形态(10.<≥4 位>/…),否则 parseFetchRecords 丢弃 doi 字段(W1 校验)
     const records = Array.from({ length: 7 }, (_, i) => ({
-      id: `doi:10.1/x${i}`,
-      doi: `10.1/x${i}`,
+      id: `doi:10.1000/x${i}`,
+      doi: `10.1000/x${i}`,
     }))
     const { res, captured } = makeRes()
     await h(makeReq('POST', '/v3/research/lit/fetch', { records }), res, ctx)
@@ -312,6 +313,36 @@ describe('researchProxy lit/fetch-batch + job/status(flag 开)', () => {
     assert.equal(input.kind, 'research_task')
     assert.equal(input.payload.mode, 'fetch')
     assert.equal(input.payload.records.length, 1)
+  })
+
+  it('doi 形态校验:含引号/空白/非 10.NNNN 前缀的 doi 被丢弃,合法 doi 小写保留(auditor W1)', async () => {
+    const js = makeJobStore()
+    const h = makeResearchProxyHandler({
+      identityRepo: passingRepo(),
+      readConfig: fetchCfg(true),
+      jobStore: js.jobStore,
+    })
+    const { res, captured } = makeRes()
+    await h(
+      makeReq('POST', '/v3/research/lit/fetch-batch', {
+        records: [
+          { id: 'inj', doi: '10.1000/x" OR TITLE:"y' },
+          { id: 'ws', doi: '10.1000/a b' },
+          { id: 'short', doi: '10.1/a' },
+          { id: 'ok', doi: '10.1093/MNRAS/stz123' },
+        ],
+        requestId: 'doi-shape-1',
+      }),
+      res,
+      ctx,
+    )
+    assert.equal(captured.statusCode, 200)
+    const recs = (js.created[0] as any).payload.records as Array<{ id: string; doi?: string }>
+    assert.equal(recs.length, 4)
+    assert.equal(recs.find((r) => r.id === 'inj')?.doi, undefined)
+    assert.equal(recs.find((r) => r.id === 'ws')?.doi, undefined)
+    assert.equal(recs.find((r) => r.id === 'short')?.doi, undefined)
+    assert.equal(recs.find((r) => r.id === 'ok')?.doi, '10.1093/mnras/stz123')
   })
 
   it('同 requestId 重提且既有 job interrupted → requeue 后回 queued', async () => {

@@ -489,7 +489,9 @@ export async function downloadFulltext(
       attempts.push({
         source: 'proxy',
         code: 'proxy_unavailable',
-        detail: `proxy fetch unavailable for ${cfg.proxyUrl.slice(0, 120)}`,
+        // 不回显 proxyUrl:管理员级配置不经 attempts 泄回容器侧(auditor W5)
+        detail:
+          'proxy fetch unavailable (research_config fetch.proxyUrl invalid or undici missing)',
         ms: 0,
       })
     }

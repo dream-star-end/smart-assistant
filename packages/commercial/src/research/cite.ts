@@ -91,14 +91,16 @@ export function parseIdentifier(raw: string): ParsedId | null {
     return /^\d{1,9}$/.test(digits) ? { scheme: "pmid", id: digits } : null;
   }
   if (lower.startsWith("ads:")) {
+    // 前缀路径与裸路径同一把关:非 19 字符 bibcode 形态拒绝,防经 identifier:"…" 注入
+    // 任意 ADS 查询把他篇文献铸成 resolved verdict(auditor W2)。
     const bc = decodeSafe(s.slice(4).trim());
-    return bc ? { scheme: "ads", id: bc } : null;
+    return looksLikeBibcode(bc) ? { scheme: "ads", id: bc } : null;
   }
   // ADS abs URL:ui.adsabs.harvard.edu/abs/<bibcode>(路径里 & 会被编码成 %26,先捕后解码)
   const adsUrl = s.match(/ui\.adsabs\.harvard\.edu\/abs\/([A-Za-z0-9&.%]+)/i);
   if (adsUrl) {
     const bc = decodeSafe(adsUrl[1]);
-    if (bc.length === 19) return { scheme: "ads", id: bc };
+    if (looksLikeBibcode(bc)) return { scheme: "ads", id: bc };
   }
   // 裸 DOI
   if (/^10\.\d{4,}\//.test(s) || lower.includes("doi.org/")) {
