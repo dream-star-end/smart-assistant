@@ -79,6 +79,8 @@ const LOG_ALLOW_KEYS = new Set([
   'branch',
   'reason',
   'selected',
+  'pathname',
+  'candidateCount',
 ])
 
 /**
@@ -154,7 +156,8 @@ export function sanitizeZhihuWorkerLogEvent(
       key === 'hits' ||
       key === 'timeoutMs' ||
       key === 'textLen' ||
-      key === 'selected'
+      key === 'selected' ||
+      key === 'candidateCount'
     ) {
       if (typeof item === 'number' && Number.isFinite(item)) out[key] = Math.round(item)
       continue

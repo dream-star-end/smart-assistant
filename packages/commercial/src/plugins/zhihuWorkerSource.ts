@@ -65,10 +65,12 @@ function emitStep(event) {
       if (typeof event.step === 'string') payload.step = String(event.step).slice(0, 64);
       if (event.ok === true || event.ok === false) payload.ok = event.ok;
       if (typeof event.ms === 'number' && Number.isFinite(event.ms)) payload.ms = Math.round(event.ms);
+      if (typeof event.candidateCount === 'number' && Number.isFinite(event.candidateCount)) payload.candidateCount = Math.round(event.candidateCount);
       if (typeof event.code === 'string') payload.code = String(event.code).slice(0, 64);
       if (typeof event.actionId === 'string') payload.actionId = String(event.actionId).slice(0, 64);
       if (typeof event.branch === 'string') payload.branch = String(event.branch).slice(0, 32);
       if (typeof event.reason === 'string') payload.reason = String(event.reason).slice(0, 32);
+      if (typeof event.pathname === 'string') payload.pathname = String(event.pathname).slice(0, 96);
     }
     process.stderr.write(JSON.stringify(payload) + '\n');
   } catch {}
@@ -158,6 +160,16 @@ async function startRelay(token, allowedHosts) {
     close: () => new Promise((resolve) => server.close(() => resolve()))
   };
 }
+function cookieDomainAllowed(domain, domainSet) {
+  const canonical = String(domain || '').replace(/^\./, '').toLowerCase();
+  if (domainSet.has(canonical)) return true;
+  if (canonical.startsWith('www.') && domainSet.has(canonical.slice(4))) return true;
+  return false;
+}
+function isZhihuAuthHost(domain) {
+  const canonical = String(domain || '').replace(/^\./, '').toLowerCase();
+  return canonical === 'zhihu.com' || canonical === 'www.zhihu.com' || /\.zhihu\.com$/.test(canonical);
+}
 function filteredState(state, domains, origins) {
   const domainSet = new Set(domains);
   const originSet = new Set(origins);
@@ -174,7 +186,7 @@ function filteredState(state, domains, origins) {
     const domain = String(cookie && cookie.domain || '');
     const canonicalDomain = domain.replace(/^\./, '').toLowerCase();
     const key = canonicalDomain + '\0' + String(cookie && cookie.path || '') + '\0' + String(cookie && cookie.name || '');
-    if (!cookie || cookie.secure !== true || !domainSet.has(canonicalDomain) || cookieKeys.has(key)) continue;
+    if (!cookie || cookie.secure !== true || !cookieDomainAllowed(canonicalDomain, domainSet) || cookieKeys.has(key)) continue;
     cookieKeys.add(key);
     cookies.push({
       name: cookie.name, value: cookie.value, domain: cookie.domain, path: cookie.path,
@@ -245,23 +257,91 @@ async function isLoginVisible(page) {
   const qrTab = page.getByText('二维码登录', { exact: true }).first();
   return await login.isVisible().catch(() => false) && await qrTab.isVisible().catch(() => false);
 }
-async function selfTokenFromPage(page) {
-  const candidates = await page.locator('a[href]').evaluateAll((anchors) => {
+function peopleTokenFromPath(pathname) {
+  const match = /^\/people\/([A-Za-z0-9-]{1,64})(?:\/|$)/.exec(String(pathname || ''));
+  const token = match ? match[1] : null;
+  return token && token !== 'edit' ? token : null;
+}
+async function topBarPeopleTokens(page) {
+  return page.locator('a[href]').evaluateAll((anchors) => {
     const rows = [];
     for (const anchor of anchors) {
       const bounds = anchor.getBoundingClientRect();
       const style = getComputedStyle(anchor);
-      if (bounds.width <= 0 || bounds.height <= 0 || bounds.top < 0 || bounds.top > 96 || style.visibility !== 'visible' || style.display === 'none') continue;
+      if (bounds.width <= 0 || bounds.height <= 0 || bounds.top < 0 || bounds.top > 200 || style.visibility !== 'visible' || style.display === 'none') continue;
       let url;
       try { url = new URL(anchor.href, location.href); } catch { continue; }
       const match = /^\/people\/([A-Za-z0-9-]{1,64})(?:\/|$)/.exec(url.pathname);
-      if (!match) continue;
-      rows.push({ token: match[1], top: bounds.top, right: bounds.right, hasImg: !!anchor.querySelector('img') });
+      if (!match || match[1] === 'edit') continue;
+      rows.push(match[1]);
     }
-    rows.sort((a, b) => Number(b.hasImg) - Number(a.hasImg) || a.top - b.top || b.right - a.right);
-    return rows.map((row) => row.token);
-  });
-  const unique = Array.from(new Set(candidates));
+    return rows;
+  }).catch(() => []);
+}
+async function avatarMenuPeopleToken(page) {
+  try {
+    const clicked = await page.evaluate(() => {
+      const targets = [];
+      const seen = new Set();
+      for (const el of document.querySelectorAll('img, button, a, [role="button"]')) {
+        const bounds = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        if (bounds.width <= 0 || bounds.height <= 0 || bounds.top < 0 || bounds.top > 200) continue;
+        if (bounds.right < window.innerWidth - 280) continue;
+        if (style.visibility !== 'visible' || style.display === 'none') continue;
+        const hasImg = el.tagName === 'IMG' || !!el.querySelector('img');
+        if (!hasImg) continue;
+        const clickable = el.closest('a, button, [role="button"]') || el;
+        if (seen.has(clickable)) continue;
+        seen.add(clickable);
+        targets.push(clickable);
+      }
+      if (targets.length !== 1) return false;
+      targets[0].click();
+      return true;
+    });
+    if (!clicked) return null;
+    await page.waitForTimeout(500);
+    const tokens = await page.locator('a[href*="/people/"]').evaluateAll((anchors) => {
+      const rows = [];
+      for (const anchor of anchors) {
+        const text = (anchor.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!/我的主页/.test(text)) continue;
+        const bounds = anchor.getBoundingClientRect();
+        const style = getComputedStyle(anchor);
+        if (bounds.width <= 0 || bounds.height <= 0 || style.visibility !== 'visible' || style.display === 'none') continue;
+        let url;
+        try { url = new URL(anchor.href, location.href); } catch { continue; }
+        const match = /^\/people\/([A-Za-z0-9-]{1,64})(?:\/|$)/.exec(url.pathname);
+        if (!match || match[1] === 'edit') continue;
+        rows.push(match[1]);
+      }
+      return rows;
+    });
+    const unique = Array.from(new Set(tokens));
+    return unique.length === 1 ? unique[0] : null;
+  } catch {
+    return null;
+  }
+}
+async function editRedirectPeopleToken(page) {
+  try {
+    await page.goto('https://www.zhihu.com/people/edit', { waitUntil: 'domcontentloaded', timeout: 20_000 });
+    await page.waitForTimeout(800);
+    return peopleTokenFromPath(new URL(page.url()).pathname);
+  } catch {
+    return null;
+  }
+}
+async function selfTokenFromPage(page) {
+  const found = [];
+  const topBar = Array.from(new Set(await topBarPeopleTokens(page)));
+  if (topBar.length === 1) found.push(topBar[0]);
+  const menu = await avatarMenuPeopleToken(page);
+  if (menu) found.push(menu);
+  const redirected = await editRedirectPeopleToken(page);
+  if (redirected) found.push(redirected);
+  const unique = Array.from(new Set(found));
   return unique.length === 1 ? unique[0] : null;
 }
 async function gotoAuthenticated(page, url) {
@@ -1130,21 +1210,34 @@ async function switchToQrLogin(page) {
 }
 async function authCookieDigest(context) {
   const rows = (await context.cookies())
-    .filter((cookie) => ['z_c0', 'q_c1', 'd_c0', '_xsrf'].includes(cookie.name) && /(?:^|\.)zhihu\.com$/.test(cookie.domain.replace(/^\./, '')))
+    .filter((cookie) => ['z_c0', 'q_c1', 'd_c0', '_xsrf'].includes(cookie.name) && isZhihuAuthHost(cookie.domain))
     .map((cookie) => cookie.domain + '\0' + cookie.name + '\0' + cookie.value).sort();
   return digest(rows);
+}
+function urlPathname(raw) {
+  try { return new URL(raw).pathname.slice(0, 96); } catch { return ''; }
 }
 async function proveSelf(context) {
   const page = await context.newPage();
   try {
     await gotoAuthenticated(page, 'https://www.zhihu.com/');
+    const topBar = await topBarPeopleTokens(page);
     const first = await selfTokenFromPage(page);
-    if (!first) return null;
+    if (!first) {
+      emitStep({ step: 'login.prove_self', ok: false, reason: 'home-no-unique-token', candidateCount: Array.from(new Set(topBar)).length });
+      return null;
+    }
     await gotoAuthenticated(page, 'https://www.zhihu.com/people/' + first);
-    const current = urlTokenOf(page.url()) || await selfTokenFromPage(page);
-    if (current !== first) return null;
+    const current = peopleTokenFromPath(new URL(page.url()).pathname) || await selfTokenFromPage(page);
+    if (current !== first) {
+      emitStep({ step: 'login.prove_self', ok: false, reason: 'people-page-token-mismatch' });
+      return null;
+    }
     const profile = await projectProfile(page, first).catch(() => null);
-    if (!profile || !profile.urlToken) return null;
+    if (!profile || !profile.urlToken) {
+      emitStep({ step: 'login.prove_self', ok: false, reason: 'profile-projection-null' });
+      return null;
+    }
     return first;
   } catch { return null; }
   finally { await page.close().catch(() => {}); }
@@ -1165,6 +1258,7 @@ async function runLogin(input, relay) {
     const initialCookies = await authCookieDigest(context);
     let nextQr = Date.now() + QR_REFRESH_MS;
     let nextProbe = 0;
+    let signalEmitted = false;
     while (Date.now() < input.deadlineMs) {
       await assertNoChallenge(home);
       if (Date.now() >= nextQr) {
@@ -1177,10 +1271,22 @@ async function runLogin(input, relay) {
             qrHash = freshHash;
             png = fresh;
             writeFrame({ event: 'qr', png: png.toString('base64') });
+            emitStep({ step: 'login.qr_refresh' });
           }
         }
       }
-      const signal = (await authCookieDigest(context)) !== initialCookies || !/\/signin/.test(home.url());
+      const cookieChanged = (await authCookieDigest(context)) !== initialCookies;
+      const leftSignin = !/\/signin/.test(home.url());
+      const signal = cookieChanged || leftSignin;
+      if (signal && !signalEmitted) {
+        signalEmitted = true;
+        emitStep({
+          step: 'login.signal',
+          ok: true,
+          reason: cookieChanged ? 'cookie-changed' : 'url-left-signin',
+          pathname: urlPathname(home.url())
+        });
+      }
       if (signal && Date.now() >= nextProbe) {
         nextProbe = Date.now() + 5_000;
         const selfId = await proveSelf(context);

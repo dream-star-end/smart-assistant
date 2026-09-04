@@ -276,6 +276,7 @@ describe('Zhihu managed setup', () => {
         sessionId: string
         onQr: (png: Buffer) => void
         onAuthenticated: (state: unknown) => void
+        onStep?: (step: Record<string, unknown>) => void
       }) {
         callbacks = args
         return {

@@ -79,6 +79,17 @@ describe('Zhihu write failure mapping', () => {
       step: 'action.start',
       ok: true,
     })
+    assert.deepEqual(
+      sanitizeZhihuWorkerLogLine(
+        '{"step":"login.signal","reason":"cookie-changed","pathname":"/","candidateCount":0,"z_c0":"leak"}',
+      ),
+      {
+        step: 'login.signal',
+        reason: 'cookie-changed',
+        pathname: '/',
+        candidateCount: 0,
+      },
+    )
     const dir = await mkdtemp(join(tmpdir(), 'zhihu-obs-'))
     try {
       await persistZhihuWorkerLog(dir, '12345678-aaaa-bbbb-cccc-1234567890ab', {

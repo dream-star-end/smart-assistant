@@ -497,6 +497,7 @@ export class ZhihuDockerService {
     deadlineMs: number
     input: Record<string, unknown>
     onEvent?: (event: WorkerEvent) => void
+    onStep?: (step: Record<string, unknown>) => void
     signal?: AbortSignal
     beforeDispatch?: () => Promise<void>
     inputDirectory?: string
@@ -519,6 +520,7 @@ export class ZhihuDockerService {
     deadlineMs: number
     input: Record<string, unknown>
     onEvent?: (event: WorkerEvent) => void
+    onStep?: (step: Record<string, unknown>) => void
     signal?: AbortSignal
     beforeDispatch?: () => Promise<void>
     inputDirectory?: string
@@ -732,7 +734,10 @@ export class ZhihuDockerService {
           stderrRemainder = lines.pop() ?? ''
           for (const line of lines) {
             const sanitized = sanitizeZhihuWorkerLogLine(line)
-            if (sanitized) this.writeWorkerLog(sessionId, sanitized)
+            if (sanitized) {
+              this.writeWorkerLog(sessionId, sanitized)
+              args.onStep?.(sanitized)
+            }
           }
           if (stderrBytes > WORKER_STDERR_MAX_BYTES) void current.kill().catch(() => {})
           callback()
@@ -880,6 +885,7 @@ export class ZhihuDockerService {
     onQr: (png: Buffer) => void
     onAuthenticated: (storageState: unknown) => void
     onFailed: (code: string) => void
+    onStep?: (step: Record<string, unknown>) => void
   }): Promise<ZhihuLoginWorkerHandle> {
     const worker = await this.startWorker({
       key: `login:${args.sessionId}`,
@@ -897,6 +903,7 @@ export class ZhihuDockerService {
         else if (event.event === 'authenticated') args.onAuthenticated(event.storageState)
         else if (event.event === 'failed') args.onFailed(event.code)
       },
+      ...(args.onStep ? { onStep: args.onStep } : {}),
     })
     return {
       sessionId: args.sessionId,

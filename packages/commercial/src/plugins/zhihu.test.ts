@@ -75,6 +75,24 @@ function compileWorkerChallengeHarness(writeTerminalAndExit: (event: unknown) =>
   ) as ReturnType<typeof compileWorkerChallengeHarness>
 }
 
+function compileFilteredStateHarness(): {
+  cookieDomainAllowed(domain: string, domainSet: Set<string>): boolean
+  isZhihuAuthHost(domain: string): boolean
+  filteredState(
+    state: unknown,
+    domains: string[],
+    origins: string[],
+  ): { cookies: Array<{ name: string; domain: string }>; origins: unknown[] }
+} {
+  const start = ZHIHU_WORKER_SOURCE.indexOf('function cookieDomainAllowed')
+  const end = ZHIHU_WORKER_SOURCE.indexOf('function digest(value)')
+  assert.ok(start >= 0 && end > start)
+  return new Function(
+    `'use strict'; ${ZHIHU_WORKER_SOURCE.slice(start, end)}
+      return { cookieDomainAllowed, isZhihuAuthHost, filteredState };`,
+  )() as ReturnType<typeof compileFilteredStateHarness>
+}
+
 function compileSnapshotGuardHarness(
   writeTerminalAndExit: (event: unknown) => Promise<void>,
 ): {
@@ -425,6 +443,68 @@ describe('official Zhihu Plugin', () => {
     assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /__reactFiber/)
     assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /__INITIAL_STATE__/)
     assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /api\.zhihu\.com/)
+  })
+
+  test('login loop emits non-secret step names for scan diagnosis', () => {
+    assert.match(ZHIHU_WORKER_SOURCE, /step: 'login\.signal'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /cookie-changed/)
+    assert.match(ZHIHU_WORKER_SOURCE, /url-left-signin/)
+    assert.match(ZHIHU_WORKER_SOURCE, /step: 'login\.prove_self'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /home-no-unique-token/)
+    assert.match(ZHIHU_WORKER_SOURCE, /people-page-token-mismatch/)
+    assert.match(ZHIHU_WORKER_SOURCE, /profile-projection-null/)
+    assert.match(ZHIHU_WORKER_SOURCE, /step: 'login\.qr_refresh'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /https:\/\/www\.zhihu\.com\/people\/edit/)
+    assert.match(ZHIHU_WORKER_SOURCE, /我的主页/)
+    assert.match(ZHIHU_WORKER_SOURCE, /bounds\.top > 200/)
+    assert.match(ZHIHU_WORKER_SOURCE, /isZhihuAuthHost/)
+    assert.match(ZHIHU_WORKER_SOURCE, /canonical === 'www\.zhihu\.com'/)
+  })
+
+  test('filteredState keeps z_c0 from both .zhihu.com and www.zhihu.com', () => {
+    const { cookieDomainAllowed, isZhihuAuthHost, filteredState } = compileFilteredStateHarness()
+    const allowed = new Set(['zhihu.com', 'zhuanlan.zhihu.com', 'zhimg.com'])
+    assert.equal(cookieDomainAllowed('zhihu.com', allowed), true)
+    assert.equal(cookieDomainAllowed('.zhihu.com', allowed), true)
+    assert.equal(cookieDomainAllowed('www.zhihu.com', allowed), true)
+    assert.equal(cookieDomainAllowed('example.com', allowed), false)
+    assert.equal(isZhihuAuthHost('.zhihu.com'), true)
+    assert.equal(isZhihuAuthHost('www.zhihu.com'), true)
+    assert.equal(isZhihuAuthHost('zhihu.com'), true)
+    assert.equal(isZhihuAuthHost('zhuanlan.zhihu.com'), true)
+    assert.equal(isZhihuAuthHost('example.com'), false)
+    const cookie = (
+      name: string,
+      domain: string,
+      extra: Record<string, unknown> = {},
+    ) => ({
+      name,
+      value: 'secret',
+      domain,
+      path: '/',
+      expires: -1,
+      httpOnly: true,
+      secure: true,
+      sameSite: 'Lax',
+      ...extra,
+    })
+    const state = filteredState(
+      {
+        cookies: [
+          cookie('z_c0', '.zhihu.com'),
+          cookie('z_c0', 'www.zhihu.com'),
+          cookie('z_c0', '.zhihu.com', { secure: false }),
+          cookie('z_c0', 'attacker.example'),
+        ],
+        origins: [],
+      },
+      [...allowed],
+      ['https://www.zhihu.com'],
+    )
+    assert.deepEqual(
+      state.cookies.map((row) => `${row.domain}:${row.name}`).sort(),
+      ['.zhihu.com:z_c0', 'www.zhihu.com:z_c0'],
+    )
   })
 
   test('mismatched edit/delete snapshots fail closed as PRECONDITION_CHANGED', async () => {
