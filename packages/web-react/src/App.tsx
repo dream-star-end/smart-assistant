@@ -713,6 +713,14 @@ export function App() {
       const sid = activeId;
       const commit = (modelSwitchId?: string) => {
         if (activeModelSwitchSessionRef.current === sid) setModelId(id);
+        // 成功反馈只挂用户主动切换路径:boot 恢复模型偏好走上方 resolveSessionModel 的
+        // setModelId,不经过 commit,不会误报。失败面已有 toast(压缩失败)或 server-wins
+        // 盖回,成功此前静默;压缩切换(prepareModelSwitch)带明确等待,给压缩语义文案。
+        const displayName = models.find((m) => m.id === id)?.display_name ?? id;
+        toast(
+          modelSwitchId ? `已压缩上下文并切换到 ${displayName}` : `已切换到 ${displayName}`,
+          "success",
+        );
         if (demo) return;
         if (!sid) return;
         setSessions((c) => c.map((s) => (s.id === sid ? { ...s, modelId: id } : s)));
