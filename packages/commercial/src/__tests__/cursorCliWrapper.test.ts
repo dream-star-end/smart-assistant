@@ -820,6 +820,38 @@ describe('oc-cursor wrapper', () => {
     assert.match(blocked.stderr, /model is not allowlisted/)
   })
 
+  test('accepts the Gemini 3.8 Flash upstream ids and rejects unlisted siblings', () => {
+    const f = fixture()
+    for (const model of [
+      'gemini-3.8-flash-low',
+      'gemini-3.8-flash-medium',
+      'gemini-3.8-flash-high',
+    ]) {
+      const result = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, result.stderr)
+    }
+    // Only the three catalogued 3.8 efforts are allowlisted: no Fast twin,
+    // no xhigh, and no other Gemini generation (3.7 / 3.6 / 3.1 Pro).
+    for (const model of [
+      'gemini-3.8-flash-high-fast',
+      'gemini-3.8-flash-xhigh',
+      'gemini-3.7-flash-high',
+      'gemini-3.1-pro',
+    ]) {
+      const blocked = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(blocked.status, 2, model)
+      assert.match(blocked.stderr, /model is not allowlisted/)
+    }
+  })
+
   test('does not assume an undocumented Cursor API-key prefix', () => {
     const f = fixture()
     const key = 'cursor-key.with-punctuation=='

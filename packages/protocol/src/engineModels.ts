@@ -231,6 +231,7 @@ export type CursorEngineFamilyId =
   | 'opus-4.8'
   | 'fable-5'
   | 'fable-5.1'
+  | 'gemini-3.8-flash'
   | 'grok-4.5'
 
 export const CURSOR_ENGINE_MODELS = [
@@ -692,6 +693,36 @@ export const CURSOR_ENGINE_MODELS = [
     family: 'fable-5.1',
     familyLabel: 'Fable 5.1',
     effort: 'max',
+    fast: false,
+  },
+  // Gemini 3.8 Flash: pinned CLI `--list-models` (2026-09-04) exposes exactly
+  // gemini-3.8-flash-{low,medium,high}; no Fast, xhigh or max variants exist,
+  // so none are catalogued.
+  {
+    id: 'cursor-gemini-3.8-flash-low',
+    displayName: 'Gemini 3.8 Flash Low',
+    upstreamModel: 'gemini-3.8-flash-low',
+    family: 'gemini-3.8-flash',
+    familyLabel: 'Gemini 3.8 Flash',
+    effort: 'low',
+    fast: false,
+  },
+  {
+    id: 'cursor-gemini-3.8-flash-medium',
+    displayName: 'Gemini 3.8 Flash Medium',
+    upstreamModel: 'gemini-3.8-flash-medium',
+    family: 'gemini-3.8-flash',
+    familyLabel: 'Gemini 3.8 Flash',
+    effort: 'medium',
+    fast: false,
+  },
+  {
+    id: 'cursor-gemini-3.8-flash-high',
+    displayName: 'Gemini 3.8 Flash High',
+    upstreamModel: 'gemini-3.8-flash-high',
+    family: 'gemini-3.8-flash',
+    familyLabel: 'Gemini 3.8 Flash',
+    effort: 'high',
     fast: false,
   },
   {

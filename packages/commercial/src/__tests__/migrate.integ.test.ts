@@ -198,6 +198,9 @@ describe("migrate.runMigrations", () => {
          FROM model_catalog c
          JOIN model_pricing p ON p.model_id = c.model_id
         WHERE c.engine = 'cursor'
+          -- 0258 re-versions Opus/Fable rows through fn_model_switch_version,
+          -- leaving retired lineage entries; the snapshot tracks the live row.
+          AND c.state <> 'retired'
         ORDER BY c.model_id COLLATE "C"`,
     );
     assert.deepEqual(cursorModels.rows, [
@@ -214,6 +217,9 @@ describe("migrate.runMigrations", () => {
       { model_id: "cursor-fable-5.1-max", upstream_model_id: "claude-fable-5-1-thinking-max", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-fable-5.1-medium", upstream_model_id: "claude-fable-5-1-thinking-medium", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-fable-5.1-xhigh", upstream_model_id: "claude-fable-5-1-thinking-xhigh", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-gemini-3.8-flash-high", upstream_model_id: "gemini-3.8-flash-high", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-gemini-3.8-flash-low", upstream_model_id: "gemini-3.8-flash-low", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-gemini-3.8-flash-medium", upstream_model_id: "gemini-3.8-flash-medium", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-grok-4.5-high", upstream_model_id: "cursor-grok-4.5-high", state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-grok-4.6-high", upstream_model_id: "cursor-grok-4.6-high", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-grok-4.6-high-fast", upstream_model_id: "cursor-grok-4.6-high-fast", state: "active", enabled: true, visibility: "public" },

@@ -25,6 +25,8 @@ const CURSOR_PUBLIC: PublicModel[] = [
   { id: 'cursor-fable-5-high', display_name: 'Fable 5 High (Non-ZDR)' },
   { id: 'cursor-fable-5.1-high', display_name: 'Fable 5.1 High (Non-ZDR)' },
   { id: 'cursor-fable-5.1-max', display_name: 'Fable 5.1 Max (Non-ZDR)' },
+  { id: 'cursor-gemini-3.8-flash-medium', display_name: 'Gemini 3.8 Flash Medium' },
+  { id: 'cursor-gemini-3.8-flash-high', display_name: 'Gemini 3.8 Flash High' },
 ]
 
 function rowKey(row: ReturnType<typeof modelPickerRows>[number]): string {
@@ -44,7 +46,23 @@ describe('cursorModelPicker', () => {
       'opus-4.8',
       'fable-5',
       'fable-5.1',
+      'gemini-3.8-flash',
     ])
+  })
+
+  it('drops Fast when switching from Grok Fast onto Gemini 3.8 Flash and keeps effort', () => {
+    const gemini = CURSOR_PUBLIC.filter((m) => m.id.startsWith('cursor-gemini-3.8-flash'))
+    expect(
+      resolveCursorPickerSelection(gemini, 'gemini-3.8-flash', 'cursor-grok-4.6-high-fast'),
+    ).toBe('cursor-gemini-3.8-flash-high')
+    // Fable Max has no Gemini twin (no max tier) -> fall back to the family default High.
+    expect(resolveCursorPickerSelection(gemini, 'gemini-3.8-flash', 'cursor-fable-5.1-max')).toBe(
+      'cursor-gemini-3.8-flash-high',
+    )
+    // Requesting Fast on a family without Fast rows lands on the non-Fast twin.
+    expect(pickCursorPublicModel(gemini, 'gemini-3.8-flash', 'high', true)?.id).toBe(
+      'cursor-gemini-3.8-flash-high',
+    )
   })
 
   it('drops Fast when switching from Grok Fast onto Fable 5.1 (family without Fast)', () => {

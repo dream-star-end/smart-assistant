@@ -74,7 +74,7 @@ describe('GPT-5.6 engine model authority', () => {
 
 describe('Cursor engine model authority', () => {
   test('pins CLI families with effort/fast metadata and excludes GPT/Codex entries', () => {
-    assert.equal(CURSOR_ENGINE_MODELS.length, 52)
+    assert.equal(CURSOR_ENGINE_MODELS.length, 55)
     assert.equal(CURSOR_ENGINE_MODELS[0].id, 'cursor-auto')
     assert.deepEqual(
       CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),
@@ -133,6 +133,19 @@ describe('Cursor engine model authority', () => {
       'claude-fable-5-1-thinking-high',
     )
     assert.equal(findCursorEngineModel('fable-5.1', 'high', true), undefined)
+    assert.equal(cursorFamilySupportsFast('gemini-3.8-flash'), false)
+    assert.deepEqual(cursorFamilyEfforts('gemini-3.8-flash'), ['low', 'medium', 'high'])
+    assert.equal(
+      findCursorEngineModel('gemini-3.8-flash', 'high', false)?.upstreamModel,
+      'gemini-3.8-flash-high',
+    )
+    assert.equal(findCursorEngineModel('gemini-3.8-flash', 'xhigh', false), undefined)
+    assert.equal(findCursorEngineModel('gemini-3.8-flash', 'high', true), undefined)
+    assert.equal(
+      CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-gemini-3.8-flash-medium')?.displayName,
+      'Gemini 3.8 Flash Medium',
+    )
+    assert.equal(cursorFamilySupportsContextTier('gemini-3.8-flash'), false)
     assert.equal(cursorFamilyDefaultFast('composer-2.5'), false)
     assert.equal(cursorFamilyDefaultFast('grok-4.6'), false)
     assert.equal(modelReasoningPolicy('cursor-grok-4.6-high').supported.length, 0)
@@ -146,6 +159,8 @@ describe('Cursor engine model authority', () => {
     assert.equal(cursorCredentialModelFamily('cursor-opus-5-high'), 'other_models')
     assert.equal(cursorCredentialModelFamily('claude-fable-5-thinking-high'), 'other_models')
     assert.equal(cursorCredentialModelFamily('cursor-fable-5.1-high'), 'other_models')
+    assert.equal(cursorCredentialModelFamily('cursor-gemini-3.8-flash-high'), 'other_models')
+    assert.equal(cursorCredentialModelFamily('gemini-3.8-flash-low'), 'other_models')
   })
 })
 
