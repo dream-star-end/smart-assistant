@@ -3255,8 +3255,10 @@ export function App() {
               />
             </div>
           )}
-          {/* WS 连接状态条三态（离线 / 环境启动中 / 服务端重连中，见 deriveConnBanner）。仅非 demo。*/}
-          {!gated && connBanner && (
+          {/* WS 连接状态条三态（离线 / 环境启动中 / 服务端重连中，见 deriveConnBanner）。仅非 demo。
+              移动端(< md)软键盘弹出会压缩可视视口,流式布局里的横幅会被顶出屏幕;改走
+              Composer 的 banner 插槽钉在输入框上方,始终可见。桌面(md+)保持原流式位置。 */}
+          {!gated && connBanner && isMdViewport && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert tone={connBanner.tone}>{connBanner.text}</Alert>
             </div>
@@ -3282,6 +3284,13 @@ export function App() {
             stopping={activeSess?._recoveryStatus?.kind === "stopping"}
             onStop={stopTurn}
             disabled={gated}
+            banner={
+              !gated && connBanner && !isMdViewport ? (
+                <div className="mb-2">
+                  <Alert tone={connBanner.tone}>{connBanner.text}</Alert>
+                </div>
+              ) : undefined
+            }
             placeholder={`和「${agent.name}」对话…`}
             onUpload={demo ? undefined : uploadMedia}
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}

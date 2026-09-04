@@ -3,7 +3,7 @@ import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
 import type { MessageReplyQuote } from "@openclaude/protocol";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { ArrowUp, FileText, Loader2, Mic, Paperclip, Pencil, Plus, RotateCcw, Square, Target, X } from "lucide-react";
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
@@ -63,6 +63,7 @@ export function Composer({
   stopping,
   onStop,
   disabled,
+  banner,
   placeholder = "给从简发消息…",
   onUpload,
   getVoiceToken,
@@ -82,6 +83,9 @@ export function Composer({
   stopping?: boolean;
   onStop?: () => void;
   disabled?: boolean;
+  /** 状态横幅插槽(渲染在输入框上方,Composer 根容器内)。移动端软键盘压缩视口时,
+   *  外部流式布局里的横幅会被顶出可视区;挪进 Composer 让它钉在输入框旁始终可见。 */
+  banner?: ReactNode;
   placeholder?: string;
   /** 上传单文件 → MediaRef（demo / 未登录省略 → 附件入口禁用）。 */
   onUpload?: (file: File) => Promise<MediaRef>;
@@ -294,6 +298,7 @@ export function Composer({
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4">
+      {banner}
       {visibleGoal && canGoal && (
         <button
           type="button"
