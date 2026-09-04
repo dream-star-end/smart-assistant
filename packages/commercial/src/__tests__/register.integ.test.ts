@@ -188,9 +188,16 @@ describe("auth.register (integ)", () => {
     //   (a) 含 6 位数字验证码(四空格缩进行)
     //   (b) 主动提示检查垃圾邮件箱(boss 明确要求)
     //   (c) 不再出现 http/https 链接(别再留旧模板残骸混淆用户)
+    // 2026-09-04 OCV5-97:文案补全过期重发/勿转发/落款;subject 不含验证码。
+    assert.equal(mailer.sent[0].subject, "[OpenClaude] 邮箱验证码 · 完成注册");
+    assert.doesNotMatch(mailer.sent[0].subject, /\d{6}/, "subject 不得含验证码");
     assert.match(mailer.sent[0].text, /\n {4}(\d{6})\n/, "邮件必须含 6 位验证码");
     assert.match(mailer.sent[0].text, /垃圾邮件|Spam/, "邮件必须提示检查垃圾邮箱");
     assert.doesNotMatch(mailer.sent[0].text, /https?:\/\//, "不应再有 URL 链接");
+    assert.match(mailer.sent[0].text, /重新发送/, "须提示过期后可重新发送");
+    assert.match(mailer.sent[0].text, /不要把验证码转发/, "须提示勿转发验证码");
+    assert.match(mailer.sent[0].text, /账号不会被激活/);
+    assert.match(mailer.sent[0].text, /—— OpenClaude 团队\nclaudeai\.chat/);
     // 邮件正文中的 raw code 不能等于 DB 里的 token_hash(存的是 sha256 hex)
     const code = mailer.sent[0].text.match(/\n {4}(\d{6})\n/)?.[1] ?? "";
     assert.ok(code.length === 6);

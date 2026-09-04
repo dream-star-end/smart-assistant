@@ -406,6 +406,12 @@ describe("auth.verify.resendVerification (integ)", () => {
     const r = await resendVerification("resend@example.com", { mailer });
     assert.equal(r.accepted, true);
     assert.equal(mailer.sent.length, 1, "resend 必须发一封新邮件");
+    assert.equal(mailer.sent[0].subject, "[OpenClaude] 新的邮箱验证码（重发）");
+    assert.doesNotMatch(mailer.sent[0].subject, /\d{6}/, "subject 不得含验证码");
+    assert.match(mailer.sent[0].text, /垃圾邮件|Spam/, "重发邮件必须提示检查垃圾邮箱");
+    assert.doesNotMatch(mailer.sent[0].text, /https?:\/\//, "重发验证码邮件不应含 URL");
+    assert.match(mailer.sent[0].text, /旧验证码已作废/);
+    assert.match(mailer.sent[0].text, /不要把验证码转发/);
     const newCodeMatch = mailer.sent[0].text.match(/\n {4}(\d{6})\n/);
     assert.ok(newCodeMatch, "新邮件必须含 6 位码");
     const newCode = newCodeMatch![1];
@@ -496,7 +502,13 @@ describe("auth.verify.requestPasswordReset (integ)", () => {
     assert.equal(r.accepted, true);
     assert.equal(mailer.sent.length, 1);
     assert.equal(mailer.sent[0].to, "dan@example.com");
+    assert.equal(mailer.sent[0].subject, "[OpenClaude] 重置密码链接");
     assert.match(mailer.sent[0].text, /https:\/\/claudeai\.chat\/reset-password\?token=/);
+    assert.match(mailer.sent[0].text, /1 小时内有效/);
+    assert.match(mailer.sent[0].text, /不要把此链接转发/);
+    assert.match(mailer.sent[0].text, /忘记密码/);
+    assert.match(mailer.sent[0].text, /密码不会被改动/);
+    assert.match(mailer.sent[0].text, /—— OpenClaude 团队\nclaudeai\.chat/);
 
     const ev = await query<{ cnt: string }>(
       "SELECT COUNT(*)::text AS cnt FROM email_verifications WHERE purpose = 'reset_password'",
