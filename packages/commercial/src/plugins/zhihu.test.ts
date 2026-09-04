@@ -1,0 +1,443 @@
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import { RuntimePluginContractError, validateRuntimePluginJson } from './contracts.js'
+import {
+  COMPILED_ZHIHU_PLUGIN,
+  ZHIHU_DRIVER_VERSION,
+  ZHIHU_LAUNCHER_VERSION,
+  ZHIHU_LOGIN_ORIGINS,
+  ZHIHU_PLUGIN_CONTRACT,
+  ZHIHU_PLUGIN_SLUG,
+  ZHIHU_PLUGIN_VERSION,
+  classifyZhihuSetupPin,
+  decodeZhihuWorkerFramesForTest,
+  isOfficialZhihuPluginIdentity,
+  resolveZhihuWorkerResources,
+  validateZhihuAccountState,
+} from './zhihu.js'
+import { ZHIHU_WORKER_SOURCE } from './zhihuWorkerSource.js'
+import { managedPluginWritePolicy, managedPluginWritePreapprovalPolicy } from './writePolicy.js'
+
+function framed(value: unknown): Buffer {
+  const body = Buffer.from(JSON.stringify(value))
+  const header = Buffer.alloc(4)
+  header.writeUInt32BE(body.length)
+  return Buffer.concat([header, body])
+}
+
+const ACTION_IDS = [
+  'get_self',
+  'get_user',
+  'get_question',
+  'list_question_answers',
+  'get_answer',
+  'list_answer_comments',
+  'search',
+  'list_feed',
+  'list_notifications',
+  'list_my_answers',
+  'list_my_articles',
+  'list_hot',
+  'create_answer',
+  'edit_answer',
+  'delete_answer',
+  'create_comment',
+  'reply_comment',
+  'delete_comment',
+  'set_vote',
+  'set_following',
+  'create_article',
+] as const
+
+function compileWorkerChallengeHarness(writeTerminalAndExit: (event: unknown) => Promise<void>): {
+  assertNoChallenge(page: {
+    locator(selector: string): { innerText(): Promise<string> }
+    url(): string
+  }): Promise<void>
+} {
+  const riskStart = ZHIHU_WORKER_SOURCE.indexOf('const RISK_TEXT')
+  const riskEnd = ZHIHU_WORKER_SOURCE.indexOf('let terminal', riskStart)
+  const bodyStart = ZHIHU_WORKER_SOURCE.indexOf('async function bodyText')
+  const bodyEnd = ZHIHU_WORKER_SOURCE.indexOf('async function isLoginVisible', bodyStart)
+  assert.ok(riskStart >= 0 && riskEnd > riskStart && bodyStart >= 0 && bodyEnd > bodyStart)
+  return new Function(
+    'writeTerminalAndExit',
+    'cleanText',
+    `'use strict'; ${ZHIHU_WORKER_SOURCE.slice(riskStart, riskEnd)}
+      ${ZHIHU_WORKER_SOURCE.slice(bodyStart, bodyEnd)}
+      return { assertNoChallenge };`,
+  )(writeTerminalAndExit, (value: unknown, max: number) =>
+    String(value ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, max),
+  ) as ReturnType<typeof compileWorkerChallengeHarness>
+}
+
+describe('official Zhihu Plugin', () => {
+  test('pins the current artifact and compiles a stable hash', () => {
+    assert.equal(ZHIHU_PLUGIN_VERSION, '1.0.0')
+    assert.equal(ZHIHU_DRIVER_VERSION, ZHIHU_PLUGIN_VERSION)
+    assert.equal(ZHIHU_LAUNCHER_VERSION, ZHIHU_PLUGIN_VERSION)
+    assert.match(COMPILED_ZHIHU_PLUGIN.artifactHash, /^[0-9a-f]{64}$/)
+    assert.match(COMPILED_ZHIHU_PLUGIN.execContractHash, /^[0-9a-f]{64}$/)
+    assert.equal(COMPILED_ZHIHU_PLUGIN.pluginType, 'managed-browser')
+    assert.equal(
+      classifyZhihuSetupPin({
+        version: ZHIHU_PLUGIN_VERSION,
+        artifactHash: COMPILED_ZHIHU_PLUGIN.artifactHash,
+        execContractHash: COMPILED_ZHIHU_PLUGIN.execContractHash,
+      }),
+      'current',
+    )
+    assert.equal(
+      classifyZhihuSetupPin({
+        version: ZHIHU_PLUGIN_VERSION,
+        artifactHash: '0'.repeat(64),
+        execContractHash: COMPILED_ZHIHU_PLUGIN.execContractHash,
+      }),
+      null,
+    )
+  })
+
+  test('official badge requires platform provenance and both exact hashes', () => {
+    const exact = {
+      slug: ZHIHU_PLUGIN_SLUG,
+      pluginType: 'managed-browser',
+      artifactHash: COMPILED_ZHIHU_PLUGIN.artifactHash,
+      execContractHash: COMPILED_ZHIHU_PLUGIN.execContractHash,
+    }
+    assert.equal(isOfficialZhihuPluginIdentity({ ...exact, reviewSource: 'platform' }), true)
+    assert.equal(isOfficialZhihuPluginIdentity({ ...exact, reviewSource: 'human' }), false)
+    assert.equal(
+      isOfficialZhihuPluginIdentity({
+        ...exact,
+        execContractHash: '0'.repeat(64),
+        reviewSource: 'platform',
+      }),
+      false,
+    )
+  })
+
+  test('exposes bounded reads and default-confirmed writes with independent preapproval', () => {
+    assert.deepEqual(
+      ZHIHU_PLUGIN_CONTRACT.actions.map((action) => action.id),
+      [...ACTION_IDS],
+    )
+    assert.equal(
+      ZHIHU_PLUGIN_CONTRACT.actions.filter((action) => action.effect === 'read').length,
+      12,
+    )
+    assert.equal(
+      ZHIHU_PLUGIN_CONTRACT.actions.filter((action) => action.effect === 'write').length,
+      9,
+    )
+    for (const action of ZHIHU_PLUGIN_CONTRACT.actions.filter(
+      (candidate) => candidate.effect === 'write',
+    ))
+      assert.match(action.description, /逐次确认/)
+    const writePolicy = managedPluginWritePolicy(ZHIHU_PLUGIN_SLUG)
+    assert.ok(writePolicy)
+    assert.equal(writePolicy.version, 1)
+    assert.match(writePolicy.disclaimerText, /默认每一次写操作仍须.*确认卡/)
+    const preapprovalPolicy = managedPluginWritePreapprovalPolicy(ZHIHU_PLUGIN_SLUG)
+    assert.ok(preapprovalPolicy)
+    assert.equal(preapprovalPolicy.version, 1)
+    assert.match(preapprovalPolicy.disclaimerText, /免逐次确认/)
+    assert.match(preapprovalPolicy.disclaimerText, /派发围栏/)
+  })
+
+  test('keeps account state and browser network inside exact signed origins', () => {
+    assert.ok(ZHIHU_PLUGIN_CONTRACT.runtime.network.origins.includes('https://www.zhihu.com:443'))
+    assert.ok(
+      ZHIHU_PLUGIN_CONTRACT.runtime.network.origins.includes('https://zhuanlan.zhihu.com:443'),
+    )
+    assert.ok(ZHIHU_PLUGIN_CONTRACT.runtime.network.origins.includes('https://picx.zhimg.com:443'))
+    assert.ok(!ZHIHU_PLUGIN_CONTRACT.runtime.network.origins.some((origin) => /api\.zhihu/.test(origin)))
+    assert.ok(ZHIHU_LOGIN_ORIGINS.includes('https://www.zhihu.com:443'))
+    assert.ok(ZHIHU_LOGIN_ORIGINS.length <= 16)
+    const state = validateZhihuAccountState({
+      cookies: [
+        {
+          name: 'z_c0',
+          value: 'secret',
+          domain: '.zhihu.com',
+          path: '/',
+          expires: -1,
+          httpOnly: true,
+          secure: true,
+          sameSite: 'Lax',
+        },
+      ],
+      origins: [],
+    })
+    assert.equal(state.cookies[0]?.name, 'z_c0')
+  })
+
+  test('each action schema accepts a valid example and rejects extras', () => {
+    const examples: Record<string, { params: Record<string, unknown>; result: Record<string, unknown> }> =
+      {
+        get_self: {
+          params: {},
+          result: {
+            user: {
+              urlToken: 'excited-vczh',
+              name: 'vczh',
+              profileUrl: 'https://www.zhihu.com/people/excited-vczh',
+            },
+          },
+        },
+        get_user: {
+          params: { urlToken: 'excited-vczh' },
+          result: {
+            user: {
+              urlToken: 'excited-vczh',
+              name: 'vczh',
+              profileUrl: 'https://www.zhihu.com/people/excited-vczh',
+            },
+          },
+        },
+        get_question: {
+          params: { questionId: '19550225' },
+          result: {
+            question: {
+              id: '19550225',
+              title: '如何评价知乎',
+              url: 'https://www.zhihu.com/question/19550225',
+            },
+          },
+        },
+        list_question_answers: {
+          params: { questionId: '19550225', limit: 5 },
+          result: { answers: [], complete: true, degradedReason: 'empty_list' },
+        },
+        get_answer: {
+          params: { answerId: '12345678' },
+          result: {
+            answer: {
+              id: '12345678',
+              text: '正文',
+              url: 'https://www.zhihu.com/answer/12345678',
+              contentDigest: '0'.repeat(64),
+            },
+          },
+        },
+        list_answer_comments: {
+          params: { answerId: '12345678' },
+          result: { comments: [], complete: true },
+        },
+        search: {
+          params: { query: 'openai', type: 'question', limit: 10 },
+          result: { results: [], complete: true },
+        },
+        list_feed: { params: { limit: 10 }, result: { items: [], complete: true } },
+        list_notifications: { params: {}, result: { notifications: [], complete: true } },
+        list_my_answers: { params: {}, result: { answers: [], complete: true } },
+        list_my_articles: { params: {}, result: { articles: [], complete: true } },
+        list_hot: {
+          params: {},
+          result: {
+            searches: [{ rank: 1, title: '热榜', url: 'https://www.zhihu.com/hot' }],
+            complete: true,
+          },
+        },
+        create_answer: {
+          params: { questionId: '19550225', text: '回答正文' },
+          result: {
+            answer: {
+              id: '9',
+              text: '回答正文',
+              url: 'https://www.zhihu.com/answer/9',
+              contentDigest: '0'.repeat(64),
+            },
+          },
+        },
+        edit_answer: {
+          params: {
+            answerId: '9',
+            text: '改写',
+            snapshot: { expectedDigest: '0'.repeat(64), owned: true },
+          },
+          result: {
+            answer: {
+              id: '9',
+              text: '改写',
+              url: 'https://www.zhihu.com/answer/9',
+              contentDigest: '1'.repeat(64),
+            },
+          },
+        },
+        delete_answer: {
+          params: { answerId: '9', snapshot: { expectedDigest: '0'.repeat(64), owned: true } },
+          result: { ok: true, changed: true },
+        },
+        create_comment: {
+          params: { answerId: '9', text: '评论' },
+          result: {
+            comment: {
+              id: '1',
+              answerId: '9',
+              text: '评论',
+              contentDigest: '0'.repeat(64),
+            },
+          },
+        },
+        reply_comment: {
+          params: { answerId: '9', commentId: '1', text: '回复' },
+          result: {
+            comment: {
+              id: '2',
+              answerId: '9',
+              text: '回复',
+              contentDigest: '0'.repeat(64),
+            },
+          },
+        },
+        delete_comment: {
+          params: { commentId: '1', snapshot: { expectedDigest: '0'.repeat(64), owned: true } },
+          result: { ok: true, changed: true },
+        },
+        set_vote: {
+          params: { answerId: '9', vote: 'up' },
+          result: { ok: true, changed: true },
+        },
+        set_following: {
+          params: { urlToken: 'excited-vczh', following: true },
+          result: { ok: true, changed: true },
+        },
+        create_article: {
+          params: { title: '标题', text: '正文' },
+          result: {
+            article: {
+              id: '1',
+              title: '标题',
+              url: 'https://zhuanlan.zhihu.com/p/1',
+              contentDigest: '0'.repeat(64),
+            },
+          },
+        },
+      }
+
+    for (const action of ZHIHU_PLUGIN_CONTRACT.actions) {
+      const example = examples[action.id]
+      assert.ok(example, `missing example for ${action.id}`)
+      assert.doesNotThrow(() =>
+        validateRuntimePluginJson(action.params, example.params, 'params'),
+      )
+      assert.doesNotThrow(() =>
+        validateRuntimePluginJson(action.result, example.result, 'result'),
+      )
+      assert.throws(
+        () =>
+          validateRuntimePluginJson(action.params, { ...example.params, extra: true }, 'params'),
+        (error: unknown) =>
+          error instanceof RuntimePluginContractError && error.code === 'INVALID_PARAMS',
+      )
+    }
+
+    const create = ZHIHU_PLUGIN_CONTRACT.actions.find((action) => action.id === 'create_answer')!
+    assert.throws(
+      () => validateRuntimePluginJson(create.params, { questionId: 'abc', text: 'x' }, 'params'),
+      (error: unknown) =>
+        error instanceof RuntimePluginContractError && error.code === 'INVALID_PARAMS',
+    )
+    const edit = ZHIHU_PLUGIN_CONTRACT.actions.find((action) => action.id === 'edit_answer')!
+    assert.throws(
+      () =>
+        validateRuntimePluginJson(
+          edit.params,
+          {
+            answerId: '9',
+            text: 'changed',
+            snapshot: { expectedDigest: '0'.repeat(64), owned: false },
+          },
+          'params',
+        ),
+      (error: unknown) =>
+        error instanceof RuntimePluginContractError && error.code === 'INVALID_PARAMS',
+    )
+  })
+
+  test('worker source has a handling branch for every action id and is DOM-only', () => {
+    for (const id of ACTION_IDS) {
+      assert.ok(
+        ZHIHU_WORKER_SOURCE.includes(`'${id}'`) || ZHIHU_WORKER_SOURCE.includes(`"${id}"`),
+        `worker missing action id ${id}`,
+      )
+    }
+    assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'get_self'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'create_answer'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'create_comment'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'set_vote'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /actionId === 'set_following'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /ZHIHU_UPSTREAM_CHALLENGE/)
+    assert.match(ZHIHU_WORKER_SOURCE, /\/account\/unhuman/)
+    assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /page\.request/)
+    assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /__reactFiber/)
+    assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /__INITIAL_STATE__/)
+    assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /api\.zhihu\.com/)
+  })
+
+  test('risk pages and unhuman URLs fail closed as ZHIHU_UPSTREAM_CHALLENGE', async () => {
+    const events: unknown[] = []
+    const { assertNoChallenge } = compileWorkerChallengeHarness(async (event) => {
+      events.push(event)
+    })
+    const page = (text: string, url: string) => ({
+      locator: (selector: string) => {
+        assert.equal(selector, 'body')
+        return { innerText: async () => text }
+      },
+      url: () => url,
+    })
+    await assertNoChallenge(page('欢迎来到知乎', 'https://www.zhihu.com/'))
+    assert.equal(events.length, 0)
+    await assertNoChallenge(page('安全验证 请完成验证', 'https://www.zhihu.com/account/unhuman'))
+    assert.deepEqual(events.at(-1), {
+      event: 'failed',
+      code: 'ZHIHU_UPSTREAM_CHALLENGE',
+    })
+    events.length = 0
+    await assertNoChallenge(page('普通正文', 'https://www.zhihu.com/account/unhuman?type=slide'))
+    assert.deepEqual(events.at(-1), {
+      event: 'failed',
+      code: 'ZHIHU_UPSTREAM_CHALLENGE',
+    })
+  })
+
+  test('does not mistake standard SMS login labels for a challenge', async () => {
+    const events: unknown[] = []
+    const { assertNoChallenge } = compileWorkerChallengeHarness(async (event) => {
+      events.push(event)
+    })
+    await assertNoChallenge({
+      locator: (selector: string) => {
+        assert.equal(selector, 'body')
+        return { innerText: async () => '验证码登录 获取验证码 短信验证码' }
+      },
+      url: () => 'https://www.zhihu.com/signin',
+    })
+    assert.equal(events.length, 0)
+  })
+
+  test('worker resources and coalesced protocol frames', () => {
+    assert.deepEqual(resolveZhihuWorkerResources('action'), {
+      memoryBytes: 768 * 1024 * 1024,
+      memorySwapBytes: 768 * 1024 * 1024,
+      pidsLimit: 128,
+      shmSizeBytes: 64 * 1024 * 1024,
+    })
+    assert.deepEqual(resolveZhihuWorkerResources('login'), {
+      memoryBytes: 768 * 1024 * 1024,
+      memorySwapBytes: 768 * 1024 * 1024,
+      pidsLimit: 256,
+      shmSizeBytes: 256 * 1024 * 1024,
+    })
+    const chunk = Buffer.concat([
+      framed({ event: 'ready', runtime: 'zhihu-worker-v1', playwrightMcpVersion: '0.0.76' }),
+      framed({ event: 'failed', code: 'WORKER_FAILED' }),
+    ])
+    assert.equal(decodeZhihuWorkerFramesForTest(chunk), 2)
+  })
+})
