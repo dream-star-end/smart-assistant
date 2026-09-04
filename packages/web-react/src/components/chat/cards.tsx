@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
 import { memo, useEffect, useRef, useState } from "react";
+import type { BlankProbeReport as TimelineBlankReport } from "../../lib/chat/timelineBlankProbe";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
   CONTINUE_PROMPT,
@@ -90,6 +91,9 @@ export type CardCallbacks = {
     latencyMs: number;
     backgroundAtFrame: boolean;
   }) => void;
+  /** INC-20260905-TIMELINE-BLANK: viewport had no painted timeline row for
+   *  several consecutive samples. Bounded geometry only, never message text. */
+  onTimelineBlank?: (input: { sessionId?: string; report: TimelineBlankReport }) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   onRetrySend?: (msg: ChatMessage) => void;
   /** Resume an executed interrupted turn as one new, deduplicated user turn. */

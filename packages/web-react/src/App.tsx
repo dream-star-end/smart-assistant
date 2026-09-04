@@ -2109,6 +2109,26 @@ export function App() {
               sessionId: input.sessionId,
             }, authRef.current?.snapshot().token);
           },
+      onTimelineBlank: demo
+        ? undefined
+        : ({ sessionId, report }) => {
+            // Bounded counters only; the full geometry stays in localStorage
+            // (`oc.timelineBlank.last`) / `window.__ocTimelineDump()` for the
+            // user to hand over when the blank shows up again.
+            const snap = report.snapshot;
+            reportClientFriction({
+              surface: "webchat",
+              stage: "timeline_paint",
+              code: `TIMELINE_BLANK_${report.classification.toUpperCase()}`,
+              outcome: "failed",
+              attempts: snap.rowsMounted,
+              latencyMs: Math.max(0, Math.round(snap.distBottom)),
+              sessionId,
+            }, authRef.current?.snapshot().token);
+            if (typeof console !== "undefined") {
+              console.warn("[oc-timeline] blank viewport detected", report.classification, snap);
+            }
+          },
       onRetrySend: demo ? undefined : retrySend,
       onContinueInterrupted: demo ? undefined : continueInterrupted,
       resolveInterruptedContinuation: demo ? undefined : resolveInterruptedContinuation,

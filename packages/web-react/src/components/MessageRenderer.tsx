@@ -44,6 +44,13 @@ import {
   paintWindowEnabled,
   selectPaintRange,
 } from "../lib/chat/timelinePaint";
+import {
+  BLANK_SAMPLE_INTERVAL_MS,
+  collectProbeInput,
+  createBlankDetector,
+  persistSnapshot,
+  readPersistedSnapshot,
+} from "../lib/chat/timelineBlankProbe";
 import { prefetchMarkdownImpl } from "./Markdown";
 import {
   AssistantCard,
@@ -1085,6 +1092,9 @@ export function MessageList({
   const lastViewportAnchorRef = useRef<VisibleVirtualRowAnchor | null>(null);
   const lastPaintSpanRef = useRef({ start: -1, end: -1 });
   const pinStartRef = useRef<number | undefined>(undefined);
+  // INC-20260905-TIMELINE-BLANK probe state (passive; never writes scrollTop).
+  const blankDetectorRef = useRef(createBlankDetector());
+  const blankProbeStateRef = useRef({ paintStart: 0, paintEnd: 0, sending: false, messagesLength: 0 });
   const beginViewportPreserve = () => {
     viewportPreserveLockRef.current = true;
     const follow = followBottomRefBox.current;
@@ -1291,6 +1301,68 @@ export function MessageList({
     if (!scrollParent) return;
     void prefetchMarkdownImpl();
   }, [sessionId, scrollParent]);
+
+  // INC-20260905-TIMELINE-BLANK: sample viewport geometry ~1/s while mounted
+  // (plus on scroll). A confirmed blank persists a snapshot to localStorage,
+  // exposes `window.__ocTimelineDump()` for manual pull and emits one bounded
+  // friction signal. Purely observational so it can ship before the root cause.
+  useEffect(() => {
+    const scroller = scrollParent;
+    if (!scroller || typeof window === "undefined") return;
+    blankDetectorRef.current = createBlankDetector();
+    let lastSampleAt = 0;
+    let disposed = false;
+    const collect = () => collectProbeInput({
+      scroller,
+      root: listRootRef.current,
+      paintStart: blankProbeStateRef.current.paintStart,
+      paintEnd: blankProbeStateRef.current.paintEnd,
+      sending: blankProbeStateRef.current.sending,
+      followBottom: followBottomRefBox.current ? followBottomRefBox.current.current === true : null,
+      messagesLength: blankProbeStateRef.current.messagesLength,
+    });
+    const sample = (force = false) => {
+      if (disposed) return;
+      const now = Date.now();
+      if (!force && now - lastSampleAt < BLANK_SAMPLE_INTERVAL_MS) return;
+      lastSampleAt = now;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      let report;
+      try {
+        report = blankDetectorRef.current.sample(collect(), now);
+      } catch {
+        return;
+      }
+      if (!report) return;
+      persistSnapshot(sessionId, report);
+      cb.onTimelineBlank?.({ sessionId, report });
+    };
+    const timer = window.setInterval(() => sample(false), BLANK_SAMPLE_INTERVAL_MS);
+    const onScroll = () => sample(false);
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    const w = window as typeof window & {
+      __ocTimelineDump?: () => unknown;
+      __ocTimelineBlankLast?: () => unknown;
+    };
+    w.__ocTimelineDump = () => {
+      const input = collect();
+      return {
+        sessionId,
+        now: Date.now(),
+        input,
+        classification: blankDetectorRef.current.sample(input, Date.now())?.classification ?? "sampled",
+        lastConfirmed: blankDetectorRef.current.lastSnapshot(),
+        persisted: readPersistedSnapshot(),
+      };
+    };
+    w.__ocTimelineBlankLast = () => readPersistedSnapshot();
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      scroller.removeEventListener("scroll", onScroll);
+      if (w.__ocTimelineDump) delete w.__ocTimelineDump;
+    };
+  }, [scrollParent, sessionId, cb]);
 
   useEffect(() => {
     const root = listRootRef.current;
@@ -1588,6 +1660,7 @@ export function MessageList({
     paintEnd = chosen.end;
   }
   const paintedItems = visibleItems.slice(paintStart, paintEnd);
+  blankProbeStateRef.current = { paintStart, paintEnd, sending, messagesLength: messages.length };
   const topSpacerPx = paintStart > 0
     ? measuredRangePx(0, paintStart, (index) => itemKey(visibleItems[index]), rowHeightCacheRef.current)
     : 0;

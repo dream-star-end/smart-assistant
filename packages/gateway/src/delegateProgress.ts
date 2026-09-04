@@ -321,6 +321,14 @@ export function summarizeDelegateProgressEvent(
  */
 export function coalesceDelegateTranscript(transcript: readonly unknown[]): unknown[] {
   const out: unknown[] = []
+  // tool_use streaming emits one snapshot per input_json_delta (Cursor/CCB
+  // Write of a 10 KB file → ~5 700 partial blocks for a single blockId). The
+  // live reducers fold these by blockId (protocol/liveUnits.appendSubagentBlock,
+  // web reducer); the durable transcript must do the same or a team card
+  // hydrates 13 079 children / 8.6 MB where 153 / 0.8 MB is the real tree.
+  // Position of the first snapshot is kept, content of the latest wins;
+  // `partialJsonDelta`/`partialJsonOffset` are streaming-only and dropped.
+  const toolUseIndex = new Map<string, number>()
   for (const raw of transcript) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       out.push(raw)
@@ -328,6 +336,36 @@ export function coalesceDelegateTranscript(transcript: readonly unknown[]): unkn
     }
     const block = raw as Record<string, unknown>
     const kind = block.kind
+    if (kind === 'tool_use') {
+      const blockId = typeof block.blockId === 'string' ? block.blockId : ''
+      const isBoundary = Object.keys(block).some((key) => key.startsWith('_nestedDelegate'))
+      if (!blockId || isBoundary) {
+        out.push(raw)
+        continue
+      }
+      const { partialJsonDelta: _delta, partialJsonOffset: _offset, ...snapshot } = block
+      const at = toolUseIndex.get(blockId)
+      if (at === undefined) {
+        toolUseIndex.set(blockId, out.length)
+        out.push(snapshot)
+        continue
+      }
+      const prev = out[at] as Record<string, unknown>
+      const merged: Record<string, unknown> = { ...prev, ...snapshot }
+      // A later snapshot without inputJson must not erase the final input.
+      if ((snapshot.inputJson === undefined || snapshot.inputJson === null) && prev.inputJson != null) {
+        merged.inputJson = prev.inputJson
+      }
+      // inputPreview grows monotonically; keep the longer one.
+      if (typeof prev.inputPreview === 'string' && typeof snapshot.inputPreview === 'string' &&
+          prev.inputPreview.length > snapshot.inputPreview.length) {
+        merged.inputPreview = prev.inputPreview
+      }
+      // Once any snapshot is final (partial:false) the tool call is final.
+      if (prev.partial === false || snapshot.partial === false) merged.partial = false
+      out[at] = merged
+      continue
+    }
     if (kind !== 'text' && kind !== 'thinking') {
       out.push(raw)
       continue
@@ -357,6 +395,18 @@ export function coalesceDelegateTranscript(transcript: readonly unknown[]): unkn
   }
   return out
 }
+
+/** Rough JSON size of a transcript for the oversize diagnostic; never throws. */
+export function estimateTranscriptBytes(transcript: readonly unknown[]): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(transcript), 'utf8')
+  } catch {
+    return -1
+  }
+}
+
+/** Above this the durable team card is a UI hazard (multi-MB tape record). */
+export const DELEGATE_TRANSCRIPT_WARN_BYTES = 2 * 1024 * 1024
 
 export function makeDelegateBlockPassthrough(
   event: any,

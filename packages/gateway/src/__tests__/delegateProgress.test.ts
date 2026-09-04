@@ -60,6 +60,66 @@ describe('coalesceDelegateTranscript', () => {
     ])
   })
 
+  it('folds tool_use partial snapshots by blockId (INC-20260905 13079-child team card)', () => {
+    // Real shape from a Cursor delegate Write: one snapshot per input_json_delta.
+    const partials = Array.from({ length: 50 }, (_, i) => ({
+      kind: 'tool_use',
+      blockId: 'call_w',
+      toolName: 'Write',
+      messageId: 'm1',
+      partial: true,
+      inputPreview: '{"file_path":"/x"'.slice(0, Math.min(17, i + 1)),
+      partialJsonDelta: 'x',
+      partialJsonOffset: i,
+    }))
+    const finalSnap = {
+      kind: 'tool_use',
+      blockId: 'call_w',
+      toolName: 'Write',
+      messageId: 'm1',
+      partial: false,
+      inputPreview: '{"file_path":"/x"',
+      inputJson: { file_path: '/x', content: 'hello' },
+    }
+    const out = coalesceDelegateTranscript([
+      { kind: 'thinking', text: 'plan' },
+      ...partials,
+      { kind: 'tool_use', blockId: 'call_b', toolName: 'Bash', partial: true, inputPreview: '{"com' },
+      finalSnap,
+      { kind: 'tool_use', blockId: 'call_b', toolName: 'Bash', partial: false, inputJson: { command: 'ls' } },
+      { kind: 'tool_result', toolUseBlockId: 'call_w', output: 'ok' },
+      { kind: 'tool_result', toolUseBlockId: 'call_b', output: 'a b' },
+      { kind: 'final', meta: {} },
+    ])
+    assert.equal(out.length, 6)
+    assert.deepEqual(out[0], { kind: 'thinking', text: 'plan' })
+    // First-seen position kept, latest content wins, streaming deltas dropped.
+    assert.deepEqual(out[1], finalSnap)
+    assert.deepEqual(out[2], {
+      kind: 'tool_use', blockId: 'call_b', toolName: 'Bash', partial: false,
+      inputPreview: '{"com', inputJson: { command: 'ls' },
+    })
+    assert.equal((out[3] as { kind: string }).kind, 'tool_result')
+    assert.equal((out[4] as { kind: string }).kind, 'tool_result')
+    assert.deepEqual(out[5], { kind: 'final', meta: {} })
+    for (const b of out) {
+      assert.ok(!('partialJsonDelta' in (b as object)), 'streaming delta must not persist')
+    }
+  })
+
+  it('does not erase a final inputJson with a later inputJson-less snapshot and keeps distinct blockIds apart', () => {
+    const out = coalesceDelegateTranscript([
+      { kind: 'tool_use', blockId: 'a', toolName: 'Bash', partial: false, inputJson: { command: 'x' } },
+      { kind: 'tool_use', blockId: 'a', toolName: 'Bash', partial: true, inputPreview: '{' },
+      { kind: 'tool_use', blockId: 'b', toolName: 'Read', partial: false, inputJson: { file_path: '/y' } },
+      { kind: 'tool_use', toolName: 'NoId', partial: true },
+    ])
+    assert.equal(out.length, 3)
+    assert.deepEqual(out[0], { kind: 'tool_use', blockId: 'a', toolName: 'Bash', partial: false, inputJson: { command: 'x' }, inputPreview: '{' })
+    assert.deepEqual(out[1], { kind: 'tool_use', blockId: 'b', toolName: 'Read', partial: false, inputJson: { file_path: '/y' } })
+    assert.deepEqual(out[2], { kind: 'tool_use', toolName: 'NoId', partial: true })
+  })
+
   it('treats nested-delegate marker blocks as hard boundaries', () => {
     const marker = {
       kind: 'text',

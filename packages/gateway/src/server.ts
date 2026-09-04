@@ -373,6 +373,8 @@ import {
   makeDelegateUsageProgressBlock,
   makeDelegateBlockPassthrough,
   coalesceDelegateTranscript,
+  DELEGATE_TRANSCRIPT_WARN_BYTES,
+  estimateTranscriptBytes,
   resolveDelegateProgressRouting,
   toNestedDelegateProgressLine,
   formatDelegateParentWorkingDetail,
@@ -13295,6 +13297,28 @@ export class Gateway {
     // over its live-merged local card — so persist the merged form, matching
     // what the live reducers already render.
     const coalescedTranscript = coalesceDelegateTranscript(durableTranscript)
+    {
+      // INC-20260905-TIMELINE-BLANK diagnostics: a 20–32 MB agent-group tape
+      // record was found behind a "blank bottom" report. Log the shape of every
+      // oversized durable transcript so the next occurrence is attributable.
+      const bytes = estimateTranscriptBytes(coalescedTranscript)
+      if (bytes < 0 || bytes >= DELEGATE_TRANSCRIPT_WARN_BYTES || durableTranscript.length >= 2000) {
+        const kinds: Record<string, number> = {}
+        for (const b of coalescedTranscript) {
+          const k = b && typeof b === 'object' ? String((b as { kind?: unknown }).kind ?? '?') : '?'
+          kinds[k] = (kinds[k] ?? 0) + 1
+        }
+        this.log.warn('delegate transcript oversized', {
+          runId: progressRunId,
+          agentId: targetAgentId,
+          parentSessionKey: progressTarget?.sessionKey ?? delegateParent?.sessionKey ?? null,
+          rawBlocks: durableTranscript.length,
+          coalescedBlocks: coalescedTranscript.length,
+          bytes,
+          kinds,
+        })
+      }
+    }
     const durableGroup: DurableAgentGroup = {
       runId: progressRunId,
       agentId: targetAgentId,
