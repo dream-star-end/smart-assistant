@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 
-import { SESSION_KEY_MAX_CHARS } from '@openclaude/protocol'
+import { DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS } from '@openclaude/protocol'
 
 import {
   createDelegateEngineBillingClient,
@@ -389,7 +389,7 @@ describe('delegate engine-billing sessionKey contract', () => {
     assert.equal(admission.requestId, 'a'.repeat(32))
   })
 
-  it('rejects illegal characters', async () => {
+  it('rejects illegal characters and empty string', async () => {
     await assert.rejects(
       () => admit(`${TASKBOARD_SESSION_KEY_155.slice(0, 154)}/`),
       /INVALID_SESSION/,
@@ -398,17 +398,15 @@ describe('delegate engine-billing sessionKey contract', () => {
       () => admit(`${TASKBOARD_SESSION_KEY_155.slice(0, 154)} `),
       /INVALID_SESSION/,
     )
+    await assert.rejects(() => admit(''), /INVALID_SESSION/)
   })
 
-  it('rejects sessionKey longer than SESSION_KEY_MAX_CHARS', async () => {
+  it('accepts 240-char sessionKey and rejects 241', async () => {
+    const admission = await admit('a'.repeat(DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS))
+    assert.equal(admission.requestId, 'a'.repeat(32))
     await assert.rejects(
-      () => admit('a'.repeat(SESSION_KEY_MAX_CHARS + 1)),
+      () => admit('a'.repeat(DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS + 1)),
       /INVALID_SESSION/,
     )
-  })
-
-  it('accepts the SESSION_KEY_MAX_CHARS boundary', async () => {
-    const admission = await admit('a'.repeat(SESSION_KEY_MAX_CHARS))
-    assert.equal(admission.requestId, 'a'.repeat(32))
   })
 })

@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { SESSION_KEY_MAX_CHARS } from '@openclaude/protocol'
+import { DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS } from '@openclaude/protocol'
 
+import { deriveEngineSessionId } from '../billing/codexFinalizer.js'
 import {
   createDelegateEngineBillingRuntime,
   resolveDelegateBillingAttribution,
@@ -315,7 +316,7 @@ describe('delegate engine-billing runtime', () => {
     assert.deepEqual(abortCalls, [REQUEST_ID])
   })
 
-  it('admits a real 155-char taskboard patrol sessionKey', async () => {
+  it('admits a real 155-char taskboard patrol sessionKey without truncating it', async () => {
     assert.equal(TASKBOARD_SESSION_KEY_155.length, 155)
     const { runtime, journalCalls } = makeRuntime()
     const result = await runtime.handle({
@@ -330,10 +331,11 @@ describe('delegate engine-billing runtime', () => {
       },
     })
     assert.equal(result.requestId, REQUEST_ID)
+    assert.equal(result.engineSessionId, deriveEngineSessionId(TASKBOARD_SESSION_KEY_155))
     assert.equal(journalCalls.length, 1)
   })
 
-  it('rejects illegal sessionKey characters', async () => {
+  it('rejects illegal sessionKey characters and empty string', async () => {
     const { runtime, journalCalls } = makeRuntime()
     await assert.rejects(
       () =>
@@ -365,10 +367,25 @@ describe('delegate engine-billing runtime', () => {
         }),
       /INVALID_SESSIONKEY/,
     )
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+          identity: IDENTITY,
+          body: {
+            model: 'grok-build',
+            engine: 'grok',
+            agentId: 'stage-triage',
+            delegateAgentId: 'stage-triage',
+            sessionKey: '',
+          },
+        }),
+      /INVALID_SESSIONKEY/,
+    )
     assert.equal(journalCalls.length, 0)
   })
 
-  it('rejects sessionKey longer than SESSION_KEY_MAX_CHARS and accepts the boundary', async () => {
+  it('accepts 240-char sessionKey and rejects 241', async () => {
     const { runtime, journalCalls } = makeRuntime()
     await assert.rejects(
       () =>
@@ -380,11 +397,12 @@ describe('delegate engine-billing runtime', () => {
             engine: 'grok',
             agentId: 'stage-triage',
             delegateAgentId: 'stage-triage',
-            sessionKey: 'a'.repeat(SESSION_KEY_MAX_CHARS + 1),
+            sessionKey: 'a'.repeat(DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS + 1),
           },
         }),
       /INVALID_SESSIONKEY/,
     )
+    const boundary = 'a'.repeat(DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS)
     const result = await runtime.handle({
       path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
       identity: IDENTITY,
@@ -393,10 +411,11 @@ describe('delegate engine-billing runtime', () => {
         engine: 'grok',
         agentId: 'stage-triage',
         delegateAgentId: 'stage-triage',
-        sessionKey: 'a'.repeat(SESSION_KEY_MAX_CHARS),
+        sessionKey: boundary,
       },
     })
     assert.equal(result.requestId, REQUEST_ID)
+    assert.equal(result.engineSessionId, deriveEngineSessionId(boundary))
     assert.equal(journalCalls.length, 1)
   })
 })
