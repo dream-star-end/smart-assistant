@@ -274,6 +274,60 @@ describe('research oc-* CLI public operations against a loopback master', () => 
     })
     assertBearer()
   })
+
+  test('oc-ingest / oc-litrag --help 新文案', async () => {
+    let result = await runCli('packages/gateway/src/ocIngestCli.ts', ['--help'])
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(result.stdout, /oc-ingest parse/)
+    assert.match(result.stdout, /oc-ingest list/)
+    result = await runCli('packages/gateway/src/ocLitragCli.ts', ['--help'])
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(result.stdout, /\[--docs/)
+    assert.match(result.stdout, /\[--project/)
+  })
+
+  test('oc-litrag 无 --docs 且 workspace 开 → body 含 projectId、不含空 docIds', async () => {
+    const result = await runCli(
+      'packages/gateway/src/ocLitragCli.ts',
+      ['query', 'what', 'changed', '--project', 'proj-1'],
+      { OC_RESEARCH_WORKSPACE: '1' },
+    )
+    assert.equal(result.code, 0, result.stderr)
+    assert.equal(captured[0].url, '/v3/research/litrag/query')
+    const body = bodyJson(0)
+    assert.equal(body.query, 'what changed')
+    assert.equal(body.projectId, 'proj-1')
+    assert.equal(body.docIds, undefined)
+  })
+
+  test('oc-litrag 无 --docs 且 workspace 关 → 仍要求 --docs', async () => {
+    const result = await runCli(
+      'packages/gateway/src/ocLitragCli.ts',
+      ['query', 'what'],
+      { OC_RESEARCH_WORKSPACE: '0' },
+    )
+    assert.notEqual(result.code, 0)
+    assert.match(result.stderr, /--docs/)
+    assert.equal(captured.length, 0)
+  })
+
+  test('本机路径 /Users/foo/a.pdf → exit 2 且 stderr 含上传', async () => {
+    const result = await runCli('packages/gateway/src/ocIngestCli.ts', ['parse', '/Users/foo/a.pdf'])
+    assert.equal(result.code, 2, result.stderr)
+    assert.match(result.stderr, /上传/)
+    assert.equal(captured.length, 0)
+  })
+
+  test('oc-ingest list 打 library/list', async () => {
+    const result = await runCli(
+      'packages/gateway/src/ocIngestCli.ts',
+      ['list', '--project', 'proj-1'],
+      { OC_RESEARCH_WORKSPACE: '1' },
+    )
+    assert.equal(result.code, 0, result.stderr)
+    assert.equal(captured[0].url, '/v3/research/library/list')
+    assert.deepEqual(bodyJson(0), { projectId: 'proj-1' })
+  })
 })
 
 describe('oc-market gateway operations against a loopback master', () => {
