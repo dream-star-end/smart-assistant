@@ -341,7 +341,7 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 | `packages/web-react/**` | dist 静态资源 | deploy-v5.sh --dist(与后端代码同批时用 --with-dist) | `test:web-react` |
 | `packages/storage/**`<br>`packages/cli/**`<br>`packages/protocol/**`<br>`packages/gateway/**`<br>`packages/mcp-memory/**` | runtime source release | deploy-v5.sh(部署前活体断言 runtime-release 轴已启用,否则 manual) | `test:storage`, `test:gateway`, `test:mcp-memory` |
 | `**/agent-sandbox/platform-runtime/**` | platform bundle | deploy-v5.sh(部署前活体断言 platform-bundle 轴已启用,否则 manual) | — |
-| `packages/commercial/src/egress/**`<br>`packages/commercial/src/http/proxy/**`<br>`packages/commercial/src/http/anthropicProxy.ts`<br>`packages/commercial/src/http/internalCostEvent.ts`<br>`packages/commercial/src/account-pool/**`<br>`packages/commercial/src/billing/**` | egress 进程 | deploy-v5.sh --egress(egress 进程;需 boss 明确放行后机器执行)。**egress 独立指针不随 A/B 翻转**;`--with-dist` 不带 `--egress` 时 deploy 的 egress surface gate 会在 lease 外比对「egress 运行 release sourceCommit..发布源」这些路径的 diff(排除测试文件),有变更即拒(2026-09-04 cursor 子 agent 409 事故)。极少数确认不需同步时 `OC_V5_SKIP_EGRESS_SURFACE_GATE=1` 显式放行 | `test:commercial:unit` |
+| `packages/commercial/src/egress/**` | egress 进程 | deploy-v5.sh --egress(egress 进程;需 boss 明确放行后机器执行) | `test:commercial:unit` |
 | (见下方 manual-only 清单) | **manual-only(fail-closed)** | 人工受控(§4.5 apply / RFC §3);另:rules 零命中 / 未知路径 / 未知 manifest version / symlink·gitlink·typechange 亦整体 manual | — |
 
 **manual-only globs**(命中任一 → 整体 `manual_required`):
