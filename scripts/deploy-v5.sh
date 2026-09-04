@@ -9821,6 +9821,74 @@ current_egress_release() {
   ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true
 }
 
+# ── egress surface gate(2026-09-04 INC:cursor 子 agent 409 VERIFICATION_SPONSORSHIP_CONFLICT)──
+# egress 独立指针不随 A/B 翻转,只有 --egress 才切。8/26→9/4 三次 --with-dist 都没带 --egress,
+# master 已含 authority_turn_dispatches 写入(0dea03d3b)而 egress 仍是 8/26 旧代码(缺 d70acbdff),
+# 半套修复组合出 100% 409。本门在 lease 外只读比对「egress 当前运行 release 的 sourceCommit ..
+# 本次发布源 commit」在 egress 面文件上的 diff:有差异而未带 --egress → fail-loud。
+# 面的口径与 --egress 参数注释一致(anthropicProxy / http/proxy / 账号池 / 计费 / egress/*),
+# 排除测试文件;故意不把 db/config/logging 这类全局依赖算进来,否则每次都要 --egress,解耦就没意义。
+EGRESS_SURFACE_PATHSPECS=(
+  'packages/commercial/src/egress'
+  'packages/commercial/src/http/proxy'
+  'packages/commercial/src/http/anthropicProxy.ts'
+  'packages/commercial/src/http/internalCostEvent.ts'
+  'packages/commercial/src/account-pool'
+  'packages/commercial/src/billing'
+  ':(exclude,glob)**/__tests__/**'
+  ':(exclude,glob)**/*.test.ts'
+  ':(exclude,glob)**/*.integ.test.ts'
+)
+
+egress_release_source_commit() { # <release-dir> → 40-hex(strong .complete)或 VERSION.json 短 sha 解析
+  local reldir="$1" sha
+  [[ -n "$reldir" ]] || return 1
+  # </dev/null:ssh 会吞掉调用方 stdin(source-only harness / bash -s 场景下会截断后续脚本)。
+  sha="$(ssh "$KL_HOST" "jq -er '.sourceCommit // empty' '$reldir/.complete' 2>/dev/null || jq -er '.commit // empty' '$reldir/VERSION.json' 2>/dev/null" </dev/null 2>/dev/null || true)"
+  [[ -n "$sha" ]] || return 1
+  git -C "$REPO_ROOT" rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null
+}
+
+assert_egress_surface_covered() { # 仅 MODE=deploy 且未带 --egress 时有意义
+  [[ "$MODE" == "deploy" && "$RESTART_EGRESS" != 1 ]] || return 0
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] egress surface gate:比对 egress 运行 release..发布源 commit 在 ${EGRESS_SURFACE_PATHSPECS[0]} 等面上的 diff"
+    return 0
+  fi
+  local current egress_sha target_sha changed
+  current="$(current_egress_release </dev/null)"
+  [[ -n "$current" ]] || {
+    echo "✗ egress surface gate:读不到 $V5_EGRESS_UNIT 运行中的 release cwd(unit 未起?)。egress 面无法判定,fail-closed" >&2
+    return 1
+  }
+  egress_sha="$(egress_release_source_commit "$current")" || {
+    echo "✗ egress surface gate:egress release $current 的 sourceCommit 缺失或本地不可达;无法判定是否需要 --egress" >&2
+    return 1
+  }
+  target_sha="$(resolve_release_source_commit)" || return 1
+  changed="$(git -C "$REPO_ROOT" diff --name-only "$egress_sha" "$target_sha" -- "${EGRESS_SURFACE_PATHSPECS[@]}" 2>/dev/null)" || {
+    echo "✗ egress surface gate:git diff $egress_sha..$target_sha 失败" >&2
+    return 1
+  }
+  if [[ -z "$changed" ]]; then
+    echo "  ✓ egress surface gate:egress 运行 ${egress_sha:0:9}..发布源 ${target_sha:0:9} 在 egress 面无变更,可不带 --egress"
+    return 0
+  fi
+  if [[ "${OC_V5_SKIP_EGRESS_SURFACE_GATE:-0}" == 1 ]]; then
+    echo "  ⚠ egress surface gate:egress 面有变更但 OC_V5_SKIP_EGRESS_SURFACE_GATE=1 放行(egress 将继续跑 ${egress_sha:0:9}):" >&2
+    printf '     · %s\n' $changed >&2
+    return 0
+  fi
+  {
+    echo "✗ egress surface gate:egress 仍运行 ${egress_sha:0:9}($current),本次发布 ${target_sha:0:9} 在 egress 面改了以下文件却未带 --egress:"
+    printf '     · %s\n' $changed
+    echo "   master 与 egress 版本错位会把只修了一半的 proxy/计费逻辑推上线(参见 2026-09-04 cursor 子 agent 409)。"
+    echo "   改用:deploy-v5.sh --with-dist --egress(同 SHA,egress SIGTERM drain 重启)。"
+    echo "   确认 egress 面变更本次不需要一起上时(极少),OC_V5_SKIP_EGRESS_SURFACE_GATE=1 显式放行。"
+  } >&2
+  return 1
+}
+
 begin_candidate_egress_transition() { # <candidate-release> <generation>
   local release="$1" generation="$2" predecessor current
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] test candidate egress then restore exact predecessor"; return 0; }
@@ -11544,6 +11612,8 @@ fi
 # B1:会 build_release 的 lane 先在 lease 外跑完 CI 绿门(含轮询),再取全局写锁。
 # rollback/recover/canary-reuse 等不建 release,绝不能被绿门拖住。
 maybe_run_ci_green_gate_for_mode || exit 1
+# egress surface gate 同样在 lease 外、只读:egress 面有变更却没带 --egress 直接拒,别等构建完才发现。
+assert_egress_surface_covered || exit 1
 
 # 只读 lane(smoke/baseline-census/两个 model-authority 只读态)不取;dry-run 只打印意图。
 case "$MODE" in
