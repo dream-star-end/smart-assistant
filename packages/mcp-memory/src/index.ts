@@ -839,6 +839,7 @@ async function handleRequestReview(args: {
   draft?: string
   revisionNote?: string
   resumeSessionKey?: string
+  mode?: string
 }) {
   const draft = typeof args?.draft === 'string' ? args.draft.trim() : ''
   if (!draft) {
@@ -848,10 +849,17 @@ async function handleRequestReview(args: {
     typeof args?.revisionNote === 'string' && args.revisionNote.trim()
       ? `\n\n【队长修订说明】\n${args.revisionNote.trim().slice(0, 4000)}`
       : ''
+  // 2026-09-04 团队模式两策略:mode 只选审查任务书模板(gateway 侧 teamMode.ts),
+  // 非法值 gateway 回落 execution。草稿截断由 gateway 显式标注,这里不再静默 slice。
+  const reviewMode = args?.mode === 'deliberation' ? 'deliberation' : 'execution'
   return handleDelegateTaskToAgent('hidden-reviewer', {
-    goal: '对队长准备提交给用户的最终答复草稿做独立质量审查,给出结构化裁决。',
-    context: draft.slice(0, 16000) + note,
+    goal:
+      reviewMode === 'deliberation'
+        ? '作为 analyst 对比 panel 各成员回答(共识/矛盾/部分覆盖/独有洞见/盲点),并核对队长草稿,给出结构化裁决。'
+        : '对队长准备提交给用户的最终答复草稿做独立质量验收(对照成员证据),给出结构化裁决。',
+    context: draft + note,
     label: '质量审查',
+    reviewMode,
     resumeSessionKey:
       typeof args.resumeSessionKey === 'string' ? args.resumeSessionKey : undefined,
   })
@@ -919,6 +927,7 @@ async function runAsyncDelegateToAgent(
     toolsets?: string[]
     resumeSessionKey?: string
     model?: string
+    reviewMode?: string
     label: string
   },
 ): Promise<FormattedDelegateResult> {
@@ -935,6 +944,7 @@ async function runAsyncDelegateToAgent(
     context: args.context,
     ...(args.effort ? { effort: args.effort } : {}),
     ...(args.model ? { model: args.model } : {}),
+    ...(args.reviewMode ? { reviewMode: args.reviewMode } : {}),
     sourceAgent,
     toolsets: args.toolsets,
     async: true,
@@ -1001,6 +1011,7 @@ async function handleDelegateTaskToAgent(
     toolsets?: string[]
     resumeSessionKey?: string
     model?: string
+    reviewMode?: string
     label: string
   },
 ) {

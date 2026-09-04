@@ -359,6 +359,11 @@ export const TOOLS = [
     description: [
       '【仅团队模式】把你准备提交给用户的**完整答复草稿**送独立质量审查员审查,',
       '返回审查意见与结构化裁决(`VERDICT: PASS` / `VERDICT: NEEDS_FIX`)。',
+      '审查员会自动拿到本轮每位成员的任务/状态/回传/产物路径作为证据,你不必复述。',
+      '',
+      'mode 按你本轮采用的策略填:`execution`(领域拆分执行,审查员逐条核对草稿声称的',
+      '「已完成/已验证」是否有成员证据)/ `deliberation`(多模型 panel 审议,审查员当 analyst',
+      '按共识/矛盾/部分覆盖/独有洞见/盲点对比 panel 回答并核对草稿)。不填 = execution。',
       '',
       '使用纪律:除非任务明显简单(单一事实问答/寒暄/无实质交付物),组队完成的任务',
       '在写最终答复**之前**都应送审;草稿只放本工具参数,不要先写进给用户的正文。',
@@ -371,6 +376,11 @@ export const TOOLS = [
         draft: {
           type: 'string',
           description: '准备提交给用户的完整答复草稿(全文,不是摘要)。',
+        },
+        mode: {
+          type: 'string',
+          enum: ['execution', 'deliberation'],
+          description: '审查模式:execution(默认,执行验收)/ deliberation(多模型审议对比)。',
         },
         revisionNote: {
           type: 'string',

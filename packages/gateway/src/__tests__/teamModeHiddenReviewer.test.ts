@@ -26,23 +26,42 @@ const SERVER_TS = join(__dirname, '..', 'server.ts')
 const CRON_TS = join(__dirname, '..', 'cron.ts')
 
 
-describe('team mode preamble — 协作语义 + 队长自主送审纪律', () => {
-  it('preamble 保留组队/委派/领域路由/综合语义', () => {
+const TEAM_MODE_TS = join(__dirname, '..', 'teamMode.ts')
+
+describe('team mode preamble — 两策略(审议/执行)+ 队长自主送审纪律(2026-09-04 起在 teamMode.ts)', () => {
+  it('server.ts 仍是唯一注入点:队长 main + teamMode → buildTeamPreamble(catalog panel)', () => {
     const src = readFileSync(SERVER_TS, 'utf8')
     assert.match(src, /if \(teamMode && agent\.id === 'main'\)/)
-    assert.match(src, /可委派的成员（已安装 agent）/)
     assert.match(src, /listCollaboratorAgents\(teamCfg, \{ selfId: 'main', includeMain: false \}\)/)
-    assert.match(src, /领域匹配优先于泛泛并行/)
-    assert.match(src, /委派只走平台通道/)
+    assert.match(src, /pickDeliberationPanel\(view, \{/)
+    assert.match(src, /buildTeamPreamble\(\{/)
     assert.match(src, /collabAgentPolicy: 'team-mode-prefer-delegate'/)
   })
 
-  it('preamble 含自主送审纪律(request_review,除明显简单任务外都送审,草稿不进正文)', () => {
-    const src = readFileSync(SERVER_TS, 'utf8')
-    assert.match(src, /request_review\(draft\)/)
-    assert.match(src, /除非任务明显简单/)
+  it('preamble 文案(teamMode.ts)保留组队/领域路由/平台通道语义,并新增审议策略', () => {
+    const src = readFileSync(TEAM_MODE_TS, 'utf8')
+    assert.match(src, /可委派的成员\(已安装 agent\)/)
+    assert.match(src, /领域匹配优先/)
+    assert.match(src, /委派只走平台通道/)
+    assert.match(src, /审议类 → 审议策略/)
+    assert.match(src, /执行类 → 执行策略/)
+    assert.match(src, /成本预告/)
+  })
+
+  it('preamble 含自主送审纪律(request_review + mode,除明显简单任务外都送审,草稿不进正文)', () => {
+    const src = readFileSync(TEAM_MODE_TS, 'utf8')
+    assert.match(src, /request_review\(draft, mode=/)
     assert.match(src, /草稿只放在工具\/命令参数里/)
     assert.match(src, /VERDICT: PASS/)
+  })
+
+  it('审查员不盲审:任务书从队长会话 _pendingAgentGroups 取证据,型号 ≠ 队长/panel', () => {
+    const src = readFileSync(SERVER_TS, 'utf8')
+    assert.match(src, /parent\._pendingAgentGroups \?\? \[\]/)
+    assert.match(src, /buildTeamReviewContext\(\{[\s\S]*mode: reviewMode[\s\S]*evidence,/)
+    assert.match(src, /pickReviewerModel\(view, \{/)
+    assert.match(src, /const requestedModel = isReview \? reviewerModelOverride : input\.model/)
+    assert.match(src, /team_review_skipped/)
   })
 
   it('硬编排产物已整体退役(防复活:队长自主送审是现行唯一机制)', () => {
@@ -55,7 +74,7 @@ describe('team mode preamble — 协作语义 + 队长自主送审纪律', () =>
     // 审查语义单一权威 = 目标身份派生 + 团队门。
     assert.match(src, /isHiddenSystemAgentId\(targetAgentId\)/)
     assert.match(src, /仅在团队模式的队长回合中可用/)
-    assert.match(src, /buildTeamReviewContext\(parent\._currentTurnUserText/)
+    assert.match(src, /userTask: parent\._currentTurnUserText/)
   })
 })
 
