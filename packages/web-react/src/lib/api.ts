@@ -10,13 +10,7 @@ import type {
   CommunityTutorialDraft,
   CommunityTutorialMine,
   CommunityTutorialPage,
-  CommunityTutorialPending,
   CommunityTutorialSummary,
-  TutorialEvalCompassItem,
-  TutorialEvalJob,
-  TutorialEvalRecordInput,
-  TutorialEvalSpec,
-  TutorialEvalSpecDraft,
   TutorialSnapshotDraft,
   TutorialSnapshotSubmitResult,
   CronCreateInput,
@@ -44,12 +38,9 @@ import type {
   SkillRunUsage,
   SkillTrainRun,
   SkillTrainStartResult,
-  MarketplaceAiReview,
   MarketplaceMyPublish,
-  MarketplacePending,
   MarketplacePublishInput,
   MarketplacePublishResult,
-  MarketplaceReviewBatchResult,
   MarketplaceSearchResult,
   HupiCreateResult,
   LoginResult,
@@ -3257,113 +3248,8 @@ export const api = {
       ),
     ),
 
-  adminPendingCommunityTutorials: (a: AuthSession, cursor?: string | null) =>
-    jsonOrThrow<CommunityTutorialPage<CommunityTutorialPending>>(
-      callWithRefresh(a, (token) =>
-        fetch(`/api/admin/tutorials/pending${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`, {
-          credentials: "include",
-          headers: bearerHeaders(token),
-        }),
-      ),
-    ),
-
-  adminReviewCommunityTutorial: (
-    a: AuthSession,
-    id: string,
-    decision: "approve" | "reject",
-    note?: string,
-  ) =>
-    jsonOrThrow<{ ok: boolean }>(
-      callWithRefresh(a, (token) =>
-        fetch(`/api/admin/tutorials/${encodeURIComponent(id)}/review`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify({ decision, note }),
-        }),
-      ),
-    ),
-
-  listTutorialEvalSpecs: (a: AuthSession, cursor?: string | null) =>
-    jsonOrThrow<{ specs: TutorialEvalSpec[]; nextCursor?: string | null }>(
-      callWithRefresh(a, (token) =>
-        fetch(
-          `/api/admin/tutorials/case-specs${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
-          { credentials: "include", headers: bearerHeaders(token) },
-        ),
-      ),
-    ),
-
-  createTutorialEvalSpec: (a: AuthSession, draft: TutorialEvalSpecDraft) =>
-    jsonOrThrow<{ spec: TutorialEvalSpec }>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/admin/tutorials/case-specs", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify(draft),
-        }),
-      ),
-    ).then((result) => result.spec),
-
-  listTutorialEvalJobs: (a: AuthSession, cursor?: string | null) =>
-    jsonOrThrow<{ jobs: TutorialEvalJob[]; nextCursor?: string | null }>(
-      callWithRefresh(a, (token) =>
-        fetch(
-          `/api/admin/tutorials/eval-jobs${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
-          { credentials: "include", headers: bearerHeaders(token) },
-        ),
-      ),
-    ),
-
-  enqueueTutorialEvalJob: (
-    a: AuthSession,
-    specId: string,
-    extra?: { idempotencyKey?: string; publicationId?: string | null; evalUserId?: string | null },
-  ) =>
-    jsonOrThrow<{ job: TutorialEvalJob }>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/admin/tutorials/eval-jobs", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify({
-            specId,
-            idempotencyKey: extra?.idempotencyKey ?? `eval-${specId}-${Date.now()}`,
-            publicationId: extra?.publicationId,
-            evalUserId: extra?.evalUserId,
-          }),
-        }),
-      ),
-    ).then((result) => result.job),
-
-  listTutorialEvalCompass: (a: AuthSession, cursor?: string | null) =>
-    jsonOrThrow<{ items?: TutorialEvalCompassItem[]; notes?: TutorialEvalCompassItem[]; nextCursor?: string | null }>(
-      callWithRefresh(a, (token) =>
-        fetch(
-          `/api/admin/tutorials/compass${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
-          { credentials: "include", headers: bearerHeaders(token) },
-        ),
-      ),
-    ).then((result) => ({
-      items: result.items ?? result.notes ?? [],
-      nextCursor: result.nextCursor ?? null,
-    })),
-
-  recordTutorialEvalResult: (a: AuthSession, input: TutorialEvalRecordInput) =>
-    jsonOrThrow<{ ok?: boolean; job?: TutorialEvalJob }>(
-      callWithRefresh(a, (token) =>
-        fetch(`/api/admin/tutorials/eval-jobs/${encodeURIComponent(input.jobId)}/evidence`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify({
-            result: input.result ?? (input.status === "failed" ? "failed" : "passed"),
-            evidence: input.evidence ?? { notes: input.notes, summary: input.summary },
-          }),
-        }),
-      ),
-    ),
+  // 社区教程 admin 审核 + 教程评测(/api/admin/tutorials/*)已整体迁往 lib/api/admin.ts
+  // (adminApi),管理后台页直接 import;用户端无调用点,故此处不再保留代理。
 
   // ── AI 市场（marketplace，见 packages/commercial/src/marketplace） ─────────
 
@@ -3588,100 +3474,38 @@ export const api = {
       ),
     ).then((b) => b.agents || []),
 
-  // ── 管理员审核（admin；后端 requireAdminVerifyDb 二次把关） ────────────────
+  // ── 管理员审核（admin；实现已迁 lib/api/admin.ts 的 adminApi） ─────────────
+  // why 惰性代理:市场审核面板(ReviewPanel)与精选管理(FeaturedPanel)是嵌在用户端
+  // 市场中心的 admin-only 组件,调用点保留 `api.*` 不动;真正的实现(含全部
+  // /api/admin/marketplace/* 路径字符串)进 lib/api/admin.ts 按需动态加载,不再
+  // 占用户端首屏 chunk 体积。签名与迁出前一致,仅首跳多一次已缓存模块的 import()。
 
   /** 待审版本列表（GET /api/admin/marketplace/pending）。 */
-  adminMarketplacePending: (a: AuthSession) =>
-    jsonOrThrow<{ pending: MarketplacePending[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/admin/marketplace/pending", {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => b.pending || []),
+  adminMarketplacePending: (...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplacePending>) =>
+    import("./api/admin").then((m) => m.adminApi.adminMarketplacePending(...a)),
 
   /** AI 自动审批记录（GET /api/admin/marketplace/ai-reviews；review_source='ai'）。 */
-  adminMarketplaceAiReviews: (a: AuthSession) =>
-    jsonOrThrow<{ reviews: MarketplaceAiReview[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/admin/marketplace/ai-reviews", {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => b.reviews || []),
+  adminMarketplaceAiReviews: (...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplaceAiReviews>) =>
+    import("./api/admin").then((m) => m.adminApi.adminMarketplaceAiReviews(...a)),
 
   /** 审核(批准/拒绝)一个版本（POST /api/admin/marketplace/:id/review）。 */
-  adminMarketplaceReview: (
-    a: AuthSession,
-    versionId: string,
-    decision: "approve" | "reject",
-    note?: string,
-    connectorReview?: {
-      securityDecision: Record<string, unknown>;
-      expectedSpecHash: string;
-      functionalVerified: true;
-    },
-  ) =>
-    jsonOrThrow<{ ok: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/admin/marketplace/${encodeURIComponent(versionId)}/review`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ decision, note, ...(connectorReview ?? {}) }),
-        }),
-      ),
-    ),
+  adminMarketplaceReview: (...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplaceReview>) =>
+    import("./api/admin").then((m) => m.adminApi.adminMarketplaceReview(...a)),
 
   /** 批量审核(批准/拒绝)多个待审版本（POST /api/admin/marketplace/review-batch）。 */
-  adminMarketplaceReviewBatch: (
-    a: AuthSession,
-    versionIds: string[],
-    decision: "approve" | "reject",
-    note?: string,
-  ) =>
-    jsonOrThrow<MarketplaceReviewBatchResult>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/admin/marketplace/review-batch", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ versionIds, decision, note }),
-        }),
-      ),
-    ),
+  adminMarketplaceReviewBatch: (...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplaceReviewBatch>) =>
+    import("./api/admin").then((m) => m.adminApi.adminMarketplaceReviewBatch(...a)),
 
   /** 下架(kill-switch)一个条目（POST /api/admin/marketplace/:slug/revoke）。 */
-  adminMarketplaceRevoke: (a: AuthSession, slug: string, reason?: string) =>
-    jsonOrThrow<{ ok: boolean; affectedInstalls: number; affectedUserIds: number[] }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/admin/marketplace/${encodeURIComponent(slug)}/revoke`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ reason }),
-        }),
-      ),
-    ),
+  adminMarketplaceRevoke: (...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplaceRevoke>) =>
+    import("./api/admin").then((m) => m.adminApi.adminMarketplaceRevoke(...a)),
 
   /**
    * 设置/取消精选（POST /api/admin/marketplace/:slug/featured；requireAdminVerifyDb）。
-   * featuredRank：1..9999 精选排序（越小越靠前）；null=取消精选。listing 不存在/非
-   * active 时后端返 404/409，上层据此提示。服务端契约见批3简报（并行 agent 实现）。
+   * featuredRank：1..9999 精选排序（越小越靠前）；null=取消精选。
    */
-  setMarketplaceFeatured: (a: AuthSession, slug: string, featuredRank: number | null) =>
-    jsonOrThrow<{ ok: boolean; slug: string; featuredRank: number | null }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/admin/marketplace/${encodeURIComponent(slug)}/featured`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ featuredRank }),
-        }),
-      ),
-    ),
+  setMarketplaceFeatured: (...a: Parameters<typeof import("./api/admin").adminApi.setMarketplaceFeatured>) =>
+    import("./api/admin").then((m) => m.adminApi.setMarketplaceFeatured(...a)),
 
   // ── 站内信（inbox，用户侧） ───────────────────────────────────────────
 
