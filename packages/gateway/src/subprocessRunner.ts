@@ -72,6 +72,26 @@ export function _isOfficialClaudeAbortResult(msg: SdkMessage): boolean {
     && (result.stop_reason === null || result.stop_reason === undefined)
 }
 
+/** Compact caller chain for `shutdown()` diagnostics: strip the Error header
+ * and this module's own frames, keep the next few `at …` lines as
+ * `fn (file:line)` tokens. Pure; exported for tests. */
+export function _shutdownOriginFrames(stack: string | undefined, max = 6): string[] {
+  if (!stack) return []
+  const out: string[] = []
+  for (const raw of stack.split('\n').slice(1)) {
+    const line = raw.trim()
+    if (!line.startsWith('at ')) continue
+    if (/subprocessRunner\.[cm]?[jt]s/.test(line)) continue
+    const m = /^at (?:async )?(.*?) \(?(?:file:\/\/)?([^()]*?):(\d+):\d+\)?$/.exec(line)
+    const token = m
+      ? `${m[1] || '<anonymous>'} (${m[2].split('/').slice(-2).join('/')}:${m[3]})`
+      : line.slice(3)
+    out.push(token)
+    if (out.length >= max) break
+  }
+  return out
+}
+
 export function _isExpectedOfficialClaudeAbortExit(args: {
   harness: 'ccb' | 'official-cc'
   code: number | null
@@ -1603,9 +1623,14 @@ export class SubprocessRunner extends EventEmitter {
       return
     }
     this.proc = proc as unknown as ChildProcessWithoutNullStreams
+    // Capture the resolver by value: a retired generation (official-cc abort
+    // recycle) may close stdout after a newer process already owns the shared
+    // field, and must not settle the newer barrier.
+    let resolveThisDrain!: () => void
     this.outputDrainPromise = new Promise<void>((resolve) => {
-      this.resolveOutputDrain = resolve
+      resolveThisDrain = resolve
     })
+    this.resolveOutputDrain = resolveThisDrain
     this.spawnedExecutionDescriptor = this.currentExecutionDescriptor
     // Emit BEFORE any stdout listener is attached, so subscribers (e.g. session
     // manager's per-CCB cost-tracker reset) run strictly before any 'message'
@@ -1651,8 +1676,8 @@ export class SubprocessRunner extends EventEmitter {
       // the normal parser before declaring the stream drained.
       if (this.proc === proc && this.stdoutBuf.length > 0) this.handleStdout('\n')
       stdoutClosed = true
-      this.resolveOutputDrain?.()
-      this.resolveOutputDrain = null
+      resolveThisDrain()
+      if (this.resolveOutputDrain === resolveThisDrain) this.resolveOutputDrain = null
       forwardDrainedExit()
     })
 
@@ -1842,6 +1867,13 @@ export class SubprocessRunner extends EventEmitter {
           } else {
             if (this.opts.harness === 'official-cc' && _isOfficialClaudeAbortResult(msg)) {
               this.officialAbortResultObserved = true
+              // Official Claude Code exits 1 a few seconds after this frame; a
+              // user turn submitted in that window would be written into a
+              // process that is already dying and surface as RUNNER_CRASHED.
+              // Retire the process generation now so the next submit() spawns
+              // a fresh one (--resume keeps the transcript), and so the
+              // trailing exit(1) is classified as an expected recycle.
+              this.retireOfficialAbortedProcess()
             }
             // Always update session ID (CCB may report a new one after --resume)
             if (msg.session_id && msg.session_id !== this.currentSessionId) {
@@ -2461,6 +2493,52 @@ export class SubprocessRunner extends EventEmitter {
     }
   }
 
+  /**
+   * Official Claude Code (`official-cc` harness) answers a cooperative Stop
+   * with one `aborted_streaming` result and then exits 1 on its own a few
+   * seconds later. Between those two points the process is still alive, so a
+   * follow-up submit() would happily write into it and then observe the
+   * exit(1) as a RUNNER_CRASHED terminal for the new turn.
+   *
+   * Detach the current process generation right away: `this.proc` is dropped
+   * so `isRunning` reports false and the next submit() spawns a fresh CLI
+   * (--resume keeps the transcript). The old process keeps its stdout listener
+   * (identity-guarded) and gets its own bounded reaper so a CLI that never
+   * exits cannot leak. The trailing exit is already classified as an expected
+   * recycle by `_isExpectedOfficialClaudeAbortExit`; because `this.proc` no
+   * longer points at it, that exit is also not forwarded as a runner 'exit'.
+   */
+  private retireOfficialAbortedProcess(): void {
+    const proc = this.proc
+    if (!proc) return
+    runnerLog.info('official-cc abort result observed; retiring process generation', {
+      sessionKey: this.opts.sessionKey,
+      pid: proc.pid,
+    })
+    // The exit handler and the stdout-close handler both bail on
+    // `this.proc !== proc`; the stdout-close handler still resolves the drain
+    // barrier captured for this generation.
+    this.proc = null
+    this.spawnedExecutionDescriptor = undefined
+    this._boundRepoBinding = null
+    this.closed = true
+    try { proc.stdin.end() } catch {}
+    const reaper = setTimeout(() => {
+      if (proc.exitCode === null && proc.signalCode === null) {
+        runnerLog.warn('official-cc did not exit after abort result; killing process group', {
+          sessionKey: this.opts.sessionKey,
+          pid: proc.pid,
+        })
+        killRunnerProcessGroup(proc, 'SIGKILL')
+      }
+    }, runnerShutdownTimeoutMs(
+      'OPENCLAUDE_RUNNER_SHUTDOWN_GRACE_MS',
+      RUNNER_SHUTDOWN_GRACE_DEFAULT_MS,
+    ))
+    reaper.unref?.()
+    proc.once('exit', () => clearTimeout(reaper))
+  }
+
   /** Remove the session's temp directory (extra-prompt.md, mcp-config.json, …). */
   private cleanupSessionDir(): void {
     if (this.sessionDir) {
@@ -2519,6 +2597,15 @@ export class SubprocessRunner extends EventEmitter {
       return
     }
     this.shuttingDown = true
+    // Who is recycling a live engine process is the single most useful fact
+    // when a turn later terminates as `子进程被信号 SIGKILL 终止`; the caller
+    // chain is otherwise invisible in production logs.
+    runnerLog.info('subprocess shutdown requested', {
+      sessionKey: this.opts.sessionKey,
+      pid: this.proc.pid,
+      harness: this.opts.harness ?? 'ccb',
+      origin: _shutdownOriginFrames(new Error().stack),
+    })
     try {
       this.proc.stdin.end()
     } catch {}
