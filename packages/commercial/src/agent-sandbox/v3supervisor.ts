@@ -709,7 +709,7 @@ function readCcbBaselineOptionalFromEnv(): boolean {
  *   3. baseline root、`AGENTS.md`、`CLAUDE.md`、`skills/`,以及 `V3_CCB_BASELINE_SKILL_NAMES`
  *      里每一条 skill 目录都:非 symlink、类型正确、root owned、非 group/other writable
  *   4. `skills/` 下的顶层条目**必须完全等于** manifest(多余的 / 未声明的条目直接拒)
- *   5. 每条 skill 目录下**必须只有** `SKILL.md` 一个文件,不允许 subdir / 其它文件 / symlink
+ *   5. 每条 skill 目录必须含 `SKILL.md`;可选 `evals/`(恰好 evals.json)、`references/`、`scripts/`(后两者为文件树,逐叶子 assertBaselineLeaf)。其它顶层条目一律拒
  *   6. 所有 realpath 都在 baseline root 内
  *
  * 任一项失败返回 null;调用方(provisionV3Container)按 OC_V3_CCB_BASELINE_OPTIONAL
@@ -723,11 +723,31 @@ function readCcbBaselineOptionalFromEnv(): boolean {
  *   未声明的条目(运维 rsync 漏带 `--delete` 的残余目录、手工误放的临时文件、
  *   被攻击者替换成 symlink 的"看起来不像 skill 但父目录挂进去就暴露"的项)都会跟着
  *   父目录一起进容器。必须额外用 `readdirSync` 断言 `skills/` 和每条 skill 目录下
- *   的条目**恰好等于** manifest / `["SKILL.md"]`,否则拒。
+ *   的条目**恰好等于** manifest / 白名单 `{SKILL.md, evals?, references?, scripts?}`,否则拒。
  *
  *   这样基线的"全有或全无"语义就严格成立 ——
  *   skills/ 下看见的 ≡ manifest 声明的 ≡ 每条都 root owned + mode safe + SKILL.md 合规。
  */
+/**
+ * 递归校验 baseline 子树(references/、scripts/):每个目录/文件都走
+ * assertBaselineLeaf(owner=root / 非 group-other 可写 / 非 symlink / realpath 不逃逸)。
+ * fifo/socket/device 一律拒。
+ */
+function assertBaselineTree(dirPath: string, baselineRoot: string): void {
+  assertBaselineLeaf(dirPath, "dir", baselineRoot);
+  for (const name of readdirSync(dirPath).sort()) {
+    const child = pathJoin(dirPath, name);
+    const st = lstatSync(child);
+    if (st.isDirectory()) {
+      assertBaselineTree(child, baselineRoot);
+    } else if (st.isFile()) {
+      assertBaselineLeaf(child, "file", baselineRoot);
+    } else {
+      throw new Error(`baseline tree entry is neither file nor directory: ${child}`);
+    }
+  }
+}
+
 export type CcbBaselineMountOpts = {
   /** role=admin 时挂不含租户限制守则的 *.admin.md；缺省/非 admin 仍挂完整守则。 */
   admin?: boolean;
@@ -791,20 +811,22 @@ export function resolveCcbBaselineMounts(
     for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
       const skillDir = pathJoin(skillsDirPath, name);
       assertBaselineLeaf(skillDir, "dir", abs);
-      // R3 codex HIGH#1 白名单(2026-07-16 显式扩展):skill 目录允许恰好
-      // {SKILL.md} 或 {SKILL.md, evals/};evals/ 目录内必须恰好只有 evals.json。
-      // 每个放行条目都走 assertBaselineLeaf 的 lstat 校验闭环(owner=root/非可写/
-      // 非 symlink/realpath 不逃逸);再支持 scripts/ references/ 时同样在此扩展。
+      // 白名单:SKILL.md 必有;evals/ / references/ / scripts/ 可选。
+      // evals/ 必须恰好 evals.json;references/ 与 scripts/ 为文件树,逐叶子
+      // assertBaselineLeaf(owner=root / 非 group-other 可写 / 非 symlink / 不逃逸)。
       const skillEntries = readdirSync(skillDir).sort();
-      const shapeOk =
-        (skillEntries.length === 1 && skillEntries[0] === "SKILL.md") ||
-        (skillEntries.length === 2 &&
-          skillEntries[0] === "SKILL.md" &&
-          skillEntries[1] === "evals");
-      if (!shapeOk) {
+      const allowed = new Set(["SKILL.md", "evals", "references", "scripts"]);
+      if (!skillEntries.includes("SKILL.md")) {
         throw new Error(
-          `skill dir ${name} must contain exactly SKILL.md (optionally plus evals/), got: ${JSON.stringify(skillEntries)}`,
+          `skill dir ${name} missing SKILL.md, got: ${JSON.stringify(skillEntries)}`,
         );
+      }
+      for (const entry of skillEntries) {
+        if (!allowed.has(entry)) {
+          throw new Error(
+            `skill dir ${name} has undeclared entry ${entry}; allowed: SKILL.md, evals/, references/, scripts/`,
+          );
+        }
       }
       const skillMd = pathJoin(skillDir, "SKILL.md");
       assertBaselineLeaf(skillMd, "file", abs);
@@ -819,6 +841,12 @@ export function resolveCcbBaselineMounts(
         }
         assertBaselineLeaf(pathJoin(evalsDir, "evals.json"), "file", abs);
       }
+      if (skillEntries.includes("references")) {
+        assertBaselineTree(pathJoin(skillDir, "references"), abs);
+      }
+      if (skillEntries.includes("scripts")) {
+        assertBaselineTree(pathJoin(skillDir, "scripts"), abs);
+      }
     }
     const admin = opts?.admin === true;
     return {
@@ -826,8 +854,11 @@ export function resolveCcbBaselineMounts(
       claudeMdHostPath: admin ? claudeAdminReal : claudeReal,
       skillsDirHostPath: skillsDirReal,
     };
-  } catch {
+  } catch (err) {
     // ENOENT / EACCES / 校验失败全走 fail-closed 路径(调用方处理)
+    log.warn("[v3supervisor] resolveCcbBaselineMounts failed", {
+      err: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 }

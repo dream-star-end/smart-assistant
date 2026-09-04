@@ -3434,14 +3434,46 @@ describe("resolveCcbBaselineMounts", () => {
     }
   });
 
-  test("(root only) rejects if a skill dir contains a subdirectory", () => {
-    // 未来要支持 scripts/ references/,必须显式改 manifest 校验代码扩白名单,
-    // 默认一律拒 —— parent-dir 挂载时 subdir 无论权限如何都会暴露进容器。
+  test("(root only) rejects if a skill dir contains an undeclared subdirectory", () => {
+    // scripts/ 与 references/ 已在白名单;其它 subdir 仍然 fail-closed。
     const b = makeFakeBaseline();
     if (!b) return;
     try {
       const target = V3_CCB_BASELINE_SKILL_NAMES[3]!;
-      mkdirSync(pathJoin(b.dir, "skills", target, "scripts"), { mode: 0o755 });
+      mkdirSync(pathJoin(b.dir, "skills", target, "tmpdir"), { mode: 0o755 });
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) accepts well-formed references/ and scripts/ trees", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      const target = V3_CCB_BASELINE_SKILL_NAMES[3]!;
+      const refs = pathJoin(b.dir, "skills", target, "references");
+      mkdirSync(pathJoin(refs, "templates"), { recursive: true, mode: 0o755 });
+      writeFileSync(pathJoin(refs, "templates", "template.py"), "print(1)\n", { mode: 0o644 });
+      const scriptsDir = pathJoin(b.dir, "skills", target, "scripts");
+      mkdirSync(scriptsDir, { mode: 0o755 });
+      writeFileSync(pathJoin(scriptsDir, "run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+      const got = resolveCcbBaselineMounts(b.dir);
+      assert.ok(got);
+      assert.ok(got.skillsDirHostPath.endsWith("/skills"));
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects references/ that contains a symlink", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      const target = V3_CCB_BASELINE_SKILL_NAMES[3]!;
+      const refs = pathJoin(b.dir, "skills", target, "references");
+      mkdirSync(refs, { mode: 0o755 });
+      symlinkSync("/etc/hostname", pathJoin(refs, "escape"));
       assert.equal(resolveCcbBaselineMounts(b.dir), null);
     } finally {
       b.cleanup();
