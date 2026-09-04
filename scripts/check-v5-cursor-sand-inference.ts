@@ -86,4 +86,35 @@ assert.match(frames, /CursorStablePoolIdentity/)
 assert.match(commercialDeploy, /check-v5-cursor-sand-inference\.ts/)
 assert.match(selfhostRelease, /check-v5-cursor-sand-inference\.ts/)
 
+// INC-20260903-CURSOR-CLI-ERROR-WASH: finish() must keep sanitized Cursor CLI error text on tape.
+// The washed literal 'Cursor CLI failed' must not come back as the ENGINE_ERROR detail; the
+// redacted first-line summary goes through cursorCliErrorSanitize and the raw is only warn-logged.
+const sanitizer = readFileSync(resolve(root, 'packages/gateway/src/engine/cursorCliErrorSanitize.ts'), 'utf8')
+const sanitizerTests = readFileSync(resolve(root, 'packages/gateway/src/__tests__/cursorCliErrorSanitize.test.ts'), 'utf8')
+assert.match(registry, /formatCursorCliFailureDetail\(detail\)/)
+assert.match(registry, /error: formatCursorCliFailureLog\(detail\)/)
+assert.doesNotMatch(registry, /: 'Cursor CLI failed'/)
+assert.match(sanitizer, /export const CURSOR_CLI_FAILURE_DETAIL_MAX = 200/)
+assert.match(sanitizer, /export const CURSOR_CLI_FAILURE_LOG_MAX = 2000/)
+assert.match(sanitizerTests, /keeps the first-line Sand root cause under the tape cap/)
+
+// INC-20260904-OFFICIAL-CC-STOP-STALE-PROCESS: official Claude Code answers Stop with an
+// `aborted_streaming` result and exits 1 a few seconds later. The runner must retire that
+// process generation on the result frame (never keep writing the next user turn into the
+// dying CLI, never surface its trailing exit(1) as RUNNER_CRASHED) and log who asked for
+// every shutdown so recover-loop triggers are attributable.
+const runner = readFileSync(resolve(root, 'packages/gateway/src/subprocessRunner.ts'), 'utf8')
+const runnerAbortTests = readFileSync(
+  resolve(root, 'packages/gateway/src/__tests__/subprocessRunnerOfficialAbortRecycle.test.ts'),
+  'utf8',
+)
+assert.match(runner, /this\.opts\.harness === 'official-cc' && _isOfficialClaudeAbortResult\(msg\)/)
+assert.match(runner, /this\.retireOfficialAbortedProcess\(\)/)
+assert.match(runner, /private retireOfficialAbortedProcess\(\): void/)
+assert.match(runner, /official-cc abort result observed; retiring process generation/)
+assert.match(runner, /official-cc did not exit after abort result; killing process group/)
+assert.match(runner, /origin: _shutdownOriginFrames\(new Error\(\)\.stack\)/)
+assert.match(runnerAbortTests, /detaches proc, reports not running, and swallows the trailing exit\(1\)/)
+assert.match(runnerAbortTests, /retired generation stdout close does not settle a newer generation barrier/)
+
 console.log('[cursor-sand-inference] PASS — Sand keys use InferenceService with native tool schemas; native Cursor stays isolated to native keys and Auto')
