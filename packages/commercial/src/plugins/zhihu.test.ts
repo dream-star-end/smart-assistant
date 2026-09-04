@@ -461,6 +461,15 @@ describe('official Zhihu Plugin', () => {
     assert.match(ZHIHU_WORKER_SOURCE, /canonical === 'www\.zhihu\.com'/)
   })
 
+  test('question projection emits diagnostic steps and waits for SPA render', () => {
+    assert.match(ZHIHU_WORKER_SOURCE, /question\.project/)
+    assert.match(ZHIHU_WORKER_SOURCE, /question\.answers/)
+    assert.match(ZHIHU_WORKER_SOURCE, /waitQuestionRendered/)
+    assert.match(ZHIHU_WORKER_SOURCE, /id-mismatch/)
+    assert.match(ZHIHU_WORKER_SOURCE, /no-title/)
+    assert.match(ZHIHU_WORKER_SOURCE, /typeof event.hits === 'number'/)
+  })
+
   test('filteredState keeps z_c0 from both .zhihu.com and www.zhihu.com', () => {
     const { cookieDomainAllowed, isZhihuAuthHost, filteredState } = compileFilteredStateHarness()
     const allowed = new Set(['zhihu.com', 'zhuanlan.zhihu.com', 'zhimg.com'])

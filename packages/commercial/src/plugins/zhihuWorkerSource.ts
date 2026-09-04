@@ -65,6 +65,7 @@ function emitStep(event) {
       if (typeof event.step === 'string') payload.step = String(event.step).slice(0, 64);
       if (event.ok === true || event.ok === false) payload.ok = event.ok;
       if (typeof event.ms === 'number' && Number.isFinite(event.ms)) payload.ms = Math.round(event.ms);
+      if (typeof event.hits === 'number' && Number.isFinite(event.hits)) payload.hits = Math.round(event.hits);
       if (typeof event.candidateCount === 'number' && Number.isFinite(event.candidateCount)) payload.candidateCount = Math.round(event.candidateCount);
       if (typeof event.code === 'string') payload.code = String(event.code).slice(0, 64);
       if (typeof event.actionId === 'string') payload.actionId = String(event.actionId).slice(0, 64);
@@ -498,13 +499,18 @@ async function projectProfile(page, expectedToken) {
   if (!data) throw new Error('profile');
   return data;
 }
+async function waitQuestionRendered(page) {
+  await page.waitForSelector('h1, .QuestionHeader-title, [class*="QuestionHeader"]', { timeout: 15_000 }).catch(() => null);
+}
 async function projectQuestion(page, expectedId) {
-  const data = await page.evaluate((expected) => {
+  await waitQuestionRendered(page);
+  const result = await page.evaluate((expected) => {
     const visible = (element) => {
       const bounds = element.getBoundingClientRect();
       const style = getComputedStyle(element);
       return bounds.width > 0 && bounds.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
     };
+    const clean = (value) => (value || '').replace(/\s+/g, ' ').trim().slice(0, 500);
     const idFrom = (raw) => {
       try {
         const url = new URL(raw, location.href);
@@ -512,9 +518,26 @@ async function projectQuestion(page, expectedId) {
         return match ? match[1] : null;
       } catch { return null; }
     };
-    const questionId = expected || idFrom(location.href);
-    const heading = Array.from(document.querySelectorAll('h1')).find(visible);
-    const title = (heading && heading.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+    const pathname = location.pathname || '';
+    const parsedId = idFrom(location.href);
+    const visibleH1s = Array.from(document.querySelectorAll('h1')).filter(visible);
+    const headerTitles = Array.from(document.querySelectorAll('.QuestionHeader-title')).filter(visible);
+    const headerTitleWild = Array.from(document.querySelectorAll('[class*="QuestionHeader-title"]')).filter(visible);
+    let title = clean(visibleH1s[0] && visibleH1s[0].textContent);
+    if (!title) title = clean(headerTitles[0] && headerTitles[0].textContent);
+    if (!title) title = clean(headerTitleWild[0] && headerTitleWild[0].textContent);
+    if (!title) title = clean((document.title || '').replace(/\s+- 知乎\s*$/, ''));
+    const hits = visibleH1s.length || headerTitles.length || headerTitleWild.length || (title ? 1 : 0);
+    const candidateCount = headerTitles.length + headerTitleWild.length;
+    const fail = (reason) => ({ ok: false, reason, hits, candidateCount, pathname, data: null });
+    if (expected) {
+      if (!parsedId) return fail('no-id');
+      if (parsedId !== expected) return fail('id-mismatch');
+    } else if (!parsedId) {
+      return fail('no-id');
+    }
+    if (!title) return fail('no-title');
+    const questionId = parsedId || expected;
     const detailEl = Array.from(document.querySelectorAll('.QuestionRichText, [class*="QuestionRichText"], .QuestionHeader-detail')).find(visible);
     const detail = (detailEl && detailEl.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 5000);
     let followerCount = 0;
@@ -525,18 +548,33 @@ async function projectQuestion(page, expectedId) {
     const scale = (unit) => unit === '亿' ? 100000000 : unit === '万' ? 10000 : 1;
     if (followMatch) followerCount = Math.max(0, Math.round(Number(followMatch[1]) * scale(followMatch[2])));
     if (answerMatch) answerCount = Math.max(0, Math.round(Number(answerMatch[1]) * scale(answerMatch[2])));
-    if (!questionId || !title) return null;
-    if (expected && questionId !== expected) return null;
     return {
-      id: questionId, title, detail, followerCount, answerCount,
-      url: 'https://www.zhihu.com/question/' + questionId
+      ok: true,
+      reason: '',
+      hits,
+      candidateCount,
+      pathname,
+      data: {
+        id: questionId, title, detail, followerCount, answerCount,
+        url: 'https://www.zhihu.com/question/' + questionId
+      }
     };
   }, expectedId || null);
-  if (!data) throw new Error('question');
-  return data;
+  const ok = !!(result && result.ok && result.data);
+  emitStep({
+    step: 'question.project',
+    ok,
+    reason: ok ? undefined : ((result && result.reason) || 'no-title'),
+    pathname: result && result.pathname,
+    hits: result && typeof result.hits === 'number' ? result.hits : 0,
+    candidateCount: result && typeof result.candidateCount === 'number' ? result.candidateCount : 0
+  });
+  if (!ok) throw new Error('question');
+  return result.data;
 }
 async function collectAnswers(page, questionId, limit) {
-  const rows = await page.evaluate((input) => {
+  await page.waitForSelector('.AnswerItem, .ContentItem.AnswerItem, [data-zop], .List-item', { timeout: 15_000 }).catch(() => null);
+  const scan = () => page.evaluate((input) => {
     const visible = (element) => {
       const bounds = element.getBoundingClientRect();
       const style = getComputedStyle(element);
@@ -544,7 +582,9 @@ async function collectAnswers(page, questionId, limit) {
     };
     const items = [];
     const seen = new Set();
-    for (const node of document.querySelectorAll('[data-zop], .ContentItem, .List-item, .AnswerItem')) {
+    const nodes = document.querySelectorAll('[data-zop], .ContentItem, .List-item, .AnswerItem, .QuestionAnswers-answers .List-item, [itemprop="suggestedAnswer"], div[data-za-detail-view-path-module="AnswerItem"]');
+    const candidateCount = nodes.length;
+    for (const node of nodes) {
       if (!visible(node)) continue;
       let zop = null;
       const raw = node.getAttribute('data-zop');
@@ -586,11 +626,31 @@ async function collectAnswers(page, questionId, limit) {
       });
       if (items.length >= input.limit) break;
     }
-    return items;
+    return { items, candidateCount };
   }, { questionId, limit });
+  let scanned = await scan();
+  let rows = scanned && Array.isArray(scanned.items) ? scanned.items : [];
+  let candidateCount = scanned && typeof scanned.candidateCount === 'number' ? scanned.candidateCount : 0;
+  for (let attempt = 0; attempt < 2 && rows.length === 0; attempt += 1) {
+    await page.mouse.wheel(0, 1500);
+    await page.waitForTimeout(1500);
+    scanned = await scan();
+    rows = scanned && Array.isArray(scanned.items) ? scanned.items : [];
+    candidateCount = scanned && typeof scanned.candidateCount === 'number' ? scanned.candidateCount : 0;
+  }
+  let pathname = '';
+  try { pathname = new URL(page.url()).pathname; } catch {}
+  emitStep({
+    step: 'question.answers',
+    ok: rows.length > 0,
+    hits: rows.length,
+    candidateCount,
+    pathname
+  });
   return rows;
 }
 async function projectAnswer(page, expectedId) {
+  await page.waitForSelector('.RichContent-inner, .RichText, [class*="RichContent"], .AnswerItem, [data-zop]', { timeout: 15_000 }).catch(() => null);
   const data = await page.evaluate((expected) => {
     const visible = (element) => {
       const bounds = element.getBoundingClientRect();
@@ -684,6 +744,7 @@ async function collectComments(page, answerId, limit) {
     await open.click({ timeout: 10_000 }).catch(() => {});
     await page.waitForTimeout(1200);
   }
+  await page.waitForSelector('[class*="CommentItem"], [class*="comment-item"], [data-id]', { timeout: 15_000 }).catch(() => null);
   const rows = await page.evaluate((input) => {
     const visible = (element) => {
       const bounds = element.getBoundingClientRect();
@@ -909,6 +970,7 @@ async function actionRead(page, input) {
   if (input.actionId === 'list_question_answers') {
     await ensureSelfToken(page);
     await gotoAuthenticated(page, 'https://www.zhihu.com/question/' + params.questionId);
+    await waitQuestionRendered(page);
     const answers = await collectAnswers(page, params.questionId, limit);
     const complete = answers.length < limit;
     return { answers, complete, ...(answers.length === 0 ? { degradedReason: 'empty_list' } : {}) };
