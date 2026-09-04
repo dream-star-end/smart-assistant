@@ -501,6 +501,7 @@ describe('official Zhihu Plugin', () => {
     assert.match(ZHIHU_WORKER_SOURCE, /people-page-token-mismatch/)
     assert.match(ZHIHU_WORKER_SOURCE, /profile-projection-null/)
     assert.match(ZHIHU_WORKER_SOURCE, /step: 'login\.qr_refresh'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /login\.loop_error/)
     assert.match(ZHIHU_WORKER_SOURCE, /https:\/\/www\.zhihu\.com\/people\/edit/)
     assert.match(ZHIHU_WORKER_SOURCE, /我的主页/)
     assert.match(ZHIHU_WORKER_SOURCE, /bounds\.top > 200/)
@@ -656,14 +657,14 @@ describe('official Zhihu Plugin', () => {
 
   test('worker resources and coalesced protocol frames', () => {
     assert.deepEqual(resolveZhihuWorkerResources('action'), {
-      memoryBytes: 768 * 1024 * 1024,
-      memorySwapBytes: 768 * 1024 * 1024,
+      memoryBytes: 1024 * 1024 * 1024,
+      memorySwapBytes: 1024 * 1024 * 1024,
       pidsLimit: 128,
       shmSizeBytes: 64 * 1024 * 1024,
     })
     assert.deepEqual(resolveZhihuWorkerResources('login'), {
-      memoryBytes: 768 * 1024 * 1024,
-      memorySwapBytes: 768 * 1024 * 1024,
+      memoryBytes: 1536 * 1024 * 1024,
+      memorySwapBytes: 1536 * 1024 * 1024,
       pidsLimit: 256,
       shmSizeBytes: 256 * 1024 * 1024,
     })

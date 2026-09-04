@@ -50,8 +50,8 @@ export function resolveZhihuWorkerResources(kind: 'action' | 'login'): {
   shmSizeBytes: number
 } {
   return {
-    memoryBytes: 768 * 1024 * 1024,
-    memorySwapBytes: 768 * 1024 * 1024,
+    memoryBytes: kind === 'login' ? 1536 * 1024 * 1024 : 1024 * 1024 * 1024,
+    memorySwapBytes: kind === 'login' ? 1536 * 1024 * 1024 : 1024 * 1024 * 1024,
     pidsLimit: kind === 'login' ? 256 : 128,
     shmSizeBytes: kind === 'login' ? 256 * 1024 * 1024 : 64 * 1024 * 1024,
   }

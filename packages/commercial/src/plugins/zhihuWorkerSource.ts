@@ -1867,7 +1867,7 @@ function urlPathname(raw) {
 }
 async function proveSelf(context) {
   const started = Date.now();
-  const page = await context.newPage();
+  let page = await context.newPage();
   let peoplePage = null;
   let settled = false;
   try {
@@ -1894,6 +1894,8 @@ async function proveSelf(context) {
         if (!settled) emitStep({ step: 'login.prove_self', ok: false, reason: 'home-no-unique-token', candidateCount: Array.from(new Set(topBar)).length });
         return null;
       }
+      await page.close().catch(() => {});
+      page = null;
       peoplePage = await context.newPage();
       await gotoAuthenticated(peoplePage, 'https://www.zhihu.com/people/' + first);
       const path = urlPathname(peoplePage.url());
@@ -1930,7 +1932,7 @@ async function proveSelf(context) {
   } catch { return null; }
   finally {
     if (peoplePage) await peoplePage.close().catch(() => {});
-    await page.close().catch(() => {});
+    if (page) await page.close().catch(() => {});
   }
 }
 async function runLogin(input, relay) {
@@ -1951,49 +1953,54 @@ async function runLogin(input, relay) {
     let nextProbe = 0;
     let signalEmitted = false;
     let probeHits = 0;
-    while (Date.now() < input.deadlineMs) {
-      await assertNoChallenge(home);
-      if (!signalEmitted && Date.now() >= nextQr) {
-        nextQr = Date.now() + QR_REFRESH_MS;
-        try {
-          await switchToQrLogin(home);
-          const fresh = await captureQr(home);
-          if (fresh) {
-            const freshHash = digest(fresh.toString('base64'));
-            if (freshHash !== qrHash) {
-              qrHash = freshHash;
-              png = fresh;
-              writeFrame({ event: 'qr', png: png.toString('base64') });
-              emitStep({ step: 'login.qr_refresh' });
+    try {
+      while (Date.now() < input.deadlineMs) {
+        await assertNoChallenge(home);
+        if (!signalEmitted && Date.now() >= nextQr) {
+          nextQr = Date.now() + QR_REFRESH_MS;
+          try {
+            await switchToQrLogin(home);
+            const fresh = await captureQr(home);
+            if (fresh) {
+              const freshHash = digest(fresh.toString('base64'));
+              if (freshHash !== qrHash) {
+                qrHash = freshHash;
+                png = fresh;
+                writeFrame({ event: 'qr', png: png.toString('base64') });
+                emitStep({ step: 'login.qr_refresh' });
+              }
             }
+          } catch {
+            emitStep({ step: 'login.qr_refresh', ok: false });
           }
-        } catch {
-          emitStep({ step: 'login.qr_refresh', ok: false });
         }
-      }
-      const cookieChanged = (await authCookieDigest(context)) !== initialCookies;
-      const leftSignin = !/\/signin/.test(home.url());
-      const signal = cookieChanged || leftSignin;
-      if (signal && !signalEmitted) {
-        signalEmitted = true;
-        emitStep({
-          step: 'login.signal',
-          ok: true,
-          reason: cookieChanged ? 'cookie-changed' : 'url-left-signin',
-          pathname: urlPathname(home.url())
-        });
-      }
-      if (signal && Date.now() >= nextProbe) {
-        probeHits += 1;
-        emitStep({ step: 'login.probe', ok: true, hits: probeHits });
-        const selfId = await proveSelf(context);
-        nextProbe = Date.now() + 5_000;
-        if (selfId) {
-          const state = filteredState(await context.storageState(), input.cookieDomains, input.stateOrigins);
-          await writeTerminalAndExit({ event: 'authenticated', storageState: state });
+        const cookieChanged = (await authCookieDigest(context)) !== initialCookies;
+        const leftSignin = !/\/signin/.test(home.url());
+        const signal = cookieChanged || leftSignin;
+        if (signal && !signalEmitted) {
+          signalEmitted = true;
+          emitStep({
+            step: 'login.signal',
+            ok: true,
+            reason: cookieChanged ? 'cookie-changed' : 'url-left-signin',
+            pathname: urlPathname(home.url())
+          });
         }
+        if (signal && Date.now() >= nextProbe) {
+          probeHits += 1;
+          emitStep({ step: 'login.probe', ok: true, hits: probeHits });
+          const selfId = await proveSelf(context);
+          nextProbe = Date.now() + 5_000;
+          if (selfId) {
+            const state = filteredState(await context.storageState(), input.cookieDomains, input.stateOrigins);
+            await writeTerminalAndExit({ event: 'authenticated', storageState: state });
+          }
+        }
+        await home.waitForTimeout(800);
       }
-      await home.waitForTimeout(800);
+    } catch (e) {
+      emitStep({ step: 'login.loop_error', ok: false, reason: /crash/i.test(String(e && e.message || e)) ? 'target-crashed' : /closed/i.test(String(e && e.message || e)) ? 'page-closed' : 'error' });
+      throw e;
     }
     await writeTerminalAndExit({ event: 'failed', code: 'LOGIN_EXPIRED' });
   } finally { await browser.close(); }
