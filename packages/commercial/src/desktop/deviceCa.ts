@@ -83,11 +83,6 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
-async function writeMode(file: string, data: string, mode: number): Promise<void> {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, data, { mode });
-}
-
 export async function certFingerprintSha256Bytes(certPem: string): Promise<Buffer> {
   const out = await opensslRun(["x509", "-noout", "-fingerprint", "-sha256"], certPem, "verify");
   const m = /Fingerprint=([0-9A-F:]+)/i.exec(out);
@@ -137,21 +132,133 @@ export interface DeviceCaMaterial {
   caCertPath: string;
 }
 
-export async function ensureDeviceCa(): Promise<DeviceCaMaterial> {
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function pidAlive(pid: number): Promise<boolean> {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+let localLockDepth = 0;
+
+async function withDeviceCaLock<T>(fn: () => Promise<T>): Promise<T> {
+  if (localLockDepth > 0) return fn();
   const dir = deviceCaDir();
-  const keyPath = path.join(dir, "ca.key");
-  const crtPath = path.join(dir, "ca.crt");
-  if (!(await exists(keyPath)) || !(await exists(crtPath))) {
-    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const lockPath = path.join(dir, ".init.lock");
+  const deadline = Date.now() + 30_000;
+  while (true) {
+    try {
+      const fh = await fs.open(lockPath, "wx", 0o600);
+      try {
+        await fh.writeFile(String(process.pid));
+        localLockDepth += 1;
+        try {
+          return await fn();
+        } finally {
+          localLockDepth -= 1;
+        }
+      } finally {
+        await fh.close().catch(() => {});
+        await fs.unlink(lockPath).catch(() => {});
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      if (Date.now() > deadline) {
+        throw new DeviceCaError("init", "timeout waiting for device CA init lock");
+      }
+      try {
+        const raw = (await fs.readFile(lockPath, "utf8")).trim();
+        const pid = Number(raw);
+        if (Number.isInteger(pid) && pid > 0 && !(await pidAlive(pid))) {
+          await fs.unlink(lockPath).catch(() => {});
+          continue;
+        }
+      } catch {
+        // lock disappeared or unreadable; retry create
+      }
+      await sleep(50);
+    }
+  }
+}
+
+function normalizePem(pem: string): string {
+  return pem.replace(/\r/g, "").trim();
+}
+
+async function assertKeyMatchesCert(keyPem: string, certPem: string, stage: DeviceCaError["stage"]): Promise<void> {
+  const pubFromCert = normalizePem(await opensslRun(["x509", "-noout", "-pubkey"], certPem, stage));
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "oc-dca-pair-"));
+  try {
+    const keyFile = path.join(tmp, "k.pem");
+    await fs.writeFile(keyFile, keyPem, { mode: 0o600 });
+    const pubFromKey = normalizePem(await opensslRun(["pkey", "-pubout", "-in", keyFile], undefined, stage));
+    if (pubFromCert !== pubFromKey) {
+      throw new DeviceCaError(stage, "device CA key/cert public key mismatch");
+    }
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+}
+
+async function assertCertIssuedByCa(certPem: string, caCertPem: string, stage: DeviceCaError["stage"]): Promise<void> {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "oc-dca-ver-"));
+  try {
+    const caFile = path.join(tmp, "ca.crt");
+    const leafFile = path.join(tmp, "leaf.crt");
+    await fs.writeFile(caFile, caCertPem, { mode: 0o644 });
+    await fs.writeFile(leafFile, certPem, { mode: 0o644 });
+    await opensslRun(["verify", "-CAfile", caFile, leafFile], undefined, stage);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+}
+
+async function atomicPublish(finalPath: string, contents: string, mode: number): Promise<void> {
+  const tmpPath = `${finalPath}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
+  await fs.writeFile(tmpPath, contents, { mode });
+  await fs.rename(tmpPath, finalPath);
+}
+
+async function loadOrRejectHalfSet(keyPath: string, crtPath: string, stage: DeviceCaError["stage"]): Promise<{ key: string; cert: string } | "missing"> {
+  const keyOk = await exists(keyPath);
+  const crtOk = await exists(crtPath);
+  if (!keyOk && !crtOk) return "missing";
+  if (keyOk !== crtOk) {
+    throw new DeviceCaError(stage, `device CA half-set at ${keyOk ? keyPath : crtPath} (refusing to overwrite)`);
+  }
+  const key = await fs.readFile(keyPath, "utf8");
+  const cert = await fs.readFile(crtPath, "utf8");
+  await assertKeyMatchesCert(key, cert, stage);
+  return { key, cert };
+}
+
+export async function ensureDeviceCa(): Promise<DeviceCaMaterial> {
+  return withDeviceCaLock(async () => {
+    const dir = deviceCaDir();
+    const keyPath = path.join(dir, "ca.key");
+    const crtPath = path.join(dir, "ca.crt");
+    const existing = await loadOrRejectHalfSet(keyPath, crtPath, "init");
+    if (existing !== "missing") {
+      return { caCertPem: existing.cert, caKeyPath: keyPath, caCertPath: crtPath };
+    }
     const key = await opensslRun(
       ["ecparam", "-name", "prime256v1", "-genkey", "-noout"],
       undefined,
       "init",
     );
-    await writeMode(keyPath, key, 0o600);
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "oc-dca-"));
     try {
       const extPath = path.join(tmp, "ca.cnf");
+      const tmpCrt = path.join(tmp, "ca.crt");
+      const tmpKey = path.join(tmp, "ca.key");
+      await fs.writeFile(tmpKey, key, { mode: 0o600 });
       await fs.writeFile(
         extPath,
         [
@@ -171,22 +278,25 @@ export async function ensureDeviceCa(): Promise<DeviceCaMaterial> {
       await opensslRun(
         [
           "req", "-new", "-x509",
-          "-key", keyPath,
+          "-key", tmpKey,
           "-sha256",
           "-days", "3650",
           "-config", extPath,
-          "-out", crtPath,
+          "-out", tmpCrt,
         ],
         undefined,
         "init",
       );
-      await fs.chmod(crtPath, 0o644);
+      const certPem = await fs.readFile(tmpCrt, "utf8");
+      await assertKeyMatchesCert(key, certPem, "init");
+      await atomicPublish(keyPath, key, 0o600);
+      await atomicPublish(crtPath, certPem, 0o644);
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
     }
-  }
-  const caCertPem = await fs.readFile(crtPath, "utf8");
-  return { caCertPem, caKeyPath: keyPath, caCertPath: crtPath };
+    const caCertPem = await fs.readFile(crtPath, "utf8");
+    return { caCertPem, caKeyPath: keyPath, caCertPath: crtPath };
+  });
 }
 
 export interface IssuedDeviceCert {
@@ -269,18 +379,25 @@ export interface DesktopOriginMaterial {
 
 /** Server leaf for 18445 (serverAuth). Isolated from 18443 host CA. */
 export async function ensureDesktopOriginCert(): Promise<DesktopOriginMaterial> {
-  const ca = await ensureDeviceCa();
-  const dir = deviceCaDir();
-  const keyPath = path.join(dir, "origin.key");
-  const crtPath = path.join(dir, "origin.crt");
-  if (!(await exists(keyPath)) || !(await exists(crtPath))) {
+  return withDeviceCaLock(async () => {
+    const ca = await ensureDeviceCa();
+    const dir = deviceCaDir();
+    const keyPath = path.join(dir, "origin.key");
+    const crtPath = path.join(dir, "origin.crt");
+    const existing = await loadOrRejectHalfSet(keyPath, crtPath, "sign");
+    if (existing !== "missing") {
+      await assertCertIssuedByCa(existing.cert, ca.caCertPem, "verify");
+      return { certPem: existing.cert, keyPem: existing.key, caCertPem: ca.caCertPem };
+    }
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "oc-dorigin-"));
     try {
       const keyPem = await opensslRun(["ecparam", "-name", "prime256v1", "-genkey", "-noout"], undefined, "sign");
-      await writeMode(keyPath, keyPem, 0o600);
+      const tmpKey = path.join(tmp, "origin.key");
       const csrPath = path.join(tmp, "origin.csr");
       const extPath = path.join(tmp, "ext.cnf");
-      await opensslRun(["req", "-new", "-key", keyPath, "-subj", "/CN=openclaude-desktop-origin", "-out", csrPath], undefined, "sign");
+      const tmpCrt = path.join(tmp, "origin.crt");
+      await fs.writeFile(tmpKey, keyPem, { mode: 0o600 });
+      await opensslRun(["req", "-new", "-key", tmpKey, "-subj", "/CN=openclaude-desktop-origin", "-out", csrPath], undefined, "sign");
       await fs.writeFile(
         extPath,
         [
@@ -294,16 +411,20 @@ export async function ensureDesktopOriginCert(): Promise<DesktopOriginMaterial> 
       await opensslRun([
         "x509", "-req", "-in", csrPath, "-CA", ca.caCertPath, "-CAkey", ca.caKeyPath,
         "-set_serial", `0x${randomBytes(8).toString("hex")}`,
-        "-days", "365", "-extfile", extPath, "-sha256", "-out", crtPath,
+        "-days", "365", "-extfile", extPath, "-sha256", "-out", tmpCrt,
       ]);
-      await fs.chmod(crtPath, 0o644);
+      const certPem = await fs.readFile(tmpCrt, "utf8");
+      await assertKeyMatchesCert(keyPem, certPem, "sign");
+      await assertCertIssuedByCa(certPem, ca.caCertPem, "verify");
+      await atomicPublish(keyPath, keyPem, 0o600);
+      await atomicPublish(crtPath, certPem, 0o644);
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
     }
-  }
-  return {
-    certPem: await fs.readFile(crtPath, "utf8"),
-    keyPem: await fs.readFile(keyPath, "utf8"),
-    caCertPem: ca.caCertPem,
-  };
+    return {
+      certPem: await fs.readFile(crtPath, "utf8"),
+      keyPem: await fs.readFile(keyPath, "utf8"),
+      caCertPem: ca.caCertPem,
+    };
+  });
 }
