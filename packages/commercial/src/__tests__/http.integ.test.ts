@@ -295,6 +295,17 @@ describe("commercial HTTP router (integ)", () => {
     const user = me.json.user as Record<string, unknown>;
     assert.equal(user.email, "alice@example.com");
     assert.equal(user.role, "user");
+
+    const funnel = await query<{ surface: string; stage: string; code: string; outcome: string }>(
+      `SELECT surface, stage, code, outcome
+         FROM product_friction_events
+        WHERE user_id = $1
+        ORDER BY created_at`,
+      [String(reg.json.user_id)],
+    );
+    const keys = funnel.rows.map((row) => `${row.surface}/${row.stage}/${row.outcome}/${row.code}`);
+    assert.ok(keys.includes("auth/register/succeeded/REGISTERED"), keys.join(","));
+    assert.ok(keys.includes("auth/login/succeeded/email"), keys.join(","));
   });
 
   test("/api/me without token → 401 UNAUTHORIZED + standard error body", async (t) => {
@@ -579,6 +590,12 @@ describe("commercial HTTP router (integ)", () => {
     });
     assert.equal(r.status, 409);
     assert.equal((r.json.error as Record<string, unknown>).code, "CONFLICT");
+    const funnel = await query<{ code: string; outcome: string }>(
+      `SELECT code, outcome FROM product_friction_events
+        WHERE surface = 'auth' AND stage = 'register' AND code = 'CONFLICT'`,
+    );
+    assert.equal(funnel.rows.length, 1);
+    assert.equal(funnel.rows[0].outcome, "failed");
   });
 
   test("login wrong password → 401 INVALID_CREDENTIALS", async (t) => {
@@ -885,6 +902,12 @@ describe("commercial HTTP router (integ)", () => {
         ["abuse@tempmail-http-integ.test"],
       );
       assert.equal(u.rows[0].cnt, "0", "blocked register 不应落用户行");
+      const funnel = await query<{ code: string; outcome: string }>(
+        `SELECT code, outcome FROM product_friction_events
+          WHERE surface = 'auth' AND stage = 'register' AND code = 'EMAIL_DOMAIN_BLOCKED'`,
+      );
+      assert.equal(funnel.rows.length, 1);
+      assert.equal(funnel.rows[0].outcome, "failed");
     } finally {
       // beforeEach 不 TRUNCATE system_settings → 必须显式清,免得污染后续 case
       await query(

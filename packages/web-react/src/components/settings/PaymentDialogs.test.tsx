@@ -6,6 +6,13 @@ import type { AuthSession, HupiCreateResult, MySubscription } from "../../lib/ty
 import { SubscriptionDialog } from "./SubscriptionDialog";
 import { TopupDialog } from "./TopupDialog";
 
+const friction = vi.hoisted(() => ({
+  reportClientFrictionOnce: vi.fn(() => "eid"),
+  reportClientFriction: vi.fn(() => "eid"),
+  resetClientFrictionOnceForTests: vi.fn(),
+}));
+vi.mock("../../lib/clientFriction", () => friction);
+
 const apiMocks = vi.hoisted(() => ({
   listPlans: vi.fn(),
   createHupiOrder: vi.fn(),
@@ -68,6 +75,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  friction.reportClientFrictionOnce.mockClear();
   Object.defineProperties(window.navigator, {
     userAgent: { configurable: true, value: "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0" },
     userAgentData: { configurable: true, value: undefined },
@@ -107,5 +115,24 @@ describe("个人支付弹窗的手机路径", () => {
       order.mobileUrl,
     );
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  test("打开订阅弹窗触发 pricing_exposure 一次", async () => {
+    apiMocks.listSubscriptionPlans.mockResolvedValue([
+      { code: "free", name: "免费版", priceCents: "0", monthlyCredits: "300", periodDays: 30, tier: 0 },
+    ]);
+    apiMocks.getMySubscription.mockResolvedValue(freeSub);
+    render(<SubscriptionDialog open auth={auth} onClose={() => {}} onPaid={() => {}} />);
+    await screen.findByText("当前套餐");
+    expect(friction.reportClientFrictionOnce).toHaveBeenCalledWith(
+      expect.stringMatching(/^billing:pricing_exposure:/),
+      {
+        surface: "billing",
+        stage: "pricing_exposure",
+        code: "PRICING_EXPOSURE",
+        outcome: "succeeded",
+      },
+      "t",
+    );
   });
 });

@@ -6,11 +6,14 @@ import {
   installGlobalClientFrictionHandlers,
   reportClientFriction,
   reportClientFrictionBatch,
+  reportClientFrictionOnce,
+  resetClientFrictionOnceForTests,
   scriptRefFromSource,
 } from "./clientFriction";
 
 afterEach(() => {
   document.querySelector('meta[name="oc-build"]')?.remove();
+  resetClientFrictionOnceForTests();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -156,5 +159,26 @@ describe("client friction reporter", () => {
       "skill.one",
       "skill.two",
     ]);
+  });
+
+  test("reportClientFrictionOnce dedupes the same key", () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: false })));
+
+    const first = reportClientFrictionOnce("billing:pricing_exposure", {
+      surface: "billing", stage: "pricing_exposure", code: "PRICING_EXPOSURE", outcome: "succeeded",
+    }, "token");
+    const second = reportClientFrictionOnce("billing:pricing_exposure", {
+      surface: "billing", stage: "pricing_exposure", code: "PRICING_EXPOSURE", outcome: "succeeded",
+    }, "token");
+
+    expect(first).toBeTruthy();
+    expect(second).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body));
+    expect(body).toMatchObject({
+      surface: "billing", stage: "pricing_exposure", code: "PRICING_EXPOSURE", outcome: "succeeded",
+    });
   });
 });

@@ -34,6 +34,7 @@ import { getBalanceBreakdown } from "../billing/spend.js";
 import { createPackOrder, createSubscriptionOrder } from "../payment/orders.js";
 import { HupijiaoError } from "../payment/hupijiao/client.js";
 import { recordQrIssueFailure } from "../payment/qrIssueFailure.js";
+import { recordProductFrictionEvent } from "../productFriction/events.js";
 
 // ─── GET /api/subscription/plans ─────────────────────────────────────────
 // 公开档位数据(定价本就是公开信息)。?scope=user(默认,向后兼容)| org。
@@ -151,6 +152,14 @@ async function createOrderAndQr(
     amountCents: args.amountCents,
     credits: args.credits,
   });
+  await recordProductFrictionEvent({
+    correlation: order.order_no,
+    userId: order.user_id,
+    surface: "payment",
+    stage: "checkout",
+    code: `${order.kind}_${order.plan_code ?? "none"}`.replace(/[^A-Za-z0-9_]/g, "_").slice(0, 64),
+    outcome: "succeeded",
+  }).catch(() => {});
   let qr: { qrcodeUrl: string; mobileUrl: string | null };
   try {
     qr = await deps.hupijiao.createQr({
@@ -242,6 +251,14 @@ export async function handleBuyPack(
   // 有效期内桶承载加量包；先确保有订阅行（履约侧也会就地兜底，但此处提前 bootstrap 更直观）。
   await ensureFreeSubscription(user.id);
   const { order, plan } = await createPackOrder({ userId: user.id });
+  await recordProductFrictionEvent({
+    correlation: order.order_no,
+    userId: order.user_id,
+    surface: "payment",
+    stage: "checkout",
+    code: `${order.kind}_${order.plan_code ?? "none"}`.replace(/[^A-Za-z0-9_]/g, "_").slice(0, 64),
+    outcome: "succeeded",
+  }).catch(() => {});
 
   let qr: { qrcodeUrl: string; mobileUrl: string | null };
   try {

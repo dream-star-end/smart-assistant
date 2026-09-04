@@ -1,7 +1,14 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { HupijiaoPaymentEntry, paymentClientKind } from "./HupijiaoPaymentEntry";
+
+const friction = vi.hoisted(() => ({
+  reportClientFrictionOnce: vi.fn(() => "eid"),
+  reportClientFriction: vi.fn(() => "eid"),
+  resetClientFrictionOnceForTests: vi.fn(),
+}));
+vi.mock("../../lib/clientFriction", () => friction);
 
 function setNavigator({
   userAgent,
@@ -25,6 +32,7 @@ function setNavigator({
 afterEach(() => {
   cleanup();
   sessionStorage.clear();
+  friction.reportClientFrictionOnce.mockClear();
   setNavigator({ userAgent: "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0" });
 });
 
@@ -78,6 +86,18 @@ describe("HupijiaoPaymentEntry 当前微信支付能力", () => {
       "https://pay.test/qr.png",
     );
     expect(screen.queryByTestId("mobile-payment-link")).not.toBeInTheDocument();
+    expect(friction.reportClientFrictionOnce).toHaveBeenCalledTimes(1);
+    expect(friction.reportClientFrictionOnce).toHaveBeenCalledWith(
+      "payment:qr_shown:order-1",
+      {
+        surface: "payment",
+        stage: "qr_shown",
+        code: "QR_SHOWN",
+        outcome: "succeeded",
+        sessionId: "order-1",
+      },
+      undefined,
+    );
   });
 
   test("普通手机只挂载安全的手机支付链接，不请求二维码", () => {
