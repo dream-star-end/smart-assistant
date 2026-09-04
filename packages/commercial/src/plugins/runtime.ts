@@ -43,6 +43,7 @@ import {
   loadVerifiedRuntimePluginContract,
 } from './review.js'
 import { WEIBO_PLUGIN_SLUG } from './weiboContract.js'
+import { ZHIHU_PLUGIN_SLUG } from './zhihuContract.js'
 import { managedPluginWritePolicy, managedPluginWritePreapprovalPolicy } from './writePolicy.js'
 
 export class PluginRuntimeFacadeError extends Error {
@@ -269,6 +270,29 @@ function knowledgePlanetRemovalIds(value: unknown): string[] {
   if (!Array.isArray(value) || value.some((item) => typeof item !== 'string'))
     throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin media removal ids are invalid')
   return [...new Set(value)] as string[]
+}
+
+function zhihuExactTargetSnapshot(
+  entity: Record<string, unknown> | undefined,
+  expectedId: string,
+  selfToken: string,
+): { expectedDigest: string; owned: true } | null {
+  const expectedDigest = entity?.contentDigest
+  const authorUrlToken = entity?.authorUrlToken
+  const revision = entity?.revision
+  const updatedAt = entity?.updatedAt
+  const hasRevision = typeof revision === 'string' && revision.length > 0
+  const hasUpdatedAt = typeof updatedAt === 'string' && updatedAt.length > 0
+  if (
+    !entity ||
+    entity.id !== expectedId ||
+    authorUrlToken !== selfToken ||
+    typeof expectedDigest !== 'string' ||
+    !/^[0-9a-f]{64}$/.test(expectedDigest) ||
+    (!hasRevision && !hasUpdatedAt)
+  )
+    return null
+  return { expectedDigest, owned: true }
 }
 
 export class PluginRuntimeFacade {
@@ -1298,6 +1322,101 @@ export class PluginRuntimeFacade {
     return prepared
   }
 
+  private async prepareZhihuWriteParams(input: {
+    userId: number
+    targetId: string
+    actionId: string
+    params: Record<string, unknown>
+  }): Promise<Record<string, unknown>> {
+    if (Object.hasOwn(input.params, 'snapshot') || Object.hasOwn(input.params, 'mediaManifest'))
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'server-owned Plugin fields are forbidden')
+
+    const prepared: Record<string, unknown> = { ...input.params }
+    if (
+      input.actionId === 'edit_answer' ||
+      input.actionId === 'delete_answer' ||
+      input.actionId === 'delete_comment'
+    ) {
+      const self = (await this.call({
+        userId: input.userId,
+        targetId: input.targetId,
+        actionId: 'get_self',
+        params: {},
+      })) as { user?: Record<string, unknown> }
+      const selfToken = self.user?.urlToken
+      if (typeof selfToken !== 'string' || selfToken.length === 0)
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin owned snapshot is unavailable')
+
+      if (input.actionId === 'edit_answer' || input.actionId === 'delete_answer') {
+        const expectedId = String(input.params.answerId ?? '')
+        const read = (await this.call({
+          userId: input.userId,
+          targetId: input.targetId,
+          actionId: 'get_answer',
+          params: { answerId: expectedId },
+        })) as { answer?: Record<string, unknown> }
+        const snapshot = zhihuExactTargetSnapshot(read.answer, expectedId, selfToken)
+        if (!snapshot)
+          throw new PluginRuntimeFacadeError(
+            'BAD_REQUEST',
+            'Plugin owned-answer snapshot is unavailable',
+          )
+        prepared.snapshot = snapshot
+      } else {
+        const expectedAnswerId = String(input.params.answerId ?? '')
+        const expectedCommentId = String(input.params.commentId ?? '')
+        const read = (await this.call({
+          userId: input.userId,
+          targetId: input.targetId,
+          actionId: 'list_answer_comments',
+          params: { answerId: expectedAnswerId, limit: 50 },
+        })) as { comments?: Record<string, unknown>[] }
+        const comment = read.comments?.find((candidate) => candidate.id === expectedCommentId)
+        if (comment && comment.answerId != null && comment.answerId !== expectedAnswerId) {
+          throw new PluginRuntimeFacadeError(
+            'BAD_REQUEST',
+            'Plugin owned-comment snapshot is unavailable',
+          )
+        }
+        const snapshot = zhihuExactTargetSnapshot(comment, expectedCommentId, selfToken)
+        if (!snapshot)
+          throw new PluginRuntimeFacadeError(
+            'BAD_REQUEST',
+            'Plugin owned-comment snapshot is unavailable',
+          )
+        prepared.snapshot = snapshot
+      }
+    }
+
+    if (
+      input.actionId === 'create_pin' ||
+      input.actionId === 'create_answer' ||
+      input.actionId === 'edit_answer' ||
+      input.actionId === 'create_article'
+    ) {
+      const imagePaths = Array.isArray(input.params.images)
+        ? (input.params.images as unknown[]).filter(
+            (value): value is string => typeof value === 'string',
+          )
+        : []
+      if (imagePaths.length > 0) {
+        if (!this.opts.knowledgePlanetMedia)
+          throw new PluginRuntimeFacadeError('RUNTIME_UNAVAILABLE', 'Plugin media is unavailable')
+        prepared.mediaManifest = await sealKnowledgePlanetMedia({
+          userId: input.userId,
+          items: imagePaths.map((path) => ({ path, kind: 'image' as const })),
+          deps: this.opts.knowledgePlanetMedia,
+        })
+      } else prepared.mediaManifest = []
+      if (input.actionId === 'create_pin') {
+        prepared.text = typeof input.params.text === 'string' ? input.params.text : ''
+        if (String(prepared.text).length === 0 && imagePaths.length === 0)
+          throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin pin cannot be empty')
+      }
+    }
+    return prepared
+  }
+
   async proposeWrite(input: {
     userId: number
     targetId: string
@@ -1332,7 +1451,9 @@ export class PluginRuntimeFacade {
         ? await this.prepareKnowledgePlanetWriteParams(input)
         : initial.verified.slug === WEIBO_PLUGIN_SLUG
           ? await this.prepareWeiboWriteParams(input)
-          : input.params
+          : initial.verified.slug === ZHIHU_PLUGIN_SLUG
+            ? await this.prepareZhihuWriteParams(input)
+            : input.params
 
     const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
       hardTimeoutMs: 15_000,
@@ -1492,7 +1613,9 @@ export class PluginRuntimeFacade {
           : []
         let staged: Awaited<ReturnType<typeof stageKnowledgePlanetMedia>> | null = null
         if (
-          [KNOWLEDGE_PLANET_PLUGIN_SLUG, WEIBO_PLUGIN_SLUG].includes(verified.slug) &&
+          [KNOWLEDGE_PLANET_PLUGIN_SLUG, WEIBO_PLUGIN_SLUG, ZHIHU_PLUGIN_SLUG].includes(
+            verified.slug,
+          ) &&
           manifest.length > 0
         ) {
           const mediaDeps = this.opts.knowledgePlanetMedia

@@ -59,6 +59,10 @@ vi.mock("../../lib/api", async (importOriginal) => {
       getWeiboSetup: vi.fn(),
       getWeiboSetupQr: vi.fn(),
       cancelWeiboSetup: vi.fn(),
+      startZhihuSetup: vi.fn(),
+      getZhihuSetup: vi.fn(),
+      getZhihuSetupQr: vi.fn(),
+      cancelZhihuSetup: vi.fn(),
       revokePluginAccount: vi.fn(),
       setPluginWriteAccess: vi.fn(),
       setPluginWritePreapproval: vi.fn(),
@@ -98,6 +102,10 @@ const mockedWeiboStart = vi.mocked(api.startWeiboSetup)
 const mockedWeiboStatus = vi.mocked(api.getWeiboSetup)
 const mockedWeiboQr = vi.mocked(api.getWeiboSetupQr)
 const mockedWeiboCancel = vi.mocked(api.cancelWeiboSetup)
+const mockedZhihuStart = vi.mocked(api.startZhihuSetup)
+const mockedZhihuStatus = vi.mocked(api.getZhihuSetup)
+const mockedZhihuQr = vi.mocked(api.getZhihuSetupQr)
+const mockedZhihuCancel = vi.mocked(api.cancelZhihuSetup)
 const mockedPluginRevoke = vi.mocked(api.revokePluginAccount)
 const mockedSetPluginWriteAccess = vi.mocked(api.setPluginWriteAccess)
 const mockedSetPluginWritePreapproval = vi.mocked(api.setPluginWritePreapproval)
@@ -310,6 +318,28 @@ function knowledgePlanetPlugin() {
     installedVersion: '1.2.0',
     latestVersionId: '101',
     latestVersion: '1.2.0',
+    installedCurrent: true,
+    updateAvailable: false,
+    available: true,
+  }
+}
+
+function zhihuPlugin() {
+  return {
+    versionId: '401',
+    slug: 'zhihu',
+    pluginType: 'managed-browser' as const,
+    label: '知乎',
+    description: '通过受管浏览器读取知乎，并在逐次确认后执行常用写操作',
+    accountMode: 'required' as const,
+    actions: [
+      { id: 'get_self', description: '读取当前账号', readOnly: true as const },
+      { id: 'create_answer', description: '发布回答', readOnly: false as const },
+    ],
+    installed: true,
+    installedVersion: '1.0.0',
+    latestVersionId: '401',
+    latestVersion: '1.0.0',
     installedCurrent: true,
     updateAvailable: false,
     available: true,
@@ -1319,6 +1349,148 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     render(<ConnectorsTab auth={auth} />)
     await screen.findByText('微博')
     fireEvent.click(within(providerCard('微博')).getByRole('button', { name: '微博扫码授权' }))
+    dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    expect(await within(dialog).findByText('本次授权未完成，请重试。')).toBeInTheDocument()
+    expect(within(dialog).queryByText(/UNKNOWN_FAILURE/)).not.toBeInTheDocument()
+  })
+
+  test('知乎使用知乎 App 扫码，并提供可单独打开的实时二维码链接', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [zhihuPlugin()], accounts: [] })
+    mockedZhihuStart.mockResolvedValue({
+      sessionId: '44444444-4444-4444-8444-444444444444',
+      status: 'waiting_for_scan',
+      qrReady: true,
+      createdAt: '2026-07-18T00:00:00.000Z',
+      expiresAt: '2026-07-18T00:04:00.000Z',
+    })
+    mockedZhihuStatus.mockImplementation(() => new Promise(() => {}))
+    mockedZhihuQr.mockResolvedValue(new Blob(['png'], { type: 'image/png' }))
+    mockedZhihuCancel.mockResolvedValue({
+      sessionId: '44444444-4444-4444-8444-444444444444',
+      status: 'cancelled',
+      qrReady: false,
+      createdAt: '2026-07-18T00:00:00.000Z',
+      expiresAt: '2026-07-18T00:04:00.000Z',
+    })
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:zhihu-qr'),
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知乎')
+    fireEvent.click(within(providerCard('知乎')).getByRole('button', { name: '知乎扫码授权' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText('授权知乎')).toBeInTheDocument()
+    expect(within(dialog).getByText(/知乎 App扫码一次即可复用登录/)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    expect(await within(dialog).findByAltText('知乎登录二维码')).toHaveAttribute(
+      'src',
+      'blob:zhihu-qr',
+    )
+    expect(within(dialog).getByRole('link', { name: '单独打开二维码' })).toHaveAttribute(
+      'target',
+      '_blank',
+    )
+    expect(mockedZhihuStart).toHaveBeenCalledWith(auth)
+    expect(mockedZhihuQr).toHaveBeenCalledWith(auth, '44444444-4444-4444-8444-444444444444')
+    fireEvent.click(within(dialog).getByRole('button', { name: '取消' }))
+    await waitFor(() =>
+      expect(mockedZhihuCancel).toHaveBeenCalledWith(auth, '44444444-4444-4444-8444-444444444444'),
+    )
+  })
+
+  test('当前版本知乎账号始终可原位重新登录，扫码成功前不销毁旧连接', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [zhihuPlugin()],
+      accounts: [
+        {
+          id: '912',
+          provider: 'zhihu',
+          pluginType: 'managed-browser',
+          displayName: '我的知乎',
+          accountHint: '知乎扫码账号',
+          status: 'active',
+          actions: [{ id: 'get_self', description: '读取当前账号', readOnly: true }],
+          versionId: '401',
+          executable: true,
+          writeControl: weiboWriteControl(),
+        },
+      ],
+    })
+    mockedZhihuStart.mockResolvedValue({
+      sessionId: '46464646-4646-4646-8646-464646464646',
+      status: 'waiting_for_scan',
+      qrReady: false,
+      createdAt: '2026-08-08T00:00:00.000Z',
+      expiresAt: '2026-08-08T00:04:00.000Z',
+    })
+    mockedZhihuStatus.mockImplementation(() => new Promise(() => {}))
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('我的知乎')
+    fireEvent.click(
+      within(providerCard('知乎')).getByRole('button', { name: '重新扫码登录' }),
+    )
+
+    const confirmDialog = await screen.findByRole('dialog')
+    expect(within(confirmDialog).getByText(/新扫码成功前会保留当前登录状态/)).toBeInTheDocument()
+    fireEvent.click(within(confirmDialog).getByRole('button', { name: '重新扫码登录' }))
+
+    expect(await screen.findByText('重新登录知乎')).toBeInTheDocument()
+    const setupDialog = screen.getByRole('dialog')
+    fireEvent.click(within(setupDialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    await waitFor(() => expect(mockedZhihuStart).toHaveBeenCalledWith(auth, '912'))
+    expect(mockedPluginRevoke).not.toHaveBeenCalled()
+  })
+
+  test('知乎安全验证失败时给出可操作指引，未知失败仍使用通用兜底', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [zhihuPlugin()], accounts: [] })
+    mockedZhihuStart.mockResolvedValueOnce({
+      sessionId: '45454545-4545-4545-8545-454545454545',
+      status: 'failed',
+      phase: 'failed',
+      qrReady: false,
+      agentReady: true,
+      createdAt: '2026-07-25T23:18:46.000Z',
+      expiresAt: '2026-07-25T23:22:46.000Z',
+      errorCode: 'UPSTREAM_FAILED',
+    })
+
+    const { unmount } = render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知乎')
+    fireEvent.click(within(providerCard('知乎')).getByRole('button', { name: '知乎扫码授权' }))
+    let dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    expect(
+      await within(dialog).findByText(/知乎触发了风控或安全验证.*请先在知乎 App 完成安全验证/),
+    ).toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: '重新授权' })).toBeEnabled()
+
+    unmount()
+    mockedZhihuStart.mockResolvedValueOnce({
+      sessionId: '47474747-4747-4747-8747-474747474747',
+      status: 'failed',
+      phase: 'failed',
+      qrReady: false,
+      agentReady: true,
+      createdAt: '2026-07-25T23:19:46.000Z',
+      expiresAt: '2026-07-25T23:23:46.000Z',
+      errorCode: 'UNKNOWN_FAILURE',
+    })
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知乎')
+    fireEvent.click(within(providerCard('知乎')).getByRole('button', { name: '知乎扫码授权' }))
     dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
 
