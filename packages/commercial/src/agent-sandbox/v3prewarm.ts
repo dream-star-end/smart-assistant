@@ -15,25 +15,31 @@
 
 import type { Logger } from "../logging/logger.js";
 
+/** 首次 prewarm 失败后再试一次的间隔。不改 singleflight,第二次仍走同一 ensureRunning。 */
+export const PREWARM_RETRY_DELAY_MS = 5_000;
+
 /**
  * 把 async `ensureRunning(uid)` 包成 fire-and-forget 调用器。
  *
- * **关键不变量**:async rejection 必须用 `.catch` 显式接住 —— 外层同步
+ * **关键不变量**:async rejection 必须用 `.catch` / async IIFE 显式接住 —— 外层同步
  * try/catch 接不住 promise rejection(rejection 是异步事件)。漏接会触发
  * unhandledRejection,在 strict process 下 crash gateway。
  *
- * 返回的函数同步 return void,**绝不抛**(任何错误转日志吞掉),保证调用方
- * `prewarmContainer(uid)` 不需要 try/catch 包裹。
+ * 失败自动再试 1 次(默认间隔 5s);两次都失败才 `recordFailure` + warn。
+ * 返回的函数同步 return void,**绝不抛**,保证调用方 `prewarmContainer(uid)`
+ * 不需要 try/catch 包裹。
  */
 export function makePrewarmContainer(
   ensureRunning: (uid: bigint) => Promise<unknown>,
   log: Pick<Logger, "warn">,
   recordFailure?: (input: { userId: bigint; correlation: string; latencyMs: number }) => void,
+  opts?: { retryDelayMs?: number },
 ): (uid: bigint) => void {
+  const retryDelayMs = opts?.retryDelayMs ?? PREWARM_RETRY_DELAY_MS;
   return function prewarm(uid: bigint): void {
     const startedAt = Date.now();
     const correlation = `${uid.toString()}:${startedAt}`;
-    void ensureRunning(uid).catch((err: unknown) => {
+    const reportTerminalFailure = (err: unknown): void => {
       recordFailure?.({
         userId: uid,
         correlation,
@@ -43,6 +49,22 @@ export function makePrewarmContainer(
         uid: uid.toString(),
         errorClass: err instanceof Error ? err.name : typeof err,
       });
-    });
+    };
+    void (async () => {
+      try {
+        await ensureRunning(uid);
+        return;
+      } catch {
+        // first failure: wait then retry once. Do not emit friction yet.
+      }
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, retryDelayMs);
+      });
+      try {
+        await ensureRunning(uid);
+      } catch (err: unknown) {
+        reportTerminalFailure(err);
+      }
+    })();
   };
 }

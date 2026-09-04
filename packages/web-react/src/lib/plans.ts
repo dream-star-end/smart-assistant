@@ -38,6 +38,21 @@ export const PLANS: Plan[] = [
     ],
   },
   {
+    id: "lite",
+    name: "Lite",
+    price: 38,
+    credits: 4000,
+    tagline: "入门付费，日常够用",
+    cta: "选择 Lite",
+    features: [
+      "每月 4,000 积分",
+      "免费版全部能力",
+      "解锁 Cursor 专享模型",
+      "文件 / 图片上传识别",
+      "联网搜索 · 定时任务",
+    ],
+  },
+  {
     id: "pro",
     name: "Pro",
     price: 88,
