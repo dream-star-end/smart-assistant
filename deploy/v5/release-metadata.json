@@ -140,7 +140,8 @@
     "0256_cursor_picker_plan_gate_half_price",
     "0257_cursor_session_credential",
     "0258_cursor_opus_fable_context_1m",
-    "0259_cursor_gemini_38_flash"
+    "0259_cursor_gemini_38_flash",
+    "0260_research_workspace"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
