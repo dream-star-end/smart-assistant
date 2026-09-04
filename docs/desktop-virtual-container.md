@@ -38,7 +38,12 @@ Device CA：`$OPENCLAUDE_DEVICE_CA_DIR` 或 `/etc/openclaude/device-ca/{ca.key,c
 |---|---|---|
 | WSS register | master:18445 | **只** master:18445。egress:18446 对该 upgrade **404**（禁止第二份 registry） |
 | `POST /v1/messages` | master:18445 | **egress:18446**（LLM 与 docker 18892 同进程，master 重启不掐流） |
+| `POST /api/desktop/token` 与 `/api/desktop/token/refresh` | master:18445 | **只** master:18445（与 register 同进程，要 pin 设备证 fp）。egress:18446 **404** |
 | 白名单 `/internal/v3/*` | master:18445 | master:18445。egress 不转发这些路径：desktop 身份是 mTLS+token，HTTP 转发会丢掉对端证，master 的 docker 双因子无法重建 |
+
+公网 commercial router 上的 `/api/desktop/token` 与 `/refresh` **保留但恒 401**：外层 TLS 已终止，Node 拿不到设备证，生产装配也不得注入 `desktopPeerCert`（那是 test/sim 注入点）。设备必须打 18445 mTLS 面。自报 `x-oc-device-*` header 在 listener 入口被剥掉，不能绕过。
+
+18445 未登记路径（含 Grok/Codex/ZCode relay 前缀）统一 **404**。非 CCB 的 `ENGINE_NOT_ENABLED` 403 只出现在 user-chat-bridge turn admission gate。
 
 同机 split 不得让两进程抢 `127.0.0.1:18445`；egress 默认 18446。Ingress 按上表分流。旗子关：两进程都不 bind。
 
@@ -62,3 +67,19 @@ Device CA：`$OPENCLAUDE_DEVICE_CA_DIR` 或 `/etc/openclaude/device-ca/{ca.key,c
 5. 确认无 active desktop 行后再部署旧 binary。
 
 一次回退后禁止无证据重开旗子。
+
+## 0255 invalid 索引恢复 runbook
+
+`CREATE UNIQUE INDEX CONCURRENTLY` 中断会留下同名 `indisvalid=false` 索引。0255 已改为 fail-loud（无 `IF NOT EXISTS`，invalid 同名先 `RAISE EXCEPTION`），失败时 **不会** 写入 `schema_migrations`。
+
+1. 确认：
+   ```sql
+   SELECT c.relname, i.indisvalid
+     FROM pg_index i
+     JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'uniq_ac_user_channel_kind_active';
+   SELECT version FROM schema_migrations WHERE version = '0255_desktop_kind_unique_index';
+   ```
+2. 若 `indisvalid=false`：`DROP INDEX CONCURRENTLY uniq_ac_user_channel_kind_active;`
+3. 确认 ledger 无 0255 行后重跑 migrate。不要手工 INSERT ledger。
+4. 清理后重跑应建出 `indisvalid=true` 的索引并登记 0255。

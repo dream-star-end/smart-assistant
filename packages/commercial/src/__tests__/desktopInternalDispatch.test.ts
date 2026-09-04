@@ -17,11 +17,17 @@ describe("desktop 18445 whitelist", () => {
     assert.equal(classifyDesktopPath("GET", "/internal/v3/model-catalog-epoch"), "catalogEpoch");
   });
 
-  test("Grok/Codex/ZCode prefixes are engine_disabled (no relay registered)", () => {
-    assert.equal(classifyDesktopPath("POST", GROK_RELAY_PREFIX), "engine_disabled");
-    assert.equal(classifyDesktopPath("POST", `${CODEX_RELAY_PREFIX}/x`), "engine_disabled");
-    assert.equal(classifyDesktopPath("POST", `${ZCODE_RELAY_PREFIX}/y`), "engine_disabled");
+  test("Grok/Codex/ZCode prefixes are 404 on the TLS face (W-01; 403 stays on turn admission)", () => {
+    assert.equal(classifyDesktopPath("POST", GROK_RELAY_PREFIX), "not_found");
+    assert.equal(classifyDesktopPath("POST", `${CODEX_RELAY_PREFIX}/x`), "not_found");
+    assert.equal(classifyDesktopPath("POST", `${ZCODE_RELAY_PREFIX}/y`), "not_found");
     assert.equal(DESKTOP_ENGINE_NOT_ENABLED, "ENGINE_NOT_ENABLED");
+  });
+
+  test("token mint/refresh are master whitelist paths", () => {
+    assert.equal(classifyDesktopPath("POST", "/api/desktop/token"), "tokenMint");
+    assert.equal(classifyDesktopPath("POST", "/api/desktop/token/refresh"), "tokenRefresh");
+    assert.equal(classifyDesktopPath("GET", "/api/desktop/token"), "not_found");
   });
 
   test("W-01 desktop only allows ccb", () => {

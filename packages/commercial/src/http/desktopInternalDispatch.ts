@@ -1,22 +1,23 @@
 /**
  * 18445 pathname whitelist (design v2 §6.3). Unlisted → 404.
- * Grok/Codex/ZCode prefixes return 403 ENGINE_NOT_ENABLED without registering relays.
+ * Non-CCB relay prefixes are 404 on this TLS face; ENGINE_NOT_ENABLED 403 is
+ * reserved for the user-turn admission gate (W-01).
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
-  CODEX_RELAY_PREFIX,
-  GROK_RELAY_PREFIX,
   MODEL_CATALOG_EPOCH_PATH,
   MODEL_CATALOG_PATH,
   SERVER_AUTHORED_PATH,
   TURN_LEASE_RENEW_PATH,
   TURN_TAPE_STATE_PATH,
-  ZCODE_RELAY_PREFIX,
 } from "@openclaude/protocol";
 import { HttpError, sendJson } from "./util.js";
 
 export const DESKTOP_ENGINE_NOT_ENABLED = "ENGINE_NOT_ENABLED";
+
+export const DESKTOP_TOKEN_MINT_PATH = "/api/desktop/token";
+export const DESKTOP_TOKEN_REFRESH_PATH = "/api/desktop/token/refresh";
 
 export const DESKTOP_ALLOWED_PATHS = {
   messages: { method: "POST", path: "/v1/messages" },
@@ -25,9 +26,9 @@ export const DESKTOP_ALLOWED_PATHS = {
   turnLease: { method: "POST", path: TURN_LEASE_RENEW_PATH },
   catalog: { method: "GET", path: MODEL_CATALOG_PATH },
   catalogEpoch: { method: "GET", path: MODEL_CATALOG_EPOCH_PATH },
+  tokenMint: { method: "POST", path: DESKTOP_TOKEN_MINT_PATH },
+  tokenRefresh: { method: "POST", path: DESKTOP_TOKEN_REFRESH_PATH },
 } as const;
-
-const RELAY_PREFIXES = [GROK_RELAY_PREFIX, CODEX_RELAY_PREFIX, ZCODE_RELAY_PREFIX];
 
 export type DesktopDispatchTarget =
   | "messages"
@@ -35,7 +36,9 @@ export type DesktopDispatchTarget =
   | "turnTape"
   | "turnLease"
   | "catalog"
-  | "catalogEpoch";
+  | "catalogEpoch"
+  | "tokenMint"
+  | "tokenRefresh";
 
 export function classifyDesktopPath(method: string, pathname: string): DesktopDispatchTarget | "engine_disabled" | "not_found" {
   const m = method.toUpperCase();
@@ -45,7 +48,8 @@ export function classifyDesktopPath(method: string, pathname: string): DesktopDi
   if (m === "POST" && pathname === TURN_LEASE_RENEW_PATH) return "turnLease";
   if (m === "GET" && pathname === MODEL_CATALOG_PATH) return "catalog";
   if (m === "GET" && pathname === MODEL_CATALOG_EPOCH_PATH) return "catalogEpoch";
-  if (RELAY_PREFIXES.some((p) => pathname === p || pathname.startsWith(`${p}/`))) return "engine_disabled";
+  if (m === "POST" && pathname === DESKTOP_TOKEN_MINT_PATH) return "tokenMint";
+  if (m === "POST" && pathname === DESKTOP_TOKEN_REFRESH_PATH) return "tokenRefresh";
   return "not_found";
 }
 
@@ -70,4 +74,10 @@ export function pathnameOf(req: IncomingMessage): string {
   } catch {
     return "/";
   }
+}
+
+/** Token mint/refresh belong on master 18445 (same process as register). Egress 404s them. */
+export function desktopTokenAction(role: "master" | "egress", kind: DesktopDispatchTarget | "engine_disabled" | "not_found"): "handle" | "not_found" {
+  if (kind !== "tokenMint" && kind !== "tokenRefresh") return "not_found";
+  return role === "egress" ? "not_found" : "handle";
 }

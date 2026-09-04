@@ -28,7 +28,7 @@ describe("desktop tunnel integ", () => {
   test("registry http over mux + engine gate + 18445 classify", async (t) => {
     if (db.skipIfUnavailable(t)) return;
     assert.equal(desktopAllowsEngine(true, "cursor"), false);
-    assert.equal(classifyDesktopPath("POST", "/internal/v5/grok-relay"), "engine_disabled");
+    assert.equal(classifyDesktopPath("POST", "/internal/v5/grok-relay"), "not_found");
     assert.equal(classifyDesktopPath("POST", "/v1/messages"), "messages");
 
     const pair = createMuxLoopbackPair();

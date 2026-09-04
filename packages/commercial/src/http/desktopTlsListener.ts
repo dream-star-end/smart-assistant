@@ -16,12 +16,13 @@ import { createPgDesktopIdentityRepo } from "./desktopEnroll.js";
 import { DESKTOP_REGISTER_PATH, handleDesktopRegisterUpgrade } from "../ws/desktopRegister.js";
 import {
   classifyDesktopPath,
+  desktopTokenAction,
   pathnameOf,
   sendDesktopEngineDisabled,
   sendDesktopNotFound,
 } from "./desktopInternalDispatch.js";
 import { getDesktopTunnelRegistry } from "../ws/desktopTunnelRegistry.js";
-import { sendJson } from "./util.js";
+import { HttpError, sendJson } from "./util.js";
 import { rootLogger } from "../logging/logger.js";
 import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
 
@@ -31,6 +32,10 @@ export interface DesktopTlsHandlers {
   turnTape: (req: IncomingMessage, res: ServerResponse, ctx: { hostUuid: string; boundIp: string }) => Promise<void> | void;
   turnLease: (req: IncomingMessage, res: ServerResponse, ctx: { hostUuid: string; boundIp: string }) => Promise<void> | void;
   catalog: (req: IncomingMessage, res: ServerResponse, ctx: { hostUuid: string; boundIp: string }) => Promise<void> | void;
+  /** Master-only: device mTLS token mint. Egress omits → 404. */
+  tokenMint?: (req: IncomingMessage, res: ServerResponse) => Promise<void> | void;
+  /** Master-only: device mTLS token refresh. Egress omits → 404. */
+  tokenRefresh?: (req: IncomingMessage, res: ServerResponse) => Promise<void> | void;
 }
 
 export type DesktopTlsRole = "master" | "egress";
@@ -161,6 +166,30 @@ async function handleHttps(
   }
   if (kind === "not_found") {
     sendDesktopNotFound(res);
+    return;
+  }
+  const role: DesktopTlsRole = opts.role ?? "master";
+  if (kind === "tokenMint" || kind === "tokenRefresh") {
+    if (desktopTokenAction(role, kind) !== "handle") {
+      sendDesktopNotFound(res);
+      return;
+    }
+    const tokenHandler = kind === "tokenMint" ? opts.handlers.tokenMint : opts.handlers.tokenRefresh;
+    if (!tokenHandler) {
+      sendDesktopNotFound(res);
+      return;
+    }
+    // Token handlers pin the listener-verified peer cert themselves (device
+    // credential + fp). They must not go through oc-v3 verifyDesktopIdentity.
+    try {
+      await tokenHandler(req, res);
+    } catch (err) {
+      if (err instanceof HttpError) {
+        if (!res.headersSent) sendJson(res, err.status, { error: { code: err.code, message: err.message } });
+        return;
+      }
+      throw err;
+    }
     return;
   }
   const tls = extractDesktopTlsContext(req);
