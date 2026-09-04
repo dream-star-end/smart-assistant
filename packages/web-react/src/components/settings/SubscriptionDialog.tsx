@@ -1,11 +1,51 @@
 import { ArrowUpCircle, Check, Loader2, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
+import type { SubscribeIntent } from "../../lib/chat/pure";
 import { reportClientFrictionOnce } from "../../lib/clientFriction";
 import type { AuthSession, HupiCreateResult, MySubscription, SubscriptionPlanWire } from "../../lib/types";
 import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
 import { HupijiaoPaymentEntry } from "../payment/HupijiaoPaymentEntry";
 import { Alert, Button, Modal, Spinner } from "../ui";
+
+export type { SubscribeIntent };
+
+let pendingSubscribeIntent: SubscribeIntent | null = null;
+let knownSubscriptionPaid: boolean | null = null;
+
+/** 红卡/账户条在打开订阅弹窗前预选 Lite 或加量包。 */
+export function requestSubscribeIntent(intent: SubscribeIntent): void {
+  pendingSubscribeIntent = intent;
+}
+
+export function consumeSubscribeIntent(): SubscribeIntent | null {
+  const intent = pendingSubscribeIntent;
+  pendingSubscribeIntent = null;
+  return intent;
+}
+
+export function rememberSubscriptionPaid(paid: boolean): void {
+  knownSubscriptionPaid = paid;
+}
+
+export function lastKnownSubscriptionPaid(): boolean | null {
+  return knownSubscriptionPaid;
+}
+
+export function resetSubscribeUiState(): void {
+  pendingSubscribeIntent = null;
+  knownSubscriptionPaid = null;
+}
+
+function litePlanOf(plans: SubscriptionPlanWire[]): SubscriptionPlanWire | undefined {
+  return (
+    plans.find((p) => p.code === "lite") ??
+    plans
+      .filter((p) => p.tier > 0)
+      .slice()
+      .sort((a, b) => a.tier - b.tier || a.code.localeCompare(b.code))[0]
+  );
+}
 
 type Stage =
   | { kind: "plans" }
@@ -32,12 +72,15 @@ export function SubscriptionDialog({
   auth,
   onClose,
   onPaid,
+  initialIntent,
 }: {
   open: boolean;
   auth: AuthSession;
   onClose: () => void;
   /** 到账后回调（刷新顶栏 / 账户余额 / 当前套餐）。 */
   onPaid: () => void;
+  /** 测试或调用方直接预选；缺省消费 requestSubscribeIntent。 */
+  initialIntent?: SubscribeIntent | null;
 }) {
   const [stage, setStage] = useState<Stage>({ kind: "plans" });
   const [plans, setPlans] = useState<SubscriptionPlanWire[] | null>(null);
@@ -45,6 +88,7 @@ export function SubscriptionDialog({
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [busyCode, setBusyCode] = useState<string | null>(null);
+  const [intent, setIntent] = useState<SubscribeIntent | null>(initialIntent ?? null);
   const pollRef = useRef<number | null>(null);
   // 当前 open 镜像：异步回调（下单/轮询）resolve 后据此丢弃关闭后的迟到 setState。
   const openRef = useRef(open);
@@ -86,9 +130,12 @@ export function SubscriptionDialog({
       setBusyCode(null);
       setPlans(null);
       setSub(null);
+      setIntent(null);
       genRef.current += 1; // 关闭即作废任何在途下单请求
+    } else {
+      setIntent(initialIntent ?? consumeSubscribeIntent());
     }
-  }, [open, stopPoll]);
+  }, [open, stopPoll, initialIntent]);
 
   // 打开 plans 段：拉套餐 + 当前订阅。plans!=null 守卫挡成功后回跑（同 TopupDialog 注意点）。
   useEffect(() => {
@@ -101,6 +148,7 @@ export function SubscriptionDialog({
         if (!alive) return;
         setPlans(ps);
         setSub(s);
+        rememberSubscriptionPaid(s.paid);
       })
       .catch((e) => {
         if (alive) setErr(apiErrorMessage(e, "加载套餐失败"));
@@ -252,6 +300,8 @@ export function SubscriptionDialog({
                 const isFree = p.tier === 0;
                 const isUpgrade = p.tier > sub.tier && sub.paid;
                 const busy = busyCode === p.code;
+                const liteTarget = litePlanOf(plans);
+                const preselected = intent === "lite" && liteTarget?.code === p.code;
                 const action = isFree
                   ? null
                   : isCurrent
@@ -264,9 +314,10 @@ export function SubscriptionDialog({
                 return (
                   <div
                     key={p.code}
+                    data-preselected={preselected ? "lite" : undefined}
                     className={cn(
                       "flex items-center justify-between gap-3 rounded-xl border px-4 py-3",
-                      isCurrent ? "border-accent bg-accent-soft" : "border-border bg-surface",
+                      isCurrent || preselected ? "border-accent bg-accent-soft" : "border-border bg-surface",
                     )}
                   >
                     <div className="min-w-0">
@@ -307,7 +358,15 @@ export function SubscriptionDialog({
 
             {/* 加量包：套餐用量不够时按需加（进期内桶，仅当前套餐有效期内可用）。 */}
             {!loading && sub && (
-              <div className="flex items-center justify-between gap-3 rounded-xl border border-dashed border-border-strong bg-bg px-4 py-3">
+              <div
+                data-preselected={intent === "pack" ? "pack" : undefined}
+                className={cn(
+                  "flex items-center justify-between gap-3 rounded-xl border border-dashed px-4 py-3",
+                  intent === "pack"
+                    ? "border-accent bg-accent-soft"
+                    : "border-border-strong bg-bg",
+                )}
+              >
                 <div className="min-w-0">
                   <div className="text-[14px] font-semibold text-fg">积分加量包</div>
                   <div className="mt-0.5 text-[12px] text-faint">¥50 加 5,000 积分 · 仅当前套餐有效期内可用</div>
@@ -335,16 +394,14 @@ export function SubscriptionDialog({
 
         {stage.kind === "qr" && (
           <div className="flex flex-col items-center gap-3">
-            <div className="text-center">
-              <div className="text-[20px] font-semibold text-fg">
-                {formatCentsYuan(stage.order.amountCents)}
-              </div>
-              <div className="text-[12.5px] text-faint">{stage.note}</div>
-            </div>
+            <div className="text-center text-[12.5px] text-faint">{stage.note}</div>
             <HupijiaoPaymentEntry
               qrcodeUrl={stage.order.qrcodeUrl}
               mobileUrl={stage.order.mobileUrl}
               pendingPayment={{ orderNo: stage.order.orderNo, label: stage.note }}
+              amountCents={stage.order.amountCents}
+              expiresAt={stage.order.expiresAt}
+              onReorder={backToPlans}
               token={auth.snapshot().token}
             />
             <Button variant="ghost" size="sm" onClick={backToPlans} className="text-muted">

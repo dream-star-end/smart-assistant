@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { ChatMessage } from "./model";
-import { friendlyBridgeErrorMessage } from "./pure";
+import { friendlyBridgeErrorMessage, insufficientCreditsCopy } from "./pure";
 import {
   childSignature,
   defaultCollapsed,
@@ -279,9 +279,27 @@ describe("isLive / defaultCollapsed 折叠态默认", () => {
   });
 });
 
+describe("insufficientCreditsCopy 分层", () => {
+  test("免费/付费两种文案与 CTA", () => {
+    expect(insufficientCreditsCopy(false)).toEqual({
+      title: "免费额度已用完",
+      message: "免费额度已用完,开通 Lite(¥38/月,4000 积分)即可继续",
+      cta: "开通 Lite",
+      intent: "lite",
+    });
+    expect(insufficientCreditsCopy(true)).toEqual({
+      title: "本期积分已用完",
+      message: "本期积分已用完,可购买加量包或升级套餐",
+      cta: "购买加量包",
+      intent: "pack",
+    });
+    expect(friendlyBridgeErrorMessage("insufficient_credits")).toBe(insufficientCreditsCopy(false).message);
+  });
+});
+
 describe("errorLabel / stripMarkdown", () => {
   test("已知错误码 → 中文，未知 → 友好兜底(不再抛裸码)", () => {
-    expect(errorLabel("insufficient_credits")).toBe("积分已耗尽");
+    expect(errorLabel("insufficient_credits")).toBe("免费额度已用完");
     expect(errorLabel("conn_kicked")).toBe("连接已断开");
     expect(errorLabel("some_new_code")).toBe("出错了"); // 未知码不再回退裸码,统一友好
     expect(errorLabel(undefined)).toBe("出错了");

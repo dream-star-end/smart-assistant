@@ -5,11 +5,45 @@ import type { AuthSession } from "../../lib/types";
 import {
   clearPendingPayment,
   loadPendingPayment,
+  savePendingPayment,
   type PendingPayment,
 } from "../../lib/pendingPayment";
 import { Button, Spinner } from "../ui";
 
 const POLL_INTERVAL_MS = 3000;
+const ORDER_NO_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+
+/** 从恢复 URL（?order_no=）解析 pending 单。 */
+export function pendingPaymentFromUrl(
+  href: string = typeof window === "undefined" ? "" : window.location.href,
+): PendingPayment | null {
+  if (!href) return null;
+  try {
+    const url = new URL(href);
+    const orderNo = url.searchParams.get("order_no") ?? url.searchParams.get("orderNo");
+    if (!orderNo || !ORDER_NO_PATTERN.test(orderNo)) return null;
+    const label = url.searchParams.get("order_label");
+    return {
+      orderNo,
+      label: label && label.trim() ? label : "微信支付",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function stripOrderParamsFromUrl(): void {
+  try {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has("order_no") && !url.searchParams.has("orderNo")) return;
+    url.searchParams.delete("order_no");
+    url.searchParams.delete("orderNo");
+    url.searchParams.delete("order_label");
+    window.history.replaceState(window.history.state, "", url.toString());
+  } catch {
+    /* ignore */
+  }
+}
 
 type RecoveryResult =
   | { kind: "paid"; label: string }
@@ -24,8 +58,19 @@ export function PendingPaymentRecovery({
   auth: AuthSession;
   onPaid: () => void;
 }) {
-  const [pending, setPending] = useState<PendingPayment | null>(() => loadPendingPayment());
+  const [pending, setPending] = useState<PendingPayment | null>(() => {
+    const fromUrl = pendingPaymentFromUrl();
+    if (fromUrl) {
+      savePendingPayment(fromUrl);
+      return fromUrl;
+    }
+    return loadPendingPayment();
+  });
   const [result, setResult] = useState<RecoveryResult>(null);
+
+  useEffect(() => {
+    stripOrderParamsFromUrl();
+  }, []);
 
   useEffect(() => {
     if (!pending) return;

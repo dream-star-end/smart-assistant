@@ -12,6 +12,7 @@ afterEach(() => {
   cleanup();
   sessionStorage.clear();
   vi.clearAllMocks();
+  window.history.replaceState({}, "", "/");
 });
 
 test("手机支付返回后立即查单、清理 pending 并刷新余额", async () => {
@@ -39,6 +40,24 @@ test("手机支付返回后立即查单、清理 pending 并刷新余额", async
   expect(sessionStorage.getItem("openclaude_pending_order")).toBeNull();
 
   window.removeEventListener("openclaude:billing-paid", billingPaid);
+});
+
+test("恢复 URL 含 order_no 时写入 pending 并继续轮询", async () => {
+  window.history.pushState({}, "", "/chat?order_no=order-url-1");
+  apiMocks.getOrder.mockResolvedValue({ status: "pending" });
+
+  render(
+    <PendingPaymentRecovery
+      auth={createMemoryAuthSession(() => {}, "t")}
+      onPaid={() => {}}
+    />,
+  );
+
+  expect(screen.getByTestId("payment-recovery-pending")).toHaveTextContent("正在确认微信支付结果");
+  await waitFor(() => expect(apiMocks.getOrder).toHaveBeenCalledWith(expect.anything(), "order-url-1"));
+  expect(JSON.parse(sessionStorage.getItem("openclaude_pending_order") ?? "null")).toMatchObject({
+    order_no: "order-url-1",
+  });
 });
 
 test("旧前端遗留的最小订单结构也能恢复，pending 状态不被提前清掉", async () => {
