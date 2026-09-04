@@ -79,6 +79,7 @@ function emitStep(event) {
       if (typeof event.branch === 'string') payload.branch = String(event.branch).slice(0, 32);
       if (typeof event.reason === 'string') payload.reason = String(event.reason).slice(0, 32);
       if (typeof event.pathname === 'string') payload.pathname = String(event.pathname).slice(0, 96);
+      if (typeof event.selected === 'number' && Number.isFinite(event.selected)) payload.selected = Math.round(event.selected);
     }
     process.stderr.write(JSON.stringify(payload) + '\n');
   } catch {}
@@ -399,14 +400,10 @@ async function gotoAuthenticated(page, url) {
   await finishAuthenticatedNav(page, response ? response.status() : 0);
 }
 async function gotoInSite(page, url) {
-  let sameOrigin = false;
-  try { sameOrigin = new URL(page.url()).origin === 'https://www.zhihu.com'; } catch {}
-  if (!sameOrigin) {
-    await gotoAuthenticated(page, url);
-    return;
-  }
+  const nav = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => null);
   await page.evaluate((target) => { location.assign(target); }, url).catch(() => {});
-  await page.waitForLoadState('domcontentloaded', { timeout: 60_000 });
+  await nav;
+  await page.waitForFunction(() => document.body && document.body.innerText.trim().length > 0, null, { timeout: 15_000 }).catch(() => null);
   await page.waitForTimeout(2500);
   await finishAuthenticatedNav(page, 0);
 }
@@ -425,6 +422,15 @@ async function uniqueVisible(locator, limit = 100) {
     if (await visible(candidate)) matches.push(candidate);
   }
   return matches.length === 1 ? matches[0] : null;
+}
+async function countVisible(locator, limit = 100) {
+  let hits = 0;
+  if (!locator || typeof locator.count !== 'function') return hits;
+  const total = Math.min(await locator.count().catch(() => 0), limit);
+  for (let index = 0; index < total; index += 1) {
+    if (await visible(locator.nth(index))) hits += 1;
+  }
+  return hits;
 }
 async function uniqueExactControl(locator, labels) {
   const matches = [];
@@ -1376,9 +1382,16 @@ async function projectCreatedPin(page, selfToken, text) {
   };
 }
 async function fillEditor(page, text, existing) {
-  const editor = existing
-    || await uniqueVisible(page.locator('[contenteditable="true"], textarea, .public-DraftEditor-content, .ProseMirror'))
-    || await uniqueVisible(page.locator('[role="textbox"]'));
+  const innerSel = '[contenteditable="true"], textarea, .public-DraftEditor-content, .ProseMirror, [role="textbox"]';
+  let editor = null;
+  if (existing && typeof existing.locator === 'function') {
+    editor = await uniqueVisible(existing.locator(innerSel));
+    if (!editor && await visible(existing)) editor = existing;
+  }
+  if (!editor) {
+    editor = await uniqueVisible(page.locator('[contenteditable="true"], textarea, .public-DraftEditor-content, .ProseMirror'))
+      || await uniqueVisible(page.locator('[role="textbox"]'));
+  }
   if (!editor) throw new Error('composer-editor');
   await editor.click({ timeout: 10_000 });
   await page.waitForTimeout(200);
@@ -1540,31 +1553,44 @@ async function writeAction(page, input) {
   }
   if (input.actionId === 'create_pin') {
     await gotoAuthenticated(page, 'https://www.zhihu.com/');
-    const opener = await uniqueExactControl(page.locator('button, [role="button"], [role="tab"], a'), ['写想法', '发想法', '分享你此刻的想法'])
-      || await uniqueVisible(page.getByPlaceholder(/写想法|发想法|分享你此刻的想法/));
+    const pinOpenerLabels = ['写想法', '发想法', '分享你此刻的想法'];
+    let opener = null;
+    let selected = -1;
+    for (let index = 0; index < pinOpenerLabels.length; index += 1) {
+      const control = await uniqueExactControl(page.locator('button, [role="button"], [role="tab"], a'), [pinOpenerLabels[index]]);
+      if (control) { opener = control; selected = index; break; }
+    }
+    if (!opener) {
+      opener = await uniqueVisible(page.getByPlaceholder(/写想法|发想法|分享你此刻的想法/));
+      if (opener) selected = pinOpenerLabels.length;
+    }
     if (!opener) {
       emitStep({ step: 'write.compose', ok: false, reason: 'no-composer' });
       throw new Error('composer');
     }
+    emitStep({ step: 'write.compose', ok: true, reason: 'opener', selected });
     await opener.click({ timeout: 10_000 });
-    await page.waitForTimeout(800);
+    await page.waitForSelector('[class*="PinEditor"], [class*="CreatePin"], .Modal-content [contenteditable="true"], .Editable-content, .public-DraftEditor-content', { timeout: 10_000 }).catch(() => null);
+    await page.waitForTimeout(400);
+    const pinContainers = page.locator('[class*="PinEditor"], [class*="CreatePin"], .Modal-content, [class*="Pin"] form');
+    const editorSel = '[contenteditable="true"], [role="textbox"], textarea, .public-DraftEditor-content';
+    const scopedEditor = await uniqueVisible(pinContainers.locator(editorSel));
+    const editor = scopedEditor
+      || await uniqueVisible(page.locator('[contenteditable="true"], textarea, .public-DraftEditor-content, .ProseMirror'))
+      || await uniqueVisible(page.locator('[role="textbox"]'));
     const text = cleanText(params.text || '', 2000);
-    let editor;
-    if (text) {
-      try { editor = await fillEditor(page, text); }
-      catch (error) {
-        if (String(error && error.message) === 'composer-editor')
-          emitStep({ step: 'write.compose', ok: false, reason: 'no-editor' });
-        throw error;
-      }
-    } else {
-      editor = await uniqueVisible(page.locator('[contenteditable="true"], textarea, .public-DraftEditor-content, .ProseMirror'))
-        || await uniqueVisible(page.locator('[role="textbox"]'));
-      if (!editor) {
-        emitStep({ step: 'write.compose', ok: false, reason: 'no-editor' });
-        throw new Error('composer-editor');
-      }
+    if (!editor) {
+      emitStep({
+        step: 'write.compose',
+        ok: false,
+        reason: 'no-editor',
+        hits: await countVisible(page.locator('[contenteditable="true"]')),
+        candidateCount: await countVisible(pinContainers),
+        textLen: (await bodyText(page)).length
+      });
+      throw new Error('composer-editor');
     }
+    if (text) await fillEditor(page, text, editor);
     const scope = (await composerScope(editor)) || page;
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
     await awaitDispatch();
@@ -1583,23 +1609,35 @@ async function writeAction(page, input) {
   }
   if (input.actionId === 'create_article') {
     await gotoInSite(page, 'https://zhuanlan.zhihu.com/write');
-    const titleBox = await uniqueVisible(page.getByPlaceholder(/请输入标题/));
+    await page.waitForSelector('textarea[placeholder*="标题"], input[placeholder*="标题"], .WriteIndex-titleInput, [contenteditable="true"]', { timeout: 20_000 }).catch(() => null);
+    const titleBox = await uniqueVisible(page.getByPlaceholder(/请输入标题|标题/))
+      || await uniqueVisible(page.locator('.WriteIndex-titleInput, textarea[class*="title" i]'));
+    const articleComposeFail = async (reason) => {
+      emitStep({
+        step: 'write.compose',
+        ok: false,
+        reason,
+        hits: (await countVisible(page.getByPlaceholder(/请输入标题|标题/))) + (await countVisible(page.locator('.WriteIndex-titleInput, textarea[class*="title" i]'))),
+        candidateCount: await countVisible(page.locator('[contenteditable="true"]')),
+        textLen: (await bodyText(page)).length
+      });
+    };
     if (!titleBox) {
-      emitStep({ step: 'write.compose', ok: false, reason: 'no-title' });
+      await articleComposeFail('no-title');
       throw new Error('composer');
     }
     await titleBox.fill(params.title);
     const body = await uniqueVisible(page.locator('.public-DraftEditor-content'))
+      || await uniqueVisible(page.locator('.Editable-content [contenteditable="true"]'))
       || await uniqueVisible(page.locator('[contenteditable="true"]'));
     if (!body) {
-      emitStep({ step: 'write.compose', ok: false, reason: 'no-editor' });
+      await articleComposeFail('no-editor');
       throw new Error('composer-editor');
     }
     let editor;
     try { editor = await fillEditor(page, params.text, body); }
     catch (error) {
-      if (String(error && error.message) === 'composer-editor')
-        emitStep({ step: 'write.compose', ok: false, reason: 'no-editor' });
+      if (String(error && error.message) === 'composer-editor') await articleComposeFail('no-editor');
       throw error;
     }
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
