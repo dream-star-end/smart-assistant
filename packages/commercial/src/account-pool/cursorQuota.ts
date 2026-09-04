@@ -173,7 +173,7 @@ export function renderSandModeSidecar(slots: Array<{ name: string; sandEnabled: 
 }
 
 /**
- * 0260 — per-slot first-touch weight sidecar (`.slot-weight`), no secrets.
+ * 0262 — per-slot first-touch weight sidecar (`.slot-weight`), no secrets.
  *
  * `name <weight>` with an integer weight in [1, 10000]. The container wrapper
  * (oc-cursor.sh) uses it only when a user has no sticky account yet: it draws

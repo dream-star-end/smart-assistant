@@ -1549,7 +1549,7 @@ describe('oc-cursor wrapper', () => {
     assert.match(filteredFailure.stdout, new RegExp(`selected_slot 3 api-key\\.3 native ${gen4} 3 ${fp(keyC)}`))
   })
 
-  test('an all-Sand generation assigns each user a sticky account by weighted first touch (0260)', () => {
+  test('an all-Sand generation assigns each user a sticky account by weighted first touch (0262)', () => {
     const f = fixture()
     const authDir = dirname(f.auth)
     const gen = 'gen-555555555555555555555555'

@@ -153,7 +153,7 @@ describe("sand mode sidecar", () => {
   });
 });
 
-describe("slot weight (0260)", () => {
+describe("slot weight (0262)", () => {
   const now = new Date("2026-09-05T00:00:00.000Z");
   const h = (hours: number) => new Date(now.getTime() + hours * 3_600_000);
 

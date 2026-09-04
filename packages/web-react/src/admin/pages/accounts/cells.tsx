@@ -232,7 +232,7 @@ export function LastUsed({ iso }: { iso: string | null }) {
 }
 
 /**
- * 0260 — Cursor Sand(Grok Bot)池已用 %。每小时 sweeper 刷新;>2h 未刷新灰显。
+ * 0262 — Cursor Sand(Grok Bot)池已用 %。每小时 sweeper 刷新;>2h 未刷新灰显。
  * api_key 行没有 cursor.com 面,永远 —。tooltip 带刷新时间与最近一次失败原因。
  */
 export function CursorSandUsageCell({ a }: { a: AccountRow }) {
@@ -274,7 +274,7 @@ export function CursorSandUsageCell({ a }: { a: AccountRow }) {
   );
 }
 
-/** 0260 — 套餐 membership(pro/ultra/free)+ 账期到期日。 */
+/** 0262 — 套餐 membership(pro/ultra/free)+ 账期到期日。 */
 export function CursorPlanCell({ a }: { a: AccountRow }) {
   if (a.provider !== "cursor") return <span className="text-faint">—</span>;
   const membership = a.cursor_plan_membership ?? null;

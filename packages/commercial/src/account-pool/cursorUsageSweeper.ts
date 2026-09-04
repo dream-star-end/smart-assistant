@@ -1,6 +1,6 @@
 /**
  * cursorUsageSweeper — hourly Sand (Grok Bot) pool usage refresh for Cursor
- * account-session rows (0260).
+ * account-session rows (0262).
  *
  * Before this, the only place the platform learned a Cursor account's Sand
  * usage was the admin "Cursor 额度 / 用量" modal (on demand, 60s in-memory
@@ -270,7 +270,7 @@ export async function sweepCursorUsageOnce(deps: CursorUsageSweepDeps = {}): Pro
   if (anyWeightChanged) {
     (deps.onWeightInputsChanged ?? (() => scheduleCursorAuthSync("cursor.usage-sweep")))(0n);
   }
-  log.info("cursor usage sweep done", summary);
+  log.info("cursor usage sweep done", { ...summary });
   return summary;
 }
 

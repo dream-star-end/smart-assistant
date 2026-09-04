@@ -1,5 +1,5 @@
 /**
- * cursorUsageSweeper (0260): snapshot → column patch, per-account isolation,
+ * cursorUsageSweeper (0262): snapshot → column patch, per-account isolation,
  * weight-input bucketing, materializer nudge. No DB / no network: every
  * dependency is injected.
  *

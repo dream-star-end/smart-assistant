@@ -5595,7 +5595,7 @@ export async function registerCommercial(
     });
   }
 
-  // 0260 — Cursor Sand (Grok Bot) usage sweeper. Hourly, per session row:
+  // 0262 — Cursor Sand (Grok Bot) usage sweeper. Hourly, per session row:
   // cursor.com get-sand-usage-status → claude_accounts.cursor_sand_* columns
   // → `.slot-weight` sidecar via the materializer. Leader-only (one set of
   // cursor.com calls per pool, and the materializer already runs here).

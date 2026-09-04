@@ -58,7 +58,7 @@ const PROVIDER_SECTIONS = [
   { id: "grok", title: "Grok", desc: "Grok Build 官方账号池" },
 ] as const;
 
-/** 0260 — 按 provider 段切换的列:Cursor 段隐藏 Anthropic 配额列,其余段隐藏 Sand 列。 */
+/** 0262 — 按 provider 段切换的列:Cursor 段隐藏 Anthropic 配额列,其余段隐藏 Sand 列。 */
 const CCB_ONLY_COLUMNS = new Set(["q5h", "q5hr", "q7d", "q7dr", "oauth_exp"]);
 const CURSOR_ONLY_COLUMNS = new Set(["sand_pct", "sand_reset", "cursor_plan", "usage_upd", "cursor_pool"]);
 
@@ -173,7 +173,7 @@ export default function AccountsPage() {
     [confirm, toast, refresh],
   );
 
-  // 0260 — 立即回源刷新一行的 Sand 用量(同 sweeper 路径:落库 + 重算 slot 权重)。
+  // 0262 — 立即回源刷新一行的 Sand 用量(同 sweeper 路径:落库 + 重算 slot 权重)。
   const doRefreshCursorUsage = useCallback(
     async (a: AccountRow) => {
       try {
@@ -218,7 +218,7 @@ export default function AccountsPage() {
     },
     { key: "group", title: "分组", width: 70, render: (a) => (a.group_id ? <span className="font-mono text-[12px]">#{a.group_id}</span> : <span className="text-faint">—</span>) },
     { key: "cursor_pool", title: "Cursor 池", width: 120, render: (a) => <CursorPoolCell a={a} /> },
-    // 0260 — Cursor 段专用:Sand(Grok Bot)池已用 % / 周重置 / 套餐与账期 / 用量刷新时间。
+    // 0262 — Cursor 段专用:Sand(Grok Bot)池已用 % / 周重置 / 套餐与账期 / 用量刷新时间。
     // CCB 段专用:Anthropic 5h/7d 滚动配额。两组列语义不同,按 provider 段切换(见 sectionColumns)。
     { key: "sand_pct", title: "Sand 已用%", align: "right", render: (a) => <CursorSandUsageCell a={a} /> },
     { key: "sand_reset", title: "Sand 重置", align: "right", render: (a) => <ResetCell resetsAt={a.cursor_sand_next_reset_at ?? null} /> },

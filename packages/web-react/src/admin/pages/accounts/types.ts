@@ -35,7 +35,7 @@ export type AccountRow = {
   /** 0257 — Sand 凭证形态:api_key(crsr_ 换 token)| session(Cursor 账号登录会话)。 */
   cursor_credential_kind: "api_key" | "session" | null;
   cursor_auth_id: string | null;
-  /** 0260 — Sand / Grok Bot 池用量(每小时 sweeper 刷新;仅 session 行有值)。可选以兼容旧后端。 */
+  /** 0262 — Sand / Grok Bot 池用量(每小时 sweeper 刷新;仅 session 行有值)。可选以兼容旧后端。 */
   cursor_sand_usage_pct?: number | null;
   cursor_sand_period_start?: string | null;
   cursor_sand_next_reset_at?: string | null;

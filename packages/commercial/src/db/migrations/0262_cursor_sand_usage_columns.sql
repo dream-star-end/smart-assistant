@@ -1,5 +1,5 @@
--- order-dependency: 0259_cursor_gemini_38_flash
--- 0260_cursor_sand_usage_columns.sql
+-- order-dependency: 0261_research_fetch_attempts
+-- 0262_cursor_sand_usage_columns.sql
 -- Cursor account rows learn their Sand (Grok Bot) pool usage on an hourly
 -- schedule (cursorUsageSweeper) instead of only when an admin opens the
 -- "Cursor 额度 / 用量" modal. The materializer turns these columns into a

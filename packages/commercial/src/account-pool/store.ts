@@ -131,7 +131,7 @@ export interface AccountRow {
   /** 0257 — session rows only: authId from /auth/poll (identity, not a secret). */
   cursor_auth_id: string | null;
   /**
-   * 0260 — Sand (Grok Bot) pool usage learned hourly by cursorUsageSweeper.
+   * 0262 — Sand (Grok Bot) pool usage learned hourly by cursorUsageSweeper.
    * Session rows only; api_key rows have no cursor.com face and stay NULL.
    * NUMERIC(5,2) → cast ::float8 in SELECT, hence number | null.
    */

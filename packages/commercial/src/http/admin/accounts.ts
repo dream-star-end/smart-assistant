@@ -126,7 +126,7 @@ function serializeAccount(
     /** 0257 — Sand 凭证形态:api_key(crsr_ 换 token)| session(账号登录会话)。 */
     cursor_credential_kind: a.provider === "cursor" ? a.cursor_credential_kind : null,
     cursor_auth_id: a.provider === "cursor" ? a.cursor_auth_id : null,
-    /** 0260 — Sand / Grok Bot 池用量(cursorUsageSweeper 每小时刷新;仅 session 行有值)。 */
+    /** 0262 — Sand / Grok Bot 池用量(cursorUsageSweeper 每小时刷新;仅 session 行有值)。 */
     cursor_sand_usage_pct: a.provider === "cursor" ? a.cursor_sand_usage_pct : null,
     cursor_sand_period_start: a.provider === "cursor" ? (a.cursor_sand_period_start?.toISOString() ?? null) : null,
     cursor_sand_next_reset_at: a.provider === "cursor" ? (a.cursor_sand_next_reset_at?.toISOString() ?? null) : null,
@@ -326,7 +326,7 @@ async function handleAccountCursorUsage(
       sendJson(res, 200, { usage: cached, cached: true });
       return;
     }
-    // 0260 — the hourly sweeper persists the last good snapshot; serve it
+    // 0262 — the hourly sweeper persists the last good snapshot; serve it
     // when the 60s cache is cold so the modal opens without a cursor.com
     // round trip. `refresh=1` still forces a live fetch.
     const stored = await loadStoredCursorUsage(id);

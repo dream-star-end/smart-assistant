@@ -125,7 +125,7 @@ interface MaterializedCursorSlot {
   sandEnabled: boolean;
   credentialKind: CursorSlotCredentialKind;
   machineId: string | null;
-  /** 0260 — first-touch selection weight from Sand usage columns (1..10000). */
+  /** 0262 — first-touch selection weight from Sand usage columns (1..10000). */
   weight: number;
 }
 
@@ -240,7 +240,7 @@ function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[]): str
       // 0257: kind/machine id participate so a kind flip (or machine id
       // change) always yields a fresh immutable generation.
       ...(slots[i].credentialKind === "session" ? ["session", slots[i].machineId ?? ""] : []),
-      // 0260: weight participates so a usage refresh yields a new generation
+      // 0262: weight participates so a usage refresh yields a new generation
       // (weights are bucketed upstream so hourly drift does not churn).
       String(slots[i].weight),
     ].join("\0"));
@@ -390,7 +390,7 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
           sandNextResetAt: row.cursor_sand_next_reset_at ?? null,
           billingCycleEnd: row.cursor_billing_cycle_end ?? null,
           sandAccessState: row.cursor_sand_access_state ?? null,
-        }, resolved.now());
+        }, (resolved.now ?? (() => new Date()))());
         if (credentialKind === "session") {
           // Session rows are Sand-only and need their persisted machine id;
           // a malformed row is skipped (never silently downgraded to api_key).

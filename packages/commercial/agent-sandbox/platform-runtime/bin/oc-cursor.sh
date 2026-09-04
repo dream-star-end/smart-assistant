@@ -608,7 +608,7 @@ if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.sand-mode" 2>/dev/null \
     || sand_sidecar_text=""
 fi
 
-# 0260 — .slot-weight sidecar: `name <int 1..10000>`, first-touch selection
+# 0262 — .slot-weight sidecar: `name <int 1..10000>`, first-touch selection
 # weight derived from each account's Sand usage / reset / plan expiry. No
 # secrets. Missing sidecar or missing slot → weight 1 (uniform fallback).
 weight_sidecar_text=""
@@ -711,7 +711,7 @@ SAND_LOOKUP
 #      account's rate limit per user) regardless of later weight changes.
 #   2. Otherwise (first touch, account removed, or the sticky account is under
 #      cooldown) draw ONE eligible account with probability proportional to
-#      its `.slot-weight` (0260: more Sand headroom / sooner weekly reset /
+#      its `.slot-weight` (0262: more Sand headroom / sooner weekly reset /
 #      sooner plan expiry → higher weight; missing sidecar → uniform), persist
 #      it as the new sticky account and use it. A cooldown-driven redraw is
 #      persisted too: after a real credential failure the user stays on the
