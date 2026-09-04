@@ -34,6 +34,7 @@ import {
   stripMarkdown,
 } from "../../lib/chat/render";
 import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
+import { reportClientFriction, reportClientFrictionOnce } from "../../lib/clientFriction";
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
@@ -80,6 +81,8 @@ export type CardCallbacks = {
   onRegenerate?: () => void;
   onContinue?: () => void;
   onTopUp?: () => void;
+  /** Optional access token for conversion-funnel telemetry (exhausted card/CTA). */
+  getToken?: () => string | null | undefined;
   /** context_too_long 类:在新会话中延续目标(导航非重发,同 onTopUp 不受末轮门控)。 */
   onStartNewSession?: () => void;
   onFeedback?: (ctx: FeedbackContext) => void;
@@ -579,6 +582,19 @@ export function AssistantCard({
     (sem.cta === "retry" || sem.cta === "retry_or_switch") &&
     !!cb.onRegenerate;
   const showTopUp = isInsufficient && !!cb.onTopUp;
+  useEffect(() => {
+    if (!isInsufficient) return;
+    reportClientFrictionOnce(
+      `chat:exhausted_card:${msg.id}`,
+      {
+        surface: "chat",
+        stage: "exhausted_card",
+        code: "EXHAUSTED_CARD",
+        outcome: "succeeded",
+      },
+      cb.getToken?.(),
+    );
+  }, [isInsufficient, msg.id, cb]);
   // cta==='new_session'(上下文超限类):导航非重发,同「去充值」不受末轮门控。
   const showNewSession =
     !!presentedError && !presentedError.waived && sem.cta === "new_session" && !!cb.onStartNewSession;
@@ -700,7 +716,23 @@ export function AssistantCard({
                 <div className="mt-2.5 flex flex-wrap items-center gap-2">
                   {showTopUp ? (
                     // insufficient_credits「去充值」= 导航非重发,不受末轮门控。
-                    <Button size="sm" variant="accent" shape="pill" onClick={cb.onTopUp}>
+                    <Button
+                      size="sm"
+                      variant="accent"
+                      shape="pill"
+                      onClick={() => {
+                        reportClientFriction(
+                          {
+                            surface: "chat",
+                            stage: "exhausted_cta",
+                            code: "EXHAUSTED_CTA",
+                            outcome: "succeeded",
+                          },
+                          cb.getToken?.(),
+                        );
+                        cb.onTopUp?.();
+                      }}
+                    >
                       <Wallet size={14} /> 去充值
                     </Button>
                   ) : showNewSession ? (

@@ -223,6 +223,7 @@ export function TopupDialog({
               qrcodeUrl={stage.order.qrcodeUrl}
               mobileUrl={stage.order.mobileUrl}
               pendingPayment={{ orderNo: stage.order.orderNo, label: "积分充值" }}
+              token={auth.snapshot().token}
             />
             <Button variant="ghost" size="sm" onClick={backToPlans} className="text-muted">
               <RefreshCw size={14} /> 换个套餐
