@@ -2921,6 +2921,30 @@
           "assertion": "INC-20260903-CURSOR-CLI-ERROR-WASH: finish() must keep sanitized Cursor CLI error text on tape."
         }
       ]
+    },
+    {
+      "id": "INC-20260904-OFFICIAL-CC-STOP-STALE-PROCESS",
+      "occurredAt": "2026-09-04",
+      "severity": "P1",
+      "symptom": "Cursor Opus/Fable(official-cc harness)点「停止生成」后再发下一条消息，红卡「执行环境异常中断，你的消息已保留，请重试」+ 黄条「模型繁忙，正在重试中（n/10）」循环。根因：官方 Claude Code 对 Stop 回 aborted_streaming result 后数秒才自行 exit 1，SubprocessRunner 仍把 this.proc 指向这个正在死亡的进程，下一轮 submit() 写进去即被判 RUNNER_CRASHED（子进程异常退出 code 1），master 自动恢复最多 10 次。",
+      "rootFixCommit": "e5967df4",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/subprocessRunnerOfficialAbortRecycle.test.ts",
+          "assertion": "detaches proc, reports not running, and swallows the trailing exit(1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/subprocessRunnerOfficialAbortRecycle.test.ts",
+          "assertion": "retired generation stdout close does not settle a newer generation barrier"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cursor-sand-inference.ts",
+          "assertion": "INC-20260904-OFFICIAL-CC-STOP-STALE-PROCESS: official Claude Code answers Stop with an"
+        }
+      ]
     }
   ]
 }
