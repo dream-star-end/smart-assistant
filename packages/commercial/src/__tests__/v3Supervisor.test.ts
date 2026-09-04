@@ -1023,6 +1023,9 @@ describe("provisionV3Container", () => {
       ] as const) {
         if (flag === undefined) delete process.env.OC_RESEARCH_WORKSPACE;
         else process.env.OC_RESEARCH_WORKSPACE = flag;
+        // FakePool rejects a second ensure for the same uid ("concurrent ensure"),
+        // so each iteration provisions a fresh pool + fresh uid.
+        pool = new FakePool();
         const { docker, captured } = makeDocker();
         await provisionV3Container(
           {
