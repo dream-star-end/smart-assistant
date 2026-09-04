@@ -2200,6 +2200,25 @@ export function normalizeAutoDreamSchedule(
 
 export const GATEWAY_PENDING_PERMISSION_TTL_MS = 30 * 60_000
 
+/**
+ * Tools whose permission prompt is the turn's only way forward: the engine
+ * cannot proceed, retry or degrade until the user decides (AskUserQuestion
+ * answers; ExitPlanMode 按此计划执行 / 继续规划). Their prompts must not be
+ * auto-denied by the 30-minute idle TTL nor by a bridge disconnect — the
+ * user simply may not be looking. Ordinary tool approvals (Bash/Edit/…)
+ * keep the short TTL because a timed-out deny is a safe, recoverable answer.
+ * INC-20260904-EXITPLAN-PROMPT-BURIED (the same buried card was auto-denied
+ * at 30 min and the plan degraded into a text dump).
+ */
+export const BLOCKING_USER_INPUT_TOOLS: ReadonlySet<string> = new Set([
+  'AskUserQuestion',
+  'ExitPlanMode',
+])
+
+export function _isBlockingUserInputTool(toolName: string): boolean {
+  return BLOCKING_USER_INPUT_TOOLS.has(toolName)
+}
+
 export function _permissionRequestExpiresAt(
   blockingUserInput: boolean,
   nowMs: number = Date.now(),
@@ -19551,8 +19570,10 @@ export class Gateway {
         // both to read from `out`, which is correct: `out` is the source of
         // truth for this turn's routing tuple after model-routing has settled
         // any agent-override sessionKey.
+        // ccbAdapter registers the requestId before emitting, so for CCB this
+        // getter is already true here; Codex exposes its own blocking state.
         const blockingUserInput =
-          e.request.toolName === 'AskUserQuestion' &&
+          _isBlockingUserInputTool(e.request.toolName) &&
           session.runner.waitingForUserInput === true
         const permissionExpiresAt = _permissionRequestExpiresAt(
           blockingUserInput,

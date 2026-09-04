@@ -98,7 +98,11 @@ export function permissionHasExpired(msg: ChatMessage, now = Date.now()): boolea
     return now >= expiresAt;
   }
   if (!Number.isFinite(msg.ts)) return false;
-  const ttlMs = isDetachedAskUserCard(msg) ? DETACHED_ASK_USER_TTL_MS : PENDING_PERMISSION_TTL_MS;
+  // Blocking prompts (detached ask_user, ExitPlanMode) are not subject to the
+  // 30-minute idle TTL on the server either (gateway `BLOCKING_USER_INPUT_TOOLS`).
+  const ttlMs = isDetachedAskUserCard(msg) || isExitPlanModeTool(msg.toolName)
+    ? DETACHED_ASK_USER_TTL_MS
+    : PENDING_PERMISSION_TTL_MS;
   return now - msg.ts > ttlMs;
 }
 

@@ -813,6 +813,66 @@ describe("userChatBridge — durable outbound frame ordering", () => {
     }
   });
 
+  test("stamped outbound.permission_request joins the durable live journal of its turn", async () => {
+    // INC-20260904-EXITPLAN-PROMPT-BURIED follow-up. The container gateway
+    // emits permission prompts through `_sendStampedSessionFrame` (sessionKey
+    // + frameSeq) and inherits `clientMessageId` from the turn's main frame,
+    // so the bridge must treat them exactly like outbound.message: persist
+    // first (dispatch:<id>:<attempt> stream via clientMessageId), forward
+    // second. A prompt that only lived in the in-memory ring would vanish on
+    // Master restart / late reconnect while the engine stays blocked on it.
+    const persisted: Array<Parameters<NonNullable<UserChatBridgeDeps["persistOutboundFrame"]>>[0]> = [];
+    const portRef = { value: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 79 }),
+      persistOutboundFrame: async (input) => { persisted.push(input); },
+    });
+    portRef.value = rig.containerPort;
+    try {
+      const containerOpen = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("702"));
+      await new Promise<void>((resolve) => ws.once("open", resolve));
+      const containerWs = await containerOpen;
+      const business: Record<string, unknown>[] = [];
+      ws.on("message", (data) => {
+        try {
+          const frame = JSON.parse(data.toString()) as Record<string, unknown>;
+          if (typeof frame.type === "string" && !frame.type.startsWith("sys.")) business.push(frame);
+        } catch { /* irrelevant */ }
+      });
+      const prompt = JSON.stringify({
+        type: "outbound.permission_request",
+        sessionKey: "agent:main:webchat:dm:sess-perm",
+        channel: "webchat",
+        peer: { id: "sess-perm", kind: "dm" },
+        clientMessageId: "m-mtmqd5ng-bw-053y",
+        requestId: "req-exitplan-1",
+        toolName: "ExitPlanMode",
+        toolUseId: "toolu_exitplan",
+        inputPreview: "{}",
+        inputJson: {},
+        expiresAt: Date.now() + 60_000,
+        ts: Date.now(),
+        frameSeq: 7,
+      });
+      containerWs.send(prompt);
+      await waitFor(() => business.length === 1);
+      assert.equal(business[0]!.type, "outbound.permission_request");
+      assert.equal(business[0]!.requestId, "req-exitplan-1");
+      assert.equal(persisted.length, 1, "prompt must be journaled exactly once");
+      assert.equal(persisted[0]!.frameSeq, 7);
+      assert.equal(persisted[0]!.sessionId, "sess-perm");
+      assert.equal(persisted[0]!.clientMessageId, "m-mtmqd5ng-bw-053y");
+      assert.equal(persisted[0]!.sessionKey, "agent:main:webchat:dm:sess-perm");
+      assert.equal(persisted[0]!.agentContainerId, 79);
+      assert.equal(persisted[0]!.payload, prompt, "byte-exact payload, no rewrite");
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
   test("a failed commit is never shown and the exact container replay can heal it", async () => {
     let attempts = 0;
     const portRef = { value: 0 };
