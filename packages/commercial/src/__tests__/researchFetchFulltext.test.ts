@@ -13,6 +13,7 @@ import {
   arxivIdFromDoi,
   downloadFulltext,
 } from '../research/fetchFulltext.js'
+import { vetFetchTarget } from '../research/fetchUrlGuard.js'
 import { fetchRecordIntoLibrary } from '../research/researchHandlers.js'
 import type { FetchAttemptRowInput } from '../research/store.js'
 
@@ -52,6 +53,12 @@ function record(over: Partial<FetchRecordInput> = {}): FetchRecordInput {
   return { id: 'r1', title: 'A paper', ...over }
 }
 
+/** 测试 host(publisher.example 等)不打真 DNS:一律解到公网地址,让 SSRF 门放行。 */
+const PUBLIC_DNS = {
+  resolve4: async () => ['93.184.216.34'],
+  resolve6: async () => [] as string[],
+}
+
 // ── arxivIdFromDoi ───────────────────────────────────────────────────
 
 describe('fetchFulltext: arxivIdFromDoi', () => {
@@ -75,7 +82,7 @@ describe('fetchFulltext: 策略链', () => {
     const r = await downloadFulltext(
       record({ oa: { url: 'https://publisher.example/oa/paper.pdf' } }),
       {},
-      { fetchImpl },
+      { fetchImpl, guardResolver: PUBLIC_DNS },
     )
     assert.equal(r.ok, true)
     if (r.ok) {
@@ -92,7 +99,7 @@ describe('fetchFulltext: 策略链', () => {
     const r = await downloadFulltext(
       record({ arxivId: undefined, oa: { url: 'https://arxiv.org/abs/2301.01234' } }),
       {},
-      { fetchImpl },
+      { fetchImpl, guardResolver: PUBLIC_DNS },
     )
     assert.equal(r.ok, true)
     assert.deepEqual(urls, ['https://arxiv.org/pdf/2301.01234'])
@@ -101,12 +108,16 @@ describe('fetchFulltext: 策略链', () => {
   it('arxiv:arxivId 命中 → arxiv.org/pdf/<id>;DOI 10.48550/arxiv.* 同样成立', async () => {
     const urls: string[] = []
     const fetchImpl = mockFetch([{ match: 'arxiv.org', respond: () => pdfResponse() }], urls)
-    const r1 = await downloadFulltext(record({ arxivId: '2301.01234' }), {}, { fetchImpl })
+    const r1 = await downloadFulltext(
+      record({ arxivId: '2301.01234' }),
+      {},
+      { fetchImpl, guardResolver: PUBLIC_DNS },
+    )
     assert.equal(r1.ok && r1.strategy, 'arxiv')
     const r2 = await downloadFulltext(
       record({ doi: '10.48550/arxiv.2301.01234' }),
       {},
-      { fetchImpl },
+      { fetchImpl, guardResolver: PUBLIC_DNS },
     )
     assert.equal(r2.ok && r2.strategy, 'arxiv')
     assert.deepEqual(urls, [
@@ -142,7 +153,7 @@ describe('fetchFulltext: 策略链', () => {
     const r = await downloadFulltext(
       record({ doi: '10.1371/journal.pone.0026140', arxivId: undefined }),
       { unpaywallEmail: 'research@example.org' },
-      { fetchImpl },
+      { fetchImpl, guardResolver: PUBLIC_DNS },
     )
     assert.equal(r.ok, true)
     if (r.ok) assert.equal(r.strategy, 'unpaywall_pdf')
@@ -197,7 +208,7 @@ describe('fetchFulltext: 策略链', () => {
     const r = await downloadFulltext(
       record({ doi: '10.1371/journal.pone.0026140', arxivId: undefined }),
       {},
-      { fetchImpl },
+      { fetchImpl, guardResolver: PUBLIC_DNS },
     )
     assert.equal(r.ok, true)
     if (r.ok) assert.equal(r.strategy, 'pmc_oa')
@@ -219,7 +230,7 @@ describe('fetchFulltext: 策略链', () => {
     const r = await downloadFulltext(
       record({ arxivId: '2301.01234', oa: { url: 'https://publisher.example/oa/x.pdf' } }),
       {},
-      { fetchImpl },
+      { fetchImpl, guardResolver: PUBLIC_DNS },
     )
     assert.equal(r.ok, true)
     if (r.ok) {
@@ -253,7 +264,7 @@ describe('fetchFulltext: 策略链', () => {
     const r = await downloadFulltext(
       record({ doi: '10.1/x', arxivId: undefined }),
       { unpaywallEmail: 'research@example.org' },
-      { fetchImpl },
+      { fetchImpl, guardResolver: PUBLIC_DNS },
     )
     assert.equal(r.ok, true)
     if (r.ok) assert.equal(r.strategy, 'publisher_oa')
@@ -264,7 +275,11 @@ describe('fetchFulltext: 策略链', () => {
 
 describe('fetchFulltext: 结构化失败', () => {
   it('no_identifier:无 doi/arxiv/oa/title', async () => {
-    const r = await downloadFulltext({ id: 'r1' }, {}, { fetchImpl: mockFetch([]) })
+    const r = await downloadFulltext(
+      { id: 'r1' },
+      {},
+      { fetchImpl: mockFetch([]), guardResolver: PUBLIC_DNS },
+    )
     assert.equal(r.ok, false)
     if (!r.ok) {
       assert.equal(r.reason, 'no_identifier')
@@ -286,7 +301,7 @@ describe('fetchFulltext: 结构化失败', () => {
     const r = await downloadFulltext(
       record({ doi: '10.1/closed', arxivId: undefined }),
       { unpaywallEmail: 'research@example.org' },
-      { fetchImpl },
+      { fetchImpl, guardResolver: PUBLIC_DNS },
     )
     assert.equal(r.ok, false)
     if (!r.ok) assert.equal(r.reason, 'paywalled')
@@ -306,6 +321,7 @@ describe('fetchFulltext: 结构化失败', () => {
       { proxyUrl: 'http://proxy.example:3128' },
       {
         fetchImpl,
+        guardResolver: PUBLIC_DNS,
         proxyFetchImpl: (async (u: string | URL | Request) => {
           proxyCalls.push(String(u))
           return pdfResponse()
@@ -324,7 +340,11 @@ describe('fetchFulltext: 结构化失败', () => {
         respond: () => htmlResponse('<html><body>article landing page</body></html>'),
       },
     ])
-    const r = await downloadFulltext(record({ arxivId: '2301.01234' }), {}, { fetchImpl })
+    const r = await downloadFulltext(
+      record({ arxivId: '2301.01234' }),
+      {},
+      { fetchImpl, guardResolver: PUBLIC_DNS },
+    )
     assert.equal(r.ok, false)
     if (!r.ok) {
       assert.equal(r.reason, 'not_pdf')
@@ -351,7 +371,7 @@ describe('fetchFulltext: 结构化失败', () => {
     const r = await downloadFulltext(
       record({ arxivId: '2301.01234' }),
       {},
-      { fetchImpl, maxBytes: 1024 * 1024 },
+      { fetchImpl, maxBytes: 1024 * 1024, guardResolver: PUBLIC_DNS },
     )
     assert.equal(r.ok, false)
     if (!r.ok) assert.equal(r.reason, 'too_large')
@@ -372,7 +392,7 @@ describe('fetchFulltext: 结构化失败', () => {
     const r = await downloadFulltext(
       record({ arxivId: '2301.01234' }),
       {},
-      { fetchImpl, retryDelayMs: 0 },
+      { fetchImpl, retryDelayMs: 0, guardResolver: PUBLIC_DNS },
     )
     assert.equal(r.ok, true)
     assert.equal(n, 2, '瞬时 5xx 有界重试')
@@ -391,7 +411,7 @@ describe('fetchFulltext: 结构化失败', () => {
     const r2 = await downloadFulltext(
       record({ arxivId: '2301.01234' }),
       {},
-      { fetchImpl: hang, timeoutMs: 40, retryDelayMs: 0 },
+      { fetchImpl: hang, timeoutMs: 40, retryDelayMs: 0, guardResolver: PUBLIC_DNS },
     )
     assert.equal(r2.ok, false)
     if (!r2.ok) assert.equal(r2.reason, 'timeout')
@@ -411,7 +431,7 @@ describe('fetchFulltext: 结构化失败', () => {
     const r = await downloadFulltext(
       record({ doi: '10.1/x', arxivId: undefined }),
       {},
-      { fetchImpl },
+      { fetchImpl, guardResolver: PUBLIC_DNS },
     )
     assert.equal(r.ok, false)
     if (!r.ok) assert.equal(r.reason, 'no_oa_location')
@@ -420,6 +440,7 @@ describe('fetchFulltext: 结构化失败', () => {
   it('失败枚举完备:attempts 里出现的 code 都在 FETCH_FAIL_REASONS 或 ok', () => {
     assert.deepEqual([...FETCH_FAIL_REASONS].sort(), [
       'blocked_robot',
+      'blocked_target',
       'fetch_error_4xx',
       'fetch_error_5xx',
       'no_identifier',
@@ -430,6 +451,182 @@ describe('fetchFulltext: 结构化失败', () => {
       'timeout',
       'too_large',
     ])
+  })
+})
+
+// ── SSRF 边界(auditor W3)────────────────────────────────────────────
+
+describe('fetchFulltext: SSRF 边界', () => {
+  const blockedIps = ['127.0.0.1', '172.31.0.1', '10.8.0.5', '169.254.169.254', '[::1]']
+
+  for (const ip of blockedIps) {
+    it(`known_oa 指向 ${ip} → blocked_target,且 fetch 不发出`, async () => {
+      const urls: string[] = []
+      const fetchImpl = mockFetch([{ match: ip, respond: () => pdfResponse() }], urls)
+      const r = await downloadFulltext(
+        record({ oa: { url: `http://${ip}:18892/x.pdf` } }),
+        {},
+        { fetchImpl, guardResolver: PUBLIC_DNS },
+      )
+      assert.equal(r.ok, false)
+      if (!r.ok) {
+        assert.equal(r.reason, 'blocked_target')
+        const a = r.attempts.find((x) => x.source === 'known_oa')
+        assert.equal(a?.code, 'blocked_target')
+        assert.match(String(a?.detail), /target rejected/)
+      }
+      assert.equal(urls.filter((u) => u.includes(ip)).length, 0)
+    })
+  }
+
+  it('域名解析到私网地址 → blocked_target', async () => {
+    const urls: string[] = []
+    const fetchImpl = mockFetch([{ match: 'evil.example', respond: () => pdfResponse() }], urls)
+    const r = await downloadFulltext(
+      record({ oa: { url: 'https://evil.example/paper.pdf' } }),
+      {},
+      {
+        fetchImpl,
+        guardResolver: {
+          resolve4: async () => ['93.184.216.34', '172.31.0.9'],
+          resolve6: async () => [],
+        },
+      },
+    )
+    assert.equal(r.ok, false)
+    if (!r.ok) assert.equal(r.reason, 'blocked_target')
+    assert.equal(urls.length, 0)
+  })
+
+  it('redirect 某跳指回内网 → blocked_target,detail 带 hop 序号,该跳不发出', async () => {
+    const urls: string[] = []
+    const fetchImpl = mockFetch(
+      [
+        {
+          match: 'publisher.example/landing',
+          respond: () =>
+            new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:5432/' } }),
+        },
+        { match: '127.0.0.1', respond: () => pdfResponse() },
+      ],
+      urls,
+    )
+    const r = await downloadFulltext(
+      record({ oa: { url: 'https://publisher.example/landing' } }),
+      {},
+      { fetchImpl, guardResolver: PUBLIC_DNS },
+    )
+    assert.equal(r.ok, false)
+    if (!r.ok) {
+      assert.equal(r.reason, 'blocked_target')
+      const a = r.attempts.find((x) => x.source === 'known_oa')
+      assert.match(String(a?.detail), /redirect hop 1 rejected/)
+    }
+    assert.equal(urls.filter((u) => u.includes('127.0.0.1')).length, 0)
+  })
+
+  it('公网 redirect 正常跟随(相对 Location 亦可)→ 命中 PDF', async () => {
+    const urls: string[] = []
+    const fetchImpl = mockFetch(
+      [
+        {
+          match: 'publisher.example/landing',
+          respond: () =>
+            new Response(null, { status: 301, headers: { location: '/files/paper.pdf' } }),
+        },
+        {
+          match: 'publisher.example/files/paper.pdf',
+          respond: () =>
+            new Response(null, { status: 307, headers: { location: 'https://cdn.example/p.pdf' } }),
+        },
+        { match: 'cdn.example', respond: () => pdfResponse() },
+      ],
+      urls,
+    )
+    const r = await downloadFulltext(
+      record({ oa: { url: 'https://publisher.example/landing' } }),
+      {},
+      { fetchImpl, guardResolver: PUBLIC_DNS },
+    )
+    assert.equal(r.ok, true)
+    if (r.ok) assert.equal(r.strategy, 'known_oa')
+    assert.deepEqual(urls, [
+      'https://publisher.example/landing',
+      'https://publisher.example/files/paper.pdf',
+      'https://cdn.example/p.pdf',
+    ])
+  })
+
+  it('redirect 超过 5 跳 → fetch_error_4xx(too many redirects),不无限跟随', async () => {
+    const urls: string[] = []
+    const fetchImpl = mockFetch(
+      [
+        {
+          match: 'loop.example',
+          respond: (u) => {
+            const n = Number(new URL(u).searchParams.get('n') ?? '0')
+            return new Response(null, {
+              status: 302,
+              headers: { location: `https://loop.example/?n=${n + 1}` },
+            })
+          },
+        },
+      ],
+      urls,
+    )
+    const r = await downloadFulltext(
+      record({ oa: { url: 'https://loop.example/?n=0' } }),
+      {},
+      { fetchImpl, guardResolver: PUBLIC_DNS, retryDelayMs: 0 },
+    )
+    assert.equal(r.ok, false)
+    if (!r.ok) {
+      assert.equal(r.reason, 'fetch_error_4xx')
+      const a = r.attempts.find((x) => x.source === 'known_oa')
+      assert.match(String(a?.detail), /too many redirects/)
+    }
+    assert.equal(urls.length, 6)
+  })
+
+  it('blocked_target 不重试(非 transient),且不影响后续策略继续', async () => {
+    const urls: string[] = []
+    const fetchImpl = mockFetch([{ match: 'arxiv.org', respond: () => pdfResponse() }], urls)
+    const r = await downloadFulltext(
+      record({ oa: { url: 'http://10.0.0.1/x.pdf' }, arxivId: '2301.01234' }),
+      {},
+      { fetchImpl, guardResolver: PUBLIC_DNS, retryDelayMs: 0 },
+    )
+    assert.equal(r.ok, true)
+    if (r.ok) {
+      assert.equal(r.strategy, 'arxiv')
+      const blocked = r.attempts.filter((x) => x.source === 'known_oa')
+      assert.equal(blocked.length, 1)
+      assert.equal(blocked[0]?.code, 'blocked_target')
+    }
+    assert.equal(urls.filter((u) => u.includes('10.0.0.1')).length, 0)
+  })
+
+  it('非 http(s) scheme / userinfo:候选期已被 safeCandidateUrl 剔除(no_oa_location),门内再拒一层', async () => {
+    const urls: string[] = []
+    const fetchImpl = mockFetch([], urls)
+    for (const url of ['file:///etc/passwd', 'https://user:pw@publisher.example/x.pdf']) {
+      const r = await downloadFulltext(
+        record({ oa: { url } }),
+        {},
+        { fetchImpl, guardResolver: PUBLIC_DNS },
+      )
+      assert.equal(r.ok, false)
+      if (!r.ok) assert.equal(r.reason, 'no_oa_location')
+    }
+    assert.equal(urls.length, 0)
+    // 门自身(redirect Location 不经 safeCandidateUrl,靠这层兜底)
+    for (const url of ['file:///etc/passwd', 'ftp://x.example/a', 'https://u:p@x.example/a']) {
+      const v = await vetFetchTarget(url, PUBLIC_DNS)
+      assert.equal(v.ok, false)
+    }
+    assert.equal((await vetFetchTarget('https://x.example/a', PUBLIC_DNS)).ok, true)
+    assert.equal((await vetFetchTarget('http://localhost/a', PUBLIC_DNS)).ok, false)
+    assert.equal((await vetFetchTarget('http://db.local/a', PUBLIC_DNS)).ok, false)
   })
 })
 
@@ -449,6 +646,7 @@ describe('fetchFulltext: 机构 proxy', () => {
       { proxyUrl: 'http://proxy.example:3128' },
       {
         fetchImpl: direct,
+        guardResolver: PUBLIC_DNS,
         proxyFetchImpl: (async (u: string | URL | Request) => {
           proxyUrls.push(String(u))
           return pdfResponse()
@@ -473,6 +671,7 @@ describe('fetchFulltext: 机构 proxy', () => {
       {},
       {
         fetchImpl: direct,
+        guardResolver: PUBLIC_DNS,
         proxyFetchImpl: (async () => {
           proxyCalls++
           return pdfResponse()
@@ -489,6 +688,7 @@ describe('fetchFulltext: 机构 proxy', () => {
       record({ arxivId: '2301.01234' }),
       { proxyUrl: 'http://proxy.example:3128' },
       {
+        guardResolver: PUBLIC_DNS,
         fetchImpl: mockFetch([
           { match: 'arxiv.org', respond: () => new Response('x', { status: 404 }) },
         ]),
@@ -521,7 +721,10 @@ function makeStoreDeps() {
     attempts,
     memberships,
     deps: {
-      http: { fetchImpl: mockFetch([{ match: 'arxiv.org', respond: () => pdfResponse() }]) },
+      http: {
+        guardResolver: PUBLIC_DNS,
+        fetchImpl: mockFetch([{ match: 'arxiv.org', respond: () => pdfResponse() }]),
+      },
       putBlob: async (p: { blobId: string; mime?: string }) => {
         blobs.set(p.blobId, Buffer.alloc(0))
       },
@@ -624,6 +827,7 @@ describe('fetchRecordIntoLibrary 编排器', () => {
   it('下载失败 → 结构化 failed,attempts 全记录,不动 blob', async () => {
     const s = makeStoreDeps()
     s.deps.http = {
+      guardResolver: PUBLIC_DNS,
       fetchImpl: mockFetch([
         { match: 'arxiv.org', respond: () => new Response('nf', { status: 404 }) },
       ]),

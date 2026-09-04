@@ -25,6 +25,12 @@
  * (documentStyle=pdf + availabilityCode OA|F + site=Europe_PMC);arxiv.org/pdf/<id>。
  */
 
+import {
+  FETCH_MAX_REDIRECTS,
+  type FetchGuardResolver,
+  isRedirectStatus,
+  vetFetchTarget,
+} from './fetchUrlGuard.js'
 import type { FetchLike } from './sources.js'
 
 // ─── 类型 ────────────────────────────────────────────────────────────
@@ -41,6 +47,8 @@ export const FETCH_FAIL_REASONS = [
   'not_pdf',
   'too_large',
   'proxy_unavailable',
+  /** 目标 URL(或某一跳 redirect)指向私网/回环/链路本地/平台网段 → SSRF 边界拒绝(auditor W3)。 */
+  'blocked_target',
 ] as const
 export type FetchFailReason = (typeof FETCH_FAIL_REASONS)[number]
 
@@ -92,6 +100,8 @@ export interface FetchFulltextHttpDeps {
   maxBytes?: number
   /** 瞬时错误重试退避基数(ms);默认 400,测试可传 0 跑快。 */
   retryDelayMs?: number
+  /** SSRF 门的 DNS 解析器(默认 node:dns/promises);测试注入以免打真 DNS。 */
+  guardResolver?: FetchGuardResolver
 }
 
 // ─── 常量 ────────────────────────────────────────────────────────────
@@ -279,22 +289,87 @@ async function readBodyCapped(
   return { bytes: Buffer.concat(chunks) }
 }
 
+/**
+ * 手工跟随 redirect:每一跳的 Location 都重新过 SSRF 门(vetFetchTarget),
+ * 上限 FETCH_MAX_REDIRECTS。`redirect:'follow'` 会让 fetch 内部静默跟到内网,所以必须 manual。
+ * 返回最终非 3xx 响应,或结构化拒绝。
+ */
+async function fetchFollowingVettedRedirects(
+  startUrl: string,
+  fetchImpl: FetchLike,
+  init: { headers: Record<string, string>; signal: AbortSignal },
+  resolver: FetchGuardResolver | undefined,
+): Promise<{ res: Response } | { code: AttemptFailCode; httpStatus?: number; detail?: string }> {
+  let current = startUrl
+  for (let hop = 0; hop <= FETCH_MAX_REDIRECTS; hop++) {
+    const vet = await vetFetchTarget(current, resolver)
+    if (!vet.ok) {
+      return {
+        code: 'blocked_target',
+        detail:
+          hop === 0
+            ? `target rejected: ${vet.reason}`
+            : `redirect hop ${hop} rejected: ${vet.reason}`,
+      }
+    }
+    const res = await fetchImpl(vet.url.toString(), {
+      method: 'GET',
+      headers: init.headers,
+      signal: init.signal,
+      redirect: 'manual',
+    })
+    if (!isRedirectStatus(res.status)) return { res }
+    const loc = res.headers.get('location')
+    try {
+      await res.body?.cancel()
+    } catch {
+      /* 3xx body 可丢 */
+    }
+    if (!loc)
+      return {
+        code: 'fetch_error_4xx',
+        httpStatus: res.status,
+        detail: 'redirect without location',
+      }
+    if (hop === FETCH_MAX_REDIRECTS) {
+      return {
+        code: 'fetch_error_4xx',
+        httpStatus: res.status,
+        detail: `too many redirects (>${FETCH_MAX_REDIRECTS})`,
+      }
+    }
+    try {
+      current = new URL(loc, vet.url).toString()
+    } catch {
+      return {
+        code: 'fetch_error_4xx',
+        httpStatus: res.status,
+        detail: 'malformed redirect location',
+      }
+    }
+  }
+  // 循环内必返回;此处仅让 TS 收敛。
+  return { code: 'fetch_error_4xx', detail: 'redirect loop' }
+}
+
 async function attemptDownloadOnce(
   url: string,
   fetchImpl: FetchLike,
-  opts: { timeoutMs: number; maxBytes: number; ua?: string },
+  opts: { timeoutMs: number; maxBytes: number; ua?: string; guardResolver?: FetchGuardResolver },
 ): Promise<AttemptOk | { code: AttemptFailCode; httpStatus?: number; detail?: string }> {
   const ctrl = new AbortController()
   const to = setTimeout(() => ctrl.abort(), opts.timeoutMs)
   try {
     const headers: Record<string, string> = { Accept: 'application/pdf,*/*' }
     if (opts.ua) headers['User-Agent'] = opts.ua
-    const res = await fetchImpl(url, {
-      method: 'GET',
-      headers,
-      signal: ctrl.signal,
-      redirect: 'follow',
-    })
+    const followed = await fetchFollowingVettedRedirects(
+      url,
+      fetchImpl,
+      { headers, signal: ctrl.signal },
+      opts.guardResolver,
+    )
+    if (!('res' in followed)) return followed
+    const res = followed.res
     if (!res.ok) {
       const code = res.status >= 500 ? 'fetch_error_5xx' : 'fetch_error_4xx'
       return { code, httpStatus: res.status }
@@ -339,7 +414,13 @@ function contentTypeHeaderMime(raw: string | null): string {
 async function attemptDownload(
   url: string,
   fetchImpl: FetchLike,
-  opts: { timeoutMs: number; maxBytes: number; ua?: string; retryDelayMs?: number },
+  opts: {
+    timeoutMs: number
+    maxBytes: number
+    ua?: string
+    retryDelayMs?: number
+    guardResolver?: FetchGuardResolver
+  },
 ): Promise<
   AttemptOk | { code: AttemptFailCode; httpStatus?: number; detail?: string; attempts: number }
 > {
@@ -438,6 +519,7 @@ export async function downloadFulltext(
       maxBytes,
       ua,
       retryDelayMs: deps.retryDelayMs,
+      guardResolver: deps.guardResolver,
     })
     const ms = Date.now() - t0
     if ('ok' in r) {
@@ -465,6 +547,7 @@ export async function downloadFulltext(
           maxBytes,
           ua,
           retryDelayMs: deps.retryDelayMs,
+          guardResolver: deps.guardResolver,
         })
         const ms = Date.now() - t0
         if ('ok' in r) {
