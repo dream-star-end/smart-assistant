@@ -19,9 +19,9 @@ import type { HealthMode, Inflight, ModelOpsResp, ModelRowData, ProviderData, St
 function PriceChangeTable({ changes }: { changes: PriceChange[] }) {
   return (
     <div className="overflow-x-auto">
-      <table className="w-full text-[13px]">
+      <table className="w-full text-body">
         <thead>
-          <tr className="border-b border-border text-left text-[12px] text-faint">
+          <tr className="border-b border-border text-left text-meta text-faint">
             <th className="py-1.5 pr-3">项</th>
             <th className="py-1.5 pr-3 text-right">旧(分/Mtok)</th>
             <th className="py-1.5 text-right">新(分/Mtok)</th>
@@ -37,7 +37,7 @@ function PriceChangeTable({ changes }: { changes: PriceChange[] }) {
           ))}
         </tbody>
       </table>
-      <p className="mt-3 text-[12.5px] text-warning">保存后计费立即生效,请核对每 Mtok 分值。</p>
+      <p className="mt-3 text-meta text-warning">保存后计费立即生效,请核对每 Mtok 分值。</p>
     </div>
   );
 }
@@ -83,7 +83,7 @@ function ExtraPromptModal({
       }
     >
       <div className="flex flex-col gap-2">
-        <label className="text-[12px] text-faint">extra_system_prompt(per-model 行为补丁)</label>
+        <label className="text-meta text-faint">extra_system_prompt(per-model 行为补丁)</label>
         <Textarea
           value={text}
           onChange={(e) => setText(e.target.value)}
@@ -356,7 +356,7 @@ export default function PricingPage() {
       />
 
       {statsMeta.source === "local_fallback" && (
-        <div className="flex items-center gap-2 rounded-lg border border-warning/40 bg-warning-soft px-3 py-2 text-[12.5px] text-warning">
+        <div className="flex items-center gap-2 rounded-lg border border-warning/40 bg-warning-soft px-3 py-2 text-meta text-warning">
           <TriangleAlert size={15} className="shrink-0" />
           egress 统计不可达,并发数据可能不完整
         </div>
@@ -365,8 +365,8 @@ export default function PricingPage() {
       {/* ── 服务商 ── */}
       <section className="flex flex-col gap-3">
         <div className="flex items-baseline gap-2">
-          <h2 className="text-[14px] font-semibold text-fg">服务商</h2>
-          <span className="text-[12px] text-faint">
+          <h2 className="text-title font-semibold text-fg">服务商</h2>
+          <span className="text-meta text-faint">
             共 {providers.length} 家 · key / 订阅 / 探测延迟 / 并发
           </span>
         </div>
@@ -396,10 +396,10 @@ export default function PricingPage() {
       {/* ── 模型 ── */}
       <section className="flex flex-col gap-3">
         <div className="flex items-baseline gap-2">
-          <h2 className="text-[14px] font-semibold text-fg">模型</h2>
-          <span className="text-[12px] text-faint">共 {models.length} 个 · 行内编辑,逐行保存</span>
+          <h2 className="text-title font-semibold text-fg">模型</h2>
+          <span className="text-meta text-faint">共 {models.length} 个 · 行内编辑,逐行保存</span>
         </div>
-        <p className="text-[12px] text-faint">价格单位:分/百万token;上下线即时生效(NOTIFY 热加载)</p>
+        <p className="text-meta text-faint">价格单位:分/百万token;上下线即时生效(NOTIFY 热加载)</p>
         {loading ? (
           <div className="h-64 animate-pulse rounded-xl border border-border bg-surface" />
         ) : models.length === 0 ? (
@@ -408,7 +408,7 @@ export default function PricingPage() {
           <div className="overflow-x-auto rounded-xl border border-border bg-surface">
             <table className="w-full border-collapse text-sm">
               <thead className="bg-surface">
-                <tr className="border-b border-border text-left text-[12px] font-medium text-faint">
+                <tr className="border-b border-border text-left text-meta font-medium text-faint">
                   <th className="px-3 py-2.5">模型ID</th>
                   <th className="px-3 py-2.5">显示名</th>
                   <th className="px-3 py-2.5">服务商</th>

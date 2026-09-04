@@ -108,19 +108,19 @@ function EditPlanModal({
       }
     >
       <div className="flex flex-col gap-3">
-        <label className="flex flex-col gap-1 text-[12px] text-faint">
+        <label className="flex flex-col gap-1 text-meta text-faint">
           label
           <Input value={label} onChange={(e) => setLabel(e.target.value)} />
         </label>
-        <label className="flex flex-col gap-1 text-[12px] text-faint">
+        <label className="flex flex-col gap-1 text-meta text-faint">
           amount_cents(支付金额,单位:分;¥1 = 100)
           <Input value={amount} onChange={(e) => setAmount(e.target.value)} className="tabular-nums" />
         </label>
-        <label className="flex flex-col gap-1 text-[12px] text-faint">
+        <label className="flex flex-col gap-1 text-meta text-faint">
           credits(到账余额,单位:分;可大于 amount 表赠送)
           <Input value={credits} onChange={(e) => setCredits(e.target.value)} className="tabular-nums" />
         </label>
-        <label className="flex flex-col gap-1 text-[12px] text-faint">
+        <label className="flex flex-col gap-1 text-meta text-faint">
           sort_order
           <Input
             type="number"
@@ -227,8 +227,8 @@ export default function PlansPage() {
             <Card key={p.code} className="flex flex-col gap-3 p-4">
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
-                  <p className="truncate text-[14px] font-semibold text-fg">{p.label}</p>
-                  <span className="font-mono text-[11px] text-faint">{p.code}</span>
+                  <p className="truncate text-title font-semibold text-fg">{p.label}</p>
+                  <span className="font-mono text-caption text-faint">{p.code}</span>
                 </div>
                 <Badge tone={p.enabled ? "success" : "neutral"}>{p.enabled ? "上架" : "下架"}</Badge>
               </div>
@@ -238,7 +238,7 @@ export default function PlansPage() {
                 <KeyValue label="排序" value={<span className="tabular-nums">{p.sort_order}</span>} />
               </div>
               <div className="flex items-center justify-between border-t border-border pt-3">
-                <label className="flex items-center gap-2 text-[12.5px] text-muted">
+                <label className="flex items-center gap-2 text-meta text-muted">
                   <Switch
                     checked={p.enabled}
                     disabled={togglingCode === p.code}

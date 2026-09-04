@@ -103,7 +103,7 @@ function fmtDateTime(value?: string): string {
 
 function SmallMeta({ icon, children }: { icon?: ReactNode; children: ReactNode }) {
   return (
-    <span className="inline-flex min-w-0 items-center gap-1 rounded-full bg-hover px-2 py-0.5 text-[11px] text-muted">
+    <span className="inline-flex min-w-0 items-center gap-1 rounded-full bg-hover px-2 py-0.5 text-caption text-muted">
       {icon}
       <span className="min-w-0 truncate">{children}</span>
     </span>
@@ -121,7 +121,7 @@ function ReminderJobCard({ job }: { job: ReminderJob }) {
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-            <span className="min-w-0 max-w-full truncate text-[13px] font-semibold text-fg">{job.title}</span>
+            <span className="min-w-0 max-w-full truncate text-body font-semibold text-fg">{job.title}</span>
             {job.isSystem && <Badge tone="neutral">系统</Badge>}
             {job.enabled === false ? <Badge tone="warning">已停用</Badge> : <Badge tone="success">启用中</Badge>}
           </div>
@@ -146,15 +146,15 @@ export function renderReminderListCard(output?: string | null): ReactNode | null
     return (
       <div className="rounded-xl border border-dashed border-border bg-elevated px-3 py-4 text-center">
         <Clock size={18} className="mx-auto text-faint" />
-        <div className="mt-1 text-[13px] font-medium text-fg">还没有定时任务</div>
-        <p className="mt-0.5 text-[12px] text-faint">可以直接对智能体说“每天 9 点提醒我…”来创建。</p>
+        <div className="mt-1 text-body font-medium text-fg">还没有定时任务</div>
+        <p className="mt-0.5 text-meta text-faint">可以直接对智能体说“每天 9 点提醒我…”来创建。</p>
       </div>
     );
   }
   return (
     <div className="flex flex-col gap-2">
       <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-[12.5px] font-medium text-fg">
+        <div className="flex items-center gap-2 text-meta font-medium text-fg">
           <ListChecks size={14} className="text-accent" />
           当前共有 {parsed.declaredCount ?? parsed.jobs.length} 个定时任务
         </div>
@@ -167,7 +167,7 @@ export function renderReminderListCard(output?: string | null): ReactNode | null
       {parsed.leftovers.length > 0 && (
         <ul className="flex flex-col gap-1">
           {parsed.leftovers.map((line, i) => (
-            <li key={`lo-${i}`} className="whitespace-pre-wrap break-words text-[12px] text-faint">
+            <li key={`lo-${i}`} className="whitespace-pre-wrap break-words text-meta text-faint">
               {line}
             </li>
           ))}
@@ -237,7 +237,7 @@ export function ReminderStatusCard({ op, input, output, error }: { op: string; i
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-[13px] font-semibold text-fg">{status.title}</span>
+            <span className="text-body font-semibold text-fg">{status.title}</span>
             <Badge tone={statusTone(status.ok)}>{status.ok === false ? "失败" : "完成"}</Badge>
           </div>
           {status.desc && <p className="mt-0.5 whitespace-pre-wrap break-words text-[12px] leading-snug text-muted">{status.desc}</p>}

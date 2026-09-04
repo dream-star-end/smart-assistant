@@ -69,7 +69,7 @@ export function MermaidBlock({ code }: { code: string }) {
   }
   if (!svg) {
     return (
-      <div className="my-3 flex items-center justify-center rounded-lg border border-border bg-surface px-3 py-6 text-[12.5px] text-faint">
+      <div className="my-3 flex items-center justify-center rounded-lg border border-border bg-surface px-3 py-6 text-meta text-faint">
         图表渲染中…
       </div>
     );
@@ -176,7 +176,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
 
   if (!parsed) {
     return (
-      <pre className="overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-[12px] text-fg">{code}</pre>
+      <pre className="overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-meta text-fg">{code}</pre>
     );
   }
 
@@ -225,7 +225,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
   return (
     <>
     <div className="my-1.5 flex flex-col gap-1.5 rounded-xl border border-border bg-surface p-2.5 not-prose">
-      {parsed.question && <p className="px-1 text-[13px] font-medium text-fg">{parsed.question}</p>}
+      {parsed.question && <p className="px-1 text-body font-medium text-fg">{parsed.question}</p>}
       <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
         {parsed.options.map((o, i) => {
           const chosen = parsed.multi || grouped ? picked.has(i) : sentText === o.label;
@@ -245,14 +245,14 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
             >
               <span
                 className={
-                  "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border text-[10px] " +
+                  "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border text-micro " +
                   (chosen ? "border-accent bg-accent text-white" : "border-border text-transparent")
                 }
               >
                 ✓
               </span>
               <span className="min-w-0">
-                <span className="block text-[13px] font-medium text-fg">{o.label}</span>
+                <span className="block text-body font-medium text-fg">{o.label}</span>
                 {o.desc && <span className="mt-0.5 block text-[11.5px] leading-snug text-muted">{o.desc}</span>}
               </span>
             </button>
@@ -264,16 +264,16 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
           type="button"
           disabled={picked.size === 0 || blockedByBusy}
           onClick={confirmMulti}
-          className="self-end rounded-lg bg-accent px-3.5 py-1.5 text-[12.5px] font-medium text-white transition-opacity disabled:opacity-40"
+          className="self-end rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-white transition-opacity disabled:opacity-40"
         >
           确认选择{picked.size > 0 ? `(${picked.size})` : ""}
         </button>
       )}
-      {sent && sentText && <p className="px-1 text-[11.5px] text-faint">已选择:{sentText}</p>}
+      {sent && sentText && <p className="px-1 text-caption text-faint">已选择:{sentText}</p>}
       {grouped && !sent && (groupEntry?.labels.length ?? 0) > 0 && (
-        <p className="px-1 text-[11.5px] text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
+        <p className="px-1 text-caption text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
       )}
-      {!readOnly && !sendUserText && <p className="px-1 text-[11px] text-faint">(此会话中不可交互)</p>}
+      {!readOnly && !sendUserText && <p className="px-1 text-caption text-faint">(此会话中不可交互)</p>}
     </div>
     {parsed.trailing ? (
       <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-fg">{parsed.trailing}</p>
@@ -382,7 +382,7 @@ export function HtmlPreview({ code, live }: { code: string; live?: boolean }) {
   );
   return (
     <div className="my-3 overflow-hidden rounded-lg border border-border">
-      <div className="flex items-center justify-between border-b border-border bg-hover px-3 py-1.5 text-[12px] text-muted">
+      <div className="flex items-center justify-between border-b border-border bg-hover px-3 py-1.5 text-meta text-muted">
         <span>HTML {show ? (live ? "预览(生成中)" : "预览(沙盒)") : "源码"}</span>
         <div className="flex items-center gap-1">
           {show && (

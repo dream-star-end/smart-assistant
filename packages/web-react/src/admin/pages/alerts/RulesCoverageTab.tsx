@@ -46,7 +46,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       render: (r) => (
         <span className="flex items-center gap-2">
           {r.classification === "firing" && !r.acked && <span className="size-1.5 shrink-0 rounded-full bg-danger" />}
-          <span className="font-mono text-[12.5px]">{r.rule_id}</span>
+          <span className="font-mono text-meta">{r.rule_id}</span>
         </span>
       ),
     },
@@ -75,7 +75,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
         if (r.classification !== "firing") return <span className="text-faint">—</span>;
         if (r.acked)
           return (
-            <span className="text-[12px]">
+            <span className="text-meta">
               #{r.acked_by ?? "?"}{" "}
               {r.acked_at && <span className="text-faint">(<TimeAgo value={r.acked_at} />)</span>}
             </span>
@@ -86,7 +86,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
     {
       key: "dedupe_key",
       title: "dedupe_key",
-      render: (r) => <span className="font-mono text-[12px] text-faint">{r.dedupe_key ?? "—"}</span>,
+      render: (r) => <span className="font-mono text-meta text-faint">{r.dedupe_key ?? "—"}</span>,
     },
     {
       key: "last_transition_at",
@@ -106,7 +106,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       render: (r) => {
         const s = JSON.stringify(r.last_payload ?? {});
         return (
-          <span className="line-clamp-1 max-w-[240px] font-mono text-[11.5px] text-faint" title={s}>
+          <span className="line-clamp-1 max-w-[240px] font-mono text-caption text-faint" title={s}>
             {s}
           </span>
         );
@@ -138,7 +138,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       bodyClassName="p-0"
     >
       {error ? (
-        <div className="px-5 py-4 text-[13px] text-danger">加载规则状态失败: {errText(error)}</div>
+        <div className="px-5 py-4 text-body text-danger">加载规则状态失败: {errText(error)}</div>
       ) : (
         <DataTable
           className="rounded-none border-0"
@@ -183,15 +183,15 @@ function CoverageSection() {
       }
     >
       {error ? (
-        <div className="text-[13px] text-danger">加载覆盖矩阵失败: {errText(error)}</div>
+        <div className="text-body text-danger">加载覆盖矩阵失败: {errText(error)}</div>
       ) : loading && rows.length === 0 ? (
-        <div className="text-[13px] text-faint">加载中…</div>
+        <div className="text-body text-faint">加载中…</div>
       ) : rows.length === 0 ? (
-        <div className="text-[13px] text-faint">暂无事件(EVENT_META 为空?)</div>
+        <div className="text-body text-faint">暂无事件(EVENT_META 为空?)</div>
       ) : (
         <div className="flex flex-col gap-5">
           {orphanCount > 0 && (
-            <div className="flex items-center gap-2 rounded-lg border border-warning/40 bg-warning-soft px-3 py-2.5 text-[12.5px] text-warning">
+            <div className="flex items-center gap-2 rounded-lg border border-warning/40 bg-warning-soft px-3 py-2.5 text-meta text-warning">
               <AlertTriangle size={15} className="shrink-0" />
               <span>
                 有 <strong className="tabular-nums">{orphanCount}</strong> 个事件<strong>没有主动通道订阅</strong>
@@ -215,8 +215,8 @@ function CoverageGroup({ group, rows }: { group: string; rows: CoverageRow[] }) 
       title: "事件",
       render: (r) => (
         <div>
-          <div className="font-mono text-[12.5px] text-fg">{r.event_type}</div>
-          {r.description && <div className="text-[11.5px] text-faint">{r.description}</div>}
+          <div className="font-mono text-meta text-fg">{r.event_type}</div>
+          {r.description && <div className="text-caption text-faint">{r.description}</div>}
         </div>
       ),
     },
@@ -278,7 +278,7 @@ function CoverageGroup({ group, rows }: { group: string; rows: CoverageRow[] }) 
 
   return (
     <div>
-      <h4 className="mb-2 text-[12.5px] font-semibold text-fg">
+      <h4 className="mb-2 text-meta font-semibold text-fg">
         {groupLabel(group)} <span className="font-normal text-faint">({rows.length})</span>
       </h4>
       <DataTable columns={columns} rows={rows} rowKey={(r) => r.event_type} />

@@ -433,8 +433,8 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
         <div className="rounded-xl border border-border bg-elevated p-3 sm:p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h3 className="text-[13px] font-semibold text-fg">受众 dry-run</h3>
-              <p className="mt-1 text-[12px] text-faint">只计算受众，不创建消息；发送时将固化不可变收件人快照。</p>
+              <h3 className="text-body font-semibold text-fg">受众 dry-run</h3>
+              <p className="mt-1 text-meta text-faint">只计算受众，不创建消息；发送时将固化不可变收件人快照。</p>
             </div>
             <Button variant="secondary" size="sm" onClick={() => void previewAudience()} disabled={previewBusy || busy}>
               <Eye size={14} />{previewBusy ? '计算中…' : '预览受众'}
@@ -444,16 +444,16 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
           {audiencePreview && (
             <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
               <div className="rounded-lg bg-surface px-3 py-2">
-                <p className="text-[11px] text-faint">预计收件人</p>
+                <p className="text-caption text-faint">预计收件人</p>
                 <p className="mt-1 text-xl font-semibold tabular-nums text-fg">{audiencePreview.recipients}</p>
-                <p className="mt-1 text-[11px] text-faint">
+                <p className="mt-1 text-caption text-faint">
                   近30天接收量 p50 {audiencePreview.recipient_load.p50_30d} · p90 {audiencePreview.recipient_load.p90_30d} · max {audiencePreview.recipient_load.max_30d}
                 </p>
               </div>
               <div className="min-w-0 rounded-lg bg-surface px-3 py-2">
-                <p className="text-[11px] text-faint">样本（仅供人工核对）</p>
+                <p className="text-caption text-faint">样本（仅供人工核对）</p>
                 <div className="mt-2 flex flex-wrap gap-1.5">
-                  {audiencePreview.sample.length === 0 ? <span className="text-[12px] text-faint">无匹配用户</span> : audiencePreview.sample.map((user) => (
+                  {audiencePreview.sample.length === 0 ? <span className="text-meta text-faint">无匹配用户</span> : audiencePreview.sample.map((user) => (
                     <Badge key={user.user_id} tone={user.traffic_class === 'production_user' ? 'success' : 'neutral'}>
                       {user.username ?? `#${user.user_id}`} · {user.traffic_class}
                     </Badge>
@@ -539,7 +539,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
               >
                 <GitBranch size={15} />
               </ToolButton>
-              <span className="ml-auto hidden items-center gap-1 text-[11px] text-faint sm:inline-flex">
+              <span className="ml-auto hidden items-center gap-1 text-caption text-faint sm:inline-flex">
                 <Eye size={12} /> 右侧实时预览
               </span>
               <input
@@ -571,9 +571,9 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
                   rows={14}
                   maxLength={16_384}
                   placeholder="输入 Markdown，或把图片拖到这里…"
-                  className="min-h-[22rem] resize-y rounded-none border-0 bg-transparent font-mono text-[13px] focus:ring-0"
+                  className="min-h-[22rem] resize-y rounded-none border-0 bg-transparent font-mono text-body focus:ring-0"
                 />
-                <div className="flex items-center justify-between border-t border-border px-3 py-2 text-[11px] text-faint">
+                <div className="flex items-center justify-between border-t border-border px-3 py-2 text-caption text-faint">
                   <span className="inline-flex items-center gap-1">
                     <UploadCloud size={12} /> 最多 8 张，共 15 MiB
                   </span>
@@ -606,8 +606,8 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
                   className="size-11 shrink-0 rounded-md object-cover"
                 />
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-[12px] font-medium text-fg">{asset.file.name}</p>
-                  <p className="text-[11px] text-faint">
+                  <p className="truncate text-meta font-medium text-fg">{asset.file.name}</p>
+                  <p className="text-caption text-faint">
                     {(asset.file.size / 1024 / 1024).toFixed(2)} MiB
                   </p>
                 </div>
@@ -661,11 +661,11 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
                 onCheckedChange={setNotifyEmail}
                 aria-label="同时发邮件到用户邮箱"
               />
-              <span className="text-[13px] text-fg">
+              <span className="text-body text-fg">
                 同时发邮件到用户邮箱（图片和图表降级为“登录站内信查看”）
               </span>
             </div>
-            <p className="text-[12px] text-faint">{emailHint}</p>
+            <p className="text-meta text-faint">{emailHint}</p>
           </div>
         </Field>
 
@@ -691,14 +691,14 @@ function PreviewCard({ title, level, body }: { title: string; level: InboxLevel;
     <article className="mx-auto overflow-hidden rounded-xl border border-border bg-elevated shadow-soft">
       <header className="border-b border-border px-4 py-3">
         <div className="flex items-center justify-between gap-2">
-          <p className="min-w-0 truncate text-[14px] font-semibold text-fg">
+          <p className="min-w-0 truncate text-title font-semibold text-fg">
             {title || '站内信标题'}
           </p>
           <Badge tone={meta.tone}>{meta.label}</Badge>
         </div>
-        <p className="mt-1 text-[11px] text-faint">用户收到的卡片预览</p>
+        <p className="mt-1 text-caption text-faint">用户收到的卡片预览</p>
       </header>
-      <div className="min-h-52 overflow-hidden px-4 py-4 text-[13px] text-fg">
+      <div className="min-h-52 overflow-hidden px-4 py-4 text-body text-fg">
         {body.trim() ? (
           <Markdown signMedia readOnly>
             {body}
@@ -735,8 +735,8 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
   return (
     <div className="flex min-w-0 flex-col gap-1.5">
       <div className="flex flex-wrap items-baseline gap-2">
-        <span className="text-[12px] font-medium text-faint">{label}</span>
-        {hint && <span className="text-[11px] text-faint/80">{hint}</span>}
+        <span className="text-meta font-medium text-faint">{label}</span>
+        {hint && <span className="text-caption text-faint/80">{hint}</span>}
       </div>
       {children}
     </div>

@@ -21,7 +21,7 @@ export function Field({
   return (
     // biome-ignore lint/a11y/noLabelWithoutControl: label 经 children 隐式关联表单控件(Input/Select/Textarea)
     <label className={cn("flex flex-col gap-1.5", className)}>
-      <span className="text-[12.5px] font-medium text-muted">{label}</span>
+      <span className="text-meta font-medium text-muted">{label}</span>
       {children}
       {hint && <span className="text-[11.5px] leading-snug text-faint">{hint}</span>}
     </label>

@@ -71,7 +71,7 @@ export function modelLabel(m: PublicModel): string {
 function CostMark({ model }: { model?: { cost_x?: number } }) {
   const label = modelCostLabel(model)
   if (!label) return null
-  return <span className="text-[11px] font-normal text-faint">{label}</span>
+  return <span className="text-caption font-normal text-faint">{label}</span>
 }
 
 function promoLabelOf(model: { promo_label?: unknown } | undefined): string | undefined {
@@ -271,7 +271,7 @@ export function ModelSelector({
             {active && !degraded && (
               <>
                 {teamEngineActive && (
-                  <span className="text-[11px] text-faint">团队模式关闭后生效</span>
+                  <span className="text-caption text-faint">团队模式关闭后生效</span>
                 )}
                 <Check size={14} className="shrink-0 text-accent" />
               </>
@@ -310,7 +310,7 @@ export function ModelSelector({
             {familyActive && !degraded && (
               <>
                 {teamEngineActive && (
-                  <span className="text-[11px] text-faint">团队模式关闭后生效</span>
+                  <span className="text-caption text-faint">团队模式关闭后生效</span>
                 )}
                 <Check size={14} className="shrink-0 text-accent" />
               </>
@@ -399,7 +399,7 @@ export function ModelSelector({
           {familyActive && !degraded && (
             <>
               {teamEngineActive && (
-                <span className="text-[11px] text-faint">团队模式关闭后生效</span>
+                <span className="text-caption text-faint">团队模式关闭后生效</span>
               )}
               <Check size={14} className="shrink-0 text-accent" />
             </>
@@ -419,7 +419,7 @@ export function ModelSelector({
             disabled={disabled}
             aria-label="选择对话模型"
             className={cn(
-              'flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[13.5px] font-medium text-muted outline-none transition-colors',
+              'flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-section font-medium text-muted outline-none transition-colors',
               'hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]',
               'disabled:pointer-events-none disabled:opacity-50',
               teamEngineActive && 'text-accent hover:text-accent',
@@ -493,7 +493,7 @@ export function ModelSelector({
                     )}
                     <span>{COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL}</span>
                   </span>
-                  <span className="text-[11px] font-normal text-faint">
+                  <span className="text-caption font-normal text-faint">
                     {collapsedRows.length} 个
                   </span>
                 </DropdownMenuItem>
@@ -506,7 +506,7 @@ export function ModelSelector({
               <DropdownMenuSeparator />
               <DropdownMenuLabel className="flex items-center justify-between">
                 思考档位
-                <span className="text-[11px] font-normal text-faint">
+                <span className="text-caption font-normal text-faint">
                   {EFFORT_OPTIONS.find((o) => o.value === selectedCursor.effort)?.label ??
                     selectedCursor.effort ??
                     '—'}
@@ -534,7 +534,7 @@ export function ModelSelector({
               <DropdownMenuSeparator />
               <DropdownMenuLabel className="flex items-center justify-between">
                 速度
-                <span className="text-[11px] font-normal text-faint">
+                <span className="text-caption font-normal text-faint">
                   {selectedCursor.fast ? 'Fast' : '标准'}
                 </span>
               </DropdownMenuLabel>
@@ -563,7 +563,7 @@ export function ModelSelector({
               <DropdownMenuSeparator />
               <DropdownMenuLabel className="flex items-center justify-between">
                 上下文
-                <span className="text-[11px] font-normal text-faint">
+                <span className="text-caption font-normal text-faint">
                   {activeCursorContextTier === '1m' ? '1M' : '300k'}
                 </span>
               </DropdownMenuLabel>
@@ -594,7 +594,7 @@ export function ModelSelector({
               <DropdownMenuSeparator />
               <DropdownMenuLabel className="flex items-center justify-between">
                 上下文
-                <span className="text-[11px] font-normal text-faint">
+                <span className="text-caption font-normal text-faint">
                   {selectedId === selectedContext.longId ? '1M' : '标准'}
                 </span>
               </DropdownMenuLabel>
@@ -635,7 +635,7 @@ export function ModelSelector({
               <DropdownMenuSeparator />
               <DropdownMenuLabel className="flex items-center justify-between">
                 思考档位
-                <span className="text-[11px] font-normal text-faint">
+                <span className="text-caption font-normal text-faint">
                   {effortActive == null
                     ? '跟随模型默认'
                     : (EFFORT_OPTIONS.find((o) => o.value === effortActive)?.label ?? effortActive)}

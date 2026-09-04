@@ -27,7 +27,7 @@ function TraceCard({ trace }: { trace: TraceInfo }) {
         label="Agent"
         value={
           trace.agent_id ? (
-            <span className="font-mono text-[12px] break-all">{trace.agent_id}</span>
+            <span className="font-mono text-meta break-all">{trace.agent_id}</span>
           ) : (
             <span className="text-faint">—</span>
           )
@@ -37,7 +37,7 @@ function TraceCard({ trace }: { trace: TraceInfo }) {
         label="模型"
         value={
           trace.model ? (
-            <span className="font-mono text-[12px] break-all">{trace.model}</span>
+            <span className="font-mono text-meta break-all">{trace.model}</span>
           ) : (
             <span className="text-faint">—</span>
           )

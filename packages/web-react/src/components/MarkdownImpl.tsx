@@ -302,7 +302,7 @@ export default function MarkdownImpl({
                   title="在容器内安全预览"
                 >
                   {children}
-                  <span className="ml-1 inline-flex rounded-full bg-accent-soft px-1.5 py-0.5 align-middle text-[10px] font-medium text-accent">
+                  <span className="ml-1 inline-flex rounded-full bg-accent-soft px-1.5 py-0.5 align-middle text-micro font-medium text-accent">
                     容器预览
                   </span>
                 </a>

@@ -59,7 +59,7 @@ export function InspectorPanelContent({
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <span className="text-[13px] font-semibold text-fg">{meta.label}</span>
+            <span className="text-body font-semibold text-fg">{meta.label}</span>
             {isRunning ? (
               <Spinner size={13} className="text-accent" />
             ) : hasError ? (

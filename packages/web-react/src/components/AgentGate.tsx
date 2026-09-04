@@ -132,7 +132,7 @@ export function AgentGate({
             <>
               {phase.message}
               {phase.requestId && (
-                <span className="mt-1 block select-all font-mono text-[11px] text-faint">
+                <span className="mt-1 block select-all font-mono text-caption text-faint">
                   追踪号 {phase.requestId}
                 </span>
               )}

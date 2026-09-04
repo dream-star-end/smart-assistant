@@ -102,7 +102,7 @@ export function FeedbackQueue() {
         r.user_id ? (
           <span className="truncate">
             {r.username ? `${r.username} ` : ""}
-            <span className="font-mono text-[11px] text-faint">#{r.user_id}</span>
+            <span className="font-mono text-caption text-faint">#{r.user_id}</span>
           </span>
         ) : (
           <span className="text-faint">匿名</span>
@@ -132,7 +132,7 @@ export function FeedbackQueue() {
       key: "assigned_to",
       title: "负责人",
       width: 88,
-      render: (r) => r.assigned_to ? <span className="font-mono text-[11px]">#{r.assigned_to}</span> : <span className="text-faint">未指派</span>,
+      render: (r) => r.assigned_to ? <span className="font-mono text-caption">#{r.assigned_to}</span> : <span className="text-faint">未指派</span>,
     },
     {
       key: "description",
@@ -147,13 +147,13 @@ export function FeedbackQueue() {
       key: "version",
       title: "版本",
       width: 90,
-      render: (r) => <span className="font-mono text-[11px] text-faint">{r.version || "—"}</span>,
+      render: (r) => <span className="font-mono text-caption text-faint">{r.version || "—"}</span>,
     },
     {
       key: "created_at",
       title: "时间",
       width: 96,
-      render: (r) => <TimeAgo value={r.created_at} className="text-[12px] text-muted" />,
+      render: (r) => <TimeAgo value={r.created_at} className="text-meta text-muted" />,
     },
   ];
 
@@ -235,7 +235,7 @@ export function FeedbackQueue() {
 
         <ChartCard title="状态构成" hint="按当前筛选的服务端全量统计" height={240}>
           {(totals?.total ?? 0) === 0 ? (
-            <div className="flex h-full items-center justify-center text-[12px] text-faint">
+            <div className="flex h-full items-center justify-center text-meta text-faint">
               暂无数据
             </div>
           ) : (

@@ -193,7 +193,7 @@ export function ToolCard({
           <Icon size={14} />
         </span>
         {/* 窄屏(L7):标题限宽、摘要优先截断,右侧徽章区 shrink-0 保持完整可见。 */}
-        <span className="min-w-0 max-w-[45%] shrink-0 truncate text-[13px] font-semibold text-fg">
+        <span className="min-w-0 max-w-[45%] shrink-0 truncate text-body font-semibold text-fg">
           {meta.label}
         </span>
         {summary && (

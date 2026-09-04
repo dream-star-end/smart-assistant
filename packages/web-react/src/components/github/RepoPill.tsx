@@ -56,7 +56,7 @@ export function RepoPill({
       aria-label={sel ? `代码仓库 ${sel.owner}/${sel.repo}，点击管理` : "关联 GitHub 仓库"}
       title={sel ? `${sel.owner}/${sel.repo} @ ${sel.branch}` : "关联 GitHub 仓库"}
       className={cn(
-        "inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 text-[12.5px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]",
+        "inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]",
         sel
           ? "border-accent/40 bg-accent-soft text-accent hover:border-accent/60"
           : "border-border text-muted hover:border-border-strong hover:bg-hover hover:text-fg",
@@ -69,11 +69,11 @@ export function RepoPill({
             <span className="opacity-70">{sel.owner}/</span>
             <span className="font-semibold">{sel.repo}</span>
           </span>
-          <span className="hidden shrink-0 items-center gap-1 border-l border-accent/25 pl-1.5 text-[11px] opacity-80 sm:inline-flex">
+          <span className="hidden shrink-0 items-center gap-1 border-l border-accent/25 pl-1.5 text-caption opacity-80 sm:inline-flex">
             {sel.branch}
           </span>
           {statusText ? (
-            <span className="shrink-0 text-[11px] opacity-80">· {statusText}</span>
+            <span className="shrink-0 text-caption opacity-80">· {statusText}</span>
           ) : (
             dot !== "none" && (
               <span className={cn("size-1.5 shrink-0 rounded-full", DOT_CLASS[dot])} />

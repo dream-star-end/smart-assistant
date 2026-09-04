@@ -589,7 +589,7 @@ export function AccountFormModal({
 
           {isCreate && provider === "cursor" && (
             <div className="rounded-lg border border-accent/40 bg-accent-soft/50 p-3.5">
-              <div className="mb-2 flex items-center gap-1.5 text-[13px] font-semibold text-fg">
+              <div className="mb-2 flex items-center gap-1.5 text-body font-semibold text-fg">
                 <KeyRound size={15} className="text-accent" /> 登录 Cursor 账号（Sand 会话，无需 API Key）
               </div>
               <div className="flex flex-wrap items-center gap-2">
@@ -601,16 +601,16 @@ export function AccountFormModal({
                 >
                   {exchanging || cursorSessionId ? <Spinner className="size-4" /> : isCursorSession ? "已登录" : "打开 Cursor 登录页"}
                 </Button>
-                <span className="text-[12px] text-muted">
+                <span className="text-meta text-muted">
                   与 Grok Bot 客户端同一套 PKCE 登录，拿到的是 Cursor 账号会话（accessToken / refreshToken），只服务 Sand 直连；Grok 4.6 / Composer 等原生 CLI 模型不走该凭证。
                 </span>
               </div>
               {cursorSessionUrl && cursorSessionId && (
-                <p className="mt-2 break-all font-mono text-[11px] text-muted">{cursorSessionUrl}</p>
+                <p className="mt-2 break-all font-mono text-caption text-muted">{cursorSessionUrl}</p>
               )}
-              {oauthHint && <p className="mt-2 text-[12px] text-muted">{oauthHint}</p>}
+              {oauthHint && <p className="mt-2 text-meta text-muted">{oauthHint}</p>}
               {isCursorSession && tokenFilled && (
-                <div className="mt-2 flex flex-col gap-1 text-[12px]">
+                <div className="mt-2 flex flex-col gap-1 text-meta">
                   <p className="flex items-center gap-1 text-success">
                     <CheckCircle2 size={13} /> 会话凭证已写入下方表单
                     {cursorSessionEmail ? `（${cursorSessionEmail}）` : cursorAuthId ? `（${cursorAuthId}）` : ""}
@@ -627,7 +627,7 @@ export function AccountFormModal({
                 </div>
               )}
               {!isCursorSession && (
-                <p className="mt-2 text-[12px] text-muted">
+                <p className="mt-2 text-meta text-muted">
                   或者在下方直接粘贴官方订阅 API Key（`crsr_…`）：密钥加密进账号池，再物化到宿主机 auth 目录供 oc-cursor 轮询，与 CCB 账号池同一套启用 / 冷却 / 分组。
                 </p>
               )}
@@ -635,7 +635,7 @@ export function AccountFormModal({
           )}
 
           {!isCreate && isCursorSession && (
-            <div className="rounded-lg border border-accent/40 bg-accent-soft/50 p-3.5 text-[13px] text-muted">
+            <div className="rounded-lg border border-accent/40 bg-accent-soft/50 p-3.5 text-body text-muted">
               该账号为 Cursor 账号登录会话凭证（Sand）{account?.cursor_auth_id ? `，auth id ${account.cursor_auth_id}` : ""}。
               Sand 模式固定开启；如需换 token，请粘贴同一账号重新登录得到的 accessToken / refreshToken。
             </div>
@@ -643,7 +643,7 @@ export function AccountFormModal({
 
           {isCreate && provider !== "cursor" && (
             <div className="rounded-lg border border-accent/40 bg-accent-soft/50 p-3.5">
-              <div className="mb-2 flex items-center gap-1.5 text-[13px] font-semibold text-fg">
+              <div className="mb-2 flex items-center gap-1.5 text-body font-semibold text-fg">
                 <KeyRound size={15} className="text-accent" /> OAuth 授权(推荐)
               </div>
               {provider === "grok" ? (
@@ -652,13 +652,13 @@ export function AccountFormModal({
                     <Button size="sm" variant="accent" onClick={startGrokOAuth} disabled={exchanging || !!grokSessionId}>
                       {exchanging || grokSessionId ? <Spinner className="size-4" /> : "打开 Grok 设备授权"}
                     </Button>
-                    <span className="text-[12px] text-muted">使用 xAI 订阅账号登录，完成后自动回填。授权请求直连 x.ai，不走上方 egress（后续对话仍走该代理）。</span>
+                    <span className="text-meta text-muted">使用 xAI 订阅账号登录，完成后自动回填。授权请求直连 x.ai，不走上方 egress（后续对话仍走该代理）。</span>
                   </div>
                   {grokVerificationUrl && (
-                    <p className="mt-2 break-all font-mono text-[11px] text-muted">{grokVerificationUrl}</p>
+                    <p className="mt-2 break-all font-mono text-caption text-muted">{grokVerificationUrl}</p>
                   )}
                   {grokUserCode && (
-                    <p className="mt-2 text-[12px] text-muted">
+                    <p className="mt-2 text-meta text-muted">
                       页面确认码: <strong className="font-mono text-fg">{grokUserCode}</strong>
                     </p>
                   )}
@@ -669,14 +669,14 @@ export function AccountFormModal({
                     <Button size="sm" variant="accent" onClick={startOAuth} disabled={exchanging}>
                       ① 打开授权页
                     </Button>
-                    <span className="text-[12px] text-muted">新页签授权 → 复制回调 URL 里的 code</span>
+                    <span className="text-meta text-muted">新页签授权 → 复制回调 URL 里的 code</span>
                   </div>
                   {authUrlFallback && (
-                    <p className="mt-2 break-all font-mono text-[11px] text-muted">{authUrlFallback}</p>
+                    <p className="mt-2 break-all font-mono text-caption text-muted">{authUrlFallback}</p>
                   )}
                   {step2 && (
                     <div className="mt-3 flex flex-col gap-1.5">
-                      <span className="text-[12px] text-muted">② 粘贴 code(或整段回调 URL,自动抽 code):</span>
+                      <span className="text-meta text-muted">② 粘贴 code(或整段回调 URL,自动抽 code):</span>
                       <div className="flex gap-2">
                         <Input
                           value={oauthCode}
@@ -692,9 +692,9 @@ export function AccountFormModal({
                   )}
                 </>
               )}
-              {oauthHint && <p className="mt-2 text-[12px] text-muted">{oauthHint}</p>}
+              {oauthHint && <p className="mt-2 text-meta text-muted">{oauthHint}</p>}
               {tokenFilled && (
-                <p className="mt-2 flex items-center gap-1 text-[12px] text-success">
+                <p className="mt-2 flex items-center gap-1 text-meta text-success">
                   <CheckCircle2 size={13} /> token 已写入下方表单,核对 label/plan 后点"创建"。
                 </p>
               )}
@@ -704,8 +704,8 @@ export function AccountFormModal({
           {provider === "cursor" && (
             <div className="flex items-center justify-between rounded-lg border border-border bg-subtle p-3">
               <div className="flex flex-col">
-                <span className="text-[13px] font-medium text-fg">启用 Sand 客户端模式</span>
-                <span className="text-[11px] text-muted">
+                <span className="text-body font-medium text-fg">启用 Sand 客户端模式</span>
+                <span className="text-caption text-muted">
                   {isCursorSession
                     ? "会话凭证只服务 Sand 直连，此项固定开启"
                     : "Opus 5 / Opus 4.8 / Fable 5 等高级模型携带 Sand 客户端请求头 (x-cursor-client-type: sand)；Grok 4.6 / Composer 2.5 保持原生 CLI 模式"}

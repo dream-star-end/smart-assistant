@@ -220,7 +220,7 @@ class ReplayRenderBoundary extends Component<{ children: ReactNode }, { failed: 
 
   render() {
     if (this.state.failed) {
-      return <p className="px-4 py-5 text-[12.5px] text-danger">轨迹消息格式无法安全展示。</p>;
+      return <p className="px-4 py-5 text-meta text-danger">轨迹消息格式无法安全展示。</p>;
     }
     return this.props.children;
   }
@@ -385,20 +385,20 @@ export function TutorialReplay({
     );
   const actualArtifacts = (
     <div className="mt-3 rounded-lg border border-border bg-surface px-3 py-2">
-      <p className="text-[11px] font-semibold text-fg">真实运行产物</p>
+      <p className="text-caption font-semibold text-fg">真实运行产物</p>
       {actualArtifactsValid ? (
         <ul className="mt-1.5 flex flex-col gap-2">
           {replay.actualArtifacts.map((artifact) => (
             <li key={artifact.path}>
-              <a href={artifact.path} download className="text-[11.5px] font-medium text-accent hover:underline">
+              <a href={artifact.path} download className="text-caption font-medium text-accent hover:underline">
                 {artifact.title} · {formatBytes(artifact.bytes)}
               </a>
-              <p className="break-all text-[10.5px] text-faint">SHA-256：{artifact.sha256}</p>
+              <p className="break-all text-micro text-faint">SHA-256：{artifact.sha256}</p>
             </li>
           ))}
         </ul>
       ) : (
-        <p className="mt-1 text-[11.5px] text-danger">产物清单未通过公开路径与完整性校验，已拒绝展示下载链接。</p>
+        <p className="mt-1 text-caption text-danger">产物清单未通过公开路径与完整性校验，已拒绝展示下载链接。</p>
       )}
     </div>
   );
@@ -412,7 +412,7 @@ export function TutorialReplay({
       ) : (
         <img src={replay.poster} alt="案例真实运行预览" className="aspect-video w-full object-cover" />
       )}
-      <p className="border-t border-border px-3 py-2 text-[11px] text-faint">短预览只帮助定位；下方轨迹保留完整过程，不以视频代替。</p>
+      <p className="border-t border-border px-3 py-2 text-caption text-faint">短预览只帮助定位；下方轨迹保留完整过程，不以视频代替。</p>
     </div>
   ) : null;
 
@@ -425,13 +425,13 @@ export function TutorialReplay({
         <Button variant="secondary" size="sm" onClick={() => void loadManifestAndFirstPage()}>
           加载真实完整过程 <ChevronDown size={14} />
         </Button>
-        <p className="mt-2 text-[11.5px] text-faint">首次只读取目录和第一页；后续过程由你逐页展开。</p>
+        <p className="mt-2 text-caption text-faint">首次只读取目录和第一页；后续过程由你逐页展开。</p>
       </div>
     );
   }
 
   if (currentState.status === "loading") {
-    return <div>{provenance}{actualArtifacts}{preview}<p className="mt-3 inline-flex items-center gap-2 text-[12.5px] text-muted"><Loader2 size={14} className="animate-spin" /> 正在校验真实 Agent 过程…</p></div>;
+    return <div>{provenance}{actualArtifacts}{preview}<p className="mt-3 inline-flex items-center gap-2 text-meta text-muted"><Loader2 size={14} className="animate-spin" /> 正在校验真实 Agent 过程…</p></div>;
   }
 
   if (currentState.status === "error") {
@@ -440,7 +440,7 @@ export function TutorialReplay({
         {provenance}
         {actualArtifacts}
         {preview}
-        <p className="text-[12.5px] text-danger">真实过程读取失败：{currentState.message}</p>
+        <p className="text-meta text-danger">真实过程读取失败：{currentState.message}</p>
         <Button variant="ghost" size="sm" onClick={() => void loadManifestAndFirstPage()} className="mt-2"><RotateCcw size={13} /> 从第一页重试</Button>
       </div>
     );
@@ -453,7 +453,7 @@ export function TutorialReplay({
       {actualArtifacts}
       {preview}
       <details open className="mt-3 rounded-xl border border-border bg-bg">
-        <summary className="cursor-pointer px-4 py-3 text-[12.5px] font-semibold text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring">
+        <summary className="cursor-pointer px-4 py-3 text-meta font-semibold text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring">
           真实 Agent 过程 · 已校验 {currentState.messages.length}/{currentState.manifest.messageCount} 条
         </summary>
         <div className="border-t border-border">
@@ -476,7 +476,7 @@ export function TutorialReplay({
               >
                 加载下一页（还剩 {remainingPages} 页）
               </Button>
-              <p className="mt-1.5 text-[11px] text-faint">每页独立校验字节数、SHA-256、顺序与消息结构；不截断。</p>
+              <p className="mt-1.5 text-caption text-faint">每页独立校验字节数、SHA-256、顺序与消息结构；不截断。</p>
             </div>
           )}
         </div>

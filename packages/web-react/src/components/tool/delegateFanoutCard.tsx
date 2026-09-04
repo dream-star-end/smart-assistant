@@ -78,13 +78,13 @@ function FanoutItemCard({ item }: { item: FanoutItem }) {
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-            <span className="min-w-0 truncate text-[13px] font-medium text-fg">{name}</span>
+            <span className="min-w-0 truncate text-body font-medium text-fg">{name}</span>
             <Badge tone={item.isError ? "danger" : "success"}>{item.isError ? "失败" : "完成"}</Badge>
           </div>
           {item.goal && <p className="mt-0.5 line-clamp-2 text-[12px] leading-snug text-muted">{item.goal}</p>}
           {item.body && (
             <details className="mt-1">
-              <summary className="cursor-pointer rounded text-[11.5px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看结果</summary>
+              <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看结果</summary>
               <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
                 {item.body}
               </pre>
@@ -101,7 +101,7 @@ export function renderDelegateFanoutCard(output?: string | null): ReactNode | nu
   if (!parse) return null;
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-center gap-2 text-[12.5px] font-medium text-fg">
+      <div className="flex items-center gap-2 text-meta font-medium text-fg">
         <Users size={14} className="text-accent" />
         并行委派 {parse.total} 个子任务
         <Badge tone="success">{parse.ok} 成功</Badge>

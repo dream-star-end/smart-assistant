@@ -49,9 +49,9 @@ export function parseMcpResources(output?: string | null): McpResourceParse | nu
 function ResourceRow({ item }: { item: McpResource }) {
   return (
     <li className="rounded-lg border border-border bg-surface px-3 py-2">
-      <div className="break-words text-[13px] font-medium text-fg">{item.name}</div>
-      {item.uri && <div className="mt-0.5 break-all font-mono text-[11.5px] text-faint">{item.uri}</div>}
-      {item.description && <div className="mt-0.5 break-words text-[12px] text-muted">{item.description}</div>}
+      <div className="break-words text-body font-medium text-fg">{item.name}</div>
+      {item.uri && <div className="mt-0.5 break-all font-mono text-caption text-faint">{item.uri}</div>}
+      {item.description && <div className="mt-0.5 break-words text-meta text-muted">{item.description}</div>}
     </li>
   );
 }
@@ -64,7 +64,7 @@ export function renderMcpResourcesCard(output?: string | null): ReactNode | null
     return (
       <div className="rounded-xl border border-dashed border-border bg-elevated px-3 py-4 text-center">
         <Boxes size={18} className="mx-auto text-faint" />
-        <div className="mt-1 text-[13px] font-medium text-fg">{emptyText}</div>
+        <div className="mt-1 text-body font-medium text-fg">{emptyText}</div>
       </div>
     );
   }

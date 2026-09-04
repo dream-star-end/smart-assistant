@@ -212,7 +212,7 @@ export function ConfirmationDetailView({ detail }: { detail: unknown }): ReactNo
     return (
       <dl className="flex flex-col gap-1.5">
         {rows.map(([k, v]) => (
-          <div key={k} className="flex flex-col gap-0.5 text-[12.5px] sm:flex-row sm:gap-2">
+          <div key={k} className="flex flex-col gap-0.5 text-meta sm:flex-row sm:gap-2">
             <dt className="shrink-0 font-medium text-faint sm:w-20">{detailKeyLabel(k)}</dt>
             <dd className="min-w-0 flex-1">
               <DetailValue value={v} />
@@ -254,7 +254,7 @@ function StatusBadge({ status }: { status: string }) {
   const Icon =
     tone === "ok" ? CheckCircle2 : tone === "danger" ? XCircle : tone === "pending" ? Clock : AlertTriangle;
   return (
-    <span className={cn("inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]", cls)}>
+    <span className={cn("inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-caption", cls)}>
       <Icon className="size-2.5" />
       {confirmStatusLabel(status)}
     </span>
@@ -390,7 +390,7 @@ export function ConnectorConfirmCard({
           {loading ? (
             <Spinner />
           ) : loadError || unverified ? (
-            <span className="inline-flex items-center gap-1 rounded bg-danger/10 px-1.5 py-0.5 text-[11px] text-danger">
+            <span className="inline-flex items-center gap-1 rounded bg-danger/10 px-1.5 py-0.5 text-caption text-danger">
               <AlertTriangle className="size-2.5" />
               无法核验
             </span>
@@ -403,13 +403,13 @@ export function ConnectorConfirmCard({
       <div className="px-3 py-2">
         {/* 主体：一切展示以服务端权威为准；拉取中/失败/不符/无凭据各自降级，绝不展示 CLI 内容 */}
         {loading ? (
-          <div className="flex items-center gap-2 py-1 text-[13px] text-faint">
+          <div className="flex items-center gap-2 py-1 text-body text-faint">
             <Spinner /> 正在核验此操作…
           </div>
         ) : loadError ? (
-          <div className="py-1 text-[13px] text-danger">{loadError}</div>
+          <div className="py-1 text-body text-danger">{loadError}</div>
         ) : unverified ? (
-          <div className="py-1 text-[13px] text-danger">无法核验此确认，请勿在此操作。</div>
+          <div className="py-1 text-body text-danger">无法核验此确认，请勿在此操作。</div>
         ) : detail ? (
           <>
             {/* 摘要：服务端解密后铸造，非 CLI 输出 */}
@@ -426,7 +426,7 @@ export function ConnectorConfirmCard({
             <button
               type="button"
               onClick={() => setDetailOpen((o) => !o)}
-              className="mt-2 inline-flex items-center gap-1 text-[12px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+              className="mt-2 inline-flex items-center gap-1 text-meta text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
             >
               {detailOpen ? (
                 <ChevronDown className="size-3.5" />
@@ -442,7 +442,7 @@ export function ConnectorConfirmCard({
             )}
           </>
         ) : (
-          <div className="py-1 text-[13px] text-faint">此写操作需在网页端登录后核验并确认。</div>
+          <div className="py-1 text-body text-faint">此写操作需在网页端登录后核验并确认。</div>
         )}
 
         {/* 操作区：只有拉取成功且服务端 status==='pending' 才可点。批准默认 accent
@@ -477,7 +477,7 @@ export function ConnectorConfirmCard({
         {error && <div className="mt-2 text-xs text-danger">{error}</div>}
         {manualFollowUp && <div className="mt-2 text-xs text-success">{manualFollowUp}</div>}
 
-        <div className="mt-2 text-[11px] text-faint">确认码 {shortId} · 批准后 10 分钟内有效</div>
+        <div className="mt-2 text-caption text-faint">确认码 {shortId} · 批准后 10 分钟内有效</div>
       </div>
     </div>
   );

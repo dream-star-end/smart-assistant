@@ -53,7 +53,7 @@ export function HupijiaoPaymentEntry({
 
   if (client === "wechat") {
     return (
-      <Alert tone="warning" className="w-full text-[12.5px]" data-testid="wechat-payment-browser-hint">
+      <Alert tone="warning" className="w-full text-meta" data-testid="wechat-payment-browser-hint">
         当前支付通道不支持在微信内直接发起，请在系统浏览器打开本页后重新下单。
       </Alert>
     );
@@ -63,7 +63,7 @@ export function HupijiaoPaymentEntry({
     const href = safeHupijiaoMobileUrl(mobileUrl);
     if (!href) {
       return (
-        <Alert tone="warning" className="w-full text-[12.5px]" data-testid="mobile-payment-unavailable">
+        <Alert tone="warning" className="w-full text-meta" data-testid="mobile-payment-unavailable">
           当前订单无法在手机端发起，请改用电脑或另一台设备扫码支付。
         </Alert>
       );
@@ -78,7 +78,7 @@ export function HupijiaoPaymentEntry({
         >
           <ExternalLink size={16} /> 前往微信支付
         </a>
-        <p className="text-center text-[12px] text-faint">将跳转至微信支付，完成后返回本页自动确认。</p>
+        <p className="text-center text-meta text-faint">将跳转至微信支付，完成后返回本页自动确认。</p>
       </div>
     );
   }
@@ -95,7 +95,7 @@ export function HupijiaoPaymentEntry({
           className="size-[200px] object-contain"
         />
       </div>
-      <div className="flex items-center gap-1.5 text-[12.5px] text-faint">
+      <div className="flex items-center gap-1.5 text-meta text-faint">
         <Spinner size={13} /> 请用微信扫码支付，到账后自动确认…
       </div>
     </>

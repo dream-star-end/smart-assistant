@@ -183,7 +183,7 @@ export function InvoicesTab({
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
+      <div className="flex items-center justify-center gap-2 py-16 text-body text-faint">
         <Spinner /> 加载发票…
       </div>
     );
@@ -193,7 +193,7 @@ export function InvoicesTab({
     <div className="flex flex-col">
       {!canManageBilling && (
         <div className="px-5 pt-4">
-          <Alert tone="info" className="text-[12.5px]">
+          <Alert tone="info" className="text-meta">
             仅组织拥有者或财务委派人可管理发票抬头与申请开票，下方为开票申请记录（只读）。
           </Alert>
         </div>
@@ -202,7 +202,7 @@ export function InvoicesTab({
       {/* 发票抬头(写:owner∥财务委派) */}
       {canManageBilling && (
       <form onSubmit={saveProfile} className="px-5 py-4">
-        <div className="flex items-center gap-1.5 pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+        <div className="flex items-center gap-1.5 pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           <FileText size={13} /> 发票抬头
         </div>
         <div className="flex flex-col gap-2.5">
@@ -248,7 +248,7 @@ export function InvoicesTab({
             保存抬头
           </Button>
           {profile?.updated_at && (
-            <span className="text-[11.5px] text-faint">上次更新 {shortTime(profile.updated_at)}</span>
+            <span className="text-caption text-faint">上次更新 {shortTime(profile.updated_at)}</span>
           )}
         </div>
       </form>
@@ -257,15 +257,15 @@ export function InvoicesTab({
       {/* 按订单申请开票(写:owner∥财务委派) */}
       {canManageBilling && (
       <div className="border-t border-border px-5 py-4">
-        <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           选择已支付订单申请开票
         </div>
         {ordersErr ? (
-          <Alert tone="warning" className="text-[12.5px]">
+          <Alert tone="warning" className="text-meta">
             {ordersErr}
           </Alert>
         ) : paidOrders.length === 0 ? (
-          <p className="py-2 text-[12.5px] text-faint">暂无可开票的已支付订单。</p>
+          <p className="py-2 text-meta text-faint">暂无可开票的已支付订单。</p>
         ) : (
           <>
             <ul className="flex flex-col gap-1">
@@ -287,14 +287,14 @@ export function InvoicesTab({
                         className="size-4 shrink-0 accent-[var(--accent,#6d5efc)]"
                       />
                       <span className="min-w-0 flex-1">
-                        <span className="block truncate font-mono text-[12.5px] text-fg">
+                        <span className="block truncate font-mono text-meta text-fg">
                           {o.order_no}
                         </span>
-                        <span className="block truncate text-[11.5px] text-faint">
+                        <span className="block truncate text-caption text-faint">
                           {o.paid_at ? shortTime(o.paid_at) : shortTime(o.created_at)}
                         </span>
                       </span>
-                      <span className="shrink-0 text-[13px] font-medium tabular-nums text-fg">
+                      <span className="shrink-0 text-body font-medium tabular-nums text-fg">
                         {formatCentsYuan(o.amount_cents)}
                       </span>
                     </label>
@@ -303,7 +303,7 @@ export function InvoicesTab({
               })}
             </ul>
             <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-              <span className="text-[12.5px] text-muted">
+              <span className="text-meta text-muted">
                 已选 {selected.size} 笔 · 合计{" "}
                 <span className="font-medium text-fg">{formatCentsYuan(selectedTotal)}</span>
               </span>
@@ -318,7 +318,7 @@ export function InvoicesTab({
               </Button>
             </div>
             {!profile?.title && (
-              <p className="mt-1.5 text-[11.5px] text-warning">请先在上方保存发票抬头再申请。</p>
+              <p className="mt-1.5 text-caption text-warning">请先在上方保存发票抬头再申请。</p>
             )}
           </>
         )}
@@ -327,15 +327,15 @@ export function InvoicesTab({
 
       {/* 申请状态(读:全员可见) */}
       <div className="border-t border-border px-5 py-4">
-        <div className="flex items-center gap-1.5 pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+        <div className="flex items-center gap-1.5 pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           <ReceiptText size={13} /> 开票申请
         </div>
         {invoicesErr ? (
-          <Alert tone="warning" className="text-[12.5px]">
+          <Alert tone="warning" className="text-meta">
             {invoicesErr}
           </Alert>
         ) : invoices.length === 0 ? (
-          <p className="py-2 text-[12.5px] text-faint">暂无开票申请。</p>
+          <p className="py-2 text-meta text-faint">暂无开票申请。</p>
         ) : (
           <ul className="flex flex-col gap-1.5">
             {invoices.map((inv) => {
@@ -343,17 +343,17 @@ export function InvoicesTab({
               return (
                 <li key={inv.id} className="rounded-lg border border-border px-3 py-2.5">
                   <div className="flex items-center justify-between gap-3">
-                    <span className="text-[13.5px] font-medium tabular-nums text-fg">
+                    <span className="text-section font-medium tabular-nums text-fg">
                       {formatCentsYuan(inv.amount_cents)}
                     </span>
                     <Badge tone={sm.tone}>{sm.label}</Badge>
                   </div>
-                  <div className="mt-1 text-[11.5px] text-faint">
+                  <div className="mt-1 text-caption text-faint">
                     {inv.profile_snapshot?.title ? `${inv.profile_snapshot.title} · ` : ""}
                     {inv.order_ids.length} 笔订单 · {shortTime(inv.created_at)}
                   </div>
                   {inv.admin_note && (
-                    <div className="mt-1 text-[11.5px] text-muted">备注：{inv.admin_note}</div>
+                    <div className="mt-1 text-caption text-muted">备注：{inv.admin_note}</div>
                   )}
                 </li>
               );
@@ -376,7 +376,7 @@ function Field({
 }) {
   return (
     <label className="block">
-      <span className="mb-1 block text-[12px] text-muted">
+      <span className="mb-1 block text-meta text-muted">
         {label}
         {required && <span className="ml-0.5 text-danger">*</span>}
       </span>

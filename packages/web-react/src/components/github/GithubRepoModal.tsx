@@ -233,7 +233,7 @@ export function GithubRepoModal({
           className="fixed left-1/2 top-1/2 z-50 flex max-h-[85vh] w-[calc(100vw-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
         >
           <div className="flex items-center justify-between px-5 py-4">
-            <Dialog.Title className="flex items-center gap-2 text-[15px] font-semibold text-fg">
+            <Dialog.Title className="flex items-center gap-2 text-title font-semibold text-fg">
               <GitBranch size={16} className="text-faint" /> 绑定 GitHub 仓库
             </Dialog.Title>
             <Dialog.Close asChild>
@@ -249,12 +249,12 @@ export function GithubRepoModal({
           {/* 账号栏 */}
           <div className="border-y border-border bg-hover/30 px-5 py-3">
             {!auth || linkLoading ? (
-              <div className="flex items-center gap-2 text-[13px] text-faint">
+              <div className="flex items-center gap-2 text-body text-faint">
                 <Spinner /> 加载账号状态…
               </div>
             ) : !linked ? (
               <div className="flex items-center justify-between gap-3">
-                <span className="text-[13px] text-muted">
+                <span className="text-body text-muted">
                   连接 GitHub 账号后即可把仓库绑定到当前会话
                 </span>
                 <Button
@@ -276,10 +276,10 @@ export function GithubRepoModal({
                   }
                 />
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-[13.5px] font-medium text-fg">
+                  <div className="truncate text-section font-medium text-fg">
                     @{link.linked ? link.login : ""}
                   </div>
-                  <div className="truncate text-[11.5px] text-faint">
+                  <div className="truncate text-caption text-faint">
                     {(link.linked && link.scopes) || "已连接"}
                   </div>
                 </div>
@@ -329,21 +329,21 @@ export function GithubRepoModal({
                       value={search}
                       onChange={(e) => setSearch(e.target.value)}
                       placeholder="搜索仓库…"
-                      className="h-9 pl-9 text-[13px]"
+                      className="h-9 pl-9 text-body"
                     />
                   </div>
                 </div>
                 <div className="min-h-0 flex-1 overflow-y-auto p-2">
                   {reposLoading ? (
-                    <div className="flex items-center justify-center gap-2 py-10 text-[13px] text-faint">
+                    <div className="flex items-center justify-center gap-2 py-10 text-body text-faint">
                       <Spinner /> 加载仓库…
                     </div>
                   ) : reposErr ? (
-                    <p className="px-2 py-8 text-center text-[13px] text-danger">
+                    <p className="px-2 py-8 text-center text-body text-danger">
                       {reposErr}
                     </p>
                   ) : filteredRepos.length === 0 ? (
-                    <p className="px-2 py-8 text-center text-[13px] text-faint">
+                    <p className="px-2 py-8 text-center text-body text-faint">
                       无匹配仓库
                     </p>
                   ) : (
@@ -361,7 +361,7 @@ export function GithubRepoModal({
                                   : "hover:bg-hover",
                               )}
                             >
-                              <span className="min-w-0 flex-1 truncate text-[13px]">
+                              <span className="min-w-0 flex-1 truncate text-body">
                                 <span className="text-faint">
                                   {r.owner.login}/
                                 </span>
@@ -390,20 +390,20 @@ export function GithubRepoModal({
 
               {/* 分支列 */}
               <div className="flex min-h-0 flex-col border-t border-border sm:border-t-0">
-                <div className="px-3 pt-3 text-[11px] font-medium uppercase tracking-wide text-faint">
+                <div className="px-3 pt-3 text-caption font-medium uppercase tracking-wide text-faint">
                   分支
                 </div>
                 <div className="min-h-0 flex-1 overflow-y-auto p-2">
                   {!selRepo ? (
-                    <p className="px-2 py-8 text-center text-[12.5px] text-faint">
+                    <p className="px-2 py-8 text-center text-meta text-faint">
                       先选择左侧仓库
                     </p>
                   ) : branchesLoading ? (
-                    <div className="flex items-center justify-center gap-2 py-10 text-[13px] text-faint">
+                    <div className="flex items-center justify-center gap-2 py-10 text-body text-faint">
                       <Spinner /> 加载分支…
                     </div>
                   ) : branches.length === 0 ? (
-                    <p className="px-2 py-8 text-center text-[12.5px] text-faint">
+                    <p className="px-2 py-8 text-center text-meta text-faint">
                       无分支
                     </p>
                   ) : (
@@ -421,7 +421,7 @@ export function GithubRepoModal({
                                   : "hover:bg-hover",
                               )}
                             >
-                              <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-fg">
+                              <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">
                                 {b.name}
                               </span>
                               {b.name === selRepo.default_branch && (

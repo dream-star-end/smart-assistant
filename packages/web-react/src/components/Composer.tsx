@@ -306,7 +306,7 @@ export function Composer({
           aria-label={`会话目标：${visibleGoal.objective}`}
           title={visibleGoal.objective}
           onClick={() => setGoalOpen(true)}
-          className="mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-[12px] text-fg hover:bg-hover"
+          className="mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-meta text-fg hover:bg-hover"
         >
           <Target
             size={13}
@@ -325,7 +325,7 @@ export function Composer({
         {replyTo && (
           <div className="mx-3.5 mt-3 flex items-start gap-2 rounded-xl bg-hover px-3 py-2 text-left">
             <div className="min-w-0 flex-1 border-l-2 border-accent/60 pl-2.5">
-              <div className="mb-0.5 text-[11px] font-medium text-muted">
+              <div className="mb-0.5 text-caption font-medium text-muted">
                 正在引用 {replyTo.role === "assistant" ? "从简" : "你"}
               </div>
               <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5 text-fg/75">
@@ -636,7 +636,7 @@ export function AttachChip({
   return (
     <div
       className={cn(
-        "flex items-center gap-2 rounded-lg border bg-bg py-1.5 pr-1.5 text-[12.5px]",
+        "flex items-center gap-2 rounded-lg border bg-bg py-1.5 pr-1.5 text-meta",
         isImage ? "pl-1.5" : "pl-2.5",
         a.status === "error" ? "border-danger/40" : "border-border",
       )}
@@ -684,7 +684,7 @@ export function AttachChip({
           disabled={!onAnnotate}
           aria-label={`编辑图片 ${a.name}`}
           title={annotateDisabledReason ?? "编辑 · Image 2"}
-          className="flex h-8 min-h-11 shrink-0 items-center gap-1 rounded-md px-2 text-[12px] font-medium text-accent hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-35 sm:min-h-8"
+          className="flex h-8 min-h-11 shrink-0 items-center gap-1 rounded-md px-2 text-meta font-medium text-accent hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-35 sm:min-h-8"
         >
           <Pencil size={14} />
           编辑

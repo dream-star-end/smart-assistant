@@ -133,7 +133,7 @@ export function FeedbackDetailSheet({
         <>
           <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
             <div className="flex items-center gap-2">
-              <h2 className="text-[15px] font-semibold text-fg">反馈 #{current.id}</h2>
+              <h2 className="text-title font-semibold text-fg">反馈 #{current.id}</h2>
               <Badge tone={FEEDBACK_STATUS_TONE[current.status]}>
                 {FEEDBACK_STATUS_LABELS[current.status]}
               </Badge>
@@ -174,35 +174,35 @@ export function FeedbackDetailSheet({
             </div>
 
             <div className="mt-4">
-              <p className="mb-1.5 text-[12px] font-medium text-faint">描述</p>
+              <p className="mb-1.5 text-meta font-medium text-faint">描述</p>
               <pre className="max-h-52 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-surface px-3 py-2 text-[13px] leading-relaxed text-fg">
                 {current.description}
               </pre>
             </div>
 
             <div className="mt-4">
-              <p className="mb-1.5 text-[12px] font-medium text-faint">上下文</p>
+              <p className="mb-1.5 text-meta font-medium text-faint">上下文</p>
               <div className="flex flex-col gap-1.5">
                 {current.request_id && (
-                  <div className="flex items-center gap-2 text-[12px]">
+                  <div className="flex items-center gap-2 text-meta">
                     <span className="w-20 shrink-0 text-faint">request_id</span>
                     <CopyChip value={current.request_id} />
                   </div>
                 )}
                 {current.session_id && (
-                  <div className="flex items-center gap-2 text-[12px]">
+                  <div className="flex items-center gap-2 text-meta">
                     <span className="w-20 shrink-0 text-faint">session_id</span>
                     <CopyChip value={current.session_id} />
                   </div>
                 )}
                 {current.version && (
-                  <div className="flex items-center gap-2 text-[12px]">
+                  <div className="flex items-center gap-2 text-meta">
                     <span className="w-20 shrink-0 text-faint">version</span>
                     <span className="font-mono text-muted">{current.version}</span>
                   </div>
                 )}
                 {current.user_agent && (
-                  <div className="flex items-start gap-2 text-[12px]">
+                  <div className="flex items-start gap-2 text-meta">
                     <span className="w-20 shrink-0 text-faint">UA</span>
                     <span className="break-all font-mono text-muted">{current.user_agent}</span>
                   </div>
@@ -211,7 +211,7 @@ export function FeedbackDetailSheet({
             </div>
 
             <div className="mt-4">
-              <p className="mb-1.5 text-[12px] font-medium text-faint">meta（JSON）</p>
+              <p className="mb-1.5 text-meta font-medium text-faint">meta（JSON）</p>
               <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-surface px-3 py-2 font-mono text-[11.5px] leading-relaxed text-muted">
                 {metaText}
               </pre>
@@ -220,7 +220,7 @@ export function FeedbackDetailSheet({
             {current.request_id && (
               <div className="mt-4">
                 <div className="mb-2 flex items-center justify-between gap-3">
-                  <p className="text-[12px] font-medium text-faint">请求归属</p>
+                  <p className="text-meta font-medium text-faint">请求归属</p>
                   <Button
                     variant="secondary"
                     size="sm"
@@ -273,12 +273,12 @@ export function FeedbackDetailSheet({
             )}
 
             <div className="mt-5 rounded-xl border border-border bg-elevated p-4">
-              <h3 className="text-[13px] font-semibold text-fg">处理闭环</h3>
-              <p className="mt-1 text-[12px] text-faint">
+              <h3 className="text-body font-semibold text-fg">处理闭环</h3>
+              <p className="mt-1 text-meta text-faint">
                 负责人独立于确认操作人；优先级和解决结论可分别维护。
               </p>
               <div className="mt-4 grid gap-4 sm:grid-cols-2">
-                <label className="flex flex-col gap-1.5 text-[12px] font-medium text-muted">
+                <label className="flex flex-col gap-1.5 text-meta font-medium text-muted">
                   负责人
                   <div className="flex gap-2">
                     <Input
@@ -299,7 +299,7 @@ export function FeedbackDetailSheet({
                     </Button>
                   </div>
                 </label>
-                <label className="flex flex-col gap-1.5 text-[12px] font-medium text-muted">
+                <label className="flex flex-col gap-1.5 text-meta font-medium text-muted">
                   优先级
                   <div className="flex gap-2">
                     <select
@@ -307,7 +307,7 @@ export function FeedbackDetailSheet({
                       value={priority}
                       onChange={(event) => setPriority(event.target.value as FeedbackPriority | "")}
                       disabled={busy}
-                      className="h-9 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-[12px] text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+                      className="h-9 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-meta text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
                     >
                       <option value="">未设置</option>
                       <option value="low">低</option>
@@ -326,7 +326,7 @@ export function FeedbackDetailSheet({
                   </div>
                 </label>
               </div>
-              <label className="mt-4 flex flex-col gap-1.5 text-[12px] font-medium text-muted">
+              <label className="mt-4 flex flex-col gap-1.5 text-meta font-medium text-muted">
                 解决结论
                 <Textarea
                   aria-label="反馈解决结论"

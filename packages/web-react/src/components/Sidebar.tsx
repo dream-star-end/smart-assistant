@@ -441,11 +441,7 @@ export function Sidebar({
   const renderFlat = (item: FlatItem) => {
     if (item.kind === "header") {
       return (
-        <div
-          role="heading"
-          aria-level={2}
-          className="flex h-full items-end px-3 pb-1 text-caption font-medium uppercase tracking-wide text-faint"
-        >
+        <h2 className="m-0 flex h-full items-end px-3 pb-1 text-caption font-medium uppercase tracking-wide text-faint">
           {item.label}
           {item.label === "项目" && onCreateProject && (
             <IconButton
@@ -459,7 +455,7 @@ export function Sidebar({
               <Plus size={13} />
             </IconButton>
           )}
-        </div>
+        </h2>
       );
     }
     if (item.kind === "hint") {

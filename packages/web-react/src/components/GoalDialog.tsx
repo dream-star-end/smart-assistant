@@ -143,29 +143,29 @@ export function GoalDialog({
       }
     >
       {visibleGoal && (
-        <div className="mb-3 grid grid-cols-2 gap-2 rounded-lg bg-hover p-2.5 text-[11.5px] text-muted tabular-nums">
+        <div className="mb-3 grid grid-cols-2 gap-2 rounded-lg bg-hover p-2.5 text-caption text-muted tabular-nums">
           <span>Token：{groupDigits(String(visibleGoal.tokensUsed))}{visibleGoal.tokenBudget == null ? "" : ` / ${groupDigits(String(visibleGoal.tokenBudget))}`}</span>
           <span>积分：{groupDigits(visibleGoal.creditsUsed)}{visibleGoal.creditBudget == null ? "" : ` / ${groupDigits(visibleGoal.creditBudget)}`}</span>
           <span className="col-span-2">累计运行：{elapsed(displayedTimeUsed)}</span>
           {warning && <span className="col-span-2 text-warning">预算已接近或达到；这是软提醒，不会停止或阻断执行。</span>}
         </div>
       )}
-      <label className="mb-2 block text-[11.5px] text-muted">
+      <label className="mb-2 block text-caption text-muted">
         目标
         <textarea
           value={objective}
           onChange={(e) => setObjective(e.target.value)}
           rows={3}
           maxLength={8000}
-          className="mt-1 w-full resize-y rounded-lg border border-border bg-bg px-3 py-2 text-[13px] text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+          className="mt-1 w-full resize-y rounded-lg border border-border bg-bg px-3 py-2 text-body text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
           placeholder="这次会话要达成什么？"
         />
       </label>
       <div className="grid grid-cols-2 gap-2">
-        <label className="text-[11.5px] text-muted">Token 预算<Input className="mt-1" inputMode="numeric" value={tokenBudget} onChange={(e) => setTokenBudget(e.target.value)} placeholder="可选" /></label>
-        <label className="text-[11.5px] text-muted">积分预算<Input className="mt-1" inputMode="numeric" value={creditBudget} onChange={(e) => setCreditBudget(e.target.value)} placeholder="可选" /></label>
+        <label className="text-caption text-muted">Token 预算<Input className="mt-1" inputMode="numeric" value={tokenBudget} onChange={(e) => setTokenBudget(e.target.value)} placeholder="可选" /></label>
+        <label className="text-caption text-muted">积分预算<Input className="mt-1" inputMode="numeric" value={creditBudget} onChange={(e) => setCreditBudget(e.target.value)} placeholder="可选" /></label>
       </div>
-      {error && <p className="mt-2 text-[11.5px] text-danger">{error}</p>}
+      {error && <p className="mt-2 text-caption text-danger">{error}</p>}
       <div className="mt-3 flex flex-wrap gap-1.5">
         <Button size="sm" disabled={busy} onClick={submit}>{visibleGoal ? "保存" : "开始目标"}</Button>
         {visibleGoal?.status === "active" && <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("pause"))}><Pause size={13} />暂停</Button>}

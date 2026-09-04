@@ -140,7 +140,7 @@ export function CreateOrgWizard({
 
       <div className="px-5 py-4">
         {err && (
-          <Alert tone="warning" className="mb-3 text-[12.5px]">
+          <Alert tone="warning" className="mb-3 text-meta">
             {err}
           </Alert>
         )}
@@ -148,7 +148,7 @@ export function CreateOrgWizard({
         {step === "name" && (
           <div className="flex flex-col gap-3">
             <div>
-              <label htmlFor="create-org-name" className="mb-1.5 block text-[12.5px] text-muted">
+              <label htmlFor="create-org-name" className="mb-1.5 block text-meta text-muted">
                 组织名称
               </label>
               <Input
@@ -165,7 +165,7 @@ export function CreateOrgWizard({
                 maxLength={60}
                 autoFocus
               />
-              <p className="mt-1.5 text-[11.5px] text-faint">
+              <p className="mt-1.5 text-caption text-faint">
                 将作为组织在平台内的显示名,可稍后在组织中心修改。
               </p>
             </div>
@@ -190,12 +190,12 @@ export function CreateOrgWizard({
         {step === "plan" && (
           <div className="flex flex-col gap-3">
             {plansErr && (
-              <Alert tone="danger" className="text-[12.5px]">
+              <Alert tone="danger" className="text-meta">
                 {plansErr}
               </Alert>
             )}
             {!plans && !plansErr && (
-              <div className="flex items-center justify-center gap-2 py-10 text-[13px] text-faint">
+              <div className="flex items-center justify-center gap-2 py-10 text-body text-faint">
                 <Spinner /> 加载套餐…
               </div>
             )}
@@ -223,13 +223,13 @@ export function CreateOrgWizard({
 
                 {plan && total && (
                   <div className="rounded-xl border border-border bg-bg px-4 py-3">
-                    <div className="flex items-center justify-between text-[13px]">
+                    <div className="flex items-center justify-between text-body">
                       <span className="text-muted">应付合计</span>
                       <span className="text-[16px] font-semibold text-fg">
                         {formatCentsYuan(total.totalCents)}
                       </span>
                     </div>
-                    <div className="mt-1 text-[12px] text-faint">
+                    <div className="mt-1 text-meta text-faint">
                       {seats} 席 × {formatCentsYuan(plan.seatPriceCents)}/月 · 入池{" "}
                       {formatCredits(total.totalCredits)} 积分 · 有效期 {plan.periodDays} 天
                     </div>
@@ -239,7 +239,7 @@ export function CreateOrgWizard({
             )}
 
             {plans && plans.length === 0 && !plansErr && (
-              <p className="py-8 text-center text-[13px] text-faint">暂无可用企业套餐。</p>
+              <p className="py-8 text-center text-body text-faint">暂无可用企业套餐。</p>
             )}
 
             <div className="flex items-center justify-between gap-2">
@@ -287,7 +287,7 @@ export function CreateOrgDialog({
           className="fixed left-1/2 top-1/2 z-50 flex max-h-[85vh] w-[calc(100vw-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
         >
           <div className="flex items-center justify-between gap-3 px-5 py-4">
-            <Dialog.Title className="text-[15px] font-semibold text-fg">创建组织</Dialog.Title>
+            <Dialog.Title className="text-title font-semibold text-fg">创建组织</Dialog.Title>
             <Dialog.Close asChild>
               <button
                 aria-label="关闭"
@@ -315,7 +315,7 @@ function WizardSteps({ step }: { step: Step }) {
   ];
   const activeIdx = step === "name" ? 0 : 1;
   return (
-    <div className="flex items-center gap-2 border-b border-border px-5 py-3 text-[12px]">
+    <div className="flex items-center gap-2 border-b border-border px-5 py-3 text-meta">
       {items.map((it, i) => {
         const done = i < activeIdx;
         const active = i === activeIdx;
@@ -323,7 +323,7 @@ function WizardSteps({ step }: { step: Step }) {
           <div key={it.key} className="flex items-center gap-2">
             <span
               className={cn(
-                "flex size-5 items-center justify-center rounded-full text-[11px] font-medium",
+                "flex size-5 items-center justify-center rounded-full text-caption font-medium",
                 done
                   ? "bg-success-soft text-success"
                   : active
@@ -366,18 +366,18 @@ function PlanCard({
     >
       <div className="min-w-0">
         <div className="flex items-center gap-2">
-          <span className="text-[14px] font-semibold text-fg">{plan.name}</span>
+          <span className="text-title font-semibold text-fg">{plan.name}</span>
           {selected && (
-            <span className="rounded-full bg-accent px-1.5 py-0.5 text-[10px] font-medium text-white">
+            <span className="rounded-full bg-accent px-1.5 py-0.5 text-micro font-medium text-white">
               已选
             </span>
           )}
         </div>
-        <div className="mt-0.5 text-[12px] text-faint">
+        <div className="mt-0.5 text-meta text-faint">
           {formatCentsYuan(plan.seatPriceCents)}/席·月 · 每席 {formatCredits(plan.perSeatCredits)} 积分入池
         </div>
       </div>
-      <span className="shrink-0 text-[11.5px] text-faint">最低 {plan.minSeats} 席</span>
+      <span className="shrink-0 text-caption text-faint">最低 {plan.minSeats} 席</span>
     </button>
   );
 }
@@ -400,7 +400,7 @@ export function SeatPicker({
   const lo = min ?? plan.minSeats;
   return (
     <div className="flex items-center justify-between gap-3">
-      <span className="text-[12.5px] text-muted">{label}</span>
+      <span className="text-meta text-muted">{label}</span>
       <div className="flex items-center gap-2">
         <button
           type="button"
@@ -421,7 +421,7 @@ export function SeatPicker({
             onChange(Number.isFinite(n) ? n : lo);
           }}
           aria-label={label}
-          className="h-8 w-16 rounded-md border border-border bg-surface text-center text-[14px] tabular-nums text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+          className="h-8 w-16 rounded-md border border-border bg-surface text-center text-title tabular-nums text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
         />
         <button
           type="button"

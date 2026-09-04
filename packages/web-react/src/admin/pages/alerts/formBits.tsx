@@ -13,7 +13,7 @@ export function Field({
 }) {
   return (
     <div className="flex flex-col gap-1.5">
-      <label className="text-[13px] font-medium text-fg">{label}</label>
+      <label className="text-body font-medium text-fg">{label}</label>
       {children}
       {hint && <p className="text-[11.5px] leading-snug text-faint">{hint}</p>}
     </div>

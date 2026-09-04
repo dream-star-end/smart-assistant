@@ -179,7 +179,7 @@ export default function UsersPage() {
                 e.stopPropagation()
                 navigate('containers', { user_email: u.email })
               }}
-              className="shrink-0 rounded-md bg-hover px-1.5 py-0.5 text-[11px] text-muted outline-none transition-colors hover:bg-active hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+              className="shrink-0 rounded-md bg-hover px-1.5 py-0.5 text-caption text-muted outline-none transition-colors hover:bg-active hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
               title="查看该用户的活跃容器"
             >
               {u.containers_active} 容器
@@ -328,7 +328,7 @@ export default function UsersPage() {
 
       {/* 新用户漏斗 */}
       <div className="flex items-center justify-between">
-        <h2 className="text-[13px] font-semibold text-muted">
+        <h2 className="text-body font-semibold text-muted">
           新用户漏斗 <span className="text-faint">· 最近 {funnelDays} 天</span>
         </h2>
         <RangePreset value={funnelDays} onChange={setFunnelDays} />
@@ -419,13 +419,13 @@ export default function UsersPage() {
           options={FUNNEL_OPTS}
           onChange={(v) => resetTo(() => setFunnelState(v))}
         />
-        <span className="ml-auto text-[12px] text-faint tabular-nums">
+        <span className="ml-auto text-meta text-faint tabular-nums">
           {list.data ? `本页 ${totalLoaded}${list.data.next_cursor ? '+' : ''} 人` : ''}
         </span>
       </FilterBar>
 
       {list.error && !list.data ? (
-        <div className="rounded-xl border border-danger/40 bg-danger-soft px-4 py-8 text-center text-[13px] text-danger">
+        <div className="rounded-xl border border-danger/40 bg-danger-soft px-4 py-8 text-center text-body text-danger">
           加载失败：{errMsg(list.error)}
         </div>
       ) : (
@@ -563,7 +563,7 @@ function FunnelChart({
       {loading ? (
         <div className="h-full w-full animate-pulse rounded-lg bg-hover" />
       ) : error ? (
-        <div className="flex h-full w-full items-center justify-center text-[13px] text-danger">
+        <div className="flex h-full w-full items-center justify-center text-body text-danger">
           加载失败
         </div>
       ) : (

@@ -113,7 +113,7 @@ export function DelegateProcessList({ childBlocks }: { childBlocks: ChildBlock[]
   return (
     <div className="relative">
       <div className="border-b border-border px-3.5 py-1.5">
-        <div className="flex items-center justify-between gap-2 text-[11px] text-muted">
+        <div className="flex items-center justify-between gap-2 text-caption text-muted">
           <span>
             已加载 {groupDigits(String(mountedCount))} / {groupDigits(String(total))} 步
           </span>
@@ -151,7 +151,7 @@ export function DelegateProcessList({ childBlocks }: { childBlocks: ChildBlock[]
       {!followBottom && (
         <button
           type="button"
-          className="absolute bottom-3 right-3 rounded-full bg-fg px-2.5 py-1 text-[11px] text-bg shadow"
+          className="absolute bottom-3 right-3 rounded-full bg-fg px-2.5 py-1 text-caption text-bg shadow"
           onClick={() => {
             stickRef.current = true;
             setFollowBottom(true);

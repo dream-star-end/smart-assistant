@@ -168,7 +168,7 @@ function SkillCard({ entry }: { entry: SkillEntry }) {
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-            <span className="min-w-0 max-w-full truncate font-mono text-[13px] font-semibold text-fg">{entry.name}</span>
+            <span className="min-w-0 max-w-full truncate font-mono text-body font-semibold text-fg">{entry.name}</span>
             <SourceBadge source={entry.source} />
           </div>
           {entry.description && <p className="mt-0.5 line-clamp-2 text-[12px] leading-snug text-muted">{entry.description}</p>}
@@ -228,7 +228,7 @@ function SkillListInner({ parse, mode }: { parse: SkillListParse; mode: "list" |
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-center gap-2 text-[12.5px] font-medium text-fg">
+      <div className="flex items-center gap-2 text-meta font-medium text-fg">
         <Sparkles size={14} className="text-accent" />
         {mode === "search"
           ? `找到 ${parse.declaredCount ?? total} 个相关技能`
@@ -236,7 +236,7 @@ function SkillListInner({ parse, mode }: { parse: SkillListParse; mode: "list" |
       </div>
       {visible.map((sec) => (
         <div key={sec.key} className="flex flex-col gap-2">
-          {grouped && <div className="text-[11.5px] font-medium text-faint">{SECTION_LABEL[sec.key]}</div>}
+          {grouped && <div className="text-caption font-medium text-faint">{SECTION_LABEL[sec.key]}</div>}
           <ul className="flex flex-col gap-2">
             {sec.entries.map((entry) => (
               <SkillCard key={entry.name} entry={entry} />
@@ -257,9 +257,9 @@ function SkillSearchEmpty({ query }: { query?: string }) {
   return (
     <div className="rounded-xl border border-dashed border-border bg-elevated px-3 py-4 text-center">
       <Sparkles size={18} className="mx-auto text-faint" />
-      <div className="mt-1 text-[13px] font-medium text-fg">没有找到匹配技能</div>
-      {query && <p className="mt-0.5 text-[12px] text-faint">关键词:{query}</p>}
-      <p className="mt-0.5 text-[12px] text-faint">换个说法再搜,或让智能体列出全部可用技能。</p>
+      <div className="mt-1 text-body font-medium text-fg">没有找到匹配技能</div>
+      {query && <p className="mt-0.5 text-meta text-faint">关键词:{query}</p>}
+      <p className="mt-0.5 text-meta text-faint">换个说法再搜,或让智能体列出全部可用技能。</p>
     </div>
   );
 }
@@ -275,7 +275,7 @@ function SkillViewInner({ v }: { v: SkillViewParse }) {
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="truncate font-mono text-[13px] font-semibold text-fg">{v.name || "(未命名技能)"}</span>
+            <span className="truncate font-mono text-body font-semibold text-fg">{v.name || "(未命名技能)"}</span>
             {v.version && <Badge tone="neutral">v{v.version.replace(/^v/i, "")}</Badge>}
             <SourceBadge source={sourceBadge} />
           </div>
@@ -293,7 +293,7 @@ function SkillViewInner({ v }: { v: SkillViewParse }) {
       </div>
       {v.body && (
         <details>
-          <summary className="cursor-pointer rounded text-[11.5px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看技能正文</summary>
+          <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看技能正文</summary>
           <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
             {v.body}
           </pre>

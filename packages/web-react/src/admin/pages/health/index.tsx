@@ -163,8 +163,8 @@ export default function HealthPage() {
       {failed ? (
         <Card className="flex flex-col items-center gap-2 px-6 py-12 text-center">
           <AlertTriangle size={28} className="text-danger" />
-          <p className="text-[14px] font-medium text-fg">拉取 /api/admin/metrics 失败</p>
-          <p className="max-w-md text-[12.5px] text-faint">{apiErrorMessage(poll.error, "未知错误")}</p>
+          <p className="text-title font-medium text-fg">拉取 /api/admin/metrics 失败</p>
+          <p className="max-w-md text-meta text-faint">{apiErrorMessage(poll.error, "未知错误")}</p>
           <Button variant="secondary" size="sm" onClick={() => poll.refresh()} className="mt-2 gap-1.5">
             <RefreshCw size={14} />
             重试
@@ -190,7 +190,7 @@ function CurrentActions({ overview, loading }: { overview: OpsOverview | null; l
   if (!actions) {
     return (
       <SectionCard title="当前行动" hint="告警与事故的待处理入口">
-        <p className="text-[13px] text-muted">行动汇总暂不可用，请分别进入告警和自愈修复查看。</p>
+        <p className="text-body text-muted">行动汇总暂不可用，请分别进入告警和自愈修复查看。</p>
       </SectionCard>
     );
   }
@@ -206,20 +206,20 @@ function CurrentActions({ overview, loading }: { overview: OpsOverview | null; l
         className="rounded-lg border border-border p-4 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
       >
         <div className="flex items-center justify-between gap-3">
-          <span className="flex items-center gap-2 text-[13px] font-medium text-fg"><BellRing size={16} /> 告警行动队列</span>
+          <span className="flex items-center gap-2 text-body font-medium text-fg"><BellRing size={16} /> 告警行动队列</span>
           <Badge tone={actions.firing_alerts.length > 0 ? "danger" : "success"}>{actions.firing_alerts.length} firing</Badge>
         </div>
-        <p className="mt-2 text-[12px] text-muted">已恢复 {actions.recovered_alerts.length} · 陈旧 {actions.stale_alerts.length} · 查看确认、静默与 runbook</p>
+        <p className="mt-2 text-meta text-muted">已恢复 {actions.recovered_alerts.length} · 陈旧 {actions.stale_alerts.length} · 查看确认、静默与 runbook</p>
       </a>
       <a
         href="#tab=selfheal"
         className="rounded-lg border border-border p-4 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
       >
         <div className="flex items-center justify-between gap-3">
-          <span className="flex items-center gap-2 text-[13px] font-medium text-fg"><Wrench size={16} /> 自愈事故</span>
+          <span className="flex items-center gap-2 text-body font-medium text-fg"><Wrench size={16} /> 自愈事故</span>
           <Badge tone={actions.open_incidents.length > 0 ? "danger" : "success"}>{actions.open_incidents.length} open</Badge>
         </div>
-        <p className="mt-2 text-[12px] text-muted">查看持续时间、修复状态与完整事件时间线</p>
+        <p className="mt-2 text-meta text-muted">查看持续时间、修复状态与完整事件时间线</p>
       </a>
     </SectionCard>
   );
@@ -248,15 +248,15 @@ function SloSection({ overview, loading }: { overview: OpsOverview | null; loadi
           {[0, 1, 2].map((i) => <div key={i} className="h-28 animate-pulse rounded-lg bg-hover" />)}
         </div>
       ) : !slo || slo.source === "unavailable" ? (
-        <div className="px-4 py-5 text-[13px] text-muted">时间窗口 SLO 暂不可用；不会用进程累计 counter 伪装历史数据。</div>
+        <div className="px-4 py-5 text-body text-muted">时间窗口 SLO 暂不可用；不会用进程累计 counter 伪装历史数据。</div>
       ) : (
         <div className="grid grid-cols-1 divide-y divide-border sm:grid-cols-3 sm:divide-x sm:divide-y-0">
           {entries.map(([label, w]) => (
             <div key={label} className="p-4">
-              <div className="text-[12px] font-medium text-faint">{label}</div>
+              <div className="text-meta font-medium text-faint">{label}</div>
               <div className="mt-2 flex flex-wrap items-baseline gap-x-3 gap-y-1">
                 <span className="text-[20px] font-semibold tabular-nums text-success">{fmtInt(w?.success ?? 0)} 成功</span>
-                <span className={(w?.failure ?? 0) > 0 ? "text-[13px] text-danger" : "text-[13px] text-muted"}>{fmtInt(w?.failure ?? 0)} 失败</span>
+                <span className={(w?.failure ?? 0) > 0 ? "text-body text-danger" : "text-body text-muted"}>{fmtInt(w?.failure ?? 0)} 失败</span>
               </div>
               <div className="mt-2 text-[12px] leading-relaxed text-muted">
                 受影响用户 {fmtInt(w?.affected_users ?? 0)}<br />
@@ -285,7 +285,7 @@ function DiagnosticsSection({ diag, loading }: { diag: Diagnostics | null; loadi
           ))}
         </div>
       ) : !diag ? (
-        <div className="flex items-center gap-2 rounded-lg bg-warning-soft px-3 py-2.5 text-[13px] text-warning">
+        <div className="flex items-center gap-2 rounded-lg bg-warning-soft px-3 py-2.5 text-body text-warning">
           <AlertTriangle size={15} className="shrink-0" />
           /api/admin/diagnostics 加载失败；下方 metrics 仍可查看。
         </div>
@@ -293,7 +293,7 @@ function DiagnosticsSection({ diag, loading }: { diag: Diagnostics | null; loadi
         <DiagMatrix diag={diag} />
       )}
       {diag && (
-        <details className="text-[12px]">
+        <details className="text-meta">
           <summary className="cursor-pointer select-none text-faint transition-colors hover:text-fg">
             查看原始 diagnostics JSON
           </summary>
@@ -392,7 +392,7 @@ function DiagCard({
   return (
     <Card className="flex flex-col gap-2 p-4">
       <div className="flex items-center justify-between gap-2">
-        <span className="flex items-center gap-1.5 text-[12px] font-medium text-faint">
+        <span className="flex items-center gap-1.5 text-meta font-medium text-faint">
           <Icon size={13} className="shrink-0" />
           {label}
         </span>
@@ -537,7 +537,7 @@ function ChartPanel({
       {loading ? (
         <div className="h-full w-full animate-pulse rounded-lg bg-hover" />
       ) : empty ? (
-        <div className="flex h-full w-full items-center justify-center text-[13px] text-faint">
+        <div className="flex h-full w-full items-center justify-center text-body text-faint">
           无数据
         </div>
       ) : (
@@ -560,11 +560,11 @@ function TablesSection({ view, loading }: { view: HealthView | null; loading: bo
 
       <SectionCard title="Anthropic 代理 settle / reject" bodyClassName="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <div className="flex flex-col gap-2">
-          <h3 className="text-[12.5px] font-medium text-muted">settle（成功收尾种类）</h3>
+          <h3 className="text-meta font-medium text-muted">settle（成功收尾种类）</h3>
           <KvTable obj={view?.settleByKind ?? {}} keyHeader="kind" valHeader="count" loading={loading} />
         </div>
         <div className="flex flex-col gap-2">
-          <h3 className="text-[12.5px] font-medium text-muted">reject（拒绝原因）</h3>
+          <h3 className="text-meta font-medium text-muted">reject（拒绝原因）</h3>
           <KvTable obj={view?.rejectByReason ?? {}} keyHeader="reason" valHeader="count" loading={loading} />
         </div>
       </SectionCard>
@@ -579,22 +579,22 @@ function TablesSection({ view, loading }: { view: HealthView | null; loading: bo
 
       <SectionCard title="代理延迟（按模型 / 平均）" bodyClassName="flex flex-col gap-4">
         <div className="flex flex-col gap-2">
-          <h3 className="text-[12.5px] font-medium text-muted">TTFT 首字延迟</h3>
+          <h3 className="text-meta font-medium text-muted">TTFT 首字延迟</h3>
           <HistTable rows={view?.ttftHist ?? []} keyHeader="模型" avgHeader="TTFT 平均" fmtAvg={(h) => fmtMs(h.avg)} loading={loading} />
         </div>
         <div className="flex flex-col gap-2">
-          <h3 className="text-[12.5px] font-medium text-muted">流式总时长</h3>
+          <h3 className="text-meta font-medium text-muted">流式总时长</h3>
           <HistTable rows={view?.streamHist ?? []} keyHeader="模型" avgHeader="总时长平均" fmtAvg={(h) => fmtMs(h.avg)} loading={loading} />
         </div>
       </SectionCard>
 
       <SectionCard title="WS Bridge" bodyClassName="flex flex-col gap-4">
         <div className="flex flex-col gap-2">
-          <h3 className="text-[12.5px] font-medium text-muted">缓冲字节（按方向）</h3>
+          <h3 className="text-meta font-medium text-muted">缓冲字节（按方向）</h3>
           <HistTable rows={view?.bridgeBufferedHist ?? []} keyHeader="方向" avgHeader="平均" fmtAvg={(h) => fmtKB(h.avg)} loading={loading} />
         </div>
         <div className="flex flex-col gap-2">
-          <h3 className="text-[12.5px] font-medium text-muted">会话时长（按结束原因）</h3>
+          <h3 className="text-meta font-medium text-muted">会话时长（按结束原因）</h3>
           <HistTable rows={view?.bridgeSessionHist ?? []} keyHeader="原因" avgHeader="平均时长" fmtAvg={(h) => fmtSec(h.avg)} loading={loading} />
         </div>
       </SectionCard>
@@ -633,7 +633,7 @@ function KvTable({
     [obj],
   );
   const columns: Column<{ k: string; v: number }>[] = [
-    { key: "k", title: keyHeader, render: (r) => <code className="font-mono text-[12px] text-fg">{r.k}</code> },
+    { key: "k", title: keyHeader, render: (r) => <code className="font-mono text-meta text-fg">{r.k}</code> },
     { key: "v", title: valHeader, align: "right", cellClassName: "tabular-nums", render: (r) => fmtInt(r.v) },
   ];
   return (
@@ -664,7 +664,7 @@ function HistTable({
 }) {
   const sorted = useMemo(() => [...rows].sort((a, b) => b.count - a.count), [rows]);
   const columns: Column<HistRow>[] = [
-    { key: "key", title: keyHeader, render: (h) => <code className="font-mono text-[12px] text-fg">{h.key}</code> },
+    { key: "key", title: keyHeader, render: (h) => <code className="font-mono text-meta text-fg">{h.key}</code> },
     { key: "count", title: "请求数", align: "right", cellClassName: "tabular-nums", render: (h) => fmtInt(h.count) },
     { key: "avg", title: avgHeader, align: "right", cellClassName: "tabular-nums", render: (h) => fmtAvg(h) },
   ];
@@ -682,7 +682,7 @@ const ACCT_TONE: Record<string, "neutral" | "success" | "warning" | "danger"> = 
 };
 function AccountPoolTable({ rows, loading }: { rows: AcctRow[]; loading?: boolean }) {
   const columns: Column<AcctRow>[] = [
-    { key: "account_id", title: "account_id", render: (r) => <code className="font-mono text-[12px] text-fg">{r.account_id}</code> },
+    { key: "account_id", title: "account_id", render: (r) => <code className="font-mono text-meta text-fg">{r.account_id}</code> },
     {
       key: "status",
       title: "status",

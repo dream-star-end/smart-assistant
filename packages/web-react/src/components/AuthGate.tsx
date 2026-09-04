@@ -348,7 +348,7 @@ export function AuthGate({
     </div>
   );
   const turnstileGate = modeNeedsTurnstile && !bypassKnown ? (
-    <output className="flex items-center justify-center gap-2 text-[13px] text-muted">
+    <output className="flex items-center justify-center gap-2 text-body text-muted">
       <Spinner size={15} />
       <span>正在准备登录…</span>
     </output>
@@ -360,7 +360,7 @@ export function AuthGate({
     <div
       role="alert"
       aria-live="assertive"
-      className="rounded-xl border border-danger/30 bg-danger-soft px-3.5 py-2.5 text-[13px] text-danger"
+      className="rounded-xl border border-danger/30 bg-danger-soft px-3.5 py-2.5 text-body text-danger"
     >
       {shownErr}
     </div>
@@ -369,7 +369,7 @@ export function AuthGate({
     <div
       role="status"
       aria-live="polite"
-      className="flex items-start gap-2 rounded-xl border border-success/30 bg-success-soft px-3.5 py-2.5 text-[13px] text-success"
+      className="flex items-start gap-2 rounded-xl border border-success/30 bg-success-soft px-3.5 py-2.5 text-body text-success"
     >
       <Check size={15} className="mt-0.5 shrink-0" />
       <span>{notice}</span>
@@ -409,7 +409,7 @@ export function AuthGate({
               替换原紫色渐变 Sparkles —— 用户从落地页点「登录」进来不再像换了个产品。 */}
           <BrandMark className="mb-4 size-12" fontSize="text-[24px]" />
           <h1 className="text-[22px] font-semibold tracking-tight text-fg">{titles[mode].h}</h1>
-          <p className="mt-1.5 text-[14px] text-muted">{titles[mode].sub}</p>
+          <p className="mt-1.5 text-title text-muted">{titles[mode].sub}</p>
         </div>
 
         {/* ── 登录 ── */}
@@ -422,7 +422,7 @@ export function AuthGate({
             className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
           >
             <label className="flex flex-col gap-1.5">
-              <span className="text-[13px] font-medium text-muted">邮箱</span>
+              <span className="text-body font-medium text-muted">邮箱</span>
               <Input
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -434,12 +434,12 @@ export function AuthGate({
             </label>
             <div className="flex flex-col gap-1.5">
               <div className="flex items-center justify-between">
-                <span className="text-[13px] font-medium text-muted">密码</span>
+                <span className="text-body font-medium text-muted">密码</span>
                 {onRequestReset && (
                   <button
                     type="button"
                     onClick={() => go("forgot")}
-                    className="text-[12.5px] text-accent hover:underline"
+                    className="text-meta text-accent hover:underline"
                   >
                     忘记密码？
                   </button>
@@ -481,7 +481,7 @@ export function AuthGate({
             </Button>
 
             {allowRegistration && onRegister && (
-              <p className="mt-1 text-center text-[13px] text-muted">
+              <p className="mt-1 text-center text-body text-muted">
                 还没有账号？
                 <button type="button" onClick={() => go("register")} className="ml-1 font-medium text-accent hover:underline">
                   立即注册
@@ -505,7 +505,7 @@ export function AuthGate({
             className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
           >
             <label className="flex flex-col gap-1.5">
-              <span className="text-[13px] font-medium text-muted">邮箱</span>
+              <span className="text-body font-medium text-muted">邮箱</span>
               <Input
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -516,7 +516,7 @@ export function AuthGate({
               />
             </label>
             <label className="flex flex-col gap-1.5">
-              <span className="text-[13px] font-medium text-muted">昵称（可选）</span>
+              <span className="text-body font-medium text-muted">昵称（可选）</span>
               <Input
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
@@ -527,7 +527,7 @@ export function AuthGate({
               />
             </label>
             <label className="flex flex-col gap-1.5">
-              <span className="text-[13px] font-medium text-muted">密码</span>
+              <span className="text-body font-medium text-muted">密码</span>
               <Input
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
@@ -538,7 +538,7 @@ export function AuthGate({
               />
             </label>
             <label className="flex flex-col gap-1.5">
-              <span className="text-[13px] font-medium text-muted">确认密码</span>
+              <span className="text-body font-medium text-muted">确认密码</span>
               <Input
                 value={confirmPw}
                 onChange={(e) => setConfirmPw(e.target.value)}
@@ -573,7 +573,7 @@ export function AuthGate({
               {busyNow ? <Spinner size={17} /> : (<>创建账号<ArrowRight size={16} /></>)}
             </Button>
 
-            <p className="mt-1 text-center text-[13px] text-muted">
+            <p className="mt-1 text-center text-body text-muted">
               已有账号？
               <button type="button" onClick={() => go("login")} className="ml-1 font-medium text-accent hover:underline">
                 去登录
@@ -593,7 +593,7 @@ export function AuthGate({
           >
             {noticeBox}
             <label className="flex flex-col gap-1.5">
-              <span className="text-[13px] font-medium text-muted">6 位验证码</span>
+              <span className="text-body font-medium text-muted">6 位验证码</span>
               <Input
                 value={code}
                 onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
@@ -620,7 +620,7 @@ export function AuthGate({
                 type="button"
                 onClick={() => void resendCode()}
                 disabled={cooldown > 0}
-                className="mt-1 text-center text-[13px] text-accent hover:underline disabled:text-faint disabled:no-underline"
+                className="mt-1 text-center text-body text-accent hover:underline disabled:text-faint disabled:no-underline"
               >
                 {cooldown > 0 ? `重新发送（${cooldown}s）` : "没收到？重新发送验证码"}
               </button>
@@ -642,10 +642,10 @@ export function AuthGate({
                 <span className="flex size-12 items-center justify-center rounded-full bg-success-soft text-success">
                   <MailCheck size={26} />
                 </span>
-                <p className="text-[14px] text-fg">
+                <p className="text-title text-fg">
                   如果 <span className="font-medium">{email.trim()}</span> 已注册，重置链接已发出。
                 </p>
-                <p className="text-[12.5px] text-faint">请查收邮件（含垃圾箱），点击链接设置新密码。</p>
+                <p className="text-meta text-faint">请查收邮件（含垃圾箱），点击链接设置新密码。</p>
                 <Button variant="secondary" onClick={() => go("login")} className="mt-1 rounded-xl">
                   返回登录
                 </Button>
@@ -653,7 +653,7 @@ export function AuthGate({
             ) : (
               <>
                 <label className="flex flex-col gap-1.5">
-                  <span className="text-[13px] font-medium text-muted">邮箱</span>
+                  <span className="text-body font-medium text-muted">邮箱</span>
                   <Input
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
@@ -676,7 +676,7 @@ export function AuthGate({
                   {busyNow ? <Spinner size={17} /> : (<>发送重置链接<ArrowRight size={16} /></>)}
                 </Button>
 
-                <p className="mt-1 text-center text-[13px] text-muted">
+                <p className="mt-1 text-center text-body text-muted">
                   想起来了？
                   <button type="button" onClick={() => go("login")} className="ml-1 font-medium text-accent hover:underline">
                     返回登录
@@ -698,7 +698,7 @@ export function AuthGate({
           >
             {!resetToken ? (
               <div className="flex flex-col items-center gap-3 py-3 text-center">
-                <p className="text-[14px] text-fg">重置链接无效或缺少 token。</p>
+                <p className="text-title text-fg">重置链接无效或缺少 token。</p>
                 <Button variant="secondary" onClick={() => go("forgot")} className="rounded-xl">
                   重新申请重置
                 </Button>
@@ -706,7 +706,7 @@ export function AuthGate({
             ) : (
               <>
                 <label className="flex flex-col gap-1.5">
-                  <span className="text-[13px] font-medium text-muted">新密码</span>
+                  <span className="text-body font-medium text-muted">新密码</span>
                   <Input
                     value={newPw}
                     onChange={(e) => setNewPw(e.target.value)}
@@ -717,7 +717,7 @@ export function AuthGate({
                   />
                 </label>
                 <label className="flex flex-col gap-1.5">
-                  <span className="text-[13px] font-medium text-muted">确认新密码</span>
+                  <span className="text-body font-medium text-muted">确认新密码</span>
                   <Input
                     value={newPwConfirm}
                     onChange={(e) => setNewPwConfirm(e.target.value)}
@@ -743,7 +743,7 @@ export function AuthGate({
           </form>
         )}
 
-        <p className="mt-4 text-center text-[12px] text-faint">全能助手 · 流式对话 · 持久会话</p>
+        <p className="mt-4 text-center text-meta text-faint">全能助手 · 流式对话 · 持久会话</p>
       </div>
       </div>
     </div>

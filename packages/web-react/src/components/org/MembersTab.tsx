@@ -254,7 +254,7 @@ export function MembersTab({
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
+      <div className="flex items-center justify-center gap-2 py-16 text-body text-faint">
         <Spinner /> 加载成员…
       </div>
     );
@@ -262,7 +262,7 @@ export function MembersTab({
   if (err) {
     return (
       <div className="px-5 py-4">
-        <Alert tone="danger" className="text-[12.5px]">
+        <Alert tone="danger" className="text-meta">
           {err}
         </Alert>
       </div>
@@ -280,7 +280,7 @@ export function MembersTab({
     <div className="flex flex-col">
       {/* 成员列表 */}
       <div className="px-5 py-4">
-        <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           成员（{members.length}）
         </div>
         <ul className="flex flex-col gap-1.5">
@@ -291,10 +291,10 @@ export function MembersTab({
               <li key={m.user_id} className="rounded-lg border border-border px-3 py-2.5">
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
-                    <div className="truncate text-[13.5px] font-medium text-fg">
+                    <div className="truncate text-section font-medium text-fg">
                       {m.display_name || m.email}
                     </div>
-                    <div className="truncate text-[11.5px] text-faint">
+                    <div className="truncate text-caption text-faint">
                       {m.email} · 加入 {shortTime(m.joined_at)}
                     </div>
                   </div>
@@ -307,7 +307,7 @@ export function MembersTab({
 
                 <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-2">
                   {/* 组织结算开关:服务端 owner-only(安全加固),非 owner 只读展示,消除"点了才 403"。 */}
-                  <label className="flex items-center gap-2 text-[12px] text-muted">
+                  <label className="flex items-center gap-2 text-meta text-muted">
                     <Switch
                       checked={m.billing_enabled}
                       onCheckedChange={(v) => toggleBilling(m, v)}
@@ -319,7 +319,7 @@ export function MembersTab({
 
                   {/* 财务委派开关:仅 owner 可见可操作;owner 行本身恒有权限,不显开关。 */}
                   {isOwner && !ownerRow && (
-                    <label className="flex items-center gap-2 text-[12px] text-muted">
+                    <label className="flex items-center gap-2 text-meta text-muted">
                       <Switch
                         checked={m.billing_delegate}
                         onCheckedChange={(v) => toggleDelegate(m, v)}
@@ -331,7 +331,7 @@ export function MembersTab({
                   )}
 
                   {isOwner && !ownerRow && (
-                    <label className="flex items-center gap-1.5 text-[12px] text-muted">
+                    <label className="flex items-center gap-1.5 text-meta text-muted">
                       角色
                       <select
                         className={selectCls}
@@ -348,7 +348,7 @@ export function MembersTab({
                   )}
 
                   {ownerRow ? (
-                    <span className="text-[11.5px] text-faint">拥有者不可变更</span>
+                    <span className="text-caption text-faint">拥有者不可变更</span>
                   ) : (
                     <Button
                       variant="ghost"
@@ -388,16 +388,16 @@ export function MembersTab({
 
       {/* 邀请成员 */}
       <div className="border-t border-border px-5 py-4">
-        <div className="flex items-center gap-1.5 pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+        <div className="flex items-center gap-1.5 pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           <UserPlus size={13} /> 邀请成员
         </div>
 
         {seatFull ? (
           <div className="rounded-lg border border-border bg-warning-soft px-3.5 py-3">
-            <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-warning">
+            <div className="flex items-center gap-1.5 text-meta font-medium text-warning">
               <Users size={14} /> 席位已满（{activeMembers} / {subscription?.seats} 席）
             </div>
-            <p className="mt-1 text-[12px] text-muted">
+            <p className="mt-1 text-meta text-muted">
               {canManageBilling
                 ? "当前席位已用满，加席后即可继续邀请新成员。"
                 : "当前席位已用满，如需邀请更多成员，请联系组织拥有者加席。"}
@@ -449,8 +449,8 @@ export function MembersTab({
                   className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-hover"
                 >
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[13px] text-fg">{inv.email}</span>
-                    <span className="block truncate text-[11.5px] text-faint">
+                    <span className="block truncate text-body text-fg">{inv.email}</span>
+                    <span className="block truncate text-caption text-faint">
                       {orgRoleLabel(inv.org_role)} · {shortTime(inv.created_at)}
                     </span>
                   </span>
@@ -512,7 +512,7 @@ function MemberUsageRow({
   return (
     <div className="mt-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border/60 pt-2">
       <div className="min-w-[11rem] flex-1">
-        <div className="flex items-center justify-between text-[11.5px]">
+        <div className="flex items-center justify-between text-caption">
           <span className="flex items-center gap-1 text-faint">
             <Wallet size={12} /> 本月组织用量
           </span>
@@ -525,7 +525,7 @@ function MemberUsageRow({
           <Progress value={bv.pct} className="mt-1" aria-label="月度限额用量" />
         )}
         {bv.over && (
-          <p className="mt-1 text-[11px] text-faint">本月已达限额，正用个人余额。</p>
+          <p className="mt-1 text-caption text-faint">本月已达限额，正用个人余额。</p>
         )}
       </div>
 
@@ -549,7 +549,7 @@ function MemberUsageRow({
             </Button>
           </div>
         ) : (
-          <div className="flex items-center gap-1.5 text-[12px] text-muted">
+          <div className="flex items-center gap-1.5 text-meta text-muted">
             限额 <span className="tabular-nums text-fg">{budgetLabel}</span>
             <Button size="sm" variant="ghost" onClick={onEditStart} disabled={busy}>
               编辑
@@ -557,7 +557,7 @@ function MemberUsageRow({
           </div>
         )
       ) : (
-        <span className="text-[11.5px] text-faint">限额 {budgetLabel}</span>
+        <span className="text-caption text-faint">限额 {budgetLabel}</span>
       )}
     </div>
   );

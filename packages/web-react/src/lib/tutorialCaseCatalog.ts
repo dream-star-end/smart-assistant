@@ -1,5 +1,5 @@
 import type { ProductFeatureId } from './productCapabilities'
-import { type TutorialCaseId } from './tutorialCaseId'
+import type { TutorialCaseId } from './tutorialCaseId'
 
 // 向后兼容 re-export:这两个符号历史上定义在本文件,现拆到 tutorialCaseId.ts
 // (useAppRoute 等首屏路径只需 id 联合类型 + parse,不该连带整份案例数据进首屏闭包)。

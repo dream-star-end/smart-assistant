@@ -19,10 +19,10 @@ export function CaseFieldReportVisual({
       data-artwork-kind={report.visual}
     >
       <div className="absolute inset-x-4 top-3 z-10 flex items-center justify-between gap-2 sm:inset-x-5 sm:top-4">
-        <span className="rounded-full border border-emerald-300/35 bg-emerald-400/15 px-2.5 py-1 text-[10px] font-semibold text-emerald-100 backdrop-blur-sm sm:text-[11px]">
+        <span className="rounded-full border border-emerald-300/35 bg-emerald-400/15 px-2.5 py-1 text-micro font-semibold text-emerald-100 backdrop-blur-sm sm:text-caption">
           {report.visual === 'bike-model-comparison' ? '科研分析成果' : '代码修复成果'}
         </span>
-        <span className="text-[9px] font-medium text-white/70 sm:text-[10px]">
+        <span className="text-[9px] font-medium text-white/70 sm:text-micro">
           案例演示
         </span>
       </div>
@@ -31,14 +31,14 @@ export function CaseFieldReportVisual({
 
       <div className="absolute inset-x-4 bottom-3 z-10 hidden items-end justify-between gap-3 sm:inset-x-5 sm:bottom-4 sm:flex">
         <div className="min-w-0">
-          <p className="truncate text-[10px] text-white/65 sm:text-[11px]">{report.sourceLabel}</p>
-          <p className="mt-0.5 text-[14px] font-semibold tracking-tight sm:text-[16px]">
+          <p className="truncate text-micro text-white/65 sm:text-caption">{report.sourceLabel}</p>
+          <p className="mt-0.5 text-title font-semibold tracking-tight sm:text-[16px]">
             {report.visual === 'bike-model-comparison'
               ? '模型对照 + 可复跑验证'
               : '先红后绿 + 一行根因修复'}
           </p>
         </div>
-        <span className="shrink-0 rounded-full bg-white/10 px-2.5 py-1 text-[10px] font-semibold text-white/85 sm:text-[11px]">
+        <span className="shrink-0 rounded-full bg-white/10 px-2.5 py-1 text-micro font-semibold text-white/85 sm:text-caption">
           可核对成果
         </span>
       </div>
@@ -50,7 +50,7 @@ function BikeModelComparison() {
   return (
     <div className="absolute inset-x-5 bottom-4 top-[48px] grid grid-cols-2 gap-3 sm:inset-x-8 sm:bottom-[66px] sm:top-[58px] sm:gap-5">
       <div className="flex flex-col justify-center rounded-xl border border-white/15 bg-white/[0.07] p-3 backdrop-blur-sm sm:p-4">
-        <div className="flex items-center justify-between gap-2 text-[9px] font-semibold text-white/65 sm:text-[10px]">
+        <div className="flex items-center justify-between gap-2 text-[9px] font-semibold text-white/65 sm:text-micro">
           <span>RMSE</span>
           <span>越低越好</span>
         </div>
@@ -60,7 +60,7 @@ function BikeModelComparison() {
         </div>
       </div>
       <div className="flex flex-col justify-center rounded-xl border border-white/15 bg-white/[0.07] p-3 backdrop-blur-sm sm:p-4">
-        <div className="flex items-center justify-between gap-2 text-[9px] font-semibold text-white/65 sm:text-[10px]">
+        <div className="flex items-center justify-between gap-2 text-[9px] font-semibold text-white/65 sm:text-micro">
           <span>测试集 R²</span>
           <span>越高越好</span>
         </div>
@@ -68,7 +68,7 @@ function BikeModelComparison() {
           <MetricNumber label="线性" value="0.714" />
           <MetricNumber label="GBM" value="0.904" accent />
         </div>
-        <div className="mt-2.5 flex items-center gap-1.5 text-[9px] font-medium text-emerald-200 sm:mt-3 sm:text-[10px]">
+        <div className="mt-2.5 flex items-center gap-1.5 text-[9px] font-medium text-emerald-200 sm:mt-3 sm:text-micro">
           <span className="size-1.5 rounded-full bg-emerald-300" />
           34 项复现测试通过
         </div>
@@ -90,7 +90,7 @@ function MetricBar({
 }) {
   return (
     <div>
-      <div className="flex items-center justify-between text-[9px] text-white/75 sm:text-[10px]">
+      <div className="flex items-center justify-between text-[9px] text-white/75 sm:text-micro">
         <span>{label}</span>
         <span>{value}</span>
       </div>
@@ -116,7 +116,7 @@ function MetricNumber({
       <p className="text-[8px] text-white/55 sm:text-[9px]">{label}</p>
       <p
         className={cn(
-          'mt-0.5 text-[15px] font-bold sm:text-[19px]',
+          'mt-0.5 text-title font-bold sm:text-[19px]',
           accent ? 'text-emerald-200' : 'text-white/80',
         )}
       >
@@ -139,7 +139,7 @@ function AstropyPatch() {
         <p className="truncate text-white/45">cright[-right.shape[0]:, -right.shape[1]:]</p>
         <p className="mt-0.5 rounded bg-rose-400/10 px-1.5 text-rose-200">− = 1</p>
         <p className="mt-1 rounded bg-emerald-400/10 px-1.5 text-emerald-200">+ = right</p>
-        <div className="mt-2 flex gap-2 font-sans text-[8px] font-semibold sm:text-[10px]">
+        <div className="mt-2 flex gap-2 font-sans text-[8px] font-semibold sm:text-micro">
           <span className="rounded-full bg-rose-400/15 px-2 py-1 text-rose-200">基线 2 failed</span>
           <span className="rounded-full bg-emerald-400/15 px-2 py-1 text-emerald-200">
             修复后 13 passed

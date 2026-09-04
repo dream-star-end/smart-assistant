@@ -29,7 +29,7 @@ export function RepoStatusBanner({
 
   return (
     <div className={cn("mx-auto mt-2 w-full max-w-3xl px-4")}>
-      <div className={cn("flex items-center gap-2.5 rounded-lg border px-3 py-2 text-[12.5px]", tone)}>
+      <div className={cn("flex items-center gap-2.5 rounded-lg border px-3 py-2 text-meta", tone)}>
         <span className="shrink-0">
           {status === "ready" ? (
             <CheckCircle2 size={15} />

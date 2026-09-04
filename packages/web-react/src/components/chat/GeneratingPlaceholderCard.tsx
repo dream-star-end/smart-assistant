@@ -210,13 +210,13 @@ export function GeneratingPlaceholderCard({
           {failed && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-4 text-center">
               <TriangleAlert size={22} className="text-danger" aria-hidden="true" />
-              <div className="text-[13px] font-medium text-danger">图片生成失败</div>
-              {reason && <div className="max-w-full truncate text-[11.5px] text-muted">{reason}</div>}
+              <div className="text-body font-medium text-danger">图片生成失败</div>
+              {reason && <div className="max-w-full truncate text-caption text-muted">{reason}</div>}
               {onRetry && (
                 <button
                   type="button"
                   onClick={onRetry}
-                  className="mt-1 inline-flex items-center gap-1 rounded-full bg-hover px-2.5 py-1 text-[11.5px] text-fg hover:opacity-90"
+                  className="mt-1 inline-flex items-center gap-1 rounded-full bg-hover px-2.5 py-1 text-caption text-fg hover:opacity-90"
                 >
                   <RotateCcw size={12} /> 重试
                 </button>
@@ -227,7 +227,7 @@ export function GeneratingPlaceholderCard({
           {/* 生成中角标（左下小字胶囊）。 */}
           {badge && (
             <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center gap-1.5 p-2">
-              <span className="inline-flex items-center gap-1.5 rounded-full bg-black/45 px-2 py-1 text-[11px] font-medium text-white/90 backdrop-blur-sm">
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-black/45 px-2 py-1 text-caption font-medium text-white/90 backdrop-blur-sm">
                 <ImageIcon size={12} className="opacity-80" aria-hidden="true" />
                 {badge}
               </span>

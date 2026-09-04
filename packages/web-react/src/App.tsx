@@ -236,6 +236,7 @@ function SplashFallback() {
  *  role=status + aria-live 让读屏用户也收到「正在加载」而非静默黑屏。*/
 function DialogFallback() {
   return (
+    // biome-ignore lint/a11y/useSemanticElements: <output> 语义是"表单计算结果",这里是全屏加载遮罩,保留 div+role=status
     <div
       role="status"
       aria-live="polite"

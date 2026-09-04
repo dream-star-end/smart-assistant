@@ -168,7 +168,7 @@ function OrderDetailModal({
           <Spinner />
         </div>
       ) : error ? (
-        <p className="py-6 text-center text-[13px] text-danger">加载失败：{error}</p>
+        <p className="py-6 text-center text-body text-danger">加载失败：{error}</p>
       ) : order ? (
         <div className="flex flex-col gap-1 divide-y divide-border/60">
           <KeyValue
@@ -209,7 +209,7 @@ function OrderDetailModal({
             <KeyValue
               label="积分流水"
               value={
-                <span className="font-mono text-[12px]">
+                <span className="font-mono text-meta">
                   #{order.ledger_id}
                   {order.refunded_ledger_id ? ` · 退款 #${order.refunded_ledger_id}` : ""}
                 </span>
@@ -217,14 +217,14 @@ function OrderDetailModal({
             />
           )}
           <div className="pt-3">
-            <p className="mb-1.5 text-[12px] text-faint">callback_payload(支付方原始回调)</p>
+            <p className="mb-1.5 text-meta text-faint">callback_payload(支付方原始回调)</p>
             <pre className="max-h-72 overflow-auto rounded-lg bg-hover p-3 font-mono text-[11px] leading-relaxed text-muted">
               {payloadText}
             </pre>
           </div>
         </div>
       ) : (
-        <p className="py-6 text-center text-[13px] text-faint">未找到该订单</p>
+        <p className="py-6 text-center text-body text-faint">未找到该订单</p>
       )}
     </Modal>
   );
@@ -386,7 +386,7 @@ export default function OrdersPage() {
       render: (r) => (
         <span>
           {r.username ? `${r.username} ` : ""}
-          <span className="font-mono text-[12px] text-muted">#{r.user_id}</span>
+          <span className="font-mono text-meta text-muted">#{r.user_id}</span>
         </span>
       ),
     },
@@ -487,7 +487,7 @@ export default function OrdersPage() {
 
       <ChartCard title="支付状态构成" hint="当前视图 · 按 status">
         {statusAgg.length === 0 ? (
-          <div className="flex h-full items-center justify-center text-[13px] text-faint">无订单</div>
+          <div className="flex h-full items-center justify-center text-body text-faint">无订单</div>
         ) : (
           <canvas ref={donutRef} />
         )}

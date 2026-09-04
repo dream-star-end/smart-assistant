@@ -80,7 +80,7 @@ function Progress({ job }: { job: MediaGenerationJob }) {
     : 0
   return (
     <div className="space-y-1.5">
-      <div className="flex items-center justify-between text-[12px] text-muted">
+      <div className="flex items-center justify-between text-meta text-muted">
         <span>
           {STATUS[job.status]} · {job.phase}
         </span>
@@ -139,7 +139,7 @@ function JobResult({ job, auth }: { job: MediaGenerationJob; auth: AuthSession |
             src={resultUrl}
           />
           <a
-            className="inline-flex items-center gap-1 text-[12px] font-medium text-accent hover:underline"
+            className="inline-flex items-center gap-1 text-meta font-medium text-accent hover:underline"
             href={resultUrl}
             download
           >
@@ -152,7 +152,7 @@ function JobResult({ job, auth }: { job: MediaGenerationJob; auth: AuthSession |
           播放或下载结果
         </Button>
       )}
-      {error && <p className="text-[12px] text-danger">{error}</p>}
+      {error && <p className="text-meta text-danger">{error}</p>}
     </div>
   )
 }
@@ -295,7 +295,7 @@ export function MediaTaskCenter({
         </div>
 
         {error && (
-          <div className="mt-4 rounded-xl border border-danger/30 bg-danger-soft p-3 text-[12.5px] text-danger">
+          <div className="mt-4 rounded-xl border border-danger/30 bg-danger-soft p-3 text-meta text-danger">
             {error}
           </div>
         )}
@@ -305,14 +305,14 @@ export function MediaTaskCenter({
           </div>
         )}
         {capability?.available && capability.workerReachable === false && (
-          <div className="mt-4 rounded-xl border border-warning/30 bg-warning-soft p-3 text-[12.5px] text-warning">
+          <div className="mt-4 rounded-xl border border-warning/30 bg-warning-soft p-3 text-meta text-warning">
             算力节点暂时失联，已提交的任务和素材不会丢失，恢复连接后可继续处理。
           </div>
         )}
 
         {projects.length > 0 && (
           <section className="mt-6 space-y-3">
-            <h3 className="text-[13px] font-semibold text-fg">长视频项目</h3>
+            <h3 className="text-body font-semibold text-fg">长视频项目</h3>
             {projects.map((project) => {
               const compose = project.currentComposeJobId
                 ? jobs.find((job) => job.id === project.currentComposeJobId)
@@ -325,7 +325,7 @@ export function MediaTaskCenter({
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <div className="truncate text-sm font-semibold text-fg">{project.title}</div>
-                      <div className="mt-1 text-[12px] text-muted">
+                      <div className="mt-1 text-meta text-muted">
                         {
                           project.shots.filter((shot) => shot.activeJob?.status === 'completed')
                             .length
@@ -333,7 +333,7 @@ export function MediaTaskCenter({
                         /{project.shots.length} 个分镜 · rev {project.rev}
                       </div>
                     </div>
-                    <span className="rounded-full bg-hover px-2 py-1 text-[11px] text-muted">
+                    <span className="rounded-full bg-hover px-2 py-1 text-caption text-muted">
                       {PROJECT_STATUS[project.status]}
                     </span>
                   </div>
@@ -341,14 +341,14 @@ export function MediaTaskCenter({
                     {project.shots.map((shot) => (
                       <div key={shot.id} className="rounded-xl bg-bg px-3 py-2.5">
                         <div className="flex items-start gap-2">
-                          <span className="shrink-0 text-[11px] font-semibold text-faint">
+                          <span className="shrink-0 text-caption font-semibold text-faint">
                             #{shot.ordinal + 1}
                           </span>
                           <p className="line-clamp-2 flex-1 text-[12px] leading-relaxed text-fg">
                             {shot.prompt}
                           </p>
                           {shot.stale && project.status !== 'canceled' && (
-                            <span className="shrink-0 rounded-full bg-warning-soft px-1.5 py-0.5 text-[10px] text-warning">
+                            <span className="shrink-0 rounded-full bg-warning-soft px-1.5 py-0.5 text-micro text-warning">
                               依赖已变
                             </span>
                           )}
@@ -459,7 +459,7 @@ export function MediaTaskCenter({
         )}
 
         <section className="mt-6 space-y-3">
-          <h3 className="text-[13px] font-semibold text-fg">单段视频</h3>
+          <h3 className="text-body font-semibold text-fg">单段视频</h3>
           {standalone.map((job) => (
             <article
               key={job.id}
@@ -472,7 +472,7 @@ export function MediaTaskCenter({
                 <Progress job={job} />
               </div>
               {job.errorMessage && (
-                <p className="mt-2 text-[12px] text-danger">{job.errorMessage}</p>
+                <p className="mt-2 text-meta text-danger">{job.errorMessage}</p>
               )}
               {ACTIVE.has(job.status) && (
                 <Button

@@ -192,7 +192,7 @@ function ReqIdChip({ traceId }: { traceId: string }) {
           /* ignore */
         }
       }}
-      className="inline-flex items-center gap-1 rounded-full bg-hover px-2 py-0.5 font-mono text-[11px] text-faint transition-colors hover:text-muted"
+      className="inline-flex items-center gap-1 rounded-full bg-hover px-2 py-0.5 font-mono text-caption text-faint transition-colors hover:text-muted"
     >
       {copied ? <Check size={11} /> : null}
       {copied ? "已复制" : `#${traceId.slice(0, 8)}`}
@@ -365,7 +365,7 @@ function ReplyQuoteBlock({
       className="mb-2 border-l-2 border-fg/20 pl-2.5 text-left text-fg/70"
       data-testid="message-reply-quote"
     >
-      <div className="mb-0.5 text-[11px] font-medium">
+      <div className="mb-0.5 text-caption font-medium">
         {role === "assistant" ? "从简" : "你"}
       </div>
       <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5">
@@ -407,7 +407,7 @@ export function UserCard({
       {showStatus && (
         <div
           className={cn(
-            "mt-1 flex items-center gap-2 text-[11px]",
+            "mt-1 flex items-center gap-2 text-caption",
             status === "error" ? "text-danger" : "text-faint",
           )}
         >
@@ -461,7 +461,7 @@ export function TurnStatusCard({
       <div className="flex items-start gap-2.5">
         <ShieldCheck size={16} className="mt-0.5 shrink-0 text-warning" />
         <div className="min-w-0 flex-1">
-          <div className="text-[13px] font-medium text-fg">{presented.title}</div>
+          <div className="text-body font-medium text-fg">{presented.title}</div>
           <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted">{presented.message}</div>
         </div>
         {currentTurn && retryTarget && cb.onRetrySend && (
@@ -672,7 +672,7 @@ export function AssistantCard({
         {/* 终态错误卡：自动免单用温和提示，不把平台 JSON/英文堆栈甩给用户。 */}
         {isUserCancelled ? (
           <output
-            className="mt-2.5 flex items-center gap-2 py-1 text-[13px] text-muted"
+            className="mt-2.5 flex items-center gap-2 py-1 text-body text-muted"
             aria-label="已停止生成"
           >
             <Square size={14} className="shrink-0" />
@@ -695,7 +695,7 @@ export function AssistantCard({
                   <summary className="w-fit cursor-pointer select-none text-xs text-muted hover:text-fg">
                     查看请求信息
                   </summary>
-                  <pre className="mt-1.5 max-h-28 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-code px-2.5 py-2 text-[11px] text-muted [overflow-wrap:anywhere]">
+                  <pre className="mt-1.5 max-h-28 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-code px-2.5 py-2 text-caption text-muted [overflow-wrap:anywhere]">
                     {presentedError.detail}
                   </pre>
                 </details>
@@ -752,7 +752,7 @@ export function AssistantCard({
 
         {showUnpublishedProcessPending && (
           <output
-            className="mt-2.5 flex items-center gap-2 py-1 text-[13px] text-muted"
+            className="mt-2.5 flex items-center gap-2 py-1 text-body text-muted"
             aria-label="过程记录整理中"
           >
             <span>过程记录整理中…</span>
@@ -828,7 +828,7 @@ export const ThinkingCard = memo(
         <button
           type="button"
           onClick={() => setUserCollapsed(!collapsed)}
-          className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-[13px] text-muted hover:bg-hover"
+          className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-body text-muted hover:bg-hover"
         >
           <Brain size={14} className="shrink-0 text-faint" />
           <span className="min-w-0 truncate font-medium" title={headline}>
@@ -896,7 +896,7 @@ export function PlanCard({
           <ListTodo size={14} />
         </span>
         <span
-          className="min-w-0 flex-1 truncate text-[13px] font-medium text-fg"
+          className="min-w-0 flex-1 truncate text-body font-medium text-fg"
           title={msg.text || "执行计划"}
         >
           {msg.text || "执行计划"}
@@ -910,7 +910,7 @@ export function PlanCard({
         )}
         <ol className="space-y-1.5">
           {steps.map((s, i) => (
-            <li key={i} className="flex items-start gap-2.5 text-[13.5px] text-fg">
+            <li key={i} className="flex items-start gap-2.5 text-section text-fg">
               <span className={cn("mt-[7px] size-2 shrink-0 rounded-full", STEP_DOT[s.status] ?? "bg-faint")} />
               <span className={cn("leading-relaxed", s.status === "completed" && "text-muted line-through")}>
                 {s.step}
@@ -932,11 +932,11 @@ export function GoalCard({ msg }: { msg: ChatMessage }) {
     <div className="rounded-lg border border-border bg-surface px-3.5 py-3 animate-in">
       <div className="flex items-center gap-2">
         <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent"><Target size={14} /></span>
-        <span className="text-[13px] font-medium text-fg">{msg.text || "会话目标"}</span>
+        <span className="text-body font-medium text-fg">{msg.text || "会话目标"}</span>
         <Badge tone={msg.cleared ? "neutral" : "accent"}>{status}</Badge>
       </div>
       {!msg.cleared && (
-        <p className="mt-2 text-[11.5px] text-muted tabular-nums">
+        <p className="mt-2 text-caption text-muted tabular-nums">
           Token {groupDigits(String(msg.tokensUsed ?? 0))}{msg.tokenBudget == null ? "" : ` / ${groupDigits(String(msg.tokenBudget))}`}
           {typeof msg.timeUsedSeconds === "number" ? ` · ${msg.timeUsedSeconds}s` : ""}
         </p>
@@ -967,7 +967,7 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
         <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent">
           <Sparkles size={13} />
         </span>
-        <span className="min-w-0 truncate text-[13px] font-medium text-fg">{msg.text || "委派子任务"}</span>
+        <span className="min-w-0 truncate text-body font-medium text-fg">{msg.text || "委派子任务"}</span>
         <span className="ml-auto flex items-center gap-2">
           <TokenUsageBadge usage={tokenUsage} label="子 Agent 合计" />
           {done ? (
@@ -987,7 +987,7 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
         </div>
       )}
       {!collapsed && entries.length > 0 && (
-        <ul className="border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
+        <ul className="border-t border-border px-3.5 py-2 text-meta text-muted">
           {entries.slice(0, visibleEntries).map((e, i) => (
             <li key={i} className="whitespace-pre-wrap break-words">
               <span className="text-faint">[{e.phase}]</span> {e.text}
@@ -1009,12 +1009,12 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
       {!collapsed && done && msg.summary && (
         <ProgressivePlainText
           text={msg.summary}
-          className="border-t border-border px-3.5 py-2 text-[12.5px] text-muted"
+          className="border-t border-border px-3.5 py-2 text-meta text-muted"
         />
       )}
       {/* 折叠态展示结果摘要（完成后）——与 AgentGroupCard 折叠页脚一致。 */}
       {collapsed && done && msg.summary && (
-        <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
+        <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-meta text-muted">
           <Check size={13} className="mt-0.5 shrink-0 text-success" />
           <span className="line-clamp-2">
             {msg.summary.slice(0, 500)}{msg.summary.length > 500 ? "…" : ""}

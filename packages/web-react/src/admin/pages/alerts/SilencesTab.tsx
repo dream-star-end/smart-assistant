@@ -82,7 +82,7 @@ export function SilencesTab({
         return m.empty ? (
           <Badge tone="danger">空 matcher</Badge>
         ) : (
-          <span className="font-mono text-[12px]">{m.text}</span>
+          <span className="font-mono text-meta">{m.text}</span>
         );
       },
     },
@@ -106,7 +106,7 @@ export function SilencesTab({
       key: "created_by",
       title: "创建人",
       width: 80,
-      render: (s) => <span className="font-mono text-[12px] text-faint">{s.created_by ?? "—"}</span>,
+      render: (s) => <span className="font-mono text-meta text-faint">{s.created_by ?? "—"}</span>,
     },
     {
       key: "actions",
@@ -128,7 +128,7 @@ export function SilencesTab({
     <div className="flex flex-col gap-3">
       {confirmEl}
       <FilterBar className="justify-between">
-        <p className="text-[13px] text-muted">matcher 三字段任选(AND 关系,命中则不发);窗口最长 7 天。</p>
+        <p className="text-body text-muted">matcher 三字段任选(AND 关系,命中则不发);窗口最长 7 天。</p>
         <div className="flex items-center gap-2">
           <Button variant="secondary" size="sm" onClick={reload} disabled={loading}>
             <RefreshCw size={14} className={loading ? "animate-spin" : undefined} /> 刷新
@@ -140,7 +140,7 @@ export function SilencesTab({
       </FilterBar>
 
       {error && (
-        <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-[13px] text-danger">
+        <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-body text-danger">
           加载静默失败: {errText(error)}
         </div>
       )}

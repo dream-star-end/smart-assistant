@@ -143,17 +143,17 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
     const ok = await confirm({
       title: risk === "critical" ? "确认关键设置变更？" : "确认保存设置？",
       body: (
-        <div className="flex flex-col gap-3 text-[13px]">
+        <div className="flex flex-col gap-3 text-body">
           <div className="flex items-center gap-2">
             <Badge tone={riskMeta.tone}>{riskMeta.label}</Badge>
             <span className="break-all font-mono text-fg">{row.key}</span>
           </div>
           <div className="grid gap-2 rounded-lg border border-border bg-hover p-3 sm:grid-cols-2">
-            <div className="min-w-0"><div className="text-[11px] text-faint">当前值{isDefault ? "（继承默认）" : ""}</div><code className="mt-1 block break-all text-[12px] text-muted">{diffValue(baseline.ok ? baseline.value : row.value)}</code></div>
-            <div className="min-w-0"><div className="text-[11px] text-faint">保存后</div><code className="mt-1 block break-all text-[12px] text-fg">{diffValue(c.value)}</code></div>
+            <div className="min-w-0"><div className="text-caption text-faint">当前值{isDefault ? "（继承默认）" : ""}</div><code className="mt-1 block break-all text-meta text-muted">{diffValue(baseline.ok ? baseline.value : row.value)}</code></div>
+            <div className="min-w-0"><div className="text-caption text-faint">保存后</div><code className="mt-1 block break-all text-meta text-fg">{diffValue(c.value)}</code></div>
           </div>
           {desc !== initialDescription && (
-            <div className="rounded-lg border border-border p-3 text-[12px] text-muted">
+            <div className="rounded-lg border border-border p-3 text-meta text-muted">
               说明：<span className="line-through">{initialDescription || "（空）"}</span> → <span className="text-fg">{desc || "（空）"}</span>
             </div>
           )}
@@ -189,7 +189,7 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
           onCheckedChange={(v) => setDraft(v)}
           aria-label={`${row.key} 开关`}
         />
-        <span className="font-mono text-[13px] text-muted">{on ? "true" : "false"}</span>
+        <span className="font-mono text-body text-muted">{on ? "true" : "false"}</span>
       </div>
     );
   } else if (kind === "enum" || kind === "model") {
@@ -240,13 +240,13 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
         <Textarea
           aria-label={`${row.key} 取值`}
           rows={6}
-          className="font-mono text-[12.5px]"
+          className="font-mono text-meta"
           value={String(draft)}
           placeholder={kind === "string_array" ? "一行一个，例如：tempmail.com" : "JSON"}
           onChange={(e) => setDraft(e.target.value)}
         />
         {count !== null && (
-          <div className="mt-1 text-[11px] text-faint">当前 {count} 项</div>
+          <div className="mt-1 text-caption text-faint">当前 {count} 项</div>
         )}
       </div>
     );
@@ -260,11 +260,11 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
       {/* 头行：key + 类型/范围/继承徽标 + 保存 */}
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <div className="break-all font-mono text-[13px] font-semibold text-fg">{row.key}</div>
+          <div className="break-all font-mono text-body font-semibold text-fg">{row.key}</div>
           <div className="mt-1 flex flex-wrap items-center gap-1.5">
             <Badge tone="neutral">{String(kind)}</Badge>
             <Badge tone={riskMeta.tone} title={`风险等级：${riskMeta.label}`}>{riskMeta.label}</Badge>
-            <span className="font-mono text-[11px] text-faint">{rangeHint(row)}</span>
+            <span className="font-mono text-caption text-faint">{rangeHint(row)}</span>
             {isDefault ? (
               <Badge tone="neutral" title="继承平台默认值，尚未持久化">
                 默认
@@ -275,14 +275,14 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
               </Badge>
             )}
             {!isDefault && row.updated_at && (
-              <TimeAgo value={row.updated_at} className="text-[11px] text-faint" />
+              <TimeAgo value={row.updated_at} className="text-caption text-faint" />
             )}
             {!isDefault && row.updated_by && (
-              <span className="font-mono text-[11px] text-faint">by #{row.updated_by}</span>
+              <span className="font-mono text-caption text-faint">by #{row.updated_by}</span>
             )}
             <a
               href="#tab=audit"
-              className="rounded text-[11px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+              className="rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
             >
               查看审计
             </a>
@@ -304,7 +304,7 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
         <div>
           <label
             htmlFor={`setting-desc-${row.key}`}
-            className="mb-1 block text-[11px] text-faint"
+            className="mb-1 block text-caption text-faint"
           >
             说明 description
           </label>

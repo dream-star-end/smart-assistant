@@ -71,9 +71,9 @@ export function HostCard({
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
               <span className="truncate font-semibold text-fg">{h.name}</span>
-              {isSelf && <span className="shrink-0 text-[11px] text-faint">(master)</span>}
+              {isSelf && <span className="shrink-0 text-caption text-faint">(master)</span>}
             </div>
-            <p className="mt-0.5 truncate font-mono text-[11.5px] text-faint">
+            <p className="mt-0.5 truncate font-mono text-caption text-faint">
               {h.host}:{h.ssh_port}
               {h.agent_port && h.agent_port !== 9443 ? ` · agent ${h.agent_port}` : ''}
             </p>
@@ -130,28 +130,28 @@ export function HostCard({
             type="button"
             title="查看该 host 上的容器"
             onClick={() => onOpenContainers(h.id)}
-            className="text-[12.5px] tabular-nums text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+            className="text-meta tabular-nums text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
           >
             slots {h.active_containers | 0} / {h.max_containers | 0}
           </button>
           <span
-            className="text-[12px] text-faint tabular-nums"
+            className="text-meta text-faint tabular-nums"
             title="过去 5 分钟 /v1/messages 请求数"
           >
             {h.req_5m | 0} req/5m
           </span>
-          <span className="text-[12px] text-faint tabular-nums" title={load.label}>
+          <span className="text-meta text-faint tabular-nums" title={load.label}>
             {(h.cpu_count ?? 0) || '—'} cpu
           </span>
           {stale && (
-            <span className="text-[11px] text-warning" title="metrics 超过 10 分钟未刷新">
+            <span className="text-caption text-warning" title="metrics 超过 10 分钟未刷新">
               metrics stale
             </span>
           )}
         </div>
 
         {/* 到期 / 健康 / bootstrap chips */}
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-border pt-3 text-[12px]">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-border pt-3 text-meta">
           <div className="flex items-center gap-1.5">
             <span className="text-faint">cert</span>
             {cert ? (
@@ -195,7 +195,7 @@ export function HostCard({
             )}
             {(okN > 0 || failN > 0) && (
               <span
-                className="text-[11px] text-faint tabular-nums"
+                className="text-caption text-faint tabular-nums"
                 title="连续 OK / 连续 FAIL（各 3 次切换状态）"
               >
                 {okN}/{failN}

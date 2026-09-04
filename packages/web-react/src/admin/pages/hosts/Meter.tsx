@@ -37,7 +37,7 @@ export function Meter({
   const pct = has ? Math.max(0, Math.min(100, (value / max) * 100)) : 0
   return (
     <div className={cn('min-w-0', className)}>
-      <div className="mb-1 flex items-baseline justify-between gap-2 text-[12px]">
+      <div className="mb-1 flex items-baseline justify-between gap-2 text-meta">
         <span className="truncate text-faint">{label}</span>
         <span className="shrink-0 font-medium tabular-nums text-fg">
           {has ? (display ?? `${value}%`) : '—'}

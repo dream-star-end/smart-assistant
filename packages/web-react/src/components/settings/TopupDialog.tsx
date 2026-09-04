@@ -164,7 +164,7 @@ export function TopupDialog({
     <Modal open={open} onOpenChange={(o) => !o && onClose()} title={title} className="max-w-md">
       <div>
         {err && (
-          <Alert tone="warning" className="mb-3 text-[12.5px]">
+          <Alert tone="warning" className="mb-3 text-meta">
             {err}
           </Alert>
         )}
@@ -172,12 +172,12 @@ export function TopupDialog({
         {stage.kind === "plans" && (
           <div className="flex flex-col gap-2">
             {loadingPlans && (
-              <div className="flex items-center justify-center gap-2 py-8 text-[13px] text-faint">
+              <div className="flex items-center justify-center gap-2 py-8 text-body text-faint">
                 <Spinner /> 加载套餐…
               </div>
             )}
             {!loadingPlans && plans && plans.length === 0 && (
-              <p className="py-8 text-center text-[13px] text-faint">暂无可用充值方案。</p>
+              <p className="py-8 text-center text-body text-faint">暂无可用充值方案。</p>
             )}
             {!loadingPlans &&
               plans?.map((p) => {
@@ -192,14 +192,14 @@ export function TopupDialog({
                     )}
                   >
                     <span className="min-w-0">
-                      <span className="block truncate text-[14px] font-medium text-fg">
+                      <span className="block truncate text-title font-medium text-fg">
                         {p.label}
                       </span>
-                      <span className="block text-[12px] text-faint">
+                      <span className="block text-meta text-faint">
                         到账 {formatCredits(p.credits)} 积分
                       </span>
                     </span>
-                    <span className="flex shrink-0 items-center gap-1 text-[15px] font-semibold text-accent">
+                    <span className="flex shrink-0 items-center gap-1 text-title font-semibold text-accent">
                       {busy ? <Loader2 size={15} className="animate-spin" /> : null}
                       {formatCentsYuan(p.amountCents)}
                     </span>
@@ -215,7 +215,7 @@ export function TopupDialog({
               <div className="text-[20px] font-semibold text-fg">
                 {formatCentsYuan(stage.order.amountCents)}
               </div>
-              <div className="text-[12.5px] text-faint">
+              <div className="text-meta text-faint">
                 到账 {formatCredits(stage.order.credits)} 积分
               </div>
             </div>
@@ -235,10 +235,10 @@ export function TopupDialog({
             <span className="flex size-12 items-center justify-center rounded-full bg-success-soft text-success">
               <Check size={26} />
             </span>
-            <div className="text-[15px] font-semibold text-fg">
+            <div className="text-title font-semibold text-fg">
               已到账 {formatCredits(stage.credits)} 积分
             </div>
-            <p className="text-[12.5px] text-faint">余额已更新，感谢你的支持。</p>
+            <p className="text-meta text-faint">余额已更新，感谢你的支持。</p>
             <Button variant="primary" size="sm" onClick={onClose} className="mt-1">
               完成
             </Button>

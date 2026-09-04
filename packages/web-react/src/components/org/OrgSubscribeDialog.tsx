@@ -136,7 +136,7 @@ export function OrgSubscribeDialog({
         {phase.kind === "form" && (
           <div className="flex flex-col gap-3">
             {err && (
-              <Alert tone="warning" className="text-[12.5px]">
+              <Alert tone="warning" className="text-meta">
                 {err}
               </Alert>
             )}
@@ -144,7 +144,7 @@ export function OrgSubscribeDialog({
             {mode === "subscribe" ? (
               <>
                 {plans.length === 0 ? (
-                  <p className="py-8 text-center text-[13px] text-faint">暂无可用企业套餐。</p>
+                  <p className="py-8 text-center text-body text-faint">暂无可用企业套餐。</p>
                 ) : (
                   <div className="flex flex-col gap-2">
                     {plans.map((p) => {
@@ -168,19 +168,19 @@ export function OrgSubscribeDialog({
                         >
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
-                              <span className="text-[14px] font-semibold text-fg">{p.name}</span>
+                              <span className="text-title font-semibold text-fg">{p.name}</span>
                               {isCurrent && (
-                                <span className="rounded-full bg-accent px-1.5 py-0.5 text-[10px] font-medium text-white">
+                                <span className="rounded-full bg-accent px-1.5 py-0.5 text-micro font-medium text-white">
                                   当前
                                 </span>
                               )}
                             </div>
-                            <div className="mt-0.5 text-[12px] text-faint">
+                            <div className="mt-0.5 text-meta text-faint">
                               {formatCentsYuan(p.seatPriceCents)}/席·月 · 每席{" "}
                               {formatCredits(p.perSeatCredits)} 积分
                             </div>
                           </div>
-                          <span className="shrink-0 text-[11.5px] text-faint">
+                          <span className="shrink-0 text-caption text-faint">
                             最低 {p.minSeats} 席
                           </span>
                         </button>
@@ -199,7 +199,7 @@ export function OrgSubscribeDialog({
             ) : (
               <>
                 {currentSub && plan ? (
-                  <div className="rounded-xl border border-border bg-bg px-4 py-3 text-[12.5px]">
+                  <div className="rounded-xl border border-border bg-bg px-4 py-3 text-meta">
                     <div className="flex items-center justify-between">
                       <span className="text-muted">当前套餐</span>
                       <span className="font-medium text-fg">{plan.name}</span>
@@ -210,7 +210,7 @@ export function OrgSubscribeDialog({
                     </div>
                   </div>
                 ) : (
-                  <Alert tone="warning" className="text-[12.5px]">
+                  <Alert tone="warning" className="text-meta">
                     未找到当前订阅信息,无法加席。请先订阅企业套餐。
                   </Alert>
                 )}
@@ -228,13 +228,13 @@ export function OrgSubscribeDialog({
 
             {plan && priced && seatsValid && (
               <div className="rounded-xl border border-border bg-bg px-4 py-3">
-                <div className="flex items-center justify-between text-[13px]">
+                <div className="flex items-center justify-between text-body">
                   <span className="text-muted">应付合计</span>
                   <span className="text-[16px] font-semibold text-fg">
                     {formatCentsYuan(priced.totalCents)}
                   </span>
                 </div>
-                <div className="mt-1 text-[12px] text-faint">
+                <div className="mt-1 text-meta text-faint">
                   {mode === "subscribe"
                     ? `${seats} 席 × ${formatCentsYuan(plan.seatPriceCents)}/月 · 入池 ${formatCredits(priced.totalCredits)} 积分`
                     : `+${seats - currentSeats} 席 × ${formatCentsYuan(plan.seatPriceCents)} · 入池 ${formatCredits(priced.totalCredits)} 积分`}

@@ -231,15 +231,15 @@ function GroupCard({
         />
       </div>
       <div>
-        <p className="mb-1.5 text-[12px] font-medium text-faint">
+        <p className="mb-1.5 text-meta font-medium text-faint">
           模型路由边界{g.models.length > 0 ? `(${g.models.length})` : ""}
         </p>
         {g.models.length === 0 ? (
-          <span className="text-[12px] text-faint">不限定精确模型</span>
+          <span className="text-meta text-faint">不限定精确模型</span>
         ) : (
           <div className="flex flex-wrap gap-1.5">
             {g.models.map((m) => (
-              <span key={m} className="rounded-md bg-hover px-2 py-0.5 font-mono text-[11.5px] text-muted">
+              <span key={m} className="rounded-md bg-hover px-2 py-0.5 font-mono text-caption text-muted">
                 {m}
               </span>
             ))}

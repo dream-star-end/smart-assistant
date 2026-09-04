@@ -125,7 +125,6 @@ function codemodFile(src, stats, relPath) {
   const edits = [];
   for (const [start, end] of regions) {
     const text = src.slice(start, end);
-    let replacedInRegion = 0;
     ARBITRARY.lastIndex = 0;
     let m;
     const regionEdits = [];

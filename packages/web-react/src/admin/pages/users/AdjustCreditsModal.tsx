@@ -94,7 +94,7 @@ export function AdjustCreditsModal({
     >
       <div className="flex flex-col gap-4">
         <div className="flex flex-col gap-1.5">
-          <label className="text-[12.5px] font-medium text-muted" htmlFor="adj-amount">
+          <label className="text-meta font-medium text-muted" htmlFor="adj-amount">
             金额（¥，支持两位小数；正数加、负数扣）
           </label>
           <Input
@@ -113,7 +113,7 @@ export function AdjustCreditsModal({
           <p className={`text-[12px] tabular-nums ${previewTone}`}>{preview}</p>
         </div>
         <div className="flex flex-col gap-1.5">
-          <label className="text-[12.5px] font-medium text-muted" htmlFor="adj-memo">
+          <label className="text-meta font-medium text-muted" htmlFor="adj-memo">
             备注（必填）
           </label>
           <Input

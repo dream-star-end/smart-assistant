@@ -380,7 +380,7 @@ function ExactTapeRecordDisclosure({
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        className="text-[11px] text-faint hover:text-muted"
+        className="text-caption text-faint hover:text-muted"
       >
         {open ? `收起原始${label}记录` : `查看原始${label}记录`}
       </button>
@@ -393,7 +393,7 @@ function ExactTapeRecordDisclosure({
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted hover:text-fg"
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
             >
               继续显示原始记录
             </button>
@@ -424,11 +424,11 @@ function RuntimeEventCard({ message }: { message: ChatMessage }) {
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-[12.5px] hover:bg-hover"
+        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-meta hover:bg-hover"
       >
         <span className="size-1.5 shrink-0 rounded-full bg-faint" />
         <span className="min-w-0 flex-1 truncate text-muted">{label}</span>
-        {message._runtimeSource && <span className="shrink-0 text-[11px] text-faint">{message._runtimeSource}</span>}
+        {message._runtimeSource && <span className="shrink-0 text-caption text-faint">{message._runtimeSource}</span>}
         <span className="text-faint">{open ? "收起" : "查看原始记录"}</span>
       </button>
       {open && (
@@ -440,7 +440,7 @@ function RuntimeEventCard({ message }: { message: ChatMessage }) {
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted hover:text-fg"
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
             >
               继续显示原始记录
             </button>
@@ -1749,7 +1749,7 @@ export function MessageList({
       return (
         <MessageBoundary messageId={rowId} sig={`corrupt-row|${rowId}`}>
           <div
-            className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-[12.5px] text-muted"
+            className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-meta text-muted"
             data-testid="corrupt-message-placeholder"
           >
             此条消息数据结构异常，已跳过渲染

@@ -90,7 +90,7 @@ export function OutboxTab({ events }: { events: EventMeta[] }) {
     {
       key: "event_type",
       title: "事件",
-      render: (r) => <span className="font-mono text-[12.5px]">{r.event_type}</span>,
+      render: (r) => <span className="font-mono text-meta">{r.event_type}</span>,
     },
     {
       key: "severity",
@@ -102,7 +102,7 @@ export function OutboxTab({ events }: { events: EventMeta[] }) {
       key: "channel_id",
       title: "通道",
       width: 72,
-      render: (r) => <span className="font-mono text-[12px] text-faint">{r.channel_id ?? "—"}</span>,
+      render: (r) => <span className="font-mono text-meta text-faint">{r.channel_id ?? "—"}</span>,
     },
     {
       key: "status",
@@ -154,7 +154,7 @@ export function OutboxTab({ events }: { events: EventMeta[] }) {
       </FilterBar>
 
       {error && (
-        <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-[13px] text-danger">
+        <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-body text-danger">
           加载投递历史失败: {errText(error)}
         </div>
       )}

@@ -113,7 +113,7 @@ export default function ContainersPage() {
       danger: action !== 'restart',
       confirmText: ACTION_LABEL[action],
       body: (
-        <div className="space-y-1.5 text-[13px] text-muted">
+        <div className="space-y-1.5 text-body text-muted">
           <p>
             对象：<span className="font-medium text-fg">{label}</span>
           </p>
@@ -133,7 +133,7 @@ export default function ContainersPage() {
         danger: true,
         confirmText: '确认删除',
         body: (
-          <p className="text-[13px] text-muted">
+          <p className="text-body text-muted">
             该操作不可撤销。确认删除容器 <span className="font-medium text-fg">#{c.id}</span>？
           </p>
         ),
@@ -176,7 +176,7 @@ export default function ContainersPage() {
             <div className="flex items-center gap-1.5">
               <span className="truncate text-fg">{c.user_email || `#${c.user_id}`}</span>
               {c.user_email && (
-                <span className="shrink-0 font-mono text-[11px] text-faint">#{c.user_id}</span>
+                <span className="shrink-0 font-mono text-caption text-faint">#{c.user_id}</span>
               )}
             </div>
             {(c.last_error || expiry) && (
@@ -211,7 +211,7 @@ export default function ContainersPage() {
       title: '镜像',
       render: (c) => (
         <Tooltip content={c.image || ''}>
-          <span className="font-mono text-[12px] text-muted">{imageTag(c.image)}</span>
+          <span className="font-mono text-meta text-muted">{imageTag(c.image)}</span>
         </Tooltip>
       ),
     },
@@ -221,7 +221,7 @@ export default function ContainersPage() {
       render: (c) => {
         const ref =
           c.row_kind === 'v2' ? c.docker_name || '—' : (c.docker_id || '').slice(0, 12) || '—'
-        return <span className="font-mono text-[12px] text-muted">{ref}</span>
+        return <span className="font-mono text-meta text-muted">{ref}</span>
       },
     },
     {
@@ -233,7 +233,7 @@ export default function ContainersPage() {
             type="button"
             title={`查看虚机 ${c.host_uuid}`}
             onClick={() => navigate('hosts', { focus_uuid: c.host_uuid ?? '' })}
-            className="max-w-[9rem] truncate font-mono text-[12px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+            className="max-w-[9rem] truncate font-mono text-meta text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
           >
             {c.host_name || c.host_uuid.slice(0, 8)}
           </button>
@@ -399,14 +399,14 @@ export default function ContainersPage() {
         </FilterBar>
 
         {hostFilter && (
-          <div className="flex items-center gap-2 text-[12px] text-faint">
+          <div className="flex items-center gap-2 text-meta text-faint">
             <span>虚机过滤：</span>
             <CopyChip value={hostFilter} />
           </div>
         )}
 
         {list.error ? (
-          <p className="px-1 py-8 text-center text-[13px] text-danger">
+          <p className="px-1 py-8 text-center text-body text-danger">
             加载失败：{apiErrorMessage(list.error, '加载失败')}
           </p>
         ) : (
@@ -456,7 +456,7 @@ function StatusDonut({ stats, loading }: { stats: ContainerStats | null; loading
           <Spinner size={20} className="text-muted" />
         </div>
       ) : present.length === 0 ? (
-        <div className="flex h-full items-center justify-center text-[13px] text-faint">无容器</div>
+        <div className="flex h-full items-center justify-center text-body text-faint">无容器</div>
       ) : (
         <canvas ref={canvasRef} />
       )}
@@ -489,7 +489,7 @@ function ImageDistCard({ rows, loading }: { rows: ContainerRow[]; loading: boole
           <Spinner size={20} className="text-muted" />
         </div>
       ) : dist.length === 0 ? (
-        <div className="flex h-full items-center justify-center text-[13px] text-faint">无数据</div>
+        <div className="flex h-full items-center justify-center text-body text-faint">无数据</div>
       ) : (
         <canvas ref={canvasRef} />
       )}

@@ -188,7 +188,7 @@ export default function AccountsPage() {
   );
 
   const columns: Column<AccountRow>[] = [
-    { key: "id", title: "id", width: 60, render: (a) => <span className="font-mono text-[12px]">{a.id}</span> },
+    { key: "id", title: "id", width: 60, render: (a) => <span className="font-mono text-meta">{a.id}</span> },
     {
       key: "label",
       title: "label",
@@ -204,19 +204,19 @@ export default function AccountsPage() {
     { key: "health", title: "health", align: "right", cellClassName: "tabular-nums", render: (a) => a.health_score ?? "—" },
     { key: "today", title: "今日 / 错误率", align: "right", render: (a) => <TodayCell a={a} /> },
     { key: "lifetime", title: "累计 ok/fail", align: "right", render: (a) => <LifetimeCell a={a} /> },
-    { key: "oauth_exp", title: "OAuth 到期", width: 140, render: (a) => <span className="font-mono text-[12px]">{fmtDateTime(a.oauth_expires_at)}</span> },
+    { key: "oauth_exp", title: "OAuth 到期", width: 140, render: (a) => <span className="font-mono text-meta">{fmtDateTime(a.oauth_expires_at)}</span> },
     {
       key: "sub_end",
       title: "订阅到期",
       width: 140,
       render: (a) =>
         a.subscription_end_at ? (
-          <span className="font-mono text-[12px]">{fmtDateTime(a.subscription_end_at)}</span>
+          <span className="font-mono text-meta">{fmtDateTime(a.subscription_end_at)}</span>
         ) : (
           <span className="text-faint">—</span>
         ),
     },
-    { key: "group", title: "分组", width: 70, render: (a) => (a.group_id ? <span className="font-mono text-[12px]">#{a.group_id}</span> : <span className="text-faint">—</span>) },
+    { key: "group", title: "分组", width: 70, render: (a) => (a.group_id ? <span className="font-mono text-meta">#{a.group_id}</span> : <span className="text-faint">—</span>) },
     { key: "cursor_pool", title: "Cursor 池", width: 120, render: (a) => <CursorPoolCell a={a} /> },
     // 0262 — Cursor 段专用:Sand(Grok Bot)池已用 % / 周重置 / 套餐与账期 / 用量刷新时间。
     // CCB 段专用:Anthropic 5h/7d 滚动配额。两组列语义不同,按 provider 段切换(见 sectionColumns)。
@@ -234,7 +234,7 @@ export default function AccountsPage() {
       key: "egress",
       title: "egress",
       render: (a) => (
-        <span className="max-w-[10rem] truncate text-[12px]" title={a.egress_proxy_pool_label || ""}>
+        <span className="max-w-[10rem] truncate text-meta" title={a.egress_proxy_pool_label || ""}>
           {a.egress_proxy_pool_label || "—"}
         </span>
       ),
@@ -404,8 +404,8 @@ export default function AccountsPage() {
               <section key={section.id} className="flex flex-col gap-3">
                 <div className="flex items-end justify-between gap-3">
                   <div>
-                    <h2 className="text-[15px] font-semibold text-fg">{section.title}</h2>
-                    <p className="text-[12px] text-muted">{section.desc} · {sectionRows.length} 条</p>
+                    <h2 className="text-title font-semibold text-fg">{section.title}</h2>
+                    <p className="text-meta text-muted">{section.desc} · {sectionRows.length} 条</p>
                   </div>
                 </div>
                 <DataTable

@@ -65,8 +65,8 @@ export function CreateChannelWizard({
                 <o.icon size={18} />
               </span>
               <span className="min-w-0">
-                <span className="block text-[13.5px] font-medium text-fg">{o.label}</span>
-                <span className="block text-[12px] text-faint">{o.desc}</span>
+                <span className="block text-section font-medium text-fg">{o.label}</span>
+                <span className="block text-meta text-faint">{o.desc}</span>
               </span>
             </button>
           ))}
@@ -78,7 +78,7 @@ export function CreateChannelWizard({
           <button
             type="button"
             onClick={() => setType(null)}
-            className="inline-flex w-fit items-center gap-1 text-[12.5px] text-muted outline-none hover:text-fg focus-visible:underline"
+            className="inline-flex w-fit items-center gap-1 text-meta text-muted outline-none hover:text-fg focus-visible:underline"
           >
             <ArrowLeft size={13} /> 换一种通道类型
           </button>
@@ -322,12 +322,12 @@ function IlinkBindFlow({ onConfirmed }: { onConfirmed: () => void }) {
         用<strong>已注册该机器人的微信</strong>扫码,确认后请再向机器人发任意一句话以捕获 context_token。
       </p>
       {phase === "loading" && (
-        <div className="flex items-center gap-2 py-8 text-[13px] text-faint">
+        <div className="flex items-center gap-2 py-8 text-body text-faint">
           <Spinner size={15} /> 正在向 iLink 申请二维码…
         </div>
       )}
       {phase === "error" && (
-        <div className="w-full rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-[12.5px] text-danger">
+        <div className="w-full rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-meta text-danger">
           {errMsg}
         </div>
       )}
@@ -338,11 +338,11 @@ function IlinkBindFlow({ onConfirmed }: { onConfirmed: () => void }) {
               <img src={imgSrc} alt="iLink 绑定二维码" width={220} height={220} className="size-[220px] object-contain" />
             </div>
           ) : (
-            <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-[12.5px] text-danger">
+            <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-meta text-danger">
               iLink 没返回可渲染的二维码内容
             </div>
           )}
-          <p className="text-[12px] text-faint">{statusText}</p>
+          <p className="text-meta text-faint">{statusText}</p>
         </>
       )}
     </div>

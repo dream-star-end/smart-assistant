@@ -621,7 +621,7 @@ export function SignedFileCard({ src, filename }: { src?: string; filename?: str
       <FileText size={16} />
     </span>
   );
-  const nameLabel = <span className="min-w-0 flex-1 truncate text-[13px] text-fg">{name}</span>;
+  const nameLabel = <span className="min-w-0 flex-1 truncate text-body text-fg">{name}</span>;
 
   // 未签名(容器冷启)：占位，不可点。
   if (!resolved) {
@@ -665,7 +665,7 @@ export function SignedFileCard({ src, filename }: { src?: string; filename?: str
               style={pct != null ? { width: `${pct}%` } : undefined}
             />
           </span>
-          <span className="shrink-0 text-[11px] tabular-nums text-muted">
+          <span className="shrink-0 text-caption tabular-nums text-muted">
             {pct != null ? `${pct}%` : formatBytes(state.loaded)}
           </span>
         </span>
@@ -683,7 +683,7 @@ export function SignedFileCard({ src, filename }: { src?: string; filename?: str
           </span>
           {nameLabel}
         </span>
-        <span className="flex items-center gap-3 pl-[42px] text-[12px]">
+        <span className="flex items-center gap-3 pl-[42px] text-meta">
           <span className="text-danger">下载失败</span>
           <button
             type="button"
