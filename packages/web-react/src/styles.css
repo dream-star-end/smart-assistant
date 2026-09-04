@@ -67,8 +67,13 @@
   --text-meta--line-height: 1.5;
   --text-caption: 11px;
   --text-caption--line-height: 1.45;
-  /* 受限档:仅角标/序号等确无空间处。新代码不得新增,存量逐步并入 caption。 */
-  --text-micro: 10.5px;
+  /* 受限档:仅角标/序号等确无空间处。10px 与 10.5px 的存量任意值统一收编到本档
+     (半像素差异不构成层次,只会制造不一致);新代码仍不得新增,优先用 caption。
+     ⚠️ 刻意不定义 --text-lg:16px —— Tailwind v4 默认主题的 text-lg(18px)已有 11 处
+     真实标题用法(admin PageHeader / MediaTaskCenter / MissionReplay / MemoryPanel),
+     在这里覆盖成 16px 会把这些页面标题全部悄悄缩小。text-[16px] 存量保持任意值,
+     待单独定名(如 --text-lead)后再收敛。 */
+  --text-micro: 10px;
   --text-micro--line-height: 1.4;
 
   --radius-xl2: 28px;
