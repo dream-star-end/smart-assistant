@@ -15,6 +15,7 @@ SURVIVOR_MASTER_URL="${SURVIVOR_MASTER_URL:-http://127.0.0.1:18790/healthz}"
 SURVIVOR_EGRESS_URL="${SURVIVOR_EGRESS_URL:-http://172.31.0.1:18892/internal/v5/egress-health}"
 SURVIVOR_MASTER_UNIT="${SURVIVOR_MASTER_UNIT:-openclaude-v5-selfhost.service}"
 SURVIVOR_EGRESS_UNIT="${SURVIVOR_EGRESS_UNIT:-openclaude-v5-selfhost-egress.service}"
+SURVIVOR_EGRESS_SLOT_TPL="${SURVIVOR_EGRESS_SLOT_TPL:-openclaude-v5-selfhost-egress@.service}"
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) survivor: $*"; }
 
@@ -111,8 +112,13 @@ compound_health_green() {
   local st
   st="$(systemctl is-active "$SURVIVOR_MASTER_UNIT" 2>/dev/null || true)"
   [[ "$st" == "active" ]] || return 1
+  # egress:legacy 单 unit 或 双槽 egress@A/@B 任一 active(2026-09-05 蓝绿)。
   st="$(systemctl is-active "$SURVIVOR_EGRESS_UNIT" 2>/dev/null || true)"
-  [[ "$st" == "active" ]] || return 1
+  if [[ "$st" != "active" ]]; then
+    st="$(systemctl is-active "${SURVIVOR_EGRESS_SLOT_TPL/@./@A.}" 2>/dev/null || true)"
+    [[ "$st" == "active" ]] || st="$(systemctl is-active "${SURVIVOR_EGRESS_SLOT_TPL/@./@B.}" 2>/dev/null || true)"
+    [[ "$st" == "active" ]] || return 1
+  fi
   command -v curl >/dev/null 2>&1 || return 1
   command -v jq >/dev/null 2>&1 || return 1
   local hz eg

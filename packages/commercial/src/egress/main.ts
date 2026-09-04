@@ -12,6 +12,9 @@
  *
  * 部署语义:deploy-v5.sh 默认只重启 master;egress 只在其相关代码变更时显式重启
  * (--egress),重启前 SIGTERM 走 drain(停接新连接,在飞流最多等 EGRESS_DRAIN_MS)。
+ * selfhost(deploy-v5-selfhost.sh)自 2026-09-05 起走蓝绿双槽:egress@A/egress@B 两个
+ * systemd 模板 unit 共享同一个 SO_REUSEPORT socket(见 listenPlan.ts),发布 = 起空闲槽 →
+ * 私有健康口就绪 → stop 旧槽(旧槽只 drain 自己的在飞流,共享口始终有人 accept)。
  * master 重启期间:/v1/messages 完全无感;转发路径 503 transient(容器侧调用方
  * 均按 transient 重试);cost 持久化回执先 fsync 到本地 outbox,无 TTL 重试到 ACK。
  *
@@ -72,6 +75,7 @@ import { V3_AGENT_GID, V3_AGENT_UID } from "../agent-sandbox/constants.js";
 import { CostEventSink } from "./costEventSink.js";
 import { makeForwarder } from "./forwarder.js";
 import { shutdownDurableMetricRollups } from "../admin/durableMetricRollups.js";
+import { computeListenPlan, type SlotHealthBody } from "./listenPlan.js";
 
 const log = rootLogger.child({ subsys: "egressMain" });
 
@@ -83,6 +87,10 @@ export async function startEgress(): Promise<void> {
   // D3④:进程实例标识 —— 优先 systemd invocation id(每次 (re)start 变化),否则随机
   // UUID。finalize 门槛用它区分"队列自然排空"与"egress 中途重启计数归零假绿"。
   const processStartId = process.env.INVOCATION_ID ?? randomUUID();
+  // 蓝绿双槽:sd_listen_fds 传入的共享 SO_REUSEPORT socket + 每槽私有健康口。
+  // 在任何 await 之前算好(LISTEN_* 是 systemd 在 exec 时注入的,越早读越不会被子进程搅)。
+  const listenPlan = computeListenPlan(process.env, process.pid);
+  const slot = listenPlan.slot;
   // 出口拓扑与拆分前的 master 完全对齐(packages/cli gateway.ts 同款):
   // 有 HTTP(S)_PROXY env(日本 sing-box 节点)→ 装全局 EnvHttpProxyAgent,给
   // Anthropic/OpenAI 等出海上游用;国内静态 provider(ark glm/deepseek/minimax)
@@ -410,6 +418,8 @@ export async function startEgress(): Promise<void> {
         JSON.stringify({
           ok: true,
           role: "egress",
+          slot,
+          listenMode: listenPlan.mode,
           processStartId,
           ...costSink.healthCounters(),
           capabilities: [...EGRESS_CAPABILITIES],
@@ -432,16 +442,68 @@ export async function startEgress(): Promise<void> {
   server.requestTimeout = 0;
   server.headersTimeout = 60_000;
 
+  // 共享口:sd_activation 时接管 systemd 传入的 SO_REUSEPORT fd(与另一个槽同组),
+  // 否则自 bind(legacy 单 unit / 开发)。注意 systemd 的 socket 已 listen(),node 只是
+  // 在它上面 accept;backlog 由 unit 的 Backlog= 决定。
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, bind, () => {
+    const onListening = () => {
       server.removeListener("error", reject);
       resolve();
-    });
+    };
+    if (listenPlan.mode === "sd_activation") {
+      server.listen({ fd: listenPlan.fd! }, onListening);
+    } else {
+      server.listen(port, bind, onListening);
+    }
   });
-  log.info("egress_listening", { bind, port, control: controlBaseUrl });
+  log.info("egress_listening", {
+    bind,
+    port,
+    control: controlBaseUrl,
+    slot,
+    listenMode: listenPlan.mode,
+  });
   // eslint-disable-next-line no-console
-  console.log(`[egress] listening on ${bind}:${port} → control ${controlBaseUrl}`);
+  console.log(
+    `[egress] listening on ${bind}:${port} (${listenPlan.mode}${slot ? `, slot ${slot}` : ""}) → control ${controlBaseUrl}`,
+  );
+
+  // 私有健康口(仅有槽时):部署脚本靠它判定「本槽已接管共享口」。只答 GET,不转发。
+  // 必须在共享口 listen 成功**之后**才起,否则脚本会把「进程活着但还没接管」误判就绪。
+  let slotHealthServer: ReturnType<typeof createHttpServer> | null = null;
+  if (slot && listenPlan.privatePort) {
+    const body: SlotHealthBody = {
+      ok: true,
+      role: "egress",
+      slot,
+      listenMode: listenPlan.mode,
+      processStartId,
+      pid: process.pid,
+    };
+    slotHealthServer = createHttpServer((req, res) => {
+      const p = (req.url ?? "/").split("?")[0];
+      if (req.method === "GET" && (p === "/internal/v5/egress-slot-health" || p === "/healthz")) {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ ...body, inflight: snapshotInflight().total_current }));
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    const shs = slotHealthServer;
+    await new Promise<void>((resolve, reject) => {
+      shs.once("error", reject);
+      shs.listen(listenPlan.privatePort!, "127.0.0.1", () => {
+        shs.removeListener("error", reject);
+        resolve();
+      });
+    });
+    log.info("egress_slot_health_listening", { slot, port: listenPlan.privatePort });
+    // eslint-disable-next-line no-console
+    console.log(`[egress] slot ${slot} health on 127.0.0.1:${listenPlan.privatePort}`);
+  }
 
   let shuttingDown = false;
   const shutdown = () => {
@@ -450,8 +512,14 @@ export async function startEgress(): Promise<void> {
     latencyProber?.stop();
     recoveryProber?.stop();
     // eslint-disable-next-line no-console
-    console.log(`[egress] SIGTERM — draining in-flight streams (max ${EGRESS_DRAIN_MS}ms)…`);
+    console.log(
+      `[egress] SIGTERM — draining in-flight streams (max ${EGRESS_DRAIN_MS}ms)${slot ? ` slot ${slot}` : ""}…`,
+    );
+    // 私有健康口立刻关:部署脚本/watch 把「私有口不可连」当成本槽已退出接管。
+    try { slotHealthServer?.close(); } catch { /* */ }
     // close() 停接新连接,已建立连接(在飞流)自然完结;到 drain 上限强制退出。
+    // 双槽下 close() 只把本进程摘出 reuseport 组(tcp_migrate_req=1 时 accept 队列
+    // 里的半开连接迁到另一槽),另一槽继续接新连接 —— 这就是零停机的全部机制。
     server.close(() => {
       void (async () => {
         try { await costSink.flush(); } finally {

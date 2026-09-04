@@ -652,6 +652,19 @@ assert_unit_templates_live_wd() { # <dir-with-unit-files>
     [[ "$wd" == "$MASTER_LIVE_LINK" ]] \
       || die "unit 模板 $f WorkingDirectory='$wd' 必须等于 $MASTER_LIVE_LINK"
   done
+  # 双槽 egress 模板(可选,旧 release 没有):存在则同样必须钉 live WD,且 service 必须
+  # 直跑 node --import tsx(npx 会 fork,LISTEN_PID 不匹配 → fd 丢失 → 槽自 bind EADDRINUSE)。
+  f="${dir}/${V5_EGRESS_SLOT_SERVICE_TPL:-openclaude-v5-selfhost-egress@.service}"
+  if [[ -f "$f" ]]; then
+    [[ ! -L "$f" ]] || die "双槽 egress 模板不能是 symlink: $f"
+    wd="$(unit_template_working_directory "$f")"
+    [[ "$wd" == "$MASTER_LIVE_LINK" ]] \
+      || die "双槽 egress 模板 $f WorkingDirectory='$wd' 必须等于 $MASTER_LIVE_LINK"
+    grep -Eq '^ExecStart=/usr/bin/node --import tsx ' "$f" \
+      || die "双槽 egress 模板 $f ExecStart 必须是 /usr/bin/node --import tsx …(不可经 npx)"
+    [[ -f "${dir}/${V5_EGRESS_SLOT_SOCKET_TPL:-openclaude-v5-selfhost-egress@.socket}" ]] \
+      || die "有双槽 service 模板却缺 .socket 模板: $dir"
+  fi
 }
 
 assert_old_deploy_fail_closed() {
@@ -1001,6 +1014,16 @@ snapshot_cutover_units_from_release() { # <rel> <out-var>
   chmod 0700 -- "$snap" || return 1
   cp -a -- "$src_dir/${V5_UNIT}" "$snap/" || { rm -rf -- "$snap"; return 1; }
   cp -a -- "$src_dir/${V5_EGRESS_UNIT}" "$snap/" || { rm -rf -- "$snap"; return 1; }
+  # 双槽 egress 模板 + sysctl(候选自带才快照)。
+  local f
+  for f in "${V5_EGRESS_SLOT_SOCKET_TPL:-openclaude-v5-selfhost-egress@.socket}" \
+           "${V5_EGRESS_SLOT_SERVICE_TPL:-openclaude-v5-selfhost-egress@.service}" \
+           "${V5_EGRESS_SYSCTL_FILE:-99-openclaude-v5-selfhost-egress.sysctl.conf}"; do
+    if [[ -f "$src_dir/$f" && ! -L "$src_dir/$f" ]]; then
+      cp -a -- "$src_dir/$f" "$snap/" || { rm -rf -- "$snap"; return 1; }
+      fsync_path "$snap/$f" || { rm -rf -- "$snap"; return 1; }
+    fi
+  done
   assert_unit_templates_live_wd "$snap"
   fsync_path "$snap/${V5_UNIT}" || { rm -rf -- "$snap"; return 1; }
   fsync_path "$snap/${V5_EGRESS_UNIT}" || { rm -rf -- "$snap"; return 1; }
@@ -1045,6 +1068,14 @@ backup_installed_units_for_cutover() { # <out-var>
   mkdir -p -- "$dest" || return 1
   cp -a -- "/etc/systemd/system/${V5_UNIT}" "$dest/" || return 1
   cp -a -- "/etc/systemd/system/${V5_EGRESS_UNIT}" "$dest/" || return 1
+  # 双槽 egress 模板(已装才备;forensics 用,恢复脚本不依赖它们)。
+  local sf
+  for sf in "${V5_EGRESS_SLOT_SOCKET_TPL:-openclaude-v5-selfhost-egress@.socket}" \
+            "${V5_EGRESS_SLOT_SERVICE_TPL:-openclaude-v5-selfhost-egress@.service}"; do
+    if [[ -f "/etc/systemd/system/$sf" ]]; then
+      cp -a -- "/etc/systemd/system/$sf" "$dest/" || return 1
+    fi
+  done
   if [[ -n "${UNIT_DIR:-}" && -f "${UNIT_DIR}/${V5_UNIT}" ]]; then
     cp -a -- "${UNIT_DIR}/${V5_UNIT}" "$dest/repo-${V5_UNIT}" || return 1
     cp -a -- "${UNIT_DIR}/${V5_EGRESS_UNIT}" "$dest/repo-${V5_EGRESS_UNIT}" || return 1
