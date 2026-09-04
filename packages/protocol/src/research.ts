@@ -146,6 +146,8 @@ export const DocumentOutline = Type.Object({
   spanCount: Type.Integer(),
   /** 扫描件无文字层且未开 OCR 时,master 回 needs_ocr=true,不静默产空。 */
   needsOcr: Type.Optional(Type.Boolean()),
+  /** 课题 chat_projects.id。可选:旧客户端忽略未知字段不崩。 */
+  projectId: Type.Optional(Type.String()),
 })
 export type DocumentOutline = Static<typeof DocumentOutline>
 
@@ -171,6 +173,25 @@ export const QuoteHandle = Type.Object({
   score: Type.Optional(Type.Number()),
 })
 export type QuoteHandle = Static<typeof QuoteHandle>
+
+/** oc-litrag query 请求。docIds / projectId 均可选(flag 关时 proxy 仍要求 docIds)。 */
+export const LitragQueryRequest = Type.Object({
+  query: Type.String(),
+  docIds: Type.Optional(Type.Array(Type.String())),
+  projectId: Type.Optional(Type.String()),
+  topK: Type.Optional(Type.Integer()),
+})
+export type LitragQueryRequest = Static<typeof LitragQueryRequest>
+
+/** oc-litrag query 响应。truncated/docCount/projectId 仅课题范围路径出现。 */
+export const LitragQueryResult = Type.Object({
+  quotes: Type.Array(QuoteHandle),
+  missing: Type.Array(Type.String()),
+  truncated: Type.Optional(Type.Boolean()),
+  docCount: Type.Optional(Type.Integer()),
+  projectId: Type.Optional(Type.String()),
+})
+export type LitragQueryResult = Static<typeof LitragQueryResult>
 
 // ───────────────────────────────────────────────
 // 4) Claim 与证据 manifest

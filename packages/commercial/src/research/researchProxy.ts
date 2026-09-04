@@ -53,6 +53,7 @@ import type { FetchLike } from "./sources.js";
 import { type LitSourceName, searchMultiSource } from "./litSearch.js";
 import { type SnowballDirection, snowball } from "./snowball.js";
 import { formatRecord, verifyIdentifier, verifyIdentifiers } from "./cite.js";
+import { isResearchWorkspaceEnabled } from "./workspaceFlag.js";
 
 /** master-owned blob 暂存目录(ingest 输入字节;仅 master worker 读)。
  *  export:research/library.ts(用户会话向上传入库)与本 proxy 共用同一目录权威。 */
@@ -342,6 +343,16 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
         await handleLitragQuery(res, body, cfg, identity.userId, store, requestId);
         return;
       }
+      if (isResearchWorkspaceEnabled()) {
+        if (reqPath === `${RESEARCH_PREFIX}library/list`) {
+          await handleLibraryList(res, body, identity.userId, requestId);
+          return;
+        }
+        if (reqPath === `${RESEARCH_PREFIX}library/add`) {
+          await handleLibraryAdd(res, body, identity.userId, requestId);
+          return;
+        }
+      }
       if (reqPath === `${RESEARCH_PREFIX}cite/check`) {
         await handleCiteCheck(res, body, cfg, identity.userId, store, citeDeps, requestId);
         return;
@@ -536,6 +547,21 @@ async function handleIngest(
     return;
   }
   const filename = typeof body.filename === "string" ? body.filename : undefined;
+  let membershipProjectId: string | undefined;
+  if (isResearchWorkspaceEnabled()) {
+    const lib = await import("./library.js");
+    const raw = typeof body.projectId === "string" ? body.projectId.trim() : "";
+    try {
+      await lib.ensureDefaultResearchProject(String(userId));
+      membershipProjectId = await lib.resolveWorkspaceProjectId(String(userId), raw || undefined);
+    } catch (err) {
+      if (err instanceof lib.WorkspaceProjectError) {
+        sendErr(res, 400, "BAD_REQUEST", err.message, requestId);
+        return;
+      }
+      throw err;
+    }
+  }
   const outcome = await ingestBlob(
     { userId, blobId, filename, engine: cfg.config.ingest.engine },
     {
@@ -553,6 +579,12 @@ async function handleIngest(
       return;
     }
     sendErr(res, 400, "INGEST_FAILED", outcome.reason, requestId);
+    return;
+  }
+  if (membershipProjectId) {
+    const lib = await import("./library.js");
+    await lib.addMembership(String(userId), outcome.outline.docId, membershipProjectId);
+    sendJson(res, 200, { ...outcome.outline, projectId: membershipProjectId }, requestId);
     return;
   }
   sendJson(res, 200, outcome.outline, requestId);
@@ -596,20 +628,103 @@ async function handleLitragQuery(
   store: ResearchStoreDeps,
   requestId: string,
 ): Promise<void> {
-  const docIds = Array.isArray(body.docIds)
-    ? body.docIds.filter((x): x is string => typeof x === "string").slice(0, 50)
+  const explicitIds = Array.isArray(body.docIds)
+    ? body.docIds.filter((x): x is string => typeof x === "string")
     : [];
   const query = typeof body.query === "string" ? body.query.trim() : "";
-  if (!query || docIds.length === 0) {
+  if (!query) {
     sendErr(res, 400, "BAD_REQUEST", "query and docIds[] required", requestId);
     return;
   }
+
+  let docIds = explicitIds.slice(0, 50);
+  let truncated = false;
+  let projectId: string | undefined;
+  if (docIds.length === 0) {
+    if (!isResearchWorkspaceEnabled()) {
+      sendErr(res, 400, "BAD_REQUEST", "query and docIds[] required", requestId);
+      return;
+    }
+    const lib = await import("./library.js");
+    const raw = typeof body.projectId === "string" ? body.projectId.trim() : "";
+    try {
+      await lib.ensureDefaultResearchProject(String(userId));
+      projectId = await lib.resolveWorkspaceProjectId(String(userId), raw || undefined);
+    } catch (err) {
+      if (err instanceof lib.WorkspaceProjectError) {
+        sendErr(res, 400, "BAD_REQUEST", err.message, requestId);
+        return;
+      }
+      throw err;
+    }
+    const listed = await lib.listProjectDocIds(String(userId), projectId, 51);
+    truncated = listed.length > 50;
+    docIds = listed.slice(0, 50);
+    if (docIds.length === 0) {
+      sendJson(res, 200, { quotes: [], missing: [], truncated: false, docCount: 0, projectId }, requestId);
+      return;
+    }
+  }
+
   const topK = typeof body.topK === "number" && Number.isFinite(body.topK) ? body.topK : undefined;
   const result = await litragQuery(userId, docIds, query, { topK }, {
     getDocument: store.getDocument,
     semantic: buildLitragSemanticDeps(cfg),
   });
+  if (projectId) {
+    sendJson(res, 200, { ...result, truncated, docCount: docIds.length, projectId }, requestId);
+    return;
+  }
   sendJson(res, 200, result, requestId);
+}
+
+async function handleLibraryList(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  userId: number,
+  requestId: string,
+): Promise<void> {
+  const lib = await import("./library.js");
+  const raw = typeof body.projectId === "string" ? body.projectId.trim() : "";
+  try {
+    await lib.ensureDefaultResearchProject(String(userId));
+    const projectId = await lib.resolveWorkspaceProjectId(String(userId), raw || undefined);
+    const documents = await lib.listLibraryDocuments(String(userId), projectId);
+    sendJson(res, 200, { documents, projectId }, requestId);
+  } catch (err) {
+    if (err instanceof lib.WorkspaceProjectError) {
+      sendErr(res, 400, "BAD_REQUEST", err.message, requestId);
+      return;
+    }
+    throw err;
+  }
+}
+
+async function handleLibraryAdd(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  userId: number,
+  requestId: string,
+): Promise<void> {
+  const docId = typeof body.docId === "string" ? body.docId.trim() : "";
+  if (!docId) {
+    sendErr(res, 400, "BAD_REQUEST", "docId required", requestId);
+    return;
+  }
+  const lib = await import("./library.js");
+  const raw = typeof body.projectId === "string" ? body.projectId.trim() : "";
+  try {
+    await lib.ensureDefaultResearchProject(String(userId));
+    const projectId = await lib.resolveWorkspaceProjectId(String(userId), raw || undefined);
+    await lib.addMembership(String(userId), docId, projectId);
+    sendJson(res, 200, { ok: true, docId, projectId }, requestId);
+  } catch (err) {
+    if (err instanceof lib.WorkspaceProjectError) {
+      sendErr(res, 400, "BAD_REQUEST", err.message, requestId);
+      return;
+    }
+    throw err;
+  }
 }
 
 async function handleCiteCheck(

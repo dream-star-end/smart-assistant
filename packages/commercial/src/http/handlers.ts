@@ -2993,8 +2993,18 @@ export async function handleListResearchLibrary(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret);
-  const { listLibraryDocuments } = await import("../research/library.js");
-  const docs = await listLibraryDocuments(user.id);
+  const {
+    listLibraryDocuments,
+    ensureDefaultResearchProject,
+    libraryListProjectIdFromUrl,
+    isResearchWorkspaceEnabled,
+  } = await import("../research/library.js");
+  const workspaceOn = isResearchWorkspaceEnabled();
+  const projectId = libraryListProjectIdFromUrl(req.url, workspaceOn);
+  if (workspaceOn) {
+    await ensureDefaultResearchProject(user.id);
+  }
+  const docs = await listLibraryDocuments(user.id, projectId);
   sendJson(res, 200, { documents: docs });
 }
 

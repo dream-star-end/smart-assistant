@@ -716,6 +716,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/me/api-keys', handler: handleCreateMyApiKey },
     { method: 'DELETE', pathPrefix: '/api/me/api-keys/', handler: handleRevokeMyApiKey },
     // 用户文献库(research_documents 管理面):列表 / 上传入库(raw bytes) / 删单篇。
+    // GET 接受 ?projectId=(OC_RESEARCH_WORKSPACE 开时过滤;关时忽略)。
     // 详见 handlers.ts 对应 handler 注释;数据逻辑在 research/library.ts。
     { method: 'GET', path: '/api/me/research/library', handler: handleListResearchLibrary },
     { method: 'POST', path: '/api/me/research/library', handler: handleUploadResearchLibraryDoc },
