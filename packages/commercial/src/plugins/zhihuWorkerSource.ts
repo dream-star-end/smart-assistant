@@ -66,6 +66,7 @@ function emitStep(event) {
       if (event.ok === true || event.ok === false) payload.ok = event.ok;
       if (typeof event.ms === 'number' && Number.isFinite(event.ms)) payload.ms = Math.round(event.ms);
       if (typeof event.hits === 'number' && Number.isFinite(event.hits)) payload.hits = Math.round(event.hits);
+      if (typeof event.textLen === 'number' && Number.isFinite(event.textLen)) payload.textLen = Math.round(event.textLen);
       if (typeof event.candidateCount === 'number' && Number.isFinite(event.candidateCount)) payload.candidateCount = Math.round(event.candidateCount);
       if (typeof event.code === 'string') payload.code = String(event.code).slice(0, 64);
       if (typeof event.actionId === 'string') payload.actionId = String(event.actionId).slice(0, 64);
@@ -346,9 +347,10 @@ async function selfTokenFromPage(page) {
   return unique.length === 1 ? unique[0] : null;
 }
 async function gotoAuthenticated(page, url) {
+  let response = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
       break;
     } catch (error) {
       const retryable = /net::ERR_(?:EMPTY_RESPONSE|CONNECTION_RESET|CONNECTION_CLOSED|NETWORK_CHANGED|HTTP2_PROTOCOL_ERROR|NAME_NOT_RESOLVED)/.test(String(error));
@@ -358,6 +360,16 @@ async function gotoAuthenticated(page, url) {
   }
   await page.waitForTimeout(2500);
   await assertNoChallenge(page);
+  const status = response ? response.status() : 0;
+  let pathname = '';
+  try { pathname = new URL(page.url()).pathname; } catch {}
+  emitStep({
+    step: 'nav.response',
+    ok: status < 400,
+    code: 'http-' + status,
+    pathname,
+    textLen: (await bodyText(page)).length
+  });
   if (await isLoginVisible(page)) await writeTerminalAndExit({ event: 'failed', code: 'LOGIN_EXPIRED' });
 }
 async function ensureSelfToken(page) {
@@ -567,7 +579,8 @@ async function projectQuestion(page, expectedId) {
     reason: ok ? undefined : ((result && result.reason) || 'no-title'),
     pathname: result && result.pathname,
     hits: result && typeof result.hits === 'number' ? result.hits : 0,
-    candidateCount: result && typeof result.candidateCount === 'number' ? result.candidateCount : 0
+    candidateCount: result && typeof result.candidateCount === 'number' ? result.candidateCount : 0,
+    textLen: (await bodyText(page)).length
   });
   if (!ok) throw new Error('question');
   return result.data;
@@ -645,7 +658,8 @@ async function collectAnswers(page, questionId, limit) {
     ok: rows.length > 0,
     hits: rows.length,
     candidateCount,
-    pathname
+    pathname,
+    textLen: (await bodyText(page)).length
   });
   return rows;
 }

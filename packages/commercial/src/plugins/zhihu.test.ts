@@ -468,6 +468,9 @@ describe('official Zhihu Plugin', () => {
     assert.match(ZHIHU_WORKER_SOURCE, /id-mismatch/)
     assert.match(ZHIHU_WORKER_SOURCE, /no-title/)
     assert.match(ZHIHU_WORKER_SOURCE, /typeof event.hits === 'number'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /step: 'nav\.response'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /typeof event.textLen === 'number'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /code: 'http-' \+ status/)
   })
 
   test('filteredState keeps z_c0 from both .zhihu.com and www.zhihu.com', () => {
