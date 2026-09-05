@@ -42,15 +42,31 @@ export async function loadTrayIcon(
   return nativeImage.createEmpty()
 }
 
+export function tunnelStateLabel(state) {
+  switch (state) {
+    case 'connecting':
+      return '本地模式：连接中'
+    case 'registered':
+      return '本地模式：已连接'
+    case 'degraded':
+      return '本地模式：降级'
+    case 'offline':
+      return '本地模式：离线'
+    default:
+      return null
+  }
+}
+
 export function buildTrayMenuTemplate({
   windowVisible,
   closeToTray,
+  tunnelState,
   onShow,
   onHide,
   onToggleCloseToTray,
   onQuit,
 } = {}) {
-  return [
+  const items = [
     {
       label: windowVisible === true ? '隐藏主窗口' : '显示主窗口',
       click: windowVisible === true ? onHide : onShow,
@@ -63,12 +79,19 @@ export function buildTrayMenuTemplate({
         onToggleCloseToTray?.(menuItem?.checked === true)
       },
     },
+  ]
+  const status = tunnelStateLabel(tunnelState)
+  if (status) {
+    items.push({ type: 'separator' }, { label: status, enabled: false })
+  }
+  items.push(
     { type: 'separator' },
     {
       label: '退出',
       click: onQuit,
     },
-  ]
+  )
+  return items
 }
 
 export function createDesktopTray({
@@ -93,6 +116,7 @@ export function createDesktopTray({
         buildTrayMenuTemplate({
           windowVisible: state.windowVisible === true,
           closeToTray: state.closeToTray === true,
+          tunnelState: state.tunnelState,
           onShow,
           onHide,
           onToggleCloseToTray: (value) => {
@@ -103,6 +127,12 @@ export function createDesktopTray({
         }),
       ),
     )
+    if (typeof tray.setToolTip === 'function') {
+      const status = tunnelStateLabel(state.tunnelState)
+      const base = typeof tooltip === 'string' ? tooltip : ''
+      const next = status ? (base ? `${base} · ${status}` : status) : base
+      if (next) tray.setToolTip(next)
+    }
   }
   if (typeof tooltip === 'string' && tooltip.length > 0 && typeof tray.setToolTip === 'function') {
     tray.setToolTip(tooltip)

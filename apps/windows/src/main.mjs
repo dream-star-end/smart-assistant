@@ -60,6 +60,7 @@ import {
   createSafeStorageIdentityStore,
   resolveIdentityDirectory,
 } from './identity.mjs'
+import { createHostSupervisor, readDesktopHostConfigFromEnv } from './hostSupervisor.mjs'
 import {
   IPC_CHANNELS,
   createLocalHostIpcHandler,
@@ -165,6 +166,10 @@ let pendingDeepLinkTarget = null
 let localHostWindow = null
 let enrollmentController = null
 let localHostIpcHandler = null
+let appIdentityStore = null
+let hostSupervisor = null
+let tunnelState = 'offline'
+let hostStopStarted = false
 const liveNotifications = new Set()
 
 const viewerWindows = new Set()
@@ -2094,15 +2099,29 @@ function ensureLocalHostWindow() {
 
 function installEnrollment() {
   if (enrollmentController) return enrollmentController
+  if (!appIdentityStore) appIdentityStore = createAppIdentityStore()
   enrollmentController = createEnrollmentController({
     origin: PINNED_APP_ORIGIN,
-    identityStore: createAppIdentityStore(),
+    identityStore: appIdentityStore,
     openExternal: (targetUrl) => openExternal(targetUrl),
     publicName: os.hostname().slice(0, 128),
     audit: (event, fields) => {
       console.info('[windows]', event, fields ?? '')
     },
   })
+  const originalCallback = enrollmentController.handleCallback.bind(enrollmentController)
+  enrollmentController.handleCallback = async (parsed) => {
+    const result = await originalCallback(parsed)
+    if (result?.ok && appIdentityStore) {
+      try {
+        const rec = await appIdentityStore.load()
+        if (rec) await hostSupervisor?.sendEnrollResult(rec)
+      } catch (error) {
+        console.warn('[windows] host enroll-result failed:', error instanceof Error ? error.message : error)
+      }
+    }
+    return result
+  }
   localHostIpcHandler = createLocalHostIpcHandler({
     getLocalWebContents: () => (isAlive(localHostWindow) ? localHostWindow.webContents : null),
     enrollment: enrollmentController,
@@ -2176,6 +2195,7 @@ async function installDesktopTray() {
     getState: () => ({
       windowVisible: isAlive(mainWindow) && mainWindow.isVisible(),
       closeToTray: desktopSettingsStore?.closeToTray === true,
+      tunnelState,
     }),
     onShow: showMainWindow,
     onHide: hideMainWindow,
@@ -2250,6 +2270,7 @@ if (!hasSingleInstanceLock) {
       }
       await installDesktopTray()
       installEnrollment()
+      installLocalAgentHost()
       const launchDeepLink = findOpenClaudeUrlInArgv(process.argv)
       if (launchDeepLink) applyDeepLink(launchDeepLink)
       await ensureNormalMainWindow()
@@ -2265,10 +2286,43 @@ app.on('activate', () => {
   if (!smokeTest && !isAlive(mainWindow)) void ensureNormalMainWindow()
 })
 
-app.on('before-quit', () => {
+function installLocalAgentHost() {
+  if (smokeTest || hostSupervisor) return hostSupervisor
+  hostSupervisor = createHostSupervisor({
+    execPath: process.execPath,
+    env: process.env,
+    identityLoader: async () => {
+      try {
+        return (await appIdentityStore?.load()) ?? null
+      } catch {
+        return null
+      }
+    },
+    config: readDesktopHostConfigFromEnv(process.env),
+    onState: (state) => {
+      tunnelState = state
+      desktopTrayApi?.rebuild()
+    },
+    onError: (err) => {
+      console.warn('[windows] host error:', err?.code || '', err?.message || err)
+    },
+  })
+  void hostSupervisor.start().catch((error) => {
+    console.warn('[windows] host start failed:', error instanceof Error ? error.message : error)
+  })
+  return hostSupervisor
+}
+
+app.on('before-quit', (event) => {
   isQuitting = true
   if (isAlive(localHostWindow)) localHostWindow.destroy()
   void windowStateStore?.flush().catch(() => {})
+  if (smokeTest || hostStopStarted || !hostSupervisor) return
+  hostStopStarted = true
+  event.preventDefault()
+  Promise.resolve(hostSupervisor.stop())
+    .catch(() => {})
+    .finally(() => app.quit())
 })
 
 app.on('window-all-closed', () => {

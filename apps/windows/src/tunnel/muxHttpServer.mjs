@@ -237,9 +237,33 @@ export function attachMuxHttpServer({
         return
       }
       if (typeof onOpenWs === 'function') {
-        streams.set(frame.streamId, { kind: 'ws' })
+        const session = {
+          kind: 'ws',
+          path: String(obj.path ?? '/ws'),
+          sendData(opcode, data) {
+            send(encodeJsonFrame(MuxType.WS_DATA, frame.streamId, {
+              opcode,
+              data: Buffer.isBuffer(data) ? data.toString('base64') : Buffer.from(String(data)).toString('base64'),
+            }))
+          },
+          sendClose(code, reason) {
+            send(encodeJsonFrame(MuxType.WS_CLOSE, frame.streamId, { code, reason }))
+            dropStream(frame.streamId)
+          },
+        }
+        streams.set(frame.streamId, session)
         try {
-          onOpenWs({ streamId: frame.streamId, path: String(obj.path ?? '/ws'), transport })
+          const handle = onOpenWs({
+            streamId: frame.streamId,
+            path: session.path,
+            transport,
+            session,
+          })
+          if (handle && typeof handle === 'object') {
+            session.onMuxData = handle.onMuxData
+            session.onMuxClose = handle.onMuxClose
+            session.destroy = handle.destroy
+          }
         } catch (err) {
           reset(frame.streamId, 'PROTOCOL', err.message)
         }
@@ -248,10 +272,37 @@ export function attachMuxHttpServer({
       reset(frame.streamId, 'NOT_IMPLEMENTED', 'OPEN_WS handler not attached')
       return
     }
-    if (frame.type === MuxType.WS_DATA || frame.type === MuxType.WS_CLOSE) {
-      if (!streams.has(frame.streamId)) {
+    if (frame.type === MuxType.WS_DATA) {
+      const pending = streams.get(frame.streamId)
+      if (!pending || pending.kind !== 'ws') {
         reset(frame.streamId, 'PROTOCOL', 'WS frame for unknown stream')
+        return
       }
+      let payload = {}
+      try {
+        if (frame.payload.length) payload = parseJsonPayload(frame.payload)
+      } catch (err) {
+        failClosed(err)
+        return
+      }
+      pending.onMuxData?.(payload)
+      return
+    }
+    if (frame.type === MuxType.WS_CLOSE) {
+      const pending = streams.get(frame.streamId)
+      if (!pending || pending.kind !== 'ws') {
+        reset(frame.streamId, 'PROTOCOL', 'WS frame for unknown stream')
+        return
+      }
+      let payload = {}
+      try {
+        if (frame.payload.length) payload = parseJsonPayload(frame.payload)
+      } catch {
+        payload = {}
+      }
+      pending.onMuxClose?.(payload)
+      pending.destroy?.()
+      dropStream(frame.streamId)
       return
     }
     reset(frame.streamId, 'PROTOCOL', `unexpected type ${frame.type}`)
@@ -302,6 +353,7 @@ export function attachMuxHttpServer({
       closed = true
       for (const s of streams.values()) {
         if (s.timer) clearTimeout(s.timer)
+        try { s.destroy?.() } catch { /* */ }
       }
       streams.clear()
       try { transport.off?.('message', onMessage) } catch { /* */ }
