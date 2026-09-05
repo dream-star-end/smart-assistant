@@ -63,7 +63,7 @@ export const DELIBERATION_PANEL_SIZE_DEFAULT = 3
  * grok-build 家族重叠(都是 xAI 路线)时反而降低多样性。
  */
 export const DELIBERATION_PANEL_PREFERENCE = [
-  'gpt-5.6-sol',
+  'gpt-6-astra',
   'grok-build',
   'glm-5.3-zai',
   'deepseek-v4-pro',
