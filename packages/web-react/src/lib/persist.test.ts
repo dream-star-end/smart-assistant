@@ -2004,6 +2004,172 @@ describe("mergeFullServerWins — records_unpublished degrade page", () => {
     expect(phaseB.some((m) => m._unpublishedFallbackLiveText !== undefined)).toBe(false);
   });
 
+  test("Phase-B deferred last-segment stub keeps carried final text until the exact record arrives (INC-20260905-TURNEND-DEFERRED-STUB-SWALLOW)", () => {
+    const cmid = "u-gen5-defer";
+    const seg0 = "srv-web5-sess-main-t2-s0";
+    const seg1 = "srv-web5-sess-main-t2-s1";
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1 };
+    const a1: ChatMessage = {
+      id: seg0, role: "assistant", text: "PART1", ts: 3, _clientMessageId: cmid,
+    };
+    const tool: ChatMessage = {
+      id: "live-gen5-tool", role: "tool", text: "", ts: 4, _clientMessageId: cmid,
+      toolName: "Bash", _completed: true,
+    };
+    const a2: ChatMessage = {
+      id: seg1, role: "assistant", text: "PART2-FINAL", ts: 5, _clientMessageId: cmid,
+    };
+    const fallback: ChatMessage = {
+      id: seg1,
+      role: "assistant",
+      text: "PART1PART2-FINAL",
+      ts: 10,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-gen5",
+      _turnTapeComplete: true,
+      _orderSeq: 2,
+      _timelineRecord: true,
+      _displayDegraded: true,
+      _displayDegradeReason: "records_unpublished",
+      usage: { totalTokens: 9 },
+    };
+    const phaseA = mergeFullServerWins([user, fallback], [user, a1, tool, a2], 0, cmid, {
+      deletionAuthority: true,
+    });
+    expect(
+      phaseA.filter((m) => m.role === "assistant" && !m._hideUnpublishedFallback).map((m) => [m.id, m.text]),
+    ).toEqual([
+      [seg0, "PART1"],
+      [seg1, "PART2-FINAL"],
+    ]);
+
+    // Phase-B: readable s0 + exact tool + deferred (>1MiB) s1 locator under the
+    // same id the live row / Phase-A fallback already used.
+    const tape = (ordinal: number, orderSeq: number) => ({
+      _source: "server" as const,
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-gen5",
+      _turnTapeSha256: "a".repeat(64),
+      _turnTapeComplete: true,
+      _orderSeq: orderSeq,
+      _timelineRecord: true as const,
+      _turnTapeOrdinal: ordinal,
+    });
+    const exactSeg0: ChatMessage = {
+      id: seg0, role: "assistant", text: "PART1", ts: 3, ...tape(1, 2),
+    };
+    const exactTool: ChatMessage = {
+      id: "srv-web5-sess-main-t2-tool-tb1", role: "tool", text: "", ts: 4,
+      toolName: "Bash", output: "ok", _completed: true, blockId: "tb1", ...tape(2, 3),
+    };
+    const deferredSeg1: ChatMessage = {
+      id: seg1, role: "assistant", text: "", ts: 5, ...tape(3, 4),
+      _payloadDeferred: true,
+      _payloadBytes: 1_572_864,
+    };
+    const phaseBServer = [user, exactSeg0, exactTool, deferredSeg1];
+    const phaseB = mergeFullServerWins(phaseBServer, phaseA, 0, cmid, { deletionAuthority: true });
+    const stubRow = phaseB.find((m) => m.id === seg1);
+    // The stub slot must keep showing the streamed final segment text…
+    expect(stubRow?.text).toBe("PART2-FINAL");
+    expect(stubRow?._unpublishedFallbackLiveText).toBe("PART2-FINAL");
+    // …presented as content, not as the deferred locator placeholder card.
+    expect(stubRow?._payloadDeferred).toBeUndefined();
+    expect(stubRow?._payloadBytes).toBeUndefined();
+    // Record identity survives for hydration / incremental replacement.
+    expect(stubRow?._timelineRecord).toBe(true);
+    expect(stubRow?._source).toBe("server");
+    expect(stubRow?._turnTapeOrdinal).toBe(3);
+    expect(
+      phaseB.filter((m) => m.role === "assistant" && !m._hideUnpublishedFallback).map((m) => [m.id, m.text]),
+    ).toEqual([
+      [seg0, "PART1"],
+      [seg1, "PART2-FINAL"],
+    ]);
+
+    // Repeated Phase-B poll re-sends the raw deferred stub; text must not regress.
+    const remerged = mergeFullServerWins(phaseBServer, phaseB, 0, cmid, { deletionAuthority: true });
+    expect(remerged.find((m) => m.id === seg1)?.text).toBe("PART2-FINAL");
+    expect(remerged.find((m) => m.id === seg1)?._unpublishedFallbackLiveText).toBe("PART2-FINAL");
+
+    // The real non-deferred record arrives → exact text wins, helper field gone.
+    const exactSeg1: ChatMessage = {
+      id: seg1, role: "assistant", text: "PART2-FINAL-EXACT", ts: 5, ...tape(3, 4),
+    };
+    const replaced = mergeFullServerWins(
+      [user, exactSeg0, exactTool, exactSeg1],
+      remerged,
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    expect(replaced.find((m) => m.id === seg1)?.text).toBe("PART2-FINAL-EXACT");
+    expect(replaced.find((m) => m.id === seg1)?._payloadDeferred).toBeUndefined();
+    expect(replaced.some((m) => m._unpublishedFallbackLiveText !== undefined)).toBe(false);
+  });
+
+  test("deferred thinking stub keeps the sibling live thinking segment alive (INC-20260905-TURNEND-DEFERRED-STUB-SWALLOW)", () => {
+    const cmid = "u-gen5-thinking";
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1 };
+    const liveTh1: ChatMessage = {
+      id: "live-gen5-th-1", role: "thinking", text: "REASON-1", ts: 2, _clientMessageId: cmid,
+    };
+    const liveTh2: ChatMessage = {
+      id: "live-gen5-th-2", role: "thinking", text: "REASON-2", ts: 4, _clientMessageId: cmid,
+    };
+    const tape = (ordinal: number, orderSeq: number) => ({
+      _source: "server" as const,
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-gen5-th",
+      _turnTapeSha256: "b".repeat(64),
+      _turnTapeComplete: true,
+      _orderSeq: orderSeq,
+      _timelineRecord: true as const,
+      _turnTapeOrdinal: ordinal,
+    });
+    const exactTh0: ChatMessage = {
+      id: "srv-web5-sess-main-t3-thinking-s0", role: "thinking", text: "REASON-1", ts: 2, ...tape(1, 2),
+    };
+    const deferredTh1: ChatMessage = {
+      id: "srv-web5-sess-main-t3-thinking-s1", role: "thinking", text: "", ts: 4, ...tape(2, 3),
+      _payloadDeferred: true,
+      _payloadBytes: 1_572_864,
+    };
+    const finalAssistant: ChatMessage = {
+      id: "srv-web5-sess-main-t3-s0", role: "assistant", text: "FINAL", ts: 5, ...tape(3, 4),
+    };
+    const merged = mergeFullServerWins(
+      [user, exactTh0, deferredTh1, finalAssistant],
+      [user, liveTh1, liveTh2],
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    // One readable thinking record is NOT role-level completion: the second
+    // segment's payload is still deferred, so its live copy must stay.
+    // (liveTh1 may transiently duplicate exactTh0 until the payload lands —
+    // accepted coarse-grained cost; per-segment identity is not derivable.)
+    expect(merged.some((m) => m.id === "live-gen5-th-2")).toBe(true);
+    expect(merged.find((m) => m.id === "live-gen5-th-2")?.text).toBe("REASON-2");
+    expect(merged.some((m) => m.id === "srv-web5-sess-main-t3-thinking-s1")).toBe(true);
+
+    // Once the deferred payload hydrates, the role is complete and the live
+    // copies are positively superseded.
+    const hydratedTh1: ChatMessage = {
+      id: "srv-web5-sess-main-t3-thinking-s1", role: "thinking", text: "REASON-2", ts: 4, ...tape(2, 3),
+    };
+    const replaced = mergeFullServerWins(
+      [user, exactTh0, hydratedTh1, finalAssistant],
+      merged,
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    expect(replaced.some((m) => m.id === "live-gen5-th-2")).toBe(false);
+    expect(replaced.some((m) => m.id === "live-gen5-th-1")).toBe(false);
+  });
+
   test("Phase-B ordinal assistants replace live fragments without duplicates", () => {
     const cmid = "u-exact-assist";
     const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1, _source: "server", _orderSeq: 1 };
