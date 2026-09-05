@@ -13,6 +13,7 @@ describe('killProcessGroup — B3 process tree termination', () => {
         platform: 'linux',
         kill: (pid, signal) => {
           kills.push([pid, signal as NodeJS.Signals])
+          return true
         },
         spawnSync: (command, args) => {
           spawns.push([String(command), ...(args ?? []).map(String)])
@@ -63,6 +64,7 @@ describe('killProcessGroup — B3 process tree termination', () => {
         platform: 'win32',
         kill: (pid) => {
           kills.push(pid)
+          return true
         },
         spawnSync: (command, args) => {
           spawns.push([String(command), ...(args ?? []).map(String)])

@@ -24,7 +24,7 @@
  * 子进程的 process.cwd() 永远指向二进制所在目录,与系统提示中"Bash 默认 cwd
  * 已指向项目目录"自相矛盾。Phase 5 通过 subprocessCwd 字段修正这个语义错位。
  */
-import { type ChildProcessWithoutNullStreams, type SpawnOptions, spawn } from 'node:child_process'
+import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { createLogger } from './logger.js'
 
 const backendLog = createLogger({ module: 'terminalBackend' })
@@ -69,17 +69,23 @@ export interface TerminalBackend {
 export function localBackendSpawnOptions(
   opts: SpawnOpts,
   platform: NodeJS.Platform = process.platform,
-): SpawnOptions {
-  const base: SpawnOptions = {
-    cwd: opts.subprocessCwd ?? opts.ccbBinaryDir,
+) {
+  const cwd = opts.subprocessCwd ?? opts.ccbBinaryDir
+  if (platform === 'win32') {
+    return {
+      cwd,
+      env: opts.env,
+      stdio: opts.stdio,
+      detached: false,
+      windowsHide: true,
+    }
+  }
+  return {
+    cwd,
     env: opts.env,
     stdio: opts.stdio,
     detached: opts.detached,
   }
-  if (platform === 'win32') {
-    return { ...base, detached: false, windowsHide: true }
-  }
-  return base
 }
 
 // ── Local backend (default) ──
