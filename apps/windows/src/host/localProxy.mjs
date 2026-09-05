@@ -230,7 +230,7 @@ export function createLocalProxy({
     if (Number.isFinite(declared) && declared > maxBodyBytes) {
       stats.tooLarge += 1
       sendJson(res, 413, { error: { code: 'BODY_TOO_LARGE', message: 'request body exceeds 8 MiB' } })
-      req.resume()
+      req.destroy()
       return
     }
     stats.allowed += 1
