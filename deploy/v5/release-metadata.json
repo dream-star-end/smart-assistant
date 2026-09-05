@@ -150,7 +150,7 @@
     "0266_drop_user_channel_active",
     "0267_turn_dispatches_agent_container",
     "0268_desktop_session_secret_generation",
-    "0273_restore_ccb_provider_check"
+    "0274_restore_ccb_provider_check"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

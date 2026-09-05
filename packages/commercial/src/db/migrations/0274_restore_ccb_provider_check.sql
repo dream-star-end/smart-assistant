@@ -1,5 +1,5 @@
--- 0273_restore_ccb_provider_check.sql
--- order-dependency: none 0269-0272 are claimed on selfhost/other lines, not on aurora 0268 tip
+-- 0274_restore_ccb_provider_check.sql
+-- order-dependency: none 0269-0273 are claimed on the selfhost line (0273_chatgpt_proxy_credentials), not on aurora 0268 tip; this CHECK restore touches only model_catalog and has no dependency on them
 --
 -- Restore model_catalog_ccb_needs_provider. 0143 created
 --   CHECK (engine <> 'ccb' OR provider_id IS NOT NULL)
