@@ -1,7 +1,8 @@
 /**
  * Intercept gateway `/ws` `outbound.permission_request` frames, run the S5
  * approval engine, and inject `inbound.permission_response` (design §7, S6).
- * Does not modify gateway: Host is a WS man-in-the-middle on the loopback hop.
+ * Only read-only whitelist auto-allows; everything else goes through
+ * requestApproval (default deny, 120s timeout deny).
  */
 
 import { classifyDestructiveOp } from './workspace/approval.mjs'
@@ -57,7 +58,13 @@ export function classifyPermissionFrame(request) {
   return classifyDestructiveOp({
     kind: request.toolName,
     command,
-    detail: { path: target, command, toolName: request.toolName },
+    detail: {
+      path: target,
+      command,
+      toolName: request.toolName,
+      method: input.method,
+      workspaceRoot: input.workspaceRoot || request.workspaceRoot,
+    },
   })
 }
 
@@ -74,9 +81,10 @@ export function createApprovalBridge({
       toolName: request.toolName,
       needsApproval: classified.needsApproval,
       reason: classified.reason,
+      readOnly: classified.readOnly === true,
     })
-    if (!classified.needsApproval) {
-      return buildPermissionResponse(request, { approved: true, message: 'not-destructive' })
+    if (classified.readOnly === true && classified.needsApproval === false) {
+      return buildPermissionResponse(request, { approved: true, message: 'read-only' })
     }
     if (!approval || typeof approval.requestApproval !== 'function') {
       return buildPermissionResponse(request, { approved: false, message: 'no-approval-controller' })

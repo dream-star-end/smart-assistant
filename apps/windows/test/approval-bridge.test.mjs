@@ -67,7 +67,7 @@ test('non-destructive permission_request auto-allows without the approval window
     inputJson: { command: 'ls' },
   }), { sendJson: () => {} })
   assert.equal(response.behavior, 'allow')
-  assert.equal(response.message, 'not-destructive')
+  assert.equal(response.message, 'read-only')
   assert.equal(approval.pendingCount(), 0)
 })
 

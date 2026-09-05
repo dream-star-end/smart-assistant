@@ -18,7 +18,7 @@ test('rule table requires approval for delete, git hard/force, rm -rf, format, a
       .reason,
     'system-disk',
   )
-  assert.equal(classifyDestructiveOp({ command: 'echo hello' }).needsApproval, false)
+  assert.equal(classifyDestructiveOp({ command: 'echo hello' }).needsApproval, true)
   assert.equal(APPROVAL_TIMEOUT_MS, 120_000)
 })
 
