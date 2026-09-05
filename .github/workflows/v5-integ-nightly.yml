@@ -20,6 +20,10 @@ on:
         description: '只跑某一片(留空 = 全部 nightly-*)'
         required: false
         default: ''
+      ref:
+        description: 'checkout 的 git ref(schedule 触发时回落到 feat/v5-aurora-rewrite)'
+        required: false
+        default: 'feat/v5-aurora-rewrite'
 
 permissions:
   contents: read
@@ -87,6 +91,14 @@ jobs:
       - name: Checkout
         if: steps.pick.outputs.run == 'true'
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || 'feat/v5-aurora-rewrite' }}
+
+      - name: Record checkout identity
+        if: steps.pick.outputs.run == 'true'
+        shell: bash
+        run: |
+          echo "checked out $(git rev-parse HEAD) from ref=${{ github.event.inputs.ref || 'feat/v5-aurora-rewrite' }}" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Setup Node
         if: steps.pick.outputs.run == 'true'
