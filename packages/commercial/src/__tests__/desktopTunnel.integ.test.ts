@@ -66,7 +66,7 @@ describe("desktop tunnel integ", () => {
     );
     const containerId = Number(c.rows[0]!.id);
     const before = c.rows[0]!.session_secret_expires_at;
-    reg.attach(containerId, { mux, close: () => {} }, {
+    await reg.attach(containerId, { mux, close: () => {} }, {
       deviceId: "11111111-1111-4111-8111-111111111111",
       uid,
       expiresAt: new Date(Date.now() + 3_600_000),

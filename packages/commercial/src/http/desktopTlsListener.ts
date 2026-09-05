@@ -131,6 +131,17 @@ export async function startDesktopTlsListener(opts: DesktopTlsListenerOpts): Pro
   const addr = server.address();
   const boundPort = typeof addr === "object" && addr ? addr.port : port;
   rootLogger.info("desktop_tls_listening", { bind, port: boundPort, role, allowRegister });
+  try {
+    const swept = await getDesktopTunnelRegistry().sweepOwnInstance();
+    if (swept > 0) {
+      rootLogger.info("desktop_owner_sweep", {
+        swept,
+        instanceId: getDesktopTunnelRegistry().instanceId,
+      });
+    }
+  } catch (err) {
+    rootLogger.warn("desktop_owner_sweep_failed", { err: (err as Error)?.message });
+  }
   return {
     server,
     address: { host: bind, port: boundPort },

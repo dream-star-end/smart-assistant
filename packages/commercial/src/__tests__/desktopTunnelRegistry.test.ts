@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { createMemoryDesktopTunnelRegistry } from "../ws/desktopTunnelRegistry.js";
+import { createMemoryDesktopTunnelOwnerStore } from "../ws/desktopTunnelOwnerStore.js";
 
 describe("DesktopTunnelRegistry", () => {
-  test("single slot kicks previous handle", () => {
+  test("single slot kicks previous handle", async () => {
     const reg = createMemoryDesktopTunnelRegistry();
     let closed = 0;
-    reg.attach(1, { close: () => { closed += 1; } }, {
+    await reg.attach(1, { close: () => { closed += 1; } }, {
       deviceId: "d1", uid: 1, expiresAt: new Date(Date.now() + 60_000),
     });
-    reg.attach(1, { close: () => {} }, {
+    await reg.attach(1, { close: () => {} }, {
       deviceId: "d1", uid: 1, expiresAt: new Date(Date.now() + 60_000),
     });
     assert.equal(closed, 1);
@@ -19,7 +20,7 @@ describe("DesktopTunnelRegistry", () => {
   test("expiry timer drops the slot", async () => {
     const reg = createMemoryDesktopTunnelRegistry();
     let closed = 0;
-    reg.attach(3, { close: () => { closed += 1; } }, {
+    await reg.attach(3, { close: () => { closed += 1; } }, {
       deviceId: "d3", uid: 1, expiresAt: new Date(Date.now() + 25),
     });
     await new Promise((r) => setTimeout(r, 80));
@@ -43,7 +44,7 @@ describe("DesktopTunnelRegistry", () => {
     });
     const reg = createMemoryDesktopTunnelRegistry();
     assert.throws(() => { void reg.http(1, "GET", "/", {}, null, 500); }, /not attached/);
-    reg.attach(1, { mux, close: () => {} }, {
+    await reg.attach(1, { mux, close: () => {} }, {
       deviceId: "d1", uid: 1, expiresAt: new Date(Date.now() + 60_000),
     });
     const res = await reg.http(1, "GET", "/healthz", {}, null, 2_000);
@@ -53,10 +54,10 @@ describe("DesktopTunnelRegistry", () => {
     mux.close();
   });
 
-  test("drop closes handle and mint-style drop is idempotent", () => {
+  test("drop closes handle and mint-style drop is idempotent", async () => {
     const reg = createMemoryDesktopTunnelRegistry();
     let closed = 0;
-    reg.attach(9, { close: () => { closed += 1; } }, {
+    await reg.attach(9, { close: () => { closed += 1; } }, {
       deviceId: "d9", uid: 2, expiresAt: new Date(Date.now() + 60_000),
     });
     assert.equal(reg.drop(9, "token_rotated"), true);
@@ -65,22 +66,37 @@ describe("DesktopTunnelRegistry", () => {
     assert.equal(reg.get(9), undefined);
   });
 
-  test("drop(g) rejects later attach with generation <= g", () => {
+  test("drop(g) rejects later attach with generation <= g", async () => {
     const reg = createMemoryDesktopTunnelRegistry();
     let closedCode: number | undefined;
     reg.drop(4, "token_rotated", 3);
-    assert.throws(
-      () => {
-        reg.attach(4, { close: (code) => { closedCode = code; } }, {
-          deviceId: "d4", uid: 1, expiresAt: new Date(Date.now() + 60_000), generation: 3,
-        });
-      },
+    await assert.rejects(
+      () => reg.attach(4, { close: (code) => { closedCode = code; } }, {
+        deviceId: "d4", uid: 1, expiresAt: new Date(Date.now() + 60_000), generation: 3,
+      }),
       /generation 3 <= fence 3/,
     );
     assert.equal(closedCode, 1008);
-    reg.attach(4, { close: () => {} }, {
+    await reg.attach(4, { close: () => {} }, {
       deviceId: "d4", uid: 1, expiresAt: new Date(Date.now() + 60_000), generation: 4,
     });
     assert.equal(reg.size(), 1);
+  });
+
+  test("owner upsert failure rolls back the in-process slot", async () => {
+    const owners = createMemoryDesktopTunnelOwnerStore();
+    const orig = owners.upsert.bind(owners);
+    owners.upsert = async () => {
+      throw new Error("pg down");
+    };
+    const reg = createMemoryDesktopTunnelRegistry({ instanceId: "self", owners });
+    await assert.rejects(
+      () => reg.attach(1, { close: () => {} }, {
+        deviceId: "d1", uid: 1, expiresAt: new Date(Date.now() + 60_000),
+      }),
+      /pg down/,
+    );
+    assert.equal(reg.size(), 0);
+    owners.upsert = orig;
   });
 });
