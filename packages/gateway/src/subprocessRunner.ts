@@ -24,7 +24,7 @@ import {
   shutdownTimeoutMs as runnerShutdownTimeoutMs,
   waitForCloseWithin,
 } from './processGroupShutdown.js'
-import { decideEngineCwd } from './engineCwd.js'
+import { decideEngineCwd, resolveDesktopWorkspaceDir } from './engineCwd.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { projectCcbMcpAvailability } from './ccbMcpAvailability.js'
 import { buildPromptContext } from './promptSlots.js'
@@ -1450,10 +1450,11 @@ export class SubprocessRunner extends EventEmitter {
         repoSnapshot = null
       }
     }
+    const desktopWorkspaceDir = resolveDesktopWorkspaceDir()
     const effectiveAddDir =
       repoSnapshot?.status === 'ready' && repoSnapshot.workspaceDir
         ? repoSnapshot.workspaceDir
-        : this.opts.agentBaseDir
+        : desktopWorkspaceDir || this.opts.agentBaseDir
     if (repoSnapshot?.status === 'ready' && repoSnapshot.workspaceDir) {
       this._boundRepoBinding = {
         selectionVersion: repoSnapshot.selectionVersion,
@@ -2278,6 +2279,7 @@ export class SubprocessRunner extends EventEmitter {
         agentBaseDir: this.opts.agentBaseDir,
         repoSnapshot,
         projectBound: Boolean(this.opts.projectId),
+        desktopWorkspaceDir: resolveDesktopWorkspaceDir(),
       })
       await persistRunContextSnapshot({
         descriptor: this.opts.runContext,
