@@ -1,5 +1,5 @@
--- 0270_chatgpt_proxy_credentials.sql
--- order-dependency: 0269_cursor_usd_150_credits
+-- 0273_chatgpt_proxy_credentials.sql
+-- order-dependency: 0272_cursor_sonnet5_admin_only
 --
 -- ChatGPT direct-connect proxy: per-user Basic-auth secret for the master-hosted
 -- TLS CONNECT proxy (chained into the subscription egress). One row per user;
