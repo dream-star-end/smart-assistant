@@ -102,6 +102,7 @@ import {
   verifyDelegateContextToken,
 } from './delegateContext.js'
 import { checkLocalBridge, isHealthzFileProxyReady } from './localBridgeAuth.js'
+import { resolveGatewayListen } from './gatewayBind.js'
 import { defaultReleaseJobDir, isReleaseJobId, publicReleaseJob, readReleaseJob } from './releaseJobStore.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
 import {
@@ -3494,10 +3495,18 @@ export class Gateway {
       this.log.warn('live stream convergence failed', undefined, err)
     }
 
+    const listenOpts = resolveGatewayListen(config.gateway.bind, config.gateway.port)
     await new Promise<void>((res) => {
-      this.httpServer.listen(config.gateway.port, config.gateway.bind, () => res())
+      if (listenOpts.exclusive) {
+        this.httpServer.listen(
+          { port: listenOpts.port, host: listenOpts.host, exclusive: true },
+          () => res(),
+        )
+      } else {
+        this.httpServer.listen(listenOpts.port, listenOpts.host, () => res())
+      }
     })
-    this.log.info('server started', { bind: config.gateway.bind, port: config.gateway.port })
+    this.log.info('server started', { bind: listenOpts.host, port: listenOpts.port })
 
     // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
     this.bootAutoResume().catch((err) =>
