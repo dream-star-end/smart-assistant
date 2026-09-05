@@ -46,7 +46,7 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
       'gpt-6-astra',
       'gpt-6-astra-1m',
     ])
-    assert.equal(DEFAULT_CODEX_ENGINE_MODEL, 'gpt-5.6-sol')
+    assert.equal(DEFAULT_CODEX_ENGINE_MODEL, 'gpt-6-astra')
     assert.equal(isCodexLongContextModel('gpt-6-astra'), false)
     assert.equal(isCodexLongContextModel('gpt-6-astra-1m'), true)
     assert.equal(codexTransportModelId('gpt-6-astra-1m'), 'gpt-6-astra')

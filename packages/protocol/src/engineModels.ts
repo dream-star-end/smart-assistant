@@ -948,9 +948,9 @@ export function projectContextWindowForCursorTier(
 }
 
 /** codex seed agent(id='codex')的固定模型 —— entrypoint desiredCodexAgent 同值。 */
-export const DEFAULT_CODEX_ENGINE_MODEL: CodexEngineModelId = CODEX_ENGINE_MODELS[0].id
+export const DEFAULT_CODEX_ENGINE_MODEL: CodexEngineModelId = 'gpt-6-astra'
 export const DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME: string =
-  CODEX_ENGINE_MODELS[0].displayName
+  CODEX_ENGINE_MODELS.find((model) => model.id === DEFAULT_CODEX_ENGINE_MODEL)!.displayName
 
 export interface ModelReasoningPolicy {
   /** 该模型在 v5 可接受/展示的思考档位；空数组 = 本模型不支持该功能。 */
