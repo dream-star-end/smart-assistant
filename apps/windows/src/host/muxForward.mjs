@@ -1,7 +1,7 @@
 import http from 'node:http'
 import { EventEmitter } from 'node:events'
 import { createHash, randomBytes } from 'node:crypto'
-import { LOCAL_BRIDGE_HEADER_CANON } from './tokens.mjs'
+import { LOCAL_BRIDGE_HEADER, LOCAL_BRIDGE_HEADER_CANON } from './tokens.mjs'
 import { encodeWsFrame, decodeWsFrames } from '../tunnel/wss.mjs'
 
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
@@ -15,7 +15,7 @@ const HOP = new Set([
   'transfer-encoding',
   'upgrade',
   'host',
-  'x-openclaude-local-bridge',
+  LOCAL_BRIDGE_HEADER,
   'x-openclaude-bridge-nonce',
 ])
 
@@ -43,6 +43,21 @@ export function classifyMuxHttp(method, path) {
   }
   if (pathname.startsWith('/internal/')) return 'not_implemented'
   return 'forward'
+}
+
+/**
+ * Stamp the loopback request with the process-lifetime local-bridge token.
+ * Incoming mux headers named X-OpenClaude-Local-Bridge are hop-stripped first
+ * so a remote peer cannot supply the secret; we then set the canonical name
+ * that gateway `checkLocalBridge` reads (`x-openclaude-local-bridge`).
+ */
+export function applyLocalBridgeHeaders(headers, localBridgeToken) {
+  const out = { ...headers }
+  delete out[LOCAL_BRIDGE_HEADER]
+  delete out[LOCAL_BRIDGE_HEADER_CANON]
+  delete out['X-Openclaude-Local-Bridge']
+  out[LOCAL_BRIDGE_HEADER_CANON] = localBridgeToken
+  return out
 }
 
 function headersToNode(headers) {
@@ -82,8 +97,7 @@ export function createMuxHttpForwarder({
     const decision = classifyMuxHttp(req.method, req.path)
     if (decision === 'not_implemented') return notImplemented()
     const path = req.path || '/'
-    const headers = headersToNode(req.headers)
-    headers[LOCAL_BRIDGE_HEADER_CANON] = localBridgeToken
+    const headers = applyLocalBridgeHeaders(headersToNode(req.headers), localBridgeToken)
     headers.host = `127.0.0.1:${gatewayPort}`
     const body = req.body && req.body.length ? req.body : null
     if (body) headers['content-length'] = String(body.length)
@@ -242,19 +256,19 @@ export function connectLoopbackWs({ port, path, localBridgeToken, timeoutMs = 5_
   const key = randomBytes(16).toString('base64')
   const expectedAccept = createHash('sha1').update(key + GUID).digest('base64')
   const emitter = new EventEmitter()
+  const headers = applyLocalBridgeHeaders({
+    host: `127.0.0.1:${port}`,
+    connection: 'Upgrade',
+    upgrade: 'websocket',
+    'sec-websocket-version': '13',
+    'sec-websocket-key': key,
+  }, localBridgeToken)
   const req = http.request({
     host: '127.0.0.1',
     port,
     path,
     method: 'GET',
-    headers: {
-      host: `127.0.0.1:${port}`,
-      connection: 'Upgrade',
-      upgrade: 'websocket',
-      'sec-websocket-version': '13',
-      'sec-websocket-key': key,
-      [LOCAL_BRIDGE_HEADER_CANON]: localBridgeToken,
-    },
+    headers,
   })
   const timer = setTimeout(() => {
     req.destroy()
