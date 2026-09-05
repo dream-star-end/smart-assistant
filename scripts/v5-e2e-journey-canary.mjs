@@ -26,8 +26,10 @@
 //
 // 环境变量:
 //   V5_E2E_SSH_HOST(默认 kl-mirror)  V5_E2E_REMOTE_PORT(默认 18790)
+//   V5_E2E_BASE  若设(例 http://127.0.0.1:18790),直连该 origin,不建 ssh 隧道(本地/selfhost 复现)
 //   V5_CANARY_EMAIL(默认 v5-canary@claudeai.chat)
 //   V5_CANARY_PASSWORD_FILE(默认 /root/.secrets/v5-canary.password,经 ssh 读远端 —— 单一权威在 kl-mirror)
+//   V5_CANARY_PASSWORD  若设则用此密码,不再 ssh 读 PASSWORD_FILE(仅本地复现;生产部署仍走文件)
 //   OC_E2E_BROWSER(浏览器路径覆盖)  OC_E2E_ARTIFACTS(失败截图目录,默认 /tmp)
 // 退出码:0=旅程全过;1=断言失败;2=环境错误(浏览器/隧道/凭据)。两者都算门失败,
 // 错误信息区分排查方向。
@@ -46,6 +48,7 @@ const { chromium } = require_("playwright-core");
 
 const SSH_HOST = process.env.V5_E2E_SSH_HOST ?? "kl-mirror";
 const REMOTE_PORT = Number(process.env.V5_E2E_REMOTE_PORT ?? 18790);
+const DIRECT_BASE = (process.env.V5_E2E_BASE ?? "").replace(/\/$/, "");
 const EMAIL = process.env.V5_CANARY_EMAIL ?? "v5-canary@claudeai.chat";
 const PASSWORD_FILE = process.env.V5_CANARY_PASSWORD_FILE ?? "/root/.secrets/v5-canary.password";
 const ARTIFACTS = process.env.OC_E2E_ARTIFACTS ?? tmpdir();
@@ -88,16 +91,20 @@ function fatal(code, msg) {
 }
 const preJ5Timer = setTimeout(() => fatal(1, "J1-J4 在总防挂预算内未完成"), PRE_J5_TIMEOUT);
 
-// ── 凭据(单一权威在 kl-mirror,不落本机副本)──────────────────────────────
+// ── 凭据(单一权威在 kl-mirror,不落本机副本;本地复现可走 V5_CANARY_PASSWORD)──
 let password;
-try {
-  password = execFileSync("ssh", [SSH_HOST, `cat ${PASSWORD_FILE}`], { encoding: "utf8" }).trim();
-} catch (err) {
-  fatal(2, `无法读取 canary 密码(ssh ${SSH_HOST} cat ${PASSWORD_FILE}): ${err.message}`);
+if (process.env.V5_CANARY_PASSWORD) {
+  password = process.env.V5_CANARY_PASSWORD.trim();
+} else {
+  try {
+    password = execFileSync("ssh", [SSH_HOST, `cat ${PASSWORD_FILE}`], { encoding: "utf8" }).trim();
+  } catch (err) {
+    fatal(2, `无法读取 canary 密码(ssh ${SSH_HOST} cat ${PASSWORD_FILE}): ${err.message}`);
+  }
 }
 if (!password) fatal(2, "canary 密码为空");
 
-// ── ssh 隧道(本进程管理,退出必回收)─────────────────────────────────────
+// ── ssh 隧道(本进程管理,退出必回收)。V5_E2E_BASE 直连时跳过。─────────────
 async function freePort() {
   const { createServer } = await import("node:net");
   return new Promise((resolve, reject) => {
@@ -110,15 +117,10 @@ async function freePort() {
   });
 }
 
-const localPort = await freePort();
-const tunnel = spawn(
-  "ssh",
-  ["-N", "-o", "ExitOnForwardFailure=yes", "-o", "BatchMode=yes", "-L", `${localPort}:127.0.0.1:${REMOTE_PORT}`, SSH_HOST],
-  { stdio: ["ignore", "ignore", "pipe"] },
-);
+let tunnel = null;
 let tunnelStderr = "";
-tunnel.stderr.on("data", (d) => (tunnelStderr += d));
 const cleanupTunnel = () => {
+  if (!tunnel) return;
   try {
     tunnel.kill("SIGTERM");
   } catch {}
@@ -128,7 +130,7 @@ process.on("exit", cleanupTunnel);
 async function waitPort(port, deadlineMs) {
   const deadline = Date.now() + deadlineMs;
   while (Date.now() < deadline) {
-    if (tunnel.exitCode !== null) {
+    if (tunnel && tunnel.exitCode !== null) {
       fatal(2, `ssh 隧道进程提前退出(code=${tunnel.exitCode}): ${tunnelStderr.slice(0, 300)}`);
     }
     const ok = await new Promise((resolve) => {
@@ -145,10 +147,24 @@ async function waitPort(port, deadlineMs) {
     if (ok) return;
     await new Promise((r) => setTimeout(r, 300));
   }
-  fatal(2, `ssh 隧道 ${localPort}→${SSH_HOST}:${REMOTE_PORT} 在 15s 内未就绪: ${tunnelStderr.slice(0, 300)}`);
+  fatal(2, `ssh 隧道未在 15s 内就绪: ${tunnelStderr.slice(0, 300)}`);
 }
-await waitPort(localPort, 15_000);
-const BASE = `http://127.0.0.1:${localPort}`;
+
+let BASE;
+if (DIRECT_BASE) {
+  BASE = DIRECT_BASE;
+} else {
+  const localPort = await freePort();
+  tunnel = spawn(
+    "ssh",
+    ["-N", "-o", "ExitOnForwardFailure=yes", "-o", "BatchMode=yes", "-L", `${localPort}:127.0.0.1:${REMOTE_PORT}`, SSH_HOST],
+    { stdio: ["ignore", "ignore", "pipe"] },
+  );
+  tunnel.stderr.on("data", (d) => (tunnelStderr += d));
+  await waitPort(localPort, 15_000);
+  BASE = `http://127.0.0.1:${localPort}`;
+}
+const cookieDomain = new URL(BASE).hostname;
 
 // ── 浏览器旅程 ───────────────────────────────────────────────────────────
 let browser;
@@ -239,13 +255,21 @@ try {
       {
         name: "oc_rt",
         value: rt,
-        domain: "127.0.0.1",
+        domain: cookieDomain,
         path: "/api/auth",
         httpOnly: true,
         secure: false,
         sameSite: "Lax",
       },
     ]);
+    // 2026-09-05: 匿名访客 boot 不再必发 /api/auth/refresh(selfhost 61dd31d3e / authHint)。
+    // 判据是 localStorage oc_auth_hint; Playwright 新 context 没有该标记,只种 HttpOnly
+    // oc_rt 会被当成从未登录过,goto / 停在营销 Landing。真实用户经 UI 登录会写 hint;
+    // canary 走 API 登录,必须在二次进入 / 前补种,与 App.test 静默续期用例同一契约。
+    // 只在当前 origin 写标记,不提前 addInitScript,以免首屏未登录 Landing 误发 refresh。
+    await page.evaluate(() => {
+      localStorage.setItem("oc_auth_hint", "1");
+    });
     await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded", timeout: STEP_TIMEOUT });
 
     // 登录成功的判据 = 侧栏「新建会话」出现(composer placeholder 随 agent 名动态变化,
