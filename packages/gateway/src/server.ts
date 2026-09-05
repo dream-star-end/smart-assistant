@@ -101,6 +101,7 @@ import {
   DELEGATE_CONTEXT_HEADER,
   verifyDelegateContextToken,
 } from './delegateContext.js'
+import { checkLocalBridge, isHealthzFileProxyReady } from './localBridgeAuth.js'
 import { defaultReleaseJobDir, isReleaseJobId, publicReleaseJob, readReleaseJob } from './releaseJobStore.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
 import {
@@ -3989,7 +3990,13 @@ export class Gateway {
     const bridgeVerified = needsAuth ? this.checkBridgeBypass(req, url) : false
     const delegateAuthedByContext =
       this._isDelegateHttpPath(url.pathname) && this._hasValidDelegateContext(req)
-    if (needsAuth && !bridgeVerified && !this.checkHttpAuth(req) && !delegateAuthedByContext) {
+    if (
+      needsAuth &&
+      !bridgeVerified &&
+      !this.checkHttpAuth(req) &&
+      !checkLocalBridge(req) &&
+      !delegateAuthedByContext
+    ) {
       res.writeHead(401, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'unauthorized' }))
       return
@@ -4375,18 +4382,10 @@ export class Gateway {
       // (supervisor 写错 / 部署降级 / 容器复用)→ not ready → HOST 返 CONTAINER_OUTDATED,
       // 避免 HOST 按 bypass 发头结果容器内 checkBridgeBypass 失败 401 的 dead lock。
       // (Codex R1 SHOULD-3:校验形态,不只校验非空)
-      const TRUST_BRIDGE_IP = process.env.OPENCLAUDE_TRUST_BRIDGE_IP || ''
       const OC_CONTAINER_ID = process.env.OC_CONTAINER_ID || ''
-      const OC_BRIDGE_NONCE = process.env.OC_BRIDGE_NONCE || ''
-      // trust IP 必须是 IPv4 文本(docker bridge gateway,通常 172.30.0.1)
-      // 用 net.isIPv4 而不是松正则 —— R2 SHOULD:`999.999.999.999` 会过正则但
-      // remoteAddress 永远 match 不到,结果 /healthz 误报 ready 导致 HOST probe
-      // 通过但真实 bypass 全挂。
-      const TRUST_IP_OK = isIPv4(TRUST_BRIDGE_IP)
-      // container id 必须是 10 位以内正整数(BIGSERIAL),禁止 alpha / leading 0 / 超长
-      const CONTAINER_ID_OK = /^[1-9][0-9]{0,18}$/.test(OC_CONTAINER_ID)
-      const NONCE_OK = /^[0-9a-f]{64}$/i.test(OC_BRIDGE_NONCE)
-      const bridgeReady = TRUST_IP_OK && CONTAINER_ID_OK && NONCE_OK
+      // file-proxy-v1 仍只看 TRUST_BRIDGE 三件套形态(isHealthzFileProxyReady)。
+      // local-bridge token 不是三件套的一部分,W4:不得因此广播 file-proxy-v1。
+      const bridgeReady = isHealthzFileProxyReady(process.env)
       const body: Record<string, unknown> = c
         ? {
             ok: true,
@@ -15305,7 +15304,7 @@ export class Gateway {
       remoteIp === TRUST_BRIDGE_IP ||
       remoteIp === `::ffff:${TRUST_BRIDGE_IP}`
     )
-    if (!isFromBridge && !this.checkHttpAuth(req)) {
+    if (!isFromBridge && !checkLocalBridge(req) && !this.checkHttpAuth(req)) {
       ws.close(1008, 'unauthorized')
       return
     }
