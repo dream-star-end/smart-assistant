@@ -17,7 +17,9 @@ import {
   nativeImage,
   nativeTheme,
   protocol,
+  safeStorage,
   screen,
+  session,
   shell,
 } from 'electron'
 
@@ -47,7 +49,23 @@ import {
   parseOpenClaudeDeepLink,
 } from './desktop-protocol.mjs'
 import { DownloadRegistry, taskbarProgressState } from './download-registry.mjs'
-import { IPC_CHANNELS, isTrustedShellEvent, parseShellCommand } from './ipc-contract.mjs'
+import {
+  createEnrollmentController,
+  LOCAL_HOST_PARTITION,
+  LOCAL_HOST_URL,
+  registerLocalHostProtocol,
+} from './enroll.mjs'
+import {
+  createMemoryIdentityStore,
+  createSafeStorageIdentityStore,
+  resolveIdentityDirectory,
+} from './identity.mjs'
+import {
+  IPC_CHANNELS,
+  createLocalHostIpcHandler,
+  isTrustedShellEvent,
+  parseShellCommand,
+} from './ipc-contract.mjs'
 import { permissionDecision } from './permission-adapter.mjs'
 import {
   PRODUCT_PARTITION,
@@ -116,6 +134,7 @@ const ZOOM_MAX = 3
 const ZOOM_STEP = 0.1
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SHELL_PRELOAD_PATH = path.join(__dirname, 'shell-preload.cjs')
+const LOCAL_PRELOAD_PATH = path.join(__dirname, 'local-preload.cjs')
 const smokeTest = process.argv.includes('--smoke-test')
 
 registerShellScheme(protocol)
@@ -143,6 +162,9 @@ let desktopSettingsStore = null
 let desktopTrayApi = null
 let isQuitting = false
 let pendingDeepLinkTarget = null
+let localHostWindow = null
+let enrollmentController = null
+let localHostIpcHandler = null
 const liveNotifications = new Set()
 
 const viewerWindows = new Set()
@@ -1997,8 +2019,108 @@ async function writeSmokeFailureReport(stage, error) {
 
 
 
+function createAppIdentityStore() {
+  try {
+    if (typeof safeStorage?.isEncryptionAvailable === 'function' && safeStorage.isEncryptionAvailable()) {
+      return createSafeStorageIdentityStore({
+        directory: resolveIdentityDirectory({
+          userDataPath: app.getPath('userData'),
+          env: process.env,
+        }),
+        safeStorage,
+      })
+    }
+  } catch (error) {
+    console.warn(
+      '[windows] identity DPAPI unavailable:',
+      error instanceof Error ? error.message : error,
+    )
+  }
+  console.warn('[windows] identity store is in-memory only (safeStorage unavailable)')
+  return createMemoryIdentityStore()
+}
+
+function localHostWebPreferences() {
+  return {
+    partition: LOCAL_HOST_PARTITION,
+    preload: LOCAL_PRELOAD_PATH,
+    contextIsolation: true,
+    sandbox: true,
+    nodeIntegration: false,
+    nodeIntegrationInWorker: false,
+    nodeIntegrationInSubFrames: false,
+    webSecurity: true,
+    allowRunningInsecureContent: false,
+    webviewTag: false,
+    plugins: false,
+    experimentalFeatures: false,
+    enableWebSQL: false,
+    navigateOnDragDrop: false,
+    safeDialogs: true,
+    safeDialogsMessage: '此页面正在尝试创建更多对话框。',
+    devTools: !app.isPackaged,
+  }
+}
+
+function ensureLocalHostWindow() {
+  if (isAlive(localHostWindow)) return localHostWindow
+  const desktopSession = session.fromPartition(LOCAL_HOST_PARTITION)
+  if (!protocolSessions.has(desktopSession)) {
+    registerLocalHostProtocol(desktopSession.protocol)
+    protocolSessions.add(desktopSession)
+  }
+  desktopSession.setPermissionCheckHandler(() => false)
+  desktopSession.setPermissionRequestHandler((_webContents, _permission, callback) => {
+    callback(false)
+  })
+  localHostWindow = new BrowserWindow({
+    width: 480,
+    height: 640,
+    show: false,
+    autoHideMenuBar: true,
+    webPreferences: localHostWebPreferences(),
+  })
+  installWebContentsHardening(localHostWindow.webContents)
+  localHostWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  localHostWindow.webContents.on('will-navigate', (event, targetUrl) => {
+    if (targetUrl !== LOCAL_HOST_URL) event.preventDefault()
+  })
+  localHostWindow.once('closed', () => {
+    localHostWindow = null
+  })
+  void localHostWindow.loadURL(LOCAL_HOST_URL)
+  return localHostWindow
+}
+
+function installEnrollment() {
+  if (enrollmentController) return enrollmentController
+  enrollmentController = createEnrollmentController({
+    origin: PINNED_APP_ORIGIN,
+    identityStore: createAppIdentityStore(),
+    openExternal: (targetUrl) => openExternal(targetUrl),
+    publicName: os.hostname().slice(0, 128),
+    audit: (event, fields) => {
+      console.info('[windows]', event, fields ?? '')
+    },
+  })
+  localHostIpcHandler = createLocalHostIpcHandler({
+    getLocalWebContents: () => (isAlive(localHostWindow) ? localHostWindow.webContents : null),
+    enrollment: enrollmentController,
+    audit: (entry) => console.info('[windows]', entry.event),
+  })
+  return enrollmentController
+}
+
 function applyDeepLink(raw) {
   const parsed = parseOpenClaudeDeepLink(raw)
+  if (parsed.action === 'enroll-callback') {
+    if (!enrollmentController) {
+      console.info('[windows] ignored deep link: enroll-not-ready')
+      return true
+    }
+    void enrollmentController.handleCallback(parsed)
+    return true
+  }
   if (parsed.action !== 'open') {
     console.info('[windows] ignored deep link:', parsed.reason)
     return false
@@ -2088,6 +2210,12 @@ async function ensureNormalMainWindow() {
 }
 
 ipcMain.on(IPC_CHANNELS.command, onShellCommand)
+ipcMain.handle(IPC_CHANNELS.localHost, (event, payload) => {
+  if (!localHostIpcHandler) {
+    return { ok: false, error: 'forbidden' }
+  }
+  return localHostIpcHandler(event, payload)
+})
 
 const hasSingleInstanceLock = smokeTest || app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) {
@@ -2121,6 +2249,7 @@ if (!hasSingleInstanceLock) {
         return
       }
       await installDesktopTray()
+      installEnrollment()
       const launchDeepLink = findOpenClaudeUrlInArgv(process.argv)
       if (launchDeepLink) applyDeepLink(launchDeepLink)
       await ensureNormalMainWindow()
@@ -2138,6 +2267,7 @@ app.on('activate', () => {
 
 app.on('before-quit', () => {
   isQuitting = true
+  if (isAlive(localHostWindow)) localHostWindow.destroy()
   void windowStateStore?.flush().catch(() => {})
 })
 

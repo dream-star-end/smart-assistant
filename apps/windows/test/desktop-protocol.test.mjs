@@ -7,6 +7,10 @@ import {
   parseOpenClaudeDeepLink,
 } from '../src/desktop-protocol.mjs'
 
+const ENROLL_ID = '6ba7b810-9dad-11d1-80b4-00c04fd430c8'
+const ENROLL_CODE = 'ab'.repeat(32)
+const VALID_ENROLL = `openclaude://enroll/callback?enrollment_id=${ENROLL_ID}&code=${ENROLL_CODE}`
+
 test('findOpenClaudeUrlInArgv returns the first protocol argument and ignores others', () => {
   assert.equal(
     findOpenClaudeUrlInArgv(['Clarvy.exe', 'openclaude://open?path=/settings']),
@@ -53,5 +57,63 @@ test('parseOpenClaudeDeepLink ignores malformed, unpinned, and non-open hosts', 
     const parsed = parseOpenClaudeDeepLink(raw)
     assert.equal(parsed.action, 'ignore', raw)
     assert.equal('targetUrl' in parsed, false, raw)
+  }
+})
+
+test('parseOpenClaudeDeepLink accepts a well-formed enroll callback and does not navigate', () => {
+  assert.deepEqual(parseOpenClaudeDeepLink(VALID_ENROLL), {
+    action: 'enroll-callback',
+    enrollmentId: ENROLL_ID,
+    code: ENROLL_CODE,
+  })
+  assert.deepEqual(
+    parseOpenClaudeDeepLink(
+      `openclaude://enroll/callback/?enrollment_id=${ENROLL_ID.toUpperCase()}&code=${ENROLL_CODE.toUpperCase()}`,
+    ),
+    {
+      action: 'enroll-callback',
+      enrollmentId: ENROLL_ID,
+      code: ENROLL_CODE,
+    },
+  )
+  const parsed = parseOpenClaudeDeepLink(VALID_ENROLL)
+  assert.equal('targetUrl' in parsed, false)
+})
+
+test('parseOpenClaudeDeepLink rejects enroll callbacks with extra query, hash, port, or bad ids', () => {
+  const ignored = [
+    [`${VALID_ENROLL}&foo=1`, 'invalid-query'],
+    [`${VALID_ENROLL}#fragment`, 'hash'],
+    [
+      `openclaude://enroll:443/callback?enrollment_id=${ENROLL_ID}&code=${ENROLL_CODE}`,
+      'port',
+    ],
+    [`openclaude://enroll/callback?enrollment_id=not-a-uuid&code=${ENROLL_CODE}`, 'invalid-enrollment-id'],
+    [`openclaude://enroll/callback?enrollment_id=${ENROLL_ID}&code=abcd`, 'invalid-code'],
+    [`openclaude://enroll/callback?enrollment_id=${ENROLL_ID}&code=${'g'.repeat(64)}`, 'invalid-code'],
+    [`openclaude://enroll/callback?enrollment_id=${ENROLL_ID}&code=${'a'.repeat(63)}`, 'invalid-code'],
+    [
+      `openclaude://user:pass@enroll/callback?enrollment_id=${ENROLL_ID}&code=${ENROLL_CODE}`,
+      'credentials',
+    ],
+    [
+      `openclaude://enroll//callback?enrollment_id=${ENROLL_ID}&code=${ENROLL_CODE}`,
+      'unsupported-host',
+    ],
+    [
+      `openclaude://enroll/callback/extra?enrollment_id=${ENROLL_ID}&code=${ENROLL_CODE}`,
+      'unsupported-host',
+    ],
+    [`openclaude://enroll/callback?enrollment_id=${ENROLL_ID}&enrollment_id=${ENROLL_ID}&code=${ENROLL_CODE}`, 'invalid-query'],
+    [`openclaude://enroll/callback?enrollment_id=${ENROLL_ID}&code=${ENROLL_CODE}&code=${ENROLL_CODE}`, 'invalid-query'],
+    [`openclaude://enroll/callback?enrollment_id=${ENROLL_ID}`, 'invalid-query'],
+    [`openclaude://${'a'.repeat(8200)}`, 'invalid-url'],
+  ]
+  for (const [raw, reason] of ignored) {
+    const parsed = parseOpenClaudeDeepLink(raw)
+    assert.equal(parsed.action, 'ignore', raw)
+    assert.equal(parsed.reason, reason, raw)
+    assert.equal('enrollmentId' in parsed, false, raw)
+    assert.equal('code' in parsed, false, raw)
   }
 })

@@ -1,18 +1,29 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 import {
   IPC_CHANNELS,
+  LOCAL_HOST_ORIGIN,
   MAX_SHELL_COMMAND_ID_LENGTH,
+  createLocalHostIpcHandler,
+  isTrustedLocalHostEvent,
   isTrustedShellEvent,
+  parseLocalHostCommand,
   parseShellCommand,
 } from '../src/ipc-contract.mjs'
+
+const srcDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../src')
 
 test('IPC channel names are fixed narrow contracts', () => {
   assert.deepEqual(IPC_CHANNELS, {
     command: 'aurora:shell-command',
     state: 'aurora:shell-state',
+    localHost: 'clarvy:local-host',
   })
+  assert.equal(LOCAL_HOST_ORIGIN, 'app://clarvy-local')
 })
 
 test('parseShellCommand accepts only enumerated exact-shape commands', () => {
@@ -93,4 +104,98 @@ test('isTrustedShellEvent rejects lookalike origins, credentials, and ports', ()
     const fixture = trustedFixture(url)
     assert.equal(isTrustedShellEvent(fixture.event, fixture.webContents), false, url)
   }
+})
+
+test('parseLocalHostCommand accepts the privileged whitelist and rejects extra keys', () => {
+  for (const type of ['get-status', 'choose-workspace', 'fallback-cloud', 'start-enroll']) {
+    assert.deepEqual(parseLocalHostCommand({ type }), { type })
+  }
+  assert.deepEqual(parseLocalHostCommand({ type: 'set-workspace', path: 'C:\\work' }), {
+    type: 'set-workspace',
+    path: 'C:\\work',
+  })
+  assert.deepEqual(parseLocalHostCommand({ type: 'approve-op', id: 'op-1' }), {
+    type: 'approve-op',
+    id: 'op-1',
+  })
+  assert.equal(parseLocalHostCommand({ type: 'start-enroll', extra: true }), null)
+  assert.equal(parseLocalHostCommand({ type: 'set-workspace' }), null)
+  assert.equal(parseLocalHostCommand({ type: 'open-url' }), null)
+})
+
+test('isTrustedLocalHostEvent accepts app://clarvy-local and rejects product origins', () => {
+  const local = trustedFixture('app://clarvy-local/index.html')
+  assert.equal(isTrustedLocalHostEvent(local.event, local.webContents), true)
+  const product = trustedFixture('https://claudeai.chat/')
+  assert.equal(isTrustedLocalHostEvent(product.event, product.webContents), false)
+  const shell = trustedFixture('app://aurora-shell/index.html')
+  assert.equal(isTrustedLocalHostEvent(shell.event, shell.webContents), false)
+})
+
+test('createLocalHostIpcHandler rejects forged product frames for start-enroll and later ops', async () => {
+  const local = trustedFixture('app://clarvy-local/index.html')
+  const started = []
+  const audits = []
+  const handler = createLocalHostIpcHandler({
+    getLocalWebContents: () => local.webContents,
+    enrollment: {
+      start: async () => {
+        started.push('start')
+        return { enrollmentId: 'id', authUrl: 'https://claudeai.chat/desktop/enroll' }
+      },
+    },
+    audit: (entry) => audits.push(entry),
+  })
+
+  for (const url of ['https://claudeai.chat/', 'app://aurora-shell/index.html']) {
+    const forged = trustedFixture(url)
+    for (const payload of [{ type: 'start-enroll' }, { type: 'approve-op', id: 'op-1' }, { type: 'set-workspace', path: 'C:\\w' }]) {
+      const result = await handler(forged.event, payload)
+      assert.equal(result.ok, false, url)
+      assert.equal(result.error, 'forbidden', url)
+    }
+  }
+  assert.deepEqual(started, [])
+  assert.equal(audits.some((entry) => entry.event === 'ipc_rejected'), true)
+})
+
+test('createLocalHostIpcHandler allows trusted local start-enroll and gates not-implemented ops', async () => {
+  const local = trustedFixture('app://clarvy-local/index.html')
+  const handler = createLocalHostIpcHandler({
+    getLocalWebContents: () => local.webContents,
+    enrollment: {
+      start: async () => ({ enrollmentId: 'enroll-1', authUrl: 'https://claudeai.chat/desktop/enroll?enrollment_id=enroll-1' }),
+      getStatus: () => ({ phase: 'idle', hasIdentity: false, enrollmentId: null }),
+    },
+  })
+
+  const started = await handler(local.event, { type: 'start-enroll' })
+  assert.deepEqual(started, {
+    ok: true,
+    enrollmentId: 'enroll-1',
+    authUrl: 'https://claudeai.chat/desktop/enroll?enrollment_id=enroll-1',
+  })
+
+  const status = await handler(local.event, { type: 'get-status' })
+  assert.equal(status.ok, true)
+  assert.equal(status.status.phase, 'idle')
+
+  const approve = await handler(local.event, { type: 'approve-op', id: 'op-1' })
+  assert.deepEqual(approve, { ok: false, error: 'not-implemented' })
+  const workspace = await handler(local.event, { type: 'set-workspace', path: 'C:\\work' })
+  assert.deepEqual(workspace, { ok: false, error: 'not-implemented' })
+})
+
+test('product preload and product WebContentsView do not expose clarvy:local-host', async () => {
+  const [productView, shellPreload, localPreload] = await Promise.all([
+    readFile(path.join(srcDirectory, 'product-view.mjs'), 'utf8'),
+    readFile(path.join(srcDirectory, 'shell-preload.cjs'), 'utf8'),
+    readFile(path.join(srcDirectory, 'local-preload.cjs'), 'utf8'),
+  ])
+  assert.equal(productView.includes('clarvy:local-host'), false)
+  assert.equal(productView.includes('preload'), true)
+  assert.equal(shellPreload.includes('clarvy:local-host'), false)
+  assert.equal(shellPreload.includes('clarvyLocalHost'), false)
+  assert.equal(localPreload.includes("exposeInMainWorld('clarvyLocalHost'"), true)
+  assert.equal(localPreload.includes('clarvy:local-host'), true)
 })
