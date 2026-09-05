@@ -147,7 +147,7 @@ BASELINE_GUARD_SCRIPT="$SCRIPT_DIR/v5-baseline-security.sh"
 # First sourceCommit whose builds write .baseline-manifest.json. Empty until
 # this feature's merge SHA is filled in; empty = no automatic
 # --allow-legacy-manifest-missing from ancestry.
-LEGACY_MANIFEST_CUTOFF_COMMIT=""
+LEGACY_MANIFEST_CUTOFF_COMMIT="a43ead9e5ec963785ad33d68ec418984aa5c361e"
 # One-cycle fallback: missing-manifest + allow still uses
 # check-release-legacy-cursor / serving_release_uses_legacy_baseline.
 # Delete when every live/rollback target has a manifest and cutoff is set.
