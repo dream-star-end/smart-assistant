@@ -176,6 +176,9 @@ function MobileChatPage() {
   }, [scroller, stick]);
   window.__mobilePage.armSticky = () => {
     if (!scroller) return;
+    // 重新武装:上一个用例可能已离底(following=false),而 controller 在离底态拒绝写
+    // scrollTop。用例之间没有手势在飞(调用方已等过 quiet window),reset 安全。
+    stick.reset();
     stick.scrollToBottom(scroller);
     syncFollowing();
   };
