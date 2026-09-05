@@ -15,6 +15,14 @@ import type { DesktopEndpointHint } from "../ws/containerTransportKind.js";
 import { makeUidSingleflight } from "./ensureContainerSingleflight.js";
 import { ownerHeartbeatIsFresh, type DesktopTunnelOwnerRow } from "../ws/desktopTunnelOwnerStore.js";
 import { rootLogger } from "../logging/logger.js";
+import {
+  invalidateDesktopRowMiss,
+  rememberDesktopRowMiss,
+  resetDesktopEnsureCacheForTest,
+  shouldSkipDesktopRowLookup,
+} from "../desktop/desktopRowCache.js";
+
+export { invalidateDesktopRowMiss, resetDesktopEnsureCacheForTest };
 
 export type DesktopAttachedEndpoint = {
   host: string;
@@ -23,18 +31,6 @@ export type DesktopAttachedEndpoint = {
   desktop: DesktopEndpointHint;
   coldStart: false;
 };
-
-/** W-R03: skip the desktop-row SELECT for uids that recently had none. */
-const NO_ROW_TTL_MS = 15_000;
-const noDesktopRowUntil = new Map<number, number>();
-
-export function resetDesktopEnsureCacheForTest(): void {
-  noDesktopRowUntil.clear();
-}
-
-export function invalidateDesktopRowMiss(uid: number): void {
-  noDesktopRowUntil.delete(uid);
-}
 
 export interface DesktopEnsureAttachedDeps {
   flags?: () => Promise<DesktopFlagSnapshot>;
@@ -95,16 +91,15 @@ export async function makeDesktopEnsureAttached(
 
   const now = deps.now ?? Date.now;
   const uidNum = Number(uid);
-  const cachedUntil = noDesktopRowUntil.get(uidNum);
-  if (cachedUntil !== undefined && now() < cachedUntil) return null;
+  if (shouldSkipDesktopRowLookup(uidNum, now())) return null;
 
   const find = deps.findDesktopContainerId ?? defaultFindDesktopContainerId;
   const id = await find(uid);
   if (id === null) {
-    noDesktopRowUntil.set(uidNum, now() + NO_ROW_TTL_MS);
+    rememberDesktopRowMiss(uidNum, now());
     return null;
   }
-  noDesktopRowUntil.delete(uidNum);
+  invalidateDesktopRowMiss(uidNum);
 
   const registry = deps.registry ?? getDesktopTunnelRegistry();
   const slot = registry.get(id);

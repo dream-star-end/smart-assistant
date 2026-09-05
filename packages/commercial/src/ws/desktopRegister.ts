@@ -18,7 +18,7 @@ import {
   markDesktopTunnelHeartbeat,
   DesktopTunnelGenerationError,
 } from "./desktopTunnelRegistry.js";
-import { invalidateDesktopRowMiss } from "../agent-sandbox/desktopEnsure.js";
+import { invalidateDesktopRowMiss } from "../desktop/desktopRowCache.js";
 import { extractDesktopTlsContext, type PeerCertReader } from "../desktop/tlsContext.js";
 import { getDesktopFlagSnapshot } from "../desktop/flags.js";
 import { createPgDesktopIdentityRepo } from "../http/desktopEnroll.js";

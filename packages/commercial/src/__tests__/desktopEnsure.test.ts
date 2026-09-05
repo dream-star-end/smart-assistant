@@ -6,6 +6,7 @@ import {
   makeInboundChannelResolver,
   makeDesktopEnsureAttached,
   resetDesktopEnsureCacheForTest,
+  invalidateDesktopRowMiss,
   type DesktopAttachedEndpoint,
 } from "../agent-sandbox/desktopEnsure.js";
 import { createMemoryDesktopTunnelRegistry } from "../ws/desktopTunnelRegistry.js";
@@ -129,6 +130,7 @@ describe("makeDesktopEnsureAttached owner miss", () => {
       instanceId: "self",
       instanceAddr: "127.0.0.1:18445",
       generation: 1,
+      ownerEpoch: 1,
     });
     await assert.rejects(
       () => makeDesktopEnsureAttached(1n, {
@@ -140,5 +142,51 @@ describe("makeDesktopEnsureAttached owner miss", () => {
       }),
       (e: unknown) => e instanceof ContainerUnreadyError && e.reason === "desktop_offline",
     );
+  });
+});
+
+describe("W05-IMPL-02 negative cache invalidation", () => {
+  test("without invalidate, a newly appearing row stays cached-null (the bug)", async () => {
+    resetDesktopEnsureCacheForTest();
+    let finds = 0;
+    let id: number | null = null;
+    const deps = {
+      flags: async () => ({
+        envEnabled: true, killSwitch: false, settingsOn: true, allowlist: [1], assembled: true,
+      }),
+      findDesktopContainerId: async () => {
+        finds += 1;
+        return id;
+      },
+      now: () => 1_000,
+    };
+    assert.equal(await makeDesktopEnsureAttached(7n, deps), null);
+    id = 42;
+    assert.equal(await makeDesktopEnsureAttached(7n, deps), null);
+    assert.equal(finds, 1);
+  });
+
+  test("invalidateDesktopRowMiss forces a SELECT within TTL, not silent docker", async () => {
+    resetDesktopEnsureCacheForTest();
+    let finds = 0;
+    let id: number | null = null;
+    const deps = {
+      flags: async () => ({
+        envEnabled: true, killSwitch: false, settingsOn: true, allowlist: [1], assembled: true,
+      }),
+      findDesktopContainerId: async () => {
+        finds += 1;
+        return id;
+      },
+      now: () => 1_000,
+    };
+    assert.equal(await makeDesktopEnsureAttached(7n, deps), null);
+    id = 42;
+    invalidateDesktopRowMiss(7);
+    await assert.rejects(
+      () => makeDesktopEnsureAttached(7n, deps),
+      (e: unknown) => e instanceof ContainerUnreadyError && e.reason === "desktop_offline",
+    );
+    assert.equal(finds, 2);
   });
 });

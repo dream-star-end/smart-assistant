@@ -27,6 +27,7 @@ import {
 } from "../desktop/flags.js";
 import { extractDesktopTlsContext } from "../desktop/tlsContext.js";
 import { getDesktopTunnelRegistry, type DesktopTunnelRegistry } from "../ws/desktopTunnelRegistry.js";
+import { invalidateDesktopRowMiss } from "../desktop/desktopRowCache.js";
 import { OPENCLAUDE_CONTAINER_GATEWAY_PORT } from "@openclaude/protocol";
 import { requireActiveAccountVerifyDb } from "./requireUser.js";
 import { HttpError, readJsonBody, sendJson } from "./util.js";
@@ -330,6 +331,7 @@ export async function handleDesktopEnrollFinish(
     throw new HttpError(400, "INVALID_FINISH", "enrollment_id, code, pkce_verifier required");
   }
   const issuedBy = await lookupIssuedByHost();
+  let finishedUid: number | undefined;
   const result = await tx(async (client) => {
     const sel = await client.query<{
       id: string;
@@ -425,6 +427,7 @@ export async function handleDesktopEnrollFinish(
       ip: ctx.clientIp,
       userAgent: ctx.userAgent,
     });
+    finishedUid = uid;
     return {
       deviceId,
       containerId,
@@ -433,6 +436,7 @@ export async function handleDesktopEnrollFinish(
       device_key: issued.keyPem,
     };
   });
+  if (finishedUid !== undefined) invalidateDesktopRowMiss(finishedUid);
   sendJson(res, 200, result);
 }
 
