@@ -156,6 +156,8 @@ async function runWorker(): Promise<void> {
   const { runReconcileTick } = await import('../packages/commercial/src/dispatch/turnDispatchReconciler.js')
   const { createPgSessionsBackend } = await import('../packages/commercial/src/db/pgSessionsBackend.js')
   const { makeTurnTapeStateHandler } = await import('../packages/commercial/src/http/internalServerAuthored.js')
+  const { installQueuedConsumerProofFixture } =
+    await import('../packages/commercial/src/__tests__/helpers/queuedConsumerProofFixture.js')
   const db = testDatabase()
   const pool = new Pool({ ...db.config, max: 4, options: '-c search_path=' + schema + ',public' })
   const forbidden: string[] = []
@@ -194,24 +196,7 @@ async function runWorker(): Promise<void> {
   eventBus.on('tool.called', onTool)
   setV3MasterSinkSingleton({ stageDurable: async () => fail('tape'), enqueue: () => fail('tape') } as never)
   try {
-    assert.equal((await pool.query('SELECT current_schema() AS name')).rows[0].name, schema)
-    // Minimal dedicated-schema fixture plus the production dispatch migration. No public writes/extensions.
-    await pool.query(`
-      CREATE TABLE client_sessions (id text, user_id text, deleted_at bigint, messages text DEFAULT '[]', PRIMARY KEY(id,user_id));
-      CREATE TABLE agent_containers (id bigint PRIMARY KEY, user_id bigint, state text, runtime_kind text);
-      CREATE TABLE request_finalize_journal (request_id text PRIMARY KEY, ctx jsonb DEFAULT '{}', state text);
-      CREATE TABLE usage_records (id bigint PRIMARY KEY);
-      CREATE TABLE client_session_turn_tapes (tape_id text, session_id text, user_id text,
-        finalized_at bigint, visible_at bigint, status text, part_count integer);
-      CREATE TABLE client_session_turn_tape_parts (tape_id text, session_id text, user_id text);
-      CREATE TABLE client_session_live_streams (stream_key text, dispatch_id uuid);
-      CREATE TABLE client_session_live_frames (stream_key text, created_at timestamptz);
-      CREATE TABLE turn_traces (trace_id text, user_id bigint, session_key text, first_visible_at timestamptz);
-    `)
-    await pool.query(await readFile(join(root, 'packages/commercial/src/db/migrations/0170_durable_turn_dispatch.sql'), 'utf8'))
-    await pool.query(await readFile(join(root, 'packages/commercial/src/db/migrations/0239_turn_dispatch_shutdown_ctx.sql'), 'utf8'))
-    await pool.query(await readFile(join(root, 'packages/commercial/src/db/migrations/0267_turn_dispatches_agent_container.sql'), 'utf8'))
-    await pool.query('ALTER TABLE turn_dispatches ADD COLUMN visible_head jsonb, ADD COLUMN visible_at bigint, ADD COLUMN producer_fenced_at timestamptz')
+    const fixture = await installQueuedConsumerProofFixture({ pool, schema })
     await pool.query("INSERT INTO agent_containers VALUES (7,42,'active','docker')")
     const bridgeSecret = randomBytes(32).toString('hex')
     Object.assign(process.env, { OPENCLAUDE_TRUST_BRIDGE_IP: '127.0.0.1',
@@ -247,7 +232,7 @@ async function runWorker(): Promise<void> {
     const identity = { uid: 42n, sessionId: 'proof-queued', clientMessageId: 'cm-queued',
       dispatchId: randomUUID(), attemptNo: 1 }
     const seed = async (id: typeof identity, status: 'accepted' | 'terminal', at: number) => {
-      await pool.query('INSERT INTO client_sessions(id,user_id) VALUES($1,$2)', [id.sessionId, 'c:42'])
+      await fixture.seedSession({ sessionId: id.sessionId, userId: 'c:42' })
       await pool.query(`INSERT INTO turn_dispatches
         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,billing_request_id,
          status,outcome,client_notified,anchor_seq,admitted_at,accepted_at,terminal_at,agent_container_id,runtime_kind)
@@ -266,7 +251,7 @@ async function runWorker(): Promise<void> {
         'request_finalize_journal', 'turn_dispatch_error_projections']) {
         assert.equal(Number((await pool.query('SELECT count(*) AS n FROM ' + table)).rows[0].n), 0, table)
       }
-      assert.equal((await pool.query('SELECT messages FROM client_sessions WHERE id=$1', [id.sessionId])).rows[0].messages, '[]')
+      assert.equal(await fixture.readSessionMessages({ sessionId: id.sessionId, userId: 'c:42' }), '[]')
       assert.deepEqual(forbidden, [])
       return { pg, local }
     }
