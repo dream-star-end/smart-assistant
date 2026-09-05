@@ -248,6 +248,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0246_CHAT_PROJECT, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE agent_containers (
+      id BIGSERIAL PRIMARY KEY,
       user_id BIGINT NOT NULL,
       state TEXT NOT NULL
     );
@@ -262,6 +263,14 @@ before(async () => {
       user_agent TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+  `);
+  // 0267: production SQL selects agent_container_id/runtime_kind; this isolated
+  // schema does not apply the full desktop migration chain, so add the columns.
+  await pool.query(`
+    ALTER TABLE turn_dispatches
+      ADD COLUMN IF NOT EXISTS agent_container_id BIGINT REFERENCES agent_containers(id) ON DELETE RESTRICT;
+    ALTER TABLE turn_dispatches
+      ADD COLUMN IF NOT EXISTS runtime_kind TEXT;
   `);
   migration0176EscapedNulBackfill = (
     await pool.query<NonNullable<typeof migration0176EscapedNulBackfill>>(
