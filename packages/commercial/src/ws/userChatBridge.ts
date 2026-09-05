@@ -8323,7 +8323,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             typeof parsedPermission.peer.id === "string" &&
             isPlainRecord(parsedPermission.inputJson)
           ) {
-            permissionAuthorityCommit = () => persistPermissionAuthority(deps.pgPool, {
+            // Capture the narrowed values now: TS does not carry control-flow
+            // narrowing of `deps.pgPool` / `parsedPermission.peer` into the
+            // deferred closure, and the frame must be validated at receipt.
+            const permissionPool = deps.pgPool;
+            const permissionAuthorityInput = {
               userId: uid,
               requestId: parsedPermission.requestId,
               sessionId: parsedPermission.peer.id,
@@ -8339,7 +8343,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ? parsedPermission.inputJson
                 : null,
               expiresAt: resolvePermissionExpiresAt(parsedPermission.expiresAt),
-            }).then(() => {});
+            };
+            permissionAuthorityCommit = () =>
+              persistPermissionAuthority(permissionPool, permissionAuthorityInput).then(() => {});
           }
         } else if (permissionText?.includes('"outbound.permission_settled"')) {
           // INC-20260903-PENDING-PERMISSION-ZOMBIE — the runtime is the only
