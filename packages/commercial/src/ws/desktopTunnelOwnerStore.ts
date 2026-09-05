@@ -4,6 +4,9 @@
  * The in-process mux handle still lives in MemoryDesktopTunnelRegistry.
  * This store is the cross-instance directory used for fail-loud miss
  * (`desktop_owned_elsewhere`) and crash leftover sweep.
+ *
+ * `ownerEpoch` is the row identity: a delayed DELETE from a previous
+ * generation-identical reconnect must not match the new UPSERT.
  */
 
 import { query, type QueryRunner } from "../db/queries.js";
@@ -17,6 +20,7 @@ export interface DesktopTunnelOwnerRow {
   attachedAt: Date;
   lastHeartbeatAt: Date;
   generation: number;
+  ownerEpoch: number;
 }
 
 export interface DesktopTunnelOwnerStore {
@@ -25,18 +29,25 @@ export interface DesktopTunnelOwnerStore {
     instanceId: string;
     instanceAddr: string;
     generation: number;
+    ownerEpoch: number;
     attachedAt?: Date;
     lastHeartbeatAt?: Date;
   }): Promise<void>;
-  deleteIfMatch(agentContainerId: number, instanceId: string, generation: number): Promise<boolean>;
+  deleteIfMatch(
+    agentContainerId: number,
+    instanceId: string,
+    generation: number,
+    ownerEpoch: number,
+  ): Promise<boolean>;
   get(agentContainerId: number): Promise<DesktopTunnelOwnerRow | null>;
   sweepInstance(instanceId: string): Promise<number>;
   touchHeartbeat(
     agentContainerId: number,
     instanceId: string,
     generation: number,
+    ownerEpoch: number,
     at: Date,
-  ): Promise<void>;
+  ): Promise<number>;
 }
 
 export function ownerHeartbeatIsFresh(
@@ -62,11 +73,17 @@ export function createMemoryDesktopTunnelOwnerStore(): DesktopTunnelOwnerStore &
         attachedAt: row.attachedAt ?? now,
         lastHeartbeatAt: row.lastHeartbeatAt ?? now,
         generation: row.generation,
+        ownerEpoch: row.ownerEpoch,
       });
     },
-    async deleteIfMatch(agentContainerId, instanceId, generation) {
+    async deleteIfMatch(agentContainerId, instanceId, generation, ownerEpoch) {
       const cur = rows.get(agentContainerId);
-      if (!cur || cur.instanceId !== instanceId || cur.generation !== generation) return false;
+      if (
+        !cur
+        || cur.instanceId !== instanceId
+        || cur.generation !== generation
+        || cur.ownerEpoch !== ownerEpoch
+      ) return false;
       rows.delete(agentContainerId);
       return true;
     },
@@ -83,10 +100,16 @@ export function createMemoryDesktopTunnelOwnerStore(): DesktopTunnelOwnerStore &
       }
       return n;
     },
-    async touchHeartbeat(agentContainerId, instanceId, generation, at) {
+    async touchHeartbeat(agentContainerId, instanceId, generation, ownerEpoch, at) {
       const cur = rows.get(agentContainerId);
-      if (!cur || cur.instanceId !== instanceId || cur.generation !== generation) return;
+      if (
+        !cur
+        || cur.instanceId !== instanceId
+        || cur.generation !== generation
+        || cur.ownerEpoch !== ownerEpoch
+      ) return 0;
       rows.set(agentContainerId, { ...cur, lastHeartbeatAt: at });
+      return 1;
     },
   };
 }
@@ -105,14 +128,16 @@ export function createPgDesktopTunnelOwnerStore(
     async upsert(row) {
       await q(
         `INSERT INTO desktop_tunnel_owners (
-           agent_container_id, instance_id, instance_addr, attached_at, last_heartbeat_at, generation
-         ) VALUES ($1, $2, $3, COALESCE($4::timestamptz, NOW()), COALESCE($5::timestamptz, NOW()), $6)
+           agent_container_id, instance_id, instance_addr, attached_at, last_heartbeat_at,
+           generation, owner_epoch
+         ) VALUES ($1, $2, $3, COALESCE($4::timestamptz, NOW()), COALESCE($5::timestamptz, NOW()), $6, $7)
          ON CONFLICT (agent_container_id) DO UPDATE SET
            instance_id = EXCLUDED.instance_id,
            instance_addr = EXCLUDED.instance_addr,
            attached_at = EXCLUDED.attached_at,
            last_heartbeat_at = EXCLUDED.last_heartbeat_at,
-           generation = EXCLUDED.generation`,
+           generation = EXCLUDED.generation,
+           owner_epoch = EXCLUDED.owner_epoch`,
         [
           row.agentContainerId,
           row.instanceId,
@@ -120,14 +145,15 @@ export function createPgDesktopTunnelOwnerStore(
           row.attachedAt ?? null,
           row.lastHeartbeatAt ?? null,
           row.generation,
+          row.ownerEpoch,
         ],
       );
     },
-    async deleteIfMatch(agentContainerId, instanceId, generation) {
+    async deleteIfMatch(agentContainerId, instanceId, generation, ownerEpoch) {
       const r = await q(
         `DELETE FROM desktop_tunnel_owners
-          WHERE agent_container_id = $1 AND instance_id = $2 AND generation = $3`,
-        [agentContainerId, instanceId, generation],
+          WHERE agent_container_id = $1 AND instance_id = $2 AND generation = $3 AND owner_epoch = $4`,
+        [agentContainerId, instanceId, generation, ownerEpoch],
       );
       return (r.rowCount ?? 0) > 0;
     },
@@ -139,9 +165,11 @@ export function createPgDesktopTunnelOwnerStore(
         attached_at: Date | string;
         last_heartbeat_at: Date | string;
         generation: number;
+        owner_epoch: string;
       }>(
         `SELECT agent_container_id::text AS agent_container_id,
-                instance_id, instance_addr, attached_at, last_heartbeat_at, generation
+                instance_id, instance_addr, attached_at, last_heartbeat_at,
+                generation, owner_epoch::text AS owner_epoch
            FROM desktop_tunnel_owners
           WHERE agent_container_id = $1`,
         [agentContainerId],
@@ -155,6 +183,7 @@ export function createPgDesktopTunnelOwnerStore(
         attachedAt: asDate(row.attached_at),
         lastHeartbeatAt: asDate(row.last_heartbeat_at),
         generation: Number(row.generation),
+        ownerEpoch: Number(row.owner_epoch),
       };
     },
     async sweepInstance(instanceId) {
@@ -164,13 +193,14 @@ export function createPgDesktopTunnelOwnerStore(
       );
       return r.rowCount ?? 0;
     },
-    async touchHeartbeat(agentContainerId, instanceId, generation, at) {
-      await q(
+    async touchHeartbeat(agentContainerId, instanceId, generation, ownerEpoch, at) {
+      const r = await q(
         `UPDATE desktop_tunnel_owners
-            SET last_heartbeat_at = $4
-          WHERE agent_container_id = $1 AND instance_id = $2 AND generation = $3`,
-        [agentContainerId, instanceId, generation, at],
+            SET last_heartbeat_at = $5
+          WHERE agent_container_id = $1 AND instance_id = $2 AND generation = $3 AND owner_epoch = $4`,
+        [agentContainerId, instanceId, generation, ownerEpoch, at],
       );
+      return r.rowCount ?? 0;
     },
   };
 }

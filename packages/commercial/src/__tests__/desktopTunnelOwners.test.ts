@@ -171,3 +171,102 @@ describe("desktop tunnel owner directory", () => {
     assert.equal(lookups, 0);
   });
 });
+
+describe("W05-IMPL-01 owner_epoch and owner SQL chain", () => {
+  test("delayed same-generation DELETE does not wipe the new owner row", async () => {
+    const inner = createMemoryDesktopTunnelOwnerStore();
+    const delayed: Array<() => Promise<boolean>> = [];
+    const wrap = {
+      ...inner,
+      rows: inner.rows,
+      async deleteIfMatch(
+        agentContainerId: number,
+        instanceId: string,
+        generation: number,
+        ownerEpoch: number,
+      ) {
+        delayed.push(() => inner.deleteIfMatch(agentContainerId, instanceId, generation, ownerEpoch));
+        return false;
+      },
+    };
+    const reg = createMemoryDesktopTunnelRegistry({ instanceId: "self", owners: wrap });
+    await reg.attach(11, { close: () => {} }, {
+      deviceId: "d11", uid: 1, expiresAt: new Date(Date.now() + 60_000), generation: 7,
+    });
+    const firstEpoch = (await inner.get(11))!.ownerEpoch;
+    assert.equal(reg.drop(11, "ws_close"), true);
+    await reg.attach(11, { close: () => {} }, {
+      deviceId: "d11", uid: 1, expiresAt: new Date(Date.now() + 60_000), generation: 7,
+    });
+    const second = await inner.get(11);
+    assert.ok(second);
+    assert.equal(second.generation, 7);
+    assert.notEqual(second.ownerEpoch, firstEpoch);
+    assert.equal(delayed.length, 1);
+    assert.equal(await delayed[0]!(), false);
+    const still = await inner.get(11);
+    assert.equal(still?.ownerEpoch, second.ownerEpoch);
+    const touched = await inner.touchHeartbeat(11, "self", 7, still!.ownerEpoch, new Date());
+    assert.equal(touched, 1);
+  });
+
+  test("memory store deleteIfMatch is epoch-conditional", async () => {
+    const store = createMemoryDesktopTunnelOwnerStore();
+    await store.upsert({
+      agentContainerId: 3, instanceId: "self", instanceAddr: "a", generation: 1, ownerEpoch: 100,
+    });
+    assert.equal(await store.deleteIfMatch(3, "self", 1, 99), false);
+    assert.ok(await store.get(3));
+    assert.equal(await store.deleteIfMatch(3, "self", 1, 100), true);
+    assert.equal(await store.get(3), null);
+  });
+
+  test("failed DELETE is retried from the 90s ledger", async () => {
+    const inner = createMemoryDesktopTunnelOwnerStore();
+    let fail = true;
+    const wrap = {
+      ...inner,
+      rows: inner.rows,
+      async deleteIfMatch(
+        agentContainerId: number,
+        instanceId: string,
+        generation: number,
+        ownerEpoch: number,
+      ) {
+        if (fail) throw new Error("pool blip");
+        return inner.deleteIfMatch(agentContainerId, instanceId, generation, ownerEpoch);
+      },
+    };
+    const reg = createMemoryDesktopTunnelRegistry({ instanceId: "self", owners: wrap });
+    await reg.attach(5, { close: () => {} }, {
+      deviceId: "d5", uid: 1, expiresAt: new Date(Date.now() + 60_000), generation: 1,
+    });
+    assert.equal(reg.drop(5, "ws_close"), true);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(await inner.get(5));
+    fail = false;
+    await reg.retryPendingOwnerDeletes();
+    assert.equal(await inner.get(5), null);
+  });
+
+  test("sweepDesktopOwnersBeforeListen retries then throws", async () => {
+    const { sweepDesktopOwnersBeforeListen, createMemoryDesktopTunnelRegistry } = await import("../ws/desktopTunnelRegistry.js");
+    let n = 0;
+    const store = createMemoryDesktopTunnelOwnerStore();
+    store.sweepInstance = async () => {
+      n += 1;
+      throw new Error("pg down");
+    };
+    const reg = createMemoryDesktopTunnelRegistry({ instanceId: "self", owners: store });
+    await assert.rejects(() => sweepDesktopOwnersBeforeListen(reg, 3), /pg down/);
+    assert.equal(n, 3);
+    n = 0;
+    store.sweepInstance = async () => {
+      n += 1;
+      if (n < 3) throw new Error("pg down");
+      return 0;
+    };
+    await sweepDesktopOwnersBeforeListen(reg, 3);
+    assert.equal(n, 3);
+  });
+});

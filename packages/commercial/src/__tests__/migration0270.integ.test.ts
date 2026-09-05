@@ -45,7 +45,7 @@ describe("0270 desktop_tunnel_owners", () => {
     const names = cols.rows.map((r) => r.column_name);
     for (const col of [
       "agent_container_id", "instance_id", "instance_addr",
-      "attached_at", "last_heartbeat_at", "generation",
+      "attached_at", "last_heartbeat_at", "generation", "owner_epoch",
     ]) {
       assert.ok(names.includes(col), `missing ${col}`);
     }

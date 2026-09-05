@@ -14,6 +14,8 @@ import {
   startDesktopTlsListener,
   type DesktopTlsHandlers,
 } from "../http/desktopTlsListener.js";
+import { resetDesktopTunnelRegistryForTest } from "../ws/desktopTunnelRegistry.js";
+import { createMemoryDesktopTunnelOwnerStore } from "../ws/desktopTunnelOwnerStore.js";
 
 function stubHandlers(hits: string[]): DesktopTlsHandlers {
   const hit = (name: string) => async (_req: IncomingMessage, res: ServerResponse) => {
@@ -83,6 +85,7 @@ describe("desktop TLS split assembly", () => {
     process.env.OC_DESKTOP_VIRTUAL_CONTAINER = "1";
     resetDesktopFlagCache();
     setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [1] }));
+    resetDesktopTunnelRegistryForTest({ owners: createMemoryDesktopTunnelOwnerStore() });
     const origin = await ensureDesktopOriginCert();
     const issued = await issueDeviceCertificate(randomUUID());
     const egressHits: string[] = [];

@@ -132,4 +132,47 @@ describe("W-05 desktop_tunnel_owners integ", () => {
     );
     assert.equal(gone.rows[0]!.n, "0");
   });
+
+  test("delayed DELETE after same-generation reconnect leaves owner row; heartbeat updates 1", async (t) => {
+    if (db.skipIfUnavailable(t)) return;
+    const { uid, containerId } = await insertDesktopContainer();
+    const inner = createPgDesktopTunnelOwnerStore();
+    const delayed: Array<() => Promise<boolean>> = [];
+    const wrap = {
+      ...inner,
+      async deleteIfMatch(
+        agentContainerId: number,
+        instanceId: string,
+        generation: number,
+        ownerEpoch: number,
+      ) {
+        delayed.push(() => inner.deleteIfMatch(agentContainerId, instanceId, generation, ownerEpoch));
+        return false;
+      },
+    };
+    const reg = createMemoryDesktopTunnelRegistry({
+      instanceId: "reconnect-self", instanceAddr: "127.0.0.1:18445", owners: wrap,
+    });
+    await reg.attach(containerId, { close: () => {} }, {
+      deviceId: "d", uid, expiresAt: new Date(Date.now() + 60_000), generation: 5,
+    });
+    const first = await inner.get(containerId);
+    assert.ok(first);
+    assert.equal(reg.drop(containerId, "ws_close"), true);
+    await reg.attach(containerId, { close: () => {} }, {
+      deviceId: "d", uid, expiresAt: new Date(Date.now() + 60_000), generation: 5,
+    });
+    const second = await inner.get(containerId);
+    assert.ok(second);
+    assert.equal(second.generation, 5);
+    assert.notEqual(second.ownerEpoch, first.ownerEpoch);
+    assert.equal(delayed.length, 1);
+    assert.equal(await delayed[0]!(), false);
+    const still = await inner.get(containerId);
+    assert.equal(still?.ownerEpoch, second.ownerEpoch);
+    const n = await inner.touchHeartbeat(
+      containerId, "reconnect-self", 5, still!.ownerEpoch, new Date(),
+    );
+    assert.equal(n, 1);
+  });
 });

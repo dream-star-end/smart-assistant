@@ -32,7 +32,8 @@ CREATE TABLE desktop_tunnel_owners (
   instance_addr      TEXT NOT NULL,
   attached_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_heartbeat_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  generation         INTEGER NOT NULL DEFAULT 0
+  generation         INTEGER NOT NULL DEFAULT 0,
+  owner_epoch        BIGINT NOT NULL
 );
 
 CREATE INDEX desktop_tunnel_owners_instance_id

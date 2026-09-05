@@ -21,7 +21,7 @@ import {
   sendDesktopEngineDisabled,
   sendDesktopNotFound,
 } from "./desktopInternalDispatch.js";
-import { getDesktopTunnelRegistry } from "../ws/desktopTunnelRegistry.js";
+import { getDesktopTunnelRegistry, sweepDesktopOwnersBeforeListen } from "../ws/desktopTunnelRegistry.js";
 import { HttpError, sendJson } from "./util.js";
 import { rootLogger } from "../logging/logger.js";
 import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
@@ -109,6 +109,8 @@ export async function startDesktopTlsListener(opts: DesktopTlsListenerOpts): Pro
     },
   );
 
+  await sweepDesktopOwnersBeforeListen();
+
   server.on("upgrade", (req, socket, head) => {
     const path = pathnameOf(req);
     const action = allowRegister ? desktopUpgradeAction("master", path) : desktopUpgradeAction("egress", path);
@@ -131,17 +133,6 @@ export async function startDesktopTlsListener(opts: DesktopTlsListenerOpts): Pro
   const addr = server.address();
   const boundPort = typeof addr === "object" && addr ? addr.port : port;
   rootLogger.info("desktop_tls_listening", { bind, port: boundPort, role, allowRegister });
-  try {
-    const swept = await getDesktopTunnelRegistry().sweepOwnInstance();
-    if (swept > 0) {
-      rootLogger.info("desktop_owner_sweep", {
-        swept,
-        instanceId: getDesktopTunnelRegistry().instanceId,
-      });
-    }
-  } catch (err) {
-    rootLogger.warn("desktop_owner_sweep_failed", { err: (err as Error)?.message });
-  }
   return {
     server,
     address: { host: bind, port: boundPort },
