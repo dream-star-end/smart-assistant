@@ -16,6 +16,9 @@ export function createHostRuntime(opts = {}) {
     gatewayCommand,
     gatewayArgs = [],
     gatewayExtraEnv = {},
+    claudeCodePath,
+    claudeCodeEntry,
+    claudeCodeRuntime,
     gatewayPort = GATEWAY_PORT,
     egressPort = EGRESS_PROXY_PORT,
     masterPort = MASTER_PROXY_PORT,
@@ -133,8 +136,13 @@ export function createHostRuntime(opts = {}) {
       args: gatewayArgs,
       localBridgeToken: tokens.localBridge,
       lahGwToken: tokens.lahGw,
+      lahToken: tokens.lah,
       masterProxyPort: masterProxy.port,
+      egressProxyPort: egressProxy.port,
       gatewayPort,
+      claudeCodePath,
+      claudeCodeEntry,
+      claudeCodeRuntime,
       extraEnv: gatewayExtraEnv,
       onDegraded: (info) => {
         onDegraded?.(info)

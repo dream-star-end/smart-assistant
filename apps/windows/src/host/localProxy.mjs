@@ -1,5 +1,6 @@
 import http from 'node:http'
 import https from 'node:https'
+import { Transform } from 'node:stream'
 import { createOutboundTlsOptions, parseHttpsOrigin } from '../tunnel/bootstrap.mjs'
 import {
   checkBearerToken,
@@ -14,6 +15,8 @@ import {
 
 export const EGRESS_PROXY_PORT = 18791
 export const MASTER_PROXY_PORT = 18792
+/** Design draft does not specify a body cap; 8 MiB fail-closed. */
+export const MAX_PROXY_BODY_BYTES = 8 * 1024 * 1024
 
 export const MASTER_PATH_ALLOWLIST = Object.freeze([
   { method: 'POST', path: '/v1/messages' },
@@ -78,7 +81,26 @@ function copyHeaders(src) {
   return out
 }
 
-function proxyHttps({ origin, tls, req, res, identity, onOutbound }) {
+function createBodyLimiter(maxBytes, onTooLarge) {
+  let size = 0
+  let tooLarge = false
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      size += chunk.length
+      if (size > maxBytes) {
+        if (!tooLarge) {
+          tooLarge = true
+          onTooLarge()
+        }
+        cb()
+        return
+      }
+      cb(null, chunk)
+    },
+  })
+}
+
+function proxyHttps({ origin, tls, req, res, identity, onOutbound, onUpstreamStatus, onUpstreamError, onTooLarge }) {
   let url
   try {
     url = parseHttpsOrigin(origin, 'proxyOrigin')
@@ -98,6 +120,18 @@ function proxyHttps({ origin, tls, req, res, identity, onOutbound }) {
   const headers = copyHeaders(req.headers)
   headers.host = url.host
   headers.authorization = `Bearer ${token}`
+  let tooLarge = false
+  const abortTooLarge = () => {
+    tooLarge = true
+    try { upstream.destroy() } catch { /* */ }
+    onTooLarge?.()
+    if (!res.headersSent) {
+      sendJson(res, 413, { error: { code: 'BODY_TOO_LARGE', message: 'request body exceeds 8 MiB' } })
+    } else {
+      try { res.destroy() } catch { /* */ }
+    }
+  }
+  const limiter = createBodyLimiter(MAX_PROXY_BODY_BYTES, abortTooLarge)
   const upstream = https.request({
     hostname: url.hostname,
     port: Number(url.port) || 443,
@@ -113,15 +147,23 @@ function proxyHttps({ origin, tls, req, res, identity, onOutbound }) {
     rejectUnauthorized: true,
     checkServerIdentity: tls.checkServerIdentity,
   }, (up) => {
+    if (tooLarge) {
+      up.resume()
+      return
+    }
+    const status = up.statusCode || 502
+    onUpstreamStatus?.({ status, contentType: up.headers['content-type'] })
     const outHeaders = copyHeaders(up.headers)
-    res.writeHead(up.statusCode || 502, outHeaders)
+    res.writeHead(status, outHeaders)
+    if (typeof res.flushHeaders === 'function') res.flushHeaders()
     up.pipe(res)
   })
   upstream.on('error', () => {
+    onUpstreamError?.()
     if (!res.headersSent) sendJson(res, 502, { error: { code: 'UPSTREAM', message: 'upstream failed' } })
     else try { res.destroy() } catch { /* */ }
   })
-  req.pipe(upstream)
+  req.pipe(limiter).pipe(upstream)
 }
 
 export function createLocalProxy({
@@ -137,8 +179,17 @@ export function createLocalProxy({
   inspectRemote = remoteAddressOf,
   onUnauth,
   onOutbound,
+  maxBodyBytes = MAX_PROXY_BODY_BYTES,
 }) {
-  const stats = { unauth: 0, rejected: 0, allowed: 0, outbound: 0 }
+  const stats = {
+    unauth: 0,
+    rejected: 0,
+    allowed: 0,
+    outbound: 0,
+    success: 0,
+    upstreamError: 0,
+    tooLarge: 0,
+  }
   let servers = []
   let boundPort = port
   let closed = true
@@ -175,21 +226,35 @@ export function createLocalProxy({
       sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'path not allowed' } })
       return
     }
-    stats.allowed += 1
-    const counted = {
-      origin: outboundOrigin,
-      onOutbound: (info) => {
-        stats.outbound += 1
-        onOutbound?.(info)
-      },
+    const declared = Number(req.headers['content-length'] || 0)
+    if (Number.isFinite(declared) && declared > maxBodyBytes) {
+      stats.tooLarge += 1
+      sendJson(res, 413, { error: { code: 'BODY_TOO_LARGE', message: 'request body exceeds 8 MiB' } })
+      req.resume()
+      return
     }
+    stats.allowed += 1
     proxyHttps({
       origin: outboundOrigin,
       tls: tlsFor(),
       req,
       res,
       identity,
-      onOutbound: counted.onOutbound,
+      onOutbound: (info) => {
+        stats.outbound += 1
+        onOutbound?.(info)
+      },
+      onUpstreamStatus: ({ status }) => {
+        if (status >= 400) stats.upstreamError += 1
+        else stats.success += 1
+      },
+      onUpstreamError: () => {
+        stats.upstreamError += 1
+      },
+      onTooLarge: () => {
+        stats.tooLarge += 1
+      },
+      maxBodyBytes,
     })
   }
 

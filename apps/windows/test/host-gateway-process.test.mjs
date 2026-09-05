@@ -11,7 +11,7 @@ import {
   createGatewayProcess,
   healthzHasFileProxy,
 } from '../src/host/gatewayProcess.mjs'
-import { createLahGwToken, createLocalBridgeToken, FORBIDDEN_GATEWAY_ENV } from '../src/host/tokens.mjs'
+import { createLahGwToken, createLahToken, createLocalBridgeToken, FORBIDDEN_GATEWAY_ENV } from '../src/host/tokens.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const stubGateway = path.join(here, 'fixtures/stub-gateway.mjs')
@@ -28,15 +28,18 @@ function freePort() {
 }
 
 test('buildGatewayEnv strips TRUST_BRIDGE trio and never puts oc-v3 in child env', () => {
+  const lah = createLahToken()
   const env = buildGatewayEnv({
     baseEnv: {
       PATH: process.env.PATH,
       OPENCLAUDE_TRUST_BRIDGE_IP: '127.0.0.1',
       OC_CONTAINER_ID: '9',
       OC_BRIDGE_NONCE: 'deadbeef',
+      ANTHROPIC_API_KEY: 'sk-should-strip',
     },
     localBridgeToken: 'aa'.repeat(32),
     lahGwToken: createLahGwToken(),
+    lahToken: lah,
     masterProxyPort: 18792,
     extraEnv: { OPENCLAUDE_V3_CONTAINER_TOKEN: 'oc-v3.should.not.win' },
   })
@@ -45,7 +48,33 @@ test('buildGatewayEnv strips TRUST_BRIDGE trio and never puts oc-v3 in child env
   }
   assert.equal(env.OPENCLAUDE_V3_CONTAINER_TOKEN.startsWith('oc-lah-gw.'), true)
   assert.equal(env.OPENCLAUDE_GATEWAY_BIND, '127.0.0.1')
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, lah)
+  assert.equal(env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:18791')
+  assert.equal(env.OPENCLAUDE_ENGINES, 'ccb')
+  assert.equal(Object.hasOwn(env, 'ANTHROPIC_API_KEY'), false)
   assertGatewayEnvSafe(env)
+})
+
+test('assertGatewayEnvSafe rejects real provider keys and non-oc-lah auth tokens', () => {
+  const lah = createLahToken()
+  const env = buildGatewayEnv({
+    localBridgeToken: 'aa'.repeat(32),
+    lahGwToken: createLahGwToken(),
+    lahToken: lah,
+    masterProxyPort: 18792,
+  })
+  assert.throws(
+    () => assertGatewayEnvSafe({ ...env, ANTHROPIC_API_KEY: 'sk-live' }),
+    /ANTHROPIC_API_KEY/,
+  )
+  assert.throws(
+    () => assertGatewayEnvSafe({ ...env, ANTHROPIC_AUTH_TOKEN: 'sk-ant-api' }),
+    /oc-lah/,
+  )
+  assert.throws(
+    () => assertGatewayEnvSafe({ ...env, ANTHROPIC_AUTH_TOKEN: env.OPENCLAUDE_V3_CONTAINER_TOKEN }),
+    /oc-lah/,
+  )
 })
 
 test('healthzHasFileProxy detects the capability string', () => {
@@ -61,6 +90,7 @@ test('gateway spawn env probe has bridge token and no TRUST_BRIDGE trio', { time
     args: [stubGateway],
     localBridgeToken: createLocalBridgeToken(),
     lahGwToken: createLahGwToken(),
+    lahToken: createLahToken(),
     masterProxyPort: 18792,
     gatewayPort: port,
   })
@@ -80,6 +110,8 @@ test('gateway spawn env probe has bridge token and no TRUST_BRIDGE trio', { time
     assert.equal(body.bind, '127.0.0.1')
     assert.equal(body.tokenIsOcV3, false)
     assert.equal(body.tokenPrefix.startsWith('oc-lah-gw.'), true)
+    assert.equal(proc.lastEnv.OPENCLAUDE_ENGINES, 'ccb')
+    assert.equal(proc.lastEnv.ANTHROPIC_AUTH_TOKEN.startsWith('oc-lah.'), true)
   } finally {
     await proc.stop()
   }
@@ -93,6 +125,7 @@ test('healthz advertising file-proxy-v1 marks the gateway degraded', { timeout: 
     args: [stubGateway],
     localBridgeToken: createLocalBridgeToken(),
     lahGwToken: createLahGwToken(),
+    lahToken: createLahToken(),
     masterProxyPort: 18792,
     gatewayPort: port,
     extraEnv: { STUB_HEALTHZ_CAPS: 'durable-turn-dispatch-v1,file-proxy-v1' },

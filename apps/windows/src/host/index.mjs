@@ -37,3 +37,9 @@ export {
 export { createMuxHttpForwarder, classifyMuxHttp, connectLoopbackWs } from './muxForward.mjs'
 export { createHostRuntime } from './runtime.mjs'
 export { ElectronToHost, HostToElectron, HOST_IPC_VERSION } from './ipc.mjs'
+export { buildCcbGatewayEnv } from './gatewayProcess.mjs'
+export {
+  loadRuntimeManifest,
+  fetchArtifact,
+  defaultRuntimeRoot,
+} from './runtime/index.mjs'

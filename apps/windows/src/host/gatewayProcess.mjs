@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process'
 import http from 'node:http'
-import { FORBIDDEN_GATEWAY_ENV, LOCAL_BRIDGE_HEADER_CANON, stripForbiddenGatewayEnv } from './tokens.mjs'
+import { FORBIDDEN_GATEWAY_ENV, LOCAL_BRIDGE_HEADER_CANON, createLahToken, stripForbiddenGatewayEnv } from './tokens.mjs'
 
 export const GATEWAY_PORT = 18789
 export const FILE_PROXY_CAP = 'file-proxy-v1'
+export const DESKTOP_ENGINES = 'ccb'
 
 function killProcessTree(pid, signal = 'SIGTERM') {
   if (!pid) return
@@ -18,13 +19,42 @@ function killProcessTree(pid, signal = 'SIGTERM') {
   try { process.kill(pid, signal) } catch { /* */ }
 }
 
+function isLahCcbToken(value) {
+  return typeof value === 'string' && /^oc-lah\.[0-9a-f]{64}$/i.test(value)
+}
+
+export function buildCcbGatewayEnv({
+  lahToken,
+  egressProxyPort = 18791,
+  claudeCodePath,
+  claudeCodeEntry,
+  claudeCodeRuntime,
+}) {
+  const env = {
+    ANTHROPIC_BASE_URL: `http://127.0.0.1:${egressProxyPort}`,
+    ANTHROPIC_AUTH_TOKEN: isLahCcbToken(lahToken) ? lahToken : createLahToken(),
+    OPENCLAUDE_ENGINES: DESKTOP_ENGINES,
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    CLAUDE_CODE_MAX_RETRIES: '2',
+  }
+  if (claudeCodePath) env.OPENCLAUDE_CLAUDE_CODE_PATH = claudeCodePath
+  if (claudeCodeEntry) env.OPENCLAUDE_CLAUDE_CODE_ENTRY = claudeCodeEntry
+  if (claudeCodeRuntime) env.OPENCLAUDE_CLAUDE_CODE_RUNTIME = claudeCodeRuntime
+  return env
+}
+
 export function buildGatewayEnv({
   baseEnv = process.env,
   localBridgeToken,
   lahGwToken,
+  lahToken,
   masterProxyPort,
+  egressProxyPort = 18791,
   gatewayBind = '127.0.0.1',
   gatewayPort = GATEWAY_PORT,
+  claudeCodePath,
+  claudeCodeEntry,
+  claudeCodeRuntime,
   extraEnv = {},
 }) {
   const env = stripForbiddenGatewayEnv({
@@ -35,8 +65,16 @@ export function buildGatewayEnv({
     OPENCLAUDE_GATEWAY_PORT: String(gatewayPort),
     OPENCLAUDE_V3_MASTER_BASE_URL: `http://127.0.0.1:${masterProxyPort}`,
     OPENCLAUDE_V3_CONTAINER_TOKEN: lahGwToken,
+    ...buildCcbGatewayEnv({
+      lahToken,
+      egressProxyPort,
+      claudeCodePath,
+      claudeCodeEntry,
+      claudeCodeRuntime,
+    }),
   })
   for (const key of FORBIDDEN_GATEWAY_ENV) delete env[key]
+  delete env.ANTHROPIC_API_KEY
   return env
 }
 
@@ -47,6 +85,15 @@ export function assertGatewayEnvSafe(env) {
     }
   }
   if (typeof env.OPENCLAUDE_V3_CONTAINER_TOKEN === 'string' && env.OPENCLAUDE_V3_CONTAINER_TOKEN.startsWith('oc-v3.')) {
+    throw new Error('gateway env must not contain oc-v3')
+  }
+  if (Object.prototype.hasOwnProperty.call(env, 'ANTHROPIC_API_KEY') && env.ANTHROPIC_API_KEY) {
+    throw new Error('gateway env must not contain ANTHROPIC_API_KEY')
+  }
+  if (env.ANTHROPIC_AUTH_TOKEN && !isLahCcbToken(env.ANTHROPIC_AUTH_TOKEN)) {
+    throw new Error('ANTHROPIC_AUTH_TOKEN must use oc-lah. prefix')
+  }
+  if (typeof env.ANTHROPIC_BASE_URL === 'string' && /oc-v3\./.test(env.ANTHROPIC_BASE_URL)) {
     throw new Error('gateway env must not contain oc-v3')
   }
 }
@@ -86,8 +133,13 @@ export function createGatewayProcess({
   execPath,
   localBridgeToken,
   lahGwToken,
+  lahToken,
   masterProxyPort,
+  egressProxyPort = 18791,
   gatewayPort = GATEWAY_PORT,
+  claudeCodePath,
+  claudeCodeEntry,
+  claudeCodeRuntime,
   extraEnv = {},
   healthzPath = '/healthz',
   healthzTimeoutMs = 8_000,
@@ -138,8 +190,13 @@ export function createGatewayProcess({
     const env = buildGatewayEnv({
       localBridgeToken,
       lahGwToken,
+      lahToken,
       masterProxyPort,
+      egressProxyPort,
       gatewayPort,
+      claudeCodePath,
+      claudeCodeEntry,
+      claudeCodeRuntime,
       extraEnv,
     })
     assertGatewayEnvSafe(env)
