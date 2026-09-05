@@ -271,6 +271,10 @@ before(async () => {
       ADD COLUMN IF NOT EXISTS agent_container_id BIGINT REFERENCES agent_containers(id) ON DELETE RESTRICT;
     ALTER TABLE turn_dispatches
       ADD COLUMN IF NOT EXISTS runtime_kind TEXT;
+    ALTER TABLE agent_containers
+      ADD COLUMN IF NOT EXISTS runtime_kind TEXT NOT NULL DEFAULT 'docker';
+    ALTER TABLE chat_projects
+      ADD COLUMN IF NOT EXISTS is_research_default BOOLEAN NOT NULL DEFAULT FALSE;
   `);
   migration0176EscapedNulBackfill = (
     await pool.query<NonNullable<typeof migration0176EscapedNulBackfill>>(
