@@ -35,16 +35,13 @@
 // 错误信息区分排查方向。
 import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveBrowserExecutable } from "./lib/resolve-browser.mjs";
+import { launchJourneyBrowser, selectJourneyModel } from "./lib/journey-browser.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const require_ = createRequire(join(HERE, "..", "package.json"));
-const { chromium } = require_("playwright-core");
 
 const SSH_HOST = process.env.V5_E2E_SSH_HOST ?? "kl-mirror";
 const REMOTE_PORT = Number(process.env.V5_E2E_REMOTE_PORT ?? 18790);
@@ -169,7 +166,7 @@ const cookieDomain = new URL(BASE).hostname;
 // ── 浏览器旅程 ───────────────────────────────────────────────────────────
 let browser;
 try {
-  browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true });
+  browser = await launchJourneyBrowser();
 } catch (err) {
   fatal(2, `浏览器不可用: ${err.message}`);
 }
@@ -281,33 +278,7 @@ try {
 
     // 走真实模型选择器固定本轮模型，不直接改 storage/API。触发器回显菜单项的权威
     // display_name 才算选择生效；模型缺失、降级禁选或 UI 状态未更新都会 fail-loud。
-    const modelTrigger = page.getByRole("button", { name: "选择对话模型" });
-    await modelTrigger.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
-    await modelTrigger.click();
-    // 2026-09-05 selfhost df78c8c9b: Terra/Luna 收进折叠组「更多 GPT 模型」(data-collapsed-group)。
-    // 旅程模型若不在首屏菜单里,先展开折叠组(onSelect preventDefault,菜单保持打开),再找菜单项。
-    // 与 App.test b940064f1 同一契约;折叠组不存在(旧 UI)则直接找项,不放宽超时。
-    const modelItem = page.locator(`[data-model-id="${JOURNEY_MODEL_ID}"]`);
-    if ((await modelItem.count()) === 0) {
-      const collapsedGroup = page.locator("[data-collapsed-group]").first();
-      if ((await collapsedGroup.count()) > 0) {
-        await collapsedGroup.click();
-        await page
-          .locator('[data-collapsed-group="open"]')
-          .waitFor({ state: "visible", timeout: STEP_TIMEOUT });
-      }
-    }
-    await modelItem.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
-    const journeyModelLabel = (await modelItem.textContent())?.trim();
-    if (!journeyModelLabel) throw new Error(`旅程模型 ${JOURNEY_MODEL_ID} 缺少可见展示名`);
-    await modelItem.click();
-    const modelDeadline = Date.now() + STEP_TIMEOUT;
-    while (!((await modelTrigger.textContent()) ?? "").includes(journeyModelLabel)) {
-      if (Date.now() > modelDeadline) {
-        throw new Error(`模型选择器未在超时窗内切换到 ${JOURNEY_MODEL_ID}`);
-      }
-      await new Promise((r) => setTimeout(r, 100));
-    }
+    await selectJourneyModel(page, JOURNEY_MODEL_ID, { timeout: STEP_TIMEOUT });
   });
 
   const probeName = `e2e-journey-${Date.now().toString(36)}.txt`;
