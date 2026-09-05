@@ -102,20 +102,31 @@ async function waitFor(pred: () => boolean | Promise<boolean>, timeoutMs = 2000,
   return false;
 }
 
+// 0144 guards require migration-seeded runtime models to remain active and priced.
+// Delete only our fixtures; the compatibility trigger stages a new version on reinsertion.
+// Runtime requirements and immutable retired catalog history remain intact.
+let seededPricingCount = 0;
+async function resetPricingFixture(): Promise<void> {
+  await query("DELETE FROM model_pricing WHERE model_id LIKE 'claude-n5-%' OR model_id = 'legacy-v1'");
+  const count = await query<{ count: string }>("SELECT count(*)::text AS count FROM model_pricing");
+  seededPricingCount = Number(count.rows[0].count);
+}
+
 // ───────────────────────────────────────────────────────────────────
 describe("PricingCache.load (integ)", () => {
   beforeEach(async () => {
     if (!pgAvailable) return;
-    // 恢复 seed 状态
-    await query("DELETE FROM model_pricing");
+    await resetPricingFixture();
+    // 独立模型 fixture，不修改运行必需模型或复活 retired 版本。
+    await query("UPDATE model_pricing SET visibility = 'admin'");
     await query(
       `INSERT INTO model_pricing(model_id, display_name,
          input_per_mtok, output_per_mtok,
          cache_read_per_mtok, cache_write_per_mtok,
          multiplier, enabled, sort_order)
        VALUES
-         ('claude-sonnet-4-6','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100),
-         ('claude-opus-4-7','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90)`,
+         ('claude-n5-sonnet','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100),
+         ('claude-n5-opus','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90)`,
     );
   });
 
@@ -124,8 +135,8 @@ describe("PricingCache.load (integ)", () => {
     const p = new PricingCache();
     await p.load();
     try {
-      assert.equal(p.size(), 2);
-      const sonnet = p.get("claude-sonnet-4-6");
+      assert.equal(p.size(), seededPricingCount + 2);
+      const sonnet = p.get("claude-n5-sonnet");
       assert.ok(sonnet, "sonnet row must load");
       assert.equal(sonnet!.display_name, "Claude Sonnet 4.6");
       assert.equal(sonnet!.input_per_mtok, 300n);
@@ -144,8 +155,8 @@ describe("PricingCache.load (integ)", () => {
     try {
       const list = p.listPublic();
       assert.equal(list.length, 2);
-      assert.equal(list[0].id, "claude-opus-4-7");
-      assert.equal(list[1].id, "claude-sonnet-4-6");
+      assert.equal(list[0].id, "claude-n5-opus");
+      assert.equal(list[1].id, "claude-n5-sonnet");
       // 6-decimal string format
       assert.match(list[0].input_per_ktok_credits, /^\d+\.\d{6}$/);
     } finally {
@@ -165,7 +176,7 @@ describe("PricingCache.load (integ)", () => {
     const p = new PricingCache();
     await p.load();
     try {
-      assert.equal(p.size(), 3);
+      assert.equal(p.size(), seededPricingCount + 3);
       assert.ok(p.get("legacy-v1"), "disabled model still accessible via get()");
       const list = p.listPublic();
       assert.equal(list.length, 2, "disabled model excluded from public list");
@@ -180,13 +191,14 @@ describe("PricingCache.load (integ)", () => {
 describe("PricingCache LISTEN/NOTIFY auto-reload (integ)", () => {
   beforeEach(async () => {
     if (!pgAvailable) return;
-    await query("DELETE FROM model_pricing");
+    await resetPricingFixture();
+    await query("UPDATE model_pricing SET visibility = 'admin'");
     await query(
       `INSERT INTO model_pricing(model_id, display_name,
          input_per_mtok, output_per_mtok,
          cache_read_per_mtok, cache_write_per_mtok,
          multiplier, enabled, sort_order)
-       VALUES ('claude-sonnet-4-6','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100)`,
+       VALUES ('claude-n5-sonnet','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100)`,
     );
   });
 
@@ -198,10 +210,10 @@ describe("PricingCache LISTEN/NOTIFY auto-reload (integ)", () => {
     await p.load();
     await p.startListener(TEST_DB_URL);
     try {
-      assert.equal(p.get("claude-sonnet-4-6")!.multiplier, "2.000");
+      assert.equal(p.get("claude-n5-sonnet")!.multiplier, "2.000");
 
-      await query("UPDATE model_pricing SET multiplier = 3.500 WHERE model_id = $1", ["claude-sonnet-4-6"]);
-      const reloaded = await waitFor(() => p.get("claude-sonnet-4-6")?.multiplier === "3.500");
+      await query("UPDATE model_pricing SET multiplier = 3.500 WHERE model_id = $1", ["claude-n5-sonnet"]);
+      const reloaded = await waitFor(() => p.get("claude-n5-sonnet")?.multiplier === "3.500");
       assert.ok(reloaded, "cache must reload within 2s");
       assert.ok(reloads >= 1, "onReload must fire at least once from NOTIFY");
     } finally {
@@ -215,17 +227,17 @@ describe("PricingCache LISTEN/NOTIFY auto-reload (integ)", () => {
     await p.load();
     await p.startListener(TEST_DB_URL);
     try {
-      assert.equal(p.get("claude-haiku-4-5"), null);
+      assert.equal(p.get("claude-n5-haiku"), null);
       await query(
         `INSERT INTO model_pricing(model_id, display_name,
            input_per_mtok, output_per_mtok,
            cache_read_per_mtok, cache_write_per_mtok,
            multiplier, enabled, sort_order)
-         VALUES ('claude-haiku-4-5','Claude Haiku 4.5',80,400,8,100,2.0,TRUE,110)`,
+         VALUES ('claude-n5-haiku','Claude Haiku 4.5',80,400,8,100,2.0,TRUE,110)`,
       );
-      const reloaded = await waitFor(() => p.get("claude-haiku-4-5") !== null);
+      const reloaded = await waitFor(() => p.get("claude-n5-haiku") !== null);
       assert.ok(reloaded, "new row must appear in cache after NOTIFY");
-      assert.equal(p.get("claude-haiku-4-5")!.display_name, "Claude Haiku 4.5");
+      assert.equal(p.get("claude-n5-haiku")!.display_name, "Claude Haiku 4.5");
     } finally {
       await p.shutdown();
     }
@@ -237,9 +249,9 @@ describe("PricingCache LISTEN/NOTIFY auto-reload (integ)", () => {
     await p.load();
     await p.startListener(TEST_DB_URL);
     try {
-      assert.ok(p.get("claude-sonnet-4-6"));
-      await query("DELETE FROM model_pricing WHERE model_id = $1", ["claude-sonnet-4-6"]);
-      const gone = await waitFor(() => p.get("claude-sonnet-4-6") === null);
+      assert.ok(p.get("claude-n5-sonnet"));
+      await query("DELETE FROM model_pricing WHERE model_id = $1", ["claude-n5-sonnet"]);
+      const gone = await waitFor(() => p.get("claude-n5-sonnet") === null);
       assert.ok(gone, "row must disappear from cache after NOTIFY");
     } finally {
       await p.shutdown();
@@ -259,7 +271,8 @@ describe("/api/public/models (http integ)", () => {
 
   before(async () => {
     if (!pgAvailable || !redis) return;
-    await query("DELETE FROM model_pricing");
+    await resetPricingFixture();
+    await query("UPDATE model_pricing SET visibility = 'admin'");
     // 注意:haiku 故意 enabled=TRUE 模拟生产状态(boss 翻 true 让 WebFetch 能用),
     // 但 listPublic / /api/public/models 必须把它过滤掉(品牌叙事:UI 不展示)。
     // 0049 后 visibility 列控制 listPublic 过滤;haiku 显式 visibility='admin'
@@ -270,9 +283,9 @@ describe("/api/public/models (http integ)", () => {
          cache_read_per_mtok, cache_write_per_mtok,
          multiplier, enabled, sort_order, visibility)
        VALUES
-         ('claude-sonnet-4-6','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100,'public'),
-         ('claude-opus-4-7','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90,'public'),
-         ('claude-haiku-4-5','Claude Haiku 4.5',80,400,8,100,1.5,TRUE,110,'admin')`,
+         ('claude-n5-sonnet','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100,'public'),
+         ('claude-n5-opus','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90,'public'),
+         ('claude-n5-haiku','Claude Haiku 4.5',80,400,8,100,1.5,TRUE,110,'admin')`,
     );
     pricing = new PricingCache();
     await pricing.load();
@@ -313,11 +326,11 @@ describe("/api/public/models (http integ)", () => {
     // opus first (sort_order 90). Opus 4.7 pricing per migration 0020:
     // 500/2500 cents/Mtok × 2.0 mul → 0.010/0.050 credits/ktok (under legacy
     // "1 积分 = ¥1 = 100 分" formula in perKtokCredits; see pricing.ts).
-    assert.equal(j.models[0].id, "claude-opus-4-7");
+    assert.equal(j.models[0].id, "claude-n5-opus");
     assert.equal(j.models[0].input_per_ktok_credits, "0.010000");
     assert.equal(j.models[0].output_per_ktok_credits, "0.050000");
     assert.equal(j.models[0].multiplier, "2.000");
-    assert.equal(j.models[1].id, "claude-sonnet-4-6");
+    assert.equal(j.models[1].id, "claude-n5-sonnet");
     assert.equal(j.models[1].input_per_ktok_credits, "0.006000");
   });
 
@@ -326,13 +339,13 @@ describe("/api/public/models (http integ)", () => {
       t.skip("fixtures not ready");
       return;
     }
-    // 端到端验证:DB 里 haiku enabled=TRUE 且 PricingCache.get('claude-haiku-4-5')
+    // 端到端验证:DB 里 haiku enabled=TRUE 且 PricingCache.get('claude-n5-haiku')
     // 命中(下条 assertion);但 /api/public/models 响应里**不**含 haiku。
     // 这把品牌侧的"前台不展示"行为锁死在 http 出口。
-    assert.ok(pricing!.get("claude-haiku-4-5"), "DB 里 haiku 仍应可路由");
+    assert.ok(pricing!.get("claude-n5-haiku"), "DB 里 haiku 仍应可路由");
     const r = await fetch(`${baseUrl}/api/public/models`);
     const j = (await r.json()) as { models: Array<{ id: string }> };
-    assert.ok(!j.models.some((m) => m.id === "claude-haiku-4-5"));
+    assert.ok(!j.models.some((m) => m.id === "claude-n5-haiku"));
     assert.equal(j.models.length, 2, "只有 sonnet + opus 出现在 picker");
   });
 
