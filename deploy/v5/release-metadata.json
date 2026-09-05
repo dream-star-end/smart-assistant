@@ -150,7 +150,8 @@
     "0266_drop_user_channel_active",
     "0267_turn_dispatches_agent_container",
     "0268_desktop_session_secret_generation",
-    "0269_cursor_usd_150_credits"
+    "0269_cursor_usd_150_credits",
+    "0270_cursor_claude_200_others_100_grok_admin"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
