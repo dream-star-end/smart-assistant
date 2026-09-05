@@ -151,7 +151,8 @@
     "0267_turn_dispatches_agent_container",
     "0268_desktop_session_secret_generation",
     "0269_cursor_usd_150_credits",
-    "0270_cursor_claude_200_others_100_grok_admin"
+    "0270_cursor_claude_200_others_100_grok_admin",
+    "0271_cursor_retire_fable5_add_sonnet5"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

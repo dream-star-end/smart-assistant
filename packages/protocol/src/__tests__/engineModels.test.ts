@@ -109,7 +109,7 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
 
 describe('Cursor engine model authority', () => {
   test('pins CLI families with effort/fast metadata and excludes GPT/Codex entries', () => {
-    assert.equal(CURSOR_ENGINE_MODELS.length, 55)
+    assert.equal(CURSOR_ENGINE_MODELS.length, 60)
     assert.equal(CURSOR_ENGINE_MODELS[0].id, 'cursor-auto')
     assert.deepEqual(
       CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),
@@ -194,6 +194,10 @@ describe('Cursor engine model authority', () => {
     assert.equal(cursorCredentialModelFamily('cursor-opus-5-high'), 'other_models')
     assert.equal(cursorCredentialModelFamily('claude-fable-5-thinking-high'), 'other_models')
     assert.equal(cursorCredentialModelFamily('cursor-fable-5.1-high'), 'other_models')
+    assert.equal(cursorCredentialModelFamily('cursor-sonnet-5-high'), 'other_models')
+    assert.equal(cursorFamilySupportsFast('sonnet-5'), false)
+    assert.deepEqual(cursorFamilyEfforts('sonnet-5'), ['low', 'medium', 'high', 'xhigh', 'max'])
+    assert.equal(findCursorEngineModel('sonnet-5', 'high', false)?.upstreamModel, 'claude-sonnet-5-thinking-high')
     assert.equal(cursorCredentialModelFamily('cursor-gemini-3.8-flash-high'), 'other_models')
     assert.equal(cursorCredentialModelFamily('gemini-3.8-flash-low'), 'other_models')
   })
@@ -228,8 +232,8 @@ describe('Cursor context tier (300k default / 1M opt-in, turn-level execution ax
     assert.equal(isCursorContextTier(undefined), false)
   })
 
-  test('exactly opus-5 / opus-4.8 / fable-5 / fable-5.1 families are tiered', () => {
-    assert.deepEqual([...CURSOR_CONTEXT_TIER_FAMILIES], ['opus-5', 'opus-4.8', 'fable-5', 'fable-5.1'])
+  test('exactly opus-5 / opus-4.8 / fable-5 / fable-5.1 / sonnet-5 families are tiered', () => {
+    assert.deepEqual([...CURSOR_CONTEXT_TIER_FAMILIES], ['opus-5', 'opus-4.8', 'fable-5', 'fable-5.1', 'sonnet-5'])
     for (const model of CURSOR_ENGINE_MODELS) {
       assert.equal(
         cursorModelSupportsContextTier(model.id),
