@@ -488,6 +488,18 @@ assert_legacy_release_baseline_security() { # <absolute-release-root>
     || { echo "✗ legacy serving release 的 CCB baseline 不完整/不安全:$1" >&2; return 1; }
 }
 
+# Smoke on this deploy's newly built release stays strict (check-dir).
+# Compensation/rollback may re-serve a predecessor that predates skills added
+# in this checkout (e.g. multi-model-review). Official --rollback already
+# prefixes ROLLBACK_LEGACY_BASELINE_OK=1; compensation callers historically did
+# not, so smoke itself must pick legacy when serving != BUILT_RELEASE.
+serving_release_uses_legacy_baseline() { # <serving-release>
+  local serving="${1:-}"
+  [[ "${ROLLBACK_LEGACY_BASELINE_OK:-0}" == 1 ]] && return 0
+  [[ -n "${BUILT_RELEASE:-}" && -n "$serving" && "$serving" != "$BUILT_RELEASE" ]] && return 0
+  return 1
+}
+
 install_v5_slot_units() {
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] 安装 A/B slot + loopback baseline port guard units，启用并实测 18893 占位"
@@ -6699,13 +6711,18 @@ smoke() {
       || { echo "✗ OC_MODEL_AUTHORITY=1 但 egress 未广播 '$MODEL_AUTHORITY_EGRESS_CAP'(caps=[${ecaps:-<none>}])—— 旧 egress 进程无每请求 epoch fence;修法:deploy-v5.sh --egress" >&2; return 1; }
     echo "  ✓ 模型权威:master=[$mcaps] egress=[$ecaps](flag=1,两进程活体 capability 齐)"
   fi
-  local baseline_slot
+  local baseline_slot serving_release=""
   case "$sport" in
     18790) baseline_slot=A ;;
     18795) baseline_slot=B ;;
     *) echo "✗ 无法由 smoke port=$sport 判定 slot baseline 路径" >&2; return 1 ;;
   esac
-  assert_live_baseline_security_for_slot "$baseline_slot" || return 1
+  serving_release="$(bg_current_release "$(slot_src "$baseline_slot")")"
+  if serving_release_uses_legacy_baseline "$serving_release"; then
+    ROLLBACK_LEGACY_BASELINE_OK=1 assert_live_baseline_security_for_slot "$baseline_slot" || return 1
+  else
+    assert_live_baseline_security_for_slot "$baseline_slot" || return 1
+  fi
   echo "✓ v5 smoke 通过:隔离空壳健康、控制面静默、v3 未受影响"
 }
 

@@ -1897,6 +1897,61 @@ describe('v5 release safety lanes', () => {
     assert.doesNotMatch(prepare, /assert_release_baseline_security "\$live_release"/)
   })
 
+  test('post-rollback smoke uses legacy baseline for predecessor missing multi-model-review', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-rollback-smoke-legacy-')); dirs.push(dir)
+    const oldRelease = path.join(dir, 'rel-old')
+    const newRelease = path.join(dir, 'rel-new')
+    const copyBaseline = async (release: string) => {
+      const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
+      await mkdir(path.dirname(baseline), { recursive: true })
+      await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
+      return baseline
+    }
+    const oldBaseline = await copyBaseline(oldRelease)
+    await copyBaseline(newRelease)
+    await rm(path.join(oldBaseline, 'skills/multi-model-review'), { recursive: true })
+
+    const strictOld = spawnSync('bash', [baselineGuard, 'check-release', oldRelease], { encoding: 'utf8' })
+    assert.notEqual(strictOld.status, 0)
+    assert.match(strictOld.stderr, /skill manifest mismatch/)
+
+    const strictNew = spawnSync('bash', [baselineGuard, 'check-release', newRelease], { encoding: 'utf8' })
+    assert.equal(strictNew.status, 0, strictNew.stderr)
+
+    const legacyOld = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', oldRelease], { encoding: 'utf8' })
+    assert.equal(legacyOld.status, 0, legacyOld.stderr)
+
+    const source = await readFile(deploy, 'utf8')
+    const helper = source.match(/serving_release_uses_legacy_baseline\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(helper, /BUILT_RELEASE/)
+    assert.match(helper, /ROLLBACK_LEGACY_BASELINE_OK/)
+    const smoke = source.match(/^smoke\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
+    assert.match(smoke, /serving_release_uses_legacy_baseline "\$serving_release"/)
+    assert.match(smoke, /ROLLBACK_LEGACY_BASELINE_OK=1 assert_live_baseline_security_for_slot "\$baseline_slot"/)
+
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      `BUILT_RELEASE='${newRelease}'`,
+      `serving_release_uses_legacy_baseline '${oldRelease}' && echo old=0 || echo old=1`,
+      `serving_release_uses_legacy_baseline '${newRelease}' && echo new=0 || echo new=1`,
+      `ROLLBACK_LEGACY_BASELINE_OK=1 serving_release_uses_legacy_baseline '${newRelease}' && echo flagged=0 || echo flagged=1`,
+      'unset ROLLBACK_LEGACY_BASELINE_OK BUILT_RELEASE',
+      `serving_release_uses_legacy_baseline '${oldRelease}' && echo unknown=0 || echo unknown=1`,
+    ].join('\n')
+    const decision = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.equal(decision.status, 0, decision.stdout + decision.stderr)
+    assert.match(decision.stdout, /^old=0$/m)
+    assert.match(decision.stdout, /^new=1$/m)
+    assert.match(decision.stdout, /^flagged=0$/m)
+    assert.match(decision.stdout, /^unknown=1$/m)
+  })
+
   test('baseline release/config guards cover build, slots, smoke, canary and rollback activation', async () => {
     const [source, overrides, unitA, unitB, portGuardSocket, portGuardService, indexSource] = await Promise.all([
       readFile(deploy, 'utf8'),
