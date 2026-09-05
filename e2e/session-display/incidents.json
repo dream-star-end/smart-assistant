@@ -1197,7 +1197,8 @@
         "bab6c8c6",
         "d8b81aae",
         "54014c3d",
-        "d76aae91"
+        "d76aae91",
+        "f782c235"
       ],
       "regressions": [
         {
@@ -1214,6 +1215,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/regression-contracts/outboundDurabilityPermanentConflict.contract.test.ts",
           "assertion": "REG-20260817: permanent live-frame conflict never closes the browser or poisons later frames"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "permission authority rejection behind a busy queue never surfaces as unhandledRejection"
         }
       ]
     },
@@ -2282,6 +2288,31 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
           "assertion": "continuous failure is bounded and does not query on every frame"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "INC-20260831 gap1: typed-state proven-live running dispatch is never interrupted (16min, zero frames)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "INC-20260831 gap1: interrupt_tapeless outside the stuck page re-probes typed state; queued skips"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "INC-20260831 gap2: frame landed between scan and lock → ROLLBACK, zero UPDATE, counted stale"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "INC-20260831 gap2: first_visible appearing between scan and lock → ROLLBACK"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-visible-orphan-liveness.ts",
+          "assertion": "provenLive short-circuit must run before classifyVisibleOrphan"
         }
       ],
       "coverageCommits": [
@@ -2289,7 +2320,10 @@
         "568fb53b",
         "1c7e4aae",
         "2295a322",
-        "bfcc174e"
+        "bfcc174e",
+        "27eb21c7",
+        "89b95c33",
+        "57d40643"
       ]
     },
     {
