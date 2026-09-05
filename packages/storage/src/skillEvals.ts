@@ -5,12 +5,12 @@
  *
  * 设计约束:
  *  - 纯函数,无 I/O — 读写由 SkillStore(saveAuxFile/view(name,'evals/evals.json'))承担。
- *  - 容量上限收紧(用例≤5/断言≤8):评测跑真模型消耗用户积分,上限即成本上限。
+ *  - 容量上限收紧(用例≤8/断言≤8):评测跑真模型消耗用户积分,上限即成本上限。
  *  - autoRegression 是 P3 自动回归的 opt-in 开关,默认缺省=关闭 —— 任何自动消耗
  *    积分的行为都必须用户显式开启(boss 红线:不静默扣费)。
  */
 
-export const MAX_EVAL_CASES = 5
+export const MAX_EVAL_CASES = 8
 export const MAX_EVAL_ASSERTIONS = 8
 export const MAX_EVAL_PROMPT_CHARS = 4000
 export const MAX_EVAL_ASSERTION_CHARS = 500

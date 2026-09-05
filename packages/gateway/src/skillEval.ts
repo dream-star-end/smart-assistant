@@ -7,7 +7,7 @@
 // 然后由 grader(锁 pro 模型)按断言逐条判定 PASS/FAIL(PASS 须给证据),
 // draft 模式附带匿名 A/B 盲测偏好。数值口径:pass rate = 断言通过数/断言总数。
 //
-// 成本纪律(boss 红线):评测消耗用户积分 —— 上限即成本上限(用例≤5),每 arm 每用例
+// 成本纪律(boss 红线):评测消耗用户积分 —— 上限即成本上限(用例≤8),每 arm 每用例
 // 恰一个会话一个 turn;所有用量逐 turn 累计进 run.usage,前端据公开费率折算并展示。
 
 import type { SkillEvalCase } from '@openclaude/storage'
