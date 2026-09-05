@@ -372,11 +372,17 @@ describe('loadVerifiedContract', () => {
     )
   })
 
-  test('kind 被篡改成 skill → WRONG_ARTIFACT_KIND(P0-2)', async (t) => {
+  test('kind 被篡改成 skill → listing kind 不可变(0153)', async (t) => {
     if (skipIfNoDb(t)) return
-    const { versionId, slug } = await approved()
-    await query(`UPDATE marketplace_skill_listings SET kind='skill' WHERE slug=$1`, [slug])
-    await assert.rejects(loadVerifiedContract(versionId, getPool()), isCode('WRONG_ARTIFACT_KIND'))
+    const { slug } = await approved()
+    // 0153 made kind/plugin_type immutable at the trigger. Tampering is now
+    // refused at UPDATE (stronger than the previous load-time WRONG_ARTIFACT_KIND).
+    // loadVerifiedContract still rejects skill/agent versions — covered by
+    // 'skill/agent version 调本函数 → WRONG_ARTIFACT_KIND(P0-2)'.
+    await assert.rejects(
+      () => query(`UPDATE marketplace_skill_listings SET kind='skill' WHERE slug=$1`, [slug]),
+      /kind\/plugin_type is immutable/,
+    )
   })
 
   test('exec_revoked_at 置位 → EXEC_REVOKED(fail-closed)', async (t) => {

@@ -11,7 +11,7 @@ import path from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { loadCatalogSnapshot } from '../billing/modelCatalog.js'
+import { loadCatalogSnapshotPrePlanGate as loadCatalogSnapshot } from './helpers/historicalCatalogSnapshot.js'
 import { query } from '../db/queries.js'
 import { resetAndMigrateBefore, useDedicatedTestDatabase } from './helpers/db.js'
 
