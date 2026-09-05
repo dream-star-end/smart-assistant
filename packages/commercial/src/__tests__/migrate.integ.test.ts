@@ -1066,7 +1066,7 @@ describe("migrate.runMigrations", () => {
     assert.deepEqual(luna.rows, [{
       state: "active",
       enabled: true,
-      visibility: "hidden",
+      visibility: "public",
       default_effort: "medium",
       capability_profile: {
         ccb: { capability_zero: false, supports_thinking: false },
