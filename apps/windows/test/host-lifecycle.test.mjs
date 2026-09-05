@@ -72,7 +72,7 @@ async function withMaster(fn, extra = {}) {
   }
 }
 
-test('runtime: mint, bind proxies, mux OPEN_HTTP reaches stub gateway with local-bridge header', async () => {
+test('runtime: mint, bind proxies, mux OPEN_HTTP reaches stub gateway with local-bridge header', { timeout: 20_000 }, async () => {
   await withMaster(async (stub, originPort) => {
     const gatewayPort = await freePort()
     const origin = `https://127.0.0.1:${originPort}`
@@ -139,7 +139,7 @@ test('runtime: mint, bind proxies, mux OPEN_HTTP reaches stub gateway with local
   })
 })
 
-test('short expires_in refreshes and reconnects the tunnel', async () => {
+test('short expires_in refreshes and reconnects the tunnel', { timeout: 20_000 }, async () => {
   const stub = createStub18445({
     originKey: pem('origin.key'),
     originCert: pem('origin.crt'),
@@ -175,7 +175,7 @@ test('short expires_in refreshes and reconnects the tunnel', async () => {
   }
 })
 
-test('hostMain IPC handshake, start, and parent exit tears down Host', async () => {
+test('hostMain IPC handshake, start, and parent exit tears down Host', { timeout: 20_000 }, async () => {
   const stub = createStub18445({
     originKey: pem('origin.key'),
     originCert: pem('origin.crt'),

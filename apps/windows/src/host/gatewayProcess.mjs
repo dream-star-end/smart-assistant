@@ -200,16 +200,30 @@ export function createGatewayProcess({
         clearTimeout(restartTimer)
         restartTimer = null
       }
-      const pid = child?.pid
+      const current = child
+      const pid = current?.pid
       if (pid) {
+        const exited = new Promise((resolve) => {
+          if (!current.exitCode && current.exitCode !== 0 && current.killed !== true) {
+            current.once('exit', () => resolve())
+          } else resolve()
+        })
         if (process.platform === 'win32') {
           killProcessTree(pid)
+          try { current.kill() } catch { /* */ }
         } else {
           try { process.kill(-pid, 'SIGTERM') } catch { /* */ }
-          try { child.kill('SIGTERM') } catch { /* */ }
-          await new Promise((r) => setTimeout(r, 80))
-          try { process.kill(-pid, 'SIGKILL') } catch { /* */ }
-          try { child.kill('SIGKILL') } catch { /* */ }
+          try { current.kill('SIGTERM') } catch { /* */ }
+        }
+        const timer = new Promise((r) => setTimeout(r, 400))
+        await Promise.race([exited, timer])
+        if (current.exitCode == null && !current.killed) {
+          if (process.platform === 'win32') killProcessTree(pid)
+          else {
+            try { process.kill(-pid, 'SIGKILL') } catch { /* */ }
+            try { current.kill('SIGKILL') } catch { /* */ }
+          }
+          await Promise.race([exited, new Promise((r) => setTimeout(r, 200))])
         }
       }
       child = null

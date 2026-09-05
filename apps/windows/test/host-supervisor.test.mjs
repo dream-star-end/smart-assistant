@@ -54,7 +54,7 @@ function freePort() {
   })
 }
 
-test('supervisor spawn + stop makes Host exit; identity is not on argv/env', async () => {
+test('supervisor spawn + stop makes Host exit; identity is not on argv/env', { timeout: 20_000 }, async () => {
   const stub = createStub18445({
     originKey: pem('origin.key'),
     originCert: pem('origin.crt'),

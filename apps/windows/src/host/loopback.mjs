@@ -15,16 +15,27 @@ export function remoteAddressOf(req) {
   return req?.socket?.remoteAddress || req?.connection?.remoteAddress || ''
 }
 
-export function listenExclusive(server, { host, port, ipv6Only } = {}) {
+export function listenExclusive(server, { host, port, ipv6Only, timeoutMs = 2_000 } = {}) {
   return new Promise((resolve, reject) => {
-    const onError = (err) => {
-      server.off('listening', onListening)
-      reject(err)
-    }
-    const onListening = () => {
+    let settled = false
+    const done = (err, addr) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
       server.off('error', onError)
-      resolve(server.address())
+      server.off('listening', onListening)
+      if (err) reject(err)
+      else resolve(addr)
     }
+    const onError = (err) => done(err)
+    const onListening = () => done(null, server.address())
+    const timer = setTimeout(() => {
+      const err = new Error(`listen timeout ${host}:${port}`)
+      err.code = 'LISTEN_TIMEOUT'
+      try { server.close() } catch { /* */ }
+      done(err)
+    }, timeoutMs)
+    timer.unref?.()
     server.once('error', onError)
     server.once('listening', onListening)
     const opts = { host, port, exclusive: true }
@@ -33,7 +44,9 @@ export function listenExclusive(server, { host, port, ipv6Only } = {}) {
   })
 }
 
-export async function listenLoopbackPair(createServer, port, { alsoV6 = true } = {}) {
+const SOFT_V6 = new Set(['EADDRNOTAVAIL', 'EAFNOSUPPORT', 'EACCES', 'EINVAL', 'LISTEN_TIMEOUT'])
+
+export async function listenLoopbackPair(createServer, port, { alsoV6 = true, requireV6 = false } = {}) {
   const v4 = createServer()
   await listenExclusive(v4, { host: LOOPBACK_V4, port })
   const boundPort = v4.address().port
@@ -43,9 +56,12 @@ export async function listenLoopbackPair(createServer, port, { alsoV6 = true } =
     try {
       await listenExclusive(v6, { host: LOOPBACK_V6, port: boundPort, ipv6Only: true })
     } catch (err) {
-      v4.close()
       try { v6.close() } catch { /* */ }
-      throw err
+      v6 = null
+      if (requireV6 || !SOFT_V6.has(err.code)) {
+        try { v4.close() } catch { /* */ }
+        throw err
+      }
     }
   }
   return { v4, v6, port: boundPort }

@@ -54,7 +54,7 @@ test('healthzHasFileProxy detects the capability string', () => {
   assert.equal(healthzHasFileProxy('file-proxy-v1'), true)
 })
 
-test('gateway spawn env probe has bridge token and no TRUST_BRIDGE trio', async () => {
+test('gateway spawn env probe has bridge token and no TRUST_BRIDGE trio', { timeout: 15_000 }, async () => {
   const port = await freePort()
   const proc = createGatewayProcess({
     command: process.execPath,
@@ -85,7 +85,7 @@ test('gateway spawn env probe has bridge token and no TRUST_BRIDGE trio', async 
   }
 })
 
-test('healthz advertising file-proxy-v1 marks the gateway degraded', async () => {
+test('healthz advertising file-proxy-v1 marks the gateway degraded', { timeout: 15_000 }, async () => {
   const port = await freePort()
   const alarms = []
   const proc = createGatewayProcess({
