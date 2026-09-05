@@ -195,6 +195,9 @@ const ContainerWebPreview = lazy(() =>
 const MediaTaskCenter = lazy(() =>
   import("./components/MediaTaskCenter").then((m) => ({ default: m.MediaTaskCenter })),
 );
+const ChatGptProxyDialog = lazy(() =>
+  import("./components/ChatGptProxyDialog").then((m) => ({ default: m.ChatGptProxyDialog })),
+);
 const TaskboardView = lazy(() =>
   import("./components/taskboard/TaskboardView").then((m) => ({ default: m.TaskboardView })),
 );
@@ -359,6 +362,9 @@ export function App() {
   const [mediaTasksOpen, setMediaTasksOpen] = useState(false);
   // 「视频任务」入口门控:null=未知(保持可见),false=账号未开放(隐藏死入口)。
   const [mediaTasksAvailable, setMediaTasksAvailable] = useState<boolean | null>(null);
+  // 「ChatGPT 直连」入口门控:服务端 GET /api/chatgpt-proxy/access 明确 enabled 才显示(默认隐藏)。
+  const [chatGptProxyEnabled, setChatGptProxyEnabled] = useState(false);
+  const [chatGptProxyOpen, setChatGptProxyOpen] = useState(false);
   const [liveMediaJob, setLiveMediaJob] = useState<MediaGenerationJob | null>(null);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(bootPanel === "manage");
@@ -2229,6 +2235,28 @@ export function App() {
     };
   }, [mediaGateEnabled]);
 
+  // ChatGPT 直连授权探测:登录后拉一次。与视频任务相反,这里默认隐藏、只有服务端明确
+  // enabled:true 才显示入口 —— 未授权用户看不到任何代理信息。
+  useEffect(() => {
+    if (!mediaGateEnabled) {
+      setChatGptProxyEnabled(false);
+      setChatGptProxyOpen(false);
+      return;
+    }
+    let cancelled = false;
+    api
+      .getChatGptProxyAccess(authRef.current)
+      .then((access) => {
+        if (!cancelled) setChatGptProxyEnabled(access.enabled === true);
+      })
+      .catch(() => {
+        if (!cancelled) setChatGptProxyEnabled(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaGateEnabled]);
+
   // 已评回读：切会话/登录后拉一次 GET，填充已评态（重开会话时高亮 👍/👎、避免重复采集）。
   // 依赖用**派生布尔**（非 user 对象，refreshMe 换引用不误触发清空）+ activeId。切会话先清
   // 旧 Map（防串态），再异步注水；cancelled 守卫防慢响应覆盖新会话。demo/未登录不拉。
@@ -2881,6 +2909,7 @@ export function App() {
     onOpenTutorial: demo ? undefined : () => openTutorial(),
     onOpenMediaTasks:
       demo || mediaTasksAvailable === false ? undefined : () => setMediaTasksOpen(true),
+    onOpenChatGptProxy: !demo && chatGptProxyEnabled ? () => setChatGptProxyOpen(true) : undefined,
     theme,
     onCycleTheme: cycle,
     // 管理后台入口:仅平台超管(user.role === 'admin')可见,导航到 React 管理后台
@@ -3006,6 +3035,7 @@ export function App() {
           onOpenTutorial={closeMobileThen(sidebarProps.onOpenTutorial)}
           onOpenOrg={closeMobileThen(sidebarProps.onOpenOrg)}
           onOpenMediaTasks={closeMobileThen(sidebarProps.onOpenMediaTasks)}
+          onOpenChatGptProxy={closeMobileThen(sidebarProps.onOpenChatGptProxy)}
           onLogout={closeMobileThen(sidebarProps.onLogout)}
           width={undefined}
           onResizeStart={undefined}
@@ -3439,6 +3469,12 @@ export function App() {
             liveJob={liveMediaJob}
             onOpenChange={setMediaTasksOpen}
           />
+        </LazyBoundary>
+      )}
+
+      {!demo && auth && chatGptProxyEnabled && chatGptProxyOpen && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <ChatGptProxyDialog open={chatGptProxyOpen} auth={auth} onOpenChange={setChatGptProxyOpen} />
         </LazyBoundary>
       )}
 

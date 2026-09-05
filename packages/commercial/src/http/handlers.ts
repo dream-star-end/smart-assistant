@@ -107,6 +107,7 @@ import {
 } from "../inbox/assets.js";
 import type { ContainerPreviewTicketStore } from '../ws/containerPreviewTickets.js'
 import type { DirectContainerPreviewService } from '../ws/directContainerPreview.js'
+import type { ChatGptProxyHttpDeps } from './chatgptProxy.js'
 import type { PluginRuntimeFacade } from '../plugins/runtime.js'
 import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetup.js'
 import type { WeiboSetupManager } from '../plugins/weiboSetup.js'
@@ -127,6 +128,8 @@ export interface CommercialHttpDeps {
   containerPreviewAvailable?: () => boolean;
   /** Optional native iframe transport; legacy screencast remains the fallback. */
   directContainerPreview?: DirectContainerPreviewService
+  /** ChatGPT direct-connect proxy management; undefined when the listener is off. */
+  chatgptProxy?: ChatGptProxyHttpDeps
   /** Signed Plugin catalog/accounts runtime for the browser management surface. */
   pluginRuntime?: PluginRuntimeFacade
   /** Short-lived managed login coordinator for the official Knowledge Planet Plugin. */

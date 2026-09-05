@@ -55,6 +55,11 @@
       "openclaude-precompiled": "./dist/containerPreview.js",
       "default": "./src/containerPreview.ts"
     },
+    "./chatgptProxy": {
+      "types": "./src/chatgptProxy.ts",
+      "openclaude-precompiled": "./dist/chatgptProxy.js",
+      "default": "./src/chatgptProxy.ts"
+    },
     "./containerPreviewAuth": {
       "types": "./src/containerPreviewAuth.ts",
       "openclaude-precompiled": "./dist/containerPreviewAuth.js",

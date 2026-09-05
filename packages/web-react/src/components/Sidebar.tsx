@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   Film,
+  Globe,
   Kanban,
   LayoutGrid,
   LogOut,
@@ -112,6 +113,8 @@ export type SidebarProps = {
   onOpenOrg?: () => void;
   onOpenBoard?: () => void;
   onOpenMediaTasks?: () => void;
+  /** 「ChatGPT 直连」面板入口:仅管理员 / 白名单用户且服务端已开启时由 App 传入。 */
+  onOpenChatGptProxy?: () => void;
   boardActive?: boolean;
   showAdmin?: boolean;
   theme?: Theme;
@@ -173,6 +176,7 @@ export function Sidebar({
   onOpenOrg,
   onOpenBoard,
   onOpenMediaTasks,
+  onOpenChatGptProxy,
   boardActive,
   showAdmin,
   theme,
@@ -411,6 +415,7 @@ export function Sidebar({
       onOpenOrg ||
       showAdmin ||
       onOpenMediaTasks ||
+      onOpenChatGptProxy ||
       onOpenAccount ||
       onOpenFeedback ||
       onLogout,
@@ -814,8 +819,19 @@ export function Sidebar({
                   视频任务
                 </DropdownMenuItem>
               )}
+              {onOpenChatGptProxy && (
+                <DropdownMenuItem data-product-control onSelect={onOpenChatGptProxy}>
+                  <Globe size={16} className="shrink-0 text-muted" />
+                  ChatGPT 直连
+                </DropdownMenuItem>
+              )}
               {(onOpenAccount || onOpenFeedback || onLogout) &&
-                (onOpenManage || onOpenMarketplace || onOpenOrg || showAdmin || onOpenMediaTasks) && (
+                (onOpenManage ||
+                  onOpenMarketplace ||
+                  onOpenOrg ||
+                  showAdmin ||
+                  onOpenMediaTasks ||
+                  onOpenChatGptProxy) && (
                   <DropdownMenuSeparator />
                 )}
               {onOpenAccount && (

@@ -18,6 +18,7 @@ import {
   markDesktopTunnelHeartbeat,
   DesktopTunnelGenerationError,
 } from "./desktopTunnelRegistry.js";
+import { invalidateDesktopRowMiss } from "../desktop/desktopRowCache.js";
 import { extractDesktopTlsContext, type PeerCertReader } from "../desktop/tlsContext.js";
 import { getDesktopFlagSnapshot } from "../desktop/flags.js";
 import { createPgDesktopIdentityRepo } from "../http/desktopEnroll.js";
@@ -201,7 +202,7 @@ export function handleDesktopRegisterUpgrade(
             },
           });
           try {
-            getDesktopTunnelRegistry().attach(ident.containerId, {
+            await getDesktopTunnelRegistry().attach(ident.containerId, {
               mux,
               close: (code, reason) => {
                 try { ws.close(code ?? 4001, reason); } catch { /* */ }
@@ -212,6 +213,7 @@ export function handleDesktopRegisterUpgrade(
               expiresAt: exp,
               generation: upgradeGeneration,
             });
+            invalidateDesktopRowMiss(ident.userId);
           } catch (err) {
             if (err instanceof DesktopTunnelGenerationError) {
               ws.close(1008, "stale_generation");

@@ -4,8 +4,13 @@ import { ContainerUnreadyError } from "../ws/userChatBridge.js";
 import {
   makeDesktopOrDockerResolver,
   makeInboundChannelResolver,
+  makeDesktopEnsureAttached,
+  resetDesktopEnsureCacheForTest,
+  invalidateDesktopRowMiss,
   type DesktopAttachedEndpoint,
 } from "../agent-sandbox/desktopEnsure.js";
+import { createMemoryDesktopTunnelRegistry } from "../ws/desktopTunnelRegistry.js";
+import { createMemoryDesktopTunnelOwnerStore } from "../ws/desktopTunnelOwnerStore.js";
 
 const desktopEp: DesktopAttachedEndpoint = {
   host: "desktop-reverse",
@@ -41,6 +46,22 @@ describe("makeDesktopOrDockerResolver", () => {
     await assert.rejects(
       () => resolve(1n),
       (e: unknown) => e instanceof ContainerUnreadyError && e.reason === "desktop_offline",
+    );
+    assert.equal(dockerCalls, 0);
+  });
+
+  test("owned_elsewhere does not provision docker", async () => {
+    let dockerCalls = 0;
+    const docker = async () => {
+      dockerCalls += 1;
+      return { host: "127.0.0.1", port: 1 };
+    };
+    const resolve = makeDesktopOrDockerResolver(docker, async () => {
+      throw new ContainerUnreadyError(5, "desktop_owned_elsewhere");
+    });
+    await assert.rejects(
+      () => resolve(1n),
+      (e: unknown) => e instanceof ContainerUnreadyError && e.reason === "desktop_owned_elsewhere",
     );
     assert.equal(dockerCalls, 0);
   });
@@ -96,5 +117,76 @@ describe("makeInboundChannelResolver", () => {
       () => inbound(1n),
       (e: unknown) => e instanceof ContainerUnreadyError && e.reason === "supervisor_not_wired",
     );
+  });
+});
+
+describe("makeDesktopEnsureAttached owner miss", () => {
+  test("self owner + memory miss is desktop_offline not owned_elsewhere", async () => {
+    resetDesktopEnsureCacheForTest();
+    const store = createMemoryDesktopTunnelOwnerStore();
+    const reg = createMemoryDesktopTunnelRegistry({ instanceId: "self", owners: store });
+    await store.upsert({
+      agentContainerId: 5,
+      instanceId: "self",
+      instanceAddr: "127.0.0.1:18445",
+      generation: 1,
+      ownerEpoch: 1,
+    });
+    await assert.rejects(
+      () => makeDesktopEnsureAttached(1n, {
+        flags: async () => ({
+          envEnabled: true, killSwitch: false, settingsOn: true, allowlist: [1], assembled: true,
+        }),
+        findDesktopContainerId: async () => 5,
+        registry: reg,
+      }),
+      (e: unknown) => e instanceof ContainerUnreadyError && e.reason === "desktop_offline",
+    );
+  });
+});
+
+describe("W05-IMPL-02 negative cache invalidation", () => {
+  test("without invalidate, a newly appearing row stays cached-null (the bug)", async () => {
+    resetDesktopEnsureCacheForTest();
+    let finds = 0;
+    let id: number | null = null;
+    const deps = {
+      flags: async () => ({
+        envEnabled: true, killSwitch: false, settingsOn: true, allowlist: [1], assembled: true,
+      }),
+      findDesktopContainerId: async () => {
+        finds += 1;
+        return id;
+      },
+      now: () => 1_000,
+    };
+    assert.equal(await makeDesktopEnsureAttached(7n, deps), null);
+    id = 42;
+    assert.equal(await makeDesktopEnsureAttached(7n, deps), null);
+    assert.equal(finds, 1);
+  });
+
+  test("invalidateDesktopRowMiss forces a SELECT within TTL, not silent docker", async () => {
+    resetDesktopEnsureCacheForTest();
+    let finds = 0;
+    let id: number | null = null;
+    const deps = {
+      flags: async () => ({
+        envEnabled: true, killSwitch: false, settingsOn: true, allowlist: [1], assembled: true,
+      }),
+      findDesktopContainerId: async () => {
+        finds += 1;
+        return id;
+      },
+      now: () => 1_000,
+    };
+    assert.equal(await makeDesktopEnsureAttached(7n, deps), null);
+    id = 42;
+    invalidateDesktopRowMiss(7);
+    await assert.rejects(
+      () => makeDesktopEnsureAttached(7n, deps),
+      (e: unknown) => e instanceof ContainerUnreadyError && e.reason === "desktop_offline",
+    );
+    assert.equal(finds, 2);
   });
 });

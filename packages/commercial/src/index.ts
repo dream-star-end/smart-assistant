@@ -130,6 +130,10 @@ import { extractDesktopTlsContext } from "./desktop/tlsContext.js";
 import { makeDesktopContainerTransport } from "./wechat/desktopContainerTransport.js";
 import { resolveDispatchEndpoint } from "./dispatch/resolveDispatchEndpoint.js";
 import { getDesktopFlagSnapshot } from "./desktop/flags.js";
+import { ChatGptProxyCredentialStore } from "./chatgptProxy/credentials.js";
+import { getChatGptProxyFlagSnapshot, readChatGptProxyEnv } from "./chatgptProxy/flags.js";
+import { createChatGptProxyServer, type ChatGptProxyServer } from "./chatgptProxy/server.js";
+import type { ChatGptProxyHttpDeps } from "./http/chatgptProxy.js";
 import { getDesktopTunnelRegistry } from "./ws/desktopTunnelRegistry.js";
 import {
   startAuditRetentionSweeper,
@@ -3963,6 +3967,64 @@ export async function registerCommercial(
     }
   }
 
+  // ChatGPT 直连代理:公网 TLS CONNECT 监听(仅白名单域名),链到订阅 egress。
+  // env fail-closed;证书缺失/配置错 → 记 error、功能关闭,不影响 master 启动。
+  let chatgptProxyServer: ChatGptProxyServer | undefined;
+  let chatgptProxyHttp: ChatGptProxyHttpDeps | undefined;
+  {
+    const cgpEnv = readChatGptProxyEnv();
+    if (cgpEnv.enabled && runtimeChannel === "v5" && v3Deps) {
+      if (cgpEnv.configError || !cgpEnv.upstream) {
+        rootLogger.error("[commercial] chatgpt proxy disabled: bad config", {
+          error: cgpEnv.configError ?? "no upstream",
+        });
+      } else {
+        try {
+          const cgpLogger = rootLogger.child({ subsys: "commercial", module: "chatgptProxy" });
+          const credentials = new ChatGptProxyCredentialStore(v3Deps.pool);
+          const pool = v3Deps.pool;
+          chatgptProxyServer = createChatGptProxyServer({
+            publicHost: cgpEnv.publicHost,
+            port: cgpEnv.port,
+            tlsCertPath: cgpEnv.tlsCertPath,
+            tlsKeyPath: cgpEnv.tlsKeyPath,
+            upstream: cgpEnv.upstream,
+            verifyCredential: (uid, secret) => credentials.verify(uid, secret),
+            resolveUserRole: async (uid) => {
+              const r = await pool.query<{ role: string }>(
+                `SELECT role FROM users WHERE id = $1::bigint AND status = 'active' LIMIT 1`,
+                [uid],
+              );
+              const role = r.rows[0]?.role;
+              return role === "admin" || role === "user" ? role : null;
+            },
+            getEntitlement: async () => {
+              const snap = await getChatGptProxyFlagSnapshot();
+              return { assembled: snap.assembled, allowlist: snap.allowlist };
+            },
+            onTunnelUsed: (uid) => credentials.touchLastUsed(uid),
+            logger: cgpLogger,
+          });
+          chatgptProxyHttp = {
+            publicHost: cgpEnv.publicHost,
+            port: cgpEnv.port,
+            credentials,
+            getFlags: () => getChatGptProxyFlagSnapshot(),
+          };
+          chatgptProxyServer.listenWithRetry();
+          // eslint-disable-next-line no-console
+          console.log(`[commercial] ChatGPT direct-connect proxy ENABLED on ${cgpEnv.publicHost}:${cgpEnv.port}`);
+        } catch (err) {
+          chatgptProxyServer = undefined;
+          chatgptProxyHttp = undefined;
+          rootLogger.error("[commercial] chatgpt proxy disabled: init failed", {
+            error: (err as Error)?.message ?? String(err),
+          });
+        }
+      }
+    }
+  }
+
   const handler = createCommercialHandler({
     jwtSecret,
     mediaGeneration: mediaGenerationService,
@@ -3970,6 +4032,7 @@ export async function registerCommercial(
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,
     directContainerPreview,
+    chatgptProxy: chatgptProxyHttp,
     pluginRuntime: pluginFacade,
     knowledgePlanetSetup,
     weiboSetup,
@@ -6619,6 +6682,9 @@ export async function registerCommercial(
       containerPreviewBridge = undefined;
       const directPreview = directContainerPreview;
       directContainerPreview = undefined;
+      const cgpServer = chatgptProxyServer;
+      chatgptProxyServer = undefined;
+      try { await cgpServer?.close(); } catch { /* ignore */ }
       try { await directPreview?.shutdown(); } catch { /* ignore */ }
       try { await previewBridge?.shutdown(); } catch { /* ignore */ }
       try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
