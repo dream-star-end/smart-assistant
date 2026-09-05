@@ -2952,7 +2952,10 @@
       "severity": "P1",
       "symptom": "OCV5-121 selfhost：容器同会话前驱仍占用时后继正常 queued，master visible-orphan 把尚未启动的排队项按 15min engine-dead 终态化并 fence；本地 live waiter 仍可迟到启动。R1 用 exact queued→rejected CAS 同步撤销消费权，历史分裂由同快照 terminal recovery 收敛，迟到原闭包静默退出。",
       "rootFixCommit": "3158524a",
-      "coverageCommits": ["2d745db7", "f3868499"],
+      "coverageCommits": [
+        "2d745db7",
+        "f3868499"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -2978,12 +2981,13 @@
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
           "assertion": "tape-state 单 statement 同时返回租户内 tape + dispatch lease 证据"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-queued-consumer.ts",
+          "assertion": "OCV5-121 hermetic deploy proof: queued waiting, exact cancellation, late-consumer silence"
         }
-      ],
-      "proofPending": {
-        "since": "2026-09-05",
-        "reason": "已按审定方案新增 pinned hermetic deploy runner；本机与 exact archive 三旅程、build_release 失败注入及类型检查通过。尚未取得 Incident 门自然全绿：临时 deploy-gate ledger 候选推进到历史 trailer 检查后，被基线已有 6922b5b0 缺 Incident trailer 阻断。保留 proofPending，不登记尚未闭环的 proof 层，不改门/waiver/历史；待队长裁决该范围外历史阻塞。"
-      }
+      ]
     }
   ]
 }
