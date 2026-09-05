@@ -120,9 +120,10 @@ async function insertV2Container(uid: number): Promise<bigint> {
     [String(uid)],
   );
   const r = await query<{ id: string }>(
+    // 0023(2026-04-22)起 secret_hash NOT NULL;v2 legacy 行给一个不可能被真实 container 算出的 32 字节占位
     `INSERT INTO agent_containers
-       (user_id, subscription_id, docker_name, workspace_volume, home_volume, image, status)
-     VALUES ($1::bigint, $2::bigint, $3, $4, $5, $6, 'running')
+       (user_id, subscription_id, docker_name, workspace_volume, home_volume, image, status, secret_hash)
+     VALUES ($1::bigint, $2::bigint, $3, $4, $5, $6, 'running', $7::bytea)
      RETURNING id::text`,
     [
       String(uid),
@@ -131,6 +132,7 @@ async function insertV2Container(uid: number): Promise<bigint> {
       `oc-ws-u${uid}`,
       `oc-home-u${uid}`,
       "openclaude/agent-runtime:test",
+      Buffer.alloc(32, 2),
     ],
   );
   return BigInt(r.rows[0]!.id);

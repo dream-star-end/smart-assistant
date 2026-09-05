@@ -47,7 +47,7 @@ function snapshotEnv(): void {
     "DATABASE_URL", "REDIS_URL", "COMMERCIAL_ENABLED",
     "COMMERCIAL_AUTO_MIGRATE", "OPENCLAUDE_KMS_KEY",
     "INTERNAL_PROXY_BIND", "INTERNAL_PROXY_PORT",
-    "COMMERCIAL_ALERTS_DISABLED",
+    "COMMERCIAL_ALERTS_DISABLED", "OPENCODE_GO_API_KEY",
   ]) ORIGINAL_ENV[k] = process.env[k];
 }
 function restoreEnv(): void {
@@ -77,6 +77,8 @@ before(async () => {
   process.env.DATABASE_URL = TEST_DB_URL;
   process.env.REDIS_URL = TEST_REDIS_URL;
   process.env.COMMERCIAL_ENABLED = "1";
+  // Boot validates the default static provider. These tests never call upstream.
+  process.env.OPENCODE_GO_API_KEY = "n5-test-only-not-a-real-key";
   process.env.OPENCLAUDE_KMS_KEY = randomBytes(32).toString("base64");
   // 静默 alert 调度器,避免后台 tick 影响 shutdown 等待
   process.env.COMMERCIAL_ALERTS_DISABLED = "1";
@@ -249,7 +251,7 @@ describe("V3 2H — registerCommercial 接入装配", () => {
       );
       const token2 = issued.token;
       const ws = new WebSocket(
-        `ws://127.0.0.1:${port}/ws/user-chat-bridge?token=${encodeURIComponent(token2)}`,
+        `ws://127.0.0.1:${port}/ws/user-chat-bridge`, ["bearer", token2],
       );
       const closeInfo = await new Promise<{ code: number; reason: string }>((resolve, reject) => {
         const t = setTimeout(() => reject(new Error("ws never closed")), 5000);
@@ -303,7 +305,7 @@ describe("V3 2H — registerCommercial 接入装配", () => {
         JWT_SECRET,
       );
       const ws = new WebSocket(
-        `ws://127.0.0.1:${port}/ws/user-chat-bridge?token=${encodeURIComponent(issued.token)}`,
+        `ws://127.0.0.1:${port}/ws/user-chat-bridge`, ["bearer", issued.token],
       );
       const closeInfo = await new Promise<{ code: number; reason: string }>((resolve, reject) => {
         const t = setTimeout(() => reject(new Error("ws never closed")), 8000);

@@ -21,18 +21,17 @@ import { randomBytes } from 'node:crypto'
 import { after, before, beforeEach, describe, test } from 'node:test'
 import { createAccount } from '../account-pool/store.js'
 import { KMS_KEY_BYTES } from '../crypto/keys.js'
-import { encrypt } from '../crypto/aead.js'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
 import { resetTestSchemaForTest } from './helpers/db.js'
+import { insertTestEgressProxy } from './helpers/accountFixture.js';
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
 const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
 
 let pgAvailable = false
-let TEST_EGRESS_PROXY_ID = '1'
 const KEY = randomBytes(KMS_KEY_BYTES)
 const keyFn = (): Buffer => Buffer.from(KEY)
 
@@ -62,12 +61,6 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
   await resetTestSchemaForTest()
   await runMigrations()
-  const _ep = encrypt('http://test:test@10.0.0.1:8080', KEY)
-  const _r = await query<{ id: string }>(
-    "INSERT INTO egress_proxies(label, url_enc, url_nonce, status) VALUES ($1, $2, $3, 'active') RETURNING id::text AS id",
-    [`t-pinned-${Date.now()}`, _ep.ciphertext, _ep.nonce],
-  )
-  TEST_EGRESS_PROXY_ID = _r.rows[0].id
 })
 
 after(async () => {
@@ -100,11 +93,11 @@ describe('claude_accounts.pinned_user_id schema invariant (0067)', () => {
 
     // store.ts/createAccount 的 INSERT 列表没有 pinned_user_id;DB DEFAULT 应自动注入。
     const a = await createAccount(
-      { runtime_channel: 'v3', label: 'pin-a', plan: 'pro', token: 'T-A', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: 'v3', label: 'pin-a', plan: 'pro', token: 'T-A', egress_proxy_id: await insertTestEgressProxy(KEY) },
       keyFn,
     )
     const b = await createAccount(
-      { runtime_channel: 'v3', label: 'pin-b', plan: 'pro', token: 'T-B', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: 'v3', label: 'pin-b', plan: 'pro', token: 'T-B', egress_proxy_id: await insertTestEgressProxy(KEY) },
       keyFn,
     )
 

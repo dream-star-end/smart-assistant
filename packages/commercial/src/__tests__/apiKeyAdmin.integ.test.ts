@@ -45,9 +45,11 @@ import { setPoolOverride, resetPool } from "../db/index.js";
 import { _clearMaintenanceCache } from "../middleware/maintenanceMode.js";
 import { createLogger } from "../logging/logger.js";
 import type { AccountScheduler, PickResult, ReleaseInput } from "../account-pool/scheduler.js";
+import { generatePersona } from "../account-pool/persona.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
 import type { RateLimitRedis } from "../middleware/rateLimit.js";
 import type { PricingCache, ModelPricing } from "../billing/pricing.js";
+import { matchObservabilitySql } from "./helpers/fakePoolSql.js";
 
 // ─── 固定常量 ───────────────────────────────────────────────────────────────
 
@@ -55,6 +57,7 @@ const JWT_SECRET = "test-jwt-secret-not-actually-used-cc-external-32b!";
 const USER_A_ID = "7";
 const USER_B_ID = "8";
 const FIXED_MODEL = "claude-sonnet-4-6";
+const FIXED_PERSONA = generatePersona(Buffer.from("n1-fake-pick-persona-apikey"));
 const FIXED_PINNED_USER_ID = createHash("sha256")
   .update("test-pinned-account-phase4-integ")
   .digest("hex");
@@ -180,6 +183,18 @@ function buildFakePool(): FakePoolHandle {
     if (head.startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL")) return { rows: [], rowCount: 1 };
     if (head.startsWith("UPDATE REQUEST_FINALIZE_JOURNAL")) return { rows: [], rowCount: 1 };
     if (head.startsWith("INSERT INTO USAGE_RECORDS")) return { rows: [{ id: "1" }], rowCount: 1 };
+    if (head.startsWith("SELECT U.CREDITS::TEXT AS WALLET")) {
+      return { rows: [{ wallet: "99999999", period: "0" }], rowCount: 1 };
+    }
+    if (head.startsWith("SELECT (O.CREDITS + COALESCE(OS.PERIOD_CREDITS")) {
+      return { rows: [], rowCount: 0 };
+    }
+    if (head.startsWith("SELECT M.ORG_ID::TEXT AS ORG_ID")) {
+      return { rows: [], rowCount: 0 };
+    }
+    if (head.startsWith("SELECT ID::TEXT AS ID, PERIOD_CREDITS::TEXT AS PERIOD_CREDITS")) {
+      return { rows: [], rowCount: 0 };
+    }
     if (head.startsWith("SELECT CREDITS")) return { rows: [{ credits: "99999999" }], rowCount: 1 };
     if (head.startsWith("UPDATE USERS SET CREDITS")) return { rows: [], rowCount: 1 };
     if (head.startsWith("INSERT INTO CREDIT_LEDGER")) return { rows: [{ id: "101" }], rowCount: 1 };
@@ -262,6 +277,8 @@ function buildFakePool(): FakePoolHandle {
       return { rows: [], rowCount: row ? 1 : 0 };
     }
 
+    const _obs = matchObservabilitySql(trimmed);
+    if (_obs) return _obs;
     throw new Error(`unknown SQL in fakePool: ${trimmed.slice(0, 160)}`);
   };
 
@@ -318,7 +335,7 @@ function buildFakeScheduler(): AccountScheduler {
         egress_host_uuid: null,
         pinned_user_id: FIXED_PINNED_USER_ID,
         account_uuid: null,
-        persona: null,
+        persona: FIXED_PERSONA,
       };
     },
     async release(_input: ReleaseInput): Promise<void> {},
@@ -399,6 +416,13 @@ class MockRes {
     if (!this.listeners.has(ev)) this.listeners.set(ev, []);
     this.listeners.get(ev)!.push(cb);
     return this;
+  }
+  once(ev: string, cb: (...a: unknown[]) => void): this {
+    const onceCb = (...args: unknown[]) => {
+      this.off(ev, onceCb);
+      cb(...args);
+    };
+    return this.on(ev, onceCb);
   }
   off(ev: string, cb: (...a: unknown[]) => void): this {
     const arr = this.listeners.get(ev);

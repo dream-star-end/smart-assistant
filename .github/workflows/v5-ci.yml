@@ -51,7 +51,7 @@ jobs:
             # scheduler-wiring:导出了生命周期类/工厂却没人 start 的静默死代码
             # (HealthPoller 真实事故);agent-containers-sql:读 agent_containers 必须显式
             # 过滤 state,否则 vanished 行渗进用户视图/计费聚合。
-            run: npm run lint:scheduler-wiring && npm run lint:agent-containers-sql
+            run: npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run check:test-retries
             timeout: 10
           - name: protocol
             # protocol = gateway↔web-react↔容器的帧与错误码单一权威
@@ -325,6 +325,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: known-failures admission policy
+        if: always()
+        run: node .github/scripts/check-known-failures-policy.mjs
+
   commercial-integ:
     name: commercial-integ (${{ matrix.shard }})
     needs: [ci-queue-sentinel]
@@ -451,3 +455,64 @@ jobs:
           path: commercial-integ-${{ matrix.shard }}.tap
           if-no-files-found: error
           retention-days: 14
+
+  # OCV5-119 observe-only classifier. Not a required check. Failure may turn
+  # this workflow red but must not change deploy-v5.sh green-gate required
+  # contexts (typecheck/gateway/storage/web-react/commercial-unit/v5-ops).
+  ci-classify:
+    name: ci-classify
+    if: always()
+    needs:
+      - ci-queue-sentinel
+      - suite
+      - web-react-browser
+      - node-agent-go
+      - v5-ops
+      - commercial-unit
+      - commercial-integ
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Classify this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ci-classify/artifacts
+          gh api "repos/${GH_REPO}/actions/runs/${{ github.run_id }}/jobs?per_page=100" > /tmp/ci-classify/jobs.json
+          gh run download "${{ github.run_id }}" -D /tmp/ci-classify/artifacts || true
+          gh run view "${{ github.run_id }}" --log-failed > /tmp/ci-classify/failed.log || true
+          node .github/scripts/ci-classify.mjs \
+            --jobs /tmp/ci-classify/jobs.json \
+            --artifacts-dir /tmp/ci-classify/artifacts \
+            --logs /tmp/ci-classify/failed.log \
+            --out ci-classification.json \
+            --sha "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --event "${{ github.event_name }}" \
+            --summary "${GITHUB_STEP_SUMMARY}"
+          test -s ci-classification.json
+
+      - name: Upload classification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-classification
+          path: ci-classification.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30

@@ -4,16 +4,27 @@
  * Run: REQUIRE_TEST_DB=1 npx tsx --test packages/commercial/src/__tests__/migration0207.integ.test.ts
  */
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import { describe, test } from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 import { query } from '../db/queries.js'
-import { useDedicatedTestDatabase } from './helpers/db.js'
+import { resetAndMigrateBefore, useDedicatedTestDatabase } from './helpers/db.js'
 
 const db = useDedicatedTestDatabase('grok_0207_test')
+const here = path.dirname(fileURLToPath(import.meta.url))
+const migrationPath = path.resolve(here, '../db/migrations/0207_grok_build_admin_pool.sql')
+
+async function apply0207(): Promise<void> {
+  await resetAndMigrateBefore('0207')
+  await query(await readFile(migrationPath, 'utf8'))
+}
 
 describe('0207_grok_build_admin_pool', () => {
   test('stages the exact admin model without exposing it to the rollback runtime', async (t) => {
     if (db.skipIfUnavailable(t)) return
+    await apply0207()
     const result = await query<{
       model_id: string
       engine: string
@@ -55,6 +66,7 @@ describe('0207_grok_build_admin_pool', () => {
 
   test('database trigger rejects a direct Grok grant to non-admin and permits admin', async (t) => {
     if (db.skipIfUnavailable(t)) return
+    await apply0207()
     const users = await query<{ id: string; role: string }>(
       `INSERT INTO users(email,password_hash,role)
        VALUES ('grok-user@test.invalid','x','user'),('grok-admin@test.invalid','x','admin')
@@ -75,6 +87,7 @@ describe('0207_grok_build_admin_pool', () => {
 
   test('route table binds token to container/user/account/slot/model with active expiry lookup index', async (t) => {
     if (db.skipIfUnavailable(t)) return
+    await apply0207()
     const table = await query<{ name: string }>(
       `SELECT relname AS name FROM pg_class
         WHERE relname IN ('grok_route_contexts','idx_grok_route_contexts_lookup')
