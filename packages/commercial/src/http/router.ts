@@ -246,6 +246,11 @@ import { dispatchPluginsRoute } from './plugins.js'
 // V3 CC 外接 plan Phase 4(2026-05-18):用户自管 CC API key 的管理面 endpoints。
 import { handleCreateMyApiKey, handleListMyApiKeys, handleRevokeMyApiKey } from './apiKeyAdmin.js'
 import { getBearerToken, getSessionCookieToken } from './authHelpers.js'
+import {
+  handleGetChatGptProxyAccess,
+  handleIssueChatGptProxyCredential,
+  handleRevokeChatGptProxyCredential,
+} from './chatgptProxy.js'
 import { handleClientErrorReport } from './clientErrors.js'
 import {
   handleCreateContainerPreviewTicket,
@@ -786,6 +791,10 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/container-preview/ticket', handler: handleCreateContainerPreviewTicket },
     { method: 'POST', path: '/api/container-preview/heartbeat', handler: handleHeartbeatContainerPreview },
     { method: 'POST', path: '/api/container-preview/revoke', handler: handleRevokeContainerPreview },
+    // ChatGPT 直连代理(管理员 + system_settings 白名单)。凭据明文只在 POST 时返回一次。
+    { method: 'GET', path: '/api/chatgpt-proxy/access', handler: handleGetChatGptProxyAccess },
+    { method: 'POST', path: '/api/chatgpt-proxy/credential', handler: handleIssueChatGptProxyCredential },
+    { method: 'DELETE', path: '/api/chatgpt-proxy/credential', handler: handleRevokeChatGptProxyCredential },
     // ── 用户共建教程：公开目录 + 登录投稿 + 快照 + 管理审核 ──
     // approved 目录/详情允许匿名读取；投稿/我的/撤回要求浏览器用户 JWT；管理员审核
     // 由 requireAdminVerifyDb 再核验数据库角色。/api/tutorials 与 blob/embed
@@ -1502,6 +1511,7 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     '/api/subscription/',
     '/api/agent/',
     '/api/container-preview/',
+    '/api/chatgpt-proxy/',
     '/api/admin/',
     // 企业版(P3.1)org 管理面。匹配 exact `/api/org` 与 prefix `/api/org/*`。
     // 注:BLOCKED_FOR_USER_RULES 不含 /api/org,BRIDGE 白名单也不含 → 容器无法代理,

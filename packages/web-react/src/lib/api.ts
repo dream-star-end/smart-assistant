@@ -919,6 +919,29 @@ export type ContainerPreviewTicketResponse = {
   };
 };
 
+/** GET /api/chatgpt-proxy/access — unentitled users only ever see `{ enabled: false }`. */
+export type ChatGptProxyAccess =
+  | { enabled: false }
+  | {
+      enabled: true;
+      proxyHost: string;
+      proxyPort: number;
+      pacUrl: string;
+      homeUrl: string;
+      username: string;
+      hasCredential: boolean;
+      createdAt: string | null;
+      rotatedAt: string | null;
+      lastUsedAt: string | null;
+    };
+
+/** POST /api/chatgpt-proxy/credential — plaintext password is returned exactly once. */
+export type ChatGptProxyCredential = {
+  username: string;
+  password: string;
+  rotatedAt: string;
+};
+
 function decodeCanonicalBase64urlUtf8(value: string): string {
   if (!/^[A-Za-z0-9_-]+$/.test(value) || value.length % 4 === 1) {
     throw new Error("invalid immutable deferred payload record id encoding");
@@ -4551,6 +4574,43 @@ export const api = {
           headers: bearerHeaders(token, true),
           body: JSON.stringify({ sessionId }),
           keepalive: true,
+        }),
+      ),
+    ).then(() => undefined),
+
+  // ── ChatGPT 直连代理（仅管理员 + system_settings 白名单用户） ───────────────
+
+  /** GET /api/chatgpt-proxy/access：授权状态 + 连接信息。未授权 → `{ enabled: false }`。 */
+  getChatGptProxyAccess: (a: AuthSession): Promise<ChatGptProxyAccess> =>
+    jsonOrThrow<ChatGptProxyAccess>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/chatgpt-proxy/access", {
+          credentials: "include",
+          headers: bearerHeaders(token),
+        }),
+      ),
+    ),
+
+  /** POST /api/chatgpt-proxy/credential：生成 / 轮换代理凭据，明文密码只返回这一次。 */
+  createChatGptProxyCredential: (a: AuthSession): Promise<ChatGptProxyCredential> =>
+    jsonOrThrow<ChatGptProxyCredential>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/chatgpt-proxy/credential", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token),
+        }),
+      ),
+    ),
+
+  /** DELETE /api/chatgpt-proxy/credential：吊销当前凭据。 */
+  revokeChatGptProxyCredential: (a: AuthSession): Promise<void> =>
+    jsonOrThrow<{ ok: true }>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/chatgpt-proxy/credential", {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(token),
         }),
       ),
     ).then(() => undefined),
