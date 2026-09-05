@@ -3289,6 +3289,7 @@ assert_ci_green_for_source_commit() { # <full sha>
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "✗ CI 门:source commit 非法:$sha" >&2; return 1; }
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] 校验 $sha 的 required checks(分支保护 $CI_PROTECTED_BRANCH 的 contexts)全 success"
+    echo "  [dry-run] flake ledger record $sha"
     return 0
   fi
   # 【绝不挡住止血】dx-declared emergency containment lane 天然是「CI 还没跑完就要上」的场景,
@@ -3380,6 +3381,8 @@ assert_ci_green_for_source_commit() { # <full sha>
     local why="$1"
     echo "  ✓ required checks 全绿($why; $(tr '\n' ' ' <<<"$required"))"
     clear_gate_waiver ci-verification
+    # OCV5-119 observe-only: must not change this function's return value.
+    bash "$REPO_ROOT/scripts/v5-ci-flake-ledger.sh" record "$sha" || echo "⚠ flake ledger record failed (non-fatal)"
   }
 
   if ! required="$(_ci_gh_api_retry "repos/{owner}/{repo}/branches/$(printf '%s' "$CI_PROTECTED_BRANCH" | sed 's|/|%2F|g')/protection/required_status_checks" --jq '.contexts[]')"; then
