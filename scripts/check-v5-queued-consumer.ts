@@ -310,7 +310,7 @@ async function runWorker(): Promise<void> {
     const historical = { ...identity, sessionId: 'proof-historical', clientMessageId: 'cm-historical', dispatchId: randomUUID() }
     await seed(historical, 'terminal', now)
     probeWrites = true
-    const backend = createPgSessionsBackend(pool, { expectedGeneration: 'proof' })
+    const backend = createPgSessionsBackend(pool, { expectedGeneration: 1 })
     const secret = randomBytes(32).toString('hex')
     const hostUuid = 'hermetic-proof-host'
     let masterQueries = 0
