@@ -1,0 +1,18 @@
+# OpenClaude stale maint-lease restore timer (OCV5-117).
+# Every 30 minutes: if /opt/openclaude/tmp/maint-suspended.json exists,
+# suspendedAt is older than 6h, and no in-flight openclaude-v5-deploy-*
+# (MainPID != 0), restore apt-daily timers and logger -t openclaude-maint.
+#
+# Prepare only — do not enable from the PR agent. See the .service file.
+[Unit]
+Description=Every 30min, restore stale OpenClaude maint-suspended apt timers
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+Unit=openclaude-maint-restore.service
+
+[Install]
+WantedBy=timers.target
