@@ -5,9 +5,11 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import {
+  SELF_DELEGATE_ERROR,
   normalizeDelegateAgentId,
   normalizeDelegateModel,
   rejectSelfDelegate,
+  rewriteSelfDelegateErrorForMcp,
 } from '../delegateArgs.js'
 
 describe('normalizeDelegateModel', () => {
@@ -69,5 +71,17 @@ describe('rejectSelfDelegate', () => {
       rejectSelfDelegate({ callerAgentId: 'main', targetAgentId: 'coding-assistant' }).ok,
       true,
     )
+  })
+})
+
+describe('rewriteSelfDelegateErrorForMcp', () => {
+  it('把 CLI 口径的 --allow-self 提示改写为 MCP 参数 allowSelf', () => {
+    const out = rewriteSelfDelegateErrorForMcp(`委派失败: ${SELF_DELEGATE_ERROR}`)
+    assert.doesNotMatch(out, /--allow-self/)
+    assert.match(out, /allowSelf: true/)
+    assert.match(out, /coding-assistant/)
+  })
+  it('其它文本原样返回', () => {
+    assert.equal(rewriteSelfDelegateErrorForMcp('foo'), 'foo')
   })
 })
