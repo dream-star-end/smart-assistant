@@ -19,13 +19,14 @@ export function resolveGatewayProfileDir({
   if (typeof env.OPENCLAUDE_HOME === 'string' && env.OPENCLAUDE_HOME.trim()) {
     return env.OPENCLAUDE_HOME.trim()
   }
+  const join = platform === 'win32' ? path.win32.join : path.posix.join
   if (platform === 'win32' && typeof env.LOCALAPPDATA === 'string' && env.LOCALAPPDATA) {
-    return path.win32.join(env.LOCALAPPDATA, GATEWAY_PROFILE_PRODUCT, GATEWAY_PROFILE_DIRNAME)
+    return join(env.LOCALAPPDATA, GATEWAY_PROFILE_PRODUCT, GATEWAY_PROFILE_DIRNAME)
   }
   if (typeof env.CLARVY_GATEWAY_HOME === 'string' && env.CLARVY_GATEWAY_HOME.trim()) {
     return env.CLARVY_GATEWAY_HOME.trim()
   }
-  return path.join(tmpdir, 'clarvy-gateway')
+  return join(tmpdir, 'clarvy-gateway')
 }
 
 export function randomGatewayAccessToken() {
