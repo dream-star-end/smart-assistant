@@ -112,7 +112,7 @@
     },
     {
       "id": "T28",
-      "proves": "iPhone Safari 手机支付首次渲染不请求 PC 二维码、受信点击真跳安全 mobile_url，返回后恢复订单并自动确认；微信 WebView 无链接、无二维码并提示改用系统浏览器"
+      "proves": "iPhone Safari 手机支付首次渲染不请求 PC 二维码、受信点击真跳安全 mobile_url，返回后恢复订单并自动确认；微信 WebView 无支付链接、无二维码、不导航到 mobile_url，并提供复制链接到系统浏览器"
     },
     {
       "id": "T29",

@@ -348,14 +348,24 @@ fs.writeFileSync(output, 'PASS: spec e2e stub')
     // 键集与键序 = 旧版(image,kind,deterministic,vision,verdict,hint),绝无 spec 键
     assert.deepEqual(Object.keys(report), ['image', 'kind', 'deterministic', 'vision', 'verdict', 'hint'])
     assert.deepEqual(Object.keys(report.deterministic as object), ['checks', 'issues'])
-    assert.deepEqual(Object.keys((report.deterministic as { checks: object }).checks), [
-      'width',
-      'height',
-      'dpi',
-      'dominantFrac',
-      'dominantColor',
-      'edgeInkFrac',
-    ])
+    // Pillow pixel stats are optional (CLI skips them when python3-pil is absent,
+    // as on GitHub Actions). Width/height/dpi always come from the PNG header.
+    const detChecks = Object.keys((report.deterministic as { checks: object }).checks)
+    assert.equal(detChecks[0], 'width')
+    assert.equal(detChecks[1], 'height')
+    assert.equal(detChecks[2], 'dpi')
+    if (detChecks.length > 3) {
+      assert.deepEqual(detChecks, [
+        'width',
+        'height',
+        'dpi',
+        'dominantFrac',
+        'dominantColor',
+        'edgeInkFrac',
+      ])
+    } else {
+      assert.deepEqual(detChecks, ['width', 'height', 'dpi'])
+    }
     assert.equal((report.deterministic as { issues: unknown[] }).issues.length, 0)
     assert.equal(report.verdict, 'PASS')
     assert.match(r.stdout, /\nVERDICT: PASS\n$/)

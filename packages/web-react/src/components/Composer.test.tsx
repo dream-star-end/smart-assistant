@@ -16,6 +16,18 @@ describe("Composer 控件边框 token", () => {
   });
 });
 
+describe("Composer environment preparing", () => {
+  test("shows a 20s prep progress in the input area", () => {
+    render(<Composer onSend={() => {}} environmentPreparing />);
+    expect(screen.getByRole("status")).toHaveTextContent("环境准备中，约 20 秒");
+  });
+
+  test("hides the prep progress by default", () => {
+    render(<Composer onSend={() => {}} />);
+    expect(screen.queryByText(/环境准备中/)).toBeNull();
+  });
+});
+
 describe("Composer Stop ownership", () => {
   test("the composer is the sole active Stop control", () => {
     const onStop = vi.fn();

@@ -20,4 +20,10 @@ describe("落地页教程区", () => {
     expect(document.body.textContent).not.toContain("打开任务全流程");
     expect(document.body.textContent).not.toContain("research-bike-demand");
   });
+
+  it("注册步骤写登录后到账，不写即刻到账", () => {
+    render(<Tutorials />);
+    expect(document.body.textContent).toContain("登录后到账");
+    expect(document.body.textContent).not.toContain("即刻到账");
+  });
 });

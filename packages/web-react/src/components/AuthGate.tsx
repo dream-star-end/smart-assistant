@@ -51,10 +51,10 @@ export function AuthGate({
     /** 用户勾选同意的协议版本（lib/legal TERMS_VERSION），后端落 users 留证。 */
     termsVersion: string;
   }) => Promise<{ verifyEmailSent: boolean }>;
-  /** 邮箱验证（6 位验证码）。 */
+  /** 邮箱验证（6 位验证码）。成功后父组件应写入 session 并卸载本页。 */
   onVerifyEmail?: (email: string, code: string) => Promise<void>;
-  /** 重发验证码。 */
-  onResendVerification?: (email: string) => Promise<void>;
+  /** 重发验证码。emailSent===false 时展示发送失败且不开冷却。void 视为成功(兼容旧 mock)。 */
+  onResendVerification?: (email: string) => Promise<{ emailSent?: boolean } | void>;
   /** 发起密码重置（发重置邮件）。 */
   onRequestReset?: (email: string, turnstileToken: string) => Promise<void>;
   /** 用邮件 token 完成密码重置。 */
@@ -249,8 +249,8 @@ export function AuthGate({
     try {
       await onVerifyEmail(email.trim(), code.trim());
       if (!alive(gen)) return;
-      go("login");
-      setNotice("邮箱验证成功，请登录。");
+      // 后端已签发 session;useAuth 写入后本页卸载。不再 go("login") 强迫二次登录。
+      setBusy(false);
     } catch (e) {
       if (!alive(gen)) return;
       setBusy(false);
@@ -263,8 +263,12 @@ export function AuthGate({
     setLocalErr(null);
     const gen = opGen.current;
     try {
-      await onResendVerification(email.trim());
+      const r = await onResendVerification(email.trim());
       if (!alive(gen)) return;
+      if (r && r.emailSent === false) {
+        setLocalErr("发送失败，请稍后重试或更换邮箱");
+        return;
+      }
       setNotice("验证码已重新发送，请查收。");
       setCooldown(60);
     } catch (e) {
@@ -356,13 +360,26 @@ export function AuthGate({
     widget
   );
 
+  const conflictOnRegister = mode === "register" && !!shownErr && shownErr.includes("该邮箱已注册");
   const errBox = shownErr && (
     <div
       role="alert"
       aria-live="assertive"
       className="rounded-xl border border-danger/30 bg-danger-soft px-3.5 py-2.5 text-body text-danger"
     >
-      {shownErr}
+      <span>{shownErr}</span>
+      {conflictOnRegister && onRequestReset && (
+        <>
+          {" "}
+          <button
+            type="button"
+            onClick={() => go("forgot")}
+            className="font-medium underline decoration-danger/60 underline-offset-2"
+          >
+            忘记密码？
+          </button>
+        </>
+      )}
     </div>
   );
   const noticeBox = notice && (
@@ -519,10 +536,11 @@ export function AuthGate({
               <span className="text-body font-medium text-muted">昵称（可选）</span>
               <Input
                 value={displayName}
-                onChange={(e) => setDisplayName(e.target.value)}
+                onChange={(e) => setDisplayName(e.target.value.slice(0, 32))}
                 type="text"
                 autoComplete="nickname"
                 placeholder="怎么称呼你"
+                maxLength={32}
                 className="rounded-xl bg-bg"
               />
             </label>

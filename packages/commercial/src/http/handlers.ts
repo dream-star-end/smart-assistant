@@ -29,8 +29,9 @@ import {
 } from "./cookies.js";
 import { evaluateLaneForUser } from "../deploy/laneEvaluate.js";
 import { register, RegisterError } from "../auth/register.js";
-import { verifyEmail, requestPasswordReset, confirmPasswordReset, resendVerification, VerifyError } from "../auth/verify.js";
+import { verifyEmail, issueVerifiedUserSession, requestPasswordReset, confirmPasswordReset, resendVerification, VerifyError } from "../auth/verify.js";
 import { login, refresh, logout, LoginError, RefreshError } from "../auth/login.js";
+import { recordProductFrictionEvent } from "../productFriction/events.js";
 import { requireAuth } from "./auth.js";
 import type { EngineHttpDeps as ConnectorEngineHttpDeps } from "../connectors/engine/driver.js";
 import { query } from "../db/queries.js";
@@ -567,6 +568,39 @@ export async function enforceRateLimit(
   }
 }
 
+function parseFunnelUserId(raw: string | bigint | null | undefined): bigint | null {
+  if (raw == null) return null;
+  if (typeof raw === "bigint") return raw;
+  return /^\d+$/.test(raw) ? BigInt(raw) : null;
+}
+
+/** Best-effort conversion funnel write. Never throws into the user path. */
+async function emitAuthFunnel(input: {
+  correlation: string;
+  userId?: string | bigint | null;
+  stage: "register" | "verify" | "resend" | "login";
+  code: string;
+  outcome: "succeeded" | "failed";
+}): Promise<void> {
+  await recordProductFrictionEvent({
+    correlation: input.correlation,
+    userId: parseFunnelUserId(input.userId),
+    surface: "auth",
+    stage: input.stage,
+    code: input.code,
+    outcome: input.outcome,
+  }).catch(() => {});
+}
+
+/** Map register business errors onto the frozen funnel code set. */
+export function mapRegisterFunnelCode(
+  code: string,
+): "CONFLICT" | "TURNSTILE" | "EMAIL_DOMAIN_BLOCKED" | null {
+  if (code === "TURNSTILE_FAILED") return "TURNSTILE";
+  if (code === "CONFLICT" || code === "EMAIL_DOMAIN_BLOCKED") return code;
+  return null;
+}
+
 // ─── POST /api/auth/register ─────────────────────────────────────────
 
 export async function handleRegister(
@@ -612,12 +646,28 @@ export async function handleRegister(
       verifyEmailUrlBase: deps.verifyEmailUrlBase,
       emailDomainBlocklist: blocklistSetting.value,
     });
+    await emitAuthFunnel({
+      correlation: ctx.requestId,
+      userId: result.user_id,
+      stage: "register",
+      code: "REGISTERED",
+      outcome: "succeeded",
+    });
     sendJson(res, 201, {
       user_id: result.user_id,
       verify_email_sent: result.verify_email_sent,
     });
   } catch (err) {
     if (err instanceof RegisterError) {
+      const funnelCode = mapRegisterFunnelCode(err.code);
+      if (funnelCode) {
+        await emitAuthFunnel({
+          correlation: ctx.requestId,
+          stage: "register",
+          code: funnelCode,
+          outcome: "failed",
+        });
+      }
       const map: Record<string, { status: number }> = {
         VALIDATION: { status: 400 },
         TURNSTILE_FAILED: { status: 400 },
@@ -713,6 +763,13 @@ export async function handleLogin(
     });
     // P3 cohort:登录即评估 lane 并(按需)下发 oc_v5lane,前端 laneReady gate 拿到后建 WS。
     const lane = await resolveLaneAndApply(req, res, String(result.user.id), deps.refreshCookieSecure);
+    await emitAuthFunnel({
+      correlation: ctx.requestId,
+      userId: result.user.id,
+      stage: "login",
+      code: "email",
+      outcome: "succeeded",
+    });
     sendJson(res, 200, {
       user: result.user,
       access_token: result.access_token,
@@ -761,7 +818,26 @@ export async function handleResendVerification(
     mailer: deps.mailer,
     verifyEmailUrlBase: deps.verifyEmailUrlBase,
   });
-  sendJson(res, 200, { accepted: r.accepted });
+  // Mail success/failure is swallowed inside resendVerification (anti-enumeration).
+  // Only emit when we can attach a user_id; do not look up by leaking existence to clients.
+  let resendUserId: string | null = null;
+  if (email) {
+    const looked = await query<{ id: string }>(
+      `SELECT id::text AS id FROM users WHERE email = $1 AND status != 'deleted' LIMIT 1`,
+      [email.trim().toLowerCase()],
+    ).catch(() => ({ rows: [] as Array<{ id: string }> }));
+    resendUserId = looked.rows[0]?.id ?? null;
+  }
+  if (resendUserId) {
+    await emitAuthFunnel({
+      correlation: ctx.requestId,
+      userId: resendUserId,
+      stage: "resend",
+      code: "RESEND",
+      outcome: "succeeded",
+    });
+  }
+  sendJson(res, 200, { accepted: r.accepted, email_sent: r.email_sent });
 }
 
 // ─── GET /api/auth/check-verification?email=xxx ─────────────────────
@@ -966,11 +1042,48 @@ export async function handleVerifyEmail(
     if (r.newly_verified) {
       deps.prewarmContainer?.(BigInt(r.user_id));
     }
-    sendJson(res, 200, { user_id: r.user_id, newly_verified: r.newly_verified });
+    // OCV5-101:验证成功即签发 session(同 login 的 cookie/refresh 语义),前端免二次登录。
+    const session = await issueVerifiedUserSession(r.user_id, {
+      jwtSecret: deps.jwtSecret,
+      bindIp: ctx.authBoundIp,
+      userAgent: ctx.userAgent ?? undefined,
+      replaceRefreshToken: readRefreshCookie(req),
+    });
+    const ttl = Math.max(0, session.refresh_exp - Math.floor(Date.now() / 1000));
+    setRefreshCookie(res, session.refresh_token, ttl, {
+      secure: deps.refreshCookieSecure,
+      persistent: session.remember,
+    });
+    const lane = await resolveLaneAndApply(req, res, String(session.user.id), deps.refreshCookieSecure);
+    await emitAuthFunnel({
+      correlation: ctx.requestId,
+      userId: r.user_id,
+      stage: "verify",
+      code: "VERIFIED",
+      outcome: "succeeded",
+    });
+    sendJson(res, 200, {
+      user_id: r.user_id,
+      newly_verified: r.newly_verified,
+      user: session.user,
+      access_token: session.access_token,
+      access_exp: session.access_exp,
+      refresh_exp: session.refresh_exp,
+      remember: session.remember,
+      lane,
+    });
   } catch (err) {
     if (err instanceof VerifyError) {
-      // INVALID_TOKEN 也是 400(用户改不了的格式错,需前端重新输)
-      throw new HttpError(400, err.code, err.message);
+      await emitAuthFunnel({
+        correlation: ctx.requestId,
+        stage: "verify",
+        code: err.code,
+        outcome: "failed",
+      });
+      // ACCOUNT_UNAVAILABLE:码已消费但账号不能发 session,403 不伪装成码错。
+      // 其余(INVALID_TOKEN/VALIDATION/EMAIL_DOMAIN_BLOCKED)仍 400。
+      const status = err.code === "ACCOUNT_UNAVAILABLE" ? 403 : 400;
+      throw new HttpError(status, err.code, err.message);
     }
     throw err;
   }

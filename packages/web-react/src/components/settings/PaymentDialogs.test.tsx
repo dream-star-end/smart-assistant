@@ -3,8 +3,15 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { createMemoryAuthSession } from "../../lib/authSession";
 import type { AuthSession, HupiCreateResult, MySubscription } from "../../lib/types";
-import { SubscriptionDialog } from "./SubscriptionDialog";
+import { resetSubscribeUiState, SubscriptionDialog } from "./SubscriptionDialog";
 import { TopupDialog } from "./TopupDialog";
+
+const friction = vi.hoisted(() => ({
+  reportClientFrictionOnce: vi.fn(() => "eid"),
+  reportClientFriction: vi.fn(() => "eid"),
+  resetClientFrictionOnceForTests: vi.fn(),
+}));
+vi.mock("../../lib/clientFriction", () => friction);
 
 const apiMocks = vi.hoisted(() => ({
   listPlans: vi.fn(),
@@ -68,6 +75,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  resetSubscribeUiState();
+  friction.reportClientFrictionOnce.mockClear();
   Object.defineProperties(window.navigator, {
     userAgent: { configurable: true, value: "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0" },
     userAgentData: { configurable: true, value: undefined },
@@ -107,5 +116,81 @@ describe("个人支付弹窗的手机路径", () => {
       order.mobileUrl,
     );
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  test("打开订阅弹窗触发 pricing_exposure 一次", async () => {
+    apiMocks.listSubscriptionPlans.mockResolvedValue([
+      { code: "free", name: "免费版", priceCents: "0", monthlyCredits: "300", periodDays: 30, tier: 0 },
+    ]);
+    apiMocks.getMySubscription.mockResolvedValue(freeSub);
+    render(<SubscriptionDialog open auth={auth} onClose={() => {}} onPaid={() => {}} />);
+    await screen.findByText("当前套餐");
+    expect(friction.reportClientFrictionOnce).toHaveBeenCalledWith(
+      expect.stringMatching(/^billing:pricing_exposure:/),
+      {
+        surface: "billing",
+        stage: "pricing_exposure",
+        code: "PRICING_EXPOSURE",
+        outcome: "succeeded",
+      },
+      "t",
+    );
+  });
+});
+
+describe("订阅弹窗预选与二维码倒计时", () => {
+  const litePlan = {
+    code: "lite",
+    name: "Lite",
+    priceCents: "3800",
+    monthlyCredits: "4000",
+    periodDays: 30,
+    tier: 1,
+  };
+
+  test("initialIntent=lite 预选 Lite 套餐卡", async () => {
+    apiMocks.listSubscriptionPlans.mockResolvedValue([
+      { code: "free", name: "免费版", priceCents: "0", monthlyCredits: "300", periodDays: 30, tier: 0 },
+      litePlan,
+    ]);
+    apiMocks.getMySubscription.mockResolvedValue(freeSub);
+    render(
+      <SubscriptionDialog open auth={auth} onClose={() => {}} onPaid={() => {}} initialIntent="lite" />,
+    );
+    expect(await screen.findByText("Lite")).toBeInTheDocument();
+    expect(document.querySelector('[data-preselected="lite"]')).not.toBeNull();
+  });
+
+  test("initialIntent=pack 预选加量包", async () => {
+    apiMocks.listSubscriptionPlans.mockResolvedValue([
+      { code: "free", name: "免费版", priceCents: "0", monthlyCredits: "300", periodDays: 30, tier: 0 },
+      litePlan,
+    ]);
+    apiMocks.getMySubscription.mockResolvedValue(freeSub);
+    render(
+      <SubscriptionDialog open auth={auth} onClose={() => {}} onPaid={() => {}} initialIntent="pack" />,
+    );
+    expect(await screen.findByText("积分加量包")).toBeInTheDocument();
+    expect(document.querySelector('[data-preselected="pack"]')).not.toBeNull();
+  });
+
+  test("二维码页展示金额与倒计时，过期后重新下单", async () => {
+    Object.defineProperties(window.navigator, {
+      userAgent: { configurable: true, value: "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0" },
+      userAgentData: { configurable: true, value: undefined },
+    });
+    apiMocks.listSubscriptionPlans.mockResolvedValue([
+      { code: "free", name: "免费版", priceCents: "0", monthlyCredits: "300", periodDays: 30, tier: 0 },
+      litePlan,
+    ]);
+    apiMocks.getMySubscription.mockResolvedValue(freeSub);
+    apiMocks.subscribe.mockResolvedValue({
+      ...order,
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    render(<SubscriptionDialog open auth={auth} onClose={() => {}} onPaid={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "订阅" }));
+    expect(await screen.findByTestId("payment-order-amount")).toHaveTextContent("¥38.00");
+    expect(screen.getByRole("button", { name: "重新下单" })).toBeInTheDocument();
   });
 });

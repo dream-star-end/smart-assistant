@@ -1649,6 +1649,8 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
   });
 
   test("R4-B3 enrichment deadline → terminal；history 晚成功仍不执行", async () => {
+    // Deadline is enforced by the timer even when libuv wakes it before the
+    // wall-clock deadline (busy loop): the early wake must re-arm, never give up.
     const queries: { sql: string; params: unknown[] }[] = [];
     const pgPool = {
       query: async (sql: string, params: unknown[] = []) => {

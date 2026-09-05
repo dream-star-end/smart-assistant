@@ -419,8 +419,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(screen.queryByText(/追踪号/)).toBeNull()
   })
 
-  test('Landing「免费开始」进入登录表单（login，非注册）；新用户经登录页「立即注册」不受阻', async () => {
-    // Bug2：「免费开始」入口从 register 改为 login。登录页自带「立即注册」链接，新用户不受阻。
+  test('Landing「免费开始」进入注册表单（register）', async () => {
     fetchMock = vi.fn(async (url: string) =>
       String(url).includes('/api/auth/refresh')
         ? REFRESH_401
@@ -435,11 +434,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     const start = (await screen.findAllByRole('button', { name: /免费开始/ }))[0]
     fireEvent.click(start)
 
-    // 进登录表单：有「登录」提交按钮，无「创建账号」按钮（注册表单标志）。
-    await waitFor(() => expect(screen.getByRole('button', { name: /登录/ })).toBeInTheDocument())
-    expect(screen.queryByRole('button', { name: /创建账号/ })).toBeNull()
-    // 登录页仍提供「立即注册」入口，新用户不受阻。
-    expect(screen.getByRole('button', { name: '立即注册' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: /创建账号/ })).toBeInTheDocument())
   })
 
   test('authenticated send goes through the real WS engine — optimistic user bubble, no SSE/v4 chat', async () => {
@@ -525,6 +520,11 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     // 空白态显式换模：随后 Goal 物化会话也必须定格该选择，不能因 activeId 改变回落默认。
     const modelTrigger = screen.getByRole('button', { name: '选择对话模型' })
     fireEvent.pointerDown(modelTrigger, { button: 0, pointerType: 'mouse' })
+    await screen.findAllByRole('menuitem')
+    // 2026-09-05 selfhost: Terra/Luna live in the collapsed "更多 GPT 模型" group.
+    const collapsed = document.querySelector('[data-collapsed-group]')
+    expect(collapsed).toBeTruthy()
+    if (collapsed) fireEvent.click(collapsed)
     const modelTarget = (await screen.findAllByRole('menuitem'))
       .find((item) => item.textContent?.includes('GPT-5.6-Terra'))
     expect(modelTarget).toBeTruthy()
@@ -982,6 +982,15 @@ function routedFetchTwoSessions() {
   }) as unknown as FetchMock
 }
 
+/** React.lazy 块在 CI 冷 transform 下会把 heading findBy 变成时长竞态；先预热模块缓存。 */
+async function preloadLazyPanels() {
+  await Promise.all([
+    import('./components/Landing'),
+    import('./components/TutorialCenter'),
+    import('./components/SettingsCenter'),
+  ])
+}
+
 describe('Aurora v5 — P7 最小路由', () => {
   test('boot 深链列表迟到前点新建：保持空白草稿，不被目标会话抢回', async () => {
     window.history.replaceState({}, '', '/s/webhist01')
@@ -1108,6 +1117,7 @@ describe('Aurora v5 — P7 最小路由', () => {
   })
 
   test('面板深链：?panel=settings boot 后自动打开设置中心并保参', async () => {
+    await preloadLazyPanels()
     window.history.replaceState({}, '', '/?panel=settings')
     fetchMock = routedFetchTwoSessions()
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
@@ -1127,6 +1137,7 @@ describe('Aurora v5 — P7 最小路由', () => {
   })
 
   test('教程深链：?panel=help&topic=<稳定 id> 打开对应教程并保留可分享 URL', async () => {
+    await preloadLazyPanels()
     window.history.replaceState({}, '', '/?campaign=docs&panel=help&topic=models-reasoning')
     fetchMock = routedFetchTwoSessions()
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
@@ -1142,6 +1153,7 @@ describe('Aurora v5 — P7 最小路由', () => {
   })
 
   test('未登录首页的案例深链在 Landing 上方打开详情，并可转入登录后试用', async () => {
+    await preloadLazyPanels()
     window.history.replaceState(
       {},
       '',
@@ -1171,6 +1183,7 @@ describe('Aurora v5 — P7 最小路由', () => {
   }, 30000)
 
   test('教程 CTA 联动真实功能：反馈教程直达设置·反馈，且不会自动提交', async () => {
+    await preloadLazyPanels()
     window.history.replaceState({}, '', '/?panel=help&topic=feedback-support')
     fetchMock = routedFetchTwoSessions()
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
@@ -1192,6 +1205,7 @@ describe('Aurora v5 — P7 最小路由', () => {
   })
 
   test('教程 CTA 回到页面功能时，把键盘焦点交给真实入口', async () => {
+    await preloadLazyPanels()
     window.history.replaceState({}, '', '/?panel=help&topic=chat-basics')
     fetchMock = routedFetchTwoSessions()
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
@@ -1224,6 +1238,7 @@ describe('Aurora v5 — P7 最小路由', () => {
   })
 
   test('教程工作室深链：?panel=help&community= 打开详情，popstate 关闭 help 清 community', async () => {
+    await preloadLazyPanels()
     window.history.replaceState({}, '', '/?campaign=docs&panel=help&community=tut-7')
     const base = routedFetchTwoSessions()
     fetchMock = vi.fn(async (url: string, init?: RequestInit) => {

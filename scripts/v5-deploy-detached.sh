@@ -92,6 +92,7 @@ start_run() {
     --property=Type=exec
     --property=KillMode=control-group
     --property=RemainAfterExit=yes
+    "--property=ExecStopPost=/usr/bin/bash ${SCRIPT_DIR}/v5-host-maint-lib.sh restore"
     "--property=WorkingDirectory=$REPO_ROOT"
     --setenv=HOME=/root
     --setenv=XDG_CONFIG_HOME=/root/.config

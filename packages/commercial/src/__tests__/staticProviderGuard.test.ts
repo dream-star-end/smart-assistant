@@ -56,8 +56,9 @@ describe("assertPlatformDefaultModelConfigured", () => {
   test("不变量:PLATFORM_DEFAULT_MODEL 当前确实路由到一个静态 provider(否则 guard 形同虚设)", () => {
     const p = findRouteProviderForModel(PLATFORM_DEFAULT_MODEL);
     assert.ok(p, `PLATFORM_DEFAULT_MODEL=${PLATFORM_DEFAULT_MODEL} 应命中静态 provider`);
-    // 2026-08-22 起平台默认 = glm-5.3-zai → zai(此前 glm-5.2/glm-5.3 → ark)。
-    assert.equal(p?.id, "zai");
+    // 跟随 PLATFORM_DEFAULT_MODEL 推导,不硬编码某一家(当前 deepseek-v4-flash → opencodego)。
+    assert.equal(p?.id, defaultProvider?.id);
+    assert.ok(p?.id && STATIC_PROVIDER_META[p.id], `provider ${p?.id} 必须有 STATIC_PROVIDER_META`);
   });
 
   // 结构守护(Codex diff review Blocker):guard 调用必须在 internal-proxy 装配的 try **之前**,

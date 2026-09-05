@@ -71,7 +71,10 @@ export function extractAutoDreamFeature(snap: unknown): AutoDreamFeatureView | n
   };
 }
 
-/** 只接受当前用户模型列表中仍可见且健康的偏好；否则回落首个健康模型。 */
+/** 无 user_preferences.default_model 时的平台默认（与 commercial platformDefaults 对齐）。 */
+export const PLATFORM_NEW_USER_MODEL = "deepseek-v4-flash";
+
+/** 只接受当前用户模型列表中仍可见且健康的偏好；否则回落平台默认，再回落首个健康模型。 */
 export function initialModelFromPreferences(
   models: PublicModel[],
   prefs: PrefsView,
@@ -79,7 +82,11 @@ export function initialModelFromPreferences(
   const preferred = prefs.default_model
     ? models.find((m) => m.id === prefs.default_model && m.degraded !== true)
     : undefined;
-  return preferred?.id ?? models.find((m) => m.degraded !== true)?.id ?? models[0]?.id;
+  if (preferred?.id) return preferred.id;
+  const platformDefault = models.find(
+    (m) => m.id === PLATFORM_NEW_USER_MODEL && m.degraded !== true,
+  );
+  return platformDefault?.id ?? models.find((m) => m.degraded !== true)?.id ?? models[0]?.id;
 }
 
 /**

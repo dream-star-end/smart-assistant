@@ -9,7 +9,7 @@ describe('EmptyState first-task starters', () => {
     const onPrefill = vi.fn()
     render(<EmptyState agent={MAIN_AGENT} onPrefill={onPrefill} onChangeAgent={() => {}} />)
 
-    expect(MAIN_AGENT.starters).toHaveLength(4)
+    expect(MAIN_AGENT.starters).toHaveLength(3)
     for (const starter of MAIN_AGENT.starters ?? []) {
       expect(screen.getByRole('button', { name: starter })).toBeTruthy()
     }
