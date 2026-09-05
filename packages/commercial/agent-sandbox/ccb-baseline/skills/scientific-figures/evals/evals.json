@@ -55,6 +55,37 @@
         "若尝试让支路指向上游(如 模型→清洗),模板必须拒画并 exit 非 0,而不是画出错误图",
         "给出 png 与 spec.json 的绝对路径(/home/agent/.openclaude/ 下)"
       ]
+    },
+    {
+      "id": "template-magnitude-compare-log-panels",
+      "prompt": "画一张量级对比条形图对比这些项:项A 0.5 mV、项B 0.02 mV、项C 12 mV、项D 3 ps、项E 80 ps。上次把 0.02 和 12 画在同一根轴上条长差不多,量级完全失真。请在最终回复里说明条长如何归一,并给出 oc-figcheck --spec 结论与产物路径。",
+      "assertions": [
+        "优先使用 references/templates/magnitude-compare 模板;同单位自动同组,mV/ps 两组分开面板且各有单位标注",
+        "每条条形带数值+单位;组内条长按 log10 量级归一(同组内 0.02 与 12 mV 的条长差异反映对数差而非线性差)",
+        "spec.json 的 magnitudes 带 group 与 rendered_length,oc-figcheck --spec 的量级归一检查确定性 issues 为 0",
+        "数值≤0 的输入模板必须拒画并 exit 非 0(log10 需要正值)",
+        "给出产物绝对路径"
+      ]
+    },
+    {
+      "id": "template-coverage-geometry-beam-check",
+      "prompt": "画一张覆盖几何示意图:地面三个指向单元 S1(x=0)、S2(x=8)、S3(x=16),共同覆盖上方同一个目标 T1(8,30),覆盖锥半张角 12°。连线必须真的落进各自覆盖锥里,单元间基线用虚线且与覆盖连线区分。之前画了 10 轮连线都落在锥外。请在最终回复里给出模板与单元指向角、oc-figcheck --spec 结论、产物绝对路径。",
+      "assertions": [
+        "优先使用 references/templates/coverage-geometry 模板,单元 boresight 按目标几何设定(S1≈75°,S2=90°,S3≈105°)而非随手角度",
+        "三条覆盖连线端点都落在各自覆盖锥内;基线为虚线且只连单元支架;图例区分覆盖连线与基线;单元支撑链落地不悬空",
+        "运行 oc-figcheck --kind schematic --spec <spec.json>,must_be_in_beam_of 锥覆盖检查确定性 issues 为 0(目标在锥外时模板拒画并 exit 非 0)",
+        "给出产物绝对路径与关键参数"
+      ]
+    },
+    {
+      "id": "template-pptx-editable-delivery",
+      "prompt": "我要在自己的 PowerPoint 里配一张流程框图,但必须能编辑——每个部件能单独选中改字改颜色,不要贴死的图片。参数:链『采集,清洗,特征,模型,评估』,支路『清洗:模型』。请在最终回复里说明可编辑性如何保证、oc-artifact-qa 结论,并给出 pptx 绝对路径。",
+      "assertions": [
+        "使用通用原型模板 --backend pptx(python-pptx 原生 shapes)输出,而非把 png 位图贴入幻灯片",
+        "产物用 oc-artifact-qa inspect 验收零 error;每个部件(阶段框/连线/箭头/标注)为独立 shape,无 picture 部件",
+        "可同时给 png 预览版;物理约束与 mpl 版一致(同参数)",
+        "给出 pptx 绝对路径(/home/agent/.openclaude/ 下)与 QA 结论"
+      ]
     }
   ]
 }
