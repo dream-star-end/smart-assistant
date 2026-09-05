@@ -78,6 +78,10 @@ case "$mode" in
     jq -cn '{phase:"mutating"}' >"$T/run/cutover-survivor.state"; rm -f "$T/run/cutover-survivor.committed"
     ;;
   hang) cd "$T" && exec sleep 3600 ;;
+  fail)   # 门禁拒绝:自己标 failed 退出(真 deploy 的 EXIT trap 行为)
+    sqlite3 "$T/lib/lease.db" "UPDATE train SET status='failed', reason='fake gate refused', finished_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'), updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id='$train';
+      INSERT INTO event(subject_id,event,actor,detail,created_at) VALUES('$train','train-failed','deploy:$$','fake gate refused',strftime('%Y-%m-%dT%H:%M:%SZ','now'));"
+    exit 1 ;;
 esac
 EOF
 chmod +x "$T/bin/fake-deploy.sh"
@@ -149,6 +153,19 @@ assert_eq "$(q "SELECT status FROM train WHERE executor_pid=$pid;")" failed "执
 assert_eq "$(q "SELECT COUNT(*) FROM train WHERE status='building';")" 1 "ride 仍 pending → 同 tick 重新发一班(新 train)"
 assert_eq "$(q "SELECT COUNT(*) FROM lease WHERE status='satisfied';")" 0 "未结算"
 kill_stubs
+# d) 同 target 一班已 failed(门禁拒绝)→ 老 ride 转 failed 并回调,不再自动重发;新 ride 才允许再发一班
+reset_db; set_live "$C0" committed; echo fail >"$T/fake-deploy.mode"
+"$LEASE" register --resource deploy:selfhost --mode ride --sha "$C2" --ticket OCV5-908 --owner s1 >/dev/null
+"$WORKER" >/dev/null 2>&1; wait_train_done || true; sleep 1.1
+"$WORKER" >/dev/null 2>&1
+assert_eq "$(starts)" 1 "同 target 上一班 failed → 不自动重发"
+assert_eq "$(q "SELECT status FROM lease;")" failed "老 ride → failed"
+assert_eq "$(q "SELECT status||':'||kind FROM outbox;")" "delivered:failed" "failed 回调已投面板"
+assert_eq "$(comments OCV5-908)" 1 "面板恰 1 条失败评论"
+"$WORKER" >/dev/null 2>&1; assert_eq "$(starts)" 1 "再 tick 仍不发"
+sleep 1.1; "$LEASE" register --resource deploy:selfhost --mode ride --sha "$C2" --ticket OCV5-909 --owner s2 >/dev/null
+"$WORKER" >/dev/null 2>&1; assert_eq "$(starts)" 2 "新 ride(人工决定)→ 允许再发一班"
+wait_train_done || true; kill_stubs
 
 echo "═══ T4 deploy.lock 被外部持有 → 不发车;桩只切 symlink 未 committed → 不结算、下班不发 ═══"
 reset_db; set_live "$C0" committed; echo commit >"$T/fake-deploy.mode"

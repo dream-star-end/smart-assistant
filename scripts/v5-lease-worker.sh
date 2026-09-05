@@ -222,6 +222,26 @@ dispatch_train() {
   miss="$(lease_sql "SELECT want_sha FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';" \
           | while read -r w; do lease_sha_contained "$w" "$tip" || echo "$w"; done)"
   [[ -z "$miss" ]] || { wlog "tip ${tip:0:12} 不含 pending sha: $miss;不发车"; return 0; }
+  # 同一 target 上一班由执行器自己上报 failed(门禁/构建拒绝 = 确定性失败)→ 不自动重发
+  # (2026-09-05 实测:0274 迁移门拒绝后 worker 每 15min 烧一班)。worker 对账判的 failed(planned 超时、执行器被外力杀)不受此限。
+  # 在那班结束前登记的 ride 置 failed 并回调(design-v2 §2.2:train failed 且无法自动重发 → failed);
+  # 之后新登记的 ride 是人工决定,允许再发一班。
+  local lastf ftid ffin freason flog
+  lastf="$(lease_sql -separator $'\t' "SELECT t.id,t.finished_at,COALESCE(t.reason,''),COALESCE(t.log_path,'') FROM train t
+             WHERE t.resource='$RESOURCE' AND t.target_sha='$tip' AND t.status='failed'
+               AND EXISTS (SELECT 1 FROM event e WHERE e.subject_id=t.id AND e.event='train-failed' AND e.actor LIKE 'deploy:%')
+             ORDER BY t.seq DESC LIMIT 1;")"
+  if [[ -n "$lastf" ]]; then
+    IFS=$'\t' read -r ftid ffin freason flog <<<"$lastf"
+    local rid
+    while read -r rid; do
+      [[ -n "$rid" ]] || continue
+      transition_with_outbox "$rid" registered failed "train $ftid(target ${tip:0:12})failed,同 target 不自动重发" \
+        "$(lease_body_failed "$rid" "列车 $ftid 失败: $freason" "${flog:-无日志}(target ${tip:0:12} 仍是分支 tip;修复后 push 新 tip 或人工放行后再 register)")"
+    done < <(lease_sql "SELECT id FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride' AND created_at <= '$(lease_q "$ffin")';")
+    pending="$(lease_sql "SELECT COUNT(*) FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")"
+    [[ "$pending" -gt 0 ]] || { wlog "tip ${tip:0:12} 上一班 $ftid 已 failed 且无新 ride,不发车"; return 0; }
+  fi
   # 宿主工作树 HEAD 必须等于 tip(deploy 脚本认工作树 HEAD;lease 列车只发已 push 的 tip)
   local head; head="$(git -C "$LEASE_REPO_ROOT" rev-parse HEAD)"
   [[ "$head" == "$tip" ]] || { wlog "工作树 HEAD ${head:0:12} ≠ origin tip ${tip:0:12};不发车(等 ff-merge/push 对齐)"; return 0; }
