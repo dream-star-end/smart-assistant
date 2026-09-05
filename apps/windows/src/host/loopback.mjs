@@ -48,43 +48,31 @@ export function listenExclusive(server, { host, port, ipv6Only, timeoutMs = 2_00
 const SOFT_V6 = new Set(['EADDRNOTAVAIL', 'EAFNOSUPPORT', 'EACCES', 'EINVAL', 'LISTEN_TIMEOUT'])
 
 /**
- * Windows can bind 127.0.0.1 even when 0.0.0.0:port is already taken.
- * Probe that a loopback connect is delivered to *this* server.
+ * Windows lets 127.0.0.1 bind succeed beside an existing 0.0.0.0 listener.
+ * Probe 0.0.0.0 exclusive first when the port is already chosen (W5).
  */
-export function assertOwnsLoopbackPort(server, port, timeoutMs = 400) {
-  return new Promise((resolve, reject) => {
-    let settled = false
-    const done = (ok) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      server.off('connection', onConn)
-      try { socket.destroy() } catch { /* */ }
-      if (ok) resolve()
-      else {
-        const err = new Error('loopback port is owned by another process')
-        err.code = 'EADDRINUSE'
-        reject(err)
-      }
-    }
-    const onConn = () => done(true)
-    server.once('connection', onConn)
-    const timer = setTimeout(() => done(false), timeoutMs)
-    const socket = net.connect({ host: LOOPBACK_V4, port })
-    socket.on('error', () => done(false))
-  })
+export async function assertWildcardPortFree(port) {
+  if (!port) return
+  const probe = net.createServer()
+  try {
+    await listenExclusive(probe, { host: '0.0.0.0', port, timeoutMs: 800 })
+    await new Promise((resolve) => {
+      probe.close(() => resolve())
+    })
+  } catch (err) {
+    try { probe.close() } catch { /* */ }
+    const wrapped = new Error('wildcard port occupant')
+    wrapped.code = err.code === 'EACCES' ? 'EADDRINUSE' : (err.code || 'EADDRINUSE')
+    wrapped.cause = err
+    throw wrapped
+  }
 }
 
 export async function listenLoopbackPair(createServer, port, { alsoV6 = true, requireV6 = false } = {}) {
+  if (port) await assertWildcardPortFree(port)
   const v4 = createServer()
   await listenExclusive(v4, { host: LOOPBACK_V4, port })
   const boundPort = v4.address().port
-  try {
-    await assertOwnsLoopbackPort(v4, boundPort)
-  } catch (err) {
-    try { v4.close() } catch { /* */ }
-    throw err
-  }
   let v6 = null
   if (alsoV6) {
     v6 = createServer()
