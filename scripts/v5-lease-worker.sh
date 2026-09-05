@@ -19,7 +19,8 @@ source "$SCRIPT_DIR/v5-lease-lib.sh"
 WORKER_LOCK="${OC_V5_LEASE_WORKER_LOCK:-/run/openclaude-v5-selfhost/lease-worker.lock}"
 WORKER_LOG_DIR="${OC_V5_LEASE_LOG_DIR:-/opt/openclaude/tmp/lease-trains}"
 DEPLOY_BIN="${OC_V5_LEASE_DEPLOY_BIN:-$LEASE_REPO_ROOT/scripts/deploy-v5-selfhost.sh}"
-TASK_CLI="${OC_V5_LEASE_TASK_CLI:-}"            # 面板 CLI;空 → 自动探测 oc-task
+TASK_CLI="${OC_V5_LEASE_TASK_CLI:-}"            # 面板 CLI;空 → 自动探测 oc-task,再退到 docker exec 用户容器
+TASK_CONTAINER_FMT="${OC_V5_LEASE_TASK_CONTAINER_FMT:-oc-v5-u%s}"   # printf 格式,%s = owner_uid
 CALLBACK_URL="${OC_V5_LEASE_CALLBACK_URL:-}"    # P2:http://127.0.0.1:18790/internal/v3/lease-callback
 CALLBACK_SECRET_FILE="${OC_V5_LEASE_CALLBACK_SECRET_FILE:-/etc/openclaude/commercial-v5-selfhost.env}"
 DRY="${OC_V5_LEASE_DRY:-0}"
@@ -312,11 +313,24 @@ detect_task_cli() {
   command -v oc-task 2>/dev/null || true
 }
 
+# 面板 CLI 只存在于用户容器(经容器自身 gateway 回环 /api/board);宿主上没有。
+# 宿主运行时用 docker exec 进 lease 归属 uid 的容器调 oc-task(2026-09-05 真机:failed 回调 11 次 "oc-task CLI 不可用")。
+# 用法: task_cli <uid> <oc-task args...>
+task_cli() {
+  local uid="$1"; shift
+  local cli; cli="$(detect_task_cli)"
+  if [[ -n "$cli" ]]; then HOME=/home/agent "$cli" "$@"; return; fi
+  command -v docker >/dev/null 2>&1 || { echo "oc-task CLI 不可用(无本地 oc-task,无 docker)" >&2; return 127; }
+  local ctr; ctr="$(printf "$TASK_CONTAINER_FMT" "$uid")"
+  [[ "$(docker inspect -f '{{.State.Running}}' "$ctr" 2>/dev/null)" == true ]] \
+    || { echo "oc-task CLI 不可用(容器 $ctr 未运行)" >&2; return 127; }
+  docker exec -u agent -e HOME=/home/agent "$ctr" /home/agent/.local/bin/oc-task "$@"
+}
+
 deliver_outbox() {
   local rows id tid kind tkind target body attempts
   rows="$(lease_sql "SELECT id FROM outbox WHERE status='pending' AND next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now') ORDER BY created_at LIMIT 20;")"
   [[ -n "$rows" ]] || return 0
-  local cli; cli="$(detect_task_cli)"
   while read -r id; do
     [[ -n "$id" ]] || continue
     IFS=$'\t' read -r tid kind tkind target attempts < <(lease_sql -separator $'\t' "SELECT transport_id,kind,target_kind,target,attempts FROM outbox WHERE id='$(lease_q "$id")';")
@@ -343,7 +357,7 @@ SQL
           mark_delivered_log "$id" "$body"; continue
         fi
         deliver_session "$id" "$tid" "$target" "$body" "$attempts" ;;
-      ticket) deliver_ticket "$id" "$tid" "$target" "$body" "$attempts" "$cli" ;;
+      ticket) deliver_ticket "$id" "$tid" "$target" "$body" "$attempts" ;;
       log) mark_delivered_log "$id" "$body" ;;
     esac
   done <<<"$rows"
@@ -363,20 +377,23 @@ backoff_sql() { # <attempts> → seconds(30·2^n,上限 600)
   echo "$s"
 }
 
-deliver_ticket() { # <id> <tid> <ticket> <body> <attempts> <cli>
-  local id="$1" tid="$2" ticket="$3" body="$4" attempts="$5" cli="$6" marked out
-  [[ -n "$cli" ]] || { retry_later "$id" "$attempts" "oc-task CLI 不可用"; return; }
+deliver_ticket() { # <id> <tid> <ticket> <body> <attempts>
+  local id="$1" tid="$2" ticket="$3" body="$4" attempts="$5" marked out uid
+  uid="$(lease_sql "SELECT l.owner_uid FROM outbox o JOIN lease l ON l.id=o.lease_id WHERE o.id='$(lease_q "$id")';")"
+  # train_alert 的 lease_id 是 train id,无 owner → 取最近一条持有该 ticket 的 lease 的 uid
+  [[ -n "$uid" ]] || uid="$(lease_sql "SELECT owner_uid FROM lease WHERE ticket_ref='$(lease_q "$ticket")' ORDER BY seq DESC LIMIT 1;")"
+  [[ -n "$uid" ]] || { retry_later "$id" "$attempts" "无法确定 ticket $ticket 归属 uid"; return; }
   marked="$(printf '%s\n\n<!-- lease-outbox %s -->' "$body" "$tid")"
   # 幂等:先查该 ticket 是否已有同 transport_id 的评论(写成功但响应丢失的情况)
   local existing
-  existing="$(HOME=/home/agent "$cli" ticket get "$ticket" 2>/dev/null || true)"
+  existing="$(task_cli "$uid" ticket get "$ticket" 2>/dev/null || true)"
   if [[ "$existing" == *"lease-outbox $tid"* ]]; then
     lease_tx <<SQL || true
 BEGIN IMMEDIATE; UPDATE outbox SET status='delivered', delivered_at='$(lease_now)', last_error='already-present' WHERE id='$(lease_q "$id")'; COMMIT;
 SQL
     wlog "outbox $id 面板已有同 transport_id 评论,标记 delivered"; return
   fi
-  if out="$(HOME=/home/agent "$cli" ticket comment "$ticket" --body "$marked" 2>&1)"; then
+  if out="$(task_cli "$uid" ticket comment "$ticket" --body "$marked" 2>&1)"; then
     lease_tx <<SQL || true
 BEGIN IMMEDIATE; UPDATE outbox SET status='delivered', delivered_at='$(lease_now)', attempts=attempts+1 WHERE id='$(lease_q "$id")'; COMMIT;
 SQL
