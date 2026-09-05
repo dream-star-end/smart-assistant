@@ -27,8 +27,21 @@ echo "running: npm run test:commercial:unit (TAP -> $tap_out)"
 npm run test:commercial:unit > "$tap_out" 2>&1
 status=$?
 echo "test runner exit: $status"
+echo "TAP path: $tap_out bytes=$(wc -c < "$tap_out" 2>/dev/null || echo 0)"
+
+if [[ ! -s "$tap_out" ]]; then
+  echo "::error::TAP output missing or empty: $tap_out (test runner exit=$status)" >&2
+  echo "This is NOT a known-failures diff failure — the unit runner never produced TAP." >&2
+  echo "Typical causes: this script never ran (npm ci / fixture wait failed), the runner crashed before TAP header, or TAP_OUT pointed at an unwritable path." >&2
+  exit 1
+fi
 
 # 摘要可见性:把 TAP 汇总行打到 job log
 grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)' "$tap_out" || true
+
+echo "----- TAP head (40) -----"
+head -40 "$tap_out" || true
+echo "----- TAP tail (80) -----"
+tail -80 "$tap_out" || true
 
 exec bash .github/scripts/diff-known-failures.sh "$tap_out" "$baseline" "$status"
