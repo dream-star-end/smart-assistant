@@ -388,6 +388,8 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // Sand extendedUsage 计费 9315cd2fd/ec9335b41、proxy sponsorship d70acbdff、terminal
   // red card c8e4e8b6e);源提交不可改写,只豁免其不可变祖先,后续 commit 逐条走 trailer 门。
   "c8e4e8b6e29906ed9369c5ad5fe0f4dcc07b3b11",
+  // 2026-09-05 全量正向同步冻结:selfhost 2e1c90c87 已上线;只豁免其不可变祖先。含 P1 桌面底座(旗关)/GPT-6 Astra/R5 文献/UI 审计/egress 蓝绿;禁止 amend 源提交。
+  "2e1c90c87bf8653c70b4be9d9a350825711b5828",
 ] as const;
 
 function checkTrailerClosure(): number {
