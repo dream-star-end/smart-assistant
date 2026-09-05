@@ -21,7 +21,7 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 | --- | --- | --- | --- |
 | ci-queue-sentinel | `(none; scheduling gate)` | 秒级调度闸:先让第一梯队(含 required 6 job)抢 runner,再放行 integ/browser | 2 min |
 | typecheck | `npm run typecheck && npm run check:ci-parity` | 全仓类型闭合;CI 门集合 ≡ `check:v5` 门集合(见下「CI parity 门」) | 20 min |
-| lint | `npm run lint:scheduler-wiring && npm run lint:agent-containers-sql` | 导出的调度器/轮询器真的被 start(HealthPoller 事故);读 `agent_containers` 显式带 state,vanished 行不渗进用户视图/计费聚合 | 10 min |
+| lint | `npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run check:test-retries` | 导出的调度器/轮询器真的被 start(HealthPoller 事故);读 `agent_containers` 显式带 state,vanished 行不渗进用户视图/计费聚合;禁止静默 test retry | 10 min |
 | protocol | `npm run test:protocol` | gateway↔web-react↔容器的帧与错误码单一权威(frames / turnErrorTaxonomy / promptQueueFrames / modelAuthority)未漂 | 10 min |
 | channels | `npm run test:channels` | 企微 iLink 收发/媒体/配对链路契约 | 10 min |
 | gateway | `npm run test:gateway` | 网关侧会话/工具/路由行为 | 25 min |
@@ -32,6 +32,7 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 | v5-ops | `npm run test:v5:ops` | 发布/回滚脚本的安全契约(真 psql 持久化);迁移编号门规则 + **对真实仓库状态的断言**(不重号、缺口必须声明 `-- order-dependency:`、新迁移登记进 `requiredMigrations`,规则同 `npm run lint:migration-order`) | 20 min |
 | commercial-unit | `npm run test:commercial:unit:gate` | 商业后端全量 unit(基线失败集 diff 门,见下) | 30 min |
 | commercial-integ | `bash .github/scripts/commercial-integ-gate.sh <shard>` | 真 PG 语义:能注册/能收验证信/能登录/refresh 家族被盗整族吊销/下单加积分/同一 request_id 只扣一次钱/会话 tape 落库读回/新表有保留策略 | 20 min/片 |
+| ci-classify | observe-only `node .github/scripts/ci-classify.mjs` | 本 attempt 的 passed / infra-error / failed 分类 + 失败签名;不进 required checks,不改变发布判定 | 10 min |
 
 一把梭:`npm run check:v5`。**它与 CI 的 job 命令并集必须逐条相等**,由 `npm run
 check:ci-parity`(挂在 typecheck job 里)机器核对 —— 任一方向差集非空即红。
@@ -138,6 +139,33 @@ v5 master 的 systemd unit 明确是 `User=root`,而 container provision 的真�
 不能在 `/run` 建目录也不能 chown,会让所有触发 provision 的单测稳定报 `EACCES`,
 形成“本机(root)绿、CI(runner)红”的假回归。root 运行同时让标记为 requires-root 的
 artifact/seed 校验在 CI 真正执行;runner 是 GitHub 一次性虚机,不接触生产主机。
+
+
+### known-failures 条目准入（OCV5-119）
+
+每一条非注释条目的**上一行**必须是：
+
+```
+# issue=OCV5-<n> approved-by=<who> expires=YYYY-MM-DD
+```
+
+- `expires` 已过 → 红（到期必须删行或续期，禁止无限豁免）。
+- 条目所属套件 ∈ `.github/known-failures/core-contract-suites.txt` → 红（核心旅程/计费永远不能进清单）。
+- 机器门：`node .github/scripts/check-known-failures-policy.mjs`（挂在 `commercial-unit` job 现有 diff 门之后）。
+- 当前清单已归零；新增条目仍走本规则，**不放宽**。
+
+### 静默测试重试禁令（OCV5-119）
+
+`npm run check:test-retries` 扫 `vitest.config*` / `playwright.config*` / `*.test.{ts,tsx,mjs}` / `e2e/**`：
+`retry:` / `retries:` 为 1–9、`test.retry(`、`.retry(`、`OC_E2E_RETRIES` 默认值 ≠ 0 → 红。
+唯一放行：同一行或上一行 `// oc-retry: transport <原因>`。
+`OC_TEST_RETRY_ENFORCE=0` 时只 warning（观察档）；CI 默认 enforce=1。
+
+### flake 账本（OCV5-119，只观察）
+
+`scripts/v5-ci-flake-ledger.sh record <sha>` 在 deploy CI 绿门通过后非致命调用。
+attempt 1 为 failed/infra-error 且末 attempt passed → 记 candidate JSONL。
+`report --days N` 永远 exit 0。第一期**不阻断发布**。
 
 ### known-failures 清单维护
 
