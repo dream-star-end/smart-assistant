@@ -92,7 +92,8 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onClose).not.toHaveBeenCalled();
     expect(screen.getByRole("dialog")).toBeTruthy();
-    expect(screen.getByRole("alert").textContent).toMatch(/后端拒绝保存|保存项目设置失败/);
+    // setError lands one microtask after onSave rejects; wait for the alert instead of reading it synchronously.
+    expect((await screen.findByRole("alert")).textContent).toMatch(/后端拒绝保存|保存项目设置失败/);
   });
 
   test("ESC 关闭", async () => {
