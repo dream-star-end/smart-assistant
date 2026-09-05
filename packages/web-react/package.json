@@ -9,7 +9,7 @@
     "typecheck": "tsc -b",
     "test": "vitest run --maxWorkers=1",
     "test:watch": "vitest",
-    "test:browser": "node browser-tests/run.mjs && node --test browser-tests/user-contract.test.mjs",
+    "test:browser": "node browser-tests/run.mjs && node --test browser-tests/user-contract.node-test.mjs",
     "preview:shots": "node browser-tests/ui-preview/shoot.mjs"
   },
   "dependencies": {
