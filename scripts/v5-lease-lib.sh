@@ -229,15 +229,20 @@ lease_remote_tip() {
   git -C "$LEASE_REPO_ROOT" rev-parse --verify -q "refs/remotes/origin/${LEASE_BRANCH}" 2>/dev/null
 }
 
+# 是否有真正的 deploy 执行器在跑。只认 argv 精确形态(argv[i] 以 deploy-v5-selfhost.sh 结尾且下一个是 --deploy/--cutover/--bootstrap),
+# 不做 cmdline 子串匹配:否则任何 `bash -c "... deploy-v5-selfhost.sh --deploy ..."`(比如别的会话在 grep 日志)都会误判成在飞。
 lease_deploy_process_running() {
-  if command -v pgrep >/dev/null 2>&1; then
-    pgrep -f 'deploy-v5-selfhost\.sh --(deploy|cutover|bootstrap)' >/dev/null 2>&1
-    return
-  fi
-  local p c
+  local p
   for p in /proc/[0-9]*; do
-    c="$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null || true)"
-    [[ "$c" == *deploy-v5-selfhost.sh\ --deploy* || "$c" == *deploy-v5-selfhost.sh\ --cutover* || "$c" == *deploy-v5-selfhost.sh\ --bootstrap* ]] && return 0
+    [[ -r "$p/cmdline" ]] || continue
+    local -a argv=(); mapfile -d '' -t argv <"$p/cmdline" 2>/dev/null || continue
+    local i n=${#argv[@]}
+    for (( i=0; i<n-1; i++ )); do
+      case "${argv[i]}" in
+        */deploy-v5-selfhost.sh|deploy-v5-selfhost.sh)
+          case "${argv[i+1]}" in --deploy|--cutover|--bootstrap) return 0 ;; esac ;;
+      esac
+    done
   done
   return 1
 }

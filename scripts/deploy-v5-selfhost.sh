@@ -169,7 +169,8 @@ own_instance_present() {
 
 cleanup_selfhost_deploy() {
   local exit_rc=$?
-  lease_train_on_exit "$exit_rc" || true
+  # 函数定义在后面;参数校验阶段的 die 也会进这里,此时函数尚不存在。
+  if declare -F lease_train_on_exit >/dev/null 2>&1; then lease_train_on_exit "$exit_rc" || true; fi
   if [[ -n "${PLATFORM_ARCHIVE_TMP:-}" && -d "$PLATFORM_ARCHIVE_TMP" ]]; then
     rm -rf "$PLATFORM_ARCHIVE_TMP"
     PLATFORM_ARCHIVE_TMP=""
