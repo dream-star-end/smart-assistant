@@ -223,7 +223,30 @@
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/06-archive-paging.spec.ts",
           "assertion": "归档分页:无重复行 / 无空页死循环 / 游标收敛"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/unifiedTimelineDisplayDegrade.test.ts",
+          "assertion": "published tape with zero semantic heads degrades to visible_head final text"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/unifiedTimelineDisplayDegrade.test.ts",
+          "assertion": "heads without any final assistant record append the visible_head fallback after process rows"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/unifiedTimelineDisplayDegrade.test.ts",
+          "assertion": "bash-tail probe never decodes bytes in SQL and survives invalid UTF-8 tool output"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/unifiedTimelineDisplayDegrade.test.ts",
+          "assertion": "invalid UTF-8 probe bytes on one tape leave other tapes on the page intact"
         }
+      ],
+      "coverageCommits": [
+        "3cd0c117"
       ]
     },
     {
