@@ -1,16 +1,15 @@
--- 0270_desktop_tunnel_owners.sql
--- order-dependency: none  (0269_cursor_usd_150_credits 仅存在于未 push 的 canonical worktree;本支从 origin/feat/v5-selfhost 82176f0b8 开、目录最高 0268。合入前若 0269 已进 tip,改回 0269_cursor_usd_150_credits)
+-- 0274_desktop_tunnel_owners.sql
+-- order-dependency: none  (origin/feat/v5-selfhost 0a3780b7 最高 0272_cursor_sonnet5_admin_only; 0273 被 restore_ccb_provider_check / chatgpt_proxy_credentials 占号。本支基线 82176f0b8 目录最高 0268,空库重放无 0269-0273 文件。合入时若 0273 已进 tip,改本行为该 version)
 --
 -- W-05 桌面反向隧道 owner 目录(session affinity + fail-loud)。
--- 缺口 0269 被 feat/v5-selfhost 未推送的 Cursor Sand 150 credits/USD 迁移占号
--- (worktree openclaude-v5-selfhost)。先合并 apply 0269,再合本支。
+-- 号从 0270 让到 0274: origin/feat/v5-selfhost 已占 0269-0272,在途分支占 0273。
 --
 -- Fail-loud:故意省略 IF NOT EXISTS。残留表会让 CREATE 失败,不会被 ledger 记成成功。
 -- preflight 在表已存在时 RAISE,给出 runbook,且不会登记 schema_migrations。
 --
 -- Runbook(残留表):
 --   1. DROP TABLE desktop_tunnel_owners;
---   2. 确认 schema_migrations 无 0270_desktop_tunnel_owners 后重跑 migrate。
+--   2. 确认 schema_migrations 无 0274_desktop_tunnel_owners 后重跑 migrate。
 
 DO $$
 BEGIN
@@ -22,7 +21,7 @@ BEGIN
        AND c.relname = 'desktop_tunnel_owners'
        AND c.relkind = 'r'
   ) THEN
-    RAISE EXCEPTION '0270 fail-loud: desktop_tunnel_owners already exists. Runbook: DROP TABLE desktop_tunnel_owners; confirm schema_migrations has no 0270_desktop_tunnel_owners; re-run migrate. Do not insert into schema_migrations.';
+    RAISE EXCEPTION '0274 fail-loud: desktop_tunnel_owners already exists. Runbook: DROP TABLE desktop_tunnel_owners; confirm schema_migrations has no 0274_desktop_tunnel_owners; re-run migrate. Do not insert into schema_migrations.';
   END IF;
 END $$;
 

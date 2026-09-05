@@ -1,9 +1,9 @@
 /**
- * 0270 desktop_tunnel_owners schema.
+ * 0274 desktop_tunnel_owners schema.
  *
  * REQUIRE_TEST_DB=1 bash scripts/test-mutex.sh commercial \
  *   'npx tsx --test --test-force-exit --test-concurrency=1 --test-timeout=180000 \
- *    packages/commercial/src/__tests__/migration0270.integ.test.ts'
+ *    packages/commercial/src/__tests__/migration0274.integ.test.ts'
  */
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -14,15 +14,15 @@ import { query } from "../db/queries.js";
 import { splitSqlStatements } from "../db/migrate.js";
 import { useDedicatedTestDatabase } from "./helpers/db.js";
 
-const db = useDedicatedTestDatabase("desktop_owners_0270_test");
+const db = useDedicatedTestDatabase("desktop_owners_0274_test");
 const here = path.dirname(fileURLToPath(import.meta.url));
-const sqlPath = path.resolve(here, "../db/migrations/0270_desktop_tunnel_owners.sql");
+const sqlPath = path.resolve(here, "../db/migrations/0274_desktop_tunnel_owners.sql");
 
-describe("0270 desktop_tunnel_owners", () => {
+describe("0274 desktop_tunnel_owners", () => {
   test("SQL is fail-loud: no IF NOT EXISTS on CREATE TABLE, has preflight", async () => {
     const sql = await readFile(sqlPath, "utf8");
     assert.match(sql, /order-dependency:\s*none/);
-    assert.match(sql, /RAISE EXCEPTION '0270 fail-loud/);
+    assert.match(sql, /RAISE EXCEPTION '0274 fail-loud/);
     assert.doesNotMatch(sql, /CREATE TABLE IF NOT EXISTS desktop_tunnel_owners/i);
     const stmts = splitSqlStatements(sql);
     assert.ok(stmts.length >= 2, `expected preflight + DDL, got ${stmts.length}`);
@@ -67,7 +67,7 @@ describe("0270 desktop_tunnel_owners", () => {
 
     const u = await query<{ id: string }>(
       `INSERT INTO users(email, password_hash) VALUES ($1,'x') RETURNING id::text`,
-      [`own-0270-${Date.now()}@t.local`],
+      [`own-0274-${Date.now()}@t.local`],
     );
     const uid = u.rows[0]!.id;
     await query(
