@@ -146,6 +146,23 @@ export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
   // 0214 旧模型下线的 catalog/pricing 精确 before-image。证明下线只做 disabled+hidden、
   // 从未 retired，并为条件补偿提供不可变比对锚点。
   "model_legacy_disable_snapshots",
+  // 2026-09-05 OCV5-113: migration before-images / release verification /
+  // P0 containment debt. Same class as model_default_transition_snapshots —
+  // small, immutable ops ledgers; deleting them would drop rollback proof.
+  "model_dsv4pro_transition_snapshots",
+  "model_flash_opencode_subject_snapshots",
+  "model_flash_opencode_transition",
+  "model_k3_256k_transition",
+  "model_pricing_0234_backup",
+  "model_pricing_0238_backup",
+  "model_pricing_0245_backup",
+  "model_pricing_0256_backup",
+  "emergency_containment_authorizations",
+  "emergency_containment_debts",
+  "verification_runs",
+  "verification_sponsored_requests",
+  "release_verification_evidence",
+  "release_egress_transitions",
 ] as const;
 
 // 模块加载即校验:合规永久表与运维永久账本表名不得重叠(命名域彻底分离,防混淆)。
