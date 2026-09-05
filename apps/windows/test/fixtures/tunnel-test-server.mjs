@@ -42,7 +42,12 @@ export function createRegisterTestServer({
     res.end('not ws')
   })
 
+  server.on('tlsClientError', () => {})
+  server.on('clientError', (_err, socket) => {
+    try { socket.destroy() } catch { /* */ }
+  })
   server.on('upgrade', (req, socket, head) => {
+    socket.on('error', () => {})
     connectLog.push({ url: req.url, auth: req.headers.authorization })
     if (req.url !== '/ws/desktop-container-register') {
       socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n')

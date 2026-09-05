@@ -215,6 +215,9 @@ export function createTunnelClient(opts) {
           if (!stopped && !updateRequired) scheduleReconnect('fail_closed')
         },
       })
+      sock.on('error', (err) => {
+        emit('ws_error', { message: err?.code || err?.message })
+      })
       sock.on('close', (code, reasonBuf) => {
         const why = Buffer.isBuffer(reasonBuf) ? reasonBuf.toString('utf8') : String(reasonBuf ?? '')
         const mapped = mapClose(code, why)

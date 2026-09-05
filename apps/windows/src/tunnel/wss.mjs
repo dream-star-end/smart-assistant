@@ -107,12 +107,15 @@ export class WssSocket extends EventEmitter {
     this._closed = false
     this.readyState = 1
     socket.on('data', (chunk) => this._onData(chunk))
-    socket.on('error', (err) => {
-      if (this._closed) return
-      this.emit('error', err)
-    })
+    socket.on('error', (err) => this._onSocketError(err))
     socket.on('close', () => this._onPeerClose(1006, 'socket_close'))
     socket.on('end', () => this._onPeerClose(1006, 'socket_end'))
+  }
+
+  _onSocketError(err) {
+    if (this._closed) return
+    if (this.listenerCount('error') > 0) this.emit('error', err)
+    this._finish(1006, err?.code || err?.message || 'socket_error')
   }
 
   sendText(text) {
@@ -322,7 +325,11 @@ export class TestWssConnection extends EventEmitter {
     this._buf = leftover.length ? leftover : Buffer.alloc(0)
     this._closed = false
     socket.on('data', (chunk) => this._onData(chunk))
-    socket.on('error', (err) => this.emit('error', err))
+    socket.on('error', (err) => {
+      if (this._closed) return
+      if (this.listenerCount('error') > 0) this.emit('error', err)
+      this._finish(1006, err?.code || err?.message || 'socket_error')
+    })
     socket.on('close', () => this._finish(1006, 'socket_close'))
   }
 
