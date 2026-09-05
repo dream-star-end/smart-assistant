@@ -34,6 +34,7 @@ EXPECTED_SKILLS=(
   scientific-figures
   research-slides
   research-tournament
+  multi-model-review
   research-experiment-loop
   research-writing-style
   office-spreadsheet
