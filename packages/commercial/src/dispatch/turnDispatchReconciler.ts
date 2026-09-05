@@ -791,9 +791,6 @@ type VisibleOrphanScanRow = {
   tape_parts_rows: string
   last_frame_at: Date | null
   container_running: boolean
-  attempt_no: number | string | null
-  agent_container_id: number | null
-  runtime_kind: string | null
 }
 
 /**

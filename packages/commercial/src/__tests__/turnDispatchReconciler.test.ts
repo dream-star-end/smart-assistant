@@ -1115,7 +1115,6 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       last_frame_at: new Date(nowMs - 10 * 60_000),
       first_visible_at: null,
       container_running: false,
-      attempt_no: 1,
       agent_container_id: null,
       runtime_kind: null,
       ...over,
@@ -1427,7 +1426,7 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
-      container: { ...noContainer, getDispatchState: async () => { probes++; return { kind: 'unreachable' } } },
+      container: { ...noContainer, getDispatchState: async () => { probes++; return { kind: 'unreachable', detail: 'unexpected probe after credited first_visible' } } },
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
