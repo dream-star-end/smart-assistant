@@ -1,12 +1,16 @@
 /**
  * Chat timeline paint-window geometry.
  *
- * Indexing uses measured row-height prefix sums (unmeasured rows fall back to
- * 200px). Idle warmup force-visibles already-mounted rows for one frame so
+ * Indexing uses measured row-height prefix sums. Unmeasured rows fall back to
+ * an estimate: the caller passes the median of rows already measured in this
+ * session (`rowHeightEstimatePx`), or 200px before anything is measured. Idle
+ * warmup force-visibles already-mounted rows for one frame so
  * `content-visibility: auto` records last remembered size, then measures.
  */
 
 export const PAINT_ESTIMATE_PX = 200;
+/** Fewer measured rows than this and the median is too noisy to beat 200px. */
+export const ESTIMATE_MIN_SAMPLES = 4;
 /** Floor so a tiny viewport still mounts a usable neighborhood. */
 export const PAINT_MIN_ITEMS = 12;
 /** Paint window turns on at the first-screen tail, not after a second +80 expand. */
@@ -33,8 +37,37 @@ export function paintWindowEnabled(
   );
 }
 
-export function itemHeightPx(key: string, heights: Map<string, number>): number {
-  return heights.get(key) ?? PAINT_ESTIMATE_PX;
+export function itemHeightPx(
+  key: string,
+  heights: Map<string, number>,
+  estimatePx: number = PAINT_ESTIMATE_PX,
+): number {
+  return heights.get(key) ?? estimatePx;
+}
+
+export function medianPx(values: readonly number[]): number | null {
+  const finite = values.filter((v) => Number.isFinite(v) && v > 0);
+  if (finite.length === 0) return null;
+  const sorted = [...finite].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 === 1 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+}
+
+/**
+ * Estimate for rows the cache has not measured yet. A row that mounts with the
+ * wrong `contain-intrinsic-size` lays out at that size while skipped and grows
+ * to its real height when it becomes relevant; above the viewport that growth
+ * is a visible jump on every row scrolled past. The median of rows already
+ * measured in this session tracks the real distribution (message rows are
+ * rarely 200px) far better than the CSS constant.
+ */
+export function rowHeightEstimatePx(
+  heights: Map<string, number>,
+  fallback: number = PAINT_ESTIMATE_PX,
+  minSamples: number = ESTIMATE_MIN_SAMPLES,
+): number {
+  if (heights.size < minSamples) return fallback;
+  return medianPx(Array.from(heights.values())) ?? fallback;
 }
 
 /**
@@ -46,11 +79,12 @@ export function indexAtOffsetPx(
   offsetPx: number,
   keyAt: (index: number) => string,
   heights: Map<string, number>,
+  estimatePx: number = PAINT_ESTIMATE_PX,
 ): number {
   if (count <= 0 || offsetPx <= 0) return 0;
   let acc = 0;
   for (let i = 0; i < count; i += 1) {
-    const height = itemHeightPx(keyAt(i), heights);
+    const height = itemHeightPx(keyAt(i), heights, estimatePx);
     if (acc + height > offsetPx) return i;
     acc += height;
   }
@@ -83,8 +117,11 @@ export function computePaintRange(args: {
   heights: Map<string, number>;
   /** Inclusive index that must stay mounted (e.g. the in-flight user bubble). */
   pinStart?: number;
+  /** Height assumed for unmeasured rows; see rowHeightEstimatePx. */
+  estimatePx?: number;
 }): { start: number; end: number } {
   const { count, scrollTop, clientHeight, followBottom, keyAt, heights, pinStart } = args;
+  const estimatePx = args.estimatePx ?? PAINT_ESTIMATE_PX;
   if (count <= 0) return { start: 0, end: 0 };
   const extra = overscanPx(clientHeight);
 
@@ -96,13 +133,19 @@ export function computePaintRange(args: {
     const target = clientHeight + extra;
     while (start > 0 && acc < target) {
       start -= 1;
-      acc += itemHeightPx(keyAt(start), heights);
+      acc += itemHeightPx(keyAt(start), heights, estimatePx);
     }
     start = Math.min(start, Math.max(0, count - PAINT_MIN_ITEMS));
     end = count;
   } else {
-    start = indexAtOffsetPx(count, Math.max(0, scrollTop - extra), keyAt, heights);
-    end = indexAtOffsetPx(count, Math.max(0, scrollTop) + clientHeight + extra, keyAt, heights);
+    start = indexAtOffsetPx(count, Math.max(0, scrollTop - extra), keyAt, heights, estimatePx);
+    end = indexAtOffsetPx(
+      count,
+      Math.max(0, scrollTop) + clientHeight + extra,
+      keyAt,
+      heights,
+      estimatePx,
+    );
     if (end < count) end += 1;
     end = Math.min(count, Math.max(end, start + PAINT_MIN_ITEMS));
     start = Math.min(start, Math.max(0, count - PAINT_MIN_ITEMS));
@@ -134,10 +177,11 @@ export function measuredRangePx(
   to: number,
   keyAt: (index: number) => string,
   heights: Map<string, number>,
+  estimatePx: number = PAINT_ESTIMATE_PX,
 ): number {
   let height = 0;
   for (let i = from; i < to; i += 1) {
-    height += itemHeightPx(keyAt(i), heights);
+    height += itemHeightPx(keyAt(i), heights, estimatePx);
   }
   return height;
 }
@@ -151,12 +195,14 @@ export function paintRangeCoversViewport(args: {
   clientHeight: number;
   keyAt: (index: number) => string;
   heights: Map<string, number>;
+  estimatePx?: number;
 }): boolean {
   const { start, end, count, scrollTop, clientHeight, keyAt, heights } = args;
+  const estimatePx = args.estimatePx ?? PAINT_ESTIMATE_PX;
   if (count <= 0 || end <= start) return false;
-  const top = measuredRangePx(0, start, keyAt, heights);
-  const painted = measuredRangePx(start, end, keyAt, heights);
-  const total = top + painted + measuredRangePx(end, count, keyAt, heights);
+  const top = measuredRangePx(0, start, keyAt, heights, estimatePx);
+  const painted = measuredRangePx(start, end, keyAt, heights, estimatePx);
+  const total = top + painted + measuredRangePx(end, count, keyAt, heights, estimatePx);
   const viewEnd = Math.min(scrollTop + Math.max(0, clientHeight), total);
   return top <= scrollTop + 1 && top + painted >= viewEnd - 1;
 }
@@ -176,6 +222,7 @@ export function selectPaintRange(args: {
   keyAt: (index: number) => string;
   heights: Map<string, number>;
   pinStart?: number;
+  estimatePx?: number;
 }): { start: number; end: number } {
   const { prev, next, followBottom, pinStart } = args;
   if (followBottom) return next;
