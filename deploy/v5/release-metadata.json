@@ -153,7 +153,8 @@
     "0269_cursor_usd_150_credits",
     "0270_cursor_claude_200_others_100_grok_admin",
     "0271_cursor_retire_fable5_add_sonnet5",
-    "0272_cursor_sonnet5_admin_only"
+    "0272_cursor_sonnet5_admin_only",
+    "0273_chatgpt_proxy_credentials"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
