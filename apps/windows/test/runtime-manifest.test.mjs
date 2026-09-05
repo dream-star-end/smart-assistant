@@ -105,3 +105,26 @@ test('loadRuntimeManifest reads the bake file', () => {
   const loaded = loadRuntimeManifest(file, { expectedOs: 'linux', expectedArch: 'x64', env: {} })
   assert.equal(loaded.selected.url, 'https://cdn.example.test/ccb.bin')
 })
+
+test('parseRuntimeManifest rejects mixed artifact origins', () => {
+  assert.throws(
+    () => parseRuntimeManifest({
+      v: 1,
+      engine: 'ccb',
+      artifacts: [
+        { os: 'linux', arch: 'x64', url: 'https://example.invalid/a', sha256: '0'.repeat(64) },
+        { os: 'windows', arch: 'x64', url: 'https://other.invalid/a', sha256: '0'.repeat(64) },
+      ],
+    }, { expectedOs: 'linux', expectedArch: 'x64' }),
+    (err) => err && err.code === 'ORIGIN_MISMATCH',
+  )
+})
+
+test('bake placeholder artifacts share one https origin', () => {
+  const parsed = loadRuntimeManifest(bakePath, { expectedOs: 'windows', expectedArch: 'x64' })
+  const origin = new URL(parsed.selected.url).origin
+  assert.equal(origin.startsWith('https://'), true)
+  for (const item of parsed.artifacts) {
+    assert.equal(new URL(item.url).origin, origin)
+  }
+})

@@ -48,6 +48,30 @@ function parseArtifact(raw, index) {
   }
 }
 
+export function publicOriginFromHttpsUrl(url) {
+  let parsed
+  try {
+    parsed = new URL(url)
+  } catch {
+    throw new ManifestError('NON_HTTPS_URL', 'url must be https')
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new ManifestError('NON_HTTPS_URL', 'url must be https')
+  }
+  return parsed.origin
+}
+
+export function assertArtifactsSharePublicOrigin(artifacts, publicOrigin) {
+  const expected = publicOriginFromHttpsUrl(publicOrigin)
+  for (const [index, item] of artifacts.entries()) {
+    const origin = publicOriginFromHttpsUrl(item.url)
+    if (origin !== expected) {
+      throw new ManifestError('ORIGIN_MISMATCH', `artifacts[${index}] origin ${origin} != ${expected}`)
+    }
+  }
+  return expected
+}
+
 export function parseRuntimeManifest(raw, { expectedOs, expectedArch } = {}) {
   const doc = typeof raw === 'string' ? JSON.parse(raw) : raw
   if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
@@ -70,6 +94,7 @@ export function parseRuntimeManifest(raw, { expectedOs, expectedArch } = {}) {
   if (!selected) {
     throw new ManifestError('OS_ARCH_MISMATCH', `no ccb artifact for ${mappedOs}/${arch}`)
   }
+  assertArtifactsSharePublicOrigin(artifacts, artifacts[0].url)
   return {
     v: doc.v,
     engine: doc.engine,
