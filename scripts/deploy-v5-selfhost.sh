@@ -1605,6 +1605,17 @@ assert_ssh_rule_before_drop() {
   log "  ✓ V5_EGRESS_IN SSH RETURN 在 DROP 之前 (ssh=$ssh_line drop=$drop_line)"
 }
 
+# Fail closed; the caller owns the existing compensation/exit path.
+user_contract_gate() {
+  local password_file=/etc/openclaude/selfhost-canary.password
+  [[ -f "$password_file" && -r "$password_file" && -s "$password_file" ]] \
+    || { echo "FATAL: user contract canary password missing/unreadable/empty: $password_file" >&2; return 1; }
+  V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
+    V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
+    V5_CANARY_PASSWORD_FILE="$password_file" V5_CONTRACT_COST=live \
+    node "$SCRIPT_DIR/v5-user-contract-smoke.mjs"
+}
+
 cmd_smoke() {
   local hz i ok=0 code
   log "══ selfhost smoke ══"
@@ -1877,6 +1888,8 @@ cutover_smoke_against_release() { # <rel>
     [[ "$got" == "$want" ]] || { cutover_fail "cutover smoke: 共享口应答槽=$got,active 槽=$want 不一致"; return 1; }
     cutover_clog "  ✓ egress 双槽拓扑一致:active=$want"
   fi
+  # Must pass before either branch persists phase=smoked (survivor invariant).
+  user_contract_gate || return 1
 }
 
 cutover_smoke_healthz_only() {
