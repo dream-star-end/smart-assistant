@@ -126,8 +126,11 @@ export function createStickToBottomController() {
 
   const correctTo = (el: StickScroller, nextTop: number) => {
     // The user owns scrollTop right now; the anchor is recaptured on the next
-    // scroll event, so this correction is simply not needed.
-    if (fenced()) return;
+    // scroll event, so this correction is simply not needed. A transient input
+    // mark (keyboard / first wheel tick before the fence attaches) counts too:
+    // a correction there would overwrite the user's move and, through
+    // recordWrite, also erase the baseline that lets onScroll detect the leave.
+    if (fenced() || writeSuspended.current) return;
     el.scrollTop = nextTop;
     recordWrite(el);
   };
@@ -141,9 +144,19 @@ export function createStickToBottomController() {
     const expected = expectedWrittenTop(el);
     const leaveTolerance = hadUserIntent ? 0 : WRITE_TOLERANCE_PX;
 
-    // Browser clamped our last position after scrollHeight shrank. That is not
-    // a user leave, and landing near the new bottom is not a re-follow.
+    // Browser clamped our last position after maxScrollTop dropped (content
+    // shrank, or a bottom HUD / banner / soft keyboard collapsed and the
+    // viewport grew). That is not a user leave, and landing near the new
+    // bottom is not a re-follow.
+    //
+    // A marked user gesture must never be mistaken for that clamp. The user's
+    // scroll-up and the viewport growth can land in the same scroll event; the
+    // clamp shape (scrollTop == new max) is then a coincidence, and swallowing
+    // it here leaves `following` true so the next stream pin snaps the viewport
+    // back to the bottom. With intent present the user owns the position and
+    // the zero-tolerance leave check below decides.
     if (
+      !hadUserIntent &&
       prevObserved !== null &&
       maxTop < prevObserved - WRITE_TOLERANCE_PX &&
       Math.abs(current - maxTop) <= WRITE_TOLERANCE_PX
