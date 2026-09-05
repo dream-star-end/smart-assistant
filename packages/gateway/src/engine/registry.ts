@@ -29,7 +29,36 @@ export type EngineFactory = (opts: EngineCreateOpts) => EngineAdapter
 
 const engineFactories = new Map<string, EngineFactory>()
 
+/** Desktop W-01: Host sets OPENCLAUDE_ENGINES=ccb. Unset = all engines (current). */
+export const ENGINE_NOT_ENABLED = 'ENGINE_NOT_ENABLED' as const
+
+export class EngineNotEnabledError extends Error {
+  readonly code = ENGINE_NOT_ENABLED
+  constructor(engineId: string) {
+    super(`${ENGINE_NOT_ENABLED}: engine '${engineId}' is not enabled`)
+    this.name = 'EngineNotEnabledError'
+  }
+}
+
+export function parseEnabledEngines(
+  raw: string | undefined = process.env.OPENCLAUDE_ENGINES,
+): Set<string> | null {
+  const value = raw?.trim()
+  if (!value) return null
+  return new Set(value.split(/[,\s]+/).map((part) => part.trim()).filter(Boolean))
+}
+
+export function isEngineEnabled(
+  engineId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const allowed = parseEnabledEngines(env.OPENCLAUDE_ENGINES)
+  if (allowed === null) return true
+  return allowed.has(engineId)
+}
+
 export function registerEngine(engineId: string, factory: EngineFactory): void {
+  if (!isEngineEnabled(engineId)) return
   engineFactories.set(engineId, factory)
 }
 
@@ -159,6 +188,9 @@ export function resolveEngine(
 
 /** 构造 engine adapter。未注册 engine → fail-closed 抛错(v5 硬闸的升级形态)。 */
 export function createEngine(engineId: string, opts: EngineCreateOpts): EngineAdapter {
+  if (!isEngineEnabled(engineId)) {
+    throw new EngineNotEnabledError(engineId)
+  }
   const factory = engineFactories.get(engineId)
   if (!factory) {
     throw new Error(
