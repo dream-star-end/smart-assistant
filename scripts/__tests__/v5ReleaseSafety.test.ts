@@ -1933,6 +1933,7 @@ describe('v5 release safety lanes', () => {
       'set -u',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'ssh() { echo "UNEXPECTED-ssh:$*" >&2; return 1; }',
       `BUILT_RELEASE='${newRelease}'`,
       `serving_release_uses_legacy_baseline '${oldRelease}' && echo old=0 || echo old=1`,
       `serving_release_uses_legacy_baseline '${newRelease}' && echo new=0 || echo new=1`,
@@ -1950,6 +1951,65 @@ describe('v5 release safety lanes', () => {
     assert.match(decision.stdout, /^new=1$/m)
     assert.match(decision.stdout, /^flagged=0$/m)
     assert.match(decision.stdout, /^unknown=1$/m)
+  })
+
+  test('recover smoke classifies legacy baseline by serving sourceCommit when BUILT_RELEASE is empty', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-recover-smoke-legacy-')); dirs.push(dir)
+    const mismatch = path.join(dir, 'rel-old')
+    const match = path.join(dir, 'rel-head')
+    const missing = path.join(dir, 'rel-nosha')
+    await mkdir(mismatch, { recursive: true })
+    await mkdir(match, { recursive: true })
+    await mkdir(missing, { recursive: true })
+    const head = spawnSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' })
+    assert.equal(head.status, 0, head.stderr)
+    const headSha = head.stdout.trim()
+    assert.match(headSha, /^[0-9a-f]{40}$/)
+    const otherSha = 'c40f716cc0000000000000000000000000000000'
+    assert.notEqual(otherSha, headSha)
+    await writeFile(path.join(mismatch, '.complete'), JSON.stringify({
+      schemaVersion: 2,
+      sourceCommit: otherSha,
+    }) + '\n')
+    await writeFile(path.join(match, '.complete'), JSON.stringify({
+      schemaVersion: 2,
+      sourceCommit: headSha,
+    }) + '\n')
+    await writeFile(path.join(missing, '.complete'), JSON.stringify({
+      schemaVersion: 2,
+    }) + '\n')
+
+    const source = await readFile(deploy, 'utf8')
+    const helper = source.match(/serving_release_uses_legacy_baseline\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(helper, /sourceCommit/)
+    assert.match(helper, /rev-parse HEAD/)
+    assert.match(helper, /BUILT_RELEASE/)
+    assert.match(helper, /DRY/)
+
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'KL_HOST=fake-v5',
+      'DRY=0',
+      'unset BUILT_RELEASE ROLLBACK_LEGACY_BASELINE_OK',
+      'ssh() { local _host="$1"; shift; if [[ $# == 1 ]]; then bash -c "$1"; else "$@"; fi; }',
+      `serving_release_uses_legacy_baseline '${mismatch}' && echo mismatch=0 || echo mismatch=1`,
+      `serving_release_uses_legacy_baseline '${match}' && echo match=0 || echo match=1`,
+      `serving_release_uses_legacy_baseline '${missing}' && echo missing=0 || echo missing=1`,
+      'DRY=1',
+      `serving_release_uses_legacy_baseline '${mismatch}' && echo dry=0 || echo dry=1`,
+    ].join('\n')
+    const decision = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.equal(decision.status, 0, decision.stdout + decision.stderr)
+    assert.match(decision.stdout, /^mismatch=0$/m)
+    assert.match(decision.stdout, /^match=1$/m)
+    assert.match(decision.stdout, /^missing=1$/m)
+    assert.match(decision.stdout, /^dry=1$/m)
   })
 
   test('baseline release/config guards cover build, slots, smoke, canary and rollback activation', async () => {

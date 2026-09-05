@@ -493,10 +493,23 @@ assert_legacy_release_baseline_security() { # <absolute-release-root>
 # in this checkout (e.g. multi-model-review). Official --rollback already
 # prefixes ROLLBACK_LEGACY_BASELINE_OK=1; compensation callers historically did
 # not, so smoke itself must pick legacy when serving != BUILT_RELEASE.
+# --recover has no build (BUILT_RELEASE empty). Identity is serving .complete
+# sourceCommit vs this checkout HEAD: unequal → legacy; unreadable / non-40-hex
+# / ssh fail / DRY → strict (fail-closed, same as today).
 serving_release_uses_legacy_baseline() { # <serving-release>
-  local serving="${1:-}"
+  local serving="${1:-}" serving_sha checkout_sha
   [[ "${ROLLBACK_LEGACY_BASELINE_OK:-0}" == 1 ]] && return 0
   [[ -n "${BUILT_RELEASE:-}" && -n "$serving" && "$serving" != "$BUILT_RELEASE" ]] && return 0
+  # Fast path above covers this invocation's new vs predecessor. Recover (and
+  # any lane that never assigned BUILT_RELEASE) must still classify by source.
+  [[ -n "${BUILT_RELEASE:-}" ]] && return 1
+  [[ -n "$serving" ]] || return 1
+  [[ "${DRY:-0}" == 1 ]] && return 1
+  serving_sha="$(ssh "$KL_HOST" "jq -er '.sourceCommit | select(type==\"string\" and test(\"^[0-9a-f]{40}$\"))' '$serving/.complete'" 2>/dev/null)" || return 1
+  [[ "$serving_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  checkout_sha="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)" || return 1
+  [[ "$checkout_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$serving_sha" != "$checkout_sha" ]] && return 0
   return 1
 }
 
