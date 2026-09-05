@@ -1862,7 +1862,7 @@ describe('v5 release safety lanes', () => {
     assert.match(untraversableResult.stderr, /not world-readable\/traversable/)
   })
 
-  test('legacy serving baseline compat allows only pre-admin cursor/taskboard/ssh gaps', async () => {
+  test('legacy serving baseline compat allows only pre-admin cursor/taskboard/ssh/multi-model-review gaps', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-legacy-cursor-')); dirs.push(dir)
     const release = path.join(dir, 'release')
     const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
@@ -1871,6 +1871,7 @@ describe('v5 release safety lanes', () => {
     await rm(path.join(baseline, 'skills/cursor-cli'), { recursive: true })
     await rm(path.join(baseline, 'skills/manage-taskboard'), { recursive: true })
     await rm(path.join(baseline, 'skills/ssh'), { recursive: true })
+    await rm(path.join(baseline, 'skills/multi-model-review'), { recursive: true })
     await rm(path.join(baseline, 'AGENTS.admin.md'))
     await rm(path.join(baseline, 'CLAUDE.admin.md'))
     const strict = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
