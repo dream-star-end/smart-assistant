@@ -176,6 +176,10 @@ HOT_CONFIG_LIB="$SCRIPT_DIR/v5-hot-config-lib.sh"
 [ -f "$HOT_CONFIG_LIB" ] || { echo "FATAL: 缺 hot-config lib: $HOT_CONFIG_LIB" >&2; exit 1; }
 # shellcheck source=scripts/v5-hot-config-lib.sh
 source "$HOT_CONFIG_LIB"
+HOST_MAINT_LIB="$SCRIPT_DIR/v5-host-maint-lib.sh"
+[ -f "$HOST_MAINT_LIB" ] || { echo "FATAL: 缺 host maint lib: $HOST_MAINT_LIB" >&2; exit 1; }
+# shellcheck source=scripts/v5-host-maint-lib.sh
+source "$HOST_MAINT_LIB"
 DEPLOY_SURFACE_CHECK="$SCRIPT_DIR/v5-deploy-surface-check.mjs"
 [ -x "$DEPLOY_SURFACE_CHECK" ] || {
   echo "FATAL: 缺或不可执行的 V5 deploy surface check: $DEPLOY_SURFACE_CHECK" >&2
@@ -1043,6 +1047,7 @@ MUTATION_LEASE_TTL_PGID=""  # 独立 PGID，outer 整组 STOP/KILL 时 deadline 
 MUTATION_LEASE_ACTIVE=0     # 1=已持有,cleanup 需释放
 MUTATION_LEASE_BYPASSED=0   # 1=OC_V5_SKIP_MUTATION_LEASE 紧急旁路,活性断言直接放行
 MUTATION_DEPLOY_ID=""       # 与 lease fencing meta 的 deploy_id 同值；不是 lane marker nonce
+HOST_MAINT_DEPLOY_ID=""     # apt-daily 维护租约; cleanup / ExecStopPost 按此 id 恢复
 MUTATION_HOLDER_IDENTITY=""
 KNOWLEDGE_PLANET_VERIFY_HOLDER_OWNED=0
 MUTATION_LANE_PID=""
@@ -1383,6 +1388,9 @@ cleanup_deploy_process() {
   [[ "$DEPLOY_HOLDER_OWNED" == 1 ]] && rm -f "${DEPLOY_LOCK}.holder"
   [[ "$KNOWLEDGE_PLANET_VERIFY_HOLDER_OWNED" == 1 ]] \
     && rm -f "${KNOWLEDGE_PLANET_VERIFY_LOCK}.holder"
+  # Restore apt-daily timers even on abnormal EXIT (OCV5-117). Idempotent; no-op
+  # without a matching maint-suspended.json. set +e is already on.
+  host_maint_restore_owned "${HOST_MAINT_DEPLOY_ID:-}"
   exit "$rc"
 }
 
@@ -11666,6 +11674,25 @@ esac
 
 # B1 持锁后廉价复核:pinned SHA 未漂 + 本进程绿门结论仍在。
 maybe_recheck_ci_green_after_lease || exit 1
+
+# Host apt/needrestart mutex (OCV5-117): fail-closed if apt/dpkg/needrestart is
+# running; stop apt-daily timers for the write-lane lifetime; restore on EXIT.
+# Readonly / reclaim lanes skip (reclaim must not block on a 6h timer lease).
+case "$MODE" in
+  smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|reclaim-mutation-inflight) ;;
+  *)
+    if [[ "$DRY" != 1 ]]; then
+      host_maint_precheck || exit 1
+      HOST_MAINT_DEPLOY_ID="${MUTATION_DEPLOY_ID:-}"
+      if [[ -z "$HOST_MAINT_DEPLOY_ID" ]]; then
+        HOST_MAINT_DEPLOY_ID="$(openssl rand -hex 12 2>/dev/null || printf 'pid%s-%s' "$$" "$(date +%s)")"
+      fi
+      host_maint_begin "$HOST_MAINT_DEPLOY_ID" || exit 1
+    else
+      echo "  [dry-run] skip host-maint precheck/suspend (apt-daily timers untouched)"
+    fi
+    ;;
+esac
 
 # Durable containment debt is checked only after the real mutation lease has been acquired.
 # Recovery/rollback/abort and Luna-hide compensation remain available; every other write lane
