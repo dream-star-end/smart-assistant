@@ -434,13 +434,16 @@ describe("attemptSend — multipart upload", () => {
       () => attemptSend(PAYLOAD, { config: CFG, fetcher, timeoutMs: 5 }),
       (error: unknown) => error instanceof V3SinkError &&
         error.errorClass === "transient" &&
-        /network error/i.test(error.message),
+        // Deadline aborts used to surface as "network error"; they now name the
+        // bounded deadline explicitly so slow-master incidents are diagnosable.
+        /network error|timeout after/i.test(error.message),
     );
     assert.equal(signalAborted, true);
   });
 
-  test("finalize has no content-size deadline while parts keep the bounded signal", async () => {
+  test("finalize keeps no content-size deadline but carries its own bounded signal", async () => {
     let finalizeInit: any;
+    let partSignal: AbortSignal | undefined;
     let releaseFinalize!: () => void;
     const finalizeBarrier = new Promise<void>((resolve) => { releaseFinalize = resolve; });
     const fetcher = (async (_url: string, init: any) => {
@@ -449,6 +452,7 @@ describe("attemptSend — multipart upload", () => {
         finalizeInit = init;
         await finalizeBarrier;
       } else {
+        partSignal = init.signal;
         assert.ok(init.signal instanceof AbortSignal, "part retains its bounded deadline signal");
         assert.equal(init.headersTimeout, undefined);
         assert.equal(init.bodyTimeout, undefined);
@@ -470,11 +474,55 @@ describe("attemptSend — multipart upload", () => {
       await new Promise((resolve) => setImmediate(resolve));
     }
     assert.ok(finalizeInit, "finalize envelope reached the fetcher");
-    assert.equal(finalizeInit.signal, undefined, "finalize must not inherit the part AbortSignal");
+    assert.ok(finalizeInit.signal instanceof AbortSignal, "finalize carries its own bounded deadline signal");
+    assert.notEqual(finalizeInit.signal, partSignal, "finalize must not inherit the part AbortSignal");
     assert.equal(finalizeInit.headersTimeout, 0);
     assert.equal(finalizeInit.bodyTimeout, 0);
+    // The short 5ms part deadline must not leak into finalize; only the much
+    // longer finalize deadline (env/default 120s) owns its wall clock.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(finalizeInit.signal.aborted, false, "part deadline must not abort finalize");
     releaseFinalize();
     await sending;
+  });
+
+  test("finalize deadline aborts a half-dead master and stays transient (retry, not fatal)", async () => {
+    // gpt-6 recurring-incident audit case 3: finalize used to run with no
+    // AbortController, so a half-dead master held the retry queue forever.
+    process.env.OC_V5_SINK_FINALIZE_TIMEOUT_MS = "15";
+    let finalizeAborted = false;
+    try {
+      const fetcher = (async (_url: string, init: any) => {
+        const action = JSON.parse(init.body).action;
+        if (action !== "finalize") {
+          return {
+            statusCode: 200,
+            headers: {},
+            trailers: {},
+            opaque: undefined,
+            context: {},
+            body: {
+              async *[Symbol.asyncIterator]() { yield Buffer.from('{"ok":true}', "utf8"); },
+            } as any,
+          };
+        }
+        return await new Promise<never>((_resolve, reject) => {
+          init.signal.addEventListener("abort", () => {
+            finalizeAborted = true;
+            reject(new DOMException("This operation was aborted", "AbortError"));
+          }, { once: true });
+        });
+      }) as unknown as typeof import("undici").request;
+      await assert.rejects(
+        () => attemptSend(PAYLOAD, { config: CFG, fetcher }),
+        (error: unknown) => error instanceof V3SinkError
+          && error.errorClass === "transient"
+          && /timeout after 15ms/i.test(error.message),
+      );
+      assert.equal(finalizeAborted, true);
+    } finally {
+      delete process.env.OC_V5_SINK_FINALIZE_TIMEOUT_MS;
+    }
   });
 });
 

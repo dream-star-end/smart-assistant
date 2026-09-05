@@ -734,6 +734,206 @@ describe("internalServerAuthored handler — lossless turn tape error classifica
     assert.equal(r.status, 409);
     assert.equal(r.code, "TURN_TAPE_CONFLICT");
   });
+
+  // gpt-6 复发事故审计 case 3:旧白名单制把 PG 容量/连接类与一切未识别错误都误判成
+  // 409 永久冲突 → 网关 sink 视 409 为 fatal → drainer 整 tape 永久 quarantine。
+  // 默认反转后:只有确定性 immutable 冲突闭集才 409,其余一律 503 幂等重试。
+  test("part: PG 53300 too many clients → 503 TURN_TAPE_RETRYABLE(不再误判 409)", async () => {
+    const handler = handlerThrowing("part", () => {
+      throw Object.assign(new Error("sorry, too many clients already"), { code: "53300" });
+    });
+    const r = await run(handler, partBody);
+    assert.equal(r.status, 503);
+    assert.equal(r.code, "TURN_TAPE_RETRYABLE");
+  });
+
+  test("finalize: PG 53300 too many clients → 503 TURN_TAPE_RETRYABLE", async () => {
+    const handler = handlerThrowing("finalize", () => {
+      throw Object.assign(new Error("sorry, too many clients already"), { code: "53300" });
+    });
+    const r = await run(handler, finalizeBody);
+    assert.equal(r.status, 503);
+    assert.equal(r.code, "TURN_TAPE_RETRYABLE");
+  });
+
+  test("finalize: PG 57P01 terminated by administrator + socket ECONNREFUSED → 503", async () => {
+    const terminated = handlerThrowing("finalize", () => {
+      throw Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" });
+    });
+    const r1 = await run(terminated, finalizeBody);
+    assert.equal(r1.status, 503);
+    assert.equal(r1.code, "TURN_TAPE_RETRYABLE");
+
+    const refused = handlerThrowing("finalize", () => {
+      throw Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:5432"), { code: "ECONNREFUSED" });
+    });
+    const r2 = await run(refused, finalizeBody);
+    assert.equal(r2.status, 503);
+    assert.equal(r2.code, "TURN_TAPE_RETRYABLE");
+  });
+
+  test("part: 未知形态(无 code 普通 Error)→ 默认 503 可重试,而非 409 永久", async () => {
+    const handler = handlerThrowing("part", () => {
+      throw new Error("totally unprecedented storage failure");
+    });
+    const r = await run(handler, partBody);
+    assert.equal(r.status, 503);
+    assert.equal(r.code, "TURN_TAPE_RETRYABLE");
+  });
+
+  test("finalize: 未知形态(AbortError)→ 默认 503 可重试", async () => {
+    const handler = handlerThrowing("finalize", () => {
+      throw new Error("The operation was aborted");
+    });
+    const r = await run(handler, finalizeBody);
+    assert.equal(r.status, 503);
+    assert.equal(r.code, "TURN_TAPE_RETRYABLE");
+  });
+
+  test("part: pgSessionsBackend 真实 immutable 冲突消息闭集 → 仍 409", async () => {
+    const handler = handlerThrowing("part", () => {
+      throw new Error("lossless turn tape immutable part manifest conflict");
+    });
+    const r = await run(handler, partBody);
+    assert.equal(r.status, 409);
+    assert.equal(r.code, "TURN_TAPE_CONFLICT");
+  });
+
+  test("finalize: 聚合校验失败(immutable 数据确定性错误)→ 仍 409", async () => {
+    const handler = handlerThrowing("finalize", () => {
+      throw new Error("lossless turn tape aggregate hash mismatch");
+    });
+    const r = await run(handler, finalizeBody);
+    assert.equal(r.status, 409);
+    assert.equal(r.code, "TURN_TAPE_CONFLICT");
+  });
+
+  test("finalize: incomplete → 503 可重试(parts 尚在途,不再永久 quarantine)", async () => {
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async stageLosslessTurnTapePart() {
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape() {
+          return { applied: "incomplete" };
+        },
+      },
+    });
+    const r = await run(handler, finalizeBody);
+    assert.equal(r.status, 503);
+    assert.equal(r.code, "TURN_TAPE_RETRYABLE");
+  });
+});
+
+// gpt-6 复发事故审计 case 3:visible/finalize 分支里 broadcastToUser 跑在 storage 的
+// try/catch 里 —— 广播同步抛错会把"落库已成功"的 tape 误分类成存储失败(409)→ 永久
+// quarantine。广播必须在 storage try 之外自带 try/catch(warn),成功 ACK 不受影响。
+describe("internalServerAuthored handler — post-commit broadcast isolation", () => {
+  test("visible: broadcast throws after storage success → 200 ACK, storage not re-run", async () => {
+    let commits = 0;
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async commitVisibleLosslessTurnTape() {
+          commits++;
+          return {
+            applied: "finalized",
+            recordCount: 0,
+            engineBillings: [],
+            settlementHandoff: true,
+            newlyVisible: true,
+            clientMessageId: "cm-broadcast-throw-1",
+          };
+        },
+        async stageLosslessTurnTapePart() {
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape() {
+          return { applied: "finalized", recordCount: 0, engineBillings: [] };
+        },
+      },
+      broadcastToUser() {
+        throw new Error("ws bridge socket destroyed mid-send");
+      },
+    });
+    const body: LosslessTurnTapeVisibleRequest = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "visible",
+      sessionId: "web-test1",
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "a".repeat(64),
+      tapeId: "b".repeat(64),
+      tapeSha256: "c".repeat(64),
+      totalBytes: 2,
+      partCount: 1,
+      createdAt: 1_783_944_000_000,
+      settlement: {
+        billingAnchorId: "srv-web-test1-main-t1",
+        engineBillings: [],
+        text: "visible answer",
+        ts: 1_783_944_000_000,
+      },
+    };
+    const out = makeRes();
+    await handler(makeReq({ body: JSON.stringify(body), auth: `Bearer ${VALID_TOKEN}` }), out.res, CTX);
+    assert.equal(out.rec.status, 200, "storage already committed; broadcast failure must not flip the ACK");
+    assert.equal(commits, 1, "storage must not be re-run for a broadcast failure");
+    const parsed = JSON.parse(out.rec.body) as { ok?: boolean; settlementHandoff?: boolean };
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.settlementHandoff, true);
+  });
+
+  test("finalize: broadcast throws after storage success → 200 ACK, storage not re-run", async () => {
+    let finalizeCalls = 0;
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async stageLosslessTurnTapePart() {
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape() {
+          finalizeCalls++;
+          return {
+            applied: "finalized",
+            recordCount: 1,
+            engineBillings: [],
+            newlyVisible: true,
+            clientMessageId: "cm-broadcast-throw-2",
+          };
+        },
+      },
+      broadcastToUser() {
+        throw new Error("ws bridge socket destroyed mid-send");
+      },
+    });
+    const finalize: LosslessTurnTapeFinalizeRequest = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "finalize",
+      sessionId: "web-test1",
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "a".repeat(64),
+      tapeId: "b".repeat(64),
+      tapeSha256: "e".repeat(64),
+      totalBytes: 1,
+      partCount: 1,
+      createdAt: 1_783_944_000_000,
+    };
+    const out = makeRes();
+    await handler(makeReq({ body: JSON.stringify(finalize), auth: `Bearer ${VALID_TOKEN}` }), out.res, CTX);
+    assert.equal(out.rec.status, 200, "storage already committed; broadcast failure must not flip the ACK");
+    assert.equal(finalizeCalls, 1, "storage must not be re-run for a broadcast failure");
+    const parsed = JSON.parse(out.rec.body) as { ok?: boolean; recordCount?: number };
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.recordCount, 1);
+  });
 });
 
 // ─── tests ───────────────────────────────────────────────────────────────

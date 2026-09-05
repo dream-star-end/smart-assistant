@@ -87,9 +87,24 @@ export { SERVER_AUTHORED_PATH }
 const MAX_DIAGNOSTIC_RESPONSE_BYTES = 256 * 1024
 
 /** HTTP timeout per staged part. Finalize is content-sized work and has no
- * product-level deadline: the fsynced queue remains the durable owner until
- * the master returns an ACK. */
+ * content-size deadline; it instead carries its own bounded wall-clock
+ * deadline (FINALIZE_TIMEOUT_MS) so a half-dead master cannot hold the retry
+ * queue forever. The fsynced queue remains the durable owner until the master
+ * returns an ACK. */
 const ATTEMPT_TIMEOUT_MS = 10_000
+
+/** Bounded wall-clock deadline for one finalize request. A large lossless tape
+ * can legitimately take minutes to verify and materialize, but a half-dead
+ * master that swallows the request must not pin the drainer forever
+ * (gpt-6 recurring-incident audit case 3). Override via env for ops tuning. */
+const FINALIZE_TIMEOUT_MS = 120_000
+
+function readFinalizeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = (env.OC_V5_SINK_FINALIZE_TIMEOUT_MS ?? '').trim()
+  if (raw === '') return FINALIZE_TIMEOUT_MS
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : FINALIZE_TIMEOUT_MS
+}
 
 /**
  * Wire-shape payload. Mirrors what attemptSend serializes to the master.
@@ -469,10 +484,15 @@ async function postLosslessTurnTapeEnvelope(
 ): Promise<{ settlementHandoff?: boolean }> {
   const fetcher = deps.fetcher ?? undiciRequest
   const isFinalize = envelope.action === 'finalize'
-  const controller = isFinalize ? null : new AbortController()
-  const timer = controller === null
-    ? null
-    : setTimeout(() => controller.abort(), deps.timeoutMs ?? ATTEMPT_TIMEOUT_MS)
+  // Finalize keeps no content-size deadline (headersTimeout/bodyTimeout stay 0)
+  // but gains its own bounded AbortController deadline (default 120s, env
+  // OC_V5_SINK_FINALIZE_TIMEOUT_MS). Abort is classified transient so the
+  // fsynced queue retries instead of hanging forever on a half-dead master.
+  const controller = new AbortController()
+  const timeoutMs = isFinalize
+    ? readFinalizeTimeoutMs()
+    : deps.timeoutMs ?? ATTEMPT_TIMEOUT_MS
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
   let res: Awaited<ReturnType<typeof undiciRequest>>
   try {
     res = await fetcher(`${deps.config.baseUrl}${SERVER_AUTHORED_PATH}`, {
@@ -482,28 +502,36 @@ async function postLosslessTurnTapeEnvelope(
         authorization: `Bearer ${deps.config.bearer}`,
       },
       body: JSON.stringify(envelope),
-      ...(controller === null
+      signal: controller.signal,
+      ...(isFinalize
         ? {
             // A large lossless tape can legitimately take minutes to verify
             // and materialize. Undici's default headers timeout would turn
-            // that valid work into overlapping retries. Connection failures
-            // still reject normally; there is simply no content-size timer.
+            // that valid work into overlapping retries. The bounded signal
+            // above is the sole wall-clock owner; there is no content-size timer.
             headersTimeout: 0,
             bodyTimeout: 0,
           }
-        : { signal: controller.signal }),
+        : {}),
     })
   } catch (err) {
-    if (timer !== null) clearTimeout(timer)
-    throw new V3SinkError(`network error: ${err instanceof Error ? err.message : String(err)}`, 'transient')
+    clearTimeout(timer)
+    const aborted = err instanceof Error
+      && (err.name === 'AbortError' || /abort/i.test(err.message))
+    throw new V3SinkError(
+      aborted
+        ? `timeout after ${timeoutMs}ms: ${err instanceof Error ? err.message : String(err)}`
+        : `network error: ${err instanceof Error ? err.message : String(err)}`,
+      'transient',
+    )
   }
-  if (timer !== null) clearTimeout(timer)
   let bodyText = ''
   try {
     bodyText = await readBoundedBody(res.body, MAX_DIAGNOSTIC_RESPONSE_BYTES)
   } catch {
     // Status remains authoritative when an error response body cannot be read.
   }
+  clearTimeout(timer)
   const status = res.statusCode
   if (status >= 200 && status < 300) {
     try {
