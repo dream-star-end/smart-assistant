@@ -42,7 +42,7 @@ export function firstFailedStep(job) {
 
 export function extractTapFirstNotOk(text) {
   if (!text) return null;
-  const m = String(text).match(/^not ok \d+ - (.+)$/m);
+  const m = String(text).match(/(?:^|\t)\s*not ok \d+ - (.+)$/m);
   return m ? m[1].trim() : null;
 }
 
