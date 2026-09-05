@@ -7,11 +7,22 @@
  * turn's stdout open, and a caller blocked on the close barrier would never
  * write a terminal state. */
 
+import { spawnSync as spawnSyncDefault } from 'node:child_process'
 import type { Readable } from 'node:stream'
 
 type SignalTarget = {
   pid?: number | undefined
   kill(signal: NodeJS.Signals): boolean
+}
+
+export type KillProcessGroupOpts = {
+  platform?: NodeJS.Platform
+  kill?: (pid: number, signal?: NodeJS.Signals | number) => boolean
+  spawnSync?: (
+    command: string,
+    args?: readonly string[],
+    options?: { windowsHide?: boolean; stdio?: 'ignore' },
+  ) => unknown
 }
 
 export function shutdownTimeoutMs(name: string, fallback: number): number {
@@ -36,10 +47,38 @@ export function waitForCloseWithin(
   })
 }
 
-export function killProcessGroup(proc: SignalTarget, signal: NodeJS.Signals): void {
+export function killProcessGroup(
+  proc: SignalTarget,
+  signal: NodeJS.Signals,
+  opts?: KillProcessGroupOpts,
+): void {
+  const platform = opts?.platform ?? process.platform
+  const groupKill = opts?.kill ?? process.kill.bind(process)
+  const pid = proc.pid
+
+  if (platform === 'win32') {
+    if (typeof pid === 'number' && pid > 0) {
+      const spawnSync = opts?.spawnSync ?? spawnSyncDefault
+      try {
+        spawnSync('taskkill', ['/T', '/F', '/PID', String(pid)], {
+          windowsHide: true,
+          stdio: 'ignore',
+        })
+      } catch {
+        /* Job Object would be better; P2 uses taskkill /T. Fall back below. */
+      }
+    }
+    try {
+      proc.kill(signal)
+    } catch {
+      /* ignore */
+    }
+    return
+  }
+
   try {
-    if (typeof proc.pid === 'number' && proc.pid > 0) {
-      process.kill(-proc.pid, signal)
+    if (typeof pid === 'number' && pid > 0) {
+      groupKill(-pid, signal)
       return
     }
   } catch {

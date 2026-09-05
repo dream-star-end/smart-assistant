@@ -1912,10 +1912,8 @@ export class SubprocessRunner extends EventEmitter {
     this.emit('overflow', info)
     // Trigger an exit path: force-kill the process group so MCP children die too.
     try {
-      if (pid) {
-        try { process.kill(-pid, 'SIGKILL') } catch { proc?.kill('SIGKILL') }
-      } else {
-        proc?.kill('SIGKILL')
+      if (proc) {
+        killRunnerProcessGroup(proc, 'SIGKILL')
       }
     } catch (err) {
       runnerLog.warn('overflow kill failed', { sessionKey: this.opts.sessionKey }, err)
