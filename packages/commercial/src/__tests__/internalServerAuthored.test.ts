@@ -799,6 +799,22 @@ describe("internalServerAuthored handler — lossless turn tape error classifica
     assert.equal(r.code, "TURN_TAPE_CONFLICT");
   });
 
+  test("finalize: header / dispatch identity / settlement / engineBillings 同键异身份冲突 → 仍 409", async () => {
+    for (const message of [
+      "lossless turn tape immutable header conflict",
+      "lossless turn tape dispatch identity conflict",
+      "lossless turn tape settlement conflict",
+      "lossless turn tape engineBillings mismatch",
+    ]) {
+      const handler = handlerThrowing("finalize", () => {
+        throw new Error(message);
+      });
+      const r = await run(handler, finalizeBody);
+      assert.equal(r.status, 409, message);
+      assert.equal(r.code, "TURN_TAPE_CONFLICT", message);
+    }
+  });
+
   test("finalize: 聚合校验失败(immutable 数据确定性错误)→ 仍 409", async () => {
     const handler = handlerThrowing("finalize", () => {
       throw new Error("lossless turn tape aggregate hash mismatch");

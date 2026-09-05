@@ -2286,6 +2286,11 @@ const IMMUTABLE_TURN_TAPE_CONFLICT_MESSAGE_RE = new RegExp(
   [
     "immutable part (?:manifest )?conflict",
     "finalize header conflict",
+    "immutable header conflict",
+    "dispatch identity conflict",
+    "settlement conflict",
+    "engineBillings mismatch",
+    "recovery (?:request|source) identity conflict",
     "immutable record identity conflict",
     "immutable model sidecar conflict",
     "immutable lossless cost locator conflict",
