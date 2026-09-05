@@ -3021,6 +3021,38 @@ await check("T62 Phase-A fallback 与最后一段 live 正文同 id 时最后一
   }
 });
 
+await check("T64 Phase-B 同 id deferred 空壳到达时最后一段正文不再次闪没", async () => {
+  const deferred = await page.evaluate(() =>
+    window.__replayDrive.runPhaseBDeferredLastSegmentIdCollision("deferred"));
+  if (deferred.sending) throw new Error("Phase-B 终态后仍在发送");
+  const texts = deferred.visibleAssistant.map((row) => row.text);
+  if (JSON.stringify(texts) !== JSON.stringify(["BROWSER_PB_DEFER_A1", "BROWSER_PB_DEFER_FINAL"])) {
+    throw new Error(`Phase-B deferred 空壳吞掉最后一段正文:${JSON.stringify(deferred)}`);
+  }
+  if (deferred.lastSegmentDeferred) {
+    throw new Error(`最后一段仍以 deferred locator 形态渲染(占位卡无正文):${JSON.stringify(deferred)}`);
+  }
+  await replayRoot.getByText("BROWSER_PB_DEFER_FINAL", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  if ((await replayRoot.getByText("正在读取真实 Agent 记录…", { exact: true }).count()) !== 0) {
+    throw new Error("最后一段槽位渲染了 deferred 占位卡而不是已流式正文");
+  }
+  if ((await replayRoot.getByText("BROWSER_PB_DEFER_A1BROWSER_PB_DEFER_FINAL", { exact: true }).count()) !== 0) {
+    throw new Error("渲染了 fallback 拼接整块正文");
+  }
+  const exact = await page.evaluate(() =>
+    window.__replayDrive.runPhaseBDeferredLastSegmentIdCollision("exact"));
+  if (exact.lastSegmentText !== "BROWSER_PB_DEFER_FINAL_EXACT" || !exact.helperFieldGone) {
+    throw new Error(`真实 record 到达后未整体替换/辅助字段未消失:${JSON.stringify(exact)}`);
+  }
+  await replayRoot.getByText("BROWSER_PB_DEFER_FINAL_EXACT", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+});
+
 await check("T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runPhaseAEmptyUnitsReset());
   if (JSON.stringify(result.roles) !== JSON.stringify(["user", "thinking", "tool", "plan", "assistant"])) {
