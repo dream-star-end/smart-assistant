@@ -51,6 +51,8 @@ export { createApprovalController, classifyDestructiveOp, APPROVAL_TIMEOUT_MS } 
 export { snapshotWorkspace } from './workspace/snapshot.mjs'
 export { applyWorkspaceToGatewaySpawn } from './workspace/applySpawn.mjs'
 export { createApprovalBridge } from './approvalBridge.mjs'
+export { spawnHostProcess, assertElectronHostTransport } from './hostTransport.mjs'
+export { detectHostIpcChannel, announceHostReady } from './ipcChannel.mjs'
 export {
   buildDesktopGatewayConfig,
   resolveGatewayProfileDir,

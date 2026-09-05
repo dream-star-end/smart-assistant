@@ -1,8 +1,8 @@
-import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ElectronToHost, HostToElectron, HOST_IPC_VERSION, isIpcRecord } from './host/ipc.mjs'
 import { killProcessTree } from './host/gatewayProcess.mjs'
+import { spawnHostProcess } from './host/hostTransport.mjs'
 import { TunnelState } from './tunnel/tunnelClient.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -38,6 +38,9 @@ export function createHostSupervisor({
   env = process.env,
   identityLoader,
   config,
+  utilityProcess,
+  forkImpl,
+  versions = process.versions,
   onState,
   onError,
   onMessage,
@@ -49,6 +52,7 @@ export function createHostSupervisor({
   stopTimeoutMs = 5_000,
 } = {}) {
   let child = null
+  let transportKind = null
   let stopped = true
   let tunnelState = TunnelState.OFFLINE
   let lastStatus = null
@@ -58,21 +62,19 @@ export function createHostSupervisor({
   let restartTimer = null
   let stopWait = null
 
-  const childEnv = () => {
-    const next = { ...env, ELECTRON_RUN_AS_NODE: '1' }
-    delete next.OPENCLAUDE_TRUST_BRIDGE_IP
-    delete next.OC_CONTAINER_ID
-    delete next.OC_BRIDGE_NONCE
-    return next
-  }
-
   function send(message) {
-    if (child && typeof child.send === 'function') child.send(message)
+    if (!child) return
+    if (typeof child.send === 'function') child.send(message)
+    else if (typeof child.postMessage === 'function') child.postMessage(message)
   }
 
   function handleMessage(raw) {
     if (!isIpcRecord(raw)) return
     onMessage?.(raw)
+    if (raw.type === HostToElectron.READY) {
+      send({ type: ElectronToHost.HELLO, v: HOST_IPC_VERSION })
+      return
+    }
     if (raw.type === HostToElectron.HELLO_OK) {
       if (pendingIdentity && pendingConfig) {
         send({
@@ -119,17 +121,21 @@ export function createHostSupervisor({
   }
 
   function spawnHost() {
-    const spawned = spawn(execPath, [hostEntry], {
-      stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
-      env: childEnv(),
-      windowsHide: true,
+    const spawned = spawnHostProcess({
+      hostEntry,
+      execPath,
+      env,
+      utilityProcess,
+      forkImpl,
+      versions,
     })
-    child = spawned
-    spawned.stderr?.on('data', () => {})
-    spawned.stdout?.on('data', () => {})
-    spawned.on('message', handleMessage)
-    spawned.on('exit', (code, signal) => {
-      if (child === spawned) child = null
+    child = spawned.child
+    transportKind = spawned.kind
+    child.stderr?.on?.('data', () => {})
+    child.stdout?.on?.('data', () => {})
+    child.on('message', handleMessage)
+    child.on('exit', (code, signal) => {
+      if (child === spawned.child) child = null
       if (stopped) return
       const t = now()
       restartTimes.push(t)
@@ -150,12 +156,16 @@ export function createHostSupervisor({
       void code
       void signal
     })
-    sendHello(spawned)
+    sendHello(child)
   }
 
   function sendHello(target) {
     try {
-      target.send({ type: ElectronToHost.HELLO, v: HOST_IPC_VERSION })
+      if (typeof target.send === 'function') {
+        target.send({ type: ElectronToHost.HELLO, v: HOST_IPC_VERSION })
+      } else if (typeof target.postMessage === 'function') {
+        target.postMessage({ type: ElectronToHost.HELLO, v: HOST_IPC_VERSION })
+      }
     } catch { /* */ }
   }
 
@@ -201,9 +211,7 @@ export function createHostSupervisor({
     await new Promise((resolve) => {
       const timer = setTimeout(() => {
         killProcessTree(current.pid)
-        if (process.platform !== 'win32') {
-          try { current.kill('SIGKILL') } catch { /* */ }
-        }
+        try { current.kill?.('SIGKILL') } catch { /* */ }
         resolve()
       }, stopTimeoutMs)
       stopWait = () => {
@@ -241,6 +249,9 @@ export function createHostSupervisor({
     },
     get child() {
       return child
+    },
+    get transportKind() {
+      return transportKind
     },
   }
 }

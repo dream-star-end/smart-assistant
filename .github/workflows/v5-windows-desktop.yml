@@ -132,6 +132,39 @@ jobs:
             }
           }
 
+      - name: Smoke packaged local Host via utilityProcess
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $PWD 'apps/windows/release/win-unpacked/Clarvy.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "packaged executable missing: $exe"
+          }
+          $report = Join-Path $env:RUNNER_TEMP 'clarvy-unpacked-local-host-smoke.txt'
+          $env:OPENCLAUDE_SMOKE_REPORT_PATH = $report
+          $process = Start-Process -FilePath $exe -ArgumentList '--smoke-local-host' -PassThru
+          try {
+            if (-not $process.WaitForExit(40000)) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              throw 'Clarvy.exe --smoke-local-host exceeded 40 seconds'
+            }
+            $process.Refresh()
+            if ($process.ExitCode -ne 0) {
+              $detail = if (Test-Path -LiteralPath $report -PathType Leaf) {
+                Get-Content -LiteralPath $report -Raw
+              } else {
+                'No local-host smoke report was produced.'
+              }
+              throw "Clarvy.exe --smoke-local-host exited with code $($process.ExitCode)`n$detail"
+            }
+            Write-Host 'local-host smoke: Host IPC ready via utilityProcess, exit 0'
+          }
+          finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
+
       - name: Smoke silent install and uninstall
         shell: pwsh
         run: |

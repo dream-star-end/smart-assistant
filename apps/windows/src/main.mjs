@@ -23,6 +23,7 @@ import {
   screen,
   session,
   shell,
+  utilityProcess,
 } from 'electron'
 
 import {
@@ -62,7 +63,8 @@ import {
   createSafeStorageIdentityStore,
   resolveIdentityDirectory,
 } from './identity.mjs'
-import { createHostSupervisor, readDesktopHostConfigFromEnv } from './hostSupervisor.mjs'
+import { createHostSupervisor, readDesktopHostConfigFromEnv, DEFAULT_HOST_ENTRY } from './hostSupervisor.mjs'
+import { runLocalHostSmoke } from './localHostSmoke.mjs'
 import { createHostLogger, resolveLogsDirectory } from './host/log.mjs'
 import { createApprovalController } from './host/workspace/approval.mjs'
 import { snapshotWorkspace } from './host/workspace/snapshot.mjs'
@@ -145,6 +147,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SHELL_PRELOAD_PATH = path.join(__dirname, 'shell-preload.cjs')
 const LOCAL_PRELOAD_PATH = path.join(__dirname, 'local-preload.cjs')
 const smokeTest = process.argv.includes('--smoke-test')
+const smokeLocalHost = process.argv.includes('--smoke-local-host')
 
 registerShellScheme(protocol)
 app.enableSandbox()
@@ -2410,6 +2413,26 @@ if (!hasSingleInstanceLock) {
     .then(async () => {
       installApplicationMenu()
       if (!smokeTest && process.platform === 'win32') installJumpList({ app })
+      if (smokeLocalHost) {
+        try {
+          const exitCode = await runLocalHostSmoke({
+            createSupervisor: (opts) => createHostSupervisor({
+              utilityProcess,
+              hostEntry: DEFAULT_HOST_ENTRY,
+              env: process.env,
+              identityLoader: async () => null,
+              config: { registerOrigin: '', egressOrigin: '', spkiPin: '', deviceCaPem: '' },
+              ...opts,
+            }),
+          })
+          app.exit(exitCode)
+        } catch (error) {
+          console.error('[windows] local-host smoke failed:', error instanceof Error ? error.message : error)
+          await writeSmokeFailureReport('local-host', error)
+          app.exit(1)
+        }
+        return
+      }
       if (smokeTest) {
         const exitCode = await runSmokeTest()
         app.exit(exitCode)
@@ -2448,7 +2471,7 @@ app.on('activate', () => {
 function installLocalAgentHost() {
   if (smokeTest || hostSupervisor) return hostSupervisor
   hostSupervisor = createHostSupervisor({
-    execPath: process.execPath,
+    utilityProcess,
     env: process.env,
     identityLoader: async () => {
       try {

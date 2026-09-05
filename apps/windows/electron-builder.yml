@@ -14,9 +14,9 @@ files:
   - package.json
   - runtime-manifest.json
 
-# R7: Host + tunnel run as ELECTRON_RUN_AS_NODE and spawn gateway/CCB.
-# They must be real files, not inside asar. fake-ccb is a test fixture and
-# is not in `files`, so it never ships.
+# Host is spawned with Electron utilityProcess.fork (runAsNode fuse stays false).
+# Host + tunnel + gateway/CCB need real files, not asar. fake-ccb is a test fixture
+# and is not in files, so it never ships.
 asarUnpack:
   - src/host/**
   - src/hostSupervisor.mjs

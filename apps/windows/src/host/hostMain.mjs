@@ -1,9 +1,10 @@
 /**
- * Local Agent Host entry. Spawned by Electron with stdio IPC.
+ * Local Agent Host entry. Spawned by Electron utilityProcess or Node fork.
  * Identity and tokens arrive over IPC only — never argv/env.
  */
 import { createHostRuntime } from './runtime.mjs'
 import { ElectronToHost, HostToElectron, HOST_IPC_VERSION, isIpcRecord } from './ipc.mjs'
+import { announceHostReady, detectHostIpcChannel } from './ipcChannel.mjs'
 import { createHostLogger, resolveLogsDirectory } from './log.mjs'
 
 function makeHostLog() {
@@ -17,17 +18,12 @@ function makeHostLog() {
 }
 const hostLog = makeHostLog()
 
-function send(message) {
-  if (typeof process.send === 'function') process.send(message)
-}
-
 function watchParent(shutdown) {
   const startPpid = process.ppid
   const timer = setInterval(() => {
     if (process.ppid === 1 || process.ppid !== startPpid) shutdown('parent_gone')
   }, 1000)
   timer.unref?.()
-  process.on('disconnect', () => shutdown('ipc_disconnect'))
   return () => clearInterval(timer)
 }
 
@@ -39,12 +35,17 @@ function assertNoIdentityInProcess() {
 }
 
 async function main() {
-  if (typeof process.send !== 'function') {
+  const channel = detectHostIpcChannel(process)
+  if (!channel) {
     hostLog.error('host_ipc_missing', { errCode: 'NO_IPC' })
     console.error('hostMain requires an IPC channel')
     process.exit(2)
   }
   assertNoIdentityInProcess()
+
+  const send = (message) => {
+    try { channel.send(message) } catch { /* */ }
+  }
 
   let runtime = null
   let shuttingDown = false
@@ -58,9 +59,10 @@ async function main() {
   }
 
   watchParent(shutdown)
+  channel.onDisconnect(() => shutdown('ipc_disconnect'))
   try { process.stdin.unref() } catch { /* */ }
 
-  process.on('message', async (raw) => {
+  channel.onMessage(async (raw) => {
     if (!isIpcRecord(raw)) return
     try {
       if (raw.type === ElectronToHost.HELLO) {
@@ -131,6 +133,7 @@ async function main() {
     }
   })
 
+  announceHostReady(channel)
   process.on('SIGTERM', () => { void shutdown('sigterm') })
   process.on('SIGINT', () => { void shutdown('sigint') })
 }

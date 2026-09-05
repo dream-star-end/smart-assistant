@@ -11,6 +11,7 @@ export const HostToElectron = Object.freeze({
   APPROVAL_REQUEST: 'approval-request',
   WORKSPACE_UPDATED: 'workspace-updated',
   FALLBACK: 'fallback-cloud',
+  READY: 'ready',
 })
 
 export const ElectronToHost = Object.freeze({
