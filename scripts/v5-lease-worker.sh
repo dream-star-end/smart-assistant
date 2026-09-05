@@ -142,7 +142,7 @@ expire_and_alert() {
     [[ -n "$id" ]] || continue
     age_h="$(lease_sql "SELECT CAST((julianday('now')-julianday('$created'))*24 AS INTEGER);")"
     blocker="$(describe_blocker)"
-    local key="lease:$id:alert:$(lease_sql "SELECT strftime('%Y%m%d%H','now');")"
+    local key hour; hour="$(lease_sql "SELECT strftime('%Y%m%d%H','now');")"; key="lease:$id:alert:$hour"
     lease_tx <<SQL || continue
 BEGIN IMMEDIATE;
 UPDATE lease SET last_alert_at='$(lease_now)', updated_at='$(lease_now)' WHERE id='$id';
@@ -159,7 +159,7 @@ describe_blocker() {
   if [[ -n "$open" ]]; then echo "open train $open"; return; fi
   if lease_deploy_process_running; then echo "外部 deploy-v5-selfhost.sh 进程在跑(非列车)"; return; fi
   if ! ( exec 8>"$LEASE_DEPLOY_LOCK"; flock -n 8 ) 2>/dev/null; then echo "deploy.lock 被外部持有"; return; fi
-  if [[ -f /run/openclaude-v5-selfhost/cutover-grace-until ]]; then echo "cutover grace 窗口"; return; fi
+  if lease_in_cutover_grace; then echo "cutover grace 窗口"; return; fi
   echo "未知(worker 应已发车,请查 worker 日志)"
 }
 
@@ -214,7 +214,7 @@ dispatch_train() {
   [[ -z "$open" ]] || { wlog "有 open train $open,不发车"; return 0; }
   [[ -n "$(lease_sql "SELECT id FROM lease WHERE resource='$RESOURCE' AND status='granted' LIMIT 1;")" ]] && { wlog "有 granted drive,不发车"; return 0; }
   lease_deploy_process_running && { wlog "外部 deploy 进程在跑,不发车"; return 0; }
-  [[ -f /run/openclaude-v5-selfhost/cutover-grace-until ]] && { wlog "cutover grace 窗口,不发车"; return 0; }
+  lease_in_cutover_grace && { wlog "cutover grace 窗口,不发车"; return 0; }
 
   git -C "$LEASE_REPO_ROOT" fetch -q origin "$LEASE_BRANCH" 2>/dev/null || true
   tip="$(lease_remote_tip)" || { wlog "读不到 origin tip"; return 0; }

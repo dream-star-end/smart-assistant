@@ -31,6 +31,7 @@ export OC_V5_LEASE_LOG_DIR="$T/logs"
 export OC_V5_LEASE_DEPLOY_BIN="$T/bin/fake-deploy.sh"
 export OC_V5_LEASE_TASK_CLI="$T/bin/fake-oc-task"
 export OC_V5_LEASE_TRAIN_PLANNED_STALE_SECONDS=1
+export OC_V5_LEASE_CUTOVER_GRACE_FILE="$T/run/cutover-grace-until"
 export OC_USER_ID=3
 unset OC_SESSION_KEY OC_V5_LEASE_CALLBACK_URL
 
@@ -155,6 +156,11 @@ reset_db; set_live "$C0" committed; echo commit >"$T/fake-deploy.mode"
 ( exec 9>"$OC_V5_SELFHOST_DEPLOY_LOCK"; flock 9; sleep 3 ) & holder=$!; sleep 0.3
 "$WORKER" >/dev/null 2>&1; assert_eq "$(starts)" 0 "锁被持有不发车"
 wait $holder
+echo "until=$(( $(date -u +%s) + 600 ))" >"$OC_V5_LEASE_CUTOVER_GRACE_FILE"
+"$WORKER" >/dev/null 2>&1; assert_eq "$(starts)" 0 "grace 未到期不发车"
+echo "until=$(( $(date -u +%s) - 600 ))" >"$OC_V5_LEASE_CUTOVER_GRACE_FILE"
+"$WORKER" >/dev/null 2>&1; assert_eq "$(starts)" 1 "grace 文件残留但已过期 → 正常发车"
+wait_train_done || true; kill_stubs
 reset_db; set_live "$C0" committed; echo stuck-smoked >"$T/fake-deploy.mode"
 "$LEASE" register --resource deploy:selfhost --mode ride --sha "$C1" --ticket OCV5-906 --owner s1 >/dev/null
 "$WORKER" >/dev/null 2>&1; wait_train_done || true; sleep 1.2; "$WORKER" >/dev/null 2>&1

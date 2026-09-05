@@ -23,6 +23,7 @@ LEASE_LIVE_LINK="${OC_V5_LEASE_LIVE_LINK:-/opt/openclaude/openclaude-v5-selfhost
 LEASE_SURVIVOR_STATE="${OC_V5_LEASE_SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}"
 LEASE_SURVIVOR_COMMITTED="${OC_V5_LEASE_SURVIVOR_COMMITTED:-/run/openclaude-v5-selfhost/cutover-survivor.committed}"
 LEASE_DEPLOY_LOCK="${OC_V5_SELFHOST_DEPLOY_LOCK:-/run/openclaude-v5-selfhost/deploy.lock}"
+LEASE_CUTOVER_GRACE_FILE="${OC_V5_LEASE_CUTOVER_GRACE_FILE:-/run/openclaude-v5-selfhost/cutover-grace-until}"
 LEASE_RIDE_ALERT_SECONDS="${OC_V5_LEASE_RIDE_ALERT_SECONDS:-21600}"      # ride 6h 未结算 → 面板告警(不过期)
 LEASE_GRANT_ACK_SECONDS="${OC_V5_LEASE_GRANT_ACK_SECONDS:-600}"          # drive:granted 后 10min 内必须 heartbeat
 LEASE_HEARTBEAT_STALE_SECONDS="${OC_V5_LEASE_HEARTBEAT_STALE_SECONDS:-180}"
@@ -208,6 +209,16 @@ lease_live_committed_sha() {
 }
 
 lease_live_rel_path() { readlink -f -- "$LEASE_LIVE_LINK" 2>/dev/null || true; }
+
+# cutover grace 是否仍在窗口内。文件在每次切流后都会留着(watch.sh 用绝对到期时间),
+# 内容 until=<epoch>;存在但已过期 = 不在窗口。无法解析时保守视为在窗口。
+lease_in_cutover_grace() {
+  [[ -f "$LEASE_CUTOVER_GRACE_FILE" && ! -L "$LEASE_CUTOVER_GRACE_FILE" ]] || return 1
+  local until
+  until="$(sed -n 's/^until=\([0-9]\{9,11\}\)$/\1/p' "$LEASE_CUTOVER_GRACE_FILE" 2>/dev/null | head -1)"
+  [[ -n "$until" ]] || return 0
+  (( $(date -u +%s) < until ))
+}
 
 # want 是否已包含在 base 中(祖先或相等)。
 lease_sha_contained() { # <want> <base>
