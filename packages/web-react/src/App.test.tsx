@@ -520,6 +520,11 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     // 空白态显式换模：随后 Goal 物化会话也必须定格该选择，不能因 activeId 改变回落默认。
     const modelTrigger = screen.getByRole('button', { name: '选择对话模型' })
     fireEvent.pointerDown(modelTrigger, { button: 0, pointerType: 'mouse' })
+    await screen.findAllByRole('menuitem')
+    // 2026-09-05 selfhost: Terra/Luna live in the collapsed "更多 GPT 模型" group.
+    const collapsed = document.querySelector('[data-collapsed-group]')
+    expect(collapsed).toBeTruthy()
+    if (collapsed) fireEvent.click(collapsed)
     const modelTarget = (await screen.findAllByRole('menuitem'))
       .find((item) => item.textContent?.includes('GPT-5.6-Terra'))
     expect(modelTarget).toBeTruthy()
