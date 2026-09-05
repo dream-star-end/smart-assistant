@@ -65,21 +65,21 @@ function EventDetail({ row }: { row: SecurityEventRow }) {
           label="对象"
           value={
             row.target ? (
-              <span className="font-mono text-[12px] break-all">{row.target}</span>
+              <span className="font-mono text-meta break-all">{row.target}</span>
             ) : (
               <span className="text-faint">—</span>
             )
           }
         />
-        <KeyValue label="IP" value={<span className="font-mono text-[12px]">{row.ip ?? "—"}</span>} />
+        <KeyValue label="IP" value={<span className="font-mono text-meta">{row.ip ?? "—"}</span>} />
         <KeyValue
           label="User-Agent"
-          value={<span className="break-all text-[12px] text-muted">{row.user_agent ?? "—"}</span>}
+          value={<span className="break-all text-meta text-muted">{row.user_agent ?? "—"}</span>}
         />
         <KeyValue label="时间" value={<TimeAgo value={row.created_at} />} />
       </div>
       <div>
-        <p className="mb-1.5 text-[12px] font-medium text-faint">detail</p>
+        <p className="mb-1.5 text-meta font-medium text-faint">detail</p>
         <FormatJsonValue value={row.detail} />
       </div>
     </div>
@@ -199,7 +199,7 @@ export function SecurityEventsTab() {
       render: (r) => {
         const s = detailPreview(r.detail);
         return (
-          <span className="block max-w-[18rem] truncate font-mono text-[12px] text-muted" title={s}>
+          <span className="block max-w-[18rem] truncate font-mono text-meta text-muted" title={s}>
             {s}
           </span>
         );

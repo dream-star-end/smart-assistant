@@ -1010,6 +1010,51 @@ describe("provisionV3Container", () => {
     }
   });
 
+  test("selfhost master OC_RESEARCH_WORKSPACE=1 is forwarded into v5 container env; unset stays out", async () => {
+    const savedChannel = process.env.OC_RUNTIME_CHANNEL;
+    const savedPromptQueue = process.env.OC_PROMPT_QUEUE_V1;
+    const savedFlag = process.env.OC_RESEARCH_WORKSPACE;
+    try {
+      process.env.OC_RUNTIME_CHANNEL = "v5";
+      process.env.OC_PROMPT_QUEUE_V1 = "1";
+      for (const [flag, expectInjected] of [
+        [undefined, false],
+        ["1", true],
+      ] as const) {
+        if (flag === undefined) delete process.env.OC_RESEARCH_WORKSPACE;
+        else process.env.OC_RESEARCH_WORKSPACE = flag;
+        // FakePool rejects a second ensure for the same uid ("concurrent ensure"),
+        // so each iteration provisions a fresh pool + fresh uid.
+        pool = new FakePool();
+        const { docker, captured } = makeDocker();
+        await provisionV3Container(
+          {
+            docker,
+            pool: pool as unknown as Pool,
+            image: TEST_IMAGE,
+            selfHostId: TEST_HOST,
+            randomIp: () => "172.31.5.44",
+            randomSecret: fixedSecret("d".repeat(64)),
+          },
+          779,
+        );
+        const env = captured.containersCreated[0]?.Env ?? [];
+        assert.equal(
+          env.includes("OC_RESEARCH_WORKSPACE=1"),
+          expectInjected,
+          `OC_RESEARCH_WORKSPACE=${String(flag)} → container env injected should be ${expectInjected}`,
+        );
+      }
+    } finally {
+      if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL;
+      else process.env.OC_RUNTIME_CHANNEL = savedChannel;
+      if (savedPromptQueue === undefined) delete process.env.OC_PROMPT_QUEUE_V1;
+      else process.env.OC_PROMPT_QUEUE_V1 = savedPromptQueue;
+      if (savedFlag === undefined) delete process.env.OC_RESEARCH_WORKSPACE;
+      else process.env.OC_RESEARCH_WORKSPACE = savedFlag;
+    }
+  });
+
   test("v5 Cursor auth bind is mounted only for configured local uid and never enters Docker Env", async () => {
     const keys = [
       "OC_RUNTIME_CHANNEL",
@@ -3389,14 +3434,46 @@ describe("resolveCcbBaselineMounts", () => {
     }
   });
 
-  test("(root only) rejects if a skill dir contains a subdirectory", () => {
-    // 未来要支持 scripts/ references/,必须显式改 manifest 校验代码扩白名单,
-    // 默认一律拒 —— parent-dir 挂载时 subdir 无论权限如何都会暴露进容器。
+  test("(root only) rejects if a skill dir contains an undeclared subdirectory", () => {
+    // scripts/ 与 references/ 已在白名单;其它 subdir 仍然 fail-closed。
     const b = makeFakeBaseline();
     if (!b) return;
     try {
       const target = V3_CCB_BASELINE_SKILL_NAMES[3]!;
-      mkdirSync(pathJoin(b.dir, "skills", target, "scripts"), { mode: 0o755 });
+      mkdirSync(pathJoin(b.dir, "skills", target, "tmpdir"), { mode: 0o755 });
+      assert.equal(resolveCcbBaselineMounts(b.dir), null);
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) accepts well-formed references/ and scripts/ trees", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      const target = V3_CCB_BASELINE_SKILL_NAMES[3]!;
+      const refs = pathJoin(b.dir, "skills", target, "references");
+      mkdirSync(pathJoin(refs, "templates"), { recursive: true, mode: 0o755 });
+      writeFileSync(pathJoin(refs, "templates", "template.py"), "print(1)\n", { mode: 0o644 });
+      const scriptsDir = pathJoin(b.dir, "skills", target, "scripts");
+      mkdirSync(scriptsDir, { mode: 0o755 });
+      writeFileSync(pathJoin(scriptsDir, "run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+      const got = resolveCcbBaselineMounts(b.dir);
+      assert.ok(got);
+      assert.ok(got.skillsDirHostPath.endsWith("/skills"));
+    } finally {
+      b.cleanup();
+    }
+  });
+
+  test("(root only) rejects references/ that contains a symlink", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      const target = V3_CCB_BASELINE_SKILL_NAMES[3]!;
+      const refs = pathJoin(b.dir, "skills", target, "references");
+      mkdirSync(refs, { mode: 0o755 });
+      symlinkSync("/etc/hostname", pathJoin(refs, "escape"));
       assert.equal(resolveCcbBaselineMounts(b.dir), null);
     } finally {
       b.cleanup();

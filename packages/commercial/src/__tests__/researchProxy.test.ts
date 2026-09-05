@@ -9,6 +9,8 @@ import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import { describe, it } from "node:test";
 
+delete process.env.OC_RESEARCH_WORKSPACE;
+
 import {
   type ResearchProxyHandlerCtx,
   makePerContainerLimiter,
@@ -143,6 +145,25 @@ describe("researchProxy: gating", () => {
     const { res, captured } = makeRes();
     await h(makeReq("POST", "/v3/research/bogus", {}), res, ctx);
     assert.equal(captured.statusCode, 404);
+  });
+
+  it("flag 关 library/list 与 library/add → 404", async () => {
+    delete process.env.OC_RESEARCH_WORKSPACE;
+    const h = makeResearchProxyHandler({ identityRepo: passingRepo(), readConfig: enabledCfg() });
+    for (const path of ["/v3/research/library/list", "/v3/research/library/add"]) {
+      const { res, captured } = makeRes();
+      await h(makeReq("POST", path, { docId: "x" }), res, ctx);
+      assert.equal(captured.statusCode, 404, path);
+    }
+  });
+
+  it("flag 关 litrag 无 docIds → 400 旧行为", async () => {
+    delete process.env.OC_RESEARCH_WORKSPACE;
+    const h = makeResearchProxyHandler({ identityRepo: passingRepo(), readConfig: enabledCfg() });
+    const { res, captured } = makeRes();
+    await h(makeReq("POST", "/v3/research/litrag/query", { query: "hello" }), res, ctx);
+    assert.equal(captured.statusCode, 400);
+    assert.equal(captured.body.error.code, "BAD_REQUEST");
   });
 });
 

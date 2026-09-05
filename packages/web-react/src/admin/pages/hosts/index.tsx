@@ -87,7 +87,7 @@ export default function HostsPage() {
     const ok = await confirm({
       title: opts.title,
       danger: opts.danger,
-      body: <p className="whitespace-pre-line text-[13px] text-muted">{opts.body}</p>,
+      body: <p className="whitespace-pre-line text-body text-muted">{opts.body}</p>,
     })
     if (!ok) return
     try {
@@ -201,7 +201,7 @@ export default function HostsPage() {
       {/* host 卡片网格 */}
       {list.error ? (
         <SectionCard title="虚机列表">
-          <p className="py-6 text-center text-[13px] text-danger">
+          <p className="py-6 text-center text-body text-danger">
             加载失败：{apiErrorMessage(list.error, '加载失败')}
           </p>
         </SectionCard>
@@ -216,7 +216,7 @@ export default function HostsPage() {
         </div>
       ) : rows.length === 0 ? (
         <SectionCard title="虚机列表">
-          <p className="py-10 text-center text-[13px] text-faint">
+          <p className="py-10 text-center text-body text-faint">
             无虚机，点右上「添加虚机」接入。
           </p>
         </SectionCard>
@@ -279,16 +279,16 @@ function BaselineCard({ baseline, loading }: { baseline: BaselineView | null; lo
   return (
     <SectionCard title="Baseline 版本" hint="master 当前 baseline 与各 host 已同步版本对比">
       {loading && !baseline ? (
-        <div className="flex items-center gap-2 text-[13px] text-muted">
+        <div className="flex items-center gap-2 text-body text-muted">
           <Spinner size={14} /> 加载中…
         </div>
       ) : !baseline ? (
-        <p className="text-[13px] text-faint">—</p>
+        <p className="text-body text-faint">—</p>
       ) : (
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-[13px]">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-body">
           <span className="text-faint">master</span>
           {baseline.master_version ? (
-            <code className="rounded bg-hover px-1.5 py-0.5 font-mono text-[12px] text-fg">
+            <code className="rounded bg-hover px-1.5 py-0.5 font-mono text-meta text-fg">
               {baseline.master_version}
             </code>
           ) : (
@@ -375,7 +375,7 @@ function UtilizationChart({
           <Spinner size={20} className="text-muted" />
         </div>
       ) : rows.length === 0 ? (
-        <div className="flex h-full items-center justify-center text-[13px] text-faint">无虚机</div>
+        <div className="flex h-full items-center justify-center text-body text-faint">无虚机</div>
       ) : (
         <canvas ref={canvasRef} />
       )}

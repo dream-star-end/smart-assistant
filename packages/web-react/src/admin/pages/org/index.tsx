@@ -169,15 +169,15 @@ function CreateOrgModal({
       }
     >
       <div className="flex flex-col gap-3">
-        <label className="flex flex-col gap-1 text-[12px] text-faint">
+        <label className="flex flex-col gap-1 text-meta text-faint">
           组织名称
           <Input value={name} onChange={(e) => setName(e.target.value)} />
         </label>
-        <label className="flex flex-col gap-1 text-[12px] text-faint">
+        <label className="flex flex-col gap-1 text-meta text-faint">
           owner 邮箱
           <Input value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="owner@example.com" />
         </label>
-        <label className="flex flex-col gap-1 text-[12px] text-faint">
+        <label className="flex flex-col gap-1 text-meta text-faint">
           成员上限(可选)
           <Input type="number" min={1} value={maxMembers} onChange={(e) => setMaxMembers(e.target.value)} />
         </label>
@@ -253,11 +253,11 @@ function EditOrgModal({
       }
     >
       <div className="flex flex-col gap-3">
-        <label className="flex flex-col gap-1 text-[12px] text-faint">
+        <label className="flex flex-col gap-1 text-meta text-faint">
           名称
           <Input value={name} onChange={(e) => setName(e.target.value)} />
         </label>
-        <div className="flex flex-col gap-1 text-[12px] text-faint">
+        <div className="flex flex-col gap-1 text-meta text-faint">
           状态
           <SelectFilter
             value={status}
@@ -265,7 +265,7 @@ function EditOrgModal({
             onChange={setStatus}
           />
         </div>
-        <label className="flex flex-col gap-1 text-[12px] text-faint">
+        <label className="flex flex-col gap-1 text-meta text-faint">
           成员上限(留空=不改)
           <Input type="number" min={1} value={maxMembers} onChange={(e) => setMaxMembers(e.target.value)} />
         </label>
@@ -344,14 +344,14 @@ function CreditsModal({
     >
       <div className="flex flex-col gap-3">
         <KeyValue label="当前余额" value={<span className="tabular-nums">{fmtCents(org?.credits)}</span>} />
-        <label className="flex flex-col gap-1 text-[12px] text-faint">
+        <label className="flex flex-col gap-1 text-meta text-faint">
           变动金额(¥,正数入账 / 负数扣减,如 1.50 或 -0.25)
           <Input value={delta} onChange={(e) => setDelta(e.target.value)} placeholder="¥ 金额" />
           <span className={`text-[11.5px] ${cents == null && delta.trim() !== "" ? "text-danger" : "text-faint"}`}>
             {preview}
           </span>
         </label>
-        <label className="flex flex-col gap-1 text-[12px] text-faint">
+        <label className="flex flex-col gap-1 text-meta text-faint">
           备注(memo)
           <Input value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="调整原因" />
         </label>
@@ -415,7 +415,7 @@ function RejectInvoiceModal({
         </>
       }
     >
-      <label className="flex flex-col gap-1 text-[12px] text-faint">
+      <label className="flex flex-col gap-1 text-meta text-faint">
         拒绝理由(admin_note,会记录并展示)
         <Textarea value={note} onChange={(e) => setNote(e.target.value)} rows={3} placeholder="填写拒绝原因" />
       </label>
@@ -508,7 +508,7 @@ export default function OrgPage() {
       title: "组织",
       render: (r) => (
         <span>
-          {r.org_name || ""} <span className="font-mono text-[12px] text-muted">#{r.org_id}</span>
+          {r.org_name || ""} <span className="font-mono text-meta text-muted">#{r.org_id}</span>
         </span>
       ),
     },
@@ -614,8 +614,8 @@ export default function OrgPage() {
               <Card key={o.id} className="flex flex-col gap-2.5 p-4">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
-                    <p className="truncate text-[14px] font-semibold text-fg">{o.name}</p>
-                    <span className="font-mono text-[11px] text-faint">#{o.id}</span>
+                    <p className="truncate text-title font-semibold text-fg">{o.name}</p>
+                    <span className="font-mono text-caption text-faint">#{o.id}</span>
                   </div>
                   <Badge tone={ORG_STATUS_TONE[o.status] ?? "neutral"}>{o.status || "—"}</Badge>
                 </div>
@@ -690,7 +690,7 @@ export default function OrgPage() {
             onChange={setInvStatus}
           />
           {invOrgFilter && (
-            <span className="inline-flex items-center gap-1.5 rounded-md bg-accent-soft px-2 py-1 text-[12px] text-accent">
+            <span className="inline-flex items-center gap-1.5 rounded-md bg-accent-soft px-2 py-1 text-meta text-accent">
               已筛选组织:<strong>{invOrgFilter.name}</strong>
               <button
                 type="button"

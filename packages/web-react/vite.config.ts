@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { gzipSync } from "node:zlib";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { forbiddenTaskboardEntryImports } from "./src/lib/forbidTaskboardEntryImport";
+import { describeFirstScreenBudget, firstScreenBudgetReport } from "./src/lib/firstScreenBudget";
 
 /**
  * 前端构建身份(版本握手单一权威):对最终 index.html(资产标签已注入)取
@@ -72,9 +74,47 @@ function forbidTaskboardEntryImport(): Plugin {
   };
 }
 
+/**
+ * 首屏体量门:index.html 的 modulepreload 集合(= SPA 入口 chunk 的静态 import 闭包,
+ * 含入口自身)gzip 总量超过 FIRST_SCREEN_GZIP_BUDGET 即 fail build。2026-09 审计该集合
+ * 已达 461117 bytes gzip(useAppRoute 拖教程案例数据 / api.ts 拖 admin 域 / 死依赖等),
+ * 修复后实测 436426;阈值取实测值上取整到 10KB(439296)+ 20KB 余量 = 459776,
+ * 允许小幅自然增长,但不许再把教程目录/admin 域量级的大模块静态接进入口。
+ * 纯函数与单测在 src/lib/firstScreenBudget。
+ */
+const FIRST_SCREEN_GZIP_BUDGET = 459776;
+
+function firstScreenBudget(): Plugin {
+  return {
+    name: "first-screen-budget",
+    apply: "build",
+    generateBundle(_opts, bundle) {
+      const chunks = Object.values(bundle).flatMap((item) => {
+        if (item.type !== "chunk") return [];
+        return [
+          {
+            type: item.type,
+            fileName: item.fileName,
+            code: item.code,
+            isEntry: item.isEntry,
+            facadeModuleId: item.facadeModuleId,
+            imports: item.imports,
+          },
+        ];
+      });
+      const report = firstScreenBudgetReport(chunks, FIRST_SCREEN_GZIP_BUDGET, (code) =>
+        gzipSync(Buffer.from(code), { level: 9 }).length,
+      );
+      if (report.overBudget) {
+        throw new Error(`first-screen-budget:\n${describeFirstScreenBudget(report)}`);
+      }
+    },
+  };
+}
+
 export default defineConfig(() => {
   return {
-    plugins: [react(), tailwindcss(), ocBuildMeta(), forbidTaskboardEntryImport()],
+    plugins: [react(), tailwindcss(), ocBuildMeta(), forbidTaskboardEntryImport(), firstScreenBudget()],
     server: {
       host: "127.0.0.1",
       port: 5174,

@@ -268,7 +268,8 @@ export function createUserMediaResolver(deps: {
         `SELECT h.name AS host_name, h.id::text AS host_uuid, c.id::text AS container_id
            FROM agent_containers c
            JOIN compute_hosts h ON c.host_uuid = h.id
-          WHERE c.user_id = $1 AND c.state = 'active' AND c.runtime_channel = $2`,
+          WHERE c.user_id = $1 AND c.state = 'active' AND c.runtime_channel = $2
+            AND c.runtime_kind = 'docker'`,
         // P1d:媒体解析按 channel —— 否则同 user v3+v5 并行 active 会命中 >1 行走 ambiguous fail-closed,
         // 或选错 channel 的 host/volume,破坏 v5 媒体链路。
         [uid, getRuntimeChannel()],

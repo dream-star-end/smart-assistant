@@ -81,6 +81,8 @@ export interface AdminContainerRowView {
    * 看不到 v3 行真状态。
    */
   state: string | null;
+  /** docker | desktop;0254 起。列表展示两行,lifecycle 按钮只认 docker。 */
+  runtime_kind: string | null;
   /**
    * UI 渲染用的统一 lifecycle 字段:
    *   - v2 行(docker_name 非空) → 取 status
@@ -120,6 +122,7 @@ const CONTAINER_COLS = `
   c.image,
   c.status,
   c.state,
+  c.runtime_kind,
   -- v2 行用 status,v3 行用 state,UI 拿一个字段就够。
   -- R2 finding 加固:row_kind 判据加 subscription_id IS NULL 兜底。
   -- 0017 把 docker_name 改 nullable 后,单看 docker_name 空判 v3 不稳:
@@ -236,7 +239,7 @@ export async function listContainers(input: ListContainersInput = {}): Promise<A
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
   const r = await query<AdminContainerRowView>(
     `SELECT ${CONTAINER_COLS}
-     FROM agent_containers c
+     FROM agent_containers c /* runtime_kind: list docker + desktop */
      JOIN users u ON u.id = c.user_id
      LEFT JOIN agent_subscriptions s ON s.id = c.subscription_id
      LEFT JOIN compute_hosts ch ON ch.id = c.host_uuid
@@ -297,7 +300,7 @@ async function lookupContainer(id: bigint | string): Promise<ContainerLookup | n
             docker_name,
             container_internal_id
        FROM agent_containers
-      WHERE id = $1 AND runtime_channel = $2`,
+      WHERE id = $1 AND runtime_channel = $2 AND runtime_kind = 'docker'`,
     // P1d:admin 写操作(restart/stop/remove 都经此 lookup)按 channel —— v5 admin 查不到
     // v3 容器 → ContainerNotFoundError,绝不跨 channel stop/remove(stopAndRemoveV3Container 另有兜底)。
     [String(id), getRuntimeChannel()],

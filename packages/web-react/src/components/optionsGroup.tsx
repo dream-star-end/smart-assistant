@@ -153,13 +153,13 @@ export function OptionsGroupFooter() {
   const showFooter = !!snap && snap.count >= 1 && (snap.live || snap.count >= 2);
   if (!store || !snap || !showFooter || !sendUserText) return null;
   if (snap.sent)
-    return <p className="mt-1.5 text-[11.5px] text-faint">已发送全部选择。</p>;
+    return <p className="mt-1.5 text-caption text-faint">已发送全部选择。</p>;
   const ready = snap.answered >= 1;
   // 生产里 busy===sending===live;流式期忽略 busy,否则长回合发不出选择。
   const blockedByBusy = !!busy && !snap.live;
   return (
     <div className="mt-2 flex items-center justify-between gap-3 rounded-xl border border-border bg-surface px-3.5 py-2.5">
-      <span className="text-[12.5px] text-muted">
+      <span className="text-meta text-muted">
         已作答 <span className="font-medium text-fg">{snap.answered}</span> / {snap.count} 题
         {!ready ? <span className="text-faint"> —— 每题点选后一次性发送</span> : null}
       </span>
@@ -170,7 +170,7 @@ export function OptionsGroupFooter() {
           store.markSent();
           sendUserText(text);
         }}
-        className="rounded-lg bg-accent px-3.5 py-1.5 text-[12.5px] font-medium text-white transition-opacity disabled:opacity-40"
+        className="rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-white transition-opacity disabled:opacity-40"
       >
         发送选择
       </button>

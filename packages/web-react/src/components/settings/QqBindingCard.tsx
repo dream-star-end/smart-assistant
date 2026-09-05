@@ -5,7 +5,7 @@ import { qrDataUrl } from '../../admin/pages/alerts/qr/qr'
 import { type QqBindingStart, type QqBindingStatus, api, apiErrorMessage } from '../../lib/api'
 import type { PrefsView } from '../../lib/modelPreferences'
 import type { AuthSession } from '../../lib/types'
-import { Alert, Button, Spinner, Switch } from '../ui'
+import { Alert, Button, Spinner, Switch, useConfirm } from '../ui'
 
 export function QqBindingCard({
   auth,
@@ -21,6 +21,7 @@ export function QqBindingCard({
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [confirmDialog, confirmDialogEl] = useConfirm()
 
   const refresh = useCallback(async () => {
     const next = await api.getQqBinding(auth)
@@ -67,7 +68,13 @@ export function QqBindingCard({
   }
 
   async function unbind() {
-    if (!window.confirm('解绑后，尚未发出的 QQ 消息会立即取消。确定解绑吗？')) return
+    const ok = await confirmDialog({
+      title: '解绑 QQ？',
+      body: '解绑后，尚未发出的 QQ 消息会立即取消。确定解绑吗？',
+      confirmText: '解绑',
+      danger: true,
+    })
+    if (!ok) return
     setBusy(true)
     setError(null)
     try {
@@ -83,7 +90,7 @@ export function QqBindingCard({
 
   if (!status) {
     return (
-      <div className="flex items-center gap-2 rounded-2xl border border-border bg-surface px-4 py-4 text-[12.5px] text-muted">
+      <div className="flex items-center gap-2 rounded-2xl border border-border bg-surface px-4 py-4 text-meta text-muted">
         <Spinner /> 正在读取 QQ 绑定状态…
       </div>
     )
@@ -91,15 +98,16 @@ export function QqBindingCard({
 
   return (
     <div className="overflow-hidden rounded-2xl border border-border bg-surface">
+      {confirmDialogEl}
       <div className="flex items-start gap-3 px-4 py-4">
         <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-[#12b7f5] text-white">
           <Link2 size={20} />
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-[14px] font-semibold text-fg">QQ 对话与通知</span>
+            <span className="text-title font-semibold text-fg">QQ 对话与通知</span>
             {status.bound && (
-              <span className="rounded-full bg-success-soft px-2 py-0.5 text-[10.5px] font-semibold text-success">
+              <span className="rounded-full bg-success-soft px-2 py-0.5 text-micro font-semibold text-success">
                 已绑定
               </span>
             )}
@@ -117,15 +125,15 @@ export function QqBindingCard({
       )}
 
       {!status.available ? (
-        <div className="border-t border-border px-4 py-3 text-[12px] text-faint">
+        <div className="border-t border-border px-4 py-3 text-meta text-faint">
           QQ Bot 尚未完成平台配置，配置完成后这里会自动开放。
         </div>
       ) : status.bound ? (
         <div className="border-t border-border px-4 py-3">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <div className="text-[13px] text-fg">主动推送到 QQ</div>
-              <div className="mt-0.5 text-[11.5px] text-faint">
+              <div className="text-body text-fg">主动推送到 QQ</div>
+              <div className="mt-0.5 text-caption text-faint">
                 定时任务与提醒优先发送到已绑定 QQ
               </div>
             </div>
@@ -135,7 +143,7 @@ export function QqBindingCard({
             />
           </div>
           <div className="mt-3 flex items-center justify-between gap-3 rounded-xl bg-elevated px-3 py-2.5">
-            <span className="text-[11.5px] text-muted">
+            <span className="text-caption text-muted">
               QQ {status.maskedOpenid ?? '已安全绑定'}
             </span>
             <Button size="sm" variant="secondary" disabled={busy} onClick={() => void unbind()}>
@@ -152,16 +160,16 @@ export function QqBindingCard({
               </div>
             )}
             <div className="flex min-w-0 flex-col justify-center">
-              <div className="text-[12.5px] font-medium text-fg">1. 用 QQ 扫码进入机器人</div>
+              <div className="text-meta font-medium text-fg">1. 用 QQ 扫码进入机器人</div>
               <a
                 href={binding.entry_url}
                 target="_blank"
                 rel="noreferrer"
-                className="mt-2 inline-flex w-fit items-center gap-1 text-[12px] text-accent hover:underline"
+                className="mt-2 inline-flex w-fit items-center gap-1 text-meta text-accent hover:underline"
               >
                 手机端也可直接打开 <ExternalLink size={13} />
               </a>
-              <div className="mt-4 text-[12.5px] font-medium text-fg">2. 向机器人发送</div>
+              <div className="mt-4 text-meta font-medium text-fg">2. 向机器人发送</div>
               <button
                 type="button"
                 onClick={() => {
@@ -169,12 +177,12 @@ export function QqBindingCard({
                   setCopied(true)
                   window.setTimeout(() => setCopied(false), 1_500)
                 }}
-                className="mt-2 flex items-center justify-between rounded-xl border border-border bg-elevated px-3 py-3 font-mono text-[15px] font-semibold tracking-wider text-fg"
+                className="mt-2 flex items-center justify-between rounded-xl border border-border bg-elevated px-3 py-3 font-mono text-title font-semibold tracking-wider text-fg"
               >
                 <span>/bind {binding.bind_code}</span>
                 {copied ? <Check size={15} className="text-success" /> : <Copy size={15} />}
               </button>
-              <p className="mt-2 text-[11.5px] text-faint">
+              <p className="mt-2 text-caption text-faint">
                 绑定码 10 分钟内有效；发送成功后本页会自动变为已绑定。
               </p>
               <Button

@@ -349,7 +349,7 @@ export default function LedgerPage() {
 
       <ChartCard title="流水构成" hint="按 reason · 金额(当前视图)">
         {agg.entries.length === 0 ? (
-          <div className="flex h-full items-center justify-center text-[13px] text-faint">无记录</div>
+          <div className="flex h-full items-center justify-center text-body text-faint">无记录</div>
         ) : (
           <canvas ref={donutRef} />
         )}
@@ -372,7 +372,7 @@ export default function LedgerPage() {
             options={reasonOptions}
             onChange={(v) => setDReason(v as LedgerReason | "")}
           />
-          <label className="flex items-center gap-1.5 text-[12px] text-muted">
+          <label className="flex items-center gap-1.5 text-meta text-muted">
             从
             <Input
               type="datetime-local"
@@ -381,7 +381,7 @@ export default function LedgerPage() {
               className="h-9 w-auto"
             />
           </label>
-          <label className="flex items-center gap-1.5 text-[12px] text-muted">
+          <label className="flex items-center gap-1.5 text-meta text-muted">
             至
             <Input
               type="datetime-local"

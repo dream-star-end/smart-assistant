@@ -32,6 +32,10 @@ import {
   selectCursorCredential,
   type CursorCredentialSelection,
 } from './cursorCredentialSelection.js'
+import { createLogger } from '../logger.js'
+import { _shutdownOriginFrames } from '../subprocessRunner.js'
+
+const log = createLogger({ module: 'cursorRoutingAdapter' })
 
 export type CursorVariant = 'native' | 'sand-ccb' | 'sand-official-cc'
 
@@ -151,10 +155,12 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
       const listener = (...args: unknown[]): void => {
         if (event === 'external_billing') {
           const billing = args[0] as { status?: unknown; terminalCode?: unknown } | undefined
-          if (
-            billing?.status !== 'success'
-            && billing?.terminalCode !== 'USER_CANCELLED'
-          ) this.credentialNeedsRefresh = true
+          // Re-select only when the credential itself was rejected. A plain
+          // engine error (Sand 5xx, aborted stream, SIGKILL on restart, tool
+          // failure) is not evidence against the account; re-selecting on it
+          // used to hop the user's sessions between accounts every time the
+          // wrapper cooldown flipped.
+          if (billing?.status === 'unavailable') this.credentialNeedsRefresh = true
         }
         if (event === 'session_id' && this.variant !== 'native' && typeof args[0] === 'string') {
           this.emit(event, prefixResumeId(args[0], this.variant))
@@ -227,14 +233,40 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
         throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
       }
       this.credentialNeedsRefresh = false
-      if (
-        next.keyName !== this.credentialSelection.keyName
-        || next.slot !== this.credentialSelection.slot
-        || next.poolGeneration !== this.credentialSelection.poolGeneration
-        || next.accountId !== this.credentialSelection.accountId
-        || next.keyFingerprint !== this.credentialSelection.keyFingerprint
-      ) {
+      const sameCredential = next.accountId === this.credentialSelection.accountId
+        && next.keyFingerprint === this.credentialSelection.keyFingerprint
+        && next.credentialKind === this.credentialSelection.credentialKind
+        && next.machineId === this.credentialSelection.machineId
+      if (sameCredential) {
+        // Same account, same secret bytes: only the pool projection moved
+        // (a new immutable generation after an unrelated row update, a slot
+        // renumbering after another account was removed). Pool generations
+        // are never pruned, so the inner adapter can keep reading its bound
+        // generation; adopt the new metadata without tearing down a live
+        // CCB/Sand process mid-turn.
+        if (
+          next.poolGeneration !== this.credentialSelection.poolGeneration
+          || next.slot !== this.credentialSelection.slot
+          || next.keyName !== this.credentialSelection.keyName
+        ) {
+          log.info('cursor credential projection moved: adopting without recycle', {
+            sessionKey: this.opts.sessionKey,
+            accountId: next.accountId,
+            from: { keyName: this.credentialSelection.keyName, poolGeneration: this.credentialSelection.poolGeneration },
+            to: { keyName: next.keyName, poolGeneration: next.poolGeneration },
+          })
+          this.credentialSelection = next
+          this.opts.cursorCredentialSelection = next
+        }
+      } else {
         const nativeId = this.inner.nativeSessionId
+        log.info('cursor credential switch: recycling inner adapter', {
+          sessionKey: this.opts.sessionKey,
+          variant: this.variant,
+          from: { keyName: this.credentialSelection.keyName, accountId: this.credentialSelection.accountId },
+          to: { keyName: next.keyName, accountId: next.accountId },
+          innerRunning: this.inner.isRunning,
+        })
         await this.inner.shutdown()
         await this.inner.waitForOutputDrain()
         this.assertLifecycle(generation)
@@ -340,6 +372,14 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   interrupt(): boolean { return this.activeCancel?.() ?? this.inner.interrupt() }
   async shutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise
+    // Outermost engine-facade shutdown: this is the frame SessionManager /
+    // server call into, so the synchronous stack here names the real trigger.
+    log.info('cursor routing adapter shutdown requested', {
+      sessionKey: this.opts.sessionKey,
+      variant: this.variant,
+      hasActiveRun: this.activeCancel !== null,
+      origin: _shutdownOriginFrames(new Error().stack),
+    })
     this.lifecycleClosed = true
     this.lifecycleGeneration++
     this.activeCancel?.()

@@ -519,6 +519,99 @@ export async function getBlob(
   };
 }
 
+// ─── 全文下载尝试指标(0261;fetchFulltext 链,R5 Phase A) ────────────
+
+export interface FetchAttemptRowInput {
+  userId: bigint | number | string;
+  recordId: string;
+  doi?: string;
+  arxivId?: string;
+  /** 策略名(known_oa/unpaywall_pdf/arxiv/pmc_oa/publisher_oa,proxy pass 带 ":proxy" 后缀)。 */
+  strategy: string;
+  ok: boolean;
+  /** 失败原因枚举(fetchFulltext.FETCH_FAIL_REASONS);成功时省略。 */
+  reason?: string;
+  httpStatus?: number;
+  /** 命中且入库成功后的 docId(仅获胜 attempt 有)。 */
+  docId?: string;
+  bytes?: number;
+  ms: number;
+}
+
+/** 记一条下载尝试(单写者=master;成功/失败都记,供 per-source 成功率报表)。 */
+export async function recordFetchAttempt(input: FetchAttemptRowInput): Promise<void> {
+  await query(
+    `INSERT INTO research_fetch_attempts
+       (user_id, record_id, doi, arxiv_id, strategy, status, reason, http_status, doc_id, bytes, ms)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    [
+      String(input.userId),
+      input.recordId,
+      input.doi ?? null,
+      input.arxivId ?? null,
+      input.strategy,
+      input.ok ? "ok" : "failed",
+      input.ok ? null : (input.reason ?? null),
+      input.httpStatus ?? null,
+      input.docId ?? null,
+      input.bytes == null ? null : Math.trunc(input.bytes),
+      Math.trunc(input.ms),
+    ],
+  );
+}
+
+export interface FetchSourceStat {
+  strategy: string;
+  attempts: number;
+  ok: number;
+  avgMs: number;
+}
+
+/** per-strategy 成功率聚合(近 N 天;Phase E 报表 / admin 观测用)。 */
+export async function fetchSourceStats(sinceDays = 30): Promise<FetchSourceStat[]> {
+  const days = Math.max(1, Math.floor(sinceDays));
+  const res = await query<{
+    strategy: string;
+    attempts: string;
+    ok: string;
+    avg_ms: string | number | null;
+  }>(
+    `SELECT strategy,
+            COUNT(*)::text AS attempts,
+            COUNT(*) FILTER (WHERE status = 'ok')::text AS ok,
+            COALESCE(AVG(ms), 0)::int AS avg_ms
+       FROM research_fetch_attempts
+      WHERE created_at > NOW() - make_interval(days => $1::int)
+      GROUP BY strategy
+      ORDER BY COUNT(*) DESC`,
+    [days],
+  );
+  return res.rows.map((r) => ({
+    strategy: r.strategy,
+    attempts: Number(r.attempts),
+    ok: Number(r.ok),
+    avgMs: Number(r.avg_ms ?? 0),
+  }));
+}
+
+/**
+ * interrupted → queued(幂等续跑入口:同 requestId 重提 fetch-batch 时,把中断的
+ * job 重新入队;handler 从相位 checkpoint 跳过已完成记录)。queued/running/
+ * completed 不动。返回最新 job 行。
+ */
+export async function requeueInterruptedJob(
+  userId: bigint | number | string,
+  requestId: string,
+): Promise<ResearchJobRow | null> {
+  await query(
+    `UPDATE research_jobs
+        SET status = 'queued', error = NULL, locked_at = NULL, updated_at = NOW()
+      WHERE user_id = $1 AND request_id = $2 AND status = 'interrupted'`,
+    [String(userId), requestId],
+  );
+  return getJob(userId, requestId);
+}
+
 // ─── 保留策略 GC(scheduler 每日 tick 调;见 research/scheduler.ts) ────
 
 export interface GcDeps {

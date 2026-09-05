@@ -1,0 +1,22 @@
+[Unit]
+# 蓝绿双槽 egress 的共享监听 socket(每槽一份,SO_REUSEPORT 同组)。
+# 实例名 %i = A|B。两个 .socket 同时 bind 172.31.0.1:18892,内核按连接哈希分流;
+# 一个槽 stop 时 close() 只把自己摘出组,另一槽继续 accept → 发布零停机。
+# 与 legacy 单 unit openclaude-v5-selfhost-egress.service 互斥:legacy 的普通 bind 会让
+# 这里 EADDRINUSE(反之亦然),deploy 脚本负责一次性迁移。
+Description=OpenClaude v5 Selfhost Egress shared listener (slot %i)
+After=network.target openclaude-v5-selfhost-hostnet.service openclaude-v5-selfhost-boot-guard.service
+Wants=openclaude-v5-selfhost-hostnet.service
+Conflicts=openclaude-v5-selfhost-egress.service
+
+[Socket]
+ListenStream=172.31.0.1:18892
+ReusePort=yes
+Backlog=511
+NoDelay=true
+# 只把 fd 交给同名 service 实例;socket 自身不 accept。
+Accept=no
+Service=openclaude-v5-selfhost-egress@%i.service
+
+[Install]
+WantedBy=sockets.target

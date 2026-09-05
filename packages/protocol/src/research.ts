@@ -71,6 +71,10 @@ export const SourceRecord = Type.Object({
   doi: Type.Optional(Type.String()),
   arxivId: Type.Optional(Type.String()),
   openalexId: Type.Optional(Type.String()),
+  /** PubMed PMID(R5 Phase B:resolvePmid 铸造;additive optional,旧数据兼容)。 */
+  pmid: Type.Optional(Type.String()),
+  /** NASA ADS bibcode(R5 Phase B:resolveAds 铸造,19 字符形态)。 */
+  adsBibcode: Type.Optional(Type.String()),
   crossrefType: Type.Optional(Type.String()),
   citationCount: Type.Optional(Type.Integer()),
   oa: Type.Optional(OpenAccess),
@@ -146,6 +150,8 @@ export const DocumentOutline = Type.Object({
   spanCount: Type.Integer(),
   /** 扫描件无文字层且未开 OCR 时,master 回 needs_ocr=true,不静默产空。 */
   needsOcr: Type.Optional(Type.Boolean()),
+  /** 课题 chat_projects.id。可选:旧客户端忽略未知字段不崩。 */
+  projectId: Type.Optional(Type.String()),
 })
 export type DocumentOutline = Static<typeof DocumentOutline>
 
@@ -171,6 +177,25 @@ export const QuoteHandle = Type.Object({
   score: Type.Optional(Type.Number()),
 })
 export type QuoteHandle = Static<typeof QuoteHandle>
+
+/** oc-litrag query 请求。docIds / projectId 均可选(flag 关时 proxy 仍要求 docIds)。 */
+export const LitragQueryRequest = Type.Object({
+  query: Type.String(),
+  docIds: Type.Optional(Type.Array(Type.String())),
+  projectId: Type.Optional(Type.String()),
+  topK: Type.Optional(Type.Integer()),
+})
+export type LitragQueryRequest = Static<typeof LitragQueryRequest>
+
+/** oc-litrag query 响应。truncated/docCount/projectId 仅课题范围路径出现。 */
+export const LitragQueryResult = Type.Object({
+  quotes: Type.Array(QuoteHandle),
+  missing: Type.Array(Type.String()),
+  truncated: Type.Optional(Type.Boolean()),
+  docCount: Type.Optional(Type.Integer()),
+  projectId: Type.Optional(Type.String()),
+})
+export type LitragQueryResult = Static<typeof LitragQueryResult>
 
 // ───────────────────────────────────────────────
 // 4) Claim 与证据 manifest
@@ -367,6 +392,10 @@ export const CitationVerdict = Type.Object({
   bibtex: Type.Optional(Type.String()),
   gbt7714: Type.Optional(Type.String()),
   apa: Type.Optional(Type.String()),
+  /** 未命中/不可用时的结构化原因(如 'ads_token_not_configured');R5 Phase B。 */
+  reason: Type.Optional(Type.String()),
+  /** 原因对应的上游获取指引(如 ADS token 生成路径)。 */
+  hint: Type.Optional(Type.String()),
 })
 export type CitationVerdict = Static<typeof CitationVerdict>
 
@@ -524,6 +553,7 @@ export function formatBibtex(rec: SourceRecord): string {
   if (rec.year) fields.push(`  year = {${rec.year}}`)
   if (rec.doi) fields.push(`  doi = {${rec.doi}}`)
   if (rec.arxivId) fields.push(`  eprint = {${rec.arxivId}}`)
+  if (rec.pmid) fields.push(`  pmid = {${rec.pmid}}`)
   return `@${type}{${asciiCiteKey(rec)},\n${fields.join(',\n')}\n}`
 }
 

@@ -3,6 +3,7 @@
  * 二者都在 MarkdownImpl(懒加载 chunk)内按需用：mermaid 库再经 dynamic import 拆成
  * 独立 chunk(只有真出现 ```mermaid 才下载,不拖累首屏与普通对话)。
  */
+import * as Dialog from "@radix-ui/react-dialog";
 import { Maximize2, X } from "lucide-react";
 import { useChatInteraction } from "./tool/context";
 import { useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
@@ -68,7 +69,7 @@ export function MermaidBlock({ code }: { code: string }) {
   }
   if (!svg) {
     return (
-      <div className="my-3 flex items-center justify-center rounded-lg border border-border bg-surface px-3 py-6 text-[12.5px] text-faint">
+      <div className="my-3 flex items-center justify-center rounded-lg border border-border bg-surface px-3 py-6 text-meta text-faint">
         图表渲染中…
       </div>
     );
@@ -175,7 +176,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
 
   if (!parsed) {
     return (
-      <pre className="overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-[12px] text-fg">{code}</pre>
+      <pre className="overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-meta text-fg">{code}</pre>
     );
   }
 
@@ -224,7 +225,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
   return (
     <>
     <div className="my-1.5 flex flex-col gap-1.5 rounded-xl border border-border bg-surface p-2.5 not-prose">
-      {parsed.question && <p className="px-1 text-[13px] font-medium text-fg">{parsed.question}</p>}
+      {parsed.question && <p className="px-1 text-body font-medium text-fg">{parsed.question}</p>}
       <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
         {parsed.options.map((o, i) => {
           const chosen = parsed.multi || grouped ? picked.has(i) : sentText === o.label;
@@ -244,14 +245,14 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
             >
               <span
                 className={
-                  "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border text-[10px] " +
+                  "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border text-micro " +
                   (chosen ? "border-accent bg-accent text-white" : "border-border text-transparent")
                 }
               >
                 ✓
               </span>
               <span className="min-w-0">
-                <span className="block text-[13px] font-medium text-fg">{o.label}</span>
+                <span className="block text-body font-medium text-fg">{o.label}</span>
                 {o.desc && <span className="mt-0.5 block text-[11.5px] leading-snug text-muted">{o.desc}</span>}
               </span>
             </button>
@@ -263,16 +264,16 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
           type="button"
           disabled={picked.size === 0 || blockedByBusy}
           onClick={confirmMulti}
-          className="self-end rounded-lg bg-accent px-3.5 py-1.5 text-[12.5px] font-medium text-white transition-opacity disabled:opacity-40"
+          className="self-end rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-white transition-opacity disabled:opacity-40"
         >
           确认选择{picked.size > 0 ? `(${picked.size})` : ""}
         </button>
       )}
-      {sent && sentText && <p className="px-1 text-[11.5px] text-faint">已选择:{sentText}</p>}
+      {sent && sentText && <p className="px-1 text-caption text-faint">已选择:{sentText}</p>}
       {grouped && !sent && (groupEntry?.labels.length ?? 0) > 0 && (
-        <p className="px-1 text-[11.5px] text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
+        <p className="px-1 text-caption text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
       )}
-      {!readOnly && !sendUserText && <p className="px-1 text-[11px] text-faint">(此会话中不可交互)</p>}
+      {!readOnly && !sendUserText && <p className="px-1 text-caption text-faint">(此会话中不可交互)</p>}
     </div>
     {parsed.trailing ? (
       <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-fg">{parsed.trailing}</p>
@@ -354,15 +355,8 @@ const RENDER_THROTTLE_MS = 800;
 export function HtmlPreview({ code, live }: { code: string; live?: boolean }) {
   const [show, setShow] = useState(true); // 默认预览(boss:html 应默认渲染,而非看源码)
   const [full, setFull] = useState(false);
-  // 全屏时按 Esc 退出。
-  useEffect(() => {
-    if (!full) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setFull(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [full]);
+  // 全屏层走 Radix Dialog:免费获得焦点陷阱 / role=dialog / Esc 关闭与焦点归还,
+  // 替代原先手写的 window keydown 监听(无障碍审计:自研覆盖层缺焦点管理)。
   // 流式渲染节流:iframe 每次换 srcDoc 都会整帧重载(白屏一闪),逐 token 更新会狂闪。
   // committed=喂给 iframe 的代码,只在它变化时才触发重载。两条 effect 各司其职:
   const [committed, setCommitted] = useState(code);
@@ -388,7 +382,7 @@ export function HtmlPreview({ code, live }: { code: string; live?: boolean }) {
   );
   return (
     <div className="my-3 overflow-hidden rounded-lg border border-border">
-      <div className="flex items-center justify-between border-b border-border bg-hover px-3 py-1.5 text-[12px] text-muted">
+      <div className="flex items-center justify-between border-b border-border bg-hover px-3 py-1.5 text-meta text-muted">
         <span>HTML {show ? (live ? "预览(生成中)" : "预览(沙盒)") : "源码"}</span>
         <div className="flex items-center gap-1">
           {show && (
@@ -416,22 +410,30 @@ export function HtmlPreview({ code, live }: { code: string; live?: boolean }) {
       ) : (
         <pre className="max-h-72 overflow-auto bg-code px-3 py-2 font-mono text-xs text-fg">{code}</pre>
       )}
-      {full && (
-        <div className="fixed inset-0 z-[60] flex flex-col bg-black/80 p-3 animate-in sm:p-6">
-          <div className="mb-2 flex items-center justify-between text-white">
-            <span className="text-sm opacity-80">HTML 预览(沙盒) · 按 Esc 退出</span>
-            <button
-              type="button"
-              onClick={() => setFull(false)}
-              aria-label="关闭全屏"
-              className="flex items-center gap-1 rounded-md bg-white/15 px-3 py-1.5 text-sm outline-none hover:bg-white/25 focus-visible:ring-2 focus-visible:ring-white/50"
-            >
-              <X size={16} /> 关闭
-            </button>
-          </div>
-          {frame("min-h-0 flex-1 w-full rounded-lg bg-white")}
-        </div>
-      )}
+      <Dialog.Root open={full} onOpenChange={setFull}>
+        <Dialog.Portal>
+          {/* 全屏内容自身铺满视口(黑底),无需单独 Overlay;样式保持改造前的全屏黑底。 */}
+          <Dialog.Content
+            aria-describedby={undefined}
+            className="fixed inset-0 z-[60] flex flex-col bg-black/80 p-3 animate-in outline-none sm:p-6"
+          >
+            <Dialog.Title className="sr-only">HTML 全屏预览</Dialog.Title>
+            <div className="mb-2 flex items-center justify-between text-white">
+              <span className="text-sm opacity-80">HTML 预览(沙盒) · 按 Esc 退出</span>
+              <Dialog.Close asChild>
+                <button
+                  type="button"
+                  aria-label="关闭全屏"
+                  className="flex items-center gap-1 rounded-md bg-white/15 px-3 py-1.5 text-sm outline-none hover:bg-white/25 focus-visible:ring-2 focus-visible:ring-white/50"
+                >
+                  <X size={16} /> 关闭
+                </button>
+              </Dialog.Close>
+            </div>
+            {frame("min-h-0 flex-1 w-full rounded-lg bg-white")}
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   );
 }

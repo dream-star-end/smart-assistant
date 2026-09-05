@@ -84,7 +84,7 @@ function HealthBadge({ provider }: { provider: ProviderData }) {
         {degraded ? "降级" : "健康"}
         {modeTag}
       </Badge>
-      {notes.length > 0 && <span className="text-[11px] text-faint">{notes.join(" · ")}</span>}
+      {notes.length > 0 && <span className="text-caption text-faint">{notes.join(" · ")}</span>}
     </span>
   );
 }
@@ -175,10 +175,10 @@ export function ProviderCard({
     <Card className="flex flex-col gap-2.5 p-4">
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <h3 className="truncate text-[13px] font-semibold text-fg">
+          <h3 className="truncate text-body font-semibold text-fg">
             {provider.display_name || provider.id}
           </h3>
-          <span className="font-mono text-[11px] text-faint">{provider.id}</span>
+          <span className="font-mono text-caption text-faint">{provider.id}</span>
         </div>
         {provider.keyConfigured ? (
           <Badge tone="success">已配置</Badge>
@@ -187,7 +187,7 @@ export function ProviderCard({
         )}
       </div>
 
-      <div className="flex items-center gap-1.5 text-[12px] text-muted">
+      <div className="flex items-center gap-1.5 text-meta text-muted">
         <span className="truncate font-mono">{provider.endpoint || "—"}</span>
         <Badge tone={provider.egress === "proxy" ? "success" : "neutral"}>
           {provider.egress || "direct"}
@@ -210,7 +210,7 @@ export function ProviderCard({
             >
               {provider.latest.latency_ms ?? "—"}ms
             </Badge>
-            <TimeAgo value={provider.latest.probed_at} className="text-[11px] text-faint" />
+            <TimeAgo value={provider.latest.probed_at} className="text-caption text-faint" />
           </span>
         ) : (
           <Badge tone="neutral">未探测</Badge>
@@ -247,7 +247,7 @@ export function ProviderCard({
         (provider.samples?.length ? (
           <LatencySparkline provider={provider} />
         ) : (
-          <div className="flex h-10 items-center text-[11px] text-faint">暂无探测样本</div>
+          <div className="flex h-10 items-center text-caption text-faint">暂无探测样本</div>
         ))}
 
       <div className="flex flex-col gap-1">
@@ -281,11 +281,11 @@ export function ProviderCard({
           value={climit}
           onChange={(e) => setClimit(e.target.value)}
           placeholder="空=不限"
-          className="h-8 w-28 text-[13px] tabular-nums"
+          className="h-8 w-28 text-body tabular-nums"
         />
       </div>
 
-      <div className="text-[11.5px] text-faint">{providerUsageLine(provider.usage_d1)}</div>
+      <div className="text-caption text-faint">{providerUsageLine(provider.usage_d1)}</div>
 
       <div className={row}>
         <span className={rowLabel}>订阅到期</span>
@@ -293,7 +293,7 @@ export function ProviderCard({
           type="date"
           value={subDate}
           onChange={(e) => setSubDate(e.target.value)}
-          className="h-8 w-40 text-[13px]"
+          className="h-8 w-40 text-body"
         />
         <Badge
           tone={
@@ -311,7 +311,7 @@ export function ProviderCard({
           onChange={(e) => setNotes(e.target.value)}
           maxLength={500}
           placeholder="账号归属 / 续费渠道等"
-          className="h-8 flex-1 text-[13px]"
+          className="h-8 flex-1 text-body"
         />
       </div>
 

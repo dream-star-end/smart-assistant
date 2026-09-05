@@ -130,6 +130,19 @@ export interface AccountRow {
   cursor_credential_kind: CursorCredentialKind;
   /** 0257 — session rows only: authId from /auth/poll (identity, not a secret). */
   cursor_auth_id: string | null;
+  /**
+   * 0262 — Sand (Grok Bot) pool usage learned hourly by cursorUsageSweeper.
+   * Session rows only; api_key rows have no cursor.com face and stay NULL.
+   * NUMERIC(5,2) → cast ::float8 in SELECT, hence number | null.
+   */
+  cursor_sand_usage_pct: number | null;
+  cursor_sand_period_start: Date | null;
+  cursor_sand_next_reset_at: Date | null;
+  cursor_sand_access_state: string | null;
+  cursor_plan_membership: string | null;
+  cursor_billing_cycle_end: Date | null;
+  cursor_usage_updated_at: Date | null;
+  cursor_usage_error: string | null;
 }
 
 export const CURSOR_CREDENTIAL_KINDS = ["api_key", "session"] as const;
@@ -347,7 +360,15 @@ const META_COLUMNS = `
   COALESCE(cursor_quota_class, 'unknown') AS cursor_quota_class,
   COALESCE(cursor_sand_enabled, FALSE) AS cursor_sand_enabled,
   COALESCE(cursor_credential_kind, 'api_key') AS cursor_credential_kind,
-  cursor_auth_id
+  cursor_auth_id,
+  cursor_sand_usage_pct::float8 AS cursor_sand_usage_pct,
+  cursor_sand_period_start,
+  cursor_sand_next_reset_at,
+  cursor_sand_access_state,
+  cursor_plan_membership,
+  cursor_billing_cycle_end,
+  cursor_usage_updated_at,
+  cursor_usage_error
 `;
 
 interface RawMetaRow extends QueryResultRow {
@@ -382,6 +403,14 @@ interface RawMetaRow extends QueryResultRow {
   cursor_sand_enabled: boolean;
   cursor_credential_kind: string;
   cursor_auth_id: string | null;
+  cursor_sand_usage_pct: number | null;
+  cursor_sand_period_start: Date | null;
+  cursor_sand_next_reset_at: Date | null;
+  cursor_sand_access_state: string | null;
+  cursor_plan_membership: string | null;
+  cursor_billing_cycle_end: Date | null;
+  cursor_usage_updated_at: Date | null;
+  cursor_usage_error: string | null;
 }
 
 interface RawSecretRow extends QueryResultRow {
@@ -453,6 +482,14 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     cursor_sand_enabled: row.cursor_sand_enabled === true,
     cursor_credential_kind: row.cursor_credential_kind === "session" ? "session" : "api_key",
     cursor_auth_id: row.cursor_auth_id ?? null,
+    cursor_sand_usage_pct: row.cursor_sand_usage_pct ?? null,
+    cursor_sand_period_start: row.cursor_sand_period_start ?? null,
+    cursor_sand_next_reset_at: row.cursor_sand_next_reset_at ?? null,
+    cursor_sand_access_state: row.cursor_sand_access_state ?? null,
+    cursor_plan_membership: row.cursor_plan_membership ?? null,
+    cursor_billing_cycle_end: row.cursor_billing_cycle_end ?? null,
+    cursor_usage_updated_at: row.cursor_usage_updated_at ?? null,
+    cursor_usage_error: row.cursor_usage_error ?? null,
   };
 }
 

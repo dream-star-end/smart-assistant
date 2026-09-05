@@ -98,7 +98,11 @@ export function permissionHasExpired(msg: ChatMessage, now = Date.now()): boolea
     return now >= expiresAt;
   }
   if (!Number.isFinite(msg.ts)) return false;
-  const ttlMs = isDetachedAskUserCard(msg) ? DETACHED_ASK_USER_TTL_MS : PENDING_PERMISSION_TTL_MS;
+  // Blocking prompts (detached ask_user, ExitPlanMode) are not subject to the
+  // 30-minute idle TTL on the server either (gateway `BLOCKING_USER_INPUT_TOOLS`).
+  const ttlMs = isDetachedAskUserCard(msg) || isExitPlanModeTool(msg.toolName)
+    ? DETACHED_ASK_USER_TTL_MS
+    : PENDING_PERMISSION_TTL_MS;
   return now - msg.ts > ttlMs;
 }
 
@@ -168,13 +172,13 @@ function PermissionInputSummary({
   return (
     <div className="space-y-2">
       {command && (
-        <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[12px] text-fg">
+        <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-meta text-fg">
           <span className="text-success">$ </span>
           {command.slice(0, 2000)}
         </pre>
       )}
       {rows.length > 0 && (
-        <dl className="flex flex-col gap-1 text-[12.5px]">
+        <dl className="flex flex-col gap-1 text-meta">
           {rows.map((row) => (
             <div key={row.label} className="flex gap-2">
               <dt className="shrink-0 font-medium text-faint">{row.label}</dt>
@@ -185,10 +189,10 @@ function PermissionInputSummary({
       )}
       {json && json !== "{}" && (
         <details open={!hasStructured}>
-          <summary className="cursor-pointer rounded text-[11.5px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">
+          <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">
             查看完整参数
           </summary>
-          <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[12px] text-muted">
+          <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-meta text-muted">
             {json}
           </pre>
         </details>
@@ -285,16 +289,16 @@ export function PermissionCard({
         <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
           {questions ? <HelpCircle size={14} /> : <ShieldCheck size={14} />}
         </span>
-        <span className="text-[13px] font-medium text-fg">
+        <span className="text-body font-medium text-fg">
           {questions ? "用户问答" : isExitPlan ? "退出计划模式" : "权限请求"}
         </span>
         {!questions && (
-          <span className="inline-flex min-w-0 items-center gap-1 rounded bg-hover px-1.5 py-0.5 text-[12px] text-muted">
+          <span className="inline-flex min-w-0 items-center gap-1 rounded bg-hover px-1.5 py-0.5 text-meta text-muted">
             {ToolIcon && <ToolIcon size={12} aria-hidden="true" className="shrink-0" />}
             <span className="truncate">{toolLabel}</span>
           </span>
         )}
-        <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[12px] text-muted">
+        <span className="ml-auto flex shrink-0 items-center gap-1.5 text-meta text-muted">
           <StatusIcon size={13} aria-hidden="true" className={statusIconCls} />
           {statusText}
         </span>
@@ -319,12 +323,12 @@ export function PermissionCard({
         </div>
       )}
       {!resolved && readOnly && (
-        <div className="border-t border-border px-3.5 py-2 text-[11.5px] text-faint">
+        <div className="border-t border-border px-3.5 py-2 text-caption text-faint">
           只读查看 · 需由用户在原会话中处理
         </div>
       )}
       {!resolved && !readOnly && expired && !livePrompt && (
-        <div className="border-t border-border px-3.5 py-2 text-[11.5px] text-faint">
+        <div className="border-t border-border px-3.5 py-2 text-caption text-faint">
           提问已过期，无法再作答
         </div>
       )}
@@ -332,7 +336,7 @@ export function PermissionCard({
       {!resolved && isExitPlan && planMarkdown && (
         <div
           data-testid="exit-plan-preview"
-          className="max-h-28 overflow-hidden border-t border-border px-3.5 py-2 text-[12.5px] text-muted"
+          className="max-h-28 overflow-hidden border-t border-border px-3.5 py-2 text-meta text-muted"
         >
           <Markdown>{planMarkdown}</Markdown>
         </div>
@@ -342,7 +346,7 @@ export function PermissionCard({
       {resolved && questions && behavior === "allow" && (
         <div className="space-y-1.5 border-t border-border px-3.5 py-2.5">
           {questions.map((q, i) => (
-            <div key={i} className="text-[13px]">
+            <div key={i} className="text-body">
               <div className="text-muted">{q.question}</div>
               <div className="text-fg">→ {msg._answers?.[q.question] || "（未回答）"}</div>
             </div>
@@ -367,7 +371,7 @@ export function PermissionCard({
         </div>
       )}
       {resolved && msg._settledReason && msg._settledReason !== "remote" && (
-        <div className="border-t border-border px-3.5 py-1.5 text-[11px] text-faint">
+        <div className="border-t border-border px-3.5 py-1.5 text-caption text-faint">
           {settledReasonLabel(msg._settledReason)}
         </div>
       )}
@@ -551,7 +555,7 @@ function ExitPlanModeModal({
           </p>
         )}
         {planFilePath ? (
-          <p className="truncate font-mono text-[11px] text-faint">{planFilePath}</p>
+          <p className="truncate font-mono text-caption text-faint">{planFilePath}</p>
         ) : null}
       </div>
     </Modal>
@@ -675,8 +679,8 @@ function AskUserQuestionModal({
               key={idx}
               className={cn("space-y-2", error === idx && "rounded-lg ring-2 ring-danger ring-offset-2 ring-offset-elevated")}
             >
-              {q.header && <div className="text-[11px] font-medium uppercase tracking-wide text-faint">{q.header}</div>}
-              <div className="text-[14px] font-medium text-fg">{q.question}</div>
+              {q.header && <div className="text-caption font-medium uppercase tracking-wide text-faint">{q.header}</div>}
+              <div className="text-title font-medium text-fg">{q.question}</div>
               <div
                 className="grid gap-1.5"
                 role={q.multiSelect ? "group" : "radiogroup"}
@@ -706,9 +710,9 @@ function AskUserQuestionModal({
                         {sel && <Check size={11} />}
                       </span>
                       <span className="min-w-0">
-                        <span className="block text-[13.5px] text-fg">{opt.label}</span>
+                        <span className="block text-section text-fg">{opt.label}</span>
                         {opt.description && (
-                          <span className="block text-[12px] text-muted">{opt.description}</span>
+                          <span className="block text-meta text-muted">{opt.description}</span>
                         )}
                       </span>
                     </button>
@@ -736,7 +740,7 @@ function AskUserQuestionModal({
                     >
                       {qs.selected.includes(OTHER) && <Check size={11} />}
                     </span>
-                    <span className="text-[13.5px] text-fg">其他（自行输入）</span>
+                    <span className="text-section text-fg">其他（自行输入）</span>
                   </button>
                 )}
               </div>
@@ -746,16 +750,18 @@ function AskUserQuestionModal({
                   value={qs.other}
                   autoFocus
                   onChange={(e) => setQ(q.question, { other: e.target.value })}
+                  // placeholder 不构成可访问名(探针 label=null),读屏需要显式名字。
+                  aria-label="其他答案"
                   placeholder="输入你的答案…"
-                  className="w-full rounded-lg border border-border bg-bg px-3 py-2 text-[13.5px] text-fg outline-none focus-visible:border-accent"
+                  className="w-full rounded-lg border border-border bg-bg px-3 py-2 text-section text-fg outline-none focus-visible:border-accent"
                 />
               )}
               {hasPreview && preview && (
-                <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 text-[12px] text-muted">
+                <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 text-meta text-muted">
                   {preview}
                 </pre>
               )}
-              {error === idx && <div className="text-[12px] text-danger">请先回答此题</div>}
+              {error === idx && <div className="text-meta text-danger">请先回答此题</div>}
             </section>
           );
         })}

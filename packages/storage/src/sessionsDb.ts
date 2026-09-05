@@ -442,11 +442,17 @@ export async function getSessionsDb(): Promise<Database.Database> {
     if (!projCols.some(c => c.name === 'board_project_id')) {
       db.exec('ALTER TABLE chat_projects ADD COLUMN board_project_id TEXT DEFAULT NULL')
     }
+    if (!projCols.some(c => c.name === 'is_research_default')) {
+      db.exec('ALTER TABLE chat_projects ADD COLUMN is_research_default INTEGER NOT NULL DEFAULT 0')
+    }
   } catch { /* table missing in extremely old fixtures; CREATE above already ran */ }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_projects_user_board
       ON chat_projects(user_id, board_project_id)
       WHERE deleted_at IS NULL AND board_project_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_projects_user_research_default
+      ON chat_projects(user_id)
+      WHERE is_research_default = 1 AND deleted_at IS NULL;
   `)
   // Migration: project_assets —— 聊天项目资产层(用户上传参考资料 + 会话产出物索引)。
   // 软删只删索引行,绝不删磁盘文件:文件是 sha256 内容寻址的,可能被别的消息/资产共用。
@@ -5956,7 +5962,7 @@ async function _sqliteListChatProjects(userId: string): Promise<ChatProject[]> {
 
 async function _sqliteCreateChatProject(
   userId: string,
-  input: { name?: unknown; instructions?: unknown; color?: unknown },
+  input: { name?: unknown; instructions?: unknown; color?: unknown; isResearchDefault?: unknown },
 ): Promise<ChatProjectCreateResult> {
   const name = parseChatProjectName(input.name)
   if (!name) return { ok: false, error: 'invalid_name' }
@@ -5964,6 +5970,7 @@ async function _sqliteCreateChatProject(
   if ('invalid' in instructions) return { ok: false, error: 'invalid_instructions' }
   const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX)
   if ('invalid' in color) return { ok: false, error: 'invalid_color' }
+  const isDefault = input.isResearchDefault === true
 
   const db = await getSessionsDb()
   const now = Date.now()
@@ -5973,22 +5980,36 @@ async function _sqliteCreateChatProject(
       'SELECT COUNT(*) AS n FROM chat_projects WHERE user_id = ? AND deleted_at IS NULL',
     ).get(userId) as { n: number }
     if (countRow.n >= CHAT_PROJECT_PER_USER_LIMIT) return { ok: false, error: 'limit_exceeded' }
-    db.prepare(`
-      INSERT INTO chat_projects
-        (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at)
-      VALUES (?, ?, ?, ?, ?, COALESCE((
-        SELECT MAX(sort_order) + 1 FROM chat_projects WHERE user_id = ? AND deleted_at IS NULL
-      ), 0), ?, ?, NULL)
-    `).run(
-      id,
-      userId,
-      name,
-      instructions.present ? instructions.value : null,
-      color.present ? color.value : null,
-      userId,
-      now,
-      now,
-    )
+    try {
+      db.prepare(`
+        INSERT INTO chat_projects
+          (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at, is_research_default)
+        VALUES (?, ?, ?, ?, ?, COALESCE((
+          SELECT MAX(sort_order) + 1 FROM chat_projects WHERE user_id = ? AND deleted_at IS NULL
+        ), 0), ?, ?, NULL, ?)
+      `).run(
+        id,
+        userId,
+        name,
+        instructions.present ? instructions.value : null,
+        color.present ? color.value : null,
+        userId,
+        now,
+        now,
+        isDefault ? 1 : 0,
+      )
+    } catch (err) {
+      if (isDefault && isUniqueConstraintError(err, 'idx_chat_projects_user_research_default')) {
+        const existing = db.prepare(
+          'SELECT id FROM chat_projects WHERE user_id = ? AND is_research_default = 1 AND deleted_at IS NULL',
+        ).get(userId) as { id: string } | undefined
+        if (existing) {
+          const project = _sqliteReadChatProject(db, userId, existing.id)
+          if (project) return { ok: true, project }
+        }
+      }
+      throw err
+    }
     const project = _sqliteReadChatProject(db, userId, id)
     if (!project) throw new Error('chat project insert vanished')
     return { ok: true, project }

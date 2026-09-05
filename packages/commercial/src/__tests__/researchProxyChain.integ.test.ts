@@ -7,6 +7,7 @@
  *   - identifier 命中 + 未撤稿 → master 铸 verified。
  */
 process.env.OPENCLAUDE_KMS_KEY = process.env.OPENCLAUDE_KMS_KEY ?? Buffer.alloc(32, 7).toString("base64");
+delete process.env.OC_RESEARCH_WORKSPACE;
 
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";

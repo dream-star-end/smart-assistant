@@ -61,19 +61,24 @@ export async function getContainersPoolStats(): Promise<ContainersPoolStats> {
        COUNT(*)                                                                                AS total,
        -- running: v2 status='running' OR v3 state='active'
        COUNT(*) FILTER (
-         WHERE (subscription_id IS NOT NULL AND status = 'running')
+         WHERE runtime_kind = 'docker' AND (
+               (subscription_id IS NOT NULL AND status = 'running')
             OR (subscription_id IS NULL     AND state  = 'active')
+         )
        )                                                                                        AS running,
-       COUNT(*) FILTER (WHERE subscription_id IS NOT NULL AND status = 'provisioning')          AS provisioning,
-       COUNT(*) FILTER (WHERE subscription_id IS NOT NULL AND status = 'stopped')               AS stopped,
-       COUNT(*) FILTER (WHERE subscription_id IS NOT NULL AND status = 'error')                 AS error,
+       COUNT(*) FILTER (WHERE runtime_kind = 'docker' AND subscription_id IS NOT NULL AND status = 'provisioning') AS provisioning,
+       COUNT(*) FILTER (WHERE runtime_kind = 'docker' AND subscription_id IS NOT NULL AND status = 'stopped')      AS stopped,
+       COUNT(*) FILTER (WHERE runtime_kind = 'docker' AND subscription_id IS NOT NULL AND status = 'error')        AS error,
        -- gone: v2 removed + v3 vanished
        COUNT(*) FILTER (
-         WHERE (subscription_id IS NOT NULL AND status = 'removed')
+         WHERE runtime_kind = 'docker' AND (
+               (subscription_id IS NOT NULL AND status = 'removed')
             OR (subscription_id IS NULL     AND state  = 'vanished')
+         )
        )                                                                                        AS gone,
-       COUNT(*) FILTER (WHERE subscription_id IS NOT NULL)                                      AS v2,
-       COUNT(*) FILTER (WHERE subscription_id IS NULL)                                          AS v3,
+       COUNT(*) FILTER (WHERE runtime_kind = 'docker' AND subscription_id IS NOT NULL)           AS v2,
+       COUNT(*) FILTER (WHERE runtime_kind = 'docker' AND subscription_id IS NULL)               AS v3,
+       COUNT(*) FILTER (WHERE runtime_kind = 'desktop' AND state = 'active')                    AS desktop_active,
        COUNT(*) FILTER (WHERE last_error IS NOT NULL AND last_error <> '')                      AS with_last_error
      FROM agent_containers`,
   );
@@ -89,6 +94,7 @@ export async function getContainersPoolStats(): Promise<ContainersPoolStats> {
        FROM agent_containers c
        JOIN agent_subscriptions s ON s.id = c.subscription_id
       WHERE c.subscription_id IS NOT NULL
+        AND c.runtime_kind = 'docker'
         AND c.status <> 'removed'
         AND s.status = 'active'
         AND s.end_at IS NOT NULL

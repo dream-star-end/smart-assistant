@@ -9,7 +9,7 @@ SELF_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # help-fast-path: stdout usage + exit 0; do not start tsx/node/network.
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "help" ]; then
   cat <<'EOF'
-usage: oc-cite <verify <id...>|format <id> --style ...|check --manifest <f>|fix --manifest <f> --docs <ids>>
+usage: oc-cite <verify <id...>|format <id> --style ...|check --manifest <f>|fix --manifest <f> --docs <ids>>  # id 支持 doi:/arxiv:/openalex:/pmid:/ads:<bibcode>
 EOF
   exit 0
 fi

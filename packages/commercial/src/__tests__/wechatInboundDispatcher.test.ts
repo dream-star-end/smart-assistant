@@ -59,6 +59,7 @@ interface RecordedPost {
   headers: Record<string, string>
   bodyJson: string
   bodyParsed: Record<string, unknown>
+  host: string
 }
 
 interface TransportSpy {
@@ -88,7 +89,13 @@ function makeTransport(
     supportsTunnel: opts.supportsTunnel,
     async post(endpoint, path, headers, bodyJson, _timeoutMs) {
       const bodyParsed = JSON.parse(bodyJson) as Record<string, unknown>
-      const req: RecordedPost = { path, headers: { ...headers }, bodyJson, bodyParsed }
+      const req: RecordedPost = {
+        path,
+        headers: { ...headers },
+        bodyJson,
+        bodyParsed,
+        host: endpoint.host,
+      }
       spy.posts.push(req)
       if (cursor >= responses.length) {
         throw new Error(`transport spy ran out of programmed responses at call #${cursor + 1}`)
@@ -232,7 +239,7 @@ function makeStorageSpies(opts: {
 
 function makeResolver(
   endpoint:
-    | { host: string; port: number; containerId?: number; tunnel?: unknown }
+    | { host: string; port: number; containerId?: number; tunnel?: unknown; desktop?: { containerId: number } }
     | { throw: Error },
 ): InboundDispatcherDeps["resolveContainerEndpoint"] {
   return (async (_uid: bigint) => {
@@ -518,6 +525,71 @@ describe("inboundDispatcher — resolver / cold start", () => {
       assert.equal(r.retryable, false)
       assert.equal(r.errMessage, "container_id_missing_from_resolver")
     }
+  })
+
+  test("desktop_offline without fallback → transport_failed, not cold_start", async () => {
+    const d = makeInboundDispatcher(
+      makeDeps({
+        resolveContainerEndpoint: makeResolver({
+          throw: new ContainerUnreadyError(5, "desktop_offline"),
+        }),
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "transport_failed")
+    if (r.kind === "transport_failed") {
+      assert.equal(r.phase, "step1")
+      assert.equal(r.errMessage, "desktop_not_allowed_for_inbound")
+    }
+  })
+
+  test("desktop endpoint + docker fallback → POST docker bound_ip, never desktop-reverse", async () => {
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true}' },
+    ])
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        resolveContainerEndpoint: makeResolver({
+          host: "desktop-reverse",
+          port: 0,
+          containerId: 9,
+          desktop: { containerId: 9 },
+        }),
+        fallbackDockerEnsure: makeResolver({
+          host: "172.31.0.9",
+          port: 18789,
+          containerId: CONTAINER_ID,
+        }),
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    assert.equal(tSpy.posts.length, 1)
+    assert.equal(tSpy.posts[0]!.host, "172.31.0.9")
+    assert.notEqual(tSpy.posts[0]!.host, "desktop-reverse")
+  })
+
+  test("desktop_offline + docker fallback → POST docker bound_ip, not cold_start", async () => {
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true}' },
+    ])
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        resolveContainerEndpoint: makeResolver({
+          throw: new ContainerUnreadyError(5, "desktop_offline"),
+        }),
+        fallbackDockerEnsure: makeResolver({
+          host: "172.31.0.9",
+          port: 18789,
+          containerId: CONTAINER_ID,
+        }),
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    assert.equal(tSpy.posts[0]!.host, "172.31.0.9")
   })
 })
 

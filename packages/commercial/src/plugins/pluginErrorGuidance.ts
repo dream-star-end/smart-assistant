@@ -6,6 +6,7 @@
  * CONNECTION_ERROR fallback; messages never include pin/hash/DNS internals.
  */
 import { WEIBO_WRITE_FAILURE_CODES } from './weiboWriteObservability.js'
+import { ZHIHU_WRITE_FAILURE_CODES } from './zhihuWriteObservability.js'
 
 export type PluginRetrySafe = 'yes' | 'no' | 'after_reauth' | 'check_first'
 export type PluginSideEffect = 'none' | 'possible' | 'likely'
@@ -37,6 +38,7 @@ export const UNKNOWN_WRITE_NEXT_ACTION =
 
 export const PLUGIN_PASSTHROUGH_ERROR_CODES = [
   ...WEIBO_WRITE_FAILURE_CODES,
+  ...ZHIHU_WRITE_FAILURE_CODES,
   'LOGIN_EXPIRED',
   'LOGIN_EXPIRED_ACCOUNT',
   'PRECONDITION_CHANGED',
@@ -67,6 +69,10 @@ const SEND_OR_RESULT = new Set([
   'WEIBO_WRITE_SEND_CLICK',
   'WEIBO_WRITE_SEND_UNCLEARED',
   'WEIBO_WRITE_RESULT',
+  'ZHIHU_WRITE_SEND',
+  'ZHIHU_WRITE_SEND_BUTTON',
+  'ZHIHU_WRITE_SEND_CLICK',
+  'ZHIHU_WRITE_RESULT',
 ])
 
 export function isPluginPassthroughErrorCode(code: string): code is PluginPassthroughErrorCode {
@@ -117,6 +123,15 @@ function unknownWritePrefix(code: string): string {
     case 'WEIBO_WRITE_SEND_UNCLEARED':
     case 'WEIBO_WRITE_RESULT':
       return '可能已点发送。'
+    case 'ZHIHU_ACTION_FAILED':
+      return '写操作结果不明，不要重新授权后直接重发。'
+    case 'ZHIHU_UPSTREAM_CHALLENGE':
+      return '验证码出现前可能已有写副作用。'
+    case 'ZHIHU_WRITE_SEND':
+    case 'ZHIHU_WRITE_SEND_BUTTON':
+    case 'ZHIHU_WRITE_SEND_CLICK':
+    case 'ZHIHU_WRITE_RESULT':
+      return '可能已点发送。'
     default:
       return ''
   }
@@ -128,10 +143,14 @@ function applyUnknownWriteOverride(
 ): PluginErrorGuidance {
   if (code === 'PRECONDITION_CHANGED') return guidance
   const prefix = unknownWritePrefix(code)
+  const next =
+    code.startsWith('ZHIHU_')
+      ? '先 get_self 或 list_my_answers 核对是否已发出，确认未发出才可新开确认卡重发'
+      : UNKNOWN_WRITE_NEXT_ACTION
   return {
     ...guidance,
     retrySafe: 'check_first',
-    nextAction: `${prefix}${UNKNOWN_WRITE_NEXT_ACTION}`,
+    nextAction: `${prefix}${next}`,
   }
 }
 
@@ -317,6 +336,103 @@ const ROWS: Record<string, Row> = {
     message: '微博运行时正在关闭',
     nextAction: '请稍后重试',
   },
+  ZHIHU_ACTION_FAILED: {
+    retrySafe: 'after_reauth',
+    requiresReauth: false,
+    message: '知乎动作失败，页面未能完成操作',
+    nextAction:
+      '可再试一次读操作确认；若仍失败，引导用户重新扫码授权知乎（设置里可能仍显示已授权）',
+  },
+  ZHIHU_UPSTREAM_CHALLENGE: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎触发了验证码或风控，无法自动继续',
+    nextAction: '请用户本人在浏览器完成验证后再试，不要自动重试',
+  },
+  ZHIHU_WRITE_COMPOSER: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎编辑器未能就绪',
+    nextAction: '正文未发出。可稍后重开一条新确认，不要重放同一 confirmId',
+  },
+  ZHIHU_WRITE_COMPOSER_EDITOR: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎编辑器无法定位或填写',
+    nextAction: '正文未发出。可稍后重开一条新确认',
+  },
+  ZHIHU_WRITE_COMPOSER_READBACK: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎正文回读校验失败',
+    nextAction: '正文未发出。请检查文案后重开一条新确认',
+  },
+  ZHIHU_WRITE_SEND: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎发送步骤失败，可能已点过发送',
+    nextAction: '发送未执行。可重开一条新确认',
+  },
+  ZHIHU_WRITE_SEND_BUTTON: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '找不到知乎发送按钮',
+    nextAction: '发送未执行。可重开一条新确认',
+  },
+  ZHIHU_WRITE_SEND_CLICK: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎发送按钮点击未确认成功',
+    nextAction: '发送未执行。可重开一条新确认',
+  },
+  ZHIHU_WRITE_RESULT: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎发送后未能确认结果',
+    nextAction: '请先到知乎核实是否已发出，不要重放',
+  },
+  ZHIHU_WRITE_UNSUPPORTED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '该知乎写动作尚未实现',
+    nextAction: '请改用已实现的回答、评论、投票或关注动作',
+  },
+  ZHIHU_WRITE_MEDIA_CHOOSER: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎图片选择控件不可用',
+    nextAction: '图片控件未就绪。可改纯文字发布，或稍后重开一条新确认',
+  },
+  ZHIHU_WRITE_MEDIA_UPLOAD: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎图片上传失败',
+    nextAction: '配图未完成。可改纯文字发布，不要重放同一条确认卡',
+  },
+  ZHIHU_WRITE_MEDIA_PREVIEW_TIMEOUT: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '知乎图片预览超时',
+    nextAction: '图片预览超时。可改纯文字发布，不要重放同一条确认卡',
+  },
+  ZHIHU_WORKER_BUSY: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '知乎工作槽位正忙',
+    nextAction: '请稍后重试；本次未发送',
+  },
+  ZHIHU_WORKER_DEADLINE: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '知乎工作器执行超时',
+    nextAction: '请先到知乎核实是否已发出',
+  },
+  ZHIHU_WORKER_INCOMPLETE: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '知乎工作器未正常结束',
+    nextAction: '工作器未完成且未发送，可稍后重试',
+  },
   PLUGIN_RUNTIME_UNAVAILABLE: {
     retrySafe: 'yes',
     requiresReauth: false,
@@ -438,6 +554,10 @@ export function resolvePluginErrorGuidance(input: PluginErrorGuidanceInput): Plu
 }
 
 export function weiboRuntimePublicMessage(code: string): string {
+  return resolvePluginErrorGuidance({ code }).message
+}
+
+export function zhihuRuntimePublicMessage(code: string): string {
   return resolvePluginErrorGuidance({ code }).message
 }
 

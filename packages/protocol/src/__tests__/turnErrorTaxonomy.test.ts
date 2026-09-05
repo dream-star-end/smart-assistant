@@ -156,6 +156,31 @@ describe('automatic turn recovery policy', () => {
     }), true)
   })
 
+  it('pauses a runner-loss lineage after two zero-progress attempts, not one', () => {
+    const empty = [
+      { role: 'assistant', text: '子进程被信号 SIGKILL 终止', _errorCode: 'RUNNER_CRASHED' },
+      { usage: { inputTokens: 0, outputTokens: 0 } },
+    ]
+    for (const errorCode of ['RUNNER_CRASHED', 'runner_crashed', 'SERVICE_RESTART']) {
+      // First loss: ordinary respawn is still worth one automatic attempt.
+      assert.equal(shouldPauseSilentAutomaticRecovery({ errorCode, currentAttempt: 0, records: empty }), false)
+      assert.equal(shouldPauseSilentAutomaticRecovery({ errorCode, currentAttempt: 1, records: empty }), false)
+      // Second consecutive loss with nothing produced: stop the loop.
+      assert.equal(shouldPauseSilentAutomaticRecovery({ errorCode, currentAttempt: 2, records: empty }), true)
+      assert.equal(shouldPauseSilentAutomaticRecovery({ errorCode, currentAttempt: 7, records: empty }), true)
+      // Progress keeps the full budget.
+      assert.equal(shouldPauseSilentAutomaticRecovery({
+        errorCode, currentAttempt: 5, records: [{ kind: 'tool_use', id: 'tool-1' }],
+      }), false)
+      // Runner loss never triggers the silent first-event native reset.
+      assert.equal(shouldResetNativeSessionForRecovery({ errorCode, currentAttempt: 0, records: empty }), false)
+    }
+    // Non-silent, non-runner-loss transient codes are untouched.
+    assert.equal(shouldPauseSilentAutomaticRecovery({
+      errorCode: 'upstream_failed', currentAttempt: 9, records: empty,
+    }), false)
+  })
+
   it('keeps the ordinary retry budget once model, tool, or token progress exists', () => {
     for (const records of [
       [{ role: 'thinking', text: 'checked state' }],

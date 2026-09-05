@@ -92,6 +92,120 @@ function defaultMigrationsDir(): string {
 }
 
 /**
+ * 把一段 SQL 按顶层分号切成独立语句。识别行注释、块注释、单双引号、
+ * dollar-quote (`$$` / `$tag$`),不会切开 DO $$ ... END $$ 块内部的分号。
+ *
+ * 给 `-- no-transaction` 迁移用:CREATE/DROP INDEX CONCURRENTLY 必须是独立
+ * simple-query 语句,不能和 preflight DO 块同进 node-pg 一次 query() 的隐式事务。
+ */
+export function splitSqlStatements(sql: string): string[] {
+  const out: string[] = [];
+  let buf = "";
+  let i = 0;
+  let dollar: string | null = null;
+  let quote: "'" | '"' | null = null;
+  let lineComment = false;
+  let blockComment = false;
+  const n = sql.length;
+
+  const flush = (): void => {
+    const stmt = buf.trim();
+    buf = "";
+    if (stmt.length === 0) return;
+    const stripped = stmt
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^[ \t]*--[^\n]*$/gm, "")
+      .trim();
+    if (stripped.length === 0) return;
+    out.push(stmt);
+  };
+
+  while (i < n) {
+    const ch = sql[i]!;
+    const nxt = i + 1 < n ? sql[i + 1]! : "";
+
+    if (lineComment) {
+      buf += ch;
+      if (ch === "\n") lineComment = false;
+      i++;
+      continue;
+    }
+    if (blockComment) {
+      buf += ch;
+      if (ch === "*" && nxt === "/") {
+        buf += nxt;
+        i += 2;
+        blockComment = false;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (quote !== null) {
+      buf += ch;
+      if (quote === "'" && ch === "'" && nxt === "'") {
+        buf += nxt;
+        i += 2;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (dollar !== null) {
+      if (sql.startsWith(dollar, i)) {
+        buf += dollar;
+        i += dollar.length;
+        dollar = null;
+        continue;
+      }
+      buf += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === "-" && nxt === "-") {
+      lineComment = true;
+      buf += ch;
+      i++;
+      continue;
+    }
+    if (ch === "/" && nxt === "*") {
+      blockComment = true;
+      buf += ch;
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      buf += ch;
+      i++;
+      continue;
+    }
+    if (ch === "$") {
+      const rest = sql.slice(i);
+      const tagged = /^\$[A-Za-z_][A-Za-z0-9_]*\$/.exec(rest);
+      const tag = tagged ? tagged[0] : rest.startsWith("$$") ? "$$" : null;
+      if (tag) {
+        dollar = tag;
+        buf += tag;
+        i += tag.length;
+        continue;
+      }
+    }
+    if (ch === ";") {
+      flush();
+      i++;
+      continue;
+    }
+    buf += ch;
+    i++;
+  }
+  flush();
+  return out;
+}
+
+/**
  * 扫描目录,返回按文件名排序的 `{version, file}` 列表。
  * 只接受 `*.sql`,其他文件忽略(README / .bak / 隐藏文件等)。
  */
@@ -305,7 +419,9 @@ async function runMigrationsInner(
     const noTransaction = /^--\s*no-transaction\b/im.test(sql);
     if (noTransaction) {
       // 逐条裸执行(无事务)。CONCURRENTLY 须是独立语句、不能在 tx 内。
-      await client.query(sql);
+      for (const stmt of splitSqlStatements(sql)) {
+        await client.query(stmt);
+      }
       await client.query(
         "INSERT INTO schema_migrations(version) VALUES ($1)",
         [version],

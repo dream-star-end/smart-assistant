@@ -1292,7 +1292,7 @@ oc_hotcfg_activate_saga() {
   [ "$lossless_writer_candidate" = 1 ] && lossless_writer_may_have_served=1
   if ! eval "$restart_cmd"; then
     echo "⚠ [hotcfg] restart_cmd 失败;摘录 egress/master 最近日志" >&2
-    journalctl -u openclaude-v5-selfhost-egress.service -n 40 --no-pager >&2 || true
+    journalctl -u openclaude-v5-selfhost-egress.service -u 'openclaude-v5-selfhost-egress@*' -n 40 --no-pager >&2 || true
     journalctl -u openclaude-v5-selfhost.service -n 20 --no-pager >&2 || true
     tail -n 80 /var/log/openclaude-v5-selfhost-egress.log >&2 || true
     _hotcfg_saga_rollback; return 1; fi

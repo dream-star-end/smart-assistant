@@ -2,7 +2,8 @@ import { Check, Clock3, X } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { Markdown } from '../../../components/Markdown'
 import { Alert, Badge, Button, Textarea } from '../../../components/ui'
-import { api, apiErrorMessage } from '../../../lib/api'
+import { apiErrorMessage } from '../../../lib/api'
+import { adminApi } from '../../../lib/api/admin'
 import type { CommunityTutorialPending } from '../../../lib/types'
 import { deriveTutorialArtifacts, tutorialKindOf } from '../../../lib/tutorialStudio'
 import { PageHeader } from '../../components'
@@ -25,7 +26,7 @@ export default function TutorialReviewPage() {
     setLoading(true)
     setError(null)
     try {
-      const page = await api.adminPendingCommunityTutorials(adminSession, cursor)
+      const page = await adminApi.adminPendingCommunityTutorials(adminSession, cursor)
       setItems((current) => (append ? [...current, ...page.tutorials] : page.tutorials))
       setNextCursor(page.nextCursor)
     } catch (cause) {
@@ -48,7 +49,7 @@ export default function TutorialReviewPage() {
     setBusyId(item.id)
     setError(null)
     try {
-      await api.adminReviewCommunityTutorial(adminSession, item.id, decision, note || undefined)
+      await adminApi.adminReviewCommunityTutorial(adminSession, item.id, decision, note || undefined)
       setItems((current) => current.filter((entry) => entry.id !== item.id))
       setNotes((current) => {
         const next = { ...current }

@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
 
 import { runOcConnectCli, runOcPluginCli } from '../../../gateway/src/ocConnectCli.js'
+import { runOcReviewCli } from '../../../gateway/src/ocReviewCli.js'
 import { planSkillCommand } from '../../../gateway/src/ocSkillCli.js'
 import { planTaskCommand } from '../../../gateway/src/ocTaskCli.js'
 import { runOcWebCli } from '../../../gateway/src/ocWebCli.js'
@@ -147,6 +148,15 @@ function taskProbe(argv: string[], expectedKind: string): Probe {
   return () => assert.equal(planTaskCommand(argv).kind, expectedKind)
 }
 
+function reviewProbe(argv: string[], exitCode: number, expected: RegExp): Probe {
+  return () => {
+    const result = runOcReviewCli(argv)
+    assert.equal(result.exitCode, exitCode, result.stderr)
+    if (exitCode === 0) assert.match(result.stdout, expected)
+    else assert.match(result.stderr, expected)
+  }
+}
+
 const connectDeps = {
   readStdin: async () => '{}',
   transport: async (op: string) => {
@@ -230,9 +240,17 @@ function xlsxCommandProbe(command: string): Probe {
  */
 const OC_SURFACES: Record<string, Record<string, Probe>> = {
   'oc-artifact-qa': {
-    inspect: scriptProbe('oc-artifact-qa.py', ['--help'], {
+    inspect: scriptProbe('oc-artifact-qa.py', ['inspect', '--help'], {
       code: 0,
-      stdout: /Inspect and render PDF\/PPTX\/XLSX artifacts/,
+      stdout: /PDF\/PPTX\/XLSX input file/,
+    }),
+    deliver: scriptProbe('oc-artifact-qa.py', ['deliver', '--help'], {
+      code: 0,
+      stdout: /file to gate/,
+    }),
+    pack: scriptProbe('oc-artifact-qa.py', ['pack', '--help'], {
+      code: 0,
+      stdout: /uncompressed total byte cap/,
     }),
   },
   'oc-browser': {
@@ -266,13 +284,18 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     build: scriptProbe('oc-docx.py', ['build', '--help'], { code: 0, stdout: /YAML/ }),
     render: scriptProbe('oc-docx.py', ['render', '--help'], { code: 0, stdout: /视觉安全 JPEG/ }),
     inspect: scriptProbe('oc-docx.py', ['inspect', '--help'], { code: 0, stdout: /逐页配对/ }),
+    check: scriptProbe('oc-docx.py', ['check', '--help'], { code: 0, stdout: /--expect-formulas/ }),
     scrub: scriptProbe('oc-docx.py', ['scrub', '--help'], { code: 0, stdout: /--keep-author/ }),
+  },
+  'oc-docxcheck': {
+    check: scriptProbe('oc-docxcheck.sh', ['--help'], { code: 0, stdout: /--expect-formulas/ }),
   },
   'oc-figcheck': {
     check: tsFailureProbe('packages/gateway/src/ocFigCheckCli.ts', [], /usage: oc-figcheck/),
   },
   'oc-ingest': {
     parse: tsFailureProbe('packages/gateway/src/ocIngestCli.ts', ['parse'], /parse <file>/),
+    list: tsFailureProbe('packages/gateway/src/ocIngestCli.ts', ['list'], /not in a commercial container/),
   },
   'oc-ocr': {
     run: tsFailureProbe('packages/gateway/src/ocOcrCli.ts', ['run'], /run <file>/),
@@ -325,6 +348,21 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
   'oc-lit': {
     search: tsFailureProbe('packages/gateway/src/ocLitCli.ts', ['search'], /search <query>/),
     snowball: tsFailureProbe('packages/gateway/src/ocLitCli.ts', ['snowball'], /snowball <DOI/),
+    fetch: tsFailureProbe(
+      'packages/gateway/src/ocLitCli.ts',
+      ['fetch'],
+      /fetch <id\|records\.json>/,
+    ),
+    'fetch-batch': tsFailureProbe(
+      'packages/gateway/src/ocLitCli.ts',
+      ['fetch-batch'],
+      /fetch-batch <records\.json> --request-id/,
+    ),
+    'job-status': tsFailureProbe(
+      'packages/gateway/src/ocLitCli.ts',
+      ['job-status'],
+      /job-status <requestId>/,
+    ),
   },
   'oc-litrag': {
     query: tsFailureProbe('packages/gateway/src/ocLitragCli.ts', ['query'], /query .*--docs/),
@@ -487,6 +525,10 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
   'oc-report': {
     render: tsFailureProbe('packages/gateway/src/ocReportCli.ts', [], /usage: oc-report/),
   },
+  'oc-review': {
+    schema: reviewProbe(['schema'], 0, /ReviewFile/),
+    collate: reviewProbe(['collate'], 2, /collate --dir/),
+  },
   'oc-skill': {
     train: skillProbe(['train', 'demo', '--confirm'], 'request'),
     'train-status': skillProbe(['train-status', 'run-1'], 'request'),
@@ -583,6 +625,7 @@ const THIN_WRAPPERS: Record<string, string> = {
   'oc-poster': 'packages/gateway/src/ocPosterCli.ts',
   'oc-rank': 'packages/gateway/src/ocRankCli.ts',
   'oc-report': 'packages/gateway/src/ocReportCli.ts',
+  'oc-review': 'packages/gateway/src/ocReviewCli.ts',
   'oc-skill': 'packages/gateway/src/ocSkillCli.ts',
   'oc-slides': 'packages/gateway/src/ocSlidesCli.ts',
   'oc-task': 'packages/gateway/src/ocTaskCli.ts',
@@ -842,10 +885,8 @@ function productionSurfaces(): Record<string, Set<string>> {
   assert.equal(memory.delete('memory'), true, 'oc-memory: retired memory branch not discovered')
   memory.add('memory.retired')
   return {
-    'oc-artifact-qa': singlePurpose(
+    'oc-artifact-qa': pythonArgparseCommands(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-artifact-qa.py',
-      'inspect',
-      /add_parser\("inspect"/,
     ),
     'oc-browser': singlePurpose(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-browser.sh',
@@ -872,6 +913,11 @@ function productionSurfaces(): Record<string, Set<string>> {
     'oc-docx': pythonArgparseCommands(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docx.py',
     ),
+    'oc-docxcheck': singlePurpose(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docxcheck.sh',
+      'check',
+      /oc-docx\.py" check/,
+    ),
     'oc-figcheck': singlePurpose(
       'packages/gateway/src/ocFigCheckCli.ts',
       'check',
@@ -894,6 +940,7 @@ function productionSurfaces(): Record<string, Set<string>> {
     'oc-poster': singlePurpose('packages/gateway/src/ocPosterCli.ts', 'render', /usage: oc-poster/),
     'oc-rank': tsDispatchCommands('packages/gateway/src/ocRankCli.ts', 'cmd'),
     'oc-report': singlePurpose('packages/gateway/src/ocReportCli.ts', 'render', /usage: oc-report/),
+    'oc-review': tsDispatchCommands('packages/gateway/src/ocReviewCli.ts', 'cmd'),
     'oc-skill': tsDispatchCommands('packages/gateway/src/ocSkillCli.ts', 'cmd'),
     'oc-slides': singlePurpose('packages/gateway/src/ocSlidesCli.ts', 'render', /usage: oc-slides/),
     'oc-task': tsDispatchCommands('packages/gateway/src/ocTaskCli.ts', 'cmd'),

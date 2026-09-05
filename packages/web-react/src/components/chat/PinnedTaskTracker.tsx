@@ -95,7 +95,7 @@ function TodoRow({ t, compact }: { t: TodoItem; compact?: boolean }) {
   const active = t.status === "in_progress";
   const text = active && t.activeForm ? t.activeForm : t.content;
   return (
-    <div className={cn("flex items-start gap-2", compact ? "text-[13px]" : "text-[13px]")}>
+    <div className={cn("flex items-start gap-2", compact ? "text-body" : "text-body")}>
       <span className="mt-px shrink-0">
         {done ? (
           <Check className="size-3.5 text-success" />
@@ -201,7 +201,7 @@ export function PinnedTaskTracker({
             任务 {doneCount}/{total}
           </span>
           {!expanded && activeTodo && (
-            <span className="min-w-0 flex-1 truncate text-[13px] text-fg">
+            <span className="min-w-0 flex-1 truncate text-body text-fg">
               <span className="inline-flex items-center gap-1.5">
                 {activeTodo.status === "in_progress" ? (
                   <LoaderCircle className="size-3 shrink-0 animate-spin text-accent" />

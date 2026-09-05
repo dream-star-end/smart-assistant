@@ -214,4 +214,21 @@ describe('chat_projects CRUD', () => {
     if (!overflow.ok) assert.equal(overflow.error, 'limit_exceeded')
     assert.equal((await createChatProject(OTHER, { name: '别人不受影响' })).ok, true)
   })
+
+  it('is_research_default 自愈列 + unique:第二次创建回读已有默认课题', async () => {
+    const db = await getSessionsDb()
+    const cols = db.pragma('table_info(chat_projects)') as Array<{ name: string }>
+    assert.ok(cols.some((c) => c.name === 'is_research_default'))
+    const a = await createChatProject(USER, { name: '默认课题', isResearchDefault: true })
+    assert.equal(a.ok, true)
+    if (!a.ok) return
+    const b = await createChatProject(USER, { name: '另一个默认', isResearchDefault: true })
+    assert.equal(b.ok, true)
+    if (!b.ok) return
+    assert.equal(b.project.id, a.project.id)
+    const n = db.prepare(
+      'SELECT COUNT(*) AS n FROM chat_projects WHERE user_id = ? AND is_research_default = 1 AND deleted_at IS NULL',
+    ).get(USER) as { n: number }
+    assert.equal(n.n, 1)
+  })
 })

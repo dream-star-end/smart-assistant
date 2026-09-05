@@ -77,11 +77,13 @@ cat > qa-expect.json <<'JSON'
 {"kind":"pdf","requiredText":["文档标题","必须出现的关键文字"],"minPages":1}
 JSON
 oc-artifact-qa inspect --input out.pdf --out-dir out.pdf.qa --expect qa-expect.json
+oc-artifact-qa deliver --input out.pdf
 ```
 
 查看 `out.pdf.qa/contact-sheets/` 或逐页 PNG,确认没有裁切、重叠、空白页、乱码和字体替换;
 发现问题就修源文件并重新生成到新的 QA 目录。`report.json` 的 `passed` 必须为 true,不能把
-“命令运行成功”或最终回复里的自述当验证。最终回复给**绝对路径**,并简述 QA 结果。
+“命令运行成功”或最终回复里的自述当验证。L0 `deliver` 的末行必须是 `PASS`，否则禁止打印路径。
+最终回复**只打印 FINAL 绝对路径、单独成行**；禁止 fenced code；禁止发明 URL。
 
 ## 工具调用纪律(重要)
 

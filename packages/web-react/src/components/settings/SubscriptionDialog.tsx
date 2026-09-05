@@ -262,7 +262,7 @@ export function SubscriptionDialog({
     <Modal open={open} onOpenChange={(o) => !o && onClose()} title={title} className="max-w-lg">
       <div>
         {err && (
-          <Alert tone="warning" className="mb-3 text-[12.5px]">
+          <Alert tone="warning" className="mb-3 text-meta">
             {err}
           </Alert>
         )}
@@ -270,7 +270,7 @@ export function SubscriptionDialog({
         {stage.kind === "plans" && (
           <div className="flex flex-col gap-3">
             {loading && (
-              <div className="flex items-center justify-center gap-2 py-8 text-[13px] text-faint">
+              <div className="flex items-center justify-center gap-2 py-8 text-body text-faint">
                 <Spinner /> 加载套餐…
               </div>
             )}
@@ -278,16 +278,16 @@ export function SubscriptionDialog({
             {!loading && sub && (
               <div className="rounded-xl border border-border bg-bg px-4 py-3">
                 <div className="flex items-center justify-between">
-                  <span className="text-[13px] text-muted">当前套餐</span>
-                  <span className="text-[14px] font-semibold text-fg">{sub.planName}</span>
+                  <span className="text-body text-muted">当前套餐</span>
+                  <span className="text-title font-semibold text-fg">{sub.planName}</span>
                 </div>
-                <div className="mt-1.5 flex items-center justify-between text-[12px] text-faint">
+                <div className="mt-1.5 flex items-center justify-between text-meta text-faint">
                   <span>本期到期 {fmtDate(sub.periodEnd)}</span>
                   <span>
                     期内 {formatCredits(sub.periodCredits)} · 钱包 {formatCredits(sub.balance.wallet)}
                   </span>
                 </div>
-                <div className="mt-1 text-[12px] text-accent">
+                <div className="mt-1 text-meta text-accent">
                   总可用 {formatCredits(sub.balance.total)} 积分
                 </div>
               </div>
@@ -322,14 +322,14 @@ export function SubscriptionDialog({
                   >
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
-                        <span className="text-[14px] font-semibold text-fg">{p.name}</span>
+                        <span className="text-title font-semibold text-fg">{p.name}</span>
                         {isCurrent && (
-                          <span className="rounded-full bg-accent px-1.5 py-0.5 text-[10px] font-medium text-white">
+                          <span className="rounded-full bg-accent px-1.5 py-0.5 text-micro font-medium text-white">
                             当前
                           </span>
                         )}
                       </div>
-                      <div className="mt-0.5 text-[12px] text-faint">
+                      <div className="mt-0.5 text-meta text-faint">
                         {isFree ? "免费" : `${formatCentsYuan(p.priceCents)}/月`} · 每月{" "}
                         {formatCredits(p.monthlyCredits)} 积分
                       </div>
@@ -350,7 +350,7 @@ export function SubscriptionDialog({
                         {action}
                       </Button>
                     ) : (
-                      <span className="shrink-0 text-[12px] text-faint">{isCurrent ? "" : "—"}</span>
+                      <span className="shrink-0 text-meta text-faint">{isCurrent ? "" : "—"}</span>
                     )}
                   </div>
                 );
@@ -368,8 +368,8 @@ export function SubscriptionDialog({
                 )}
               >
                 <div className="min-w-0">
-                  <div className="text-[14px] font-semibold text-fg">积分加量包</div>
-                  <div className="mt-0.5 text-[12px] text-faint">¥50 加 5,000 积分 · 仅当前套餐有效期内可用</div>
+                  <div className="text-title font-semibold text-fg">积分加量包</div>
+                  <div className="mt-0.5 text-meta text-faint">¥50 加 5,000 积分 · 仅当前套餐有效期内可用</div>
                 </div>
                 <Button
                   variant="secondary"
@@ -394,7 +394,7 @@ export function SubscriptionDialog({
 
         {stage.kind === "qr" && (
           <div className="flex flex-col items-center gap-3">
-            <div className="text-center text-[12.5px] text-faint">{stage.note}</div>
+            <div className="text-center text-meta text-faint">{stage.note}</div>
             <HupijiaoPaymentEntry
               qrcodeUrl={stage.order.qrcodeUrl}
               mobileUrl={stage.order.mobileUrl}
@@ -415,8 +415,8 @@ export function SubscriptionDialog({
             <span className="flex size-12 items-center justify-center rounded-full bg-success-soft text-success">
               <Check size={26} />
             </span>
-            <div className="text-[15px] font-semibold text-fg">{stage.note} 成功</div>
-            <p className="text-[12.5px] text-faint">套餐与积分已更新，感谢你的支持。</p>
+            <div className="text-title font-semibold text-fg">{stage.note} 成功</div>
+            <p className="text-meta text-faint">套餐与积分已更新，感谢你的支持。</p>
             <Button variant="primary" size="sm" onClick={onClose} className="mt-1">
               完成
             </Button>

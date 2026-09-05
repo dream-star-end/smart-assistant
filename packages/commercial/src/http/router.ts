@@ -303,6 +303,14 @@ import {
   SELFHEAL_REPAIRS_PREFIX,
   dispatchSelfhealRepairsRoute,
 } from './internal/selfhealRepairs.js'
+import {
+  handleDesktopEnrollConfirm,
+  handleDesktopEnrollFinish,
+  handleDesktopEnrollStart,
+  handleDesktopRevoke,
+  handleDesktopTokenMint,
+  handleDesktopTokenRefresh,
+} from './desktopEnroll.js'
 import { handleGithubCallback, handleGithubStart } from './oauthGithub.js'
 import { handleLinuxdoCallback, handleLinuxdoStart } from './oauthLinuxdo.js'
 import { dispatchOrgRoute } from './org/routes.js'
@@ -675,6 +683,12 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/auth/github/callback', handler: handleGithubCallback },
     // v3 file proxy: 用 Bearer access token 换一个 HttpOnly `oc_session` cookie,
     // 让 `<a href>` / `<img>` 等原生下载链接能携带身份(见 handlers.ts 详注)
+    { method: 'POST', path: '/api/desktop/enroll/start', handler: handleDesktopEnrollStart },
+    { method: 'POST', path: '/api/desktop/enroll/confirm', handler: handleDesktopEnrollConfirm },
+    { method: 'POST', path: '/api/desktop/enroll/finish', handler: handleDesktopEnrollFinish },
+    { method: 'POST', path: '/api/desktop/token', handler: handleDesktopTokenMint },
+    { method: 'POST', path: '/api/desktop/token/refresh', handler: handleDesktopTokenRefresh },
+    { method: 'POST', path: '/api/desktop/revoke', handler: handleDesktopRevoke },
     { method: 'POST', path: '/api/auth/session', handler: handleCreateSession },
     { method: 'POST', path: '/api/auth/session/logout', handler: handleClearSession },
     // v3 signed media URL —— iOS Safari + CF SameSite=Strict cookie drop 修复
@@ -716,6 +730,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/me/api-keys', handler: handleCreateMyApiKey },
     { method: 'DELETE', pathPrefix: '/api/me/api-keys/', handler: handleRevokeMyApiKey },
     // 用户文献库(research_documents 管理面):列表 / 上传入库(raw bytes) / 删单篇。
+    // GET 接受 ?projectId=(OC_RESEARCH_WORKSPACE 开时过滤;关时忽略)。
     // 详见 handlers.ts 对应 handler 注释;数据逻辑在 research/library.ts。
     { method: 'GET', path: '/api/me/research/library', handler: handleListResearchLibrary },
     { method: 'POST', path: '/api/me/research/library', handler: handleUploadResearchLibraryDoc },
@@ -1546,6 +1561,7 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     //   - 末尾 isOurs 兜底命中,无 route 命中时返 404 而非 fall through 给 gateway。
     // 实际 dispatch 由 pre-route adapter 处理(见下方 `CC 外接 endpoint` 块)。
     '/api/anthropic/',
+    '/api/desktop',
     // 切片②ⓐ:codex 修复回调命名空间(经 SSH 隧道 loopback 到达)。必须列此使 isOurs()=true,
     // 否则 commercialHandler 返回 false → fall through gateway 404。鉴权在 handler 内自理。
     SELFHEAL_REPAIRS_PREFIX,

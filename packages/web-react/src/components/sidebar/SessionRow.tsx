@@ -124,7 +124,7 @@ export function SessionRow({
         <span
           title={durationTitle}
           data-session-duration
-          className="shrink-0 tabular-nums text-[11px] text-faint"
+          className="shrink-0 tabular-nums text-caption text-faint"
         >
           {durationText}
         </span>

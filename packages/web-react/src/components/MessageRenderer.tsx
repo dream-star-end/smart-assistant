@@ -44,6 +44,13 @@ import {
   paintWindowEnabled,
   selectPaintRange,
 } from "../lib/chat/timelinePaint";
+import {
+  BLANK_SAMPLE_INTERVAL_MS,
+  collectProbeInput,
+  createBlankDetector,
+  persistSnapshot,
+  readPersistedSnapshot,
+} from "../lib/chat/timelineBlankProbe";
 import { prefetchMarkdownImpl } from "./Markdown";
 import {
   AssistantCard,
@@ -373,7 +380,7 @@ function ExactTapeRecordDisclosure({
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        className="text-[11px] text-faint hover:text-muted"
+        className="text-caption text-faint hover:text-muted"
       >
         {open ? `收起原始${label}记录` : `查看原始${label}记录`}
       </button>
@@ -386,7 +393,7 @@ function ExactTapeRecordDisclosure({
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted hover:text-fg"
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
             >
               继续显示原始记录
             </button>
@@ -417,11 +424,11 @@ function RuntimeEventCard({ message }: { message: ChatMessage }) {
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-[12.5px] hover:bg-hover"
+        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-meta hover:bg-hover"
       >
         <span className="size-1.5 shrink-0 rounded-full bg-faint" />
         <span className="min-w-0 flex-1 truncate text-muted">{label}</span>
-        {message._runtimeSource && <span className="shrink-0 text-[11px] text-faint">{message._runtimeSource}</span>}
+        {message._runtimeSource && <span className="shrink-0 text-caption text-faint">{message._runtimeSource}</span>}
         <span className="text-faint">{open ? "收起" : "查看原始记录"}</span>
       </button>
       {open && (
@@ -433,7 +440,7 @@ function RuntimeEventCard({ message }: { message: ChatMessage }) {
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted hover:text-fg"
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
             >
               继续显示原始记录
             </button>
@@ -1085,6 +1092,9 @@ export function MessageList({
   const lastViewportAnchorRef = useRef<VisibleVirtualRowAnchor | null>(null);
   const lastPaintSpanRef = useRef({ start: -1, end: -1 });
   const pinStartRef = useRef<number | undefined>(undefined);
+  // INC-20260905-TIMELINE-BLANK probe state (passive; never writes scrollTop).
+  const blankDetectorRef = useRef(createBlankDetector());
+  const blankProbeStateRef = useRef({ paintStart: 0, paintEnd: 0, sending: false, messagesLength: 0 });
   const beginViewportPreserve = () => {
     viewportPreserveLockRef.current = true;
     const follow = followBottomRefBox.current;
@@ -1291,6 +1301,68 @@ export function MessageList({
     if (!scrollParent) return;
     void prefetchMarkdownImpl();
   }, [sessionId, scrollParent]);
+
+  // INC-20260905-TIMELINE-BLANK: sample viewport geometry ~1/s while mounted
+  // (plus on scroll). A confirmed blank persists a snapshot to localStorage,
+  // exposes `window.__ocTimelineDump()` for manual pull and emits one bounded
+  // friction signal. Purely observational so it can ship before the root cause.
+  useEffect(() => {
+    const scroller = scrollParent;
+    if (!scroller || typeof window === "undefined") return;
+    blankDetectorRef.current = createBlankDetector();
+    let lastSampleAt = 0;
+    let disposed = false;
+    const collect = () => collectProbeInput({
+      scroller,
+      root: listRootRef.current,
+      paintStart: blankProbeStateRef.current.paintStart,
+      paintEnd: blankProbeStateRef.current.paintEnd,
+      sending: blankProbeStateRef.current.sending,
+      followBottom: followBottomRefBox.current ? followBottomRefBox.current.current === true : null,
+      messagesLength: blankProbeStateRef.current.messagesLength,
+    });
+    const sample = (force = false) => {
+      if (disposed) return;
+      const now = Date.now();
+      if (!force && now - lastSampleAt < BLANK_SAMPLE_INTERVAL_MS) return;
+      lastSampleAt = now;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      let report;
+      try {
+        report = blankDetectorRef.current.sample(collect(), now);
+      } catch {
+        return;
+      }
+      if (!report) return;
+      persistSnapshot(sessionId, report);
+      cb.onTimelineBlank?.({ sessionId, report });
+    };
+    const timer = window.setInterval(() => sample(false), BLANK_SAMPLE_INTERVAL_MS);
+    const onScroll = () => sample(false);
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    const w = window as typeof window & {
+      __ocTimelineDump?: () => unknown;
+      __ocTimelineBlankLast?: () => unknown;
+    };
+    w.__ocTimelineDump = () => {
+      const input = collect();
+      return {
+        sessionId,
+        now: Date.now(),
+        input,
+        classification: blankDetectorRef.current.sample(input, Date.now())?.classification ?? "sampled",
+        lastConfirmed: blankDetectorRef.current.lastSnapshot(),
+        persisted: readPersistedSnapshot(),
+      };
+    };
+    w.__ocTimelineBlankLast = () => readPersistedSnapshot();
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      scroller.removeEventListener("scroll", onScroll);
+      if (w.__ocTimelineDump) delete w.__ocTimelineDump;
+    };
+  }, [scrollParent, sessionId, cb]);
 
   useEffect(() => {
     const root = listRootRef.current;
@@ -1588,6 +1660,7 @@ export function MessageList({
     paintEnd = chosen.end;
   }
   const paintedItems = visibleItems.slice(paintStart, paintEnd);
+  blankProbeStateRef.current = { paintStart, paintEnd, sending, messagesLength: messages.length };
   const topSpacerPx = paintStart > 0
     ? measuredRangePx(0, paintStart, (index) => itemKey(visibleItems[index]), rowHeightCacheRef.current)
     : 0;
@@ -1676,7 +1749,7 @@ export function MessageList({
       return (
         <MessageBoundary messageId={rowId} sig={`corrupt-row|${rowId}`}>
           <div
-            className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-[12.5px] text-muted"
+            className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-meta text-muted"
             data-testid="corrupt-message-placeholder"
           >
             此条消息数据结构异常，已跳过渲染
@@ -1806,6 +1879,12 @@ export function MessageList({
         const liveRow =
           (typeof pinPaintStart === "number" && visibleIndex >= pinPaintStart) ||
           visibleIndex >= visibleItems.length - PAINT_MIN_ITEMS;
+        // A row freshly (re)mounted by the paint window has no last-remembered
+        // size, so `content-visibility:auto` lays it out at the 200px estimate
+        // until it scrolls into relevancy, then grows to its real height. That
+        // growth above the viewport is what forces a correction write on every
+        // row while scrolling up. Seed the estimate with the measured height.
+        const cachedHeight = liveRow ? undefined : rowHeightCacheRef.current.get(key);
         return (
           <TimelineEagerMediaContext.Provider key={key} value={eagerMedia}>
             <div
@@ -1815,6 +1894,7 @@ export function MessageList({
                   : "chat-virtual-item chat-timeline-row"
               }
               data-chat-virtual-key={key}
+              style={cachedHeight ? { containIntrinsicSize: `auto ${cachedHeight}px` } : undefined}
             >
               {renderItem(item)}
             </div>

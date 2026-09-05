@@ -76,7 +76,7 @@ function StatusLine({ text, error }: { text: string; error?: boolean }) {
 
 function PromptBlock({ children }: { children: ReactNode }) {
   return (
-    <div className="mt-1.5 whitespace-pre-wrap break-words rounded-md bg-hover px-3 py-2 text-[13px] text-fg">
+    <div className="mt-1.5 whitespace-pre-wrap break-words rounded-md bg-hover px-3 py-2 text-body text-fg">
       {children}
     </div>
   );
@@ -631,7 +631,7 @@ function TodoWriteBody({ input, tool }: BodyProps) {
         const mark = status === "completed" ? "✓" : status === "in_progress" ? "◐" : "○";
         const text = status === "in_progress" && t.activeForm ? asStr(t.activeForm) : asStr(t.content);
         return (
-          <div key={i} className="flex items-start gap-2 text-[13px]">
+          <div key={i} className="flex items-start gap-2 text-body">
             <span
               className={cn(
                 "mt-px shrink-0",
@@ -690,7 +690,7 @@ function BrowserBody({ op, input, tool }: BodyProps & { op: string }) {
         href={url}
         target="_blank"
         rel="noopener noreferrer"
-        className="block break-all rounded-lg bg-info-soft px-3 py-2.5 text-[12.5px] font-medium text-info outline-none transition-colors hover:bg-info-soft/80 focus-visible:ring-2 focus-visible:ring-ring"
+        className="block break-all rounded-lg bg-info-soft px-3 py-2.5 text-meta font-medium text-info outline-none transition-colors hover:bg-info-soft/80 focus-visible:ring-2 focus-visible:ring-ring"
       >
         {url}
       </a>
@@ -717,8 +717,8 @@ function BrowserBody({ op, input, tool }: BodyProps & { op: string }) {
       <dl className="grid gap-2 sm:grid-cols-2">
         {useful.map((row) => (
           <div key={row.label} className="min-w-0 rounded-lg bg-hover/70 px-3 py-2">
-            <dt className="text-[11px] font-medium text-faint">{row.label}</dt>
-            <dd className="mt-0.5 break-words text-[12.5px] text-fg">{row.value}</dd>
+            <dt className="text-caption font-medium text-faint">{row.label}</dt>
+            <dd className="mt-0.5 break-words text-meta text-fg">{row.value}</dd>
           </div>
         ))}
       </dl>
@@ -922,7 +922,7 @@ function SkillWriteCard({ op, input, tool }: BodyProps & { op: string }) {
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="truncate font-mono text-[13px] font-semibold text-fg">{name || "(未命名)"}</span>
+            <span className="truncate font-mono text-body font-semibold text-fg">{name || "(未命名)"}</span>
             <Badge tone="accent">{op === "skill_propose" ? "训练草稿" : "技能"}</Badge>
             {done && <Badge tone="success">{op === "skill_propose" ? "已暂存" : "已保存"}</Badge>}
           </div>
@@ -936,12 +936,12 @@ function SkillWriteCard({ op, input, tool }: BodyProps & { op: string }) {
               ))}
             </div>
           )}
-          {rationale && <p className="mt-1 text-[11.5px] text-faint">理由:{rationale}</p>}
+          {rationale && <p className="mt-1 text-caption text-faint">理由:{rationale}</p>}
         </div>
       </div>
       {body && (
         <details>
-          <summary className="cursor-pointer rounded text-[11.5px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看技能正文</summary>
+          <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看技能正文</summary>
           <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
             {body}
           </pre>
@@ -1099,7 +1099,7 @@ function ScanSciResults({
           .map(String);
         return (
           <div key={i} className="rounded-md border border-border bg-surface px-3 py-2">
-            <div className="break-words text-[13px] font-medium text-fg">
+            <div className="break-words text-body font-medium text-fg">
               {asStr(r.title) || asStr(r.display_name) || asStr(r.identifier) || asStr(r.doi) || "无标题论文"}
             </div>
             {parts.length > 0 && <div className="mt-0.5 text-xs text-faint">{parts.join(" · ")}</div>}

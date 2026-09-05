@@ -92,6 +92,12 @@ export function parseContainerToken(raw: string | undefined): {
   // Authorization header 形如 `Bearer <token>`,允许调用方传 raw token
   // 也允许带 Bearer 前缀
   const trimmed = raw.startsWith("Bearer ") ? raw.slice(7).trim() : raw.trim();
+  if (trimmed.startsWith("oc-dv.")) {
+    throw new ContainerIdentityError(
+      "BAD_TOKEN_FORMAT",
+      "device credential oc-dv.* is not a container token",
+    );
+  }
   // ^oc-v3\.(\d+)\.([0-9a-f]{64})$
   const m = /^oc-v3\.(\d+)\.([0-9a-f]{64})$/.exec(trimmed);
   if (!m) {

@@ -8,7 +8,8 @@ SELF_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # help-fast-path: stdout usage + exit 0; do not start tsx/node/network.
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "help" ]; then
   cat <<'EOF'
-usage: oc-ingest parse <file>
+usage: oc-ingest parse <file> [--project <id>]
+       oc-ingest list [--project <id>]
 EOF
   exit 0
 fi

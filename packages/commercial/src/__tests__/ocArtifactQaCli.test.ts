@@ -91,6 +91,43 @@ function pngSize(path: string): { width: number; height: number } {
   return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) }
 }
 
+function writeMinDocx(path: string, extras: Record<string, string> = {}): void {
+  execFileSync('/usr/bin/python3', [
+    '-c',
+    [
+      'import sys, zipfile',
+      'path, pad = sys.argv[1], int(sys.argv[2])',
+      'doc = ("<?xml version=\\"1.0\\" encoding=\\"UTF-8\\"?>"',
+      '    "<w:document xmlns:w=\\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\\">"',
+      '    "<w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p>" + (" " * pad) + "</w:body></w:document>")',
+      'types = ("<?xml version=\\"1.0\\"?><Types xmlns=\\"http://schemas.openxmlformats.org/package/2006/content-types\\">"',
+      '    "<Default Extension=\\"rels\\" ContentType=\\"application/vnd.openxmlformats-package.relationships+xml\\"/>"',
+      '    "<Default Extension=\\"xml\\" ContentType=\\"application/xml\\"/>"',
+      '    "<Override PartName=\\"/word/document.xml\\" ContentType=\\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\\"/>"',
+      '    "</Types>")',
+      'rels = ("<?xml version=\\"1.0\\"?><Relationships xmlns=\\"http://schemas.openxmlformats.org/package/2006/relationships\\">"',
+      '    "<Relationship Id=\\"rId1\\" Type=\\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\\" Target=\\"word/document.xml\\"/>"',
+      '    "</Relationships>")',
+      'z = zipfile.ZipFile(path, "w")',
+      'z.writestr("[Content_Types].xml", types)',
+      'z.writestr("_rels/.rels", rels)',
+      'z.writestr("word/document.xml", doc)',
+      'z.close()',
+    ].join('\n'),
+    path,
+    '2048',
+  ])
+  for (const [name, body] of Object.entries(extras)) {
+    execFileSync('/usr/bin/python3', [
+      '-c',
+      'import sys, zipfile; p, n, b = sys.argv[1:]; z=zipfile.ZipFile(p,"a"); z.writestr(n,b); z.close()',
+      path,
+      name,
+      body,
+    ])
+  }
+}
+
 describe('oc-artifact-qa', () => {
   test('validates real input bytes and persists render evidence without modifying the PDF', async () => {
     const work = mkdtempSync(join(tmpdir(), 'oc-artifact-qa-pdf-'))
@@ -295,6 +332,99 @@ describe('oc-artifact-qa', () => {
         false,
       )
       assert.equal(report.renderedPages.length, 1)
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
+  test('deliver: 142B JSON renamed docx fails too-small/bad-magic', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'oc-artifact-qa-deliver-json-'))
+    try {
+      const input = join(work, 'empty.docx')
+      writeFileSync(
+        input,
+        `${JSON.stringify({ error: { code: 'GONE', message: 'signed URL expired', request_id: 'a'.repeat(32) } })}\n`,
+      )
+      assert.ok(readFileSync(input).byteLength < 2048)
+      const result = await run(['deliver', '--input', input], {})
+      assert.equal(result.code, 1)
+      assert.match(result.stdout.trim().split('\n').pop() ?? '', /^FAIL$/)
+      const report = JSON.parse(result.stdout.trim().split('\n').slice(0, -1).join('\n'))
+      assert.equal(report.passed, false)
+      const codes = report.failures.map((failure: { code: string }) => failure.code)
+      assert.ok(codes.includes('too-small') || codes.includes('bad-magic'), String(codes))
+      assert.equal(JSON.parse(readFileSync(join(work, 'empty.deliver.json'), 'utf8')).passed, false)
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
+  test('deliver: GATE=shadow writes sidecar but exits 0 on FAIL', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'oc-artifact-qa-deliver-shadow-'))
+    try {
+      const input = join(work, 'empty.docx')
+      writeFileSync(input, '{"error":true}')
+      const result = await run(['deliver', '--input', input], { OC_ARTIFACT_DELIVER_GATE: 'shadow' })
+      assert.equal(result.code, 0, result.stderr || result.stdout)
+      assert.match(result.stdout, /\nFAIL\s*$/)
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
+  test('deliver: minimum legal docx PASS', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'oc-artifact-qa-deliver-ok-'))
+    try {
+      const input = join(work, 'ok.docx')
+      writeMinDocx(input)
+      const result = await run(['deliver', '--input', input], {})
+      assert.equal(result.code, 0, result.stderr || result.stdout)
+      assert.match(result.stdout.trim().split('\n').pop() ?? '', /^PASS$/)
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
+  test('deliver: corrupt zip FAIL', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'oc-artifact-qa-deliver-badzip-'))
+    try {
+      const input = join(work, 'bad.docx')
+      const pk = Buffer.concat([Buffer.from('PK\x03\x04'), Buffer.alloc(3000, 0)])
+      writeFileSync(input, pk)
+      const result = await run(['deliver', '--input', input], {})
+      assert.equal(result.code, 1)
+      const report = JSON.parse(result.stdout.trim().split('\n').slice(0, -1).join('\n'))
+      const codes = report.failures.map((failure: { code: string }) => failure.code)
+      assert.ok(codes.includes('package-invalid') || codes.includes('package-corrupt'), String(codes))
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
+  test('pack: two files zip testzip OK; over-limit FAIL', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'oc-artifact-qa-pack-'))
+    try {
+      const a = join(work, 'a.txt')
+      const b = join(work, 'b.txt')
+      writeFileSync(a, 'hello')
+      writeFileSync(b, 'world')
+      const out = join(work, 'bundle.zip')
+      const ok = await run(['pack', '--out', out, a, b], {})
+      assert.equal(ok.code, 0, ok.stderr || ok.stdout)
+      assert.match(ok.stdout, /\nPASS\s*$/)
+      const listing = execFileSync('/usr/bin/python3', [
+        '-c',
+        'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; print(",".join(z.namelist()))',
+        out,
+      ], { encoding: 'utf8' }).trim()
+      assert.equal(listing, 'a.txt,b.txt')
+
+      const big = join(work, 'big.bin')
+      writeFileSync(big, Buffer.alloc(64))
+      const over = await run(['pack', '--out', join(work, 'over.zip'), '--max-bytes', '10', big], {})
+      assert.equal(over.code, 1)
+      const report = JSON.parse(over.stdout.trim().split('\n').slice(0, -1).join('\n'))
+      assert.ok(report.failures.some((failure: { code: string }) => failure.code === 'over-limit'))
     } finally {
       rmSync(work, { recursive: true, force: true })
     }

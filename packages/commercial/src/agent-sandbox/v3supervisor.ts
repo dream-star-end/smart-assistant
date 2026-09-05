@@ -657,6 +657,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "scientific-figures",
   "research-slides",
   "research-tournament",
+  "multi-model-review",
   "research-experiment-loop",
   "research-writing-style",
   "office-spreadsheet",
@@ -708,7 +709,7 @@ function readCcbBaselineOptionalFromEnv(): boolean {
  *   3. baseline root、`AGENTS.md`、`CLAUDE.md`、`skills/`,以及 `V3_CCB_BASELINE_SKILL_NAMES`
  *      里每一条 skill 目录都:非 symlink、类型正确、root owned、非 group/other writable
  *   4. `skills/` 下的顶层条目**必须完全等于** manifest(多余的 / 未声明的条目直接拒)
- *   5. 每条 skill 目录下**必须只有** `SKILL.md` 一个文件,不允许 subdir / 其它文件 / symlink
+ *   5. 每条 skill 目录必须含 `SKILL.md`;可选 `evals/`(恰好 evals.json)、`references/`、`scripts/`(后两者为文件树,逐叶子 assertBaselineLeaf)。其它顶层条目一律拒
  *   6. 所有 realpath 都在 baseline root 内
  *
  * 任一项失败返回 null;调用方(provisionV3Container)按 OC_V3_CCB_BASELINE_OPTIONAL
@@ -722,11 +723,31 @@ function readCcbBaselineOptionalFromEnv(): boolean {
  *   未声明的条目(运维 rsync 漏带 `--delete` 的残余目录、手工误放的临时文件、
  *   被攻击者替换成 symlink 的"看起来不像 skill 但父目录挂进去就暴露"的项)都会跟着
  *   父目录一起进容器。必须额外用 `readdirSync` 断言 `skills/` 和每条 skill 目录下
- *   的条目**恰好等于** manifest / `["SKILL.md"]`,否则拒。
+ *   的条目**恰好等于** manifest / 白名单 `{SKILL.md, evals?, references?, scripts?}`,否则拒。
  *
  *   这样基线的"全有或全无"语义就严格成立 ——
  *   skills/ 下看见的 ≡ manifest 声明的 ≡ 每条都 root owned + mode safe + SKILL.md 合规。
  */
+/**
+ * 递归校验 baseline 子树(references/、scripts/):每个目录/文件都走
+ * assertBaselineLeaf(owner=root / 非 group-other 可写 / 非 symlink / realpath 不逃逸)。
+ * fifo/socket/device 一律拒。
+ */
+function assertBaselineTree(dirPath: string, baselineRoot: string): void {
+  assertBaselineLeaf(dirPath, "dir", baselineRoot);
+  for (const name of readdirSync(dirPath).sort()) {
+    const child = pathJoin(dirPath, name);
+    const st = lstatSync(child);
+    if (st.isDirectory()) {
+      assertBaselineTree(child, baselineRoot);
+    } else if (st.isFile()) {
+      assertBaselineLeaf(child, "file", baselineRoot);
+    } else {
+      throw new Error(`baseline tree entry is neither file nor directory: ${child}`);
+    }
+  }
+}
+
 export type CcbBaselineMountOpts = {
   /** role=admin 时挂不含租户限制守则的 *.admin.md；缺省/非 admin 仍挂完整守则。 */
   admin?: boolean;
@@ -790,20 +811,22 @@ export function resolveCcbBaselineMounts(
     for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
       const skillDir = pathJoin(skillsDirPath, name);
       assertBaselineLeaf(skillDir, "dir", abs);
-      // R3 codex HIGH#1 白名单(2026-07-16 显式扩展):skill 目录允许恰好
-      // {SKILL.md} 或 {SKILL.md, evals/};evals/ 目录内必须恰好只有 evals.json。
-      // 每个放行条目都走 assertBaselineLeaf 的 lstat 校验闭环(owner=root/非可写/
-      // 非 symlink/realpath 不逃逸);再支持 scripts/ references/ 时同样在此扩展。
+      // 白名单:SKILL.md 必有;evals/ / references/ / scripts/ 可选。
+      // evals/ 必须恰好 evals.json;references/ 与 scripts/ 为文件树,逐叶子
+      // assertBaselineLeaf(owner=root / 非 group-other 可写 / 非 symlink / 不逃逸)。
       const skillEntries = readdirSync(skillDir).sort();
-      const shapeOk =
-        (skillEntries.length === 1 && skillEntries[0] === "SKILL.md") ||
-        (skillEntries.length === 2 &&
-          skillEntries[0] === "SKILL.md" &&
-          skillEntries[1] === "evals");
-      if (!shapeOk) {
+      const allowed = new Set(["SKILL.md", "evals", "references", "scripts"]);
+      if (!skillEntries.includes("SKILL.md")) {
         throw new Error(
-          `skill dir ${name} must contain exactly SKILL.md (optionally plus evals/), got: ${JSON.stringify(skillEntries)}`,
+          `skill dir ${name} missing SKILL.md, got: ${JSON.stringify(skillEntries)}`,
         );
+      }
+      for (const entry of skillEntries) {
+        if (!allowed.has(entry)) {
+          throw new Error(
+            `skill dir ${name} has undeclared entry ${entry}; allowed: SKILL.md, evals/, references/, scripts/`,
+          );
+        }
       }
       const skillMd = pathJoin(skillDir, "SKILL.md");
       assertBaselineLeaf(skillMd, "file", abs);
@@ -818,6 +841,12 @@ export function resolveCcbBaselineMounts(
         }
         assertBaselineLeaf(pathJoin(evalsDir, "evals.json"), "file", abs);
       }
+      if (skillEntries.includes("references")) {
+        assertBaselineTree(pathJoin(skillDir, "references"), abs);
+      }
+      if (skillEntries.includes("scripts")) {
+        assertBaselineTree(pathJoin(skillDir, "scripts"), abs);
+      }
     }
     const admin = opts?.admin === true;
     return {
@@ -825,8 +854,11 @@ export function resolveCcbBaselineMounts(
       claudeMdHostPath: admin ? claudeAdminReal : claudeReal,
       skillsDirHostPath: skillsDirReal,
     };
-  } catch {
+  } catch (err) {
     // ENOENT / EACCES / 校验失败全走 fail-closed 路径(调用方处理)
+    log.warn("[v3supervisor] resolveCcbBaselineMounts failed", {
+      err: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 }
@@ -1087,7 +1119,7 @@ export function readPlatformBundleOptionalFromEnv(): boolean {
  * provisionV3Container 的依赖注入。
  *
  * - `docker`:dockerode client(index.ts 单例)
- * - `pool`:pg Pool(用于 INSERT/UPDATE agent_containers,IP 唯一约束在 PG 层)
+ * - `pool`:pg Pool(用于 INSERT/UPDATE agent_containers runtime_kind='docker',IP 唯一约束在 PG 层)
  * - `image`:openclaude/openclaude-runtime:<tag>(由 OC_RUNTIME_IMAGE env 注入)
  *
  * `randomIp` / `randomSecret` 为可选注入,生产用 crypto 默认实现;
@@ -2013,9 +2045,9 @@ async function allocateBoundIpAndInsertRow(
   // 历史 NULL 行不 backfill:v3 ephemeral 容器在 lazy reprovision 时自然修复,
   // 残留 NULL 行均已 vanished / stopped,admin 不再操作。
   const insertSql = `INSERT INTO agent_containers
-       (user_id, host_uuid, bound_ip, secret_hash, state, port, image, runtime_channel, last_ws_activity, created_at, updated_at)
+       (user_id, host_uuid, bound_ip, secret_hash, state, port, image, runtime_channel, runtime_kind, last_ws_activity, created_at, updated_at)
      VALUES
-       ($1::bigint, $2::uuid, $3::inet, $4::bytea, 'active', $5::int, $6::text, $7::text, NOW(), NOW(), NOW())
+       ($1::bigint, $2::uuid, $3::inet, $4::bytea, 'active', $5::int, $6::text, $7::text, 'docker', NOW(), NOW(), NOW())
      RETURNING id`;
 
   // B.4: scheduler 已经为我们选好了 IP — 不 retry,冲突直接 NameConflict。
@@ -2269,7 +2301,7 @@ async function compensateProvisionFailure(
     await deps.pool.query(
       `UPDATE agent_containers
           SET state = 'vanished', updated_at = NOW()
-        WHERE id = $1 AND runtime_channel = $2`,
+        WHERE id = $1 AND runtime_channel = $2 AND runtime_kind = 'docker'`,
       [String(rowId), getRuntimeChannel()],
     );
   } catch (err) {
@@ -2502,6 +2534,7 @@ export async function provisionV3Container(
     const dupQ = await tx1Client.query<{ id: string }>(
       `SELECT id::text AS id FROM agent_containers
         WHERE user_id = $1::bigint AND state = 'active' AND runtime_channel = $2
+          AND runtime_kind = 'docker'
         LIMIT 1`,
       [String(uid), getRuntimeChannel()],
     );
@@ -2529,7 +2562,8 @@ export async function provisionV3Container(
       // P1a 隔离:host 容量计数按 channel(v3/v5 各算各的 active 数)。
       `SELECT
            (SELECT COUNT(*) FROM agent_containers
-             WHERE state = 'active' AND host_uuid = $1::uuid AND runtime_channel = $2)::text AS active,
+             WHERE state = 'active' AND host_uuid = $1::uuid AND runtime_channel = $2
+               AND runtime_kind = 'docker')::text AS active,
            (SELECT max_containers FROM compute_hosts WHERE id = $1::uuid)
              AS max_containers`,
       [effectiveHostUuid, getRuntimeChannel()],
@@ -2790,6 +2824,15 @@ export async function provisionV3Container(
     // modelAuthority so rebuilds without a signer still honor the master flag.
     if (process.env.OC_PROJECT_CONTEXT === "1") {
       env.push("OC_PROJECT_CONTEXT=1");
+    }
+    // R3.0 research workspace (课题): flag is judged on both sides — master
+    // (workspaceFlag.ts) and the container CLIs (ocResearchClient.ts read
+    // process.env). Without this line the container never sees the flag and
+    // `oc-litrag` / `oc-ingest --project` silently stay on the old path.
+    // Same selective-injection discipline as OC_PROJECT_CONTEXT: unset on
+    // commercial production → container keeps legacy behaviour.
+    if (process.env.OC_RESEARCH_WORKSPACE === "1") {
+      env.push("OC_RESEARCH_WORKSPACE=1");
     }
     for (const key of [
       "OC_LOCAL_OBSERVABILITY_RETENTION",
@@ -3513,7 +3556,8 @@ export async function provisionV3Container(
           SET container_internal_id = $2,
               codex_account_id = $3,
               updated_at = NOW()
-        WHERE id = $1 AND state = 'active' AND runtime_channel = $4`,
+        WHERE id = $1 AND state = 'active' AND runtime_channel = $4
+          AND runtime_kind = 'docker'`,
       [
         String(row.id),
         createdDockerId,
@@ -3618,7 +3662,7 @@ export async function markV3ContainerVanished(
     `UPDATE agent_containers
         SET state='vanished',
             updated_at=NOW()
-      WHERE id = $1 AND runtime_channel = $2
+      WHERE id = $1 AND runtime_channel = $2 AND runtime_kind = 'docker'
         AND container_internal_id IS NOT DISTINCT FROM $3${guardSql}${idleSql}
       RETURNING host_uuid`,
     updateParams,
@@ -3757,7 +3801,7 @@ export async function cleanupV3ContainerDocker(
  * 优雅停止并删除一个 active 容器,把 row 标 vanished。
  *
  * 顺序(2026-04-21 codex round 1 finding #4 修复):
- *   1. UPDATE agent_containers SET state='vanished' WHERE id = $1 —— 优先落
+ *   1. UPDATE agent_containers SET state='vanished' WHERE id = $1 AND runtime_kind='docker' —— 优先落
  *      DB,因为这是 admin / idle sweep 的"权威意图":这个行就是要走。
  *      docker 实际清理是否成功是 best-effort;失败留半死容器也是 GC 兜的事
  *      (`v3volumeGc` 见到 vanished 行的 docker_id 还残留时再 force remove)
@@ -3887,6 +3931,7 @@ export async function markV3ContainerActivity(
 ): Promise<void> {
   if (!Number.isInteger(agentContainerId) || agentContainerId <= 0) return;
   try {
+    // lint-agent-containers-kind: allow — 按 id 刷心跳;desktop 隧道复用同一函数,不得加 kind
     await deps.pool.query(
       `UPDATE agent_containers
           SET last_ws_activity = NOW(),
@@ -3947,6 +3992,7 @@ export async function getV3ContainerStatus(
             created_at, last_ws_activity
        FROM agent_containers
       WHERE user_id = $1::bigint AND state='active' AND runtime_channel = $2::text
+        AND runtime_kind = 'docker'
         AND NOT EXISTS (
           SELECT 1 FROM agent_migrations m
            WHERE m.agent_container_id = agent_containers.id

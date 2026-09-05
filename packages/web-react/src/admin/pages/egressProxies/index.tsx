@@ -96,7 +96,7 @@ export default function EgressProxiesPage() {
 
   const columns: Column<EgressProxyRow>[] = [
     { key: "label", title: "label", render: (r) => <span className="font-medium">{r.label}</span> },
-    { key: "url_masked", title: "URL(已遮蔽)", render: (r) => <span className="font-mono text-[12px] break-all">{r.url_masked}</span> },
+    { key: "url_masked", title: "URL(已遮蔽)", render: (r) => <span className="font-mono text-meta break-all">{r.url_masked}</span> },
     {
       key: "status",
       title: "status",
@@ -113,7 +113,7 @@ export default function EgressProxiesPage() {
         ),
     },
     { key: "notes", title: "notes", render: (r) => r.notes || <span className="text-faint">—</span> },
-    { key: "updated_at", title: "更新时间", width: 120, render: (r) => <TimeAgo value={r.updated_at} className="text-[12px]" /> },
+    { key: "updated_at", title: "更新时间", width: 120, render: (r) => <TimeAgo value={r.updated_at} className="text-meta" /> },
     {
       key: "actions",
       title: "操作",

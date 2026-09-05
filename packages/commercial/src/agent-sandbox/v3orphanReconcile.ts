@@ -7,7 +7,7 @@
  *
  *   Direction A — docker → DB orphan(本机 v3 标签容器 不在 DB active 集合)
  *     - listContainers({all:true, filters:{label:'com.openclaude.v3.managed=1'}})
- *     - SELECT container_internal_id, host_uuid FROM agent_containers WHERE state='active'
+ *     - SELECT container_internal_id, host_uuid FROM agent_containers WHERE state='active' AND runtime_kind='docker'
  *     - dbActiveCids 只取 (host_uuid IS NULL OR = selfHostId) 的行;selfHostId 缺失
  *       时退回原全集,避免误排除本机带 host_uuid 的真实容器
  *     - diff: docker 有但 DB 不在 → docker 孤儿(supervisor 崩 / 老进程残留)
@@ -17,7 +17,7 @@
  *
  *   Direction B — DB → docker orphan(DB active 行 inspect 404)
  *     - SELECT id, container_internal_id, host_uuid FROM agent_containers
- *         WHERE state='active' AND container_internal_id IS NOT NULL
+ *         WHERE state='active' AND runtime_kind='docker' AND container_internal_id IS NOT NULL
  *     - 多机路由(2026-04-27 修复):
  *       · host_uuid NULL/空 或 === selfHostId → 走本机 deps.docker.inspect
  *       · host_uuid !== selfHostId 且 containerService + selfHostId 都注入
@@ -225,6 +225,7 @@ async function listActiveRows(pool: Pool, batchLimit: number): Promise<DbActiveR
        FROM agent_containers c
       WHERE state = 'active'
         AND c.runtime_channel = $2::text
+        AND c.runtime_kind = 'docker'
         AND NOT EXISTS (
               SELECT 1 FROM agent_migrations m
                WHERE m.agent_container_id = c.id

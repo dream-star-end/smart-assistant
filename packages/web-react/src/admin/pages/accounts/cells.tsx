@@ -29,7 +29,7 @@ export function StatusBadge({ status }: { status: string }) {
 /** 小号内联百分比芯片(用于今日错误率 / 累计失败率)。 */
 function MiniChip({ tone, children }: { tone: Tone; children: React.ReactNode }) {
   return (
-    <Badge tone={tone} className="ml-1 px-1.5 py-0 text-[11px]">
+    <Badge tone={tone} className="ml-1 px-1.5 py-0 text-caption">
       {children}
     </Badge>
   );
@@ -47,7 +47,7 @@ export function QuotaCell({ pct, updatedAt }: { pct: number | null; updatedAt: s
   const label = `${num.toFixed(0)}%`;
   const title = updatedAt ? `更新: ${fmtDateTime(updatedAt)}${stale ? " (陈旧)" : ""}` : undefined;
   const inner = tone ? (
-    <Badge tone={tone} className="px-1.5 py-0 text-[11px]">
+    <Badge tone={tone} className="px-1.5 py-0 text-caption">
       {label}
     </Badge>
   ) : (
@@ -91,7 +91,7 @@ export function CooldownCell({ cooldownUntil }: { cooldownUntil: string | null }
   if (ms <= 0) {
     return (
       <Tooltip content={fmtDateTime(cooldownUntil)}>
-        <Badge tone="neutral" className="px-1.5 py-0 text-[11px]">
+        <Badge tone="neutral" className="px-1.5 py-0 text-caption">
           已过
         </Badge>
       </Tooltip>
@@ -101,7 +101,7 @@ export function CooldownCell({ cooldownUntil }: { cooldownUntil: string | null }
   const label = mins >= 60 ? `${Math.round(mins / 60)}h` : `${mins}m`;
   return (
     <Tooltip content={fmtDateTime(cooldownUntil)}>
-      <Badge tone="warning" className="px-1.5 py-0 text-[11px]">
+      <Badge tone="warning" className="px-1.5 py-0 text-caption">
         {label}
       </Badge>
     </Tooltip>
@@ -157,14 +157,14 @@ export function CursorPoolCell({ a }: { a: AccountRow }) {
       <span>{poolLabel}</span>
       <div className="flex flex-wrap gap-1">
         {a.cursor_sand_enabled ? (
-          <Badge tone="accent" className="w-fit px-1.5 py-0 text-[10px]">
+          <Badge tone="accent" className="w-fit px-1.5 py-0 text-micro">
             Sand
           </Badge>
         ) : null}
         {a.cursor_credential_kind === "session" ? (
           <Badge
             tone="neutral"
-            className="w-fit px-1.5 py-0 text-[10px]"
+            className="w-fit px-1.5 py-0 text-micro"
             title={a.cursor_auth_id ? `Cursor 账号登录会话 · ${a.cursor_auth_id}` : "Cursor 账号登录会话"}
           >
             账号会话
@@ -211,12 +211,12 @@ export function AccountWarningChips({ a }: { a: AccountRow }) {
       {chips.map((c) =>
         c.title ? (
           <Tooltip key={c.label} content={c.title}>
-            <Badge tone={c.tone} className="px-1.5 py-0 text-[11px]">
+            <Badge tone={c.tone} className="px-1.5 py-0 text-caption">
               {c.label}
             </Badge>
           </Tooltip>
         ) : (
-          <Badge key={c.label} tone={c.tone} className="px-1.5 py-0 text-[11px]">
+          <Badge key={c.label} tone={c.tone} className="px-1.5 py-0 text-caption">
             {c.label}
           </Badge>
         ),
@@ -228,5 +228,68 @@ export function AccountWarningChips({ a }: { a: AccountRow }) {
 /** 最近使用相对时间(空→—)。 */
 export function LastUsed({ iso }: { iso: string | null }) {
   if (!iso) return <span className="text-faint">—</span>;
-  return <TimeAgo value={iso} className="font-mono text-[12px]" />;
+  return <TimeAgo value={iso} className="font-mono text-meta" />;
+}
+
+/**
+ * 0262 — Cursor Sand(Grok Bot)池已用 %。每小时 sweeper 刷新;>2h 未刷新灰显。
+ * api_key 行没有 cursor.com 面,永远 —。tooltip 带刷新时间与最近一次失败原因。
+ */
+export function CursorSandUsageCell({ a }: { a: AccountRow }) {
+  if (a.provider !== "cursor") return <span className="text-faint">—</span>;
+  const pct = a.cursor_sand_usage_pct;
+  const updatedAt = a.cursor_usage_updated_at ?? null;
+  const err = a.cursor_usage_error ?? null;
+  if (pct === null || pct === undefined || !Number.isFinite(Number(pct))) {
+    const hint =
+      a.cursor_credential_kind !== "session"
+        ? "API Key 行无 cursor.com 面,无法读取 Sand 池"
+        : err
+          ? `最近刷新失败:${err}`
+          : "尚未刷新(每小时自动;可在更多操作里手动刷新)";
+    return (
+      <Tooltip content={hint}>
+        <span className="text-faint">—</span>
+      </Tooltip>
+    );
+  }
+  const num = Number(pct);
+  const updMs = updatedAt ? new Date(updatedAt).getTime() : Number.NaN;
+  const stale = Number.isFinite(updMs) ? Date.now() - updMs > 2 * 60 * 60 * 1000 : true;
+  const tone: Tone = stale ? "neutral" : num >= 95 ? "danger" : num >= 80 ? "warning" : num <= 40 ? "success" : "info";
+  const title = [
+    `Sand 池已用 ${num.toFixed(1)}%`,
+    updatedAt ? `更新: ${fmtDateTime(updatedAt)}${stale ? " (陈旧)" : ""}` : null,
+    a.cursor_sand_access_state ? `状态: ${a.cursor_sand_access_state.replace("SAND_ACCESS_STATE_", "")}` : null,
+    err ? `最近失败: ${err}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <Tooltip content={title}>
+      <Badge tone={tone} className="px-1.5 py-0 text-caption tabular-nums">
+        {num.toFixed(0)}%
+      </Badge>
+    </Tooltip>
+  );
+}
+
+/** 0262 — 套餐 membership(pro/ultra/free)+ 账期到期日。 */
+export function CursorPlanCell({ a }: { a: AccountRow }) {
+  if (a.provider !== "cursor") return <span className="text-faint">—</span>;
+  const membership = a.cursor_plan_membership ?? null;
+  const end = a.cursor_billing_cycle_end ?? null;
+  if (!membership && !end) return <span className="text-faint">—</span>;
+  return (
+    <div className="flex flex-col gap-0.5 leading-tight">
+      {membership ? <span className="text-meta">{membership}</span> : null}
+      {end ? (
+        <Tooltip content={`账期到期 ${fmtDateTime(end)}`}>
+          <span className="font-mono text-caption text-muted">
+            <ResetCell resetsAt={end} />
+          </span>
+        </Tooltip>
+      ) : null}
+    </div>
+  );
 }

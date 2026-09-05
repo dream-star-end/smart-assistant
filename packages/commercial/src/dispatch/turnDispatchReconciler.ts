@@ -249,6 +249,8 @@ function idOf(row: TurnDispatchRow): DispatchIdentity {
     attemptNo: row.attemptNo,
     sessionId: row.sessionId,
     clientMessageId: row.clientMessageId,
+    agentContainerId: row.agentContainerId ?? null,
+    runtimeKind: row.runtimeKind ?? null,
   }
 }
 
@@ -776,10 +778,18 @@ async function closeVisibleOrphans(
                 JOIN client_session_live_frames f ON f.stream_key = s.stream_key
                WHERE s.dispatch_id = d.dispatch_id
             ) AS last_frame_at,
-            EXISTS (
-              SELECT 1 FROM agent_containers ac
-               WHERE ac.user_id = d.user_id AND ac.state = 'active'
-            ) AS container_running
+            CASE
+              WHEN d.agent_container_id IS NOT NULL THEN EXISTS (
+                SELECT 1 FROM agent_containers ac
+                 WHERE ac.id = d.agent_container_id AND ac.state = 'active'
+                   AND (d.runtime_kind IS NULL OR ac.runtime_kind = d.runtime_kind)
+              )
+              ELSE EXISTS (
+                SELECT 1 FROM agent_containers ac
+                 WHERE ac.user_id = d.user_id AND ac.state = 'active'
+                   AND ac.runtime_kind = 'docker'
+              )
+            END AS container_running
        FROM turn_dispatches d
        LEFT JOIN client_session_turn_tapes t ON t.dispatch_id = d.dispatch_id
       WHERE d.status IN ('admitted','accepted')

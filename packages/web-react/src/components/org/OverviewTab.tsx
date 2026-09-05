@@ -94,7 +94,7 @@ export function OverviewTab({
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
+      <div className="flex items-center justify-center gap-2 py-16 text-body text-faint">
         <Spinner /> 加载组织信息…
       </div>
     );
@@ -102,7 +102,7 @@ export function OverviewTab({
   if (err || !org) {
     return (
       <div className="px-5 py-4">
-        <Alert tone="danger" className="text-[12.5px]">
+        <Alert tone="danger" className="text-meta">
           {err || "组织信息不可用。"}
         </Alert>
       </div>
@@ -121,7 +121,7 @@ export function OverviewTab({
   return (
     <div className="flex flex-col">
       <div className="px-5 py-4">
-        <div className="flex items-center gap-1.5 text-[12px] text-faint">
+        <div className="flex items-center gap-1.5 text-meta text-faint">
           <Building2 size={13} /> 组织
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-2">
@@ -133,7 +133,7 @@ export function OverviewTab({
 
       {suspended && (
         <div className="px-5 pb-2">
-          <Alert tone="warning" className="text-[12.5px]">
+          <Alert tone="warning" className="text-meta">
             该组织已被暂停，组织钱包与共享技能暂不可用。请联系平台客服处理。
           </Alert>
         </div>
@@ -141,16 +141,16 @@ export function OverviewTab({
 
       {/* 订阅面板 */}
       <div className="border-t border-border px-5 py-4">
-        <div className="flex items-center gap-1.5 text-[12px] text-faint">
+        <div className="flex items-center gap-1.5 text-meta text-faint">
           <Crown size={13} /> 企业套餐
         </div>
 
         {subErr ? (
-          <Alert tone="warning" className="mt-2 text-[12.5px]">
+          <Alert tone="warning" className="mt-2 text-meta">
             {subErr}
           </Alert>
         ) : subLoading ? (
-          <div className="flex items-center gap-2 py-4 text-[13px] text-faint">
+          <div className="flex items-center gap-2 py-4 text-body text-faint">
             <Spinner size={15} /> 加载订阅…
           </div>
         ) : sub ? (
@@ -159,7 +159,7 @@ export function OverviewTab({
               {/* F 的 subscription 无 plan_name,优先用 plans 列表里的展示名。 */}
               <span className="text-[16px] font-semibold text-fg">{plan?.name ?? sub.planName}</span>
               {sub.status === "active" ? (
-                <span className="inline-flex items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-[11px] font-medium text-accent">
+                <span className="inline-flex items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent">
                   <CalendarClock size={11} /> 到期 {fmtDate(sub.periodEnd)}
                 </span>
               ) : (
@@ -169,7 +169,7 @@ export function OverviewTab({
 
             {/* 席位 used / total */}
             <div className="mt-3">
-              <div className="flex items-center justify-between text-[12.5px]">
+              <div className="flex items-center justify-between text-meta">
                 <span className="text-muted">席位</span>
                 <span className="tabular-nums text-fg">
                   {seats.used}
@@ -182,13 +182,13 @@ export function OverviewTab({
                 aria-label="席位占用"
               />
               {seats.full && (
-                <p className="mt-1 text-[11.5px] text-warning">席位已满，如需邀请更多成员请加席。</p>
+                <p className="mt-1 text-caption text-warning">席位已满，如需邀请更多成员请加席。</p>
               )}
             </div>
 
             {/* 期内池余额 + 进度 */}
             <div className="mt-3">
-              <div className="flex items-center justify-between text-[12.5px]">
+              <div className="flex items-center justify-between text-meta">
                 <span className="text-muted">期内池余额</span>
                 <span className="tabular-nums text-fg">
                   {formatCredits(sub.periodCredits)}
@@ -198,7 +198,7 @@ export function OverviewTab({
               {grantedPool && (
                 <Progress value={poolPct} className="mt-1.5" aria-label="期内池余额占比" />
               )}
-              <p className="mt-1 text-[11.5px] text-faint">
+              <p className="mt-1 text-caption text-faint">
                 期内池由席位积分汇集，扣费优先消耗；到期清零，超额由组织钱包承接。
               </p>
             </div>
@@ -216,7 +216,7 @@ export function OverviewTab({
           </>
         ) : (
           <>
-            <p className="mt-1 text-[13px] text-muted">
+            <p className="mt-1 text-body text-muted">
               尚未订阅企业套餐。订阅后按席位获得可汇集的期内积分池，闲置席位积分不浪费。
             </p>
             {canManageBilling ? (
@@ -226,7 +226,7 @@ export function OverviewTab({
                 </Button>
               </div>
             ) : (
-              <p className="mt-2 text-[11.5px] text-faint">如需订阅，请联系组织拥有者。</p>
+              <p className="mt-2 text-caption text-faint">如需订阅，请联系组织拥有者。</p>
             )}
           </>
         )}
@@ -235,10 +235,10 @@ export function OverviewTab({
       {/* 成员数 */}
       <div className="border-t border-border px-5 py-4">
         <div className="flex items-center justify-between">
-          <span className="flex items-center gap-1.5 text-[12.5px] text-muted">
+          <span className="flex items-center gap-1.5 text-meta text-muted">
             <Users size={14} /> 成员
           </span>
-          <span className="text-[13.5px] font-medium tabular-nums text-fg">
+          <span className="text-section font-medium tabular-nums text-fg">
             {org.member_count}
             <span className="text-faint"> / {sub ? seats.total : org.max_members}</span>
           </span>
@@ -247,7 +247,7 @@ export function OverviewTab({
 
       {/* 组织钱包余额 */}
       <div className="border-t border-border px-5 py-4">
-        <div className="flex items-center gap-1.5 text-[12px] text-faint">
+        <div className="flex items-center gap-1.5 text-meta text-faint">
           <Wallet size={13} /> 组织钱包余额
         </div>
         <div
@@ -256,7 +256,7 @@ export function OverviewTab({
           )}
         >
           {formatCredits(org.credits)}
-          <span className="text-[14px] font-normal text-faint">积分</span>
+          <span className="text-title font-normal text-faint">积分</span>
         </div>
         {canManageBilling ? (
           <div className="mt-3 flex flex-wrap gap-2">
@@ -270,9 +270,9 @@ export function OverviewTab({
             </Button>
           </div>
         ) : (
-          <p className="mt-2 text-[11.5px] text-faint">如需充值，请联系组织拥有者或财务委派人。</p>
+          <p className="mt-2 text-caption text-faint">如需充值，请联系组织拥有者或财务委派人。</p>
         )}
-        <p className="mt-2 text-[12px] text-faint">
+        <p className="mt-2 text-meta text-faint">
           组织钱包承接期内池超额与非订阅用量，永久有效。成员对话用量可由组织钱包统一结算
           （按成员的「组织结算」开关生效）。
         </p>

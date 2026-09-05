@@ -53,6 +53,7 @@ import {
   type VisibleVirtualRowAnchor,
 } from "./components/chat/archivePaging";
 import { createStickToBottomController } from "./components/chat/stickToBottom";
+import { attachWheelFence } from "./components/chat/wheelFence";
 import { currentTurnSettled, turnFinalAssistantFlags } from "./components/chat/turnSegment";
 import type { CardCallbacks, FeedbackContext } from "./components/chat/cards";
 import { MessageFeedbackDialog } from "./components/chat/MessageFeedbackDialog";
@@ -231,11 +232,19 @@ function SplashFallback() {
   );
 }
 /** 对话框懒块加载态——铺一层与 Dialog.Overlay 同款的半透明遮罩 + 居中 spinner,
- *  首次打开拉块的短暂空窗内给出「正在打开」的视觉,避免点击后无反馈。*/
+ *  首次打开拉块的短暂空窗内给出「正在打开」的视觉,避免点击后无反馈。
+ *  role=status + aria-live 让读屏用户也收到「正在加载」而非静默黑屏。*/
 function DialogFallback() {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+    // biome-ignore lint/a11y/useSemanticElements: <output> 语义是"表单计算结果",这里是全屏加载遮罩,保留 div+role=status
+    <div
+      role="status"
+      aria-live="polite"
+      aria-busy="true"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+    >
       <Spinner size={22} />
+      <span className="sr-only">加载中</span>
     </div>
   );
 }
@@ -704,6 +713,14 @@ export function App() {
       const sid = activeId;
       const commit = (modelSwitchId?: string) => {
         if (activeModelSwitchSessionRef.current === sid) setModelId(id);
+        // 成功反馈只挂用户主动切换路径:boot 恢复模型偏好走上方 resolveSessionModel 的
+        // setModelId,不经过 commit,不会误报。失败面已有 toast(压缩失败)或 server-wins
+        // 盖回,成功此前静默;压缩切换(prepareModelSwitch)带明确等待,给压缩语义文案。
+        const displayName = models.find((m) => m.id === id)?.display_name ?? id;
+        toast(
+          modelSwitchId ? `已压缩上下文并切换到 ${displayName}` : `已切换到 ${displayName}`,
+          "success",
+        );
         if (demo) return;
         if (!sid) return;
         setSessions((c) => c.map((s) => (s.id === sid ? { ...s, modelId: id } : s)));
@@ -2108,6 +2125,26 @@ export function App() {
               sessionId: input.sessionId,
             }, authRef.current?.snapshot().token);
           },
+      onTimelineBlank: demo
+        ? undefined
+        : ({ sessionId, report }) => {
+            // Bounded counters only; the full geometry stays in localStorage
+            // (`oc.timelineBlank.last`) / `window.__ocTimelineDump()` for the
+            // user to hand over when the blank shows up again.
+            const snap = report.snapshot;
+            reportClientFriction({
+              surface: "webchat",
+              stage: "timeline_paint",
+              code: `TIMELINE_BLANK_${report.classification.toUpperCase()}`,
+              outcome: "failed",
+              attempts: snap.rowsMounted,
+              latencyMs: Math.max(0, Math.round(snap.distBottom)),
+              sessionId,
+            }, authRef.current?.snapshot().token);
+            if (typeof console !== "undefined") {
+              console.warn("[oc-timeline] blank viewport detected", report.classification, snap);
+            }
+          },
       onRetrySend: demo ? undefined : retrySend,
       onContinueInterrupted: demo ? undefined : continueInterrupted,
       resolveInterruptedContinuation: demo ? undefined : resolveInterruptedContinuation,
@@ -2335,6 +2372,14 @@ export function App() {
     stick.markUserIntent();
     cancelArchiveCorrection();
   }, [stick, cancelArchiveCorrection]);
+  // Wheel / trackpad fence (see wheelFence.ts). The React `onWheel` above keeps
+  // the zero-tolerance leave mark; the fence itself lives in native listeners so
+  // begin and release share one ordering with the browser's scrollend.
+  useEffect(() => {
+    const el = chatScrollParent;
+    if (!el) return;
+    return attachWheelFence(el, stick);
+  }, [chatScrollParent, stick]);
   const beginDirectUserChatScroll = useCallback(() => {
     stick.beginDirectManipulation();
     cancelArchiveCorrection();
@@ -2726,31 +2771,35 @@ export function App() {
   }
   if (!demo && (!auth || !user)) {
     return (
-      <AuthGate
-        onLogin={login}
-        onRegister={register}
-        onVerifyEmail={verifyEmail}
-        onResendVerification={resendVerification}
-        onRequestReset={requestReset}
-        onConfirmReset={confirmReset}
-        loading={authLoading}
-        error={authError}
-        onRetrySession={authRecoveryAvailable ? retryBoot : undefined}
-        onBack={() => {
-          if (authRecoveryAvailable) clearAuth();
-          setAuthMode("login");
-          setView("home");
-        }}
-        theme={theme}
-        onCycleTheme={cycle}
-        turnstileBypass={publicCfg?.turnstileBypass}
-        turnstileSiteKey={publicCfg?.turnstileSiteKey}
-        onRetryPublicConfig={() => setPublicCfgRetryNonce((n) => n + 1)}
-        allowRegistration={publicCfg?.allowRegistration ?? true}
-        requireEmailVerified={publicCfg?.requireEmailVerified ?? false}
-        initialMode={authMode}
-        resetToken={resetToken}
-      />
+      // 首页(Landing)固定深色,登录页跟随系统主题:系统浅色时直切会闪白。
+      // 外层容器挂 animate-in(styles.css 的 fade-up 0.32s)把硬切柔化成整页淡入。
+      <div className="h-full animate-in">
+        <AuthGate
+          onLogin={login}
+          onRegister={register}
+          onVerifyEmail={verifyEmail}
+          onResendVerification={resendVerification}
+          onRequestReset={requestReset}
+          onConfirmReset={confirmReset}
+          loading={authLoading}
+          error={authError}
+          onRetrySession={authRecoveryAvailable ? retryBoot : undefined}
+          onBack={() => {
+            if (authRecoveryAvailable) clearAuth();
+            setAuthMode("login");
+            setView("home");
+          }}
+          theme={theme}
+          onCycleTheme={cycle}
+          turnstileBypass={publicCfg?.turnstileBypass}
+          turnstileSiteKey={publicCfg?.turnstileSiteKey}
+          onRetryPublicConfig={() => setPublicCfgRetryNonce((n) => n + 1)}
+          allowRegistration={publicCfg?.allowRegistration ?? true}
+          requireEmailVerified={publicCfg?.requireEmailVerified ?? false}
+          initialMode={authMode}
+          resetToken={resetToken}
+        />
+      </div>
     );
   }
 
@@ -2989,6 +3038,8 @@ export function App() {
           </LazyBoundary>
         ) : (
         <>
+        {/* 会话标题 h1(读屏定位当前会话;视觉已由顶栏表达,故 sr-only。探针:工作区 h1=0)。 */}
+        <h1 className="sr-only">{activeSess?.title || "新对话"}</h1>
         <ChatHeader
           agent={agent}
           onAgentClick={() => setPickerOpen(true)}
@@ -3204,8 +3255,10 @@ export function App() {
               />
             </div>
           )}
-          {/* WS 连接状态条三态（离线 / 环境启动中 / 服务端重连中，见 deriveConnBanner）。仅非 demo。*/}
-          {!gated && connBanner && (
+          {/* WS 连接状态条三态（离线 / 环境启动中 / 服务端重连中，见 deriveConnBanner）。仅非 demo。
+              移动端(< md)软键盘弹出会压缩可视视口,流式布局里的横幅会被顶出屏幕;改走
+              Composer 的 banner 插槽钉在输入框上方,始终可见。桌面(md+)保持原流式位置。 */}
+          {!gated && connBanner && isMdViewport && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert tone={connBanner.tone}>{connBanner.text}</Alert>
             </div>
@@ -3232,6 +3285,13 @@ export function App() {
             onStop={stopTurn}
             disabled={gated}
             environmentPreparing={!demo && chat.provisioning}
+            banner={
+              !gated && connBanner && !isMdViewport ? (
+                <div className="mb-2">
+                  <Alert tone={connBanner.tone}>{connBanner.text}</Alert>
+                </div>
+              ) : undefined
+            }
             placeholder={`和「${agent.name}」对话…`}
             onUpload={demo ? undefined : uploadMedia}
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}

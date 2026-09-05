@@ -106,21 +106,21 @@ export function ApiKeysSection({ auth }: { auth: AuthSession }) {
   return (
     <div className="border-t border-border px-5 py-4">
       {confirmDialogEl}
-      <div className="flex items-center gap-1.5 pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+      <div className="flex items-center gap-1.5 pb-2 text-caption font-medium uppercase tracking-wide text-faint">
         <KeyRound size={13} /> API Key
       </div>
 
       {err && (
-        <Alert tone="danger" className="mb-2 text-[12.5px]">
+        <Alert tone="danger" className="mb-2 text-meta">
           {err}
         </Alert>
       )}
 
       {justCreated && (
-        <Alert tone="warning" className="mb-3 flex flex-col gap-2 text-[12.5px]">
+        <Alert tone="warning" className="mb-3 flex flex-col gap-2 text-meta">
           <span>请立即复制并妥善保存，关闭后将无法再次查看完整密钥。</span>
           <div className="flex items-center gap-2">
-            <code className="min-w-0 flex-1 truncate rounded-md bg-bg px-2 py-1 font-mono text-[12px] text-fg">
+            <code className="min-w-0 flex-1 truncate rounded-md bg-bg px-2 py-1 font-mono text-meta text-fg">
               {justCreated.plaintext}
             </code>
             <Button variant="secondary" size="sm" onClick={copyPlaintext}>
@@ -136,7 +136,7 @@ export function ApiKeysSection({ auth }: { auth: AuthSession }) {
           onChange={(e) => setLabel(e.target.value)}
           placeholder="新密钥名称（如 my-cli）"
           maxLength={64}
-          className="h-auto bg-bg px-3 py-2 text-[13.5px]"
+          className="h-auto bg-bg px-3 py-2 text-section"
           onKeyDown={(e) => {
             if (e.key === "Enter") create();
           }}
@@ -153,18 +153,18 @@ export function ApiKeysSection({ auth }: { auth: AuthSession }) {
       </div>
 
       {loading ? (
-        <div className="flex items-center justify-center gap-2 py-4 text-[13px] text-faint">
+        <div className="flex items-center justify-center gap-2 py-4 text-body text-faint">
           <Spinner /> 加载中…
         </div>
       ) : !keys || keys.length === 0 ? (
-        <p className="py-3 text-center text-[12.5px] text-faint">还没有 API Key</p>
+        <p className="py-3 text-center text-meta text-faint">还没有 API Key</p>
       ) : (
         <ul className="flex flex-col gap-1">
           {keys.map((k) => (
             <li key={k.id} className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-hover">
               <span className="min-w-0 flex-1">
-                <span className="block truncate text-[13.5px] text-fg">{k.label}</span>
-                <span className="block truncate font-mono text-[11.5px] text-faint">
+                <span className="block truncate text-section text-fg">{k.label}</span>
+                <span className="block truncate font-mono text-caption text-faint">
                   {k.keyPrefix}··· · {shortTime(k.createdAt)}
                   {k.lastUsedAt ? ` · 最近使用 ${shortTime(k.lastUsedAt)}` : " · 从未使用"}
                 </span>

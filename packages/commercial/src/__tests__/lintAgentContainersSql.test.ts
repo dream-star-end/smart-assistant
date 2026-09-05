@@ -21,6 +21,7 @@ import {
   STATE_WINDOW_LINES,
   WAIVER_LOOKBEHIND_LINES,
   WAIVER_MARKER,
+  KIND_WAIVER_MARKER,
 } from "../../scripts/lint-agent-containers-sql.js";
 
 describe("lint-agent-containers-sql (3M, R6.7 (a))", () => {
@@ -219,5 +220,40 @@ const r = await query(\`SELECT id FROM agent_containers WHERE status = 'running'
  *   SELECT id FROM agent_containers WHERE state='active'
  */`;
     assert.deepEqual(lintFile("agent-sandbox/v3foo.ts", src), []);
+  });
+});
+
+describe("lint-agent-containers-sql — runtime_kind (B-06)", () => {
+  test("FROM without runtime_kind → kind violation", () => {
+    const src = `const r = await query(\`SELECT id FROM agent_containers WHERE state = 'active'\`, []);`;
+    const res = lintFileDetailed("agent-sandbox/v3foo.ts", src);
+    assert.equal(res.violations.length, 0);
+    assert.equal(res.kindViolations.length, 1);
+  });
+
+  test("runtime_kind='docker' on same statement → pass", () => {
+    const src = `const r = await query(\`SELECT id FROM agent_containers WHERE state = 'active' AND runtime_kind = 'docker'\`, []);`;
+    const res = lintFileDetailed("agent-sandbox/v3foo.ts", src);
+    assert.deepEqual(res.kindViolations, []);
+  });
+
+  test("UPDATE without runtime_kind → kind violation", () => {
+    const src = `await query(\`UPDATE agent_containers SET state='vanished' WHERE id = $1\`);`;
+    const res = lintFileDetailed("agent-sandbox/v3foo.ts", src);
+    assert.equal(res.kindViolations.length, 1);
+  });
+
+  test("kind waiver with reason → pass", () => {
+    const src = `// ${KIND_WAIVER_MARKER} — 按 id 刷心跳,desktop 复用
+await query(\`UPDATE agent_containers SET last_ws_activity = NOW() WHERE id = $1 AND state = 'active'\`);`;
+    const res = lintFileDetailed("agent-sandbox/v3foo.ts", src);
+    assert.deepEqual(res.kindViolations, []);
+    assert.deepEqual(res.staleKindWaivers, []);
+  });
+
+  test("INSERT INTO listing runtime_kind column → pass", () => {
+    const src = `await query(\`INSERT INTO agent_containers (user_id, runtime_kind) VALUES ($1, 'docker')\`);`;
+    const res = lintFileDetailed("agent-sandbox/v3foo.ts", src);
+    assert.deepEqual(res.kindViolations, []);
   });
 });

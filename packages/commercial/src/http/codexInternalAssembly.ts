@@ -132,7 +132,7 @@ export function buildCodexTokenRefreshHandler(
                   ca.status AS account_status
              FROM agent_containers ac -- state selected above; refresh handler rejects non-active
              LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-            WHERE ac.id = $1 AND ac.runtime_channel = $2`,
+            WHERE ac.id = $1 AND ac.runtime_channel = $2 AND ac.runtime_kind = 'docker'`,
           [containerId, getRuntimeChannel()],
         );
         if (r.rows.length === 0) return null;
@@ -161,7 +161,7 @@ export function buildCodexTokenRefreshHandler(
                     ca.status AS account_status
                FROM agent_containers ac -- state selected above; handler re-validates under lock
                LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-              WHERE ac.id = $1 AND ac.runtime_channel = $2
+              WHERE ac.id = $1 AND ac.runtime_channel = $2 AND ac.runtime_kind = 'docker'
                 FOR UPDATE OF ac`,
             [containerId, getRuntimeChannel()],
           );

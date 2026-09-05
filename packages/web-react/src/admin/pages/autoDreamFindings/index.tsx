@@ -151,10 +151,10 @@ export default function AutoDreamFindingsPage() {
       render: (row) => (
         <div className="min-w-[18rem]">
           <div className="font-medium">{row.title}</div>
-          <div className="mt-0.5 text-[11.5px] text-faint">
+          <div className="mt-0.5 text-caption text-faint">
             {row.capability_id} · {row.taxonomy}
           </div>
-          <div className="mt-1 font-mono text-[10.5px] text-faint" title={row.fingerprint}>
+          <div className="mt-1 font-mono text-micro text-faint" title={row.fingerprint}>
             cluster {row.fingerprint.slice(0, 12)}
           </div>
         </div>
@@ -361,7 +361,7 @@ export default function AutoDreamFindingsPage() {
         <StatCard label="当前页未指派" value={summary.unowned} icon={Users} tone={summary.unowned > 0 ? 'warning' : 'success'} loading={loading} />
       </StatCardRow>
       <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-surface px-3 py-2">
-        <span className="text-[12px] text-muted">已选择 {selectedIds.size} 项</span>
+        <span className="text-meta text-muted">已选择 {selectedIds.size} 项</span>
         <Button size="sm" variant="secondary" disabled={selectedIds.size === 0 || updating} onClick={() => void updateBatch([...selectedIds], { status: 'triaged' })}>
           批量分诊
         </Button>
@@ -373,7 +373,7 @@ export default function AutoDreamFindingsPage() {
             <Archive size={14} />归档当前页陈旧单源（{staleSingleSourceIds.length}）
           </Button>
         )}
-        <span className="text-[11px] text-faint">“归档”复用既有「已忽略」状态，不创建第二套生命周期。</span>
+        <span className="text-caption text-faint">“归档”复用既有「已忽略」状态，不创建第二套生命周期。</span>
       </div>
       <DataTable
         rows={visibleRows}

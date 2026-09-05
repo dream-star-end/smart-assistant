@@ -23,4 +23,4 @@
 export * from "./proxy/shared.js";
 
 // handler 工厂
-export { makeAnthropicProxyHandler } from "./proxy/index.js";
+export { makeAnthropicProxyHandler, buildProxyJournalCtxJson } from "./proxy/index.js";

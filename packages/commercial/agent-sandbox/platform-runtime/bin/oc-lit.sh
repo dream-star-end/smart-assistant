@@ -9,7 +9,7 @@ SELF_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # help-fast-path: stdout usage + exit 0; do not start tsx/node/network.
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "help" ]; then
   cat <<'EOF'
-usage: oc-lit <search <query> [--sources ...] [--size N] [--year-min Y] [--lang zh|en] | snowball <id> [--direction ...]>
+usage: oc-lit <search <query> [--sources ...] [--size N] [--year-min Y] [--lang zh|en] | snowball <id> [--direction ...] | fetch <id|records.json> [--project P] [--no-ingest] | fetch-batch <records.json> --request-id <rid> [--project P] | job-status <requestId>>
 EOF
   exit 0
 fi

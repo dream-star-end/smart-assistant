@@ -170,9 +170,9 @@ function CardShell({ title, subtitle, children }: {
   return (
     <section className="space-y-2">
       <div className="flex min-w-0 items-center gap-2">
-        <span className="min-w-0 truncate text-[11.5px] font-medium text-faint">{title}</span>
+        <span className="min-w-0 truncate text-caption font-medium text-faint">{title}</span>
         {subtitle && (
-          <span className="ml-auto shrink-0 rounded-full bg-hover px-2 py-0.5 text-[11px] font-medium text-faint">
+          <span className="ml-auto shrink-0 rounded-full bg-hover px-2 py-0.5 text-caption font-medium text-faint">
             {subtitle}
           </span>
         )}
@@ -205,7 +205,7 @@ function Chip({ children, href, tone }: { children: ReactNode; href?: string; to
 /** 渐进披露提示:结果被截断、卡片只展示已加载的前若干条时给用户的一行说明。 */
 function PartialNote({ shown }: { shown: number }) {
   return (
-    <div className="mt-2 text-[11px] text-faint">
+    <div className="mt-2 text-caption text-faint">
       结果较多,卡片仅展示已加载的前 {shown} 条;完整结果见上方回答。
     </div>
   );
@@ -375,7 +375,7 @@ function CitationCard({ data, partial }: { data: Record<string, unknown>; partia
           {single.retracted === true && <Chip tone="danger">已撤稿</Chip>}
         </div>
         {cite && (
-          <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded bg-code px-2.5 py-2 font-mono text-[12px] text-muted">
+          <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded bg-code px-2.5 py-2 font-mono text-meta text-muted">
             {cite}
           </pre>
         )}
@@ -443,8 +443,8 @@ function IngestCard({ data }: { data: Record<string, unknown> }) {
     .join(" · ");
   return (
     <CardShell icon={<Database className="size-4" />} title="文档已入库" subtitle={meta}>
-      <div className="text-[13px] text-fg">{asStr(data.title) || "(无标题)"}</div>
-      <div className="mt-0.5 font-mono text-[11px] text-faint">{docId}</div>
+      <div className="text-body text-fg">{asStr(data.title) || "(无标题)"}</div>
+      <div className="mt-0.5 font-mono text-caption text-faint">{docId}</div>
     </CardShell>
   );
 }
@@ -466,7 +466,7 @@ function LitragCard({ data, partial }: { data: Record<string, unknown>; partial?
           {quotes.slice(0, 30).map((q, i) => (
             <li key={q.id || `${i}`} className="border-l-2 border-accent/40 pl-2">
               <div className="text-[13px] leading-snug text-fg">“{asStr(q.text).slice(0, 300)}”</div>
-              {q.sourceId && <div className="mt-0.5 font-mono text-[11px] text-faint">{asStr(q.sourceId)}</div>}
+              {q.sourceId && <div className="mt-0.5 font-mono text-caption text-faint">{asStr(q.sourceId)}</div>}
             </li>
           ))}
         </ul>
@@ -515,7 +515,7 @@ function ArtifactPreviewLink({ src }: { src: string }) {
       href={signed}
       target="_blank"
       rel="noreferrer noopener"
-      className="inline-flex items-center gap-1 rounded bg-accent-soft px-2 py-1 text-[12px] text-accent hover:underline"
+      className="inline-flex items-center gap-1 rounded bg-accent-soft px-2 py-1 text-meta text-accent hover:underline"
     >
       预览
       <ExternalLink className="size-3" />
@@ -564,7 +564,7 @@ function EvidenceSection({ src, coverage }: {
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-[12.5px] text-fg hover:bg-hover"
+        className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-meta text-fg hover:bg-hover"
       >
         {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
         引用接地详情
@@ -581,7 +581,7 @@ function EvidenceSection({ src, coverage }: {
                   type="button"
                   onClick={() => setTab("evidence")}
                   className={cn(
-                    "rounded-md px-2 py-0.5 text-[12px]",
+                    "rounded-md px-2 py-0.5 text-meta",
                     tab === "evidence" ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
                   )}
                 >
@@ -591,7 +591,7 @@ function EvidenceSection({ src, coverage }: {
                   type="button"
                   onClick={() => setTab("library")}
                   className={cn(
-                    "rounded-md px-2 py-0.5 text-[12px]",
+                    "rounded-md px-2 py-0.5 text-meta",
                     tab === "library" ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
                   )}
                 >
@@ -696,10 +696,10 @@ function RankCard({ data, partial }: { data: Record<string, unknown>; partial?: 
             <span className={cn("w-5 text-center text-xs", i === 0 ? "text-accent font-semibold" : "text-faint")}>
               {i + 1}
             </span>
-            <span className="min-w-0 flex-1 truncate text-[13px] text-fg">{asStr(r.id)}</span>
+            <span className="min-w-0 flex-1 truncate text-body text-fg">{asStr(r.id)}</span>
             {typeof r.rating === "number" && <Chip>Elo {Math.round(r.rating)}</Chip>}
             {(r.wins != null || r.losses != null) && (
-              <span className="text-[11px] text-faint">
+              <span className="text-caption text-faint">
                 {r.wins ?? 0}胜 {r.losses ?? 0}负 {r.draws ?? 0}平
               </span>
             )}
@@ -802,7 +802,7 @@ function MarketItems({ items }: { items: MarketItem[] }) {
         {items.slice(0, shown).map((it, i) => (
           <li key={it.slug || `${i}`} className="py-2.5 first:pt-0 last:pb-0">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="text-[13px] font-medium text-fg">{asStr(it.name) || asStr(it.slug)}</span>
+              <span className="text-body font-medium text-fg">{asStr(it.name) || asStr(it.slug)}</span>
               {it.kind && <Chip>{it.kind === "agent" ? "智能体" : it.kind === "plugin" ? "插件" : "技能"}</Chip>}
               {it.version && <Chip>v{asStr(it.version)}</Chip>}
             </div>
@@ -1001,7 +1001,7 @@ function OcWebExtractCard({ tool }: { tool: ToolLike }): ReactNode | null {
     return (
       <CardShell icon={<AlertTriangle className="size-4" />} title="网页提取受阻">
         <div className="rounded-lg bg-warning-soft px-3 py-2.5">
-          <div className="text-[13px] font-medium text-warning">站点阻止了自动内容提取</div>
+          <div className="text-body font-medium text-warning">站点阻止了自动内容提取</div>
           <div className="mt-1 text-xs leading-relaxed text-muted">
             {reason?.toLowerCase().includes("cloudflare")
               ? "该页面启用了 Cloudflare 访问保护，可改用浏览器方式打开并读取页面。"
@@ -1027,7 +1027,7 @@ function OcWebExtractCard({ tool }: { tool: ToolLike }): ReactNode | null {
       )}
       {body.length > summary.length && (
         <details className="mt-2">
-          <summary className="cursor-pointer rounded text-[11.5px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看抽取全文</summary>
+          <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看抽取全文</summary>
           <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
             {body}
           </pre>
@@ -1183,7 +1183,7 @@ function FriendlyObjectPreview({ value }: { value: Record<string, unknown> }) {
       <dl className="grid gap-2 sm:grid-cols-2">
         {rows.map(([key, item]) => (
           <div key={key} className="min-w-0 rounded-lg bg-hover/70 px-3 py-2">
-            <dt className="text-[11px] font-medium text-faint">{key.replaceAll("_", " ")}</dt>
+            <dt className="text-caption font-medium text-faint">{key.replaceAll("_", " ")}</dt>
             <dd className="mt-0.5 break-words text-[12.5px] leading-relaxed text-fg">
               {typeof item === "string"
                 ? firstParagraph(item)
@@ -1222,7 +1222,7 @@ function OutputDetails({ text, label }: { text: string | null; label: string }) 
   if (!clean) return null;
   return (
     <details className="mt-2">
-      <summary className="cursor-pointer rounded text-[11.5px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">
+      <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">
         {label}
       </summary>
       <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">

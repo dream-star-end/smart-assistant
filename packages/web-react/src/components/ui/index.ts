@@ -15,6 +15,7 @@ export { Avatar, avatarVariants, type AvatarProps } from "./Avatar";
 export { Badge, badgeVariants } from "./Badge";
 export { Button, buttonVariants, type ButtonProps } from "./Button";
 export { Card, CardRow, cardVariants, type CardProps, type CardRowProps } from "./Card";
+export { Chip, chipVariants, type ChipProps } from "./Chip";
 export { useConfirm, usePrompt, type ConfirmChoice } from "./ConfirmDialog";
 export { CopyChip } from "./CopyChip";
 export { DescriptionList, DescriptionRow } from "./DescriptionList";
@@ -47,6 +48,11 @@ export { Popover, PopoverContent, PopoverTrigger } from "./Popover";
 export { Progress, type ProgressProps } from "./Progress";
 export { Select, type SelectOption, type SelectProps } from "./Select";
 export { ProjectScopeSelect } from "./ProjectScopeSelect";
+export {
+  SegmentedControl,
+  type SegmentedControlProps,
+  type SegmentedOption,
+} from "./SegmentedControl";
 export { Sheet } from "./Sheet";
 export { Skeleton } from "./Skeleton";
 export { Spinner } from "./Spinner";

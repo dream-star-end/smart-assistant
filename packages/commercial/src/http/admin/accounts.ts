@@ -50,7 +50,7 @@ import {
   OAuthExchangeError,
   type OAuthProvider,
 } from "../../admin/oauth.js";
-import { AccountNotFoundError, getCursorTokenSnapshot, type AccountRow } from "../../account-pool/store.js";
+import { AccountNotFoundError, type AccountRow } from "../../account-pool/store.js";
 import { getEgressProxy } from "../../admin/egressProxies.js";
 import {
   cancelGrokDeviceAuth,
@@ -63,11 +63,10 @@ import {
   startCursorSessionAuth,
 } from "../../admin/cursorSessionAuth.js";
 import {
-  CursorUsageUnavailableError,
-  fetchCursorSessionUsage,
   getCachedCursorUsage,
-  setCachedCursorUsage,
+  type CursorUsageSnapshot,
 } from "../../admin/cursorSessionUsage.js";
+import { refreshCursorAccountUsage } from "../../account-pool/cursorUsageSweeper.js";
 import {
   listRefreshEvents,
   MAX_LIST_LIMIT as REFRESH_EVENTS_MAX_LIMIT,
@@ -127,6 +126,15 @@ function serializeAccount(
     /** 0257 — Sand 凭证形态:api_key(crsr_ 换 token)| session(账号登录会话)。 */
     cursor_credential_kind: a.provider === "cursor" ? a.cursor_credential_kind : null,
     cursor_auth_id: a.provider === "cursor" ? a.cursor_auth_id : null,
+    /** 0262 — Sand / Grok Bot 池用量(cursorUsageSweeper 每小时刷新;仅 session 行有值)。 */
+    cursor_sand_usage_pct: a.provider === "cursor" ? a.cursor_sand_usage_pct : null,
+    cursor_sand_period_start: a.provider === "cursor" ? (a.cursor_sand_period_start?.toISOString() ?? null) : null,
+    cursor_sand_next_reset_at: a.provider === "cursor" ? (a.cursor_sand_next_reset_at?.toISOString() ?? null) : null,
+    cursor_sand_access_state: a.provider === "cursor" ? a.cursor_sand_access_state : null,
+    cursor_plan_membership: a.provider === "cursor" ? a.cursor_plan_membership : null,
+    cursor_billing_cycle_end: a.provider === "cursor" ? (a.cursor_billing_cycle_end?.toISOString() ?? null) : null,
+    cursor_usage_updated_at: a.provider === "cursor" ? (a.cursor_usage_updated_at?.toISOString() ?? null) : null,
+    cursor_usage_error: a.provider === "cursor" ? a.cursor_usage_error : null,
     created_at: a.created_at.toISOString(),
     updated_at: a.updated_at.toISOString(),
   };
@@ -318,40 +326,44 @@ async function handleAccountCursorUsage(
       sendJson(res, 200, { usage: cached, cached: true });
       return;
     }
+    // 0262 — the hourly sweeper persists the last good snapshot; serve it
+    // when the 60s cache is cold so the modal opens without a cursor.com
+    // round trip. `refresh=1` still forces a live fetch.
+    const stored = await loadStoredCursorUsage(id);
+    if (stored) {
+      sendJson(res, 200, { usage: stored, cached: true, stored: true });
+      return;
+    }
   }
-  const snap = await getCursorTokenSnapshot(id);
-  if (!snap) throw new HttpError(404, "NOT_FOUND", "account not found");
-  if (snap.expires_at && snap.expires_at.getTime() <= Date.now()) {
-    snap.token.fill(0);
-    snap.refresh?.fill(0);
+  // Shared with cursorUsageSweeper: fetch + persist columns/snapshot +
+  // warm the cache + nudge the materializer when weight inputs moved.
+  const result = await refreshCursorAccountUsage(a);
+  if (result.ok) {
+    sendJson(res, 200, { usage: result.snapshot, cached: false });
+    return;
+  }
+  if (result.skipped === "expired") {
     throw new HttpError(409, "CONFLICT", "cursor session expired; log in again");
   }
-  let accessToken: string | null = snap.token.toString("utf8");
-  snap.token.fill(0);
-  snap.refresh?.fill(0);
-  try {
-    const usage = await fetchCursorSessionUsage({
-      accessToken,
-      authId: a.cursor_auth_id,
-      machineId: snap.machine_id,
+  if (result.skipped === "missing") throw new HttpError(404, "NOT_FOUND", "account not found");
+  if (result.reason.startsWith("session_rejected")) {
+    throw new HttpError(409, "CONFLICT", "Cursor rejected the account session; log in again", {
+      issues: [{ path: "session", message: result.reason }],
     });
-    accessToken = null;
-    setCachedCursorUsage(id, usage);
-    sendJson(res, 200, { usage, cached: false });
-  } catch (err) {
-    accessToken = null;
-    if (err instanceof CursorUsageUnavailableError) {
-      throw new HttpError(
-        err.code === "session_rejected" ? 409 : 502,
-        err.code === "session_rejected" ? "CONFLICT" : "UPSTREAM",
-        err.code === "session_rejected"
-          ? "Cursor rejected the account session; log in again"
-          : "Cursor usage endpoints unavailable",
-        { issues: Object.entries(err.details).map(([path, message]) => ({ path, message })) },
-      );
-    }
-    throw err;
   }
+  throw new HttpError(502, "UPSTREAM", "Cursor usage endpoints unavailable", {
+    issues: [{ path: "upstream", message: result.reason }],
+  });
+}
+
+async function loadStoredCursorUsage(id: string): Promise<CursorUsageSnapshot | null> {
+  const r = await getPool().query<{ snap: unknown }>(
+    `SELECT cursor_usage_snapshot AS snap FROM claude_accounts WHERE id = $1 AND cursor_usage_snapshot IS NOT NULL`,
+    [id],
+  );
+  const snap = r.rows[0]?.snap;
+  if (!snap || typeof snap !== "object") return null;
+  return snap as CursorUsageSnapshot;
 }
 
 /**

@@ -119,7 +119,7 @@ const USAGE = [
   '  oc-memory archival-delete <id>',
   '  oc-memory delegate-wait <jobId> [<jobId>...]',
   '  oc-memory delegate --goal "<text>" [--agent-id ID] [--model SLUG] [--context "..."] [--effort low|medium|high] [--toolsets a,b] [--resume-session-key KEY] [--allow-self]',
-  '  oc-memory request-review --draft "<text>" [--revision-note "..."] [--resume-session-key KEY]',
+  '  oc-memory request-review --draft "<text>" [--mode execution|deliberation] [--revision-note "..."] [--resume-session-key KEY]',
 ].join('\n')
 
 /**
@@ -224,7 +224,12 @@ async function main(): Promise<void> {
     if (cmd === 'request-review') {
       const draft = flags.draft || positional[0]
       if (!draft) fail('request-review requires --draft "<完整答复草稿>"')
-      args = requestReviewArgs(draft, flags['revision-note'], flags['resume-session-key'])
+      args = requestReviewArgs(
+        draft,
+        flags['revision-note'],
+        flags['resume-session-key'],
+        flags.mode,
+      )
     } else {
       if (!goal) fail('delegate requires --goal "<text>" (or a positional goal)')
       const agentNorm = normalizeDelegateAgentId(flags['agent-id'] || flags.agentId)

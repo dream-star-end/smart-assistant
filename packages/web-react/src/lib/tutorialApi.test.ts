@@ -1,5 +1,6 @@
 import { afterEach, expect, test, vi } from "vitest";
 import { api } from "./api";
+import { adminApi } from "./api/admin";
 import { createMemoryAuthSession } from "./authSession";
 
 afterEach(() => {
@@ -76,8 +77,8 @@ test("admin tutorial evals specs/jobs/compass/record use /api/admin/tutorials pr
   });
   vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
   const a = session();
-  await api.listTutorialEvalSpecs(a);
-  await api.createTutorialEvalSpec(a, {
+  await adminApi.listTutorialEvalSpecs(a);
+  await adminApi.createTutorialEvalSpec(a, {
     publicId: "ext-1",
     title: "外部案例登记标题足够长",
     sourcePlatform: "external",
@@ -87,10 +88,10 @@ test("admin tutorial evals specs/jobs/compass/record use /api/admin/tutorials pr
     frozenMaterials: { items: [{ name: "public.zip" }] },
     rubric: { pass: true },
   });
-  await api.listTutorialEvalJobs(a);
-  await api.enqueueTutorialEvalJob(a, "spec-1", { evalUserId: "247" });
-  await api.listTutorialEvalCompass(a);
-  await api.recordTutorialEvalResult(a, { jobId: "job-1", result: "failed" });
+  await adminApi.listTutorialEvalJobs(a);
+  await adminApi.enqueueTutorialEvalJob(a, "spec-1", { evalUserId: "247" });
+  await adminApi.listTutorialEvalCompass(a);
+  await adminApi.recordTutorialEvalResult(a, { jobId: "job-1", result: "failed" });
   const urls = fetchMock.mock.calls.map((call) => String(call[0]));
   expect(urls).toEqual([
     "/api/admin/tutorials/case-specs",

@@ -146,7 +146,7 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
 
   return (
     <div
-      className={cn("flex items-center gap-2 py-1 text-[13px]", retry ? "text-warning" : "text-muted", cls)}
+      className={cn("flex items-center gap-2 py-1 text-body", retry ? "text-warning" : "text-muted", cls)}
       aria-label="生成中"
       aria-live="polite"
     >

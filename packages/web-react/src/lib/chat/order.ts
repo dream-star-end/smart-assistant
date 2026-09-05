@@ -22,8 +22,10 @@ function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-function isLocalProcessRow(message: ChatMessage): boolean {
-  return PROCESS_ROLES.has(message.role) && message._source !== "server";
+function isLocalProcessRow(message: ChatMessage, nowMs: number): boolean {
+  return PROCESS_ROLES.has(message.role) &&
+    message._source !== "server" &&
+    !isOpenPermissionPrompt(message, nowMs);
 }
 
 function isTurnTerminalCandidate(message: ChatMessage): boolean {
@@ -76,6 +78,57 @@ function isLaterTerminal(candidate: TerminalCandidate, current: TerminalCandidat
 }
 
 /**
+ * A prompt the engine is still blocked on. Restricted to cards the reducer
+ * materialised from `outbound.permission_request` (`_resolved === false`);
+ * legacy rows without the flag keep the classic process-card rules.
+ */
+function isOpenPermissionPrompt(message: ChatMessage, nowMs: number): boolean {
+  if (message.role !== "permission" || message._resolved !== false) return false;
+  if (message._source === "server") return false;
+  const expiresAt = (message as ChatMessage & { _askUserExpiresAt?: unknown })._askUserExpiresAt;
+  if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt <= nowMs) return false;
+  return true;
+}
+
+/**
+ * An open prompt is the last thing the runtime did in its turn: the engine is
+ * blocked on it, so no later row of that turn can exist yet. It must therefore
+ * never be treated as a mid-turn process card. Two things used to bury it:
+ *  - `repairPostFinalProcessOrder` moved it in front of the latest assistant
+ *    row with a body, but CCB narrates mid-turn ("我先看一下…") — after a
+ *    reconnect rebuild the ExitPlanMode card ended up above ~45 minutes of
+ *    tool rows, far from the tail the paint window and auto-open follow;
+ *  - owner resets keep the card but drop its neighbours, and the journal /
+ *    live-unit replay then appends below it.
+ * Sink every open prompt to the end of its owner turn (just before the next
+ * user row, or the end of the transcript), preserving relative order of
+ * multiple prompts. Pure and idempotent; returns the original array when
+ * nothing moves. INC-20260904-EXITPLAN-PROMPT-BURIED
+ */
+export function sinkOpenPermissionPrompts(
+  messages: ChatMessage[],
+  nowMs: number = Date.now(),
+): ChatMessage[] {
+  if (messages.length < 2) return messages;
+  const out: ChatMessage[] = [];
+  let carried: ChatMessage[] = [];
+  for (const m of messages) {
+    if (m?.role === "user") {
+      if (carried.length > 0) { out.push(...carried); carried = []; }
+      out.push(m);
+      continue;
+    }
+    if (m && isOpenPermissionPrompt(m, nowMs)) {
+      carried.push(m);
+      continue;
+    }
+    out.push(m);
+  }
+  if (carried.length > 0) out.push(...carried);
+  return out.every((m, index) => m === messages[index]) ? messages : out;
+}
+
+/**
  * Restore the invariant that local process cards owned by a turn cannot sit
  * after that turn's terminal assistant row.
  *
@@ -90,12 +143,22 @@ function isLaterTerminal(candidate: TerminalCandidate, current: TerminalCandidat
  * cards stay in place.  The selected terminal uses durable order axes
  * (`_orderSeq`, `_turnTapeOrdinal`, original index), never `ts`.
  *
+ * Open (unresolved, unexpired) engine prompts are not process cards: they are
+ * the blocking tail of their turn and are sunk there afterwards by
+ * `sinkOpenPermissionPrompts`.
+ *
  * This function is pure and idempotent.  It returns the original array when
  * neither metadata nor order needs repair, preserving zero-copy fast paths.
  */
-export function repairPostFinalProcessOrder(messages: ChatMessage[]): ChatMessage[] {
+export function repairPostFinalProcessOrder(
+  messages: ChatMessage[],
+  nowMs: number = Date.now(),
+): ChatMessage[] {
   if (messages.length === 0) return messages;
+  return sinkOpenPermissionPrompts(repairProcessCardsBeforeTerminal(messages, nowMs), nowMs);
+}
 
+function repairProcessCardsBeforeTerminal(messages: ChatMessage[], nowMs: number): ChatMessage[] {
   const userIds = new Set<string>();
   for (const message of messages) {
     if (message?.role === "user" && nonEmptyString(message.id)) userIds.add(message.id);
@@ -126,7 +189,7 @@ export function repairPostFinalProcessOrder(messages: ChatMessage[]): ChatMessag
   const ownerByProcess = new Map<ChatMessage, string>();
   for (let index = 0; index < messages.length; index++) {
     const message = messages[index];
-    if (!message || !isLocalProcessRow(message)) continue;
+    if (!message || !isLocalProcessRow(message, nowMs)) continue;
     const explicitOwner = nonEmptyString(message._turnOwnerId)
       ? message._turnOwnerId
       : undefined;

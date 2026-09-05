@@ -173,12 +173,12 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
       </div>
 
       {loading ? (
-        <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
+        <div className="flex items-center justify-center gap-2 py-16 text-body text-faint">
           <Spinner /> 加载报表…
         </div>
       ) : err ? (
         <div className="px-5 py-4">
-          <Alert tone="danger" className="text-[12.5px]">
+          <Alert tone="danger" className="text-meta">
             {err}
           </Alert>
           <Button
@@ -202,11 +202,11 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
 
           {/* token 构成堆叠条 */}
           <div className="border-t border-border px-5 py-4">
-            <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+            <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
               Token 构成
             </div>
             {tokenTotal === "0" ? (
-              <p className="py-2 text-[12.5px] text-faint">该时段暂无用量数据。</p>
+              <p className="py-2 text-meta text-faint">该时段暂无用量数据。</p>
             ) : (
               <>
                 <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-hover">
@@ -225,7 +225,7 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
                 </div>
                 <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1">
                   {TOKEN_PARTS.map((p) => (
-                    <div key={p.key} className="flex items-center gap-1.5 text-[12px]">
+                    <div key={p.key} className="flex items-center gap-1.5 text-meta">
                       <span className={cn("size-2 rounded-full", p.color)} />
                       <span className="text-muted">{p.label}</span>
                       <span className="ml-auto tabular-nums text-fg">
@@ -259,7 +259,7 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
               {trendHasData ? (
                 <canvas ref={trendRef} />
               ) : (
-                <div className="flex h-full items-center justify-center text-[12.5px] text-faint">
+                <div className="flex h-full items-center justify-center text-meta text-faint">
                   该时段暂无趋势数据。
                 </div>
               )}
@@ -301,7 +301,7 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
 function Stat({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
   return (
     <div className="rounded-xl border border-border bg-surface px-3 py-2.5">
-      <div className="text-[11px] text-faint">{label}</div>
+      <div className="text-caption text-faint">{label}</div>
       <div
         className={cn(
           "mt-0.5 text-[16px] font-semibold tabular-nums",
@@ -334,21 +334,21 @@ function UsageTable({
 }) {
   return (
     <div className="border-t border-border px-5 py-4">
-      <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">{title}</div>
+      <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">{title}</div>
       {rows.length === 0 ? (
-        <p className="py-2 text-[12.5px] text-faint">{emptyText}</p>
+        <p className="py-2 text-meta text-faint">{emptyText}</p>
       ) : (
         <>
-          <p className="pb-1.5 text-[11px] text-faint sm:hidden">表格可左右滑动查看更多</p>
+          <p className="pb-1.5 text-caption text-faint sm:hidden">表格可左右滑动查看更多</p>
           <section
             aria-label={`${title}用量表，可横向滚动`}
             // biome-ignore lint/a11y/noNoninteractiveTabindex: 横向滚动区必须可由键盘聚焦和滚动。
             tabIndex={0}
             className="overflow-x-auto rounded outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
-            <table className="w-full min-w-[26rem] text-[12.5px]">
+            <table className="w-full min-w-[26rem] text-meta">
               <thead>
-                <tr className="text-left text-[11px] text-faint">
+                <tr className="text-left text-caption text-faint">
                   <th className="pb-1.5 font-medium">名称</th>
                   <th className="pb-1.5 text-right font-medium">请求</th>
                   <th className="pb-1.5 text-right font-medium">Token</th>
@@ -360,7 +360,7 @@ function UsageTable({
                   <tr key={r.key} className="border-t border-border/60">
                     <td className="max-w-[12rem] py-1.5 pr-2">
                       <span className="block truncate text-fg">{r.name}</span>
-                      {r.sub && <span className="block truncate text-[11px] text-faint">{r.sub}</span>}
+                      {r.sub && <span className="block truncate text-caption text-faint">{r.sub}</span>}
                     </td>
                     <td className="py-1.5 text-right tabular-nums text-muted">
                       {groupDigits(r.requests)}

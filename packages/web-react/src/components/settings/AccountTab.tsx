@@ -216,26 +216,26 @@ export function AccountTab({
       {/* 我的组织(只读展示;管理功能在组织中心,仅 owner/admin 有入口) */}
       {org && (
         <div className="border-b border-border px-5 py-4">
-          <div className="flex items-center gap-1.5 text-[12px] text-faint">
+          <div className="flex items-center gap-1.5 text-meta text-faint">
             <Building2 size={13} /> 我的组织
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-2">
             <span className="text-[16px] font-semibold text-fg">{org.name}</span>
-            <span className="rounded-full bg-hover px-2 py-0.5 text-[11px] font-medium text-muted">
+            <span className="rounded-full bg-hover px-2 py-0.5 text-caption font-medium text-muted">
               {orgRoleLabel}
             </span>
             {org.billing_delegate && (
-              <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[11px] font-medium text-accent">
+              <span className="rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent">
                 财务委派
               </span>
             )}
           </div>
           {org.status === "suspended" ? (
-            <Alert tone="warning" className="mt-2 text-[12.5px]">
+            <Alert tone="warning" className="mt-2 text-meta">
               该组织已被暂停,组织钱包与共享技能暂不可用。
             </Alert>
           ) : (
-            <p className="mt-1 text-[12px] text-faint">
+            <p className="mt-1 text-meta text-faint">
               {org.billing_enabled
                 ? "你的对话用量可由组织钱包统一结算。"
                 : "该组织未对你开启统一结算,用量按个人账户计费。"}
@@ -247,10 +247,10 @@ export function AccountTab({
       {/* 无 org:自助开通入口(Claude/GPT 式)。 */}
       {!org && (
         <div className="border-b border-border px-5 py-4">
-          <div className="flex items-center gap-1.5 text-[12px] text-faint">
+          <div className="flex items-center gap-1.5 text-meta text-faint">
             <Building2 size={13} /> 组织
           </div>
-          <p className="mt-1 text-[13px] text-muted">
+          <p className="mt-1 text-body text-muted">
             创建组织，按席位订阅企业套餐，团队共享积分池、技能与统一发票。
           </p>
           <div className="mt-3">
@@ -265,18 +265,18 @@ export function AccountTab({
       <div className="border-b border-border px-5 py-4">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
-            <div className="flex items-center gap-1.5 text-[12px] text-faint">
+            <div className="flex items-center gap-1.5 text-meta text-faint">
               <Crown size={13} /> 当前套餐
             </div>
             <div className="mt-1 flex items-center gap-2">
               <span className="text-[18px] font-semibold text-fg">{sub?.planName ?? "—"}</span>
               {sub?.paid && (
-                <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[11px] font-medium text-accent">
+                <span className="rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent">
                   到期 {fmtDate(sub.periodEnd)}
                 </span>
               )}
             </div>
-            <div className="mt-1 text-[12px] text-faint">
+            <div className="mt-1 text-meta text-faint">
               每月 {sub ? formatCredits(sub.monthlyCredits) : "—"} 积分
               {sub ? ` · 本期剩余 ${formatCredits(sub.periodCredits)}` : ""}
             </div>
@@ -288,7 +288,7 @@ export function AccountTab({
       </div>
 
       <div className="px-5 py-4">
-        <div className="flex items-center gap-1.5 text-[12px] text-faint">
+        <div className="flex items-center gap-1.5 text-meta text-faint">
           <Wallet size={13} /> {user?.displayName || "账户"} · 总可用余额
         </div>
         <div
@@ -298,17 +298,17 @@ export function AccountTab({
           )}
         >
           {credits != null ? formatCredits(credits) : "—"}
-          <span className="text-[14px] font-normal text-faint">积分</span>
+          <span className="text-title font-normal text-faint">积分</span>
         </div>
         {sub && (
-          <div className="mt-1 text-[12px] text-faint">
+          <div className="mt-1 text-meta text-faint">
             套餐期内 {formatCredits(sub.balance.period)} + 钱包 {formatCredits(sub.balance.wallet)}
           </div>
         )}
         {/* 本期套餐积分进度（仅订阅有月度额度时显示） */}
         {sub && showQuota && (
           <div className="mt-3">
-            <div className="flex items-center justify-between pb-1.5 text-[12px]">
+            <div className="flex items-center justify-between pb-1.5 text-meta">
               <span className="text-muted">本期套餐积分</span>
               <span className="tabular-nums text-fg">
                 本期剩余 {formatCredits(sub.balance.period)} / {formatCredits(sub.monthlyCredits)}
@@ -318,7 +318,7 @@ export function AccountTab({
           </div>
         )}
         {low && (
-          <Alert tone="danger" className="mt-2 text-[12.5px]">
+          <Alert tone="danger" className="mt-2 text-meta">
             {insufficientCreditsCopy(sub?.paid === true).message}
           </Alert>
         )}
@@ -344,7 +344,7 @@ export function AccountTab({
             <Plus size={15} /> {sub?.paid ? "购买加量包" : "加量包"}
           </Button>
         </div>
-        <p className="mt-2 text-[12px] text-faint">
+        <p className="mt-2 text-meta text-faint">
           按实际用量计量扣费，扣费优先消耗套餐期内积分。加量包仅在当前套餐有效期内可用；
           存量钱包余额永久有效、扣完期内桶后继续使用。
         </p>
@@ -371,13 +371,13 @@ export function AccountTab({
           </div>
         ) : reportErr ? (
           <>
-            <Alert tone="danger" className="text-[12.5px]">
+            <Alert tone="danger" className="text-meta">
               {reportErr}
             </Alert>
             <button
               type="button"
               onClick={() => setReportReloadTick((t) => t + 1)}
-              className="mt-2 text-[13px] text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+              className="mt-2 text-body text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
             >
               重试
             </button>
@@ -402,7 +402,7 @@ export function AccountTab({
               {trendHasData ? (
                 <canvas ref={flowRef} />
               ) : (
-                <div className="flex h-full items-center justify-center text-[12.5px] text-faint">
+                <div className="flex h-full items-center justify-center text-meta text-faint">
                   该时段暂无收支记录。
                 </div>
               )}
@@ -424,7 +424,7 @@ export function AccountTab({
               {reasonHasData ? (
                 <canvas ref={reasonRef} />
               ) : (
-                <div className="flex h-full items-center justify-center text-[12.5px] text-faint">
+                <div className="flex h-full items-center justify-center text-meta text-faint">
                   该时段暂无支出。
                 </div>
               )}
@@ -439,7 +439,7 @@ export function AccountTab({
         </div>
         {err && (
           <div className="mb-2">
-            <Alert tone="danger" className="text-[12.5px]">
+            <Alert tone="danger" className="text-meta">
               {err}
             </Alert>
             <Button
@@ -454,11 +454,11 @@ export function AccountTab({
           </div>
         )}
         {loading ? (
-          <div className="flex items-center justify-center gap-2 py-8 text-[13px] text-faint">
+          <div className="flex items-center justify-center gap-2 py-8 text-body text-faint">
             <Spinner /> 加载中…
           </div>
         ) : err && rows.length === 0 ? null : rows.length === 0 ? (
-          <p className="py-6 text-center text-[13px] text-faint">暂无账单记录</p>
+          <p className="py-6 text-center text-body text-faint">暂无账单记录</p>
         ) : (
           <>
             <ul className="flex flex-col gap-0.5">
@@ -470,7 +470,7 @@ export function AccountTab({
                     className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-hover"
                   >
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate text-[13.5px] text-fg">
+                      <span className="block truncate text-section text-fg">
                         {ledgerReasonLabel(r.reason)}
                         {r.memo ? <span className="text-faint"> · {r.memo}</span> : null}
                       </span>

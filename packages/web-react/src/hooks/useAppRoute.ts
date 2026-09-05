@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { type ProductFeatureId, isProductFeatureId } from '../lib/productCapabilities'
 import { TICKET_TYPES, type TicketType } from '../lib/taskboard'
-import { type TutorialCaseId, parseTutorialCaseId } from '../lib/tutorialCaseCatalog'
+import { type TutorialCaseId, parseTutorialCaseId } from '../lib/tutorialCaseId'
 import type { Session } from '../lib/types'
 
 /**

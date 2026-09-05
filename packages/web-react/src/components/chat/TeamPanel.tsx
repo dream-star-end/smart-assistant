@@ -87,8 +87,8 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
           )}
         </span>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-[12.5px] font-medium text-fg">{name}</span>
-          {goal && <span className="block truncate text-[11.5px] text-faint">{goal}</span>}
+          <span className="block truncate text-meta font-medium text-fg">{name}</span>
+          {goal && <span className="block truncate text-caption text-faint">{goal}</span>}
         </span>
         <span className="flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1">
           {running ? (
@@ -103,7 +103,7 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
           )}
           {verdict && <Badge tone={verdict.tone}>{verdict.label}</Badge>}
           <TokenUsageBadge usage={tokenUsage} label="子 Agent" />
-          {cost && <span className="text-[11px] font-medium text-faint">{groupDigits(cost)} 积分</span>}
+          {cost && <span className="text-caption font-medium text-faint">{groupDigits(cost)} 积分</span>}
           <ChevronRight size={14} className={cn("text-faint transition-transform", open && "rotate-90")} />
         </span>
       </button>
@@ -111,7 +111,7 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
       {open && (
         <div className="border-t border-border/70">
           {children.length === 0 && running && (
-            <div className="flex items-center gap-2 px-3 py-2.5 text-[12px] text-faint">
+            <div className="flex items-center gap-2 px-3 py-2.5 text-meta text-faint">
               <Spinner size={11} /> 启动中…
             </div>
           )}
@@ -131,7 +131,7 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
       )}
 
       {!open && !running && typeof msg._resultPreview === "string" && msg._resultPreview && (
-        <div className="flex items-start gap-1.5 border-t border-border/70 px-3 py-1.5 text-[12px] text-muted">
+        <div className="flex items-start gap-1.5 border-t border-border/70 px-3 py-1.5 text-meta text-muted">
           <Check size={12} className="mt-0.5 shrink-0 text-success" />
           <span className="line-clamp-1">
             {msg._resultPreview.slice(0, 500)}{msg._resultPreview.length > 500 ? "…" : ""}
@@ -185,10 +185,10 @@ export const TeamPanel = memo(
           <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-grad-cta text-white">
             <Users size={13} />
           </span>
-          <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-fg">
+          <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">
             团队协作 · {total} 个智能体
           </span>
-          <span className="flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1 text-[11.5px]">
+          <span className="flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1 text-caption">
             {running > 0 && (
               <span className="flex items-center gap-1 text-accent">
                 <Spinner size={10} /> {running} 运行中

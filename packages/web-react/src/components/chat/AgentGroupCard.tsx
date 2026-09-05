@@ -36,7 +36,7 @@ export function ProgressivePlainText({ text, className }: { text: string; classN
         <button
           type="button"
           onClick={() => setVisibleChars((value) => value + RAW_CHILD_STEP)}
-          className="mt-2 rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted hover:text-fg"
+          className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
         >
           继续显示完整结果
         </button>
@@ -115,7 +115,7 @@ function RawChildEventView({ child }: { child: ChildBlock }) {
           {serialized !== "{}" && <ProgressiveChildRaw text={serialized} />}
           {bulk.map((field) => (
             <section key={field.name}>
-              <div className="mb-1 text-[11px] font-medium text-faint">{field.name}</div>
+              <div className="mb-1 text-caption font-medium text-faint">{field.name}</div>
               <ProgressiveChildRaw text={field.text} />
             </section>
           ))}
@@ -145,7 +145,7 @@ export const ChildBlockView = memo(
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + 64 * 1024)}
-              className="mt-1 rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted hover:text-fg"
+              className="mt-1 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
             >
               继续显示正文
             </button>
@@ -162,7 +162,7 @@ export const ChildBlockView = memo(
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + 64 * 1024)}
-              className="mt-2 block rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted hover:text-fg"
+              className="mt-2 block rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
             >
               继续显示思考内容
             </button>
@@ -214,7 +214,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
         <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
           {running ? <Spinner size={13} /> : <TerminalIcon tone={status.tone} size={13} />}
         </span>
-        <span className="min-w-0 truncate text-[13px] font-medium text-fg">{msg.text || "子任务"}</span>
+        <span className="min-w-0 truncate text-body font-medium text-fg">{msg.text || "子任务"}</span>
         <span className="ml-auto flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1">
           {running ? (
             <Badge tone="accent">运行中</Badge>
@@ -229,7 +229,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
           {verdict && <Badge tone={verdict.tone}>{verdict.label}</Badge>}
           <TokenUsageBadge usage={tokenUsage} label="子 Agent 合计" />
           {delegateCost && (
-            <span className="text-[11px] font-medium text-faint">{groupDigits(delegateCost)} 积分</span>
+            <span className="text-caption font-medium text-faint">{groupDigits(delegateCost)} 积分</span>
           )}
           <ChevronRight
             size={15}
@@ -241,7 +241,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
       {!collapsed && (
         <div className="border-t border-border">
           {children.length === 0 && running && (
-            <div className="flex items-center gap-2 px-3.5 py-2.5 text-[12.5px] text-faint">
+            <div className="flex items-center gap-2 px-3.5 py-2.5 text-meta text-faint">
               <Spinner size={12} /> 子智能体启动中…
             </div>
           )}
@@ -262,7 +262,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
 
       {/* 折叠态下展示结果摘要（完成后） */}
       {collapsed && !running && typeof msg._resultPreview === "string" && msg._resultPreview && (
-        <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
+        <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-meta text-muted">
           <Check size={13} className="mt-0.5 shrink-0 text-success" />
           <span className="line-clamp-2">
             {msg._resultPreview.slice(0, 500)}{msg._resultPreview.length > 500 ? "…" : ""}

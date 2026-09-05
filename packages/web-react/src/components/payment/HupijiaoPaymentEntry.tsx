@@ -117,13 +117,13 @@ export function HupijiaoPaymentEntry({
         </div>
       ) : null}
       {remaining != null ? (
-        <p className="text-[12.5px] text-faint" data-testid="payment-countdown">
+        <p className="text-meta text-faint" data-testid="payment-countdown">
           {expired
             ? "订单已过期，请重新下单"
             : `剩余有效时间 ${formatPaymentCountdown(remaining)} · 过期后请重新下单`}
         </p>
       ) : (
-        <p className="text-[12.5px] text-faint">过期后请重新下单</p>
+        <p className="text-meta text-faint">过期后请重新下单</p>
       )}
     </div>
   );
@@ -159,7 +159,7 @@ export function HupijiaoPaymentEntry({
     return (
       <div className="flex w-full flex-col items-center gap-2">
         {meta}
-        <Alert tone="warning" className="w-full text-[12.5px]" data-testid="wechat-payment-browser-hint">
+        <Alert tone="warning" className="w-full text-meta" data-testid="wechat-payment-browser-hint">
           当前支付通道不支持在微信内直接发起，请复制链接后在系统浏览器打开。
         </Alert>
         {expired ? (
@@ -175,7 +175,7 @@ export function HupijiaoPaymentEntry({
             >
               <Copy size={16} /> {copied ? "已复制" : "复制链接"}
             </Button>
-            <p className="text-center text-[12px] text-faint">
+            <p className="text-center text-meta text-faint">
               在系统浏览器打开后自动恢复本次订单
             </p>
           </>
@@ -199,7 +199,7 @@ export function HupijiaoPaymentEntry({
       return (
         <div className="flex w-full flex-col items-center gap-2">
           {meta}
-          <Alert tone="warning" className="w-full text-[12.5px]" data-testid="mobile-payment-unavailable">
+          <Alert tone="warning" className="w-full text-meta" data-testid="mobile-payment-unavailable">
             当前订单无法在手机端发起，请改用电脑或另一台设备扫码支付。
           </Alert>
         </div>
@@ -216,7 +216,7 @@ export function HupijiaoPaymentEntry({
         >
           <ExternalLink size={16} /> 前往微信支付
         </a>
-        <p className="text-center text-[12px] text-faint">将跳转至微信支付，完成后返回本页自动确认。</p>
+        <p className="text-center text-meta text-faint">将跳转至微信支付，完成后返回本页自动确认。</p>
       </div>
     );
   }
@@ -234,7 +234,7 @@ export function HupijiaoPaymentEntry({
           className="size-[200px] object-contain"
         />
       </div>
-      <div className="flex items-center gap-1.5 text-[12.5px] text-faint">
+      <div className="flex items-center gap-1.5 text-meta text-faint">
         <Spinner size={13} /> 请用微信扫码支付，到账后自动确认…
       </div>
     </>

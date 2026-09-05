@@ -108,8 +108,19 @@ function rehypeEmbedMedia() {
         }
         continue;
       }
-      // 代码块/已有链接不下钻。
-      if (child.type === "element" && (child.tagName === "pre" || child.tagName === "a")) continue;
+      // 已有链接不下钻。pre：仅当整块就是一条白名单路径时转 filecard（防模型套 ```）。
+      if (child.type === "element" && child.tagName === "a") continue;
+      if (child.type === "element" && child.tagName === "pre") {
+        const codeKids = (child.children || []).filter((k) => k.type === "element" && k.tagName === "code");
+        if (codeKids.length === 1) {
+          const text = hastText(codeKids[0]!).trim();
+          if (text && !/\s/.test(text)) {
+            const tag = classifyEmbed(text);
+            if (tag) kids[i] = embedEl(tag, text);
+          }
+        }
+        continue;
+      }
       // ② 纯文本:扫容器路径并切分插入媒体/文件元素。
       if (child.type === "text" && typeof child.value === "string") {
         const parts = splitText(child.value);
@@ -291,7 +302,7 @@ export default function MarkdownImpl({
                   title="在容器内安全预览"
                 >
                   {children}
-                  <span className="ml-1 inline-flex rounded-full bg-accent-soft px-1.5 py-0.5 align-middle text-[10px] font-medium text-accent">
+                  <span className="ml-1 inline-flex rounded-full bg-accent-soft px-1.5 py-0.5 align-middle text-micro font-medium text-accent">
                     容器预览
                   </span>
                 </a>

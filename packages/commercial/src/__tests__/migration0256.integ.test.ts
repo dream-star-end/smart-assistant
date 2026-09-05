@@ -133,7 +133,19 @@ describe('0256_cursor_picker_plan_gate_half_price', () => {
       )
     ).rows[0]!.count
     assert.equal(cursorBefore, '42')
-    assert.equal(uniqueProtocol.length, 42, 'protocol unique CURSOR_ENGINE_MODELS must match catalog')
+    // Later families (0259 Gemini 3.8 Flash, ...) grow the protocol registry
+    // past the 0256-era 42; every 0256-era catalog id must still be a
+    // protocol id, but the registry may be a superset.
+    const catalogBefore = (
+      await query<{ model_id: string }>(
+        `SELECT model_id FROM model_pricing WHERE model_id LIKE 'cursor-%'`,
+      )
+    ).rows.map((row) => row.model_id)
+    const protocolIds = new Set<string>(uniqueProtocol)
+    for (const id of catalogBefore) {
+      assert.ok(protocolIds.has(id), `catalog ${id} missing from protocol CURSOR_ENGINE_MODELS`)
+    }
+    assert.ok(uniqueProtocol.length >= 42, 'protocol unique CURSOR_ENGINE_MODELS must cover catalog')
 
     const beforeRows = (await query<PriceRow>(priceSelect(false))).rows
     const before = byId(beforeRows)

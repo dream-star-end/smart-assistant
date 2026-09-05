@@ -48,7 +48,7 @@ export function GatesRow({ manifest }: { manifest: EvidenceManifest }) {
         <span
           key={it.label}
           className={cn(
-            'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px]',
+            'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-caption',
             it.passed ? 'bg-success-soft text-success' : 'bg-danger-soft text-danger',
           )}
         >
@@ -131,7 +131,7 @@ function ClaimRow({
             <button
               type="button"
               onClick={() => setOpen((o) => !o)}
-              className="align-baseline text-[12px] text-accent hover:underline"
+              className="align-baseline text-meta text-accent hover:underline"
               title="查看出处"
             >
               [{nums.join(',')}]
@@ -160,12 +160,12 @@ function ClaimRow({
 
 function EvidenceItem({ quote, source }: { quote: QuoteHandle; source?: SourceRecord }) {
   return (
-    <div className="text-[12.5px]">
+    <div className="text-meta">
       <blockquote className="border-l-2 border-accent/40 pl-2 italic text-muted">
         “{quote.text}”
       </blockquote>
       {source && (
-        <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11.5px] text-faint">
+        <div className="mt-1 flex flex-wrap items-center gap-1.5 text-caption text-faint">
           <span className="text-muted">{source.title}</span>
           {source.authors.length > 0 && (
             <span>
@@ -223,7 +223,7 @@ export function LiteratureLibraryPanel({ sources }: { sources: SourceRecord[] })
     <div className="px-3.5 py-3">
       <div className="mb-2 flex items-center gap-2">
         <BookOpen size={13} className="text-muted" />
-        <span className="text-[12px] text-muted">{sources.length} 篇文献</span>
+        <span className="text-meta text-muted">{sources.length} 篇文献</span>
         <div className="ml-auto flex gap-1.5">
           <Button size="sm" variant="ghost" onClick={() => copy('gb-t-7714-2015')}>
             {copied === 'gb-t-7714-2015' ? <Check size={13} /> : <Copy size={13} />} GB/T7714
@@ -235,7 +235,7 @@ export function LiteratureLibraryPanel({ sources }: { sources: SourceRecord[] })
       </div>
       <ul className="divide-y divide-border">
         {sources.map((s) => (
-          <li key={s.id} className="py-1.5 text-[12.5px]">
+          <li key={s.id} className="py-1.5 text-meta">
             <div className="flex items-start gap-2">
               <span className="min-w-0 flex-1">
                 <span className="text-fg">{s.title}</span>
@@ -252,7 +252,7 @@ export function LiteratureLibraryPanel({ sources }: { sources: SourceRecord[] })
               </span>
               <span className="flex shrink-0 items-center gap-1">
                 {typeof s.citationCount === 'number' && (
-                  <span className="text-[11px] text-faint">被引 {s.citationCount}</span>
+                  <span className="text-caption text-faint">被引 {s.citationCount}</span>
                 )}
                 {s.oa?.isOA && <Badge tone="success">OA</Badge>}
                 {s.retracted === true && <Badge tone="danger">撤稿</Badge>}

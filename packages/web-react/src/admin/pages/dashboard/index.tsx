@@ -304,8 +304,8 @@ export default function DashboardPage() {
 
       {/* 运营至今累计 */}
       <div className="flex items-center justify-between">
-        <h2 className="text-[13px] font-semibold text-muted">运营至今</h2>
-        <span className="text-[12px] text-faint">
+        <h2 className="text-body font-semibold text-muted">运营至今</h2>
+        <span className="text-meta text-faint">
           {lifetime.data?.first_paid_at
             ? `自 ${lifetime.data.first_paid_at.slice(0, 10)} 首单`
             : lifetime.error
@@ -559,7 +559,7 @@ function PageHeaderRow({
         <p className="mt-1 text-[13px] leading-snug text-muted">{desc} · 30s 自动刷新</p>
       </div>
       <div className="flex shrink-0 flex-wrap items-center gap-2">
-        <span className="text-[12px] text-faint">活跃度窗口</span>
+        <span className="text-meta text-faint">活跃度窗口</span>
         <RangePreset options={DAU_OPTS} value={dauV} onChange={onDau} />
         <Button variant="secondary" size="sm" onClick={onRefresh} className="gap-1.5">
           <RefreshCw size={14} className={refreshing ? 'animate-spin' : undefined} />
@@ -682,12 +682,12 @@ function AlertsCard({
     >
       <div className="flex items-start justify-between gap-3 px-5 py-3.5">
         <div className="min-w-0">
-          <h3 className="text-[13px] font-semibold text-fg">告警摘要</h3>
-          <p className="mt-0.5 text-[11.5px] text-faint">
+          <h3 className="text-body font-semibold text-fg">告警摘要</h3>
+          <p className="mt-0.5 text-caption text-faint">
             触发中规则 / 近 24h 事件级别 / 近 7 日事件
           </p>
         </div>
-        <span className="shrink-0 text-[12px] font-medium text-accent">告警中心 →</span>
+        <span className="shrink-0 text-meta font-medium text-accent">告警中心 →</span>
       </div>
 
       {loading ? (
@@ -695,7 +695,7 @@ function AlertsCard({
           <div className="h-24 w-full animate-pulse rounded-lg bg-hover" />
         </div>
       ) : failed || !summary ? (
-        <div className="border-t border-border px-5 py-8 text-center text-[13px] text-danger">
+        <div className="border-t border-border px-5 py-8 text-center text-body text-danger">
           加载失败
         </div>
       ) : (
@@ -728,7 +728,7 @@ function AlertsCard({
           <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
             {/* 24h 级别分布 donut */}
             <div>
-              <p className="mb-1 text-[11.5px] text-faint">
+              <p className="mb-1 text-caption text-faint">
                 近 24h 事件 · 按级别（{fmtInt(sevTotal)} 起）
               </p>
               <div className="relative h-[132px] w-full">
@@ -737,19 +737,19 @@ function AlertsCard({
             </div>
             {/* 最近触发规则 */}
             <div>
-              <p className="mb-1 text-[11.5px] text-faint">最近触发规则</p>
+              <p className="mb-1 text-caption text-faint">最近触发规则</p>
               {recent.length === 0 ? (
-                <p className="py-6 text-center text-[12.5px] text-faint">近期无触发规则</p>
+                <p className="py-6 text-center text-meta text-faint">近期无触发规则</p>
               ) : (
                 <ul className="flex flex-col divide-y divide-border/60">
                   {recent.map((r) => (
                     <li key={r.rule_id} className="flex items-center justify-between gap-2 py-1.5">
                       <span className="flex min-w-0 items-center gap-1.5">
                         <LevelBadge level="critical" label="触发" />
-                        <code className="truncate text-[12px] text-fg">{r.rule_id}</code>
+                        <code className="truncate text-meta text-fg">{r.rule_id}</code>
                       </span>
                       {r.fired_at && (
-                        <TimeAgo value={r.fired_at} className="shrink-0 text-[11.5px] text-faint" />
+                        <TimeAgo value={r.fired_at} className="shrink-0 text-caption text-faint" />
                       )}
                     </li>
                   ))}
@@ -776,7 +776,7 @@ function MiniStat({
   }[tone]
   return (
     <div className="rounded-lg bg-hover px-3 py-2">
-      <p className="truncate text-[11px] text-faint">{label}</p>
+      <p className="truncate text-caption text-faint">{label}</p>
       <p className={`mt-0.5 text-[16px] font-semibold tabular-nums ${toneCls}`}>{value}</p>
     </div>
   )

@@ -3,7 +3,7 @@ import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
 import type { MessageReplyQuote } from "@openclaude/protocol";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { ArrowUp, FileText, Loader2, Mic, Paperclip, Pencil, Plus, RotateCcw, Square, Target, X } from "lucide-react";
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
@@ -70,7 +70,7 @@ function EnvironmentPrepBar() {
   }, []);
   return (
     <div className="px-4 pt-3" data-testid="composer-env-prep" role="status" aria-live="polite">
-      <div className="mb-1.5 text-[12px] text-muted">环境准备中，约 20 秒</div>
+      <div className="mb-1.5 text-meta text-muted">环境准备中，约 20 秒</div>
       <div className="h-1 overflow-hidden rounded-full bg-hover" aria-hidden>
         <div
           className="h-full rounded-full bg-accent transition-[width] duration-200"
@@ -87,6 +87,7 @@ export function Composer({
   stopping,
   onStop,
   disabled,
+  banner,
   placeholder = "给从简发消息…",
   onUpload,
   getVoiceToken,
@@ -107,6 +108,9 @@ export function Composer({
   stopping?: boolean;
   onStop?: () => void;
   disabled?: boolean;
+  /** 状态横幅插槽(渲染在输入框上方,Composer 根容器内)。移动端软键盘压缩视口时,
+   *  外部流式布局里的横幅会被顶出可视区;挪进 Composer 让它钉在输入框旁始终可见。 */
+  banner?: ReactNode;
   placeholder?: string;
   /** 上传单文件 → MediaRef（demo / 未登录省略 → 附件入口禁用）。 */
   onUpload?: (file: File) => Promise<MediaRef>;
@@ -321,6 +325,7 @@ export function Composer({
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4">
+      {banner}
       {visibleGoal && canGoal && (
         <button
           type="button"
@@ -328,7 +333,7 @@ export function Composer({
           aria-label={`会话目标：${visibleGoal.objective}`}
           title={visibleGoal.objective}
           onClick={() => setGoalOpen(true)}
-          className="mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-[12px] text-fg hover:bg-hover"
+          className="mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-meta text-fg hover:bg-hover"
         >
           <Target
             size={13}
@@ -348,7 +353,7 @@ export function Composer({
         {replyTo && (
           <div className="mx-3.5 mt-3 flex items-start gap-2 rounded-xl bg-hover px-3 py-2 text-left">
             <div className="min-w-0 flex-1 border-l-2 border-accent/60 pl-2.5">
-              <div className="mb-0.5 text-[11px] font-medium text-muted">
+              <div className="mb-0.5 text-caption font-medium text-muted">
                 正在引用 {replyTo.role === "assistant" ? "从简" : "你"}
               </div>
               <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5 text-fg/75">
@@ -412,6 +417,9 @@ export function Composer({
             multiple
             tabIndex={-1}
             className="sr-only"
+            // 菜单闭合时 htmlFor label 不在 DOM,可访问名退化为空;补 aria-label 供读屏。
+            // 结构红线(T4:type=file/无 accept/非 display:none/tabindex=-1)一项不动。
+            aria-label="选择附件文件"
             onChange={(e) => onFiles(Array.from(e.currentTarget.files ?? []))}
           />
           {/* 「+」选项菜单:聚合附件上传与「设定目标」入口(目标入口由会话头部迁入)。
@@ -656,7 +664,7 @@ export function AttachChip({
   return (
     <div
       className={cn(
-        "flex items-center gap-2 rounded-lg border bg-bg py-1.5 pr-1.5 text-[12.5px]",
+        "flex items-center gap-2 rounded-lg border bg-bg py-1.5 pr-1.5 text-meta",
         isImage ? "pl-1.5" : "pl-2.5",
         a.status === "error" ? "border-danger/40" : "border-border",
       )}
@@ -704,7 +712,7 @@ export function AttachChip({
           disabled={!onAnnotate}
           aria-label={`编辑图片 ${a.name}`}
           title={annotateDisabledReason ?? "编辑 · Image 2"}
-          className="flex h-8 min-h-11 shrink-0 items-center gap-1 rounded-md px-2 text-[12px] font-medium text-accent hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-35 sm:min-h-8"
+          className="flex h-8 min-h-11 shrink-0 items-center gap-1 rounded-md px-2 text-meta font-medium text-accent hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-35 sm:min-h-8"
         >
           <Pencil size={14} />
           编辑

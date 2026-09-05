@@ -1,7 +1,8 @@
 import { Compass, ListTodo, Plus } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useState } from "react";
 import { Alert, Badge, Button, Field, Input, Textarea } from "../../../components/ui";
-import { api, apiErrorMessage } from "../../../lib/api";
+import { apiErrorMessage } from "../../../lib/api";
+import { adminApi } from "../../../lib/api/admin";
 import type {
   TutorialEvalCompassItem,
   TutorialEvalJob,
@@ -48,9 +49,9 @@ export function TutorialEvalsPanel() {
     setError(null);
     try {
       const [specPage, jobPage, compassPage] = await Promise.all([
-        api.listTutorialEvalSpecs(adminSession),
-        api.listTutorialEvalJobs(adminSession),
-        api.listTutorialEvalCompass(adminSession),
+        adminApi.listTutorialEvalSpecs(adminSession),
+        adminApi.listTutorialEvalJobs(adminSession),
+        adminApi.listTutorialEvalCompass(adminSession),
       ]);
       setSpecs(specPage.specs);
       setJobs(jobPage.jobs);
@@ -80,7 +81,7 @@ export function TutorialEvalsPanel() {
     setBusy(true);
     setError(null);
     try {
-      await api.createTutorialEvalSpec(adminSession, {
+      await adminApi.createTutorialEvalSpec(adminSession, {
         publicId: publicId.trim(),
         title: title.trim(),
         sourcePlatform: sourcePlatform.trim(),
@@ -110,7 +111,7 @@ export function TutorialEvalsPanel() {
     setBusy(true);
     setError(null);
     try {
-      await api.enqueueTutorialEvalJob(adminSession, specId, { evalUserId: evalUserId.trim() });
+      await adminApi.enqueueTutorialEvalJob(adminSession, specId, { evalUserId: evalUserId.trim() });
       await refresh();
     } catch (cause) {
       setError(apiErrorMessage(cause, "排队评测失败"));

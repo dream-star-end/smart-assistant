@@ -16,6 +16,7 @@ import {
   type CursorCredentialSelection,
 } from './cursorCredentialSelection.js'
 import { createLogger } from '../logger.js'
+import { _shutdownOriginFrames } from '../subprocessRunner.js'
 
 const log = createLogger({ module: 'cursorSandAdapter' })
 const REQUEST_ID_RE = /^[0-9a-f]{32}$/
@@ -58,6 +59,7 @@ export class CursorSandAdapter extends CcbAdapter {
   private readonly relay: CursorSandRelay
   private readonly submitDelegate?: (params: TurnParams) => EngineTurnRun
   private readonly selection: CursorCredentialSelection
+  private readonly sessionKey: string
   private readonly recordResult: (result: 'ok' | 'fail') => void
   private activeCancel: (() => boolean) | null = null
   private activeFinalize: (() => void) | null = null
@@ -80,6 +82,7 @@ export class CursorSandAdapter extends CcbAdapter {
     super({ ...opts, providerEnvOverride: providerEnv, authorityEngine: 'cursor' })
     this.providerEnv = providerEnv
     this.selection = selection
+    this.sessionKey = opts.sessionKey
     this.relay = relay ?? new CursorSandRelay({
       credentialName: selection.keyName,
       poolGeneration: selection.poolGeneration,
@@ -219,9 +222,22 @@ export class CursorSandAdapter extends CcbAdapter {
             : status === 'error'
               ? 'ENGINE_ERROR'
               : undefined
-      if (!interrupted) {
+      // Only credential-class outcomes reach the wrapper's rotation state.
+      // `recordResult('fail')` writes a per-container cooldown that makes the
+      // sticky per-user selection skip this account for ten minutes — i.e.
+      // every session of this user hops to another Cursor account. Transient
+      // faults (Sand HTTP 5xx, aborted stream, CCB SIGKILL on service
+      // restart, tool errors) say nothing about the credential, so they must
+      // not scatter a user's sessions across accounts. Observed 2026-09-04:
+      // 185 ENGINE_ERROR vs 128 success in 36h, zero of them auth/quota.
+      const slotResult: 'ok' | 'fail' | null = status === 'success'
+        ? 'ok'
+        : status === 'unavailable'
+          ? 'fail'
+          : null
+      if (!interrupted && slotResult !== null) {
         try {
-          this.recordResult(status === 'success' ? 'ok' : 'fail')
+          this.recordResult(slotResult)
         } catch (error) {
           log.warn('cursor sand credential result recording threw', {
             slot: this.selection.slot,
@@ -243,10 +259,10 @@ export class CursorSandAdapter extends CcbAdapter {
             cache_creation_input_tokens: result.usage.cacheCreationTokens,
           },
         } : {}),
-        ...(!interrupted ? {
+        ...(!interrupted && slotResult !== null ? {
           cursorSlotResults: [{
             slot: this.selection.slot,
-            result: status === 'success' ? 'ok' as const : 'fail' as const,
+            result: slotResult,
           }],
         } : {}),
         ...(!interrupted && this.selection.accountId !== '0' ? {
@@ -335,6 +351,15 @@ export class CursorSandAdapter extends CcbAdapter {
 
   override async shutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise
+    // The inner SubprocessRunner logs its own `subprocess shutdown requested`
+    // origin, but by then the stack is truncated at this adapter's async
+    // boundary. Capture the synchronous caller chain here so a recover-loop
+    // (spawn → shutdown within ~1s) can be attributed to its real trigger.
+    log.info('cursor sand adapter shutdown requested', {
+      sessionKey: this.sessionKey,
+      hasActiveRun: this.activeCancel !== null,
+      origin: _shutdownOriginFrames(new Error().stack),
+    })
     this.lifecycleClosed = true
     this.lifecycleGeneration++
     this.activeCancel?.()

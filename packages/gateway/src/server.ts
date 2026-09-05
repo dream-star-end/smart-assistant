@@ -373,6 +373,8 @@ import {
   makeDelegateUsageProgressBlock,
   makeDelegateBlockPassthrough,
   coalesceDelegateTranscript,
+  DELEGATE_TRANSCRIPT_WARN_BYTES,
+  estimateTranscriptBytes,
   resolveDelegateProgressRouting,
   toNestedDelegateProgressLine,
   formatDelegateParentWorkingDetail,
@@ -590,6 +592,16 @@ import {
   type LocalExecutionRejectCode,
 } from './modelCatalogClient.js'
 import { resolveDelegateCostUsd } from './usageCost.js'
+import {
+  buildTeamPreamble,
+  buildTeamReviewContext,
+  parseTeamReviewMode,
+  pickDeliberationPanel,
+  pickReviewerModel,
+  type DeliberationPanelMember,
+  type ReviewEvidenceItem,
+  type TeamReviewMode,
+} from './teamMode.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
@@ -1870,29 +1882,9 @@ function waitForDelegateSettlement(
   })
 }
 
-// ── P2 债C — hidden reviewer 硬编排 review pass 参数/文案 ──────────────────
-/** gateway 硬编排 review pass 的隐藏审查员 agent id(权威 = protocol
- *  HIDDEN_SYSTEM_AGENT_IDS,此处引用其唯一成员的字面量;isHiddenSystemAgentId 恒真)。 */
-const HIDDEN_REVIEWER_AGENT_ID = 'hidden-reviewer'
-/** NEEDS_FIX → continuation → 再审 的迭代封顶(预算封顶,env 可配)。到顶强制放行 +
- *  披露"仍有未决意见"。默认 2;非法/缺省回退默认。硬护栏另见 MAX_HIDDEN_DELEGATIONS_PER_TURN。 */
-/** 审查委派的 context:喂给隐藏审查员的用户原始需求 + 队长待提交草稿。 */
-function buildTeamReviewContext(userTask: string, leaderDraft: string): string {
-  const task = userTask.trim()
-  const draft = leaderDraft.trim()
-  return [
-    '【审查任务】队长(全能助手)在团队协作后准备把下面的草稿作为最终答复提交给用户。',
-    '请独立审查该草稿:找事实错误、遗漏、过度承诺、执行风险、以及与用户需求的偏离。',
-    '',
-    '## 用户原始需求',
-    task || '(未提供)',
-    '',
-    '## 队长待提交草稿',
-    draft || '(队长本轮没有产出文本草稿)',
-    '',
-    '审查完成后,按你的 persona 要求在最后单独一行输出结构化裁决:`VERDICT: PASS` 或 `VERDICT: NEEDS_FIX`。',
-  ].join('\n')
-}
+// ── 团队模式审查任务书 ──────────────────────────────────────────────────────
+// 2026-09-04 起两套模板(执行验收 / 审议对比)+ 成员证据块,全部在 teamMode.ts
+// (buildTeamReviewContext);server.ts 只负责从队长会话取证据(_pendingAgentGroups)喂进去。
 
 /** 资源闸拦截原因 —— 两道闸共用一个判定/拒绝收口,避免两套并行机制。 */
 type DelegateGateBlock =
@@ -1930,8 +1922,11 @@ interface RunDelegateInput {
   channel?: string
   /** 可选的本次无活动超时。只按真实 child activity 续租,不是总运行时长上限。 */
   idleTimeoutMs?: number
-  /** 可选:覆盖目标成员默认模型的 catalog 型号。审查委派忽略。 */
+  /** 可选:覆盖目标成员默认模型的 catalog 型号。审查委派忽略(审查员型号由 gateway 选)。 */
   model?: string
+  /** 2026-09-04 团队模式:审查任务书模板(execution 验收 / deliberation 审议对比)。
+   *  仅审查委派读取;非法/缺省 → execution。只影响提示词,不影响闸与计费。 */
+  reviewMode?: string
   /** HTTP/MCP 可选续跑:已通过 DelegateResumeRegistry 占用的钥匙。 */
   resumable?: boolean
   /** 本次是否新 mint。早退时要 drop binding,避免占 cap。 */
@@ -2063,6 +2058,11 @@ export class PerTurnDelegationGuard {
   /** 父会话开启新用户 turn / 父 delegate 会话收尾时清零。 */
   resetForParent(parentKey: string): void {
     this.counts.delete(parentKey)
+  }
+
+  /** 只读:该父键本 turn 已占用的额度(团队模式「组队却未送审」可观测用)。 */
+  countFor(parentKey: string): number {
+    return this.counts.get(parentKey)?.count ?? 0
   }
 
   private prune(now: number): void {
@@ -2201,6 +2201,25 @@ export function normalizeAutoDreamSchedule(
 }
 
 export const GATEWAY_PENDING_PERMISSION_TTL_MS = 30 * 60_000
+
+/**
+ * Tools whose permission prompt is the turn's only way forward: the engine
+ * cannot proceed, retry or degrade until the user decides (AskUserQuestion
+ * answers; ExitPlanMode 按此计划执行 / 继续规划). Their prompts must not be
+ * auto-denied by the 30-minute idle TTL nor by a bridge disconnect — the
+ * user simply may not be looking. Ordinary tool approvals (Bash/Edit/…)
+ * keep the short TTL because a timed-out deny is a safe, recoverable answer.
+ * INC-20260904-EXITPLAN-PROMPT-BURIED (the same buried card was auto-denied
+ * at 30 min and the plan degraded into a text dump).
+ */
+export const BLOCKING_USER_INPUT_TOOLS: ReadonlySet<string> = new Set([
+  'AskUserQuestion',
+  'ExitPlanMode',
+])
+
+export function _isBlockingUserInputTool(toolName: string): boolean {
+  return BLOCKING_USER_INPUT_TOOLS.has(toolName)
+}
 
 export function _permissionRequestExpiresAt(
   blockingUserInput: boolean,
@@ -10739,6 +10758,9 @@ export class Gateway {
    *  turn 起始清零(与 _hiddenDelegateGuard.resetForParent 同点),_runDelegateTask 里对
    *  非隐藏 + webchat 父的委派置位。使用处惰性 ??=(同上)。 */
   private _turnDelegatedNonHiddenByParent: Set<string> | undefined
+  /** 2026-09-04 团队模式 — 委派 runId → 实际执行型号(有界 FIFO 512)。审查任务书据此给
+   *  panel 成员标注视角型号;DurableAgentGroup 本身不带 model 字段,不改 wire 契约。 */
+  private _delegateModelByRunId: Map<string, string> | undefined
   /** hidden 审查员串行委派熔断(见 PerTurnDelegationGuard 注释)。gateway 是容器内
    *  单进程,内存计数即权威。 */
   private _hiddenDelegateGuard = new PerTurnDelegationGuard()
@@ -11767,6 +11789,7 @@ export class Gateway {
       depth,
       effort,
       model: modelNorm.model,
+      ...(typeof parsed.reviewMode === 'string' ? { reviewMode: parsed.reviewMode } : {}),
       sessionKey: resume.sessionKey,
       resumable: true,
       resumeMinted: resume.minted,
@@ -12148,6 +12171,9 @@ export class Gateway {
     let context = input.context
     let isReview = input.isReview === true
     const parentSessionKey = input.parentSessionKey
+    /** 审查员本次执行型号(2026-09-04:必须 ≠ 队长/panel 家族;选不出则沿用成员默认绑定)。 */
+    let reviewerModelOverride: string | undefined
+    let reviewMode: TeamReviewMode = 'execution'
 
     // 队长自主送审(2026-07-07):目标是隐藏审查员 ⇒ 一律按审查语义执行(资源闸保留槽/
     // 免 per-parent 桶/回传不封顶/结构化 verdict)。单一权威 = 目标身份,不采信调用方自报。
@@ -12165,9 +12191,51 @@ export class Gateway {
           message: '质量审查仅在团队模式的队长回合中可用;当前回合请直接完成任务。',
         }
       }
-      // 外部送审(request_review 工具)的 context = 草稿正文;统一包装成审查任务书。
-      // 用户原始需求取父会话本 turn 入站文本的服务端权威快照,不采信模型自报。
-      context = buildTeamReviewContext(parent._currentTurnUserText ?? '', (context ?? '').trim())
+      // 2026-09-04 团队模式重构:审查员不再盲审。
+      //   - 证据 = 队长会话本 turn 已完成的成员团队卡(_pendingAgentGroups,turn 末才 drain,
+      //     审查发生在 turn 内 → 此刻全在);审查员自己的历史委派行剔除(teamMode.ts 内做)。
+      //   - 模式 = 调用方自报 reviewMode(execution/deliberation),只影响任务书模板,
+      //     不影响任何闸/计费 → 采信无风险;非法值回落 execution。
+      //   - 用户原始需求仍取服务端权威快照,不采信模型自报。
+      reviewMode = parseTeamReviewMode(input.reviewMode)
+      const evidence: ReviewEvidenceItem[] = (parent._pendingAgentGroups ?? []).map((g) => ({
+        runId: g.runId,
+        agentId: g.agentId,
+        model: this._delegateModelByRunId?.get(g.runId),
+        goal: g.goal,
+        status: g.status,
+        resultSummary: g.resultSummary,
+      }))
+      context = buildTeamReviewContext({
+        mode: reviewMode,
+        userTask: parent._currentTurnUserText ?? '',
+        leaderDraft: (context ?? '').trim(),
+        evidence,
+      })
+      // 审查员型号 ≠ 队长本轮型号(同模型审自己盲点重合);审议模式下还要避开 panel 成员
+      // (analyst 不能是刚答过题的那位)。catalog 拿不到 / 选不出 → undefined,沿用
+      // agents.yaml 里 hidden-reviewer 的默认绑定(降级,仍审查)。
+      if (isModelAuthorityRequired()) {
+        try {
+          const view = await getLocalCatalogView()
+          reviewerModelOverride = pickReviewerModel(view, {
+            leaderModel: parent.model ?? this.deps.config.defaults.model,
+            avoidModels: evidence.map((e) => e.model).filter((m): m is string => typeof m === 'string'),
+            requireLocalEngines: !isEngineLocalTurnExempt(process.env),
+          })
+        } catch (err) {
+          this.log.warn('team_reviewer_catalog_unavailable', {
+            parentSessionKey,
+            error: (err as Error)?.message ?? String(err),
+          })
+        }
+      }
+      this.log.info('team_review_request', {
+        parentSessionKey,
+        reviewMode,
+        evidenceCount: evidence.length,
+        reviewerModel: reviewerModelOverride ?? '(agent default)',
+      })
     }
 
     // Recursion guard: 深度闸必须先于资源闸(超深嵌套是硬错误,不进排队/不占等待名额)。
@@ -12256,7 +12324,9 @@ export class Gateway {
     // 让它先去排队等内存名额、等到了再拒,是纯粹的浪费 + 误导性等待。
     // 也因此,这里必然**先于 getOrCreate/createEngine** —— 结构化拒绝时不会有任何 runner
     // 被 spawn(方案 §3 要求的"创建 runner 前拒",测试 ④/⑤ 断言未 spawn)。
-    const requestedModel = isReview ? undefined : input.model
+    // 审查委派:调用方 model 忽略,改用 gateway 按「≠ 队长 / ≠ panel 家族」选出的审查员型号
+    // (选不出 → undefined → 沿用 hidden-reviewer 成员绑定)。
+    const requestedModel = isReview ? reviewerModelOverride : input.model
     let execAgent = requestedModel ? { ...delegatedAgent, model: requestedModel } : delegatedAgent
     let delegateExec: LocalExecutionDecision | undefined
     // 默认(未显式指定 model、非 review)委派优先 grok-build;只在 selfhost 引擎本地豁免门
@@ -12316,6 +12386,19 @@ export class Gateway {
     })
 
     const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
+    // 2026-09-04 团队模式:记录本次委派实际执行型号(runId → model),供审查任务书标注
+    // panel 成员视角(审议模式)。有界 Map(FIFO 512)—— 只服务本 turn 内的审查,不需持久。
+    {
+      const resolvedModel = delegateExec?.canonicalModel ?? requestedModel ?? execAgent.model
+      if (typeof resolvedModel === 'string' && resolvedModel) {
+        const map = (this._delegateModelByRunId ??= new Map())
+        map.set(progressRunId, resolvedModel)
+        if (map.size > 512) {
+          const first = map.keys().next().value
+          if (first !== undefined) map.delete(first)
+        }
+      }
+    }
     // 嵌套帧复用**一级**委派卡的 runId,把二级进度 append 回用户可见的那张卡;拿不到
     // 一级 runId(如一级未开进度)时退回本委派自身 runId → 独立进度卡兜底(仍可见,不丢)。
     const emitProgressRunId =
@@ -13214,6 +13297,28 @@ export class Gateway {
     // over its live-merged local card — so persist the merged form, matching
     // what the live reducers already render.
     const coalescedTranscript = coalesceDelegateTranscript(durableTranscript)
+    {
+      // INC-20260905-TIMELINE-BLANK diagnostics: a 20–32 MB agent-group tape
+      // record was found behind a "blank bottom" report. Log the shape of every
+      // oversized durable transcript so the next occurrence is attributable.
+      const bytes = estimateTranscriptBytes(coalescedTranscript)
+      if (bytes < 0 || bytes >= DELEGATE_TRANSCRIPT_WARN_BYTES || durableTranscript.length >= 2000) {
+        const kinds: Record<string, number> = {}
+        for (const b of coalescedTranscript) {
+          const k = b && typeof b === 'object' ? String((b as { kind?: unknown }).kind ?? '?') : '?'
+          kinds[k] = (kinds[k] ?? 0) + 1
+        }
+        this.log.warn('delegate transcript oversized', {
+          runId: progressRunId,
+          agentId: targetAgentId,
+          parentSessionKey: progressTarget?.sessionKey ?? delegateParent?.sessionKey ?? null,
+          rawBlocks: durableTranscript.length,
+          coalescedBlocks: coalescedTranscript.length,
+          bytes,
+          kinds,
+        })
+      }
+    }
     const durableGroup: DurableAgentGroup = {
       runId: progressRunId,
       agentId: targetAgentId,
@@ -19155,43 +19260,43 @@ export class Gateway {
       // 成员 = 市场安装集(source==='marketplace'),与 AgentPicker(master 市场安装权威)
       // 对齐、对存量容器的幽灵平台 seed 免疫。队长是 main 自己,故 includeMain:false。
       const members = listCollaboratorAgents(teamCfg, { selfId: 'main', includeMain: false })
-      const memberLines =
-        members.length > 0
-          ? members
-              .map((a) => {
-                const model = a.model
-                  ? a.model === AGENT_MODEL_AUTO
-                    ? '任意模型'
-                    : `${a.model}`
-                  : '默认模型'
-                const provider = a.provider || '继承全局'
-                return `- \`${a.id}\`${a.displayName ? `（${a.displayName}）` : ''} [${model}, ${provider}]${teamMemberCapabilityHint(a)}`
-              })
-              .join('\n')
-          : '（当前没有其它已安装 agent —— 直接自己完成即可）'
-      // P2 债C — preamble 只保留**协作**语义(拆解/委派/领域路由/综合)。审查已由 gateway
-      // 硬编排接管(见 dispatchInbound 队长 final 放行前的 review pass):队长不再被 prompt
-      // 要求"自觉调用 hidden-reviewer / 解读 verdict / 迭代到 PASS / 说明审查失败" —— 那套
-      // 软约束整体删除,审查触发权威唯一 = gateway 代码,消"prompt 说要审查但模型不照做"的漂移。
-      const teamPreamble = [
-        '【团队模式已开启】把这次任务当作队长来处理：',
-        `可委派的成员（已安装 agent）：\n${memberLines}`,
-        '- 你是队长，也是完成用户任务的第一负责人；从任务拆解、是否委派到最终答复，都由你端到端负责。',
-        '- 领域匹配优先于泛泛并行：用户任务明显属于某个已安装成员的领域时，优先把对应部分委派给该成员；多领域任务则拆给对应成员后由你综合。常见路由：代码/调试/测试/重构/代码库 → `coding-assistant`；科研/文献/论文/引用/学术分析 → `research-assistant`；文档/PPT/Excel/PDF/周报/公文/邮件/办公交付 → `office-assistant`。如果对应成员未安装，你可以自己完成或选择最接近的已安装成员。',
-        '- 需要多个成员协作的复杂任务：先用 `TodoWrite` 列出一份简明的拆解计划（每一步派给谁、预期产出什么），再照计划委派；简单任务无需列计划，直接做即可。',
-        '- 任务复杂、可拆解 → **首选**同步委派给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。CCB/Codex 用 MCP `delegate_task(goal, agentId, context)`；Cursor 用 Bash `oc-memory delegate --goal "..."`，返回 `status=running` 时立即用 `oc-memory delegate-wait <jobId>` 续等，不走 MCP，不用 Cursor `TaskOutput`。',
-        '- 多个**互相独立、可同时进行**的子任务 → CCB/Codex 用 `delegate_tasks`（tasks 列表，单次最多 4 个）；Cursor 在同一回合并发多条 `oc-memory delegate`。若子任务之间有先后依赖（B 要用到 A 的产出），仍串行。',
-        '- 按子任务量级选 `effort`：机械/简单子任务填 `low`，常规填 `medium`，攻坚/高难度填 `high`；拿不准就不填（用该成员默认档位），不要把简单活儿也开到 `high` 徒增开销与耗时。',
-        '- 成员的大产物（完整代码/长文档/数据文件）会以「文件路径 + 摘要」的形式回传（大产物落在共享目录 `/home/agent/.openclaude/generated/`）；你综合最终答案时，需要完整内容就用 `Read` 按回传的路径读回来，别只凭摘要臆测。',
-        '- 委派只走平台通道（有实时进度回传、计费与资源约束）：CCB/Codex 用 MCP `delegate_task` / `delegate_tasks`；Cursor 用 Bash `oc-memory delegate`（MCP `delegate_task` 在 Cursor 上已关闭）。平台已停用 codex 原生 `Agent`/子进程编排，不要尝试启动；不确定或不适合委派时就自己完成。',
-        // 队长自主送审(2026-07-07 boss 裁决):审查触发权在队长,prompt 纪律强引导
-        // "除明显简单任务外都送审"。平台侧保证 = request_review 通道 + hidden guard
-        // 熔断(≤3/turn)+ 团队门;不再有 gateway 硬编排兜底(已整体退役)。
-        '- 质量审查（重要纪律）：写给用户的最终答复**之前**，先把准备提交的完整答复草稿送独立审查员——**草稿只放在工具/命令参数里，不要先写进正文**。CCB/Codex 用 MCP `request_review(draft)`；Cursor 用 `oc-memory request-review --draft "..."`。除非任务明显简单（单一事实问答、寒暄、无实质交付物），否则都必须送审。拿到 `VERDICT: PASS` 再输出最终答复；`NEEDS_FIX` 就修订草稿后再送审一次（对误报可在修订说明中据理反驳）。审查是内部流程：最终答复不要复述审查意见、不要致歉。送审有每轮次数上限，达到上限时直接输出你当前最优的最终答复。',
-        '',
-        '用户任务：',
-        '',
-      ].join('\n')
+      // 2026-09-04 团队模式重构(teamMode.ts):一个开关、两条策略。
+      //   审议策略 = 同一问题并行派给多个**不同家族**型号(panel)+ 审查员当 analyst 做
+      //   结构化对比;执行策略 = 领域拆分 + 审查员拿成员证据验收。panel 从 catalog 投影
+      //   按家族多样性挑,排除队长本轮型号(队长自己已是一份视角)。投影拿不到 → 空 panel,
+      //   preamble 自动降级成"审议不可用",不影响执行策略。
+      const leaderModelForTeam = safeModelForRouting ?? agent.model ?? this.deps.config.defaults.model
+      let panel: DeliberationPanelMember[] = []
+      if (isModelAuthorityRequired()) {
+        try {
+          const view = await getLocalCatalogView()
+          panel = pickDeliberationPanel(view, {
+            excludeModel: leaderModelForTeam,
+            requireLocalEngines: !isEngineLocalTurnExempt(process.env),
+          })
+        } catch (err) {
+          this.log.warn('team_panel_catalog_unavailable', {
+            sessionKey,
+            error: (err as Error)?.message ?? String(err),
+          })
+        }
+      }
+      const cursorEngine =
+        typeof leaderModelForTeam === 'string' && isCursorEngineModel(leaderModelForTeam)
+      const teamPreamble = buildTeamPreamble({
+        members,
+        memberHint: teamMemberCapabilityHint,
+        autoModelToken: AGENT_MODEL_AUTO,
+        panel,
+        leaderModel: leaderModelForTeam,
+        cursorEngine,
+      })
+      this.log.info('team_mode_turn', {
+        sessionKey,
+        leaderModel: leaderModelForTeam,
+        panel: panel.map((p) => p.modelId),
+        members: members.map((m) => m.id),
+      })
       finalText = teamPreamble + finalText
     }
     // Pass as plain text. No image content blocks — safer for non-multimodal providers.
@@ -19489,8 +19594,10 @@ export class Gateway {
         // both to read from `out`, which is correct: `out` is the source of
         // truth for this turn's routing tuple after model-routing has settled
         // any agent-override sessionKey.
+        // ccbAdapter registers the requestId before emitting, so for CCB this
+        // getter is already true here; Codex exposes its own blocking state.
         const blockingUserInput =
-          e.request.toolName === 'AskUserQuestion' &&
+          _isBlockingUserInputTool(e.request.toolName) &&
           session.runner.waitingForUserInput === true
         const permissionExpiresAt = _permissionRequestExpiresAt(
           blockingUserInput,
@@ -19908,6 +20015,20 @@ export class Gateway {
         } finally {
           promptQueueExecutionFence?.release()
         }
+      }
+    }
+    // 2026-09-04 团队模式可观测:本 turn 组队了(有非隐藏委派)却没送审 → 记一条 warn。
+    // 不硬拦(审查触发权仍在队长),只让「送审纪律是否被执行」可度量,再决定要不要收紧。
+    if (session._teamModeTurn && !turnErrored) {
+      const delegated = this._turnDelegatedNonHiddenByParent?.has(sessionKey) === true
+      const reviewed = this._hiddenDelegateGuard.countFor(sessionKey) > 0
+      if (delegated && !reviewed) {
+        this.log.warn('team_review_skipped', { sessionKey, leaderModel: session.model })
+      } else if (delegated) {
+        this.log.info('team_review_done', {
+          sessionKey,
+          reviews: this._hiddenDelegateGuard.countFor(sessionKey),
+        })
       }
     }
     if (

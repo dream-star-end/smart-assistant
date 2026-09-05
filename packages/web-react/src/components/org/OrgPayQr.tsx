@@ -85,13 +85,13 @@ export function OrgPayQr({
   return (
     <div className="flex flex-col items-center gap-3">
       {err && (
-        <Alert tone="warning" className="w-full text-[12.5px]">
+        <Alert tone="warning" className="w-full text-meta">
           {err}
         </Alert>
       )}
       <div className="text-center">
         <div className="text-[20px] font-semibold text-fg">{formatCentsYuan(amountCents)}</div>
-        <div className="text-[12.5px] text-faint">{note}</div>
+        <div className="text-meta text-faint">{note}</div>
       </div>
       <HupijiaoPaymentEntry
         qrcodeUrl={order.qr}
@@ -124,8 +124,8 @@ export function OrgPaySuccess({
       <span className="flex size-12 items-center justify-center rounded-full bg-success-soft text-success">
         <Check size={26} />
       </span>
-      <div className="text-[15px] font-semibold text-fg">{title}</div>
-      {subtitle && <p className="text-[12.5px] text-faint">{subtitle}</p>}
+      <div className="text-title font-semibold text-fg">{title}</div>
+      {subtitle && <p className="text-meta text-faint">{subtitle}</p>}
       <Button variant="primary" size="sm" onClick={onDone} className="mt-1">
         {doneLabel}
       </Button>

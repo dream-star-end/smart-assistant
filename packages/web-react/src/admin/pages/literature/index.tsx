@@ -202,7 +202,7 @@ export default function LiteraturePage() {
 
       <SectionCard title="DeepXiv 文献检索" hint="平台级单例配置 · 改完点保存立即生效">
         {!ready && config.error ? (
-          <p className="py-8 text-center text-[13px] text-danger">
+          <p className="py-8 text-center text-body text-danger">
             加载失败：
             {apiErrorMessage(config.error, "加载失败")}
           </p>
@@ -219,8 +219,8 @@ export default function LiteraturePage() {
             {/* 启用开关 */}
             <div className="flex items-start justify-between gap-4">
               <div className="min-w-0">
-                <div className="text-[13px] font-medium text-fg">启用文献检索</div>
-                <p className="mt-0.5 text-[12px] text-faint">
+                <div className="text-body font-medium text-fg">启用文献检索</div>
+                <p className="mt-0.5 text-meta text-faint">
                   关闭时检索端点直接 503，容器侧 prompt 不注入文献检索技能段。
                 </p>
               </div>
@@ -248,15 +248,15 @@ export default function LiteraturePage() {
 
             {/* Token 区 */}
             <div className="flex flex-col gap-2.5">
-              <div className="text-[13px] font-medium text-fg">
+              <div className="text-body font-medium text-fg">
                 Token <span className="font-normal text-faint">（AEAD 加密存储，永不明文回显）</span>
               </div>
-              <div className="flex items-center gap-2 text-[13px]">
+              <div className="flex items-center gap-2 text-body">
                 <span className="text-faint">当前：</span>
                 {c.token_set ? (
                   <span className="inline-flex items-center gap-2">
                     <Badge tone="success">已配置</Badge>
-                    <code className="font-mono text-[12px] text-muted">{c.token_hint ?? "****????"}</code>
+                    <code className="font-mono text-meta text-muted">{c.token_hint ?? "****????"}</code>
                   </span>
                 ) : (
                   <Badge tone="neutral">未设置</Badge>
@@ -342,7 +342,7 @@ export default function LiteraturePage() {
                 <TestResultSummary result={testResult} />
               </div>
 
-              <div className="text-[12px] text-faint">
+              <div className="text-meta text-faint">
                 最后更新：
                 {updatedTs > 0 && c.updated_at ? <TimeAgo value={c.updated_at} /> : <span>—</span>}
                 {c.updated_by ? (
@@ -373,7 +373,7 @@ function LiteratureOps({
   if (!operations) {
     return (
       <SectionCard title="运行数据" hint="数据窗口：不可用">
-        <p className="text-[13px] text-muted">当前版本未返回文献检索运行指标；不会把配置值当作真实使用量。</p>
+        <p className="text-body text-muted">当前版本未返回文献检索运行指标；不会把配置值当作真实使用量。</p>
       </SectionCard>
     );
   }
@@ -389,7 +389,7 @@ function LiteratureOps({
   return (
     <SectionCard title="运行数据" hint={`请求指标窗口：${windowLabel}`} bodyClassName="flex flex-col gap-4">
       <div>
-        <div className="flex flex-wrap items-center justify-between gap-2 text-[13px]">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-body">
           <span className="font-medium text-fg">今日用量（UTC {daily.utc_day}）</span>
           <span className="tabular-nums text-muted">{daily.used === null ? "不可用" : daily.used.toLocaleString("en-US")} / {daily.cap.toLocaleString("en-US")} · {daily.source}</span>
         </div>
@@ -402,7 +402,7 @@ function LiteratureOps({
         <StatCard label="错误" value={errors.toLocaleString("en-US")} hint="上游、Redis 或配置读取" tone={errors > 0 ? "danger" : "neutral"} />
         <StatCard label="超时" value={timeout.toLocaleString("en-US")} hint="upstream timeout" tone={timeout > 0 ? "danger" : "neutral"} />
       </StatCardRow>
-      <div className="flex flex-wrap gap-x-6 gap-y-1 text-[12px] text-muted">
+      <div className="flex flex-wrap gap-x-6 gap-y-1 text-meta text-muted">
         <span>最近成功：{metrics.last_success_at ? <TimeAgo value={metrics.last_success_at} /> : "暂无"}</span>
         <span>延迟 p50：{metrics.latency_ms?.p50 == null ? "—" : `${Math.round(metrics.latency_ms.p50)} ms`}</span>
         <span>延迟 p95：{metrics.latency_ms?.p95 == null ? "—" : `${Math.round(metrics.latency_ms.p95)} ms`}</span>
@@ -426,11 +426,11 @@ function Field({
 }) {
   return (
     <div className="flex flex-col gap-1.5">
-      <label htmlFor={htmlFor} className="text-[13px] font-medium text-fg">
+      <label htmlFor={htmlFor} className="text-body font-medium text-fg">
         {label}
       </label>
       {children}
-      {desc && <p className="text-[12px] text-faint">{desc}</p>}
+      {desc && <p className="text-meta text-faint">{desc}</p>}
     </div>
   );
 }
@@ -449,7 +449,7 @@ function RadioRow({
   children?: ReactNode;
 }) {
   return (
-    <label className="flex items-center gap-2 text-[13px] text-fg">
+    <label className="flex items-center gap-2 text-body text-fg">
       <input
         type="radio"
         name="lit-token-action"
@@ -479,11 +479,11 @@ function TestResultSummary({
   result: TestResult | { exception: string } | "probing" | null;
 }) {
   if (result === null) return null;
-  if (result === "probing") return <p className="text-[13px] text-faint">探测中…</p>;
+  if (result === "probing") return <p className="text-body text-faint">探测中…</p>;
 
   if ("exception" in result) {
     return (
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px]">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-body">
         <Badge tone="danger">异常</Badge>
         <span className="break-all text-muted">{result.exception}</span>
       </div>
@@ -492,7 +492,7 @@ function TestResultSummary({
 
   if (result.ok) {
     return (
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px]">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-body">
         <Badge tone="success">连接正常</Badge>
         <Metric label="status" value={result.status} />
         <Metric label="result_count" value={result.result_count} />
@@ -505,7 +505,7 @@ function TestResultSummary({
   }
 
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px]">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-body">
       <Badge tone="neutral">失败</Badge>
       <Metric label="error" value={result.error ?? "unknown"} />
       {result.status != null && <Metric label="status" value={result.status} />}

@@ -29,6 +29,8 @@ export type DelegateCliArgs = {
   /** Opaque per-request id. Sequential same-content resumes must mint a new one. */
   idempotencyKey?: string
   allowSelf?: boolean
+  /** request-review 专用:审查任务书模板(execution / deliberation)。 */
+  reviewMode?: string
 }
 
 export function readDelegateContextToken(
@@ -70,6 +72,7 @@ export function buildDelegateStartBody(args: DelegateCliArgs): Record<string, un
         }
       : {}),
     ...(args.allowSelf ? { allowSelf: true } : {}),
+    ...(args.reviewMode ? { reviewMode: args.reviewMode } : {}),
     async: true,
     streamProgress: true,
   }
@@ -87,16 +90,24 @@ export function requestReviewArgs(
   draft: string,
   revisionNote?: string,
   resumeSessionKey?: string,
+  mode?: string,
 ): DelegateCliArgs {
   const note =
     revisionNote && revisionNote.trim()
       ? `\n\n【队长修订说明】\n${revisionNote.trim().slice(0, 4000)}`
       : ''
+  // 2026-09-04:mode 选审查任务书模板(gateway teamMode.ts);草稿不再静默截断
+  // (gateway 侧超长显式标注)。
+  const reviewMode = mode === 'deliberation' ? 'deliberation' : 'execution'
   return {
     agentId: 'hidden-reviewer',
-    goal: '对队长准备提交给用户的最终答复草稿做独立质量审查,给出结构化裁决。',
-    context: draft.slice(0, 16000) + note,
+    goal:
+      reviewMode === 'deliberation'
+        ? '作为 analyst 对比 panel 各成员回答(共识/矛盾/部分覆盖/独有洞见/盲点),并核对队长草稿,给出结构化裁决。'
+        : '对队长准备提交给用户的最终答复草稿做独立质量验收(对照成员证据),给出结构化裁决。',
+    context: draft + note,
     resumeSessionKey,
+    reviewMode,
   }
 }
 

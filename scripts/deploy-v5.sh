@@ -8465,15 +8465,15 @@ activate_staged_inner() {
     [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$expected_full_commit" == "$image_commit"* ]] || {
       echo "✗ runtime image source_commit=$image_commit is not target commit $expected_full_commit 的前缀" >&2; exit 1;
     }
-    [[ "$image_codex_version" == "0.149.0" ]] || {
-      echo "✗ runtime image codex label=$image_codex_version,expected=0.149.0" >&2; exit 1;
+    [[ "$image_codex_version" == "0.153.3" ]] || {
+      echo "✗ runtime image codex label=$image_codex_version,expected=0.153.3" >&2; exit 1;
     }
     [[ "$image_include_grok" == 1 ]] || {
       echo "✗ runtime image 缺 official Grok binary label(oc.runtime.include_grok=1)" >&2; exit 1;
     }
     actual_codex_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint codex '$runtime_image' --version")"
-    [[ "$actual_codex_version" == "codex-cli 0.149.0" ]] || {
-      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.149.0'" >&2; exit 1;
+    [[ "$actual_codex_version" == "codex-cli 0.153.3" ]] || {
+      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.153.3'" >&2; exit 1;
     }
     actual_grok_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$runtime_image' --version")"
     [[ "$actual_grok_version" == grok\ 1.0.5\ * ]] || {

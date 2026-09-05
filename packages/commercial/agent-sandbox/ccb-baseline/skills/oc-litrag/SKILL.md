@@ -11,17 +11,19 @@ tags: [research, rag, quote, grounding]
 ## 用法
 
 ```bash
-oc-litrag query "<问题/关键词>" --docs <docId,docId> [--top-k 8]
+oc-litrag query "<问题/关键词>" [--docs <docId,docId>] [--project <课题id>] [--top-k 8]
 ```
 
-- `--docs`:来自 `oc-ingest parse` 的 docId(可多个,逗号分隔)。
-- 输出 `{ quotes: [{ id, docId, spanId, charStart, charEnd, text, score }], missing: [...] }`。
+- **默认**(课题工作区开启时):**不必**手填 `--docs`。省略则检索当前课题 membership(最多 50 篇,超出返回 `truncated:true`)。换会话直接 query,先 `oc-ingest list` 可确认范围。
+- `--docs`:来自 `oc-ingest parse` 的 docId(可多个,逗号分隔);显式传入时不再走课题范围。
+- `--project`:课题 `chat_projects.id`;省略则 `OC_RESEARCH_PROJECT` 或默认课题。
+- 输出 `{ quotes: [{ id, docId, spanId, charStart, charEnd, text, score }], missing: [...], truncated?, docCount? }`。
 - `quotes[].text` 是权威段落原文;`quotes[].id` 是写 claim 时引用的句柄。
 
 ## 工作流(引用接地)
 
-1. 先 `oc-ingest parse` 得 docId。
-2. `oc-litrag query` 取 quote handles。
+1. 先 `oc-ingest parse`(或 `oc-ingest list` 确认课题已有文献)。
+2. `oc-litrag query "问题"` 取 quote handles(默认真课题;也可 `--docs` 收窄)。
 3. 写正文 claim 时,**每个论断都引用一个或多个 quote 的 id**,不要写没有 quote 支撑的"事实性"论断。
 4. 组装 evidence manifest(claims + 引用的 quotes + sources),用 `oc-cite check` 校验 → 平台铸造 verified;未接地的 claim 会被标 unsupported(红标),需删除或补证据。
 

@@ -72,7 +72,7 @@ export function AgentPicker({
       className="max-w-2xl"
     >
       {loading && (
-        <div className="mb-2 flex items-center gap-2 text-[12px] text-faint">
+        <div className="mb-2 flex items-center gap-2 text-meta text-faint">
           <Loader2 size={13} className="animate-spin" /> 加载你的智能体…
         </div>
       )}
@@ -101,7 +101,7 @@ export function AgentPicker({
           <span className="min-w-0 flex-1">
             <span className="flex items-center gap-1.5">
               <span className="text-[14.5px] font-semibold text-fg">{defaultAgent.name}</span>
-              <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent">
+              <span className="rounded bg-accent/15 px-1.5 py-0.5 text-micro font-medium text-accent">
                 默认
               </span>
               {defaultActive && <Check size={14} className="text-accent" />}
@@ -115,7 +115,7 @@ export function AgentPicker({
         {onToggleTeamMode && (
           <div className="flex items-center justify-between gap-3 border-t border-accent/20 bg-surface/70 px-3.5 py-2.5">
             <span className="flex min-w-0 flex-col">
-              <span className="flex items-center gap-1.5 text-[12.5px] font-semibold text-fg">
+              <span className="flex items-center gap-1.5 text-meta font-semibold text-fg">
                 <Users size={13} className="text-accent" /> 团队模式
               </span>
               <span className="mt-0.5 text-[11.5px] leading-snug text-muted">
@@ -183,7 +183,7 @@ export function AgentPicker({
             type="button"
             data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
             onClick={onAddFromMarket}
-            className="group flex items-center justify-center gap-2 rounded-xl border border-dashed border-border p-3.5 text-[13.5px] text-muted outline-none transition-colors hover:border-accent/50 hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="group flex items-center justify-center gap-2 rounded-xl border border-dashed border-border p-3.5 text-section text-muted outline-none transition-colors hover:border-accent/50 hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <Store size={16} />
             从市场添加更多智能体

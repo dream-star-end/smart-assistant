@@ -176,7 +176,8 @@ describe("Sidebar 会话列表", () => {
       theme: "light",
       onCycleTheme: () => {},
     });
-    const create = screen.getByRole("button", { name: "新建会话" });
+    // 顶部「新建会话」+ 空态 CTA 同名(空态出口),取 DOM 序第一个(顶部按钮)锁 class 契约。
+    const create = screen.getAllByRole("button", { name: "新建会话" })[0];
     expect(create).toHaveClass("text-section");
     expect(create.className).toMatch(/border-border/);
     expect(create.className).toMatch(/bg-surface/);

@@ -91,7 +91,7 @@ function TagChip({
       aria-pressed={active}
       onClick={onClick}
       className={cn(
-        "rounded-full border px-2.5 py-1 text-[12px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+        "rounded-full border px-2.5 py-1 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
         active
           ? "border-accent/50 bg-accent-soft text-accent"
           : "border-border text-muted hover:border-accent/40 hover:text-fg",
@@ -204,7 +204,7 @@ export function ResponseRatingCard({
     // oc-rating-nudge:纯 box-shadow/border-radius 脉冲(见 styles.css),无布局位移、
     // respect prefers-reduced-motion、暗色自适应；未命中/已评时不加,布局与常态完全一致。
     <div className={cn("mt-1 flex flex-col gap-2", nudged && "oc-rating-nudge")}>
-      <div className="flex items-center gap-1.5 text-[12px] text-faint">
+      <div className="flex items-center gap-1.5 text-meta text-faint">
         <span>
           {expanded && rating === "down"
             ? "已记录，可选补充原因"
@@ -230,9 +230,11 @@ export function ResponseRatingCard({
               value={comment}
               onChange={(e) => setComment(e.target.value)}
               maxLength={500}
+              // placeholder 不构成可访问名,读屏需要显式名字。
+              aria-label="补充评价"
               placeholder="补充说说哪里不好（可选）"
               // text-base（≥16px）防 iOS 聚焦整页放大，md+ 回落紧凑字号（与 Input 原语同策略）。
-              className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-base text-fg outline-none transition-[border-color,box-shadow] duration-150 placeholder:text-faint focus:border-accent focus:ring-2 focus:ring-ring md:text-[13px]"
+              className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-base text-fg outline-none transition-[border-color,box-shadow] duration-150 placeholder:text-faint focus:border-accent focus:ring-2 focus:ring-ring md:text-body"
             />
             <Button size="sm" variant="secondary" shape="pill" onClick={submitDetail}>
               保存补充

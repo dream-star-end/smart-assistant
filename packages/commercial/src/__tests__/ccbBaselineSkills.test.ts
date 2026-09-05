@@ -34,16 +34,17 @@ describe('ccb-baseline skills ↔ manifest', () => {
     )
   })
 
-  it('every skill dir contains exactly SKILL.md (optionally plus evals/evals.json)', () => {
+  it('every skill dir contains SKILL.md plus only allowed extras (evals/, references/, scripts/)', () => {
+    const allowed = new Set(['SKILL.md', 'evals', 'references', 'scripts'])
     for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
       const entries = readdirSync(join(skillsDir, name)).sort()
-      const shapeOk =
-        (entries.length === 1 && entries[0] === 'SKILL.md') ||
-        (entries.length === 2 && entries[0] === 'SKILL.md' && entries[1] === 'evals')
-      assert.ok(
-        shapeOk,
-        `skill ${name} must contain exactly SKILL.md (optionally plus evals/), got: ${entries.join(', ')}`,
-      )
+      assert.ok(entries.includes('SKILL.md'), `skill ${name} missing SKILL.md`)
+      for (const entry of entries) {
+        assert.ok(
+          allowed.has(entry),
+          `skill ${name} has undeclared entry ${entry}; allowed: SKILL.md, evals/, references/, scripts/`,
+        )
+      }
       if (entries.includes('evals')) {
         const evalEntries = readdirSync(join(skillsDir, name, 'evals'))
         assert.deepEqual(

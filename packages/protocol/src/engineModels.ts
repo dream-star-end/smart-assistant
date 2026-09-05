@@ -47,7 +47,12 @@ export const AGENT_MODEL_AUTO = 'auto'
 
 /**
  * Codex engine 模型号 + 模型自身默认思考深度的单一权威。
- * 顺序有产品语义:第一项同时是 codex seed / 团队模式队长默认型号。
+ * 顺序有产品语义:第一项同时是 codex seed / 团队模式队长默认型号(仍为 Sol;
+ * GPT-6-Astra 在选择器里置顶靠 model_pricing.sort_order,不靠本表顺序)。
+ *
+ * GPT-6-Astra(2026-09-05,Codex 0.153.3 内嵌目录 slug `gpt-6-astra`,
+ * minimal_client_version 0.153.0,`visibility: hide` 但 supported_in_api)。定价 = Sol
+ * 标准档 ×2(迁移 0263),1M 孪生沿用 0238 的 1.5× 长上下文契约。
  */
 export const CODEX_ENGINE_MODELS = [
   { id: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', defaultReasoningEffort: 'xhigh', longContext: false },
@@ -74,6 +79,14 @@ export const CODEX_ENGINE_MODELS = [
     cliModel: 'gpt-5.6-luna',
     longContext: true,
   },
+  { id: 'gpt-6-astra', displayName: 'GPT-6-Astra', defaultReasoningEffort: 'xhigh', longContext: false },
+  {
+    id: 'gpt-6-astra-1m',
+    displayName: 'GPT-6-Astra',
+    defaultReasoningEffort: 'xhigh',
+    cliModel: 'gpt-6-astra',
+    longContext: true,
+  },
 ] as const satisfies readonly {
   id: string
   displayName: string
@@ -88,35 +101,58 @@ export const CODEX_ENGINE_MODEL_IDS = CODEX_ENGINE_MODELS.map((m) => m.id)
 export type CodexEngineModelId = (typeof CODEX_ENGINE_MODELS)[number]['id']
 export type CodexEngineModel = (typeof CODEX_ENGINE_MODELS)[number]
 
+/**
+ * 标准/1M 上下文成对家族。`collapsedByDefault` 是选择器的展示语义:为 true 的家族默认
+ * 收进「更多 GPT 模型」折叠组(2026-09-05 产品决定:GPT-5.6 Terra/Luna 折叠,给 GPT-6-Astra
+ * 与 Sol 腾位;当前选中模型落在折叠组时该组自动展开)。不影响准入、计费与路由。
+ */
 export const CONTEXT_TIER_FAMILIES = [
+  {
+    family: 'gpt-6-astra',
+    familyLabel: 'GPT-6-Astra',
+    standardId: 'gpt-6-astra',
+    longId: 'gpt-6-astra-1m',
+    collapsedByDefault: false,
+  },
   {
     family: 'gpt-5.6-sol',
     familyLabel: 'GPT-5.6-Sol',
     standardId: 'gpt-5.6-sol',
     longId: 'gpt-5.6-sol-1m',
+    collapsedByDefault: false,
   },
   {
     family: 'gpt-5.6-terra',
     familyLabel: 'GPT-5.6-Terra',
     standardId: 'gpt-5.6-terra',
     longId: 'gpt-5.6-terra-1m',
+    collapsedByDefault: true,
   },
   {
     family: 'gpt-5.6-luna',
     familyLabel: 'GPT-5.6-Luna',
     standardId: 'gpt-5.6-luna',
     longId: 'gpt-5.6-luna-1m',
+    collapsedByDefault: true,
   },
   {
     family: 'kimi-k3',
     familyLabel: 'Kimi K3',
     standardId: 'k3-256k',
     longId: 'kimi-k3',
+    collapsedByDefault: false,
   },
 ] as const
 
 export type ContextTierFamily = (typeof CONTEXT_TIER_FAMILIES)[number]
 export type ContextTierFamilyId = ContextTierFamily['family']
+
+/** 选择器折叠组标题(单一权威,前端与测试共用)。 */
+export const COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL = '更多 GPT 模型'
+
+export function contextFamilyCollapsedByDefault(family: ContextTierFamilyId): boolean {
+  return CONTEXT_TIER_FAMILIES.some((row) => row.family === family && row.collapsedByDefault)
+}
 
 export function contextFamilyByModelId(
   modelId: string | null | undefined,
@@ -231,6 +267,7 @@ export type CursorEngineFamilyId =
   | 'opus-4.8'
   | 'fable-5'
   | 'fable-5.1'
+  | 'gemini-3.8-flash'
   | 'grok-4.5'
 
 export const CURSOR_ENGINE_MODELS = [
@@ -692,6 +729,36 @@ export const CURSOR_ENGINE_MODELS = [
     family: 'fable-5.1',
     familyLabel: 'Fable 5.1',
     effort: 'max',
+    fast: false,
+  },
+  // Gemini 3.8 Flash: pinned CLI `--list-models` (2026-09-04) exposes exactly
+  // gemini-3.8-flash-{low,medium,high}; no Fast, xhigh or max variants exist,
+  // so none are catalogued.
+  {
+    id: 'cursor-gemini-3.8-flash-low',
+    displayName: 'Gemini 3.8 Flash Low',
+    upstreamModel: 'gemini-3.8-flash-low',
+    family: 'gemini-3.8-flash',
+    familyLabel: 'Gemini 3.8 Flash',
+    effort: 'low',
+    fast: false,
+  },
+  {
+    id: 'cursor-gemini-3.8-flash-medium',
+    displayName: 'Gemini 3.8 Flash Medium',
+    upstreamModel: 'gemini-3.8-flash-medium',
+    family: 'gemini-3.8-flash',
+    familyLabel: 'Gemini 3.8 Flash',
+    effort: 'medium',
+    fast: false,
+  },
+  {
+    id: 'cursor-gemini-3.8-flash-high',
+    displayName: 'Gemini 3.8 Flash High',
+    upstreamModel: 'gemini-3.8-flash-high',
+    family: 'gemini-3.8-flash',
+    familyLabel: 'Gemini 3.8 Flash',
+    effort: 'high',
     fast: false,
   },
   {

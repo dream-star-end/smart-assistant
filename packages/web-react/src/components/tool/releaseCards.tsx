@@ -171,9 +171,9 @@ export function ReleaseProgressCard({
         <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent">
           {current.phase === "failed" ? <AlertTriangle size={13} /> : current.phase === "rolled_back" ? <RotateCcw size={13} /> : <Rocket size={13} />}
         </span>
-        <span className="min-w-0 truncate text-[13px] font-medium text-fg">{current.title || "发布任务"}</span>
+        <span className="min-w-0 truncate text-body font-medium text-fg">{current.title || "发布任务"}</span>
         <span className="ml-auto flex items-center gap-2">
-          <span className="inline-flex items-center gap-1 text-[11px] text-muted">
+          <span className="inline-flex items-center gap-1 text-caption text-muted">
             <Clock size={11} />
             {formatElapsed(elapsedMs(current, now))}
           </span>
@@ -182,7 +182,7 @@ export function ReleaseProgressCard({
         </span>
       </button>
       {!collapsed && current.entries.length > 0 && (
-        <ul className="border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
+        <ul className="border-t border-border px-3.5 py-2 text-meta text-muted">
           {current.entries.map((entry, index) => (
             <li key={`${entry.phase}-${index}`} className="whitespace-pre-wrap break-words">
               <span className="text-faint">[{RELEASE_PHASE_LABELS[entry.phase as ReleasePhase] ?? entry.phase}]</span> {entry.text}
@@ -191,13 +191,13 @@ export function ReleaseProgressCard({
         </ul>
       )}
       {!collapsed && current.phase === "failed" && (
-        <div className="space-y-1 border-t border-border px-3.5 py-2 text-[12.5px]">
+        <div className="space-y-1 border-t border-border px-3.5 py-2 text-meta">
           <p className="text-danger">{current.error || "发布失败"}</p>
           {current.nextStep && <p className="text-muted">下一步：{current.nextStep}</p>}
         </div>
       )}
       {collapsed && done && (
-        <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
+        <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-meta text-muted">
           {current.phase === "failed" ? (
             <AlertTriangle size={13} className="mt-0.5 shrink-0 text-danger" />
           ) : (
@@ -221,7 +221,7 @@ export function renderReleaseJobCard(command: string, tool: ToolLike) {
   if (fromOutput) return <ReleaseProgressCard job={fromOutput} />;
   if (looksLikeReleaseWorkerCommand(command) && tool.error) {
     return (
-      <div className="rounded-lg border border-danger/40 bg-danger-soft px-3.5 py-2.5 text-[12.5px] text-danger">
+      <div className="rounded-lg border border-danger/40 bg-danger-soft px-3.5 py-2.5 text-meta text-danger">
         发布任务未能启动。不要改走旁路；先读报错再查 queue / lease。
       </div>
     );

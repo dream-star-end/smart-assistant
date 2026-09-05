@@ -149,11 +149,11 @@ function DetailBody({ row }: { row: AgentAuditRow }) {
         <KeyValue label="工具" value={<Badge tone="accent">{row.tool}</Badge>} />
         <KeyValue
           label="用户"
-          value={<span className="font-mono text-[12px]">{row.user_id}</span>}
+          value={<span className="font-mono text-meta">{row.user_id}</span>}
         />
         <KeyValue
           label="会话"
-          value={<span className="font-mono text-[12px] break-all">{row.session_id}</span>}
+          value={<span className="font-mono text-meta break-all">{row.session_id}</span>}
         />
         <KeyValue
           label="耗时"
@@ -171,16 +171,16 @@ function DetailBody({ row }: { row: AgentAuditRow }) {
         />
         <KeyValue
           label="input_hash"
-          value={<span className="font-mono text-[12px] break-all">{row.input_hash ?? "—"}</span>}
+          value={<span className="font-mono text-meta break-all">{row.input_hash ?? "—"}</span>}
         />
         <KeyValue
           label="output_hash"
-          value={<span className="font-mono text-[12px] break-all">{row.output_hash ?? "—"}</span>}
+          value={<span className="font-mono text-meta break-all">{row.output_hash ?? "—"}</span>}
         />
         <KeyValue label="时间" value={<TimeAgo value={row.created_at} />} />
       </div>
       <div>
-        <p className="mb-1.5 text-[12px] font-medium text-faint">input_meta</p>
+        <p className="mb-1.5 text-meta font-medium text-faint">input_meta</p>
         <FormatJsonValue value={row.input_meta} />
       </div>
     </div>
@@ -510,8 +510,8 @@ export function AgentAuditTab() {
       )}
 
       <div>
-        <h3 className="text-[13px] font-semibold text-fg">按工具成败率</h3>
-        <p className="mt-0.5 text-[12px] text-faint">
+        <h3 className="text-body font-semibold text-fg">按工具成败率</h3>
+        <p className="mt-0.5 text-meta text-faint">
           成功/失败均来自容器侧聚合上报；失败明细流只含失败,不能直接当失败率看。
         </p>
       </div>
@@ -527,8 +527,8 @@ export function AgentAuditTab() {
 
       <div className="flex items-end justify-between gap-3">
         <div>
-          <h3 className="text-[13px] font-semibold text-fg">失败原因聚合</h3>
-          <p className="mt-0.5 text-[12px] text-faint">
+          <h3 className="text-body font-semibold text-fg">失败原因聚合</h3>
+          <p className="mt-0.5 text-meta text-faint">
             {stats
               ? `${formatCount(stats.failures.events)} 条失败事件 · ${formatCount(stats.failures.affected_users)} 位涉及用户`
               : "按工具与安全错误分类汇总"}
@@ -548,8 +548,8 @@ export function AgentAuditTab() {
       {error && <p className="text-sm text-danger">加载失败：{apiErrorMessage(error, "加载失败")}</p>}
 
       <div>
-        <h3 className="text-[13px] font-semibold text-fg">失败调用明细</h3>
-        <p className="mt-0.5 text-[12px] text-faint">仅失败事件，用于定位具体工具与会话。</p>
+        <h3 className="text-body font-semibold text-fg">失败调用明细</h3>
+        <p className="mt-0.5 text-meta text-faint">仅失败事件，用于定位具体工具与会话。</p>
       </div>
 
       <DataTable

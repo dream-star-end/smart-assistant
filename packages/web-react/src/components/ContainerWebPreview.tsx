@@ -815,10 +815,10 @@ export function ContainerWebPreview({
                   size={16}
                 />
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[12px] font-semibold text-white/90">
+                  <span className="block truncate text-meta font-semibold text-white/90">
                     {displayTitle}
                   </span>
-                  <span className="block truncate text-[10px] text-white/45">{displayUrl}</span>
+                  <span className="block truncate text-micro text-white/45">{displayUrl}</span>
                 </span>
               </div>
               <button
@@ -1580,7 +1580,7 @@ function ElementSummary({ target }: { target: ContainerPreviewElementTarget }) {
   return (
     <div className="min-w-0">
       <div className="preview-accent-text truncate text-xs font-semibold">{target.selector}</div>
-      <div className="mt-1 flex flex-wrap gap-1 text-[10px] text-white/45">
+      <div className="mt-1 flex flex-wrap gap-1 text-micro text-white/45">
         <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5">&lt;{target.tag}&gt;</span>
         {target.role && (
           <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5">role={target.role}</span>

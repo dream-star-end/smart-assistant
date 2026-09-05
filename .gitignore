@@ -30,3 +30,4 @@ commercial-unit.tap
 # Windows desktop local dependencies and installers
 packages/desktop/node_modules/
 packages/desktop/release/
+__pycache__/

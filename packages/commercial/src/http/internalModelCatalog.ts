@@ -90,6 +90,10 @@ export interface CatalogSource {
 
 export interface ModelCatalogHandlerDeps {
   identityRepo: ContainerIdentityRepo;
+  verify?: (
+    req: IncomingMessage,
+    ctx: { hostUuid: string; boundIp: string },
+  ) => Promise<import("../auth/containerIdentity.js").ContainerIdentity>;
   catalog: CatalogSource;
   /** role + grants 的权威加载器(auth/userModelAuthz.makeLoadUserModelAuthz)。 */
   loadUserModelAuthz: UserModelAuthzLoader;
@@ -173,7 +177,9 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
     // 1) 容器身份 → uid(绝不从 query/body 取)
     let identity;
     try {
-      identity = await verifyContainerIdentity(deps.identityRepo, ctx, req.headers.authorization);
+      identity = await (deps.verify
+        ? deps.verify(req, ctx)
+        : verifyContainerIdentity(deps.identityRepo, ctx, req.headers.authorization));
     } catch (err) {
       if (err instanceof ContainerIdentityError) {
         sendError(res, 401, "UNAUTHORIZED", "container identity verification failed", requestId);

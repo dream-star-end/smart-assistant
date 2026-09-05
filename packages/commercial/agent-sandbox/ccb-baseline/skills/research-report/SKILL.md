@@ -21,7 +21,13 @@ tags: [research, report, quarto, citation]
 oc-report --schema report-schema.json --manifest checked-manifest.json -o /home/agent/.openclaude/research/<id>/report.pdf
 ```
 
-支持 `.pdf` / `.docx` / `.html` / `.md`。输出末行是产物绝对路径(前端渲染成文件卡片)。
+支持 `.pdf` / `.docx` / `.html` / `.md`。交付前对产物跑 L0：
+
+```bash
+oc-artifact-qa deliver --input /home/agent/.openclaude/research/<id>/report.pdf
+```
+
+`VERDICT` 不是 PASS 就禁止打印该路径。只打印 FINAL 绝对路径，单独成行；禁止 fenced code；禁止发明 URL。
 
 ## 规则
 

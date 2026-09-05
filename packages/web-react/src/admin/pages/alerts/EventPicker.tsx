@@ -37,7 +37,7 @@ export function EventPicker({
   };
 
   if (events.length === 0) {
-    return <div className="text-[12px] text-faint">事件目录未加载。</div>;
+    return <div className="text-meta text-faint">事件目录未加载。</div>;
   }
 
   const allChecked = selected.size === allTypes.length && allTypes.length > 0;
@@ -51,19 +51,19 @@ export function EventPicker({
         <Button variant="secondary" size="sm" onClick={() => onChange([])}>
           全不选
         </Button>
-        <span className="text-[12px] text-faint">
+        <span className="text-meta text-faint">
           {selected.size === 0 || allChecked ? "全部订阅" : `已选 ${selected.size} / ${allTypes.length}`}
         </span>
       </div>
       <div className="max-h-[240px] space-y-3 overflow-y-auto p-3">
         {orderedGroups(Object.keys(grouped)).map((g) => (
           <fieldset key={g} className="rounded-md border border-border/70 px-3 py-2">
-            <legend className="px-1 text-[11.5px] font-medium text-faint">{groupLabel(g)}</legend>
+            <legend className="px-1 text-caption font-medium text-faint">{groupLabel(g)}</legend>
             <div className="flex flex-wrap gap-x-4 gap-y-1.5">
               {grouped[g].map((e) => (
                 <label
                   key={e.event_type}
-                  className="flex cursor-pointer items-center gap-1.5 text-[12.5px] text-fg"
+                  className="flex cursor-pointer items-center gap-1.5 text-meta text-fg"
                   title={e.description}
                 >
                   <input

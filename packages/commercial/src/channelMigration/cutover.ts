@@ -83,7 +83,7 @@ export function defaultQuiesceV3(docker: Docker): (uid: string) => Promise<void>
     }
     await query(
       `UPDATE agent_containers SET state='vanished', last_stopped_at=NOW(), updated_at=NOW()
-        WHERE user_id=$1 AND runtime_channel='v3' AND state='active'`,
+        WHERE user_id=$1 AND runtime_channel='v3' AND state='active' AND runtime_kind='docker'`,
       [uid],
     );
   };

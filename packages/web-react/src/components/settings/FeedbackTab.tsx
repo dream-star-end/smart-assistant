@@ -252,7 +252,7 @@ export function FeedbackTab({
           <MessageSquareText size={20} />
         </div>
         <div className="min-w-0">
-          <h3 className="text-[15px] font-semibold text-fg">告诉我们哪里还能更好</h3>
+          <h3 className="text-title font-semibold text-fg">告诉我们哪里还能更好</h3>
           <p className="mt-1 text-[12.5px] leading-relaxed text-muted">
             遇到问题、有功能想法或觉得哪里不顺手，都可以直接告诉我们。
           </p>
@@ -282,7 +282,7 @@ export function FeedbackTab({
       ) : (
         <form className="mt-5" aria-label="反馈表单" aria-busy={submitting} onSubmit={submit}>
           <fieldset disabled={submitting}>
-            <legend className="block text-[12.5px] font-medium text-fg">反馈类型</legend>
+            <legend className="block text-meta font-medium text-fg">反馈类型</legend>
             <div className="mt-2 flex flex-wrap gap-2">
               {CATEGORY_OPTIONS.map((option) => (
                 <button
@@ -291,7 +291,7 @@ export function FeedbackTab({
                   aria-pressed={category === option.value}
                   onClick={() => setCategory(option.value)}
                   className={cn(
-                    'rounded-full border px-3 py-1.5 text-[12.5px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    'rounded-full border px-3 py-1.5 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
                     category === option.value
                       ? 'border-accent/50 bg-accent-soft text-accent'
                       : 'border-border text-muted hover:border-accent/40 hover:text-fg',
@@ -304,7 +304,7 @@ export function FeedbackTab({
           </fieldset>
 
           <label
-            className="mt-4 block text-[12.5px] font-medium text-fg"
+            className="mt-4 block text-meta font-medium text-fg"
             htmlFor="settings-feedback-description"
           >
             反馈内容
@@ -327,7 +327,7 @@ export function FeedbackTab({
           />
           <div
             id={DESCRIPTION_HELP_ID}
-            className="mt-1.5 flex items-center justify-between gap-3 text-[11.5px] text-faint"
+            className="mt-1.5 flex items-center justify-between gap-3 text-caption text-faint"
           >
             <span>草稿仅保存在当前账号的本标签页</span>
             <span>
@@ -337,7 +337,7 @@ export function FeedbackTab({
           </div>
 
           {(context?.sessionId || context?.requestId) && (
-            <label className="mt-3 flex items-start gap-2 rounded-lg border border-border bg-elevated px-3 py-2.5 text-[12px] text-muted">
+            <label className="mt-3 flex items-start gap-2 rounded-lg border border-border bg-elevated px-3 py-2.5 text-meta text-muted">
               <input
                 type="checkbox"
                 checked={includeContext}
@@ -358,7 +358,7 @@ export function FeedbackTab({
             <Alert
               id={error.field ? DESCRIPTION_ERROR_ID : undefined}
               tone="danger"
-              className="mt-3 text-[12.5px]"
+              className="mt-3 text-meta"
             >
               {error.message}
             </Alert>

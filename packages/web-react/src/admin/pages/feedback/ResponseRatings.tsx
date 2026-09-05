@@ -132,7 +132,7 @@ export function ResponseRatings() {
       key: "model",
       title: "模型",
       render: (m) => (
-        <span className="font-mono text-[12px] text-fg">{m.model ?? "（未标注）"}</span>
+        <span className="font-mono text-meta text-fg">{m.model ?? "（未标注）"}</span>
       ),
     },
     {
@@ -171,7 +171,7 @@ export function ResponseRatings() {
       title: "模型",
       width: 130,
       render: (r) => (
-        <span className="font-mono text-[11px] text-muted">{r.model ?? "—"}</span>
+        <span className="font-mono text-caption text-muted">{r.model ?? "—"}</span>
       ),
     },
     {
@@ -202,7 +202,7 @@ export function ResponseRatings() {
       key: "username",
       title: "用户",
       width: 120,
-      render: (r) => <span className="truncate text-[12px] text-muted">{r.username ?? "—"}</span>,
+      render: (r) => <span className="truncate text-meta text-muted">{r.username ?? "—"}</span>,
     },
     {
       key: "traffic_class",
@@ -229,7 +229,7 @@ export function ResponseRatings() {
       key: "created_at",
       title: "时间",
       width: 96,
-      render: (r) => <TimeAgo value={r.created_at} className="text-[12px] text-muted" />,
+      render: (r) => <TimeAgo value={r.created_at} className="text-meta text-muted" />,
     },
   ];
 
@@ -333,7 +333,7 @@ export function ResponseRatings() {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
         <ChartCard title="好评 / 差评构成" hint="全部时间" height={240}>
           {(overall?.total ?? 0) === 0 ? (
-            <div className="flex h-full items-center justify-center text-[12px] text-faint">
+            <div className="flex h-full items-center justify-center text-meta text-faint">
               暂无评分
             </div>
           ) : (
@@ -370,7 +370,7 @@ export function ResponseRatings() {
               requestSeqRef.current += 1;
               setSource(event.target.value as DownRatingSource);
             }}
-            className="h-8 rounded-md border border-border bg-surface px-2.5 text-[12px] text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+            className="h-8 rounded-md border border-border bg-surface px-2.5 text-meta text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
           >
             <option value="explicit">用户主动点踩</option>
             <option value="implicit">行为弱信号</option>

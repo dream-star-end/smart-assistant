@@ -123,7 +123,7 @@ export function ChatHeader({
       >
         <AgentAvatar agent={agent} className="size-7 rounded-lg" iconSize={15} />
         {/* 窄屏不折行：截断而非换行（避免"全能/助手"难看的两行）。 */}
-        <span className="max-w-[7.5rem] truncate whitespace-nowrap text-[15px] font-semibold text-fg sm:max-w-none">
+        <span className="max-w-[7.5rem] truncate whitespace-nowrap text-title font-semibold text-fg sm:max-w-none">
           {agent.name}
         </span>
         <ChevronDown size={15} className="shrink-0 text-faint" />
@@ -149,7 +149,7 @@ export function ChatHeader({
               type="button"
               data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
               aria-label="团队模式已开启"
-              className="flex shrink-0 items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-[11px] font-medium text-accent outline-none transition-colors hover:bg-accent/15 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+              className="flex shrink-0 items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent outline-none transition-colors hover:bg-accent/15 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
             >
               <Users size={11} className="shrink-0" />
               {/* 移动端只留图标(选择器同排还有引擎标签,文案冗余挤爆头部);sm+ 显示全称。 */}
@@ -208,7 +208,7 @@ export function ChatHeader({
             onClick={onOpenBilling}
             disabled={!onOpenBilling}
             aria-label="账户与计费"
-            className={`flex items-center gap-1.5 rounded-full border px-2 py-1 text-[12.5px] font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:px-2.5 ${
+            className={`flex items-center gap-1.5 rounded-full border px-2 py-1 text-meta font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:px-2.5 ${
               low
                 ? "border-danger/40 bg-danger-soft text-danger hover:bg-danger-soft"
                 : "border-border text-muted enabled:hover:bg-hover enabled:hover:text-fg"

@@ -2,6 +2,8 @@
  * 同源 tab 的 token-free 登出信号。refresh/access token 绝不落 storage，也不经此通道传播。
  * BroadcastChannel 不可用时用一次性 localStorage 写入触发 storage event。
  */
+import { clearAuthHint } from "./authHint";
+
 const CHANNEL_NAME = "oc-auth";
 const STORAGE_LOGOUT_KEY = "oc_auth_logout_signal";
 const TAB_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -17,6 +19,9 @@ function dispatch(message: unknown): void {
   if (!message || typeof message !== "object") return;
   const m = message as Partial<LogoutMessage>;
   if (m.type !== "logout" || m.senderTabId === TAB_ID) return;
+  // 收到其它 tab 的登出广播：服务端已吊销本浏览器的 refresh cookie，
+  // 「登录过」标记一并作废，后续 boot 不再对已死的 cookie 发静默续期。
+  clearAuthHint();
   for (const listener of listeners) listener();
 }
 

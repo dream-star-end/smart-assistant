@@ -105,11 +105,11 @@ export function RelayCredentialsModal({
 
   const columns: Column<RelayCredential>[] = [
     { key: "label", title: "label", render: (c) => <span className="font-medium">{c.label}</span> },
-    { key: "base_url", title: "base_url", render: (c) => <span className="font-mono text-[12px] break-all">{c.base_url}</span> },
-    { key: "model_provider", title: "provider", render: (c) => <span className="font-mono text-[12px]">{c.model_provider}</span> },
+    { key: "base_url", title: "base_url", render: (c) => <span className="font-mono text-meta break-all">{c.base_url}</span> },
+    { key: "model_provider", title: "provider", render: (c) => <span className="font-mono text-meta">{c.model_provider}</span> },
     { key: "status", title: "状态", width: 80, render: (c) => <Badge tone={credTone(c.status)}>{c.status}</Badge> },
     { key: "health_score", title: "health", align: "right", cellClassName: "tabular-nums", render: (c) => c.health_score },
-    { key: "last_error", title: "最近错误", render: (c) => (c.last_error ? <span className="text-[12px] text-danger" title={c.last_error}>{c.last_error}</span> : <span className="text-faint">—</span>) },
+    { key: "last_error", title: "最近错误", render: (c) => (c.last_error ? <span className="text-meta text-danger" title={c.last_error}>{c.last_error}</span> : <span className="text-faint">—</span>) },
     {
       key: "actions",
       title: "操作",

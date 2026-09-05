@@ -722,7 +722,7 @@ export function TaskboardView({
         <EmptyState
           icon={Kanban}
           title={UNBOUND_BOARD_COPY}
-          hint="看板只绑定工作项目。请选择 all/none 以外的工作项目，或把当前会话绑定到看板。"
+          hint="任务看板按工作项目组织。请在上方选择一个具体的工作项目，或先把当前会话归入某个项目。"
         />
       ) : !board.projectId || (lockedProjectId && board.projectId !== lockedProjectId && !board.board) ? (
         <EmptyState

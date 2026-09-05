@@ -311,7 +311,8 @@ export function Landing(props: {
             </a>
           </nav>
           <div className="flex shrink-0 items-center gap-1.5">
-            <ThemeToggle theme={theme} onCycle={onCycleTheme} />
+            {/* 首页固定深色,但这里切的主题会带进登录页/工作区 —— 提前说明,避免"切了没反应"的错觉。 */}
+            <ThemeToggle theme={theme} onCycle={onCycleTheme} titleHint="影响登录后的界面" />
             <Button
               variant="ghost"
               shape="pill"

@@ -17,6 +17,86 @@
 export const DOWNLOAD_STREAM_MIN_BYTES = 3 * 1024 * 1024; // 3MB
 /** 达到/超过此值走原生 `<a download>`（Blob 全量驻内存，超大文件防 OOM）。 */
 export const DOWNLOAD_STREAM_MAX_BYTES = 100 * 1024 * 1024; // 100MB
+/** office/pdf 存盘前最小字节：挡住 410 JSON / 空 stub 冒充 .docx。 */
+export const OFFICE_PDF_MIN_BYTES = 2048;
+
+const OFFICE_EXTS = new Set(["docx", "pptx", "xlsx", "dotx", "xltx", "potx"]);
+const PDF_EXTS = new Set(["pdf"]);
+
+export type MagicSniffReason = "too-small" | "bad-magic";
+export type MagicSniffResult = { ok: true } | { ok: false; reason: MagicSniffReason };
+
+function filenameExt(filename: string): string {
+  const base = filename.split(/[\\/]/).pop() || filename;
+  const dot = base.lastIndexOf(".");
+  return dot >= 0 ? base.slice(dot + 1).toLowerCase() : "";
+}
+
+function asciiHead(bytes: Uint8Array, max = 32): string {
+  const n = Math.min(bytes.byteLength, max);
+  let out = "";
+  for (let i = 0; i < n; i++) out += String.fromCharCode(bytes[i]!);
+  return out;
+}
+
+function looksLikeJsonOrHtml(bytes: Uint8Array): boolean {
+  let i = 0;
+  if (bytes.byteLength >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) i = 3;
+  while (i < bytes.byteLength && (bytes[i] === 0x20 || bytes[i] === 0x09 || bytes[i] === 0x0a || bytes[i] === 0x0d)) {
+    i += 1;
+  }
+  const head = asciiHead(bytes.subarray(i), 16).toLowerCase();
+  return head.startsWith("{") || head.startsWith("[") || head.startsWith("<");
+}
+
+/**
+ * office/pdf 魔数表（纯函数）：PK / %PDF- 合法；`{` / `<!DOC` / 过短一律拒。
+ * 其它扩展名不嗅探（txt/csv 可以很小）。
+ */
+export function sniffOfficeOrPdfMagic(bytes: Uint8Array, filename: string): MagicSniffResult {
+  const ext = filenameExt(filename);
+  const isOffice = OFFICE_EXTS.has(ext);
+  const isPdf = PDF_EXTS.has(ext);
+  if (!isOffice && !isPdf) return { ok: true };
+  if (bytes.byteLength < OFFICE_PDF_MIN_BYTES) return { ok: false, reason: "too-small" };
+  if (looksLikeJsonOrHtml(bytes)) return { ok: false, reason: "bad-magic" };
+  if (isPdf) {
+    const h = asciiHead(bytes, 5);
+    if (h !== "%PDF-") return { ok: false, reason: "bad-magic" };
+  }
+  if (isOffice) {
+    if (bytes.byteLength < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b || bytes[2] !== 0x03 || bytes[3] !== 0x04) {
+      return { ok: false, reason: "bad-magic" };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * VITE_OC_FILECARD_SNIFF bake 默认关。关则 SignedFileCard 走现网 nativeDownload 路径。
+ * 测试可设 `globalThis.__OC_FILECARD_SNIFF = "1"`。
+ */
+export function fileCardSniffEnabled(): boolean {
+  const g = globalThis as typeof globalThis & {
+    __OC_FILECARD_SNIFF?: string;
+    process?: { env?: Record<string, string | undefined> };
+  };
+  const raw =
+    typeof g.__OC_FILECARD_SNIFF === "string"
+      ? g.__OC_FILECARD_SNIFF
+      : typeof g.process?.env?.VITE_OC_FILECARD_SNIFF === "string"
+        ? g.process.env.VITE_OC_FILECARD_SNIFF
+        : (() => {
+            try {
+              const vite = (import.meta as { env?: Record<string, string | undefined> }).env;
+              return typeof vite?.VITE_OC_FILECARD_SNIFF === "string" ? vite.VITE_OC_FILECARD_SNIFF : "";
+            } catch {
+              return "";
+            }
+          })();
+  const v = raw.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "on";
+}
 
 export type DownloadStrategy = "native" | "stream";
 
