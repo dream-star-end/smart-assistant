@@ -71,6 +71,7 @@ interface Canned {
   visibleOrphans?: Raw[]
   firstVisibleTraces?: Raw[]
   casToTerminalMiss?: boolean
+  abortedJournalRefs?: { user_id: string; request_id: string }[]
 }
 
 function makeFakePool(canned: Canned) {
@@ -126,6 +127,9 @@ function makeFakePool(canned: Canned) {
     if (s.startsWith('UPDATE') || s.startsWith('INSERT')) {
       recordWrite(s)
       writeParams.push(params ?? [])
+      if (s.includes("state='aborted'") && s.includes('request_finalize_journal')) {
+        return { rows: canned.abortedJournalRefs ?? [], rowCount: canned.abortedJournalRefs?.length ?? 0 }
+      }
       if (s.includes('client_notified = TRUE')) return { rows: [], rowCount: 1 }
       if (s.includes("status = 'manual_reconcile'")) return { rows: [rawRow({ status: 'manual_reconcile', conflict_reason: 'x' })], rowCount: 1 }
       if (s.includes("status = 'terminal'")) {
@@ -1081,6 +1085,7 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
   function orphanRow(over: Partial<Raw> = {}): Raw {
     return {
       dispatch_id: 'd-vis-1',
+      attempt_no: 1,
       user_id: '42',
       session_id: 'sess-vis',
       client_message_id: 'cm-vis',
@@ -1238,7 +1243,7 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
-      container: noContainer,
+      container: { ...noContainer, getDispatchState: async () => ({ kind: 'ok', state: 'running' }) },
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
@@ -1294,7 +1299,7 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
-      container: noContainer,
+      container: { ...noContainer, getDispatchState: async () => ({ kind: 'ok', state: 'running' }) },
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
@@ -1371,7 +1376,7 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
-      container: noContainer,
+      container: { ...noContainer, getDispatchState: async () => ({ kind: 'ok', state: 'running' }) },
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
@@ -1408,4 +1413,115 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.ok(!pool.writes.includes("COMMIT"))
   })
 
+})
+
+describe('OCV5-121 queued consumer full tick', () => {
+  for (const age of [16 * 60_000, 6 * 3_600_000]) {
+    for (const acceptedPage of [true, false]) {
+      test('queued age=' + age + ' acceptedPage=' + acceptedPage, async () => {
+        _resetVisibleOrphanScanOffset()
+        const now = Date.now()
+        const row = rawRow({ status: 'accepted', outcome: null,
+          admitted_at: new Date(now - age), accepted_at: new Date(now - age),
+          tape_visible_at: null, tape_id: null, tape_part_count: null, tape_parts_rows: '0',
+          last_frame_at: null, container_running: true })
+        const pool = makeFakePool({ acceptedStuck: acceptedPage ? [row] : [], visibleOrphans: [row] })
+        let probes = 0
+        let cancels = 0
+        const counts = await runReconcileTick({
+          pool: pool as unknown as Pool, now: () => now,
+          listCarrierDeadDispatchIds: async () => [],
+          container: { ...noContainer,
+            getDispatchState: async () => { probes++; return { kind: 'ok', state: 'queued' } },
+            cancelIfQueued: async (id) => {
+              assert.equal(id.attemptNo, 1)
+              cancels++
+              return { kind: 'ok', state: 'rejected', outcome: 'not_accepted' }
+            },
+          },
+        })
+        assert.equal(counts.visibleOrphans, 0)
+        assert.equal(probes, 1, 'accepted cache or exact per-row probe')
+        assert.equal(cancels, age >= 6 * 3_600_000 ? 1 : 0)
+        assert.equal(pool.writes.some(s => s.includes('producer_fenced_at') || s.includes("status = 'terminal'")), false)
+      })
+    }
+  }
+})
+
+test('OCV5-121 cancel outcomes always defer this tick; durable rejected settles without fallback', async () => {
+  for (const cancelResult of [
+    { kind: 'ok', state: 'rejected', outcome: 'not_accepted' },
+    { kind: 'ok', state: 'running' }, { kind: 'ok', state: 'absent' },
+    { kind: 'unreachable', detail: 'old runtime 404' },
+    { kind: 'error', detail: 'lost response after CAS' },
+  ] as ContainerCallResult[]) {
+    _resetVisibleOrphanScanOffset()
+    const now = Date.now()
+    const row = rawRow({ status: 'accepted', outcome: null, admitted_at: new Date(now - 6 * 3_600_000),
+      accepted_at: new Date(now - 6 * 3_600_000), tape_visible_at: null, tape_id: null,
+      tape_part_count: null, tape_parts_rows: '0', last_frame_at: null, container_running: true })
+    const canned: Canned = { acceptedStuck: [row], visibleOrphans: [row],
+      abortedJournalRefs: [{ user_id: '42', request_id: 'br-1' }] }
+    const pool = makeFakePool(canned)
+    let state: ContainerCallResult = { kind: 'ok', state: 'queued' }
+    let cancels = 0
+    const released: unknown[] = []
+    const deps = { pool: pool as unknown as Pool, now: () => now, listCarrierDeadDispatchIds: async () => [],
+      assessBilling: async () => 'not_billed' as const,
+      releaseReservation: async (ref: unknown) => { released.push(ref) },
+      container: { ...noContainer, getDispatchState: async () => state,
+        cancelIfQueued: async () => { cancels++; return cancelResult } } }
+    const first = await runReconcileTick(deps)
+    assert.equal(cancels, 1)
+    assert.equal(first.visibleOrphans, 0)
+    assert.equal(pool.writes.length, 0)
+    if (cancelResult.kind === 'unreachable' || (cancelResult.kind === 'ok' && cancelResult.state === 'absent')) {
+      const next = await runReconcileTick(deps)
+      assert.equal(next.rejectedTerminal, 0)
+      assert.equal(next.visibleOrphans, 0)
+      assert.equal(pool.writes.length, 0)
+      continue
+    }
+    if (cancelResult.kind === 'ok' && cancelResult.state === 'running') {
+      state = cancelResult
+      const next = await runReconcileTick(deps)
+      assert.equal(next.rejectedTerminal, 0)
+      assert.equal(next.visibleOrphans, 1, 'next tick retains running hard cap')
+      assert.equal(cancels, 1)
+      continue
+    }
+    // A successful or response-lost cancellation is discovered only by the next GET.
+    state = { kind: 'ok', state: 'rejected', outcome: 'not_accepted' }
+    const next = await runReconcileTick(deps)
+    assert.equal(next.rejectedTerminal, 1)
+    assert.equal(next.visibleOrphans, 0)
+    assert.equal(cancels, 1)
+    // Existing tick order visits terminal-unnotified before accepted; finance is the following tick.
+    canned.acceptedStuck = []
+    canned.visibleOrphans = []
+    canned.terminalUnnotified = [rawRow()]
+    const settled = await runReconcileTick(deps)
+    assert.equal(settled.notified, 1)
+    assert.deepEqual(released, [{ userId: '42', requestId: 'br-1' }])
+    assert.ok(pool.writes.some(s => s.includes("state='aborted'") && s.includes('request_finalize_journal')))
+    assert.equal(pool.writes.some(s => /producer_fenced_at\s*=/.test(s) || s.includes('visible-fallback')), false)
+  }
+})
+
+test('OCV5-121 active destructive candidates require exact running proof', async () => {
+  for (const state of [
+    { kind: 'unreachable', detail: 'timeout' }, { kind: 'error', detail: 'bad body' },
+    ...['rejected', 'terminal', 'absent', 'sink_staged', 'sink_stage_failed', 'recovery_pending'].map(state => ({ kind: 'ok', state })),
+  ] as ContainerCallResult[]) {
+    const now = Date.now()
+    const pool = makeFakePool({ visibleOrphans: [rawRow({ status: 'accepted',
+      admitted_at: new Date(now - 7 * 3_600_000), accepted_at: new Date(now - 7 * 3_600_000),
+      tape_visible_at: null, tape_id: null, tape_part_count: null, tape_parts_rows: '0',
+      last_frame_at: null, container_running: true })] })
+    const counts = await runReconcileTick({ pool: pool as unknown as Pool, now: () => now,
+      listCarrierDeadDispatchIds: async () => [], container: { ...noContainer, getDispatchState: async () => state } })
+    assert.equal(counts.visibleOrphans, 0)
+    assert.equal(pool.writes.length, 0)
+  }
 })

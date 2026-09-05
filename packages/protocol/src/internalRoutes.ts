@@ -92,6 +92,7 @@ export const WECHAT_INBOUND_COMPENSATE_PATH = '/internal/v3/wechat-inbound-compe
 export const QQ_INBOUND_CONTAINER_PATH = '/internal/v3/qq-inbound'
 export const QQ_INBOUND_COMPENSATE_PATH = '/internal/v3/qq-inbound-compensate'
 export const QQ_STOP_CONTAINER_PATH = '/internal/v3/qq-stop'
+export const TURN_CANCEL_IF_QUEUED_PATH = '/internal/v3/turn-cancel-if-queued'
 export const TURN_REJECT_IF_ABSENT_PATH = '/internal/v3/turn-reject-if-absent'
 export const TURN_DISPATCH_STATE_PATH = '/internal/v3/turn-dispatch-state'
 export const RUNTIME_RECYCLE_DRAIN_PATH = '/internal/v3/runtime-recycle-drain'
@@ -465,6 +466,12 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v3',
     sources: ['gateway/src/server.ts', 'commercial/src/qqbot/service.ts'],
+  },
+  {
+    path: TURN_CANCEL_IF_QUEUED_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/server.ts', 'commercial/src/dispatch/containerDispatchClient.ts'],
   },
   {
     path: TURN_REJECT_IF_ABSENT_PATH,

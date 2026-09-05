@@ -74,6 +74,7 @@ import {
   stripDispatchAuthorityField,
   isLiveUnitsEnabled,
   type PromptQueueMutationFrame,
+  TURN_CANCEL_IF_QUEUED_PATH,
 } from '@openclaude/protocol'
 import {
   failureClassFromLocalExecutionCode,
@@ -579,6 +580,7 @@ import {
   queryMasterTapeState,
   recoverTurnDispatchInboxOnBoot,
   rejectTurnDispatchIfAbsent,
+  cancelQueuedTurnDispatchExact,
   resolveInboxTerminalAck,
   runDurableDispatchAdmission,
 } from './turnDispatchInbox.js'
@@ -4297,6 +4299,21 @@ export class Gateway {
     // POST /internal/v3/turn-reject-if-absent —— reconciler rejecting 分支:有 inbox 行
     // 返状态(negative proof 不成立);无行插 rejected(not_accepted)墓碑。durable
     // rejected tombstone 是 I2 里 negative proof 的**唯一**合法来源。
+    if (url.pathname === TURN_CANCEL_IF_QUEUED_PATH && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      this.handleTurnCancelIfQueued(req, res).catch((err) => {
+        this.log.error('turn-cancel-if-queued handler crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
     if (url.pathname === '/internal/v3/turn-reject-if-absent' && req.method === 'POST') {
       if (!this.checkInboundBypass(req, url)) {
         this.sendJson(res, 401, { error: 'unauthorized' })
@@ -6562,6 +6579,32 @@ export class Gateway {
    * 整段消息走错容器属于上游路由 bug,跟 dispatchInbound 收到一条 WS frame 信任
    * _userId 是同一信任模型(checkInboundBypass 已确认 caller = master broker)。
    */
+  /** OCV5-121: exact queued cancellation, never Stop an active predecessor. */
+  private async handleTurnCancelIfQueued(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let body: Record<string, unknown>
+    try {
+      const parsed: unknown = JSON.parse(await this.readBody(req, 16 * 1024))
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid body')
+      body = parsed as Record<string, unknown>
+    } catch {
+      this.sendJson(res, 400, { error: 'invalid or oversized body' })
+      return
+    }
+    const { userId, sessionId, clientMessageId, dispatchId, attemptNo } = body
+    if (typeof userId !== 'string' || userId === ''
+      || typeof sessionId !== 'string' || sessionId === ''
+      || typeof clientMessageId !== 'string' || clientMessageId === ''
+      || typeof dispatchId !== 'string' || dispatchId === ''
+      || typeof attemptNo !== 'number' || !Number.isSafeInteger(attemptNo) || attemptNo < 1) {
+      this.sendJson(res, 400, { error: 'userId/sessionId/clientMessageId/dispatchId/attemptNo required' })
+      return
+    }
+    const result = await cancelQueuedTurnDispatchExact({ userId, sessionId, clientMessageId, dispatchId, attemptNo })
+    this.sendJson(res, result.conflict ? 409 : 200, result.conflict
+      ? { ...result, error: 'dispatch identity conflict' }
+      : result)
+  }
+
   /**
    * RFC-v5-durable-turn-dispatch §3 — POST /internal/v3/turn-reject-if-absent。
    *

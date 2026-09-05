@@ -28,6 +28,7 @@ import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBack
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
   classifyVisibleOrphan,
+  HARD_CAP_AGE_MS,
   firstVisibleAtMsForDispatch,
   shouldFenceProducer,
   type TraceFirstVisibleRow,
@@ -202,6 +203,7 @@ export async function abortNeverExecutedJournalForDispatch(
 export interface TurnDispatchReconcilerDeps {
   pool: Pool
   container: {
+    cancelIfQueued?: (id: DispatchIdentity) => Promise<ContainerCallResult>
     rejectIfAbsent: (id: DispatchIdentity) => Promise<ContainerCallResult>
     getDispatchState: (id: DispatchIdentity) => Promise<ContainerCallResult>
   }
@@ -353,6 +355,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   // 扫描下限取 ALERT_MS(15min)而非 stuckMs(下限 90min):否则求证系统性瘫痪
   // (如 SSRF 拦死)要等 stuckMs 才首告(Codex R1 MAJOR)。[ALERT_MS, stuckMs)
   // 窗口内的行**只探测+告警,零状态迁移**——所有既有收敛分支仍由下方 age 门守住。
+  const dispatchStates = new Map<string, ContainerCallResult>()
   const stuck = await scanAcceptedStuck(deps.pool, {
     // Read typed container state every tick. This is a bounded indexed page,
     // not a timeout: it lets a restarted executor publish an interruption
@@ -368,7 +371,10 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   for (const row of stuck) {
     const age = now() - (row.acceptedAt ?? row.admittedAt).getTime()
     const hasDeadEvidence = acceptedDeadIds.has(row.dispatchId) || dispatchHasShutdownEvidence(row)
-    const res = await deps.container.getDispatchState(idOf(row))
+    const res = await deps.container.getDispatchState(idOf(row)).catch((): ContainerCallResult => ({
+      kind: 'unreachable', detail: 'dispatch state query failed',
+    }))
+    dispatchStates.set(JSON.stringify([row.dispatchId, row.attemptNo]), res)
     if (res.kind === 'ok' && (res.state === 'running' || res.state === 'queued' || res.state === 'sink_staged')) {
       // 真在飞:禁止因停机证据收口。清掉证据,避免下一轮不可达时误杀。
       if (hasDeadEvidence) await clearExitMark(deps, row)
@@ -485,7 +491,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   }
 
   // ── closeVisibleOrphans (rev2 B4): tapeless fallback + fence + late tape ──
-  counts.visibleOrphans = await closeVisibleOrphans(deps, now(), limit)
+  counts.visibleOrphans = await closeVisibleOrphans(deps, now(), limit, dispatchStates)
 
   // ── open>7d 只读告警(永不 GC)─────────────────────────────────────────────
   const openAged = await scanOpenAged(deps.pool, { ageMs: DISPATCH_OPEN_ALERT_AGE_MS, limit, now: now() })
@@ -660,6 +666,9 @@ async function finalizeOrphanDispatch(input: {
 
 type VisibleOrphanScanRow = {
   dispatch_id: string
+  attempt_no: number
+  agent_container_id: number | null
+  runtime_kind: string | null
   user_id: string
   session_id: string
   client_message_id: string
@@ -756,12 +765,13 @@ async function closeVisibleOrphans(
   deps: TurnDispatchReconcilerDeps,
   nowMs: number,
   limit: number,
+  dispatchStates: Map<string, ContainerCallResult>,
 ): Promise<number> {
   const scanLimit = Math.min(200, Math.max(limit * 4, limit))
   const queryVisible = async (offset: number) => deps.pool.query<VisibleOrphanScanRow>(
     `SELECT -- closeVisibleOrphans
             d.dispatch_id, d.user_id::text AS user_id, d.session_id, d.client_message_id,
-            d.status, d.admitted_at, d.accepted_at,
+            d.status, d.admitted_at, d.accepted_at, d.attempt_no, d.agent_container_id, d.runtime_kind,
             t.visible_at::text AS tape_visible_at,
             t.part_count AS tape_part_count,
             t.tape_id,
@@ -825,6 +835,34 @@ async function closeVisibleOrphans(
       nowMs,
     })
     if (action === 'skip') continue
+    if (row.container_running === true && (action === 'interrupt_tapeless' || action === 'fence_hard_cap')) {
+      // Active queued is waiting, not an engine-dead signal. The wider visible
+      // page must probe identities missing from this tick's accepted page.
+      if (!Number.isSafeInteger(row.attempt_no) || row.attempt_no < 1) continue
+      const id: DispatchIdentity = {
+        uid: BigInt(row.user_id), sessionId: row.session_id, clientMessageId: row.client_message_id,
+        dispatchId: row.dispatch_id, attemptNo: row.attempt_no,
+        agentContainerId: row.agent_container_id, runtimeKind: row.runtime_kind,
+      }
+      const cacheKey = JSON.stringify([id.dispatchId, id.attemptNo])
+      let state = dispatchStates.get(cacheKey)
+      if (!state) {
+        state = await deps.container.getDispatchState(id).catch((): ContainerCallResult => ({
+          kind: 'unreachable', detail: 'dispatch state query failed',
+        }))
+        dispatchStates.set(cacheKey, state)
+      }
+      if (state.kind !== 'ok') continue
+      if (state.state === 'queued') {
+        if (nowMs - (row.accepted_at ?? row.admitted_at).getTime() >= HARD_CAP_AGE_MS) {
+          // Even a successful cancel cannot terminalize in this tick. The next
+          // durable GET reclassifies rejected through the existing financial path.
+          await deps.container.cancelIfQueued?.(id).catch(() => undefined)
+        }
+        continue
+      }
+      if (state.state !== 'running') continue
+    }
     const hasTape = typeof row.tape_id === 'string' && row.tape_id.length > 0
     const outcome = action === 'complete_from_frames' || action === 'converge_only'
       ? 'completed' as const
@@ -1284,6 +1322,9 @@ function withProbeBudget(
     }
   }
   return {
+    ...(container.cancelIfQueued ? {
+      cancelIfQueued: (id: DispatchIdentity) => wrap(container.cancelIfQueued!(id)),
+    } : {}),
     rejectIfAbsent: (id) => wrap(container.rejectIfAbsent(id)),
     getDispatchState: (id) => wrap(container.getDispatchState(id)),
   }

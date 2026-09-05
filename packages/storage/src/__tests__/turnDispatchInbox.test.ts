@@ -331,3 +331,46 @@ test('session 硬删级联清 inbox 行', async () => {
     'session 软删级联清 inbox 行',
   )
 })
+
+test('OCV5-121 exact cancel: identity, both CAS orders and idempotence', async () => {
+  const { cancelQueuedTurnDispatchExact } = await import('../sessionsDb.js')
+  const k = key(121)
+  await insertQueuedTurnDispatch(k)
+  for (const mismatch of [
+    { userId: 'other' }, { sessionId: 'other' }, { clientMessageId: 'other' },
+    { dispatchId: 'other' }, { attemptNo: 2 },
+  ]) {
+    assert.equal((await cancelQueuedTurnDispatchExact({ ...k, ...mismatch })).conflict, true)
+    assert.equal((await getTurnDispatchByDispatchId(k.dispatchId, 1))?.state, 'queued')
+  }
+  assert.deepEqual(await cancelQueuedTurnDispatchExact(key(999)), {
+    applied: false, found: false, conflict: false, state: 'absent', outcome: null,
+  })
+  assert.equal((await cancelQueuedTurnDispatchExact(k)).applied, true)
+  const duplicate = await cancelQueuedTurnDispatchExact(k)
+  assert.equal(duplicate.applied, false)
+  assert.equal(duplicate.state, 'rejected')
+  assert.equal(duplicate.outcome, 'not_accepted')
+  const execution = { agentId: 'main', turnIndex: 1, turnKey: 'tk', requestId: null, createdAt: 1 }
+  assert.equal(await recordTurnDispatchRunning({ ...k, ...execution }), null)
+  const runningKey = key(122)
+  await insertQueuedTurnDispatch(runningKey)
+  assert.equal((await recordTurnDispatchRunning({ ...runningKey, ...execution }))?.state, 'running')
+  assert.equal((await cancelQueuedTurnDispatchExact(runningKey)).state, 'running')
+  assert.equal((await cancelQueuedTurnDispatchExact(runningKey)).applied, false)
+})
+
+test('OCV5-121 exact cancel preserves every non-queued durable state', async () => {
+  const { cancelQueuedTurnDispatchExact } = await import('../sessionsDb.js')
+  let n = 130
+  for (const state of ['running', 'recovery_pending', 'sink_staged', 'sink_stage_failed', 'terminal'] as const) {
+    const k = key(n++)
+    await insertQueuedTurnDispatch(k)
+    await casTurnDispatchState({ ...k, fromStates: ['queued'], toState: state })
+    const before = await getTurnDispatchByDispatchId(k.dispatchId, 1)
+    const response = await cancelQueuedTurnDispatchExact({ ...k, now: 999999 })
+    assert.equal(response.applied, false)
+    assert.equal(response.state, state)
+    assert.deepEqual(await getTurnDispatchByDispatchId(k.dispatchId, 1), before)
+  }
+})

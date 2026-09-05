@@ -78,3 +78,49 @@ describe("containerDispatchClient B4 dispatch-state 解析契约", () => {
     assert.equal(r.kind, "unreachable");
   });
 });
+
+describe('OCV5-121 cancel client fail-closed contract', () => {
+  test('exact POST identity, shared nonce and deadline; repeated rejected proof', async () => {
+    const client = makeContainerDispatchClient({
+      bridgeSecret: 's'.repeat(32), timeoutMs: 321,
+      resolveRunningEndpoint: async () => ({ host: '127.0.0.1', port: 8080, containerId: 7 }),
+      transport: {
+        post: async () => { throw new Error('unexpected post fallback') },
+        request: async (method, _endpoint, path, headers, body, timeout) => {
+          assert.equal(method, 'POST')
+          assert.equal(path, '/internal/v3/turn-cancel-if-queued')
+          assert.equal(timeout, 321)
+          assert.equal(headers['x-openclaude-container-id'], '7')
+          assert.equal(headers['x-openclaude-inbound-nonce']?.length, 43)
+          assert.deepEqual(JSON.parse(body!), { userId: '42', sessionId: 'web-1',
+            clientMessageId: 'cm-1', dispatchId: 'd-1', attemptNo: 1 })
+          return { status: 200, bodyText: JSON.stringify({ applied: false, found: true,
+            conflict: false, state: 'rejected', outcome: 'not_accepted' }) }
+        },
+      },
+    })
+    assert.deepEqual(await client.cancelIfQueued(ID), { kind: 'ok', state: 'rejected', outcome: 'not_accepted' })
+  })
+  test('404, conflict, malformed and lost response never prove cancellation', async () => {
+    for (const [status, body] of [
+      [404, '{}'], [409, '{}'], [500, '{}'], [200, 'null'],
+      [200, '{"state":"rejected"}'],
+      [200, '{"applied":true,"found":true,"conflict":false,"state":"running"}'],
+      [200, '{"applied":false,"found":false,"conflict":false,"state":"rejected"}'],
+    ] as const) assert.notEqual((await clientWith(status, body).cancelIfQueued(ID)).kind, 'ok')
+    const client = makeContainerDispatchClient({
+      bridgeSecret: 's'.repeat(32),
+      resolveRunningEndpoint: async () => ({ host: '127.0.0.1', port: 8080, containerId: 7 }),
+      transport: { post: async () => { throw new Error('deadline/lost response') } },
+    })
+    assert.equal((await client.cancelIfQueued(ID)).kind, 'unreachable')
+  })
+  test('running CAS loser and absent are not rejected proof', async () => {
+    for (const state of ['running', 'recovery_pending', 'sink_staged', 'sink_stage_failed', 'terminal', 'absent']) {
+      const result = await clientWith(200, JSON.stringify({ applied: false, conflict: false,
+        found: state !== 'absent', state })).cancelIfQueued(ID)
+      assert.equal(result.kind, 'ok')
+      assert.equal((result as { state: string }).state, state)
+    }
+  })
+})

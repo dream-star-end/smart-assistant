@@ -2814,6 +2814,9 @@ export function makeTurnTapeStateHandler(deps: TurnTapeStateHandlerDeps): Server
         status: result.status,
         dispatchLeaseActive: result.dispatchLeaseActive,
         gatewayShutdownEvidence: result.gatewayShutdownEvidence === true,
+        ...(result.dispatchStatus !== undefined ? { dispatchStatus: result.dispatchStatus } : {}),
+        ...(result.dispatchOutcome !== undefined ? { dispatchOutcome: result.dispatchOutcome } : {}),
+        ...(result.producerFenced !== undefined ? { producerFenced: result.producerFenced } : {}),
       }, requestId);
     } catch (err) {
       log.error("turn_tape_state_read_failed", { dispatchId, attemptNo, err: err as Error });

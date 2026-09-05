@@ -17,6 +17,7 @@ import {
   inheritMemoryTurnPolicy,
   readMemoryTurnPolicy,
   recordTurnDispatchRunning,
+  getTurnDispatchByDispatchId,
   reserveTurnIndex,
   recordMemoryUsageEvent,
   paths,
@@ -5116,6 +5117,24 @@ export class SessionManager {
         recordErr = err
       }
       if (recordErr !== undefined || runningRow === null) {
+        if (recordErr === undefined) {
+          try {
+            const current = await getTurnDispatchByDispatchId(dispatchContext.dispatchId, dispatchContext.attemptNo)
+            if (current?.state === 'rejected'
+              && current.userId === dispatchContext.userId
+              && current.sessionId === dispatchContext.sessionId
+              && current.clientMessageId === dispatchContext.clientMessageId
+              && current.dispatchId === dispatchContext.dispatchId
+              && current.attemptNo === dispatchContext.attemptNo) {
+              log.info('DISPATCH_QUEUED_CANCELLED_BEFORE_START', {
+                dispatchId: current.dispatchId, attemptNo: current.attemptNo, state: current.state,
+              })
+              return
+            }
+          } catch (err) {
+            recordErr = err
+          }
+        }
         log.error(
           'turn dispatch running CAS unconfirmed — refusing model call (fail-closed)',
           {
