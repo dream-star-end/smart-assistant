@@ -28,6 +28,8 @@ packages/**/*.tsbuildinfo
 commercial-unit.tap
 
 # Windows desktop local dependencies and installers
+apps/windows/node_modules/
+apps/windows/release/
 packages/desktop/node_modules/
 packages/desktop/release/
 __pycache__/

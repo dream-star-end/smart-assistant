@@ -1,0 +1,43 @@
+appId: chat.claudeai.clarvy
+productName: Clarvy
+asar: true
+# appId 必须与 src/main.mjs 的 APP_ID 一致，否则 Windows toast / Jump List 无法绑定到本应用。
+# NSIS 会创建同名开始菜单快捷方式；本阶段不保证进程退出后 Action Center 点击能重新拉起下载面板。
+
+directories:
+  output: release
+  buildResources: ../../packages/web-react/public/icons
+
+files:
+  - src/**/*
+  - THIRD_PARTY_NOTICES.md
+  - package.json
+
+win:
+  executableName: Clarvy
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: icon-512.png
+  artifactName: Clarvy-Setup-${version}-${arch}.${ext}
+  forceCodeSigning: false
+  verifyUpdateCodeSignature: true
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 从简
+  deleteAppDataOnUninstall: false
+
+electronFuses:
+  runAsNode: false
+  enableCookieEncryption: true
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  grantFileProtocolExtraPrivileges: false
+  enableEmbeddedAsarIntegrityValidation: true
+  onlyLoadAppFromAsar: true
