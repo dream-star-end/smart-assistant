@@ -1332,8 +1332,13 @@ await check("T14 消息反馈弹窗关闭后把焦点还给原消息动作", asy
   }
   await dialog.getByRole("button", { name: "关闭" }).click();
   await dialog.waitFor({ state: "hidden", timeout: 3000 });
-  const focused = await trigger.evaluate((node) => document.activeElement === node);
-  if (!focused) throw new Error("关闭反馈弹窗后焦点没有归还原消息动作");
+  const handle = await trigger.elementHandle();
+  if (!handle) throw new Error("关闭后找不到原消息动作按钮");
+  await page.waitForFunction(
+    (el) => el instanceof HTMLElement && document.activeElement === el,
+    handle,
+    { timeout: 3000 },
+  );
 });
 
 await check("T15 活动 turn 中专用 Ask UI 在移动端可点选并提交", async () => {
@@ -1947,7 +1952,13 @@ await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹
     const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
     return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 200;
   }, null, { timeout: 5000 });
-  await mobilePage.evaluate(() => window.__mobilePage.armSticky());
+  // grow 后 layout 可能还在涨高；反复 armSticky 直到真贴底，避免 12px 级竞态。
+  await mobilePage.waitForFunction(() => {
+    window.__mobilePage.armSticky();
+    const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
+    if (!(node instanceof HTMLElement)) return false;
+    return Math.abs(node.scrollTop - (node.scrollHeight - node.clientHeight)) <= 2;
+  }, null, { timeout: 5000 });
   const before = await scroll.evaluate((node) => ({
     top: node.scrollTop,
     height: node.scrollHeight,

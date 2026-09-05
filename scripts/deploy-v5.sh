@@ -41,6 +41,9 @@
 #   scripts/deploy-v5.sh --activate-staged --cutover-nonce=NONCE
 #   scripts/deploy-v5.sh --rollback    # 恢复 .prev.1 + restart(收尾追加一次非阻断 real-turn canary)
 #   scripts/deploy-v5.sh --rollback=N  # 恢复 .prev.N(N=1..5)+ restart
+#   scripts/deploy-v5.sh --allow-legacy-manifest-missing
+#                                  # 缺 .baseline-manifest.json 时走旧 legacy 基线校验；
+#                                  # 新 release（有 manifest）仍按自身清单 + MIN_SECURITY_POLICY。
 #   scripts/deploy-v5.sh --install-monitor # 原子安装独立于 A/B slot 的 host monitor bundle
 #   scripts/deploy-v5.sh --reclaim-mutation-lease
 #                                  # 回收陈旧的 kl-mirror production-mutation lease:读远端 fencing meta →
@@ -141,6 +144,15 @@ BASELINE_GUARD_SCRIPT="$SCRIPT_DIR/v5-baseline-security.sh"
   echo "FATAL: 缺或不可执行的 V5 baseline guard: $BASELINE_GUARD_SCRIPT" >&2
   exit 1
 }
+# First sourceCommit whose builds write .baseline-manifest.json. Empty until
+# this feature's merge SHA is filled in; empty = no automatic
+# --allow-legacy-manifest-missing from ancestry.
+LEGACY_MANIFEST_CUTOFF_COMMIT=""
+# One-cycle fallback: missing-manifest + allow still uses
+# check-release-legacy-cursor / serving_release_uses_legacy_baseline.
+# Delete when every live/rollback target has a manifest and cutoff is set.
+OC_V5_LEGACY_BASELINE_FALLBACK="${OC_V5_LEGACY_BASELINE_FALLBACK:-1}"
+ALLOW_LEGACY_MANIFEST_MISSING=0
 RELEASE_GC_SCRIPT="$SCRIPT_DIR/v5-release-gc.sh"
 [ -x "$RELEASE_GC_SCRIPT" ] || {
   echo "FATAL: 缺或不可执行的 V5 release GC guard: $RELEASE_GC_SCRIPT" >&2
@@ -314,6 +326,7 @@ for arg in "$@"; do
     --rollback=*) MODE="rollback"; ROLLBACK_N="${arg#*=}" ;;
     # 陈旧 production-mutation lease 回收(C1):只读探测 + 条件清理,不抢任何本地/全局锁。
     --allow-unverified-ci) ALLOW_UNVERIFIED_CI=1 ;;
+    --allow-legacy-manifest-missing) ALLOW_LEGACY_MANIFEST_MISSING=1 ;;
     --reclaim-mutation-lease) MODE="reclaim-mutation-lease" ;;
     --reclaim-mutation-inflight) MODE="reclaim-mutation-inflight" ;;
     # 模型权威(方案 §7 步 4/5)。preflight 是四面活体门,cutover 是不可逆地板。
@@ -457,19 +470,24 @@ slot_baseline_dir() { # <A|B>
   printf '%s/packages/commercial/agent-sandbox/ccb-baseline\n' "$(slot_src "$1")"
 }
 
-run_baseline_guard_remote() { # <check-release|harden-release|check-dir|harden-dir> <absolute-path>
-  local guard_mode="$1" target="$2" qmode qtarget
-  [[ "$guard_mode" =~ ^(check-release|harden-release|check-release-legacy-cursor|harden-release-legacy-cursor|check-dir|harden-dir)$ ]] \
+run_baseline_guard_remote() { # <mode> <absolute-path> [extra-args...]
+  local guard_mode="$1" target="$2" qmode qtarget extra_q="" q a
+  shift 2
+  [[ "$guard_mode" =~ ^(check-release|harden-release|check-release-legacy-cursor|harden-release-legacy-cursor|check-dir|harden-dir|verify-release|write-manifest)$ ]] \
     || { echo "✗ baseline guard mode 非法:$guard_mode" >&2; return 2; }
   [[ "$target" =~ ^/[A-Za-z0-9._/-]+$ ]] \
     || { echo "✗ baseline guard path 非法:$target" >&2; return 2; }
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] baseline guard $guard_mode $target"
+    echo "  [dry-run] baseline guard $guard_mode $target $*"
     return 0
   fi
   printf -v qmode '%q' "$guard_mode"
   printf -v qtarget '%q' "$target"
-  ssh "$KL_HOST" "bash -s -- $qmode $qtarget" < "$BASELINE_GUARD_SCRIPT"
+  for a in "$@"; do
+    printf -v q '%q' "$a"
+    extra_q+=" $q"
+  done
+  ssh "$KL_HOST" "bash -s -- $qmode $qtarget$extra_q" < "$BASELINE_GUARD_SCRIPT"
 }
 
 assert_release_baseline_security() { # <absolute-release-root>
@@ -492,14 +510,55 @@ assert_legacy_release_baseline_security() { # <absolute-release-root>
     || { echo "✗ legacy serving release 的 CCB baseline 不完整/不安全:$1" >&2; return 1; }
 }
 
-# Smoke on this deploy's newly built release stays strict (check-dir).
+write_release_baseline_manifest() { # <release-root> <40-hex-source>
+  local root="$1" sha="$2"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "✗ write baseline manifest: sourceCommit 非法" >&2; return 1; }
+  run_baseline_guard_remote write-manifest "$root" "$sha" \
+    || { echo "✗ 写入 .baseline-manifest.json 失败:$root" >&2; return 1; }
+}
+
+# True when this release's .complete.sourceCommit is a strict ancestor of
+# LEGACY_MANIFEST_CUTOFF_COMMIT (the first SHA that writes manifests).
+# Empty cutoff → never auto-allow (fail-closed until the merge SHA is filled).
+release_source_predates_manifest_cutoff() { # <release-root>
+  local release="$1" serving_sha
+  [[ "$LEGACY_MANIFEST_CUTOFF_COMMIT" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ -n "$release" ]] || return 1
+  [[ "${DRY:-0}" == 1 ]] && return 1
+  serving_sha="$(ssh "$KL_HOST" "jq -er '.sourceCommit | select(type==\"string\" and test(\"^[0-9a-f]{40}$\"))' '$release/.complete'" 2>/dev/null)" || return 1
+  [[ "$serving_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$serving_sha" != "$LEGACY_MANIFEST_CUTOFF_COMMIT" ]] || return 1
+  git -C "$REPO_ROOT" merge-base --is-ancestor "$serving_sha" "$LEGACY_MANIFEST_CUTOFF_COMMIT" 2>/dev/null
+}
+
+# Two-question baseline verify: (a) release matches its own manifest;
+# (b) current checkout MIN_SECURITY_POLICY. Missing manifest is FATAL unless
+# --allow-legacy-manifest-missing / rollback flag / cutoff ancestry / one-cycle
+# fallback classifier says otherwise.
+verify_release_baseline_security() { # <absolute-release-root>
+  local release="$1"
+  local extra=()
+  if [[ "${ALLOW_LEGACY_MANIFEST_MISSING:-0}" == 1 \
+     || "${ROLLBACK_LEGACY_BASELINE_OK:-0}" == 1 ]] \
+     || release_source_predates_manifest_cutoff "$release" \
+     || { [[ "${OC_V5_LEGACY_BASELINE_FALLBACK:-1}" == 1 ]] && serving_release_uses_legacy_baseline "$release"; }; then
+    extra+=(--allow-legacy-manifest-missing)
+  fi
+  run_baseline_guard_remote verify-release "$release" "${extra[@]}" \
+    || { echo "✗ release baseline 两问校验失败:$release" >&2; return 1; }
+}
+
+# One-cycle fallback classifier for missing-manifest releases.
 # Compensation/rollback may re-serve a predecessor that predates skills added
 # in this checkout (e.g. multi-model-review). Official --rollback already
 # prefixes ROLLBACK_LEGACY_BASELINE_OK=1; compensation callers historically did
-# not, so smoke itself must pick legacy when serving != BUILT_RELEASE.
+# not, so this helper still returns true when serving != BUILT_RELEASE.
 # --recover has no build (BUILT_RELEASE empty). Identity is serving .complete
 # sourceCommit vs this checkout HEAD: unequal → legacy; unreadable / non-40-hex
 # / ssh fail / DRY → strict (fail-closed, same as today).
+# verify_release_baseline_security consults this only when
+# OC_V5_LEGACY_BASELINE_FALLBACK=1 (default). Delete after cutoff is filled
+# and every live/rollback target has .baseline-manifest.json.
 serving_release_uses_legacy_baseline() { # <serving-release>
   local serving="${1:-}" serving_sha checkout_sha
   [[ "${ROLLBACK_LEGACY_BASELINE_OK:-0}" == 1 ]] && return 0
@@ -767,17 +826,10 @@ case "$shared_rc" in
   *) echo "FATAL: cannot inspect shared V5 env(rc=$shared_rc)" >&2; exit 1 ;;
 esac
 REMOTE
-  if [[ "${ROLLBACK_LEGACY_BASELINE_OK:-0}" == 1 ]]; then
-    # Emergency/history rollback targets may predate the admin overlay files.
-    # Keep the live env/port fail-closed checks above, but validate the immutable
-    # target with the narrow legacy allowlist instead of the forward-only tree.
-    local live_release
-    live_release="$(bg_current_release "$src")"
-    [[ -n "$live_release" ]] || { echo "✗ legacy rollback live release 无法解析:$src" >&2; return 1; }
-    assert_legacy_release_baseline_security "$live_release" || return 1
-  else
-    run_baseline_guard_remote check-dir "$expected" || return 1
-  fi
+  local live_release
+  live_release="$(bg_current_release "$src")"
+  [[ -n "$live_release" ]] || { echo "✗ live release 无法解析:$src" >&2; return 1; }
+  verify_release_baseline_security "$live_release" || return 1
   # V5 is local-only (deploy/v5/P1-PLAN.md). A loopback-only reservation blocks
   # the old wildcard BaselineServer bind across rollback and A/B canary masters.
   assert_v5_baseline_port_guard || {
@@ -2900,12 +2952,14 @@ version_commit="$(jq -er '.commit | select(type == "string")' "$version")" || ex
 if [[ "$kind" == strong ]]; then
   row="$(jq -er --argjson schema "$schema" '
     if (((["artifactSha256","builtAt","metadataSha256","schemaVersion","sourceCommit"] - keys) | length) == 0
-      and ((keys - ["artifactSha256","builtAt","distReuse","flavorGuardGeneration","metadataSha256","schemaVersion","sourceCommit"]) | length) == 0
+      and ((keys - ["artifactSha256","baselineManifestSha256","builtAt","distReuse","flavorGuardGeneration","metadataSha256","schemaVersion","sourceCommit"]) | length) == 0
       and .schemaVersion == $schema
       and (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
       and (.builtAt | type == "string" and test("^[0-9]{8}-[0-9]{6}$"))
       and (.metadataSha256 | type == "string" and test("^[0-9a-f]{64}$"))
       and (.artifactSha256 | type == "string" and test("^[0-9a-f]{64}$"))
+      and ((has("baselineManifestSha256") | not)
+        or (.baselineManifestSha256 | type == "string" and test("^[0-9a-f]{64}$")))
       and ((has("distReuse") | not)
         or ((.distReuse | type == "object")
           and (.distReuse.fromRelease | type == "string" and startswith("/"))
@@ -2932,6 +2986,17 @@ if [[ "$kind" == strong ]]; then
   [[ "$artifact_have" == "$artifact_want" ]] || {
     echo "FATAL: release artifact digest mismatch:$reldir" >&2; exit 1;
   }
+  if jq -e '.baselineManifestSha256 | type == "string"' "$marker" >/dev/null; then
+    manifest="$reldir/.baseline-manifest.json"
+    [[ -f "$manifest" && ! -L "$manifest" ]] || {
+      echo "FATAL: baselineManifestSha256 present but .baseline-manifest.json missing:$reldir" >&2; exit 1;
+    }
+    manifest_want="$(jq -er '.baselineManifestSha256' "$marker")"
+    manifest_have="$(sha256sum -- "$manifest" | cut -d' ' -f1)"
+    [[ "$manifest_have" == "$manifest_want" ]] || {
+      echo "FATAL: baseline manifest digest mismatch:$reldir" >&2; exit 1;
+    }
+  fi
   printf 'strong\t%s\t%s\t%s\t%s\n' "$source_commit" "$short" "$built_at" "$artifact_want"
 else
   row="$(jq -er '
@@ -3147,16 +3212,32 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
   artifact_sha="$(release_artifact_digest "$root")"
   [[ "$metadata_sha" =~ ^[0-9a-f]{64}$ && "$artifact_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
   marker_tmp="${root}.complete.$$"
-  if ! jq -n \
-    --argjson schemaVersion "$schema" \
-    --arg sourceCommit "$full_sha" \
-    --arg builtAt "$built_at" \
-    --arg metadataSha256 "$metadata_sha" \
-    --arg artifactSha256 "$artifact_sha" \
-    --argjson flavorGuardGeneration 1 \
-    '{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
+  local jq_args=(
+    -n
+    --argjson schemaVersion "$schema"
+    --arg sourceCommit "$full_sha"
+    --arg builtAt "$built_at"
+    --arg metadataSha256 "$metadata_sha"
+    --arg artifactSha256 "$artifact_sha"
+    --argjson flavorGuardGeneration 1
+  )
+  local jq_prog='{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
       metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
-      flavorGuardGeneration:$flavorGuardGeneration}' >"$marker_tmp"; then
+      flavorGuardGeneration:$flavorGuardGeneration}'
+  local baked_manifest="$root/.baseline-manifest.json" manifest_sha
+  if [[ -e "$baked_manifest" ]]; then
+    [[ -f "$baked_manifest" && ! -L "$baked_manifest" ]] || {
+      echo "FATAL: .baseline-manifest.json 必须是常规文件:$baked_manifest" >&2; return 1;
+    }
+    manifest_sha="$(sha256sum -- "$baked_manifest" | cut -d' ' -f1)"
+    [[ "$manifest_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    jq_args+=(--arg baselineManifestSha256 "$manifest_sha")
+    jq_prog='{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
+      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
+      flavorGuardGeneration:$flavorGuardGeneration,
+      baselineManifestSha256:$baselineManifestSha256}'
+  fi
+  if ! jq "${jq_args[@]}" "$jq_prog" >"$marker_tmp"; then
     rm -f -- "$marker_tmp"
     return 1
   fi
@@ -3959,6 +4040,13 @@ REMOTE
   if ! write_version "$staging" "$short_sha" >&2; then ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
   if ! harden_release_baseline "$staging"; then
     echo "✗ staging CCB baseline hardening/validation 失败" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  # Bake the checkout's expectedSkills into the immutable release before the
+  # tree digest. .complete.baselineManifestSha256 is filled by the marker writer.
+  if ! write_release_baseline_manifest "$staging" "$full_sha"; then
+    echo "✗ staging .baseline-manifest.json 写入失败" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
@@ -6423,6 +6511,7 @@ migrate_to_bluegreen() {
   harden_release_baseline "$REMOTE_SRC" || return 1
   strip_shared_baseline_env_keys || return 1
   assert_release_baseline_security "$REMOTE_SRC" || return 1
+  write_release_baseline_manifest "$REMOTE_SRC" "$full_sha" || return 1
   ts="$(date -u +%Y%m%d-%H%M%S)"
   reldir="$RELEASES_ROOT/rel-$sha-$ts-migrated"
   echo "── 停机 → 实目录搬入 $reldir → 写 strong .complete → symlink → 启动(一次性,几秒停机;ERR 自动恢复贯穿 start)──"
@@ -6732,18 +6821,13 @@ smoke() {
       || { echo "✗ OC_MODEL_AUTHORITY=1 但 egress 未广播 '$MODEL_AUTHORITY_EGRESS_CAP'(caps=[${ecaps:-<none>}])—— 旧 egress 进程无每请求 epoch fence;修法:deploy-v5.sh --egress" >&2; return 1; }
     echo "  ✓ 模型权威:master=[$mcaps] egress=[$ecaps](flag=1,两进程活体 capability 齐)"
   fi
-  local baseline_slot serving_release=""
+  local baseline_slot
   case "$sport" in
     18790) baseline_slot=A ;;
     18795) baseline_slot=B ;;
     *) echo "✗ 无法由 smoke port=$sport 判定 slot baseline 路径" >&2; return 1 ;;
   esac
-  serving_release="$(bg_current_release "$(slot_src "$baseline_slot")")"
-  if serving_release_uses_legacy_baseline "$serving_release"; then
-    ROLLBACK_LEGACY_BASELINE_OK=1 assert_live_baseline_security_for_slot "$baseline_slot" || return 1
-  else
-    assert_live_baseline_security_for_slot "$baseline_slot" || return 1
-  fi
+  assert_live_baseline_security_for_slot "$baseline_slot" || return 1
   echo "✓ v5 smoke 通过:隔离空壳健康、控制面静默、v3 未受影响"
 }
 
@@ -9040,9 +9124,9 @@ rollback_runtime_tuple() {
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
   assert_release_marker "$master" || return 1
   assert_release_required_migrations "$master" || return 1
-  # History predecessors may predate admin prompt variants and the
-  # cursor/taskboard baseline skills. Forward targets remain strict.
-  assert_legacy_release_baseline_security "$master" || return 1
+  # History predecessors: two-question verify (own manifest, or legacy
+  # fallback under --allow-legacy-manifest-missing / cutoff / one-cycle flag).
+  verify_release_baseline_security "$master" || return 1
   assert_web_storage_rollback_transition \
     "$prev_src" "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" "$master" \
     "tuple rollback exact target" || return 1

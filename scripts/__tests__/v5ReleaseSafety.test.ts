@@ -1926,8 +1926,11 @@ describe('v5 release safety lanes', () => {
     assert.match(helper, /BUILT_RELEASE/)
     assert.match(helper, /ROLLBACK_LEGACY_BASELINE_OK/)
     const smoke = source.match(/^smoke\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
-    assert.match(smoke, /serving_release_uses_legacy_baseline "\$serving_release"/)
-    assert.match(smoke, /ROLLBACK_LEGACY_BASELINE_OK=1 assert_live_baseline_security_for_slot "\$baseline_slot"/)
+    assert.match(smoke, /assert_live_baseline_security_for_slot "\$baseline_slot"/)
+    assert.match(source, /assert_live_baseline_security_for_slot\(\)[\s\S]*verify_release_baseline_security "\$live_release"/)
+    const verify = source.match(/verify_release_baseline_security\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(verify, /serving_release_uses_legacy_baseline "\$release"/)
+    assert.match(verify, /--allow-legacy-manifest-missing/)
 
     const harness = [
       'set -u',
@@ -2075,9 +2078,16 @@ describe('v5 release safety lanes', () => {
     assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf('publish_strong_release'))
     assert.match(source, /activate_release\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
     assert.match(source, /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
-    assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?assert_legacy_release_baseline_security "\$master"/)
+    assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?verify_release_baseline_security "\$master"/)
     assert.match(source, /ROLLBACK_LEGACY_BASELINE_OK=1 smoke "\$ACTIVE_PORT"/)
-    assert.match(source, /if \[\[ "\$\{ROLLBACK_LEGACY_BASELINE_OK:-0\}" == 1 \]\][\s\S]*?assert_legacy_release_baseline_security "\$live_release"/)
+    assert.match(source, /verify_release_baseline_security\(\)[\s\S]*ROLLBACK_LEGACY_BASELINE_OK/)
+    assert.match(source, /write_release_baseline_manifest "\$staging" "\$full_sha"/)
+    assert.ok(
+      build.indexOf('write_release_baseline_manifest "$staging"') >
+        build.indexOf('harden_release_baseline "$staging"') &&
+      build.indexOf('write_release_baseline_manifest "$staging"') <
+        build.indexOf('publish_strong_release'),
+    )
     assert.match(source, /canary\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
     assert.match(source, /smoke\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$baseline_slot"/)
     assert.match(source, /start_candidate_unit_and_wait\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$cand"/)
@@ -8887,35 +8897,45 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(blocked.stderr, /无法读取 deploy_state/)
   })
 
-  const danglingFileChange = (file: string, extra = '\n// audit-blocker\n') => {
-    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
-    const orig = spawnSync('git', ['show', `${head}:${file}`], { cwd: root, encoding: 'utf8' })
-    assert.equal(orig.status, 0, orig.stderr)
-    const blob = spawnSync('git', ['hash-object', '-w', '--stdin'], {
+  const gitIdent = {
+    GIT_AUTHOR_NAME: 'v5-ops-fixture',
+    GIT_AUTHOR_EMAIL: 'v5-ops-fixture@example.test',
+    GIT_COMMITTER_NAME: 'v5-ops-fixture',
+    GIT_COMMITTER_EMAIL: 'v5-ops-fixture@example.test',
+  }
+  const gitEnv = (extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
+    ...process.env,
+    ...gitIdent,
+    ...extra,
+  })
+  const gitOk = (
+    args: string[],
+    opts: { env?: NodeJS.ProcessEnv; input?: string } = {},
+  ) => {
+    const result = spawnSync('git', args, {
       cwd: root,
       encoding: 'utf8',
-      input: orig.stdout + extra,
-    }).stdout.trim()
+      env: gitEnv(opts.env),
+      input: opts.input,
+    })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    return result
+  }
+
+  const danglingFileChange = (file: string, extra = '\n// audit-blocker\n') => {
+    const head = gitOk(['rev-parse', 'HEAD']).stdout.trim()
+    const orig = gitOk(['show', `${head}:${file}`])
+    const blob = gitOk(['hash-object', '-w', '--stdin'], { input: orig.stdout + extra }).stdout.trim()
     assert.match(blob, /^[0-9a-f]{40}$/)
-    const ls = spawnSync('git', ['ls-tree', '-r', head, '--', file], { cwd: root, encoding: 'utf8' })
-    assert.equal(ls.status, 0, ls.stderr)
+    const ls = gitOk(['ls-tree', '-r', head, '--', file])
     const mode = ls.stdout.trim().split(/\s+/)[0]
     const index = path.join(tmpdir(), `oc-v5-audit-idx-${process.pid}-${Date.now()}`)
-    const env = { ...process.env, GIT_INDEX_FILE: index }
-    const readTree = spawnSync('git', ['read-tree', head], { cwd: root, encoding: 'utf8', env })
-    assert.equal(readTree.status, 0, readTree.stderr)
-    const upd = spawnSync('git', ['update-index', '--cacheinfo', `${mode},${blob},${file}`], {
-      cwd: root,
-      encoding: 'utf8',
-      env,
-    })
-    assert.equal(upd.status, 0, upd.stderr)
-    const tree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env }).stdout.trim()
+    const env = { GIT_INDEX_FILE: index }
+    gitOk(['read-tree', head], { env })
+    gitOk(['update-index', '--cacheinfo', `${mode},${blob},${file}`], { env })
+    const tree = gitOk(['write-tree'], { env }).stdout.trim()
     assert.match(tree, /^[0-9a-f]{40}$/)
-    const commit = spawnSync('git', ['commit-tree', tree, '-p', head, '-m', `audit overlay ${file}`], {
-      cwd: root,
-      encoding: 'utf8',
-    }).stdout.trim()
+    const commit = gitOk(['commit-tree', tree, '-p', head, '-m', `audit overlay ${file}`]).stdout.trim()
     assert.match(commit, /^[0-9a-f]{40}$/)
     spawnSync('rm', ['-f', index])
     return { head, commit }
@@ -9066,10 +9086,7 @@ describe('v5 release speedup (B1-B5, C4)', () => {
       0,
     )
     const tree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env }).stdout.trim()
-    const commit = spawnSync('git', ['commit-tree', tree, '-p', sha, '-m', 'audit overlay metadata migrations'], {
-      cwd: root,
-      encoding: 'utf8',
-    }).stdout.trim()
+    const commit = gitOk(['commit-tree', tree, '-p', sha, '-m', 'audit overlay metadata migrations']).stdout.trim()
     spawnSync('rm', ['-f', index])
     const migrated = invokeHelpers(`compute_runtime_input_digest '${commit}' '${image}'`)
     assert.equal(migrated.status, 0, migrated.stderr)
@@ -9093,11 +9110,14 @@ describe('v5 release speedup (B1-B5, C4)', () => {
       0,
     )
     const capTree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env: capEnv }).stdout.trim()
-    const capCommit = spawnSync(
-      'git',
-      ['commit-tree', capTree, '-p', sha, '-m', 'audit overlay metadata runtimeCapabilities'],
-      { cwd: root, encoding: 'utf8' },
-    ).stdout.trim()
+    const capCommit = gitOk([
+      'commit-tree',
+      capTree,
+      '-p',
+      sha,
+      '-m',
+      'audit overlay metadata runtimeCapabilities',
+    ]).stdout.trim()
     spawnSync('rm', ['-f', capIndex])
     const caps = invokeHelpers(`compute_runtime_input_digest '${capCommit}' '${image}'`)
     assert.equal(caps.status, 0, caps.stderr)
@@ -9292,3 +9312,148 @@ describe('v5 oc-memory MCP cjs survives runtime prune and gateway precompile', (
     assert.doesNotMatch(excludes, /packages\/mcp-memory\/scripts/)
   })
 })
+
+describe('v5 versioned baseline manifest', () => {
+  const expectedSkills = (): string[] => {
+    const text = spawnSync('sed', ['-n', '/^EXPECTED_SKILLS=(/,/^)/p', baselineGuard], { encoding: 'utf8' })
+    assert.equal(text.status, 0, text.stderr)
+    return text.stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('EXPECTED_SKILLS') && line !== ')')
+  }
+
+  async function copyRelease(suffix: string): Promise<{ dir: string; release: string; baseline: string }> {
+    const dir = await mkdtemp(path.join(tmpdir(), `v5-bman-${suffix}-`))
+    dirs.push(dir)
+    const release = path.join(dir, 'release')
+    const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
+    await mkdir(path.dirname(baseline), { recursive: true })
+    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
+    const hardened = spawnSync('bash', [baselineGuard, 'harden-release', release], { encoding: 'utf8' })
+    assert.equal(hardened.status, 0, hardened.stderr)
+    return { dir, release, baseline }
+  }
+
+  async function writeManifest(
+    release: string,
+    skills: string[],
+    sourceCommit: string,
+  ): Promise<{ body: string; sha: string }> {
+    const body = JSON.stringify({
+      schemaVersion: 1,
+      sourceCommit,
+      generatedAt: '2026-09-05T00:00:00Z',
+      expectedSkills: skills,
+      forbiddenPaths: [],
+      expectedTopLevel: ['AGENTS.admin.md', 'AGENTS.md', 'CLAUDE.admin.md', 'CLAUDE.md', 'skills'],
+    })
+    await writeFile(path.join(release, '.baseline-manifest.json'), body)
+    const sha = createHash('sha256').update(body).digest('hex')
+    return { body, sha }
+  }
+
+  async function writeComplete(release: string, sha: string | null, sourceCommit: string) {
+    const marker: Record<string, unknown> = {
+      schemaVersion: 2,
+      sourceCommit,
+    }
+    if (sha) marker.baselineManifestSha256 = sha
+    await writeFile(path.join(release, '.complete'), JSON.stringify(marker) + '\n')
+  }
+
+  const headSha = (): string => {
+    const head = spawnSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' })
+    assert.equal(head.status, 0, head.stderr)
+    return head.stdout.trim()
+  }
+
+  test('versioned baseline manifest: matching digest passes', async () => {
+    const { release } = await copyRelease('match')
+    const skills = expectedSkills()
+    const sourceCommit = headSha()
+    const { sha } = await writeManifest(release, skills, sourceCommit)
+    await writeComplete(release, sha, sourceCommit)
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /ok verify-release=/)
+  })
+
+  test('versioned baseline manifest: digest mismatch is FATAL', async () => {
+    const { release } = await copyRelease('mismatch')
+    const skills = expectedSkills()
+    const sourceCommit = headSha()
+    await writeManifest(release, skills, sourceCommit)
+    await writeComplete(release, 'a'.repeat(64), sourceCommit)
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /baseline manifest digest mismatch/)
+  })
+
+  test('versioned baseline manifest: missing without flag is FATAL', async () => {
+    const { release } = await copyRelease('missing-strict')
+    const sourceCommit = headSha()
+    await writeComplete(release, null, sourceCommit)
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /baseline manifest missing/)
+  })
+
+  test('versioned baseline manifest: missing with flag uses legacy', async () => {
+    const { release, baseline } = await copyRelease('missing-legacy')
+    await rm(path.join(baseline, 'skills/multi-model-review'), { recursive: true })
+    const sourceCommit = headSha()
+    await writeComplete(release, null, sourceCommit)
+    const denied = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    assert.notEqual(denied.status, 0)
+    const allowed = spawnSync(
+      'bash',
+      [baselineGuard, 'verify-release', release, '--allow-legacy-manifest-missing'],
+      { encoding: 'utf8' },
+    )
+    assert.equal(allowed.status, 0, allowed.stderr)
+    assert.match(allowed.stdout, /ok baseline=/)
+  })
+
+  test('versioned baseline manifest: older fewer skills self-consistent passes', async () => {
+    const { release, baseline } = await copyRelease('fewer')
+    await rm(path.join(baseline, 'skills/multi-model-review'), { recursive: true })
+    const skills = expectedSkills().filter((name) => name !== 'multi-model-review')
+    const sourceCommit = headSha()
+    const { sha } = await writeManifest(release, skills, sourceCommit)
+    await writeComplete(release, sha, sourceCommit)
+    const strict = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
+    assert.notEqual(strict.status, 0)
+    assert.match(strict.stderr, /skill manifest mismatch/)
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /ok verify-release=/)
+  })
+
+  test('versioned baseline manifest: MIN_SECURITY_POLICY rejects group-writable', async () => {
+    const { release, baseline } = await copyRelease('minsec')
+    const skills = expectedSkills()
+    const sourceCommit = headSha()
+    const { sha } = await writeManifest(release, skills, sourceCommit)
+    await writeComplete(release, sha, sourceCommit)
+    const chmod = spawnSync('chmod', ['g+w', path.join(baseline, 'AGENTS.md')], { encoding: 'utf8' })
+    assert.equal(chmod.status, 0, chmod.stderr)
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /group\/other writable/)
+  })
+
+  test('versioned baseline manifest: deploy cutoff placeholder and fallback wiring', async () => {
+    const source = await readFile(deploy, 'utf8')
+    assert.match(source, /LEGACY_MANIFEST_CUTOFF_COMMIT=""/)
+    assert.match(source, /OC_V5_LEGACY_BASELINE_FALLBACK="\$\{OC_V5_LEGACY_BASELINE_FALLBACK:-1\}"/)
+    assert.match(source, /--allow-legacy-manifest-missing\) ALLOW_LEGACY_MANIFEST_MISSING=1/)
+    assert.match(source, /baselineManifestSha256/)
+    assert.match(source, /write-manifest/)
+    assert.match(source, /verify-release/)
+    const verify = source.match(/verify_release_baseline_security\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(verify, /release_source_predates_manifest_cutoff/)
+    assert.match(verify, /OC_V5_LEGACY_BASELINE_FALLBACK/)
+  })
+})
+
