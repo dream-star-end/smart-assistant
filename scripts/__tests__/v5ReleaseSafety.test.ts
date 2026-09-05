@@ -8876,35 +8876,45 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(blocked.stderr, /无法读取 deploy_state/)
   })
 
-  const danglingFileChange = (file: string, extra = '\n// audit-blocker\n') => {
-    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
-    const orig = spawnSync('git', ['show', `${head}:${file}`], { cwd: root, encoding: 'utf8' })
-    assert.equal(orig.status, 0, orig.stderr)
-    const blob = spawnSync('git', ['hash-object', '-w', '--stdin'], {
+  const gitIdent = {
+    GIT_AUTHOR_NAME: 'v5-ops-fixture',
+    GIT_AUTHOR_EMAIL: 'v5-ops-fixture@example.test',
+    GIT_COMMITTER_NAME: 'v5-ops-fixture',
+    GIT_COMMITTER_EMAIL: 'v5-ops-fixture@example.test',
+  }
+  const gitEnv = (extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
+    ...process.env,
+    ...gitIdent,
+    ...extra,
+  })
+  const gitOk = (
+    args: string[],
+    opts: { env?: NodeJS.ProcessEnv; input?: string } = {},
+  ) => {
+    const result = spawnSync('git', args, {
       cwd: root,
       encoding: 'utf8',
-      input: orig.stdout + extra,
-    }).stdout.trim()
+      env: gitEnv(opts.env),
+      input: opts.input,
+    })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    return result
+  }
+
+  const danglingFileChange = (file: string, extra = '\n// audit-blocker\n') => {
+    const head = gitOk(['rev-parse', 'HEAD']).stdout.trim()
+    const orig = gitOk(['show', `${head}:${file}`])
+    const blob = gitOk(['hash-object', '-w', '--stdin'], { input: orig.stdout + extra }).stdout.trim()
     assert.match(blob, /^[0-9a-f]{40}$/)
-    const ls = spawnSync('git', ['ls-tree', '-r', head, '--', file], { cwd: root, encoding: 'utf8' })
-    assert.equal(ls.status, 0, ls.stderr)
+    const ls = gitOk(['ls-tree', '-r', head, '--', file])
     const mode = ls.stdout.trim().split(/\s+/)[0]
     const index = path.join(tmpdir(), `oc-v5-audit-idx-${process.pid}-${Date.now()}`)
-    const env = { ...process.env, GIT_INDEX_FILE: index }
-    const readTree = spawnSync('git', ['read-tree', head], { cwd: root, encoding: 'utf8', env })
-    assert.equal(readTree.status, 0, readTree.stderr)
-    const upd = spawnSync('git', ['update-index', '--cacheinfo', `${mode},${blob},${file}`], {
-      cwd: root,
-      encoding: 'utf8',
-      env,
-    })
-    assert.equal(upd.status, 0, upd.stderr)
-    const tree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env }).stdout.trim()
+    const env = { GIT_INDEX_FILE: index }
+    gitOk(['read-tree', head], { env })
+    gitOk(['update-index', '--cacheinfo', `${mode},${blob},${file}`], { env })
+    const tree = gitOk(['write-tree'], { env }).stdout.trim()
     assert.match(tree, /^[0-9a-f]{40}$/)
-    const commit = spawnSync('git', ['commit-tree', tree, '-p', head, '-m', `audit overlay ${file}`], {
-      cwd: root,
-      encoding: 'utf8',
-    }).stdout.trim()
+    const commit = gitOk(['commit-tree', tree, '-p', head, '-m', `audit overlay ${file}`]).stdout.trim()
     assert.match(commit, /^[0-9a-f]{40}$/)
     spawnSync('rm', ['-f', index])
     return { head, commit }
@@ -9055,10 +9065,7 @@ describe('v5 release speedup (B1-B5, C4)', () => {
       0,
     )
     const tree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env }).stdout.trim()
-    const commit = spawnSync('git', ['commit-tree', tree, '-p', sha, '-m', 'audit overlay metadata migrations'], {
-      cwd: root,
-      encoding: 'utf8',
-    }).stdout.trim()
+    const commit = gitOk(['commit-tree', tree, '-p', sha, '-m', 'audit overlay metadata migrations']).stdout.trim()
     spawnSync('rm', ['-f', index])
     const migrated = invokeHelpers(`compute_runtime_input_digest '${commit}' '${image}'`)
     assert.equal(migrated.status, 0, migrated.stderr)
@@ -9082,11 +9089,14 @@ describe('v5 release speedup (B1-B5, C4)', () => {
       0,
     )
     const capTree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env: capEnv }).stdout.trim()
-    const capCommit = spawnSync(
-      'git',
-      ['commit-tree', capTree, '-p', sha, '-m', 'audit overlay metadata runtimeCapabilities'],
-      { cwd: root, encoding: 'utf8' },
-    ).stdout.trim()
+    const capCommit = gitOk([
+      'commit-tree',
+      capTree,
+      '-p',
+      sha,
+      '-m',
+      'audit overlay metadata runtimeCapabilities',
+    ]).stdout.trim()
     spawnSync('rm', ['-f', capIndex])
     const caps = invokeHelpers(`compute_runtime_input_digest '${capCommit}' '${image}'`)
     assert.equal(caps.status, 0, caps.stderr)
