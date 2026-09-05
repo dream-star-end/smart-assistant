@@ -33,3 +33,7 @@ apps/windows/release/
 packages/desktop/node_modules/
 packages/desktop/release/
 __pycache__/
+
+# Testdata TLS private keys (generated at test start)
+apps/windows/test/fixtures/tls/*.key
+apps/windows/test/fixtures/tls/*.crt
