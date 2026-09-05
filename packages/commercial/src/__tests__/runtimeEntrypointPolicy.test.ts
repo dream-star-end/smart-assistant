@@ -489,7 +489,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("codex/GPT-5.6 默认队长的路由字段(provider/runnerKind)落在 seed 声明里(schema v2)", () => {
+  test("codex/GPT-6 默认队长的路由字段(provider/runnerKind)落在 seed 声明里(schema v2)", () => {
     // 模型权威 §5 阶段 A:codex 的 model/provider/runnerKind 已从 entrypoint 常量迁到 platform-seed.yaml。
     // provider/runnerKind 是 gateway runner seam 的路由依据,缺失/写错 = 落错 runner(CCB 跑 codex 模型)。
     // 声明值与 protocol DEFAULT_CODEX_ENGINE_MODEL 的一致性由本文件末尾的**一致性锚**守护;
@@ -499,7 +499,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       join(__dirname, "..", "..", "agent-sandbox", "platform-runtime", "seed", "platform-seed.yaml"),
       "utf-8",
     );
-    assert.match(seedYaml, /- id: codex\n\s+model: gpt-5\.6-[a-z]+\n\s+provider: codex-native\n\s+runnerKind: app-server/,
+    assert.match(seedYaml, /- id: codex\n\s+model: gpt-6-astra\n\s+provider: codex-native\n\s+runnerKind: app-server/,
       "codex 声明必须带 model + codex-native provider + app-server runnerKind(gateway runner 路由依据)");
     assert.match(
       src,

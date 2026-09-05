@@ -244,8 +244,8 @@ describe('buildTeamPreamble', () => {
     assert.match(p, /## 第一步:分类/)
     assert.match(p, /审议类/)
     assert.match(p, /执行类/)
-    assert.match(p, /`gpt-5.6-sol`（openai）/)
-    assert.match(p, /delegate_tasks\(\{ tasks: \[\{ model: "gpt-5.6-sol", goal: "<同一个问题>" \}/)
+    assert.match(p, /`gpt-6-astra`（openai）/)
+    assert.match(p, /delegate_tasks\(\{ tasks: \[\{ model: "gpt-6-astra", goal: "<同一个问题>" \}/)
     assert.match(p, /request_review\(draft, mode="deliberation"\)/)
     assert.match(p, /request_review\(draft, mode="execution"\)/)
     assert.match(p, /约为单模型直答的 5 倍/)
@@ -256,7 +256,7 @@ describe('buildTeamPreamble', () => {
 
   it('Cursor 版:走 oc-memory CLI,panel 用 --allow-self --model', () => {
     const p = buildTeamPreamble({ ...base, cursorEngine: true })
-    assert.match(p, /oc-memory delegate --allow-self --model gpt-5.6-sol --goal "<同一个问题>"/)
+    assert.match(p, /oc-memory delegate --allow-self --model gpt-6-astra --goal "<同一个问题>"/)
     assert.match(p, /oc-memory request-review --mode deliberation --draft/)
     assert.doesNotMatch(p, /delegate_tasks\(/)
   })
