@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, expect, test } from "vitest";
 import { useConfirm } from "./ConfirmDialog";
@@ -31,12 +31,17 @@ test("useConfirm still resolves true/false without an alt action", async () => {
   render(<ConfirmHost />);
   fireEvent.click(screen.getByRole("button", { name: "open" }));
   fireEvent.click(await screen.findByRole("button", { name: "压缩并切换" }));
-  expect(await screen.findByTestId("choice")).toHaveTextContent("true");
+  // findByTestId 只等节点出现(choice 一开始就是 none)，必须等 promise then 落定。
+  await waitFor(() => {
+    expect(screen.getByTestId("choice")).toHaveTextContent("true");
+  });
 });
 
 test("useConfirm exposes a direct-switch alt action", async () => {
   render(<ConfirmHost altText="直接切换" />);
   fireEvent.click(screen.getByRole("button", { name: "open" }));
   fireEvent.click(await screen.findByRole("button", { name: "直接切换" }));
-  expect(await screen.findByTestId("choice")).toHaveTextContent("alt");
+  await waitFor(() => {
+    expect(screen.getByTestId("choice")).toHaveTextContent("alt");
+  });
 });
