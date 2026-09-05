@@ -307,7 +307,42 @@
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
           "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
+          "assertion": "part: PG 53300 too many clients → 503 TURN_TAPE_RETRYABLE(不再误判 409)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
+          "assertion": "part: 未知形态(无 code 普通 Error)→ 默认 503 可重试,而非 409 永久"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
+          "assertion": "finalize: incomplete → 503 可重试(parts 尚在途,不再永久 quarantine)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
+          "assertion": "visible: broadcast throws after storage success → 200 ACK, storage not re-run"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
+          "assertion": "finalize: header / dispatch identity / settlement / engineBillings 同键异身份冲突 → 仍 409"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/v3MasterSink.test.ts",
+          "assertion": "finalize keeps no content-size deadline but carries its own bounded signal"
         }
+      ],
+      "coverageCommits": [
+        "aef463bf",
+        "fa710b06",
+        "3961df52"
       ]
     },
     {
