@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 import {
   CODEX_ENGINE_MODEL_IDS,
+  COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL,
+  CONTEXT_TIER_FAMILIES,
   CURSOR_CONTEXT_TIERS,
   CURSOR_CONTEXT_TIER_FAMILIES,
   CURSOR_CONTEXT_TIER_WINDOW,
@@ -21,6 +23,8 @@ import {
   isCursorContextTier,
   isCursorEngineModel,
   cursorModelSupportsContextTier,
+  contextFamilyByModelId,
+  contextFamilyCollapsedByDefault,
   projectContextWindowForCursorTier,
   isZcodeEngineModel,
   modelReasoningPolicy,
@@ -30,8 +34,8 @@ import {
   ZCODE_HOSTED_PERMISSION_MODE,
 } from '../engineModels.js'
 
-describe('GPT-5.6 engine model authority', () => {
-  test('exactly the three GPT-5.6 series are Codex models; GPT-5.5 is retired', () => {
+describe('GPT-5.6 / GPT-6 engine model authority', () => {
+  test('exactly the GPT-5.6 series plus GPT-6-Astra are Codex models; GPT-5.5 is retired', () => {
     assert.deepEqual(CODEX_ENGINE_MODEL_IDS, [
       'gpt-5.6-sol',
       'gpt-5.6-terra',
@@ -39,8 +43,16 @@ describe('GPT-5.6 engine model authority', () => {
       'gpt-5.6-sol-1m',
       'gpt-5.6-terra-1m',
       'gpt-5.6-luna-1m',
+      'gpt-6-astra',
+      'gpt-6-astra-1m',
     ])
     assert.equal(DEFAULT_CODEX_ENGINE_MODEL, 'gpt-5.6-sol')
+    assert.equal(isCodexLongContextModel('gpt-6-astra'), false)
+    assert.equal(isCodexLongContextModel('gpt-6-astra-1m'), true)
+    assert.equal(codexTransportModelId('gpt-6-astra-1m'), 'gpt-6-astra')
+    assert.equal(modelReasoningPolicy('gpt-6-astra').codexModelDefault, 'xhigh')
+    assert.equal(modelReasoningPolicy('gpt-6-astra-1m').codexModelDefault, 'xhigh')
+    assert.equal(isCodexEngineModel('gpt-6'), false)
     for (const id of CODEX_ENGINE_MODEL_IDS) assert.equal(isCodexEngineModel(id), true)
     assert.equal(isCodexEngineModel('gpt-5.5'), false)
     assert.equal(isCodexEngineModel('gpt-5.6-ultra'), false)
@@ -65,6 +77,29 @@ describe('GPT-5.6 engine model authority', () => {
     assert.equal(modelReasoningPolicy('gpt-5.6-sol').supported.includes('ultra' as never), false)
   })
 
+  test('context-tier families: Astra first, Terra/Luna collapsed by default', () => {
+    assert.deepEqual(
+      CONTEXT_TIER_FAMILIES.map((f) => f.family),
+      ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'kimi-k3'],
+    )
+    assert.deepEqual(
+      CONTEXT_TIER_FAMILIES.filter((f) => f.collapsedByDefault).map((f) => f.family),
+      ['gpt-5.6-terra', 'gpt-5.6-luna'],
+    )
+    assert.equal(contextFamilyCollapsedByDefault('gpt-6-astra'), false)
+    assert.equal(contextFamilyCollapsedByDefault('gpt-5.6-sol'), false)
+    assert.equal(contextFamilyCollapsedByDefault('gpt-5.6-terra'), true)
+    assert.equal(contextFamilyCollapsedByDefault('gpt-5.6-luna'), true)
+    assert.equal(contextFamilyCollapsedByDefault('kimi-k3'), false)
+    assert.equal(contextFamilyByModelId('gpt-6-astra-1m')?.family, 'gpt-6-astra')
+    assert.equal(COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL, '更多 GPT 模型')
+    for (const family of CONTEXT_TIER_FAMILIES) {
+      if (family.family === 'kimi-k3') continue
+      assert.equal(isCodexEngineModel(family.standardId), true, family.standardId)
+      assert.equal(isCodexEngineModel(family.longId), true, family.longId)
+    }
+  })
+
   test('static-provider effort policy is projected from the same registry', () => {
     assert.deepEqual(modelReasoningPolicy('glm-5.2').supported, ['high', 'max'])
     assert.deepEqual(modelReasoningPolicy('MiniMax-M3').supported, [])
@@ -74,7 +109,7 @@ describe('GPT-5.6 engine model authority', () => {
 
 describe('Cursor engine model authority', () => {
   test('pins CLI families with effort/fast metadata and excludes GPT/Codex entries', () => {
-    assert.equal(CURSOR_ENGINE_MODELS.length, 52)
+    assert.equal(CURSOR_ENGINE_MODELS.length, 55)
     assert.equal(CURSOR_ENGINE_MODELS[0].id, 'cursor-auto')
     assert.deepEqual(
       CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),
@@ -133,6 +168,19 @@ describe('Cursor engine model authority', () => {
       'claude-fable-5-1-thinking-high',
     )
     assert.equal(findCursorEngineModel('fable-5.1', 'high', true), undefined)
+    assert.equal(cursorFamilySupportsFast('gemini-3.8-flash'), false)
+    assert.deepEqual(cursorFamilyEfforts('gemini-3.8-flash'), ['low', 'medium', 'high'])
+    assert.equal(
+      findCursorEngineModel('gemini-3.8-flash', 'high', false)?.upstreamModel,
+      'gemini-3.8-flash-high',
+    )
+    assert.equal(findCursorEngineModel('gemini-3.8-flash', 'xhigh', false), undefined)
+    assert.equal(findCursorEngineModel('gemini-3.8-flash', 'high', true), undefined)
+    assert.equal(
+      CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-gemini-3.8-flash-medium')?.displayName,
+      'Gemini 3.8 Flash Medium',
+    )
+    assert.equal(cursorFamilySupportsContextTier('gemini-3.8-flash'), false)
     assert.equal(cursorFamilyDefaultFast('composer-2.5'), false)
     assert.equal(cursorFamilyDefaultFast('grok-4.6'), false)
     assert.equal(modelReasoningPolicy('cursor-grok-4.6-high').supported.length, 0)
@@ -146,6 +194,8 @@ describe('Cursor engine model authority', () => {
     assert.equal(cursorCredentialModelFamily('cursor-opus-5-high'), 'other_models')
     assert.equal(cursorCredentialModelFamily('claude-fable-5-thinking-high'), 'other_models')
     assert.equal(cursorCredentialModelFamily('cursor-fable-5.1-high'), 'other_models')
+    assert.equal(cursorCredentialModelFamily('cursor-gemini-3.8-flash-high'), 'other_models')
+    assert.equal(cursorCredentialModelFamily('gemini-3.8-flash-low'), 'other_models')
   })
 })
 

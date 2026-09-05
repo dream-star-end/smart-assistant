@@ -35,13 +35,16 @@ import {
   CURSOR_MACHINE_ID_RE,
   CURSOR_QUOTA_CLASS_FILE,
   CURSOR_SAND_MODE_FILE,
+  CURSOR_SLOT_WEIGHT_FILE,
   asCursorSlotResults,
+  computeCursorSlotWeight,
   cursorModelFamily,
   planCursorQuotaUpdates,
   planStableCursorQuotaUpdate,
   renderCredentialKindSidecar,
   renderQuotaClassSidecar,
   renderSandModeSidecar,
+  renderSlotWeightSidecar,
   uniqueCursorAccountIdFromSlotResults,
   type CursorQuotaClass,
   type CursorSlotCredentialKind,
@@ -113,7 +116,7 @@ export const CURSOR_POOL_OWNED_MARKER = ".account-pool-owned";
 export const CURSOR_POOL_GENERATIONS_DIR = ".pool-generations";
 export const CURSOR_POOL_ACTIVE_FILE = ".pool-active";
 export const CURSOR_POOL_IDENTITIES_FILE = ".slot-identities";
-export { CURSOR_CREDENTIAL_KIND_FILE, CURSOR_QUOTA_CLASS_FILE, CURSOR_SAND_MODE_FILE };
+export { CURSOR_CREDENTIAL_KIND_FILE, CURSOR_QUOTA_CLASS_FILE, CURSOR_SAND_MODE_FILE, CURSOR_SLOT_WEIGHT_FILE };
 
 interface MaterializedCursorSlot {
   key: string;
@@ -122,6 +125,8 @@ interface MaterializedCursorSlot {
   sandEnabled: boolean;
   credentialKind: CursorSlotCredentialKind;
   machineId: string | null;
+  /** 0262 — first-touch selection weight from Sand usage columns (1..10000). */
+  weight: number;
 }
 
 export function isCanonicalCursorKeyFile(name: string): boolean {
@@ -235,6 +240,9 @@ function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[]): str
       // 0257: kind/machine id participate so a kind flip (or machine id
       // change) always yields a fresh immutable generation.
       ...(slots[i].credentialKind === "session" ? ["session", slots[i].machineId ?? ""] : []),
+      // 0262: weight participates so a usage refresh yields a new generation
+      // (weights are bucketed upstream so hourly drift does not churn).
+      String(slots[i].weight),
     ].join("\0"));
     generationDigest.update("\n");
   }
@@ -248,6 +256,7 @@ function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[]): str
     try {
       const quotaSlots: Array<{ name: string; quotaClass: CursorQuotaClass }> = [];
       const sandSlots: Array<{ name: string; sandEnabled: boolean }> = [];
+      const weightSlots: Array<{ name: string; weight: number }> = [];
       const identities = [`# cursor-pool-identity v1 ${generation}`];
       for (let i = 0; i < slots.length; i += 1) {
         const name = slotFileName(i);
@@ -255,12 +264,15 @@ function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[]): str
         chmodSync(join(generationStaging, name), 0o600);
         quotaSlots.push({ name, quotaClass: slots[i].quotaClass });
         sandSlots.push({ name, sandEnabled: slots[i].sandEnabled });
+        weightSlots.push({ name, weight: slots[i].weight });
         identities.push(`${name} ${slots[i].accountId} ${fingerprints[i]} ${slots[i].sandEnabled ? "1" : "0"}`);
       }
       writeFileSync(join(generationStaging, CURSOR_QUOTA_CLASS_FILE), renderQuotaClassSidecar(quotaSlots), { mode: 0o600 });
       writeFileSync(join(generationStaging, CURSOR_SAND_MODE_FILE), renderSandModeSidecar(sandSlots), { mode: 0o600 });
       writeFileSync(join(generationStaging, CURSOR_CREDENTIAL_KIND_FILE), renderCredentialKindSidecar(credentialKindSlots(slots)), { mode: 0o600 });
       writeFileSync(join(generationStaging, CURSOR_POOL_IDENTITIES_FILE), `${identities.join("\n")}\n`, { mode: 0o600 });
+      writeFileSync(join(generationStaging, CURSOR_SLOT_WEIGHT_FILE), renderSlotWeightSidecar(weightSlots), { mode: 0o600 });
+      chmodSync(join(generationStaging, CURSOR_SLOT_WEIGHT_FILE), 0o600);
       chmodSync(join(generationStaging, CURSOR_QUOTA_CLASS_FILE), 0o600);
       chmodSync(join(generationStaging, CURSOR_SAND_MODE_FILE), 0o600);
       chmodSync(join(generationStaging, CURSOR_CREDENTIAL_KIND_FILE), 0o600);
@@ -283,6 +295,7 @@ function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[]): str
   try {
     const sidecarSlots: Array<{ name: string; quotaClass: CursorQuotaClass }> = [];
     const sandSlots: Array<{ name: string; sandEnabled: boolean }> = [];
+    const weightSlots: Array<{ name: string; weight: number }> = [];
     for (let i = 0; i < slots.length; i += 1) {
       const name = slotFileName(i);
       const dest = join(staging, name);
@@ -290,6 +303,7 @@ function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[]): str
       chmodSync(dest, 0o600);
       sidecarSlots.push({ name, quotaClass: slots[i].quotaClass });
       sandSlots.push({ name, sandEnabled: slots[i].sandEnabled });
+      weightSlots.push({ name, weight: slots[i].weight });
     }
     writeFileSync(join(staging, CURSOR_QUOTA_CLASS_FILE), renderQuotaClassSidecar(sidecarSlots), {
       mode: 0o600,
@@ -306,6 +320,11 @@ function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[]): str
       encoding: "utf8",
     });
     chmodSync(join(staging, CURSOR_CREDENTIAL_KIND_FILE), 0o600);
+    writeFileSync(join(staging, CURSOR_SLOT_WEIGHT_FILE), renderSlotWeightSidecar(weightSlots), {
+      mode: 0o600,
+      encoding: "utf8",
+    });
+    chmodSync(join(staging, CURSOR_SLOT_WEIGHT_FILE), 0o600);
     for (let i = 0; i < slots.length; i += 1) {
       const name = slotFileName(i);
       renameSync(join(staging, name), join(authDir, name));
@@ -313,6 +332,7 @@ function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[]): str
     renameSync(join(staging, CURSOR_QUOTA_CLASS_FILE), join(authDir, CURSOR_QUOTA_CLASS_FILE));
     renameSync(join(staging, CURSOR_SAND_MODE_FILE), join(authDir, CURSOR_SAND_MODE_FILE));
     renameSync(join(staging, CURSOR_CREDENTIAL_KIND_FILE), join(authDir, CURSOR_CREDENTIAL_KIND_FILE));
+    renameSync(join(staging, CURSOR_SLOT_WEIGHT_FILE), join(authDir, CURSOR_SLOT_WEIGHT_FILE));
     const expected = new Set(slots.map((_, i) => slotFileName(i)));
     for (const name of readdirSync(authDir)) {
       if (!isCanonicalCursorKeyFile(name)) continue;
@@ -365,6 +385,12 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
         const quotaClass: CursorQuotaClass = row.cursor_quota_class === "other_ok" || row.cursor_quota_class === "cursor_only"
           ? row.cursor_quota_class
           : "unknown";
+        const weight = computeCursorSlotWeight({
+          sandUsagePct: row.cursor_sand_usage_pct ?? null,
+          sandNextResetAt: row.cursor_sand_next_reset_at ?? null,
+          billingCycleEnd: row.cursor_billing_cycle_end ?? null,
+          sandAccessState: row.cursor_sand_access_state ?? null,
+        }, (resolved.now ?? (() => new Date()))());
         if (credentialKind === "session") {
           // Session rows are Sand-only and need their persisted machine id;
           // a malformed row is skipped (never silently downgraded to api_key).
@@ -384,6 +410,7 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
             sandEnabled: true,
             credentialKind: "session",
             machineId,
+            weight,
           });
         } else {
           slots.push({
@@ -393,6 +420,7 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
             sandEnabled: row.cursor_sand_enabled === true,
             credentialKind: "api_key",
             machineId: null,
+            weight,
           });
         }
       } finally {

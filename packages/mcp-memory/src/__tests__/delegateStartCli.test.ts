@@ -158,8 +158,25 @@ describe('delegateStartCli', () => {
   it('request-review wraps hidden-reviewer and keeps the draft in context', () => {
     const args = requestReviewArgs('草稿全文', '已按意见改')
     assert.equal(args.agentId, 'hidden-reviewer')
-    assert.match(args.goal, /质量审查/)
+    assert.match(args.goal, /质量验收/)
+    assert.equal(args.reviewMode, 'execution')
     assert.match(args.context ?? '', /草稿全文/)
     assert.match(args.context ?? '', /队长修订说明/)
+    const body = buildDelegateStartBody(args)
+    assert.equal(body.reviewMode, 'execution')
+  })
+
+  it('request-review --mode deliberation selects analyst goal and forwards reviewMode', () => {
+    const args = requestReviewArgs('草稿全文', undefined, undefined, 'deliberation')
+    assert.equal(args.reviewMode, 'deliberation')
+    assert.match(args.goal, /analyst/)
+    assert.equal(buildDelegateStartBody(args).reviewMode, 'deliberation')
+    // 非法 mode 回落 execution,不报错
+    assert.equal(requestReviewArgs('x', undefined, undefined, 'bogus').reviewMode, 'execution')
+  })
+
+  it('request-review no longer silently truncates long drafts (gateway marks truncation)', () => {
+    const long = 'a'.repeat(20000)
+    assert.equal(requestReviewArgs(long).context?.length, 20000)
   })
 })

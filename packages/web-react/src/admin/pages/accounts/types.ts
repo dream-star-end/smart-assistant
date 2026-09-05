@@ -35,6 +35,15 @@ export type AccountRow = {
   /** 0257 — Sand 凭证形态:api_key(crsr_ 换 token)| session(Cursor 账号登录会话)。 */
   cursor_credential_kind: "api_key" | "session" | null;
   cursor_auth_id: string | null;
+  /** 0262 — Sand / Grok Bot 池用量(每小时 sweeper 刷新;仅 session 行有值)。可选以兼容旧后端。 */
+  cursor_sand_usage_pct?: number | null;
+  cursor_sand_period_start?: string | null;
+  cursor_sand_next_reset_at?: string | null;
+  cursor_sand_access_state?: string | null;
+  cursor_plan_membership?: string | null;
+  cursor_billing_cycle_end?: string | null;
+  cursor_usage_updated_at?: string | null;
+  cursor_usage_error?: string | null;
   created_at: string;
   updated_at: string;
   today_requests?: number;
@@ -129,6 +138,24 @@ export type CursorUsageSnapshot = {
       cache_write_tokens: number | null;
       cache_read_tokens: number | null;
     }>;
+  };
+  /** Grok Bot / Sand 独立池(与 included 无关,按周重置)。旧后端可能不返回该字段。 */
+  sand?: {
+    access_state: string | null;
+    block_reason: string | null;
+    usage_percent: number | null;
+    has_available_usage: boolean | null;
+    has_included_limit: boolean | null;
+    period_start: string | null;
+    next_reset_at: string | null;
+    on_demand_visible: boolean | null;
+    on_demand_eligible: boolean | null;
+    grok_plan: string | null;
+    grok_plan_label: string | null;
+    super_grok_linked: boolean | null;
+    super_grok_granted: boolean | null;
+    super_grok_linked_at: string | null;
+    link_blocked_reason: string | null;
   };
 };
 

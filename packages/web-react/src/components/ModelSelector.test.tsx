@@ -463,3 +463,106 @@ describe('ModelSelector GPT/Kimi 上下文档', () => {
     expect(onSelect).not.toHaveBeenCalled()
   })
 })
+
+describe('ModelSelector 「更多 GPT 模型」折叠组(2026-09-05 Terra/Luna)', () => {
+  const MODELS: PublicModel[] = [
+    { id: 'glm-5.3', display_name: 'GLM-5.3' },
+    { id: 'gpt-6-astra', display_name: 'GPT-6-Astra', cost_x: 22.6 },
+    { id: 'gpt-6-astra-1m', display_name: 'GPT-6-Astra', cost_x: 33.9 },
+    { id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol', cost_x: 11.3 },
+    { id: 'gpt-5.6-sol-1m', display_name: 'GPT-5.6-Sol', cost_x: 22.6 },
+    { id: 'gpt-5.6-terra', display_name: 'GPT-5.6-Terra' },
+    { id: 'gpt-5.6-terra-1m', display_name: 'GPT-5.6-Terra' },
+    { id: 'gpt-5.6-luna', display_name: 'GPT-5.6-Luna' },
+    { id: 'gpt-5.6-luna-1m', display_name: 'GPT-5.6-Luna' },
+  ]
+
+  it('默认收起:Terra/Luna 不渲染,Astra/Sol 按目录顺序直接可见,折叠头标注数量', async () => {
+    render(<ModelSelector models={MODELS} selectedId="gpt-5.6-sol" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    const families = Array.from(document.querySelectorAll('[data-context-family]')).map((el) =>
+      el.getAttribute('data-context-family'),
+    )
+    expect(families).toEqual(['gpt-6-astra', 'gpt-5.6-sol'])
+    expect(screen.queryByText('GPT-5.6-Terra')).toBeNull()
+    expect(screen.queryByText('GPT-5.6-Luna')).toBeNull()
+    const toggle = document.querySelector('[data-collapsed-group]')
+    expect(toggle).toHaveAttribute('data-collapsed-group', 'closed')
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(toggle).toHaveTextContent('更多 GPT 模型')
+    expect(toggle).toHaveTextContent('2 个')
+  })
+
+  it('点击折叠头展开 Terra/Luna(菜单不关闭),再点收起', async () => {
+    render(<ModelSelector models={MODELS} selectedId="gpt-5.6-sol" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    const toggle = document.querySelector('[data-collapsed-group]')
+    expect(toggle).toBeTruthy()
+    if (toggle) fireEvent.click(toggle)
+    await waitFor(() =>
+      expect(document.querySelector('[data-collapsed-group]')).toHaveAttribute(
+        'data-collapsed-group',
+        'open',
+      ),
+    )
+    expect(document.querySelector('[data-context-family="gpt-5.6-terra"]')).toBeTruthy()
+    expect(document.querySelector('[data-context-family="gpt-5.6-luna"]')).toBeTruthy()
+    // 折叠行排在可见行之后
+    const families = Array.from(document.querySelectorAll('[data-context-family]')).map((el) =>
+      el.getAttribute('data-context-family'),
+    )
+    expect(families).toEqual(['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])
+    // 菜单仍开着
+    expect(screen.getAllByRole('menuitem').length).toBeGreaterThan(0)
+
+    const again = document.querySelector('[data-collapsed-group]')
+    if (again) fireEvent.click(again)
+    await waitFor(() =>
+      expect(document.querySelector('[data-context-family="gpt-5.6-terra"]')).toBeNull(),
+    )
+  })
+
+  it('当前选中 Terra(含 1M)时折叠组自动展开,选中项永远可见', async () => {
+    render(<ModelSelector models={MODELS} selectedId="gpt-5.6-terra-1m" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-collapsed-group]')).toHaveAttribute(
+      'data-collapsed-group',
+      'open',
+    )
+    const terra = document.querySelector('[data-context-family="gpt-5.6-terra"]')
+    expect(terra).toBeTruthy()
+    expect(terra?.textContent).toContain('GPT-5.6-Terra')
+  })
+
+  it('展开后点击 Luna 行照常上抛 onSelect(标准档)', async () => {
+    const onSelect = vi.fn()
+    render(<ModelSelector models={MODELS} selectedId="glm-5.3" onSelect={onSelect} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    const toggle = document.querySelector('[data-collapsed-group]')
+    if (toggle) fireEvent.click(toggle)
+    const luna = await waitFor(() => {
+      const el = document.querySelector('[data-context-family="gpt-5.6-luna"]')
+      expect(el).toBeTruthy()
+      return el as Element
+    })
+    fireEvent.click(luna)
+    await waitFor(() => expect(onSelect).toHaveBeenCalledWith('gpt-5.6-luna'))
+  })
+
+  it('没有可折叠家族时不渲染折叠头', async () => {
+    const plain: PublicModel[] = [
+      { id: 'glm-5.3', display_name: 'GLM-5.3' },
+      { id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol' },
+      { id: 'gpt-5.6-sol-1m', display_name: 'GPT-5.6-Sol' },
+    ]
+    render(<ModelSelector models={plain} selectedId="glm-5.3" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-collapsed-group]')).toBeNull()
+    expect(screen.queryByText('更多 GPT 模型')).toBeNull()
+  })
+})

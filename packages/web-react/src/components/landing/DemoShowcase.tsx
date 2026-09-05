@@ -41,7 +41,7 @@ function TranscriptFlow({ scenario }: { scenario: TranscriptScenario }) {
             return (
               <div key={key} className="flex min-w-0 justify-end">
                 <div className="max-w-[92%] break-words rounded-2xl rounded-br-md bg-bubble px-3.5 py-2.5 text-[13.5px] leading-relaxed text-fg">
-                  <span className="mb-1 block text-[10.5px] font-semibold text-faint">第 {block.turn} 轮 · 用户</span>
+                  <span className="mb-1 block text-micro font-semibold text-faint">第 {block.turn} 轮 · 用户</span>
                   {block.text}
                 </div>
               </div>
@@ -52,8 +52,8 @@ function TranscriptFlow({ scenario }: { scenario: TranscriptScenario }) {
             return (
               <div key={key} className="rounded-xl border border-border bg-sidebar/25 px-3 py-3">
                 <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-[12px] font-semibold text-fg">{block.label}</span>
-                  <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10.5px] font-medium text-accent">
+                  <span className="text-meta font-semibold text-fg">{block.label}</span>
+                  <span className="rounded-full bg-accent-soft px-2 py-0.5 text-micro font-medium text-accent">
                     生产记录 · {block.toolCallCount} 次工具调用
                   </span>
                 </div>
@@ -74,7 +74,7 @@ function TranscriptFlow({ scenario }: { scenario: TranscriptScenario }) {
           return (
             <div key={key} className="flex min-w-0 justify-start">
               <div className="min-w-0 max-w-[98%] overflow-hidden rounded-2xl rounded-bl-md border border-border bg-bg px-3.5 py-2.5">
-                <span className="mb-1 block text-[10.5px] font-semibold text-faint">
+                <span className="mb-1 block text-micro font-semibold text-faint">
                   第 {block.turn} 轮 · Agent 完成
                 </span>
                 <div className="min-w-0 break-words text-[13px] leading-relaxed text-fg [overflow-wrap:anywhere] [&_.prose]:max-w-none [&_.prose]:text-[13px] [&_.prose]:leading-relaxed [&_pre]:max-w-full [&_pre]:overflow-x-auto">
@@ -87,7 +87,7 @@ function TranscriptFlow({ scenario }: { scenario: TranscriptScenario }) {
       </div>
 
       {scenario.runMeta && (
-        <div className="mt-4 flex items-center gap-1.5 pl-1 text-[12px] text-faint">
+        <div className="mt-4 flex items-center gap-1.5 pl-1 text-meta text-faint">
           <Timer size={13} className="shrink-0 text-accent" />
           {scenario.runMeta}
         </div>
@@ -256,7 +256,7 @@ export function DemoShowcase({
               onClick={() => play(i)}
               aria-pressed={active}
               className={cn(
-                "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-[13px] font-medium transition-colors",
+                "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-body font-medium transition-colors",
                 active
                   ? "border-accent bg-accent-soft text-accent"
                   : "border-border bg-surface text-muted hover:border-border-strong hover:text-fg",
@@ -276,8 +276,8 @@ export function DemoShowcase({
           <span className="flex size-6 items-center justify-center rounded-lg bg-grad-cta text-white">
             <Sparkles size={13} />
           </span>
-          <span className="text-[13px] font-medium text-fg">全能助手</span>
-          <span className="ml-auto rounded-full border border-border bg-bg px-2 py-0.5 text-[11px] text-faint">
+          <span className="text-body font-medium text-fg">全能助手</span>
+          <span className="ml-auto rounded-full border border-border bg-bg px-2 py-0.5 text-caption text-faint">
             {sc.sourceLabel ?? "动态演示 · 示意数据"}
           </span>
         </div>
@@ -310,7 +310,7 @@ export function DemoShowcase({
                     <div
                       key={st.label}
                       className={cn(
-                        "flex items-center gap-2 text-[12.5px] transition-all duration-300",
+                        "flex items-center gap-2 text-meta transition-all duration-300",
                         isDone ? "text-muted" : isActive ? "text-fg" : "text-faint/0",
                       )}
                     >
@@ -370,7 +370,7 @@ export function DemoShowcase({
             {sc.runMeta && (
               <div
                 className={cn(
-                  "flex items-center gap-1.5 pl-1 text-[12px] text-faint transition-opacity duration-300",
+                  "flex items-center gap-1.5 pl-1 text-meta text-faint transition-opacity duration-300",
                   shownDone ? "opacity-100" : "opacity-0",
                 )}
               >
@@ -398,7 +398,7 @@ export function DemoShowcase({
 
         {/* 底部行动条 */}
         <div className="flex items-center justify-between gap-3 rounded-b-2xl border-t border-border bg-sidebar/40 px-4 py-3 sm:px-6">
-          <span className="flex items-center gap-3 text-[12.5px] text-faint">
+          <span className="flex items-center gap-3 text-meta text-faint">
             {ended
               ? "演示播完了"
               : sc.presentation === "transcript"
@@ -415,7 +415,7 @@ export function DemoShowcase({
           </span>
           <button
             onClick={onTry}
-            className="rounded-full bg-primary px-3.5 py-1.5 text-[13px] font-medium text-primary-fg transition-opacity hover:opacity-90"
+            className="rounded-full bg-primary px-3.5 py-1.5 text-body font-medium text-primary-fg transition-opacity hover:opacity-90"
           >
             免费试一句
           </button>

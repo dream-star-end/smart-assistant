@@ -2,8 +2,28 @@
 //   agent:<agentId>:main                              # 主会话(本机操作)
 //   agent:<agentId>:<channel>:dm:<peerId>             # 私聊
 //   agent:<agentId>:<channel>:group:<peerId>          # 群组
+//   agent:<agentId>:taskboard:<ticketId>:<stageId>:<runId>  # 巡检
 
 export type SessionKey = string
+
+/**
+ * engine-reported delegate billing 专用 sessionKey 长度上限，不是全局
+ * sessionKey 契约。prompt_queue VARCHAR(512) 只是 PG 列宽，不能当 admit 上限：
+ * `paths.sessionLog` 把 sessionKey 只替换 `:/` 后写成 `${key}.jsonl`，Linux
+ * NAME_MAX=255，减去 `.jsonl`(6) 再留 9 字符余量 = 240。覆盖 taskboard 合法
+ * 最坏约 207 与 mintDelegateSessionKey 约 175。
+ */
+export const DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS = 240
+
+/**
+ * engine-reported delegate billing 的 sessionKey 白名单。
+ * 字符集沿用 2026-09-02 的 `[A-Za-z0-9_:@.-]`；长度从 128 抬到
+ * DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS。gateway 与 commercial
+ * runtime 必须共用本常量。
+ */
+export const DELEGATE_ENGINE_BILLING_SESSION_KEY_RE = new RegExp(
+  `^[A-Za-z0-9_:@.-]{1,${DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS}}$`,
+)
 
 export interface ParsedSessionKey {
   agentId: string

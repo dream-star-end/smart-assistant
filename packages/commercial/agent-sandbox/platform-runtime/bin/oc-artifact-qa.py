@@ -25,6 +25,16 @@ TOOL = "oc-artifact-qa"
 SELF_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_VERSION = 1
 SUPPORTED = {".pdf": "pdf", ".pptx": "pptx", ".xlsx": "xlsx"}
+DELIVER_KINDS = {
+    ".pdf": "pdf",
+    ".pptx": "pptx",
+    ".xlsx": "xlsx",
+    ".docx": "docx",
+    ".zip": "zip",
+}
+OFFICE_PDF_MIN_BYTES = 2048
+PACK_DEFAULT_MAX_BYTES = 100 * 1024 * 1024
+P_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 FORMULA_ERRORS = {
     "#DIV/0!",
     "#N/A",
@@ -414,6 +424,7 @@ def inspect_pptx(
             add_issue(report, "failures", "pptx-empty", "presentation has no slides")
         if out_of_bounds:
             add_issue(report, "failures", "pptx-shape-bounds", f"{len(out_of_bounds)} shapes exceed the slide canvas")
+        collect_pptx_editable_facts(source, report)
     except Exception as error:
         add_issue(report, "failures", "pptx-structure", f"cannot parse PPTX: {error}")
     validate_count(report, expect, slide_count, "slideCount", "minSlides")
@@ -569,6 +580,197 @@ def inspect_xlsx(
     report["contactSheets"] = [str(path.resolve()) for path in contacts]
 
 
+def collect_pptx_editable_facts(source: Path, report: dict[str, Any]) -> None:
+    """R6 前置：只报告 raster/native 比，不 FAIL。"""
+    try:
+        import xml.etree.ElementTree as ET
+
+        with zipfile.ZipFile(source) as package:
+            names = package.namelist()
+            raster = sum(1 for name in names if name.startswith("ppt/media/"))
+            native = 0
+            graphic = 0
+            for name in names:
+                if not (name.startswith("ppt/slides/slide") and name.endswith(".xml")):
+                    continue
+                root = ET.fromstring(package.read(name))
+                native += len(root.findall(f".//{P_NS}sp")) + len(root.findall(f".//{P_NS}cxnSp"))
+                graphic += len(root.findall(f".//{P_NS}graphicFrame"))
+        denom = native + raster
+        ratio = (native / denom) if denom else None
+        report["facts"].update(
+            {
+                "rasterPictureCount": raster,
+                "nativeShapeCount": native,
+                "graphicFrameCount": graphic,
+                "editableFigureRatio": ratio,
+            }
+        )
+        if raster > 0:
+            add_issue(
+                report,
+                "warnings",
+                "pptx-raster-figures",
+                f"raster={raster} native={native} editableFigureRatio={ratio}",
+            )
+    except Exception:
+        return
+
+
+def deliver_gate_mode() -> str:
+    raw = (os.environ.get("OC_ARTIFACT_DELIVER_GATE") or "off").strip().lower()
+    if raw in {"shadow", "enforce"}:
+        return raw
+    return "off"
+
+
+def _head_bytes(path: Path, nbytes: int = 4096) -> bytes:
+    with path.open("rb") as handle:
+        return handle.read(nbytes)
+
+
+def _looks_like_json_or_html(head: bytes) -> bool:
+    stripped = head.lstrip(b"\xef\xbb\xbf \t\r\n")
+    return stripped.startswith(b"{") or stripped.startswith(b"[") or stripped.startswith(b"<")
+
+
+def deliver_check(path: Path) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "tool": TOOL,
+        "passed": False,
+        "verdict": "FAIL",
+        "input": {"path": str(path), "bytes": 0, "sha256": "", "kind": "file"},
+        "failures": [],
+        "warnings": [],
+    }
+    if not path.is_file():
+        add_issue(report, "failures", "not-a-file", f"not a regular file: {path}")
+        return report
+    size = path.stat().st_size
+    kind = DELIVER_KINDS.get(path.suffix.lower(), "file")
+    report["input"] = {
+        "path": str(path),
+        "bytes": size,
+        "sha256": sha256(path),
+        "kind": kind,
+    }
+    if size <= 0:
+        add_issue(report, "failures", "empty", "file is empty")
+    office_or_pdf = kind in {"pdf", "docx", "pptx", "xlsx"}
+    if office_or_pdf and size < OFFICE_PDF_MIN_BYTES:
+        add_issue(report, "failures", "too-small", f"office/pdf smaller than {OFFICE_PDF_MIN_BYTES} bytes")
+    head = _head_bytes(path)
+    if office_or_pdf or kind == "zip":
+        if _looks_like_json_or_html(head):
+            add_issue(report, "failures", "bad-magic", "JSON/HTML magic is not a valid office/pdf package")
+        elif kind == "pdf":
+            if not head.startswith(b"%PDF-"):
+                add_issue(report, "failures", "bad-magic", "file does not start with %PDF-")
+        elif not head.startswith(b"PK\x03\x04"):
+            add_issue(report, "failures", "bad-magic", "file does not start with ZIP/PK magic")
+        if kind in {"docx", "pptx", "xlsx", "zip"} and head.startswith(b"PK\x03\x04"):
+            check_zip(path, report)
+            if kind != "zip":
+                try:
+                    with zipfile.ZipFile(path) as package:
+                        names = set(package.namelist())
+                    if "[Content_Types].xml" not in names:
+                        add_issue(report, "failures", "bad-magic", "OOXML package missing [Content_Types].xml")
+                    if kind == "docx" and "word/document.xml" not in names:
+                        add_issue(report, "failures", "docx-not-ooxml", "docx missing word/document.xml")
+                    if kind == "pptx":
+                        slides = [name for name in names if name.startswith("ppt/slides/slide") and name.endswith(".xml")]
+                        if not slides:
+                            add_issue(report, "failures", "pptx-empty", "presentation has no slides")
+                    if kind == "xlsx":
+                        sheets = [name for name in names if name.startswith("xl/worksheets/")]
+                        if not sheets:
+                            add_issue(report, "failures", "xlsx-empty", "workbook has no sheets")
+                except Exception as error:
+                    add_issue(report, "failures", "package-invalid", f"invalid OOXML package: {error}")
+        if kind == "pdf" and head.startswith(b"%PDF-"):
+            inspect_pdf_structure(path, report)
+    report["passed"] = len(report["failures"]) == 0
+    report["verdict"] = "PASS" if report["passed"] else "FAIL"
+    return report
+
+
+def emit_verdict(report: dict[str, Any]) -> None:
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print("PASS" if report.get("passed") else "FAIL")
+
+
+def deliver(args: argparse.Namespace) -> int:
+    source = Path(args.input).expanduser().resolve()
+    report = deliver_check(source)
+    sidecar = source.parent / f"{source.stem}.deliver.json"
+    sidecar.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    emit_verdict(report)
+    mode = deliver_gate_mode()
+    if mode == "shadow":
+        return 0
+    return 0 if report["passed"] else 1
+
+
+def pack(args: argparse.Namespace) -> int:
+    output = Path(args.out).expanduser().resolve()
+    max_bytes = args.max_bytes
+    paths = [Path(item).expanduser().resolve() for item in args.paths]
+    failures: list[dict[str, str]] = []
+    total = 0
+    for item in paths:
+        if not item.is_file():
+            failures.append({"code": "not-a-file", "message": f"not a regular file: {item}"})
+            continue
+        total += item.stat().st_size
+        if total > max_bytes:
+            failures.append(
+                {
+                    "code": "over-limit",
+                    "message": f"uncompressed total {total} exceeds --max-bytes {max_bytes}",
+                }
+            )
+            break
+    report: dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "tool": TOOL,
+        "passed": False,
+        "verdict": "FAIL",
+        "input": {"paths": [str(item) for item in paths], "bytes": total, "kind": "zip"},
+        "failures": failures,
+        "warnings": [],
+    }
+    if failures:
+        emit_verdict(report)
+        return 1
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as package:
+        for item in paths:
+            info = zipfile.ZipInfo(filename=item.name)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            with item.open("rb") as handle, package.open(info, "w") as dest:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dest.write(chunk)
+    with zipfile.ZipFile(output) as package:
+        bad = package.testzip()
+    if bad:
+        output.unlink(missing_ok=True)
+        report["failures"].append({"code": "package-corrupt", "message": f"corrupt package member: {bad}"})
+        emit_verdict(report)
+        return 1
+    report["passed"] = True
+    report["verdict"] = "PASS"
+    report["input"]["path"] = str(output)
+    report["input"]["bytes"] = output.stat().st_size
+    report["input"]["sha256"] = sha256(output)
+    emit_verdict(report)
+    return 0
+
+
 def inspect(args: argparse.Namespace) -> int:
     source = Path(args.input).expanduser().resolve()
     if not source.is_file():
@@ -621,8 +823,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog=TOOL,
         description="Inspect and render PDF/PPTX/XLSX artifacts; emit a JSON QA report.",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
-    command = sub.add_parser("inspect", help="inspect one immutable input artifact")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    command = subparsers.add_parser("inspect", help="inspect one immutable input artifact")
     command.add_argument("--input", required=True, help="PDF/PPTX/XLSX input file")
     command.add_argument("--out-dir", required=True, help="new directory for report and renders")
     command.add_argument("--expect", help="optional JSON expectations")
@@ -632,16 +834,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=900,
         help="per external command timeout; 0 disables the deadline (default: 900)",
     )
+    deliver_cmd = subparsers.add_parser("deliver", help="L0 magic/size/zip gate before handing a file to the user")
+    deliver_cmd.add_argument("--input", required=True, help="file to gate (pdf/docx/pptx/xlsx/zip)")
+    pack_cmd = subparsers.add_parser("pack", help="zip multiple delivery files with a 100MB uncompressed cap")
+    pack_cmd.add_argument("--out", required=True, help="output zip path")
+    pack_cmd.add_argument(
+        "--max-bytes",
+        type=int,
+        default=PACK_DEFAULT_MAX_BYTES,
+        help="uncompressed total byte cap (default: 104857600)",
+    )
+    pack_cmd.add_argument("paths", nargs="+", help="files to pack")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.timeout_seconds < 0:
-        parser.error("--timeout-seconds must be >= 0")
     if args.command == "inspect":
+        if args.timeout_seconds < 0:
+            parser.error("--timeout-seconds must be >= 0")
         return inspect(args)
+    if args.command == "deliver":
+        return deliver(args)
+    if args.command == "pack":
+        if args.max_bytes <= 0:
+            parser.error("--max-bytes must be > 0")
+        return pack(args)
     parser.error("unknown command")
     return 2
 

@@ -47,10 +47,10 @@ export class MessageBoundary extends Component<Props, State> {
     if (this.state.failed) {
       // 紧凑占位行:沿用消息卡的 border/surface token(暗色主题自适配),不打断消息流节奏。
       return (
-        <div className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-[12.5px] text-muted">
+        <div className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-meta text-muted">
           <AlertTriangle size={13} className="shrink-0 text-warning" aria-hidden="true" />
           <span>此条消息渲染失败</span>
-          <span className="font-mono text-[11px] text-faint" title={this.props.messageId}>
+          <span className="font-mono text-caption text-faint" title={this.props.messageId}>
             #{this.props.messageId.slice(0, 8)}
           </span>
         </div>

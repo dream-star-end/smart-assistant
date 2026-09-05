@@ -171,7 +171,7 @@ export function OrgTopupDialog({
     <Modal open={open} onOpenChange={(o) => !o && onClose()} title={title} className="max-w-md">
       <div>
         {err && (
-          <Alert tone="warning" className="mb-3 text-[12.5px]">
+          <Alert tone="warning" className="mb-3 text-meta">
             {err}
           </Alert>
         )}
@@ -181,12 +181,12 @@ export function OrgTopupDialog({
             <div>
               <label
                 htmlFor="org-topup-amount"
-                className="mb-1.5 block text-[12.5px] text-muted"
+                className="mb-1.5 block text-meta text-muted"
               >
                 充值金额（元）
               </label>
               <div className="flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3.5 focus-within:border-accent focus-within:ring-2 focus-within:ring-ring">
-                <span className="text-[15px] text-faint">¥</span>
+                <span className="text-title text-faint">¥</span>
                 <input
                   id="org-topup-amount"
                   inputMode="decimal"
@@ -199,11 +199,11 @@ export function OrgTopupDialog({
                     }
                   }}
                   placeholder="输入充值金额"
-                  className="h-10 w-full bg-transparent text-[15px] text-fg outline-none placeholder:text-faint"
+                  className="h-10 w-full bg-transparent text-title text-fg outline-none placeholder:text-faint"
                 />
               </div>
               {amountCents && (
-                <p className="mt-1 text-[11.5px] text-faint">
+                <p className="mt-1 text-caption text-faint">
                   实付 {formatCentsYuan(amountCents)}
                 </p>
               )}
@@ -216,7 +216,7 @@ export function OrgTopupDialog({
                   type="button"
                   onClick={() => setAmount(y)}
                   className={cn(
-                    "rounded-full border px-3 py-1 text-[12.5px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                    "rounded-full border px-3 py-1 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
                     amount === y
                       ? "border-accent bg-accent-soft text-accent"
                       : "border-border bg-surface text-muted hover:border-border-strong hover:text-fg",
@@ -235,7 +235,7 @@ export function OrgTopupDialog({
               {creating ? <Spinner size={15} /> : null}
               发起充值
             </Button>
-            <p className="text-[11.5px] text-faint">
+            <p className="text-caption text-faint">
               到账积分按平台当前汇率计算，支付成功后即时入账组织钱包。
             </p>
           </div>
@@ -247,7 +247,7 @@ export function OrgTopupDialog({
               <div className="text-[20px] font-semibold text-fg">
                 {formatCentsYuan(stage.amountCents)}
               </div>
-              <div className="text-[12.5px] text-faint">订单号 {stage.result.orderNo}</div>
+              <div className="text-meta text-faint">订单号 {stage.result.orderNo}</div>
             </div>
             <HupijiaoPaymentEntry
               qrcodeUrl={stage.result.qr}
@@ -265,10 +265,10 @@ export function OrgTopupDialog({
             <span className="flex size-12 items-center justify-center rounded-full bg-success-soft text-success">
               <Check size={26} />
             </span>
-            <div className="text-[15px] font-semibold text-fg">
+            <div className="text-title font-semibold text-fg">
               已到账 {formatCentsYuan(stage.amountCents)}
             </div>
-            <p className="text-[12.5px] text-faint">组织钱包余额已更新。</p>
+            <p className="text-meta text-faint">组织钱包余额已更新。</p>
             <Button variant="primary" size="sm" onClick={onClose} className="mt-1">
               完成
             </Button>

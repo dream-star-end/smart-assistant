@@ -1642,6 +1642,39 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("gateway-initiated shutdown escalated to SIGKILL (crashed=false) → SERVICE_RESTART, not RUNNER_CRASHED", async () => {
+    // Runner sets shuttingDown before the process dies, so the exit carries
+    // crashed:false even though grace expired and it had to be SIGKILLed.
+    // Reporting RUNNER_CRASHED here made master respawn → recycle → loop.
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("recycled mid-turn");
+          r.emitExit({ code: null, signal: "SIGKILL", crashed: false });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+      assert.equal(session._plannedTeardown, undefined);
+
+      await runOneTurn(sm, session, events);
+
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0].status, "interrupted");
+      assert.equal(captured.payloads[0].errorCode, "SERVICE_RESTART");
+      assert.equal(captured.payloads[0].waiveReason, "no_response");
+      assert.equal(captured.payloads[0].text, "recycled mid-turn");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("unplanned SIGKILL stays RUNNER_CRASHED", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);

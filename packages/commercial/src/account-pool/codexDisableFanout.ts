@@ -132,7 +132,8 @@ async function runFanout(
       // P1d 防御:按 channel(fanout 受 controlPlaneEnabled gate,v5 不跑;codex 下线见 P1f)。
       `SELECT id::text AS id
        FROM agent_containers
-       WHERE codex_account_id = $1 AND state = 'active' AND runtime_channel = $2`,
+       WHERE codex_account_id = $1 AND state = 'active' AND runtime_channel = $2
+         AND runtime_kind = 'docker'`,
       [String(accountId), getRuntimeChannel()],
     )
     if (rows.rows.length === 0) {
@@ -283,6 +284,7 @@ export async function findCodexDisableDrift(
        JOIN claude_accounts ca ON ca.id = ac.codex_account_id
       WHERE ac.state = 'active'
         AND ac.runtime_channel = $1
+        AND ac.runtime_kind = 'docker'
         AND ac.codex_account_id IS NOT NULL
         AND ca.provider = 'codex'
         AND ca.status <> 'active'

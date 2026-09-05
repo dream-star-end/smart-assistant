@@ -57,23 +57,23 @@ function DiffBody({ row }: { row: AdminAuditRow }) {
         <KeyValue label="动作" value={<Badge tone="neutral">{row.action}</Badge>} />
         <KeyValue
           label="操作者"
-          value={<span className="font-mono text-[12px]">{row.admin_id}</span>}
+          value={<span className="font-mono text-meta">{row.admin_id}</span>}
         />
         <KeyValue
           label="对象"
           value={
             row.target ? (
-              <span className="font-mono text-[12px] break-all">{row.target}</span>
+              <span className="font-mono text-meta break-all">{row.target}</span>
             ) : (
               <span className="text-faint">—</span>
             )
           }
         />
-        <KeyValue label="IP" value={<span className="font-mono text-[12px]">{row.ip ?? "—"}</span>} />
+        <KeyValue label="IP" value={<span className="font-mono text-meta">{row.ip ?? "—"}</span>} />
         <KeyValue
           label="User-Agent"
           value={
-            <span className="break-all text-[12px] text-muted">{row.user_agent ?? "—"}</span>
+            <span className="break-all text-meta text-muted">{row.user_agent ?? "—"}</span>
           }
         />
         <KeyValue label="时间" value={<TimeAgo value={row.created_at} />} />
@@ -84,11 +84,11 @@ function DiffBody({ row }: { row: AdminAuditRow }) {
         <table className="w-full table-fixed border-collapse text-sm">
           <thead>
             <tr className="border-b border-border bg-surface">
-              <th className="w-28 whitespace-nowrap px-3 py-2 text-left text-[12px] font-medium text-faint">
+              <th className="w-28 whitespace-nowrap px-3 py-2 text-left text-meta font-medium text-faint">
                 字段
               </th>
-              <th className="px-3 py-2 text-left text-[12px] font-medium text-faint">变更前</th>
-              <th className="px-3 py-2 text-left text-[12px] font-medium text-faint">变更后</th>
+              <th className="px-3 py-2 text-left text-meta font-medium text-faint">变更前</th>
+              <th className="px-3 py-2 text-left text-meta font-medium text-faint">变更后</th>
             </tr>
           </thead>
           <tbody>
@@ -103,13 +103,13 @@ function DiffBody({ row }: { row: AdminAuditRow }) {
                     : "border-b border-border/60 last:border-0"
                 }
               >
-                <td className="px-3 py-2 align-top font-mono text-[12px] text-muted break-all">
+                <td className="px-3 py-2 align-top font-mono text-meta text-muted break-all">
                   {d.key}
                 </td>
-                <td className="px-3 py-2 align-top text-[13px] text-fg">
+                <td className="px-3 py-2 align-top text-body text-fg">
                   <FormatJsonValue value={d.before} />
                 </td>
-                <td className="px-3 py-2 align-top text-[13px] text-fg">
+                <td className="px-3 py-2 align-top text-body text-fg">
                   <FormatJsonValue value={d.after} />
                 </td>
               </tr>
@@ -290,7 +290,7 @@ export function AdminAuditTab() {
           className="h-9 w-full sm:w-48"
           aria-label="对象精确匹配"
         />
-        <label className="flex items-center gap-1.5 text-[12px] text-faint">
+        <label className="flex items-center gap-1.5 text-meta text-faint">
           从
           <Input
             type="datetime-local"
@@ -301,7 +301,7 @@ export function AdminAuditTab() {
             aria-label="起始时间"
           />
         </label>
-        <label className="flex items-center gap-1.5 text-[12px] text-faint">
+        <label className="flex items-center gap-1.5 text-meta text-faint">
           到
           <Input
             type="datetime-local"

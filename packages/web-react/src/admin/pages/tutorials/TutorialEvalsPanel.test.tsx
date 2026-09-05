@@ -1,14 +1,14 @@
 import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { api } from '../../../lib/api'
+import { adminApi } from '../../../lib/api/admin'
 import { TutorialEvalsPanel } from './TutorialEvalsPanel'
 
 beforeEach(() => {
-  vi.spyOn(api, 'listTutorialEvalSpecs').mockResolvedValue({ specs: [], nextCursor: null })
-  vi.spyOn(api, 'listTutorialEvalJobs').mockResolvedValue({ jobs: [], nextCursor: null })
-  vi.spyOn(api, 'listTutorialEvalCompass').mockResolvedValue({ items: [], nextCursor: null })
-  vi.spyOn(api, 'createTutorialEvalSpec').mockResolvedValue({
+  vi.spyOn(adminApi, 'listTutorialEvalSpecs').mockResolvedValue({ specs: [], nextCursor: null })
+  vi.spyOn(adminApi, 'listTutorialEvalJobs').mockResolvedValue({ jobs: [], nextCursor: null })
+  vi.spyOn(adminApi, 'listTutorialEvalCompass').mockResolvedValue({ items: [], nextCursor: null })
+  vi.spyOn(adminApi, 'createTutorialEvalSpec').mockResolvedValue({
     id: 'spec-1',
     publicId: 'ext-1',
     title: '外部案例登记标题足够长',
@@ -20,7 +20,7 @@ beforeEach(() => {
     rubric: { checks: [] },
     createdAt: '2026-08-20T00:00:00.000Z',
   })
-  vi.spyOn(api, 'enqueueTutorialEvalJob').mockResolvedValue({
+  vi.spyOn(adminApi, 'enqueueTutorialEvalJob').mockResolvedValue({
     id: 'job-1',
     specId: 'spec-1',
     status: 'queued',
@@ -48,8 +48,8 @@ describe('TutorialEvalsPanel', () => {
     fireEvent.change(screen.getByLabelText(/冻结 prompt/), { target: { value: 'do the task with public materials only' } })
     fireEvent.click(screen.getByRole('button', { name: '登记案例' }))
 
-    await waitFor(() => expect(api.createTutorialEvalSpec).toHaveBeenCalledTimes(1))
-    expect(api.createTutorialEvalSpec).toHaveBeenCalledWith(
+    await waitFor(() => expect(adminApi.createTutorialEvalSpec).toHaveBeenCalledTimes(1))
+    expect(adminApi.createTutorialEvalSpec).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
         publicId: 'ext-1',

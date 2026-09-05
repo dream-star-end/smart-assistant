@@ -169,7 +169,7 @@ export default function ModelGrantsPage() {
           {searching ? "查询中…" : "查询"}
         </Button>
         {selected && (
-          <span className="text-[12.5px] text-muted">
+          <span className="text-meta text-muted">
             当前:{selected.email || "—"} <span className="font-mono">(uid={selected.uid})</span>
           </span>
         )}

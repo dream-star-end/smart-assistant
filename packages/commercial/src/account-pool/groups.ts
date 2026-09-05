@@ -910,6 +910,7 @@ export async function expireSettledGrokRouteLeases(
             SELECT 1 FROM agent_containers ac
              WHERE ac.id = c.container_id
                AND ac.state = 'active'
+               AND ac.runtime_kind = 'docker'
           )
           OR (
             EXISTS (

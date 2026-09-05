@@ -141,7 +141,7 @@ export function PreferencesTab({
       <div className="flex flex-col">
         {err && (
           <div className="px-5 pt-3">
-            <Alert tone="danger" className="text-[12.5px]">
+            <Alert tone="danger" className="text-meta">
               {err}
             </Alert>
           </div>
@@ -155,7 +155,7 @@ export function PreferencesTab({
     <div className="flex flex-col">
       {err && (
         <div className="px-5 pt-3">
-          <Alert tone="danger" className="text-[12.5px]">
+          <Alert tone="danger" className="text-meta">
             {err}
           </Alert>
         </div>
@@ -163,7 +163,7 @@ export function PreferencesTab({
 
       {/* 外观主题 */}
       <div className="px-5 py-4">
-        <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           外观主题
         </div>
         <div className="grid grid-cols-3 gap-2">
@@ -173,7 +173,7 @@ export function PreferencesTab({
               onClick={() => changeTheme(o.value)}
               aria-pressed={theme === o.value}
               className={cn(
-                'flex flex-col items-center gap-1.5 rounded-xl border px-3 py-3 text-[13px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+                'flex flex-col items-center gap-1.5 rounded-xl border px-3 py-3 text-body outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
                 theme === o.value
                   ? 'border-accent bg-accent-soft text-accent'
                   : 'border-border text-muted hover:bg-hover hover:text-fg',
@@ -188,11 +188,11 @@ export function PreferencesTab({
 
       {/* 默认模型 + 思考深度 */}
       <div className="border-t border-border px-5 py-4">
-        <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           对话默认
         </div>
         <label className="flex items-center justify-between gap-3 py-1.5">
-          <span className="text-[13.5px] text-fg">默认模型</span>
+          <span className="text-section text-fg">默认模型</span>
           <Select
             value={prefs.default_model ?? ''}
             onChange={(v) => {
@@ -212,7 +212,7 @@ export function PreferencesTab({
           </Select>
         </label>
         <label className="flex items-center justify-between gap-3 py-1.5">
-          <span className="text-[13.5px] text-fg">思考深度</span>
+          <span className="text-section text-fg">思考深度</span>
           <Select
             value={selectedEffort}
             onChange={(v) => patch({ default_effort: v === '' ? null : v })}
@@ -239,8 +239,8 @@ export function PreferencesTab({
             </div>
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
-                <span className="text-[14px] font-semibold text-fg">Auto‑Dream</span>
-                <span className="inline-flex items-center gap-1 rounded-full border border-accent/25 bg-accent-soft px-2 py-0.5 text-[10.5px] font-semibold text-accent">
+                <span className="text-title font-semibold text-fg">Auto‑Dream</span>
+                <span className="inline-flex items-center gap-1 rounded-full border border-accent/25 bg-accent-soft px-2 py-0.5 text-micro font-semibold text-accent">
                   <Sparkles size={10} /> Max+
                 </span>
               </div>
@@ -279,30 +279,30 @@ export function PreferencesTab({
               <button
                 type="button"
                 onClick={onOpenMemory}
-                className="shrink-0 rounded-lg border border-border bg-elevated px-3 py-1.5 text-[12px] font-medium text-fg outline-none transition-colors hover:border-accent hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+                className="shrink-0 rounded-lg border border-border bg-elevated px-3 py-1.5 text-meta font-medium text-fg outline-none transition-colors hover:border-accent hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
               >
                 查看优化建议
               </button>
             </div>
             {autoDream && !autoDream.eligible && (
               <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-border bg-surface px-3 py-2.5">
-                <span className="text-[12px] text-muted">升级到 Max 即可解锁后台记忆整理。</span>
+                <span className="text-meta text-muted">升级到 Max 即可解锁后台记忆整理。</span>
                 <button
                   type="button"
                   onClick={onUpgrade}
-                  className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-medium text-white outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring"
+                  className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-meta font-medium text-white outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   升级到 Max
                 </button>
               </div>
             )}
             {autoDream?.eligible && !autoDream.available && (
-              <p className="mt-3 rounded-xl border border-warning/25 bg-warning-soft px-3 py-2 text-[12px] text-warning">
+              <p className="mt-3 rounded-xl border border-warning/25 bg-warning-soft px-3 py-2 text-meta text-warning">
                 Auto‑Dream 当前暂不可用，功能已安全暂停。
               </p>
             )}
             {autoDream?.legacy_enabled && !autoDream.optimizer_enabled && (
-              <p className="mt-3 rounded-xl border border-warning/25 bg-warning-soft px-3 py-2 text-[12px] text-warning">
+              <p className="mt-3 rounded-xl border border-warning/25 bg-warning-soft px-3 py-2 text-meta text-warning">
                 你当前仍在使用旧版记忆整理。打开上方开关并确认后，将安全升级到全面优化；旧版自动改记忆会同时关闭。
               </p>
             )}
@@ -369,15 +369,15 @@ export function PreferencesTab({
 
       {/* 通知 */}
       <div className="border-t border-border px-5 py-4">
-        <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">通知</div>
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">通知</div>
         <div className="mb-3">
           <QqBindingCard auth={auth} prefs={prefs} onPatch={patch} />
         </div>
         {NOTIF_FIELDS.map((f) => (
           <label key={String(f.key)} className="flex items-center justify-between gap-3 py-2">
             <span className="min-w-0">
-              <span className="block text-[13.5px] text-fg">{f.label}</span>
-              {f.hint && <span className="block text-[11.5px] text-faint">{f.hint}</span>}
+              <span className="block text-section text-fg">{f.label}</span>
+              {f.hint && <span className="block text-caption text-faint">{f.hint}</span>}
             </span>
             <Switch
               checked={prefs[f.key] === true}
@@ -434,22 +434,22 @@ function HotkeysEditor({
 
   return (
     <div className="border-t border-border px-5 py-4">
-      <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+      <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
         自定义快捷键
       </div>
       {err && (
-        <Alert tone="warning" className="mb-2 text-[12.5px]">
+        <Alert tone="warning" className="mb-2 text-meta">
           {err}
         </Alert>
       )}
       {entries.length === 0 ? (
-        <p className="pb-2 text-[12.5px] text-faint">还没有自定义快捷键。</p>
+        <p className="pb-2 text-meta text-faint">还没有自定义快捷键。</p>
       ) : (
         <ul className="mb-2 flex flex-col gap-1">
           {entries.map(([k, v]) => (
             <li key={k} className="flex items-center gap-3 rounded-lg px-2 py-1.5 hover:bg-hover">
-              <span className="min-w-0 flex-1 truncate text-[13px] text-fg">{k}</span>
-              <kbd className="rounded-md border border-border bg-bg px-1.5 py-0.5 font-mono text-[11.5px] text-muted">
+              <span className="min-w-0 flex-1 truncate text-body text-fg">{k}</span>
+              <kbd className="rounded-md border border-border bg-bg px-1.5 py-0.5 font-mono text-caption text-muted">
                 {v}
               </kbd>
               <button
@@ -469,14 +469,14 @@ function HotkeysEditor({
           onChange={(e) => setName(e.target.value)}
           placeholder="动作名"
           maxLength={64}
-          className="h-auto bg-bg px-3 py-2 text-[13px]"
+          className="h-auto bg-bg px-3 py-2 text-body"
         />
         <Input
           value={combo}
           onChange={(e) => setCombo(e.target.value)}
           placeholder="如 Ctrl+K"
           maxLength={64}
-          className="h-auto bg-bg px-3 py-2 text-[13px]"
+          className="h-auto bg-bg px-3 py-2 text-body"
           onKeyDown={(e) => {
             if (e.key === 'Enter') add()
           }}
@@ -484,7 +484,7 @@ function HotkeysEditor({
         <button
           onClick={add}
           disabled={!name.trim() || !combo.trim()}
-          className="shrink-0 rounded-md border border-border bg-surface px-3 py-2 text-[13px] text-fg outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+          className="shrink-0 rounded-md border border-border bg-surface px-3 py-2 text-body text-fg outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
         >
           添加
         </button>
@@ -515,7 +515,7 @@ function Select({
       value={value}
       disabled={disabled}
       onChange={(e) => onChange(e.target.value)}
-      className="max-w-[55%] rounded-lg border border-border bg-bg px-2.5 py-1.5 text-[13px] text-fg outline-none transition-colors hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+      className="max-w-[55%] rounded-lg border border-border bg-bg px-2.5 py-1.5 text-body text-fg outline-none transition-colors hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
     >
       {children}
     </select>

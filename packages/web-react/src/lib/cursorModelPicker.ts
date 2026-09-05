@@ -5,6 +5,7 @@ import {
   type CursorEngineModel,
   type PlatformReasoningEffort,
   contextFamilyByModelId,
+  contextFamilyCollapsedByDefault,
   contextFamilyDefaultLong,
   cursorFamilyDefaultEffort,
   cursorFamilyDefaultFast,
@@ -25,6 +26,11 @@ export type ContextPickerRow = {
   label: string
   members: PublicModel[]
   spec: ContextTierFamily
+  /**
+   * protocol CONTEXT_TIER_FAMILIES.collapsedByDefault 的投影:为 true 的家族默认收进
+   * 「更多 GPT 模型」折叠组(2026-09-05:Terra/Luna)。纯展示语义,不改准入/计费。
+   */
+  collapsed: boolean
 }
 
 export type LockedCursorFamilyRow = {
@@ -154,6 +160,7 @@ export function modelPickerRows(
           label: context.familyLabel,
           spec: context,
           members: models.filter((item) => ids.has(item.id)),
+          collapsed: contextFamilyCollapsedByDefault(context.family),
         },
       })
       continue
@@ -164,6 +171,40 @@ export function modelPickerRows(
   const usable = rows.filter((row) => !rowDegraded(row))
   const degraded = rows.filter(rowDegraded)
   return [...usable, ...lockedPickerRows(models, lockedModels, seenCursor), ...degraded]
+}
+
+/** 折叠组里的行(仅 context-family 且 collapsed)。锁定/降级行不进折叠组。 */
+export function isCollapsedPickerRow(row: ModelPickerRow): boolean {
+  return row.kind === 'context-family' && row.row.collapsed && !rowDegraded(row)
+}
+
+/**
+ * 把 picker 行拆成「直接展示」与「折叠组」两段。折叠组保持在 rows 中的相对顺序。
+ * `selectedId` 落在折叠家族内时 `selectedInCollapsed=true`,调用方据此默认展开,
+ * 保证当前选中项永远可见。
+ */
+export function partitionCollapsedRows(
+  rows: readonly ModelPickerRow[],
+  selectedId: string | undefined,
+): { visible: ModelPickerRow[]; collapsed: ModelPickerRow[]; selectedInCollapsed: boolean } {
+  const visible: ModelPickerRow[] = []
+  const collapsed: ModelPickerRow[] = []
+  let selectedInCollapsed = false
+  for (const row of rows) {
+    if (isCollapsedPickerRow(row)) {
+      collapsed.push(row)
+      if (
+        row.kind === 'context-family' &&
+        selectedId !== undefined &&
+        row.row.members.some((member) => member.id === selectedId)
+      ) {
+        selectedInCollapsed = true
+      }
+    } else {
+      visible.push(row)
+    }
+  }
+  return { visible, collapsed, selectedInCollapsed }
 }
 
 export function availableCursorEfforts(members: readonly PublicModel[]): PlatformReasoningEffort[] {

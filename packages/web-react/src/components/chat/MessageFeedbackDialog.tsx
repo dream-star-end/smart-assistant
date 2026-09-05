@@ -209,7 +209,7 @@ export function MessageFeedbackDialog({
           )}
 
           <fieldset disabled={submitting}>
-            <legend className="text-[12.5px] font-medium text-fg">哪里不够好？</legend>
+            <legend className="text-meta font-medium text-fg">哪里不够好？</legend>
             <div className="mt-2 flex flex-wrap gap-2">
               {REASONS.map((item) => (
                 <button
@@ -217,7 +217,7 @@ export function MessageFeedbackDialog({
                   type="button"
                   aria-pressed={reason === item}
                   className={cn(
-                    'rounded-full border px-3 py-1.5 text-[12.5px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    'rounded-full border px-3 py-1.5 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
                     reason === item
                       ? 'border-accent/50 bg-accent-soft text-accent'
                       : 'border-border text-muted hover:border-accent/40 hover:text-fg',
@@ -234,7 +234,7 @@ export function MessageFeedbackDialog({
           </fieldset>
 
           <label
-            className="mt-4 block text-[12.5px] font-medium text-fg"
+            className="mt-4 block text-meta font-medium text-fg"
             htmlFor="message-feedback-detail"
           >
             补充说明（可选）
@@ -253,7 +253,7 @@ export function MessageFeedbackDialog({
           />
 
           {error && (
-            <Alert tone="danger" className="mt-3 text-[12.5px]">
+            <Alert tone="danger" className="mt-3 text-meta">
               {error}
             </Alert>
           )}

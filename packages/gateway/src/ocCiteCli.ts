@@ -2,7 +2,7 @@
  * oc-cite — 容器内引用接地门禁 CLI(Phase 1:identifier 回查 + 撤稿 + 格式化)。
  *
  * 用法(baseline skill oc-cite 文档化):
- *   oc-cite verify <id...>            # DOI/arXiv/OpenAlex 回查 + 撤稿(闸③④)
+ *   oc-cite verify <id...>            # DOI/arXiv/OpenAlex/PMID/ADS bibcode 回查 + 撤稿(闸③④)
  *   oc-cite format <id> --style gb-t-7714-2015|apa|bibtex
  *   oc-cite check --manifest <file>   # 证据 manifest 接地校验(闸①②③④,master 铸 verified)
  *
@@ -18,7 +18,7 @@ async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   if (isCliHelpArg(cmd)) {
     exitWithCliHelp(
-      "usage: oc-cite <verify <id...>|format <id> --style ...|check --manifest <f>|fix --manifest <f> --docs <ids>>",
+      "usage: oc-cite <verify <id...>|format <id> --style ...|check --manifest <f>|fix --manifest <f> --docs <ids>>  # id 支持 doi:/arxiv:/openalex:/pmid:/ads:<bibcode>",
     );
   }
   const { positional, flags } = parseFlags(rest);
@@ -66,7 +66,7 @@ async function main(): Promise<void> {
       return;
     }
     default:
-      fail(TOOL, "usage: oc-cite <verify <id...>|format <id> --style ...|check --manifest <f>|fix --manifest <f> --docs <ids>>");
+      fail(TOOL, "usage: oc-cite <verify <id...>|format <id> --style ...|check --manifest <f>|fix --manifest <f> --docs <ids>>  # id 支持 doi:/arxiv:/openalex:/pmid:/ads:<bibcode>");
   }
 }
 

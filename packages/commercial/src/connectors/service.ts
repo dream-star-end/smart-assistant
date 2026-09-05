@@ -268,6 +268,71 @@ export function buildWriteSummary(
         `用微博${hint}把评论 ${String(params.commentId ?? '')} 设置为${params.liked === true ? '已点赞' : '未点赞'}`,
         2000,
       )
+    case 'zhihu/create_pin': {
+      const text = String(params.text ?? '')
+      const media = Array.isArray(params.mediaManifest) ? params.mediaManifest : []
+      const images = media.length > 0 ? `（${media.length} 张图片）` : ''
+      return ellipsize(
+        `用知乎${hint}发布想法${images}：「${ellipsize(text, 300)}」`,
+        2000,
+      )
+    }
+    case 'zhihu/create_answer': {
+      const media = Array.isArray(params.mediaManifest) ? params.mediaManifest : []
+      const images = media.length > 0 ? `（${media.length} 张图片）` : ''
+      return ellipsize(
+        `用知乎${hint}回答问题 ${String(params.questionId ?? '')}${images}：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        2000,
+      )
+    }
+    case 'zhihu/edit_answer': {
+      const media = Array.isArray(params.mediaManifest) ? params.mediaManifest : []
+      const images = media.length > 0 ? `（${media.length} 张图片）` : ''
+      return ellipsize(
+        `用知乎${hint}编辑回答 ${String(params.answerId ?? '')}${images}：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        2000,
+      )
+    }
+    case 'zhihu/delete_answer':
+      return ellipsize(
+        `用知乎${hint}永久删除回答 ${String(params.answerId ?? '')}（不可撤销）`,
+        2000,
+      )
+    case 'zhihu/create_comment':
+      return ellipsize(
+        `用知乎${hint}评论回答 ${String(params.answerId ?? '')}：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        2000,
+      )
+    case 'zhihu/reply_comment':
+      return ellipsize(
+        `用知乎${hint}回复评论 ${String(params.commentId ?? '')}：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        2000,
+      )
+    case 'zhihu/delete_comment':
+      return ellipsize(
+        `用知乎${hint}永久删除评论 ${String(params.commentId ?? '')}（不可撤销）`,
+        2000,
+      )
+    case 'zhihu/set_vote':
+      return ellipsize(
+        `用知乎${hint}把回答 ${String(params.answerId ?? '')} 设置为${
+          params.vote === 'up' ? '赞同' : params.vote === 'down' ? '反对' : '中立'
+        }`,
+        2000,
+      )
+    case 'zhihu/set_following':
+      return ellipsize(
+        `用知乎${hint}把用户 ${String(params.urlToken ?? '')} 设置为${params.following === true ? '已关注' : '未关注'}`,
+        2000,
+      )
+    case 'zhihu/create_article': {
+      const media = Array.isArray(params.mediaManifest) ? params.mediaManifest : []
+      const images = media.length > 0 ? `（${media.length} 张图片）` : ''
+      return ellipsize(
+        `用知乎${hint}发布文章${images}「${ellipsize(String(params.title ?? ''), 80)}」`,
+        2000,
+      )
+    }
     default:
       return ellipsize(`${provider} 写操作 ${action}`, 2000)
   }
@@ -465,6 +530,71 @@ export function buildWriteDetail(
         postId: String(params.postId ?? ''),
         commentId: String(params.commentId ?? ''),
         liked: params.liked === true,
+      }
+    case 'zhihu/create_pin':
+      return {
+        kind: 'zhihu_pin',
+        text: String(params.text ?? ''),
+        media: Array.isArray(params.mediaManifest) ? params.mediaManifest : [],
+      }
+    case 'zhihu/create_answer':
+      return {
+        kind: 'zhihu_answer',
+        questionId: String(params.questionId ?? ''),
+        text: String(params.text ?? ''),
+        media: Array.isArray(params.mediaManifest) ? params.mediaManifest : [],
+      }
+    case 'zhihu/edit_answer':
+      return {
+        kind: 'zhihu_answer_edit',
+        answerId: String(params.answerId ?? ''),
+        text: String(params.text ?? ''),
+        media: Array.isArray(params.mediaManifest) ? params.mediaManifest : [],
+        warning: '知乎回答将被修改；最终复核与网页点击之间仍存在极短竞态窗口。',
+      }
+    case 'zhihu/delete_answer':
+      return {
+        kind: 'zhihu_delete_answer',
+        answerId: String(params.answerId ?? ''),
+        irreversible: true,
+      }
+    case 'zhihu/create_comment':
+      return {
+        kind: 'zhihu_comment',
+        answerId: String(params.answerId ?? ''),
+        text: String(params.text ?? ''),
+      }
+    case 'zhihu/reply_comment':
+      return {
+        kind: 'zhihu_comment_reply',
+        answerId: String(params.answerId ?? ''),
+        commentId: String(params.commentId ?? ''),
+        text: String(params.text ?? ''),
+      }
+    case 'zhihu/delete_comment':
+      return {
+        kind: 'zhihu_delete_comment',
+        commentId: String(params.commentId ?? ''),
+        irreversible: true,
+      }
+    case 'zhihu/set_vote':
+      return {
+        kind: 'zhihu_vote',
+        answerId: String(params.answerId ?? ''),
+        vote: String(params.vote ?? ''),
+      }
+    case 'zhihu/set_following':
+      return {
+        kind: 'zhihu_following',
+        urlToken: String(params.urlToken ?? ''),
+        following: params.following === true,
+      }
+    case 'zhihu/create_article':
+      return {
+        kind: 'zhihu_article',
+        title: String(params.title ?? ''),
+        text: String(params.text ?? ''),
+        media: Array.isArray(params.mediaManifest) ? params.mediaManifest : [],
       }
     default:
       // 兜底:原样返回(params 本身已过严格 schema,无凭据)

@@ -44,6 +44,17 @@
         "运行 oc-figcheck --kind 3d 回看,针对取景空/悬空/背景异常/标注缺失自纠并在回复中说明结论",
         "三个部件(天线1、天线2、控制箱)标注齐全,并给出产物绝对路径"
       ]
+    },
+    {
+      "id": "template-block-diagram-generic-chain",
+      "prompt": "画一张有向流程框图:数据流水线 采集→清洗→特征→模型→评估,另外从『清洗』引一条支路直接到『模型』(跳过特征),底部加脚注『旁路为增量更新路径』。箭头方向不能反、不能成环。请在最终回复里给出所用模板与参数、oc-figcheck 的 --spec 结论、产物绝对路径。",
+      "assertions": [
+        "优先使用 scientific-figures references/templates/block-diagram 模板(--chain --branch)而非从零手摆坐标",
+        "主链五段相邻连线方向全部沿声明顺序,支路 源在目标上游(清洗→模型),无回环;spec.json 中 links kind=flow 且两端都是声明的 stage 对象",
+        "出图后运行 oc-figcheck --kind schematic --spec <伴生 spec.json> 并在回复中给出结论(确定性 issues 为 0)",
+        "若尝试让支路指向上游(如 模型→清洗),模板必须拒画并 exit 非 0,而不是画出错误图",
+        "给出 png 与 spec.json 的绝对路径(/home/agent/.openclaude/ 下)"
+      ]
     }
   ]
 }

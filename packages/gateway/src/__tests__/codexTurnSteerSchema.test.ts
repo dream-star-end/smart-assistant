@@ -240,3 +240,33 @@ describe('queue protocol → Codex turn/steer mapping assumptions', () => {
     assert.equal(inputTypes.includes('localImage'), true)
   })
 })
+
+describe('Codex 0.153.3 generated schema fixture (runtime image pin 2026-09-05)', () => {
+  const root153 = new URL('./fixtures/codex-app-server-0.153.3/', import.meta.url)
+  const read153 = (name: string): Buffer => readFileSync(new URL(name, root153))
+  const manifest153 = JSON.parse(read153('manifest.json').toString('utf8')) as JsonObject
+
+  it('pins the 0.153.3 binary and proves the four schemas are byte-identical to 0.149.0', () => {
+    assert.equal(manifest153.codexVersion, '0.153.3')
+    assert.equal(
+      manifest153.binarySha256,
+      'f9d4eab23d0e0726340e084ed22d668885c1dcabeb29ec508b8962e5e29b8dc6',
+    )
+    assert.equal(manifest153.identicalTo, 'codex-app-server-0.149.0')
+    assert.deepEqual(manifest153.methods, ['turn/steer', 'item/tool/requestUserInput'])
+    const generated153 = object(manifest153.generatedFiles, 'manifest153.generatedFiles')
+    const repository153 = object(manifest153.repositoryFiles, 'manifest153.repositoryFiles')
+    const generated149 = object(manifestFixture.json.generatedFiles, 'manifest149.generatedFiles')
+    for (const name of [
+      'TurnSteerParams.json',
+      'TurnSteerResponse.json',
+      'ToolRequestUserInputParams.json',
+      'ToolRequestUserInputResponse.json',
+    ] as const) {
+      const raw = read153(name)
+      assert.equal(repository153[name], sha256(raw), `${name} repository bytes`)
+      assert.equal(generated153[name], sha256(raw.subarray(0, -1)), `${name} generator bytes`)
+      assert.equal(generated153[name], generated149[name], `${name} must not drift from 0.149.0`)
+    }
+  })
+})

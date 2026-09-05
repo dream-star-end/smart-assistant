@@ -53,7 +53,7 @@ const pct = (part: number, total: number) => total > 0 ? `${((part / total) * 10
 const eventColumns: Column<EventRow>[] = [
   { key: "surface", title: "入口", render: (r) => <Badge tone="neutral">{r.surface}</Badge> },
   { key: "stage", title: "阶段" },
-  { key: "code", title: "稳定分类", render: (r) => <span className="font-mono text-[12px]">{r.code}</span> },
+  { key: "code", title: "稳定分类", render: (r) => <span className="font-mono text-meta">{r.code}</span> },
   { key: "attempts_7d", title: "7 天尝试", align: "right", cellClassName: "tabular-nums" },
   { key: "failed_7d", title: "终局未成功", align: "right", cellClassName: "tabular-nums" },
   { key: "recovered_7d", title: "已恢复", align: "right", cellClassName: "tabular-nums" },
@@ -62,7 +62,7 @@ const eventColumns: Column<EventRow>[] = [
 ];
 
 const modelColumns: Column<ModelRow>[] = [
-  { key: "model", title: "模型", render: (r) => <span className="font-mono text-[12px]">{r.model}</span> },
+  { key: "model", title: "模型", render: (r) => <span className="font-mono text-meta">{r.model}</span> },
   { key: "attempts_1d", title: "24 小时尝试", align: "right" },
   { key: "success_1d", title: "成功", align: "right" },
   { key: "failures_1d", title: "失败", align: "right" },
@@ -81,15 +81,15 @@ function SourceCard({ title, rows, fields }: {
 }) {
   return (
     <Card className="p-4">
-      <h3 className="mb-3 text-[13px] font-semibold text-fg">{title}</h3>
+      <h3 className="mb-3 text-body font-semibold text-fg">{title}</h3>
       <div className="flex flex-col gap-2">
-        {rows.length === 0 && <span className="text-[12px] text-faint">暂无记录</span>}
+        {rows.length === 0 && <span className="text-meta text-faint">暂无记录</span>}
         {rows.map((row, i) => (
-          <div key={`${row.model ?? ""}:${row.status ?? row.outcome ?? row.rating ?? ""}:${row.code ?? i}`} className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg bg-hover px-3 py-2 text-[12px]">
+          <div key={`${row.model ?? ""}:${row.status ?? row.outcome ?? row.rating ?? ""}:${row.code ?? i}`} className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg bg-hover px-3 py-2 text-meta">
             <Badge tone={row.status === "failed" || row.status === "expired" || row.outcome === "failed" || row.outcome === "cancelled" || row.rating === "down" ? "warning" : "neutral"}>
               {row.code ?? row.status ?? row.outcome ?? row.rating ?? "unknown"}
             </Badge>
-            {row.model && <span className="font-mono text-[12px] text-fg">{row.model}</span>}
+            {row.model && <span className="font-mono text-meta text-fg">{row.model}</span>}
             {row.code && (row.status || row.outcome) && <span className="text-faint">{row.status ?? row.outcome}</span>}
             {fields.map((f) => <span key={f.key} className="text-faint"><b className="font-medium text-fg tabular-nums">{row[f.key] ?? "0"}</b> {f.label}</span>)}
           </div>
@@ -131,7 +131,7 @@ export function ProductFrictionTab() {
   if (error) {
     return (
       <Card className="flex items-center justify-between gap-4 p-4">
-        <span className="text-[13px] text-danger">{apiErrorMessage(error, "产品摩擦数据加载失败")}</span>
+        <span className="text-body text-danger">{apiErrorMessage(error, "产品摩擦数据加载失败")}</span>
         <Button size="sm" variant="secondary" onClick={() => setReload((v) => v + 1)}>重试</Button>
       </Card>
     );
@@ -140,7 +140,7 @@ export function ProductFrictionTab() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between gap-3">
-        <p className="text-[12px] text-faint">重试是过程，不等于终局失败；这里按时间窗和受影响用户判断当前是否仍在持续。</p>
+        <p className="text-meta text-faint">重试是过程，不等于终局失败；这里按时间窗和受影响用户判断当前是否仍在持续。</p>
         <Button size="sm" variant="secondary" onClick={() => setReload((v) => v + 1)} disabled={loading}>
           <RefreshCw size={14} />刷新
         </Button>
@@ -169,11 +169,11 @@ export function ProductFrictionTab() {
       </StatCardRow>
 
       <section className="flex flex-col gap-2">
-        <h3 className="text-[13px] font-semibold text-fg">模型尝试与终局</h3>
+        <h3 className="text-body font-semibold text-fg">模型尝试与终局</h3>
         <DataTable columns={modelColumns} rows={data?.models ?? []} rowKey={(r) => r.model} loading={loading} />
       </section>
       <section className="flex flex-col gap-2">
-        <h3 className="text-[13px] font-semibold text-fg">恢复感知事件</h3>
+        <h3 className="text-body font-semibold text-fg">恢复感知事件</h3>
         <DataTable columns={eventColumns} rows={data?.events ?? []} rowKey={(r) => `${r.surface}:${r.stage}:${r.code}`} loading={loading} emptyHint="只有出现摩擦或恢复时才记录，不写成功心跳。" />
       </section>
       <div className="grid gap-3 lg:grid-cols-2">
@@ -195,7 +195,7 @@ function WindowCard({ title, value, loading }: { title: string; value?: EventWin
   return (
     <Card className="min-w-0 p-4">
       <div className="flex items-center justify-between gap-2">
-        <h3 className="text-[13px] font-semibold text-fg">{title}</h3>
+        <h3 className="text-body font-semibold text-fg">{title}</h3>
         <Clock3 size={15} className="text-faint" />
       </div>
       {loading ? (
@@ -207,7 +207,7 @@ function WindowCard({ title, value, loading }: { title: string; value?: EventWin
             <Metric icon={<Users size={13} />} label="用户" value={value?.affected_users ?? 0} />
             <Metric icon={<Link2 size={13} />} label="trace" value={traceRate} />
           </div>
-          <div className="mt-3 grid grid-cols-2 gap-1 text-[11px] text-faint sm:grid-cols-3">
+          <div className="mt-3 grid grid-cols-2 gap-1 text-caption text-faint sm:grid-cols-3">
             <span>失败 <b className="text-danger">{value?.outcomes.failed ?? 0}</b></span>
             <span>恢复 <b className="text-success">{value?.outcomes.recovered ?? 0}</b></span>
             <span>成功 <b className="text-success">{value?.outcomes.succeeded ?? 0}</b></span>
@@ -215,7 +215,7 @@ function WindowCard({ title, value, loading }: { title: string; value?: EventWin
             <span>进行中 <b className="text-fg">{value?.outcomes.pending ?? 0}</b></span>
             <span>取消 <b className="text-fg">{value?.outcomes.cancelled ?? 0}</b></span>
           </div>
-          <p className="mt-3 truncate text-[11px] text-faint" title={value?.latest_occurrence ?? undefined}>
+          <p className="mt-3 truncate text-caption text-faint" title={value?.latest_occurrence ?? undefined}>
             最近：{value?.latest_occurrence ? new Date(value.latest_occurrence).toLocaleString('zh-CN') : '暂无'}
           </p>
         </>
@@ -226,7 +226,7 @@ function WindowCard({ title, value, loading }: { title: string; value?: EventWin
 
 function Metric({ icon, label, value }: { icon: ReactNode; label: string; value: string | number }) {
   return (
-    <span className="inline-flex items-center gap-1 text-[12px] text-muted">
+    <span className="inline-flex items-center gap-1 text-meta text-muted">
       {icon}{label} <b className="tabular-nums text-fg">{value}</b>
     </span>
   )

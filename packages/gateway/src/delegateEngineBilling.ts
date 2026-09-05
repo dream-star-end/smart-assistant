@@ -18,6 +18,7 @@ import { dirname, join } from 'node:path'
 
 import {
   CODEX_ENGINE_MODEL_IDS,
+  DELEGATE_ENGINE_BILLING_SESSION_KEY_RE,
   isGrokEngineModel,
   type DurableCodexBilling,
 } from '@openclaude/protocol'
@@ -33,7 +34,7 @@ const ABANDON_PATH = '/internal/v3/' + 'delegate/engine-billing/abandon'
 
 const MAX_RESPONSE_BYTES = 64 * 1024
 const REQUEST_ID_RE = /^[0-9a-f]{32}$/
-const SESSION_ID_RE = /^[A-Za-z0-9_:@.-]{1,128}$/
+const SESSION_ID_RE = DELEGATE_ENGINE_BILLING_SESSION_KEY_RE
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
 
 export type DelegateEngineBillingEngine = 'codex' | 'grok'

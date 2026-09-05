@@ -286,11 +286,11 @@ function PendingReleaseCard({
     <div className="rounded-lg border border-warning/40 bg-warning-soft px-4 py-3">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <div className="flex items-center gap-2 text-[13px] font-semibold text-warning">
+          <div className="flex items-center gap-2 text-body font-semibold text-warning">
             <Rocket size={14} />
             {header}
           </div>
-          <div className="mt-1.5 text-[13px] text-fg">
+          <div className="mt-1.5 text-body text-fg">
             codex 修复已通过验证（第 {repair.attempt} 次尝试）。核对下方改动与分类后再放行 —— 放行即通知执行侧合并并部署该 SHA（全链审计留痕）。
           </div>
         </div>
@@ -304,7 +304,7 @@ function PendingReleaseCard({
             {buttonLabel}
           </Button>
           {plan.manual.length > 0 && !buttonDisabled && (
-            <span className="text-right text-[11px] font-medium text-danger">
+            <span className="text-right text-caption font-medium text-danger">
               含需人工介入的改动，放行将被置为「需人工处理」
             </span>
           )}
@@ -313,7 +313,7 @@ function PendingReleaseCard({
 
       {/* 全局熔断提示（Modal 覆盖页面顶部 banner，卡片内需自证为何禁用）。 */}
       {fuseEngaged && (
-        <div className="mt-2 flex items-center gap-1.5 text-[12px] font-medium text-danger">
+        <div className="mt-2 flex items-center gap-1.5 text-meta font-medium text-danger">
           <ShieldX size={13} className="shrink-0" />
           全局部署熔断已触发，暂不可放行；请先在页面顶部清除熔断。
         </div>
@@ -321,7 +321,7 @@ function PendingReleaseCard({
 
       {/* 放行请求状态流（202 异步；随详情轮询自动更新）。 */}
       {rr && (
-        <div className="mt-3 rounded-md border border-border bg-surface px-3 py-2 text-[12px]">
+        <div className="mt-3 rounded-md border border-border bg-surface px-3 py-2 text-meta">
           <div className="flex items-center justify-between gap-2">
             <span className="text-faint">放行请求</span>
             <span className="flex items-center gap-1.5">
@@ -346,7 +346,7 @@ function PendingReleaseCard({
       )}
 
       {/* 放行内容清单（human gate）—— 数据源=最新 pending_release 事件 detail。 */}
-      <div className="mt-3 space-y-2 rounded-md border border-warning/30 bg-surface px-3 py-2.5 text-[12px]">
+      <div className="mt-3 space-y-2 rounded-md border border-warning/30 bg-surface px-3 py-2.5 text-meta">
         {!plan.complete && (
           <div className="flex items-center gap-1.5 font-medium text-danger">
             <AlertTriangle size={13} className="shrink-0" />
@@ -357,7 +357,7 @@ function PendingReleaseCard({
         <KeyValue
           label="部署 SHA"
           value={
-            <span className="font-mono text-[11.5px] text-fg">
+            <span className="font-mono text-caption text-fg">
               {short(plan.baseSha)}
               <span className="mx-1 text-faint">→</span>
               {short(plan.sha)}
@@ -384,7 +384,7 @@ function PendingReleaseCard({
           label="部署参数"
           value={
             plan.deployArgs.length > 0 ? (
-              <span className="font-mono text-[11.5px] text-fg">{plan.deployArgs.join(" ")}</span>
+              <span className="font-mono text-caption text-fg">{plan.deployArgs.join(" ")}</span>
             ) : (
               <span className="text-faint">（无附加参数）</span>
             )
@@ -394,7 +394,7 @@ function PendingReleaseCard({
         {plan.deployPlanHash && (
           <KeyValue
             label="deployPlanHash"
-            value={<span className="font-mono text-[11.5px] text-muted">{short(plan.deployPlanHash)}…</span>}
+            value={<span className="font-mono text-caption text-muted">{short(plan.deployPlanHash)}…</span>}
           />
         )}
 
@@ -438,7 +438,7 @@ function PendingReleaseCard({
         {plan.verifyLayers.length > 0 && (
           <KeyValue
             label="部署校验层"
-            value={<span className="font-mono text-[11.5px] text-muted">{plan.verifyLayers.join(", ")}</span>}
+            value={<span className="font-mono text-caption text-muted">{plan.verifyLayers.join(", ")}</span>}
           />
         )}
 
@@ -449,7 +449,7 @@ function PendingReleaseCard({
               <FileText size={12} className="shrink-0" />
               改动文件（{plan.changedFilesTotal}）
             </div>
-            <ul className="mt-0.5 space-y-0.5 font-mono text-[11.5px] text-muted">
+            <ul className="mt-0.5 space-y-0.5 font-mono text-caption text-muted">
               {plan.changedFiles.slice(0, CHANGED_FILES_SHOWN).map((f) => (
                 <li key={f} className="break-all">
                   {f}
@@ -524,7 +524,7 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
     const ok = await confirm({
       title: "放行部署？",
       body: (
-        <span className="text-[13px] text-muted">
+        <span className="text-body text-muted">
           codex 修复已通过验证，部署正等待人工放行。确认后将向执行侧提交放行请求，由其异步合并并部署该
           SHA（全链审计留痕）—— 部署结果与事故是否恢复稍后在卡片内跟踪。仅在核对过改动内容与分类后操作。
           {manualCount > 0 && (
@@ -562,11 +562,11 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
   };
 
   if (loading && !data) {
-    return <p className="py-6 text-center text-[13px] text-muted">加载详情…</p>;
+    return <p className="py-6 text-center text-body text-muted">加载详情…</p>;
   }
   if (error) {
     return (
-      <p className="py-6 text-center text-[13px] text-danger">
+      <p className="py-6 text-center text-body text-danger">
         加载详情失败：{apiErrorMessage(error, "请求失败")}
       </p>
     );
@@ -596,11 +596,11 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
       {/* 正在修复卡（活跃 repair 的最新进度；待放行时上卡已覆盖，不重复）。 */}
       {activeRepair && activeRepair.id !== pendingReleaseRepair?.id && (
         <div className="rounded-lg border border-info/40 bg-info-soft px-4 py-3">
-          <div className="flex items-center gap-2 text-[13px] font-semibold text-info">
+          <div className="flex items-center gap-2 text-body font-semibold text-info">
             <RefreshCw size={14} className="animate-spin" />
             正在修复（第 {activeRepair.attempt} 次尝试 · {activeRepair.status}）
           </div>
-          <div className="mt-1.5 text-[13px] text-fg">
+          <div className="mt-1.5 text-body text-fg">
             {activeEvent
               ? activeEvent.message?.trim() || `进度：${activeEvent.kind}`
               : "已派发 codex 修复，等待首个进度回报…"}
@@ -619,7 +619,7 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
           }
         />
         <KeyValue label="严重度" value={<LevelBadge level={inc.severity} />} />
-        <KeyValue label="影响面" value={<span className="font-mono text-[12px]">{inc.surface}</span>} />
+        <KeyValue label="影响面" value={<span className="font-mono text-meta">{inc.surface}</span>} />
         <KeyValue
           label="事故 ID"
           value={<CopyChip value={inc.id} className="justify-end" />}
@@ -627,7 +627,7 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
         {inc.condition_key != null && (
           <KeyValue
             label="condition"
-            value={<span className="font-mono text-[12px] break-all">{inc.condition_key}</span>}
+            value={<span className="font-mono text-meta break-all">{inc.condition_key}</span>}
           />
         )}
         {inc.rev != null && (
@@ -666,7 +666,7 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
         bodyClassName="p-0"
       >
         {data.repairs.length === 0 ? (
-          <p className="px-4 py-3 text-[13px] text-muted">未触发自动修复。</p>
+          <p className="px-4 py-3 text-body text-muted">未触发自动修复。</p>
         ) : (
           <ul className="divide-y divide-border">
             {data.repairs.map((r: RepairRow) => (
@@ -674,12 +674,12 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <Badge tone={repairTone(r.status)}>{r.status}</Badge>
-                    <span className="text-[12px] text-faint">第 {r.attempt} 次</span>
+                    <span className="text-meta text-faint">第 {r.attempt} 次</span>
                   </div>
                   {r.summary && (
-                    <p className="mt-1 text-[13px] text-fg break-words">{r.summary}</p>
+                    <p className="mt-1 text-body text-fg break-words">{r.summary}</p>
                   )}
-                  <p className="mt-0.5 text-[11.5px] text-faint">
+                  <p className="mt-0.5 text-caption text-faint">
                     <TimeAgo value={r.started_at ?? r.finished_at ?? inc.opened_at} />
                     {r.finished_at && (
                       <>
@@ -707,7 +707,7 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
       {/* 事件时间线（append-only 进度流）。 */}
       <SectionCard title={`修复事件（${sortedEvents.length}）`} bodyClassName="p-0">
         {sortedEvents.length === 0 ? (
-          <p className="px-4 py-3 text-[13px] text-muted">暂无进度事件。</p>
+          <p className="px-4 py-3 text-body text-muted">暂无进度事件。</p>
         ) : (
           <ol className="divide-y divide-border">
             {sortedEvents.map((e) => (
@@ -717,9 +717,9 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
                 </span>
                 <div className="min-w-0 flex-1">
                   {e.message && (
-                    <p className="text-[13px] text-fg break-words">{e.message}</p>
+                    <p className="text-body text-fg break-words">{e.message}</p>
                   )}
-                  <p className="text-[11.5px] text-faint">
+                  <p className="text-caption text-faint">
                     <TimeAgo value={e.created_at} />
                   </p>
                 </div>
@@ -808,7 +808,7 @@ export default function SelfhealPage() {
     const ok = await confirm({
       title: "手动标记为已恢复？",
       body: (
-        <span className="text-[13px] text-muted">
+        <span className="text-body text-muted">
           只结束事故，不会直接向任何用户推送通知。用户恢复通知必须另行通过精确影响证据和企业微信审批。
         </span>
       ),
@@ -837,7 +837,7 @@ export default function SelfhealPage() {
     const ok = await confirm({
       title: "解除压制？",
       body: (
-        <span className="text-[13px] text-muted">
+        <span className="text-body text-muted">
           解除后该检测项恢复正常投影：若仍在异常，下一轮探测（约 2 分钟内）会重新开启事故并推送告警。
         </span>
       ),
@@ -870,7 +870,7 @@ export default function SelfhealPage() {
     const reason = await promptReason({
       title: "清除 Tier2 部署熔断？",
       body: (
-        <span className="text-[13px] text-muted">
+        <span className="text-body text-muted">
           熔断通常由 deploy_unknown（部署结果未知）触发。清除前请人工核对线上 /version、deploy_state
           与远端 candidate ref，确认没有遗留部署仍在后台推进。填写清除原因（写入审计留痕）。
         </span>
@@ -906,7 +906,7 @@ export default function SelfhealPage() {
     {
       key: "condition_key",
       title: "检测项",
-      render: (r) => <span className="font-mono text-[12px] break-all">{r.condition_key}</span>,
+      render: (r) => <span className="font-mono text-meta break-all">{r.condition_key}</span>,
     },
     {
       key: "level",
@@ -926,7 +926,7 @@ export default function SelfhealPage() {
       title: "操作人",
       width: 120,
       render: (r) => (
-        <span className="text-[12px] text-muted">{r.suppressed_by ?? "—"}</span>
+        <span className="text-meta text-muted">{r.suppressed_by ?? "—"}</span>
       ),
     },
     {
@@ -950,7 +950,7 @@ export default function SelfhealPage() {
   const noticeColumns: Column<UserNoticeProposalRow>[] = [
     { key: "shortCode", title: "审批码", width: 96, render: (r) => <CopyChip value={r.shortCode} /> },
     { key: "status", title: "状态", width: 92, render: (r) => <Badge tone={r.status === "sent" ? "success" : r.status === "pending" ? "warning" : "neutral"}>{r.status}</Badge> },
-    { key: "incidentId", title: "事故/修复", render: (r) => <span className="font-mono text-[12px]">#{r.incidentId} / #{r.repairId}</span> },
+    { key: "incidentId", title: "事故/修复", render: (r) => <span className="font-mono text-meta">#{r.incidentId} / #{r.repairId}</span> },
     { key: "recipientCount", title: "冻结/实发", width: 100, render: (r) => <span>{r.recipientCount} / {r.sentRecipientCount ?? "—"}</span> },
     { key: "createdAt", title: "创建时间", width: 96, render: (r) => <TimeAgo value={r.createdAt} /> },
   ];
@@ -975,7 +975,7 @@ export default function SelfhealPage() {
       key: "surface",
       title: "影响面",
       width: 120,
-      render: (r) => <span className="font-mono text-[12px] text-muted">{r.surface}</span>,
+      render: (r) => <span className="font-mono text-meta text-muted">{r.surface}</span>,
     },
     {
       key: "user_title",
@@ -1006,7 +1006,7 @@ export default function SelfhealPage() {
           <span className="flex flex-col items-start gap-0.5">
             <Badge tone={repairTone(r.latest_repair_status)}>{r.latest_repair_status}</Badge>
             {r.latest_repair_at && (
-              <TimeAgo value={r.latest_repair_at} className="text-[11px] text-faint" />
+              <TimeAgo value={r.latest_repair_at} className="text-caption text-faint" />
             )}
           </span>
         ) : (
@@ -1044,16 +1044,16 @@ export default function SelfhealPage() {
         <div className="flex items-start gap-3 rounded-lg border border-danger/50 bg-danger-soft px-4 py-3">
           <ShieldX size={18} className="mt-0.5 shrink-0 text-danger" />
           <div className="min-w-0 flex-1">
-            <div className="text-[13px] font-semibold text-danger">
+            <div className="text-body font-semibold text-danger">
               Tier2 部署熔断已触发 —— 所有一键放行已禁用
             </div>
-            <div className="mt-1 text-[13px] text-fg break-words">
+            <div className="mt-1 text-body text-fg break-words">
               原因：{fuseData.reason || "未提供"}
               {fuseData.releaseRequestId && (
                 <span className="text-muted">（关联请求 {short(fuseData.releaseRequestId, 8)}…）</span>
               )}
             </div>
-            <div className="mt-0.5 text-[12px] text-muted">
+            <div className="mt-0.5 text-meta text-muted">
               触发时间：
               {fuseData.engagedAt ? <TimeAgo value={fuseData.engagedAt} /> : "—"}
               {fuseData.engagedBy && <> · {fuseData.engagedBy}</>}
@@ -1085,7 +1085,7 @@ export default function SelfhealPage() {
           <Button variant="secondary" size="sm" onClick={refresh} disabled={loading}>
             <RefreshCw size={14} className={loading ? "animate-spin" : undefined} /> 刷新
           </Button>
-          <span className="ml-auto text-[12px] text-muted" aria-live="polite">
+          <span className="ml-auto text-meta text-muted" aria-live="polite">
             {typeof data?.total === "number"
               ? `共 ${data.total} 条${typeof data.open_total === "number" ? ` · ${data.open_total} 条未恢复` : ""}`
               : `已加载 ${incidents.length} 条${data?.next_before ? "，仍有更多" : ""}`}
@@ -1093,7 +1093,7 @@ export default function SelfhealPage() {
         </FilterBar>
 
         {error && (
-          <div className="flex items-center gap-2 rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-[13px] text-danger">
+          <div className="flex items-center gap-2 rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-body text-danger">
             <AlertTriangle size={15} className="shrink-0" />
             加载事故列表失败：{apiErrorMessage(error, "请求失败")}
           </div>
@@ -1127,7 +1127,7 @@ export default function SelfhealPage() {
         hint="仅真实失败且已全自动恢复的在线用户可进入冻结人群；企微同意后才定向发送"
         bodyClassName="p-0"
       >
-        <div className="border-b border-line px-4 py-3 text-[13px] text-muted">
+        <div className="border-b border-line px-4 py-3 text-body text-muted">
           {noticeData?.binding?.active ? (
             <>审批人已绑定：{noticeData.binding.boundIdentity ?? "已绑定"}</>
           ) : noticeData?.binding ? (
@@ -1137,7 +1137,7 @@ export default function SelfhealPage() {
           )}
         </div>
         {noticeError ? (
-          <div className="px-4 py-3 text-[13px] text-danger">加载用户通知审批状态失败：{apiErrorMessage(noticeError, "请求失败")}</div>
+          <div className="px-4 py-3 text-body text-danger">加载用户通知审批状态失败：{apiErrorMessage(noticeError, "请求失败")}</div>
         ) : (
           <DataTable
             columns={noticeColumns}
@@ -1159,7 +1159,7 @@ export default function SelfhealPage() {
         bodyClassName="p-0"
       >
         {suppressedError ? (
-          <div className="flex items-center gap-2 px-4 py-3 text-[13px] text-danger">
+          <div className="flex items-center gap-2 px-4 py-3 text-body text-danger">
             <AlertTriangle size={15} className="shrink-0" />
             加载已压制检测项失败：{apiErrorMessage(suppressedError, "请求失败")}
           </div>

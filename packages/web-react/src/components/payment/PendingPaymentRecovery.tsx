@@ -127,14 +127,14 @@ export function PendingPaymentRecovery({
         <CircleAlert size={20} className="shrink-0 text-warning" />
       )}
       <div className="min-w-0 flex-1">
-        <div className="text-[13.5px] font-medium text-fg">
+        <div className="text-section font-medium text-fg">
           {pending
             ? `正在确认${pending.label}结果…`
             : result?.kind === "paid"
               ? `${result.label}成功`
               : "支付未完成"}
         </div>
-        <div className="mt-0.5 text-[12px] text-faint">
+        <div className="mt-0.5 text-meta text-faint">
           {pending
             ? "到账后会自动更新，无需重复下单。"
             : result?.kind === "paid"

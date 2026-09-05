@@ -104,8 +104,8 @@ export function ManageCenter({
       // 四个中心壳都依赖它；fullscreen/sheet 挂上反而会被它反向覆盖定位。
       mobile="center"
       className="bg-surface"
-      // layout="grid"：6 个中文 tab 单行需 ~467px，390px 屏上容器只有 ~326px ——
-      // 横滚形态下末尾两个 tab 在所有主流手机上默认不可见。宫格 3×2 让主导航整屏可见。
+      // 移动端主导航：与市场壳同款的单行横滚（no-scrollbar + 边缘渐隐 + 选中项自动居中）。
+      // 3×2 宫格把首屏内容压掉两行高度、热区又被摊薄，移动端审计后弃用。
       toolbar={
         <div className="flex flex-col gap-2">
           {tab === "memory" || tab === "skills" || tab === "cron" ? (
@@ -114,7 +114,6 @@ export function ManageCenter({
           <Tabs
             aria-label="管理分区"
             idBase="manage"
-            layout="grid"
             value={tab}
             onValueChange={(v) => onTabChange(v as ManageTab)}
             items={items}

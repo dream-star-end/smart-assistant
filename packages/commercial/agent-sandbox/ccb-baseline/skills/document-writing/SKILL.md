@@ -128,8 +128,19 @@ scrub 只清理元数据和 `rsid`，不改变可见版式；因此通过视觉�
 
 ## 4. 交付
 
-最终只交付清理后的 `.docx`（以及用户需要的源文件），给出绝对路径。不要把 QA PNG/JPEG 当正式附件，除非用户明确要求。
+```bash
+oc-docx convert ... -o "$OUT.docx"
+oc-docx check "$OUT.docx" --expect-formulas   # 源含 $ 时
+# VERDICT!=PASS → 改源再 convert，最多 2 轮，然后失败明示
+oc-docx scrub ...
+oc-artifact-qa deliver --input "$FINAL.docx"
+# L0 FAIL → 同一生成命令最多再跑 1 次（换输出文件名）；第二次仍 FAIL → 把 failures[].message 告诉用户，禁止再打印该路径
+```
+
+只打印 FINAL 绝对路径，单独成行；禁止放进 fenced code；禁止发明 URL/端口/token。不要把 `.deliver.json` sidecar 当交付物。≥2 个交付文件先 `oc-artifact-qa pack --out /home/agent/.openclaude/generated/<stem>.zip -- f1 f2`，只打印 zip 路径。
+
+最终只交付清理后的 `.docx`（以及用户需要的源文件）。不要把 QA PNG/JPEG 当正式附件，除非用户明确要求。
 
 ## 工具调用纪律
 
-只调用本 skill 给出的 `oc-docx` / `oc-vision` / 本地校验命令；绝不自行拼 `curl`、URL、端口或 token。命令失败时读清错误并修正输入/路径，不能用 HTML 改扩展名兜底。
+只调用本 skill 给出的 `oc-docx` / `oc-docxcheck` / `oc-artifact-qa` / `oc-vision` / 本地校验命令；绝不自行拼 `curl`、URL、端口或 token。命令失败时读清错误并修正输入/路径，不能用 HTML 改扩展名兜底。

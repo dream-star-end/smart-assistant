@@ -244,6 +244,11 @@ fi
 RESTART_OK=1
 if [[ "$DO_RESTART" == 1 ]]; then
   # 严禁通配 openclaude*。只点名这两个 unit,不碰个人版 18789。
+  # 应急恢复走 legacy 单 unit(工作树 WD);双槽 egress@A/@B 若在跑会占着 18892
+  # (SO_REUSEPORT 组 vs 普通 bind 互斥),先点名停掉。这是 break-glass,允许停机窗口。
+  for _slot in A B; do
+    systemctl stop "openclaude-v5-selfhost-egress@${_slot}.socket" "openclaude-v5-selfhost-egress@${_slot}.service" 2>/dev/null || true
+  done
   if systemctl restart "$EGRESS_UNIT"; then
     log "✓ restart $EGRESS_UNIT"
   else

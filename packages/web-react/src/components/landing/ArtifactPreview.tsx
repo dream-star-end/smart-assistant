@@ -22,12 +22,12 @@ export function ArtifactPreview({
       {/* 面板头：交付物文件名 + 状态 */}
       <div className="flex items-center gap-2 border-b border-border bg-sidebar/40 px-3.5 py-2.5">
         <FileDown size={14} className="shrink-0 text-accent" />
-        <span className="truncate text-[12.5px] font-medium text-fg">
+        <span className="truncate text-meta font-medium text-fg">
           {deliverable ?? artifact.title}
         </span>
         <span
           className={cn(
-            "ml-auto inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] font-medium",
+            "ml-auto inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-micro font-medium",
             done ? "bg-success-soft text-success" : "bg-accent-soft text-accent",
           )}
         >
@@ -152,9 +152,9 @@ function MockFrame({
 }) {
   return (
     <div className="flex flex-col gap-2.5">
-      <p className="text-[12px] font-semibold text-fg">{title}</p>
+      <p className="text-meta font-semibold text-fg">{title}</p>
       {children}
-      <p className="flex items-center gap-1.5 text-[11px] font-medium text-accent">
+      <p className="flex items-center gap-1.5 text-caption font-medium text-accent">
         <Check size={12} className="shrink-0" />
         {note}
       </p>
@@ -170,7 +170,7 @@ function ChartMock({ a }: { a: Extract<Artifact, { kind: "chart" }> }) {
       <div className="flex flex-col gap-1.5">
         {a.bars.map((b, i) => (
           <div key={b.label} className="flex items-center gap-2">
-            <span className="w-12 shrink-0 text-right text-[10.5px] text-muted">{b.label}</span>
+            <span className="w-12 shrink-0 text-right text-micro text-muted">{b.label}</span>
             <div className="h-2.5 flex-1 overflow-hidden rounded-full bg-hover">
               <div
                 className={cn(
@@ -184,7 +184,7 @@ function ChartMock({ a }: { a: Extract<Artifact, { kind: "chart" }> }) {
             </div>
             <span
               className={cn(
-                "w-8 shrink-0 text-[10.5px] tabular-nums",
+                "w-8 shrink-0 text-micro tabular-nums",
                 b.tier === "hot" ? "font-semibold text-fg" : "text-faint",
               )}
             >
@@ -265,7 +265,7 @@ function TableMock({ a }: { a: Extract<Artifact, { kind: "table" }> }) {
           <thead>
             <tr className="bg-sidebar/60">
               {a.head.map((h) => (
-                <th key={h} className="px-2 py-1.5 text-[10px] font-medium text-muted">
+                <th key={h} className="px-2 py-1.5 text-micro font-medium text-muted">
                   {h}
                 </th>
               ))}
@@ -278,7 +278,7 @@ function TableMock({ a }: { a: Extract<Artifact, { kind: "table" }> }) {
                   <td
                     key={j}
                     className={cn(
-                      "px-2 py-1.5 text-[10.5px]",
+                      "px-2 py-1.5 text-micro",
                       j === 0
                         ? "font-semibold text-accent"
                         : j === r.length - 1
@@ -340,12 +340,12 @@ function BoardMock({ a }: { a: Extract<Artifact, { kind: "board" }> }) {
             key={t.role}
             className="flex items-center gap-2 rounded-lg border border-border bg-bg px-2.5 py-2"
           >
-            <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-[10px] font-bold text-accent">
+            <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-micro font-bold text-accent">
               {t.role.slice(0, 1)}
             </span>
             <span className="min-w-0 flex-1">
-              <span className="block truncate text-[10.5px] font-semibold text-fg">{t.role}</span>
-              <span className="block truncate text-[10px] text-muted">{t.task}</span>
+              <span className="block truncate text-micro font-semibold text-fg">{t.role}</span>
+              <span className="block truncate text-micro text-muted">{t.task}</span>
             </span>
             {/* 积分明细:对齐 TeamPanel 每成员「N 积分」(示意值)。 */}
             {t.credit && (

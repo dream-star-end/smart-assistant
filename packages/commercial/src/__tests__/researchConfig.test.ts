@@ -71,7 +71,8 @@ describe("researchConfig.validateResearchConfig", () => {
   it("secret 名白名单稳定", () => {
     assert.deepEqual(
       [...RESEARCH_SECRET_NAMES].sort(),
-      ["embedApiKey", "mineruApiKey", "mistralApiKey", "qdrantApiKey", "s2ApiKey"],
+      // R5 Phase B:+adsApiToken(oc-cite ADS bibcode 回查/导出)
+      ["adsApiToken", "embedApiKey", "mineruApiKey", "mistralApiKey", "qdrantApiKey", "s2ApiKey"],
     );
   });
 });

@@ -265,14 +265,19 @@ RUN printf '%s\n' 'deb http://deb.debian.org/debian bookworm-backports main' \
 # v3/v5 容器复用同一份 codex CLI 二进制,gateway 选到 GPT-5.6 时,sessionManager 通过
 # `runnerKind:'app-server'` 路由到 CodexAppServerRunner,长驻一个 codex app-server 子进程。
 #
-# 版本 pin 0.149.0(2026-08-21):latest stable；保留 GPT-5.6
-# Sol/Terra/Luna + max effort，并适配 requestUserInput.isBlocking。
+# 版本 pin 0.153.3(2026-09-05):latest stable。GPT-6-Astra(slug gpt-6-astra)
+# 的内嵌目录要求 minimal_client_version >= 0.153.0,0.149.0 拒绝该 slug。
+# 0.153.3 对 turn/steer + item/tool/requestUserInput 的 generate-json-schema 输出与
+# 0.149.0 字节级一致(fixture 见 gateway __tests__/fixtures/codex-app-server-0.149.0),
+# gateway 使用的 thread/start / turn/start / thread/resume 参数集仍被 0.153.3 接受。
+# 上一 pin 0.149.0(2026-08-21)保留 GPT-5.6 Sol/Terra/Luna + max effort,并适配
+# requestUserInput.isBlocking。
 # Protocol 兼容性: 前端 normalizer 继续兼容 `{type:'plan'}` 与 0.130+ `todo_list`;
 # 0.137 新增 goal / collaboration 通知由 gateway 显式降级成 OpenClaude
 # `goal` / `Agent` / `Codex:multiAgent` blocks。**真正 e2e 行为验证仍是发布门槛**:
-# 镜像 build 完后必须对 GPT-5.6 三型号各跑一次真 turn(包含 image_gen + plan/goal
-# + multi-agent 调用)再 ship 生产。出现协议
-# 漂移则把版本回滚到上一已验证 pin(0.137.0)并重 build。
+# 镜像 build 完后必须对 GPT-6-Astra + GPT-5.6 三型号各跑一次真 turn(包含 image_gen
+# + plan/goal + multi-agent 调用)再 ship 生产。出现协议
+# 漂移则把版本回滚到上一已验证 pin(0.149.0)并重 build。
 #
 # 全局装到 /usr/local/lib/node_modules/@openai/codex,二进制 symlink 在 /usr/local/bin/codex。
 # 容器内 USER=agent 走默认 PATH 即可命中。
@@ -286,7 +291,7 @@ RUN printf '%s\n' 'deb http://deb.debian.org/debian bookworm-backports main' \
 # seam 永不走 codex、模型面无 gpt-*,故 codex 二进制对 v5 是纯死重)。v3 默认 1,行为不变。
 ARG OC_INCLUDE_CODEX=1
 RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
-      npm install -g @openai/codex@0.149.0 --no-audit --no-fund \
+      npm install -g @openai/codex@0.153.3 --no-audit --no-fund \
       && npm cache clean --force \
       && rm -rf /root/.npm; \
     else echo "[v5 ccb-only] skip codex CLI install (OC_INCLUDE_CODEX=0)"; fi

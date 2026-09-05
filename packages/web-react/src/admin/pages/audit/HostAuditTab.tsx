@@ -41,7 +41,7 @@ function HostAuditDetail({ row }: { row: HostAuditRow }) {
         />
         <KeyValue
           label="actor"
-          value={<span className="font-mono text-[12px] break-all">{row.actor}</span>}
+          value={<span className="font-mono text-meta break-all">{row.actor}</span>}
         />
         <KeyValue
           label="reason_code"
@@ -57,7 +57,7 @@ function HostAuditDetail({ row }: { row: HostAuditRow }) {
           label="operation_id"
           value={
             row.operationId ? (
-              <span className="font-mono text-[12px] break-all">{row.operationId}</span>
+              <span className="font-mono text-meta break-all">{row.operationId}</span>
             ) : (
               <span className="text-faint">—</span>
             )
@@ -66,7 +66,7 @@ function HostAuditDetail({ row }: { row: HostAuditRow }) {
         <KeyValue label="时间" value={<TimeAgo value={row.ts} />} />
       </div>
       <div>
-        <p className="mb-1.5 text-[12px] font-medium text-faint">detail</p>
+        <p className="mb-1.5 text-meta font-medium text-faint">detail</p>
         <FormatJsonValue value={row.detail} />
       </div>
     </div>
@@ -208,7 +208,7 @@ export function HostAuditTab() {
       render: (r) => {
         const s = detailPreview(r.detail);
         return (
-          <span className="block max-w-[18rem] truncate font-mono text-[12px] text-muted" title={s}>
+          <span className="block max-w-[18rem] truncate font-mono text-meta text-muted" title={s}>
             {s}
           </span>
         );

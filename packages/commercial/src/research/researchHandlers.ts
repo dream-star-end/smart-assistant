@@ -18,6 +18,7 @@ import type {
 import {
   type ExtractDeps,
   type ExtractResult,
+  type IngestEngine,
   MAX_DOC_CHARS,
   extractLocal,
   isNeedsOcr,
@@ -31,6 +32,15 @@ import {
 } from "./litrag.js";
 import { type CheckManifestDeps, checkManifest } from "./checkManifest.js";
 import { type CiteFixChange, realignUnsupportedClaims } from "./citeFix.js";
+import {
+  type FetchAttempt,
+  type FetchFulltextConfig,
+  type FetchFulltextHttpDeps,
+  type FetchRecordInput,
+  downloadFulltext,
+} from "./fetchFulltext.js";
+import { type FetchAttemptRowInput, recordFetchAttempt } from "./store.js";
+import { createHash, randomUUID } from "node:crypto";
 
 // ── ingest ───────────────────────────────────────────────────────────
 
@@ -197,4 +207,162 @@ export async function runCiteFix(
   });
   const checked = await runCheck(userId, realigned.manifest, deps);
   return { manifest: checked.manifest, gates: checked.gates, changes: realigned.changes };
+}
+
+// ── fetch fulltext(R5 Phase A:下载 → blob → ingest → membership) ──
+
+/** 单条记录下载+入库结果(status: fetched | needs_ocr | failed)。 */
+export interface FetchRecordOutcome {
+  id: string;
+  status: "fetched" | "needs_ocr" | "failed";
+  /** failed/needs_ocr 的结构化原因(FETCH_FAIL_REASONS 或 "needs_ocr")。 */
+  reason?: string;
+  /** 获胜策略(known_oa/unpaywall_pdf/arxiv/pmc_oa/publisher_oa[":proxy"])。 */
+  strategy?: string;
+  blobId?: string;
+  docId?: string;
+  bytes?: number;
+  /** membership 是否已挂到课题(fail-soft:挂载失败不影响下载成功)。 */
+  projectAdded?: boolean;
+  attempts: FetchAttempt[];
+}
+
+export interface FetchIntoLibraryDeps {
+  http: FetchFulltextHttpDeps;
+  putBlob: (input: {
+    blobId: string;
+    userId: number;
+    sha256: string;
+    sizeBytes: number;
+    storagePath: string;
+    mime?: string;
+  }) => Promise<void>;
+  getBlob: (userId: number, blobId: string) => Promise<{ storagePath: string; mime: string | null } | null>;
+  readBlobBytes: (storagePath: string) => Promise<Buffer>;
+  putDocument: (userId: number, doc: NormalizedDocument) => Promise<void>;
+  writeBlobBytes: (storagePath: string, bytes: Buffer) => Promise<void>;
+  blobDir: string;
+  /** 指标行写入(research_fetch_attempts);失败 best-effort 不阻断下载。 */
+  recordAttempt?: (row: FetchAttemptRowInput) => Promise<void>;
+  /** 课题 membership(R3.0 addMembership,flag 开时由调用方注入)。 */
+  addMembership?: (userId: string, docId: string, projectId: string) => Promise<void>;
+  /** 透传 ingest 抽取注入(测试)。 */
+  extract?: ExtractDeps;
+}
+
+async function recordAttempts(
+  deps: FetchIntoLibraryDeps,
+  userId: number,
+  record: FetchRecordInput,
+  attempts: FetchAttempt[],
+  won: { docId?: string; bytes?: number } | null,
+): Promise<void> {
+  const rec = deps.recordAttempt ?? recordFetchAttempt;
+  for (const a of attempts) {
+    try {
+      await rec({
+        userId,
+        recordId: record.id,
+        doi: record.doi,
+        arxivId: record.arxivId,
+        strategy: a.source,
+        ok: a.code === "ok",
+        reason: a.code === "ok" ? undefined : a.code,
+        httpStatus: a.httpStatus,
+        docId: a.code === "ok" ? won?.docId : undefined,
+        bytes: a.code === "ok" ? won?.bytes : undefined,
+        ms: a.ms,
+      });
+    } catch {
+      // 指标写入失败不阻断下载/入库(best-effort)。
+    }
+  }
+}
+
+/**
+ * 下载一条 OA 全文并走与用户上传完全相同的铸造链:落 blob → ingestBlob 铸权威
+ * 文档 →(可选)挂课题 membership。下载与入库同一条链,不另起解析;
+ * needs_ocr 是合法成功态(下载成功、无文字层)。
+ * blob/ingest 的 DB/IO 异常上抛(系统性,由调用方决定 fail 语义);下载侧失败
+ * 全部结构化,不上抛。
+ */
+export async function fetchRecordIntoLibrary(
+  input: {
+    userId: number;
+    record: FetchRecordInput;
+    projectId?: string;
+    ingest: boolean;
+    engine: IngestEngine;
+  },
+  cfg: FetchFulltextConfig,
+  deps: FetchIntoLibraryDeps,
+): Promise<FetchRecordOutcome> {
+  const dl = await downloadFulltext(input.record, cfg, deps.http);
+
+  if (!dl.ok) {
+    await recordAttempts(deps, input.userId, input.record, dl.attempts, null);
+    return { id: input.record.id, status: "failed", reason: dl.reason, attempts: dl.attempts };
+  }
+
+  const bytes = dl.bytes;
+  const blobId = randomUUID();
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const storagePath = `${deps.blobDir}/${input.userId}-${blobId}`;
+  await deps.writeBlobBytes(storagePath, bytes);
+  await deps.putBlob({ blobId, userId: input.userId, sha256, sizeBytes: bytes.length, storagePath, mime: dl.mime });
+
+  // ingest 与用户上传同链(researchHandlers.ingestBlob);ingest=false 仅落 blob
+  const outcome = input.ingest
+    ? await ingestBlob(
+        { userId: input.userId, blobId, engine: input.engine },
+        {
+          getBlob: deps.getBlob,
+          readBlobBytes: deps.readBlobBytes,
+          putDocument: deps.putDocument,
+          extract: deps.extract,
+        },
+      )
+    : null;
+
+  if (outcome && !outcome.ok) {
+    if (outcome.needsOcr) {
+      // needs_ocr = 下载成功、无文字层:合法成功态(进结果不进失败)
+      await recordAttempts(deps, input.userId, input.record, dl.attempts, { bytes: bytes.length });
+      return {
+        id: input.record.id,
+        status: "needs_ocr",
+        reason: "needs_ocr",
+        strategy: dl.strategy,
+        blobId,
+        bytes: bytes.length,
+        attempts: dl.attempts,
+      };
+    }
+    await recordAttempts(deps, input.userId, input.record, dl.attempts, null);
+    return { id: input.record.id, status: "failed", reason: `ingest_failed: ${outcome.reason}`, attempts: dl.attempts };
+  }
+
+  const docId = outcome ? outcome.outline.docId : undefined;
+  await recordAttempts(deps, input.userId, input.record, dl.attempts, { docId, bytes: bytes.length });
+
+  let projectAdded: boolean | undefined;
+  if (input.projectId && deps.addMembership && docId) {
+    try {
+      await deps.addMembership(String(input.userId), docId, input.projectId);
+      projectAdded = true;
+    } catch {
+      projectAdded = false; // fail-soft:membership 失败不影响下载/入库成功
+    }
+  }
+
+  return {
+    id: input.record.id,
+    status: "fetched",
+    strategy: dl.strategy,
+    blobId,
+    docId,
+    bytes: bytes.length,
+    projectAdded,
+    attempts: dl.attempts,
+  };
 }

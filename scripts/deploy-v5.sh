@@ -6634,8 +6634,16 @@ smoke() {
   #     只 UPDATE 该 audit 表。index.ts 门在 runtimeChannel=v5 且挂 LeaderBundle 单 leader。
   #     首发 b34e7e925 因本白名单漏登被 smoke 拒、对称补偿回滚——名单与 trackScheduler
   #     登记必须同批更新。关停:COMMERCIAL_CURSOR_AUDIT_RECONCILER_DISABLED=1)
+  #   cursorUsageSweep(2026-09-05 selfhost 7ef53b33b 正向同步引入:index.ts
+  #     leaderBundle.add({name:"cursorUsageSweep",domain:"v5-owned"...}),只写 0262
+  #     引入的 cursor sand usage 列;关停 COMMERCIAL_CURSOR_USAGE_SWEEP_DISABLED=1)
+  #   desktopEnrollSweep(2026-09-05 selfhost P1 桌面底座引入:index.ts domain:"shared",
+  #     清扫 0264 引入表 desktop_enrollments 过期行,旗 OC_DESKTOP_VIRTUAL_CONTAINER
+  #     默认关;关停 OC_DESKTOP_ENROLL_SWEEP_DISABLED=1。shared 域条目进本名单是既有
+  #     先例,idleSweep/alert/refreshEventsSweep 等同列;smoke 校验 healthz.schedulers
+  #     必须是本名单子集,加白名单即可,不改 domain)
   allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot cursorAuthSync"
-  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler"
+  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler cursorUsageSweep desktopEnrollSweep"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do
@@ -8465,15 +8473,15 @@ activate_staged_inner() {
     [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$expected_full_commit" == "$image_commit"* ]] || {
       echo "✗ runtime image source_commit=$image_commit is not target commit $expected_full_commit 的前缀" >&2; exit 1;
     }
-    [[ "$image_codex_version" == "0.149.0" ]] || {
-      echo "✗ runtime image codex label=$image_codex_version,expected=0.149.0" >&2; exit 1;
+    [[ "$image_codex_version" == "0.153.3" ]] || {
+      echo "✗ runtime image codex label=$image_codex_version,expected=0.153.3" >&2; exit 1;
     }
     [[ "$image_include_grok" == 1 ]] || {
       echo "✗ runtime image 缺 official Grok binary label(oc.runtime.include_grok=1)" >&2; exit 1;
     }
     actual_codex_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint codex '$runtime_image' --version")"
-    [[ "$actual_codex_version" == "codex-cli 0.149.0" ]] || {
-      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.149.0'" >&2; exit 1;
+    [[ "$actual_codex_version" == "codex-cli 0.153.3" ]] || {
+      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.153.3'" >&2; exit 1;
     }
     actual_grok_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$runtime_image' --version")"
     [[ "$actual_grok_version" == grok\ 1.0.5\ * ]] || {

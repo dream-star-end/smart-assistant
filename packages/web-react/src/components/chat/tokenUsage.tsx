@@ -187,7 +187,7 @@ export function TokenUsageBadge({
   return (
     <span
       key={exact.totalTokens}
-      className="whitespace-nowrap text-[11px] font-medium tabular-nums text-faint animate-in"
+      className="whitespace-nowrap text-caption font-medium tabular-nums text-faint animate-in"
       title={title}
       aria-label={title}
     >

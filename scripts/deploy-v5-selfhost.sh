@@ -60,6 +60,13 @@ V5_HOME="/root/.openclaude-v5-selfhost"
 V5_ENV="/etc/openclaude/commercial-v5-selfhost.env"
 V5_UNIT="openclaude-v5-selfhost.service"
 V5_EGRESS_UNIT="openclaude-v5-selfhost-egress.service"
+# 蓝绿双槽 egress(2026-09-05):模板 unit + 每槽私有健康口。legacy 单 unit 仅作
+# break-glass / 旧 release 回滚目标保留。
+V5_EGRESS_SLOT_SOCKET_TPL="openclaude-v5-selfhost-egress@.socket"
+V5_EGRESS_SLOT_SERVICE_TPL="openclaude-v5-selfhost-egress@.service"
+V5_EGRESS_SYSCTL_FILE="99-openclaude-v5-selfhost-egress.sysctl.conf"
+V5_EGRESS_SLOT_A_PORT="18898"
+V5_EGRESS_SLOT_B_PORT="18899"
 V5_HOSTNET_UNIT="openclaude-v5-selfhost-hostnet.service"
 V5_CCB_PROXY_UNIT="openclaude-v5-selfhost-ccb-proxy.service"
 V5_CURSOR_PROXY_UNIT="openclaude-v5-selfhost-cursor-proxy.service"
@@ -80,9 +87,9 @@ CATALOG_ADMIN_ROLE="${PG_ROLE}_catalog_admin"
 MODEL_AUTHORITY_DEPLOY_ROLE="${PG_ROLE}_model_deploy"
 REDIS_URL="redis://127.0.0.1:6379/3"
 # Runtime image pin. Rebuild with:
-#   OC_FLAVOR=selfhost packages/commercial/agent-sandbox/build-image.sh v5-cli-codex0149-grok105-zcode381-slim
+#   OC_FLAVOR=selfhost packages/commercial/agent-sandbox/build-image.sh v5-cli-codex0153-grok105-zcode381-slim
 # which sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1).
-RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-codex0149-grok105-zcode381-slim"
+RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-codex0153-grok105-zcode381-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
 PERSONAL_PORT="18789"
@@ -1107,6 +1114,26 @@ install_unit() {
   install -m 0644 "$src" "/etc/systemd/system/$name" || return 1
 }
 
+# 双槽 egress 模板 unit + sysctl。<src-dir> 是候选 release 的 deploy/v5-selfhost 或其
+# root-owned snapshot。旧 release(无模板)→ 跳过并返回 2,调用方按 legacy 走。
+install_egress_slot_units_from() { # <src-dir>
+  local dir="$1" f
+  if [[ ! -f "$dir/$V5_EGRESS_SLOT_SERVICE_TPL" || ! -f "$dir/$V5_EGRESS_SLOT_SOCKET_TPL" ]]; then
+    return 2
+  fi
+  for f in "$V5_EGRESS_SLOT_SOCKET_TPL" "$V5_EGRESS_SLOT_SERVICE_TPL"; do
+    install_unit "$dir/$f" || return 1
+  done
+  if [[ -f "$dir/$V5_EGRESS_SYSCTL_FILE" ]]; then
+    if [[ "$DRY" == 1 ]]; then
+      echo "  [dry-run] install $dir/$V5_EGRESS_SYSCTL_FILE → /etc/sysctl.d/ && sysctl -w net.ipv4.tcp_migrate_req=1"
+    else
+      install -m 0644 "$dir/$V5_EGRESS_SYSCTL_FILE" "/etc/sysctl.d/$V5_EGRESS_SYSCTL_FILE" || return 1
+      sysctl -q -w net.ipv4.tcp_migrate_req=1 || return 1
+    fi
+  fi
+}
+
 # 把开机 oneshot 脚本拷到固定目录。ExecStart 不跟 rel-* 变,也不钉 git 工作树。
 sync_boot_scripts_from() {
   local src="$1" hostnet_src sshgate_src flavor_lib_src flavor_rules_src tmp have_flavor=0
@@ -1190,6 +1217,7 @@ install_units() {
   install_unit "$UNIT_DIR/$V5_CURSOR_PROXY_UNIT"
   install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
   install_unit "$UNIT_DIR/$V5_EGRESS_UNIT"
+  install_egress_slot_units_from "$UNIT_DIR" || [[ $? == 2 ]] || die "安装双槽 egress unit 失败"
   install_unit "$UNIT_DIR/$V5_UNIT"
   install_unit "$UNIT_DIR/$V5_TUNNEL_UNIT"
   run "systemctl daemon-reload"
@@ -1349,8 +1377,150 @@ hotcfg_smoke_cmd() {
 #
 # 判据用端口而不是解析 append-only 日志:egress/main.ts 里 model_catalog_ready(:189)
 # 早于 egress_listening(:493),所以「端口可连」即「catalog 已就绪且 enforce 已定」。
+#
+# 2026-09-05 蓝绿双槽:egress 不再 `systemctl restart`(单 unit 停机 = 关监听 + 等 drain
+# ≤31min,期间容器 ECONNREFUSED 18892,grok 报「unknown model id」)。改为槽翻转:
+# 起空闲槽 → 私有健康口就绪 → stop --no-block 旧槽(旧槽只 drain 自己的在飞流)。
+# restart_cmd 由 oc_hotcfg_activate_saga 在本 shell eval,所以可以直接引用函数名。
 egress_then_master_restart_cmd() {
-  printf '%s' "systemctl restart '$V5_EGRESS_UNIT' && timeout 90 bash -c 'until (exec 3<>/dev/tcp/$V5_EGRESS_BIND/$V5_EGRESS_PORT) 2>/dev/null; do sleep 1; done' && systemctl restart '$V5_UNIT'"
+  printf '%s' "egress_slot_flip_then_master_restart"
+}
+
+egress_slot_unit() { # <A|B> <socket|service>
+  local tpl
+  if [[ "$2" == socket ]]; then tpl="$V5_EGRESS_SLOT_SOCKET_TPL"; else tpl="$V5_EGRESS_SLOT_SERVICE_TPL"; fi
+  printf '%s' "${tpl/@./@$1.}"
+}
+
+egress_slot_private_port() { # <A|B>
+  if [[ "$1" == A ]]; then printf '%s' "$V5_EGRESS_SLOT_A_PORT"; else printf '%s' "$V5_EGRESS_SLOT_B_PORT"; fi
+}
+
+egress_slot_is_active() { # <A|B>
+  [[ "$(systemctl is-active "$(egress_slot_unit "$1" service)" 2>/dev/null || true)" == active ]]
+}
+
+# 当前 live release 是否自带双槽 unit 模板。回滚到旧 release 时为假 → 走 legacy 单 unit。
+egress_live_release_has_slots() {
+  local live
+  live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+  [[ -n "$live" && -f "$live/deploy/v5-selfhost/$V5_EGRESS_SLOT_SERVICE_TPL" \
+     && -f "$live/deploy/v5-selfhost/$V5_EGRESS_SLOT_SOCKET_TPL" ]]
+}
+
+egress_wait_shared_port() {
+  timeout 90 bash -c "until (exec 3<>/dev/tcp/$V5_EGRESS_BIND/$V5_EGRESS_PORT) 2>/dev/null; do sleep 1; done"
+}
+
+# 等某槽私有健康口回 ok 且 slot 字段吻合(不能拿共享口判定:共享口可能由旧槽应答)。
+egress_wait_slot_ready() { # <A|B>
+  local s="$1" port body i
+  port="$(egress_slot_private_port "$s")"
+  for i in $(seq 1 90); do
+    body="$(curl -fsS --max-time 3 "http://127.0.0.1:${port}/internal/v5/egress-slot-health" 2>/dev/null || true)"
+    if echo "$body" | jq -e --arg s "$s" '.ok==true and .slot==$s and .listenMode=="sd_activation"' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "  ✗ egress slot $s 私有健康口 90s 未就绪: ${body:0:200}" >&2
+  return 1
+}
+
+# legacy 单 unit 路径(live release 无双槽模板,即回滚到旧 release)。先把槽全停
+# (Conflicts= 也会做,这里显式化便于日志),再 restart legacy 并等端口。
+egress_restart_legacy_single_unit() {
+  local s
+  echo "  egress: live release 无双槽模板 → legacy 单 unit 路径(会有 drain 停机窗口)" >&2
+  for s in A B; do
+    systemctl stop "$(egress_slot_unit "$s" socket)" "$(egress_slot_unit "$s" service)" 2>/dev/null || true
+  done
+  systemctl restart "$V5_EGRESS_UNIT" && egress_wait_shared_port
+}
+
+# 槽翻转主体。幂等:任何一步失败 return 1(saga 会回滚并重跑本函数,彼时 live 已翻回)。
+egress_slot_flip() {
+  local cur="" target old_sock old_svc new_sock new_svc legacy_state
+  if ! egress_live_release_has_slots; then
+    egress_restart_legacy_single_unit
+    return
+  fi
+  # sysctl:旧槽 close() 时 accept 队列半开连接迁到另一槽,而不是 RST。
+  if [[ "$(sysctl -n net.ipv4.tcp_migrate_req 2>/dev/null || echo 0)" != 1 ]]; then
+    sysctl -w net.ipv4.tcp_migrate_req=1 >/dev/null || { echo "  ✗ sysctl tcp_migrate_req=1 失败" >&2; return 1; }
+  fi
+  # 两槽都 active(上次翻转半途被杀):阻塞停掉更老的那个,回到单槽态再翻。
+  if egress_slot_is_active A && egress_slot_is_active B; then
+    local ta tb older
+    ta="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$(egress_slot_unit A service)")"
+    tb="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$(egress_slot_unit B service)")"
+    if (( ${ta:-0} <= ${tb:-0} )); then older=A; else older=B; fi
+    echo "  egress: A/B 同时 active,先阻塞停掉更老的槽 $older(会等其 drain)" >&2
+    systemctl stop "$(egress_slot_unit "$older" socket)" "$(egress_slot_unit "$older" service)" || return 1
+  fi
+  if egress_slot_is_active A; then cur=A; target=B
+  elif egress_slot_is_active B; then cur=B; target=A
+  else target=A
+  fi
+  new_sock="$(egress_slot_unit "$target" socket)"
+  new_svc="$(egress_slot_unit "$target" service)"
+  # 首次迁移:legacy 单 unit 还在跑,持有 18892 普通 bind。必须先停它(这一次仍会
+  # 等 drain ≤31min;之后再没有这种窗口)。
+  legacy_state="$(systemctl is-active "$V5_EGRESS_UNIT" 2>/dev/null || true)"
+  if [[ "$legacy_state" == active || "$legacy_state" == activating || "$legacy_state" == deactivating ]]; then
+    echo "  egress: 首次迁移 legacy→双槽,阻塞 stop $V5_EGRESS_UNIT(等其 drain,最后一次停机窗口)" >&2
+    systemctl stop "$V5_EGRESS_UNIT" || return 1
+    systemctl disable "$V5_EGRESS_UNIT" >/dev/null 2>&1 || true
+  fi
+  # 若目标槽残留(deactivating 中的旧进程)则等它真正退出,否则 start 会排在 stop 之后无谓等待。
+  local st
+  st="$(systemctl is-active "$new_svc" 2>/dev/null || true)"
+  if [[ "$st" == deactivating ]]; then
+    echo "  egress: 目标槽 $target 仍在 deactivating,等待其退出…" >&2
+    timeout 1900 bash -c "while [[ \"\$(systemctl is-active '$new_svc' 2>/dev/null)\" == deactivating ]]; do sleep 2; done" || return 1
+  fi
+  echo "  egress: 起槽 $target ($new_sock + $new_svc)${cur:+,当前槽 $cur}" >&2
+  systemctl start "$new_sock" || return 1
+  if ! systemctl start "$new_svc"; then
+    journalctl -u "$new_svc" -n 20 --no-pager >&2 || true
+    tail -n 40 /var/log/openclaude-v5-selfhost-egress.log >&2 || true
+    systemctl stop "$new_sock" "$new_svc" 2>/dev/null || true
+    return 1
+  fi
+  if ! egress_wait_slot_ready "$target"; then
+    tail -n 40 /var/log/openclaude-v5-selfhost-egress.log >&2 || true
+    # 新槽没起来:旧槽(若有)仍在服务,撤回新槽,保持现网不动。
+    systemctl stop "$new_sock" "$new_svc" 2>/dev/null || true
+    return 1
+  fi
+  egress_wait_shared_port || return 1
+  # 新槽已接管共享口 → 摘旧槽。socket 与 service 一起 stop:只停 service 会留下一个
+  # 没人 accept 的 listener(systemd 会按需再拉起),连接会卡在它的 backlog 里。
+  # --no-block:旧槽 drain 自己的在飞流(≤31min),不阻塞发布。
+  if [[ -n "$cur" ]]; then
+    old_sock="$(egress_slot_unit "$cur" socket)"
+    old_svc="$(egress_slot_unit "$cur" service)"
+    echo "  egress: 新槽 $target 就绪,stop --no-block 旧槽 $cur(后台 drain)" >&2
+    systemctl stop --no-block "$old_sock" "$old_svc" || return 1
+    systemctl disable "$old_sock" "$old_svc" >/dev/null 2>&1 || true
+  fi
+  systemctl enable "$new_sock" "$new_svc" >/dev/null 2>&1 || true
+  # 旧槽 close() 后共享口必须仍可连(reuseport 组里还有新槽)。
+  egress_wait_shared_port
+}
+
+egress_slot_flip_then_master_restart() {
+  egress_slot_flip && systemctl restart "$V5_UNIT"
+}
+
+# 当前对外服务的 egress 描述(status / 日志用)。
+egress_describe_topology() {
+  local out="" s
+  for s in A B; do
+    egress_slot_is_active "$s" && out="${out:+$out,}slot$s"
+  done
+  [[ "$(systemctl is-active "$V5_EGRESS_UNIT" 2>/dev/null || true)" == active ]] && out="${out:+$out,}legacy"
+  printf '%s' "${out:-none}"
 }
 
 activate_tuple() {
@@ -1406,9 +1576,18 @@ activate_tuple_joint() { # <master-rel> <prev-master-or-none>
 
 enable_now_services() {
   log "── enable --now egress + master(egress 先就绪,理由见 egress_then_master_restart_cmd)──"
-  run "systemctl enable '$V5_EGRESS_UNIT' '$V5_UNIT'"
-  run "systemctl start '$V5_EGRESS_UNIT'"
-  run "timeout 90 bash -c 'until (exec 3<>/dev/tcp/$V5_EGRESS_BIND/$V5_EGRESS_PORT) 2>/dev/null; do sleep 1; done'"
+  if [[ -f "/etc/systemd/system/$V5_EGRESS_SLOT_SERVICE_TPL" ]]; then
+    run "systemctl enable '$V5_UNIT'"
+    if [[ "$DRY" == 1 ]]; then
+      echo "  [dry-run] egress_slot_flip (起槽 A,等私有口 $V5_EGRESS_SLOT_A_PORT 就绪)"
+    else
+      egress_slot_flip || die "bootstrap: egress 槽启动失败"
+    fi
+  else
+    run "systemctl enable '$V5_EGRESS_UNIT' '$V5_UNIT'"
+    run "systemctl start '$V5_EGRESS_UNIT'"
+    run "timeout 90 bash -c 'until (exec 3<>/dev/tcp/$V5_EGRESS_BIND/$V5_EGRESS_PORT) 2>/dev/null; do sleep 1; done'"
+  fi
   run "systemctl start '$V5_UNIT'"
 }
 
@@ -1510,7 +1689,7 @@ cmd_status() {
     log "  OC_CONTROL_PLANE_LEADER=$(oc_hotcfg_env_get "$V5_ENV" OC_CONTROL_PLANE_LEADER)"
   fi
   log "  unit master:  $(systemctl is-active "$V5_UNIT" 2>/dev/null || echo n/a)"
-  log "  unit egress:  $(systemctl is-active "$V5_EGRESS_UNIT" 2>/dev/null || echo n/a)"
+  log "  unit egress:  legacy=$(systemctl is-active "$V5_EGRESS_UNIT" 2>/dev/null || echo n/a) slotA=$(systemctl is-active "$(egress_slot_unit A service)" 2>/dev/null || echo n/a) slotB=$(systemctl is-active "$(egress_slot_unit B service)" 2>/dev/null || echo n/a) serving=$(egress_describe_topology) tcp_migrate_req=$(sysctl -n net.ipv4.tcp_migrate_req 2>/dev/null || echo n/a)"
   log "  unit hostnet: $(systemctl is-active "$V5_HOSTNET_UNIT" 2>/dev/null || echo n/a)"
   log "  unit ccb-proxy: $(systemctl is-active "$V5_CCB_PROXY_UNIT" 2>/dev/null || echo n/a)"
   log "  unit sshgate: $(systemctl is-active "$V5_SSHGATE_UNIT" 2>/dev/null || echo n/a)"
@@ -1685,7 +1864,19 @@ cutover_smoke_against_release() { # <rel>
   eg="$(curl -fsS --max-time 5 "http://${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health" 2>/dev/null || true)"
   echo "$eg" | jq -e '.ok==true' >/dev/null 2>&1 \
     || { cutover_fail "cutover smoke: egress-health 失败"; return 1; }
-  cutover_clog "  ✓ egress-health ok"
+  cutover_clog "  ✓ egress-health ok (slot=$(echo "$eg" | jq -r '.slot // "legacy"') mode=$(echo "$eg" | jq -r '.listenMode // "self_bind"') serving=$(egress_describe_topology))"
+  # 双槽下额外要求:恰有一个槽 active(翻转后旧槽 deactivating 不算 active)且共享口
+  # 应答就来自它 —— 防「新槽私有口绿、共享口仍全由旧槽应答」的假绿。
+  if egress_live_release_has_slots; then
+    local a b want got
+    egress_slot_is_active A && a=1 || a=0
+    egress_slot_is_active B && b=1 || b=0
+    (( a + b == 1 )) || { cutover_fail "cutover smoke: 双槽 egress 应恰一槽 active,实际 A=$a B=$b"; return 1; }
+    want="$([[ $a == 1 ]] && echo A || echo B)"
+    got="$(echo "$eg" | jq -r '.slot // empty')"
+    [[ "$got" == "$want" ]] || { cutover_fail "cutover smoke: 共享口应答槽=$got,active 槽=$want 不一致"; return 1; }
+    cutover_clog "  ✓ egress 双槽拓扑一致:active=$want"
+  fi
 }
 
 cutover_smoke_healthz_only() {
@@ -2126,12 +2317,25 @@ cmd_cutover() {
   if [[ "$DRY" == 1 ]]; then
     cutover_clog "  [dry-run] install $unit_snap/$V5_UNIT → /etc/systemd/system/$V5_UNIT"
     cutover_clog "  [dry-run] install $unit_snap/$V5_EGRESS_UNIT → /etc/systemd/system/$V5_EGRESS_UNIT"
+    if [[ -f "$unit_snap/$V5_EGRESS_SLOT_SERVICE_TPL" ]]; then
+      cutover_clog "  [dry-run] install $unit_snap/{$V5_EGRESS_SLOT_SOCKET_TPL,$V5_EGRESS_SLOT_SERVICE_TPL} + sysctl tcp_migrate_req=1"
+    else
+      cutover_clog "  [dry-run] 候选无双槽 egress 模板 → 翻转后走 legacy 单 unit"
+    fi
     cutover_clog "  [dry-run] systemctl daemon-reload"
   else
     if ! install_unit "$unit_snap/$V5_EGRESS_UNIT"; then
       cutover_compensate "install-egress-unit"
       return 1
     fi
+    # 双槽模板(候选自带才装;旧候选无模板 rc=2 → 保留 installed 的旧模板文件不动,
+    # egress_slot_flip 会按 live 是否自带模板决定走槽还是 legacy)。
+    install_egress_slot_units_from "$unit_snap"
+    case $? in
+      0) cutover_clog "  ✓ 双槽 egress 模板 + sysctl 已装" ;;
+      2) cutover_clog "  · 候选无双槽 egress 模板,翻转后走 legacy 单 unit" ;;
+      *) cutover_compensate "install-egress-slot-units"; return 1 ;;
+    esac
     cutover_persist_phase_or_compensate "units-partial" "units-partial" || return 1
     if ! install_unit "$unit_snap/$V5_UNIT"; then
       cutover_compensate "install-master-unit"
@@ -2197,9 +2401,9 @@ cmd_cutover() {
       cutover_persist_phase_or_compensate "smoked" "smoked" || return 1
     fi
   else
-    cutover_clog "STEP $step 按现有顺序重启(先 egress、等 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} 可连、再 master)"
+    cutover_clog "STEP $step 按现有顺序重启(先 egress 槽翻转/就绪、等 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} 可连、再 master)"
     if [[ "$DRY" == 1 ]]; then
-      cutover_clog "  [dry-run] $(egress_then_master_restart_cmd)"
+      cutover_clog "  [dry-run] $(egress_then_master_restart_cmd) (当前 egress 拓扑: $(egress_describe_topology))"
     else
       if ! eval "$(egress_then_master_restart_cmd)"; then
         cutover_compensate "restart"
@@ -2253,7 +2457,7 @@ cmd_cutover() {
     "$MASTER_RELEASES_ROOT" 6 \
     "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" \
     "$MASTER_RELEASES_ROOT/.prev-release" \
-    "$V5_UNIT" "$V5_EGRESS_UNIT" "$V5_EGRESS_UNIT" \
+    "$V5_UNIT" "$(egress_slot_unit A service)" "$(egress_slot_unit B service)" \
     '' '' '' 2>&1 | sed 's/^/  /' \
     || cutover_clog "  ⚠ master release GC 失败/安全跳过(仅告警,不回滚)"
   oc_hotcfg_gc "$V5_ENV" "$OC_HOTCFG_HISTORY" 2>&1 | sed 's/^/  /' \

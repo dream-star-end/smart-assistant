@@ -348,7 +348,7 @@ export function KnowledgePlanetAutomationPanel({
 
   if (loading) {
     return (
-      <div className="mt-2 flex items-center gap-2 rounded-lg bg-hover px-3 py-2 text-[11.5px] text-faint">
+      <div className="mt-2 flex items-center gap-2 rounded-lg bg-hover px-3 py-2 text-caption text-faint">
         <Spinner /> 加载无人值守设置…
       </div>
     )
@@ -368,13 +368,13 @@ export function KnowledgePlanetAutomationPanel({
           <Bot size={16} />
         </span>
         <div className="min-w-0 flex-1">
-          <div className="text-[12.5px] font-medium text-fg">无人值守自动回复</div>
+          <div className="text-meta font-medium text-fg">无人值守自动回复</div>
           <p className="mt-0.5 text-[11px] leading-relaxed text-faint">
             仅自动发送带 AI 标识的文字评论；不会自动发主题、上传媒体、点赞、编辑或删除。
             默认关闭，每账号每日最多 {view.control.accountDailyLimit} 条。
           </p>
         </div>
-        <div className="flex items-center gap-2 text-[11.5px] text-muted">
+        <div className="flex items-center gap-2 text-caption text-muted">
           <span>{view.control.enabled ? '已开启' : '已关闭'}</span>
           <Switch
             aria-label="知识星球无人值守自动回复"
@@ -397,24 +397,24 @@ export function KnowledgePlanetAutomationPanel({
       </div>
 
       {!manualWriteEnabled && (
-        <Alert tone="warning" className="mt-2 text-[11.5px]">
+        <Alert tone="warning" className="mt-2 text-caption">
           请先开启上方“写入能力”，再单独同意并开启无人值守自动回复。
         </Alert>
       )}
       {view.control.pausedReason && (
-        <Alert tone="danger" className="mt-2 text-[11.5px]">
+        <Alert tone="danger" className="mt-2 text-caption">
           已安全停用：{REASON[view.control.pausedReason] ?? view.control.pausedReason}
           。核实知识星球中的实际结果后，可重新阅读免责声明并开启。
         </Alert>
       )}
       {error && (
-        <Alert tone="danger" className="mt-2 text-[11.5px]">
+        <Alert tone="danger" className="mt-2 text-caption">
           {error}
         </Alert>
       )}
 
       <div className="mt-3 flex items-center justify-between gap-2 border-t border-warning/20 pt-3">
-        <div className="text-[11.5px] font-medium text-fg">规则（{view.rules.length}/10）</div>
+        <div className="text-caption font-medium text-fg">规则（{view.rules.length}/10）</div>
         <Button
           size="sm"
           variant="secondary"
@@ -426,7 +426,7 @@ export function KnowledgePlanetAutomationPanel({
       </div>
 
       {view.rules.length === 0 ? (
-        <p className="py-3 text-center text-[11.5px] text-faint">
+        <p className="py-3 text-center text-caption text-faint">
           尚无规则；即使总开关开启也不会自动回复。
         </p>
       ) : (
@@ -435,14 +435,14 @@ export function KnowledgePlanetAutomationPanel({
             <li key={rule.id} className="rounded-lg border border-border bg-surface p-2.5">
               <div className="flex flex-wrap items-center gap-2">
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-[12px] font-medium text-fg">{rule.name}</div>
-                  <div className="mt-0.5 text-[10.5px] text-faint">
+                  <div className="truncate text-meta font-medium text-fg">{rule.name}</div>
+                  <div className="mt-0.5 text-micro text-faint">
                     {groupById.get(rule.groupId)?.name ?? `星球 ${rule.groupId}`} ·{' '}
                     {rule.triggerKind === 'new_question' ? '仅新提问' : '全部新主题'} · 每日{' '}
                     {rule.dailyLimit} 条 · 冷却 {rule.cooldownMinutes} 分钟
                   </div>
                   {rule.pausedReason && (
-                    <div className="mt-1 text-[10.5px] text-danger">
+                    <div className="mt-1 text-micro text-danger">
                       已暂停：{REASON[rule.pausedReason] ?? rule.pausedReason}
                     </div>
                   )}
@@ -477,7 +477,7 @@ export function KnowledgePlanetAutomationPanel({
       )}
 
       {view.recentRuns.length > 0 && (
-        <details className="mt-3 border-t border-warning/20 pt-2 text-[11px]">
+        <details className="mt-3 border-t border-warning/20 pt-2 text-caption">
           <summary className="cursor-pointer text-muted">最近执行记录</summary>
           <ul className="mt-2 flex flex-col gap-1.5">
             {view.recentRuns.slice(0, 10).map((run) => (
@@ -534,7 +534,7 @@ export function KnowledgePlanetAutomationPanel({
           </Alert>
           <label
             htmlFor="kp-automation-account-limit"
-            className="flex items-center gap-2 text-[12px] text-muted"
+            className="flex items-center gap-2 text-meta text-muted"
           >
             每账号每日最多
             <Input
@@ -574,7 +574,7 @@ export function KnowledgePlanetAutomationPanel({
         footer={
           <div className="flex w-full min-w-0 flex-col gap-2">
             {ruleError && (
-              <Alert tone="danger" className="text-left text-[11.5px]">
+              <Alert tone="danger" className="text-left text-caption">
                 {ruleError}
               </Alert>
             )}
@@ -600,13 +600,13 @@ export function KnowledgePlanetAutomationPanel({
       >
         <div className="grid gap-3">
           {editing === 'new' ? (
-            <div className="grid gap-1 text-[11.5px] text-muted">
+            <div className="grid gap-1 text-caption text-muted">
               <span>选择知识星球（可多选）</span>
               <Popover open={groupPickerOpen} onOpenChange={setGroupPickerOpen}>
                 <PopoverTrigger asChild>
                   <button
                     type="button"
-                    className="flex min-h-9 w-full items-center justify-between gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-left text-[12px] text-fg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+                    className="flex min-h-9 w-full items-center justify-between gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-left text-meta text-fg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     <span className={selectedGroupIds.length > 0 ? '' : 'text-faint'}>
                       {selectedGroupIds.length > 0
@@ -624,7 +624,7 @@ export function KnowledgePlanetAutomationPanel({
                       placeholder="搜索星球名称或 ID"
                       onChange={(event) => setGroupSearch(event.target.value)}
                     />
-                    <div className="mt-2 flex items-center justify-between gap-2 text-[10.5px] text-faint">
+                    <div className="mt-2 flex items-center justify-between gap-2 text-micro text-faint">
                       <span>
                         还可选择 {Math.max(0, remainingRuleSlots - selectedGroupIds.length)} 个
                       </span>
@@ -654,12 +654,12 @@ export function KnowledgePlanetAutomationPanel({
                   </div>
                   <div className="max-h-64 overflow-y-auto p-1.5">
                     {groupsLoading ? (
-                      <div className="flex items-center justify-center gap-2 py-8 text-[11.5px] text-faint">
+                      <div className="flex items-center justify-center gap-2 py-8 text-caption text-faint">
                         <Spinner /> 正在读取星球列表…
                       </div>
                     ) : groupsError ? (
                       <div className="p-2">
-                        <Alert tone="danger" className="text-[11px]">
+                        <Alert tone="danger" className="text-caption">
                           {groupsError}
                         </Alert>
                         <Button
@@ -672,7 +672,7 @@ export function KnowledgePlanetAutomationPanel({
                         </Button>
                       </div>
                     ) : filteredGroups.length === 0 ? (
-                      <div className="py-8 text-center text-[11.5px] text-faint">
+                      <div className="py-8 text-center text-caption text-faint">
                         {groups.length === 0 ? '当前账号没有可用星球' : '没有匹配的星球'}
                       </div>
                     ) : (
@@ -704,13 +704,13 @@ export function KnowledgePlanetAutomationPanel({
                               {selected && <Check size={11} />}
                             </span>
                             <span className="min-w-0 flex-1">
-                              <span className="block truncate text-[12px] text-fg">{group.name}</span>
-                              <span className="block truncate text-[10px] text-faint">
+                              <span className="block truncate text-meta text-fg">{group.name}</span>
+                              <span className="block truncate text-micro text-faint">
                                 ID {group.id}
                                 {group.memberCount === null ? '' : ` · ${group.memberCount} 位成员`}
                               </span>
                             </span>
-                            {configured && <span className="text-[10px] text-faint">已配置</span>}
+                            {configured && <span className="text-micro text-faint">已配置</span>}
                           </button>
                         )
                       })
@@ -723,7 +723,7 @@ export function KnowledgePlanetAutomationPanel({
                   {selectedGroupIds.map((groupId) => (
                     <span
                       key={groupId}
-                      className="inline-flex max-w-full items-center gap-1 rounded-full bg-accent-soft px-2 py-1 text-[10.5px] text-accent"
+                      className="inline-flex max-w-full items-center gap-1 rounded-full bg-accent-soft px-2 py-1 text-micro text-accent"
                     >
                       <span className="truncate">{groupById.get(groupId)?.name ?? groupId}</span>
                       <button
@@ -742,14 +742,14 @@ export function KnowledgePlanetAutomationPanel({
               )}
             </div>
           ) : (
-            <div className="grid gap-1 text-[11.5px] text-muted">
+            <div className="grid gap-1 text-caption text-muted">
               <span>知识星球</span>
-              <div className="rounded-lg border border-border bg-hover px-3 py-2 text-[12px] text-fg">
+              <div className="rounded-lg border border-border bg-hover px-3 py-2 text-meta text-fg">
                 {groupById.get(draft.groupId)?.name ?? `星球 ${draft.groupId}`}
               </div>
             </div>
           )}
-          <label htmlFor="kp-automation-rule-name" className="grid gap-1 text-[11.5px] text-muted">
+          <label htmlFor="kp-automation-rule-name" className="grid gap-1 text-caption text-muted">
             规则名称
             <Input
               id="kp-automation-rule-name"
@@ -762,7 +762,7 @@ export function KnowledgePlanetAutomationPanel({
           </label>
           <label
             htmlFor="kp-automation-instructions"
-            className="grid gap-1 text-[11.5px] text-muted"
+            className="grid gap-1 text-caption text-muted"
           >
             回复要求
             <Textarea
@@ -776,10 +776,10 @@ export function KnowledgePlanetAutomationPanel({
               }
             />
           </label>
-          <label className="grid gap-1 text-[11.5px] text-muted">
+          <label className="grid gap-1 text-caption text-muted">
             触发范围
             <select
-              className="h-9 rounded-lg border border-border bg-surface px-2 text-[12px] text-fg"
+              className="h-9 rounded-lg border border-border bg-surface px-2 text-meta text-fg"
               value={draft.triggerKind}
               onChange={(event) =>
                 setDraft((current) => ({
@@ -795,7 +795,7 @@ export function KnowledgePlanetAutomationPanel({
           <div className="grid grid-cols-3 gap-2">
             <label
               htmlFor="kp-automation-daily-limit"
-              className="grid gap-1 text-[10.5px] text-muted"
+              className="grid gap-1 text-micro text-muted"
             >
               每日上限
               <Input
@@ -809,7 +809,7 @@ export function KnowledgePlanetAutomationPanel({
                 }
               />
             </label>
-            <label htmlFor="kp-automation-cooldown" className="grid gap-1 text-[10.5px] text-muted">
+            <label htmlFor="kp-automation-cooldown" className="grid gap-1 text-micro text-muted">
               冷却（分钟）
               <Input
                 id="kp-automation-cooldown"
@@ -824,7 +824,7 @@ export function KnowledgePlanetAutomationPanel({
             </label>
             <label
               htmlFor="kp-automation-max-reply"
-              className="grid gap-1 text-[10.5px] text-muted"
+              className="grid gap-1 text-micro text-muted"
             >
               回复字符上限
               <Input

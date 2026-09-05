@@ -540,6 +540,15 @@ export const commercialConfigSchema = z
     OC_RUNTIME_RELEASES_ROOT: ocRuntimeReleasesRoot,
     OC_RUNTIME_EMERGENCY_TUPLE: ocRuntimeEmergencyTuple,
     OC_PLATFORM_BUNDLE_OPTIONAL: ocPlatformBundleOptional,
+    /**
+     * P1 desktop virtual container. Unset / not "1" = off (fail-closed).
+     * system_settings.desktop_virtual_container cannot enable this when env is off.
+     */
+    OC_DESKTOP_VIRTUAL_CONTAINER: enabledFlag,
+    /** Unset = open; "1" cuts desktop control plane (503) while docker is unchanged. */
+    OC_DESKTOP_KIND_KILLSWITCH: enabledFlag,
+    /** Allow platform=sim enrollment without deep link (also NODE_ENV=test). */
+    OC_DESKTOP_SIM_ENROLL: enabledFlag,
     FILE_PROXY_ENABLED: fileProxyEnabled,
     FEATURE_REMOTE_SSH: featureRemoteSsh,
     R7_GCS_BUCKET: r7GcsBucket,

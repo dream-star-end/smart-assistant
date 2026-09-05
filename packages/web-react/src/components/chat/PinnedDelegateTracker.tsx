@@ -67,7 +67,7 @@ function DelegateRow({
   const summary = item.state === "completed" ? firstLine(item.resultSummary ?? "") : "";
   const name = agentDisplayName(item.agentId) || item.agentId;
   return (
-    <div className="flex items-start gap-2 text-[13px]">
+    <div className="flex items-start gap-2 text-body">
       <span className="mt-px shrink-0">
         <StatusMark state={item.state} />
       </span>
@@ -194,7 +194,7 @@ export function PinnedDelegateTracker({
             后台任务 {live.length}/{visible.length}
           </span>
           {!expanded && latestRunning && (
-            <span className="min-w-0 flex-1 truncate text-[13px] text-fg">
+            <span className="min-w-0 flex-1 truncate text-body text-fg">
               <span className="inline-flex max-w-full items-center gap-1.5">
                 {isRunningState(latestRunning.state) ? (
                   <LoaderCircle className="size-3 shrink-0 animate-spin text-accent" />

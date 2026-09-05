@@ -46,6 +46,9 @@ import tailwindcss from "@tailwindcss/vite";
 import { build as viteBuild } from "vite";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
 
+// 与 src/components/chat/stickToBottom.ts WHEEL_FENCE_QUIET_MS 同值(run.mjs 不 import TS)。
+const WHEEL_QUIET_MS = 200;
+
 const require_ = createRequire(import.meta.url);
 const esbuild = require_("esbuild");
 const { chromium } = require_("playwright-core");
@@ -2024,6 +2027,78 @@ await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹
     );
   }
   if (afterGrow.following) throw new Error("内容增长后错误恢复贴底态");
+});
+await check("T63 滚轮连续上滑期间 controller 不写 scrollTop，无回弹，松开后也不补写", async () => {
+  screenshotPage = mobilePage;
+  const scroll = mobilePage.getByTestId("mobile-chat-scroll");
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForFunction(() => {
+    const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
+    return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 1200;
+  }, null, { timeout: 5000 });
+  await mobilePage.evaluate(() => window.__mobilePage.armSticky());
+  await mobilePage.waitForTimeout(WHEEL_QUIET_MS + 80);
+  await mobilePage.evaluate(() => { window.__mobilePage.programmaticWrites = 0; });
+  const box = await scroll.boundingBox();
+  if (!box) throw new Error("移动聊天区无可滚轮几何");
+  const x = Math.round(box.x + box.width / 2);
+  const y = Math.round(box.y + box.height / 2);
+  await mobilePage.mouse.move(x, y);
+  const before = await scroll.evaluate((node) => node.scrollTop);
+  // 连续 12 次滚轮上滑,间隔短于 quiet window,模拟一次真实的滚轮/触控板手势。
+  // 每一步都记下 scrollTop:任何一步位置比上一步更靠下(回弹)即失败。
+  const tops = [];
+  for (let i = 0; i < 12; i += 1) {
+    await mobilePage.mouse.wheel(0, -120);
+    await mobilePage.waitForTimeout(40);
+    const s = await scroll.evaluate((node) => ({
+      top: node.scrollTop,
+      fence: window.__mobilePage.wheelFence,
+      writes: window.__mobilePage.programmaticWrites,
+    }));
+    // 上方行从 200px 估高变真实高度时 RO 要求校正;篱笆期间必须挂起而不是写。
+    await mobilePage.evaluate(() => window.__mobilePage.attemptViewportCorrection(24));
+    if (!s.fence) throw new Error(`第 ${i + 1} 次滚轮后篱笆未保持: ${JSON.stringify(s)}`);
+    if (s.writes !== 0) throw new Error(`滚轮期间出现程序化 scrollTop 写入: ${JSON.stringify(s)}`);
+    tops.push(s.top);
+  }
+  for (let i = 1; i < tops.length; i += 1) {
+    if (tops[i] > tops[i - 1] + 1) {
+      throw new Error(`滚轮上滑途中回弹: step ${i} ${tops[i - 1]} → ${tops[i]} (all=${tops.join(",")})`);
+    }
+  }
+  if (tops[tops.length - 1] >= before - 600) {
+    throw new Error(`滚轮上滑未实际移动视口: before=${before}, after=${tops[tops.length - 1]}`);
+  }
+  const held = tops[tops.length - 1];
+  // 手势停下:quiet window(且滚动已静止)释放篱笆。篱笆期间被拦下的 12 次校正
+  // 全部丢弃 —— 用户已经带着位移滚过去了,事后再对齐旧锚点就是第二次可见跳动。
+  await mobilePage.waitForTimeout(WHEEL_QUIET_MS + 200);
+  const after = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    fence: window.__mobilePage.wheelFence,
+    following: window.__mobilePage.following,
+    writes: window.__mobilePage.programmaticWrites,
+  }));
+  if (after.fence) throw new Error(`滚轮停止后篱笆未释放: ${JSON.stringify(after)}`);
+  if (after.following) throw new Error("滚轮上滑后仍处于贴底态");
+  if (Math.abs(after.top - held) > 2) {
+    throw new Error(`篱笆释放后视口被补写移动: held=${held}, after=${JSON.stringify(after)}`);
+  }
+  if (after.writes !== 0) throw new Error(`篱笆释放后出现程序化写入: ${JSON.stringify(after)}`);
+  // 篱笆已释放,校正恢复即时生效(controller 仍是唯一写手)。
+  await mobilePage.evaluate(() => window.__mobilePage.attemptViewportCorrection(24));
+  const corrected = await scroll.evaluate((node) => node.scrollTop);
+  if (Math.abs(corrected - (after.top + 24)) > 2) {
+    throw new Error(`篱笆释放后校正未即时生效: ${after.top} → ${corrected}`);
+  }
+  // 静止后再长内容,视口不得被拉走。
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForTimeout(300);
+  const afterGrow = await scroll.evaluate((node) => node.scrollTop);
+  if (Math.abs(afterGrow - corrected) > 2) {
+    throw new Error(`离底静止后内容增长把视口拉走: ${corrected} → ${afterGrow}`);
+  }
 });
 screenshotPage = page;
 

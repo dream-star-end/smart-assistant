@@ -621,6 +621,11 @@ export interface ServerAuthoredStorage {
 
 export interface ServerAuthoredHandlerDeps {
   identityRepo: ContainerIdentityRepo;
+  /** Override identity (desktop mTLS). Docker assembly omits this. */
+  verify?: (
+    req: IncomingMessage,
+    ctx: { hostUuid: string; boundIp: string },
+  ) => Promise<import("../auth/containerIdentity.js").ContainerIdentity>;
   storage: ServerAuthoredStorage;
   /** v5 PG-only lossless v2 tape store. v1 remains available for rolling old containers. */
   losslessTurnTapeStorage?: LosslessTurnTapeStorage;
@@ -762,11 +767,13 @@ export function makeServerAuthoredHandler(
     // 1) Container identity (same double-factor as anthropicProxy)
     let identity;
     try {
-      identity = await verifyContainerIdentity(
-        deps.identityRepo,
-        ctx,
-        req.headers.authorization,
-      );
+      identity = await (deps.verify
+        ? deps.verify(req, ctx)
+        : verifyContainerIdentity(
+            deps.identityRepo,
+            ctx,
+            req.headers.authorization,
+          ));
     } catch (err) {
       if (err instanceof ContainerIdentityError) {
         reqLog.warn("identity_failed", { errcode: err.code });
@@ -2750,6 +2757,10 @@ const DISPATCH_UUID_RE =
 
 export interface TurnTapeStateHandlerDeps {
   identityRepo: ContainerIdentityRepo;
+  verify?: (
+    req: IncomingMessage,
+    ctx: { hostUuid: string; boundIp: string },
+  ) => Promise<import("../auth/containerIdentity.js").ContainerIdentity>;
   /** pgSessionsBackend(DispatchAdmissionBackend);缺省 → 503。 */
   storage?: Pick<DispatchAdmissionBackend, "getTurnTapeStateByDispatch">;
   logger?: Logger;
@@ -2768,7 +2779,9 @@ export function makeTurnTapeStateHandler(deps: TurnTapeStateHandlerDeps): Server
     }
     let identity;
     try {
-      identity = await verifyContainerIdentity(deps.identityRepo, ctx, req.headers.authorization);
+      identity = await (deps.verify
+        ? deps.verify(req, ctx)
+        : verifyContainerIdentity(deps.identityRepo, ctx, req.headers.authorization));
     } catch (err) {
       if (err instanceof ContainerIdentityError) {
         sendJsonError(res, 401, "UNAUTHORIZED", "container identity verification failed", requestId);

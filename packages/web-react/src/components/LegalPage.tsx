@@ -50,11 +50,11 @@ export function LegalPage({ kind }: { kind: LegalKind }) {
     <div className="min-h-screen bg-bg text-fg">
       <header className="sticky top-0 z-10 border-b border-border bg-bg/90 backdrop-blur">
         <div className="mx-auto flex h-14 max-w-3xl items-center justify-between px-5">
-          <a href="/" className="flex items-center gap-2 text-[14px] font-semibold text-fg hover:text-accent">
+          <a href="/" className="flex items-center gap-2 text-title font-semibold text-fg hover:text-accent">
             <ArrowLeft size={16} />
             {BRAND.name}
           </a>
-          <a href={`/${other}`} className="text-[13px] text-accent hover:underline">
+          <a href={`/${other}`} className="text-body text-accent hover:underline">
             {LEGAL_DOCS[other].title}
           </a>
         </div>
@@ -62,13 +62,13 @@ export function LegalPage({ kind }: { kind: LegalKind }) {
 
       <main className="mx-auto max-w-3xl px-5 py-10">
         <h1 className="text-[26px] font-bold tracking-tight">{doc.title}</h1>
-        <p className="mt-2 text-[13px] text-faint">更新日期:{doc.updated} · 生效日期:{doc.updated}</p>
+        <p className="mt-2 text-body text-faint">更新日期:{doc.updated} · 生效日期:{doc.updated}</p>
 
         <div className="mt-6">
           <LegalDocBody kind={kind} />
         </div>
 
-        <footer className="mt-12 border-t border-border pt-6 text-[12.5px] text-faint">
+        <footer className="mt-12 border-t border-border pt-6 text-meta text-faint">
           © {BRAND.year} {BRAND.company} · {BRAND.icp}
         </footer>
       </main>

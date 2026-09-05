@@ -30,6 +30,7 @@ cat > qa-expect.json <<'JSON'
 {"kind":"pptx","requiredText":["汇报标题","核心结论"],"minSlides":1}
 JSON
 oc-artifact-qa inspect --input slides.pptx --out-dir slides.pptx.qa --expect qa-expect.json
+oc-artifact-qa deliver --input slides.pptx
 ```
 
 检查全部 `contact-sheets`/逐页 PNG:无裁切、重叠、字体替换、拉伸或层级混乱;同时确认
@@ -49,4 +50,4 @@ oc-poster --spec poster.json -o /home/agent/.openclaude/research/<id>/poster.pdf
 - 论断有据:slide/海报里的事实/数据沿用报告口径,不编造数字/DOI。
 - 图表零生成式插画(PresAesth 会软标);多主题切 `theme` 即可。
 - 渲染失败(无 quarto)降级产出 `.qmd`,仍可读;据此告知用户。
-- 输出末行打印产物绝对路径(前端渲染文件卡片)。
+- 输出只打印 FINAL 绝对路径，单独成行（前端渲染文件卡片）。禁止 fenced；禁止发明 URL。L0 `oc-artifact-qa deliver` 未 PASS 不得打印路径。

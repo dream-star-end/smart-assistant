@@ -777,7 +777,7 @@ export function ImageAnnotationEditor({
               <Dialog.Title className="text-sm font-semibold">
                 {selectionPresent ? '已选中区域' : '圈选要修改的区域'}
               </Dialog.Title>
-              <span className="text-[11px] text-white/60">Image 2 · 每张 50 积分</span>
+              <span className="text-caption text-white/60">Image 2 · 每张 50 积分</span>
             </div>
             <button
               type="button"
@@ -884,7 +884,7 @@ export function ImageAnnotationEditor({
               </p>
             )}
             {submitHint && (
-              <p role="status" className="mx-auto w-full max-w-2xl text-center text-[13px] text-amber-300">
+              <p role="status" className="mx-auto w-full max-w-2xl text-center text-body text-amber-300">
                 {submitHint}
               </p>
             )}

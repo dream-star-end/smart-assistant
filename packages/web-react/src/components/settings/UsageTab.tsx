@@ -292,7 +292,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
+      <div className="flex items-center justify-center gap-2 py-16 text-body text-faint">
         <Spinner /> 加载用量统计…
       </div>
     );
@@ -300,7 +300,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   if (err) {
     return (
       <div className="px-5 py-4">
-        <Alert tone="danger" className="text-[12.5px]">
+        <Alert tone="danger" className="text-meta">
           {err}
         </Alert>
         <Button
@@ -317,7 +317,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   if (scopeQuery.blocked) {
     return (
       <div className="px-5 py-4">
-        <Alert tone="warning" className="text-[12.5px]">
+        <Alert tone="warning" className="text-meta">
           {scopeQuery.blocked}
         </Alert>
       </div>
@@ -375,13 +375,13 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         </div>
       ) : reportErr ? (
         <div className="px-5 py-4">
-          <Alert tone="danger" className="text-[12.5px]">
+          <Alert tone="danger" className="text-meta">
             {reportErr}
           </Alert>
           <button
             type="button"
             onClick={() => setReportReloadTick((t) => t + 1)}
-            className="mt-2 text-[13px] text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="mt-2 text-body text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             重试
           </button>
@@ -409,14 +409,14 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
             {usageView === "by-model" ? (
             <div className="px-5 pb-4">
               {report.models.length === 0 ? (
-                <p className="py-8 text-center text-[12.5px] text-faint">该时段暂无模型用量。</p>
+                <p className="py-8 text-center text-meta text-faint">该时段暂无模型用量。</p>
               ) : (
                 <div className="overflow-x-auto rounded-xl border border-border">
-                  <table className="w-full min-w-[40rem] text-left text-[12.5px]">
+                  <table className="w-full min-w-[40rem] text-left text-meta">
                     <caption className="sr-only">
                       {`按模型用量，近 ${REPORT_WINDOW_NOUN[window]}`}
                     </caption>
-                    <thead className="bg-hover text-[11px] font-medium uppercase tracking-wide text-faint">
+                    <thead className="bg-hover text-caption font-medium uppercase tracking-wide text-faint">
                       <tr>
                         <th className="px-3 py-2">模型</th>
                         <th className="px-3 py-2 text-right">请求</th>
@@ -493,7 +493,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                 {modelHasData ? (
                   <canvas ref={modelRef} />
                 ) : (
-                  <div className="flex h-full items-center justify-center text-[12.5px] text-faint">
+                  <div className="flex h-full items-center justify-center text-meta text-faint">
                     该时段暂无模型用量。
                   </div>
                 )}
@@ -516,7 +516,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                 {tokenHasData ? (
                   <canvas ref={tokenRef} />
                 ) : (
-                  <div className="flex h-full items-center justify-center text-[12.5px] text-faint">
+                  <div className="flex h-full items-center justify-center text-meta text-faint">
                     该时段暂无用量数据。
                   </div>
                 )}
@@ -533,28 +533,28 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
           累计 · 自开通以来
         </div>
         <div className="flex items-center justify-between pb-1.5">
-          <span className="text-[12.5px] text-muted">缓存命中率</span>
-          <span className="text-[12.5px] font-medium tabular-nums text-fg">
+          <span className="text-meta text-muted">缓存命中率</span>
+          <span className="text-meta font-medium tabular-nums text-fg">
             {hitPct != null ? `${hitPct}%` : "—"}
           </span>
         </div>
         <Progress value={hitPct ?? 0} aria-label="缓存命中率" />
         <div className="mt-3 flex items-center justify-between">
-          <span className="text-[12.5px] text-muted">缓存为你节省</span>
-          <span className="text-[13.5px] font-semibold text-success">
+          <span className="text-meta text-muted">缓存为你节省</span>
+          <span className="text-section font-semibold text-success">
             {data.savings.savings_unavailable || data.savings.savings_credits == null
               ? "—"
               : `${formatCredits(data.savings.savings_credits)} 积分`}
             {data.savings.savings_is_estimate ? (
-              <span className="ml-1 text-[11px] font-normal text-faint">（估算）</span>
+              <span className="ml-1 text-caption font-normal text-faint">（估算）</span>
             ) : null}
           </span>
         </div>
         {data.savings.savings_unavailable && (
-          <p className="mt-1 text-[11.5px] text-faint">数据量较大，暂不展示节省精算值。</p>
+          <p className="mt-1 text-caption text-faint">数据量较大，暂不展示节省精算值。</p>
         )}
         {/* 累计口径不回退：全生命周期请求 + 实际扣费 */}
-        <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 border-t border-border pt-3 text-[12px]">
+        <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 border-t border-border pt-3 text-meta">
           <div className="flex items-center justify-between">
             <span className="text-muted">累计请求</span>
             <span className="tabular-nums text-fg">{groupDigits(s.requests_total)}</span>
@@ -568,11 +568,11 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
 
       {/* 会话维度明细 */}
       <div className="border-t border-border px-5 py-4">
-        <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           会话用量明细
         </div>
         {sessions.length === 0 ? (
-          <p className="py-3 text-center text-[12.5px] text-faint">
+          <p className="py-3 text-center text-meta text-faint">
             暂无会话维度用量{data.cutoff_started_at ? "" : "（功能上线后开始记录）"}。
           </p>
         ) : (
@@ -595,12 +595,12 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                           {hasTitle ? (
                             <span className="truncate text-body text-fg">{title}</span>
                           ) : (
-                            <span className="truncate font-mono text-[12.5px] text-fg">
+                            <span className="truncate font-mono text-meta text-fg">
                               {row.session_id}
                             </span>
                           )}
                           {row.delegate_only ? (
-                            <span className="shrink-0 rounded-full bg-hover px-1.5 py-px text-[10.5px] text-muted">
+                            <span className="shrink-0 rounded-full bg-hover px-1.5 py-px text-micro text-muted">
                               组队
                             </span>
                           ) : null}
@@ -616,7 +616,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                           ) : null}
                         </span>
                       </span>
-                      <span className="shrink-0 text-[13px] font-medium tabular-nums text-fg">
+                      <span className="shrink-0 text-body font-medium tabular-nums text-fg">
                         <span>{formatCredits(row.billed_credits)}</span>
                         <span className="ml-0.5 text-caption text-faint">积分</span>
                       </span>
@@ -626,7 +626,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                         type="button"
                         onClick={() => toggleDelegates(row.session_id)}
                         aria-expanded={isOpen}
-                        className="mt-1 inline-flex items-center gap-1 rounded-full border border-border bg-surface px-2 py-0.5 text-[11px] text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                        className="mt-1 inline-flex items-center gap-1 rounded-full border border-border bg-surface px-2 py-0.5 text-caption text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
                       >
                         含组队 {formatCredits(row.delegate_credits ?? "0")} 积分
                         <span
@@ -642,7 +642,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                         {delegates.map((d, i) => (
                           <li
                             key={`${d.delegate_agent_id ?? "unknown"}:${d.model}:${i}`}
-                            className="flex items-center gap-2 text-[11.5px]"
+                            className="flex items-center gap-2 text-caption"
                           >
                             <span className="min-w-0 flex-1 truncate">
                               <span className="text-fg">
@@ -670,14 +670,14 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                 <button
                   onClick={loadMore}
                   disabled={loadingMore}
-                  className="text-[13px] text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+                  className="text-body text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
                 >
                   {loadingMore ? "加载中…" : "加载更多"}
                 </button>
               </div>
             )}
             {/[1-9]/.test(data.legacy_unattributed.requests) && (
-              <p className="mt-2 text-[11.5px] text-faint">
+              <p className="mt-2 text-caption text-faint">
                 另有 {groupDigits(data.legacy_unattributed.requests)} 次早期请求未归属到具体会话。
               </p>
             )}
@@ -691,7 +691,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
 function Stat({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
   return (
     <div className="rounded-xl border border-border bg-surface px-3 py-2.5">
-      <div className="text-[11px] text-faint">{label}</div>
+      <div className="text-caption text-faint">{label}</div>
       <div
         className={cn(
           "mt-0.5 text-[16px] font-semibold tabular-nums",

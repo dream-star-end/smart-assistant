@@ -106,7 +106,7 @@ function StarterChip({ s }: { s: Starter }) {
         <s.icon size={14} />
       </span>
       <span className="min-w-0 flex-1">
-        <span className="block text-[11.5px] font-semibold text-accent">{s.tag}</span>
+        <span className="block text-caption font-semibold text-accent">{s.tag}</span>
         <span className="mt-0.5 block text-[13.5px] leading-relaxed text-muted">
           {copied ? "已复制，去粘贴给它吧 ✓" : `「${s.text}」`}
         </span>
@@ -127,7 +127,7 @@ export function Tutorials() {
   return (
     <section id="tutorials" className="mx-auto max-w-6xl scroll-mt-20 px-5 py-20">
       <div className="mb-12 text-center">
-        <span className="mb-3 inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-3 py-1 text-[12.5px] text-muted">
+        <span className="mb-3 inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-3 py-1 text-meta text-muted">
           <Rocket size={13} className="text-accent" />
           快速上手
         </span>
@@ -141,7 +141,7 @@ export function Tutorials() {
       <div className="mb-14 grid grid-cols-1 gap-4 sm:grid-cols-3">
         {QUICKSTART.map((s) => (
           <div key={s.n} className="relative rounded-2xl border border-border bg-surface p-6">
-            <span className="flex size-9 items-center justify-center rounded-full bg-grad-cta text-[15px] font-semibold text-white shadow-sm">
+            <span className="flex size-9 items-center justify-center rounded-full bg-grad-cta text-title font-semibold text-white shadow-sm">
               {s.n}
             </span>
             <h3 className="mt-4 text-[17px] font-semibold">{s.title}</h3>
@@ -160,7 +160,7 @@ export function Tutorials() {
         </div>
         <a
           href={tutorialHref(window.location)}
-          className="mt-4 inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-grad-cta px-4 py-2.5 text-[13.5px] font-semibold text-white shadow-sm outline-none transition-transform hover:-translate-y-0.5 focus-visible:ring-2 focus-visible:ring-ring sm:mt-0"
+          className="mt-4 inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-grad-cta px-4 py-2.5 text-section font-semibold text-white shadow-sm outline-none transition-transform hover:-translate-y-0.5 focus-visible:ring-2 focus-visible:ring-ring sm:mt-0"
         >
           打开快速上手
           <ArrowRight size={15} />

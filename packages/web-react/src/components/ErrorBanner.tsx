@@ -27,10 +27,10 @@ export function ErrorBanner({
         <AlertTriangle size={14} />
       </span>
       <div className="min-w-0 flex-1 basis-[calc(100%_-_2.25rem)] sm:basis-auto">
-        <p className="text-[13px] font-medium text-fg">发送失败</p>
-        <p className="mt-0.5 break-words text-[13px] text-muted">{error.message}</p>
+        <p className="text-body font-medium text-fg">发送失败</p>
+        <p className="mt-0.5 break-words text-body text-muted">{error.message}</p>
         {error.requestId && (
-          <p className="mt-1 select-all font-mono text-[11px] text-faint">追踪号 {error.requestId}</p>
+          <p className="mt-1 select-all font-mono text-caption text-faint">追踪号 {error.requestId}</p>
         )}
       </div>
       <div className="flex w-full shrink-0 items-center justify-end gap-1 sm:w-auto">

@@ -166,7 +166,7 @@ export function SkillsPanel({
           ) : undefined
         }
       />
-      <ProjectSkillOverlay auth={auth} />
+      <ProjectSkillOverlay auth={auth} agents={agents} />
       {/* 顶层 Alert 只承载「整表加载失败」。单行操作的失败走 Toast / 行内。 */}
       {err && (
         <div className="px-4 pb-2">

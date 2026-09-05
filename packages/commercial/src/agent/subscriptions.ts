@@ -259,9 +259,9 @@ export async function openAgentSubscription(
     const conRow = await client.query<{ id: string }>(
       `INSERT INTO agent_containers
           (user_id, subscription_id, docker_id, docker_name,
-           workspace_volume, home_volume, image, status,
+           workspace_volume, home_volume, image, status, runtime_kind,
            last_started_at, last_stopped_at, volume_gc_at, last_error)
-       VALUES ($1, $2, NULL, $3, $4, $5, $6, 'provisioning',
+       VALUES ($1, $2, NULL, $3, $4, $5, $6, 'provisioning', 'docker',
                NULL, NULL, NULL, NULL)
        ON CONFLICT (user_id) DO UPDATE SET
            subscription_id = EXCLUDED.subscription_id,
@@ -363,7 +363,7 @@ export async function getAgentStatus(
             docker_id, docker_name, image, status,
             last_started_at, last_stopped_at, volume_gc_at, last_error
        FROM agent_containers
-      WHERE user_id = $1
+      WHERE user_id = $1 AND runtime_kind = 'docker'
       LIMIT 1`,
     [uidStr],
   );
@@ -453,7 +453,7 @@ export async function checkAgentAccess(
   }
 
   const conR = await query<{ id: string; status: string }>(
-    "SELECT id::text AS id, status FROM agent_containers WHERE user_id = $1 LIMIT 1",
+    "SELECT id::text AS id, status FROM agent_containers WHERE user_id = $1 AND runtime_kind = 'docker' LIMIT 1",
     [uidStr],
   );
   if (conR.rows.length === 0) {
@@ -536,7 +536,7 @@ export async function markContainerRunning(
             last_started_at = NOW(),
             last_error = NULL,
             updated_at = NOW()
-      WHERE user_id = $1`,
+      WHERE user_id = $1 AND runtime_kind = 'docker'`,
     [uidStr, dockerId],
   );
 }
@@ -554,7 +554,7 @@ export async function markContainerError(
         SET status = 'error',
             last_error = $2,
             updated_at = NOW()
-      WHERE user_id = $1`,
+      WHERE user_id = $1 AND runtime_kind = 'docker'`,
     [uidStr, trimmed],
   );
 }
@@ -621,7 +621,7 @@ export async function markContainerStoppedAfterExpiry(
             last_stopped_at = NOW(),
             volume_gc_at = NOW() + ($2::int || ' days')::interval,
             updated_at = NOW()
-      WHERE user_id = $1 AND status IN ('provisioning','running','error')`,
+      WHERE user_id = $1 AND status IN ('provisioning','running','error') AND runtime_kind = 'docker'`,
     [uidStr, gcDays],
   );
 }
@@ -663,9 +663,10 @@ export async function listVolumeGcCandidates(
   }>(
     `UPDATE agent_containers
         SET volume_gc_at = NULL, updated_at = NOW()
-      WHERE id IN (
+      WHERE runtime_kind = 'docker' AND id IN (
         SELECT id FROM agent_containers
          WHERE status = 'stopped'
+           AND runtime_kind = 'docker'
            AND volume_gc_at IS NOT NULL
            AND volume_gc_at < NOW()
          ORDER BY volume_gc_at ASC
@@ -704,7 +705,7 @@ export async function restoreVolumeGcAfterFailure(
     `UPDATE agent_containers
         SET volume_gc_at = NOW() + ($2::int || ' seconds')::interval,
             updated_at = NOW()
-      WHERE user_id = $1 AND status = 'stopped' AND volume_gc_at IS NULL`,
+      WHERE user_id = $1 AND status = 'stopped' AND volume_gc_at IS NULL AND runtime_kind = 'docker'`,
     [uidStr, retryAfterSeconds],
   );
 }
@@ -717,7 +718,7 @@ export async function markContainerRemoved(
   await query(
     `UPDATE agent_containers
         SET status = 'removed', docker_id = NULL, updated_at = NOW()
-      WHERE user_id = $1 AND status = 'stopped'`,
+      WHERE user_id = $1 AND status = 'stopped' AND runtime_kind = 'docker'`,
     [uidStr],
   );
 }

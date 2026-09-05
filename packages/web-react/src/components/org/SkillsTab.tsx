@@ -74,7 +74,7 @@ export function SkillsTab({ auth }: { auth: AuthSession }) {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
+      <div className="flex items-center justify-center gap-2 py-16 text-body text-faint">
         <Spinner /> 加载组织技能…
       </div>
     );
@@ -82,7 +82,7 @@ export function SkillsTab({ auth }: { auth: AuthSession }) {
   if (err) {
     return (
       <div className="px-5 py-4">
-        <Alert tone="danger" className="text-[12.5px]">
+        <Alert tone="danger" className="text-meta">
           {err}
         </Alert>
       </div>
@@ -156,9 +156,9 @@ function Section({
 }) {
   return (
     <div className={border ? "border-t border-border px-5 py-4" : "px-5 py-4"}>
-      <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">{title}</div>
+      <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">{title}</div>
       {skills.length === 0 ? (
-        <p className="py-3 text-center text-[12.5px] text-faint">{empty}</p>
+        <p className="py-3 text-center text-meta text-faint">{empty}</p>
       ) : (
         <ul className="flex flex-col gap-1.5">
           {skills.map((s) => (
@@ -170,9 +170,9 @@ function Section({
                 <Check size={16} />
               </span>
               <span className="min-w-0 flex-1">
-                <span className="block truncate text-[13.5px] font-medium text-fg">{s.name}</span>
+                <span className="block truncate text-section font-medium text-fg">{s.name}</span>
                 {s.summary && (
-                  <span className="block truncate text-[11.5px] text-faint">{s.summary}</span>
+                  <span className="block truncate text-caption text-faint">{s.summary}</span>
                 )}
               </span>
               <span className="shrink-0">{renderAction(s)}</span>

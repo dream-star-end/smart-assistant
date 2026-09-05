@@ -184,6 +184,12 @@ export const DURABLE_TABLES: readonly string[] = [
   "wechat_outbox",
   "wechat_running_sessions",
   "wechat_session_pointer",
+  // 2026-09-05 selfhost sync: 0260/0261 research + 0264 desktop live rows.
+  "research_library_memberships",
+  "research_fetch_attempts",
+  "desktop_enrollments",
+  "desktop_devices",
+  "desktop_device_audit",
 ] as const;
 
 /**

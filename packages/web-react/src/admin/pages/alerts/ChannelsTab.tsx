@@ -117,7 +117,7 @@ export function ChannelsTab({ events }: { events: EventMeta[] }) {
     <div className="flex flex-col gap-4">
       {confirmEl}
       <div className="flex items-center justify-between gap-2">
-        <p className="text-[13px] text-muted">
+        <p className="text-body text-muted">
           微信 iLink / Telegram / 企业微信群机器人 / 企业微信智能机器人 —— 只发给绑定了的超管。
         </p>
         <div className="flex items-center gap-2">
@@ -131,7 +131,7 @@ export function ChannelsTab({ events }: { events: EventMeta[] }) {
       </div>
 
       {error && (
-        <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-[13px] text-danger">
+        <div className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2.5 text-body text-danger">
           加载通道失败: {errText(error)}
         </div>
       )}
@@ -222,16 +222,16 @@ function ChannelCard({
           </span>
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <span className="truncate text-[14px] font-medium text-fg" title={c.label}>
+              <span className="truncate text-title font-medium text-fg" title={c.label}>
                 {c.label}
               </span>
-              <span className="shrink-0 font-mono text-[11px] text-faint">#{c.id}</span>
+              <span className="shrink-0 font-mono text-caption text-faint">#{c.id}</span>
             </div>
-            <span className="text-[12px] text-faint">{CHANNEL_TYPE_LABEL[c.channel_type]}</span>
+            <span className="text-meta text-faint">{CHANNEL_TYPE_LABEL[c.channel_type]}</span>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <span className="text-[11.5px] text-faint">{c.enabled ? "启用" : "停用"}</span>
+          <span className="text-caption text-faint">{c.enabled ? "启用" : "停用"}</span>
           <Switch checked={c.enabled} disabled={busy} onCheckedChange={onToggle} aria-label="启用/停用" />
         </div>
       </div>
@@ -247,18 +247,18 @@ function ChannelCard({
       </div>
 
       {aibotUnbound && act.tone !== "danger" && (
-        <div className="rounded-lg border border-warning/40 bg-warning-soft px-3 py-2 text-[12px] text-warning">
+        <div className="rounded-lg border border-warning/40 bg-warning-soft px-3 py-2 text-meta text-warning">
           尚未绑定推送会话 —— 请在企业微信里<strong>给该机器人发一条消息</strong>完成绑定。
         </div>
       )}
 
-      <div className="flex items-center justify-between gap-2 text-[12px] text-faint">
+      <div className="flex items-center justify-between gap-2 text-meta text-faint">
         <span>
           最近发送:{c.last_send_at ? <TimeAgo value={c.last_send_at} /> : "—"}
         </span>
       </div>
       {c.last_error && (
-        <p className="truncate text-[12px] text-danger" title={c.last_error}>
+        <p className="truncate text-meta text-danger" title={c.last_error}>
           最近错误:{c.last_error}
         </p>
       )}

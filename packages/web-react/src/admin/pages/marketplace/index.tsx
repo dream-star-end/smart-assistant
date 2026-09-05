@@ -106,7 +106,7 @@ function FunnelPanel() {
   const cohort = data?.cohort;
   const cohortAvailable = cohort?.availability === "available";
   const skillColumns: Column<SkillFunnelRow>[] = [
-    { key: "skill_slug", title: "技能", render: (row) => <span className="font-mono text-[12px]">{row.skill_slug}</span> },
+    { key: "skill_slug", title: "技能", render: (row) => <span className="font-mono text-meta">{row.skill_slug}</span> },
     { key: "exposure_pairs", title: "曝光对", align: "right" },
     { key: "installed_pairs", title: "安装对", align: "right" },
     { key: "first_use_pairs", title: "首用对", align: "right" },

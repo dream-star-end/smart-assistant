@@ -139,6 +139,22 @@ describe('MarkdownImpl 代码高亮', () => {
   })
 })
 
+describe('MarkdownImpl signMedia 路径卡片', () => {
+  test('fenced 整块就是一条生成路径 → filecard，不进代码块', () => {
+    const source = ['```', '/home/agent/.openclaude/generated/report.docx', '```'].join('\n')
+    render(<MarkdownImpl signMedia>{source}</MarkdownImpl>)
+    expect(screen.getByText('report.docx')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '复制' })).toBeNull()
+  })
+
+  test('fenced 含路径以外正文 → 仍是代码块', () => {
+    const source = ['```', '/home/agent/.openclaude/generated/report.docx', 'echo hi', '```'].join('\n')
+    const { container } = render(<MarkdownImpl signMedia>{source}</MarkdownImpl>)
+    expect(container.querySelector('pre code')).toHaveTextContent('report.docx')
+    expect(screen.getByRole('button', { name: '复制' })).toBeInTheDocument()
+  })
+})
+
 test('容器 loopback 链接显示预览标识且不交给浏览器新标签页', () => {
   const { container } = render(
     <MarkdownImpl>{'[打开应用](http://0.0.0.0:3000/dashboard)'}</MarkdownImpl>,

@@ -65,14 +65,105 @@ function errText(e: unknown, fallback: string): string {
   return apiErrorMessage(e, fallback);
 }
 
+type ManagedQrProvider = 'knowledge-planet' | 'weibo' | 'zhihu'
+
+function managedQrProvider(slug: string | undefined): ManagedQrProvider {
+  if (slug === 'weibo') return 'weibo'
+  if (slug === 'zhihu') return 'zhihu'
+  return 'knowledge-planet'
+}
+
+function isQrRelinkProvider(provider: ManagedQrProvider): boolean {
+  return provider === 'weibo' || provider === 'zhihu'
+}
+
+function managedQrMeta(provider: ManagedQrProvider): {
+  label: string
+  scanner: string
+  qrAlt: string
+  authorizeLabel: string
+} {
+  if (provider === 'weibo') {
+    return {
+      label: '微博',
+      scanner: '微博客户端',
+      qrAlt: '微博登录二维码',
+      authorizeLabel: '微博扫码授权',
+    }
+  }
+  if (provider === 'zhihu') {
+    return {
+      label: '知乎',
+      scanner: '知乎 App',
+      qrAlt: '知乎登录二维码',
+      authorizeLabel: '知乎扫码授权',
+    }
+  }
+  return {
+    label: '知识星球',
+    scanner: '微信',
+    qrAlt: '知识星球微信登录二维码',
+    authorizeLabel: '微信扫码授权',
+  }
+}
+
 function managedSetupFailureText(
-  isWeibo: boolean,
+  provider: ManagedQrProvider,
   setup: Pick<KnowledgePlanetSetupView, 'status' | 'errorCode'>,
 ): string {
   if (setup.status === 'expired') return '二维码已过期，请重新授权。'
-  if (isWeibo && setup.errorCode === 'UPSTREAM_FAILED')
+  if (provider === 'weibo' && setup.errorCode === 'UPSTREAM_FAILED')
     return '微博触发了安全验证，本次授权已安全停止。请先在微博 App 完成安全验证并确认账号可正常使用，再重新授权；若仍反复出现，请稍后再试。'
+  if (
+    provider === 'zhihu' &&
+    (setup.errorCode === 'UPSTREAM_FAILED' || setup.errorCode === 'ZHIHU_UPSTREAM_CHALLENGE')
+  )
+    return '知乎触发了风控或安全验证，本次授权已安全停止。请先在知乎 App 完成安全验证并确认账号可正常使用，再重新授权；若仍反复出现，请稍后再试。'
   return '本次授权未完成，请重试。'
+}
+
+function startManagedQrSetup(
+  auth: AuthSession,
+  provider: ManagedQrProvider,
+  relinkAccountId?: string,
+) {
+  if (provider === 'weibo') {
+    return relinkAccountId ? api.startWeiboSetup(auth, relinkAccountId) : api.startWeiboSetup(auth)
+  }
+  if (provider === 'zhihu') {
+    return relinkAccountId ? api.startZhihuSetup(auth, relinkAccountId) : api.startZhihuSetup(auth)
+  }
+  return api.startKnowledgePlanetSetup(auth)
+}
+
+function getManagedQrSetup(
+  auth: AuthSession,
+  provider: ManagedQrProvider,
+  sessionId: string,
+) {
+  if (provider === 'weibo') return api.getWeiboSetup(auth, sessionId)
+  if (provider === 'zhihu') return api.getZhihuSetup(auth, sessionId)
+  return api.getKnowledgePlanetSetup(auth, sessionId)
+}
+
+function getManagedQrSetupQr(
+  auth: AuthSession,
+  provider: ManagedQrProvider,
+  sessionId: string,
+) {
+  if (provider === 'weibo') return api.getWeiboSetupQr(auth, sessionId)
+  if (provider === 'zhihu') return api.getZhihuSetupQr(auth, sessionId)
+  return api.getKnowledgePlanetSetupQr(auth, sessionId)
+}
+
+function cancelManagedQrSetup(
+  auth: AuthSession,
+  provider: ManagedQrProvider,
+  sessionId: string,
+) {
+  if (provider === 'weibo') return api.cancelWeiboSetup(auth, sessionId)
+  if (provider === 'zhihu') return api.cancelZhihuSetup(auth, sessionId)
+  return api.cancelKnowledgePlanetSetup(auth, sessionId)
 }
 
 /**
@@ -484,7 +575,9 @@ export function ConnectorsTab({
   const reauthorizeRuntimeAccount = useCallback(
     async (account: RuntimePluginAccount, plugin: RuntimePluginCatalogEntry) => {
       const relinkInPlace =
-        plugin.slug === 'weibo' && plugin.installedCurrent && account.versionId === plugin.versionId
+        isQrRelinkProvider(managedQrProvider(plugin.slug)) &&
+        plugin.installedCurrent &&
+        account.versionId === plugin.versionId
       const ok = await confirm({
         title: `重新登录「${plugin.label}」?`,
         body: relinkInPlace
@@ -846,9 +939,10 @@ function RuntimePluginCard({
   onWritePreapprovalError: (error: unknown) => void
 }) {
   const Icon = connectorIcon(plugin.slug)
+  const qrProvider = managedQrProvider(plugin.slug)
   const canSelfAuthorize =
-    ['knowledge-planet', 'weibo'].includes(plugin.slug) && plugin.installedCurrent
-  const authorizeLabel = plugin.slug === 'weibo' ? '微博扫码授权' : '微信扫码授权'
+    ['knowledge-planet', 'weibo', 'zhihu'].includes(plugin.slug) && plugin.installedCurrent
+  const authorizeLabel = managedQrMeta(qrProvider).authorizeLabel
   const readCount = plugin.actions.filter((action) => action.readOnly).length
   const writeCount = plugin.actions.length - readCount
   const [consentAccount, setConsentAccount] = useState<RuntimePluginAccount | null>(null)
@@ -1111,7 +1205,8 @@ function RuntimePluginCard({
                     )}
                   </div>
                 </div>
-                {canSelfAuthorize && (accountState.needsReauth || plugin.slug === 'weibo') && (
+                {canSelfAuthorize &&
+                  (accountState.needsReauth || isQrRelinkProvider(qrProvider)) && (
                   <Button
                     variant="secondary"
                     size="sm"
@@ -1120,7 +1215,7 @@ function RuntimePluginCard({
                     disabled={busyAction !== null}
                   >
                     <QrCode size={13} />
-                    {plugin.slug === 'weibo' ? '重新扫码登录' : '重新扫码授权'}
+                    {isQrRelinkProvider(qrProvider) ? '重新扫码登录' : '重新扫码授权'}
                   </Button>
                 )}
                 {account.writeControl && (
@@ -1398,10 +1493,8 @@ function ManagedBrowserSetupDialog({
   onClose: () => void
   onBound: (agentReady: boolean) => void
 }) {
-  const provider = plugin?.slug === 'weibo' ? 'weibo' : 'knowledge-planet'
-  const isWeibo = provider === 'weibo'
-  const label = isWeibo ? '微博' : '知识星球'
-  const scanner = isWeibo ? '微博客户端' : '微信'
+  const provider = managedQrProvider(plugin?.slug)
+  const { label, scanner, qrAlt } = managedQrMeta(provider)
   const [starting, setStarting] = useState(false)
   const [setup, setSetup] = useState<KnowledgePlanetSetupView | null>(null)
   const [qrUrl, setQrUrl] = useState<string | null>(null)
@@ -1476,9 +1569,7 @@ function ManagedBrowserSetupDialog({
     let cancelled = false
     let timer: number | undefined
     const poll = () => {
-      const request = isWeibo
-        ? api.getWeiboSetup(auth, setupSessionId)
-        : api.getKnowledgePlanetSetup(auth, setupSessionId)
+      const request = getManagedQrSetup(auth, provider, setupSessionId)
       void request
         .then((next) => {
           if (!cancelled) {
@@ -1519,8 +1610,8 @@ function ManagedBrowserSetupDialog({
   }, [
     auth,
     findExistingAccount,
-    isWeibo,
     markExistingAccountActive,
+    provider,
     relinkAccountId,
     setupSessionId,
     setupStatus,
@@ -1529,14 +1620,12 @@ function ManagedBrowserSetupDialog({
   useEffect(() => {
     if (!setupQrReady || !setupSessionId) return
     const qrKey = `${setupSessionId}:${setupQrRevision}`
-    const revisionBound = !isWeibo && hasSetupQrRevision
+    const revisionBound = provider === 'knowledge-planet' && hasSetupQrRevision
     if (revisionBound && loadedQrKey === qrKey) return
     let cancelled = false
     let timer: number | undefined
     const load = () => {
-      const request = isWeibo
-        ? api.getWeiboSetupQr(auth, setupSessionId)
-        : api.getKnowledgePlanetSetupQr(auth, setupSessionId)
+      const request = getManagedQrSetupQr(auth, provider, setupSessionId)
       void request
         .then((blob) => {
           if (cancelled) return
@@ -1564,8 +1653,8 @@ function ManagedBrowserSetupDialog({
   }, [
     auth,
     hasSetupQrRevision,
-    isWeibo,
     loadedQrKey,
+    provider,
     setupQrReady,
     setupQrRevision,
     setupSessionId,
@@ -1592,11 +1681,7 @@ function ManagedBrowserSetupDialog({
     setError(null)
     try {
       setSetup(
-        await (isWeibo
-          ? relinkAccountId
-            ? api.startWeiboSetup(auth, relinkAccountId)
-            : api.startWeiboSetup(auth)
-          : api.startKnowledgePlanetSetup(auth)),
+        await startManagedQrSetup(auth, provider, relinkAccountId ?? undefined),
       )
     } catch (e) {
       if (!relinkAccountId && e instanceof ApiError && e.code === 'ACCOUNT_ALREADY_EXISTS') {
@@ -1619,8 +1704,7 @@ function ManagedBrowserSetupDialog({
       setCancelling(true)
       setError(null)
       try {
-        if (isWeibo) await api.cancelWeiboSetup(auth, setup.sessionId)
-        else await api.cancelKnowledgePlanetSetup(auth, setup.sessionId)
+        await cancelManagedQrSetup(auth, provider, setup.sessionId)
       } catch (e) {
         setError(errText(e, '取消授权失败，请重试'))
         setCancelling(false)
@@ -1746,7 +1830,7 @@ function ManagedBrowserSetupDialog({
               <div className="flex justify-center rounded-xl border border-border bg-white p-4">
                 <img
                   src={qrUrl}
-                  alt={isWeibo ? '微博登录二维码' : '知识星球微信登录二维码'}
+                  alt={qrAlt}
                   className="size-56 object-contain"
                 />
               </div>
@@ -1793,7 +1877,7 @@ function ManagedBrowserSetupDialog({
           </Alert>
         )}
         {terminalFailure && (
-          <Alert tone="warning">{managedSetupFailureText(isWeibo, setup)}</Alert>
+          <Alert tone="warning">{managedSetupFailureText(provider, setup)}</Alert>
         )}
       </div>
     </Modal>

@@ -133,11 +133,11 @@ function AlertActionQueue({
       action={<Button variant="secondary" size="sm" onClick={onOpenRules}>查看全部规则</Button>}
     >
       {query.error ? (
-        <div className="flex items-center gap-2 text-[13px] text-danger"><AlertTriangle size={15} />加载行动队列失败：{errText(query.error)}</div>
+        <div className="flex items-center gap-2 text-body text-danger"><AlertTriangle size={15} />加载行动队列失败：{errText(query.error)}</div>
       ) : query.loading && !query.data ? (
         <div className="h-20 animate-pulse rounded-lg bg-hover" />
       ) : actionable.length === 0 ? (
-        <div className="flex items-center gap-2 text-[13px] text-muted"><Check size={15} className="text-success" />当前没有 firing 或 stale 告警。</div>
+        <div className="flex items-center gap-2 text-body text-muted"><Check size={15} className="text-success" />当前没有 firing 或 stale 告警。</div>
       ) : (
         <ul className="divide-y divide-border">
           {actionable.map((row) => {
@@ -151,13 +151,13 @@ function AlertActionQueue({
                     <Badge tone={stale || row.acked ? "warning" : "danger"}>
                       {stale ? "STALE" : row.acked ? "ACKED" : "FIRING"}
                     </Badge>
-                    <span className="break-all font-mono text-[12.5px] text-fg">{row.rule_id}</span>
+                    <span className="break-all font-mono text-meta text-fg">{row.rule_id}</span>
                   </div>
-                  <p className="mt-1 flex items-center gap-1.5 text-[12px] text-muted">
+                  <p className="mt-1 flex items-center gap-1.5 text-meta text-muted">
                     <Clock3 size={12} />持续时间 {row.last_transition_at ? <TimeAgo value={row.last_transition_at} /> : "未知"}
                   </p>
                   {stale && row.firing && (
-                    <p className="mt-1 text-[12px] text-warning">
+                    <p className="mt-1 text-meta text-warning">
                       最近一次记录为 FIRING，但已超过 {row.classification_basis.stale_after_minutes} 分钟未评估
                     </p>
                   )}
@@ -165,8 +165,8 @@ function AlertActionQueue({
                 <div className="flex flex-wrap items-center gap-2">
                   {!stale && !row.acked && <Button variant="secondary" size="sm" onClick={() => void ack(row)}>确认</Button>}
                   <Button variant="secondary" size="sm" onClick={() => onSilence(row.rule_id)}>静默</Button>
-                  {runbook && <a href={runbook} target="_blank" rel="noreferrer" className="inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-[12px] font-medium text-accent outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"><BookOpen size={13} />runbook</a>}
-                  {incidentId && <a href={`#tab=selfheal&incident_id=${encodeURIComponent(incidentId)}`} className="inline-flex h-8 items-center rounded-md px-2.5 text-[12px] font-medium text-accent outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring">事故 #{incidentId}</a>}
+                  {runbook && <a href={runbook} target="_blank" rel="noreferrer" className="inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-meta font-medium text-accent outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"><BookOpen size={13} />runbook</a>}
+                  {incidentId && <a href={`#tab=selfheal&incident_id=${encodeURIComponent(incidentId)}`} className="inline-flex h-8 items-center rounded-md px-2.5 text-meta font-medium text-accent outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring">事故 #{incidentId}</a>}
                 </div>
               </li>
             );

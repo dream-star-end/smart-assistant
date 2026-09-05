@@ -264,14 +264,37 @@ export function hasMeaningfulAutomaticRecoveryProgress(records: readonly unknown
   return progressed
 }
 
+/** Runner-loss codes that are individually recoverable (a respawn usually
+ * works) but become a self-inflicted loop when the replacement process is
+ * torn down again before producing anything. Two consecutive zero-progress
+ * losses is the signature of that loop (INC 2026-09-04: gateway recycle →
+ * SIGKILL → RUNNER_CRASHED → respawn → recycle …, 10/10 attempts burnt in
+ * 60s). One extra attempt over the silent-stall rule keeps a genuine one-off
+ * crash recoverable. */
+const RUNNER_LOSS_NO_PROGRESS_CODES = new Set([
+  'runner_crashed',
+  'service_restart',
+])
+export const RUNNER_LOSS_NO_PROGRESS_PAUSE_ATTEMPT = 2
+
+export function isRunnerLossAutomaticRecoveryError(code: string): boolean {
+  return RUNNER_LOSS_NO_PROGRESS_CODES.has(normalizeTurnErrorCode(code))
+}
+
 export function shouldPauseSilentAutomaticRecovery(input: {
   errorCode: string
   currentAttempt: number
   records: readonly unknown[]
 }): boolean {
-  return input.currentAttempt >= 1 &&
-    isSilentAutomaticRecoveryError(input.errorCode) &&
-    !hasMeaningfulAutomaticRecoveryProgress(input.records)
+  if (isSilentAutomaticRecoveryError(input.errorCode)) {
+    return input.currentAttempt >= 1 &&
+      !hasMeaningfulAutomaticRecoveryProgress(input.records)
+  }
+  if (isRunnerLossAutomaticRecoveryError(input.errorCode)) {
+    return input.currentAttempt >= RUNNER_LOSS_NO_PROGRESS_PAUSE_ATTEMPT &&
+      !hasMeaningfulAutomaticRecoveryProgress(input.records)
+  }
+  return false
 }
 
 export function shouldResetNativeSessionForRecovery(input: {

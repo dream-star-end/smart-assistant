@@ -16,6 +16,7 @@ import {
   _buildEngineErrorFrame,
   _buildTurnStatusFrame,
   _earlyRejectErrorFrames,
+  _isBlockingUserInputTool,
   _permissionRequestExpiresAt,
   _turnStatusWireFields,
   GATEWAY_PENDING_PERMISSION_TTL_MS,
@@ -188,6 +189,16 @@ describe('_buildTurnStatusFrame — 完整 wire 帧', () => {
     const fields = _turnStatusWireFields({ status: 'working', detail: 'Read foo.ts' })
     assert.deepEqual(fields, { status: 'working', detail: 'Read foo.ts' })
     assert.deepEqual(_turnStatusWireFields({ status: 'working' }), { status: 'working' })
+  })
+})
+
+describe('_isBlockingUserInputTool', () => {
+  it('AskUserQuestion and ExitPlanMode block the turn; ordinary tool approvals do not', () => {
+    assert.equal(_isBlockingUserInputTool('AskUserQuestion'), true)
+    assert.equal(_isBlockingUserInputTool('ExitPlanMode'), true)
+    assert.equal(_isBlockingUserInputTool('Bash'), false)
+    assert.equal(_isBlockingUserInputTool('Edit'), false)
+    assert.equal(_isBlockingUserInputTool('EnterPlanMode'), false)
   })
 })
 

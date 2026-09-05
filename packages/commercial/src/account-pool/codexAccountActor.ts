@@ -5,9 +5,9 @@
  *   1. setInterval 60s 扫描 `claude_accounts WHERE provider='codex' AND status='active'
  *      AND oauth_expires_at < now() + interval '15 minutes'`
  *   2. 对每个待刷新账号调 `refreshCodexAccountToken(acc.id)`(refresh.ts G3 实现)
- *   3. 成功 → 枚举 `agent_containers WHERE codex_account_id=$id AND state='active'`,
+ *   3. 成功 → 枚举 `agent_containers WHERE codex_account_id=$id AND state='active' AND runtime_kind='docker'`,
  *      为每个容器**持锁**重写 per-container `auth.json`(决策 M2 协议):
- *        BEGIN; SELECT codex_account_id, state FROM agent_containers WHERE id=$cid FOR UPDATE;
+ *        BEGIN; SELECT codex_account_id, state FROM agent_containers WHERE id=$cid AND runtime_kind='docker' FOR UPDATE;
  *        校验仍 = 本次刷新的 account_id + state='active'
  *        writeCodexContainerAuthFile(<containerDir>/<cid>/auth.json) — atomic rename
  *        COMMIT (rename 成功后 commit) — ROLLBACK (任意失败)
@@ -167,7 +167,8 @@ export function startCodexRefreshActor(deps: CodexRefreshActorDeps): CodexRefres
         // P1d 防御:按 channel(codex actor 受 controlPlaneEnabled gate,v5 不跑;codex 下线见 P1f)。
         `SELECT id::text AS id
          FROM agent_containers
-         WHERE codex_account_id = $1 AND state = 'active' AND runtime_channel = $2`,
+         WHERE codex_account_id = $1 AND state = 'active' AND runtime_channel = $2
+           AND runtime_kind = 'docker'`,
         [String(accountId), getRuntimeChannel()],
       )
       if (containerRes.rows.length === 0) return
@@ -214,7 +215,7 @@ export function startCodexRefreshActor(deps: CodexRefreshActorDeps): CodexRefres
       const lockRes = await client.query<ContainerLockRow>(
         `SELECT codex_account_id::text AS codex_account_id, state, host_uuid::text AS host_uuid
          FROM agent_containers -- state selected above; caller skips non-active under lock
-         WHERE id = $1 AND runtime_channel = $2
+         WHERE id = $1 AND runtime_channel = $2 AND runtime_kind = 'docker'
          FOR UPDATE`,
         [containerId, getRuntimeChannel()],
       )

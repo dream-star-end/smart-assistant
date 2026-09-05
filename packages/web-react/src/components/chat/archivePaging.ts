@@ -81,8 +81,8 @@ export function captureVisibleVirtualRowAnchor(
   };
 }
 
-/** Re-align one exact immutable virtual row. Returns false while Virtuoso has
- * not mounted/measured that row yet, allowing the caller to retry next frame. */
+/** Re-align one exact immutable virtual row. Returns false while the windowed
+ * timeline renderer has not mounted/measured that row yet, allowing retry. */
 /** The chat stick-to-bottom controller is the only programmatic writer. */
 export type ScrollTopWriter = (scroller: HTMLElement, nextTop: number) => void;
 
@@ -95,8 +95,8 @@ export function correctToVisibleVirtualRowAnchor(
     scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
   ).find((candidate) => candidate.getAttribute("data-chat-virtual-key") === anchor.key);
   if (!row) {
-    // A large prepend can temporarily move the anchor outside Virtuoso's
-    // mounted range before its per-row measurements settle. Move by the
+    // A large prepend can temporarily move the anchor outside the windowed
+    // renderer's mounted range before paint-window measurement settles. Move by the
     // observed total-height delta as a bootstrap only; subsequent frames use
     // the exact immutable row as soon as it remounts. This is not the final
     // correction, so concurrent bottom growth cannot permanently skew it.
@@ -114,7 +114,7 @@ export function correctToVisibleVirtualRowAnchor(
 
 type FrameScheduler = (callback: () => void) => void;
 
-/** Repeat row correction while Virtuoso finishes measuring. Real user input
+/** Repeat row correction while the windowed renderer finishes measuring. Real user input
  * is supplied separately through `cancelled`, so programmatic scroll events
  * do not mask a later wheel/touch/keyboard decision. */
 export function restoreVisibleVirtualRowAnchor(
@@ -139,9 +139,10 @@ export function restoreVisibleVirtualRowAnchor(
       scroller.classList.remove("chat-anchor-restoring");
       resolve();
     };
-    // Ordinary DOM rows (no Virtuoso data-index) can receive a late paint-window
-    // layout shift after the first apparent plateau. Keep a longer proof window;
-    // indexed virtual rows retain the historical two-frame contract.
+    // Ordinary DOM rows (no virtualizer data-index wrapper; the current windowed
+    // renderer never writes one) can receive a late paint-window layout shift after
+    // the first apparent plateau. Keep a longer proof window; rows that do carry a
+    // data-index retain the historical two-frame contract.
     const requiredStableFrames = anchor.dataIndex === null ? 4 : 2;
     let observedPrependLayout = false;
     let lastBeforeTop: number | null = null;
@@ -159,11 +160,12 @@ export function restoreVisibleVirtualRowAnchor(
         ? beforeRow.getBoundingClientRect().top - scroller.getBoundingClientRect().top
         : null;
       const beforeDataIndex = beforeRow ? virtualRowDataIndex(beforeRow) : null;
-      // react-virtuoso writes each mounted row's current data-array position to
-      // its outer `data-index` wrapper. A real prepend moves the same immutable
-      // row to a higher data index; bottom/live growth leaves it unchanged.
-      // This is direct DOM evidence that Virtuoso accepted the older page,
-      // unlike itemsRendered which need not fire when the visible set is stable.
+      // A virtualizer that writes each mounted row's current data-array position
+      // to an outer `data-index` wrapper lets a real prepend move the same
+      // immutable row to a higher data index, while bottom/live growth leaves it
+      // unchanged. The current自研窗口化渲染器不写 data-index(anchor.dataIndex 恒为
+      // null),此证据路径保留给将来再引入会写 data-index 的列表层;没有它时落到下方
+      // 的 top 稳定证明窗,同样能区分前插与底部生长。
       const rowReindexed =
         anchor.dataIndex !== null &&
         beforeDataIndex !== null &&
@@ -192,8 +194,8 @@ export function restoreVisibleVirtualRowAnchor(
       }
       lastBeforeTop = beforeTop;
 
-      // On a slow renderer Virtuoso can still be applying its own measured
-      // prepend deviation. Writing scrollTop every frame while that value is
+      // On a slow renderer the windowing layer can still be applying its own
+      // measured prepend deviation. Writing scrollTop every frame while that value is
       // moving creates a ± one-row feedback loop. Wait for the unmodified row
       // position to form a two-frame plateau, then make one exact correction.
       if (!observedPrependLayout || beforeTopStableFrames < 2) {

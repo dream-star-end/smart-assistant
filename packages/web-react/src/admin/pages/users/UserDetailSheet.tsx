@@ -114,10 +114,10 @@ export function UserDetailSheet({
       {/* 头部 */}
       <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border px-5">
         <div className="min-w-0">
-          <p className="truncate text-[14px] font-semibold text-fg">
+          <p className="truncate text-title font-semibold text-fg">
             {u?.email || (userId ? `用户 #${userId}` : '用户详情')}
           </p>
-          {u && <p className="truncate text-[11.5px] text-faint">#{u.id}</p>}
+          {u && <p className="truncate text-caption text-faint">#{u.id}</p>}
         </div>
         <Button variant="ghost" size="sm" onClick={onClose}>
           关闭
@@ -132,7 +132,7 @@ export function UserDetailSheet({
             ))}
           </div>
         ) : detail.error ? (
-          <div className="rounded-lg border border-danger/40 bg-danger-soft px-4 py-6 text-center text-[13px] text-danger">
+          <div className="rounded-lg border border-danger/40 bg-danger-soft px-4 py-6 text-center text-body text-danger">
             加载失败：{errMsg(detail.error)}
           </div>
         ) : u ? (
@@ -290,7 +290,7 @@ export function UserDetailSheet({
                   )}
                 </div>
                 <div className="flex items-center justify-between rounded-lg bg-hover px-3 py-2">
-                  <span className="text-[12.5px] text-muted">标记邮箱已验证</span>
+                  <span className="text-meta text-muted">标记邮箱已验证</span>
                   <Switch
                     checked={u.email_verified}
                     disabled={busy}
@@ -335,15 +335,15 @@ export function UserDetailSheet({
               {grants.loading && !grants.data ? (
                 <div className="h-10 w-full animate-pulse rounded-lg bg-hover" />
               ) : grants.error ? (
-                <p className="text-[12.5px] text-danger">加载失败：{errMsg(grants.error)}</p>
+                <p className="text-meta text-danger">加载失败：{errMsg(grants.error)}</p>
               ) : (grants.data?.rows.length ?? 0) === 0 ? (
-                <p className="text-[12.5px] text-faint">无额外模型授权</p>
+                <p className="text-meta text-faint">无额外模型授权</p>
               ) : (
                 <ul className="flex flex-col divide-y divide-border/60">
                   {grants.data?.rows.map((g) => (
                     <li key={g.id} className="flex items-center justify-between gap-2 py-2">
-                      <code className="truncate text-[12.5px] text-fg">{g.model_id}</code>
-                      <TimeAgo value={g.granted_at} className="shrink-0 text-[11.5px] text-faint" />
+                      <code className="truncate text-meta text-fg">{g.model_id}</code>
+                      <TimeAgo value={g.granted_at} className="shrink-0 text-caption text-faint" />
                     </li>
                   ))}
                 </ul>
@@ -359,7 +359,7 @@ export function UserDetailSheet({
               {(t) => (
                 <div
                   key={t.id}
-                  className="flex items-center justify-between gap-3 py-1.5 text-[12.5px]"
+                  className="flex items-center justify-between gap-3 py-1.5 text-meta"
                 >
                   <span className="shrink-0 text-faint tabular-nums">
                     {fmtDateTime(t.created_at)}
@@ -381,7 +381,7 @@ export function UserDetailSheet({
               {(r) => (
                 <div
                   key={r.id}
-                  className="flex items-center justify-between gap-3 py-1.5 text-[12.5px]"
+                  className="flex items-center justify-between gap-3 py-1.5 text-meta"
                 >
                   <span className="shrink-0 text-faint tabular-nums">
                     {fmtDateTime(r.created_at)}
@@ -408,7 +408,7 @@ export function UserDetailSheet({
                   key={s.session_id}
                   onClick={() => setViewingSession(s)}
                   aria-label={`查看会话：${s.title || s.session_id}`}
-                  className="-mx-2 flex w-[calc(100%+1rem)] items-center justify-between gap-3 rounded-lg px-2 py-2 text-left text-[12.5px] outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+                  className="-mx-2 flex w-[calc(100%+1rem)] items-center justify-between gap-3 rounded-lg px-2 py-2 text-left text-meta outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   <MessageSquareText size={14} className="shrink-0 text-accent" />
                   <span className="min-w-0 flex-1 truncate text-fg" title={s.title}>
@@ -450,7 +450,7 @@ function MiniTableCard<T>({
   return (
     <SectionCard title={title} bodyClassName="py-2">
       {rows.length === 0 ? (
-        <p className="py-1 text-[12.5px] text-faint">{empty}</p>
+        <p className="py-1 text-meta text-faint">{empty}</p>
       ) : (
         <div className="flex flex-col divide-y divide-border/60">
           {rows.map((r) => children(r))}

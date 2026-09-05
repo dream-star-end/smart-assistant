@@ -270,7 +270,7 @@ export function InboxDialog({
       {/* 头部：铃铛 + 标题 + 未读数 + 全部已读 + 关闭 */}
       <div className="flex items-center gap-2 border-b border-border px-4 py-3">
         <Bell size={17} className="shrink-0 text-muted" />
-        <span className="text-[15px] font-semibold text-fg">站内信</span>
+        <span className="text-title font-semibold text-fg">站内信</span>
         {unreadCount > 0 && <Badge tone="danger">{unreadCount}</Badge>}
         <div className="ml-auto flex items-center gap-0.5">
           <Button
@@ -291,7 +291,7 @@ export function InboxDialog({
 
       {markAllErr && (
         <div className="px-4 pt-3">
-          <Alert tone="danger" className="text-[12.5px]">
+          <Alert tone="danger" className="text-meta">
             {markAllErr}
           </Alert>
         </div>
@@ -322,7 +322,7 @@ export function InboxDialog({
           <SkeletonRows />
         ) : err ? (
           <div className="flex flex-col items-center gap-3 px-5 py-14 text-center">
-            <p className="text-[13px] text-danger">{err}</p>
+            <p className="text-body text-danger">{err}</p>
             <Button variant="secondary" size="sm" onClick={retry}>
               重试
             </Button>
@@ -457,7 +457,7 @@ function InboxItem({
               {m.title}
             </span>
             <span
-              className="shrink-0 pt-0.5 text-[11px] tabular-nums text-faint"
+              className="shrink-0 pt-0.5 text-caption tabular-nums text-faint"
               title={fmtAbsTime(m.created_at)}
             >
               {fmtRelativeTime(m.created_at)}
@@ -471,12 +471,12 @@ function InboxItem({
           <span className="mt-2 flex min-h-5 flex-wrap items-center gap-1.5">
             <Badge tone={meta.tone}>{meta.label}</Badge>
             {hasImage && (
-              <span className="inline-flex items-center gap-1 text-[11px] text-faint">
+              <span className="inline-flex items-center gap-1 text-caption text-faint">
                 <ImageIcon size={12} /> 图片
               </span>
             )}
             {hasChart && (
-              <span className="inline-flex items-center gap-1 text-[11px] text-faint">
+              <span className="inline-flex items-center gap-1 text-caption text-faint">
                 <BarChart3 size={12} /> 图表
               </span>
             )}

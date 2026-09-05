@@ -1,7 +1,7 @@
 import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { api } from '../../../lib/api'
+import { adminApi } from '../../../lib/api/admin'
 import type { CommunityTutorialPending } from '../../../lib/types'
 import TutorialReviewPage from './index'
 
@@ -21,14 +21,14 @@ const pending: CommunityTutorialPending = {
 }
 
 beforeEach(() => {
-  vi.spyOn(api, 'adminPendingCommunityTutorials').mockResolvedValue({
+  vi.spyOn(adminApi, 'adminPendingCommunityTutorials').mockResolvedValue({
     tutorials: [pending],
     nextCursor: null,
   })
-  vi.spyOn(api, 'adminReviewCommunityTutorial').mockResolvedValue({ ok: true })
-  vi.spyOn(api, 'listTutorialEvalSpecs').mockResolvedValue({ specs: [], nextCursor: null })
-  vi.spyOn(api, 'listTutorialEvalJobs').mockResolvedValue({ jobs: [], nextCursor: null })
-  vi.spyOn(api, 'listTutorialEvalCompass').mockResolvedValue({ items: [], nextCursor: null })
+  vi.spyOn(adminApi, 'adminReviewCommunityTutorial').mockResolvedValue({ ok: true })
+  vi.spyOn(adminApi, 'listTutorialEvalSpecs').mockResolvedValue({ specs: [], nextCursor: null })
+  vi.spyOn(adminApi, 'listTutorialEvalJobs').mockResolvedValue({ jobs: [], nextCursor: null })
+  vi.spyOn(adminApi, 'listTutorialEvalCompass').mockResolvedValue({ items: [], nextCursor: null })
 })
 
 afterEach(() => {
@@ -47,7 +47,7 @@ describe('TutorialReviewPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '审核通过并上线' }))
 
     await waitFor(() =>
-      expect(api.adminReviewCommunityTutorial).toHaveBeenCalledWith(
+      expect(adminApi.adminReviewCommunityTutorial).toHaveBeenCalledWith(
         expect.anything(),
         pending.id,
         'approve',
@@ -58,7 +58,7 @@ describe('TutorialReviewPage', () => {
   })
 
   it('会话快照投稿显示 badge 和清单统计，不当纯 Markdown 审', async () => {
-    vi.mocked(api.adminPendingCommunityTutorials).mockResolvedValue({
+    vi.mocked(adminApi.adminPendingCommunityTutorials).mockResolvedValue({
       tutorials: [
         {
           ...pending,
@@ -87,7 +87,7 @@ describe('TutorialReviewPage', () => {
     fireEvent.click(reject)
 
     await waitFor(() =>
-      expect(api.adminReviewCommunityTutorial).toHaveBeenCalledWith(
+      expect(adminApi.adminReviewCommunityTutorial).toHaveBeenCalledWith(
         expect.anything(),
         pending.id,
         'reject',

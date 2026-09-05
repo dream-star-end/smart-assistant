@@ -13,12 +13,16 @@ import { classifyMediaRef, needsSignedSrc, type ResolvedMedia } from "../../lib/
 import { PRODUCT_CAPABILITIES } from "../../lib/productCapabilities";
 import { useImageEditActions } from "./imageEditActions";
 import {
+  DOWNLOAD_STREAM_MAX_BYTES,
   downloadPercent,
+  fileCardSniffEnabled,
   formatBytes,
   nativeDownload,
   pickDownloadStrategy,
   saveBlob,
+  sniffOfficeOrPdfMagic,
 } from "../../lib/chat/download";
+import { reportClientFriction } from "../../lib/clientFriction";
 import { cn } from "../../lib/utils";
 import { authScopedImageIdentity, pickThumbnailWidth } from "../../lib/chat/imageBytes";
 import { useProgressiveImage } from "../../lib/chat/useProgressiveImage";
@@ -473,6 +477,31 @@ type DownloadState =
  * fetch 拿到 410(过期)/403(签名失效) → 强制重签一次再试(服务端裁决优先于本地缓存钟)。
  * 其余异常 → error 态（重试 + 直接下载兜底,两者同样走点击时签名）。
  */
+function artifactDownloadFriction(
+  code: "EMPTY_OR_MAGIC" | "RESIGN" | "EXPIRED" | "SAVE",
+  outcome: "failed" | "recovered" | "succeeded",
+  filename: string,
+): void {
+  const ext = (filename.split(".").pop() || "").toLowerCase();
+  reportClientFriction({
+    surface: "artifacts",
+    stage: "download",
+    code,
+    outcome,
+    entitySlug: /^[a-z0-9]{1,10}$/.test(ext) ? ext : undefined,
+  });
+}
+
+function concatChunks(chunks: Uint8Array[], total: number): Uint8Array {
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged;
+}
+
 export function useSignedDownload(src: string | null, name: string) {
   const { get } = useFreshSignedUrl(src);
   const [state, setState] = useState<DownloadState>({ phase: "idle" });
@@ -487,21 +516,47 @@ export function useSignedDownload(src: string | null, name: string) {
     const controller = new AbortController();
     abortRef.current = controller;
     setState({ phase: "downloading", loaded: 0, total: null });
+    const sniff = fileCardSniffEnabled();
     try {
       let url = await get();
       if (!url) throw new Error("sign failed");
       let res = await fetch(url, { signal: controller.signal });
+      let didResign = false;
       if (res.status === 410 || res.status === 403) {
         const resigned = await get({ forceResign: true });
         if (resigned) {
+          didResign = true;
           url = resigned;
           res = await fetch(url, { signal: controller.signal });
         }
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (sniff && didResign && res.ok) artifactDownloadFriction("RESIGN", "recovered", name);
+      if (!res.ok) {
+        if (sniff && didResign) artifactDownloadFriction("EXPIRED", "failed", name);
+        throw new Error(`HTTP ${res.status}`);
+      }
       const total = Number(res.headers.get("content-length")) || null;
-      // 尺寸决策：仅 3MB~100MB 走流式；其余(小/超大/未知/无流)交原生 <a download>。
+      const type = res.headers.get("content-type") || "application/octet-stream";
+      const finishBytes = (bytes: Uint8Array, mime: string) => {
+        if (sniff) {
+          const verdict = sniffOfficeOrPdfMagic(bytes, name);
+          if (!verdict.ok) {
+            artifactDownloadFriction("EMPTY_OR_MAGIC", "failed", name);
+            throw new Error(`magic ${verdict.reason}`);
+          }
+        }
+        saveBlob(new Blob([bytes as BlobPart], { type: mime }), name);
+        if (sniff) artifactDownloadFriction("SAVE", "succeeded", name);
+        setState({ phase: "idle" });
+      };
+      // sniff 开：小文件读第一次 200 body 直接 saveBlob，禁止 abort 后再 native GET（会漏嗅 410 JSON）。
+      // ≥100MB 仍交原生，避免整包进 JS 内存。flag 关：字节级走现网 abort+nativeDownload。
       if (pickDownloadStrategy(total) === "native" || !res.body) {
+        if (sniff && (total == null || total < DOWNLOAD_STREAM_MAX_BYTES) && res.arrayBuffer) {
+          const bytes = new Uint8Array(await res.arrayBuffer());
+          finishBytes(bytes, type);
+          return;
+        }
         controller.abort(); // 放弃流式：小文件几乎未下正文；超大文件不入 JS 内存
         setState({ phase: "idle" });
         nativeDownload(url, name);
@@ -519,7 +574,10 @@ export function useSignedDownload(src: string | null, name: string) {
           setState({ phase: "downloading", loaded, total });
         }
       }
-      const type = res.headers.get("content-type") || "application/octet-stream";
+      if (sniff) {
+        finishBytes(concatChunks(chunks, loaded), type);
+        return;
+      }
       saveBlob(new Blob(chunks as BlobPart[], { type }), name);
       setState({ phase: "idle" });
     } catch {
@@ -537,9 +595,14 @@ export function useSignedDownload(src: string | null, name: string) {
 
   /** 「直接下载」逃生门(iOS blob 异常等不可检测场景):同样点击时签名后交原生下载。 */
   const direct = useCallback(async () => {
+    // sniff 开时不能绕过魔数走原生 GET，否则 410 JSON 仍会存成 .docx。
+    if (fileCardSniffEnabled()) {
+      await start();
+      return;
+    }
     const url = await get();
     if (url) nativeDownload(url, name);
-  }, [get, name]);
+  }, [get, name, start]);
 
   return { state, start, cancel, direct };
 }
@@ -558,7 +621,7 @@ export function SignedFileCard({ src, filename }: { src?: string; filename?: str
       <FileText size={16} />
     </span>
   );
-  const nameLabel = <span className="min-w-0 flex-1 truncate text-[13px] text-fg">{name}</span>;
+  const nameLabel = <span className="min-w-0 flex-1 truncate text-body text-fg">{name}</span>;
 
   // 未签名(容器冷启)：占位，不可点。
   if (!resolved) {
@@ -602,7 +665,7 @@ export function SignedFileCard({ src, filename }: { src?: string; filename?: str
               style={pct != null ? { width: `${pct}%` } : undefined}
             />
           </span>
-          <span className="shrink-0 text-[11px] tabular-nums text-muted">
+          <span className="shrink-0 text-caption tabular-nums text-muted">
             {pct != null ? `${pct}%` : formatBytes(state.loaded)}
           </span>
         </span>
@@ -620,7 +683,7 @@ export function SignedFileCard({ src, filename }: { src?: string; filename?: str
           </span>
           {nameLabel}
         </span>
-        <span className="flex items-center gap-3 pl-[42px] text-[12px]">
+        <span className="flex items-center gap-3 pl-[42px] text-meta">
           <span className="text-danger">下载失败</span>
           <button
             type="button"
@@ -630,12 +693,13 @@ export function SignedFileCard({ src, filename }: { src?: string; filename?: str
             <RotateCcw size={12} /> 重试
           </button>
           <a
-            href={resolved}
-            download={name}
-            target="_blank"
+            href="#"
             rel="noreferrer"
             onClick={(e) => {
-              // 点击时重签后交原生下载;href 仅留给"右键/长按另存"语义。
+              e.preventDefault();
+              void direct();
+            }}
+            onContextMenu={(e) => {
               e.preventDefault();
               void direct();
             }}
@@ -648,18 +712,20 @@ export function SignedFileCard({ src, filename }: { src?: string; filename?: str
     );
   }
 
-  // idle：拦截点击 → start()（内部按尺寸决定流式或原生兜底）。
+  // idle：href 不暴露挂载态 signed URL（右键/长按另存会拿到 5min 后的 410 JSON）。
+  // 左键/右键/辅助键一律走 start()（点击时重签）。
+  const beginDownload = (e: React.MouseEvent) => {
+    e.preventDefault();
+    void start();
+  };
   return (
     <a
       data-product-feature={PRODUCT_CAPABILITIES.artifacts.id}
-      href={resolved}
-      download={name}
-      target="_blank"
+      href="#"
       rel="noreferrer"
-      onClick={(e) => {
-        e.preventDefault();
-        void start();
-      }}
+      onClick={beginDownload}
+      onContextMenu={beginDownload}
+      onAuxClick={beginDownload}
       className="my-1.5 inline-flex max-w-full items-center gap-2.5 rounded-lg border border-border bg-surface px-3 py-2 no-underline transition-colors hover:border-border-strong hover:bg-hover"
     >
       {fileIcon}

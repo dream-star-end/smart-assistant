@@ -25,6 +25,7 @@ import { ChatHeader } from "../src/components/ChatHeader";
 import { Composer } from "../src/components/Composer";
 import { MessageList } from "../src/components/MessageRenderer";
 import { createStickToBottomController } from "../src/components/chat/stickToBottom";
+import { attachWheelFence } from "../src/components/chat/wheelFence";
 import type { Agent } from "../src/lib/agents";
 import type { MediaRef } from "../src/lib/chat/frames";
 import type { ChatMessage } from "../src/lib/chat/model";
@@ -37,6 +38,9 @@ declare global {
       sends: Array<{ text: string; mediaCount: number }>;
       following: boolean;
       directManipulation: boolean;
+      wheelFence: boolean;
+      /** 程序化 scrollTop 写入计数(controller 是唯一写手;T63 断言滚轮期间为 0)。 */
+      programmaticWrites: number;
       armSticky: () => void;
       growTimeline: () => void;
       attemptViewportCorrection: (delta: number) => void;
@@ -49,6 +53,8 @@ window.__mobilePage = {
   sends: [],
   following: true,
   directManipulation: false,
+  wheelFence: false,
+  programmaticWrites: 0,
   armSticky: () => {},
   growTimeline: () => {},
   attemptViewportCorrection: () => {},
@@ -129,6 +135,37 @@ function MobileChatPage() {
     window.__mobilePage.following = stick.following.current;
     window.__mobilePage.directManipulation = stick.directManipulation.current;
   }, [stick]);
+  // 篱笆标志按实时值读:释放由原生 timer/scrollend 触发,不经过任何 React 事件,
+  // 靠 syncFollowing 快照会读到过期值。
+  useLayoutEffect(() => {
+    Object.defineProperty(window.__mobilePage, "wheelFence", {
+      configurable: true,
+      get: () => stick.wheelFence.current,
+    });
+  }, [stick]);
+  // 与 App.tsx 同一份滚轮篱笆接线(共享 attachWheelFence),真浏览器 T63 守的就是它。
+  useLayoutEffect(() => {
+    if (!scroller) return;
+    return attachWheelFence(scroller, stick);
+  }, [scroller, stick]);
+  // 统计 controller 之外无人写 scrollTop:把 scroller 的 scrollTop setter 包一层,
+  // 只在非用户手势(篱笆已起)期间计数。用户滚轮本身由合成线程滚动,不经过 setter。
+  useLayoutEffect(() => {
+    if (!scroller) return;
+    const desc = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+    if (!desc?.set || !desc.get) return;
+    Object.defineProperty(scroller, "scrollTop", {
+      configurable: true,
+      get() { return desc.get!.call(this); },
+      set(v: number) {
+        if (stick.wheelFence.current || stick.directManipulation.current) {
+          window.__mobilePage.programmaticWrites += 1;
+        }
+        desc.set!.call(this, v);
+      },
+    });
+    return () => { delete (scroller as { scrollTop?: unknown }).scrollTop; };
+  }, [scroller, stick]);
   window.__mobilePage.armSticky = () => {
     if (!scroller) return;
     stick.scrollToBottom(scroller);

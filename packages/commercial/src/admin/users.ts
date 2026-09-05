@@ -351,6 +351,7 @@ export async function listUsersWithStats(
        SELECT user_id, COUNT(*) AS n
        FROM agent_containers
        WHERE state = 'active' AND subscription_id IS NULL
+         AND runtime_kind = 'docker'
          AND user_id = ANY($1::bigint[])
        GROUP BY user_id
      ),
@@ -361,6 +362,7 @@ export async function listUsersWithStats(
        SELECT user_id, COUNT(*) AS n
        FROM agent_containers
        WHERE status = 'running' AND subscription_id IS NOT NULL
+         AND runtime_kind = 'docker'
          AND user_id = ANY($1::bigint[])
        GROUP BY user_id
      )

@@ -1636,6 +1636,8 @@ export interface AdmitUserTurnInput {
   };
   leaseTtlMs?: number;
   now?: number;
+  agentContainerId?: number | null;
+  runtimeKind?: string | null;
 }
 
 export type AdmitUserTurnResult =
@@ -8469,6 +8471,8 @@ export function createPgSessionsBackend(
           anchorSeq,
           ...(input.leaseTtlMs !== undefined ? { leaseTtlMs: input.leaseTtlMs } : {}),
           ...(input.now !== undefined ? { now: input.now } : {}),
+          ...(input.agentContainerId !== undefined ? { agentContainerId: input.agentContainerId } : {}),
+          ...(input.runtimeKind !== undefined ? { runtimeKind: input.runtimeKind } : {}),
         });
         if (input.recoveryJob) {
           const bound = await bindRecoveryJobDispatch(client, {
@@ -11850,7 +11854,7 @@ export function createPgSessionsBackend(
 
     async createChatProject(
       userId: string,
-      input: { name?: unknown; instructions?: unknown; color?: unknown },
+      input: { name?: unknown; instructions?: unknown; color?: unknown; isResearchDefault?: unknown },
     ): Promise<ChatProjectCreateResult> {
       const name = parseChatProjectName(input.name);
       if (!name) return { ok: false, error: "invalid_name" };
@@ -11858,6 +11862,7 @@ export function createPgSessionsBackend(
       if ("invalid" in instructions) return { ok: false, error: "invalid_instructions" };
       const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX);
       if ("invalid" in color) return { ok: false, error: "invalid_color" };
+      const isDefault = input.isResearchDefault === true;
       const id = randomUUID();
       return withTx(pool, async (client) => {
         const countRow = (
@@ -11869,20 +11874,39 @@ export function createPgSessionsBackend(
         if (Number(countRow?.n ?? 0) >= CHAT_PROJECT_PER_USER_LIMIT) {
           return { ok: false, error: "limit_exceeded" };
         }
-        await client.query(
-          `INSERT INTO chat_projects
-             (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at)
-           VALUES ($1, $2, $3, $4, $5, COALESCE((
-             SELECT MAX(sort_order) + 1 FROM chat_projects WHERE user_id = $2 AND deleted_at IS NULL
-           ), 0), ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, NULL)`,
-          [
-            id,
-            userId,
-            name,
-            instructions.present ? instructions.value : null,
-            color.present ? color.value : null,
-          ],
-        );
+        try {
+          await client.query(
+            `INSERT INTO chat_projects
+               (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at, is_research_default)
+             VALUES ($1, $2, $3, $4, $5, COALESCE((
+               SELECT MAX(sort_order) + 1 FROM chat_projects WHERE user_id = $2 AND deleted_at IS NULL
+             ), 0), ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, NULL, $6)`,
+            [
+              id,
+              userId,
+              name,
+              instructions.present ? instructions.value : null,
+              color.present ? color.value : null,
+              isDefault,
+            ],
+          );
+        } catch (err) {
+          const code = (err as { code?: string } | undefined)?.code;
+          if (isDefault && code === "23505") {
+            const existing = (
+              await client.query<{ id: string }>(
+                `SELECT id FROM chat_projects
+                  WHERE user_id = $1 AND is_research_default IS TRUE AND deleted_at IS NULL`,
+                [userId],
+              )
+            ).rows[0];
+            if (existing) {
+              const project = await readPgChatProject(client, userId, existing.id);
+              if (project) return { ok: true, project };
+            }
+          }
+          throw err;
+        }
         const project = await readPgChatProject(client, userId, id);
         if (!project) throw new Error("chat project insert vanished");
         return { ok: true, project };

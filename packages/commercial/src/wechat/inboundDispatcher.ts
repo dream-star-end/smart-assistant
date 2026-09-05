@@ -7,7 +7,9 @@
  * 编排成下面一串副作用:
  *
  *   0. 命令短路:text 以 "/" 开头 → 本地反射回 "暂不支持命令" 文案,**不**触容器
- *   1. resolveContainerEndpoint(uid) — cold-start 抛 ContainerUnreadyError → 反射 "正在唤醒,稍等几秒"
+ *   1. resolveContainerEndpoint(uid) — docker-only. Desktop / desktop_offline
+ *      is audited and falls back to fallbackDockerEnsure; leftover desktop
+ *      never becomes SSRF or cold_start. Other ContainerUnreadyError → 反射 "正在唤醒,稍等几秒"
  *   2. pointer lookup:`getCurrentSessionId(pgPool, bindingUserId)`;null → allocate new `wsess-…`
  *   3. **Step 1**:POST 容器 `/internal/v3/wechat-inbound`(带 HMAC nonce + container-id 头);
  *      容器侧 handler 单调原子地做 (a) `INSERT OR IGNORE client_sessions` row + (b) 构造
@@ -217,7 +219,7 @@ export type StopOutcome = { kind: "command_echo"; reply: string; interrupted: bo
  */
 export interface ContainerTransport {
   post(
-    endpoint: { host: string; port: number; tunnel?: unknown },
+    endpoint: { host: string; port: number; tunnel?: unknown; containerId?: number },
     path: string,
     headers: Record<string, string>,
     bodyJson: string,
@@ -230,7 +232,7 @@ export interface ContainerTransport {
    */
   request?(
     method: "GET" | "POST",
-    endpoint: { host: string; port: number; tunnel?: unknown },
+    endpoint: { host: string; port: number; tunnel?: unknown; containerId?: number },
     path: string,
     headers: Record<string, string>,
     bodyJson: string | null,
@@ -262,6 +264,16 @@ export type PrepareWechatCodexTurnResult =
 export interface InboundDispatcherDeps {
   pgPool: PgConn
   resolveContainerEndpoint: ResolveContainerEndpoint
+  /**
+   * Docker-only fallback used when the primary resolver returns a desktop
+   * endpoint or throws `desktop_offline`. Production injects the same
+   * `sharedEnsureRunning` singleflight as WeChat/QQ's primary resolver so a
+   * hijacked desktop-preferring primary still lands on cloud docker.
+   *
+   * Omit in tests that want fail-closed (transport_failed, never cold_start
+   * `desktop_offline`).
+   */
+  fallbackDockerEnsure?: ResolveContainerEndpoint
   /** master 的 bridge HMAC root secret(载于 `/var/lib/openclaude/.v3-bridge-secret`)。 */
   bridgeSecret: string
   /**
@@ -423,10 +435,24 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       }
 
       // ── 1) endpoint 解析 + cold-start UX ──────────────────────────────
+      // Desktop endpoints / desktop_offline must not become SSRF (desktop-reverse)
+      // or a "正在唤醒" cold_start while the cloud docker container is healthy.
       let endpoint
       try {
-        endpoint = await deps.resolveContainerEndpoint(BigInt(evt.bindingUserId))
+        endpoint = await resolveInboundDockerEndpoint(deps, BigInt(evt.bindingUserId), reqLog)
       } catch (err) {
+        if (isDesktopInboundForbidden(err)) {
+          reqLog.error("inbound_desktop_hijack_fail_closed", {
+            errMessage: (err as Error)?.message ?? String(err),
+            reason: desktopInboundReason(err),
+          })
+          return {
+            kind: "transport_failed",
+            phase: "step1",
+            retryable: true,
+            errMessage: "desktop_not_allowed_for_inbound",
+          }
+        }
         if (isContainerUnreadyError(err)) {
           reqLog.info("cold_start", { reason: err.reason, retryAfterSec: err.retryAfterSec })
           return {
@@ -867,8 +893,19 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
 
       let endpoint
       try {
-        endpoint = await deps.resolveContainerEndpoint(BigInt(evt.bindingUserId))
+        endpoint = await resolveInboundDockerEndpoint(deps, BigInt(evt.bindingUserId), reqLog)
       } catch (err) {
+        if (isDesktopInboundForbidden(err)) {
+          reqLog.error("stop_inbound_desktop_hijack_fail_closed", {
+            errMessage: (err as Error)?.message ?? String(err),
+            reason: desktopInboundReason(err),
+          })
+          return {
+            kind: "command_echo",
+            interrupted: false,
+            reply: "中断指令暂时发送失败，请稍后重试；也可以打开实时过程链接在网页端停止。",
+          }
+        }
         if (isContainerUnreadyError(err)) {
           return {
             kind: "command_echo",
@@ -1144,6 +1181,68 @@ function isContainerUnreadyError(err: unknown): err is ContainerUnreadyError {
     typeof (err as { retryAfterSec?: unknown }).retryAfterSec === "number" &&
     typeof (err as { reason?: unknown }).reason === "string"
   )
+}
+
+const DESKTOP_INBOUND_FORBIDDEN_REASONS = new Set([
+  "desktop_offline",
+  "desktop_not_allowed_for_inbound",
+])
+
+function desktopInboundReason(err: unknown): string | undefined {
+  if (isContainerUnreadyError(err) && DESKTOP_INBOUND_FORBIDDEN_REASONS.has(err.reason)) {
+    return err.reason
+  }
+  if (
+    err instanceof Error
+    && (err as unknown as { code?: string }).code === "desktop_not_allowed_for_inbound"
+  ) {
+    return "desktop_not_allowed_for_inbound"
+  }
+  return undefined
+}
+
+function isDesktopInboundForbidden(err: unknown): boolean {
+  return desktopInboundReason(err) !== undefined
+}
+
+function rejectDesktopInboundEndpoint(
+  endpoint: Awaited<ReturnType<ResolveContainerEndpoint>>,
+  reqLog: Logger,
+): void {
+  if (!endpoint.desktop) return
+  reqLog.warn("inbound_desktop_endpoint_rejected", {
+    containerId: endpoint.desktop.containerId,
+    host: endpoint.host,
+  })
+  throw Object.assign(new Error("desktop_not_allowed_for_inbound"), {
+    code: "desktop_not_allowed_for_inbound",
+  })
+}
+
+/**
+ * Channel inbound must resolve a docker endpoint. If the primary resolver is
+ * still the desktop-preferring selector (composition-root hijack), audit and
+ * fall back to docker ensure instead of SSRF / desktop_offline cold_start.
+ */
+async function resolveInboundDockerEndpoint(
+  deps: InboundDispatcherDeps,
+  uid: bigint,
+  reqLog: Logger,
+): Promise<Awaited<ReturnType<ResolveContainerEndpoint>>> {
+  const run = async (resolver: ResolveContainerEndpoint): Promise<Awaited<ReturnType<ResolveContainerEndpoint>>> => {
+    const endpoint = await resolver(uid)
+    rejectDesktopInboundEndpoint(endpoint, reqLog)
+    return endpoint
+  }
+  try {
+    return await run(deps.resolveContainerEndpoint)
+  } catch (err) {
+    if (!isDesktopInboundForbidden(err) || !deps.fallbackDockerEnsure) throw err
+    reqLog.warn("inbound_fallback_docker_after_desktop", {
+      reason: desktopInboundReason(err),
+    })
+    return await run(deps.fallbackDockerEnsure)
+  }
 }
 
 /**

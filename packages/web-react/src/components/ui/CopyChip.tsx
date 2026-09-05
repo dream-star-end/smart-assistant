@@ -6,7 +6,7 @@ import { Tooltip } from "./Tooltip";
 /**
  * 点击复制芯片:复制成功短暂显 ✓,悬停提示当前动作。
  * 用于 UUID / token / 订单号 / 短码这类"给用户看一眼、真正用途是粘贴出去"的长标识,
- * 替代全仓手写的 `<span className="font-mono text-[12px]">{id}</span>` + 旁边一个复制按钮。
+ * 替代全仓手写的 `<span className="font-mono text-meta">{id}</span>` + 旁边一个复制按钮。
  *
  * 触控靶下沉在这里:芯片在无 hover 的设备上撑到 44px 高,调用方不必再补
  * `[@media(hover:none)]:min-h-11`。

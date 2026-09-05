@@ -27,7 +27,7 @@ function InflightBadge({ fl, startedAt }: { fl: Inflight | null; startedAt: stri
   return (
     <span className="inline-flex items-center gap-1.5">
       <Badge tone={cur > 0 ? "success" : "neutral"}>{cur}</Badge>
-      <span className="text-[11px] text-faint" title={peakTitle}>
+      <span className="text-caption text-faint" title={peakTitle}>
         峰值 {fl.peak ?? 0}
       </span>
     </span>
@@ -134,18 +134,18 @@ export function ModelRow({
 
   return (
     <tr className="border-b border-border/60 last:border-0">
-      <td className="whitespace-nowrap px-3 py-2 font-mono text-[12px] text-fg">{model.model_id}</td>
+      <td className="whitespace-nowrap px-3 py-2 font-mono text-meta text-fg">{model.model_id}</td>
       <td className="px-3 py-2">
         <Input
           value={displayName}
           onChange={(e) => setDisplayName(e.target.value)}
           maxLength={120}
           placeholder="—"
-          className="h-8 w-full min-w-[8rem] text-[13px]"
+          className="h-8 w-full min-w-[8rem] text-body"
         />
       </td>
       <td className="px-3 py-2">
-        <span className="rounded-md bg-hover px-1.5 py-0.5 font-mono text-[11px] text-muted">
+        <span className="rounded-md bg-hover px-1.5 py-0.5 font-mono text-caption text-muted">
           {model.provider.id || "—"}
         </span>
       </td>
@@ -153,7 +153,7 @@ export function ModelRow({
         <InflightBadge fl={inflight} startedAt={startedAt} />
       </td>
       <td
-        className="whitespace-nowrap px-3 py-2 text-[12px] text-muted"
+        className="whitespace-nowrap px-3 py-2 text-meta text-muted"
         title={
           model.usage
             ? `7d: ${usageLine(model.usage.d7)}\ncache_read: 24h ${fmtCompactNum(model.usage.d1.cache_read_tokens)} · 7d ${fmtCompactNum(model.usage.d7.cache_read_tokens)}`
@@ -178,7 +178,7 @@ export function ModelRow({
         <Input
           value={multiplier}
           onChange={(e) => setMultiplier(e.target.value)}
-          className="h-8 w-full min-w-[4.5rem] text-[13px] tabular-nums"
+          className="h-8 w-full min-w-[4.5rem] text-body tabular-nums"
         />
       </td>
       <td className="px-3 py-2">

@@ -94,4 +94,15 @@ Scrub changes metadata/`rsid`, not visible layout, so it does not require anothe
 
 ## Delivery
 
-Return the absolute path of the cleaned final DOCX and any requested source file. Do not deliver internal QA images unless requested. Use only the documented `oc-docx`/`oc-vision` commands; never invent URLs, ports, tokens, or curl fallbacks.
+```bash
+oc-docx convert ... -o "$OUT.docx"
+oc-docx check "$OUT.docx" --expect-formulas   # when the source contains $...$
+# VERDICT!=PASS → edit source and convert again, at most 2 rounds, then fail explicitly
+oc-docx scrub ...
+oc-artifact-qa deliver --input "$FINAL.docx"
+# If L0 FAIL: retry generation once with a new filename; second FAIL → tell the user the failures[].message. Never print that path.
+```
+
+Print **only** the FINAL absolute path, on its own line. Do not wrap it in a fenced code block. Never invent URLs, ports, tokens, or curl fallbacks. Do not print `.deliver.json` sidecars. Two or more deliverables → `oc-artifact-qa pack --out /home/agent/.openclaude/generated/<stem>.zip -- file1 file2` and print the zip path only.
+
+Return the absolute path of the cleaned final DOCX and any requested source file. Do not deliver internal QA images unless requested. Use only the documented `oc-docx`/`oc-docxcheck`/`oc-artifact-qa`/`oc-vision` commands.

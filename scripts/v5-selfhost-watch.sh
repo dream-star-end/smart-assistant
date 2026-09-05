@@ -18,6 +18,7 @@ WATCH_MASTER_URL="${WATCH_MASTER_URL:-http://127.0.0.1:18790/healthz}"
 WATCH_EGRESS_URL="${WATCH_EGRESS_URL:-http://172.31.0.1:18892/internal/v5/egress-health}"
 WATCH_MASTER_UNIT="${WATCH_MASTER_UNIT:-openclaude-v5-selfhost.service}"
 WATCH_EGRESS_UNIT="${WATCH_EGRESS_UNIT:-openclaude-v5-selfhost-egress.service}"
+WATCH_EGRESS_SLOT_TPL="${WATCH_EGRESS_SLOT_TPL:-openclaude-v5-selfhost-egress@.service}"
 WATCH_LIVE="${WATCH_LIVE:-/opt/openclaude/openclaude-v5-selfhost-live}"
 WATCH_RELEASES_ROOT="${WATCH_RELEASES_ROOT:-/opt/openclaude/openclaude-v5-selfhost-releases}"
 WATCH_LOCK="${WATCH_LOCK:-/run/openclaude-v5-selfhost/deploy.lock}"
@@ -215,7 +216,17 @@ unit_is_active() {
     return
   fi
   st="$(systemctl is-active "$unit" 2>/dev/null || true)"
-  [[ "$st" == "active" ]]
+  [[ "$st" == "active" ]] && return 0
+  # 2026-09-05 蓝绿双槽:egress 可能由 egress@A/egress@B 任一槽承载,legacy 单 unit 不 active
+  # 属正常。任一槽 active 即视为 egress unit 在。
+  if [[ "$unit" == "$WATCH_EGRESS_UNIT" ]]; then
+    local s
+    for s in A B; do
+      st="$(systemctl is-active "${WATCH_EGRESS_SLOT_TPL/@./@$s.}" 2>/dev/null || true)"
+      [[ "$st" == "active" ]] && return 0
+    done
+  fi
+  return 1
 }
 
 probe_master() {
@@ -476,10 +487,40 @@ tier1_rollback() {
   fi
   write_grace
   atomic_flip_live "$prev"
-  systemctl restart "$WATCH_EGRESS_UNIT"
+  restart_egress_for_live
   timeout 90 bash -c 'until (exec 3<>/dev/tcp/172.31.0.1/18892) 2>/dev/null; do sleep 1; done' || true
   systemctl restart "$WATCH_MASTER_UNIT"
   return 0
+}
+
+# egress 重启:live 自带双槽模板 → 起另一个槽再 stop --no-block 当前槽(零停机);
+# 否则 legacy 单 unit restart(先停两槽,腾出 18892)。与 deploy-v5-selfhost.sh
+# egress_slot_flip 同语义的精简版;watch 是独立脚本,不 source deploy lib。
+restart_egress_for_live() {
+  local live sa sb cur target s
+  live="$(readlink -f -- "$WATCH_LIVE" 2>/dev/null || true)"
+  sa="${WATCH_EGRESS_SLOT_TPL/@./@A.}"; sb="${WATCH_EGRESS_SLOT_TPL/@./@B.}"
+  if [[ -n "$live" && -f "$live/deploy/v5-selfhost/$WATCH_EGRESS_SLOT_TPL" ]]; then
+    if [[ "$(systemctl is-active "$sa" 2>/dev/null)" == active ]]; then cur=A; target=B
+    elif [[ "$(systemctl is-active "$sb" 2>/dev/null)" == active ]]; then cur=B; target=A
+    else cur=""; target=A; fi
+    if [[ "$(systemctl is-active "$WATCH_EGRESS_UNIT" 2>/dev/null)" == active ]]; then
+      wlog "tier1: legacy egress 仍 active,阻塞 stop(等 drain)"
+      systemctl stop "$WATCH_EGRESS_UNIT" || true
+    fi
+    wlog "tier1: egress 槽翻转 ${cur:-none} -> $target"
+    systemctl start "${WATCH_EGRESS_SLOT_TPL/@.service/@$target.socket}" "${WATCH_EGRESS_SLOT_TPL/@./@$target.}" || true
+    local port; [[ "$target" == A ]] && port=18898 || port=18899
+    timeout 90 bash -c "until curl -fsS --max-time 2 http://127.0.0.1:$port/internal/v5/egress-slot-health >/dev/null 2>&1; do sleep 1; done" || true
+    if [[ -n "$cur" ]]; then
+      systemctl stop --no-block "${WATCH_EGRESS_SLOT_TPL/@.service/@$cur.socket}" "${WATCH_EGRESS_SLOT_TPL/@./@$cur.}" || true
+    fi
+  else
+    for s in A B; do
+      systemctl stop "${WATCH_EGRESS_SLOT_TPL/@.service/@$s.socket}" "${WATCH_EGRESS_SLOT_TPL/@./@$s.}" 2>/dev/null || true
+    done
+    systemctl restart "$WATCH_EGRESS_UNIT"
+  fi
 }
 
 tier2_restore_units() {

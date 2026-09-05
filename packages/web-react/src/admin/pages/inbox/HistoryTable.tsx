@@ -156,7 +156,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
       key: "created_at",
       title: "时间",
       width: 96,
-      render: (m) => <TimeAgo value={m.created_at} className="text-[12px] text-muted" />,
+      render: (m) => <TimeAgo value={m.created_at} className="text-meta text-muted" />,
     },
     { key: "audience", title: "受众", width: 110, render: (m) => <AudienceBadge m={m} /> },
     {
@@ -186,7 +186,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
       width: 96,
       render: (m) =>
         m.expires_at ? (
-          <TimeAgo value={m.expires_at} className="text-[12px] text-muted" />
+          <TimeAgo value={m.expires_at} className="text-meta text-muted" />
         ) : (
           <span className="text-faint">永不</span>
         ),
@@ -232,7 +232,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
   const total = data?.total ?? 0;
 
   const breakdownColumns: Column<MessageStatsBreakdown>[] = [
-    { key: "name", title: "来源 / 分类", render: (row) => <span className="font-mono text-[12px]">{row.source_type ?? (row.category ? CATEGORY_LABEL[row.category] : "未知")}</span> },
+    { key: "name", title: "来源 / 分类", render: (row) => <span className="font-mono text-meta">{row.source_type ?? (row.category ? CATEGORY_LABEL[row.category] : "未知")}</span> },
     { key: "messages", title: "消息", align: "right" },
     { key: "recipients", title: "收件", align: "right" },
     { key: "reads", title: "已读", align: "right" },
@@ -243,7 +243,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
     <div className="flex flex-col gap-4">
       <SectionCard title="30 天触达效果" hint="仅使用发送时不可变受众快照；历史缺失不猜测">
         {statsError ? (
-          <p className="text-[13px] text-danger">加载失败：{apiErrorMessage(statsError, "统计加载失败")}</p>
+          <p className="text-body text-danger">加载失败：{apiErrorMessage(statsError, "统计加载失败")}</p>
         ) : (
           <div className="flex flex-col gap-4">
             <StatCardRow>
@@ -253,22 +253,22 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
               <StatCard label="后续行动" value="不可用" icon={TriangleAlert} tone="neutral" hint="尚无可靠 action 归因，不伪造转化" loading={statsLoading} />
             </StatCardRow>
             {stats && stats.snapshot_coverage.legacy_unavailable_messages > 0 && (
-              <p className="text-[12px] text-faint">
+              <p className="text-meta text-faint">
                 快照覆盖：{stats.snapshot_coverage.captured_messages} 条已固化；{stats.snapshot_coverage.legacy_unavailable_messages} 条历史消息不可计算收件/已读率。
               </p>
             )}
             {stats && (stats.recipient_load.over_20 > 0 || stats.recipient_load.over_100 > 0) && (
-              <div className="rounded-lg border border-warning/30 bg-warning-soft px-3 py-2 text-[12px] text-fg">
+              <div className="rounded-lg border border-warning/30 bg-warning-soft px-3 py-2 text-meta text-fg">
                 高负荷提示：{stats.recipient_load.over_20} 位用户近30天收到超过20条，{stats.recipient_load.over_100} 位超过100条；p50 {stats.recipient_load.p50}、p90 {stats.recipient_load.p90}、最高 {stats.recipient_load.max}。仅透明提示，不自动硬频控。
               </div>
             )}
             <div className="grid min-w-0 gap-3 lg:grid-cols-2">
               <div className="min-w-0">
-                <p className="mb-2 text-[12px] font-semibold text-fg">按来源</p>
+                <p className="mb-2 text-meta font-semibold text-fg">按来源</p>
                 <DataTable columns={breakdownColumns} rows={stats?.by_source ?? []} rowKey={(row) => `source:${row.source_type}`} loading={statsLoading} emptyTitle="暂无来源统计" />
               </div>
               <div className="min-w-0">
-                <p className="mb-2 text-[12px] font-semibold text-fg">按分类</p>
+                <p className="mb-2 text-meta font-semibold text-fg">按分类</p>
                 <DataTable columns={breakdownColumns} rows={stats?.by_category ?? []} rowKey={(row) => `category:${row.category}`} loading={statsLoading} emptyTitle="暂无分类统计" />
               </div>
             </div>
@@ -293,7 +293,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
       </div>
       {error ? (
         <div className="px-5 py-4">
-          <p className="text-[13px] text-danger">加载失败：{apiErrorMessage(error, "加载失败")}</p>
+          <p className="text-body text-danger">加载失败：{apiErrorMessage(error, "加载失败")}</p>
         </div>
       ) : (
         <>
@@ -368,7 +368,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
             </div>
             <div>
               <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                <p className="text-[14px] font-semibold text-fg">{detail.title}</p>
+                <p className="text-title font-semibold text-fg">{detail.title}</p>
                 <Tabs
                   value={detailMode}
                   onValueChange={(value) => setDetailMode(value as "preview" | "source")}
@@ -380,7 +380,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
                 />
               </div>
               {detailMode === "preview" ? (
-                <div className="max-h-[55vh] min-h-40 overflow-auto rounded-xl border border-border bg-surface px-4 py-4 text-[13px] text-fg">
+                <div className="max-h-[55vh] min-h-40 overflow-auto rounded-xl border border-border bg-surface px-4 py-4 text-body text-fg">
                   <Markdown signMedia readOnly>{detail.body_md}</Markdown>
                 </div>
               ) : (

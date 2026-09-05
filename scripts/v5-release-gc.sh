@@ -74,6 +74,13 @@ protect_unit_cwd() { # unit
 protect_unit_cwd "$unit_a"
 protect_unit_cwd "$unit_b"
 protect_unit_cwd "$egress_unit"
+# 2026-09-05 蓝绿双槽:无论调用方传的是哪几个 unit,legacy 单 unit 与 egress@A/@B
+# 只要有 MainPID(含 deactivating 中仍在 drain 的旧槽)其 cwd 一律保护。
+for _u in openclaude-v5-selfhost-egress.service \
+          openclaude-v5-selfhost-egress@A.service \
+          openclaude-v5-selfhost-egress@B.service; do
+  protect_unit_cwd "$_u"
+done
 
 # Complete the Docker census before computing/deleting candidates. docker ps
 # filters are re-verified against inspect labels to make the boundary explicit.

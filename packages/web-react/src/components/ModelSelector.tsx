@@ -1,4 +1,5 @@
 import {
+  COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL,
   type ContextTierFamily,
   type CursorContextTier,
   type CursorEngineFamilyId,
@@ -11,7 +12,8 @@ import {
   cursorFamilySupportsFast,
   cursorModelById,
 } from '@openclaude/protocol'
-import { AlertTriangle, Check, ChevronDown, Cpu, Lock, Users } from 'lucide-react'
+import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Lock, Users } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import {
   availableCursorEfforts,
   contextFamilyHasLong,
@@ -22,6 +24,7 @@ import {
   longContextCostConfirmationRequired,
   modelCostLabel,
   modelPickerRows,
+  partitionCollapsedRows,
   resolveContextPickerSelection,
   resolveCursorPickerSelection,
 } from '../lib/cursorModelPicker'
@@ -68,7 +71,7 @@ export function modelLabel(m: PublicModel): string {
 function CostMark({ model }: { model?: { cost_x?: number } }) {
   const label = modelCostLabel(model)
   if (!label) return null
-  return <span className="text-[11px] font-normal text-faint">{label}</span>
+  return <span className="text-caption font-normal text-faint">{label}</span>
 }
 
 function promoLabelOf(model: { promo_label?: unknown } | undefined): string | undefined {
@@ -173,6 +176,17 @@ export function ModelSelector({
   const label = teamEngineActive ? engineLabel : baseLabel
   const disabled = loading || (models.length === 0 && lockedModels.length === 0)
   const rows = modelPickerRows(models, lockedModels)
+  const {
+    visible: visibleRows,
+    collapsed: collapsedRows,
+    selectedInCollapsed,
+  } = partitionCollapsedRows(rows, selectedId)
+  // 折叠组默认收起;当前选中项落在组内时自动展开,保证选中项永远可见。
+  const [collapsedOpen, setCollapsedOpen] = useState(selectedInCollapsed)
+  useEffect(() => {
+    if (selectedInCollapsed) setCollapsedOpen(true)
+  }, [selectedInCollapsed])
+  const showCollapsedGroup = collapsedRows.length > 0
   const selectedPromo = promoLabelOf(selected)
   const selectedFamilyRow = rows.find(
     (row) => row.kind === 'cursor-family' && row.row.family === selectedCursor?.family,
@@ -236,6 +250,165 @@ export function ModelSelector({
     onSelect(id)
   }
 
+  const renderRow = (row: (typeof rows)[number]) => {
+    if (row.kind === 'plain') {
+      const m = row.model
+      const active = m.id === selectedId
+      const degraded = isDegraded(m)
+      return (
+        <DropdownMenuItem
+          key={m.id}
+          data-model-id={m.id}
+          disabled={degraded}
+          onSelect={degraded ? undefined : () => onSelect(m.id)}
+          className="justify-between"
+        >
+          <span className="truncate">{modelLabel(m)}</span>
+          <span className="flex shrink-0 items-center gap-1.5">
+            <CostMark model={m} />
+            <PromoBadge label={promoLabelOf(m)} />
+            {degraded && <Badge tone="danger">暂不可用</Badge>}
+            {active && !degraded && (
+              <>
+                {teamEngineActive && (
+                  <span className="text-caption text-faint">团队模式关闭后生效</span>
+                )}
+                <Check size={14} className="shrink-0 text-accent" />
+              </>
+            )}
+          </span>
+        </DropdownMenuItem>
+      )
+    }
+    if (row.kind === 'context-family') {
+      const familyActive = selectedContext?.family === row.row.family
+      const representative =
+        resolveContextPickerSelection(row.row.members, row.row.spec, selectedId) ??
+        row.row.members[0]?.id
+      const representativeModel = row.row.members.find((item) => item.id === representative)
+      const degraded = row.row.members.every(isDegraded)
+      return (
+        <DropdownMenuItem
+          key={row.row.family}
+          data-model-id={representative}
+          data-context-family={row.row.family}
+          disabled={degraded}
+          onSelect={
+            degraded
+              ? undefined
+              : () => {
+                  void selectContext(row.row.spec, row.row.members)
+                }
+          }
+          className="justify-between"
+        >
+          <span className="truncate">{row.row.label}</span>
+          <span className="flex shrink-0 items-center gap-1.5">
+            <CostMark model={representativeModel} />
+            <PromoBadge label={promoLabelOf(representativeModel)} />
+            {degraded && <Badge tone="danger">暂不可用</Badge>}
+            {familyActive && !degraded && (
+              <>
+                {teamEngineActive && (
+                  <span className="text-caption text-faint">团队模式关闭后生效</span>
+                )}
+                <Check size={14} className="shrink-0 text-accent" />
+              </>
+            )}
+          </span>
+        </DropdownMenuItem>
+      )
+    }
+    if (row.kind === 'locked-plain') {
+      const locked = row.model
+      const labelText = lockedPlainLabel(locked)
+      return (
+        <DropdownMenuItem
+          key={`locked-${locked.id}`}
+          data-model-id={locked.id}
+          data-locked="true"
+          onSelect={() =>
+            onLockedSelect?.({
+              label: labelText,
+              minPlanCode: locked.min_plan_code,
+              minPlanName: locked.min_plan_name,
+              modelId: locked.id,
+            })
+          }
+          className="justify-between text-faint opacity-80"
+        >
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Lock size={14} className="shrink-0" aria-hidden />
+            <span className="truncate">{labelText}</span>
+          </span>
+          <span className="flex shrink-0 items-center gap-1.5">
+            <CostMark model={locked} />
+            <PromoBadge label={promoLabelOf(locked)} />
+          </span>
+        </DropdownMenuItem>
+      )
+    }
+    if (row.kind === 'locked-cursor-family') {
+      return (
+        <DropdownMenuItem
+          key={`locked-family-${row.row.family}`}
+          data-model-id={row.row.representative.id}
+          data-cursor-family={row.row.family}
+          data-locked="true"
+          onSelect={() =>
+            onLockedSelect?.({
+              label: row.row.label,
+              minPlanCode: row.row.minPlanCode,
+              minPlanName: row.row.minPlanName,
+              modelId: row.row.representative.id,
+            })
+          }
+          className="justify-between text-faint opacity-80"
+        >
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Lock size={14} className="shrink-0" aria-hidden />
+            <span className="truncate">{row.row.label}</span>
+          </span>
+          <span className="flex shrink-0 items-center gap-1.5">
+            <CostMark model={row.row.representative} />
+            <PromoBadge label={promoLabelOf(row.row.representative)} />
+          </span>
+        </DropdownMenuItem>
+      )
+    }
+    const familyActive = selectedCursor?.family === row.row.family
+    const representative =
+      resolveCursorPickerSelection(row.row.members, row.row.family, selectedId) ??
+      row.row.members[0]?.id
+    const representativeModel = row.row.members.find((item) => item.id === representative)
+    const degraded = row.row.members.every(isDegraded)
+    return (
+      <DropdownMenuItem
+        key={row.row.family}
+        data-model-id={representative}
+        data-cursor-family={row.row.family}
+        disabled={degraded}
+        onSelect={degraded ? undefined : () => selectCursor(row.row.family, row.row.members)}
+        className="justify-between"
+      >
+        <span className="truncate">{row.row.label}</span>
+        <span className="flex shrink-0 items-center gap-1.5">
+          <CostMark model={representativeModel} />
+          <PromoBadge label={promoLabelOf(representativeModel)} />
+          {degraded && <Badge tone="danger">暂不可用</Badge>}
+          {familyActive && !degraded && (
+            <>
+              {teamEngineActive && (
+                <span className="text-caption text-faint">团队模式关闭后生效</span>
+              )}
+              <Check size={14} className="shrink-0 text-accent" />
+            </>
+          )}
+        </span>
+      </DropdownMenuItem>
+    )
+  }
+
   return (
     <>
       <DropdownMenu>
@@ -246,7 +419,7 @@ export function ModelSelector({
             disabled={disabled}
             aria-label="选择对话模型"
             className={cn(
-              'flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[13.5px] font-medium text-muted outline-none transition-colors',
+              'flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-section font-medium text-muted outline-none transition-colors',
               'hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]',
               'disabled:pointer-events-none disabled:opacity-50',
               teamEngineActive && 'text-accent hover:text-accent',
@@ -299,175 +472,41 @@ export function ModelSelector({
             </div>
           )}
           <div className="min-h-0 flex-1 overflow-y-auto">
-            {rows.map((row) => {
-              if (row.kind === 'plain') {
-                const m = row.model
-                const active = m.id === selectedId
-                const degraded = isDegraded(m)
-                return (
-                  <DropdownMenuItem
-                    key={m.id}
-                    data-model-id={m.id}
-                    disabled={degraded}
-                    onSelect={degraded ? undefined : () => onSelect(m.id)}
-                    className="justify-between"
-                  >
-                    <span className="truncate">{modelLabel(m)}</span>
-                    <span className="flex shrink-0 items-center gap-1.5">
-                      <CostMark model={m} />
-                      <PromoBadge label={promoLabelOf(m)} />
-                      {degraded && <Badge tone="danger">暂不可用</Badge>}
-                      {active && !degraded && (
-                        <>
-                          {teamEngineActive && (
-                            <span className="text-[11px] text-faint">团队模式关闭后生效</span>
-                          )}
-                          <Check size={14} className="shrink-0 text-accent" />
-                        </>
-                      )}
-                    </span>
-                  </DropdownMenuItem>
-                )
-              }
-              if (row.kind === 'context-family') {
-                const familyActive = selectedContext?.family === row.row.family
-                const representative =
-                  resolveContextPickerSelection(row.row.members, row.row.spec, selectedId) ??
-                  row.row.members[0]?.id
-                const representativeModel = row.row.members.find(
-                  (item) => item.id === representative,
-                )
-                const degraded = row.row.members.every(isDegraded)
-                return (
-                  <DropdownMenuItem
-                    key={row.row.family}
-                    data-model-id={representative}
-                    data-context-family={row.row.family}
-                    disabled={degraded}
-                    onSelect={
-                      degraded
-                        ? undefined
-                        : () => {
-                            void selectContext(row.row.spec, row.row.members)
-                          }
-                    }
-                    className="justify-between"
-                  >
-                    <span className="truncate">{row.row.label}</span>
-                    <span className="flex shrink-0 items-center gap-1.5">
-                      <CostMark model={representativeModel} />
-                      <PromoBadge label={promoLabelOf(representativeModel)} />
-                      {degraded && <Badge tone="danger">暂不可用</Badge>}
-                      {familyActive && !degraded && (
-                        <>
-                          {teamEngineActive && (
-                            <span className="text-[11px] text-faint">团队模式关闭后生效</span>
-                          )}
-                          <Check size={14} className="shrink-0 text-accent" />
-                        </>
-                      )}
-                    </span>
-                  </DropdownMenuItem>
-                )
-              }
-              if (row.kind === 'locked-plain') {
-                const locked = row.model
-                const labelText = lockedPlainLabel(locked)
-                return (
-                  <DropdownMenuItem
-                    key={`locked-${locked.id}`}
-                    data-model-id={locked.id}
-                    data-locked="true"
-                    onSelect={() =>
-                      onLockedSelect?.({
-                        label: labelText,
-                        minPlanCode: locked.min_plan_code,
-                        minPlanName: locked.min_plan_name,
-                        modelId: locked.id,
-                      })
-                    }
-                    className="justify-between text-faint opacity-80"
-                  >
-                    <span className="flex min-w-0 items-center gap-1.5">
-                      <Lock size={14} className="shrink-0" aria-hidden />
-                      <span className="truncate">{labelText}</span>
-                    </span>
-                    <span className="flex shrink-0 items-center gap-1.5">
-                      <CostMark model={locked} />
-                      <PromoBadge label={promoLabelOf(locked)} />
-                    </span>
-                  </DropdownMenuItem>
-                )
-              }
-              if (row.kind === 'locked-cursor-family') {
-                return (
-                  <DropdownMenuItem
-                    key={`locked-family-${row.row.family}`}
-                    data-model-id={row.row.representative.id}
-                    data-cursor-family={row.row.family}
-                    data-locked="true"
-                    onSelect={() =>
-                      onLockedSelect?.({
-                        label: row.row.label,
-                        minPlanCode: row.row.minPlanCode,
-                        minPlanName: row.row.minPlanName,
-                        modelId: row.row.representative.id,
-                      })
-                    }
-                    className="justify-between text-faint opacity-80"
-                  >
-                    <span className="flex min-w-0 items-center gap-1.5">
-                      <Lock size={14} className="shrink-0" aria-hidden />
-                      <span className="truncate">{row.row.label}</span>
-                    </span>
-                    <span className="flex shrink-0 items-center gap-1.5">
-                      <CostMark model={row.row.representative} />
-                      <PromoBadge label={promoLabelOf(row.row.representative)} />
-                    </span>
-                  </DropdownMenuItem>
-                )
-              }
-              const familyActive = selectedCursor?.family === row.row.family
-              const representative =
-                resolveCursorPickerSelection(row.row.members, row.row.family, selectedId) ??
-                row.row.members[0]?.id
-              const representativeModel = row.row.members.find((item) => item.id === representative)
-              const degraded = row.row.members.every(isDegraded)
-              return (
+            {visibleRows.map(renderRow)}
+            {showCollapsedGroup && (
+              <>
+                <DropdownMenuSeparator />
                 <DropdownMenuItem
-                  key={row.row.family}
-                  data-model-id={representative}
-                  data-cursor-family={row.row.family}
-                  disabled={degraded}
-                  onSelect={
-                    degraded ? undefined : () => selectCursor(row.row.family, row.row.members)
-                  }
-                  className="justify-between"
+                  data-collapsed-group={collapsedOpen ? 'open' : 'closed'}
+                  aria-expanded={collapsedOpen}
+                  onSelect={(event) => {
+                    event.preventDefault()
+                    setCollapsedOpen((open) => !open)
+                  }}
+                  className="justify-between text-muted"
                 >
-                  <span className="truncate">{row.row.label}</span>
-                  <span className="flex shrink-0 items-center gap-1.5">
-                    <CostMark model={representativeModel} />
-                    <PromoBadge label={promoLabelOf(representativeModel)} />
-                    {degraded && <Badge tone="danger">暂不可用</Badge>}
-                    {familyActive && !degraded && (
-                      <>
-                        {teamEngineActive && (
-                          <span className="text-[11px] text-faint">团队模式关闭后生效</span>
-                        )}
-                        <Check size={14} className="shrink-0 text-accent" />
-                      </>
+                  <span className="flex items-center gap-1.5">
+                    {collapsedOpen ? (
+                      <ChevronDown size={14} className="shrink-0" aria-hidden />
+                    ) : (
+                      <ChevronRight size={14} className="shrink-0" aria-hidden />
                     )}
+                    <span>{COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL}</span>
+                  </span>
+                  <span className="text-caption font-normal text-faint">
+                    {collapsedRows.length} 个
                   </span>
                 </DropdownMenuItem>
-              )
-            })}
+                {collapsedOpen && collapsedRows.map(renderRow)}
+              </>
+            )}
           </div>
           {showCursorEffort && selectedCursor && (
             <div className="shrink-0">
               <DropdownMenuSeparator />
               <DropdownMenuLabel className="flex items-center justify-between">
                 思考档位
-                <span className="text-[11px] font-normal text-faint">
+                <span className="text-caption font-normal text-faint">
                   {EFFORT_OPTIONS.find((o) => o.value === selectedCursor.effort)?.label ??
                     selectedCursor.effort ??
                     '—'}
@@ -495,7 +534,7 @@ export function ModelSelector({
               <DropdownMenuSeparator />
               <DropdownMenuLabel className="flex items-center justify-between">
                 速度
-                <span className="text-[11px] font-normal text-faint">
+                <span className="text-caption font-normal text-faint">
                   {selectedCursor.fast ? 'Fast' : '标准'}
                 </span>
               </DropdownMenuLabel>
@@ -524,7 +563,7 @@ export function ModelSelector({
               <DropdownMenuSeparator />
               <DropdownMenuLabel className="flex items-center justify-between">
                 上下文
-                <span className="text-[11px] font-normal text-faint">
+                <span className="text-caption font-normal text-faint">
                   {activeCursorContextTier === '1m' ? '1M' : '300k'}
                 </span>
               </DropdownMenuLabel>
@@ -555,7 +594,7 @@ export function ModelSelector({
               <DropdownMenuSeparator />
               <DropdownMenuLabel className="flex items-center justify-between">
                 上下文
-                <span className="text-[11px] font-normal text-faint">
+                <span className="text-caption font-normal text-faint">
                   {selectedId === selectedContext.longId ? '1M' : '标准'}
                 </span>
               </DropdownMenuLabel>
@@ -596,7 +635,7 @@ export function ModelSelector({
               <DropdownMenuSeparator />
               <DropdownMenuLabel className="flex items-center justify-between">
                 思考档位
-                <span className="text-[11px] font-normal text-faint">
+                <span className="text-caption font-normal text-faint">
                   {effortActive == null
                     ? '跟随模型默认'
                     : (EFFORT_OPTIONS.find((o) => o.value === effortActive)?.label ?? effortActive)}

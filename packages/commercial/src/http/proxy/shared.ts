@@ -1446,6 +1446,19 @@ export interface AnthropicProxyDeps {
    * AuthzDeniedError → 403。
    */
   identity: IdentityStrategy;
+  /** Journal ctx.runtimeKind. Omit for docker (legacy). */
+  runtimeKind?: "docker" | "desktop";
+  /**
+   * Optional process-wide per-uid concurrency limiter. When omitted the handler
+   * constructs a private instance (flag-off docker equivalence). Master/egress
+   * inject one shared instance into both docker and desktop handlers.
+   */
+  concurrencyLimiter?: ConcurrencyLimiter;
+  /**
+   * Optional process-wide Redis-fallback limiter. Same sharing rules as
+   * concurrencyLimiter.
+   */
+  fallbackLimiter?: FallbackRateLimiter;
   /** identity authorize 与 model-authority gate 共用的 epoch-aware 权威加载器。 */
   loadUserModelAuthz: import("../../auth/userModelAuthz.js").UserModelAuthzLoader;
   rateLimitRedis: RateLimitRedis;

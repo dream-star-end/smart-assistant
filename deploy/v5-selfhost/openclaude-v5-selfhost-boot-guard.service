@@ -3,7 +3,7 @@
 Description=OpenClaude v5 selfhost boot guard (live symlink)
 DefaultDependencies=yes
 After=local-fs.target
-Before=openclaude-v5-selfhost.service openclaude-v5-selfhost-egress.service
+Before=openclaude-v5-selfhost.service openclaude-v5-selfhost-egress.service openclaude-v5-selfhost-egress@A.service openclaude-v5-selfhost-egress@B.service openclaude-v5-selfhost-egress@A.socket openclaude-v5-selfhost-egress@B.socket
 
 [Service]
 Type=oneshot

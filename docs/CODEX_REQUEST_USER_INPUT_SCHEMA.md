@@ -164,3 +164,21 @@ OpenClaude 的兼容矩阵固定为：
 字节级证据在
 `packages/gateway/src/__tests__/fixtures/codex-app-server-0.149.0/`，同时保留 0.144.0
 fixture 作为旧请求兼容与历史错误契约。
+
+## 2026-09-05:Codex 0.153.3 升级补充
+
+runtime 镜像 pin 升到 0.153.3(npm `latest`,二进制 SHA-256
+`f9d4eab23d0e0726340e084ed22d668885c1dcabeb29ec508b8962e5e29b8dc6`)。升级动因是
+GPT-6-Astra:该 slug 在 Codex 内嵌模型目录里 `minimal_client_version = 0.153.0`,
+0.149.0 客户端拒绝路由。
+
+对同一 `generate-json-schema --experimental` 命令重新取样,`TurnSteerParams` /
+`TurnSteerResponse` / `ToolRequestUserInputParams` / `ToolRequestUserInputResponse`
+四份 schema 与 0.149.0 fixture **字节级一致**,兼容矩阵不变。证据在
+`packages/gateway/src/__tests__/fixtures/codex-app-server-0.153.3/`(manifest 同时钉
+0.149.0 的 generator hash,任何一侧漂移都会让
+`codexTurnSteerSchema.test.ts` 失败)。
+
+gateway 实际发出的 `thread/start`(approvalPolicy / sandbox / cwd / model)与
+`turn/start`(threadId / input / …)参数在 0.153.3 `ThreadStartParams` /
+`TurnStartParams` 中仍全部存在;`TurnStartParams.required` 仍为 `['input','threadId']`。

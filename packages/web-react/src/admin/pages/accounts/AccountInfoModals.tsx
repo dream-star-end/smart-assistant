@@ -63,7 +63,7 @@ export function RefreshHistoryModal({
   );
 
   const columns: Column<RefreshEvent>[] = [
-    { key: "ts", title: "时间", width: 150, render: (e) => <span className="font-mono text-[12px]">{fmtDateTime(e.ts)}</span> },
+    { key: "ts", title: "时间", width: 150, render: (e) => <span className="font-mono text-meta">{fmtDateTime(e.ts)}</span> },
     {
       key: "ok",
       title: "结果",
@@ -80,7 +80,7 @@ export function RefreshHistoryModal({
     {
       key: "detail",
       title: "详情",
-      render: (e) => (e.ok ? <span className="text-faint">—</span> : <span className="font-mono text-[12px] break-all">{e.err_msg || ""}</span>),
+      render: (e) => (e.ok ? <span className="text-faint">—</span> : <span className="font-mono text-meta break-all">{e.err_msg || ""}</span>),
     },
   ];
 
@@ -107,7 +107,7 @@ export function RefreshHistoryModal({
             emptyTitle="暂无 refresh 事件"
             emptyHint="该账号暂无记录(28 天 retention)。"
           />
-          <p className="mt-2 text-[11.5px] text-faint">
+          <p className="mt-2 text-caption text-faint">
             仅展示最近 50 条;事件保留 28 天。详情字段为后端枚举字面量,不含 raw error。
           </p>
         </>
@@ -141,10 +141,10 @@ export function RecentUsersModal({
   );
 
   const columns: Column<RecentUser>[] = [
-    { key: "user_id", title: "user_id", render: (u) => <span className="font-mono text-[12px]">{u.user_id}</span> },
+    { key: "user_id", title: "user_id", render: (u) => <span className="font-mono text-meta">{u.user_id}</span> },
     { key: "email", title: "email", render: (u) => u.email || <span className="text-faint">—</span> },
     { key: "request_count", title: "请求数", align: "right", cellClassName: "tabular-nums", render: (u) => Number(u.request_count).toLocaleString() },
-    { key: "last_used_at", title: "最近使用", width: 150, render: (u) => <span className="font-mono text-[12px]">{fmtDateTime(u.last_used_at)}</span> },
+    { key: "last_used_at", title: "最近使用", width: 150, render: (u) => <span className="font-mono text-meta">{fmtDateTime(u.last_used_at)}</span> },
   ];
 
   return (
@@ -170,7 +170,7 @@ export function RecentUsersModal({
             emptyTitle="近 24h 无用户使用"
             emptyHint="近 24h 无用户使用过该账号。"
           />
-          <p className="mt-2 text-[11.5px] text-faint">仅近 24h、Top 20。</p>
+          <p className="mt-2 text-caption text-faint">仅近 24h、Top 20。</p>
         </>
       )}
     </Modal>
@@ -207,7 +207,16 @@ const USAGE_SOURCE_LABEL: Record<string, string> = {
   aggregated_usage: "api2 按模型聚合",
   usage_summary: "cursor.com 用量摘要",
   stripe_profile: "cursor.com 订阅状态",
+  sand_usage: "cursor.com Grok Bot 池用量",
+  sand_access: "cursor.com Grok Bot 访问状态",
+  super_grok: "cursor.com SuperGrok 关联",
 };
+
+/** SAND_ACCESS_STATE_GRANTED → "GRANTED";未知形态原样返回。 */
+function shortEnum(v: string | null, prefix: string): string | null {
+  if (!v) return null;
+  return v.startsWith(prefix) ? v.slice(prefix.length) : v;
+}
 
 type CursorUsageResponse = { usage: CursorUsageSnapshot; cached: boolean };
 
@@ -259,10 +268,18 @@ export function CursorUsageModal({
   const u = data?.usage ?? null;
   const pct = u?.included.total_percent_used ?? null;
   const errorEntries = u ? Object.entries(u.errors) : [];
+  const sand = u?.sand ?? null;
+  const sandPct = sand?.usage_percent ?? null;
+  const sandAccess = shortEnum(sand?.access_state ?? null, "SAND_ACCESS_STATE_");
+  const sandBlock = shortEnum(sand?.block_reason ?? null, "SAND_ACCESS_BLOCK_REASON_");
+  // 三个来源全没拿到任何字段 → 视为该池不可读(旧后端 / 无 authId / 全部 403)。
+  const sandReadable =
+    sand !== null &&
+    (sandPct !== null || sand.access_state !== null || sand.super_grok_linked !== null || sand.grok_plan !== null);
 
   type ModelRow = CursorUsageSnapshot["cycle_usage"]["models"][number];
   const modelColumns: Column<ModelRow>[] = [
-    { key: "model", title: "模型", render: (m) => <span className="font-mono text-[12px]">{m.model}</span> },
+    { key: "model", title: "模型", render: (m) => <span className="font-mono text-meta">{m.model}</span> },
     { key: "cost", title: "费用", align: "right", cellClassName: "tabular-nums", render: (m) => fmtCents(m.cost_cents) },
     { key: "in", title: "输入", align: "right", cellClassName: "tabular-nums", render: (m) => fmtTokens(m.input_tokens) },
     { key: "out", title: "输出", align: "right", cellClassName: "tabular-nums", render: (m) => fmtTokens(m.output_tokens) },
@@ -291,7 +308,7 @@ export function CursorUsageModal({
         </div>
       ) : u ? (
         <div className="flex flex-col gap-4">
-          <div className="flex items-center justify-between gap-3 text-[12px] text-faint">
+          <div className="flex items-center justify-between gap-3 text-meta text-faint">
             <span>
               拉取于 {fmtDateTime(u.fetched_at)}
               {data?.cached ? "(缓存,60s)" : ""}
@@ -303,7 +320,76 @@ export function CursorUsageModal({
 
           <section className="rounded-md border border-border p-3">
             <div className="mb-2 flex items-center gap-2">
+              <span className="text-sm font-medium">Grok Bot / Sand 池</span>
+              <span className="text-caption text-faint">独立额度 · 每周重置</span>
+              {sand?.grok_plan_label && <Badge tone="neutral">{sand.grok_plan_label}</Badge>}
+              {!sand?.grok_plan_label && sand?.grok_plan && <Badge tone="neutral">{sand.grok_plan}</Badge>}
+              {sandAccess && (
+                <Badge tone={sandAccess === "GRANTED" ? "success" : "warning"}>
+                  {sandAccess === "GRANTED" ? "已开通" : sandAccess}
+                </Badge>
+              )}
+              {sand?.super_grok_linked === true && <Badge tone="success">已关联 SuperGrok</Badge>}
+              {sand?.super_grok_linked === false && <Badge tone="neutral">未关联 SuperGrok</Badge>}
+            </div>
+            {!sandReadable ? (
+              <p className="text-meta text-faint">
+                未能读取 Grok Bot 池
+                {u.errors.sand_usage === "no_auth_id" ? "(该凭证缺少 auth id,无法访问 cursor.com dashboard)" : "(见下方来源提示)"}。
+              </p>
+            ) : (
+              <>
+                {sandPct != null && (
+                  <div className="mb-2 flex items-center gap-3">
+                    <Progress value={sandPct} thresholds={{ warning: 75, danger: 90 }} className="flex-1" />
+                    <span className="w-12 text-right text-sm tabular-nums">{fmtPct(sandPct)}</span>
+                  </div>
+                )}
+                <DescriptionList>
+                  <DescriptionRow
+                    label="本周期"
+                    value={`${fmtDate(sand?.period_start ?? null)} → ${fmtDate(sand?.next_reset_at ?? null)}(重置)`}
+                  />
+                  <DescriptionRow
+                    label="可用状态"
+                    value={
+                      sand?.has_available_usage === true ? (
+                        "仍有额度"
+                      ) : sand?.has_available_usage === false ? (
+                        <span className="text-danger">额度耗尽,等待重置</span>
+                      ) : (
+                        "—"
+                      )
+                    }
+                  />
+                  {sandBlock && sandBlock !== "NONE" && (
+                    <DescriptionRow label="限制原因" value={<span className="text-warning">{sandBlock}</span>} />
+                  )}
+                  {sand?.link_blocked_reason && (
+                    <DescriptionRow label="SuperGrok 关联受限" value={<span className="text-warning">{sand.link_blocked_reason}</span>} />
+                  )}
+                  <DescriptionRow
+                    label="按需付费"
+                    value={
+                      sand?.on_demand_eligible === true
+                        ? "可开启"
+                        : sand?.on_demand_eligible === false
+                          ? "不可用"
+                          : "—"
+                    }
+                  />
+                  {sand?.super_grok_linked_at && (
+                    <DescriptionRow label="SuperGrok 关联时间" value={fmtDateTime(sand.super_grok_linked_at)} />
+                  )}
+                </DescriptionList>
+              </>
+            )}
+          </section>
+
+          <section className="rounded-md border border-border p-3">
+            <div className="mb-2 flex items-center gap-2">
               <span className="text-sm font-medium">套餐内额度</span>
+              <span className="text-caption text-faint">Cursor IDE / CLI · 月度</span>
               {u.plan.name && <Badge tone="neutral">{u.plan.name}</Badge>}
               {u.plan.membership_type && u.plan.membership_type !== u.plan.name?.toLowerCase() && (
                 <Badge tone="neutral">{u.plan.membership_type}</Badge>
@@ -336,7 +422,7 @@ export function CursorUsageModal({
                 }
               />
               <DescriptionRow
-                label="Auto / 指定模型 占比"
+                label="Auto(Composer / Grok 4.5)/ 具名模型 占比"
                 value={`${fmtPct(u.included.auto_percent_used)} / ${fmtPct(u.included.api_percent_used)}`}
               />
               <DescriptionRow
@@ -374,7 +460,7 @@ export function CursorUsageModal({
           <section className="rounded-md border border-border p-3">
             <div className="mb-2 flex items-baseline justify-between gap-2">
               <span className="text-sm font-medium">本账期消耗(按模型)</span>
-              <span className="text-[12px] text-faint">
+              <span className="text-meta text-faint">
                 {fmtDate(u.cycle_usage.range_start)} → {fmtDate(u.cycle_usage.range_end)} · 合计{" "}
                 {fmtCents(u.cycle_usage.total_cost_cents)} · 输出 {fmtTokens(u.cycle_usage.total_output_tokens)} · 缓存读{" "}
                 {fmtTokens(u.cycle_usage.total_cache_read_tokens)}
@@ -390,7 +476,7 @@ export function CursorUsageModal({
           </section>
 
           {errorEntries.length > 0 && (
-            <div className="rounded-md border border-warning/40 bg-warning/5 p-2 text-[12px] text-warning">
+            <div className="rounded-md border border-warning/40 bg-warning/5 p-2 text-meta text-warning">
               部分来源不可用:
               {errorEntries.map(([k, v]) => (
                 <span key={k} className="ml-2 font-mono">
@@ -399,9 +485,9 @@ export function CursorUsageModal({
               ))}
             </div>
           )}
-          <p className="text-[11.5px] text-faint">
+          <p className="text-caption text-faint">
             数据来自 Cursor 内部 dashboard 接口,字段可能随 Cursor 变更;金额为 Cursor 侧计价(美元),仅供查看,不作为平台计费依据。
-            Sand 请求消耗的就是这份账号额度。
+            平台 Sand(Opus / Fable)请求消耗的是顶部「Grok Bot / Sand 池」;「套餐内额度」对应 Cursor IDE / CLI 的 Auto 与具名模型,两者互不相通。
           </p>
         </div>
       ) : null}
