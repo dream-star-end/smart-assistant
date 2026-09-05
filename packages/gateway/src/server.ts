@@ -103,6 +103,7 @@ import {
 } from './delegateContext.js'
 import { checkLocalBridge, isHealthzFileProxyReady } from './localBridgeAuth.js'
 import { resolveGatewayListen } from './gatewayBind.js'
+import { resolveOpenedPath } from './openedPath.js'
 import { defaultReleaseJobDir, isReleaseJobId, publicReleaseJob, readReleaseJob } from './releaseJobStore.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
 import {
@@ -7212,7 +7213,7 @@ export class Gateway {
     }
     let fdReal: string
     try {
-      fdReal = realpathSync(`/proc/self/fd/${fd}`)
+      fdReal = resolveOpenedPath(fd, realPath)
     } catch {
       closeSync(fd)
       res.writeHead(404)
@@ -8108,7 +8109,7 @@ export class Gateway {
       // violation. Documented in docs/audit-file-toctou.md.
       let tmpFdReal: string
       try {
-        tmpFdReal = realpathSync(`/proc/self/fd/${tmpFd}`)
+        tmpFdReal = resolveOpenedPath(tmpFd, tmpPath)
       } catch (err) {
         this.log.error('handleUpload: tmp fd realpath failed', { tmpPath }, err)
         try { unlinkSync(tmpPath) } catch {}
@@ -8374,7 +8375,7 @@ export class Gateway {
         }
         let finalReal: string
         try {
-          finalReal = realpathSync(`/proc/self/fd/${finalFd}`)
+          finalReal = resolveOpenedPath(finalFd, finalPath)
         } catch (err) {
           this.log.error('handleUpload: post-link realpath failed', { finalPath, eexistDedup }, err)
           if (!eexistDedup) {
