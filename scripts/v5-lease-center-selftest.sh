@@ -133,7 +133,7 @@ reset_db; set_live "$C0" committed
 OC_V5_LEASE_DRY=1 "$WORKER" >/dev/null 2>&1
 assert_eq "$(q "SELECT COUNT(*) FROM train WHERE status='planned';")" 1 "planned 留下无 pid"
 "$WORKER" >/dev/null 2>&1; assert_eq "$(starts)" 0 "planned 未超时不发第二班"
-sleep 1.2; "$WORKER" >/dev/null 2>&1
+sleep 2.2; "$WORKER" >/dev/null 2>&1   # PLANNED_STALE=1s,sqlite 秒级时间戳,留 >1s 余量
 assert_eq "$(q "SELECT status FROM train ORDER BY seq LIMIT 1;")" failed "planned 超时 → failed"
 assert_eq "$(starts)" 1 "对账后同 tick 发出新一班"
 # b) spawn 后 worker 死:执行器还在跑(hang),再 tick 不重发
