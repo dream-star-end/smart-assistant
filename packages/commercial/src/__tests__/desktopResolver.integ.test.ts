@@ -198,6 +198,7 @@ describe("desktop resolver production composition", () => {
       instanceId: "other-slot",
       instanceAddr: "127.0.0.1:18795",
       generation: 1,
+      ownerEpoch: 1,
     });
     resetDesktopFlagCache();
     setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [uid] }));
