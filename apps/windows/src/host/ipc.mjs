@@ -8,6 +8,8 @@ export const HostToElectron = Object.freeze({
   ERROR: 'error',
   DEGRADED: 'degraded',
   STOPPED: 'stopped',
+  APPROVAL_REQUEST: 'approval-request',
+  WORKSPACE_UPDATED: 'workspace-updated',
 })
 
 export const ElectronToHost = Object.freeze({
@@ -17,6 +19,8 @@ export const ElectronToHost = Object.freeze({
   STATUS: 'status',
   ENROLL_RESULT: 'enroll-result',
   SHUTDOWN: 'shutdown',
+  SET_WORKSPACE: 'set-workspace',
+  APPROVAL_RESULT: 'approval-result',
 })
 
 export function isIpcRecord(value) {

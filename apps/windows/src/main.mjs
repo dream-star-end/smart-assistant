@@ -61,6 +61,9 @@ import {
   resolveIdentityDirectory,
 } from './identity.mjs'
 import { createHostSupervisor, readDesktopHostConfigFromEnv } from './hostSupervisor.mjs'
+import { createApprovalController } from './host/workspace/approval.mjs'
+import { snapshotWorkspace } from './host/workspace/snapshot.mjs'
+import { createWorkspaceStore } from './host/workspace/workspaces.mjs'
 import {
   IPC_CHANNELS,
   createLocalHostIpcHandler,
@@ -166,6 +169,51 @@ let pendingDeepLinkTarget = null
 let localHostWindow = null
 let enrollmentController = null
 let localHostIpcHandler = null
+let workspaceStore = null
+let approvalController = null
+
+function clarvyUserDataPath() {
+  if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
+    return path.win32.join(process.env.LOCALAPPDATA, 'Clarvy')
+  }
+  try {
+    return app.getPath('userData')
+  } catch {
+    return os.tmpdir()
+  }
+}
+
+function ensureWorkspaceStore() {
+  if (workspaceStore) return workspaceStore
+  workspaceStore = createWorkspaceStore({
+    platform: process.platform,
+    env: process.env,
+    userDataPath: clarvyUserDataPath(),
+  })
+  return workspaceStore
+}
+
+async function applyWorkspaceRoot(rootPath) {
+  const result = await ensureWorkspaceStore().setWorkspace(rootPath)
+  if (result.ok && result.path) {
+    void snapshotWorkspace(result.path).then((snap) => {
+      if (snap.warning) console.warn('[windows] git snapshot:', snap.warning)
+    })
+  }
+  return result
+}
+
+function ensureApprovalController() {
+  if (approvalController) return approvalController
+  approvalController = createApprovalController({
+    prompt: async () => {
+      const win = ensureLocalHostWindow()
+      if (isAlive(win)) win.show()
+    },
+    audit: (entry) => console.info('[windows]', entry.event, entry.id ?? ''),
+  })
+  return approvalController
+}
 let appIdentityStore = null
 let hostSupervisor = null
 let tunnelState = 'offline'
@@ -2126,6 +2174,22 @@ function installEnrollment() {
     getLocalWebContents: () => (isAlive(localHostWindow) ? localHostWindow.webContents : null),
     enrollment: enrollmentController,
     audit: (entry) => console.info('[windows]', entry.event),
+    workspace: {
+      setWorkspace: (rootPath) => applyWorkspaceRoot(rootPath),
+      chooseWorkspace: async () => {
+        const win = ensureLocalHostWindow()
+        if (isAlive(win)) win.show()
+        const picked = await dialog.showOpenDialog(isAlive(win) ? win : undefined, {
+          title: '选择工作区',
+          properties: ['openDirectory'],
+        })
+        if (picked.canceled || !picked.filePaths?.[0]) {
+          return { ok: false, error: 'cancelled' }
+        }
+        return applyWorkspaceRoot(picked.filePaths[0])
+      },
+    },
+    approval: ensureApprovalController(),
   })
   return enrollmentController
 }

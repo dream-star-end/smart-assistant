@@ -4,6 +4,18 @@
  */
 import { createHostRuntime } from './runtime.mjs'
 import { ElectronToHost, HostToElectron, HOST_IPC_VERSION, isIpcRecord } from './ipc.mjs'
+import { createHostLogger, resolveLogsDirectory } from './log.mjs'
+
+function makeHostLog() {
+  try {
+    return createHostLogger({
+      directory: resolveLogsDirectory({ env: process.env, platform: process.platform }),
+    })
+  } catch {
+    return { error() {}, warn() {}, info() {}, debug() {} }
+  }
+}
+const hostLog = makeHostLog()
 
 function send(message) {
   if (typeof process.send === 'function') process.send(message)
@@ -28,6 +40,7 @@ function assertNoIdentityInProcess() {
 
 async function main() {
   if (typeof process.send !== 'function') {
+    hostLog.error('host_ipc_missing', { errCode: 'NO_IPC' })
     console.error('hostMain requires an IPC channel')
     process.exit(2)
   }

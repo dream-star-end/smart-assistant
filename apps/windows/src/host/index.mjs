@@ -43,3 +43,9 @@ export {
   fetchArtifact,
   defaultRuntimeRoot,
 } from './runtime/index.mjs'
+export { createHostLogger, redactLogValue, resolveLogsDirectory } from './log.mjs'
+export { isPathWithinWorkspace, isPathWithinAnyWorkspace } from './workspace/guard.mjs'
+export { createWorkspaceStore, resolveWorkspacesPath } from './workspace/workspaces.mjs'
+export { buildWorkspaceEnv } from './workspace/workspaceEnv.mjs'
+export { createApprovalController, classifyDestructiveOp, APPROVAL_TIMEOUT_MS } from './workspace/approval.mjs'
+export { snapshotWorkspace } from './workspace/snapshot.mjs'

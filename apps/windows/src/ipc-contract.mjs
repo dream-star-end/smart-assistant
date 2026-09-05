@@ -128,6 +128,8 @@ export function createLocalHostIpcHandler({
   getLocalWebContents,
   enrollment,
   audit = () => {},
+  workspace,
+  approval,
 } = {}) {
   return async function handleLocalHostIpc(event, payload) {
     const webContents = typeof getLocalWebContents === 'function' ? getLocalWebContents() : null
@@ -163,6 +165,50 @@ export function createLocalHostIpcHandler({
           ? enrollment.getStatus()
           : { phase: 'idle', hasIdentity: false, enrollmentId: null }
       return { ok: true, status }
+    }
+
+    if (command.type === 'set-workspace') {
+      if (typeof workspace?.setWorkspace !== 'function') {
+        return { ok: false, error: 'not-implemented' }
+      }
+      try {
+        return await workspace.setWorkspace(command.path)
+      } catch {
+        return { ok: false, error: 'workspace-failed' }
+      }
+    }
+
+    if (command.type === 'choose-workspace') {
+      if (typeof workspace?.chooseWorkspace !== 'function') {
+        return { ok: false, error: 'not-implemented' }
+      }
+      try {
+        return await workspace.chooseWorkspace()
+      } catch {
+        return { ok: false, error: 'workspace-failed' }
+      }
+    }
+
+    if (command.type === 'approve-op') {
+      if (typeof approval?.approve !== 'function') {
+        return { ok: false, error: 'not-implemented' }
+      }
+      try {
+        return approval.approve(command.id)
+      } catch {
+        return { ok: false, error: 'approval-failed' }
+      }
+    }
+
+    if (command.type === 'deny-op') {
+      if (typeof approval?.deny !== 'function') {
+        return { ok: false, error: 'not-implemented' }
+      }
+      try {
+        return approval.deny(command.id)
+      } catch {
+        return { ok: false, error: 'approval-failed' }
+      }
     }
 
     return { ok: false, error: 'not-implemented' }

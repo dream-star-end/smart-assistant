@@ -149,7 +149,7 @@ test('createLocalHostIpcHandler rejects forged product frames for start-enroll a
 
   for (const url of ['https://claudeai.chat/', 'app://aurora-shell/index.html']) {
     const forged = trustedFixture(url)
-    for (const payload of [{ type: 'start-enroll' }, { type: 'approve-op', id: 'op-1' }, { type: 'set-workspace', path: 'C:\\w' }]) {
+    for (const payload of [{ type: 'start-enroll' }, { type: 'approve-op', id: 'op-1' }, { type: 'set-workspace', path: 'C:\\w' }, { type: 'choose-workspace' }]) {
       const result = await handler(forged.event, payload)
       assert.equal(result.ok, false, url)
       assert.equal(result.error, 'forbidden', url)
