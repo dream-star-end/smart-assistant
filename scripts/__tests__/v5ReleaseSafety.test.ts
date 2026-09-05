@@ -9434,7 +9434,12 @@ describe('v5 versioned baseline manifest', () => {
 
   test('versioned baseline manifest: deploy cutoff placeholder and fallback wiring', async () => {
     const source = await readFile(deploy, 'utf8')
-    assert.match(source, /LEGACY_MANIFEST_CUTOFF_COMMIT=""/)
+    // Filled with the #545 merge SHA: must be 40-hex and an ancestor of HEAD
+    // (otherwise the ancestry classifier can never be true).
+    const cutoff = /^LEGACY_MANIFEST_CUTOFF_COMMIT="([0-9a-f]{40})"$/m.exec(source)
+    assert.ok(cutoff, 'LEGACY_MANIFEST_CUTOFF_COMMIT must be a filled 40-hex merge SHA, not the empty placeholder')
+    const anc = spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', cutoff[1], 'HEAD'], { encoding: 'utf8' })
+    assert.equal(anc.status, 0, `cutoff ${cutoff[1]} must be an ancestor of HEAD`)
     assert.match(source, /OC_V5_LEGACY_BASELINE_FALLBACK="\$\{OC_V5_LEGACY_BASELINE_FALLBACK:-1\}"/)
     assert.match(source, /--allow-legacy-manifest-missing\) ALLOW_LEGACY_MANIFEST_MISSING=1/)
     assert.match(source, /baselineManifestSha256/)
