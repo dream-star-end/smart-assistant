@@ -7701,6 +7701,23 @@ wait $!
     assert.match(source, /getByPlaceholder\("邮箱"\)\.waitFor\(\{ state: "visible", timeout: STEP_TIMEOUT \}\)/)
   })
 
+  test('E2E journey seeds oc_auth_hint after API login cookie and before authed root reload', async () => {
+    const source = await readFile(e2eJourney, 'utf8')
+    // 2026-09-05: 匿名访客 boot 跳过 refresh(authHint)。canary 走 API 登录+种 oc_rt,
+    // Playwright 新 context 没有 localStorage 标记,不补种则 goto / 停在营销 Landing。
+    assert.match(source, /localStorage\.setItem\("oc_auth_hint", "1"\)/)
+    const cookieAt = source.indexOf('name: "oc_rt"')
+    const hintAt = source.indexOf('localStorage.setItem("oc_auth_hint", "1")')
+    const reloadAt = source.indexOf('getByText("新建会话"')
+    assert.ok(cookieAt >= 0 && hintAt > cookieAt, 'oc_auth_hint 必须在种 oc_rt 之后写入')
+    assert.ok(reloadAt > hintAt, 'oc_auth_hint 必须在断言侧栏「新建会话」之前写入')
+    assert.equal(
+      source.split('localStorage.setItem("oc_auth_hint", "1")').length - 1,
+      1,
+      'hint 只应补种一次,且不得在 context 创建时 addInitScript 提前写入',
+    )
+  })
+
   test('release verification accepts public Luna and keeps hidden Luna grant-gated', (t) => {
     const databaseUrl = process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
     const schema = `oc_release_verification_${process.pid}_${Date.now()}`
