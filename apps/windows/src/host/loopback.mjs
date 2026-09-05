@@ -35,7 +35,6 @@ export function listenExclusive(server, { host, port, ipv6Only, timeoutMs = 2_00
       try { server.close() } catch { /* */ }
       done(err)
     }, timeoutMs)
-    timer.unref?.()
     server.once('error', onError)
     server.once('listening', onListening)
     const opts = { host, port, exclusive: true }

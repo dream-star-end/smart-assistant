@@ -45,6 +45,7 @@ async function main() {
   }
 
   watchParent(shutdown)
+  try { process.stdin.unref() } catch { /* */ }
 
   process.on('message', async (raw) => {
     if (!isIpcRecord(raw)) return

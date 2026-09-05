@@ -9,7 +9,8 @@ function killProcessTree(pid, signal = 'SIGTERM') {
   if (!pid) return
   if (process.platform === 'win32') {
     try {
-      spawn('taskkill', ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true })
+      const killer = spawn('taskkill', ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true })
+      killer.unref?.()
     } catch { /* */ }
     return
   }
