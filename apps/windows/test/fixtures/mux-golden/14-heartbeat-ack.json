@@ -1,0 +1,8 @@
+{
+  "name": "14-heartbeat-ack",
+  "hex": "210000000000000000167b227473223a312c227365727665724e6f77223a327d",
+  "length": 32,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 33,
+  "streamId": 0
+}

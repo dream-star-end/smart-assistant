@@ -1,0 +1,8 @@
+{
+  "name": "20-neg-payload-len-overflow",
+  "hex": "03000000000100010001",
+  "length": 10,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "expectDecode": "BODY_TOO_LARGE",
+  "declaredPayloadLen": 65537
+}

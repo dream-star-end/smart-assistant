@@ -1,0 +1,8 @@
+{
+  "name": "15-goaway",
+  "hex": "3000000000000000001e7b226d657373616765223a22746f6f206d616e792073747265616d73227d",
+  "length": 40,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 48,
+  "streamId": 0
+}

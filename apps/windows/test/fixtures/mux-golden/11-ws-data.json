@@ -1,0 +1,8 @@
+{
+  "name": "11-ws-data",
+  "hex": "1200000000090000001a7b226f70636f6465223a312c2264617461223a2261476b3d227d",
+  "length": 36,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 18,
+  "streamId": 9
+}

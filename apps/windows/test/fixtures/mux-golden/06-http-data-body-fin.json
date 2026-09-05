@@ -1,0 +1,9 @@
+{
+  "name": "06-http-data-body-fin",
+  "hex": "03010000000100000004706f6e67",
+  "length": 14,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 3,
+  "flags": 1,
+  "streamId": 1
+}
