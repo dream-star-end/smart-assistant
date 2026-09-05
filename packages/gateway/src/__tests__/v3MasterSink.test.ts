@@ -479,7 +479,7 @@ describe("attemptSend — multipart upload", () => {
     assert.equal(finalizeInit.headersTimeout, 0);
     assert.equal(finalizeInit.bodyTimeout, 0);
     // The short 5ms part deadline must not leak into finalize; only the much
-    // longer finalize deadline (env/default 120s) owns its wall clock.
+    // longer finalize deadline (env/default 300s) owns its wall clock.
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(finalizeInit.signal.aborted, false, "part deadline must not abort finalize");
     releaseFinalize();

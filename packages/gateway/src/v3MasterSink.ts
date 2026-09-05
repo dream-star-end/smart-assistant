@@ -97,7 +97,7 @@ const ATTEMPT_TIMEOUT_MS = 10_000
  * can legitimately take minutes to verify and materialize, but a half-dead
  * master that swallows the request must not pin the drainer forever
  * (gpt-6 recurring-incident audit case 3). Override via env for ops tuning. */
-const FINALIZE_TIMEOUT_MS = 120_000
+const FINALIZE_TIMEOUT_MS = 300_000
 
 function readFinalizeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = (env.OC_V5_SINK_FINALIZE_TIMEOUT_MS ?? '').trim()
@@ -485,7 +485,7 @@ async function postLosslessTurnTapeEnvelope(
   const fetcher = deps.fetcher ?? undiciRequest
   const isFinalize = envelope.action === 'finalize'
   // Finalize keeps no content-size deadline (headersTimeout/bodyTimeout stay 0)
-  // but gains its own bounded AbortController deadline (default 120s, env
+  // but gains its own bounded AbortController deadline (default 300s, env
   // OC_V5_SINK_FINALIZE_TIMEOUT_MS). Abort is classified transient so the
   // fsynced queue retries instead of hanging forever on a half-dead master.
   const controller = new AbortController()
