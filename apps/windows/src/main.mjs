@@ -132,7 +132,7 @@ import {
 const APP_ID = 'chat.claudeai.clarvy'
 const APP_NAME = 'Clarvy'
 const SHELL_PARTITION = 'openclaude-v5-shell-v1'
-const SMOKE_TIMEOUT_MS = 25_000
+const SMOKE_TIMEOUT_MS = 40_000
 const ZOOM_MIN = 0.5
 const ZOOM_MAX = 3
 const ZOOM_STEP = 0.1
