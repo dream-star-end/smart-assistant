@@ -25,14 +25,36 @@ export type CursorEngineStatus = "success" | "error" | "unavailable";
  * is left untouched so nothing user-facing advertises the markup. Composed on
  * top of the row multiplier (so `-fast` siblings keep their own 2x) and
  * recorded in price_snapshot as `cursor_settle_multiplier` for reconciliation.
+ *
+ * `COMMERCIAL_CURSOR_SETTLE_SURCHARGE_MULTIPLIER` overrides the default per
+ * deployment. selfhost sets `1.000` (0269: catalog fen are fitted to Cursor's
+ * real USD spend at 150 credits/USD, so the catalog price *is* the debited
+ * price and the snapshot carries no `cursor_settle_multiplier`). Anything
+ * that is not a finite positive NUMERIC(6,3) falls back to the default.
  */
 export const CURSOR_SETTLE_SURCHARGE_FAMILIES: ReadonlyArray<string> = ["cursor-opus-", "cursor-fable-"];
 export const CURSOR_SETTLE_SURCHARGE_MULTIPLIER = "2.000";
+export const CURSOR_SETTLE_SURCHARGE_ENV = "COMMERCIAL_CURSOR_SETTLE_SURCHARGE_MULTIPLIER";
 
-export function cursorSettleMultiplier(modelId: string): string | null {
-  return CURSOR_SETTLE_SURCHARGE_FAMILIES.some((prefix) => modelId.startsWith(prefix))
-    ? CURSOR_SETTLE_SURCHARGE_MULTIPLIER
-    : null;
+/** Parse the env override into a canonical "d.ddd" string; null = use default. */
+export function parseCursorSettleSurcharge(raw: string | undefined): string | null {
+  if (raw === undefined) return null;
+  const trimmed = raw.trim();
+  if (!/^\d{1,3}(\.\d{1,3})?$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n.toFixed(3);
+}
+
+export function cursorSettleMultiplier(
+  modelId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  if (!CURSOR_SETTLE_SURCHARGE_FAMILIES.some((prefix) => modelId.startsWith(prefix))) return null;
+  const surcharge = parseCursorSettleSurcharge(env[CURSOR_SETTLE_SURCHARGE_ENV]) ?? CURSOR_SETTLE_SURCHARGE_MULTIPLIER;
+  // 1.000 = no surcharge: behave exactly like a non-surcharged family so the
+  // snapshot does not advertise a phantom `cursor_settle_multiplier`.
+  return surcharge === "1.000" ? null : surcharge;
 }
 
 function applyCursorSettleMultiplier(pricing: ModelPricing): { pricing: ModelPricing; surcharge: string | null } {
