@@ -121,6 +121,11 @@ CUTOVER_RELEASE=""
 DEPLOY_BUILT_RELEASE=""
 CUTOVER_JOINT=0
 CUTOVER_TUPLE_BUNDLE=""
+# Lease Center(OCV5-131):worker 发车时传 --lease-train=<tr-*> --target-sha=<sha>;
+# 人工直跑 --deploy 时脚本自己登记一条 manual train,让 worker 能对账、不会在同一窗口再发一班。
+LEASE_TRAIN_ID=""
+LEASE_TARGET_SHA=""
+LEASE_LIB="$SCRIPT_DIR/v5-lease-lib.sh"
 
 # 本实例专属发布锁。禁止复用:
 #   /var/lock/oc-v5-deploy.lock                      V5 商业版生产(deploy-v5.sh / 发布队列 / 自愈)
@@ -163,6 +168,8 @@ own_instance_present() {
 }
 
 cleanup_selfhost_deploy() {
+  local exit_rc=$?
+  lease_train_on_exit "$exit_rc" || true
   if [[ -n "${PLATFORM_ARCHIVE_TMP:-}" && -d "$PLATFORM_ARCHIVE_TMP" ]]; then
     rm -rf "$PLATFORM_ARCHIVE_TMP"
     PLATFORM_ARCHIVE_TMP=""
@@ -412,6 +419,9 @@ usage() {
   --release=PATH        仅配合 --cutover:指定候选 rel-* 绝对路径(默认=sourceCommit 等于 HEAD 的最新完整 release)
   --allow-dirty         仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,防脏 platform 进全员容器)
   --platform-from-head  仅配合 --deploy/--bootstrap:平台 bundle 从 git archive 取已提交的 platform-runtime(默认仍拷工作树)
+  --lease-train=ID --target-sha=SHA
+                        仅配合 --deploy:由 v5-lease-worker 发车时传入;HEAD 必须精确等于 SHA,否则拒绝。
+                        人工直跑 --deploy 会自动登记 manual train(有 open train 时拒绝并行发布)。见 scripts/oc-lease.sh
   --force-env           仅配合 --bootstrap:覆盖已存在的 env 文件
   --force-npm-ci        配合 --build-master-only 或 --deploy:跳过硬链,在 staging 内冷装
 
@@ -443,6 +453,8 @@ for arg in "$@"; do
     --platform-from-head) PLATFORM_FROM_HEAD=1 ;;
     --force-npm-ci) FORCE_NPM_CI=1 ;;
     --release=*) CUTOVER_RELEASE="${arg#--release=}" ;;
+    --lease-train=*) LEASE_TRAIN_ID="${arg#--lease-train=}" ;;
+    --target-sha=*) LEASE_TARGET_SHA="${arg#--target-sha=}" ;;
     --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--cutover)
       [[ -z "$MODE" ]] || die "只能指定一个主模式(已有 --$MODE,又收到 $arg)"
       MODE="${arg#--}"
@@ -468,6 +480,10 @@ done
   && die "--force-npm-ci 只能与 --build-master-only 或 --deploy 同用"
 [[ -n "$CUTOVER_RELEASE" && "$MODE" != "cutover" ]] \
   && die "--release= 只能与 --cutover 同用"
+[[ -n "$LEASE_TRAIN_ID$LEASE_TARGET_SHA" && "$MODE" != "deploy" ]] \
+  && die "--lease-train=/--target-sha= 只能与 --deploy 同用"
+[[ -n "$LEASE_TRAIN_ID" && -z "$LEASE_TARGET_SHA" ]] && die "--lease-train= 必须同时给 --target-sha="
+[[ -z "$LEASE_TARGET_SHA" || "$LEASE_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || die "--target-sha= 必须是 40 位 sha"
 [[ -f "$MASTER_RELEASE_LIB" ]] || die "缺 master release lib: $MASTER_RELEASE_LIB"
 
 # 锁自测钩子:只加锁再 sleep,不碰发布路径。给并发/超时验证用,生产勿设。
@@ -1275,6 +1291,92 @@ source_commit() {
   git -C "$REPO_ROOT" rev-parse HEAD
 }
 
+# ── Lease Center train 账本(OCV5-131)────────────────────────────────────────
+# 三面制品都 `git archive HEAD`;固定发布对象的方式是要求 HEAD 精确等于 --target-sha,
+# 不满足就 fail-closed(不做"archive 某个非 HEAD sha"的半套改造)。
+lease_train_enabled() { [[ -n "$LEASE_TRAIN_ID" || -f "$LEASE_LIB" ]]; }
+
+lease_train_load_lib() {
+  [[ -f "$LEASE_LIB" ]] || return 1
+  # shellcheck disable=SC1090
+  source "$LEASE_LIB"
+}
+
+# 进入 --deploy:worker 列车 → CAS planned/building→building 并记 pid;人工直跑 → 插 manual train(有 open train 则拒)。
+lease_train_begin() {
+  lease_train_load_lib || { [[ -z "$LEASE_TRAIN_ID" ]] && return 0; die "缺 $LEASE_LIB,无法校验 --lease-train"; }
+  [[ "$DRY" == 1 ]] && return 0
+  lease_init_db
+  local head; head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  if [[ -n "$LEASE_TRAIN_ID" ]]; then
+    lease_valid_train_id "$LEASE_TRAIN_ID" || die "非法 --lease-train=$LEASE_TRAIN_ID"
+    [[ "$head" == "$LEASE_TARGET_SHA" ]] \
+      || die "工作树 HEAD $head ≠ --target-sha $LEASE_TARGET_SHA。列车只发固定 sha;先把工作树对齐(ff-merge)再发。"
+    local st tgt pid
+    st="$(train_field "$LEASE_TRAIN_ID" status)"; tgt="$(train_field "$LEASE_TRAIN_ID" target_sha)"; pid="$(train_field "$LEASE_TRAIN_ID" executor_pid)"
+    [[ -n "$st" ]] || die "train 不存在:$LEASE_TRAIN_ID"
+    [[ "$tgt" == "$LEASE_TARGET_SHA" ]] || die "train $LEASE_TRAIN_ID target_sha=$tgt ≠ --target-sha"
+    [[ "$st" == planned || "$st" == building ]] || die "train $LEASE_TRAIN_ID status=$st,不可执行"
+    [[ -z "$pid" || "$pid" == "$$" || "$pid" == "$PPID" ]] || { kill -0 "$pid" 2>/dev/null && die "train $LEASE_TRAIN_ID 已有活执行器 pid=$pid"; }
+    lease_tx <<SQL || die "train CAS building 写失败(sqlite),fail-closed"
+BEGIN IMMEDIATE;
+UPDATE train SET status='building', executor_pid=$$, started_at=COALESCE(started_at,'$(lease_now)'), updated_at='$(lease_now)'
+ WHERE id='$LEASE_TRAIN_ID' AND status IN ('planned','building');
+$(lease_event_sql "$LEASE_TRAIN_ID" executor-begin "deploy:$$" "head=$head")
+COMMIT;
+SQL
+    log "  🎫 lease train $LEASE_TRAIN_ID building(pid $$,target ${LEASE_TARGET_SHA:0:12})"
+  else
+    # 人工直跑:登记 manual train。已有 open train(worker 列车在跑)→ 拒,避免双发布线。
+    local open
+    open="$(lease_sql "SELECT id||'('||status||')' FROM train WHERE resource='deploy:selfhost' AND status NOT IN ('committed','failed') LIMIT 1;")"
+    [[ -z "$open" ]] || die "Lease Center 有 open train $open,拒绝并行人工发布。查看:scripts/oc-lease.sh status"
+    LEASE_TRAIN_ID="$(lease_new_id tr)"; LEASE_TARGET_SHA="$head"
+    lease_tx <<SQL || { log "  ⚠ manual train 登记失败(sqlite),继续发布但 worker 无法对账"; LEASE_TRAIN_ID=""; return 0; }
+BEGIN IMMEDIATE;
+INSERT INTO train(id,resource,target_sha,status,owner,executor_pid,created_at,started_at,updated_at)
+VALUES('$LEASE_TRAIN_ID','deploy:selfhost','$head','building','manual:$$',$$,'$(lease_now)','$(lease_now)','$(lease_now)');
+$(lease_event_sql "$LEASE_TRAIN_ID" train-manual "deploy:$$" "head=$head")
+COMMIT;
+SQL
+    log "  ⚠ 人工发布已登记为 manual train $LEASE_TRAIN_ID(worker 据此对账;搭车会话将在 committed 后自动结算)"
+  fi
+  LEASE_TRAIN_ACTIVE=1
+}
+
+# 终态:成功由 cmd_deploy 末尾调 committed;失败由 EXIT trap 调(未 committed 即 failed/recovery_required)。
+lease_train_finish() { # <committed|failed> <reason>
+  [[ "${LEASE_TRAIN_ACTIVE:-0}" == 1 && -n "$LEASE_TRAIN_ID" ]] || return 0
+  LEASE_TRAIN_ACTIVE=0
+  local st="$1" reason="$2" rel="" ev
+  if [[ "$st" == failed ]]; then
+    # 已动 unit 但未 committed → 交给 survivor,并要人工确认;不自动重发
+    local phase=""
+    [[ -f "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" ]] && \
+      phase="$(jq -er '.phase // empty' "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" 2>/dev/null || true)"
+    case "${phase:-}" in ''|armed|pre-install|pre-mutation|smoked|committed) ;; *) st=recovery_required ;; esac
+  else
+    rel="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+  fi
+  ev="$(jq -cn --arg rel "$rel" --arg log "${CUTOVER_LOG:-}" --arg phase "${CUTOVER_PHASE:-}" '{live:$rel,cutover_log:$log,phase:$phase}')"
+  lease_tx <<SQL || { echo "⚠ train $LEASE_TRAIN_ID 终态 $st 写失败;worker 将按 executor 退出对账" >&2; return 0; }
+BEGIN IMMEDIATE;
+UPDATE train SET status='$st', reason='$(lease_q "$reason")', rel_path=$( [[ -n "$rel" ]] && printf "'%s'" "$(lease_q "$rel")" || printf NULL ),
+       evidence_json='$(lease_q "$ev")', finished_at='$(lease_now)', updated_at='$(lease_now)'
+ WHERE id='$LEASE_TRAIN_ID' AND status NOT IN ('committed','failed');
+$(lease_event_sql "$LEASE_TRAIN_ID" "train-$st" "deploy:$$" "$reason")
+COMMIT;
+SQL
+  echo "  🎫 lease train $LEASE_TRAIN_ID → $st"
+}
+
+lease_train_on_exit() {
+  local rc="${1:-$?}"
+  if [[ "${LEASE_TRAIN_ACTIVE:-0}" == 1 ]]; then
+    lease_train_finish failed "deploy 进程退出 rc=$rc 未到 committed"
+  fi
+}
+
 runtime_caps_from_metadata() {
   local sha="$1"
   git -C "$REPO_ROOT" show "${sha}:deploy/v5/release-metadata.json" \
@@ -1811,6 +1913,7 @@ $dirty
   refresh_ccb_proxy_path
   ensure_model_authority
   sha="$(source_commit)"
+  lease_train_begin
   log "── HEAD=$sha 构建三面制品(失败则 live 不动) ──"
   build_master_release
   [[ -n "$BUILT_MASTER_RELEASE" ]] || die "build_master_release 未设置 BUILT_MASTER_RELEASE"
@@ -1825,6 +1928,7 @@ $dirty
   CUTOVER_JOINT=1
   log "── 进入 --cutover 翻转窗口(同一套状态机,不是第二份逻辑) release=$DEPLOY_BUILT_RELEASE ──"
   cmd_cutover
+  lease_train_finish committed "cutover committed live=$DEPLOY_BUILT_RELEASE"
   log "✓ --deploy 完成 live → $DEPLOY_BUILT_RELEASE"
 }
 
