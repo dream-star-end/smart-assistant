@@ -104,6 +104,13 @@ import {
 import { checkLocalBridge, isHealthzFileProxyReady } from './localBridgeAuth.js'
 import { resolveGatewayListen } from './gatewayBind.js'
 import { resolveOpenedPath } from './openedPath.js'
+import {
+  hasResolvedPrefix,
+  isPathStrictlyUnder,
+  isPathWithinRoot,
+  openclaudeTempPrefix,
+  trustedContainerHome,
+} from './pathAcl.js'
 import { defaultReleaseJobDir, isReleaseJobId, publicReleaseJob, readReleaseJob } from './releaseJobStore.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
 import {
@@ -21089,8 +21096,8 @@ export const FILE_ALLOWED_DIRS: string[] = [
   resolve(paths.uploadsDir),    // /root/.openclaude/uploads/
 ]
 
-/** Temp-file prefix pattern: /tmp/openclaude-* */
-const TEMP_PREFIX = resolve('/tmp/openclaude-')
+/** Temp-file prefix pattern: /tmp/openclaude-* (win32: os.tmpdir()/openclaude-) */
+const TEMP_PREFIX = openclaudeTempPrefix()
 
 /**
  * v3 Codex sometimes writes a user-requested artifact into its cwd
@@ -21145,7 +21152,7 @@ const COMMERCIAL_USER_VOLUME_MEDIA_GATE =
  * Used only by the trusted branch of `isFileAllowed`; legacy/personal-version
  * code never references this constant.
  */
-const TRUSTED_CONTAINER_HOME = '/home/agent'
+const TRUSTED_CONTAINER_HOME = trustedContainerHome()
 
 /**
  * Call-time check (NOT a module-load const) — tests can flip the env between
@@ -21209,30 +21216,28 @@ export function isFileAllowed(
   //     must add a matching pattern in the same PR (with a `security.test.ts`
   //     case). v3supervisor.ts and entrypoint.ts cite this contract.
   if (isTrustedContainerFileServeEnabled()) {
-    const inHome =
-      resolvedPath === TRUSTED_CONTAINER_HOME ||
-      resolvedPath.startsWith(`${TRUSTED_CONTAINER_HOME}/`)
-    const inTemp = resolvedPath.startsWith(TEMP_PREFIX)
+    const inHome = isPathWithinRoot(resolvedPath, TRUSTED_CONTAINER_HOME)
+    const inTemp = hasResolvedPrefix(resolvedPath, TEMP_PREFIX)
     const inOptExport = OPT_OPENCLAUDE_EXPORT_RE.test(resolvedPath)
     if (!inHome && !inTemp && !inOptExport) return false
     return !isFileBlocked(resolvedPath)
   }
   // 1. Static allowed directories (OPENCLAUDE_HOME, generated/, uploads/)
   for (const dir of FILE_ALLOWED_DIRS) {
-    if (resolvedPath.startsWith(dir + '/') || resolvedPath === dir) return true
+    if (isPathWithinRoot(resolvedPath, dir)) return true
   }
   // 2. Temp files matching /tmp/openclaude-*
-  if (resolvedPath.startsWith(TEMP_PREFIX)) return true
+  if (hasResolvedPrefix(resolvedPath, TEMP_PREFIX)) return true
   // 3. Dynamic agent cwds (if provided) — allow media files and generated/uploads subdirs
   if (agentCwds) {
     for (const raw of agentCwds) {
       if (!raw) continue
       const cwd = resolve(raw)
-      if (resolvedPath.startsWith(cwd + '/') || resolvedPath === cwd) {
+      if (isPathWithinRoot(resolvedPath, cwd)) {
         // Allow generated/ and uploads/ subdirs unconditionally
-        const genSub = cwd + '/generated'
-        const upSub = cwd + '/uploads'
-        if (resolvedPath.startsWith(genSub + '/') || resolvedPath.startsWith(upSub + '/')) return true
+        const genSub = join(cwd, 'generated')
+        const upSub = join(cwd, 'uploads')
+        if (isPathStrictlyUnder(resolvedPath, genSub) || isPathStrictlyUnder(resolvedPath, upSub)) return true
         // Allow non-executable media file extensions anywhere in CWD
         const ext = extname(resolvedPath).toLowerCase()
         if (MEDIA_EXTENSIONS.has(ext)) return true
@@ -21266,9 +21271,7 @@ export function makeUserScopedMediaPredicate(
 ): (p: string) => boolean {
   const u = resolve(uploadsDir)
   const g = resolve(generatedDir)
-  return (p) =>
-    p === u || p.startsWith(u + '/') ||
-    p === g || p.startsWith(g + '/')
+  return (p) => isPathWithinRoot(p, u) || isPathWithinRoot(p, g)
 }
 
 /**
