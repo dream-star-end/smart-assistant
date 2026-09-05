@@ -308,7 +308,10 @@ describe("admin accounts — DB 层", () => {
     assert.equal(audits.rows.length, 1);
     const after = audits.rows[0].after as Record<string, unknown>;
     assert.equal(after.oauth_token_changed, true);
-    assert.equal(after.oauth_refresh_token, "<cleared>");
+    // 2026-07-11 起 writeAdminAudit 中央脱敏(admin/auditRedact.ts)对命中 /token/ 的 key 连
+    // "<cleared>"/"<rotated>" 标记本身也包成 {__redacted,len} 元信息(宁可多脱)。
+    // 本用例守的契约是"改没改可见 + 明文永不落库",按元信息断言:len 9 = "<cleared>"。
+    assert.deepEqual(after.oauth_refresh_token, { __redacted: true, len: "<cleared>".length });
     // 确认明文永远不在
     const js = JSON.stringify(audits.rows[0]);
     assert.ok(!js.includes("tok1"));
@@ -869,10 +872,11 @@ describe("admin agent-containers — HTTP", () => {
     );
     const subId = sub.rows[0].id;
     const con = await query<{ id: string }>(
-      `INSERT INTO agent_containers(user_id, subscription_id, docker_name, workspace_volume, home_volume, image, status)
-       VALUES ($1, $2, 'agent-u-1', 'vol-ws', 'vol-home', 'test/image', 'running')
+      // 0023(2026-04-22)起 secret_hash NOT NULL;v2 legacy 行给一个不可能被真实 container 算出的 32 字节占位
+      `INSERT INTO agent_containers(user_id, subscription_id, docker_name, workspace_volume, home_volume, image, status, secret_hash)
+       VALUES ($1, $2, 'agent-u-1', 'vol-ws', 'vol-home', 'test/image', 'running', $3::bytea)
        RETURNING id::text AS id`,
-      [uid.toString(), subId],
+      [uid.toString(), subId, Buffer.alloc(32, 2)],
     );
 
     const list = await fetch(`${baseUrl}/api/admin/agent-containers`, {
