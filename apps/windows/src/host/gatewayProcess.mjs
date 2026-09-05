@@ -141,6 +141,7 @@ export function createGatewayProcess({
   claudeCodeEntry,
   claudeCodeRuntime,
   extraEnv = {},
+  cwd,
   healthzPath = '/healthz',
   healthzTimeoutMs = 8_000,
   restartBackoffMs = 400,
@@ -205,6 +206,7 @@ export function createGatewayProcess({
     const childArgs = command ? args : args
     const spawned = spawn(cmd, childArgs, {
       env,
+      cwd: cwd || undefined,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
       detached: process.platform !== 'win32',

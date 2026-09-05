@@ -92,6 +92,7 @@ export function createMuxHttpForwarder({
   gatewayPort,
   localBridgeToken,
   timeoutMs = 15_000,
+  onGatewayFrame,
 }) {
   async function handler(req) {
     const decision = classifyMuxHttp(req.method, req.path)
@@ -154,6 +155,13 @@ export function createMuxHttpForwarder({
     })
     ws.on('open', () => {})
     ws.on('message', (data, isBinary) => {
+      try {
+        onGatewayFrame?.(data, isBinary, {
+          sendJson(frame) {
+            ws.send(1, Buffer.from(JSON.stringify(frame)))
+          },
+        })
+      } catch { /* */ }
       session.sendData(isBinary ? 2 : 1, data)
     })
     ws.on('close', (code, reason) => {

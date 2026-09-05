@@ -5,6 +5,12 @@ import { createGatewayProcess, GATEWAY_PORT } from './gatewayProcess.mjs'
 import { createMuxHttpForwarder } from './muxForward.mjs'
 import { createLocalBridgeToken, createLahToken, createLahGwToken } from './tokens.mjs'
 import { createTunnelClient, TunnelState } from '../tunnel/tunnelClient.mjs'
+import { createApprovalController } from './workspace/approval.mjs'
+import { createApprovalBridge } from './approvalBridge.mjs'
+import { applyWorkspaceToGatewaySpawn } from './workspace/applySpawn.mjs'
+import { buildWorkspaceEnv } from './workspace/workspaceEnv.mjs'
+import { snapshotWorkspace } from './workspace/snapshot.mjs'
+import { createWorkspaceStore } from './workspace/workspaces.mjs'
 
 export function createHostRuntime(opts = {}) {
   const {
@@ -23,11 +29,15 @@ export function createHostRuntime(opts = {}) {
     egressPort = EGRESS_PROXY_PORT,
     masterPort = MASTER_PROXY_PORT,
     refreshLeadMs,
+    workspaceRoots = [],
+    workspacesPath,
     now = () => Date.now(),
     onState,
     onEvent,
     onDegraded,
     onUpdateRequired,
+    onApprovalRequest,
+    onFallback,
   } = opts
 
   let identity = null
@@ -39,6 +49,7 @@ export function createHostRuntime(opts = {}) {
   let started = false
   let tokens = null
   let lastError = null
+  let approval = null
   const audit = []
 
   function emit(event, extra = {}) {
@@ -64,6 +75,28 @@ export function createHostRuntime(opts = {}) {
         egress: egressProxy?.stats ?? null,
         master: masterProxy?.stats ?? null,
       },
+    }
+  }
+
+  async function loadWorkspaceRoots() {
+    if (Array.isArray(workspaceRoots) && workspaceRoots.length > 0) return workspaceRoots
+    if (typeof workspacesPath !== 'string' || !workspacesPath) return []
+    try {
+      const store = createWorkspaceStore({ filePath: workspacesPath })
+      return await store.getRoots()
+    } catch {
+      return []
+    }
+  }
+
+  async function snapshotRoots(roots) {
+    for (const root of roots) {
+      try {
+        const snap = await snapshotWorkspace(root)
+        emit('workspace_snapshot', { root, ok: snap.ok === true, warning: snap.warning || null, ref: snap.ref || null })
+      } catch (err) {
+        emit('workspace_snapshot', { root, ok: false, warning: err.message })
+      }
     }
   }
 
@@ -126,14 +159,42 @@ export function createHostRuntime(opts = {}) {
       throw wrapped
     }
 
+    approval = createApprovalController({
+      prompt: async (request) => {
+        onApprovalRequest?.({
+          id: request.id,
+          kind: request.kind,
+          detail: request.detail,
+          command: request.command,
+        })
+      },
+      audit: (entry) => emit(entry.event, entry),
+    })
+    const approvalBridge = createApprovalBridge({
+      approval,
+      audit: (entry) => emit(entry.event, entry),
+    })
+
     const forwarder = createMuxHttpForwarder({
       gatewayPort,
       localBridgeToken: tokens.localBridge,
+      onGatewayFrame: (data, isBinary, { sendJson }) => {
+        if (isBinary) return false
+        void approvalBridge.inspectOutbound(data, { sendJson }).catch((err) => {
+          emit('approval_bridge_error', { message: err.message })
+        })
+        return false
+      },
     })
+
+    const roots = await loadWorkspaceRoots()
+    const workspaceEnv = buildWorkspaceEnv({ roots, platform: process.platform })
+    const spawnOpts = applyWorkspaceToGatewaySpawn(workspaceEnv, { extraEnv: gatewayExtraEnv })
 
     gateway = createGatewayProcess({
       command: gatewayCommand,
       args: gatewayArgs,
+      cwd: spawnOpts.cwd,
       localBridgeToken: tokens.localBridge,
       lahGwToken: tokens.lahGw,
       lahToken: tokens.lah,
@@ -143,7 +204,7 @@ export function createHostRuntime(opts = {}) {
       claudeCodePath,
       claudeCodeEntry,
       claudeCodeRuntime,
-      extraEnv: gatewayExtraEnv,
+      extraEnv: spawnOpts.extraEnv,
       onDegraded: (info) => {
         onDegraded?.(info)
         emit('gateway_degraded', info)
@@ -153,6 +214,7 @@ export function createHostRuntime(opts = {}) {
     })
     try {
       await gateway.start()
+      await snapshotRoots(roots)
       const minted = await minter.mint('mint')
       minter.start(minted.expires_in)
 
@@ -170,7 +232,15 @@ export function createHostRuntime(opts = {}) {
         now,
         onState,
         onUpdateRequired,
-        onEvent: (event, extra) => emit(event, extra),
+        onEvent: (event, extra) => {
+          emit(event, extra)
+          if (extra?.code === 'KILLSWITCH' || extra?.mapped === 'KILLSWITCH') {
+            onFallback?.({ reason: 'killswitch' })
+          }
+          if (event === 'stopped' && extra?.reason === 'flag_off') {
+            onFallback?.({ reason: 'flag_off' })
+          }
+        },
         refreshToken: async ({ reason }) => minter.refresh(reason),
       })
       started = true
@@ -195,10 +265,24 @@ export function createHostRuntime(opts = {}) {
     emit('stopped', { reason })
   }
 
+  function handlePower(event) {
+    if (!tunnel) return
+    if (event === 'suspend') tunnel.onSuspend()
+    else if (event === 'resume') tunnel.onResume()
+    else if (event === 'network_change' || event === 'offline' || event === 'online') tunnel.onNetworkChange()
+  }
+
   return {
     start,
     stop,
     status,
+    handlePower,
+    approve(id) {
+      return approval?.approve(id) ?? { ok: false, error: 'no-approval', approved: false }
+    },
+    deny(id) {
+      return approval?.deny(id) ?? { ok: false, error: 'no-approval', approved: false }
+    },
     get identity() {
       return identity
     },
@@ -213,6 +297,9 @@ export function createHostRuntime(opts = {}) {
     },
     get gateway() {
       return gateway
+    },
+    get approval() {
+      return approval
     },
   }
 }

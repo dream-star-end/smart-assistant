@@ -49,3 +49,10 @@ export { createWorkspaceStore, resolveWorkspacesPath } from './workspace/workspa
 export { buildWorkspaceEnv } from './workspace/workspaceEnv.mjs'
 export { createApprovalController, classifyDestructiveOp, APPROVAL_TIMEOUT_MS } from './workspace/approval.mjs'
 export { snapshotWorkspace } from './workspace/snapshot.mjs'
+export { applyWorkspaceToGatewaySpawn } from './workspace/applySpawn.mjs'
+export { createApprovalBridge } from './approvalBridge.mjs'
+export {
+  buildDesktopGatewayConfig,
+  resolveGatewayProfileDir,
+  writeDesktopGatewayProfile,
+} from './desktopGatewayProfile.mjs'

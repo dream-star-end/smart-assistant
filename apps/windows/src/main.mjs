@@ -16,6 +16,8 @@ import {
   ipcMain,
   nativeImage,
   nativeTheme,
+  net,
+  powerMonitor,
   protocol,
   safeStorage,
   screen,
@@ -61,9 +63,12 @@ import {
   resolveIdentityDirectory,
 } from './identity.mjs'
 import { createHostSupervisor, readDesktopHostConfigFromEnv } from './hostSupervisor.mjs'
+import { createHostLogger, resolveLogsDirectory } from './host/log.mjs'
 import { createApprovalController } from './host/workspace/approval.mjs'
 import { snapshotWorkspace } from './host/workspace/snapshot.mjs'
 import { createWorkspaceStore } from './host/workspace/workspaces.mjs'
+import { createLocalModeController, LocalMode } from './localMode.mjs'
+import { createPowerEventBridge } from './powerEvents.mjs'
 import {
   IPC_CHANNELS,
   createLocalHostIpcHandler,
@@ -210,7 +215,7 @@ function ensureApprovalController() {
       const win = ensureLocalHostWindow()
       if (isAlive(win)) win.show()
     },
-    audit: (entry) => console.info('[windows]', entry.event, entry.id ?? ''),
+    audit: (entry) => ensureAppLogger().info(entry.event, { id: entry.id, reason: entry.reason }),
   })
   return approvalController
 }
@@ -218,6 +223,34 @@ let appIdentityStore = null
 let hostSupervisor = null
 let tunnelState = 'offline'
 let hostStopStarted = false
+let appLogger = null
+let localModeController = null
+let powerBridge = null
+
+function ensureAppLogger() {
+  if (appLogger) return appLogger
+  try {
+    appLogger = createHostLogger({
+      directory: resolveLogsDirectory({
+        env: process.env,
+        platform: process.platform,
+        userDataPath: clarvyUserDataPath(),
+      }),
+    })
+  } catch {
+    appLogger = { info() {}, warn() {}, error() {}, debug() {} }
+  }
+  return appLogger
+}
+
+function ensureLocalMode() {
+  if (localModeController) return localModeController
+  localModeController = createLocalModeController({
+    audit: (entry) => ensureAppLogger().info('local_mode', entry),
+    onChange: () => desktopTrayApi?.rebuild(),
+  })
+  return localModeController
+}
 const liveNotifications = new Set()
 
 const viewerWindows = new Set()
@@ -2154,7 +2187,7 @@ function installEnrollment() {
     openExternal: (targetUrl) => openExternal(targetUrl),
     publicName: os.hostname().slice(0, 128),
     audit: (event, fields) => {
-      console.info('[windows]', event, fields ?? '')
+      ensureAppLogger().info(event, fields || {})
     },
   })
   const originalCallback = enrollmentController.handleCallback.bind(enrollmentController)
@@ -2173,7 +2206,13 @@ function installEnrollment() {
   localHostIpcHandler = createLocalHostIpcHandler({
     getLocalWebContents: () => (isAlive(localHostWindow) ? localHostWindow.webContents : null),
     enrollment: enrollmentController,
-    audit: (entry) => console.info('[windows]', entry.event),
+    audit: (entry) => ensureAppLogger().info(entry.event || 'ipc', entry),
+    localMode: ensureLocalMode(),
+    getProductStatus: () => ({
+      localMode: ensureLocalMode().mode,
+      tunnelState,
+      desiredLocal: ensureLocalMode().desired,
+    }),
     workspace: {
       setWorkspace: (rootPath) => applyWorkspaceRoot(rootPath),
       chooseWorkspace: async () => {
@@ -2189,9 +2228,48 @@ function installEnrollment() {
         return applyWorkspaceRoot(picked.filePaths[0])
       },
     },
-    approval: ensureApprovalController(),
+    approval: {
+      approve(id) {
+        hostSupervisor?.sendApprovalResult(id, true)
+        return ensureApprovalController().approve(id)
+      },
+      deny(id) {
+        hostSupervisor?.sendApprovalResult(id, false)
+        return ensureApprovalController().deny(id)
+      },
+    },
   })
   return enrollmentController
+}
+
+async function toggleLocalMode(enabled) {
+  const mode = ensureLocalMode()
+  if (enabled) {
+    const result = mode.enableLocal()
+    if (!result.ok) {
+      ensureAppLogger().info('local_mode_blocked', { reason: result.reason })
+      desktopTrayApi?.rebuild()
+      return result
+    }
+    await desktopSettingsStore?.setLocalModeEnabled(true)
+    if (!hostSupervisor) installLocalAgentHost()
+    ensureLocalHostWindow()?.show()
+  } else {
+    mode.disableLocal('user')
+    await desktopSettingsStore?.setLocalModeEnabled(false)
+  }
+  desktopTrayApi?.rebuild()
+  return { ok: true, mode: mode.mode }
+}
+
+function applyHostFallback(reason) {
+  const mode = ensureLocalMode()
+  if (reason === 'killswitch') mode.noteKillSwitch()
+  else if (reason === 'flag_off') mode.noteFlagOff()
+  else mode.noteHostUnavailable(reason || 'host_unavailable')
+  void desktopSettingsStore?.setLocalModeEnabled(false)
+  desktopTrayApi?.rebuild()
+  ensureAppLogger().warn('fallback_cloud', { reason })
 }
 
 function applyDeepLink(raw) {
@@ -2260,11 +2338,16 @@ async function installDesktopTray() {
       windowVisible: isAlive(mainWindow) && mainWindow.isVisible(),
       closeToTray: desktopSettingsStore?.closeToTray === true,
       tunnelState,
+      localModeEnabled: ensureLocalMode().desired === true || desktopSettingsStore?.localModeEnabled === true,
+      localMode: ensureLocalMode().mode,
     }),
     onShow: showMainWindow,
     onHide: hideMainWindow,
     onToggleCloseToTray: (value) => {
       void desktopSettingsStore?.setCloseToTray(value === true)
+    },
+    onToggleLocalMode: (enabled) => {
+      void toggleLocalMode(enabled === true)
     },
     onQuit: quitApplication,
   })
@@ -2334,7 +2417,19 @@ if (!hasSingleInstanceLock) {
       }
       await installDesktopTray()
       installEnrollment()
-      installLocalAgentHost()
+      ensureLocalMode()
+      powerBridge = createPowerEventBridge({
+        onSuspend: () => hostSupervisor?.sendPower('suspend'),
+        onResume: () => hostSupervisor?.sendPower('resume'),
+        onNetworkChange: () => hostSupervisor?.sendPower('network_change'),
+      })
+      powerBridge.attachElectron({ powerMonitor, net })
+      if (desktopSettingsStore?.localModeEnabled === true) {
+        ensureLocalMode().enableLocal({ force: true })
+        installLocalAgentHost()
+      } else {
+        installLocalAgentHost()
+      }
       const launchDeepLink = findOpenClaudeUrlInArgv(process.argv)
       if (launchDeepLink) applyDeepLink(launchDeepLink)
       await ensureNormalMainWindow()
@@ -2365,10 +2460,19 @@ function installLocalAgentHost() {
     config: readDesktopHostConfigFromEnv(process.env),
     onState: (state) => {
       tunnelState = state
+      if (state === 'offline' && ensureLocalMode().mode === LocalMode.LOCAL) {
+        applyHostFallback('tunnel_offline')
+      }
       desktopTrayApi?.rebuild()
     },
     onError: (err) => {
-      console.warn('[windows] host error:', err?.code || '', err?.message || err)
+      ensureAppLogger().warn('host_error', { errCode: err?.code, message: err?.message || String(err) })
+    },
+    onFallback: (info) => applyHostFallback(info?.reason || 'host_unavailable'),
+    onApprovalRequest: (info) => {
+      const win = ensureLocalHostWindow()
+      if (isAlive(win)) win.show()
+      ensureAppLogger().info('approval_request', { id: info?.id, kind: info?.kind })
     },
   })
   void hostSupervisor.start().catch((error) => {

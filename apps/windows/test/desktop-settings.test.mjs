@@ -10,13 +10,14 @@ import {
 
 test('normalizeDesktopSettings defaults closeToTray to false and only accepts true', () => {
   assert.deepEqual(normalizeDesktopSettings(undefined), DEFAULT_DESKTOP_SETTINGS)
-  assert.deepEqual(normalizeDesktopSettings(null), { closeToTray: false })
-  assert.deepEqual(normalizeDesktopSettings({ closeToTray: false }), { closeToTray: false })
-  assert.deepEqual(normalizeDesktopSettings({ closeToTray: true }), { closeToTray: true })
-  assert.deepEqual(normalizeDesktopSettings({ closeToTray: 'true' }), { closeToTray: false })
-  assert.deepEqual(normalizeDesktopSettings({ closeToTray: 1 }), { closeToTray: false })
+  assert.deepEqual(normalizeDesktopSettings(null), { closeToTray: false, localModeEnabled: false })
+  assert.deepEqual(normalizeDesktopSettings({ closeToTray: false }), { closeToTray: false, localModeEnabled: false })
+  assert.deepEqual(normalizeDesktopSettings({ closeToTray: true }), { closeToTray: true, localModeEnabled: false })
+  assert.deepEqual(normalizeDesktopSettings({ closeToTray: 'true' }), { closeToTray: false, localModeEnabled: false })
+  assert.deepEqual(normalizeDesktopSettings({ closeToTray: 1 }), { closeToTray: false, localModeEnabled: false })
   assert.deepEqual(normalizeDesktopSettings({ closeToTray: true, extra: 'drop' }), {
     closeToTray: true,
+    localModeEnabled: false,
   })
 })
 
@@ -30,7 +31,7 @@ test('DesktopSettingsStore loads missing or corrupt files as the safe default', 
     },
   })
   assert.equal(missing.filePath.endsWith(DESKTOP_SETTINGS_FILE), true)
-  assert.deepEqual(await missing.load(), { closeToTray: false })
+  assert.deepEqual(await missing.load(), { closeToTray: false, localModeEnabled: false })
   assert.equal(missing.closeToTray, false)
 
   const corrupt = new DesktopSettingsStore({
@@ -39,10 +40,10 @@ test('DesktopSettingsStore loads missing or corrupt files as the safe default', 
       readFile: async () => '{not-json',
     },
   })
-  assert.deepEqual(await corrupt.load(), { closeToTray: false })
+  assert.deepEqual(await corrupt.load(), { closeToTray: false, localModeEnabled: false })
 })
 
-test('DesktopSettingsStore persists only the boolean closeToTray flag atomically', async () => {
+test('DesktopSettingsStore persists closeToTray and localModeEnabled atomically', async () => {
   const files = new Map()
   const fsImpl = {
     mkdir: async () => {},
@@ -66,19 +67,22 @@ test('DesktopSettingsStore persists only the boolean closeToTray flag atomically
     userDataPath: 'C:\\Users\\test\\AppData\\Roaming\\Clarvy',
     fsImpl,
   })
-  assert.deepEqual(await store.load(), { closeToTray: false })
-  assert.deepEqual(await store.setCloseToTray(true), { closeToTray: true })
+  assert.deepEqual(await store.load(), { closeToTray: false, localModeEnabled: false })
+  assert.deepEqual(await store.setCloseToTray(true), { closeToTray: true, localModeEnabled: false })
   assert.equal(store.closeToTray, true)
-  assert.equal(files.get(store.filePath), '{"closeToTray":true}\n')
+  assert.equal(files.get(store.filePath), '{"closeToTray":true,"localModeEnabled":false}\n')
   assert.equal([...files.keys()].some((key) => key.includes('.tmp-')), false)
+
+  assert.deepEqual(await store.setLocalModeEnabled(true), { closeToTray: true, localModeEnabled: true })
+  assert.equal(store.localModeEnabled, true)
 
   const reloaded = new DesktopSettingsStore({
     userDataPath: 'C:\\Users\\test\\AppData\\Roaming\\Clarvy',
     fsImpl,
   })
-  assert.deepEqual(await reloaded.load(), { closeToTray: true })
-  assert.deepEqual(await reloaded.setCloseToTray(false), { closeToTray: false })
-  assert.equal(files.get(reloaded.filePath), '{"closeToTray":false}\n')
+  assert.deepEqual(await reloaded.load(), { closeToTray: true, localModeEnabled: true })
+  assert.deepEqual(await reloaded.setCloseToTray(false), { closeToTray: false, localModeEnabled: true })
+  assert.equal(files.get(reloaded.filePath), '{"closeToTray":false,"localModeEnabled":true}\n')
 })
 
 test('DesktopSettingsStore constructor requires userDataPath', () => {

@@ -4,11 +4,14 @@ import path from 'node:path'
 export const DESKTOP_SETTINGS_FILE = 'desktop-settings.json'
 export const DEFAULT_DESKTOP_SETTINGS = Object.freeze({
   closeToTray: false,
+  localModeEnabled: false,
 })
 
 export function normalizeDesktopSettings(value) {
+  const src = value != null && typeof value === 'object' ? value : {}
   return {
-    closeToTray: value != null && typeof value === 'object' && value.closeToTray === true,
+    closeToTray: src.closeToTray === true,
+    localModeEnabled: src.localModeEnabled === true,
   }
 }
 
@@ -46,8 +49,18 @@ export class DesktopSettingsStore {
     return this.settings.closeToTray === true
   }
 
+  get localModeEnabled() {
+    return this.settings.localModeEnabled === true
+  }
+
   async setCloseToTray(value) {
-    this.settings = normalizeDesktopSettings({ closeToTray: value === true })
+    this.settings = normalizeDesktopSettings({ ...this.settings, closeToTray: value === true })
+    await this.#persist()
+    return { ...this.settings }
+  }
+
+  async setLocalModeEnabled(value) {
+    this.settings = normalizeDesktopSettings({ ...this.settings, localModeEnabled: value === true })
     await this.#persist()
     return { ...this.settings }
   }

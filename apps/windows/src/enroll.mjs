@@ -20,32 +20,70 @@ const LOCAL_INDEX_HTML = `<!doctype html>
 <body>
 <main>
 <h1>本地模式</h1>
-<p>此窗口用于设备注册与工作区授权。</p>
+<p>此窗口用于设备注册、工作区授权与破坏性操作审批。</p>
+<p id="status">本地通道就绪</p>
+<p id="mode-status"></p>
 <button id="start-enroll" type="button">启用本地模式</button>
-<p id="status"></p>
+<button id="choose-workspace" type="button">选择工作区</button>
+<button id="fallback-cloud" type="button">回落云端</button>
+<section id="approval" hidden>
+  <h2>待审批操作</h2>
+  <p id="approval-detail"></p>
+  <button id="approve-op" type="button">允许</button>
+  <button id="deny-op" type="button">拒绝</button>
+</section>
 </main>
 <script src="./local.mjs"></script>
 </body>
 </html>
 `
 
-const LOCAL_SCRIPT = `const button = document.getElementById('start-enroll')
-const status = document.getElementById('status')
-button?.addEventListener('click', async () => {
-  if (!window.clarvyLocalHost?.invoke) {
-    status.textContent = '本地通道不可用'
-    return
-  }
-  button.disabled = true
+const LOCAL_SCRIPT = `const status = document.getElementById('status')
+const modeStatus = document.getElementById('mode-status')
+const invoke = (payload) => window.clarvyLocalHost?.invoke(payload)
+
+async function refreshStatus() {
   try {
-    const result = await window.clarvyLocalHost.invoke({ type: 'start-enroll' })
+    const result = await invoke({ type: 'get-status' })
+    if (result?.ok && result.status) {
+      const mode = result.status.localMode || result.status.phase || ''
+      modeStatus.textContent = mode ? ('状态：' + mode) : ''
+    }
+  } catch {
+    /* */
+  }
+}
+
+document.getElementById('start-enroll')?.addEventListener('click', async (event) => {
+  event.target.disabled = true
+  try {
+    const result = await invoke({ type: 'start-enroll' })
     status.textContent = result?.ok ? '已打开浏览器，请在网页确认这台电脑' : (result?.error || '失败')
   } catch {
     status.textContent = '失败'
   } finally {
-    button.disabled = false
+    event.target.disabled = false
+    void refreshStatus()
   }
 })
+document.getElementById('choose-workspace')?.addEventListener('click', async () => {
+  try {
+    const result = await invoke({ type: 'choose-workspace' })
+    status.textContent = result?.ok ? ('工作区：' + (result.path || '')) : (result?.error || '未选择')
+  } catch {
+    status.textContent = '选择工作区失败'
+  }
+})
+document.getElementById('fallback-cloud')?.addEventListener('click', async () => {
+  try {
+    const result = await invoke({ type: 'fallback-cloud' })
+    status.textContent = result?.ok ? '已回落云端薄壳' : (result?.error || '失败')
+  } catch {
+    status.textContent = '回落失败'
+  }
+  void refreshStatus()
+})
+void refreshStatus()
 `
 
 const LOCAL_ASSETS = new Map([

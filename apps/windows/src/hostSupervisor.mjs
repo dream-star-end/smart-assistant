@@ -41,6 +41,8 @@ export function createHostSupervisor({
   onState,
   onError,
   onMessage,
+  onFallback,
+  onApprovalRequest,
   now = () => Date.now(),
   restartWindowMs = RESTART_WINDOW_MS,
   maxRestarts = MAX_RESTARTS,
@@ -99,8 +101,17 @@ export function createHostSupervisor({
       onState?.(tunnelState)
       return
     }
+    if (raw.type === HostToElectron.FALLBACK) {
+      onFallback?.(raw)
+    }
+    if (raw.type === HostToElectron.APPROVAL_REQUEST) {
+      onApprovalRequest?.(raw)
+    }
     if (raw.type === HostToElectron.ERROR) {
       onError?.(raw)
+      if (raw.code === 'HOST_RESTART_LIMIT' || raw.code === 'UPDATE_REQUIRED') {
+        onFallback?.({ reason: raw.code })
+      }
     }
     if (raw.type === HostToElectron.STOPPED && stopWait) {
       stopWait()
@@ -127,6 +138,7 @@ export function createHostSupervisor({
         tunnelState = TunnelState.OFFLINE
         onState?.(tunnelState)
         onError?.({ code: 'HOST_RESTART_LIMIT', message: 'host crashed too many times' })
+        onFallback?.({ reason: 'host_unavailable' })
         return
       }
       const delay = Math.min(8_000, 400 * 2 ** Math.max(0, restartTimes.length - 1))
@@ -212,6 +224,12 @@ export function createHostSupervisor({
     start,
     stop,
     sendEnrollResult,
+    sendPower(event) {
+      send({ type: ElectronToHost.POWER_EVENT, event })
+    },
+    sendApprovalResult(id, approved) {
+      send({ type: ElectronToHost.APPROVAL_RESULT, id, approved: approved === true })
+    },
     get state() {
       return tunnelState
     },

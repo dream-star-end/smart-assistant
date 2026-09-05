@@ -130,6 +130,8 @@ export function createLocalHostIpcHandler({
   audit = () => {},
   workspace,
   approval,
+  localMode,
+  getProductStatus,
 } = {}) {
   return async function handleLocalHostIpc(event, payload) {
     const webContents = typeof getLocalWebContents === 'function' ? getLocalWebContents() : null
@@ -164,7 +166,20 @@ export function createLocalHostIpcHandler({
         typeof enrollment?.getStatus === 'function'
           ? enrollment.getStatus()
           : { phase: 'idle', hasIdentity: false, enrollmentId: null }
-      return { ok: true, status }
+      const extra = typeof getProductStatus === 'function' ? getProductStatus() : {}
+      return { ok: true, status: { ...status, ...extra } }
+    }
+
+    if (command.type === 'fallback-cloud') {
+      if (typeof localMode?.fallbackCloud !== 'function') {
+        return { ok: false, error: 'not-implemented' }
+      }
+      try {
+        const result = localMode.fallbackCloud('user')
+        return { ok: true, mode: result.mode }
+      } catch {
+        return { ok: false, error: 'fallback-failed' }
+      }
     }
 
     if (command.type === 'set-workspace') {

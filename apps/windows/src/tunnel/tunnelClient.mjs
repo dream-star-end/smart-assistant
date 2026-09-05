@@ -257,7 +257,11 @@ export function createTunnelClient(opts) {
         return
       }
       if (err instanceof RegisterError && (err.code === 'STALE_GENERATION' || err.code === 'UNAUTHORIZED')) {
-        void rotateAndReconnect(err.code)
+        if (typeof refreshToken === 'function') {
+          void rotateAndReconnect(err.code)
+          return
+        }
+        stopReconnectForever(err.code === 'STALE_GENERATION' ? 'stale_generation' : 'unauthorized')
         return
       }
       scheduleReconnect(err?.code || 'connect_error')

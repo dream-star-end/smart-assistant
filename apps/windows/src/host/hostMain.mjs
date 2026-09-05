@@ -75,6 +75,15 @@ async function main() {
         await shutdown(raw.type)
         return
       }
+      if (raw.type === ElectronToHost.POWER_EVENT) {
+        runtime?.handlePower(raw.event)
+        return
+      }
+      if (raw.type === ElectronToHost.APPROVAL_RESULT) {
+        if (raw.approved === true) runtime?.approve(raw.id)
+        else runtime?.deny(raw.id)
+        return
+      }
       if (raw.type === ElectronToHost.START || raw.type === ElectronToHost.ENROLL_RESULT) {
         const identity = raw.identity
         const config = raw.config || {}
@@ -94,10 +103,20 @@ async function main() {
           gatewayPort: config.gatewayPort,
           egressPort: config.egressPort,
           masterPort: config.masterPort,
+          claudeCodePath: config.claudeCodePath,
+          claudeCodeEntry: config.claudeCodeEntry,
+          claudeCodeRuntime: config.claudeCodeRuntime,
+          workspaceRoots: config.workspaceRoots || [],
+          workspacesPath: config.workspacesPath,
           refreshLeadMs: config.refreshLeadMs,
           onState: (state) => send({ type: HostToElectron.STATE, state }),
           onDegraded: (info) => send({ type: HostToElectron.DEGRADED, ...info }),
           onUpdateRequired: (info) => send({ type: HostToElectron.ERROR, code: 'UPDATE_REQUIRED', ...info }),
+          onApprovalRequest: (info) => send({ type: HostToElectron.APPROVAL_REQUEST, ...info }),
+          onFallback: (info) => send({ type: HostToElectron.FALLBACK, ...info }),
+          onEvent: (event, extra) => {
+            if (event === 'workspace_denied') hostLog.warn('workspace_denied', extra)
+          },
         })
         const st = await runtime.start(identity)
         send({ type: HostToElectron.STARTED, ...st })

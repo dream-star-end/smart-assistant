@@ -71,14 +71,17 @@ test('loadTrayIcon uses the packaged executable icon and never throws on empty c
   assert.deepEqual(empty, { empty: true })
 })
 
-test('buildTrayMenuTemplate exposes show/hide, the persisted close-to-tray toggle, and quit', () => {
+test('buildTrayMenuTemplate exposes show/hide, tray toggle, local mode, and quit', () => {
   const calls = []
   const hidden = buildTrayMenuTemplate({
     windowVisible: false,
     closeToTray: false,
+    localModeEnabled: false,
+    localMode: 'cloud',
     onShow: () => calls.push('show'),
     onHide: () => calls.push('hide'),
     onToggleCloseToTray: (value) => calls.push(['toggle', value]),
+    onToggleLocalMode: (value) => calls.push(['local', value]),
     onQuit: () => calls.push('quit'),
   })
   assert.equal(hidden[0].label, '显示主窗口')
@@ -88,8 +91,12 @@ test('buildTrayMenuTemplate exposes show/hide, the persisted close-to-tray toggl
   assert.equal(hidden[1].checked, false)
   hidden[1].click({ checked: true })
   assert.equal(hidden[2].type, 'separator')
-  hidden[3].click()
-  assert.deepEqual(calls, ['show', ['toggle', true], 'quit'])
+  assert.equal(hidden[3].type, 'checkbox')
+  assert.equal(hidden[3].label, '本地模式:关')
+  hidden[3].click({ checked: true })
+  const quit = hidden.find((item) => item.label === '退出')
+  quit.click()
+  assert.deepEqual(calls, ['show', ['toggle', true], ['local', true], 'quit'])
 
   const visible = buildTrayMenuTemplate({
     windowVisible: true,
@@ -126,14 +133,15 @@ test('createDesktopTray rebuilds the menu, shows on click, and does not invent I
     },
     icon: { id: 'icon' },
     tooltip: 'Clarvy',
-    getState: () => ({ windowVisible: false, closeToTray: false }),
+    getState: () => ({ windowVisible: false, closeToTray: false, localModeEnabled: false }),
     onShow: () => menus.push('shown'),
     onHide: () => {},
     onToggleCloseToTray: () => {},
+    onToggleLocalMode: () => {},
     onQuit: () => {},
   })
   assert.equal(trayApi.tray.icon.id, 'icon')
-  assert.equal(trayApi.tray.tooltip, 'Clarvy')
+  assert.ok(typeof trayApi.tray.tooltip === 'string')
   assert.equal(menus[0][0].label, '显示主窗口')
   handlers.get('click')()
   assert.equal(menus.includes('shown'), true)

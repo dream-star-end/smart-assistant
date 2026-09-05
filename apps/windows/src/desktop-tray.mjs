@@ -1,5 +1,7 @@
 import path from 'node:path'
 
+import { localModeTrayLabel } from './localMode.mjs'
+
 export function shouldHideInsteadOfClose({ isQuitting, closeToTray, smokeTest } = {}) {
   return smokeTest !== true && isQuitting !== true && closeToTray === true
 }
@@ -61,9 +63,12 @@ export function buildTrayMenuTemplate({
   windowVisible,
   closeToTray,
   tunnelState,
+  localModeEnabled,
+  localMode,
   onShow,
   onHide,
   onToggleCloseToTray,
+  onToggleLocalMode,
   onQuit,
 } = {}) {
   const items = [
@@ -80,9 +85,18 @@ export function buildTrayMenuTemplate({
       },
     },
   ]
+  items.push({ type: 'separator' })
+  items.push({
+    type: 'checkbox',
+    label: localModeTrayLabel(localMode, { desired: localModeEnabled === true }),
+    checked: localModeEnabled === true,
+    click: (menuItem) => {
+      onToggleLocalMode?.(menuItem?.checked === true)
+    },
+  })
   const status = tunnelStateLabel(tunnelState)
   if (status) {
-    items.push({ type: 'separator' }, { label: status, enabled: false })
+    items.push({ label: status, enabled: false })
   }
   items.push(
     { type: 'separator' },
@@ -103,6 +117,7 @@ export function createDesktopTray({
   onShow,
   onHide,
   onToggleCloseToTray,
+  onToggleLocalMode,
   onQuit,
 } = {}) {
   if (typeof Tray !== 'function' || typeof Menu?.buildFromTemplate !== 'function') {
@@ -117,10 +132,16 @@ export function createDesktopTray({
           windowVisible: state.windowVisible === true,
           closeToTray: state.closeToTray === true,
           tunnelState: state.tunnelState,
+          localModeEnabled: state.localModeEnabled === true,
+          localMode: state.localMode,
           onShow,
           onHide,
           onToggleCloseToTray: (value) => {
             onToggleCloseToTray?.(value)
+            rebuild()
+          },
+          onToggleLocalMode: (value) => {
+            onToggleLocalMode?.(value)
             rebuild()
           },
           onQuit,
@@ -129,8 +150,10 @@ export function createDesktopTray({
     )
     if (typeof tray.setToolTip === 'function') {
       const status = tunnelStateLabel(state.tunnelState)
+      const mode = localModeTrayLabel(state.localMode, { desired: state.localModeEnabled === true })
       const base = typeof tooltip === 'string' ? tooltip : ''
-      const next = status ? (base ? `${base} · ${status}` : status) : base
+      const bits = [base, mode, status].filter(Boolean)
+      const next = bits.join(' · ')
       if (next) tray.setToolTip(next)
     }
   }
