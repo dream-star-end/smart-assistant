@@ -26,19 +26,19 @@ import {
   refreshAccountToken,
 } from '../account-pool/refresh.js'
 import { createAccount, deleteAccount, getAccount } from '../account-pool/store.js'
-import { decryptToBuffer, encrypt } from '../crypto/aead.js'
+import { decryptToBuffer } from '../crypto/aead.js'
 import { KMS_KEY_BYTES } from '../crypto/keys.js'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
 import { resetTestSchemaForTest } from './helpers/db.js'
+import { insertTestEgressProxy } from './helpers/accountFixture.js';
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
 const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
 
 let pgAvailable = false
-let TEST_EGRESS_PROXY_ID = '1'
 const KEY = randomBytes(KMS_KEY_BYTES)
 const keyFn = (): Buffer => Buffer.from(KEY)
 
@@ -68,12 +68,6 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
   await resetTestSchemaForTest()
   await runMigrations()
-  const _ep = encrypt('http://test:test@10.0.0.1:8080', KEY)
-  const _r = await query<{ id: string }>(
-    "INSERT INTO egress_proxies(label, url_enc, url_nonce, status) VALUES ($1, $2, $3, 'active') RETURNING id::text AS id",
-    [`t-pool-${Date.now()}`, _ep.ciphertext, _ep.nonce],
-  )
-  TEST_EGRESS_PROXY_ID = _r.rows[0].id
 })
 
 after(async () => {
@@ -153,7 +147,7 @@ describe('refreshAccountToken — 成功路径', () => {
         token: 'OLD-ACCESS',
         refresh: 'OLD-REFRESH',
         expires_at: new Date(FIXED_NOW.getTime() - 60_000),
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -187,7 +181,7 @@ describe('refreshAccountToken — 成功路径', () => {
         plan: 'max',
         token: 'OLD-A',
         refresh: 'OLD-R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -216,7 +210,7 @@ describe('refreshAccountToken — 成功路径', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -239,7 +233,7 @@ describe('refreshAccountToken — 成功路径', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -262,7 +256,7 @@ describe('refreshAccountToken — 成功路径', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -284,7 +278,7 @@ describe('refreshAccountToken — 成功路径', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -310,7 +304,7 @@ describe('refreshAccountToken — 成功路径', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R-VAL',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -346,7 +340,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
   test('无 refresh_token → 禁用 + 抛 no_refresh_token', async (t) => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
-      { runtime_channel: 'v3', label: 'nr', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: 'v3', label: 'nr', plan: 'pro', token: 'T', egress_proxy_id: await insertTestEgressProxy(KEY) },
       keyFn,
     )
     await assert.rejects(
@@ -370,7 +364,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -400,7 +394,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -431,7 +425,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -457,7 +451,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -483,7 +477,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -516,7 +510,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -525,9 +519,11 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
     // 预埋 fail/health 缓存,验证 manualDisable 会清
     await redis.set(`acct:fail:${a.id}`, '2')
     await redis.set(`acct:health:${a.id}`, '80')
+    // 5xx is classified as network_transient (no disable). Use 400 http_error
+    // so this still covers the injected health.manualDisable path.
     await assert.rejects(
       refreshAccountToken(a.id, {
-        http: mockHttp({ status: 500, body: 'boom' }),
+        http: mockHttp({ status: 400, body: 'boom' }),
         keyFn,
         now,
         health: tracker,
@@ -552,7 +548,7 @@ describe('refreshAccountToken — 并发删除', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )
@@ -578,7 +574,7 @@ describe('refreshAccountToken — singleflight (#H8)', () => {
   test('同账号 5 个并发 refresh → http.post 只被打 1 次,5 个 waiter 都拿到结果', async (t) => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
-      { runtime_channel: 'v3', label: 'sf', plan: 'pro', token: 'T', refresh: 'R', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: 'v3', label: 'sf', plan: 'pro', token: 'T', refresh: 'R', egress_proxy_id: await insertTestEgressProxy(KEY) },
       keyFn,
     )
 
@@ -629,7 +625,7 @@ describe('refreshAccountToken — singleflight (#H8)', () => {
         plan: 'pro',
         token: 'T',
         refresh: 'R',
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY),
       },
       keyFn,
     )

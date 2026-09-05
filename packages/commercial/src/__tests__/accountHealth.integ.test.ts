@@ -29,7 +29,6 @@ import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.j
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { KMS_KEY_BYTES } from "../crypto/keys.js";
-import { encrypt } from "../crypto/aead.js";
 import { createAccount, getAccount, updateAccount } from "../account-pool/store.js";
 import {
   AccountHealthTracker,
@@ -39,6 +38,7 @@ import {
   type HealthRedis,
 } from "../account-pool/health.js";
 import { resetTestSchemaForTest } from "./helpers/db.js";
+import { insertTestEgressProxy } from "./helpers/accountFixture.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
@@ -46,7 +46,6 @@ const TEST_DB_URL =
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 
 let pgAvailable = false;
-let TEST_EGRESS_PROXY_ID = "1";
 const KEY = randomBytes(KMS_KEY_BYTES);
 const keyFn = (): Buffer => Buffer.from(KEY);
 
@@ -66,12 +65,6 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }));
   await resetTestSchemaForTest();
   await runMigrations();
-  const _ep = encrypt("http://test:test@10.0.0.1:8080", KEY);
-  const _r = await query<{ id: string }>(
-    "INSERT INTO egress_proxies(label, url_enc, url_nonce, status) VALUES ($1, $2, $3, 'active') RETURNING id::text AS id",
-    [`t-pool-${Date.now()}`, _ep.ciphertext, _ep.nonce],
-  );
-  TEST_EGRESS_PROXY_ID = _r.rows[0].id;
 });
 
 after(async () => {
@@ -92,7 +85,7 @@ function skipIfNoDb(t: { skip: (reason: string) => void }): boolean {
 }
 
 async function freshAccount(): Promise<bigint> {
-  const a = await createAccount({ runtime_channel: "v3", label: "h-test", plan: "pro", token: "T", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
+  const a = await createAccount({ runtime_channel: "v3", label: "h-test", plan: "pro", token: "T", egress_proxy_id: await insertTestEgressProxy(KEY) }, keyFn);
   return a.id;
 }
 
@@ -278,11 +271,11 @@ describe("halfOpen", () => {
     // v5 codex 行(他 channel)cooldown 已到期也不许翻;v3 codex 行(本 channel)照常恢复。
     const foreign = await createAccount({
       runtime_channel: "v5", provider: "codex", label: "h-codex-v5", plan: "pro",
-      token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID,
+      token: "T", refresh: "R", egress_proxy_id: await insertTestEgressProxy(KEY),
     }, keyFn);
     const own = await createAccount({
       runtime_channel: "v3", provider: "codex", label: "h-codex-v3", plan: "pro",
-      token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID,
+      token: "T", refresh: "R", egress_proxy_id: await insertTestEgressProxy(KEY),
     }, keyFn);
     const expired = { status: "cooldown" as const, cooldown_until: new Date(Date.now() - 60_000), health_score: 40 };
     await updateAccount(foreign.id, expired, keyFn);
