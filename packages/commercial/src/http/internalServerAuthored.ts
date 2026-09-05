@@ -71,7 +71,11 @@ import {
   type LosslessTurnTapeVisibleRequest,
   type TurnWaiveReason,
 } from "@openclaude/protocol";
-import type { DispatchAdmissionBackend, LosslessTurnTapeStorage } from "../db/pgSessionsBackend.js";
+import type {
+  DispatchAdmissionBackend,
+  LosslessTurnTapeFinalizeResult,
+  LosslessTurnTapeStorage,
+} from "../db/pgSessionsBackend.js";
 import type { TurnWaiverInput, TurnWaiverResult } from "../billing/refund.js";
 import { recordProviderHealthSample } from "./proxy/providerHealthSink.js";
 
@@ -2260,20 +2264,61 @@ function isLosslessTurnTapeWireBody(raw: unknown): boolean {
 }
 
 /**
- * turn tape 落库错误的**瞬态 vs 永久**判定(止血批 A · A3)。
+ * turn tape 落库错误的**瞬态 vs 永久**判定(止血批 A · A3;2026-09-05 起默认反转)。
  *
  * part/finalize 若因 PG **瞬态**故障失败(statement timeout / 连接类 / 死锁 / 锁不可得 /
- * 服务重启),必须回 **503 + TURN_TAPE_RETRYABLE**,让容器侧 fsync 队列**幂等重试**;绝不能
+ * 服务重启 / 连接池打满),必须回 **503 + TURN_TAPE_RETRYABLE**,让容器侧 fsync 队列**幂等重试**;绝不能
  * 回 409 —— 409 语义=永久不可变冲突(别重试),会让本可重试的 part/finalize 永久丢失。
  * 409(TURN_TAPE_CONFLICT)只留给真正的 immutable 冲突(同 index 不同 sha、聚合/校验失败等,
  * 重试也不会变的确定性错误)。
  *
- * 判据:PG SQLSTATE(node-pg 挂在 err.code,仓内既有惯例即直读 .code,见 plugins/accounts.ts
- * 的 '23505' 判定)+ message 兜底(socket 级错误可能无 code)。
- *   57014 query_canceled(statement timeout) · 40001 serialization_failure ·
- *   40P01 deadlock_detected · 55P03 lock_not_available ·
- *   08*  连接异常类 · 57P0* 服务 shutdown / cannot_connect_now。
+ * **默认反转**(gpt-6 复发事故审计 case 3):旧白名单制把一切未识别形态(PG 53300 too many
+ * clients、57P01、ECONNRESET/ECONNREFUSED/ETIMEDOUT、AbortError、任意未知异常)都判成永久
+ * → 409 → 网关 sink 视 409 为 fatal → drainer 把整条 tape 永久 quarantine。part/finalize
+ * 本身幂等,未知错误重试无害;误判 409 却不可逆。因此现在改为**闭集判定**:只有
+ * `isImmutableTurnTapeConflict` 认定的确定性 immutable 冲突才允许 409,其余(含全部未知
+ * 形态与 PG 容量/连接类 SQLSTATE 53300/57P01/08xxx/40001/40P01/55P03/57014)一律 503 重试。
  */
+
+/** pgSessionsBackend 确定性 immutable 冲突消息闭集(同 tapeId 异身份 / header 冲突 /
+ * 聚合与哈希校验失败 / 不可变存储格式漂移)。命中 → 409 永久;未命中 → 503 重试。 */
+const IMMUTABLE_TURN_TAPE_CONFLICT_MESSAGE_RE = new RegExp(
+  [
+    "immutable part (?:manifest )?conflict",
+    "finalize header conflict",
+    "immutable header conflict",
+    "dispatch identity conflict",
+    "settlement conflict",
+    "engineBillings mismatch",
+    "recovery (?:request|source) identity conflict",
+    "immutable record identity conflict",
+    "immutable model sidecar conflict",
+    "immutable lossless cost locator conflict",
+    "part hash mismatch",
+    "aggregate (?:hash|length) mismatch",
+    "envelope/payload identity mismatch",
+    "canonical JSON invalid",
+    "storage format is invalid",
+    "materialization format changed",
+    "derived record write changed",
+    "source parts changed during record staging",
+  ].join("|"),
+  "i",
+);
+
+/** 只有确定性 immutable 冲突才返回 true(→ 409 TURN_TAPE_CONFLICT,sink 侧唯一 quarantine
+ * 信号)。storage 实现也可用 `{ immutableConflict: true }` 显式标记。 */
+function isImmutableTurnTapeConflict(err: unknown): boolean {
+  if (
+    err && typeof err === "object" &&
+    (err as { immutableConflict?: unknown }).immutableConflict === true
+  ) {
+    return true;
+  }
+  const msg = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+  return msg !== "" && IMMUTABLE_TURN_TAPE_CONFLICT_MESSAGE_RE.test(msg);
+}
+
 function isTransientTurnTapeStorageError(err: unknown): boolean {
   if (
     err && typeof err === "object" &&
@@ -2281,20 +2326,8 @@ function isTransientTurnTapeStorageError(err: unknown): boolean {
   ) {
     return true;
   }
-  const code =
-    err && typeof err === "object" && typeof (err as { code?: unknown }).code === "string"
-      ? (err as { code: string }).code
-      : "";
-  if (
-    code === "57014" || code === "40001" || code === "40P01" || code === "55P03"
-    || code.startsWith("08") || code.startsWith("57P")
-  ) {
-    return true;
-  }
-  const msg = err instanceof Error ? err.message : typeof err === "string" ? err : "";
-  return /statement timeout|canceling statement due to|connection terminated|terminating connection|server closed the connection|ECONNRESET|ETIMEDOUT|EPIPE/i.test(
-    msg,
-  );
+  // 默认瞬态:未识别错误重试无害(幂等),误判 409 却会永久 quarantine 整条 tape。
+  return !isImmutableTurnTapeConflict(err);
 }
 
 async function handleLosslessTurnTapeRequest(args: {
@@ -2334,43 +2367,9 @@ async function handleLosslessTurnTapeRequest(args: {
       sendJsonError(args.res, 400, "INVALID_TURN_TAPE_LAYOUT", "turn tape visible layout rejected", args.requestId);
       return;
     }
+    let result: LosslessTurnTapeFinalizeResult;
     try {
-      const result = await args.storage.commitVisibleLosslessTurnTape(args.userId, body);
-      if (result.applied === "session_not_found") {
-        sendJsonError(args.res, 404, "SESSION_NOT_FOUND", "no client_sessions row for sessionId+userId", args.requestId);
-        return;
-      }
-      if (result.applied === "session_deleted") {
-        sendJsonError(args.res, 410, "SESSION_DELETED", "client_sessions row is soft-deleted", args.requestId);
-        return;
-      }
-      if (result.applied !== "finalized" && result.applied !== "idempotent") {
-        throw new Error("visible commit failed to create immutable tape header");
-      }
-      if (result.newlyVisible && result.clientMessageId && !result.dispatchLateTape) {
-        args.broadcastToUser?.(args.numericUserId, {
-          type: "outbound.message",
-          channel: "webchat",
-          peer: { id: body.sessionId, kind: "dm" },
-          agentId: body.agentId,
-          clientMessageId: result.clientMessageId,
-          blocks: [],
-          isFinal: true,
-          meta: {
-            reconcile: body.status === "completed" ? "turn_completed" : "interrupted",
-            clientMessageId: result.clientMessageId,
-          },
-          ts: Date.now(),
-        });
-      }
-      args.metric(result.applied === "idempotent" ? "deduped" : "ok", "assistant");
-      sendJsonOk(args.res, 200, {
-        ok: true,
-        idempotent: result.applied === "idempotent",
-        visible: true,
-        settlementHandoff: true,
-      }, args.requestId);
-      return;
+      result = await args.storage.commitVisibleLosslessTurnTape(args.userId, body);
     } catch (err) {
       const transient = isTransientTurnTapeStorageError(err);
       args.userLog.error("lossless_turn_tape_visible_failed", {
@@ -2387,6 +2386,69 @@ async function handleLosslessTurnTapeRequest(args: {
       );
       return;
     }
+    if (result.applied === "session_not_found") {
+      sendJsonError(args.res, 404, "SESSION_NOT_FOUND", "no client_sessions row for sessionId+userId", args.requestId);
+      return;
+    }
+    if (result.applied === "session_deleted") {
+      sendJsonError(args.res, 410, "SESSION_DELETED", "client_sessions row is soft-deleted", args.requestId);
+      return;
+    }
+    if (result.applied !== "finalized" && result.applied !== "idempotent") {
+      // Defensive contract violation: storage already decided. Retryable by
+      // policy — quarantining a stored tape over an unrecognized outcome would
+      // discard paid content (default-transient, gpt-6 audit case 3).
+      args.userLog.error("lossless_turn_tape_visible_failed", {
+        tapeId: body.tapeId,
+        transient: true,
+        err: new Error("visible commit failed to create immutable tape header"),
+      });
+      sendJsonError(
+        args.res,
+        503,
+        "TURN_TAPE_RETRYABLE",
+        "visible commit failed to create immutable tape header",
+        args.requestId,
+      );
+      return;
+    }
+    // Post-commit live projection is a best-effort side effect and deliberately
+    // lives OUTSIDE the storage try/catch: storage already committed, so a
+    // synchronous broadcast throw must never fall into the storage classifier
+    // (that used to flip a successfully stored tape into 409/fatal → permanent
+    // quarantine; gpt-6 recurring-incident audit case 3).
+    if (result.newlyVisible && result.clientMessageId && !result.dispatchLateTape) {
+      try {
+        args.broadcastToUser?.(args.numericUserId, {
+          type: "outbound.message",
+          channel: "webchat",
+          peer: { id: body.sessionId, kind: "dm" },
+          agentId: body.agentId,
+          clientMessageId: result.clientMessageId,
+          blocks: [],
+          isFinal: true,
+          meta: {
+            reconcile: body.status === "completed" ? "turn_completed" : "interrupted",
+            clientMessageId: result.clientMessageId,
+          },
+          ts: Date.now(),
+        });
+      } catch (err) {
+        args.userLog.warn("lossless_turn_tape_visible_broadcast_failed", {
+          tapeId: body.tapeId,
+          clientMessageId: result.clientMessageId,
+          err: err as Error,
+        });
+      }
+    }
+    args.metric(result.applied === "idempotent" ? "deduped" : "ok", "assistant");
+    sendJsonOk(args.res, 200, {
+      ok: true,
+      idempotent: result.applied === "idempotent",
+      visible: true,
+      settlementHandoff: true,
+    }, args.requestId);
+    return;
   }
   if (action === "part") {
     const parsed = LosslessTapePartSchema.safeParse(args.raw);
@@ -2474,7 +2536,11 @@ async function handleLosslessTurnTapeRequest(args: {
         return;
       }
       if (result.applied === "incomplete") {
-        sendJsonError(args.res, 409, "TURN_TAPE_INCOMPLETE", "turn tape is not fully staged", args.requestId);
+        // Parts may still be in flight in the container fsync queue (or their
+        // own transient retries pending). Incomplete is NOT an immutable
+        // conflict — 409 made the sink quarantine a tape whose parts were
+        // merely late (gpt-6 audit case 3). Retry finalize after they land.
+        sendJsonError(args.res, 503, "TURN_TAPE_RETRYABLE", "turn tape is not fully staged", args.requestId);
         return;
       }
       if (result.applied !== "finalized" && result.applied !== "idempotent") {
@@ -2603,20 +2669,32 @@ async function handleLosslessTurnTapeRequest(args: {
         }
       }
       if (result.newlyVisible && result.clientMessageId && !result.dispatchLateTape) {
-        args.broadcastToUser?.(args.numericUserId, {
-          type: "outbound.message",
-          channel: "webchat",
-          peer: { id: body.sessionId, kind: "dm" },
-          agentId: body.agentId,
-          clientMessageId: result.clientMessageId,
-          blocks: [],
-          isFinal: true,
-          meta: {
-            reconcile: body.status === "completed" ? "turn_completed" : "interrupted",
+        // Best-effort post-commit projection: a synchronous broadcast throw
+        // must never reach the storage classifier below — storage already
+        // committed, so the response stays a success ACK regardless (gpt-6
+        // recurring-incident audit case 3).
+        try {
+          args.broadcastToUser?.(args.numericUserId, {
+            type: "outbound.message",
+            channel: "webchat",
+            peer: { id: body.sessionId, kind: "dm" },
+            agentId: body.agentId,
             clientMessageId: result.clientMessageId,
-          },
-          ts: Date.now(),
-        });
+            blocks: [],
+            isFinal: true,
+            meta: {
+              reconcile: body.status === "completed" ? "turn_completed" : "interrupted",
+              clientMessageId: result.clientMessageId,
+            },
+            ts: Date.now(),
+          });
+        } catch (err) {
+          args.userLog.warn("lossless_turn_tape_finalize_broadcast_failed", {
+            tapeId: body.tapeId,
+            clientMessageId: result.clientMessageId,
+            err: err as Error,
+          });
+        }
       }
       args.metric(result.applied === "idempotent" ? "deduped" : "ok", "assistant");
       sendJsonOk(args.res, 200, {
