@@ -284,7 +284,19 @@ try {
     const modelTrigger = page.getByRole("button", { name: "选择对话模型" });
     await modelTrigger.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     await modelTrigger.click();
+    // 2026-09-05 selfhost df78c8c9b: Terra/Luna 收进折叠组「更多 GPT 模型」(data-collapsed-group)。
+    // 旅程模型若不在首屏菜单里,先展开折叠组(onSelect preventDefault,菜单保持打开),再找菜单项。
+    // 与 App.test b940064f1 同一契约;折叠组不存在(旧 UI)则直接找项,不放宽超时。
     const modelItem = page.locator(`[data-model-id="${JOURNEY_MODEL_ID}"]`);
+    if ((await modelItem.count()) === 0) {
+      const collapsedGroup = page.locator("[data-collapsed-group]").first();
+      if ((await collapsedGroup.count()) > 0) {
+        await collapsedGroup.click();
+        await page
+          .locator('[data-collapsed-group="open"]')
+          .waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+      }
+    }
     await modelItem.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     const journeyModelLabel = (await modelItem.textContent())?.trim();
     if (!journeyModelLabel) throw new Error(`旅程模型 ${JOURNEY_MODEL_ID} 缺少可见展示名`);
