@@ -751,9 +751,9 @@ describe("模型权威阶段 A 一致性锚:platform-seed 声明 == master 常�
     assert.equal(agents.codex?.runnerKind, "app-server", "codex runner 必须是 app-server");
     assert.equal(agents["hidden-reviewer"]?.forcePersona, true, "隐藏审查员 persona 必须每 boot 强刷(裁决词同步)");
 
-    // 当前期望值(2026-08-22 起 glm-5.3-zai / zai;ark glm-5.3 不再做默认)。
-    assert.equal(PLATFORM_DEFAULT_MODEL, "glm-5.3-zai");
-    assert.equal(PLATFORM_DEFAULT_PROVIDER, "zai");
+    // 当前期望值(2026-09-04 起 deepseek-v4-flash / opencodego;隐藏审查员仍 glm-5.3-zai)。
+    assert.equal(PLATFORM_DEFAULT_MODEL, "deepseek-v4-flash");
+    assert.equal(PLATFORM_DEFAULT_PROVIDER, "opencodego");
     assert.equal(PLATFORM_HIDDEN_REVIEWER_MODEL, "glm-5.3-zai");
     assert.equal(PLATFORM_HIDDEN_REVIEWER_PROVIDER, "zai");
   });

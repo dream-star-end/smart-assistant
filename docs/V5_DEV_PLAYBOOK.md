@@ -22,6 +22,10 @@ master: openclaude-v5.service(kl-mirror,127.0.0.1:18790)
   ├─► egress: openclaude-v5-egress.service(172.31.0.1:18892,LLM 出站面)
   │     /v1/messages 本地 anthropicProxy 全链;其余转发 master 控制口 127.0.0.1:18894
   │     日志 /var/log/openclaude-v5-egress.log;master 重启不断流;改它必须 deploy-v5.sh --egress
+  │     独立 release 指针 /opt/openclaude/openclaude-v5-egress,不随 A/B 翻转。deploy 在 lease 外跑
+  │     egress surface gate:egress 运行 release..发布源在 egress/、http/proxy/、anthropicProxy.ts、
+  │     internalCostEvent.ts、account-pool/、billing/(排除测试)有 diff 而未带 --egress → 拒发
+  │     (2026-09-04 cursor 子 agent 409 事故);OC_V5_SKIP_EGRESS_SURFACE_GATE=1 显式放行
   │
   └─► 用户容器(docker,openclaude-v5-net 172.31/16,镜像 openclaude/openclaude-runtime:v5-ccb-*)
         容器内 gateway(packages/gateway)= 真正执行 turn 的进程

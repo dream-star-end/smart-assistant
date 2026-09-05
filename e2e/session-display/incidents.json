@@ -2916,6 +2916,9 @@
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "[session-unavailable-rootfix] PASS — detach drain, durable cron receipt, rejected convergence and bounded memory retry are locked"
         }
+      ],
+      "coverageCommits": [
+        "8daba1a8"
       ]
     },
     {
@@ -2945,6 +2948,9 @@
           "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
           "assertion": "停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活"
         }
+      ],
+      "coverageCommits": [
+        "ec0957f2"
       ]
     },
     {

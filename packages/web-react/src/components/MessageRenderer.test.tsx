@@ -181,13 +181,13 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(document.body.textContent).toContain(marker);
   });
 
-  test("assistant：余额不足错误卡含「去充值」CTA，点击触发 onTopUp", () => {
+  test("assistant：余额不足错误卡含「开通 Lite」CTA，点击触发 onTopUp", () => {
     const onTopUp = vi.fn();
     renderMsg(mk("assistant", { _errorCode: "insufficient_credits", _errorDetail: "shortfall 120" }), {
-      cb: { onTopUp },
+      cb: { onTopUp, subscriptionPaid: false },
     });
-    expect(screen.getByText("积分已耗尽")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /去充值/ }));
+    expect(screen.getByText("免费额度已用完")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /开通 Lite/ }));
     expect(onTopUp).toHaveBeenCalledTimes(1);
   });
 

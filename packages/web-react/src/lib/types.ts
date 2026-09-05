@@ -282,8 +282,17 @@ export type RefreshOutcome =
 /** 注册（POST /api/auth/register，201）。 */
 export type RegisterResult = { userId: string; verifyEmailSent: boolean };
 
-/** 邮箱验证（POST /api/auth/verify-email）。 */
-export type VerifyEmailResult = { userId: string; newlyVerified: boolean };
+/** 邮箱验证（POST /api/auth/verify-email）。成功响应同时带 session(同 LoginResult)。 */
+export type VerifyEmailResult = {
+  userId: string;
+  newlyVerified: boolean;
+  accessToken: string;
+  accessExp: number;
+  refreshExp: number;
+  remember: boolean;
+  user: User;
+  lane?: string | null;
+};
 
 /** 公开配置（GET /api/public/config）。匿名可读，驱动 Turnstile / 注册开关。 */
 export type PublicConfig = {

@@ -27,7 +27,7 @@ const {
 } = await import('../skillEvalGen.js')
 const { SkillEvalGenJobStore } = await import('../skillEvalGenJobs.js')
 const { SkillEvalJobStore } = await import('../skillEvalJobs.js')
-const { paths } = await import('@openclaude/storage')
+const { paths, MAX_EVAL_CASES } = await import('@openclaude/storage')
 
 const T0 = 1_700_000_000_000
 
@@ -197,9 +197,9 @@ describe('normalizeGeneratedCases', () => {
     assert.equal(out[1].assertions.length, 8) // MAX_EVAL_ASSERTIONS
   })
 
-  it('caps generated cases at MAX_EVAL_CASES (5)', () => {
-    const raw = Array.from({ length: 9 }, (_, i) => ({ prompt: `p${i}`, assertions: ['a'] }))
-    assert.equal(normalizeGeneratedCases(raw, []).length, 5)
+  it('caps generated cases at MAX_EVAL_CASES', () => {
+    const raw = Array.from({ length: MAX_EVAL_CASES + 4 }, (_, i) => ({ prompt: `p${i}`, assertions: ['a'] }))
+    assert.equal(normalizeGeneratedCases(raw, []).length, MAX_EVAL_CASES)
   })
 })
 
@@ -214,8 +214,8 @@ describe('buildGenerationNote', () => {
     assert.match(n, /按技能声明的场景推导/)
   })
   it('warns when existing + generated exceed the cap', () => {
-    const n = buildGenerationNote({ excerptCount: 1, existingCount: 4, generatedCount: 4 })
-    assert.match(n, /上限 5/)
+    const n = buildGenerationNote({ excerptCount: 1, existingCount: MAX_EVAL_CASES, generatedCount: 4 })
+    assert.match(n, new RegExp(`上限 ${MAX_EVAL_CASES}`))
     assert.match(n, /酌情删减/)
   })
   it('no merge warning when total within cap', () => {

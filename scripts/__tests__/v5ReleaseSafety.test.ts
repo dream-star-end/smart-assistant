@@ -1862,7 +1862,7 @@ describe('v5 release safety lanes', () => {
     assert.match(untraversableResult.stderr, /not world-readable\/traversable/)
   })
 
-  test('legacy serving baseline compat allows only pre-admin cursor/taskboard/ssh gaps', async () => {
+  test('legacy serving baseline compat allows only pre-admin cursor/taskboard/ssh/multi-model-review gaps', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-legacy-cursor-')); dirs.push(dir)
     const release = path.join(dir, 'release')
     const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
@@ -1871,6 +1871,7 @@ describe('v5 release safety lanes', () => {
     await rm(path.join(baseline, 'skills/cursor-cli'), { recursive: true })
     await rm(path.join(baseline, 'skills/manage-taskboard'), { recursive: true })
     await rm(path.join(baseline, 'skills/ssh'), { recursive: true })
+    await rm(path.join(baseline, 'skills/multi-model-review'), { recursive: true })
     await rm(path.join(baseline, 'AGENTS.admin.md'))
     await rm(path.join(baseline, 'CLAUDE.admin.md'))
     const strict = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
@@ -1894,6 +1895,124 @@ describe('v5 release safety lanes', () => {
     assert.match(prepare, /assert_legacy_release_baseline_security "\$live_release"/)
     assert.doesNotMatch(prepare, /harden_release_baseline "\$live_release"/)
     assert.doesNotMatch(prepare, /assert_release_baseline_security "\$live_release"/)
+  })
+
+  test('post-rollback smoke uses legacy baseline for predecessor missing multi-model-review', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-rollback-smoke-legacy-')); dirs.push(dir)
+    const oldRelease = path.join(dir, 'rel-old')
+    const newRelease = path.join(dir, 'rel-new')
+    const copyBaseline = async (release: string) => {
+      const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
+      await mkdir(path.dirname(baseline), { recursive: true })
+      await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
+      return baseline
+    }
+    const oldBaseline = await copyBaseline(oldRelease)
+    await copyBaseline(newRelease)
+    await rm(path.join(oldBaseline, 'skills/multi-model-review'), { recursive: true })
+
+    const strictOld = spawnSync('bash', [baselineGuard, 'check-release', oldRelease], { encoding: 'utf8' })
+    assert.notEqual(strictOld.status, 0)
+    assert.match(strictOld.stderr, /skill manifest mismatch/)
+
+    const strictNew = spawnSync('bash', [baselineGuard, 'check-release', newRelease], { encoding: 'utf8' })
+    assert.equal(strictNew.status, 0, strictNew.stderr)
+
+    const legacyOld = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', oldRelease], { encoding: 'utf8' })
+    assert.equal(legacyOld.status, 0, legacyOld.stderr)
+
+    const source = await readFile(deploy, 'utf8')
+    const helper = source.match(/serving_release_uses_legacy_baseline\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(helper, /BUILT_RELEASE/)
+    assert.match(helper, /ROLLBACK_LEGACY_BASELINE_OK/)
+    const smoke = source.match(/^smoke\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
+    assert.match(smoke, /assert_live_baseline_security_for_slot "\$baseline_slot"/)
+    assert.match(source, /assert_live_baseline_security_for_slot\(\)[\s\S]*verify_release_baseline_security "\$live_release"/)
+    const verify = source.match(/verify_release_baseline_security\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(verify, /serving_release_uses_legacy_baseline "\$release"/)
+    assert.match(verify, /--allow-legacy-manifest-missing/)
+
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'ssh() { echo "UNEXPECTED-ssh:$*" >&2; return 1; }',
+      `BUILT_RELEASE='${newRelease}'`,
+      `serving_release_uses_legacy_baseline '${oldRelease}' && echo old=0 || echo old=1`,
+      `serving_release_uses_legacy_baseline '${newRelease}' && echo new=0 || echo new=1`,
+      `ROLLBACK_LEGACY_BASELINE_OK=1 serving_release_uses_legacy_baseline '${newRelease}' && echo flagged=0 || echo flagged=1`,
+      'unset ROLLBACK_LEGACY_BASELINE_OK BUILT_RELEASE',
+      `serving_release_uses_legacy_baseline '${oldRelease}' && echo unknown=0 || echo unknown=1`,
+    ].join('\n')
+    const decision = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.equal(decision.status, 0, decision.stdout + decision.stderr)
+    assert.match(decision.stdout, /^old=0$/m)
+    assert.match(decision.stdout, /^new=1$/m)
+    assert.match(decision.stdout, /^flagged=0$/m)
+    assert.match(decision.stdout, /^unknown=1$/m)
+  })
+
+  test('recover smoke classifies legacy baseline by serving sourceCommit when BUILT_RELEASE is empty', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-recover-smoke-legacy-')); dirs.push(dir)
+    const mismatch = path.join(dir, 'rel-old')
+    const match = path.join(dir, 'rel-head')
+    const missing = path.join(dir, 'rel-nosha')
+    await mkdir(mismatch, { recursive: true })
+    await mkdir(match, { recursive: true })
+    await mkdir(missing, { recursive: true })
+    const head = spawnSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' })
+    assert.equal(head.status, 0, head.stderr)
+    const headSha = head.stdout.trim()
+    assert.match(headSha, /^[0-9a-f]{40}$/)
+    const otherSha = 'c40f716cc0000000000000000000000000000000'
+    assert.notEqual(otherSha, headSha)
+    await writeFile(path.join(mismatch, '.complete'), JSON.stringify({
+      schemaVersion: 2,
+      sourceCommit: otherSha,
+    }) + '\n')
+    await writeFile(path.join(match, '.complete'), JSON.stringify({
+      schemaVersion: 2,
+      sourceCommit: headSha,
+    }) + '\n')
+    await writeFile(path.join(missing, '.complete'), JSON.stringify({
+      schemaVersion: 2,
+    }) + '\n')
+
+    const source = await readFile(deploy, 'utf8')
+    const helper = source.match(/serving_release_uses_legacy_baseline\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(helper, /sourceCommit/)
+    assert.match(helper, /rev-parse HEAD/)
+    assert.match(helper, /BUILT_RELEASE/)
+    assert.match(helper, /DRY/)
+
+    const harness = [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'KL_HOST=fake-v5',
+      'DRY=0',
+      'unset BUILT_RELEASE ROLLBACK_LEGACY_BASELINE_OK',
+      'ssh() { local _host="$1"; shift; if [[ $# == 1 ]]; then bash -c "$1"; else "$@"; fi; }',
+      `serving_release_uses_legacy_baseline '${mismatch}' && echo mismatch=0 || echo mismatch=1`,
+      `serving_release_uses_legacy_baseline '${match}' && echo match=0 || echo match=1`,
+      `serving_release_uses_legacy_baseline '${missing}' && echo missing=0 || echo missing=1`,
+      'DRY=1',
+      `serving_release_uses_legacy_baseline '${mismatch}' && echo dry=0 || echo dry=1`,
+    ].join('\n')
+    const decision = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.equal(decision.status, 0, decision.stdout + decision.stderr)
+    assert.match(decision.stdout, /^mismatch=0$/m)
+    assert.match(decision.stdout, /^match=1$/m)
+    assert.match(decision.stdout, /^missing=1$/m)
+    assert.match(decision.stdout, /^dry=1$/m)
   })
 
   test('baseline release/config guards cover build, slots, smoke, canary and rollback activation', async () => {
@@ -1959,9 +2078,16 @@ describe('v5 release safety lanes', () => {
     assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf('publish_strong_release'))
     assert.match(source, /activate_release\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
     assert.match(source, /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
-    assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?assert_legacy_release_baseline_security "\$master"/)
+    assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?verify_release_baseline_security "\$master"/)
     assert.match(source, /ROLLBACK_LEGACY_BASELINE_OK=1 smoke "\$ACTIVE_PORT"/)
-    assert.match(source, /if \[\[ "\$\{ROLLBACK_LEGACY_BASELINE_OK:-0\}" == 1 \]\][\s\S]*?assert_legacy_release_baseline_security "\$live_release"/)
+    assert.match(source, /verify_release_baseline_security\(\)[\s\S]*ROLLBACK_LEGACY_BASELINE_OK/)
+    assert.match(source, /write_release_baseline_manifest "\$staging" "\$full_sha"/)
+    assert.ok(
+      build.indexOf('write_release_baseline_manifest "$staging"') >
+        build.indexOf('harden_release_baseline "$staging"') &&
+      build.indexOf('write_release_baseline_manifest "$staging"') <
+        build.indexOf('publish_strong_release'),
+    )
     assert.match(source, /canary\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
     assert.match(source, /smoke\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$baseline_slot"/)
     assert.match(source, /start_candidate_unit_and_wait\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$cand"/)
@@ -2207,6 +2333,126 @@ describe('v5 release safety lanes', () => {
     assert.equal(egress.status, 0, egress.stderr || egress.stdout)
     assert.doesNotMatch(normal.stdout, /checks=.*svc_egress/)
     assert.match(egress.stdout, /checks=svc_v5,http_v5,public_route,turn_failures,svc_egress,http_egress/)
+  })
+
+  describe('egress surface gate (2026-09-04 cursor subagent 409 incident)', () => {
+    async function fixture() {
+      const dir = await mkdtemp(path.join(tmpdir(), 'v5-egress-surface-'))
+      dirs.push(dir)
+      const repo = path.join(dir, 'repo')
+      await mkdir(repo, { recursive: true })
+      const write = async (relative: string, contents = 'fixture\n') => {
+        const target = path.join(repo, relative)
+        await mkdir(path.dirname(target), { recursive: true })
+        await writeFile(target, contents)
+      }
+      const git = (...args: string[]) => {
+        const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
+        assert.equal(result.status, 0, result.stderr || result.stdout)
+        return result.stdout.trim()
+      }
+      await write('packages/commercial/src/http/proxy/index.ts')
+      await write('packages/commercial/src/auth/register.ts')
+      await write('packages/gateway/src/x.ts')
+      git('init', '--initial-branch=main')
+      git('config', 'user.name', 'Egress Test')
+      git('config', 'user.email', 'egress@example.test')
+      git('add', '.')
+      git('commit', '-q', '-m', 'egress-running')
+      const egressSha = git('rev-parse', 'HEAD')
+      const commit = (message: string) => {
+        git('add', '-A')
+        git('commit', '-q', '-m', message)
+        return git('rev-parse', 'HEAD')
+      }
+      // Source-only harness: real assert_egress_surface_covered + real git diff; only the
+      // ssh-backed probes are stubbed.
+      const invoke = (targetSha: string, opts: { egress?: boolean; skip?: boolean; noRelease?: boolean } = {}) => {
+        const harness = [
+          'set -euo pipefail',
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          `REPO_ROOT='${repo}'`,
+          'MODE=deploy',
+          `RESTART_EGRESS=${opts.egress ? 1 : 0}`,
+          'DRY=0',
+          opts.noRelease
+            ? 'current_egress_release() { printf ""; }'
+            : 'current_egress_release() { printf "%s\\n" /rel/egress-running; }',
+          `egress_release_source_commit() { printf "%s\\n" '${egressSha}'; }`,
+          `resolve_release_source_commit() { printf "%s\\n" '${targetSha}'; }`,
+          'assert_egress_surface_covered',
+        ].join('\n')
+        return spawnSync('bash', ['-c', harness], {
+          cwd: root,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            ALLOW_ANY_BRANCH: '1',
+            OC_V5_SKIP_EGRESS_SURFACE_GATE: opts.skip ? '1' : '0',
+          },
+        })
+      }
+      return { write, commit, invoke, egressSha }
+    }
+
+    test('rejects a deploy without --egress when egress-plane files changed since the running egress release', async () => {
+      const f = await fixture()
+      await f.write('packages/commercial/src/http/proxy/index.ts', 'authorityCanonicalModel fix\n')
+      const target = await f.commit('proxy fix')
+      const result = f.invoke(target)
+      assert.equal(result.status, 1, result.stdout + result.stderr)
+      assert.match(result.stderr, /egress surface gate/)
+      assert.match(result.stderr, /packages\/commercial\/src\/http\/proxy\/index\.ts/)
+      assert.match(result.stderr, /--with-dist --egress/)
+    })
+
+    test('passes without --egress when only non-egress files changed', async () => {
+      const f = await fixture()
+      await f.write('packages/commercial/src/auth/register.ts', 'mail copy\n')
+      await f.write('packages/gateway/src/x.ts', 'gateway\n')
+      const target = await f.commit('auth copy')
+      const result = f.invoke(target)
+      assert.equal(result.status, 0, result.stdout + result.stderr)
+      assert.match(result.stdout, /egress surface gate.*无变更/)
+    })
+
+    test('ignores test-only changes under the egress plane', async () => {
+      const f = await fixture()
+      await f.write('packages/commercial/src/__tests__/modelAuthorityGate.test.ts', 'test\n')
+      await f.write('packages/commercial/src/egress/recoveryProber.test.ts', 'test\n')
+      const target = await f.commit('tests only')
+      const result = f.invoke(target)
+      assert.equal(result.status, 0, result.stdout + result.stderr)
+    })
+
+    test('is a no-op when --egress is present and honours the explicit skip knob', async () => {
+      const f = await fixture()
+      await f.write('packages/commercial/src/billing/verificationSponsorship.ts', 'sponsorship\n')
+      const target = await f.commit('billing')
+      const withEgress = f.invoke(target, { egress: true })
+      assert.equal(withEgress.status, 0, withEgress.stdout + withEgress.stderr)
+      assert.doesNotMatch(withEgress.stdout + withEgress.stderr, /egress surface gate/)
+      const skipped = f.invoke(target, { skip: true })
+      assert.equal(skipped.status, 0, skipped.stdout + skipped.stderr)
+      assert.match(skipped.stderr, /OC_V5_SKIP_EGRESS_SURFACE_GATE=1 放行/)
+    })
+
+    test('fails closed when the running egress release cannot be resolved', async () => {
+      const f = await fixture()
+      const result = f.invoke(f.egressSha, { noRelease: true })
+      assert.equal(result.status, 1, result.stdout + result.stderr)
+      assert.match(result.stderr, /fail-closed/)
+    })
+
+    test('deploy main flow wires the gate right after the pre-lease CI green gate', async () => {
+      const body = await readFile(deploy, 'utf8')
+      assert.match(
+        body,
+        /maybe_run_ci_green_gate_for_mode \|\| exit 1\n[^\n]*\nassert_egress_surface_covered \|\| exit 1/,
+      )
+      assert.match(body, /--egress\) RESTART_EGRESS=1 ;;/)
+    })
   })
 
   test('production smoke allowlist covers every explicitly v5-owned leader scheduler', async () => {
@@ -7298,9 +7544,14 @@ wait $!
       'J5 deadline 必须实际使用 TURN_WAIT_TIMEOUT',
     )
     const modelPin = journeySource.indexOf('const JOURNEY_MODEL_ID = "gpt-5.6-luna";')
-    const modelTrigger = journeySource.indexOf('page.getByRole("button", { name: "选择对话模型" })')
-    const modelItem = journeySource.indexOf('page.locator(`[data-model-id="${JOURNEY_MODEL_ID}"]`)')
-    const modelApplied = journeySource.indexOf('modelTrigger.textContent()')
+    // 选模逻辑已抽到共享 helper(selfhost 契约门共用);不变量不变:真实选择器 → 菜单项 → 触发器回显,
+    // 且必须在附件上传/首次 UI 发送之前生效。canary 侧断言"调用 helper 并传固定模型",helper 侧断言顺序。
+    const helperSource = await readFile(path.join(root, 'scripts/lib/journey-browser.mjs'), 'utf8')
+    const helperTrigger = helperSource.indexOf('page.getByRole("button", { name: "选择对话模型" })')
+    const helperItem = helperSource.indexOf('page.locator(`[data-model-id="${id}"]`)')
+    const helperClick = helperSource.indexOf('await item.click()')
+    const helperApplied = helperSource.indexOf('[aria-label="选择对话模型"]')
+    const modelApplied = journeySource.indexOf('await selectJourneyModel(page, JOURNEY_MODEL_ID')
     const j2 = journeySource.indexOf('await step("J2 ')
     const j4 = journeySource.indexOf('await step("J4 ')
     assert.ok(modelPin >= 0, 'journey 必须固定使用平台自有的 GPT-5.6 Luna')
@@ -7309,10 +7560,16 @@ wait $!
       /请读取刚上传的附件「\$\{probeName\}」第一行/,
       'Luna 旅程必须用本轮原始文件名锁定当前附件，禁止从历史 uploads 猜文件',
     )
+    assert.match(
+      journeySource,
+      /import \{[^}]*selectJourneyModel[^}]*\} from "\.\/lib\/journey-browser\.mjs"/,
+      'journey 必须复用共享的真实模型选择器 helper',
+    )
     assert.ok(
-      modelTrigger > modelPin && modelItem > modelTrigger && modelApplied > modelItem,
+      helperTrigger >= 0 && helperItem > helperTrigger && helperClick > helperItem && helperApplied > helperClick,
       'journey 必须经真实模型选择器选中固定模型并等待触发器回显',
     )
+    assert.ok(modelApplied > modelPin, 'journey 必须用固定的 JOURNEY_MODEL_ID 调用选模 helper')
     assert.ok(
       modelApplied < j2 && modelApplied < j4,
       '固定模型必须在附件上传与首次 UI 发送之前生效，禁止账号历史粘滞模型决定 J5',
@@ -7578,6 +7835,23 @@ wait $!
       `BOOT_TIMEOUT 只应用于 J1 首屏落地(goto + 首个 click),当前传参 ${bootUses.length} 处`,
     )
     assert.match(source, /getByPlaceholder\("邮箱"\)\.waitFor\(\{ state: "visible", timeout: STEP_TIMEOUT \}\)/)
+  })
+
+  test('E2E journey seeds oc_auth_hint after API login cookie and before authed root reload', async () => {
+    const source = await readFile(e2eJourney, 'utf8')
+    // 2026-09-05: 匿名访客 boot 跳过 refresh(authHint)。canary 走 API 登录+种 oc_rt,
+    // Playwright 新 context 没有 localStorage 标记,不补种则 goto / 停在营销 Landing。
+    assert.match(source, /localStorage\.setItem\("oc_auth_hint", "1"\)/)
+    const cookieAt = source.indexOf('name: "oc_rt"')
+    const hintAt = source.indexOf('localStorage.setItem("oc_auth_hint", "1")')
+    const reloadAt = source.indexOf('getByText("新建会话"')
+    assert.ok(cookieAt >= 0 && hintAt > cookieAt, 'oc_auth_hint 必须在种 oc_rt 之后写入')
+    assert.ok(reloadAt > hintAt, 'oc_auth_hint 必须在断言侧栏「新建会话」之前写入')
+    assert.equal(
+      source.split('localStorage.setItem("oc_auth_hint", "1")').length - 1,
+      1,
+      'hint 只应补种一次,且不得在 context 创建时 addInitScript 提前写入',
+    )
   })
 
   test('release verification accepts public Luna and keeps hidden Luna grant-gated', (t) => {
@@ -8623,35 +8897,45 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(blocked.stderr, /无法读取 deploy_state/)
   })
 
-  const danglingFileChange = (file: string, extra = '\n// audit-blocker\n') => {
-    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
-    const orig = spawnSync('git', ['show', `${head}:${file}`], { cwd: root, encoding: 'utf8' })
-    assert.equal(orig.status, 0, orig.stderr)
-    const blob = spawnSync('git', ['hash-object', '-w', '--stdin'], {
+  const gitIdent = {
+    GIT_AUTHOR_NAME: 'v5-ops-fixture',
+    GIT_AUTHOR_EMAIL: 'v5-ops-fixture@example.test',
+    GIT_COMMITTER_NAME: 'v5-ops-fixture',
+    GIT_COMMITTER_EMAIL: 'v5-ops-fixture@example.test',
+  }
+  const gitEnv = (extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
+    ...process.env,
+    ...gitIdent,
+    ...extra,
+  })
+  const gitOk = (
+    args: string[],
+    opts: { env?: NodeJS.ProcessEnv; input?: string } = {},
+  ) => {
+    const result = spawnSync('git', args, {
       cwd: root,
       encoding: 'utf8',
-      input: orig.stdout + extra,
-    }).stdout.trim()
+      env: gitEnv(opts.env),
+      input: opts.input,
+    })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    return result
+  }
+
+  const danglingFileChange = (file: string, extra = '\n// audit-blocker\n') => {
+    const head = gitOk(['rev-parse', 'HEAD']).stdout.trim()
+    const orig = gitOk(['show', `${head}:${file}`])
+    const blob = gitOk(['hash-object', '-w', '--stdin'], { input: orig.stdout + extra }).stdout.trim()
     assert.match(blob, /^[0-9a-f]{40}$/)
-    const ls = spawnSync('git', ['ls-tree', '-r', head, '--', file], { cwd: root, encoding: 'utf8' })
-    assert.equal(ls.status, 0, ls.stderr)
+    const ls = gitOk(['ls-tree', '-r', head, '--', file])
     const mode = ls.stdout.trim().split(/\s+/)[0]
     const index = path.join(tmpdir(), `oc-v5-audit-idx-${process.pid}-${Date.now()}`)
-    const env = { ...process.env, GIT_INDEX_FILE: index }
-    const readTree = spawnSync('git', ['read-tree', head], { cwd: root, encoding: 'utf8', env })
-    assert.equal(readTree.status, 0, readTree.stderr)
-    const upd = spawnSync('git', ['update-index', '--cacheinfo', `${mode},${blob},${file}`], {
-      cwd: root,
-      encoding: 'utf8',
-      env,
-    })
-    assert.equal(upd.status, 0, upd.stderr)
-    const tree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env }).stdout.trim()
+    const env = { GIT_INDEX_FILE: index }
+    gitOk(['read-tree', head], { env })
+    gitOk(['update-index', '--cacheinfo', `${mode},${blob},${file}`], { env })
+    const tree = gitOk(['write-tree'], { env }).stdout.trim()
     assert.match(tree, /^[0-9a-f]{40}$/)
-    const commit = spawnSync('git', ['commit-tree', tree, '-p', head, '-m', `audit overlay ${file}`], {
-      cwd: root,
-      encoding: 'utf8',
-    }).stdout.trim()
+    const commit = gitOk(['commit-tree', tree, '-p', head, '-m', `audit overlay ${file}`]).stdout.trim()
     assert.match(commit, /^[0-9a-f]{40}$/)
     spawnSync('rm', ['-f', index])
     return { head, commit }
@@ -8802,10 +9086,7 @@ describe('v5 release speedup (B1-B5, C4)', () => {
       0,
     )
     const tree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env }).stdout.trim()
-    const commit = spawnSync('git', ['commit-tree', tree, '-p', sha, '-m', 'audit overlay metadata migrations'], {
-      cwd: root,
-      encoding: 'utf8',
-    }).stdout.trim()
+    const commit = gitOk(['commit-tree', tree, '-p', sha, '-m', 'audit overlay metadata migrations']).stdout.trim()
     spawnSync('rm', ['-f', index])
     const migrated = invokeHelpers(`compute_runtime_input_digest '${commit}' '${image}'`)
     assert.equal(migrated.status, 0, migrated.stderr)
@@ -8829,11 +9110,14 @@ describe('v5 release speedup (B1-B5, C4)', () => {
       0,
     )
     const capTree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env: capEnv }).stdout.trim()
-    const capCommit = spawnSync(
-      'git',
-      ['commit-tree', capTree, '-p', sha, '-m', 'audit overlay metadata runtimeCapabilities'],
-      { cwd: root, encoding: 'utf8' },
-    ).stdout.trim()
+    const capCommit = gitOk([
+      'commit-tree',
+      capTree,
+      '-p',
+      sha,
+      '-m',
+      'audit overlay metadata runtimeCapabilities',
+    ]).stdout.trim()
     spawnSync('rm', ['-f', capIndex])
     const caps = invokeHelpers(`compute_runtime_input_digest '${capCommit}' '${image}'`)
     assert.equal(caps.status, 0, caps.stderr)
@@ -9028,3 +9312,148 @@ describe('v5 oc-memory MCP cjs survives runtime prune and gateway precompile', (
     assert.doesNotMatch(excludes, /packages\/mcp-memory\/scripts/)
   })
 })
+
+describe('v5 versioned baseline manifest', () => {
+  const expectedSkills = (): string[] => {
+    const text = spawnSync('sed', ['-n', '/^EXPECTED_SKILLS=(/,/^)/p', baselineGuard], { encoding: 'utf8' })
+    assert.equal(text.status, 0, text.stderr)
+    return text.stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('EXPECTED_SKILLS') && line !== ')')
+  }
+
+  async function copyRelease(suffix: string): Promise<{ dir: string; release: string; baseline: string }> {
+    const dir = await mkdtemp(path.join(tmpdir(), `v5-bman-${suffix}-`))
+    dirs.push(dir)
+    const release = path.join(dir, 'release')
+    const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
+    await mkdir(path.dirname(baseline), { recursive: true })
+    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
+    const hardened = spawnSync('bash', [baselineGuard, 'harden-release', release], { encoding: 'utf8' })
+    assert.equal(hardened.status, 0, hardened.stderr)
+    return { dir, release, baseline }
+  }
+
+  async function writeManifest(
+    release: string,
+    skills: string[],
+    sourceCommit: string,
+  ): Promise<{ body: string; sha: string }> {
+    const body = JSON.stringify({
+      schemaVersion: 1,
+      sourceCommit,
+      generatedAt: '2026-09-05T00:00:00Z',
+      expectedSkills: skills,
+      forbiddenPaths: [],
+      expectedTopLevel: ['AGENTS.admin.md', 'AGENTS.md', 'CLAUDE.admin.md', 'CLAUDE.md', 'skills'],
+    })
+    await writeFile(path.join(release, '.baseline-manifest.json'), body)
+    const sha = createHash('sha256').update(body).digest('hex')
+    return { body, sha }
+  }
+
+  async function writeComplete(release: string, sha: string | null, sourceCommit: string) {
+    const marker: Record<string, unknown> = {
+      schemaVersion: 2,
+      sourceCommit,
+    }
+    if (sha) marker.baselineManifestSha256 = sha
+    await writeFile(path.join(release, '.complete'), JSON.stringify(marker) + '\n')
+  }
+
+  const headSha = (): string => {
+    const head = spawnSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' })
+    assert.equal(head.status, 0, head.stderr)
+    return head.stdout.trim()
+  }
+
+  test('versioned baseline manifest: matching digest passes', async () => {
+    const { release } = await copyRelease('match')
+    const skills = expectedSkills()
+    const sourceCommit = headSha()
+    const { sha } = await writeManifest(release, skills, sourceCommit)
+    await writeComplete(release, sha, sourceCommit)
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /ok verify-release=/)
+  })
+
+  test('versioned baseline manifest: digest mismatch is FATAL', async () => {
+    const { release } = await copyRelease('mismatch')
+    const skills = expectedSkills()
+    const sourceCommit = headSha()
+    await writeManifest(release, skills, sourceCommit)
+    await writeComplete(release, 'a'.repeat(64), sourceCommit)
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /baseline manifest digest mismatch/)
+  })
+
+  test('versioned baseline manifest: missing without flag is FATAL', async () => {
+    const { release } = await copyRelease('missing-strict')
+    const sourceCommit = headSha()
+    await writeComplete(release, null, sourceCommit)
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /baseline manifest missing/)
+  })
+
+  test('versioned baseline manifest: missing with flag uses legacy', async () => {
+    const { release, baseline } = await copyRelease('missing-legacy')
+    await rm(path.join(baseline, 'skills/multi-model-review'), { recursive: true })
+    const sourceCommit = headSha()
+    await writeComplete(release, null, sourceCommit)
+    const denied = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    assert.notEqual(denied.status, 0)
+    const allowed = spawnSync(
+      'bash',
+      [baselineGuard, 'verify-release', release, '--allow-legacy-manifest-missing'],
+      { encoding: 'utf8' },
+    )
+    assert.equal(allowed.status, 0, allowed.stderr)
+    assert.match(allowed.stdout, /ok baseline=/)
+  })
+
+  test('versioned baseline manifest: older fewer skills self-consistent passes', async () => {
+    const { release, baseline } = await copyRelease('fewer')
+    await rm(path.join(baseline, 'skills/multi-model-review'), { recursive: true })
+    const skills = expectedSkills().filter((name) => name !== 'multi-model-review')
+    const sourceCommit = headSha()
+    const { sha } = await writeManifest(release, skills, sourceCommit)
+    await writeComplete(release, sha, sourceCommit)
+    const strict = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
+    assert.notEqual(strict.status, 0)
+    assert.match(strict.stderr, /skill manifest mismatch/)
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /ok verify-release=/)
+  })
+
+  test('versioned baseline manifest: MIN_SECURITY_POLICY rejects group-writable', async () => {
+    const { release, baseline } = await copyRelease('minsec')
+    const skills = expectedSkills()
+    const sourceCommit = headSha()
+    const { sha } = await writeManifest(release, skills, sourceCommit)
+    await writeComplete(release, sha, sourceCommit)
+    const chmod = spawnSync('chmod', ['g+w', path.join(baseline, 'AGENTS.md')], { encoding: 'utf8' })
+    assert.equal(chmod.status, 0, chmod.stderr)
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /group\/other writable/)
+  })
+
+  test('versioned baseline manifest: deploy cutoff placeholder and fallback wiring', async () => {
+    const source = await readFile(deploy, 'utf8')
+    assert.match(source, /LEGACY_MANIFEST_CUTOFF_COMMIT=""/)
+    assert.match(source, /OC_V5_LEGACY_BASELINE_FALLBACK="\$\{OC_V5_LEGACY_BASELINE_FALLBACK:-1\}"/)
+    assert.match(source, /--allow-legacy-manifest-missing\) ALLOW_LEGACY_MANIFEST_MISSING=1/)
+    assert.match(source, /baselineManifestSha256/)
+    assert.match(source, /write-manifest/)
+    assert.match(source, /verify-release/)
+    const verify = source.match(/verify_release_baseline_security\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(verify, /release_source_predates_manifest_cutoff/)
+    assert.match(verify, /OC_V5_LEGACY_BASELINE_FALLBACK/)
+  })
+})
+

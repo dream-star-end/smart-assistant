@@ -22,8 +22,8 @@ schemaVersion: 2
 agents:
   # 默认全能助手。其 model 同时是容器 config.defaults.model(平台默认模型)的来源。
   - id: main
-    model: glm-5.3-zai
-    provider: zai
+    model: deepseek-v4-flash
+    provider: opencodego
     persona: personas/main.md
     permissionMode: bypassPermissions
     displayName: 全能助手

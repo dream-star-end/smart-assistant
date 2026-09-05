@@ -234,6 +234,16 @@ describe("POST /api/payment/hupi/create", () => {
     assert.equal(dbo.rows.length, 1);
     assert.equal(dbo.rows[0].status, "pending");
     assert.equal(dbo.rows[0].user_id, uid);
+
+    const funnel = await query<{ stage: string; code: string; outcome: string }>(
+      `SELECT stage, code, outcome FROM product_friction_events
+        WHERE user_id = $1 AND surface = 'payment'`,
+      [uid],
+    );
+    assert.equal(funnel.rows.length, 1, JSON.stringify(funnel.rows));
+    assert.equal(funnel.rows[0].stage, "checkout");
+    assert.equal(funnel.rows[0].outcome, "succeeded");
+    assert.equal(funnel.rows[0].code, "topup_plan_10");
   });
 
   test("plan_code 不存在:400 PLAN_NOT_FOUND", async (t) => {
@@ -358,6 +368,15 @@ describe("POST /api/payment/hupi/callback", () => {
     );
     assert.equal(o.rows[0].status, "paid");
     assert.equal(o.rows[0].provider_order, "WX_TX_OK");
+
+    const funnel = await query<{ stage: string; outcome: string; latency_ms: number | null }>(
+      `SELECT stage, outcome, latency_ms FROM product_friction_events
+        WHERE user_id = $1 AND surface = 'payment' AND stage = 'paid'`,
+      [uid],
+    );
+    assert.equal(funnel.rows.length, 1, JSON.stringify(funnel.rows));
+    assert.equal(funnel.rows[0].outcome, "succeeded");
+    assert.ok(funnel.rows[0].latency_ms == null || funnel.rows[0].latency_ms >= 0);
   });
 
   test("status != OD (如 PN) + 签名正确:200 'success' + 订单仍 pending", async (t) => {

@@ -352,8 +352,11 @@ describe("其余 oc-* 卡片", () => {
     );
     expect(screen.getByText("PDF 文档已生成")).toBeInTheDocument();
     expect(screen.getAllByText("paper.pdf").length).toBeGreaterThanOrEqual(1);
-    // 签名解析完成后出现真正可点的下载 <a download> 与「预览」链接(pdf 可预览)。
-    await waitFor(() => expect(container.querySelector("a[download]")).not.toBeNull());
+    // SignedFileCard no longer freezes a mount-time signed URL on <a download>
+    // (that 410'd after 5min). Idle card is href="#" + click-to-resign.
+    await waitFor(() =>
+      expect(container.querySelector('a[data-product-feature="artifacts-download"]')).not.toBeNull(),
+    );
     expect(screen.getByText("预览")).toBeInTheDocument();
   });
 

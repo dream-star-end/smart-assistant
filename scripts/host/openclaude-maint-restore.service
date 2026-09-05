@@ -1,0 +1,24 @@
+# OpenClaude stale maint-lease restore (OCV5-117).
+# Prepare only — do not install from the PR agent.
+#
+# Install (host owner):
+#   install -m 644 scripts/host/openclaude-maint-restore.service /etc/systemd/system/
+#   install -m 644 scripts/host/openclaude-maint-restore.timer   /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now openclaude-maint-restore.timer
+#
+# Canonical path is the source of truth on v3-dev-sg. After merge, this
+# ExecStart must keep pointing at a tree that contains v5-host-maint-lib.sh.
+[Unit]
+Description=OpenClaude restore apt-daily timers if a deploy maint lease is stale
+Documentation=file:///opt/openclaude/openclaude-v5-aurora/scripts/host/restart-excluded-units-checklist.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash /opt/openclaude/openclaude-v5-aurora/scripts/v5-host-maint-lib.sh restore-stale
+Nice=10
+# Default KillMode=control-group. Do not set KillMode=none.
+
+[Install]
+WantedBy=multi-user.target

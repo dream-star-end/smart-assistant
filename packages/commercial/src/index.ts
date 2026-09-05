@@ -3824,6 +3824,7 @@ export async function registerCommercial(
 
   // 邮箱验证成功 → fire-and-forget 触发 v3 容器 pre-warm(p50=215s"验证 → 首消息"间隔
   // 覆盖 docker run 冷启,首条消息命中 running)。
+  // 失败自动再试 1 次(间隔 5s,见 makePrewarmContainer);两次都失败才记 friction。
   // **复用 sharedEnsureRunning 的同一 singleflight**(不再独立 makeV3EnsureRunning 闭包):
   // 旧独立闭包让 prewarm 与 WS 走两个 in-flight map,都能独立观察并销毁同一 active+cid=NULL
   // 在途行(Codex MAJOR)。统一后 prewarm 在途时 WS 请求 join 而非另起观察销毁。fire-and-forget

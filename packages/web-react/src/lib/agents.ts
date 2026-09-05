@@ -207,10 +207,9 @@ export const MAIN_AGENT: Agent = {
   grad: 'from-emerald-500 to-teal-600',
   description: '通用全能智能体，内置工具齐全，可随时从市场加装技能与更多智能体。',
   starters: [
-    '帮我查清一个问题，并列出可靠来源',
-    '把这段内容改得更清晰、专业',
-    '帮我把一个目标拆成可执行的步骤',
-    '分析我上传的文件，提炼重点和待办',
+    '把这段文字整理成表格：周一开会、周二写周报、周三客户拜访、周四复盘、周五总结',
+    '帮我写一封请假邮件：明天因身体不适请一天病假，收件人是直属主管',
+    '解释这段代码在做什么：const uniq = (arr) => [...new Set(arr)]',
   ],
   isDefault: true,
   installed: true,

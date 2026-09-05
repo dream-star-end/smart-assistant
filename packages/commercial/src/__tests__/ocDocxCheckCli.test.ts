@@ -181,7 +181,18 @@ function parseCheckStdout(stdout: string): { report: any; verdict: string } {
   return { report, verdict }
 }
 
-describe('oc-docx check', () => {
+function hasPythonDocx(): boolean {
+  try {
+    execFileSync(process.env.PYTHON ?? '/usr/bin/python3', ['-c', 'from docx import Document'], {
+      stdio: 'ignore',
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+describe('oc-docx check', { skip: !hasPythonDocx() }, () => {
   test('OC_DOCXCHECK=off: check equals inspect (no VERDICT line, empty content is warning)', async () => {
     const work = mkdtempSync(join(tmpdir(), 'oc-docx-check-off-'))
     try {

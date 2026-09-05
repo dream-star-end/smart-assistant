@@ -12,7 +12,9 @@ import type {
 } from "../../lib/types";
 import { cn, formatCredits } from "../../lib/utils";
 import { Alert, Button, Progress, Skeleton, Spinner, Tabs } from "../ui";
+import { insufficientCreditsCopy } from "../../lib/chat/pure";
 import { CreateOrgDialog } from "../org/CreateOrgWizard";
+import { rememberSubscriptionPaid, requestSubscribeIntent } from "./SubscriptionDialog";
 import { formatReportBucket, ledgerReasonLabel, REPORT_WINDOW_NOUN, shortTime } from "./labels";
 
 /** 账单收支卡窗口（默认 30d，独立于用量 Tab 的窗口）。 */
@@ -81,7 +83,9 @@ export function AccountTab({
     api
       .getMySubscription(auth)
       .then((s) => {
-        if (alive) setSub(s);
+        if (!alive) return;
+        setSub(s);
+        rememberSubscriptionPaid(s.paid);
       })
       .catch(() => {
         /* 订阅读取失败：仅不显示套餐卡，不阻断账户页 */
@@ -315,15 +319,29 @@ export function AccountTab({
         )}
         {low && (
           <Alert tone="danger" className="mt-2 text-meta">
-            余额不足，已暂停对话计费。充值或升级套餐后即可继续。
+            {insufficientCreditsCopy(sub?.paid === true).message}
           </Alert>
         )}
         <div className="mt-3 flex flex-wrap gap-2">
-          <Button variant="primary" size="sm" onClick={onManageSub}>
-            <Crown size={15} /> 套餐订阅
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => {
+              requestSubscribeIntent("lite");
+              onManageSub();
+            }}
+          >
+            <Crown size={15} /> {sub?.paid ? "套餐订阅" : "开通 Lite"}
           </Button>
-          <Button variant="secondary" size="sm" onClick={onManageSub}>
-            <Plus size={15} /> 加量包
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              requestSubscribeIntent("pack");
+              onManageSub();
+            }}
+          >
+            <Plus size={15} /> {sub?.paid ? "购买加量包" : "加量包"}
           </Button>
         </div>
         <p className="mt-2 text-meta text-faint">

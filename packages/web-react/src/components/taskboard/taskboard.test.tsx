@@ -681,7 +681,8 @@ describe('TicketDrawer 详情', () => {
     )
     renderDrawer(ticket)
     expect(await screen.findByTestId('ticket-discussion')).toBeInTheDocument()
-    expect(screen.getByTestId('ticket-comment-md').textContent).toMatch(/改了/)
+    // Markdown 评论块在 listTimeline 落定后才挂上，同步 getBy 会在 CI 负载下偶发 miss。
+    expect((await screen.findByTestId('ticket-comment-md')).textContent).toMatch(/改了/)
     expect(screen.queryByTestId('ticket-run-detail')).not.toBeInTheDocument()
     await act(async () => {
       fireEvent.click(screen.getByTestId('ticket-system-toggle'))

@@ -114,6 +114,23 @@ export function reportClientFriction(signal: ClientFrictionSignal, token?: strin
   return eventId;
 }
 
+const onceKeys = new Set<string>();
+
+/** Dedupe conversion-funnel exposures across StrictMode double-mount. */
+export function reportClientFrictionOnce(
+  key: string,
+  signal: ClientFrictionSignal,
+  token?: string | null,
+): string | null {
+  if (!key || onceKeys.has(key)) return null;
+  onceKeys.add(key);
+  return reportClientFriction(signal, token);
+}
+
+export function resetClientFrictionOnceForTests(): void {
+  onceKeys.clear();
+}
+
 /** One request for a rendered marketplace page, so per-entity truth does not exhaust telemetry rate limits. */
 export function reportClientFrictionBatch(
   signals: ClientFrictionSignal[],

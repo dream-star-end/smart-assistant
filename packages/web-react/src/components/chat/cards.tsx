@@ -27,6 +27,7 @@ import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol
 import { memo, useEffect, useRef, useState } from "react";
 import type { BlankProbeReport as TimelineBlankReport } from "../../lib/chat/timelineBlankProbe";
 import type { ChatMessage } from "../../lib/chat/model";
+import { insufficientCreditsCopy } from "../../lib/chat/pure";
 import {
   CONTINUE_PROMPT,
   defaultCollapsed,
@@ -34,7 +35,9 @@ import {
   isLive,
   stripMarkdown,
 } from "../../lib/chat/render";
+import { lastKnownSubscriptionPaid, requestSubscribeIntent } from "../settings/SubscriptionDialog";
 import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
+import { reportClientFriction, reportClientFrictionOnce } from "../../lib/clientFriction";
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
@@ -81,6 +84,10 @@ export type CardCallbacks = {
   onRegenerate?: () => void;
   onContinue?: () => void;
   onTopUp?: () => void;
+  /** 当前是否付费订阅。缺省按免费用户引导开通 Lite。 */
+  subscriptionPaid?: boolean;
+  /** Optional access token for conversion-funnel telemetry (exhausted card/CTA). */
+  getToken?: () => string | null | undefined;
   /** context_too_long 类:在新会话中延续目标(导航非重发,同 onTopUp 不受末轮门控)。 */
   onStartNewSession?: () => void;
   onFeedback?: (ctx: FeedbackContext) => void;
@@ -541,6 +548,9 @@ export function AssistantCard({
   const showUnpublishedProcessPending =
     msg._displayDegradeReason === "records_unpublished" && !hasDisplayableBody && !live;
   const isInsufficient = normalizedCode === "insufficient_credits";
+  const creditsCopy = insufficientCreditsCopy(
+    cb.subscriptionPaid ?? lastKnownSubscriptionPaid() ?? false,
+  );
   // 「精确重试」资格:非免单 + 该码可重试 + cta∈{retry,retry_or_switch} + 会话内能定位到带完整
   // payload 的原 user 行(_clientMessageId 命中且 status='error')。任一不满足 → 不显示精确「重试」,
   // 落回原有 onRegenerate「重新尝试」兜底(现状语义)。
@@ -564,7 +574,7 @@ export function AssistantCard({
   // 显示。末轮判据复用 turnSegment 单一权威 inActiveTurn(= 该行位于最后一条 user 之后 = 当前轮
   // 尾部;错误卡恒追加在其归属 user 轮之后,故与"_clientMessageId 命中最后一条 user"等价),不另
   // 造第二套轮判定。历史中间错误卡:不显示任何重发按钮(标题/正文/详情照旧)。
-  // 「去充值」是导航非重发,不受此门控。
+  // 耗尽 CTA 是导航非重发,不受此门控。
   const isLastTurn = ctx.inActiveTurn === true;
   const interruptedContinuationTarget =
     isLastTurn && ctx.isLast
@@ -583,7 +593,20 @@ export function AssistantCard({
     (sem.cta === "retry" || sem.cta === "retry_or_switch") &&
     !!cb.onRegenerate;
   const showTopUp = isInsufficient && !!cb.onTopUp;
-  // cta==='new_session'(上下文超限类):导航非重发,同「去充值」不受末轮门控。
+  useEffect(() => {
+    if (!isInsufficient) return;
+    reportClientFrictionOnce(
+      `chat:exhausted_card:${msg.id}`,
+      {
+        surface: "chat",
+        stage: "exhausted_card",
+        code: "EXHAUSTED_CARD",
+        outcome: "succeeded",
+      },
+      cb.getToken?.(),
+    );
+  }, [isInsufficient, msg.id, cb]);
+  // cta==='new_session'(上下文超限类):导航非重发,同耗尽 CTA 不受末轮门控。
   const showNewSession =
     !!presentedError && !presentedError.waived && sem.cta === "new_session" && !!cb.onStartNewSession;
   const showActionRow =
@@ -684,11 +707,12 @@ export function AssistantCard({
             density={expectedError && !presentedError.waived ? "compact" : "comfortable"}
             className="mt-2.5 max-w-full overflow-hidden"
             icon={presentedError.waived ? <ShieldCheck size={17} /> : <AlertTriangle size={17} />}
-            title={presentedError.title}
+            title={isInsufficient ? creditsCopy.title : presentedError.title}
           >
             <div className="min-w-0">
               <p className="text-[13px] leading-5 text-fg/90 [overflow-wrap:anywhere]">
-                {msg._recoverySkippedNotice ?? presentedError.message}
+                {msg._recoverySkippedNotice ??
+                  (isInsufficient ? creditsCopy.message : presentedError.message)}
               </p>
               {presentedError.detail && (
                 <details className="mt-1.5 max-w-full">
@@ -703,9 +727,26 @@ export function AssistantCard({
               {showActionRow && (
                 <div className="mt-2.5 flex flex-wrap items-center gap-2">
                   {showTopUp ? (
-                    // insufficient_credits「去充值」= 导航非重发,不受末轮门控。
-                    <Button size="sm" variant="accent" shape="pill" onClick={cb.onTopUp}>
-                      <Wallet size={14} /> 去充值
+                    // insufficient_credits CTA = 导航非重发,不受末轮门控。
+                    <Button
+                      size="sm"
+                      variant="accent"
+                      shape="pill"
+                      onClick={() => {
+                        requestSubscribeIntent(creditsCopy.intent);
+                        reportClientFriction(
+                          {
+                            surface: "chat",
+                            stage: "exhausted_cta",
+                            code: "EXHAUSTED_CTA",
+                            outcome: "succeeded",
+                          },
+                          cb.getToken?.(),
+                        );
+                        cb.onTopUp?.();
+                      }}
+                    >
+                      <Wallet size={14} /> {creditsCopy.cta}
                     </Button>
                   ) : showNewSession ? (
                     <Button

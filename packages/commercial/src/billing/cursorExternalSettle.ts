@@ -19,7 +19,8 @@ export type CursorEngineStatus = "success" | "error" | "unavailable";
 
 /**
  * Settle-time surcharge for Cursor Sand Opus/Fable families (operator decision
- * 2026-09-03): the credits actually debited are 2x the catalog price, but the
+ * 2026-09-03; commercial reverted 1.5→2.0 on 2026-09-05): the credits actually
+ * debited are 2x the catalog price, but the
  * public catalog (`model_pricing.multiplier`, cost_x badge, per_ktok_credits)
  * is left untouched so nothing user-facing advertises the markup. Composed on
  * top of the row multiplier (so `-fast` siblings keep their own 2x) and

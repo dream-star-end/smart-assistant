@@ -28,6 +28,12 @@ describe("isCcbUserCancellationDiagnostic", () => {
     assert.equal(isCcbUserCancellationDiagnostic(ede([ABORTED]), null), true);
   });
 
+  test("legacy shape under an authoritative stop_reason is CCB's verdict, not a user Stop", () => {
+    assert.equal(isCcbUserCancellationDiagnostic(ede([ABORTED]), "refusal"), false);
+    assert.equal(isCcbUserCancellationDiagnostic(ede([ABORTED]), "end_turn"), false);
+    assert.equal(isCcbUserCancellationDiagnostic(ede([ABORTED]), "tool_use"), false);
+  });
+
   test("tool-phase abort: stop_reason=tool_use diagnostic with matching TurnResult stopReason", () => {
     assert.equal(isCcbUserCancellationDiagnostic(ede([TOOL_USER]), "tool_use"), true);
     assert.equal(isCcbUserCancellationDiagnostic(ede([TOOL_USER, ABORTED]), "tool_use"), true);
