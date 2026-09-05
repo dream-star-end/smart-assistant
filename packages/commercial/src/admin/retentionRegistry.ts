@@ -53,6 +53,10 @@ export const BESPOKE_SWEEPER_TABLES: Readonly<Record<string, string>> = {
   // 批D D3 新增:session_goals 终态离场,由 auditRetentionSweeper tick 驱动
   // (sweepTerminalSessionGoals,见 auditRetention.ts)。
   session_goals: "auditRetentionSweeper.sweepTerminalSessionGoals (admin/auditRetention.ts)",
+  // tape-projected live frames are unreachable once tape records exist;
+  // pruneProjectedLiveFrames is the dedicated DELETE path (not age-based TTL).
+  client_session_live_frames: "pruneProjectedLiveFrames (db/liveTurnFrames.ts)",
+  client_session_live_unit_checkpoints: "deleteLiveUnitCheckpoints via pruneProjectedLiveFrames (db/liveUnitCheckpoints.ts)",
 };
 
 /**
@@ -84,6 +88,7 @@ export const DURABLE_TABLES: readonly string[] = [
   "client_session_user_payloads",
   "client_sessions",
   "codex_route_contexts",
+  "grok_route_contexts",
   "compute_hosts",
   "compute_pool_state",
   "connections",
@@ -184,6 +189,45 @@ export const DURABLE_TABLES: readonly string[] = [
   "wechat_outbox",
   "wechat_running_sessions",
   "wechat_session_pointer",
+  // 2026-09-05 selfhost sync: 0260/0261 research + 0264 desktop live rows.
+  "research_library_memberships",
+  "research_fetch_attempts",
+  "desktop_enrollments",
+  "desktop_devices",
+  "desktop_device_audit",
+  // 2026-09-05 OCV5-113: schema tables that had no retention disposition.
+  // Classification is by analogy with already-registered siblings; none of
+  // these get a new time-based DELETE.
+  "authority_turn_dispatches",
+  "auto_dream_action_receipts",
+  "auto_dream_platform_finding_occurrences",
+  "auto_dream_platform_findings",
+  "auto_dream_platform_raw_signals",
+  "chat_projects",
+  "client_session_live_streams",
+  "community_tutorials",
+  "cursor_external_usage_audit",
+  "inbox_message_audience_snapshots",
+  "ocr_jobs",
+  "project_assets",
+  "provider_quota_blocks",
+  "qq_bind_attempts",
+  "qq_bind_tokens",
+  "qq_bot_bindings",
+  "qq_outbox",
+  "qq_running_sessions",
+  "qq_session_pointer",
+  "turn_control_requests",
+  "turn_permission_requests",
+  "turn_recovery_jobs",
+  "turn_tape_materialization_jobs",
+  "turn_tape_settlement_jobs",
+  "tutorial_blob_refs",
+  "tutorial_blobs",
+  "tutorial_case_specs",
+  "tutorial_compass_notes",
+  "tutorial_eval_jobs",
+  "zcode_external_usage_audit",
 ] as const;
 
 /**

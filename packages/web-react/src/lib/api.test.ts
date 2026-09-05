@@ -1020,6 +1020,7 @@ test('authErrorMessage maps the whole auth error family from ApiError.code (one 
     ['INVALID_TOKEN', '验证码或重置链接无效或已过期，请重新获取'],
     ['EMAIL_NOT_VERIFIED', '邮箱尚未验证，请查收邮件完成验证后再登录'],
     ['TURNSTILE_FAILED', '人机验证未通过，请刷新后重试'],
+    ['ACCOUNT_UNAVAILABLE', '账号当前不可用，请联系客服'],
   ]
   for (const [code, zh] of cases) {
     const err = new ApiError({ status: 400, code, message: `raw english（追踪号 r1）` })

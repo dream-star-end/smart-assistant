@@ -3847,8 +3847,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       };
       // Store the absolute check on the state without exposing it to callers.
       enrichmentDeadlineChecks.set(state, expireIfDue);
-      state.timer = setTimeout(expireIfDue, Math.max(0, state.deadlineAt - Date.now()));
-      state.timer.unref?.();
+      // libuv schedules timers off the loop's cached clock while deadlineAt is
+      // wall-clock, so under a busy loop the callback can wake ~1ms *before*
+      // the absolute deadline. expireIfDue correctly refuses early, but the
+      // refusal must re-arm for the remainder or the deadline is only ever
+      // enforced lazily at transfer (admitted row sits without a terminal).
+      const armDeadlineTimer = (): void => {
+        state.timer = setTimeout(() => {
+          state.timer = null;
+          if (state.phase !== "enriching") return;
+          if (Date.now() < state.deadlineAt) {
+            armDeadlineTimer();
+            return;
+          }
+          expireIfDue();
+        }, Math.max(0, state.deadlineAt - Date.now()));
+        state.timer.unref?.();
+      };
+      armDeadlineTimer();
       // Admission may commit after this bridge already completed cleanup. Own
       // the row first, then terminalize in the same synchronous continuation;
       // never start heartbeat/history on a dead bridge.

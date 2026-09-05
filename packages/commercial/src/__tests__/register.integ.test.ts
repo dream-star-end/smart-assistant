@@ -188,9 +188,16 @@ describe("auth.register (integ)", () => {
     //   (a) 含 6 位数字验证码(四空格缩进行)
     //   (b) 主动提示检查垃圾邮件箱(boss 明确要求)
     //   (c) 不再出现 http/https 链接(别再留旧模板残骸混淆用户)
+    // 2026-09-04 OCV5-97:文案补全过期重发/勿转发/落款;subject 不含验证码。
+    assert.equal(mailer.sent[0].subject, "[OpenClaude] 邮箱验证码 · 完成注册");
+    assert.doesNotMatch(mailer.sent[0].subject, /\d{6}/, "subject 不得含验证码");
     assert.match(mailer.sent[0].text, /\n {4}(\d{6})\n/, "邮件必须含 6 位验证码");
     assert.match(mailer.sent[0].text, /垃圾邮件|Spam/, "邮件必须提示检查垃圾邮箱");
     assert.doesNotMatch(mailer.sent[0].text, /https?:\/\//, "不应再有 URL 链接");
+    assert.match(mailer.sent[0].text, /重新发送/, "须提示过期后可重新发送");
+    assert.match(mailer.sent[0].text, /不要把验证码转发/, "须提示勿转发验证码");
+    assert.match(mailer.sent[0].text, /账号不会被激活/);
+    assert.match(mailer.sent[0].text, /—— OpenClaude 团队\nclaudeai\.chat/);
     // 邮件正文中的 raw code 不能等于 DB 里的 token_hash(存的是 sha256 hex)
     const code = mailer.sent[0].text.match(/\n {4}(\d{6})\n/)?.[1] ?? "";
     assert.ok(code.length === 6);
@@ -199,6 +206,62 @@ describe("auth.register (integ)", () => {
       [result.user_id],
     );
     assert.notEqual(code, hashRow.rows[0].token_hash, "raw code must not equal stored hash");
+  });
+
+  test("display_name <=32 is persisted; omitted/blank stays NULL", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const mailer = new CapturingMailer();
+    const named = await register(
+      {
+        email: "nick@example.com",
+        password: "correct horse battery staple",
+        turnstile_token: "tok",
+        display_name: "  小明同学  ",
+      },
+      { mailer, turnstileBypass: true },
+    );
+    const namedRow = await query<{ display_name: string | null }>(
+      "SELECT display_name FROM users WHERE id = $1",
+      [named.user_id],
+    );
+    assert.equal(namedRow.rows[0].display_name, "小明同学");
+
+    const anon = await register(
+      {
+        email: "nonick@example.com",
+        password: "correct horse battery staple",
+        turnstile_token: "tok",
+        display_name: "   ",
+      },
+      { mailer, turnstileBypass: true },
+    );
+    const anonRow = await query<{ display_name: string | null }>(
+      "SELECT display_name FROM users WHERE id = $1",
+      [anon.user_id],
+    );
+    assert.equal(anonRow.rows[0].display_name, null);
+  });
+
+  test("display_name longer than 32 -> VALIDATION, no DB write", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const mailer = new CapturingMailer();
+    await assert.rejects(
+      register(
+        {
+          email: "longnick@example.com",
+          password: "correct horse battery staple",
+          turnstile_token: "tok",
+          display_name: "n".repeat(33),
+        },
+        { mailer, turnstileBypass: true },
+      ),
+      (err: unknown) => err instanceof RegisterError && err.code === "VALIDATION",
+    );
+    const u = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM users WHERE email = $1",
+      ["longnick@example.com"],
+    );
+    assert.equal(u.rows[0].cnt, "0");
   });
 
   test("terms consent(0125): terms_version 有值 → 两列同落;缺省 → 两列 NULL", async (t) => {

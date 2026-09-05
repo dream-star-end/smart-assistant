@@ -41,6 +41,9 @@
 #   scripts/deploy-v5.sh --activate-staged --cutover-nonce=NONCE
 #   scripts/deploy-v5.sh --rollback    # 恢复 .prev.1 + restart(收尾追加一次非阻断 real-turn canary)
 #   scripts/deploy-v5.sh --rollback=N  # 恢复 .prev.N(N=1..5)+ restart
+#   scripts/deploy-v5.sh --allow-legacy-manifest-missing
+#                                  # 缺 .baseline-manifest.json 时走旧 legacy 基线校验；
+#                                  # 新 release（有 manifest）仍按自身清单 + MIN_SECURITY_POLICY。
 #   scripts/deploy-v5.sh --install-monitor # 原子安装独立于 A/B slot 的 host monitor bundle
 #   scripts/deploy-v5.sh --reclaim-mutation-lease
 #                                  # 回收陈旧的 kl-mirror production-mutation lease:读远端 fencing meta →
@@ -141,6 +144,15 @@ BASELINE_GUARD_SCRIPT="$SCRIPT_DIR/v5-baseline-security.sh"
   echo "FATAL: 缺或不可执行的 V5 baseline guard: $BASELINE_GUARD_SCRIPT" >&2
   exit 1
 }
+# First sourceCommit whose builds write .baseline-manifest.json. Empty until
+# this feature's merge SHA is filled in; empty = no automatic
+# --allow-legacy-manifest-missing from ancestry.
+LEGACY_MANIFEST_CUTOFF_COMMIT=""
+# One-cycle fallback: missing-manifest + allow still uses
+# check-release-legacy-cursor / serving_release_uses_legacy_baseline.
+# Delete when every live/rollback target has a manifest and cutoff is set.
+OC_V5_LEGACY_BASELINE_FALLBACK="${OC_V5_LEGACY_BASELINE_FALLBACK:-1}"
+ALLOW_LEGACY_MANIFEST_MISSING=0
 RELEASE_GC_SCRIPT="$SCRIPT_DIR/v5-release-gc.sh"
 [ -x "$RELEASE_GC_SCRIPT" ] || {
   echo "FATAL: 缺或不可执行的 V5 release GC guard: $RELEASE_GC_SCRIPT" >&2
@@ -176,6 +188,10 @@ HOT_CONFIG_LIB="$SCRIPT_DIR/v5-hot-config-lib.sh"
 [ -f "$HOT_CONFIG_LIB" ] || { echo "FATAL: 缺 hot-config lib: $HOT_CONFIG_LIB" >&2; exit 1; }
 # shellcheck source=scripts/v5-hot-config-lib.sh
 source "$HOT_CONFIG_LIB"
+HOST_MAINT_LIB="$SCRIPT_DIR/v5-host-maint-lib.sh"
+[ -f "$HOST_MAINT_LIB" ] || { echo "FATAL: 缺 host maint lib: $HOST_MAINT_LIB" >&2; exit 1; }
+# shellcheck source=scripts/v5-host-maint-lib.sh
+source "$HOST_MAINT_LIB"
 DEPLOY_SURFACE_CHECK="$SCRIPT_DIR/v5-deploy-surface-check.mjs"
 [ -x "$DEPLOY_SURFACE_CHECK" ] || {
   echo "FATAL: 缺或不可执行的 V5 deploy surface check: $DEPLOY_SURFACE_CHECK" >&2
@@ -310,6 +326,7 @@ for arg in "$@"; do
     --rollback=*) MODE="rollback"; ROLLBACK_N="${arg#*=}" ;;
     # 陈旧 production-mutation lease 回收(C1):只读探测 + 条件清理,不抢任何本地/全局锁。
     --allow-unverified-ci) ALLOW_UNVERIFIED_CI=1 ;;
+    --allow-legacy-manifest-missing) ALLOW_LEGACY_MANIFEST_MISSING=1 ;;
     --reclaim-mutation-lease) MODE="reclaim-mutation-lease" ;;
     --reclaim-mutation-inflight) MODE="reclaim-mutation-inflight" ;;
     # 模型权威(方案 §7 步 4/5)。preflight 是四面活体门,cutover 是不可逆地板。
@@ -453,19 +470,24 @@ slot_baseline_dir() { # <A|B>
   printf '%s/packages/commercial/agent-sandbox/ccb-baseline\n' "$(slot_src "$1")"
 }
 
-run_baseline_guard_remote() { # <check-release|harden-release|check-dir|harden-dir> <absolute-path>
-  local guard_mode="$1" target="$2" qmode qtarget
-  [[ "$guard_mode" =~ ^(check-release|harden-release|check-release-legacy-cursor|harden-release-legacy-cursor|check-dir|harden-dir)$ ]] \
+run_baseline_guard_remote() { # <mode> <absolute-path> [extra-args...]
+  local guard_mode="$1" target="$2" qmode qtarget extra_q="" q a
+  shift 2
+  [[ "$guard_mode" =~ ^(check-release|harden-release|check-release-legacy-cursor|harden-release-legacy-cursor|check-dir|harden-dir|verify-release|write-manifest)$ ]] \
     || { echo "✗ baseline guard mode 非法:$guard_mode" >&2; return 2; }
   [[ "$target" =~ ^/[A-Za-z0-9._/-]+$ ]] \
     || { echo "✗ baseline guard path 非法:$target" >&2; return 2; }
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] baseline guard $guard_mode $target"
+    echo "  [dry-run] baseline guard $guard_mode $target $*"
     return 0
   fi
   printf -v qmode '%q' "$guard_mode"
   printf -v qtarget '%q' "$target"
-  ssh "$KL_HOST" "bash -s -- $qmode $qtarget" < "$BASELINE_GUARD_SCRIPT"
+  for a in "$@"; do
+    printf -v q '%q' "$a"
+    extra_q+=" $q"
+  done
+  ssh "$KL_HOST" "bash -s -- $qmode $qtarget$extra_q" < "$BASELINE_GUARD_SCRIPT"
 }
 
 assert_release_baseline_security() { # <absolute-release-root>
@@ -486,6 +508,72 @@ harden_legacy_release_baseline() { # <absolute-release-root>
 assert_legacy_release_baseline_security() { # <absolute-release-root>
   run_baseline_guard_remote check-release-legacy-cursor "$1" \
     || { echo "✗ legacy serving release 的 CCB baseline 不完整/不安全:$1" >&2; return 1; }
+}
+
+write_release_baseline_manifest() { # <release-root> <40-hex-source>
+  local root="$1" sha="$2"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "✗ write baseline manifest: sourceCommit 非法" >&2; return 1; }
+  run_baseline_guard_remote write-manifest "$root" "$sha" \
+    || { echo "✗ 写入 .baseline-manifest.json 失败:$root" >&2; return 1; }
+}
+
+# True when this release's .complete.sourceCommit is a strict ancestor of
+# LEGACY_MANIFEST_CUTOFF_COMMIT (the first SHA that writes manifests).
+# Empty cutoff → never auto-allow (fail-closed until the merge SHA is filled).
+release_source_predates_manifest_cutoff() { # <release-root>
+  local release="$1" serving_sha
+  [[ "$LEGACY_MANIFEST_CUTOFF_COMMIT" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ -n "$release" ]] || return 1
+  [[ "${DRY:-0}" == 1 ]] && return 1
+  serving_sha="$(ssh "$KL_HOST" "jq -er '.sourceCommit | select(type==\"string\" and test(\"^[0-9a-f]{40}$\"))' '$release/.complete'" 2>/dev/null)" || return 1
+  [[ "$serving_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$serving_sha" != "$LEGACY_MANIFEST_CUTOFF_COMMIT" ]] || return 1
+  git -C "$REPO_ROOT" merge-base --is-ancestor "$serving_sha" "$LEGACY_MANIFEST_CUTOFF_COMMIT" 2>/dev/null
+}
+
+# Two-question baseline verify: (a) release matches its own manifest;
+# (b) current checkout MIN_SECURITY_POLICY. Missing manifest is FATAL unless
+# --allow-legacy-manifest-missing / rollback flag / cutoff ancestry / one-cycle
+# fallback classifier says otherwise.
+verify_release_baseline_security() { # <absolute-release-root>
+  local release="$1"
+  local extra=()
+  if [[ "${ALLOW_LEGACY_MANIFEST_MISSING:-0}" == 1 \
+     || "${ROLLBACK_LEGACY_BASELINE_OK:-0}" == 1 ]] \
+     || release_source_predates_manifest_cutoff "$release" \
+     || { [[ "${OC_V5_LEGACY_BASELINE_FALLBACK:-1}" == 1 ]] && serving_release_uses_legacy_baseline "$release"; }; then
+    extra+=(--allow-legacy-manifest-missing)
+  fi
+  run_baseline_guard_remote verify-release "$release" "${extra[@]}" \
+    || { echo "✗ release baseline 两问校验失败:$release" >&2; return 1; }
+}
+
+# One-cycle fallback classifier for missing-manifest releases.
+# Compensation/rollback may re-serve a predecessor that predates skills added
+# in this checkout (e.g. multi-model-review). Official --rollback already
+# prefixes ROLLBACK_LEGACY_BASELINE_OK=1; compensation callers historically did
+# not, so this helper still returns true when serving != BUILT_RELEASE.
+# --recover has no build (BUILT_RELEASE empty). Identity is serving .complete
+# sourceCommit vs this checkout HEAD: unequal → legacy; unreadable / non-40-hex
+# / ssh fail / DRY → strict (fail-closed, same as today).
+# verify_release_baseline_security consults this only when
+# OC_V5_LEGACY_BASELINE_FALLBACK=1 (default). Delete after cutoff is filled
+# and every live/rollback target has .baseline-manifest.json.
+serving_release_uses_legacy_baseline() { # <serving-release>
+  local serving="${1:-}" serving_sha checkout_sha
+  [[ "${ROLLBACK_LEGACY_BASELINE_OK:-0}" == 1 ]] && return 0
+  [[ -n "${BUILT_RELEASE:-}" && -n "$serving" && "$serving" != "$BUILT_RELEASE" ]] && return 0
+  # Fast path above covers this invocation's new vs predecessor. Recover (and
+  # any lane that never assigned BUILT_RELEASE) must still classify by source.
+  [[ -n "${BUILT_RELEASE:-}" ]] && return 1
+  [[ -n "$serving" ]] || return 1
+  [[ "${DRY:-0}" == 1 ]] && return 1
+  serving_sha="$(ssh "$KL_HOST" "jq -er '.sourceCommit | select(type==\"string\" and test(\"^[0-9a-f]{40}$\"))' '$serving/.complete'" 2>/dev/null)" || return 1
+  [[ "$serving_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  checkout_sha="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)" || return 1
+  [[ "$checkout_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$serving_sha" != "$checkout_sha" ]] && return 0
+  return 1
 }
 
 install_v5_slot_units() {
@@ -738,17 +826,10 @@ case "$shared_rc" in
   *) echo "FATAL: cannot inspect shared V5 env(rc=$shared_rc)" >&2; exit 1 ;;
 esac
 REMOTE
-  if [[ "${ROLLBACK_LEGACY_BASELINE_OK:-0}" == 1 ]]; then
-    # Emergency/history rollback targets may predate the admin overlay files.
-    # Keep the live env/port fail-closed checks above, but validate the immutable
-    # target with the narrow legacy allowlist instead of the forward-only tree.
-    local live_release
-    live_release="$(bg_current_release "$src")"
-    [[ -n "$live_release" ]] || { echo "✗ legacy rollback live release 无法解析:$src" >&2; return 1; }
-    assert_legacy_release_baseline_security "$live_release" || return 1
-  else
-    run_baseline_guard_remote check-dir "$expected" || return 1
-  fi
+  local live_release
+  live_release="$(bg_current_release "$src")"
+  [[ -n "$live_release" ]] || { echo "✗ live release 无法解析:$src" >&2; return 1; }
+  verify_release_baseline_security "$live_release" || return 1
   # V5 is local-only (deploy/v5/P1-PLAN.md). A loopback-only reservation blocks
   # the old wildcard BaselineServer bind across rollback and A/B canary masters.
   assert_v5_baseline_port_guard || {
@@ -1018,6 +1099,7 @@ MUTATION_LEASE_TTL_PGID=""  # 独立 PGID，outer 整组 STOP/KILL 时 deadline 
 MUTATION_LEASE_ACTIVE=0     # 1=已持有,cleanup 需释放
 MUTATION_LEASE_BYPASSED=0   # 1=OC_V5_SKIP_MUTATION_LEASE 紧急旁路,活性断言直接放行
 MUTATION_DEPLOY_ID=""       # 与 lease fencing meta 的 deploy_id 同值；不是 lane marker nonce
+HOST_MAINT_DEPLOY_ID=""     # apt-daily 维护租约; cleanup / ExecStopPost 按此 id 恢复
 MUTATION_HOLDER_IDENTITY=""
 KNOWLEDGE_PLANET_VERIFY_HOLDER_OWNED=0
 MUTATION_LANE_PID=""
@@ -1358,6 +1440,9 @@ cleanup_deploy_process() {
   [[ "$DEPLOY_HOLDER_OWNED" == 1 ]] && rm -f "${DEPLOY_LOCK}.holder"
   [[ "$KNOWLEDGE_PLANET_VERIFY_HOLDER_OWNED" == 1 ]] \
     && rm -f "${KNOWLEDGE_PLANET_VERIFY_LOCK}.holder"
+  # Restore apt-daily timers even on abnormal EXIT (OCV5-117). Idempotent; no-op
+  # without a matching maint-suspended.json. set +e is already on.
+  host_maint_restore_owned "${HOST_MAINT_DEPLOY_ID:-}"
   exit "$rc"
 }
 
@@ -2867,12 +2952,14 @@ version_commit="$(jq -er '.commit | select(type == "string")' "$version")" || ex
 if [[ "$kind" == strong ]]; then
   row="$(jq -er --argjson schema "$schema" '
     if (((["artifactSha256","builtAt","metadataSha256","schemaVersion","sourceCommit"] - keys) | length) == 0
-      and ((keys - ["artifactSha256","builtAt","distReuse","flavorGuardGeneration","metadataSha256","schemaVersion","sourceCommit"]) | length) == 0
+      and ((keys - ["artifactSha256","baselineManifestSha256","builtAt","distReuse","flavorGuardGeneration","metadataSha256","schemaVersion","sourceCommit"]) | length) == 0
       and .schemaVersion == $schema
       and (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
       and (.builtAt | type == "string" and test("^[0-9]{8}-[0-9]{6}$"))
       and (.metadataSha256 | type == "string" and test("^[0-9a-f]{64}$"))
       and (.artifactSha256 | type == "string" and test("^[0-9a-f]{64}$"))
+      and ((has("baselineManifestSha256") | not)
+        or (.baselineManifestSha256 | type == "string" and test("^[0-9a-f]{64}$")))
       and ((has("distReuse") | not)
         or ((.distReuse | type == "object")
           and (.distReuse.fromRelease | type == "string" and startswith("/"))
@@ -2899,6 +2986,17 @@ if [[ "$kind" == strong ]]; then
   [[ "$artifact_have" == "$artifact_want" ]] || {
     echo "FATAL: release artifact digest mismatch:$reldir" >&2; exit 1;
   }
+  if jq -e '.baselineManifestSha256 | type == "string"' "$marker" >/dev/null; then
+    manifest="$reldir/.baseline-manifest.json"
+    [[ -f "$manifest" && ! -L "$manifest" ]] || {
+      echo "FATAL: baselineManifestSha256 present but .baseline-manifest.json missing:$reldir" >&2; exit 1;
+    }
+    manifest_want="$(jq -er '.baselineManifestSha256' "$marker")"
+    manifest_have="$(sha256sum -- "$manifest" | cut -d' ' -f1)"
+    [[ "$manifest_have" == "$manifest_want" ]] || {
+      echo "FATAL: baseline manifest digest mismatch:$reldir" >&2; exit 1;
+    }
+  fi
   printf 'strong\t%s\t%s\t%s\t%s\n' "$source_commit" "$short" "$built_at" "$artifact_want"
 else
   row="$(jq -er '
@@ -3114,16 +3212,32 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
   artifact_sha="$(release_artifact_digest "$root")"
   [[ "$metadata_sha" =~ ^[0-9a-f]{64}$ && "$artifact_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
   marker_tmp="${root}.complete.$$"
-  if ! jq -n \
-    --argjson schemaVersion "$schema" \
-    --arg sourceCommit "$full_sha" \
-    --arg builtAt "$built_at" \
-    --arg metadataSha256 "$metadata_sha" \
-    --arg artifactSha256 "$artifact_sha" \
-    --argjson flavorGuardGeneration 1 \
-    '{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
+  local jq_args=(
+    -n
+    --argjson schemaVersion "$schema"
+    --arg sourceCommit "$full_sha"
+    --arg builtAt "$built_at"
+    --arg metadataSha256 "$metadata_sha"
+    --arg artifactSha256 "$artifact_sha"
+    --argjson flavorGuardGeneration 1
+  )
+  local jq_prog='{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
       metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
-      flavorGuardGeneration:$flavorGuardGeneration}' >"$marker_tmp"; then
+      flavorGuardGeneration:$flavorGuardGeneration}'
+  local baked_manifest="$root/.baseline-manifest.json" manifest_sha
+  if [[ -e "$baked_manifest" ]]; then
+    [[ -f "$baked_manifest" && ! -L "$baked_manifest" ]] || {
+      echo "FATAL: .baseline-manifest.json 必须是常规文件:$baked_manifest" >&2; return 1;
+    }
+    manifest_sha="$(sha256sum -- "$baked_manifest" | cut -d' ' -f1)"
+    [[ "$manifest_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    jq_args+=(--arg baselineManifestSha256 "$manifest_sha")
+    jq_prog='{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
+      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
+      flavorGuardGeneration:$flavorGuardGeneration,
+      baselineManifestSha256:$baselineManifestSha256}'
+  fi
+  if ! jq "${jq_args[@]}" "$jq_prog" >"$marker_tmp"; then
     rm -f -- "$marker_tmp"
     return 1
   fi
@@ -3933,6 +4047,13 @@ REMOTE
   if ! write_version "$staging" "$short_sha" >&2; then ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
   if ! harden_release_baseline "$staging"; then
     echo "✗ staging CCB baseline hardening/validation 失败" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  # Bake the checkout's expectedSkills into the immutable release before the
+  # tree digest. .complete.baselineManifestSha256 is filled by the marker writer.
+  if ! write_release_baseline_manifest "$staging" "$full_sha"; then
+    echo "✗ staging .baseline-manifest.json 写入失败" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
@@ -6397,6 +6518,7 @@ migrate_to_bluegreen() {
   harden_release_baseline "$REMOTE_SRC" || return 1
   strip_shared_baseline_env_keys || return 1
   assert_release_baseline_security "$REMOTE_SRC" || return 1
+  write_release_baseline_manifest "$REMOTE_SRC" "$full_sha" || return 1
   ts="$(date -u +%Y%m%d-%H%M%S)"
   reldir="$RELEASES_ROOT/rel-$sha-$ts-migrated"
   echo "── 停机 → 实目录搬入 $reldir → 写 strong .complete → symlink → 启动(一次性,几秒停机;ERR 自动恢复贯穿 start)──"
@@ -6641,8 +6763,16 @@ smoke() {
   #     只 UPDATE 该 audit 表。index.ts 门在 runtimeChannel=v5 且挂 LeaderBundle 单 leader。
   #     首发 b34e7e925 因本白名单漏登被 smoke 拒、对称补偿回滚——名单与 trackScheduler
   #     登记必须同批更新。关停:COMMERCIAL_CURSOR_AUDIT_RECONCILER_DISABLED=1)
+  #   cursorUsageSweep(2026-09-05 selfhost 7ef53b33b 正向同步引入:index.ts
+  #     leaderBundle.add({name:"cursorUsageSweep",domain:"v5-owned"...}),只写 0262
+  #     引入的 cursor sand usage 列;关停 COMMERCIAL_CURSOR_USAGE_SWEEP_DISABLED=1)
+  #   desktopEnrollSweep(2026-09-05 selfhost P1 桌面底座引入:index.ts domain:"shared",
+  #     清扫 0264 引入表 desktop_enrollments 过期行,旗 OC_DESKTOP_VIRTUAL_CONTAINER
+  #     默认关;关停 OC_DESKTOP_ENROLL_SWEEP_DISABLED=1。shared 域条目进本名单是既有
+  #     先例,idleSweep/alert/refreshEventsSweep 等同列;smoke 校验 healthz.schedulers
+  #     必须是本名单子集,加白名单即可,不改 domain)
   allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot cursorAuthSync"
-  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler"
+  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler cursorUsageSweep desktopEnrollSweep"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do
@@ -9001,9 +9131,9 @@ rollback_runtime_tuple() {
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
   assert_release_marker "$master" || return 1
   assert_release_required_migrations "$master" || return 1
-  # History predecessors may predate admin prompt variants and the
-  # cursor/taskboard baseline skills. Forward targets remain strict.
-  assert_legacy_release_baseline_security "$master" || return 1
+  # History predecessors: two-question verify (own manifest, or legacy
+  # fallback under --allow-legacy-manifest-missing / cutoff / one-cycle flag).
+  verify_release_baseline_security "$master" || return 1
   assert_web_storage_rollback_transition \
     "$prev_src" "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" "$master" \
     "tuple rollback exact target" || return 1
@@ -9826,6 +9956,74 @@ SQL
 
 current_egress_release() {
   ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true
+}
+
+# ── egress surface gate(2026-09-04 INC:cursor 子 agent 409 VERIFICATION_SPONSORSHIP_CONFLICT)──
+# egress 独立指针不随 A/B 翻转,只有 --egress 才切。8/26→9/4 三次 --with-dist 都没带 --egress,
+# master 已含 authority_turn_dispatches 写入(0dea03d3b)而 egress 仍是 8/26 旧代码(缺 d70acbdff),
+# 半套修复组合出 100% 409。本门在 lease 外只读比对「egress 当前运行 release 的 sourceCommit ..
+# 本次发布源 commit」在 egress 面文件上的 diff:有差异而未带 --egress → fail-loud。
+# 面的口径与 --egress 参数注释一致(anthropicProxy / http/proxy / 账号池 / 计费 / egress/*),
+# 排除测试文件;故意不把 db/config/logging 这类全局依赖算进来,否则每次都要 --egress,解耦就没意义。
+EGRESS_SURFACE_PATHSPECS=(
+  'packages/commercial/src/egress'
+  'packages/commercial/src/http/proxy'
+  'packages/commercial/src/http/anthropicProxy.ts'
+  'packages/commercial/src/http/internalCostEvent.ts'
+  'packages/commercial/src/account-pool'
+  'packages/commercial/src/billing'
+  ':(exclude,glob)**/__tests__/**'
+  ':(exclude,glob)**/*.test.ts'
+  ':(exclude,glob)**/*.integ.test.ts'
+)
+
+egress_release_source_commit() { # <release-dir> → 40-hex(strong .complete)或 VERSION.json 短 sha 解析
+  local reldir="$1" sha
+  [[ -n "$reldir" ]] || return 1
+  # </dev/null:ssh 会吞掉调用方 stdin(source-only harness / bash -s 场景下会截断后续脚本)。
+  sha="$(ssh "$KL_HOST" "jq -er '.sourceCommit // empty' '$reldir/.complete' 2>/dev/null || jq -er '.commit // empty' '$reldir/VERSION.json' 2>/dev/null" </dev/null 2>/dev/null || true)"
+  [[ -n "$sha" ]] || return 1
+  git -C "$REPO_ROOT" rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null
+}
+
+assert_egress_surface_covered() { # 仅 MODE=deploy 且未带 --egress 时有意义
+  [[ "$MODE" == "deploy" && "$RESTART_EGRESS" != 1 ]] || return 0
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] egress surface gate:比对 egress 运行 release..发布源 commit 在 ${EGRESS_SURFACE_PATHSPECS[0]} 等面上的 diff"
+    return 0
+  fi
+  local current egress_sha target_sha changed
+  current="$(current_egress_release </dev/null)"
+  [[ -n "$current" ]] || {
+    echo "✗ egress surface gate:读不到 $V5_EGRESS_UNIT 运行中的 release cwd(unit 未起?)。egress 面无法判定,fail-closed" >&2
+    return 1
+  }
+  egress_sha="$(egress_release_source_commit "$current")" || {
+    echo "✗ egress surface gate:egress release $current 的 sourceCommit 缺失或本地不可达;无法判定是否需要 --egress" >&2
+    return 1
+  }
+  target_sha="$(resolve_release_source_commit)" || return 1
+  changed="$(git -C "$REPO_ROOT" diff --name-only "$egress_sha" "$target_sha" -- "${EGRESS_SURFACE_PATHSPECS[@]}" 2>/dev/null)" || {
+    echo "✗ egress surface gate:git diff $egress_sha..$target_sha 失败" >&2
+    return 1
+  }
+  if [[ -z "$changed" ]]; then
+    echo "  ✓ egress surface gate:egress 运行 ${egress_sha:0:9}..发布源 ${target_sha:0:9} 在 egress 面无变更,可不带 --egress"
+    return 0
+  fi
+  if [[ "${OC_V5_SKIP_EGRESS_SURFACE_GATE:-0}" == 1 ]]; then
+    echo "  ⚠ egress surface gate:egress 面有变更但 OC_V5_SKIP_EGRESS_SURFACE_GATE=1 放行(egress 将继续跑 ${egress_sha:0:9}):" >&2
+    printf '     · %s\n' $changed >&2
+    return 0
+  fi
+  {
+    echo "✗ egress surface gate:egress 仍运行 ${egress_sha:0:9}($current),本次发布 ${target_sha:0:9} 在 egress 面改了以下文件却未带 --egress:"
+    printf '     · %s\n' $changed
+    echo "   master 与 egress 版本错位会把只修了一半的 proxy/计费逻辑推上线(参见 2026-09-04 cursor 子 agent 409)。"
+    echo "   改用:deploy-v5.sh --with-dist --egress(同 SHA,egress SIGTERM drain 重启)。"
+    echo "   确认 egress 面变更本次不需要一起上时(极少),OC_V5_SKIP_EGRESS_SURFACE_GATE=1 显式放行。"
+  } >&2
+  return 1
 }
 
 begin_candidate_egress_transition() { # <candidate-release> <generation>
@@ -11551,6 +11749,8 @@ fi
 # B1:会 build_release 的 lane 先在 lease 外跑完 CI 绿门(含轮询),再取全局写锁。
 # rollback/recover/canary-reuse 等不建 release,绝不能被绿门拖住。
 maybe_run_ci_green_gate_for_mode || exit 1
+# egress surface gate 同样在 lease 外、只读:egress 面有变更却没带 --egress 直接拒,别等构建完才发现。
+assert_egress_surface_covered || exit 1
 
 # 只读 lane(smoke/baseline-census/两个 model-authority 只读态)不取;dry-run 只打印意图。
 case "$MODE" in
@@ -11565,6 +11765,25 @@ esac
 
 # B1 持锁后廉价复核:pinned SHA 未漂 + 本进程绿门结论仍在。
 maybe_recheck_ci_green_after_lease || exit 1
+
+# Host apt/needrestart mutex (OCV5-117): fail-closed if apt/dpkg/needrestart is
+# running; stop apt-daily timers for the write-lane lifetime; restore on EXIT.
+# Readonly / reclaim lanes skip (reclaim must not block on a 6h timer lease).
+case "$MODE" in
+  smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|reclaim-mutation-inflight) ;;
+  *)
+    if [[ "$DRY" != 1 ]]; then
+      host_maint_precheck || exit 1
+      HOST_MAINT_DEPLOY_ID="${MUTATION_DEPLOY_ID:-}"
+      if [[ -z "$HOST_MAINT_DEPLOY_ID" ]]; then
+        HOST_MAINT_DEPLOY_ID="$(openssl rand -hex 12 2>/dev/null || printf 'pid%s-%s' "$$" "$(date +%s)")"
+      fi
+      host_maint_begin "$HOST_MAINT_DEPLOY_ID" || exit 1
+    else
+      echo "  [dry-run] skip host-maint precheck/suspend (apt-daily timers untouched)"
+    fi
+    ;;
+esac
 
 # Durable containment debt is checked only after the real mutation lease has been acquired.
 # Recovery/rollback/abort and Luna-hide compensation remain available; every other write lane

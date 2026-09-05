@@ -139,13 +139,23 @@ echo "actual failing (top-level): $(wc -l < "$workdir/actual")"
 echo "baseline entries:           $(wc -l < "$workdir/known")"
 
 # ── A. TAP 完整性 ────────────────────────────────────────────────────────────
+dump_tap_excerpt() {
+  echo "----- TAP excerpt for diagnosis ($tap_file, $(wc -c < "$tap_file") bytes) -----" >&2
+  echo "----- head 30 -----" >&2
+  head -30 "$tap_file" >&2 || true
+  echo "----- tail 50 -----" >&2
+  tail -50 "$tap_file" >&2 || true
+}
 if [[ "$total_points" -eq 0 ]]; then
-  note_fail "no TAP test points found in $tap_file — 套件根本没跑起来"
+  note_fail "no TAP test points found in $tap_file — 套件根本没跑起来。若 job 在更早步骤(npm ci / fixture wait)已红,这不是 known-failures 回归。"
+  dump_tap_excerpt
 fi
 if [[ -z "$plan_n" ]]; then
-  note_fail "TAP 缺顶层 plan 行 \`1..N\`:$tap_file —— 进程在跑完前就没了(OOM / 看门狗 kill / 崩溃)。跑了一半不算绿。"
+  note_fail "TAP 缺顶层 plan 行 \`1..N\`:$tap_file —— 进程在跑完前就没了(OOM / 看门狗 kill / 崩溃 / npm ci 根本没跑到本脚本)。跑了一半不算绿。"
+  dump_tap_excerpt
 elif [[ "$plan_n" -ne "$total_points" ]]; then
   note_fail "TAP plan 与实际测试点数不符:plan=1..$plan_n,实际顶层测试点=$total_points —— 输出被截断或被并发写串了。"
+  dump_tap_excerpt
 fi
 for key in tests pass fail cancelled skipped; do
   val_var="sum_$key"

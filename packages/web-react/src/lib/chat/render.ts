@@ -19,7 +19,7 @@ import {
 import { REVIEW_VERDICT_NEEDS_FIX, REVIEW_VERDICT_PASS } from "@openclaude/protocol/teamCards";
 import { isServerAuthoredRow } from "./model";
 import type { BashTail, ChatMessage, ChildBlock } from "./model";
-import { friendlyBridgeErrorMessage } from "./pure";
+import { friendlyBridgeErrorMessage, insufficientCreditsCopy } from "./pure";
 
 /**
  * dispatch 终态错误码(免单语义:受理未执行 = 未计费 / 服务重启中断 = 已退款)。归一化小写。
@@ -534,7 +534,7 @@ export const CONTINUE_PROMPT =
  */
 const ERROR_LABELS: Record<string, string> = {
   // ── 计费/配额 ──
-  insufficient_credits: "积分已耗尽",
+  insufficient_credits: insufficientCreditsCopy(false).title,
   rate_limited: "请求过于频繁，请稍后再试",
   // ── 上游模型服务 ──
   model_capacity: "模型繁忙",

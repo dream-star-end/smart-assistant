@@ -51,6 +51,13 @@ export const registerInputSchema = z.object({
   // 强收该字段既不能证明直连调用方"同意过",还会把灰度期旧 bundle 的注册打崩;
   // 有值才落库。
   terms_version: z.string().min(1).max(64).optional(),
+  // 前端 AuthGate 收集昵称;缺省 / 空串不写列(NULL)。zod strip 未知字段,必须显式接收。
+  display_name: z
+    .string()
+    .trim()
+    .max(32)
+    .optional()
+    .transform((v) => (v && v.length > 0 ? v : undefined)),
 });
 
 export type RegisterInput = z.infer<typeof registerInputSchema>;
@@ -264,19 +271,20 @@ export async function register(
   try {
     userId = await tx<string>(async (client) => {
       // INSERT user;email UNIQUE 约束撞了会抛 23505。
-      // credits 不带,默认 0 —— 注册赠金延后到 verifyEmail 时刻发放(反薅羊毛)。
+      // credits 不带,默认 0。注册赠金已于 2026-07-07 下线;免费额度由 login/SSO/
+      // GET /api/me 调用 ensureFreeSubscription 发放期内桶 300,verifyEmail 不再发积分。
       // v3 退役:新号直接 v5 原生(v5_migrated_at=NOW()+status=migrated,满足 0099
       // consistency CHECK)。新号无 v3 数据,迁移是 no-op,故在建号时就置权威源,
       // routeChannelForUser 恒返回 v5、v3MayServe 恒 false → 永不 provisioning v3 容器。
       // 协议同意留证(0125):terms_version 有值 = 注册页勾选过,accepted_at 同刻落
       // NOW();无值两列 NULL(旧 bundle / 直连 API),语义见迁移头注释。
       const ins = await client.query<{ id: string }>(
-        `INSERT INTO users(email, password_hash, v5_migrated_at, v5_migration_status,
+        `INSERT INTO users(email, password_hash, display_name, v5_migrated_at, v5_migration_status,
                            terms_version, terms_accepted_at)
-         VALUES ($1, $2, NOW(), 'migrated',
-                 $3, CASE WHEN $3::text IS NULL THEN NULL ELSE NOW() END)
+         VALUES ($1, $2, $3, NOW(), 'migrated',
+                 $4, CASE WHEN $4::text IS NULL THEN NULL ELSE NOW() END)
          RETURNING id::text AS id`,
-        [input.email, passwordHash, input.terms_version ?? null],
+        [input.email, passwordHash, input.display_name ?? null, input.terms_version ?? null],
       );
       const uid = ins.rows[0].id;
       await client.query(
@@ -307,16 +315,19 @@ export async function register(
   try {
     await deps.mailer.send({
       to: input.email,
-      subject: "[OpenClaude] 邮箱验证码",
+      subject: "[OpenClaude] 邮箱验证码 · 完成注册",
       text:
-        `你好,\n\n` +
-        `你的 OpenClaude 邮箱验证码是:\n\n` +
+        `你好,欢迎使用 OpenClaude。\n\n` +
+        `这是一封由 OpenClaude（claudeai.chat）发出的邮箱验证邮件。你的验证码是:\n\n` +
         `    ${verify.raw}\n\n` +
-        `请回到注册页面输入此验证码完成验证。\n` +
-        `验证码 30 分钟内有效,一次性使用。\n\n` +
+        `请在有效期内回到注册页输入此验证码完成验证。\n` +
+        `验证码 30 分钟内有效,一次性使用。若验证码过期,可在注册页点「重新发送」。\n\n` +
+        `请不要把验证码转发给任何人(包括自称客服的联系人)。\n\n` +
         `📬 若未在收件箱看到此邮件,请检查「垃圾邮件 / Spam」文件夹,\n` +
-        `   并把 OpenClaude 寄件地址加入联系人 / 白名单以后续避免误判。\n\n` +
-        `如果这不是你本人操作,忽略此邮件即可,账号不会被激活。`,
+        `   并把 OpenClaude 寄件地址加入联系人 / 白名单,以免后续被误判。\n\n` +
+        `如果这不是你本人操作,忽略此邮件即可,账号不会被激活。\n\n` +
+        `—— OpenClaude 团队\n` +
+        `claudeai.chat`,
     });
   } catch {
     sent = false;

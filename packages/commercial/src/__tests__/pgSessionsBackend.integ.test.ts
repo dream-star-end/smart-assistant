@@ -265,8 +265,18 @@ before(async () => {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
-  // The production dispatch store already reads 0267 target identity columns.
-  await pool.query(await readFile(path.resolve(here, "../db/migrations/0267_turn_dispatches_agent_container.sql"), "utf8"));
+  // 0267: production SQL selects agent_container_id/runtime_kind; this isolated
+  // schema does not apply the full desktop migration chain, so add the columns.
+  await pool.query(`
+    ALTER TABLE turn_dispatches
+      ADD COLUMN IF NOT EXISTS agent_container_id BIGINT REFERENCES agent_containers(id) ON DELETE RESTRICT;
+    ALTER TABLE turn_dispatches
+      ADD COLUMN IF NOT EXISTS runtime_kind TEXT;
+    ALTER TABLE agent_containers
+      ADD COLUMN IF NOT EXISTS runtime_kind TEXT NOT NULL DEFAULT 'docker';
+    ALTER TABLE chat_projects
+      ADD COLUMN IF NOT EXISTS is_research_default BOOLEAN NOT NULL DEFAULT FALSE;
+  `);
   migration0176EscapedNulBackfill = (
     await pool.query<NonNullable<typeof migration0176EscapedNulBackfill>>(
       `SELECT physical_record_count, logical_record_count, record_payload_bytes::text

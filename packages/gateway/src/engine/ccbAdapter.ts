@@ -121,6 +121,12 @@ export function isCcbUserCancellationDiagnostic(
   const first = errors[0]
   if (typeof first !== 'string') return false
   if (first.startsWith('Error: Request was aborted.')) {
+    // Legacy shape without a diagnostic line only ever came from the
+    // streaming-phase AbortController path, whose result frame carries
+    // stop_reason=null. An authoritative terminal such as stop_reason=refusal
+    // that merely lists an abort error is CCB's own verdict, not the user's
+    // Stop, and must keep painting ENGINE_ERROR.
+    if ((stopReason ?? null) !== null) return false
     return errors.every((e) => typeof e === 'string' && e.startsWith('Error: Request was aborted.'))
   }
   const m = CCB_EDE_CANCEL_DIAGNOSTIC_RE.exec(first)

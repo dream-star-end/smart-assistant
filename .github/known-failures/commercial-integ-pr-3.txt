@@ -18,4 +18,5 @@
 #   也放宽到最松的那一片。本片 CI 实测 # tests 119 / # fail 3(顶层 2 条)。
 # 真值来源 = CI artifact commercial-integ-tap-pr-3(铁律:基线真值只认 CI,不认本机)。
 
-retention 反向对账门(连库跑全量迁移)
+
+# 2026-09-05 OCV5-113 块 A: retention 反向对账门已登记 47 张缺失表,本片基线清空。

@@ -1332,8 +1332,13 @@ await check("T14 消息反馈弹窗关闭后把焦点还给原消息动作", asy
   }
   await dialog.getByRole("button", { name: "关闭" }).click();
   await dialog.waitFor({ state: "hidden", timeout: 3000 });
-  const focused = await trigger.evaluate((node) => document.activeElement === node);
-  if (!focused) throw new Error("关闭反馈弹窗后焦点没有归还原消息动作");
+  const handle = await trigger.elementHandle();
+  if (!handle) throw new Error("关闭后找不到原消息动作按钮");
+  await page.waitForFunction(
+    (el) => el instanceof HTMLElement && document.activeElement === el,
+    handle,
+    { timeout: 3000 },
+  );
 });
 
 await check("T15 活动 turn 中专用 Ask UI 在移动端可点选并提交", async () => {
@@ -1947,7 +1952,13 @@ await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹
     const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
     return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 200;
   }, null, { timeout: 5000 });
-  await mobilePage.evaluate(() => window.__mobilePage.armSticky());
+  // grow 后 layout 可能还在涨高；反复 armSticky 直到真贴底，避免 12px 级竞态。
+  await mobilePage.waitForFunction(() => {
+    window.__mobilePage.armSticky();
+    const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
+    if (!(node instanceof HTMLElement)) return false;
+    return Math.abs(node.scrollTop - (node.scrollHeight - node.clientHeight)) <= 2;
+  }, null, { timeout: 5000 });
   const before = await scroll.evaluate((node) => ({
     top: node.scrollTop,
     height: node.scrollHeight,
@@ -2284,10 +2295,29 @@ await check("T28 iPhone 支付跳 mobile_url，微信 WebView 不误导航", asy
   if (await wechatPaymentPage.getByRole("link", { name: "前往微信支付" }).count()) {
     throw new Error("微信 WebView 暴露了手机支付链接");
   }
-  await wechatPaymentPage.getByText("请在系统浏览器打开本页后重新下单").waitFor({
+  if (await wechatPaymentPage.getByTestId("mobile-payment-link").count()) {
+    throw new Error("微信 WebView 暴露了手机支付链接");
+  }
+  await wechatPaymentPage.getByTestId("wechat-copy-payment-link").waitFor({
     state: "visible",
     timeout: 3000,
   });
+  await wechatPaymentPage.getByTestId("wechat-payment-browser-hint").waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await wechatPaymentPage.getByText("在系统浏览器打开后自动恢复本次订单").waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  const wechatUrlBefore = wechatPaymentPage.url();
+  await wechatPaymentPage.getByTestId("wechat-copy-payment-link").click();
+  if (wechatPaymentPage.url() !== wechatUrlBefore) {
+    throw new Error(`微信 WebView 点击复制链接后发生导航: ${wechatPaymentPage.url()}`);
+  }
+  if (wechatPaymentPage.url().includes("pay.xunhupay.com")) {
+    throw new Error("微信 WebView 误导航到 mobile_url");
+  }
   if (wechatExternalRequests !== 0) {
     throw new Error(`微信 WebView 发生了 ${wechatExternalRequests} 次外部请求`);
   }
@@ -2792,6 +2822,15 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
           balance: { wallet: "0", period: "0", total: "0" },
         },
       }),
+    }),
+  );
+  // OCV5-96(selfhost 435c29adc):用量页 best-effort 拉 listSessions 补会话标题;
+  // 失败静默,但 harness 对未登记请求 404 会计入运行时错误,这里登记空列表。
+  await page.route("**/api/sessions/list**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ sessions: [] }),
     }),
   );
   await page.route("**/api/me/**", (route, request) => {

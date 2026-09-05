@@ -57,3 +57,19 @@ usageRecordsAliasGuard
 # 平台默认模型必须已配置:没有默认模型时新会话无法开始。红 = 新用户第一条消息
 # 就失败。
 assertPlatformDefaultModelConfigured
+
+# 2026-09-05 OCV5-113 块 A: billing / payment / login 扩围。
+# 三条全中:用户当场可见(登不进去 / 付了钱不到账 / 多扣少扣)、无声失效时
+# 没有别的门替它兜、且仓内有过对应事故或单一权威语义(登录并发重置、虎皮椒
+# 回调金额、settle 落库)。先本地确认套件稳定绿再加;加入后禁止再登记进
+# known-failures。
+
+# 登录主路径:口令校验、并发重置/封禁窗口、cookie 替换。红 = 用户登不进去,
+# 或旧口令在重置窗口漏网。
+auth.login
+
+# 虎皮椒支付回调:签名 / 金额 / 幂等。红 = 用户付了钱积分不到账,或伪造回调加余额。
+POST /api/payment/hupi/callback
+
+# 计费落库:usage_records + credit_ledger 原子写。红 = 多扣/少扣用户的钱。
+settleUsageAndLedger
