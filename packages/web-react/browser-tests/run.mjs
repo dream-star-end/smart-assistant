@@ -2111,6 +2111,58 @@ await check("T63 滚轮连续上滑期间 controller 不写 scrollTop，无回�
     throw new Error(`离底静止后内容增长把视口拉走: ${corrected} → ${afterGrow}`);
   }
 });
+await check("T65 上滑与底部占位收起合并进同一 scroll 事件时不被当成 clamp，追加内容不回底", async () => {
+  screenshotPage = mobilePage;
+  const scroll = mobilePage.getByTestId("mobile-chat-scroll");
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForFunction(() => {
+    const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
+    return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 1200;
+  }, null, { timeout: 5000 });
+  // 底部先有 120px 占位(任务 HUD / 断线横幅 / 委派进度条),再贴底。
+  await mobilePage.evaluate(() => window.__mobilePage.setBottomInset(120));
+  await mobilePage.waitForSelector('[data-testid="mobile-bottom-inset"]');
+  await mobilePage.evaluate(() => window.__mobilePage.armSticky());
+  await mobilePage.waitForTimeout(WHEEL_QUIET_MS + 80);
+  const before = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    max: node.scrollHeight - node.clientHeight,
+    client: node.clientHeight,
+    following: window.__mobilePage.following,
+  }));
+  if (Math.abs(before.top - before.max) > 2 || !before.following) {
+    throw new Error(`占位在场时未贴底: ${JSON.stringify(before)}`);
+  }
+  // 用户上滑 40px,同一帧内占位收起(clientHeight +120 → max -120):浏览器把 scrollTop
+  // 夹到新 max,scroll 事件里 scrollTop == max,与 scrollHeight 收缩 clamp 同形。
+  await mobilePage.evaluate(() => window.__mobilePage.scrollUpWithCollapse(40));
+  await mobilePage.waitForTimeout(120);
+  const after = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    max: node.scrollHeight - node.clientHeight,
+    client: node.clientHeight,
+    following: window.__mobilePage.following,
+  }));
+  if (after.client <= before.client + 100) {
+    throw new Error(`占位未收起, clientHeight 未增大: ${JSON.stringify({ before, after })}`);
+  }
+  if (after.following) {
+    throw new Error(`上滑被 clamp 巧合吞掉, following 仍为 true: ${JSON.stringify({ before, after })}`);
+  }
+  // 追加内容:following=false 时流式 pin 不得把视口写回底部。
+  await mobilePage.evaluate(() => { window.__mobilePage.programmaticWrites = 0; });
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForTimeout(300);
+  const afterGrow = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    max: node.scrollHeight - node.clientHeight,
+    following: window.__mobilePage.following,
+  }));
+  if (Math.abs(afterGrow.top - after.top) > 2) {
+    throw new Error(`占位收起后追加内容把视口拉回底部: ${JSON.stringify({ after, afterGrow })}`);
+  }
+  if (afterGrow.following) throw new Error("追加内容后错误恢复贴底态");
+});
 screenshotPage = page;
 
 // ── T26 微博登录页二维码挑战判定 ────────────────────────────────────────────
@@ -3058,6 +3110,38 @@ await check("T62 Phase-A fallback 与最后一段 live 正文同 id 时最后一
   if ((await replayRoot.getByText("BROWSER_PHASE_A_COLLIDE_A1BROWSER_PHASE_A_COLLIDE_FINAL", { exact: true }).count()) !== 0) {
     throw new Error("渲染了 fallback 拼接整块正文");
   }
+});
+
+await check("T64 Phase-B 同 id deferred 空壳到达时最后一段正文不再次闪没", async () => {
+  const deferred = await page.evaluate(() =>
+    window.__replayDrive.runPhaseBDeferredLastSegmentIdCollision("deferred"));
+  if (deferred.sending) throw new Error("Phase-B 终态后仍在发送");
+  const texts = deferred.visibleAssistant.map((row) => row.text);
+  if (JSON.stringify(texts) !== JSON.stringify(["BROWSER_PB_DEFER_A1", "BROWSER_PB_DEFER_FINAL"])) {
+    throw new Error(`Phase-B deferred 空壳吞掉最后一段正文:${JSON.stringify(deferred)}`);
+  }
+  if (deferred.lastSegmentDeferred) {
+    throw new Error(`最后一段仍以 deferred locator 形态渲染(占位卡无正文):${JSON.stringify(deferred)}`);
+  }
+  await replayRoot.getByText("BROWSER_PB_DEFER_FINAL", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  if ((await replayRoot.getByText("正在读取真实 Agent 记录…", { exact: true }).count()) !== 0) {
+    throw new Error("最后一段槽位渲染了 deferred 占位卡而不是已流式正文");
+  }
+  if ((await replayRoot.getByText("BROWSER_PB_DEFER_A1BROWSER_PB_DEFER_FINAL", { exact: true }).count()) !== 0) {
+    throw new Error("渲染了 fallback 拼接整块正文");
+  }
+  const exact = await page.evaluate(() =>
+    window.__replayDrive.runPhaseBDeferredLastSegmentIdCollision("exact"));
+  if (exact.lastSegmentText !== "BROWSER_PB_DEFER_FINAL_EXACT" || !exact.helperFieldGone) {
+    throw new Error(`真实 record 到达后未整体替换/辅助字段未消失:${JSON.stringify(exact)}`);
+  }
+  await replayRoot.getByText("BROWSER_PB_DEFER_FINAL_EXACT", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
 });
 
 await check("T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划", async () => {

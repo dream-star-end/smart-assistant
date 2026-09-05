@@ -14514,6 +14514,34 @@ export class Gateway {
     })
     const clientMessageId = args.clientMessageId || sendToAgentCallbackClientMessageId(args.jobId)
     const tryOnce = async (): Promise<CronOriginFireResult> => {
+      // Billing parity with cron-origin-inject (2026-09-05): when a master is
+      // reachable the callback turn MUST be admitted by master (admitUserTurn →
+      // turn_dispatches row + billingRequestId) and come back down as a durable
+      // frame. The local dispatchInbound path below builds a frame with no
+      // requestId, so cursorAdapter.finish() never emits external_billing /
+      // durable billing — the parent's callback turn ran for free and
+      // turn_traces had no row (master logged "first-visible record failed").
+      // Only the legacy no-master (standalone) deployment keeps the local path.
+      const masterCfg = readV3CronOriginInjectConfig()
+      if (masterCfg) {
+        const posted = await postCronOriginInject(
+          {
+            sessionId: origin.peerId,
+            text,
+            clientMessageId,
+            agentId: origin.agentId,
+          },
+          { config: masterCfg },
+        )
+        if (posted.kind === 'injected') return { kind: 'injected' }
+        if (posted.kind === 'gone') return { kind: 'fallback' }
+        // Master says another turn is open → same busy contract as the local
+        // path so the notifier parks the job as pending instead of degrading.
+        if (posted.kind === 'in_flight') {
+          return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
+        }
+        return { kind: 'retryable_failure', code: posted.code }
+      }
       const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
       let queued = false
       try {

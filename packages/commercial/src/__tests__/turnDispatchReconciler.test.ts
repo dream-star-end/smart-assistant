@@ -72,6 +72,13 @@ interface Canned {
   firstVisibleTraces?: Raw[]
   casToTerminalMiss?: boolean
   abortedJournalRefs?: { user_id: string; request_id: string }[]
+  /**
+   * INC-20260831 gap2:锁内重验(finalizeOrphanDispatch)看到的"扫描之后"证据。
+   * frame 重验返回比扫描时更新的帧 → finalize 必须 ROLLBACK 且零 UPDATE。
+   */
+  orphanFrameReverify?: Date | null
+  /** 锁内 first_visible 重验返回的 turn_traces 行(扫描时没有的存活证据)。 */
+  orphanFirstVisibleReverify?: Raw[]
 }
 
 function makeFakePool(canned: Canned) {
@@ -119,6 +126,15 @@ function makeFakePool(canned: Canned) {
         ?? canned.visibleOrphans?.[0]
       if (!orphan) return { rows: [], rowCount: 0 }
       return { rows: [{ status: orphan.status }], rowCount: 1 }
+    }
+    // INC-20260831 gap2:finalize 锁内证据重验 —— 可注入"扫描后新出现"的帧/trace。
+    if (s.includes('-- orphanFinalizeFrameReverify')) {
+      if (canned.orphanFrameReverify == null) return { rows: [], rowCount: 0 }
+      return { rows: [{ last_frame_at: canned.orphanFrameReverify }], rowCount: 1 }
+    }
+    if (s.includes('-- orphanFinalizeFirstVisibleReverify')) {
+      const traces = canned.orphanFirstVisibleReverify ?? []
+      return { rows: traces, rowCount: traces.length }
     }
     // 行锁读(getDispatchForUpdate):返回锁定的 terminal 行,重验通过。
     if (s.includes('FROM turn_dispatches') && s.includes('FOR UPDATE')) {
@@ -1099,6 +1115,9 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       last_frame_at: new Date(nowMs - 10 * 60_000),
       first_visible_at: null,
       container_running: false,
+      attempt_no: 1,
+      agent_container_id: null,
+      runtime_kind: null,
       ...over,
     }
   }
@@ -1237,13 +1256,13 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
         first_visible_at: null,
         admitted_at: new Date(nowMs - 15 * 60_000),
         accepted_at: new Date(nowMs - 15 * 60_000),
-        container_running: true,
+        container_running: false,
       })],
       casToTerminalMiss: true,
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
-      container: { ...noContainer, getDispatchState: async () => ({ kind: 'ok', state: 'running' }) },
+      container: noContainer,
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
@@ -1294,12 +1313,12 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
         first_visible_at: null,
         admitted_at: new Date(nowMs - 15 * 60_000),
         accepted_at: new Date(nowMs - 15 * 60_000),
-        container_running: true,
+        container_running: false,
       })],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
-      container: { ...noContainer, getDispatchState: async () => ({ kind: 'ok', state: 'running' }) },
+      container: noContainer,
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
@@ -1365,7 +1384,7 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
         first_visible_at: null,
         admitted_at: new Date(nowMs - 15 * 60_000),
         accepted_at: new Date(nowMs - 15 * 60_000),
-        container_running: true,
+        container_running: false,
       })],
       firstVisibleTraces: [{
         dispatch_id: null,
@@ -1376,16 +1395,19 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
-      container: { ...noContainer, getDispatchState: async () => ({ kind: 'ok', state: 'running' }) },
+      container: noContainer,
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
+    assert.ok(pool.queries.some(sql => sql.includes('-- orphanFinalizeFirstVisibleReverify')),
+      'sibling trace was not credited: absent first_visible is rechecked inside the lock')
     assert.equal(counts.visibleOrphans, 1, "LIKE '_' must not credit sibling sessX001")
     assert.ok(pool.writes.some((sql) => sql.includes("producer_fenced_at")))
   })
 
   test("exact session_key suffix with underscore is still credited", async () => {
     _resetVisibleOrphanScanOffset()
+    let probes = 0
     const pool = makeFakePool({
       visibleOrphans: [orphanRow({
         dispatch_id: "disp-under-hit",
@@ -1405,12 +1427,208 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
+      container: { ...noContainer, getDispatchState: async () => { probes++; return { kind: 'unreachable' } } },
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(probes, 0, 'credited first_visible skips before any typed-state probe')
+    assert.equal(counts.visibleOrphans, 0)
+    assert.ok(!pool.writes.includes("COMMIT"))
+  })
+
+  // ── INC-20260831-VISIBLE-ORPHAN-FALSE-KILL 后续:两处缺口的回归锁 ──────────
+  // gap1: typed state(running/queued/sink_staged)的存活结论必须传进 orphan 收口;
+  // gap2: 扫描→提交之间帧/first_visible 推进必须使 finalize 回滚。
+
+  test("INC-20260831 gap1: typed-state proven-live running dispatch is never interrupted (16min, zero frames)", async () => {
+    _resetVisibleOrphanScanOffset()
+    // 主循环 accepted-stuck 探测返回 running;同一 dispatch 出现在 orphan 扫描里,
+    // 零帧 + 无 first_visible + 静默 16min + 容器在跑 —— 旧实现对这种行判 interrupt_tapeless。
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        dispatch_id: 'd-live-1',
+        status: 'accepted',
+        outcome: null,
+        failure_code: null,
+        admitted_at: new Date(nowMs - 16 * 60_000),
+        accepted_at: new Date(nowMs - 16 * 60_000),
+      })],
+      visibleOrphans: [orphanRow({
+        dispatch_id: 'd-live-1',
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: '0',
+        last_frame_at: null,
+        first_visible_at: null,
+        admitted_at: new Date(nowMs - 16 * 60_000),
+        accepted_at: new Date(nowMs - 16 * 60_000),
+        container_running: true,
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+      },
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphansSkippedLive, 1, 'proven-live 行必须计入 skipped-live')
+    assert.equal(counts.visibleOrphans, 0)
+    assert.ok(!pool.writes.includes('COMMIT'), '不得中断提交')
+    assert.ok(!pool.writes.some((sql) => sql.includes('producer_fenced_at')), '不得 fence')
+    assert.ok(!pool.writes.some((sql) => sql.includes("status = 'terminal'")), '不得写终态')
+    assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback')), '不得投影 fallback')
+  })
+
+  test("INC-20260831 gap1: interrupt_tapeless outside the stuck page re-probes typed state; queued skips", async () => {
+    _resetVisibleOrphanScanOffset()
+    // orphan 扫描有自己的 OFFSET 分页且含 admitted 行:这行不在主循环 stuck 页里,
+    // 分类为 interrupt_tapeless 后必须在提交前再查一次 typed state。
+    let probes = 0
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: '0',
+        last_frame_at: null,
+        first_visible_at: null,
+        admitted_at: new Date(nowMs - 16 * 60_000),
+        accepted_at: new Date(nowMs - 16 * 60_000),
+        container_running: true,
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => {
+          probes++
+          return { kind: 'ok', state: 'queued' }
+        },
+      },
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.ok(probes >= 1, '未在 stuck 页里的 interrupt 行必须复查 typed state')
+    assert.equal(counts.visibleOrphansSkippedLive, 1)
+    assert.equal(counts.visibleOrphans, 0)
+    assert.ok(!pool.writes.includes('COMMIT'))
+    assert.ok(!pool.writes.some((sql) => sql.includes('producer_fenced_at')))
+    assert.ok(!pool.writes.some((sql) => sql.includes("status = 'terminal'")))
+  })
+
+  test("INC-20260831 gap2: frame landed between scan and lock → ROLLBACK, zero UPDATE, counted stale", async () => {
+    _resetVisibleOrphanScanOffset()
+    // 扫描时零帧;锁内重验返回 5 分钟前的新帧(producer 在扫描后落帧)。
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: '0',
+        last_frame_at: null,
+        first_visible_at: null,
+        admitted_at: new Date(nowMs - 16 * 60_000),
+        accepted_at: new Date(nowMs - 16 * 60_000),
+        container_running: false,
+      })],
+      orphanFrameReverify: new Date(nowMs - 5 * 60_000),
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
       container: noContainer,
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
+    const lock = pool.queries.findIndex(sql => sql.includes('-- closeVisibleOrphans lock'))
+    const frame = pool.queries.findIndex(sql => sql.includes('-- orphanFinalizeFrameReverify'))
+    const rollback = pool.queries.indexOf('ROLLBACK')
+    assert.ok(lock >= 0 && frame > lock && rollback > frame, 'lock and frame recheck execute before rollback')
+    assert.equal(pool.attemptedWrites.length, 0, 'no UPDATE/INSERT before stale-evidence rollback')
+    assert.equal(pool.queries.some(sql => sql.includes('-- orphanFinalizeFirstVisibleReverify')), false,
+      'new frame returns before later rechecks or writes')
     assert.equal(counts.visibleOrphans, 0)
-    assert.ok(!pool.writes.includes("COMMIT"))
+    assert.equal(counts.visibleOrphansEvidenceStale, 1, '证据推进必须计数')
+    assert.ok(pool.writes.includes('ROLLBACK'))
+    assert.ok(!pool.writes.includes('COMMIT'))
+    assert.ok(
+      !pool.attemptedWrites.some((sql) => sql.includes('producer_fenced_at') || sql.includes("status = 'terminal'")),
+      '锁内重验失败必须在任何 UPDATE 之前回滚',
+    )
+  })
+
+  test("INC-20260831 gap2: first_visible appearing between scan and lock → ROLLBACK", async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: '0',
+        last_frame_at: null,
+        first_visible_at: null,
+        admitted_at: new Date(nowMs - 16 * 60_000),
+        accepted_at: new Date(nowMs - 16 * 60_000),
+        container_running: false,
+      })],
+      orphanFirstVisibleReverify: [{
+        dispatch_id: 'd-vis-1',
+        user_id: '42',
+        session_key: 'agent:main:webchat:dm:sess-vis',
+        first_visible_at: new Date(nowMs - 60_000),
+      }],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    const lock = pool.queries.findIndex(sql => sql.includes('-- closeVisibleOrphans lock'))
+    const frame = pool.queries.findIndex(sql => sql.includes('-- orphanFinalizeFrameReverify'))
+    const rollback = pool.queries.indexOf('ROLLBACK')
+    assert.ok(lock >= 0 && frame > lock && rollback > frame, 'lock and frame recheck execute before rollback')
+    assert.equal(pool.attemptedWrites.length, 0, 'no UPDATE/INSERT before stale-evidence rollback')
+    const trace = pool.queries.findIndex(sql => sql.includes('-- orphanFinalizeFirstVisibleReverify'))
+    assert.ok(trace > frame && rollback > trace, 'first_visible recheck executes inside the lock')
+    assert.equal(counts.visibleOrphans, 0)
+    assert.equal(counts.visibleOrphansEvidenceStale, 1)
+    assert.ok(pool.writes.includes('ROLLBACK'))
+    assert.ok(!pool.writes.includes('COMMIT'))
+    assert.ok(!pool.attemptedWrites.some((sql) => sql.includes('producer_fenced_at')))
+  })
+
+  test("INC-20260831: inactive carrier remains independent dead evidence despite typed-state error", async () => {
+    _resetVisibleOrphanScanOffset()
+    // typed error is not death evidence; the inactive carrier is independent proof.
+    // Keep interrupt/fence assertions; active-error cases separately prove fail-closed.
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: '0',
+        last_frame_at: null,
+        first_visible_at: null,
+        admitted_at: new Date(nowMs - 16 * 60_000),
+        accepted_at: new Date(nowMs - 16 * 60_000),
+        container_running: false,
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'error', detail: '502' }),
+      },
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 1, 'OCV5-43 仍须中断')
+    assert.equal(counts.visibleOrphansSkippedLive, 0)
+    assert.equal(counts.visibleOrphansEvidenceStale, 0)
+    assert.ok(pool.writes.includes('COMMIT'))
+    assert.ok(pool.writes.some((sql) => sql.includes('producer_fenced_at')))
+    assert.ok(pool.writes.some((sql) => sql.includes("status = 'terminal'")))
   })
 
 })
@@ -1523,5 +1741,139 @@ test('OCV5-121 active destructive candidates require exact running proof', async
       listCarrierDeadDispatchIds: async () => [], container: { ...noContainer, getDispatchState: async () => state } })
     assert.equal(counts.visibleOrphans, 0)
     assert.equal(pool.writes.length, 0)
+  }
+})
+
+describe('OCV5-121 R4 exact-attempt liveness integration', () => {
+  const rowAt = (now: number, age: number, attempt = 1) => rawRow({
+    status: 'accepted', outcome: null, attempt_no: attempt,
+    admitted_at: new Date(now - age), accepted_at: new Date(now - age),
+    tape_visible_at: null, tape_id: null, tape_part_count: null, tape_parts_rows: '0',
+    first_visible_at: null, last_frame_at: null, container_running: true,
+  })
+  const assertNoDestructive = (pool: ReturnType<typeof makeFakePool>) => {
+    assert.equal(pool.attemptedWrites.length, 0)
+    assert.equal(pool.writes.includes('COMMIT'), false)
+    assert.equal(pool.queries.some(sql => sql.includes('SELECT f.payload') && sql.includes('FROM client_session_live_streams')), false)
+  }
+
+  for (const age of [16 * 60_000, 6 * 3_600_000]) {
+    for (const acceptedPage of [true, false]) {
+      test('running age=' + age + ' acceptedPage=' + acceptedPage, async () => {
+        _resetVisibleOrphanScanOffset()
+        const now = Date.now(), row = rowAt(now, age)
+        const pool = makeFakePool({ acceptedStuck: acceptedPage ? [row] : [], visibleOrphans: [row] })
+        let probes = 0
+        const counts = await runReconcileTick({
+          pool: pool as unknown as Pool, now: () => now, listCarrierDeadDispatchIds: async () => [],
+          container: { ...noContainer, getDispatchState: async () => {
+            probes++; return { kind: 'ok', state: 'running' }
+          }, cancelIfQueued: async () => { assert.fail('running is never a queued cancellation') } },
+        })
+        assert.equal(probes, 1)
+        if (age < 6 * 3_600_000) {
+          assert.equal(counts.visibleOrphans, 0)
+          assert.equal(counts.visibleOrphansSkippedLive, 1)
+          assertNoDestructive(pool)
+        } else {
+          assert.equal(counts.visibleOrphans, 1)
+          assert.equal(counts.visibleOrphansSkippedLive, 0)
+          assert.ok(pool.writes.includes('COMMIT'))
+          assert.ok(pool.writes.some(sql => sql.includes('producer_fenced_at')))
+          assert.ok(pool.writes.some(sql => sql.includes("status = 'terminal'")))
+        }
+      })
+    }
+  }
+
+  for (const currentState of ['queued', 'running'] as const) {
+    test('raw-id live/probed hits cannot reuse a different attempt: ' + currentState, async () => {
+      _resetVisibleOrphanScanOffset()
+      const now = Date.now(), age = 6 * 3_600_000
+      const old = rowAt(now, age, 1), current = rowAt(now, age, 2)
+      const pool = makeFakePool({ acceptedStuck: [old], visibleOrphans: [current] })
+      const attempts: number[] = [], canceled: number[] = []
+      const counts = await runReconcileTick({
+        pool: pool as unknown as Pool, now: () => now, listCarrierDeadDispatchIds: async () => [],
+        container: { ...noContainer, getDispatchState: async id => {
+          attempts.push(id.attemptNo)
+          return { kind: 'ok', state: id.attemptNo === 1 ? 'sink_staged' : currentState }
+        }, cancelIfQueued: async id => {
+          canceled.push(id.attemptNo); return { kind: 'ok', state: 'rejected', outcome: 'not_accepted' }
+        } },
+      })
+      assert.deepEqual(attempts, [1, 2])
+      assert.deepEqual(canceled, currentState === 'queued' ? [2] : [])
+      assert.equal(counts.visibleOrphans, currentState === 'queued' ? 0 : 1)
+      if (currentState === 'queued') assertNoDestructive(pool)
+    })
+  }
+
+  for (const kind of ['error', 'unreachable'] as const) {
+    for (const age of [16 * 60_000, 6 * 3_600_000]) {
+      for (const acceptedPage of [true, false]) {
+        test('active unknown ' + kind + ' age=' + age + ' acceptedPage=' + acceptedPage, async () => {
+          _resetVisibleOrphanScanOffset()
+          const now = Date.now(), row = rowAt(now, age)
+          const pool = makeFakePool({ acceptedStuck: acceptedPage ? [row] : [], visibleOrphans: [row] })
+          let probes = 0
+          const counts = await runReconcileTick({
+            pool: pool as unknown as Pool, now: () => now, listCarrierDeadDispatchIds: async () => [],
+            container: { ...noContainer, getDispatchState: async () => { probes++; return { kind, detail: 'unknown' } } },
+          })
+          assert.equal(probes, 1)
+          assert.equal(counts.visibleOrphans, 0)
+          assertNoDestructive(pool)
+        })
+      }
+    }
+  }
+
+  for (const acceptedPage of [true, false]) {
+    test('sink_staged at 6h remains live acceptedPage=' + acceptedPage, async () => {
+      _resetVisibleOrphanScanOffset()
+      const now = Date.now(), row = rowAt(now, 6 * 3_600_000)
+      const pool = makeFakePool({ acceptedStuck: acceptedPage ? [row] : [], visibleOrphans: [row] })
+      let probes = 0
+      const counts = await runReconcileTick({
+        pool: pool as unknown as Pool, now: () => now, listCarrierDeadDispatchIds: async () => [],
+        container: { ...noContainer, getDispatchState: async () => { probes++; return { kind: 'ok', state: 'sink_staged' } } },
+      })
+      assert.equal(probes, 1)
+      assert.equal(counts.visibleOrphans, 0)
+      assert.equal(counts.visibleOrphansSkippedLive, 1)
+      assertNoDestructive(pool)
+    })
+
+    test('queued hard-cap waits for durable next-tick GET; first acceptedPage=' + acceptedPage, async () => {
+      _resetVisibleOrphanScanOffset()
+      const now = Date.now(), row = rowAt(now, 6 * 3_600_000)
+      const canned: Canned = { acceptedStuck: acceptedPage ? [row] : [], visibleOrphans: [row] }
+      const pool = makeFakePool(canned)
+      let state: ContainerCallResult = { kind: 'ok', state: 'queued' }
+      let probes = 0, cancels = 0
+      const deps = {
+        pool: pool as unknown as Pool, now: () => now, listCarrierDeadDispatchIds: async () => [],
+        container: { ...noContainer, getDispatchState: async () => { probes++; return state },
+          cancelIfQueued: async () => {
+            cancels++; state = { kind: 'ok', state: 'rejected', outcome: 'not_accepted' }; return state
+          } },
+      }
+      const first = await runReconcileTick(deps)
+      assert.equal(probes, 1)
+      assert.equal(cancels, 1)
+      assert.equal(first.rejectedTerminal, 0)
+      assert.equal(first.visibleOrphans, 0)
+      assertNoDestructive(pool)
+      // The next accepted scan visits this identity even when the previous page did not.
+      canned.acceptedStuck = [row]
+      const next = await runReconcileTick(deps)
+      assert.equal(probes, 2)
+      assert.equal(cancels, 1)
+      assert.equal(next.rejectedTerminal, 1)
+      assert.equal(next.visibleOrphans, 0)
+      assert.ok(pool.writes.some(sql => sql.includes("status = 'terminal'")))
+      assert.equal(pool.writes.some(sql => /producer_fenced_at\s*=/.test(sql) || sql.includes('visible-fallback')), false)
+    })
   }
 })

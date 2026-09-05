@@ -267,6 +267,7 @@ export type CursorEngineFamilyId =
   | 'opus-4.8'
   | 'fable-5'
   | 'fable-5.1'
+  | 'sonnet-5'
   | 'gemini-3.8-flash'
   | 'grok-4.5'
 
@@ -731,6 +732,54 @@ export const CURSOR_ENGINE_MODELS = [
     effort: 'max',
     fast: false,
   },
+  // Sonnet 5: pinned CLI `--list-models` (2026-09-05) thinking variants
+  // claude-sonnet-5-thinking-{low,medium,high,xhigh,max}; no Fast variant, so
+  // none are catalogued (Claude-family policy: thinking upstreams only).
+  {
+    id: 'cursor-sonnet-5-low',
+    displayName: 'Sonnet 5 Low',
+    upstreamModel: 'claude-sonnet-5-thinking-low',
+    family: 'sonnet-5',
+    familyLabel: 'Sonnet 5',
+    effort: 'low',
+    fast: false,
+  },
+  {
+    id: 'cursor-sonnet-5-medium',
+    displayName: 'Sonnet 5 Medium',
+    upstreamModel: 'claude-sonnet-5-thinking-medium',
+    family: 'sonnet-5',
+    familyLabel: 'Sonnet 5',
+    effort: 'medium',
+    fast: false,
+  },
+  {
+    id: 'cursor-sonnet-5-high',
+    displayName: 'Sonnet 5 High',
+    upstreamModel: 'claude-sonnet-5-thinking-high',
+    family: 'sonnet-5',
+    familyLabel: 'Sonnet 5',
+    effort: 'high',
+    fast: false,
+  },
+  {
+    id: 'cursor-sonnet-5-xhigh',
+    displayName: 'Sonnet 5 Extra High',
+    upstreamModel: 'claude-sonnet-5-thinking-xhigh',
+    family: 'sonnet-5',
+    familyLabel: 'Sonnet 5',
+    effort: 'xhigh',
+    fast: false,
+  },
+  {
+    id: 'cursor-sonnet-5-max',
+    displayName: 'Sonnet 5 Max',
+    upstreamModel: 'claude-sonnet-5-thinking-max',
+    family: 'sonnet-5',
+    familyLabel: 'Sonnet 5',
+    effort: 'max',
+    fast: false,
+  },
   // Gemini 3.8 Flash: pinned CLI `--list-models` (2026-09-04) exposes exactly
   // gemini-3.8-flash-{low,medium,high}; no Fast, xhigh or max variants exist,
   // so none are catalogued.
@@ -862,6 +911,7 @@ export const CURSOR_CONTEXT_TIER_FAMILIES: readonly CursorEngineFamilyId[] = [
   'opus-4.8',
   'fable-5',
   'fable-5.1',
+  'sonnet-5',
 ]
 
 export function isCursorContextTier(value: unknown): value is CursorContextTier {
@@ -898,9 +948,9 @@ export function projectContextWindowForCursorTier(
 }
 
 /** codex seed agent(id='codex')的固定模型 —— entrypoint desiredCodexAgent 同值。 */
-export const DEFAULT_CODEX_ENGINE_MODEL: CodexEngineModelId = CODEX_ENGINE_MODELS[0].id
+export const DEFAULT_CODEX_ENGINE_MODEL: CodexEngineModelId = 'gpt-6-astra'
 export const DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME: string =
-  CODEX_ENGINE_MODELS[0].displayName
+  CODEX_ENGINE_MODELS.find((model) => model.id === DEFAULT_CODEX_ENGINE_MODEL)!.displayName
 
 export interface ModelReasoningPolicy {
   /** 该模型在 v5 可接受/展示的思考档位；空数组 = 本模型不支持该功能。 */

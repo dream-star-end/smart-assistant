@@ -8292,7 +8292,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // exact runtime-authored tool identity/input survives a browser or
       // Master restart; bridge disconnect is therefore no longer an implicit
       // denial signal at the commercial boundary.
-      let permissionAuthorityCommit: Promise<void> | null = null;
+      // Thunk, not a started promise. Starting the write here and merely
+      // awaiting it inside the outbound persist queue task leaves a rejection
+      // window: while the queue is busy with an earlier frame's work, the
+      // await (the only handler this promise ever gets on the durable path)
+      // registers only after that work drains, so an early rejection is
+      // reported as an unhandledRejection before the queue catch adopts it
+      // (--unhandled-rejections=strict would kill the worker). Deferring the
+      // start into the task keeps every failure inside the queue's catch and
+      // therefore under the standard onFailure semantics (transient → poison
+      // + close 1011). Authority-before-browser-visibility is unchanged:
+      // forwardCommittedFrame still only runs after both awaits inside the
+      // task.
+      let permissionAuthorityCommit: (() => Promise<void>) | null = null;
       if (!isBinary && deps.pgPool) {
         let permissionText: string | null = null;
         if (typeof data === "string") permissionText = data;
@@ -8311,7 +8323,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             typeof parsedPermission.peer.id === "string" &&
             isPlainRecord(parsedPermission.inputJson)
           ) {
-            permissionAuthorityCommit = persistPermissionAuthority(deps.pgPool, {
+            // Capture the narrowed values now: TS does not carry control-flow
+            // narrowing of `deps.pgPool` / `parsedPermission.peer` into the
+            // deferred closure, and the frame must be validated at receipt.
+            const permissionPool = deps.pgPool;
+            const permissionAuthorityInput = {
               userId: uid,
               requestId: parsedPermission.requestId,
               sessionId: parsedPermission.peer.id,
@@ -8327,7 +8343,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ? parsedPermission.inputJson
                 : null,
               expiresAt: resolvePermissionExpiresAt(parsedPermission.expiresAt),
-            }).then(() => {});
+            };
+            permissionAuthorityCommit = () =>
+              persistPermissionAuthority(permissionPool, permissionAuthorityInput).then(() => {});
           }
         } else if (permissionText?.includes('"outbound.permission_settled"')) {
           // INC-20260903-PENDING-PERMISSION-ZOMBIE — the runtime is the only
@@ -8722,7 +8740,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           stamped.storeKey,
           stamped.frameSeq,
           async () => {
-            if (permissionAuthorityCommit !== null) await permissionAuthorityCommit;
+            if (permissionAuthorityCommit !== null) await permissionAuthorityCommit();
             await deps.persistOutboundFrame!({
               uid,
               sessionId: durableSessionId,
@@ -8759,7 +8777,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         return;
       }
       if (permissionAuthorityCommit !== null) {
-        void permissionAuthorityCommit.then(forwardCommittedFrame).catch((error) => {
+        void permissionAuthorityCommit().then(forwardCommittedFrame).catch((error) => {
           bridgeLog?.error("user-chat-bridge: permission authority commit failed", {
             error: (error as Error)?.message ?? String(error),
           });

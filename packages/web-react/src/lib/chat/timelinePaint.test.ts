@@ -7,8 +7,11 @@ import {
   indexAtOffsetPx,
   measureMountedRowHeight,
   measureRevealedSlice,
+  measuredRangePx,
+  medianPx,
   paintRangeCoversViewport,
   revealWarmupSlice,
+  rowHeightEstimatePx,
   selectPaintRange,
 } from "./timelinePaint";
 
@@ -41,6 +44,39 @@ describe("computePaintRange prefix sums", () => {
     expect(range.start).toBe(0);
     expect(range.end).toBeGreaterThanOrEqual(PAINT_MIN_ITEMS);
     expect(range.end).toBeLessThanOrEqual(20);
+  });
+
+  test("session median replaces the 200px estimate once enough rows are measured", () => {
+    const few = new Map<string, number>([["a", 60], ["b", 64], ["c", 900]]);
+    expect(rowHeightEstimatePx(few)).toBe(PAINT_ESTIMATE_PX);
+    const enough = new Map<string, number>([["a", 60], ["b", 64], ["c", 900], ["d", 72]]);
+    // 60,64,72,900 → median = (64+72)/2 = 68；单条 900px 代码块不能把估高拉走
+    expect(rowHeightEstimatePx(enough)).toBe(68);
+    expect(medianPx([])).toBeNull();
+    expect(medianPx([5])).toBe(5);
+    expect(medianPx([1, 3, 2])).toBe(2);
+  });
+
+  test("estimatePx drives unmeasured rows in prefix sums and spacers", () => {
+    const ids = keys(20);
+    const heights = new Map<string, number>([["row-0", 100]]);
+    expect(indexAtOffsetPx(20, 100 + 59, keyAt(ids), heights, 60)).toBe(1);
+    expect(indexAtOffsetPx(20, 100 + 60, keyAt(ids), heights, 60)).toBe(2);
+    expect(measuredRangePx(0, 20, keyAt(ids), heights, 60)).toBe(100 + 19 * 60);
+    // default remains 200px for callers that do not pass one
+    expect(measuredRangePx(0, 20, keyAt(ids), heights)).toBe(100 + 19 * 200);
+    const range = computePaintRange({
+      count: 20,
+      scrollTop: 0,
+      clientHeight: 400,
+      followBottom: false,
+      keyAt: keyAt(ids),
+      heights,
+      estimatePx: 60,
+    });
+    // 400 + overscan 600 = 1000px → 100 + 15*60 = 1000 → end 索引 16，再 +1
+    expect(range.start).toBe(0);
+    expect(range.end).toBe(17);
   });
 
   test("measured heights locate start/end by pixel, mixed with 200px holes", () => {

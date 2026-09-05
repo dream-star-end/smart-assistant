@@ -149,7 +149,11 @@
     "0265_desktop_kind_unique_index",
     "0266_drop_user_channel_active",
     "0267_turn_dispatches_agent_container",
-    "0268_desktop_session_secret_generation"
+    "0268_desktop_session_secret_generation",
+    "0269_cursor_usd_150_credits",
+    "0270_cursor_claude_200_others_100_grok_admin",
+    "0271_cursor_retire_fable5_add_sonnet5",
+    "0272_cursor_sonnet5_admin_only"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

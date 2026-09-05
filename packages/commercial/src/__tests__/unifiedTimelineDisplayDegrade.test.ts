@@ -381,3 +381,432 @@ test("fallback tape plus hidden runtime-events still pages to older messages", a
   assert.equal(second.messages.some((m) => m.id === "user-old"), true);
   assert.equal(second.messages.find((m) => m.id === "user-old")?.text, "更旧的用户消息，分页必须还能翻到");
 });
+
+// ── INC-20260829-PARTIAL-FINAL-TAPE-POISON (gpt-6 audit case 5) ──────────────
+
+function publishedHeader(over: Record<string, unknown> = {}) {
+  return {
+    tape_id: "tape-failed",
+    tape_sha256: TAPE_SHA,
+    billing_anchor_id: "srv-visible",
+    status: "completed",
+    turn_key: "b".repeat(64),
+    client_message_id: "user-1",
+    materialization_status: "complete",
+    finalized_at: "2026-08-19T00:00:00.000Z",
+    visible_head: {
+      role: "assistant",
+      text: FULL_TEXT,
+      ts: 200,
+      messageId: "srv-visible",
+    },
+    ...over,
+  };
+}
+
+function recordBytes(value: Record<string, unknown>): Buffer {
+  return Buffer.from(JSON.stringify(value), "utf8");
+}
+
+/** A bash_output_tail runtime-event whose JSON text holds raw invalid UTF-8
+ * bytes (0xff 0xfe 0x41). SQL-side convert_from would throw on it; the JS
+ * lossy decode must turn them into U+FFFD replacement characters. */
+function poisonTailEventBytes(): Buffer {
+  return Buffer.concat([
+    Buffer.from(`{"id":"rt-poison","role":"runtime-event","text":"tail:`, "utf8"),
+    Buffer.from([0xff, 0xfe, 0x41]),
+    Buffer.from(
+      `","ts":150,"_runtimeEvent":{"type":"system","subtype":"bash_output_tail","tool_use_id":"tool-poison","total_bytes":9000000}}`,
+      "utf8",
+    ),
+  ]);
+}
+
+function cleanTailEventBytes(): Buffer {
+  return recordBytes({
+    id: "rt-clean",
+    role: "runtime-event",
+    text: "tail:CLEAN-OUTPUT",
+    ts: 150,
+    _runtimeEvent: {
+      type: "system",
+      subtype: "bash_output_tail",
+      tool_use_id: "tool-clean",
+      total_bytes: 42,
+    },
+  });
+}
+
+type SqlCall = { sql: string; params: unknown[] };
+
+async function readPageCaptured(
+  handlers: Array<[string, unknown]>,
+  cursor: Parameters<ReturnType<typeof createPgSessionsBackend>["readClientTimelinePage"]>[2] = null,
+  limit = 1,
+): Promise<{ page: Awaited<ReturnType<ReturnType<typeof createPgSessionsBackend>["readClientTimelinePage"]>>; sqlCalls: SqlCall[] }> {
+  resetTapeDisplayDegradeLogForTests();
+  const sqlCalls: SqlCall[] = [];
+  const inner = fakePool(handlers);
+  const query = async (sql: string, params: unknown[] = []) => {
+    sqlCalls.push({ sql, params });
+    return inner.query(sql, params);
+  };
+  const client = { query, release() {} };
+  const pool = { query, connect: async () => client } as unknown as Pool;
+  const backend = createPgSessionsBackend(pool, { expectedGeneration: 0 });
+  const page = await backend.readClientTimelinePage(SESSION_ID, USER_ID, cursor, limit);
+  return { page, sqlCalls };
+}
+
+test("published tape with zero semantic heads degrades to visible_head final text", async () => {
+  const { page } = await readPageCaptured(baseHandlers({
+    headerRows: [publishedHeader()],
+  }));
+  assert.ok(page);
+  const assistant = page.messages.find((m) => m.role === "assistant");
+  assert.equal(assistant?.text, FULL_TEXT);
+  assert.equal(assistant?._displayDegraded, true);
+  assert.equal(assistant?._displayDegradeReason, "final_record_missing");
+  assert.equal(assistant?._timelineUnitKey, "tape-fallback:tape-failed");
+  assert.equal(assistant?._turnTapeId, "tape-failed");
+});
+
+test("semantic heads present keep the exact hydrated record without fallback", async () => {
+  const payload = recordBytes({ id: "rec-1", role: "assistant", text: "exact semantic answer", ts: 200 });
+  const { page } = await readPageCaptured(baseHandlers({
+    headerRows: [publishedHeader()],
+    headRows: [{
+      tape_id: "tape-failed",
+      msg_id: "rec-1",
+      ordinal: 1,
+      role: "assistant",
+      ts: "200",
+      content_sha256: sha256(payload),
+      payload_bytes: String(payload.length),
+      visible_content_sha256: sha256(payload),
+    }],
+    payloadRows: [{
+      tape_id: "tape-failed",
+      msg_id: "rec-1",
+      ordinal: 1,
+      role: "assistant",
+      content_sha256: sha256(payload),
+      payload,
+      visible_payload: payload,
+      visible_content_sha256: sha256(payload),
+    }],
+  }));
+  assert.ok(page);
+  const assistant = page.messages.find((m) => m.role === "assistant");
+  assert.equal(assistant?.text, "exact semantic answer");
+  assert.equal(assistant?._displayDegraded, undefined);
+  assert.equal(page.messages.some((m) => m._timelineUnitKey === "tape-fallback:tape-failed"), false);
+});
+
+test("heads without any final assistant record append the visible_head fallback after process rows", async () => {
+  const toolPayload = recordBytes({
+    id: "tool-1",
+    role: "tool",
+    text: "",
+    toolName: "Bash",
+    output: "ls -la",
+    ts: 180,
+  });
+  const { page } = await readPageCaptured(baseHandlers({
+    headerRows: [publishedHeader()],
+    headRows: [{
+      tape_id: "tape-failed",
+      msg_id: "tool-1",
+      ordinal: 3,
+      role: "tool",
+      ts: "180",
+      content_sha256: sha256(toolPayload),
+      payload_bytes: String(toolPayload.length),
+      visible_content_sha256: sha256(toolPayload),
+    }],
+    payloadRows: [{
+      tape_id: "tape-failed",
+      msg_id: "tool-1",
+      ordinal: 3,
+      role: "tool",
+      content_sha256: sha256(toolPayload),
+      payload: toolPayload,
+      visible_payload: toolPayload,
+      visible_content_sha256: sha256(toolPayload),
+    }],
+  }));
+  assert.ok(page);
+  const tool = page.messages.find((m) => m.role === "tool");
+  assert.equal(tool?.output, "ls -la");
+  const assistant = page.messages.find((m) => m.role === "assistant");
+  assert.equal(assistant?.text, FULL_TEXT);
+  assert.equal(assistant?._displayDegradeReason, "final_record_missing");
+});
+
+test("bash-tail probe never decodes bytes in SQL and survives invalid UTF-8 tool output", async () => {
+  const tailBytes = poisonTailEventBytes();
+  const semantic = recordBytes({ id: "rec-1", role: "assistant", text: "done", ts: 200 });
+  const handlers: Array<[string, unknown]> = [
+    ...baseHandlers({
+      headerRows: [publishedHeader()],
+      headRows: [{
+        tape_id: "tape-failed",
+        msg_id: "rec-1",
+        ordinal: 9,
+        role: "assistant",
+        ts: "200",
+        content_sha256: sha256(semantic),
+        payload_bytes: String(semantic.length),
+        visible_content_sha256: sha256(semantic),
+      }],
+      payloadRows: [{
+        tape_id: "tape-failed",
+        msg_id: "rec-1",
+        ordinal: 9,
+        role: "assistant",
+        content_sha256: sha256(semantic),
+        payload: semantic,
+        visible_payload: semantic,
+        visible_content_sha256: sha256(semantic),
+      }],
+    }),
+    ["AS probe_bytes", { rows: [{
+      tape_id: "tape-failed",
+      msg_id: "rt-poison",
+      ordinal: 7,
+      role: "runtime-event",
+      ts: "150",
+      content_sha256: "e".repeat(64),
+      payload_bytes: String(tailBytes.length),
+      visible_content_sha256: sha256(tailBytes),
+      probe_bytes: tailBytes,
+    }] }],
+    ["ordinal=ANY($4::int[])", { rows: [{
+      msg_id: "rt-poison",
+      ordinal: 7,
+      role: "runtime-event",
+      content_sha256: "e".repeat(64),
+      payload: tailBytes,
+      visible_payload: tailBytes,
+      visible_content_sha256: sha256(tailBytes),
+    }] }],
+  ];
+  const { page, sqlCalls } = await readPageCaptured(handlers);
+  assert.ok(page);
+  const tail = page.messages.find((m) => m._timelineAuxiliary === "bash-tail");
+  assert.ok(tail, "bash-tail auxiliary must survive invalid UTF-8 bytes");
+  assert.equal(String(tail?.text), "tail:\uFFFD\uFFFDA");
+  assert.equal(page.messages.find((m) => m.role === "assistant")?.text, "done");
+  assert.equal(
+    sqlCalls.every((call) => !call.sql.includes("convert_from")),
+    true,
+    "no SQL-side UTF-8 decode may remain on the timeline read path",
+  );
+  const probe = sqlCalls.find((call) => call.sql.includes("AS probe_bytes"));
+  assert.ok(probe, "sidecar-incomplete bypass must fetch raw bytes for a JS-side probe");
+  assert.equal(probe.sql.includes("model_sidecar_complete=FALSE"), true);
+  // PG has no strpos(bytea, bytea) — only position(bytea IN bytea). The mock
+  // pool cannot catch that; the integ test below runs the statement for real.
+  assert.equal(/\bstrpos\(/.test(probe.sql), false, "strpos has no bytea overload");
+  assert.equal(
+    /position\(\s*convert_to\('bash_output_tail','UTF8'\)\s*IN\s+COALESCE\(r\.visible_payload,r\.payload\)\s*\)\s*>\s*0/.test(probe.sql),
+    true,
+    "byte-level probe must be position(bytea IN bytea)",
+  );
+});
+
+function twoTapeMessages() {
+  return [
+    {
+      id: "user-1",
+      role: "user",
+      text: "hello",
+      ts: 100,
+      _seq: 1,
+      _orderSeq: 1,
+    },
+    {
+      id: "tape-anchor-poison",
+      role: "assistant",
+      text: FIRST_SENTENCE,
+      ts: 200,
+      _seq: 2,
+      _orderSeq: 2,
+      _turnTapeComplete: true,
+      _turnTapeId: "tape-poison",
+      _turnTapeSha256: "d".repeat(64),
+    },
+    {
+      id: "tape-anchor-clean",
+      role: "assistant",
+      text: "clean turn",
+      ts: 300,
+      _seq: 3,
+      _orderSeq: 3,
+      _turnTapeComplete: true,
+      _turnTapeId: "tape-clean",
+      _turnTapeSha256: "c".repeat(64),
+    },
+  ];
+}
+
+test("invalid UTF-8 probe bytes on one tape leave other tapes on the page intact", async () => {
+  const poisonTail = poisonTailEventBytes();
+  const cleanTail = cleanTailEventBytes();
+  const poisonSemantic = recordBytes({ id: "rec-poison", role: "assistant", text: "poison answer", ts: 200 });
+  const cleanSemantic = recordBytes({ id: "rec-clean", role: "assistant", text: "clean answer", ts: 300 });
+  const tailHydrateRows: Record<string, unknown[]> = {
+    "tape-poison": [{
+      msg_id: "rt-poison",
+      ordinal: 7,
+      role: "runtime-event",
+      content_sha256: "e".repeat(64),
+      payload: poisonTail,
+      visible_payload: poisonTail,
+      visible_content_sha256: sha256(poisonTail),
+    }],
+    "tape-clean": [{
+      msg_id: "rt-clean",
+      ordinal: 9,
+      role: "runtime-event",
+      content_sha256: "f".repeat(64),
+      payload: cleanTail,
+      visible_payload: cleanTail,
+      visible_content_sha256: sha256(cleanTail),
+    }],
+  };
+  const handlers: Array<[string, unknown]> = [
+    ["SELECT messages,archived_through_seq,history_revision,timeline_generation", {
+      rows: [{
+        messages: JSON.stringify(twoTapeMessages()),
+        archived_through_seq: 0,
+        history_revision: "1",
+        timeline_generation: "1",
+      }],
+    }],
+    ["t.materialization_status, t.finalized_at::text, t.visible_head", { rows: [
+      publishedHeader({
+        tape_id: "tape-poison",
+        tape_sha256: "d".repeat(64),
+        turn_key: "1".repeat(64),
+        visible_head: {
+          role: "assistant",
+          text: FULL_TEXT,
+          ts: 200,
+          messageId: "srv-poison",
+        },
+      }),
+      publishedHeader({
+        tape_id: "tape-clean",
+        tape_sha256: "c".repeat(64),
+        turn_key: "2".repeat(64),
+        billing_anchor_id: "srv-clean",
+        visible_head: {
+          role: "assistant",
+          text: "clean final",
+          ts: 300,
+          messageId: "srv-clean",
+        },
+      }),
+    ] }],
+    ["WITH requested(tape_id,before_ordinal)", { rows: [
+      {
+        tape_id: "tape-poison",
+        msg_id: "rec-poison",
+        ordinal: 8,
+        role: "assistant",
+        ts: "200",
+        content_sha256: sha256(poisonSemantic),
+        payload_bytes: String(poisonSemantic.length),
+        visible_content_sha256: sha256(poisonSemantic),
+      },
+      {
+        tape_id: "tape-clean",
+        msg_id: "rec-clean",
+        ordinal: 10,
+        role: "assistant",
+        ts: "300",
+        content_sha256: sha256(cleanSemantic),
+        payload_bytes: String(cleanSemantic.length),
+        visible_content_sha256: sha256(cleanSemantic),
+      },
+    ] }],
+    ["WITH selected(tape_id,ordinal)", { rows: [
+      {
+        tape_id: "tape-poison",
+        msg_id: "rec-poison",
+        ordinal: 8,
+        role: "assistant",
+        content_sha256: sha256(poisonSemantic),
+        payload: poisonSemantic,
+        visible_payload: poisonSemantic,
+        visible_content_sha256: sha256(poisonSemantic),
+      },
+      {
+        tape_id: "tape-clean",
+        msg_id: "rec-clean",
+        ordinal: 10,
+        role: "assistant",
+        content_sha256: sha256(cleanSemantic),
+        payload: cleanSemantic,
+        visible_payload: cleanSemantic,
+        visible_content_sha256: sha256(cleanSemantic),
+      },
+    ] }],
+    ["AS probe_bytes", { rows: [
+      {
+        tape_id: "tape-poison",
+        msg_id: "rt-poison",
+        ordinal: 7,
+        role: "runtime-event",
+        ts: "150",
+        content_sha256: "e".repeat(64),
+        payload_bytes: String(poisonTail.length),
+        visible_content_sha256: sha256(poisonTail),
+        probe_bytes: poisonTail,
+      },
+      {
+        tape_id: "tape-clean",
+        msg_id: "rt-clean",
+        ordinal: 9,
+        role: "runtime-event",
+        ts: "150",
+        content_sha256: "f".repeat(64),
+        payload_bytes: String(cleanTail.length),
+        visible_content_sha256: sha256(cleanTail),
+        probe_bytes: cleanTail,
+      },
+      {
+        // Defensive shape: unusable probe bytes must be skipped per tape
+        // without touching any other tape on the same page.
+        tape_id: "tape-clean",
+        msg_id: "rt-null",
+        ordinal: 11,
+        role: "runtime-event",
+        ts: "150",
+        content_sha256: "0".repeat(64),
+        payload_bytes: "1",
+        visible_content_sha256: null,
+        probe_bytes: null,
+      },
+    ] }],
+    ["ordinal=ANY($4::int[])", (_sql: string, params: unknown[]) => ({
+      rows: tailHydrateRows[String(params[2])] ?? [],
+    })],
+  ];
+  const { page, sqlCalls } = await readPageCaptured(handlers, null, 4);
+  assert.ok(page);
+  const answers = page.messages
+    .filter((m) => m.role === "assistant" && m._timelineAuxiliary !== "bash-tail")
+    .map((m) => String(m.text));
+  assert.deepEqual([...answers].sort(), ["clean answer", "poison answer"]);
+  const tails = page.messages.filter((m) => m._timelineAuxiliary === "bash-tail");
+  assert.equal(tails.length, 2);
+  const cleanTailMessage = tails.find((m) => String(m.text).includes("CLEAN"));
+  const poisonTailMessage = tails.find((m) => m.text !== cleanTailMessage?.text);
+  assert.equal(cleanTailMessage?.text, "tail:CLEAN-OUTPUT");
+  assert.equal(String(poisonTailMessage?.text).includes("\uFFFD"), true);
+  assert.equal(String(poisonTailMessage?.text).includes("CLEAN"), false);
+  assert.equal(page.messages.some((m) => m._displayDegradeReason === "final_record_missing"), false);
+  assert.equal(sqlCalls.every((call) => !call.sql.includes("convert_from")), true);
+});

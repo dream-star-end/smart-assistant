@@ -9112,6 +9112,145 @@ describe("pgSessionsBackend direct turn timeline", () => {
       /hash mismatch|JSON invalid|Unexpected end/i,
     );
   });
+
+  // INC-20260829-PARTIAL-FINAL-TAPE-POISON (gpt-6 audit case 5) — a completed
+  // tape whose final assistant record disappears before read must degrade to
+  // the header visible_head text instead of rendering the turn with no final
+  // assistant message.
+  maybe("timeline degrades a records-less terminal tape to the visible_head final text", async () => {
+    const sessionId = "s-direct-final-record-missing";
+    const userId = "u-direct-final-record-missing";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "5".repeat(64), {
+      text: "零记录带必须回退出的权威可见头全文",
+    });
+    await stageAndFinalize(userId, tape);
+    // Simulate the incident: every semantic record of the finalized tape is
+    // gone by the time the browser reads the page.
+    await pool.query(
+      `DELETE FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+
+    const page = await backend.readClientTimelinePage(sessionId, userId, null, 20);
+    assert.ok(page);
+    const fallback = page.messages.find(
+      (message) => message._displayDegradeReason === "final_record_missing",
+    );
+    assert.ok(fallback, "zero-head terminal tape must degrade, not skip");
+    assert.equal(fallback.role, "assistant");
+    assert.equal(fallback.text, "零记录带必须回退出的权威可见头全文");
+    assert.equal(fallback._displayDegraded, true);
+    assert.equal(fallback._turnTapeId, tape.finalize.tapeId);
+  });
+
+  maybe("invalid UTF-8 bash-tail bytes on one tape never fail the page read for the others", async () => {
+    const sessionId = "s-direct-bash-tail-utf8-poison";
+    const userId = "u-direct-bash-tail-utf8-poison";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const poisonTape = directTape(sessionId, "a".repeat(64), {
+      text: "毒带之外的最终回答",
+      tools: [{
+        toolUseId: "tool-poison",
+        blockId: "tool-poison",
+        toolName: "Bash",
+        inputJson: { command: "printf_bad_utf8" },
+        inputPreview: "printf_bad_utf8",
+        output: "运行中",
+        isError: false,
+        durationMs: 1,
+        ts: 1_783_944_000_001,
+        arrivedAt: 1_783_944_000_001,
+      }],
+      runtimeEvents: [{
+        ordinal: 5,
+        observedAt: 1_783_944_000_002,
+        source: "ccb",
+        payload: {
+          type: "system",
+          subtype: "bash_output_tail",
+          tool_use_id: "tool-poison",
+          tail: "PLACEHOLDER",
+          total_bytes: 7,
+          truncated_head: false,
+        },
+      }],
+    });
+    await stageAndFinalize(userId, poisonTape);
+    const cleanTape = directTape(sessionId, "c".repeat(64), {
+      turnIndex: 2,
+      text: "干净回合的最终回答",
+      tools: [{
+        toolUseId: "tool-clean",
+        blockId: "tool-clean",
+        toolName: "Bash",
+        inputJson: { command: "printf ok" },
+        inputPreview: "printf ok",
+        output: "运行中",
+        isError: false,
+        durationMs: 1,
+        ts: 1_783_944_100_001,
+        arrivedAt: 1_783_944_100_001,
+      }],
+      runtimeEvents: [{
+        ordinal: 5,
+        observedAt: 1_783_944_100_002,
+        source: "ccb",
+        payload: {
+          type: "system",
+          subtype: "bash_output_tail",
+          tool_use_id: "tool-clean",
+          tail: "CLEAN_TAIL_OK",
+          total_bytes: 13,
+          truncated_head: false,
+        },
+      }],
+    });
+    await stageAndFinalize(userId, cleanTape);
+    // Rewrite the poison tape's runtime-event record with invalid UTF-8 bytes
+    // (0xff 0xfe 0x41) around the bash_output_tail marker, then force the
+    // legacy sidecar-incomplete state so only the raw-byte bypass can find it.
+    const poisonBytes = Buffer.concat([
+      Buffer.from(`{"id":"rt-poison","role":"runtime-event","text":"tail:`, "utf8"),
+      Buffer.from([0xff, 0xfe, 0x41]),
+      Buffer.from(
+        `","ts":150,"_runtimeEvent":{"type":"system","subtype":"bash_output_tail","tool_use_id":"tool-poison","tail":"POISON_TAIL","total_bytes":7}}`,
+        "utf8",
+      ),
+    ]);
+    const poisonSha = sha256(poisonBytes);
+    await pool.query(
+      `UPDATE client_session_turn_tape_records
+          SET payload=$4, visible_payload=$4, content_sha256=$5, visible_content_sha256=$5,
+              model_sidecar_complete=FALSE
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND role='runtime-event'`,
+      [sessionId, userId, poisonTape.finalize.tapeId, poisonBytes, poisonSha],
+    );
+    await pool.query(
+      `DELETE FROM client_session_turn_tape_model_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, poisonTape.finalize.tapeId],
+    );
+
+    // Before the fix the SQL-side convert_from probe threw here for the whole
+    // page; now the read must succeed for both tapes.
+    const page = await backend.readClientTimelinePage(sessionId, userId, null, 20);
+    assert.ok(page);
+    const answers = page.messages
+      .filter((message) => message.role === "assistant")
+      .map((message) => message.text);
+    assert.deepEqual([...answers].sort(), ["干净回合的最终回答", "毒带之外的最终回答"]);
+    const tails = page.messages.filter((message) => message._timelineAuxiliary === "bash-tail");
+    const cleanTail = tails.find((message) =>
+      (message._runtimeEvent as { tail?: string } | undefined)?.tail === "CLEAN_TAIL_OK");
+    assert.ok(cleanTail, "sidecar-indexed clean tape keeps its exact bash tail");
+    const poisonTail = tails.find((message) =>
+      (message._runtimeEvent as { tail?: string } | undefined)?.tail === "POISON_TAIL");
+    assert.ok(poisonTail, "bypass probed tail still hydrates");
+    assert.equal(String(poisonTail.text).includes("\uFFFD"), true,
+      "invalid UTF-8 bytes must surface as lossy replacement characters");
+  });
 });
 
 

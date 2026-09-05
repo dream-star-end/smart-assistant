@@ -253,6 +253,14 @@
     {
       "id": "T63",
       "proves": "真 Chromium 中滚轮/触控板连续上滑(12 步、间隔小于 quiet window)期间 wheelFence 持续保持(Chromium 每个离散 tick 之间会发 scrollend,不能单靠它释放)、controller 零程序化 scrollTop 写入、逐步位置单调不回弹;滚轮停止后 quiet window 释放篱笆,篱笆期间被拦下的视口校正全部丢弃而不是事后补写(否则是第二次可见跳动,T43 的触摸松手即曾因此被拉回底部),释放后校正即时生效、following=false 且随后内容增长不拉走视口(根治 c00fcf598 未覆盖的滚轮路径一卡一卡回弹)"
+    },
+    {
+      "id": "T64",
+      "proves": "真 Chromium 中 Phase-B 用同 id(`visible_head.messageId`=…-sK)的 `_payloadDeferred` 空壳(>1MiB)落到最后一段正文槽位时，已流式正文仍渲染在原槽位而不是被空壳占位卡闪没;真实非 deferred record 到达后按 id 整体替换、`_unpublishedFallbackLiveText` 辅助字段随之消失(INC-20260905-TURNEND-DEFERRED-STUB-SWALLOW)"
+    },
+    {
+      "id": "T65",
+      "proves": "真 Chromium 中底部 120px 占位(任务 HUD / 断线横幅 / 委派进度条)在场且贴底时，用户上滑与占位收起落在同一 scroll 事件(clientHeight 增大、scrollTop 恰等于新 max，与 scrollHeight 收缩 clamp 同形)，controller 不把它当 clamp 吞掉：following 立即为 false，随后追加内容不把视口写回底部(gpt-6 审计候选 1：clamp 短路掩盖首次离底)"
     }
   ]
 }

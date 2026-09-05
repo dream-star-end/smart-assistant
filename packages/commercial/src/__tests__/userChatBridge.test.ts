@@ -873,6 +873,122 @@ describe("userChatBridge — durable outbound frame ordering", () => {
     }
   });
 
+  test("permission authority rejection behind a busy queue never surfaces as unhandledRejection", async () => {
+    // INC-20260810-LIVE-FRAME-SEQUENCE-RESET follow-up. The permission
+    // authority write used to start at frame receipt and was only ever
+    // awaited inside the serial outbound persist queue task. While the queue
+    // was busy committing an earlier frame, that await registered only after
+    // the earlier work drained, so an immediately-rejected authority write
+    // crossed a microtask checkpoint with zero handlers → process-level
+    // unhandledRejection (fatal under --unhandled-rejections=strict). The
+    // write must start inside the queue task so the failure lands in the
+    // queue catch → onFailure → poison + close(1011), same as any other
+    // persistence failure.
+    const persisted: Array<Parameters<NonNullable<UserChatBridgeDeps["persistOutboundFrame"]>>[0]> = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const portRef = { value: 0 };
+    // pgPool must be set or the bridge never attempts the durable permission
+    // authority write; codex billing deps are all-or-none, so stub the trio.
+    // persistPermissionAuthority is a module-level import (not dep-injected),
+    // so the immediate rejection is produced through the pool's query.
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 84 }),
+      persistOutboundFrame: async (input) => {
+        persisted.push(input);
+        if (input.frameSeq === 1) await firstGate;
+      },
+      pgPool: {
+        query: async (sql: unknown) => {
+          const text = typeof sql === "string"
+            ? sql
+            : String((sql as { text?: unknown })?.text ?? "");
+          if (/INSERT INTO turn_permission_requests/.test(text)) {
+            throw new Error("permission authority db unavailable");
+          }
+          if (/SELECT status FROM users WHERE id/.test(text)) {
+            return { rows: [{ status: "active" }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        },
+      } as UserChatBridgeDeps["pgPool"],
+      preCheckRedis: {
+        async atomicReserve() { return { ok: true as const, locked: 0n, needed: 0n }; },
+        async releaseReservation() { return true; },
+      } as UserChatBridgeDeps["preCheckRedis"],
+      pricing: { get() { return null; } } as unknown as UserChatBridgeDeps["pricing"],
+    });
+    portRef.value = rig.containerPort;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const containerOpen = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("708"));
+      await new Promise<void>((resolve) => ws.once("open", resolve));
+      const containerWs = await containerOpen;
+      const business: Record<string, unknown>[] = [];
+      ws.on("message", (data) => {
+        try {
+          const frame = JSON.parse(data.toString()) as Record<string, unknown>;
+          if (typeof frame.type === "string" && !frame.type.startsWith("sys.")) business.push(frame);
+        } catch { /* irrelevant */ }
+      });
+      let closed: { code: number; reason: string } | null = null;
+      ws.once("close", (code, reason) => {
+        closed = { code, reason: reason.toString("utf8") };
+      });
+      const first = JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sess-perm-reject",
+        frameSeq: 1,
+        peer: { id: "sess-perm-reject", kind: "dm" },
+        clientMessageId: "cm-perm-reject",
+        blocks: [{ kind: "text", text: "one" }],
+      });
+      const prompt = JSON.stringify({
+        type: "outbound.permission_request",
+        sessionKey: "agent:main:webchat:dm:sess-perm-reject",
+        channel: "webchat",
+        peer: { id: "sess-perm-reject", kind: "dm" },
+        clientMessageId: "cm-perm-reject",
+        requestId: "req-perm-reject-1",
+        toolName: "ExitPlanMode",
+        toolUseId: "toolu_perm_reject",
+        inputPreview: "{}",
+        inputJson: {},
+        expiresAt: Date.now() + 60_000,
+        ts: Date.now(),
+        frameSeq: 2,
+      });
+      containerWs.send(first);
+      containerWs.send(prompt);
+      // The queue is parked on frame 1's gated commit. The old code had
+      // already started — and with this mock, already rejected — the
+      // permission authority write with no handler attached; give that
+      // hypothetical rejection every opportunity to surface while the gate
+      // is still closed.
+      await new Promise<void>((resolve) => setTimeout(resolve, 150));
+      assert.equal(unhandled.length, 0, "no unhandledRejection while the queue is busy");
+      assert.deepEqual(persisted.map((input) => input.frameSeq), [1]);
+      assert.equal(business.length, 0);
+
+      releaseFirst();
+      await waitFor(() => closed !== null);
+      assert.equal(closed!.code, CLOSE_BRIDGE.INTERNAL);
+      assert.match(closed!.reason, /output persistence unavailable/);
+      // The permission frame never became durable or browser-visible; its
+      // authority failure poisoned the namespace via the standard onFailure.
+      assert.deepEqual(persisted.map((input) => input.frameSeq), [1]);
+      assert.deepEqual(business.map((frame) => frame.frameSeq), [1]);
+      assert.equal(unhandled.length, 0, "failure adopted by the queue catch, not the process");
+      await waitClose(ws);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      await stopRig(rig);
+    }
+  });
+
   test("a failed commit is never shown and the exact container replay can heal it", async () => {
     let attempts = 0;
     const portRef = { value: 0 };

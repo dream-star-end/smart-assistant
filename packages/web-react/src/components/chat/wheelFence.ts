@@ -48,7 +48,11 @@ export function attachWheelFence(
     timer = window.setTimeout(tryEnd, Math.max(1, Math.ceil(ms)));
   };
   const tryEnd = () => {
-    timer = null;
+    // `scrollend` calls tryEnd directly while a quiet timer may still be
+    // queued. Only nulling the handle would orphan that timer: `schedule`
+    // can track one handle, and the orphan would fire later — after a
+    // detach/re-attach on the same controller — and end a fence it never owned.
+    clearTimer();
     if (!stick.wheelFence.current) return;
     const t = now();
     const inputRemaining = quietMs - (t - lastInputAt);

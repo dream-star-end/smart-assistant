@@ -68,6 +68,7 @@ export function cursorOfficialCcEnabledForModel(
     || family === 'opus-4.8'
     || family === 'fable-5'
     || family === 'fable-5.1'
+    || family === 'sonnet-5'
 }
 
 export function cursorVariantFor(
