@@ -7534,9 +7534,14 @@ wait $!
       'J5 deadline 必须实际使用 TURN_WAIT_TIMEOUT',
     )
     const modelPin = journeySource.indexOf('const JOURNEY_MODEL_ID = "gpt-5.6-luna";')
-    const modelTrigger = journeySource.indexOf('page.getByRole("button", { name: "选择对话模型" })')
-    const modelItem = journeySource.indexOf('page.locator(`[data-model-id="${JOURNEY_MODEL_ID}"]`)')
-    const modelApplied = journeySource.indexOf('modelTrigger.textContent()')
+    // 选模逻辑已抽到共享 helper(selfhost 契约门共用);不变量不变:真实选择器 → 菜单项 → 触发器回显,
+    // 且必须在附件上传/首次 UI 发送之前生效。canary 侧断言"调用 helper 并传固定模型",helper 侧断言顺序。
+    const helperSource = await readFile(path.join(root, 'scripts/lib/journey-browser.mjs'), 'utf8')
+    const helperTrigger = helperSource.indexOf('page.getByRole("button", { name: "选择对话模型" })')
+    const helperItem = helperSource.indexOf('page.locator(`[data-model-id="${id}"]`)')
+    const helperClick = helperSource.indexOf('await item.click()')
+    const helperApplied = helperSource.indexOf('[aria-label="选择对话模型"]')
+    const modelApplied = journeySource.indexOf('await selectJourneyModel(page, JOURNEY_MODEL_ID')
     const j2 = journeySource.indexOf('await step("J2 ')
     const j4 = journeySource.indexOf('await step("J4 ')
     assert.ok(modelPin >= 0, 'journey 必须固定使用平台自有的 GPT-5.6 Luna')
@@ -7545,10 +7550,16 @@ wait $!
       /请读取刚上传的附件「\$\{probeName\}」第一行/,
       'Luna 旅程必须用本轮原始文件名锁定当前附件，禁止从历史 uploads 猜文件',
     )
+    assert.match(
+      journeySource,
+      /import \{[^}]*selectJourneyModel[^}]*\} from "\.\/lib\/journey-browser\.mjs"/,
+      'journey 必须复用共享的真实模型选择器 helper',
+    )
     assert.ok(
-      modelTrigger > modelPin && modelItem > modelTrigger && modelApplied > modelItem,
+      helperTrigger >= 0 && helperItem > helperTrigger && helperClick > helperItem && helperApplied > helperClick,
       'journey 必须经真实模型选择器选中固定模型并等待触发器回显',
     )
+    assert.ok(modelApplied > modelPin, 'journey 必须用固定的 JOURNEY_MODEL_ID 调用选模 helper')
     assert.ok(
       modelApplied < j2 && modelApplied < j4,
       '固定模型必须在附件上传与首次 UI 发送之前生效，禁止账号历史粘滞模型决定 J5',
