@@ -301,13 +301,28 @@ jobs:
             "TAP_OUT=$TAP_OUT" \
             npm run test:commercial:unit:gate
 
+      - name: Explain missing TAP
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tap="${COMMERCIAL_UNIT_TAP:-commercial-unit.tap}"
+          if [[ ! -s "$tap" ]]; then
+            echo "::error::commercial-unit.tap was not produced. The known-failures gate did not run. Diagnose the first failed step (usually npm ci or Wait for test fixtures), not TAP parsing. 2026-09-05 run 33948677980 attempt 1 was npm ci ECONNRESET downloading onnxruntime, then this upload step masked it as missing TAP."
+          else
+            echo "TAP present: $tap ($(wc -c < "$tap") bytes)"
+          fi
+
       - name: Upload TAP output
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: commercial-unit-tap
           path: ${{ env.COMMERCIAL_UNIT_TAP }}
-          if-no-files-found: error
+          # warn not error: missing TAP is a symptom (npm ci / fixture / runner
+          # crash). Failing the upload step hid the real npm ci ECONNRESET in
+          # run 33948677980 attempt 1 behind "No files were found ... commercial-unit.tap".
+          if-no-files-found: warn
           retention-days: 14
 
   commercial-integ:
