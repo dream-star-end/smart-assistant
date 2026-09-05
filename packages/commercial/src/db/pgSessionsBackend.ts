@@ -6277,7 +6277,10 @@ async function readUnifiedTimelineBashTailAuxiliaries(
   // probe used to decode inside SQL (`convert_from(...,'UTF8')`), which makes
   // the statement itself throw on any invalid UTF-8 byte sequence — one bad
   // tape then failed the whole page read for every tape on it. The probe now
-  // pre-filters with a pure byte-level strpos (no decoding, never throws) so
+  // pre-filters with a pure byte-level `position(bytea IN bytea)` (no decoding,
+  // never throws; NB `strpos` has no bytea overload — 2026-09-05 that shipped
+  // as `function strpos(bytea, bytea) does not exist` and 500'd every session
+  // GET until rollback, so the integ test now runs this SQL against real PG) so
   // only genuinely matching rows leave the database, and the authoritative
   // marker check decodes those bytes lossily in JS (invalid sequences become
   // U+FFFD and never throw), keeping the blast radius inside a single tape
@@ -6299,9 +6302,9 @@ async function readUnifiedTimelineBashTailAuxiliaries(
           AND r.ordinal < requested.upper_ordinal
         WHERE r.role='runtime-event'
           AND r.model_sidecar_complete=FALSE
-          AND strpos(
-                COALESCE(r.visible_payload,r.payload),
+          AND position(
                 convert_to('bash_output_tail','UTF8')
+                IN COALESCE(r.visible_payload,r.payload)
               ) > 0
         ORDER BY requested.tape_id,r.ordinal`,
       windowParams,

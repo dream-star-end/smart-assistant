@@ -243,10 +243,21 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/unifiedTimelineDisplayDegrade.test.ts",
           "assertion": "invalid UTF-8 probe bytes on one tape leave other tapes on the page intact"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/unifiedTimelineDisplayDegrade.test.ts",
+          "assertion": "byte-level probe must be position(bytea IN bytea)"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "invalid UTF-8 bash-tail bytes on one tape never fail the page read for the others"
         }
       ],
       "coverageCommits": [
-        "3cd0c117"
+        "3cd0c117",
+        "f3d1d383"
       ]
     },
     {

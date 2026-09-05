@@ -605,8 +605,14 @@ test("bash-tail probe never decodes bytes in SQL and survives invalid UTF-8 tool
   const probe = sqlCalls.find((call) => call.sql.includes("AS probe_bytes"));
   assert.ok(probe, "sidecar-incomplete bypass must fetch raw bytes for a JS-side probe");
   assert.equal(probe.sql.includes("model_sidecar_complete=FALSE"), true);
-  assert.equal(probe.sql.includes("strpos("), true);
-  assert.equal(probe.sql.includes("convert_to('bash_output_tail','UTF8')"), true);
+  // PG has no strpos(bytea, bytea) — only position(bytea IN bytea). The mock
+  // pool cannot catch that; the integ test below runs the statement for real.
+  assert.equal(/\bstrpos\(/.test(probe.sql), false, "strpos has no bytea overload");
+  assert.equal(
+    /position\(\s*convert_to\('bash_output_tail','UTF8'\)\s*IN\s+COALESCE\(r\.visible_payload,r\.payload\)\s*\)\s*>\s*0/.test(probe.sql),
+    true,
+    "byte-level probe must be position(bytea IN bytea)",
+  );
 });
 
 function twoTapeMessages() {
