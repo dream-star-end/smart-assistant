@@ -104,6 +104,14 @@ before(async () => {
        repeat('c',64),1,repeat('d',64));
   `)
   await pool.query(await readFile(MIGRATION_0190, 'utf8'))
+  // 0203 added auto_dream_platform_findings.owner. This file freezes 0188+0190
+  // on a stub schema then calls HEAD listAutoDreamPlatformFindings, which
+  // SELECTs f.owner. Add the later column without applying the rest of 0203.
+  await pool.query(`
+    ALTER TABLE auto_dream_platform_findings
+      ADD COLUMN IF NOT EXISTS owner TEXT
+        CHECK (owner IS NULL OR char_length(owner) BETWEEN 1 AND 128)
+  `)
 })
 
 after(async () => {

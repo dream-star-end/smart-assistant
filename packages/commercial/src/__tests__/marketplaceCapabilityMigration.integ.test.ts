@@ -39,7 +39,10 @@ before(async () => {
   await resetSchema()
   partialDir = await mkdtemp(join(tmpdir(), 'oc-migrations-through-0151-'))
   for (const file of (await readdir(MIGRATIONS)).filter((name) => name.endsWith('.sql'))) {
-    if (file === '0152_marketplace_capability_bindings.sql') continue
+    // Seed must land on the pre-0152 schema. Skipping only 0152 while still
+    // applying 0153+ installs 'approved plugin version requires a signature
+    // scheme' before the legacy fixture insert.
+    if (file.slice(0, 4) >= '0152') continue
     await symlink(join(MIGRATIONS, file), join(partialDir, file))
   }
   await runMigrations({ dir: partialDir })
@@ -114,7 +117,13 @@ before(async () => {
     [userId, skill.rows[0]!.id, agent.rows[0]!.id, pluginAgent.rows[0]!.id],
   )
 
-  const migrated = await runMigrations({ dir: MIGRATIONS })
+  const through0152 = await mkdtemp(join(tmpdir(), 'oc-migrations-through-0152-'))
+  for (const file of (await readdir(MIGRATIONS)).filter((name) => name.endsWith('.sql'))) {
+    if (file.slice(0, 4) > '0152') continue
+    await symlink(join(MIGRATIONS, file), join(through0152, file))
+  }
+  const migrated = await runMigrations({ dir: through0152 })
+  await rm(through0152, { recursive: true, force: true })
   assert.deepEqual(migrated.applied, ['0152_marketplace_capability_bindings'])
 })
 
