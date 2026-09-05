@@ -21,6 +21,7 @@
 // stub 原则同主 harness:只 stub 网络/宿主副作用,不 stub 任何 UI 结构。
 import { StrictMode, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { flushSync } from "react-dom";
 import { ChatHeader } from "../src/components/ChatHeader";
 import { Composer } from "../src/components/Composer";
 import { MessageList } from "../src/components/MessageRenderer";
@@ -44,6 +45,10 @@ declare global {
       armSticky: () => void;
       growTimeline: () => void;
       attemptViewportCorrection: (delta: number) => void;
+      /** T65:滚动区下方占位(模拟底部 HUD / 断线横幅 / 委派进度条),收起时 clientHeight 变大。 */
+      setBottomInset: (px: number) => void;
+      /** T65:用户上滑 px 与底部占位收起落在同一帧 → 浏览器一次 scroll 事件里 scrollTop == 新 max。 */
+      scrollUpWithCollapse: (px: number) => void;
     };
   }
 }
@@ -58,6 +63,8 @@ window.__mobilePage = {
   armSticky: () => {},
   growTimeline: () => {},
   attemptViewportCorrection: () => {},
+  setBottomInset: () => {},
+  scrollUpWithCollapse: () => {},
 };
 
 // 宽内容样本:每一条都是线上真实出现过的形态,且都是移动端最容易被裁的东西。
@@ -129,6 +136,7 @@ const MOBILE_MODELS = [
 function MobileChatPage() {
   const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   const [growCount, setGrowCount] = useState(0);
+  const [bottomInset, setBottomInset] = useState(0);
   const [modelId, setModelId] = useState(MOBILE_MODELS[0].id);
   const stick = useRef(createStickToBottomController()).current;
   const syncFollowing = useCallback(() => {
@@ -176,6 +184,15 @@ function MobileChatPage() {
     if (!scroller) return;
     stick.correctTo(scroller, scroller.scrollTop + delta);
     syncFollowing();
+  };
+  window.__mobilePage.setBottomInset = (px) => setBottomInset(px);
+  window.__mobilePage.scrollUpWithCollapse = (px) => {
+    if (!scroller) return;
+    // 键盘/滚轮首 tick 都先 mark;用户位移与占位收起在同一任务里落地,浏览器把两者
+    // 合并成一次 scroll 事件,scrollTop 恰好等于新 max —— 和 scrollHeight 收缩 clamp 同形。
+    stick.markUserIntent();
+    scroller.scrollTop = scroller.scrollTop - px;
+    flushSync(() => setBottomInset(0));
   };
   useLayoutEffect(() => {
     if (!scroller) return;
@@ -247,6 +264,9 @@ function MobileChatPage() {
             followBottomRef={stick.canRestick}
           />
         </div>
+        {bottomInset > 0 ? (
+          <div data-testid="mobile-bottom-inset" className="shrink-0" style={{ height: bottomInset }} />
+        ) : null}
         <div className="shrink-0 composer-safe-b">
           <Composer
             onSend={(text: string, media?: MediaRef[]) => {
