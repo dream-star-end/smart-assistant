@@ -319,10 +319,10 @@ jobs:
         with:
           name: commercial-unit-tap
           path: ${{ env.COMMERCIAL_UNIT_TAP }}
-          # warn not error: missing TAP is a symptom (npm ci / fixture / runner
-          # crash). Failing the upload step hid the real npm ci ECONNRESET in
-          # run 33948677980 attempt 1 behind "No files were found ... commercial-unit.tap".
-          if-no-files-found: warn
+          # error (check:ci-parity contract): missing TAP must keep the job red.
+          # The "Explain missing TAP" step above already surfaces the real cause
+          # (e.g. npm ci ECONNRESET in run 33948677980 attempt 1) before this fails.
+          if-no-files-found: error
           retention-days: 14
 
   commercial-integ:
