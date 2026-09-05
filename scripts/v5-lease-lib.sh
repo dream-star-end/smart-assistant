@@ -249,7 +249,8 @@ lease_deploy_process_running() {
 
 # 僵尸(容器内无 reaper 时会出现)视为已死。
 lease_pid_alive() {
-  [[ -n "$1" ]] && kill -0 "$1" 2>/dev/null || return 1
+  [[ -n "$1" && "$1" != 0 ]] || return 1     # kill -0 0 会打到整个进程组,必须挡掉
+  kill -0 "$1" 2>/dev/null || return 1
   local st; st="$(awk '/^State:/{print $2}' "/proc/$1/status" 2>/dev/null || true)"
   [[ "$st" != Z ]]
 }

@@ -245,13 +245,37 @@ SQL
   if [[ "$DRY" == 1 ]]; then
     wlog "[dry] 不 spawn"; exec 8>&-; return 0
   fi
-  # 执行器继承 fd 8(OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 让脚本跳过自己再 flock)。
+  # 执行器必须活得比本 tick 长。worker 由 systemd oneshot 拉起(KillMode=control-group),
+  # 直接 setsid 的子进程仍在同一 cgroup,tick 结束即被收割(2026-09-05 实测:首三班 30s 内全死)。
+  # 所以在 systemd 下用 systemd-run 起独立 transient unit;不在 systemd 下(selftest)退回 setsid。
+  # 锁:transient unit 无法继承 fd 8 → 这里先释放,让执行器自己走脚本原生 flock 路径;
+  # 双发防线仍是 train 唯一开放索引 + 本 tick 已确认锁空。
   local pid
-  OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 OC_V5_LEASE_TRAIN_ID="$id" OC_V5_LEASE_DB="$LEASE_DB" \
-    setsid nohup "$DEPLOY_BIN" --deploy --lease-train="$id" --target-sha="$tip" --allow-dirty --platform-from-head \
-      >"$logf" 2>&1 </dev/null 8>&8 211>&- 212>&- &
-  pid=$!
-  exec 8>&-   # worker 放手;锁随执行器进程生命周期
+  if [[ -n "${INVOCATION_ID:-}" ]] && command -v systemd-run >/dev/null 2>&1; then
+    exec 8>&-
+    local unit="oc-v5-lease-train-${id#tr-}"
+    if ! systemd-run --quiet --collect --unit="$unit" --description="lease train $id → ${tip:0:12}" \
+         --property=KillMode=process --property=TimeoutStopSec=35min \
+         --setenv=OC_V5_LEASE_TRAIN_ID="$id" --setenv=OC_V5_LEASE_DB="$LEASE_DB" \
+         --setenv=HOME=/root --setenv=PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+         --property=StandardOutput="file:$logf" --property=StandardError="file:$logf" \
+         "$DEPLOY_BIN" --deploy --lease-train="$id" --target-sha="$tip" --allow-dirty --platform-from-head; then
+      finish_train "$id" failed "systemd-run 启动失败" '{}'
+      return 0
+    fi
+    # 拿 transient unit 主 pid(最多等 3s)
+    local i; for i in 1 2 3 4 5 6; do
+      pid="$(systemctl show -p MainPID --value "$unit.service" 2>/dev/null || true)"
+      [[ -n "$pid" && "$pid" != 0 ]] && break; sleep 0.5
+    done
+    [[ -n "$pid" && "$pid" != 0 ]] || { wlog "拿不到 $unit MainPID(可能已秒退),交给对账"; pid=0; }
+  else
+    OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 OC_V5_LEASE_TRAIN_ID="$id" OC_V5_LEASE_DB="$LEASE_DB" \
+      setsid nohup "$DEPLOY_BIN" --deploy --lease-train="$id" --target-sha="$tip" --allow-dirty --platform-from-head \
+        >"$logf" 2>&1 </dev/null 8>&8 211>&- 212>&- &
+    pid=$!
+    exec 8>&-   # worker 放手;锁随执行器进程生命周期
+  fi
   lease_tx <<SQL || wlog "写 executor_pid 失败(对账将按 planned 超时处理)"
 BEGIN IMMEDIATE;
 UPDATE train SET executor_pid=$pid, status='building', started_at='$(lease_now)', updated_at='$(lease_now)' WHERE id='$id' AND status='planned';

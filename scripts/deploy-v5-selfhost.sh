@@ -1318,7 +1318,7 @@ lease_train_begin() {
     [[ -n "$st" ]] || die "train 不存在:$LEASE_TRAIN_ID"
     [[ "$tgt" == "$LEASE_TARGET_SHA" ]] || die "train $LEASE_TRAIN_ID target_sha=$tgt ≠ --target-sha"
     [[ "$st" == planned || "$st" == building ]] || die "train $LEASE_TRAIN_ID status=$st,不可执行"
-    [[ -z "$pid" || "$pid" == "$$" || "$pid" == "$PPID" ]] || { kill -0 "$pid" 2>/dev/null && die "train $LEASE_TRAIN_ID 已有活执行器 pid=$pid"; }
+    [[ -z "$pid" || "$pid" == 0 || "$pid" == "$$" || "$pid" == "$PPID" ]] || { kill -0 "$pid" 2>/dev/null && die "train $LEASE_TRAIN_ID 已有活执行器 pid=$pid"; }
     lease_tx <<SQL || die "train CAS building 写失败(sqlite),fail-closed"
 BEGIN IMMEDIATE;
 UPDATE train SET status='building', executor_pid=$$, started_at=COALESCE(started_at,'$(lease_now)'), updated_at='$(lease_now)'
