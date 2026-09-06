@@ -214,6 +214,166 @@ test('history round-trips through resume-map.json and is bounded / deduped / hea
   }
 })
 
+// ── Live-session promotion (GPT-6 review B2) ─────────────────────────────────
+// A promotion that only rewrites the map is undone by _saveResumeMap's live
+// overlay (session.ccbSessionId still = dead head) and never reaches the
+// adapter, so the next spawn --resumes the dead id anyway. These tests drive a
+// real getOrCreate() session (grok/ccb adapters construct without spawning).
+
+const LIVE_A = '11111111-1111-4111-8111-111111111111'
+const LIVE_B = '22222222-2222-4222-8222-222222222222'
+const LIVE_C = '33333333-3333-4333-8333-333333333333'
+
+type LiveSession = {
+  sessionKey: string
+  ccbSessionId: string | null
+  workspaceCwd?: string
+  runner: {
+    nativeSessionId: string | null
+    setResumeSessionId?: (id: string) => void
+    emit: (ev: string, ...args: unknown[]) => boolean
+  }
+  _pendingStaleResumeClear?: boolean
+}
+
+type LiveInternals = Internals & {
+  sessions: Map<string, LiveSession>
+  getOrCreate: (opts: Record<string, unknown>) => Promise<LiveSession>
+  submit: (...args: unknown[]) => Promise<void>
+  runOneTurnWithRetry: (...args: unknown[]) => Promise<unknown>
+}
+
+async function liveSetup(engine: 'grok' | 'ccb') {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-ladder-live-'))
+  const artifacts =
+    engine === 'grok'
+      ? join(dir, 'grok-build', 'sessions', '%2Fws')
+      : join(dir, 'claude', 'projects', 'p')
+  mkdirSync(artifacts, { recursive: true })
+  for (const id of [LIVE_B, LIVE_C]) {
+    if (engine === 'grok') {
+      mkdirSync(join(artifacts, id))
+      writeFileSync(join(artifacts, id, 'messages.jsonl'), '{}\n')
+    } else {
+      writeFileSync(join(artifacts, `${id}.jsonl`), '{"type":"user"}\n')
+    }
+  }
+  const env = {
+    OPENCLAUDE_HOME: dir,
+    CLAUDE_CONFIG_DIR: join(dir, 'claude'),
+    // Commercial runtime rejects submit() without a master sink; this test
+    // is about resume steering, not persistence.
+    OC_RUNTIME_CHANNEL: undefined,
+    OPENCLAUDE_V3_MASTER_BASE_URL: undefined,
+    OPENCLAUDE_V3_CONTAINER_TOKEN: undefined,
+  }
+  const model = engine === 'grok' ? 'grok-build' : 'glm-5.3-zai'
+  const run = async <T>(fn: (m: LiveInternals, s: LiveSession) => Promise<T>): Promise<T> =>
+    withEnv(env, async () => {
+      const m = newManager(dir) as LiveInternals
+      const s = await m.getOrCreate({
+        sessionKey: 'ladder-live',
+        agent: { id: 'ladder', model, cwd: dir },
+        model,
+        executionAuthority: { engine, canonicalModel: model, source: 'local_catalog' },
+        workspaceCwd: dir,
+      })
+      s.runner.setResumeSessionId?.(LIVE_A)
+      s.runner.emit('session_id', LIVE_A)
+      m._resumeMapHistory.set(s.sessionKey, [LIVE_B, LIVE_C])
+      try {
+        return await fn(m, s)
+      } finally {
+        await m.awaitResumeMapFlush()
+      }
+    })
+  return { dir, run, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
+}
+
+test('live promotion steers session + adapter and survives _saveResumeMap overlay', async () => {
+  const { run, cleanup } = await liveSetup('grok')
+  try {
+    await run(async (m, s) => {
+      assert.equal(s.runner.nativeSessionId, LIVE_A)
+      assert.equal(m._resumeIdFor(s.sessionKey, 'grok', s.workspaceCwd), LIVE_B)
+      assert.equal(s.ccbSessionId, LIVE_B, 'live session must follow promotion')
+      assert.equal(s.runner.nativeSessionId, LIVE_B, 'adapter must --resume promoted id')
+      assert.equal(m._resumeMap.get(s.sessionKey), LIVE_B)
+      await m.awaitResumeMapFlush()
+      const saved = JSON.parse(readFileSync(m.resumeMapPath, 'utf8'))[s.sessionKey]
+      assert.equal(saved.id, LIVE_B, 'serializer must not write the dead head back')
+      assert.deepEqual(saved.history, [LIVE_C])
+    })
+  } finally {
+    cleanup()
+  }
+})
+
+test('consecutive runtime stale exits walk the ladder monotonically (rejected id never re-picked)', async () => {
+  const { run, cleanup } = await liveSetup('ccb')
+  try {
+    await run(async (m, s) => {
+      s._pendingStaleResumeClear = true
+      s.runner.emit('exit', { code: 1, signal: null, crashed: true })
+      assert.equal(s.runner.nativeSessionId, LIVE_B)
+      assert.equal(m._resumeMap.get(s.sessionKey), LIVE_B)
+      assert.deepEqual(m._resumeMapHistory.get(s.sessionKey), [LIVE_C])
+
+      // Engine rejects B too (non-empty file ≠ resumable conversation).
+      s._pendingStaleResumeClear = true
+      s.runner.emit('exit', { code: 1, signal: null, crashed: true })
+      assert.equal(s.runner.nativeSessionId, LIVE_C, 'must move on to C, not re-pick B')
+      assert.equal(m._resumeMap.get(s.sessionKey), LIVE_C)
+      assert.deepEqual(m._resumeMapHistory.get(s.sessionKey), [])
+
+      // Ladder exhausted → forget (previous drop behaviour).
+      s._pendingStaleResumeClear = true
+      s.runner.emit('exit', { code: 1, signal: null, crashed: true })
+      assert.equal(s.runner.nativeSessionId, null)
+      assert.equal(m._resumeMap.has(s.sessionKey), false)
+    })
+  } finally {
+    cleanup()
+  }
+})
+
+test('submit() preflight promotion reaches the execution seam with the promoted id', async () => {
+  const { run, cleanup } = await liveSetup('grok')
+  try {
+    await run(async (m, s) => {
+      const seams: Array<{ nativeId: string | null; mapped: string | undefined }> = []
+      m.runOneTurnWithRetry = async (session: unknown) => {
+        const sess = session as LiveSession
+        seams.push({
+          nativeId: sess.runner.nativeSessionId,
+          mapped: m._resumeMap.get(sess.sessionKey),
+        })
+      }
+      await m.submit(
+        s,
+        'continue',
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          historicalMessages: [
+            { id: 'old-u', role: 'user', content: 'prior task' },
+            { id: 'srv-unknown-ladder-t1', role: 'assistant', content: 'prior response' },
+          ],
+        },
+      )
+      assert.equal(seams.length, 1, 'submit must reach execution seam')
+      assert.equal(seams[0].nativeId, LIVE_B)
+      assert.equal(seams[0].mapped, LIVE_B)
+    })
+  } finally {
+    cleanup()
+  }
+})
+
 test('paths.home is the default OPENCLAUDE_HOME for grok/zcode probes', () => {
   // Sanity: the module must not throw when env is unset and paths.home exists.
   assert.equal(typeof paths.home, 'string')

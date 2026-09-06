@@ -43,7 +43,11 @@ import {
   usableCursorResumeId,
 } from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
-import { RESUME_HISTORY_MAX, pickResumableId, probeResumeArtifact } from './engine/resumeArtifacts.js'
+import {
+  RESUME_HISTORY_MAX,
+  pickResumableId,
+  probeResumeArtifact,
+} from './engine/resumeArtifacts.js'
 import type {
   AutomaticRetryState,
   CollabAgentPolicy,
@@ -68,7 +72,11 @@ import type { GrokRouteOverride } from './engine/grokAdapter.js'
 import type { ZcodeRouteOverride } from './engine/zcodeAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { beginMemoryTurnTracking } from './memoryTurnObserver.js'
-import { createTurnUsageRecorder, mapTurnTerminalStatus, type TurnTerminalStatus } from './turnUsage.js'
+import {
+  createTurnUsageRecorder,
+  mapTurnTerminalStatus,
+  type TurnTerminalStatus,
+} from './turnUsage.js'
 import { emptyCompletedTurnAssistantText } from './emptyCompletedTurn.js'
 import { applyPlatformCostIfMissing } from './usageCost.js'
 import { createLogger } from './logger.js'
@@ -131,7 +139,8 @@ async function computeSessionContextFingerprint(
       projectId: id,
       contextVersion: snap.version,
       assetsRevision,
-      projectMdSha256: snap.meta.contentManifest?.projectMdSha256 ?? snap.meta.instructionsSha256 ?? null,
+      projectMdSha256:
+        snap.meta.contentManifest?.projectMdSha256 ?? snap.meta.instructionsSha256 ?? null,
       skillManifestSha256: skillOverlayManifestSha256(snap.meta.contentManifest?.skills ?? []),
       officialMemoryManifestSha256: snap.meta.promotion.manifestSha256 ?? null,
     })
@@ -289,7 +298,7 @@ export function assertPromptQueueExecutionAdmission(
   if (queueTurn && (activeSubmits !== 0 || activeClientTurns !== 1)) {
     throw new Error(
       `PROMPT_QUEUE_EXECUTION_INVARIANT: expected one client turn and no queued submit ` +
-      `(client=${activeClientTurns}, submit=${activeSubmits})`,
+        `(client=${activeClientTurns}, submit=${activeSubmits})`,
     )
   }
   if (queueExecutionActive) {
@@ -390,11 +399,14 @@ export function historicalContextInjectionKey(opts: {
   const messages = Array.isArray(opts.messages) ? opts.messages : []
   if (messages.length === 0) return opts.hasProviderResumeId ? null : 'local:no-provider-resume'
   const latestAssistantId = latestAssistantMessageId(messages)
-  if (latestAssistantId && shouldTreatMasterHistoryAsProviderGap({
-    messages,
-    peerId: opts.peerId,
-    agentId: opts.agentId,
-  })) {
+  if (
+    latestAssistantId &&
+    shouldTreatMasterHistoryAsProviderGap({
+      messages,
+      peerId: opts.peerId,
+      agentId: opts.agentId,
+    })
+  ) {
     return `master:${latestAssistantId}`
   }
   return opts.hasProviderResumeId ? null : `master:${latestAssistantId ?? 'no-assistant'}`
@@ -659,10 +671,12 @@ export function applyTurnIdleTimeoutTick(input: {
   finalized: boolean
   refresh: () => void
 }): boolean {
-  if (!shouldFireTurnIdleTimeout({
-    waitingForUserInput: input.waitingForUserInput,
-    finalized: input.finalized,
-  })) {
+  if (
+    !shouldFireTurnIdleTimeout({
+      waitingForUserInput: input.waitingForUserInput,
+      finalized: input.finalized,
+    })
+  ) {
     if (!input.finalized && input.waitingForUserInput) input.refresh()
     return false
   }
@@ -688,9 +702,7 @@ export function isTempSessionKey(sessionKey: string): boolean {
 
 function throwIfLogicalTurnCancelled(signal: AbortSignal | undefined): void {
   if (!signal?.aborted) return
-  throw signal.reason instanceof Error
-    ? signal.reason
-    : new Error('logical turn cancelled')
+  throw signal.reason instanceof Error ? signal.reason : new Error('logical turn cancelled')
 }
 
 function waitForRetryDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
@@ -699,11 +711,7 @@ function waitForRetryDelay(ms: number, signal: AbortSignal | undefined): Promise
   return new Promise<void>((resolve, reject) => {
     const onAbort = () => {
       clearTimeout(timer)
-      reject(
-        signal.reason instanceof Error
-          ? signal.reason
-          : new Error('logical turn cancelled'),
-      )
+      reject(signal.reason instanceof Error ? signal.reason : new Error('logical turn cancelled'))
     }
     const timer = setTimeout(() => {
       signal.removeEventListener('abort', onAbort)
@@ -740,10 +748,14 @@ function scheduleSessionOutputAssetCollection(opts: {
     sessionId: opts.sessionId,
     assistantText: opts.assistantText,
   }).catch((err) => {
-    log.warn('collectSessionOutputAssets failed', {
-      sessionKey: opts.sessionKey,
-      ...(opts.traceId ? { traceId: opts.traceId } : {}),
-    }, err)
+    log.warn(
+      'collectSessionOutputAssets failed',
+      {
+        sessionKey: opts.sessionKey,
+        ...(opts.traceId ? { traceId: opts.traceId } : {}),
+      },
+      err,
+    )
   })
 }
 
@@ -977,7 +989,7 @@ export interface AgentSession {
    * handleExit/handleError then persist SERVICE_RESTART (yellow/waived)
    * instead of RUNNER_CRASHED (red). Unexpected crashes leave this unset.
    */
-  _plannedTeardown?: "service_restart"
+  _plannedTeardown?: 'service_restart'
   /** Platform-executed exchanges not yet observed in master history. A
    * transient master-sink failure can durably queue the assistant row while
    * the very next user turn arrives first; this session-local tail keeps that
@@ -1076,7 +1088,10 @@ export interface AgentSession {
    * inFlightClientMessageId 精确对账:命中 completed → turn_completed reconcile
    * 帧带 id;命中中断类 → interrupted 帧带 id;未知 → turn_state_unknown。
    * 非持久化(重启后空 → 未知身份 → forceSync,不冒充终态)。 */
-  _recentTerminalRing?: Array<{ clientMessageId: string; outcome: 'completed' | 'interrupted' | 'crashed' }>
+  _recentTerminalRing?: Array<{
+    clientMessageId: string
+    outcome: 'completed' | 'interrupted' | 'crashed'
+  }>
 
   /** RFC-v5-durable-turn-dispatch §3 — 本 turn 的 durable inbox 准入身份
    * (server.ts dispatchInbound 从验签 descriptor 取出并在 submit 前挂上)。
@@ -1141,11 +1156,12 @@ function combineRetryAssistantOutput(
   if (retrySegments.length === 0) {
     return { text: terminalText, segments: terminalSegments.map((segment) => ({ ...segment })) }
   }
-  const tail = terminalSegments.length > 0
-    ? terminalSegments
-    : terminalText.length > 0
-      ? [{ index: 0, text: terminalText, ts: fallbackTs }]
-      : []
+  const tail =
+    terminalSegments.length > 0
+      ? terminalSegments
+      : terminalText.length > 0
+        ? [{ index: 0, text: terminalText, ts: fallbackTs }]
+        : []
   const segments = [...retrySegments, ...tail].map((segment, index) => ({
     ...segment,
     index,
@@ -1156,11 +1172,7 @@ function combineRetryAssistantOutput(
   }
 }
 
-const TRANSIENT_RETRY_ERROR_CODES = new Set([
-  'rate_limited',
-  'model_capacity',
-  'upstream_failed',
-])
+const TRANSIENT_RETRY_ERROR_CODES = new Set(['rate_limited', 'model_capacity', 'upstream_failed'])
 
 /** E12 — 瞬时错误自动重试的续跑输入。裸「继续」会让模型丢失重试语境(可能被
  *  理解成用户新指令);这里显式附带原始意图:上一轮因上游瞬时错误被打断,应
@@ -1207,7 +1219,9 @@ function withPreheatDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
 }
 
 function isPreheatDeadline(err: unknown): boolean {
-  return Boolean(err && typeof err === 'object' && (err as { code?: string }).code === PREHEAT_DEADLINE_CODE)
+  return Boolean(
+    err && typeof err === 'object' && (err as { code?: string }).code === PREHEAT_DEADLINE_CODE,
+  )
 }
 
 export interface CronBridgeEvent {
@@ -1243,9 +1257,9 @@ type TapePersistResult = 'acked' | 'queued' | 'dropped' | 'skipped'
  *   1. v3 commercial (container has OPENCLAUDE_V3_MASTER_BASE_URL +
  *      OPENCLAUDE_V3_CONTAINER_TOKEN env): send via the container→master
  *      sink (V3MasterSink). Master writes to its own SQLite where the
-   *      authoritative session row lives. The sink stages every v2 turn
-   *      before its first network attempt and retains all non-410 failures.
-   *      **userId is irrelevant on this path** — master derives it
+ *      authoritative session row lives. The sink stages every v2 turn
+ *      before its first network attempt and retains all non-410 failures.
+ *      **userId is irrelevant on this path** — master derives it
  *      from the verified container identity, so we don't even bother
  *      looking it up here.
  *
@@ -1392,9 +1406,7 @@ function persistServerAuthoredTurnOutcome(args: {
       ...(args.clientMessageId ? { clientMessageId: args.clientMessageId } : {}),
       ...(args.turnKey ? { turnKey: args.turnKey } : {}),
       ...(args.waiveReason ? { waiveReason: args.waiveReason } : {}),
-      ...(args.continuationOfTurnKey
-        ? { continuationOfTurnKey: args.continuationOfTurnKey }
-        : {}),
+      ...(args.continuationOfTurnKey ? { continuationOfTurnKey: args.continuationOfTurnKey } : {}),
       // durable dispatch identity 只挂主 tape：continuation tape(post-terminal
       // Bash tail)绝不携带,避免非主内容触发 inbox terminal / 污染 dispatch 归属。
       ...(args.dispatch && !args.continuationOfTurnKey
@@ -1432,9 +1444,7 @@ function persistServerAuthoredTurnOutcome(args: {
         : {}),
       // P2 债A — team cards. Forward when non-empty; master writes one
       // server-authored `role: 'agent-group'` row per delegation.
-      ...(args.agentGroups && args.agentGroups.length > 0
-        ? { agentGroups: args.agentGroups }
-        : {}),
+      ...(args.agentGroups && args.agentGroups.length > 0 ? { agentGroups: args.agentGroups } : {}),
       ...(args.structuredBlocks && args.structuredBlocks.length > 0
         ? { structuredBlocks: args.structuredBlocks }
         : {}),
@@ -1500,8 +1510,8 @@ function persistServerAuthoredTurnOutcome(args: {
   const directWrite = async () => {
     // OCV5-94: only the owner is needed here; the timeline view is page-bounded
     // while the default exact view hydrates every turn tape of the session.
-    const uid = args.userId ??
-      ((await getClientSession(args.peerId, undefined, { view: 'timeline' }))?.userId)
+    const uid =
+      args.userId ?? (await getClientSession(args.peerId, undefined, { view: 'timeline' }))?.userId
     if (!uid) return undefined // cron-style pre-UI, no owner — skip.
     const baseTs = Date.now()
     // Best-effort thinking write: doesn't block assistant. Failures are
@@ -1594,10 +1604,12 @@ function persistServerAuthoredTurnOutcome(args: {
     })
 }
 
-function activeGoalAttribution(session: AgentSession): {
-  goalId: string
-  goalStateRevision: number
-} | undefined {
+function activeGoalAttribution(session: AgentSession):
+  | {
+      goalId: string
+      goalStateRevision: number
+    }
+  | undefined {
   const goal = session._platformGoal
   return goal?.status === 'active'
     ? { goalId: goal.goalId, goalStateRevision: goal.stateRevision }
@@ -1605,9 +1617,7 @@ function activeGoalAttribution(session: AgentSession): {
 }
 
 function safeUsageCounter(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
-    ? value
-    : undefined
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
 }
 
 /** Partial/crash persistence must retain every token counter already observed.
@@ -1634,9 +1644,13 @@ function terminalUsageForPersistence(args: {
   const totalTokens = safeUsageCounter(args.finalMeta?.totalTokens) ?? billingTotal
   return {
     inputTokens:
-      safeUsageCounter(args.finalMeta?.inputTokens) ?? safeUsageCounter(billingUsage?.input_tokens) ?? 0,
+      safeUsageCounter(args.finalMeta?.inputTokens) ??
+      safeUsageCounter(billingUsage?.input_tokens) ??
+      0,
     outputTokens:
-      safeUsageCounter(args.finalMeta?.outputTokens) ?? safeUsageCounter(billingUsage?.output_tokens) ?? 0,
+      safeUsageCounter(args.finalMeta?.outputTokens) ??
+      safeUsageCounter(billingUsage?.output_tokens) ??
+      0,
     cacheReadTokens:
       safeUsageCounter(args.finalMeta?.cacheReadTokens) ??
       safeUsageCounter(billingUsage?.cache_read_input_tokens) ??
@@ -1695,11 +1709,7 @@ function persistPostTerminalRuntimeEvents(args: {
     status: 'completed',
     runtimeEvents: args.events.map((event) => structuredClone(event)),
   }).catch((err): TapePersistResult => {
-    log.error(
-      'post-terminal runtime persist threw',
-      { sessionKey: args.sessionKey },
-      err as Error,
-    )
+    log.error('post-terminal runtime persist threw', { sessionKey: args.sessionKey }, err as Error)
     return 'dropped'
   })
 }
@@ -1746,8 +1756,18 @@ interface TailPersistQueueItem {
 
 type TailPersistOp =
   | { kind: 'real'; st: TailFoldStreamState; item: TailFoldItem; event: DurableRuntimeEvent }
-  | { kind: 'stream_marker'; st: TailFoldStreamState; item: TailFoldItem; event: DurableRuntimeEvent }
-  | { kind: 'owner_marker'; st: TailFoldStreamState; item: TailFoldItem; event: DurableRuntimeEvent }
+  | {
+      kind: 'stream_marker'
+      st: TailFoldStreamState
+      item: TailFoldItem
+      event: DurableRuntimeEvent
+    }
+  | {
+      kind: 'owner_marker'
+      st: TailFoldStreamState
+      item: TailFoldItem
+      event: DurableRuntimeEvent
+    }
 
 /** F2/F6 — 单个 ownerTurnKey 的跨会话 tail 预算(SessionManager 级,有界 LRU)。多个
  *  delegate 子会话共享同一 parent ownerTurnKey 时**共用**本预算(不再各领 64)。 */
@@ -1977,7 +1997,9 @@ export class SessionManager {
     if (!session) return
     const prev = session.lock
     let release!: () => void
-    session.lock = new Promise<void>((resolve) => { release = resolve })
+    session.lock = new Promise<void>((resolve) => {
+      release = resolve
+    })
     try {
       await prev
       session._platformGoal = structuredClone(goal)
@@ -2026,8 +2048,7 @@ export class SessionManager {
       // null 走 unbind 路径,不该到这里;safety only
       shouldRecycle = binding !== null
     } else if (newSnapshot.status === 'ready') {
-      shouldRecycle =
-        !binding || binding.selectionVersion !== newSnapshot.selectionVersion
+      shouldRecycle = !binding || binding.selectionVersion !== newSnapshot.selectionVersion
     } else {
       // cloning / failed / pending → 让 runner 继续在旧 binding(若有)dir 工作
       shouldRecycle = false
@@ -2132,7 +2153,7 @@ export class SessionManager {
   }
 
   private markPlannedServiceRestart(session: AgentSession): void {
-    session._plannedTeardown = "service_restart"
+    session._plannedTeardown = 'service_restart'
   }
 
   /** Deploy/container recycle/SIGTERM → SERVICE_RESTART. Real crash stays RUNNER_CRASHED.
@@ -2149,10 +2170,10 @@ export class SessionManager {
     session: AgentSession,
     info?: { signal: string | null; crashed?: boolean },
   ): boolean {
-    if (session._plannedTeardown === "service_restart") return true
+    if (session._plannedTeardown === 'service_restart') return true
     if (this.isRuntimeRecycleDraining()) return true
     if (info?.crashed === false) return true
-    return info?.signal === "SIGTERM"
+    return info?.signal === 'SIGTERM'
   }
 
   /**
@@ -2230,7 +2251,9 @@ export class SessionManager {
     // rejects (its catches absorb sink/storage errors into log lines),
     // but this is belt-and-braces — a future call site swapping in a
     // different awaitable shouldn't be able to crash the gateway.
-    const cleanup = (): void => { this._pendingPersistence.delete(p) }
+    const cleanup = (): void => {
+      this._pendingPersistence.delete(p)
+    }
     p.then(cleanup, cleanup)
   }
 
@@ -2301,11 +2324,7 @@ export class SessionManager {
     const next = budget.chain
       .then(task)
       .catch((err) =>
-        log.error(
-          'post-terminal tail owner-chain task failed',
-          { ownerTurnKey },
-          err as Error,
-        ),
+        log.error('post-terminal tail owner-chain task failed', { ownerTurnKey }, err as Error),
       )
     budget.chain = next
     return next
@@ -2406,9 +2425,7 @@ export class SessionManager {
 
     for (const entry of batch) {
       const { st, item } = entry
-      const currentHash = plannedHashes.has(st)
-        ? plannedHashes.get(st)!
-        : st.lastPersistedHash
+      const currentHash = plannedHashes.has(st) ? plannedHashes.get(st)! : st.lastPersistedHash
       if (item.hash === currentHash) {
         metrics.unchangedSuppressed++
         continue
@@ -2711,7 +2728,13 @@ export class SessionManager {
    * sees this external exchange. */
   async recordExternalTurn(
     session: AgentSession,
-    args: { userText: string; assistantText: string; requestId: string; traceId?: string; model?: string },
+    args: {
+      userText: string
+      assistantText: string
+      requestId: string
+      traceId?: string
+      model?: string
+    },
     reservation?: PromptQueueExternalTurnReservation,
   ): Promise<{ turnIndex: number; messageId: string }> {
     // Caller owns session.lock through beginExternalTurn().
@@ -2735,8 +2758,7 @@ export class SessionManager {
         const legacyId = this._resumeMap.get(session.sessionKey)
         turnIndex = await reserveTurnIndex(session.sessionKey, {
           minimumLastTurn: session.turns,
-          legacySessionIds:
-            legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
+          legacySessionIds: legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
         })
         turnKey = deriveLosslessTurnKey({
           sessionId: session.peerId,
@@ -2750,8 +2772,14 @@ export class SessionManager {
       session.currentUserText = args.userText
       session.currentAssistantBuf = args.assistantText
       session.lastUsedAt = Date.now()
-      void indexTurn(session.sessionKey, turnIndex, args.userText, args.assistantText)
-        .catch((err) => log.warn('external turn index failed', { sessionKey: session.sessionKey, turnIndex }, err))
+      void indexTurn(session.sessionKey, turnIndex, args.userText, args.assistantText).catch(
+        (err) =>
+          log.warn(
+            'external turn index failed',
+            { sessionKey: session.sessionKey, turnIndex },
+            err,
+          ),
+      )
       const persistence = persistServerAuthoredTurn({
         sessionKey: session.sessionKey,
         peerId: session.peerId,
@@ -2843,8 +2871,7 @@ export class SessionManager {
     const legacyId = this._resumeMap.get(session.sessionKey)
     const turnIndex = await reserveTurnIndex(session.sessionKey, {
       minimumLastTurn: session.turns,
-      legacySessionIds:
-        legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
+      legacySessionIds: legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
     })
     const turnKey = deriveLosslessTurnKey({
       sessionId: session.peerId,
@@ -2906,7 +2933,9 @@ export class SessionManager {
       this._promptQueueExecutions.add(session)
       this._promptQueueExecutionKeys.add(session.sessionKey)
     }
-    session.lock = new Promise<void>((resolve) => { release = resolve })
+    session.lock = new Promise<void>((resolve) => {
+      release = resolve
+    })
     const controller = new AbortController()
     try {
       await prev
@@ -2994,15 +3023,29 @@ export class SessionManager {
     provider: string,
     head: string | undefined,
     workspacePath?: string,
+    opts?: {
+      /** Id the engine just rejected at runtime — never re-pick it even if its
+       *  artifact looks present (non-empty file ≠ resumable conversation). */
+      exclude?: string
+      /** Default true: steer the live adapter via setResumeSessionId. Pass
+       *  false when the caller IS the engine (codex resolveResumeFallback runs
+       *  inside the kernel's own attach path and sets threadId itself). */
+      syncRunner?: boolean
+    },
   ): string | undefined {
-    const history = this._resumeMapHistory.get(sessionKey) ?? []
-    const picked = pickResumableId(provider, head, history, { workspacePath })
+    const exclude = opts?.exclude
+    const history = (this._resumeMapHistory.get(sessionKey) ?? []).filter(
+      (h) => h !== exclude && h !== head,
+    )
+    const picked = pickResumableId(provider, head && head !== exclude ? head : undefined, history, {
+      workspacePath,
+    })
     if (!picked) return undefined
     if (picked.fromHistory) {
       log.warn('resume-map head has no durable transcript — promoting prior id from history', {
         sessionKey,
         provider,
-        staleId: head ?? null,
+        staleId: head ?? exclude ?? null,
         promotedId: picked.id,
         artifact: picked.probe.path,
       })
@@ -3011,7 +3054,17 @@ export class SessionManager {
       // history keeps only ids older than the promoted one.
       const idx = history.indexOf(picked.id)
       this._resumeMap.set(sessionKey, picked.id)
+      this._resumeMapProvider.set(sessionKey, provider)
       this._resumeMapHistory.set(sessionKey, history.slice(idx + 1))
+      // Sync the live session BEFORE saving: _saveResumeMap overlays live
+      // sessions onto the map, so an unsynced session.ccbSessionId would write
+      // the dead head straight back (review B2). The runner must follow too,
+      // otherwise the next spawn still --resumes the dead id.
+      const live = this.sessions.get(sessionKey)
+      if (live && live.providerTag === provider) {
+        live.ccbSessionId = picked.id
+        if (opts?.syncRunner !== false) live.runner.setResumeSessionId?.(picked.id)
+      }
       this._saveResumeMap()
     }
     return picked.id
@@ -3046,7 +3099,11 @@ export class SessionManager {
    *
    *  Native Cursor keeps its special case: a store.db missing at *this* cwd is
    *  first a hash-relocation problem, not staleness. */
-  private _resumeIdFor(sessionKey: string, wantProvider: string, workspacePath?: string): string | undefined {
+  private _resumeIdFor(
+    sessionKey: string,
+    wantProvider: string,
+    workspacePath?: string,
+  ): string | undefined {
     const id = this._resumeMap.get(sessionKey)
     if (!id) return undefined
     const tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
@@ -3099,10 +3156,13 @@ export class SessionManager {
       }
       const promoted = this._resolveDurableResumeId(sessionKey, tag, undefined, workspacePath)
       if (promoted) return promoted
-      log.warn('resume-map Cursor store not at this workspace — keeping map, skipping this lookup', {
-        sessionKey,
-        resumeId: id,
-      })
+      log.warn(
+        'resume-map Cursor store not at this workspace — keeping map, skipping this lookup',
+        {
+          sessionKey,
+          resumeId: id,
+        },
+      )
       return undefined
     }
 
@@ -3122,14 +3182,23 @@ export class SessionManager {
   /** Same cwd projection CursorAdapter.spawnTurn uses: repo workspace when
    *  ready, otherwise the agent base dir. Wrapper --workspace is pwd -P of
    *  that cwd, so realpath when the path exists. */
-  private _cursorWorkspacePath(agentBaseDir: string, repoSessionId?: string, projectBound?: boolean): string {
-    const snap = repoSessionId && this._getRepoSnapshot ? this._getRepoSnapshot(repoSessionId) : null
+  private _cursorWorkspacePath(
+    agentBaseDir: string,
+    repoSessionId?: string,
+    projectBound?: boolean,
+  ): string {
+    const snap =
+      repoSessionId && this._getRepoSnapshot ? this._getRepoSnapshot(repoSessionId) : null
     const cwd = decideEngineCwd({
       agentBaseDir,
       repoSnapshot: snap,
       projectBound,
     }).cwd
-    try { return realpathSync(cwd) } catch { return cwd }
+    try {
+      return realpathSync(cwd)
+    } catch {
+      return cwd
+    }
   }
 
   private _cursorWorkspacePathForSession(session: AgentSession): string | undefined {
@@ -3256,7 +3325,10 @@ export class SessionManager {
             const history = (val as any).history
             if (Array.isArray(history)) {
               const cleaned = history
-                .filter((h): h is string => typeof h === 'string' && h.length > 0 && h !== (val as any).id)
+                .filter(
+                  (h): h is string =>
+                    typeof h === 'string' && h.length > 0 && h !== (val as any).id,
+                )
                 .slice(0, RESUME_HISTORY_MAX)
               if (cleaned.length > 0) this._resumeMapHistory.set(key, cleaned)
             }
@@ -3317,10 +3389,9 @@ export class SessionManager {
           entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
         }
         if (prov && prov !== SessionManager.CCB_PROVIDER_TAG) entry.provider = prov
-        // Live session overrides a loaded head that differs: remember the
-        // loaded head on the ladder so a dead live id can still fall back.
-        const loadedHead = this._resumeMap.get(key)
-        if (loadedHead && loadedHead !== sess.ccbSessionId) this._pushResumeHistory(key, loadedHead)
+        // Live session is authoritative for head. History is only ever fed by
+        // the session_id handler (previous durable id) — never re-derived here,
+        // so a promotion can't be undone by the serializer (review B2).
         const hist = this._resumeMapHistory.get(key)?.filter((h) => h !== sess.ccbSessionId)
         if (hist && hist.length > 0) entry.history = hist.slice(0, RESUME_HISTORY_MAX)
         obj[key] = entry
@@ -3377,9 +3448,7 @@ export class SessionManager {
       (existing?._activeTurnCount ?? 0) > 0 ||
       (existing?._activeClientTurnCount ?? 0) > 0
     ) {
-      throw new Error(
-        'PROMPT_QUEUE_EXECUTION_INVARIANT: logical session already owns runtime work',
-      )
+      throw new Error('PROMPT_QUEUE_EXECUTION_INVARIANT: logical session already owns runtime work')
     }
     const token = Symbol(`prompt-queue:${sessionKey}`)
     this._promptQueueDispatchFences.set(sessionKey, token)
@@ -3401,9 +3470,11 @@ export class SessionManager {
     sessionKey: string,
     fence: PromptQueueExecutionFence | undefined,
   ): boolean {
-    return fence !== undefined &&
+    return (
+      fence !== undefined &&
       fence.sessionKey === sessionKey &&
       this._promptQueueDispatchFences.get(sessionKey) === fence.token
+    )
   }
 
   async getOrCreate(opts: {
@@ -3528,7 +3599,10 @@ export class SessionManager {
     const held = new Promise<void>((resolve) => {
       release = resolve
     })
-    const tail = previous.then(() => held, () => held)
+    const tail = previous.then(
+      () => held,
+      () => held,
+    )
     this._sessionCreateGates.set(sessionKey, tail)
     try {
       await previous
@@ -3552,9 +3626,7 @@ export class SessionManager {
       (opts.promptQueueExecutionFence && !ownsDispatchFence) ||
       (this._promptQueueDispatchFences.has(opts.sessionKey) && !ownsDispatchFence)
     ) {
-      throw new Error(
-        'PROMPT_QUEUE_EXECUTION_INVARIANT: queue preflight owns this logical session',
-      )
+      throw new Error('PROMPT_QUEUE_EXECUTION_INVARIANT: queue preflight owns this logical session')
     }
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)
     const initialEffort: string | undefined =
@@ -3629,12 +3701,12 @@ export class SessionManager {
       const workspaceCwdChanged =
         opts.workspaceCwd !== undefined && existing.workspaceCwd !== opts.workspaceCwd
       const nextProjectId =
-        opts.projectId === undefined ? existing.projectId ?? null : opts.projectId
+        opts.projectId === undefined ? (existing.projectId ?? null) : opts.projectId
       const projectIdChanged =
         opts.projectId !== undefined && (existing.projectId ?? null) !== (opts.projectId ?? null)
       const cursorTransportChanged = Boolean(
-        (opts.model !== undefined || opts.executionAuthority !== undefined)
-        && existing.runner.requiresReopenForModel?.(executionModel),
+        (opts.model !== undefined || opts.executionAuthority !== undefined) &&
+          existing.runner.requiresReopenForModel?.(executionModel),
       )
       const nextFingerprint =
         opts.contextFingerprint ??
@@ -3681,18 +3753,20 @@ export class SessionManager {
             const stillNeedsReplace =
               canonical.providerTag !== desiredEngineNow ||
               Boolean(
-                (opts.model !== undefined || opts.executionAuthority !== undefined)
-                && canonical.runner.requiresReopenForModel?.(executionModel),
+                (opts.model !== undefined || opts.executionAuthority !== undefined) &&
+                  canonical.runner.requiresReopenForModel?.(executionModel),
               ) ||
               (opts.workspaceMode !== undefined && canonical.workspaceMode !== workspaceMode) ||
               (opts.workspaceCwd !== undefined && canonical.workspaceCwd !== opts.workspaceCwd) ||
-              (opts.projectId !== undefined && (canonical.projectId ?? null) !== (opts.projectId ?? null))
+              (opts.projectId !== undefined &&
+                (canonical.projectId ?? null) !== (opts.projectId ?? null))
             if (!stillNeedsReplace) {
               canonical.lastUsedAt = Date.now()
               if (opts.title && (!canonical.title || canonical.title === 'New conversation'))
                 canonical.title = opts.title
               if (opts.userId && !canonical.userId) canonical.userId = opts.userId
-              if (opts.repoSessionId && !canonical.repoSessionId) canonical.repoSessionId = opts.repoSessionId
+              if (opts.repoSessionId && !canonical.repoSessionId)
+                canonical.repoSessionId = opts.repoSessionId
               if (opts.parentSessionKey && !canonical.parentSessionKey)
                 canonical.parentSessionKey = opts.parentSessionKey
               if (opts.projectId !== undefined) canonical.projectId = opts.projectId
@@ -3714,8 +3788,7 @@ export class SessionManager {
             // Durable reservations are the authority for attempted real turns;
             // FTS/meta inside the helper cover pre-reservation legacy history.
             const hadPriorProviderState =
-              existing.turns > 0 ||
-              await hasPersistedTurnActivity(ids)
+              existing.turns > 0 || (await hasPersistedTurnActivity(ids))
             // Browser creation persists the UI-default engine before the first
             // real turn. Switching that untouched prewarm to Cursor is not a
             // provider-context rebuild and must not create a notice. The durable
@@ -3727,18 +3800,26 @@ export class SessionManager {
             // Failure to prove freshness must preserve the exceptional notice.
             // Suppressing a real provider switch is worse than a best-effort
             // notice; runner replacement itself must still continue.
-            log.warn('session-replacement prior-turn read failed; preserving rebuild notice', {
-              sessionKey: opts.sessionKey,
-              replacementNotice,
-            }, historyErr)
+            log.warn(
+              'session-replacement prior-turn read failed; preserving rebuild notice',
+              {
+                sessionKey: opts.sessionKey,
+                replacementNotice,
+              },
+              historyErr,
+            )
           }
           await existing.runner.shutdown()
         } catch (err) {
-          log.warn('session-replacement shutdown failed', {
-            sessionKey: opts.sessionKey,
-            engineChanged: existing.providerTag !== desiredEngine,
-            workspaceModeChanged,
-          }, err)
+          log.warn(
+            'session-replacement shutdown failed',
+            {
+              sessionKey: opts.sessionKey,
+              engineChanged: existing.providerTag !== desiredEngine,
+              workspaceModeChanged,
+            },
+            err,
+          )
         }
         if (this.sessions.get(opts.sessionKey) === existing) {
           this.sessions.delete(opts.sessionKey)
@@ -3752,7 +3833,8 @@ export class SessionManager {
         // Never *overwrite* an already-set userId — doing so would enable a
         // different authenticated user to redirect another user's persistence.
         if (opts.userId && !existing.userId) existing.userId = opts.userId
-        if (opts.repoSessionId && !existing.repoSessionId) existing.repoSessionId = opts.repoSessionId
+        if (opts.repoSessionId && !existing.repoSessionId)
+          existing.repoSessionId = opts.repoSessionId
         if (opts.parentSessionKey && !existing.parentSessionKey)
           existing.parentSessionKey = opts.parentSessionKey
         if (opts.projectId !== undefined) existing.projectId = opts.projectId
@@ -3765,17 +3847,20 @@ export class SessionManager {
     // 仅在没有显式 cwd 时用 OPENCLAUDE_DEFAULT_WORKSPACE(存在且是目录)/否则 process.cwd()。
     const repoSessionId = opts.repoSessionId ?? opts.peerId
     const cwd =
-      opts.workspaceCwd ?? opts.agent.cwd ?? resolveDefaultWorkspaceCwd(workspaceMode, repoSessionId)
+      opts.workspaceCwd ??
+      opts.agent.cwd ??
+      resolveDefaultWorkspaceCwd(workspaceMode, repoSessionId)
     const persona = opts.hermeticNoTools
       ? undefined
-      : opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
+      : (opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id))
     // M0/M1a engine 适配层:runner 构造收口到 registry factory。
     //   - executionModel / engineId 已在函数头部一次收口(见上方注释)——
     //     teardown 判定与构造用同一份解析结果,不会出现"比较用 A、spawn 用 B"。
     //   - createEngine 对未注册 engine fail-closed 抛错(原 v5 channel 硬闸的
     //     语义升级形态:任何 channel 都不会把未注册 engine 静默落到 CCB)。
-    const hadSameProviderResume = Boolean(this._resumeMap.get(opts.sessionKey))
-      && SessionManager.normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === engineId
+    const hadSameProviderResume =
+      Boolean(this._resumeMap.get(opts.sessionKey)) &&
+      SessionManager.normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === engineId
     const mappedResumeId = opts.hermeticNoTools
       ? undefined
       : this._resumeIdFor(
@@ -3807,6 +3892,7 @@ export class SessionManager {
           engineId,
           undefined,
           this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
+          { exclude: staleId, syncRunner: false },
         )
         return promoted && promoted !== staleId ? promoted : undefined
       },
@@ -3828,13 +3914,11 @@ export class SessionManager {
       hermeticNoTools: opts.hermeticNoTools,
       structuredOutputSchema: opts.structuredOutputSchema,
     })
-    const resumeTransportMismatch = !opts.hermeticNoTools && hadSameProviderResume && (
-      !mappedResumeId
-      || Boolean(
-        runner.isResumeIdCompatible
-        && !runner.isResumeIdCompatible(mappedResumeId),
-      )
-    )
+    const resumeTransportMismatch =
+      !opts.hermeticNoTools &&
+      hadSameProviderResume &&
+      (!mappedResumeId ||
+        Boolean(runner.isResumeIdCompatible && !runner.isResumeIdCompatible(mappedResumeId)))
     if (resumeTransportMismatch) contextRebuildNotice = 'native-resume-loss'
     const now = Date.now()
     const session: AgentSession = {
@@ -3857,9 +3941,7 @@ export class SessionManager {
       // 可向上追溯 webchat 祖先;不影响 _sessionIdToKey / peerId 身份。
       parentSessionKey: opts.parentSessionKey,
       _billingParentTurnKey: opts.usageAttribution?.parentTurnKey,
-      _usageAttribution: opts.usageAttribution
-        ? { ...opts.usageAttribution }
-        : undefined,
+      _usageAttribution: opts.usageAttribution ? { ...opts.usageAttribution } : undefined,
       startedAt: now,
       runner,
       ccbSessionId: null,
@@ -3900,21 +3982,27 @@ export class SessionManager {
       _contextRebuildNotice: contextRebuildNotice,
       _forceHistoricalContextOnFirstTurn: resumeTransportMismatch || undefined,
     }
-    runner.on('task_notification', (payload: {
-      taskId: string
-      status: string
-      outputFile: string
-      summary: string
-      toolUseId?: string
-    }) => {
-      this.onCcbTaskNotification?.(session, payload)
-    })
-    runner.on('task_notification_delivered', (payload: {
-      taskId: string
-      deliveredBy: 'ccb-mid-turn'
-    }) => {
-      this.onCcbTaskNotificationDelivered?.(session, payload)
-    })
+    runner.on(
+      'task_notification',
+      (payload: {
+        taskId: string
+        status: string
+        outputFile: string
+        summary: string
+        toolUseId?: string
+      }) => {
+        this.onCcbTaskNotification?.(session, payload)
+      },
+    )
+    runner.on(
+      'task_notification_delivered',
+      (payload: {
+        taskId: string
+        deliveredBy: 'ccb-mid-turn'
+      }) => {
+        this.onCcbTaskNotificationDelivered?.(session, payload)
+      },
+    )
     runner.on('session_id', (id: string) => {
       // Durable-artifact ladder: when the engine mints a NEW id for this
       // session (fresh spawn after the previous id failed to resume, codex
@@ -3922,10 +4010,21 @@ export class SessionManager {
       // same-provider id so a rebuild that leaves the new id transcript-less
       // can still resume the older one instead of replaying history.
       const prevId = session.ccbSessionId ?? this._resumeMap.get(opts.sessionKey)
-      const prevProv = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey))
+      const prevProv = SessionManager.normalizeEngineTag(
+        this._resumeMapProvider.get(opts.sessionKey),
+      )
       if (prevId && prevId !== id) {
-        if (prevProv === engineId) this._pushResumeHistory(opts.sessionKey, prevId)
-        else this._resumeMapHistory.delete(opts.sessionKey)
+        if (prevProv !== engineId) {
+          this._resumeMapHistory.delete(opts.sessionKey)
+        } else if (
+          probeResumeArtifact(engineId, prevId, {
+            workspacePath: this._cursorWorkspacePathForSession(session),
+          }).exists
+        ) {
+          // Only durable ids earn a ladder slot; a head that never landed on
+          // disk (the incident shape) has nothing to fall back to.
+          this._pushResumeHistory(opts.sessionKey, prevId)
+        }
       }
       session.ccbSessionId = id
       // Remember which provider produced this id — the next getOrCreate on
@@ -3977,7 +4076,11 @@ export class SessionManager {
       // 误推 compacting 给重连客户端。
       session.currentTurnStatus = null
       if (info.crashed) {
-        log.warn('subprocess crashed', { sessionKey: opts.sessionKey, code: info.code, signal: info.signal })
+        log.warn('subprocess crashed', {
+          sessionKey: opts.sessionKey,
+          code: info.code,
+          signal: info.signal,
+        })
         // If the most recent turn failed because the --resume session id on
         // disk is stale (CCB: "No conversation found with session ID: ..."),
         // evict the entry so the next submit() starts a fresh CCB session.
@@ -3988,17 +4091,18 @@ export class SessionManager {
           const staleId = session.ccbSessionId ?? this._resumeMap.get(opts.sessionKey)
           // Durable-artifact ladder first: the engine just told us the head id
           // is gone; a prior same-provider id may still have its transcript.
-          const promoted = this._resolveDurableResumeId(
-            opts.sessionKey,
-            engineId,
-            undefined,
-            this._cursorWorkspacePathForSession(session),
-          )
-          if (promoted && promoted !== staleId && session.runner.setResumeSessionId) {
-            session.ccbSessionId = promoted
-            session.runner.setResumeSessionId(promoted)
-            this._resumeMapProvider.set(opts.sessionKey, engineId)
-            this._saveResumeMap()
+          const promoted = session.runner.setResumeSessionId
+            ? this._resolveDurableResumeId(
+                opts.sessionKey,
+                engineId,
+                undefined,
+                this._cursorWorkspacePathForSession(session),
+                { exclude: staleId ?? undefined },
+              )
+            : undefined
+          if (promoted && promoted !== staleId) {
+            // _resolveDurableResumeId already synced session.ccbSessionId,
+            // runner.setResumeSessionId and persisted the map.
           } else {
             this._forgetResumeEntry(opts.sessionKey)
             session.ccbSessionId = null
@@ -4015,11 +4119,14 @@ export class SessionManager {
           this._saveResumeMap()
         }
         // Notify via eventBus so gateway can push a reconnect hint to the client
-        eventBus.emit('session.crashed', createEvent('session.crashed', session.agentId, {
-          sessionKey: opts.sessionKey,
-          peerId: session.peerId,
-          ccbSessionId: session.ccbSessionId,
-        }))
+        eventBus.emit(
+          'session.crashed',
+          createEvent('session.crashed', session.agentId, {
+            sessionKey: opts.sessionKey,
+            peerId: session.peerId,
+            ccbSessionId: session.ccbSessionId,
+          }),
+        )
       }
     })
     this.sessions.set(opts.sessionKey, session)
@@ -4076,13 +4183,19 @@ export class SessionManager {
           undefined,
           { modelSwitchInternal: switchId },
         )
-        artifact = session.providerTag === 'grok'
-          ? await session.runner.readCompactionHandoffSince?.(compactStartedAt)
-          : session._lastNativeCompactionSummary
-            ? { summaryText: session._lastNativeCompactionSummary, source: 'ccb' as const, compactStartedAt }
-            : undefined
+        artifact =
+          session.providerTag === 'grok'
+            ? await session.runner.readCompactionHandoffSince?.(compactStartedAt)
+            : session._lastNativeCompactionSummary
+              ? {
+                  summaryText: session._lastNativeCompactionSummary,
+                  source: 'ccb' as const,
+                  compactStartedAt,
+                }
+              : undefined
       }
-      if (!artifact?.summaryText?.trim()) throw new Error('MODEL_SWITCH_NATIVE_COMPACTION_UNAVAILABLE')
+      if (!artifact?.summaryText?.trim())
+        throw new Error('MODEL_SWITCH_NATIVE_COMPACTION_UNAVAILABLE')
       if (artifact.summaryText.length > NATIVE_MODEL_HANDOFF_MAX_CHARS) {
         throw new Error('MODEL_SWITCH_NATIVE_COMPACTION_TOO_LARGE')
       }
@@ -4173,9 +4286,13 @@ export class SessionManager {
           try {
             await session.runner.shutdown()
           } catch (shutdownErr) {
-            log.warn('engine_preheat shutdown after deadline failed', {
-              sessionKey: session.sessionKey,
-            }, shutdownErr)
+            log.warn(
+              'engine_preheat shutdown after deadline failed',
+              {
+                sessionKey: session.sessionKey,
+              },
+              shutdownErr,
+            )
           }
           return 'failed'
         }
@@ -4402,8 +4519,7 @@ export class SessionManager {
     }
 
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
-    const desiredEffort: string | undefined =
-      effortLevel === null ? undefined : effortLevel
+    const desiredEffort: string | undefined = effortLevel === null ? undefined : effortLevel
     const callerSpecifiedEffort = effortLevel !== undefined
     const desiredModel: string | undefined = model
     const callerSpecifiedModel = model !== undefined
@@ -4512,8 +4628,7 @@ export class SessionManager {
       //   - 本 turn 之后:env / cli args 已被 CCB 启动时读完,改也无效
       // 同时受 lock chain 保护,后到的 submit 想 set 别的 effort/model 也得排在我们后面。
       // 把 effort/model 的 needsRestart 信号合并 → 一次 shutdown(下次 submit 自动 spawn 用新 effort+model)。
-      const effortChanged =
-        callerSpecifiedEffort && session.runner.effortLevel !== desiredEffort
+      const effortChanged = callerSpecifiedEffort && session.runner.effortLevel !== desiredEffort
       const modelChanged = callerSpecifiedModel && session.runner.model !== desiredModel
       const runnerToolsets = (session.runner as any).toolsets
       const maybeSetToolsets = (session.runner as any).setToolsets
@@ -4618,8 +4733,7 @@ export class SessionManager {
       }
       let runnerPayload = userTextOrBlocks
       const skipPromptRewrite =
-        opts?.modelSwitchInternal !== undefined ||
-        isCcbSlashCommandPrompt(runnerPayload)
+        opts?.modelSwitchInternal !== undefined || isCcbSlashCommandPrompt(runnerPayload)
       try {
         if (!skipPromptRewrite) {
           const efficiencyNote = await prepareEfficiencyTurnNote(
@@ -4631,7 +4745,10 @@ export class SessionManager {
           }
         }
       } catch (err) {
-        log.debug('efficiency guard prepare failed', { sessionKey: session.sessionKey, err: String(err) })
+        log.debug('efficiency guard prepare failed', {
+          sessionKey: session.sessionKey,
+          err: String(err),
+        })
       }
       const masterHistoricalMessages = Array.isArray(opts?.historicalMessages)
         ? opts.historicalMessages
@@ -4641,8 +4758,12 @@ export class SessionManager {
         if (!pending?.length) return messages
         const ids = new Set(
           messages
-            .filter((raw): raw is { id: string } =>
-              !!raw && typeof raw === 'object' && typeof (raw as { id?: unknown }).id === 'string')
+            .filter(
+              (raw): raw is { id: string } =>
+                !!raw &&
+                typeof raw === 'object' &&
+                typeof (raw as { id?: unknown }).id === 'string',
+            )
             .map((raw) => raw.id),
         )
         const remaining: PendingExternalExchange[] = []
@@ -4653,8 +4774,10 @@ export class SessionManager {
           const hasEquivalentUser = merged.some((raw) => {
             if (!raw || typeof raw !== 'object') return false
             const msg = raw as ChatHistoryMessage
-            return msg.role === 'user'
-              && normForCompare(extractHistoryText(msg)) === normForCompare(exchange.user.text)
+            return (
+              msg.role === 'user' &&
+              normForCompare(extractHistoryText(msg)) === normForCompare(exchange.user.text)
+            )
           })
           if (!hasEquivalentUser && !ids.has(exchange.user.id)) merged.push(exchange.user)
           merged.push(exchange.assistant)
@@ -4666,25 +4789,25 @@ export class SessionManager {
       const effectiveMasterHistoricalMessages = masterHistoricalMessages
         ? mergePendingExternalHistory(masterHistoricalMessages)
         : null
-      const contextOverflowHistoryChars = effectiveMasterHistoricalMessages?.reduce<number>(
-        (total, raw) => {
+      const contextOverflowHistoryChars =
+        effectiveMasterHistoricalMessages?.reduce<number>((total, raw) => {
           if (!raw || typeof raw !== 'object') return total
           const msg = raw as ChatHistoryMessage
           if (msg.system === true || !modelHistorySemanticRole(msg)) return total
           return total + modelHistorySemanticText(msg).length
-        },
-        0,
-      ) ?? 0
+        }, 0) ?? 0
       const contextOverflowRetryInputs =
         effectiveMasterHistoricalMessages &&
         typeof userTextOrBlocks === 'string' &&
         contextOverflowHistoryChars > 0
           ? [4, 16, 64]
-              .map((divisor) => buildHistoricalContextPrompt(
-                effectiveMasterHistoricalMessages,
-                userTextOrBlocks,
-                Math.max(1, Math.ceil(contextOverflowHistoryChars / divisor)),
-              ))
+              .map((divisor) =>
+                buildHistoricalContextPrompt(
+                  effectiveMasterHistoricalMessages,
+                  userTextOrBlocks,
+                  Math.max(1, Math.ceil(contextOverflowHistoryChars / divisor)),
+                ),
+              )
               .filter((prompt): prompt is string => prompt !== null)
           : []
       if (opts?.resetNativeSession === true && session.providerTag === 'grok') {
@@ -4707,33 +4830,35 @@ export class SessionManager {
       }
       const spawnCwd = this._cursorWorkspacePathForSession(session)
       const liveNativeId = session.runner.nativeSessionId
-      const liveSandJsonlId = session.providerTag === 'cursor'
-        ? cursorSandResumeInnerId(liveNativeId)
-          ?? cursorSandOfficialCcResumeInnerId(liveNativeId)
-        : undefined
-      const usableCursorId = session.providerTag === 'cursor'
-        ? liveSandJsonlId && this._ccbJsonlExists(liveSandJsonlId)
-          ? liveNativeId ?? undefined
-          : usableCursorResumeId({
-              workspacePath: spawnCwd,
-              liveId: liveNativeId,
-              mappedId: this._resumeMap.get(session.sessionKey),
-            })
-        : undefined
-      let providerResumeId = usableCursorId ?? this._resumeIdFor(
-        session.sessionKey,
-        session.providerTag,
-        spawnCwd,
-      )
+      const liveSandJsonlId =
+        session.providerTag === 'cursor'
+          ? (cursorSandResumeInnerId(liveNativeId) ??
+            cursorSandOfficialCcResumeInnerId(liveNativeId))
+          : undefined
+      const usableCursorId =
+        session.providerTag === 'cursor'
+          ? liveSandJsonlId && this._ccbJsonlExists(liveSandJsonlId)
+            ? (liveNativeId ?? undefined)
+            : usableCursorResumeId({
+                workspacePath: spawnCwd,
+                liveId: liveNativeId,
+                mappedId: this._resumeMap.get(session.sessionKey),
+              })
+          : undefined
+      let providerResumeId =
+        usableCursorId ?? this._resumeIdFor(session.sessionKey, session.providerTag, spawnCwd)
       if (
-        providerResumeId
-        && session.runner.isResumeIdCompatible
-        && !session.runner.isResumeIdCompatible(providerResumeId)
+        providerResumeId &&
+        session.runner.isResumeIdCompatible &&
+        !session.runner.isResumeIdCompatible(providerResumeId)
       ) {
-        log.info('native resume belongs to a different engine transport — rebuilding bounded history', {
-          sessionKey: session.sessionKey,
-          provider: session.providerTag,
-        })
+        log.info(
+          'native resume belongs to a different engine transport — rebuilding bounded history',
+          {
+            sessionKey: session.sessionKey,
+            provider: session.providerTag,
+          },
+        )
         session._forceHistoricalContextOnFirstTurn = true
         session._contextRebuildNotice ??= 'native-resume-loss'
         providerResumeId = undefined
@@ -4779,20 +4904,16 @@ export class SessionManager {
         if (!historyForMedia) {
           try {
             historyForMedia = mergePendingExternalHistory(
-              (await getEngineContextMessages(
-                session.peerId,
-                session.userId ?? 'default',
-                {
-                  contextWindow:
-                    opts?.modelAuthority?.executionDescriptor.contextWindow ??
-                    (session.providerTag === 'codex' ? null : undefined),
-                  engine: session.providerTag,
-                  currentUserText: typeof userTextOrBlocks === 'string' ? userTextOrBlocks : '',
-                  ...(opts?.replayLifecycle?.clientMessageId
-                    ? { excludeClientMessageId: opts.replayLifecycle.clientMessageId }
-                    : {}),
-                },
-              )) ?? [],
+              (await getEngineContextMessages(session.peerId, session.userId ?? 'default', {
+                contextWindow:
+                  opts?.modelAuthority?.executionDescriptor.contextWindow ??
+                  (session.providerTag === 'codex' ? null : undefined),
+                engine: session.providerTag,
+                currentUserText: typeof userTextOrBlocks === 'string' ? userTextOrBlocks : '',
+                ...(opts?.replayLifecycle?.clientMessageId
+                  ? { excludeClientMessageId: opts.replayLifecycle.clientMessageId }
+                  : {}),
+              })) ?? [],
             )
           } catch {
             historyForMedia = []
@@ -4830,33 +4951,30 @@ export class SessionManager {
           const historyMessages =
             effectiveMasterHistoricalMessages ??
             mergePendingExternalHistory(
-              (await getEngineContextMessages(
-                session.peerId,
-                session.userId ?? 'default',
-                {
-                  contextWindow:
-                    opts?.modelAuthority?.executionDescriptor.contextWindow ??
-                    (session.providerTag === 'codex' ? null : undefined),
-                  engine: session.providerTag,
-                  currentUserText: typeof userTextOrBlocks === 'string' ? userTextOrBlocks : '',
-                  ...(opts?.replayLifecycle?.clientMessageId
-                    ? { excludeClientMessageId: opts.replayLifecycle.clientMessageId }
-                    : {}),
-                },
-              )) ?? [],
+              (await getEngineContextMessages(session.peerId, session.userId ?? 'default', {
+                contextWindow:
+                  opts?.modelAuthority?.executionDescriptor.contextWindow ??
+                  (session.providerTag === 'codex' ? null : undefined),
+                engine: session.providerTag,
+                currentUserText: typeof userTextOrBlocks === 'string' ? userTextOrBlocks : '',
+                ...(opts?.replayLifecycle?.clientMessageId
+                  ? { excludeClientMessageId: opts.replayLifecycle.clientMessageId }
+                  : {}),
+              })) ?? [],
             )
           const hasHistoricalContextRows =
             historyMessages && typeof userTextOrBlocks === 'string'
               ? buildHistoricalContextPrompt(historyMessages, userTextOrBlocks) !== null
               : false
-          const historicalPrompt = historyMessages && typeof userTextOrBlocks === 'string'
-            ? buildHistoricalContextPrompt(
-                historyMessages,
-                userTextOrBlocks,
-                undefined,
-                session.runner.capabilities.maxPromptBytes,
-              )
-            : null
+          const historicalPrompt =
+            historyMessages && typeof userTextOrBlocks === 'string'
+              ? buildHistoricalContextPrompt(
+                  historyMessages,
+                  userTextOrBlocks,
+                  undefined,
+                  session.runner.capabilities.maxPromptBytes,
+                )
+              : null
           if (historicalPrompt) {
             runnerPayload = historicalPrompt
             session._historicalContextInjected = true
@@ -4880,7 +4998,11 @@ export class SessionManager {
               try {
                 opts?.emitContextRebuilt?.({ messageCount: injectedCount })
               } catch (emitErr) {
-                log.warn('emit sys.context_rebuilt failed', { sessionKey: session.sessionKey }, emitErr)
+                log.warn(
+                  'emit sys.context_rebuilt failed',
+                  { sessionKey: session.sessionKey },
+                  emitErr,
+                )
               }
             }
             session._contextRebuildNotice = undefined
@@ -4938,11 +5060,13 @@ export class SessionManager {
             session.runner.pendingToolCalls,
             session.providerTag,
           )
-          if (shouldTripIdleWatchdog({
-            waitingForUserInput: session.runner.waitingForUserInput === true,
-            idleMs,
-            thresholdMs: threshold,
-          })) {
+          if (
+            shouldTripIdleWatchdog({
+              waitingForUserInput: session.runner.waitingForUserInput === true,
+              idleMs,
+              thresholdMs: threshold,
+            })
+          ) {
             const error = new TurnIdleTimeoutError(
               `idle timeout (${Math.round(idleMs / 1000)}s no output)`,
             )
@@ -4968,10 +5092,7 @@ export class SessionManager {
         consumingModelSwitch ? transition : undefined,
       )
       try {
-        await Promise.race([
-          logicalTurnRun,
-          livenessPromise,
-        ])
+        await Promise.race([logicalTurnRun, livenessPromise])
       } finally {
         if (livenessTimer) clearInterval(livenessTimer)
       }
@@ -4979,7 +5100,9 @@ export class SessionManager {
       if (err instanceof TurnIdleTimeoutError || err?.code === 'TURN_IDLE_TIMEOUT') {
         const persistTimedOutTurn = session._persistActiveTurn
         // Actually interrupt the runner so the subprocess stops
-        try { session.runner.interrupt() } catch {}
+        try {
+          session.runner.interrupt()
+        } catch {}
         // Extract idle seconds from the inner error so the user-facing
         // message reflects the actual silence duration (avoids confusing
         // mismatch with the inner 30-min idle timer's fixed wording).
@@ -5009,15 +5132,13 @@ export class SessionManager {
         )
       } else if (err instanceof TurnHardLimitError || err?.code === 'TURN_HARD_LIMIT') {
         const persistLimitedTurn = session._persistActiveTurn
-        try { session.runner.interrupt() } catch {}
-        const reason = '任务已达到 12 小时运行上限，系统已中断。本轮已自动免单，积分将原路退回；请重新发起。'
+        try {
+          session.runner.interrupt()
+        } catch {}
+        const reason =
+          '任务已达到 12 小时运行上限，系统已中断。本轮已自动免单，积分将原路退回；请重新发起。'
         if (persistLimitedTurn) {
-          const persistence = persistLimitedTurn(
-            'interrupted',
-            reason,
-            'TURN_LIMIT',
-            'turn_limit',
-          )
+          const persistence = persistLimitedTurn('interrupted', reason, 'TURN_LIMIT', 'turn_limit')
           this._trackPersistence(persistence)
           await persistence
         } else {
@@ -5045,10 +5166,16 @@ export class SessionManager {
         transition.summaryInjected = false
       }
       await finalizeEfficiencyTurn(session).catch((err) => {
-        log.debug('efficiency guard finalize failed', { sessionKey: session.sessionKey, err: String(err) })
+        log.debug('efficiency guard finalize failed', {
+          sessionKey: session.sessionKey,
+          err: String(err),
+        })
       })
       await memoryTurnPolicyLease?.stop().catch((err) => {
-        log.warn('memory turn policy cleanup failed', { sessionKey: session.sessionKey, err: String(err) })
+        log.warn('memory turn policy cleanup failed', {
+          sessionKey: session.sessionKey,
+          err: String(err),
+        })
       })
       await memoryTurnBarrier?.release().catch(() => {})
       // turn-alive-heartbeat (Plan 1) — turn-level inFlight 真值源 --。
@@ -5063,7 +5190,11 @@ export class SessionManager {
           try {
             opts?.replayLifecycle?.onBeforeRelease(unhandledTurnError)
           } catch (err) {
-            log.warn('active-turn replay before-release hook failed', { sessionKey: session.sessionKey }, err)
+            log.warn(
+              'active-turn replay before-release hook failed',
+              { sessionKey: session.sessionKey },
+              err,
+            )
           }
         }
       } finally {
@@ -5072,7 +5203,11 @@ export class SessionManager {
             try {
               opts?.replayLifecycle?.onEnd()
             } catch (err) {
-              log.warn('active-turn replay end hook failed', { sessionKey: session.sessionKey }, err)
+              log.warn(
+                'active-turn replay end hook failed',
+                { sessionKey: session.sessionKey },
+                err,
+              )
             }
           }
         } finally {
@@ -5177,23 +5312,29 @@ export class SessionManager {
     const legacyId = this._resumeMap.get(session.sessionKey)
     const projectedTurnIndex = await reserveTurnIndex(session.sessionKey, {
       minimumLastTurn: session.turns,
-      legacySessionIds:
-        legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
+      legacySessionIds: legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
     })
-    const memoryObservationText = typeof userTextOrBlocks === 'string'
-      ? userTextOrBlocks
-      : userTextOrBlocks
-          .flatMap((block) => typeof block.text === 'string' ? [block.text] : [])
-          .join('\n')
+    const memoryObservationText =
+      typeof userTextOrBlocks === 'string'
+        ? userTextOrBlocks
+        : userTextOrBlocks
+            .flatMap((block) => (typeof block.text === 'string' ? [block.text] : []))
+            .join('\n')
     await beginMemoryTurnTracking({
       sessionKey: session.sessionKey,
       turnIndex: projectedTurnIndex,
       agentId: session.agentId,
       userText: memoryObservationText,
-    }).catch((err) => log.warn('memory turn observation start failed', {
-      sessionKey: session.sessionKey,
-      turnIndex: projectedTurnIndex,
-    }, err))
+    }).catch((err) =>
+      log.warn(
+        'memory turn observation start failed',
+        {
+          sessionKey: session.sessionKey,
+          turnIndex: projectedTurnIndex,
+        },
+        err,
+      ),
+    )
     // CcbMessageParser increments this reference on a real result. Seed it to
     // the slot immediately before the reservation so the result lands exactly
     // on projectedTurnIndex; partial/crash persistence uses the same slot.
@@ -5389,10 +5530,7 @@ export class SessionManager {
         // user and do not add transient backoff latency.
         if (
           errorClass === 'context_too_long' &&
-          (
-            session.providerTag === 'codex' ||
-            err instanceof SafeCcbContextRebuildRetryError
-          ) &&
+          (session.providerTag === 'codex' || err instanceof SafeCcbContextRebuildRetryError) &&
           canRetry() &&
           contextOverflowRetryIndex < contextOverflowRetryInputs.length
         ) {
@@ -5462,7 +5600,12 @@ export class SessionManager {
     const drained = await Promise.race([
       // A barrier that settles after the deadline must not resurface as an
       // unhandled rejection once we have already moved on.
-      runner.waitForOutputDrain().then(() => true, () => true),
+      runner
+        .waitForOutputDrain()
+        .then(
+          () => true,
+          () => true,
+        ),
       new Promise<boolean>((resolve) => {
         timer = setTimeout(() => resolve(false), timeoutMs)
       }),
@@ -5560,9 +5703,7 @@ export class SessionManager {
       messageIdBase: string | undefined,
     ): SegmentRecord[] =>
       segments.map((segment) => {
-        const targetId = messageIdBase
-          ? `${messageIdBase}-s${segment.index}`
-          : undefined
+        const targetId = messageIdBase ? `${messageIdBase}-s${segment.index}` : undefined
         const call = targetId ? callUsageByTarget.get(targetId) : undefined
         return {
           ...structuredClone(segment),
@@ -5584,12 +5725,9 @@ export class SessionManager {
       event: DurableRuntimeEvent,
       block: OutboundContentBlock,
     ): void => {
-      const ownerTurnKey = session.channel === 'delegate'
-        ? session._billingParentTurnKey
-        : turnKey
-      const ownerSessionId = session.channel === 'delegate'
-        ? session._usageAttribution?.parentSessionId
-        : session.peerId
+      const ownerTurnKey = session.channel === 'delegate' ? session._billingParentTurnKey : turnKey
+      const ownerSessionId =
+        session.channel === 'delegate' ? session._usageAttribution?.parentSessionId : session.peerId
       this._dispatchPostTerminalRuntimeEvent(session, event, block, {
         ownerTurnKey,
         ownerSessionId,
@@ -5616,28 +5754,34 @@ export class SessionManager {
         model?: string
       },
       turnIndex = Math.max(session.turns, prevTurns + 1),
-    ): boolean => turnUsage.record({
-      agentId: session.agentId,
-      sessionKey: session.sessionKey,
-      turnIndex,
-      usage: {
-        inputTokens: usage?.inputTokens ?? 0,
-        outputTokens: usage?.outputTokens ?? 0,
-        cacheReadTokens: usage?.cacheReadTokens ?? 0,
-        cacheCreationTokens: usage?.cacheCreationTokens ?? 0,
-        costUsd: usage?.costUsd ?? 0,
-        model: usage?.model ?? session.model,
-      },
-      toolCalls: turnToolCallCount,
-      durationMs: Date.now() - turnStartTime,
-      terminalStatus,
-      ...(requestId ? { requestId } : {}),
-      ...(session._currentTurnTraceId ? { traceId: session._currentTurnTraceId } : {}),
-    })
+    ): boolean =>
+      turnUsage.record({
+        agentId: session.agentId,
+        sessionKey: session.sessionKey,
+        turnIndex,
+        usage: {
+          inputTokens: usage?.inputTokens ?? 0,
+          outputTokens: usage?.outputTokens ?? 0,
+          cacheReadTokens: usage?.cacheReadTokens ?? 0,
+          cacheCreationTokens: usage?.cacheCreationTokens ?? 0,
+          costUsd: usage?.costUsd ?? 0,
+          model: usage?.model ?? session.model,
+        },
+        toolCalls: turnToolCallCount,
+        durationMs: Date.now() - turnStartTime,
+        terminalStatus,
+        ...(requestId ? { requestId } : {}),
+        ...(session._currentTurnTraceId ? { traceId: session._currentTurnTraceId } : {}),
+      })
 
     await new Promise<void>((resolve, reject) => {
       let settled = false
-      const settle = (fn: () => void) => { if (!settled) { settled = true; fn() } }
+      const settle = (fn: () => void) => {
+        if (!settled) {
+          settled = true
+          fn()
+        }
+      }
       let turn: EngineTurnRun | null = null
       let finalizationDone: Promise<void> | null = null
       let persistTerminalSnapshot:
@@ -5672,26 +5816,19 @@ export class SessionManager {
       // Waiting for the user is not silence: re-arm instead of IDLE_TIMEOUT/waiver.
       // The 12h logical-turn hard limit in submit() is unchanged.
       const IDLE_TIMEOUT_MS = 30 * 60 * 1000 // 30 min of silence from runner
-      const timer = setTimeout(
-        () => {
-          const fire = applyTurnIdleTimeoutTick({
-            waitingForUserInput: runner.waitingForUserInput === true,
-            finalized: turn?.finalized === true,
-            refresh: () => timer.refresh(),
-          })
-          if (!fire) return
-          const reason = '任务 30 分钟没有新输出，已中断。本轮已自动免单，积分将原路退回；请重试。'
-          const persistence = requestTerminalPersistence?.(
-            'interrupted',
-            reason,
-            'IDLE_TIMEOUT',
-            'idle_timeout',
-          )
-            ?? Promise.resolve()
-          this._trackPersistence(persistence)
-        },
-        IDLE_TIMEOUT_MS,
-      )
+      const timer = setTimeout(() => {
+        const fire = applyTurnIdleTimeoutTick({
+          waitingForUserInput: runner.waitingForUserInput === true,
+          finalized: turn?.finalized === true,
+          refresh: () => timer.refresh(),
+        })
+        if (!fire) return
+        const reason = '任务 30 分钟没有新输出，已中断。本轮已自动免单，积分将原路退回；请重试。'
+        const persistence =
+          requestTerminalPersistence?.('interrupted', reason, 'IDLE_TIMEOUT', 'idle_timeout') ??
+          Promise.resolve()
+        this._trackPersistence(persistence)
+      }, IDLE_TIMEOUT_MS)
 
       // Buffer 'final' event — only forward to client after auth check passes
       let pendingFinal: SessionStreamEvent | null = null
@@ -5707,7 +5844,8 @@ export class SessionManager {
           session._durableDelegateEngineBillings?.push(structuredClone(billing))
           onEvent({ kind: 'codex_billing', ...billing })
         }
-        if (terminalExternalBilling) onEvent({ kind: 'external_billing', ...structuredClone(terminalExternalBilling) })
+        if (terminalExternalBilling)
+          onEvent({ kind: 'external_billing', ...structuredClone(terminalExternalBilling) })
       }
       // Engine cold-start visibility (INC-20260824-FIRST-TEXT-LATENCY):
       // while this turn's engine process is spawning/resuming, the browser
@@ -5794,11 +5932,12 @@ export class SessionManager {
           turnToolCallCount++
           if (tool.name === 'Read') {
             const toolInput = tool.input as unknown as Record<string, unknown>
-            const rawPath = typeof toolInput.file_path === 'string'
-              ? toolInput.file_path
-              : typeof toolInput.path === 'string'
-                ? toolInput.path
-                : null
+            const rawPath =
+              typeof toolInput.file_path === 'string'
+                ? toolInput.file_path
+                : typeof toolInput.path === 'string'
+                  ? toolInput.path
+                  : null
             if (rawPath) {
               const memoryRoot = resolvePath(paths.agentMemoryDir(session.agentId))
               const target = resolvePath(rawPath)
@@ -5810,26 +5949,35 @@ export class SessionManager {
           try {
             applyEfficiencyToolObservation(session, tool, turnToolCallCount)
           } catch (err) {
-            log.debug('efficiency guard observe failed', { sessionKey: session.sessionKey, err: String(err) })
+            log.debug('efficiency guard observe failed', {
+              sessionKey: session.sessionKey,
+              err: String(err),
+            })
           }
           // Bridge CCB CronCreate/CronDelete via EventBus
           if (tool.name === 'CronCreate') {
             const gatewayJobId = `ccb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
             if (!session._cronBridgeMap) session._cronBridgeMap = new Map()
             session._cronBridgeMap.set(`_pending:${tool.id}`, gatewayJobId)
-            eventBus.emit('task.created', createEvent('task.created', session.agentId, {
-              taskId: gatewayJobId,
-              schedule: tool.input.cron,
-              prompt: tool.input.prompt,
-              oneshot: tool.input.recurring === false,
-              source: 'cron-bridge',
-            }))
+            eventBus.emit(
+              'task.created',
+              createEvent('task.created', session.agentId, {
+                taskId: gatewayJobId,
+                schedule: tool.input.cron,
+                prompt: tool.input.prompt,
+                oneshot: tool.input.recurring === false,
+                source: 'cron-bridge',
+              }),
+            )
           } else if (tool.name === 'CronDelete') {
             const ccbId = tool.input.id
             const gatewayId = session._cronBridgeMap?.get(ccbId) ?? ccbId
-            eventBus.emit('task.deleted', createEvent('task.deleted', session.agentId, {
-              taskId: gatewayId,
-            }))
+            eventBus.emit(
+              'task.deleted',
+              createEvent('task.deleted', session.agentId, {
+                taskId: gatewayId,
+              }),
+            )
           }
           return
         }
@@ -5864,22 +6012,23 @@ export class SessionManager {
           // turnIndex is 1-indexed to match turn.completed semantics:
           // session.turns is still pre-increment during tool processing
           // (incremented inside parser._handleResult after this path runs).
-          eventBus.emit('tool.called', createEvent('tool.called', session.agentId, {
-            sessionKey: session.sessionKey,
-            turnIndex: session.turns + 1,
-            toolName: tr.toolName,
-            durationMs: tr.durationMs,
-            isError: tr.isError,
-            ...(session._currentTurnTraceId
-              ? { traceId: session._currentTurnTraceId }
-              : {}),
-            inputPreview: tr.inputPreview,
-            outputPreview: tr.preview ? tr.preview.slice(0, 500) : undefined,
-            ...(tr.exitCode !== undefined ? { exitCode: tr.exitCode } : {}),
-            ...(tr.terminationReason !== undefined
-              ? { terminationReason: tr.terminationReason }
-              : {}),
-          }))
+          eventBus.emit(
+            'tool.called',
+            createEvent('tool.called', session.agentId, {
+              sessionKey: session.sessionKey,
+              turnIndex: session.turns + 1,
+              toolName: tr.toolName,
+              durationMs: tr.durationMs,
+              isError: tr.isError,
+              ...(session._currentTurnTraceId ? { traceId: session._currentTurnTraceId } : {}),
+              inputPreview: tr.inputPreview,
+              outputPreview: tr.preview ? tr.preview.slice(0, 500) : undefined,
+              ...(tr.exitCode !== undefined ? { exitCode: tr.exitCode } : {}),
+              ...(tr.terminationReason !== undefined
+                ? { terminationReason: tr.terminationReason }
+                : {}),
+            }),
+          )
           return
         }
         if (e.kind === 'call_usage') {
@@ -5923,7 +6072,9 @@ export class SessionManager {
       // adapter 'activity' = 底座每条原始消息到达。detach 后不再 refresh:旧实现
       // 靠 `!detached` guard(listener 跨 turn 保留),现 listener 在 detach 卸载,
       // guard 留作 belt-and-braces(卸载与 emit 同 tick 竞争时不重臂已清的 timer)。
-      const handleActivity = () => { if (!detached) timer.refresh() }
+      const handleActivity = () => {
+        if (!detached) timer.refresh()
+      }
       // M1a — engine-reported 计费侧信道(codex)。adapter 在 turn 终态 result
       // 帧上 emit 'billing'(先于 parser 产出 'final',顺序与 P1f 前一致);这里
       // 包装成 SessionStreamEvent 'codex_billing' 直通 onEvent → server.ts 发
@@ -6113,9 +6264,7 @@ export class SessionManager {
                 ...(waiveReason ? { waiveReason } : {}),
                 ...(session._currentDispatch ? { dispatch: session._currentDispatch } : {}),
                 text: partialAssistant.text,
-                ...(partialThinking.text.length > 0
-                  ? { thinkingText: partialThinking.text }
-                  : {}),
+                ...(partialThinking.text.length > 0 ? { thinkingText: partialThinking.text } : {}),
                 status,
                 errorCode,
                 errorDetail: reason,
@@ -6178,11 +6327,13 @@ export class SessionManager {
             // 对「子进程异常退出 (code 1)」这类原文正则分类压成 upstream_failed。
             if (persistenceAcknowledged) {
               const wireCode = _wireTerminalCodeForTape(errorCode)
-              onEvent(_asEngineErrorEvent({
-                kind: 'error',
-                error: reason,
-                ...(wireCode ? { errorCode: wireCode } : {}),
-              }))
+              onEvent(
+                _asEngineErrorEvent({
+                  kind: 'error',
+                  error: reason,
+                  ...(wireCode ? { errorCode: wireCode } : {}),
+                }),
+              )
             } else if (persistenceQueuedToOutbox) {
               // E6 — queued 降级终态(语义同 finalizeTurn 主路径):不静默卡住。
               log.warn('partial terminal delivered in degraded persist-queued mode', {
@@ -6190,11 +6341,13 @@ export class SessionManager {
                 errorCode,
                 ...(traceId ? { traceId } : {}),
               })
-              onEvent(_asEngineErrorEvent({
-                kind: 'error',
-                error: reason || SESSION_PERSIST_QUEUED_NOTICE,
-                errorCode: 'session_persist_unavailable',
-              }))
+              onEvent(
+                _asEngineErrorEvent({
+                  kind: 'error',
+                  error: reason || SESSION_PERSIST_QUEUED_NOTICE,
+                  errorCode: 'session_persist_unavailable',
+                }),
+              )
             }
             if (settleAfter) settle(() => resolve())
           }
@@ -6225,7 +6378,9 @@ export class SessionManager {
             }
           }
 
-          try { runner.interrupt() } catch {}
+          try {
+            runner.interrupt()
+          } catch {}
 
           // Give a cooperative interrupt one short window to produce its own
           // usage-bearing terminal result. If it does, normal finalization is
@@ -6234,7 +6389,9 @@ export class SessionManager {
           let summaryFinished = false
           let timerHandle: NodeJS.Timeout | null = null
           await Promise.race([
-            targetTurn.summary.then(() => { summaryFinished = true }),
+            targetTurn.summary.then(() => {
+              summaryFinished = true
+            }),
             new Promise<void>((resolveWait) => {
               timerHandle = setTimeout(resolveWait, this._terminalRequestGraceMs)
             }),
@@ -6288,258 +6445,249 @@ export class SessionManager {
       // 后处理相对底座输出流的顺序与旧同步实现一致(含 crash 路径下
       // _pendingStaleResumeClear 先于 getOrCreate 'exit' handler 可见)。
       const finalizeTurn = async (result: TurnSummary | null): Promise<void> => {
-          if (terminalPersistenceClaim === 'partial') return
-          detach()
-          if (result?.nativeCompactionSummary) {
-            session._lastNativeCompactionSummary = result.nativeCompactionSummary
+        if (terminalPersistenceClaim === 'partial') return
+        detach()
+        if (result?.nativeCompactionSummary) {
+          session._lastNativeCompactionSummary = result.nativeCompactionSummary
+        }
+        if (modelSwitchTransition && session._modelSwitchTransition === modelSwitchTransition) {
+          if (result && !result.isError) session._modelSwitchTransition = undefined
+          else {
+            modelSwitchTransition.state = 'prepared'
+            modelSwitchTransition.summaryInjected = false
           }
-          if (modelSwitchTransition && session._modelSwitchTransition === modelSwitchTransition) {
-            if (result && !result.isError) session._modelSwitchTransition = undefined
-            else {
-              modelSwitchTransition.state = 'prepared'
-              modelSwitchTransition.summaryInjected = false
-            }
-          }
-          let persistenceAcknowledged = true
-          // E6 — 'queued'(queued_to_outbox)三态旁路:本地已可靠排队但权威库未
-          // 确认。不算 acknowledged(paid-turn 完成语义不变),但也不能静默不投递
-          // 终态 —— 那会让用户永远停在「思考中」。
-          let persistenceQueuedToOutbox = false
-          let terminalErrorForClient: string | undefined
-          let terminalErrorCodeForClient: GatewayTerminalErrorCode | undefined
+        }
+        let persistenceAcknowledged = true
+        // E6 — 'queued'(queued_to_outbox)三态旁路:本地已可靠排队但权威库未
+        // 确认。不算 acknowledged(paid-turn 完成语义不变),但也不能静默不投递
+        // 终态 —— 那会让用户永远停在「思考中」。
+        let persistenceQueuedToOutbox = false
+        let terminalErrorForClient: string | undefined
+        let terminalErrorCodeForClient: GatewayTerminalErrorCode | undefined
 
-          // Detect stale --resume session id. CCB emits an error result with
-          // `errors: ["No conversation found with session ID: <id>"]` when
-          // the JSONL file for the requested resume id is missing on disk.
-          // Flag the session so the upcoming runner.exit handler evicts the
-          // entry from resume-map; otherwise every subsequent submit()
-          // re-spawns CCB with the same dead id and loops forever.
-          if (result?.staleResumeId) {
-            log.warn('stale --resume session id detected, will clear resume-map entry', {
-              sessionKey: session.sessionKey,
-              staleId: session.ccbSessionId,
-              ...(traceId ? { traceId } : {}),
-            })
-            session._pendingStaleResumeClear = true
-            session.totalCostUSD = prevCostUSD
-            session.turns = prevTurns
-            session._lastCcbCumulativeCost = prevLastCcbCost
-            await persistTerminalSnapshot?.(
-              'crashed',
-              result.errorDetail ?? 'Previous engine session is no longer available',
-              'STALE_RESUME_ID',
-              false,
-            )
-            settle(() => reject(new Error('STALE_RESUME_ID: Previous session file missing; next submit will start fresh')))
-            return
-          }
+        // Detect stale --resume session id. CCB emits an error result with
+        // `errors: ["No conversation found with session ID: <id>"]` when
+        // the JSONL file for the requested resume id is missing on disk.
+        // Flag the session so the upcoming runner.exit handler evicts the
+        // entry from resume-map; otherwise every subsequent submit()
+        // re-spawns CCB with the same dead id and loops forever.
+        if (result?.staleResumeId) {
+          log.warn('stale --resume session id detected, will clear resume-map entry', {
+            sessionKey: session.sessionKey,
+            staleId: session.ccbSessionId,
+            ...(traceId ? { traceId } : {}),
+          })
+          session._pendingStaleResumeClear = true
+          session.totalCostUSD = prevCostUSD
+          session.turns = prevTurns
+          session._lastCcbCumulativeCost = prevLastCcbCost
+          await persistTerminalSnapshot?.(
+            'crashed',
+            result.errorDetail ?? 'Previous engine session is no longer available',
+            'STALE_RESUME_ID',
+            false,
+          )
+          settle(() =>
+            reject(
+              new Error(
+                'STALE_RESUME_ID: Previous session file missing; next submit will start fresh',
+              ),
+            ),
+          )
+          return
+        }
 
-          const terminalResultErrorClass =
-            result?.errorClass ?? classifyRunError(result?.errorDetail).code
-          if (
-            terminalResultErrorClass === 'context_too_long' &&
-            (session.providerTag === 'ccb' || session.providerTag === 'codex')
-          ) {
-            log.warn('native context window exhausted; clearing resume before context rebuild', {
-              sessionKey: session.sessionKey,
-              provider: session.providerTag,
-              ...(traceId ? { traceId } : {}),
-            })
-            await runner.shutdown()
-            this._resumeMap.delete(session.sessionKey)
-            this._resumeMapTimestamps.delete(session.sessionKey)
-            this._resumeMapProvider.delete(session.sessionKey)
-            this._resumeMapLastCost.delete(session.sessionKey)
-            this._resumeMapCostImprecise.delete(session.sessionKey)
-            this._resumeMapHistory.delete(session.sessionKey)
-            session.ccbSessionId = null
-            runner.clearSessionId?.()
-            this._saveResumeMap()
-            session._historicalContextInjected = false
-            session._historicalContextInjectedKey = undefined
-          }
+        const terminalResultErrorClass =
+          result?.errorClass ?? classifyRunError(result?.errorDetail).code
+        if (
+          terminalResultErrorClass === 'context_too_long' &&
+          (session.providerTag === 'ccb' || session.providerTag === 'codex')
+        ) {
+          log.warn('native context window exhausted; clearing resume before context rebuild', {
+            sessionKey: session.sessionKey,
+            provider: session.providerTag,
+            ...(traceId ? { traceId } : {}),
+          })
+          await runner.shutdown()
+          this._resumeMap.delete(session.sessionKey)
+          this._resumeMapTimestamps.delete(session.sessionKey)
+          this._resumeMapProvider.delete(session.sessionKey)
+          this._resumeMapLastCost.delete(session.sessionKey)
+          this._resumeMapCostImprecise.delete(session.sessionKey)
+          this._resumeMapHistory.delete(session.sessionKey)
+          session.ccbSessionId = null
+          runner.clearSessionId?.()
+          this._saveResumeMap()
+          session._historicalContextInjected = false
+          session._historicalContextInjectedKey = undefined
+        }
 
-          // Detect auth error — roll back counters and reject. 分类逻辑(isError +
-          // 关键字宽匹配 / CCB 精确错误前缀)已下沉 CcbAdapter(底座私有知识),
-          // 本层只消费 errorKind === 'auth'。
-          if (result?.errorKind === 'auth' && retryAuthErrors) {
-            retryRuntimeEvents.push(
-              ...result.runtimeEvents.map((event) => structuredClone(event)),
-            )
-            session.totalCostUSD = prevCostUSD
-            session.turns = prevTurns
-            session._lastCcbCumulativeCost = prevLastCcbCost
-            settle(() => reject(new Error('AUTH_ERROR: Token expired or invalid')))
-            return
-          }
+        // Detect auth error — roll back counters and reject. 分类逻辑(isError +
+        // 关键字宽匹配 / CCB 精确错误前缀)已下沉 CcbAdapter(底座私有知识),
+        // 本层只消费 errorKind === 'auth'。
+        if (result?.errorKind === 'auth' && retryAuthErrors) {
+          retryRuntimeEvents.push(...result.runtimeEvents.map((event) => structuredClone(event)))
+          session.totalCostUSD = prevCostUSD
+          session.turns = prevTurns
+          session._lastCcbCumulativeCost = prevLastCcbCost
+          settle(() => reject(new Error('AUTH_ERROR: Token expired or invalid')))
+          return
+        }
 
-          const transientErrorClass = terminalResultErrorClass
-          const contextOverflowHasUsage =
-            result !== null &&
-            (
-              result.usage.cost !== 0 ||
-              result.usage.inputTokens !== 0 ||
-              result.usage.outputTokens !== 0 ||
-              result.usage.cacheReadTokens !== 0 ||
-              result.usage.cacheCreationTokens !== 0 ||
-              Object.values(terminalEngineBilling?.usage ?? {}).some(
-                (value) => typeof value === 'number' && value !== 0,
-              )
-            )
-          const ccbContextDiagnostic =
-            session.providerTag === 'ccb' &&
-            result !== null &&
-            result.assistantSegments.length === 1 &&
-            (
-              /^API Error:\s*413\b[\s\S]*\bPROMPT_TOO_LONG\b[\s\S]*$/i.test(
-                result.assistantSegments[0]!.text.trim(),
-              ) ||
-              /^Prompt is too long\.?$/i.test(result.assistantSegments[0]!.text.trim())
-            ) &&
-            result.assistantText.trim() === result.assistantSegments[0]!.text.trim()
-          const contextOverflowIsSafeToRetry =
-            result !== null &&
-            transientErrorClass === 'context_too_long' &&
-            (session.providerTag === 'ccb' || session.providerTag === 'codex') &&
-            (session.providerTag === 'codex' || ccbContextDiagnostic) &&
-            turnBlockCount === (ccbContextDiagnostic ? 1 : 0) &&
-            turnPermissionCount === 0 &&
-            turnToolCallCount === 0 &&
-            structuredBlocks.length === 0 &&
-            (result.assistantText.length === 0 || ccbContextDiagnostic) &&
-            result.thinkingText.length === 0 &&
-            (result.assistantSegments.length === 0 || ccbContextDiagnostic) &&
-            result.thinkingSegments.length === 0 &&
-            result.tools.length === 0 &&
-            !contextOverflowHasUsage
-          const transientContinuationIsSafe =
-            turnPermissionCount === 0 &&
-            assessTurnRecoveryTape(
-              freezeTools(result?.tools ?? []).map((tool) => ({
-                role: 'tool',
-                ...tool,
-                // TurnToolEntry omits completed for a matched result; the
-                // durable recovery contract requires an explicit terminal bit.
-                _completed: tool.completed !== false,
-              })),
-            ).checkpointSafe
-          if (
-            result?.isError &&
-            retryTransientErrors &&
-            transientContinuationIsSafe &&
-            (
-              TRANSIENT_RETRY_ERROR_CODES.has(transientErrorClass) ||
-              contextOverflowIsSafeToRetry
-            )
-          ) {
-            retryRuntimeEvents.push(
-              ...result.runtimeEvents.map((event) => structuredClone(event)),
-            )
-            const frozenAttemptAssistantSegments =
-              freezeSegments(result.assistantSegments, assistantMessageId)
-            const attemptAssistantSegments = frozenAttemptAssistantSegments.length > 0
+        const transientErrorClass = terminalResultErrorClass
+        const contextOverflowHasUsage =
+          result !== null &&
+          (result.usage.cost !== 0 ||
+            result.usage.inputTokens !== 0 ||
+            result.usage.outputTokens !== 0 ||
+            result.usage.cacheReadTokens !== 0 ||
+            result.usage.cacheCreationTokens !== 0 ||
+            Object.values(terminalEngineBilling?.usage ?? {}).some(
+              (value) => typeof value === 'number' && value !== 0,
+            ))
+        const ccbContextDiagnostic =
+          session.providerTag === 'ccb' &&
+          result !== null &&
+          result.assistantSegments.length === 1 &&
+          (/^API Error:\s*413\b[\s\S]*\bPROMPT_TOO_LONG\b[\s\S]*$/i.test(
+            result.assistantSegments[0]!.text.trim(),
+          ) ||
+            /^Prompt is too long\.?$/i.test(result.assistantSegments[0]!.text.trim())) &&
+          result.assistantText.trim() === result.assistantSegments[0]!.text.trim()
+        const contextOverflowIsSafeToRetry =
+          result !== null &&
+          transientErrorClass === 'context_too_long' &&
+          (session.providerTag === 'ccb' || session.providerTag === 'codex') &&
+          (session.providerTag === 'codex' || ccbContextDiagnostic) &&
+          turnBlockCount === (ccbContextDiagnostic ? 1 : 0) &&
+          turnPermissionCount === 0 &&
+          turnToolCallCount === 0 &&
+          structuredBlocks.length === 0 &&
+          (result.assistantText.length === 0 || ccbContextDiagnostic) &&
+          result.thinkingText.length === 0 &&
+          (result.assistantSegments.length === 0 || ccbContextDiagnostic) &&
+          result.thinkingSegments.length === 0 &&
+          result.tools.length === 0 &&
+          !contextOverflowHasUsage
+        const transientContinuationIsSafe =
+          turnPermissionCount === 0 &&
+          assessTurnRecoveryTape(
+            freezeTools(result?.tools ?? []).map((tool) => ({
+              role: 'tool',
+              ...tool,
+              // TurnToolEntry omits completed for a matched result; the
+              // durable recovery contract requires an explicit terminal bit.
+              _completed: tool.completed !== false,
+            })),
+          ).checkpointSafe
+        if (
+          result?.isError &&
+          retryTransientErrors &&
+          transientContinuationIsSafe &&
+          (TRANSIENT_RETRY_ERROR_CODES.has(transientErrorClass) || contextOverflowIsSafeToRetry)
+        ) {
+          retryRuntimeEvents.push(...result.runtimeEvents.map((event) => structuredClone(event)))
+          const frozenAttemptAssistantSegments = freezeSegments(
+            result.assistantSegments,
+            assistantMessageId,
+          )
+          const attemptAssistantSegments =
+            frozenAttemptAssistantSegments.length > 0
               ? frozenAttemptAssistantSegments
               : result.assistantText.length > 0
                 ? [{ index: 0, text: result.assistantText, ts: Date.now() }]
                 : []
-            retryAssistantSegments.push(
-              ...attemptAssistantSegments.map((segment, index) => ({
-                ...segment,
-                index: retryAssistantSegments.length + index,
-              })),
-            )
-            const frozenAttemptThinkingSegments =
-              freezeSegments(result.thinkingSegments, thinkingMessageId)
-            const attemptThinkingSegments = frozenAttemptThinkingSegments.length > 0
+          retryAssistantSegments.push(
+            ...attemptAssistantSegments.map((segment, index) => ({
+              ...segment,
+              index: retryAssistantSegments.length + index,
+            })),
+          )
+          const frozenAttemptThinkingSegments = freezeSegments(
+            result.thinkingSegments,
+            thinkingMessageId,
+          )
+          const attemptThinkingSegments =
+            frozenAttemptThinkingSegments.length > 0
               ? frozenAttemptThinkingSegments
               : result.thinkingText.length > 0
                 ? [{ index: 0, text: result.thinkingText, ts: Date.now() }]
                 : []
-            retryThinkingSegments.push(
-              ...attemptThinkingSegments.map((segment, index) => ({
-                ...segment,
-                index: retryThinkingSegments.length + index,
-              })),
-            )
-            retryTools.push(...freezeTools(result.tools))
-            retryStructuredBlocks.push(
-              ...freezeStructuredBlocks(structuredBlocks),
-            )
-            session.totalCostUSD = prevCostUSD
-            session.turns = prevTurns
-            session._lastCcbCumulativeCost = prevLastCcbCost
-            // The failed attempt is free and must not claim the shared
-            // request/turn identity before the terminal attempt.
-            terminalEngineBilling = undefined
-            const retryError = result.errorDetail ??
-              `${transientErrorClass}: transient model failure`
-            settle(() => reject(
+          retryThinkingSegments.push(
+            ...attemptThinkingSegments.map((segment, index) => ({
+              ...segment,
+              index: retryThinkingSegments.length + index,
+            })),
+          )
+          retryTools.push(...freezeTools(result.tools))
+          retryStructuredBlocks.push(...freezeStructuredBlocks(structuredBlocks))
+          session.totalCostUSD = prevCostUSD
+          session.turns = prevTurns
+          session._lastCcbCumulativeCost = prevLastCcbCost
+          // The failed attempt is free and must not claim the shared
+          // request/turn identity before the terminal attempt.
+          terminalEngineBilling = undefined
+          const retryError = result.errorDetail ?? `${transientErrorClass}: transient model failure`
+          settle(() =>
+            reject(
               contextOverflowIsSafeToRetry && session.providerTag === 'ccb'
                 ? new SafeCcbContextRebuildRetryError(retryError)
                 : new Error(retryError),
-            ))
-            return
-          }
+            ),
+          )
+          return
+        }
 
-          const modelAuthorityFailure = result?.errorKind === 'model_authority'
-          const modelAuthorityReason = modelAuthorityFailure
-            ? '任务运行时间较长，平台执行凭证未能继续。本轮已自动免单，积分将原路退回；你可以重新尝试。'
-            : undefined
-          // A generic runner error may be emitted before the remaining stdout
-          // drains into a valid terminal result (pipe/error ordering). Preserve
-          // that diagnostic runtime event, but only a platform-owned waiver or
-          // an engine-confirmed user cancellation may override the summary.
-          // If Stop races a natural end_turn, completion remains authoritative.
-          // CCB confirms its cooperative AbortController path with an
-          // error_during_execution result instead of stopReason='interrupted'.
-          // Streaming-phase aborts carry stop_reason=null; a Stop that lands
-          // while a tool call is executing (query.ts aborted_tools) yields the
-          // "[Request interrupted by user for tool use]" user message and keeps
-          // the last API stop_reason=tool_use. Both are the same user action.
-          const ccbUserCancellationResult =
-            session.providerTag === 'ccb' &&
-            result?.isError === true &&
-            isCcbUserCancellationDiagnostic(result.errorDetail, result.stopReason)
-          const engineUserCancellationResult = result
-            ? session.runner.isUserCancellationResult?.(result) === true
-            : false
-          const userCancellationOverride =
-            requestedTerminal?.status === 'interrupted' &&
-            requestedTerminal.errorCode === 'USER_CANCELLED' &&
-            (
-              result?.stopReason === 'interrupted' ||
-              ccbUserCancellationResult ||
-              engineUserCancellationResult ||
-              (
-                terminalRequestEscalated &&
-                result?.isError === true &&
-                result.stopReason !== 'end_turn' &&
-                terminalEngineBilling?.status === 'error' &&
-                terminalEngineBilling.terminalCode === 'CODEX_ERROR' &&
-                result.errorDetail?.includes(
-                  '"result":"codex app-server exited code=',
-                ) === true
-              )
-            )
-              ? requestedTerminal
-              : null
-          if (
-            userCancellationOverride &&
-            terminalEngineBilling?.status === 'error'
-          ) {
-            // A forced Codex app-server shutdown reports a generic CODEX_ERROR
-            // because the runner cannot know why its process was killed. At
-            // this layer both sides are authoritative: the browser requested
-            // USER_CANCELLED and the engine confirmed an interrupted result.
-            // Keep billing/audit classification aligned with the tape.
-            terminalEngineBilling = {
-              ...terminalEngineBilling,
-              terminalCode: 'USER_CANCELLED',
-            }
+        const modelAuthorityFailure = result?.errorKind === 'model_authority'
+        const modelAuthorityReason = modelAuthorityFailure
+          ? '任务运行时间较长，平台执行凭证未能继续。本轮已自动免单，积分将原路退回；你可以重新尝试。'
+          : undefined
+        // A generic runner error may be emitted before the remaining stdout
+        // drains into a valid terminal result (pipe/error ordering). Preserve
+        // that diagnostic runtime event, but only a platform-owned waiver or
+        // an engine-confirmed user cancellation may override the summary.
+        // If Stop races a natural end_turn, completion remains authoritative.
+        // CCB confirms its cooperative AbortController path with an
+        // error_during_execution result instead of stopReason='interrupted'.
+        // Streaming-phase aborts carry stop_reason=null; a Stop that lands
+        // while a tool call is executing (query.ts aborted_tools) yields the
+        // "[Request interrupted by user for tool use]" user message and keeps
+        // the last API stop_reason=tool_use. Both are the same user action.
+        const ccbUserCancellationResult =
+          session.providerTag === 'ccb' &&
+          result?.isError === true &&
+          isCcbUserCancellationDiagnostic(result.errorDetail, result.stopReason)
+        const engineUserCancellationResult = result
+          ? session.runner.isUserCancellationResult?.(result) === true
+          : false
+        const userCancellationOverride =
+          requestedTerminal?.status === 'interrupted' &&
+          requestedTerminal.errorCode === 'USER_CANCELLED' &&
+          (result?.stopReason === 'interrupted' ||
+            ccbUserCancellationResult ||
+            engineUserCancellationResult ||
+            (terminalRequestEscalated &&
+              result?.isError === true &&
+              result.stopReason !== 'end_turn' &&
+              terminalEngineBilling?.status === 'error' &&
+              terminalEngineBilling.terminalCode === 'CODEX_ERROR' &&
+              result.errorDetail?.includes('"result":"codex app-server exited code=') === true))
+            ? requestedTerminal
+            : null
+        if (userCancellationOverride && terminalEngineBilling?.status === 'error') {
+          // A forced Codex app-server shutdown reports a generic CODEX_ERROR
+          // because the runner cannot know why its process was killed. At
+          // this layer both sides are authoritative: the browser requested
+          // USER_CANCELLED and the engine confirmed an interrupted result.
+          // Keep billing/audit classification aligned with the tape.
+          terminalEngineBilling = {
+            ...terminalEngineBilling,
+            terminalCode: 'USER_CANCELLED',
           }
-          let terminalOverride = (
-            requestedTerminal?.waiveReason ? requestedTerminal : userCancellationOverride
-          ) ?? (modelAuthorityFailure
+        }
+        let terminalOverride =
+          (requestedTerminal?.waiveReason ? requestedTerminal : userCancellationOverride) ??
+          (modelAuthorityFailure
             ? {
                 status: 'crashed' as const,
                 reason: modelAuthorityReason!,
@@ -6547,463 +6695,456 @@ export class SessionManager {
                 waiveReason: 'platform_authority_expired' as const,
               }
             : null)
-          if (terminalOverride) {
-            retainTerminalError(
-              terminalOverride.status,
-              terminalOverride.reason,
-              terminalOverride.errorCode,
-            )
-          }
+        if (terminalOverride) {
+          retainTerminalError(
+            terminalOverride.status,
+            terminalOverride.reason,
+            terminalOverride.errorCode,
+          )
+        }
 
-          // Phantom-turn detection — three-state logic (v3):
-          //   - apiState='skipped'  → CCB explicitly said no API call
-          //                           (slash command path). Normal completion,
-          //                           zero cost is expected, NOT phantom.
-          //   - apiState='called'   → CCB explicitly fired willCallApi.
-          //                           Cannot be phantom. If the result row is
-          //                           missing stop_reason AND no blocks came
-          //                           out, note `incomplete` for diagnostics
-          //                           but don't roll back.
-          //   - apiState='unknown'  → No telemetry arrived (e.g. old CCB,
-          //                           disabled kill switch, emit swallowed an
-          //                           error). Fall back to the legacy 9-AND
-          //                           heuristic so behavior is strictly ≤
-          //                           pre-refactor (R7: never fail closed).
-          // See docs/ccb-telemetry-refactor-plan.md §5.4.
-          const userInputStr =
-            typeof userTextOrBlocks === 'string' ? userTextOrBlocks : null
-          const isStringInput = userInputStr !== null
-          const isSlashCommand =
-            isStringInput && userInputStr!.trimStart().startsWith('/')
+        // Phantom-turn detection — three-state logic (v3):
+        //   - apiState='skipped'  → CCB explicitly said no API call
+        //                           (slash command path). Normal completion,
+        //                           zero cost is expected, NOT phantom.
+        //   - apiState='called'   → CCB explicitly fired willCallApi.
+        //                           Cannot be phantom. If the result row is
+        //                           missing stop_reason AND no blocks came
+        //                           out, note `incomplete` for diagnostics
+        //                           but don't roll back.
+        //   - apiState='unknown'  → No telemetry arrived (e.g. old CCB,
+        //                           disabled kill switch, emit swallowed an
+        //                           error). Fall back to the legacy 9-AND
+        //                           heuristic so behavior is strictly ≤
+        //                           pre-refactor (R7: never fail closed).
+        // See docs/ccb-telemetry-refactor-plan.md §5.4.
+        const userInputStr = typeof userTextOrBlocks === 'string' ? userTextOrBlocks : null
+        const isStringInput = userInputStr !== null
+        const isSlashCommand = isStringInput && userInputStr!.trimStart().startsWith('/')
 
-          // phantom 信号经 turn 句柄读(异常终态 result=null 时仍可读 —— 旧实现
-          // 在 onFinish(null) 里同样消费 telemetry signals;正常终态与
-          // result.phantomSignals 同源同值)。
-          const signals = turn!.getPhantomSignals()
-          let isPhantomTurn = false
-          switch (signals.apiState) {
-            case 'skipped':
-              log.info('turn.skipped (telemetry)', {
-                sessionKey: session.sessionKey,
-                reason: signals.skipReason,
-                ...(traceId ? { traceId } : {}),
-              })
-              isPhantomTurn = false
-              break
-            case 'called':
-              isPhantomTurn = false
-              if (
-                result &&
-                !result.stopReason &&
-                turnBlockCount === 0 &&
-                turnPermissionCount === 0
-              ) {
-                // Correlate with turn.apiResponse (if received) to distinguish
-                // "stream ended mid-flight" from "stream never finished" —
-                // apiResponse fires only after stream loop completes, so its
-                // absence here means CCB's stream completed without producing
-                // an assistant message. 诊断字段由 CcbAdapter 在汇总时快照
-                // (result.diagnostics);incompleteCount 恒为 1 —— telemetry
-                // channel 是 per-turn 实例,旧 noteIncomplete/getIncompleteCount
-                // 组合在此路径的取值恒等于 1。
-                const diag = result.diagnostics
-                log.warn('telemetry: willCallApi fired but no stop_reason and no blocks', {
-                  sessionKey: session.sessionKey,
-                  incompleteCount: 1,
-                  hadApiResponse: diag?.hadApiResponse ?? false,
-                  apiRespStopReason: diag?.apiRespStopReason,
-                  lastToolPreUse: diag?.lastToolPreUse,
-                  toolErrorCount: diag?.toolErrorCount ?? 0,
-                  ...(traceId ? { traceId } : {}),
-                })
-              }
-              break
-            case 'unknown':
-              // Legacy 9-AND heuristic (unchanged from pre-refactor)
-              isPhantomTurn =
-                !!result &&
-                isStringInput &&
-                !isSlashCommand &&
-                !result.isError &&
-                result.usage.inputTokens === 0 &&
-                result.usage.outputTokens === 0 &&
-                result.usage.cacheReadTokens === 0 &&
-                result.usage.cacheCreationTokens === 0 &&
-                result.usage.cost === 0 &&
-                turnToolCallCount === 0 &&
-                turnBlockCount === 0 &&
-                turnPermissionCount === 0
-              break
-          }
-          if (terminalOverride) isPhantomTurn = false
-
-          if (isPhantomTurn) {
-            if (result && retryPhantomErrors) {
-              retryRuntimeEvents.push(
-                ...result.runtimeEvents.map((event) => structuredClone(event)),
-              )
-            }
-            // Roll back parser-mutated counters (parser already incremented
-            // turns and may have touched cost/cumulative even if delta was 0).
-            session.totalCostUSD = prevCostUSD
-            session.turns = prevTurns
-            session._lastCcbCumulativeCost = prevLastCcbCost
-            log.warn('phantom turn — CCB returned empty result without invoking model', {
+        // phantom 信号经 turn 句柄读(异常终态 result=null 时仍可读 —— 旧实现
+        // 在 onFinish(null) 里同样消费 telemetry signals;正常终态与
+        // result.phantomSignals 同源同值)。
+        const signals = turn!.getPhantomSignals()
+        let isPhantomTurn = false
+        switch (signals.apiState) {
+          case 'skipped':
+            log.info('turn.skipped (telemetry)', {
               sessionKey: session.sessionKey,
-              turnIndex: session.turns + 1,
-              durationMs: Date.now() - turnStartTime,
+              reason: signals.skipReason,
               ...(traceId ? { traceId } : {}),
             })
-            if (retryPhantomErrors) {
-              settle(() => reject(new Error('PHANTOM_TURN: CCB returned empty result')))
-            } else {
-              await persistTerminalSnapshot?.(
-                'crashed',
-                '任务未能产生有效回复。本轮已自动免单；请重新尝试。',
-                'PHANTOM_TURN',
-                true,
-                'no_response',
-              )
-            }
-            return
-          }
-
-          // Proxy billing already treats a successfully metered call with
-          // zero output tokens as no-response and charges 0. Carry the same
-          // exact reason onto the terminal tape so that decision is never a
-          // silent waiver: even a zero-debit turn gets one inbox receipt.
-          if (
-            !terminalOverride &&
-            result &&
-            result.usage.outputTokens === 0 &&
-            (result.usage.inputTokens > 0 ||
-              result.usage.cacheReadTokens > 0 ||
-              result.usage.cacheCreationTokens > 0)
-          ) {
-            terminalOverride = {
-              status: 'crashed',
-              reason: '任务未能产生有效回复。本轮已自动免单；请重新尝试。',
-              errorCode: 'NO_RESPONSE',
-              waiveReason: 'no_response',
-            }
-            retainTerminalError(
-              terminalOverride.status,
-              terminalOverride.reason,
-              terminalOverride.errorCode,
-            )
-          }
-
-          // Update session accumulators from turn result
-          if (result) {
-            terminalPersistenceClaim = 'complete'
-            flushTerminalBilling()
-            const completedAssistantRaw = combineRetryAssistantOutput(
-              retryAssistantSegments,
-              result.assistantText,
-              freezeSegments(result.assistantSegments, assistantMessageId),
-              Date.now(),
-            )
-            const completedAssistantText = emptyCompletedTurnAssistantText({
-              status: terminalOverride?.status ?? 'completed',
-              errorCode: terminalOverride?.errorCode,
-              assistantText: completedAssistantRaw.text,
-            })
-            const completedAssistant =
-              completedAssistantText === completedAssistantRaw.text
-                ? completedAssistantRaw
-                : { text: completedAssistantText, segments: completedAssistantRaw.segments }
-            const completedThinking = combineRetryAssistantOutput(
-              retryThinkingSegments,
-              result.thinkingText,
-              freezeSegments(result.thinkingSegments, thinkingMessageId),
-              Date.now(),
-            )
-            const completedTools = [
-              ...retryTools.map((tool) => structuredClone(tool)),
-              ...freezeTools(result.tools),
-            ]
-            const completedStructuredBlocks = [
-              ...retryStructuredBlocks.map((block) => structuredClone(block)),
-              ...freezeStructuredBlocks(structuredBlocks),
-            ]
-            const pricedUsd = await applyPlatformCostIfMissing({
-              model: session.model,
-              usage: result.usage,
-              sessionCostUsd: session.totalCostUSD,
-              prevCostUsd: prevCostUSD,
-              waiveReason: terminalOverride?.waiveReason,
-              agentId: session.agentId,
-              engine: session.providerTag,
-              isError: result.isError,
-              terminalBillingStatus:
-                terminalExternalBilling?.status ?? terminalEngineBilling?.status,
-            })
-            if (pricedUsd != null) {
-              session.totalCostUSD = prevCostUSD + pricedUsd
-              // Gateway-side catalog backfill is an estimate unless the engine
-              // reports vendor USD. Keep the estimate visible, but never present
-              // it as the exact master admission/ledger amount.
-              session.costImprecise = true
-            }
-            const resultUsageCost = result.usage as typeof result.usage & { costImprecise?: boolean }
-            if (resultUsageCost.costImprecise === true) session.costImprecise = true
-            session.totalInputTokens += result.usage.inputTokens
-            session.totalOutputTokens += result.usage.outputTokens
-            session.totalCacheReadTokens += result.usage.cacheReadTokens
-            session.totalCacheCreationTokens += result.usage.cacheCreationTokens
-            session.currentAssistantBuf = completedAssistant.text
-            // Persist cost-delta baseline after every successful turn so that
-            // a gateway crash + restart can re-seed the correct baseline for
-            // the resumed CCB (whose restoreCostStateForSession will target
-            // the same cumulative). Without this, `lastCost` in resume-map
-            // would only get updated when session_id changes, which lags
-            // behind real turn completion by many turns.
-            this._saveResumeMap()
-            // L2: persist to FTS5 for session_search.
-            // Use sessionKey (not ccbSessionId) as the FTS / sessions_meta
-            // identity: sessionKey is stable across CCB process lifecycles
-            // and across provider switches, while ccbSessionId rotates and
-            // would split one logical session's history into multiple rows
-            // — also breaking getMaxTurnIdx() lookup on resume.
-            if (session.channel !== 'auto-dream') {
-              const sessId = session.sessionKey
-              Promise.all([
-                upsertSessionMeta({
-                  id: sessId,
-                  agentId: session.agentId,
-                  channel: session.channel,
-                  peerId: session.peerId,
-                  title: session.title,
-                  startedAt: session.startedAt,
-                  lastAt: Date.now(),
-                  turnCount: session.turns,
-                  totalCostUSD: session.totalCostUSD,
-                }),
-                indexTurn(sessId, session.turns, session.currentUserText ?? '', completedAssistant.text),
-              ]).catch((err) =>
-                log.error(
-                  'FTS5 index failed',
-                  { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
-                  err,
-                ),
-              )
-            }
-
-            // ── Phase 0.1: persist server-authored assistant message ──
-            // Write the authoritative assistant text into the client_sessions
-            // row so that a mobile client that missed the tail of the
-            // streaming response (tab backgrounded, tab frozen, network
-            // drop, OS-level JS suspension) can recover the full turn via
-            // REST force-sync after reconnect. This is the core durability
-            // fix — prior to this, server.ts:3787 silently dropped outbound
-            // frames when no ws client was connected, and nothing else
-            // persisted the assistant text to the user-visible messages
-            // array. See docs/MOBILE_STREAM_DURABILITY_PLAN.md.
-            //
-            // Only applies to channels whose peerId resolves to a client_sessions
-            // row id —— 当前是 webchat(UI 创建会话拿到 id 后才 dispatch 第一条)
-            // 和 wechat(broker 用 wechat_session_pointer.current_session_id 当 peer.id
-            // 喂 dispatchInbound,语义等价)。telegram/cron/webhook/delegate 的 peerId
-            // 不是 client_sessions.id,master 端 WHERE id=? 永远命不中,只会浪费 outbox
-            // 死信 IO,所以由 MASTER_SINK_PERSIST_CHANNELS 拒。它们的 turn 跟踪走
-            // sessions_meta / event_log 路径(已存在,不在本 if 内)。
-            const completedHasAssistant = completedAssistant.text.length > 0
-            const completedHasThinking = completedThinking.text.length > 0
-            // Tools-only turn is rare but real: a turn that emits tool_use
-            // blocks, runs them, and ends without producing further assistant
-            // text or thinking. We still need to persist the tool snapshots
-            // so refresh recovery has something to render. Without this,
-            // tool rows would only land when assistantText|thinkingText is
-            // also non-empty — losing the durability fix in the rare case.
-            const completedHasTools = completedTools.length > 0
-            // P2 债A — drain the leader session's buffered team cards. Drained
-            // unconditionally (take-and-clear) so a completed turn never leaks
-            // its delegations into the next turn's persist, even if the persist
-            // gate below is false (non-persisting channel). Added to the gate so
-            // a delegation-only turn (leader produced no text/thinking/tools —
-            // Agent tool is excluded from tools[] by ccbMessageParser) still
-            // persists its team cards.
-            const completedAgentGroups = this.drainPendingAgentGroups(session)
-            const completedHasAgentGroups = completedAgentGroups.length > 0
-            const completedHasStructuredBlocks = completedStructuredBlocks.length > 0
-            const completedRuntimeEvents = [
-              ...retryRuntimeEvents.map((event) => structuredClone(event)),
-              ...result.runtimeEvents,
-            ]
-            if (session._durableDelegateRuntimeEvents) {
-              session._durableDelegateRuntimeEvents.push(
-                ...completedRuntimeEvents.map((event) => structuredClone(event)),
-              )
-            }
-            const completedHasRuntimeEvents = completedRuntimeEvents.length > 0
-            const completedHasError =
-              terminalOverride !== null || result.isError || result.errorDetail !== undefined
-            if (completedHasError) {
-              terminalErrorForClient =
-                terminalOverride?.reason ?? result.errorDetail ?? 'engine reported an error'
-              // E4.2 — gateway 权威终态码透传:handleExit/tape 已正确分类的
-              // RUNNER_CRASHED / SERVICE_RESTART(以及 USER_CANCELLED、tape
-              // AUTH_ERROR / ENGINE_ERROR)不再被 server 侧原文正则压成
-              // upstream_failed。免单/静默恢复类码(LIVENESS_TIMEOUT 等)不在
-              // wire 枚举内,保持 undefined 走既有 classify 兜底。
-              terminalErrorCodeForClient =
-                _wireTerminalCodeForTape(terminalOverride?.errorCode) ??
-                (result.errorKind === 'auth' ? 'auth_error' : undefined)
-            }
-            if (
-              MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
-              (completedHasAssistant ||
-                completedHasThinking ||
-                completedHasTools ||
-                completedHasAgentGroups ||
-                completedHasStructuredBlocks ||
-                completedHasRuntimeEvents ||
-                completedHasError)
-            ) {
-              const peerId = session.peerId
-              const assistantText = completedAssistant.text
-              const thinkingText = completedThinking.text
-              const turnIndex = session.turns
-              scheduleSessionOutputAssetCollection({
-                userId: session.userId,
-                sessionId: peerId,
-                assistantText,
+            isPhantomTurn = false
+            break
+          case 'called':
+            isPhantomTurn = false
+            if (result && !result.stopReason && turnBlockCount === 0 && turnPermissionCount === 0) {
+              // Correlate with turn.apiResponse (if received) to distinguish
+              // "stream ended mid-flight" from "stream never finished" —
+              // apiResponse fires only after stream loop completes, so its
+              // absence here means CCB's stream completed without producing
+              // an assistant message. 诊断字段由 CcbAdapter 在汇总时快照
+              // (result.diagnostics);incompleteCount 恒为 1 —— telemetry
+              // channel 是 per-turn 实例,旧 noteIncomplete/getIncompleteCount
+              // 组合在此路径的取值恒等于 1。
+              const diag = result.diagnostics
+              log.warn('telemetry: willCallApi fired but no stop_reason and no blocks', {
                 sessionKey: session.sessionKey,
+                incompleteCount: 1,
+                hadApiResponse: diag?.hadApiResponse ?? false,
+                apiRespStopReason: diag?.apiRespStopReason,
+                lastToolPreUse: diag?.lastToolPreUse,
+                toolErrorCount: diag?.toolErrorCount ?? 0,
                 ...(traceId ? { traceId } : {}),
               })
-              // Phase 0.4 P1-3 (tightened): use `session.userId` directly when
-              // we have it — this lets `appendServerAuthoredMessageDurable`
-              // route `session_not_found` into the outbox instead of silently
-              // dropping when the client's debounced PUT hasn't landed yet.
-              // Fall back to `getClientSession` lookup for legacy code paths
-              // that didn't carry userId (cron pre-warm, old webchat calls).
-              //
-              // thinkingText is forwarded too (Phase 0.4 thinking durability):
-              // server-wins overwrite path was discarding the streaming-only
-              // thinking buffer; persisting it as `_source: 'server'` keeps it
-              // through merge-preserving-server-authored & through phantom
-              // dedupe. Threshold extended to "thinking-only" turns (Sonnet
-              // 4.6 adaptive thinking that runs out of tokens before producing
-              // assistant text) so those don't disappear either.
-              // E6 — 用四态 Outcome 版本以识别 'queued'(queued_to_outbox):
-              // 布尔层语义不变(acked|skipped→true),queued 走下方降级终态旁路。
-              const persistenceOutcome = persistServerAuthoredTurnOutcome({
-                sessionKey: session.sessionKey,
-                peerId,
-                agentId: session.agentId,
-                userId: session.userId,
-                turnIndex,
-                ...activeGoalAttribution(session),
-                ...(clientMessageId ? { clientMessageId } : {}),
-                ...(turnKey ? { turnKey } : {}),
-                ...(session._currentDispatch ? { dispatch: session._currentDispatch } : {}),
-                text: assistantText,
-                ...(completedHasThinking ? { thinkingText } : {}),
-                status: terminalOverride?.status ?? 'completed',
-                ...(terminalOverride?.waiveReason
-                  ? { waiveReason: terminalOverride.waiveReason }
-                  : {}),
-                // Plan §4.4 改动 7 — wire telemetry into the sink so master
-                // can persist `usage` + render refresh-stable truncated pill.
-                // requestId may be absent on non-codex / non-master paths;
-                // master schema only requires it when text is non-empty,
-                // and we already gate the persist call on completedHasAssistant
-                // OR completedHasThinking. The v3 sink schema enforces
-                // requestId for assistant writes; the gateway is run only
-                // by master in v3 commercial, so requestId is always present
-                // there. When absent (personal-version dev), the legacy
-                // path is taken (sink is null) and requestId is ignored.
-                ...(requestId ? { requestId } : {}),
-                // CCB agent session id → 让 master 按 session 精确排空 pending costCredits
-                // (= anthropicProxy 从 LLM metadata.session_id 提取的同一 id)。
-                ...(session.ccbSessionId ? { agentSessionId: session.ccbSessionId } : {}),
-                usage: {
-                  inputTokens: result.usage.inputTokens,
-                  outputTokens: result.usage.outputTokens,
-                  cacheReadTokens: result.usage.cacheReadTokens,
-                  cacheCreationTokens: result.usage.cacheCreationTokens,
-                  totalTokens: result.usage.totalTokens,
-                  ...(session.model ? { model: session.model } : {}),
-                  turn: turnIndex,
-                  // Surface the master-owned per-turn traceId so the web UI can
-                  // show a copyable "请求ID" that greps verbatim against master
-                  // turn logs; persisted into messages[i].usage.traceId so it
-                  // survives refresh via the usage sync channel.
-                  ...(traceId ? { traceId } : {}),
-                },
-                ...(result.stopReason === 'max_tokens' ? { truncated: true } : {}),
-                ...(completedHasError
-                  ? {
-                      errorCode:
-                        terminalOverride?.errorCode ??
-                        (result.errorKind === 'auth'
-                          ? 'AUTH_ERROR'
-                          : (result.errorClass && result.errorClass !== 'unknown'
-                              ? result.errorClass
-                              : _tapeErrorCodeForGenericFailure(result.errorDetail))),
-                      errorDetail:
-                        terminalOverride?.reason ??
-                        result.errorDetail ??
-                        'engine reported an error',
-                    }
-                  : {}),
-                ...(completedHasTools ? { tools: completedTools } : {}),
-                // Fix B (2026-05-25) — per-segment durable rows. Plan §3.5.1.
-                ...(completedAssistant.segments.length > 0
-                  ? { assistantSegments: completedAssistant.segments }
-                  : {}),
-                ...(completedThinking.segments.length > 0
-                  ? { thinkingSegments: completedThinking.segments }
-                  : {}),
-                // P2 债A — team cards drained above.
-                ...(completedHasAgentGroups ? { agentGroups: completedAgentGroups } : {}),
-                ...(completedHasStructuredBlocks
-                  ? { structuredBlocks: completedStructuredBlocks }
-                  : {}),
-                ...(completedHasRuntimeEvents ? { runtimeEvents: completedRuntimeEvents } : {}),
-                ...(terminalEngineBilling !== undefined
-                  ? { engineBilling: terminalEngineBilling }
-                  : {}),
-              })
-              const persistence = persistenceOutcome.then(
-                (r) => r === 'acked' || r === 'skipped',
-              )
-              this._trackPersistence(persistence)
-              // Do not declare the paid turn complete until master has
-              // durably finalized the immutable tape. A queued local spool is
-              // safe but not yet refresh-visible, so it must not masquerade as
-              // an acknowledged completion.
-              persistenceAcknowledged = await persistence
-              // E6 的降级投递只针对**个人版本地 outbox**(queued_to_outbox):本地
-              // SQLite 即权威库,没有任何上游会替我们把终态送给用户。商用 v3 sink
-              // 的 'queued'(master 暂不可达)保持既有静默语义 —— master ACK 才是
-              // 权威终态,提前投递会与 master 侧恢复链路(reconnect replay)打架
-              // (契约测试锁此语义)。
-              persistenceQueuedToOutbox =
-                getV3MasterSinkOrNull() === null && (await persistenceOutcome) === 'queued'
             }
+            break
+          case 'unknown':
+            // Legacy 9-AND heuristic (unchanged from pre-refactor)
+            isPhantomTurn =
+              !!result &&
+              isStringInput &&
+              !isSlashCommand &&
+              !result.isError &&
+              result.usage.inputTokens === 0 &&
+              result.usage.outputTokens === 0 &&
+              result.usage.cacheReadTokens === 0 &&
+              result.usage.cacheCreationTokens === 0 &&
+              result.usage.cost === 0 &&
+              turnToolCallCount === 0 &&
+              turnBlockCount === 0 &&
+              turnPermissionCount === 0
+            break
+        }
+        if (terminalOverride) isPhantomTurn = false
 
-            // Unified turn-usage emit (eventPersist writes usage_log).
-            recordTurnUsage(
-              mapTurnTerminalStatus({
-                persistStatus: terminalOverride?.status,
-                errorCode: terminalOverride?.errorCode,
-                hasResult: true,
-                resultIsError: terminalOverride !== null || result.isError,
+        if (isPhantomTurn) {
+          if (result && retryPhantomErrors) {
+            retryRuntimeEvents.push(...result.runtimeEvents.map((event) => structuredClone(event)))
+          }
+          // Roll back parser-mutated counters (parser already incremented
+          // turns and may have touched cost/cumulative even if delta was 0).
+          session.totalCostUSD = prevCostUSD
+          session.turns = prevTurns
+          session._lastCcbCumulativeCost = prevLastCcbCost
+          log.warn('phantom turn — CCB returned empty result without invoking model', {
+            sessionKey: session.sessionKey,
+            turnIndex: session.turns + 1,
+            durationMs: Date.now() - turnStartTime,
+            ...(traceId ? { traceId } : {}),
+          })
+          if (retryPhantomErrors) {
+            settle(() => reject(new Error('PHANTOM_TURN: CCB returned empty result')))
+          } else {
+            await persistTerminalSnapshot?.(
+              'crashed',
+              '任务未能产生有效回复。本轮已自动免单；请重新尝试。',
+              'PHANTOM_TURN',
+              true,
+              'no_response',
+            )
+          }
+          return
+        }
+
+        // Proxy billing already treats a successfully metered call with
+        // zero output tokens as no-response and charges 0. Carry the same
+        // exact reason onto the terminal tape so that decision is never a
+        // silent waiver: even a zero-debit turn gets one inbox receipt.
+        if (
+          !terminalOverride &&
+          result &&
+          result.usage.outputTokens === 0 &&
+          (result.usage.inputTokens > 0 ||
+            result.usage.cacheReadTokens > 0 ||
+            result.usage.cacheCreationTokens > 0)
+        ) {
+          terminalOverride = {
+            status: 'crashed',
+            reason: '任务未能产生有效回复。本轮已自动免单；请重新尝试。',
+            errorCode: 'NO_RESPONSE',
+            waiveReason: 'no_response',
+          }
+          retainTerminalError(
+            terminalOverride.status,
+            terminalOverride.reason,
+            terminalOverride.errorCode,
+          )
+        }
+
+        // Update session accumulators from turn result
+        if (result) {
+          terminalPersistenceClaim = 'complete'
+          flushTerminalBilling()
+          const completedAssistantRaw = combineRetryAssistantOutput(
+            retryAssistantSegments,
+            result.assistantText,
+            freezeSegments(result.assistantSegments, assistantMessageId),
+            Date.now(),
+          )
+          const completedAssistantText = emptyCompletedTurnAssistantText({
+            status: terminalOverride?.status ?? 'completed',
+            errorCode: terminalOverride?.errorCode,
+            assistantText: completedAssistantRaw.text,
+          })
+          const completedAssistant =
+            completedAssistantText === completedAssistantRaw.text
+              ? completedAssistantRaw
+              : { text: completedAssistantText, segments: completedAssistantRaw.segments }
+          const completedThinking = combineRetryAssistantOutput(
+            retryThinkingSegments,
+            result.thinkingText,
+            freezeSegments(result.thinkingSegments, thinkingMessageId),
+            Date.now(),
+          )
+          const completedTools = [
+            ...retryTools.map((tool) => structuredClone(tool)),
+            ...freezeTools(result.tools),
+          ]
+          const completedStructuredBlocks = [
+            ...retryStructuredBlocks.map((block) => structuredClone(block)),
+            ...freezeStructuredBlocks(structuredBlocks),
+          ]
+          const pricedUsd = await applyPlatformCostIfMissing({
+            model: session.model,
+            usage: result.usage,
+            sessionCostUsd: session.totalCostUSD,
+            prevCostUsd: prevCostUSD,
+            waiveReason: terminalOverride?.waiveReason,
+            agentId: session.agentId,
+            engine: session.providerTag,
+            isError: result.isError,
+            terminalBillingStatus: terminalExternalBilling?.status ?? terminalEngineBilling?.status,
+          })
+          if (pricedUsd != null) {
+            session.totalCostUSD = prevCostUSD + pricedUsd
+            // Gateway-side catalog backfill is an estimate unless the engine
+            // reports vendor USD. Keep the estimate visible, but never present
+            // it as the exact master admission/ledger amount.
+            session.costImprecise = true
+          }
+          const resultUsageCost = result.usage as typeof result.usage & { costImprecise?: boolean }
+          if (resultUsageCost.costImprecise === true) session.costImprecise = true
+          session.totalInputTokens += result.usage.inputTokens
+          session.totalOutputTokens += result.usage.outputTokens
+          session.totalCacheReadTokens += result.usage.cacheReadTokens
+          session.totalCacheCreationTokens += result.usage.cacheCreationTokens
+          session.currentAssistantBuf = completedAssistant.text
+          // Persist cost-delta baseline after every successful turn so that
+          // a gateway crash + restart can re-seed the correct baseline for
+          // the resumed CCB (whose restoreCostStateForSession will target
+          // the same cumulative). Without this, `lastCost` in resume-map
+          // would only get updated when session_id changes, which lags
+          // behind real turn completion by many turns.
+          this._saveResumeMap()
+          // L2: persist to FTS5 for session_search.
+          // Use sessionKey (not ccbSessionId) as the FTS / sessions_meta
+          // identity: sessionKey is stable across CCB process lifecycles
+          // and across provider switches, while ccbSessionId rotates and
+          // would split one logical session's history into multiple rows
+          // — also breaking getMaxTurnIdx() lookup on resume.
+          if (session.channel !== 'auto-dream') {
+            const sessId = session.sessionKey
+            Promise.all([
+              upsertSessionMeta({
+                id: sessId,
+                agentId: session.agentId,
+                channel: session.channel,
+                peerId: session.peerId,
+                title: session.title,
+                startedAt: session.startedAt,
+                lastAt: Date.now(),
+                turnCount: session.turns,
+                totalCostUSD: session.totalCostUSD,
               }),
-              {
+              indexTurn(
+                sessId,
+                session.turns,
+                session.currentUserText ?? '',
+                completedAssistant.text,
+              ),
+            ]).catch((err) =>
+              log.error(
+                'FTS5 index failed',
+                { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
+                err,
+              ),
+            )
+          }
+
+          // ── Phase 0.1: persist server-authored assistant message ──
+          // Write the authoritative assistant text into the client_sessions
+          // row so that a mobile client that missed the tail of the
+          // streaming response (tab backgrounded, tab frozen, network
+          // drop, OS-level JS suspension) can recover the full turn via
+          // REST force-sync after reconnect. This is the core durability
+          // fix — prior to this, server.ts:3787 silently dropped outbound
+          // frames when no ws client was connected, and nothing else
+          // persisted the assistant text to the user-visible messages
+          // array. See docs/MOBILE_STREAM_DURABILITY_PLAN.md.
+          //
+          // Only applies to channels whose peerId resolves to a client_sessions
+          // row id —— 当前是 webchat(UI 创建会话拿到 id 后才 dispatch 第一条)
+          // 和 wechat(broker 用 wechat_session_pointer.current_session_id 当 peer.id
+          // 喂 dispatchInbound,语义等价)。telegram/cron/webhook/delegate 的 peerId
+          // 不是 client_sessions.id,master 端 WHERE id=? 永远命不中,只会浪费 outbox
+          // 死信 IO,所以由 MASTER_SINK_PERSIST_CHANNELS 拒。它们的 turn 跟踪走
+          // sessions_meta / event_log 路径(已存在,不在本 if 内)。
+          const completedHasAssistant = completedAssistant.text.length > 0
+          const completedHasThinking = completedThinking.text.length > 0
+          // Tools-only turn is rare but real: a turn that emits tool_use
+          // blocks, runs them, and ends without producing further assistant
+          // text or thinking. We still need to persist the tool snapshots
+          // so refresh recovery has something to render. Without this,
+          // tool rows would only land when assistantText|thinkingText is
+          // also non-empty — losing the durability fix in the rare case.
+          const completedHasTools = completedTools.length > 0
+          // P2 债A — drain the leader session's buffered team cards. Drained
+          // unconditionally (take-and-clear) so a completed turn never leaks
+          // its delegations into the next turn's persist, even if the persist
+          // gate below is false (non-persisting channel). Added to the gate so
+          // a delegation-only turn (leader produced no text/thinking/tools —
+          // Agent tool is excluded from tools[] by ccbMessageParser) still
+          // persists its team cards.
+          const completedAgentGroups = this.drainPendingAgentGroups(session)
+          const completedHasAgentGroups = completedAgentGroups.length > 0
+          const completedHasStructuredBlocks = completedStructuredBlocks.length > 0
+          const completedRuntimeEvents = [
+            ...retryRuntimeEvents.map((event) => structuredClone(event)),
+            ...result.runtimeEvents,
+          ]
+          if (session._durableDelegateRuntimeEvents) {
+            session._durableDelegateRuntimeEvents.push(
+              ...completedRuntimeEvents.map((event) => structuredClone(event)),
+            )
+          }
+          const completedHasRuntimeEvents = completedRuntimeEvents.length > 0
+          const completedHasError =
+            terminalOverride !== null || result.isError || result.errorDetail !== undefined
+          if (completedHasError) {
+            terminalErrorForClient =
+              terminalOverride?.reason ?? result.errorDetail ?? 'engine reported an error'
+            // E4.2 — gateway 权威终态码透传:handleExit/tape 已正确分类的
+            // RUNNER_CRASHED / SERVICE_RESTART(以及 USER_CANCELLED、tape
+            // AUTH_ERROR / ENGINE_ERROR)不再被 server 侧原文正则压成
+            // upstream_failed。免单/静默恢复类码(LIVENESS_TIMEOUT 等)不在
+            // wire 枚举内,保持 undefined 走既有 classify 兜底。
+            terminalErrorCodeForClient =
+              _wireTerminalCodeForTape(terminalOverride?.errorCode) ??
+              (result.errorKind === 'auth' ? 'auth_error' : undefined)
+          }
+          if (
+            MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
+            (completedHasAssistant ||
+              completedHasThinking ||
+              completedHasTools ||
+              completedHasAgentGroups ||
+              completedHasStructuredBlocks ||
+              completedHasRuntimeEvents ||
+              completedHasError)
+          ) {
+            const peerId = session.peerId
+            const assistantText = completedAssistant.text
+            const thinkingText = completedThinking.text
+            const turnIndex = session.turns
+            scheduleSessionOutputAssetCollection({
+              userId: session.userId,
+              sessionId: peerId,
+              assistantText,
+              sessionKey: session.sessionKey,
+              ...(traceId ? { traceId } : {}),
+            })
+            // Phase 0.4 P1-3 (tightened): use `session.userId` directly when
+            // we have it — this lets `appendServerAuthoredMessageDurable`
+            // route `session_not_found` into the outbox instead of silently
+            // dropping when the client's debounced PUT hasn't landed yet.
+            // Fall back to `getClientSession` lookup for legacy code paths
+            // that didn't carry userId (cron pre-warm, old webchat calls).
+            //
+            // thinkingText is forwarded too (Phase 0.4 thinking durability):
+            // server-wins overwrite path was discarding the streaming-only
+            // thinking buffer; persisting it as `_source: 'server'` keeps it
+            // through merge-preserving-server-authored & through phantom
+            // dedupe. Threshold extended to "thinking-only" turns (Sonnet
+            // 4.6 adaptive thinking that runs out of tokens before producing
+            // assistant text) so those don't disappear either.
+            // E6 — 用四态 Outcome 版本以识别 'queued'(queued_to_outbox):
+            // 布尔层语义不变(acked|skipped→true),queued 走下方降级终态旁路。
+            const persistenceOutcome = persistServerAuthoredTurnOutcome({
+              sessionKey: session.sessionKey,
+              peerId,
+              agentId: session.agentId,
+              userId: session.userId,
+              turnIndex,
+              ...activeGoalAttribution(session),
+              ...(clientMessageId ? { clientMessageId } : {}),
+              ...(turnKey ? { turnKey } : {}),
+              ...(session._currentDispatch ? { dispatch: session._currentDispatch } : {}),
+              text: assistantText,
+              ...(completedHasThinking ? { thinkingText } : {}),
+              status: terminalOverride?.status ?? 'completed',
+              ...(terminalOverride?.waiveReason
+                ? { waiveReason: terminalOverride.waiveReason }
+                : {}),
+              // Plan §4.4 改动 7 — wire telemetry into the sink so master
+              // can persist `usage` + render refresh-stable truncated pill.
+              // requestId may be absent on non-codex / non-master paths;
+              // master schema only requires it when text is non-empty,
+              // and we already gate the persist call on completedHasAssistant
+              // OR completedHasThinking. The v3 sink schema enforces
+              // requestId for assistant writes; the gateway is run only
+              // by master in v3 commercial, so requestId is always present
+              // there. When absent (personal-version dev), the legacy
+              // path is taken (sink is null) and requestId is ignored.
+              ...(requestId ? { requestId } : {}),
+              // CCB agent session id → 让 master 按 session 精确排空 pending costCredits
+              // (= anthropicProxy 从 LLM metadata.session_id 提取的同一 id)。
+              ...(session.ccbSessionId ? { agentSessionId: session.ccbSessionId } : {}),
+              usage: {
                 inputTokens: result.usage.inputTokens,
                 outputTokens: result.usage.outputTokens,
                 cacheReadTokens: result.usage.cacheReadTokens,
                 cacheCreationTokens: result.usage.cacheCreationTokens,
-                costUsd: result.usage.cost,
-                model: session.model,
+                totalTokens: result.usage.totalTokens,
+                ...(session.model ? { model: session.model } : {}),
+                turn: turnIndex,
+                // Surface the master-owned per-turn traceId so the web UI can
+                // show a copyable "请求ID" that greps verbatim against master
+                // turn logs; persisted into messages[i].usage.traceId so it
+                // survives refresh via the usage sync channel.
+                ...(traceId ? { traceId } : {}),
               },
-              session.turns,
-            )
+              ...(result.stopReason === 'max_tokens' ? { truncated: true } : {}),
+              ...(completedHasError
+                ? {
+                    errorCode:
+                      terminalOverride?.errorCode ??
+                      (result.errorKind === 'auth'
+                        ? 'AUTH_ERROR'
+                        : result.errorClass && result.errorClass !== 'unknown'
+                          ? result.errorClass
+                          : _tapeErrorCodeForGenericFailure(result.errorDetail)),
+                    errorDetail:
+                      terminalOverride?.reason ?? result.errorDetail ?? 'engine reported an error',
+                  }
+                : {}),
+              ...(completedHasTools ? { tools: completedTools } : {}),
+              // Fix B (2026-05-25) — per-segment durable rows. Plan §3.5.1.
+              ...(completedAssistant.segments.length > 0
+                ? { assistantSegments: completedAssistant.segments }
+                : {}),
+              ...(completedThinking.segments.length > 0
+                ? { thinkingSegments: completedThinking.segments }
+                : {}),
+              // P2 债A — team cards drained above.
+              ...(completedHasAgentGroups ? { agentGroups: completedAgentGroups } : {}),
+              ...(completedHasStructuredBlocks
+                ? { structuredBlocks: completedStructuredBlocks }
+                : {}),
+              ...(completedHasRuntimeEvents ? { runtimeEvents: completedRuntimeEvents } : {}),
+              ...(terminalEngineBilling !== undefined
+                ? { engineBilling: terminalEngineBilling }
+                : {}),
+            })
+            const persistence = persistenceOutcome.then((r) => r === 'acked' || r === 'skipped')
+            this._trackPersistence(persistence)
+            // Do not declare the paid turn complete until master has
+            // durably finalized the immutable tape. A queued local spool is
+            // safe but not yet refresh-visible, so it must not masquerade as
+            // an acknowledged completion.
+            persistenceAcknowledged = await persistence
+            // E6 的降级投递只针对**个人版本地 outbox**(queued_to_outbox):本地
+            // SQLite 即权威库,没有任何上游会替我们把终态送给用户。商用 v3 sink
+            // 的 'queued'(master 暂不可达)保持既有静默语义 —— master ACK 才是
+            // 权威终态,提前投递会与 master 侧恢复链路(reconnect replay)打架
+            // (契约测试锁此语义)。
+            persistenceQueuedToOutbox =
+              getV3MasterSinkOrNull() === null && (await persistenceOutcome) === 'queued'
+          }
 
-            // Emit cost.recorded for budget tracking
-            eventBus.emit('cost.recorded', createEvent('cost.recorded', session.agentId, {
+          // Unified turn-usage emit (eventPersist writes usage_log).
+          recordTurnUsage(
+            mapTurnTerminalStatus({
+              persistStatus: terminalOverride?.status,
+              errorCode: terminalOverride?.errorCode,
+              hasResult: true,
+              resultIsError: terminalOverride !== null || result.isError,
+            }),
+            {
+              inputTokens: result.usage.inputTokens,
+              outputTokens: result.usage.outputTokens,
+              cacheReadTokens: result.usage.cacheReadTokens,
+              cacheCreationTokens: result.usage.cacheCreationTokens,
+              costUsd: result.usage.cost,
+              model: session.model,
+            },
+            session.turns,
+          )
+
+          // Emit cost.recorded for budget tracking
+          eventBus.emit(
+            'cost.recorded',
+            createEvent('cost.recorded', session.agentId, {
               sessionKey: session.sessionKey,
               turnIndex: session.turns,
               usage: {
@@ -7015,68 +7156,76 @@ export class SessionManager {
                 model: session.model,
               },
               sessionTotalCostUsd: session.totalCostUSD,
-            }))
+            }),
+          )
 
-            // Detect verification verdicts in assistant output and emit structured event
-            const verdict = parseVerificationVerdict(result.assistantText)
-            if (verdict) {
-              eventBus.emit('verification.result', createEvent('verification.result', session.agentId, {
+          // Detect verification verdicts in assistant output and emit structured event
+          const verdict = parseVerificationVerdict(result.assistantText)
+          if (verdict) {
+            eventBus.emit(
+              'verification.result',
+              createEvent('verification.result', session.agentId, {
                 sessionKey: session.sessionKey,
                 target: 'code' as const,
                 passed: verdict.passed,
                 evidence: verdict.evidence,
-              }))
-              log.info('verification verdict', {
-                sessionKey: session.sessionKey,
-                verdict: verdict.verdict,
-                checks: verdict.evidence.length,
-                passed: verdict.passed,
-                ...(traceId ? { traceId } : {}),
-              })
-            }
+              }),
+            )
+            log.info('verification verdict', {
+              sessionKey: session.sessionKey,
+              verdict: verdict.verdict,
+              checks: verdict.evidence.length,
+              passed: verdict.passed,
+              ...(traceId ? { traceId } : {}),
+            })
           }
-          // A transient persistence failure stays in the unlimited fsynced
-          // retry queue. Do not emit a new user-facing notice and do not expose
-          // terminal completion until the authoritative master ACKs it.
-          if (!result) {
-            recordTurnUsage(mapTurnTerminalStatus({ hasResult: false }))
-          }
-          if (persistenceAcknowledged) {
-            if (terminalErrorForClient) {
-              // 审计 R3:errorClass 已是 TurnSummary 的权威字段(各 adapter 的
-              // buildTurnSummary 从 TurnResult 复制),直读即可 —— 不再 cast 穿透,
-              // 也不再靠 server 侧重新正则解析 errorDetail 兜底。runner 预分类在场
-              // 则透传给 server.ts 直接按码组 outbound.error;缺省 undefined →
-              // server 侧回落 classifyRunError,行为不变。
-              const preClassified = result?.errorClass
-              onEvent(_asEngineErrorEvent({
+        }
+        // A transient persistence failure stays in the unlimited fsynced
+        // retry queue. Do not emit a new user-facing notice and do not expose
+        // terminal completion until the authoritative master ACKs it.
+        if (!result) {
+          recordTurnUsage(mapTurnTerminalStatus({ hasResult: false }))
+        }
+        if (persistenceAcknowledged) {
+          if (terminalErrorForClient) {
+            // 审计 R3:errorClass 已是 TurnSummary 的权威字段(各 adapter 的
+            // buildTurnSummary 从 TurnResult 复制),直读即可 —— 不再 cast 穿透,
+            // 也不再靠 server 侧重新正则解析 errorDetail 兜底。runner 预分类在场
+            // 则透传给 server.ts 直接按码组 outbound.error;缺省 undefined →
+            // server 侧回落 classifyRunError,行为不变。
+            const preClassified = result?.errorClass
+            onEvent(
+              _asEngineErrorEvent({
                 kind: 'error',
                 error: terminalErrorForClient,
                 ...(preClassified ? { errorClass: preClassified } : {}),
                 ...(terminalErrorCodeForClient ? { errorCode: terminalErrorCodeForClient } : {}),
-              }))
-            } else if (pendingFinal) {
-              onEvent(pendingFinal)
-            }
-          } else if (persistenceQueuedToOutbox) {
-            // E6 — 落库进 outbox(权威库暂不可用):不算 acknowledged,但必须向
-            // 当前连接投递降级终态,否则用户永远停在「思考中」。发一个
-            // session_persist_unavailable 的 error 事件:server.ts 组结构化
-            // outbound.error(受控文案「回复已生成、暂存待落库」)+ 兼容 [error]
-            // final 终止器关闭本轮。已流式送达的正文气泡不受影响;outbox replay
-            // 落库后刷新可见全文。原始失败细节(若有)进事件 error 字段仅供日志。
-            log.warn('turn terminal delivered in degraded persist-queued mode', {
-              sessionKey: session.sessionKey,
-              turnIndex: session.turns,
-              ...(traceId ? { traceId } : {}),
-            })
-            onEvent(_asEngineErrorEvent({
+              }),
+            )
+          } else if (pendingFinal) {
+            onEvent(pendingFinal)
+          }
+        } else if (persistenceQueuedToOutbox) {
+          // E6 — 落库进 outbox(权威库暂不可用):不算 acknowledged,但必须向
+          // 当前连接投递降级终态,否则用户永远停在「思考中」。发一个
+          // session_persist_unavailable 的 error 事件:server.ts 组结构化
+          // outbound.error(受控文案「回复已生成、暂存待落库」)+ 兼容 [error]
+          // final 终止器关闭本轮。已流式送达的正文气泡不受影响;outbox replay
+          // 落库后刷新可见全文。原始失败细节(若有)进事件 error 字段仅供日志。
+          log.warn('turn terminal delivered in degraded persist-queued mode', {
+            sessionKey: session.sessionKey,
+            turnIndex: session.turns,
+            ...(traceId ? { traceId } : {}),
+          })
+          onEvent(
+            _asEngineErrorEvent({
               kind: 'error',
               error: terminalErrorForClient ?? SESSION_PERSIST_QUEUED_NOTICE,
               errorCode: 'session_persist_unavailable',
-            }))
-          }
-          settle(() => resolve())
+            }),
+          )
+        }
+        settle(() => resolve())
       }
 
       const handleError = (err: Error) => {
@@ -7084,18 +7233,23 @@ export class SessionManager {
         // immutable detail still preserves the concrete transport/process
         // error, while the Master can make one deterministic retry decision.
         const planned = this.shouldClassifyExitAsServiceRestart(session)
-        const persistence = requestTerminalPersistence?.(
-          planned ? 'interrupted' : 'crashed',
-          err.message,
-          planned ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
-          planned ? 'no_response' : undefined,
-        ) ?? Promise.resolve()
+        const persistence =
+          requestTerminalPersistence?.(
+            planned ? 'interrupted' : 'crashed',
+            err.message,
+            planned ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
+            planned ? 'no_response' : undefined,
+          ) ?? Promise.resolve()
         this._trackPersistence(persistence)
       }
 
       // Listen for subprocess crash mid-turn. Defer slightly to let remaining
       // stdout data drain (exit can fire before stdout 'end' in Node.js).
-      const handleExit = (info: { code: number | null; signal: string | null; crashed: boolean }) => {
+      const handleExit = (info: {
+        code: number | null
+        signal: string | null
+        crashed: boolean
+      }) => {
         // Normal lifecycle restarts (model/effort/toolset swaps and Codex
         // app-server route-token respawns) emit a clean `exit` before the turn
         // continues on the replacement process. Do not finalize/detach the
@@ -7127,14 +7281,15 @@ export class SessionManager {
             const planned = this.shouldClassifyExitAsServiceRestart(session, info)
             const status: 'interrupted' | 'crashed' =
               planned || info.signal ? 'interrupted' : 'crashed'
-            void (persistTerminalSnapshot?.(
-              status,
-              reason,
-              planned ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
-              true,
-              planned ? 'no_response' : undefined,
-            ) ?? Promise.resolve())
-              .finally(resolveFlush)
+            void (
+              persistTerminalSnapshot?.(
+                status,
+                reason,
+                planned ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
+                true,
+                planned ? 'no_response' : undefined,
+              ) ?? Promise.resolve()
+            ).finally(resolveFlush)
           }, 150)
         })
         this._trackPersistence(flushP)
@@ -7174,9 +7329,7 @@ export class SessionManager {
         onPostTerminalRuntimeEvent,
         collabAgentPolicy,
         automaticRetryState,
-        ...(session._usageAttribution
-          ? { usageAttribution: session._usageAttribution }
-          : {}),
+        ...(session._usageAttribution ? { usageAttribution: session._usageAttribution } : {}),
         ...(session._turnCreditBudgetFen !== undefined
           ? { creditBudgetFen: session._turnCreditBudgetFen }
           : {}),
@@ -7190,11 +7343,9 @@ export class SessionManager {
 
       // 对位旧 runner.submit(...).catch:spawn 失败 / crash-loop backoff 等。
       submittedTurn.submitted.catch((err) => {
-        const persistence = requestTerminalPersistence?.(
-          'crashed',
-          String(err),
-          'RUNNER_CRASHED',
-        ) ?? Promise.resolve()
+        const persistence =
+          requestTerminalPersistence?.('crashed', String(err), 'RUNNER_CRASHED') ??
+          Promise.resolve()
         this._trackPersistence(persistence)
       })
 
@@ -7215,11 +7366,7 @@ export class SessionManager {
     if (external && !external.signal.aborted) external.abort()
     const persistActiveTurn = s._persistActiveTurn
     if (persistActiveTurn) {
-      const persistence = persistActiveTurn(
-        'interrupted',
-        '本轮已由用户停止。',
-        'USER_CANCELLED',
-      )
+      const persistence = persistActiveTurn('interrupted', '本轮已由用户停止。', 'USER_CANCELLED')
       this._trackPersistence(persistence)
       return true
     }
@@ -7267,8 +7414,7 @@ export class SessionManager {
     if (!parent) return false
     ;(parent._pendingAgentGroups ??= []).push({
       ...group,
-      _ocEventOrdinal:
-        group._ocEventOrdinal ?? takeDurableEventOrdinal(parent),
+      _ocEventOrdinal: group._ocEventOrdinal ?? takeDurableEventOrdinal(parent),
     })
     return true
   }
@@ -7301,10 +7447,13 @@ export class SessionManager {
     session._activeClientTurnCount = Math.max(0, (session._activeClientTurnCount ?? 0) - 1)
     session._lastClientTurnOutcome = outcome
     if (clientMessageId) {
-      recordRecentTerminal(session, clientMessageId, outcome === 'completed' ? 'completed' : 'interrupted')
+      recordRecentTerminal(
+        session,
+        clientMessageId,
+        outcome === 'completed' ? 'completed' : 'interrupted',
+      )
     }
   }
-
 
   /**
    * 切换 session 的执行目标 (local ⇄ remote)。
@@ -7341,7 +7490,12 @@ export class SessionManager {
       // 幂等短路:target 未变(remote 需 hostId 相同)
       if (current.kind === target.kind) {
         if (current.kind === 'local') return
-        if (current.kind === 'remote' && target.kind === 'remote' && current.hostId === target.hostId) return
+        if (
+          current.kind === 'remote' &&
+          target.kind === 'remote' &&
+          current.hostId === target.hostId
+        )
+          return
       }
 
       // 切入 remote 的前置校验
@@ -7402,7 +7556,9 @@ export class SessionManager {
         queueMicrotask(() => {
           this._remoteTargetController
             ?.releaseMux(sessionKey, uid, oldHostId)
-            .catch((err) => log.warn('release old mux failed', { sessionKey, oldHostId, err: String(err) }))
+            .catch((err) =>
+              log.warn('release old mux failed', { sessionKey, oldHostId, err: String(err) }),
+            )
         })
       }
       log.info('execution target switched', {
@@ -7453,7 +7609,9 @@ export class SessionManager {
     // Medium#G1:让 server.ts 的 outboundRing 也清掉这个 key(两个 server.ts
     // 里现存的 destroySession 调用点已经显式 clear 过,这里再调一次是幂等;
     // 未来若有遗漏的路径,callback 能兜住)
-    try { this.onSessionDestroyed?.(sessionKey) } catch {}
+    try {
+      this.onSessionDestroyed?.(sessionKey)
+    } catch {}
   }
 
   /**
@@ -7485,7 +7643,9 @@ export class SessionManager {
       this.sessions.delete(sessionKey)
       this._sessionIdToKey.delete(s.peerId)
     }
-    try { this.onSessionDestroyed?.(sessionKey) } catch {}
+    try {
+      this.onSessionDestroyed?.(sessionKey)
+    } catch {}
   }
 
   hasLiveSession(sessionKey: string): boolean {
@@ -7521,16 +7681,19 @@ export class SessionManager {
         const uid = s.userId
         const key = s.sessionKey
         const hostId = s.executionTarget.hostId
-        muxReleases.push(() =>
-          this._remoteTargetController?.releaseMux(key, uid, hostId).catch(() => {}) ??
+        muxReleases.push(
+          () =>
+            this._remoteTargetController?.releaseMux(key, uid, hostId).catch(() => {}) ??
             Promise.resolve(),
         )
       }
     }
-    await Promise.all([...this.sessions.values()].map((s) => {
-      this.markPlannedServiceRestart(s)
-      return s.runner.shutdown()
-    }))
+    await Promise.all(
+      [...this.sessions.values()].map((s) => {
+        this.markPlannedServiceRestart(s)
+        return s.runner.shutdown()
+      }),
+    )
     await Promise.all(muxReleases.map((fn) => fn()))
     // A1:底座已全部停产出,flush 各 session 折叠 tail 的 pending(其持久化随后被
     // awaitPendingPersistence 一并排空)。
@@ -7545,7 +7708,9 @@ export class SessionManager {
     // Phase 5:整体清空时同步清反查索引。
     this._sessionIdToKey.clear()
     for (const k of keysToClear) {
-      try { this.onSessionDestroyed?.(k) } catch {}
+      try {
+        this.onSessionDestroyed?.(k)
+      } catch {}
     }
   }
 
@@ -7580,7 +7745,7 @@ export class SessionManager {
     // 用 async IIFE 不阻塞 interval 队列(每轮 eviction 独立跑,上一轮若卡住不影响下一轮)。
     let _inFlight = false
     const t = setInterval(() => {
-      if (_inFlight) return  // 防并行:shutdown 链慢 → 跳过本轮,下一轮再扫
+      if (_inFlight) return // 防并行:shutdown 链慢 → 跳过本轮,下一轮再扫
       _inFlight = true
       ;(async () => {
         try {
@@ -7624,7 +7789,9 @@ export class SessionManager {
             // Medium#G1 + N11:shutdown 完才清 ring,保证不会有"runner 已死但 ring 还能
             // 接尾帧"的窗口。webchat 虽然 resume-map 留着等 reconnect,但 outboundRing
             // 没必要留(重连时会重走 hello,server 按 lastFrameSeq=0 重建)。
-            try { this.onSessionDestroyed?.(key) } catch {}
+            try {
+              this.onSessionDestroyed?.(key)
+            } catch {}
           }
           if (toEvict.length > 0) this._saveResumeMap()
           this._pruneResumeMap()

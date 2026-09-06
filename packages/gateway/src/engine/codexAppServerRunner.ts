@@ -14,13 +14,18 @@ export function _codexMemoryTurnEnv(
     OC_AGENT_ID: agentId,
     OC_SESSION_KEY: sessionKey,
     ...(routing?.gatewayPort ? { OPENCLAUDE_GATEWAY_PORT: String(routing.gatewayPort) } : {}),
-    ...(routing?.contextFile
-      ? { OPENCLAUDE_DELEGATE_CONTEXT_FILE: routing.contextFile }
-      : {}),
+    ...(routing?.contextFile ? { OPENCLAUDE_DELEGATE_CONTEXT_FILE: routing.contextFile } : {}),
   }
 }
 import { EventEmitter } from 'node:events'
-import { createReadStream, lstatSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  createReadStream,
+  lstatSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
@@ -58,12 +63,18 @@ import { shouldOmitPlatformMcp } from '../codexLaunchOverrides.js'
 import { issueDelegateContextToken } from '../delegateContext.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
-import type { AutomaticRetryState, CollabAgentPolicy, NativeModelHandoffArtifact } from './engineAdapter.js'
+import type {
+  AutomaticRetryState,
+  CollabAgentPolicy,
+  NativeModelHandoffArtifact,
+} from './engineAdapter.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
 
 const guardedStdin = new WeakSet<object>()
-function guardStdinErrors(stdin: { on?: (event: 'error', fn: (err: Error) => void) => unknown }): void {
+function guardStdinErrors(stdin: {
+  on?: (event: 'error', fn: (err: Error) => void) => unknown
+}): void {
   if (guardedStdin.has(stdin)) return
   guardedStdin.add(stdin)
   if (typeof stdin.on !== 'function') return
@@ -97,7 +108,11 @@ export async function readLatestCodexNativeHandoff(
   for await (const line of lines) {
     if (!line.includes('"type":"compacted"')) continue
     let parsed: unknown
-    try { parsed = JSON.parse(line) } catch { continue }
+    try {
+      parsed = JSON.parse(line)
+    } catch {
+      continue
+    }
     if (!parsed || typeof parsed !== 'object') continue
     const row = parsed as Record<string, unknown>
     if (row.type !== 'compacted' || !row.payload || typeof row.payload !== 'object') continue
@@ -149,10 +164,7 @@ function waitForCloseWithin(closePromise: Promise<void>, timeoutMs: number): Pro
   })
 }
 
-function killCodexProcessGroup(
-  proc: ChildProcessWithoutNullStreams,
-  signal: NodeJS.Signals,
-): void {
+function killCodexProcessGroup(proc: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
   try {
     if (typeof proc.pid === 'number' && proc.pid > 0) {
       process.kill(-proc.pid, signal)
@@ -707,10 +719,7 @@ function _isContextCompactionItem(item: unknown): item is Record<string, unknown
 
 /** Full item JSON. The old 2,000-character preview budget silently discarded
  * paid tool/MCP output; Turn Tape now handles transport/storage size instead. */
-export function _stringifyItemBounded(
-  item: unknown,
-  _legacyBudget?: number,
-): string {
+export function _stringifyItemBounded(item: unknown, _legacyBudget?: number): string {
   return JSON.stringify(item) ?? 'null'
 }
 
@@ -982,11 +991,16 @@ function normalizeCodexUserInput(paramsUnk: unknown): NormalizedCodexUserInput |
   // Legacy 0.144 requests omit isBlocking, so preserve their old duration
   // semantics. A new non-blocking request without a usable legacy duration
   // receives the platform minimum instead of becoming accidentally blocking.
-  const effectiveAutoResolutionMs = isBlocking === true
-    ? undefined
-    : isBlocking === false
-      ? typeof autoResolutionMs === 'number' ? autoResolutionMs : 60_000
-      : typeof autoResolutionMs === 'number' ? autoResolutionMs : undefined
+  const effectiveAutoResolutionMs =
+    isBlocking === true
+      ? undefined
+      : isBlocking === false
+        ? typeof autoResolutionMs === 'number'
+          ? autoResolutionMs
+          : 60_000
+        : typeof autoResolutionMs === 'number'
+          ? autoResolutionMs
+          : undefined
 
   return {
     threadId,
@@ -1381,11 +1395,7 @@ export class CodexAppServerRunner extends EventEmitter {
       await this.sendRequest('thread/goal/set', {
         threadId: this.threadId,
         objective: cleared ? null : goal.objective,
-        status: cleared
-          ? null
-          : goal.status === 'completed'
-            ? 'complete'
-            : goal.status,
+        status: cleared ? null : goal.status === 'completed' ? 'complete' : goal.status,
         tokenBudget: cleared ? null : goal.tokenBudget,
       })
     } catch (err) {
@@ -1461,10 +1471,10 @@ export class CodexAppServerRunner extends EventEmitter {
       return this.opts.getRepoSnapshot(this.opts.sessionId)
     } catch (err) {
       if (this.opts.hermeticNoTools) throw err
-      log.warn(
-        'getRepoSnapshot threw; treating as no-bind',
-        { sessionKey: this.opts.sessionKey, err: (err as Error).message },
-      )
+      log.warn('getRepoSnapshot threw; treating as no-bind', {
+        sessionKey: this.opts.sessionKey,
+        err: (err as Error).message,
+      })
       return null
     }
   }
@@ -1596,10 +1606,10 @@ export class CodexAppServerRunner extends EventEmitter {
     try {
       await this.sendRequest('thread/compact/start', { threadId: this.threadId })
       await completed
-      const result = await this.sendRequest('thread/read', {
+      const result = (await this.sendRequest('thread/read', {
         threadId: this.threadId,
         includeTurns: false,
-      }) as { thread?: { path?: unknown } }
+      })) as { thread?: { path?: unknown } }
       const rolloutPath = result.thread?.path
       if (typeof rolloutPath !== 'string' || !rolloutPath) {
         throw new Error('CODEX_NATIVE_COMPACTION_PATH_MISSING')
@@ -1868,7 +1878,9 @@ export class CodexAppServerRunner extends EventEmitter {
     const proc = this.proc
     if (proc) {
       let resolveClose!: () => void
-      const closePromise = new Promise<void>((resolve) => { resolveClose = resolve })
+      const closePromise = new Promise<void>((resolve) => {
+        resolveClose = resolve
+      })
       const onClose = () => resolveClose()
       proc.once('close', onClose)
       if (proc.exitCode === null && proc.signalCode === null) {
@@ -1995,10 +2007,7 @@ export class CodexAppServerRunner extends EventEmitter {
    * app-server finished the handshake (preheat + submit race). */
   private _spawnPromise: Promise<void> | null = null
 
-  private async ensureSpawned(
-    repoSnap: RepoSnapshot | null,
-    effectiveCwd: string,
-  ): Promise<void> {
+  private async ensureSpawned(repoSnap: RepoSnapshot | null, effectiveCwd: string): Promise<void> {
     if (this.proc && !this.proc.killed && this.initialized) return
     const inflight = this._spawnPromise
     if (inflight) return inflight
@@ -2055,17 +2064,28 @@ export class CodexAppServerRunner extends EventEmitter {
     try {
       if (this.opts.hermeticNoTools) {
         argvOverrides = [
-          '-c', 'mcp_servers={}',
-          '-c', 'features.shell_tool=false',
-          '-c', 'features.unified_exec=false',
-          '-c', 'features.apps=false',
-          '-c', 'features.plugins=false',
-          '-c', 'features.browser_use=false',
-          '-c', 'features.browser_use_external=false',
-          '-c', 'features.computer_use=false',
-          '-c', 'features.image_generation=false',
-          '-c', 'features.multi_agent=false',
-          '-c', 'features.multi_agent_v2=false',
+          '-c',
+          'mcp_servers={}',
+          '-c',
+          'features.shell_tool=false',
+          '-c',
+          'features.unified_exec=false',
+          '-c',
+          'features.apps=false',
+          '-c',
+          'features.plugins=false',
+          '-c',
+          'features.browser_use=false',
+          '-c',
+          'features.browser_use_external=false',
+          '-c',
+          'features.computer_use=false',
+          '-c',
+          'features.image_generation=false',
+          '-c',
+          'features.multi_agent=false',
+          '-c',
+          'features.multi_agent_v2=false',
         ]
       } else {
         const overrides = await this.ensureLaunchOverrides(repoSnap)
@@ -2130,11 +2150,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // 覆盖 launch overrides 里可能注入的 mcp_servers.openclaude_memory.*。
     const omitPlatformMcp = shouldOmitPlatformMcp(this.opts.agentId, this.opts.sessionKey)
     const stageAgentArgs = omitPlatformMcp
-      ? [
-          '-c', 'mcp_servers={}',
-          '-c', 'features.apps=false',
-          '-c', 'features.plugins=false',
-        ]
+      ? ['-c', 'mcp_servers={}', '-c', 'features.apps=false', '-c', 'features.plugins=false']
       : []
     const args = [
       'app-server',
@@ -2644,8 +2660,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // turnId + itemId are app-server generated and make this opaque id stable
     // and collision-resistant across runner respawns; the serial disambiguates
     // a protocol-violating duplicate item id without parsing the id later.
-    const requestId =
-      `codex-user-input:${params.turnId}:${params.itemId}:${++this.nextUserInputRequestId}`
+    const requestId = `codex-user-input:${params.turnId}:${params.itemId}:${++this.nextUserInputRequestId}`
     this.pendingUserInputs.set(requestId, {
       rpcId: id,
       rpcKey,
@@ -2687,8 +2702,8 @@ export class CodexAppServerRunner extends EventEmitter {
     // CcbMessageParser for crash/interrupt persistence, and the native final
     // fileChange item remains in this raw tape.
     if (
-      (this.currentTurnCompleter || this.activeTurnId)
-      && !(msg.kind === 'notification' && msg.method === 'item/fileChange/patchUpdated')
+      (this.currentTurnCompleter || this.activeTurnId) &&
+      !(msg.kind === 'notification' && msg.method === 'item/fileChange/patchUpdated')
     ) {
       let payload: unknown
       try {
@@ -2793,12 +2808,15 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
-  private emitPlanBlock(plan: {
-    text?: string
-    explanation?: string
-    steps?: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' }>
-    partial?: boolean
-  }, callTargetId?: string): void {
+  private emitPlanBlock(
+    plan: {
+      text?: string
+      explanation?: string
+      steps?: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' }>
+      partial?: boolean
+    },
+    callTargetId?: string,
+  ): void {
     // Scope the plan card identity to the current Codex turn. The frontend
     // uses blockId as the stable update key; a process-wide "codex-plan"
     // key made separate turns fight over one card and made multi-client
@@ -2859,12 +2877,11 @@ export class CodexAppServerRunner extends EventEmitter {
           developer_instructions: mode === 'default' ? CODEX_DEFAULT_MODE_INSTRUCTIONS : null,
         },
       },
-      sandboxPolicy:
-        this.opts.hermeticNoTools
-          ? { type: 'readOnly', networkAccess: false }
-          : mode === 'plan'
-            ? { type: 'readOnly', networkAccess: true }
-            : { type: 'dangerFullAccess' },
+      sandboxPolicy: this.opts.hermeticNoTools
+        ? { type: 'readOnly', networkAccess: false }
+        : mode === 'plan'
+          ? { type: 'readOnly', networkAccess: true }
+          : { type: 'dangerFullAccess' },
     }
     if (this.codexTransportModel()) params.model = this.codexTransportModel()
     if (this.opts.structuredOutputSchema) params.outputSchema = this.opts.structuredOutputSchema
@@ -2968,10 +2985,7 @@ export class CodexAppServerRunner extends EventEmitter {
       const itemId = typeof p.itemId === 'string' ? p.itemId : ''
       if (itemId) this.bindItemCallUsageEpoch(itemId)
       this.currentPlanDraft += delta
-      this.emitPlanBlock(
-        { text: this.currentPlanDraft, partial: true },
-        itemId || undefined,
-      )
+      this.emitPlanBlock({ text: this.currentPlanDraft, partial: true }, itemId || undefined)
       return
     }
     if (method === 'turn/plan/updated') {
@@ -3067,11 +3081,11 @@ export class CodexAppServerRunner extends EventEmitter {
           )
         : []
       if (
-        !this.currentTurnCompleter
-        || !this.threadId
-        || notificationThreadId !== this.threadId
-        || !itemId
-        || changes.length === 0
+        !this.currentTurnCompleter ||
+        !this.threadId ||
+        notificationThreadId !== this.threadId ||
+        !itemId ||
+        changes.length === 0
       ) {
         return
       }
@@ -3150,9 +3164,10 @@ export class CodexAppServerRunner extends EventEmitter {
             type: 'openclaude_handler_error',
             handler: 'handleItemCompleted',
             item: structuredClone(itemUnk),
-            error: err instanceof Error
-              ? { name: err.name, message: err.message, stack: err.stack }
-              : { value: String(err) },
+            error:
+              err instanceof Error
+                ? { name: err.name, message: err.message, stack: err.stack }
+                : { value: String(err) },
           })
         })
         .finally(() => {
@@ -3428,9 +3443,7 @@ export class CodexAppServerRunner extends EventEmitter {
       const outcome = codexToolOutcome(item)
       const failedExit = exit != null && exit !== 0
       const isError = failedExit || outcome.isError
-      let engineMeta:
-        | { exitCode?: number; terminationReason?: ToolTerminationReason }
-        | undefined
+      let engineMeta: { exitCode?: number; terminationReason?: ToolTerminationReason } | undefined
       if (failedExit) {
         engineMeta =
           safeExit === undefined
@@ -3588,9 +3601,7 @@ export class CodexAppServerRunner extends EventEmitter {
           : `imageGeneration → ${summary}`,
         isError,
         undefined,
-        isError
-          ? { terminationReason: outcome.terminationReason ?? 'tool_error' }
-          : undefined,
+        isError ? { terminationReason: outcome.terminationReason ?? 'tool_error' } : undefined,
       )
       return
     }
@@ -3773,9 +3784,7 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private abortTurnForRelayPathDenied(): void {
-    const err = new Error(
-      'CODEX_RELAY_PATH_DENIED: MCP/relay path not allowed; aborting turn',
-    )
+    const err = new Error('CODEX_RELAY_PATH_DENIED: MCP/relay path not allowed; aborting turn')
     err.name = 'CodexRelayPathDeniedError'
     if (this.currentTurnCompleter) {
       this.currentTurnCompleter.reject(err)
@@ -3980,7 +3989,17 @@ export class CodexAppServerRunner extends EventEmitter {
                 staleThreadId,
                 fallbackThreadId: fallback,
               })
+              // Switching native thread: thread-scoped token ledger must be
+              // re-seeded from the fallback thread's own history (same reset
+              // _startNewThread does), otherwise the first usage frame is
+              // diffed against the dead thread's cumulative total (B1).
               this.threadId = fallback
+              this.priorTurnTotal = null
+              this.activeTurnTotal = null
+              this.currentTurnUsage = null
+              this.resetCallUsageAttribution()
+              this.syncedPlatformGoalSignature = null
+              this.syncedPlatformGoal = null
               try {
                 await this.sendRequest('thread/resume', {
                   threadId: fallback,
@@ -4266,9 +4285,7 @@ export class CodexAppServerRunner extends EventEmitter {
         durationMs,
         ok: false,
         error: errMsg,
-        usage: failedTurnUsage
-          ? _codexUsageToAnthropicShape(failedTurnUsage)
-          : undefined,
+        usage: failedTurnUsage ? _codexUsageToAnthropicShape(failedTurnUsage) : undefined,
         requestId,
         // Issue A v1.0.108 — catch 路径也走 dedup helper(notification 与 turn 异常
         // 不耦合,init 阶段可能已经收到过快照,但若上一 turn 已发同值就别再发)。
@@ -4487,9 +4504,7 @@ export class CodexAppServerRunner extends EventEmitter {
         : {}),
       ...(opts.rateLimits ? { rateLimits: opts.rateLimits } : {}),
       ...(opts.stopReason ? { stop_reason: opts.stopReason } : {}),
-      ...(!opts.ok
-        ? { billing_terminal_code: opts.terminalCode ?? 'CODEX_ERROR' as const }
-        : {}),
+      ...(!opts.ok ? { billing_terminal_code: opts.terminalCode ?? ('CODEX_ERROR' as const) } : {}),
       ...(opts.errorClass ? { errorClass: opts.errorClass } : {}),
     }
     this.emit('message', msg)
