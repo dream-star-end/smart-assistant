@@ -56,6 +56,7 @@ import {
 } from './delegateFanout.js'
 import {
   normalizeDelegateAgentId,
+  normalizeDelegateGoal,
   normalizeDelegateModel,
   parseDelegateAllowSelf,
   rewriteSelfDelegateErrorForMcp,
@@ -737,13 +738,15 @@ async function handleDelegateTask(args: {
   resumeSessionKey?: string
   allowSelf?: unknown
 }) {
+  const goalNorm = normalizeDelegateGoal(args?.goal, args as Record<string, unknown>)
+  if (!goalNorm.ok) return toolError(goalNorm.error)
   const agentNorm = normalizeDelegateAgentId(args.agentId)
   if (!agentNorm.ok) return toolError(agentNorm.error)
   const modelNorm = normalizeDelegateModel(args.model)
   if (!modelNorm.ok) return toolError(modelNorm.error)
   const agentId = agentNorm.agentId || 'main'
   return handleDelegateTaskToAgent(agentId, {
-    goal: args.goal,
+    goal: goalNorm.goal,
     context: args.context,
     effort: args.effort,
     toolsets: args.toolsets,

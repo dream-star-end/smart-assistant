@@ -448,7 +448,13 @@ import {
   persistDelegateJobSnapshots,
   restoreDelegateJobSnapshots,
 } from './delegateCompleter.js'
-import { isPlatformAgentId, parseDelegateAllowSelf, parseDelegateModel, rejectSelfDelegate } from './delegateModel.js'
+import {
+  DELEGATE_GOAL_REQUIRED_ERROR,
+  isPlatformAgentId,
+  parseDelegateAllowSelf,
+  parseDelegateModel,
+  rejectSelfDelegate,
+} from './delegateModel.js'
 import { EMPTY_COMPLETED_TURN_NOTICE, hasPlatedAssistantOutput } from './emptyCompletedTurn.js'
 import {
   rebindOutboundClientMessageId,
@@ -601,6 +607,7 @@ import {
   type LocalCatalogView,
   type LocalExecutionRejectCode,
 } from './modelCatalogClient.js'
+import { suggestDelegateModels } from './delegateModelCatalogPrompt.js'
 import { resolveDelegateCostUsd } from './usageCost.js'
 import {
   buildTeamPreamble,
@@ -754,9 +761,17 @@ export function resolveExecutionModel(
     preferred !== '' &&
     !ALLOWED_INBOUND_MODELS.has(preferred)
   ) {
+    const suggestions = suggestDelegateModels(
+      preferred,
+      [...ALLOWED_INBOUND_MODELS].map((modelId) => ({ modelId, available: true })),
+    )
+    const hint =
+      suggestions.length > 0
+        ? ` 你是不是想填: ${suggestions.map((s) => `'${s}'`).join(' / ')}?`
+        : ' 系统提示「委派可用型号」段列出了可填的精确 slug。'
     throw new LocalExecutionRejected(
       'DELEGATE_MODEL_UNKNOWN',
-      `unknown explicit delegate model '${preferred}' (not inherited)`,
+      `unknown explicit delegate model '${preferred}' (not inherited).${hint} model 只能填精确 catalog slug,不要猜或截短。`,
     )
   }
   for (const m of [preferred, fallback, ...EXECUTION_MODEL_FALLBACK_ROUTE]) {
@@ -1006,9 +1021,16 @@ export function decideLocalExecution(args: {
   if (explicitModel) {
     const canonical = view.canonicalize(explicitModel)
     if (!view.isRoutable(canonical) || view.resolve(canonical)?.engine == null) {
+      // 自愈提示:只从**可路由**集合里挑近邻(不泄露不可用/无权限型号),仅作建议不自动替换。
+      const suggestions = suggestDelegateModels(explicitModel, view.models)
+      const hint =
+        suggestions.length > 0
+          ? ` 你是不是想填: ${suggestions.map((s) => `'${s}'`).join(' / ')}?`
+          : ' 系统提示「委派可用型号」段列出了可填的精确 slug。'
       throw new LocalExecutionRejected(
         'DELEGATE_MODEL_UNKNOWN',
-        `model '${explicitModel}' is not in the current catalog projection (not inherited)`,
+        `model '${explicitModel}' is not in the current catalog projection (not inherited).` +
+          `${hint} model 只能填精确 catalog slug,不要猜或截短;不填则用成员绑定型号。`,
       )
     }
   }
@@ -11726,7 +11748,7 @@ export class Gateway {
       )
     }
     const { goal, context, sourceAgent, toolsets } = parsed
-    if (!goal) return this.sendError(res, 400, 'goal required')
+    if (!goal) return this.sendError(res, 400, DELEGATE_GOAL_REQUIRED_ERROR)
     const modelNorm = parseDelegateModel(parsed.model)
     if (!modelNorm.ok) return this.sendError(res, 400, modelNorm.error)
     // Flag-off: reject unknown explicit slugs before async job creation / spawn.
