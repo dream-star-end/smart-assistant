@@ -157,6 +157,10 @@ export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
   "model_pricing_0238_backup",
   "model_pricing_0245_backup",
   "model_pricing_0256_backup",
+  // 2026-09-06 selfhost sync: 0269/0270 Cursor repricing before-images. Same class —
+  // the exact manual-compensation anchor named in each migration header.
+  "model_pricing_0269_backup",
+  "model_pricing_0270_backup",
   "emergency_containment_authorizations",
   "emergency_containment_debts",
   "verification_runs",
