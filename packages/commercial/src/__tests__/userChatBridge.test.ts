@@ -49,7 +49,7 @@ import {
   SCANSCI_PAPER_HINT_MARKER,
 } from "../ws/paperIntentHint.js";
 import { GoalStateError } from "../goal/goalStateService.js";
-import { formatMessageReplyPrompt } from "@openclaude/protocol";
+import { DEFAULT_CODEX_ENGINE_MODEL, formatMessageReplyPrompt } from "@openclaude/protocol";
 
 // ------- 测试夹具:bridge gateway + mock 容器 ws server ------------------
 
@@ -1858,6 +1858,11 @@ describe("userChatBridge — model authorization", () => {
 
   test("authoritative user row is persisted before history load and current logical turn is excluded", async () => {
     const order: string[] = [];
+    const persisted: Array<Parameters<NonNullable<UserChatBridgeDeps["persistMasterUserMessage"]>>> = [];
+    const historyCalls: Array<{
+      args: Parameters<NonNullable<UserChatBridgeDeps["loadMasterSessionMessages"]>>;
+      orderAtCall: string[];
+    }> = [];
     const replyTo = {
       messageId: "a-old",
       role: "assistant" as const,
@@ -1865,29 +1870,12 @@ describe("userChatBridge — model authorization", () => {
     };
     const rig = await startRig({
       persistMasterUserMessage: async (uid, sessionId, message) => {
-        assert.equal(uid, 205n);
-        assert.equal(sessionId, "sess-persist-order");
-        assert.equal(message.id, "m-current-turn");
-        assert.equal(message.text, "continue safely");
-        assert.equal(message._modelText, "continue safely\n[attachment text]");
-        assert.deepEqual(message._replyTo, replyTo);
-        assert.deepEqual(message._media, [
-          { kind: "file", url: "/api/media/visible.txt" },
-        ]);
-        assert.deepEqual(message._routing, {
-          model: "gpt-5.6-sol",
-          teamMode: true,
-          effortLevel: "high",
-        });
+        persisted.push([uid, sessionId, structuredClone(message)]);
         order.push("persist");
         return { applied: true };
       },
       loadMasterSessionMessages: async (_uid, _sessionId, options) => {
-        assert.deepEqual(order, ["persist"]);
-        assert.equal(
-          options.currentUserText,
-          formatMessageReplyPrompt("continue safely\n[attachment text]", replyTo),
-        );
+        historyCalls.push({ args: [_uid, _sessionId, structuredClone(options)], orderAtCall: [...order] });
         order.push("history");
         return [
           { id: "u-old", role: "user", text: "older question", ts: 1 },
@@ -1901,10 +1889,8 @@ describe("userChatBridge — model authorization", () => {
       const containerOpenP = waitNextContainerSocket(rig);
       const ws = openClient(rig.gatewayPort, await makeJwt("205"));
       await new Promise<void>((resolve) => ws.once("open", () => resolve()));
-      const containerWs = await containerOpenP;
-      const forwardedP = new Promise<Record<string, unknown>>((resolve) => {
-        containerWs.once("message", (data) => resolve(JSON.parse(data.toString())));
-      });
+      await containerOpenP;
+      const seenBefore = rig.containerSeen.length;
       ws.send(JSON.stringify({
         type: "inbound.message",
         channel: "webchat",
@@ -1923,7 +1909,36 @@ describe("userChatBridge — model authorization", () => {
           replyTo,
         },
       }));
-      const forwarded = await forwardedP;
+      // Mock callbacks must not assert: the bridge catches persistence failures.
+      // Assert in this control flow before waiting for any container output.
+      await waitFor(() => persisted.length === 1);
+      const [uid, sessionId, message] = persisted[0]!;
+      assert.equal(uid, 205n);
+      assert.equal(sessionId, "sess-persist-order");
+      assert.equal(message.id, "m-current-turn");
+      assert.equal(message.text, "continue safely");
+      assert.equal(message._modelText, "continue safely\n[attachment text]");
+      assert.deepEqual(message._replyTo, replyTo);
+      assert.deepEqual(message._media, [
+        { kind: "file", url: "/api/media/visible.txt" },
+      ]);
+      assert.deepEqual(message._routing, {
+        model: DEFAULT_CODEX_ENGINE_MODEL,
+        teamMode: true,
+        effortLevel: "high",
+      });
+      await waitFor(() => historyCalls.length === 1);
+      assert.deepEqual(historyCalls[0]!.orderAtCall, ["persist"]);
+      assert.equal(
+        historyCalls[0]!.args[2].currentUserText,
+        formatMessageReplyPrompt("continue safely\n[attachment text]", replyTo),
+      );
+      const findForwarded = () => rig.containerSeen.slice(seenBefore)
+        .map(({ data }) => JSON.parse(data.toString()) as Record<string, unknown>)
+        .find((frame) => frame.clientMessageId === "m-current-turn");
+      await waitFor(() => findForwarded() !== undefined);
+      const forwarded = findForwarded()!;
+      assert.equal(forwarded.model, DEFAULT_CODEX_ENGINE_MODEL);
       assert.deepEqual(order, ["persist", "history"]);
       assert.deepEqual(forwarded._masterHistoricalMessages, [
         { id: "u-old", role: "user", text: "older question", ts: 1 },
@@ -1938,11 +1953,11 @@ describe("userChatBridge — model authorization", () => {
   });
 
   test("browser workspace mode is stripped and replaced with the database authority", async () => {
+    const workspaceCalls: Array<{ uid: bigint; sessionId: string }> = [];
     const rig = await startRig({
       persistMasterUserMessage: async () => ({ applied: true }),
       loadSessionWorkspaceMode: async (uid, sessionId) => {
-        assert.equal(uid, 211n);
-        assert.equal(sessionId, "sess-workspace-authority");
+        workspaceCalls.push({ uid, sessionId });
         return "isolated_v1";
       },
     });
@@ -1950,10 +1965,8 @@ describe("userChatBridge — model authorization", () => {
       const containerOpenP = waitNextContainerSocket(rig);
       const ws = openClient(rig.gatewayPort, await makeJwt("211"));
       await new Promise<void>((resolve) => ws.once("open", () => resolve()));
-      const containerWs = await containerOpenP;
-      const forwardedP = new Promise<Record<string, unknown>>((resolve) => {
-        containerWs.once("message", (data) => resolve(JSON.parse(data.toString())));
-      });
+      await containerOpenP;
+      const seenBefore = rig.containerSeen.length;
       ws.send(JSON.stringify({
         type: "inbound.message",
         channel: "webchat",
@@ -1963,7 +1976,13 @@ describe("userChatBridge — model authorization", () => {
         content: { text: "isolate me" },
         _workspaceMode: "legacy",
       }));
-      const forwarded = await forwardedP;
+      await waitFor(() => workspaceCalls.length === 1);
+      assert.deepEqual(workspaceCalls, [{ uid: 211n, sessionId: "sess-workspace-authority" }]);
+      const findForwarded = () => rig.containerSeen.slice(seenBefore)
+        .map(({ data }) => JSON.parse(data.toString()) as Record<string, unknown>)
+        .find((frame) => frame.clientMessageId === "m-workspace-authority");
+      await waitFor(() => findForwarded() !== undefined);
+      const forwarded = findForwarded()!;
       assert.equal(forwarded._workspaceMode, "isolated_v1");
       ws.close();
       await waitClose(ws);

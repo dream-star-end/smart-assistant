@@ -4570,6 +4570,25 @@ export class SessionManager {
     session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
     try {
       await prev
+      // A deferred dispatch can be cancelled while its predecessor owns the lock.
+      // Fence it before resume promotion / runner reconfiguration, not only before
+      // submitTurn. This read does not replace the final queued -> running CAS:
+      // a cancellation after this read is still handled by that authoritative CAS.
+      if (opts?.dispatchContext) {
+        const ctx = opts.dispatchContext
+        // Lookup errors propagate fail-closed through the existing catch/finally.
+        const current = await getTurnDispatchByDispatchId(ctx.dispatchId, ctx.attemptNo)
+        if (
+          current?.state === 'rejected' &&
+          current.userId === ctx.userId &&
+          current.sessionId === ctx.sessionId &&
+          current.clientMessageId === ctx.clientMessageId &&
+          current.dispatchId === ctx.dispatchId &&
+          current.attemptNo === ctx.attemptNo
+        ) {
+          return
+        }
+      }
       // Browser Stop must own the complete logical turn, including the gap
       // between engine attempts while an automatic retry is backing off.
       session._externalTurnAbort = logicalTurnAbort
