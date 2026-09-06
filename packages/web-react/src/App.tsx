@@ -10,6 +10,7 @@ import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
+import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer } from "./components/Composer";
@@ -281,9 +282,12 @@ export function App() {
     !demo && location.pathname === "/reset-password"
       ? params.get("token") || undefined
       : undefined;
-  // P7 最小路由（无路由库）：demo / reset-password 特判不启用。boot 时一次性解析
+  // 桌面 enrollment 确认页：/desktop/enroll?enrollment_id=（gateway SPA fallback 无扩展名回退
+  // index.html，与 /reset-password 同族）。demo 模式不启用。
+  const desktopEnroll = !demo && location.pathname === "/desktop/enroll";
+  // P7 最小路由（无路由库）：demo / reset-password / desktop/enroll 特判不启用。boot 时一次性解析
   // URL 深链（会话 /s/<id> + 面板 ?panel=），此后 URL 是状态的 replaceState 单向镜像。
-  const routingEnabled = !demo && !resetToken;
+  const routingEnabled = !demo && !resetToken && !desktopEnroll;
   const bootPanel = routingEnabled ? parsePanelParam(params) : null;
   const bootTutorialCommunity = routingEnabled ? parseTutorialCommunity(params) : null;
   const bootTutorialCase = routingEnabled ? parseTutorialCase(params) : null;
@@ -310,7 +314,7 @@ export function App() {
   );
   // 视图态：home=营销首页,app=登录页/工作区。启动静默续期成功（useAuth onBootAuthed）
   // 直接置 app,失败停在 home。
-  const [view, setView] = useState<"home" | "app">(resetToken ? "app" : "home");
+  const [view, setView] = useState<"home" | "app">(resetToken || desktopEnroll ? "app" : "home");
   // AuthGate 初始模式：「免费开始」=register，顶栏「登录」=login，重置链接=reset。
   const [authMode, setAuthMode] = useState<AuthMode>(resetToken ? "reset" : "login");
   // 主题的唯一权威源：useTheme 是「挂载读 localStorage」的单实例，经 props 下传给顶栏快捷开关
@@ -2706,7 +2710,7 @@ export function App() {
   }
   // A transient boot failure is not a logout. Surface the dedicated recovery
   // action immediately instead of hiding it behind the ordinary landing page.
-  if (!demo && view === "home" && !authRecoveryAvailable) {
+  if (!demo && view === "home" && !authRecoveryAvailable && !desktopEnroll) {
     return (
       <>
         <LazyBoundary fallback={<SplashFallback />}>
@@ -2813,6 +2817,10 @@ export function App() {
           error={authError}
           onRetrySession={authRecoveryAvailable ? retryBoot : undefined}
           onBack={() => {
+            if (desktopEnroll) {
+              window.location.assign("/");
+              return;
+            }
             if (authRecoveryAvailable) clearAuth();
             setAuthMode("login");
             setView("home");
@@ -2829,6 +2837,10 @@ export function App() {
         />
       </div>
     );
+  }
+
+  if (desktopEnroll && auth) {
+    return <DesktopEnrollPage auth={auth} />;
   }
 
   const showEmpty = demo ? messages.length === 0 && !busy : wsMessages.length === 0 && !wsSending;
