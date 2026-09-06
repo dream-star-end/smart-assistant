@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { ChatInteractionContext } from "../tool/context";
@@ -70,6 +70,27 @@ describe("F3 UserCard 发送失败重试命中区", () => {
   test("非 error 态不渲染重试按钮", () => {
     render(<UserCard msg={userMsg({ status: "sent" })} cb={{ onRetrySend: () => {} }} />);
     expect(screen.queryByRole("button", { name: /重试/ })).toBeNull();
+  });
+});
+
+describe("UserCard 复制", () => {
+  test("status=replied 时复制按钮写入消息文本", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    render(<UserCard msg={userMsg({ status: "replied", text: "请把这段复制走" })} cb={{ onQuote: () => {} }} />);
+    const copy = screen.getByRole("button", { name: "复制" });
+    expect(copy).toHaveClass("[@media(hover:none)]:size-11");
+    fireEvent.click(copy);
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("请把这段复制走"));
+  });
+
+  test("error 态仍显示复制，sending 不显示", () => {
+    const { rerender } = render(
+      <UserCard msg={userMsg({ status: "error", text: "失败内容" })} cb={{ onQuote: () => {} }} />,
+    );
+    expect(screen.getByRole("button", { name: "复制" })).toBeInTheDocument();
+    rerender(<UserCard msg={userMsg({ status: "sending", text: "发送中" })} cb={{ onQuote: () => {} }} />);
+    expect(screen.queryByRole("button", { name: "复制" })).toBeNull();
   });
 });
 
