@@ -254,6 +254,19 @@ declare global {
         unpublishedRowText?: string;
         unpublishedRowHidden: boolean;
       }>;
+      /** Phase-B lands the same-id final segment as a `_payloadDeferred` stub
+       *  (INC-20260905-TURNEND-DEFERRED-STUB-SWALLOW). mode="deferred" stops in
+       *  the stub window; mode="exact" continues until the real record arrives. */
+      runPhaseBDeferredLastSegmentIdCollision: (
+        mode: "deferred" | "exact",
+      ) => Promise<{
+        sending: boolean;
+        visibleAssistant: Array<{ id: string; text: string }>;
+        lastSegmentText?: string;
+        lastSegmentDeferred: boolean;
+        lastSegmentHelperText?: string;
+        helperFieldGone: boolean;
+      }>;
       /** Phase-B deferred agent-group stub + empty live-units reset must keep live agent-group. */
       runPhaseBDeferredAgentGroupReset: () => Promise<{
         sending: boolean;
@@ -414,6 +427,9 @@ window.__replayDrive = {
   },
   runPhaseALastSegmentIdCollision: async () => {
     throw new Error("phase-a last-segment id collision probe 未挂载");
+  },
+  runPhaseBDeferredLastSegmentIdCollision: async () => {
+    throw new Error("phase-b deferred last-segment id collision probe 未挂载");
   },
   runPhaseBDeferredAgentGroupReset: async () => {
     throw new Error("phase-b deferred agent-group reset probe 未挂载");
@@ -2441,6 +2457,198 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
           .map((message) => ({ id: message.id, text: message.text })),
         unpublishedRowText: unpublishedRow?.text,
         unpublishedRowHidden: unpublishedRow?._hideUnpublishedFallback === true,
+      };
+    },
+    runPhaseBDeferredLastSegmentIdCollision: async (mode: "deferred" | "exact") => {
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        "phase-b deferred last-segment id collision",
+      );
+      const clientMessageId = "m-browser-phase-b-defer";
+      const firstSegmentId = `srv-${REPLAY_SESSION_ID}-main-t1-s0`;
+      const lastSegmentId = `srv-${REPLAY_SESSION_ID}-main-t1-s1`;
+      const user = {
+        id: clientMessageId,
+        role: "user" as const,
+        text: "BROWSER_PB_DEFER_USER",
+        ts: 1,
+        status: "sent" as const,
+        _source: "server" as const,
+        _seq: 1,
+        _orderSeq: 1,
+        _timelineRecord: true,
+        _timelineUnitKey: `outer:${REPLAY_SESSION_ID}:1`,
+      };
+      session._sendingInFlight = true;
+      session._activeClientMessageId = clientMessageId;
+      session.messages = [
+        user,
+        {
+          id: firstSegmentId,
+          role: "assistant" as const,
+          text: "BROWSER_PB_DEFER_A1",
+          ts: 3,
+          _clientMessageId: clientMessageId,
+        },
+        {
+          id: "browser-pb-defer-tool",
+          role: "tool" as const,
+          text: "",
+          toolName: "Bash",
+          output: "BROWSER_PB_DEFER_TOOL",
+          _completed: true,
+          ts: 4,
+          _clientMessageId: clientMessageId,
+        },
+        {
+          id: lastSegmentId,
+          role: "assistant" as const,
+          text: "BROWSER_PB_DEFER_FINAL",
+          ts: 5,
+          _clientMessageId: clientMessageId,
+        },
+      ];
+      // Phase-A: records_unpublished fallback stamped with visible_head.messageId
+      // = the LAST assistant segment id (gen-4 collision).
+      replaySocket.applyServerMessages(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        [
+          user,
+          {
+            id: lastSegmentId,
+            role: "assistant" as const,
+            text: "BROWSER_PB_DEFER_A1BROWSER_PB_DEFER_FINAL",
+            ts: 5,
+            _source: "server" as const,
+            _seq: 2,
+            _orderSeq: 2,
+            _clientMessageId: clientMessageId,
+            _turnTapeId: "tape-browser-pb-defer",
+            _turnTapeSha256: "b".repeat(64),
+            _turnTapeComplete: true,
+            _dispatchOutcome: "completed" as const,
+            _timelineRecord: true,
+            _timelineUnitKey: "tape-fallback:tape-browser-pb-defer",
+            _displayDegraded: true,
+            _displayDegradeReason: "records_unpublished",
+          },
+        ],
+        true,
+        2,
+        {
+          serverUpdatedAt: 2,
+          historyRevision: 1,
+          timelineGeneration: 2,
+          completedClientMessageId: clientMessageId,
+        },
+      );
+      replaySocket.applyLiveUnits(REPLAY_SESSION_ID, [], [clientMessageId]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // Phase-B: readable s0 + tool + deferred (>1MiB) s1 locator under the
+      // same id the live row / Phase-A fallback already used (gen-5).
+      const tapeCommon = {
+        _source: "server" as const,
+        _seq: 3,
+        _clientMessageId: clientMessageId,
+        _turnTapeId: "tape-browser-pb-defer",
+        _turnTapeSha256: "b".repeat(64),
+        _turnTapeComplete: true,
+        _dispatchOutcome: "completed" as const,
+        _timelineRecord: true,
+      };
+      const deferredPhaseB = [
+        user,
+        {
+          id: firstSegmentId,
+          role: "assistant" as const,
+          text: "BROWSER_PB_DEFER_A1",
+          ts: 3,
+          ...tapeCommon,
+          _orderSeq: 2,
+          _turnTapeOrdinal: 1,
+          _timelineUnitKey: "tape:browser-pb-defer:1",
+        },
+        {
+          id: "browser-pb-defer-tape-tool",
+          role: "tool" as const,
+          text: "",
+          toolName: "Bash",
+          output: "BROWSER_PB_DEFER_TOOL",
+          _completed: true,
+          ts: 4,
+          ...tapeCommon,
+          _orderSeq: 3,
+          _turnTapeOrdinal: 2,
+          _timelineUnitKey: "tape:browser-pb-defer:2",
+        },
+        {
+          id: lastSegmentId,
+          role: "assistant" as const,
+          text: "",
+          ts: 5,
+          ...tapeCommon,
+          _orderSeq: 4,
+          _turnTapeOrdinal: 3,
+          _timelineUnitKey: "tape:browser-pb-defer:3",
+          _payloadDeferred: true,
+          _payloadBytes: 1_572_864,
+        },
+      ];
+      replaySocket.applyServerMessages(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        deferredPhaseB,
+        true,
+        3,
+        {
+          serverUpdatedAt: 3,
+          historyRevision: 2,
+          timelineGeneration: 3,
+          completedClientMessageId: clientMessageId,
+        },
+      );
+      replaySocket.applyLiveUnits(REPLAY_SESSION_ID, [], [clientMessageId]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (mode === "exact") {
+        replaySocket.applyServerMessages(
+          REPLAY_SESSION_ID,
+          REPLAY_AGENT_ID,
+          deferredPhaseB.map((message) =>
+            message.id === lastSegmentId
+              ? {
+                  ...message,
+                  text: "BROWSER_PB_DEFER_FINAL_EXACT",
+                  _payloadDeferred: undefined,
+                  _payloadBytes: undefined,
+                }
+              : message,
+          ),
+          true,
+          4,
+          {
+            serverUpdatedAt: 4,
+            historyRevision: 3,
+            timelineGeneration: 4,
+            completedClientMessageId: clientMessageId,
+          },
+        );
+        replaySocket.applyLiveUnits(REPLAY_SESSION_ID, [], [clientMessageId]);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      const lastSegment = session.messages.find((message) => message.id === lastSegmentId);
+      return {
+        sending: session._sendingInFlight === true,
+        visibleAssistant: session.messages
+          .filter((message) => message.role === "assistant" && !message._hideUnpublishedFallback)
+          .map((message) => ({ id: message.id, text: message.text })),
+        lastSegmentText: lastSegment?.text,
+        lastSegmentDeferred: lastSegment?._payloadDeferred === true,
+        lastSegmentHelperText: lastSegment?._unpublishedFallbackLiveText,
+        helperFieldGone: !session.messages.some(
+          (message) => message._unpublishedFallbackLiveText !== undefined),
       };
     },
     runPhaseBDeferredAgentGroupReset: async () => {

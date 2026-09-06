@@ -209,6 +209,21 @@ describe("Sidebar 会话列表", () => {
     expect(onLogout).toHaveBeenCalledTimes(1);
   });
 
+  it("「ChatGPT 直连」只在 App 传入回调时出现在账号菜单，未授权不渲染", () => {
+    renderSidebar({ onOpenAccount: () => {}, onOpenMediaTasks: () => {} });
+    openAccountMenu();
+    expect(screen.queryByRole("menuitem", { name: "ChatGPT 直连" })).toBeNull();
+    cleanup();
+
+    const onOpenChatGptProxy = vi.fn();
+    renderSidebar({ onOpenAccount: () => {}, onOpenChatGptProxy });
+    openAccountMenu();
+    const item = screen.getByRole("menuitem", { name: "ChatGPT 直连" });
+    expect(item).toHaveAttribute("data-product-control");
+    fireEvent.click(item);
+    expect(onOpenChatGptProxy).toHaveBeenCalledTimes(1);
+  });
+
   it("点击用户区先弹出账号菜单，而不是直接进入设置", () => {
     const onOpenAccount = vi.fn();
     renderSidebar({ onOpenAccount });

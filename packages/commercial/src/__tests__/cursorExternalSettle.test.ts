@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  CURSOR_SETTLE_SURCHARGE_ENV,
   cursorSettleMultiplier,
   mapCursorReportedUsage,
+  parseCursorSettleSurcharge,
   planCursorExternalSettle,
 } from "../billing/cursorExternalSettle.js";
 import type { ModelPricing } from "../billing/pricing.js";
@@ -181,5 +183,87 @@ describe("planCursorExternalSettle", () => {
     const err = planCursorExternalSettle({ engineStatus: "error", usage, pricing: fable });
     assert.equal(err.costCredits, 0n);
     assert.match(err.snapshotJson, /"wouldHaveCharged":"22404"/);
+  });
+
+  describe("COMMERCIAL_CURSOR_SETTLE_SURCHARGE_MULTIPLIER override", () => {
+    test("parses canonical NUMERIC(6,3) strings and rejects garbage", () => {
+      assert.equal(parseCursorSettleSurcharge(undefined), null);
+      assert.equal(parseCursorSettleSurcharge(""), null);
+      assert.equal(parseCursorSettleSurcharge("0"), null);
+      assert.equal(parseCursorSettleSurcharge("-1"), null);
+      assert.equal(parseCursorSettleSurcharge("abc"), null);
+      assert.equal(parseCursorSettleSurcharge("1e3"), null);
+      assert.equal(parseCursorSettleSurcharge("1"), "1.000");
+      assert.equal(parseCursorSettleSurcharge(" 1.5 "), "1.500");
+      assert.equal(parseCursorSettleSurcharge("2.000"), "2.000");
+    });
+
+    test("1.000 disables the surcharge: selfhost 0269 catalog price is the debited price", () => {
+      const env = { [CURSOR_SETTLE_SURCHARGE_ENV]: "1.000" };
+      assert.equal(cursorSettleMultiplier("cursor-fable-5.1-high", env), null);
+      assert.equal(cursorSettleMultiplier("cursor-opus-5-high-fast", env), null);
+      assert.equal(cursorSettleMultiplier("cursor-grok-4.6-high", env), null);
+    });
+
+    test("other values override the default; invalid falls back to 2.000", () => {
+      assert.equal(cursorSettleMultiplier("cursor-fable-5.1-high", { [CURSOR_SETTLE_SURCHARGE_ENV]: "1.5" }), "1.500");
+      assert.equal(cursorSettleMultiplier("cursor-fable-5.1-high", { [CURSOR_SETTLE_SURCHARGE_ENV]: "nope" }), "2.000");
+      assert.equal(cursorSettleMultiplier("cursor-fable-5.1-high", {}), "2.000");
+      // Non-surcharged families never pick it up regardless of env.
+      assert.equal(cursorSettleMultiplier("cursor-grok-4.6-high", { [CURSOR_SETTLE_SURCHARGE_ENV]: "3" }), null);
+    });
+
+    test("planCursorExternalSettle honours the override through process.env (0269 fable at 150 credits/USD)", () => {
+      const prev = process.env[CURSOR_SETTLE_SURCHARGE_ENV];
+      process.env[CURSOR_SETTLE_SURCHARGE_ENV] = "1.000";
+      try {
+        // 0269 Fable 5.1 fen/MTok: 1500 / 7500 / 38 / 1875.
+        const fable = pricing({
+          model_id: "cursor-fable-5.1-high",
+          multiplier: "1.000",
+          input_per_mtok: 1500n,
+          output_per_mtok: 7500n,
+          cache_read_per_mtok: 38n,
+          cache_write_per_mtok: 1875n,
+        });
+        // A real Cursor Fable 5.1 cycle row from the pool snapshot:
+        // 23_532 in / 3_447_104 out / 28_139_627 cw / 410_126_070 cr = 626.52 USD.
+        const usage = {
+          input_tokens: 23_532,
+          output_tokens: 3_447_104,
+          cache_read_tokens: 410_126_070,
+          cache_write_tokens: 28_139_627,
+        };
+        const plan = planCursorExternalSettle({ engineStatus: "success", usage, pricing: fable });
+        // cost_credits debits the ledger 1:1 (what the UI shows as 积分):
+        // ≈ 94_235 credits → 150.4 credits per USD.
+        const perUsd = Number(plan.costCredits) / 626.52;
+        assert.ok(perUsd > 148 && perUsd < 153, `expected ~150 credits/USD, got ${perUsd}`);
+        assert.match(plan.snapshotJson, /"multiplier":"1.000"/);
+        assert.doesNotMatch(plan.snapshotJson, /cursor_settle_multiplier/);
+        assert.doesNotMatch(plan.snapshotJson, /catalog_multiplier/);
+
+        // Fast sibling keeps its own catalog 2x and nothing more.
+        const opusFast = pricing({
+          model_id: "cursor-opus-5-high-fast",
+          multiplier: "2.000",
+          input_per_mtok: 1050n,
+          output_per_mtok: 3750n,
+          cache_read_per_mtok: 27n,
+          cache_write_per_mtok: 1313n,
+        });
+        const fast = planCursorExternalSettle({
+          engineStatus: "success",
+          usage: { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_tokens: 0, cache_write_tokens: 0 },
+          pricing: opusFast,
+        });
+        assert.equal(fast.costCredits, 9_600n);
+        assert.match(fast.snapshotJson, /"multiplier":"2.000"/);
+        assert.doesNotMatch(fast.snapshotJson, /cursor_settle_multiplier/);
+      } finally {
+        if (prev === undefined) delete process.env[CURSOR_SETTLE_SURCHARGE_ENV];
+        else process.env[CURSOR_SETTLE_SURCHARGE_ENV] = prev;
+      }
+    });
   });
 });

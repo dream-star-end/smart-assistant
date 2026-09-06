@@ -15,7 +15,9 @@ import { describe, test } from 'node:test'
 import { ZCODE_HOSTED_PERMISSION_MODE } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import { existsSync, readFileSync } from 'node:fs'
+import { CREDIT_EXHAUSTED_DETAIL } from '../creditExhaustion.js'
 import { ZcodeAdapter, _internals } from '../engine/zcodeAdapter.js'
+import { _setPlatformPricingLookupForTests } from '../usageCost.js'
 import type { EngineEvent, EngineExternalBillingEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 
@@ -469,6 +471,99 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
       assert.equal(events.at(-1)?.event.kind, 'final')
       assert.equal(observedAuth, `Bearer oc-v3.1.${'a'.repeat(64)}`)
     } finally {
+      restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
+      restoreEnv('OPENCLAUDE_V3_CONTAINER_TOKEN', previousContainerToken)
+      await closeServer(server)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('OCV5-92 creditBudgetFen: relay-metered usage reaching the budget SIGINTs the CLI and bills the metered tokens as success', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-credit-stop-'))
+    const fake = path.join(dir, 'fake-zcode-credit-stop.cjs')
+    await writeFile(path.join(dir, 'persona.md'), 'persona-line')
+    // Never prints final JSON on its own: only the budget SIGINT ends it.
+    await writeFile(fake, [
+      '#!/usr/bin/env node',
+      "process.on('SIGINT', () => process.exit(130))",
+      'setInterval(() => {}, 1000)',
+    ].join('\n'))
+    await chmod(fake, 0o755)
+    const token = 'e'.repeat(64)
+    let polls = 0
+    const server = createServer((req, res) => {
+      polls++
+      const parsed = new URL(req.url ?? '/', 'http://local')
+      const after = Number(parsed.searchParams.get('after') ?? '0')
+      // 100 fen / M input: first poll 50 fen (< 120), from the second poll on 150 fen (≥ 120).
+      const usage = polls === 1
+        ? { input_tokens: 500_000, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+        : { input_tokens: 1_500_000, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+      const events = after < 1 ? [{ seq: 1, kind: 'text', text: '部分输出' }] : []
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ events, next: events.at(-1)?.seq ?? after, done: false, usage }))
+    })
+    const port = await listen(server)
+    const previousBin = process.env.OC_ZCODE_CLI_BIN
+    const previousContainerToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+    process.env.OC_ZCODE_CLI_BIN = fake
+    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = `oc-v3.1.${'a'.repeat(64)}`
+    _setPlatformPricingLookupForTests(async () => ({
+      inputPerMtok: '100',
+      outputPerMtok: '1000',
+      cacheReadPerMtok: '10',
+      cacheWritePerMtok: '0',
+      multiplier: '1.000',
+    }))
+    try {
+      const adapter = new ZcodeAdapter(createOpts(dir))
+      adapter.setZcodeRoute({
+        baseUrl: `http://127.0.0.1:${port}/internal/v5/zcode-relay/route/${token}`,
+        routeToken: token,
+      })
+      const events: EngineEvent[] = []
+      const billing: EngineExternalBillingEvent[] = []
+      const exits: Array<{ code: number | null; crashed: boolean }> = []
+      adapter.on('error', () => {})
+      adapter.on('external_billing', (event: EngineExternalBillingEvent) => billing.push(event))
+      adapter.on('exit', (info: { code: number | null; crashed: boolean }) => exits.push(info))
+      const run = adapter.submitTurn({
+        input: 'burn budget',
+        requestId: REQUEST_ID,
+        creditBudgetFen: 120n,
+        onEvent: (event) => events.push(event),
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await Promise.race([
+        run.summary,
+        new Promise<null>((_, reject) => setTimeout(() => reject(new Error('budget hard-stop did not finalize in time')), 15_000)),
+      ])
+      await adapter.waitForOutputDrain()
+      assert.ok(summary)
+      assert.equal(summary.isError, true)
+      assert.equal(summary.errorClass, 'insufficient_credits')
+      assert.equal(summary.errorDetail, CREDIT_EXHAUSTED_DETAIL)
+      assert.equal(summary.stopReason, 'error')
+      // Relay-metered usage survives the kill (CLI never printed final JSON).
+      assert.equal(summary.usage.inputTokens, 1_500_000)
+      assert.ok(polls >= 2, `expected at least two relay polls, saw ${polls}`)
+      // SIGINT of our own making is not a crash.
+      assert.equal(exits.length, 1)
+      assert.equal(exits[0]?.crashed, false)
+      const errors = events.filter((event) => event.kind === 'error')
+      assert.equal(errors.length, 1)
+      assert.equal((errors[0] as { errorClass?: string }).errorClass, 'insufficient_credits')
+      assert.equal(events.at(-1)?.kind, 'final')
+      // zcodeCatalogSettle charges only engineOk: the metered tokens must
+      // settle as success, never USER_CANCELLED / ENGINE_ERROR.
+      assert.equal(billing.length, 1)
+      assert.equal(billing[0]?.status, 'success')
+      assert.equal(billing[0]?.terminalCode, undefined)
+      assert.equal(billing[0]?.usage?.input_tokens, 1_500_000)
+    } finally {
+      _setPlatformPricingLookupForTests(null)
       restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
       restoreEnv('OPENCLAUDE_V3_CONTAINER_TOKEN', previousContainerToken)
       await closeServer(server)

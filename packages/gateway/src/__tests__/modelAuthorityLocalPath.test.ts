@@ -322,6 +322,38 @@ describe('② flag 开 + catalog 可用 → engine/model 取投影', () => {
     assert.equal(d.canonicalModel, 'deepseek-v4-pro')
   })
 
+  test('DELEGATE_MODEL_UNKNOWN 附可路由近邻候选(gpt-6 → gpt-6-astra),不列不可用型号', () => {
+    const v = view([
+      row('glm-5.2', 'ccb'),
+      row('gpt-6-astra', 'codex'),
+      row('gpt-6-astra-1m', 'codex'),
+      { ...row('gpt-6-hidden', 'codex'), available: false },
+    ])
+    assert.throws(
+      () =>
+        decideLocalExecution({ view: v, agent: AGENT, model: 'gpt-6', defaultModel: 'glm-5.2', kind: 'turn' }),
+      (err: unknown) => {
+        const e = err as { code?: string; message: string }
+        assert.equal(e.code, 'DELEGATE_MODEL_UNKNOWN')
+        assert.match(e.message, /你是不是想填: 'gpt-6-astra' \/ 'gpt-6-astra-1m'/)
+        assert.doesNotMatch(e.message, /gpt-6-hidden/)
+        assert.match(e.message, /不要猜或截短/)
+        return true
+      },
+    )
+    // 没有近邻 → 引导看「委派可用型号」段,不给假候选
+    assert.throws(
+      () =>
+        decideLocalExecution({ view: v, agent: AGENT, model: 'claude-opus-9', defaultModel: 'glm-5.2', kind: 'turn' }),
+      (err: unknown) => {
+        const e = err as { message: string }
+        assert.match(e.message, /「委派可用型号」/)
+        assert.doesNotMatch(e.message, /你是不是想填/)
+        return true
+      },
+    )
+  })
+
   test('explicit unknown slug is DELEGATE_MODEL_UNKNOWN and does not inherit', () => {
     assert.throws(
       () =>

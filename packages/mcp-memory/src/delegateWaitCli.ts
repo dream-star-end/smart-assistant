@@ -7,8 +7,11 @@
 import {
   formatDelegateHttpResult,
   interpretDelegateWaitBody,
+  isTransientDelegateWaitError,
   type FormattedDelegateResult,
 } from './delegateCursorFastPath.js'
+
+export { isTransientDelegateWaitError }
 
 export const DEFAULT_DELEGATE_WAIT_POLL_MS = 30_000
 export const MIN_DELEGATE_WAIT_POLL_MS = 250
@@ -66,20 +69,6 @@ export type DelegateWaitLoopResult = {
 }
 
 const BUSY_LOOP_GUARD_MS = 200
-
-/** Transport blip on one long-poll: keep waiting instead of failing the whole CLI. */
-export function isTransientDelegateWaitError(err: unknown): boolean {
-  const e = err as { code?: string; cause?: { code?: string }; message?: unknown }
-  const code = e?.code || e?.cause?.code
-  const msg = String(e?.message ?? err)
-  return (
-    code === 'ETIMEDOUT' ||
-    code === 'ECONNRESET' ||
-    code === 'EPIPE' ||
-    /delegate client timeout/i.test(msg) ||
-    /socket hang up/i.test(msg)
-  )
-}
 
 export async function runDelegateWaitLoop(opts: {
   jobIds: string[]

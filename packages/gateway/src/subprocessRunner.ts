@@ -24,7 +24,7 @@ import {
   shutdownTimeoutMs as runnerShutdownTimeoutMs,
   waitForCloseWithin,
 } from './processGroupShutdown.js'
-import { decideEngineCwd } from './engineCwd.js'
+import { decideEngineCwd, resolveDesktopWorkspaceDir } from './engineCwd.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { projectCcbMcpAvailability } from './ccbMcpAvailability.js'
 import { buildPromptContext } from './promptSlots.js'
@@ -420,12 +420,21 @@ export function finalizeCcbSpawnEnv(input: {
   providerEnv: Record<string, string>
   routing: 'host-static' | 'oauth-direct' | 'settings-default'
 }): NodeJS.ProcessEnv {
+  const source = input.source ?? process.env
   const env: NodeJS.ProcessEnv = {
-    ...buildCcbSpawnProcessEnv(input.source),
+    ...buildCcbSpawnProcessEnv(source),
     ...input.providerEnv,
   }
   if (input.routing === 'oauth-direct') {
     delete env[CCB_SUBAGENT_MODEL_ENV]
+  }
+  // Desktop Host injects oc-lah.* + 18791. Keep that pin even if oauth-direct
+  // tries to clear inherited ANTHROPIC_* (zero change when token is not oc-lah).
+  const lah = source.ANTHROPIC_AUTH_TOKEN
+  if (typeof lah === 'string' && /^oc-lah\.[0-9a-f]{64}$/i.test(lah)) {
+    env.ANTHROPIC_AUTH_TOKEN = lah
+    if (source.ANTHROPIC_BASE_URL) env.ANTHROPIC_BASE_URL = source.ANTHROPIC_BASE_URL
+    delete env.ANTHROPIC_API_KEY
   }
   return env
 }
@@ -802,6 +811,11 @@ export interface SubprocessRunnerOpts {
   harness?: 'ccb' | 'official-cc'
   permissionMode?: string
   resumeSessionId?: string // 续上之前的 CCB session
+  /** Engine-agnostic durable-artifact ladder: given the native id the engine
+   *  just declared stale, return a prior id for the SAME engine whose transcript
+   *  still exists on disk (or undefined). Consumed by engines that self-heal a
+   *  stale resume inside their own turn loop (codex thread/resume). */
+  resolveResumeFallback?: (staleId: string) => string | undefined
   // Per-agent overrides
   agentProvider?: string // 覆盖 config.provider
   agentMcpServers?: McpServerConfig[] // agent 专属 MCP servers
@@ -1012,6 +1026,23 @@ export interface CcbCliArgsInput {
  * Non-interactive tools are unaffected — step 2a's bypass-allow in
  * permissions.ts fires before any ask result is ever produced for them.
  */
+
+export function resolveClaudeCodeLaunch(
+  config: OpenClaudeConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): { binaryDir: string; entry: string; runtime: 'bun' | 'node' } {
+  const pathRaw = env.OPENCLAUDE_CLAUDE_CODE_PATH?.trim() || config.auth.claudeCodePath
+  const binaryDir = resolve(pathRaw)
+  const entryRaw =
+    env.OPENCLAUDE_CLAUDE_CODE_ENTRY?.trim()
+    || config.auth.claudeCodeEntry
+    || 'src/entrypoints/cli.tsx'
+  const entry = isAbsolute(entryRaw) ? entryRaw : resolve(binaryDir, entryRaw)
+  const runtimeRaw = env.OPENCLAUDE_CLAUDE_CODE_RUNTIME?.trim() || config.auth.claudeCodeRuntime || 'bun'
+  const runtime: 'bun' | 'node' = runtimeRaw === 'node' ? 'node' : 'bun'
+  return { binaryDir, entry, runtime }
+}
+
 export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
   const {
     runtime,
@@ -1218,6 +1249,11 @@ export class SubprocessRunner extends EventEmitter {
     this.currentSessionId = null
   }
 
+  /** Steer the next spawn's `--resume` at a known-durable prior id. */
+  setResumeSessionId(sessionId: string): void {
+    this.currentSessionId = sessionId
+  }
+
   /** Update config (e.g. after OAuth token refresh). Takes effect on next start(). */
   updateConfig(config: OpenClaudeConfig): void {
     this.opts.config = config
@@ -1390,7 +1426,11 @@ export class SubprocessRunner extends EventEmitter {
       binaryDir = dirname(command)
     } else {
       try {
-        binaryDir = resolve(config.auth.claudeCodePath)
+        const launch = resolveClaudeCodeLaunch(config)
+        binaryDir = launch.binaryDir
+        ccbEntry = launch.entry
+        ccbRuntime = launch.runtime
+        command = ccbRuntime
       } catch (err) {
         this.starting = false
         throw err
@@ -1398,15 +1438,9 @@ export class SubprocessRunner extends EventEmitter {
       if (!existsSync(binaryDir)) {
         this.starting = false
         throw new Error(
-          `Claude Code path not found: ${binaryDir}. Set auth.claudeCodePath in ~/.openclaude/openclaude.json`,
+          `Claude Code path not found: ${binaryDir}. Set auth.claudeCodePath in ~/.openclaude/openclaude.json or OPENCLAUDE_CLAUDE_CODE_PATH`,
         )
       }
-      const entryRaw = config.auth.claudeCodeEntry ?? 'src/entrypoints/cli.tsx'
-      // Phase 5:子进程 cwd 即将切到 effectiveAddDir(repo workspaceDir 或 agentBaseDir),
-      // 不再是 ccbBinaryDir。entry 若是相对路径,相对于 CCB binary dir 解析。
-      ccbEntry = isAbsolute(entryRaw) ? entryRaw : resolve(binaryDir, entryRaw)
-      ccbRuntime = config.auth.claudeCodeRuntime ?? 'bun'
-      command = ccbRuntime
     }
 
     // ─── Phase 5: read repo snapshot ONCE before learning context + spawn args ──
@@ -1426,10 +1460,11 @@ export class SubprocessRunner extends EventEmitter {
         repoSnapshot = null
       }
     }
+    const desktopWorkspaceDir = resolveDesktopWorkspaceDir()
     const effectiveAddDir =
       repoSnapshot?.status === 'ready' && repoSnapshot.workspaceDir
         ? repoSnapshot.workspaceDir
-        : this.opts.agentBaseDir
+        : desktopWorkspaceDir || this.opts.agentBaseDir
     if (repoSnapshot?.status === 'ready' && repoSnapshot.workspaceDir) {
       this._boundRepoBinding = {
         selectionVersion: repoSnapshot.selectionVersion,
@@ -1912,10 +1947,8 @@ export class SubprocessRunner extends EventEmitter {
     this.emit('overflow', info)
     // Trigger an exit path: force-kill the process group so MCP children die too.
     try {
-      if (pid) {
-        try { process.kill(-pid, 'SIGKILL') } catch { proc?.kill('SIGKILL') }
-      } else {
-        proc?.kill('SIGKILL')
+      if (proc) {
+        killRunnerProcessGroup(proc, 'SIGKILL')
       }
     } catch (err) {
       runnerLog.warn('overflow kill failed', { sessionKey: this.opts.sessionKey }, err)
@@ -2256,6 +2289,7 @@ export class SubprocessRunner extends EventEmitter {
         agentBaseDir: this.opts.agentBaseDir,
         repoSnapshot,
         projectBound: Boolean(this.opts.projectId),
+        desktopWorkspaceDir: resolveDesktopWorkspaceDir(),
       })
       await persistRunContextSnapshot({
         descriptor: this.opts.runContext,

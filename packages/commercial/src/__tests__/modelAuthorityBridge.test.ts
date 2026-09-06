@@ -1642,6 +1642,10 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       assert.equal(rig.containerSeen.some((row) => row.includes('"type":"inbound.message"')), false);
       releaseHistory!([{ id: "old", role: "assistant", text: "late" }]);
       await waitFor(() => rig.containerSeen.filter((row) => row.includes('"type":"inbound.message"')).length === 1);
+      // receipt CAS 是 mock 容器收到 inbound.message 后回 receipt → bridge 再落库的异步回程,
+      // 与 R4-B1 同样要等到位再断言"只有一次"(直接断言会在负载下偶发读到 0)。
+      await waitFor(() => rig.receiptCasCalls.length >= 1);
+      await new Promise((resolve) => setTimeout(resolve, 50));
       assert.equal(rig.receiptCasCalls.length, 1);
     } finally {
       await stopRig(rig);

@@ -49,7 +49,7 @@ import {
   SCANSCI_PAPER_HINT_MARKER,
 } from "../ws/paperIntentHint.js";
 import { GoalStateError } from "../goal/goalStateService.js";
-import { formatMessageReplyPrompt } from "@openclaude/protocol";
+import { DEFAULT_CODEX_ENGINE_MODEL, formatMessageReplyPrompt } from "@openclaude/protocol";
 
 // ------- 测试夹具:bridge gateway + mock 容器 ws server ------------------
 
@@ -869,6 +869,122 @@ describe("userChatBridge — durable outbound frame ordering", () => {
       ws.close();
       await waitClose(ws);
     } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("permission authority rejection behind a busy queue never surfaces as unhandledRejection", async () => {
+    // INC-20260810-LIVE-FRAME-SEQUENCE-RESET follow-up. The permission
+    // authority write used to start at frame receipt and was only ever
+    // awaited inside the serial outbound persist queue task. While the queue
+    // was busy committing an earlier frame, that await registered only after
+    // the earlier work drained, so an immediately-rejected authority write
+    // crossed a microtask checkpoint with zero handlers → process-level
+    // unhandledRejection (fatal under --unhandled-rejections=strict). The
+    // write must start inside the queue task so the failure lands in the
+    // queue catch → onFailure → poison + close(1011), same as any other
+    // persistence failure.
+    const persisted: Array<Parameters<NonNullable<UserChatBridgeDeps["persistOutboundFrame"]>>[0]> = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const portRef = { value: 0 };
+    // pgPool must be set or the bridge never attempts the durable permission
+    // authority write; codex billing deps are all-or-none, so stub the trio.
+    // persistPermissionAuthority is a module-level import (not dep-injected),
+    // so the immediate rejection is produced through the pool's query.
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 84 }),
+      persistOutboundFrame: async (input) => {
+        persisted.push(input);
+        if (input.frameSeq === 1) await firstGate;
+      },
+      pgPool: {
+        query: async (sql: unknown) => {
+          const text = typeof sql === "string"
+            ? sql
+            : String((sql as { text?: unknown })?.text ?? "");
+          if (/INSERT INTO turn_permission_requests/.test(text)) {
+            throw new Error("permission authority db unavailable");
+          }
+          if (/SELECT status FROM users WHERE id/.test(text)) {
+            return { rows: [{ status: "active" }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        },
+      } as UserChatBridgeDeps["pgPool"],
+      preCheckRedis: {
+        async atomicReserve() { return { ok: true as const, locked: 0n, needed: 0n }; },
+        async releaseReservation() { return true; },
+      } as UserChatBridgeDeps["preCheckRedis"],
+      pricing: { get() { return null; } } as unknown as UserChatBridgeDeps["pricing"],
+    });
+    portRef.value = rig.containerPort;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const containerOpen = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("708"));
+      await new Promise<void>((resolve) => ws.once("open", resolve));
+      const containerWs = await containerOpen;
+      const business: Record<string, unknown>[] = [];
+      ws.on("message", (data) => {
+        try {
+          const frame = JSON.parse(data.toString()) as Record<string, unknown>;
+          if (typeof frame.type === "string" && !frame.type.startsWith("sys.")) business.push(frame);
+        } catch { /* irrelevant */ }
+      });
+      let closed: { code: number; reason: string } | null = null;
+      ws.once("close", (code, reason) => {
+        closed = { code, reason: reason.toString("utf8") };
+      });
+      const first = JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sess-perm-reject",
+        frameSeq: 1,
+        peer: { id: "sess-perm-reject", kind: "dm" },
+        clientMessageId: "cm-perm-reject",
+        blocks: [{ kind: "text", text: "one" }],
+      });
+      const prompt = JSON.stringify({
+        type: "outbound.permission_request",
+        sessionKey: "agent:main:webchat:dm:sess-perm-reject",
+        channel: "webchat",
+        peer: { id: "sess-perm-reject", kind: "dm" },
+        clientMessageId: "cm-perm-reject",
+        requestId: "req-perm-reject-1",
+        toolName: "ExitPlanMode",
+        toolUseId: "toolu_perm_reject",
+        inputPreview: "{}",
+        inputJson: {},
+        expiresAt: Date.now() + 60_000,
+        ts: Date.now(),
+        frameSeq: 2,
+      });
+      containerWs.send(first);
+      containerWs.send(prompt);
+      // The queue is parked on frame 1's gated commit. The old code had
+      // already started — and with this mock, already rejected — the
+      // permission authority write with no handler attached; give that
+      // hypothetical rejection every opportunity to surface while the gate
+      // is still closed.
+      await new Promise<void>((resolve) => setTimeout(resolve, 150));
+      assert.equal(unhandled.length, 0, "no unhandledRejection while the queue is busy");
+      assert.deepEqual(persisted.map((input) => input.frameSeq), [1]);
+      assert.equal(business.length, 0);
+
+      releaseFirst();
+      await waitFor(() => closed !== null);
+      assert.equal(closed!.code, CLOSE_BRIDGE.INTERNAL);
+      assert.match(closed!.reason, /output persistence unavailable/);
+      // The permission frame never became durable or browser-visible; its
+      // authority failure poisoned the namespace via the standard onFailure.
+      assert.deepEqual(persisted.map((input) => input.frameSeq), [1]);
+      assert.deepEqual(business.map((frame) => frame.frameSeq), [1]);
+      assert.equal(unhandled.length, 0, "failure adopted by the queue catch, not the process");
+      await waitClose(ws);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
       await stopRig(rig);
     }
   });
@@ -1742,6 +1858,11 @@ describe("userChatBridge — model authorization", () => {
 
   test("authoritative user row is persisted before history load and current logical turn is excluded", async () => {
     const order: string[] = [];
+    const persisted: Array<Parameters<NonNullable<UserChatBridgeDeps["persistMasterUserMessage"]>>> = [];
+    const historyCalls: Array<{
+      args: Parameters<NonNullable<UserChatBridgeDeps["loadMasterSessionMessages"]>>;
+      orderAtCall: string[];
+    }> = [];
     const replyTo = {
       messageId: "a-old",
       role: "assistant" as const,
@@ -1749,29 +1870,12 @@ describe("userChatBridge — model authorization", () => {
     };
     const rig = await startRig({
       persistMasterUserMessage: async (uid, sessionId, message) => {
-        assert.equal(uid, 205n);
-        assert.equal(sessionId, "sess-persist-order");
-        assert.equal(message.id, "m-current-turn");
-        assert.equal(message.text, "continue safely");
-        assert.equal(message._modelText, "continue safely\n[attachment text]");
-        assert.deepEqual(message._replyTo, replyTo);
-        assert.deepEqual(message._media, [
-          { kind: "file", url: "/api/media/visible.txt" },
-        ]);
-        assert.deepEqual(message._routing, {
-          model: "gpt-5.6-sol",
-          teamMode: true,
-          effortLevel: "high",
-        });
+        persisted.push([uid, sessionId, structuredClone(message)]);
         order.push("persist");
         return { applied: true };
       },
       loadMasterSessionMessages: async (_uid, _sessionId, options) => {
-        assert.deepEqual(order, ["persist"]);
-        assert.equal(
-          options.currentUserText,
-          formatMessageReplyPrompt("continue safely\n[attachment text]", replyTo),
-        );
+        historyCalls.push({ args: [_uid, _sessionId, structuredClone(options)], orderAtCall: [...order] });
         order.push("history");
         return [
           { id: "u-old", role: "user", text: "older question", ts: 1 },
@@ -1785,9 +1889,11 @@ describe("userChatBridge — model authorization", () => {
       const containerOpenP = waitNextContainerSocket(rig);
       const ws = openClient(rig.gatewayPort, await makeJwt("205"));
       await new Promise<void>((resolve) => ws.once("open", () => resolve()));
-      const containerWs = await containerOpenP;
-      const forwardedP = new Promise<Record<string, unknown>>((resolve) => {
-        containerWs.once("message", (data) => resolve(JSON.parse(data.toString())));
+      await containerOpenP;
+      const seenBefore = rig.containerSeen.length;
+      const browserFrames: Record<string, unknown>[] = [];
+      ws.on("message", (data) => {
+        try { browserFrames.push(JSON.parse(data.toString()) as Record<string, unknown>); } catch { /* ignore */ }
       });
       ws.send(JSON.stringify({
         type: "inbound.message",
@@ -1807,7 +1913,40 @@ describe("userChatBridge — model authorization", () => {
           replyTo,
         },
       }));
-      const forwarded = await forwardedP;
+      // Mock callbacks must not assert: the bridge catches persistence failures.
+      // Assert in this control flow before waiting for any container output.
+      await waitFor(() => persisted.length === 1);
+      const [uid, sessionId, message] = persisted[0]!;
+      assert.equal(uid, 205n);
+      assert.equal(sessionId, "sess-persist-order");
+      assert.equal(message.id, "m-current-turn");
+      assert.equal(message.text, "continue safely");
+      assert.equal(message._modelText, "continue safely\n[attachment text]");
+      assert.deepEqual(message._replyTo, replyTo);
+      assert.deepEqual(message._media, [
+        { kind: "file", url: "/api/media/visible.txt" },
+      ]);
+      assert.deepEqual(message._routing, {
+        model: DEFAULT_CODEX_ENGINE_MODEL,
+        teamMode: true,
+        effortLevel: "high",
+      });
+      await waitFor(() => historyCalls.length === 1);
+      assert.deepEqual(historyCalls[0]!.orderAtCall, ["persist"]);
+      assert.equal(
+        historyCalls[0]!.args[2].currentUserText,
+        formatMessageReplyPrompt("continue safely\n[attachment text]", replyTo),
+      );
+      const findForwarded = () => rig.containerSeen.slice(seenBefore)
+        .map(({ data }) => JSON.parse(data.toString()) as Record<string, unknown>)
+        .find((frame) => frame.clientMessageId === "m-current-turn");
+      try {
+        await waitFor(() => findForwarded() !== undefined, 5000);
+      } catch (error) {
+        throw new Error(`container never received the forwarded turn within 5s; browser frames=${JSON.stringify(browserFrames)}`, { cause: error });
+      }
+      const forwarded = findForwarded()!;
+      assert.equal(forwarded.model, DEFAULT_CODEX_ENGINE_MODEL);
       assert.deepEqual(order, ["persist", "history"]);
       assert.deepEqual(forwarded._masterHistoricalMessages, [
         { id: "u-old", role: "user", text: "older question", ts: 1 },
@@ -1822,11 +1961,11 @@ describe("userChatBridge — model authorization", () => {
   });
 
   test("browser workspace mode is stripped and replaced with the database authority", async () => {
+    const workspaceCalls: Array<{ uid: bigint; sessionId: string }> = [];
     const rig = await startRig({
       persistMasterUserMessage: async () => ({ applied: true }),
       loadSessionWorkspaceMode: async (uid, sessionId) => {
-        assert.equal(uid, 211n);
-        assert.equal(sessionId, "sess-workspace-authority");
+        workspaceCalls.push({ uid, sessionId });
         return "isolated_v1";
       },
     });
@@ -1834,10 +1973,8 @@ describe("userChatBridge — model authorization", () => {
       const containerOpenP = waitNextContainerSocket(rig);
       const ws = openClient(rig.gatewayPort, await makeJwt("211"));
       await new Promise<void>((resolve) => ws.once("open", () => resolve()));
-      const containerWs = await containerOpenP;
-      const forwardedP = new Promise<Record<string, unknown>>((resolve) => {
-        containerWs.once("message", (data) => resolve(JSON.parse(data.toString())));
-      });
+      await containerOpenP;
+      const seenBefore = rig.containerSeen.length;
       ws.send(JSON.stringify({
         type: "inbound.message",
         channel: "webchat",
@@ -1847,7 +1984,13 @@ describe("userChatBridge — model authorization", () => {
         content: { text: "isolate me" },
         _workspaceMode: "legacy",
       }));
-      const forwarded = await forwardedP;
+      await waitFor(() => workspaceCalls.length === 1);
+      assert.deepEqual(workspaceCalls, [{ uid: 211n, sessionId: "sess-workspace-authority" }]);
+      const findForwarded = () => rig.containerSeen.slice(seenBefore)
+        .map(({ data }) => JSON.parse(data.toString()) as Record<string, unknown>)
+        .find((frame) => frame.clientMessageId === "m-workspace-authority");
+      await waitFor(() => findForwarded() !== undefined);
+      const forwarded = findForwarded()!;
       assert.equal(forwarded._workspaceMode, "isolated_v1");
       ws.close();
       await waitClose(ws);
@@ -3325,6 +3468,49 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(source, /closePendingZcodeAudits/);
     assert.match(source, /isCursorModel\(authorityModelForFrame\)/);
     assert.match(source, /isZcodeModel\(authorityModelForFrame\)/);
+  });
+
+  test("OCV5-92: every base engine inbound carries a master-owned _creditBudget and ZCode gates on balance", async () => {
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+
+    // ZCode: same 0-balance hard reject as Cursor, budget written after the spread.
+    const zcodeStart = source.indexOf("if (isZcodeInboundFrame && containerId !== undefined)");
+    const zcodeEnd = source.indexOf("if (\n        isCodexInboundFrame &&", zcodeStart);
+    assert.notEqual(zcodeStart, -1);
+    const zcodeBranch = source.slice(zcodeStart, zcodeEnd);
+    assert.match(zcodeBranch, /zcodeSpendable = await readTotalSpendableBalance\(uid\)/);
+    assert.match(zcodeBranch, /if \(zcodeSpendable <= 0n\)/);
+    assert.match(zcodeBranch, /rejectPromptQueueDispatch\('ERR_INSUFFICIENT_CREDITS'\)/);
+    assert.match(zcodeBranch, /failDispatchPreForward\(dispatchRecord, 'insufficient_credits'\)/);
+    assert.match(zcodeBranch, /sendErrorFrame\(\s*userWs,\s*'ERR_INSUFFICIENT_CREDITS'/);
+    // Lookup failure is a hard reject for ZCode (settled after the fact, no per-request 402 floor).
+    assert.match(zcodeBranch, /failDispatchPreForward\(dispatchRecord, 'zcode_spendable_unavailable'\)/);
+    assert.match(zcodeBranch, /\.\.\.enriched,[\s\S]*?_creditBudget: zcodeSpendable\.toString\(\)/);
+    // Balance gate runs before a relay route is minted.
+    assert.ok(
+      zcodeBranch.indexOf("if (zcodeSpendable <= 0n)") < zcodeBranch.indexOf("deps.mintZcodeRoute("),
+      "zcode balance gate must precede mintZcodeRoute",
+    );
+
+    // CCB: budget injected after the spread; lookup failure fails open (per-request 402 remains).
+    const ccbStart = source.indexOf("let ccbSpendable: bigint | null = null;");
+    assert.notEqual(ccbStart, -1);
+    const ccbBranch = source.slice(ccbStart, source.indexOf("dispatchAuthorityField(dispatchRecordC)", ccbStart));
+    assert.match(ccbBranch, /ccbSpendable = await readTotalSpendableBalance\(uid\)/);
+    assert.match(ccbBranch, /ccb spendable lookup failed, fail-open/);
+    assert.match(
+      ccbBranch,
+      /\.\.\.enrichedParsed,[\s\S]*?\.\.\.\(ccbSpendable !== null \? \{ _creditBudget: ccbSpendable\.toString\(\) \} : \{\}\)/,
+    );
+    assert.doesNotMatch(ccbBranch, /ERR_INSUFFICIENT_CREDITS/);
+
+    // Sanitize step strips a browser-forged _creditBudget before any engine path.
+    assert.match(source, /hasClientCreditBudget = Object\.prototype\.hasOwnProperty\.call\(\s*sanitizedParsed,\s*"_creditBudget",?\s*\)/);
+    assert.match(source, /if \(hasClientCreditBudget\) \{\s*delete sanitizedParsed\._creditBudget;/);
+
+    // Cursor / Grok / Codex paths keep their existing injection.
+    assert.match(source, /_creditBudget: cursorSpendable\.toString\(\)/);
+    assert.ok((source.match(/_creditBudget:/g) ?? []).length >= 4, "cursor, grok/codex, zcode and ccb must all inject _creditBudget");
   });
 
   test("Cursor accepts only an active row on the trusted self host", async () => {

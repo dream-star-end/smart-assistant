@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light" data-overlay-active="false" data-wco-ready="false">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Clarvy</title>
+    <link rel="stylesheet" href="app://aurora-shell/shell.css" />
+    <script type="module" src="app://aurora-shell/shell.mjs"></script>
+  </head>
+  <body data-shell-mode="toolbar">
+    <header class="command-surface" aria-label="从简 桌面应用栏">
+      <div class="brand" aria-label="从简 桌面工作区">
+        <img class="brand-mark" src="app://aurora-shell/icons/aurora.svg" alt="" />
+        <span class="brand-copy">
+          <span class="brand-name">从简</span>
+          <span class="workspace-title">桌面工作区</span>
+        </span>
+      </div>
+
+      <div class="command-spacer" aria-hidden="true"></div>
+
+      <div id="connection-status" class="connection-status" role="status" aria-live="polite" aria-atomic="true">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="connection-label">正在连接</span>
+      </div>
+
+      <button
+        id="downloads-button"
+        class="downloads-button"
+        type="button"
+        aria-label="下载"
+        aria-expanded="false"
+        aria-controls="downloads-dialog"
+        title="查看下载"
+      >
+        <span class="fluent-icon icon-download" aria-hidden="true"></span>
+        <span class="downloads-text">下载</span>
+        <span id="downloads-badge" class="badge" aria-hidden="true" hidden>0</span>
+      </button>
+
+      <button
+        id="more-menu-button"
+        class="icon-button"
+        type="button"
+        aria-label="更多桌面操作"
+        aria-haspopup="menu"
+        title="更多桌面操作"
+      >
+        <span class="fluent-icon icon-more" aria-hidden="true"></span>
+      </button>
+
+      <div id="loading-track" class="loading-track" aria-hidden="true" hidden>
+        <span></span>
+      </div>
+    </header>
+
+    <div id="downloads-layer" class="downloads-layer" hidden>
+      <button id="downloads-scrim" class="downloads-scrim" type="button" tabindex="-1" aria-label="关闭下载面板"></button>
+      <section
+        id="downloads-dialog"
+        class="downloads-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="downloads-heading"
+        tabindex="-1"
+      >
+        <header class="drawer-header">
+          <div>
+            <p class="eyebrow">本机文件</p>
+            <h1 id="downloads-heading">下载</h1>
+          </div>
+          <div class="drawer-actions">
+            <button id="open-downloads-folder" class="text-button" type="button">
+              <span class="fluent-icon icon-folder-open" aria-hidden="true"></span>
+              打开文件夹
+            </button>
+            <button id="downloads-close" class="icon-button" type="button" aria-label="关闭下载面板" title="关闭 (Esc)">
+              <span class="fluent-icon icon-dismiss" aria-hidden="true"></span>
+            </button>
+          </div>
+        </header>
+        <div id="downloads-empty" class="empty-state">
+          <span class="fluent-icon icon-download empty-state-icon" aria-hidden="true"></span>
+          <p>下载的文件会显示在这里</p>
+          <span>文件路径只保留在受信任的 Windows 主进程中。</span>
+        </div>
+        <ol id="downloads-list" class="downloads-list" aria-label="下载记录"></ol>
+      </section>
+    </div>
+
+    <main id="offline-workspace" class="offline-workspace" hidden>
+      <section class="offline-card" aria-labelledby="offline-title">
+        <div class="offline-symbol" aria-hidden="true">
+          <span class="fluent-icon icon-wifi-off"></span>
+        </div>
+        <p class="eyebrow">从简 桌面工作区</p>
+        <h1 id="offline-title">暂时无法连接</h1>
+        <p id="offline-message" class="offline-message">请检查网络连接，然后重试。</p>
+        <button id="offline-retry" class="primary-button" type="button">
+          <span class="fluent-icon icon-reload" aria-hidden="true"></span>
+          重新连接
+        </button>
+        <p id="offline-network" class="offline-network" role="status" aria-live="polite">正在检查网络状态</p>
+      </section>
+    </main>
+  </body>
+</html>

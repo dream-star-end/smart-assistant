@@ -1287,3 +1287,241 @@ describe('B4 buildTurnDispatchStateResponse(缺行 → absent)', () => {
     })
   })
 })
+
+test('OCV5-121 live queued recovery consumes only explicit master terminal', async () => {
+  const statuses = ['terminal', 'accepted', 'manual_reconcile', 'absent', undefined] as const
+  for (const status of statuses) {
+    const k = { userId: 'u1', sessionId: 'r121-' + status, clientMessageId: 'cm',
+      dispatchId: 'r121-' + status, attemptNo: 1, payloadHash: 'h' }
+    await insertQueuedTurnDispatch(k)
+    markTurnDispatchLive(k.dispatchId, 1)
+    try {
+      await recoverTurnDispatchInboxOnBoot({
+        retryQueueHasDispatch: async () => false,
+        queryMasterTapeState: async () => ({ state: 'none', dispatchLeaseActive: false,
+          dispatchStatus: status }),
+        stageSyntheticCrashedTape: async () => {},
+        isDispatchLive: isTurnDispatchLive,
+      })
+      assert.equal((await getTurnDispatchByLogicalKey(k.userId, k.sessionId, k.clientMessageId))?.state,
+        status === 'terminal' ? 'rejected' : 'queued')
+    } finally {
+      unmarkTurnDispatchLive(k.dispatchId, 1)
+    }
+  }
+})
+
+test('OCV5-121 delayed original submit silently drains after exact cancellation', async () => {
+  const { SessionManager } = await import('../sessionManager.js')
+  const { CcbAdapter } = await import('../engine/ccbAdapter.js')
+  const { EventEmitter } = await import('node:events')
+  const rawRunner = Object.assign(new EventEmitter(), { isRunning: true, lastActivityAt: Date.now() })
+  const adapter = new CcbAdapter({} as never, rawRunner as never)
+  const { cancelQueuedTurnDispatchExact } = await import('@openclaude/storage')
+  const { setV3MasterSinkSingleton } = await import('../v3MasterSink.js')
+  const ctx = { uid: 'u1', sessionId: 'late-121', clientMessageId: 'late-cm',
+    dispatchId: 'late-121', attemptNo: 1, payloadHash: 'h', billingRequestId: 'b' }
+  let release!: () => void
+  const predecessor = new Promise<void>(resolve => { release = resolve })
+  const session = {
+    sessionKey: 'agent:main:webchat:dm:late-121', agentId: 'main', peerId: ctx.sessionId,
+    channel: 'unit', turns: 0, lock: predecessor, lastUsedAt: 0,
+    totalCostUSD: 0, totalInputTokens: 0, totalOutputTokens: 0,
+    totalCacheReadTokens: 0, totalCacheCreationTokens: 0,
+    toolUseIdToName: new Map(), providerTag: 'ccb', executionTarget: { kind: 'local' },
+    runner: adapter,
+  } as unknown as import('../sessionManager.js').AgentSession
+  const sm = new SessionManager({ version: 1, defaults: {}, gateway: { bind: '127.0.0.1', port: 0, accessToken: '' },
+    auth: { mode: 'subscription', claudeCodePath: '' }, sessions: { dbPath: '' } } as never)
+  let model = 0
+  let tape = 0
+  let errors = 0
+  let tools = 0
+  const events: unknown[] = []
+  ;(sm as unknown as { _runOneTurn: () => Promise<void> })._runOneTurn = async () => { model++; tools++ }
+  setV3MasterSinkSingleton({ stageDurable: async () => { tape++ } } as never)
+  let entered!: () => void
+  const waiting = new Promise<void>(resolve => { entered = resolve })
+  try {
+    const original = runDurableDispatchAdmission({
+      ctx, sendReceipt: () => {},
+      dispatch: async () => {
+        const pending = sm.submit(session, 'test', event => events.push(event),
+          undefined, undefined, undefined, undefined, undefined, {
+            dispatchContext: { userId: ctx.uid, sessionId: ctx.sessionId, clientMessageId: ctx.clientMessageId,
+              dispatchId: ctx.dispatchId, attemptNo: ctx.attemptNo },
+            replayLifecycle: { clientMessageId: ctx.clientMessageId, onStart() {},
+              onBeforeRelease(error) { if (error !== undefined) errors++ }, onEnd() {} },
+          })
+        entered()
+        await pending
+      },
+    })
+    await waiting
+    assert.equal(isTurnDispatchLive(ctx.dispatchId, 1), true)
+    assert.equal(session._activeTurnCount, 1)
+    assert.equal(model, 0)
+    assert.equal((await cancelQueuedTurnDispatchExact({ ...ctx, userId: ctx.uid })).applied, true)
+    release()
+    await original
+    assert.equal(model, 0)
+    assert.equal(tools, 0)
+    assert.equal(tape, 0)
+    assert.equal(errors, 0)
+    assert.deepEqual(events, [])
+    assert.equal(session._currentDispatch, undefined)
+    assert.equal(session._activeTurnCount, 0)
+    assert.equal(isTurnDispatchLive(ctx.dispatchId, 1), false)
+    await session.lock
+  } finally {
+    release()
+    setV3MasterSinkSingleton(null)
+  }
+})
+
+test('OCV5-121 cancel HTTP route uses inbound auth and exact body identity', async () => {
+  const { createServer } = await import('node:http')
+  const env = { OPENCLAUDE_TRUST_BRIDGE_IP: '127.0.0.1', OC_CONTAINER_ID: '7',
+    OPENCLAUDE_INBOUND_NONCE: 's'.repeat(43) }
+  const saved = Object.fromEntries(Object.keys(env).map(k => [k, process.env[k]]))
+  Object.assign(process.env, env)
+  const gateway = new Gateway({
+    config: { gateway: { accessToken: 'test' }, auth: { mode: 'subscription', claudeCodePath: '' },
+      defaults: {}, sessions: { dbPath: '' } } as never,
+    agentsConfig: { agents: [{ id: 'main' }], routes: [], default: 'main' } as never,
+  })
+  const server = createServer((req, res) => {
+    ;(gateway as unknown as { handleHttp: (req: unknown, res: unknown) => void }).handleHttp(req, res)
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address() as { port: number }
+  const url = 'http://127.0.0.1:' + address.port + '/internal/v3/turn-cancel-if-queued'
+  const k = { userId: 'u1', sessionId: 'http121', clientMessageId: 'cm', dispatchId: 'http121',
+    attemptNo: 1, payloadHash: 'h' }
+  await insertQueuedTurnDispatch(k)
+  const headers = { 'content-type': 'application/json', 'x-openclaude-container-id': '7',
+    'x-openclaude-inbound-nonce': env.OPENCLAUDE_INBOUND_NONCE }
+  try {
+    for (const bad of [{}, { ...headers, 'x-openclaude-inbound-nonce': 'x'.repeat(43) },
+      { ...headers, 'x-openclaude-container-id': '8' }]) {
+      const response = await fetch(url, { method: 'POST', headers: bad, body: JSON.stringify(k) })
+      assert.equal(response.status, 401)
+      await response.text()
+    }
+    assert.equal((await getTurnDispatchStateByDispatch(k.dispatchId, 1))?.state, 'queued')
+    for (const mismatch of [{ userId: 'other' }, { sessionId: 'other' }, { clientMessageId: 'other' },
+      { dispatchId: 'other' }, { attemptNo: 2 }]) {
+      const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ ...k, ...mismatch }) })
+      assert.equal(response.status, 409)
+      await response.text()
+    }
+    for (const body of ['null', '{}', JSON.stringify({ ...k, attemptNo: 1.5 })]) {
+      const response = await fetch(url, { method: 'POST', headers, body })
+      assert.equal(response.status, 400)
+      await response.text()
+    }
+    // Existing readBody destroys over-limit streams: either a rejected transport or 400, never 2xx.
+    let oversizedAccepted = false
+    try {
+      const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ ...k, pad: 'x'.repeat(17 * 1024) }) })
+      oversizedAccepted = response.ok
+      await response.text()
+    } catch {}
+    assert.equal(oversizedAccepted, false)
+    assert.equal((await getTurnDispatchStateByDispatch(k.dispatchId, 1))?.state, 'queued')
+    for (const applied of [true, false]) {
+      const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(k) })
+      assert.equal(response.status, 200)
+      assert.deepEqual(await response.json(), { applied, found: true, conflict: false,
+        state: 'rejected', outcome: 'not_accepted' })
+    }
+  } finally {
+    server.closeAllConnections()
+    await new Promise<void>(resolve => server.close(() => resolve()))
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+})
+
+test('OCV5-121 master authority wire fields preserve unknown and all tape states', async () => {
+  const env = { OPENCLAUDE_V3_MASTER_BASE_URL: 'http://master.test', OPENCLAUDE_V3_CONTAINER_TOKEN: 'token' }
+  for (const state of ['none', 'partial', 'finalized']) {
+    for (const authority of [{}, { dispatchStatus: 'bogus', producerFenced: 'true' },
+      { dispatchStatus: 'terminal', dispatchOutcome: 'interrupted', producerFenced: true }]) {
+      const result = await queryMasterTapeState('wire121', 1, { env,
+        fetcher: (async () => ({ statusCode: 200, body: Readable.from([JSON.stringify({
+          state, status: 'interrupted', dispatchLeaseActive: false, ...authority,
+        })]) })) as never })
+      assert.equal(result.state, state)
+      assert.equal(result.dispatchStatus, authority.dispatchStatus === 'terminal' ? 'terminal' : undefined)
+      assert.equal(result.producerFenced, authority.producerFenced === true ? true : undefined)
+    }
+  }
+})
+
+test('OCV5-121 live queued recovery unreachable and running CAS winner remain protected', async () => {
+  for (const mode of ['unreachable', 'running-wins']) {
+    const k = { userId: 'u1', sessionId: 'race121-' + mode, clientMessageId: 'cm',
+      dispatchId: 'race121-' + mode, attemptNo: 1, payloadHash: 'h' }
+    await insertQueuedTurnDispatch(k)
+    markTurnDispatchLive(k.dispatchId, 1)
+    try {
+      await recoverTurnDispatchInboxOnBoot({
+        isDispatchLive: isTurnDispatchLive, retryQueueHasDispatch: async () => false,
+        stageSyntheticCrashedTape: async () => {},
+        queryMasterTapeState: async (id) => {
+          if (id !== k.dispatchId || mode === 'unreachable') return { state: 'unreachable' }
+          await recordTurnDispatchRunning({ ...k, agentId: 'main', turnIndex: 1, turnKey: 'tk',
+            requestId: null, createdAt: 1 })
+          return { state: 'none', dispatchLeaseActive: false, dispatchStatus: 'terminal' }
+        },
+      })
+      assert.equal((await getTurnDispatchStateByDispatch(k.dispatchId, 1))?.state,
+        mode === 'unreachable' ? 'queued' : 'running')
+    } finally { unmarkTurnDispatchLive(k.dispatchId, 1) }
+  }
+})
+
+test('OCV5-121 running CAS misses other than exact rejected still fail closed', async (t) => {
+  const { SessionManager } = await import('../sessionManager.js')
+  const { getSessionsDb } = await import('@openclaude/storage')
+  for (const mode of ['absent', 'wrong-identity', 'running', 'read-error', 'write-error']) {
+    const ctx = { userId: 'u1', sessionId: 'miss121-' + mode, clientMessageId: 'cm',
+      dispatchId: 'miss121-' + mode, attemptNo: 1 }
+    if (mode !== 'absent') {
+      await insertQueuedTurnDispatch({ ...ctx, payloadHash: 'h' })
+      await casTurnDispatchState({ ...ctx, fromStates: ['queued'],
+        toState: mode === 'running' ? 'running' : 'rejected', outcome: 'not_accepted' })
+    }
+    const sm = new SessionManager({ version: 1, gateway: {}, auth: {}, defaults: {}, sessions: {} } as never)
+    const session = { sessionKey: 'agent:main:webchat:dm:' + ctx.sessionId,
+      peerId: ctx.sessionId, agentId: 'main', turns: 0 } as never
+    let model = 0
+    let events = 0
+    ;(sm as unknown as { _runOneTurn: () => Promise<void> })._runOneTurn = async () => { model++ }
+    const db = await getSessionsDb()
+    const prepare = db.prepare
+    if (mode === 'read-error' || mode === 'write-error') {
+      t.mock.method(db, 'prepare', function (sql: string) {
+        if ((mode === 'read-error' && sql.includes('WHERE dispatch_id = ? AND attempt_no = ?'))
+          || (mode === 'write-error' && sql.includes('UPDATE turn_dispatch_inbox'))) {
+          throw new Error('injected sqlite fault')
+        }
+        return prepare.call(db, sql)
+      })
+    }
+    try {
+      await assert.rejects(
+        (sm as unknown as { runOneTurnWithRetry: (...args: unknown[]) => Promise<void> })
+          .runOneTurnWithRetry(session, 'test', () => { events++ }, undefined, undefined,
+            undefined, undefined, ctx.clientMessageId,
+            mode === 'wrong-identity' ? { ...ctx, clientMessageId: 'other' } : ctx),
+        TurnDispatchNotAcceptedError,
+      )
+      assert.equal(model, 0)
+      assert.equal(events, 0)
+    } finally { t.mock.restoreAll() }
+  }
+})

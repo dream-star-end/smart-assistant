@@ -28,6 +28,9 @@ import { paths } from "@openclaude/storage";
 
 import { CodexAdapter, buildCodexBillingEvent, classifyCodexErrorKind } from "../engine/codexAdapter.js";
 import { __setCodexAppServerSpawnForTests } from "../engine/codexAppServerRunner.js";
+import { CREDIT_EXHAUSTED_DETAIL } from "../creditExhaustion.js";
+import { _setModelCatalogClientForTests } from "../modelCatalogClient.js";
+import { _setPlatformPricingLookupForTests } from "../usageCost.js";
 import { engineSessionId } from "../engine/engineSessionId.js";
 import type { EngineBillingEvent, EngineEvent } from "../engine/engineEvents.js";
 import type { EngineCreateOpts } from "../engine/registry.js";
@@ -739,6 +742,63 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
     assert.equal(h.billing[0].terminalCode, "USER_CANCELLED");
     assert.equal(h.billing[0].usage?.output_tokens, 4);
     assert.equal(Object.prototype.hasOwnProperty.call(h.billing[0], "errorReason"), false);
+  });
+
+  test("OCV5-92 creditBudgetFen:累计 usage 达预算 → turn/interrupt;终态 insufficient_credits,billing 仍按 success 入账(非 USER_CANCELLED)", async () => {
+    // 100 fen / M input, 1000 fen / M output;agent 倍率 2.000 与 codexFinalizer 同口径。
+    _setPlatformPricingLookupForTests(async () => ({
+      inputPerMtok: "100",
+      outputPerMtok: "1000",
+      cacheReadPerMtok: "10",
+      cacheWritePerMtok: "0",
+      multiplier: "1.000",
+    }));
+    _setModelCatalogClientForTests({
+      get configured() { return true; },
+      async lookupAgentCostMultiplier() { return "2.000"; },
+    } as never);
+    try {
+      const h = makeHarness();
+      const turn = beginTurn(h, { requestId: "req-credit", creditBudgetFen: 200n });
+      await waitForRequest(h, "turn/start");
+      const p = h.proc();
+      const tid = { threadId: "thr-new-1", turnId: "turn-1" };
+      p.notify("item/agentMessage/delta", { ...tid, itemId: "m1", delta: "still under budget" });
+      // 50 fen × 2 = 100 fen < 200:不得中断。
+      p.notify("thread/tokenUsage/updated", {
+        ...tid,
+        tokenUsage: {
+          last: { cachedInputTokens: 0, inputTokens: 500_000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 500_000 },
+          total: { cachedInputTokens: 0, inputTokens: 500_000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 500_000 },
+        },
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(p.written.some((r) => r.method === "turn/interrupt"), false, "预算未到不得中断");
+      // 100 fen × 2 = 200 fen ≥ 200:立刻 turn/interrupt。
+      p.notify("thread/tokenUsage/updated", {
+        ...tid,
+        tokenUsage: {
+          last: { cachedInputTokens: 0, inputTokens: 500_000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 500_000 },
+          total: { cachedInputTokens: 0, inputTokens: 1_000_000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1_000_000 },
+        },
+      });
+      await waitForRequest(h, "turn/interrupt");
+      p.notify("turn/completed", { turn: { id: "turn-1", status: "interrupted", durationMs: 7 } });
+      const summary = await turn.summary;
+      assert.ok(summary);
+      assert.equal(summary.isError, true);
+      assert.equal(summary.errorClass, "insufficient_credits");
+      assert.equal(summary.errorDetail, CREDIT_EXHAUSTED_DETAIL);
+      assert.equal(summary.stopReason, "error");
+      // 已消耗 token 照扣:success 入账,禁止 USER_CANCELLED / CODEX_ERROR 免单。
+      assert.equal(h.billing.length, 1);
+      assert.equal(h.billing[0].status, "success");
+      assert.equal(h.billing[0].terminalCode, undefined);
+      assert.equal(h.billing[0].usage?.input_tokens, 1_000_000);
+    } finally {
+      _setPlatformPricingLookupForTests(null);
+      _setModelCatalogClientForTests(null);
+    }
   });
 
   test("无活跃 turn / 无进程 → interrupt() = false", () => {

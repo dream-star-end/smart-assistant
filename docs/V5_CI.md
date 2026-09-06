@@ -70,6 +70,22 @@ CLI 落到默认 `v3` 分支、`packages/web/public` 就是容器的 web root。
 无法与根脚本集合对齐。要跑 workspace 脚本就在根 `package.json` 加 alias(例:
 `test:browser` → `npm run --workspace @openclaude/web-react test:browser`),两侧都用 alias。
 违反时 parity 门直接红并给出改法。
+## commercial-unit:挂死看门狗(分钟级止损)
+
+2026-09-06 PR #557 两轮:一条用例 `await` 容器帧永挂 → TAP 零增长 → job 吃满 30 min 被
+GitHub cancel,且 cancel 后没有任何栈可查(INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL)。
+现在 `.github/scripts/commercial-unit-gate.sh` 在后台跑 runner,每 10s 看 TAP 字节数:
+
+- 连续 `COMMERCIAL_UNIT_IDLE_TIMEOUT`(CI 240s;基线单套件最长 ~36s、叶用例最长 ~9s)零增长
+  → 对 runner 派生的全部 node 进程发 SIGUSR2(`NODE_OPTIONS=--report-on-signal`),把每份
+  diagnostic report 的 JS 栈 + 活跃 libuv 句柄摘要以 `# hang-watchdog:` TAP 注释追加到 TAP 尾,
+  再整树 TERM→KILL,runner 退出码统一 124。
+- TAP 因此缺 plan/汇总 → diff 门判据 A/G 照样红;`# hang-watchdog:` 是注释,不参与判据。
+- `OC_TEST_MUTEX_TIMEOUT` 在 CI 透传为 1500s(默认 3600 > job 的 1800,等于没有)兜总预算。
+- 原始 report 含环境变量,只留在 0700 私有目录,不进 artifact;TAP 里只有栈与句柄摘要。
+- 本地复现:`COMMERCIAL_UNIT_IDLE_TIMEOUT=30 TAP_OUT=/tmp/x.tap npm run test:commercial:unit:gate`,
+  被杀的用例 = TAP 尾最后一个没有 `ok/not ok` 收尾的 `# Subtest:`。
+
 ## commercial-unit:基线失败集 diff 门
 
 商业 unit 套件(`test:commercial:unit`)存在**已知存量失败**(多为 v3 迁移

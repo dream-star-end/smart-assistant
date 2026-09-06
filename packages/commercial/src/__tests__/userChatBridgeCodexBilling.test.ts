@@ -68,7 +68,7 @@ import { setPoolOverride, resetPool } from "../db/index.js";
 import { AuthoritySigner } from "../ws/authoritySigner.js";
 import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
 import { ModelAuthorityConsumer, buildContainerAttestFrame } from "@openclaude/gateway";
-import { MODEL_AUTHORITY_FIELD } from "@openclaude/protocol";
+import { DEFAULT_CODEX_ENGINE_MODEL, MODEL_AUTHORITY_FIELD } from "@openclaude/protocol";
 import {
   ModelCatalogSnapshot,
   type ModelCatalogCache,
@@ -104,6 +104,13 @@ const PRICING: ModelPricing = {
   extra_system_prompt: null,
   default_effort: null,
   updated_at: new Date(0),
+};
+
+// Only team-leader fixtures opt in; explicit non-team Sol prices stay unchanged.
+const TEAM_LEADER_PRICING: ModelPricing = {
+  ...PRICING,
+  model_id: DEFAULT_CODEX_ENGINE_MODEL,
+  display_name: "Default GPT team leader (test)",
 };
 
 const GROK_PRICING: ModelPricing = {
@@ -3078,10 +3085,11 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
   test("teamMode main 强制 GPT 队长:即使客户端传 glm 也按 gpt 计费并转发 gpt model", async () => {
     const rig = await startRig({
       userBalance: 1_000_000n,
-      loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-5.6-sol",
+      loadAllowedModelChecker: async () => (modelId: string) => modelId === DEFAULT_CODEX_ENGINE_MODEL,
       loadAgentModelResolver: async () => (agentId: string) =>
         agentId === "main" ? "glm-5.2" : null,
     });
+    rig.pricing._setForTests([PRICING, TEAM_LEADER_PRICING]);
     try {
       const containerOpenP = waitNextContainerSocket(rig);
       const ws = openClient(rig.gatewayPort, await makeJwt("25"));
@@ -3101,12 +3109,12 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
       assert.equal(parsed.type, "inbound.message");
       assert.equal(parsed.agentId, "main");
       assert.equal(parsed.teamMode, true);
-      assert.equal(parsed.model, "gpt-5.6-sol", "teamMode main must be forwarded as GPT");
+      assert.equal(parsed.model, DEFAULT_CODEX_ENGINE_MODEL, "teamMode main must be forwarded as GPT");
       assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
       assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
       const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
       assert.ok(journal, "forced GPT must open inflight journal");
-      assert.equal(journal.ctx.model, "gpt-5.6-sol", "journal model must match forced GPT");
+      assert.equal(journal.ctx.model, DEFAULT_CODEX_ENGINE_MODEL, "journal model must match forced GPT");
       assert.equal(journal.ctx.agentId, "main", "team-mode GPT leader should charge main agent multiplier");
       ws.close();
     } finally {
@@ -3122,10 +3130,11 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     for (const [idx, variant] of variants.entries()) {
       const rig = await startRig({
         userBalance: 1_000_000n,
-        loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-5.6-sol",
+        loadAllowedModelChecker: async () => (modelId: string) => modelId === DEFAULT_CODEX_ENGINE_MODEL,
         loadAgentModelResolver: async () => (agentId: string) =>
           agentId === "main" ? "glm-5.2" : null,
       });
+      rig.pricing._setForTests([PRICING, TEAM_LEADER_PRICING]);
       try {
         const containerOpenP = waitNextContainerSocket(rig);
         const ws = openClient(rig.gatewayPort, await makeJwt(`27${idx}`));
@@ -3144,12 +3153,12 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
         assert.equal(parsed.type, "inbound.message");
         assert.equal(parsed.agentId, "main", "missing agentId must be normalized to main");
         assert.equal(parsed.teamMode, true);
-        assert.equal(parsed.model, "gpt-5.6-sol", "teamMode main must be forwarded as GPT");
+        assert.equal(parsed.model, DEFAULT_CODEX_ENGINE_MODEL, "teamMode main must be forwarded as GPT");
         assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
         assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
         const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
         assert.ok(journal, "forced GPT must open inflight journal");
-        assert.equal(journal.ctx.model, "gpt-5.6-sol", "journal model must match forced GPT");
+        assert.equal(journal.ctx.model, DEFAULT_CODEX_ENGINE_MODEL, "journal model must match forced GPT");
         assert.equal(journal.ctx.agentId, "main", "missing agentId team-mode turn should charge main");
         ws.close();
       } finally {
@@ -3162,10 +3171,11 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     const rig = await startRig({
       userBalance: 1_000_000n,
       loadAllowedModelChecker: async () => (modelId: string) =>
-        modelId === "gpt-5.6-sol" || modelId === "glm-5.2",
+        modelId === DEFAULT_CODEX_ENGINE_MODEL || modelId === "glm-5.2",
       loadAgentModelResolver: async () => (agentId: string) =>
         agentId === "main" ? "glm-5.2" : null,
     });
+    rig.pricing._setForTests([PRICING, TEAM_LEADER_PRICING]);
     try {
       const containerOpenP = waitNextContainerSocket(rig);
       const ws = openClient(rig.gatewayPort, await makeJwt("28"));
@@ -3185,12 +3195,12 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
       assert.equal(parsed.type, "inbound.message");
       assert.equal(parsed.agentId, "main", "unknown teamMode agentId must be normalized to main");
       assert.equal(parsed.teamMode, true);
-      assert.equal(parsed.model, "gpt-5.6-sol", "unknown teamMode agentId must still force GPT leader");
+      assert.equal(parsed.model, DEFAULT_CODEX_ENGINE_MODEL, "unknown teamMode agentId must still force GPT leader");
       assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
       assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
       const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
       assert.ok(journal, "forced GPT must open inflight journal");
-      assert.equal(journal.ctx.model, "gpt-5.6-sol", "journal model must match forced GPT");
+      assert.equal(journal.ctx.model, DEFAULT_CODEX_ENGINE_MODEL, "journal model must match forced GPT");
       assert.equal(journal.ctx.agentId, "main", "unknown teamMode agent should charge main");
       ws.close();
     } finally {
@@ -3201,8 +3211,9 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
   test("teamMode 无 agent 权威快照时,显式 non-main agentId 也 fail-safe 按 main GPT 队长处理", async () => {
     const rig = await startRig({
       userBalance: 1_000_000n,
-      loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-5.6-sol",
+      loadAllowedModelChecker: async () => (modelId: string) => modelId === DEFAULT_CODEX_ENGINE_MODEL,
     });
+    rig.pricing._setForTests([PRICING, TEAM_LEADER_PRICING]);
     try {
       const containerOpenP = waitNextContainerSocket(rig);
       const ws = openClient(rig.gatewayPort, await makeJwt("29"));
@@ -3221,12 +3232,12 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
       const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
       assert.equal(parsed.type, "inbound.message");
       assert.equal(parsed.agentId, "main", "teamMode without authority must normalize to main");
-      assert.equal(parsed.model, "gpt-5.6-sol", "teamMode without authority must force GPT leader");
+      assert.equal(parsed.model, DEFAULT_CODEX_ENGINE_MODEL, "teamMode without authority must force GPT leader");
       assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
       assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
       const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
       assert.ok(journal, "forced GPT must open inflight journal");
-      assert.equal(journal.ctx.model, "gpt-5.6-sol", "journal model must match forced GPT");
+      assert.equal(journal.ctx.model, DEFAULT_CODEX_ENGINE_MODEL, "journal model must match forced GPT");
       assert.equal(journal.ctx.agentId, "main", "authority-less teamMode turn should charge main");
       ws.close();
     } finally {
@@ -3234,13 +3245,14 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     }
   });
 
-  test("teamMode main 未授权 gpt-5.6-sol → 拒帧且不转发容器", async () => {
+  test("teamMode main 未授权默认 GPT 队长 → 拒帧且不转发容器", async () => {
     const rig = await startRig({
       userBalance: 1_000_000n,
-      loadAllowedModelChecker: async () => (modelId: string) => modelId !== "gpt-5.6-sol",
+      loadAllowedModelChecker: async () => (modelId: string) => modelId !== DEFAULT_CODEX_ENGINE_MODEL,
       loadAgentModelResolver: async () => (agentId: string) =>
         agentId === "main" ? "glm-5.2" : null,
     });
+    rig.pricing._setForTests([PRICING, TEAM_LEADER_PRICING]);
     try {
       const containerOpenP = waitNextContainerSocket(rig);
       const ws = openClient(rig.gatewayPort, await makeJwt("26"));

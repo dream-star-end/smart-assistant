@@ -36,6 +36,7 @@ import {
   type TurnDispatchInboxRow,
   type TurnDispatchInboxState,
   casTurnDispatchState,
+  cancelQueuedTurnDispatchExact,
   getTurnDispatchByDispatchId,
   getTurnDispatchByLogicalKey,
   insertQueuedTurnDispatch,
@@ -48,7 +49,7 @@ import { request as undiciRequest } from 'undici'
 import { createLogger } from './logger.js'
 import { readV3MasterSinkConfig } from './v3MasterSink.js'
 
-export { DISPATCH_AUTHORITY_FIELD, DURABLE_TURN_DISPATCH_CAPABILITY }
+export { DISPATCH_AUTHORITY_FIELD, DURABLE_TURN_DISPATCH_CAPABILITY, cancelQueuedTurnDispatchExact }
 
 const log = createLogger({ module: 'turnDispatchInbox' })
 
@@ -566,6 +567,9 @@ export type TapeStatus = 'completed' | 'interrupted' | 'crashed'
 export interface MasterTapeStateResult {
   state: MasterTapeState
   tapeStatus?: TapeStatus
+  dispatchStatus?: 'admitted' | 'accepted' | 'rejecting' | 'terminal' | 'manual_reconcile' | 'absent'
+  dispatchOutcome?: 'completed' | 'interrupted' | 'crashed' | 'executed_error' | 'not_accepted' | null
+  producerFenced?: boolean
   /** Required when state=none; protects recovery while the master dispatch lease is live. */
   dispatchLeaseActive?: boolean
   /** Optional; true means master recorded process shutdown for this dispatch. */
@@ -608,28 +612,42 @@ export async function queryMasterTapeState(
     const parsed = JSON.parse(bodyText) as {
       state?: unknown
       status?: unknown
+      dispatchStatus?: unknown
+      dispatchOutcome?: unknown
+      producerFenced?: unknown
       dispatchLeaseActive?: unknown
       gatewayShutdownEvidence?: unknown
     }
+    const authority: Pick<MasterTapeStateResult, 'dispatchStatus' | 'dispatchOutcome' | 'producerFenced'> = {}
+    if (typeof parsed.dispatchStatus === 'string'
+      && ['admitted', 'accepted', 'rejecting', 'terminal', 'manual_reconcile', 'absent'].includes(parsed.dispatchStatus)) {
+      authority.dispatchStatus = parsed.dispatchStatus as MasterTapeStateResult['dispatchStatus']
+    }
+    if (parsed.dispatchOutcome === null || (typeof parsed.dispatchOutcome === 'string'
+      && ['completed', 'interrupted', 'crashed', 'executed_error', 'not_accepted'].includes(parsed.dispatchOutcome))) {
+      authority.dispatchOutcome = parsed.dispatchOutcome as MasterTapeStateResult['dispatchOutcome']
+    }
+    if (typeof parsed.producerFenced === 'boolean') authority.producerFenced = parsed.producerFenced
     if (parsed.state === 'none') {
       // Rolling-safe capability handshake: a new gateway talking to an old
       // master must wait, not turn missing lease evidence into negative proof.
       if (typeof parsed.dispatchLeaseActive !== 'boolean') return { state: 'unreachable' }
       return {
         state: 'none',
+        ...authority,
         dispatchLeaseActive: parsed.dispatchLeaseActive,
         ...(parsed.gatewayShutdownEvidence === true ? { gatewayShutdownEvidence: true } : {}),
       }
     }
     if (parsed.state === 'partial') {
-      return { state: 'partial' }
+      return { state: 'partial', ...authority }
     }
     if (parsed.state === 'finalized') {
       const tapeStatus =
         parsed.status === 'completed' || parsed.status === 'interrupted' || parsed.status === 'crashed'
           ? parsed.status
           : undefined
-      return { state: 'finalized', ...(tapeStatus ? { tapeStatus } : {}) }
+      return { state: 'finalized', ...authority, ...(tapeStatus ? { tapeStatus } : {}) }
     }
     return { state: 'unreachable' }
   } catch {
@@ -868,10 +886,19 @@ async function recoverOneRow(
 ): Promise<void> {
   const key = keyOf(row)
 
-  // 活执行行一律不碰(任何状态):恢复协议的孤儿推断只对无执行方的行成立。
-  // 周期 sweep 撞上在飞 turn(queued 等锁 / running 生成中 / sink_staged 刚落)全走这里跳过;
-  // boot 首跑注册表恒空,不改变 boot 语义。
+  // Only live queued may consume a monotonic master terminal fact. Other live
+  // states retain their existing protection; missing old-master fields are unknown.
   if (deps.isDispatchLive?.(row.dispatchId, row.attemptNo)) {
+    if (row.state === 'queued') {
+      const master = await deps.queryMasterTapeState(row.dispatchId, row.attemptNo)
+      if (master.state !== 'unreachable' && master.dispatchStatus === 'terminal') {
+        const result = await cancelQueuedTurnDispatchExact({ ...row, now: now() })
+        if (result.applied) {
+          stats.rejected++
+          return
+        }
+      }
+    }
     stats.liveSkipped++
     return
   }

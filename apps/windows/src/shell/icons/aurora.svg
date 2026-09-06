@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Aurora">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6d4af0"/>
+      <stop offset="1" stop-color="#4a63d6"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#g)"/>
+  <!-- main 4-point sparkle -->
+  <polygon fill="#ffffff" points="256,102.4 279.9,232.1 409.6,256 279.9,279.9 256,409.6 232.1,279.9 102.4,256 232.1,232.1"/>
+  <!-- secondary small sparkle -->
+  <polygon fill="#ffffff" points="366.6,99.3 374.4,137.6 412.7,145.4 374.4,153.2 366.6,191.5 358.8,153.2 320.5,145.4 358.8,137.6"/>
+</svg>

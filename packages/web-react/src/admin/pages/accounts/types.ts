@@ -44,6 +44,14 @@ export type AccountRow = {
   cursor_billing_cycle_end?: string | null;
   cursor_usage_updated_at?: string | null;
   cursor_usage_error?: string | null;
+  /** 0276 — Grok Build 周额度(grokUsageSweeper 每小时刷新)。provider!=='grok' 时全为 null;可选以兼容旧后端。 */
+  grok_credit_usage_pct?: number | null;
+  grok_build_usage_pct?: number | null;
+  grok_credit_period_start?: string | null;
+  grok_credit_period_end?: string | null;
+  grok_subscription_tier?: string | null;
+  grok_usage_updated_at?: string | null;
+  grok_usage_error?: string | null;
   created_at: string;
   updated_at: string;
   today_requests?: number;
@@ -158,6 +166,35 @@ export type CursorUsageSnapshot = {
     link_blocked_reason: string | null;
   };
 };
+
+/** GET /api/admin/accounts/:id/grok-usage — Grok Build 官方账号周额度快照。 */
+export interface GrokUsageSnapshot {
+  fetched_at: string;
+  errors: Record<string, string>;
+  credits: {
+    period_type: string | null; // USAGE_PERIOD_TYPE_WEEKLY
+    period_start: string | null;
+    period_end: string | null;
+    usage_percent: number | null;
+    products: Array<{ product: string; usage_percent: number | null }>;
+    grok_build_percent: number | null;
+    on_demand_cap: number | null;
+    on_demand_used: number | null;
+    prepaid_balance: number | null;
+    top_up_method: string | null;
+    is_unified_billing_user: boolean | null;
+  };
+  monthly: { limit: number | null; used: number | null; on_demand_cap: number | null; period_start: string | null; period_end: string | null };
+  account: {
+    subscription_tier: string | null;
+    has_grok_code_access: boolean | null;
+    user_blocked_reason: string | null;
+    principal_type: string | null;
+    team_name: string | null;
+    organization_name: string | null;
+    email_masked: string | null;
+  };
+}
 
 /** 创建/编辑账号表单依赖:active 代理池条目。 */
 export type ActiveProxy = {

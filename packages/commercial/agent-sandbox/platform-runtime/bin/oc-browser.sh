@@ -2,8 +2,8 @@
 # oc-browser — per-Agent launcher for the pinned official Playwright CLI.
 #
 # Agent path: browser Skill -> Bash -> playwright-cli. There is no custom
-# browser command translation and no @playwright/mcp stdio transport. Keep the
-# stable oc-browser name for product cards while isolating official CLI state.
+# browser command translation or MCP stdio transport. Preserve the official
+# daemon's structured error bit before the CLI discards it for display.
 set -eu
 
 SELF="$(readlink -f "$0")"
@@ -142,6 +142,54 @@ cli_bin=/usr/local/bin/playwright-cli
 config_file=/etc/openclaude/playwright-cli.config.json
 [ -r "$config_file" ] || die "pinned Playwright CLI config is unavailable"
 
+# Keep the official CLI's argv, output and isolated environment identical on
+# both paths. FD9 must never reach its daemon or Chromium descendants.
+run_cli() (
+  cd "$browser_home"
+  unset PLAYWRIGHT_MCP_CDP_ENDPOINT PLAYWRIGHT_MCP_CDP_HEADERS \
+    PLAYWRIGHT_MCP_CDP_TIMEOUT PLAYWRIGHT_MCP_EXTENSION \
+    PLAYWRIGHT_MCP_STORAGE_STATE PLAYWRIGHT_MCP_USER_DATA_DIR
+  XDG_CACHE_HOME="$cache_home" PLAYWRIGHT_CLI_SESSION="$session_name" \
+    PWTEST_SOCKETS_DIR="$state_dir/sockets" \
+    PLAYWRIGHT_MCP_CONFIG="$config_file" \
+    node -e '
+      const { realpathSync } = require("node:fs");
+      const { createRequire } = require("node:module");
+      const { dirname, join } = require("node:path");
+      const cli = realpathSync(process.argv[1]);
+      const cliRequire = createRequire(cli);
+      const core = dirname(cliRequire.resolve("playwright-core/package.json"));
+      const { Session } = cliRequire(join(core, "lib/tools/cli-client/session.js"));
+      const run = Session.prototype.run;
+      if (typeof run !== "function") {
+        throw new Error("oc-browser: incompatible pinned Playwright CLI Session.run");
+      }
+      // CLI 0.1.14 prints only result.text. Read the trusted daemon envelope,
+      // never page text, and leave official text/JSON/raw output untouched.
+      Session.prototype.run = async function (...args) {
+        const result = await run.apply(this, args);
+        if (result.isError === true && !process.exitCode) process.exitCode = 1;
+        return result;
+      };
+      process.argv = [process.execPath, cli, ...process.argv.slice(2)];
+      cliRequire(cli);
+    ' "$cli_bin" "$@" 9>&-
+)
+
+# help-fast-path: these official CLI operations never touch a browser. Do not
+# queue diagnostics behind a busy page, create activity files or start a reaper.
+# Only unambiguous standalone/command-help forms bypass the lock. In particular,
+# `-- --help` is positional data and a later `--help=false` can cancel help.
+# Identity and forbidden overrides above still fail closed on this path.
+if [ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && [ -n "$command" ]; }; then
+  for arg in "$@"; do
+    case "$arg" in
+      --help|-h|--version|-v) run_cli "$@"; exit $? ;;
+    esac
+  done
+fi
+[ "$#" -ne 0 ] || { run_cli; exit $?; }
+
 idle_seconds="${OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS:-1800}"
 poll_seconds="${OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS:-30}"
 is_positive_integer "$idle_seconds" || die "invalid idle timeout"
@@ -182,16 +230,7 @@ if [ "$track_activity" -eq 1 ] && \
 fi
 
 set +e
-(
-  cd "$browser_home"
-  unset PLAYWRIGHT_MCP_CDP_ENDPOINT PLAYWRIGHT_MCP_CDP_HEADERS \
-    PLAYWRIGHT_MCP_CDP_TIMEOUT PLAYWRIGHT_MCP_EXTENSION \
-    PLAYWRIGHT_MCP_STORAGE_STATE PLAYWRIGHT_MCP_USER_DATA_DIR
-  XDG_CACHE_HOME="$cache_home" PLAYWRIGHT_CLI_SESSION="$session_name" \
-    PWTEST_SOCKETS_DIR="$state_dir/sockets" \
-    PLAYWRIGHT_MCP_CONFIG="$config_file" \
-    "$cli_bin" "$@" 9>&-
-)
+run_cli "$@"
 status=$?
 set -e
 

@@ -5,9 +5,13 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import {
+  goalRequiredError,
+  normalizeDelegateGoal,
+  SELF_DELEGATE_ERROR,
   normalizeDelegateAgentId,
   normalizeDelegateModel,
   rejectSelfDelegate,
+  rewriteSelfDelegateErrorForMcp,
 } from '../delegateArgs.js'
 
 describe('normalizeDelegateModel', () => {
@@ -69,5 +73,42 @@ describe('rejectSelfDelegate', () => {
       rejectSelfDelegate({ callerAgentId: 'main', targetAgentId: 'coding-assistant' }).ok,
       true,
     )
+  })
+})
+
+describe('rewriteSelfDelegateErrorForMcp', () => {
+  it('把 CLI 口径的 --allow-self 提示改写为 MCP 参数 allowSelf', () => {
+    const out = rewriteSelfDelegateErrorForMcp(`委派失败: ${SELF_DELEGATE_ERROR}`)
+    assert.doesNotMatch(out, /--allow-self/)
+    assert.match(out, /allowSelf: true/)
+    assert.match(out, /coding-assistant/)
+  })
+  it('其它文本原样返回', () => {
+    assert.equal(rewriteSelfDelegateErrorForMcp('foo'), 'foo')
+  })
+})
+
+describe('normalizeDelegateGoal / goalRequiredError(缺 goal 自愈)', () => {
+  it('缺 goal → 点名正确字段名 + 最小示例,保留 goal required 前缀', () => {
+    const r = normalizeDelegateGoal(undefined, {})
+    assert.equal(r.ok, false)
+    if (!r.ok) {
+      assert.match(r.error, /^goal required/)
+      assert.match(r.error, /字段名不是 task\/message\/prompt/)
+      assert.match(r.error, /\{"goal":"\.\.\."\}/)
+    }
+  })
+  it('任务写进了 task/message → 直接指出改名', () => {
+    const r = normalizeDelegateGoal(undefined, { task: '修 bug', message: 'x' })
+    assert.equal(r.ok, false)
+    if (!r.ok) assert.match(r.error, /你填的 "task"\/"message" 请改名为 "goal"/)
+  })
+  it('空白 goal 视为缺失;正常 goal trim 后返回', () => {
+    assert.equal(normalizeDelegateGoal('   ', {}).ok, false)
+    assert.deepEqual(normalizeDelegateGoal('  do it ', {}), { ok: true, goal: 'do it' })
+  })
+  it('goalRequiredError 无同义字段时不出现改名提示', () => {
+    assert.doesNotMatch(goalRequiredError({ agentId: 'main' }), /请改名为/)
+    assert.doesNotMatch(goalRequiredError(null), /请改名为/)
   })
 })

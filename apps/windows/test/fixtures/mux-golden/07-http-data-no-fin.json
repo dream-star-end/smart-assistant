@@ -1,0 +1,9 @@
+{
+  "name": "07-http-data-no-fin",
+  "hex": "030000000005000000026162",
+  "length": 12,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 3,
+  "flags": 0,
+  "streamId": 5
+}

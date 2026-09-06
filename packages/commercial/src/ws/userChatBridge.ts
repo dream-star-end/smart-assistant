@@ -5817,17 +5817,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sanitizedParsed,
               "_workspaceMode",
             );
+            // `_creditBudget` is master-owned (OCV5-92): engine paths overwrite
+            // it after the spread, but the CCB path only injects on a successful
+            // balance lookup, so a client-supplied value must die here.
+            const hasClientCreditBudget = Object.prototype.hasOwnProperty.call(
+              sanitizedParsed,
+              "_creditBudget",
+            );
             if (
               (rawClientTrace !== undefined && !clientHint.ok) ||
               hasClientCodexRoute ||
               hasClientGrokRoute ||
               hasClientZcodeRoute ||
               hasClientWorkspaceMode ||
+              hasClientCreditBudget ||
               teamModeMain
             ) {
               sanitizedParsed = { ...sanitizedParsed };
               if (rawClientTrace !== undefined && !clientHint.ok) {
                 delete sanitizedParsed.clientTraceId;
+              }
+              if (hasClientCreditBudget) {
+                delete sanitizedParsed._creditBudget;
               }
               if (hasClientCodexRoute) {
                 delete sanitizedParsed.__oc_codex_route;
@@ -6133,6 +6144,35 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account', zcodeTurnIdentity);
               return;
             }
+            // OCV5-92: same balance gate + spendable budget as Cursor. ZCode
+            // is settled after the fact (zcodeCatalogSettle clamp), so without
+            // this a 0-balance wallet could still start a turn and any turn
+            // could run past its balance for free.
+            let zcodeSpendable: bigint;
+            try {
+              zcodeSpendable = await readTotalSpendableBalance(uid);
+            } catch (err) {
+              logCapture?.error('user-chat-bridge: zcode spendable lookup failed', { err });
+              rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
+              failDispatchPreForward(dispatchRecord, 'zcode_spendable_unavailable');
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode billing is temporarily unavailable', zcodeTurnIdentity);
+              }
+              return;
+            }
+            if (zcodeSpendable <= 0n) {
+              rejectPromptQueueDispatch('ERR_INSUFFICIENT_CREDITS');
+              failDispatchPreForward(dispatchRecord, 'insufficient_credits');
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  'ERR_INSUFFICIENT_CREDITS',
+                  `insufficient credits: balance=${zcodeSpendable} required=1`,
+                  zcodeTurnIdentity,
+                );
+              }
+              return;
+            }
             let minted: { token: string; baseUrl: string };
             try {
               minted = await deps.mintZcodeRoute({
@@ -6181,6 +6221,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               ...enriched,
               requestId,
               traceId: traceCapture,
+              // After the spread so a browser-forged budget cannot survive.
+              _creditBudget: zcodeSpendable.toString(),
               __oc_zcode_route: { baseUrl: minted.baseUrl, routeToken: minted.token },
               ...authorityFields,
               ...dispatchAuthorityField(dispatchRecord),
@@ -7279,9 +7321,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               authorityFields = sealed;
             }
             if (cleaned) { failDispatchPreForward(dispatchRecordC, "bridge_cleaned"); return; }
+            // OCV5-92: CCB egress is settled per request by the anthropic proxy
+            // (balance>0 admits, clamp on finalize), so a single agentic turn
+            // could still overshoot its wallet by up to one request per loop
+            // iteration. Hand the container the spendable balance so the
+            // adapter hard-stops as soon as cumulative cost reaches it.
+            // Lookup failure fails open (per-request 402 remains the floor).
+            let ccbSpendable: bigint | null = null;
+            if (deps.pgPool) {
+              try {
+                ccbSpendable = await readTotalSpendableBalance(uid);
+              } catch (err) {
+                turnLogCapture?.warn("user-chat-bridge: ccb spendable lookup failed, fail-open", { err });
+              }
+            }
             const rewrittenObj = {
               ...enrichedParsed,
               traceId: turnTraceIdCapture,
+              // After the spread so a browser-forged budget cannot survive.
+              ...(ccbSpendable !== null ? { _creditBudget: ccbSpendable.toString() } : {}),
               ...authorityFields,
               // durable dispatch envelope(容器 durable inbox 准入 + at-most-once)。
               ...dispatchAuthorityField(dispatchRecordC),
@@ -8292,7 +8350,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // exact runtime-authored tool identity/input survives a browser or
       // Master restart; bridge disconnect is therefore no longer an implicit
       // denial signal at the commercial boundary.
-      let permissionAuthorityCommit: Promise<void> | null = null;
+      // Thunk, not a started promise. Starting the write here and merely
+      // awaiting it inside the outbound persist queue task leaves a rejection
+      // window: while the queue is busy with an earlier frame's work, the
+      // await (the only handler this promise ever gets on the durable path)
+      // registers only after that work drains, so an early rejection is
+      // reported as an unhandledRejection before the queue catch adopts it
+      // (--unhandled-rejections=strict would kill the worker). Deferring the
+      // start into the task keeps every failure inside the queue's catch and
+      // therefore under the standard onFailure semantics (transient → poison
+      // + close 1011). Authority-before-browser-visibility is unchanged:
+      // forwardCommittedFrame still only runs after both awaits inside the
+      // task.
+      let permissionAuthorityCommit: (() => Promise<void>) | null = null;
       if (!isBinary && deps.pgPool) {
         let permissionText: string | null = null;
         if (typeof data === "string") permissionText = data;
@@ -8311,7 +8381,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             typeof parsedPermission.peer.id === "string" &&
             isPlainRecord(parsedPermission.inputJson)
           ) {
-            permissionAuthorityCommit = persistPermissionAuthority(deps.pgPool, {
+            // Capture the narrowed values now: TS does not carry control-flow
+            // narrowing of `deps.pgPool` / `parsedPermission.peer` into the
+            // deferred closure, and the frame must be validated at receipt.
+            const permissionPool = deps.pgPool;
+            const permissionAuthorityInput = {
               userId: uid,
               requestId: parsedPermission.requestId,
               sessionId: parsedPermission.peer.id,
@@ -8327,7 +8401,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ? parsedPermission.inputJson
                 : null,
               expiresAt: resolvePermissionExpiresAt(parsedPermission.expiresAt),
-            }).then(() => {});
+            };
+            permissionAuthorityCommit = () =>
+              persistPermissionAuthority(permissionPool, permissionAuthorityInput).then(() => {});
           }
         } else if (permissionText?.includes('"outbound.permission_settled"')) {
           // INC-20260903-PENDING-PERMISSION-ZOMBIE — the runtime is the only
@@ -8722,7 +8798,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           stamped.storeKey,
           stamped.frameSeq,
           async () => {
-            if (permissionAuthorityCommit !== null) await permissionAuthorityCommit;
+            if (permissionAuthorityCommit !== null) await permissionAuthorityCommit();
             await deps.persistOutboundFrame!({
               uid,
               sessionId: durableSessionId,
@@ -8759,7 +8835,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         return;
       }
       if (permissionAuthorityCommit !== null) {
-        void permissionAuthorityCommit.then(forwardCommittedFrame).catch((error) => {
+        void permissionAuthorityCommit().then(forwardCommittedFrame).catch((error) => {
           bridgeLog?.error("user-chat-bridge: permission authority commit failed", {
             error: (error as Error)?.message ?? String(error),
           });

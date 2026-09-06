@@ -1603,6 +1603,20 @@ export interface AnthropicProxyDeps {
    * 30s TTL cache。灰度路线 off → observe(收集 metric)→ enforce。
    */
   getSessionPinMode?: () => Promise<import("../../account-pool/scheduler.js").SessionPinMode>;
+  /**
+   * External API-key proxy only: serve `cursor-*` models on the master via
+   * `CursorSandRelay` + `settleCursorExternalUsage` (see proxy/cursorExternal.ts).
+   * Handler branches to it right after body parsing when
+   * `isCursorEngineModel(body.model)`. Not injected → cursor models fall through
+   * to the legacy oauth/static routing (and are rejected there), zero change.
+   */
+  cursorExternal?: import("./cursorExternal.js").CursorExternalRoute;
+  /**
+   * Accept `POST /v1/messages/count_tokens` (Claude Code calls it for context
+   * estimation) and answer with a byte-based estimate after identity resolves.
+   * Off by default so the internal container proxy keeps its strict whitelist.
+   */
+  allowCountTokens?: boolean;
   /** Optional group resolver for official_oauth+claude routing. */
   listEnabledAccountGroupsForModel?: (args: {
     modelId: string;

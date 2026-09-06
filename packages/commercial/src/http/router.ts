@@ -246,6 +246,11 @@ import { dispatchPluginsRoute } from './plugins.js'
 // V3 CC 外接 plan Phase 4(2026-05-18):用户自管 CC API key 的管理面 endpoints。
 import { handleCreateMyApiKey, handleListMyApiKeys, handleRevokeMyApiKey } from './apiKeyAdmin.js'
 import { getBearerToken, getSessionCookieToken } from './authHelpers.js'
+import {
+  handleGetChatGptProxyAccess,
+  handleIssueChatGptProxyCredential,
+  handleRevokeChatGptProxyCredential,
+} from './chatgptProxy.js'
 import { handleClientErrorReport } from './clientErrors.js'
 import {
   handleCreateContainerPreviewTicket,
@@ -786,6 +791,10 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/container-preview/ticket', handler: handleCreateContainerPreviewTicket },
     { method: 'POST', path: '/api/container-preview/heartbeat', handler: handleHeartbeatContainerPreview },
     { method: 'POST', path: '/api/container-preview/revoke', handler: handleRevokeContainerPreview },
+    // ChatGPT 直连代理(管理员 + system_settings 白名单)。凭据明文只在 POST 时返回一次。
+    { method: 'GET', path: '/api/chatgpt-proxy/access', handler: handleGetChatGptProxyAccess },
+    { method: 'POST', path: '/api/chatgpt-proxy/credential', handler: handleIssueChatGptProxyCredential },
+    { method: 'DELETE', path: '/api/chatgpt-proxy/credential', handler: handleRevokeChatGptProxyCredential },
     // ── 用户共建教程：公开目录 + 登录投稿 + 快照 + 管理审核 ──
     // approved 目录/详情允许匿名读取；投稿/我的/撤回要求浏览器用户 JWT；管理员审核
     // 由 requireAdminVerifyDb 再核验数据库角色。/api/tutorials 与 blob/embed
@@ -1502,6 +1511,7 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     '/api/subscription/',
     '/api/agent/',
     '/api/container-preview/',
+    '/api/chatgpt-proxy/',
     '/api/admin/',
     // 企业版(P3.1)org 管理面。匹配 exact `/api/org` 与 prefix `/api/org/*`。
     // 注:BLOCKED_FOR_USER_RULES 不含 /api/org,BRIDGE 白名单也不含 → 容器无法代理,
@@ -1582,6 +1592,7 @@ export const COMMERCIAL_PRE_ROUTE_PATHS: readonly {
   requiresPrefix: boolean
 }[] = [
   { path: '/api/anthropic/v1/messages', kind: 'exact', requiresPrefix: true },
+  { path: '/api/anthropic/v1/messages/count_tokens', kind: 'exact', requiresPrefix: true },
   { path: '/api/file', kind: 'prefix', requiresPrefix: false },
   { path: '/api/media/', kind: 'prefix', requiresPrefix: false },
 ]
@@ -1676,7 +1687,12 @@ export function createCommercialHandler(
     //   - `deps.externalApiKeyProxy` 注入 → 正常分发
     //   - 未注入 → 同一精确路径返 **503 EXTERNAL_PROXY_UNAVAILABLE** + log + metric
     //     而**不是** 404。部署故障不该伪装成"用户 URL 写错了",保留运维可见性。
-    if (method === 'POST' && path === '/api/anthropic/v1/messages') {
+    // count_tokens 同样进 external proxy(handler 内按 allowCountTokens 决定是否放行);
+    // 前缀 `/api/anthropic` 剥掉后交给 handler 自己的白名单。
+    if (
+      method === 'POST' &&
+      (path === '/api/anthropic/v1/messages' || path === '/api/anthropic/v1/messages/count_tokens')
+    ) {
       setSecurityHeaders(res)
       const requestId = ensureRequestId(req)
       res.setHeader(REQUEST_ID_HEADER, requestId)
@@ -1703,7 +1719,8 @@ export function createCommercialHandler(
       // (anthropic CLI 不带 query,但稳妥起见处理)。
       const original = req.url ?? '/api/anthropic/v1/messages'
       const qIdx = original.indexOf('?')
-      req.url = qIdx >= 0 ? `/v1/messages${original.slice(qIdx)}` : '/v1/messages'
+      const innerPath = path.slice('/api/anthropic'.length)
+      req.url = qIdx >= 0 ? `${innerPath}${original.slice(qIdx)}` : innerPath
       // requestId 贯通:proxy handler 内部会再调一次 ensureRequestId。若入站没有
       // x-request-id,router 这里生成的 id 与 proxy 内部又生成的 id 不一致,
       // log/response header 会被劈成两半。把 router 的 id 写回 req.headers 让

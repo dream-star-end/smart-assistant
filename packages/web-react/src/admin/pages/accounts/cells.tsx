@@ -293,3 +293,56 @@ export function CursorPlanCell({ a }: { a: AccountRow }) {
     </div>
   );
 }
+
+/**
+ * 0276 — Grok Build 周额度池已用 %。每小时 sweeper 刷新;>2h 未刷新灰显。
+ * 非 grok 行永远 —。tooltip 带 GrokBuild 占比、刷新时间与最近一次失败原因。
+ */
+export function GrokCreditUsageCell({ a }: { a: AccountRow }) {
+  if (a.provider !== "grok") return <span className="text-faint">—</span>;
+  const pct = a.grok_credit_usage_pct;
+  const updatedAt = a.grok_usage_updated_at ?? null;
+  const err = a.grok_usage_error ?? null;
+  if (pct === null || pct === undefined || !Number.isFinite(Number(pct))) {
+    const hint = err || "尚未刷新(每小时自动;可在更多操作里手动刷新)";
+    return (
+      <Tooltip content={hint}>
+        <span className="text-faint">—</span>
+      </Tooltip>
+    );
+  }
+  const num = Number(pct);
+  const updMs = updatedAt ? new Date(updatedAt).getTime() : Number.NaN;
+  const stale = Number.isFinite(updMs) ? Date.now() - updMs > 2 * 60 * 60 * 1000 : true;
+  const tone: Tone = stale ? "neutral" : num >= 95 ? "danger" : num >= 80 ? "warning" : num <= 40 ? "success" : "info";
+  const buildPct = a.grok_build_usage_pct;
+  const title = [
+    `周额度已用 ${num.toFixed(1)}%`,
+    buildPct != null && Number.isFinite(Number(buildPct)) ? `GrokBuild ${Number(buildPct).toFixed(1)}%` : null,
+    updatedAt ? `更新: ${fmtDateTime(updatedAt)}${stale ? " (陈旧)" : ""}` : null,
+    err ? `最近失败: ${err}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <Tooltip content={title}>
+      <Badge tone={tone} className="px-1.5 py-0 text-caption tabular-nums">
+        {num.toFixed(0)}%
+      </Badge>
+    </Tooltip>
+  );
+}
+
+/** 0276 — 订阅档 + 周额度周期结束(重置倒计时)。 */
+export function GrokPlanCell({ a }: { a: AccountRow }) {
+  if (a.provider !== "grok") return <span className="text-faint">—</span>;
+  const tier = a.grok_subscription_tier ?? null;
+  const end = a.grok_credit_period_end ?? null;
+  if (!tier && !end) return <span className="text-faint">—</span>;
+  return (
+    <div className="flex flex-col gap-0.5 leading-tight">
+      {tier ? <span className="text-meta">{tier}</span> : null}
+      {end ? <ResetCell resetsAt={end} /> : null}
+    </div>
+  );
+}

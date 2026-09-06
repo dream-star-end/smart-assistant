@@ -23,6 +23,7 @@ const ALLOWED = new Set([
   'GET /api-key',
   'GET /settings',
   'GET /user',
+  'GET /billing',
   'GET /deployment/config',
   'POST /chat/completions',
   'POST /responses',

@@ -246,6 +246,12 @@ jobs:
       TEST_DATABASE_URL: postgres://test:test@127.0.0.1:55432/openclaude_test
       TEST_REDIS_URL: redis://127.0.0.1:56379/0
       COMMERCIAL_UNIT_TAP: commercial-unit.tap
+      # 挂死止损预算必须都小于 timeout-minutes(30):否则 GitHub 先 cancel,TAP 产物
+      # 和 JS 栈全丢(2026-09-06 #557 两轮各盲等 30 min)。
+      # - OC_TEST_MUTEX_TIMEOUT:test-mutex 的执行总预算(默认 3600 > 1800,在 CI 形同没有)
+      # - COMMERCIAL_UNIT_IDLE_TIMEOUT:gate 的 TAP 零增长看门狗(基线单套件最长 ~36s)
+      OC_TEST_MUTEX_TIMEOUT: '1500'
+      COMMERCIAL_UNIT_IDLE_TIMEOUT: '240'
 
     steps:
       - name: Checkout
@@ -299,6 +305,8 @@ jobs:
             "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
             "TEST_REDIS_URL=$TEST_REDIS_URL" \
             "TAP_OUT=$TAP_OUT" \
+            "OC_TEST_MUTEX_TIMEOUT=$OC_TEST_MUTEX_TIMEOUT" \
+            "COMMERCIAL_UNIT_IDLE_TIMEOUT=$COMMERCIAL_UNIT_IDLE_TIMEOUT" \
             npm run test:commercial:unit:gate
 
       - name: Explain missing TAP

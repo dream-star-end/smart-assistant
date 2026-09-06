@@ -36,12 +36,14 @@ import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
   EAGER_MEDIA_TAIL_ITEMS,
   EAGER_PAYLOAD_TAIL_ITEMS,
+  PAINT_ESTIMATE_PX,
   PAINT_MIN_ITEMS,
   computePaintRange,
   createRowGeometryWarmup,
   measureMountedRowHeight,
   measuredRangePx,
   paintWindowEnabled,
+  rowHeightEstimatePx,
   selectPaintRange,
 } from "../lib/chat/timelinePaint";
 import {
@@ -674,6 +676,35 @@ function DeferredTapeRecordCard({
 /** 渲染项:普通单条消息(idx 为全局下标,供活跃段归属判定),或"连续多个委派智能体聚成的团队",
  *  或"连续多个 role=thinking 行合并成的单张多段思考卡"。
  *  delegateCost / delegateCosts = 债D per-delegate 成本(见 coalesceTeam)。 */
+/**
+ * Measured row heights, bucketed per session. Row keys are timeline unit keys
+ * (unique per record), so a bucket survives leaving and re-entering a session:
+ * the first scroll-up after switching back no longer re-lays every row from
+ * the 200px estimate to its real height — that per-row growth above the
+ * viewport is the "snaps back a little on every row" feel. Bounded so long
+ * sessions cannot pin memory; eviction is oldest-session-first.
+ */
+const ROW_HEIGHT_BUCKETS_MAX = 12;
+const rowHeightBuckets = new Map<string, Map<string, number>>();
+function rowHeightBucket(sessionId: string | undefined): Map<string, number> {
+  const id = sessionId ?? "";
+  const existing = rowHeightBuckets.get(id);
+  if (existing) {
+    // Refresh recency.
+    rowHeightBuckets.delete(id);
+    rowHeightBuckets.set(id, existing);
+    return existing;
+  }
+  const created = new Map<string, number>();
+  rowHeightBuckets.set(id, created);
+  while (rowHeightBuckets.size > ROW_HEIGHT_BUCKETS_MAX) {
+    const oldest = rowHeightBuckets.keys().next().value;
+    if (oldest === undefined) break;
+    rowHeightBuckets.delete(oldest);
+  }
+  return created;
+}
+
 type RenderItem =
   | {
       kind: "single";
@@ -1085,7 +1116,7 @@ export function MessageList({
   const didSnapToBottomRef = useRef(false);
   const followBottomRefBox = useRef(followBottomRef);
   followBottomRefBox.current = followBottomRef;
-  const rowHeightCacheRef = useRef<Map<string, number>>(new Map());
+  const rowHeightCacheRef = useRef<Map<string, number>>(rowHeightBucket(sessionId));
   const visibleKeysRef = useRef<string[]>([]);
   const eagerPayloadKeysRef = useRef<Set<string> | null>(null);
   const eagerMediaKeysRef = useRef<Set<string> | null>(null);
@@ -1117,7 +1148,7 @@ export function MessageList({
     startOverrideRef.current = null;
     didSnapToBottomRef.current = false;
     viewportPreserveLockRef.current = false;
-    rowHeightCacheRef.current = new Map();
+    rowHeightCacheRef.current = rowHeightBucket(sessionId);
     visibleKeysRef.current = [];
     eagerPayloadKeysRef.current = null;
     eagerMediaKeysRef.current = null;
@@ -1270,6 +1301,7 @@ export function MessageList({
         keyAt: (index) => keys[index] ?? "",
         heights: rowHeightCacheRef.current,
         pinStart: pinStartRef.current,
+        estimatePx: rowHeightEstimatePx(rowHeightCacheRef.current),
       });
       setPaintRange((prev) => selectPaintRange({
         prev,
@@ -1281,6 +1313,7 @@ export function MessageList({
         keyAt: (index) => keys[index] ?? "",
         heights: rowHeightCacheRef.current,
         pinStart: pinStartRef.current,
+        estimatePx: rowHeightEstimatePx(rowHeightCacheRef.current),
       }));
     };
     const onScroll = () => {
@@ -1633,6 +1666,7 @@ export function MessageList({
   pinStartRef.current = pinPaintStart;
   let paintStart = 0;
   let paintEnd = visibleItems.length;
+  const estimatePx = rowHeightEstimatePx(rowHeightCacheRef.current);
   if (paintOn && scrollParent) {
     const followBottom = followBottomRef?.current === true;
     const keyAt = (index: number) => itemKey(visibleItems[index]);
@@ -1644,6 +1678,7 @@ export function MessageList({
       keyAt,
       heights: rowHeightCacheRef.current,
       pinStart: pinPaintStart,
+      estimatePx,
     });
     const chosen = selectPaintRange({
       prev: paintRange,
@@ -1655,6 +1690,7 @@ export function MessageList({
       keyAt,
       heights: rowHeightCacheRef.current,
       pinStart: pinPaintStart,
+      estimatePx,
     });
     paintStart = chosen.start;
     paintEnd = chosen.end;
@@ -1662,10 +1698,22 @@ export function MessageList({
   const paintedItems = visibleItems.slice(paintStart, paintEnd);
   blankProbeStateRef.current = { paintStart, paintEnd, sending, messagesLength: messages.length };
   const topSpacerPx = paintStart > 0
-    ? measuredRangePx(0, paintStart, (index) => itemKey(visibleItems[index]), rowHeightCacheRef.current)
+    ? measuredRangePx(
+      0,
+      paintStart,
+      (index) => itemKey(visibleItems[index]),
+      rowHeightCacheRef.current,
+      estimatePx,
+    )
     : 0;
   const bottomSpacerPx = paintEnd < visibleItems.length
-    ? measuredRangePx(paintEnd, visibleItems.length, (index) => itemKey(visibleItems[index]), rowHeightCacheRef.current)
+    ? measuredRangePx(
+      paintEnd,
+      visibleItems.length,
+      (index) => itemKey(visibleItems[index]),
+      rowHeightCacheRef.current,
+      estimatePx,
+    )
     : 0;
   useLayoutEffect(() => {
     const root = listRootRef.current;
@@ -1880,11 +1928,15 @@ export function MessageList({
           (typeof pinPaintStart === "number" && visibleIndex >= pinPaintStart) ||
           visibleIndex >= visibleItems.length - PAINT_MIN_ITEMS;
         // A row freshly (re)mounted by the paint window has no last-remembered
-        // size, so `content-visibility:auto` lays it out at the 200px estimate
+        // size, so `content-visibility:auto` lays it out at the CSS estimate
         // until it scrolls into relevancy, then grows to its real height. That
-        // growth above the viewport is what forces a correction write on every
-        // row while scrolling up. Seed the estimate with the measured height.
-        const cachedHeight = liveRow ? undefined : rowHeightCacheRef.current.get(key);
+        // growth above the viewport is a visible jump on every row scrolled
+        // past (and, before the wheel fence, a correction write). Seed the
+        // estimate with the measured height; for rows never measured in this
+        // session, use the session median instead of the 200px constant.
+        const cachedHeight = liveRow
+          ? undefined
+          : rowHeightCacheRef.current.get(key) ?? (estimatePx !== PAINT_ESTIMATE_PX ? estimatePx : undefined);
         return (
           <TimelineEagerMediaContext.Provider key={key} value={eagerMedia}>
             <div

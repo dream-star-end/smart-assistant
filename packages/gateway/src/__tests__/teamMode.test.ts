@@ -41,6 +41,7 @@ function view(models: Array<Record<string, unknown>>): LocalCatalogView {
 
 const FULL = view([
   row('glm-5.3-zai', 'ccb'),
+  row('gpt-6-astra', 'codex'),
   row('gpt-5.6-sol', 'codex'),
   row('gpt-5.6-terra', 'codex'),
   row('grok-build', 'grok'),
@@ -73,7 +74,7 @@ describe('pickDeliberationPanel', () => {
     assert.ok(!panel.some((p) => p.engine === 'cursor'))
     assert.deepEqual(
       panel.map((p) => p.modelId),
-      ['gpt-5.6-sol', 'grok-build', 'deepseek-v4-pro'],
+      ['gpt-6-astra', 'grok-build', 'deepseek-v4-pro'],
     )
   })
 
@@ -102,11 +103,11 @@ describe('pickDeliberationPanel', () => {
 
 describe('pickReviewerModel', () => {
   it('审查员 ≠ 队长家族;审议时还避开 panel 成员', () => {
-    assert.equal(pickReviewerModel(FULL, { leaderModel: 'glm-5.3-zai' }), 'gpt-5.6-sol')
+    assert.equal(pickReviewerModel(FULL, { leaderModel: 'glm-5.3-zai' }), 'gpt-6-astra')
     assert.equal(
       pickReviewerModel(FULL, {
         leaderModel: 'glm-5.3-zai',
-        avoidModels: ['gpt-5.6-sol', 'grok-build', 'deepseek-v4-pro'],
+        avoidModels: ['gpt-6-astra', 'grok-build', 'deepseek-v4-pro'],
       }),
       'kimi-k3',
     )
@@ -243,8 +244,8 @@ describe('buildTeamPreamble', () => {
     assert.match(p, /## 第一步:分类/)
     assert.match(p, /审议类/)
     assert.match(p, /执行类/)
-    assert.match(p, /`gpt-5.6-sol`（openai）/)
-    assert.match(p, /delegate_tasks\(\{ tasks: \[\{ model: "gpt-5.6-sol", goal: "<同一个问题>" \}/)
+    assert.match(p, /`gpt-6-astra`（openai）/)
+    assert.match(p, /delegate_tasks\(\{ tasks: \[\{ model: "gpt-6-astra", goal: "<同一个问题>" \}/)
     assert.match(p, /request_review\(draft, mode="deliberation"\)/)
     assert.match(p, /request_review\(draft, mode="execution"\)/)
     assert.match(p, /约为单模型直答的 5 倍/)
@@ -255,7 +256,7 @@ describe('buildTeamPreamble', () => {
 
   it('Cursor 版:走 oc-memory CLI,panel 用 --allow-self --model', () => {
     const p = buildTeamPreamble({ ...base, cursorEngine: true })
-    assert.match(p, /oc-memory delegate --allow-self --model gpt-5.6-sol --goal "<同一个问题>"/)
+    assert.match(p, /oc-memory delegate --allow-self --model gpt-6-astra --goal "<同一个问题>"/)
     assert.match(p, /oc-memory request-review --mode deliberation --draft/)
     assert.doesNotMatch(p, /delegate_tasks\(/)
   })

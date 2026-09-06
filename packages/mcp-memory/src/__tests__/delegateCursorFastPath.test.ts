@@ -236,3 +236,76 @@ describe('formatDelegateFanoutRunning', () => {
     assert.match(text, /✅ coder/)
   })
 })
+
+describe('runCursorDelegateFastPath — wait transport blip → running handle (2026-09-06 L2 矩阵)', () => {
+  const started = async () => ({
+    statusCode: 200,
+    body: JSON.stringify({
+      status: 'running',
+      jobId: 'dlgjob-blip',
+      agentId: 'coding-assistant',
+      sessionKey: 'agent:coding-assistant:delegate:main:1:deadbeef',
+    }),
+  })
+
+  it('wait ETIMEDOUT(网关长轮询慢于客户端期限)→ 不是失败,返回 jobId + delegate-wait 指令', async () => {
+    const r = await runCursorDelegateFastPath({
+      fastWaitMs: 40,
+      label: 'coding-assistant',
+      goal: 'slow gateway',
+      transport: {
+        start: started,
+        wait: async () => {
+          const err: any = new Error('delegate client timeout after 60s')
+          err.code = 'ETIMEDOUT'
+          throw err
+        },
+      },
+    })
+    assert.equal(r.kind, 'running')
+    if (r.kind !== 'running') return
+    assert.equal(r.jobId, 'dlgjob-blip')
+    assert.match(r.text, /status=running jobId=dlgjob-blip/)
+    assert.match(r.text, /oc-memory delegate-wait dlgjob-blip/)
+    assert.match(r.text, /sessionKey=agent:coding-assistant:delegate:main:1:deadbeef/)
+  })
+
+  it('wait ECONNRESET / socket hang up 同样降级为 running', async () => {
+    for (const mk of [
+      () => Object.assign(new Error('reset'), { code: 'ECONNRESET' }),
+      () => new Error('socket hang up'),
+    ]) {
+      const r = await runCursorDelegateFastPath({
+        fastWaitMs: 40,
+        label: 'x',
+        transport: { start: started, wait: async () => { throw mk() } },
+      })
+      assert.equal(r.kind, 'running')
+    }
+  })
+
+  it('非传输类错误仍向上抛(不吞真实 bug)', async () => {
+    await assert.rejects(
+      runCursorDelegateFastPath({
+        fastWaitMs: 40,
+        label: 'x',
+        transport: { start: started, wait: async () => { throw new TypeError('bad json path') } },
+      }),
+      /bad json path/,
+    )
+  })
+
+  it('start 阶段超时仍是失败(没有 jobId 可交还)', async () => {
+    await assert.rejects(
+      runCursorDelegateFastPath({
+        fastWaitMs: 40,
+        label: 'x',
+        transport: {
+          start: async () => { throw Object.assign(new Error('delegate client timeout after 15s'), { code: 'ETIMEDOUT' }) },
+          wait: async () => ({ statusCode: 200, body: '{}' }),
+        },
+      }),
+      /timeout/,
+    )
+  })
+})

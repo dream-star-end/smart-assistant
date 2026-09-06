@@ -57,9 +57,9 @@ export interface ContainerDispatchClientDeps {
   timeoutMs?: number
 }
 
-import { TURN_REJECT_IF_ABSENT_PATH, TURN_DISPATCH_STATE_PATH } from '@openclaude/protocol'
+import { TURN_CANCEL_IF_QUEUED_PATH, TURN_REJECT_IF_ABSENT_PATH, TURN_DISPATCH_STATE_PATH } from '@openclaude/protocol'
 
-export { TURN_REJECT_IF_ABSENT_PATH, TURN_DISPATCH_STATE_PATH }
+export { TURN_CANCEL_IF_QUEUED_PATH, TURN_REJECT_IF_ABSENT_PATH, TURN_DISPATCH_STATE_PATH }
 const DEFAULT_TIMEOUT_MS = 5_000
 
 const VALID_STATES = new Set<ContainerInboxState>([
@@ -106,6 +106,7 @@ function parseStateBody(bodyText: string): ContainerDispatchStateResponse | null
 }
 
 export function makeContainerDispatchClient(deps: ContainerDispatchClientDeps): {
+  cancelIfQueued: (id: DispatchIdentity) => Promise<ContainerCallResult>
   rejectIfAbsent: (id: DispatchIdentity) => Promise<ContainerCallResult>
   getDispatchState: (id: DispatchIdentity) => Promise<ContainerCallResult>
 } {
@@ -176,12 +177,30 @@ export function makeContainerDispatchClient(deps: ContainerDispatchClientDeps): 
     if (res.status < 200 || res.status >= 300) {
       return { kind: 'error', detail: `status ${res.status}: ${res.bodyText.slice(0, 200)}` }
     }
+    if (path === TURN_CANCEL_IF_QUEUED_PATH) {
+      try {
+        const body = JSON.parse(res.bodyText)
+        if (!body || typeof body !== 'object' || Array.isArray(body)
+          || typeof body.applied !== 'boolean' || typeof body.found !== 'boolean'
+          || body.conflict !== false
+          || (body.found === false
+            ? body.state !== 'absent' || body.applied !== false
+            : !VALID_STATES.has(body.state) || body.state === 'absent' || body.state === 'queued')
+          || (body.applied && body.state !== 'rejected')
+          || (body.state === 'rejected' && body.outcome !== 'not_accepted')) {
+          return { kind: 'error', detail: 'invalid cancel response' }
+        }
+      } catch {
+        return { kind: 'error', detail: 'invalid cancel response' }
+      }
+    }
     const parsed = parseStateBody(res.bodyText)
     if (parsed === null) return { kind: 'error', detail: `unparseable state body: ${res.bodyText.slice(0, 200)}` }
     return { kind: 'ok', state: parsed.state, ...(parsed.outcome ? { outcome: parsed.outcome } : {}) }
   }
 
   return {
+    cancelIfQueued: (id) => call(id, 'POST', TURN_CANCEL_IF_QUEUED_PATH),
     rejectIfAbsent: (id) => call(id, 'POST', TURN_REJECT_IF_ABSENT_PATH),
     getDispatchState: (id) => call(id, 'GET', TURN_DISPATCH_STATE_PATH),
   }

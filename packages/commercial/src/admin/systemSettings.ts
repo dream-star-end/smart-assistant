@@ -141,6 +141,15 @@ export const KEY_SCHEMAS = {
   desktop_allowlist: z
     .array(z.string().trim().regex(/^[1-9][0-9]{0,18}$/))
     .max(10_000),
+  /**
+   * ChatGPT direct-connect proxy hot switch. Default off.
+   * Ignored unless OC_CHATGPT_PROXY_ENABLED=1 on the master (env fail-closed).
+   */
+  chatgpt_proxy_enabled: z.boolean(),
+  /** User ids allowed to use the ChatGPT proxy (admins always allowed). */
+  chatgpt_proxy_allowlist: z
+    .array(z.string().trim().regex(/^[1-9][0-9]{0,18}$/))
+    .max(10_000),
 } as const;
 
 export type SystemSettingKey = keyof typeof KEY_SCHEMAS;
@@ -218,6 +227,8 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   auto_dream_model: DEFAULT_AUTO_DREAM_MODEL,
   desktop_virtual_container: false,
   desktop_allowlist: [] as string[],
+  chatgpt_proxy_enabled: false,
+  chatgpt_proxy_allowlist: [] as string[],
 };
 
 /**
@@ -309,6 +320,15 @@ export const KEY_META: Record<
     kind: "string_array",
     max: 10_000,
     description: "允许 enrollment 的用户 uid 列表(admin 默认有权;一行一个)",
+  },
+  chatgpt_proxy_enabled: {
+    kind: "boolean",
+    description: "ChatGPT 直连代理热开关(还需 master OC_CHATGPT_PROXY_ENABLED=1)",
+  },
+  chatgpt_proxy_allowlist: {
+    kind: "string_array",
+    max: 10_000,
+    description: "允许使用 ChatGPT 直连代理的用户 uid 列表(admin 默认有权;一行一个)",
   },
 };
 

@@ -48,7 +48,16 @@ describe('normalizeFanoutTasks — 入参校验', () => {
   it('某项缺 goal → 拒绝并指出第几项', () => {
     const r = normalizeFanoutTasks([{ goal: 'ok' }, { context: '无 goal' }])
     assert.equal(r.ok, false)
-    if (!r.ok) assert.match(r.error, /第 2 个/)
+    if (!r.ok) {
+      assert.match(r.error, /第 2 个/)
+      assert.match(r.error, /字段名不是 task\/message\/prompt/)
+    }
+  })
+
+  it('某项把任务写进 task 字段 → 点名改成 goal', () => {
+    const r = normalizeFanoutTasks([{ task: '写测试' }])
+    assert.equal(r.ok, false)
+    if (!r.ok) assert.match(r.error, /你填的 "task" 请改名为 "goal"/)
   })
 
   it('合法项规范化:effort 白名单外丢弃、toolsets 非字符串过滤、字段透传', () => {
@@ -137,5 +146,23 @@ describe('aggregateDelegateFanoutResults — 结果聚合 + 单项失败隔离',
     assert.match(lines[0], /^并行委派 2 个子任务已全部返回:1 成功 \/ 1 失败。$/)
     assert.match(out, /### 1\. ✅ coding-assistant — 写脚本/)
     assert.match(out, /### 2\. ❌ office-assistant — do something/)
+  })
+})
+
+describe('normalizeFanoutTasks — allowSelf 透传(2026-09-06 MCP 自委派缺口)', () => {
+  it('allowSelf true/"true"/"1" → true;缺省/false/其它 → 不带字段', () => {
+    const r = normalizeFanoutTasks([
+      { goal: 'a', allowSelf: true },
+      { goal: 'b', allowSelf: 'true' },
+      { goal: 'c', allowSelf: '1' },
+      { goal: 'd' },
+      { goal: 'e', allowSelf: false },
+    ].slice(0, 4))
+    assert.equal(r.ok, true)
+    if (!r.ok) return
+    assert.equal(r.tasks[0].allowSelf, true)
+    assert.equal(r.tasks[1].allowSelf, true)
+    assert.equal(r.tasks[2].allowSelf, true)
+    assert.equal('allowSelf' in r.tasks[3], false)
   })
 })

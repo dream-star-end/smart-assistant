@@ -273,6 +273,45 @@ describe('internal Grok relay', () => {
     }
   })
 
+  test('relays official CLI GET /billing (usage) while still fail-closed for other billing paths', async () => {
+    const captured: string[] = []
+    let contextCalls = 0
+    const handler = makeGrokRelayHandler({
+      identityRepo: repo(),
+      resolveContext: async () => {
+        contextCalls += 1
+        return { modelId: 'grok-build', accountId: 53n, slotId: 'slot-53' }
+      },
+      freshToken: async () => Buffer.from('real-xai-oauth-token', 'utf8'),
+      resolveDispatcher: async () => ({ dispatcher: DISPATCHER }),
+      requestFn: (async (url: unknown) => {
+        captured.push(String(url))
+        return { statusCode: 200, headers: { 'content-type': 'application/json' }, body: Readable.from(['{"ok":true}']) }
+      }) as never,
+      recordStatus: async () => {},
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    try {
+      const ok = await fetch(`http://127.0.0.1:${port}${GROK_RELAY_PREFIX}/route/${ROUTE_TOKEN}/v1/billing?format=credits`, {
+        headers: { authorization: `Bearer ${CONTAINER_TOKEN}` },
+      })
+      assert.equal(ok.status, 200)
+      assert.deepEqual(captured, [`${GROK_OFFICIAL_UPSTREAM_BASE_URL}/billing?format=credits`])
+      assert.equal(contextCalls, 1)
+
+      const blocked = await fetch(`http://127.0.0.1:${port}${GROK_RELAY_PREFIX}/route/${ROUTE_TOKEN}/v1/billing`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${CONTAINER_TOKEN}`, 'content-type': 'application/json' },
+        body: '{}',
+      })
+      assert.equal(blocked.status, 405)
+      assert.equal(contextCalls, 1)
+    } finally {
+      await close(server)
+    }
+  })
+
   test('defaults to the process-direct dispatcher instead of the bound account egress', async () => {
     let capturedDispatcher: unknown
     const handler = makeGrokRelayHandler({

@@ -1,0 +1,8 @@
+{
+  "name": "18-http-data-16-bytes",
+  "hex": "030100000001000000105a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+  "length": 26,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 3,
+  "streamId": 1
+}

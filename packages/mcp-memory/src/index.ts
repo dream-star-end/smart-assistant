@@ -54,7 +54,13 @@ import {
   aggregateDelegateFanoutResults,
   normalizeFanoutTasks,
 } from './delegateFanout.js'
-import { normalizeDelegateAgentId, normalizeDelegateModel } from './delegateArgs.js'
+import {
+  normalizeDelegateAgentId,
+  normalizeDelegateGoal,
+  normalizeDelegateModel,
+  parseDelegateAllowSelf,
+  rewriteSelfDelegateErrorForMcp,
+} from './delegateArgs.js'
 import { normalizeSkillSaveArgs } from './skillSaveArgs.js'
 import { delegateResumeIdempotencyKey } from './delegateStartCli.js'
 import {
@@ -730,20 +736,24 @@ async function handleDelegateTask(args: {
   effort?: string
   toolsets?: string[]
   resumeSessionKey?: string
+  allowSelf?: unknown
 }) {
+  const goalNorm = normalizeDelegateGoal(args?.goal, args as Record<string, unknown>)
+  if (!goalNorm.ok) return toolError(goalNorm.error)
   const agentNorm = normalizeDelegateAgentId(args.agentId)
   if (!agentNorm.ok) return toolError(agentNorm.error)
   const modelNorm = normalizeDelegateModel(args.model)
   if (!modelNorm.ok) return toolError(modelNorm.error)
   const agentId = agentNorm.agentId || 'main'
   return handleDelegateTaskToAgent(agentId, {
-    goal: args.goal,
+    goal: goalNorm.goal,
     context: args.context,
     effort: args.effort,
     toolsets: args.toolsets,
     resumeSessionKey: args.resumeSessionKey,
     model: modelNorm.model,
     label: agentNorm.agentId || 'main',
+    allowSelf: parseDelegateAllowSelf(args.allowSelf),
   })
 }
 
@@ -878,6 +888,7 @@ async function handleAsyncDelegateTasks(tasks: FanoutTask[]) {
           resumeSessionKey: t.resumeSessionKey,
           model: t.model,
           label,
+          allowSelf: t.allowSelf,
         })
         if (r.kind === 'running') {
           return {
@@ -893,7 +904,7 @@ async function handleAsyncDelegateTasks(tasks: FanoutTask[]) {
           label,
           goal: t.goal,
           isError: r.kind === 'error',
-          text: r.kind === 'error' ? `error: ${r.text}` : r.text,
+          text: r.kind === 'error' ? `error: ${rewriteSelfDelegateErrorForMcp(r.text)}` : r.text,
         }
       } catch (err: any) {
         return {
@@ -929,6 +940,7 @@ async function runAsyncDelegateToAgent(
     model?: string
     reviewMode?: string
     label: string
+    allowSelf?: boolean
   },
 ): Promise<FormattedDelegateResult> {
   const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
@@ -948,6 +960,7 @@ async function runAsyncDelegateToAgent(
     sourceAgent,
     toolsets: args.toolsets,
     async: true,
+    ...(args.allowSelf ? { allowSelf: true } : {}),
     ...(args.resumeSessionKey ? { resumeSessionKey: args.resumeSessionKey } : {}),
     ...(args.resumeSessionKey
       ? {
@@ -1013,11 +1026,13 @@ async function handleDelegateTaskToAgent(
     model?: string
     reviewMode?: string
     label: string
+    allowSelf?: boolean
   },
 ) {
   try {
     const r = await runAsyncDelegateToAgent(targetAgent, args)
-    if (r.kind === 'error') return toolError(r.text)
+    // 网关的自委派拒绝文案指向 CLI 旗标 --allow-self;MCP 调用方要的是 allowSelf 参数。
+    if (r.kind === 'error') return toolError(rewriteSelfDelegateErrorForMcp(r.text))
     return toolOk(r.text)
   } catch (err: any) {
     return toolError(`委派失败: ${describeDelegateTransportError(err)}`)

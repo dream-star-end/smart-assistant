@@ -1,0 +1,8 @@
+{
+  "name": "17-open-http-large-odd-stream",
+  "hex": "01007ffffffd000000387b226d6574686f64223a22474554222c2270617468223a222f78222c2268656164657273223a7b7d2c22646561646c696e654d73223a307d",
+  "length": 66,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 1,
+  "streamId": 2147483645
+}

@@ -52,7 +52,7 @@ export function resolveZhihuWorkerResources(kind: 'action' | 'login'): {
   return {
     memoryBytes: kind === 'login' ? 1536 * 1024 * 1024 : 1024 * 1024 * 1024,
     memorySwapBytes: kind === 'login' ? 1536 * 1024 * 1024 : 1024 * 1024 * 1024,
-    pidsLimit: kind === 'login' ? 256 : 128,
+    pidsLimit: kind === 'login' ? 384 : 256,
     shmSizeBytes: kind === 'login' ? 256 * 1024 * 1024 : 64 * 1024 * 1024,
   }
 }
@@ -615,7 +615,7 @@ export class ZhihuDockerService {
           NanoCpus: 1_000_000_000,
           PidsLimit: resources.pidsLimit,
           Tmpfs: {
-            '/tmp': 'rw,nosuid,nodev,noexec,size=128m,mode=0700,uid=1000,gid=1000',
+            '/tmp': 'rw,nosuid,nodev,noexec,size=512m,mode=0700,uid=1000,gid=1000',
             '/state': 'rw,nosuid,nodev,noexec,size=64m,mode=0700,uid=1000,gid=1000',
           },
           Mounts: [

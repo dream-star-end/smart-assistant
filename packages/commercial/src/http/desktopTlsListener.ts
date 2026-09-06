@@ -21,7 +21,7 @@ import {
   sendDesktopEngineDisabled,
   sendDesktopNotFound,
 } from "./desktopInternalDispatch.js";
-import { getDesktopTunnelRegistry } from "../ws/desktopTunnelRegistry.js";
+import { getDesktopTunnelRegistry, sweepDesktopOwnersBeforeListen } from "../ws/desktopTunnelRegistry.js";
 import { HttpError, sendJson } from "./util.js";
 import { rootLogger } from "../logging/logger.js";
 import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
@@ -108,6 +108,8 @@ export async function startDesktopTlsListener(opts: DesktopTlsListenerOpts): Pro
       });
     },
   );
+
+  await sweepDesktopOwnersBeforeListen();
 
   server.on("upgrade", (req, socket, head) => {
     const path = pathnameOf(req);

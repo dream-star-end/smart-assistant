@@ -58,7 +58,10 @@ Use OpenClaude's storage channels: Core memory through \`oc-memory core-search\`
 plus the exact platform memory files; session/archival recall through the
 \`oc-memory\` CLI; skills/reminders/tasks through the \`openclaude-memory\` MCP
 tools. Sync delegation: MCP \`delegate_task\` / \`delegate_tasks\`, or Bash
-\`oc-memory delegate --goal "..."\`. Do not use Grok-native memory or skill
+\`oc-memory delegate --goal "..."\`. Delegate contract: the only required
+field is \`goal\`; \`agentId\` is a platform member id, \`model\` is an exact
+catalog slug from the "委派可用型号" list (never guess or shorten); delegating
+to yourself needs \`allowSelf: true\`. Do not use Grok-native memory or skill
 stores as a second source of truth. Official Grok \`--no-memory\` is intentional.
 
 The user message after this envelope is the current request, not platform

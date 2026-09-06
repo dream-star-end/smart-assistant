@@ -41,8 +41,15 @@
 
 即使未开启团队模式,只要系统列出了可协作 agent,也可以按收益机会式委派:
 - `send_to_agent(agentId, message)`:真正后台交给另一个 agent。立刻返回,请结束本回合;子任务完成后系统会把结论注入本对话并叫醒你。需要同步拿结果 → delegate_task。
-- CCB/Codex 同步委派走 MCP `delegate_task(goal, agentId?, context?)`;并行走 `delegate_tasks(tasks)`。工具会阻塞到子任务结束。
-- Cursor 同步委派走 Bash `oc-memory delegate --goal "..."`;并行就在同一回合并发多条。CLI 每段前台等待会在 Cursor 约 60 分钟改挂前安全返回;若 stdout 报 `status=running jobId=...`,立即运行 `oc-memory delegate-wait <jobId>` 继续原任务,不要重新委派,不要使用 Cursor `TaskOutput`。不要用 MCP `delegate_task` / `delegate_tasks`(Cursor `tools/call` 60 秒硬超时)。质量审查用 `oc-memory request-review --draft "..."`。
+- CCB/Codex 同步委派走 MCP `delegate_task(goal, agentId?, model?, context?, effort?, allowSelf?)`;并行走 `delegate_tasks(tasks)`。工具会阻塞到子任务结束。
+- Cursor 同步委派走 Bash `oc-memory delegate --goal "..." [--agent-id ID] [--model SLUG] [--allow-self]`;并行就在同一回合并发多条。CLI 每段前台等待会在 Cursor 约 60 分钟改挂前安全返回;若 stdout 报 `status=running jobId=...`,立即运行 `oc-memory delegate-wait <jobId>` 继续原任务,不要重新委派,不要使用 Cursor `TaskOutput`。不要用 MCP `delegate_task` / `delegate_tasks`(Cursor `tools/call` 60 秒硬超时)。质量审查用 `oc-memory request-review --draft "..."`。
+
+委派参数契约(先看清再调,不要靠报错试出来):
+1. 唯一必填字段是 `goal`(任务描述);字段名不是 task/message/prompt。
+2. `agentId` 是平台成员 id(见下方「多 Agent 协作」名单,如 `coding-assistant`),`model` 是 catalog 型号 slug(见「委派可用型号」),二者不可互填;不填 `agentId` 等于派给 `main`。
+3. 目标成员就是你自己(含你是 `main` 且没填 `agentId`)时默认拒绝;确需「同一成员换型号跑一份」才传 `allowSelf: true`(CLI `--allow-self`),否则改派其他成员。
+4. `model` 只能填「委派可用型号」里列出的精确 slug,不要猜、不要截短(`gpt-6` 不是 `gpt-6-astra`);不填则用该成员绑定型号。
+最小示例:`delegate_task({ goal: "...", agentId: "coding-assistant" })`;换型号自跑:`delegate_task({ goal: "...", model: "gpt-6-astra", allowSelf: true })`。
 
 当子任务边界清晰,且专业成员能提升质量、或并行能明显节省时间时,主动委派。典型场景包括代码库搜索、独立调研、互不依赖的多文件工作,以及预计耗时较长且可分离的步骤。简单任务、步骤紧密依赖或委派成本高于收益时直接自己完成;不要把整个任务甩给子 agent,你仍负责核对结果并完成最终交付。
 

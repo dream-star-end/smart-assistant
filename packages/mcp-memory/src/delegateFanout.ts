@@ -6,7 +6,12 @@
  * 编排(Promise.all 各自 POST /delegate、单项失败隔离)留在 index.ts handleDelegateTasks。
  */
 
-import { normalizeDelegateAgentId, normalizeDelegateModel } from './delegateArgs.js'
+import {
+  goalRequiredError,
+  normalizeDelegateAgentId,
+  normalizeDelegateModel,
+  parseDelegateAllowSelf,
+} from './delegateArgs.js'
 
 /** 单个并行子任务的规范化描述。 */
 export interface FanoutTask {
@@ -17,6 +22,8 @@ export interface FanoutTask {
   effort?: string
   toolsets?: string[]
   resumeSessionKey?: string
+  /** 显式允许 agentId == 当前成员(同成员换 model 跑)。缺省 false → 网关 400 自委派拒绝。 */
+  allowSelf?: boolean
 }
 
 /** 一次 fan-out 中单个子任务的执行结果(供聚合)。 */
@@ -61,7 +68,7 @@ export function normalizeFanoutTasks(
     const item = raw[i] as Record<string, unknown> | null
     const goal = item && typeof item.goal === 'string' ? item.goal.trim() : ''
     if (!goal) {
-      return { ok: false, error: `第 ${i + 1} 个子任务缺少 goal` }
+      return { ok: false, error: `第 ${i + 1} 个子任务缺少 goal(${goalRequiredError(item)})` }
     }
     const effort =
       item && typeof item.effort === 'string' && EFFORT_ALLOW.has(item.effort)
@@ -87,6 +94,7 @@ export function normalizeFanoutTasks(
       effort,
       toolsets: toolsets && toolsets.length > 0 ? toolsets : undefined,
       resumeSessionKey,
+      ...(parseDelegateAllowSelf(item?.allowSelf) ? { allowSelf: true } : {}),
     })
   }
   return { ok: true, tasks }

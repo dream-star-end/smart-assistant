@@ -24,10 +24,47 @@ export function normalizeDelegateModel(
   return { ok: true, model }
 }
 
+/** 调用方最常误用的字段名;命中时在错误里点名指回 goal。 */
+const GOAL_ALIAS_KEYS = ['task', 'message', 'prompt', 'instruction', 'instructions', 'text', 'query'] as const
+
+/**
+ * 缺 goal 的自愈错误:点名正确字段,若发现调用方把任务写进了同义字段(task/message/prompt…)
+ * 直接指出。以 `goal required` 开头保留旧前缀。
+ */
+export function goalRequiredError(args?: Record<string, unknown> | null): string {
+  const misplaced = args
+    ? GOAL_ALIAS_KEYS.filter((k) => typeof args[k] === 'string' && (args[k] as string).trim() !== '')
+    : []
+  const hint = misplaced.length > 0 ? `你填的 ${misplaced.map((k) => `"${k}"`).join('/')} 请改名为 "goal"。` : ''
+  return `goal required:唯一必填字段是 goal(任务描述字符串),字段名不是 task/message/prompt。${hint}最小示例 {"goal":"..."}`
+}
+
+export function normalizeDelegateGoal(
+  raw: unknown,
+  args?: Record<string, unknown> | null,
+): { ok: true; goal: string } | { ok: false; error: string } {
+  const goal = typeof raw === 'string' ? raw.trim() : ''
+  if (!goal) return { ok: false, error: goalRequiredError(args) }
+  return { ok: true, goal }
+}
+
 export const SELF_DELEGATE_ERROR = '不能把任务委派给自己。确需自调用时请加 --allow-self'
+/** MCP 工具侧的同义提示:`--allow-self` 是 oc-memory CLI 旗标,MCP 调用方看不到 CLI。 */
+export const SELF_DELEGATE_MCP_HINT =
+  '不能把任务委派给自己(agentId 与当前成员相同)。确需自调用(例如同成员换 model 跑一份)请传 allowSelf: true;否则改派其他成员,如 agentId="coding-assistant"'
 
 export function parseDelegateAllowSelf(raw: unknown): boolean {
   return raw === true || raw === 'true' || raw === '1'
+}
+
+/**
+ * 把网关回传的 CLI 口径自委派错误改写成 MCP 口径(参数名 allowSelf 而非 --allow-self)。
+ * 其它文本原样返回。
+ */
+export function rewriteSelfDelegateErrorForMcp(text: string): string {
+  return text.includes(SELF_DELEGATE_ERROR)
+    ? text.replace(SELF_DELEGATE_ERROR, SELF_DELEGATE_MCP_HINT)
+    : text
 }
 
 export function rejectSelfDelegate(opts: {

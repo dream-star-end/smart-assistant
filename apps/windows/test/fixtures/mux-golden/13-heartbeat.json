@@ -1,0 +1,8 @@
+{
+  "name": "13-heartbeat",
+  "hex": "200000000000000000087b227473223a317d",
+  "length": 18,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 32,
+  "streamId": 0
+}

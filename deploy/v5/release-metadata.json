@@ -154,7 +154,10 @@
     "0270_cursor_claude_200_others_100_grok_admin",
     "0271_cursor_retire_fable5_add_sonnet5",
     "0272_cursor_sonnet5_admin_only",
-    "0275_restore_ccb_provider_check"
+    "0273_chatgpt_proxy_credentials",
+    "0274_desktop_tunnel_owners",
+    "0275_restore_ccb_provider_check",
+    "0276_grok_account_usage_columns"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

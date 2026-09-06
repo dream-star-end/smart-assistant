@@ -68,6 +68,7 @@ export function cursorOfficialCcEnabledForModel(
     || family === 'opus-4.8'
     || family === 'fable-5'
     || family === 'fable-5.1'
+    || family === 'sonnet-5'
 }
 
 export function cursorVariantFor(
@@ -412,6 +413,14 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   clearSessionId(): void {
     this.opts.resumeSessionId = undefined
     this.inner.clearSessionId()
+  }
+  setResumeSessionId(sessionId: string): void {
+    // Prefixed id (sand-ccb:/sand-official-cc:/bare native) must match the
+    // live variant; a foreign-variant id is a clear, not a steer.
+    const inner = resumeForVariant(sessionId, this.variant)
+    if (!inner) { this.clearSessionId(); return }
+    this.opts.resumeSessionId = sessionId
+    this.inner.setResumeSessionId?.(inner)
   }
 
   requiresReopenForModel(model: string | undefined): boolean {
