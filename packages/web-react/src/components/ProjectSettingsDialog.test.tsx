@@ -122,6 +122,7 @@ describe("ProjectSettingsDialog", () => {
       },
     });
     await waitFor(() => expect(taskboardApi.getProjectContext).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByLabelText("自定义指令")).toHaveValue("from-project-md"));
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     await waitFor(() => expect(put).toHaveBeenCalled());
     expect(put).toHaveBeenCalledWith(
