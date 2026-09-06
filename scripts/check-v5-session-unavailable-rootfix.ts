@@ -49,6 +49,29 @@ for (const marker of ['class MemoryBarrierTimeoutError', 'while (quiesceAttempts
   }
 }
 
+// INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL: the bridge rewrites teamMode:true
+// turns to DEFAULT_CODEX_ENGINE_MODEL. The model-authorization test must assert that constant
+// (never a model literal) and must bound its container-frame wait, otherwise a stub assertion
+// failure becomes SESSION_PERSIST_UNAVAILABLE + an unbounded await that hangs commercial-unit
+// until the 30 min CI timeout (PR #557, 2026-09-06, twice).
+const bridgeTests = readFileSync(
+  join(root, 'packages/commercial/src/__tests__/userChatBridge.test.ts'),
+  'utf8',
+)
+if (!/import \{[^}]*DEFAULT_CODEX_ENGINE_MODEL[^}]*\} from "@openclaude\/protocol"/.test(bridgeTests)) {
+  throw new Error('[session-unavailable-rootfix] userChatBridge.test.ts must import DEFAULT_CODEX_ENGINE_MODEL')
+}
+if (!/model: DEFAULT_CODEX_ENGINE_MODEL,\s*teamMode: true,/.test(bridgeTests)) {
+  throw new Error('[session-unavailable-rootfix] teamMode:true routing assertion must use DEFAULT_CODEX_ENGINE_MODEL, not a literal')
+}
+if (!bridgeTests.includes('container never received the forwarded turn within 5s')) {
+  throw new Error('[session-unavailable-rootfix] persisted-before-history test lost its bounded container wait')
+}
+if (!bridge.includes('effectiveModel = DEFAULT_CODEX_ENGINE_MODEL;')) {
+  throw new Error('[session-unavailable-rootfix] bridge no longer pins teamMode main to DEFAULT_CODEX_ENGINE_MODEL')
+}
+
 console.log(
   '[session-unavailable-rootfix] PASS — detach drain, durable cron receipt, rejected convergence and bounded memory retry are locked',
 )
+console.log('[session-unavailable-rootfix] PASS — INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL team-leader default-model test contract is locked')
