@@ -310,7 +310,7 @@ PY
   fi
   if [[ "$host_ok" -ne 0 ]]; then
     if [[ "$dockerenv" -eq 1 ]]; then
-      if [[ "$flavor" == "selfhost" && ( "$hostname" == "kl-mirror" || "$hostname" == "ser135234097086" ) ]]; then
+      if [[ "$flavor" == "selfhost" && ( "$hostname" == "kl-mirror" || "$hostname" == "ser135234097086" || "$hostname" == "cj-volc-gz" ) ]]; then
         flavor_die "container hostname ${hostname} belongs to the other flavor (manifest=${flavor})"
         return 1
       fi
@@ -427,7 +427,7 @@ write_flavor_manifest() {
     dbs='["openclaude_v5_selfhost"]'
   else
     builder="deploy-v5.sh"
-    hosts='["kl-mirror","ser135234097086"]'
+    hosts='["kl-mirror","ser135234097086","cj-volc-gz"]'
     roots='["/opt/openclaude/openclaude-v5","/opt/openclaude/openclaude-v5-b"]'
     dbs='["openclaude"]'
   fi
