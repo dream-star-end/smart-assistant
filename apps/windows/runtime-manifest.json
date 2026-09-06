@@ -1,0 +1,24 @@
+{
+  "v": 1,
+  "engine": "ccb",
+  "min_version": "0.0.0-placeholder",
+  "keyring_fp": "",
+  "artifacts": [
+    {
+      "os": "windows",
+      "arch": "x64",
+      "url": "https://example.invalid/runtime/ccb-placeholder",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 0,
+      "version": "0.0.0-placeholder"
+    },
+    {
+      "os": "linux",
+      "arch": "x64",
+      "url": "https://example.invalid/runtime/ccb-placeholder",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 0,
+      "version": "0.0.0-placeholder"
+    }
+  ]
+}

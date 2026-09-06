@@ -1108,6 +1108,45 @@ export async function insertQueuedTurnDispatch(input: {
   return txn()
 }
 
+export interface ExactTurnDispatchIdentity {
+  userId: string
+  sessionId: string
+  clientMessageId: string
+  dispatchId: string
+  attemptNo: number
+}
+
+/** OCV5-121: queued cancellation competes with running in the same SQLite transaction. */
+export async function cancelQueuedTurnDispatchExact(input: ExactTurnDispatchIdentity & { now?: number }): Promise<{
+  applied: boolean
+  found: boolean
+  conflict: boolean
+  state: TurnDispatchInboxState | 'absent' | null
+  outcome: TurnDispatchInboxOutcome | null
+}> {
+  const db = await getSessionsDb()
+  return db.transaction(() => {
+    const logical = _readTurnDispatchByLogicalKey(db, input.userId, input.sessionId, input.clientMessageId)
+    const dispatch = db.prepare(
+      'SELECT * FROM turn_dispatch_inbox WHERE dispatch_id = ? AND attempt_no = ?',
+    ).get(input.dispatchId, input.attemptNo) as TurnDispatchInboxDbRow | undefined
+    if ((logical && (logical.dispatchId !== input.dispatchId || logical.attemptNo !== input.attemptNo))
+      || (dispatch && (dispatch.user_id !== input.userId || dispatch.session_id !== input.sessionId
+        || dispatch.client_message_id !== input.clientMessageId))) {
+      return { applied: false, found: false, conflict: true, state: null, outcome: null }
+    }
+    if (!logical) return { applied: false, found: false, conflict: false, state: 'absent' as const, outcome: null }
+    const result = db.prepare(`
+      UPDATE turn_dispatch_inbox SET state='rejected', outcome='not_accepted', updated_at=?
+       WHERE user_id=? AND session_id=? AND client_message_id=?
+         AND dispatch_id=? AND attempt_no=? AND state='queued'
+    `).run(input.now ?? Date.now(), input.userId, input.sessionId, input.clientMessageId,
+      input.dispatchId, input.attemptNo)
+    const row = _readTurnDispatchByLogicalKey(db, input.userId, input.sessionId, input.clientMessageId)!
+    return { applied: result.changes > 0, found: true, conflict: false, state: row.state, outcome: row.outcome }
+  })()
+}
+
 /**
  * CAS 状态迁移(from-state 守卫)。命中 → 更新 state/outcome/updated_at,返回新行;
  * 未命中(当前 state 不在 fromStates 内)→ 返回 null(调用方不重试、按幂等处理)。

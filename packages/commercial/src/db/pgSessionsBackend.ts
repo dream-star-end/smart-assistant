@@ -1669,6 +1669,9 @@ export interface TurnTapeStateResult {
   dispatchLeaseActive: boolean;
   /** Dispatch-level master shutdown evidence; none+true may synthesize even if lease looks live. */
   gatewayShutdownEvidence: boolean;
+  dispatchStatus?: "admitted" | "accepted" | "rejecting" | "terminal" | "manual_reconcile" | "absent";
+  dispatchOutcome?: "completed" | "interrupted" | "crashed" | "executed_error" | "not_accepted" | null;
+  producerFenced?: boolean;
 }
 
 export interface DispatchAdmissionBackend {
@@ -8847,12 +8850,18 @@ export function createPgSessionsBackend(
         tape_status: string | null;
         dispatch_lease_active: boolean;
         gateway_shutdown_evidence: boolean;
+        dispatch_status: TurnTapeStateResult["dispatchStatus"];
+        dispatch_outcome: TurnTapeStateResult["dispatchOutcome"];
+        producer_fenced: boolean;
       }>(
         `SELECT
            (tape.tape_id IS NOT NULL) AS tape_found,
            tape.finalized_at,
            tape.visible_at,
            tape.status AS tape_status,
+           COALESCE(dispatch.status, 'absent') AS dispatch_status,
+           dispatch.outcome AS dispatch_outcome,
+           (dispatch.producer_fenced_at IS NOT NULL) AS producer_fenced,
            COALESCE(
              dispatch.status IN ('admitted','accepted')
                AND dispatch.lease_until > statement_timestamp(),
@@ -8868,7 +8877,7 @@ export function createPgSessionsBackend(
             LIMIT 1
          ) AS tape ON TRUE
          LEFT JOIN LATERAL (
-           SELECT status, lease_until, shutdown_ctx
+           SELECT status, outcome, producer_fenced_at, lease_until, shutdown_ctx
              FROM turn_dispatches
             WHERE user_id = $2 AND dispatch_id = $3 AND attempt_no = $4
             LIMIT 1
@@ -8882,12 +8891,18 @@ export function createPgSessionsBackend(
       const row = res.rows[0]!;
       const dispatchLeaseActive = row.dispatch_lease_active === true;
       const gatewayShutdownEvidence = row.gateway_shutdown_evidence === true;
+      const authority = {
+        dispatchStatus: row.dispatch_status,
+        dispatchOutcome: row.dispatch_outcome,
+        producerFenced: row.producer_fenced === true,
+      };
       if (!row.tape_found) {
-        return { state: "none", status: null, dispatchLeaseActive, gatewayShutdownEvidence };
+        return { state: "none", status: null, dispatchLeaseActive, gatewayShutdownEvidence, ...authority };
       }
       return {
         state: row.visible_at !== null || row.finalized_at !== null ? "finalized" : "partial",
         status: row.tape_status ?? null,
+        ...authority,
         dispatchLeaseActive,
         gatewayShutdownEvidence,
       };

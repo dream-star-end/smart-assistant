@@ -240,14 +240,17 @@ export const TOOLS = [
         agentId: {
           type: 'string',
           description:
-            '目标平台成员 id(可选,不填则派给 main)。只能是 coding-assistant / explorer 这类成员,不要填型号。',
+            '目标平台成员 id(可选,不填则派给 main —— 若你自己就是 main,这等于自委派,会被拒,除非同时传 allowSelf:true)。只能是 coding-assistant / explorer 这类成员,不要填型号。',
         },
         model: {
           type: 'string',
           description:
-            '可选:本次子任务使用的 catalog 型号(如 cursor-grok-4.6-high-fast、gpt-5.6-sol)。覆盖该成员默认模型;不填则用成员绑定。',
+            '可选:本次子任务使用的 catalog 型号,必须是系统提示「委派可用型号」里列出的精确 slug(如 cursor-grok-4.6-high-fast、gpt-6-astra),不要猜、不要截短(gpt-6 不是合法值)。覆盖该成员默认模型;不填则用成员绑定。',
         },
-        goal: { type: 'string', description: '委派任务的目标描述' },
+        goal: {
+          type: 'string',
+          description: '委派任务的目标描述(唯一必填字段;字段名就是 goal,不是 task/message/prompt)',
+        },
         context: { type: 'string', description: '传递给子 agent 的上下文信息 (可选)' },
         effort: {
           type: 'string',
@@ -302,13 +305,15 @@ export const TOOLS = [
             properties: {
               agentId: {
                 type: 'string',
-                description: '目标平台成员 id(可选,不填则派给 main)。不要填型号。',
+                description:
+                  '目标平台成员 id(可选,不填则派给 main;你自己是 main 时需配 allowSelf:true)。不要填型号。',
               },
               model: {
                 type: 'string',
-                description: '可选:该子任务的 catalog 型号,覆盖成员默认模型(同 delegate_task)。',
+                description:
+                  '可选:该子任务的 catalog 型号,必须是「委派可用型号」里的精确 slug,覆盖成员默认模型(同 delegate_task)。',
               },
-              goal: { type: 'string', description: '该子任务的目标描述' },
+              goal: { type: 'string', description: '该子任务的目标描述(每项唯一必填字段)' },
               context: { type: 'string', description: '传递给子 agent 的上下文信息 (可选)' },
               effort: {
                 type: 'string',

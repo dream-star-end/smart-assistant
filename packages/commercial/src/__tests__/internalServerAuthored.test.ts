@@ -113,7 +113,8 @@ describe("internal turn-tape-state lease response", () => {
       storage: {
         async getTurnTapeStateByDispatch(userId, seenDispatchId, attemptNo) {
           call = { userId, dispatchId: seenDispatchId, attemptNo };
-          return { state: "none", status: null, dispatchLeaseActive: true, gatewayShutdownEvidence: false };
+          return { state: "none", status: null, dispatchLeaseActive: true, gatewayShutdownEvidence: false,
+            dispatchStatus: "accepted", dispatchOutcome: null, producerFenced: false };
         },
       },
     });
@@ -134,6 +135,9 @@ describe("internal turn-tape-state lease response", () => {
       status: null,
       dispatchLeaseActive: true,
       gatewayShutdownEvidence: false,
+      dispatchStatus: "accepted",
+      dispatchOutcome: null,
+      producerFenced: false,
     });
   });
 });

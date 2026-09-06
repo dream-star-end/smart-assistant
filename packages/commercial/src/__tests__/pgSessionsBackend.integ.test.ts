@@ -250,7 +250,8 @@ before(async () => {
     CREATE TABLE agent_containers (
       id BIGSERIAL PRIMARY KEY,
       user_id BIGINT NOT NULL,
-      state TEXT NOT NULL
+      state TEXT NOT NULL,
+      runtime_kind TEXT NOT NULL DEFAULT 'docker'
     );
     CREATE TABLE admin_audit (
       id BIGSERIAL PRIMARY KEY,
@@ -7189,15 +7190,18 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     }).dispatch;
 
     const fresh = await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 1);
-    assert.deepEqual(fresh, { state: "none", status: null, dispatchLeaseActive: true, gatewayShutdownEvidence: false });
+    assert.deepEqual(fresh, { state: "none", status: null, dispatchLeaseActive: true, gatewayShutdownEvidence: false,
+      dispatchStatus: "admitted", dispatchOutcome: null, producerFenced: false });
     assert.deepEqual(
       await backend.getTurnTapeStateByDispatch("c:8", dispatch.dispatchId, 1),
-      { state: "none", status: null, dispatchLeaseActive: false, gatewayShutdownEvidence: false },
+      { state: "none", status: null, dispatchLeaseActive: false, gatewayShutdownEvidence: false,
+        dispatchStatus: "absent", dispatchOutcome: null, producerFenced: false },
       "错误租户不能观察 lease",
     );
     assert.deepEqual(
       await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 2),
-      { state: "none", status: null, dispatchLeaseActive: false, gatewayShutdownEvidence: false },
+      { state: "none", status: null, dispatchLeaseActive: false, gatewayShutdownEvidence: false,
+        dispatchStatus: "absent", dispatchOutcome: null, producerFenced: false },
       "attemptNo 必须同样参与 lease scope",
     );
 
@@ -7255,6 +7259,16 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       true,
       "dispatch 级停机证据必须出现在 tape-state 快照里",
     );
+    await pool.query(
+      "UPDATE turn_dispatches SET status='terminal', outcome='interrupted', producer_fenced_at=NOW() WHERE dispatch_id=$1",
+      [dispatch.dispatchId],
+    );
+    const terminal = await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 1);
+    assert.equal(terminal.dispatchStatus, "terminal");
+    assert.equal(terminal.dispatchOutcome, "interrupted");
+    assert.equal(terminal.producerFenced, true);
+    assert.equal(terminal.state, "none");
+
   });
 
   maybe("受理即建行(PUT-vs-WS 竞态根治):无预建行 admitted;ensure PUT 后到 rejected_stale;墓碑/他人行不动", async () => {

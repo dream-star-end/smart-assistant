@@ -74,6 +74,7 @@ import {
   stripDispatchAuthorityField,
   isLiveUnitsEnabled,
   type PromptQueueMutationFrame,
+  TURN_CANCEL_IF_QUEUED_PATH,
 } from '@openclaude/protocol'
 import {
   failureClassFromLocalExecutionCode,
@@ -101,6 +102,16 @@ import {
   DELEGATE_CONTEXT_HEADER,
   verifyDelegateContextToken,
 } from './delegateContext.js'
+import { checkLocalBridge, isHealthzFileProxyReady } from './localBridgeAuth.js'
+import { resolveGatewayListen } from './gatewayBind.js'
+import { resolveOpenedPath } from './openedPath.js'
+import {
+  hasResolvedPrefix,
+  isPathStrictlyUnder,
+  isPathWithinRoot,
+  openclaudeTempPrefix,
+  trustedContainerHome,
+} from './pathAcl.js'
 import { defaultReleaseJobDir, isReleaseJobId, publicReleaseJob, readReleaseJob } from './releaseJobStore.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
 import {
@@ -439,7 +450,13 @@ import {
   persistDelegateJobSnapshots,
   restoreDelegateJobSnapshots,
 } from './delegateCompleter.js'
-import { isPlatformAgentId, parseDelegateAllowSelf, parseDelegateModel, rejectSelfDelegate } from './delegateModel.js'
+import {
+  DELEGATE_GOAL_REQUIRED_ERROR,
+  isPlatformAgentId,
+  parseDelegateAllowSelf,
+  parseDelegateModel,
+  rejectSelfDelegate,
+} from './delegateModel.js'
 import { EMPTY_COMPLETED_TURN_NOTICE, hasPlatedAssistantOutput } from './emptyCompletedTurn.js'
 import {
   rebindOutboundClientMessageId,
@@ -580,6 +597,7 @@ import {
   queryMasterTapeState,
   recoverTurnDispatchInboxOnBoot,
   rejectTurnDispatchIfAbsent,
+  cancelQueuedTurnDispatchExact,
   resolveInboxTerminalAck,
   runDurableDispatchAdmission,
 } from './turnDispatchInbox.js'
@@ -592,6 +610,7 @@ import {
   type LocalCatalogView,
   type LocalExecutionRejectCode,
 } from './modelCatalogClient.js'
+import { suggestDelegateModels } from './delegateModelCatalogPrompt.js'
 import { resolveDelegateCostUsd } from './usageCost.js'
 import {
   buildTeamPreamble,
@@ -745,9 +764,17 @@ export function resolveExecutionModel(
     preferred !== '' &&
     !ALLOWED_INBOUND_MODELS.has(preferred)
   ) {
+    const suggestions = suggestDelegateModels(
+      preferred,
+      [...ALLOWED_INBOUND_MODELS].map((modelId) => ({ modelId, available: true })),
+    )
+    const hint =
+      suggestions.length > 0
+        ? ` 你是不是想填: ${suggestions.map((s) => `'${s}'`).join(' / ')}?`
+        : ' 系统提示「委派可用型号」段列出了可填的精确 slug。'
     throw new LocalExecutionRejected(
       'DELEGATE_MODEL_UNKNOWN',
-      `unknown explicit delegate model '${preferred}' (not inherited)`,
+      `unknown explicit delegate model '${preferred}' (not inherited).${hint} model 只能填精确 catalog slug,不要猜或截短。`,
     )
   }
   for (const m of [preferred, fallback, ...EXECUTION_MODEL_FALLBACK_ROUTE]) {
@@ -997,9 +1024,16 @@ export function decideLocalExecution(args: {
   if (explicitModel) {
     const canonical = view.canonicalize(explicitModel)
     if (!view.isRoutable(canonical) || view.resolve(canonical)?.engine == null) {
+      // 自愈提示:只从**可路由**集合里挑近邻(不泄露不可用/无权限型号),仅作建议不自动替换。
+      const suggestions = suggestDelegateModels(explicitModel, view.models)
+      const hint =
+        suggestions.length > 0
+          ? ` 你是不是想填: ${suggestions.map((s) => `'${s}'`).join(' / ')}?`
+          : ' 系统提示「委派可用型号」段列出了可填的精确 slug。'
       throw new LocalExecutionRejected(
         'DELEGATE_MODEL_UNKNOWN',
-        `model '${explicitModel}' is not in the current catalog projection (not inherited)`,
+        `model '${explicitModel}' is not in the current catalog projection (not inherited).` +
+          `${hint} model 只能填精确 catalog slug,不要猜或截短;不填则用成员绑定型号。`,
       )
     }
   }
@@ -3504,10 +3538,18 @@ export class Gateway {
       this.log.warn('live stream convergence failed', undefined, err)
     }
 
+    const listenOpts = resolveGatewayListen(config.gateway.bind, config.gateway.port)
     await new Promise<void>((res) => {
-      this.httpServer.listen(config.gateway.port, config.gateway.bind, () => res())
+      if (listenOpts.exclusive) {
+        this.httpServer.listen(
+          { port: listenOpts.port, host: listenOpts.host, exclusive: true },
+          () => res(),
+        )
+      } else {
+        this.httpServer.listen(listenOpts.port, listenOpts.host, () => res())
+      }
     })
-    this.log.info('server started', { bind: config.gateway.bind, port: config.gateway.port })
+    this.log.info('server started', { bind: listenOpts.host, port: listenOpts.port })
 
     // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
     this.bootAutoResume().catch((err) =>
@@ -4000,7 +4042,13 @@ export class Gateway {
     const bridgeVerified = needsAuth ? this.checkBridgeBypass(req, url) : false
     const delegateAuthedByContext =
       this._isDelegateHttpPath(url.pathname) && this._hasValidDelegateContext(req)
-    if (needsAuth && !bridgeVerified && !this.checkHttpAuth(req) && !delegateAuthedByContext) {
+    if (
+      needsAuth &&
+      !bridgeVerified &&
+      !this.checkHttpAuth(req) &&
+      !checkLocalBridge(req) &&
+      !delegateAuthedByContext
+    ) {
       res.writeHead(401, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'unauthorized' }))
       return
@@ -4308,6 +4356,21 @@ export class Gateway {
     // POST /internal/v3/turn-reject-if-absent —— reconciler rejecting 分支:有 inbox 行
     // 返状态(negative proof 不成立);无行插 rejected(not_accepted)墓碑。durable
     // rejected tombstone 是 I2 里 negative proof 的**唯一**合法来源。
+    if (url.pathname === TURN_CANCEL_IF_QUEUED_PATH && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      this.handleTurnCancelIfQueued(req, res).catch((err) => {
+        this.log.error('turn-cancel-if-queued handler crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
     if (url.pathname === '/internal/v3/turn-reject-if-absent' && req.method === 'POST') {
       if (!this.checkInboundBypass(req, url)) {
         this.sendJson(res, 401, { error: 'unauthorized' })
@@ -4386,18 +4449,10 @@ export class Gateway {
       // (supervisor 写错 / 部署降级 / 容器复用)→ not ready → HOST 返 CONTAINER_OUTDATED,
       // 避免 HOST 按 bypass 发头结果容器内 checkBridgeBypass 失败 401 的 dead lock。
       // (Codex R1 SHOULD-3:校验形态,不只校验非空)
-      const TRUST_BRIDGE_IP = process.env.OPENCLAUDE_TRUST_BRIDGE_IP || ''
       const OC_CONTAINER_ID = process.env.OC_CONTAINER_ID || ''
-      const OC_BRIDGE_NONCE = process.env.OC_BRIDGE_NONCE || ''
-      // trust IP 必须是 IPv4 文本(docker bridge gateway,通常 172.30.0.1)
-      // 用 net.isIPv4 而不是松正则 —— R2 SHOULD:`999.999.999.999` 会过正则但
-      // remoteAddress 永远 match 不到,结果 /healthz 误报 ready 导致 HOST probe
-      // 通过但真实 bypass 全挂。
-      const TRUST_IP_OK = isIPv4(TRUST_BRIDGE_IP)
-      // container id 必须是 10 位以内正整数(BIGSERIAL),禁止 alpha / leading 0 / 超长
-      const CONTAINER_ID_OK = /^[1-9][0-9]{0,18}$/.test(OC_CONTAINER_ID)
-      const NONCE_OK = /^[0-9a-f]{64}$/i.test(OC_BRIDGE_NONCE)
-      const bridgeReady = TRUST_IP_OK && CONTAINER_ID_OK && NONCE_OK
+      // file-proxy-v1 仍只看 TRUST_BRIDGE 三件套形态(isHealthzFileProxyReady)。
+      // local-bridge token 不是三件套的一部分,W4:不得因此广播 file-proxy-v1。
+      const bridgeReady = isHealthzFileProxyReady(process.env)
       const body: Record<string, unknown> = c
         ? {
             ok: true,
@@ -6573,6 +6628,32 @@ export class Gateway {
    * 整段消息走错容器属于上游路由 bug,跟 dispatchInbound 收到一条 WS frame 信任
    * _userId 是同一信任模型(checkInboundBypass 已确认 caller = master broker)。
    */
+  /** OCV5-121: exact queued cancellation, never Stop an active predecessor. */
+  private async handleTurnCancelIfQueued(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let body: Record<string, unknown>
+    try {
+      const parsed: unknown = JSON.parse(await this.readBody(req, 16 * 1024))
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid body')
+      body = parsed as Record<string, unknown>
+    } catch {
+      this.sendJson(res, 400, { error: 'invalid or oversized body' })
+      return
+    }
+    const { userId, sessionId, clientMessageId, dispatchId, attemptNo } = body
+    if (typeof userId !== 'string' || userId === ''
+      || typeof sessionId !== 'string' || sessionId === ''
+      || typeof clientMessageId !== 'string' || clientMessageId === ''
+      || typeof dispatchId !== 'string' || dispatchId === ''
+      || typeof attemptNo !== 'number' || !Number.isSafeInteger(attemptNo) || attemptNo < 1) {
+      this.sendJson(res, 400, { error: 'userId/sessionId/clientMessageId/dispatchId/attemptNo required' })
+      return
+    }
+    const result = await cancelQueuedTurnDispatchExact({ userId, sessionId, clientMessageId, dispatchId, attemptNo })
+    this.sendJson(res, result.conflict ? 409 : 200, result.conflict
+      ? { ...result, error: 'dispatch identity conflict' }
+      : result)
+  }
+
   /**
    * RFC-v5-durable-turn-dispatch §3 — POST /internal/v3/turn-reject-if-absent。
    *
@@ -7215,7 +7296,7 @@ export class Gateway {
     }
     let fdReal: string
     try {
-      fdReal = realpathSync(`/proc/self/fd/${fd}`)
+      fdReal = resolveOpenedPath(fd, realPath)
     } catch {
       closeSync(fd)
       res.writeHead(404)
@@ -8111,7 +8192,7 @@ export class Gateway {
       // violation. Documented in docs/audit-file-toctou.md.
       let tmpFdReal: string
       try {
-        tmpFdReal = realpathSync(`/proc/self/fd/${tmpFd}`)
+        tmpFdReal = resolveOpenedPath(tmpFd, tmpPath)
       } catch (err) {
         this.log.error('handleUpload: tmp fd realpath failed', { tmpPath }, err)
         try { unlinkSync(tmpPath) } catch {}
@@ -8377,7 +8458,7 @@ export class Gateway {
         }
         let finalReal: string
         try {
-          finalReal = realpathSync(`/proc/self/fd/${finalFd}`)
+          finalReal = resolveOpenedPath(finalFd, finalPath)
         } catch (err) {
           this.log.error('handleUpload: post-link realpath failed', { finalPath, eexistDedup }, err)
           if (!eexistDedup) {
@@ -11717,7 +11798,7 @@ export class Gateway {
       )
     }
     const { goal, context, sourceAgent, toolsets } = parsed
-    if (!goal) return this.sendError(res, 400, 'goal required')
+    if (!goal) return this.sendError(res, 400, DELEGATE_GOAL_REQUIRED_ERROR)
     const modelNorm = parseDelegateModel(parsed.model)
     if (!modelNorm.ok) return this.sendError(res, 400, modelNorm.error)
     // Flag-off: reject unknown explicit slugs before async job creation / spawn.
@@ -15386,7 +15467,7 @@ export class Gateway {
       remoteIp === TRUST_BRIDGE_IP ||
       remoteIp === `::ffff:${TRUST_BRIDGE_IP}`
     )
-    if (!isFromBridge && !this.checkHttpAuth(req)) {
+    if (!isFromBridge && !checkLocalBridge(req) && !this.checkHttpAuth(req)) {
       ws.close(1008, 'unauthorized')
       return
     }
@@ -21161,8 +21242,8 @@ export const FILE_ALLOWED_DIRS: string[] = [
   resolve(paths.uploadsDir),    // /root/.openclaude/uploads/
 ]
 
-/** Temp-file prefix pattern: /tmp/openclaude-* */
-const TEMP_PREFIX = resolve('/tmp/openclaude-')
+/** Temp-file prefix pattern: /tmp/openclaude-* (win32: os.tmpdir()/openclaude-) */
+const TEMP_PREFIX = openclaudeTempPrefix()
 
 /**
  * v3 Codex sometimes writes a user-requested artifact into its cwd
@@ -21217,7 +21298,7 @@ const COMMERCIAL_USER_VOLUME_MEDIA_GATE =
  * Used only by the trusted branch of `isFileAllowed`; legacy/personal-version
  * code never references this constant.
  */
-const TRUSTED_CONTAINER_HOME = '/home/agent'
+const TRUSTED_CONTAINER_HOME = trustedContainerHome()
 
 /**
  * Call-time check (NOT a module-load const) — tests can flip the env between
@@ -21281,30 +21362,28 @@ export function isFileAllowed(
   //     must add a matching pattern in the same PR (with a `security.test.ts`
   //     case). v3supervisor.ts and entrypoint.ts cite this contract.
   if (isTrustedContainerFileServeEnabled()) {
-    const inHome =
-      resolvedPath === TRUSTED_CONTAINER_HOME ||
-      resolvedPath.startsWith(`${TRUSTED_CONTAINER_HOME}/`)
-    const inTemp = resolvedPath.startsWith(TEMP_PREFIX)
+    const inHome = isPathWithinRoot(resolvedPath, TRUSTED_CONTAINER_HOME)
+    const inTemp = hasResolvedPrefix(resolvedPath, TEMP_PREFIX)
     const inOptExport = OPT_OPENCLAUDE_EXPORT_RE.test(resolvedPath)
     if (!inHome && !inTemp && !inOptExport) return false
     return !isFileBlocked(resolvedPath)
   }
   // 1. Static allowed directories (OPENCLAUDE_HOME, generated/, uploads/)
   for (const dir of FILE_ALLOWED_DIRS) {
-    if (resolvedPath.startsWith(dir + '/') || resolvedPath === dir) return true
+    if (isPathWithinRoot(resolvedPath, dir)) return true
   }
   // 2. Temp files matching /tmp/openclaude-*
-  if (resolvedPath.startsWith(TEMP_PREFIX)) return true
+  if (hasResolvedPrefix(resolvedPath, TEMP_PREFIX)) return true
   // 3. Dynamic agent cwds (if provided) — allow media files and generated/uploads subdirs
   if (agentCwds) {
     for (const raw of agentCwds) {
       if (!raw) continue
       const cwd = resolve(raw)
-      if (resolvedPath.startsWith(cwd + '/') || resolvedPath === cwd) {
+      if (isPathWithinRoot(resolvedPath, cwd)) {
         // Allow generated/ and uploads/ subdirs unconditionally
-        const genSub = cwd + '/generated'
-        const upSub = cwd + '/uploads'
-        if (resolvedPath.startsWith(genSub + '/') || resolvedPath.startsWith(upSub + '/')) return true
+        const genSub = join(cwd, 'generated')
+        const upSub = join(cwd, 'uploads')
+        if (isPathStrictlyUnder(resolvedPath, genSub) || isPathStrictlyUnder(resolvedPath, upSub)) return true
         // Allow non-executable media file extensions anywhere in CWD
         const ext = extname(resolvedPath).toLowerCase()
         if (MEDIA_EXTENSIONS.has(ext)) return true
@@ -21338,9 +21417,7 @@ export function makeUserScopedMediaPredicate(
 ): (p: string) => boolean {
   const u = resolve(uploadsDir)
   const g = resolve(generatedDir)
-  return (p) =>
-    p === u || p.startsWith(u + '/') ||
-    p === g || p.startsWith(g + '/')
+  return (p) => isPathWithinRoot(p, u) || isPathWithinRoot(p, g)
 }
 
 /**

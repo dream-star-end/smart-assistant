@@ -1,0 +1,9 @@
+{
+  "name": "19-unknown-type-0x99",
+  "hex": "990000000001000000046e6f7065",
+  "length": 14,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 153,
+  "streamId": 1,
+  "expectSession": "fail-closed"
+}

@@ -66,7 +66,7 @@ import {
   type ModelAuthorityDecision,
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
-import { findRouteProviderForModel } from "@openclaude/protocol";
+import { findRouteProviderForModel, isCursorEngineModel } from "@openclaude/protocol";
 import {
   getDegradedProviders,
   getHealthDegradedProviders,
@@ -302,9 +302,12 @@ export function makeAnthropicProxyHandler(
       path: req.url ?? "",
     });
 
-    // 0) 路径白名单 — 这个 handler 只挂在 POST /v1/messages
+    // 0) 路径白名单 — 这个 handler 只挂在 POST /v1/messages(external API-key 实例
+    // 额外放行 /v1/messages/count_tokens,身份通过后按字节估算返回,见下)
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
-    if (req.method !== "POST" || url.pathname !== "/v1/messages") {
+    const isCountTokens =
+      deps.allowCountTokens === true && url.pathname === "/v1/messages/count_tokens";
+    if (req.method !== "POST" || (url.pathname !== "/v1/messages" && !isCountTokens)) {
       reqLog.warn("proxy_bad_path", { method: req.method, path: url.pathname });
       incrAnthropicProxyReject("bad_path");
       sendJsonError(res, 404, "NOT_FOUND", "endpoint not found", requestId);
@@ -346,6 +349,31 @@ export function makeAnthropicProxyHandler(
       uid: uid.toString(),
       containerId: containerIdBig === null ? null : containerIdBig.toString(),
     });
+
+    // 1b) count_tokens(仅 allowCountTokens 实例):身份通过即答,不进限流/并发/授权 ——
+    // 它不产生上游调用,只是 Claude Code 上下文估算的辅助接口。口径与容器侧
+    // CursorSandRelay 一致:raw body 字节 / 4,至少 1。
+    if (isCountTokens) {
+      let rawBytes = 0;
+      try {
+        for await (const chunk of req) {
+          rawBytes += chunk instanceof Buffer ? chunk.length : Buffer.byteLength(chunk as string);
+          if (rawBytes > maxBodyBytes) {
+            incrAnthropicProxyReject("too_large");
+            sendJsonError(res, 413, "PAYLOAD_TOO_LARGE", `request body exceeds ${maxBodyBytes} bytes`, requestId);
+            return;
+          }
+        }
+      } catch (err) {
+        userLog.warn("proxy_count_tokens_read_failed", { err: errSummary(err) });
+        sendJsonError(res, 400, "BAD_BODY", "invalid request body", requestId);
+        return;
+      }
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ input_tokens: Math.max(1, Math.ceil(rawBytes / 4)) }));
+      return;
+    }
 
     // 2) 限流(per-uid 滑动固定窗口)
     try {
@@ -422,6 +450,27 @@ export function makeAnthropicProxyHandler(
           return;
         }
         throw err;
+      }
+
+      // 4a) cursor-* 引擎模型(仅 external API-key 实例注入 cursorExternal)。
+      // 放在 authority gate 之前:gate 对 engine!=='ccb' 的模型一律 not_available,
+      // 而这条路径的可用性由 cursorExternal 自己按 pricing.enabled + authorize + 账号池判定。
+      // 授权/余额/账号选择/relay/settle/post-commit 全在 cursorExternal.handle 内完成;
+      // 仍在本 try/finally 内 → releaseSlot 照常。
+      if (deps.cursorExternal && isCursorEngineModel(body.model)) {
+        await deps.cursorExternal.handle({
+          req,
+          res,
+          requestId,
+          uid,
+          identity,
+          body,
+          authorize: (p) => deps.identity.authorize(identity, p, body.model),
+          appendCostCredits: deps.appendCostCredits,
+          broadcastToUser: deps.broadcastToUser,
+          userLog,
+        });
+        return;
       }
 
       // 4b) 模型执行权威 gate(模型权威批次 · 方案 §1.2/§4)。

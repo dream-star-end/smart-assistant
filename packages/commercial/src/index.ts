@@ -151,6 +151,7 @@ import {
 } from "./account-pool/cooldownRecoveryActor.js";
 import { startCursorAuthSyncActor } from "./account-pool/cursorMaterializer.js";
 import { startCursorUsageSweeper } from "./account-pool/cursorUsageSweeper.js";
+import { startGrokUsageSweeper } from "./account-pool/grokUsageSweeper.js";
 import {
   DEFAULT_V3_CODEX_CONTAINER_DIR,
   V3_CONTAINER_PORT,
@@ -246,6 +247,7 @@ import {
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured, STATIC_PROVIDER_META } from "./http/proxy/staticProviderMeta.js";
+import { makeCursorExternalRoute, type CursorExternalRoute } from "./http/proxy/cursorExternal.js";
 import type {
   DurableCodexBilling,
   StaticProviderId,
@@ -3084,6 +3086,10 @@ export async function registerCommercial(
   // 见 undefined 走 503 EXTERNAL_PROXY_UNAVAILABLE 而非 404(部署故障不该伪装成
   // "用户 URL 写错")。
   let externalApiKeyProxy: AnthropicProxyHandler | undefined;
+  // cursor-* 模型在 external API-key 路径上的服务端 Sand relay(本地 Claude Code 接入
+  // Cursor 系模型)。仅 external 实例注入;容器 internal proxy 不注 —— 容器内 cursor 走
+  // 容器自己的 relay。shutdown 时 close() 归零凭据副本。
+  let cursorExternalRoute: CursorExternalRoute | undefined;
   if (!options.skipInternalProxy) {
     try {
       const apiKeyRepo = makePgApiKeyRepo(getPool());
@@ -3105,12 +3111,20 @@ export async function registerCommercial(
       const platformContextLoader = makePlatformContextLoader({
         reader: makeDefaultVolumeContextReader(),
       });
+      cursorExternalRoute = makeCursorExternalRoute({
+        pgPool: getPool(),
+        pricing,
+        logger: rootLogger.child({ subsys: "cursorExternal" }),
+      });
       externalApiKeyProxy = makeAnthropicProxyHandler({
         pgPool: getPool(),
         pricing,
         preCheckRedis,
         scheduler,
         identity: apiKeyStrategy,
+        cursorExternal: cursorExternalRoute,
+        // Claude Code 会打 /v1/messages/count_tokens 做上下文估算;external 实例放行。
+        allowCountTokens: true,
         loadUserModelAuthz,
         rateLimitRedis: sharedRateLimitRedis,
         // 与 internal 同型:OAuth refresh 走 health + codex disable fanout。
@@ -3132,7 +3146,7 @@ export async function registerCommercial(
       });
       // eslint-disable-next-line no-console
       console.log(
-        "[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages)",
+        "[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages, cursor-* via sand relay)",
       );
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -3141,6 +3155,9 @@ export async function registerCommercial(
         err,
       );
       externalApiKeyProxy = undefined;
+      const stale = cursorExternalRoute;
+      cursorExternalRoute = undefined;
+      void stale?.close().catch(() => undefined);
     }
   }
 
@@ -5846,6 +5863,23 @@ export async function registerCommercial(
     });
   }
 
+  // 0276 — Grok Build (xAI subscription) usage sweeper. Hourly, per grok
+  // row: cli-chat-proxy /billing + /user → claude_accounts.grok_* columns.
+  // Leader-only (one set of xAI calls per pool). No materializer: grok has
+  // no sidecar. Direct egress only (sing-box IPv6 RST).
+  if (process.env.COMMERCIAL_GROK_USAGE_SWEEP_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "grokUsageSweep",
+      domain: "v5-owned",
+      start: () => {
+        const raw = Number(process.env.COMMERCIAL_GROK_USAGE_SWEEP_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 60_000 ? raw : 60 * 60_000;
+        const h = trackScheduler("grokUsageSweep", "v5-owned", startGrokUsageSweeper({ intervalMs }));
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
   // A1 — pending 订单 expirer(默认 60s tick,部署即 boot 跑一次清历史脏单)。
   // markOrderPaid 不在事务内对 expires_at 做硬防线(避免用户超时几秒扫码就硬失败
   // 的体验回归);过期清理由本 sweeper 负责,被推 expired 后 markOrderPaid 自然拒。
@@ -6689,6 +6723,7 @@ export async function registerCommercial(
       try { await previewBridge?.shutdown(); } catch { /* ignore */ }
       try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
       try { await userChatBridge.shutdown(); } catch { /* ignore */ }
+      try { await cursorExternalRoute?.close(); } catch { /* ignore */ }
       // Managed setup/action workers must drain while PG/Redis and Docker control are alive.
       try {
         await Promise.all([

@@ -1,0 +1,8 @@
+{
+  "name": "09-reset-stream",
+  "hex": "050000000007000000247b22636f6465223a2250524f544f434f4c222c226d657373616765223a226e6f7065227d",
+  "length": 46,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 5,
+  "streamId": 7
+}

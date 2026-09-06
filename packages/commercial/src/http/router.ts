@@ -1592,6 +1592,7 @@ export const COMMERCIAL_PRE_ROUTE_PATHS: readonly {
   requiresPrefix: boolean
 }[] = [
   { path: '/api/anthropic/v1/messages', kind: 'exact', requiresPrefix: true },
+  { path: '/api/anthropic/v1/messages/count_tokens', kind: 'exact', requiresPrefix: true },
   { path: '/api/file', kind: 'prefix', requiresPrefix: false },
   { path: '/api/media/', kind: 'prefix', requiresPrefix: false },
 ]
@@ -1686,7 +1687,12 @@ export function createCommercialHandler(
     //   - `deps.externalApiKeyProxy` 注入 → 正常分发
     //   - 未注入 → 同一精确路径返 **503 EXTERNAL_PROXY_UNAVAILABLE** + log + metric
     //     而**不是** 404。部署故障不该伪装成"用户 URL 写错了",保留运维可见性。
-    if (method === 'POST' && path === '/api/anthropic/v1/messages') {
+    // count_tokens 同样进 external proxy(handler 内按 allowCountTokens 决定是否放行);
+    // 前缀 `/api/anthropic` 剥掉后交给 handler 自己的白名单。
+    if (
+      method === 'POST' &&
+      (path === '/api/anthropic/v1/messages' || path === '/api/anthropic/v1/messages/count_tokens')
+    ) {
       setSecurityHeaders(res)
       const requestId = ensureRequestId(req)
       res.setHeader(REQUEST_ID_HEADER, requestId)
@@ -1713,7 +1719,8 @@ export function createCommercialHandler(
       // (anthropic CLI 不带 query,但稳妥起见处理)。
       const original = req.url ?? '/api/anthropic/v1/messages'
       const qIdx = original.indexOf('?')
-      req.url = qIdx >= 0 ? `/v1/messages${original.slice(qIdx)}` : '/v1/messages'
+      const innerPath = path.slice('/api/anthropic'.length)
+      req.url = qIdx >= 0 ? `${innerPath}${original.slice(qIdx)}` : innerPath
       // requestId 贯通:proxy handler 内部会再调一次 ensureRequestId。若入站没有
       // x-request-id,router 这里生成的 id 与 proxy 内部又生成的 id 不一致,
       // log/response header 会被劈成两半。把 router 的 id 写回 req.headers 让

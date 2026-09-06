@@ -243,7 +243,6 @@ describe('CodexAppServerRunner turn/start params', () => {
     const instructions = (params.collaborationMode as any).settings.developer_instructions as string
     assert.match(instructions, /native fileChange\/apply_patch/)
     assert.match(instructions, /avoid Bash heredocs solely for file writes/)
-
     ;(h.runner as any).setConversationMode('plan')
     const planParams = (h.runner as any).buildTurnStartParams('hi')
     assert.equal((planParams.collaborationMode as any).settings.developer_instructions, null)
@@ -338,7 +337,11 @@ describe('CodexAppServerRunner route-specific provider lifecycle', () => {
     let ensureSpawned = 0
     ;(h.runner as any).shutdown = async () => {
       shutdowns += 1
-      assert.equal((h.runner as any).queue.length, 0, 'queued turns are shielded from shutdown rejection')
+      assert.equal(
+        (h.runner as any).queue.length,
+        0,
+        'queued turns are shielded from shutdown rejection',
+      )
       ;(h.runner as any).proc = null
       ;(h.runner as any).initialized = false
       ;(h.runner as any).attached = false
@@ -915,7 +918,6 @@ describe('handleNotification — item/completed', () => {
       },
     })
     await new Promise((r) => setImmediate(r))
-
     ;(h.runner as any).emitResult({
       durationMs: 1,
       ok: true,
@@ -965,7 +967,6 @@ describe('handleNotification — item/completed', () => {
       Object.prototype.hasOwnProperty.call(h.messages.at(-1), 'structured_output'),
       false,
     )
-
     ;(h.runner as any).hasCurrentStructuredOutput = true
     ;(h.runner as any).currentStructuredOutput = { summary: 'stale' }
     ;(h.runner as any).resetAttemptState()
@@ -1142,11 +1143,7 @@ describe('handleNotification — item/completed', () => {
       .map((m) => m.message.content[0])
     assert.equal(results.length, 2)
     assert.deepEqual(
-      results.map((result) => [
-        result.tool_use_id,
-        result.is_error,
-        result.termination_reason,
-      ]),
+      results.map((result) => [result.tool_use_id, result.is_error, result.termination_reason]),
       [
         ['mcp-failed', true, 'tool_error'],
         ['web-cancelled', true, 'cancelled'],
@@ -1451,9 +1448,7 @@ describe('handleNotification — early-arriving turn-scoped notifications (Codex
     })
     assert.equal(h.messages.length, 0)
 
-    const changes = [
-      { path: '/tmp/live.ts', kind: { type: 'update' }, diff: '@@\\n-old\\n+new' },
-    ]
+    const changes = [{ path: '/tmp/live.ts', kind: { type: 'update' }, diff: '@@\\n-old\\n+new' }]
     feed(h.runner, {
       jsonrpc: '2.0',
       method: 'item/fileChange/patchUpdated',
@@ -1771,9 +1766,7 @@ describe('thread/resume missing-rollout self-heal (Codex review #019e0b72 BLOCKE
       if (written.length > prevLen) return JSON.parse(written[written.length - 1])
       await new Promise((r) => setImmediate(r))
     }
-    throw new Error(
-      `runner never wrote a new line (prevLen=${prevLen}, total=${written.length})`,
-    )
+    throw new Error(`runner never wrote a new line (prevLen=${prevLen}, total=${written.length})`)
   }
 
   it('thread/resume returns -32600 "no rollout found" → restart with thread/start, threadId updated, session_id re-emitted', async () => {
@@ -1828,7 +1821,11 @@ describe('thread/resume missing-rollout self-heal (Codex review #019e0b72 BLOCKE
     // Post-conditions
     assert.equal(runner.threadId, 'thr-NEW', 'threadId must be updated to fresh id')
     assert.equal(runner.attached, true, 'attached must be true after successful self-heal')
-    assert.deepEqual(h.sessionIds, ['thr-NEW'], 'session_id must be emitted exactly once for the new thread')
+    assert.deepEqual(
+      h.sessionIds,
+      ['thr-NEW'],
+      'session_id must be emitted exactly once for the new thread',
+    )
 
     // The runTurn should have emitted a result message with ok=true.
     const resultMsg = h.messages.find((m) => m.type === 'result')
@@ -1984,6 +1981,78 @@ describe('thread/resume missing-rollout self-heal (Codex review #019e0b72 BLOCKE
     })
 
     await turnPromise
+    await h.cleanup()
+  })
+
+  it('missing rollout + resolveResumeFallback → thread/resume(fallback), token baseline re-seeded from fallback thread', async () => {
+    // Durable-artifact ladder: sessionManager offers a prior thread whose
+    // rollout still exists. Switching native thread on a hot runner must reset
+    // the thread-scoped token ledger exactly like _startNewThread does —
+    // otherwise the fallback thread's first usage frame is diffed against the
+    // dead thread's cumulative total and the turn bills 0 (GPT-6 review B1).
+    const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'thr-dead' })
+    const runner = h.runner as any
+    runner.opts.resolveResumeFallback = (stale: string) =>
+      stale === 'thr-dead' ? 'thr-prior' : undefined
+    const tokens = (n: number) => ({
+      cachedInputTokens: 0,
+      inputTokens: n,
+      outputTokens: 0,
+      reasoningOutputTokens: 0,
+      totalTokens: n,
+    })
+    runner.priorTurnTotal = tokens(1000)
+
+    const turnPromise = runner.runTurn('hello')
+
+    const req1 = await waitForNextWritten(h.written, 0)
+    assert.equal(req1.method, 'thread/resume')
+    assert.equal(req1.params.threadId, 'thr-dead')
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: req1.id,
+      error: { code: -32600, message: 'no rollout found for thread id thr-dead' },
+    })
+
+    const req2 = await waitForNextWritten(h.written, 1)
+    assert.equal(req2.method, 'thread/resume', 'fallback must resume, not thread/start')
+    assert.equal(req2.params.threadId, 'thr-prior')
+    feed(h.runner, { jsonrpc: '2.0', id: req2.id, result: { thread: { id: 'thr-prior' } } })
+
+    const req3 = await waitForNextWritten(h.written, 2)
+    assert.equal(req3.method, 'turn/start')
+    assert.equal(req3.params.threadId, 'thr-prior')
+    assert.equal(runner.priorTurnTotal, null, 'priorTurnTotal must reset on thread switch')
+    assert.equal(runner.activeTurnTotal, null)
+    assert.equal(runner.currentTurnUsage, null)
+    feed(h.runner, { jsonrpc: '2.0', id: req3.id, result: { turn: { id: 't1' } } })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: 'thr-prior',
+        turnId: 't1',
+        tokenUsage: { total: tokens(110), last: tokens(10) },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: { threadId: 'thr-prior', turn: { id: 't1', status: 'completed', durationMs: 5 } },
+    })
+    await turnPromise
+
+    assert.equal(runner.threadId, 'thr-prior')
+    assert.equal(runner.attached, true)
+    assert.deepEqual(h.sessionIds, ['thr-prior'])
+    const resultMsg = h.messages.find((m) => m.type === 'result')
+    assert.ok(resultMsg)
+    assert.equal(resultMsg.is_error, false)
+    assert.equal(
+      resultMsg.usage?.input_tokens,
+      10,
+      'first turn on fallback thread bills its own delta, not diff vs dead thread',
+    )
     await h.cleanup()
   })
 
@@ -2370,7 +2439,11 @@ describe('LOW-1 — commandExecution Bash 卡 description 摘要', () => {
     feed(h.runner, {
       jsonrpc: '2.0',
       method: 'item/started',
-      params: { threadId: 'thr', turnId: 't-desc', item: { id, type: 'commandExecution', command } },
+      params: {
+        threadId: 'thr',
+        turnId: 't-desc',
+        item: { id, type: 'commandExecution', command },
+      },
     })
   }
 
@@ -2412,7 +2485,9 @@ describe('LOW-1 — commandExecution Bash 卡 description 摘要', () => {
 // interrupted → 'interrupted',failed/异常 → 不带(保持 is_error 语义)。
 // ccbMessageParser._handleResult 读 result.stop_reason 随 final meta 下发。 ────
 describe('LOW-2 — turn 终态 stop_reason 映射', () => {
-  async function runTurnWithStatus(status: string): Promise<{ msg: any; cleanup: () => Promise<void> }> {
+  async function runTurnWithStatus(
+    status: string,
+  ): Promise<{ msg: any; cleanup: () => Promise<void> }> {
     const h = await makeHarness()
     const runner = h.runner as any
     runner.ensureSpawned = async () => {}
@@ -2490,10 +2565,37 @@ describe('handleNotification — goals', () => {
     await h.runner.setGoalState(goal({ status: 'completed', stateRevision: 3 }))
     await h.runner.setGoalState(goal({ status: 'cleared', stateRevision: 4 }))
     assert.deepEqual(calls, [
-      { method: 'thread/goal/set', params: { threadId: 'thread-goal-sync', objective: 'ship commercial goals', status: 'active', tokenBudget: 1200 } },
-      { method: 'thread/goal/set', params: { threadId: 'thread-goal-sync', objective: 'ship commercial goals', status: 'paused', tokenBudget: 1200 } },
-      { method: 'thread/goal/set', params: { threadId: 'thread-goal-sync', objective: 'ship commercial goals', status: 'complete', tokenBudget: 1200 } },
-      { method: 'thread/goal/set', params: { threadId: 'thread-goal-sync', objective: null, status: null, tokenBudget: null } },
+      {
+        method: 'thread/goal/set',
+        params: {
+          threadId: 'thread-goal-sync',
+          objective: 'ship commercial goals',
+          status: 'active',
+          tokenBudget: 1200,
+        },
+      },
+      {
+        method: 'thread/goal/set',
+        params: {
+          threadId: 'thread-goal-sync',
+          objective: 'ship commercial goals',
+          status: 'paused',
+          tokenBudget: 1200,
+        },
+      },
+      {
+        method: 'thread/goal/set',
+        params: {
+          threadId: 'thread-goal-sync',
+          objective: 'ship commercial goals',
+          status: 'complete',
+          tokenBudget: 1200,
+        },
+      },
+      {
+        method: 'thread/goal/set',
+        params: { threadId: 'thread-goal-sync', objective: null, status: null, tokenBudget: null },
+      },
     ])
     await h.cleanup()
   })
@@ -2507,8 +2609,14 @@ describe('handleNotification — goals', () => {
     runner.sendRequest = async (method: string, params: unknown) => {
       calls.push({ method, params })
       throw Object.assign(
-        new Error('thread/goal/set -> -32600: cannot update goal for thread thread-goal-none: no goal exists'),
-        { rpcCode: -32600, rpcMessage: 'cannot update goal for thread thread-goal-none: no goal exists', rpcMethod: 'thread/goal/set' },
+        new Error(
+          'thread/goal/set -> -32600: cannot update goal for thread thread-goal-none: no goal exists',
+        ),
+        {
+          rpcCode: -32600,
+          rpcMessage: 'cannot update goal for thread thread-goal-none: no goal exists',
+          rpcMethod: 'thread/goal/set',
+        },
       )
     }
     // 从未设过目标的会话:清除同步必须吞掉 "no goal exists" 而不是让整轮失败
@@ -2565,7 +2673,9 @@ describe('handleNotification — goals', () => {
     assert.equal(h.messages[0].goal.platformGoalId, '11111111-1111-4111-8111-111111111111')
     assert.equal(h.messages[0].goal.platformStateRevision, 2)
 
-    runner.sendRequest = async () => { throw new Error('goal sync rejected') }
+    runner.sendRequest = async () => {
+      throw new Error('goal sync rejected')
+    }
     await assert.rejects(
       h.runner.setGoalState(goal({ status: 'completed', stateRevision: 3 })),
       /goal sync rejected/,
@@ -2849,7 +2959,10 @@ describe('handleNotification — collabAgentToolCall', () => {
       agentsStates: { 'child-a': { status: 'completed' } },
     }
     feed(h.runner, collabFrame('item/completed', 't-collab-dedupe', completedItem))
-    feed(h.runner, collabFrame('item/completed', 't-collab-dedupe', { ...completedItem, id: 'wait-2' }))
+    feed(
+      h.runner,
+      collabFrame('item/completed', 't-collab-dedupe', { ...completedItem, id: 'wait-2' }),
+    )
     await flushItemCompleted()
     const spawnResults = h.messages
       .filter((m) => m.type === 'user')
@@ -2942,11 +3055,14 @@ describe('handleNotification — thread/tokenUsage/updated (PR1 v1.0.65 A.2)', (
         item: { id: 'tool-1', type: 'commandExecution', command: 'pwd' },
       },
     })
-    feed(h.runner, tokenUsageFrame(
-      't-call-cards',
-      { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
-      { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
-    ))
+    feed(
+      h.runner,
+      tokenUsageFrame(
+        't-call-cards',
+        { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+        { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+      ),
+    )
     feed(h.runner, {
       jsonrpc: '2.0',
       method: 'item/started',
@@ -2956,11 +3072,14 @@ describe('handleNotification — thread/tokenUsage/updated (PR1 v1.0.65 A.2)', (
         item: { id: 'tool-2', type: 'webSearch', query: 'latest' },
       },
     })
-    feed(h.runner, tokenUsageFrame(
-      't-call-cards',
-      { inputTokens: 300, outputTokens: 40, totalTokens: 340 },
-      { inputTokens: 400, outputTokens: 60, totalTokens: 460 },
-    ))
+    feed(
+      h.runner,
+      tokenUsageFrame(
+        't-call-cards',
+        { inputTokens: 300, outputTokens: 40, totalTokens: 340 },
+        { inputTokens: 400, outputTokens: 60, totalTokens: 460 },
+      ),
+    )
 
     assert.deepEqual(calls.filter((call) => call.callId === 'codex-1').at(-1), {
       callId: 'codex-1',
@@ -2991,11 +3110,14 @@ describe('handleNotification — thread/tokenUsage/updated (PR1 v1.0.65 A.2)', (
         },
       })
     }
-    feed(h.runner, tokenUsageFrame(
-      't-parallel-cards',
-      { inputTokens: 120_000, outputTokens: 3_456, totalTokens: 123_456 },
-      { inputTokens: 120_000, outputTokens: 3_456, totalTokens: 123_456 },
-    ))
+    feed(
+      h.runner,
+      tokenUsageFrame(
+        't-parallel-cards',
+        { inputTokens: 120_000, outputTokens: 3_456, totalTokens: 123_456 },
+        { inputTokens: 120_000, outputTokens: 3_456, totalTokens: 123_456 },
+      ),
+    )
     assert.deepEqual(calls.at(-1), {
       callId: 'codex-1',
       targetIds: ['parallel-1', 'parallel-2'],
@@ -3029,11 +3151,14 @@ describe('handleNotification — thread/tokenUsage/updated (PR1 v1.0.65 A.2)', (
         item: { id: 'late-item', type: 'lateItem' },
       },
     })
-    feed(h.runner, tokenUsageFrame(
-      't-late-target',
-      { inputTokens: 80, outputTokens: 20, totalTokens: 100 },
-      { inputTokens: 80, outputTokens: 20, totalTokens: 100 },
-    ))
+    feed(
+      h.runner,
+      tokenUsageFrame(
+        't-late-target',
+        { inputTokens: 80, outputTokens: 20, totalTokens: 100 },
+        { inputTokens: 80, outputTokens: 20, totalTokens: 100 },
+      ),
+    )
     await waitFor(() => calls.length > 0)
     assert.deepEqual(calls.at(-1), {
       callId: 'codex-1',
@@ -3129,8 +3254,20 @@ describe('handleNotification — thread/tokenUsage/updated (PR1 v1.0.65 A.2)', (
         threadId: 'thr',
         turnId: 't-other',
         tokenUsage: {
-          last: { cachedInputTokens: 0, inputTokens: 1, outputTokens: 1, reasoningOutputTokens: 0, totalTokens: 2 },
-          total: { cachedInputTokens: 0, inputTokens: 1, outputTokens: 1, reasoningOutputTokens: 0, totalTokens: 2 },
+          last: {
+            cachedInputTokens: 0,
+            inputTokens: 1,
+            outputTokens: 1,
+            reasoningOutputTokens: 0,
+            totalTokens: 2,
+          },
+          total: {
+            cachedInputTokens: 0,
+            inputTokens: 1,
+            outputTokens: 1,
+            reasoningOutputTokens: 0,
+            totalTokens: 2,
+          },
         },
       },
     })
@@ -3157,7 +3294,13 @@ describe('handleNotification — thread/tokenUsage/updated (PR1 v1.0.65 A.2)', (
           threadId: 'thr',
           turnId: 't-multi',
           tokenUsage: {
-            last: { cachedInputTokens: 0, inputTokens: 50, outputTokens: 50, reasoningOutputTokens: 0, totalTokens: 100 },
+            last: {
+              cachedInputTokens: 0,
+              inputTokens: 50,
+              outputTokens: 50,
+              reasoningOutputTokens: 0,
+              totalTokens: 100,
+            },
             total: {
               cachedInputTokens: 0,
               inputTokens: totalIn,
@@ -3252,7 +3395,13 @@ describe('runTurn token usage propagation (PR1 v1.0.65 A.3)', () => {
         threadId: 'thr',
         turnId: 't-clamp',
         tokenUsage: {
-          last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
+          last: {
+            cachedInputTokens: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            reasoningOutputTokens: 0,
+            totalTokens: 0,
+          },
           total: {
             cachedInputTokens: 50,
             inputTokens: 800,
@@ -3554,7 +3703,11 @@ describe('PR2 v1.0.66 — requestId queue-entry transit', () => {
   it('_parseCodexRateLimits: 双窗口带 windowDurationMins 路由到正确桶', () => {
     const rl = {
       primary: { usedPercent: 42, resetsAt: 1714425600, windowDurationMins: _CODEX_5H_WINDOW_MINS },
-      secondary: { usedPercent: 17, resetsAt: 1714512000, windowDurationMins: _CODEX_7D_WINDOW_MINS },
+      secondary: {
+        usedPercent: 17,
+        resetsAt: 1714512000,
+        windowDurationMins: _CODEX_7D_WINDOW_MINS,
+      },
     }
     const out = _parseCodexRateLimits(rl)
     assert.ok(out, 'should parse')
@@ -3566,7 +3719,11 @@ describe('PR2 v1.0.66 — requestId queue-entry transit', () => {
 
   it('_parseCodexRateLimits: 7d-only plan 即使无 windowDurationMins,带 duration 仍精确路由', () => {
     const rl = {
-      secondary: { usedPercent: 60, resetsAt: 1714512000, windowDurationMins: _CODEX_7D_WINDOW_MINS },
+      secondary: {
+        usedPercent: 60,
+        resetsAt: 1714512000,
+        windowDurationMins: _CODEX_7D_WINDOW_MINS,
+      },
     }
     const out = _parseCodexRateLimits(rl)
     assert.ok(out)
@@ -3648,8 +3805,16 @@ describe('PR2 v1.0.66 — requestId queue-entry transit', () => {
     // 模拟先收到 account/rateLimits/updated(turn 还没开始也可以 — 不 clear at turn start)
     runner.handleNotification('account/rateLimits/updated', {
       rateLimits: {
-        primary: { usedPercent: 33, resetsAt: 1714425600, windowDurationMins: _CODEX_5H_WINDOW_MINS },
-        secondary: { usedPercent: 8, resetsAt: 1714512000, windowDurationMins: _CODEX_7D_WINDOW_MINS },
+        primary: {
+          usedPercent: 33,
+          resetsAt: 1714425600,
+          windowDurationMins: _CODEX_5H_WINDOW_MINS,
+        },
+        secondary: {
+          usedPercent: 8,
+          resetsAt: 1714512000,
+          windowDurationMins: _CODEX_7D_WINDOW_MINS,
+        },
       },
     })
     assert.deepEqual(runner.latestRateLimits, {
@@ -3889,10 +4054,13 @@ describe('item/completed — result JSON lossless persistence', () => {
     assert.equal(parsed.type, 'webSearch')
     assert.equal(parsed.query, '深度检索')
     assert.equal(parsed.results.length, 6, 'array structure preserved')
-    assert.deepEqual(parsed.results, Array.from({ length: 6 }, (_, i) => ({
-      title: `结果${i}`,
-      snippet: `摘要内容${i} `.repeat(120),
-    })))
+    assert.deepEqual(
+      parsed.results,
+      Array.from({ length: 6 }, (_, i) => ({
+        title: `结果${i}`,
+        snippet: `摘要内容${i} `.repeat(120),
+      })),
+    )
     await h.cleanup()
   })
 
@@ -3942,7 +4110,7 @@ describe('stripShellWrapper — POSIX shell 引号解包', () => {
 
   it('单引号段与双引号段相邻拼接(结尾非单引号)→ 拼成一个 word', () => {
     // /bin/bash -lc 'rm -f /opt/x.png && echo '"'截图演示文件已清理'"
-    const wrapped = '/bin/bash -lc \'rm -f /opt/x.png && echo \'"\'截图演示文件已清理\'"'
+    const wrapped = "/bin/bash -lc 'rm -f /opt/x.png && echo '\"'截图演示文件已清理'\""
     const expected = "rm -f /opt/x.png && echo '截图演示文件已清理'"
     assert.equal(stripShellWrapper(wrapped), expected)
   })
@@ -4071,18 +4239,32 @@ describe('handleItemCompleted — 孤儿 tool_result 自动配对(subAgentActivi
   })
 })
 
-
 it('reads the exact native Codex compacted payload from rollout JSONL', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-handoff-'))
   const file = join(dir, 'rollout.jsonl')
   const started = Date.now()
-  await writeFile(file, [
-    JSON.stringify({ timestamp: new Date(started - 60_000).toISOString(), type: 'compacted', payload: { message: 'old', replacement_history: [] } }),
-    JSON.stringify({ timestamp: new Date(started + 1).toISOString(), type: 'compacted', payload: { message: 'native handoff', replacement_history: [{ type: 'message' }] } }),
-  ].join('\n') + '\n')
+  await writeFile(
+    file,
+    [
+      JSON.stringify({
+        timestamp: new Date(started - 60_000).toISOString(),
+        type: 'compacted',
+        payload: { message: 'old', replacement_history: [] },
+      }),
+      JSON.stringify({
+        timestamp: new Date(started + 1).toISOString(),
+        type: 'compacted',
+        payload: { message: 'native handoff', replacement_history: [{ type: 'message' }] },
+      }),
+    ].join('\n') + '\n',
+  )
   try {
     assert.deepEqual(await readLatestCodexNativeHandoff(file, started), {
-      summaryText: 'native handoff', source: 'codex', compactStartedAt: started,
+      summaryText: 'native handoff',
+      source: 'codex',
+      compactStartedAt: started,
     })
-  } finally { await rm(dir, { recursive: true, force: true }) }
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })

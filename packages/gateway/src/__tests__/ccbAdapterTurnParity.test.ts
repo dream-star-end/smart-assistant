@@ -19,6 +19,8 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 
 import { CcbAdapter } from "../engine/ccbAdapter.js";
+import { CREDIT_EXHAUSTED_DETAIL } from "../creditExhaustion.js";
+import { _setPlatformPricingLookupForTests } from "../usageCost.js";
 import type { EngineEvent } from "../engine/engineEvents.js";
 import type { TurnParams } from "../engine/engineAdapter.js";
 import type { SubprocessRunner } from "../subprocessRunner.js";
@@ -26,7 +28,14 @@ import type { EngineCreateOpts } from "../engine/registry.js";
 
 class FakeCcbRunner extends EventEmitter {
   lastActivityAt = Date.now();
+  model: string | undefined = "claude-opus-4-6";
+  interrupts = 0;
   submitted: Array<{ input: unknown; requestId?: string }> = [];
+
+  interrupt(): boolean {
+    this.interrupts++;
+    return true;
+  }
   /** stdin 可写性开关(false 模拟 control_response 写入失败)。 */
   permissionWritable = true;
   permissionResponses: Array<{ requestId: string; response: unknown }> = [];
@@ -272,6 +281,101 @@ describe("CcbAdapter turn parity", () => {
       assert.equal(summary?.phantomSignals.skipReason, "slash_command");
       // 句柄级读取与 summary 同源(异常终态 summary=null 时 sessionManager 靠它)
       assert.equal(turn.getPhantomSignals().apiState, "skipped");
+    }
+  });
+
+  test("OCV5-92 creditBudgetFen:live usage 达预算 → runner.interrupt();abort 诊断改写为 insufficient_credits 且只发一条 error 帧", async () => {
+    // 100 fen / M input, 1000 fen / M output;CCB 路径不叠 agent 倍率。
+    _setPlatformPricingLookupForTests(async () => ({
+      inputPerMtok: "100",
+      outputPerMtok: "1000",
+      cacheReadPerMtok: "10",
+      cacheWritePerMtok: "0",
+      multiplier: "1.000",
+    }));
+    try {
+      const { adapter, runner } = makeAdapter();
+      const events: EngineEvent[] = [];
+      const turn = beginTurn(adapter, events, { requestId: "req-credit", creditBudgetFen: 150n });
+      await turn.submitted;
+      runner.msg(textDelta("working "));
+      // message_start: 1M input → 100 fen < 150,不得中断。
+      runner.msg({
+        type: "stream_event",
+        event: { type: "message_start", message: { usage: { input_tokens: 1_000_000, output_tokens: 0 } } },
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(runner.interrupts, 0, "预算未到不得中断");
+      // message_delta: +50k output → 150 fen ≥ 150,立刻 interrupt。
+      runner.msg({
+        type: "stream_event",
+        event: { type: "message_delta", usage: { output_tokens: 50_000 } },
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(runner.interrupts, 1, "达预算须走 runner.interrupt()");
+      // 再来一条更大的 usage 也只中断一次。
+      runner.msg({
+        type: "stream_event",
+        event: { type: "message_delta", usage: { output_tokens: 90_000 } },
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(runner.interrupts, 1);
+      // CCB 协作式中止落地的 result:error_during_execution 诊断。
+      runner.msg(
+        resultRow({
+          is_error: true,
+          subtype: "error_during_execution",
+          stop_reason: null,
+          errors: ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"],
+          usage: { input_tokens: 1_000_000, output_tokens: 90_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }),
+      );
+      const summary = await turn.summary;
+      assert.ok(summary);
+      assert.equal(summary.isError, true);
+      assert.equal(summary.errorClass, "insufficient_credits");
+      assert.equal(summary.errorDetail, CREDIT_EXHAUSTED_DETAIL);
+      assert.equal(summary.stopReason, "error");
+      assert.equal(summary.usage.outputTokens, 90_000);
+      // 不能被 sessionManager 当作用户 Stop(否则前端画「已由用户停止」而非充值卡)。
+      assert.equal(adapter.isUserCancellationResult(summary), false);
+      const errors = events.filter((e) => e.kind === "error");
+      assert.equal(errors.length, 1, "恰好一条归一化 error 帧");
+      assert.equal((errors[0] as { errorClass?: string }).errorClass, "insufficient_credits");
+      assert.equal((errors[0] as { error: string }).error, CREDIT_EXHAUSTED_DETAIL);
+      const errorIdx = events.findIndex((e) => e.kind === "error");
+      const finalIdx = events.findIndex((e) => e.kind === "final");
+      assert.ok(errorIdx >= 0 && finalIdx === events.length - 1 && errorIdx < finalIdx, "error 帧在 final 之前");
+    } finally {
+      _setPlatformPricingLookupForTests(null);
+    }
+  });
+
+  test("OCV5-92 无预算(selfhost / delegate)→ 相同 usage 不触发中断", async () => {
+    _setPlatformPricingLookupForTests(async () => ({
+      inputPerMtok: "100",
+      outputPerMtok: "1000",
+      cacheReadPerMtok: "10",
+      cacheWritePerMtok: "0",
+      multiplier: "1.000",
+    }));
+    try {
+      const { adapter, runner } = makeAdapter();
+      const events: EngineEvent[] = [];
+      const turn = beginTurn(adapter, events, { requestId: "req-nobudget" });
+      await turn.submitted;
+      runner.msg({
+        type: "stream_event",
+        event: { type: "message_start", message: { usage: { input_tokens: 50_000_000, output_tokens: 0 } } },
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(runner.interrupts, 0);
+      runner.msg(resultRow());
+      const summary = await turn.summary;
+      assert.equal(summary?.isError, false);
+      assert.equal(events.filter((e) => e.kind === "error").length, 0);
+    } finally {
+      _setPlatformPricingLookupForTests(null);
     }
   });
 

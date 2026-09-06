@@ -10,6 +10,7 @@ import type {
 } from './engineEvents.js'
 import type { EngineCreateOpts } from './registry.js'
 import { CcbAdapter } from './ccbAdapter.js'
+import { CREDIT_EXHAUSTED_DETAIL } from '../creditExhaustion.js'
 import { CursorSandRelay } from './cursorSandRelay.js'
 import {
   recordCursorCredentialResult,
@@ -206,22 +207,32 @@ export class CursorSandAdapter extends CcbAdapter {
     const emitBilling = (result: TurnSummary | null, detail?: string): void => {
       if (billingEmitted) return
       billingEmitted = true
-      const errorDetail = detail ?? result?.errorDetail ?? ''
+      // OCV5-92 budget hard-stop (CcbAdapter relabels the cooperative abort).
+      // The Cursor tokens were really consumed: settle as `success`, never as
+      // ENGINE_ERROR/USER_CANCELLED, or the drained remainder is a free overage.
+      const creditExhausted =
+        result?.errorClass === 'insufficient_credits' &&
+        result.errorDetail === CREDIT_EXHAUSTED_DETAIL
+      const errorDetail = creditExhausted ? '' : detail ?? result?.errorDetail ?? ''
       const unavailable = /auth|credential|unauthorized|forbidden|quota|rate.?limit|usage limit|subscription|\b40[13]\b|\b429\b/i.test(errorDetail)
-      const status: EngineExternalBillingEvent['status'] = unavailable
-        ? 'unavailable'
-        : result?.isError || !result
-          ? 'error'
-          : 'success'
-      const terminalCode: EngineExternalBillingEvent['terminalCode'] | undefined = interrupted
-        ? 'USER_CANCELLED'
-        : /quota|rate.?limit|usage limit|subscription|\b429\b/i.test(errorDetail)
-          ? 'QUOTA_UNAVAILABLE'
-          : /auth|credential|unauthorized|forbidden|\b40[13]\b/i.test(errorDetail)
-            ? 'AUTH_UNAVAILABLE'
-            : status === 'error'
-              ? 'ENGINE_ERROR'
-              : undefined
+      const status: EngineExternalBillingEvent['status'] = creditExhausted
+        ? 'success'
+        : unavailable
+          ? 'unavailable'
+          : result?.isError || !result
+            ? 'error'
+            : 'success'
+      const terminalCode: EngineExternalBillingEvent['terminalCode'] | undefined = creditExhausted
+        ? undefined
+        : interrupted
+          ? 'USER_CANCELLED'
+          : /quota|rate.?limit|usage limit|subscription|\b429\b/i.test(errorDetail)
+            ? 'QUOTA_UNAVAILABLE'
+            : /auth|credential|unauthorized|forbidden|\b40[13]\b/i.test(errorDetail)
+              ? 'AUTH_UNAVAILABLE'
+              : status === 'error'
+                ? 'ENGINE_ERROR'
+                : undefined
       // Only credential-class outcomes reach the wrapper's rotation state.
       // `recordResult('fail')` writes a per-container cooldown that makes the
       // sticky per-user selection skip this account for ten minutes — i.e.

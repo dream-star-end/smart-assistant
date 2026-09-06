@@ -231,6 +231,11 @@ export interface EngineAdapter extends EventEmitter {
    * bounded history reconstruction. */
   isResumeIdCompatible?(sessionId: string): boolean
   clearSessionId(): void
+  /** Optional: point the NEXT spawn at a different native id without
+   * restarting now. SessionManager uses it when the head resume id turned out
+   * stale at runtime and a prior id from the durable-artifact ladder is still
+   * resumable. Engines that omit it are cleared instead (fresh session). */
+  setResumeSessionId?(sessionId: string): void
 
   // ── setters(与原 SubprocessRunner 对齐;均为 opts mutator,重启后生效)──
   /** True when applying this model would change an incompatible transport and

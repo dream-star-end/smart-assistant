@@ -1,0 +1,8 @@
+{
+  "name": "12-ws-close",
+  "hex": "1300000000090000001c7b22636f6465223a313030302c22726561736f6e223a22627965227d",
+  "length": 38,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 19,
+  "streamId": 9
+}

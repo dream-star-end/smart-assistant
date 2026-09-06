@@ -1,0 +1,9 @@
+{
+  "name": "05-http-data-empty-fin",
+  "hex": "03010000000100000000",
+  "length": 10,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 3,
+  "flags": 1,
+  "streamId": 1
+}

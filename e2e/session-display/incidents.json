@@ -3083,6 +3083,70 @@
           "assertion": "commercial containers get OC_TASKBOARD_ENABLED=0, gateway gates patrol/digest on it, empty boards never emit a digest"
         }
       ]
+    },
+    {
+      "id": "INC-20260905-QUEUED-CONSUMER",
+      "occurredAt": "2026-09-05",
+      "severity": "P1",
+      "symptom": "OCV5-121 selfhost：容器同会话前驱仍占用时后继正常 queued，master visible-orphan 把尚未启动的排队项按 15min engine-dead 终态化并 fence；本地 live waiter 仍可迟到启动。R1 用 exact queued→rejected CAS 同步撤销消费权，历史分裂由同快照 terminal recovery 收敛，迟到原闭包静默退出。",
+      "rootFixCommit": "3158524a",
+      "coverageCommits": [
+        "2d745db7",
+        "f3868499",
+        "a1b422fb",
+        "bb7e1ff7"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/storage/src/__tests__/turnDispatchInbox.test.ts",
+          "assertion": "OCV5-121 exact cancel: identity, both CAS orders and idempotence"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/turnDispatchInbox.test.ts",
+          "assertion": "OCV5-121 delayed original submit silently drains after exact cancellation"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/turnDispatchInbox.test.ts",
+          "assertion": "OCV5-121 cancel HTTP route uses inbound auth and exact body identity"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "OCV5-121 cancel outcomes always defer this tick; durable rejected settles without fallback"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "tape-state 单 statement 同时返回租户内 tape + dispatch lease 证据"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-queued-consumer.ts",
+          "assertion": "OCV5-121 hermetic deploy proof: queued waiting, exact cancellation, late-consumer silence"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL",
+      "occurredAt": "2026-09-06",
+      "severity": "P1",
+      "symptom": "商业版全量同步 PR #557 的 required 门 commercial-unit 在「userChatBridge — model authorization」第 5 例后再无 TAP 输出，两轮各吃满 30 min timeout 被 cancel，紧急计费改动被拖 ~3h 后改走小切片才上线。根因：protocol DEFAULT_CODEX_ENGINE_MODEL 由 gpt-5.6-sol 改为 gpt-6-astra（GPT-6 队长引擎）；bridge 对 teamMode:true 强制覆写 frame.model 为该常量，但测试桩 persistMasterUserMessage 内断言字面量 gpt-5.6-sol → 断言在桩内抛错被 bridge 捕获为 SESSION_PERSIST_UNAVAILABLE、不再转发容器，而用例只 once('message') 无限等容器帧 → 永挂。本地绿是因为同步 worktree 的 node_modules 软链到旧 canonical，@openclaude/protocol 解析到旧常量。",
+      "rootFixCommit": "c26f9a81",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "authoritative user row is persisted before history load and current logical turn is excluded"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL: the bridge rewrites teamMode:true"
+        }
+      ]
     }
   ]
 }

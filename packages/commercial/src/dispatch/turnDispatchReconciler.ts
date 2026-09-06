@@ -28,6 +28,7 @@ import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBack
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
   classifyVisibleOrphan,
+  HARD_CAP_AGE_MS,
   firstVisibleAtMsForDispatch,
   shouldFenceProducer,
   type TraceFirstVisibleRow,
@@ -202,6 +203,7 @@ export async function abortNeverExecutedJournalForDispatch(
 export interface TurnDispatchReconcilerDeps {
   pool: Pool
   container: {
+    cancelIfQueued?: (id: DispatchIdentity) => Promise<ContainerCallResult>
     rejectIfAbsent: (id: DispatchIdentity) => Promise<ContainerCallResult>
     getDispatchState: (id: DispatchIdentity) => Promise<ContainerCallResult>
   }
@@ -368,6 +370,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   // 扫描下限取 ALERT_MS(15min)而非 stuckMs(下限 90min):否则求证系统性瘫痪
   // (如 SSRF 拦死)要等 stuckMs 才首告(Codex R1 MAJOR)。[ALERT_MS, stuckMs)
   // 窗口内的行**只探测+告警,零状态迁移**——所有既有收敛分支仍由下方 age 门守住。
+  const dispatchStates = new Map<string, ContainerCallResult>()
   const stuck = await scanAcceptedStuck(deps.pool, {
     // Read typed container state every tick. This is a bounded indexed page,
     // not a timeout: it lets a restarted executor publish an interruption
@@ -390,7 +393,10 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
     const age = now() - (row.acceptedAt ?? row.admittedAt).getTime()
     const hasDeadEvidence = acceptedDeadIds.has(row.dispatchId) || dispatchHasShutdownEvidence(row)
     probedDispatchIds.add(row.dispatchId)
-    const res = await deps.container.getDispatchState(idOf(row))
+    const res = await deps.container.getDispatchState(idOf(row)).catch((): ContainerCallResult => ({
+      kind: 'unreachable', detail: 'dispatch state query failed',
+    }))
+    dispatchStates.set(JSON.stringify([row.dispatchId, row.attemptNo]), res)
     if (res.kind === 'ok' && (res.state === 'running' || res.state === 'queued' || res.state === 'sink_staged')) {
       // 真在飞:禁止因停机证据收口。清掉证据,避免下一轮不可达时误杀。
       provenLiveDispatchIds.add(row.dispatchId)
@@ -509,6 +515,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
 
   // ── closeVisibleOrphans (rev2 B4): tapeless fallback + fence + late tape ──
   const orphanOutcome = await closeVisibleOrphans(deps, now(), limit, {
+    dispatchStates,
     provenLiveDispatchIds,
     probedDispatchIds,
   })
@@ -769,6 +776,9 @@ async function finalizeOrphanDispatch(input: {
 
 type VisibleOrphanScanRow = {
   dispatch_id: string
+  attempt_no: number
+  agent_container_id: number | null
+  runtime_kind: string | null
   user_id: string
   session_id: string
   client_message_id: string
@@ -781,9 +791,6 @@ type VisibleOrphanScanRow = {
   tape_parts_rows: string
   last_frame_at: Date | null
   container_running: boolean
-  attempt_no: number | string | null
-  agent_container_id: number | null
-  runtime_kind: string | null
 }
 
 /**
@@ -877,7 +884,7 @@ function orphanDispatchIdentity(row: VisibleOrphanScanRow): DispatchIdentity {
   return {
     uid: BigInt(row.user_id),
     dispatchId: row.dispatch_id,
-    attemptNo: Number(row.attempt_no ?? 1),
+    attemptNo: row.attempt_no,
     sessionId: row.session_id,
     clientMessageId: row.client_message_id,
     agentContainerId: row.agent_container_id ?? null,
@@ -898,18 +905,19 @@ async function closeVisibleOrphans(
   nowMs: number,
   limit: number,
   opts: {
-    /** 本轮 accepted-stuck 探测已证明在飞(running/queued/sink_staged)的 dispatch。 */
+    dispatchStates: Map<string, ContainerCallResult>
+    /** Coarse live-id index; exact attempt + age/state checks are still required. */
     provenLiveDispatchIds: ReadonlySet<string>
-    /** 本轮 accepted-stuck 探测已问过 typed state 的 dispatch(避免双查)。 */
+    /** Coarse probed-id index; only dispatchStates proves an exact cache hit. */
     probedDispatchIds: ReadonlySet<string>
   },
 ): Promise<CloseVisibleOrphansOutcome> {
+  const { dispatchStates } = opts
   const scanLimit = Math.min(200, Math.max(limit * 4, limit))
   const queryVisible = async (offset: number) => deps.pool.query<VisibleOrphanScanRow>(
     `SELECT -- closeVisibleOrphans
             d.dispatch_id, d.user_id::text AS user_id, d.session_id, d.client_message_id,
-            d.status, d.admitted_at, d.accepted_at,
-            d.attempt_no, d.agent_container_id, d.runtime_kind,
+            d.status, d.admitted_at, d.accepted_at, d.attempt_no, d.agent_container_id, d.runtime_kind,
             t.visible_at::text AS tape_visible_at,
             t.part_count AS tape_part_count,
             t.tape_id,
@@ -956,6 +964,17 @@ async function closeVisibleOrphans(
   if (traces === null) {
     return { closed: 0, skippedLive: 0, staleEvidence: 0 }
   }
+  // Raw-id sets are coarse indexes. Only exact attempts can share a GET.
+  const exactState = async (id: DispatchIdentity): Promise<ContainerCallResult> => {
+    const key = JSON.stringify([id.dispatchId, id.attemptNo])
+    const cached = dispatchStates.get(key)
+    if (cached) return cached
+    const result = await deps.container.getDispatchState(id).catch((): ContainerCallResult => ({
+      kind: 'unreachable', detail: 'dispatch state query failed',
+    }))
+    dispatchStates.set(key, result)
+    return result
+  }
   let closed = 0
   let skippedLive = 0
   let staleEvidence = 0
@@ -963,9 +982,17 @@ async function closeVisibleOrphans(
     // INC-20260831 gap 1: 本轮 accepted-stuck 探测已证明在飞的 dispatch,
     // "真在飞禁止收口"(visibleOrphan OCV5-57)在此路径同样成立 —— PG 证据
     // (零帧+无 first_visible+静默)对活引擎只是 persist lag,不构成 kill 信号。
+    const age = nowMs - (row.accepted_at ?? row.admitted_at).getTime()
     if (opts.provenLiveDispatchIds.has(row.dispatch_id)) {
-      skippedLive++
-      continue
+      if (!Number.isSafeInteger(row.attempt_no) || row.attempt_no < 1) continue
+      const cached = dispatchStates.get(JSON.stringify([row.dispatch_id, row.attempt_no]))
+      if (cached?.kind === 'ok' && (cached.state === 'sink_staged'
+        || ((cached.state === 'queued' || cached.state === 'running') && age < HARD_CAP_AGE_MS))) {
+        skippedLive++
+        continue
+      }
+      // A different attempt must be probed; queued/running at 6h must reach
+      // their distinct exact-cancel / existing hard-cap paths below.
     }
     const scanFirstVisibleAtMs = firstVisibleAtMsForDispatch(traces, {
       dispatchId: row.dispatch_id,
@@ -986,6 +1013,38 @@ async function closeVisibleOrphans(
       nowMs,
     })
     if (action === 'skip') continue
+    if (action === 'interrupt_tapeless' || action === 'fence_hard_cap') {
+      if (!Number.isSafeInteger(row.attempt_no) || row.attempt_no < 1) continue
+      const id = orphanDispatchIdentity(row)
+      let probe = dispatchStates.get(JSON.stringify([id.dispatchId, id.attemptNo]))
+      if (action === 'interrupt_tapeless' && !opts.probedDispatchIds.has(row.dispatch_id)) {
+        // Real outside-page probe path, retained by the unchanged deploy gate.
+        probe = await exactState(id)
+      } else if (!probe) {
+        // Covers a raw-id hit whose exact attempt was never queried, and 6h
+        // hard-cap rows. exactState never repeats a cached GET.
+        probe = await exactState(id)
+      }
+      if (probe.kind === 'ok' && isLiveTypedState(probe)) {
+        if (probe.state === 'queued') {
+          if (age >= HARD_CAP_AGE_MS) {
+            // No cancellation response is same-tick terminal evidence.
+            await deps.container.cancelIfQueued?.(id).catch(() => undefined)
+          }
+          skippedLive++
+          continue
+        }
+        if (probe.state === 'sink_staged' || age < HARD_CAP_AGE_MS) {
+          skippedLive++
+          continue
+        }
+        // Exact running >=6h retains the existing hard cap, never a queued CAS.
+      } else if (row.container_running !== false) {
+        // Unknown/non-live typed state cannot prove an active carrier dead.
+        // Independent carrier-dead evidence keeps its old interrupt path.
+        continue
+      }
+    }
     const hasTape = typeof row.tape_id === 'string' && row.tape_id.length > 0
     const outcome = action === 'complete_from_frames' || action === 'converge_only'
       ? 'completed' as const
@@ -1019,17 +1078,6 @@ async function closeVisibleOrphans(
     if (hasTape && !projectFallback && action !== 'converge_only'
       && action !== 'interrupt_tapeless' && action !== 'fence_hard_cap') {
       continue
-    }
-    // INC-20260831 gap 1(后半): 本扫描有自己的 OFFSET 分页且含 admitted 行,
-    // 扫到的行可能不在主循环 stuck 页里 —— 对没问过 typed state 的行,
-    // interrupt_tapeless 提交前再求证一次;真在飞 → 改 skip。查询失败
-    // (unreachable/error)维持「不可达 ≠ 已死」的既有语义:不拦截也不额外放行。
-    if (action === 'interrupt_tapeless' && !opts.probedDispatchIds.has(row.dispatch_id)) {
-      const probe = await deps.container.getDispatchState(orphanDispatchIdentity(row))
-      if (isLiveTypedState(probe)) {
-        skippedLive++
-        continue
-      }
     }
     const aggregated = projectFallback ? await aggregateDispatchLiveText(deps.pool, row.dispatch_id) : ''
     const text = aggregated
@@ -1461,6 +1509,9 @@ function withProbeBudget(
     }
   }
   return {
+    ...(container.cancelIfQueued ? {
+      cancelIfQueued: (id: DispatchIdentity) => wrap(container.cancelIfQueued!(id)),
+    } : {}),
     rejectIfAbsent: (id) => wrap(container.rejectIfAbsent(id)),
     getDispatchState: (id) => wrap(container.getDispatchState(id)),
   }
