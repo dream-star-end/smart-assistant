@@ -448,7 +448,8 @@ async function humanPause(page, minMs, maxMs) {
 async function arriveInSite(page, target) {
   const started = Date.now();
   const url = 'https://www.zhihu.com/' + target.kind + '/' + target.id;
-  const arrivedPath = /\/(question|answer|people)\//;
+  const arrivedPath = new RegExp('^/' + target.kind + '/' + target.id + '(?:/|$)');
+  const urlMatcher = new RegExp('/' + target.kind + '/' + target.id + '(?:/|$|[?#])');
   const currentPath = () => {
     try { return new URL(page.url()).pathname; } catch { return ''; }
   };
@@ -458,6 +459,7 @@ async function arriveInSite(page, target) {
     ms: Date.now() - started
   });
   let branch = 'home';
+  let finished = false;
   try {
     if (currentPath() !== '/') await gotoAuthenticated(page, 'https://www.zhihu.com/');
     const searchBox = await uniqueVisible(page.locator('input[type="text"][placeholder*="搜索"], .SearchBar-input, input#Popover1-toggle'));
@@ -470,7 +472,7 @@ async function arriveInSite(page, target) {
         await page.waitForTimeout(60 + Math.random() * 80);
       }
       await page.keyboard.press('Enter');
-      await page.waitForURL(arrivedPath, { timeout: 30_000 }).catch(() => {});
+      await page.waitForURL(urlMatcher, { timeout: 30_000 }).catch(() => {});
       arrived = arrivedPath.test(currentPath());
     }
     if (!arrived) {
@@ -486,10 +488,11 @@ async function arriveInSite(page, target) {
     if (!arrived) {
       branch = 'assign';
       await gotoInSite(page, url);
+      finished = true;
     }
     emitArrive(true, branch);
     await humanPause(page, 1500, 3000);
-    await finishAuthenticatedNav(page, 0);
+    if (!finished) await finishAuthenticatedNav(page, 0);
   } catch (error) {
     emitArrive(false, branch);
     throw error;
@@ -1859,13 +1862,17 @@ async function secureContext(browser, storageState, allowed) {
   let version = '';
   try { version = String(browser.version() || ''); } catch {}
   const major = /^([0-9]+)\./.exec(version);
+  if (!major) {
+    emitStep({ step: 'browser.context', ok: false, reason: 'version-unknown' });
+    throw new Error('browser-version');
+  }
   const options = {
     locale: 'zh-CN', timezoneId: 'Asia/Shanghai', viewport: { width: 1280, height: 900 },
     serviceWorkers: 'block', storageState,
     extraHTTPHeaders: { 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
-    deviceScaleFactor: 1, hasTouch: false, colorScheme: 'light'
+    deviceScaleFactor: 1, hasTouch: false, colorScheme: 'light',
+    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + major[1] + '.0.0.0 Safari/537.36'
   };
-  if (major) options.userAgent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + major[1] + '.0.0.0 Safari/537.36';
   const context = await browser.newContext(options);
   await context.route('**/*', async (route) => {
     const request = route.request();
@@ -1877,7 +1884,7 @@ async function secureContext(browser, storageState, allowed) {
     }
     await route.continue();
   });
-  emitStep({ step: 'browser.context', ok: true, code: 'chrome-' + (major ? major[1] : 'unknown') });
+  emitStep({ step: 'browser.context', ok: true, code: 'chrome-' + major[1] });
   return context;
 }
 async function runAction(input, relay) {
