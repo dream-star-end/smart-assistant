@@ -151,8 +151,10 @@ export function renderDelegateModelSection(input: DelegateModelSectionInput): st
   }
   const lines: string[] = [DELEGATE_MODEL_SECTION_HEADING, '']
   const state = input.verifiedAt > 0 ? '已在线核验' : '仅本地缓存,可能滞后'
+  // projectionRevision 是 64 位 hex;只留前 12 位够做诊断对照,省 token。
+  const rev = input.projectionRevision.length > 12 ? input.projectionRevision.slice(0, 12) : input.projectionRevision
   lines.push(
-    `以下是你这个账号当前可委派的 catalog 型号 slug(投影 ${input.projectionRevision},${state});\`model\`/\`--model\` 只能填这里的精确值,调用时服务端仍会重新校验。\`{a,b}\` 表示逐个可选,\`[-fast]\` 表示每个档位另有 \`-fast\` 变体;没写的组合就是不存在。`,
+    `以下是你这个账号当前可委派的 catalog 型号 slug(投影 ${rev},${state});\`model\`/\`--model\` 只能填这里的精确值,调用时服务端仍会重新校验。\`{a,b}\` 表示逐个可选,\`[-fast]\` 表示每个档位另有 \`-fast\` 变体;没写的组合就是不存在。`,
   )
   let any = false
   for (const engine of ENGINE_ORDER) {
