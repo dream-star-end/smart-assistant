@@ -129,14 +129,19 @@ BEGIN
       target_count, backup_count;
   END IF;
 
-  -- Before-image guard: refuse if the catalog is not the 0256/0259 + 09-03
-  -- cache_write DB-edit state this repricing was derived from.
+  -- Before-image guard: refuse unless the catalog is the 0256/0259 state.
+  -- input/output/cache_read are pinned exactly. cache_write accepts either
+  -- 0 (the 0256 half-price terminal state: fresh replay and the commercial
+  -- production catalog) or the 2026-09-03 selfhost DB edit (fable 1905 /
+  -- opus 951 / grok+gemini 235) this repricing was originally derived from.
+  -- Both lead to the same absolute targets below, so widening the accepted
+  -- before-image changes nothing about the after-image (OCV5-132).
   IF EXISTS (
     SELECT 1 FROM model_pricing_0269_backup
-     WHERE (family IN ('fable51','fable5') AND (input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok) <> (1524, 7621, 152, 1905))
-        OR (family = 'opus'   AND (input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok) <> (761, 3808, 76, 951))
-        OR (family = 'grok'   AND (input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok) <> (188, 563, 47, 235))
-        OR (family = 'gemini' AND (input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok) <> (188, 563, 47, 235))
+     WHERE (family IN ('fable51','fable5') AND ((input_per_mtok, output_per_mtok, cache_read_per_mtok) <> (1524, 7621, 152) OR cache_write_per_mtok NOT IN (0, 1905)))
+        OR (family = 'opus'   AND ((input_per_mtok, output_per_mtok, cache_read_per_mtok) <> (761, 3808, 76) OR cache_write_per_mtok NOT IN (0, 951)))
+        OR (family = 'grok'   AND ((input_per_mtok, output_per_mtok, cache_read_per_mtok) <> (188, 563, 47) OR cache_write_per_mtok NOT IN (0, 235)))
+        OR (family = 'gemini' AND ((input_per_mtok, output_per_mtok, cache_read_per_mtok) <> (188, 563, 47) OR cache_write_per_mtok NOT IN (0, 235)))
   ) THEN
     RAISE EXCEPTION '0269 refuses unexpected Cursor before-image prices';
   END IF;
