@@ -65,6 +65,11 @@ import {
 } from './identity.mjs'
 import { createHostSupervisor, readDesktopHostConfigFromEnv, DEFAULT_HOST_ENTRY } from './hostSupervisor.mjs'
 import { runLocalHostSmoke } from './localHostSmoke.mjs'
+import {
+  formatSmokeFailureReport,
+  resolveSmokeReportMode,
+  shouldWriteSmokeFailureReport,
+} from './smokeReport.mjs'
 import { createHostLogger, resolveLogsDirectory } from './host/log.mjs'
 import { createApprovalController } from './host/workspace/approval.mjs'
 import {
@@ -2093,14 +2098,14 @@ async function runSmokeTest() {
 }
 
 async function writeSmokeFailureReport(stage, error) {
-  if (!smokeTest) return
+  if (!shouldWriteSmokeFailureReport({ smokeTest, smokeLocalHost })) return
   const reportPath = process.env.OPENCLAUDE_SMOKE_REPORT_PATH
   if (typeof reportPath !== 'string' || reportPath.length === 0 || reportPath.length > 32_767)
     return
 
-  const detail = error instanceof Error ? error.stack || error.message : String(error)
+  const mode = resolveSmokeReportMode({ stage, smokeTest, smokeLocalHost })
   try {
-    await writeFile(reportPath, `[windows] ${stage} failed:\n${detail}\n`, {
+    await writeFile(reportPath, formatSmokeFailureReport({ stage, error, mode }), {
       encoding: 'utf8',
       mode: 0o600,
     })
