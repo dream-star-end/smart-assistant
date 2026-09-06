@@ -119,7 +119,7 @@ See the \`memory-management\` skill for details.
 
 - \`skill_search\` / \`skill_list\` / \`skill_view\` / \`skill_save\` / \`skill_delete\` — platform skills.
 - \`create_reminder\` / \`list_reminders\` / \`update_reminder\` / \`delete_reminder\` — manage scheduled reminders/tasks.
-- \`delegate_task\` (sync) / \`send_to_agent\` (async) — talk to sibling agents.
+- \`delegate_task\` (sync) / \`send_to_agent\` (async) — talk to sibling agents. \`goal\` is the only required field; \`agentId\` = platform member id, \`model\` = exact catalog slug from「委派可用型号」(never guess/shorten); self-delegation needs \`allowSelf: true\`.
 
 Do **not** read OR write codex's built-in \`~/.codex/memories/\` or
 \`~/.codex/skills/\` to manage platform state — those are codex-private and

@@ -349,6 +349,25 @@ export class ModelCatalogClient {
     return this.fetchCatalog()
   }
 
+  /**
+   * **只读窥视**当前投影(prompt 注入「委派可用型号」用):内存快照优先,否则读 LKG 文件。
+   * 不发网络、不验 epoch、不改任何内部状态(不动 `lkgLoaded`/`snapshot`),所以它
+   * **不是**路由判定依据 —— 返回的 `verifiedAt` 为 0 表示「仅本地缓存、未经在线核验」,
+   * 调用方必须如实标注。没有快照也没有 LKG → null。
+   */
+  peekView(): { view: LocalCatalogView; verifiedAt: number; source: 'memory' | 'lkg' } | null {
+    if (this.snapshot) {
+      return { view: this.snapshot.view, verifiedAt: this.snapshot.verifiedAt, source: 'memory' }
+    }
+    try {
+      const raw = readFileSync(this.lkgPath, 'utf8')
+      const view = parseCatalogResponse(JSON.parse(raw) as unknown)
+      return { view, verifiedAt: 0, source: 'lkg' }
+    } catch {
+      return null
+    }
+  }
+
   /** 测试用:清空内存态(不动 LKG 文件)。 */
   _resetForTests(): void {
     this.snapshot = null
