@@ -278,6 +278,9 @@ export class TaskboardNotifier implements TaskboardNotifyHooks {
   private async sendDigestForDate(db: TaskboardDb, date: string): Promise<void> {
     const outboundId = digestOutboundId(date)
     if (this.sent.has(outboundId)) return
+    // 面板从未用过(一张票都没有)就没有可汇报的东西:不发 0/0/0 简报,也不标 sent
+    // (当天稍后建了票仍可正常出简报)。商业版另有 OC_TASKBOARD_ENABLED=0 整体关闭。
+    if (!boardHasTickets(db)) return
     const stats = collectDigestStats(db, date, this.timezone)
     const copy = formatDigestMessage(stats)
     await this.deliver({
@@ -414,6 +417,12 @@ export function formatDigestMessage(stats: DigestStats): { title: string; bodyMd
     closing,
   ].join('\n')
   return { title, bodyMd }
+}
+
+/** 任务面板是否曾有过任何票。空面板不出简报。 */
+export function boardHasTickets(db: TaskboardDb): boolean {
+  const row = db.prepare('SELECT COUNT(*) AS n FROM tb_ticket').get() as { n: number }
+  return row.n > 0
 }
 
 export function collectDigestStats(

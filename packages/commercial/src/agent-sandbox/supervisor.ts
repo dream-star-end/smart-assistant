@@ -9,6 +9,7 @@ import {
   type ProvisionResult,
   SupervisorError,
 } from "./types.js";
+import { taskboardContainerEnv } from "./taskboardEnv.js";
 
 /**
  * Agent 沙箱 supervisor。
@@ -357,6 +358,8 @@ export async function createContainer(
   // weekly-curation / skill-check / heartbeat)的首次 seed,避免没人交互时也
   // 自动烧 credits。处理逻辑见 packages/gateway/src/cron.ts::ensureCronFile。
   env.push("OC_SEED_DEFAULT_CRON=0");
+  // 商业版容器:关掉任务面板后台自动化(巡检/简报)。决策见 ./taskboardEnv.ts。
+  env.push(...taskboardContainerEnv());
 
   try {
     // 网络 / volume 预创建放到 try 里,socket 级错误(ENOENT/ECONNREFUSED)
