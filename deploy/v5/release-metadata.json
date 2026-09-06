@@ -157,7 +157,8 @@
     "0273_chatgpt_proxy_credentials",
     "0274_desktop_tunnel_owners",
     "0275_restore_ccb_provider_check",
-    "0276_grok_account_usage_columns"
+    "0276_grok_account_usage_columns",
+    "0277_api_key_usage_and_controls"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
