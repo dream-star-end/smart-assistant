@@ -59,6 +59,9 @@ function makeRow(opts: Partial<ApiKeyRow> & { secretHex?: string } = {}): ApiKey
     keyHash: opts.keyHash ?? hashSecretForTest(secretHex),
     createdAt: opts.createdAt ?? new Date("2026-05-18T00:00:00Z"),
     lastUsedAt: opts.lastUsedAt ?? null,
+    disabledAt: opts.disabledAt ?? null,
+    creditLimit: opts.creditLimit ?? null,
+    spentCredits: opts.spentCredits ?? 0n,
   };
 }
 
@@ -88,6 +91,9 @@ function makeRepoSpy(initialRow: ApiKeyRow | null = null): RepoSpy {
     },
     async revoke(): Promise<boolean> {
       return false;
+    },
+    async update(): Promise<ApiKeySummary | null> {
+      return null;
     },
     async touchLastUsed(id: bigint): Promise<void> {
       touchLastUsedCalls.push(id);
@@ -401,6 +407,40 @@ describe("apiKeyIdentity.resolve — 成功路径返 containerId=null + bump las
     await new Promise((r) => setImmediate(r));
     assert.equal(spy.touchLastUsedCalls.length, 1);
     assert.equal(spy.touchLastUsedCalls[0], 7n);
+  });
+
+  test("0277:成功路径携带 apiKey 快照 {id, creditLimit, spentCredits}(不含 secret 材料)", async () => {
+    const secret = "deadbeef".repeat(6);
+    const spy = makeRepoSpy(
+      makeRow({ id: 7n, userId: 200n, secretHex: secret, creditLimit: 5000n, spentCredits: 1234n }),
+    );
+    const strat = makeApiKeyIdentityStrategy({
+      repo: spy.repo,
+      pricing: FAKE_PRICING,
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
+    });
+    const identity = await strat.resolve(reqWith("Bearer oc-cc.abcd1234." + secret), CTX);
+    assert.deepStrictEqual(identity.apiKey, { id: 7n, creditLimit: 5000n, spentCredits: 1234n });
+    assert.ok(!("keyHash" in (identity as unknown as Record<string, unknown>)));
+    assert.ok(!("keyHash" in (identity.apiKey as unknown as Record<string, unknown>)));
+  });
+
+  test("0277:disabled_at 非空 → IdentityError API_KEY_DISABLED(对外仍 401 同型),不 bump", async () => {
+    const secret = "deadbeef".repeat(6);
+    const spy = makeRepoSpy(
+      makeRow({ id: 7n, secretHex: secret, disabledAt: new Date("2026-09-06T00:00:00Z") }),
+    );
+    const strat = makeApiKeyIdentityStrategy({
+      repo: spy.repo,
+      pricing: FAKE_PRICING,
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
+    });
+    await assert.rejects(
+      strat.resolve(reqWith("Bearer oc-cc.abcd1234." + secret), CTX),
+      (err: unknown) => err instanceof IdentityError && err.code === "API_KEY_DISABLED",
+    );
+    await new Promise((r) => setImmediate(r));
+    assert.equal(spy.touchLastUsedCalls.length, 0, "禁用期间的尝试不算使用,不 bump");
   });
 });
 

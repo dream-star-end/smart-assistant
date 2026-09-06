@@ -6,14 +6,13 @@
  * 维护一套清单。稳定 id 会进入 URL 与 localStorage，发布后不得改名；改标题不改 id。
  */
 
-export type ProductFeatureCategory =
-  "start" | "create" | "automate" | "extend" | "account";
+export type ProductFeatureCategory = "start" | "create" | "automate" | "extend" | "account";
 
-export type ManageDestinationTab =
-  "memory" | "cron" | "skills" | "connectors" | "library";
+export type ManageDestinationTab = "memory" | "cron" | "skills" | "connectors" | "library";
 export type SettingsDestinationSection =
   | "account"
   | "usage"
+  | "api-access"
   | "preferences"
   | "hotkeys"
   | "feedback"
@@ -22,8 +21,7 @@ export type SettingsDestinationSection =
   | "plugins";
 export type MarketplaceDestinationTab = "browse" | "installed" | "publish";
 export type MarketplaceDestinationKind = "skill" | "agent" | "connector";
-export type OrgDestinationSection =
-  "overview" | "members" | "skills" | "reports" | "invoices";
+export type OrgDestinationSection = "overview" | "members" | "skills" | "reports" | "invoices";
 
 export type TutorialDestination =
   | { kind: "new-chat" }
@@ -41,8 +39,7 @@ export type TutorialDestination =
   | { kind: "org"; section: OrgDestinationSection }
   | { kind: "taskboard" };
 
-export type ProductRequirement =
-  "authenticated" | "image2" | "microphone" | "org-manager";
+export type ProductRequirement = "authenticated" | "image2" | "microphone" | "org-manager";
 
 export type ProductCapability = {
   id: string;
@@ -152,14 +149,7 @@ export const PRODUCT_CAPABILITIES = {
     shortTitle: "容器网页预览",
     category: "create",
     icon: "monitor",
-    aliases: [
-      "localhost",
-      "网页预览",
-      "开发服务器",
-      "元素选择",
-      "UI 评论",
-      "移动端适配",
-    ],
+    aliases: ["localhost", "网页预览", "开发服务器", "元素选择", "UI 评论", "移动端适配"],
     destination: { kind: "new-chat" },
     requirements: ["authenticated"],
   },
@@ -316,20 +306,13 @@ export const PRODUCT_CAPABILITIES = {
 } as const satisfies Record<string, ProductCapability>;
 
 export type ProductCapabilityKey = keyof typeof PRODUCT_CAPABILITIES;
-export type ProductFeatureId =
-  (typeof PRODUCT_CAPABILITIES)[ProductCapabilityKey]["id"];
+export type ProductFeatureId = (typeof PRODUCT_CAPABILITIES)[ProductCapabilityKey]["id"];
 
-export const PRODUCT_CAPABILITY_LIST = Object.values(
-  PRODUCT_CAPABILITIES,
-) as ProductCapability[];
+export const PRODUCT_CAPABILITY_LIST = Object.values(PRODUCT_CAPABILITIES) as ProductCapability[];
 
-const ID_SET = new Set<string>(
-  PRODUCT_CAPABILITY_LIST.map((feature) => feature.id),
-);
+const ID_SET = new Set<string>(PRODUCT_CAPABILITY_LIST.map((feature) => feature.id));
 
-export function isProductFeatureId(
-  value: string | null | undefined,
-): value is ProductFeatureId {
+export function isProductFeatureId(value: string | null | undefined): value is ProductFeatureId {
   return typeof value === "string" && ID_SET.has(value);
 }
 

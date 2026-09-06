@@ -7,6 +7,7 @@ import {
   Film,
   Globe,
   Kanban,
+  KeyRound,
   LayoutGrid,
   LogOut,
   MessageSquareText,
@@ -18,7 +19,13 @@ import {
   Sparkles,
   Store,
 } from "lucide-react";
-import { useEffect, useMemo, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { useProjectScope } from "../hooks/useProjectScope";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
@@ -101,7 +108,9 @@ export type SidebarProps = {
   /** 在指定项目下直接新建会话（真实项目组专用，default 未分类走顶部 onNew）。 */
   onNewInProject?: (projectId: string) => void;
   isSending?: (id: string) => boolean;
-  liveTerminal?: (id: string) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
+  liveTerminal?: (
+    id: string,
+  ) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
   socketVersion?: number;
   onCollapse?: () => void;
   onLogout?: () => void;
@@ -115,6 +124,8 @@ export type SidebarProps = {
   onOpenMediaTasks?: () => void;
   /** 「ChatGPT 直连」面板入口:仅管理员 / 白名单用户且服务端已开启时由 App 传入。 */
   onOpenChatGptProxy?: () => void;
+  /** 「API 接入」入口:管理员由 App 传入(admin-only rollout),直达设置 api-access 分区。 */
+  onOpenApiAccess?: () => void;
   boardActive?: boolean;
   showAdmin?: boolean;
   theme?: Theme;
@@ -177,6 +188,7 @@ export function Sidebar({
   onOpenBoard,
   onOpenMediaTasks,
   onOpenChatGptProxy,
+  onOpenApiAccess,
   boardActive,
   showAdmin,
   theme,
@@ -252,13 +264,21 @@ export function Sidebar({
 
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
-    const pool = searching ? sessions.filter((s) => !s.archived || archivedExpanded) : activeSessions;
+    const pool = searching
+      ? sessions.filter((s) => !s.archived || archivedExpanded)
+      : activeSessions;
     if (!needle) return pool;
     return pool.filter((s) => (s.title || "新对话").toLowerCase().includes(needle));
   }, [activeSessions, sessions, q, searching, archivedExpanded]);
 
   const pinned = useMemo(
-    () => (searching ? [] : sortSessionsRunningThenUpdated(filtered.filter((s) => s.pinned), runningIds)),
+    () =>
+      searching
+        ? []
+        : sortSessionsRunningThenUpdated(
+            filtered.filter((s) => s.pinned),
+            runningIds,
+          ),
     [filtered, searching, runningIds],
   );
   const pinnedIds = useMemo(() => new Set(pinned.map((s) => s.id)), [pinned]);
@@ -272,7 +292,8 @@ export function Sidebar({
       list.push(s);
       map.set(s.projectId, list);
     }
-    for (const list of map.values()) list.sort((a, b) => compareSessionsRunningThenUpdated(a, b, runningIds));
+    for (const list of map.values())
+      list.sort((a, b) => compareSessionsRunningThenUpdated(a, b, runningIds));
     return map;
   }, [filtered, pinnedIds, searching, runningIds]);
 
@@ -416,6 +437,7 @@ export function Sidebar({
       showAdmin ||
       onOpenMediaTasks ||
       onOpenChatGptProxy ||
+      onOpenApiAccess ||
       onOpenAccount ||
       onOpenFeedback ||
       onLogout,
@@ -536,7 +558,9 @@ export function Sidebar({
           onRename={isDefault ? undefined : onRenameProject}
           onDelete={isDefault ? undefined : onDeleteProject}
           onOpenSettings={isDefault ? undefined : onOpenProjectSettings}
-          onOpenAssets={isDefault && onOpenProjectAssets ? () => onOpenProjectAssets(null) : undefined}
+          onOpenAssets={
+            isDefault && onOpenProjectAssets ? () => onOpenProjectAssets(null) : undefined
+          }
           onNewSession={!isDefault && onNewInProject ? () => onNewInProject(p.id) : undefined}
           onMoveUp={() => moveProject(p.id, -1)}
           onMoveDown={() => moveProject(p.id, 1)}
@@ -645,7 +669,10 @@ export function Sidebar({
           )}
         />
       )}
-      <div className="flex flex-col gap-1.5 px-2.5 pb-1.5 pt-2.5" data-product-entry-scope="sidebar-primary">
+      <div
+        className="flex flex-col gap-1.5 px-2.5 pb-1.5 pt-2.5"
+        data-product-entry-scope="sidebar-primary"
+      >
         <div className="flex items-center justify-between px-1">
           <div className="flex items-center gap-2">
             <span className="flex size-7 items-center justify-center rounded-lg bg-grad-cta text-white">
@@ -654,7 +681,14 @@ export function Sidebar({
             <span className="text-title font-semibold tracking-tight">{BRAND.name}</span>
           </div>
           {onCollapse && (
-            <IconButton data-product-control onClick={onCollapse} aria-label="折叠侧栏" variant="muted" size="sm" shape="square">
+            <IconButton
+              data-product-control
+              onClick={onCollapse}
+              aria-label="折叠侧栏"
+              variant="muted"
+              size="sm"
+              shape="square"
+            >
               <PanelLeftClose size={17} />
             </IconButton>
           )}
@@ -683,7 +717,10 @@ export function Sidebar({
             )}
           >
             {boardActive && (
-              <span aria-hidden className="absolute inset-y-1 left-0 w-0.5 rounded-full bg-accent" />
+              <span
+                aria-hidden
+                className="absolute inset-y-1 left-0 w-0.5 rounded-full bg-accent"
+              />
             )}
             <Kanban size={16} className="text-faint" />
             任务
@@ -739,9 +776,7 @@ export function Sidebar({
           className="no-scrollbar flex-1 overflow-y-auto px-2 pb-3"
         />
       </nav>
-      {loadingMore && (
-        <p className="px-3 pb-2 text-center text-caption text-faint">加载更多…</p>
-      )}
+      {loadingMore && <p className="px-3 pb-2 text-center text-caption text-faint">加载更多…</p>}
 
       <div
         className="flex items-center gap-1 border-t border-border px-2 pt-2 sidebar-foot-safe-b"
@@ -825,15 +860,21 @@ export function Sidebar({
                   ChatGPT 直连
                 </DropdownMenuItem>
               )}
+              {onOpenApiAccess && (
+                <DropdownMenuItem data-product-control onSelect={onOpenApiAccess}>
+                  <KeyRound size={16} className="shrink-0 text-muted" />
+                  <span className="flex-1">API 接入</span>
+                  <span className="text-caption text-faint">本地 Claude Code</span>
+                </DropdownMenuItem>
+              )}
               {(onOpenAccount || onOpenFeedback || onLogout) &&
                 (onOpenManage ||
                   onOpenMarketplace ||
                   onOpenOrg ||
                   showAdmin ||
                   onOpenMediaTasks ||
-                  onOpenChatGptProxy) && (
-                  <DropdownMenuSeparator />
-                )}
+                  onOpenChatGptProxy ||
+                  onOpenApiAccess) && <DropdownMenuSeparator />}
               {onOpenAccount && (
                 <DropdownMenuItem
                   data-product-feature={PRODUCT_CAPABILITIES.billing.id}

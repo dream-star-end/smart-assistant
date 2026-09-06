@@ -56,6 +56,13 @@ export interface ProxyIdentity {
    * 未来若需 per-key 维度审计,新增独立 `apiKeyId?: bigint` 字段贯穿至 journal。
    */
   containerId: bigint | null;
+  /**
+   * 0277:API key strategy 专属。容器 strategy 不填(undefined)。
+   * handler 用 `id` 打戳 usage_records.api_key_id(settle 透传),用
+   * `creditLimit / spentCredits` 做单 key 上限 O(1) 预检(402 API_KEY_LIMIT_EXCEEDED)。
+   * spentCredits 是 resolve 时的快照,允许与并发结算有事务粒度的瞬时差。
+   */
+  apiKey?: { id: bigint; creditLimit: bigint | null; spentCredits: bigint } | null;
 }
 
 /**

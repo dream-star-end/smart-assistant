@@ -226,6 +226,15 @@ export function makeApiKeyIdentityStrategy(
         );
       }
 
+      // 0277 临时禁用:secret 已验对但 owner 主动停用。对外仍 401 同型(防枚举);
+      // **不** bump last_used_at —— 禁用期间的尝试不算 "使用"。
+      if (row.disabledAt !== null) {
+        throw new IdentityError(
+          "API_KEY_DISABLED",
+          `api key id=${row.id} is temporarily disabled (prefix=${keyPrefix})`,
+        );
+      }
+
       // Bump last_used_at,fire-and-forget + 5min 节流。
       //
       // **顺序说明**:bump 在 admin gate 之前。秘密已经验对 → 这是一次"持有真实 key
@@ -259,7 +268,12 @@ export function makeApiKeyIdentityStrategy(
       // 关键:`containerId: null` — 这是 Phase 0 类型放宽的实际消费点。
       // ApiKey 路径没有容器维度,journal.container_id 写 SQL NULL,
       // settle 路径(usage_records / credit_ledger)只按 uid 计费,与容器路径同型。
-      return { uid: row.userId, containerId: null };
+      return {
+        uid: row.userId,
+        containerId: null,
+        // 0277:per-key 归因 + 上限预检所需快照(不含任何 secret 材料)。
+        apiKey: { id: row.id, creditLimit: row.creditLimit, spentCredits: row.spentCredits },
+      };
     },
 
     async authorize(identity, _pricing, model, requiredEpoch) {

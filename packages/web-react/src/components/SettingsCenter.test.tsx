@@ -18,6 +18,7 @@ vi.mock('./settings/PreferencesTab', () => ({
   },
 }))
 vi.mock('./settings/SubscriptionDialog', () => ({ SubscriptionDialog: () => null }))
+vi.mock('./settings/ApiAccessTab', () => ({ ApiAccessTab: () => <div>API 接入页</div> }))
 
 const auth: AuthSession = createMemoryAuthSession(() => {}, 'token')
 
@@ -162,16 +163,13 @@ test('快捷键分区仍拉同一份 prefs', async () => {
   expect(api.getPreferences).toHaveBeenCalled()
 })
 
-test('设置中心只把 API Key 管理权限授予 admin', async () => {
-  vi.spyOn(api, 'getPreferences').mockResolvedValue({ prefs: {} } as never)
-
-  const first = render(<SettingsCenter {...base} />)
-  fireEvent.click(screen.getByRole('tab', { name: '偏好' }))
-  await screen.findByText('偏好页')
-  await waitFor(() => expect(preferencesProps).toHaveBeenCalled())
-  expect((preferencesProps.mock.calls.at(-1)?.[0] as { canManageApiKeys?: boolean }).canManageApiKeys).toBe(false)
+test('「API 接入」分区只对 admin 可见;普通用户深链回落账户页', async () => {
+  const first = render(<SettingsCenter {...base} initialSection="api-access" />)
+  expect(screen.queryByRole('tab', { name: 'API 接入' })).not.toBeInTheDocument()
+  expect(screen.queryByText('API 接入页')).not.toBeInTheDocument()
+  expect(screen.getByRole('tab', { name: '账户与计费' })).toHaveAttribute('aria-selected', 'true')
+  expect(screen.getByText('账户页')).toBeInTheDocument()
   first.unmount()
-  preferencesProps.mockClear()
 
   render(
     <SettingsCenter
@@ -179,10 +177,10 @@ test('设置中心只把 API Key 管理权限授予 admin', async () => {
       user={{ id: '2', displayName: '管理员', roles: ['admin'], role: 'admin' }}
     />,
   )
-  fireEvent.click(screen.getByRole('tab', { name: '偏好' }))
-  await screen.findByText('偏好页')
-  await waitFor(() => expect(preferencesProps).toHaveBeenCalled())
-  expect((preferencesProps.mock.calls.at(-1)?.[0] as { canManageApiKeys?: boolean }).canManageApiKeys).toBe(true)
+  const tab = screen.getByRole('tab', { name: 'API 接入' })
+  fireEvent.click(tab)
+  expect(tab).toHaveAttribute('aria-selected', 'true')
+  expect(await screen.findByText('API 接入页')).toBeInTheDocument()
 })
 
 test('偏好首次加载失败可原地重试，成功后恢复完整偏好页', async () => {

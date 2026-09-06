@@ -224,6 +224,22 @@ describe("Sidebar 会话列表", () => {
     expect(onOpenChatGptProxy).toHaveBeenCalledTimes(1);
   });
 
+  it("「API 接入」只在 App 传入回调（admin）时出现在账号菜单，点击触发", () => {
+    renderSidebar({ onOpenAccount: () => {} });
+    openAccountMenu();
+    expect(screen.queryByRole("menuitem", { name: /API 接入/ })).toBeNull();
+    cleanup();
+
+    const onOpenApiAccess = vi.fn();
+    renderSidebar({ onOpenAccount: () => {}, onOpenApiAccess });
+    openAccountMenu();
+    const item = screen.getByRole("menuitem", { name: /API 接入/ });
+    expect(item).toHaveAttribute("data-product-control");
+    expect(item).toHaveTextContent("本地 Claude Code");
+    fireEvent.click(item);
+    expect(onOpenApiAccess).toHaveBeenCalledTimes(1);
+  });
+
   it("点击用户区先弹出账号菜单，而不是直接进入设置", () => {
     const onOpenAccount = vi.fn();
     renderSidebar({ onOpenAccount });

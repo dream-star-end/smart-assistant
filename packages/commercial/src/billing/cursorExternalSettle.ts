@@ -183,6 +183,8 @@ export async function settleCursorExternalUsage(args: {
   attemptNo?: number | null;
   /** Historical backfill: usage row + 0-credit ledger truth, no debit. */
   zeroCharge?: boolean;
+  /** 0277: external API key attribution (usage_records.api_key_id + spent_credits). */
+  apiKeyId?: bigint | null;
 }): Promise<SettleResult | null> {
   const pricing = args.pricing.get(args.modelId);
   if (pricing === null) return null;
@@ -212,6 +214,7 @@ export async function settleCursorExternalUsage(args: {
     parentTurnKey: args.parentTurnKey ?? null,
     dispatchId: args.dispatchId ?? null,
     attemptNo: args.attemptNo ?? null,
+    apiKeyId: args.apiKeyId ?? null,
   });
   if (accountId !== null) {
     try {

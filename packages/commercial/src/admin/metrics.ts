@@ -575,6 +575,8 @@ export type ProxyRejectReason =
   // 防止客户端重放或跨用户碰撞绕过计费/审计。
   | "request_id_conflict"
   | "upstream_auth"
+  // 0277:外接 API key 单 key 名义积分上限(spent >= limit → 402 API_KEY_LIMIT_EXCEEDED)。
+  | "api_key_limit"
   | "deepseek_config"
   | "minimax_config"
   // OpenCode Go(Zen 网关 Go 档,qwen3.7-max/plus,2026-07-05):缺 OPENCODE_GO_API_KEY 时独立打点。

@@ -18,7 +18,6 @@ import {
   LongContextCostWarning,
 } from '../LongContextCostWarning'
 import { Alert, Button, Input, Modal, Switch, useConfirm } from '../ui'
-import { ApiKeysSection } from './ApiKeysSection'
 import { QqBindingCard } from './QqBindingCard'
 import { EFFORT_OPTIONS } from './labels'
 
@@ -62,7 +61,6 @@ export function PreferencesTab({
   onPatch,
   onUpgrade,
   onOpenMemory,
-  canManageApiKeys = false,
   pane = 'preferences',
 }: {
   auth: AuthSession
@@ -74,7 +72,6 @@ export function PreferencesTab({
   onPatch: (patch: Record<string, unknown>) => Promise<void>
   onUpgrade: () => void
   onOpenMemory: () => void
-  canManageApiKeys?: boolean
   /** 快捷键从偏好拆到独立导航；hotkeys 仍读同一份 prefs。 */
   pane?: 'preferences' | 'hotkeys'
 }) {
@@ -387,8 +384,6 @@ export function PreferencesTab({
         ))}
       </div>
 
-      {/* API Key 自管（admin-only rollout 命中 403 时整段隐藏） */}
-      {canManageApiKeys && <ApiKeysSection auth={auth} />}
       {confirmLongContextEl}
     </div>
   )

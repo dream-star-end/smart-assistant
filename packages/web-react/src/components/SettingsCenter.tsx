@@ -1,5 +1,5 @@
 import { Sparkles } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { useMdViewport } from "../hooks/useMdViewport";
 import { api, apiErrorMessage } from "../lib/api";
@@ -18,6 +18,7 @@ import {
 import type { AuthSession, User } from "../lib/types";
 import { cn } from "../lib/utils";
 import { AccountTab } from "./settings/AccountTab";
+import { ApiAccessTab } from "./settings/ApiAccessTab";
 import { FeedbackTab } from "./settings/FeedbackTab";
 import { PreferencesTab } from "./settings/PreferencesTab";
 import { SettingsRow } from "./settings/SettingsRow";
@@ -27,11 +28,18 @@ import { Avatar, Button, Modal, Spinner, Tabs } from "./ui";
 
 export type SettingsSection = SettingsDestinationSection;
 
-type SectionDef = { id: SettingsSection; label: string; featureId?: ProductFeatureId };
+type SectionDef = {
+  id: SettingsSection;
+  label: string;
+  featureId?: ProductFeatureId;
+  /** 仅 admin 可见(API key 管理面当前 admin-only rollout)。 */
+  adminOnly?: boolean;
+};
 
 const PERSONAL: SectionDef[] = [
   { id: "account", label: "账户与计费", featureId: PRODUCT_CAPABILITIES.billing.id },
   { id: "usage", label: "用量", featureId: PRODUCT_CAPABILITIES.billing.id },
+  { id: "api-access", label: "API 接入", adminOnly: true },
   { id: "preferences", label: "偏好", featureId: PRODUCT_CAPABILITIES.preferences.id },
   { id: "hotkeys", label: "快捷键" },
   { id: "feedback", label: "反馈", featureId: PRODUCT_CAPABILITIES.feedback.id },
@@ -43,11 +51,26 @@ const WORKSPACE: SectionDef[] = [
   { id: "plugins", label: "插件" },
 ];
 
-const SECTIONS: SectionDef[] = [...PERSONAL, ...WORKSPACE];
-const NAV_GROUPS: { label: string; items: SectionDef[] }[] = [
-  { label: "个人", items: PERSONAL },
-  { label: "工作区", items: WORKSPACE },
-];
+function isAdminUser(user: User | null): boolean {
+  return user?.role === "admin" || user?.roles.includes("admin") === true;
+}
+
+/** 按角色过滤后的分区清单(admin-only 分区对普通用户不渲染、不可深链)。 */
+function useVisibleSections(user: User | null) {
+  const admin = isAdminUser(user);
+  return useMemo(() => {
+    const keep = (s: SectionDef) => !s.adminOnly || admin;
+    const personal = PERSONAL.filter(keep);
+    const workspace = WORKSPACE.filter(keep);
+    return {
+      sections: [...personal, ...workspace],
+      groups: [
+        { label: "个人", items: personal },
+        { label: "工作区", items: workspace },
+      ],
+    };
+  }, [admin]);
+}
 
 /**
  * 设置中心：近全屏 Dialog（与 ManageCenter 同壳）+ 桌面左导航 / 窄屏顶栏横滚 tabs。
@@ -90,6 +113,7 @@ export function SettingsCenter({
   subscribeOpenSignal?: number;
 }) {
   const desktop = useMdViewport();
+  const { sections, groups } = useVisibleSections(user);
   const [section, setSection] = useState<SettingsSection>(initialSection);
   const [subOpen, setSubOpen] = useState(false);
   const lastSubscribeSignal = useRef(0);
@@ -105,7 +129,8 @@ export function SettingsCenter({
 
   useEffect(() => {
     if (open) {
-      setSection(initialSection);
+      // 深链到本角色不可见的分区(如普通用户 → api-access)→ 回落账户页。
+      setSection(sections.some((s) => s.id === initialSection) ? initialSection : "account");
       if (subscribeOpenSignal > 0 && subscribeOpenSignal !== lastSubscribeSignal.current) {
         lastSubscribeSignal.current = subscribeOpenSignal;
         setSubOpen(true);
@@ -114,7 +139,7 @@ export function SettingsCenter({
       setSection("account");
       setSubOpen(false);
     }
-  }, [open, initialSection, subscribeOpenSignal]);
+  }, [open, initialSection, subscribeOpenSignal, sections]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: prefsReloadTick 是显式重试触发器。
   useEffect(() => {
@@ -183,11 +208,9 @@ export function SettingsCenter({
         className="bg-surface"
         bodyClassName="flex min-h-0 flex-1 flex-col overflow-hidden p-0"
       >
-        <div
-          className={cn("flex min-h-0 min-w-0 flex-1", desktop ? "flex-row" : "flex-col")}
-        >
+        <div className={cn("flex min-h-0 min-w-0 flex-1", desktop ? "flex-row" : "flex-col")}>
           {desktop ? (
-            <VerticalNav value={section} onChange={setSection} />
+            <VerticalNav value={section} onChange={setSection} groups={groups} />
           ) : (
             <div className="shrink-0 border-b border-border px-4 py-3">
               <Tabs
@@ -195,7 +218,7 @@ export function SettingsCenter({
                 idBase="settings"
                 value={section}
                 onValueChange={(v) => setSection(v as SettingsSection)}
-                items={SECTIONS.map((s) => ({
+                items={sections.map((s) => ({
                   value: s.id,
                   label: s.label,
                   featureId: s.featureId,
@@ -252,11 +275,13 @@ export function SettingsCenter({
 function VerticalNav({
   value,
   onChange,
+  groups,
 }: {
   value: SettingsSection;
   onChange: (section: SettingsSection) => void;
+  groups: { label: string; items: SectionDef[] }[];
 }) {
-  const ids = SECTIONS.map((s) => s.id);
+  const ids = groups.flatMap((g) => g.items.map((s) => s.id));
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -281,7 +306,7 @@ function VerticalNav({
       onKeyDown={onKeyDown}
       className="flex w-[168px] shrink-0 flex-col overflow-y-auto border-r border-border p-2"
     >
-      {NAV_GROUPS.map((group) => (
+      {groups.map((group) => (
         <div key={group.label}>
           <div className="px-2.5 pb-1 pt-3 text-meta font-medium uppercase tracking-wide text-faint">
             {group.label}
@@ -385,6 +410,14 @@ function SettingsPanel({
     );
   }
 
+  if (section === "api-access") {
+    // 分区清单已按角色过滤;这里再兜底一次(角色变更竞态 / 直接改 state)。
+    if (!isAdminUser(user)) {
+      return <p className="px-5 py-10 text-center text-body text-faint">该功能暂未对你开放。</p>;
+    }
+    return <ApiAccessTab auth={auth} />;
+  }
+
   if (section === "preferences" || section === "hotkeys") {
     return (
       <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.preferences.id}>
@@ -413,7 +446,6 @@ function SettingsPanel({
             onPatch={onPatch}
             onUpgrade={onUpgrade}
             onOpenMemory={onOpenMemory}
-            canManageApiKeys={user?.role === "admin" || user?.roles.includes("admin") === true}
             pane={section === "hotkeys" ? "hotkeys" : "preferences"}
           />
         )}

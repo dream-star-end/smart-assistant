@@ -6,8 +6,6 @@ import { createMemoryAuthSession } from '../../lib/authSession'
 import type { AuthSession } from '../../lib/types'
 import { PreferencesTab } from './PreferencesTab'
 
-const apiKeysSection = vi.hoisted(() => vi.fn(() => null))
-vi.mock('./ApiKeysSection', () => ({ ApiKeysSection: apiKeysSection }))
 vi.mock('./QqBindingCard', () => ({ QqBindingCard: () => null }))
 
 const auth: AuthSession = createMemoryAuthSession(() => {}, 'tok')
@@ -15,7 +13,6 @@ const auth: AuthSession = createMemoryAuthSession(() => {}, 'tok')
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
-  apiKeysSection.mockClear()
 })
 
 describe('PreferencesTab · 对话行为', () => {
@@ -71,24 +68,22 @@ describe('PreferencesTab · 对话行为', () => {
 })
 
 describe('PreferencesTab · Auto-Dream', () => {
-  test('API Key 管理只为管理员挂载', () => {
+  test('API Key 管理已迁到「API 接入」分区,偏好页不再挂载', () => {
     vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
-    const common = {
-      auth,
-      prefs: {},
-      autoDream: null,
-      theme: 'system' as const,
-      onSetTheme: () => {},
-      onPatch: async () => {},
-      onUpgrade: () => {},
-      onOpenMemory: () => {},
-    }
-    const first = render(<PreferencesTab {...common} canManageApiKeys={false} />)
-    expect(apiKeysSection).not.toHaveBeenCalled()
-    first.unmount()
-
-    render(<PreferencesTab {...common} canManageApiKeys />)
-    expect(apiKeysSection).toHaveBeenCalledTimes(1)
+    render(
+      <PreferencesTab
+        auth={auth}
+        prefs={{}}
+        autoDream={null}
+        theme="system"
+        onSetTheme={() => {}}
+        onPatch={async () => {}}
+        onUpgrade={() => {}}
+        onOpenMemory={() => {}}
+      />,
+    )
+    expect(screen.queryByText('API Key')).not.toBeInTheDocument()
+    expect(screen.queryByPlaceholderText(/新密钥名称/)).not.toBeInTheDocument()
   })
 
   test('显示 MiniMax 全面审计范围，并提供优化建议入口', async () => {

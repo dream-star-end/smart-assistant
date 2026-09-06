@@ -153,6 +153,24 @@ interface UserApiKeyRow {
   created_at: Date;
   last_used_at: Date | null;
   revoked_at: Date | null;
+  // 0277 三列(fake 允许缺省 → 未禁用 / 不限 / 0)。
+  disabled_at?: Date | null;
+  credit_limit?: string | null;
+  spent_credits?: string;
+}
+
+/** 0277 SUMMARY_COLUMNS 的 fake 投影(与 repo SELECT 列白名单一致,**不含 key_hash**)。 */
+function summaryOf(r: UserApiKeyRow) {
+  return {
+    id: r.id,
+    label: r.label,
+    key_prefix: r.key_prefix,
+    created_at: r.created_at,
+    last_used_at: r.last_used_at,
+    disabled_at: r.disabled_at ?? null,
+    credit_limit: r.credit_limit ?? null,
+    spent_credits: r.spent_credits ?? "0",
+  };
 }
 
 interface FakePoolHandle {
@@ -227,17 +245,17 @@ function buildFakePool(): FakePoolHandle {
       return { rows: [{ id, created_at: createdAt }], rowCount: 1 };
     }
 
-    // findByPrefix:SELECT … WHERE key_prefix=$1 AND revoked_at IS NULL
-    if (/^SELECT\s+ID,\s*USER_ID,\s*LABEL,\s*KEY_PREFIX,\s*KEY_HASH/i.test(trimmed)) {
+    // 0277 SUMMARY_COLUMNS 前缀:`id, label, key_prefix, created_at, last_used_at, disabled_at, credit_limit, spent_credits`
+    const SUMMARY_RE =
+      /^SELECT\s+ID,\s*LABEL,\s*KEY_PREFIX,\s*CREATED_AT,\s*LAST_USED_AT,\s*DISABLED_AT,\s*CREDIT_LIMIT,\s*SPENT_CREDITS/i;
+
+    // findByPrefix:SELECT <summary>, user_id, key_hash … WHERE key_prefix=$1 AND revoked_at IS NULL
+    if (SUMMARY_RE.test(trimmed) && /,\s*USER_ID,\s*KEY_HASH/i.test(trimmed) && /KEY_PREFIX\s*=\s*\$1/i.test(trimmed)) {
       const [keyPrefix] = params as [string];
       for (const row of table.values()) {
         if (row.key_prefix === keyPrefix && row.revoked_at === null) {
           return {
-            rows: [{
-              id: row.id, user_id: row.user_id, label: row.label,
-              key_prefix: row.key_prefix, key_hash: row.key_hash,
-              created_at: row.created_at, last_used_at: row.last_used_at,
-            }],
+            rows: [{ ...summaryOf(row), user_id: row.user_id, key_hash: row.key_hash }],
             rowCount: 1,
           };
         }
@@ -245,17 +263,62 @@ function buildFakePool(): FakePoolHandle {
       return { rows: [], rowCount: 0 };
     }
 
-    // list:SELECT id, label, key_prefix, created_at, last_used_at … WHERE user_id=$1 AND revoked_at IS NULL
-    if (/^SELECT\s+ID,\s*LABEL,\s*KEY_PREFIX,\s*CREATED_AT,\s*LAST_USED_AT/i.test(trimmed)) {
+    // update(空 patch 读当前行):SELECT <summary> … WHERE user_id=$1 AND id=$2 AND revoked_at IS NULL
+    if (SUMMARY_RE.test(trimmed) && /USER_ID\s*=\s*\$1\s+AND\s+ID\s*=\s*\$2/i.test(trimmed)) {
+      const [userId, id] = params as [string, string];
+      const row = table.get(id);
+      if (row && row.user_id === userId && row.revoked_at === null) {
+        return { rows: [summaryOf(row)], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    }
+
+    // list:SELECT <summary> … WHERE user_id=$1 AND revoked_at IS NULL
+    if (SUMMARY_RE.test(trimmed)) {
       const [userId] = params as [string];
       const rows = [...table.values()]
         .filter((r) => r.user_id === userId && r.revoked_at === null)
         .sort((a, b) => b.created_at.getTime() - a.created_at.getTime())
-        .map((r) => ({
-          id: r.id, label: r.label, key_prefix: r.key_prefix,
-          created_at: r.created_at, last_used_at: r.last_used_at,
-        }));
+        .map(summaryOf);
       return { rows, rowCount: rows.length };
+    }
+
+    // 0277 update:UPDATE user_api_keys SET <label|disabled_at|credit_limit…> WHERE user_id=$1 AND id=$2 AND revoked_at IS NULL RETURNING <summary>
+    if (/^UPDATE\s+USER_API_KEYS\s+SET\s+(LABEL|DISABLED_AT|CREDIT_LIMIT)/i.test(trimmed)) {
+      const [userId, id, ...rest] = params as [string, string, ...string[]];
+      const row = table.get(id);
+      if (!row || row.user_id !== userId || row.revoked_at !== null) return { rows: [], rowCount: 0 };
+      // 按 SET 子句顺序消费参数:label=$n / credit_limit=$n 用参数;disabled_at 是常量表达式。
+      const setClause = trimmed.match(/SET\s+([\s\S]*?)\s+WHERE/i)![1]!;
+      let cursor = 0;
+      // 顶层逗号切分(括号内的逗号如 COALESCE(a, b) 不切)。
+      const pieces: string[] = [];
+      let depth = 0;
+      let cur = "";
+      for (const ch of setClause) {
+        if (ch === "(") depth++;
+        if (ch === ")") depth--;
+        if (ch === "," && depth === 0) { pieces.push(cur.trim()); cur = ""; continue; }
+        cur += ch;
+      }
+      if (cur.trim()) pieces.push(cur.trim());
+      for (const piece of pieces) {
+        if (/^label\s*=\s*\$\d+$/i.test(piece)) row.label = rest[cursor++]!;
+        else if (/^disabled_at\s*=\s*COALESCE\(disabled_at,\s*now\(\)\)$/i.test(piece)) row.disabled_at = row.disabled_at ?? new Date();
+        else if (/^disabled_at\s*=\s*NULL$/i.test(piece)) row.disabled_at = null;
+        else if (/^credit_limit\s*=\s*NULL$/i.test(piece)) row.credit_limit = null;
+        else if (/^credit_limit\s*=\s*\$\d+$/i.test(piece)) row.credit_limit = rest[cursor++]!;
+        else throw new Error(`fakePool: unknown SET piece ${piece}`);
+      }
+      return { rows: [summaryOf(row)], rowCount: 1 };
+    }
+
+    // 0277 settle 内累加:UPDATE user_api_keys SET spent_credits = spent_credits + $2 WHERE id = $1
+    if (/^UPDATE\s+USER_API_KEYS\s+SET\s+SPENT_CREDITS/i.test(trimmed)) {
+      const [id, delta] = params as [string, string];
+      const row = table.get(id);
+      if (row) row.spent_credits = (BigInt(row.spent_credits ?? "0") + BigInt(delta)).toString();
+      return { rows: [], rowCount: row ? 1 : 0 };
     }
 
     // revoke:UPDATE … SET revoked_at = now() WHERE user_id=$1 AND id=$2 AND revoked_at IS NULL
@@ -480,7 +543,7 @@ async function buildHarness(opts: HarnessOpts = {}): Promise<Harness> {
   const logger = createLogger({
     level: "warn",
     base: { test: "apiKeyAdmin.integ" },
-    out: () => {},
+    out: (line: string) => { if (process.env.OC_TEST_LOG) process.stderr.write(line + "\n"); },
   });
 
   const externalApiKeyProxy = makeAnthropicProxyHandler({
@@ -939,5 +1002,169 @@ describe("Phase 6 admin-only rollout — Layer 2 strategy 兜底 401 + 零副作
       const hit = sqlSeen.find((s) => re.test(s));
       assert.ok(!hit, `Phase 6 Layer 2 闭环:${reason};hit=${hit?.slice(0, 80)}`);
     }
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 0277 — PATCH(改名 / 禁用 / 上限)+ settle 归因(api_key_id + spent_credits)
+//        + 上限 402 + usage 报表 endpoint 路由
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("0277 — PATCH /api/me/api-keys/:id + 上限 402 + 禁用 401 + settle 归因", () => {
+  test("rename / limit / disable 全链路,settle 打戳 api_key_id 并累加 spent_credits", async () => {
+    const h = await buildHarness();
+    const jwt = await h.jwtFor(USER_A_ID);
+
+    const createRes = await runReq(h, {
+      method: "POST",
+      url: "/api/me/api-keys",
+      headers: { authorization: `Bearer ${jwt}` },
+      body: { label: "before" },
+    });
+    assert.equal(createRes.statusCode, 201, createRes.bodyText());
+    const created = createRes.bodyJson() as Record<string, string | null>;
+    const keyId = created.id!;
+    assert.equal(created.disabled_at, null);
+    assert.equal(created.credit_limit, null);
+    assert.equal(created.spent_credits, "0");
+
+    // —— rename
+    const renameRes = await runReq(h, {
+      method: "PATCH",
+      url: `/api/me/api-keys/${keyId}`,
+      headers: { authorization: `Bearer ${jwt}` },
+      body: { label: "  after  " },
+    });
+    assert.equal(renameRes.statusCode, 200, renameRes.bodyText());
+    assert.equal((renameRes.bodyJson() as { label: string }).label, "after");
+
+    // —— 非法 body
+    for (const body of [{}, { disabled: "yes" }, { credit_limit: 0 }, { credit_limit: -5 }, { credit_limit: "abc" }]) {
+      const bad = await runReq(h, {
+        method: "PATCH",
+        url: `/api/me/api-keys/${keyId}`,
+        headers: { authorization: `Bearer ${jwt}` },
+        body,
+      });
+      assert.equal(bad.statusCode, 400, `body=${JSON.stringify(body)} → ${bad.bodyText()}`);
+    }
+
+    // —— 一次成功请求:usage_records INSERT 带 api_key_id;spent_credits 累加
+    const ok1 = await runReq(h, {
+      method: "POST",
+      url: "/api/anthropic/v1/messages",
+      headers: { authorization: `Bearer ${created.plaintext}`, "anthropic-version": "2023-06-01" },
+      body: { model: FIXED_MODEL, max_tokens: 100, messages: [{ role: "user", content: "hi" }], stream: true },
+    });
+    assert.equal(ok1.statusCode, 200, ok1.bodyText());
+    const usageInsert = h.fp.queries.find((q) => /^INSERT\s+INTO\s+USAGE_RECORDS/i.test(q.sql.trim()));
+    assert.ok(usageInsert, "必须写 usage_records");
+    assert.match(usageInsert!.sql, /api_key_id\)/, "INSERT 列清单必须含 api_key_id");
+    assert.equal(usageInsert!.params.at(-1), keyId, "最后一个绑定参数 = api_key_id");
+    const spentUpdate = h.fp.queries.find((q) => /^UPDATE\s+USER_API_KEYS\s+SET\s+SPENT_CREDITS/i.test(q.sql.trim()));
+    assert.ok(spentUpdate, "settle 同事务内必须累加 spent_credits");
+    assert.equal(spentUpdate!.params[0], keyId);
+    const spentAfter = BigInt(h.fp.table.get(keyId)!.spent_credits ?? "0");
+    assert.ok(spentAfter > 0n, `spent_credits 应 > 0,实际 ${spentAfter}`);
+
+    // —— list 回显 spent
+    const list = await runReq(h, { method: "GET", url: "/api/me/api-keys", headers: { authorization: `Bearer ${jwt}` } });
+    const row = (list.bodyJson() as { keys: Array<Record<string, string | null>> }).keys[0]!;
+    assert.equal(row.spent_credits, spentAfter.toString());
+
+    // —— 设上限 = 已消耗 → 下一次 402 API_KEY_LIMIT_EXCEEDED,且不进 billing
+    const limitRes = await runReq(h, {
+      method: "PATCH",
+      url: `/api/me/api-keys/${keyId}`,
+      headers: { authorization: `Bearer ${jwt}` },
+      body: { credit_limit: spentAfter.toString() },
+    });
+    assert.equal(limitRes.statusCode, 200, limitRes.bodyText());
+    assert.equal((limitRes.bodyJson() as { credit_limit: string }).credit_limit, spentAfter.toString());
+    const before = h.fp.queries.length;
+    const blocked = await runReq(h, {
+      method: "POST",
+      url: "/api/anthropic/v1/messages",
+      headers: { authorization: `Bearer ${created.plaintext}`, "anthropic-version": "2023-06-01" },
+      body: { model: FIXED_MODEL, max_tokens: 100, messages: [{ role: "user", content: "hi" }], stream: true },
+    });
+    assert.equal(blocked.statusCode, 402, blocked.bodyText());
+    assert.equal((blocked.bodyJson() as { error: { code: string } }).error.code, "API_KEY_LIMIT_EXCEEDED");
+    const after = h.fp.queries.slice(before).map((q) => q.sql.trim().toUpperCase());
+    assert.ok(!after.some((s) => /INSERT\s+INTO\s+USAGE_RECORDS|INSERT\s+INTO\s+REQUEST_FINALIZE_JOURNAL/.test(s)), "402 不得进 journal / usage");
+
+    // —— 清上限 + 禁用 → 401;启用 → 200
+    const disableRes = await runReq(h, {
+      method: "PATCH",
+      url: `/api/me/api-keys/${keyId}`,
+      headers: { authorization: `Bearer ${jwt}` },
+      body: { credit_limit: null, disabled: true },
+    });
+    assert.equal(disableRes.statusCode, 200, disableRes.bodyText());
+    const disabledBody = disableRes.bodyJson() as { credit_limit: string | null; disabled_at: string | null };
+    assert.equal(disabledBody.credit_limit, null);
+    assert.ok(disabledBody.disabled_at);
+    const denied = await runReq(h, {
+      method: "POST",
+      url: "/api/anthropic/v1/messages",
+      headers: { authorization: `Bearer ${created.plaintext}`, "anthropic-version": "2023-06-01" },
+      body: { model: FIXED_MODEL, max_tokens: 100, messages: [{ role: "user", content: "hi" }], stream: true },
+    });
+    assert.equal(denied.statusCode, 401, denied.bodyText());
+    const enableRes = await runReq(h, {
+      method: "PATCH",
+      url: `/api/me/api-keys/${keyId}`,
+      headers: { authorization: `Bearer ${jwt}` },
+      body: { disabled: false },
+    });
+    assert.equal((enableRes.bodyJson() as { disabled_at: string | null }).disabled_at, null);
+    const ok2 = await runReq(h, {
+      method: "POST",
+      url: "/api/anthropic/v1/messages",
+      headers: { authorization: `Bearer ${created.plaintext}`, "anthropic-version": "2023-06-01" },
+      body: { model: FIXED_MODEL, max_tokens: 100, messages: [{ role: "user", content: "hi" }], stream: true },
+    });
+    assert.equal(ok2.statusCode, 200, ok2.bodyText());
+
+    // —— 跨用户 PATCH → 404;无 JWT → 401;非 admin → 403
+    const jwtB = await h.jwtFor(USER_B_ID);
+    const cross = await runReq(h, {
+      method: "PATCH",
+      url: `/api/me/api-keys/${keyId}`,
+      headers: { authorization: `Bearer ${jwtB}` },
+      body: { label: "hijack" },
+    });
+    assert.equal(cross.statusCode, 404);
+    assert.equal(h.fp.table.get(keyId)!.label, "after");
+    const noJwt = await runReq(h, { method: "PATCH", url: `/api/me/api-keys/${keyId}`, body: { label: "x" } });
+    assert.equal(noJwt.statusCode, 401);
+    const userJwt = await h.jwtFor(USER_A_ID, "user");
+    const nonAdmin = await runReq(h, {
+      method: "PATCH",
+      url: `/api/me/api-keys/${keyId}`,
+      headers: { authorization: `Bearer ${userJwt}` },
+      body: { label: "x" },
+    });
+    assert.equal(nonAdmin.statusCode, 403);
+    assert.equal((nonAdmin.bodyJson() as { error: { code: string } }).error.code, "ADMIN_ONLY");
+  });
+
+  test("GET /api/me/api-keys/usage 路由:exact 不被 pathPrefix 吞;window / key_id 校验", async () => {
+    const h = await buildHarness();
+    const jwt = await h.jwtFor(USER_A_ID);
+    for (const [qs, code] of [
+      ["?window=1y", 400],
+      ["?key_id=abc", 400],
+      ["?key_id=0", 400],
+    ] as const) {
+      const r = await runReq(h, { method: "GET", url: `/api/me/api-keys/usage${qs}`, headers: { authorization: `Bearer ${jwt}` } });
+      assert.equal(r.statusCode, code, `${qs} → ${r.bodyText()}`);
+      assert.equal((r.bodyJson() as { error: { code: string } }).error.code, "INVALID_USAGE_QUERY");
+    }
+    const noJwt = await runReq(h, { method: "GET", url: "/api/me/api-keys/usage" });
+    assert.equal(noJwt.statusCode, 401);
+    const userJwt = await h.jwtFor(USER_A_ID, "user");
+    const nonAdmin = await runReq(h, { method: "GET", url: "/api/me/api-keys/usage", headers: { authorization: `Bearer ${userJwt}` } });
+    assert.equal(nonAdmin.statusCode, 403);
   });
 });
