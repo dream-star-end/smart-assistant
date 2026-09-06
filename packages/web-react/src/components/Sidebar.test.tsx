@@ -9,6 +9,7 @@ import { HighlightedText } from "./sidebar/highlight";
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
 });
 
 const user: User = {
@@ -189,7 +190,9 @@ describe("Sidebar 会话列表", () => {
     expect(screen.queryByRole("button", { name: "退出登录" })).toBeNull();
     expect(screen.queryByRole("button", { name: "反馈与帮助" })).toBeNull();
 
-    expect(screen.getByRole("button", { name: "打开使用教程" })).toBeInTheDocument();
+    const tutorial = screen.getByRole("button", { name: "打开使用教程" });
+    expect(tutorial).toBeInTheDocument();
+    expect(tutorial).toHaveTextContent("教程");
     expect(screen.getByRole("button", { name: /切换主题/ })).toBeInTheDocument();
 
     openAccountMenu();
@@ -280,7 +283,7 @@ describe("Sidebar 会话列表", () => {
 
   it("搜索按标题过滤（大小写不敏感），清空后全部恢复", () => {
     renderSidebar({ sessions: listSessions });
-    const search = screen.getByPlaceholderText("搜索会话");
+    const search = screen.getByPlaceholderText("搜索标题或消息");
 
     fireEvent.change(search, { target: { value: "beta" } });
     expect(screen.getByRole("button", { name: "Beta 上线检查" })).toBeInTheDocument();
@@ -293,7 +296,7 @@ describe("Sidebar 会话列表", () => {
 
   it("过滤无命中时给出空态提示，而不是一片空白", () => {
     renderSidebar({ sessions: listSessions });
-    fireEvent.change(screen.getByPlaceholderText("搜索会话"), {
+    fireEvent.change(screen.getByPlaceholderText("搜索标题或消息"), {
       target: { value: "不存在的关键词" },
     });
     expect(screen.getByText("没有匹配的会话")).toBeInTheDocument();
@@ -431,7 +434,7 @@ describe("Sidebar 项目分组", () => {
       onToggleProjectCollapsed: () => {},
       onCreateProject: () => {},
     });
-    fireEvent.change(screen.getByPlaceholderText("搜索会话"), { target: { value: "项目里" } });
+    fireEvent.change(screen.getByPlaceholderText("搜索标题或消息"), { target: { value: "项目里" } });
     expect(screen.getByRole("button", { name: "项目里的会话" })).toBeInTheDocument();
     expect(screen.queryByText("项目")).toBeNull();
     expect(screen.queryByRole("button", { name: /工作/ })).toBeNull();
@@ -526,6 +529,30 @@ describe("Sidebar 项目分组", () => {
       onNewInProject,
     });
     expect(screen.queryByRole("button", { name: "在 未分类 新建会话" })).toBeNull();
+  });
+
+  it("空项目组内「新建会话」调用 onNewInProject 而非 onNew", () => {
+    const onNew = vi.fn();
+    const onNewInProject = vi.fn();
+    renderSidebar({
+      sessions: [],
+      projects: [project({ id: "p-work", name: "工作" })],
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+      onNew,
+      onNewInProject,
+    });
+    const news = screen.getAllByRole("button", { name: /^新建会话$/ });
+    // [0] 顶部全局；[1] 空工作项目 CTA；[2] 空未分类 CTA
+    expect(news.length).toBeGreaterThanOrEqual(3);
+    fireEvent.click(news[1]!);
+    expect(onNewInProject).toHaveBeenCalledTimes(1);
+    expect(onNewInProject).toHaveBeenCalledWith("p-work");
+    expect(onNew).not.toHaveBeenCalled();
+    fireEvent.click(news[2]!);
+    expect(onNew).toHaveBeenCalledTimes(1);
+    expect(onNewInProject).toHaveBeenCalledTimes(1);
   });
 
   it("无真实项目时仍渲染 default；default 不可重命名、删除、改色或排序", () => {
@@ -931,6 +958,22 @@ describe("Sidebar 归档与批量", () => {
     expect(onLoadArchived).toHaveBeenCalledTimes(1);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("button", { name: "已收进箱底" })).toBeInTheDocument();
+    expect(localStorage.getItem("oc_v5_sidebar_archived_expanded:u1")).toBe("1");
+  });
+
+  it("archivedExpanded 按 userId 从 localStorage 恢复", () => {
+    localStorage.setItem("oc_v5_sidebar_archived_expanded:u1", "1");
+    const onLoadArchived = vi.fn();
+    renderSidebar({
+      sessions: [
+        session({ id: "s-live", title: "进行中" }),
+        session({ id: "s-arc", title: "已收进箱底", archived: true }),
+      ],
+      onLoadArchived,
+    });
+    expect(screen.getByRole("button", { name: /已归档/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: "已收进箱底" })).toBeInTheDocument();
+    expect(onLoadArchived).toHaveBeenCalled();
   });
 
   it("会话更多菜单可归档，也可进入多选并批量操作", () => {
@@ -964,7 +1007,7 @@ describe("Sidebar 归档与批量", () => {
     const entry = screen.getByRole("button", { name: "多选" });
     expect(entry).toBeVisible();
     expect(chrome!.contains(entry)).toBe(true);
-    expect(chrome!.contains(screen.getByPlaceholderText("搜索会话"))).toBe(true);
+    expect(chrome!.contains(screen.getByPlaceholderText("搜索标题或消息"))).toBe(true);
     fireEvent.click(entry);
     expect(screen.getByTestId("sidebar-batch-bar")).toHaveTextContent("已选 0 条");
     expect(screen.getByLabelText("选择 季度复盘 Alpha")).toBeInTheDocument();
@@ -1059,7 +1102,7 @@ describe("Sidebar 服务端搜索三态", () => {
       },
     ]);
     renderSidebar({ sessions: listSessions, onSearchMessages });
-    fireEvent.change(screen.getByPlaceholderText("搜索会话"), { target: { value: "beta" } });
+    fireEvent.change(screen.getByPlaceholderText("搜索标题或消息"), { target: { value: "beta" } });
     expect(screen.getByRole("button", { name: "Beta 上线检查" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "季度复盘 Alpha" })).toBeNull();
     expect(screen.getByText("正在搜索消息…")).toBeInTheDocument();
@@ -1075,7 +1118,7 @@ describe("Sidebar 服务端搜索三态", () => {
       throw new Error("boom");
     });
     renderSidebar({ sessions: listSessions, onSearchMessages });
-    fireEvent.change(screen.getByPlaceholderText("搜索会话"), { target: { value: "zzz-none" } });
+    fireEvent.change(screen.getByPlaceholderText("搜索标题或消息"), { target: { value: "zzz-none" } });
     await waitFor(() => expect(screen.getByText("消息搜索失败")).toBeInTheDocument());
   });
 
@@ -1087,9 +1130,9 @@ describe("Sidebar 服务端搜索三态", () => {
       return [];
     });
     renderSidebar({ sessions: listSessions, onSearchMessages });
-    fireEvent.change(screen.getByPlaceholderText("搜索会话"), { target: { value: "al" } });
+    fireEvent.change(screen.getByPlaceholderText("搜索标题或消息"), { target: { value: "al" } });
     await waitFor(() => expect(onSearchMessages).toHaveBeenCalledTimes(1));
-    fireEvent.change(screen.getByPlaceholderText("搜索会话"), { target: { value: "alpha" } });
+    fireEvent.change(screen.getByPlaceholderText("搜索标题或消息"), { target: { value: "alpha" } });
     expect(seen[0]?.aborted).toBe(true);
   });
 });

@@ -95,10 +95,12 @@ export function MemoryPanel({
           ) : undefined
         }
       />
-      <div className="border-t border-border px-4 py-3">
+      <div className="min-w-0 overflow-x-auto border-t border-border px-4 py-3">
         <Tabs
           aria-label="记忆分区"
           idBase={TAB_ID_BASE}
+          layout="scroll"
+          className="max-w-full"
           value={tab}
           onValueChange={(v) =>
             setTab(
@@ -115,7 +117,7 @@ export function MemoryPanel({
           }
           items={[
             { value: "all", label: "全部" },
-            { value: "core", label: "Agent Core" },
+            { value: "core", label: "核心记忆" },
             { value: "project", label: "项目记忆" },
             { value: "profile", label: "用户画像" },
             { value: "usage", label: "使用情况" },

@@ -7,6 +7,10 @@ export function projectCollapsedStorageKey(userId: string): string {
   return `oc_v5_sidebar_project_collapsed:${userId}`;
 }
 
+export function archivedExpandedStorageKey(userId: string): string {
+  return `oc_v5_sidebar_archived_expanded:${userId}`;
+}
+
 function readCollapsed(userId: string): Set<string> {
   try {
     const raw = localStorage.getItem(projectCollapsedStorageKey(userId));

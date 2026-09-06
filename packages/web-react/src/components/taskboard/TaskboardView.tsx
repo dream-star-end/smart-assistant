@@ -588,6 +588,7 @@ export function TaskboardView({
           className="order-3 flex w-full min-w-0 items-center gap-2 md:order-2 md:ml-auto md:w-auto"
         >
           <ProjectScopeSelect
+            id="taskboard-project-scope"
             variant="work"
             className="min-w-0 flex-1 md:w-56 md:max-w-[16rem] md:flex-none"
           />
@@ -721,8 +722,28 @@ export function TaskboardView({
       ) : !lockedProjectId ? (
         <EmptyState
           icon={Kanban}
-          title={UNBOUND_BOARD_COPY}
-          hint="任务看板按工作项目组织。请在上方选择一个具体的工作项目，或先把当前会话归入某个项目。"
+          title={'blocked' in workQuery ? workQuery.blocked : UNBOUND_BOARD_COPY}
+          hint={
+            projectScope.scope.kind === 'all'
+              ? '任务看板按工作项目组织。请在上方选择一个具体的工作项目。'
+              : projectScope.scope.kind === 'chat'
+                ? '当前会话项目还没有绑定看板。请在上方选择一个已绑定的工作项目。'
+                : '任务看板按工作项目组织。请在上方选择一个具体的工作项目，或先把当前会话归入某个项目。'
+          }
+          action={
+            projectScope.scope.kind === 'all' ? (
+              <Button
+                type="button"
+                onClick={() => {
+                  const el = document.getElementById('taskboard-project-scope')
+                  el?.scrollIntoView({ block: 'nearest' })
+                  el?.focus()
+                }}
+              >
+                选择工作项目
+              </Button>
+            ) : undefined
+          }
         />
       ) : !board.projectId || (lockedProjectId && board.projectId !== lockedProjectId && !board.board) ? (
         <EmptyState

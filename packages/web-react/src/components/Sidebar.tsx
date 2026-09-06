@@ -26,6 +26,7 @@ import {
   useSyncExternalStore,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { archivedExpandedStorageKey } from "../hooks/useChatProjects";
 import { useProjectScope } from "../hooks/useProjectScope";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
@@ -73,6 +74,24 @@ import { VirtualList } from "./sidebar/VirtualList";
 
 /** 空态提示行叠加「新建会话」CTA 后的行高(文字 + gap + 按钮 + 原 py-6 呼吸位)。 */
 const EMPTY_HINT_CTA_HEIGHT = 108;
+
+function readArchivedExpanded(userId: string | undefined): boolean {
+  if (!userId) return false;
+  try {
+    return localStorage.getItem(archivedExpandedStorageKey(userId)) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeArchivedExpanded(userId: string | undefined, expanded: boolean): void {
+  if (!userId) return;
+  try {
+    localStorage.setItem(archivedExpandedStorageKey(userId), expanded ? "1" : "0");
+  } catch {
+    /* private mode / quota */
+  }
+}
 
 function useCoarsePointer(): boolean {
   return useSyncExternalStore(
@@ -215,13 +234,25 @@ export function Sidebar({
   const [q, setQ] = useState("");
   const [now, setNow] = useState(() => Date.now());
   const [dragOverProjectId, setDragOverProjectId] = useState<string | null>(null);
-  const [archivedExpanded, setArchivedExpanded] = useState(false);
+  const [archivedExpanded, setArchivedExpanded] = useState(() => readArchivedExpanded(user?.id));
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [multiSelect, setMultiSelect] = useState(false);
   const [orderOverride, setOrderOverride] = useState<string[] | null>(null);
   const [searchHits, setSearchHits] = useState<SessionSearchHit[]>([]);
   const [searchRemote, setSearchRemote] = useState<"idle" | "loading" | "empty" | "error">("idle");
   const coarse = useCoarsePointer();
+  const userId = user?.id;
+  useEffect(() => {
+    setArchivedExpanded(readArchivedExpanded(userId));
+  }, [userId]);
+  useEffect(() => {
+    writeArchivedExpanded(userId, archivedExpanded);
+  }, [userId, archivedExpanded]);
+  // 仅在挂载时按持久化展开去拉归档列表；之后由点击处理。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only restore of archived list
+  useEffect(() => {
+    if (archivedExpanded) onLoadArchived?.();
+  }, []);
   const searching = q.trim().length > 0;
   const projectScope = useProjectScope();
   const activeSearchProjectId =
@@ -501,7 +532,18 @@ export function Sidebar({
         >
           <span>{item.text}</span>
           {showNewCta && (
-            <Button variant="secondary" size="sm" onClick={onNew}>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={
+                item.projectId && onNewInProject
+                  ? () => {
+                      const pid = item.projectId;
+                      if (pid) onNewInProject(pid);
+                    }
+                  : onNew
+              }
+            >
               新建会话
             </Button>
           )}
@@ -733,10 +775,10 @@ export function Sidebar({
             <input
               data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
               data-sidebar-search
-              aria-label="搜索会话"
+              aria-label="搜索标题或消息"
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder="搜索会话"
+              placeholder="搜索标题或消息"
               className="w-full min-w-0 bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-sm"
             />
           </label>
@@ -905,16 +947,26 @@ export function Sidebar({
           userChip
         )}
         {onOpenTutorial && (
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="sm"
             data-product-control
             onClick={onOpenTutorial}
             aria-label="打开使用教程"
             title="使用教程"
-            className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+            className="h-8 shrink-0 gap-1 px-2 text-faint hover:text-fg"
           >
             <BookOpen size={16} />
-          </button>
+            <span
+              className={cn(
+                "text-caption font-medium",
+                typeof width === "number" && width < 220 && "hidden",
+              )}
+            >
+              教程
+            </span>
+          </Button>
         )}
         {theme && onCycleTheme && <ThemeToggle theme={theme} onCycle={onCycleTheme} />}
       </div>

@@ -23,6 +23,7 @@ import { api, apiErrorMessage } from "../../lib/api";
 import {
   buildSchedule,
   cronHuman,
+  describeNextRun,
   SCHEDULE_MODE_LABELS,
   type ScheduleMode,
   scheduleToPreset,
@@ -166,6 +167,32 @@ function shortTitle(s: string, max = 20): string {
 
 function deliverLabel(v: string): string {
   return deliverCopy(v).label;
+}
+
+function NextRunMeta({ nextRunAt }: { nextRunAt: string | number | null | undefined }) {
+  const desc = describeNextRun(nextRunAt, Date.now());
+  if (desc.kind === "future") {
+    return (
+      <span className="text-muted" title={desc.title}>
+        {desc.label} <TimeAgo value={nextRunAt} />
+      </span>
+    );
+  }
+  if (desc.kind === "overdue") {
+    return (
+      <span className="text-warning" title={desc.title}>
+        {desc.label}
+      </span>
+    );
+  }
+  if (desc.kind === "soon") {
+    return (
+      <span className="text-muted" title={desc.title}>
+        {desc.label}
+      </span>
+    );
+  }
+  return <span className="text-faint">{desc.label}</span>;
 }
 
 /** 表单预填种子：空态预设 chip 与「再跑一次」共用。 */
@@ -484,21 +511,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
                   ) : (
                     <code className="font-mono">{human}</code>
                   ))}
-                {status === "active" && job.nextRunAt ? (
-                  <span className="text-muted">
-                    {/* nextRunAt 是未来时刻,但它会过期:调度器落后、容器没起、任务卡住时,
-                        后端回填的这个值可能已经落在过去。此时若照常渲染相对时间,用户会看到
-                        「下次 2 小时前」这种自相矛盾的话。过期一律说「即将执行」——
-                        它既诚实(确实该跑了还没跑)又不制造困惑。 */}
-                    {new Date(job.nextRunAt).getTime() <= Date.now() ? (
-                      "即将执行"
-                    ) : (
-                      <>
-                        下次 <TimeAgo value={job.nextRunAt} />
-                      </>
-                    )}
-                  </span>
-                ) : null}
+                {status === "active" ? <NextRunMeta nextRunAt={job.nextRunAt} /> : null}
               </div>
               {/* 三级：属性与历史。 */}
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-faint">

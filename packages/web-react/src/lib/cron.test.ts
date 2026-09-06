@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSchedule, cronHuman, scheduleToPreset } from "./cron";
+import { buildSchedule, cronHuman, describeNextRun, scheduleToPreset } from "./cron";
 
 describe("cronHuman", () => {
   it("每天定点", () => expect(cronHuman("0 9 * * *")).toBe("每天 09:00"));
@@ -78,5 +78,40 @@ describe("scheduleToPreset", () => {
     expect(scheduleToPreset("99 9 * * *")).toBeNull();
     expect(scheduleToPreset("")).toBeNull();
     expect(scheduleToPreset(undefined)).toBeNull();
+  });
+});
+
+describe("describeNextRun", () => {
+  const now = Date.parse("2026-09-07T12:00:00.000Z");
+
+  it("future → 下次 + 绝对 title", () => {
+    const at = new Date(now + 2 * 60 * 60_000).toISOString();
+    const d = describeNextRun(at, now);
+    expect(d.kind).toBe("future");
+    expect(d.label).toBe("下次");
+    expect(d.title).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+  });
+
+  it("overdue < 5min → 即将执行", () => {
+    const at = new Date(now - 2 * 60_000).toISOString();
+    const d = describeNextRun(at, now);
+    expect(d).toMatchObject({ kind: "soon", label: "即将执行" });
+    expect(d.title).toBeTruthy();
+  });
+
+  it("overdue ≥ 5min → 已过点 · 原定 HH:mm", () => {
+    const past = new Date(now - 90 * 60_000);
+    const d = describeNextRun(past.toISOString(), now);
+    const hh = String(past.getHours()).padStart(2, "0");
+    const mm = String(past.getMinutes()).padStart(2, "0");
+    expect(d.kind).toBe("overdue");
+    expect(d.label).toBe(`已过点 · 原定 ${hh}:${mm}`);
+    expect(d.title).toContain(`${hh}:${mm}`);
+  });
+
+  it("missing nextRunAt → 下次时间未知", () => {
+    expect(describeNextRun(null, now)).toEqual({ kind: "unknown", label: "下次时间未知" });
+    expect(describeNextRun(undefined, now)).toEqual({ kind: "unknown", label: "下次时间未知" });
+    expect(describeNextRun("", now)).toEqual({ kind: "unknown", label: "下次时间未知" });
   });
 });
