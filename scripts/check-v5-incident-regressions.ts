@@ -399,6 +399,10 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // 含 0276 Grok 用量/API-key cursor 直出/OCV5-121 queued consumer/#559 单测挂死修复/#560 看门狗;
   // 只豁免其不可变祖先,禁止 amend 源提交。
   "3dfd897f7e92d77588016931fea228cac993bf94",
+  // 2026-09-07 第二批正向同步冻结:selfhost 0a7068cd0 已上线(rel-0a7068cd0-20260906-191254);
+  // 含 d3ac73b5f Grok Build 周额度权重/663df73a3 API 接入分区 + 0277/反合商业 3f50647c4(#562-#564);
+  // 只豁免其不可变祖先,禁止 amend 源提交。
+  "0a7068cd04ec05a50881c2359a507de21a077262",
 ] as const;
 
 function checkTrailerClosure(): number {
