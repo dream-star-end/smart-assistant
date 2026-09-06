@@ -18,6 +18,7 @@ export const DESKTOP_ENGINE_NOT_ENABLED = "ENGINE_NOT_ENABLED";
 
 export const DESKTOP_TOKEN_MINT_PATH = "/api/desktop/token";
 export const DESKTOP_TOKEN_REFRESH_PATH = "/api/desktop/token/refresh";
+export const DESKTOP_RUNTIME_MANIFEST_PATH = "/api/desktop/runtime-manifest";
 
 export const DESKTOP_ALLOWED_PATHS = {
   messages: { method: "POST", path: "/v1/messages" },
@@ -28,6 +29,7 @@ export const DESKTOP_ALLOWED_PATHS = {
   catalogEpoch: { method: "GET", path: MODEL_CATALOG_EPOCH_PATH },
   tokenMint: { method: "POST", path: DESKTOP_TOKEN_MINT_PATH },
   tokenRefresh: { method: "POST", path: DESKTOP_TOKEN_REFRESH_PATH },
+  runtimeManifest: { method: "GET", path: DESKTOP_RUNTIME_MANIFEST_PATH },
 } as const;
 
 export type DesktopDispatchTarget =
@@ -38,7 +40,8 @@ export type DesktopDispatchTarget =
   | "catalog"
   | "catalogEpoch"
   | "tokenMint"
-  | "tokenRefresh";
+  | "tokenRefresh"
+  | "runtimeManifest";
 
 export function classifyDesktopPath(method: string, pathname: string): DesktopDispatchTarget | "engine_disabled" | "not_found" {
   const m = method.toUpperCase();
@@ -50,6 +53,7 @@ export function classifyDesktopPath(method: string, pathname: string): DesktopDi
   if (m === "GET" && pathname === MODEL_CATALOG_EPOCH_PATH) return "catalogEpoch";
   if (m === "POST" && pathname === DESKTOP_TOKEN_MINT_PATH) return "tokenMint";
   if (m === "POST" && pathname === DESKTOP_TOKEN_REFRESH_PATH) return "tokenRefresh";
+  if (m === "GET" && pathname === DESKTOP_RUNTIME_MANIFEST_PATH) return "runtimeManifest";
   return "not_found";
 }
 
@@ -79,5 +83,11 @@ export function pathnameOf(req: IncomingMessage): string {
 /** Token mint/refresh belong on master 18445 (same process as register). Egress 404s them. */
 export function desktopTokenAction(role: "master" | "egress", kind: DesktopDispatchTarget | "engine_disabled" | "not_found"): "handle" | "not_found" {
   if (kind !== "tokenMint" && kind !== "tokenRefresh") return "not_found";
+  return role === "egress" ? "not_found" : "handle";
+}
+
+/** Runtime manifest is master 18445 only. Egress 404s it. Public 443 uses the commercial router JWT path. */
+export function desktopRuntimeManifestAction(role: "master" | "egress", kind: DesktopDispatchTarget | "engine_disabled" | "not_found"): "handle" | "not_found" {
+  if (kind !== "runtimeManifest") return "not_found";
   return role === "egress" ? "not_found" : "handle";
 }

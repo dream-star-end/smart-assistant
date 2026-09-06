@@ -3,6 +3,7 @@ import { describe, test } from "node:test";
 import {
   DESKTOP_ENGINE_NOT_ENABLED,
   classifyDesktopPath,
+  desktopRuntimeManifestAction,
 } from "../http/desktopInternalDispatch.js";
 import { CODEX_RELAY_PREFIX, GROK_RELAY_PREFIX, ZCODE_RELAY_PREFIX } from "@openclaude/protocol";
 import { desktopAllowsEngine } from "../ws/containerTransportKind.js";
@@ -28,6 +29,16 @@ describe("desktop 18445 whitelist", () => {
     assert.equal(classifyDesktopPath("POST", "/api/desktop/token"), "tokenMint");
     assert.equal(classifyDesktopPath("POST", "/api/desktop/token/refresh"), "tokenRefresh");
     assert.equal(classifyDesktopPath("GET", "/api/desktop/token"), "not_found");
+  });
+
+  test("runtime-manifest GET is whitelisted on 18445; other methods/bootstrap are not", () => {
+    assert.equal(classifyDesktopPath("GET", "/api/desktop/runtime-manifest"), "runtimeManifest");
+    assert.equal(classifyDesktopPath("POST", "/api/desktop/runtime-manifest"), "not_found");
+    assert.equal(classifyDesktopPath("PUT", "/api/desktop/runtime-manifest"), "not_found");
+    assert.equal(classifyDesktopPath("GET", "/api/desktop/bootstrap"), "not_found");
+    assert.equal(desktopRuntimeManifestAction("master", "runtimeManifest"), "handle");
+    assert.equal(desktopRuntimeManifestAction("egress", "runtimeManifest"), "not_found");
+    assert.equal(desktopRuntimeManifestAction("master", "tokenMint"), "not_found");
   });
 
   test("W-01 desktop only allows ccb", () => {

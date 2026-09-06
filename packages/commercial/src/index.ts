@@ -124,6 +124,7 @@ import {
   handleDesktopTokenRefresh,
   desktopTokenRequestContext,
 } from "./http/desktopEnroll.js";
+import { handleDesktopRuntimeManifest } from "./http/desktopBootstrap.js";
 import { startDesktopTlsListener, makeDesktopRequestVerifier } from "./http/desktopTlsListener.js";
 import { makeDesktopIdentityStrategy } from "./auth/desktopIdentity.js";
 import { extractDesktopTlsContext } from "./desktop/tlsContext.js";
@@ -2647,6 +2648,7 @@ export async function registerCommercial(
             messages: deskMessages,
             tokenMint: (req, res) => handleDesktopTokenMint(req, res, desktopTokenRequestContext(req), deskHttpDeps),
             tokenRefresh: (req, res) => handleDesktopTokenRefresh(req, res, desktopTokenRequestContext(req), deskHttpDeps),
+            runtimeManifest: (req, res) => handleDesktopRuntimeManifest(req, res, desktopTokenRequestContext(req), deskHttpDeps),
             serverAuthored: makeServerAuthoredHandler({
               identityRepo,
               verify: deskVerify,

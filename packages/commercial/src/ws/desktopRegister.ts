@@ -4,7 +4,7 @@
 
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
-import { createHash } from "node:crypto";
+import { hashEmptyKeyring } from "../desktop/keyringFp.js";
 import WebSocket, { WebSocketServer } from "ws";
 import { query } from "../db/queries.js";
 import { getRuntimeChannel } from "../runtimeChannel.js";
@@ -247,6 +247,3 @@ function extractDeviceId(spiffe: string): string {
   return i >= 0 ? spiffe.slice(i + 1) : spiffe;
 }
 
-function hashEmptyKeyring(): string {
-  return createHash("sha256").update("openclaude-desktop-keyring").digest("hex");
-}
