@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { describe, test } from 'node:test'
 
 import { RuntimePluginContractError, validateRuntimePluginJson } from './contracts.js'
@@ -673,15 +675,20 @@ describe('official Zhihu Plugin', () => {
     assert.deepEqual(resolveZhihuWorkerResources('action'), {
       memoryBytes: 1024 * 1024 * 1024,
       memorySwapBytes: 1024 * 1024 * 1024,
-      pidsLimit: 128,
+      pidsLimit: 256,
       shmSizeBytes: 64 * 1024 * 1024,
     })
     assert.deepEqual(resolveZhihuWorkerResources('login'), {
       memoryBytes: 1536 * 1024 * 1024,
       memorySwapBytes: 1536 * 1024 * 1024,
-      pidsLimit: 256,
+      pidsLimit: 384,
       shmSizeBytes: 256 * 1024 * 1024,
     })
+    const launcherSource = readFileSync(
+      fileURLToPath(new URL('./zhihu.ts', import.meta.url)),
+      'utf8',
+    )
+    assert.match(launcherSource, /'\/tmp': 'rw,nosuid,nodev,noexec,size=512m,mode=0700/)
     const chunk = Buffer.concat([
       framed({ event: 'ready', runtime: 'zhihu-worker-v1', playwrightMcpVersion: '0.0.76' }),
       framed({ event: 'failed', code: 'WORKER_FAILED' }),
