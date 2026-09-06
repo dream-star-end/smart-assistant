@@ -7,6 +7,7 @@
  */
 
 import {
+  goalRequiredError,
   normalizeDelegateAgentId,
   normalizeDelegateModel,
   parseDelegateAllowSelf,
@@ -67,7 +68,7 @@ export function normalizeFanoutTasks(
     const item = raw[i] as Record<string, unknown> | null
     const goal = item && typeof item.goal === 'string' ? item.goal.trim() : ''
     if (!goal) {
-      return { ok: false, error: `第 ${i + 1} 个子任务缺少 goal` }
+      return { ok: false, error: `第 ${i + 1} 个子任务缺少 goal(${goalRequiredError(item)})` }
     }
     const effort =
       item && typeof item.effort === 'string' && EFFORT_ALLOW.has(item.effort)

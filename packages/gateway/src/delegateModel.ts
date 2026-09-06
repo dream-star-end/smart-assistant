@@ -24,6 +24,13 @@ export function isPlatformAgentId(id: string): boolean {
 
 export const SELF_DELEGATE_ERROR = '不能把任务委派给自己。确需自调用时请加 --allow-self'
 
+/**
+ * 缺 goal 的可自愈错误:告诉调用方**正确的字段名**,而不是只说 required。
+ * 以 `goal required` 开头保留旧前缀,兼容既有 grep/断言。
+ */
+export const DELEGATE_GOAL_REQUIRED_ERROR =
+  'goal required:唯一必填字段是 goal(任务描述字符串),字段名不是 task/message/prompt。最小示例 {"goal":"..."}'
+
 export function parseDelegateAllowSelf(raw: unknown): boolean {
   return raw === true || raw === 'true' || raw === '1'
 }

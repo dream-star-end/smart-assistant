@@ -48,7 +48,16 @@ describe('normalizeFanoutTasks — 入参校验', () => {
   it('某项缺 goal → 拒绝并指出第几项', () => {
     const r = normalizeFanoutTasks([{ goal: 'ok' }, { context: '无 goal' }])
     assert.equal(r.ok, false)
-    if (!r.ok) assert.match(r.error, /第 2 个/)
+    if (!r.ok) {
+      assert.match(r.error, /第 2 个/)
+      assert.match(r.error, /字段名不是 task\/message\/prompt/)
+    }
+  })
+
+  it('某项把任务写进 task 字段 → 点名改成 goal', () => {
+    const r = normalizeFanoutTasks([{ task: '写测试' }])
+    assert.equal(r.ok, false)
+    if (!r.ok) assert.match(r.error, /你填的 "task" 请改名为 "goal"/)
   })
 
   it('合法项规范化:effort 白名单外丢弃、toolsets 非字符串过滤、字段透传', () => {

@@ -46,6 +46,16 @@ export type ZcodeRelayStreamEvent = {
   text: string;
 };
 
+/** Cumulative upstream token usage for the whole turn (all /v1/messages calls
+ * behind one route token). OCV5-92: lets the container price the turn while
+ * it is still running and hard-stop at the admitted credit budget. */
+export type ZcodeRelayUsage = {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+};
+
 type ZcodeRelayStreamJournal = {
   seq: number;
   chars: number;
@@ -54,7 +64,59 @@ type ZcodeRelayStreamJournal = {
   cleanupTimer: NodeJS.Timeout | null;
   boundIp: string;
   authorizationHash: Buffer;
+  /** Sum of every completed message_start/message_delta pair so far. */
+  usageCompleted: ZcodeRelayUsage;
+  /** The in-flight message (message_start seen, final message_delta pending). */
+  usageCurrent: ZcodeRelayUsage | null;
 };
+
+const ZERO_USAGE: ZcodeRelayUsage = Object.freeze({
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_read_input_tokens: 0,
+  cache_creation_input_tokens: 0,
+});
+
+function asCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+}
+
+function usageFrom(raw: unknown): ZcodeRelayUsage | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const u = raw as Record<string, unknown>;
+  return {
+    input_tokens: asCount(u.input_tokens),
+    output_tokens: asCount(u.output_tokens),
+    cache_read_input_tokens: asCount(u.cache_read_input_tokens),
+    cache_creation_input_tokens: asCount(u.cache_creation_input_tokens),
+  };
+}
+
+function addUsage(a: ZcodeRelayUsage, b: ZcodeRelayUsage): ZcodeRelayUsage {
+  return {
+    input_tokens: a.input_tokens + b.input_tokens,
+    output_tokens: a.output_tokens + b.output_tokens,
+    cache_read_input_tokens: a.cache_read_input_tokens + b.cache_read_input_tokens,
+    cache_creation_input_tokens: a.cache_creation_input_tokens + b.cache_creation_input_tokens,
+  };
+}
+
+export function journalUsageSnapshot(journal: {
+  usageCompleted: ZcodeRelayUsage;
+  usageCurrent: ZcodeRelayUsage | null;
+}): ZcodeRelayUsage {
+  return journal.usageCurrent
+    ? addUsage(journal.usageCompleted, journal.usageCurrent)
+    : { ...journal.usageCompleted };
+}
+
+/** Fold an in-flight message into the completed total (message_stop or
+ * stream end). Idempotent when nothing is in flight. */
+function settleCurrentUsage(journal: ZcodeRelayStreamJournal): void {
+  if (!journal.usageCurrent) return;
+  journal.usageCompleted = addUsage(journal.usageCompleted, journal.usageCurrent);
+  journal.usageCurrent = null;
+}
 
 const streamJournals = new Map<string, ZcodeRelayStreamJournal>();
 
@@ -77,6 +139,8 @@ function journalFor(
       cleanupTimer: null,
       boundIp,
       authorizationHash: hashAuthorization(authorization),
+      usageCompleted: { ...ZERO_USAGE },
+      usageCurrent: null,
     };
     streamJournals.set(token, journal);
   }
@@ -85,6 +149,9 @@ function journalFor(
     journal.cleanupTimer = null;
   }
   journal.done = false;
+  // A new upstream call on the same route: whatever the previous call left
+  // in flight is complete by now.
+  settleCurrentUsage(journal);
   return journal;
 }
 
@@ -110,6 +177,36 @@ function acceptSseData(journal: ZcodeRelayStreamJournal, raw: string): void {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
     event = parsed as Record<string, unknown>;
   } catch {
+    return;
+  }
+  // Anthropic Messages usage: message_start carries input/cache counts and
+  // a provisional output; message_delta carries the final output count.
+  // Track them so the container can meter the turn before the CLI exits.
+  if (event.type === "message_start") {
+    settleCurrentUsage(journal);
+    const message = event.message && typeof event.message === "object" && !Array.isArray(event.message)
+      ? event.message as Record<string, unknown>
+      : null;
+    journal.usageCurrent = usageFrom(message?.usage) ?? { ...ZERO_USAGE };
+    return;
+  }
+  if (event.type === "message_delta") {
+    const usage = usageFrom(event.usage);
+    if (usage) {
+      const current = journal.usageCurrent ?? { ...ZERO_USAGE };
+      journal.usageCurrent = {
+        // message_delta.usage may omit input fields; keep message_start's.
+        input_tokens: usage.input_tokens || current.input_tokens,
+        output_tokens: Math.max(usage.output_tokens, current.output_tokens),
+        cache_read_input_tokens: usage.cache_read_input_tokens || current.cache_read_input_tokens,
+        cache_creation_input_tokens:
+          usage.cache_creation_input_tokens || current.cache_creation_input_tokens,
+      };
+    }
+    return;
+  }
+  if (event.type === "message_stop") {
+    settleCurrentUsage(journal);
     return;
   }
   const delta = event.delta && typeof event.delta === "object" && !Array.isArray(event.delta)
@@ -178,6 +275,7 @@ class ZcodeRelaySseTap extends Transform {
 
 function finishJournal(token: string, journal: ZcodeRelayStreamJournal): void {
   journal.done = true;
+  settleCurrentUsage(journal);
   journal.cleanupTimer = setTimeout(() => {
     if (streamJournals.get(token) === journal) streamJournals.delete(token);
   }, ZCODE_RELAY_STREAM_TTL_MS);
@@ -294,7 +392,12 @@ export function makeZcodeRelayHandler(deps: {
       res.statusCode = 200;
       res.setHeader("content-type", "application/json; charset=utf-8");
       res.setHeader("cache-control", "no-store");
-      res.end(JSON.stringify({ events, next, done: journal?.done === true }));
+      res.end(JSON.stringify({
+        events,
+        next,
+        done: journal?.done === true,
+        ...(journal ? { usage: journalUsageSnapshot(journal) } : {}),
+      }));
       return;
     }
     if (method !== "POST") {

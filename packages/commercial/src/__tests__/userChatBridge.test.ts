@@ -1891,6 +1891,10 @@ describe("userChatBridge — model authorization", () => {
       await new Promise<void>((resolve) => ws.once("open", () => resolve()));
       await containerOpenP;
       const seenBefore = rig.containerSeen.length;
+      const browserFrames: Record<string, unknown>[] = [];
+      ws.on("message", (data) => {
+        try { browserFrames.push(JSON.parse(data.toString()) as Record<string, unknown>); } catch { /* ignore */ }
+      });
       ws.send(JSON.stringify({
         type: "inbound.message",
         channel: "webchat",
@@ -1936,7 +1940,11 @@ describe("userChatBridge — model authorization", () => {
       const findForwarded = () => rig.containerSeen.slice(seenBefore)
         .map(({ data }) => JSON.parse(data.toString()) as Record<string, unknown>)
         .find((frame) => frame.clientMessageId === "m-current-turn");
-      await waitFor(() => findForwarded() !== undefined);
+      try {
+        await waitFor(() => findForwarded() !== undefined, 5000);
+      } catch (error) {
+        throw new Error(`container never received the forwarded turn within 5s; browser frames=${JSON.stringify(browserFrames)}`, { cause: error });
+      }
       const forwarded = findForwarded()!;
       assert.equal(forwarded.model, DEFAULT_CODEX_ENGINE_MODEL);
       assert.deepEqual(order, ["persist", "history"]);
@@ -3460,6 +3468,49 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(source, /closePendingZcodeAudits/);
     assert.match(source, /isCursorModel\(authorityModelForFrame\)/);
     assert.match(source, /isZcodeModel\(authorityModelForFrame\)/);
+  });
+
+  test("OCV5-92: every base engine inbound carries a master-owned _creditBudget and ZCode gates on balance", async () => {
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+
+    // ZCode: same 0-balance hard reject as Cursor, budget written after the spread.
+    const zcodeStart = source.indexOf("if (isZcodeInboundFrame && containerId !== undefined)");
+    const zcodeEnd = source.indexOf("if (\n        isCodexInboundFrame &&", zcodeStart);
+    assert.notEqual(zcodeStart, -1);
+    const zcodeBranch = source.slice(zcodeStart, zcodeEnd);
+    assert.match(zcodeBranch, /zcodeSpendable = await readTotalSpendableBalance\(uid\)/);
+    assert.match(zcodeBranch, /if \(zcodeSpendable <= 0n\)/);
+    assert.match(zcodeBranch, /rejectPromptQueueDispatch\('ERR_INSUFFICIENT_CREDITS'\)/);
+    assert.match(zcodeBranch, /failDispatchPreForward\(dispatchRecord, 'insufficient_credits'\)/);
+    assert.match(zcodeBranch, /sendErrorFrame\(\s*userWs,\s*'ERR_INSUFFICIENT_CREDITS'/);
+    // Lookup failure is a hard reject for ZCode (settled after the fact, no per-request 402 floor).
+    assert.match(zcodeBranch, /failDispatchPreForward\(dispatchRecord, 'zcode_spendable_unavailable'\)/);
+    assert.match(zcodeBranch, /\.\.\.enriched,[\s\S]*?_creditBudget: zcodeSpendable\.toString\(\)/);
+    // Balance gate runs before a relay route is minted.
+    assert.ok(
+      zcodeBranch.indexOf("if (zcodeSpendable <= 0n)") < zcodeBranch.indexOf("deps.mintZcodeRoute("),
+      "zcode balance gate must precede mintZcodeRoute",
+    );
+
+    // CCB: budget injected after the spread; lookup failure fails open (per-request 402 remains).
+    const ccbStart = source.indexOf("let ccbSpendable: bigint | null = null;");
+    assert.notEqual(ccbStart, -1);
+    const ccbBranch = source.slice(ccbStart, source.indexOf("dispatchAuthorityField(dispatchRecordC)", ccbStart));
+    assert.match(ccbBranch, /ccbSpendable = await readTotalSpendableBalance\(uid\)/);
+    assert.match(ccbBranch, /ccb spendable lookup failed, fail-open/);
+    assert.match(
+      ccbBranch,
+      /\.\.\.enrichedParsed,[\s\S]*?\.\.\.\(ccbSpendable !== null \? \{ _creditBudget: ccbSpendable\.toString\(\) \} : \{\}\)/,
+    );
+    assert.doesNotMatch(ccbBranch, /ERR_INSUFFICIENT_CREDITS/);
+
+    // Sanitize step strips a browser-forged _creditBudget before any engine path.
+    assert.match(source, /hasClientCreditBudget = Object\.prototype\.hasOwnProperty\.call\(\s*sanitizedParsed,\s*"_creditBudget",?\s*\)/);
+    assert.match(source, /if \(hasClientCreditBudget\) \{\s*delete sanitizedParsed\._creditBudget;/);
+
+    // Cursor / Grok / Codex paths keep their existing injection.
+    assert.match(source, /_creditBudget: cursorSpendable\.toString\(\)/);
+    assert.ok((source.match(/_creditBudget:/g) ?? []).length >= 4, "cursor, grok/codex, zcode and ccb must all inject _creditBudget");
   });
 
   test("Cursor accepts only an active row on the trusted self host", async () => {

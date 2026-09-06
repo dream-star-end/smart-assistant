@@ -347,16 +347,21 @@ async function avatarMenuPeopleToken(page) {
   }
 }
 async function editRedirectPeopleToken(page) {
+  let probe = null;
   try {
     return await withTimeout((async () => {
-      await page.goto('https://www.zhihu.com/people/edit', { waitUntil: 'domcontentloaded', timeout: 20_000 });
-      await page.waitForTimeout(800);
-      const token = peopleTokenFromPath(new URL(page.url()).pathname);
-      emitStep({ step: 'login.edit_redirect', ok: !!token, pathname: urlPathname(page.url()) });
+      const ctx = page.context();
+      probe = await ctx.newPage();
+      await probe.goto('https://www.zhihu.com/people/edit', { waitUntil: 'domcontentloaded', timeout: 20_000 });
+      await probe.waitForTimeout(800);
+      const token = peopleTokenFromPath(new URL(probe.url()).pathname);
+      emitStep({ step: 'login.edit_redirect', ok: !!token, pathname: urlPathname(probe.url()) });
       return token;
     })(), 30_000, null);
   } catch {
     return null;
+  } finally {
+    if (probe) await probe.close().catch(() => {});
   }
 }
 async function selfTokenFromPage(page) {
@@ -461,7 +466,17 @@ async function arriveInSite(page, target) {
   let branch = 'home';
   let finished = false;
   try {
-    if (currentPath() !== '/') await gotoAuthenticated(page, 'https://www.zhihu.com/');
+    if (currentPath() !== '/') {
+      await page.goto('https://www.zhihu.com/', { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
+      if (currentPath() !== '/') {
+        branch = 'home-stuck';
+        emitStep({ step: 'nav.arrive', ok: false, branch, pathname: String(currentPath()).slice(0, 96) });
+        await gotoAuthenticated(page, url);
+        emitArrive(true, branch);
+        await humanPause(page, 1500, 3000);
+        return;
+      }
+    }
     const searchBox = await uniqueVisible(page.locator('input[type="text"][placeholder*="搜索"], .SearchBar-input, input#Popover1-toggle'));
     let arrived = false;
     if (searchBox) {

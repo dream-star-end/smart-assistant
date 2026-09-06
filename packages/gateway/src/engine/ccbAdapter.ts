@@ -20,6 +20,7 @@ import { EventEmitter } from 'node:events'
 import { TURN_LEASE_RENEW_AFTER_MS, type GoalStateSnapshot, type JobTerminal } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
+import { CREDIT_EXHAUSTED_DETAIL, CreditBudgetGuard } from '../creditExhaustion.js'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import {
   SubprocessRunner,
@@ -208,6 +209,9 @@ interface CcbTurnContext {
    */
   pendingPermissionRequestIds: Set<string>
   stopLeaseRenewal?: () => void
+  /** OCV5-92: master-admitted spendable budget → hard-stop mid-turn. */
+  creditGuard: CreditBudgetGuard
+  creditErrorEmitted: boolean
 }
 
 function toPhantomSignals(telemetry: TelemetryChannel): PhantomSignals {
@@ -219,7 +223,40 @@ function buildTurnSummary(
   result: TurnResult,
   telemetry: TelemetryChannel,
   nativeCompactionSummary?: string,
+  creditExhausted = false,
 ): TurnSummary {
+  if (creditExhausted) {
+    // Our own interrupt lands as CCB's cooperative-abort diagnostic (an
+    // error_during_execution result). Relabel it as credit exhaustion so the
+    // browser gets the top-up card and sessionManager does not treat it as a
+    // user Stop. CCB egress is per-request settled by the proxy, so the
+    // already-consumed requests are charged regardless of this label.
+    return {
+      usage: {
+        cost: result.cost,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        cacheReadTokens: result.cacheReadTokens,
+        cacheCreationTokens: result.cacheCreationTokens,
+        totalTokens: result.totalTokens,
+      },
+      assistantText: result.assistantText,
+      thinkingText: result.thinkingText,
+      assistantSegments: result.assistantSegments,
+      thinkingSegments: result.thinkingSegments,
+      tools: result.tools,
+      runtimeEvents: result.runtimeEvents,
+      stopReason: 'error',
+      numTurns: result.numTurns,
+      isError: true,
+      ...(nativeCompactionSummary ? { nativeCompactionSummary } : {}),
+      errorKind: 'other',
+      errorClass: 'insufficient_credits',
+      errorDetail: CREDIT_EXHAUSTED_DETAIL,
+      staleResumeId: false,
+      phantomSignals: toPhantomSignals(telemetry),
+    }
+  }
   const errorKind = classifyCcbErrorKind(result)
   const apiResp = telemetry.getTurnApiResponse()
   const lastTool = telemetry.getLastToolPreUse()
@@ -402,7 +439,31 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         if (e.kind === 'permission_request' && e.request.requestId) {
           ctx.pendingPermissionRequestIds.add(e.request.requestId)
         }
+        // Budget hard-stop: swallow the raw abort diagnostic and emit exactly
+        // one normalized insufficient_credits error ahead of `final`, mirroring
+        // grok/cursor so the browser shows the top-up card.
+        if (ctx.creditGuard.isExhausted) {
+          if (e.kind === 'error') return
+          if (e.kind === 'final' && !ctx.creditErrorEmitted) {
+            ctx.creditErrorEmitted = true
+            params.onEvent({
+              kind: 'error',
+              error: CREDIT_EXHAUSTED_DETAIL,
+              errorClass: 'insufficient_credits',
+            })
+          }
+        }
         params.onEvent(e as EngineEvent)
+        if (e.kind === 'usage') {
+          // Parser live usage is the per-turn cumulative (completed calls +
+          // current call), so a single snapshot prices the whole turn so far.
+          ctx.creditGuard.observe({
+            inputTokens: e.usage.inputTokens ?? 0,
+            outputTokens: e.usage.outputTokens ?? 0,
+            cacheReadTokens: e.usage.cacheReadTokens ?? 0,
+            cacheCreationTokens: e.usage.cacheCreationTokens ?? 0,
+          })
+        }
       },
       assistantMessageId: params.assistantMessageId,
       thinkingMessageId: params.thinkingMessageId,
@@ -428,7 +489,16 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         // activeTurn 仍指向本 turn 才清(防 stale end 误清后继 turn)。
         if (this._activeTurn === ctx) this._activeTurn = null
         ctx.stopLeaseRenewal?.()
-        resolveSummary(result ? buildTurnSummary(result, telemetry, nativeCompactionSummary) : null)
+        resolveSummary(
+          result
+            ? buildTurnSummary(
+                result,
+                telemetry,
+                nativeCompactionSummary,
+                ctx.creditGuard.isExhausted,
+              )
+            : null,
+        )
       },
       // CCB 成本 delta 基线:parser 直接 mutate session 引用,行为逐字节不变
       // (见 TurnParams.sessionTotals / CcbSessionTotals 注释)。
@@ -440,7 +510,25 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       telemetry,
       ownedBashToolUseIds: new Set(),
       pendingPermissionRequestIds: new Set(),
+      creditGuard: null as unknown as CreditBudgetGuard,
+      creditErrorEmitted: false,
     }
+    ctx.creditGuard = new CreditBudgetGuard({
+      budgetFen: params.creditBudgetFen,
+      modelId: () => this.model,
+      // CCB egress settles at catalog price per request (proxyBilling); no
+      // agent_cost_overrides composition on this path.
+      composeAgentMultiplier: false,
+      isLive: () => this._activeTurn === ctx && !ctx.parser.finalized,
+      onExhausted: () => {
+        log.warn('ccb turn aborted: credit budget exhausted', {
+          harness: this.harness,
+          budgetFen: params.creditBudgetFen?.toString(),
+        })
+        // Same cooperative wire as a user Stop (stdin control_request).
+        this.runner.interrupt()
+      },
+    })
     this._routeTurn = ctx
     this._interrupting = false
     // InlinePush must not treat a not-yet-ingested parent turn as live.

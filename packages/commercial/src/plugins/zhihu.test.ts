@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { describe, test } from 'node:test'
 
 import { RuntimePluginContractError, validateRuntimePluginJson } from './contracts.js'
@@ -122,7 +124,7 @@ function compileSnapshotGuardHarness(
 
 describe('official Zhihu Plugin', () => {
   test('pins the current artifact and compiles a stable hash', () => {
-    assert.equal(ZHIHU_PLUGIN_VERSION, '1.1.0')
+    assert.equal(ZHIHU_PLUGIN_VERSION, '1.1.1')
     assert.equal(ZHIHU_DRIVER_VERSION, ZHIHU_PLUGIN_VERSION)
     assert.equal(ZHIHU_LAUNCHER_VERSION, ZHIHU_PLUGIN_VERSION)
     assert.match(COMPILED_ZHIHU_PLUGIN.artifactHash, /^[0-9a-f]{64}$/)
@@ -513,6 +515,7 @@ describe('official Zhihu Plugin', () => {
     assert.match(ZHIHU_WORKER_SOURCE, /disable-blink-features=AutomationControlled/)
     assert.match(ZHIHU_WORKER_SOURCE, /Accept-Language/)
     assert.match(ZHIHU_WORKER_SOURCE, /nav\.arrive/)
+    assert.match(ZHIHU_WORKER_SOURCE, /home-stuck/)
     assert.match(ZHIHU_WORKER_SOURCE, /browser\.launch/)
     assert.match(ZHIHU_WORKER_SOURCE, /login\.self_token/)
     assert.match(ZHIHU_WORKER_SOURCE, /humanPause/)
@@ -673,15 +676,20 @@ describe('official Zhihu Plugin', () => {
     assert.deepEqual(resolveZhihuWorkerResources('action'), {
       memoryBytes: 1024 * 1024 * 1024,
       memorySwapBytes: 1024 * 1024 * 1024,
-      pidsLimit: 128,
+      pidsLimit: 256,
       shmSizeBytes: 64 * 1024 * 1024,
     })
     assert.deepEqual(resolveZhihuWorkerResources('login'), {
       memoryBytes: 1536 * 1024 * 1024,
       memorySwapBytes: 1536 * 1024 * 1024,
-      pidsLimit: 256,
+      pidsLimit: 384,
       shmSizeBytes: 256 * 1024 * 1024,
     })
+    const launcherSource = readFileSync(
+      fileURLToPath(new URL('./zhihu.ts', import.meta.url)),
+      'utf8',
+    )
+    assert.match(launcherSource, /'\/tmp': 'rw,nosuid,nodev,noexec,size=512m,mode=0700/)
     const chunk = Buffer.concat([
       framed({ event: 'ready', runtime: 'zhihu-worker-v1', playwrightMcpVersion: '0.0.76' }),
       framed({ event: 'failed', code: 'WORKER_FAILED' }),

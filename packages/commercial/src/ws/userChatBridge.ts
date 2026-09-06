@@ -5817,17 +5817,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sanitizedParsed,
               "_workspaceMode",
             );
+            // `_creditBudget` is master-owned (OCV5-92): engine paths overwrite
+            // it after the spread, but the CCB path only injects on a successful
+            // balance lookup, so a client-supplied value must die here.
+            const hasClientCreditBudget = Object.prototype.hasOwnProperty.call(
+              sanitizedParsed,
+              "_creditBudget",
+            );
             if (
               (rawClientTrace !== undefined && !clientHint.ok) ||
               hasClientCodexRoute ||
               hasClientGrokRoute ||
               hasClientZcodeRoute ||
               hasClientWorkspaceMode ||
+              hasClientCreditBudget ||
               teamModeMain
             ) {
               sanitizedParsed = { ...sanitizedParsed };
               if (rawClientTrace !== undefined && !clientHint.ok) {
                 delete sanitizedParsed.clientTraceId;
+              }
+              if (hasClientCreditBudget) {
+                delete sanitizedParsed._creditBudget;
               }
               if (hasClientCodexRoute) {
                 delete sanitizedParsed.__oc_codex_route;
@@ -6133,6 +6144,35 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account', zcodeTurnIdentity);
               return;
             }
+            // OCV5-92: same balance gate + spendable budget as Cursor. ZCode
+            // is settled after the fact (zcodeCatalogSettle clamp), so without
+            // this a 0-balance wallet could still start a turn and any turn
+            // could run past its balance for free.
+            let zcodeSpendable: bigint;
+            try {
+              zcodeSpendable = await readTotalSpendableBalance(uid);
+            } catch (err) {
+              logCapture?.error('user-chat-bridge: zcode spendable lookup failed', { err });
+              rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
+              failDispatchPreForward(dispatchRecord, 'zcode_spendable_unavailable');
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode billing is temporarily unavailable', zcodeTurnIdentity);
+              }
+              return;
+            }
+            if (zcodeSpendable <= 0n) {
+              rejectPromptQueueDispatch('ERR_INSUFFICIENT_CREDITS');
+              failDispatchPreForward(dispatchRecord, 'insufficient_credits');
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  'ERR_INSUFFICIENT_CREDITS',
+                  `insufficient credits: balance=${zcodeSpendable} required=1`,
+                  zcodeTurnIdentity,
+                );
+              }
+              return;
+            }
             let minted: { token: string; baseUrl: string };
             try {
               minted = await deps.mintZcodeRoute({
@@ -6181,6 +6221,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               ...enriched,
               requestId,
               traceId: traceCapture,
+              // After the spread so a browser-forged budget cannot survive.
+              _creditBudget: zcodeSpendable.toString(),
               __oc_zcode_route: { baseUrl: minted.baseUrl, routeToken: minted.token },
               ...authorityFields,
               ...dispatchAuthorityField(dispatchRecord),
@@ -7279,9 +7321,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               authorityFields = sealed;
             }
             if (cleaned) { failDispatchPreForward(dispatchRecordC, "bridge_cleaned"); return; }
+            // OCV5-92: CCB egress is settled per request by the anthropic proxy
+            // (balance>0 admits, clamp on finalize), so a single agentic turn
+            // could still overshoot its wallet by up to one request per loop
+            // iteration. Hand the container the spendable balance so the
+            // adapter hard-stops as soon as cumulative cost reaches it.
+            // Lookup failure fails open (per-request 402 remains the floor).
+            let ccbSpendable: bigint | null = null;
+            if (deps.pgPool) {
+              try {
+                ccbSpendable = await readTotalSpendableBalance(uid);
+              } catch (err) {
+                turnLogCapture?.warn("user-chat-bridge: ccb spendable lookup failed, fail-open", { err });
+              }
+            }
             const rewrittenObj = {
               ...enrichedParsed,
               traceId: turnTraceIdCapture,
+              // After the spread so a browser-forged budget cannot survive.
+              ...(ccbSpendable !== null ? { _creditBudget: ccbSpendable.toString() } : {}),
               ...authorityFields,
               // durable dispatch envelope(容器 durable inbox 准入 + at-most-once)。
               ...dispatchAuthorityField(dispatchRecordC),
