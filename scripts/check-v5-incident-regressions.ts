@@ -395,6 +395,10 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // 2026-09-06 全量正向同步冻结:selfhost 30ef9a3e4 已上线(rel-30ef9a3e4-20260906-021259);
   // 含 0269-0274 计费/Fable5 下架/GPT-6 队长引擎;只豁免其不可变祖先,禁止 amend 源提交。
   "30ef9a3e4c2d8fd290c1c38951381e264a2c25ba",
+  // 2026-09-06 全量正向同步冻结:selfhost 3dfd897f7 已上线(rel-3dfd897f7-20260906-132423);
+  // 含 0276 Grok 用量/API-key cursor 直出/OCV5-121 queued consumer/#559 单测挂死修复/#560 看门狗;
+  // 只豁免其不可变祖先,禁止 amend 源提交。
+  "3dfd897f7e92d77588016931fea228cac993bf94",
 ] as const;
 
 function checkTrailerClosure(): number {
