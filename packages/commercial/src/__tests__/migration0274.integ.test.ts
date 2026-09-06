@@ -21,7 +21,7 @@ const sqlPath = path.resolve(here, "../db/migrations/0274_desktop_tunnel_owners.
 describe("0274 desktop_tunnel_owners", () => {
   test("SQL is fail-loud: no IF NOT EXISTS on CREATE TABLE, has preflight", async () => {
     const sql = await readFile(sqlPath, "utf8");
-    assert.match(sql, /order-dependency:\s*none/);
+    assert.match(sql, /order-dependency:\s*0273_chatgpt_proxy_credentials/);
     assert.match(sql, /RAISE EXCEPTION '0274 fail-loud/);
     assert.doesNotMatch(sql, /CREATE TABLE IF NOT EXISTS desktop_tunnel_owners/i);
     const stmts = splitSqlStatements(sql);
