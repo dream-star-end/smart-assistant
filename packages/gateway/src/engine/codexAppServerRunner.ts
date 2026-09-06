@@ -224,6 +224,11 @@ export interface CodexAppServerRunnerOpts {
    *  must ensure this is a codex thread_id, not a CCB session id; sessionManager
    *  enforces this via provider-tagged resume map. */
   resumeSessionId?: string
+  /** Durable-artifact ladder hook: when thread/resume fails with "no rollout
+   *  found" for `staleThreadId`, return a prior thread id whose rollout still
+   *  exists (or undefined). Lets a container rebuild that lost only the newest
+   *  rollout keep the conversation instead of thread/start from scratch. */
+  resolveResumeFallback?: (staleThreadId: string) => string | undefined
   /** Agent model id from agents.yaml (e.g. `gpt-5-codex`). Forwarded to
    *  thread/start/resume so codex picks the right model. */
   model?: string
@@ -1437,6 +1442,14 @@ export class CodexAppServerRunner extends EventEmitter {
     this.syncedPlatformGoalSignature = null
     this.syncedPlatformGoal = null
     this.cleanupLaunchOverrides()
+  }
+
+  /** Steer the next attach at a prior thread whose rollout is known to exist
+   *  on disk. Same bookkeeping as clearSessionId, but with a target id so the
+   *  next runTurn does thread/resume instead of thread/start. */
+  setResumeSessionId(sessionId: string): void {
+    this.clearSessionId()
+    this.threadId = sessionId
   }
 
   /** 读当前 session 的 repo snapshot。turn 顶部一次取,贯穿 ensureSpawned /
@@ -3957,13 +3970,45 @@ export class CodexAppServerRunner extends EventEmitter {
             // schema drift, etc.) re-throws so the outer catch surfaces it
             // as ok=false rather than masking it with a fresh thread.
             if (!isMissingRolloutError(err)) throw err
-            log.warn('codex thread/resume missing rollout — restarting fresh', {
-              sessionKey: this.opts.sessionKey,
-              staleThreadId: this.threadId,
-              rpcMessage: (err as JsonRpcCallError).rpcMessage,
-            })
-            this.threadId = null
-            await this._startNewThread(effectiveCwd)
+            const staleThreadId = this.threadId
+            const fallback = staleThreadId
+              ? this.opts.resolveResumeFallback?.(staleThreadId)
+              : undefined
+            if (fallback && fallback !== staleThreadId) {
+              log.warn('codex thread/resume missing rollout — resuming prior durable thread', {
+                sessionKey: this.opts.sessionKey,
+                staleThreadId,
+                fallbackThreadId: fallback,
+              })
+              this.threadId = fallback
+              try {
+                await this.sendRequest('thread/resume', {
+                  threadId: fallback,
+                  approvalPolicy: 'never',
+                  sandbox: 'danger-full-access',
+                  cwd: effectiveCwd,
+                  ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
+                })
+                this.emit('session_id', fallback)
+                this.attached = true
+              } catch (err2) {
+                if (!isMissingRolloutError(err2)) throw err2
+                log.warn('codex fallback thread also missing rollout — restarting fresh', {
+                  sessionKey: this.opts.sessionKey,
+                  fallbackThreadId: fallback,
+                })
+                this.threadId = null
+                await this._startNewThread(effectiveCwd)
+              }
+            } else {
+              log.warn('codex thread/resume missing rollout — restarting fresh', {
+                sessionKey: this.opts.sessionKey,
+                staleThreadId,
+                rpcMessage: (err as JsonRpcCallError).rpcMessage,
+              })
+              this.threadId = null
+              await this._startNewThread(effectiveCwd)
+            }
           }
         }
         this.attached = true

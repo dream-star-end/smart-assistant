@@ -811,6 +811,11 @@ export interface SubprocessRunnerOpts {
   harness?: 'ccb' | 'official-cc'
   permissionMode?: string
   resumeSessionId?: string // 续上之前的 CCB session
+  /** Engine-agnostic durable-artifact ladder: given the native id the engine
+   *  just declared stale, return a prior id for the SAME engine whose transcript
+   *  still exists on disk (or undefined). Consumed by engines that self-heal a
+   *  stale resume inside their own turn loop (codex thread/resume). */
+  resolveResumeFallback?: (staleId: string) => string | undefined
   // Per-agent overrides
   agentProvider?: string // 覆盖 config.provider
   agentMcpServers?: McpServerConfig[] // agent 专属 MCP servers
@@ -1242,6 +1247,11 @@ export class SubprocessRunner extends EventEmitter {
    *  restart and perpetually crashes. */
   clearSessionId(): void {
     this.currentSessionId = null
+  }
+
+  /** Steer the next spawn's `--resume` at a known-durable prior id. */
+  setResumeSessionId(sessionId: string): void {
+    this.currentSessionId = sessionId
   }
 
   /** Update config (e.g. after OAuth token refresh). Takes effect on next start(). */

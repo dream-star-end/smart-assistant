@@ -414,6 +414,14 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     this.opts.resumeSessionId = undefined
     this.inner.clearSessionId()
   }
+  setResumeSessionId(sessionId: string): void {
+    // Prefixed id (sand-ccb:/sand-official-cc:/bare native) must match the
+    // live variant; a foreign-variant id is a clear, not a steer.
+    const inner = resumeForVariant(sessionId, this.variant)
+    if (!inner) { this.clearSessionId(); return }
+    this.opts.resumeSessionId = sessionId
+    this.inner.setResumeSessionId?.(inner)
+  }
 
   requiresReopenForModel(model: string | undefined): boolean {
     return cursorVariantFor(model, this.credentialSelection, this.opts.executionTarget) !== this.variant

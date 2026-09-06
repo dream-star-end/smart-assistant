@@ -43,6 +43,7 @@ import {
   usableCursorResumeId,
 } from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
+import { RESUME_HISTORY_MAX, pickResumableId, probeResumeArtifact } from './engine/resumeArtifacts.js'
 import type {
   AutomaticRetryState,
   CollabAgentPolicy,
@@ -2061,6 +2062,7 @@ export class SessionManager {
         this._resumeMapProvider.delete(sessionKey)
         this._resumeMapLastCost.delete(sessionKey)
         this._resumeMapCostImprecise.delete(sessionKey)
+        this._resumeMapHistory.delete(sessionKey)
         session.ccbSessionId = null
         session.runner.clearSessionId?.()
         this._saveResumeMap()
@@ -2809,6 +2811,7 @@ export class SessionManager {
       this._resumeMapProvider.delete(session.sessionKey)
       this._resumeMapLastCost.delete(session.sessionKey)
       this._resumeMapCostImprecise.delete(session.sessionKey)
+      this._resumeMapHistory.delete(session.sessionKey)
       session.ccbSessionId = null
       session.runner.clearSessionId?.()
       this._saveResumeMap()
@@ -2948,8 +2951,71 @@ export class SessionManager {
   // when the same sessionKey is later served by a different provider.
   // Legacy entries without explicit provider are treated as 'ccb' on load.
   private _resumeMapProvider = new Map<string, string>()
+  /** Parallel map: sessionKey → prior native ids for the SAME provider, newest
+   *  first, bounded by RESUME_HISTORY_MAX. This is the fallback ladder for
+   *  "the head id never produced a durable transcript" (CLI emitted session_id
+   *  then died / container rebuilt mid-spawn). Persisted as `history` in
+   *  resume-map.json. Cleared whenever the provider changes or the entry is
+   *  intentionally reset (model switch, context_too_long, destroy). */
+  private _resumeMapHistory = new Map<string, string[]>()
   // Serialized write queue to prevent concurrent writeFile race conditions
   private _resumeMapWrite: Promise<void> = Promise.resolve()
+
+  /** Push `prev` onto the history ladder for `key` (dedup, newest first, bounded). */
+  private _pushResumeHistory(key: string, prev: string | undefined | null): void {
+    if (!prev) return
+    const cur = this._resumeMapHistory.get(key) ?? []
+    const next = [prev, ...cur.filter((x) => x !== prev)].slice(0, RESUME_HISTORY_MAX)
+    this._resumeMapHistory.set(key, next)
+  }
+
+  /** Remove every resume-map projection for `key` (id, ts, provider, cost, history). */
+  private _forgetResumeEntry(key: string): void {
+    this._resumeMap.delete(key)
+    this._resumeMapTimestamps.delete(key)
+    this._resumeMapProvider.delete(key)
+    this._resumeMapLastCost.delete(key)
+    this._resumeMapCostImprecise.delete(key)
+    this._resumeMapHistory.delete(key)
+  }
+
+  /**
+   * Engine-agnostic durable-artifact fallback. When the mapped head id has no
+   * durable transcript on disk, walk the per-session history ladder and promote
+   * the newest id that positively exists. Returns the id to resume with, or
+   * undefined when nothing on the ladder is resumable (caller then falls back
+   * to history replay exactly as before).
+   *
+   * Head ids whose artifact is *unknown* (engine we cannot probe, unreadable fs)
+   * are returned as-is — conservative, same as `_ccbJsonlExists`.
+   */
+  private _resolveDurableResumeId(
+    sessionKey: string,
+    provider: string,
+    head: string | undefined,
+    workspacePath?: string,
+  ): string | undefined {
+    const history = this._resumeMapHistory.get(sessionKey) ?? []
+    const picked = pickResumableId(provider, head, history, { workspacePath })
+    if (!picked) return undefined
+    if (picked.fromHistory) {
+      log.warn('resume-map head has no durable transcript — promoting prior id from history', {
+        sessionKey,
+        provider,
+        staleId: head ?? null,
+        promotedId: picked.id,
+        artifact: picked.probe.path,
+      })
+      // Promote in place: the dead head is dropped (not kept in history — it
+      // has nothing to resume), the promoted id becomes head, remaining
+      // history keeps only ids older than the promoted one.
+      const idx = history.indexOf(picked.id)
+      this._resumeMap.set(sessionKey, picked.id)
+      this._resumeMapHistory.set(sessionKey, history.slice(idx + 1))
+      this._saveResumeMap()
+    }
+    return picked.id
+  }
 
   /** Provider name for CCB-backed runners (default). Used as the fallback
    *  tag when an on-disk resume-map entry omits `provider` (legacy format). */
@@ -2968,69 +3034,56 @@ export class SessionManager {
    *  produced by `wantProvider`. Cross-provider mismatches return undefined
    *  so we never feed a CCB session_id to codex (or vice versa).
    *
-   *  For CCB, also validate that the session's JSONL file exists on disk.
-   *  If the file was wiped (e.g. CLAUDE_CONFIG_DIR projects directory was
-   *  reset — pre-2026-04-22 tmpfs on v3 containers was ephemeral),
-   *  pretending to --resume yields a "No conversation found with session ID"
-   *  crash and a scary "AI 进程异常退出" banner. Pre-detect and drop the
-   *  entry so the next spawn starts a fresh session silently — UI history
-   *  stays visible (it lives in the DB), but CCB has no memory of previous
-   *  turns (unavoidable when the JSONL is gone). */
+   *  Durable-artifact gate (all engines): the head id must have a transcript
+   *  on disk (CCB / Cursor Sand JSONL, Codex rollout, Grok session dir, native
+   *  Cursor store.db at the spawn cwd). When it does not — the CLI emitted
+   *  `session_id` and died before writing, or the container was rebuilt
+   *  mid-spawn — walk the per-session history ladder and promote the newest
+   *  prior id whose artifact exists, instead of dropping straight to lossy
+   *  history replay. Only when nothing on the ladder is resumable is the
+   *  entry dropped (UI history stays visible in the DB; the engine simply has
+   *  no native memory — unavoidable when every transcript is gone).
+   *
+   *  Native Cursor keeps its special case: a store.db missing at *this* cwd is
+   *  first a hash-relocation problem, not staleness. */
   private _resumeIdFor(sessionKey: string, wantProvider: string, workspacePath?: string): string | undefined {
     const id = this._resumeMap.get(sessionKey)
     if (!id) return undefined
     const tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
     if (tag !== wantProvider) return undefined
-    if (tag === SessionManager.CCB_PROVIDER_TAG && !this._ccbJsonlExists(id)) {
-      log.warn('resume-map entry points to missing JSONL — dropping silently', {
-        sessionKey,
-        resumeId: id,
-      })
-      this._resumeMap.delete(sessionKey)
-      this._resumeMapTimestamps.delete(sessionKey)
-      this._resumeMapProvider.delete(sessionKey)
-      this._resumeMapLastCost.delete(sessionKey)
-      this._resumeMapCostImprecise.delete(sessionKey)
-      this._saveResumeMap()
-      return undefined
-    }
-    const sandJsonlId = tag === 'cursor'
-      ? cursorSandResumeInnerId(id) ?? cursorSandOfficialCcResumeInnerId(id)
-      : undefined
-    if (sandJsonlId) {
+
+    if (tag === 'cursor' && isAnyCursorSandResumeId(id)) {
+      const sandJsonlId = cursorSandResumeInnerId(id) ?? cursorSandOfficialCcResumeInnerId(id)
+      if (!sandJsonlId) {
+        log.warn('resume-map Cursor Sand entry is malformed — dropping silently', {
+          sessionKey,
+          resumeId: id,
+        })
+        this._forgetResumeEntry(sessionKey)
+        this._saveResumeMap()
+        return undefined
+      }
       if (this._ccbJsonlExists(sandJsonlId)) return id
+      const promoted = this._resolveDurableResumeId(sessionKey, tag, undefined, workspacePath)
+      if (promoted) return promoted
       log.warn('resume-map Cursor Sand entry points to missing JSONL — dropping silently', {
         sessionKey,
         resumeId: id,
       })
-      this._resumeMap.delete(sessionKey)
-      this._resumeMapTimestamps.delete(sessionKey)
-      this._resumeMapProvider.delete(sessionKey)
-      this._resumeMapLastCost.delete(sessionKey)
-      this._resumeMapCostImprecise.delete(sessionKey)
+      this._forgetResumeEntry(sessionKey)
       this._saveResumeMap()
       return undefined
     }
-    if (tag === 'cursor' && isAnyCursorSandResumeId(id)) {
-      log.warn('resume-map Cursor Sand entry is malformed — dropping silently', {
-        sessionKey,
-        resumeId: id,
-      })
-      this._resumeMap.delete(sessionKey)
-      this._resumeMapTimestamps.delete(sessionKey)
-      this._resumeMapProvider.delete(sessionKey)
-      this._resumeMapLastCost.delete(sessionKey)
-      this._resumeMapCostImprecise.delete(sessionKey)
-      this._saveResumeMap()
-      return undefined
-    }
-    if (tag === 'cursor' && workspacePath && !cursorResumeStoreExists(workspacePath, id)) {
+
+    if (tag === 'cursor') {
+      if (!workspacePath) return id
+      if (cursorResumeStoreExists(workspacePath, id)) return id
       // Do not drop the map: spawn cwd is the resume authority, and a
       // recomputed overlay can hash to a different chats/ dir than the live
       // CLI. Deleting here forces historical replay on the next follow-up
       // even when store.db is still on disk.
       // isolated_v1 次轮绑项目会改 spawn cwd → md5 目录对不上。旧 store 还在
-      // 时迁到当前哈希再 --resume;失败才跳过 lookup,回放历史。
+      // 时迁到当前哈希再 --resume;失败才走 history 梯子;再失败才跳过 lookup。
       const relocated = relocateCursorResumeStore({
         resumeId: id,
         currentWorkspacePath: workspacePath,
@@ -3044,13 +3097,26 @@ export class SessionManager {
         })
         return id
       }
+      const promoted = this._resolveDurableResumeId(sessionKey, tag, undefined, workspacePath)
+      if (promoted) return promoted
       log.warn('resume-map Cursor store not at this workspace — keeping map, skipping this lookup', {
         sessionKey,
         resumeId: id,
       })
       return undefined
     }
-    return id
+
+    // CCB / codex / grok / zcode: single durable-artifact gate + history ladder.
+    const resolved = this._resolveDurableResumeId(sessionKey, tag, id, workspacePath)
+    if (resolved) return resolved
+    log.warn('resume-map entry has no durable transcript on disk — dropping silently', {
+      sessionKey,
+      provider: tag,
+      resumeId: id,
+    })
+    this._forgetResumeEntry(sessionKey)
+    this._saveResumeMap()
+    return undefined
   }
 
   /** Same cwd projection CursorAdapter.spawnTurn uses: repo workspace when
@@ -3187,6 +3253,13 @@ export class SessionManager {
             if ((val as any).costImprecise === true) {
               this._resumeMapCostImprecise.set(key, true)
             }
+            const history = (val as any).history
+            if (Array.isArray(history)) {
+              const cleaned = history
+                .filter((h): h is string => typeof h === 'string' && h.length > 0 && h !== (val as any).id)
+                .slice(0, RESUME_HISTORY_MAX)
+              if (cleaned.length > 0) this._resumeMapHistory.set(key, cleaned)
+            }
             // M1a:tag 归一为 engine id(历史 'codex-native' → 'codex')。
             this._resumeMapProvider.set(key, prov)
           }
@@ -3208,6 +3281,8 @@ export class SessionManager {
       costImprecise?: boolean
       provider?: string
       historyContextVersion?: number
+      /** Prior same-provider ids, newest first (durable-artifact fallback ladder). */
+      history?: string[]
     }
     const obj: Record<string, ResumeEntry> = {}
     const now = Date.now()
@@ -3225,6 +3300,8 @@ export class SessionManager {
       }
       // Only serialize provider when it differs from the implicit 'ccb' default.
       if (prov && prov !== SessionManager.CCB_PROVIDER_TAG) entry.provider = prov
+      const hist = this._resumeMapHistory.get(key)?.filter((h) => h !== val)
+      if (hist && hist.length > 0) entry.history = hist.slice(0, RESUME_HISTORY_MAX)
       obj[key] = entry
     }
     for (const [key, sess] of this.sessions) {
@@ -3240,6 +3317,12 @@ export class SessionManager {
           entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
         }
         if (prov && prov !== SessionManager.CCB_PROVIDER_TAG) entry.provider = prov
+        // Live session overrides a loaded head that differs: remember the
+        // loaded head on the ladder so a dead live id can still fall back.
+        const loadedHead = this._resumeMap.get(key)
+        if (loadedHead && loadedHead !== sess.ccbSessionId) this._pushResumeHistory(key, loadedHead)
+        const hist = this._resumeMapHistory.get(key)?.filter((h) => h !== sess.ccbSessionId)
+        if (hist && hist.length > 0) entry.history = hist.slice(0, RESUME_HISTORY_MAX)
         obj[key] = entry
         // Keep in-memory maps in sync
         this._resumeMap.set(key, sess.ccbSessionId)
@@ -3718,6 +3801,15 @@ export class SessionManager {
       // 互喂)。_resumeIdFor also drops the entry silently when the CCB JSONL
       // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
       resumeSessionId: mappedResumeId,
+      resolveResumeFallback: (staleId: string) => {
+        const promoted = this._resolveDurableResumeId(
+          opts.sessionKey,
+          engineId,
+          undefined,
+          this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
+        )
+        return promoted && promoted !== staleId ? promoted : undefined
+      },
       effortLevel: initialEffort,
       // Phase 5:repoSessionId 默认等于 peerId;delegate_task 可传父 webchat
       // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
@@ -3824,6 +3916,17 @@ export class SessionManager {
       this.onCcbTaskNotificationDelivered?.(session, payload)
     })
     runner.on('session_id', (id: string) => {
+      // Durable-artifact ladder: when the engine mints a NEW id for this
+      // session (fresh spawn after the previous id failed to resume, codex
+      // missing-rollout self-heal, cursor sand re-spawn…), keep the previous
+      // same-provider id so a rebuild that leaves the new id transcript-less
+      // can still resume the older one instead of replaying history.
+      const prevId = session.ccbSessionId ?? this._resumeMap.get(opts.sessionKey)
+      const prevProv = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey))
+      if (prevId && prevId !== id) {
+        if (prevProv === engineId) this._pushResumeHistory(opts.sessionKey, prevId)
+        else this._resumeMapHistory.delete(opts.sessionKey)
+      }
       session.ccbSessionId = id
       // Remember which provider produced this id — the next getOrCreate on
       // this sessionKey (possibly after a gateway restart switching providers)
@@ -3881,18 +3984,30 @@ export class SessionManager {
         // Without this, every restart re-spawns CCB with the same dead id,
         // producing the same error, and the subprocess never boots.
         if (session._pendingStaleResumeClear) {
-          this._resumeMap.delete(opts.sessionKey)
-          this._resumeMapTimestamps.delete(opts.sessionKey)
-          this._resumeMapProvider.delete(opts.sessionKey)
-          this._resumeMapLastCost.delete(opts.sessionKey)
-          this._resumeMapCostImprecise.delete(opts.sessionKey)
-          session.ccbSessionId = null
           session._pendingStaleResumeClear = false
-          // Also forget the id inside the runner — otherwise submit()'s next
-          // start() reads it back as resumeSessionId and --resume the same
-          // dead id again.
-          session.runner.clearSessionId?.()
-          this._saveResumeMap()
+          const staleId = session.ccbSessionId ?? this._resumeMap.get(opts.sessionKey)
+          // Durable-artifact ladder first: the engine just told us the head id
+          // is gone; a prior same-provider id may still have its transcript.
+          const promoted = this._resolveDurableResumeId(
+            opts.sessionKey,
+            engineId,
+            undefined,
+            this._cursorWorkspacePathForSession(session),
+          )
+          if (promoted && promoted !== staleId && session.runner.setResumeSessionId) {
+            session.ccbSessionId = promoted
+            session.runner.setResumeSessionId(promoted)
+            this._resumeMapProvider.set(opts.sessionKey, engineId)
+            this._saveResumeMap()
+          } else {
+            this._forgetResumeEntry(opts.sessionKey)
+            session.ccbSessionId = null
+            // Also forget the id inside the runner — otherwise submit()'s next
+            // start() reads it back as resumeSessionId and --resume the same
+            // dead id again.
+            session.runner.clearSessionId?.()
+            this._saveResumeMap()
+          }
         } else if (session.ccbSessionId) {
           // Ensure the session stays in resume-map so it can be restored on next submit()
           // (SubprocessRunner.submit() auto-restarts with --resume when proc is null)
@@ -4578,6 +4693,7 @@ export class SessionManager {
         this._resumeMapTimestamps.delete(session.sessionKey)
         this._resumeMapProvider.delete(session.sessionKey)
         this._resumeMapLastCost.delete(session.sessionKey)
+        this._resumeMapHistory.delete(session.sessionKey)
         session.ccbSessionId = null
         session.runner.clearSessionId()
         this._saveResumeMap()
@@ -4641,6 +4757,7 @@ export class SessionManager {
         this._resumeMapProvider.delete(session.sessionKey)
         this._resumeMapLastCost.delete(session.sessionKey)
         this._resumeMapCostImprecise.delete(session.sessionKey)
+        this._resumeMapHistory.delete(session.sessionKey)
         session.ccbSessionId = null
         session.runner.clearSessionId?.()
         this._saveResumeMap()
@@ -6234,6 +6351,7 @@ export class SessionManager {
             this._resumeMapProvider.delete(session.sessionKey)
             this._resumeMapLastCost.delete(session.sessionKey)
             this._resumeMapCostImprecise.delete(session.sessionKey)
+            this._resumeMapHistory.delete(session.sessionKey)
             session.ccbSessionId = null
             runner.clearSessionId?.()
             this._saveResumeMap()
@@ -7260,6 +7378,7 @@ export class SessionManager {
         this._resumeMapProvider.delete(sessionKey)
         this._resumeMapLastCost.delete(sessionKey)
         this._resumeMapCostImprecise.delete(sessionKey)
+        this._resumeMapHistory.delete(sessionKey)
         session.ccbSessionId = null
         session.runner.clearSessionId?.()
         this._saveResumeMap()
@@ -7328,6 +7447,7 @@ export class SessionManager {
       this._resumeMapLastCost.delete(sessionKey)
       this._resumeMapCostImprecise.delete(sessionKey)
       this._resumeMapProvider.delete(sessionKey)
+      this._resumeMapHistory.delete(sessionKey)
       this._saveResumeMap()
     }
     // Medium#G1:让 server.ts 的 outboundRing 也清掉这个 key(两个 server.ts
@@ -7380,6 +7500,7 @@ export class SessionManager {
     this._resumeMapLastCost.delete(sessionKey)
     this._resumeMapCostImprecise.delete(sessionKey)
     this._resumeMapProvider.delete(sessionKey)
+    this._resumeMapHistory.delete(sessionKey)
     this._saveResumeMap()
   }
 
@@ -7498,6 +7619,7 @@ export class SessionManager {
               this._resumeMapLastCost.delete(key)
               this._resumeMapCostImprecise.delete(key)
               this._resumeMapProvider.delete(key)
+              this._resumeMapHistory.delete(key)
             }
             // Medium#G1 + N11:shutdown 完才清 ring,保证不会有"runner 已死但 ring 还能
             // 接尾帧"的窗口。webchat 虽然 resume-map 留着等 reconnect,但 outboundRing
@@ -7544,6 +7666,7 @@ export class SessionManager {
         this._resumeMapLastCost.delete(key)
         this._resumeMapCostImprecise.delete(key)
         this._resumeMapProvider.delete(key)
+        this._resumeMapHistory.delete(key)
         pruned = true
         log.info('pruned idle resume-map entry', {
           sessionKey: key,

@@ -647,6 +647,10 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     this.runner.clearSessionId()
   }
 
+  setResumeSessionId(sessionId: string): void {
+    this.runner.setResumeSessionId(sessionId)
+  }
+
   // ── setters(SubprocessRunner 直通)────────────────────────────────────
 
   setModel(model: string | undefined): void {
