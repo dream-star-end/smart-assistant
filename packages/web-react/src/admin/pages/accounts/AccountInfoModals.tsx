@@ -2,8 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { Badge, Button, DescriptionList, DescriptionRow, Modal, Progress, Spinner } from "../../../components/ui";
 import { DataTable, type Column } from "../../components";
 import { adminGet, apiErrorMessage } from "../../lib/adminApi";
-import { fmtDateTime } from "./cells";
-import type { CursorUsageSnapshot, RecentUser, RefreshEvent } from "./types";
+import { fmtDateTime, ResetCell } from "./cells";
+import type { CursorUsageSnapshot, GrokUsageSnapshot, RecentUser, RefreshEvent } from "./types";
 
 function errMsg(e: unknown): string {
   return apiErrorMessage(e, "请求失败");
@@ -489,6 +489,188 @@ export function CursorUsageModal({
             数据来自 Cursor 内部 dashboard 接口,字段可能随 Cursor 变更;金额为 Cursor 侧计价(美元),仅供查看,不作为平台计费依据。
             平台 Sand(Opus / Fable)请求消耗的是顶部「Grok Bot / Sand 池」;「套餐内额度」对应 Cursor IDE / CLI 的 Auto 与具名模型,两者互不相通。
           </p>
+        </div>
+      ) : null}
+    </Modal>
+  );
+}
+
+// ─── Grok Build 官方账号额度 ────────────────────────────────────────────────
+
+type GrokUsageResponse = { usage: GrokUsageSnapshot; cached: boolean; stored?: boolean };
+
+const GROK_ERROR_LABEL: Record<string, string> = {
+  credits: "周额度池",
+  monthly: "月度账单",
+  user: "账号订阅",
+};
+
+function isZeroOrNull(n: number | null | undefined): boolean {
+  return n == null || n === 0;
+}
+
+/**
+ * Grok Build 官方账号的周额度 / 订阅快照。数据来自 xAI 用量接口
+ * (随时可能变),字段缺失一律显示 "—";仅供查看,不是计费依据。
+ */
+export function GrokUsageModal({
+  accountId,
+  label,
+  open,
+  onClose,
+}: {
+  accountId: string | null;
+  label: string;
+  open: boolean;
+  onClose: () => void;
+}) {
+  const [data, setData] = useState<GrokUsageResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(
+    async (force: boolean) => {
+      if (!accountId) return;
+      setLoading(true);
+      setError(null);
+      try {
+        const r = await adminGet<GrokUsageResponse>(
+          `/accounts/${encodeURIComponent(accountId)}/grok-usage`,
+          force ? { refresh: 1 } : undefined,
+        );
+        setData(r);
+      } catch (e) {
+        setError(errMsg(e));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [accountId],
+  );
+
+  useEffect(() => {
+    if (!open || !accountId) return;
+    setData(null);
+    void load(false);
+  }, [open, accountId, load]);
+
+  const u = data?.usage ?? null;
+  const credits = u?.credits ?? null;
+  const monthly = u?.monthly ?? null;
+  const account = u?.account ?? null;
+  const errorEntries = u ? Object.entries(u.errors) : [];
+  const pct = credits?.usage_percent ?? null;
+  const noOnDemand =
+    isZeroOrNull(credits?.on_demand_used) &&
+    isZeroOrNull(credits?.on_demand_cap) &&
+    isZeroOrNull(credits?.prepaid_balance);
+
+  return (
+    <Modal
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) onClose();
+      }}
+      title={`账号 #${accountId ?? ""} — Grok 额度 / 用量`}
+      description={label}
+      className="max-w-3xl"
+    >
+      {loading && !u ? (
+        <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted">
+          <Spinner className="size-4" /> 正在查询 Grok 额度…
+        </div>
+      ) : error && !u ? (
+        <div className="flex flex-col items-center gap-3 py-8 text-center text-sm text-danger">
+          <span>查询失败:{error}</span>
+          <Button size="sm" variant="secondary" onClick={() => void load(true)}>
+            重试
+          </Button>
+        </div>
+      ) : u ? (
+        <div className="flex flex-col gap-4">
+          <div className="flex items-center justify-between gap-3 text-meta text-faint">
+            <span>
+              拉取于 {fmtDateTime(u.fetched_at)}
+              {data?.cached ? " · 缓存" : ""}
+              {data?.stored ? " · 已落库" : ""}
+              {account?.email_masked ? ` · ${account.email_masked}` : ""}
+            </span>
+            <Button size="sm" variant="ghost" disabled={loading} onClick={() => void load(true)}>
+              {loading ? <Spinner className="size-3.5" /> : null} 刷新
+            </Button>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {account?.subscription_tier ? (
+              <>
+                <span className="text-caption text-faint">订阅档</span>
+                <Badge tone="neutral">{account.subscription_tier}</Badge>
+              </>
+            ) : null}
+            {account?.has_grok_code_access === true ? <Badge tone="success">Grok Code 访问 已开通</Badge> : null}
+            {account?.has_grok_code_access === false ? <Badge tone="warning">Grok Code 访问 未开通</Badge> : null}
+            {account?.user_blocked_reason ? <Badge tone="danger">{account.user_blocked_reason}</Badge> : null}
+          </div>
+
+          <section className="rounded-md border border-border p-3">
+            <div className="mb-2 flex items-center gap-2">
+              <span className="text-sm font-medium">周额度池</span>
+              <span className="text-caption text-faint">xAI 周额度 · 每周重置</span>
+            </div>
+            {pct != null && (
+              <div className="mb-2 flex items-center gap-3">
+                <Progress value={pct} thresholds={{ warning: 75, danger: 90 }} className="flex-1" />
+                <span className="w-12 text-right text-sm tabular-nums">{fmtPct(pct)}</span>
+              </div>
+            )}
+            <DescriptionList>
+              <DescriptionRow
+                label="本周期"
+                value={`${fmtDate(credits?.period_start ?? null)} ~ ${fmtDate(credits?.period_end ?? null)}`}
+              />
+              <DescriptionRow label="重置倒计时" value={<ResetCell resetsAt={credits?.period_end ?? null} />} />
+              {(credits?.products ?? []).map((p) => (
+                <DescriptionRow key={p.product} label={p.product} value={fmtPct(p.usage_percent)} />
+              ))}
+            </DescriptionList>
+          </section>
+
+          <section className="rounded-md border border-border p-3">
+            <div className="mb-1 text-sm font-medium">按需 / 预付</div>
+            {noOnDemand ? (
+              <p className="text-meta text-faint">无按需消费</p>
+            ) : (
+              <DescriptionList>
+                <DescriptionRow
+                  label="按需已用 / 上限"
+                  value={`${credits?.on_demand_used ?? "—"} / ${credits?.on_demand_cap ?? "—"}`}
+                />
+                <DescriptionRow label="预付余额" value={credits?.prepaid_balance ?? "—"} />
+              </DescriptionList>
+            )}
+          </section>
+
+          <details className="rounded-md border border-border p-3">
+            <summary className="cursor-pointer text-sm font-medium">月度(legacy)</summary>
+            <DescriptionList>
+              <DescriptionRow label="已用 / 上限" value={`${monthly?.used ?? "—"} / ${monthly?.limit ?? "—"}`} />
+              <DescriptionRow
+                label="账期"
+                value={`${fmtDate(monthly?.period_start ?? null)} ~ ${fmtDate(monthly?.period_end ?? null)}`}
+              />
+            </DescriptionList>
+          </details>
+
+          {errorEntries.length > 0 && (
+            <div className="rounded-md border border-warning/40 bg-warning/5 p-2 text-meta text-warning">
+              未能读取:
+              {errorEntries.map(([k, v]) => (
+                <span key={k} className="ml-2">
+                  {GROK_ERROR_LABEL[k] ?? k} → {v}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       ) : null}
     </Modal>

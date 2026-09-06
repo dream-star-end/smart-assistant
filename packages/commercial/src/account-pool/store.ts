@@ -143,6 +143,18 @@ export interface AccountRow {
   cursor_billing_cycle_end: Date | null;
   cursor_usage_updated_at: Date | null;
   cursor_usage_error: string | null;
+  /**
+   * 0276 — Grok Build credit-pool usage learned hourly by grokUsageSweeper.
+   * Grok rows only; other providers stay NULL.
+   * NUMERIC(5,2) → cast ::float8 in SELECT, hence number | null.
+   */
+  grok_credit_usage_pct: number | null;
+  grok_build_usage_pct: number | null;
+  grok_credit_period_start: Date | null;
+  grok_credit_period_end: Date | null;
+  grok_subscription_tier: string | null;
+  grok_usage_updated_at: Date | null;
+  grok_usage_error: string | null;
 }
 
 export const CURSOR_CREDENTIAL_KINDS = ["api_key", "session"] as const;
@@ -368,7 +380,14 @@ const META_COLUMNS = `
   cursor_plan_membership,
   cursor_billing_cycle_end,
   cursor_usage_updated_at,
-  cursor_usage_error
+  cursor_usage_error,
+  grok_credit_usage_pct::float8 AS grok_credit_usage_pct,
+  grok_build_usage_pct::float8 AS grok_build_usage_pct,
+  grok_credit_period_start,
+  grok_credit_period_end,
+  grok_subscription_tier,
+  grok_usage_updated_at,
+  grok_usage_error
 `;
 
 interface RawMetaRow extends QueryResultRow {
@@ -411,6 +430,13 @@ interface RawMetaRow extends QueryResultRow {
   cursor_billing_cycle_end: Date | null;
   cursor_usage_updated_at: Date | null;
   cursor_usage_error: string | null;
+  grok_credit_usage_pct: number | null;
+  grok_build_usage_pct: number | null;
+  grok_credit_period_start: Date | null;
+  grok_credit_period_end: Date | null;
+  grok_subscription_tier: string | null;
+  grok_usage_updated_at: Date | null;
+  grok_usage_error: string | null;
 }
 
 interface RawSecretRow extends QueryResultRow {
@@ -490,6 +516,13 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     cursor_billing_cycle_end: row.cursor_billing_cycle_end ?? null,
     cursor_usage_updated_at: row.cursor_usage_updated_at ?? null,
     cursor_usage_error: row.cursor_usage_error ?? null,
+    grok_credit_usage_pct: row.grok_credit_usage_pct ?? null,
+    grok_build_usage_pct: row.grok_build_usage_pct ?? null,
+    grok_credit_period_start: row.grok_credit_period_start ?? null,
+    grok_credit_period_end: row.grok_credit_period_end ?? null,
+    grok_subscription_tier: row.grok_subscription_tier ?? null,
+    grok_usage_updated_at: row.grok_usage_updated_at ?? null,
+    grok_usage_error: row.grok_usage_error ?? null,
   };
 }
 
