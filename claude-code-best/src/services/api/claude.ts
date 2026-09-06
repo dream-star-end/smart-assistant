@@ -2945,8 +2945,15 @@ async function* queryModel(
     // message_delta handler before any yield. Fallback pushes to newMessages
     // then yields, so tracking must be here to survive .return() at the yield.
     if (fallbackMessage) {
-      const fallbackUsage = fallbackMessage.message
-        .usage as BetaMessageDeltaUsage
+      // A gateway/relay may answer the non-streaming fallback with a body
+      // that parses as a message but carries no `usage` (observed 2026-09-06
+      // through the Cursor Sand relay: an SSE body handed to a JSON call).
+      // Dereferencing it threw `Cannot read properties of undefined (reading
+      // 'input_tokens')` *after* the assistant message had already been
+      // yielded, so the turn surfaced the TypeError as its result text.
+      // Treat missing usage as zero usage; the message itself still stands.
+      const fallbackUsage = (fallbackMessage.message.usage ??
+        { ...EMPTY_USAGE }) as BetaMessageDeltaUsage
       usage = updateUsage(EMPTY_USAGE, fallbackUsage)
       stopReason = fallbackMessage.message.stop_reason as BetaStopReason
       const fallbackCost = calculateUSDCost(

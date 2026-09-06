@@ -18,6 +18,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Ajv2020 from 'ajv/dist/2020.js'
+import { Agent as UndiciAgent, type Dispatcher } from 'undici'
 // protobufjs is CommonJS. Node's native ESM loader exposes it only through
 // `default`; a namespace import works under the TS test loader but becomes
 // `{ default: ... }` in the precompiled production gateway.
@@ -35,6 +36,58 @@ import { AUTHORITY_HEADER, LOCAL_CATALOG_HEADER, TURN_LEASE_HEADER } from '../mo
 
 const log = createLogger({ module: 'cursorSandRelay' })
 const DEFAULT_UPSTREAM = 'https://api2.cursor.sh'
+/**
+ * Upstream body-read liveness. undici's global dispatcher defaults to
+ * `bodyTimeout=300s`; a Sand inference that stays silent for five minutes
+ * (large single-shot Write on a cold ~220k prompt) was torn down with a bare
+ * `TypeError: terminated`, which CCB then re-ran as a non-streaming fallback,
+ * hit the same wall again, and surfaced either an `upstream_failed` red card
+ * or — worse — a "completed" turn whose tool call never happened. The relay
+ * owns liveness now: no undici body timeout, one explicit stall budget, and a
+ * named diagnostic so gateway/master can tell a stalled provider from a 5xx.
+ */
+// 8 min: comfortably above the 300s undici default that bit us (so legitimately
+// slow ~220k-token prefills are not cut shorter than before) yet bounded, and
+// tunable via OPENCLAUDE_CURSOR_SAND_STALL_MS. Note CCB's own 90s stream-idle
+// watchdog never fires behind this relay because our 5s SSE pings reset it —
+// this stall budget is the only liveness guard on the Sand path.
+const DEFAULT_UPSTREAM_STALL_MS = 8 * 60_000
+const UPSTREAM_HEADERS_TIMEOUT_MS = 10 * 60_000
+export const CURSOR_SAND_UPSTREAM_STALLED = 'CURSOR_SAND_UPSTREAM_STALLED'
+export const CURSOR_SAND_UPSTREAM_TERMINATED = 'CURSOR_SAND_UPSTREAM_TERMINATED'
+
+function upstreamStallMs(): number {
+  const raw = Number.parseInt(process.env.OPENCLAUDE_CURSOR_SAND_STALL_MS ?? '', 10)
+  return Number.isFinite(raw) && raw >= 30_000 ? raw : DEFAULT_UPSTREAM_STALL_MS
+}
+
+let sandUpstreamDispatcher: Dispatcher | null = null
+function upstreamDispatcher(): Dispatcher {
+  if (!sandUpstreamDispatcher) {
+    sandUpstreamDispatcher = new UndiciAgent({
+      headersTimeout: UPSTREAM_HEADERS_TIMEOUT_MS,
+      // Liveness is enforced by the relay's stall watchdog (see consumeFrames),
+      // not by a fixed per-chunk deadline that ignores our own SSE pings.
+      bodyTimeout: 0,
+      keepAliveTimeout: 30_000,
+    })
+  }
+  return sandUpstreamDispatcher
+}
+
+/**
+ * Normalise low-level fetch failures into a stable diagnostic. `terminated`
+ * is undici's wording for "the socket closed / timed out before the body
+ * finished"; keep the raw text for logs but expose one grep-able code.
+ */
+export function classifyUpstreamReadFailure(error: unknown, stalled: boolean): string {
+  if (stalled) return CURSOR_SAND_UPSTREAM_STALLED
+  const message = error instanceof Error ? error.message : String(error)
+  if (/\bterminated\b|ECONNRESET|socket hang up|other side closed|UND_ERR_(?:BODY_TIMEOUT|SOCKET|ABORTED)/i.test(message)) {
+    return CURSOR_SAND_UPSTREAM_TERMINATED
+  }
+  return message || 'Cursor Sand inference failed'
+}
 const DEFAULT_CLIENT_VERSION = 'cli-2026.08.11-e8db854'
 const MAX_BODY_BYTES = 16 * 1024 * 1024
 const PING_MS = 5_000
@@ -84,6 +137,8 @@ interface RelayDeps {
   upstreamBaseUrl?: string
   clientVersion?: string
   now?: () => number
+  /** Max silence between upstream frames before the relay gives up (ms). */
+  upstreamStallMs?: number
   onRequestForTest?: (body: AnthropicMessagesBody) => void
   onRawTextForTest?: (text: string, attempt: number) => void
   /**
@@ -1014,7 +1069,7 @@ function correctedToolBody(body: AnthropicMessagesBody, invalidResponse: string)
 }
 
 export class CursorSandRelay {
-  private readonly deps: Required<Pick<RelayDeps, 'fetchImpl' | 'readApiKey' | 'upstreamBaseUrl' | 'clientVersion' | 'now'>>
+  private readonly deps: Required<Pick<RelayDeps, 'fetchImpl' | 'readApiKey' | 'upstreamBaseUrl' | 'clientVersion' | 'now' | 'upstreamStallMs'>>
   private readonly credentialKind: RelayCredentialKind
   /** Persisted machine id for `session` credentials; never regenerated. */
   private readonly machineId: string | null
@@ -1049,6 +1104,7 @@ export class CursorSandRelay {
       clientVersion: deps.clientVersion
         ?? (this.credentialKind === 'session' ? CURSOR_SESSION_CLIENT_VERSION : DEFAULT_CLIENT_VERSION),
       now: deps.now ?? Date.now,
+      upstreamStallMs: deps.upstreamStallMs ?? upstreamStallMs(),
     }
     this.onRequestForTest = deps.onRequestForTest
     this.onRawTextForTest = deps.onRawTextForTest
@@ -1128,16 +1184,31 @@ export class CursorSandRelay {
     if (this.origin) return `${this.origin}/route/${this.routeToken}`
     const server = createServer((req, res) => {
       void this.handle(req, res).catch(async (error: unknown) => {
-        log.warn('cursor sand relay request failed', {
-          error: error instanceof Error ? error.message : String(error),
-        })
+        const raw = error instanceof Error ? error.message : String(error)
+        // Stall / socket-termination diagnostics are already normalised by
+        // consumeFrames; anything else is a relay-internal fault. Both are
+        // surfaced verbatim so CCB's result text (and thus the gateway error
+        // classifier) sees a stable code instead of a generic sentence.
+        const known = raw === CURSOR_SAND_UPSTREAM_STALLED || raw === CURSOR_SAND_UPSTREAM_TERMINATED
+        const message = known
+          ? `Cursor Sand inference failed: ${raw} (upstream produced no frames; try a smaller step)`
+          : 'Cursor Sand inference failed'
+        log.warn('cursor sand relay request failed', { error: raw, code: known ? raw : 'relay_error' })
         if (!res.headersSent) {
-          res.statusCode = 502
+          // 504 names the failure class (gateway timeout) for logs/metrics;
+          // CCB retries any 5xx the same way, so this does not change retry
+          // policy, only observability.
+          res.statusCode = known ? 504 : 502
           res.setHeader('content-type', 'application/json')
-          res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Cursor Sand inference failed' } }))
+          // A stalled upstream is not a transient 5xx worth CCB's 10× withRetry
+          // loop (each attempt would burn another full stall budget and a fresh
+          // ~200k cache write). Fail the turn once; master-side automatic
+          // recovery already owns the bounded retry policy.
+          if (known) res.setHeader('x-should-retry', 'false')
+          res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message } }))
         } else {
           if (!res.destroyed && !res.writableEnded) {
-            await emitSse(res, 'error', { type: 'error', error: { type: 'api_error', message: 'Cursor Sand inference failed' } })
+            await emitSse(res, 'error', { type: 'error', error: { type: 'api_error', message } })
             res.end()
           }
         }
@@ -1302,14 +1373,18 @@ export class CursorSandRelay {
     if (this.credentialKind === 'session' && this.machineId !== null) {
       headers['x-cursor-checksum'] = cursorSessionChecksum(this.machineId, this.deps.now())
     }
+    const init: RequestInit & { dispatcher?: Dispatcher } = {
+      method: 'POST',
+      headers,
+      body: new Uint8Array(connectEnvelope(bytes)),
+      signal,
+    }
+    // Only the real global fetch understands undici's `dispatcher` option;
+    // injected test doubles get the plain init.
+    if (this.deps.fetchImpl === fetch) init.dispatcher = upstreamDispatcher()
     const response = await this.deps.fetchImpl(
       `${this.deps.upstreamBaseUrl}/aiserver.v1.InferenceService/Stream`,
-      {
-        method: 'POST',
-        headers,
-        body: new Uint8Array(connectEnvelope(bytes)),
-        signal,
-      },
+      init,
     )
     return { response, upstreamModel }
   }
@@ -1357,7 +1432,11 @@ export class CursorSandRelay {
       }))
       return
     }
-    if (body.stream === false) {
+    // Anthropic's default is non-streaming; CCB's non-streaming fallback omits
+    // `stream` entirely. Treating "absent" as streaming handed an SSE body to a
+    // JSON-parsing SDK call, which surfaced as `Cannot read properties of
+    // undefined (reading 'input_tokens')` inside CCB.
+    if (body.stream !== true) {
       await this.pipeNonStreaming(upstream, opened.upstreamModel, advertisedTools(body.tools), res)
       return
     }
@@ -1463,10 +1542,45 @@ export class CursorSandRelay {
   ): Promise<void> {
     const reader = response.body!.getReader()
     let buffer = Buffer.alloc(0)
+    const stallMs = this.deps.upstreamStallMs
+    let stalled = false
+    let stallTimer: NodeJS.Timeout | null = null
+    const armStall = (): void => {
+      if (stallTimer) clearTimeout(stallTimer)
+      stallTimer = setTimeout(() => {
+        stalled = true
+        void reader.cancel(new Error(CURSOR_SAND_UPSTREAM_STALLED)).catch(() => {})
+      }, stallMs)
+      stallTimer.unref()
+    }
+    const startedAt = Date.now()
+    let lastFrameAt = startedAt
+    let frames = 0
     try {
+      armStall()
       while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
+        let chunk: ReadableStreamReadResult<Uint8Array>
+        try {
+          chunk = await reader.read()
+        } catch (error) {
+          const code = classifyUpstreamReadFailure(error, stalled)
+          log.warn('cursor sand upstream read failed', {
+            code,
+            frames,
+            elapsedMs: Date.now() - startedAt,
+            sinceLastFrameMs: Date.now() - lastFrameAt,
+            raw: error instanceof Error ? error.message : String(error),
+          })
+          throw new Error(code)
+        }
+        const { done, value } = chunk
+        if (done) {
+          if (stalled) throw new Error(CURSOR_SAND_UPSTREAM_STALLED)
+          break
+        }
+        armStall()
+        lastFrameAt = Date.now()
+        frames++
         buffer = Buffer.concat([buffer, Buffer.from(value)])
         while (buffer.length >= 5) {
           const flags = buffer[0]
@@ -1484,7 +1598,29 @@ export class CursorSandRelay {
       }
       if (buffer.length !== 0) throw new Error('CURSOR_SAND_TRUNCATED_FRAME')
     } finally {
+      if (stallTimer) clearTimeout(stallTimer)
       await reader.cancel().catch(() => {})
+    }
+  }
+
+  /**
+   * Surface an upstream/relay failure to CCB as an Anthropic SSE `error`
+   * event while the response is still writable. Idempotent and never throws.
+   */
+  private async emitStreamFailure(res: ServerResponse, error: unknown): Promise<void> {
+    if (res.destroyed || res.writableEnded) return
+    const raw = error instanceof Error ? error.message : String(error)
+    const known = raw === CURSOR_SAND_UPSTREAM_STALLED || raw === CURSOR_SAND_UPSTREAM_TERMINATED
+    const message = known
+      ? `Cursor Sand inference failed: ${raw} (upstream produced no frames; try a smaller step)`
+      : raw === 'CURSOR_SAND_DOWNSTREAM_CLOSED'
+        ? null
+        : 'Cursor Sand inference failed'
+    if (message === null) return
+    try {
+      await emitSse(res, 'error', { type: 'error', error: { type: 'api_error', message } })
+    } catch {
+      // downstream already gone; nothing to tell
     }
   }
 
@@ -1745,6 +1881,13 @@ export class CursorSandRelay {
         usage: usageBlock(state),
       })
       await emitSse(res, 'message_stop', { type: 'message_stop' })
+    } catch (error) {
+      // Must run before the `finally` below ends the response: previously the
+      // stream was closed cleanly here and the SSE `error` frame in start()'s
+      // catch never went out, so CCB saw a truncated-but-"successful" message
+      // (half-open tool_use → tool never executed → turn marked completed).
+      await this.emitStreamFailure(res, error)
+      throw error
     } finally {
       clearInterval(ping)
       if (!res.writableEnded) res.end()
@@ -1922,6 +2065,13 @@ export class CursorSandRelay {
         usage: usageBlock(state),
       })
       await emitSse(res, 'message_stop', { type: 'message_stop' })
+    } catch (error) {
+      // Must run before the `finally` below ends the response: previously the
+      // stream was closed cleanly here and the SSE `error` frame in start()'s
+      // catch never went out, so CCB saw a truncated-but-"successful" message
+      // (half-open tool_use → tool never executed → turn marked completed).
+      await this.emitStreamFailure(res, error)
+      throw error
     } finally {
       clearInterval(ping)
       if (!res.writableEnded) res.end()
