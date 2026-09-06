@@ -63,7 +63,16 @@ import {
   createSafeStorageIdentityStore,
   resolveIdentityDirectory,
 } from './identity.mjs'
-import { createHostSupervisor, readDesktopHostConfigFromEnv, DEFAULT_HOST_ENTRY } from './hostSupervisor.mjs'
+import {
+  createHostSupervisor,
+  loadDesktopHostConfig,
+  readDesktopHostConfigFromEnv,
+  DEFAULT_HOST_ENTRY,
+} from './hostSupervisor.mjs'
+import {
+  BOOTSTRAP_PIN_CHANGED_MESSAGE,
+  publicOriginFromProductUrl,
+} from './desktopBootstrap.mjs'
 import { runLocalHostSmoke } from './localHostSmoke.mjs'
 import {
   formatSmokeFailureReport,
@@ -2262,8 +2271,43 @@ function installEnrollment() {
   return enrollmentController
 }
 
+async function loadDesktopBootstrap() {
+  try {
+    desktopBootstrapState = await loadDesktopHostConfig({
+      publicOrigin: publicOriginFromProductUrl(process.env.OPENCLAUDE_DESKTOP_DEV_URL, {
+        isPackaged: app.isPackaged,
+      }),
+      env: process.env,
+    })
+  } catch (error) {
+    desktopBootstrapState = {
+      ready: false,
+      disabled: false,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+  if (desktopBootstrapState?.pinChanged) {
+    applyHostFallback('pin_changed')
+    ensureAppLogger().warn('bootstrap_pin_changed', { message: BOOTSTRAP_PIN_CHANGED_MESSAGE })
+  }
+  return desktopBootstrapState
+}
+
+function desktopHostConfig() {
+  if (desktopBootstrapState?.ready) return desktopBootstrapState
+  return readDesktopHostConfigFromEnv(process.env)
+}
+
 async function toggleLocalMode(enabled) {
   const mode = ensureLocalMode()
+  if (enabled && desktopBootstrapState?.disabled === true) {
+    ensureLocalHostWindow()?.show()
+    return {
+      ok: false,
+      reason: desktopBootstrapState.disabledReason || 'bootstrap-disabled',
+      message: desktopBootstrapState.message,
+    }
+  }
   if (enabled) {
     const result = mode.enableLocal()
     if (!result.ok) {
@@ -2456,6 +2500,7 @@ if (!hasSingleInstanceLock) {
         return
       }
       await installDesktopTray()
+      await loadDesktopBootstrap()
       installEnrollment()
       ensureLocalMode()
       powerBridge = createPowerEventBridge({
@@ -2497,7 +2542,7 @@ function installLocalAgentHost() {
         return null
       }
     },
-    config: readDesktopHostConfigFromEnv(process.env),
+    config: desktopHostConfig(),
     onState: (state) => {
       tunnelState = state
       if (state === 'offline' && ensureLocalMode().mode === LocalMode.LOCAL) {

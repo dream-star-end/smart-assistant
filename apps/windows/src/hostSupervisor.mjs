@@ -4,33 +4,15 @@ import { ElectronToHost, HostToElectron, HOST_IPC_VERSION, isIpcRecord } from '.
 import { killProcessTree } from './host/gatewayProcess.mjs'
 import { spawnHostProcess } from './host/hostTransport.mjs'
 import { TunnelState } from './tunnel/tunnelClient.mjs'
+import { loadDesktopHostConfig, readDesktopHostConfigFromEnv } from './desktopBootstrap.mjs'
+
+export { loadDesktopHostConfig, readDesktopHostConfigFromEnv }
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 export const DEFAULT_HOST_ENTRY = path.join(HERE, 'host', 'hostMain.mjs')
 
 const MAX_RESTARTS = 5
 const RESTART_WINDOW_MS = 10 * 60 * 1000
-
-export function readDesktopHostConfigFromEnv(env = process.env) {
-  const registerOrigin = env.OPENCLAUDE_DESKTOP_REGISTER_ORIGIN || ''
-  const egressOrigin = env.OPENCLAUDE_DESKTOP_EGRESS_ORIGIN || ''
-  const spkiPin = env.OPENCLAUDE_DESKTOP_SPKI_PIN || ''
-  const deviceCaPem = env.OPENCLAUDE_DESKTOP_DEVICE_CA || ''
-  const keyringFp = env.OPENCLAUDE_DESKTOP_KEYRING_FP || ''
-  const gatewayCommand = env.OPENCLAUDE_GATEWAY_ENTRY || ''
-  const gatewayPort = env.OPENCLAUDE_GATEWAY_PORT ? Number(env.OPENCLAUDE_GATEWAY_PORT) : undefined
-  return {
-    registerOrigin,
-    egressOrigin,
-    spkiPin,
-    deviceCaPem,
-    keyringFp,
-    gatewayCommand: gatewayCommand || undefined,
-    gatewayArgs: gatewayCommand ? [] : undefined,
-    gatewayPort,
-    ready: Boolean(registerOrigin && egressOrigin && spkiPin && deviceCaPem),
-  }
-}
 
 export function createHostSupervisor({
   execPath = process.execPath,
