@@ -38,6 +38,7 @@ import type {
 } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
+import { CREDIT_EXHAUSTED_DETAIL, CreditBudgetGuard } from '../creditExhaustion.js'
 import { createLogger } from '../logger.js'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { SdkMessage, UsageAttributionTag } from '../subprocessRunner.js'
@@ -99,6 +100,8 @@ interface CodexTurnContext {
   latestCallUsageById: Map<string, CallTokenUsageSnapshot>
   turnKey?: string
   usageAttribution?: UsageAttributionTag
+  /** OCV5-92: master-admitted spendable budget → hard-stop mid-turn. */
+  creditGuard: CreditBudgetGuard
 }
 
 function resolveCallUsageTargets(
@@ -176,6 +179,35 @@ function observeKernelCardTarget(
 }
 
 function buildTurnSummary(result: TurnResult, ctx: CodexTurnContext): TurnSummary {
+  if (ctx.creditGuard.isExhausted) {
+    // The kernel reports our budget interrupt as a plain `interrupted`
+    // (USER_CANCELLED) terminal. Rewrite it into a credit-exhaustion error
+    // so the browser gets the top-up card instead of "已由用户停止".
+    return {
+      usage: {
+        cost: result.cost,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        cacheReadTokens: result.cacheReadTokens,
+        cacheCreationTokens: result.cacheCreationTokens,
+        totalTokens: result.totalTokens,
+      },
+      assistantText: result.assistantText,
+      thinkingText: result.thinkingText,
+      assistantSegments: result.assistantSegments,
+      thinkingSegments: result.thinkingSegments,
+      tools: result.tools,
+      runtimeEvents: result.runtimeEvents,
+      stopReason: 'error',
+      numTurns: result.numTurns,
+      isError: true,
+      errorKind: 'other',
+      errorClass: 'insufficient_credits',
+      errorDetail: CREDIT_EXHAUSTED_DETAIL,
+      staleResumeId: false,
+      phantomSignals: { ...CODEX_PHANTOM_SIGNALS },
+    }
+  }
   const errorKind = classifyCodexErrorKind(result, ctx.lastErrorText)
   return {
     usage: {
@@ -241,8 +273,13 @@ export function buildCodexBillingEvent(
   sessionEngineId: string,
   turnKey?: string,
   usageAttribution?: UsageAttributionTag,
+  opts?: { creditExhausted?: boolean },
 ): EngineBillingEvent {
-  const isOk = msg.is_error !== true
+  // A budget hard-stop is not a user cancel and not an engine error: the
+  // tokens were really consumed upstream, so settle them as `success` (master
+  // clamp still applies). Never let it surface as USER_CANCELLED / CODEX_ERROR
+  // or the drained remainder would be a free overage.
+  const isOk = msg.is_error !== true || opts?.creditExhausted === true
   const terminalCode = !isOk
     ? msg.billing_terminal_code === 'USER_CANCELLED' ? 'USER_CANCELLED' as const : 'CODEX_ERROR' as const
     : undefined
@@ -329,6 +366,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   private readonly kernel: CodexAppServerRunner
   /** engineSessionId(sessionKey) 固化 —— billing 事件的记账键(M2 settle/waive)。 */
   private readonly _engineSessionId: string
+  private readonly _sessionKey: string
+  private readonly agentId: string
 
   /** 最近一次内核上报的 codex thread id(nativeSessionId 权威;内核无公开 getter)。 */
   private _threadId: string | null
@@ -353,6 +392,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   constructor(opts: EngineCreateOpts, kernelOverride?: CodexAppServerRunner) {
     super()
     this._engineSessionId = engineSessionId(opts.sessionKey)
+    this._sessionKey = opts.sessionKey
+    this.agentId = opts.agentId
     this._threadId = opts.resumeSessionId ?? null
     this._toolsets = opts.agentToolsets
     this.kernel =
@@ -416,6 +457,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
               this._engineSessionId,
               turn.turnKey,
               turn.usageAttribution,
+              { creditExhausted: turn.creditGuard.isExhausted },
             ),
           )
         }
@@ -438,6 +480,13 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       const turn = this._activeTurn
       if (!turn || turn.parser.finalized) return
       turn.onEvent({ kind: 'usage', usage })
+      // Kernel usage is already the per-turn cumulative delta.
+      turn.creditGuard.observe({
+        inputTokens: usage.inputTokens ?? 0,
+        outputTokens: usage.outputTokens ?? 0,
+        cacheReadTokens: usage.cacheReadTokens ?? 0,
+        cacheCreationTokens: usage.cacheCreationTokens ?? 0,
+      })
     })
     this.kernel.on('call_usage', (call: CallTokenUsageSnapshot) => {
       this.emit('activity')
@@ -484,7 +533,26 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       ...(params.usageAttribution
         ? { usageAttribution: { ...params.usageAttribution } }
         : {}),
+      creditGuard: null as unknown as CreditBudgetGuard,
     }
+    ctx.creditGuard = new CreditBudgetGuard({
+      budgetFen: params.creditBudgetFen,
+      modelId: () => this.kernel.model,
+      agentId: this.agentId,
+      // Codex settlement composes agent_cost_overrides (codexFinalizer).
+      composeAgentMultiplier: true,
+      isLive: () => this._activeTurn === ctx && !ctx.parser.finalized,
+      onExhausted: () => {
+        // Same wire as a user Stop: turn/interrupt. The kernel then emits an
+        // `interrupted` result with the partial usage; buildTurnSummary /
+        // buildCodexBillingEvent relabel it via creditGuard.isExhausted.
+        log.warn('codex turn aborted: credit budget exhausted', {
+          sessionKey: this._sessionKey,
+          budgetFen: params.creditBudgetFen?.toString(),
+        })
+        this.kernel.interrupt()
+      },
+    })
     const parser = new CcbMessageParser({
       toolUseIdToName: params.toolUseIdToName,
       onEvent: (e: SessionStreamEvent) => params.onEvent(e as EngineEvent),

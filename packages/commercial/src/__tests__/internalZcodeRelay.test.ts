@@ -127,23 +127,40 @@ describe("internal ZCode relay dispatcher", () => {
     const token = await mintRoute();
     _resetZcodeRelayStreamJournalsForTests();
     const sse = [
+      'event: message_start\n',
+      'data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1000,"output_tokens":1,"cache_read_input_tokens":300,"cache_creation_input_tokens":20}}}\n\n',
       'event: content_block_delta\n',
       'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先想"}}\n\n',
       'event: content_block_delta\r\n',
       'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"第一段"}}\r\n\r\n',
       'event: content_block_delta\n',
       'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"第二段"}}\n\n',
+      'event: message_delta\n',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":50}}\n\n',
+      'event: message_stop\n',
+      'data: {"type":"message_stop"}\n\n',
     ];
     const encodedSse = Buffer.from(sse.join(""), "utf8");
     const splitAt = encodedSse.indexOf(Buffer.from("第一段", "utf8")) + 1;
     const chunks = [encodedSse.subarray(0, splitAt), encodedSse.subarray(splitAt)];
+    // Second /v1/messages call on the same route (next agent-loop step): usage
+    // must accumulate across calls so the container can price the whole turn.
+    const secondSse = Buffer.from([
+      'event: message_start\n',
+      'data: {"type":"message_start","message":{"id":"msg_2","usage":{"input_tokens":2000,"output_tokens":2}}}\n\n',
+      'event: content_block_delta\n',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"第三段"}}\n\n',
+      // No message_delta/message_stop: stream end must still fold the
+      // in-flight message_start counts into the total.
+    ].join(""), "utf8");
+    let calls = 0;
     const handler = makeZcodeRelayHandler({
       identityRepo: repo(),
       codingPlanKey: "not-a-real-key",
       requestFn: (async () => ({
         statusCode: 200,
         headers: { "content-type": "text/event-stream", connection: "close" },
-        body: Readable.from(chunks),
+        body: Readable.from(++calls === 1 ? chunks : [secondSse]),
       })) as never,
     });
     const server = createServer((req, res) => { void handler(req, res, CTX); });
@@ -162,6 +179,12 @@ describe("internal ZCode relay dispatcher", () => {
       );
       assert.equal(response.status, 200);
       assert.equal(await response.text(), encodedSse.toString("utf8"));
+      const firstUsage = {
+        input_tokens: 1000,
+        output_tokens: 50,
+        cache_read_input_tokens: 300,
+        cache_creation_input_tokens: 20,
+      };
       const eventsResponse = await fetch(
         `http://127.0.0.1:${port}${ZCODE_RELAY_PREFIX}/route/${token}/events?after=0`,
         { headers: { authorization: `Bearer ${CONTAINER_TOKEN}` } },
@@ -175,6 +198,7 @@ describe("internal ZCode relay dispatcher", () => {
         ],
         next: 3,
         done: true,
+        usage: firstUsage,
       });
       const tail = await fetch(
         `http://127.0.0.1:${port}${ZCODE_RELAY_PREFIX}/route/${token}/events?after=2`,
@@ -184,6 +208,35 @@ describe("internal ZCode relay dispatcher", () => {
         events: [{ seq: 3, kind: "text", text: "第二段" }],
         next: 3,
         done: true,
+        usage: firstUsage,
+      });
+      const second = await fetch(
+        `http://127.0.0.1:${port}${ZCODE_RELAY_PREFIX}/route/${token}/v1/messages`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${CONTAINER_TOKEN}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ model: "ignored", messages: [] }),
+        },
+      );
+      assert.equal(second.status, 200);
+      await second.text();
+      const afterSecond = await fetch(
+        `http://127.0.0.1:${port}${ZCODE_RELAY_PREFIX}/route/${token}/events?after=3`,
+        { headers: { authorization: `Bearer ${CONTAINER_TOKEN}` } },
+      );
+      assert.deepEqual(await afterSecond.json(), {
+        events: [{ seq: 4, kind: "text", text: "第三段" }],
+        next: 4,
+        done: true,
+        usage: {
+          input_tokens: 3000,
+          output_tokens: 52,
+          cache_read_input_tokens: 300,
+          cache_creation_input_tokens: 20,
+        },
       });
       const denied = await fetch(
         `http://127.0.0.1:${port}${ZCODE_RELAY_PREFIX}/route/${token}/events?after=0`,

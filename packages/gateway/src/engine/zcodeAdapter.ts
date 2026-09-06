@@ -26,6 +26,7 @@ import type {
 } from './engineEvents.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
+import { CREDIT_EXHAUSTED_DETAIL, CreditBudgetGuard } from '../creditExhaustion.js'
 import { classifyRunError } from '../errorClassify.js'
 import { createLogger } from '../logger.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
@@ -94,6 +95,11 @@ interface ZcodeTurnContext {
   errorDetail: string | null
   resolveDrain: (() => void) | null
   resolveSummary: (summary: TurnSummary | null) => void
+  /** OCV5-92: master-admitted spendable budget → hard-stop mid-turn. */
+  creditGuard: CreditBudgetGuard
+  /** Latest relay-metered cumulative usage (fallback when the CLI is killed
+   * before it prints final JSON). */
+  relayUsage: ZcodeTurnContext['lastUsage'] | null
   lastUsage: {
     inputTokens: number
     outputTokens: number
@@ -495,6 +501,8 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       errorDetail: null,
       resolveDrain: null,
       resolveSummary,
+      creditGuard: null as unknown as CreditBudgetGuard,
+      relayUsage: null,
       lastUsage: parseUsage({}),
       spawnedWithResume: false,
       staleResumeRetried: false,
@@ -513,6 +521,14 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       contentParts: new Map(),
       pendingHookRecords: new Map(),
     }
+    ctx.creditGuard = new CreditBudgetGuard({
+      budgetFen: params.creditBudgetFen,
+      modelId: () => this.currentModel,
+      // zcodeCatalogSettle prices at catalog multiplier only.
+      composeAgentMultiplier: false,
+      isLive: () => this.active === ctx && !ctx.terminal,
+      onExhausted: () => this.abortTurnForCredits(ctx),
+    })
     this.active = ctx
     this.lastActivityAt = Date.now()
     const submitted = this.spawnTurn(ctx).catch((err) => {
@@ -682,6 +698,22 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       const body = await response.json() as {
         events?: unknown
         next?: unknown
+        usage?: unknown
+      }
+      // OCV5-92: the relay journals cumulative upstream usage for this route
+      // token. Meter it while the CLI is still running instead of waiting for
+      // the final JSON, so an exhausted wallet stops the agentic loop early.
+      if (body.usage && typeof body.usage === 'object' && !Array.isArray(body.usage)) {
+        const live = parseUsage(body.usage)
+        if (live.totalTokens > 0 && !ctx.terminal) {
+          ctx.relayUsage = live
+          ctx.creditGuard.observe({
+            inputTokens: live.inputTokens,
+            outputTokens: live.outputTokens,
+            cacheReadTokens: live.cacheReadTokens,
+            cacheCreationTokens: live.cacheWriteTokens,
+          })
+        }
       }
       if (Array.isArray(body.events)) {
         for (const raw of body.events) {
@@ -1244,22 +1276,49 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     this.finalize(ctx, true)
   }
 
+  /** OCV5-92: running cost reached the admitted budget. Kill only this
+   * turn's process; the close handler drains and finalizes with the tokens
+   * already observed. */
+  private abortTurnForCredits(ctx: ZcodeTurnContext): void {
+    if (ctx.terminal || ctx.abandoned) return
+    log.warn('zcode turn aborted: credit budget exhausted', {
+      budgetFen: ctx.params.creditBudgetFen?.toString(),
+    })
+    // Mark as interrupted so the close handler does not treat the SIGINT
+    // exit code as a crash / stale-resume retry; finalize relabels it.
+    ctx.interrupted = true
+    ctx.errorDetail = CREDIT_EXHAUSTED_DETAIL
+    if (ctx.proc && !ctx.proc.killed) killProcessGroup(ctx.proc, 'SIGINT')
+  }
+
   private finalize(ctx: ZcodeTurnContext, isError: boolean): void {
     if (ctx.terminal) return
     ctx.terminal = true
     ctx.params.sessionTotals.turns += 1
-    const cls = ctx.errorDetail ? unavailable(ctx.errorDetail) : null
-    const errorClass = ctx.errorDetail ? classifyRunError(ctx.errorDetail).code : undefined
-    const safeDetail = ctx.interrupted
-      ? 'Turn cancelled'
-      : cls === 'auth'
-        ? 'Authentication unavailable'
-        : cls === 'quota'
-          ? 'Quota unavailable'
-          : ctx.errorDetail
-            ? 'CLI failed'
-            : null
-    this.emitExternalBilling(ctx, isError, cls)
+    const creditExhausted = ctx.creditGuard.isExhausted
+    if (creditExhausted) {
+      isError = true
+      ctx.errorDetail = CREDIT_EXHAUSTED_DETAIL
+      // The CLI was killed before it printed final JSON: bill the
+      // relay-metered cumulative usage instead of zeros.
+      if (ctx.lastUsage.totalTokens === 0 && ctx.relayUsage) ctx.lastUsage = ctx.relayUsage
+    }
+    const cls = !creditExhausted && ctx.errorDetail ? unavailable(ctx.errorDetail) : null
+    const errorClass = creditExhausted
+      ? 'insufficient_credits' as const
+      : ctx.errorDetail ? classifyRunError(ctx.errorDetail).code : undefined
+    const safeDetail = creditExhausted
+      ? CREDIT_EXHAUSTED_DETAIL
+      : ctx.interrupted
+        ? 'Turn cancelled'
+        : cls === 'auth'
+          ? 'Authentication unavailable'
+          : cls === 'quota'
+            ? 'Quota unavailable'
+            : ctx.errorDetail
+              ? 'CLI failed'
+              : null
+    this.emitExternalBilling(ctx, isError, cls, creditExhausted)
     if (isError) ctx.params.onEvent({ kind: 'error', error: safeDetail ?? 'CLI failed', errorClass })
     ctx.params.onEvent({
       kind: 'final',
@@ -1269,7 +1328,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         cacheReadTokens: ctx.lastUsage.cacheReadTokens,
         cacheCreationTokens: ctx.lastUsage.cacheWriteTokens,
         totalTokens: ctx.lastUsage.totalTokens,
-        stopReason: ctx.interrupted ? 'interrupted' : undefined,
+        stopReason: creditExhausted ? 'error' : ctx.interrupted ? 'interrupted' : undefined,
         cost: 0,
       },
     })
@@ -1288,7 +1347,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       thinkingSegments: ctx.thinkingSegments.map((segment) => ({ ...segment })),
       tools: [...ctx.tools.values()].map(({ entry }) => ({ ...entry })),
       runtimeEvents: [],
-      stopReason: ctx.interrupted ? 'interrupted' : null,
+      stopReason: creditExhausted ? 'error' : ctx.interrupted ? 'interrupted' : null,
       numTurns: 1,
       isError,
       ...(isError ? { errorKind: 'other' as const, errorClass, errorDetail: safeDetail ?? ctx.errorDetail! } : {}),
@@ -1297,10 +1356,22 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     })
   }
 
-  private emitExternalBilling(ctx: ZcodeTurnContext, isError: boolean, cls: 'auth' | 'quota' | null): void {
+  private emitExternalBilling(
+    ctx: ZcodeTurnContext,
+    isError: boolean,
+    cls: 'auth' | 'quota' | null,
+    creditExhausted = false,
+  ): void {
     if (!ctx.params.requestId || !REQUEST_ID_RE.test(ctx.params.requestId)) return
-    const status: EngineExternalBillingEvent['status'] = cls ? 'unavailable' : isError ? 'error' : 'success'
-    const terminalCode = ctx.interrupted
+    // A budget hard-stop settles the consumed tokens as `success` (master
+    // clamp still applies). zcodeCatalogSettle only charges engineOk, so an
+    // `error`/USER_CANCELLED label here would make the overage free.
+    const status: EngineExternalBillingEvent['status'] = creditExhausted
+      ? 'success'
+      : cls ? 'unavailable' : isError ? 'error' : 'success'
+    const terminalCode = creditExhausted
+      ? undefined
+      : ctx.interrupted
       ? 'USER_CANCELLED'
       : cls === 'auth'
         ? 'AUTH_UNAVAILABLE'

@@ -9,6 +9,7 @@ import protobuf from 'protobufjs'
 import { CURSOR_ENGINE_MODELS, CURSOR_SESSION_CLIENT_VERSION, cursorSessionChecksum } from '@openclaude/protocol'
 import { CursorSandRelay, encodeCursorSandRequest, recoverXmlToolCalls } from '../engine/cursorSandRelay.js'
 import { CursorSandAdapter } from '../engine/cursorSandAdapter.js'
+import { CREDIT_EXHAUSTED_DETAIL } from '../creditExhaustion.js'
 import {
   cursorSandEnabledForSelection,
   cursorSelectionUserId,
@@ -535,6 +536,55 @@ test('transient Sand turn errors never record a slot failure; credential rejecti
     assert.equal(billing[0].cursorAccountId, '42', testCase.detail)
     await adapter.shutdown()
   }
+})
+
+test('OCV5-92 credit-budget hard-stop settles Sand usage as success (never USER_CANCELLED / ENGINE_ERROR)', async () => {
+  const relay = {
+    async start() { return 'http://127.0.0.1:12345/route/test' },
+    async close() {},
+  } as unknown as CursorSandRelay
+  const recorded: Array<'ok' | 'fail'> = []
+  // CcbAdapter relabels its own budget interrupt into this exact summary shape.
+  const run = {
+    ...inertRun(),
+    summary: Promise.resolve({
+      usage: { cost: 0, inputTokens: 900_000, outputTokens: 40_000, cacheReadTokens: 10, cacheCreationTokens: 0, totalTokens: 940_010 },
+      assistantText: 'partial', thinkingText: '', assistantSegments: [], thinkingSegments: [],
+      tools: [], runtimeEvents: [], stopReason: 'error', numTurns: 1,
+      isError: true, staleResumeId: false,
+      errorKind: 'other', errorClass: 'insufficient_credits', errorDetail: CREDIT_EXHAUSTED_DETAIL,
+      phantomSignals: { apiState: 'called', skipReason: null },
+    }),
+    finalized: true,
+  }
+  const adapter = new CursorSandAdapter({
+    sessionKey: 'agent:main:test:sand-credit-exhausted', agentId: 'main', agentBaseDir: process.cwd(),
+    config: {} as never, model: 'cursor-fable-5-high', cursorCredentialSelection: STABLE_SAND_SELECTION,
+  }, relay, () => run as never, (result) => recorded.push(result))
+  const billing: Array<Record<string, unknown>> = []
+  adapter.on('external_billing', (event) => billing.push(event as Record<string, unknown>))
+  const submitted = adapter.submitTurn({
+    input: 'hello', requestId: 'e'.repeat(32),
+    sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map(),
+    onEvent() {}, onPostTerminalRuntimeEvent() {},
+  })
+  await submitted.submitted
+  const summary = await submitted.summary
+  await new Promise((resolvePromise) => setImmediate(resolvePromise))
+  assert.equal(summary?.errorClass, 'insufficient_credits')
+  assert.equal(billing.length, 1)
+  // cursorExternalSettle charges `success` and USER_CANCELLED; ENGINE_ERROR
+  // would waive the drained remainder. The tokens were really consumed.
+  assert.equal(billing[0].status, 'success')
+  assert.equal('terminalCode' in billing[0], false)
+  assert.deepEqual(billing[0].usage, {
+    input_tokens: 900_000, output_tokens: 40_000,
+    cache_read_input_tokens: 10, cache_creation_input_tokens: 0,
+  })
+  // Budget exhaustion says nothing bad about the credential.
+  assert.deepEqual(recorded, ['ok'])
+  assert.deepEqual(billing[0].cursorSlotResults, [{ slot: 2, result: 'ok' }])
+  await adapter.shutdown()
 })
 
 test('interrupt before cold Sand preparation prevents submission', async () => {
