@@ -1,8 +1,8 @@
 /** 会话超过此条数（拍平后的 items）才窗口化渲染。测试可经 props 覆盖。 */
 export const VIRTUALIZE_THRESHOLD = 120;
 
-/** 会话行两行（标题 + 预览占位），含触控靶。 */
-export const SESSION_ROW_HEIGHT = 56;
+/** 会话行固定为单行（含触控 ≥44px）。 */
+export const SESSION_ROW_HEIGHT = 44;
 
 export const GROUP_HEADER_HEIGHT = 32;
 export const PROJECT_ROW_HEIGHT = 44;
