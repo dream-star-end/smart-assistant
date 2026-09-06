@@ -4,7 +4,8 @@
 
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { ensureDesktopOriginCert } from "../desktop/deviceCa.js";
+import { assertOriginCertCoversHost, ensureDesktopOriginCert } from "../desktop/deviceCa.js";
+import { readDesktopPublicHost } from "../desktop/publicHost.js";
 import { extractDesktopTlsContext, stripUntrustedDeviceHeaders } from "../desktop/tlsContext.js";
 import { getDesktopFlagSnapshot } from "../desktop/flags.js";
 import {
@@ -16,6 +17,7 @@ import { createPgDesktopIdentityRepo } from "./desktopEnroll.js";
 import { DESKTOP_REGISTER_PATH, handleDesktopRegisterUpgrade } from "../ws/desktopRegister.js";
 import {
   classifyDesktopPath,
+  desktopRuntimeManifestAction,
   desktopTokenAction,
   pathnameOf,
   sendDesktopEngineDisabled,
@@ -36,6 +38,8 @@ export interface DesktopTlsHandlers {
   tokenMint?: (req: IncomingMessage, res: ServerResponse) => Promise<void> | void;
   /** Master-only: device mTLS token refresh. Egress omits → 404. */
   tokenRefresh?: (req: IncomingMessage, res: ServerResponse) => Promise<void> | void;
+  /** Master-only: runtime manifest (device mTLS). Egress omits → 404. */
+  runtimeManifest?: (req: IncomingMessage, res: ServerResponse) => Promise<void> | void;
 }
 
 export type DesktopTlsRole = "master" | "egress";
@@ -80,6 +84,7 @@ export async function startDesktopTlsListener(opts: DesktopTlsListenerOpts): Pro
   const flags = await getDesktopFlagSnapshot();
   if (!flags.assembled) return null;
   const origin = await ensureDesktopOriginCert();
+  await assertOriginCertCoversHost(origin.certPem, readDesktopPublicHost());
   const role: DesktopTlsRole = opts.role ?? "master";
   const allowRegister = opts.allowRegister ?? role !== "egress";
   const explicit = opts.bind !== undefined && opts.port !== undefined;
@@ -185,6 +190,32 @@ async function handleHttps(
     // credential + fp). They must not go through oc-v3 verifyDesktopIdentity.
     try {
       await tokenHandler(req, res);
+    } catch (err) {
+      if (err instanceof HttpError) {
+        if (!res.headersSent) sendJson(res, err.status, { error: { code: err.code, message: err.message } });
+        return;
+      }
+      throw err;
+    }
+    return;
+  }
+  if (kind === "runtimeManifest") {
+    if (desktopRuntimeManifestAction(role, kind) !== "handle") {
+      sendDesktopNotFound(res);
+      return;
+    }
+    const manifestHandler = opts.handlers.runtimeManifest;
+    if (!manifestHandler) {
+      sendDesktopNotFound(res);
+      return;
+    }
+    const tlsManifest = extractDesktopTlsContext(req);
+    if (!tlsManifest) {
+      sendJson(res, 401, { error: { code: "UNAUTHORIZED", message: "container identity verification failed" } });
+      return;
+    }
+    try {
+      await manifestHandler(req, res);
     } catch (err) {
       if (err instanceof HttpError) {
         if (!res.headersSent) sendJson(res, err.status, { error: { code: err.code, message: err.message } });

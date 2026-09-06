@@ -9,9 +9,12 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { DESKTOP_SPIFFE_PREFIX } from "./flags.js";
+import { readDesktopPublicHost } from "./publicHost.js";
+import { rootLogger } from "../logging/logger.js";
 
 export function deviceCaDir(): string {
   if (process.env.OPENCLAUDE_DEVICE_CA_DIR?.trim()) {
@@ -104,6 +107,74 @@ export async function extractSpiffeUris(certPem: string): Promise<string[]> {
     uris.push(m[1]!.replace(/,+$/, ""));
   }
   return uris;
+}
+
+/** Frozen local SAN used when OC_DESKTOP_PUBLIC_HOST is unset. Byte-lock vs historical origin.crt. */
+export const DESKTOP_ORIGIN_SAN_LOCAL = "DNS:localhost,IP:127.0.0.1";
+
+export function desktopOriginSanString(publicHost?: string | null): string {
+  const host = typeof publicHost === "string" ? publicHost.trim() : "";
+  if (!host) return DESKTOP_ORIGIN_SAN_LOCAL;
+  if (net.isIP(host)) return `IP:${host},${DESKTOP_ORIGIN_SAN_LOCAL}`;
+  if (/[\s,/=]/.test(host)) return DESKTOP_ORIGIN_SAN_LOCAL;
+  return `DNS:${host},${DESKTOP_ORIGIN_SAN_LOCAL}`;
+}
+
+export async function extractSanEntries(certPem: string): Promise<{ dns: string[]; ip: string[]; uri: string[] }> {
+  const out = await opensslRun(["x509", "-noout", "-ext", "subjectAltName"], certPem, "verify");
+  const dns: string[] = [];
+  const ip: string[] = [];
+  const uri: string[] = [];
+  for (const m of out.matchAll(/DNS:([^,\s]+)/gi)) {
+    dns.push(m[1]!.replace(/,+$/, ""));
+  }
+  for (const m of out.matchAll(/IP Address:([^,\s]+)/gi)) {
+    ip.push(m[1]!.replace(/,+$/, ""));
+  }
+  for (const m of out.matchAll(/URI:(\S+)/g)) {
+    uri.push(m[1]!.replace(/,+$/, ""));
+  }
+  return { dns, ip, uri };
+}
+
+export async function originCertCoversHost(certPem: string, host: string): Promise<boolean> {
+  const h = host.trim();
+  if (!h) return true;
+  const { dns, ip } = await extractSanEntries(certPem);
+  if (net.isIP(h)) {
+    return ip.some((x) => x.toLowerCase() === h.toLowerCase());
+  }
+  return dns.some((x) => x.toLowerCase() === h.toLowerCase());
+}
+
+/** Warn (do not delete/reissue) when existing origin.crt SAN lacks OC_DESKTOP_PUBLIC_HOST. */
+export async function assertOriginCertCoversHost(certPem: string, host: string | null): Promise<boolean> {
+  if (!host) return true;
+  const ok = await originCertCoversHost(certPem, host);
+  if (!ok) {
+    rootLogger.warn("desktop_origin_san_mismatch", {
+      host,
+      hint: "delete origin.crt and origin.key under OPENCLAUDE_DEVICE_CA_DIR to reissue with OC_DESKTOP_PUBLIC_HOST in SAN",
+    });
+  }
+  return ok;
+}
+
+/** SPKI pin: openssl x509 -pubkey → DER → sha256 → base64. */
+export async function originSpkiPinBase64(certPem: string): Promise<string> {
+  const pubPem = await opensslRun(["x509", "-noout", "-pubkey"], certPem, "verify");
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "oc-spki-"));
+  try {
+    const pubFile = path.join(tmp, "pub.pem");
+    const derFile = path.join(tmp, "pub.der");
+    await fs.writeFile(pubFile, pubPem, { mode: 0o600 });
+    await opensslRun(["pkey", "-pubin", "-in", pubFile, "-outform", "DER", "-out", derFile], undefined, "verify");
+    const der = await fs.readFile(derFile);
+    if (der.length < 16) throw new DeviceCaError("verify", "SPKI DER too short");
+    return createHash("sha256").update(der).digest("base64");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
 }
 
 export async function certValidity(certPem: string): Promise<{ notBefore: Date; notAfter: Date }> {
@@ -377,6 +448,30 @@ export interface DesktopOriginMaterial {
   caCertPem: string;
 }
 
+/**
+ * Read origin material if already on disk. Never mkdir, never issue, never lock.
+ * Anonymous bootstrap must not create a CA.
+ */
+export async function loadDesktopOriginMaterialIfPresent(): Promise<DesktopOriginMaterial | null> {
+  const dir = deviceCaDir();
+  const caCrt = path.join(dir, "ca.crt");
+  const originKey = path.join(dir, "origin.key");
+  const originCrt = path.join(dir, "origin.crt");
+  if (!(await exists(dir))) return null;
+  if (!(await exists(caCrt)) || !(await exists(originKey)) || !(await exists(originCrt))) return null;
+  try {
+    const caCertPem = await fs.readFile(caCrt, "utf8");
+    const certPem = await fs.readFile(originCrt, "utf8");
+    const keyPem = await fs.readFile(originKey, "utf8");
+    if (!caCertPem.trim() || !certPem.trim() || !keyPem.trim()) return null;
+    await assertKeyMatchesCert(keyPem, certPem, "verify");
+    await assertCertIssuedByCa(certPem, caCertPem, "verify");
+    return { certPem, keyPem, caCertPem };
+  } catch {
+    return null;
+  }
+}
+
 /** Server leaf for 18445 (serverAuth). Isolated from 18443 host CA. */
 export async function ensureDesktopOriginCert(): Promise<DesktopOriginMaterial> {
   return withDeviceCaLock(async () => {
@@ -401,7 +496,7 @@ export async function ensureDesktopOriginCert(): Promise<DesktopOriginMaterial> 
       await fs.writeFile(
         extPath,
         [
-          "subjectAltName = DNS:localhost,IP:127.0.0.1",
+          `subjectAltName = ${desktopOriginSanString(readDesktopPublicHost())}`,
           "basicConstraints = critical, CA:FALSE",
           "keyUsage = critical, digitalSignature",
           "extendedKeyUsage = serverAuth",

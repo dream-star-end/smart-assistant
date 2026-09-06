@@ -8,11 +8,16 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
   DeviceCaError,
+  DESKTOP_ORIGIN_SAN_LOCAL,
+  assertOriginCertCoversHost,
+  desktopOriginSanString,
   ensureDeviceCa,
   ensureDesktopOriginCert,
   extractDeviceIdFromSpiffe,
+  extractSanEntries,
   extractSpiffeUris,
   issueDeviceCertificate,
+  loadDesktopOriginMaterialIfPresent,
 } from "../desktop/deviceCa.js";
 
 describe("device CA", () => {
@@ -77,6 +82,88 @@ describe("device CA", () => {
       assert.equal(a.length, 64);
       assert.equal(a, b);
     } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("origin SAN string is byte-locked without public host", () => {
+    assert.equal(desktopOriginSanString(null), DESKTOP_ORIGIN_SAN_LOCAL);
+    assert.equal(desktopOriginSanString(""), DESKTOP_ORIGIN_SAN_LOCAL);
+    assert.equal(DESKTOP_ORIGIN_SAN_LOCAL, "DNS:localhost,IP:127.0.0.1");
+    assert.equal(
+      desktopOriginSanString("desktop.example.test"),
+      "DNS:desktop.example.test,DNS:localhost,IP:127.0.0.1",
+    );
+    assert.equal(
+      desktopOriginSanString("203.0.113.9"),
+      "IP:203.0.113.9,DNS:localhost,IP:127.0.0.1",
+    );
+  });
+
+  test("no public host → origin cert SAN matches historical localhost/127.0.0.1", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oc-dca-san-local-"));
+    const prevDir = process.env.OPENCLAUDE_DEVICE_CA_DIR;
+    const prevHost = process.env.OC_DESKTOP_PUBLIC_HOST;
+    process.env.OPENCLAUDE_DEVICE_CA_DIR = dir;
+    delete process.env.OC_DESKTOP_PUBLIC_HOST;
+    try {
+      const origin = await ensureDesktopOriginCert();
+      const san = await extractSanEntries(origin.certPem);
+      assert.deepEqual(san.dns.map((d) => d.toLowerCase()).sort(), ["localhost"]);
+      assert.ok(san.ip.includes("127.0.0.1"));
+      assert.equal(san.dns.length, 1);
+      assert.equal(san.ip.length, 1);
+    } finally {
+      if (prevDir === undefined) delete process.env.OPENCLAUDE_DEVICE_CA_DIR;
+      else process.env.OPENCLAUDE_DEVICE_CA_DIR = prevDir;
+      if (prevHost === undefined) delete process.env.OC_DESKTOP_PUBLIC_HOST;
+      else process.env.OC_DESKTOP_PUBLIC_HOST = prevHost;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("public host → origin cert SAN includes host plus localhost", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oc-dca-san-host-"));
+    const prevDir = process.env.OPENCLAUDE_DEVICE_CA_DIR;
+    const prevHost = process.env.OC_DESKTOP_PUBLIC_HOST;
+    process.env.OPENCLAUDE_DEVICE_CA_DIR = dir;
+    process.env.OC_DESKTOP_PUBLIC_HOST = "desktop.example.test";
+    try {
+      const origin = await ensureDesktopOriginCert();
+      const san = await extractSanEntries(origin.certPem);
+      assert.ok(san.dns.some((d) => d.toLowerCase() === "desktop.example.test"));
+      assert.ok(san.dns.some((d) => d.toLowerCase() === "localhost"));
+      assert.ok(san.ip.includes("127.0.0.1"));
+      assert.equal(await assertOriginCertCoversHost(origin.certPem, "desktop.example.test"), true);
+    } finally {
+      if (prevDir === undefined) delete process.env.OPENCLAUDE_DEVICE_CA_DIR;
+      else process.env.OPENCLAUDE_DEVICE_CA_DIR = prevDir;
+      if (prevHost === undefined) delete process.env.OC_DESKTOP_PUBLIC_HOST;
+      else process.env.OC_DESKTOP_PUBLIC_HOST = prevHost;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("existing origin.crt is not reissued when public host is added later", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oc-dca-san-noreissue-"));
+    const prevDir = process.env.OPENCLAUDE_DEVICE_CA_DIR;
+    const prevHost = process.env.OC_DESKTOP_PUBLIC_HOST;
+    process.env.OPENCLAUDE_DEVICE_CA_DIR = dir;
+    delete process.env.OC_DESKTOP_PUBLIC_HOST;
+    try {
+      const first = await ensureDesktopOriginCert();
+      process.env.OC_DESKTOP_PUBLIC_HOST = "desktop.example.test";
+      const second = await ensureDesktopOriginCert();
+      assert.equal(first.certPem, second.certPem);
+      const san = await extractSanEntries(second.certPem);
+      assert.equal(san.dns.some((d) => d.toLowerCase() === "desktop.example.test"), false);
+      assert.equal(await assertOriginCertCoversHost(second.certPem, "desktop.example.test"), false);
+      assert.equal(await loadDesktopOriginMaterialIfPresent() !== null, true);
+    } finally {
+      if (prevDir === undefined) delete process.env.OPENCLAUDE_DEVICE_CA_DIR;
+      else process.env.OPENCLAUDE_DEVICE_CA_DIR = prevDir;
+      if (prevHost === undefined) delete process.env.OC_DESKTOP_PUBLIC_HOST;
+      else process.env.OC_DESKTOP_PUBLIC_HOST = prevHost;
       await rm(dir, { recursive: true, force: true });
     }
   });

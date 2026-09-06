@@ -316,6 +316,7 @@ import {
   handleDesktopTokenMint,
   handleDesktopTokenRefresh,
 } from './desktopEnroll.js'
+import { handleDesktopBootstrap, handleDesktopRuntimeManifest } from './desktopBootstrap.js'
 import { handleGithubCallback, handleGithubStart } from './oauthGithub.js'
 import { handleLinuxdoCallback, handleLinuxdoStart } from './oauthLinuxdo.js'
 import { dispatchOrgRoute } from './org/routes.js'
@@ -691,6 +692,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/desktop/enroll/start', handler: handleDesktopEnrollStart },
     { method: 'POST', path: '/api/desktop/enroll/confirm', handler: handleDesktopEnrollConfirm },
     { method: 'POST', path: '/api/desktop/enroll/finish', handler: handleDesktopEnrollFinish },
+    { method: 'GET', path: '/api/desktop/bootstrap', handler: handleDesktopBootstrap },
+    { method: 'GET', path: '/api/desktop/runtime-manifest', handler: handleDesktopRuntimeManifest },
     { method: 'POST', path: '/api/desktop/token', handler: handleDesktopTokenMint },
     { method: 'POST', path: '/api/desktop/token/refresh', handler: handleDesktopTokenRefresh },
     { method: 'POST', path: '/api/desktop/revoke', handler: handleDesktopRevoke },
