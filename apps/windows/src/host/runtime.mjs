@@ -6,7 +6,7 @@ import { createMuxHttpForwarder } from './muxForward.mjs'
 import { createLocalBridgeToken, createLahToken, createLahGwToken } from './tokens.mjs'
 import { createTunnelClient, TunnelState } from '../tunnel/tunnelClient.mjs'
 import { createApprovalController } from './workspace/approval.mjs'
-import { createApprovalBridge } from './approvalBridge.mjs'
+import { classifyPermissionFrame, createApprovalBridge, shouldForwardGatewayFrame } from './approvalBridge.mjs'
 import { applyWorkspaceToGatewaySpawn } from './workspace/applySpawn.mjs'
 import { buildWorkspaceEnv } from './workspace/workspaceEnv.mjs'
 import { snapshotWorkspace } from './workspace/snapshot.mjs'
@@ -179,11 +179,12 @@ export function createHostRuntime(opts = {}) {
       gatewayPort,
       localBridgeToken: tokens.localBridge,
       onGatewayFrame: (data, isBinary, { sendJson }) => {
-        if (isBinary) return false
+        if (isBinary) return true
+        const forward = shouldForwardGatewayFrame(data, isBinary, classifyPermissionFrame)
         void approvalBridge.inspectOutbound(data, { sendJson }).catch((err) => {
           emit('approval_bridge_error', { message: err.message })
         })
-        return false
+        return forward
       },
     })
 

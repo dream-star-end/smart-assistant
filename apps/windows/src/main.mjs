@@ -67,6 +67,10 @@ import { createHostSupervisor, readDesktopHostConfigFromEnv, DEFAULT_HOST_ENTRY 
 import { runLocalHostSmoke } from './localHostSmoke.mjs'
 import { createHostLogger, resolveLogsDirectory } from './host/log.mjs'
 import { createApprovalController } from './host/workspace/approval.mjs'
+import {
+  APPROVAL_PENDING_CHANNEL,
+  createPendingApprovalStore,
+} from './approvalWindow.mjs'
 import { snapshotWorkspace } from './host/workspace/snapshot.mjs'
 import { createWorkspaceStore } from './host/workspace/workspaces.mjs'
 import { createLocalModeController, LocalMode } from './localMode.mjs'
@@ -179,6 +183,8 @@ let enrollmentController = null
 let localHostIpcHandler = null
 let workspaceStore = null
 let approvalController = null
+let desktopBootstrapState = null
+const pendingApprovals = createPendingApprovalStore()
 
 function clarvyUserDataPath() {
   if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
@@ -2215,6 +2221,8 @@ function installEnrollment() {
       localMode: ensureLocalMode().mode,
       tunnelState,
       desiredLocal: ensureLocalMode().desired,
+      pendingApprovals: pendingApprovals.size,
+      bootstrapDisabled: desktopBootstrapState?.disabled === true,
     }),
     workspace: {
       setWorkspace: (rootPath) => applyWorkspaceRoot(rootPath),
@@ -2233,12 +2241,16 @@ function installEnrollment() {
     },
     approval: {
       approve(id) {
+        const resolved = pendingApprovals.resolve(id, true)
+        if (!resolved.ok) return resolved
         hostSupervisor?.sendApprovalResult(id, true)
-        return ensureApprovalController().approve(id)
+        return resolved
       },
       deny(id) {
+        const resolved = pendingApprovals.resolve(id, false)
+        if (!resolved.ok) return resolved
         hostSupervisor?.sendApprovalResult(id, false)
-        return ensureApprovalController().deny(id)
+        return resolved
       },
     },
   })
@@ -2493,8 +2505,16 @@ function installLocalAgentHost() {
     },
     onFallback: (info) => applyHostFallback(info?.reason || 'host_unavailable'),
     onApprovalRequest: (info) => {
+      const payload = pendingApprovals.add(info)
       const win = ensureLocalHostWindow()
-      if (isAlive(win)) win.show()
+      if (payload && isAlive(win) && !win.webContents.isDestroyed?.()) {
+        win.webContents.send(APPROVAL_PENDING_CHANNEL, {
+          opId: payload.opId,
+          summary: payload.summary,
+          deadlineAt: payload.deadlineAt,
+        })
+        win.show()
+      }
       ensureAppLogger().info('approval_request', { id: info?.id, kind: info?.kind })
     },
   })
