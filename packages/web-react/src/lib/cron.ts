@@ -204,3 +204,42 @@ export const WEEKDAY_OPTIONS = [1, 2, 3, 4, 5, 6, 0].map((v) => ({
   value: v,
   label: WEEKDAY_LABELS[v === 0 ? 6 : v - 1],
 }));
+
+const SOON_MS = 5 * 60 * 1000;
+
+export type NextRunKind = "soon" | "overdue" | "future" | "unknown";
+
+export type NextRunDescription = {
+  kind: NextRunKind;
+  label: string;
+  title?: string;
+};
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+function absDateTime(d: Date): string {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/** 启用中任务的下次执行文案：即将执行 / 已过点 / 相对未来 / 未知。 */
+export function describeNextRun(
+  nextRunAt: string | number | null | undefined,
+  now: number,
+): NextRunDescription {
+  if (nextRunAt == null || nextRunAt === "") {
+    return { kind: "unknown", label: "下次时间未知" };
+  }
+  const t = new Date(nextRunAt).getTime();
+  if (!Number.isFinite(t)) return { kind: "unknown", label: "下次时间未知" };
+  const d = new Date(t);
+  const title = absDateTime(d);
+  if (t > now) return { kind: "future", label: "下次", title };
+  if (now - t < SOON_MS) return { kind: "soon", label: "即将执行", title };
+  return {
+    kind: "overdue",
+    label: `已过点 · 原定 ${pad2(d.getHours())}:${pad2(d.getMinutes())}`,
+    title,
+  };
+}
