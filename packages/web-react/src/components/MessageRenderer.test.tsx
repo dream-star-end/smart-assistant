@@ -6,7 +6,7 @@ import type { OutboundMessageWire } from "../lib/chat/frames";
 import { applyOutboundMessage } from "../lib/chat/reducer";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
-import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS } from "./MessageRenderer";
+import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS, shouldShowScrollToBottom } from "./MessageRenderer";
 import * as MarkdownMod from "./Markdown";
 import { PAINT_MIN_ITEMS } from "../lib/chat/timelinePaint";
 import { createStickToBottomController } from "./chat/stickToBottom";
@@ -1529,10 +1529,10 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
   });
 
   test("无归档时不造客户端 100 条总量上限", () => {
-    const { container } = renderList(users(130));
+    renderList(users(130));
     expect(screen.getByText("m0")).toBeInTheDocument();
     expect(screen.getByText("m129")).toBeInTheDocument();
-    expect(container.querySelector("button")).toBeNull();
+    expect(screen.queryByRole("button", { name: /查看更早历史记录/ })).toBeNull();
   });
 
   test("统一时间线保留最新思考、工具和回答，完成态思考默认折叠且可完整展开", () => {
@@ -1932,8 +1932,8 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
   });
 
   test("本地翻尽 + 无归档 → 无按钮", () => {
-    const { container } = renderList(users(3), { archivedCount: 0 });
-    expect(container.querySelector("button")).toBeNull();
+    renderList(users(3), { archivedCount: 0 });
+    expect(screen.queryByRole("button", { name: /查看更早历史记录/ })).toBeNull();
   });
 
   test("云端加载中 → 原位禁用按钮并给出明确反馈", () => {
@@ -3084,5 +3084,61 @@ describe("流式指针按 messageId 换行（A4）", () => {
     const asst = s.messages.filter((m) => m.role === "assistant");
     expect(asst).toHaveLength(1);
     expect(asst[0].text).toBe("Hello");
+  });
+});
+
+describe("主时间线回到底部 FAB", () => {
+  test("shouldShowScrollToBottom 仅在离底且有消息时为真", () => {
+    expect(shouldShowScrollToBottom(false, 2)).toBe(true);
+    expect(shouldShowScrollToBottom(true, 2)).toBe(false);
+    expect(shouldShowScrollToBottom(undefined, 2)).toBe(false);
+    expect(shouldShowScrollToBottom(false, 0)).toBe(false);
+  });
+
+  test("离底时渲染按钮，贴底时不渲染，点击调用 scrollToBottom", () => {
+    const scrollToBottom = vi.fn();
+    const followBottomRef = {
+      current: false,
+      scrollToBottom,
+    };
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = [
+      mk("user", { id: "fab-u1", text: "问题", status: "replied" }),
+      mk("assistant", { id: "fab-a1", text: "回答" }),
+    ];
+    const view = render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+      />,
+      { container: scroller },
+    );
+    const btn = screen.getByTestId("scroll-to-bottom");
+    expect(btn).toHaveAttribute("aria-label", "回到底部");
+    scrollToBottom.mockClear();
+    fireEvent.click(btn);
+    expect(scrollToBottom).toHaveBeenCalledTimes(1);
+    expect(scrollToBottom).toHaveBeenCalledWith(scroller);
+    expect(followBottomRef.current).toBe(true);
+
+    followBottomRef.current = true;
+    view.rerender(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+      />,
+    );
+    fireEvent.scroll(scroller);
+    expect(screen.queryByTestId("scroll-to-bottom")).toBeNull();
+    scroller.remove();
   });
 });

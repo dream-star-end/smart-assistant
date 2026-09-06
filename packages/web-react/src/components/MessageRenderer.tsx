@@ -8,7 +8,7 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { Info, Sparkles } from "lucide-react";
+import { ChevronDown, Info, Sparkles } from "lucide-react";
 import {
   memo,
   type ReactNode,
@@ -980,6 +980,13 @@ function coalesceTeam(
 // top reveals already-resident rows; server history still uses the explicit
 // hasMore / loadOlder button (scroll never issues a network page).
 export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
+
+export function shouldShowScrollToBottom(
+  following: boolean | undefined,
+  messageCount: number,
+): boolean {
+  return messageCount > 0 && following === false;
+}
 const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
 const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
 
@@ -1116,6 +1123,21 @@ export function MessageList({
   const didSnapToBottomRef = useRef(false);
   const followBottomRefBox = useRef(followBottomRef);
   followBottomRefBox.current = followBottomRef;
+  const [following, setFollowing] = useState<boolean | undefined>(() => followBottomRef?.current);
+  useEffect(() => {
+    const el = scrollParent;
+    if (!el || !followBottomRef) {
+      setFollowing(followBottomRef?.current);
+      return;
+    }
+    const sync = () => setFollowing(followBottomRef.current);
+    sync();
+    const onScroll = () => {
+      requestAnimationFrame(sync);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [scrollParent, followBottomRef]);
   const rowHeightCacheRef = useRef<Map<string, number>>(rowHeightBucket(sessionId));
   const visibleKeysRef = useRef<string[]>([]);
   const eagerPayloadKeysRef = useRef<Set<string> | null>(null);
@@ -1961,6 +1983,22 @@ export function MessageList({
         />
       ) : null}
       {footer}
+      {shouldShowScrollToBottom(following, messages.length) && (
+        <button
+          type="button"
+          data-testid="scroll-to-bottom"
+          aria-label="回到底部"
+          className="sticky bottom-4 z-10 ml-auto flex size-9 items-center justify-center rounded-full bg-fg text-bg shadow-float animate-fade [@media(hover:none)]:size-11"
+          onClick={() => {
+            if (!scrollParent || !followBottomRef) return;
+            followBottomRef.current = true;
+            followBottomRef.scrollToBottom?.(scrollParent);
+            setFollowing(true);
+          }}
+        >
+          <ChevronDown size={18} />
+        </button>
+      )}
     </div>
   );
 }
