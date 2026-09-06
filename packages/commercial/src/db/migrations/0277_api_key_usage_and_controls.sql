@@ -27,11 +27,21 @@ ALTER TABLE user_api_keys
   ADD COLUMN IF NOT EXISTS credit_limit  BIGINT,
   ADD COLUMN IF NOT EXISTS spent_credits BIGINT NOT NULL DEFAULT 0;
 
-ALTER TABLE user_api_keys
-  DROP CONSTRAINT IF EXISTS user_api_keys_credit_limit_positive;
-ALTER TABLE user_api_keys
-  ADD CONSTRAINT user_api_keys_credit_limit_positive
-  CHECK (credit_limit IS NULL OR credit_limit > 0);
+-- Idempotent ADD CONSTRAINT (no DROP: the release migration gate rejects
+-- destructive DDL; this file must stay purely additive).
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'user_api_keys_credit_limit_positive'
+      AND conrelid = 'user_api_keys'::regclass
+  ) THEN
+    ALTER TABLE user_api_keys
+      ADD CONSTRAINT user_api_keys_credit_limit_positive
+      CHECK (credit_limit IS NULL OR credit_limit > 0);
+  END IF;
+END
+$$;
 
 COMMENT ON COLUMN usage_records.api_key_id IS
   'user_api_keys.id when the request came through the external API-key endpoint (/api/anthropic); NULL for container / web chat traffic.';
