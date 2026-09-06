@@ -119,9 +119,18 @@ const OPEN_MIGRATION_PHASES = new Set<OpenPhase | "committed" | "rolled_back">([
   "planned", "created", "detached", "attached_pre", "attached_route", "started",
 ]);
 
+interface FakeTurn {
+  agent_container_id: number;
+  status: "admitted" | "accepted" | "rejecting" | "terminal" | "manual_reconcile";
+  /** terminal_at(或 last_attempt_at / admitted_at 兜底) */
+  at: Date;
+}
+
 class FakePool {
   rows: FakeRow[] = [];
   migrations: FakeMigration[] = [];
+  /** 2026-09-06:turn_dispatches 投影,给 recentTurnPredicate 用 */
+  turns: FakeTurn[] = [];
   selectCalls = 0;
   updateActivityCalls: number[] = []; // ids 被 mark 过
   /** FOR UPDATE 重读前把这些 id 的 last_ws_activity 刷成 NOW(),模拟 SELECT 后用户重连 */
@@ -145,6 +154,21 @@ class FakePool {
 
   seedMigration(m: FakeMigration): void {
     this.migrations.push(m);
+  }
+
+  seedTurn(t: FakeTurn): void {
+    this.turns.push(t);
+  }
+
+  /** recentTurnPredicate 的语义:在飞 turn 或 cutoff 内 terminal 的 turn → 不 idle */
+  private hasRecentTurn(containerId: number, cutoffMin: number): boolean {
+    const cutoff = Date.now() - cutoffMin * 60_000;
+    return this.turns.some(
+      (t) =>
+        t.agent_container_id === containerId &&
+        (t.status === "admitted" || t.status === "accepted" || t.status === "rejecting"
+          || t.at.getTime() >= cutoff),
+    );
   }
 
   /** 是否存在该 container 的 open(non-terminal)migration ledger 行 */
@@ -205,7 +229,9 @@ class FakePool {
           (r) =>
             this.isIdle(r, cutoffMin) &&
             // R6.11 Phase 2.C — NOT EXISTS predicate
-            !this.hasOpenMigration(r.id),
+            !this.hasOpenMigration(r.id) &&
+            // 2026-09-06 — recentTurnPredicate
+            !this.hasRecentTurn(r.id, cutoffMin),
         )
         .sort(
           (a, b) =>
@@ -233,7 +259,7 @@ class FakePool {
       if (r && this.touchActivityOnReread.has(id)) {
         r.last_ws_activity = new Date();
       }
-      if (r && this.isIdle(r, cutoffMin) && !this.hasOpenMigration(id)) {
+      if (r && this.isIdle(r, cutoffMin) && !this.hasOpenMigration(id) && !this.hasRecentTurn(id, cutoffMin)) {
         return { rowCount: 1, rows: [{ id: String(r.id) }] };
       }
       return { rowCount: 0, rows: [] };
@@ -387,6 +413,60 @@ describe("runIdleSweepTick", () => {
     assert.deepEqual(captured.stopped, ["docker-aaaa"]);
     assert.deepEqual(captured.removed, ["docker-aaaa"]);
     assert.equal(pool.rows[0]!.state, "vanished");
+  });
+
+  test("用户 WS 静默 45min 但 agent 长轮 2min 前刚 terminal → 不 sweep(2026-09-06 uid4 事故)", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 7, user_id: 700, bound_ip: "172.30.1.70",
+      state: "active", port: 18789,
+      container_internal_id: "docker-7777",
+      last_ws_activity: makeStaleDate(45),
+    });
+    pool.seedTurn({ agent_container_id: 7, status: "terminal", at: makeStaleDate(2) });
+    const { docker, captured } = makeDocker();
+    const r = await runIdleSweepTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+    });
+    assert.equal(r.scanned, 0);
+    assert.equal(r.swept, 0);
+    assert.equal(captured.stopped.length, 0);
+    assert.equal(pool.rows[0]!.state, "active");
+  });
+
+  test("在飞 turn(accepted,admitted 很久以前)→ SQL 层直接排除,不进 drain", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 8, user_id: 800, bound_ip: "172.30.1.80",
+      state: "active", port: 18789,
+      container_internal_id: "docker-8888",
+      last_ws_activity: makeStaleDate(200),
+    });
+    pool.seedTurn({ agent_container_id: 8, status: "accepted", at: makeStaleDate(190) });
+    const { docker, captured } = makeDocker();
+    const r = await runIdleSweepTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+    });
+    assert.equal(r.scanned, 0);
+    assert.equal(r.swept, 0);
+    assert.equal(captured.stopped.length, 0);
+  });
+
+  test("turn 早于 cutoff 且已 terminal → 仍照常 sweep", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 9, user_id: 900, bound_ip: "172.30.1.90",
+      state: "active", port: 18789,
+      container_internal_id: "docker-9999",
+      last_ws_activity: makeStaleDate(45),
+    });
+    pool.seedTurn({ agent_container_id: 9, status: "terminal", at: makeStaleDate(40) });
+    const { docker, captured } = makeDocker();
+    const r = await runIdleSweepTick({
+      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
+    });
+    assert.equal(r.swept, 1);
+    assert.deepEqual(captured.stopped, ["docker-9999"]);
   });
 
   test("fresh active(15min)不被 sweep — 默认 cutoff=30min", async () => {
