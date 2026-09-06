@@ -73,6 +73,23 @@ test('createArtifactTlsOptions freezes rejectUnauthorized true and requires pin 
     publicOrigin: 'https://cdn.example.test',
   })
   assert.equal(same.rejectUnauthorized, true)
+  assert.equal(same.checkServerIdentity, undefined)
+  assert.equal(same.ca, undefined)
+})
+
+test('createArtifactTlsOptions ignores 18445 pin and device CA on public same-origin artifact', () => {
+  const pin = spkiSha256Base64FromPem(pem('origin.crt'))
+  const tls = createArtifactTlsOptions({
+    url: 'https://claudeai.chat/artifacts/ccb.bin',
+    publicOrigin: 'https://claudeai.chat',
+    spkiPin: pin,
+    caPem: pem('ca.crt'),
+  })
+  assert.equal(tls.rejectUnauthorized, true)
+  assert.equal(tls.minVersion, 'TLSv1.3')
+  assert.equal(tls.checkServerIdentity, undefined)
+  assert.equal(tls.ca, undefined)
+  assert.equal('ca' in tls, false)
 })
 
 test('fetchArtifact downloads over pinned https and skips when hash already matches', async () => {

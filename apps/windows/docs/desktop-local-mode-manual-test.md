@@ -49,7 +49,19 @@
 
 ## 工作区 / 审批
 
-- 步骤：选 `C:\w\proj`；尝试指向 `C:\w\proj-evil` 应拒。破坏性命令弹出本地审批窗，超时 120s 默认拒绝。
-- 判定：与 E12/E13 单测一致。
+- 步骤：选 `C:\w\proj`；尝试指向 `C:\w\proj-evil` 应拒。破坏性命令弹出**本地设置窗**（`app://clarvy-local`）`#approval`，`#approval-detail` 用 textContent 显示工具/命令/工作区。点「允许」/「拒绝」走 `approve-op`/`deny-op`。产品 WebContentsView 不应出现第二张审批卡。超时 120s 默认拒绝。
+- 判定：与 E12/E13 单测一致；伪造产品源 `approve-op` 必拒。
 
-S6 未在真机执行以上项。标「S6 未验」。
+## bootstrap 不可用
+
+- 步骤：旗关时 `GET /api/desktop/bootstrap` 404，或未配置 503 `DESKTOP_BOOTSTRAP_UNCONFIGURED`。打开本地设置窗。
+- 预期：「启用本地模式」按钮禁用，文案「服务端未开放本地模式」，不崩、不反复重连。
+- 判定：按钮 disabled；托盘不能切入本地模式。
+
+## 服务端证书更换
+
+- 步骤：缓存里已有 pin，bootstrap 下发不同 `origin_spki_pin`。
+- 预期：提示「服务端证书已更换,需要重新绑定」，本地模式停止，不自动切到新 pin。
+- 判定：须重新绑定后才能再用本地模式。
+
+S6 未在真机执行以上项。标「S6 未验」。P2b 已把本地审批窗与 bootstrap 不可用态接到客户端；真机仍待开旗。

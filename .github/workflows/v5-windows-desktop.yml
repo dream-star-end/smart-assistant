@@ -2,9 +2,9 @@ name: Aurora v5 Windows App
 
 on:
   pull_request:
-    branches: [feat/v5-desktop-client]
+    branches: [feat/v5-desktop-client, feat/v5-desktop-client-p2b]
   push:
-    branches: [feat/v5-desktop-client]
+    branches: [feat/v5-desktop-client, feat/v5-desktop-client-p2b]
 
 permissions:
   contents: read
@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$BASE_REF" == "feat/v5-desktop-client" || "$REF_NAME" == "feat/v5-desktop-client" ]]; then
+          if [[ "$BASE_REF" == "feat/v5-desktop-client" || "$REF_NAME" == "feat/v5-desktop-client" || "$BASE_REF" == "feat/v5-desktop-client-p2b" || "$REF_NAME" == "feat/v5-desktop-client-p2b" ]]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -164,6 +164,18 @@ jobs:
               Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
             }
           }
+
+      - name: Upload local-host and packaged smoke reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clarvy-windows-smoke-reports-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/clarvy-unpacked-smoke.txt
+            ${{ runner.temp }}/clarvy-unpacked-local-host-smoke.txt
+            ${{ runner.temp }}/clarvy-installed-smoke.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Smoke silent install and uninstall
         shell: pwsh

@@ -31,10 +31,48 @@ test('read-only CCB tools auto-allow', () => {
 })
 
 test('readonly bash whitelist allows ls/cat/git status/log/diff/rg/find without delete', () => {
-  for (const command of ['ls', 'ls -la /tmp', 'cat README.md', 'git status', 'git log -1', 'git diff', 'rg foo', 'find . -name *.js']) {
+  for (const command of [
+    'ls',
+    'ls -la /tmp',
+    'cat README.md',
+    'git status',
+    'git log -1',
+    'git diff',
+    'git diff --stat',
+    'rg foo',
+    'rg foo src',
+    'find . -name *.js',
+    "find . -name '*.mjs'",
+  ]) {
     const result = classifyDestructiveOp({ kind: 'Bash', command, detail: { toolName: 'Bash', command } })
     assert.equal(result.readOnly, true, command)
     assert.equal(result.needsApproval, false, command)
+  }
+})
+
+test('W-R2-1 rg --pre / find -fprintf / git --output require approval', () => {
+  const denied = [
+    'rg --pre rm foo',
+    "rg --pre-glob '*' x",
+    'rg --pre=rm foo',
+    'find . -fprintf /tmp/out %p',
+    'find . -fls /tmp/x',
+    'find . -fprint /tmp/out',
+    'find . -fprint0 /tmp/out',
+    'find . -ok rm {} ;',
+    'find . -okdir rm {} ;',
+    'git log --output=/tmp/x',
+    'git diff --output=/tmp/x',
+    'git log -o /tmp/x',
+    'ls | rm -rf /',
+    'cat $(rm -rf /tmp/x)',
+    'cat README && rm -rf src',
+    'cat a | tee b',
+  ]
+  for (const command of denied) {
+    const result = classifyDestructiveOp({ kind: 'Bash', command, detail: { toolName: 'Bash', command } })
+    assert.equal(result.needsApproval, true, command)
+    assert.equal(result.readOnly, false, command)
   }
 })
 
