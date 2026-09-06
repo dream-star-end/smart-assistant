@@ -8,6 +8,8 @@
  *   GET    /api/me/api-keys       → list 未撤销 key(无 secret / 无 keyHash)
  *   POST   /api/me/api-keys       → 创建新 key,**返完整明文一次**
  *   DELETE /api/me/api-keys/:id   → 软撤销(set revoked_at)
+ *   PATCH  /api/me/api-keys/:id   → 0277 改名 / 临时禁用 / 单 key 积分上限
+ *   GET    /api/me/api-keys/usage → 0277 消耗报表(窗口 + 可选钉单 key)
  *
  * 关键不变量(plan §4 invariant #1):**list 响应严禁含 secret / keyHash**。
  *   - repo 层用 `ApiKeySummary`(没有 keyHash 字段)从 TS 类型上锁;
@@ -44,9 +46,31 @@ import { requireAuth, type AuthedUser } from "./auth.js";
 import {
   makePgApiKeyRepo,
   ApiKeyRepoError,
+  type ApiKeyPatch,
+  type ApiKeySummary,
   type CreatedApiKey,
 } from "../auth/apiKeyRepo.js";
 import { getPool } from "../db/index.js";
+import {
+  getApiKeyUsageReport,
+  isUsageWindow,
+  parseApiKeyIdQuery,
+  type UsageWindow,
+} from "../billing/apiKeyUsageReport.js";
+
+/** list / create / patch 共用的对外形状(0277 三列一并输出;BigInt → 字符串)。 */
+function apiKeyToJson(r: ApiKeySummary) {
+  return {
+    id: r.id.toString(),
+    label: r.label,
+    key_prefix: r.keyPrefix,
+    created_at: r.createdAt.toISOString(),
+    last_used_at: r.lastUsedAt ? r.lastUsedAt.toISOString() : null,
+    disabled_at: r.disabledAt ? r.disabledAt.toISOString() : null,
+    credit_limit: r.creditLimit === null ? null : r.creditLimit.toString(),
+    spent_credits: r.spentCredits.toString(),
+  };
+}
 
 /**
  * PostgreSQL `BIGINT` 上限(2^63 - 1)。
@@ -100,15 +124,7 @@ export async function handleListMyApiKeys(
   const rows = await repo.list(BigInt(user.id));
   // 注意 BigInt 不能直接 JSON.stringify;统一 → string。
   // ApiKeySummary 类型本身没有 keyHash,这里映射出的对象天然不可能漏掉 secret。
-  sendJson(res, 200, {
-    keys: rows.map((r) => ({
-      id: r.id.toString(),
-      label: r.label,
-      key_prefix: r.keyPrefix,
-      created_at: r.createdAt.toISOString(),
-      last_used_at: r.lastUsedAt ? r.lastUsedAt.toISOString() : null,
-    })),
-  });
+  sendJson(res, 200, { keys: rows.map(apiKeyToJson) });
 }
 
 /** ────────────────────────────────────────────────────────────────────────
@@ -168,7 +184,132 @@ export async function handleCreateMyApiKey(
      */
     plaintext: created.plaintext,
     created_at: created.createdAt.toISOString(),
+    // 0277:新 key 默认未禁用 / 不限 / 0 消耗,前端列表行可直接拼装。
+    disabled_at: null,
+    credit_limit: null,
+    spent_credits: "0",
   });
+}
+
+/** `/api/me/api-keys/:id` 路径解析,PATCH / DELETE 共用;非法 → 404(不暴露存在性)。 */
+function parseKeyIdPath(req: IncomingMessage): bigint {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const m = url.pathname.match(/^\/api\/me\/api-keys\/([1-9][0-9]{0,19})$/);
+  if (!m) {
+    throw new HttpError(404, "NOT_FOUND", "expected /api/me/api-keys/:id");
+  }
+  const id = BigInt(m[1]!);
+  if (id > PG_BIGINT_MAX) {
+    throw new HttpError(404, "NOT_FOUND", "api key not found");
+  }
+  return id;
+}
+
+/** ────────────────────────────────────────────────────────────────────────
+ * PATCH /api/me/api-keys/:id { label?, disabled?, credit_limit? }(0277)
+ *
+ * 三个字段均可选、独立生效;body 里没出现的字段不动。
+ *   - label:string,trim 后 1..80(repo LABEL_INVALID → 400 INVALID_LABEL)
+ *   - disabled:boolean(true → disabled_at=now() 幂等;false → NULL)
+ *   - credit_limit:null 清除;正整数(number 或十进制字串,≤ BIGINT)设上限;
+ *     其它 → 400 INVALID_LIMIT
+ * 不存在 / 已撤销 / 非本人 → 404(同 revoke)。返回更新后的 key 元信息(无 secret)。
+ * ──────────────────────────────────────────────────────────────────────── */
+export async function handleUpdateMyApiKey(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  requireAdmin(user);
+  const id = parseKeyIdPath(req);
+  const body = await readJsonBody(req);
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new HttpError(400, "INVALID_BODY", "body must be a JSON object");
+  }
+  const b = body as { label?: unknown; disabled?: unknown; credit_limit?: unknown };
+  const patch: ApiKeyPatch = {};
+  if (b.label !== undefined) {
+    if (typeof b.label !== "string") {
+      throw new HttpError(400, "INVALID_LABEL", "label must be a string");
+    }
+    patch.label = b.label;
+  }
+  if (b.disabled !== undefined) {
+    if (typeof b.disabled !== "boolean") {
+      throw new HttpError(400, "INVALID_BODY", "disabled must be a boolean");
+    }
+    patch.disabled = b.disabled;
+  }
+  if (b.credit_limit !== undefined) {
+    if (b.credit_limit === null) {
+      patch.creditLimit = null;
+    } else {
+      const raw = b.credit_limit;
+      const str =
+        typeof raw === "number" && Number.isSafeInteger(raw)
+          ? String(raw)
+          : typeof raw === "string"
+            ? raw.trim()
+            : "";
+      if (!/^[1-9][0-9]{0,19}$/.test(str) || BigInt(str) > PG_BIGINT_MAX) {
+        throw new HttpError(400, "INVALID_LIMIT", "credit_limit must be a positive integer or null");
+      }
+      patch.creditLimit = BigInt(str);
+    }
+  }
+  if (Object.keys(patch).length === 0) {
+    throw new HttpError(400, "INVALID_BODY", "nothing to update");
+  }
+
+  const repo = makePgApiKeyRepo(getPool());
+  let updated: ApiKeySummary | null;
+  try {
+    updated = await repo.update(BigInt(user.id), id, patch);
+  } catch (err) {
+    if (err instanceof ApiKeyRepoError) {
+      if (err.code === "LABEL_INVALID") throw new HttpError(400, "INVALID_LABEL", err.message);
+      if (err.code === "LIMIT_INVALID") throw new HttpError(400, "INVALID_LIMIT", err.message);
+    }
+    throw err;
+  }
+  if (!updated) {
+    throw new HttpError(404, "NOT_FOUND", "api key not found");
+  }
+  sendJson(res, 200, apiKeyToJson(updated));
+}
+
+/** ────────────────────────────────────────────────────────────────────────
+ * GET /api/me/api-keys/usage?window=24h|7d|30d&key_id=<id>(0277)
+ *
+ * 当前 JWT user 经外接 API key 产生的消耗报表(summary / trend / by_key / by_model /
+ * recent)。key_id 可选钉单 key;非法 → 400 INVALID_USAGE_QUERY。别人的 key_id 因
+ * SQL 双重 `user_id=$1` 限定只会得到空集,不泄漏存在性。
+ * ──────────────────────────────────────────────────────────────────────── */
+export async function handleGetMyApiKeyUsage(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  requireAdmin(user);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const rawWindow = url.searchParams.get("window");
+  let window: UsageWindow = "7d";
+  if (rawWindow !== null && rawWindow !== "") {
+    if (!isUsageWindow(rawWindow)) {
+      throw new HttpError(400, "INVALID_USAGE_QUERY", "window must be 24h, 7d or 30d");
+    }
+    window = rawWindow;
+  }
+  const parsedKey = parseApiKeyIdQuery(url.searchParams.get("key_id"));
+  if (!parsedKey.ok) {
+    throw new HttpError(400, "INVALID_USAGE_QUERY", "key_id must be a positive integer");
+  }
+  const report = await getApiKeyUsageReport(user.id, window, parsedKey.keyId);
+  sendJson(res, 200, report);
 }
 
 /** ────────────────────────────────────────────────────────────────────────
@@ -192,19 +333,9 @@ export async function handleRevokeMyApiKey(
   // 这是 admin-only rollout 阶段刻意的契约 —— 用户级 endpoint 对非 admin 不开放,
   // 不区分 path 是否合法(Codex Phase 6 plan-review 同意,测试预期跟着更新)。
   requireAdmin(user);
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
-  // 严格 path:`/api/me/api-keys/:id`(id 纯数字,长度 ≤ 20 位上限同 BIGINT 文本长度)
-  const m = url.pathname.match(/^\/api\/me\/api-keys\/([1-9][0-9]{0,19})$/);
-  if (!m) {
-    throw new HttpError(404, "NOT_FOUND", "expected /api/me/api-keys/:id");
-  }
-  const id = BigInt(m[1]!);
-  // BIGINT 边缘锁:正则允许 20 位数字 → 可能超 PG BIGINT 上限;若交给 DB 会触发
-  // numeric range error 500,这里截到 404 与 "不存在" 同一返回路径,避免泄漏
-  // 内部存储类型(Codex Phase 4 plan-review MINOR 2 采纳)。
-  if (id > PG_BIGINT_MAX) {
-    throw new HttpError(404, "NOT_FOUND", "api key not found");
-  }
+  // 严格 path:`/api/me/api-keys/:id`(id 纯数字,≤ 20 位;超 BIGINT 上限 → 404,
+  // 避免 DB numeric range error 500 泄漏内部存储类型 — Codex Phase 4 MINOR 2)。
+  const id = parseKeyIdPath(req);
 
   const repo = makePgApiKeyRepo(getPool());
   const ok = await repo.revoke(BigInt(user.id), id);

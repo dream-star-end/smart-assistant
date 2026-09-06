@@ -525,6 +525,8 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
         parentTurnKey: attribution.parentTurnKey,
         parentSessionId: attribution.parentSessionId,
         delegateAgentId: attribution.delegateAgentId,
+        // 0277 per-key attribution — always an API-key identity on this route.
+        apiKeyId: args.identity.apiKey?.id ?? null,
       });
     } catch (err) {
       userLog.error("cursor_external_settle_failed", { model, accountId: accountId.toString(), err: errSummary(err) });

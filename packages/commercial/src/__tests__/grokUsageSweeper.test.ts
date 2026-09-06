@@ -16,6 +16,7 @@ import {
 import { GrokOAuthRefreshError } from '../account-pool/grokOAuth.js'
 import {
   grokUsagePatchFromSnapshot,
+  grokUsageWeightInputsChanged,
   isGrokUsageSweepCandidate,
   refreshGrokAccountUsage,
   sweepGrokUsageOnce,
@@ -164,6 +165,41 @@ test('refreshGrokAccountUsage records the fetch failure reason and keeps previou
   assert.equal(token.every((b) => b === 0), true, 'token buffer wiped after use')
 })
 
+test('grokUsageWeightInputsChanged buckets pct by 5% and period_end by day', () => {
+  const day = new Date('2026-09-11T04:33:28.612Z')
+  const laterSameDay = new Date('2026-09-11T20:00:00.000Z')
+  const nextDay = new Date('2026-09-12T04:33:28.612Z')
+  const before = { grok_credit_usage_pct: 8, grok_credit_period_end: day }
+  assert.equal(
+    grokUsageWeightInputsChanged(before, { grok_credit_usage_pct: 9, grok_credit_period_end: day }),
+    false,
+    '8→9 stays in the same 5% bucket',
+  )
+  assert.equal(
+    grokUsageWeightInputsChanged(before, { grok_credit_usage_pct: 13, grok_credit_period_end: day }),
+    true,
+    '8→13 crosses a 5% boundary',
+  )
+  assert.equal(
+    grokUsageWeightInputsChanged(before, { grok_credit_usage_pct: 8, grok_credit_period_end: laterSameDay }),
+    false,
+    'same calendar day, different hour is not a change',
+  )
+  assert.equal(
+    grokUsageWeightInputsChanged(before, { grok_credit_usage_pct: 8, grok_credit_period_end: nextDay }),
+    true,
+    'crossing a day boundary matters',
+  )
+  assert.equal(
+    grokUsageWeightInputsChanged(
+      { grok_credit_usage_pct: null, grok_credit_period_end: null },
+      { grok_credit_usage_pct: 8, grok_credit_period_end: day },
+    ),
+    true,
+    'null → value is a change',
+  )
+})
+
 test('refreshGrokAccountUsage persists columns + snapshot and warms the cache', async () => {
   clearGrokUsageCache()
   const queries: Array<{ text: string; params: unknown[] }> = []
@@ -182,6 +218,7 @@ test('refreshGrokAccountUsage persists columns + snapshot and warms the cache', 
   })
   assert.equal(result.ok, true)
   if (!result.ok) return
+  assert.equal(result.weightInputsChanged, true, 'row 初值 null,快照 pct 8 → true')
   assert.equal(queries.length, 1)
   assert.match(queries[0].text, /grok_credit_usage_pct\s*=\s*COALESCE\(\$2::numeric/)
   assert.match(queries[0].text, /grok_usage_snapshot\s*=\s*\$7::jsonb/)
@@ -196,6 +233,45 @@ test('refreshGrokAccountUsage persists columns + snapshot and warms the cache', 
   assert.match(String(queries[0].params[6]), /^(?!.*access-token-bytes)/, 'snapshot never carries the token')
   assert.equal(token.every((b) => b === 0), true)
   assert.equal(getCachedGrokUsage('14', NOW)?.credits.usage_percent, 8)
+  clearGrokUsageCache()
+})
+
+test('refreshGrokAccountUsage weightInputsChanged is false when pct stays in the same 5% bucket', async () => {
+  clearGrokUsageCache()
+  const periodEnd = new Date('2026-09-11T04:33:28.612Z')
+  const token = Buffer.from('access-token-bytes')
+  const result = await refreshGrokAccountUsage(
+    row({ grok_credit_usage_pct: 8, grok_credit_period_end: periodEnd }),
+    {
+      now: () => NOW,
+      getToken: async () => token,
+      fetchUsage: async () => usageSnapshot(9, 8, '2026-09-04T04:33:28.612Z', '2026-09-11T04:33:28.612Z', 'SuperGrokPro'),
+      query: async () => {},
+    },
+  )
+  assert.equal(result.ok, true)
+  if (!result.ok) return
+  assert.equal(result.weightInputsChanged, false, 'row 初值 8 快照 9 → false')
+  clearGrokUsageCache()
+})
+
+test('refreshGrokAccountUsage compares against the COALESCEd value when the snapshot lacks a number', async () => {
+  clearGrokUsageCache()
+  const periodEnd = new Date('2026-09-11T04:33:28.612Z')
+  const snap = emptyGrokUsageSnapshot(NOW) // usage_percent / period_end stay null → UPDATE keeps old columns
+  snap.account.subscription_tier = 'SuperGrokPro'
+  const result = await refreshGrokAccountUsage(
+    row({ grok_credit_usage_pct: 8, grok_credit_period_end: periodEnd }),
+    {
+      now: () => NOW,
+      getToken: async () => Buffer.from('access-token-bytes'),
+      fetchUsage: async () => snap,
+      query: async () => {},
+    },
+  )
+  assert.equal(result.ok, true)
+  if (!result.ok) return
+  assert.equal(result.weightInputsChanged, false, 'null patch value COALESCEs onto 8 → nothing moved')
   clearGrokUsageCache()
 })
 
@@ -230,6 +306,7 @@ test('sweepGrokUsageOnce isolates failures, skips ineligible rows, and never thr
   assert.equal(summary.refreshed, 0)
   assert.equal(summary.failed, 4)
   assert.equal(summary.skipped, 0)
+  assert.equal(summary.weightChanged, 0)
   assert.equal(sleeps.length, 3, 'paced between accounts, not after the last')
 
   const listingFailed = await sweepGrokUsageOnce({
@@ -238,7 +315,7 @@ test('sweepGrokUsageOnce isolates failures, skips ineligible rows, and never thr
     fetchUsage: async () => { throw new Error('must not run') },
     query: async () => { throw new Error('must not run') },
   })
-  assert.deepEqual(listingFailed, { scanned: 0, refreshed: 0, failed: 0, skipped: 0 })
+  assert.deepEqual(listingFailed, { scanned: 0, refreshed: 0, failed: 0, skipped: 0, weightChanged: 0 })
   clearGrokUsageCache()
 })
 
@@ -264,4 +341,25 @@ test('sweepGrokUsageOnce counts token_terminal as skipped and a success as refre
   assert.equal(summary.refreshed, 1)
   assert.equal(summary.skipped, 2)
   assert.equal(summary.failed, 0)
+  assert.equal(summary.weightChanged, 1, 'null → pct 12 moves the 5% bucket')
+})
+
+test('sweepGrokUsageOnce weightChanged counts only bucketed input moves', async () => {
+  const periodEndIso = '2026-09-11T00:00:00.000Z'
+  const periodEnd = new Date(periodEndIso)
+  const rows = [
+    row({ id: 30n, grok_credit_usage_pct: 8, grok_credit_period_end: periodEnd }),
+    row({ id: 31n, grok_credit_usage_pct: null, grok_credit_period_end: null }),
+  ]
+  const summary = await sweepGrokUsageOnce({
+    now: () => NOW,
+    listGrokAccounts: async () => rows,
+    sleep: async () => {},
+    getToken: async () => Buffer.from('access-token-bytes'),
+    fetchUsage: async () => usageSnapshot(9, 9, '2026-09-04T00:00:00.000Z', periodEndIso, 'SuperGrok'),
+    query: async () => {},
+  })
+  assert.equal(summary.scanned, 2)
+  assert.equal(summary.refreshed, 2)
+  assert.equal(summary.weightChanged, 1, '8→9 same day is not a change; null→9 is')
 })

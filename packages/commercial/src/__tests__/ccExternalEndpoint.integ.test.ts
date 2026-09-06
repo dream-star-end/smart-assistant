@@ -231,6 +231,10 @@ function buildFakePool(override: FakePoolOverride = {}) {
     if (head.startsWith("UPDATE USER_API_KEYS SET LAST_USED_AT")) {
       return { rows: [], rowCount: 1 };
     }
+    // 0277 settle 同事务累加 spent_credits(api_key_id 非空时)
+    if (head.startsWith("UPDATE USER_API_KEYS SET SPENT_CREDITS")) {
+      return { rows: [], rowCount: 1 };
+    }
     // user_api_keys.findByPrefix — fakeApiKeyRepo 自己 mock,不会落到这条
     // user_api_keys.list / revoke 同理
 
@@ -382,6 +386,9 @@ function makeDefaultRow(): ApiKeyRow {
     keyHash: hashSecretBytes(FIXED_SECRET),
     createdAt: new Date("2026-05-18T00:00:00Z"),
     lastUsedAt: null,
+    disabledAt: null,
+    creditLimit: null,
+    spentCredits: 0n,
   };
 }
 
@@ -399,6 +406,7 @@ function buildApiKeyRepoSpy(initialRow: ApiKeyRow | null = makeDefaultRow()): Ap
     },
     async list(): Promise<ApiKeySummary[]> { return []; },
     async revoke(): Promise<boolean> { return false; },
+    async update(): Promise<ApiKeySummary | null> { return null; },
     async touchLastUsed(id: bigint): Promise<void> {
       touchLastUsedCalls.push(id);
     },

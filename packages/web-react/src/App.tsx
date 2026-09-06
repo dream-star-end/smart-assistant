@@ -2910,6 +2910,8 @@ export function App() {
     onOpenMediaTasks:
       demo || mediaTasksAvailable === false ? undefined : () => setMediaTasksOpen(true),
     onOpenChatGptProxy: !demo && chatGptProxyEnabled ? () => setChatGptProxyOpen(true) : undefined,
+    // 「API 接入」:admin-only rollout(与后端 requireAdmin / strategy Layer 2 同门)。
+    onOpenApiAccess: !demo && user?.role === "admin" ? () => openSettings("api-access") : undefined,
     theme,
     onCycleTheme: cycle,
     // 管理后台入口:仅平台超管(user.role === 'admin')可见,导航到 React 管理后台
@@ -3036,6 +3038,7 @@ export function App() {
           onOpenOrg={closeMobileThen(sidebarProps.onOpenOrg)}
           onOpenMediaTasks={closeMobileThen(sidebarProps.onOpenMediaTasks)}
           onOpenChatGptProxy={closeMobileThen(sidebarProps.onOpenChatGptProxy)}
+          onOpenApiAccess={closeMobileThen(sidebarProps.onOpenApiAccess)}
           onLogout={closeMobileThen(sidebarProps.onLogout)}
           width={undefined}
           onResizeStart={undefined}

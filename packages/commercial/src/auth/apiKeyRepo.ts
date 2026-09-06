@@ -36,7 +36,7 @@ const KEY_PREFIX_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz";
  */
 export class ApiKeyRepoError extends Error {
   constructor(
-    readonly code: "LABEL_INVALID" | "PREFIX_COLLISION_RETRIES_EXHAUSTED",
+    readonly code: "LABEL_INVALID" | "LIMIT_INVALID" | "PREFIX_COLLISION_RETRIES_EXHAUSTED",
     message: string,
   ) {
     super(message);
@@ -58,6 +58,12 @@ export interface ApiKeyRow {
   keyHash: Buffer;
   createdAt: Date;
   lastUsedAt: Date | null;
+  /** 0277:临时禁用时间;非 null → strategy 拒绝(401)。 */
+  disabledAt: Date | null;
+  /** 0277:单 key 名义积分上限;null = 不限。 */
+  creditLimit: bigint | null;
+  /** 0277:经该 key 已结算的名义积分累计(预检缓存)。 */
+  spentCredits: bigint;
 }
 
 /**
@@ -71,6 +77,18 @@ export interface ApiKeySummary {
   keyPrefix: string;
   createdAt: Date;
   lastUsedAt: Date | null;
+  disabledAt: Date | null;
+  creditLimit: bigint | null;
+  spentCredits: bigint;
+}
+
+/** PATCH /api/me/api-keys/:id 允许修改的字段(0277)。缺省字段不动。 */
+export interface ApiKeyPatch {
+  label?: string;
+  /** true → disabled_at = now()(已禁用则保持原时间);false → NULL。 */
+  disabled?: boolean;
+  /** null → 清除上限;bigint 必须 > 0。 */
+  creditLimit?: bigint | null;
 }
 
 /**
@@ -117,6 +135,14 @@ export interface ApiKeyRepo {
   revoke(userId: bigint, id: bigint): Promise<boolean>;
 
   /**
+   * 0277:改名 / 临时禁用 / 单 key 上限。`WHERE user_id=$1 AND id=$2 AND revoked_at IS NULL`,
+   * 返 null = 不存在 OR 已撤销 OR 不属于该 user(caller 404,不暴露存在性)。
+   * 空 patch 不发 UPDATE,直接返当前行。label 校验与 create 同(trim 后 1..80);
+   * creditLimit ≤ 0 → LIMIT_INVALID。
+   */
+  update(userId: bigint, id: bigint, patch: ApiKeyPatch): Promise<ApiKeySummary | null>;
+
+  /**
    * 更新 `last_used_at = now()`。Phase 2 strategy fire-and-forget 调用。
    *
    * repo 内**不**catch 错误 — 让 caller 决定 best-effort 策略
@@ -160,34 +186,31 @@ export function hashApiKeySecret(secretHex: string): Buffer {
   return createHash("sha256").update(Buffer.from(secretHex, "hex")).digest();
 }
 
-interface DbRowFull {
-  id: string;
-  user_id: string;
-  label: string;
-  key_prefix: string;
-  key_hash: Buffer;
-  created_at: Date;
-  last_used_at: Date | null;
-}
-
 interface DbRowSummary {
   id: string;
   label: string;
   key_prefix: string;
   created_at: Date;
   last_used_at: Date | null;
+  disabled_at: Date | null;
+  /** BIGINT 以十进制字符串返回(pg 默认),可能为 null。 */
+  credit_limit: string | null;
+  spent_credits: string;
 }
 
-function mapFullRow(r: DbRowFull): ApiKeyRow {
-  return {
-    id: BigInt(r.id),
-    userId: BigInt(r.user_id),
-    label: r.label,
-    keyPrefix: r.key_prefix,
-    keyHash: r.key_hash,
-    createdAt: r.created_at,
-    lastUsedAt: r.last_used_at,
-  };
+interface DbRowFull extends DbRowSummary {
+  user_id: string;
+  key_hash: Buffer;
+}
+
+/** 0277 之前的 fake pool / 旧快照可能没这三列:缺省按 "未禁用 / 不限 / 0" 解释。 */
+function optBigInt(v: string | number | bigint | null | undefined): bigint | null {
+  if (v === null || v === undefined || v === "") return null;
+  try {
+    return BigInt(v);
+  } catch {
+    return null;
+  }
 }
 
 function mapSummaryRow(r: DbRowSummary): ApiKeySummary {
@@ -197,8 +220,23 @@ function mapSummaryRow(r: DbRowSummary): ApiKeySummary {
     keyPrefix: r.key_prefix,
     createdAt: r.created_at,
     lastUsedAt: r.last_used_at,
+    disabledAt: r.disabled_at ?? null,
+    creditLimit: optBigInt(r.credit_limit),
+    spentCredits: optBigInt(r.spent_credits) ?? 0n,
   };
 }
+
+function mapFullRow(r: DbRowFull): ApiKeyRow {
+  return {
+    ...mapSummaryRow(r),
+    userId: BigInt(r.user_id),
+    keyHash: r.key_hash,
+  };
+}
+
+/** SELECT 列白名单(**不含 key_hash**),list / update RETURNING 共用。 */
+const SUMMARY_COLUMNS =
+  "id, label, key_prefix, created_at, last_used_at, disabled_at, credit_limit, spent_credits";
 
 /**
  * Postgres 实现。注入 Pool 让单测能用 mock pool(同 Phase 0 baseline 风格)。
@@ -254,7 +292,7 @@ export function makePgApiKeyRepo(pool: Pool): ApiKeyRepo {
       // 严格 [0-9a-z]{8} 格式校验;不符合直接返 null,不查 DB(节省查询)。
       if (!/^[0-9a-z]{8}$/.test(keyPrefix)) return null;
       const r = await pool.query<DbRowFull>(
-        `SELECT id, user_id, label, key_prefix, key_hash, created_at, last_used_at
+        `SELECT ${SUMMARY_COLUMNS}, user_id, key_hash
          FROM user_api_keys
          WHERE key_prefix = $1 AND revoked_at IS NULL
          LIMIT 1`,
@@ -267,13 +305,56 @@ export function makePgApiKeyRepo(pool: Pool): ApiKeyRepo {
     async list(userId) {
       // 严格 SELECT 列白名单,**不** SELECT key_hash — invariant #1 SQL 层钉子。
       const r = await pool.query<DbRowSummary>(
-        `SELECT id, label, key_prefix, created_at, last_used_at
+        `SELECT ${SUMMARY_COLUMNS}
          FROM user_api_keys
          WHERE user_id = $1 AND revoked_at IS NULL
          ORDER BY created_at DESC`,
         [userId.toString()],
       );
       return r.rows.map(mapSummaryRow);
+    },
+
+    async update(userId, id, patch) {
+      const sets: string[] = [];
+      const params: unknown[] = [userId.toString(), id.toString()];
+      if (patch.label !== undefined) {
+        const trimmed = typeof patch.label === "string" ? patch.label.trim() : "";
+        if (trimmed.length < 1 || trimmed.length > 80) {
+          throw new ApiKeyRepoError("LABEL_INVALID", "label must be 1..80 chars after trim");
+        }
+        params.push(trimmed);
+        sets.push(`label = $${params.length}`);
+      }
+      if (patch.disabled !== undefined) {
+        // 已禁用再禁用保持原 disabled_at(审计上"首次禁用时间"稳定)。
+        sets.push(patch.disabled ? "disabled_at = COALESCE(disabled_at, now())" : "disabled_at = NULL");
+      }
+      if (patch.creditLimit !== undefined) {
+        if (patch.creditLimit === null) {
+          sets.push("credit_limit = NULL");
+        } else {
+          if (patch.creditLimit <= 0n) {
+            throw new ApiKeyRepoError("LIMIT_INVALID", "credit_limit must be a positive integer");
+          }
+          params.push(patch.creditLimit.toString());
+          sets.push(`credit_limit = $${params.length}`);
+        }
+      }
+      if (sets.length === 0) {
+        const cur = await pool.query<DbRowSummary>(
+          `SELECT ${SUMMARY_COLUMNS} FROM user_api_keys
+           WHERE user_id = $1 AND id = $2 AND revoked_at IS NULL`,
+          [userId.toString(), id.toString()],
+        );
+        return cur.rows.length === 0 ? null : mapSummaryRow(cur.rows[0]!);
+      }
+      const r = await pool.query<DbRowSummary>(
+        `UPDATE user_api_keys SET ${sets.join(", ")}
+         WHERE user_id = $1 AND id = $2 AND revoked_at IS NULL
+         RETURNING ${SUMMARY_COLUMNS}`,
+        params,
+      );
+      return r.rows.length === 0 ? null : mapSummaryRow(r.rows[0]!);
     },
 
     async revoke(userId, id) {

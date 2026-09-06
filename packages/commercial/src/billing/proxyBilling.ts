@@ -150,6 +150,11 @@ export interface FinalizeContext {
   attemptNo?: number | null;
   /** Release-bound test sponsorship admitted before provider work. */
   verificationSponsorship?: VerificationSponsorshipSnapshot | null;
+  /**
+   * 0277:经外接 API key 进来的请求 → user_api_keys.id;容器 / 网页路径 null。
+   * settle 打戳 usage_records.api_key_id 并累加 user_api_keys.spent_credits。
+   */
+  apiKeyId?: bigint | null;
 }
 
 export interface FinalizeOutcome {
@@ -489,6 +494,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
         dispatchId: ctx.dispatchId ?? null,
         attemptNo: ctx.attemptNo ?? null,
         verificationSponsorship: ctx.verificationSponsorship ?? null,
+        apiKeyId: ctx.apiKeyId ?? null,
       });
     } catch (err) {
       ctx.log.error("proxy_finalize_settle_db_failed", {
@@ -746,6 +752,11 @@ export async function settleUsageAndLedger(
       boardProjectId: string | null;
       source?: "session_bind" | "delegate_parent" | "explicit" | "migration_backfill";
     } | null;
+    /**
+     * 0277:外接 API key 归因。缺省/null → usage_records.api_key_id 写 NULL,
+     * 不碰 user_api_keys(容器 / 网页 / codex 路径落库形状与之前完全一致)。
+     */
+    apiKeyId?: bigint | null;
   },
 ): Promise<SettleResult> {
   const client = await pool.connect();
@@ -814,9 +825,10 @@ export async function settleUsageAndLedger(
            execution_revision, projection_revision, security_epoch, authority_kind,
            turn_key, parent_turn_key, dispatch_id, attempt_no,
            verification_run_id, would_have_cost_credits,
-           board_project_id, board_project_source, board_project_captured_at)
+           board_project_id, board_project_source, board_project_captured_at,
+           api_key_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16,
-                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
          RETURNING id::text AS id`,
         [
           args.userId.toString(),
@@ -852,6 +864,8 @@ export async function settleUsageAndLedger(
           attribution.boardProjectId,
           attribution.source,
           attribution.capturedAt,
+          // 0277 外接 API key 归因(非 API key 路径 NULL)。
+          args.apiKeyId === null || args.apiKeyId === undefined ? null : args.apiKeyId.toString(),
         ],
       );
       usageId = BigInt(ins.rows[0]!.id);
@@ -912,6 +926,15 @@ export async function settleUsageAndLedger(
           ledgerId.toString(),
           usageId.toString(),
         ]);
+      }
+      // 0277:单 key 累计(名义口径 = cost_credits,与报表 SUM(cost_credits) 一致;
+      // 不用 debited,clamp 时也按名义累计,让上限语义与 "报表里看到的消耗" 对齐)。
+      // 同事务:usage 行与 spent 快照要么一起提交要么一起回滚。
+      if (args.apiKeyId !== null && args.apiKeyId !== undefined) {
+        await client.query(
+          `UPDATE user_api_keys SET spent_credits = spent_credits + $2 WHERE id = $1`,
+          [args.apiKeyId.toString(), settledCostCredits.toString()],
+        );
       }
     }
     const targetTurnKey = args.parentTurnKey ?? args.turnKey ?? null;

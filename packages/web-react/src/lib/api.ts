@@ -2,7 +2,9 @@ import type {
   AgentCancelResult,
   AgentOpenResult,
   AgentStatus,
+  ApiKeyPatch,
   ApiKeySummary,
+  ApiKeyUsageReport,
   AuthSession,
   CreatedApiKey,
   CommunityTutorialCategory,
@@ -126,25 +128,25 @@ import type {
   KnowledgePlanetAutomationRule,
   KnowledgePlanetAutomationView,
   RuntimePluginAccount,
-} from './connectors'
-import { normalizeOrgPlan, normalizeOrgSubscription } from './orgBilling'
-import { reportClientFriction } from './clientFriction'
+} from "./connectors";
+import { normalizeOrgPlan, normalizeOrgSubscription } from "./orgBilling";
+import { reportClientFriction } from "./clientFriction";
 
 export type QqBindingStatus = {
-  available: boolean
-  bound: boolean
-  entry_url?: string
-  maskedOpenid?: string
-  boundAt?: number
-  lastInteractionAt?: number
-}
+  available: boolean;
+  bound: boolean;
+  entry_url?: string;
+  maskedOpenid?: string;
+  boundAt?: number;
+  lastInteractionAt?: number;
+};
 
 export type QqBindingStart = {
-  available: true
-  entry_url: string
-  bind_code: string
-  expires_at: number
-}
+  available: true;
+  entry_url: string;
+  bind_code: string;
+  expires_at: number;
+};
 
 /**
  * v5 商业版前端网络层。
@@ -306,7 +308,9 @@ async function refreshWithRaceRetry(signal: AbortSignal): Promise<RawRefreshOutc
   }
   return outcome.kind === "race"
     ? { kind: "transient", retryAfterMs: 0, raceObserved: true }
-    : raceObserved ? { ...outcome, raceObserved: true } : outcome;
+    : raceObserved
+      ? { ...outcome, raceObserved: true }
+      : outcome;
 }
 
 /** 中止当前 session 的旧身份 refresh；返回值可用于需要等待其真正 settle 的调用点。 */
@@ -318,10 +322,12 @@ export function cancelAuthRefresh(a: AuthSession): Promise<void> {
   } catch {
     state.controller?.abort();
   }
-  return state.flight?.then(
-    () => undefined,
-    () => undefined,
-  ) ?? Promise.resolve();
+  return (
+    state.flight?.then(
+      () => undefined,
+      () => undefined,
+    ) ?? Promise.resolve()
+  );
 }
 
 /** REST、boot、admin、WS 共用的唯一静默续期入口。 */
@@ -372,14 +378,17 @@ export function refreshAuth(
       state.nextAllowedAt = 0;
       const prior = state.friction;
       if (prior || raw.raceObserved) {
-        reportClientFriction({
-          eventId: prior?.id,
-          surface: prior?.surface ?? surface,
-          stage: "refresh",
-          code: prior?.code ?? "REFRESH_RACE",
-          outcome: "recovered",
-          attempts: Math.min(32, (prior?.attempts ?? 0) + 1),
-        }, raw.result.accessToken);
+        reportClientFriction(
+          {
+            eventId: prior?.id,
+            surface: prior?.surface ?? surface,
+            stage: "refresh",
+            code: prior?.code ?? "REFRESH_RACE",
+            outcome: "recovered",
+            attempts: Math.min(32, (prior?.attempts ?? 0) + 1),
+          },
+          raw.result.accessToken,
+        );
       }
       state.friction = null;
       return a.commitToken(expectedEpoch, raw.result.accessToken)
@@ -393,22 +402,29 @@ export function refreshAuth(
       return { kind: "invalid", epoch: expectedEpoch };
     }
 
-    state.transientFailures = Math.min(state.transientFailures + 1, REFRESH_TRANSIENT_BACKOFF_MS.length);
+    state.transientFailures = Math.min(
+      state.transientFailures + 1,
+      REFRESH_TRANSIENT_BACKOFF_MS.length,
+    );
     const backoff = REFRESH_TRANSIENT_BACKOFF_MS[state.transientFailures - 1] ?? 10_000;
     const retryAfterMs = Math.max(raw.kind === "transient" ? raw.retryAfterMs : 0, backoff);
     state.nextAllowedAt = Date.now() + retryAfterMs;
     const prior = state.friction;
-    const code = prior?.code ??
+    const code =
+      prior?.code ??
       (raw.kind === "race" || raw.raceObserved ? "REFRESH_RACE" : "REFRESH_TRANSIENT");
     const attempts = Math.min(32, (prior?.attempts ?? 0) + 1);
-    const id = reportClientFriction({
-      eventId: prior?.id,
-      surface: prior?.surface ?? surface,
-      stage: "refresh",
-      code,
-      outcome: "failed",
-      attempts,
-    }, a.snapshot().token);
+    const id = reportClientFriction(
+      {
+        eventId: prior?.id,
+        surface: prior?.surface ?? surface,
+        stage: "refresh",
+        code,
+        outcome: "failed",
+        attempts,
+      },
+      a.snapshot().token,
+    );
     state.friction = { id, code, attempts, surface: prior?.surface ?? surface };
     return { kind: "transient", epoch: expectedEpoch, retryAfterMs };
   }).finally(() => {
@@ -450,7 +466,8 @@ export async function callWithRefresh(
 
   const beforeReplay = a.snapshot();
   if (beforeReplay.epoch !== used.epoch) throw new AuthEpochStaleError();
-  if (beforeReplay.token !== refreshed.result.accessToken) return fenceAuthResponse(res, a, used.epoch);
+  if (beforeReplay.token !== refreshed.result.accessToken)
+    return fenceAuthResponse(res, a, used.epoch);
   // 最多重放一次；重放仍 401 不递归刷新。
   const replay = await make(beforeReplay.token);
   if (a.snapshot().epoch !== used.epoch) throw new AuthEpochStaleError();
@@ -498,7 +515,10 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 /** 拼鉴权头：身份完全由 access JWT(sub) 决定，只带 Bearer。 */
 // export：admin 数据层复用（见 callWithRefresh 注释）。仅加导出。
 export function bearerHeaders(token: string, json = false): Record<string, string> {
-  const h: Record<string, string> = { Accept: "application/json", Authorization: `Bearer ${token}` };
+  const h: Record<string, string> = {
+    Accept: "application/json",
+    Authorization: `Bearer ${token}`,
+  };
   if (json) h["content-type"] = "application/json";
   return h;
 }
@@ -725,7 +745,9 @@ function hasCjk(s: string): boolean {
 function isNetworkError(err: unknown): boolean {
   return (
     err instanceof TypeError &&
-    /failed to fetch|fetch failed|networkerror|load failed|network request failed/i.test(err.message)
+    /failed to fetch|fetch failed|networkerror|load failed|network request failed/i.test(
+      err.message,
+    )
   );
 }
 
@@ -818,9 +840,7 @@ export async function jsonOrThrow<T>(p: Promise<Response> | Response): Promise<T
 }
 
 /** 资产写接口回 `{ asset }`，早期契约回裸对象；两种都收。 */
-function unwrapProjectAsset(
-  body: { asset?: ProjectAsset } & Partial<ProjectAsset>,
-): ProjectAsset {
+function unwrapProjectAsset(body: { asset?: ProjectAsset } & Partial<ProjectAsset>): ProjectAsset {
   return (body.asset ?? body) as ProjectAsset;
 }
 
@@ -851,8 +871,12 @@ function parseSubscriptionOrder(p: Promise<Response>): Promise<HupiCreateResult>
   return jsonOrThrow<{
     ok: boolean;
     data: {
-      order_no: string; qrcode_url: string; mobile_url: string | null;
-      amount_cents: string; credits: string; expires_at: string;
+      order_no: string;
+      qrcode_url: string;
+      mobile_url: string | null;
+      amount_cents: string;
+      credits: string;
+      expires_at: string;
     };
   }>(p).then((b) => ({
     orderNo: b.data.order_no,
@@ -946,8 +970,8 @@ function decodeCanonicalBase64urlUtf8(value: string): string {
   if (!/^[A-Za-z0-9_-]+$/.test(value) || value.length % 4 === 1) {
     throw new Error("invalid immutable deferred payload record id encoding");
   }
-  const padded = value.replace(/-/g, "+").replace(/_/g, "/") +
-    "=".repeat((4 - (value.length % 4)) % 4);
+  const padded =
+    value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (value.length % 4)) % 4);
   let binary = "";
   try {
     binary = atob(padded);
@@ -993,19 +1017,20 @@ export async function getExactDeferredPayload(
   );
   assertAuthResponseCurrent(probe);
   if (!probe.ok) await throwApi(probe);
-  const rangeMatch = /^bytes 0-0\/([1-9][0-9]*)$/.exec(
-    probe.headers.get("content-range") ?? "",
-  );
+  const rangeMatch = /^bytes 0-0\/([1-9][0-9]*)$/.exec(probe.headers.get("content-range") ?? "");
   const totalBytes = rangeMatch ? Number(rangeMatch[1]) : Number.NaN;
   const contentSha256 = probe.headers.get("x-openclaude-content-sha256") ?? "";
   const recordId = immutableRecordIdFromHeaders(probe.headers);
   const role = probe.headers.get("x-openclaude-record-role") ?? "";
   const probeEncoding = probe.headers.get("content-encoding")?.toLowerCase();
   if (
-    probe.status !== 206 || (probeEncoding !== undefined && probeEncoding !== "identity") ||
-    !Number.isSafeInteger(totalBytes) || totalBytes < 1 ||
+    probe.status !== 206 ||
+    (probeEncoding !== undefined && probeEncoding !== "identity") ||
+    !Number.isSafeInteger(totalBytes) ||
+    totalBytes < 1 ||
     !/^[a-f0-9]{64}$/.test(contentSha256) ||
-    recordId.length === 0 || role.length === 0
+    recordId.length === 0 ||
+    role.length === 0
   ) {
     void probe.body?.cancel().catch(() => {});
     throw new Error("invalid immutable deferred payload metadata");
@@ -1057,6 +1082,31 @@ export async function getExactDeferredPayload(
 
 /** Per live-frames HTTP request. Journal hydrate adds its own page/time cap. */
 export const LIVE_FRAMES_REQUEST_TIMEOUT_MS = 12_000;
+
+/** /api/me/api-keys 线上形状（snake_case）；list / PATCH 共用。 */
+type ApiKeyWire = {
+  id: string;
+  label: string;
+  key_prefix: string;
+  created_at: string;
+  last_used_at: string | null;
+  disabled_at?: string | null;
+  credit_limit?: string | null;
+  spent_credits?: string;
+};
+
+function apiKeyFromWire(k: ApiKeyWire): ApiKeySummary {
+  return {
+    id: k.id,
+    label: k.label,
+    keyPrefix: k.key_prefix,
+    createdAt: k.created_at,
+    lastUsedAt: k.last_used_at,
+    disabledAt: k.disabled_at ?? null,
+    creditLimit: k.credit_limit ?? null,
+    spentCredits: k.spent_credits ?? "0",
+  };
+}
 
 export const api = {
   // ── 鉴权 ───────────────────────────────────────────────────────────
@@ -1117,7 +1167,11 @@ export const api = {
    * 按 outcome.kind 区分真正失效与瞬时故障。
    * 该调用绝不经 callWithRefresh 包装，避免 401 时自我递归。
    */
-  refresh(a: AuthSession, expectedEpoch?: number, surface?: RefreshSurface): Promise<RefreshOutcome> {
+  refresh(
+    a: AuthSession,
+    expectedEpoch?: number,
+    surface?: RefreshSurface,
+  ): Promise<RefreshOutcome> {
     return refreshAuth(a, expectedEpoch, surface);
   },
 
@@ -1338,10 +1392,7 @@ export const api = {
    * 无效 Bearer 时后端返回 401，callWithRefresh 刷新重放，避免把登录用户静默记成匿名。
    * 两种 source 分支分别重建 payload，消息上下文不会意外泄漏到设置反馈，反之亦然。
    */
-  submitFeedback: (
-    a: AuthSession,
-    input: FeedbackSubmitInput,
-  ): Promise<FeedbackSubmitResult> =>
+  submitFeedback: (a: AuthSession, input: FeedbackSubmitInput): Promise<FeedbackSubmitResult> =>
     jsonOrThrow<FeedbackSubmitResult>(
       callWithRefresh(a, (t) =>
         fetch("/api/feedback", {
@@ -1429,27 +1480,54 @@ export const api = {
 
   /** 列出我的 API key（GET /api/me/api-keys，Bearer）。不含明文。 */
   listApiKeys: (a: AuthSession): Promise<ApiKeySummary[]> =>
-    jsonOrThrow<{
-      keys: Array<{
-        id: string;
-        label: string;
-        key_prefix: string;
-        created_at: string;
-        last_used_at: string | null;
-      }>;
-    }>(
+    jsonOrThrow<{ keys: ApiKeyWire[] }>(
       callWithRefresh(a, (t) =>
         fetch("/api/me/api-keys", { credentials: "include", headers: bearerHeaders(t) }),
       ),
-    ).then((b) =>
-      b.keys.map((k) => ({
-        id: k.id,
-        label: k.label,
-        keyPrefix: k.key_prefix,
-        createdAt: k.created_at,
-        lastUsedAt: k.last_used_at,
-      })),
-    ),
+    ).then((b) => b.keys.map(apiKeyFromWire)),
+
+  /**
+   * 0277：改名 / 临时禁用 / 单 key 上限（PATCH /api/me/api-keys/:id，Bearer）。
+   * 400 INVALID_LABEL / INVALID_LIMIT / INVALID_BODY，404 不存在或非本人，经 ApiError 抛。
+   */
+  updateApiKey: (a: AuthSession, id: string, patch: ApiKeyPatch): Promise<ApiKeySummary> => {
+    const body: Record<string, unknown> = {};
+    if (patch.label !== undefined) body.label = patch.label;
+    if (patch.disabled !== undefined) body.disabled = patch.disabled;
+    if (patch.creditLimit !== undefined) body.credit_limit = patch.creditLimit;
+    return jsonOrThrow<ApiKeyWire>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/me/api-keys/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ).then(apiKeyFromWire);
+  },
+
+  /**
+   * 0277：经 API key 的消耗报表（GET /api/me/api-keys/usage，Bearer）。
+   * summary + 趋势 + 按 key + 按模型 + 最近明细；keyId 可选钉单 key。
+   * **所有数字字段为字符串大数。**
+   */
+  getApiKeyUsage: (
+    a: AuthSession,
+    window: UsageReportWindow,
+    keyId?: string | null,
+  ): Promise<ApiKeyUsageReport> => {
+    const qs = new URLSearchParams({ window });
+    if (keyId) qs.set("key_id", keyId);
+    return jsonOrThrow<ApiKeyUsageReport>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/me/api-keys/usage?${qs.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    );
+  },
 
   /**
    * 新建 API key（POST /api/me/api-keys，201，Bearer）。返完整明文 plaintext **仅一次**，
@@ -1527,7 +1605,9 @@ export const api = {
         headers: t ? bearerHeaders(t) : { Accept: "application/json" },
       });
     const res = a ? await callWithRefresh(a, (t) => run(t)) : await run();
-    const b = await jsonOrThrow<{ models?: PublicModel[]; locked_models?: LockedPublicModel[] }>(res);
+    const b = await jsonOrThrow<{ models?: PublicModel[]; locked_models?: LockedPublicModel[] }>(
+      res,
+    );
     return {
       models: Array.isArray(b.models) ? b.models : [],
       lockedModels: Array.isArray(b.locked_models) ? b.locked_models : [],
@@ -1751,7 +1831,10 @@ export const api = {
     params.set("limit", String(opts?.limit ?? 30));
     params.set("includeArchived", opts?.includeArchived ? "1" : "0");
     if (opts && "projectId" in opts) {
-      params.set("projectId", opts.projectId === null || opts.projectId === undefined ? "none" : opts.projectId);
+      params.set(
+        "projectId",
+        opts.projectId === null || opts.projectId === undefined ? "none" : opts.projectId,
+      );
     }
     return jsonOrThrow<SessionSearchResponse>(
       callWithRefresh(a, (t) =>
@@ -1825,21 +1908,19 @@ export const api = {
     }
     const query = params.toString();
     const suffix = query ? `?${query}` : "";
-    const request = (requestSuffix: string) => jsonOrThrow<SessionDetail>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/sessions/${encodeURIComponent(id)}${requestSuffix}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    );
+    const request = (requestSuffix: string) =>
+      jsonOrThrow<SessionDetail>(
+        callWithRefresh(a, (t) =>
+          fetch(`/api/sessions/${encodeURIComponent(id)}${requestSuffix}`, {
+            credentials: "include",
+            headers: bearerHeaders(t),
+          }),
+        ),
+      );
     return request(suffix).then(async (initial) => {
       let detail = initial;
       let historyRevisionUnsupported = false;
-      if (
-        !Number.isSafeInteger(detail.historyRevision)
-        || (detail.historyRevision as number) < 0
-      ) {
+      if (!Number.isSafeInteger(detail.historyRevision) || (detail.historyRevision as number) < 0) {
         // A legacy backend can return a plausible `_seq` partial without the
         // history revision. Never retain that cursor: retry an incremental
         // request once as full, and mark every legacy full so callers evict
@@ -1917,7 +1998,12 @@ export const api = {
   getSessionLiveUnits: (
     a: AuthSession,
     id: string,
-    query?: { n?: number; before?: string | null; group?: string | null; nestedBefore?: string | null },
+    query?: {
+      n?: number;
+      before?: string | null;
+      group?: string | null;
+      nestedBefore?: string | null;
+    },
     opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<unknown> => {
     const params = new URLSearchParams();
@@ -2130,8 +2216,11 @@ export const api = {
   /**
    * 会话重命名。走 patchSessionMeta，后端换 /meta 端点时不必再改这里。
    */
-  patchSessionTitle: (a: AuthSession, id: string, title: string): Promise<{ ok: true; updatedAt: number }> =>
-    api.patchSessionMeta(a, id, { title }),
+  patchSessionTitle: (
+    a: AuthSession,
+    id: string,
+    title: string,
+  ): Promise<{ ok: true; updatedAt: number }> => api.patchSessionMeta(a, id, { title }),
 
   /**
    * 会话级模型选择持久化（PATCH /api/sessions/:id，Bearer，元数据专用，与 rename 同款）。
@@ -2139,7 +2228,11 @@ export const api = {
    * 盖回,用户重选即重试。会话行尚未建（新会话未发首条消息）时 404,同样吞掉——建行
    * PUT(ensureServerSession)会随体携带 modelId 收敛。
    */
-  patchSessionModel: (a: AuthSession, id: string, modelId: string): Promise<{ ok: true; updatedAt: number }> =>
+  patchSessionModel: (
+    a: AuthSession,
+    id: string,
+    modelId: string,
+  ): Promise<{ ok: true; updatedAt: number }> =>
     jsonOrThrow<{ ok: true; updatedAt: number }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/sessions/${encodeURIComponent(id)}`, {
@@ -2515,8 +2608,12 @@ export const api = {
       ok: boolean;
       data: {
         plans: Array<{
-          code: string; name: string; price_cents: string;
-          monthly_credits: string; period_days: number; tier: number;
+          code: string;
+          name: string;
+          price_cents: string;
+          monthly_credits: string;
+          period_days: number;
+          tier: number;
         }>;
       };
     }>(fetch("/api/subscription/plans", { headers: { Accept: "application/json" } }));
@@ -2540,14 +2637,8 @@ export const api = {
       ok?: boolean;
       plans?: unknown[];
       data?: { plans?: unknown[] };
-    }>(
-      fetch("/api/subscription/plans?scope=org", { headers: { Accept: "application/json" } }),
-    );
-    const raw = Array.isArray(b.data?.plans)
-      ? b.data.plans
-      : Array.isArray(b.plans)
-        ? b.plans
-        : [];
+    }>(fetch("/api/subscription/plans?scope=org", { headers: { Accept: "application/json" } }));
+    const raw = Array.isArray(b.data?.plans) ? b.data.plans : Array.isArray(b.plans) ? b.plans : [];
     return raw.map(normalizeOrgPlan);
   },
 
@@ -2557,9 +2648,16 @@ export const api = {
       ok: boolean;
       data: {
         subscription: {
-          plan_code: string; plan_name: string; status: string;
-          period_start: string; period_end: string; period_credits: string;
-          monthly_credits: string; price_cents: string; tier: number; paid: boolean;
+          plan_code: string;
+          plan_name: string;
+          status: string;
+          period_start: string;
+          period_end: string;
+          period_credits: string;
+          monthly_credits: string;
+          price_cents: string;
+          tier: number;
+          paid: boolean;
         };
         balance: { wallet: string; period: string; total: string };
       };
@@ -2665,7 +2763,9 @@ export const api = {
       }),
     );
     if (res.status === 409) {
-      const body = (await res.json().catch(() => null)) as { conflict?: Partial<MemoryConflict> } | null;
+      const body = (await res.json().catch(() => null)) as {
+        conflict?: Partial<MemoryConflict>;
+      } | null;
       assertAuthResponseCurrent(res);
       const c = body?.conflict;
       if (c && typeof c.text === "string") {
@@ -2682,7 +2782,12 @@ export const api = {
       // 非预期的 409（无 conflict 载荷）：按普通错误抛，保持统一错误信封。
       throw new ApiError({ status: 409, message: withReqId("记忆写入冲突", res), body });
     }
-    const out = await jsonOrThrow<{ ok: boolean; version: string; charCount?: number; limit?: number }>(res);
+    const out = await jsonOrThrow<{
+      ok: boolean;
+      version: string;
+      charCount?: number;
+      limit?: number;
+    }>(res);
     return { ok: true, version: out.version, charCount: out.charCount, limit: out.limit };
   },
 
@@ -2800,15 +2905,12 @@ export const api = {
     version?: string,
   ): Promise<PutMemoryFileResult> => {
     const res = await callWithRefresh(a, (t) =>
-      fetch(
-        `/api/agents/${encodeURIComponent(agentId)}/memory/files/${encodeURIComponent(file)}`,
-        {
-          method: "PUT",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(version !== undefined ? { content, version } : { content }),
-        },
-      ),
+      fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/files/${encodeURIComponent(file)}`, {
+        method: "PUT",
+        credentials: "include",
+        headers: bearerHeaders(t, true),
+        body: JSON.stringify(version !== undefined ? { content, version } : { content }),
+      }),
     );
     if (res.status === 409) {
       const body = (await res.json().catch(() => null)) as {
@@ -3047,7 +3149,12 @@ export const api = {
     jsonOrThrow<{
       evals: SkillEvalsFile | null;
       parseErrors?: string[];
-      lastRun: { runId: string; finishedAt: number; benchmark: SkillEvalRun["benchmark"]; usage: SkillRunUsage } | null;
+      lastRun: {
+        runId: string;
+        finishedAt: number;
+        benchmark: SkillEvalRun["benchmark"];
+        usage: SkillRunUsage;
+      } | null;
       writable: boolean;
     }>(
       callWithRefresh(a, (t) =>
@@ -3072,7 +3179,11 @@ export const api = {
     ),
 
   /** 启动评测 run（POST /api/skills/:name/eval-run;消耗积分,调用前必须已过成本确认）。 */
-  startSkillEvalRun: (a: AuthSession, name: string, body?: { mode?: "baseline" | "draft"; trainRunId?: string }) =>
+  startSkillEvalRun: (
+    a: AuthSession,
+    name: string,
+    body?: { mode?: "baseline" | "draft"; trainRunId?: string },
+  ) =>
     jsonOrThrow<{ ok: boolean; runId: string }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/skills/${encodeURIComponent(name)}/eval-run`, {
@@ -3193,10 +3304,13 @@ export const api = {
   getSkillDraft: (a: AuthSession, runId: string, name: string) =>
     jsonOrThrow<SkillDraftDetail>(
       callWithRefresh(a, (t) =>
-        fetch(`/api/skill-training/${encodeURIComponent(runId)}/drafts/${encodeURIComponent(name)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
+        fetch(
+          `/api/skill-training/${encodeURIComponent(runId)}/drafts/${encodeURIComponent(name)}`,
+          {
+            credentials: "include",
+            headers: bearerHeaders(t),
+          },
+        ),
       ),
     ),
 
@@ -3535,31 +3649,37 @@ export const api = {
   // 占用户端首屏 chunk 体积。签名与迁出前一致,仅首跳多一次已缓存模块的 import()。
 
   /** 待审版本列表（GET /api/admin/marketplace/pending）。 */
-  adminMarketplacePending: (...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplacePending>) =>
-    import("./api/admin").then((m) => m.adminApi.adminMarketplacePending(...a)),
+  adminMarketplacePending: (
+    ...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplacePending>
+  ) => import("./api/admin").then((m) => m.adminApi.adminMarketplacePending(...a)),
 
   /** AI 自动审批记录（GET /api/admin/marketplace/ai-reviews；review_source='ai'）。 */
-  adminMarketplaceAiReviews: (...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplaceAiReviews>) =>
-    import("./api/admin").then((m) => m.adminApi.adminMarketplaceAiReviews(...a)),
+  adminMarketplaceAiReviews: (
+    ...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplaceAiReviews>
+  ) => import("./api/admin").then((m) => m.adminApi.adminMarketplaceAiReviews(...a)),
 
   /** 审核(批准/拒绝)一个版本（POST /api/admin/marketplace/:id/review）。 */
-  adminMarketplaceReview: (...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplaceReview>) =>
-    import("./api/admin").then((m) => m.adminApi.adminMarketplaceReview(...a)),
+  adminMarketplaceReview: (
+    ...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplaceReview>
+  ) => import("./api/admin").then((m) => m.adminApi.adminMarketplaceReview(...a)),
 
   /** 批量审核(批准/拒绝)多个待审版本（POST /api/admin/marketplace/review-batch）。 */
-  adminMarketplaceReviewBatch: (...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplaceReviewBatch>) =>
-    import("./api/admin").then((m) => m.adminApi.adminMarketplaceReviewBatch(...a)),
+  adminMarketplaceReviewBatch: (
+    ...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplaceReviewBatch>
+  ) => import("./api/admin").then((m) => m.adminApi.adminMarketplaceReviewBatch(...a)),
 
   /** 下架(kill-switch)一个条目（POST /api/admin/marketplace/:slug/revoke）。 */
-  adminMarketplaceRevoke: (...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplaceRevoke>) =>
-    import("./api/admin").then((m) => m.adminApi.adminMarketplaceRevoke(...a)),
+  adminMarketplaceRevoke: (
+    ...a: Parameters<typeof import("./api/admin").adminApi.adminMarketplaceRevoke>
+  ) => import("./api/admin").then((m) => m.adminApi.adminMarketplaceRevoke(...a)),
 
   /**
    * 设置/取消精选（POST /api/admin/marketplace/:slug/featured；requireAdminVerifyDb）。
    * featuredRank：1..9999 精选排序（越小越靠前）；null=取消精选。
    */
-  setMarketplaceFeatured: (...a: Parameters<typeof import("./api/admin").adminApi.setMarketplaceFeatured>) =>
-    import("./api/admin").then((m) => m.adminApi.setMarketplaceFeatured(...a)),
+  setMarketplaceFeatured: (
+    ...a: Parameters<typeof import("./api/admin").adminApi.setMarketplaceFeatured>
+  ) => import("./api/admin").then((m) => m.adminApi.setMarketplaceFeatured(...a)),
 
   // ── 站内信（inbox，用户侧） ───────────────────────────────────────────
 
@@ -3916,8 +4036,8 @@ export const api = {
   getPluginManagement: (a: AuthSession): Promise<PluginManagementResponse> =>
     jsonOrThrow<PluginManagementResponse>(
       callWithRefresh(a, (t) =>
-        fetch('/api/plugins/management', {
-          credentials: 'include',
+        fetch("/api/plugins/management", {
+          credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
@@ -3926,9 +4046,9 @@ export const api = {
   startKnowledgePlanetSetup: (a: AuthSession): Promise<KnowledgePlanetSetupView> =>
     jsonOrThrow<KnowledgePlanetSetupView>(
       callWithRefresh(a, (t) =>
-        fetch('/api/plugins/knowledge-planet/setup', {
-          method: 'POST',
-          credentials: 'include',
+        fetch("/api/plugins/knowledge-planet/setup", {
+          method: "POST",
+          credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify({ acceptTerms: true }),
         }),
@@ -3939,7 +4059,7 @@ export const api = {
     jsonOrThrow<KnowledgePlanetSetupView>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/knowledge-planet/setup/${encodeURIComponent(sessionId)}`, {
-          credentials: 'include',
+          credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
@@ -3948,15 +4068,15 @@ export const api = {
   async getKnowledgePlanetSetupQr(a: AuthSession, sessionId: string): Promise<Blob> {
     const res = await callWithRefresh(a, (t) =>
       fetch(`/api/plugins/knowledge-planet/setup/${encodeURIComponent(sessionId)}/qr`, {
-        credentials: 'include',
-        headers: { ...bearerHeaders(t), Accept: 'image/png' },
+        credentials: "include",
+        headers: { ...bearerHeaders(t), Accept: "image/png" },
       }),
-    )
-    assertAuthResponseCurrent(res)
-    if (!res.ok) await throwApi(res)
-    const blob = await res.blob()
-    assertAuthResponseCurrent(res)
-    return blob
+    );
+    assertAuthResponseCurrent(res);
+    if (!res.ok) await throwApi(res);
+    const blob = await res.blob();
+    assertAuthResponseCurrent(res);
+    return blob;
   },
 
   cancelKnowledgePlanetSetup: (
@@ -3966,22 +4086,19 @@ export const api = {
     jsonOrThrow<KnowledgePlanetSetupView>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/knowledge-planet/setup/${encodeURIComponent(sessionId)}`, {
-          method: 'DELETE',
-          credentials: 'include',
+          method: "DELETE",
+          credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
     ),
 
-  startWeiboSetup: (
-    a: AuthSession,
-    accountId?: string,
-  ): Promise<KnowledgePlanetSetupView> =>
+  startWeiboSetup: (a: AuthSession, accountId?: string): Promise<KnowledgePlanetSetupView> =>
     jsonOrThrow<KnowledgePlanetSetupView>(
       callWithRefresh(a, (t) =>
-        fetch('/api/plugins/weibo/setup', {
-          method: 'POST',
-          credentials: 'include',
+        fetch("/api/plugins/weibo/setup", {
+          method: "POST",
+          credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify({ acceptTerms: true, ...(accountId ? { accountId } : {}) }),
         }),
@@ -3992,7 +4109,7 @@ export const api = {
     jsonOrThrow<KnowledgePlanetSetupView>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/weibo/setup/${encodeURIComponent(sessionId)}`, {
-          credentials: 'include',
+          credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
@@ -4001,37 +4118,34 @@ export const api = {
   async getWeiboSetupQr(a: AuthSession, sessionId: string): Promise<Blob> {
     const res = await callWithRefresh(a, (t) =>
       fetch(`/api/plugins/weibo/setup/${encodeURIComponent(sessionId)}/qr`, {
-        credentials: 'include',
-        headers: { ...bearerHeaders(t), Accept: 'image/png' },
+        credentials: "include",
+        headers: { ...bearerHeaders(t), Accept: "image/png" },
       }),
-    )
-    assertAuthResponseCurrent(res)
-    if (!res.ok) await throwApi(res)
-    const blob = await res.blob()
-    assertAuthResponseCurrent(res)
-    return blob
+    );
+    assertAuthResponseCurrent(res);
+    if (!res.ok) await throwApi(res);
+    const blob = await res.blob();
+    assertAuthResponseCurrent(res);
+    return blob;
   },
 
   cancelWeiboSetup: (a: AuthSession, sessionId: string): Promise<KnowledgePlanetSetupView> =>
     jsonOrThrow<KnowledgePlanetSetupView>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/weibo/setup/${encodeURIComponent(sessionId)}`, {
-          method: 'DELETE',
-          credentials: 'include',
+          method: "DELETE",
+          credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
     ),
 
-  startZhihuSetup: (
-    a: AuthSession,
-    accountId?: string,
-  ): Promise<KnowledgePlanetSetupView> =>
+  startZhihuSetup: (a: AuthSession, accountId?: string): Promise<KnowledgePlanetSetupView> =>
     jsonOrThrow<KnowledgePlanetSetupView>(
       callWithRefresh(a, (t) =>
-        fetch('/api/plugins/zhihu/setup', {
-          method: 'POST',
-          credentials: 'include',
+        fetch("/api/plugins/zhihu/setup", {
+          method: "POST",
+          credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify({ acceptTerms: true, ...(accountId ? { accountId } : {}) }),
         }),
@@ -4042,7 +4156,7 @@ export const api = {
     jsonOrThrow<KnowledgePlanetSetupView>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/zhihu/setup/${encodeURIComponent(sessionId)}`, {
-          credentials: 'include',
+          credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
@@ -4051,23 +4165,23 @@ export const api = {
   async getZhihuSetupQr(a: AuthSession, sessionId: string): Promise<Blob> {
     const res = await callWithRefresh(a, (t) =>
       fetch(`/api/plugins/zhihu/setup/${encodeURIComponent(sessionId)}/qr`, {
-        credentials: 'include',
-        headers: { ...bearerHeaders(t), Accept: 'image/png' },
+        credentials: "include",
+        headers: { ...bearerHeaders(t), Accept: "image/png" },
       }),
-    )
-    assertAuthResponseCurrent(res)
-    if (!res.ok) await throwApi(res)
-    const blob = await res.blob()
-    assertAuthResponseCurrent(res)
-    return blob
+    );
+    assertAuthResponseCurrent(res);
+    if (!res.ok) await throwApi(res);
+    const blob = await res.blob();
+    assertAuthResponseCurrent(res);
+    return blob;
   },
 
   cancelZhihuSetup: (a: AuthSession, sessionId: string): Promise<KnowledgePlanetSetupView> =>
     jsonOrThrow<KnowledgePlanetSetupView>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/zhihu/setup/${encodeURIComponent(sessionId)}`, {
-          method: 'DELETE',
-          credentials: 'include',
+          method: "DELETE",
+          credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
@@ -4077,8 +4191,8 @@ export const api = {
     jsonOrThrow<unknown>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/accounts/${encodeURIComponent(id)}`, {
-          method: 'DELETE',
-          credentials: 'include',
+          method: "DELETE",
+          credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
@@ -4087,15 +4201,13 @@ export const api = {
   setPluginWriteAccess: (
     a: AuthSession,
     id: string,
-    input:
-      | { enabled: false }
-      | { enabled: true; accepted: true; disclaimerVersion: number },
-  ): Promise<RuntimePluginAccount['writeControl']> =>
-    jsonOrThrow<{ writeControl: RuntimePluginAccount['writeControl'] }>(
+    input: { enabled: false } | { enabled: true; accepted: true; disclaimerVersion: number },
+  ): Promise<RuntimePluginAccount["writeControl"]> =>
+    jsonOrThrow<{ writeControl: RuntimePluginAccount["writeControl"] }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/write-access`, {
-          method: 'PATCH',
-          credentials: 'include',
+          method: "PATCH",
+          credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify(input),
         }),
@@ -4105,15 +4217,13 @@ export const api = {
   setPluginWritePreapproval: (
     a: AuthSession,
     id: string,
-    input:
-      | { enabled: false }
-      | { enabled: true; accepted: true; disclaimerVersion: number },
-  ): Promise<RuntimePluginAccount['writeControl']> =>
-    jsonOrThrow<{ writeControl: RuntimePluginAccount['writeControl'] }>(
+    input: { enabled: false } | { enabled: true; accepted: true; disclaimerVersion: number },
+  ): Promise<RuntimePluginAccount["writeControl"]> =>
+    jsonOrThrow<{ writeControl: RuntimePluginAccount["writeControl"] }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/write-preapproval`, {
-          method: 'PATCH',
-          credentials: 'include',
+          method: "PATCH",
+          credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify(input),
         }),
@@ -4127,7 +4237,7 @@ export const api = {
     jsonOrThrow<KnowledgePlanetAutomationView>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation`, {
-          credentials: 'include',
+          credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
@@ -4139,17 +4249,17 @@ export const api = {
     input:
       | { enabled: false; accountDailyLimit?: number }
       | {
-          enabled: true
-          accepted: true
-          disclaimerVersion: number
-          accountDailyLimit?: number
+          enabled: true;
+          accepted: true;
+          disclaimerVersion: number;
+          accountDailyLimit?: number;
         },
   ): Promise<KnowledgePlanetAutomationControl> =>
     jsonOrThrow<{ control: KnowledgePlanetAutomationControl }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation`, {
-          method: 'PATCH',
-          credentials: 'include',
+          method: "PATCH",
+          credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify(input),
         }),
@@ -4163,7 +4273,7 @@ export const api = {
     jsonOrThrow<{ groups: KnowledgePlanetAutomationGroup[] }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation/groups`, {
-          credentials: 'include',
+          credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
@@ -4173,20 +4283,20 @@ export const api = {
     a: AuthSession,
     id: string,
     input: {
-      groupIds: string[]
-      name: string
-      instructions: string
-      triggerKind: 'new_topic' | 'new_question'
-      dailyLimit: number
-      cooldownMinutes: number
-      maxReplyChars: number
+      groupIds: string[];
+      name: string;
+      instructions: string;
+      triggerKind: "new_topic" | "new_question";
+      dailyLimit: number;
+      cooldownMinutes: number;
+      maxReplyChars: number;
     },
   ): Promise<KnowledgePlanetAutomationRule[]> =>
     jsonOrThrow<{ rules: KnowledgePlanetAutomationRule[] }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation/rules/batch`, {
-          method: 'POST',
-          credentials: 'include',
+          method: "POST",
+          credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify(input),
         }),
@@ -4197,20 +4307,20 @@ export const api = {
     a: AuthSession,
     id: string,
     input: {
-      groupId: string
-      name: string
-      instructions: string
-      triggerKind: 'new_topic' | 'new_question'
-      dailyLimit: number
-      cooldownMinutes: number
-      maxReplyChars: number
+      groupId: string;
+      name: string;
+      instructions: string;
+      triggerKind: "new_topic" | "new_question";
+      dailyLimit: number;
+      cooldownMinutes: number;
+      maxReplyChars: number;
     },
   ): Promise<KnowledgePlanetAutomationRule> =>
     jsonOrThrow<{ rule: KnowledgePlanetAutomationRule }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation/rules`, {
-          method: 'POST',
-          credentials: 'include',
+          method: "POST",
+          credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify(input),
         }),
@@ -4222,13 +4332,13 @@ export const api = {
     id: string,
     ruleId: string,
     patch: Partial<{
-      name: string
-      instructions: string
-      triggerKind: 'new_topic' | 'new_question'
-      enabled: boolean
-      dailyLimit: number
-      cooldownMinutes: number
-      maxReplyChars: number
+      name: string;
+      instructions: string;
+      triggerKind: "new_topic" | "new_question";
+      enabled: boolean;
+      dailyLimit: number;
+      cooldownMinutes: number;
+      maxReplyChars: number;
     }>,
   ): Promise<KnowledgePlanetAutomationRule> =>
     jsonOrThrow<{ rule: KnowledgePlanetAutomationRule }>(
@@ -4236,8 +4346,8 @@ export const api = {
         fetch(
           `/api/plugins/accounts/${encodeURIComponent(id)}/automation/rules/${encodeURIComponent(ruleId)}`,
           {
-            method: 'PATCH',
-            credentials: 'include',
+            method: "PATCH",
+            credentials: "include",
             headers: bearerHeaders(t, true),
             body: JSON.stringify(patch),
           },
@@ -4255,8 +4365,8 @@ export const api = {
         fetch(
           `/api/plugins/accounts/${encodeURIComponent(id)}/automation/rules/${encodeURIComponent(ruleId)}`,
           {
-            method: 'DELETE',
-            credentials: 'include',
+            method: "DELETE",
+            credentials: "include",
             headers: bearerHeaders(t),
           },
         ),
@@ -4271,13 +4381,17 @@ export const api = {
   /** GET /api/org 概要(member+)。403=无 org 归属 / org 停用。 */
   getOrg: (a: AuthSession): Promise<OrgSummary> =>
     jsonOrThrow<{ org: OrgSummary }>(
-      callWithRefresh(a, (t) => fetch("/api/org", { credentials: "include", headers: bearerHeaders(t) })),
+      callWithRefresh(a, (t) =>
+        fetch("/api/org", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
     ).then((b) => b.org),
 
   // ── 成员(A 批次后端已就绪) ──────────────────────────────────────────
   listOrgMembers: (a: AuthSession): Promise<OrgMember[]> =>
     jsonOrThrow<{ members: OrgMember[] }>(
-      callWithRefresh(a, (t) => fetch("/api/org/members", { credentials: "include", headers: bearerHeaders(t) })),
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/members", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
     ).then((b) => b.members),
 
   patchOrgMember: (
@@ -4317,7 +4431,9 @@ export const api = {
 
   listOrgInvitations: (a: AuthSession): Promise<OrgInvitation[]> =>
     jsonOrThrow<{ invitations: OrgInvitation[] }>(
-      callWithRefresh(a, (t) => fetch("/api/org/invitations", { credentials: "include", headers: bearerHeaders(t) })),
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/invitations", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
     ).then((b) => b.invitations),
 
   createOrgInvitation: (a: AuthSession, email: string, orgRole: OrgRole): Promise<void> =>
@@ -4344,7 +4460,10 @@ export const api = {
     ).then(() => undefined),
 
   /** POST /api/org/invitations/accept(受邀者尚非成员,仅 requireAuth)。 */
-  acceptOrgInvitation: (a: AuthSession, token: string): Promise<{ org_id: string; org_role: OrgRole }> =>
+  acceptOrgInvitation: (
+    a: AuthSession,
+    token: string,
+  ): Promise<{ org_id: string; org_role: OrgRole }> =>
     jsonOrThrow<{ joined: boolean; org_id: string; org_role: OrgRole }>(
       callWithRefresh(a, (t) =>
         fetch("/api/org/invitations/accept", {
@@ -4375,7 +4494,10 @@ export const api = {
       ),
     ).then((b) => b.profile),
 
-  putOrgInvoiceProfile: (a: AuthSession, input: OrgInvoiceProfileInput): Promise<OrgInvoiceProfile> =>
+  putOrgInvoiceProfile: (
+    a: AuthSession,
+    input: OrgInvoiceProfileInput,
+  ): Promise<OrgInvoiceProfile> =>
     jsonOrThrow<{ profile: OrgInvoiceProfile }>(
       callWithRefresh(a, (t) =>
         fetch("/api/org/invoice-profile", {
@@ -4389,7 +4511,9 @@ export const api = {
 
   listOrgInvoices: (a: AuthSession): Promise<OrgInvoiceRequest[]> =>
     jsonOrThrow<{ invoices: OrgInvoiceRequest[] }>(
-      callWithRefresh(a, (t) => fetch("/api/org/invoices", { credentials: "include", headers: bearerHeaders(t) })),
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/invoices", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
     ).then((b) => b.invoices),
 
   createOrgInvoice: (a: AuthSession, orderIds: string[]): Promise<OrgInvoiceRequest> =>
@@ -4420,23 +4544,31 @@ export const api = {
   /** GET /api/org/balance → {credits}(批次 B)。轮询到账用。 */
   getOrgBalance: (a: AuthSession): Promise<string> =>
     jsonOrThrow<{ credits: string }>(
-      callWithRefresh(a, (t) => fetch("/api/org/balance", { credentials: "include", headers: bearerHeaders(t) })),
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/balance", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
     ).then((b) => b.credits),
 
   listOrgOrders: (a: AuthSession): Promise<OrgOrder[]> =>
     jsonOrThrow<{ rows: OrgOrder[] }>(
-      callWithRefresh(a, (t) => fetch("/api/org/orders", { credentials: "include", headers: bearerHeaders(t) })),
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/orders", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
     ).then((b) => b.rows ?? []),
 
   listOrgLedger: (a: AuthSession): Promise<OrgLedgerRow[]> =>
     jsonOrThrow<{ rows: OrgLedgerRow[] }>(
-      callWithRefresh(a, (t) => fetch("/api/org/ledger", { credentials: "include", headers: bearerHeaders(t) })),
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/ledger", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
     ).then((b) => b.rows ?? []),
 
   // ── 技能(批次 C 契约) ───────────────────────────────────────────────
   getOrgSkills: (a: AuthSession): Promise<OrgSkillsResponse> =>
     jsonOrThrow<OrgSkillsResponse>(
-      callWithRefresh(a, (t) => fetch("/api/org/skills", { credentials: "include", headers: bearerHeaders(t) })),
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/skills", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
     ).then((b) => ({ installed: b.installed ?? [], available: b.available ?? [] })),
 
   installOrgSkill: (a: AuthSession, slug: string): Promise<void> =>
@@ -4489,7 +4621,11 @@ export const api = {
           method: "POST",
           credentials: "include",
           headers: bearerHeaders(t, true),
-          body: JSON.stringify({ org_name: input.orgName, plan_code: input.planCode, seats: input.seats }),
+          body: JSON.stringify({
+            org_name: input.orgName,
+            plan_code: input.planCode,
+            seats: input.seats,
+          }),
         }),
       ),
     ),

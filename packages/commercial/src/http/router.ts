@@ -244,7 +244,13 @@ import {
 import { handleAgentCancel, handleAgentOpen, handleAgentStatus } from './agent.js'
 import { dispatchPluginsRoute } from './plugins.js'
 // V3 CC 外接 plan Phase 4(2026-05-18):用户自管 CC API key 的管理面 endpoints。
-import { handleCreateMyApiKey, handleListMyApiKeys, handleRevokeMyApiKey } from './apiKeyAdmin.js'
+import {
+  handleCreateMyApiKey,
+  handleGetMyApiKeyUsage,
+  handleListMyApiKeys,
+  handleRevokeMyApiKey,
+  handleUpdateMyApiKey,
+} from './apiKeyAdmin.js'
 import { getBearerToken, getSessionCookieToken } from './authHelpers.js'
 import {
   handleGetChatGptProxyAccess,
@@ -729,11 +735,15 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     //   GET    /api/me/api-keys           → list 未撤销 key(无 secret)
     //   POST   /api/me/api-keys { label } → 创建,**返完整明文一次**
     //   DELETE /api/me/api-keys/:id       → 软撤销
-    // DELETE 用 pathPrefix + handler 内 regex 抠 :id(同 /api/me/messages/:id/read 范本)。
-    // exact path 注册在 prefix 之前(matchRoute exact-first),不会冲突。
+    //   PATCH  /api/me/api-keys/:id       → 0277 改名 / 临时禁用 / 单 key 积分上限
+    //   GET    /api/me/api-keys/usage     → 0277 经 API key 的消耗报表(window / key_id)
+    // DELETE/PATCH 用 pathPrefix + handler 内 regex 抠 :id(同 /api/me/messages/:id/read 范本)。
+    // exact path 注册在 prefix 之前(matchRoute exact-first),`/usage` 不会被 prefix 吞。
     { method: 'GET', path: '/api/me/api-keys', handler: handleListMyApiKeys },
     { method: 'POST', path: '/api/me/api-keys', handler: handleCreateMyApiKey },
+    { method: 'GET', path: '/api/me/api-keys/usage', handler: handleGetMyApiKeyUsage },
     { method: 'DELETE', pathPrefix: '/api/me/api-keys/', handler: handleRevokeMyApiKey },
+    { method: 'PATCH', pathPrefix: '/api/me/api-keys/', handler: handleUpdateMyApiKey },
     // 用户文献库(research_documents 管理面):列表 / 上传入库(raw bytes) / 删单篇。
     // GET 接受 ?projectId=(OC_RESEARCH_WORKSPACE 开时过滤;关时忽略)。
     // 详见 handlers.ts 对应 handler 注释;数据逻辑在 research/library.ts。

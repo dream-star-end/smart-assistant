@@ -452,6 +452,32 @@ export function makeAnthropicProxyHandler(
         throw err;
       }
 
+      // 4-pre) 0277 单 key 名义积分上限(仅 API key identity 携带 apiKey 快照)。
+      // 放在 cursor 分流与 authority gate 之前:上限是 owner 对该 key 的硬约束,
+      // 与模型 / 引擎无关;count_tokens 在 1b 已返回,不受影响。
+      // 用 resolve 时的 spent 快照做 O(1) 预检,允许并发结算带来的事务粒度瞬时超额
+      // (与账户余额 clamp 语义一致:不回滚已发字节)。
+      if (
+        identity.apiKey &&
+        identity.apiKey.creditLimit !== null &&
+        identity.apiKey.spentCredits >= identity.apiKey.creditLimit
+      ) {
+        userLog.warn("proxy_api_key_limit_exceeded", {
+          apiKeyId: identity.apiKey.id.toString(),
+          creditLimit: identity.apiKey.creditLimit.toString(),
+          spentCredits: identity.apiKey.spentCredits.toString(),
+        });
+        incrAnthropicProxyReject("api_key_limit");
+        sendJsonError(
+          res,
+          402,
+          "API_KEY_LIMIT_EXCEEDED",
+          "this API key has reached its credit limit",
+          requestId,
+        );
+        return;
+      }
+
       // 4a) cursor-* 引擎模型(仅 external API-key 实例注入 cursorExternal)。
       // 放在 authority gate 之前:gate 对 engine!=='ccb' 的模型一律 not_available,
       // 而这条路径的可用性由 cursorExternal 自己按 pricing.enabled + authorize + 账号池判定。
@@ -1382,6 +1408,8 @@ export function makeAnthropicProxyHandler(
           dispatchId: dispatchIdentity?.dispatchId ?? null,
           attemptNo: dispatchIdentity?.attemptNo ?? null,
           verificationSponsorship,
+          // 0277:外接 API key 归因(容器 strategy 无 apiKey → null,落库形状不变)。
+          apiKeyId: identity.apiKey?.id ?? null,
         },
       );
 

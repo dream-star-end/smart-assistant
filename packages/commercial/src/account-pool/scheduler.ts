@@ -11,7 +11,7 @@
  *   `mode` 字段保留只作为 metric label(`scheduler_pick{mode=chat|agent}`),
  *   行为不分支 —— 简化 future readers 心智负担。
  *
- *   权重 = max(1, health_score) * f_quota(5h) * f_quota(7d) * f_subscription
+ *   权重 = max(1, health_score) * f_quota(5h) * f_quota(7d) * f_subscription * f_grok_credit
  *   各因子 NULL 输入返回中性 1.0(详见 computeAccountWeight 注释)。
  *
  * 错误语义:
@@ -239,7 +239,8 @@ export const DEFAULT_MAX_CONCURRENT_PER_ACCOUNT = 10
  *
  * 与 computeAccountWeight 里的 quotaFactor(50→95% 线性降权)分工:降权是"少用",
  * 这里是"到顶就不用"。阈值默认 95(留一点余量给 header 上报抖动),env 可调。
- * NULL(未上报,如 codex/grok)不受影响 —— SQL 用 `IS NULL OR < 阈值`。
+ * NULL(未上报,如 codex/grok 的 quota_5h/7d)不受影响 —— SQL 用 `IS NULL OR < 阈值`。
+ * grok 现在走 grok_credit_usage_pct(见 selectActiveCandidates 的 grok 主动退避 WHERE)。
  */
 export const DEFAULT_QUOTA_BACKOFF_PCT = 95
 
@@ -557,6 +558,18 @@ export interface CandidateRow extends QueryResultRow {
   /** Anthropic 订阅周期到期日(管理员手填;NULL = 未知,按中性看待) */
   subscription_end_at: Date | null
   /**
+   * xAI 周额度已用百分比(0-100);仅 provider=grok 行非空。
+   * NULL = 未知,按中性看待。
+   */
+  grok_credit_usage_pct?: number | null
+  /** 周额度重置时间(本周期结束=下次重置) */
+  grok_credit_period_end?: Date | null
+  /**
+   * grok 用量刷新错误;token 终态时为 'oauth_terminal:<code>' 开头
+   * (见 grokUsageSweeper.refreshGrokAccountUsage)。
+   */
+  grok_usage_error?: string | null
+  /**
    * 反风控锚定:该账号永久绑定的客户端 device_id(64 字符小写 hex)。
    * 来自 claude_accounts.pinned_user_id 列(0067 migration)。
    */
@@ -583,7 +596,7 @@ export function defaultHash(s: string): bigint {
 const TWO_64 = 2n ** 64n
 
 /**
- * 单账号综合权重 = max(1, health) × f_quota(5h) × f_quota(7d) × f_subscription.
+ * 单账号综合权重 = max(1, health) × f_quota(5h) × f_quota(7d) × f_subscription × f_grok_credit.
  *
  * 设计要点(boss 决策 + Codex review 反馈):
  *   1. **NULL 全部按中性 1.0 处理** — 字段未维护不应隐式降权。新加因子不能把
@@ -598,6 +611,8 @@ const TWO_64 = 2n ** 64n
  *      (中性);≥30 天 = 0.8(远期让路)。管理员手填字段、变更频率极低,阶梯 OK。
  *   4. **永不返回 0**:全局保底 0.05 — health=0、quota=100、subscription 过期的
  *      "残废账号" 也保留极小机会被探活,以便健康分恢复路径不死锁。
+ *   5. **Grok 周额度因子 f_grok_credit**:见 grokCreditFactor。非 grok 行三列
+ *      undefined/null → 1.0,现有 claude/codex 权重完全不变。
  *
  * @param now 注入"当前时间",方便测试 subscription 阶梯;默认调用方传 new Date()
  */
@@ -606,9 +621,55 @@ export function computeAccountWeight(c: CandidateRow, now: Date): number {
   const wQuota5h = quotaFactor(c.quota_5h_pct)
   const wQuota7d = quotaFactor(c.quota_7d_pct)
   const wSub = subscriptionFactor(c.subscription_end_at, now)
-  const w = wHealth * wQuota5h * wQuota7d * wSub
+  const wGrok = grokCreditFactor(c, now)
+  const w = wHealth * wQuota5h * wQuota7d * wSub * wGrok
   // 极小 floor:避免 0/负数(ln(0)=-inf → WRH 数值崩)。0.05 仍允许探活但极不被偏好。
   return Math.max(0.05, w)
+}
+
+/**
+ * Grok Build 周额度因子。与 Cursor Sand `computeCursorSlotWeight` 同构:
+ * 周额度用完前,余量多的多接流量;临近重置的账号余量作废风险大所以加权榨干。
+ *
+ *   - `grok_usage_error` 以 `'oauth_terminal:'` 开头 → 0.05
+ *     (refresh token 已死,relay 必失败;对齐 Cursor BLOCKED→最低)
+ *   - `grok_credit_usage_pct` 为 null/undefined/NaN/负数 → headroom 1.0
+ *     (中性;本文件「NULL 全部中性 1.0」,不是 Cursor 的 0.5)
+ *   - `grok_credit_period_end` 非空且 ≤ now → 陈旧:headroom 1.0、resetFactor 1
+ *     (额度已重置但 sweeper 还没刷新,避免把账号永久踢出)
+ *   - 否则 pct 先按 5% 分桶(`Math.floor(pct/5)*5`,与 cursorUsageWeightInputsChanged
+ *     一致,避免每小时 0.3% 漂移导致 WRH session 迁移),
+ *     headroom = max(0.02, min(1, (100-bucketed)/100))
+ *   - resetFactor:`period_end` 为 null → 1;距 now 小时数 <24 → 1.5;<72 → 1.2;否则 1
+ *
+ * 返回 headroom × resetFactor。非 grok 行三列 undefined/null → 1.0。
+ */
+export function grokCreditFactor(
+  c: Pick<CandidateRow, 'grok_credit_usage_pct' | 'grok_credit_period_end' | 'grok_usage_error'>,
+  now: Date,
+): number {
+  if (c.grok_usage_error?.startsWith('oauth_terminal:')) return 0.05
+
+  const periodEnd = c.grok_credit_period_end
+  if (periodEnd != null) {
+    const untilResetMs = periodEnd.getTime() - now.getTime()
+    if (!Number.isNaN(untilResetMs) && untilResetMs <= 0) return 1.0
+  }
+
+  const pct = c.grok_credit_usage_pct
+  const headroom =
+    pct == null || Number.isNaN(pct) || pct < 0
+      ? 1.0
+      : Math.max(0.02, Math.min(1, (100 - Math.floor(pct / 5) * 5) / 100))
+
+  let resetFactor = 1
+  if (periodEnd != null) {
+    const hours = (periodEnd.getTime() - now.getTime()) / 3_600_000
+    if (Number.isFinite(hours)) {
+      resetFactor = hours < 24 ? 1.5 : hours < 72 ? 1.2 : 1
+    }
+  }
+  return headroom * resetFactor
 }
 
 /**
@@ -1234,15 +1295,22 @@ export class AccountScheduler {
     // 歇到窗口滚动恢复(pct 由响应头回落),而不是被 WRH 低权重选中后一路打到 429。
     // NULL(未上报)保留在池内。pin-hit 命中被剔除账号 → pickPinnedAccount 返 null →
     // handlePinnedAccountUnavailable 走 ready→503 retry(不再把请求推到已耗尽账号)。
+    //
+    // grok 的 quota_5h/7d 恒 NULL,周额度走 grok_credit_usage_pct。到顶直接剔除
+    // (与 DEFAULT_QUOTA_BACKOFF_PCT 同一 $pctIdx / 同一阈值,默认 95);
+    // 但 grok_credit_period_end <= NOW()(sweeper 数据陈旧、额度已按周滚动重置)
+    // 不剔除,避免 sweeper 长时间失败把账号永久踢出。非 grok 行三列全 NULL 不受影响。
     params.push(this.quotaBackoffPct)
     const pctIdx = params.length
     where.push(
       `(quota_5h_pct IS NULL OR quota_5h_pct < $${pctIdx})`,
       `(quota_7d_pct IS NULL OR quota_7d_pct < $${pctIdx})`,
+      `(grok_credit_usage_pct IS NULL OR grok_credit_usage_pct < $${pctIdx} OR grok_credit_period_end IS NULL OR grok_credit_period_end <= NOW())`,
     )
     const res = await query<CandidateRow>(
       `SELECT id::text AS id, plan, health_score,
               quota_5h_pct, quota_7d_pct, subscription_end_at,
+              grok_credit_usage_pct::float8 AS grok_credit_usage_pct, grok_credit_period_end, grok_usage_error,
               pinned_user_id,
               account_uuid::text AS account_uuid,
               persona

@@ -218,6 +218,10 @@ describe("handleListMyApiKeys — GET list", () => {
         key_prefix: "abcd1234",
         created_at: "2026-05-18T00:00:00.000Z",
         last_used_at: "2026-05-18T01:00:00.000Z",
+        // 0277:fake pool 行没这三列 → 缺省 "未禁用 / 不限 / 0"。
+        disabled_at: null,
+        credit_limit: null,
+        spent_credits: "0",
       });
       assert.equal(body.keys[1]!.last_used_at, null);
     } finally { await resetPool(); }

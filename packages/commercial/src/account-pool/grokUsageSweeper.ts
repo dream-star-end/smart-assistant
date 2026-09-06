@@ -5,9 +5,11 @@
  * Before this, the only place the platform learned a Grok account's remaining
  * credits was an on-demand admin modal (60s in-memory cache, never persisted).
  * This sweeper writes the secret-free numbers onto the row so the admin
- * accounts table can show them inline (no modal round trip). Grok has no
- * `.slot-weight` sidecar / materializer — unlike cursorUsageSweeper, there is
- * no pool-projection nudge.
+ * accounts table can show them inline (no modal round trip). Grok does not
+ * need a sidecar / materializer: AccountScheduler.pick WRH reads
+ * grok_credit_usage_pct / grok_credit_period_end from claude_accounts
+ * (grokCreditFactor). This file only writes those numbers onto the row, and
+ * buckets them like Sand (`weightInputsChanged`) for logs / tests.
  *
  * Scope: `provider='grok' AND status IN ('active','cooldown')`. Disabled /
  * banned rows are skipped: nothing routes to them and their tokens may be dead.
@@ -73,6 +75,21 @@ export function grokUsagePatchFromSnapshot(snap: GrokUsageSnapshot): GrokUsageCo
   };
 }
 
+/**
+ * Did the scheduling-relevant numbers change enough to observe? Bucketed so a
+ * 0.3% drift every hour does not look like a WRH weight move.
+ */
+export function grokUsageWeightInputsChanged(
+  before: Pick<AccountRow, "grok_credit_usage_pct" | "grok_credit_period_end">,
+  after: Pick<GrokUsageColumnPatch, "grok_credit_usage_pct" | "grok_credit_period_end">,
+): boolean {
+  const bucket = (pct: number | null): number | null => (pct === null ? null : Math.floor(pct / 5));
+  if (bucket(before.grok_credit_usage_pct) !== bucket(after.grok_credit_usage_pct)) return true;
+  const day = (d: Date | null): number | null => (d === null ? null : Math.floor(d.getTime() / 86_400_000));
+  if (day(before.grok_credit_period_end) !== day(after.grok_credit_period_end)) return true;
+  return false;
+}
+
 function shortError(err: unknown): string {
   if (err instanceof GrokUsageUnavailableError) {
     const keys = Object.keys(err.details).slice(0, 4).join(",");
@@ -100,7 +117,7 @@ export interface RefreshGrokAccountUsageDeps {
 }
 
 export type RefreshGrokAccountUsageResult =
-  | { ok: true; snapshot: GrokUsageSnapshot }
+  | { ok: true; snapshot: GrokUsageSnapshot; weightInputsChanged: boolean }
   | { ok: false; reason: string; skipped?: "not_grok" | "missing" | "token_terminal" };
 
 /**
@@ -191,8 +208,21 @@ export async function refreshGrokAccountUsage(
       JSON.stringify(snapshotForStorage(snapshot)),
     ],
   );
+  // Compare against what actually landed: the UPDATE COALESCEs a null patch
+  // value onto the previous column, so a missing number is "unchanged".
+  const effective = {
+    grok_credit_usage_pct: patch.grok_credit_usage_pct ?? account.grok_credit_usage_pct,
+    grok_credit_period_end: patch.grok_credit_period_end ?? account.grok_credit_period_end,
+  };
+  const weightInputsChanged = grokUsageWeightInputsChanged(account, effective);
+  if (weightInputsChanged) {
+    log.info("grok usage sweep: weight inputs moved", {
+      accountId: id.toString(),
+      pct: effective.grok_credit_usage_pct,
+    });
+  }
   setCachedGrokUsage(id.toString(), snapshot, now());
-  return { ok: true, snapshot };
+  return { ok: true, snapshot, weightInputsChanged };
 }
 
 export interface GrokUsageSweepDeps extends RefreshGrokAccountUsageDeps {
@@ -205,6 +235,7 @@ export interface GrokUsageSweepSummary {
   refreshed: number;
   failed: number;
   skipped: number;
+  weightChanged: number;
 }
 
 export function isGrokUsageSweepCandidate(row: AccountRow): boolean {
@@ -217,7 +248,7 @@ export async function sweepGrokUsageOnce(deps: GrokUsageSweepDeps = {}): Promise
   const listGrokAccounts = deps.listGrokAccounts
     ?? (() => listAccounts({ provider: "grok", limit: 500 }));
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const summary: GrokUsageSweepSummary = { scanned: 0, refreshed: 0, failed: 0, skipped: 0 };
+  const summary: GrokUsageSweepSummary = { scanned: 0, refreshed: 0, failed: 0, skipped: 0, weightChanged: 0 };
   let rows: AccountRow[];
   try {
     rows = await listGrokAccounts();
@@ -233,6 +264,7 @@ export async function sweepGrokUsageOnce(deps: GrokUsageSweepDeps = {}): Promise
       const result = await refreshGrokAccountUsage(row, deps);
       if (result.ok) {
         summary.refreshed += 1;
+        if (result.weightInputsChanged) summary.weightChanged += 1;
       } else if (result.skipped) {
         summary.skipped += 1;
       } else {
@@ -257,7 +289,7 @@ export function startGrokUsageSweeper(
 ): { stop: () => void; runOnceForTest: () => Promise<GrokUsageSweepSummary> } {
   if (getRuntimeChannel() !== "v5") {
     // Commercial (v3) masters have no Grok subscription pool; do not schedule.
-    return { stop: () => {}, runOnceForTest: async () => ({ scanned: 0, refreshed: 0, failed: 0, skipped: 0 }) };
+    return { stop: () => {}, runOnceForTest: async () => ({ scanned: 0, refreshed: 0, failed: 0, skipped: 0, weightChanged: 0 }) };
   }
   const intervalMs = Math.max(MIN_INTERVAL_MS, opts.intervalMs ?? GROK_USAGE_SWEEP_INTERVAL_MS);
   let inFlight: Promise<GrokUsageSweepSummary> | null = null;

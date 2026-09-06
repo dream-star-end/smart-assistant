@@ -21,6 +21,7 @@ import {
   SLOT_LEASE_TTL_CEIL_MS,
   computeAccountWeight,
   defaultHash,
+  grokCreditFactor,
   parseMaxConcurrentEnv,
   parseQuotaBackoffPctEnv,
   parseSlotLeaseTtlEnv,
@@ -39,6 +40,9 @@ function mkRow(overrides: Partial<CandidateRow> = {}): CandidateRow {
     quota_5h_pct: overrides.quota_5h_pct ?? null,
     quota_7d_pct: overrides.quota_7d_pct ?? null,
     subscription_end_at: overrides.subscription_end_at ?? null,
+    grok_credit_usage_pct: overrides.grok_credit_usage_pct ?? null,
+    grok_credit_period_end: overrides.grok_credit_period_end ?? null,
+    grok_usage_error: overrides.grok_usage_error ?? null,
     pinned_user_id:
       overrides.pinned_user_id ??
       '0'.repeat(63) + ((Number(overrides.id ?? '1') % 16).toString(16)),
@@ -212,6 +216,76 @@ describe('computeAccountWeight', () => {
     // 100 * 0.1556 * 2.0 ≈ 31.11 — 想榨干但不能为榨干撞 rate limit
     assert.ok(Math.abs(computeAccountWeight(r, NOW) - 31.11) < 0.5)
   })
+
+  test('grok 字段全 null 时结果与现有公式相同(回归保护)', () => {
+    const r = mkRow({ health_score: 100, quota_5h_pct: 72.5 })
+    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 52.5) < 1e-6)
+    assert.equal(grokCreditFactor(r, NOW), 1.0)
+  })
+
+  test('pct 90 的 grok 行权重 ≈ 100×0.1', () => {
+    const r = mkRow({ health_score: 100, grok_credit_usage_pct: 90 })
+    assert.ok(Math.abs(computeAccountWeight(r, NOW) - 10) < 1e-9)
+  })
+})
+
+describe('grokCreditFactor', () => {
+  test('null → 1.0', () => {
+    assert.equal(grokCreditFactor(mkRow(), NOW), 1.0)
+  })
+  test('pct 0 → 1.0', () => {
+    assert.equal(grokCreditFactor(mkRow({ grok_credit_usage_pct: 0 }), NOW), 1.0)
+  })
+  test('pct 72(桶 70) → 0.30', () => {
+    assert.equal(grokCreditFactor(mkRow({ grok_credit_usage_pct: 72 }), NOW), 0.3)
+  })
+  test('pct 100 → 0.02', () => {
+    assert.equal(grokCreditFactor(mkRow({ grok_credit_usage_pct: 100 }), NOW), 0.02)
+  })
+  test('pct 130 → 0.02', () => {
+    assert.equal(grokCreditFactor(mkRow({ grok_credit_usage_pct: 130 }), NOW), 0.02)
+  })
+  test('period_end 在 now+1h → ×1.5', () => {
+    const r = mkRow({
+      grok_credit_usage_pct: 0,
+      grok_credit_period_end: new Date(NOW.getTime() + 3_600_000),
+    })
+    assert.equal(grokCreditFactor(r, NOW), 1.5)
+  })
+  test('period_end 在 now+48h → ×1.2', () => {
+    const r = mkRow({
+      grok_credit_usage_pct: 0,
+      grok_credit_period_end: new Date(NOW.getTime() + 48 * 3_600_000),
+    })
+    assert.equal(grokCreditFactor(r, NOW), 1.2)
+  })
+  test('period_end 在 now+200h → ×1', () => {
+    const r = mkRow({
+      grok_credit_usage_pct: 0,
+      grok_credit_period_end: new Date(NOW.getTime() + 200 * 3_600_000),
+    })
+    assert.equal(grokCreditFactor(r, NOW), 1)
+  })
+  test('period_end 在 now-1h 且 pct 99 → 1.0(陈旧中性)', () => {
+    const r = mkRow({
+      grok_credit_usage_pct: 99,
+      grok_credit_period_end: new Date(NOW.getTime() - 3_600_000),
+    })
+    assert.equal(grokCreditFactor(r, NOW), 1.0)
+  })
+  test("grok_usage_error 'oauth_terminal:invalid_grant' 且 pct 0 → 0.05", () => {
+    const r = mkRow({
+      grok_credit_usage_pct: 0,
+      grok_usage_error: 'oauth_terminal:invalid_grant',
+    })
+    assert.equal(grokCreditFactor(r, NOW), 0.05)
+  })
+  test('pct 72.9 与 70.1 同权重(分桶)', () => {
+    const a = grokCreditFactor(mkRow({ grok_credit_usage_pct: 72.9 }), NOW)
+    const b = grokCreditFactor(mkRow({ grok_credit_usage_pct: 70.1 }), NOW)
+    assert.equal(a, b)
+    assert.equal(a, 0.3)
+  })
 })
 
 describe('pickWRH', () => {
@@ -342,6 +416,19 @@ describe('pickWRH', () => {
     // weight 比 200:100 → 2:1
     const ratio = urgent / normal
     assert.ok(ratio > 1.7 && ratio < 2.4, `urgent/normal ratio=${ratio} expected ~2.0`)
+  })
+
+  test('grok 周额度:同 health 时 pct 10 比 pct 95 明显更常被选', () => {
+    const cands: CandidateRow[] = [
+      mkRow({ id: 'A', health_score: 100, grok_credit_usage_pct: 10 }),
+      mkRow({ id: 'B', health_score: 100, grok_credit_usage_pct: 95 }),
+    ]
+    let a = 0
+    const N = 200
+    for (let i = 0; i < N; i += 1) {
+      if (pickWRH(cands, `seed-${i}`, NOW).id === 'A') a += 1
+    }
+    assert.ok(a >= 150, `A selected ${a}/${N} times, expected ≥150`)
   })
 })
 

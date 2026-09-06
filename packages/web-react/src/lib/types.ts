@@ -346,12 +346,7 @@ export type Preferences = Record<string, unknown>;
 export type AgentSubscriptionStatus = "active" | "expired" | "canceled" | "suspended";
 
 /** agent_containers.status（后端权威：commercial/src/agent/subscriptions.ts）。 */
-export type AgentContainerStatus =
-  | "provisioning"
-  | "running"
-  | "stopped"
-  | "removed"
-  | "error";
+export type AgentContainerStatus = "provisioning" | "running" | "stopped" | "removed" | "error";
 
 /** Agent 订阅/容器状态（GET /api/agent/status）。 */
 export type AgentStatus = {
@@ -758,6 +753,12 @@ export type ApiKeySummary = {
   keyPrefix: string;
   createdAt: string;
   lastUsedAt: string | null;
+  /** 0277：临时禁用时间；非 null 表示已禁用（可恢复）。 */
+  disabledAt: string | null;
+  /** 0277：单 key 名义积分上限（字符串大数）；null = 不限。 */
+  creditLimit: string | null;
+  /** 0277：经该 key 已结算的名义积分累计（字符串大数）。 */
+  spentCredits: string;
 };
 
 /** 新建 API key（201）。`plaintext` 完整明文仅此一次返回，之后无法再取。 */
@@ -768,6 +769,53 @@ export type CreatedApiKey = {
   /** `oc-cc.<prefix>.<secret>` —— 仅创建时返回一次，必须立即引导用户保存。 */
   plaintext: string;
   createdAt: string;
+};
+
+/** PATCH /api/me/api-keys/:id 可改字段；缺省不动。 */
+export type ApiKeyPatch = {
+  label?: string;
+  disabled?: boolean;
+  /** null 清除上限；字符串为正整数。 */
+  creditLimit?: string | null;
+};
+
+/** GET /api/me/api-keys/usage：按 key 拆分单行（含已撤销 key 的历史消耗）。 */
+export type ApiKeyUsageByKey = {
+  api_key_id: string;
+  label: string | null;
+  key_prefix: string | null;
+  revoked: boolean;
+  disabled: boolean;
+  requests: string;
+  credits: string;
+  input_tokens: string;
+  output_tokens: string;
+  last_used_at: string | null;
+};
+
+/** 最近请求明细单行（含失败/被拒的 0 积分行）。 */
+export type ApiKeyUsageRecent = {
+  id: string;
+  created_at: string;
+  api_key_id: string | null;
+  label: string | null;
+  model: string;
+  input_tokens: string;
+  output_tokens: string;
+  cache_read_tokens: string;
+  cache_write_tokens: string;
+  cost_credits: string;
+  status: string;
+};
+
+export type ApiKeyUsageReport = {
+  window: UsageReportWindow;
+  key_id: string | null;
+  summary: UsageReportSummary;
+  trend: UsageReportTrendPoint[];
+  by_key: ApiKeyUsageByKey[];
+  by_model: UsageReportModel[];
+  recent: ApiKeyUsageRecent[];
 };
 
 // ─── 充值 / 计费（GET /api/payment/*，commercial REST，虎皮椒扫码） ──────────
@@ -1334,7 +1382,13 @@ export type TutorialLeakReport = {
 };
 
 export type TutorialSnapshotSubmitResult = {
-  tutorial: { id: string; status: "pending" | "draft"; createdAt: string; kind?: TutorialKind; sanitizerVersion?: string };
+  tutorial: {
+    id: string;
+    status: "pending" | "draft";
+    createdAt: string;
+    kind?: TutorialKind;
+    sanitizerVersion?: string;
+  };
   leakReport?: TutorialLeakReport | null;
 };
 
@@ -1883,7 +1937,12 @@ export type OrgInvoiceRequest = {
   org_id: string;
   order_ids: string[];
   amount_cents: string;
-  profile_snapshot: { title?: string; tax_id?: string | null; address?: string | null; email?: string | null };
+  profile_snapshot: {
+    title?: string;
+    tax_id?: string | null;
+    address?: string | null;
+    email?: string | null;
+  };
   status: "pending" | "issued" | "rejected";
   requested_by: string | null;
   admin_note: string | null;
