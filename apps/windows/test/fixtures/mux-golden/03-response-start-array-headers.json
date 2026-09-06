@@ -1,0 +1,8 @@
+{
+  "name": "03-response-start-array-headers",
+  "hex": "020000000001000000407b22737461747573223a3230302c2268656164657273223a5b7b226b223a22636f6e74656e742d74797065222c2276223a22746578742f706c61696e227d5d7d",
+  "length": 74,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 2,
+  "streamId": 1
+}

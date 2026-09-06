@@ -40,13 +40,20 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdir, writeFile, chmod, rename, rm, readFile, mkdtemp, stat, readdir, rmdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { paths } from '@openclaude/storage'
 
 const SESSION_ID_RE = /^[A-Za-z0-9_-]+$/
 const SAFE_GIT_REF_RE = /^[A-Za-z0-9._/-]+$/
 
-const DATA_ROOT = '/home/agent/.openclaude'
-const REPOS_ROOT = path.join(DATA_ROOT, 'repos')
-const CREDS_ROOT = path.join(DATA_ROOT, 'git-creds')
+export function sessionRepoRoots(home: string = paths.home) {
+  return {
+    dataRoot: home,
+    reposRoot: path.join(home, 'repos'),
+    credsRoot: path.join(home, 'git-creds'),
+  }
+}
+
+const { dataRoot: DATA_ROOT, reposRoot: REPOS_ROOT, credsRoot: CREDS_ROOT } = sessionRepoRoots()
 
 export interface SessionRepoBindFrame {
   type: 'inbound.control.session_repo_bind'

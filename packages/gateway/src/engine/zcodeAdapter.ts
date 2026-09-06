@@ -444,6 +444,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
 
   get nativeSessionId(): string | null { return this.nativeId }
   clearSessionId(): void { this.nativeId = null }
+  setResumeSessionId(sessionId: string): void { this.nativeId = sessionId }
 
   setModel(model: string | undefined): void { this.currentModel = model }
   get model(): string | undefined { return this.currentModel }

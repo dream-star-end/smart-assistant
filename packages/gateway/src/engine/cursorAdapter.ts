@@ -2668,6 +2668,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   waitForOutputDrain(): Promise<void> { return this.drain }
   get nativeSessionId(): string | null { return this.nativeId }
   clearSessionId(): void { this.nativeId = null }
+  setResumeSessionId(sessionId: string): void { this.nativeId = sessionId }
   setModel(model: string | undefined): void {
     const selected = model ?? DEFAULT_CURSOR_ENGINE_MODEL
     if (!CURSOR_ENGINE_MODELS.some((entry) => entry.id === selected)) {

@@ -362,6 +362,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         agentId: opts.agentId,
         cwd: opts.agentBaseDir,
         resumeSessionId: opts.resumeSessionId,
+        resolveResumeFallback: opts.resolveResumeFallback,
         model: opts.model,
         persona: opts.persona,
         // 安全 gate(见文件头):engine 路由后任意 provider 的 agent 都可能落到
@@ -582,6 +583,11 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   clearSessionId(): void {
     this._threadId = null
     this.kernel.clearSessionId()
+  }
+
+  setResumeSessionId(sessionId: string): void {
+    this._threadId = sessionId
+    this.kernel.setResumeSessionId(sessionId)
   }
 
   // ── setters ────────────────────────────────────────────────────────────

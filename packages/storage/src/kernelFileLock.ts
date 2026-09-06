@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { chmod, mkdir, open } from 'node:fs/promises'
+import { chmod, mkdir, open, readFile, unlink } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 export interface KernelFileLock {
@@ -8,6 +8,14 @@ export interface KernelFileLock {
 }
 
 export type KernelFileLockMode = 'exclusive' | 'shared'
+
+export type KernelFileLockDeps = {
+  platform?: NodeJS.Platform
+  pid?: number
+  pidAlive?: (pid: number) => boolean
+  now?: () => number
+  sleep?: (ms: number) => Promise<void>
+}
 
 /**
  * Acquire a real Linux advisory lock and keep the `flock` child alive until
@@ -17,12 +25,22 @@ export type KernelFileLockMode = 'exclusive' | 'shared'
  * The lock file is intentionally never unlinked/replaced/renamed.  Its inode is
  * the serialization domain shared by every gateway process mounting the user
  * volume.
+ *
+ * win32: `fs.open(path, 'wx')` lock file containing the holder pid. Stale locks
+ * (pid not alive) are unlinked and retried. Shared mode is serialized as
+ * exclusive — Linux shared flock is unchanged.
  */
 export async function acquireKernelFileLock(
   lockPath: string,
   timeoutMs = 5_000,
   mode: KernelFileLockMode = 'exclusive',
+  deps: KernelFileLockDeps = {},
 ): Promise<KernelFileLock> {
+  const platform = deps.platform ?? process.platform
+  if (platform === 'win32') {
+    return acquireWin32FileLock(lockPath, timeoutMs, deps)
+  }
+
   await mkdir(dirname(lockPath), { recursive: true })
   const fh = await open(lockPath, 'a', 0o600)
   await fh.close()
@@ -55,6 +73,68 @@ export async function acquireKernelFileLock(
       proc.stdin.end()
       await waitForExit(proc)
     },
+  }
+}
+
+function defaultPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
+
+async function acquireWin32FileLock(
+  lockPath: string,
+  timeoutMs: number,
+  deps: KernelFileLockDeps,
+): Promise<KernelFileLock> {
+  await mkdir(dirname(lockPath), { recursive: true })
+  const pid = deps.pid ?? process.pid
+  const pidAlive = deps.pidAlive ?? defaultPidAlive
+  const now = deps.now ?? Date.now
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)))
+  const deadline = now() + timeoutMs
+
+  while (true) {
+    try {
+      const fh = await open(lockPath, 'wx')
+      try {
+        await fh.write(Buffer.from(`${pid}\n`, 'utf8'))
+      } catch {
+        await fh.close().catch(() => {})
+        throw new Error('kernel flock write failed')
+      }
+      let released = false
+      return {
+        async release(): Promise<void> {
+          if (released) return
+          released = true
+          await fh.close().catch(() => {})
+          await unlink(lockPath).catch(() => {})
+        },
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code !== 'EEXIST') throw err
+      let holder: number | null = null
+      try {
+        const raw = (await readFile(lockPath, 'utf8')).trim()
+        const parsed = Number(raw)
+        holder = Number.isInteger(parsed) && parsed > 0 ? parsed : null
+      } catch {
+        holder = null
+      }
+      if (holder !== null && !pidAlive(holder)) {
+        await unlink(lockPath).catch(() => {})
+        continue
+      }
+      if (now() >= deadline) {
+        throw new Error('kernel flock acquire timeout')
+      }
+      await sleep(50)
+    }
   }
 }
 

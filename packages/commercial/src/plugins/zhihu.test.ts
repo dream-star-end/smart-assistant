@@ -498,9 +498,6 @@ describe('official Zhihu Plugin', () => {
     assert.match(ZHIHU_WORKER_SOURCE, /login\.home_ready/)
     assert.match(ZHIHU_WORKER_SOURCE, /login\.home_retry/)
     assert.match(ZHIHU_WORKER_SOURCE, /login\.probe/)
-    assert.match(ZHIHU_WORKER_SOURCE, /people-page-token-mismatch/)
-    assert.match(ZHIHU_WORKER_SOURCE, /profile-projection-null/)
-    assert.match(ZHIHU_WORKER_SOURCE, /people-blocked/)
     assert.match(ZHIHU_WORKER_SOURCE, /login\.edit_redirect/)
     assert.match(ZHIHU_WORKER_SOURCE, /step: 'login\.qr_refresh'/)
     assert.match(ZHIHU_WORKER_SOURCE, /login\.loop_error/)
@@ -509,6 +506,21 @@ describe('official Zhihu Plugin', () => {
     assert.match(ZHIHU_WORKER_SOURCE, /bounds\.top > 200/)
     assert.match(ZHIHU_WORKER_SOURCE, /isZhihuAuthHost/)
     assert.match(ZHIHU_WORKER_SOURCE, /canonical === 'www\.zhihu\.com'/)
+  })
+
+  test('worker browses like a normal Chrome user and arrives in-site for reads', () => {
+    assert.match(ZHIHU_WORKER_SOURCE, /channel: 'chromium'/)
+    assert.match(ZHIHU_WORKER_SOURCE, /disable-blink-features=AutomationControlled/)
+    assert.match(ZHIHU_WORKER_SOURCE, /Accept-Language/)
+    assert.match(ZHIHU_WORKER_SOURCE, /nav\.arrive/)
+    assert.match(ZHIHU_WORKER_SOURCE, /browser\.launch/)
+    assert.match(ZHIHU_WORKER_SOURCE, /login\.self_token/)
+    assert.match(ZHIHU_WORKER_SOURCE, /humanPause/)
+    assert.match(ZHIHU_WORKER_SOURCE, /step: 'browser\.context'/)
+    assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /--disable-http2/)
+    assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /--disable-quic/)
+    assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /people-blocked/)
+    assert.doesNotMatch(ZHIHU_WORKER_SOURCE, /HeadlessChrome/)
   })
 
   test('question projection emits diagnostic steps and waits for SPA render', () => {

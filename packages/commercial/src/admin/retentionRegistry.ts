@@ -228,6 +228,11 @@ export const DURABLE_TABLES: readonly string[] = [
   "tutorial_compass_notes",
   "tutorial_eval_jobs",
   "zcode_external_usage_audit",
+  // 2026-09-06 selfhost sync: 0273 per-user ChatGPT proxy credentials (FK users ON DELETE
+  // CASCADE) and 0274 desktop tunnel owner registry (FK agent_containers ON DELETE CASCADE,
+  // rows overwritten by heartbeat/attach). Live state, no time-based sweep.
+  "chatgpt_proxy_credentials",
+  "desktop_tunnel_owners",
 ] as const;
 
 /**
