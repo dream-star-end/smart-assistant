@@ -1088,11 +1088,16 @@ describe('任务面板项目范围切换', () => {
       })
       expect(screen.getByTestId('taskboard-root')).toBeInTheDocument()
       expect(screen.queryByText('此页面加载出错')).not.toBeInTheDocument()
-      if (token === 'all' || token === 'none') {
+      if (token === 'all') {
+        expect(await screen.findByText('请选择一个工作项目以查看看板')).toBeInTheDocument()
+        expect(screen.getByRole('button', { name: '选择工作项目' })).toBeInTheDocument()
+      } else if (token === 'none') {
         expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
+        expect(screen.queryByRole('button', { name: '选择工作项目' })).toBeNull()
       } else {
         await waitFor(() => {
           expect(screen.queryByText('该会话项目未绑定看板')).not.toBeInTheDocument()
+          expect(screen.queryByText('请选择一个工作项目以查看看板')).not.toBeInTheDocument()
         })
       }
     }

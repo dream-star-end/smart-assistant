@@ -135,7 +135,11 @@ export function WeeklyReportView({
         </Button>
       </div>
       {!scopedProjectId ? (
-        <EmptyState icon={CalendarRange} title={UNBOUND_BOARD_COPY} hint="切换到已绑定看板的工作项目后再查看周报。" />
+        <EmptyState
+          icon={CalendarRange}
+          title={'blocked' in workQuery ? workQuery.blocked : UNBOUND_BOARD_COPY}
+          hint="切换到已绑定看板的工作项目后再查看周报。"
+        />
       ) : loading && !report ? (
         <ListSkeleton rows={6} variant="card" />
       ) : error ? (

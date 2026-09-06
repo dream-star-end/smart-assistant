@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  SELECT_WORK_PROJECT_COPY,
   UNBOUND_BOARD_COPY,
+  boardBlockedCopy,
   boardWorkQuery,
   parseProjectScopeToken,
   preferredScopeToken,
@@ -82,8 +84,17 @@ describe("withProjectParam", () => {
   });
 });
 
+describe("boardBlockedCopy", () => {
+  it("all asks to pick a work project; chat/ungrouped keep unbound copy", () => {
+    expect(boardBlockedCopy("all")).toBe(SELECT_WORK_PROJECT_COPY);
+    expect(boardBlockedCopy("chat")).toBe(UNBOUND_BOARD_COPY);
+    expect(boardBlockedCopy("ungrouped")).toBe(UNBOUND_BOARD_COPY);
+    expect(boardBlockedCopy("work")).toBe(UNBOUND_BOARD_COPY);
+  });
+});
+
 describe("boardWorkQuery", () => {
-  it("only work scope returns a projectId; all/none/unbound chat are blocked", () => {
+  it("only work scope returns a projectId; blocked copy follows kind", () => {
     const work = resolveProjectScope({
       token: "852859fa-cf1d-481c-96fd-23f2966b8b5f",
       chatProjects: chats,
@@ -91,7 +102,7 @@ describe("boardWorkQuery", () => {
     });
     expect(boardWorkQuery(work)).toEqual({ projectId: "852859fa-cf1d-481c-96fd-23f2966b8b5f" });
     expect(boardWorkQuery(resolveProjectScope({ token: "all", chatProjects: chats, workProjects: works }))).toEqual({
-      blocked: UNBOUND_BOARD_COPY,
+      blocked: SELECT_WORK_PROJECT_COPY,
     });
     expect(boardWorkQuery(resolveProjectScope({ token: "none", chatProjects: chats, workProjects: works }))).toEqual({
       blocked: UNBOUND_BOARD_COPY,
