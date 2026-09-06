@@ -442,6 +442,59 @@ async function gotoInSite(page, url) {
   await page.waitForTimeout(2500);
   await finishAuthenticatedNav(page, 0);
 }
+async function humanPause(page, minMs, maxMs) {
+  await page.waitForTimeout(minMs + Math.random() * (maxMs - minMs));
+}
+async function arriveInSite(page, target) {
+  const started = Date.now();
+  const url = 'https://www.zhihu.com/' + target.kind + '/' + target.id;
+  const arrivedPath = /\/(question|answer|people)\//;
+  const currentPath = () => {
+    try { return new URL(page.url()).pathname; } catch { return ''; }
+  };
+  const emitArrive = (ok, branch) => emitStep({
+    step: 'nav.arrive', ok, branch,
+    pathname: String(currentPath()).slice(0, 96),
+    ms: Date.now() - started
+  });
+  let branch = 'home';
+  try {
+    if (currentPath() !== '/') await gotoAuthenticated(page, 'https://www.zhihu.com/');
+    const searchBox = await uniqueVisible(page.locator('input[type="text"][placeholder*="搜索"], .SearchBar-input, input#Popover1-toggle'));
+    let arrived = false;
+    if (searchBox) {
+      branch = 'search-url';
+      await searchBox.click({ timeout: 10_000 }).catch(() => {});
+      for (const ch of url) {
+        await page.keyboard.type(ch);
+        await page.waitForTimeout(60 + Math.random() * 80);
+      }
+      await page.keyboard.press('Enter');
+      await page.waitForURL(arrivedPath, { timeout: 30_000 }).catch(() => {});
+      arrived = arrivedPath.test(currentPath());
+    }
+    if (!arrived) {
+      branch = 'search-click';
+      const link = await uniqueVisible(page.locator('a[href*="/' + target.kind + '/' + target.id + '"]'));
+      if (link) {
+        const nav = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+        await link.click({ timeout: 10_000 }).catch(() => {});
+        await nav;
+      }
+      arrived = arrivedPath.test(currentPath());
+    }
+    if (!arrived) {
+      branch = 'assign';
+      await gotoInSite(page, url);
+    }
+    emitArrive(true, branch);
+    await humanPause(page, 1500, 3000);
+    await finishAuthenticatedNav(page, 0);
+  } catch (error) {
+    emitArrive(false, branch);
+    throw error;
+  }
+}
 async function ensureSelfToken(page) {
   await gotoAuthenticated(page, 'https://www.zhihu.com/');
   const token = await selfTokenFromPage(page);
@@ -725,7 +778,7 @@ async function collectAnswers(page, questionId, limit) {
   let candidateCount = scanned && typeof scanned.candidateCount === 'number' ? scanned.candidateCount : 0;
   for (let attempt = 0; attempt < 2 && rows.length === 0; attempt += 1) {
     await page.mouse.wheel(0, 1500);
-    await page.waitForTimeout(1500);
+    await humanPause(page, 1200, 2500);
     scanned = await scan();
     rows = scanned && Array.isArray(scanned.items) ? scanned.items : [];
     candidateCount = scanned && typeof scanned.candidateCount === 'number' ? scanned.candidateCount : 0;
@@ -835,7 +888,7 @@ async function collectComments(page, answerId, limit) {
     || page.getByText('评论', { exact: true }).first();
   if (open && await visible(open)) {
     await open.click({ timeout: 10_000 }).catch(() => {});
-    await page.waitForTimeout(1200);
+    await humanPause(page, 1200, 2500);
   }
   await page.waitForSelector('[class*="CommentItem"], [class*="comment-item"], [data-id]', { timeout: 15_000 }).catch(() => null);
   const rows = await page.evaluate((input) => {
@@ -1044,25 +1097,25 @@ async function actionRead(page, input) {
   const limit = Math.min(Number(params.limit) || 10, 50);
   if (input.actionId === 'get_self') {
     const token = await ensureSelfToken(page);
-    await gotoAuthenticated(page, 'https://www.zhihu.com/people/' + token);
+    await arriveInSite(page, { kind: 'people', id: token });
     const user = await projectProfile(page, token);
     return { user };
   }
   if (input.actionId === 'get_user') {
     await ensureSelfToken(page);
-    await gotoAuthenticated(page, 'https://www.zhihu.com/people/' + params.urlToken);
+    await arriveInSite(page, { kind: 'people', id: params.urlToken });
     const user = await projectProfile(page, params.urlToken);
     return { user };
   }
   if (input.actionId === 'get_question') {
     await ensureSelfToken(page);
-    await gotoInSite(page, 'https://www.zhihu.com/question/' + params.questionId);
+    await arriveInSite(page, { kind: 'question', id: params.questionId });
     const question = await projectQuestion(page, params.questionId);
     return { question };
   }
   if (input.actionId === 'list_question_answers') {
     await ensureSelfToken(page);
-    await gotoInSite(page, 'https://www.zhihu.com/question/' + params.questionId);
+    await arriveInSite(page, { kind: 'question', id: params.questionId });
     await waitQuestionRendered(page);
     const answers = await collectAnswers(page, params.questionId, limit);
     const complete = answers.length < limit;
@@ -1070,13 +1123,13 @@ async function actionRead(page, input) {
   }
   if (input.actionId === 'get_answer') {
     await ensureSelfToken(page);
-    await gotoInSite(page, 'https://www.zhihu.com/answer/' + params.answerId);
+    await arriveInSite(page, { kind: 'answer', id: params.answerId });
     const answer = await projectAnswer(page, params.answerId);
     return { answer };
   }
   if (input.actionId === 'list_answer_comments') {
     await ensureSelfToken(page);
-    await gotoInSite(page, 'https://www.zhihu.com/answer/' + params.answerId);
+    await arriveInSite(page, { kind: 'answer', id: params.answerId });
     const comments = await collectComments(page, params.answerId, limit);
     return { comments, complete: comments.length < limit, ...(comments.length === 0 ? { degradedReason: 'empty_list' } : {}) };
   }
@@ -1430,6 +1483,7 @@ async function projectCreatedPin(page, selfToken, text, beforeIds) {
   };
 }
 async function fillEditor(page, text, existing) {
+  await humanPause(page, 800, 1500);
   const innerSel = '[contenteditable="true"], textarea, .public-DraftEditor-content, .ProseMirror, [role="textbox"]';
   let editor = null;
   if (existing && typeof existing.locator === 'function') {
@@ -1781,16 +1835,38 @@ function browserArgs() {
     '--disable-breakpad', '--disable-component-update', '--disable-default-apps',
     '--disable-domain-reliability', '--disable-extensions',
     '--disable-features=AutofillServerCommunication,MediaRouter,OptimizationHints,Translate',
-    '--disable-http2', '--disable-quic', '--disable-sync', '--metrics-recording-only', '--no-first-run',
+    '--disable-blink-features=AutomationControlled', '--disable-sync', '--metrics-recording-only', '--no-first-run',
     '--no-default-browser-check', '--no-pings', '--password-store=basic', '--use-mock-keychain',
     '--webrtc-ip-handling-policy=disable_non_proxied_udp'
   ];
 }
+async function launchBrowser(relay) {
+  const options = { headless: true, proxy: { server: relay.proxy }, args: browserArgs() };
+  try {
+    const browser = await chromium.launch({ ...options, channel: 'chromium' });
+    emitStep({ step: 'browser.launch', ok: true, branch: 'chromium' });
+    return browser;
+  } catch (error) {
+    const message = String(error && error.message || error);
+    if (!/channel|Executable doesn't exist/i.test(message)) throw error;
+    emitStep({ step: 'browser.launch', ok: false, reason: 'channel-fallback' });
+    const browser = await chromium.launch(options);
+    emitStep({ step: 'browser.launch', ok: true, branch: 'default' });
+    return browser;
+  }
+}
 async function secureContext(browser, storageState, allowed) {
-  const context = await browser.newContext({
+  let version = '';
+  try { version = String(browser.version() || ''); } catch {}
+  const major = /^([0-9]+)\./.exec(version);
+  const options = {
     locale: 'zh-CN', timezoneId: 'Asia/Shanghai', viewport: { width: 1280, height: 900 },
-    serviceWorkers: 'block', storageState
-  });
+    serviceWorkers: 'block', storageState,
+    extraHTTPHeaders: { 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
+    deviceScaleFactor: 1, hasTouch: false, colorScheme: 'light'
+  };
+  if (major) options.userAgent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + major[1] + '.0.0.0 Safari/537.36';
+  const context = await browser.newContext(options);
   await context.route('**/*', async (route) => {
     const request = route.request();
     let origin;
@@ -1801,12 +1877,13 @@ async function secureContext(browser, storageState, allowed) {
     }
     await route.continue();
   });
+  emitStep({ step: 'browser.context', ok: true, code: 'chrome-' + (major ? major[1] : 'unknown') });
   return context;
 }
 async function runAction(input, relay) {
   const started = Date.now();
   emitStep({ step: 'action.start', actionId: input.actionId });
-  const browser = await chromium.launch({ headless: true, proxy: { server: relay.proxy }, args: browserArgs() });
+  const browser = await launchBrowser(relay);
   try {
     const context = await secureContext(browser, input.storageState, ACTION_ORIGINS);
     const page = await context.newPage();
@@ -1872,8 +1949,7 @@ function urlPathname(raw) {
 }
 async function proveSelf(context) {
   const started = Date.now();
-  let page = await context.newPage();
-  let peoplePage = null;
+  const page = await context.newPage();
   let settled = false;
   try {
     const timedOut = { timeout: true };
@@ -1899,34 +1975,6 @@ async function proveSelf(context) {
         if (!settled) emitStep({ step: 'login.prove_self', ok: false, reason: 'home-no-unique-token', candidateCount: Array.from(new Set(topBar)).length });
         return null;
       }
-      let profilePage = null;
-      if (urlPathname(page.url()).startsWith('/people/' + first)) {
-        profilePage = page;
-      } else {
-        await page.close().catch(() => {});
-        page = null;
-        peoplePage = await context.newPage();
-        const nav = await gotoAuthenticated(peoplePage, 'https://www.zhihu.com/people/' + first, { soft: true });
-        if (nav === 'blocked') {
-          if (!settled) emitStep({ step: 'login.prove_self', ok: false, reason: 'people-blocked' });
-          return { blocked: true };
-        }
-        profilePage = peoplePage;
-      }
-      const path = urlPathname(profilePage.url());
-      if (!path.startsWith('/people/' + first)) {
-        if (!settled) emitStep({ step: 'login.prove_self', ok: false, reason: 'people-page-token-mismatch' });
-        return null;
-      }
-      await profilePage.waitForSelector('h1, [class*="ProfileHeader"]', { timeout: 15_000 }).catch(() => null);
-      const profile = await projectProfile(profilePage, first).catch(() => null);
-      if (!profile || !profile.urlToken) {
-        if (!settled) {
-          const text = await bodyText(profilePage);
-          emitStep({ step: 'login.prove_self', ok: false, reason: 'profile-projection-null', textLen: text.length });
-        }
-        return null;
-      }
       if (!settled) emitStep({ step: 'login.prove_self', ok: true, ms: Date.now() - started });
       return first;
     })();
@@ -1946,13 +1994,12 @@ async function proveSelf(context) {
     return result;
   } catch { return null; }
   finally {
-    if (peoplePage) await peoplePage.close().catch(() => {});
     if (page) await page.close().catch(() => {});
   }
 }
 async function runLogin(input, relay) {
   const allowed = new Set(input.allowedOrigins.map((origin) => new URL(origin).origin));
-  const browser = await chromium.launch({ headless: true, proxy: { server: relay.proxy }, args: browserArgs() });
+  const browser = await launchBrowser(relay);
   try {
     const context = await secureContext(browser, { cookies: [], origins: [] }, allowed);
     const home = await context.newPage();
@@ -1968,7 +2015,6 @@ async function runLogin(input, relay) {
     let nextProbe = 0;
     let signalEmitted = false;
     let probeHits = 0;
-    let blockedHits = 0;
     try {
       while (Date.now() < input.deadlineMs) {
         await assertNoChallenge(home);
@@ -2006,19 +2052,10 @@ async function runLogin(input, relay) {
           probeHits += 1;
           emitStep({ step: 'login.probe', ok: true, hits: probeHits });
           const selfId = await proveSelf(context);
-          if (selfId && typeof selfId === 'object') {
-            blockedHits += 1;
-            nextProbe = Date.now() + 60_000;
-            if (blockedHits >= 3) {
-              emitStep({ step: 'login.prove_self', ok: false, reason: 'people-blocked-giveup', hits: blockedHits });
-              await writeTerminalAndExit({ event: 'failed', code: 'ZHIHU_UPSTREAM_CHALLENGE' });
-            }
-          } else {
-            nextProbe = Date.now() + 5_000;
-            if (selfId) {
-              const state = filteredState(await context.storageState(), input.cookieDomains, input.stateOrigins);
-              await writeTerminalAndExit({ event: 'authenticated', storageState: state });
-            }
+          nextProbe = Date.now() + 5_000;
+          if (selfId) {
+            const state = filteredState(await context.storageState(), input.cookieDomains, input.stateOrigins);
+            await writeTerminalAndExit({ event: 'authenticated', storageState: state });
           }
         }
         await home.waitForTimeout(800);
